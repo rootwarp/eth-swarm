@@ -1,0 +1,189 @@
+syntax = "proto3";
+
+package ethswarm.store.v1;
+
+import "ethswarm/common/v1/envelope.proto";
+import "ethswarm/common/v1/error.proto";
+
+// Served by cl-store; called by cl-api and cl-sync (and cl-p2p for finalized req/resp ranges).
+//
+// cl-store is the READ side. It opens MDBX read-only and has NO write RPC; cl-chain is the single writer.
+// Consistency:
+//  - cl-store follows the sequenced head/finalized event stream from cl-chain
+//    (ethswarm.chain.v1.EventsService, EVENT_KIND_HEAD / EVENT_KIND_FINALIZED_CHECKPOINT, ordered by seq)
+//    and opens a fresh read transaction per applied event.
+//  - Head-state (and head-block) reads can therefore be up to ONE chain write behind. Every response carries
+//    the `as_of_seq` it was served from so callers can detect staleness; callers that need the exact
+//    latest head for duties must use ethswarm.chain.v1.QueryService.
+//  - Finalized data is immutable and never stale.
+
+message BlockId {
+  oneof id {
+    // "head" | "finalized" | "justified" | "genesis".
+    string named = 1;
+    uint64 slot = 2;
+    // 32 bytes.
+    bytes root = 3;
+  }
+}
+
+// Every response carries the stamp (as_of_seq, as_of_root, as_of_slot): the chain head event that the
+// read transaction was opened after. seq identifies the event; root/slot identify the head block it named.
+// Callers compare the stamp to chain's latest event to detect the (at most one write) lag, and use root
+// to detect reorgs between reads.
+message ReadMeta {
+  // Sequence number of the last chain event applied before this read.
+  uint64 as_of_seq = 1;
+  // 32 bytes. Head block root at as_of_seq.
+  bytes as_of_root = 4;
+  // Head slot at as_of_seq.
+  uint64 as_of_slot = 5;
+  bool execution_optimistic = 2;
+  bool finalized = 3;
+}
+
+message GetBlockRequest {
+  BlockId id = 1;
+}
+
+message GetBlockResponse {
+  // PAYLOAD_TYPE_SIGNED_BEACON_BLOCK. SSZ max MAX_PAYLOAD_SIZE = 10485760 bytes.
+  ethswarm.common.v1.Envelope block = 1;
+  ReadMeta meta = 2;
+  ethswarm.common.v1.Error error = 3;
+}
+
+message GetStateRequest {
+  // Root here is a state root, or a block root when by_block_root is set.
+  BlockId id = 1;
+  bool by_block_root = 2;
+  // Optional sub-resource, e.g. "validators", "committees", "ptc", "finality_checkpoints". Empty = full SSZ state.
+  string path = 3;
+  // JSON-encoded query params. Max 64 KiB (65536 bytes). Enough for an ID list of ~1000 validator indices/pubkeys (beacon-APIs POST validators); larger filters are rejected with CONTRACT_VIOLATION.
+  bytes params_json = 4;
+}
+
+message GetStateResponse {
+  // PAYLOAD_TYPE_BEACON_STATE when path is empty. SSZ max 1 GiB (1073741824 bytes), operational and configurable; same bound and rationale as chain.v1.BootstrapRequest.state (4.58x the measured Hoodi state of 234,500,681 B, 1,664,885 validators). Streamed in chunks of <= MAX_PAYLOAD_SIZE (10485760 bytes).
+  ethswarm.common.v1.Envelope state = 1;
+  // Sub-resource result as beacon-APIs JSON. Max 16 MiB (16777216 bytes), operational; same as chain.v1.QueryResult.json. Larger sub-resources (e.g. all validators) require pagination or SSZ.
+  bytes json = 2;
+  ReadMeta meta = 3;
+  ethswarm.common.v1.Error error = 4;
+}
+
+message GetDataColumnsRequest {
+  BlockId id = 1;
+  // Empty = all custodied columns. Each < NUMBER_OF_COLUMNS = 128.
+  repeated uint64 columns = 2;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 3;
+}
+
+message GetDataColumnsResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    GetDataColumnsResponseBody body = 2;
+  }
+}
+
+message GetDataColumnsResponseBody {
+  // PAYLOAD_TYPE_DATA_COLUMN_SIDECAR, one per message. SSZ max MAX_PAYLOAD_SIZE = 10485760 bytes.
+  ethswarm.common.v1.Envelope column = 1;
+  ReadMeta meta = 2;
+  ethswarm.common.v1.Error error = 3;
+}
+
+message GetPayloadEnvelopeRequest {
+  // Gloas: envelope for the given beacon block.
+  BlockId id = 1;
+}
+
+message GetPayloadEnvelopeResponse {
+  // PAYLOAD_TYPE_SIGNED_EXECUTION_PAYLOAD_ENVELOPE. SSZ max MAX_PAYLOAD_SIZE = 10485760 bytes.
+  ethswarm.common.v1.Envelope envelope = 1;
+  ReadMeta meta = 2;
+  ethswarm.common.v1.Error error = 3;
+}
+
+message GetBlocksByRangeRequest {
+  uint64 start_slot = 1;
+  // <= MAX_REQUEST_BLOCKS_DENEB = 128.
+  uint64 count = 2;
+  // Also stream Gloas payload envelopes for each block.
+  bool include_envelopes = 3;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 4;
+}
+
+message GetBlocksByRangeResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    GetBlocksByRangeResponseBody body = 2;
+  }
+}
+
+message GetBlocksByRangeResponseBody {
+  ethswarm.common.v1.Envelope item = 1;
+  ReadMeta meta = 2;
+  ethswarm.common.v1.Error error = 3;
+}
+
+message GetChainHeadRequest {}
+
+message GetChainHeadResponse {
+  uint64 head_slot = 1;
+  // 32 bytes.
+  bytes head_root = 2;
+  // 32 bytes.
+  bytes head_state_root = 3;
+  ethswarm.common.v1.Checkpoint justified = 4;
+  ethswarm.common.v1.Checkpoint finalized = 5;
+  // Earliest slot with blocks available (checkpoint anchor or backfill progress).
+  uint64 earliest_available_slot = 6;
+  ReadMeta meta = 7;
+}
+
+// Data columns for a slot range. count * len(columns) <= MAX_REQUEST_DATA_COLUMN_SIDECARS = 16384
+// (specs/fulu/p2p-interface.md); larger requests fail with ERROR_CODE_INVALID.
+message GetDataColumnsByRangeRequest {
+  uint64 start_slot = 1;
+  uint64 count = 2;
+  // Each < NUMBER_OF_COLUMNS = 128.
+  repeated uint64 columns = 3;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 4;
+}
+
+message GetDataColumnsByRangeResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    GetDataColumnsByRangeResponseBody body = 2;
+  }
+}
+
+message GetDataColumnsByRangeResponseBody {
+  // PAYLOAD_TYPE_DATA_COLUMN_SIDECAR, one per message. SSZ max MAX_PAYLOAD_SIZE = 10485760 bytes.
+  ethswarm.common.v1.Envelope column = 1;
+  ReadMeta meta = 2;
+  ethswarm.common.v1.Error error = 3;
+}
+
+service StoreService {
+  rpc GetBlock(GetBlockRequest) returns (GetBlockResponse);
+  rpc GetState(GetStateRequest) returns (GetStateResponse);
+  rpc GetDataColumns(GetDataColumnsRequest) returns (stream GetDataColumnsResponse);
+  rpc GetPayloadEnvelope(GetPayloadEnvelopeRequest) returns (GetPayloadEnvelopeResponse);
+  rpc GetBlocksByRange(GetBlocksByRangeRequest) returns (stream GetBlocksByRangeResponse);
+  rpc GetDataColumnsByRange(GetDataColumnsByRangeRequest) returns (stream GetDataColumnsByRangeResponse);
+  rpc GetChainHead(GetChainHeadRequest) returns (GetChainHeadResponse);
+}

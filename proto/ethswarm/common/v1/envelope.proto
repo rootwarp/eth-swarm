@@ -1,0 +1,105 @@
+syntax = "proto3";
+
+package ethswarm.common.v1;
+
+import "ethswarm/common/v1/fork.proto";
+
+// Every consensus object crosses service boundaries as raw SSZ inside this envelope.
+// The payload is decoded with the fork of `slot`, never the receiver's current fork.
+message Envelope {
+  // 4 bytes (ForkDigest). Must equal compute_fork_digest(gvr, epoch(slot)); mismatch => drop + contract error.
+  bytes fork_digest = 1;
+  // Slot of the object, used to select the SSZ schema.
+  uint64 slot = 2;
+  // 32 bytes (Root). hash_tree_root of the object, or the block root for sidecars/envelopes. Empty if not yet computed.
+  bytes root = 3;
+  // Uncompressed SSZ. Max MAX_PAYLOAD_SIZE = 10485760 bytes (configs/mainnet.yaml); per-type caps are tighter.
+  bytes ssz = 4;
+  reserved 5;
+  reserved "type_name";
+  // Closed set. PAYLOAD_TYPE_UNSPECIFIED (0) is a contract error: log, increment the contract-violation metric,
+  // fail the call/stream with ERROR_CODE_CONTRACT_VIOLATION. An unknown NON-ZERO value from outside => IGNORE (drop, never decode).
+  PayloadType payload_type = 6;
+  // Max 32 bytes; senders use a 16-byte W3C trace-id. Empty = untraced.
+  // Debugging only: never used for auth or dedup.
+  bytes trace_id = 7;
+  // Per-stream sequence number, strictly increasing from 1 within one stream direction; 0 on unary calls.
+  // Ordering/debugging only, never auth or dedup. A non-monotonic seq (gap, repeat, decrease) is
+  // ERROR_CODE_CONTRACT_VIOLATION; receivers never reorder silently.
+  uint64 seq = 8;
+}
+
+// SSZ container carried in Envelope.ssz. The schema is chosen by (payload_type, fork of slot).
+// Adding a value is additive; receivers on older builds treat an unknown non-zero value => IGNORE.
+// 0 (UNSPECIFIED) is never valid on the wire.
+enum PayloadType {
+  PAYLOAD_TYPE_UNSPECIFIED = 0;
+  PAYLOAD_TYPE_SIGNED_BEACON_BLOCK = 1;
+  PAYLOAD_TYPE_BEACON_STATE = 2;
+  PAYLOAD_TYPE_DATA_COLUMN_SIDECAR = 3;
+  PAYLOAD_TYPE_SIGNED_EXECUTION_PAYLOAD_ENVELOPE = 4;
+  PAYLOAD_TYPE_SIGNED_EXECUTION_PAYLOAD_BID = 5;
+  PAYLOAD_TYPE_PAYLOAD_ATTESTATION_MESSAGE = 6;
+  PAYLOAD_TYPE_SIGNED_PROPOSER_PREFERENCES = 7;
+  PAYLOAD_TYPE_SIGNED_AGGREGATE_AND_PROOF = 8;
+  PAYLOAD_TYPE_ATTESTATION = 9;
+  PAYLOAD_TYPE_SINGLE_ATTESTATION = 10;
+  PAYLOAD_TYPE_SIGNED_VOLUNTARY_EXIT = 11;
+  PAYLOAD_TYPE_PROPOSER_SLASHING = 12;
+  PAYLOAD_TYPE_ATTESTER_SLASHING = 13;
+  PAYLOAD_TYPE_SIGNED_CONTRIBUTION_AND_PROOF = 14;
+  PAYLOAD_TYPE_SYNC_COMMITTEE_MESSAGE = 15;
+  PAYLOAD_TYPE_SIGNED_BLS_TO_EXECUTION_CHANGE = 16;
+  PAYLOAD_TYPE_LIGHT_CLIENT_FINALITY_UPDATE = 17;
+  PAYLOAD_TYPE_LIGHT_CLIENT_OPTIMISTIC_UPDATE = 18;
+}
+
+// Read stamp of a non-finalized read: the chain event the read was served after.
+message ReadStamp {
+  // Sequence number of the last chain event applied before this read.
+  uint64 as_of_seq = 1;
+  // 32 bytes. Head block root at as_of_seq.
+  bytes as_of_root = 2;
+  // Head slot at as_of_seq.
+  uint64 as_of_slot = 3;
+  bool execution_optimistic = 4;
+  bool finalized = 5;
+}
+
+message Checkpoint {
+  uint64 epoch = 1;
+  // 32 bytes (Root).
+  bytes root = 2;
+}
+
+message PeerId {
+  // libp2p peer id, base58 text.
+  string id = 1;
+}
+
+// Sent first on every stream and on connect.
+message Hello {
+  // Major API version of the sender (1 for *.v1).
+  uint32 api_version = 1;
+  string build = 2;
+  // 32 bytes (Root).
+  bytes genesis_validators_root = 3;
+  // 4 bytes (ForkDigest).
+  bytes current_fork_digest = 4;
+  // Spec versions the sender was built against.
+  SpecPin spec_pin = 5;
+  // Full fork schedule (version, epoch, digest per fork), ordered by epoch.
+  repeated ForkScheduleEntry fork_schedule = 6;
+  // Full blob-parameter (BPO) schedule, ordered by epoch.
+  repeated BlobScheduleEntry blob_schedule = 7;
+  // N / N-1 compatibility: inclusive range of proto API versions the sender can speak.
+  // The link uses the highest common version, min(max_a, max_b). It fails with ERROR_CODE_VERSION_MISMATCH
+  // if that is below max(min_a, min_b) or below the receiver's configured floor. When N-1 support is
+  // dropped the floor rises, so a peer cannot force a downgrade to an older version.
+  uint32 min_api_version = 8;
+  uint32 max_api_version = 9;
+}
+// Receiver rule: compare the WHOLE handshake, not only current_fork_digest. Any difference in
+// api_version, genesis_validators_root, spec_pin, fork_schedule or blob_schedule fails the stream
+// with ERROR_CODE_VERSION_MISMATCH (logged + metric). Two nodes can share today's digest yet
+// disagree on a future fork or BPO epoch, which would split them at that boundary.

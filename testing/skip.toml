@@ -1,0 +1,124 @@
+# Skip list for crates/spec-tests (schema: testing/skip.toml.example).
+# The run FAILS on any case that is neither run nor matched here, on an expired entry,
+# and on an entry that matches nothing.
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "ssz_static"
+handler = "DataColumnSidecar"
+reason  = "PeerDAS/Gloas data-column containers not yet transcribed (need KZG cell types and the Gloas-modified DataColumnSidecar from gloas/p2p-interface.md)"
+owner   = "ian"
+issue   = "M1-ssz-static-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "ssz_static"
+handler = "DataColumnsByRootIdentifier"
+reason  = "PeerDAS/Gloas data-column containers not yet transcribed (need KZG cell types and the Gloas-modified DataColumnSidecar from gloas/p2p-interface.md)"
+owner   = "ian"
+issue   = "M1-ssz-static-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "ssz_static"
+handler = "MatrixEntry"
+reason  = "PeerDAS/Gloas data-column containers not yet transcribed (need KZG cell types and the Gloas-modified DataColumnSidecar from gloas/p2p-interface.md)"
+owner   = "ian"
+issue   = "M1-ssz-static-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "ssz_static"
+handler = "PartialDataColumnGroupID"
+reason  = "gloas/partial-columns containers (ProgressiveBitList CellsBitList) not yet transcribed"
+owner   = "ian"
+issue   = "M1-ssz-static-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "ssz_static"
+handler = "PartialDataColumnPartsMetadata"
+reason  = "gloas/partial-columns containers (ProgressiveBitList CellsBitList) not yet transcribed"
+owner   = "ian"
+issue   = "M1-ssz-static-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "ssz_static"
+handler = "PartialDataColumnSidecar"
+reason  = "gloas/partial-columns containers (ProgressiveBitList CellsBitList) not yet transcribed"
+owner   = "ian"
+issue   = "M1-ssz-static-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "ssz_static"
+handler = "LightClientBootstrap"
+reason  = "Light-client containers out of M1 scope (beacon node follows the chain; no light-client server yet)"
+owner   = "ian"
+issue   = "M1-ssz-static-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "ssz_static"
+handler = "LightClientFinalityUpdate"
+reason  = "Light-client containers out of M1 scope (beacon node follows the chain; no light-client server yet)"
+owner   = "ian"
+issue   = "M1-ssz-static-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "ssz_static"
+handler = "LightClientHeader"
+reason  = "Light-client containers out of M1 scope (beacon node follows the chain; no light-client server yet)"
+owner   = "ian"
+issue   = "M1-ssz-static-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "ssz_static"
+handler = "LightClientOptimisticUpdate"
+reason  = "Light-client containers out of M1 scope (beacon node follows the chain; no light-client server yet)"
+owner   = "ian"
+issue   = "M1-ssz-static-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "ssz_static"
+handler = "LightClientUpdate"
+reason  = "Light-client containers out of M1 scope (beacon node follows the chain; no light-client server yet)"
+owner   = "ian"
+issue   = "M1-ssz-static-coverage"
+expires = "2026-11-30"

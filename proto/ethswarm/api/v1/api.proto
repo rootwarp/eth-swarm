@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package ethswarm.api.v1;
+
+// Served by cl-api; called by the supervisor for health and readiness.
+// Beacon API traffic itself is HTTP (beacon-APIs), not gRPC.
+
+message GetHealthRequest {}
+
+message GetHealthResponse {
+  bool chain_connected = 1;
+  bool events_connected = 2;
+  // Last event sequence seen from chain EventsService.
+  uint64 last_event_seq = 3;
+  bool db_readable = 4;
+}
+
+service ApiService {
+  rpc GetHealth(GetHealthRequest) returns (GetHealthResponse);
+}

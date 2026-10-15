@@ -1,0 +1,171 @@
+syntax = "proto3";
+
+package ethswarm.engine.v1;
+
+// Served by cl-engine; called ONLY by cl-chain.
+//
+// cl-engine is an ordered, stateless Engine API adapter (execution-apis/src/engine/*.md):
+//  - It forwards calls to the EL over JSON-RPC with JWT auth (authentication.md). The JWT secret lives
+//    only in cl-engine and never crosses this API.
+//  - Calls are executed in the order received, one at a time per EL, so forkchoiceUpdated never
+//    overtakes an earlier newPayload. cl-chain owns optimistic status and fcU ordering; cl-engine keeps
+//    no fork-choice or optimistic state.
+//  - Method version is chosen by the caller via EngineMethodVersion and must match the fork of the payload's
+//    timestamp; the EL answers -38005 "Unsupported fork" otherwise (surfaced as ENGINE_ERROR_UNSUPPORTED_FORK).
+//
+// Method versions per fork (execution-apis at the workspace clone):
+//   Fulu  (EL Osaka,     osaka.md/prague.md/cancun.md): newPayloadV4, forkchoiceUpdatedV3, getPayloadV5, getBlobsV2/V3
+//   Gloas (EL Amsterdam, amsterdam.md):                 newPayloadV5, forkchoiceUpdatedV4, getPayloadV6, getBlobsV4
+// (bogota.md newPayloadV6/forkchoiceUpdatedV5 are a later fork and out of scope for v1.)
+
+enum EngineMethodVersion {
+  ENGINE_METHOD_VERSION_UNSPECIFIED = 0;
+  ENGINE_METHOD_VERSION_FULU_OSAKA = 1;
+  ENGINE_METHOD_VERSION_GLOAS_AMSTERDAM = 2;
+}
+
+// Encoding of `data` bytes fields. JSON is the Engine API JSON-RPC param/result object as specified;
+// SSZ follows the Engine API v2 SSZ sketches (refactor-ssz.md, draft) and is reserved for later.
+enum PayloadEncoding {
+  PAYLOAD_ENCODING_UNSPECIFIED = 0;
+  PAYLOAD_ENCODING_JSON = 1;
+  PAYLOAD_ENCODING_SSZ = 2;
+}
+
+message VersionedData {
+  EngineMethodVersion version = 1;
+  PayloadEncoding encoding = 2;
+  // Encoded params/result. Max MAX_PAYLOAD_SIZE = 10485760 bytes for SSZ; JSON max 32 MiB (33554432 bytes): hex doubles the 10 MiB SSZ bound (~20 MiB) plus field-name overhead. Exception: GetBlobsResponse.result, capped at 48 MiB (see there).
+  bytes data = 3;
+}
+
+enum PayloadStatusKind {
+  PAYLOAD_STATUS_KIND_UNSPECIFIED = 0;
+  PAYLOAD_STATUS_KIND_VALID = 1;
+  PAYLOAD_STATUS_KIND_INVALID = 2;
+  PAYLOAD_STATUS_KIND_SYNCING = 3;
+  PAYLOAD_STATUS_KIND_ACCEPTED = 4;
+  PAYLOAD_STATUS_KIND_INVALID_BLOCK_HASH = 5;
+}
+
+message PayloadStatus {
+  PayloadStatusKind status = 1;
+  // 32 bytes, empty when null.
+  bytes latest_valid_hash = 2;
+  // Max 1024 bytes (MAX_ERROR_BYTES in refactor-ssz.md).
+  string validation_error = 3;
+}
+
+enum EngineErrorKind {
+  ENGINE_ERROR_KIND_UNSPECIFIED = 0;
+  ENGINE_ERROR_KIND_EL_UNREACHABLE = 1;
+  ENGINE_ERROR_KIND_TIMEOUT = 2;
+  ENGINE_ERROR_KIND_UNSUPPORTED_FORK = 3;
+  ENGINE_ERROR_KIND_INVALID_PARAMS = 4;
+  ENGINE_ERROR_KIND_UNKNOWN_PAYLOAD = 5;
+  ENGINE_ERROR_KIND_INVALID_FORKCHOICE_STATE = 6;
+  ENGINE_ERROR_KIND_INVALID_PAYLOAD_ATTRIBUTES = 7;
+  ENGINE_ERROR_KIND_TOO_LARGE_REQUEST = 8;
+  ENGINE_ERROR_KIND_OTHER = 9;
+}
+
+message EngineError {
+  EngineErrorKind kind = 1;
+  // JSON-RPC error code, e.g. -38005.
+  int32 rpc_code = 2;
+  // Max 1024 bytes.
+  string message = 3;
+}
+
+message NewPayloadRequest {
+  // Monotonic per-chain sequence assigned by cl-chain; cl-engine executes in this order.
+  uint64 seq = 1;
+  // [executionPayload, expectedBlobVersionedHashes, parentBeaconBlockRoot, executionRequests] per version.
+  VersionedData params = 2;
+  // Overrides the spec default (6s for newPayload) if non-zero.
+  uint32 timeout_ms = 3;
+}
+
+message NewPayloadResponse {
+  uint64 seq = 1;
+  PayloadStatus status = 2;
+  EngineError error = 3;
+}
+
+message ForkchoiceUpdatedRequest {
+  uint64 seq = 1;
+  // 32 bytes each (ForkchoiceStateV1).
+  bytes head_block_hash = 2;
+  bytes safe_block_hash = 3;
+  bytes finalized_block_hash = 4;
+  // PayloadAttributes per version (V3 for Fulu, V4 for Gloas); empty = no build. Max 64 KiB (65536 bytes). PayloadAttributesV3/V4 are fixed fields plus withdrawals (MAX_WITHDRAWALS_PER_PAYLOAD = 16, capella/beacon-chain.md), well under 4 KiB in JSON; 64 KiB is headroom for later versions.
+  VersionedData payload_attributes = 5;
+  uint32 timeout_ms = 6;
+}
+
+message ForkchoiceUpdatedResponse {
+  uint64 seq = 1;
+  PayloadStatus status = 2;
+  // 8 bytes, empty when null.
+  bytes payload_id = 3;
+  EngineError error = 4;
+}
+
+message GetPayloadRequest {
+  uint64 seq = 1;
+  EngineMethodVersion version = 2;
+  // 8 bytes.
+  bytes payload_id = 3;
+  uint32 timeout_ms = 4;
+}
+
+message GetPayloadResponse {
+  uint64 seq = 1;
+  // ExecutionPayloadEnvelope result (payload, blockValue, blobsBundle, executionRequests, ...).
+  VersionedData result = 2;
+  EngineError error = 3;
+}
+
+message GetBlobsRequest {
+  uint64 seq = 1;
+  // Fulu: getBlobsV2 (all-or-nothing) or V3 (partial); Gloas: getBlobsV4 (cells).
+  EngineMethodVersion version = 2;
+  bool partial = 3;
+  // 32 bytes each. Max 128 entries per call: execution-apis only guarantees 128 versioned hashes (osaka.md engine_getBlobsV2, MAX_VERSIONED_HASHES_PER_REQUEST in refactor-ssz.md); more returns -38004 Too large request. cl-engine must also enforce <= current BLOB_SCHEDULE MAX_BLOBS_PER_BLOCK for per-block calls (21 on Hoodi and Sepolia, eth-clients configs 2026-10-15), so no split is needed per block; split only multi-block requests. (MAX_BLOB_COMMITMENTS_PER_BLOCK = 4096 is a theoretical bound, not an EL limit.) Same 128 minimum for getBlobsV4 (amsterdam.md).
+  repeated bytes versioned_hashes = 4;
+  // getBlobsV4 only: 16 bytes, bitarray of cell indices to retrieve.
+  bytes indices_bitarray = 5;
+  uint32 timeout_ms = 6;
+}
+
+message GetBlobsResponse {
+  uint64 seq = 1;
+  // Array of BlobAndProofV2 / BlobCellsAndProofsV1 (null entries preserved). Max 48 MiB (50331648 bytes): 128 entries x (131072-byte blob + 128 x 48-byte cell proofs) is ~17.6 MB raw, ~35 MB as hex JSON.
+  VersionedData result = 2;
+  EngineError error = 3;
+}
+
+message ExchangeCapabilitiesRequest {
+  // Method names cl-chain may call, e.g. "engine_newPayloadV5".
+  repeated string methods = 1;
+}
+
+message ExchangeCapabilitiesResponse {
+  repeated string methods = 1;
+  EngineError error = 2;
+}
+
+// Milestones: M1 = NewPayload (V5, Gloas), ForkchoiceUpdated (V4) WITHOUT payload_attributes, and
+// ExchangeCapabilities. GetPayload, GetBlobs and fcU payload_attributes (block building) are M3.
+service EngineService {
+  // M1: engine_newPayloadV5.
+  rpc NewPayload(NewPayloadRequest) returns (NewPayloadResponse);
+  // M1: engine_forkchoiceUpdatedV4, payload_attributes unset. Attributes are M3.
+  rpc ForkchoiceUpdated(ForkchoiceUpdatedRequest) returns (ForkchoiceUpdatedResponse);
+  // M3 (block production).
+  rpc GetPayload(GetPayloadRequest) returns (GetPayloadResponse);
+  // M3.
+  rpc GetBlobs(GetBlobsRequest) returns (GetBlobsResponse);
+  // M1.
+  rpc ExchangeCapabilities(ExchangeCapabilitiesRequest) returns (ExchangeCapabilitiesResponse);
+}

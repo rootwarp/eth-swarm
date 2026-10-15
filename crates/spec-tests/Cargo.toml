@@ -1,0 +1,31 @@
+[package]
+name = "spec-tests"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Runner for ssz-specs and consensus-spec-tests vectors."
+
+[dependencies]
+ethereum_ssz.workspace = true
+ethereum_ssz_derive.workspace = true
+ssz_types.workspace = true
+tree_hash.workspace = true
+tree_hash_derive.workspace = true
+milhouse.workspace = true
+alloy-primitives.workspace = true
+typenum.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+hex = "0.4"
+snap = "1"
+thiserror = "2"
+
+[dev-dependencies]
+libtest-mimic = "0.8"
+
+[[test]]
+name = "vectors"
+harness = false

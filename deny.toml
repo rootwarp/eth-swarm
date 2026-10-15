@@ -1,0 +1,76 @@
+# cargo-deny config for ETH Swarm (cargo-deny >= 0.16 / v2 schema). Owner: Vera.
+# Run: cargo deny check   (CI also runs scripts/check-ssz-revs.sh, see [sources] note)
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Every vulnerability advisory fails CI. Ignores need an ID, a reason and an owner, and are reviewed each release.
+ignore = [
+    # paste 1.0.15 is unmaintained, not vulnerable. It's a build-time proc-macro that comes in only via alloy-primitives under the sigp SSZ crates, and no upgrade exists.
+    # Owner: Vera. Review at the next sigp pin bump or 2026-11-30, whichever is first. Approved by Ezra on 2026-10-15.
+    # The ignore is void if paste ever ends up in the runtime binary.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained build-time proc-macro via alloy-primitives; owner Vera; review 2026-11-30 or next sigp bump" },
+]
+# unmaintained/unsound advisories: report for all crates, including transitive ones
+unmaintained = "all"
+unsound = "all"
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+# The allow-list is policy for future deps; don't warn about entries not used yet.
+unused-allowed-license = "allow"
+# Permissive licenses only. Lighthouse crates and the sigp SSZ crates are Apache-2.0.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "CC0-1.0",
+  "MPL-2.0",          # weak, file-level copyleft; fine for unmodified dependencies
+  "CDLA-Permissive-2.0", # webpki-roots
+]
+# Add [[licenses.clarify]] entries (e.g. ring) only with a hash taken from the real LICENSE file once Cargo.lock exists.
+[licenses.private]
+ignore = true   # our own unpublished workspace crates
+
+[bans]
+multiple-versions = "warn"   # libp2p/tokio trees make "deny" impractical; review warnings
+wildcards = "deny"           # no `*` version requirements
+allow-wildcard-paths = true  # internal path deps
+highlight = "all"
+deny = [
+  # The Engine JWT and inter-service TLS must use rustls, never OpenSSL.
+  { crate = "openssl", reason = "use rustls" },
+  { crate = "openssl-sys", reason = "use rustls" },
+]
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Git dependencies are allowed ONLY for the four sigp SSZ repos, pinned to the revisions in
+# Lighthouse unstable's root Cargo.toml [patch] section (see arch/ssz-crate-check.md §3):
+#   ethereum_ssz + ethereum_ssz_derive  https://github.com/sigp/ethereum_ssz  rev 974f78f421fbf70cba4e8f84e0fa28c23ad54f34
+#   ssz_types                           https://github.com/sigp/ssz_types     rev 8955d22edc7633f26fe3b5ac933facb5121d717a
+#   tree_hash + tree_hash_derive        https://github.com/sigp/tree_hash     rev e5ea1875edddf12438506c3751cbb313f9c52d08
+#   milhouse                            https://github.com/sigp/milhouse      rev d67aabd2a7c405b3c16f4aaff159b137dc5b5e38
+# cargo-deny cannot enforce revs. scripts/check-ssz-revs.sh fails CI if Cargo.toml/Cargo.lock
+# reference any other rev of these repos. Bump only together with Lighthouse unstable, in a reviewed PR.
+allow-git = [
+  "https://github.com/sigp/ethereum_ssz",
+  "https://github.com/sigp/ssz_types",
+  "https://github.com/sigp/tree_hash",
+  "https://github.com/sigp/milhouse",
+]

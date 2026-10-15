@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package ethswarm.sync.v1;
+
+// Served by cl-sync; called by cl-api (node/syncing) and operators.
+
+enum SyncState {
+  SYNC_STATE_UNSPECIFIED = 0;
+  SYNC_STATE_CHECKPOINT_FETCH = 1;
+  SYNC_STATE_RANGE = 2;
+  SYNC_STATE_SYNCED = 3;
+  SYNC_STATE_STALLED = 4;
+}
+
+message GetSyncProgressRequest {}
+
+message GetSyncProgressResponse {
+  SyncState state = 1;
+  uint64 head_slot = 2;
+  uint64 target_slot = 3;
+  uint64 backfill_slot = 4;
+  uint64 anchor_slot = 5;
+  uint32 peers = 6;
+}
+
+message StartBackfillRequest {
+  // 0 = to MIN_EPOCHS_FOR_BLOCK_REQUESTS horizon.
+  uint64 to_slot = 1;
+}
+
+message StartBackfillResponse {}
+
+service SyncService {
+  rpc GetSyncProgress(GetSyncProgressRequest) returns (GetSyncProgressResponse);
+  rpc StartBackfill(StartBackfillRequest) returns (StartBackfillResponse);
+}

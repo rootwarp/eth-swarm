@@ -1,0 +1,174 @@
+syntax = "proto3";
+
+package ethswarm.verify.v1;
+
+import "ethswarm/common/v1/envelope.proto";
+import "ethswarm/common/v1/error.proto";
+
+// Served by cl-verify (service 8); called ONLY by cl-chain (UID-checked, like cl-engine).
+//
+// cl-verify is stateless apart from an append-only pubkey cache fed by cl-chain over PubkeyFeed.
+// It runs BLS (blst) and KZG cell-proof checks and returns per-item verdicts. See arch/verify-ipc.md.
+//
+// Cache-safety invariant: once FINALIZED, a validator index never changes pubkey (the registry is
+// append-only, electra beacon-chain.md add_validator_to_registry). Before finality, competing branches can
+// assign the same new index to different pubkeys, so cl-chain feeds ONLY the finalized registry prefix.
+// A signer whose index is at or past the cache high-water mark must carry its pubkey inline. Such an
+// index with no inline pubkey yields VERIFY_STATUS_UNKNOWN_INDEX -> IGNORE (or retry), never ACCEPT.
+// A lagging cache can therefore only be missing entries, never wrong. Inline keys are used for that
+// call only and never enter the cache.
+// INLINE CAP (Vera): inline signers grow by up to 16/epoch since finality (MAX_PENDING_DEPOSITS_PER_EPOCH).
+//   Max inline pubkeys per request = ___ ; behaviour when hit = ___ .
+//
+// Deadline semantics: every request carries deadline_unix_ms. cl-verify drops work it cannot finish by
+// then and answers VERIFY_STATUS_DEADLINE_EXCEEDED. A missing, timed-out, errored or UNSPECIFIED verdict
+// is NEVER treated as valid; only VERIFY_STATUS_VALID is. cl-chain has no in-process fallback.
+//
+// Streams: every stream opens with exactly one `hello` frame from each side, then only `body` frames.
+// A first frame that is not hello, or a hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+
+enum VerifyStatus {
+  // Contract violation if sent.
+  VERIFY_STATUS_UNSPECIFIED = 0;
+  VERIFY_STATUS_VALID = 1;
+  VERIFY_STATUS_INVALID = 2;
+  // Index above the cache high-water mark. Never ACCEPT.
+  VERIFY_STATUS_UNKNOWN_INDEX = 3;
+  VERIFY_STATUS_DEADLINE_EXCEEDED = 4;
+  VERIFY_STATUS_OVERLOADED = 5;
+  // Malformed point / wrong length / failed subgroup check.
+  VERIFY_STATUS_DECODE_ERROR = 6;
+}
+
+message Signer {
+  uint64 validator_index = 1;
+  // 48 bytes compressed G1. Required iff validator_index >= the cache high-water mark (unfinalized);
+  // empty otherwise. Ignored for cached (finalized) indices: the cache is authoritative.
+  bytes inline_pubkey = 2;
+}
+
+message BlsSet {
+  // >1 signer means a fast-aggregate set (aggregates, sync contributions).
+  // SIZE CAP (Vera): max signers per set = ___ (MAX_VALIDATORS_PER_COMMITTEE = 2048 is the spec bound).
+  repeated Signer signers = 1;
+  // 32 bytes.
+  bytes signing_root = 2;
+  // 96 bytes, compressed G2.
+  bytes signature = 3;
+}
+
+message VerifyBlsRequestBody {
+  // Echoed in the response; per-stream, monotonic.
+  uint64 request_id = 1;
+  // At most 256 sets; more is ERROR_CODE_CONTRACT_VIOLATION.
+  // SIZE CAP (Vera): encoded message max = ___ bytes.
+  repeated BlsSet sets = 2;
+  uint64 deadline_unix_ms = 3;
+}
+
+message BlsResult {
+  oneof result {
+    VerifyStatus status = 1;
+    ethswarm.common.v1.Error err = 2;
+  }
+}
+
+message VerifyBlsResponseBody {
+  uint64 request_id = 1;
+  // One per request set, same order.
+  repeated BlsResult results = 2;
+}
+
+message VerifyBlsRequest {
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    VerifyBlsRequestBody body = 2;
+  }
+}
+
+message VerifyBlsResponse {
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    VerifyBlsResponseBody body = 2;
+  }
+}
+
+message KzgCellProof {
+  // 48 bytes each.
+  bytes commitment = 1;
+  // < NUMBER_OF_COLUMNS = 128 (fulu/das-core.md).
+  uint64 cell_index = 2;
+  // BYTES_PER_CELL = 2048 bytes.
+  bytes cell = 3;
+  // 48 bytes.
+  bytes proof = 4;
+}
+
+message VerifyKzgRequestBody {
+  uint64 request_id = 1;
+  // Cells of one or more column sidecars, checked with verify_cell_kzg_proof_batch (fulu/polynomial-commitments-sampling.md).
+  // SIZE CAP (Vera): max cells per request = ___ ; encoded message max = ___ bytes.
+  repeated KzgCellProof cells = 2;
+  uint64 deadline_unix_ms = 3;
+}
+
+message VerifyKzgResponseBody {
+  uint64 request_id = 1;
+  // Batch verdict: VALID only if every cell verified.
+  VerifyStatus status = 2;
+  ethswarm.common.v1.Error err = 3;
+}
+
+message VerifyKzgRequest {
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    VerifyKzgRequestBody body = 2;
+  }
+}
+
+message VerifyKzgResponse {
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    VerifyKzgResponseBody body = 2;
+  }
+}
+
+// Finalized registry entries start_index .. start_index + count. start_index must equal cl-verify's
+// current high-water mark; a gap or an overlap is ERROR_CODE_CONTRACT_VIOLATION. Never sends past the
+// finalized registry length.
+// One rule for restart and lag: cl-verify reports its high-water mark first (PubkeyFeedResponseBody
+// right after its hello), and cl-chain resends from there.
+message PubkeyFeedRequestBody {
+  uint64 start_index = 1;
+  // Must equal len(pubkeys); a mismatch is ERROR_CODE_CONTRACT_VIOLATION.
+  uint64 count = 2;
+  // 48 bytes each, compressed G1; cl-verify decompresses and key_validates once on append.
+  // SIZE CAP (Vera): max count per frame = ___ .
+  repeated bytes pubkeys = 3;
+}
+
+message PubkeyFeedResponseBody {
+  // Entries cl-verify holds (next expected start_index). Sent once right after hello, then after every append.
+  uint64 high_water = 1;
+  ethswarm.common.v1.Error err = 2;
+}
+
+message PubkeyFeedRequest {
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    PubkeyFeedRequestBody body = 2;
+  }
+}
+
+message PubkeyFeedResponse {
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    PubkeyFeedResponseBody body = 2;
+  }
+}
+
+service VerifyService {
+  rpc VerifyBls(stream VerifyBlsRequest) returns (stream VerifyBlsResponse);
+  rpc VerifyKzg(stream VerifyKzgRequest) returns (stream VerifyKzgResponse);
+  rpc PubkeyFeed(stream PubkeyFeedRequest) returns (stream PubkeyFeedResponse);
+}

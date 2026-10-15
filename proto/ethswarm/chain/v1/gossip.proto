@@ -1,0 +1,130 @@
+syntax = "proto3";
+
+package ethswarm.chain.v1;
+
+import "ethswarm/common/v1/envelope.proto";
+import "ethswarm/common/v1/fork.proto";
+import "ethswarm/common/v1/verdict.proto";
+
+// Served by cl-chain, called by cl-p2p.
+// Topic list per specs/fulu/p2p-interface.md and specs/gloas/p2p-interface.md (v1.7.0-beta.4).
+enum Topic {
+  TOPIC_UNSPECIFIED = 0;
+  TOPIC_BEACON_BLOCK = 1;
+  TOPIC_BEACON_AGGREGATE_AND_PROOF = 2;
+  TOPIC_BEACON_ATTESTATION = 3;
+  TOPIC_VOLUNTARY_EXIT = 4;
+  TOPIC_PROPOSER_SLASHING = 5;
+  TOPIC_ATTESTER_SLASHING = 6;
+  TOPIC_SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF = 7;
+  TOPIC_SYNC_COMMITTEE = 8;
+  TOPIC_BLS_TO_EXECUTION_CHANGE = 9;
+  TOPIC_DATA_COLUMN_SIDECAR = 10;
+  TOPIC_EXECUTION_PAYLOAD = 11;
+  TOPIC_PAYLOAD_ATTESTATION_MESSAGE = 12;
+  TOPIC_EXECUTION_PAYLOAD_BID = 13;
+  TOPIC_PROPOSER_PREFERENCES = 14;
+  TOPIC_LIGHT_CLIENT_FINALITY_UPDATE = 15;
+  TOPIC_LIGHT_CLIENT_OPTIMISTIC_UPDATE = 16;
+}
+
+message GossipMessage {
+  // Gossipsub message-id, 20 bytes (compute_message_id in p2p-interface.md).
+  bytes message_id = 1;
+  Topic topic = 2;
+  // Attestation, sync-committee or data-column subnet; 0 for global topics.
+  uint32 subnet_id = 3;
+  ethswarm.common.v1.PeerId propagation_source = 4;
+  ethswarm.common.v1.Envelope payload = 5;
+  uint64 received_unix_ms = 6;
+}
+
+message GossipVerdict {
+  // 20 bytes, echoes GossipMessage.message_id.
+  bytes message_id = 1;
+  ethswarm.common.v1.Verdict verdict = 2;
+  // Rule that fired, e.g. "gloas/execution_payload_bid: REJECT bad signature". Max 256 bytes (operational: the longest spec rule id plus a short reason fits). Receiver truncates, never changes the verdict because of it.
+  string reason = 3;
+}
+
+message ValidateRequest {
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    // Batched: up to 256 messages or 2 ms, whichever first.
+    ValidateBatch batch = 2;
+  }
+}
+
+message ValidateBatch {
+  repeated GossipMessage messages = 1;
+}
+
+message ValidateResponse {
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    VerdictBatch verdicts = 2;
+  }
+}
+
+message VerdictBatch {
+  repeated GossipVerdict verdicts = 1;
+}
+
+message WatchPublishRequest {
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 1;
+}
+
+message WatchPublishResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    WatchPublishResponseBody body = 2;
+  }
+}
+
+message WatchPublishResponseBody {
+  Topic topic = 1;
+  uint32 subnet_id = 2;
+  ethswarm.common.v1.Envelope payload = 3;
+}
+
+message WatchSubscriptionsRequest {
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 1;
+}
+
+message WatchSubscriptionsResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    WatchSubscriptionsResponseBody body = 2;
+  }
+}
+
+message WatchSubscriptionsResponseBody {
+  repeated uint32 attnets = 1;
+  repeated uint32 syncnets = 2;
+  repeated uint64 custody_columns = 3;
+  // Each 4 bytes. Includes the next digest ahead of a fork or BPO boundary.
+  repeated bytes fork_digests = 4;
+}
+
+message GetForkScheduleRequest {}
+
+message GetForkScheduleResponse {
+  ethswarm.common.v1.ForkSchedule schedule = 1;
+}
+
+service GossipService {
+  // Bidi, ordered per topic. Missed deadline (default 500 ms) => p2p applies VERDICT_IGNORE.
+  rpc Validate(stream ValidateRequest) returns (stream ValidateResponse);
+  // Core-originated messages for p2p to publish.
+  rpc WatchPublish(WatchPublishRequest) returns (stream WatchPublishResponse);
+  rpc WatchSubscriptions(WatchSubscriptionsRequest) returns (stream WatchSubscriptionsResponse);
+  rpc GetForkSchedule(GetForkScheduleRequest) returns (GetForkScheduleResponse);
+}

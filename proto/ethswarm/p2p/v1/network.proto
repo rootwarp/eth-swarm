@@ -1,0 +1,207 @@
+syntax = "proto3";
+
+package ethswarm.p2p.v1;
+
+import "ethswarm/common/v1/envelope.proto";
+import "ethswarm/common/v1/error.proto";
+
+// Served by cl-p2p; called by cl-sync and cl-chain for outbound peer requests.
+
+message PeerTarget {
+  // Empty => p2p picks a suitable peer.
+  ethswarm.common.v1.PeerId peer = 1;
+  uint32 timeout_ms = 2;
+}
+
+message ResponseChunk {
+  ethswarm.common.v1.PeerId peer = 1;
+  oneof result {
+    ethswarm.common.v1.Envelope chunk = 2;
+    ethswarm.common.v1.Error error = 3;
+  }
+}
+
+message PeerStatus {
+  // 4 bytes.
+  bytes fork_digest = 1;
+  ethswarm.common.v1.Checkpoint finalized = 2;
+  // 32 bytes.
+  bytes head_root = 3;
+  uint64 head_slot = 4;
+  uint64 earliest_available_slot = 5;
+}
+
+message PeerInfo {
+  ethswarm.common.v1.PeerId peer = 1;
+  PeerStatus status = 2;
+  uint64 custody_group_count = 3;
+  int32 score = 4;
+}
+
+message ListPeersRequest {}
+
+message ListPeersResponse {
+  repeated PeerInfo peers = 1;
+}
+
+// count <= MAX_REQUEST_BLOCKS_DENEB = 128.
+message RequestBlocksByRangeRequest {
+  PeerTarget target = 1;
+  uint64 start_slot = 2;
+  uint64 count = 3;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 4;
+}
+
+message RequestBlocksByRangeResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    RequestBlocksByRangeResponseBody body = 2;
+  }
+}
+
+message RequestBlocksByRangeResponseBody {
+  ResponseChunk item = 1;
+}
+
+// Each root 32 bytes; <= 128 roots.
+message RequestBlocksByRootRequest {
+  PeerTarget target = 1;
+  repeated bytes roots = 2;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 3;
+}
+
+message RequestBlocksByRootResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    RequestBlocksByRootResponseBody body = 2;
+  }
+}
+
+message RequestBlocksByRootResponseBody {
+  ResponseChunk item = 1;
+}
+
+// count * len(columns) <= MAX_REQUEST_DATA_COLUMN_SIDECARS = 16384.
+message RequestDataColumnsByRangeRequest {
+  PeerTarget target = 1;
+  uint64 start_slot = 2;
+  uint64 count = 3;
+  repeated uint64 columns = 4;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 5;
+}
+
+message RequestDataColumnsByRangeResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    RequestDataColumnsByRangeResponseBody body = 2;
+  }
+}
+
+message RequestDataColumnsByRangeResponseBody {
+  ResponseChunk item = 1;
+}
+
+message ColumnsIdentifier {
+  // 32 bytes.
+  bytes block_root = 1;
+  repeated uint64 columns = 2;
+}
+
+// Total columns <= MAX_REQUEST_DATA_COLUMN_SIDECARS = 16384.
+message RequestDataColumnsByRootRequest {
+  PeerTarget target = 1;
+  repeated ColumnsIdentifier ids = 2;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 3;
+}
+
+message RequestDataColumnsByRootResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    RequestDataColumnsByRootResponseBody body = 2;
+  }
+}
+
+message RequestDataColumnsByRootResponseBody {
+  ResponseChunk item = 1;
+}
+
+// Gloas. count <= MAX_REQUEST_PAYLOADS = 128.
+message RequestPayloadEnvelopesByRangeRequest {
+  PeerTarget target = 1;
+  uint64 start_slot = 2;
+  uint64 count = 3;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 4;
+}
+
+message RequestPayloadEnvelopesByRangeResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    RequestPayloadEnvelopesByRangeResponseBody body = 2;
+  }
+}
+
+message RequestPayloadEnvelopesByRangeResponseBody {
+  ResponseChunk item = 1;
+}
+
+// Gloas. Each root 32 bytes; <= MAX_REQUEST_PAYLOADS = 128 roots.
+message RequestPayloadEnvelopesByRootRequest {
+  PeerTarget target = 1;
+  repeated bytes roots = 2;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 3;
+}
+
+message RequestPayloadEnvelopesByRootResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    RequestPayloadEnvelopesByRootResponseBody body = 2;
+  }
+}
+
+message RequestPayloadEnvelopesByRootResponseBody {
+  ResponseChunk item = 1;
+}
+
+message ReportPeerRequest {
+  ethswarm.common.v1.PeerId peer = 1;
+  int32 delta = 2;
+  // Max 256 bytes (operational: short rule id for logs/metrics; never echoed to remote peers). Receiver truncates, does not fail.
+  string reason = 3;
+}
+
+message ReportPeerResponse {}
+
+service NetworkService {
+  rpc ListPeers(ListPeersRequest) returns (ListPeersResponse);
+  rpc RequestBlocksByRange(RequestBlocksByRangeRequest) returns (stream RequestBlocksByRangeResponse);
+  rpc RequestBlocksByRoot(RequestBlocksByRootRequest) returns (stream RequestBlocksByRootResponse);
+  rpc RequestDataColumnsByRange(RequestDataColumnsByRangeRequest) returns (stream RequestDataColumnsByRangeResponse);
+  rpc RequestDataColumnsByRoot(RequestDataColumnsByRootRequest) returns (stream RequestDataColumnsByRootResponse);
+  rpc RequestPayloadEnvelopesByRange(RequestPayloadEnvelopesByRangeRequest) returns (stream RequestPayloadEnvelopesByRangeResponse);
+  rpc RequestPayloadEnvelopesByRoot(RequestPayloadEnvelopesByRootRequest) returns (stream RequestPayloadEnvelopesByRootResponse);
+  rpc ReportPeer(ReportPeerRequest) returns (ReportPeerResponse);
+}

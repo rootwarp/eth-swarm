@@ -1,0 +1,34 @@
+# Pinned test-vector archives. Every sha256 below was verified on 2026-10-15 by downloading
+# the file and running sha256sum. Each matched GitHub's release-asset digest.
+# For ssz-specs, it also matched the upstream .sha256 file.
+
+[[source]]
+name = "consensus-specs"
+repo = "ethereum/consensus-specs"
+tag  = "v1.7.0-beta.4"   # published 2026-10-08T19:27:03Z
+
+  [[source.asset]]
+  file   = "general.tar.gz"   # 3,228 bytes; contains only tests/general/altair/bls/eth_* cases
+  sha256 = "c4f395f71f606c28093500e32067990e430cc73a2277be6f3bf5090adcce3f67"
+
+  [[source.asset]]
+  file   = "minimal.tar.gz"   # 468,730,308 bytes
+  sha256 = "26d09aea70c62ed235a120a95082d544ab1c2e6fe36bd35ea1bd5da62f3b7b68"
+
+  [[source.asset]]
+  file   = "mainnet.tar.gz"   # 967,886,924 bytes
+  sha256 = "67762986572372a08d3b182535aa760433c86e174e14e0bbd756f350dd19398c"
+
+  [[source.asset]]
+  file     = "comptests.tar.gz"   # 313,252,208 bytes; content not yet reviewed
+  sha256   = "ccb3149d29e4179e852499f1a3d121424dbac22745375908cd9059350aece746"
+  optional = true
+
+[[source]]
+name = "ssz-specs"
+repo = "ethereum/ssz-specs"
+tag  = "v0.1.0"
+
+  [[source.asset]]
+  file   = "ssz-test-vectors-v0.1.0.tar.gz"   # 22,574 bytes; JSON fixtures under fixtures/ssz/
+  sha256 = "e2a65f032b59835c26127295293ea1bc07d7ca0ea1fe0e4f1128dffed333f878"

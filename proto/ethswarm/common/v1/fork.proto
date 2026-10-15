@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package ethswarm.common.v1;
+
+enum ForkName {
+  FORK_NAME_UNSPECIFIED = 0;
+  FORK_NAME_FULU = 1;
+  FORK_NAME_GLOAS = 2;
+}
+
+// One digest epoch. From Fulu on, compute_fork_digest mixes in blob parameters
+// (specs/fulu/beacon-chain.md), so a new entry appears at every BPO epoch, not only at forks.
+message ForkScheduleEntry {
+  uint64 epoch = 1;
+  // 4 bytes (ForkDigest).
+  bytes fork_digest = 2;
+  ForkName fork = 3;
+  // 4 bytes (Version).
+  bytes fork_version = 4;
+  uint64 max_blobs_per_block = 5;
+}
+
+message ForkSchedule {
+  // 32 bytes (Root).
+  bytes genesis_validators_root = 1;
+  repeated ForkScheduleEntry entries = 2;
+}
+
+// One blob-parameter-only (BPO) entry from the chain config BLOB_SCHEDULE.
+message BlobScheduleEntry {
+  uint64 epoch = 1;
+  uint64 max_blobs_per_block = 2;
+}
+
+// Spec pin of a build, e.g. consensus_specs_tag "v1.7.0-beta.4", ssz_specs_tag "v0.1.0".
+message SpecPin {
+  string consensus_specs_tag = 1;
+  string ssz_specs_tag = 2;
+}

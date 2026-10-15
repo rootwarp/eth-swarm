@@ -1,0 +1,96 @@
+syntax = "proto3";
+
+package ethswarm.discv5.v1;
+
+import "ethswarm/common/v1/envelope.proto";
+
+// Served by cl-discv5; called by cl-p2p.
+
+message Enr {
+  // "enr:..." text form; ENR max 300 bytes encoded (EIP-778), text max 512 bytes.
+  string text = 1;
+}
+
+message PeerCandidate {
+  Enr enr = 1;
+  string peer_id = 2;
+  repeated string multiaddrs = 3;
+  uint64 custody_group_count = 4;
+  // 4 bytes, ENR "nfd" field (specs/fulu/p2p-interface.md).
+  bytes next_fork_digest = 5;
+}
+
+message WatchPeersRequest {
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 1;
+}
+
+message WatchPeersResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    WatchPeersResponseBody body = 2;
+  }
+}
+
+message WatchPeersResponseBody {
+  PeerCandidate candidate = 1;
+}
+
+message FindPeersRequest {
+  repeated uint32 attnets = 1;
+  repeated uint32 syncnets = 2;
+  repeated uint64 custody_columns = 3;
+  uint32 target = 4;
+  // 4 bytes.
+  bytes fork_digest = 5;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 6;
+}
+
+message FindPeersResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    FindPeersResponseBody body = 2;
+  }
+}
+
+message FindPeersResponseBody {
+  PeerCandidate candidate = 1;
+}
+
+message UpdateEnrRequest {
+  // ENRForkID SSZ, 16 bytes ("eth2" field).
+  bytes eth2 = 1;
+  // 8 bytes.
+  bytes attnets = 2;
+  // 1 byte.
+  bytes syncnets = 3;
+  uint64 cgc = 4;
+  // 4 bytes.
+  bytes nfd = 5;
+  uint32 tcp_port = 6;
+  uint32 quic_port = 7;
+}
+
+message UpdateEnrResponse {
+  Enr enr = 1;
+}
+
+message GetLocalEnrRequest {}
+
+message GetLocalEnrResponse {
+  Enr enr = 1;
+}
+
+service DiscoveryService {
+  rpc WatchPeers(WatchPeersRequest) returns (stream WatchPeersResponse);
+  rpc FindPeers(FindPeersRequest) returns (stream FindPeersResponse);
+  rpc UpdateEnr(UpdateEnrRequest) returns (UpdateEnrResponse);
+  rpc GetLocalEnr(GetLocalEnrRequest) returns (GetLocalEnrResponse);
+}

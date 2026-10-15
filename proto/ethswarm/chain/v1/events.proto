@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package ethswarm.chain.v1;
+
+import "ethswarm/common/v1/envelope.proto";
+
+// Served by cl-chain; consumed by cl-api (SSE), cl-store, cl-sync, cl-p2p.
+// seq is strictly increasing and gap-free per chain process; cl-store applies HEAD/FINALIZED events in seq order.
+
+enum EventKind {
+  EVENT_KIND_UNSPECIFIED = 0;
+  EVENT_KIND_HEAD = 1;
+  EVENT_KIND_BLOCK = 2;
+  EVENT_KIND_FINALIZED_CHECKPOINT = 3;
+  EVENT_KIND_CHAIN_REORG = 4;
+  EVENT_KIND_EXECUTION_PAYLOAD = 5;
+  EVENT_KIND_PAYLOAD_ATTESTATION = 6;
+  EVENT_KIND_DATA_COLUMN_SIDECAR = 7;
+  EVENT_KIND_FORK_SCHEDULE = 8;
+}
+
+message SubscribeRequest {
+  repeated EventKind kinds = 1;
+  // Resume after this sequence number; a gap means the client must resync via QueryService (chain) or store.v1.StoreService.
+  uint64 resume_from_seq = 2;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 3;
+}
+
+message SubscribeResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    SubscribeResponseBody body = 2;
+  }
+}
+
+message SubscribeResponseBody {
+  uint64 seq = 1;
+  EventKind kind = 2;
+  uint64 slot = 3;
+  // 32 bytes.
+  bytes root = 4;
+  // beacon-APIs event JSON. Max 64 KiB (65536 bytes). beacon-APIs eventstream payloads carry roots/slots/small objects; full blocks/states are fetched by root, never pushed. Oversize events are dropped with a metric (subscribers re-query by root).
+  bytes data_json = 5;
+  bool optimistic = 6;
+}
+
+service EventsService {
+  // Slow consumers are dropped; chain never blocks on them.
+  rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
+}

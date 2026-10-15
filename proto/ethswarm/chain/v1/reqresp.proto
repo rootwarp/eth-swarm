@@ -1,0 +1,188 @@
+syntax = "proto3";
+
+package ethswarm.chain.v1;
+
+import "ethswarm/common/v1/envelope.proto";
+import "ethswarm/common/v1/error.proto";
+
+// Served by cl-chain, called by cl-p2p to answer inbound peer requests.
+// cl-p2p may serve finalized ranges directly from its read-only MDBX handle.
+
+message ResponseChunk {
+  oneof result {
+    ethswarm.common.v1.Envelope chunk = 1;
+    ethswarm.common.v1.Error error = 2;
+  }
+}
+
+message GetStatusRequest {}
+
+// Status v2 (specs/fulu/p2p-interface.md).
+message GetStatusResponse {
+  // 4 bytes.
+  bytes fork_digest = 1;
+  ethswarm.common.v1.Checkpoint finalized = 2;
+  // 32 bytes.
+  bytes head_root = 3;
+  uint64 head_slot = 4;
+  uint64 earliest_available_slot = 5;
+}
+
+message GetMetadataRequest {}
+
+// GetMetaData v3 (specs/fulu/p2p-interface.md).
+message GetMetadataResponse {
+  uint64 seq_number = 1;
+  // Bitvector[ATTESTATION_SUBNET_COUNT=64], 8 bytes.
+  bytes attnets = 2;
+  // Bitvector[SYNC_COMMITTEE_SUBNET_COUNT=4], 1 byte.
+  bytes syncnets = 3;
+  uint64 custody_group_count = 4;
+}
+
+// BeaconBlocksByRange v2. count <= MAX_REQUEST_BLOCKS_DENEB = 128.
+message BlocksByRangeRequest {
+  uint64 start_slot = 1;
+  uint64 count = 2;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 3;
+}
+
+message BlocksByRangeResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    BlocksByRangeResponseBody body = 2;
+  }
+}
+
+message BlocksByRangeResponseBody {
+  ResponseChunk item = 1;
+}
+
+// BeaconBlocksByRoot v2. Each root 32 bytes; <= MAX_REQUEST_BLOCKS_DENEB = 128 roots.
+message BlocksByRootRequest {
+  repeated bytes roots = 1;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 2;
+}
+
+message BlocksByRootResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    BlocksByRootResponseBody body = 2;
+  }
+}
+
+message BlocksByRootResponseBody {
+  ResponseChunk item = 1;
+}
+
+// DataColumnSidecarsByRange v1. count * len(columns) <= MAX_REQUEST_DATA_COLUMN_SIDECARS = 16384.
+message DataColumnsByRangeRequest {
+  uint64 start_slot = 1;
+  uint64 count = 2;
+  repeated uint64 columns = 3;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 4;
+}
+
+message DataColumnsByRangeResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    DataColumnsByRangeResponseBody body = 2;
+  }
+}
+
+message DataColumnsByRangeResponseBody {
+  ResponseChunk item = 1;
+}
+
+message DataColumnsByRootIdentifier {
+  // 32 bytes.
+  bytes block_root = 1;
+  repeated uint64 columns = 2;
+}
+
+// DataColumnSidecarsByRoot v1. Total columns <= MAX_REQUEST_DATA_COLUMN_SIDECARS = 16384.
+message DataColumnsByRootRequest {
+  repeated DataColumnsByRootIdentifier ids = 1;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 2;
+}
+
+message DataColumnsByRootResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    DataColumnsByRootResponseBody body = 2;
+  }
+}
+
+message DataColumnsByRootResponseBody {
+  ResponseChunk item = 1;
+}
+
+// ExecutionPayloadEnvelopesByRange v1 (Gloas). count <= MAX_REQUEST_PAYLOADS = 128.
+message PayloadEnvelopesByRangeRequest {
+  uint64 start_slot = 1;
+  uint64 count = 2;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 3;
+}
+
+message PayloadEnvelopesByRangeResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    PayloadEnvelopesByRangeResponseBody body = 2;
+  }
+}
+
+message PayloadEnvelopesByRangeResponseBody {
+  ResponseChunk item = 1;
+}
+
+// ExecutionPayloadEnvelopesByRoot v1 (Gloas). Each root 32 bytes; <= MAX_REQUEST_PAYLOADS = 128 roots.
+message PayloadEnvelopesByRootRequest {
+  repeated bytes roots = 1;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 2;
+}
+
+message PayloadEnvelopesByRootResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    PayloadEnvelopesByRootResponseBody body = 2;
+  }
+}
+
+message PayloadEnvelopesByRootResponseBody {
+  ResponseChunk item = 1;
+}
+
+service ReqRespService {
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc GetMetadata(GetMetadataRequest) returns (GetMetadataResponse);
+  rpc BlocksByRange(BlocksByRangeRequest) returns (stream BlocksByRangeResponse);
+  rpc BlocksByRoot(BlocksByRootRequest) returns (stream BlocksByRootResponse);
+  rpc DataColumnsByRange(DataColumnsByRangeRequest) returns (stream DataColumnsByRangeResponse);
+  rpc DataColumnsByRoot(DataColumnsByRootRequest) returns (stream DataColumnsByRootResponse);
+  rpc PayloadEnvelopesByRange(PayloadEnvelopesByRangeRequest) returns (stream PayloadEnvelopesByRangeResponse);
+  rpc PayloadEnvelopesByRoot(PayloadEnvelopesByRootRequest) returns (stream PayloadEnvelopesByRootResponse);
+}

@@ -1,0 +1,50 @@
+# Skip list for the spec-vector runner. The runner FAILS on any handler that is neither
+# executed nor matched by an entry here. It also fails on an entry past its expiry date,
+# and on an entry that matches nothing (stale).
+#
+# Fields:
+#   source    "consensus-specs" | "ssz-specs"                       (required)
+#   fork      e.g. "fulu", "gloas"; "*" = any                       (required)
+#   preset    "minimal" | "mainnet" | "general" | "*"               (required)
+#   runner    e.g. "operations", "fork_choice"                      (required)
+#   handler   e.g. "payload_attestation"; "*" = whole runner        (required)
+#   case      glob over case names; omit = all cases                (optional)
+#   reason    why it is skipped                                     (required)
+#   owner     team member responsible                               (required)
+#   issue     tracking issue URL or ID                              (required)
+#   expires   YYYY-MM-DD; after this date the entry fails CI        (required)
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "*"
+handler = "*"
+case    = "*"
+reason  = "EXAMPLE ONLY: pre-Fulu forks are out of scope (DECISIONS 2026-10-15: Fulu and Gloas only). Narrow this to the real fork names."
+owner   = "ian"
+issue   = "TBD"
+expires = "2026-12-31"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "minimal"
+runner  = "fork_choice"
+handler = "on_payload_attestation_message"   # real handler at v1.7.0-beta.4 minimal/gloas/fork_choice
+case    = "*_ptc_*"
+reason  = "EXAMPLE: PTC fork-choice handling not implemented yet"
+owner   = "tess"
+issue   = "TBD"
+expires = "2026-11-15"
+
+[[skip]]
+source  = "ssz-specs"
+fork    = "*"
+preset  = "*"
+runner  = "ssz"
+handler = "test_progressive_containers"   # real handler: fixtures/ssz/ssz/test_progressive_containers
+reason  = "EXAMPLE: progressive containers (EIP-7916/7495) not supported by our SSZ crate yet"
+owner   = "ian"
+issue   = "TBD"
+expires = "2026-11-30"

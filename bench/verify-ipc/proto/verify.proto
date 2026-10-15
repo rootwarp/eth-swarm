@@ -1,0 +1,19 @@
+syntax = "proto3";
+package ethswarm.benchverify.v1;
+
+message SigSet {
+  oneof key {
+    uint64 validator_index = 1; // mode A: server-side pubkey cache
+    bytes pubkey = 2;           // mode B: 48 B compressed G1 inline
+  }
+  bytes signing_root = 3;       // 32 B
+  bytes signature = 4;          // 96 B compressed G2
+}
+message VerifyBatchRequest { repeated SigSet sets = 1; bool verify = 2; bool resolve = 3; }
+message VerifyBatchResponse { bool valid = 1; uint32 count = 2; }
+message BlobBatch { bytes payload = 1; }
+
+service Verify {
+  rpc VerifyBatch(VerifyBatchRequest) returns (VerifyBatchResponse);
+  rpc Echo(BlobBatch) returns (VerifyBatchResponse);
+}

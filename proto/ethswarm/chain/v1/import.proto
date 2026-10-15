@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+package ethswarm.chain.v1;
+
+import "ethswarm/common/v1/envelope.proto";
+import "ethswarm/common/v1/error.proto";
+
+// Served by cl-chain, called by cl-sync.
+
+message BootstrapRequest {
+  // Weak-subjectivity BeaconState (Fulu or Gloas only). SSZ max 1 GiB (1073741824 bytes), operational and configurable. No spec bound applies (VALIDATOR_REGISTRY_LIMIT = 2**40 is not a practical bound). Measured 2026-10-15: Hoodi finalized (Fulu) state 234,500,681 B with 1,664,885 validators; Sepolia (Gloas) 3,600,008 B with 2,088 validators and 7 builders. 1 GiB = 4.58x Hoodi; registry growth <= MAX_PENDING_DEPOSITS_PER_EPOCH (16/epoch, electra/beacon-chain.md) means about 4.6 years to reach it (see arch/review-vera.md section 4). Must be sent as a chunked stream (<= MAX_PAYLOAD_SIZE = 10485760 bytes per chunk, phase0/p2p-interface.md); state root must match the trusted checkpoint before use (fail closed).
+  ethswarm.common.v1.Envelope state = 1;
+  ethswarm.common.v1.Envelope block = 2;
+  // Gloas: SignedExecutionPayloadEnvelope of the anchor block, if any.
+  ethswarm.common.v1.Envelope payload_envelope = 3;
+}
+
+message BootstrapResponse {
+  SyncStatus status = 1;
+}
+
+message ImportBatchRequest {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    ImportBatchRequestBody body = 2;
+  }
+}
+
+message ImportBatchRequestBody {
+  // Idempotency key, max 32 bytes.
+  bytes batch_id = 1;
+  repeated ethswarm.common.v1.Envelope blocks = 2;
+  repeated ethswarm.common.v1.Envelope payload_envelopes = 3;
+  repeated ethswarm.common.v1.Envelope data_columns = 4;
+  // Below the checkpoint anchor: verify by parent-root chain only.
+  bool backfill = 5;
+}
+
+message ImportBatchResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    ImportBatchResponseBody body = 2;
+  }
+}
+
+message ImportBatchResponseBody {
+  // Max 32 bytes.
+  bytes batch_id = 1;
+  uint64 imported = 2;
+  ethswarm.common.v1.Error error = 3;
+  // 32 bytes, empty on success.
+  bytes failed_root = 4;
+  // Credits granted for further batches (backpressure).
+  uint32 credits = 5;
+}
+
+message SyncStatus {
+  uint64 head_slot = 1;
+  // 32 bytes.
+  bytes head_root = 2;
+  ethswarm.common.v1.Checkpoint finalized = 3;
+  uint64 anchor_slot = 4;
+  bool optimistic = 5;
+  bool el_offline = 6;
+}
+
+// optimistic: chain owns optimistic status (from engine.v1 PayloadStatus).
+message GetChainStatusRequest {}
+
+message GetChainStatusResponse {
+  SyncStatus status = 1;
+}
+
+service ImportService {
+  rpc Bootstrap(BootstrapRequest) returns (BootstrapResponse);
+  rpc ImportBatch(stream ImportBatchRequest) returns (stream ImportBatchResponse);
+  rpc GetChainStatus(GetChainStatusRequest) returns (GetChainStatusResponse);
+}

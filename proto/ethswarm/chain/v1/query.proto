@@ -1,0 +1,168 @@
+syntax = "proto3";
+
+package ethswarm.chain.v1;
+
+import "ethswarm/common/v1/envelope.proto";
+import "ethswarm/common/v1/error.proto";
+
+// Served by cl-chain, called by cl-api for fork-choice and duty endpoints only.
+// Plain block/state/column/envelope reads moved to ethswarm.store.v1.StoreService.
+
+message QueryResult {
+  ethswarm.common.v1.Envelope ssz = 1;
+  // JSON body for API responses. Max 16 MiB (16777216 bytes), operational. Larger results (full validator lists, full states) must use SSZ via a chunked stream or a paginated query; cl-api returns HTTP 413/paginates rather than buffering.
+  bytes json = 2;
+  bool execution_optimistic = 3;
+  bool finalized = 4;
+}
+
+message GetForkChoiceRequest {}
+
+message GetForkChoiceResponse {
+  QueryResult result = 1;
+}
+
+enum DutyKind {
+  DUTY_KIND_UNSPECIFIED = 0;
+  DUTY_KIND_ATTESTER = 1;
+  DUTY_KIND_PROPOSER = 2;
+  DUTY_KIND_SYNC = 3;
+  DUTY_KIND_PTC = 4;
+}
+
+message GetDutiesRequest {
+  DutyKind kind = 1;
+  uint64 epoch = 2;
+  repeated uint64 indices = 3;
+}
+
+message GetDutiesResponse {
+  QueryResult result = 1;
+  // 32 bytes. Dependent root of the duties (beacon-APIs `dependent_root`).
+  bytes dependent_root = 2;
+  ethswarm.common.v1.ReadStamp stamp = 3;
+}
+
+enum ProduceKind {
+  PRODUCE_KIND_UNSPECIFIED = 0;
+  PRODUCE_KIND_BLOCK = 1;
+  PRODUCE_KIND_ATTESTATION_DATA = 2;
+  PRODUCE_KIND_PAYLOAD_ATTESTATION_DATA = 3;
+  PRODUCE_KIND_AGGREGATE = 4;
+  PRODUCE_KIND_SYNC_CONTRIBUTION = 5;
+}
+
+message ProduceRequest {
+  ProduceKind kind = 1;
+  uint64 slot = 2;
+  // Kind-specific params (randao reveal 96 bytes, graffiti 32 bytes, etc.), JSON. Max 4 KiB (4096 bytes). Largest known fields are randao_reveal (96 bytes) and graffiti (32 bytes) plus a handful of flags; 4 KiB is >10x headroom. Oversize = CONTRACT_VIOLATION, no production.
+  bytes params = 3;
+}
+
+message ProduceResponse {
+  QueryResult result = 1;
+}
+
+message SubmitRequest {
+  // Each item's Envelope.payload_type selects the pool, e.g. PAYLOAD_TYPE_ATTESTATION,
+  // PAYLOAD_TYPE_SIGNED_VOLUNTARY_EXIT; the SSZ schema is chosen by (payload_type, fork of slot).
+  repeated ethswarm.common.v1.Envelope items = 1;
+}
+
+message SubmitOk {}
+
+message SubmitItemResult {
+  // Exactly one is set; neither set is a contract error.
+  oneof result {
+    SubmitOk ok = 1;
+    ethswarm.common.v1.Error err = 2;
+  }
+}
+
+message SubmitResponse {
+  // One entry per submitted item, same order.
+  repeated SubmitItemResult results = 2;
+  reserved 1;
+  reserved "errors";
+}
+
+message HotStateId {
+  oneof id {
+    // "head" | "justified" (served from chain's in-memory state cache).
+    string named = 1;
+    // Unfinalized slot on the canonical chain.
+    uint64 slot = 2;
+    // 32 bytes. Unfinalized block root or state root.
+    bytes root = 3;
+  }
+}
+
+message GetHotStateRequest {
+  HotStateId state = 1;
+}
+
+message GetHotStateResponse {
+  // PAYLOAD_TYPE_BEACON_STATE. SSZ max: TODO(vera) (no spec bound; set an operational cap).
+  ethswarm.common.v1.Envelope state = 1;
+  ethswarm.common.v1.ReadStamp stamp = 2;
+}
+
+message GetStateSummaryRequest {
+  HotStateId state = 1;
+}
+
+message GetStateSummaryResponse {
+  uint64 slot = 1;
+  // 32 bytes each.
+  bytes state_root = 2;
+  bytes block_root = 3;
+  ethswarm.common.v1.Checkpoint justified = 4;
+  ethswarm.common.v1.Checkpoint finalized = 5;
+  ethswarm.common.v1.ReadStamp stamp = 6;
+}
+
+message GetHotValidatorsRequest {
+  HotStateId state = 1;
+  repeated uint64 indices = 2;
+}
+
+message GetHotValidatorsResponse {
+  // SSZ List[Validator] subset in request order; per-element 121 bytes.
+  ethswarm.common.v1.Envelope validators = 1;
+  repeated uint64 balances = 2;
+  ethswarm.common.v1.ReadStamp stamp = 3;
+}
+
+message GetHotCommitteesRequest {
+  HotStateId state = 1;
+  uint64 epoch = 2;
+  // Include the Gloas payload timeliness committees for the epoch's slots.
+  bool include_ptc = 3;
+}
+
+message Committee {
+  uint64 slot = 1;
+  uint64 index = 2;
+  repeated uint64 validators = 3;
+}
+
+message GetHotCommitteesResponse {
+  repeated Committee committees = 1;
+  repeated Committee ptc = 2;
+  // 32 bytes. Shuffling dependent root; consumers re-fetch when it changes.
+  bytes dependent_root = 3;
+  ethswarm.common.v1.ReadStamp stamp = 4;
+}
+
+service QueryService {
+  rpc GetForkChoice(GetForkChoiceRequest) returns (GetForkChoiceResponse);
+  // Hot (unfinalized / head) reads served by the single writer; exact, never one write behind.
+  rpc GetHotState(GetHotStateRequest) returns (GetHotStateResponse);
+  rpc GetStateSummary(GetStateSummaryRequest) returns (GetStateSummaryResponse);
+  rpc GetHotValidators(GetHotValidatorsRequest) returns (GetHotValidatorsResponse);
+  rpc GetHotCommittees(GetHotCommitteesRequest) returns (GetHotCommitteesResponse);
+  rpc GetDuties(GetDutiesRequest) returns (GetDutiesResponse);
+  // Deadline bound to slot timing; never queued behind other queries.
+  rpc Produce(ProduceRequest) returns (ProduceResponse);
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+}

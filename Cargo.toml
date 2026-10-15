@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/spec-tests", "crates/cl-verify-cache", "crates/cl-chain-columns"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+rust-version = "1.88"
+
+[workspace.dependencies]
+ethereum_ssz = "0.10"
+ethereum_ssz_derive = "0.10"
+ssz_types = "0.14"
+tree_hash = "0.12"
+tree_hash_derive = "0.12"
+milhouse = { version = "0.9", default-features = false }
+alloy-primitives = "1"
+typenum = "1"
+
+# Pinned to the exact revisions Lighthouse `unstable` uses (see arch/ssz-crate-check.md).
+# Progressive SSZ types (EIP-7916/7495-successor/8016) are only on these git revisions, not on crates.io.
+[patch.crates-io]
+ethereum_ssz = { git = "https://github.com/sigp/ethereum_ssz", rev = "974f78f421fbf70cba4e8f84e0fa28c23ad54f34" }
+ethereum_ssz_derive = { git = "https://github.com/sigp/ethereum_ssz", rev = "974f78f421fbf70cba4e8f84e0fa28c23ad54f34" }
+ssz_types = { git = "https://github.com/sigp/ssz_types", rev = "8955d22edc7633f26fe3b5ac933facb5121d717a" }
+tree_hash = { git = "https://github.com/sigp/tree_hash", rev = "e5ea1875edddf12438506c3751cbb313f9c52d08" }
+tree_hash_derive = { git = "https://github.com/sigp/tree_hash", rev = "e5ea1875edddf12438506c3751cbb313f9c52d08" }
+milhouse = { git = "https://github.com/sigp/milhouse", rev = "d67aabd2a7c405b3c16f4aaff159b137dc5b5e38" }
