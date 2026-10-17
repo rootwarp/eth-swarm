@@ -687,6 +687,8 @@ name = "cl-chain-columns"
 version = "0.1.0"
 dependencies = [
  "libmdbx",
+ "mdbx-sys",
+ "proptest",
  "tempfile",
  "thiserror",
 ]

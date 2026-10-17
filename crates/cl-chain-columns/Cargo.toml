@@ -7,8 +7,12 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-libmdbx = "0.5"
+# MPL-2.0, unmodified. Builds the native mdbx-sys 12.13.2. Exact pin: bumps need a dependency review.
+libmdbx = "=0.5.6"
 thiserror = "2"
 
 [dev-dependencies]
+# Same crate libmdbx links; tests read env flags and options straight from the C API.
+mdbx-sys = "=12.13.2"
+proptest = "1"
 tempfile = "3"
