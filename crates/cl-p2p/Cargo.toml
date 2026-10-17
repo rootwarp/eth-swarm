@@ -5,14 +5,30 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "cl-p2p: the ethswarm.p2p.v1 service (stub: contract layer only, every RPC answers UNIMPLEMENTED)."
+description = "cl-p2p: the ethswarm.p2p.v1 service (stub: contract layer only, every RPC answers UNIMPLEMENTED), the outbound req/resp codec and the pinned-peer m2a-session."
 
 [dependencies]
 ethswarm-proto = { path = "../ethswarm-proto" }
 ipc = { path = "../ipc" }
-libp2p.workspace = true
+p2p-wire = { path = "../p2p-wire" }
+consensus-types = { path = "../consensus-types" }
+# secp256k1: Ethereum node keys are secp256k1 (the peer ID must map to a discv5 node ID).
+libp2p = { workspace = true, features = ["secp256k1"] }
 libp2p-mplex.workspace = true
 tonic.workspace = true
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+rustix = { version = "1", features = ["fs", "process"] }
+thiserror = "2"
+# Wipes the node-key bytes read from a key file on every path.
+zeroize = "1"
 
 [dev-dependencies]
 ipc = { path = "../ipc", features = ["testkit"] }
+p2p-wire = { path = "../p2p-wire", features = ["testkit"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }
+tempfile = "3"
+ethereum_ssz.workspace = true
+bs58 = "0.5"

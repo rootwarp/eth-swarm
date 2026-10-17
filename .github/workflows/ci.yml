@@ -110,6 +110,8 @@ jobs:
         run: cargo check -p cl-chain --all-targets --locked
       - name: No dependency cycles among workspace crates (cargo metadata, every edge kind)
         run: bash scripts/tests/check-dep-cycles.test.sh && bash scripts/check-dep-cycles.sh
+      - name: m2a-session links no discv5 (one pinned peer, no discovery)
+        run: bash scripts/tests/check-m2a-deps.test.sh && bash scripts/check-m2a-deps.sh
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Fetch and verify spec vectors (uncached)
         run: PRESETS="general minimal" bash testing/fetch-vectors.sh

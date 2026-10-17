@@ -17,6 +17,7 @@ members = [
     "crates/cl-store",
     "crates/cl-engine",
     "crates/cl-p2p",
+    "crates/p2p-wire",
     "crates/cl-discv5",
     "crates/cl-sync",
     "crates/cl-api",

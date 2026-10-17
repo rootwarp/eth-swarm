@@ -4,6 +4,12 @@
 //! discipline, `seq`, envelope type and digest checks) and then answers `UNIMPLEMENTED`, so the
 //! service already holds its peers to the wire contract. `tests/contract.rs` runs the contract
 //! suite against it, in process and over a Unix socket.
+//!
+//! [`rpc`] is the outbound req/resp codec over libp2p `request_response`, and [`m2a_session`]
+//! the pinned-peer session the `m2a-session` binary runs.
+
+pub mod m2a_session;
+pub mod rpc;
 
 use ethswarm_proto::p2p as pb;
 use ipc::Link;
