@@ -9,6 +9,7 @@ members = [
     "crates/consensus-types",
     "crates/crypto-kzg",
     "crates/crypto-bls",
+    "crates/cl-verify",
 ]
 
 [workspace.package]

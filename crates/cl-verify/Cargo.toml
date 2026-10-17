@@ -1,0 +1,30 @@
+[package]
+name = "cl-verify"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "cl-verify: the ethswarm.verify.v1 gRPC server (BLS batch and KZG cell-proof checks, pubkey feed)."
+
+[dependencies]
+cl-verify-cache = { path = "../cl-verify-cache" }
+blst = "0.3.17"
+crypto-kzg = { path = "../crypto-kzg" }
+tonic = "0.12.3"
+prost = "0.13.5"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+rand = "0.8"
+hex = "0.4"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+tempfile = "3"
+tower = "0.4"
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+[build-dependencies]
+tonic-build = "0.12.3"

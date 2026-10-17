@@ -59,6 +59,28 @@ for mode in "${modes[@]}"; do
   printf '[features]\nx = ["c-kzg/ethereum_kzg_settings"]\n' >> "$root/crates/crypto-kzg/Cargo.toml"
   check fail "[$m] embedded settings feature in Cargo.toml" "$root" "$mode"
 
+  root=$(fixture "other-crate-$m" "$clean_tree" 0)
+  mkdir -p "$root/crates/cl-verify/src"
+  printf 'use c_kzg::ethereum_kzg_settings;\n' > "$root/crates/cl-verify/src/kzg.rs"
+  check fail "[$m] embedded settings in another crate" "$root" "$mode"
+
+  root=$(fixture "raw-loader-other-crate-$m" "$clean_tree" 0)
+  mkdir -p "$root/crates/cl-verify/src"
+  printf 'fn f() { KzgSettings::load_trusted_setup(a, b, c, 0); }\n' > "$root/crates/cl-verify/src/kzg.rs"
+  check fail "[$m] raw c-kzg loader in another crate" "$root" "$mode"
+
+  root=$(fixture "raw-loader-setup-rs-$m" "$clean_tree" 0)
+  printf 'fn f() { KzgSettings::load_trusted_setup(a, b, c, 0); }\n' > "$root/crates/crypto-kzg/src/setup.rs"
+  check pass "[$m] raw c-kzg loader in crypto-kzg/src/setup.rs is the one allowed call" "$root" "$mode"
+
+  root=$(fixture "raw-loader-crypto-kzg-other-$m" "$clean_tree" 0)
+  printf 'fn f() { KzgSettings::load_trusted_setup(a, b, c, 0); }\n' > "$root/crates/crypto-kzg/src/cells.rs"
+  check fail "[$m] raw c-kzg loader elsewhere in crypto-kzg" "$root" "$mode"
+
+  root=$(fixture "setup-rs-file-loader-$m" "$clean_tree" 0)
+  printf 'fn f() { KzgSettings::load_trusted_setup_file(p, 0); }\n' > "$root/crates/crypto-kzg/src/setup.rs"
+  check fail "[$m] text-format file loader in setup.rs is still forbidden" "$root" "$mode"
+
   root=$(fixture "hidden-$m" "$clean_tree" 0)
   printf 'ethereum_kzg_settings\n' > "$root/crates/crypto-kzg/.hidden"
   printf '.hidden\n' > "$root/crates/crypto-kzg/.gitignore"
