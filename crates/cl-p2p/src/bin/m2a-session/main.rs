@@ -1,33 +1,52 @@
-//! `m2a-session`: dial the pinned reference node (see `cl_p2p::m2a_session`).
+//! `m2a-session`: the pinned reference node's Status v2 probe (see `cl_p2p::m2a_session`).
 //!
 //! ```text
 //! m2a-session [--config <path>] [--dial-only | --print-peer-id] [--connect-timeout-secs <n>]
+//!             [--gate-file <path>]
 //! ```
 //!
 //! The config (`cl_p2p::m2a_session::config`, default `/etc/ethswarm/m2a-session.toml`) pins the
-//! peer, the deadlines and the node key. The pre-flight runs before anything else.
+//! peer, the reference API, the deadlines and the node key. The pre-flight runs before anything
+//! else.
 //!
-//! - default: dial the pinned peer and exit once it is connected.
+//! - default: the Status probe ([`probe`]). The pre-flight also requires a passing m2a fuzz
+//!   gate for the decoders this binary was built from ([`gate`]; `--gate-file`, default the
+//!   checkout's `fuzz/artifacts/m2a-gate.json`), and refuses before dialling without one. Then:
+//!   dial, send our Status v2 at the pinned Sepolia fork digest, judge the peer's against the
+//!   reference beacon API ([`reference_api`]), hold the connection and send a second Status.
+//!   One JSON line on stdout records it all.
 //! - `--dial-only`: dial, check the pinned peer ID (Noise XX, then yamux), disconnect, exit.
-//!   No req/resp traffic.
+//!   No req/resp traffic, so no response decoder runs and no fuzz gate is needed.
 //! - `--print-peer-id`: print the node key's peer ID on stdout and exit, without dialling, so
 //!   the operator can list it as a trusted peer on the reference node. Needs `node_key`.
 //!
-//! Exit 0 on success, 1 if the dial fails or times out, 2 on bad arguments, a refused config or
-//! a failed pre-flight.
+//! Exit 0 on success (every probe verdict passed), 1 if the dial, the exchange or a verdict
+//! fails, 2 on bad arguments, a refused config or a failed pre-flight.
 
-use cl_p2p::m2a_session::config::{M2aConfig, DEFAULT_CONFIG_PATH};
+mod enr;
+mod gate;
+#[cfg(test)]
+mod mock_api;
+mod probe;
+mod reference_api;
+
+use cl_p2p::m2a_session::config::{M2aConfig, Network as SessionNetwork, DEFAULT_CONFIG_PATH};
 use cl_p2p::m2a_session::{preflight, KeySource, Preflight, Session, SessionError, Transport};
-use consensus_types::Mainnet;
+use consensus_types::{EthSpec, Mainnet};
+use gate::Expected;
+use network_config::digest::digest_schedule;
+use network_config::{ChainConfig, Network};
 use p2p_wire::rpc::codec::ContextTable;
+use probe::{Chain, Probe};
+use reference_api::ReferenceApi;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "usage: m2a-session [--config <path>] [--dial-only | --print-peer-id] \
-                     [--connect-timeout-secs <n>]";
+                     [--connect-timeout-secs <n>] [--gate-file <path>]";
 const EXIT_CONNECTED: u8 = 0;
 const EXIT_FAILED: u8 = 1;
 const EXIT_REFUSED: u8 = 2;
@@ -36,7 +55,7 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// What the run does once the pre-flight passed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    /// Dial and stay connected (the req/resp work follows in later sessions).
+    /// The Status probe.
     Session,
     /// Dial, check the pinned ID, disconnect.
     DialOnly,
@@ -49,13 +68,15 @@ struct Args {
     config: PathBuf,
     mode: Mode,
     connect_timeout: Duration,
+    gate_file: PathBuf,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
-    let (mut config, mut mode, mut connect_timeout) = (
+    let (mut config, mut mode, mut connect_timeout, mut gate_file) = (
         PathBuf::from(DEFAULT_CONFIG_PATH),
         Mode::Session,
         DEFAULT_CONNECT_TIMEOUT,
+        PathBuf::from(gate::DEFAULT_GATE_FILE),
     );
     let mut set_mode = |flag: &str, new| match mode {
         Mode::Session => {
@@ -70,6 +91,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
             "--config" => config = PathBuf::from(value()?),
+            "--gate-file" => gate_file = PathBuf::from(value()?),
             "--dial-only" => set_mode(&flag, Mode::DialOnly)?,
             "--print-peer-id" => set_mode(&flag, Mode::PrintPeerId)?,
             "--connect-timeout-secs" => {
@@ -85,7 +107,33 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         config,
         mode,
         connect_timeout,
+        gate_file,
     })
+}
+
+/// What a run takes from its environment, injected so tests can fix it.
+struct RunEnv {
+    /// What the fuzz gate file must hold for this build.
+    gate: Expected,
+    /// Unix milliseconds now.
+    now_ms: Box<dyn Fn() -> u128 + Send + Sync>,
+    /// How long the probe holds the connection.
+    hold: Duration,
+}
+
+impl RunEnv {
+    /// The embedded gate expectations, the system clock, [`probe::HOLD`].
+    fn production() -> Self {
+        Self {
+            gate: Expected::built(),
+            now_ms: Box::new(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis())
+            }),
+            hold: probe::HOLD,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -94,11 +142,49 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
     let euid = rustix::process::geteuid().as_raw();
-    ExitCode::from(run(std::env::args().skip(1), euid, &mut std::io::stdout()))
+    let env = RunEnv::production();
+    ExitCode::from(run(
+        std::env::args().skip(1),
+        euid,
+        &mut std::io::stdout(),
+        &env,
+    ))
+}
+
+/// The pinned chain of `network`, checked against the session's preset.
+fn chain(network: SessionNetwork) -> Result<Chain, String> {
+    let network = match network {
+        SessionNetwork::Sepolia => Network::Sepolia,
+    };
+    let config = ChainConfig::load(network).map_err(|e| format!("{network} config: {e}"))?;
+    if config.preset_base() != Mainnet::NAME {
+        return Err(format!(
+            "{network} is preset {}, the session runs {}",
+            config.preset_base(),
+            Mainnet::NAME
+        ));
+    }
+    let genesis = network
+        .genesis()
+        .ok_or_else(|| format!("no pinned genesis for {network}"))?;
+    Ok(Chain {
+        config,
+        genesis,
+        slots_per_epoch: Mainnet::slots_per_epoch(),
+    })
+}
+
+/// Every digest of the schedule, from Fulu on.
+fn context_table(chain: &Chain) -> ContextTable {
+    let mut table = ContextTable::new();
+    for entry in digest_schedule(&chain.config, &chain.genesis.genesis_validators_root) {
+        table.insert(entry.fork_digest, entry.fork);
+    }
+    table
 }
 
 /// The whole run for `argv`, as effective UID `euid`, printing to `out`; returns the exit code.
-fn run(argv: impl Iterator<Item = String>, euid: u32, out: &mut dyn Write) -> u8 {
+fn run(argv: impl Iterator<Item = String>, euid: u32, out: &mut dyn Write, env: &RunEnv) -> u8 {
     let args = match parse_args(argv) {
         Ok(args) => args,
         Err(e) => {
@@ -138,6 +224,26 @@ fn run(argv: impl Iterator<Item = String>, euid: u32, out: &mut dyn Write) -> u8
             }
         };
     }
+    let probe_api = if args.mode == Mode::Session {
+        if let Err(e) = gate::check(&args.gate_file, &env.gate) {
+            tracing::error!(error = %e, "pre-flight refused: no passing m2a fuzz gate");
+            return EXIT_REFUSED;
+        }
+        let Some(url) = &config.reference_api_url else {
+            tracing::error!("config refused: the Status probe needs reference_api_url");
+            return EXIT_REFUSED;
+        };
+        Some(ReferenceApi::new(url, reference_api::REQUEST_TIMEOUT))
+    } else {
+        None
+    };
+    let chain = match chain(config.network) {
+        Ok(chain) => chain,
+        Err(e) => {
+            tracing::error!(error = %e, "pinned chain");
+            return EXIT_REFUSED;
+        }
+    };
     tracing::info!(
         network = ?config.network,
         reference_api = ?config.reference_api_url,
@@ -154,9 +260,7 @@ fn run(argv: impl Iterator<Item = String>, euid: u32, out: &mut dyn Write) -> u8
             return EXIT_FAILED;
         }
     };
-    // No fork digests yet: the live table comes from compute_fork_digest in later work, and no
-    // request that needs context bytes is sent before then.
-    let contexts = Arc::new(ContextTable::new());
+    let contexts = Arc::new(context_table(&chain));
     runtime.block_on(async {
         let mut session = match Session::<Mainnet>::start(
             key,
@@ -171,14 +275,32 @@ fn run(argv: impl Iterator<Item = String>, euid: u32, out: &mut dyn Write) -> u8
                 return EXIT_FAILED;
             }
         };
+        if let Some(api) = probe_api {
+            let probe = Probe {
+                chain: &chain,
+                now_ms: env.now_ms.as_ref(),
+                connect_timeout: args.connect_timeout,
+                hold: env.hold,
+            };
+            let report = probe::run(&mut session, &api, &probe).await;
+            if let Err(e) = writeln!(out, "{}", report.json_line()) {
+                tracing::error!(error = %e, "cannot write the session log line");
+                return EXIT_FAILED;
+            }
+            return if report.passed() {
+                tracing::info!("status probe passed");
+                EXIT_CONNECTED
+            } else {
+                tracing::error!(error = ?report.error, "status probe failed");
+                EXIT_FAILED
+            };
+        }
         let dial = async {
             session.connect().await?;
-            if args.mode == Mode::DialOnly {
-                session.disconnect().await?;
-                tracing::info!(
-                    "dial-only: the pinned peer proved its ID (Noise XX, yamux); disconnected"
-                );
-            }
+            session.disconnect().await?;
+            tracing::info!(
+                "dial-only: the pinned peer proved its ID (Noise XX, yamux); disconnected"
+            );
             Ok::<(), SessionError>(())
         };
         match tokio::time::timeout(args.connect_timeout, dial).await {
@@ -198,6 +320,12 @@ fn run(argv: impl Iterator<Item = String>, euid: u32, out: &mut dyn Write) -> u8
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gate::tests::{fixture_expected, passing_gate};
+    use crate::mock_api::{MockApi, Route};
+    use cl_p2p::testkit::{StatusPeer, StatusReply};
+    use consensus_types::primitives::{Root, Slot};
+    use p2p_wire::rpc::messages::StatusV2;
+    use serde_json::Value;
     use std::os::unix::fs::PermissionsExt;
 
     fn parse(args: &[&str]) -> Result<Args, String> {
@@ -210,20 +338,26 @@ mod tests {
         assert_eq!(a.config, PathBuf::from("/etc/ethswarm/m2a-session.toml"));
         assert_eq!(a.mode, Mode::Session);
         assert_eq!(a.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
+        assert_eq!(a.gate_file, PathBuf::from(gate::DEFAULT_GATE_FILE));
+        assert!(a.gate_file.ends_with("fuzz/artifacts/m2a-gate.json"));
         let a = parse(&[
             "--config",
             "/c.toml",
             "--dial-only",
             "--connect-timeout-secs",
             "3",
+            "--gate-file",
+            "/g.json",
         ])
         .unwrap();
         assert_eq!(a.config, PathBuf::from("/c.toml"));
         assert_eq!(a.mode, Mode::DialOnly);
         assert_eq!(a.connect_timeout, Duration::from_secs(3));
+        assert_eq!(a.gate_file, PathBuf::from("/g.json"));
         assert_eq!(parse(&["--print-peer-id"]).unwrap().mode, Mode::PrintPeerId);
         for bad in [
             &["--config"][..],
+            &["--gate-file"],
             &["--connect-timeout-secs", "x"],
             &["--listen", "x"],
             &["--peer", "/ip4/127.0.0.1/tcp/1"],
@@ -253,17 +387,20 @@ mod tests {
         format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", libp2p::PeerId::random())
     }
 
-    /// A config dir pinning `peer`, plus `extra` config lines.
-    fn config(peer: &str, extra: &str) -> (tempfile::TempDir, String) {
+    /// A config dir pinning `peer` and the reference API at `api`, plus `extra` config lines.
+    fn config_with_api(peer: &str, api: &str, extra: &str) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("m2a-session.toml");
         let text = format!(
-            "network = \"sepolia\"\npeer = \"{peer}\"\n\
-             reference_api_url = \"http://127.0.0.1:5052\"\n{extra}\n"
+            "network = \"sepolia\"\npeer = \"{peer}\"\nreference_api_url = \"{api}\"\n{extra}\n"
         );
         std::fs::write(&path, text).unwrap();
         let path = path.to_str().unwrap().to_owned();
         (dir, path)
+    }
+
+    fn config(peer: &str, extra: &str) -> (tempfile::TempDir, String) {
+        config_with_api(peer, "http://127.0.0.1:5052", extra)
     }
 
     /// A 0600 key file in `dir`.
@@ -278,9 +415,47 @@ mod tests {
         rustix::process::geteuid().as_raw()
     }
 
+    /// Epoch 353100: Gloas on the pinned Sepolia schedule, digest 0x669e6c11.
+    const EPOCH: u64 = 353_100;
+    const DIGEST: [u8; 4] = [0x66, 0x9e, 0x6c, 0x11];
+
+    /// 5 s into `epoch`.
+    fn ms_at(epoch: u64) -> u128 {
+        let genesis = Network::Sepolia.genesis().unwrap().genesis_time;
+        u128::from(genesis + epoch * 384) * 1000 + 5_000
+    }
+
+    fn now_ms() -> u128 {
+        ms_at(EPOCH)
+    }
+
+    /// A clock at `epochs[n]` on its `n`th reading; the last repeats.
+    fn clock(epochs: Vec<u64>) -> Box<dyn Fn() -> u128 + Send + Sync> {
+        let readings = std::sync::atomic::AtomicUsize::new(0);
+        Box::new(move || {
+            let n = readings.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ms_at(epochs[n.min(epochs.len() - 1)])
+        })
+    }
+
+    fn test_env() -> RunEnv {
+        RunEnv {
+            gate: Expected::Known(fixture_expected()),
+            now_ms: Box::new(now_ms),
+            hold: Duration::from_millis(300),
+        }
+    }
+
+    /// A passing gate file for the test key, in `dir`.
+    fn gate_file(dir: &tempfile::TempDir, gate: &Value) -> String {
+        let path = dir.path().join("m2a-gate.json");
+        std::fs::write(&path, gate.to_string()).unwrap();
+        path.to_str().unwrap().to_owned()
+    }
+
     fn run_quiet(args: &[&str], euid: u32) -> (u8, String) {
         let mut out = Vec::new();
-        let code = run(argv(args), euid, &mut out);
+        let code = run(argv(args), euid, &mut out, &test_env());
         (code, String::from_utf8(out).unwrap())
     }
 
@@ -305,16 +480,40 @@ mod tests {
             EXIT_REFUSED,
             "no key file"
         );
+        // The gate passes, but the reference API is not on loopback, or not plain HTTP.
+        let gate = gate_file(&dir, &passing_gate(&fixture_expected()));
+        for url in ["https://127.0.0.1:5052", "http://192.0.2.10:5052"] {
+            let (_dir, path) = config_with_api(&closed_port_peer(), url, "");
+            assert_eq!(
+                run_quiet(&["--config", &path, "--gate-file", &gate], 1000).0,
+                EXIT_REFUSED,
+                "{url}"
+            );
+        }
     }
 
     #[test]
     fn failed_dial_exits_1() {
         // Loopback only, to a port nothing listens on: no network contact.
-        let (_dir, path) = config(&closed_port_peer(), "");
-        assert_eq!(run_quiet(&["--config", &path], 1000).0, EXIT_FAILED);
+        let (dir, path) = config(&closed_port_peer(), "");
+        let gate = gate_file(&dir, &passing_gate(&fixture_expected()));
+        let (code, line) = run_quiet(&["--config", &path, "--gate-file", &gate], 1000);
+        assert_eq!(code, EXIT_FAILED);
+        let line: Value = serde_json::from_str(line.trim()).unwrap();
+        assert!(
+            line["error"].as_str().unwrap().starts_with("connect:"),
+            "{line}"
+        );
+        assert_eq!(line["pass"], false);
         let dial_only = ["--config", &path, "--dial-only"];
         assert_eq!(run_quiet(&dial_only, 1000).0, EXIT_FAILED);
-        let timeout = ["--config", &path, "--connect-timeout-secs", "0"];
+        let timeout = [
+            "--config",
+            &path,
+            "--connect-timeout-secs",
+            "0",
+            "--dial-only",
+        ];
         assert_eq!(run_quiet(&timeout, 1000).0, EXIT_FAILED);
     }
 
@@ -362,6 +561,599 @@ mod tests {
         let key = key_file(&dir);
         let (_keep, path) = config(&closed_port_peer(), &format!("node_key = \"{key}\""));
         let print = ["--config", &path, "--print-peer-id"];
-        assert_eq!(run(argv(&print), euid(), &mut Broken), EXIT_FAILED);
+        assert_eq!(
+            run(argv(&print), euid(), &mut Broken, &test_env()),
+            EXIT_FAILED
+        );
+    }
+
+    #[test]
+    fn context_table_has_every_schedule_digest() {
+        let chain = chain(SessionNetwork::Sepolia).unwrap();
+        let table = context_table(&chain);
+        use network_config::ForkName::{Fulu, Gloas};
+        for (digest, fork) in [
+            ([0x7e, 0x0d, 0x34, 0x47], Fulu),
+            ([0xfd, 0x32, 0xb6, 0x22], Fulu),
+            ([0x74, 0xd0, 0x14, 0x59], Fulu),
+            (DIGEST, Gloas),
+        ] {
+            assert_eq!(table.fork(&digest), Some(fork), "{digest:02x?}");
+        }
+        assert_eq!(table.fork(&[0; 4]), None);
+    }
+
+    // The Status probe against a loopback peer and a mock reference API.
+
+    fn root(b: u8) -> Root {
+        Root::repeat_byte(b)
+    }
+
+    /// The finalized checkpoints of the scenarios.
+    const F1: (u64, u8) = (353_000, 0xf1);
+    const F2: (u64, u8) = (353_001, 0xf2);
+    const F3: (u64, u8) = (353_002, 0xf3);
+    /// The API's head.
+    const HEAD_SLOT: Slot = 353_098 * 32 + 5;
+    const HEAD_ROOT: u8 = 0xaa;
+
+    fn finalized_slot(epoch: u64) -> Slot {
+        epoch * 32
+    }
+
+    /// A peer Status at `finalized` with its head `off` slots from the API's.
+    fn peer_status(finalized: (u64, u8), off: i64, eas: Slot) -> StatusV2 {
+        let head_slot = HEAD_SLOT.checked_add_signed(off).unwrap();
+        StatusV2 {
+            fork_digest: [0; 4],
+            finalized_root: root(finalized.1),
+            finalized_epoch: finalized.0,
+            head_root: root(head_byte(off)),
+            head_slot,
+            earliest_available_slot: eas,
+        }
+    }
+
+    fn head_byte(off: i64) -> u8 {
+        HEAD_ROOT.wrapping_add(off as u8)
+    }
+
+    struct Scenario {
+        /// The API's finalized checkpoint, per request.
+        finality: Vec<(u64, u8)>,
+        /// The peer's Status, per request (the digest is echoed).
+        peer: Vec<StatusV2>,
+        /// Close the connection after this many answers.
+        disconnect_after: Option<usize>,
+        /// The ENR the identity endpoint serves.
+        enr: &'static str,
+        /// The gate file.
+        gate: Value,
+        /// The epoch of the clock at each reading; the last repeats.
+        clock: Vec<u64>,
+    }
+
+    impl Scenario {
+        fn new(peer: StatusV2) -> Self {
+            Self {
+                finality: vec![F1],
+                peer: vec![peer],
+                disconnect_after: None,
+                enr: crate::enr::tests::ENR_GLOAS,
+                gate: passing_gate(&fixture_expected()),
+                clock: vec![EPOCH],
+            }
+        }
+    }
+
+    struct Outcome {
+        code: u8,
+        line: Option<Value>,
+        peer: StatusPeer,
+        api: MockApi,
+    }
+
+    impl Outcome {
+        fn verdict(&self, field: &str) -> bool {
+            let line = self.line.as_ref().expect("a log line");
+            line["verdicts"][field]["pass"]
+                .as_bool()
+                .unwrap_or_else(|| panic!("no verdict {field}: {line}"))
+        }
+
+        fn line(&self) -> &Value {
+            self.line.as_ref().expect("a log line")
+        }
+    }
+
+    async fn api_for(s: &Scenario) -> MockApi {
+        let pinned = Network::Sepolia.genesis().unwrap();
+        let mut routes = vec![
+            (
+                "/eth/v1/beacon/genesis".to_owned(),
+                Route::json(MockApi::genesis_json(
+                    pinned.genesis_time,
+                    Root::from(pinned.genesis_validators_root),
+                    [0x90, 0, 0, 0x69],
+                )),
+            ),
+            (
+                "/eth/v1/node/identity".to_owned(),
+                Route::json(MockApi::identity_json(s.enr)),
+            ),
+            (
+                "/eth/v1/beacon/states/head/finality_checkpoints".to_owned(),
+                Route::sequence(
+                    s.finality
+                        .iter()
+                        .map(|(e, r)| MockApi::finality_json(*e, root(*r)))
+                        .collect(),
+                ),
+            ),
+            (
+                "/eth/v1/beacon/headers/head".to_owned(),
+                Route::json(MockApi::header_json(root(HEAD_ROOT), HEAD_SLOT, true)),
+            ),
+        ];
+        for (epoch, r) in [F1, F2, F3] {
+            routes.push((
+                format!("/eth/v1/beacon/headers/{}", root(r)),
+                Route::json(MockApi::header_json(root(r), finalized_slot(epoch), true)),
+            ));
+        }
+        // The blocks the peers name as their head: canonical, at HEAD_SLOT + off.
+        for off in -3i64..=3 {
+            let slot = HEAD_SLOT.checked_add_signed(off).unwrap();
+            routes.push((
+                format!("/eth/v1/beacon/headers/{}", root(head_byte(off))),
+                Route::json(MockApi::header_json(root(head_byte(off)), slot, true)),
+            ));
+        }
+        MockApi::start(
+            routes
+                .iter()
+                .map(|(p, r)| (p.as_str(), r.clone()))
+                .collect(),
+        )
+        .await
+    }
+
+    /// Runs the binary's `run` against the scenario's peer and API.
+    async fn probe(s: Scenario) -> Outcome {
+        let statuses = s.peer.clone();
+        let peer = StatusPeer::spawn(
+            Box::new(move |req, n| {
+                StatusReply::Status(StatusV2 {
+                    fork_digest: req.fork_digest,
+                    ..statuses[n.min(statuses.len() - 1)].clone()
+                })
+            }),
+            s.disconnect_after,
+        )
+        .await;
+        probe_with_peer(s, peer).await
+    }
+
+    /// Runs the binary's `run` against `peer` and the scenario's API.
+    async fn probe_with_peer(s: Scenario, peer: StatusPeer) -> Outcome {
+        let api = api_for(&s).await;
+        let addr = format!("{}/p2p/{}", peer.addr, peer.id);
+        let (dir, path) = config_with_api(&addr, &api.url(), "");
+        let gate = gate_file(&dir, &s.gate);
+        let env = RunEnv {
+            now_ms: clock(s.clock.clone()),
+            ..test_env()
+        };
+        let (code, out) = tokio::task::spawn_blocking(move || {
+            std::thread::spawn(move || {
+                let _dir = dir;
+                let mut out = Vec::new();
+                let args = ["--config", &path, "--gate-file", &gate];
+                let code = run(argv(&args), 1000, &mut out, &env);
+                (code, String::from_utf8(out).unwrap())
+            })
+            .join()
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines.len() <= 1, "one JSON line at most: {out}");
+        let line = lines.first().map(|l| serde_json::from_str(l).unwrap());
+        Outcome {
+            code,
+            line,
+            peer,
+            api,
+        }
+    }
+
+    const FINALITY_PATH: &str = "/eth/v1/beacon/states/head/finality_checkpoints";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn matching_peer_passes() {
+        let eas = HEAD_SLOT - 100;
+        let out = probe(Scenario::new(peer_status(F1, 0, eas))).await;
+        assert_eq!(out.code, EXIT_CONNECTED, "{}", out.line());
+        assert_eq!(out.line()["pass"], true);
+        for field in probe::FIELDS {
+            assert!(out.verdict(field), "{field}: {}", out.line());
+        }
+        // Our Status: the computed digest, the API's finalized checkpoint and block.
+        let ours = &out.peer.requests()[0];
+        assert_eq!(ours.fork_digest, DIGEST);
+        assert_eq!(ours.finalized_root, root(F1.1));
+        assert_eq!(ours.finalized_epoch, F1.0);
+        assert_eq!(ours.head_root, root(F1.1));
+        assert_eq!(ours.head_slot, finalized_slot(F1.0));
+        assert_eq!(ours.earliest_available_slot, ours.head_slot);
+        // The first Status, then the second on the same connection.
+        assert_eq!(out.peer.requests().len(), 2);
+        assert_eq!(out.peer.connections(), 1);
+        assert_eq!(out.api.hits(FINALITY_PATH), 2, "sampled before and after");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn log_line_has_both_statuses_inputs_samples_and_verdicts() {
+        let eas = HEAD_SLOT - 100;
+        let out = probe(Scenario::new(peer_status(F1, 1, eas))).await;
+        let line = out.line();
+        assert_eq!(line["event"], "m2a-status");
+        assert_eq!(line["error"], Value::Null);
+        assert_eq!(line["ours"]["fork_digest"], "0x669e6c11");
+        assert_eq!(line["ours"]["finalized_epoch"], F1.0.to_string());
+        assert_eq!(line["peer"]["head_slot"], (HEAD_SLOT + 1).to_string());
+        assert_eq!(line["peer"]["earliest_available_slot"], eas.to_string());
+        assert_eq!(line["earliest_available_slot"], eas.to_string());
+        let inputs = &line["digest_inputs"];
+        assert_eq!(inputs["epoch"], EPOCH.to_string());
+        assert_eq!(inputs["fork"], "gloas");
+        assert_eq!(inputs["fork_version"], "0x90000076");
+        assert_eq!(inputs["blob_parameters"]["epoch"], "275712");
+        assert_eq!(inputs["blob_parameters"]["max_blobs_per_block"], "21");
+        assert_eq!(
+            inputs["genesis_validators_root"],
+            "0xd8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078"
+        );
+        assert_eq!(inputs["fork_digest"], "0x669e6c11");
+        assert_eq!(line["enr_fork_digest"], "0x669e6c11");
+        for sample in ["api_before", "api_after"] {
+            assert_eq!(line[sample]["finalized"]["epoch"], F1.0.to_string());
+            assert_eq!(line[sample]["head"]["slot"], HEAD_SLOT.to_string());
+            assert_eq!(
+                line[sample]["finalized_header"]["slot"],
+                finalized_slot(F1.0).to_string()
+            );
+        }
+        assert_eq!(line["finality_reruns"], 0);
+        let verdicts = line["verdicts"].as_object().unwrap();
+        let mut names: Vec<&str> = verdicts.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        let mut want = probe::FIELDS.to_vec();
+        want.sort_unstable();
+        assert_eq!(names, want);
+        for v in verdicts.values() {
+            assert!(v["pass"].is_boolean() && v["detail"].is_string(), "{v}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finalized_mismatch_fails() {
+        let out = probe(Scenario::new(peer_status(F2, 0, HEAD_SLOT))).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        assert!(!out.verdict("finalized_root"));
+        assert!(!out.verdict("finalized_epoch"));
+        assert!(out.verdict("head_slot") && out.verdict("fork_digest"));
+        assert_eq!(out.line()["pass"], false);
+        // Only the epoch differs: still a failure, exact match only.
+        let wrong_epoch = StatusV2 {
+            finalized_epoch: F1.0 + 1,
+            ..peer_status(F1, 0, HEAD_SLOT)
+        };
+        let out = probe(Scenario::new(wrong_epoch)).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        assert!(out.verdict("finalized_root"));
+        assert!(!out.verdict("finalized_epoch"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn head_2_slots_off_passes() {
+        for off in [-2, 2] {
+            let out = probe(Scenario::new(peer_status(F1, off, HEAD_SLOT - 10))).await;
+            assert_eq!(out.code, EXIT_CONNECTED, "{off}: {}", out.line());
+            assert!(out.verdict("head_slot") && out.verdict("head_root"));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn head_3_slots_off_fails() {
+        for off in [-3, 3] {
+            let out = probe(Scenario::new(peer_status(F1, off, 0))).await;
+            assert_eq!(out.code, EXIT_FAILED, "{off}");
+            assert!(!out.verdict("head_slot"));
+            assert!(out.verdict("head_root"), "the block itself is known");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn head_root_unknown_or_at_another_slot_fails() {
+        let unknown = StatusV2 {
+            head_root: root(0x01),
+            ..peer_status(F1, 0, 0)
+        };
+        let out = probe(Scenario::new(unknown)).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        assert!(!out.verdict("head_root"));
+        assert!(out.verdict("head_slot"));
+        // The head root of HEAD_SLOT + 1, claimed at HEAD_SLOT.
+        let elsewhere = StatusV2 {
+            head_root: root(head_byte(1)),
+            ..peer_status(F1, 0, 0)
+        };
+        let out = probe(Scenario::new(elsewhere)).await;
+        assert!(!out.verdict("head_root"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finality_moved_reruns_once() {
+        // Finality moves between the first two samples: the exchange runs again with a Status
+        // built from the newer checkpoint, and the peer (now at F2) matches it.
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.finality = vec![F1, F2, F2];
+        s.peer = vec![peer_status(F1, 0, 0), peer_status(F2, 0, 0)];
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_CONNECTED, "{}", out.line());
+        assert_eq!(out.line()["finality_reruns"], 1);
+        let requests = out.peer.requests();
+        assert_eq!(requests[0].finalized_root, root(F1.1));
+        assert_eq!(requests[1].finalized_root, root(F2.1));
+        assert_eq!(requests[1].finalized_epoch, F2.0);
+        // First, re-run, then the second Status of the connection check.
+        assert_eq!(requests.len(), 3);
+        assert_eq!(out.api.hits(FINALITY_PATH), 3);
+        assert_eq!(
+            out.line()["api_before"]["finalized"]["epoch"],
+            F2.0.to_string()
+        );
+
+        // Finality moves again during the re-run: the check fails, no third exchange.
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.finality = vec![F1, F2, F3];
+        s.peer = vec![peer_status(F1, 0, 0), peer_status(F2, 0, 0)];
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        assert_eq!(out.line()["finality_reruns"], 1);
+        assert!(!out.verdict("finalized_root") && !out.verdict("finalized_epoch"));
+        let detail = out.line()["verdicts"]["finalized_root"]["detail"]
+            .as_str()
+            .unwrap();
+        assert!(detail.contains("moved again"), "{detail}");
+        assert_eq!(out.api.hits(FINALITY_PATH), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn eas_equal_head_passes() {
+        let out = probe(Scenario::new(peer_status(F1, 1, HEAD_SLOT + 1))).await;
+        assert_eq!(out.code, EXIT_CONNECTED, "{}", out.line());
+        assert!(out.verdict("earliest_available_slot"));
+        assert_eq!(
+            out.line()["earliest_available_slot"],
+            (HEAD_SLOT + 1).to_string()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn eas_above_head_fails() {
+        let out = probe(Scenario::new(peer_status(F1, 0, HEAD_SLOT + 1))).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        assert!(!out.verdict("earliest_available_slot"));
+        assert_eq!(
+            out.line()["earliest_available_slot"],
+            (HEAD_SLOT + 1).to_string()
+        );
+        for field in ["fork_digest", "finalized_root", "head_slot", "connection"] {
+            assert!(out.verdict(field), "{field}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn status_then_disconnect_fails() {
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.disconnect_after = Some(1);
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        assert!(!out.verdict("connection"));
+        for field in ["fork_digest", "finalized_root", "head_slot", "head_root"] {
+            assert!(out.verdict(field), "{field}");
+        }
+        assert_eq!(
+            out.peer.requests().len(),
+            1,
+            "no second Status reached the peer"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn second_status_after_a_digest_boundary_sends_the_new_digest() {
+        // The exchange runs in the last Fulu epoch; the hold crosses GLOAS_FORK_EPOCH. A peer
+        // on the new fork answers the second Status with the Gloas digest, which is only ours
+        // if the second Status is built afresh.
+        const BPO2: [u8; 4] = [0x74, 0xd0, 0x14, 0x59];
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.clock = vec![353_023, 353_024];
+        s.enr = crate::enr::tests::ENR_BPO2;
+        let statuses = [
+            StatusV2 {
+                fork_digest: BPO2,
+                ..peer_status(F1, 0, 0)
+            },
+            StatusV2 {
+                fork_digest: DIGEST,
+                ..peer_status(F1, 0, 0)
+            },
+        ];
+        let peer = StatusPeer::spawn(
+            Box::new(move |_, n| StatusReply::Status(statuses[n.min(1)].clone())),
+            None,
+        )
+        .await;
+        let out = probe_with_peer(s, peer).await;
+        assert_eq!(out.code, EXIT_CONNECTED, "{}", out.line());
+        assert!(out.verdict("connection"));
+        let requests = out.peer.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].fork_digest, BPO2);
+        assert_eq!(
+            requests[1].fork_digest, DIGEST,
+            "the second Status is rebuilt"
+        );
+        assert_eq!(out.line()["digest_inputs"]["epoch"], "353023");
+    }
+
+    /// Runs `args` (after `--config <config>`) on a runtime-free thread.
+    async fn run_off_runtime(config: String, args: Vec<String>, env: RunEnv) -> (u8, String) {
+        tokio::task::spawn_blocking(move || {
+            std::thread::spawn(move || {
+                let mut out = Vec::new();
+                let mut all = vec!["--config".to_owned(), config];
+                all.extend(args);
+                let code = run(all.into_iter(), 1000, &mut out, &env);
+                (code, String::from_utf8(out).unwrap())
+            })
+            .join()
+            .unwrap()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A config pinning `peer` with no `reference_api_url`.
+    fn config_without_api(peer: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m2a-session.toml");
+        std::fs::write(&path, format!("network = \"sepolia\"\npeer = \"{peer}\"\n")).unwrap();
+        let path = path.to_str().unwrap().to_owned();
+        (dir, path)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dial_only_needs_no_reference_api_url() {
+        let peer = StatusPeer::echoing(peer_status(F1, 0, 0)).await;
+        let (_dir, path) = config_without_api(&format!("{}/p2p/{}", peer.addr, peer.id));
+        let (code, _) = run_off_runtime(path, vec!["--dial-only".into()], test_env()).await;
+        assert_eq!(code, EXIT_CONNECTED);
+        assert_eq!(peer.connections(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_without_reference_api_url_is_refused() {
+        let peer = StatusPeer::echoing(peer_status(F1, 0, 0)).await;
+        let (dir, path) = config_without_api(&format!("{}/p2p/{}", peer.addr, peer.id));
+        let gate = gate_file(&dir, &passing_gate(&fixture_expected()));
+        let (code, out) = run_off_runtime(path, vec!["--gate-file".into(), gate], test_env()).await;
+        assert_eq!(code, EXIT_REFUSED);
+        assert!(out.is_empty(), "refused before the session: {out}");
+        assert_eq!(peer.connections(), 0, "refused before dialling");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enr_digest_mismatch_fails() {
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.enr = crate::enr::tests::ENR_BPO2;
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        assert!(!out.verdict("enr_fork_digest"));
+        assert!(out.verdict("fork_digest"));
+        assert_eq!(out.line()["enr_fork_digest"], "0x74d01459");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gate_file_required() {
+        let missing = Scenario::new(peer_status(F1, 0, 0));
+        let mut stale = Scenario::new(peer_status(F1, 0, 0));
+        stale.gate["decoder_key"]["git"]["crates/p2p-wire"] = Value::from("0".repeat(40));
+        let mut short = Scenario::new(peer_status(F1, 0, 0));
+        short.gate["targets"][2]["seconds"] = Value::from(3599);
+        let mut crashed = Scenario::new(peer_status(F1, 0, 0));
+        crashed.gate["targets"][0]["crashes"] = Value::from(1);
+        missing_gate_refused(missing).await;
+        for s in [stale, short, crashed] {
+            let out = probe(s).await;
+            assert_eq!(out.code, EXIT_REFUSED);
+            assert!(out.line.is_none(), "refused before the session");
+            assert_eq!(out.peer.connections(), 0, "refused before dialling");
+            assert!(out.api.seen().is_empty(), "and before the API");
+        }
+    }
+
+    async fn missing_gate_refused(s: Scenario) {
+        let peer = StatusPeer::echoing(s.peer[0].clone()).await;
+        let addr = format!("{}/p2p/{}", peer.addr, peer.id);
+        let (dir, path) = config(&addr, "");
+        let gate = dir.path().join("no-gate.json");
+        let gate = gate.to_str().unwrap().to_owned();
+        let code = tokio::task::spawn_blocking(move || {
+            std::thread::spawn(move || {
+                let args = ["--config", path.as_str(), "--gate-file", gate.as_str()];
+                run(argv(&args), 1000, &mut Vec::new(), &test_env())
+            })
+            .join()
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, EXIT_REFUSED);
+        assert_eq!(peer.connections(), 0);
+        // A build without a decoder key refuses even a passing gate file.
+        let (dir, path) = config(&addr, "");
+        let gate = gate_file(&dir, &passing_gate(&fixture_expected()));
+        let env = RunEnv {
+            gate: Expected::Unavailable("fuzz/src is not in HEAD".into()),
+            ..test_env()
+        };
+        let code = tokio::task::spawn_blocking(move || {
+            std::thread::spawn(move || {
+                let args = ["--config", path.as_str(), "--gate-file", gate.as_str()];
+                run(argv(&args), 1000, &mut Vec::new(), &env)
+            })
+            .join()
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, EXIT_REFUSED);
+        assert_eq!(peer.connections(), 0);
+        drop(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn genesis_mismatch_stops_before_the_exchange() {
+        let s = Scenario::new(peer_status(F1, 0, 0));
+        let peer = StatusPeer::echoing(s.peer[0].clone()).await;
+        let api = MockApi::start(vec![(
+            "/eth/v1/beacon/genesis",
+            Route::json(MockApi::genesis_json(1, root(9), [0x90, 0, 0, 0x69])),
+        )])
+        .await;
+        let addr = format!("{}/p2p/{}", peer.addr, peer.id);
+        let (dir, path) = config_with_api(&addr, &api.url(), "");
+        let gate = gate_file(&dir, &passing_gate(&fixture_expected()));
+        let (code, out) = tokio::task::spawn_blocking(move || {
+            std::thread::spawn(move || {
+                let mut out = Vec::new();
+                let args = ["--config", path.as_str(), "--gate-file", gate.as_str()];
+                (run(argv(&args), 1000, &mut out, &test_env()), out)
+            })
+            .join()
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, EXIT_FAILED);
+        let line: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(line["verdicts"]["genesis"]["pass"], false);
+        assert!(line["error"].as_str().unwrap().contains("genesis"));
+        assert!(peer.requests().is_empty(), "no Status sent");
+        drop(dir);
     }
 }

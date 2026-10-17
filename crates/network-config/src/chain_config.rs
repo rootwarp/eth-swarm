@@ -76,6 +76,39 @@ impl Network {
     }
 }
 
+/// A network's genesis: what `compute_fork_digest` and the slot clock need beyond the config.
+///
+/// Neither value is in `config.yaml`: `genesis_time` and `genesis_validators_root` are fields
+/// of the genesis state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Genesis {
+    /// `genesis_time`, Unix seconds.
+    pub genesis_time: u64,
+    /// `genesis_validators_root`.
+    pub genesis_validators_root: [u8; 32],
+}
+
+impl Network {
+    /// The pinned genesis, or `None` where none is pinned yet (Hoodi).
+    ///
+    /// **Unverified constants.** The Sepolia values are written from memory, not taken from a
+    /// pinned file: `genesis_time` 1655733600 (2022-06-20 14:00:00 UTC, which is
+    /// `MIN_GENESIS_TIME + GENESIS_DELAY` of the pinned config) and the genesis validators root
+    /// below. `m2a-session` checks both against the reference node's `/eth/v1/beacon/genesis`
+    /// before it sends a Status, and refuses to go on if either differs.
+    pub const fn genesis(self) -> Option<Genesis> {
+        match self {
+            Network::Sepolia => Some(Genesis {
+                genesis_time: 1_655_733_600,
+                genesis_validators_root: hex32(
+                    "d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078",
+                ),
+            }),
+            Network::Hoodi => None,
+        }
+    }
+}
+
 impl fmt::Display for Network {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
@@ -418,6 +451,20 @@ mod tests {
             let got: [u8; 32] = Sha256::digest(n.embedded_config()).into();
             assert_eq!(got, n.pinned().sha256, "{n}");
         }
+    }
+
+    #[test]
+    fn sepolia_genesis_time_is_min_genesis_time_plus_delay() {
+        // A consistency check of the unverified constant, not a proof: Sepolia started exactly
+        // GENESIS_DELAY after MIN_GENESIS_TIME. The root is checked live (m2a-session).
+        let config = ChainConfig::load(Network::Sepolia).unwrap();
+        let field = |k| config.get(k).unwrap().parse::<u64>().unwrap();
+        let genesis = Network::Sepolia.genesis().unwrap();
+        assert_eq!(
+            genesis.genesis_time,
+            field("MIN_GENESIS_TIME") + field("GENESIS_DELAY")
+        );
+        assert_eq!(Network::Hoodi.genesis(), None);
     }
 
     #[test]

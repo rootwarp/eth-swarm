@@ -19,7 +19,8 @@
 //!   its subscriber) captures every log line of a session and checks that no key material is
 //!   in it.
 //! - **Req/resp**: one outbound-only [`request_response`] behaviour per protocol
-//!   ([`crate::rpc`]). Later work sends Status, MetaData, Ping and BlocksByRange on them.
+//!   ([`crate::rpc`]). Status goes out through [`crate::rpc::outbound::status`]; later work
+//!   sends MetaData, Ping and BlocksByRange.
 
 pub mod config;
 
@@ -286,6 +287,19 @@ impl<E: EthSpec> SessionBehaviour<E> {
             metadata: rpc(Protocol::MetaDataV3),
             ping: rpc(Protocol::PingV1),
             blocks_by_range: rpc(Protocol::BlocksByRangeV2),
+        }
+    }
+}
+
+impl<E: EthSpec> crate::rpc::outbound::StatusRpc<E> for SessionBehaviour<E> {
+    fn status_rpc(&mut self) -> &mut request_response::Behaviour<RpcCodec<E>> {
+        &mut self.status
+    }
+
+    fn status_event(event: SessionBehaviourEvent<E>) -> Option<crate::rpc::outbound::RpcEvent<E>> {
+        match event {
+            SessionBehaviourEvent::Status(e) => Some(e),
+            _ => None,
         }
     }
 }

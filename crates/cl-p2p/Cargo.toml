@@ -6,18 +6,26 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 description = "cl-p2p: the ethswarm.p2p.v1 service (stub: contract layer only, every RPC answers UNIMPLEMENTED), the outbound req/resp codec and the pinned-peer m2a-session."
+# build.rs embeds what the m2a fuzz gate must hold for the decoders it is built from.
+build = "build.rs"
+
+[features]
+# Fixtures for this crate's tests: a loopback libp2p peer that answers Status v2.
+testkit = []
 
 [dependencies]
 ethswarm-proto = { path = "../ethswarm-proto" }
 ipc = { path = "../ipc" }
 p2p-wire = { path = "../p2p-wire" }
 consensus-types = { path = "../consensus-types" }
+# compute_fork_digest and the pinned Sepolia config, for the Status the session sends.
+network-config = { path = "../network-config" }
 # secp256k1: Ethereum node keys are secp256k1 (the peer ID must map to a discv5 node ID).
 libp2p = { workspace = true, features = ["secp256k1"] }
 libp2p-mplex.workspace = true
 tonic.workspace = true
 futures = "0.3"
-tokio = { version = "1", features = ["rt", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 rustix = { version = "1", features = ["fs", "process"] }
@@ -27,13 +35,27 @@ zeroize = "1"
 # The m2a-session config (/etc/ethswarm/m2a-session.toml); the same versions svc-runtime uses.
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-# Only `http::Uri`, to check reference_api_url; already in the tree through tonic.
+# `http::Uri` checks reference_api_url. The reference beacon API client is hyper 1 over plain
+# TCP (localhost or an SSH tunnel); the same versions svc-runtime and cl-sync use, all already
+# in the tree through tonic.
 http = "1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+# Beacon API JSON, the m2a fuzz gate file and the session's JSON log line.
+serde_json = "1"
+# base64url of the reference node's ENR (`/eth/v1/node/identity`); already in the tree through
+# multiaddr.
+data-encoding = "2"
 
 [dev-dependencies]
+cl-p2p = { path = ".", features = ["testkit"] }
 ipc = { path = "../ipc", features = ["testkit"] }
+# The mock reference beacon API: plain HTTP/1.1 on 127.0.0.1.
+hyper = { version = "1", features = ["server", "http1"] }
 p2p-wire = { path = "../p2p-wire", features = ["testkit"] }
-tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "net", "test-util"] }
 tempfile = "3"
 ethereum_ssz.workspace = true
 bs58 = "0.5"

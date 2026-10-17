@@ -3,7 +3,7 @@
 //! ```toml
 //! network = "sepolia"                                   # the only network accepted
 //! peer = "/ip4/192.0.2.10/tcp/9000/p2p/16Uiu2HAm…"      # the reference node, its peer ID pinned
-//! reference_api_url = "http://192.0.2.10:5052"          # its beacon API
+//! reference_api_url = "http://127.0.0.1:5052"           # its beacon API, on loopback
 //! node_key = "/var/lib/m2a-session/node.key"            # optional: absent means ephemeral
 //! trusted_by_reference = true                           # optional (false): see below
 //!
@@ -17,9 +17,14 @@
 //!   A list (`peer = [..]`, `[[peer]]`), even of one, is refused, as is a second key or field
 //!   naming another peer. The multiaddr is `/ip4|ip6/<addr>/tcp/<port>/p2p/<peer id>`
 //!   ([`PinnedPeer`]); the peer ID is what Noise must prove, so a dial to anyone else fails.
-//! - **`reference_api_url`**: `http://` or `https://`, a host, an optional port (1..=65535) and
-//!   base path, and no credentials, query or fragment. It may still carry a key in its path, so
-//!   errors never quote it and `Debug` shows `scheme://host:port` only.
+//! - **`reference_api_url`** (optional: `--dial-only` never uses it, the Status probe requires
+//!   it): `http://`, a loopback host (`localhost`, `127.0.0.0/8` or
+//!   `[::1]`), an optional port (1..=65535) and base path, and no credentials, query or
+//!   fragment. The API's answers decide the verdicts, and plaintext over any other path could be
+//!   forged by anyone on it, so a remote node is reached through an SSH tunnel to a local port
+//!   (`ssh -L 5052:127.0.0.1:5052 ref-host`). This is the only place the rule lives: a
+//!   [`ReferenceApiUrl`] exists only once it passed. The URL may still carry a key in its path,
+//!   so errors never quote it and `Debug` shows `scheme://host:port` only.
 //! - **`deadlines`**: milliseconds, each positive; `ttfb_ms` and `per_chunk_ms` at most
 //!   `total_ms`, and `total_ms` at most [`MAX_DEADLINE`], the `request_response` backstop
 //!   ([`crate::rpc::REQUEST_TIMEOUT`]), so the configured total is the one that applies.
@@ -63,15 +68,9 @@ impl ReferenceApiUrl {
         &self.0
     }
 
-    /// The explicit port, else 443 for `https` and 80 for `http`.
-    fn port(&self) -> u16 {
-        self.0
-            .port_u16()
-            .unwrap_or(if self.0.scheme() == Some(&http::uri::Scheme::HTTPS) {
-                443
-            } else {
-                80
-            })
+    /// The explicit port, else 80.
+    pub fn port(&self) -> u16 {
+        self.0.port_u16().unwrap_or(80)
     }
 }
 
@@ -96,8 +95,8 @@ pub struct M2aConfig {
     pub network: Network,
     /// The reference node: the peer ID Noise must prove and the one address dialed.
     pub peer: PinnedPeer,
-    /// The reference node's beacon API.
-    pub reference_api_url: ReferenceApiUrl,
+    /// The reference node's beacon API: optional here, required by the Status probe.
+    pub reference_api_url: Option<ReferenceApiUrl>,
     /// The req/resp deadlines.
     pub deadlines: Deadlines,
     /// `node_key`: a credential file, or ephemeral when absent.
@@ -171,7 +170,7 @@ pub enum ConfigError {
 struct RawConfig {
     network: String,
     peer: Option<toml::Value>,
-    reference_api_url: String,
+    reference_api_url: Option<String>,
     #[serde(default)]
     deadlines: RawDeadlines,
     node_key: Option<PathBuf>,
@@ -211,7 +210,11 @@ impl M2aConfig {
             _ => return Err(ConfigError::Network(raw.network)),
         };
         let peer = pinned_peer(raw.peer)?;
-        let reference_api_url = reference_api_url(&raw.reference_api_url)?;
+        let reference_api_url = raw
+            .reference_api_url
+            .as_deref()
+            .map(reference_api_url)
+            .transpose()?;
         let deadlines = deadlines(&raw.deadlines)?;
         let node_key = match raw.node_key {
             None => KeySource::Ephemeral,
@@ -258,13 +261,17 @@ fn pinned_peer(value: Option<toml::Value>) -> Result<PinnedPeer, ConfigError> {
     Ok(multiaddr.parse::<PinnedPeer>()?)
 }
 
-/// The anchor fetcher's URL rule, with plain `http://` allowed: the reference node is ours.
+/// The anchor fetcher's URL rule, but plain `http://` to a loopback host only.
 fn reference_api_url(url: &str) -> Result<ReferenceApiUrl, ConfigError> {
     let bad = ConfigError::ReferenceApiUrl;
     let uri: http::Uri = url.parse().map_err(|_| bad("not a valid URL"))?;
     match uri.scheme_str() {
-        Some("http" | "https") => {}
-        _ => return Err(bad("the scheme must be http:// or https://")),
+        Some("http") => {}
+        _ => {
+            return Err(bad(
+                "the scheme must be http:// (loopback only; tunnel to a remote node over SSH)",
+            ))
+        }
     }
     let authority = uri.authority().ok_or(bad("no host"))?;
     if authority.as_str().contains('@') {
@@ -292,7 +299,27 @@ fn reference_api_url(url: &str) -> Result<ReferenceApiUrl, ConfigError> {
             _ => return Err(bad("the port must be 1..=65535")),
         }
     }
+    if !is_loopback_host(authority.host()) {
+        return Err(bad(
+            "the host must be loopback (localhost, 127.0.0.0/8 or [::1]); \
+             tunnel to a remote node over SSH",
+        ));
+    }
     Ok(ReferenceApiUrl(uri))
+}
+
+/// `localhost` (any case), an IPv4 address in `127.0.0.0/8`, or `[::1]`.
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return v6
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    }
+    host.parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn deadlines(raw: &RawDeadlines) -> Result<Deadlines, ConfigError> {
@@ -369,7 +396,7 @@ mod tests {
             "/ip4/127.0.0.1/tcp/9000".parse::<Multiaddr>().unwrap()
         );
         assert_eq!(
-            c.reference_api_url.uri().to_string(),
+            c.reference_api_url.as_ref().unwrap().uri().to_string(),
             "http://127.0.0.1:5052/"
         );
         assert_eq!(c.deadlines, Deadlines::default());
@@ -380,7 +407,7 @@ mod tests {
     #[test]
     fn loads_a_complete_config() {
         let c = parse(&format!(
-            "network = \"sepolia\"\nreference_api_url = \"https://ref.example:5052/\"\n\
+            "network = \"sepolia\"\nreference_api_url = \"http://localhost:5052/\"\n\
              node_key = \"/var/lib/m2a-session/node.key\"\ntrusted_by_reference = true\n\
              [peer]\nmultiaddr = \"{}\"\n\
              [deadlines]\nttfb_ms = 1500\ntotal_ms = 8000\nper_chunk_ms = 2500\n",
@@ -402,8 +429,8 @@ mod tests {
         );
         assert!(c.trusted_by_reference);
         assert_eq!(
-            format!("{:?}", c.reference_api_url),
-            "https://ref.example:5052"
+            format!("{:?}", c.reference_api_url.unwrap()),
+            "http://localhost:5052"
         );
     }
 
@@ -562,8 +589,9 @@ mod tests {
     fn reference_api_url_rules() {
         for good in [
             "http://127.0.0.1:5052",
-            "https://ref.example",
-            "https://ref.example/beacon/",
+            "http://127.0.0.1/beacon/",
+            "http://localhost:5052",
+            "http://LOCALHOST:5052",
             "http://[::1]:5052",
         ] {
             assert!(parse(&with_url(good)).is_ok(), "{good}");
@@ -571,38 +599,42 @@ mod tests {
         assert_eq!(
             format!(
                 "{:?}",
-                parse(&with_url("https://ref.example/key/abc"))
+                parse(&with_url("http://127.0.0.1/key/abc"))
                     .unwrap()
                     .reference_api_url
+                    .unwrap()
             ),
-            "https://ref.example:443/…"
+            "http://127.0.0.1:80/…"
         );
         assert_eq!(
             format!(
                 "{:?}",
-                parse(&with_url("http://[::1]")).unwrap().reference_api_url
+                parse(&with_url("http://[::1]"))
+                    .unwrap()
+                    .reference_api_url
+                    .unwrap()
             ),
             "http://[::1]:80"
         );
         for bad in [
-            "ftp://ref.example",
-            "ref.example:5052",
+            "ftp://127.0.0.1",
+            "127.0.0.1:5052",
             "/eth/v1",
             "http://",
-            "http://user:hunter2@ref.example",
-            "http://hunter2@ref.example",
-            "http://ref.example/?token=hunter2",
-            "http://ref.example/#hunter2",
-            "http://ref.example:0",
-            "http://ref.example:65536",
-            "http://ref.example:hunter2",
+            "http://user:hunter2@127.0.0.1",
+            "http://hunter2@127.0.0.1",
+            "http://127.0.0.1/?token=hunter2",
+            "http://127.0.0.1/#hunter2",
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:65536",
+            "http://127.0.0.1:hunter2",
             "http://[::1]junk:65536",
             "http://[::1]hunter2",
             "http://[::1]x:5052",
             "http://[::1]:",
-            "http://ref.example:",
-            "http://ref.example:+5052",
-            "http://ref.example:05052x",
+            "http://127.0.0.1:",
+            "http://127.0.0.1:+5052",
+            "http://127.0.0.1:05052x",
             "not a url hunter2",
         ] {
             let err = parse(&with_url(bad)).unwrap_err();
@@ -618,6 +650,59 @@ mod tests {
                 !format!("{err:?}").contains("hunter2"),
                 "{bad}: the URL is quoted"
             );
+        }
+    }
+
+    #[test]
+    fn reference_api_url_is_optional() {
+        // --dial-only never uses it; the Status probe requires it (m2a-session refuses).
+        let without = with_peer("").replace(URL, "");
+        let c = parse(&without).unwrap();
+        assert_eq!(c.reference_api_url, None);
+        // Given, it is still checked.
+        let remote = with_url("http://192.0.2.10:5052");
+        assert!(matches!(
+            parse(&remote),
+            Err(ConfigError::ReferenceApiUrl(_))
+        ));
+    }
+
+    #[test]
+    fn reference_api_url_must_be_plain_http_on_loopback() {
+        // Plaintext to anywhere else lets anyone on the path forge finality and head answers;
+        // a remote node is reached through an SSH tunnel to a local port.
+        for remote in [
+            "http://192.0.2.10:5052",
+            "http://10.0.0.1:5052",
+            "http://0.0.0.0:5052",
+            "http://ref.example:5052",
+            "http://localhost.:5052",
+            "http://localhost.ref.example:5052",
+            "http://127.0.0.1.ref.example:5052",
+            "http://[::]:5052",
+            "http://[::ffff:127.0.0.1]:5052",
+            "http://[2001:db8::1]:5052",
+        ] {
+            let err = parse(&with_url(remote)).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::ReferenceApiUrl(why) if why.contains("loopback")),
+                "{remote}: {err:?}"
+            );
+        }
+        for tls in ["https://127.0.0.1:5052", "https://ref.example"] {
+            let err = parse(&with_url(tls)).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::ReferenceApiUrl(why) if why.contains("http://")),
+                "{tls}: {err:?}"
+            );
+        }
+        for local in [
+            "http://127.0.0.1:5052",
+            "http://127.8.9.10:5052",
+            "http://localhost",
+            "http://[::1]:1",
+        ] {
+            assert!(parse(&with_url(local)).is_ok(), "{local}");
         }
     }
 

@@ -10,6 +10,13 @@
 
 pub mod m2a_session;
 pub mod rpc;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;
+
+// build.rs's checkout and environment rules, compiled here only to run their tests.
+#[cfg(test)]
+#[path = "../build_support.rs"]
+mod build_support;
 
 use ethswarm_proto::p2p as pb;
 use ipc::Link;

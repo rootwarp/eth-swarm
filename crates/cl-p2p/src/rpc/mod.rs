@@ -5,8 +5,11 @@
 //! supports, so a behaviour holding all four would send a `Status` on whatever protocol came
 //! first. One protocol per behaviour also makes `with_max_concurrent_streams(2)` the
 //! per-protocol limit `MAX_CONCURRENT_REQUESTS` (`phase0/p2p-interface.md` L309).
+//!
+//! [`outbound`] runs one exchange on a swarm (Status v2).
 
 pub mod codec;
+pub mod outbound;
 
 use codec::RpcCodec;
 use consensus_types::EthSpec;
