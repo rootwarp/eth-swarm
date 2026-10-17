@@ -57,9 +57,9 @@ jobs:
         run: bash scripts/tests/check-proto-baseline-test.sh
 
   policy:
-    name: cargo deny, ssz revs
+    name: cargo deny (and its negative test), ssz and libp2p revs
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -70,6 +70,11 @@ jobs:
           fallback: none
       - run: cargo deny --locked check
       - run: bash scripts/check-ssz-revs.sh
+      - name: Every libp2p* crate from one rust-libp2p commit that has the StrictNoSign key rejection
+        run: bash scripts/tests/check-libp2p-revs.test.sh && bash scripts/check-libp2p-revs.sh
+      # Runs on every PR, so on every change to Cargo.toml, Cargo.lock or deny.toml.
+      - name: cargo deny fails on a second libp2p* version and on a git source outside allow-git
+        run: bash scripts/check-deny-negative.sh
 
   rust:
     name: fmt, clippy, build, test

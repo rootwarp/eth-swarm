@@ -1,5 +1,6 @@
 # cargo-deny config for ETH Swarm (cargo-deny >= 0.16 / v2 schema). Owner: Vera.
-# Run: cargo deny check   (CI also runs scripts/check-ssz-revs.sh, see [sources] note)
+# Run: cargo deny check   (CI also runs scripts/check-ssz-revs.sh and scripts/check-libp2p-revs.sh,
+# see the [sources] note, and scripts/check-deny-negative.sh, which proves the bans and sources gates fail)
 
 [graph]
 all-features = true
@@ -44,7 +45,10 @@ allow = [
 ignore = true   # our own unpublished workspace crates
 
 [bans]
-multiple-versions = "warn"   # libp2p/tokio trees make "deny" impractical; review warnings
+# A second version of any crate fails. Above all a second libp2p* version: every libp2p* crate comes
+# from one rust-libp2p commit, and a libp2p* crate never goes into `skip` (scripts/check-libp2p-revs.sh
+# also fails on a duplicated libp2p* name in Cargo.lock).
+multiple-versions = "deny"
 wildcards = "deny"           # no `*` version requirements
 allow-wildcard-paths = true  # internal path deps
 highlight = "all"
@@ -53,14 +57,50 @@ deny = [
   { crate = "openssl", reason = "use rustls" },
   { crate = "openssl-sys", reason = "use rustls" },
 ]
-skip = []
+# Duplicates we cannot remove ourselves. Exact versions only, so a third version still fails; each
+# entry names the older side, which goes away once its dependents move on. Never a libp2p* crate.
+skip = [
+  # RustCrypto digest 0.10 generation: sha2 0.10 in our crates, ethereum_hashing and snow; digest 0.11
+  # in sha3 0.11, hmac 0.13, ed25519-dalek 3 and libp2p-identity/gossipsub.
+  { crate = "digest@0.10.7", reason = "RustCrypto digest 0.10/0.11 split (sha2 0.10 in our crates, ethereum_hashing, snow)" },
+  { crate = "sha2@0.10.9", reason = "RustCrypto digest 0.10/0.11 split (our crates, ethereum_hashing, snow); libp2p is on sha2 0.11" },
+  { crate = "block-buffer@0.10.4", reason = "RustCrypto digest 0.10/0.11 split, via digest 0.10" },
+  { crate = "crypto-common@0.1.7", reason = "RustCrypto digest 0.10/0.11 split, via digest 0.10 and cipher 0.4" },
+  { crate = "cpufeatures@0.2.17", reason = "RustCrypto digest 0.10/0.11 split, via sha2 0.10, ethereum_hashing, const-hex and snow's ciphers" },
+  # snow 0.10 (libp2p-noise) is still on curve25519-dalek 4 and chacha20poly1305 0.10; ed25519-dalek 3 and rand 0.10 moved on.
+  { crate = "curve25519-dalek@4.1.3", reason = "snow 0.10 under libp2p-noise; libp2p-identity's ed25519-dalek 3 uses curve25519-dalek 5" },
+  { crate = "fiat-crypto@0.2.9", reason = "via curve25519-dalek 4 under snow 0.10 (libp2p-noise)" },
+  { crate = "chacha20@0.9.1", reason = "chacha20poly1305 0.10 under snow 0.10 (libp2p-noise); rand 0.10 uses chacha20 0.10" },
+  # rand: cl-verify and svc-runtime use rand 0.8; libp2p and proptest use rand 0.10.
+  { crate = "rand@0.8.8", reason = "cl-verify and svc-runtime use rand 0.8; libp2p is on rand 0.10" },
+  { crate = "rand_core@0.6.4", reason = "rand 0.8 and the RustCrypto elliptic-curve stack; rand 0.10 uses rand_core 0.10" },
+  { crate = "getrandom@0.2.17", reason = "ring 0.17 and rand_core 0.6" },
+  { crate = "getrandom@0.3.4", reason = "crypto-bls, ipc and snow (libp2p-noise); rand 0.10 and libp2p use getrandom 0.4" },
+  { crate = "r-efi@5.3.0", reason = "via getrandom 0.3 (UEFI only)" },
+  { crate = "base64@0.22.1", reason = "tonic 0.14; libp2p-gossipsub uses base64 0.23" },
+  { crate = "hashbrown@0.15.5", reason = "petgraph 0.8 under prost-build" },
+  { crate = "foldhash@0.1.5", reason = "via hashbrown 0.15 under petgraph 0.8" },
+  { crate = "itertools@0.13.0", reason = "bindgen 0.72 and milhouse 0.9 (sigp pin); ethereum_ssz and prost use itertools 0.14" },
+  { crate = "shlex@1.3.0", reason = "bindgen 0.72; cc uses shlex 2" },
+  { crate = "syn@2.0.119", reason = "syn 2 proc macros (prost, ethereum_ssz_derive, bindgen) next to syn 3 ones" },
+  { crate = "thiserror@1.0.69", reason = "rtnetlink 0.20 under if-watch (libp2p-tcp, Linux)" },
+  { crate = "thiserror-impl@1.0.69", reason = "via thiserror 1 under rtnetlink 0.20" },
+  { crate = "windows-sys@0.52.0", reason = "ring 0.17 (Windows only)" },
+]
 skip-tree = []
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# Git dependencies are allowed ONLY for the four sigp SSZ repos, pinned to the revisions in
+# Git dependencies are allowed ONLY for rust-libp2p and the four sigp SSZ repos.
+# rust-libp2p: every libp2p* crate via the root [patch.crates-io] at one full commit SHA that contains
+# the gossipsub StrictNoSign `key` rejection (libp2p/rust-libp2p#6621):
+#   libp2p, libp2p-*, multistream-select, rw-stream-sink, prost-codec
+#                                       https://github.com/libp2p/rust-libp2p  rev 2fed78f074af91e0c7440eedd08b8f898ad4a3fe
+# scripts/check-libp2p-revs.sh fails CI on a second rust-libp2p SHA, a libp2p* crate from anywhere else,
+# or a SHA that does not descend from that fix. Move to crates.io once libp2p-gossipsub 0.51 is released.
+# The sigp SSZ repos are pinned to the revisions in
 # Lighthouse unstable's root Cargo.toml [patch] section (see arch/ssz-crate-check.md §3):
 #   ethereum_ssz + ethereum_ssz_derive  https://github.com/sigp/ethereum_ssz  rev 974f78f421fbf70cba4e8f84e0fa28c23ad54f34
 #   ssz_types                           https://github.com/sigp/ssz_types     rev 8955d22edc7633f26fe3b5ac933facb5121d717a
@@ -69,6 +109,7 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # cargo-deny cannot enforce revs. scripts/check-ssz-revs.sh fails CI if Cargo.toml/Cargo.lock
 # reference any other rev of these repos. Bump only together with Lighthouse unstable, in a reviewed PR.
 allow-git = [
+  "https://github.com/libp2p/rust-libp2p",
   "https://github.com/sigp/ethereum_ssz",
   "https://github.com/sigp/ssz_types",
   "https://github.com/sigp/tree_hash",

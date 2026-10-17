@@ -52,7 +52,7 @@ jobs:
       - run: cargo test -p spec-tests --release --locked --test vectors
 
   policy:
-    name: cargo deny, ssz revs
+    name: cargo deny, ssz and libp2p revs
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -65,3 +65,4 @@ jobs:
           fallback: none
       - run: cargo deny --locked check
       - run: bash scripts/check-ssz-revs.sh
+      - run: bash scripts/check-libp2p-revs.sh

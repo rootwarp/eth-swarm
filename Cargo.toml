@@ -42,6 +42,13 @@ tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 prost = "0.14.4"
 prost-types = "0.14.4"
+# libp2p stack. Every libp2p* crate resolves from one rust-libp2p commit via [patch.crates-io] below.
+# libp2p 0.57 has no `connection-limits` feature: `libp2p::connection_limits` is always built.
+# discv5/enr have no user yet (cl-discv5 will be the first).
+libp2p = { version = "0.57.1", default-features = false, features = ["tokio", "tcp", "noise", "yamux", "macros", "gossipsub", "request-response", "identify", "metrics"] }
+libp2p-mplex = "0.44.0"
+discv5 = "0.12.0"
+enr = "0.14"
 
 # Pinned to the exact revisions Lighthouse `unstable` uses (see arch/ssz-crate-check.md).
 # Progressive SSZ types (EIP-7916/7495-successor/8016) are only on these git revisions, not on crates.io.
@@ -52,3 +59,29 @@ ssz_types = { git = "https://github.com/sigp/ssz_types", rev = "8955d22edc7633f2
 tree_hash = { git = "https://github.com/sigp/tree_hash", rev = "e5ea1875edddf12438506c3751cbb313f9c52d08" }
 tree_hash_derive = { git = "https://github.com/sigp/tree_hash", rev = "e5ea1875edddf12438506c3751cbb313f9c52d08" }
 milhouse = { git = "https://github.com/sigp/milhouse", rev = "d67aabd2a7c405b3c16f4aaff159b137dc5b5e38" }
+
+# rust-libp2p: every libp2p* crate in the graph from one commit of libp2p/rust-libp2p, enforced by
+# scripts/check-libp2p-revs.sh. 2fed78f is master after "chore: prepare v0.57.1" (2026-10-15). It
+# descends from the gossipsub StrictNoSign `key` rejection (PR 6621, ba75f82), which is not in any
+# crates.io libp2p-gossipsub: the crates carry their released versions (gossipsub 0.50.0) while the
+# gossipsub source is already the unreleased 0.51. Move back to crates.io once gossipsub 0.51 ships.
+libp2p = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-allow-block-list = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-connection-limits = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-core = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-dns = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-gossipsub = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-identify = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-identity = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-mdns = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-metrics = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-mplex = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-noise = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-quic = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-request-response = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-swarm = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-swarm-derive = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-tcp = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-tls = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-upnp = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-yamux = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }

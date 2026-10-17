@@ -10,6 +10,8 @@ description = "cl-p2p: the ethswarm.p2p.v1 service (stub: contract layer only, e
 [dependencies]
 ethswarm-proto = { path = "../ethswarm-proto" }
 ipc = { path = "../ipc" }
+libp2p.workspace = true
+libp2p-mplex.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]

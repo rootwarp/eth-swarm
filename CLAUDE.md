@@ -43,6 +43,8 @@ Policy and contract gates (CI runs these):
 ```bash
 cargo deny check
 bash scripts/check-ssz-revs.sh                # SSZ git deps must match the pinned revs exactly
+bash scripts/check-libp2p-revs.sh             # one rust-libp2p SHA, containing the gossipsub fix (needs network)
+bash scripts/check-deny-negative.sh           # cargo deny must fail on a 2nd libp2p-swarm / foreign git dep
 (cd proto && buf lint && buf build)
 scripts/buf-breaking.sh refs/remotes/origin/develop   # default: refs/heads/develop, else the remote ref; --baseline
 bash scripts/check-workflows.sh               # runs crates/ci-checks: parses workflows as YAML, enforces hardening
@@ -101,5 +103,7 @@ The cache holds only the **finalized** validator-registry prefix `0..high_water(
 ### Dependency policy (`deny.toml`, root `Cargo.toml`)
 
 - The sigp SSZ crates (`ethereum_ssz`, `ssz_types`, `tree_hash`, `milhouse`) are pinned through `[patch.crates-io]` to the exact revisions Lighthouse `unstable` uses. Progressive SSZ types (EIP-7916 and related) exist only at those revs. A rev bump has to update three places together: root `Cargo.toml`, the `deny.toml` `[sources]` comment, and the `REV` table in `scripts/check-ssz-revs.sh`.
-- Git deps are allowed only from those four sigp repos. `Cargo.lock` must be committed.
+- Every `libp2p*` crate (plus `multistream-select`, `rw-stream-sink`, `prost-codec`) comes from one full commit SHA of `libp2p/rust-libp2p` through `[patch.crates-io]`, one entry per `libp2p-*` crate in the graph. The SHA must descend from the gossipsub StrictNoSign `key` rejection (PR 6621, `ba75f82`), which no crates.io gossipsub has yet. `scripts/check-libp2p-revs.sh` fails on a second SHA, a `libp2p*` crate from anywhere else or twice in `Cargo.lock`, a manifest rev that differs, a `libp2p*` deny `skip` entry, or a SHA without that fix (it fetches the commit graph). A bump changes every patch line and the `deny.toml` `[sources]` comment together.
+- Git deps are allowed only from rust-libp2p and those four sigp repos. `Cargo.lock` must be committed.
+- `multiple-versions = "deny"`: a new duplicate fails `cargo deny`. Excuse an unavoidable non-libp2p one in `[bans] skip` with its exact version and a reason, never a `libp2p*` crate. `scripts/check-deny-negative.sh` proves the gate: on a throwaway copy, a second `libp2p-swarm` and a git dep outside `allow-git` must each fail `cargo deny check`.
 - `openssl`/`openssl-sys` are banned, so use rustls. Only permissive licenses are allowed. Every advisory `ignore` needs an ID, a reason, an owner and a review date.
