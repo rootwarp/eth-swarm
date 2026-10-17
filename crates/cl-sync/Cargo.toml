@@ -5,12 +5,47 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "cl-sync: the ethswarm.sync.v1 service (stub: contract layer only, every RPC answers UNIMPLEMENTED)."
+description = "cl-sync: the ethswarm.sync.v1 service (stub: contract layer only, every RPC answers UNIMPLEMENTED) and the two-provider checkpoint anchor fetcher."
+
+[[bin]]
+name = "anchor-fetch"
+path = "src/bin/anchor-fetch.rs"
 
 [dependencies]
 ethswarm-proto = { path = "../ethswarm-proto" }
 ipc = { path = "../ipc" }
 tonic.workspace = true
+# Checkpoint anchor fetcher (`checkpoint::fetch`): Gloas block and state, decoded and hashed.
+consensus-types = { path = "../consensus-types" }
+tree_hash.workspace = true
+alloy-primitives.workspace = true
+# Beacon API client: hyper 1 over TCP, TLS through rustls on the ring provider (ring is already
+# in the tree through ethereum_hashing; no aws-lc, no openssl) with the Mozilla roots of
+# webpki-roots. Pending Vera's dependency review.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "time"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+sha2 = "0.10"
+thiserror = "2"
+# flock on the output directory's lock file; random quarantine and temp names. Both are
+# already in Cargo.lock through ipc.
+rustix = { version = "1", features = ["fs"] }
+getrandom = "0.3"
 
 [dev-dependencies]
 ipc = { path = "../ipc", features = ["testkit"] }
+# Fixture beacon nodes: plain HTTP/1.1 on 127.0.0.1.
+hyper = { version = "1", features = ["server", "http1"] }
+ethereum_ssz.workspace = true
+ssz_types.workspace = true
+milhouse.workspace = true
+tempfile = "3"

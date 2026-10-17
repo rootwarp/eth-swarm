@@ -448,3 +448,85 @@ container! {
         ptc_window: Vector<PayloadTimelinessCommittee<E>, E::PtcWindowLength>,
     }
 }
+
+impl<E: EthSpec> BeaconState<E> {
+    /// Flushes the pending updates of every `milhouse` field, as `tree_hash_root` requires (it
+    /// panics on a tree with pending updates). A freshly decoded state has none.
+    ///
+    /// The destructuring names every field, so adding one to the container does not compile
+    /// until it is listed here: as a tree to flush, or as `_` for a plain field.
+    pub fn apply_updates(&mut self) -> Result<(), milhouse::Error> {
+        let BeaconState {
+            genesis_time: _,
+            genesis_validators_root: _,
+            slot: _,
+            fork: _,
+            latest_block_header: _,
+            block_roots,
+            state_roots,
+            historical_roots,
+            eth1_data: _,
+            eth1_data_votes,
+            eth1_deposit_index: _,
+            validators,
+            balances,
+            randao_mixes,
+            slashings,
+            previous_epoch_participation,
+            current_epoch_participation,
+            justification_bits: _,
+            previous_justified_checkpoint: _,
+            current_justified_checkpoint: _,
+            finalized_checkpoint: _,
+            inactivity_scores,
+            current_sync_committee: _,
+            next_sync_committee: _,
+            latest_block_hash: _,
+            next_withdrawal_index: _,
+            next_withdrawal_validator_index: _,
+            historical_summaries,
+            deposit_requests_start_index: _,
+            deposit_balance_to_consume: _,
+            exit_balance_to_consume: _,
+            earliest_exit_epoch: _,
+            consolidation_balance_to_consume: _,
+            earliest_consolidation_epoch: _,
+            pending_deposits,
+            pending_partial_withdrawals,
+            pending_consolidations,
+            proposer_lookahead,
+            builders,
+            next_withdrawal_builder_index: _,
+            execution_payload_availability: _,
+            builder_pending_payments,
+            builder_pending_withdrawals,
+            latest_execution_payload_bid: _,
+            payload_expected_withdrawals,
+            ptc_window,
+        } = self;
+        block_roots.apply_updates()?;
+        state_roots.apply_updates()?;
+        historical_roots.apply_updates()?;
+        eth1_data_votes.apply_updates()?;
+        validators.apply_updates()?;
+        balances.apply_updates()?;
+        randao_mixes.apply_updates()?;
+        slashings.apply_updates()?;
+        previous_epoch_participation.apply_updates()?;
+        current_epoch_participation.apply_updates()?;
+        inactivity_scores.apply_updates()?;
+        historical_summaries.apply_updates()?;
+        pending_deposits.apply_updates()?;
+        pending_partial_withdrawals.apply_updates()?;
+        pending_consolidations.apply_updates()?;
+        proposer_lookahead.apply_updates()?;
+        builders.apply_updates()?;
+        builder_pending_payments.apply_updates()?;
+        builder_pending_withdrawals.apply_updates()?;
+        payload_expected_withdrawals.apply_updates()?;
+        ptc_window.apply_updates()
+    }
+}
+
+#[cfg(test)]
+mod tests;

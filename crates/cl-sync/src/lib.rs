@@ -4,6 +4,10 @@
 //! discipline, `seq`, envelope type and digest checks) and then answers `UNIMPLEMENTED`, so the
 //! service already holds its peers to the wire contract. `tests/contract.rs` runs the contract
 //! suite against it, in process and over a Unix socket.
+//!
+//! [`checkpoint`] is the checkpoint-sync anchor fetcher behind the `anchor-fetch` binary: one
+//! finalized root agreed by two providers of different operators, the block and state fetched
+//! by root, and every root checked before `anchor.json` is written.
 
 use ethswarm_proto::sync as pb;
 use ipc::Link;
@@ -47,3 +51,5 @@ ipc::stub_service!(SyncStub => SyncService {
     bidi: [
     ],
 });
+
+pub mod checkpoint;

@@ -1035,9 +1035,32 @@ dependencies = [
 name = "cl-sync"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
+ "bytes",
+ "consensus-types",
+ "ethereum_ssz",
  "ethswarm-proto",
+ "getrandom 0.3.4",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "ipc",
+ "milhouse",
+ "rustix",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "ssz_types",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "toml 0.8.23",
  "tonic",
+ "tree_hash",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -4642,6 +4665,7 @@ checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -5422,6 +5446,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-rustls"
+version = "0.26.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
+dependencies = [
+ "rustls",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-stream"
 version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6001,6 +6035,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]
