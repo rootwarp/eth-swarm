@@ -12,6 +12,7 @@ members = [
     "crates/cl-verify",
     "crates/ethswarm-proto",
     "crates/ipc",
+    "crates/svc-runtime",
     "crates/cl-chain",
     "crates/cl-store",
     "crates/cl-engine",

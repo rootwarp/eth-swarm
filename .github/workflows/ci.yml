@@ -117,12 +117,15 @@ jobs:
         run: cargo test -p crypto-bls --no-default-features --features aggregate --test compile_fail --locked
 
   root-tests:
-    # Tests that need a second UID (file owner checks; later peercred). The container runs as
-    # root, a throwaway user supplies the second UID, and ETHSWARM_ROOT_TESTS=1 makes those
-    # cases fail instead of skip if either is missing.
+    # Tests that need more than one UID: file owner checks, and the Unix-socket peer checks
+    # (counterfeit server, wrong-UID caller, foreign stale socket, socket directory owner and
+    # group). The container runs as root and three throwaway users supply the other UIDs: chain
+    # (the allowed caller), api (in the socket group, not allowed on every method) and other
+    # (outside the group). ETHSWARM_ROOT_TESTS=1 makes those cases fail instead of skip if
+    # root or a user is missing.
     name: multi-UID tests as root
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     container:
       image: rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 # 1.99.0-bookworm
       options: --user 0
@@ -134,11 +137,24 @@ jobs:
           persist-credentials: false
       - name: Running as root
         run: test "$(id -u)" -eq 0
-      - name: Create a throwaway second user
+      - name: Create three throwaway users
         run: |
-          useradd --no-create-home --shell /usr/sbin/nologin ethswarm-other
-          echo "ETHSWARM_OTHER_UID=$(id -u ethswarm-other)" >> "$GITHUB_ENV"
+          for user in other chain api; do
+            useradd --no-create-home --user-group --shell /usr/sbin/nologin "ethswarm-$user"
+            upper=$(echo "$user" | tr '[:lower:]' '[:upper:]')
+            echo "ETHSWARM_${upper}_UID=$(id -u "ethswarm-$user")" >> "$GITHUB_ENV"
+            echo "ETHSWARM_${upper}_GID=$(id -g "ethswarm-$user")" >> "$GITHUB_ENV"
+          done
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustc --version
+      - name: Install protoc (ethswarm-proto build.rs runs tonic-prost-build)
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc@3.36.2
+          fallback: none
       - name: Pubkey cache owner and mode tests
         run: cargo test -p cl-verify-cache --test persist --locked
+      - name: Peer credentials, socket directory and stale-socket tests
+        run: cargo test -p ipc --test peercred --locked
+      - name: Method ACL against cl-engine and the SIGTERM drain
+        run: cargo test -p svc-runtime --locked

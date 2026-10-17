@@ -17,11 +17,14 @@ use super::fixture::{self, digest_at, SLOTS_PER_EPOCH};
 use super::probe::{call_unary_empty, Answer, GuardReport, Probe, Step, UnaryProbe};
 use super::surface::{surface, Surface};
 use super::{Mode, Server};
+use crate::acl::{self, AclError, AclTables, MethodAcl};
 use crate::envelope::EnvelopeError;
 use crate::error::ContractError;
 use crate::frame::Frame;
 use crate::hello::negotiate;
 use crate::link::{Counts, Link};
+use crate::peercred::{self, PeerCredError};
+use crate::uds::{self, PeerCheckedConnector};
 
 /// Every contract rule of the suite.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -42,10 +45,15 @@ pub enum Rule {
     EnvelopeDigestMismatch,
     /// Unary calls carry no hello and are served without one.
     UnaryNoHello,
+    /// Both ends check the Unix-socket peer's UID: the service per method (an unlisted method,
+    /// a UID not listed for the method, and a request without credentials are
+    /// `PERMISSION_DENIED` before the service sees them; cl-engine and cl-verify take only
+    /// cl-chain), and its peers before sending a byte (a server with another UID is refused).
+    SoPeercred,
 }
 
 impl Rule {
-    pub const ALL: [Rule; 8] = [
+    pub const ALL: [Rule; 9] = [
         Rule::HelloVersionNN1,
         Rule::HelloFloor,
         Rule::HelloPinMismatch,
@@ -54,6 +62,7 @@ impl Rule {
         Rule::EnvelopeTypeRules,
         Rule::EnvelopeDigestMismatch,
         Rule::UnaryNoHello,
+        Rule::SoPeercred,
     ];
 
     /// The test name the suite gives the rule.
@@ -68,6 +77,7 @@ impl Rule {
             Rule::EnvelopeTypeRules => "envelope_type_rules",
             Rule::EnvelopeDigestMismatch => "envelope_digest_mismatch",
             Rule::UnaryNoHello => "unary_no_hello",
+            Rule::SoPeercred => "so_peercred",
         }
     }
 }
@@ -217,6 +227,7 @@ impl ContractSuite {
             Rule::EnvelopeTypeRules => run.envelope_type_rules().await,
             Rule::EnvelopeDigestMismatch => run.envelope_digest_mismatch().await,
             Rule::UnaryNoHello => run.unary_no_hello().await,
+            Rule::SoPeercred => run.so_peercred().await,
         }
     }
 }
@@ -832,6 +843,183 @@ impl Run<'_> {
             0,
             "unary calls without hello are not violations"
         );
+    }
+
+    /// Calls every RPC through the target behind `acl`; returns which were let through, and
+    /// checks that exactly those reached the target.
+    async fn calls_through(&self, acl: MethodAcl, credentials: bool) -> Vec<bool> {
+        let target = (self.factory)(fixture::v1_link());
+        let conn = self
+            .mode
+            .connect_behind_acl(target.server.clone(), Arc::new(acl), credentials)
+            .await;
+        let mut passed = Vec::new();
+        for rpc in &self.surface.rpcs {
+            let r = call_unary_empty(conn.connection.transport.clone(), &rpc.path).await;
+            passed.push(!is_denied(&r));
+        }
+        let allowed = passed.iter().filter(|p| **p).count() as u64;
+        assert_eq!(
+            conn.reached(),
+            allowed,
+            "denied calls must not reach the service"
+        );
+        passed
+    }
+
+    async fn so_peercred(&self) {
+        let package = &self.surface.package;
+        let service = acl::service_of(package).expect("a service package");
+        let (me, other) = (peercred::effective_uid(), another_uid());
+        let paths: Vec<String> = self.surface.rpcs.iter().map(|r| r.path.clone()).collect();
+        assert!(!paths.is_empty(), "{package} has no RPC");
+        let grant =
+            |uid: u32| -> Vec<(String, u32)> { paths.iter().map(|p| (p.clone(), uid)).collect() };
+        let all = vec![true; paths.len()];
+        let none = vec![false; paths.len()];
+
+        // Every method ours: every call passes the ACL.
+        let ours = acl_of(&service, &grant(me)).expect("ACL loads");
+        assert_eq!(
+            self.calls_through(ours.clone(), true).await,
+            all,
+            "{service}: allowed"
+        );
+        // Our UID is on the socket but not listed for the method.
+        match acl::sole_caller(&service) {
+            Some(only) => {
+                // cl-chain is someone else: we are refused on every method.
+                let theirs = acl_of(&service, &grant(other)).expect("ACL loads");
+                assert_eq!(
+                    self.calls_through(theirs, true).await,
+                    none,
+                    "{service}: not {only}"
+                );
+                // A second caller, or any caller but cl-chain, does not even load.
+                for callers in [
+                    vec![only.to_owned(), "cl-api".into()],
+                    vec!["cl-api".into()],
+                ] {
+                    let tables = AclTables {
+                        callers: [(only.to_owned(), me), ("cl-api".to_owned(), other)].into(),
+                        methods: [(paths[0].clone(), callers.clone())].into(),
+                    };
+                    assert!(
+                        matches!(
+                            MethodAcl::from_tables(&service, &tables),
+                            Err(AclError::SoleCaller { .. })
+                        ),
+                        "{service} allows {callers:?}"
+                    );
+                }
+            }
+            None => {
+                // The first method is fenced to another UID; the rest stay ours.
+                let mut grants = grant(me);
+                grants[0].1 = other;
+                let fenced = acl_of(&service, &grants).expect("ACL loads");
+                let mut want = all.clone();
+                want[0] = false;
+                assert_eq!(
+                    self.calls_through(fenced, true).await,
+                    want,
+                    "{service}: fenced"
+                );
+            }
+        }
+        // A method the ACL does not list is denied (the ACL names only a method nobody serves).
+        let unlisted =
+            acl_of(&service, &[(format!("/{package}.Unlisted/Probe"), me)]).expect("ACL loads");
+        assert_eq!(
+            self.calls_through(unlisted, true).await,
+            none,
+            "{service}: unlisted"
+        );
+        // No peer credentials (only possible in process; a Unix socket always has them).
+        if matches!(self.mode, Mode::InProcess) {
+            assert_eq!(
+                self.calls_through(ours.clone(), false).await,
+                none,
+                "no credentials"
+            );
+        }
+
+        // The peer side: a server running as another user is refused before a byte is sent.
+        let refused = peercred::expect_uid(Ok(super::own_cred()), other);
+        assert!(
+            matches!(refused, Err(PeerCredError::WrongUid { .. })),
+            "{refused:?}"
+        );
+        let gone = peercred::expect_uid(Err(std::io::ErrorKind::NotConnected.into()), me);
+        assert!(
+            matches!(gone, Err(PeerCredError::Unavailable(_))),
+            "{gone:?}"
+        );
+        if let Mode::Uds(_) = self.mode {
+            let target = (self.factory)(fixture::v1_link());
+            let conn = self
+                .mode
+                .connect_behind_acl(target.server.clone(), Arc::new(ours), true)
+                .await;
+            let socket = conn.socket.clone().expect("a socket");
+            let err = tonic::transport::Endpoint::from_static("http://localhost")
+                .connect_with_connector(PeerCheckedConnector::new(&socket, other))
+                .await
+                .expect_err("a server with another UID is refused");
+            assert!(
+                matches!(
+                    uds::peer_refusal(&err),
+                    Some(PeerCredError::WrongUid { .. })
+                ),
+                "{err:?}"
+            );
+            assert_eq!(conn.reached(), 0, "nothing reached the refused server");
+            let channel = uds::connect_path(&socket, me)
+                .await
+                .expect("our own UID is accepted");
+            let transport =
+                tower::util::BoxCloneSyncService::new(tower::ServiceExt::map_err(channel, |e| {
+                    super::TransportError(e.into())
+                }));
+            let r = call_unary_empty(transport, &paths[0]).await;
+            assert!(!is_denied(&r), "{r:?}");
+            assert_eq!(conn.reached(), 1);
+        }
+    }
+}
+
+/// A UID that is not ours (nor the invalid `u32::MAX`).
+fn another_uid() -> u32 {
+    match peercred::effective_uid().checked_add(1) {
+        Some(u) if u != u32::MAX => u,
+        _ => 0,
+    }
+}
+
+/// An ACL of `service` giving each `(method, uid)` to a caller with that UID.
+fn acl_of(service: &str, grants: &[(String, u32)]) -> Result<MethodAcl, AclError> {
+    let only = acl::sole_caller(service);
+    let mut tables = AclTables::default();
+    for (method, uid) in grants {
+        // A sole-caller service can only name its one caller; elsewhere any name will do.
+        let name = only.map_or_else(|| format!("uid-{uid}"), str::to_owned);
+        tables.callers.insert(name.clone(), *uid);
+        tables.methods.insert(method.clone(), vec![name]);
+    }
+    MethodAcl::from_tables(service, &tables)
+}
+
+fn is_denied(r: &Result<(), tonic::Status>) -> bool {
+    match r {
+        Err(s) if s.code() == tonic::Code::PermissionDenied => {
+            assert_eq!(
+                ContractError::from_status(s).code(),
+                ErrorCode::ContractViolation,
+                "{s:?}"
+            );
+            true
+        }
+        _ => false,
     }
 }
 

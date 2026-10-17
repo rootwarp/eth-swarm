@@ -5,11 +5,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "Service-to-service contract layer: Hello negotiation, stream framing, seq, envelope checks, error mapping, and the contract test kit."
+description = "Service-to-service contract layer: Hello negotiation, stream framing, seq, envelope checks, error mapping, Unix-socket peer authentication and method ACLs, and the contract test kit."
 
 [features]
 # The contract suite (`ipc::testkit`): in-process and Unix-socket transports, probes, scripted peers.
-testkit = ["tokio/rt-multi-thread", "dep:tempfile", "dep:hyper-util", "dep:tower", "dep:prost-types", "dep:tonic-prost", "dep:http"]
+testkit = ["tokio/rt-multi-thread", "dep:tempfile", "dep:prost-types", "dep:tonic-prost"]
 
 [dependencies]
 ethswarm-proto = { path = "../ethswarm-proto" }
@@ -21,12 +21,24 @@ tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 thiserror = "2"
 tracing = "0.1"
+# The UDS connector hands tonic a peer-checked stream, and the ACL is a tower layer over http.
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", features = ["util"] }
+http = "1"
+# openat/fstatat/unlinkat/fchownat/flock, a non-blocking connect probe and geteuid for the
+# socket directory (`uds`): safe wrappers, already in the dependency graph through tempfile, so
+# no libc of our own.
+rustix = { version = "1", features = ["fs", "net", "process"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 tempfile = { version = "3", optional = true }
-hyper-util = { version = "0.1", features = ["tokio"], optional = true }
-tower = { version = "0.5", features = ["util"], optional = true }
 prost-types = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }
-http = { version = "1", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "test-util", "io-util"] }
+tempfile = "3"
+
+# Root-only tests switch one thread's credentials to play another user (Linux only).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { version = "1", features = ["fs", "net", "process", "thread"] }

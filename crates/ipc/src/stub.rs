@@ -74,7 +74,7 @@ where
 {
     let link = link.clone();
     let (tx, rx) = mpsc::channel(4);
-    tokio::spawn(async move {
+    crate::spawn_in_span(async move {
         let end = async {
             let mut guarded = link.open(Inbound::new(request.into_inner())).await?;
             if tx

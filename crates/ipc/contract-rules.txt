@@ -8,3 +8,4 @@ seq_monotonic
 envelope_type_rules
 envelope_digest_mismatch
 unary_no_hello
+so_peercred

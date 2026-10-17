@@ -12,8 +12,10 @@
 //! That expands to `in_process::<rule>` and `uds::<rule>` for every [`Rule`], so
 //! `cargo test --test contract -- --list` shows each rule twice. In process, the client calls
 //! the tower service directly (no socket, no HTTP/2); over UDS it goes through tonic's server
-//! and a channel on a socket in a fresh temp dir. Both run in this process under one UID; the
-//! peer-UID rule is not part of the suite yet.
+//! and a channel on a socket in a fresh temp dir. Both run in this process under one UID, so
+//! the peer-UID rule (`so_peercred`) puts the target behind an [`crate::acl::AclLayer`] that
+//! names our UID or another one: the kernel credentials of the connection (over UDS) or this
+//! process's credentials read from a socket pair (in process) are what the ACL checks.
 
 pub mod fixture;
 pub mod probe;
@@ -25,17 +27,22 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use hyper_util::rt::TokioIo;
+use tokio::net::unix::UCred;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
+use tokio_stream::wrappers::UnixListenerStream;
 use tonic::body::Body;
 use tonic::codegen::StdError;
 use tonic::service::Routes;
+use tonic::transport::server::UdsConnectInfo;
 use tonic::transport::{Endpoint, Uri};
 use tower::util::BoxCloneSyncService;
 use tower::{ServiceBuilder, ServiceExt};
+
+use crate::acl::{AclLayer, MethodAcl};
 
 pub use crate::link::Link;
 pub use probe::{Answer, Probe, Step, UnaryProbe};
@@ -124,6 +131,54 @@ pub struct Connection {
 
 static SOCKETS: AtomicU64 = AtomicU64::new(0);
 
+/// A fresh socket path in `dir`.
+fn next_socket(dir: &Path) -> PathBuf {
+    let n = SOCKETS.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("svc-{n}.sock"))
+}
+
+/// A connection to a target served behind a method ACL.
+pub struct AclConnection {
+    pub connection: Connection,
+    /// Requests that passed the ACL and reached the target.
+    pub reached: Arc<AtomicU64>,
+    /// The socket the target listens on (over UDS).
+    pub socket: Option<PathBuf>,
+}
+
+impl AclConnection {
+    #[must_use]
+    pub fn reached(&self) -> u64 {
+        self.reached.load(Ordering::Relaxed)
+    }
+}
+
+/// This process's credentials as the peer of a Unix socket sees them (read once from a
+/// connected socket pair).
+#[must_use]
+pub fn own_cred() -> UCred {
+    static CRED: OnceLock<UCred> = OnceLock::new();
+    *CRED.get_or_init(|| {
+        // tokio needs a runtime to wrap the stream; use a private one on its own thread, so this
+        // works inside and outside the caller's runtime.
+        std::thread::spawn(|| {
+            let (a, _b) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+            a.set_nonblocking(true).expect("nonblocking");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .expect("runtime");
+            let _entered = rt.enter();
+            UnixStream::from_std(a)
+                .expect("tokio stream")
+                .peer_cred()
+                .expect("peer credentials")
+        })
+        .join()
+        .expect("read own credentials")
+    })
+}
+
 impl Mode {
     #[must_use]
     pub fn over_uds(dir: &Path) -> Self {
@@ -146,8 +201,7 @@ impl Mode {
                 _shutdown: None,
             },
             Self::Uds(dir) => {
-                let n = SOCKETS.fetch_add(1, Ordering::Relaxed);
-                let path = dir.join(format!("svc-{n}.sock"));
+                let path = next_socket(dir);
                 let listener = UnixListener::bind(&path)
                     .unwrap_or_else(|e| panic!("bind {}: {e}", path.display()));
                 let (tx, rx) = oneshot::channel();
@@ -164,6 +218,85 @@ impl Mode {
                 Connection {
                     transport: uds_channel(&path).await,
                     _shutdown: Some(tx),
+                }
+            }
+        }
+    }
+
+    /// Serves `server`'s routes behind `acl` (outermost, ahead of the target's own layers) and
+    /// returns a client transport to it. In process, `credentials` says whether requests carry
+    /// this process's Unix credentials ([`own_cred`]); over UDS the kernel always supplies them
+    /// and the routes are served by plain tonic (a target's own UDS server is not used).
+    pub async fn connect_behind_acl(
+        &self,
+        server: Server,
+        acl: Arc<MethodAcl>,
+        credentials: bool,
+    ) -> AclConnection {
+        let reached = Arc::new(AtomicU64::new(0));
+        let count = {
+            let reached = Arc::clone(&reached);
+            move |req: http::Request<Body>| {
+                reached.fetch_add(1, Ordering::Relaxed);
+                req
+            }
+        };
+        match self {
+            Self::InProcess => {
+                let cred = credentials.then(own_cred);
+                let hook = server.in_process_extensions;
+                let svc = ServiceBuilder::new()
+                    .map_request(move |mut req: http::Request<Body>| {
+                        if let Some(cred) = cred {
+                            req.extensions_mut().insert(UdsConnectInfo {
+                                peer_addr: None,
+                                peer_cred: Some(cred),
+                            });
+                        }
+                        req
+                    })
+                    .layer(AclLayer::new(acl))
+                    .map_request(count)
+                    .map_request(move |mut req: http::Request<Body>| {
+                        if let Some(hook) = &hook {
+                            hook(req.extensions_mut());
+                        }
+                        req
+                    })
+                    .service(server.routes.prepare())
+                    .map_err(|never: Infallible| -> TransportError { match never {} });
+                AclConnection {
+                    connection: Connection {
+                        transport: BoxCloneSyncService::new(svc),
+                        _shutdown: None,
+                    },
+                    reached,
+                    socket: None,
+                }
+            }
+            Self::Uds(dir) => {
+                let path = next_socket(dir);
+                let listener = UnixListener::bind(&path)
+                    .unwrap_or_else(|e| panic!("bind {}: {e}", path.display()));
+                let (tx, rx) = oneshot::channel::<()>();
+                let layers = ServiceBuilder::new()
+                    .layer(AclLayer::new(acl))
+                    .map_request(count);
+                tokio::spawn(
+                    tonic::transport::Server::builder()
+                        .layer(layers)
+                        .add_routes(server.routes)
+                        .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async {
+                            let _ = rx.await;
+                        }),
+                );
+                AclConnection {
+                    connection: Connection {
+                        transport: uds_channel(&path).await,
+                        _shutdown: Some(tx),
+                    },
+                    reached,
+                    socket: Some(path),
                 }
             }
         }
@@ -232,6 +365,7 @@ macro_rules! contract_suite {
                 envelope_type_rules => EnvelopeTypeRules,
                 envelope_digest_mismatch => EnvelopeDigestMismatch,
                 unary_no_hello => UnaryNoHello,
+                so_peercred => SoPeercred,
             );
             $($(
                 #[test]
@@ -251,6 +385,7 @@ macro_rules! contract_suite {
                 envelope_type_rules => EnvelopeTypeRules,
                 envelope_digest_mismatch => EnvelopeDigestMismatch,
                 unary_no_hello => UnaryNoHello,
+                so_peercred => SoPeercred,
             );
             $($(
                 #[test]

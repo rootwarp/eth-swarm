@@ -1,0 +1,48 @@
+[package]
+name = "svc-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Service bootstrap: config and method ACL from /etc/ethswarm/<svc>.toml, the service-owned socket, JSON tracing with trace ids, loopback /metrics, sd_notify and a bounded SIGTERM drain."
+
+[dependencies]
+ipc = { path = "../ipc" }
+network-config = { path = "../network-config" }
+# The served services' method paths, from the compiled descriptor set, to check the ACL.
+ethswarm-proto = { path = "../ethswarm-proto" }
+prost.workspace = true
+prost-types.workspace = true
+tonic.workspace = true
+# Only for the bound on tonic's `Routes::add_service`; already in the tree through tonic.
+axum = { version = "0.8", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tower = { version = "0.5", features = ["util"] }
+http = "1"
+# /metrics is plain HTTP/1.1 on 127.0.0.1; tonic already brings hyper for HTTP/2.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+# Same version as cl-verify's feed-lag metrics. Pending its external review before first use.
+prometheus-client = "0.25.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "std"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+rand = "0.8"
+
+[dev-dependencies]
+cl-chain = { path = "../cl-chain" }
+cl-engine = { path = "../cl-engine" }
+ipc = { path = "../ipc", features = ["testkit"] }
+tokio = { version = "1", features = ["io-util", "test-util"] }
+tempfile = "3"
+rustix = { version = "1", features = ["process"] }
+
+# Root-only tests switch one thread's credentials to play another user (Linux only).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { version = "1", features = ["process", "thread"] }
