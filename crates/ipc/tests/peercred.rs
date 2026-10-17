@@ -755,6 +755,21 @@ fn assert_lock_untouched(dir: &SocketDir, before: &std::fs::Metadata) {
         "the lock is neither repaired nor replaced"
     );
     assert!(!dir.socket_path().exists(), "nothing bound");
+    assert_eq!(
+        temp_locks(dir),
+        Vec::<String>::new(),
+        "no temporary lock left"
+    );
+}
+
+/// The temporary names a new lock is set up under (`.<svc>.lock.*`) in `dir`.
+fn temp_locks(dir: &SocketDir) -> Vec<String> {
+    let prefix = format!(".{}.lock.", dir.service());
+    std::fs::read_dir(dir.dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with(&prefix))
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -801,10 +816,12 @@ async fn lock_file_owner_and_mode_enforced() {
         );
         assert_lock_untouched(&dir, &before);
     }
-    // A fresh lock is 0600 with the service owner and group, whatever the umask allowed.
+    // A fresh lock is 0600 with the service owner and group, whatever the umask allowed, and
+    // its temporary name is gone.
     let dir = SocketDir::under(root.path(), "fresh").unwrap();
     drop(uds::bind(&dir, owner).unwrap());
     assert_owned(&dir.lock_path(), me(), group, 0o600);
+    assert_eq!(temp_locks(&dir), Vec::<String>::new());
     // And it is taken as is on the next start.
     drop(uds::bind(&dir, owner).unwrap());
 
@@ -843,6 +860,73 @@ async fn lock_file_owner_and_mode_enforced() {
         assert_lock_untouched(&dir, &before);
         assert_lock_refused(&dir, owner, found);
     }
+}
+
+/// A start killed while it set up a new lock leaves `.<svc>.lock.<random>` behind. Whatever
+/// that file is, it blocks no later start and is left alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn leftover_temporary_lock_does_not_block_a_start() {
+    let root = runtime_root();
+    let owner = Ownership::current();
+    let dir = SocketDir::under(root.path(), "svc").unwrap();
+    premade_dir(&dir);
+    let leftovers = [
+        (".svc.lock.0000000000000000", 0o600),
+        (".svc.lock.ffffffffffffffff", 0o644),
+        (".svc.lock.", 0o000),
+    ];
+    for (name, mode) in leftovers {
+        let p = dir.dir().join(name);
+        std::fs::write(&p, b"").unwrap();
+        set_mode(&p, mode);
+    }
+    let before = |name: &str| {
+        std::fs::symlink_metadata(dir.dir().join(name))
+            .unwrap()
+            .ino()
+    };
+    let inos: Vec<u64> = leftovers.iter().map(|(n, _)| before(n)).collect();
+    // No lock yet: a new one is published next to them.
+    drop(uds::bind(&dir, owner).unwrap());
+    assert_owned(&dir.lock_path(), owner.uid, owner.gid, 0o600);
+    // An existing lock is reused next to them.
+    let ino = std::fs::metadata(dir.lock_path()).unwrap().ino();
+    drop(uds::bind(&dir, owner).unwrap());
+    assert_eq!(std::fs::metadata(dir.lock_path()).unwrap().ino(), ino);
+    // Left in place, unchanged; nothing else was left behind.
+    for ((name, mode), ino) in leftovers.iter().zip(inos) {
+        let m = std::fs::symlink_metadata(dir.dir().join(name)).unwrap();
+        assert_eq!((m.ino(), m.mode() & 0o7777), (ino, *mode), "{name}");
+    }
+    let mut names = temp_locks(&dir);
+    names.sort_unstable();
+    let mut want: Vec<String> = leftovers.iter().map(|(n, _)| (*n).to_owned()).collect();
+    want.sort_unstable();
+    assert_eq!(names, want);
+
+    let Some(u) = users("leftover_temporary_lock_does_not_block_a_start") else {
+        return;
+    };
+    // A leftover of another user, in a directory root prepared for the service user.
+    set_mode(root.path(), 0o755);
+    let owner = Ownership {
+        uid: u.chain.0,
+        gid: u.api.1,
+    };
+    let dir = SocketDir::under(root.path(), "chain").unwrap();
+    std::fs::create_dir(dir.dir()).unwrap();
+    std::os::unix::fs::chown(dir.dir(), Some(u.chain.0), Some(u.api.1)).unwrap();
+    set_mode(&dir.dir(), 0o750);
+    let leftover = dir.dir().join(".chain.lock.0123456789abcdef");
+    std::fs::write(&leftover, b"").unwrap();
+    std::os::unix::fs::chown(&leftover, Some(u.other.0), Some(u.other.1)).unwrap();
+    set_mode(&leftover, 0o666);
+    let d = dir.clone();
+    as_user(u.chain, &[u.chain.1, u.api.1], move || {
+        drop(uds::bind(&d, owner).unwrap());
+    });
+    assert_owned(&dir.lock_path(), u.chain.0, u.api.1, 0o600);
+    assert_owned(&leftover, u.other.0, u.other.1, 0o666);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -897,6 +981,69 @@ async fn root_with_a_writable_parent_refused() {
             Ownership::current(),
         )
         .unwrap(),
+    );
+}
+
+/// The walk to the runtime root needs only search permission on the directories above it, as
+/// a path lookup does: an unprivileged service under a root-owned `0711` ancestor starts.
+/// Linux only: elsewhere the walk opens ancestors `O_RDONLY`, which needs read permission.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn search_only_ancestor_is_walked() {
+    let tmp = runtime_root();
+    // The owner bits are what apply to the owner, so `0111` is to us what a root-owned `0711`
+    // is to the service user: search, no read.
+    let locked = tmp.path().join("locked");
+    let run = locked.join("run");
+    std::fs::create_dir_all(&run).unwrap();
+    set_mode(&run, 0o755);
+    set_mode(&locked, 0o111);
+    let bound = uds::bind(
+        &SocketDir::under(&run, "svc").unwrap(),
+        Ownership::current(),
+    );
+    set_mode(&locked, 0o755);
+    drop(bound.unwrap());
+    assert!(run.join("svc/svc.lock").exists());
+
+    let Some(u) = users("search_only_ancestor_is_walked") else {
+        return;
+    };
+    // The real case: root-owned `0711` directories above the root, a service user below.
+    set_mode(tmp.path(), 0o711);
+    set_mode(&locked, 0o711);
+    let root = run.join("chain");
+    std::fs::create_dir(&root).unwrap();
+    std::os::unix::fs::chown(&root, Some(u.chain.0), Some(u.chain.1)).unwrap();
+    set_mode(&root, 0o700);
+    let owner = Ownership {
+        uid: u.chain.0,
+        gid: u.chain.1,
+    };
+    let dir = SocketDir::under(&root, "svc").unwrap();
+    let d = dir.clone();
+    as_user(u.chain, &[u.chain.1], move || {
+        drop(uds::bind(&d, owner).unwrap());
+    });
+    assert_owned(&dir.lock_path(), u.chain.0, u.chain.1, 0o600);
+}
+
+/// `/var/run` is a symlink on most systems (to `/run` on Linux distributions, through the
+/// `/var` symlink on macOS): a root under it is refused before anything is created.
+#[tokio::test(flavor = "multi_thread")]
+async fn var_run_root_refused_where_it_is_a_symlink() {
+    let through_symlink = ["/var", "/var/run"]
+        .iter()
+        .any(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()));
+    if !through_symlink {
+        eprintln!("var_run_root_refused_where_it_is_a_symlink: /var/run is no symlink here");
+        return;
+    }
+    let dir = SocketDir::under("/var/run/ethswarm-uds-test", "svc").unwrap();
+    let err = uds::bind(&dir, Ownership::current()).unwrap_err();
+    assert!(
+        matches!(&err, BindError::Insecure { reason, .. } if reason.contains("symlink")),
+        "{err}"
     );
 }
 

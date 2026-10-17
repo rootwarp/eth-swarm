@@ -17,9 +17,11 @@
 //!    one fails startup before anything on disk is touched.
 //! 2. The runtime root must be an absolute path without `..`. It is walked from `/` one
 //!    component at a time through directory file descriptors (`openat`, `O_NOFOLLOW |
-//!    O_DIRECTORY`): a symlink anywhere in it is refused, not resolved. Every directory above
-//!    the root must be owned by root or us and not writable by group or others (sticky
-//!    directories such as `/tmp` excepted), and the root itself writable only by its owner.
+//!    O_DIRECTORY`, and `O_PATH` on Linux so that search permission suffices): a symlink
+//!    anywhere in it is refused, not resolved, so configure `/run/...`, not `/var/run/...`
+//!    (a symlink to `/run` on most distributions). Every directory above the root must be
+//!    owned by root or us and not writable by group or others (sticky directories such as
+//!    `/tmp` excepted), and the root itself writable only by its owner.
 //!
 //! From there on the filesystem steps are relative to directory file descriptors
 //! (`mkdirat`/`openat`/`fstatat`/`fchownat`/`unlinkat`, `O_NOFOLLOW`), so they do not follow a
@@ -33,10 +35,14 @@
 //!    symlink or a non-directory fails startup.
 //! 4. `<svc>.lock` in that directory is `flock`ed for the life of the process, so a second
 //!    instance fails with `AddrInUse` instead of touching the first one's socket. A lock this
-//!    start creates is given to the service user and group, mode `0600`. An existing lock must
-//!    already be exactly that and is refused otherwise: a chown or chmod would not revoke a
-//!    descriptor a caller opened while it was looser, and with it the caller could hold the
-//!    flock against every start.
+//!    start creates is set up under a temporary name, `.<svc>.lock.<random>`: given to the
+//!    service user and group, mode `0600`, checked and `flock`ed, and only then linked to
+//!    `<svc>.lock` (`linkat`, which never replaces a lock another start published first). A
+//!    failure on the way unlinks the temporary name, so `<svc>.lock` never names a lock that
+//!    is only half set up; a temporary name a killed start left behind is never looked at, so
+//!    it blocks nothing. An existing lock must already be exactly that and is refused
+//!    otherwise: a chown or chmod would not revoke a descriptor a caller opened while it was
+//!    looser, and with it the caller could hold the flock against every start.
 //! 5. A leftover socket path is looked at with `lstat` (`AT_SYMLINK_NOFOLLOW`). Only a socket
 //!    owned by the service user that refuses a `connect()` probe is stale and unlinked. A live
 //!    socket fails with `AddrInUse`; a symlink, file, directory, or a socket of another user is
@@ -310,9 +316,36 @@ const DIR_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
+/// How the directories from `/` down to the runtime root are opened. They are only looked
+/// through (`fstat`, `openat`, `mkdirat`), so on Linux `O_PATH`, which needs only search
+/// permission, as a path lookup does: an unprivileged service under a root-owned `0711`
+/// ancestor can walk it. macOS has no `O_PATH` (and rustix no `O_SEARCH` there), so it opens
+/// them `O_RDONLY` and needs read permission on every ancestor.
+#[cfg(target_os = "linux")]
+const ANCESTOR_FLAGS: OFlags = OFlags::PATH
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+#[cfg(not(target_os = "linux"))]
+const ANCESTOR_FLAGS: OFlags = DIR_FLAGS;
+
 /// Opens `name` in `parent` as a directory without following a symlink.
 fn open_dir(parent: impl AsFd + Copy, name: &Path, path: &Path) -> Result<OwnedFd, BindError> {
-    match rustix::fs::openat(parent, name, DIR_FLAGS, Mode::empty()) {
+    open_dir_with(parent, name, path, DIR_FLAGS)
+}
+
+/// [`open_dir`] for a directory on the way to the runtime root, or the root itself.
+fn open_ancestor(parent: impl AsFd + Copy, name: &Path, path: &Path) -> Result<OwnedFd, BindError> {
+    open_dir_with(parent, name, path, ANCESTOR_FLAGS)
+}
+
+fn open_dir_with(
+    parent: impl AsFd + Copy,
+    name: &Path,
+    path: &Path,
+    flags: OFlags,
+) -> Result<OwnedFd, BindError> {
+    match rustix::fs::openat(parent, name, flags, Mode::empty()) {
         Ok(fd) => Ok(fd),
         Err(Errno::LOOP | Errno::NOTDIR) => {
             let kind = rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
@@ -375,7 +408,8 @@ fn through_proc(fds: &Path, dir_fd: &OwnedFd, name: &str) -> Result<PathBuf, Bin
 /// the root must be owned by root or us and not writable by group or others unless sticky:
 /// otherwise someone else could rename the next component away and put their own in its place.
 /// The root itself must be owned by root or us and writable only by its owner. A symlink
-/// anywhere in the path is refused, not resolved; so are a relative path and `..`.
+/// anywhere in the path is refused, not resolved; so are a relative path and `..`. That
+/// includes `/var/run`, a symlink to `/run` on most distributions: configure `/run/...`.
 fn open_root(root: &Path) -> Result<OwnedFd, BindError> {
     use std::path::Component;
     let me = peercred::effective_uid();
@@ -387,7 +421,7 @@ fn open_root(root: &Path) -> Result<OwnedFd, BindError> {
         return Err(insecure("runtime root must be an absolute path".into()));
     }
     let mut walked = PathBuf::from("/");
-    let mut fd = open_dir(CWD, &walked, &walked)?;
+    let mut fd = open_ancestor(CWD, &walked, &walked)?;
     for component in root.components() {
         let name = match component {
             Component::RootDir | Component::CurDir => continue,
@@ -409,7 +443,7 @@ fn open_root(root: &Path) -> Result<OwnedFd, BindError> {
             )));
         }
         walked.push(name);
-        fd = open_dir(&fd, Path::new(name), &walked)?;
+        fd = open_ancestor(&fd, Path::new(name), &walked)?;
     }
     let m = fstat(&fd, root)?;
     let writable_by_others = m.mode.intersects(Mode::WGRP | Mode::WOTH);
@@ -468,82 +502,79 @@ fn describe(m: &Meta) -> String {
     format!("uid {} gid {} mode {:o}", m.uid, m.gid, mode_bits(m.mode))
 }
 
-/// Takes the instance lock for the life of the returned descriptor. A lock this call creates
-/// is given to `owner`, mode `0600`; an existing one must already be exactly that.
+/// Takes the instance lock for the life of the returned descriptor. An existing lock must
+/// already be `owner`'s, mode `0600`, and is never repaired. Without one, a new lock is set up
+/// and taken under a temporary name, then published under `<svc>.lock` ([`create_lock`]), so
+/// the final name never shows a lock that is only half set up.
 fn lock(dir_fd: &OwnedFd, dir: &SocketDir, owner: Ownership) -> Result<OwnedFd, BindError> {
+    lock_with(dir_fd, dir, owner, |_| Ok(()))
+}
+
+/// [`lock`], running `before_publish` on a new lock right before it is published (tests inject
+/// a failure there).
+fn lock_with(
+    dir_fd: &OwnedFd,
+    dir: &SocketDir,
+    owner: Ownership,
+    before_publish: impl FnOnce(&OwnedFd) -> Result<(), BindError>,
+) -> Result<OwnedFd, BindError> {
+    if let Some(fd) = open_existing_lock(dir_fd, dir)? {
+        return take_existing_lock(&fd, dir, owner).map(|()| fd);
+    }
+    if let Some(fd) = create_lock(dir_fd, dir, owner, before_publish)? {
+        return Ok(fd);
+    }
+    // Another start published its lock first: it gets the same checks as any existing lock.
+    match open_existing_lock(dir_fd, dir)? {
+        Some(fd) => take_existing_lock(&fd, dir, owner).map(|()| fd),
+        None => Err(io_err("open", &dir.lock_path())(Errno::NOENT)),
+    }
+}
+
+/// The lock under its final name, opened without following a symlink; `None` if there is none.
+fn open_existing_lock(dir_fd: &OwnedFd, dir: &SocketDir) -> Result<Option<OwnedFd>, BindError> {
     let (name, path) = (dir.lock_name(), dir.lock_path());
     let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let opened = match rustix::fs::openat(
-        dir_fd,
-        name.as_str(),
-        flags | OFlags::CREATE | OFlags::EXCL,
-        mode(LOCK_MODE),
-    ) {
-        Ok(fd) => Ok((fd, true)),
-        Err(Errno::EXIST) => {
-            rustix::fs::openat(dir_fd, name.as_str(), flags, Mode::empty()).map(|fd| (fd, false))
-        }
-        Err(e) => Err(e),
-    };
-    let (fd, created) = match opened {
-        Ok(opened) => opened,
-        Err(Errno::LOOP) => {
-            return Err(BindError::NotASocket {
-                path,
-                kind: "symlink",
-            })
-        }
+    match rustix::fs::openat(dir_fd, name.as_str(), flags, Mode::empty()) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(Errno::NOENT) => Ok(None),
+        Err(Errno::LOOP) => Err(BindError::NotASocket {
+            path,
+            kind: "symlink",
+        }),
         Err(Errno::ACCESS | Errno::PERM) => {
             let found = lstat_at(dir_fd, &name, &path)?.map(|m| describe(&m));
-            return Err(BindError::Insecure {
+            Err(BindError::Insecure {
                 reason: format!(
                     "uid {} cannot open the lock ({}); refusing it",
                     peercred::effective_uid(),
                     found.as_deref().unwrap_or("gone")
                 ),
                 path,
-            });
+            })
         }
-        Err(e) => return Err(io_err("open", &path)(e)),
-    };
-    let m = fstat(&fd, &path)?;
+        Err(e) => Err(io_err("open", &path)(e)),
+    }
+}
+
+fn is_exact_lock(m: &Meta, owner: Ownership) -> bool {
+    m.file_type == FileType::RegularFile
+        && m.uid == owner.uid
+        && m.gid == owner.gid
+        && m.mode == mode(LOCK_MODE)
+}
+
+/// Checks and flocks a lock found under the final name.
+fn take_existing_lock(fd: &OwnedFd, dir: &SocketDir, owner: Ownership) -> Result<(), BindError> {
+    let path = dir.lock_path();
+    let m = fstat(fd, &path)?;
     if m.file_type != FileType::RegularFile {
         return Err(BindError::Insecure {
             path,
             reason: format!("lock is a {}, not a regular file", kind_name(m.file_type)),
         });
     }
-    let exact = |m: &Meta| m.uid == owner.uid && m.gid == owner.gid && m.mode == mode(LOCK_MODE);
-    if created {
-        // Set explicitly on the inode just created: neither the umask nor a setgid directory
-        // decides its owner or mode.
-        let uid = (m.uid != owner.uid).then(|| Uid::from_raw(owner.uid));
-        rustix::fs::fchown(&fd, uid, Some(Gid::from_raw(owner.gid)))
-            .and_then(|()| rustix::fs::fchmod(&fd, mode(LOCK_MODE)))
-            .map_err(|e| BindError::Insecure {
-                path: path.clone(),
-                reason: format!(
-                    "new lock is {} and cannot be made uid {} gid {} mode {:o}: {e}",
-                    describe(&m),
-                    owner.uid,
-                    owner.gid,
-                    LOCK_MODE
-                ),
-            })?;
-        let m = fstat(&fd, &path)?;
-        if !exact(&m) {
-            return Err(BindError::Insecure {
-                path,
-                reason: format!(
-                    "new lock must be uid {} gid {} mode {:o}, is {}",
-                    owner.uid,
-                    owner.gid,
-                    LOCK_MODE,
-                    describe(&m)
-                ),
-            });
-        }
-    } else if !exact(&m) {
+    if !is_exact_lock(&m, owner) {
         // Never repaired in place: a caller that opened the lock while it was looser keeps its
         // descriptor, and with it the flock, across a chown or chmod.
         return Err(BindError::Insecure {
@@ -558,13 +589,120 @@ fn lock(dir_fd: &OwnedFd, dir: &SocketDir, owner: Ownership) -> Result<OwnedFd, 
             ),
         });
     }
-    match rustix::fs::flock(&fd, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(fd),
+    flock_exclusive(fd, &path)
+}
+
+fn flock_exclusive(fd: &OwnedFd, path: &Path) -> Result<(), BindError> {
+    match rustix::fs::flock(fd, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(()),
         Err(e) if e == Errno::WOULDBLOCK => Err(BindError::InUse {
-            path,
+            path: path.to_owned(),
             reason: "another instance of the service holds the lock",
         }),
-        Err(e) => Err(io_err("lock", &path)(e)),
+        Err(e) => Err(io_err("lock", path)(e)),
+    }
+}
+
+/// A new lock's temporary name, `.<svc>.lock.<random>`, unlinked when dropped: on every error
+/// and after the lock is published under its final name. A start killed before that leaves the
+/// name behind; nothing looks at such names, so it never blocks a later start.
+struct TempLockName<'a> {
+    dir_fd: &'a OwnedFd,
+    name: String,
+    path: PathBuf,
+}
+
+impl Drop for TempLockName<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = rustix::fs::unlinkat(self.dir_fd, self.name.as_str(), AtFlags::empty()) {
+            tracing::warn!(lock = %self.path.display(), error = %e, "cannot remove a temporary lock name");
+        }
+    }
+}
+
+/// 64 bits that differ on every call (std's per-instance randomized hasher keys).
+fn random_suffix() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u32(std::process::id());
+    h.finish()
+}
+
+/// Creates a lock under a temporary name, gives it to `owner` with mode `0600`, checks that,
+/// flocks it, and only then links it to `<svc>.lock` (`linkat`, which never replaces an existing
+/// name). `None`: another start published a lock first; it is left to the existing-lock checks.
+fn create_lock(
+    dir_fd: &OwnedFd,
+    dir: &SocketDir,
+    owner: Ownership,
+    before_publish: impl FnOnce(&OwnedFd) -> Result<(), BindError>,
+) -> Result<Option<OwnedFd>, BindError> {
+    const ATTEMPTS: usize = 8;
+    let path = dir.lock_path();
+    let flags = OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut created = None;
+    for _ in 0..ATTEMPTS {
+        let name = format!(".{}.{:016x}", dir.lock_name(), random_suffix());
+        let tmp_path = dir.dir().join(&name);
+        match rustix::fs::openat(dir_fd, name.as_str(), flags, mode(LOCK_MODE)) {
+            Ok(fd) => {
+                let tmp = TempLockName {
+                    dir_fd,
+                    name,
+                    path: tmp_path,
+                };
+                created = Some((fd, tmp));
+                break;
+            }
+            Err(Errno::EXIST) => {}
+            Err(e) => return Err(io_err("create", &tmp_path)(e)),
+        }
+    }
+    let Some((fd, tmp)) = created else {
+        return Err(io_err("create", &path)(Errno::EXIST));
+    };
+    let m = fstat(&fd, &tmp.path)?;
+    // Set explicitly on the inode just created: neither the umask nor a setgid directory decides
+    // its owner or mode.
+    let uid = (m.uid != owner.uid).then(|| Uid::from_raw(owner.uid));
+    rustix::fs::fchown(&fd, uid, Some(Gid::from_raw(owner.gid)))
+        .and_then(|()| rustix::fs::fchmod(&fd, mode(LOCK_MODE)))
+        .map_err(|e| BindError::Insecure {
+            path: path.clone(),
+            reason: format!(
+                "new lock is {} and cannot be made uid {} gid {} mode {:o}: {e}",
+                describe(&m),
+                owner.uid,
+                owner.gid,
+                LOCK_MODE
+            ),
+        })?;
+    let m = fstat(&fd, &tmp.path)?;
+    if !is_exact_lock(&m, owner) {
+        return Err(BindError::Insecure {
+            path,
+            reason: format!(
+                "new lock must be uid {} gid {} mode {:o}, is {}",
+                owner.uid,
+                owner.gid,
+                LOCK_MODE,
+                describe(&m)
+            ),
+        });
+    }
+    // Held before it is published, so a start that finds it under the final name is refused.
+    flock_exclusive(&fd, &path)?;
+    before_publish(&fd)?;
+    match rustix::fs::linkat(
+        dir_fd,
+        tmp.name.as_str(),
+        dir_fd,
+        dir.lock_name().as_str(),
+        AtFlags::empty(),
+    ) {
+        Ok(()) => Ok(Some(fd)),
+        Err(Errno::EXIST) => Ok(None),
+        Err(e) => Err(io_err("publish", &path)(e)),
     }
 }
 
@@ -1046,6 +1184,99 @@ mod tests {
         // The real one works.
         let via = through_proc(Path::new(PROC_FDS), &dir_fd, "s.sock").unwrap();
         assert!(via.starts_with(PROC_FDS), "{}", via.display());
+    }
+
+    /// A service directory of ours, held open, under a root named without symlinks.
+    fn held_service_dir(tmp: &tempfile::TempDir) -> (SocketDir, OwnedFd) {
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let dir = SocketDir::under(&root, "svc").unwrap();
+        let root_fd = open_dir(CWD, &root, &root).unwrap();
+        let dir_fd = open_service_dir(&root_fd, &dir, Ownership::current()).unwrap();
+        (dir, dir_fd)
+    }
+
+    fn entries(dir: &SocketDir) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A start that fails after creating its lock but before publishing it leaves nothing under
+    /// either name, and the next start takes a fresh lock.
+    #[test]
+    fn a_lock_that_fails_before_it_is_published_leaves_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, dir_fd) = held_service_dir(&tmp);
+        let mut seen = None;
+        let err = lock_with(&dir_fd, &dir, Ownership::current(), |fd| {
+            // Fully set up but not yet under its final name.
+            seen = Some(fstat(fd, &dir.lock_path()).unwrap());
+            assert!(!dir.lock_path().exists(), "not published yet");
+            Err(BindError::Insecure {
+                path: dir.lock_path(),
+                reason: "injected".into(),
+            })
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("injected"), "{err}");
+        let seen = seen.expect("the hook ran");
+        assert_eq!(seen.mode, mode(LOCK_MODE));
+        assert_eq!(seen.file_type, FileType::RegularFile);
+        assert!(entries(&dir).is_empty(), "{:?}", entries(&dir));
+
+        let held = lock(&dir_fd, &dir, Ownership::current()).unwrap();
+        assert_eq!(entries(&dir), ["svc.lock"]);
+        // Published already locked: a second instance is refused.
+        let err = lock(&dir_fd, &dir, Ownership::current()).unwrap_err();
+        assert!(matches!(err, BindError::InUse { .. }), "{err}");
+        drop(held);
+        // Reused once free, without a new inode.
+        let ino = fstat(
+            lock(&dir_fd, &dir, Ownership::current()).unwrap(),
+            &dir.lock_path(),
+        )
+        .unwrap()
+        .ino;
+        assert_eq!(std::fs::metadata(dir.lock_path()).unwrap().ino(), ino);
+        assert_eq!(entries(&dir), ["svc.lock"]);
+    }
+
+    /// A lock another start published while this one set up its own wins: the temporary name is
+    /// removed and the published lock goes through the existing-lock checks.
+    #[test]
+    fn a_lock_published_first_by_another_start_is_used_instead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, dir_fd) = held_service_dir(&tmp);
+        // The other start's lock, held by it.
+        let mut other = None;
+        let err = lock_with(&dir_fd, &dir, Ownership::current(), |_| {
+            other = Some(lock(&dir_fd, &dir, Ownership::current()).unwrap());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(matches!(err, BindError::InUse { .. }), "{err}");
+        assert_eq!(entries(&dir), ["svc.lock"]);
+        drop(other);
+        // A loose lock published first is refused, not replaced.
+        std::fs::remove_file(dir.lock_path()).unwrap();
+        let err = lock_with(&dir_fd, &dir, Ownership::current(), |_| {
+            std::fs::write(dir.lock_path(), b"").unwrap();
+            std::fs::set_permissions(
+                dir.lock_path(),
+                std::os::unix::fs::PermissionsExt::from_mode(0o644),
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, BindError::Insecure { reason, .. } if reason.contains("existing lock")),
+            "{err}"
+        );
+        assert_eq!(entries(&dir), ["svc.lock"]);
     }
 
     #[test]

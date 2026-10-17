@@ -402,7 +402,7 @@ async fn metrics_flood_does_not_starve_the_socket() {
     let tmp = tempfile::tempdir().unwrap();
     let root = runtime_root(tmp.path());
     let config = engine_config(tmp.path(), &config_text(&root, 1000)).unwrap();
-    let cap = config.metrics_limits.max_connections;
+    let cap = config.metrics_limits.max_connections();
     let svc = start(config, slow_routes(Duration::from_millis(1))).await;
     let channel = ipc::uds::connect(&svc.socket, me()).await.unwrap();
     let mut client = EngineServiceClient::new(channel);

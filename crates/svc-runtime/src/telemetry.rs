@@ -275,11 +275,23 @@ pub async fn bind_metrics(port: u16) -> io::Result<TcpListener> {
 /// Bounds on the `/metrics` listener. Any local user can connect to it (it is TCP on
 /// loopback, outside the socket directory's group check), so it must not be able to use up the
 /// service's descriptors or tasks.
+///
+/// Built only through [`MetricsLimits::new`] (or [`Default`]), which checks the connection cap:
+/// 0 would serve nothing, and above tokio's `Semaphore::MAX_PERMITS` [`serve_metrics`] would
+/// panic.
+///
+/// ```compile_fail,E0451
+/// let _ = svc_runtime::telemetry::MetricsLimits {
+///     max_connections: 0,
+///     connection_timeout: std::time::Duration::from_secs(1),
+/// };
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MetricsLimits {
-    /// Connections served at once; one over this is accepted and closed at once. A config may
-    /// ask for 1..=[`MAX_METRICS_CONNECTIONS`].
-    pub max_connections: usize,
+    /// Connections served at once; one over this is accepted and closed at once:
+    /// 1..=[`MAX_METRICS_CONNECTIONS`]. Crate-visible only for the config loader, which checks
+    /// the same range.
+    pub(crate) max_connections: usize,
     /// The longest a connection lives, request and response included.
     pub connection_timeout: Duration,
 }
@@ -293,6 +305,33 @@ pub const DEFAULT_METRICS_CONNECTIONS: usize = 8;
 /// panics.
 pub const MAX_METRICS_CONNECTIONS: usize = 1024;
 const _: () = assert!(MAX_METRICS_CONNECTIONS <= tokio::sync::Semaphore::MAX_PERMITS);
+
+/// Why [`MetricsLimits::new`] refused a limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum MetricsLimitsError {
+    #[error("max_connections {0} is outside 1..={MAX_METRICS_CONNECTIONS}")]
+    MaxConnections(usize),
+}
+
+impl MetricsLimits {
+    /// Limits serving at most `max_connections` at once (1..=[`MAX_METRICS_CONNECTIONS`]), with
+    /// the default connection timeout.
+    pub fn new(max_connections: usize) -> Result<Self, MetricsLimitsError> {
+        if max_connections == 0 || max_connections > MAX_METRICS_CONNECTIONS {
+            return Err(MetricsLimitsError::MaxConnections(max_connections));
+        }
+        Ok(Self {
+            max_connections,
+            ..Self::default()
+        })
+    }
+
+    /// Connections served at once.
+    #[must_use]
+    pub fn max_connections(&self) -> usize {
+        self.max_connections
+    }
+}
 
 impl Default for MetricsLimits {
     fn default() -> Self {
@@ -516,6 +555,30 @@ mod tests {
         slow.await.unwrap().unwrap();
         svc.oneshot(http::Request::new(())).await.unwrap();
         assert_eq!((m.requests.get(), m.inflight.get()), (2, 0));
+    }
+
+    #[test]
+    fn metrics_limits_are_checked_when_built() {
+        for n in [0, MAX_METRICS_CONNECTIONS + 1, usize::MAX] {
+            let err = MetricsLimits::new(n).unwrap_err();
+            assert_eq!(err, MetricsLimitsError::MaxConnections(n));
+            assert_eq!(
+                err.to_string(),
+                format!("max_connections {n} is outside 1..={MAX_METRICS_CONNECTIONS}")
+            );
+        }
+        for n in [1, DEFAULT_METRICS_CONNECTIONS, MAX_METRICS_CONNECTIONS] {
+            let limits = MetricsLimits::new(n).unwrap();
+            assert_eq!(limits.max_connections(), n);
+            assert_eq!(
+                limits.connection_timeout,
+                MetricsLimits::default().connection_timeout
+            );
+        }
+        assert_eq!(
+            MetricsLimits::default().max_connections(),
+            DEFAULT_METRICS_CONNECTIONS
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
