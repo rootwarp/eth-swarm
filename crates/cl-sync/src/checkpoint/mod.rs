@@ -7,12 +7,14 @@
 //!
 //! - [`config`]: `anchor-fetch.toml`, two providers as `{name, operator, url}`.
 //! - [`http`]: the hyper 1 + rustls client and the byte-capped quarantine download.
+//! - [`outdir`]: the output directory and its quarantine, checked and held by descriptor.
 //! - [`runlog`]: the JSON-lines run log and its verifier.
 //! - [`fetch`]: resolve, fetch, check, and write `anchor.json`.
 
 pub mod config;
 pub mod fetch;
 pub mod http;
+pub mod outdir;
 pub mod runlog;
 
 #[cfg(test)]

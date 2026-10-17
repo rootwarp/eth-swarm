@@ -21,15 +21,28 @@
 //! 4. **Write.** The run log must name both providers ([`runlog::verify`]); then [`publish`]
 //!    hard-links `block.ssz` and `state.ssz` out of quarantine and `anchor.json` from a new,
 //!    uniquely named, fsynced temp file, none of them replacing an existing file, and fsyncs
-//!    the directory. A failed step removes what was published, and a crash never leaves a
-//!    partial `anchor.json`.
+//!    the directory. A failed step removes what was published; if that cleanup fails too, the
+//!    error is [`AnchorError::PublishRolledBackIncompletely`] and lists the files left behind.
+//!
+//! **`anchor.json` is the commit marker.** It is linked last, so a crash (SIGKILL, power loss)
+//! between the links can leave `block.ssz` or `state.ssz` without it, but never a partial
+//! `anchor.json`. A consumer must ignore `block.ssz` and `state.ssz` unless an `anchor.json`
+//! next to them names their sha256 values and they match.
+//!
+//! The output directory is opened once, with `O_DIRECTORY | O_NOFOLLOW`, and refused
+//! ([`AnchorError::UnsafePath`]) if it is a symlink, owned by another user, or writable by
+//! group or other; so is `quarantine/`. Every later file operation is relative to those held
+//! descriptors ([`crate::checkpoint::outdir`]), so another user cannot redirect a write by
+//! renaming a path after the checks.
 //!
 //! The run holds an exclusive `flock` on `<out>/.lock` from before the run log is opened until
 //! publication, so two runs never share an output directory; each run also streams into its
 //! own `quarantine/<random>/`.
 //!
 //! Any failure aborts with a named [`AnchorError`], deletes the quarantined bodies, records an
-//! `abort` line in the run log, and writes no `anchor.json`.
+//! `abort` line in the run log, and leaves no `anchor.json` this run published, unless the
+//! rollback of a failed publish fails too: then the error and the `abort` line's `left` list
+//! name every file that may remain, and the operator deletes them.
 //!
 //! The SSZ is decoded with the Gloas shape, the fork this fetcher requests; a response that
 //! names another fork in `Eth-Consensus-Version` is refused ([`AnchorError::WrongFork`]).
@@ -37,10 +50,12 @@
 use crate::checkpoint::api::{Checkpoint, FinalityResponse, HeaderResponse};
 use crate::checkpoint::config::{Config, Provider};
 use crate::checkpoint::http::{Client, Download};
+use crate::checkpoint::outdir::{Dir, UnsafeReason};
 use crate::checkpoint::runlog::{self, RunLog, RunLogError};
 use consensus_types::common::BeaconBlockHeader;
 use consensus_types::primitives::Root;
 use consensus_types::{forked, gloas, EthSpec, ForkName};
+use rustix::fs::OFlags;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::{self, Write};
@@ -87,6 +102,10 @@ pub enum AnchorError {
     /// The output directory already holds an anchor, block or state.
     #[error("{} already exists; an anchor is never replaced", path.display())]
     OutputExists { path: PathBuf },
+    /// The output directory, its quarantine, or a file the run opens in it is a symlink, of
+    /// the wrong type, owned by another user, or writable by group or other.
+    #[error("{} {reason}; refusing to use it", path.display())]
+    UnsafePath { path: PathBuf, reason: UnsafeReason },
     /// Another run holds the output directory's lock.
     #[error("{} is in use by another anchor-fetch run", path.display())]
     OutDirBusy { path: PathBuf },
@@ -165,6 +184,17 @@ pub enum AnchorError {
         #[source]
         source: io::Error,
     },
+    /// Publishing failed (`cause`) and so did removing what it had published (`cleanup`): the
+    /// files in `left` may still be in the output directory. Recovery: delete them by hand.
+    #[error(
+        "{cause}; the rollback failed too ({cleanup}): delete these files by hand: {}",
+        display_paths(left)
+    )]
+    PublishRolledBackIncompletely {
+        cause: Box<AnchorError>,
+        cleanup: String,
+        left: Vec<PathBuf>,
+    },
 }
 
 impl AnchorError {
@@ -175,6 +205,7 @@ impl AnchorError {
             AnchorError::SameOperator { .. } => "same_operator",
             AnchorError::SameHost { .. } => "same_host",
             AnchorError::OutputExists { .. } => "output_exists",
+            AnchorError::UnsafePath { .. } => "unsafe_path",
             AnchorError::OutDirBusy { .. } => "out_dir_busy",
             AnchorError::Transport { .. } => "transport",
             AnchorError::Timeout { .. } => "timeout",
@@ -192,6 +223,16 @@ impl AnchorError {
             AnchorError::StateRootMismatch { .. } => "state_root_mismatch",
             AnchorError::RunLog(_) => "run_log",
             AnchorError::Io { .. } => "io",
+            AnchorError::PublishRolledBackIncompletely { .. } => "publish_rollback_incomplete",
+        }
+    }
+
+    /// The files a failed rollback left in the output directory (empty for every other
+    /// error); the operator deletes them.
+    pub fn left_behind(&self) -> &[PathBuf] {
+        match self {
+            AnchorError::PublishRolledBackIncompletely { left, .. } => left,
+            _ => &[],
         }
     }
 
@@ -204,11 +245,14 @@ impl AnchorError {
             | AnchorError::SameOperator { .. }
             | AnchorError::SameHost { .. }
             | AnchorError::OutputExists { .. }
+            | AnchorError::UnsafePath { .. }
             | AnchorError::OutDirBusy { .. } => 2,
             AnchorError::Transport { .. }
             | AnchorError::Timeout { .. }
             | AnchorError::HttpStatus { .. } => 3,
-            AnchorError::RunLog(_) | AnchorError::Io { .. } => 4,
+            AnchorError::RunLog(_)
+            | AnchorError::Io { .. }
+            | AnchorError::PublishRolledBackIncompletely { .. } => 4,
             AnchorError::BadResponse { .. }
             | AnchorError::BodyTooLarge { .. }
             | AnchorError::ProvidersDisagree(_)
@@ -275,12 +319,16 @@ pub fn root_hex(root: &Root) -> String {
     format!("0x{}", alloy_primitives::hex::encode(root))
 }
 
-/// Runs one fetch: reads `config_path`, writes into `out_dir` (created if missing), appends
-/// to its run log (echoed to stderr with `echo`). On success `anchor.json` exists and is
-/// returned; on any error it does not, and the error is the run log's last line.
+/// Runs one fetch: reads `config_path`, writes into `out_dir` (created mode 0700 if missing),
+/// appends to its run log (echoed to stderr with `echo`). On success `anchor.json` exists and
+/// is returned; on any error the error is the run log's last line and this run published
+/// nothing, unless the publish's rollback failed
+/// ([`AnchorError::PublishRolledBackIncompletely`] lists what may remain).
 ///
-/// The run holds an exclusive `flock` on `<out>/.lock` throughout; a second run into the same
-/// directory fails at once with [`AnchorError::OutDirBusy`] and leaves the run log alone.
+/// An unsafe `out_dir` (a symlink, another user's, or group/other-writable) or `run.log` is
+/// refused with [`AnchorError::UnsafePath`] before anything is written. The run holds an
+/// exclusive `flock` on `<out>/.lock` throughout; a second run into the same directory fails
+/// at once with [`AnchorError::OutDirBusy`] and leaves the run log alone.
 pub async fn run<E: EthSpec>(
     config_path: &Path,
     out_dir: &Path,
@@ -296,13 +344,11 @@ pub(crate) async fn run_with<E: EthSpec>(
     echo: bool,
     fs: &dyn PublishFs,
 ) -> Result<Anchor, AnchorError> {
-    std::fs::create_dir_all(out_dir).map_err(|e| io_err("create", out_dir, e))?;
-    let _lock = lock_out_dir(out_dir)?;
-    let log_path = out_dir.join(RUN_LOG_FILE);
-    let mut log = RunLog::open(&log_path, echo).map_err(|e| io_err("open", &log_path, e))?;
+    let out = Dir::open_out(out_dir)?;
+    let _lock = lock_out_dir(&out)?;
+    let mut log = RunLog::open_in(&out, RUN_LOG_FILE, echo)?;
     log_event(
         &mut log,
-        &log_path,
         "start",
         json!({
             "version": env!("CARGO_PKG_VERSION"),
@@ -312,61 +358,71 @@ pub(crate) async fn run_with<E: EthSpec>(
     )?;
     let mut fetch = Fetch {
         log,
-        log_path,
-        out_dir: out_dir.to_owned(),
-        run_dir: None,
+        out,
+        quarantine: None,
     };
     let result = fetch.run::<E>(config_path, fs).await;
     fetch.discard_quarantine();
     if let Err(e) = &result {
+        let mut fields = json!({"error": e.name(), "message": e.to_string()});
+        let left = e.left_behind();
+        if !left.is_empty() {
+            let left: Vec<_> = left.iter().map(|p| p.display().to_string()).collect();
+            fields["left"] = json!(left);
+        }
         // The abort line is best effort: the error already says what went wrong.
-        let _ = fetch.log.event(
-            "abort",
-            json!({"error": e.name(), "message": e.to_string()}),
-        );
+        let _ = fetch.log.event("abort", fields);
     }
     result
 }
 
 /// Opens `<out>/.lock` (mode 0600, never through a symlink) and takes an exclusive,
-/// non-blocking `flock` on it; the lock lasts as long as the returned descriptor.
-fn lock_out_dir(out_dir: &Path) -> Result<rustix::fd::OwnedFd, AnchorError> {
-    use rustix::fs::{FlockOperation, Mode, OFlags};
-    let path = out_dir.join(LOCK_FILE);
-    let fd = rustix::fs::open(
-        &path,
-        OFlags::CREATE | OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .map_err(|e| io_err("open", &path, e.into()))?;
-    match rustix::fs::flock(&fd, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(fd),
+/// non-blocking `flock` on it; the lock lasts as long as the returned file.
+fn lock_out_dir(out: &Dir) -> Result<std::fs::File, AnchorError> {
+    use rustix::fs::FlockOperation;
+    let file = out.open_private_file(LOCK_FILE, OFlags::RDWR)?;
+    match rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(file),
         Err(e) if e == rustix::io::Errno::WOULDBLOCK => Err(AnchorError::OutDirBusy {
-            path: out_dir.to_owned(),
+            path: out.path().to_owned(),
         }),
-        Err(e) => Err(io_err("flock", &path, e.into())),
+        Err(e) => Err(io_err("flock", &out.join(LOCK_FILE), e.into())),
     }
 }
 
-/// The file operations of the publish step, so tests can fail one of them.
+/// The file operations of the publish step and its rollback, so tests can fail one of them.
 pub(crate) trait PublishFs: Sync {
-    /// Hard-links `from` to `to`, failing with `AlreadyExists` rather than replacing `to`.
-    fn link(&self, from: &Path, to: &Path) -> io::Result<()>;
+    /// Hard-links `name` in `from` to `to_name` in `to`, failing with `AlreadyExists` rather
+    /// than replacing it.
+    fn link(&self, from: &Dir, name: &str, to: &Dir, to_name: &str) -> io::Result<()>;
+    /// Removes the file `name` in `dir`.
+    fn unlink(&self, dir: &Dir, name: &str) -> io::Result<()>;
     /// fsyncs the directory `dir`.
-    fn sync_dir(&self, dir: &Path) -> io::Result<()>;
+    fn sync_dir(&self, dir: &Dir) -> io::Result<()>;
 }
 
 /// The real file system.
 pub(crate) struct RealFs;
 
 impl PublishFs for RealFs {
-    fn link(&self, from: &Path, to: &Path) -> io::Result<()> {
-        std::fs::hard_link(from, to)
+    fn link(&self, from: &Dir, name: &str, to: &Dir, to_name: &str) -> io::Result<()> {
+        from.link(name, to, to_name)
     }
 
-    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
-        std::fs::File::open(dir)?.sync_all()
+    fn unlink(&self, dir: &Dir, name: &str) -> io::Result<()> {
+        dir.unlink(name)
     }
+
+    fn sync_dir(&self, dir: &Dir) -> io::Result<()> {
+        dir.sync()
+    }
+}
+
+/// `quarantine/` and this run's own `quarantine/<random>/` in it.
+struct Quarantine {
+    parent: Dir,
+    name: String,
+    run: Dir,
 }
 
 /// The agreed candidate after resolution.
@@ -378,15 +434,14 @@ struct Resolved {
 
 struct Fetch {
     log: RunLog,
-    log_path: PathBuf,
-    out_dir: PathBuf,
-    /// This run's `quarantine/<random>/`, once created.
-    run_dir: Option<PathBuf>,
+    out: Dir,
+    /// Opened first thing in [`Fetch::run`].
+    quarantine: Option<Quarantine>,
 }
 
 impl Fetch {
     fn event(&mut self, event: &str, fields: serde_json::Value) -> Result<(), AnchorError> {
-        log_event(&mut self.log, &self.log_path, event, fields)
+        log_event(&mut self.log, event, fields)
     }
 
     fn check(&mut self, check: &str, ok: bool) -> Result<(), AnchorError> {
@@ -396,9 +451,32 @@ impl Fetch {
     /// Removes this run's quarantine directory: after a failure the bodies are untrusted, and
     /// after publishing they are hard-linked into the output directory.
     fn discard_quarantine(&mut self) {
-        if let Some(dir) = self.run_dir.take() {
-            let _ = std::fs::remove_dir_all(dir);
+        if let Some(q) = self.quarantine.take() {
+            drop(q.run);
+            let _ = q.parent.remove_child(&q.name);
         }
+    }
+
+    /// Opens `quarantine/` (created mode 0700 if missing) and creates this run's own
+    /// `quarantine/<random>/` (mode 0700) in it; a new name never collides with another
+    /// run's or a crashed run's. Both are refused unless safe.
+    fn open_quarantine(&mut self) -> Result<(), AnchorError> {
+        let parent = self.out.open_child(QUARANTINE_DIR, true)?;
+        let name = random_name()?;
+        let run = parent.create_child(&name)?;
+        self.quarantine = Some(Quarantine { parent, name, run });
+        Ok(())
+    }
+
+    /// This run's quarantine directory.
+    fn run_dir(&self) -> Result<&Dir, AnchorError> {
+        self.quarantine
+            .as_ref()
+            .map(|q| &q.run)
+            .ok_or_else(|| AnchorError::Io {
+                context: "quarantine".into(),
+                source: io::Error::other("not opened"),
+            })
     }
 
     async fn run<E: EthSpec>(
@@ -406,6 +484,7 @@ impl Fetch {
         config_path: &Path,
         fs: &dyn PublishFs,
     ) -> Result<Anchor, AnchorError> {
+        self.open_quarantine()?;
         let config = Config::load(config_path)?;
         for (role, p) in [("a", &config.a), ("b", &config.b)] {
             self.event(
@@ -415,9 +494,10 @@ impl Fetch {
         }
         // Checked up front so a run does not download for nothing; publish enforces it.
         for file in [ANCHOR_FILE, BLOCK_FILE, STATE_FILE] {
-            let path = self.out_dir.join(file);
-            if path.symlink_metadata().is_ok() {
-                return Err(AnchorError::OutputExists { path });
+            if self.out.exists(file)? {
+                return Err(AnchorError::OutputExists {
+                    path: self.out.join(file),
+                });
             }
         }
         if config.allow_insecure_http {
@@ -431,7 +511,7 @@ impl Fetch {
             .fetch_state::<E>(&client, &config, &resolved, &block.0)
             .await?;
 
-        runlog::verify_file(&self.log_path)?;
+        self.log.verify()?;
         self.check("run_log_names_providers", true)?;
 
         let record = |role: &str, p: &Provider| ProviderRecord {
@@ -462,10 +542,10 @@ impl Fetch {
             context: "serialize anchor.json".into(),
             source: e.into(),
         })?;
-        // Logged first: publishing is the last fallible step, and it rolls itself back.
+        // Logged first: publishing is the last fallible step, and it rolls itself back (or
+        // reports what it could not remove).
         self.event("anchor", serde_json::to_value(&anchor).unwrap_or_default())?;
-        let run_dir = self.run_dir()?;
-        publish(fs, &run_dir, &self.out_dir, &text)?;
+        publish(fs, self.run_dir()?, &self.out, &text)?;
         Ok(anchor)
     }
 
@@ -557,29 +637,6 @@ impl Fetch {
         })
     }
 
-    /// This run's own quarantine directory, `quarantine/<random>/` (both mode 0700), created
-    /// on first use; a new name never collides with another run's or a crashed run's.
-    fn run_dir(&mut self) -> Result<PathBuf, AnchorError> {
-        if let Some(dir) = &self.run_dir {
-            return Ok(dir.clone());
-        }
-        let parent = self.out_dir.join(QUARANTINE_DIR);
-        private_dir(true)
-            .create(&parent)
-            .map_err(|e| io_err("create", &parent, e))?;
-        let dir = parent.join(random_name()?);
-        private_dir(false)
-            .create(&dir)
-            .map_err(|e| io_err("create", &dir, e))?;
-        self.run_dir = Some(dir.clone());
-        Ok(dir)
-    }
-
-    /// The path for `file` in this run's quarantine; the download creates it new.
-    fn prepare_quarantine(&mut self, file: &str) -> Result<PathBuf, AnchorError> {
-        Ok(self.run_dir()?.join(file))
-    }
-
     /// Downloads `path` from `provider` into quarantine as `file` (a response naming another
     /// fork is refused before its body is read), logs it, and returns it with its bytes.
     async fn download(
@@ -591,9 +648,16 @@ impl Fetch {
         path: &str,
         file: &str,
     ) -> Result<(Download, Vec<u8>), AnchorError> {
-        let dest = self.prepare_quarantine(file)?;
+        let run_dir = self.run_dir()?;
         let d = client
-            .download_ssz(provider, path, FORK.as_str(), &dest, config.max_body_bytes)
+            .download_ssz(
+                provider,
+                path,
+                FORK.as_str(),
+                run_dir,
+                file,
+                config.max_body_bytes,
+            )
             .await?;
         self.event(
             "fetch",
@@ -604,9 +668,13 @@ impl Fetch {
             }),
         )?;
         // The file is at most `max_body_bytes`; decoding needs it in memory.
-        let bytes = tokio::fs::read(&dest)
+        let run_dir = self.run_dir()?;
+        let read = |e| io_err("read", &run_dir.join(file), e);
+        let mut bytes = Vec::new();
+        let mut f = tokio::fs::File::from_std(run_dir.open_read(file).map_err(read)?);
+        tokio::io::AsyncReadExt::read_to_end(&mut f, &mut bytes)
             .await
-            .map_err(|e| io_err("read", &dest, e))?;
+            .map_err(read)?;
         Ok((d, bytes))
     }
 
@@ -758,14 +826,14 @@ fn differing_field(a: &BeaconBlockHeader, b: &BeaconBlockHeader) -> Option<&'sta
     .find_map(|(field, same)| (!same).then_some(field))
 }
 
-fn log_event(
-    log: &mut RunLog,
-    path: &Path,
-    event: &str,
-    fields: serde_json::Value,
-) -> Result<(), AnchorError> {
+fn log_event(log: &mut RunLog, event: &str, fields: serde_json::Value) -> Result<(), AnchorError> {
     log.event(event, fields)
-        .map_err(|e| io_err("write", path, e))
+        .map_err(|e| io_err("write", log.path(), e))
+}
+
+fn display_paths(paths: &[PathBuf]) -> String {
+    let shown: Vec<_> = paths.iter().map(|p| p.display().to_string()).collect();
+    shown.join(", ")
 }
 
 fn io_err(what: &str, path: &Path, source: io::Error) -> AnchorError {
@@ -783,15 +851,6 @@ fn bad_response(p: &Provider, path: &str, reason: &str) -> AnchorError {
     }
 }
 
-/// A `DirBuilder` for mode 0700 directories.
-fn private_dir(recursive: bool) -> std::fs::DirBuilder {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(recursive);
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder
-}
-
 /// 32 random hex digits from the OS RNG.
 fn random_name() -> Result<String, AnchorError> {
     let draw = || getrandom::u64().map_err(|e| io::Error::other(e.to_string()));
@@ -805,70 +864,125 @@ fn random_name() -> Result<String, AnchorError> {
     }
 }
 
-/// Publishes the checked bodies in `run_dir` and `anchor_json` into `out_dir`, never
-/// replacing an existing file: `block.ssz` and `state.ssz` are hard-linked in, `anchor.json`
-/// is written to a new uniquely named temp file (fsynced) and hard-linked in last, then the
-/// directory is fsynced. Any failure removes every file this call published, so the output
-/// directory holds all three or none of them.
+/// Publishes the checked bodies in `run_dir` and `anchor_json` into `out`, never replacing an
+/// existing file: `block.ssz` and `state.ssz` are hard-linked in, `anchor.json` is written to a
+/// new uniquely named temp file (fsynced) and hard-linked in last, then the directory is
+/// fsynced. `anchor.json` is the commit marker: a crash between the links can leave the
+/// bodies without it, never the reverse.
+///
+/// A failed step is rolled back: the temp file and every file this call published are
+/// removed (newest first) and `out` is fsynced again. When that cleanup succeeds `out` holds
+/// none of this call's files and the step's error is returned. When it fails (an unlink
+/// error, or an fsync error that leaves the removals not durable) the error is
+/// [`AnchorError::PublishRolledBackIncompletely`], whose `left` lists every file that may
+/// remain; the operator deletes those files by hand.
 pub(crate) fn publish(
     fs: &dyn PublishFs,
-    run_dir: &Path,
-    out_dir: &Path,
+    run_dir: &Dir,
+    out: &Dir,
     anchor_json: &[u8],
 ) -> Result<(), AnchorError> {
-    let tmp = out_dir.join(format!(".{ANCHOR_FILE}.{}.tmp", random_name()?));
-    let mut published = Vec::with_capacity(3);
-    let result = publish_steps(fs, run_dir, out_dir, &tmp, anchor_json, &mut published);
-    let _ = std::fs::remove_file(&tmp);
-    if result.is_err() {
-        for path in published.iter().rev() {
-            let _ = std::fs::remove_file(path);
-        }
-        let _ = fs.sync_dir(out_dir);
+    let tmp = format!(".{ANCHOR_FILE}.{}.tmp", random_name()?);
+    let mut progress = Progress::default();
+    match publish_steps(fs, run_dir, out, &tmp, anchor_json, &mut progress) {
+        Ok(()) => Ok(()),
+        Err(cause) => Err(roll_back(fs, out, &tmp, &progress, cause)),
     }
-    result
+}
+
+/// How far [`publish_steps`] got.
+#[derive(Default)]
+struct Progress {
+    /// The names linked into the output directory, in order.
+    published: Vec<&'static str>,
+    /// The temp file was unlinked, not yet durably (that is the final fsync's job).
+    tmp_removed: bool,
 }
 
 fn publish_steps(
     fs: &dyn PublishFs,
-    run_dir: &Path,
-    out_dir: &Path,
-    tmp: &Path,
+    run_dir: &Dir,
+    out: &Dir,
+    tmp: &str,
     anchor_json: &[u8],
-    published: &mut Vec<PathBuf>,
+    progress: &mut Progress,
 ) -> Result<(), AnchorError> {
     for file in [BLOCK_FILE, STATE_FILE] {
-        let to = out_dir.join(file);
-        link_new(fs, &run_dir.join(file), &to)?;
-        published.push(to);
+        link_new(fs, run_dir, file, out, file)?;
+        progress.published.push(file);
     }
-    write_new(tmp, anchor_json).map_err(|e| io_err("write", tmp, e))?;
-    let anchor = out_dir.join(ANCHOR_FILE);
-    link_new(fs, tmp, &anchor)?;
-    published.push(anchor);
-    std::fs::remove_file(tmp).map_err(|e| io_err("remove", tmp, e))?;
-    fs.sync_dir(out_dir)
-        .map_err(|e| io_err("fsync", out_dir, e))
+    write_new(out, tmp, anchor_json).map_err(|e| io_err("write", &out.join(tmp), e))?;
+    link_new(fs, out, tmp, out, ANCHOR_FILE)?;
+    progress.published.push(ANCHOR_FILE);
+    fs.unlink(out, tmp)
+        .map_err(|e| io_err("remove", &out.join(tmp), e))?;
+    progress.tmp_removed = true;
+    fs.sync_dir(out).map_err(|e| io_err("fsync", out.path(), e))
 }
 
-fn link_new(fs: &dyn PublishFs, from: &Path, to: &Path) -> Result<(), AnchorError> {
-    match fs.link(from, to) {
+/// Removes the temp file and the published names (newest first) from `out` and fsyncs it,
+/// after `cause`. Returns `cause` if that worked, else the incomplete rollback with every
+/// file that may be left: those it could not remove and, if the fsync failed, every removal
+/// not yet on disk (the temp file's included, even when [`publish_steps`] removed it).
+fn roll_back(
+    fs: &dyn PublishFs,
+    out: &Dir,
+    tmp: &str,
+    progress: &Progress,
+    cause: AnchorError,
+) -> AnchorError {
+    let mut failures = Vec::new();
+    let mut left = Vec::new();
+    let mut removed = Vec::new();
+    if progress.tmp_removed {
+        removed.push(out.join(tmp));
+    }
+    let names = std::iter::once(tmp).chain(progress.published.iter().rev().copied());
+    for name in names {
+        match fs.unlink(out, name) {
+            Ok(()) => removed.push(out.join(name)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                failures.push(format!("remove {}: {e}", out.join(name).display()));
+                left.push(out.join(name));
+            }
+        }
+    }
+    if let Err(e) = fs.sync_dir(out) {
+        // The removals may not be on disk: after a crash every removed file can come back.
+        failures.push(format!("fsync {}: {e}", out.path().display()));
+        left.extend(removed);
+    }
+    if failures.is_empty() {
+        return cause;
+    }
+    AnchorError::PublishRolledBackIncompletely {
+        cause: Box::new(cause),
+        cleanup: failures.join("; "),
+        left,
+    }
+}
+
+fn link_new(
+    fs: &dyn PublishFs,
+    from: &Dir,
+    name: &str,
+    to: &Dir,
+    to_name: &str,
+) -> Result<(), AnchorError> {
+    match fs.link(from, name, to, to_name) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(AnchorError::OutputExists {
-            path: to.to_owned(),
+            path: to.join(to_name),
         }),
-        Err(e) => Err(io_err("link", to, e)),
+        Err(e) => Err(io_err("link", &to.join(to_name), e)),
     }
 }
 
-/// Writes `bytes` to a file that must not exist yet (`O_CREAT | O_EXCL`, so a planted symlink
-/// is refused, not followed), mode 0600, and fsyncs it.
-pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut f = options.open(path)?;
+/// Writes `bytes` to the file `name` in `dir`, which must not exist yet (`O_CREAT | O_EXCL`,
+/// so a planted symlink is refused, not followed), mode 0600, and fsyncs it.
+pub(crate) fn write_new(dir: &Dir, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let mut f = dir.create_new(name)?;
     f.write_all(bytes)?;
     f.sync_all()
 }

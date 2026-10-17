@@ -15,6 +15,7 @@
 
 use crate::checkpoint::config::{Provider, Scheme};
 use crate::checkpoint::fetch::AnchorError;
+use crate::checkpoint::outdir::Dir;
 use bytes::Bytes;
 use http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, HOST, USER_AGENT};
 use http::{Request, Response, StatusCode};
@@ -25,7 +26,6 @@ use rustls::pki_types::ServerName;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use std::fmt::Display;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -117,15 +117,17 @@ impl Client {
         })
     }
 
-    /// GETs `path` as SSZ of `expected_version` and streams the body into `dest` (created
-    /// new, mode 0600) under `cap` bytes. A response whose `Eth-Consensus-Version` names
-    /// another fork is refused before its body is read. Deletes `dest` on any failure.
+    /// GETs `path` as SSZ of `expected_version` and streams the body into the file `name`
+    /// in `dir` (created new, mode 0600, never through a symlink) under `cap` bytes. A
+    /// response whose `Eth-Consensus-Version` names another fork is refused before its body
+    /// is read. Deletes the file on any failure.
     pub async fn download_ssz(
         &self,
         provider: &Provider,
         path: &str,
         expected_version: &str,
-        dest: &Path,
+        dir: &Dir,
+        name: &str,
         cap: u64,
     ) -> Result<Download, AnchorError> {
         let response = self
@@ -157,7 +159,7 @@ impl Client {
                 });
             }
         }
-        let copy = stream_to_file(response.into_body(), dest, cap, provider, path);
+        let copy = stream_to_file(response.into_body(), dir, name, cap, provider, path);
         let result = match tokio::time::timeout(self.body_timeout, copy).await {
             Ok(result) => result,
             Err(_) => Err(timeout(provider, path)),
@@ -170,7 +172,7 @@ impl Client {
             }),
             Err(e) => {
                 // The file may not exist (refused before creation); either way it is gone.
-                let _ = tokio::fs::remove_file(dest).await;
+                let _ = dir.unlink(name);
                 Err(e)
             }
         }
@@ -250,11 +252,12 @@ where
     sender.send_request(request).await
 }
 
-/// Streams `body` into a new file at `dest`, failing as soon as more than `cap` bytes arrive.
-/// Returns the length and sha256. The caller deletes `dest` on failure.
+/// Streams `body` into the new file `name` in `dir`, failing as soon as more than `cap` bytes
+/// arrive. Returns the length and sha256. The caller deletes the file on failure.
 async fn stream_to_file<B>(
     mut body: B,
-    dest: &Path,
+    dir: &Dir,
+    name: &str,
     cap: u64,
     provider: &Provider,
     path: &str,
@@ -264,16 +267,10 @@ where
     B::Error: Display,
 {
     let io = |what: &str, source| AnchorError::Io {
-        context: format!("{what} {}", dest.display()),
+        context: format!("{what} {}", dir.join(name).display()),
         source,
     };
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(dest)
-        .await
-        .map_err(|e| io("create", e))?;
+    let mut file = tokio::fs::File::from_std(dir.create_new(name).map_err(|e| io("create", e))?);
     let mut hasher = Sha256::new();
     let mut len: u64 = 0;
     while let Some(frame) = body.frame().await {
@@ -437,12 +434,14 @@ mod tests {
         .await;
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("x.ssz");
+        let out = Dir::open_out(dir.path()).unwrap();
         let got = client()
             .download_ssz(
                 &provider(s.addr, Scheme::Http),
                 "/ssz",
                 "gloas",
-                &dest,
+                &out,
+                "x.ssz",
                 300_000,
             )
             .await
@@ -461,12 +460,14 @@ mod tests {
         let s = serve("/ssz", Reply::Declared(1025)).await;
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("x.ssz");
+        let out = Dir::open_out(dir.path()).unwrap();
         let err = client()
             .download_ssz(
                 &provider(s.addr, Scheme::Http),
                 "/ssz",
                 "gloas",
-                &dest,
+                &out,
+                "x.ssz",
                 1024,
             )
             .await
@@ -490,12 +491,14 @@ mod tests {
         let s = serve("/ssz", Reply::Endless).await;
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("x.ssz");
+        let out = Dir::open_out(dir.path()).unwrap();
         let err = client()
             .download_ssz(
                 &provider(s.addr, Scheme::Http),
                 "/ssz",
                 "gloas",
-                &dest,
+                &out,
+                "x.ssz",
                 1 << 20,
             )
             .await
@@ -528,14 +531,15 @@ mod tests {
         .await;
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("x.ssz");
+        let out = Dir::open_out(dir.path()).unwrap();
         let p = provider(s.addr, Scheme::Http);
         let err = client()
-            .download_ssz(&p, "/json", "gloas", &dest, 1024)
+            .download_ssz(&p, "/json", "gloas", &out, "x.ssz", 1024)
             .await
             .unwrap_err();
         assert!(matches!(err, AnchorError::BadResponse { .. }), "{err:?}");
         let err = client()
-            .download_ssz(&p, "/gone", "gloas", &dest, 1024)
+            .download_ssz(&p, "/gone", "gloas", &out, "x.ssz", 1024)
             .await
             .unwrap_err();
         assert!(
@@ -557,12 +561,14 @@ mod tests {
         .await;
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("x.ssz");
+        let out = Dir::open_out(dir.path()).unwrap();
         let err = client()
             .download_ssz(
                 &provider(s.addr, Scheme::Http),
                 "/ssz",
                 "gloas",
-                &dest,
+                &out,
+                "x.ssz",
                 1024,
             )
             .await
@@ -579,13 +585,15 @@ mod tests {
         let s = serve("/ssz", Reply::Endless).await;
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("x.ssz");
+        let out = Dir::open_out(dir.path()).unwrap();
         let c = Client::new(Duration::from_secs(5), Duration::from_millis(200)).unwrap();
         let err = c
             .download_ssz(
                 &provider(s.addr, Scheme::Http),
                 "/ssz",
                 "gloas",
-                &dest,
+                &out,
+                "x.ssz",
                 u64::MAX,
             )
             .await

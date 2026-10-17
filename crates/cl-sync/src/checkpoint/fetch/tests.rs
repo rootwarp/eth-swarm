@@ -1,6 +1,7 @@
 //! Two fixture beacon nodes on 127.0.0.1 serving a Gloas anchor built in code.
 
 use super::*;
+use crate::checkpoint::outdir::{Dir, UnsafeReason};
 use crate::checkpoint::runlog;
 use crate::checkpoint::testkit::gloas_fixture::{anchor, post_state};
 use crate::checkpoint::testkit::{Reply, Server};
@@ -12,7 +13,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use ssz::Encode;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{symlink, PermissionsExt};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tree_hash::TreeHash;
 
 const SLOT: u64 = 100;
@@ -600,6 +603,13 @@ fn every_error_has_a_distinct_name_and_a_non_zero_exit() {
         AnchorError::OutputExists {
             path: PathBuf::new(),
         },
+        AnchorError::UnsafePath {
+            path: PathBuf::new(),
+            reason: UnsafeReason::Symlink,
+        },
+        AnchorError::OutDirBusy {
+            path: PathBuf::new(),
+        },
         AnchorError::Transport {
             provider: s(),
             path: s(),
@@ -659,6 +669,14 @@ fn every_error_has_a_distinct_name_and_a_non_zero_exit() {
             context: s(),
             source: io(),
         },
+        AnchorError::PublishRolledBackIncompletely {
+            cause: Box::new(AnchorError::Io {
+                context: s(),
+                source: io(),
+            }),
+            cleanup: s(),
+            left: vec![PathBuf::from("block.ssz")],
+        },
     ];
     let mut names = std::collections::HashSet::new();
     for e in &errors {
@@ -669,24 +687,36 @@ fn every_error_has_a_distinct_name_and_a_non_zero_exit() {
 }
 
 /// Publish steps that fail on demand, otherwise the real ones.
+#[derive(Default)]
 struct FailingFs {
+    /// Fail the link to this name.
     fail_link_to: Option<&'static str>,
-    fail_sync: bool,
+    /// Fail the unlink of this name (the rollback's).
+    fail_unlink_of: Option<&'static str>,
+    /// Fail these `sync_dir` calls, counting from 0: the publish's own fsync is the last
+    /// step (call 0), then the rollback's; after a failed link the rollback's is call 0.
+    fail_sync_calls: &'static [usize],
+    syncs: AtomicUsize,
 }
 
 impl PublishFs for FailingFs {
-    fn link(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-        if self
-            .fail_link_to
-            .is_some_and(|f| to.file_name().unwrap() == f)
-        {
+    fn link(&self, from: &Dir, name: &str, to: &Dir, to_name: &str) -> std::io::Result<()> {
+        if self.fail_link_to == Some(to_name) {
             return Err(std::io::Error::other("injected link failure"));
         }
-        RealFs.link(from, to)
+        RealFs.link(from, name, to, to_name)
     }
 
-    fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
-        if self.fail_sync {
+    fn unlink(&self, dir: &Dir, name: &str) -> std::io::Result<()> {
+        if self.fail_unlink_of == Some(name) {
+            return Err(std::io::Error::other("injected unlink failure"));
+        }
+        RealFs.unlink(dir, name)
+    }
+
+    fn sync_dir(&self, dir: &Dir) -> std::io::Result<()> {
+        let call = self.syncs.fetch_add(1, Ordering::SeqCst);
+        if self.fail_sync_calls.contains(&call) {
             return Err(std::io::Error::other("injected fsync failure"));
         }
         RealFs.sync_dir(dir)
@@ -700,7 +730,7 @@ async fn a_failed_publish_step_rolls_back_every_published_file() {
         let net = Net::start(Node::honest(&a0, 5), Node::honest(&a0, 5)).await;
         let fs = FailingFs {
             fail_link_to: Some(fail_link_to),
-            fail_sync: false,
+            ..FailingFs::default()
         };
         let err = net.run_with(&fs).await.unwrap_err();
         assert!(
@@ -716,8 +746,8 @@ async fn a_failed_directory_fsync_removes_the_published_anchor() {
     let a0 = anchor0();
     let net = Net::start(Node::honest(&a0, 5), Node::honest(&a0, 5)).await;
     let fs = FailingFs {
-        fail_link_to: None,
-        fail_sync: true,
+        fail_sync_calls: &[0],
+        ..FailingFs::default()
     };
     let err = net.run_with(&fs).await.unwrap_err();
     net.assert_aborted(&err, "io");
@@ -733,7 +763,11 @@ fn publish_never_replaces_an_existing_anchor() {
     std::fs::write(run_dir.join(BLOCK_FILE), b"block").unwrap();
     std::fs::write(run_dir.join(STATE_FILE), b"state").unwrap();
     std::fs::write(out.join(ANCHOR_FILE), b"theirs").unwrap();
-    let err = publish(&RealFs, &run_dir, &out, b"ours").unwrap_err();
+    let (run, out_dir) = (
+        Dir::open_out(&run_dir).unwrap(),
+        Dir::open_out(&out).unwrap(),
+    );
+    let err = publish(&RealFs, &run, &out_dir, b"ours").unwrap_err();
     assert!(matches!(err, AnchorError::OutputExists { .. }), "{err:?}");
     assert_eq!(std::fs::read(out.join(ANCHOR_FILE)).unwrap(), b"theirs");
     assert!(!out.join(BLOCK_FILE).exists() && !out.join(STATE_FILE).exists());
@@ -746,21 +780,20 @@ fn publish_never_replaces_an_existing_anchor() {
     // The same holds for a block or state someone else put there.
     std::fs::remove_file(out.join(ANCHOR_FILE)).unwrap();
     std::fs::write(out.join(STATE_FILE), b"theirs").unwrap();
-    let err = publish(&RealFs, &run_dir, &out, b"ours").unwrap_err();
+    let err = publish(&RealFs, &run, &out_dir, b"ours").unwrap_err();
     assert!(matches!(err, AnchorError::OutputExists { .. }), "{err:?}");
     assert_eq!(std::fs::read(out.join(STATE_FILE)).unwrap(), b"theirs");
     assert!(!out.join(BLOCK_FILE).exists() && !out.join(ANCHOR_FILE).exists());
 }
 
-#[cfg(unix)]
 #[test]
 fn the_anchor_temp_file_never_follows_a_planted_symlink() {
     let dir = tempfile::tempdir().unwrap();
     let victim = dir.path().join("victim");
     std::fs::write(&victim, b"keep").unwrap();
-    let planted = dir.path().join("planted.tmp");
-    std::os::unix::fs::symlink(&victim, &planted).unwrap();
-    let err = write_new(&planted, b"anchor").unwrap_err();
+    symlink(&victim, dir.path().join("planted.tmp")).unwrap();
+    let out = Dir::open_out(dir.path()).unwrap();
+    let err = write_new(&out, "planted.tmp", b"anchor").unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
 }
@@ -866,4 +899,220 @@ async fn a_userinfo_secret_never_reaches_the_run_log_or_the_error() {
     let log = std::fs::read_to_string(out.join(RUN_LOG_FILE)).unwrap();
     assert!(!log.contains("hunter2"), "{log}");
     assert!(!out.join(ANCHOR_FILE).exists());
+}
+
+fn unsafe_reason(err: &AnchorError) -> UnsafeReason {
+    match err {
+        AnchorError::UnsafePath { reason, .. } => *reason,
+        other => panic!("not unsafe_path: {other:?}"),
+    }
+}
+
+fn chmod(path: &std::path::Path, bits: u32) {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap();
+}
+
+/// A refused output directory: named error, exit 2, no request made.
+fn assert_refused_before_any_request(net: &Net, err: &AnchorError, reason: UnsafeReason) {
+    assert_eq!(err.name(), "unsafe_path", "{err:?}");
+    assert_eq!(err.exit_code(), 2);
+    assert_eq!(unsafe_reason(err), reason);
+    assert!(net.a.paths().is_empty() && net.b.paths().is_empty());
+}
+
+#[tokio::test]
+async fn an_out_dir_that_is_a_symlink_is_refused() {
+    let a0 = anchor0();
+    let net = Net::start(Node::honest(&a0, 5), Node::honest(&a0, 5)).await;
+    let real = net.out.with_file_name("real");
+    std::fs::create_dir(&real).unwrap();
+    symlink(&real, &net.out).unwrap();
+    let err = net.run().await.unwrap_err();
+    assert_refused_before_any_request(&net, &err, UnsafeReason::Symlink);
+    // Nothing was written behind the link: no lock, run log or quarantine.
+    assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn a_group_or_other_writable_out_dir_is_refused() {
+    for bits in [0o770, 0o707] {
+        let a0 = anchor0();
+        let net = Net::start(Node::honest(&a0, 5), Node::honest(&a0, 5)).await;
+        std::fs::create_dir(&net.out).unwrap();
+        chmod(&net.out, bits);
+        let err = net.run().await.unwrap_err();
+        assert_refused_before_any_request(&net, &err, UnsafeReason::Writable { mode: bits });
+        assert_eq!(std::fs::read_dir(&net.out).unwrap().count(), 0, "{bits:o}");
+    }
+}
+
+#[tokio::test]
+async fn a_quarantine_that_is_a_symlink_is_refused() {
+    let a0 = anchor0();
+    let net = Net::start(Node::honest(&a0, 5), Node::honest(&a0, 5)).await;
+    let elsewhere = net.out.with_file_name("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::fs::create_dir(&net.out).unwrap();
+    symlink(&elsewhere, net.out.join(QUARANTINE_DIR)).unwrap();
+    let err = net.run().await.unwrap_err();
+    assert_refused_before_any_request(&net, &err, UnsafeReason::Symlink);
+    net.assert_aborted(&err, "unsafe_path");
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn a_planted_run_log_symlink_is_refused_and_its_target_is_untouched() {
+    let a0 = anchor0();
+    let net = Net::start(Node::honest(&a0, 5), Node::honest(&a0, 5)).await;
+    let victim = net.out.with_file_name("victim");
+    std::fs::write(&victim, b"keep").unwrap();
+    std::fs::create_dir(&net.out).unwrap();
+    symlink(&victim, net.out.join(RUN_LOG_FILE)).unwrap();
+    let err = net.run().await.unwrap_err();
+    assert_refused_before_any_request(&net, &err, UnsafeReason::Symlink);
+    assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+    assert!(!net.out.join(ANCHOR_FILE).exists());
+}
+
+#[tokio::test]
+async fn a_run_into_an_existing_private_out_dir_still_publishes() {
+    let a0 = anchor0();
+    let net = Net::start(Node::honest(&a0, 5), Node::honest(&a0, 5)).await;
+    std::fs::create_dir(&net.out).unwrap();
+    chmod(&net.out, 0o755);
+    std::fs::create_dir(net.out.join(QUARANTINE_DIR)).unwrap();
+    chmod(&net.out.join(QUARANTINE_DIR), 0o700);
+    let anchor = net.run().await.unwrap();
+    let block = std::fs::read(net.out.join(BLOCK_FILE)).unwrap();
+    assert_eq!(anchor.block.sha256, sha256_hex(&block));
+    assert!(net.out.join(ANCHOR_FILE).exists() && net.out.join(STATE_FILE).exists());
+}
+
+/// The abort line of a rollback that left files behind lists them.
+fn assert_abort_lists(net: &Net, left: &[PathBuf]) {
+    let last: Value = serde_json::from_str(net.run_log().lines().last().unwrap()).unwrap();
+    assert_eq!(last["event"], "abort");
+    assert_eq!(last["error"], "publish_rollback_incomplete");
+    let listed: Vec<_> = last["left"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| PathBuf::from(v.as_str().unwrap()))
+        .collect();
+    assert_eq!(listed, left);
+}
+
+#[tokio::test]
+async fn a_failed_rollback_unlink_reports_the_files_left_behind() {
+    let a0 = anchor0();
+    let net = Net::start(Node::honest(&a0, 5), Node::honest(&a0, 5)).await;
+    let fs = FailingFs {
+        fail_link_to: Some(ANCHOR_FILE),
+        fail_unlink_of: Some(BLOCK_FILE),
+        ..FailingFs::default()
+    };
+    let err = net.run_with(&fs).await.unwrap_err();
+    assert_eq!(err.name(), "publish_rollback_incomplete", "{err:?}");
+    assert_eq!(err.exit_code(), 4);
+    let AnchorError::PublishRolledBackIncompletely {
+        cause,
+        cleanup,
+        left,
+    } = &err
+    else {
+        panic!("{err:?}")
+    };
+    assert_eq!(cause.name(), "io");
+    assert!(cleanup.contains("injected unlink failure"), "{cleanup}");
+    let block = net.out.join(BLOCK_FILE);
+    assert_eq!(left, std::slice::from_ref(&block));
+    assert_eq!(err.left_behind(), std::slice::from_ref(&block));
+    assert!(
+        err.to_string().contains(&block.display().to_string()),
+        "{err}"
+    );
+    // The block is really still there; the state was removed and no anchor was published.
+    assert!(block.exists());
+    assert!(!net.out.join(STATE_FILE).exists() && !net.out.join(ANCHOR_FILE).exists());
+    assert_abort_lists(&net, &[block]);
+}
+
+#[tokio::test]
+async fn a_failed_rollback_fsync_reports_the_files_left_behind() {
+    let a0 = anchor0();
+    let net = Net::start(Node::honest(&a0, 5), Node::honest(&a0, 5)).await;
+    let fs = FailingFs {
+        fail_link_to: Some(ANCHOR_FILE),
+        fail_sync_calls: &[0],
+        ..FailingFs::default()
+    };
+    let err = net.run_with(&fs).await.unwrap_err();
+    assert_eq!(err.name(), "publish_rollback_incomplete", "{err:?}");
+    assert_ne!(err.exit_code(), 0);
+    let AnchorError::PublishRolledBackIncompletely { cleanup, left, .. } = &err else {
+        panic!("{err:?}")
+    };
+    assert!(cleanup.contains("injected fsync failure"), "{cleanup}");
+    // The removals are not durable, so every removed file is listed: the anchor temp file,
+    // then the state and the block (newest first).
+    let names: Vec<_> = left
+        .iter()
+        .map(|p| {
+            assert_eq!(p.parent().unwrap(), net.out);
+            p.file_name().unwrap().to_str().unwrap().to_owned()
+        })
+        .collect();
+    assert_eq!(names.len(), 3, "{names:?}");
+    assert!(names[0].starts_with(".anchor.json.") && names[0].ends_with(".tmp"));
+    assert_eq!(names[1..], [STATE_FILE, BLOCK_FILE]);
+    net.assert_nothing_published();
+    assert_abort_lists(&net, left);
+}
+
+#[tokio::test]
+async fn a_failed_rollback_after_a_failed_publish_fsync_lists_the_temp_file_too() {
+    // Every link succeeds and the temp file is already gone when the publish's own fsync
+    // fails; the rollback's fsync fails too, so none of the four removals is durable.
+    let a0 = anchor0();
+    let net = Net::start(Node::honest(&a0, 5), Node::honest(&a0, 5)).await;
+    let fs = FailingFs {
+        fail_sync_calls: &[0, 1],
+        ..FailingFs::default()
+    };
+    let err = net.run_with(&fs).await.unwrap_err();
+    assert_eq!(err.name(), "publish_rollback_incomplete", "{err:?}");
+    let AnchorError::PublishRolledBackIncompletely { cause, left, .. } = &err else {
+        panic!("{err:?}")
+    };
+    assert_eq!(cause.name(), "io");
+    let names: Vec<_> = left
+        .iter()
+        .map(|p| {
+            assert_eq!(p.parent().unwrap(), net.out);
+            p.file_name().unwrap().to_str().unwrap().to_owned()
+        })
+        .collect();
+    assert_eq!(names.len(), 4, "{names:?}");
+    assert!(names[0].starts_with(".anchor.json.") && names[0].ends_with(".tmp"));
+    assert_eq!(names[1..], [ANCHOR_FILE, STATE_FILE, BLOCK_FILE]);
+    net.assert_nothing_published();
+    assert_abort_lists(&net, left);
+}
+
+#[tokio::test]
+async fn a_directory_at_the_run_log_or_lock_is_refused() {
+    for name in [RUN_LOG_FILE, LOCK_FILE] {
+        let a0 = anchor0();
+        let net = Net::start(Node::honest(&a0, 5), Node::honest(&a0, 5)).await;
+        std::fs::create_dir_all(net.out.join(name)).unwrap();
+        let err = net.run().await.unwrap_err();
+        assert_refused_before_any_request(
+            &net,
+            &err,
+            UnsafeReason::WrongType {
+                expected: "regular file",
+                got: "directory",
+            },
+        );
+    }
 }

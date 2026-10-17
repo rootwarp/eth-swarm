@@ -7,10 +7,12 @@
 //! providers, so an anchor never comes without a record of where it came from.
 
 use crate::checkpoint::fetch::AnchorError;
+use crate::checkpoint::outdir::Dir;
+use rustix::fs::OFlags;
 use serde_json::{Map, Value};
 use std::fs::File;
-use std::io::{self, Write};
-use std::path::Path;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The provider roles a run must name.
@@ -22,21 +24,39 @@ const PROVIDER_FIELDS: [&str; 3] = ["name", "operator", "url"];
 #[derive(Debug)]
 pub struct RunLog {
     file: File,
+    path: PathBuf,
     echo: bool,
 }
 
 impl RunLog {
-    /// Opens `path` for appending (created with mode 0600). With `echo`, every line is also
-    /// written to stderr.
-    pub fn open(path: &Path, echo: bool) -> io::Result<Self> {
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    /// Opens `name` in `dir` for appending (`O_APPEND | O_CREAT | O_NOFOLLOW`, created with
+    /// mode 0600): a symlink, a non-regular file, another user's file, or one writable by
+    /// group or other is refused with [`AnchorError::UnsafePath`]. With `echo`, every line is
+    /// also written to stderr.
+    pub fn open_in(dir: &Dir, name: &str, echo: bool) -> Result<Self, AnchorError> {
         Ok(Self {
-            file: options.open(path)?,
+            file: dir.open_private_file(name, OFlags::RDWR | OFlags::APPEND)?,
+            path: dir.join(name),
             echo,
         })
+    }
+
+    /// The path the log was opened at, for messages.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// [`verify`] on this log, read back through its open descriptor.
+    pub fn verify(&self) -> Result<(), AnchorError> {
+        let mut text = String::new();
+        let mut file = &self.file;
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| file.read_to_string(&mut text))
+            .map_err(|source| AnchorError::Io {
+                context: format!("read {}", self.path.display()),
+                source,
+            })?;
+        Ok(verify(&text)?)
     }
 
     /// Appends one `event` line with `fields` (a JSON object; anything else is logged under
@@ -293,7 +313,8 @@ mod tests {
     fn writes_lines_the_verifier_accepts() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("run.log");
-        let mut log = RunLog::open(&path, false).unwrap();
+        let mut log =
+            RunLog::open_in(&Dir::open_out(dir.path()).unwrap(), "run.log", false).unwrap();
         log.event("start", serde_json::json!({})).unwrap();
         for (role, name) in [("a", "alpha"), ("b", "beta")] {
             log.event(
@@ -302,6 +323,8 @@ mod tests {
             )
             .unwrap();
         }
+        assert!(log.verify().is_ok());
+        assert_eq!(log.path(), path);
         drop(log);
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 3);

@@ -23,7 +23,8 @@
 //! IPv4-mapped IPv6 address is its IPv4 address); host names are compared as written, lower-cased
 //! and without a trailing dot, not resolved, so two names for the same machine are not caught
 //! here. URLs must be `https://` unless `allow_insecure_http` is set, and may carry a base path
-//! but no query, fragment or credentials; an explicit port must be 1..=65535.
+//! but no query, fragment or credentials; only `:PORT` (1..=65535, digits only) may follow
+//! the host.
 //!
 //! A base path may carry an API key, so the path never leaves this module in readable form:
 //! the run log, `anchor.json` and errors see [`Provider::redacted_url`]
@@ -255,16 +256,18 @@ fn provider(raw: RawProvider, allow_insecure_http: bool) -> Result<Provider, Anc
         return Err(bad("no query or fragment allowed"));
     }
     let host = canonical_host(authority.host()).ok_or_else(|| bad("no host"))?;
-    // `Authority::port` is `None` for an out-of-range port, so read what follows the host.
-    let explicit_port = authority
+    // `Authority::port` is `None` for an out-of-range port, and `http` skips junk after an
+    // IP literal, so read what follows the host: nothing, or `:` and the port's digits.
+    let rest = authority
         .as_str()
         .strip_prefix(authority.host())
-        .and_then(|rest| rest.strip_prefix(':'));
-    let port = match explicit_port {
-        None => match scheme {
+        .ok_or_else(|| bad("no host"))?;
+    let port = match rest.strip_prefix(':') {
+        None if rest.is_empty() => match scheme {
             Scheme::Https => 443,
             Scheme::Http => 80,
         },
+        None => return Err(bad("only :PORT may follow the host")),
         Some(p) => match p.parse::<u16>() {
             Ok(port) if port != 0 && p.bytes().all(|b| b.is_ascii_digit()) => port,
             _ => return Err(bad("the port must be 1..=65535")),
@@ -502,6 +505,33 @@ mod tests {
                 matches!(Config::from_toml(&text), Err(AnchorError::Config(_))),
                 "accepted {url}"
             );
+        }
+    }
+
+    #[test]
+    fn only_a_port_may_follow_the_host() {
+        for url in [
+            "http://[::1]junk:65536",
+            "http://[::1]x:5052",
+            "http://[::1]:",
+            "https://ref.example:",
+            "https://ref.example:+443",
+            "https://ref.example:0443x",
+        ] {
+            let text = two(
+                ("a", "A", url),
+                ("b", "B", "https://b.example"),
+                "allow_insecure_http = true",
+            );
+            match Config::from_toml(&text) {
+                Err(AnchorError::Config(msg)) => {
+                    assert!(
+                        !msg.contains("ref.example") && !msg.contains("::1"),
+                        "{msg}"
+                    );
+                }
+                other => panic!("{url}: {other:?}"),
+            }
         }
     }
 

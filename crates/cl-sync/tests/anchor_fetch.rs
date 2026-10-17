@@ -131,3 +131,53 @@ fn a_userinfo_secret_never_reaches_stderr_or_the_run_log() {
     let log = std::fs::read_to_string(out.join("run.log")).unwrap();
     assert!(!log.contains("hunter2"), "{log}");
 }
+
+#[test]
+fn help_names_anchor_json_as_the_commit_marker() {
+    for flag in ["--help", "-h"] {
+        let o = anchor_fetch(&[flag]);
+        assert_eq!(o.status.code(), Some(0), "{flag}");
+        let help = String::from_utf8_lossy(&o.stdout);
+        assert!(help.contains("usage:"), "{help}");
+        assert!(help.contains("anchor.json is written last"), "{help}");
+        assert!(help.contains("commit marker"), "{help}");
+        assert!(help.contains("ignore block.ssz and state.ssz"), "{help}");
+    }
+}
+
+#[test]
+fn an_unsafe_out_dir_exits_2_without_writing_into_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path(), "Op A", "Op B");
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let o = anchor_fetch(&["--config", &config, "--out", out.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(stderr.contains("aborted: unsafe_path"), "{stderr}");
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+}
+
+#[test]
+fn an_out_dir_symlink_with_a_trailing_slash_or_dot_exits_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path(), "Op A", "Op B");
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = dir.path().join("out");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    for suffix in ["/", "//", "/."] {
+        let out = format!("{}{suffix}", link.display());
+        let o = anchor_fetch(&["--config", &config, "--out", &out, "--quiet"]);
+        assert_eq!(o.status.code(), Some(2), "{suffix}");
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            stderr.contains("aborted: unsafe_path"),
+            "{suffix}: {stderr}"
+        );
+        assert!(stderr.contains("symlink"), "{suffix}: {stderr}");
+        assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0, "{suffix}");
+    }
+}
