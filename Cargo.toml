@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/spec-tests", "crates/cl-verify-cache", "crates/cl-chain-columns", "crates/ci-checks"]
+members = [
+    "crates/spec-tests",
+    "crates/cl-verify-cache",
+    "crates/cl-chain-columns",
+    "crates/ci-checks",
+    "crates/network-config",
+    "crates/consensus-types",
+]
 
 [workspace.package]
 edition = "2021"

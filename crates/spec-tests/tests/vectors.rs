@@ -2,14 +2,13 @@
 //! `target/spec-vectors` produced by `testing/fetch-vectors.sh`.
 
 use libtest_mimic::{Arguments, Failed, Trial};
+use network_config::{ForkName, SPEC_PIN};
 use spec_tests::plan::{plan, CaseKey, Date, Disposition, SkipList};
 use spec_tests::{ssz_generic, ssz_static};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-const SSZ_SPECS: &str = "ssz-specs/v0.1.0/ssz-test-vectors-v0.1.0";
-const CONSENSUS: &str = "consensus-specs/v1.7.0-beta.4";
 /// Presets run when their extracted tree is present; minimal is required.
 const PRESETS: [(&str, bool); 2] = [("minimal", true), ("mainnet", false)];
 
@@ -44,7 +43,10 @@ fn build_trials() -> Result<Vec<Trial>, String> {
     let mut keys: Vec<CaseKey> = Vec::new();
     let mut runners: Vec<Option<Runner>> = Vec::new();
 
-    let generic = ssz_generic::discover(&root.join(SSZ_SPECS))
+    let ssz_specs = format!("ssz-specs/{v}/ssz-test-vectors-{v}", v = SPEC_PIN.ssz_specs);
+    let consensus = format!("consensus-specs/{}", SPEC_PIN.consensus_specs);
+
+    let generic = ssz_generic::discover(&root.join(ssz_specs))
         .map_err(|e| format!("ssz-specs vectors missing ({e}); run testing/fetch-vectors.sh"))?;
     for case in generic {
         let fixture = ssz_generic::load(&case.path)?;
@@ -55,18 +57,23 @@ fn build_trials() -> Result<Vec<Trial>, String> {
     }
 
     for (preset, required) in PRESETS {
-        let dir = root.join(CONSENSUS).join(preset);
+        let dir = root.join(&consensus).join(preset);
         if !dir.exists() && !required {
             continue;
         }
-        let statics = ssz_static::discover(&dir, preset, "gloas").map_err(|e| {
-            format!("consensus-specs {preset} vectors missing ({e}); run testing/fetch-vectors.sh")
-        })?;
-        for case in statics {
-            let runnable = ssz_static::supported(preset, &case.key.handler);
-            keys.push(case.key.clone());
-            let case = Arc::new(case);
-            runners.push(runnable.then(|| -> Runner { Arc::new(move || ssz_static::run(&case)) }));
+        for fork in ForkName::ALL.map(ForkName::as_str) {
+            let statics = ssz_static::discover(&dir, preset, fork).map_err(|e| {
+                format!(
+                    "consensus-specs {preset}/{fork} vectors missing ({e}); run testing/fetch-vectors.sh"
+                )
+            })?;
+            for case in statics {
+                let runnable = ssz_static::supported(fork, preset, &case.key.handler);
+                keys.push(case.key.clone());
+                let case = Arc::new(case);
+                runners
+                    .push(runnable.then(|| -> Runner { Arc::new(move || ssz_static::run(&case)) }));
+            }
         }
     }
 

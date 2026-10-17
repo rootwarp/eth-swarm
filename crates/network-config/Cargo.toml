@@ -1,0 +1,15 @@
+[package]
+name = "network-config"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Pinned eth-clients network configs, the Fulu/Gloas fork schedule and blob parameters."
+
+[dependencies]
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"

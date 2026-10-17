@@ -4,9 +4,9 @@
 //! The check is decode, re-encode to identical bytes, and `hash_tree_root`.
 
 use crate::check::{parse_hex, round_trip, Expect};
-use crate::gloas::types as g;
 use crate::plan::CaseKey;
 use crate::ssz_generic::{file_name, sorted_dir};
+use consensus_types::{fulu, gloas, EthSpec, Mainnet, Minimal};
 use std::path::{Path, PathBuf};
 
 /// A discovered ssz_static case.
@@ -58,9 +58,9 @@ fn parse_root(yaml: &str) -> Result<[u8; 32], String> {
         .map_err(|_| format!("root {hex:?} is not 32 bytes"))
 }
 
-/// Whether a handler has a Rust type for this preset.
-pub fn supported(preset: &str, handler: &str) -> bool {
-    dispatch(preset, handler, &[], &Expect::Invalid).is_some()
+/// Whether a handler has a Rust type for this fork and preset.
+pub fn supported(fork: &str, preset: &str, handler: &str) -> bool {
+    dispatch(fork, preset, handler, &[], &Expect::Invalid).is_some()
 }
 
 /// Runs one case. `Err` describes a failure.
@@ -75,39 +75,76 @@ pub fn run(case: &StaticCase) -> Result<(), String> {
     let expect = Expect::Valid {
         root: parse_root(&yaml)?,
     };
-    dispatch(&case.key.preset, &case.key.handler, &bytes, &expect)
-        .ok_or_else(|| format!("no Rust type for {}", case.key.handler))?
+    let k = &case.key;
+    dispatch(&k.fork, &k.preset, &k.handler, &bytes, &expect)
+        .ok_or_else(|| format!("no Rust type for {}/{}", k.fork, k.handler))?
 }
 
-macro_rules! table {
-    ($p:expr, $h:expr, $b:expr, $e:expr; $($name:ident),* $(,)?) => {
-        match ($p, $h) {
-            $(("minimal", stringify!($name)) => Some(round_trip::<g::minimal::$name>($b, $e)),)*
-            $(("mainnet", stringify!($name)) => Some(round_trip::<g::mainnet::$name>($b, $e)),)*
-            _ => None,
+fn dispatch(
+    fork: &str,
+    preset: &str,
+    handler: &str,
+    b: &[u8],
+    e: &Expect,
+) -> Option<Result<(), String>> {
+    match (fork, preset) {
+        ("fulu", "minimal") => fulu_table::<Minimal>(handler, b, e),
+        ("fulu", "mainnet") => fulu_table::<Mainnet>(handler, b, e),
+        ("gloas", "minimal") => gloas_table::<Minimal>(handler, b, e),
+        ("gloas", "mainnet") => gloas_table::<Mainnet>(handler, b, e),
+        _ => None,
+    }
+}
+
+/// Maps handler names to `consensus-types` containers of one fork module. `plain` types take
+/// no preset; `generic` ones are instantiated with `E`.
+macro_rules! fork_table {
+    ($fn:ident, $m:ident; plain: [$($p:ident),* $(,)?]; generic: [$($g:ident),* $(,)?]) => {
+        fn $fn<E: EthSpec>(handler: &str, b: &[u8], e: &Expect) -> Option<Result<(), String>> {
+            Some(match handler {
+                $(stringify!($p) => round_trip::<$m::$p>(b, e),)*
+                $(stringify!($g) => round_trip::<$m::$g<E>>(b, e),)*
+                _ => return None,
+            })
         }
     };
 }
 
-fn dispatch(preset: &str, handler: &str, b: &[u8], e: &Expect) -> Option<Result<(), String>> {
-    table!(preset, handler, b, e;
-        AggregateAndProof, Attestation, AttestationData, AttesterSlashing, BLSToExecutionChange,
-        BeaconBlock, BeaconBlockBody, BeaconBlockHeader, BeaconState, Builder, BuilderDepositRequest,
-        BuilderExitRequest, BuilderPendingPayment, BuilderPendingWithdrawal, Checkpoint,
-        ConsolidationRequest, ContributionAndProof, Deposit, DepositData, DepositMessage,
-        DepositRequest, Eth1Block, Eth1Data, ExecutionPayload, ExecutionPayloadBid,
-        ExecutionPayloadEnvelope, ExecutionRequests, Fork, ForkData, HistoricalSummary,
-        IndexedAttestation, IndexedPayloadAttestation, NewPayloadRequest, PayloadAttestation,
-        PayloadAttestationData, PayloadAttestationMessage, PendingConsolidation, PendingDeposit,
-        PendingPartialWithdrawal, PowBlock, ProposerPreferences, ProposerSlashing,
-        SignedAggregateAndProof, SignedBLSToExecutionChange, SignedBeaconBlock,
-        SignedBeaconBlockHeader, SignedContributionAndProof, SignedExecutionPayloadBid,
-        SignedExecutionPayloadEnvelope, SignedProposerPreferences, SignedVoluntaryExit,
-        SigningData, SingleAttestation, SyncAggregate, SyncAggregatorSelectionData, SyncCommittee,
-        SyncCommitteeContribution, SyncCommitteeMessage, Validator, VoluntaryExit, Withdrawal,
-        WithdrawalRequest,
-    )
+/// Containers whose shape is the same in Fulu and Gloas, as `fork_table!` arguments.
+macro_rules! with_common {
+    ($fn:ident, $m:ident; plain: [$($p:ident),* $(,)?]; generic: [$($g:ident),* $(,)?]) => {
+        fork_table!($fn, $m;
+            plain: [
+                AttestationData, BLSToExecutionChange, BeaconBlockHeader, Checkpoint,
+                ConsolidationRequest, Deposit, DepositData, DepositMessage, DepositRequest,
+                Eth1Block, Eth1Data, Fork, ForkData, HistoricalSummary, PendingConsolidation,
+                PendingDeposit, PendingPartialWithdrawal, PowBlock, ProposerSlashing,
+                SignedBLSToExecutionChange, SignedBeaconBlockHeader, SignedVoluntaryExit,
+                SigningData, SingleAttestation, SyncAggregatorSelectionData, SyncCommitteeMessage,
+                Validator, VoluntaryExit, Withdrawal, WithdrawalRequest, $($p),*
+            ];
+            generic: [
+                ContributionAndProof, SignedContributionAndProof, SyncAggregate, SyncCommittee,
+                SyncCommitteeContribution, AggregateAndProof, Attestation, AttesterSlashing,
+                BeaconBlock, BeaconBlockBody, BeaconState, ExecutionPayload, ExecutionRequests,
+                IndexedAttestation, NewPayloadRequest, SignedAggregateAndProof, SignedBeaconBlock,
+                $($g),*
+            ]);
+    };
 }
+
+with_common!(fulu_table, fulu; plain: []; generic: [ExecutionPayloadHeader]);
+
+with_common!(gloas_table, gloas;
+plain: [
+    Builder, BuilderDepositRequest, BuilderExitRequest, BuilderPendingPayment,
+    BuilderPendingWithdrawal, PayloadAttestationData, PayloadAttestationMessage,
+    ProposerPreferences, SignedProposerPreferences,
+];
+generic: [
+    ExecutionPayloadBid, ExecutionPayloadEnvelope, IndexedPayloadAttestation,
+    PayloadAttestation, SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
+]);
 
 #[cfg(test)]
 mod tests {
@@ -123,10 +160,18 @@ mod tests {
     #[test]
     fn known_and_unknown_handlers() {
         for preset in ["minimal", "mainnet"] {
-            assert!(supported(preset, "BeaconState"));
-            assert!(supported(preset, "ExecutionPayloadBid"));
-            assert!(!supported(preset, "DataColumnSidecar"));
+            for fork in ["fulu", "gloas"] {
+                assert!(supported(fork, preset, "BeaconState"));
+                assert!(supported(fork, preset, "Checkpoint"));
+                assert!(!supported(fork, preset, "DataColumnSidecar"));
+                assert!(!supported(fork, preset, "LightClientHeader"));
+            }
+            assert!(supported("gloas", preset, "ExecutionPayloadBid"));
+            assert!(!supported("fulu", preset, "ExecutionPayloadBid"));
+            assert!(supported("fulu", preset, "ExecutionPayloadHeader"));
+            assert!(!supported("gloas", preset, "ExecutionPayloadHeader"));
         }
-        assert!(!supported("gnosis", "BeaconState"));
+        assert!(!supported("gloas", "gnosis", "BeaconState"));
+        assert!(!supported("electra", "minimal", "BeaconState"));
     }
 }

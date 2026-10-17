@@ -83,10 +83,10 @@ The skip list is strict, and the run **fails** in any of these cases:
 A skip entry wins over a handler. When you add a type, also delete its skip entry, or the type never runs.
 
 To make an ssz_static handler runnable:
-1. Add the container to `src/gloas/containers.rs`. That file is `include!`d twice by `src/gloas/types.rs`, once per preset, with that preset's typenum aliases in scope. A new preset-dependent length needs an alias in **both** modules.
-2. Add the type name to the `table!` list in `ssz_static.rs`.
+1. Add the container to `crates/consensus-types/src/{fulu,gloas}/mod.rs` (`common/` if both forks share it). A new preset-dependent length goes on `EthSpec` in `preset.rs`, for both `Minimal` and `Mainnet`.
+2. Add the type name to the `fork_table!` / `with_common!` lists in `ssz_static.rs`.
 
-ssz-specs types go into the `(handler, type_name)` table in `ssz_generic.rs`, keyed by both because filler modules reuse type names with different definitions. These Gloas shapes are test-only transcriptions from the spec, not production types.
+ssz-specs types go into the `(handler, type_name)` table in `ssz_generic.rs`, keyed by both because filler modules reuse type names with different definitions. The ssz_static types are the production containers from `consensus-types`; the ssz-specs sample types in `ssz_generic.rs` stay test-only.
 
 ### cl-verify pubkey cache (`crates/cl-verify-cache`)
 

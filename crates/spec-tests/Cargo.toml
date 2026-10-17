@@ -8,14 +8,14 @@ publish = false
 description = "Runner for ssz-specs and consensus-spec-tests vectors."
 
 [dependencies]
+consensus-types = { path = "../consensus-types" }
+network-config = { path = "../network-config" }
 ethereum_ssz.workspace = true
 ethereum_ssz_derive.workspace = true
 ssz_types.workspace = true
 tree_hash.workspace = true
 tree_hash_derive.workspace = true
-milhouse.workspace = true
 alloy-primitives.workspace = true
-typenum.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
