@@ -1,5 +1,5 @@
-//! `m2a-session`: the pinned reference node's Status v2, MetaData v3 and Ping v1 probe (see
-//! `cl_p2p::m2a_session`).
+//! `m2a-session`: the pinned reference node's Status v2, MetaData v3, Ping v1 and
+//! BeaconBlocksByRange v2 probe (see `cl_p2p::m2a_session`).
 //!
 //! ```text
 //! m2a-session [--config <path>] [--dial-only | --print-peer-id] [--connect-timeout-secs <n>]
@@ -16,16 +16,20 @@
 //!   dial, send our Status v2 at the pinned Sepolia fork digest, judge the peer's against the
 //!   reference beacon API ([`reference_api`]); request the peer's MetaData v3 on the same
 //!   connection and judge it against the node's `/eth/v1/node/identity` ([`metadata`]); Ping
-//!   it with our `seq_number` 0 and check its answer against that MetaData ([`ping`]); hold
-//!   the connection and send a second Status. One JSON line per step on stdout records it all.
+//!   it with our `seq_number` 0 and check its answer against that MetaData ([`ping`]); fetch
+//!   its last finalized slots with one BlocksByRange and compare every block root with the
+//!   API's, then drop the blocks ([`blocks`]); hold the connection and send a second Status.
+//!   One JSON line per step on stdout records it all, and a last `m2a-summary` line
+//!   aggregates every check ([`summary`]).
 //! - `--dial-only`: dial, check the pinned peer ID (Noise XX, then yamux), disconnect, exit.
 //!   No req/resp traffic, so no response decoder runs and no fuzz gate is needed.
 //! - `--print-peer-id`: print the node key's peer ID on stdout and exit, without dialling, so
 //!   the operator can list it as a trusted peer on the reference node. Needs `node_key`.
 //!
-//! Exit 0 on success (every verdict of every step passed), 1 if the dial, an exchange or a verdict
+//! Exit 0 on success (every check of the summary passed), 1 if the dial, an exchange or a verdict
 //! fails, 2 on bad arguments, a refused config or a failed pre-flight.
 
+mod blocks;
 mod enr;
 mod gate;
 mod metadata;
@@ -34,15 +38,18 @@ mod mock_api;
 mod ping;
 mod probe;
 mod reference_api;
+mod summary;
 
 use cl_p2p::m2a_session::config::{M2aConfig, Network as SessionNetwork, DEFAULT_CONFIG_PATH};
-use cl_p2p::m2a_session::{preflight, KeySource, Preflight, Session, SessionError, Transport};
+use cl_p2p::m2a_session::{
+    preflight, KeySource, Preflight, Session, SessionError, Transport, IDLE_CONNECTION_TIMEOUT,
+};
 use consensus_types::{EthSpec, Mainnet};
 use gate::Expected;
 use network_config::digest::digest_schedule;
 use network_config::{ChainConfig, Network};
 use p2p_wire::rpc::codec::ContextTable;
-use probe::{Chain, Probe};
+use probe::{Chain, Probe, Verdict};
 use reference_api::ReferenceApi;
 use std::io::Write;
 use std::path::PathBuf;
@@ -120,10 +127,30 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
 struct RunEnv {
     /// What the fuzz gate file must hold for this build.
     gate: Expected,
-    /// Unix milliseconds now.
+    /// Unix milliseconds now, for the fork digests.
     now_ms: Box<dyn Fn() -> u128 + Send + Sync>,
+    /// Unix milliseconds now, for the summary's start and end time.
+    wall_ms: Box<dyn Fn() -> u128 + Send + Sync>,
     /// How long the probe holds the connection.
     hold: Duration,
+    /// How long the connection may go without a stream before our side closes it.
+    idle_timeout: Duration,
+    /// Builds the runtime the session runs on.
+    runtime: fn() -> std::io::Result<tokio::runtime::Runtime>,
+}
+
+/// A current-thread tokio runtime with I/O and timers.
+fn current_thread_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+}
+
+/// Unix milliseconds of the system clock.
+fn system_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
 }
 
 impl RunEnv {
@@ -131,14 +158,26 @@ impl RunEnv {
     fn production() -> Self {
         Self {
             gate: Expected::built(),
-            now_ms: Box::new(|| {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_millis())
-            }),
+            now_ms: Box::new(system_ms),
+            wall_ms: Box::new(system_ms),
             hold: probe::HOLD,
+            idle_timeout: IDLE_CONNECTION_TIMEOUT,
+            runtime: current_thread_runtime,
         }
     }
+}
+
+/// How the pre-flight checked the node key, for the summary.
+fn key_handling(key: &KeySource, euid: u32) -> Verdict {
+    let detail = match key {
+        KeySource::Ephemeral => "ephemeral secp256k1 key: never written, never logged".to_owned(),
+        KeySource::File(path) => format!(
+            "key file {}: a regular file of mode 0600 owned by UID {euid}; its bytes wiped \
+             after loading, never logged",
+            path.display()
+        ),
+    };
+    Verdict { pass: true, detail }
 }
 
 fn main() -> ExitCode {
@@ -188,8 +227,76 @@ fn context_table(chain: &Chain) -> ContextTable {
     table
 }
 
+/// What the session summary needs besides the report, fixed once the pre-flight passed.
+struct SummaryInputs {
+    peer_id: libp2p::PeerId,
+    started_at_ms: u128,
+    fuzz_gate: Verdict,
+    euid: u32,
+    key_handling: Verdict,
+}
+
+/// Writes the steps' lines and the summary to `out` and returns the exit code: 0 only if
+/// every check passed. `session` is `None` if setup failed before there was one.
+fn finish<E: EthSpec>(
+    out: &mut dyn Write,
+    env: &RunEnv,
+    inputs: SummaryInputs,
+    report: &probe::Report,
+    session: Option<&mut Session<E>>,
+) -> u8 {
+    let (connected, listeners) = session.map_or((Vec::new(), 0), |s| {
+        let swarm = s.swarm();
+        (
+            swarm.connected_peers().copied().collect(),
+            swarm.listeners().count(),
+        )
+    });
+    let summary = summary::Summary::new(
+        report,
+        summary::Facts {
+            peer_id: inputs.peer_id,
+            started_at_ms: inputs.started_at_ms,
+            ended_at_ms: (env.wall_ms)(),
+            connected,
+            listeners,
+            fuzz_gate: inputs.fuzz_gate,
+            euid: inputs.euid,
+            key_handling: inputs.key_handling,
+        },
+    );
+    for line in report.json_lines().iter().chain([&summary.json_line()]) {
+        if let Err(e) = writeln!(out, "{line}") {
+            tracing::error!(error = %e, "cannot write the session log line");
+            return EXIT_FAILED;
+        }
+    }
+    if summary.passed() && report.passed() {
+        tracing::info!("every check of the session passed");
+        EXIT_CONNECTED
+    } else {
+        let failed: Vec<&str> = summary
+            .checks()
+            .iter()
+            .filter(|(_, v)| !v.pass)
+            .map(|(name, _)| *name)
+            .collect();
+        tracing::error!(error = ?report.error, ?failed, "probe failed");
+        EXIT_FAILED
+    }
+}
+
+/// A report of a session whose setup failed: no step ran.
+fn setup_failed(why: String) -> probe::Report {
+    probe::Report {
+        error: Some(format!("session setup: {why}")),
+        ..probe::Report::default()
+    }
+}
+
 /// The whole run for `argv`, as effective UID `euid`, printing to `out`; returns the exit code.
 fn run(argv: impl Iterator<Item = String>, euid: u32, out: &mut dyn Write, env: &RunEnv) -> u8 {
+    let started_at_ms = (env.wall_ms)();
     let args = match parse_args(argv) {
         Ok(args) => args,
         Err(e) => {
@@ -210,6 +317,7 @@ fn run(argv: impl Iterator<Item = String>, euid: u32, out: &mut dyn Write, env: 
         );
         return EXIT_REFUSED;
     }
+    let key_check = key_handling(&config.node_key, euid);
     let key = match preflight(&Preflight {
         euid,
         key: config.node_key.clone(),
@@ -255,32 +363,63 @@ fn run(argv: impl Iterator<Item = String>, euid: u32, out: &mut dyn Write, env: 
         trusted_by_reference = config.trusted_by_reference,
         "config loaded"
     );
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
+    // In probe mode, from here on every exit goes through the summary.
+    let inputs = probe_api.as_ref().map(|_| SummaryInputs {
+        peer_id: config.peer.peer_id,
+        started_at_ms,
+        // The probe runs only after the gate check passed.
+        fuzz_gate: Verdict {
+            pass: true,
+            detail: format!(
+                "the gate file {} passed for this build's decoders",
+                args.gate_file.display()
+            ),
+        },
+        euid,
+        key_handling: key_check,
+    });
+    let runtime = match (env.runtime)() {
         Ok(rt) => rt,
         Err(e) => {
             tracing::error!(error = %e, "tokio runtime");
-            return EXIT_FAILED;
+            return match inputs {
+                Some(inputs) => finish::<Mainnet>(
+                    out,
+                    env,
+                    inputs,
+                    &setup_failed(format!("tokio runtime: {e}")),
+                    None,
+                ),
+                None => EXIT_FAILED,
+            };
         }
     };
     let contexts = Arc::new(context_table(&chain));
     runtime.block_on(async {
-        let mut session = match Session::<Mainnet>::start(
+        let mut session = match Session::<Mainnet>::start_with_idle_timeout(
             key,
             config.peer,
             contexts,
             config.deadlines,
             Transport::Tcp,
+            env.idle_timeout,
         ) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, "session start");
-                return EXIT_FAILED;
+                return match inputs {
+                    Some(inputs) => finish::<Mainnet>(
+                        out,
+                        env,
+                        inputs,
+                        &setup_failed(format!("session start: {e}")),
+                        None,
+                    ),
+                    None => EXIT_FAILED,
+                };
             }
         };
-        if let Some(api) = probe_api {
+        if let (Some(api), Some(inputs)) = (probe_api, inputs) {
             let probe = Probe {
                 chain: &chain,
                 now_ms: env.now_ms.as_ref(),
@@ -288,21 +427,7 @@ fn run(argv: impl Iterator<Item = String>, euid: u32, out: &mut dyn Write, env: 
                 hold: env.hold,
             };
             let report = probe::run(&mut session, &api, &probe).await;
-            for line in report.json_lines() {
-                if let Err(e) = writeln!(out, "{line}") {
-                    tracing::error!(error = %e, "cannot write the session log line");
-                    return EXIT_FAILED;
-                }
-            }
-            return if report.passed() {
-                tracing::info!("status, metadata and ping probes passed");
-                EXIT_CONNECTED
-            } else {
-                let metadata_error = report.metadata.as_ref().and_then(|m| m.error.as_ref());
-                let ping_error = report.ping.as_ref().and_then(|p| p.error.as_ref());
-                tracing::error!(error = ?report.error, ?metadata_error, ?ping_error, "probe failed");
-                EXIT_FAILED
-            };
+            return finish(out, env, inputs, &report, Some(&mut session));
         }
         let dial = async {
             session.connect().await?;
@@ -331,12 +456,18 @@ mod tests {
     use super::*;
     use crate::gate::tests::{fixture_expected, passing_gate};
     use crate::mock_api::{MockApi, Route};
-    use cl_p2p::testkit::{MetaDataReply, PingReply, StatusPeer, StatusReply};
+    use cl_p2p::testkit::{
+        BlocksReply, BlocksResponder, MetaDataReply, PingReply, StatusPeer, StatusReply,
+    };
+    use consensus_types::forked;
     use consensus_types::primitives::{Root, Slot};
-    use p2p_wire::rpc::messages::{MetaDataV3, StatusV2};
-    use p2p_wire::rpc::protocols::ResultCode;
+    use p2p_wire::rpc::messages::{BlocksByRangeV2Request, ForkDigest, MetaDataV3, StatusV2};
+    use p2p_wire::rpc::protocols::{ResultCode, MAX_REQUEST_BLOCKS_DENEB};
     use serde_json::Value;
+    use ssz::Encode;
+    use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::OnceLock;
 
     fn parse(args: &[&str]) -> Result<Args, String> {
         parse_args(args.iter().map(|s| s.to_string()))
@@ -448,11 +579,20 @@ mod tests {
         })
     }
 
+    /// The summary's clock: [`WALL_MS`], then one millisecond later per reading.
+    const WALL_MS: u128 = 1_790_000_000_000;
+
     fn test_env() -> RunEnv {
+        let readings = std::sync::atomic::AtomicU64::new(0);
         RunEnv {
             gate: Expected::Known(fixture_expected()),
             now_ms: Box::new(now_ms),
+            wall_ms: Box::new(move || {
+                WALL_MS + u128::from(readings.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+            }),
             hold: Duration::from_millis(300),
+            idle_timeout: IDLE_CONNECTION_TIMEOUT,
+            runtime: current_thread_runtime,
         }
     }
 
@@ -507,14 +647,24 @@ mod tests {
         // Loopback only, to a port nothing listens on: no network contact.
         let (dir, path) = config(&closed_port_peer(), "");
         let gate = gate_file(&dir, &passing_gate(&fixture_expected()));
-        let (code, line) = run_quiet(&["--config", &path, "--gate-file", &gate], 1000);
+        let (code, out) = run_quiet(&["--config", &path, "--gate-file", &gate], 1000);
         assert_eq!(code, EXIT_FAILED);
-        let line: Value = serde_json::from_str(line.trim()).unwrap();
+        let lines: Vec<Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let line = &lines[0];
         assert!(
             line["error"].as_str().unwrap().starts_with("connect:"),
             "{line}"
         );
         assert_eq!(line["pass"], false);
+        // No other step ran; the summary records it.
+        assert_eq!(lines.len(), 2, "{out}");
+        assert_eq!(lines[1]["event"], "m2a-summary");
+        assert_eq!(lines[1]["pass"], false);
+        assert_eq!(lines[1]["exit_code"], 1);
+        assert_eq!(lines[1]["checks"]["blocks_by_range"]["pass"], false);
         let dial_only = ["--config", &path, "--dial-only"];
         assert_eq!(run_quiet(&dial_only, 1000).0, EXIT_FAILED);
         let timeout = [
@@ -578,6 +728,50 @@ mod tests {
     }
 
     #[test]
+    fn setup_failure_after_the_preflight_writes_the_summary() {
+        let (dir, path) = config(&closed_port_peer(), "");
+        let gate = gate_file(&dir, &passing_gate(&fixture_expected()));
+        let env = RunEnv {
+            runtime: || Err(std::io::Error::other("no threads")),
+            ..test_env()
+        };
+        let mut out = Vec::new();
+        let args = ["--config", &path, "--gate-file", &gate];
+        assert_eq!(run(argv(&args), 1000, &mut out, &env), EXIT_FAILED);
+        let out = String::from_utf8(out).unwrap();
+        let lines: Vec<Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "{out}");
+        let error = lines[0]["error"].as_str().unwrap();
+        assert!(error.contains("tokio runtime: no threads"), "{error}");
+        let summary = &lines[1];
+        assert_eq!(summary["event"], "m2a-summary");
+        assert_eq!(summary["pass"], false);
+        assert_eq!(summary["exit_code"], 1);
+        let check = |name: &str| summary["checks"][name].clone();
+        for step in ["metadata", "ping", "blocks_by_range"] {
+            assert_eq!(check(step)["pass"], false, "{step}");
+            let detail = check(step)["detail"].as_str().unwrap().to_owned();
+            assert!(
+                detail.starts_with("not run: ") && detail.contains("no threads"),
+                "{step}: {detail}"
+            );
+        }
+        assert_eq!(check("status")["pass"], false);
+        // What the pre-flight established still holds.
+        for passed in ["fuzz_gate", "own_os_user", "key_handling"] {
+            assert_eq!(check(passed)["pass"], true, "{passed}");
+        }
+        // Dial-only has no summary: it prints nothing either way.
+        let mut out = Vec::new();
+        let dial_only = ["--config", &path, "--dial-only"];
+        assert_eq!(run(argv(&dial_only), 1000, &mut out, &env), EXIT_FAILED);
+        assert!(out.is_empty());
+    }
+
+    #[test]
     fn context_table_has_every_schedule_digest() {
         let chain = chain(SessionNetwork::Sepolia).unwrap();
         let table = context_table(&chain);
@@ -599,10 +793,14 @@ mod tests {
         Root::repeat_byte(b)
     }
 
-    /// The finalized checkpoints of the scenarios.
-    const F1: (u64, u8) = (353_000, 0xf1);
-    const F2: (u64, u8) = (353_001, 0xf2);
-    const F3: (u64, u8) = (353_002, 0xf3);
+    /// The finalized checkpoints of the scenarios, in Gloas (from epoch 353024).
+    const F1: (u64, u8) = (353_050, 0xf1);
+    const F2: (u64, u8) = (353_051, 0xf2);
+    const F3: (u64, u8) = (353_052, 0xf3);
+    /// A finalized checkpoint whose 128 slots cross the Fulu/Gloas boundary.
+    const FB: (u64, u8) = (353_025, 0xfb);
+    /// `GLOAS_FORK_EPOCH` of the pinned Sepolia config.
+    const GLOAS_EPOCH: u64 = 353_024;
     /// The API's head.
     const HEAD_SLOT: Slot = 353_098 * 32 + 5;
     const HEAD_ROOT: u8 = 0xaa;
@@ -649,6 +847,16 @@ mod tests {
         gate: Value,
         /// The epoch of the clock at each reading; the last repeats.
         clock: Vec<u64>,
+        /// The peer's BlocksByRange answer, instead of its blocks of the requested range.
+        blocks: Option<BlocksReply>,
+        /// The API's root of these slots (`None`: 404), instead of its blocks'.
+        api_roots: Vec<(Slot, Option<Root>)>,
+        /// How long the API takes to answer each block-root read of a block.
+        root_delay: Duration,
+        /// Slots whose block-root read the API answers with HTTP 500.
+        root_failures: Vec<Slot>,
+        /// Our side's idle connection timeout.
+        idle_timeout: Duration,
     }
 
     impl Scenario {
@@ -664,6 +872,11 @@ mod tests {
                 ping: vec![PingReply::Ping(7)],
                 gate: passing_gate(&fixture_expected()),
                 clock: vec![EPOCH],
+                blocks: None,
+                api_roots: Vec::new(),
+                root_delay: Duration::ZERO,
+                root_failures: Vec::new(),
+                idle_timeout: IDLE_CONNECTION_TIMEOUT,
             }
         }
     }
@@ -711,6 +924,68 @@ mod tests {
         fn ping_verdict(&self, field: &str) -> bool {
             verdict_of(self.ping_line(), field)
         }
+
+        fn blocks_line(&self) -> &Value {
+            self.event("m2a-blocks-by-range")
+                .expect("a BlocksByRange log line")
+        }
+
+        fn blocks_verdict(&self, field: &str) -> bool {
+            verdict_of(self.blocks_line(), field)
+        }
+
+        fn summary(&self) -> &Value {
+            self.event("m2a-summary").expect("a summary line")
+        }
+
+        fn check(&self, name: &str) -> bool {
+            self.summary()["checks"][name]["pass"]
+                .as_bool()
+                .unwrap_or_else(|| panic!("no check {name}: {}", self.summary()))
+        }
+    }
+
+    /// The pinned Sepolia chain, loaded once.
+    fn sepolia() -> &'static Chain {
+        static CHAIN: OnceLock<Chain> = OnceLock::new();
+        CHAIN.get_or_init(|| chain(SessionNetwork::Sepolia).unwrap())
+    }
+
+    /// The slots of the scenarios with no block, on both sides.
+    fn empty(slot: Slot) -> bool {
+        slot % 7 == 3
+    }
+
+    /// The block the fixture chain has at `slot`: in the fork of its epoch, distinct per slot.
+    fn chain_block(slot: Slot) -> forked::SignedBeaconBlock<Mainnet> {
+        if slot / 32 >= GLOAS_EPOCH {
+            forked::SignedBeaconBlock::Gloas(p2p_wire::testkit::gloas_block(slot))
+        } else {
+            forked::SignedBeaconBlock::Fulu(p2p_wire::testkit::fulu_block(slot))
+        }
+    }
+
+    /// `chain_block(slot)` on the wire: its epoch's digest and its SSZ.
+    fn wire_block(slot: Slot) -> (ForkDigest, Vec<u8>) {
+        let chain = sepolia();
+        let digest = network_config::digest::compute_fork_digest(
+            &chain.config,
+            &chain.genesis.genesis_validators_root,
+            slot / 32,
+        )
+        .unwrap();
+        (digest, chain_block(slot).as_ssz_bytes())
+    }
+
+    /// The fixture chain's blocks in `request`'s range.
+    fn chain_blocks(request: &BlocksByRangeV2Request) -> BlocksReply {
+        let slots = request.start_slot..request.start_slot + request.count;
+        BlocksReply::Blocks(slots.filter(|s| !empty(*s)).map(wire_block).collect())
+    }
+
+    /// Serves the scenario's BlocksByRange answer, or the chain's blocks of the range.
+    fn blocks_responder(reply: Option<BlocksReply>) -> BlocksResponder {
+        Box::new(move |req, _| reply.clone().unwrap_or_else(|| chain_blocks(req)))
     }
 
     fn verdict_of(line: &Value, field: &str) -> bool {
@@ -753,11 +1028,33 @@ mod tests {
                 Route::json(MockApi::header_json(root(HEAD_ROOT), HEAD_SLOT, true)),
             ),
         ];
-        for (epoch, r) in [F1, F2, F3] {
+        for (epoch, r) in [F1, F2, F3, FB] {
             routes.push((
                 format!("/eth/v1/beacon/headers/{}", root(r)),
                 Route::json(MockApi::header_json(root(r), finalized_slot(epoch), true)),
             ));
+            // The block roots of the 128 slots up to the finalized slot; empty slots are 404.
+            let last = finalized_slot(epoch);
+            for slot in (last - 127..=last).filter(|s| !empty(*s)) {
+                let r = blocks::block_root(&chain_block(slot));
+                routes.push((
+                    format!("/eth/v1/beacon/blocks/{slot}/root"),
+                    Route::json(MockApi::block_root_json(r)).delayed(s.root_delay),
+                ));
+            }
+        }
+        for slot in &s.root_failures {
+            routes.push((
+                format!("/eth/v1/beacon/blocks/{slot}/root"),
+                Route::status(500),
+            ));
+        }
+        for (slot, r) in &s.api_roots {
+            let route = r.map_or_else(
+                || Route::status(404),
+                |r| Route::json(MockApi::block_root_json(r)),
+            );
+            routes.push((format!("/eth/v1/beacon/blocks/{slot}/root"), route));
         }
         // The blocks the peers name as their head: canonical, at HEAD_SLOT + off.
         for off in -3i64..=3 {
@@ -781,7 +1078,7 @@ mod tests {
         let statuses = s.peer.clone();
         let metadata = s.metadata.clone();
         let pings = s.ping.clone();
-        let peer = StatusPeer::spawn_with_ping(
+        let peer = StatusPeer::spawn_with_blocks(
             Box::new(move |req, n| {
                 StatusReply::Status(StatusV2 {
                     fork_digest: req.fork_digest,
@@ -792,6 +1089,7 @@ mod tests {
                 metadata[n.min(metadata.len() - 1)].clone()
             })),
             Some(Box::new(move |_, n| pings[n.min(pings.len() - 1)].clone())),
+            Some(blocks_responder(s.blocks.clone())),
             s.disconnect_after,
         )
         .await;
@@ -806,6 +1104,7 @@ mod tests {
         let gate = gate_file(&dir, &s.gate);
         let env = RunEnv {
             now_ms: clock(s.clock.clone()),
+            idle_timeout: s.idle_timeout,
             ..test_env()
         };
         let (code, out) = tokio::task::spawn_blocking(move || {
@@ -825,7 +1124,22 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert!(lines.len() <= 3, "one JSON line per step at most: {out}");
+        assert!(
+            lines.len() <= 5,
+            "one JSON line per step and the summary at most: {out}"
+        );
+        // A refused run prints nothing; any other ends with the summary.
+        if let Some(summary) = lines.last() {
+            assert_eq!(
+                summary["event"], "m2a-summary",
+                "the summary comes last: {out}"
+            );
+            assert_eq!(
+                summary["exit_code"],
+                u8::from(code != EXIT_CONNECTED),
+                "{out}"
+            );
+        }
         Outcome {
             code,
             lines,
@@ -839,7 +1153,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn matching_peer_passes() {
-        let eas = HEAD_SLOT - 100;
+        let eas = finalized_slot(F1.0) - 100;
         let out = probe(Scenario::new(peer_status(F1, 0, eas))).await;
         assert_eq!(out.code, EXIT_CONNECTED, "{}", out.line());
         assert_eq!(out.line()["pass"], true);
@@ -862,9 +1176,34 @@ mod tests {
         assert_eq!(ping::OUR_SEQ_NUMBER, 0);
         assert_eq!(out.peer.connections(), 1);
         assert_eq!(out.api.hits(FINALITY_PATH), 2, "sampled before and after");
-        assert_eq!(out.lines.len(), 3, "one line per step");
+        assert_eq!(out.lines.len(), 5, "one line per step and the summary");
         let events: Vec<&Value> = out.lines.iter().map(|l| &l["event"]).collect();
-        assert_eq!(events, ["m2a-status", "m2a-metadata", "m2a-ping"]);
+        assert_eq!(
+            events,
+            [
+                "m2a-status",
+                "m2a-metadata",
+                "m2a-ping",
+                "m2a-blocks-by-range",
+                "m2a-summary"
+            ]
+        );
+        // One BlocksByRange, from the peer's earliest_available_slot to the finalized slot,
+        // on the same connection.
+        let request = BlocksByRangeV2Request {
+            start_slot: eas,
+            count: 101,
+            step: 1,
+        };
+        assert_eq!(out.peer.blocks_requests(), vec![request]);
+        assert_eq!(out.blocks_line()["pass"], true);
+        for field in blocks::FIELDS {
+            assert!(out.blocks_verdict(field), "{field}: {}", out.blocks_line());
+        }
+        assert_eq!(out.summary()["pass"], true);
+        for check in summary::CHECKS {
+            assert!(out.check(check), "{check}: {}", out.summary());
+        }
         assert_eq!(out.ping_line()["pass"], true);
         for field in ping::FIELDS {
             assert!(out.ping_verdict(field), "{field}: {}", out.ping_line());
@@ -1084,6 +1423,10 @@ mod tests {
         // No MetaData seq_number to compare a Ping answer with: no Ping.
         assert!(out.event("m2a-ping").is_none());
         assert!(out.peer.pings().is_empty());
+        assert_eq!(
+            out.summary()["checks"]["ping"]["detail"],
+            "not run (see m2a-metadata)"
+        );
         // The connection check still ran, on the same connection.
         assert_eq!(out.line()["pass"], true);
         assert!(out.verdict("connection"));
@@ -1243,6 +1586,32 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn ping_refetch_identity_resample_failure_names_the_resample() {
+        // The re-fetch succeeds, but the identity sampled after it is malformed.
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        let body = |m: &MetaDataV3| MockApi::identity_json(s.enr, m);
+        let bad = body(&md(8)).replace("0x0100000000000080", "0x01");
+        s.identity_bodies = Some(vec![body(&md(7)), body(&md(7)), body(&md(7)), bad]);
+        s.metadata = vec![
+            MetaDataReply::MetaData(md(7)),
+            MetaDataReply::MetaData(md(8)),
+        ];
+        s.ping = vec![PingReply::Ping(8)];
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        let line = out.ping_line();
+        let error = line["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("identity re-sample: ") && error.contains("attnets"),
+            "{error}"
+        );
+        assert!(!error.contains("MetaData sample"), "{error}");
+        assert_eq!(line["refetched"]["peer"]["seq_number"], "8");
+        assert_eq!(line["refetched"]["api"], Value::Null);
+        assert_eq!(out.api.hits(IDENTITY_PATH), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn ping_failure_fails_the_step_only() {
         let mut s = Scenario::new(peer_status(F1, 0, 0));
         s.ping = vec![PingReply::Chunks(vec![7, 7])];
@@ -1285,7 +1654,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn head_2_slots_off_passes() {
         for off in [-2, 2] {
-            let out = probe(Scenario::new(peer_status(F1, off, HEAD_SLOT - 10))).await;
+            let out = probe(Scenario::new(peer_status(F1, off, finalized_slot(F1.0)))).await;
             assert_eq!(out.code, EXIT_CONNECTED, "{off}: {}", out.line());
             assert!(out.verdict("head_slot") && out.verdict("head_root"));
         }
@@ -1360,8 +1729,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn eas_equal_head_passes() {
         let out = probe(Scenario::new(peer_status(F1, 1, HEAD_SLOT + 1))).await;
-        assert_eq!(out.code, EXIT_CONNECTED, "{}", out.line());
+        assert_eq!(out.line()["pass"], true, "{}", out.line());
         assert!(out.verdict("earliest_available_slot"));
+        // Its earliest_available_slot is after its finalized slot: it serves no finalized
+        // block, so the BlocksByRange precondition fails without a request.
+        assert_eq!(out.code, EXIT_FAILED);
+        assert!(!out.blocks_verdict("request"));
+        assert!(out.peer.blocks_requests().is_empty());
         assert_eq!(
             out.line()["earliest_available_slot"],
             (HEAD_SLOT + 1).to_string()
@@ -1385,8 +1759,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn status_then_disconnect_fails() {
         let mut s = Scenario::new(peer_status(F1, 0, 0));
-        // Answers the Status, the MetaData and the Ping, then closes the connection.
-        s.disconnect_after = Some(3);
+        // Answers the Status, the MetaData, the Ping and the BlocksByRange, then closes the
+        // connection.
+        s.disconnect_after = Some(4);
         let out = probe(s).await;
         assert_eq!(out.code, EXIT_FAILED);
         assert!(!out.verdict("connection"));
@@ -1422,10 +1797,11 @@ mod tests {
         // It serves MetaData and Ping too: both steps run between the two Status exchanges.
         let metadata = s.metadata[0].clone();
         let ping = s.ping[0].clone();
-        let peer = StatusPeer::spawn_with_ping(
+        let peer = StatusPeer::spawn_with_blocks(
             Box::new(move |_, n| StatusReply::Status(statuses[n.min(1)].clone())),
             Some(Box::new(move |_| metadata.clone())),
             Some(Box::new(move |_, _| ping.clone())),
+            Some(blocks_responder(None)),
             None,
         )
         .await;
@@ -1562,6 +1938,404 @@ mod tests {
         drop(dir);
     }
 
+    // The BlocksByRange step.
+
+    #[test]
+    fn start_slot_respects_eas() {
+        let last = finalized_slot(F1.0);
+        // (earliest_available_slot, start_slot, count)
+        for (eas, start, count) in [
+            (0, last - 127, 128),
+            (last - 127, last - 127, 128),
+            (last - 128, last - 127, 128),
+            (last - 10, last - 10, 11),
+            (last, last, 1),
+        ] {
+            let r = blocks::range(F1.0, eas, 32).unwrap();
+            assert_eq!(
+                r,
+                BlocksByRangeV2Request {
+                    start_slot: start,
+                    count,
+                    step: 1
+                },
+                "eas {eas}"
+            );
+            assert!(r.start_slot >= eas);
+            assert!(r.count <= MAX_REQUEST_BLOCKS_DENEB);
+            assert_eq!(
+                r.start_slot + r.count - 1,
+                last,
+                "ends at the finalized slot"
+            );
+        }
+        // Fewer than 128 slots since genesis: no underflow.
+        for (epoch, count) in [(0, 1), (1, 33), (3, 97), (4, 128)] {
+            let r = blocks::range(epoch, 0, 32).unwrap();
+            assert_eq!(r.start_slot + r.count - 1, epoch * 32);
+            assert_eq!(r.count, count, "epoch {epoch}");
+        }
+    }
+
+    #[test]
+    fn eas_after_finalized_fails_precondition() {
+        let last = finalized_slot(F1.0);
+        let err = blocks::range(F1.0, last + 1, 32).unwrap_err();
+        assert!(
+            err.contains("precondition") && err.contains("earliest_available_slot"),
+            "{err}"
+        );
+        assert!(blocks::range(u64::MAX, 0, 32).is_err(), "no slot in u64");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn eas_after_finalized_sends_no_request() {
+        let out = probe(Scenario::new(peer_status(F1, 0, finalized_slot(F1.0) + 1))).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        assert_eq!(out.line()["pass"], true, "the Status step itself passed");
+        let line = out.blocks_line();
+        assert_eq!(line["request"], Value::Null);
+        let detail = line["verdicts"]["request"]["detail"].as_str().unwrap();
+        assert!(detail.contains("precondition"), "{detail}");
+        assert!(out.peer.blocks_requests().is_empty(), "no request");
+        assert!(!out.check("blocks_by_range") && !out.check("blocks_dropped"));
+        // The connection check still ran.
+        assert!(out.verdict("connection"));
+    }
+
+    #[test]
+    fn root_compare() {
+        let r = |b: u8| Some(root(b));
+        let request = BlocksByRangeV2Request {
+            start_slot: 100,
+            count: 6,
+            step: 1,
+        };
+        // Slots 101 and 104 are empty.
+        let api: BTreeMap<Slot, Option<Root>> = [
+            (100, r(1)),
+            (101, None),
+            (102, r(2)),
+            (103, r(3)),
+            (104, None),
+            (105, r(5)),
+        ]
+        .into();
+        let all = vec![
+            (100, root(1)),
+            (102, root(2)),
+            (103, root(3)),
+            (105, root(5)),
+        ];
+        // (a) Every block matches, and every empty slot is empty on both sides.
+        assert_eq!(blocks::compare(&request, &all, &api), []);
+
+        let kinds = |peer: &[(Slot, Root)]| -> Vec<(Slot, blocks::MismatchKind)> {
+            blocks::compare(&request, peer, &api)
+                .iter()
+                .map(|m| (m.slot, m.kind))
+                .collect()
+        };
+        use blocks::MismatchKind::{BlockForEmptySlot, MissingBlock, NoApiAnswer, RootDiffers};
+        // (b) One root differs.
+        let mut b = all.clone();
+        b[2].1 = root(9);
+        assert_eq!(kinds(&b), [(103, RootDiffers)]);
+        let m = blocks::compare(&request, &b, &api)[0];
+        assert_eq!((m.peer, m.api), (r(9), r(3)));
+        // (c) A block for a slot the API calls empty.
+        let mut c = all.clone();
+        c.insert(1, (101, root(7)));
+        assert_eq!(kinds(&c), [(101, BlockForEmptySlot)]);
+        // (d) No block for a slot the API has.
+        assert_eq!(kinds(&all[..3]), [(105, MissingBlock)]);
+        // As many blocks as the API has, at the wrong slots: a count-only match fails.
+        let shifted = vec![
+            (100, root(1)),
+            (101, root(2)),
+            (102, root(3)),
+            (105, root(5)),
+        ];
+        assert_eq!(
+            kinds(&shifted),
+            [
+                (101, BlockForEmptySlot),
+                (102, RootDiffers),
+                (103, MissingBlock)
+            ]
+        );
+        // A slot the API was not asked about never passes.
+        let mut partial = api.clone();
+        partial.remove(&104);
+        assert_eq!(
+            blocks::compare(&request, &all, &partial)
+                .iter()
+                .map(|m| (m.slot, m.kind))
+                .collect::<Vec<_>>(),
+            [(104, NoApiAnswer)]
+        );
+    }
+
+    #[test]
+    fn block_root_is_the_message_root() {
+        use tree_hash::TreeHash;
+        let gloas = p2p_wire::testkit::gloas_block::<Mainnet>(5);
+        let block = forked::SignedBeaconBlock::Gloas(gloas.clone());
+        assert_eq!(blocks::block_root(&block), gloas.message.tree_hash_root());
+        assert_ne!(
+            blocks::block_root(&block),
+            block.tree_hash_root(),
+            "not the signed block's"
+        );
+        let fulu = p2p_wire::testkit::fulu_block::<Mainnet>(5);
+        let block = forked::SignedBeaconBlock::Fulu(fulu.clone());
+        assert_eq!(blocks::block_root(&block), fulu.message.tree_hash_root());
+        let roots = blocks::hash_and_drop(vec![chain_block(1), chain_block(2)]);
+        assert_eq!(roots.iter().map(|(s, _)| *s).collect::<Vec<_>>(), [1, 2]);
+        assert_ne!(roots[0].1, roots[1].1);
+    }
+
+    /// A block that counts its drops.
+    struct Counted {
+        slot: Slot,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl blocks::Rooted for Counted {
+        fn slot(&self) -> Slot {
+            self.slot
+        }
+        fn root(&self) -> Root {
+            root(self.slot as u8)
+        }
+    }
+
+    /// The "dropped" half of the evidence: `hash_and_drop`, which the step hands every block
+    /// it receives, has dropped each one by the time it returns their roots. The "nothing
+    /// stored" half is `scripts/check-m2a-deps.sh`: the binary links no store crate.
+    #[test]
+    fn hash_and_drop_drops_every_block() {
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let blocks: Vec<Counted> = [3, 5, 8]
+            .map(|slot| Counted {
+                slot,
+                drops: Arc::clone(&drops),
+            })
+            .into();
+        let roots = blocks::hash_and_drop(blocks);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(roots, [(3, root(3)), (5, root(5)), (8, root(8))]);
+        assert_eq!(Arc::strong_count(&drops), 1, "no block is left anywhere");
+    }
+
+    /// The session-level half: the step's line keeps a slot and a root per block and nothing
+    /// else ([`hash_and_drop_drops_every_block`] proves the drop itself).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocks_are_dropped_after_comparison() {
+        let out = probe(Scenario::new(peer_status(F1, 0, 0))).await;
+        assert_eq!(out.code, EXIT_CONNECTED, "{}", out.blocks_line());
+        let line = out.blocks_line();
+        let last = finalized_slot(F1.0);
+        assert_eq!(line["request"]["start_slot"], (last - 127).to_string());
+        assert_eq!(line["request"]["count"], "128");
+        assert_eq!(line["request"]["step"], "1");
+        assert_eq!(line["finalized_slot"], last.to_string());
+        let served = (last - 127..=last).filter(|s| !empty(*s)).count();
+        assert_eq!(line["blocks_dropped"], served);
+        assert_eq!(line["api_slots_checked"], 128);
+        assert_eq!(line["api_blocks"], served);
+        // The step keeps a slot and a root per block, nothing of the block itself.
+        let kept = line["blocks"].as_array().unwrap();
+        assert_eq!(kept.len(), served);
+        for b in kept {
+            let mut keys: Vec<&String> = b.as_object().unwrap().keys().collect();
+            keys.sort();
+            assert_eq!(keys, ["root", "slot"], "{b}");
+        }
+        assert_eq!(line["mismatches"], serde_json::json!([]));
+        assert!(out.check("blocks_dropped") && out.check("decode_limits"));
+        // Every slot of the range was asked of the API, once.
+        for slot in last - 127..=last {
+            assert_eq!(
+                out.api.hits(&format!("/eth/v1/beacon/blocks/{slot}/root")),
+                1
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn slow_api_reads_do_not_idle_out_the_connection() {
+        // Each block-root read takes 40 ms: one after another, the ~110 reads take over 4 s, far
+        // past our 1 s idle timeout. The peer is correct, so the connection check must pass.
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.root_delay = Duration::from_millis(40);
+        s.idle_timeout = Duration::from_secs(1);
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_CONNECTED, "{}", out.summary());
+        assert!(out.verdict("connection"), "{}", out.line());
+        assert!(out.blocks_verdict("roots"), "{}", out.blocks_line());
+        assert_eq!(out.peer.connections(), 1);
+        assert_eq!(
+            out.peer.requests().len(),
+            2,
+            "the second Status reached the peer"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn api_root_failure_sends_no_blocks_request() {
+        // The API's roots are read before the request: a failed read stops the step first.
+        let last = finalized_slot(F1.0);
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.root_failures = vec![last - 5];
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        let line = out.blocks_line();
+        let error = line["error"].as_str().unwrap();
+        assert!(
+            error.contains(&format!("/eth/v1/beacon/blocks/{}/root", last - 5))
+                && error.contains("500"),
+            "{error}"
+        );
+        assert!(out.peer.blocks_requests().is_empty(), "no request");
+        assert!(out.blocks_verdict("request"));
+        assert!(out.verdict("connection"), "the connection check still ran");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn root_mismatch_fails_the_session() {
+        let last = finalized_slot(F1.0);
+        // (b) One root differs at the API; (c) the API calls a served slot empty; (d) the API
+        // has a block at a slot the peer leaves empty.
+        let differs = last - 1;
+        let called_empty = last - 2;
+        let unserved = (last - 127..=last).find(|s| empty(*s)).unwrap();
+        for (slot, api, kind) in [
+            (differs, Some(root(0x99)), "root differs"),
+            (called_empty, None, "a block for a slot the API calls empty"),
+            (
+                unserved,
+                Some(root(0x98)),
+                "no block for a slot the API has",
+            ),
+        ] {
+            assert!(!empty(differs) && !empty(called_empty));
+            let mut s = Scenario::new(peer_status(F1, 0, 0));
+            s.api_roots = vec![(slot, api)];
+            let out = probe(s).await;
+            assert_eq!(out.code, EXIT_FAILED, "{kind}");
+            assert!(out.blocks_verdict("request"));
+            assert!(!out.blocks_verdict("roots"), "{kind}");
+            let mismatches = out.blocks_line()["mismatches"].as_array().unwrap().clone();
+            assert_eq!(mismatches.len(), 1, "{kind}: {mismatches:?}");
+            assert_eq!(mismatches[0]["slot"], slot.to_string());
+            assert_eq!(mismatches[0]["kind"], kind);
+            assert!(!out.check("blocks_by_range"));
+            for check in [
+                "status",
+                "metadata",
+                "ping",
+                "blocks_dropped",
+                "decode_limits",
+            ] {
+                assert!(out.check(check), "{kind}: {check}");
+            }
+            assert_eq!(out.summary()["exit_code"], 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn range_across_the_gloas_fork_passes() {
+        // Epochs 353021..=353025: Fulu blocks under the BPO digest of their epoch, then Gloas
+        // blocks under the Gloas digest, each chunk decoded in its own fork.
+        let mut s = Scenario::new(peer_status(FB, 0, 0));
+        s.finality = vec![FB];
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_CONNECTED, "{}", out.blocks_line());
+        let first = finalized_slot(FB.0) - 127;
+        assert!(first / 32 < GLOAS_EPOCH);
+        assert_eq!(
+            out.blocks_line()["request"]["start_slot"],
+            first.to_string()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocks_request_failure_fails_the_step_only() {
+        // The peer serves a block under the wrong digest: the response is refused whole.
+        let last = finalized_slot(F1.0);
+        let (_, ssz) = wire_block(last);
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.blocks = Some(BlocksReply::Blocks(vec![([0x7e, 0x0d, 0x34, 0x47], ssz)]));
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        let line = out.blocks_line();
+        let error = line["error"].as_str().unwrap();
+        assert!(error.starts_with("blocks_by_range:"), "{error}");
+        assert_eq!(line["blocks"], Value::Null);
+        assert!(!out.check("blocks_by_range") && !out.check("blocks_dropped"));
+        assert!(out.check("status") && out.check("ping"));
+        assert!(out.verdict("connection"), "the connection check still ran");
+        // An error chunk.
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.blocks = Some(BlocksReply::Error(
+            ResultCode::ResourceUnavailable,
+            b"pruned".to_vec(),
+        ));
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        let error = out.blocks_line()["error"].as_str().unwrap();
+        assert!(error.contains("pruned"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn summary_line_format() {
+        let out = probe(Scenario::new(peer_status(F1, 0, 0))).await;
+        assert_eq!(out.code, EXIT_CONNECTED);
+        let line = out.summary();
+        assert_eq!(line["event"], "m2a-summary");
+        assert_eq!(line["pass"], true);
+        assert_eq!(line["exit_code"], 0);
+        assert_eq!(line["peer_id"], out.peer.id.to_string());
+        assert_eq!(line["consensus_specs"], "v1.7.0-beta.4");
+        let started = line["started_at_ms"].as_u64().unwrap();
+        let ended = line["ended_at_ms"].as_u64().unwrap();
+        assert_eq!(u128::from(started), WALL_MS);
+        assert!(ended > started, "{line}");
+        let checks = line["checks"].as_object().unwrap();
+        let names: Vec<&str> = checks.keys().map(String::as_str).collect();
+        let mut want = summary::CHECKS.to_vec();
+        want.sort_unstable();
+        let mut names_sorted = names.clone();
+        names_sorted.sort_unstable();
+        assert_eq!(names_sorted, want);
+        for (name, v) in checks {
+            assert_eq!(v["pass"], true, "{name}: {v}");
+            assert!(v["detail"].is_string(), "{name}: {v}");
+        }
+        let detail = |name: &str| line["checks"][name]["detail"].as_str().unwrap().to_owned();
+        assert!(detail("own_os_user").contains("1000"));
+        assert!(detail("key_handling").contains("ephemeral"));
+        assert!(detail("pinned_peer_only").contains("0 not pinned"));
+        assert!(detail("fuzz_gate").contains("m2a-gate.json"));
+        assert!(!line.to_string().contains('\n'));
+        // Any failed step fails the summary and the exit code.
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.ping = vec![PingReply::Ping(6)];
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        assert_eq!(out.summary()["pass"], false);
+        assert_eq!(out.summary()["exit_code"], 1);
+        assert!(!out.check("ping"));
+        assert!(out.check("blocks_by_range") && out.check("metadata"));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn genesis_mismatch_stops_before_the_exchange() {
         let s = Scenario::new(peer_status(F1, 0, 0));
@@ -1586,7 +2360,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(code, EXIT_FAILED);
-        let line: Value = serde_json::from_slice(&out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let line: Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
         assert_eq!(line["verdicts"]["genesis"]["pass"], false);
         assert!(line["error"].as_str().unwrap().contains("genesis"));
         assert!(peer.requests().is_empty(), "no Status sent");

@@ -27,9 +27,12 @@
 //!
 //! **MetaData**: once the handshake passed, the MetaData step ([`metadata`]) runs on the same
 //! connection, before the hold, with its own verdicts and log line; then, if it decoded a
-//! MetaData, the Ping step ([`ping`]). The session passes only if every step does
-//! ([`Report::passed`]).
+//! MetaData, the Ping step ([`ping`]); then the BlocksByRange step ([`blocks`]), for the peer's
+//! finalized slots. BlocksByRange runs before the hold, so the hold and the second Status also
+//! show the peer kept the connection after serving the session's largest response. The session
+//! passes only if every step does ([`Report::passed`]).
 
+use crate::blocks::{self, BlocksReport};
 use crate::enr;
 use crate::metadata::{self, MetaDataReport};
 use crate::ping::{self, PingReport};
@@ -132,6 +135,21 @@ pub struct Report {
     pub metadata: Option<MetaDataReport>,
     /// The Ping step, once the MetaData step decoded a MetaData.
     pub ping: Option<PingReport>,
+    /// The BlocksByRange step, once the handshake passed.
+    pub blocks: Option<BlocksReport>,
+}
+
+/// A step's verdicts as one JSON object, `{"<name>": {"pass": …, "detail": …}, …}`.
+pub fn verdicts_json(verdicts: &[(&'static str, Verdict)]) -> serde_json::Map<String, Value> {
+    verdicts
+        .iter()
+        .map(|(name, v)| {
+            (
+                (*name).to_owned(),
+                json!({"pass": v.pass, "detail": v.detail}),
+            )
+        })
+        .collect()
 }
 
 /// `0x` and the lower-case hex digits of `bytes`.
@@ -187,11 +205,12 @@ impl Report {
                 .all(|f| self.verdicts.iter().any(|(name, v)| name == f && v.pass))
     }
 
-    /// Whether the session passed: the Status, MetaData and Ping steps.
+    /// Whether the session passed: the Status, MetaData, Ping and BlocksByRange steps.
     pub fn passed(&self) -> bool {
         self.status_passed()
             && self.metadata.as_ref().is_some_and(MetaDataReport::passed)
             && self.ping.as_ref().is_some_and(PingReport::passed)
+            && self.blocks.as_ref().is_some_and(BlocksReport::passed)
     }
 
     /// The session log: one JSON line per step that ran, Status first.
@@ -199,6 +218,7 @@ impl Report {
         let mut lines = vec![self.json_line()];
         lines.extend(self.metadata.as_ref().map(MetaDataReport::json_line));
         lines.extend(self.ping.as_ref().map(PingReport::json_line));
+        lines.extend(self.blocks.as_ref().map(BlocksReport::json_line));
         lines
     }
 
@@ -208,16 +228,7 @@ impl Report {
 
     /// The Status step's log line: one JSON object, no newline inside.
     pub fn json_line(&self) -> String {
-        let verdicts: serde_json::Map<String, Value> = self
-            .verdicts
-            .iter()
-            .map(|(name, v)| {
-                (
-                    (*name).to_owned(),
-                    json!({"pass": v.pass, "detail": v.detail}),
-                )
-            })
-            .collect();
+        let verdicts = verdicts_json(&self.verdicts);
         json!({
             "event": "m2a-status",
             "pass": self.status_passed(),
@@ -441,6 +452,7 @@ async fn steps<E: EthSpec>(
     if let Some(seq) = decoded_seq {
         report.ping = Some(ping::run(session, api, seq).await);
     }
+    report.blocks = Some(blocks::run(session, api, probe.chain, &theirs).await);
     let connection = match hold(session, probe.hold).await {
         Err(e) => Err(e),
         Ok(()) => second_status(session, probe, &after).await,

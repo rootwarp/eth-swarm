@@ -49,12 +49,47 @@ cl_p2p "$ws" '[dev-dependencies]' 'discv5 = { path = "../discv5" }'
 crate "$ws" discv5
 check pass "a dev-dependency is not linked into the binary" "$script" "$(workspace dev cl-p2p discv5)"
 
+# The store crates: m2a-session drops every block it fetches and must be unable to store one.
+for store in cl-chain cl-chain-columns cl-store libmdbx mdbx-sys; do
+  ws="$tmp/direct-$store"
+  cl_p2p "$ws" '[dependencies]' "$store = { path = \"../$store\" }"
+  crate "$ws" "$store"
+  check fail "direct $store dependency" "$script" "$(workspace "direct-$store" cl-p2p "$store")" \
+    "$store v0.1.0"
+done
+
+ws="$tmp/store-transitive"
+cl_p2p "$ws" '[dependencies]' 'mid = { path = "../mid" }'
+crate "$ws" mid '[dependencies]' 'libmdbx = { path = "../libmdbx" }'
+crate "$ws" libmdbx
+check fail "libmdbx through another crate" "$script" "$(workspace store-transitive cl-p2p mid libmdbx)" \
+  "a store crate is a dependency"
+
+ws="$tmp/store-dev"
+cl_p2p "$ws" '[dev-dependencies]' 'cl-store = { path = "../cl-store" }'
+crate "$ws" cl-store
+check pass "a store dev-dependency is not linked into the binary" "$script" \
+  "$(workspace store-dev cl-p2p cl-store)"
+
+ws="$tmp/lookalike"
+cl_p2p "$ws" '[dependencies]' 'cl-chain-client = { path = "../cl-chain-client" }'
+crate "$ws" cl-chain-client
+check pass "a crate whose name only starts with a store crate's" "$script" \
+  "$(workspace lookalike cl-p2p cl-chain-client)"
+
+ws="$tmp/both"
+cl_p2p "$ws" '[dependencies]' 'discv5 = { path = "../discv5" }' 'cl-chain = { path = "../cl-chain" }'
+crate "$ws" discv5
+crate "$ws" cl-chain
+check fail "discv5 and a store crate are both reported" "$script" "$(workspace both cl-p2p discv5 cl-chain)" \
+  "cl-chain v0.1.0"
+
 ws="$tmp/nobin"
 crate "$ws" cl-p2p
 check fail "no m2a-session binary (the check would be vacuous)" "$script" "$(workspace nobin cl-p2p)" \
   "no m2a-session binary"
 
-check pass "real workspace" "$script" "$repo/Cargo.toml"
+check pass "real workspace" "$script" "$repo/Cargo.toml" "no discv5 and no store crate"
 
 echo "# $passed passed, $failed failed"
 ((failed == 0))

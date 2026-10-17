@@ -847,6 +847,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "tree_hash",
  "zeroize",
 ]
 

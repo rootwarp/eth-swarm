@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Fail if discv5 is anywhere in the dependency graph the m2a-session binary links.
+# Fail if discv5 or a store crate is anywhere in the dependency graph the m2a-session binary
+# links.
 #
 # m2a-session dials one pinned peer and must have no discovery at all, so no discv5 (and no
-# crate that pulls it in) may be a normal dependency of cl-p2p, on any target platform.
+# crate that pulls it in) may be a normal dependency of cl-p2p, on any target platform. It also
+# hashes and drops every block it fetches, so it must be unable to store one: no cl-chain,
+# cl-chain-columns, cl-store, libmdbx or mdbx-sys (the workspace has no `store-schema` crate;
+# these are its storage crates and the MDBX binding they use).
 # `cargo tree` has no --bin filter, but a binary links exactly its package's normal
 # dependencies, so the graph of `cargo tree -p cl-p2p -e normal --target all` is the binary's.
 # The check also fails if cl-p2p has no m2a-session binary, so it can never pass vacuously.
@@ -39,12 +43,26 @@ if ((rc != 0)); then
   echo "ERROR: cargo tree failed (exit $rc)" >&2
   exit 1
 fi
-found=$(printf '%s\n' "$tree" | grep -E '^discv5 v' | sort -u || true)
-if [[ -n $found ]]; then
-  echo "ERROR: discv5 is a dependency of cl-p2p (m2a-session must have no discovery):"
-  printf '%s\n' "$found" | sed 's/^/  /'
-  "$cargo" tree --locked -p cl-p2p -e normal --target all -i discv5 --manifest-path "$manifest" \
-    2>/dev/null | sed 's/^/  /' || true
+# banned <message> <crate...>: report every listed crate in the graph, with who pulls it in.
+status=0
+banned() {
+  local message=$1 name found
+  shift
+  for name in "$@"; do
+    found=$(printf '%s\n' "$tree" | grep -E "^$name v" | sort -u || true)
+    if [[ -n $found ]]; then
+      echo "ERROR: $message:"
+      printf '%s\n' "$found" | sed 's/^/  /'
+      "$cargo" tree --locked -p cl-p2p -e normal --target all -i "$name" \
+        --manifest-path "$manifest" 2>/dev/null | sed 's/^/  /' || true
+      status=1
+    fi
+  done
+}
+banned "discv5 is a dependency of cl-p2p (m2a-session must have no discovery)" discv5
+banned "a store crate is a dependency of cl-p2p (m2a-session must store no block)" \
+  cl-chain cl-chain-columns cl-store libmdbx mdbx-sys
+if ((status != 0)); then
   exit 1
 fi
-echo "m2a-session deps OK (no discv5 in cl-p2p's normal dependency graph)"
+echo "m2a-session deps OK (no discv5 and no store crate in cl-p2p's normal dependency graph)"

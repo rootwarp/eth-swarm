@@ -18,20 +18,34 @@
 //! `Ping(uint64)` and the response one 8-byte success chunk. Judging the answer against the
 //! peer's MetaData is the caller's business.
 //!
+//! [`blocks_by_range`] sends one `BeaconBlocksByRange` v2 request on
+//! `/eth2/beacon_chain/req/beacon_blocks_by_range/2/ssz_snappy` (`phase0/p2p-interface.md`
+//! L1485–1575) and returns the blocks once every one of them passed the request's rules:
+//! `count` is 1 to `MAX_REQUEST_BLOCKS_DENEB` (128, `deneb/p2p-interface.md` L68) and `step`
+//! is 1, checked before anything is sent; the codec reads at most `count` chunks and decodes
+//! each in the fork its context bytes name (Gloas, or Fulu codec-only); then each block's slot
+//! must be inside `[start_slot, start_slot + count)` and above the previous block's, and its
+//! context bytes must be `compute_fork_digest` of the block's own epoch (`gloas/p2p-interface.md`
+//! L1356–1374), which the caller supplies. Any failure drops every block of the response
+//! ([`OutboundError::InvalidBlocks`]).
+//!
 //! A response the codec refused (a wrong SSZ length, a chunk too many, …) fails as
 //! [`OutboundError::InvalidResponse`] with the codec's typed [`ReadError`].
 
-use crate::rpc::codec::{ReadError, RpcCodec};
-use consensus_types::EthSpec;
+use crate::rpc::codec::{ReadError, ReceivedChunk, RpcCodec};
+use consensus_types::primitives::{Epoch, Slot};
+use consensus_types::{forked, EthSpec};
 use futures::StreamExt;
 use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{PeerId, Swarm};
-use p2p_wire::rpc::messages::{ForkDigest, MetaDataV3, Ping, StatusV2};
-use p2p_wire::rpc::protocols::{Request, Response, ResponseChunk, ResultCode};
+use p2p_wire::rpc::messages::{BlocksByRangeV2Request, ForkDigest, MetaDataV3, Ping, StatusV2};
+use p2p_wire::rpc::protocols::{
+    Request, Response, ResponseChunk, ResultCode, MAX_REQUEST_BLOCKS_DENEB,
+};
 
 /// One event of an outbound `request_response` behaviour.
-pub type RpcEvent<E> = request_response::Event<Request, Vec<ResponseChunk<E>>>;
+pub type RpcEvent<E> = request_response::Event<Request, Vec<ReceivedChunk<E>>>;
 
 /// A behaviour with a Status v2 `request_response` behaviour inside.
 pub trait StatusRpc<E: EthSpec>: NetworkBehaviour {
@@ -60,6 +74,61 @@ pub trait PingRpc<E: EthSpec>: NetworkBehaviour {
     fn ping_event(event: Self::ToSwarm) -> Option<RpcEvent<E>>;
 }
 
+/// A behaviour with a BeaconBlocksByRange v2 `request_response` behaviour inside.
+pub trait BlocksByRangeRpc<E: EthSpec>: NetworkBehaviour {
+    /// The BlocksByRange v2 behaviour.
+    fn blocks_by_range_rpc(&mut self) -> &mut request_response::Behaviour<RpcCodec<E>>;
+
+    /// The BlocksByRange behaviour's event inside `event`, or `None` for another behaviour's.
+    fn blocks_by_range_event(event: Self::ToSwarm) -> Option<RpcEvent<E>>;
+}
+
+/// The fork digest of an epoch (`compute_fork_digest`), `None` where it has none.
+pub type DigestAt<'a> = dyn Fn(Epoch) -> Option<ForkDigest> + Sync + 'a;
+
+/// How a BlocksByRange response broke its request's rules.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BlocksError {
+    /// A block outside `[start, end)`.
+    #[error("a block at slot {slot}, outside the requested [{start}, {end})")]
+    SlotOutOfRange {
+        /// The block's slot.
+        slot: Slot,
+        /// `start_slot`.
+        start: Slot,
+        /// `start_slot + count`.
+        end: Slot,
+    },
+    /// A block at or below the slot of the block before it.
+    #[error("a block at slot {slot} after one at slot {previous}: slots must strictly increase")]
+    NonIncreasingSlot {
+        /// The block's slot.
+        slot: Slot,
+        /// The previous block's slot.
+        previous: Slot,
+    },
+    /// Context bytes other than the fork digest of the block's epoch.
+    #[error(
+        "a block at slot {slot} (epoch {epoch}) with context {}, the epoch's digest is {}",
+        digest_text(.got),
+        digest_text(.want)
+    )]
+    WrongContextDigest {
+        /// The block's slot.
+        slot: Slot,
+        /// Its epoch.
+        epoch: Epoch,
+        /// The context bytes it came with.
+        got: Option<ForkDigest>,
+        /// `compute_fork_digest` of its epoch.
+        want: Option<ForkDigest>,
+    },
+}
+
+fn digest_text(digest: &Option<ForkDigest>) -> String {
+    digest.map_or_else(|| "none".to_owned(), |d| format!("0x{}", hex(&d)))
+}
+
 /// Why an outbound exchange failed.
 #[derive(Debug, thiserror::Error)]
 pub enum OutboundError {
@@ -86,6 +155,12 @@ pub enum OutboundError {
     /// The response was not one chunk of the requested message.
     #[error("unexpected response: {0}")]
     UnexpectedResponse(String),
+    /// The request breaks the protocol's limits; it was not sent.
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+    /// The blocks broke the request's range or context rule; every block is dropped.
+    #[error("invalid blocks: {0}")]
+    InvalidBlocks(BlocksError),
     /// The codec refused the response: it broke the wire format (a wrong SSZ length, …) or
     /// the request's limits (a chunk too many, …).
     #[error("invalid response: {0}")]
@@ -132,7 +207,7 @@ where
         .status_rpc()
         .send_request(&peer, Request::Status(ours.clone()));
     let chunks = wait_for_response(swarm, id, B::status_event).await?;
-    let theirs = single_status(chunks)?;
+    let theirs = single_status(without_context(chunks))?;
     if theirs.fork_digest != ours.fork_digest {
         return Err(OutboundError::ForkDigestMismatch {
             ours: ours.fork_digest,
@@ -155,7 +230,7 @@ where
         .metadata_rpc()
         .send_request(&peer, Request::MetaData);
     let chunks = wait_for_response(swarm, id, B::metadata_event).await?;
-    single_metadata(chunks)
+    single_metadata(without_context(chunks))
 }
 
 /// Sends our `seq_number` to `peer` and drives `swarm` until the peer's arrives or the exchange
@@ -172,7 +247,101 @@ where
         .ping_rpc()
         .send_request(&peer, Request::Ping(Ping(ours)));
     let chunks = wait_for_response(swarm, id, B::ping_event).await?;
-    single_ping(chunks)
+    single_ping(without_context(chunks))
+}
+
+/// Sends `request` to `peer`, drives `swarm` until the response is complete or the exchange
+/// fails, and returns the blocks once each passed the request's rules (see the module docs).
+/// `digest_at` is `compute_fork_digest` of the session's chain.
+///
+/// Events of other behaviours that arrive meanwhile are dropped (logged at debug).
+pub async fn blocks_by_range<E, B>(
+    swarm: &mut Swarm<B>,
+    peer: PeerId,
+    request: BlocksByRangeV2Request,
+    digest_at: &DigestAt<'_>,
+) -> Result<Vec<forked::SignedBeaconBlock<E>>, OutboundError>
+where
+    E: EthSpec,
+    B: BlocksByRangeRpc<E>,
+{
+    check_request(&request)?;
+    let id = swarm
+        .behaviour_mut()
+        .blocks_by_range_rpc()
+        .send_request(&peer, Request::BlocksByRange(request));
+    let chunks = wait_for_response(swarm, id, B::blocks_by_range_event).await?;
+    check_blocks(&request, chunks, digest_at)
+}
+
+/// `count` in `1..=MAX_REQUEST_BLOCKS_DENEB`, `step` 1, and the range inside `u64` slots.
+fn check_request(request: &BlocksByRangeV2Request) -> Result<(), OutboundError> {
+    let invalid = |why: String| Err(OutboundError::InvalidRequest(why));
+    if !(1..=MAX_REQUEST_BLOCKS_DENEB).contains(&request.count) {
+        return invalid(format!(
+            "count {} is not in 1..={MAX_REQUEST_BLOCKS_DENEB}",
+            request.count
+        ));
+    }
+    if request.step != 1 {
+        return invalid(format!("step {}, not 1", request.step));
+    }
+    if request.start_slot.checked_add(request.count).is_none() {
+        return invalid(format!(
+            "start_slot {} + count {} overflows",
+            request.start_slot, request.count
+        ));
+    }
+    Ok(())
+}
+
+/// The blocks of a BlocksByRange response, once every chunk is a block of `request`'s range,
+/// above the one before it and under its own epoch's digest. An error chunk fails the whole
+/// response.
+fn check_blocks<E: EthSpec>(
+    request: &BlocksByRangeV2Request,
+    chunks: Vec<ReceivedChunk<E>>,
+    digest_at: &DigestAt<'_>,
+) -> Result<Vec<forked::SignedBeaconBlock<E>>, OutboundError> {
+    let start = request.start_slot;
+    let end = start.saturating_add(request.count);
+    let mut blocks: Vec<forked::SignedBeaconBlock<E>> = Vec::with_capacity(chunks.len());
+    for ReceivedChunk { context, chunk } in chunks {
+        let block = match chunk {
+            ResponseChunk::Success(Response::Block(block)) => *block,
+            ResponseChunk::Success(other) => {
+                return Err(OutboundError::UnexpectedResponse(format!("{other:?}")))
+            }
+            ResponseChunk::Error { code, message } => {
+                return Err(OutboundError::ErrorResponse {
+                    code,
+                    message: String::from_utf8_lossy(&message).into_owned(),
+                })
+            }
+        };
+        let slot = block.slot();
+        let invalid = |e| Err(OutboundError::InvalidBlocks(e));
+        if !(start..end).contains(&slot) {
+            return invalid(BlocksError::SlotOutOfRange { slot, start, end });
+        }
+        if let Some(previous) = blocks.last().map(forked::SignedBeaconBlock::slot) {
+            if slot <= previous {
+                return invalid(BlocksError::NonIncreasingSlot { slot, previous });
+            }
+        }
+        let epoch = slot / E::slots_per_epoch();
+        let want = digest_at(epoch);
+        if want.is_none() || context != want {
+            return invalid(BlocksError::WrongContextDigest {
+                slot,
+                epoch,
+                got: context,
+                want,
+            });
+        }
+        blocks.push(block);
+    }
+    Ok(blocks)
 }
 
 /// Drives `swarm` until request `id` has a response or fails; `event_of` picks the requesting
@@ -183,7 +352,7 @@ async fn wait_for_response<E, B>(
     swarm: &mut Swarm<B>,
     id: OutboundRequestId,
     event_of: fn(B::ToSwarm) -> Option<RpcEvent<E>>,
-) -> Result<Vec<ResponseChunk<E>>, OutboundError>
+) -> Result<Vec<ReceivedChunk<E>>, OutboundError>
 where
     E: EthSpec,
     B: NetworkBehaviour,
@@ -244,6 +413,11 @@ fn refused_response(e: std::io::Error) -> Result<ReadError, std::io::Error> {
     }
 }
 
+/// The chunks of a protocol without context bytes.
+fn without_context<E: EthSpec>(chunks: Vec<ReceivedChunk<E>>) -> Vec<ResponseChunk<E>> {
+    chunks.into_iter().map(|c| c.chunk).collect()
+}
+
 /// The one success payload of a single-chunk response.
 fn single_chunk<E: EthSpec>(
     mut chunks: Vec<ResponseChunk<E>>,
@@ -293,11 +467,13 @@ mod tests {
     use crate::m2a_session::{NodeKey, Session, SessionBehaviour, Transport};
     use crate::rpc::codec::Deadlines;
     use crate::rpc::codec::ReadError;
-    use crate::testkit::{MetaDataReply, PingReply, StatusPeer, StatusReply};
-    use consensus_types::primitives::B256;
-    use consensus_types::Minimal;
+    use crate::testkit::{BlocksReply, MetaDataReply, PingReply, StatusPeer, StatusReply};
+    use consensus_types::primitives::{Slot, B256};
+    use consensus_types::{ForkName, Minimal};
     use p2p_wire::rpc::codec::CodecError;
-    use p2p_wire::rpc::codec::ContextTable;
+    use p2p_wire::rpc::protocols::MAX_REQUEST_BLOCKS_DENEB;
+    use p2p_wire::testkit;
+    use ssz::Encode;
     use std::sync::Arc;
 
     type E = Minimal;
@@ -319,7 +495,7 @@ mod tests {
         let mut session = Session::<E>::start(
             NodeKey::ephemeral(),
             peer.pinned(),
-            Arc::new(ContextTable::new()),
+            Arc::new(testkit::context_table()),
             Deadlines::default(),
             Transport::Tcp,
         )
@@ -533,6 +709,299 @@ mod tests {
             "{err}"
         );
         assert_eq!(peer.pings(), vec![3]);
+    }
+
+    // BeaconBlocksByRange v2 on the fixture peer (minimal preset: 8 slots per epoch).
+
+    /// The fixture schedule: Fulu before epoch 2, Gloas from it.
+    fn fixture_digest(epoch: Epoch) -> Option<ForkDigest> {
+        Some(if epoch < 2 {
+            testkit::FULU_DIGEST
+        } else {
+            testkit::GLOAS_DIGEST
+        })
+    }
+
+    /// Slots 12..20: epoch 1 (Fulu) up to slot 15, epoch 2 (Gloas) from slot 16.
+    fn range() -> BlocksByRangeV2Request {
+        BlocksByRangeV2Request {
+            start_slot: 12,
+            count: 8,
+            step: 1,
+        }
+    }
+
+    /// The fixture block at `slot` in the shape of `fork`, on the wire with `digest`.
+    fn wire_block(slot: Slot, fork: ForkName, digest: ForkDigest) -> (ForkDigest, Vec<u8>) {
+        let ssz = match fork {
+            ForkName::Fulu => testkit::fulu_block::<E>(slot).as_ssz_bytes(),
+            ForkName::Gloas => testkit::gloas_block::<E>(slot).as_ssz_bytes(),
+        };
+        (digest, ssz)
+    }
+
+    /// The fixture block at `slot`, in its epoch's fork and digest.
+    fn canonical(slot: Slot) -> (ForkDigest, Vec<u8>) {
+        if slot < 16 {
+            wire_block(slot, ForkName::Fulu, testkit::FULU_DIGEST)
+        } else {
+            wire_block(slot, ForkName::Gloas, testkit::GLOAS_DIGEST)
+        }
+    }
+
+    /// A peer serving Status and, with `reply`, BlocksByRange.
+    async fn blocks_peer(reply: BlocksReply) -> StatusPeer {
+        StatusPeer::spawn_with_blocks(
+            Box::new(|req, _| StatusReply::Status(req.clone())),
+            None,
+            None,
+            Some(Box::new(move |_, _| reply.clone())),
+            None,
+        )
+        .await
+    }
+
+    /// Requests [`range`] from a fixture peer answering `reply`.
+    async fn fetch(
+        reply: BlocksReply,
+    ) -> (
+        StatusPeer,
+        Result<Vec<forked::SignedBeaconBlock<E>>, OutboundError>,
+    ) {
+        let peer = blocks_peer(reply).await;
+        let mut session = connected(&peer).await;
+        let got = blocks_by_range(session.swarm(), peer.id, range(), &fixture_digest).await;
+        (peer, got)
+    }
+
+    fn invalid_blocks(
+        got: Result<Vec<forked::SignedBeaconBlock<E>>, OutboundError>,
+    ) -> BlocksError {
+        match got {
+            Err(OutboundError::InvalidBlocks(e)) => e,
+            Err(other) => panic!("{other}"),
+            Ok(blocks) => panic!("accepted {} blocks", blocks.len()),
+        }
+    }
+
+    #[tokio::test]
+    async fn blocks_by_range_roundtrip() {
+        // Empty slots 14, 17, 18; the range crosses the Fulu/Gloas boundary at slot 16, and
+        // each chunk is decoded in the fork its context bytes name.
+        let slots = [12, 13, 15, 16, 19];
+        let reply = BlocksReply::Blocks(slots.map(canonical).into());
+        let (peer, got) = fetch(reply).await;
+        let blocks = got.unwrap();
+        let got: Vec<(Slot, ForkName)> = blocks.iter().map(|b| (b.slot(), b.fork_name())).collect();
+        use ForkName::{Fulu, Gloas};
+        assert_eq!(
+            got,
+            [(12, Fulu), (13, Fulu), (15, Fulu), (16, Gloas), (19, Gloas)]
+        );
+        assert_eq!(
+            blocks[3],
+            forked::SignedBeaconBlock::Gloas(testkit::gloas_block(16))
+        );
+        assert_eq!(peer.blocks_requests(), vec![range()]);
+        assert_eq!(peer.connections(), 1);
+
+        // No block at all is a valid answer: every slot of the range is empty.
+        let (_, got) = fetch(BlocksReply::Blocks(Vec::new())).await;
+        assert!(got.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn slot_out_of_range_rejected() {
+        for (slots, bad) in [([12, 20], 20), ([11, 12], 11)] {
+            let reply = BlocksReply::Blocks(slots.map(canonical).into());
+            let (_, got) = fetch(reply).await;
+            let err = invalid_blocks(got);
+            assert_eq!(
+                err,
+                BlocksError::SlotOutOfRange {
+                    slot: bad,
+                    start: 12,
+                    end: 20
+                },
+                "{slots:?}"
+            );
+            assert!(err.to_string().contains("[12, 20)"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn non_increasing_slots_rejected() {
+        for (slots, slot, previous) in [([13, 13], 13, 13), ([14, 13], 13, 14)] {
+            let reply = BlocksReply::Blocks(slots.map(canonical).into());
+            let (_, got) = fetch(reply).await;
+            assert_eq!(
+                invalid_blocks(got),
+                BlocksError::NonIncreasingSlot { slot, previous },
+                "{slots:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_context_digest_rejected() {
+        // A Fulu block of epoch 1 under the second Fulu digest: it decodes (the digest names
+        // Fulu), but it is not the digest of the block's epoch.
+        let reply = BlocksReply::Blocks(vec![
+            canonical(12),
+            wire_block(13, ForkName::Fulu, testkit::FULU_BPO_DIGEST),
+        ]);
+        let (_, got) = fetch(reply).await;
+        let err = invalid_blocks(got);
+        assert_eq!(
+            err,
+            BlocksError::WrongContextDigest {
+                slot: 13,
+                epoch: 1,
+                got: Some(testkit::FULU_BPO_DIGEST),
+                want: Some(testkit::FULU_DIGEST),
+            }
+        );
+        assert!(err.to_string().contains("0xf0010002"), "{err}");
+        // A Gloas-epoch slot under the Fulu digest, in the Fulu shape.
+        let reply = BlocksReply::Blocks(vec![wire_block(16, ForkName::Fulu, testkit::FULU_DIGEST)]);
+        let (_, got) = fetch(reply).await;
+        assert!(matches!(
+            invalid_blocks(got),
+            BlocksError::WrongContextDigest {
+                slot: 16,
+                epoch: 2,
+                ..
+            }
+        ));
+        // A digest the table does not know is refused by the codec, before the payload.
+        let reply = BlocksReply::Blocks(vec![wire_block(
+            12,
+            ForkName::Fulu,
+            testkit::UNKNOWN_DIGEST,
+        )]);
+        let (_, got) = fetch(reply).await;
+        assert!(
+            matches!(
+                got,
+                Err(OutboundError::InvalidResponse(ReadError::Codec(
+                    CodecError::UnknownContext(_)
+                )))
+            ),
+            "{got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocks_by_range_limits() {
+        // More chunks than `count`: the codec refuses the response.
+        let peer = blocks_peer(BlocksReply::Blocks([12, 13, 14].map(canonical).into())).await;
+        let mut session = connected(&peer).await;
+        let two = BlocksByRangeV2Request {
+            count: 2,
+            ..range()
+        };
+        let err = blocks_by_range(session.swarm(), peer.id, two, &fixture_digest)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OutboundError::InvalidResponse(ReadError::TooManyChunks { max: 2 })
+            ),
+            "{err:?}"
+        );
+        // A request outside 1..=MAX_REQUEST_BLOCKS_DENEB, a step other than 1 or a range past
+        // the last slot is never sent.
+        let bad = [
+            BlocksByRangeV2Request {
+                count: 0,
+                ..range()
+            },
+            BlocksByRangeV2Request {
+                count: 129,
+                ..range()
+            },
+            BlocksByRangeV2Request { step: 2, ..range() },
+            BlocksByRangeV2Request {
+                start_slot: u64::MAX,
+                ..range()
+            },
+        ];
+        for request in bad {
+            let err = blocks_by_range(session.swarm(), peer.id, request, &fixture_digest)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, OutboundError::InvalidRequest(_)),
+                "{request:?}: {err}"
+            );
+        }
+        assert_eq!(
+            peer.blocks_requests(),
+            vec![two],
+            "only the valid request went out"
+        );
+        let full = BlocksByRangeV2Request {
+            count: MAX_REQUEST_BLOCKS_DENEB,
+            ..range()
+        };
+        assert!(check_request(&full).is_ok());
+    }
+
+    #[tokio::test]
+    async fn blocks_error_chunk_fails() {
+        let reply = BlocksReply::Error(ResultCode::ResourceUnavailable, b"pruned".to_vec());
+        let (_, got) = fetch(reply).await;
+        assert!(
+            matches!(&got, Err(OutboundError::ErrorResponse { code: ResultCode::ResourceUnavailable, message }) if message == "pruned"),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn blocks_need_a_block_with_context_bytes() {
+        let block = |context| ReceivedChunk::<E> {
+            context,
+            chunk: ResponseChunk::Success(Response::Block(Box::new(
+                forked::SignedBeaconBlock::Fulu(testkit::fulu_block(12)),
+            ))),
+        };
+        assert_eq!(
+            check_blocks(
+                &range(),
+                vec![block(Some(testkit::FULU_DIGEST))],
+                &fixture_digest
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        // No context bytes: the codec never yields that for a block, and it is refused.
+        let err = check_blocks(&range(), vec![block(None)], &fixture_digest).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OutboundError::InvalidBlocks(BlocksError::WrongContextDigest { got: None, .. })
+            ),
+            "{err}"
+        );
+        // An epoch the schedule has no digest for (before Fulu).
+        let none = |_: Epoch| None;
+        let err =
+            check_blocks(&range(), vec![block(Some(testkit::FULU_DIGEST))], &none).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OutboundError::InvalidBlocks(BlocksError::WrongContextDigest { want: None, .. })
+            ),
+            "{err}"
+        );
+        let ping = ReceivedChunk::<E> {
+            context: None,
+            chunk: ResponseChunk::Success(Response::Ping(Ping(1))),
+        };
+        let err = check_blocks(&range(), vec![ping], &fixture_digest).unwrap_err();
+        assert!(matches!(err, OutboundError::UnexpectedResponse(_)), "{err}");
     }
 
     #[test]

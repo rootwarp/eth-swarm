@@ -3,8 +3,9 @@
 //!
 //! It runs after the Status exchange, on the same connection
 //! ([`cl_p2p::m2a_session::Session::request_metadata`], which keeps the peer's MetaData in the
-//! session), and the Ping step ([`crate::ping`]) compares its answer with this `seq_number`. `fulu/p2p-interface.md` L778–794 defines the request, L269–288 the type;
-//! `attnets` and `syncnets` are `altair/p2p-interface.md` L141–149.
+//! session), and the Ping step ([`crate::ping`]) compares its answer with this `seq_number`.
+//! `fulu/p2p-interface.md` L778–794 defines the request, L269–288 the type; `attnets` and
+//! `syncnets` are `altair/p2p-interface.md` L141–149.
 //!
 //! **Order**: sample the identity; request; sample again. `seq_number` increments on every
 //! change to the other fields (`phase0/p2p-interface.md` L456–477), so if it moved between the
@@ -15,7 +16,7 @@
 //! (the sample after the request, whose `seq_number` equals the one before it), compared as
 //! typed values.
 
-use crate::probe::{hex, Verdict};
+use crate::probe::{hex, verdicts_json, Verdict};
 use crate::reference_api::ReferenceApi;
 use cl_p2p::m2a_session::Session;
 use consensus_types::EthSpec;
@@ -69,16 +70,7 @@ impl MetaDataReport {
 
     /// The step's log line: one JSON object, no newline inside.
     pub fn json_line(&self) -> String {
-        let verdicts: serde_json::Map<String, Value> = self
-            .verdicts
-            .iter()
-            .map(|(name, v)| {
-                (
-                    (*name).to_owned(),
-                    json!({"pass": v.pass, "detail": v.detail}),
-                )
-            })
-            .collect();
+        let verdicts = verdicts_json(&self.verdicts);
         json!({
             "event": "m2a-metadata",
             "pass": self.passed(),

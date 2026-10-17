@@ -1,6 +1,6 @@
 //! A mock reference beacon API for the tests: plain HTTP/1.1 on 127.0.0.1. Each path has a
-//! scripted list of replies (the `n`th request gets the `n`th, the last repeats), unknown
-//! paths are 404, and every request is recorded.
+//! scripted list of replies (the `n`th request gets the `n`th, the last repeats) or a fixed
+//! status code, unknown paths are 404, and every request is recorded.
 
 use bytes::Bytes;
 use consensus_types::primitives::{Root, Slot};
@@ -14,22 +14,37 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::net::TcpListener;
 
-/// The replies of one path, in order.
+/// The replies of one path, in order, with their status code and how long each takes.
 #[derive(Clone, Debug)]
-pub struct Route(Vec<String>);
+pub struct Route(Vec<String>, StatusCode, Duration);
 
 impl Route {
     /// Always this JSON.
     pub fn json(body: impl Into<String>) -> Self {
-        Self(vec![body.into()])
+        Self(vec![body.into()], StatusCode::OK, Duration::ZERO)
     }
 
     /// These JSON bodies, one per request; the last repeats.
     pub fn sequence(bodies: Vec<String>) -> Self {
         assert!(!bodies.is_empty());
-        Self(bodies)
+        Self(bodies, StatusCode::OK, Duration::ZERO)
+    }
+
+    /// Always `status`, with an empty body.
+    pub fn status(status: u16) -> Self {
+        Self(
+            vec![String::new()],
+            StatusCode::from_u16(status).unwrap(),
+            Duration::ZERO,
+        )
+    }
+
+    /// This route, answering each request only after `delay`.
+    pub fn delayed(self, delay: Duration) -> Self {
+        Self(self.0, self.1, delay)
     }
 }
 
@@ -80,11 +95,15 @@ impl MockApi {
                         let n = counts.entry(path.clone()).or_insert(0);
                         let body = r.0[(*n).min(r.0.len() - 1)].clone();
                         *n += 1;
-                        body
+                        (r.1, r.2, body)
                     });
                     async move {
+                        if let Some((_, delay, _)) = &body {
+                            tokio::time::sleep(*delay).await;
+                        }
                         let response = match body {
-                            Some(b) => Response::builder()
+                            Some((status, _, b)) => Response::builder()
+                                .status(status)
                                 .header("content-type", "application/json")
                                 .body(Full::new(Bytes::from(b))),
                             None => Response::builder()
@@ -127,6 +146,11 @@ impl MockApi {
             "parent_root":"{root}","state_root":"{root}","body_root":"{root}"}},
             "signature":"0x00"}}}}}}"#
         )
+    }
+
+    /// A `/eth/v1/beacon/blocks/{slot}/root` body.
+    pub fn block_root_json(root: Root) -> String {
+        format!(r#"{{"execution_optimistic":false,"finalized":true,"data":{{"root":"{root}"}}}}"#)
     }
 
     /// A `/eth/v1/beacon/states/head/finality_checkpoints` body.

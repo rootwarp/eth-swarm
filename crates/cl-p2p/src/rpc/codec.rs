@@ -29,6 +29,14 @@
 //! A chunk count above the request's (`count`, or 1) is an error, data after an error chunk is
 //! an error, and so is an empty response on a single-response protocol. A response holds at
 //! most [`MAX_RESPONSE_BYTES`] of wire bytes and estimated decoded size.
+//!
+//! # Context bytes
+//!
+//! [`RpcCodec`] returns each chunk as a [`ReceivedChunk`], with the fork digest its context
+//! bytes named. The [`ContextTable`] only picks the fork to decode with, and several digests
+//! name one fork (one per blob-parameter epoch), so whether the digest is the one of the
+//! block's own epoch is for the caller to check
+//! ([`blocks_by_range`](super::outbound::blocks_by_range)).
 
 use consensus_types::EthSpec;
 use consensus_types::{caps, forked};
@@ -36,7 +44,9 @@ use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::request_response;
 use p2p_wire::rpc::codec::{
     decode_response_chunk, encode_request, CodecError, ContextTable, ResponseChunkScanner, Scan,
+    CONTEXT_BYTES_LEN,
 };
+use p2p_wire::rpc::messages::ForkDigest;
 use p2p_wire::rpc::protocols::{Protocol, Request, Response, ResponseChunk};
 use std::future::Future;
 use std::io;
@@ -177,6 +187,16 @@ fn decoded_size<E: EthSpec>(chunk: &ResponseChunk<E>, ssz_len: usize) -> usize {
     held.saturating_add(size_of::<ResponseChunk<E>>())
 }
 
+/// One decoded response chunk and the context bytes it arrived with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReceivedChunk<E: EthSpec> {
+    /// The fork digest of a success chunk on a protocol with context bytes; `None` for an
+    /// error chunk or a protocol without them.
+    pub context: Option<ForkDigest>,
+    /// The chunk.
+    pub chunk: ResponseChunk<E>,
+}
+
 /// What a response may still hold.
 #[derive(Debug, Clone, Copy)]
 struct Budget {
@@ -215,7 +235,7 @@ async fn read_chunk<E: EthSpec, T: AsyncRead + Unpin>(
     protocol: Protocol,
     contexts: &ContextTable,
     budget: &mut Budget,
-) -> Result<Option<ResponseChunk<E>>, ReadError> {
+) -> Result<Option<ReceivedChunk<E>>, ReadError> {
     let mut scanner = ResponseChunkScanner::<E>::new(protocol, contexts);
     let mut buf = Vec::new();
     loop {
@@ -227,7 +247,13 @@ async fn read_chunk<E: EthSpec, T: AsyncRead + Unpin>(
                 budget.check(buf.len().saturating_add(ssz_len))?;
                 let chunk = decode_response_chunk(&buf, protocol, contexts)?;
                 budget.charge(buf.len().saturating_add(decoded_size(&chunk, ssz_len)))?;
-                return Ok(Some(chunk));
+                // The scanner names a fork only after reading a success chunk's context bytes,
+                // which follow the result byte.
+                let context = scanner.fork().and_then(|_| {
+                    buf.get(1..=CONTEXT_BYTES_LEN)
+                        .and_then(|raw| ForkDigest::try_from(raw).ok())
+                });
+                return Ok(Some(ReceivedChunk { context, chunk }));
             }
             Scan::Incomplete { need, max_len } => (need, max_len),
         };
@@ -274,7 +300,7 @@ async fn read_chunks<E: EthSpec, T: AsyncRead + Unpin>(
     contexts: &ContextTable,
     per_chunk: Option<Duration>,
     budget: usize,
-) -> Result<Vec<ResponseChunk<E>>, ReadError> {
+) -> Result<Vec<ReceivedChunk<E>>, ReadError> {
     let mut budget = Budget::new(budget);
     let mut chunks = Vec::new();
     loop {
@@ -292,7 +318,12 @@ async fn read_chunks<E: EthSpec, T: AsyncRead + Unpin>(
         );
         match chunk.await? {
             None => break,
-            Some(c @ ResponseChunk::Error { .. }) => {
+            Some(
+                c @ ReceivedChunk {
+                    chunk: ResponseChunk::Error { .. },
+                    ..
+                },
+            ) => {
                 // An error chunk ends the response: nothing may follow it.
                 if !at_end(io, per_chunk).await? {
                     return Err(ReadError::DataAfterError);
@@ -317,7 +348,8 @@ pub async fn read_response_chunks<E: EthSpec, T: AsyncRead + Unpin>(
     max_chunks: u64,
     contexts: &ContextTable,
 ) -> Result<Vec<ResponseChunk<E>>, ReadError> {
-    read_chunks(io, protocol, max_chunks, contexts, None, MAX_RESPONSE_BYTES).await
+    let chunks = read_chunks(io, protocol, max_chunks, contexts, None, MAX_RESPONSE_BYTES).await?;
+    Ok(chunks.into_iter().map(|c| c.chunk).collect())
 }
 
 /// [`read_response_chunks`] under `deadlines`.
@@ -328,7 +360,7 @@ async fn read_response_within<E: EthSpec, T: AsyncRead + Unpin>(
     contexts: &ContextTable,
     deadlines: Deadlines,
     budget: usize,
-) -> Result<Vec<ResponseChunk<E>>, ReadError> {
+) -> Result<Vec<ReceivedChunk<E>>, ReadError> {
     let exchange = async {
         let mut first = [0u8; 1];
         let n = within(Some(deadlines.ttfb), Deadline::Ttfb, async {
@@ -395,7 +427,7 @@ impl<E: EthSpec> RpcCodec<E> {
 impl<E: EthSpec> request_response::Codec for RpcCodec<E> {
     type Protocol = Protocol;
     type Request = Request;
-    type Response = Vec<ResponseChunk<E>>;
+    type Response = Vec<ReceivedChunk<E>>;
 
     async fn read_request<T>(&mut self, _: &Protocol, _: &mut T) -> io::Result<Request>
     where
@@ -613,19 +645,24 @@ mod tests {
 
     #[tokio::test]
     async fn blocks_up_to_count_are_read() {
-        let wire: Vec<u8> = [block_chunk(1), block_chunk(2)].concat();
+        let bpo = testkit::fulu_block::<E>(2).as_ssz_bytes();
+        let bpo = encode_success_chunk(Some(testkit::FULU_BPO_DIGEST), &bpo).unwrap();
+        let wire: Vec<u8> = [block_chunk(1), bpo].concat();
         let mut codec = codec_after(range(2)).await;
         let chunks = codec
             .read_response(&Protocol::BlocksByRangeV2, &mut Cursor::new(wire))
             .await
             .unwrap();
-        let want: Vec<ResponseChunk<E>> = [1, 2]
-            .map(|s| {
-                ResponseChunk::Success(Response::Block(Box::new(forked::SignedBeaconBlock::Fulu(
-                    testkit::fulu_block(s),
-                ))))
-            })
-            .into();
+        // Each block keeps the context bytes it arrived with.
+        let want: Vec<ReceivedChunk<E>> =
+            [(1, testkit::FULU_DIGEST), (2, testkit::FULU_BPO_DIGEST)]
+                .map(|(s, digest)| ReceivedChunk {
+                    context: Some(digest),
+                    chunk: ResponseChunk::Success(Response::Block(Box::new(
+                        forked::SignedBeaconBlock::Fulu(testkit::fulu_block(s)),
+                    ))),
+                })
+                .into();
         assert_eq!(chunks, want);
         // Fewer blocks than requested, or none, end the response cleanly.
         let one = read_response_chunks::<E, _>(
@@ -769,6 +806,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chunks_without_context_bytes_have_none() {
+        let mut codec = codec_after(Request::Ping(Ping(1))).await;
+        let got = codec
+            .read_response(&Protocol::PingV1, &mut Cursor::new(ping_chunk(5)))
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            vec![ReceivedChunk {
+                context: None,
+                chunk: ResponseChunk::Success(Response::Ping(Ping(5))),
+            }]
+        );
+        // An error chunk of a protocol with context bytes carries none.
+        let wire = [
+            block_chunk(1),
+            encode_error_chunk(ResultCode::ResourceUnavailable, b"pruned").unwrap(),
+        ]
+        .concat();
+        let mut codec = codec_after(range(4)).await;
+        let got = codec
+            .read_response(&Protocol::BlocksByRangeV2, &mut Cursor::new(wire))
+            .await
+            .unwrap();
+        let contexts: Vec<_> = got.iter().map(|c| c.context).collect();
+        assert_eq!(contexts, [Some(testkit::FULU_DIGEST), None]);
+    }
+
+    #[tokio::test]
     async fn read_response_without_a_request_fails() {
         let err = codec()
             .read_response(&Protocol::PingV1, &mut Cursor::new(ping_chunk(1)))
@@ -857,7 +923,11 @@ mod tests {
             .read_response(&Protocol::PingV1, &mut Script::new(steps, false))
             .await
             .unwrap();
-        assert_eq!(got, vec![ResponseChunk::Success(Response::Ping(Ping(2)))]);
+        let chunks: Vec<_> = got.into_iter().map(|c| c.chunk).collect();
+        assert_eq!(
+            chunks,
+            vec![ResponseChunk::Success(Response::Ping(Ping(2)))]
+        );
     }
 
     /// Always ready: `head` once, then `unit` repeated forever.

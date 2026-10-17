@@ -17,6 +17,9 @@
 //! digits (`Bitvector[64]`, 8 bytes) and `syncnets` `0x` + 2 hex digits (`Bitvector[4]`, 1
 //! byte, whose upper 4 padding bits must be zero), as SSZ lays the bits out: bit `i` is bit
 //! `i % 8` of byte `i / 8` (`altair/p2p-interface.md` L132–151).
+//!
+//! [`ReferenceApi::block_root`] reads `/eth/v1/beacon/blocks/{slot}/root`, where a 404 means
+//! the slot has no block (empty, or not on the node's chain).
 
 use bytes::Bytes;
 use cl_p2p::m2a_session::config::ReferenceApiUrl;
@@ -135,6 +138,12 @@ struct SignedHeader {
 struct HeaderMessage {
     #[serde(deserialize_with = "quoted_u64")]
     slot: Slot,
+}
+
+#[derive(Deserialize)]
+struct RootData {
+    #[serde(deserialize_with = "root")]
+    root: Root,
 }
 
 #[derive(Deserialize)]
@@ -407,6 +416,17 @@ impl ReferenceApi {
             });
         }
         Ok(header)
+    }
+
+    /// `GET /eth/v1/beacon/blocks/{slot}/root`: the root of the block at `slot`, or `None` for
+    /// a 404 (no block at the slot). Any other status but 200 is an error.
+    pub async fn block_root(&self, slot: Slot) -> Result<Option<Root>, ApiError> {
+        let path = format!("/eth/v1/beacon/blocks/{slot}/root");
+        match self.get_json::<Data<RootData>>(&path).await {
+            Ok(d) => Ok(Some(d.data.root)),
+            Err(ApiError::Status { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     async fn header_at(&self, path: String) -> Result<Header, ApiError> {
@@ -698,6 +718,35 @@ mod tests {
         assert!(matches!(err, ApiError::BadResponse { .. }), "{err}");
         let err = c.header(Root::repeat_byte(6)).await.unwrap_err();
         assert!(matches!(err, ApiError::Status { status: 404, .. }), "{err}");
+    }
+
+    #[tokio::test]
+    async fn block_root_by_slot() {
+        let r = Root::repeat_byte(7);
+        let api = MockApi::start(vec![
+            (
+                "/eth/v1/beacon/blocks/100/root",
+                Route::json(MockApi::block_root_json(r)),
+            ),
+            ("/eth/v1/beacon/blocks/102/root", Route::status(500)),
+            (
+                "/eth/v1/beacon/blocks/103/root",
+                Route::json(r#"{"data":{"root":"0x07"}}"#),
+            ),
+        ])
+        .await;
+        let c = client(&api);
+        assert_eq!(c.block_root(100).await.unwrap(), Some(r));
+        // 404: no block at the slot.
+        assert_eq!(c.block_root(101).await.unwrap(), None);
+        let err = c.block_root(102).await.unwrap_err();
+        assert!(matches!(err, ApiError::Status { status: 500, .. }), "{err}");
+        let err = c.block_root(103).await.unwrap_err();
+        assert!(matches!(err, ApiError::BadResponse { .. }), "{err}");
+        assert!(
+            err.to_string().contains("/eth/v1/beacon/blocks/103/root"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

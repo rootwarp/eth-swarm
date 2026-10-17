@@ -18,6 +18,9 @@ ethswarm-proto = { path = "../ethswarm-proto" }
 ipc = { path = "../ipc" }
 p2p-wire = { path = "../p2p-wire" }
 consensus-types = { path = "../consensus-types" }
+# `hash_tree_root` of the blocks the session fetches: consensus-types derives `TreeHash` but does
+# not re-export the trait. Already in the tree through consensus-types, at the pinned rev.
+tree_hash.workspace = true
 # compute_fork_digest and the pinned Sepolia config, for the Status the session sends.
 network-config = { path = "../network-config" }
 # secp256k1: Ethereum node keys are secp256k1 (the peer ID must map to a discv5 node ID).

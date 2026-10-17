@@ -17,13 +17,13 @@
 //! No Goodbye is sent; the session closes the connection.
 
 use crate::metadata::{self, metadata_json};
-use crate::probe::Verdict;
+use crate::probe::{verdicts_json, Verdict};
 use crate::reference_api::ReferenceApi;
 use cl_p2p::m2a_session::Session;
 use cl_p2p::rpc::outbound;
 use consensus_types::EthSpec;
 use p2p_wire::rpc::messages::MetaDataV3;
-use serde_json::{json, Value};
+use serde_json::json;
 
 /// Our MetaData `seq_number`: the session advertises no subnets and answers no MetaData
 /// requests, so its MetaData never changes from the initial 0.
@@ -72,16 +72,7 @@ impl PingReport {
     /// The step's log line: one JSON object, no newline inside. The `seq_number`s are decimal
     /// strings, as the beacon API encodes a `uint64`.
     pub fn json_line(&self) -> String {
-        let verdicts: serde_json::Map<String, Value> = self
-            .verdicts
-            .iter()
-            .map(|(name, v)| {
-                (
-                    (*name).to_owned(),
-                    json!({"pass": v.pass, "detail": v.detail}),
-                )
-            })
-            .collect();
+        let verdicts = verdicts_json(&self.verdicts);
         let refetched = (self.refetches > 0).then(|| {
             json!({
                 "peer": self.refetched.as_ref().map(metadata_json),
@@ -156,7 +147,11 @@ async fn steps<E: EthSpec>(
         .await
         .map_err(|e| format!("metadata re-fetch: {e}"))?;
     report.refetched = Some(refetched.clone());
-    let identity = metadata::sample(api).await?;
+    let identity = api
+        .node_identity()
+        .await
+        .map(|id| id.metadata)
+        .map_err(|e| format!("identity re-sample: {e}"))?;
     report.refetched_api = Some(identity.clone());
     report.verdict(
         "seq_number",

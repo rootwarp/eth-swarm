@@ -21,8 +21,8 @@
 //! - **Req/resp**: one outbound-only [`request_response`] behaviour per protocol
 //!   ([`crate::rpc`]). Status goes out through [`crate::rpc::outbound::status`], MetaData
 //!   through [`Session::request_metadata`], which keeps the peer's MetaData (its `seq_number`
-//!   for Ping), and Ping through [`crate::rpc::outbound::ping`]; later work sends
-//!   BlocksByRange.
+//!   for Ping), Ping through [`crate::rpc::outbound::ping`] and one BlocksByRange through
+//!   [`crate::rpc::outbound::blocks_by_range`].
 
 pub mod config;
 
@@ -336,6 +336,21 @@ impl<E: EthSpec> crate::rpc::outbound::PingRpc<E> for SessionBehaviour<E> {
     }
 }
 
+impl<E: EthSpec> crate::rpc::outbound::BlocksByRangeRpc<E> for SessionBehaviour<E> {
+    fn blocks_by_range_rpc(&mut self) -> &mut request_response::Behaviour<RpcCodec<E>> {
+        &mut self.blocks_by_range
+    }
+
+    fn blocks_by_range_event(
+        event: SessionBehaviourEvent<E>,
+    ) -> Option<crate::rpc::outbound::RpcEvent<E>> {
+        match event {
+            SessionBehaviourEvent::BlocksByRange(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 /// The transport a session runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
@@ -399,6 +414,7 @@ fn build_swarm<E: EthSpec>(
     key: NodeKey,
     behaviour: SessionBehaviour<E>,
     transport: Transport,
+    idle_timeout: Duration,
 ) -> Result<Swarm<SessionBehaviour<E>>, SessionError> {
     let build = |e: &dyn fmt::Display| SessionError::Build(e.to_string());
     let upgraded: fn(&Keypair) -> TransportResult = match transport {
@@ -412,7 +428,7 @@ fn build_swarm<E: EthSpec>(
         .map_err(|e| build(&e))?
         .with_behaviour(|_| behaviour)
         .map_err(|e| build(&e))?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT))
+        .with_swarm_config(|c| c.with_idle_connection_timeout(idle_timeout))
         .build())
 }
 
@@ -461,7 +477,8 @@ pub struct Session<E: EthSpec> {
 }
 
 impl<E: EthSpec> Session<E> {
-    /// Builds the swarm and starts the one dial, to `pinned` at its address.
+    /// Builds the swarm and starts the one dial, to `pinned` at its address. An idle
+    /// connection closes after [`IDLE_CONNECTION_TIMEOUT`].
     pub fn start(
         key: NodeKey,
         pinned: PinnedPeer,
@@ -469,10 +486,30 @@ impl<E: EthSpec> Session<E> {
         deadlines: Deadlines,
         transport: Transport,
     ) -> Result<Self, SessionError> {
+        Self::start_with_idle_timeout(
+            key,
+            pinned,
+            contexts,
+            deadlines,
+            transport,
+            IDLE_CONNECTION_TIMEOUT,
+        )
+    }
+
+    /// [`Session::start`], with a connection closing once no stream was open for
+    /// `idle_timeout`.
+    pub fn start_with_idle_timeout(
+        key: NodeKey,
+        pinned: PinnedPeer,
+        contexts: Arc<ContextTable>,
+        deadlines: Deadlines,
+        transport: Transport,
+        idle_timeout: Duration,
+    ) -> Result<Self, SessionError> {
         let local = key.peer_id();
         tracing::info!(%local, pinned = %pinned.peer_id, addr = %pinned.addr, ?key, "m2a-session starting");
         let behaviour = SessionBehaviour::new(pinned.peer_id, contexts, deadlines);
-        let mut swarm = build_swarm(key, behaviour, transport)?;
+        let mut swarm = build_swarm(key, behaviour, transport, idle_timeout)?;
         let dial = DialOpts::peer_id(pinned.peer_id)
             .addresses(vec![pinned.addr.clone()])
             .build();
@@ -890,5 +927,51 @@ mod tests {
         assert_eq!(session.request_metadata().await.unwrap(), canned);
         assert_eq!(session.peer_metadata(), Some(&canned));
         assert_eq!(session.peer_metadata().map(|m| m.seq_number), Some(7));
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_is_the_sessions() {
+        use crate::testkit::StatusPeer;
+        let peer = StatusPeer::echoing(p2p_wire::testkit::status()).await;
+        let start = |idle| {
+            Session::<E>::start_with_idle_timeout(
+                NodeKey::ephemeral(),
+                peer.pinned(),
+                Arc::new(ContextTable::new()),
+                Deadlines::default(),
+                Transport::Tcp,
+                idle,
+            )
+            .unwrap()
+        };
+        // With no stream open, our side closes the connection once the idle timeout passed.
+        let mut short = start(Duration::from_millis(200));
+        short.connect().await.unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let SwarmEvent::ConnectionClosed { .. } = short.swarm().select_next_some().await
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "closed after 200 ms idle");
+        // The default keeps it.
+        let mut default = Session::<E>::start(
+            NodeKey::ephemeral(),
+            peer.pinned(),
+            Arc::new(ContextTable::new()),
+            Deadlines::default(),
+            Transport::Tcp,
+        )
+        .unwrap();
+        default.connect().await.unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(400),
+            default.swarm().select_next_some(),
+        )
+        .await;
+        assert!(default.swarm().is_connected(&peer.id));
     }
 }
