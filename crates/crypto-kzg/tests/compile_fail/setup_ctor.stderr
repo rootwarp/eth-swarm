@@ -1,0 +1,48 @@
+error: cannot construct `TrustedSetup` with struct literal syntax due to private fields
+ --> tests/compile_fail/setup_ctor.rs:5:13
+  |
+5 |     let _ = TrustedSetup {};
+  |             ^^^^^^^^^^^^
+
+error[E0599]: no associated function or constant named `new` found for struct `TrustedSetup` in the current scope
+ --> tests/compile_fail/setup_ctor.rs:6:27
+  |
+6 |     let _ = TrustedSetup::new();
+  |                           ^^^ associated function or constant not found in `TrustedSetup`
+  |
+note: if you're trying to build a new `TrustedSetup`, consider using `TrustedSetup::load_pinned` which returns `Result<TrustedSetup, SetupError>`
+ --> src/setup.rs
+  |
+  | /     pub fn load_pinned(
+  | |         path: impl AsRef<Path>,
+  | |         expected_sha256: [u8; 32],
+  | |     ) -> Result<Self, SetupError> {
+  | |_________________________________^
+
+error[E0277]: the trait bound `TrustedSetup: Default` is not satisfied
+ --> tests/compile_fail/setup_ctor.rs:7:27
+  |
+7 |     let _: TrustedSetup = Default::default();
+  |                           ^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `TrustedSetup`
+
+error[E0308]: mismatched types
+ --> tests/compile_fail/setup_ctor.rs:8:32
+  |
+8 |     let _ = TrustedSetup::from(std::path::PathBuf::new());
+  |             ------------------ ^^^^^^^^^^^^^^^^^^^^^^^^^ expected `TrustedSetup`, found `PathBuf`
+  |             |
+  |             arguments to this function are incorrect
+  |
+note: associated function defined here
+ --> $RUST/core/src/convert/mod.rs
+
+error[E0308]: mismatched types
+ --> tests/compile_fail/setup_ctor.rs:9:32
+  |
+9 |     let _ = TrustedSetup::from([0u8; 32]);
+  |             ------------------ ^^^^^^^^^ expected `TrustedSetup`, found `[u8; 32]`
+  |             |
+  |             arguments to this function are incorrect
+  |
+note: associated function defined here
+ --> $RUST/core/src/convert/mod.rs

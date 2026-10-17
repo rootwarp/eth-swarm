@@ -81,6 +81,8 @@ jobs:
         run: rustup toolchain install && rustc --version
       - run: cargo fmt --all -- --check
       - run: cargo build --workspace --locked
+      - name: crypto-kzg uses only its pinned setup loader; blst is not portable
+        run: bash scripts/tests/check-kzg-loaders.test.sh && bash scripts/check-kzg-loaders.sh
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Fetch and verify spec vectors (uncached)
         run: PRESETS="general minimal" bash testing/fetch-vectors.sh
