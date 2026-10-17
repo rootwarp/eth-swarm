@@ -1,0 +1,466 @@
+//! Process startup, in this order: load the KZG trusted setup and check its sha256 against
+//! [`crypto_kzg::BETA4_MAINNET_SHA256`], bind the Unix socket, start serving, then report READY to
+//! the service manager.
+//!
+//! A refused setup ends startup before anything else happens: no socket is bound, c-kzg is never
+//! called (the digest is checked before the file is parsed) and READY is never sent. The error
+//! names the expected and actual digests.
+//!
+//! Shutdown (SIGTERM or SIGINT, see [`termination`]) is graceful and bounded: open connections get
+//! [`StartupConfig::drain_timeout`] to finish, a dirty pubkey snapshot is flushed once, and the
+//! socket file this process bound is removed.
+
+use std::ffi::OsString;
+use std::future::Future;
+use std::io;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crypto_kzg::SetupError;
+use tokio::net::UnixListener;
+use tokio::signal::unix::{signal, SignalKind};
+
+use crate::feed::SharedCache;
+use crate::handshake::Handshake;
+use crate::kzg::TrustedSetupConfig;
+use crate::notify;
+use crate::proto::common::{Hello, SpecPin};
+use crate::server::{
+    serve_uds_draining, Limits, ServerConfig, VerifyServer, DEFAULT_SNAPSHOT_INTERVAL,
+};
+
+/// The `api_version` this build speaks, and the lowest one it accepts.
+pub const API_VERSION: u32 = 1;
+
+/// Command-line usage.
+pub const USAGE: &str = "\
+usage: cl-verify --trusted-setup <PATH> --socket <PATH> --peer-uid <UID> --pubkey-snapshot <PATH>
+
+  --trusted-setup    consensus-specs v1.7.0-beta.4
+                     presets/mainnet/trusted_setups/trusted_setup_4096.json
+  --socket           Unix socket to serve ethswarm.verify.v1 on
+  --peer-uid         the only peer UID served (cl-chain's)
+  --pubkey-snapshot  pubkey cache snapshot file (pubkeys.bin); its directory must be writable
+                     only by the cl-verify user (e.g. the service's state directory)";
+
+/// How long open connections get to finish once shutdown begins.
+pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Everything [`run`] needs.
+#[derive(Clone, Debug)]
+pub struct StartupConfig {
+    pub server: ServerConfig,
+    pub socket_path: PathBuf,
+    /// Once shutdown begins, the longest wait for open connections (cl-chain keeps its streams
+    /// open) before they are dropped; the snapshot flush follows either way.
+    pub drain_timeout: Duration,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StartupError {
+    /// The trusted setup is missing, unreadable, or not the pinned file.
+    #[error("trusted setup refused: {0}")]
+    Setup(#[from] SetupError),
+    #[error("cannot bind {}: {source}", path.display())]
+    Bind {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("cannot notify the service manager: {0}")]
+    Notify(#[source] io::Error),
+    #[error("serving failed: {0}")]
+    Serve(#[from] tonic::transport::Error),
+    #[error("server task failed: {0}")]
+    Join(#[from] tokio::task::JoinError),
+}
+
+/// How startup reports that it is serving (the READY seam).
+pub trait Readiness: Send + Sync {
+    fn ready(&self) -> io::Result<()>;
+}
+
+/// `READY=1` to `$NOTIFY_SOCKET`; nothing when it is unset.
+pub struct SystemdReadiness;
+
+impl Readiness for SystemdReadiness {
+    fn ready(&self) -> io::Result<()> {
+        notify::notify_ready().map(drop)
+    }
+}
+
+/// Resolves on the first SIGTERM or SIGINT. The handlers are installed when this is called (inside
+/// a runtime), so a signal that arrives before the future is polled is not lost.
+pub fn termination() -> io::Result<impl Future<Output = ()> + Send + 'static> {
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        let name = tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            _ = int.recv() => "SIGINT",
+        };
+        tracing::info!(signal = name, "shutting down");
+    })
+}
+
+/// [`run_with`] reporting readiness to systemd.
+pub async fn run(
+    config: StartupConfig,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), StartupError> {
+    run_with(config, &SystemdReadiness, shutdown).await
+}
+
+/// Loads the pinned setup, binds `config.socket_path`, serves until `shutdown` resolves, and calls
+/// `readiness` once the server is running. After `shutdown`, connections get
+/// `config.drain_timeout`, the pubkey snapshot is flushed once if dirty (a failure is logged, not
+/// returned), and the socket file is removed.
+pub async fn run_with(
+    config: StartupConfig,
+    readiness: &dyn Readiness,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), StartupError> {
+    if let Some(warning) = unwired_network_warning(&config.server) {
+        tracing::warn!("{warning}");
+    }
+    let server = VerifyServer::new(config.server, SharedCache::default()).map_err(setup_refused)?;
+    let (listener, _socket_file) = bind(&config.socket_path)?;
+    let serving = tokio::spawn(serve_uds_draining(
+        listener,
+        server,
+        shutdown,
+        config.drain_timeout,
+    ));
+    if let Err(e) = readiness.ready() {
+        serving.abort();
+        tracing::error!(error = %e, "cannot notify the service manager");
+        return Err(StartupError::Notify(e));
+    }
+    tracing::info!(socket = %config.socket_path.display(), "cl-verify ready");
+    serving.await??;
+    Ok(())
+}
+
+fn setup_refused(err: SetupError) -> StartupError {
+    match &err {
+        SetupError::DigestMismatch { expected, actual } => tracing::error!(
+            expected = %hex::encode(expected),
+            actual = %hex::encode(actual),
+            "trusted setup sha256 mismatch; refusing to start"
+        ),
+        other => tracing::error!(error = %other, "trusted setup refused; refusing to start"),
+    }
+    StartupError::Setup(err)
+}
+
+/// Binds `path`, first removing a socket file left by a previous run. Anything else at `path` is
+/// left alone and fails the bind. The returned guard removes the socket file again on every exit
+/// path after the bind.
+fn bind(path: &Path) -> Result<(UnixListener, BoundSocket), StartupError> {
+    let bind_err = |source| StartupError::Bind {
+        path: path.to_owned(),
+        source,
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path).map_err(bind_err)?,
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(bind_err(e)),
+    }
+    let listener = UnixListener::bind(path).map_err(bind_err)?;
+    let meta = std::fs::symlink_metadata(path).map_err(bind_err)?;
+    Ok((
+        listener,
+        BoundSocket {
+            path: path.to_owned(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+        },
+    ))
+}
+
+/// The socket file this process created. Dropping it unlinks the path only while it is still that
+/// file (same device and inode); a socket someone else has since put there is left alone.
+struct BoundSocket {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl Drop for BoundSocket {
+    fn drop(&mut self) {
+        let ours = std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|m| m.file_type().is_socket() && m.dev() == self.dev && m.ino() == self.ino);
+        if !ours {
+            return;
+        }
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            tracing::warn!(socket = %self.path.display(), error = %e, "cannot remove our socket");
+        }
+    }
+}
+
+/// The startup warning for a hello without network configuration (see [`local_hello`]), or `None`
+/// once the genesis root and fork schedule are set.
+#[must_use]
+pub fn unwired_network_warning(config: &ServerConfig) -> Option<&'static str> {
+    let ours = config.handshake.ours();
+    (ours.genesis_validators_root.is_empty() || ours.fork_schedule.is_empty()).then_some(
+        "network config is not wired into cl-verify: every cl-chain hello will fail with \
+         VERSION_MISMATCH and the KZG cell cap is 0, so all KZG batches are refused",
+    )
+}
+
+/// Parsed command line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Args {
+    pub trusted_setup: PathBuf,
+    pub socket: PathBuf,
+    pub peer_uid: u32,
+    pub pubkey_snapshot: PathBuf,
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum UsageError {
+    #[error("help requested")]
+    Help,
+    #[error("unknown argument {0:?}")]
+    Unknown(OsString),
+    #[error("{0} needs a value")]
+    MissingValue(&'static str),
+    #[error("{0} given twice")]
+    Duplicate(&'static str),
+    #[error("{0} is required")]
+    Required(&'static str),
+    #[error("--peer-uid: not a UID: {0:?}")]
+    BadUid(OsString),
+}
+
+impl Args {
+    /// Parses `--trusted-setup <PATH> --socket <PATH> --peer-uid <UID> --pubkey-snapshot <PATH>`
+    /// (any order, all required), or `--help`.
+    pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, UsageError> {
+        let mut setup = None;
+        let mut socket = None;
+        let mut uid = None;
+        let mut snapshot = None;
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            let (name, slot) = match arg.to_str() {
+                Some("--help" | "-h") => return Err(UsageError::Help),
+                Some("--trusted-setup") => ("--trusted-setup", &mut setup),
+                Some("--socket") => ("--socket", &mut socket),
+                Some("--peer-uid") => ("--peer-uid", &mut uid),
+                Some("--pubkey-snapshot") => ("--pubkey-snapshot", &mut snapshot),
+                _ => return Err(UsageError::Unknown(arg)),
+            };
+            let value = args.next().ok_or(UsageError::MissingValue(name))?;
+            if slot.replace(value).is_some() {
+                return Err(UsageError::Duplicate(name));
+            }
+        }
+        let uid = uid.ok_or(UsageError::Required("--peer-uid"))?;
+        Ok(Self {
+            trusted_setup: setup.ok_or(UsageError::Required("--trusted-setup"))?.into(),
+            socket: socket.ok_or(UsageError::Required("--socket"))?.into(),
+            pubkey_snapshot: snapshot
+                .ok_or(UsageError::Required("--pubkey-snapshot"))?
+                .into(),
+            peer_uid: uid
+                .to_str()
+                .and_then(|s| s.parse().ok())
+                .ok_or(UsageError::BadUid(uid))?,
+        })
+    }
+
+    /// The startup configuration, with default limits, the default snapshot interval and
+    /// [`local_hello`]. This is the one place a production [`ServerConfig`] is built.
+    #[must_use]
+    pub fn into_config(self) -> StartupConfig {
+        StartupConfig {
+            server: ServerConfig {
+                handshake: Handshake::new(local_hello(), API_VERSION),
+                peer_uid: self.peer_uid,
+                trusted_setup: TrustedSetupConfig {
+                    path: self.trusted_setup,
+                },
+                limits: Limits::default(),
+                pubkey_snapshot: self.pubkey_snapshot,
+                snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
+            },
+            socket_path: self.socket,
+            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+        }
+    }
+}
+
+/// The hello this build sends: API version, build and spec pin only.
+///
+/// No network configuration reaches cl-verify yet (that needs fork-digest computation), so the
+/// genesis root, fork digest and schedules are empty, and this fails closed: the hello of a real
+/// cl-chain, which carries them, is refused with `VERSION_MISMATCH`, and with no blob schedule the
+/// KZG cell cap ([`crate::caps::max_kzg_cells`]) is 0, so every KZG batch is refused before it is
+/// verified. Startup warns about it ([`unwired_network_warning`]).
+#[must_use]
+pub fn local_hello() -> Hello {
+    Hello {
+        api_version: API_VERSION,
+        build: concat!("cl-verify/", env!("CARGO_PKG_VERSION")).into(),
+        spec_pin: Some(SpecPin {
+            consensus_specs_tag: network_config::SPEC_PIN.consensus_specs.into(),
+            ssz_specs_tag: network_config::SPEC_PIN.ssz_specs.into(),
+        }),
+        min_api_version: API_VERSION,
+        max_api_version: API_VERSION,
+        ..Hello::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A complete command line.
+    const OK: [&str; 8] = [
+        "--trusted-setup",
+        "s",
+        "--socket",
+        "k",
+        "--peer-uid",
+        "1",
+        "--pubkey-snapshot",
+        "p",
+    ];
+
+    fn parse(args: &[&str]) -> Result<Args, UsageError> {
+        Args::parse(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn parses_the_four_flags_in_any_order() {
+        let want = Args {
+            trusted_setup: "/etc/setup.json".into(),
+            socket: "/run/verify.sock".into(),
+            peer_uid: 990,
+            pubkey_snapshot: "/var/lib/cl-verify/pubkeys.bin".into(),
+        };
+        let a = [
+            "--trusted-setup",
+            "/etc/setup.json",
+            "--socket",
+            "/run/verify.sock",
+            "--peer-uid",
+            "990",
+            "--pubkey-snapshot",
+            "/var/lib/cl-verify/pubkeys.bin",
+        ];
+        assert_eq!(parse(&a), Ok(want.clone()));
+        let b = [a[6], a[7], a[4], a[5], a[2], a[3], a[0], a[1]];
+        assert_eq!(parse(&b), Ok(want));
+    }
+
+    #[test]
+    fn refuses_bad_command_lines() {
+        let ok = OK;
+        assert_eq!(parse(&["--help"]), Err(UsageError::Help));
+        assert_eq!(parse(&["-h"]), Err(UsageError::Help));
+        assert_eq!(
+            parse(&["--bogus"]),
+            Err(UsageError::Unknown("--bogus".into()))
+        );
+        assert_eq!(
+            parse(&["--socket"]),
+            Err(UsageError::MissingValue("--socket"))
+        );
+        assert_eq!(
+            parse(&[&ok[..], &["--socket", "x"]].concat()),
+            Err(UsageError::Duplicate("--socket"))
+        );
+        assert_eq!(
+            parse(&ok[2..]),
+            Err(UsageError::Required("--trusted-setup"))
+        );
+        assert_eq!(
+            parse(&[&ok[..2], &ok[4..]].concat()),
+            Err(UsageError::Required("--socket"))
+        );
+        assert_eq!(
+            parse(&[&ok[..4], &ok[6..]].concat()),
+            Err(UsageError::Required("--peer-uid"))
+        );
+        assert_eq!(
+            parse(&ok[..6]),
+            Err(UsageError::Required("--pubkey-snapshot"))
+        );
+        assert_eq!(
+            parse(&[&ok[..4], &["--peer-uid", "-1"], &ok[6..]].concat()),
+            Err(UsageError::BadUid("-1".into()))
+        );
+    }
+
+    #[test]
+    fn config_uses_the_given_paths_and_uid() {
+        let cfg = parse(&OK).unwrap().into_config();
+        assert_eq!(cfg.socket_path, PathBuf::from("k"));
+        assert_eq!(cfg.server.peer_uid, 1);
+        assert_eq!(cfg.server.pubkey_snapshot, PathBuf::from("p"));
+        assert_eq!(cfg.server.snapshot_interval, DEFAULT_SNAPSHOT_INTERVAL);
+        assert_eq!(cfg.server.trusted_setup.path, PathBuf::from("s"));
+        assert_eq!(cfg.server.handshake.ours(), &local_hello());
+    }
+
+    /// Until network config reaches cl-verify, the unwired hello fails closed: a real cl-chain
+    /// hello is a VERSION_MISMATCH and the KZG cell cap is 0, so every KZG batch is refused.
+    #[test]
+    fn unwired_hello_fails_closed() {
+        let ours = local_hello();
+        assert_eq!(crate::caps::max_kzg_cells(&ours), 0);
+        let one_cell = crate::proto::verify::VerifyKzgRequestBody {
+            cells: vec![crate::proto::verify::KzgCellProof::default()],
+            ..Default::default()
+        };
+        assert!(crate::caps::check_kzg(&one_cell, 0).is_err());
+
+        let chain = Hello {
+            genesis_validators_root: vec![0x4b; 32],
+            current_fork_digest: vec![0xaa, 0xbb, 0xcc, 0xdd],
+            fork_schedule: vec![crate::proto::common::ForkScheduleEntry {
+                epoch: 0,
+                fork_digest: vec![0xaa, 0xbb, 0xcc, 0xdd],
+                fork: crate::proto::common::ForkName::Fulu as i32,
+                fork_version: vec![0x06, 0, 0, 0],
+                max_blobs_per_block: 9,
+            }],
+            ..ours.clone()
+        };
+        let err = Handshake::new(ours, API_VERSION)
+            .accept(&chain)
+            .unwrap_err();
+        assert_eq!(err.code(), crate::proto::common::ErrorCode::VersionMismatch);
+    }
+
+    #[test]
+    fn unwired_network_config_is_warned_about() {
+        let unwired = parse(&OK).unwrap().into_config();
+        let warning = unwired_network_warning(&unwired.server).expect("a warning");
+        assert!(warning.contains("not wired"), "{warning}");
+
+        let mut wired = unwired.server;
+        let mut hello = local_hello();
+        hello.genesis_validators_root = vec![1; 32];
+        hello.fork_schedule = vec![crate::proto::common::ForkScheduleEntry {
+            max_blobs_per_block: 9,
+            ..Default::default()
+        }];
+        wired.handshake = Handshake::new(hello, API_VERSION);
+        assert_eq!(unwired_network_warning(&wired), None);
+    }
+
+    #[test]
+    fn local_hello_carries_the_spec_pin() {
+        let pin = local_hello().spec_pin.unwrap();
+        assert_eq!(pin.consensus_specs_tag, "v1.7.0-beta.4");
+        assert_eq!(pin.ssz_specs_tag, "v0.1.0");
+    }
+}

@@ -15,8 +15,9 @@ use common::*;
 fn production_server_loads_only_the_pinned_setup() {
     let good = config(my_uid(), Limits::default());
     assert!(VerifyServer::new(good, SharedCache::default()).is_ok());
+    let dir = tempfile::tempdir().unwrap();
     let mut swapped = config(my_uid(), Limits::default());
-    swapped.trusted_setup.sha256[31] ^= 1;
+    swapped.trusted_setup = tampered_setup(dir.path());
     assert!(matches!(
         VerifyServer::new(swapped, SharedCache::default()),
         Err(crypto_kzg::SetupError::DigestMismatch { .. })

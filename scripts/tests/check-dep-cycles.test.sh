@@ -18,6 +18,11 @@ crate "$ws" d
 check pass "acyclic workspace (diamond plus a dev edge)" "$script" "$(workspace dag a b c d)" \
   "no dependency cycles among 4 workspace crates"
 
+ws="$tmp/self-dev"
+crate "$ws" a '[features]' 't = []' '[dev-dependencies]' 'a = { path = ".", features = ["t"] }'
+check pass "a dev-dependency on itself is not a cycle" "$script" "$(workspace self-dev a)" \
+  "no dependency cycles among 1 workspace crates"
+
 ws="$tmp/dev-cycle"
 crate "$ws" a '[dev-dependencies]' 'b = { path = "../b" }'
 crate "$ws" b '[dependencies]' 'a = { path = "../a" }'

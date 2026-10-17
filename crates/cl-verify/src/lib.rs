@@ -12,7 +12,9 @@ pub mod feed;
 pub mod frame;
 pub mod handshake;
 pub mod kzg;
+pub mod notify;
 pub mod server;
+pub mod startup;
 pub mod wire;
 
 /// Generated `ethswarm.*.v1` bindings.

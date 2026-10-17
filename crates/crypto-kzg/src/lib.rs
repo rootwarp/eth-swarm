@@ -17,5 +17,6 @@ pub use c_kzg::{
 };
 pub use cells::KzgError;
 pub use setup::{
-    SetupError, TrustedSetup, MAX_SETUP_BYTES, NUM_G1_POINTS, NUM_G2_POINTS, PRECOMPUTE,
+    SetupError, TrustedSetup, BETA4_MAINNET_SHA256, MAX_SETUP_BYTES, NUM_G1_POINTS, NUM_G2_POINTS,
+    PRECOMPUTE,
 };

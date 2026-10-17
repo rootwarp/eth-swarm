@@ -1,14 +1,15 @@
 //! KZG cell-proof batch verification through `crypto-kzg`.
 //!
 //! The only setup this crate can use is a [`crypto_kzg::TrustedSetup`] from
-//! [`TrustedSetup::load_pinned`], which refuses any file whose sha256 is not the configured one.
-//! cl-verify has no c-kzg dependency and no loader of its own.
+//! [`TrustedSetup::load_pinned`] under [`BETA4_MAINNET_SHA256`], the consensus-specs
+//! `v1.7.0-beta.4` mainnet setup; any other file is refused before it is parsed. The digest is
+//! fixed here, not configurable. cl-verify has no c-kzg dependency and no loader of its own.
 
 use std::path::PathBuf;
 
 use crypto_kzg::{
-    BackendError, Bytes48, Cell, KzgError, SetupError, TrustedSetup, BYTES_PER_CELL,
-    BYTES_PER_COMMITMENT, BYTES_PER_PROOF,
+    BackendError, Bytes48, Cell, KzgError, SetupError, TrustedSetup, BETA4_MAINNET_SHA256,
+    BYTES_PER_CELL, BYTES_PER_COMMITMENT, BYTES_PER_PROOF,
 };
 
 use crate::proto::common::{Error, ErrorCode};
@@ -18,11 +19,10 @@ use crate::wire::wire_error;
 /// `NUMBER_OF_COLUMNS` (fulu/das-core.md); a `cell_index` must be below it.
 pub const NUMBER_OF_COLUMNS: u64 = 128;
 
-/// Where the trusted setup lives and the sha256 it must have.
+/// Where the trusted setup lives. Its sha256 must be [`BETA4_MAINNET_SHA256`].
 #[derive(Clone, Debug)]
 pub struct TrustedSetupConfig {
     pub path: PathBuf,
-    pub sha256: [u8; 32],
 }
 
 /// Why the backend gave no verdict.
@@ -62,10 +62,22 @@ impl PreparedCells {
     }
 }
 
-/// The batch check behind [`verify_cells`]; injected so tests can stand in a failing verifier.
-pub trait KzgBackend: Send + Sync + 'static {
-    fn verify(&self, cells: &PreparedCells) -> Result<bool, KzgFailure>;
+mod backend {
+    use super::{KzgFailure, PreparedCells};
+
+    /// The batch check behind [`super::verify_cells`]; injected so tests can stand in a failing
+    /// verifier.
+    pub trait KzgBackend: Send + Sync + 'static {
+        fn verify(&self, cells: &PreparedCells) -> Result<bool, KzgFailure>;
+    }
 }
+
+/// Nameable (so implementable) outside this crate only with the `test-backends` feature; without
+/// it the only implementation is [`PinnedKzgBackend`].
+#[cfg(any(test, feature = "test-backends"))]
+pub use backend::KzgBackend;
+#[cfg(not(any(test, feature = "test-backends")))]
+pub(crate) use backend::KzgBackend;
 
 /// `verify_cell_kzg_proof_batch` over the digest-pinned trusted setup.
 pub struct PinnedKzgBackend {
@@ -73,10 +85,11 @@ pub struct PinnedKzgBackend {
 }
 
 impl PinnedKzgBackend {
-    /// Loads the setup at `config.path`, refusing it unless its sha256 is `config.sha256`.
+    /// Loads the setup at `config.path`, refusing it unless its sha256 is
+    /// [`BETA4_MAINNET_SHA256`]. On a mismatch nothing is parsed and c-kzg is not called.
     pub fn load(config: &TrustedSetupConfig) -> Result<Self, SetupError> {
         Ok(Self {
-            setup: TrustedSetup::load_pinned(&config.path, config.sha256)?,
+            setup: TrustedSetup::load_pinned(&config.path, BETA4_MAINNET_SHA256)?,
         })
     }
 }
@@ -174,17 +187,12 @@ pub(crate) mod tests {
     use super::*;
     use std::sync::OnceLock;
 
-    /// crypto-kzg's vendored consensus-specs v1.7.0-beta.4 mainnet setup and its sha256.
+    /// crypto-kzg's vendored consensus-specs v1.7.0-beta.4 mainnet setup.
     pub(crate) fn setup_config() -> TrustedSetupConfig {
         TrustedSetupConfig {
             path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../crypto-kzg/data/trusted_setup_4096.json"),
-            sha256: hex_digest("f8e44a31ebf0a6d0734dcb301b0716e2c77f3ae18ed0cab0870fbcc2ca55616f"),
         }
-    }
-
-    fn hex_digest(s: &str) -> [u8; 32] {
-        hex::decode(s).unwrap().try_into().unwrap()
     }
 
     fn backend() -> &'static PinnedKzgBackend {
@@ -202,12 +210,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn setup_with_another_digest_is_refused() {
-        let mut cfg = setup_config();
-        cfg.sha256[0] ^= 1;
+    fn only_the_beta4_mainnet_setup_loads() {
+        assert!(PinnedKzgBackend::load(&setup_config()).is_ok());
+
+        let mut bytes = std::fs::read(setup_config().path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x20;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trusted_setup_4096.json");
+        std::fs::write(&path, &bytes).unwrap();
         assert!(matches!(
-            PinnedKzgBackend::load(&cfg),
-            Err(SetupError::DigestMismatch { .. })
+            PinnedKzgBackend::load(&TrustedSetupConfig { path }),
+            Err(SetupError::DigestMismatch { expected, .. }) if expected == BETA4_MAINNET_SHA256
         ));
     }
 

@@ -1,0 +1,16 @@
+# Negative fixture for scripts/check-locked.sh: `cargo test` below has no --locked, so the check
+# must exit 1 on this file. Not a live workflow (it lives outside .github/workflows).
+name: unlocked
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace

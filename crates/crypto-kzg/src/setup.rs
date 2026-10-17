@@ -20,6 +20,14 @@ pub const NUM_G2_POINTS: usize = 65;
 /// refused before it is read in full.
 pub const MAX_SETUP_BYTES: u64 = 4 << 20;
 
+/// sha256 of consensus-specs `v1.7.0-beta.4` `presets/mainnet/trusted_setups/trusted_setup_4096.json`
+/// (`f8e44a31ebf0a6d0734dcb301b0716e2c77f3ae18ed0cab0870fbcc2ca55616f`), taken over the raw file
+/// bytes. The only digest cl-verify starts with.
+pub const BETA4_MAINNET_SHA256: [u8; 32] = [
+    0xf8, 0xe4, 0x4a, 0x31, 0xeb, 0xf0, 0xa6, 0xd0, 0x73, 0x4d, 0xcb, 0x30, 0x1b, 0x07, 0x16, 0xe2,
+    0xc7, 0x7f, 0x3a, 0xe1, 0x8e, 0xd0, 0xca, 0xb0, 0x87, 0x0f, 0xbc, 0xc2, 0xca, 0x55, 0x61, 0x6f,
+];
+
 const G1_BYTES: usize = 48;
 const G2_BYTES: usize = 96;
 
@@ -243,6 +251,57 @@ mod tests {
         let (result, calls) = load_counting(pinned());
         assert!(result.is_ok());
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn beta4_mainnet_pin_is_the_vendored_file() {
+        assert_eq!(
+            hex::encode(BETA4_MAINNET_SHA256),
+            "f8e44a31ebf0a6d0734dcb301b0716e2c77f3ae18ed0cab0870fbcc2ca55616f"
+        );
+        assert_eq!(pinned(), BETA4_MAINNET_SHA256);
+    }
+
+    /// Loads `bytes` from a temp file under the production pin, counting c-kzg builds.
+    fn load_tampered(bytes: &[u8]) -> (Result<TrustedSetup, SetupError>, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trusted_setup_4096.json");
+        std::fs::write(&path, bytes).unwrap();
+        let calls = Cell::new(0);
+        let result = TrustedSetup::load_with(&path, BETA4_MAINNET_SHA256, |points| {
+            calls.set(calls.get() + 1);
+            build_settings(points)
+        });
+        (result, calls.get())
+    }
+
+    #[test]
+    fn one_changed_byte_fails_the_pin_before_ckzg() {
+        let mut bytes = std::fs::read(SETUP).unwrap();
+        // A hex digit inside the first G1 point: still valid JSON of the right shape.
+        let at = bytes.windows(2).position(|w| w == b"0x").unwrap() + 2;
+        bytes[at] = if bytes[at] == b'a' { b'b' } else { b'a' };
+        let (result, calls) = load_tampered(&bytes);
+        let actual: [u8; 32] = Sha256::digest(&bytes).into();
+        assert!(
+            matches!(result, Err(SetupError::DigestMismatch { expected, actual: got })
+                if expected == BETA4_MAINNET_SHA256 && got == actual),
+            "{result:?}"
+        );
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn whitespace_edit_fails_the_pin() {
+        // The digest is over the raw bytes, so JSON-equivalent edits are refused too.
+        let mut bytes = std::fs::read(SETUP).unwrap();
+        bytes.push(b'\n');
+        let (result, calls) = load_tampered(&bytes);
+        assert!(
+            matches!(result, Err(SetupError::DigestMismatch { .. })),
+            "{result:?}"
+        );
+        assert_eq!(calls, 0);
     }
 
     #[test]

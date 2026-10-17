@@ -65,16 +65,23 @@ pub fn hello() -> Hello {
     }
 }
 
-/// crypto-kzg's vendored consensus-specs v1.7.0-beta.4 mainnet setup and its pinned sha256.
+/// crypto-kzg's vendored consensus-specs v1.7.0-beta.4 mainnet setup (the pinned one).
 pub fn setup_config() -> TrustedSetupConfig {
     TrustedSetupConfig {
         path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../crypto-kzg/data/trusted_setup_4096.json"),
-        sha256: hex::decode("f8e44a31ebf0a6d0734dcb301b0716e2c77f3ae18ed0cab0870fbcc2ca55616f")
-            .unwrap()
-            .try_into()
-            .unwrap(),
     }
+}
+
+/// A copy of the pinned setup with one byte changed, in `dir`. It is still well-formed JSON with
+/// valid points, so only the digest pin can refuse it.
+pub fn tampered_setup(dir: &Path) -> TrustedSetupConfig {
+    let mut bytes = std::fs::read(setup_config().path).unwrap();
+    let at = bytes.windows(2).position(|w| w == b"0x").unwrap() + 2;
+    bytes[at] = if bytes[at] == b'a' { b'b' } else { b'a' };
+    let path = dir.join("trusted_setup_4096.json");
+    std::fs::write(&path, &bytes).unwrap();
+    TrustedSetupConfig { path }
 }
 
 pub fn kzg_backend() -> Arc<PinnedKzgBackend> {
@@ -204,7 +211,7 @@ pub async fn serve_on(
     }
 }
 
-async fn connect(path: &Path) -> Channel {
+pub async fn connect(path: &Path) -> Channel {
     let path = path.to_path_buf();
     Endpoint::try_from("http://[::]:50051")
         .unwrap()

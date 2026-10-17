@@ -5,7 +5,8 @@
 # dev or build dependency (a dev-depends on b, b depends on a). Such a cycle still ties the two
 # crates together, so this check reads the resolve graph of `cargo metadata` (every target,
 # every edge kind, every feature on, so optional dependencies count) restricted to workspace
-# members and prints each cycle it finds.
+# members and prints each cycle it finds. A crate's dev-dependency on itself (the usual way to
+# enable a test-only feature for its own integration tests) is not counted.
 #
 # Usage: scripts/check-dep-cycles.sh [path/to/workspace/Cargo.toml]   (default: this repo)
 # Env: CARGO (default `cargo`). Needs python3. Works with bash 3.2.
@@ -29,10 +30,16 @@ members = set(meta["workspace_members"])
 names = {p["id"]: p["name"] for p in meta["packages"]}
 if not meta.get("resolve") or not members:
     sys.exit("ERROR: cargo metadata has no resolve graph or no workspace members")
+def self_dev_edge(node_id, dep):
+    # A crate dev-depending on itself (to turn on a test-only feature) ties no two crates together.
+    return dep["pkg"] == node_id and all(k["kind"] == "dev" for k in dep["dep_kinds"])
+
 edges = {}
 for node in meta["resolve"]["nodes"]:
     if node["id"] in members:
-        edges[node["id"]] = sorted(d["pkg"] for d in node["deps"] if d["pkg"] in members)
+        edges[node["id"]] = sorted(
+            d["pkg"] for d in node["deps"]
+            if d["pkg"] in members and not self_dev_edge(node["id"], d))
 
 WHITE, GREY, BLACK = 0, 1, 2
 color = dict.fromkeys(edges, WHITE)

@@ -139,23 +139,28 @@ struct Inner {
 
 impl VerifyServer {
     /// The production server: blst for BLS and the pinned trusted setup for KZG. Fails if the
-    /// setup file is missing or its sha256 is not `config.trusted_setup.sha256`.
+    /// setup file is missing or its sha256 is not [`crypto_kzg::BETA4_MAINNET_SHA256`].
     ///
     /// Pass an empty `cache`: it is restored from `config.pubkey_snapshot` or rebuilt from the
     /// feed on the first PubkeyFeed frame, and VerifyBls sees it empty until then. A non-empty
     /// `cache` counts as already restored by the caller.
+    ///
+    /// This is the only constructor outside tests: the `with_backends*` seams exist only with the
+    /// `test-backends` feature, so no other crate can serve over an unpinned KZG backend.
     pub fn new(config: ServerConfig, cache: SharedCache) -> Result<Self, SetupError> {
         let kzg = Arc::new(PinnedKzgBackend::load(&config.trusted_setup)?);
-        Ok(Self::with_backends(
+        Ok(Self::build(
             config,
             cache,
             Arc::new(BlstBackend),
             kzg,
+            Arc::new(SystemClock),
         ))
     }
 
     /// A server over the given verifiers (tests inject slow or failing ones). `trusted_setup` in
     /// `config` is not loaded here.
+    #[cfg(any(test, feature = "test-backends"))]
     #[must_use]
     pub fn with_backends(
         config: ServerConfig,
@@ -163,12 +168,23 @@ impl VerifyServer {
         bls: Arc<dyn BlsBackend>,
         kzg: Arc<dyn KzgBackend>,
     ) -> Self {
-        Self::with_backends_and_clock(config, cache, bls, kzg, Arc::new(SystemClock))
+        Self::build(config, cache, bls, kzg, Arc::new(SystemClock))
     }
 
     /// [`Self::with_backends`] with the wall clock deadlines are judged against (tests step it).
+    #[cfg(any(test, feature = "test-backends"))]
     #[must_use]
     pub fn with_backends_and_clock(
+        config: ServerConfig,
+        cache: SharedCache,
+        bls: Arc<dyn BlsBackend>,
+        kzg: Arc<dyn KzgBackend>,
+        clock: Arc<dyn WallClock>,
+    ) -> Self {
+        Self::build(config, cache, bls, kzg, clock)
+    }
+
+    fn build(
         config: ServerConfig,
         cache: SharedCache,
         bls: Arc<dyn BlsBackend>,
@@ -246,14 +262,51 @@ pub async fn serve_uds(
     server: VerifyServer,
     shutdown: impl Future<Output = ()> + Send,
 ) -> Result<(), tonic::transport::Error> {
+    serve(listener, server, shutdown, None).await
+}
+
+/// [`serve_uds`] with a bounded shutdown: once `shutdown` resolves, open connections get `drain`
+/// to finish before they are dropped. The snapshot is flushed once either way.
+pub async fn serve_uds_draining(
+    listener: UnixListener,
+    server: VerifyServer,
+    shutdown: impl Future<Output = ()> + Send,
+    drain: Duration,
+) -> Result<(), tonic::transport::Error> {
+    serve(listener, server, shutdown, Some(drain)).await
+}
+
+async fn serve(
+    listener: UnixListener,
+    server: VerifyServer,
+    shutdown: impl Future<Output = ()> + Send,
+    drain: Option<Duration>,
+) -> Result<(), tonic::transport::Error> {
     let limits = server.inner.limits.clone();
-    let served = tonic::transport::Server::builder()
+    let (begun, begun_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown = async move {
+        shutdown.await;
+        let _ = begun.send(());
+    };
+    let serving = tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(limits.http2_keepalive_interval))
         .http2_keepalive_timeout(Some(limits.http2_keepalive_timeout))
         .max_concurrent_streams(limits.max_concurrent_streams_per_connection)
         .add_service(server.clone().into_service())
-        .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)
-        .await;
+        .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown);
+    let drained = async move {
+        match (drain, begun_rx.await) {
+            (Some(drain), Ok(())) => tokio::time::sleep(drain).await,
+            _ => std::future::pending().await,
+        }
+    };
+    let served = tokio::select! {
+        served = serving => served,
+        () = drained => {
+            tracing::warn!(?drain, "connections still open after the drain timeout; dropping them");
+            Ok(())
+        }
+    };
     if let Err(e) = server.flush_snapshot().await {
         tracing::error!(error = %e, "pubkey snapshot not flushed at shutdown");
     }

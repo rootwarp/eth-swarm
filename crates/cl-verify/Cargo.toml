@@ -11,18 +11,26 @@ description = "cl-verify: the ethswarm.verify.v1 gRPC server (BLS batch and KZG 
 cl-verify-cache = { path = "../cl-verify-cache" }
 blst = "0.3.17"
 crypto-kzg = { path = "../crypto-kzg" }
+network-config = { path = "../network-config" }
 tonic = "0.12.3"
 prost = "0.13.5"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 rand = "0.8"
 hex = "0.4"
 thiserror = "2"
 tracing = "0.1"
 
+[features]
+# Test-only: exposes `VerifyServer::with_backends*` and `kzg::KzgBackend`, which build a server
+# over any verifier. Only this crate's own tests enable it (scripts/check-test-backends.sh).
+test-backends = []
+
 [dev-dependencies]
+cl-verify = { path = ".", features = ["test-backends"] }
 tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
+sha2 = "0.10"
 tower = "0.4"
 hyper-util = { version = "0.1", features = ["tokio"] }
 

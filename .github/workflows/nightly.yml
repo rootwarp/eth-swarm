@@ -63,5 +63,5 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
           fallback: none
-      - run: cargo deny check
+      - run: cargo deny --locked check
       - run: bash scripts/check-ssz-revs.sh

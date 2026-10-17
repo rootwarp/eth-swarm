@@ -29,6 +29,8 @@ jobs:
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustc --version
       - run: bash scripts/check-workflows.sh
+      - name: Every cargo command in a CI run step uses --locked
+        run: bash scripts/tests/check-locked.test.sh && bash scripts/check-locked.sh
 
   proto:
     name: buf lint, build, breaking vs develop, baseline drift
@@ -66,7 +68,7 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
           fallback: none
-      - run: cargo deny check
+      - run: cargo deny --locked check
       - run: bash scripts/check-ssz-revs.sh
 
   rust:
@@ -91,6 +93,10 @@ jobs:
       - run: cargo build --workspace --locked
       - name: crypto-kzg uses only its pinned setup loader; blst is not portable
         run: bash scripts/tests/check-kzg-loaders.test.sh && bash scripts/check-kzg-loaders.sh
+      - name: cl-verify is the only load_pinned caller, with the beta.4 mainnet digest
+        run: bash scripts/tests/check-setup-pin.test.sh && bash scripts/check-setup-pin.sh
+      - name: Only cl-verify's own tests enable cl-verify/test-backends
+        run: bash scripts/tests/check-test-backends.test.sh && bash scripts/check-test-backends.sh
       - name: Only spec-tests may enable crypto-bls/test-vectors
         run: bash scripts/check-bls-features.sh
       - name: cl-chain links only crypto-bls/aggregate, never crypto-bls/verify
