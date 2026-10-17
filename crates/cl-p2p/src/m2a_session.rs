@@ -19,9 +19,10 @@
 //!   its subscriber) captures every log line of a session and checks that no key material is
 //!   in it.
 //! - **Req/resp**: one outbound-only [`request_response`] behaviour per protocol
-//!   ([`crate::rpc`]). Status goes out through [`crate::rpc::outbound::status`] and MetaData
+//!   ([`crate::rpc`]). Status goes out through [`crate::rpc::outbound::status`], MetaData
 //!   through [`Session::request_metadata`], which keeps the peer's MetaData (its `seq_number`
-//!   for Ping); later work sends Ping and BlocksByRange.
+//!   for Ping), and Ping through [`crate::rpc::outbound::ping`]; later work sends
+//!   BlocksByRange.
 
 pub mod config;
 
@@ -317,6 +318,19 @@ impl<E: EthSpec> crate::rpc::outbound::MetaDataRpc<E> for SessionBehaviour<E> {
     ) -> Option<crate::rpc::outbound::RpcEvent<E>> {
         match event {
             SessionBehaviourEvent::Metadata(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl<E: EthSpec> crate::rpc::outbound::PingRpc<E> for SessionBehaviour<E> {
+    fn ping_rpc(&mut self) -> &mut request_response::Behaviour<RpcCodec<E>> {
+        &mut self.ping
+    }
+
+    fn ping_event(event: SessionBehaviourEvent<E>) -> Option<crate::rpc::outbound::RpcEvent<E>> {
+        match event {
+            SessionBehaviourEvent::Ping(e) => Some(e),
             _ => None,
         }
     }

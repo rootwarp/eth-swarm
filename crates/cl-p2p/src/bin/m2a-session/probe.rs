@@ -26,11 +26,13 @@
 //!   exchange and a second Status on it succeeds.
 //!
 //! **MetaData**: once the handshake passed, the MetaData step ([`metadata`]) runs on the same
-//! connection, before the hold, with its own verdicts and log line. The session passes only if
-//! both steps do ([`Report::passed`]).
+//! connection, before the hold, with its own verdicts and log line; then, if it decoded a
+//! MetaData, the Ping step ([`ping`]). The session passes only if every step does
+//! ([`Report::passed`]).
 
 use crate::enr;
 use crate::metadata::{self, MetaDataReport};
+use crate::ping::{self, PingReport};
 use crate::reference_api::{Checkpoint, Header, ReferenceApi};
 use cl_p2p::m2a_session::{Session, SessionError};
 use cl_p2p::rpc::outbound::{self, OutboundError};
@@ -128,6 +130,8 @@ pub struct Report {
     pub error: Option<String>,
     /// The MetaData step, once the handshake passed.
     pub metadata: Option<MetaDataReport>,
+    /// The Ping step, once the MetaData step decoded a MetaData.
+    pub ping: Option<PingReport>,
 }
 
 /// `0x` and the lower-case hex digits of `bytes`.
@@ -183,15 +187,18 @@ impl Report {
                 .all(|f| self.verdicts.iter().any(|(name, v)| name == f && v.pass))
     }
 
-    /// Whether the session passed: the Status step and the MetaData step.
+    /// Whether the session passed: the Status, MetaData and Ping steps.
     pub fn passed(&self) -> bool {
-        self.status_passed() && self.metadata.as_ref().is_some_and(MetaDataReport::passed)
+        self.status_passed()
+            && self.metadata.as_ref().is_some_and(MetaDataReport::passed)
+            && self.ping.as_ref().is_some_and(PingReport::passed)
     }
 
     /// The session log: one JSON line per step that ran, Status first.
     pub fn json_lines(&self) -> Vec<String> {
         let mut lines = vec![self.json_line()];
         lines.extend(self.metadata.as_ref().map(MetaDataReport::json_line));
+        lines.extend(self.ping.as_ref().map(PingReport::json_line));
         lines
     }
 
@@ -428,7 +435,12 @@ async fn steps<E: EthSpec>(
         );
         return Ok(());
     }
-    report.metadata = Some(metadata::run(session, api).await);
+    let metadata = metadata::run(session, api).await;
+    let decoded_seq = metadata.peer.as_ref().map(|m| m.seq_number);
+    report.metadata = Some(metadata);
+    if let Some(seq) = decoded_seq {
+        report.ping = Some(ping::run(session, api, seq).await);
+    }
     let connection = match hold(session, probe.hold).await {
         Err(e) => Err(e),
         Ok(()) => second_status(session, probe, &after).await,

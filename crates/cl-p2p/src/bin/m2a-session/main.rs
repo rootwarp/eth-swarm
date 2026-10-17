@@ -1,4 +1,4 @@
-//! `m2a-session`: the pinned reference node's Status v2 and MetaData v3 probe (see
+//! `m2a-session`: the pinned reference node's Status v2, MetaData v3 and Ping v1 probe (see
 //! `cl_p2p::m2a_session`).
 //!
 //! ```text
@@ -15,14 +15,15 @@
 //!   checkout's `fuzz/artifacts/m2a-gate.json`), and refuses before dialling without one. Then:
 //!   dial, send our Status v2 at the pinned Sepolia fork digest, judge the peer's against the
 //!   reference beacon API ([`reference_api`]); request the peer's MetaData v3 on the same
-//!   connection and judge it against the node's `/eth/v1/node/identity` ([`metadata`]); hold
+//!   connection and judge it against the node's `/eth/v1/node/identity` ([`metadata`]); Ping
+//!   it with our `seq_number` 0 and check its answer against that MetaData ([`ping`]); hold
 //!   the connection and send a second Status. One JSON line per step on stdout records it all.
 //! - `--dial-only`: dial, check the pinned peer ID (Noise XX, then yamux), disconnect, exit.
 //!   No req/resp traffic, so no response decoder runs and no fuzz gate is needed.
 //! - `--print-peer-id`: print the node key's peer ID on stdout and exit, without dialling, so
 //!   the operator can list it as a trusted peer on the reference node. Needs `node_key`.
 //!
-//! Exit 0 on success (every verdict of both steps passed), 1 if the dial, an exchange or a verdict
+//! Exit 0 on success (every verdict of every step passed), 1 if the dial, an exchange or a verdict
 //! fails, 2 on bad arguments, a refused config or a failed pre-flight.
 
 mod enr;
@@ -30,6 +31,7 @@ mod gate;
 mod metadata;
 #[cfg(test)]
 mod mock_api;
+mod ping;
 mod probe;
 mod reference_api;
 
@@ -293,11 +295,12 @@ fn run(argv: impl Iterator<Item = String>, euid: u32, out: &mut dyn Write, env: 
                 }
             }
             return if report.passed() {
-                tracing::info!("status and metadata probes passed");
+                tracing::info!("status, metadata and ping probes passed");
                 EXIT_CONNECTED
             } else {
                 let metadata_error = report.metadata.as_ref().and_then(|m| m.error.as_ref());
-                tracing::error!(error = ?report.error, ?metadata_error, "probe failed");
+                let ping_error = report.ping.as_ref().and_then(|p| p.error.as_ref());
+                tracing::error!(error = ?report.error, ?metadata_error, ?ping_error, "probe failed");
                 EXIT_FAILED
             };
         }
@@ -328,7 +331,7 @@ mod tests {
     use super::*;
     use crate::gate::tests::{fixture_expected, passing_gate};
     use crate::mock_api::{MockApi, Route};
-    use cl_p2p::testkit::{MetaDataReply, StatusPeer, StatusReply};
+    use cl_p2p::testkit::{MetaDataReply, PingReply, StatusPeer, StatusReply};
     use consensus_types::primitives::{Root, Slot};
     use p2p_wire::rpc::messages::{MetaDataV3, StatusV2};
     use p2p_wire::rpc::protocols::ResultCode;
@@ -640,6 +643,8 @@ mod tests {
         identity_bodies: Option<Vec<String>>,
         /// The peer's MetaData answer, per request.
         metadata: Vec<MetaDataReply>,
+        /// The peer's Ping answer, per request.
+        ping: Vec<PingReply>,
         /// The gate file.
         gate: Value,
         /// The epoch of the clock at each reading; the last repeats.
@@ -656,6 +661,7 @@ mod tests {
                 identity: vec![md(7)],
                 identity_bodies: None,
                 metadata: vec![MetaDataReply::MetaData(md(7))],
+                ping: vec![PingReply::Ping(7)],
                 gate: passing_gate(&fixture_expected()),
                 clock: vec![EPOCH],
             }
@@ -696,6 +702,14 @@ mod tests {
 
         fn metadata_verdict(&self, field: &str) -> bool {
             verdict_of(self.metadata_line(), field)
+        }
+
+        fn ping_line(&self) -> &Value {
+            self.event("m2a-ping").expect("a Ping log line")
+        }
+
+        fn ping_verdict(&self, field: &str) -> bool {
+            verdict_of(self.ping_line(), field)
         }
     }
 
@@ -766,7 +780,8 @@ mod tests {
     async fn probe(s: Scenario) -> Outcome {
         let statuses = s.peer.clone();
         let metadata = s.metadata.clone();
-        let peer = StatusPeer::spawn_with_metadata(
+        let pings = s.ping.clone();
+        let peer = StatusPeer::spawn_with_ping(
             Box::new(move |req, n| {
                 StatusReply::Status(StatusV2 {
                     fork_digest: req.fork_digest,
@@ -776,6 +791,7 @@ mod tests {
             Some(Box::new(move |n| {
                 metadata[n.min(metadata.len() - 1)].clone()
             })),
+            Some(Box::new(move |_, n| pings[n.min(pings.len() - 1)].clone())),
             s.disconnect_after,
         )
         .await;
@@ -809,7 +825,7 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert!(lines.len() <= 2, "one JSON line per step at most: {out}");
+        assert!(lines.len() <= 3, "one JSON line per step at most: {out}");
         Outcome {
             code,
             lines,
@@ -838,12 +854,21 @@ mod tests {
         assert_eq!(ours.head_root, root(F1.1));
         assert_eq!(ours.head_slot, finalized_slot(F1.0));
         assert_eq!(ours.earliest_available_slot, ours.head_slot);
-        // The first Status, the MetaData, then the second Status, all on one connection.
+        // The first Status, the MetaData, the Ping with our seq_number 0, then the second
+        // Status, all on one connection.
         assert_eq!(out.peer.requests().len(), 2);
         assert_eq!(out.peer.metadata_requests(), 1);
+        assert_eq!(out.peer.pings(), vec![ping::OUR_SEQ_NUMBER]);
+        assert_eq!(ping::OUR_SEQ_NUMBER, 0);
         assert_eq!(out.peer.connections(), 1);
         assert_eq!(out.api.hits(FINALITY_PATH), 2, "sampled before and after");
-        assert_eq!(out.lines.len(), 2, "one line per step");
+        assert_eq!(out.lines.len(), 3, "one line per step");
+        let events: Vec<&Value> = out.lines.iter().map(|l| &l["event"]).collect();
+        assert_eq!(events, ["m2a-status", "m2a-metadata", "m2a-ping"]);
+        assert_eq!(out.ping_line()["pass"], true);
+        for field in ping::FIELDS {
+            assert!(out.ping_verdict(field), "{field}: {}", out.ping_line());
+        }
         assert_eq!(out.metadata_line()["pass"], true);
         for field in metadata::FIELDS {
             assert!(
@@ -943,6 +968,7 @@ mod tests {
             MetaDataReply::MetaData(md(7)),
             MetaDataReply::MetaData(md(8)),
         ];
+        s.ping = vec![PingReply::Ping(8)];
         let out = probe(s).await;
         assert_eq!(out.code, EXIT_CONNECTED, "{}", out.metadata_line());
         let line = out.metadata_line();
@@ -1055,6 +1081,9 @@ mod tests {
             "sampled before the request"
         );
         assert_eq!(line["peer"], Value::Null);
+        // No MetaData seq_number to compare a Ping answer with: no Ping.
+        assert!(out.event("m2a-ping").is_none());
+        assert!(out.peer.pings().is_empty());
         // The connection check still ran, on the same connection.
         assert_eq!(out.line()["pass"], true);
         assert!(out.verdict("connection"));
@@ -1080,6 +1109,158 @@ mod tests {
             0,
             "no request without a sample"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ping_log_line_has_our_seq_the_peers_and_the_metadata_steps() {
+        let out = probe(Scenario::new(peer_status(F1, 0, 0))).await;
+        let line = out.ping_line();
+        assert_eq!(line["event"], "m2a-ping");
+        assert_eq!(line["pass"], true);
+        assert_eq!(line["error"], Value::Null);
+        // Decimal strings, as the beacon API encodes a uint64.
+        assert_eq!(line["our_seq_number"], "0");
+        assert_eq!(line["peer_seq_number"], "7");
+        assert_eq!(line["metadata_seq_number"], "7");
+        assert_eq!(line["metadata_refetches"], 0);
+        assert_eq!(line["refetched"], Value::Null);
+        let verdicts = line["verdicts"].as_object().unwrap();
+        let names: Vec<&str> = verdicts.keys().map(String::as_str).collect();
+        assert_eq!(names, ping::FIELDS);
+        let detail = verdicts["seq_number"]["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("Ping 7") && detail.contains("MetaData 7"),
+            "{detail}"
+        );
+        assert!(!line.to_string().contains('\n'));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ping_seq_lower_fails() {
+        // The MetaData step decoded 7; a Ping answer of 6 went backwards.
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.ping = vec![PingReply::Ping(6)];
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        assert_eq!(out.line()["pass"], true, "the Status step itself passed");
+        assert_eq!(out.metadata_line()["pass"], true);
+        let line = out.ping_line();
+        assert_eq!(line["pass"], false);
+        assert!(!out.ping_verdict("seq_number"));
+        assert_eq!(line["peer_seq_number"], "6");
+        assert_eq!(line["metadata_seq_number"], "7");
+        let detail = line["verdicts"]["seq_number"]["detail"].as_str().unwrap();
+        assert!(detail.contains("below"), "{detail}");
+        // No re-fetch for a lower answer.
+        assert_eq!(line["metadata_refetches"], 0);
+        assert_eq!(out.peer.metadata_requests(), 1);
+        assert_eq!(out.api.hits(IDENTITY_PATH), 3);
+        // The connection check still ran.
+        assert!(out.verdict("connection"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ping_seq_higher_refetches_metadata() {
+        // The peer's MetaData moved to 8 after the step (a subnet rotation): one re-fetch, and
+        // the new MetaData matches the Ping answer and the re-sampled identity.
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.identity = vec![md(7), md(7), md(7), md(8)];
+        s.metadata = vec![
+            MetaDataReply::MetaData(md(7)),
+            MetaDataReply::MetaData(md(8)),
+        ];
+        s.ping = vec![PingReply::Ping(8)];
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_CONNECTED, "{}", out.ping_line());
+        let line = out.ping_line();
+        assert_eq!(line["pass"], true);
+        assert_eq!(line["metadata_refetches"], 1);
+        assert_eq!(line["peer_seq_number"], "8");
+        assert_eq!(line["metadata_seq_number"], "7");
+        // Both MetaData results are logged: the step's and the re-fetched one.
+        assert_eq!(out.metadata_line()["peer"]["seq_number"], "7");
+        assert_eq!(line["refetched"]["peer"]["seq_number"], "8");
+        assert_eq!(line["refetched"]["api"]["seq_number"], "8");
+        assert!(out.ping_verdict("seq_number") && out.ping_verdict("refetch_identity"));
+        assert_eq!(out.peer.metadata_requests(), 2, "exactly one re-fetch");
+        assert_eq!(out.peer.pings(), vec![0], "one Ping");
+        // The ENR read, the step's two samples, the re-sample.
+        assert_eq!(out.api.hits(IDENTITY_PATH), 4);
+        assert_eq!(out.peer.connections(), 1);
+
+        // The re-fetched MetaData is at 9, not the Ping's 8: fail, and no second re-fetch.
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.identity = vec![md(7), md(7), md(7), md(9)];
+        s.metadata = vec![
+            MetaDataReply::MetaData(md(7)),
+            MetaDataReply::MetaData(md(9)),
+        ];
+        s.ping = vec![PingReply::Ping(8)];
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        let line = out.ping_line();
+        assert_eq!(line["pass"], false);
+        assert!(!out.ping_verdict("seq_number"));
+        assert!(out.ping_verdict("refetch_identity"), "{line}");
+        assert_eq!(line["refetched"]["peer"]["seq_number"], "9");
+        assert_eq!(line["metadata_refetches"], 1);
+        assert_eq!(out.peer.metadata_requests(), 2, "never a second re-fetch");
+
+        // The re-fetched MetaData matches the Ping, but the reference identity is still at 7.
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.metadata = vec![
+            MetaDataReply::MetaData(md(7)),
+            MetaDataReply::MetaData(md(8)),
+        ];
+        s.ping = vec![PingReply::Ping(8)];
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        assert!(out.ping_verdict("seq_number"));
+        assert!(!out.ping_verdict("refetch_identity"));
+        let line = out.ping_line();
+        let detail = line["verdicts"]["refetch_identity"]["detail"]
+            .as_str()
+            .unwrap();
+        assert!(detail.contains("seq_number"), "{detail}");
+        assert_eq!(line["refetched"]["api"]["seq_number"], "7");
+        assert_eq!(out.peer.metadata_requests(), 2);
+
+        // The re-fetch itself fails: the step fails with the error.
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.metadata = vec![
+            MetaDataReply::MetaData(md(7)),
+            MetaDataReply::Error(ResultCode::ServerError, b"busy".to_vec()),
+        ];
+        s.ping = vec![PingReply::Ping(8)];
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        let error = out.ping_line()["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("metadata re-fetch:") && error.contains("busy"),
+            "{error}"
+        );
+        assert_eq!(out.peer.metadata_requests(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ping_failure_fails_the_step_only() {
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.ping = vec![PingReply::Chunks(vec![7, 7])];
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        assert_eq!(out.line()["pass"], true);
+        assert_eq!(out.metadata_line()["pass"], true);
+        let line = out.ping_line();
+        assert_eq!(line["pass"], false);
+        assert_eq!(line["peer_seq_number"], Value::Null);
+        assert_eq!(line["metadata_seq_number"], "7");
+        let error = line["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("ping:") && error.contains("chunks"),
+            "{error}"
+        );
+        assert!(out.verdict("connection"));
+        assert_eq!(out.peer.connections(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1204,8 +1385,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn status_then_disconnect_fails() {
         let mut s = Scenario::new(peer_status(F1, 0, 0));
-        // Answers the Status and the MetaData, then closes the connection.
-        s.disconnect_after = Some(2);
+        // Answers the Status, the MetaData and the Ping, then closes the connection.
+        s.disconnect_after = Some(3);
         let out = probe(s).await;
         assert_eq!(out.code, EXIT_FAILED);
         assert!(!out.verdict("connection"));
@@ -1238,11 +1419,13 @@ mod tests {
                 ..peer_status(F1, 0, 0)
             },
         ];
-        // It serves MetaData too: the MetaData step runs between the two Status exchanges.
+        // It serves MetaData and Ping too: both steps run between the two Status exchanges.
         let metadata = s.metadata[0].clone();
-        let peer = StatusPeer::spawn_with_metadata(
+        let ping = s.ping[0].clone();
+        let peer = StatusPeer::spawn_with_ping(
             Box::new(move |_, n| StatusReply::Status(statuses[n.min(1)].clone())),
             Some(Box::new(move |_| metadata.clone())),
+            Some(Box::new(move |_, _| ping.clone())),
             None,
         )
         .await;
@@ -1251,6 +1434,8 @@ mod tests {
         assert!(out.verdict("connection"));
         assert_eq!(out.metadata_line()["pass"], true);
         assert_eq!(out.peer.metadata_requests(), 1);
+        assert_eq!(out.ping_line()["pass"], true);
+        assert_eq!(out.peer.pings(), vec![ping::OUR_SEQ_NUMBER]);
         let requests = out.peer.requests();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].fork_digest, BPO2);

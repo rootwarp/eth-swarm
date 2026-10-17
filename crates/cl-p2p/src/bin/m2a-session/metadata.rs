@@ -3,7 +3,7 @@
 //!
 //! It runs after the Status exchange, on the same connection
 //! ([`cl_p2p::m2a_session::Session::request_metadata`], which keeps the peer's MetaData in the
-//! session for Ping). `fulu/p2p-interface.md` L778–794 defines the request, L269–288 the type;
+//! session), and the Ping step ([`crate::ping`]) compares its answer with this `seq_number`. `fulu/p2p-interface.md` L778–794 defines the request, L269–288 the type;
 //! `attnets` and `syncnets` are `altair/p2p-interface.md` L141–149.
 //!
 //! **Order**: sample the identity; request; sample again. `seq_number` increments on every
@@ -94,7 +94,7 @@ impl MetaDataReport {
 }
 
 /// The reference node's MetaData.
-async fn sample(api: &ReferenceApi) -> Result<MetaDataV3, String> {
+pub async fn sample(api: &ReferenceApi) -> Result<MetaDataV3, String> {
     api.node_identity()
         .await
         .map(|id| id.metadata)

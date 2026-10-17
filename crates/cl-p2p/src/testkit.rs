@@ -1,9 +1,10 @@
 //! Test fixtures (feature `testkit`): a loopback libp2p peer that answers Status v2 and, if
-//! asked to, MetaData v3.
+//! asked to, MetaData v3 and Ping v1.
 //!
 //! [`StatusPeer`] listens on an ephemeral 127.0.0.1 TCP port with TCP + Noise + yamux, serves
-//! `/eth2/beacon_chain/req/status/2/ssz_snappy` (inbound) and, given a [`MetaDataResponder`],
-//! `/eth2/beacon_chain/req/metadata/3/ssz_snappy`, and answers each request with whatever its
+//! `/eth2/beacon_chain/req/status/2/ssz_snappy` (inbound), given a [`MetaDataResponder`]
+//! `/eth2/beacon_chain/req/metadata/3/ssz_snappy`, given a [`PingResponder`]
+//! `/eth2/beacon_chain/req/ping/1/ssz_snappy`, and answers each request with whatever its
 //! responder returns. Nothing here leaves the host.
 
 use crate::m2a_session::PinnedPeer;
@@ -13,7 +14,7 @@ use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{noise, tcp, yamux, Multiaddr, PeerId, SwarmBuilder};
 use p2p_wire::rpc::codec::{decode_request, encode_error_chunk, encode_success_chunk};
-use p2p_wire::rpc::messages::{MetaDataV3, StatusV2};
+use p2p_wire::rpc::messages::{MetaDataV3, Ping, StatusV2};
 use p2p_wire::rpc::protocols::{Protocol, Request, ResultCode};
 use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -49,15 +50,32 @@ pub enum MetaDataReply {
 /// Answers the `n`th (0-based) MetaData request.
 pub type MetaDataResponder = Box<dyn Fn(usize) -> MetaDataReply + Send + Sync>;
 
+/// What the peer answers one Ping request with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PingReply {
+    /// A success chunk with this `seq_number`.
+    Ping(u64),
+    /// A success chunk with these SSZ bytes, whatever their length (a Ping is 8).
+    Ssz(Vec<u8>),
+    /// One success chunk per entry: more than one breaks the single-response rule.
+    Chunks(Vec<u64>),
+    /// An error chunk.
+    Error(ResultCode, Vec<u8>),
+}
+
+/// Answers the `n`th (0-based) Ping request, given the requester's `seq_number`.
+pub type PingResponder = Box<dyn Fn(u64, usize) -> PingReply + Send + Sync>;
+
 /// One answer of the fixture, by protocol.
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)] // see `MetaDataReply`
 enum Reply {
     Status(StatusReply),
     MetaData(MetaDataReply),
+    Ping(PingReply),
 }
 
-/// The responder side of the Status and MetaData protocols, for the fixture only.
+/// The responder side of the Status, MetaData and Ping protocols, for the fixture only.
 #[derive(Clone, Default)]
 struct ResponderCodec;
 
@@ -88,6 +106,13 @@ fn metadata_ssz(m: &MetaDataV3) -> Vec<u8> {
     out
 }
 
+/// `Ping`'s SSZ: the `uint64`, little-endian.
+fn ping_ssz(seq_number: u64) -> Vec<u8> {
+    Request::Ping(Ping(seq_number))
+        .ssz_body()
+        .unwrap_or_default()
+}
+
 impl request_response::Codec for ResponderCodec {
     type Protocol = Protocol;
     type Request = Request;
@@ -100,7 +125,7 @@ impl request_response::Codec for ResponderCodec {
         let mut buf = Vec::new();
         io.take(MAX_REQUEST_BYTES).read_to_end(&mut buf).await?;
         match decode_request(*protocol, &buf) {
-            Ok(r @ (Request::Status(_) | Request::MetaData)) => Ok(r),
+            Ok(r @ (Request::Status(_) | Request::MetaData | Request::Ping(_))) => Ok(r),
             Ok(other) => Err(io::Error::other(format!("not served: {other:?}"))),
             Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
         }
@@ -129,12 +154,22 @@ impl request_response::Codec for ResponderCodec {
                 chunk(Ok(Request::Status(s).ssz_body().unwrap_or_default()))?
             }
             Reply::Status(StatusReply::Error(code, message))
-            | Reply::MetaData(MetaDataReply::Error(code, message)) => chunk(Err((code, message)))?,
+            | Reply::MetaData(MetaDataReply::Error(code, message))
+            | Reply::Ping(PingReply::Error(code, message)) => chunk(Err((code, message)))?,
             Reply::MetaData(MetaDataReply::MetaData(m)) => chunk(Ok(metadata_ssz(&m)))?,
             Reply::MetaData(MetaDataReply::Chunks(all)) => {
                 let mut bytes = Vec::new();
                 for m in &all {
                     bytes.extend(chunk(Ok(metadata_ssz(m)))?);
+                }
+                bytes
+            }
+            Reply::Ping(PingReply::Ping(seq)) => chunk(Ok(ping_ssz(seq)))?,
+            Reply::Ping(PingReply::Ssz(ssz)) => chunk(Ok(ssz))?,
+            Reply::Ping(PingReply::Chunks(all)) => {
+                let mut bytes = Vec::new();
+                for &seq in &all {
+                    bytes.extend(chunk(Ok(ping_ssz(seq)))?);
                 }
                 bytes
             }
@@ -144,7 +179,8 @@ impl request_response::Codec for ResponderCodec {
     }
 }
 
-/// A loopback peer that answers Status v2 and, if given a [`MetaDataResponder`], MetaData v3.
+/// A loopback peer that answers Status v2 and, if given their responders, MetaData v3 and
+/// Ping v1.
 pub struct StatusPeer {
     /// Its peer ID.
     pub id: PeerId,
@@ -152,6 +188,7 @@ pub struct StatusPeer {
     pub addr: Multiaddr,
     requests: Arc<Mutex<Vec<StatusV2>>>,
     metadata_requests: Arc<AtomicU32>,
+    pings: Arc<Mutex<Vec<u64>>>,
     connections: Arc<AtomicU32>,
 }
 
@@ -169,12 +206,27 @@ impl StatusPeer {
         metadata: Option<MetaDataResponder>,
         disconnect_after: Option<usize>,
     ) -> Self {
+        Self::spawn_with_ping(respond, metadata, None, disconnect_after).await
+    }
+
+    /// Starts the peer; it serves MetaData v3 if `metadata` is given and Ping v1 if `ping` is.
+    /// `disconnect_after` counts the answers of every protocol.
+    pub async fn spawn_with_ping(
+        respond: Responder,
+        metadata: Option<MetaDataResponder>,
+        ping: Option<PingResponder>,
+        disconnect_after: Option<usize>,
+    ) -> Self {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let metadata_requests = Arc::new(AtomicU32::new(0));
+        let pings = Arc::new(Mutex::new(Vec::new()));
         let connections = Arc::new(AtomicU32::new(0));
         let mut protocols = vec![(Protocol::StatusV2, ProtocolSupport::Inbound)];
         if metadata.is_some() {
             protocols.push((Protocol::MetaDataV3, ProtocolSupport::Inbound));
+        }
+        if ping.is_some() {
+            protocols.push((Protocol::PingV1, ProtocolSupport::Inbound));
         }
         let mut swarm = SwarmBuilder::with_existing_identity(Keypair::generate_secp256k1())
             .with_tokio()
@@ -205,6 +257,7 @@ impl StatusPeer {
         };
         let seen = Arc::clone(&requests);
         let metadata_seen = Arc::clone(&metadata_requests);
+        let pings_seen = Arc::clone(&pings);
         let established = Arc::clone(&connections);
         tokio::spawn(async move {
             let mut answered = 0usize;
@@ -234,8 +287,8 @@ impl StatusPeer {
                             },
                         ..
                     }) => {
-                        let reply = match (&request, &metadata) {
-                            (Request::Status(status), _) => {
+                        let reply = match (&request, &metadata, &ping) {
+                            (Request::Status(status), _, _) => {
                                 let n = {
                                     let mut seen = seen.lock().expect("not poisoned");
                                     seen.push(status.clone());
@@ -243,9 +296,17 @@ impl StatusPeer {
                                 };
                                 Reply::Status(respond(status, n))
                             }
-                            (Request::MetaData, Some(answer)) => {
+                            (Request::MetaData, Some(answer), _) => {
                                 let n = metadata_seen.fetch_add(1, Ordering::SeqCst);
                                 Reply::MetaData(answer(n as usize))
+                            }
+                            (Request::Ping(Ping(seq)), _, Some(answer)) => {
+                                let n = {
+                                    let mut seen = pings_seen.lock().expect("not poisoned");
+                                    seen.push(*seq);
+                                    seen.len() - 1
+                                };
+                                Reply::Ping(answer(*seq, n))
                             }
                             // Not offered, so never negotiated.
                             _ => continue,
@@ -269,6 +330,7 @@ impl StatusPeer {
             addr,
             requests,
             metadata_requests,
+            pings,
             connections,
         }
     }
@@ -303,6 +365,11 @@ impl StatusPeer {
     /// MetaData requests received; each was empty, or the peer would have refused it.
     pub fn metadata_requests(&self) -> u32 {
         self.metadata_requests.load(Ordering::SeqCst)
+    }
+
+    /// The `seq_number` of every Ping request received, in order.
+    pub fn pings(&self) -> Vec<u64> {
+        self.pings.lock().expect("not poisoned").clone()
     }
 
     /// Connections ever established to the peer.

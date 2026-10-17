@@ -12,14 +12,22 @@
 //! (the codec writes nothing and `request_response` closes the write half), and the response is
 //! exactly one success chunk. The codec already refuses a second chunk; [`single_metadata`]
 //! checks the count again on what it decoded.
+//!
+//! [`ping`] sends our MetaData `seq_number` on `/eth2/beacon_chain/req/ping/1/ssz_snappy` and
+//! returns the peer's (`phase0/p2p-interface.md` "Ping", L1628–1682): the request is
+//! `Ping(uint64)` and the response one 8-byte success chunk. Judging the answer against the
+//! peer's MetaData is the caller's business.
+//!
+//! A response the codec refused (a wrong SSZ length, a chunk too many, …) fails as
+//! [`OutboundError::InvalidResponse`] with the codec's typed [`ReadError`].
 
-use crate::rpc::codec::RpcCodec;
+use crate::rpc::codec::{ReadError, RpcCodec};
 use consensus_types::EthSpec;
 use futures::StreamExt;
 use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{PeerId, Swarm};
-use p2p_wire::rpc::messages::{ForkDigest, MetaDataV3, StatusV2};
+use p2p_wire::rpc::messages::{ForkDigest, MetaDataV3, Ping, StatusV2};
 use p2p_wire::rpc::protocols::{Request, Response, ResponseChunk, ResultCode};
 
 /// One event of an outbound `request_response` behaviour.
@@ -41,6 +49,15 @@ pub trait MetaDataRpc<E: EthSpec>: NetworkBehaviour {
 
     /// The MetaData behaviour's event inside `event`, or `None` for another behaviour's.
     fn metadata_event(event: Self::ToSwarm) -> Option<RpcEvent<E>>;
+}
+
+/// A behaviour with a Ping v1 `request_response` behaviour inside.
+pub trait PingRpc<E: EthSpec>: NetworkBehaviour {
+    /// The Ping v1 behaviour.
+    fn ping_rpc(&mut self) -> &mut request_response::Behaviour<RpcCodec<E>>;
+
+    /// The Ping behaviour's event inside `event`, or `None` for another behaviour's.
+    fn ping_event(event: Self::ToSwarm) -> Option<RpcEvent<E>>;
 }
 
 /// Why an outbound exchange failed.
@@ -69,6 +86,10 @@ pub enum OutboundError {
     /// The response was not one chunk of the requested message.
     #[error("unexpected response: {0}")]
     UnexpectedResponse(String),
+    /// The codec refused the response: it broke the wire format (a wrong SSZ length, …) or
+    /// the request's limits (a chunk too many, …).
+    #[error("invalid response: {0}")]
+    InvalidResponse(ReadError),
     /// `request_response` reported the request failed (dial, timeout, stream, codec).
     #[error("request failed: {0}")]
     Failure(String),
@@ -137,6 +158,23 @@ where
     single_metadata(chunks)
 }
 
+/// Sends our `seq_number` to `peer` and drives `swarm` until the peer's arrives or the exchange
+/// fails.
+///
+/// Events of other behaviours that arrive meanwhile are dropped (logged at debug).
+pub async fn ping<E, B>(swarm: &mut Swarm<B>, peer: PeerId, ours: u64) -> Result<u64, OutboundError>
+where
+    E: EthSpec,
+    B: PingRpc<E>,
+{
+    let id = swarm
+        .behaviour_mut()
+        .ping_rpc()
+        .send_request(&peer, Request::Ping(Ping(ours)));
+    let chunks = wait_for_response(swarm, id, B::ping_event).await?;
+    single_ping(chunks)
+}
+
 /// Drives `swarm` until request `id` has a response or fails; `event_of` picks the requesting
 /// behaviour's events. A closed connection is not judged here: `request_response` fails every
 /// request still pending on it (`OutboundFailure::ConnectionClosed`), and a response that
@@ -163,19 +201,46 @@ where
                 }) if request_id == id => return Ok(response),
                 Some(request_response::Event::OutboundFailure {
                     request_id, error, ..
-                }) if request_id == id => {
-                    return Err(match error {
-                        request_response::OutboundFailure::ConnectionClosed => {
-                            OutboundError::Disconnected
-                        }
-                        error => OutboundError::Failure(error_chain(&error)),
-                    });
-                }
+                }) if request_id == id => return Err(outbound_failure(error)),
                 Some(other) => tracing::debug!(event = ?other, "req/resp behaviour event"),
                 None => tracing::debug!("another behaviour's event"),
             },
             _ => tracing::trace!("swarm event while waiting for a response"),
         }
+    }
+}
+
+/// The error of a failed request. A codec refusal reaches `request_response` as an
+/// [`std::io::Error`] around the [`ReadError`]; that one keeps its type, unless it is a passed
+/// deadline or a stream failure, which say nothing about the peer's bytes.
+fn outbound_failure(error: request_response::OutboundFailure) -> OutboundError {
+    use request_response::OutboundFailure;
+    match error {
+        OutboundFailure::ConnectionClosed => OutboundError::Disconnected,
+        OutboundFailure::Io(e) => match refused_response(e) {
+            Ok(read) => OutboundError::InvalidResponse(read),
+            Err(e) => OutboundError::Failure(error_chain(&OutboundFailure::Io(e))),
+        },
+        error => OutboundError::Failure(error_chain(&error)),
+    }
+}
+
+/// The [`ReadError`] inside `e` if it is about the response's bytes, else `e` unchanged.
+fn refused_response(e: std::io::Error) -> Result<ReadError, std::io::Error> {
+    let refused = e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ReadError>())
+        .is_some_and(|read| !matches!(read, ReadError::Deadline(_) | ReadError::Io(_)));
+    if !refused {
+        return Err(e);
+    }
+    let kind = e.kind();
+    match e.into_inner() {
+        Some(inner) => inner
+            .downcast::<ReadError>()
+            .map(|read| *read)
+            .map_err(|inner| std::io::Error::new(kind, inner)),
+        None => Err(kind.into()),
     }
 }
 
@@ -214,16 +279,25 @@ fn single_metadata<E: EthSpec>(chunks: Vec<ResponseChunk<E>>) -> Result<MetaData
     }
 }
 
+/// The `seq_number` of the one Ping chunk of a Ping response.
+fn single_ping<E: EthSpec>(chunks: Vec<ResponseChunk<E>>) -> Result<u64, OutboundError> {
+    match single_chunk(chunks)? {
+        Response::Ping(Ping(seq_number)) => Ok(seq_number),
+        other => Err(OutboundError::UnexpectedResponse(format!("{other:?}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::m2a_session::{NodeKey, Session, SessionBehaviour, Transport};
     use crate::rpc::codec::Deadlines;
-    use crate::testkit::{MetaDataReply, StatusPeer, StatusReply};
+    use crate::rpc::codec::ReadError;
+    use crate::testkit::{MetaDataReply, PingReply, StatusPeer, StatusReply};
     use consensus_types::primitives::B256;
     use consensus_types::Minimal;
+    use p2p_wire::rpc::codec::CodecError;
     use p2p_wire::rpc::codec::ContextTable;
-    use p2p_wire::rpc::messages::Ping;
     use std::sync::Arc;
 
     type E = Minimal;
@@ -373,7 +447,13 @@ mod tests {
         let peer = metadata_peer(MetaDataReply::Chunks(vec![canned.clone(), canned])).await;
         let mut session = connected(&peer).await;
         let err = metadata(session.swarm(), peer.id).await.unwrap_err();
-        assert!(matches!(err, OutboundError::Failure(_)), "{err}");
+        assert!(
+            matches!(
+                err,
+                OutboundError::InvalidResponse(ReadError::TooManyChunks { max: 1 })
+            ),
+            "{err:?}"
+        );
         assert!(err.to_string().contains("chunks"), "{err}");
     }
 
@@ -387,6 +467,91 @@ mod tests {
             matches!(&err, OutboundError::ErrorResponse { code: ResultCode::ResourceUnavailable, message } if message == "no"),
             "{err}"
         );
+    }
+
+    /// A peer serving Status, MetaData (the fixture's, `seq_number` 7) and, with `reply`, Ping.
+    async fn ping_peer(reply: PingReply) -> StatusPeer {
+        StatusPeer::spawn_with_ping(
+            Box::new(|req, _| StatusReply::Status(req.clone())),
+            Some(Box::new(|_| {
+                MetaDataReply::MetaData(p2p_wire::testkit::metadata())
+            })),
+            Some(Box::new(move |_, _| reply.clone())),
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn ping_roundtrip() {
+        let peer = ping_peer(PingReply::Ping(7)).await;
+        let mut session = connected(&peer).await;
+        assert_eq!(ping(session.swarm(), peer.id, 0).await.unwrap(), 7);
+        assert_eq!(peer.pings(), vec![0], "the peer received our seq_number");
+        // The answer is the seq_number of the MetaData the same connection serves.
+        let m = metadata(session.swarm(), peer.id).await.unwrap();
+        assert_eq!(m.seq_number, 7);
+        assert_eq!(peer.connections(), 1);
+
+        // 9 bytes: the declared length is above Ping's 8, refused before decoding.
+        let peer = ping_peer(PingReply::Ssz(vec![7, 0, 0, 0, 0, 0, 0, 0, 0])).await;
+        let mut session = connected(&peer).await;
+        let err = ping(session.swarm(), peer.id, 0).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OutboundError::InvalidResponse(ReadError::Codec(CodecError::PayloadTooLarge {
+                    len: 9,
+                    max: 8
+                }))
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("exceeds the bound 8"), "{err}");
+
+        // Two chunks on a single-response protocol: refused, nothing decoded is returned.
+        let peer = ping_peer(PingReply::Chunks(vec![7, 7])).await;
+        let mut session = connected(&peer).await;
+        let err = ping(session.swarm(), peer.id, 0).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OutboundError::InvalidResponse(ReadError::TooManyChunks { max: 1 })
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ping_error_chunk_fails() {
+        let reply = PingReply::Error(ResultCode::InvalidRequest, b"no".to_vec());
+        let peer = ping_peer(reply).await;
+        let mut session = connected(&peer).await;
+        let err = ping(session.swarm(), peer.id, 3).await.unwrap_err();
+        assert!(
+            matches!(&err, OutboundError::ErrorResponse { code: ResultCode::InvalidRequest, message } if message == "no"),
+            "{err}"
+        );
+        assert_eq!(peer.pings(), vec![3]);
+    }
+
+    #[test]
+    fn single_ping_refuses_other_shapes() {
+        let one = vec![ResponseChunk::<E>::Success(Response::Ping(Ping(9)))];
+        assert_eq!(single_ping(one).unwrap(), 9);
+        let status = vec![ResponseChunk::<E>::Success(Response::Status(ours()))];
+        assert!(matches!(
+            single_ping(status),
+            Err(OutboundError::UnexpectedResponse(_))
+        ));
+        let two = vec![
+            ResponseChunk::<E>::Success(Response::Ping(Ping(9))),
+            ResponseChunk::<E>::Success(Response::Ping(Ping(9))),
+        ];
+        assert!(matches!(
+            single_ping(two),
+            Err(OutboundError::UnexpectedResponse(_))
+        ));
     }
 
     #[test]
@@ -428,6 +593,37 @@ mod tests {
         assert!(matches!(
             single_status(two),
             Err(OutboundError::UnexpectedResponse(_))
+        ));
+    }
+
+    #[test]
+    fn outbound_failure_keeps_the_codecs_refusal_typed() {
+        use crate::rpc::codec::Deadline;
+        use request_response::OutboundFailure;
+        let io = |e: ReadError| OutboundFailure::Io(e.into());
+        assert!(matches!(
+            outbound_failure(io(ReadError::NoResponse)),
+            OutboundError::InvalidResponse(ReadError::NoResponse)
+        ));
+        // A passed deadline or a failed stream is not about the peer's bytes.
+        let late = outbound_failure(io(ReadError::Deadline(Deadline::Ttfb)));
+        assert!(
+            matches!(&late, OutboundError::Failure(m) if m.contains("Ttfb deadline passed")),
+            "{late}"
+        );
+        let reset = io(ReadError::Io(std::io::ErrorKind::ConnectionReset.into()));
+        assert!(matches!(outbound_failure(reset), OutboundError::Failure(_)));
+        let other = OutboundFailure::Io(std::io::Error::other("stream"));
+        assert!(
+            matches!(outbound_failure(other), OutboundError::Failure(m) if m.contains("stream"))
+        );
+        assert!(matches!(
+            outbound_failure(OutboundFailure::ConnectionClosed),
+            OutboundError::Disconnected
+        ));
+        assert!(matches!(
+            outbound_failure(OutboundFailure::Timeout),
+            OutboundError::Failure(_)
         ));
     }
 
