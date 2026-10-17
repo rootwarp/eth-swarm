@@ -1,4 +1,5 @@
-//! `m2a-session`: the pinned reference node's Status v2 probe (see `cl_p2p::m2a_session`).
+//! `m2a-session`: the pinned reference node's Status v2 and MetaData v3 probe (see
+//! `cl_p2p::m2a_session`).
 //!
 //! ```text
 //! m2a-session [--config <path>] [--dial-only | --print-peer-id] [--connect-timeout-secs <n>]
@@ -13,18 +14,20 @@
 //!   gate for the decoders this binary was built from ([`gate`]; `--gate-file`, default the
 //!   checkout's `fuzz/artifacts/m2a-gate.json`), and refuses before dialling without one. Then:
 //!   dial, send our Status v2 at the pinned Sepolia fork digest, judge the peer's against the
-//!   reference beacon API ([`reference_api`]), hold the connection and send a second Status.
-//!   One JSON line on stdout records it all.
+//!   reference beacon API ([`reference_api`]); request the peer's MetaData v3 on the same
+//!   connection and judge it against the node's `/eth/v1/node/identity` ([`metadata`]); hold
+//!   the connection and send a second Status. One JSON line per step on stdout records it all.
 //! - `--dial-only`: dial, check the pinned peer ID (Noise XX, then yamux), disconnect, exit.
 //!   No req/resp traffic, so no response decoder runs and no fuzz gate is needed.
 //! - `--print-peer-id`: print the node key's peer ID on stdout and exit, without dialling, so
 //!   the operator can list it as a trusted peer on the reference node. Needs `node_key`.
 //!
-//! Exit 0 on success (every probe verdict passed), 1 if the dial, the exchange or a verdict
+//! Exit 0 on success (every verdict of both steps passed), 1 if the dial, an exchange or a verdict
 //! fails, 2 on bad arguments, a refused config or a failed pre-flight.
 
 mod enr;
 mod gate;
+mod metadata;
 #[cfg(test)]
 mod mock_api;
 mod probe;
@@ -283,15 +286,18 @@ fn run(argv: impl Iterator<Item = String>, euid: u32, out: &mut dyn Write, env: 
                 hold: env.hold,
             };
             let report = probe::run(&mut session, &api, &probe).await;
-            if let Err(e) = writeln!(out, "{}", report.json_line()) {
-                tracing::error!(error = %e, "cannot write the session log line");
-                return EXIT_FAILED;
+            for line in report.json_lines() {
+                if let Err(e) = writeln!(out, "{line}") {
+                    tracing::error!(error = %e, "cannot write the session log line");
+                    return EXIT_FAILED;
+                }
             }
             return if report.passed() {
-                tracing::info!("status probe passed");
+                tracing::info!("status and metadata probes passed");
                 EXIT_CONNECTED
             } else {
-                tracing::error!(error = ?report.error, "status probe failed");
+                let metadata_error = report.metadata.as_ref().and_then(|m| m.error.as_ref());
+                tracing::error!(error = ?report.error, ?metadata_error, "probe failed");
                 EXIT_FAILED
             };
         }
@@ -322,9 +328,10 @@ mod tests {
     use super::*;
     use crate::gate::tests::{fixture_expected, passing_gate};
     use crate::mock_api::{MockApi, Route};
-    use cl_p2p::testkit::{StatusPeer, StatusReply};
+    use cl_p2p::testkit::{MetaDataReply, StatusPeer, StatusReply};
     use consensus_types::primitives::{Root, Slot};
-    use p2p_wire::rpc::messages::StatusV2;
+    use p2p_wire::rpc::messages::{MetaDataV3, StatusV2};
+    use p2p_wire::rpc::protocols::ResultCode;
     use serde_json::Value;
     use std::os::unix::fs::PermissionsExt;
 
@@ -627,6 +634,12 @@ mod tests {
         disconnect_after: Option<usize>,
         /// The ENR the identity endpoint serves.
         enr: &'static str,
+        /// The MetaData the identity endpoint serves, per request (the first is the ENR read).
+        identity: Vec<MetaDataV3>,
+        /// Raw identity bodies, per request, instead of `identity`.
+        identity_bodies: Option<Vec<String>>,
+        /// The peer's MetaData answer, per request.
+        metadata: Vec<MetaDataReply>,
         /// The gate file.
         gate: Value,
         /// The epoch of the clock at each reading; the last repeats.
@@ -640,30 +653,56 @@ mod tests {
                 peer: vec![peer],
                 disconnect_after: None,
                 enr: crate::enr::tests::ENR_GLOAS,
+                identity: vec![md(7)],
+                identity_bodies: None,
+                metadata: vec![MetaDataReply::MetaData(md(7))],
                 gate: passing_gate(&fixture_expected()),
                 clock: vec![EPOCH],
             }
         }
     }
 
+    /// The fixture MetaData at `seq_number`.
+    fn md(seq_number: u64) -> MetaDataV3 {
+        MetaDataV3 {
+            seq_number,
+            ..p2p_wire::testkit::metadata()
+        }
+    }
+
     struct Outcome {
         code: u8,
-        line: Option<Value>,
+        lines: Vec<Value>,
         peer: StatusPeer,
         api: MockApi,
     }
 
     impl Outcome {
+        fn event(&self, event: &str) -> Option<&Value> {
+            self.lines.iter().find(|l| l["event"] == event)
+        }
+
         fn verdict(&self, field: &str) -> bool {
-            let line = self.line.as_ref().expect("a log line");
-            line["verdicts"][field]["pass"]
-                .as_bool()
-                .unwrap_or_else(|| panic!("no verdict {field}: {line}"))
+            verdict_of(self.line(), field)
         }
 
         fn line(&self) -> &Value {
-            self.line.as_ref().expect("a log line")
+            self.event("m2a-status").expect("a Status log line")
         }
+
+        fn metadata_line(&self) -> &Value {
+            self.event("m2a-metadata").expect("a MetaData log line")
+        }
+
+        fn metadata_verdict(&self, field: &str) -> bool {
+            verdict_of(self.metadata_line(), field)
+        }
+    }
+
+    fn verdict_of(line: &Value, field: &str) -> bool {
+        line["verdicts"][field]["pass"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("no verdict {field}: {line}"))
     }
 
     async fn api_for(s: &Scenario) -> MockApi {
@@ -679,7 +718,12 @@ mod tests {
             ),
             (
                 "/eth/v1/node/identity".to_owned(),
-                Route::json(MockApi::identity_json(s.enr)),
+                Route::sequence(s.identity_bodies.clone().unwrap_or_else(|| {
+                    s.identity
+                        .iter()
+                        .map(|m| MockApi::identity_json(s.enr, m))
+                        .collect()
+                })),
             ),
             (
                 "/eth/v1/beacon/states/head/finality_checkpoints".to_owned(),
@@ -721,13 +765,17 @@ mod tests {
     /// Runs the binary's `run` against the scenario's peer and API.
     async fn probe(s: Scenario) -> Outcome {
         let statuses = s.peer.clone();
-        let peer = StatusPeer::spawn(
+        let metadata = s.metadata.clone();
+        let peer = StatusPeer::spawn_with_metadata(
             Box::new(move |req, n| {
                 StatusReply::Status(StatusV2 {
                     fork_digest: req.fork_digest,
                     ..statuses[n.min(statuses.len() - 1)].clone()
                 })
             }),
+            Some(Box::new(move |n| {
+                metadata[n.min(metadata.len() - 1)].clone()
+            })),
             s.disconnect_after,
         )
         .await;
@@ -757,18 +805,21 @@ mod tests {
         })
         .await
         .unwrap();
-        let lines: Vec<&str> = out.lines().collect();
-        assert!(lines.len() <= 1, "one JSON line at most: {out}");
-        let line = lines.first().map(|l| serde_json::from_str(l).unwrap());
+        let lines: Vec<Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(lines.len() <= 2, "one JSON line per step at most: {out}");
         Outcome {
             code,
-            line,
+            lines,
             peer,
             api,
         }
     }
 
     const FINALITY_PATH: &str = "/eth/v1/beacon/states/head/finality_checkpoints";
+    const IDENTITY_PATH: &str = "/eth/v1/node/identity";
 
     #[tokio::test(flavor = "multi_thread")]
     async fn matching_peer_passes() {
@@ -787,54 +838,248 @@ mod tests {
         assert_eq!(ours.head_root, root(F1.1));
         assert_eq!(ours.head_slot, finalized_slot(F1.0));
         assert_eq!(ours.earliest_available_slot, ours.head_slot);
-        // The first Status, then the second on the same connection.
+        // The first Status, the MetaData, then the second Status, all on one connection.
         assert_eq!(out.peer.requests().len(), 2);
+        assert_eq!(out.peer.metadata_requests(), 1);
         assert_eq!(out.peer.connections(), 1);
         assert_eq!(out.api.hits(FINALITY_PATH), 2, "sampled before and after");
+        assert_eq!(out.lines.len(), 2, "one line per step");
+        assert_eq!(out.metadata_line()["pass"], true);
+        for field in metadata::FIELDS {
+            assert!(
+                out.metadata_verdict(field),
+                "{field}: {}",
+                out.metadata_line()
+            );
+        }
+        // The ENR read, then the MetaData sampled before and after the request.
+        assert_eq!(out.api.hits(IDENTITY_PATH), 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn log_line_has_both_statuses_inputs_samples_and_verdicts() {
-        let eas = HEAD_SLOT - 100;
-        let out = probe(Scenario::new(peer_status(F1, 1, eas))).await;
-        let line = out.line();
-        assert_eq!(line["event"], "m2a-status");
+    async fn metadata_log_line_has_the_peers_metadata_both_samples_and_verdicts() {
+        let out = probe(Scenario::new(peer_status(F1, 0, 0))).await;
+        let line = out.metadata_line();
+        assert_eq!(line["event"], "m2a-metadata");
         assert_eq!(line["error"], Value::Null);
-        assert_eq!(line["ours"]["fork_digest"], "0x669e6c11");
-        assert_eq!(line["ours"]["finalized_epoch"], F1.0.to_string());
-        assert_eq!(line["peer"]["head_slot"], (HEAD_SLOT + 1).to_string());
-        assert_eq!(line["peer"]["earliest_available_slot"], eas.to_string());
-        assert_eq!(line["earliest_available_slot"], eas.to_string());
-        let inputs = &line["digest_inputs"];
-        assert_eq!(inputs["epoch"], EPOCH.to_string());
-        assert_eq!(inputs["fork"], "gloas");
-        assert_eq!(inputs["fork_version"], "0x90000076");
-        assert_eq!(inputs["blob_parameters"]["epoch"], "275712");
-        assert_eq!(inputs["blob_parameters"]["max_blobs_per_block"], "21");
-        assert_eq!(
-            inputs["genesis_validators_root"],
-            "0xd8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078"
-        );
-        assert_eq!(inputs["fork_digest"], "0x669e6c11");
-        assert_eq!(line["enr_fork_digest"], "0x669e6c11");
-        for sample in ["api_before", "api_after"] {
-            assert_eq!(line[sample]["finalized"]["epoch"], F1.0.to_string());
-            assert_eq!(line[sample]["head"]["slot"], HEAD_SLOT.to_string());
-            assert_eq!(
-                line[sample]["finalized_header"]["slot"],
-                finalized_slot(F1.0).to_string()
-            );
+        // The beacon API's encodings: decimal strings, 0x hex bitvectors.
+        let want = serde_json::json!({
+            "seq_number": "7",
+            "attnets": "0x0100000000000080",
+            "syncnets": "0x04",
+            "custody_group_count": "4",
+        });
+        for key in ["peer", "api_before", "api_after"] {
+            assert_eq!(line[key], want, "{key}");
         }
-        assert_eq!(line["finality_reruns"], 0);
+        assert_eq!(line["seq_number_reruns"], 0);
         let verdicts = line["verdicts"].as_object().unwrap();
         let mut names: Vec<&str> = verdicts.keys().map(String::as_str).collect();
         names.sort_unstable();
-        let mut want = probe::FIELDS.to_vec();
-        want.sort_unstable();
-        assert_eq!(names, want);
+        let mut fields = metadata::FIELDS.to_vec();
+        fields.sort_unstable();
+        assert_eq!(names, fields);
         for v in verdicts.values() {
             assert!(v["pass"].is_boolean() && v["detail"].is_string(), "{v}");
         }
+        assert!(!line.to_string().contains('\n'));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metadata_mismatch_fails() {
+        // The peer reports sync subnet 3 as well: one syncnets bit differs from the API's.
+        let mut theirs = md(7);
+        theirs.syncnets.set(3, true).unwrap();
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.metadata = vec![MetaDataReply::MetaData(theirs)];
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        assert_eq!(out.line()["pass"], true, "the Status step itself passed");
+        let line = out.metadata_line();
+        assert_eq!(line["pass"], false);
+        assert!(!out.metadata_verdict("syncnets"));
+        for field in ["seq_number", "attnets", "custody_group_count"] {
+            assert!(out.metadata_verdict(field), "{field}: {line}");
+        }
+        let detail = line["verdicts"]["syncnets"]["detail"].as_str().unwrap();
+        assert!(detail.contains("syncnets"), "{detail}");
+        assert!(
+            detail.contains("0x0c") && detail.contains("0x04"),
+            "{detail}"
+        );
+        assert_eq!(line["peer"]["syncnets"], "0x0c");
+        assert_eq!(line["api_after"]["syncnets"], "0x04");
+        // Every other field on its own, too.
+        for (field, theirs) in [
+            ("seq_number", md(8)),
+            (
+                "custody_group_count",
+                MetaDataV3 {
+                    custody_group_count: 8,
+                    ..md(7)
+                },
+            ),
+            ("attnets", {
+                let mut m = md(7);
+                m.attnets.set(1, true).unwrap();
+                m
+            }),
+        ] {
+            let mut s = Scenario::new(peer_status(F1, 0, 0));
+            s.metadata = vec![MetaDataReply::MetaData(theirs)];
+            let out = probe(s).await;
+            assert_eq!(out.code, EXIT_FAILED, "{field}");
+            assert!(!out.metadata_verdict(field), "{field}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metadata_seq_moved_reruns_once() {
+        // The node's seq_number moves between the samples (a subnet rotation): the request runs
+        // again, sampled after the newer one, and the peer (now at 8) matches it.
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.identity = vec![md(7), md(7), md(8), md(8)];
+        s.metadata = vec![
+            MetaDataReply::MetaData(md(7)),
+            MetaDataReply::MetaData(md(8)),
+        ];
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_CONNECTED, "{}", out.metadata_line());
+        let line = out.metadata_line();
+        assert_eq!(line["seq_number_reruns"], 1);
+        assert_eq!(line["api_before"]["seq_number"], "8");
+        assert_eq!(line["api_after"]["seq_number"], "8");
+        assert_eq!(line["peer"]["seq_number"], "8");
+        assert_eq!(out.peer.metadata_requests(), 2);
+        assert_eq!(out.api.hits(IDENTITY_PATH), 4);
+
+        // It moves again during the re-run: every field fails, no third request.
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.identity = vec![md(7), md(7), md(8), md(9)];
+        s.metadata = vec![
+            MetaDataReply::MetaData(md(7)),
+            MetaDataReply::MetaData(md(8)),
+        ];
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        let line = out.metadata_line();
+        assert_eq!(line["seq_number_reruns"], 1);
+        for field in metadata::FIELDS {
+            assert!(!out.metadata_verdict(field), "{field}");
+            let detail = line["verdicts"][field]["detail"].as_str().unwrap();
+            assert!(detail.contains("moved again"), "{detail}");
+        }
+        assert_eq!(line["api_before"]["seq_number"], "8");
+        assert_eq!(line["api_after"]["seq_number"], "9");
+        assert_eq!(out.peer.metadata_requests(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metadata_rerun_request_failure_logs_only_the_rerun() {
+        // seq_number moves (7 -> 8), and the re-run's request fails: the line holds the re-run's
+        // sample before it and nothing from the first attempt.
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.identity = vec![md(7), md(7), md(8)];
+        s.metadata = vec![
+            MetaDataReply::MetaData(md(7)),
+            MetaDataReply::Error(ResultCode::ServerError, b"busy".to_vec()),
+        ];
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        let line = out.metadata_line();
+        assert_eq!(line["seq_number_reruns"], 1);
+        let error = line["error"].as_str().unwrap();
+        assert!(error.starts_with("metadata request:"), "{error}");
+        assert_eq!(line["api_before"]["seq_number"], "8");
+        assert_eq!(line["peer"], Value::Null, "not the first attempt's: {line}");
+        assert_eq!(
+            line["api_after"],
+            Value::Null,
+            "not the first attempt's: {line}"
+        );
+        assert_eq!(out.peer.metadata_requests(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metadata_rerun_sample_failure_logs_only_the_rerun() {
+        // seq_number moves (7 -> 8), and the re-run's sample after the request is malformed: the
+        // line holds the re-run's sample before and its peer MetaData, and no sample after.
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        let body = |m: &MetaDataV3| MockApi::identity_json(s.enr, m);
+        let bad = body(&md(9)).replace("0x0100000000000080", "0x01");
+        s.identity_bodies = Some(vec![body(&md(7)), body(&md(7)), body(&md(8)), bad]);
+        s.metadata = vec![
+            MetaDataReply::MetaData(md(7)),
+            MetaDataReply::MetaData(md(8)),
+        ];
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        let line = out.metadata_line();
+        assert_eq!(line["seq_number_reruns"], 1);
+        let error = line["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("MetaData sample:") && error.contains("attnets"),
+            "{error}"
+        );
+        assert_eq!(line["api_before"]["seq_number"], "8");
+        assert_eq!(
+            line["peer"]["seq_number"], "8",
+            "the re-run's answer: {line}"
+        );
+        assert_eq!(
+            line["api_after"],
+            Value::Null,
+            "not the first attempt's: {line}"
+        );
+        assert_eq!(out.api.hits(IDENTITY_PATH), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metadata_request_failure_fails_the_step_only() {
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        s.metadata = vec![MetaDataReply::Error(
+            ResultCode::ServerError,
+            b"busy".to_vec(),
+        )];
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        let line = out.metadata_line();
+        assert_eq!(line["pass"], false);
+        let error = line["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("metadata request:") && error.contains("busy"),
+            "{error}"
+        );
+        assert_eq!(
+            line["api_before"]["seq_number"], "7",
+            "sampled before the request"
+        );
+        assert_eq!(line["peer"], Value::Null);
+        // The connection check still ran, on the same connection.
+        assert_eq!(out.line()["pass"], true);
+        assert!(out.verdict("connection"));
+        assert_eq!(out.peer.connections(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_identity_metadata_fails_the_step() {
+        // The ENR read is lenient; the MetaData sample is not: attnets is one byte, not eight.
+        let mut s = Scenario::new(peer_status(F1, 0, 0));
+        let valid = MockApi::identity_json(s.enr, &md(7));
+        s.identity_bodies = Some(vec![
+            valid.clone(),
+            valid.replace("0x0100000000000080", "0x01"),
+        ]);
+        let out = probe(s).await;
+        assert_eq!(out.code, EXIT_FAILED);
+        assert_eq!(out.line()["pass"], true);
+        let error = out.metadata_line()["error"].as_str().unwrap();
+        assert!(error.contains("attnets"), "{error}");
+        assert_eq!(
+            out.peer.metadata_requests(),
+            0,
+            "no request without a sample"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -959,7 +1204,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn status_then_disconnect_fails() {
         let mut s = Scenario::new(peer_status(F1, 0, 0));
-        s.disconnect_after = Some(1);
+        // Answers the Status and the MetaData, then closes the connection.
+        s.disconnect_after = Some(2);
         let out = probe(s).await;
         assert_eq!(out.code, EXIT_FAILED);
         assert!(!out.verdict("connection"));
@@ -992,14 +1238,19 @@ mod tests {
                 ..peer_status(F1, 0, 0)
             },
         ];
-        let peer = StatusPeer::spawn(
+        // It serves MetaData too: the MetaData step runs between the two Status exchanges.
+        let metadata = s.metadata[0].clone();
+        let peer = StatusPeer::spawn_with_metadata(
             Box::new(move |_, n| StatusReply::Status(statuses[n.min(1)].clone())),
+            Some(Box::new(move |_| metadata.clone())),
             None,
         )
         .await;
         let out = probe_with_peer(s, peer).await;
         assert_eq!(out.code, EXIT_CONNECTED, "{}", out.line());
         assert!(out.verdict("connection"));
+        assert_eq!(out.metadata_line()["pass"], true);
+        assert_eq!(out.peer.metadata_requests(), 1);
         let requests = out.peer.requests();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].fork_digest, BPO2);
@@ -1080,7 +1331,7 @@ mod tests {
         for s in [stale, short, crashed] {
             let out = probe(s).await;
             assert_eq!(out.code, EXIT_REFUSED);
-            assert!(out.line.is_none(), "refused before the session");
+            assert!(out.lines.is_empty(), "refused before the session");
             assert_eq!(out.peer.connections(), 0, "refused before dialling");
             assert!(out.api.seen().is_empty(), "and before the API");
         }

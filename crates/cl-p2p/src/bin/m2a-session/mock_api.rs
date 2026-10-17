@@ -9,6 +9,7 @@ use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
+use p2p_wire::rpc::messages::MetaDataV3;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -149,12 +150,17 @@ impl MockApi {
         )
     }
 
-    /// A `/eth/v1/node/identity` body.
-    pub fn identity_json(enr: &str) -> String {
+    /// A `/eth/v1/node/identity` body with `metadata`, encoded as the beacon API does.
+    pub fn identity_json(enr: &str, metadata: &MetaDataV3) -> String {
+        let hex = |b: &[u8]| b.iter().map(|b| format!("{b:02x}")).collect::<String>();
         format!(
             r#"{{"data":{{"peer_id":"16Uiu2HAm","enr":"{enr}","p2p_addresses":[],
-            "discovery_addresses":[],"metadata":{{"seq_number":"1","attnets":"0x00",
-            "syncnets":"0x00","custody_group_count":"4"}}}}}}"#
+            "discovery_addresses":[],"metadata":{{"seq_number":"{seq}","attnets":"0x{att}",
+            "syncnets":"0x{sync}","custody_group_count":"{cgc}"}}}}}}"#,
+            seq = metadata.seq_number,
+            att = hex(metadata.attnets.as_slice()),
+            sync = hex(metadata.syncnets.as_slice()),
+            cgc = metadata.custody_group_count,
         )
     }
 }

@@ -10,6 +10,13 @@
 //! bodies buffered under [`MAX_JSON_BYTES`], one deadline per request. Integers are decimal
 //! strings and roots `0x` + 64 hex digits, as the beacon API specifies; anything else is
 //! refused.
+//!
+//! [`ReferenceApi::node_identity`] reads the node's own MetaData from `/eth/v1/node/identity`
+//! into the same [`MetaDataV3`] the peer sends, so the two compare as typed values:
+//! `seq_number` and `custody_group_count` are decimal strings, `attnets` is `0x` + 16 hex
+//! digits (`Bitvector[64]`, 8 bytes) and `syncnets` `0x` + 2 hex digits (`Bitvector[4]`, 1
+//! byte, whose upper 4 padding bits must be zero), as SSZ lays the bits out: bit `i` is bit
+//! `i % 8` of byte `i / 8` (`altair/p2p-interface.md` L132–151).
 
 use bytes::Bytes;
 use cl_p2p::m2a_session::config::ReferenceApiUrl;
@@ -18,6 +25,7 @@ use http::header::{ACCEPT, HOST, USER_AGENT};
 use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Empty, Limited};
 use hyper_util::rt::TokioIo;
+use p2p_wire::rpc::messages::MetaDataV3;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -134,14 +142,132 @@ struct IdentityData {
     enr: String,
 }
 
+/// `/eth/v1/node/identity`, with the node's MetaData.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeIdentity {
+    /// The node's libp2p peer ID, as text.
+    pub peer_id: String,
+    /// The node's ENR, as text.
+    pub enr: String,
+    /// Its libp2p addresses.
+    pub p2p_addresses: Vec<String>,
+    /// Its discv5 addresses.
+    pub discovery_addresses: Vec<String>,
+    /// Its MetaData, typed as the peer's is.
+    pub metadata: MetaDataV3,
+}
+
+#[derive(Deserialize)]
+struct FullIdentityData {
+    peer_id: String,
+    enr: String,
+    p2p_addresses: Vec<String>,
+    discovery_addresses: Vec<String>,
+    metadata: MetaDataJson,
+}
+
+/// `data.metadata`, checked field by field; every error names its field.
+#[derive(Deserialize)]
+struct MetaDataJson {
+    #[serde(deserialize_with = "seq_number")]
+    seq_number: u64,
+    #[serde(deserialize_with = "attnets")]
+    attnets: [u8; ATTNETS_BYTES],
+    #[serde(deserialize_with = "syncnets")]
+    syncnets: [u8; SYNCNETS_BYTES],
+    #[serde(deserialize_with = "custody_group_count")]
+    custody_group_count: u64,
+}
+
+/// `attnets`: `Bitvector[ATTESTATION_SUBNET_COUNT]`, 64 bits.
+const ATTNETS_BYTES: usize = 8;
+/// `syncnets`: `Bitvector[SYNC_COMMITTEE_SUBNET_COUNT]`, 4 bits in one byte.
+const SYNCNETS_BYTES: usize = 1;
+
+/// Deserializes a string and parses it with `parse`; any error is prefixed with `field`.
+fn field<'de, D, T>(
+    d: D,
+    field: &str,
+    parse: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let named = |e: &dyn std::fmt::Display| serde::de::Error::custom(format!("{field}: {e}"));
+    let s = String::deserialize(d).map_err(|e| named(&e))?;
+    parse(&s).map_err(|e| named(&e))
+}
+
+fn decimal_u64(s: &str) -> Result<u64, String> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("{s:?} is not a decimal u64"));
+    }
+    s.parse().map_err(|e| format!("{s:?}: {e}"))
+}
+
+fn hex_bytes<const N: usize>(s: &str) -> Result<[u8; N], String> {
+    parse_hex::<N>(s).ok_or_else(|| format!("{s:?} is not 0x and {} hex digits", 2 * N))
+}
+
+fn seq_number<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    field(d, "seq_number", decimal_u64)
+}
+
+fn custody_group_count<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    field(d, "custody_group_count", decimal_u64)
+}
+
+fn attnets<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; ATTNETS_BYTES], D::Error> {
+    field(d, "attnets", hex_bytes)
+}
+
+fn syncnets<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; SYNCNETS_BYTES], D::Error> {
+    field(d, "syncnets", hex_bytes)
+}
+
+/// Sets `bits` (`len` of them) from SSZ bytes; a set bit at `len` or above is an error.
+fn set_bits(
+    name: &str,
+    bytes: &[u8],
+    len: usize,
+    mut set: impl FnMut(usize, bool) -> bool,
+) -> Result<(), String> {
+    for i in 0..bytes.len() * 8 {
+        let bit = bytes[i / 8] >> (i % 8) & 1 == 1;
+        if i >= len {
+            if bit {
+                return Err(format!("{name}: padding bit {i} is set (Bitvector[{len}])"));
+            }
+        } else if !set(i, bit) {
+            return Err(format!("{name}: bit {i} out of range"));
+        }
+    }
+    Ok(())
+}
+
+impl MetaDataJson {
+    fn into_metadata(self) -> Result<MetaDataV3, String> {
+        let mut m = MetaDataV3 {
+            seq_number: self.seq_number,
+            attnets: Default::default(),
+            syncnets: Default::default(),
+            custody_group_count: self.custody_group_count,
+        };
+        let len = m.attnets.len();
+        set_bits("attnets", &self.attnets, len, |i, b| {
+            m.attnets.set(i, b).is_ok()
+        })?;
+        let len = m.syncnets.len();
+        set_bits("syncnets", &self.syncnets, len, |i, b| {
+            m.syncnets.set(i, b).is_ok()
+        })?;
+        Ok(m)
+    }
+}
+
 fn quoted_u64<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
     let s = String::deserialize(d)?;
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(serde::de::Error::custom(format!(
-            "{s:?} is not a decimal u64"
-        )));
-    }
-    s.parse().map_err(serde::de::Error::custom)
+    decimal_u64(&s).map_err(serde::de::Error::custom)
 }
 
 /// `0x` and exactly `2 * N` hex digits.
@@ -233,6 +359,27 @@ impl ReferenceApi {
     pub async fn identity_enr(&self) -> Result<String, ApiError> {
         let d: Data<IdentityData> = self.get_json("/eth/v1/node/identity").await?;
         Ok(d.data.enr)
+    }
+
+    /// `GET /eth/v1/node/identity`, with `data.metadata` parsed strictly into [`MetaDataV3`].
+    pub async fn node_identity(&self) -> Result<NodeIdentity, ApiError> {
+        const PATH: &str = "/eth/v1/node/identity";
+        let d: Data<FullIdentityData> = self.get_json(PATH).await?;
+        let metadata = d
+            .data
+            .metadata
+            .into_metadata()
+            .map_err(|reason| ApiError::BadResponse {
+                path: PATH.to_owned(),
+                reason,
+            })?;
+        Ok(NodeIdentity {
+            peer_id: d.data.peer_id,
+            enr: d.data.enr,
+            p2p_addresses: d.data.p2p_addresses,
+            discovery_addresses: d.data.discovery_addresses,
+            metadata,
+        })
     }
 
     /// `GET /eth/v1/beacon/states/head/finality_checkpoints`: the finalized checkpoint.
@@ -406,6 +553,128 @@ mod tests {
         let seen = api.seen();
         assert_eq!(seen[0].1["accept"], "application/json");
         assert_eq!(seen[0].1["host"], api.addr.to_string());
+    }
+
+    /// Mirrors the `/eth/v1/node/identity` example of beacon-APIs `01e99a6`: its shape (`peer_id`,
+    /// `enr`, `p2p_addresses`, `discovery_addresses`, `metadata`) and encodings (decimal-string
+    /// integers, `0x` hex bitvectors), with Fulu's `custody_group_count`.
+    const IDENTITY_EXAMPLE: &str = r#"{
+      "data": {
+        "peer_id": "QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N",
+        "enr": "enr:-IS4QHCYrYZbAKWCBRlAy5zzaDZXJBGkcnh4MHcBFZntXNFrdvJjX04jRzjzCBOonrkTfj499SZuOh8R33Ls8RRcy5wBgmlkgnY0gmlwhH8AAAGJc2VjcDI1NmsxoQPKY0yuDUmstAHYpMa2_oxVtw0RW_QAdpzBQA8yWM0xOIN1ZHCCdl8",
+        "p2p_addresses": ["/ip4/7.7.7.7/tcp/4242/p2p/QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N"],
+        "discovery_addresses": ["/ip4/7.7.7.7/udp/30303/p2p/QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N"],
+        "metadata": {
+          "seq_number": "1",
+          "attnets": "0x0000000000000001",
+          "syncnets": "0x0f",
+          "custody_group_count": "4"
+        }
+      }
+    }"#;
+
+    /// `IDENTITY_EXAMPLE` with `metadata.<field>` replaced by `value` (a JSON literal).
+    fn identity_with(field: &str, value: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(IDENTITY_EXAMPLE).unwrap();
+        v["data"]["metadata"][field] = serde_json::from_str(value).unwrap();
+        v.to_string()
+    }
+
+    async fn identity_of(body: String) -> Result<NodeIdentity, ApiError> {
+        let api = MockApi::start(vec![("/eth/v1/node/identity", Route::json(body))]).await;
+        client(&api).node_identity().await
+    }
+
+    #[tokio::test]
+    async fn identity_metadata_parse() {
+        let id = identity_of(IDENTITY_EXAMPLE.to_owned()).await.unwrap();
+        assert_eq!(id.peer_id, "QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N");
+        assert!(
+            id.enr.starts_with("enr:-IS4QHCYrYZbAKWCBRlAy5zzaDZ"),
+            "{}",
+            id.enr
+        );
+        assert_eq!(
+            id.p2p_addresses,
+            ["/ip4/7.7.7.7/tcp/4242/p2p/QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N"]
+        );
+        assert_eq!(
+            id.discovery_addresses,
+            ["/ip4/7.7.7.7/udp/30303/p2p/QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N"]
+        );
+        let m = &id.metadata;
+        assert_eq!(m.seq_number, 1);
+        // SSZ bit order: bit i is bit i % 8 of byte i / 8, so the last byte's low bit is 56.
+        let attnets: Vec<usize> = (0..64).filter(|&i| m.attnets.get(i).unwrap()).collect();
+        assert_eq!(attnets, [56]);
+        let syncnets: Vec<usize> = (0..4).filter(|&i| m.syncnets.get(i).unwrap()).collect();
+        assert_eq!(syncnets, [0, 1, 2, 3]);
+        assert_eq!(m.custody_group_count, 4);
+
+        // The typed value equals the wire fixture's: compared as bits, not as strings.
+        let fixture = p2p_wire::testkit::metadata();
+        let body = identity_with("attnets", r#""0x0100000000000080""#);
+        let body = {
+            let mut v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            v["data"]["metadata"]["seq_number"] = "7".into();
+            v["data"]["metadata"]["syncnets"] = "0x04".into();
+            v.to_string()
+        };
+        assert_eq!(identity_of(body).await.unwrap().metadata, fixture);
+        let upper = identity_with("attnets", r#""0x0100000000000080""#.to_uppercase().as_str());
+        assert!(identity_of(upper).await.is_err(), "0X is not 0x");
+    }
+
+    #[tokio::test]
+    async fn identity_metadata_is_parsed_strictly() {
+        let bad = [
+            // attnets: 8 bytes exactly.
+            ("attnets", r#""0x00000000000000""#),
+            ("attnets", r#""0x000000000000000000""#),
+            ("attnets", r#""0000000000000000""#),
+            ("attnets", r#""0x000000000000000g""#),
+            ("attnets", "0"),
+            // syncnets: 1 byte, and the 4 bits above Bitvector[4] are padding: zero.
+            ("syncnets", r#""0x""#),
+            ("syncnets", r#""0x0000""#),
+            ("syncnets", r#""0x10""#),
+            ("syncnets", r#""0x80""#),
+            // Decimal strings only.
+            ("seq_number", "1"),
+            ("seq_number", r#""0x1""#),
+            ("seq_number", r#""-1""#),
+            ("seq_number", r#""18446744073709551616""#),
+            ("custody_group_count", r#""""#),
+            ("custody_group_count", "null"),
+        ];
+        for (field, value) in bad {
+            let err = identity_of(identity_with(field, value)).await.unwrap_err();
+            assert!(
+                matches!(err, ApiError::BadResponse { .. }),
+                "{field} {value}: {err}"
+            );
+            assert!(err.to_string().contains(field), "{field} {value}: {err}");
+        }
+        // Upper-case hex digits are hex; the upper bound of u64 is a u64.
+        let ok = identity_with("attnets", r#""0xFF000000000000AB""#);
+        let m = identity_of(ok).await.unwrap().metadata;
+        assert!(m.attnets.get(0).unwrap() && m.attnets.get(63).unwrap());
+        let ok = identity_with("seq_number", r#""18446744073709551615""#);
+        assert_eq!(identity_of(ok).await.unwrap().metadata.seq_number, u64::MAX);
+        // Every metadata field is required.
+        for field in ["seq_number", "attnets", "syncnets", "custody_group_count"] {
+            let mut v: serde_json::Value = serde_json::from_str(IDENTITY_EXAMPLE).unwrap();
+            v["data"]["metadata"].as_object_mut().unwrap().remove(field);
+            assert!(identity_of(v.to_string()).await.is_err(), "no {field}");
+        }
+        // No metadata at all: the ENR still reads, the identity does not.
+        let api = MockApi::start(vec![(
+            "/eth/v1/node/identity",
+            Route::json(r#"{"data":{"peer_id":"16U","enr":"enr:abc","p2p_addresses":[]}}"#),
+        )])
+        .await;
+        assert_eq!(client(&api).identity_enr().await.unwrap(), "enr:abc");
+        assert!(client(&api).node_identity().await.is_err());
     }
 
     #[tokio::test]

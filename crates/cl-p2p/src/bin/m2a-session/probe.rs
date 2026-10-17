@@ -24,8 +24,13 @@
 //! - `earliest_available_slot`: the peer's, from its Status v2, at most its `head_slot`;
 //! - `connection`: the peer accepted us: the connection is still up [`HOLD`] after the
 //!   exchange and a second Status on it succeeds.
+//!
+//! **MetaData**: once the handshake passed, the MetaData step ([`metadata`]) runs on the same
+//! connection, before the hold, with its own verdicts and log line. The session passes only if
+//! both steps do ([`Report::passed`]).
 
 use crate::enr;
+use crate::metadata::{self, MetaDataReport};
 use crate::reference_api::{Checkpoint, Header, ReferenceApi};
 use cl_p2p::m2a_session::{Session, SessionError};
 use cl_p2p::rpc::outbound::{self, OutboundError};
@@ -121,9 +126,12 @@ pub struct Report {
     pub verdicts: Vec<(&'static str, Verdict)>,
     /// Why the probe stopped early.
     pub error: Option<String>,
+    /// The MetaData step, once the handshake passed.
+    pub metadata: Option<MetaDataReport>,
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// `0x` and the lower-case hex digits of `bytes`.
+pub fn hex(bytes: &[u8]) -> String {
     let digits: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     format!("0x{digits}")
 }
@@ -166,19 +174,32 @@ fn inputs_json(i: &DigestInputs) -> Value {
 }
 
 impl Report {
-    /// Whether every field in [`FIELDS`] has a passing verdict and nothing failed early.
-    pub fn passed(&self) -> bool {
+    /// Whether the Status step passed: every field in [`FIELDS`] has a passing verdict and
+    /// nothing failed early.
+    pub fn status_passed(&self) -> bool {
         self.error.is_none()
             && FIELDS
                 .iter()
                 .all(|f| self.verdicts.iter().any(|(name, v)| name == f && v.pass))
     }
 
+    /// Whether the session passed: the Status step and the MetaData step.
+    pub fn passed(&self) -> bool {
+        self.status_passed() && self.metadata.as_ref().is_some_and(MetaDataReport::passed)
+    }
+
+    /// The session log: one JSON line per step that ran, Status first.
+    pub fn json_lines(&self) -> Vec<String> {
+        let mut lines = vec![self.json_line()];
+        lines.extend(self.metadata.as_ref().map(MetaDataReport::json_line));
+        lines
+    }
+
     fn verdict(&mut self, name: &'static str, pass: bool, detail: String) {
         self.verdicts.push((name, Verdict { pass, detail }));
     }
 
-    /// The session log line: one JSON object, no newline inside.
+    /// The Status step's log line: one JSON object, no newline inside.
     pub fn json_line(&self) -> String {
         let verdicts: serde_json::Map<String, Value> = self
             .verdicts
@@ -192,7 +213,7 @@ impl Report {
             .collect();
         json!({
             "event": "m2a-status",
-            "pass": self.passed(),
+            "pass": self.status_passed(),
             "error": self.error,
             "ours": self.ours.as_ref().map(status_json),
             "peer": self.peer.as_ref().map(status_json),
@@ -407,6 +428,7 @@ async fn steps<E: EthSpec>(
         );
         return Ok(());
     }
+    report.metadata = Some(metadata::run(session, api).await);
     let connection = match hold(session, probe.hold).await {
         Err(e) => Err(e),
         Ok(()) => second_status(session, probe, &after).await,

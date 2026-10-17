@@ -19,12 +19,14 @@
 //!   its subscriber) captures every log line of a session and checks that no key material is
 //!   in it.
 //! - **Req/resp**: one outbound-only [`request_response`] behaviour per protocol
-//!   ([`crate::rpc`]). Status goes out through [`crate::rpc::outbound::status`]; later work
-//!   sends MetaData, Ping and BlocksByRange.
+//!   ([`crate::rpc`]). Status goes out through [`crate::rpc::outbound::status`] and MetaData
+//!   through [`Session::request_metadata`], which keeps the peer's MetaData (its `seq_number`
+//!   for Ping); later work sends Ping and BlocksByRange.
 
 pub mod config;
 
 use crate::rpc::codec::{Deadlines, RpcCodec};
+use crate::rpc::outbound::OutboundError;
 use crate::rpc::outbound_behaviour;
 use consensus_types::EthSpec;
 use futures::StreamExt;
@@ -36,6 +38,7 @@ use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{DialError, NetworkBehaviour, SwarmEvent};
 use libp2p::{noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
 use p2p_wire::rpc::codec::ContextTable;
+use p2p_wire::rpc::messages::MetaDataV3;
 use p2p_wire::rpc::protocols::Protocol;
 use std::fmt;
 use std::fs::File;
@@ -304,6 +307,21 @@ impl<E: EthSpec> crate::rpc::outbound::StatusRpc<E> for SessionBehaviour<E> {
     }
 }
 
+impl<E: EthSpec> crate::rpc::outbound::MetaDataRpc<E> for SessionBehaviour<E> {
+    fn metadata_rpc(&mut self) -> &mut request_response::Behaviour<RpcCodec<E>> {
+        &mut self.metadata
+    }
+
+    fn metadata_event(
+        event: SessionBehaviourEvent<E>,
+    ) -> Option<crate::rpc::outbound::RpcEvent<E>> {
+        match event {
+            SessionBehaviourEvent::Metadata(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 /// The transport a session runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
@@ -420,10 +438,12 @@ fn memory_transport(key: &Keypair) -> TransportResult {
         .boxed())
 }
 
-/// A running session: the swarm and its pinned peer.
+/// A running session: the swarm, its pinned peer and what the peer told us.
 pub struct Session<E: EthSpec> {
     swarm: Swarm<SessionBehaviour<E>>,
     pinned: PinnedPeer,
+    /// The peer's last decoded MetaData; its `seq_number` is what a Ping must carry.
+    peer_metadata: Option<MetaDataV3>,
 }
 
 impl<E: EthSpec> Session<E> {
@@ -446,7 +466,11 @@ impl<E: EthSpec> Session<E> {
             peer: pinned.peer_id,
             reason: e.to_string(),
         })?;
-        Ok(Self { swarm, pinned })
+        Ok(Self {
+            swarm,
+            pinned,
+            peer_metadata: None,
+        })
     }
 
     /// The swarm, for the req/resp work that follows the connection.
@@ -457,6 +481,20 @@ impl<E: EthSpec> Session<E> {
     /// The pinned peer.
     pub fn pinned(&self) -> &PinnedPeer {
         &self.pinned
+    }
+
+    /// Requests the pinned peer's MetaData v3 ([`crate::rpc::outbound::metadata`]) and keeps
+    /// it as [`Session::peer_metadata`]. A failed request keeps the previous one.
+    pub async fn request_metadata(&mut self) -> Result<MetaDataV3, OutboundError> {
+        let peer = self.pinned.peer_id;
+        let m = crate::rpc::outbound::metadata(&mut self.swarm, peer).await?;
+        self.peer_metadata = Some(m.clone());
+        Ok(m)
+    }
+
+    /// The peer's last MetaData from [`Session::request_metadata`]; `None` before the first.
+    pub fn peer_metadata(&self) -> Option<&MetaDataV3> {
+        self.peer_metadata.as_ref()
     }
 
     /// Connections the swarm has established and not yet closed.
@@ -812,5 +850,31 @@ mod tests {
         let err = session.connect().await.unwrap_err();
         assert!(err.to_string().contains("denied"), "{err}");
         assert!(!session.swarm().is_connected(&other));
+    }
+
+    #[tokio::test]
+    async fn session_keeps_the_peers_metadata() {
+        use crate::testkit::{MetaDataReply, StatusPeer, StatusReply};
+        let canned = p2p_wire::testkit::metadata();
+        let reply = canned.clone();
+        let peer = StatusPeer::spawn_with_metadata(
+            Box::new(|req, _| StatusReply::Status(req.clone())),
+            Some(Box::new(move |_| MetaDataReply::MetaData(reply.clone()))),
+            None,
+        )
+        .await;
+        let mut session = Session::<E>::start(
+            NodeKey::ephemeral(),
+            peer.pinned(),
+            Arc::new(ContextTable::new()),
+            Deadlines::default(),
+            Transport::Tcp,
+        )
+        .unwrap();
+        assert_eq!(session.peer_metadata(), None, "nothing before the request");
+        session.connect().await.unwrap();
+        assert_eq!(session.request_metadata().await.unwrap(), canned);
+        assert_eq!(session.peer_metadata(), Some(&canned));
+        assert_eq!(session.peer_metadata().map(|m| m.seq_number), Some(7));
     }
 }

@@ -85,15 +85,20 @@ Then: dial; check the reference API's `/eth/v1/beacon/genesis` against the pinne
 genesis; read the `eth2` digest of the node's ENR (`/eth/v1/node/identity`); sample the API
 (finalized checkpoint, its block, the head); send our Status v2 at
 `compute_fork_digest(genesis_validators_root, current_epoch)`; sample again (once more, with
-a fresh Status, if finality moved in between); judge the peer's Status; hold the connection
-10 s and send a second Status on it (built afresh, so a hold across a digest boundary sends the
-new digest).
+a fresh Status, if finality moved in between); judge the peer's Status. On the same
+connection: sample the node's MetaData (`/eth/v1/node/identity`), request the peer's MetaData
+v3, sample again (once more if `seq_number` moved in between), and judge it field by field.
+Then hold the connection 10 s and send a second Status on it (built afresh, so a hold across a
+digest boundary sends the new digest).
 
-One JSON line on stdout records both Status values, the digest inputs (epoch, fork, fork
-version, blob parameters, genesis validators root), the ENR digest, both API samples, the peer's
-`earliest_available_slot` and a verdict per field (`genesis`, `fork_digest`, `enr_fork_digest`,
-`finalized_root`, `finalized_epoch`, `head_root`, `head_slot`, `earliest_available_slot`,
-`connection`). Exit 0 only if every verdict passed.
+One JSON line per step on stdout. The `m2a-status` line records both Status values, the digest
+inputs (epoch, fork, fork version, blob parameters, genesis validators root), the ENR digest,
+both API samples, the peer's `earliest_available_slot` and a verdict per field (`genesis`,
+`fork_digest`, `enr_fork_digest`, `finalized_root`, `finalized_epoch`, `head_root`,
+`head_slot`, `earliest_available_slot`, `connection`). The `m2a-metadata` line records the
+peer's MetaData, both API samples (in the beacon API's encoding: decimal strings, `0x` hex
+bitvectors), the re-run count and a verdict per field (`seq_number`, `attnets`, `syncnets`,
+`custody_group_count`). Exit 0 only if every verdict of both steps passed.
 
 ### Dial check
 

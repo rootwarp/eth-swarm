@@ -6,6 +6,12 @@
 //! and the exchange fails ([`OutboundError::ForkDigestMismatch`], which carries the peer's
 //! Status for the log). `fulu/p2p-interface.md` L538–571 defines Status v2 (the added
 //! `earliest_available_slot`); judging the other fields is the caller's business.
+//!
+//! [`metadata`] requests the peer's MetaData v3 on `/eth2/beacon_chain/req/metadata/3/ssz_snappy`
+//! (`fulu/p2p-interface.md` "GetMetaData v3", L778–794, type L269–288): the request is empty
+//! (the codec writes nothing and `request_response` closes the write half), and the response is
+//! exactly one success chunk. The codec already refuses a second chunk; [`single_metadata`]
+//! checks the count again on what it decoded.
 
 use crate::rpc::codec::RpcCodec;
 use consensus_types::EthSpec;
@@ -13,7 +19,7 @@ use futures::StreamExt;
 use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{PeerId, Swarm};
-use p2p_wire::rpc::messages::{ForkDigest, StatusV2};
+use p2p_wire::rpc::messages::{ForkDigest, MetaDataV3, StatusV2};
 use p2p_wire::rpc::protocols::{Request, Response, ResponseChunk, ResultCode};
 
 /// One event of an outbound `request_response` behaviour.
@@ -26,6 +32,15 @@ pub trait StatusRpc<E: EthSpec>: NetworkBehaviour {
 
     /// The Status behaviour's event inside `event`, or `None` for another behaviour's.
     fn status_event(event: Self::ToSwarm) -> Option<RpcEvent<E>>;
+}
+
+/// A behaviour with a MetaData v3 `request_response` behaviour inside.
+pub trait MetaDataRpc<E: EthSpec>: NetworkBehaviour {
+    /// The MetaData v3 behaviour.
+    fn metadata_rpc(&mut self) -> &mut request_response::Behaviour<RpcCodec<E>>;
+
+    /// The MetaData behaviour's event inside `event`, or `None` for another behaviour's.
+    fn metadata_event(event: Self::ToSwarm) -> Option<RpcEvent<E>>;
 }
 
 /// Why an outbound exchange failed.
@@ -51,7 +66,7 @@ pub enum OutboundError {
         /// The peer's message, lossily UTF-8.
         message: String,
     },
-    /// The response was not one Status chunk.
+    /// The response was not one chunk of the requested message.
     #[error("unexpected response: {0}")]
     UnexpectedResponse(String),
     /// `request_response` reported the request failed (dial, timeout, stream, codec).
@@ -95,7 +110,7 @@ where
         .behaviour_mut()
         .status_rpc()
         .send_request(&peer, Request::Status(ours.clone()));
-    let chunks = wait_for_response::<E, B>(swarm, id).await?;
+    let chunks = wait_for_response(swarm, id, B::status_event).await?;
     let theirs = single_status(chunks)?;
     if theirs.fork_digest != ours.fork_digest {
         return Err(OutboundError::ForkDigestMismatch {
@@ -106,20 +121,38 @@ where
     Ok(theirs)
 }
 
-/// Drives `swarm` until request `id` has a response or fails. A closed connection is not
-/// judged here: `request_response` fails every request still pending on it
-/// (`OutboundFailure::ConnectionClosed`), and a response that arrived first is delivered first.
+/// Requests `peer`'s MetaData v3 and drives `swarm` until it arrives or the exchange fails.
+///
+/// Events of other behaviours that arrive meanwhile are dropped (logged at debug).
+pub async fn metadata<E, B>(swarm: &mut Swarm<B>, peer: PeerId) -> Result<MetaDataV3, OutboundError>
+where
+    E: EthSpec,
+    B: MetaDataRpc<E>,
+{
+    let id = swarm
+        .behaviour_mut()
+        .metadata_rpc()
+        .send_request(&peer, Request::MetaData);
+    let chunks = wait_for_response(swarm, id, B::metadata_event).await?;
+    single_metadata(chunks)
+}
+
+/// Drives `swarm` until request `id` has a response or fails; `event_of` picks the requesting
+/// behaviour's events. A closed connection is not judged here: `request_response` fails every
+/// request still pending on it (`OutboundFailure::ConnectionClosed`), and a response that
+/// arrived first is delivered first.
 async fn wait_for_response<E, B>(
     swarm: &mut Swarm<B>,
     id: OutboundRequestId,
+    event_of: fn(B::ToSwarm) -> Option<RpcEvent<E>>,
 ) -> Result<Vec<ResponseChunk<E>>, OutboundError>
 where
     E: EthSpec,
-    B: StatusRpc<E>,
+    B: NetworkBehaviour,
 {
     loop {
         match swarm.select_next_some().await {
-            SwarmEvent::Behaviour(event) => match B::status_event(event) {
+            SwarmEvent::Behaviour(event) => match event_of(event) {
                 Some(request_response::Event::Message {
                     message:
                         request_response::Message::Response {
@@ -138,7 +171,7 @@ where
                         error => OutboundError::Failure(error_chain(&error)),
                     });
                 }
-                Some(other) => tracing::debug!(event = ?other, "status behaviour event"),
+                Some(other) => tracing::debug!(event = ?other, "req/resp behaviour event"),
                 None => tracing::debug!("another behaviour's event"),
             },
             _ => tracing::trace!("swarm event while waiting for a response"),
@@ -146,8 +179,10 @@ where
     }
 }
 
-/// The one Status chunk of a Status response.
-fn single_status<E: EthSpec>(mut chunks: Vec<ResponseChunk<E>>) -> Result<StatusV2, OutboundError> {
+/// The one success payload of a single-chunk response.
+fn single_chunk<E: EthSpec>(
+    mut chunks: Vec<ResponseChunk<E>>,
+) -> Result<Response<E>, OutboundError> {
     if chunks.len() != 1 {
         return Err(OutboundError::UnexpectedResponse(format!(
             "{} chunks",
@@ -155,10 +190,7 @@ fn single_status<E: EthSpec>(mut chunks: Vec<ResponseChunk<E>>) -> Result<Status
         )));
     }
     match chunks.remove(0) {
-        ResponseChunk::Success(Response::Status(s)) => Ok(s),
-        ResponseChunk::Success(other) => {
-            Err(OutboundError::UnexpectedResponse(format!("{other:?}")))
-        }
+        ResponseChunk::Success(response) => Ok(response),
         ResponseChunk::Error { code, message } => Err(OutboundError::ErrorResponse {
             code,
             message: String::from_utf8_lossy(&message).into_owned(),
@@ -166,12 +198,28 @@ fn single_status<E: EthSpec>(mut chunks: Vec<ResponseChunk<E>>) -> Result<Status
     }
 }
 
+/// The one Status chunk of a Status response.
+fn single_status<E: EthSpec>(chunks: Vec<ResponseChunk<E>>) -> Result<StatusV2, OutboundError> {
+    match single_chunk(chunks)? {
+        Response::Status(s) => Ok(s),
+        other => Err(OutboundError::UnexpectedResponse(format!("{other:?}"))),
+    }
+}
+
+/// The one MetaData chunk of a MetaData response.
+fn single_metadata<E: EthSpec>(chunks: Vec<ResponseChunk<E>>) -> Result<MetaDataV3, OutboundError> {
+    match single_chunk(chunks)? {
+        Response::MetaData(m) => Ok(m),
+        other => Err(OutboundError::UnexpectedResponse(format!("{other:?}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::m2a_session::{NodeKey, Session, Transport};
+    use crate::m2a_session::{NodeKey, Session, SessionBehaviour, Transport};
     use crate::rpc::codec::Deadlines;
-    use crate::testkit::{StatusPeer, StatusReply};
+    use crate::testkit::{MetaDataReply, StatusPeer, StatusReply};
     use consensus_types::primitives::B256;
     use consensus_types::Minimal;
     use p2p_wire::rpc::codec::ContextTable;
@@ -286,10 +334,79 @@ mod tests {
             .status
             .send_request(&peer.id, Request::Status(ours()));
         session.swarm().disconnect_peer_id(peer.id).unwrap();
-        let err = wait_for_response::<E, _>(session.swarm(), id)
+        let err = wait_for_response(session.swarm(), id, SessionBehaviour::<E>::status_event)
             .await
             .unwrap_err();
         assert!(matches!(err, OutboundError::Disconnected), "{err}");
+    }
+
+    /// A peer serving Status and, with `reply`, MetaData.
+    async fn metadata_peer(reply: MetaDataReply) -> StatusPeer {
+        StatusPeer::spawn_with_metadata(
+            Box::new(|req, _| StatusReply::Status(req.clone())),
+            Some(Box::new(move |_| reply.clone())),
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn metadata_roundtrip() {
+        let canned = p2p_wire::testkit::metadata();
+        let peer = metadata_peer(MetaDataReply::MetaData(canned.clone())).await;
+        let mut session = connected(&peer).await;
+        let got = metadata(session.swarm(), peer.id).await.unwrap();
+        assert_eq!(got.seq_number, 7);
+        let attnets: Vec<usize> = (0..64).filter(|&i| got.attnets.get(i).unwrap()).collect();
+        assert_eq!(attnets, [0, 63]);
+        let syncnets: Vec<usize> = (0..4).filter(|&i| got.syncnets.get(i).unwrap()).collect();
+        assert_eq!(syncnets, [2]);
+        assert_eq!(got.custody_group_count, 4);
+        assert_eq!(got, canned);
+        // The request was empty (the peer refuses any byte), and the same connection serves
+        // a Status afterwards.
+        assert_eq!(peer.metadata_requests(), 1);
+        status(session.swarm(), peer.id, &ours()).await.unwrap();
+        assert_eq!(peer.connections(), 1);
+
+        // Two chunks on a single-response protocol: refused, nothing decoded is returned.
+        let peer = metadata_peer(MetaDataReply::Chunks(vec![canned.clone(), canned])).await;
+        let mut session = connected(&peer).await;
+        let err = metadata(session.swarm(), peer.id).await.unwrap_err();
+        assert!(matches!(err, OutboundError::Failure(_)), "{err}");
+        assert!(err.to_string().contains("chunks"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn metadata_error_chunk_fails() {
+        let reply = MetaDataReply::Error(ResultCode::ResourceUnavailable, b"no".to_vec());
+        let peer = metadata_peer(reply).await;
+        let mut session = connected(&peer).await;
+        let err = metadata(session.swarm(), peer.id).await.unwrap_err();
+        assert!(
+            matches!(&err, OutboundError::ErrorResponse { code: ResultCode::ResourceUnavailable, message } if message == "no"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn single_metadata_refuses_other_shapes() {
+        let m = p2p_wire::testkit::metadata();
+        let one = vec![ResponseChunk::<E>::Success(Response::MetaData(m.clone()))];
+        assert_eq!(single_metadata(one).unwrap(), m);
+        let status = vec![ResponseChunk::<E>::Success(Response::Status(ours()))];
+        assert!(matches!(
+            single_metadata(status),
+            Err(OutboundError::UnexpectedResponse(_))
+        ));
+        let two = vec![
+            ResponseChunk::<E>::Success(Response::MetaData(m.clone())),
+            ResponseChunk::<E>::Success(Response::MetaData(m)),
+        ];
+        assert!(matches!(
+            single_metadata(two),
+            Err(OutboundError::UnexpectedResponse(_))
+        ));
     }
 
     #[test]
