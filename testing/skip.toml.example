@@ -1,6 +1,6 @@
 # Skip list for the spec-vector runner. The runner FAILS on any handler that is neither
 # executed nor matched by an entry here. It also fails on an entry past its expiry date,
-# and on an entry that matches nothing (stale). Staleness is checked only for entries that a
+# and on an entry that matches no file of the scanned vectors (stale). Staleness is checked only for entries that a
 # scanned set could match (its source, presets, forks and runners; see crates/spec-tests/src/
 # suite.rs SETS), so mainnet or cryptography-specs entries do not fail a run that did not
 # extract those sets, and a run of `general` alone (altair/bls only) checks only bls entries.
@@ -24,8 +24,13 @@
 #             coverage excuse instead of a skip                     (optional)
 #   reason    why it is skipped                                     (required)
 #   owner     team member responsible                               (required)
-#   issue     tracking issue URL or ID                              (required)
-#   expires   YYYY-MM-DD; after this date the entry fails CI        (required)
+#   issue     plan item whose work removes the entry, e.g. "1.17", or "none"
+#                                                                   (required)
+#   expires   YYYY-MM-DD; valid through that day, and from the next day the entry fails CI
+#                                                                   (required)
+#
+# A missing or blank reason, owner, issue or expires fails parsing. The first matching case
+# entry gives a case its reason, so put narrow entries before broad ones.
 
 [[skip]]
 source  = "consensus-specs"
@@ -36,7 +41,7 @@ handler = "*"
 case    = "*"
 reason  = "EXAMPLE ONLY: pre-Fulu forks are out of scope (DECISIONS 2026-10-15: Fulu and Gloas only). Narrow this to the real fork names."
 owner   = "ian"
-issue   = "TBD"
+issue   = "none"
 expires = "2026-12-31"
 
 [[skip]]
@@ -48,7 +53,7 @@ handler = "on_payload_attestation_message"   # real handler at v1.7.0-beta.4 min
 case    = "*_ptc_*"
 reason  = "EXAMPLE: PTC fork-choice handling not implemented yet"
 owner   = "tess"
-issue   = "TBD"
+issue   = "4.7"
 expires = "2026-11-15"
 
 [[skip]]
@@ -60,7 +65,7 @@ handler = "*"
 file    = "value.yaml"   # the case still runs; only value.yaml is excused from the guard
 reason  = "EXAMPLE: value.yaml repeats serialized.ssz_snappy as YAML and is not decoded"
 owner   = "ian"
-issue   = "TBD"
+issue   = "none"
 expires = "2026-11-30"
 
 [[skip]]
@@ -71,5 +76,5 @@ runner  = "ssz"
 handler = "test_progressive_containers"   # real handler: fixtures/ssz/ssz/test_progressive_containers
 reason  = "EXAMPLE: progressive containers (EIP-7916/7495) not supported by our SSZ crate yet"
 owner   = "ian"
-issue   = "TBD"
+issue   = "none"
 expires = "2026-11-30"

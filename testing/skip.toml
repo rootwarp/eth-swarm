@@ -1,8 +1,20 @@
 # Skip list for crates/spec-tests (schema: testing/skip.toml.example).
 # The run FAILS on any case that is neither run nor matched here, on an expired entry,
-# and on an entry that matches nothing in a vector set that was scanned.
+# and on an entry that matches no file in a vector set that was scanned (stale).
 # The coverage guard also FAILS the run on any vector file that no handler read, unless its
 # case is skipped here or a `file` entry excuses it.
+#
+# The first matching entry gives a case its reason, so narrow groups come before the
+# fork-wide ones. `issue` is the plan item whose work removes the entry, or "none" when no
+# plan item will. Every entry expires on the M1 deadline, 2026-11-30.
+#
+# After every manifest bump: run all seven sets guarded (testing/README.md, "Skip list"),
+# delete each entry reported stale, and add an entry with a reason for each new unaccounted
+# case or unread file.
+
+# ---------------------------------------------------------------------------------------
+# ssz_static types consensus-types does not define yet.
+# Data-column containers (6 in Gloas, 7 in Fulu): removed by the column work.
 
 [[skip]]
 source  = "consensus-specs"
@@ -12,7 +24,7 @@ runner  = "ssz_static"
 handler = "DataColumnSidecar"
 reason  = "Data-column containers and their compute_max_data_column_sidecar_size() bound are defined with the column work, not in consensus-types yet"
 owner   = "ian"
-issue   = "M1-ssz-static-coverage"
+issue   = "1.17"
 expires = "2026-11-30"
 
 [[skip]]
@@ -23,7 +35,7 @@ runner  = "ssz_static"
 handler = "DataColumnsByRootIdentifier"
 reason  = "Data-column containers and their compute_max_data_column_sidecar_size() bound are defined with the column work, not in consensus-types yet"
 owner   = "ian"
-issue   = "M1-ssz-static-coverage"
+issue   = "1.17"
 expires = "2026-11-30"
 
 [[skip]]
@@ -34,7 +46,7 @@ runner  = "ssz_static"
 handler = "MatrixEntry"
 reason  = "Data-column containers and their compute_max_data_column_sidecar_size() bound are defined with the column work, not in consensus-types yet"
 owner   = "ian"
-issue   = "M1-ssz-static-coverage"
+issue   = "1.17"
 expires = "2026-11-30"
 
 [[skip]]
@@ -45,7 +57,7 @@ runner  = "ssz_static"
 handler = "PartialDataColumnGroupID"
 reason  = "Partial data-column containers (ProgressiveBitList CellsBitList) are defined with the column work, not in consensus-types yet"
 owner   = "ian"
-issue   = "M1-ssz-static-coverage"
+issue   = "1.17"
 expires = "2026-11-30"
 
 [[skip]]
@@ -56,7 +68,7 @@ runner  = "ssz_static"
 handler = "PartialDataColumnPartsMetadata"
 reason  = "Partial data-column containers (ProgressiveBitList CellsBitList) are defined with the column work, not in consensus-types yet"
 owner   = "ian"
-issue   = "M1-ssz-static-coverage"
+issue   = "1.17"
 expires = "2026-11-30"
 
 [[skip]]
@@ -67,7 +79,7 @@ runner  = "ssz_static"
 handler = "PartialDataColumnSidecar"
 reason  = "Partial data-column containers (ProgressiveBitList CellsBitList) are defined with the column work, not in consensus-types yet"
 owner   = "ian"
-issue   = "M1-ssz-static-coverage"
+issue   = "1.17"
 expires = "2026-11-30"
 
 [[skip]]
@@ -76,10 +88,13 @@ fork    = "fulu"
 preset  = "*"
 runner  = "ssz_static"
 handler = "PartialDataColumnHeader"
-reason  = "Partial data-column containers (ProgressiveBitList CellsBitList) are defined with the column work, not in consensus-types yet"
+reason  = "Partial data-column containers (ProgressiveBitList CellsBitList) are defined with the column work, not in consensus-types yet (Fulu only; Gloas drops it)"
 owner   = "ian"
-issue   = "M1-ssz-static-coverage"
+issue   = "1.17"
 expires = "2026-11-30"
+
+# ---------------------------------------------------------------------------------------
+# Light-client containers (5): no light-client server is planned.
 
 [[skip]]
 source  = "consensus-specs"
@@ -87,9 +102,9 @@ fork    = "*"
 preset  = "*"
 runner  = "ssz_static"
 handler = "LightClientBootstrap"
-reason  = "Light-client containers out of M1 scope (beacon node follows the chain; no light-client server yet)"
+reason  = "Light-client containers: no light-client server is planned (the beacon node follows the chain), so consensus-types does not define them"
 owner   = "ian"
-issue   = "M1-ssz-static-coverage"
+issue   = "none"
 expires = "2026-11-30"
 
 [[skip]]
@@ -98,9 +113,9 @@ fork    = "*"
 preset  = "*"
 runner  = "ssz_static"
 handler = "LightClientFinalityUpdate"
-reason  = "Light-client containers out of M1 scope (beacon node follows the chain; no light-client server yet)"
+reason  = "Light-client containers: no light-client server is planned (the beacon node follows the chain), so consensus-types does not define them"
 owner   = "ian"
-issue   = "M1-ssz-static-coverage"
+issue   = "none"
 expires = "2026-11-30"
 
 [[skip]]
@@ -109,9 +124,9 @@ fork    = "*"
 preset  = "*"
 runner  = "ssz_static"
 handler = "LightClientHeader"
-reason  = "Light-client containers out of M1 scope (beacon node follows the chain; no light-client server yet)"
+reason  = "Light-client containers: no light-client server is planned (the beacon node follows the chain), so consensus-types does not define them"
 owner   = "ian"
-issue   = "M1-ssz-static-coverage"
+issue   = "none"
 expires = "2026-11-30"
 
 [[skip]]
@@ -120,9 +135,9 @@ fork    = "*"
 preset  = "*"
 runner  = "ssz_static"
 handler = "LightClientOptimisticUpdate"
-reason  = "Light-client containers out of M1 scope (beacon node follows the chain; no light-client server yet)"
+reason  = "Light-client containers: no light-client server is planned (the beacon node follows the chain), so consensus-types does not define them"
 owner   = "ian"
-issue   = "M1-ssz-static-coverage"
+issue   = "none"
 expires = "2026-11-30"
 
 [[skip]]
@@ -131,9 +146,277 @@ fork    = "*"
 preset  = "*"
 runner  = "ssz_static"
 handler = "LightClientUpdate"
-reason  = "Light-client containers out of M1 scope (beacon node follows the chain; no light-client server yet)"
+reason  = "Light-client containers: no light-client server is planned (the beacon node follows the chain), so consensus-types does not define them"
 owner   = "ian"
-issue   = "M1-ssz-static-coverage"
+issue   = "none"
+expires = "2026-11-30"
+
+# ---------------------------------------------------------------------------------------
+# Runners the test layout assigns to the skip list. They come before the fork entries so a
+# pre-Fulu case of these runners (genesis exists only for phase0) shows this reason.
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "light_client"
+handler = "*"
+reason  = "No light_client runner: no light-client server is planned (sync protocol, update ranking, data collection)"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "merkle_proof"
+handler = "*"
+reason  = "No merkle_proof runner yet: the Fulu vectors check the blob_kzg_commitments inclusion proof that DataColumnSidecar carries; it lands with column sidecar verification"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "minimal"
+runner  = "genesis"
+handler = "*"
+reason  = "No genesis runner: a Fulu or Gloas node starts from a checkpoint state, never from eth1 genesis; at this pin genesis vectors exist only for phase0 minimal"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "sync"
+handler = "*"
+reason  = "No sync (optimistic sync) runner yet; it lands with cl-chain's engine integration. Fulu only among in-scope forks at this pin"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+# ---------------------------------------------------------------------------------------
+# No Fulu state transition. fork (upgrade_to_fulu) starts from an Electra state and transition
+# replays Electra blocks, so neither can ever run; the Fulu processing runners have no STF.
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "fulu"
+preset  = "*"
+runner  = "fork"
+handler = "*"
+reason  = "upgrade_to_fulu takes an Electra pre-state; there is no pre-Fulu state transition (Fulu and Gloas only), so fork vectors never run"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "fulu"
+preset  = "*"
+runner  = "transition"
+handler = "*"
+reason  = "Electra-to-Fulu transition vectors replay Electra blocks; there is no pre-Fulu state transition (Fulu and Gloas only), so transition vectors never run"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "fulu"
+preset  = "*"
+runner  = "operations"
+handler = "*"
+reason  = "No Fulu state transition: the state-transition milestone implements Gloas processing only, so Fulu operations vectors have no runner"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "fulu"
+preset  = "*"
+runner  = "epoch_processing"
+handler = "*"
+reason  = "No Fulu state transition: the state-transition milestone implements Gloas processing only, so Fulu epoch_processing vectors have no runner"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "fulu"
+preset  = "*"
+runner  = "sanity"
+handler = "*"
+reason  = "No Fulu state transition: the state-transition milestone implements Gloas processing only, so Fulu sanity vectors have no runner"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "fulu"
+preset  = "*"
+runner  = "finality"
+handler = "*"
+reason  = "No Fulu state transition: the state-transition milestone implements Gloas processing only, so Fulu finality vectors have no runner"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "fulu"
+preset  = "*"
+runner  = "random"
+handler = "*"
+reason  = "No Fulu state transition: the state-transition milestone implements Gloas processing only, so Fulu random vectors have no runner"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "fulu"
+preset  = "*"
+runner  = "rewards"
+handler = "*"
+reason  = "No Fulu state transition: the state-transition milestone implements Gloas processing only, so Fulu rewards vectors have no runner"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+# ---------------------------------------------------------------------------------------
+# Gloas state transition: moved to the state-transition milestone.
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "fork"
+handler = "*"
+reason  = "No fork runner yet: upgrade_to_gloas lands with the Gloas state transition"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "transition"
+handler = "*"
+reason  = "No transition runner yet: Fulu-to-Gloas transition vectors need the Gloas state transition (and Fulu slot processing before the fork epoch)"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "operations"
+handler = "*"
+reason  = "No operations runner yet: Gloas operations vectors land with the Gloas state transition"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "epoch_processing"
+handler = "*"
+reason  = "No epoch_processing runner yet: Gloas epoch_processing vectors land with the Gloas state transition"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "sanity"
+handler = "*"
+reason  = "No sanity runner yet: Gloas sanity vectors land with the Gloas state transition"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "finality"
+handler = "*"
+reason  = "No finality runner yet: Gloas finality vectors land with the Gloas state transition"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "random"
+handler = "*"
+reason  = "No random runner yet: Gloas random vectors land with the Gloas state transition"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "rewards"
+handler = "*"
+reason  = "No rewards runner yet: Gloas rewards vectors land with the Gloas state transition"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+# ---------------------------------------------------------------------------------------
+# Fork choice, networking and fast confirmation: runners land with cl-chain; no plan item
+# names them yet.
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "fork_choice"
+handler = "*"
+reason  = "No fork_choice runner yet; it lands with cl-chain's fork choice"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "minimal"
+runner  = "fast_confirmation"
+handler = "*"
+reason  = "No fast_confirmation runner yet; it lands with cl-chain's fork choice (minimal-only vectors)"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "networking"
+handler = "*"
+reason  = "No networking runner yet (gossip validation, custody groups); it lands with cl-chain gossip validation and cl-p2p"
+owner   = "ian"
+issue   = "none"
 expires = "2026-11-30"
 
 # ---------------------------------------------------------------------------------------
@@ -148,7 +431,7 @@ runner  = "*"
 handler = "*"
 reason  = "Pre-Fulu fork phase0: out of scope (Fulu and Gloas only)"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "none"
 expires = "2026-11-30"
 
 [[skip]]
@@ -159,7 +442,7 @@ runner  = "*"
 handler = "*"
 reason  = "Pre-Fulu fork bellatrix: out of scope (Fulu and Gloas only)"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "none"
 expires = "2026-11-30"
 
 [[skip]]
@@ -170,7 +453,7 @@ runner  = "*"
 handler = "*"
 reason  = "Pre-Fulu fork capella: out of scope (Fulu and Gloas only)"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "none"
 expires = "2026-11-30"
 
 [[skip]]
@@ -181,7 +464,7 @@ runner  = "*"
 handler = "*"
 reason  = "Pre-Fulu fork deneb: out of scope (Fulu and Gloas only)"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "none"
 expires = "2026-11-30"
 
 [[skip]]
@@ -192,7 +475,7 @@ runner  = "*"
 handler = "*"
 reason  = "Pre-Fulu fork electra: out of scope (Fulu and Gloas only)"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "none"
 expires = "2026-11-30"
 
 [[skip]]
@@ -203,7 +486,7 @@ runner  = "*"
 handler = "*"
 reason  = "Pre-Fulu fork altair: out of scope (Fulu and Gloas only); general/altair/bls runs through the bls runner"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "none"
 expires = "2026-11-30"
 
 [[skip]]
@@ -214,7 +497,7 @@ runner  = "*"
 handler = "*"
 reason  = "Pre-Fulu fork altair: out of scope (Fulu and Gloas only); general/altair/bls runs through the bls runner"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "none"
 expires = "2026-11-30"
 
 [[skip]]
@@ -225,167 +508,8 @@ runner  = "*"
 handler = "*"
 reason  = "Post-Gloas fork heze: out of scope (Fulu and Gloas only)"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "none"
 expires = "2026-11-30"
-
-
-# ---------------------------------------------------------------------------------------
-# Fulu and Gloas format dirs without a runner yet. Pre-Fulu forks are already skipped above.
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "*"
-preset  = "*"
-runner  = "epoch_processing"
-handler = "*"
-reason  = "No state-transition runner yet; it lands with cl-chain's state transition"
-owner   = "ian"
-issue   = "M1-vector-coverage"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "*"
-preset  = "*"
-runner  = "operations"
-handler = "*"
-reason  = "No state-transition runner yet; it lands with cl-chain's state transition"
-owner   = "ian"
-issue   = "M1-vector-coverage"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "*"
-preset  = "*"
-runner  = "sanity"
-handler = "*"
-reason  = "No state-transition runner yet; it lands with cl-chain's state transition"
-owner   = "ian"
-issue   = "M1-vector-coverage"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "*"
-preset  = "*"
-runner  = "finality"
-handler = "*"
-reason  = "No state-transition runner yet; it lands with cl-chain's state transition"
-owner   = "ian"
-issue   = "M1-vector-coverage"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "*"
-preset  = "*"
-runner  = "random"
-handler = "*"
-reason  = "No state-transition runner yet; it lands with cl-chain's state transition"
-owner   = "ian"
-issue   = "M1-vector-coverage"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "*"
-preset  = "*"
-runner  = "rewards"
-handler = "*"
-reason  = "No state-transition runner yet; it lands with cl-chain's state transition"
-owner   = "ian"
-issue   = "M1-vector-coverage"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "*"
-preset  = "*"
-runner  = "fork"
-handler = "*"
-reason  = "No fork-upgrade runner yet (upgrade_to_fulu / upgrade_to_gloas); it lands with cl-chain's state transition"
-owner   = "ian"
-issue   = "M1-vector-coverage"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "*"
-preset  = "*"
-runner  = "transition"
-handler = "*"
-reason  = "No cross-fork transition runner yet; it lands with cl-chain's state transition"
-owner   = "ian"
-issue   = "M1-vector-coverage"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "*"
-preset  = "*"
-runner  = "fork_choice"
-handler = "*"
-reason  = "No fork-choice runner yet; it lands with cl-chain's fork choice"
-owner   = "ian"
-issue   = "M1-vector-coverage"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "*"
-preset  = "minimal"
-runner  = "fast_confirmation"
-handler = "*"
-reason  = "No fast-confirmation runner yet; it lands with cl-chain's fork choice (minimal-only vectors)"
-owner   = "ian"
-issue   = "M1-vector-coverage"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "*"
-preset  = "*"
-runner  = "sync"
-handler = "*"
-reason  = "No optimistic-sync runner yet; it lands with cl-chain's engine integration"
-owner   = "ian"
-issue   = "M1-vector-coverage"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "*"
-preset  = "*"
-runner  = "networking"
-handler = "*"
-reason  = "No networking runner yet (gossip validation, custody groups); it lands with cl-chain gossip validation and cl-p2p"
-owner   = "ian"
-issue   = "M1-vector-coverage"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "*"
-preset  = "*"
-runner  = "light_client"
-handler = "*"
-reason  = "Light-client runners out of M1 scope (no light-client server yet)"
-owner   = "ian"
-issue   = "M1-vector-coverage"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "*"
-preset  = "*"
-runner  = "merkle_proof"
-handler = "*"
-reason  = "No merkle-proof runner yet (blob/column inclusion proofs); it lands with the data-column work"
-owner   = "ian"
-issue   = "M1-vector-coverage"
-expires = "2026-11-30"
-
 
 # ---------------------------------------------------------------------------------------
 # Files of run cases that no handler reads.
@@ -399,12 +523,12 @@ handler = "*"
 file    = "value.yaml"
 reason  = "value.yaml is the YAML rendering of serialized.ssz_snappy; the runner checks the bytes by round trip and hash_tree_root and has no YAML decoder for consensus-types"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "none"
 expires = "2026-11-30"
-
 
 # ---------------------------------------------------------------------------------------
 # cryptography-specs v0.1.0 KZG handlers the kzg runner does not run (crates/spec-tests/src/kzg.rs NOT_RUN).
+# Blob-level KZG and recovery: removed by the blob and reconstruction KZG work.
 
 [[skip]]
 source  = "cryptography-specs"
@@ -414,7 +538,7 @@ runner  = "kzg"
 handler = "blob_to_kzg_commitment"
 reason  = "Blob-level (EIP-4844) KZG: cl-verify checks only cell proofs since Fulu, and crypto-kzg exposes only the cell API"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "6.7"
 expires = "2026-11-30"
 
 [[skip]]
@@ -425,7 +549,7 @@ runner  = "kzg"
 handler = "compute_blob_kzg_proof"
 reason  = "Blob-level (EIP-4844) KZG: cl-verify checks only cell proofs since Fulu, and crypto-kzg exposes only the cell API"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "6.7"
 expires = "2026-11-30"
 
 [[skip]]
@@ -436,7 +560,7 @@ runner  = "kzg"
 handler = "compute_challenge"
 reason  = "Blob-level (EIP-4844) KZG: cl-verify checks only cell proofs since Fulu, and crypto-kzg exposes only the cell API"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "6.7"
 expires = "2026-11-30"
 
 [[skip]]
@@ -447,7 +571,7 @@ runner  = "kzg"
 handler = "compute_kzg_proof"
 reason  = "Blob-level (EIP-4844) KZG: cl-verify checks only cell proofs since Fulu, and crypto-kzg exposes only the cell API"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "6.7"
 expires = "2026-11-30"
 
 [[skip]]
@@ -458,7 +582,7 @@ runner  = "kzg"
 handler = "verify_blob_kzg_proof"
 reason  = "Blob-level (EIP-4844) KZG: cl-verify checks only cell proofs since Fulu, and crypto-kzg exposes only the cell API"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "6.7"
 expires = "2026-11-30"
 
 [[skip]]
@@ -469,7 +593,7 @@ runner  = "kzg"
 handler = "verify_blob_kzg_proof_batch"
 reason  = "Blob-level (EIP-4844) KZG: cl-verify checks only cell proofs since Fulu, and crypto-kzg exposes only the cell API"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "6.7"
 expires = "2026-11-30"
 
 [[skip]]
@@ -480,7 +604,7 @@ runner  = "kzg"
 handler = "verify_kzg_proof"
 reason  = "Blob-level (EIP-4844) KZG: cl-verify checks only cell proofs since Fulu, and crypto-kzg exposes only the cell API"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "6.7"
 expires = "2026-11-30"
 
 [[skip]]
@@ -489,9 +613,9 @@ fork    = "none"
 preset  = "none"
 runner  = "kzg"
 handler = "recover_cells_and_kzg_proofs"
-reason  = "crypto-kzg does not expose recover_cells_and_kzg_proofs yet; it lands with column reconstruction in cl-chain-columns"
+reason  = "crypto-kzg does not expose recover_cells_and_kzg_proofs yet; it lands with column reconstruction"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "6.7"
 expires = "2026-11-30"
 
 [[skip]]
@@ -502,9 +626,8 @@ runner  = "kzg"
 handler = "compute_verify_cell_kzg_proof_batch_challenge"
 reason  = "Internal Fiat-Shamir challenge of verify_cell_kzg_proof_batch; c-kzg does not expose it, and verify_cell_kzg_proof_batch vectors cover it end to end"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "none"
 expires = "2026-11-30"
-
 
 # ---------------------------------------------------------------------------------------
 # bls12-381-tests v0.1.2 handlers the bls runner does not run (crates/spec-tests/src/bls.rs NOT_RUN).
@@ -517,7 +640,7 @@ runner  = "bls"
 handler = "hash_to_G2"
 reason  = "crypto-bls does not expose hash-to-curve on its own; sign and verify vectors cover it through blst"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "none"
 expires = "2026-11-30"
 
 # ---------------------------------------------------------------------------------------
@@ -532,10 +655,11 @@ runner  = "fork_choice_compliance"
 handler = "*"
 reason  = "No fork-choice-compliance runner yet; it lands with cl-chain's state transition and fork choice"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "none"
 expires = "2026-11-30"
 
 # The Python sources shipped in the archive, one entry per tree (preset = top-level dir).
+
 [[skip]]
 source  = "comptests"
 fork    = "*"
@@ -544,7 +668,7 @@ runner  = "*"
 handler = "*"
 reason  = "Generator code shipped in comptests.tar.gz, not vectors: pyspec sources (tests/core)"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "none"
 expires = "2026-11-30"
 
 [[skip]]
@@ -555,7 +679,7 @@ runner  = "*"
 handler = "*"
 reason  = "Generator code shipped in comptests.tar.gz, not vectors: test-format docs (tests/formats)"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "none"
 expires = "2026-11-30"
 
 [[skip]]
@@ -566,5 +690,5 @@ runner  = "*"
 handler = "*"
 reason  = "Generator code shipped in comptests.tar.gz, not vectors: vector generator sources (tests/generators)"
 owner   = "ian"
-issue   = "M1-vector-coverage"
+issue   = "none"
 expires = "2026-11-30"

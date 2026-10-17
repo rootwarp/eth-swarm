@@ -82,7 +82,9 @@ fn main() {
         .collect();
     let conclusion = libtest_mimic::run(&args, trials);
 
-    if guard_off.is_none() {
+    if let Some(why) = guard_off {
+        eprintln!("coverage guard: off ({why})");
+    } else {
         let started = std::time::Instant::now();
         let result = suite.guard.check(&suite.reads);
         eprintln!(
@@ -96,8 +98,6 @@ fn main() {
                 std::process::exit(101);
             }
         }
-    } else {
-        eprintln!("coverage guard: off ({})", guard_off.unwrap_or_default());
     }
     conclusion.exit();
 }

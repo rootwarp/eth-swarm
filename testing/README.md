@@ -4,6 +4,7 @@
 |---|---|
 | `vectors.manifest.toml` | Pinned vector archives: per source an exact tag plus the commit it resolves to, per asset a sha256 |
 | `vectors.manifest.example.toml` | Byte-identical copy of `vectors.manifest.toml` (a test keeps them in sync) |
+| `skip.toml` | The skip list of the spec-vector runner and the exclusion list of its coverage guard (see "Skip list" below) |
 | `skip.toml.example` | Skip-list template. The runner fails on a handler that is neither run nor skipped, on an expired entry, and on an entry that matches nothing |
 | `fetch-vectors.sh` | Checks every tag -> commit pin, downloads, verifies sha256, then extracts to `target/spec-vectors/<source>/<tag>/<asset>/`. Fails closed |
 
@@ -26,6 +27,20 @@ Notes:
 - cryptography-specs `tests.zip` and bls12-381-tests feed the spec-tests `kzg` and `bls` runners. They stay `optional`, so the PR job (minimal) skips them; the nightly fetches and runs them.
 - `comptests.tar.gz` (fork_choice_compliance vectors plus pyspec sources) has no runner. The nightly extracts it, and the coverage guard scans it under one `skip.toml` entry.
 - consensus-specs mainnet plus minimal is about 1.4 GB compressed. CI does **not** cache them: every PR run and the nightly fetch and verify fresh.
+
+## Skip list (`skip.toml`)
+Every vector case is either run or matched by an entry. Each entry selects cases by `source`, `fork`, `preset`, `runner`, `handler` and an optional `case` glob (a `file` glob makes it a coverage excuse instead of a skip), and carries a `reason`, an `owner`, an `issue` (the plan item that removes it, or `none`) and an `expires` date. Checks, all in `crates/spec-tests/src/plan.rs`:
+- **Schema.** A missing or blank `reason`, `owner`, `issue` or `expires`, an unknown field, a bad date, an unknown `source` or `preset`, or an entry that fits no vector set fails parsing, so `cargo test --workspace` fails in PR CI (`committed_skip_files_parse`, `skip_entry_requires_reason`).
+- **Expiry.** An entry is valid through its `expires` day and fails every run from the next day (`skip_expired_fails`; the date is injected through `suite::Config::today`). `committed_skip_list_is_current` checks the committed entries against the real clock, so `cargo test` fails once one has expired.
+- **Stale.** An entry that matches no file of a scanned set fails the run (`skip_entry_matches_files`). A case entry also needs its matching case to hold a file; this is a defensive guard, because the vector walk only creates a case for a file. The nightly scans all seven sets, so it checks every entry.
+
+Groups (`tests/skip_list.rs` pins the `issue` of each): the column `ssz_static` types (`1.17`); the light-client `ssz_static` types; the `light_client`, `merkle_proof`, `genesis` and `sync` runners; Fulu `fork`, `transition` and processing runners (no Fulu state transition, `none`); Gloas `fork`, `transition`, `operations`, `epoch_processing`, `sanity`, `finality`, `random` and `rewards` (`4.7`); `fork_choice`, `fast_confirmation` and `networking`; pre-Fulu forks and `heze`; the `value.yaml` excuse; the blob-level KZG handlers and `recover_cells_and_kzg_proofs` (`6.7`); `bls/hash_to_G2`; comptests.
+
+On every manifest bump, run all seven sets guarded, delete each entry reported stale, and give each new unaccounted case or unread file an entry with a reason:
+```bash
+SPEC_SETS="ssz-specs general minimal mainnet comptests cryptography-specs bls12-381-tests" \
+  cargo test -p spec-tests --release --locked --test vectors
+```
 
 ## Local
 ```bash

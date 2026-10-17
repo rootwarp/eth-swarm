@@ -576,3 +576,23 @@ fn planning_reads_do_not_count_as_coverage() {
     run_all(&suite);
     assert!(suite.guard.check(&suite.reads).is_ok());
 }
+
+#[test]
+fn expired_entry_fails_the_suite_and_expiry_day_passes() {
+    let tree = minimal_tree();
+    let suite_on = |today: &str| {
+        suite::build(&Config {
+            root: tree.path(),
+            manifest: MANIFEST,
+            skip: &value_yaml_excused(),
+            selection: Some("minimal"),
+            today: Date::parse(today).unwrap(),
+        })
+    };
+    // The entry expires on 2026-11-30: valid through that day, expired on the next.
+    assert!(suite_on("2026-11-30").is_ok());
+    match suite_on("2026-12-01") {
+        Err(SuiteError::Rules(msg)) => assert!(msg.contains("expired on 2026-11-30"), "{msg}"),
+        other => panic!("{:?}", other.err()),
+    }
+}

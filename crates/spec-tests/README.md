@@ -24,9 +24,9 @@ SPEC_SETS="ssz-specs minimal" cargo test -p spec-tests --release --test vectors
 - **Handler directories:** `kzg.rs` and `bls.rs` list every handler they run and every one they
   know but do not run. Any other directory under `bls/` or `kzg/` fails the run, skip entry or
   not.
-- **Skips:** `testing/skip.toml` (schema in `testing/skip.toml.example`). The run fails on a
-  case that is neither run nor skipped, on an expired entry, and on a stale entry of a scanned
-  set.
+- **Skips:** `testing/skip.toml` (schema in `testing/skip.toml.example`, rules and groups in
+  `testing/README.md`). The run fails on a case that is neither run nor skipped, on an expired
+  entry, and on a stale entry of a scanned set.
 - **Coverage guard** (`src/coverage.rs`, after Lighthouse's `check_all_files_accessed.py`):
   handlers read vector files only through `coverage::Reads`. After an unfiltered run, any file
   under a scanned root that was not read fails the run and is listed, unless its case is

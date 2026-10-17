@@ -1,7 +1,7 @@
 //! Skip-list rules (schema: `testing/skip.toml.example`) and per-case disposition.
 //!
 //! The run fails when a case is neither run nor skipped, when a skip entry has
-//! expired, or when a skip entry matches no case (stale).
+//! expired, or when a skip entry matches no file of a scanned set (stale).
 //!
 //! An entry without `file` skips whole cases. An entry with `file` skips nothing: it only
 //! excuses the matching files of a case from the coverage guard ([`crate::coverage`]).
@@ -183,8 +183,8 @@ pub enum PlanError {
         /// The configured expiry.
         expires: String,
     },
-    /// An entry matches no discovered case.
-    #[error("skip entry #{index} ({summary}) matches no case (stale)")]
+    /// An entry matches no file of the discovered cases.
+    #[error("skip entry #{index} ({summary}) matches no vector file (stale)")]
     Stale {
         /// Zero-based entry index.
         index: usize,
@@ -248,10 +248,15 @@ impl Entry {
             .is_some_and(|f| glob(f, name) && self.matches_case(k))
     }
 
-    /// Whether anything in `cases` matches: a case for case entries, a file for file entries.
+    /// Whether a file in `cases` matches: a file of a matching case for case entries, a
+    /// matching file for file entries. The `files` check on case entries is a defensive
+    /// guard: [`crate::coverage::walk`] only creates a case for a file, so it fires only on
+    /// cases built by hand.
     fn matches_any(&self, cases: &[Case]) -> bool {
         match self.raw.file {
-            None => cases.iter().any(|c| self.matches_case(&c.key)),
+            None => cases
+                .iter()
+                .any(|c| !c.files.is_empty() && self.matches_case(&c.key)),
             Some(_) => cases
                 .iter()
                 .any(|c| c.files.iter().any(|f| self.matches_file(&c.key, &f.name))),
@@ -273,6 +278,30 @@ impl Entry {
             s.push_str(&format!(" file {f}"));
         }
         s
+    }
+}
+
+/// The bookkeeping fields of one skip entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryInfo<'a> {
+    /// Why it is skipped.
+    pub reason: &'a str,
+    /// Who is responsible for it.
+    pub owner: &'a str,
+    /// The plan item that removes it, or `none`.
+    pub issue: &'a str,
+    /// Last day the entry is valid.
+    pub expires: Date,
+}
+
+impl<'a> From<&'a Entry> for EntryInfo<'a> {
+    fn from(e: &'a Entry) -> Self {
+        Self {
+            reason: &e.raw.reason,
+            owner: &e.raw.owner,
+            issue: &e.raw.issue,
+            expires: e.expires,
+        }
     }
 }
 
@@ -346,6 +375,34 @@ impl SkipList {
         Ok(Self { entries })
     }
 
+    /// Every entry, in file order.
+    pub fn entries(&self) -> impl Iterator<Item = EntryInfo<'_>> {
+        self.entries.iter().map(EntryInfo::from)
+    }
+
+    /// The first case entry (no `file`) that skips case `k`, if any.
+    pub fn skipped_by(&self, k: &CaseKey) -> Option<EntryInfo<'_>> {
+        self.entries
+            .iter()
+            .find(|e| e.raw.file.is_none() && e.matches_case(k))
+            .map(EntryInfo::from)
+    }
+
+    /// Every entry whose `expires` date is before `today`. An entry is valid through its
+    /// expiry day: it expires on the day after.
+    pub fn expired(&self, today: Date) -> Vec<PlanError> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.expires < today)
+            .map(|(index, e)| PlanError::Expired {
+                index,
+                summary: e.summary(),
+                expires: e.raw.expires.clone(),
+            })
+            .collect()
+    }
+
     /// Whether a `file` entry excuses file `name` of case `k` from the coverage guard.
     pub fn excuses(&self, k: &CaseKey, name: &str) -> bool {
         self.entries.iter().any(|e| e.matches_file(k, name))
@@ -399,15 +456,8 @@ pub fn plan<'a>(
     today: Date,
     scopes: &[Scope],
 ) -> Result<Vec<(&'a Case, Disposition)>, Vec<PlanError>> {
-    let mut errors = Vec::new();
+    let mut errors = skips.expired(today);
     for (index, e) in skips.entries.iter().enumerate() {
-        if e.expires < today {
-            errors.push(PlanError::Expired {
-                index,
-                summary: e.summary(),
-                expires: e.raw.expires.clone(),
-            });
-        }
         let in_scope = scopes.iter().any(|s| e.in_scope(s));
         if in_scope && !e.matches_any(cases) {
             errors.push(PlanError::Stale {
@@ -423,12 +473,8 @@ pub fn plan<'a>(
         .iter()
         .map(|c| {
             let k = &c.key;
-            let skip = skips
-                .entries
-                .iter()
-                .find(|e| e.raw.file.is_none() && e.matches_case(k));
-            let d = match skip {
-                Some(e) => Disposition::Skip(e.raw.reason.clone()),
+            let d = match skips.skipped_by(k) {
+                Some(e) => Disposition::Skip(e.reason.to_owned()),
                 None if has_handler(k) => Disposition::Run,
                 None => Disposition::Unaccounted,
             };
@@ -479,9 +525,9 @@ mod tests {
     fn classifies_run_skip_and_unaccounted() {
         let skips = SkipList::parse(&entry("BeaconState", None, "2026-12-31")).unwrap();
         let cases = [
-            case("BeaconState", "ssz_random/case_0", &[]),
-            case("BeaconStateX", "ssz_one/case_0", &[]),
-            case("Checkpoint", "ssz_one/case_0", &[]),
+            case("BeaconState", "ssz_random/case_0", &["x"]),
+            case("BeaconStateX", "ssz_one/case_0", &["x"]),
+            case("Checkpoint", "ssz_one/case_0", &["x"]),
         ];
         let got = plan(
             &cases,
@@ -506,8 +552,8 @@ mod tests {
     fn case_glob_narrows_the_skip() {
         let skips = SkipList::parse(&entry("Foo", Some("ssz_random/*"), "2026-12-31")).unwrap();
         let cases = [
-            case("Foo", "ssz_random/case_1", &[]),
-            case("Foo", "ssz_one/case_1", &[]),
+            case("Foo", "ssz_random/case_1", &["x"]),
+            case("Foo", "ssz_one/case_1", &["x"]),
         ];
         let got = plan(&cases, |_| true, &skips, today(), &SCOPES).unwrap();
         assert_eq!(got[0].1, Disposition::Skip("r-Foo".into()));
@@ -515,50 +561,77 @@ mod tests {
     }
 
     #[test]
-    fn expired_entry_fails_the_run() {
-        let skips = SkipList::parse(&entry("Foo", None, "2026-10-14")).unwrap();
-        let errs = plan(
-            &[case("Foo", "a/b", &[])],
-            |_| true,
-            &skips,
-            today(),
-            &SCOPES,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            errs.as_slice(),
-            [PlanError::Expired { index: 0, .. }]
-        ));
+    fn skip_expired_fails() {
+        // (today, yesterday), across a month and a year boundary; the clock is injected.
+        for (today, yesterday) in [
+            ("2026-10-15", "2026-10-14"),
+            ("2026-11-01", "2026-10-31"),
+            ("2027-01-01", "2026-12-31"),
+        ] {
+            let day = Date::parse(today).unwrap();
+            let skips = SkipList::parse(&entry("Foo", None, yesterday)).unwrap();
+            assert!(
+                matches!(
+                    skips.expired(day).as_slice(),
+                    [PlanError::Expired { index: 0, expires, .. }] if expires == yesterday
+                ),
+                "{yesterday} must be expired on {today}"
+            );
+            let cases = [case("Foo", "a/b", &["x"])];
+            let errs = plan(&cases, |_| true, &skips, day, &SCOPES).unwrap_err();
+            assert!(matches!(errs.as_slice(), [PlanError::Expired { .. }]));
+
+            // The expiry day itself is inclusive.
+            let skips = SkipList::parse(&entry("Foo", None, today)).unwrap();
+            assert!(skips.expired(day).is_empty(), "{today} expires today");
+            assert!(plan(&cases, |_| true, &skips, day, &SCOPES).is_ok());
+        }
     }
 
     #[test]
-    fn entry_expiring_today_is_still_valid() {
-        let skips = SkipList::parse(&entry("Foo", None, "2026-10-15")).unwrap();
-        assert!(plan(
-            &[case("Foo", "a/b", &[])],
-            |_| true,
-            &skips,
-            today(),
-            &SCOPES
-        )
-        .is_ok());
+    fn skip_entry_matches_files() {
+        let skips = SkipList::parse(&entry("Foo", None, "2026-12-31")).unwrap();
+        let held = [case("Foo", "a/b", &["x"])];
+        assert!(plan(&held, |_| true, &skips, today(), &SCOPES).is_ok());
+        // A case entry must match a case that holds a file, not just a key.
+        for cases in [[case("Bar", "a/b", &["x"])], [case("Foo", "a/b", &[])]] {
+            let errs = plan(&cases, |_| true, &skips, today(), &SCOPES).unwrap_err();
+            assert!(
+                matches!(
+                    errs.as_slice(),
+                    [PlanError::Stale { index: 0, summary }]
+                        if summary == "consensus-specs/gloas/*/ssz_static/Foo/*"
+                ),
+                "{errs:?}"
+            );
+        }
     }
 
     #[test]
-    fn stale_entry_fails_the_run() {
-        let skips = SkipList::parse(&entry("Gone", None, "2026-12-31")).unwrap();
-        let errs = plan(
-            &[case("Foo", "a/b", &[])],
-            |_| true,
-            &skips,
-            today(),
-            &SCOPES,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            errs.as_slice(),
-            [PlanError::Stale { index: 0, .. }]
-        ));
+    fn skip_entry_requires_reason() {
+        let full = entry("Foo", None, "2026-12-31");
+        assert!(SkipList::parse(&full).is_ok());
+        for field in ["reason", "owner", "issue", "expires"] {
+            let line = full
+                .lines()
+                .find(|l| l.starts_with(&format!("{field} = ")))
+                .unwrap();
+            let missing = full.replace(&format!("{line}\n"), "");
+            match SkipList::parse(&missing) {
+                Err(PlanError::Parse(msg)) => {
+                    assert!(msg.contains(&format!("missing field `{field}`")), "{msg}")
+                }
+                other => panic!("without {field}: {other:?}"),
+            }
+            let blank = full.replace(line, &format!("{field} = \" \""));
+            assert!(
+                matches!(
+                    SkipList::parse(&blank),
+                    Err(PlanError::Invalid { index: 0, .. })
+                ),
+                "blank {field}"
+            );
+        }
     }
 
     #[test]

@@ -12,8 +12,11 @@ fn vectors(env: &[(&str, &str)], args: &[&str]) -> std::process::Output {
 }
 
 /// [`vectors`] against the vectors directory `dir`.
+///
+/// Under a coverage build the nested binaries are instrumented too; their profiles go to a
+/// throwaway directory instead of `default_*.profraw` files in the crate directory.
 fn vectors_in(dir: &Path, env: &[(&str, &str)], args: &[&str]) -> std::process::Output {
-    let empty = dir;
+    let profiles = tempfile::tempdir().unwrap();
     let mut cmd = Command::new(env!("CARGO"));
     cmd.args([
         "test",
@@ -26,7 +29,8 @@ fn vectors_in(dir: &Path, env: &[(&str, &str)], args: &[&str]) -> std::process::
         "--",
     ])
     .args(args)
-    .env("SPEC_VECTORS_DIR", empty);
+    .env("SPEC_VECTORS_DIR", dir)
+    .env("LLVM_PROFILE_FILE", profiles.path().join("%p-%m.profraw"));
     for (k, v) in env {
         cmd.env(k, v);
     }
