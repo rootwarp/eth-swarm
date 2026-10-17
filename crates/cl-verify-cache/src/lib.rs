@@ -22,11 +22,29 @@
 //!   (`PubkeyFeedResponseBody.high_water`), `sent` the end of the feed range cl-chain has sent.
 //!   That covers ranges sent before the request, but PubkeyFeed and VerifyBls are separate
 //!   streams with no ordering between them, so a range sent later could overtake the request.
-//! - Hold-back rule: cl-chain does not send a `PubkeyFeed` range that covers an index carried
-//!   inline by an in-flight VerifyBls request until that request has completed (its response is
-//!   received) or been cancelled. After a reconnect of either stream, cl-chain first drains or
-//!   cancels the in-flight requests, then sends the range. With both rules, a request's inline
-//!   indices stay past `high_water()` until the request is resolved.
+//! - Hold-back rule: a range `[start_index, start_index + count)` covers an index `i` when
+//!   `start_index <= i < start_index + count`. cl-chain does not send a `PubkeyFeed` range that
+//!   covers an index carried inline by an in-flight VerifyBls request until the matching response
+//!   (same `request_id` on the same stream) has arrived, or the stream-gone wait below has
+//!   elapsed. Nothing else ends the hold-back: a local cancellation, a timeout or a dropped waiter
+//!   does not, because VerifyBls has no per-request cancel frame and cl-verify may still resolve a
+//!   request it has already buffered.
+//! - Clock skew: `MAX_CLOCK_SKEW_MS` (1,000 ms) bounds how far the wall clocks of cl-chain and
+//!   cl-verify, on one host, may disagree, a wall-clock step included.
+//! - Stalled stream: cl-chain closes a VerifyBls stream on which a request has no response by its
+//!   `deadline_unix_ms + MAX_CLOCK_SKEW_MS`. From then on the stream is gone.
+//! - Stream gone: if the VerifyBls stream is gone (broken, closed, or closed as stalled) first,
+//!   cl-chain waits until its clock has passed the latest `deadline_unix_ms + MAX_CLOCK_SKEW_MS`
+//!   of the inline-carrying requests it had in flight on that stream, then sends the covering
+//!   range. This relies on cl-verify reading the [`high_water`](PubkeyCache::high_water)
+//!   snapshot before checking the deadline (past it: `DEADLINE_EXCEEDED`, no resolution), and
+//!   resolving no further signers for a stream's requests once that stream closes. With these
+//!   rules, a request's inline indices stay past `high_water()` until the request is resolved.
+//! - Range priority: once cl-chain has a range ready to send, it admits no new VerifyBls request
+//!   that carries inline an index the range covers. It waits for the in-flight ones as above,
+//!   sends the range, then resumes with those indices as `Validator(i)`. Without this, overlapping
+//!   imports that keep carrying an index inline could hold the range back forever, leaving gossip
+//!   from those validators at `UnknownIndex`.
 //! - Indices below the bound go as `Validator(i)`. If their append has not landed yet, they get
 //!   a transient `UnknownIndex`: IGNORE, and cl-chain retries.
 //! - After either side restarts, cl-chain sends no inline signers until the first

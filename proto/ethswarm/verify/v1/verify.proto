@@ -34,15 +34,41 @@ import "ethswarm/common/v1/error.proto";
 // transient VERIFY_STATUS_UNKNOWN_INDEX -> IGNORE and retry. After either side restarts, cl-chain sends
 // no inline signers until the first PubkeyFeedResponseBody on the new feed stream.
 // Feed hold-back: PubkeyFeed and VerifyBls are separate streams with no ordering between them, so a feed
-// range sent after a request could overtake it. cl-chain therefore MUST NOT send a PubkeyFeed range that
-// covers an index carried inline by an in-flight VerifyBls request until that request has completed (its
-// response is received) or been cancelled; after a reconnect of either stream it drains or cancels the
-// in-flight requests before sending the range. If cl-chain breaks this, the inline signer meets a cached
-// index and the result is ERROR_CODE_CONTRACT_VIOLATION, which correctly signals a cl-chain bug.
+// range sent after a request could overtake it. A range [start_index, start_index + count) covers an
+// index i when start_index <= i < start_index + count. cl-chain therefore MUST NOT send a PubkeyFeed range
+// that covers an index carried inline by an in-flight VerifyBls request until the matching
+// VerifyBlsResponseBody (same request_id on the same stream; request ids are per stream) has arrived, or
+// the stream-gone wait below has elapsed. Nothing else ends the hold-back: a local cancellation, a timeout
+// or a dropped waiter does NOT, because VerifyBls has no per-request cancel frame and cl-verify may still
+// resolve a request it has already buffered.
+// MAX_CLOCK_SKEW_MS = 1,000 ms: the most the wall clocks of cl-chain and cl-verify, which run on one
+// host, may disagree, a wall-clock step included. Both peers use it wherever one side's deadline is
+// judged against the other side's clock.
+// Stalled stream: cl-chain MUST close a VerifyBls stream on which a request has no response by its
+// deadline_unix_ms + MAX_CLOCK_SKEW_MS (cl-chain's clock). From then on the stream is gone.
+// Stream gone: if the VerifyBls stream is gone (broken, closed by either side, or closed as stalled)
+// before a response arrived, cl-chain waits until its clock has passed the latest
+// deadline_unix_ms + MAX_CLOCK_SKEW_MS of the inline-carrying requests it had in flight on that stream,
+// and only then sends the covering range. This is sound because of cl-verify's deadline rules below and
+// because, on stream close, cl-verify resolves no further signers for that stream's requests.
+// Range priority: once cl-chain has a range ready to send, it MUST NOT admit new VerifyBls requests that
+// carry inline an index the range covers. It waits for the in-flight ones as above, sends the range, then
+// resumes with those indices index-only (no inline_pubkey). Otherwise overlapping imports that keep
+// carrying an index inline could hold the range back forever and leave gossip signed by those validators
+// at VERIFY_STATUS_UNKNOWN_INDEX.
+// If cl-chain breaks these rules, the inline signer meets a cached index and the result is
+// ERROR_CODE_CONTRACT_VIOLATION, which correctly signals a cl-chain bug.
 //
-// Deadline semantics: every request carries deadline_unix_ms. cl-verify drops work it cannot finish by
-// then and answers VERIFY_STATUS_DEADLINE_EXCEEDED. A missing, timed-out, errored or UNSPECIFIED verdict
-// is NEVER treated as valid; only VERIFY_STATUS_VALID is. cl-chain has no in-process fallback.
+// Deadline semantics: every request carries deadline_unix_ms (wall-clock ms since the Unix epoch).
+// cl-verify drops work it cannot finish by then and answers VERIFY_STATUS_DEADLINE_EXCEEDED. A request
+// with deadline_unix_ms = 0, or one already past its deadline when cl-verify reads it, gets
+// VERIFY_STATUS_DEADLINE_EXCEEDED at once (for every set, on VerifyBls), with no signer resolution and
+// no BLS or KZG work. On VerifyBls, after any queue wait, cl-verify reads the cache high-water snapshot,
+// then checks now <= deadline_unix_ms immediately before any cache-dependent eligibility check, error
+// branches included; past it, every set is VERIFY_STATUS_DEADLINE_EXCEEDED. So every cache-dependent
+// outcome comes from a snapshot read no later than the deadline. A missing, timed-out, errored or
+// UNSPECIFIED verdict is NEVER treated as valid; only VERIFY_STATUS_VALID is. cl-chain has no in-process
+// fallback.
 //
 // Streams: every stream opens with exactly one `hello` frame from each side, then only `body` frames.
 // A first frame that is not hello, or a hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
@@ -88,6 +114,9 @@ message Signer {
 
 message BlsSet {
   // >1 signer means a fast-aggregate set (aggregates, sync contributions).
+  // At least one signer: a set with zero signers is ERROR_CODE_CONTRACT_VIOLATION, because
+  // eth_fast_aggregate_verify (altair/bls.md) returns true for zero pubkeys with the G2 point at infinity.
+  // cl-chain handles that case (a sync aggregate with no participants) itself and never sends it.
   // TODO(vera): max signers per set (MAX_VALIDATORS_PER_COMMITTEE = 2048 is the spec bound).
   repeated Signer signers = 1;
   // 32 bytes.
@@ -102,6 +131,8 @@ message VerifyBlsRequestBody {
   // At most 256 sets; more is ERROR_CODE_CONTRACT_VIOLATION.
   // TODO(vera): encoded message max in bytes.
   repeated BlsSet sets = 2;
+  // Wall-clock ms since the Unix epoch. 0, or already past when cl-verify reads the request: every set is
+  // VERIFY_STATUS_DEADLINE_EXCEEDED, with no signer resolution and no BLS work (see deadline semantics).
   uint64 deadline_unix_ms = 3;
   // The path every set in this request serves; one origin per request, as the inline cap is per request.
   // VERIFY_ORIGIN_UNSPECIFIED (0) is ERROR_CODE_CONTRACT_VIOLATION, like every enum. An unknown non-zero
@@ -153,8 +184,14 @@ message KzgCellProof {
 message VerifyKzgRequestBody {
   uint64 request_id = 1;
   // Cells of one or more column sidecars, checked with verify_cell_kzg_proof_batch (fulu/polynomial-commitments-sampling.md).
+  // At least one cell: a request body with zero cells is ERROR_CODE_CONTRACT_VIOLATION, never
+  // VERIFY_STATUS_VALID (an empty batch verifies vacuously in the spec, which must not become an ACCEPT).
+  // Like the BLS 256-set rule, it fails the call or stream (common.v1 ErrorCode CONTRACT_VIOLATION); it is
+  // not an in-band VerifyKzgResponseBody.err, which would leave status at 0 and break the zero-enum rule.
   // TODO(vera): max cells per request and encoded message max in bytes.
   repeated KzgCellProof cells = 2;
+  // Wall-clock ms since the Unix epoch. 0, or already past when cl-verify reads the request:
+  // VERIFY_STATUS_DEADLINE_EXCEEDED, with no KZG work (see deadline semantics).
   uint64 deadline_unix_ms = 3;
 }
 
@@ -185,7 +222,10 @@ message VerifyKzgResponse {
 // One rule for restart and lag: cl-verify reports its high-water mark first (PubkeyFeedResponseBody
 // right after its hello), and cl-chain resends from there.
 // cl-chain holds back a range that covers an index carried inline by an in-flight VerifyBls request
-// until that request has completed or been cancelled (see the feed hold-back above).
+// until that request's response has arrived on the same stream, or, once that stream is gone, until
+// the latest deadline_unix_ms + MAX_CLOCK_SKEW_MS of its in-flight inline requests has passed. A
+// cancellation or timeout on cl-chain's side does not end the hold-back, and a pending range takes
+// priority over new inline requests (see the feed hold-back and range priority above).
 message PubkeyFeedRequestBody {
   uint64 start_index = 1;
   // Must equal len(pubkeys); a mismatch is ERROR_CODE_CONTRACT_VIOLATION.
