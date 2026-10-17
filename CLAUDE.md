@@ -51,7 +51,7 @@ cargo test -p ci-checks                       # workflow rules + offline tests o
 
 `scripts/check-ssz-revs.sh` (`declare -A`) needs **bash ≥ 4**. On macOS `/bin/bash` is 3.2, and `check-ssz-revs.sh` fails there with "unbound variable", so run it with a Homebrew bash. `fetch-vectors.sh` needs python3 ≥ 3.11 (`tomllib`), `git`, `curl`, `sha256sum` and, for `.zip` assets, `unzip`. The script tests run `bash` from `PATH`.
 
-`bench/verify-ipc` is a **standalone workspace** (it has an empty `[workspace]` and is not a root member), and tonic-build needs `protoc`. It benchmarks BLS batch verification over UDS, comparing gRPC with raw framing. `cargo run --release --manifest-path bench/verify-ipc/Cargo.toml` runs the bench and starts its own `server` child. Its proto (`ethswarm.benchverify.v1`) is local to the bench and is not the real `proto/ethswarm/verify/v1` contract.
+`bench/verify-ipc` is a **standalone workspace** (it has an empty `[workspace]` and is not a root member), and tonic-prost-build needs `protoc`. It benchmarks BLS batch verification over UDS, comparing gRPC with raw framing. `cargo run --release --manifest-path bench/verify-ipc/Cargo.toml` runs the bench and starts its own `server` child. Its proto (`ethswarm.benchverify.v1`) is local to the bench and is not the real `proto/ethswarm/verify/v1` contract.
 
 ## Architecture
 

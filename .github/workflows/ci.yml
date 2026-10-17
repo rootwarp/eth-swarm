@@ -84,7 +84,7 @@ jobs:
           persist-credentials: false
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustc --version
-      - name: Install protoc (cl-verify build.rs runs tonic-build)
+      - name: Install protoc (ethswarm-proto build.rs runs tonic-prost-build)
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: protoc@3.36.2
@@ -101,12 +101,16 @@ jobs:
         run: bash scripts/check-bls-features.sh
       - name: cl-chain links only crypto-bls/aggregate, never crypto-bls/verify
         run: bash scripts/tests/check-cl-chain-features.test.sh && bash scripts/check-cl-chain-features.sh
+      - name: cl-chain builds on its own (no feature unification with spec-tests)
+        run: cargo check -p cl-chain --all-targets --locked
       - name: No dependency cycles among workspace crates (cargo metadata, every edge kind)
         run: bash scripts/tests/check-dep-cycles.test.sh && bash scripts/check-dep-cycles.sh
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Fetch and verify spec vectors (uncached)
         run: PRESETS="general minimal" bash testing/fetch-vectors.sh
       - run: cargo test --workspace --locked
+      - name: Every service runs the contract suite, in process and over UDS
+        run: bash scripts/tests/check-contract-tests.test.sh && bash scripts/check-contract-tests.sh
       - name: crypto-bls API tests with every feature (verify, aggregate, test-vectors)
         run: cargo test -p crypto-bls --all-features --locked
       - name: crypto-bls feature gate (aggregate only, trybuild)

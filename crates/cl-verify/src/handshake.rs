@@ -1,7 +1,7 @@
-//! Stream handshake: the peer's `common.v1.Hello` is compared with ours in full.
+//! Stream handshake: the peer's `common.v1.Hello` is compared with ours in full
+//! ([`ipc::hello::negotiate`]).
 
-use crate::proto::common::{Error, ErrorCode, ForkName, Hello};
-use crate::wire::wire_error;
+use crate::proto::common::{Error, Hello};
 
 /// Our side of the handshake plus the configured API-version floor.
 #[derive(Clone, Debug)]
@@ -22,6 +22,12 @@ impl Handshake {
         &self.ours
     }
 
+    /// The configured API-version floor.
+    #[must_use]
+    pub fn floor(&self) -> u32 {
+        self.floor
+    }
+
     /// Checks the peer's hello and returns the negotiated API version.
     ///
     /// The whole handshake is compared (proto/README.md rule 8): `api_version`,
@@ -30,63 +36,16 @@ impl Handshake {
     /// least `max(min_a, min_b)` and our floor. Only `build` is informational. A
     /// `FORK_NAME_UNSPECIFIED` entry is a contract violation.
     pub fn accept(&self, theirs: &Hello) -> Result<u32, Error> {
-        if theirs
-            .fork_schedule
-            .iter()
-            .any(|e| e.fork == ForkName::Unspecified as i32)
-        {
-            return Err(wire_error(
-                ErrorCode::ContractViolation,
-                "hello fork_schedule entry has FORK_NAME_UNSPECIFIED",
-            ));
-        }
-        let ours = &self.ours;
-        let mismatch =
-            |what: &str| wire_error(ErrorCode::VersionMismatch, format!("hello {what} differs"));
-        if theirs.api_version != ours.api_version {
-            return Err(mismatch("api_version"));
-        }
-        if theirs.genesis_validators_root != ours.genesis_validators_root {
-            return Err(mismatch("genesis_validators_root"));
-        }
-        if theirs.current_fork_digest != ours.current_fork_digest {
-            return Err(mismatch("current_fork_digest"));
-        }
-        if theirs.spec_pin != ours.spec_pin {
-            return Err(mismatch("spec_pin"));
-        }
-        if theirs.fork_schedule != ours.fork_schedule {
-            return Err(mismatch("fork_schedule"));
-        }
-        if theirs.blob_schedule != ours.blob_schedule {
-            return Err(mismatch("blob_schedule"));
-        }
-        let version = ours.max_api_version.min(theirs.max_api_version);
-        let lowest = ours
-            .min_api_version
-            .max(theirs.min_api_version)
-            .max(self.floor);
-        if version < lowest {
-            return Err(wire_error(
-                ErrorCode::VersionMismatch,
-                format!(
-                    "no common API version: ours {}..={}, theirs {}..={}, floor {}",
-                    ours.min_api_version,
-                    ours.max_api_version,
-                    theirs.min_api_version,
-                    theirs.max_api_version,
-                    self.floor
-                ),
-            ));
-        }
-        Ok(version)
+        ipc::hello::negotiate(&self.ours, theirs, self.floor).map_err(Error::from)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::common::{BlobScheduleEntry, ForkScheduleEntry, SpecPin};
+    use crate::proto::common::{
+        BlobScheduleEntry, ErrorCode, ForkName, ForkScheduleEntry, SpecPin,
+    };
 
     fn hello() -> Hello {
         Hello {

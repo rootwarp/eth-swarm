@@ -1,96 +1,12 @@
-//! Wire helpers shared by the server and the client mapping: `common.v1.Error` construction,
-//! `Error` <-> `tonic::Status`, and deadline arithmetic.
+//! Wire helpers shared by the server and the client mapping: `common.v1.Error` construction and
+//! `Error` <-> `tonic::Status` (from [`ipc::error`]), and deadline arithmetic.
 
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::time::{timeout_at, Instant};
 
-use prost::Message;
-use tonic::{Code, Status};
-
-use crate::proto::common::{Error, ErrorCode};
-
-/// `common.v1.Error.detail` max length in bytes (error.proto).
-pub const MAX_DETAIL_BYTES: usize = 1024;
-
-/// Builds a wire error, truncating `detail` to [`MAX_DETAIL_BYTES`] on a char boundary.
-#[must_use]
-pub fn wire_error(code: ErrorCode, detail: impl Into<String>) -> Error {
-    let mut detail = detail.into();
-    if detail.len() > MAX_DETAIL_BYTES {
-        let mut cut = MAX_DETAIL_BYTES;
-        while !detail.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        detail.truncate(cut);
-    }
-    Error {
-        code: code as i32,
-        detail,
-    }
-}
-
-/// Status that fails a stream. The `common.v1.Error` travels prost-encoded in the status details.
-#[must_use]
-pub fn to_status(err: &Error) -> Status {
-    let code = match err.code() {
-        ErrorCode::ContractViolation | ErrorCode::ForkDigestMismatch | ErrorCode::SszDecode => {
-            Code::InvalidArgument
-        }
-        ErrorCode::VersionMismatch => Code::FailedPrecondition,
-        ErrorCode::DeadlineExceeded => Code::DeadlineExceeded,
-        ErrorCode::Overloaded => Code::ResourceExhausted,
-        _ => Code::Unavailable,
-    };
-    Status::with_details(code, err.detail.clone(), err.encode_to_vec().into())
-}
-
-/// The `common.v1.Error` a stream failed with. A status without (valid) details, such as one
-/// raised by the transport itself, is mapped from its gRPC code.
-#[must_use]
-pub fn error_from_status(status: &Status) -> Error {
-    if let Ok(err) = Error::decode(status.details()) {
-        if err.code != ErrorCode::Unspecified as i32 {
-            return err;
-        }
-    }
-    let code = match status.code() {
-        Code::DeadlineExceeded | Code::Cancelled => ErrorCode::DeadlineExceeded,
-        Code::ResourceExhausted => ErrorCode::Overloaded,
-        Code::InvalidArgument | Code::OutOfRange | Code::PermissionDenied => {
-            ErrorCode::ContractViolation
-        }
-        Code::FailedPrecondition => ErrorCode::VersionMismatch,
-        _ => ErrorCode::ResourceUnavailable,
-    };
-    wire_error(code, status.message())
-}
-
-/// tonic's message for a request frame that prost could not decode (`Code::Internal`).
-const DECODE_FAILURE: &str = "failed to decode Protobuf message";
-
-/// Maps an error tonic raised while receiving a request frame. tonic reports a message over the
-/// decoding limit as `OutOfRange` from the frame header, before decoding it: a cap breach. A frame
-/// that does not decode as protobuf is malformed input, also a contract violation. Anything else
-/// is a transport failure.
-#[must_use]
-pub fn inbound_error(status: &Status) -> Error {
-    match status.code() {
-        Code::OutOfRange => wire_error(
-            ErrorCode::ContractViolation,
-            format!("request over the message cap: {}", status.message()),
-        ),
-        Code::Internal if status.message().starts_with(DECODE_FAILURE) => wire_error(
-            ErrorCode::ContractViolation,
-            format!("malformed request frame: {}", status.message()),
-        ),
-        _ => wire_error(
-            ErrorCode::ResourceUnavailable,
-            format!("receive failed: {}", status.message()),
-        ),
-    }
-}
+pub use ipc::error::{error_from_status, inbound_error, to_status, wire_error, MAX_DETAIL_BYTES};
 
 /// The wall clock deadlines are judged against. Injected so tests can step it.
 pub trait WallClock: Send + Sync + 'static {
@@ -181,7 +97,9 @@ pub fn time_left(deadline_unix_ms: u64, now_unix_ms: u64) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::common::ErrorCode;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use tonic::{Code, Status};
 
     #[test]
     fn detail_is_truncated_on_a_char_boundary() {

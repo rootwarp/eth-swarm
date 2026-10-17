@@ -12,8 +12,10 @@ cl-verify-cache = { path = "../cl-verify-cache" }
 blst = "0.3.17"
 crypto-kzg = { path = "../crypto-kzg" }
 network-config = { path = "../network-config" }
-tonic = "0.12.3"
-prost = "0.13.5"
+ethswarm-proto = { path = "../ethswarm-proto" }
+ipc = { path = "../ipc" }
+tonic.workspace = true
+prost.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 rand = "0.8"
@@ -28,11 +30,9 @@ test-backends = []
 
 [dev-dependencies]
 cl-verify = { path = ".", features = ["test-backends"] }
+ipc = { path = "../ipc", features = ["testkit"] }
 tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 sha2 = "0.10"
-tower = "0.4"
+tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
-
-[build-dependencies]
-tonic-build = "0.12.3"

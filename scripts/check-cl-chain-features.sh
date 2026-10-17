@@ -15,9 +15,8 @@
 # across a build. spec-tests enables `crypto-bls/verify` (and `test-vectors`), so any build that
 # includes spec-tests (e.g. `cargo build --workspace`) compiles crypto-bls with `verify` for
 # cl-chain too, and this script does not see it. Release artifacts must therefore come from
-# per-service builds. Once cl-chain exists, CI must also run
-# `cargo check -p cl-chain --all-targets --locked` on its own; that step is deferred until the
-# cl-chain crate lands.
+# per-service builds. CI therefore also runs `cargo check -p cl-chain --all-targets --locked` on
+# its own.
 #
 # Passes with a message while the workspace has no cl-chain package. A failed or empty
 # `cargo tree` is not a pass.
@@ -48,9 +47,12 @@ if [[ $present != True ]]; then
   exit 0
 fi
 
+# Deduplicated: every package node still appears once with its resolved feature set, and every
+# feature edge once. `--no-dedupe` would expand the whole tonic/SSZ feature graph under cl-chain
+# and does not finish in reasonable time.
 rc=0
 tree=$("$cargo" tree --locked --manifest-path "$manifest" -p "$package" -e features \
-  --all-features --target all --prefix none --no-dedupe --format '{p} {f}' 2>&1) || rc=$?
+  --all-features --target all --prefix none --format '{p} {f}' 2>&1) || rc=$?
 if ((rc != 0)) || [[ $tree != *"$package"* ]]; then
   echo "ERROR: cargo tree -p $package -e features failed (exit $rc):" >&2
   printf '%s\n' "$tree" >&2

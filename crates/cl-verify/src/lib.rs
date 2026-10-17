@@ -17,21 +17,8 @@ pub mod server;
 pub mod startup;
 pub mod wire;
 
-/// Generated `ethswarm.*.v1` bindings.
-#[allow(clippy::all, clippy::pedantic)] // tonic/prost generated code
+/// The `ethswarm.common.v1` and `ethswarm.verify.v1` bindings (generated in `ethswarm-proto`).
 pub mod proto {
-    pub mod ethswarm {
-        pub mod common {
-            pub mod v1 {
-                tonic::include_proto!("ethswarm.common.v1");
-            }
-        }
-        pub mod verify {
-            pub mod v1 {
-                tonic::include_proto!("ethswarm.verify.v1");
-            }
-        }
-    }
-    pub use ethswarm::common::v1 as common;
-    pub use ethswarm::verify::v1 as verify;
+    pub use ethswarm_proto::ethswarm;
+    pub use ethswarm_proto::{common, verify};
 }

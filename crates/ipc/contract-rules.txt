@@ -1,0 +1,10 @@
+# Every rule of ipc::testkit::Rule::ALL, in order. Each service's `tests/contract.rs` must list
+# each of them as `in_process::<rule>` and `uds::<rule>` (scripts/check-contract-tests.sh).
+hello_version_n_n1
+hello_floor
+hello_pin_mismatch
+hello_once
+seq_monotonic
+envelope_type_rules
+envelope_digest_mismatch
+unary_no_hello

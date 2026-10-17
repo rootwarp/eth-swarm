@@ -1,0 +1,18 @@
+[package]
+name = "cl-store"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "cl-store: the ethswarm.store.v1 service (stub: contract layer only, every RPC answers UNIMPLEMENTED)."
+
+[dependencies]
+ethswarm-proto = { path = "../ethswarm-proto" }
+ipc = { path = "../ipc" }
+tonic.workspace = true
+
+[dev-dependencies]
+ipc = { path = "../ipc", features = ["testkit"] }
+network-config = { path = "../network-config" }
+tokio-stream = "0.1"

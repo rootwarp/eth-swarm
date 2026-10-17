@@ -1,0 +1,16 @@
+[package]
+name = "cl-p2p"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "cl-p2p: the ethswarm.p2p.v1 service (stub: contract layer only, every RPC answers UNIMPLEMENTED)."
+
+[dependencies]
+ethswarm-proto = { path = "../ethswarm-proto" }
+ipc = { path = "../ipc" }
+tonic.workspace = true
+
+[dev-dependencies]
+ipc = { path = "../ipc", features = ["testkit"] }

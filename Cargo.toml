@@ -10,6 +10,15 @@ members = [
     "crates/crypto-kzg",
     "crates/crypto-bls",
     "crates/cl-verify",
+    "crates/ethswarm-proto",
+    "crates/ipc",
+    "crates/cl-chain",
+    "crates/cl-store",
+    "crates/cl-engine",
+    "crates/cl-p2p",
+    "crates/cl-discv5",
+    "crates/cl-sync",
+    "crates/cl-api",
 ]
 
 [workspace.package]
@@ -26,6 +35,12 @@ tree_hash_derive = "0.12"
 milhouse = { version = "0.9", default-features = false }
 alloy-primitives = "1"
 typenum = "1"
+# gRPC stack: one tonic/prost version across the workspace (`cargo tree -d` must show one tonic).
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
+prost = "0.14.4"
+prost-types = "0.14.4"
 
 # Pinned to the exact revisions Lighthouse `unstable` uses (see arch/ssz-crate-check.md).
 # Progressive SSZ types (EIP-7916/7495-successor/8016) are only on these git revisions, not on crates.io.

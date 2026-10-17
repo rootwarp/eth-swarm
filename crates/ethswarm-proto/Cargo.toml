@@ -1,0 +1,19 @@
+[package]
+name = "ethswarm-proto"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Generated tonic/prost bindings for every ethswarm.*.v1 protobuf package."
+
+[dependencies]
+tonic.workspace = true
+prost.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+
+[dev-dependencies]
+prost-types.workspace = true
