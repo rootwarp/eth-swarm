@@ -13,6 +13,16 @@
 //! stream: the table is closed, as it is on a stream error or end, so nothing that still arrives
 //! on it is ACCEPT. A response for a request whose deadline already passed, or presented with a
 //! tag of another stream, is late: IGNORE.
+//!
+//! A tag belongs to the table of the stream that issued it (its generation). Presented against
+//! another stream's table, a body, a timeout, a stream error or an end of stream changes nothing
+//! there: nothing expires, the table is not closed, and the body is not counted in that table's
+//! [`Outstanding::late_dropped`]. So settle a body that arrives under an old stream's tag against
+//! that old (closed) table, where it is counted as late.
+//!
+//! A request without items (a BLS batch of zero sets, a KZG request of zero cells) is refused
+//! locally by [`Outstanding::issue`] with `ERROR_CODE_CONTRACT_VIOLATION`: the caller finishes it
+//! locally and never sends it, and an empty batch never becomes ACCEPT.
 
 use std::future::Future;
 
@@ -115,6 +125,19 @@ fn ended(outstanding: &mut Outstanding) {
     outstanding.close();
 }
 
+/// Whether `tag` was issued by another stream's table than `outstanding` (another generation).
+/// Its body, timeout, error or end of stream is late there and must not expire or close anything.
+fn foreign(outstanding: &Outstanding, tag: RequestTag) -> bool {
+    let other = tag.generation != outstanding.generation();
+    if other {
+        tracing::debug!(
+            request_id = tag.request_id,
+            "cl-verify outcome under another stream's tag dropped"
+        );
+    }
+    other
+}
+
 /// One verdict per request set, in request order, for the request tagged `tag` with `n_sets`
 /// sets. A stream error, a response that does not settle ([`settle_bls`]), or a result count
 /// other than `n_sets` makes every set IGNORE: results are matched to sets by position, so a
@@ -123,7 +146,9 @@ fn ended(outstanding: &mut Outstanding) {
 /// A stream error or a fence violation also closes `outstanding` (the stream is failed), so a
 /// later response on it, however well fenced, is IGNORE too. Check
 /// [`Outstanding::is_closed`] to know the stream must be replaced. Responses may arrive out of
-/// order: pass each one with the tag of the request its `request_id` names.
+/// order: pass each one with the tag of the request its `request_id` names. A `tag` of another
+/// stream is IGNORE and leaves `outstanding` as it is, whatever `response` is (see the module
+/// docs). `n_sets` is at least 1: an empty batch is never issued ([`Outstanding::issue`]).
 #[must_use]
 pub fn bls_verdicts(
     response: Result<VerifyBlsResponseBody, Status>,
@@ -132,6 +157,9 @@ pub fn bls_verdicts(
     n_sets: usize,
 ) -> Vec<Verdict> {
     let ignore = || vec![Verdict::Ignore; n_sets];
+    if foreign(outstanding, tag) {
+        return ignore();
+    }
     let Ok(body) = response else {
         ended(outstanding);
         return ignore();
@@ -152,13 +180,17 @@ pub fn bls_verdicts(
 
 /// Batch verdict for the KZG request tagged `tag`. A response that does not settle
 /// ([`settle_kzg`]) is IGNORE, and an `err` wins over any status. A stream error or a fence
-/// violation closes `outstanding`, as in [`bls_verdicts`].
+/// violation closes `outstanding`, as in [`bls_verdicts`]; a `tag` of another stream leaves it
+/// as it is.
 #[must_use]
 pub fn kzg_verdict(
     response: Result<VerifyKzgResponseBody, Status>,
     outstanding: &mut Outstanding,
     tag: RequestTag,
 ) -> Verdict {
+    if foreign(outstanding, tag) {
+        return Verdict::Ignore;
+    }
     let Ok(body) = response else {
         ended(outstanding);
         return Verdict::Ignore;
@@ -174,12 +206,15 @@ pub fn kzg_verdict(
 }
 
 /// What the next response body did by the deadline: the body to map, or `None` once it is
-/// accounted for as IGNORE.
+/// accounted for as IGNORE. Under a `tag` of another stream nothing is expired or closed.
 fn by_deadline_body<B: FencedResult>(
     raced: Timed<Result<Option<B>, Status>>,
     outstanding: &mut Outstanding,
     tag: RequestTag,
 ) -> Option<B> {
+    if foreign(outstanding, tag) {
+        return None;
+    }
     match raced {
         Timed::InTime(Ok(Some(body))) => Some(body),
         // Nothing yet: the request expires, and its response, if it still comes, is late.
@@ -207,7 +242,8 @@ fn by_deadline_body<B: FencedResult>(
 /// `deadline_unix_ms` is judged against). With no body by then the request expires: its
 /// response, if it still comes, is late. A body that is ready only after the deadline is late
 /// at once: it is dropped, counted ([`Outstanding::late_dropped`]) and frees its entry. A
-/// stream error or end closes `outstanding`.
+/// stream error or end closes `outstanding`. Under a `tag` of another stream all of this is
+/// IGNORE and `outstanding` is left as it is: settle that stream's bodies against its own table.
 pub async fn bls_verdicts_by<F>(
     deadline: &Deadline,
     clock: &dyn WallClock,
@@ -540,6 +576,90 @@ mod tests {
             .unwrap_err()
             .is_ignore());
         assert_eq!(kzg_verdict(Ok(kbody), &mut new, old_ktag), Verdict::Ignore);
+    }
+
+    /// An old stream's table with one request, and a new table whose request has the same id.
+    fn old_and_new() -> (RequestTag, Outstanding, RequestTag) {
+        let mut old = outstanding();
+        let (old_tag, _) = bls_request(&mut old, 1);
+        let mut new = Outstanding::new(Generation::new(0x9f).unwrap(), 8);
+        let (new_tag, _) = bls_request(&mut new, 1);
+        assert_eq!(old_tag.request_id, new_tag.request_id);
+        (old_tag, new, new_tag)
+    }
+
+    /// The new table is untouched: open, its request outstanding, nothing counted as late.
+    fn untouched(new: &Outstanding, what: &str) {
+        assert!(!new.is_closed(), "{what}: the new table stays open");
+        assert_eq!(new.len(), 1, "{what}: its request stays outstanding");
+        assert_eq!(
+            new.late_dropped(),
+            0,
+            "{what}: nothing late on the new table"
+        );
+    }
+
+    #[test]
+    fn an_old_tag_on_an_error_does_not_close_the_new_table() {
+        let (old_tag, mut new, new_tag) = old_and_new();
+        assert_eq!(
+            bls_verdicts(Err(Status::internal("old stream")), &mut new, old_tag, 1),
+            vec![Verdict::Ignore]
+        );
+        untouched(&new, "bls error");
+        assert_eq!(
+            kzg_verdict(Err(Status::internal("old stream")), &mut new, old_tag),
+            Verdict::Ignore
+        );
+        untouched(&new, "kzg error");
+        // The new stream's own error still fails it.
+        let _ = bls_verdicts(Err(Status::internal("boom")), &mut new, new_tag, 1);
+        assert!(new.is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_old_tag_on_timeout_error_or_eof_leaves_the_new_table_alone() {
+        let deadline = deadline_in(50, &SystemClock);
+        let (old_tag, mut new, new_tag) = old_and_new();
+
+        let never = std::future::pending::<Result<Option<VerifyBlsResponseBody>, Status>>();
+        let got = bls_verdicts_by(&deadline, &SystemClock, &mut new, old_tag, 1, never).await;
+        assert_eq!(got, vec![Verdict::Ignore]);
+        untouched(&new, "bls timeout");
+
+        let kzg_never = std::future::pending::<Result<Option<VerifyKzgResponseBody>, Status>>();
+        let got = kzg_verdict_by(&deadline, &SystemClock, &mut new, old_tag, kzg_never).await;
+        assert_eq!(got, Verdict::Ignore);
+        untouched(&new, "kzg timeout");
+
+        let deadline = deadline_in(5_000, &SystemClock);
+        let eof = async { Ok(None) };
+        let got = bls_verdicts_by(&deadline, &SystemClock, &mut new, old_tag, 1, eof).await;
+        assert_eq!(got, vec![Verdict::Ignore]);
+        untouched(&new, "bls eof");
+
+        let error = async { Err(Status::internal("old stream")) };
+        let got = kzg_verdict_by(&deadline, &SystemClock, &mut new, old_tag, error).await;
+        assert_eq!(got, Verdict::Ignore);
+        untouched(&new, "kzg error");
+
+        // A late body under the old tag is not counted on the new table either.
+        let past = deadline_in(1, &SystemClock);
+        tokio::time::advance(Duration::from_millis(2)).await;
+        let mut other = outstanding();
+        let (_, old_request) = bls_request(&mut other, 1);
+        let body = bls_answer(&old_request, vec![status(VerifyStatus::Valid)]);
+        let late = async { Ok(Some(body)) };
+        let got = bls_verdicts_by(&past, &SystemClock, &mut new, old_tag, 1, late).await;
+        assert_eq!(got, vec![Verdict::Ignore]);
+        untouched(&new, "late body");
+
+        // The new stream's own timeout still expires its request.
+        let past = deadline_in(1, &SystemClock);
+        tokio::time::advance(Duration::from_millis(2)).await;
+        let never = std::future::pending::<Result<Option<VerifyBlsResponseBody>, Status>>();
+        let _ = bls_verdicts_by(&past, &SystemClock, &mut new, new_tag, 1, never).await;
+        assert!(new.is_empty() && !new.is_closed());
     }
 
     #[test]

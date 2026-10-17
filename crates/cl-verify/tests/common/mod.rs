@@ -17,7 +17,10 @@ use cl_verify::proto::common::{
 };
 use cl_verify::proto::verify::verify_service_client::VerifyServiceClient;
 use cl_verify::proto::verify::*;
-use cl_verify::server::{serve_uds, Limits, ServerConfig, VerifyServer, DEFAULT_SNAPSHOT_INTERVAL};
+use cl_verify::server::{
+    serve_uds, serve_uds_draining, Limits, ServeError, ServerConfig, VerifyServer,
+    DEFAULT_SNAPSHOT_INTERVAL,
+};
 use cl_verify::wire::{error_from_status, now_unix_ms, SystemClock, WallClock};
 use hyper_util::rt::TokioIo;
 use ipc::fence::{FencedRequest, Outstanding, RequestTag};
@@ -128,6 +131,8 @@ pub struct Options {
     pub snapshot: Option<PathBuf>,
     /// The snapshot save interval; `None` means the default.
     pub snapshot_interval: Option<Duration>,
+    /// Serve with `serve_uds_draining` and this drain timeout; `None` means `serve_uds`.
+    pub drain: Option<Duration>,
 }
 
 impl Default for Options {
@@ -141,6 +146,7 @@ impl Default for Options {
             clock: Arc::new(SystemClock),
             snapshot: None,
             snapshot_interval: None,
+            drain: None,
         }
     }
 }
@@ -149,9 +155,11 @@ pub struct Harness {
     pub server: VerifyServer,
     pub client: VerifyServiceClient<Channel>,
     pub cache: SharedCache,
+    /// The Unix socket the server listens on.
+    pub socket: PathBuf,
     _dir: tempfile::TempDir,
-    shutdown: oneshot::Sender<()>,
-    serving: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    shutdown: Option<oneshot::Sender<()>>,
+    serving: tokio::task::JoinHandle<Result<(), ServeError>>,
 }
 
 impl Harness {
@@ -165,13 +173,32 @@ impl Harness {
             ..
         } = self;
         drop(client);
-        let _ = shutdown.send(());
-        tokio::time::timeout(Duration::from_secs(20), serving)
-            .await
-            .expect("server shut down within 20 s")
-            .unwrap()
-            .unwrap();
+        if let Some(tx) = shutdown {
+            let _ = tx.send(());
+        }
+        served(serving).await.unwrap();
     }
+
+    /// Signals the server to shut down; returns at once.
+    pub fn begin_shutdown(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+    }
+
+    /// Waits up to 20 s for the server to return, and returns what it returned.
+    pub async fn served(self) -> Result<(), ServeError> {
+        served(self.serving).await
+    }
+}
+
+async fn served(
+    serving: tokio::task::JoinHandle<Result<(), ServeError>>,
+) -> Result<(), ServeError> {
+    tokio::time::timeout(Duration::from_secs(20), serving)
+        .await
+        .expect("server shut down within 20 s")
+        .unwrap()
 }
 
 pub async fn start() -> Harness {
@@ -188,28 +215,35 @@ pub async fn start_with(o: Options) -> Harness {
     }
     let server =
         VerifyServer::with_backends_and_clock(config, o.cache.clone(), o.bls, o.kzg, o.clock);
-    serve_on(&path, server.clone(), dir, o.cache).await
+    serve_on(&path, server.clone(), dir, o.cache, o.drain).await
 }
 
-/// Serves `server` on a Unix socket at `path` and connects a client.
+/// Serves `server` on a Unix socket at `path` (draining for `drain` at shutdown, if given) and
+/// connects a client.
 pub async fn serve_on(
     path: &Path,
     server: VerifyServer,
     dir: tempfile::TempDir,
     cache: SharedCache,
+    drain: Option<Duration>,
 ) -> Harness {
     let listener = UnixListener::bind(path).unwrap();
     let (tx, rx) = oneshot::channel::<()>();
-    let serving = tokio::spawn(serve_uds(listener, server.clone(), async {
+    let stop = async {
         let _ = rx.await;
-    }));
+    };
+    let serving = match drain {
+        Some(drain) => tokio::spawn(serve_uds_draining(listener, server.clone(), stop, drain)),
+        None => tokio::spawn(serve_uds(listener, server.clone(), stop)),
+    };
     let client = VerifyServiceClient::new(connect(path).await);
     Harness {
         server,
         client,
         cache,
+        socket: path.to_path_buf(),
         _dir: dir,
-        shutdown: tx,
+        shutdown: Some(tx),
         serving,
     }
 }

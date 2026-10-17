@@ -30,6 +30,13 @@ const FAR_DEADLINE: Duration = Duration::from_secs(365 * 24 * 3600);
 /// A wire deadline (`deadline_unix_ms`) plus the monotonic instant derived from it when the
 /// request was read. It is open only while both hold: the monotonic check covers a wall clock
 /// that steps backwards, the wall check one that steps forwards.
+///
+/// The deadline millisecond itself is open, everywhere: `verify.proto` answers a request
+/// `DEADLINE_EXCEEDED` once it is *past* its deadline and resolves signers while
+/// `now <= deadline_unix_ms`. So a request read at exactly `unix_ms` is admitted
+/// ([`Deadline::new`]), [`Deadline::open`] holds while the wall clock reads at most `unix_ms`, and
+/// the monotonic instant is the end of that millisecond (`unix_ms + 1` as read on admission).
+/// An unset (0) deadline is never open.
 #[derive(Clone, Copy, Debug)]
 pub struct Deadline {
     at: Instant,
@@ -37,7 +44,7 @@ pub struct Deadline {
 }
 
 impl Deadline {
-    /// `None` if `unix_ms` is unset (0) or leaves no time on `clock`.
+    /// `None` if `unix_ms` is unset (0) or already past on `clock` (`now > unix_ms`).
     #[must_use]
     pub fn new(unix_ms: u64, clock: &dyn WallClock) -> Option<Self> {
         let left = time_left(unix_ms, clock.now_unix_ms())?;
@@ -111,14 +118,17 @@ pub fn now_unix_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// Time left until `deadline_unix_ms`, or `None` if it has passed. An unset (0) deadline has
-/// always passed: work is never started without one.
+/// Time left until the end of the deadline millisecond (see [`Deadline`]), or `None` if the
+/// deadline is past (`now > deadline`). An unset (0) deadline has always passed: work is never
+/// started without one.
 #[must_use]
 pub fn time_left(deadline_unix_ms: u64, now_unix_ms: u64) -> Option<Duration> {
+    if deadline_unix_ms == 0 {
+        return None;
+    }
     deadline_unix_ms
         .checked_sub(now_unix_ms)
-        .filter(|ms| *ms > 0)
-        .map(Duration::from_millis)
+        .map(|ms| Duration::from_millis(ms.saturating_add(1)))
 }
 
 #[cfg(test)]
@@ -225,21 +235,50 @@ mod tests {
     }
 
     #[test]
-    fn deadline_needs_time_left_on_the_wall_clock() {
+    fn deadline_needs_a_set_deadline_not_yet_past_on_the_wall_clock() {
         let clock = Manual(AtomicU64::new(1_000));
         assert!(Deadline::new(0, &clock).is_none());
-        assert!(Deadline::new(1_000, &clock).is_none());
+        assert!(Deadline::new(999, &clock).is_none());
         let d = Deadline::new(u64::MAX, &clock).expect("far deadlines do not overflow");
         assert_eq!(d.unix_ms(), u64::MAX);
         assert!(SystemClock.now_unix_ms() > 1_700_000_000_000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_millisecond_itself_is_open_on_admission_and_after() {
+        // Read at exactly unix_ms: not yet past, so admitted, and open for that whole millisecond.
+        let clock = Manual(AtomicU64::new(1_000));
+        let d = Deadline::new(1_000, &clock).expect("now == unix_ms is not past");
+        assert!(d.open(&clock));
+        assert_eq!(by_deadline(&d, &clock, async { 7 }).await, Some(7));
+        tokio::time::advance(Duration::from_micros(999)).await;
+        assert!(d.open(&clock), "still inside the deadline millisecond");
+        tokio::time::advance(Duration::from_micros(1)).await;
+        assert!(
+            !d.open(&clock),
+            "the next millisecond is past on the monotonic clock"
+        );
+        clock.0.store(1_001, Ordering::SeqCst);
+        assert!(
+            Deadline::new(1_000, &clock).is_none(),
+            "one ms later is past"
+        );
     }
 
     #[test]
     fn deadline_in_the_past_or_unset_has_no_time_left() {
         assert_eq!(time_left(0, 1_000), None);
         assert_eq!(time_left(999, 1_000), None);
-        assert_eq!(time_left(1_000, 1_000), None);
-        assert_eq!(time_left(1_250, 1_000), Some(Duration::from_millis(250)));
+        assert_eq!(
+            time_left(1_000, 1_000),
+            Some(Duration::from_millis(1)),
+            "the deadline millisecond itself is left"
+        );
+        assert_eq!(time_left(1_250, 1_000), Some(Duration::from_millis(251)));
+        assert_eq!(
+            time_left(u64::MAX, 0),
+            Some(Duration::from_millis(u64::MAX))
+        );
         assert!(now_unix_ms() > 1_700_000_000_000);
     }
 }

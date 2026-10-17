@@ -17,7 +17,10 @@ use std::time::Duration;
 use cl_verify::proto::common::Hello;
 use cl_verify::proto::verify::verify_service_client::VerifyServiceClient;
 use cl_verify::server::Limits;
-use cl_verify::startup::{local_hello, run_with, Readiness, StartupConfig, StartupError};
+use cl_verify::startup::{
+    local_hello, run_with, run_with_signals, Readiness, StartupConfig, StartupError, Stopped,
+    Termination,
+};
 use common::*;
 use crypto_kzg::{SetupError, BETA4_MAINNET_SHA256};
 use sha2::{Digest, Sha256};
@@ -260,8 +263,11 @@ async fn occupied_socket_path_is_a_bind_error() {
     let socket = dir.path().join("verify.sock");
     std::fs::write(&socket, b"not a socket").unwrap();
     let readiness = Recorder::default();
-    let err = run_with(startup_config(setup_config(), &socket), &readiness, async {
-    })
+    let err = run_with(
+        startup_config(setup_config(), &socket),
+        &readiness,
+        std::future::pending(),
+    )
     .await
     .unwrap_err();
     assert!(matches!(err, StartupError::Bind { .. }), "{err:?}");
@@ -275,13 +281,85 @@ async fn stale_socket_from_a_previous_run_is_replaced() {
     let socket = dir.path().join("verify.sock");
     drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
     assert!(socket.exists());
-    let readiness = Recorder::default();
+    let (woken_tx, woken) = oneshot::channel();
+    let readiness = Recorder {
+        woken: Mutex::new(Some(woken_tx)),
+        ..Recorder::default()
+    };
+    // Shut down as soon as READY is sent.
     run_with(startup_config(setup_config(), &socket), &readiness, async {
+        let _ = woken.await;
     })
     .await
     .unwrap();
     assert_eq!(readiness.calls.load(Ordering::SeqCst), 1);
     assert!(!socket.exists(), "our socket is removed on exit");
+}
+
+#[tokio::test]
+async fn a_shutdown_during_setup_binds_nothing_and_sends_no_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("verify.sock");
+    let readiness = Recorder::default();
+    // The signal arrived while the trusted setup was loading: shutdown has already happened.
+    run_with(startup_config(setup_config(), &socket), &readiness, async {
+    })
+    .await
+    .expect("a clean exit");
+    assert!(
+        !socket.exists(),
+        "socket bound after shutdown was requested"
+    );
+    assert_eq!(readiness.calls.load(Ordering::SeqCst), 0, "READY sent");
+
+    let (signals, sender) = Termination::channel();
+    sender.signal();
+    let readiness = Recorder::default();
+    let stopped = run_with_signals(startup_config(setup_config(), &socket), &readiness, signals)
+        .await
+        .unwrap();
+    assert_eq!(stopped, Stopped::Graceful);
+    assert!(!socket.exists());
+    assert_eq!(readiness.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_second_signal_during_the_drain_returns_at_once_without_the_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("verify.sock");
+    let snapshot = dir.path().join("pubkeys.bin");
+    let mut cfg = startup_config(setup_config(), &socket);
+    cfg.server.pubkey_snapshot = snapshot.clone();
+    cfg.drain_timeout = Duration::from_secs(60);
+    let (woken_tx, woken) = oneshot::channel();
+    let readiness = std::sync::Arc::new(Recorder {
+        woken: Mutex::new(Some(woken_tx)),
+        ..Recorder::default()
+    });
+    let (signals, sender) = Termination::channel();
+    let task = {
+        let readiness = std::sync::Arc::clone(&readiness);
+        tokio::spawn(async move { run_with_signals(cfg, readiness.as_ref(), signals).await })
+    };
+    tokio::time::timeout(Duration::from_secs(30), woken)
+        .await
+        .expect("READY within 30 s")
+        .unwrap();
+    // The open feed stream holds the drain for its full minute.
+    let (_client, _feed) = feed_dirty_snapshot(&socket, hello(), &snapshot, 3, 5).await;
+    sender.signal();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!task.is_finished(), "draining");
+    sender.signal();
+    let stopped = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the second signal ends it at once")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped, Stopped::Forced);
+    assert!(!snapshot_holds(&snapshot, 5), "the flush was skipped");
+    assert!(snapshot_holds(&snapshot, 3), "the last save is intact");
+    assert!(!socket.exists(), "socket removed");
 }
 
 #[tokio::test]
@@ -375,6 +453,15 @@ fn binary_exits_nonzero_on_a_tampered_setup_without_binding() {
 
 /// Starts the binary on a fresh dir and waits for its socket.
 fn spawn_binary(dir: &Path) -> std::process::Child {
+    spawn_binary_with(dir, &dir.join("pubkeys.bin"), std::process::Stdio::null())
+}
+
+/// [`spawn_binary`] with the given snapshot path and stderr.
+fn spawn_binary_with(
+    dir: &Path,
+    snapshot: &Path,
+    stderr: std::process::Stdio,
+) -> std::process::Child {
     let socket = dir.join("verify.sock");
     let mut child = cl_verify()
         .arg("--trusted-setup")
@@ -383,8 +470,8 @@ fn spawn_binary(dir: &Path) -> std::process::Child {
         .arg(&socket)
         .args(["--peer-uid", &my_uid().to_string()])
         .arg("--pubkey-snapshot")
-        .arg(dir.join("pubkeys.bin"))
-        .stderr(std::process::Stdio::null())
+        .arg(snapshot)
+        .stderr(stderr)
         .spawn()
         .unwrap();
     for _ in 0..300 {
@@ -398,13 +485,18 @@ fn spawn_binary(dir: &Path) -> std::process::Child {
     panic!("cl-verify did not bind {} within 30 s", socket.display());
 }
 
-/// Sends `signal` to `child` and returns its exit status, within 30 s.
-fn signal_and_wait(child: &mut std::process::Child, signal: &str) -> std::process::ExitStatus {
+/// Sends `signal` to `child`.
+fn send_signal(child: &std::process::Child, signal: &str) {
     let sent = Command::new("kill")
         .args([signal, &child.id().to_string()])
         .status()
         .unwrap();
     assert!(sent.success());
+}
+
+/// Sends `signal` to `child` and returns its exit status, within 30 s.
+fn signal_and_wait(child: &mut std::process::Child, signal: &str) -> std::process::ExitStatus {
+    send_signal(child, signal);
     for _ in 0..300 {
         if let Some(status) = child.try_wait().unwrap() {
             return status;
@@ -428,6 +520,63 @@ async fn binary_sigterm_flushes_the_snapshot_removes_the_socket_and_exits_0() {
     let status = tokio::task::block_in_place(|| signal_and_wait(&mut child, "-TERM"));
     assert_eq!(status.code(), Some(0), "{status:?}");
     assert!(snapshot_holds(&snapshot, 5), "dirty snapshot flushed");
+    assert!(!socket.exists(), "socket removed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn binary_second_sigterm_exits_3_at_once_without_the_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("verify.sock");
+    let snapshot = dir.path().join("pubkeys.bin");
+    let mut child = spawn_binary(dir.path());
+    // The feed stream stays open, so the first SIGTERM drains for the default 10 s.
+    let (_client, _feed) = feed_dirty_snapshot(&socket, local_hello(), &snapshot, 3, 5).await;
+    send_signal(&child, "-TERM");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(child.try_wait().unwrap().is_none(), "draining");
+    let started = std::time::Instant::now();
+    let status = tokio::task::block_in_place(|| signal_and_wait(&mut child, "-TERM"));
+    assert_eq!(status.code(), Some(3), "{status:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "exited promptly, not after the drain"
+    );
+    assert!(!snapshot_holds(&snapshot, 5), "the flush was skipped");
+    assert!(!socket.exists(), "socket removed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn binary_reports_a_failed_shutdown_flush_and_exits_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("verify.sock");
+    // The snapshot's directory does not exist: every save, the shutdown flush included, fails.
+    let snapshot = dir.path().join("missing").join("pubkeys.bin");
+    let mut child = spawn_binary_with(dir.path(), &snapshot, std::process::Stdio::piped());
+    {
+        let mut client = VerifyServiceClient::new(connect(&socket).await);
+        let (tx, rx) = mpsc::channel(8);
+        let rx = client
+            .pubkey_feed(ReceiverStream::new(rx))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut feed = Bidi {
+            tx,
+            rx,
+            generation: 0,
+        };
+        feed.send(feed_hello(local_hello())).await;
+        assert!(feed.next().await.unwrap().is_some(), "server hello");
+        assert_eq!(feed_reply(&mut feed).await.high_water, 0);
+        feed.send(feed_body(announcing(feed_frame(0, 0..3), 3)))
+            .await;
+        assert_eq!(feed_reply(&mut feed).await.high_water, 3);
+    }
+    let status = tokio::task::block_in_place(|| signal_and_wait(&mut child, "-TERM"));
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+    assert_eq!(status.code(), Some(1), "{status:?}: {stderr}");
+    assert!(stderr.contains("pubkey snapshot not flushed"), "{stderr}");
     assert!(!socket.exists(), "socket removed");
 }
 

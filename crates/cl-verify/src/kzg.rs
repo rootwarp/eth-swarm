@@ -6,6 +6,7 @@
 //! fixed here, not configurable. cl-verify has no c-kzg dependency and no loader of its own.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crypto_kzg::{
     BackendError, Bytes48, Cell, KzgError, SetupError, TrustedSetup, BETA4_MAINNET_SHA256,
@@ -14,7 +15,7 @@ use crypto_kzg::{
 
 use crate::proto::common::{Error, ErrorCode};
 use crate::proto::verify::{KzgCellProof, VerifyStatus};
-use crate::wire::wire_error;
+use crate::wire::{wire_error, Deadline, WallClock};
 
 /// `NUMBER_OF_COLUMNS` (fulu/das-core.md); a `cell_index` must be below it.
 pub const NUMBER_OF_COLUMNS: u64 = 128;
@@ -173,6 +174,26 @@ pub fn verify_cells(
     }
 }
 
+/// [`verify_cells`] for a job admitted with `deadline`, run on a blocking thread: `None` if its
+/// stream closed before it ran (nothing is answered), `DEADLINE_EXCEEDED` with no KZG work if the
+/// deadline is no longer open on both clocks (the job may have waited for a thread past it, and a
+/// wall clock that steps backwards cannot reopen it).
+pub fn verify_cells_gated(
+    cells: &[KzgCellProof],
+    deadline: &Deadline,
+    closed: &AtomicBool,
+    clock: &dyn WallClock,
+    backend: &dyn KzgBackend,
+) -> Option<(VerifyStatus, Option<Error>)> {
+    if closed.load(Ordering::SeqCst) {
+        return None;
+    }
+    if !deadline.open(clock) {
+        return Some((VerifyStatus::DeadlineExceeded, None));
+    }
+    Some(verify_cells(cells, backend))
+}
+
 /// The no-verdict answer: `OVERLOADED` plus `ERROR_CODE_RESOURCE_UNAVAILABLE`.
 #[must_use]
 pub fn unavailable(detail: &str) -> (VerifyStatus, Option<Error>) {
@@ -286,6 +307,52 @@ pub(crate) mod tests {
         assert_ne!(status, VerifyStatus::Valid);
         assert_ne!(status, VerifyStatus::Unspecified);
         assert_eq!(err.unwrap().code(), ErrorCode::ResourceUnavailable);
+    }
+
+    /// Counts the batches it is asked to verify; every one verifies.
+    #[derive(Default)]
+    struct Counting(std::sync::atomic::AtomicUsize);
+    impl KzgBackend for Counting {
+        fn verify(&self, _: &PreparedCells) -> Result<bool, KzgFailure> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
+    }
+
+    /// A wall clock the test sets by hand.
+    struct Manual(std::sync::atomic::AtomicU64);
+    impl WallClock for Manual {
+        fn now_unix_ms(&self) -> u64 {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_monotonic_deadline_past_stops_the_job_though_the_wall_clock_stepped_back() {
+        use std::sync::atomic::Ordering;
+        let clock = Manual(std::sync::atomic::AtomicU64::new(1_000));
+        let deadline = Deadline::new(1_010, &clock).unwrap();
+        let open = AtomicBool::new(false);
+        let counting = Counting::default();
+        assert_eq!(
+            verify_cells_gated(&[cell(0)], &deadline, &open, &clock, &counting),
+            Some((VerifyStatus::Valid, None))
+        );
+        // The job then waits for a blocking thread past its monotonic deadline, and the wall
+        // clock steps back meanwhile: the wire deadline alone would still look open.
+        tokio::time::advance(std::time::Duration::from_millis(20)).await;
+        clock.0.store(500, Ordering::SeqCst);
+        assert_eq!(
+            verify_cells_gated(&[cell(0)], &deadline, &open, &clock, &counting),
+            Some((VerifyStatus::DeadlineExceeded, None))
+        );
+        assert_eq!(counting.0.load(Ordering::SeqCst), 1, "no KZG work after it");
+        let closed = AtomicBool::new(true);
+        assert_eq!(
+            verify_cells_gated(&[cell(0)], &deadline, &closed, &clock, &counting),
+            None,
+            "a closed stream answers nothing"
+        );
     }
 
     #[test]

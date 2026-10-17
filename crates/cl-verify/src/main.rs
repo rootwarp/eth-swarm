@@ -2,15 +2,31 @@
 //! `cl-verify --trusted-setup <PATH> --socket <PATH> --peer-uid <UID> --pubkey-snapshot <PATH>`.
 //!
 //! Exit status: 0 after a graceful shutdown on SIGTERM or SIGINT, or `--help`; 2 on a usage error;
-//! 1 when startup or serving fails (including a trusted setup whose sha256 is not the pinned one).
+//! 1 when startup or serving fails (including a trusted setup whose sha256 is not the pinned one,
+//! and a pubkey snapshot flush that failed at shutdown); 3 when a second SIGTERM or SIGINT cut the
+//! shutdown short (the rest of the drain and the snapshot flush are skipped). Every failure is
+//! printed to stderr: no log subscriber is installed.
 
 use std::process::ExitCode;
 use std::time::Duration;
 
-use cl_verify::startup::{run, termination, unwired_network_warning, Args, UsageError, USAGE};
+use cl_verify::startup::{
+    run, termination, unwired_network_warning, Args, Stopped, UsageError, USAGE,
+};
 
 /// After `run` returns, how long blocking jobs still running get before the process exits anyway.
 const RUNTIME_SHUTDOWN: Duration = Duration::from_secs(5);
+
+/// The exit status after a second termination signal.
+const FORCED_EXIT: u8 = 3;
+
+/// How [`serve`] ended.
+enum Outcome {
+    /// Exit with this status once the runtime has wound down.
+    Exit(ExitCode),
+    /// A second signal: exit now, without waiting for blocking jobs.
+    Forced,
+}
 
 fn main() -> ExitCode {
     let args = match Args::parse(std::env::args_os().skip(1)) {
@@ -34,28 +50,39 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let code = runtime.block_on(serve(args));
-    runtime.shutdown_timeout(RUNTIME_SHUTDOWN);
-    code
+    match runtime.block_on(serve(args)) {
+        Outcome::Exit(code) => {
+            runtime.shutdown_timeout(RUNTIME_SHUTDOWN);
+            code
+        }
+        Outcome::Forced => {
+            runtime.shutdown_background();
+            ExitCode::from(FORCED_EXIT)
+        }
+    }
 }
 
-async fn serve(args: Args) -> ExitCode {
+async fn serve(args: Args) -> Outcome {
     let config = args.into_config();
     if let Some(warning) = unwired_network_warning(&config.server) {
         eprintln!("cl-verify: warning: {warning}");
     }
-    let shutdown = match termination() {
-        Ok(shutdown) => shutdown,
+    let signals = match termination() {
+        Ok(signals) => signals,
         Err(e) => {
             eprintln!("cl-verify: cannot install signal handlers: {e}");
-            return ExitCode::FAILURE;
+            return Outcome::Exit(ExitCode::FAILURE);
         }
     };
-    match run(config, shutdown).await {
-        Ok(()) => ExitCode::SUCCESS,
+    match run(config, signals).await {
+        Ok(Stopped::Graceful) => Outcome::Exit(ExitCode::SUCCESS),
+        Ok(Stopped::Forced) => {
+            eprintln!("cl-verify: second signal; exiting without the pubkey snapshot flush");
+            Outcome::Forced
+        }
         Err(e) => {
             eprintln!("cl-verify: {e}");
-            ExitCode::FAILURE
+            Outcome::Exit(ExitCode::FAILURE)
         }
     }
 }

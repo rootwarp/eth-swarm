@@ -27,7 +27,7 @@ use crate::proto::verify::{
     bls_result, BlsResult, BlsSet, Signer as WireSigner, VerifyBlsRequestBody, VerifyOrigin,
     VerifyStatus,
 };
-use crate::wire::{wire_error, SystemClock, WallClock};
+use crate::wire::{wire_error, Deadline, SystemClock, WallClock};
 
 /// Ethereum BLS domain separation tag (proof-of-possession ciphersuite).
 pub const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
@@ -199,10 +199,11 @@ enum Stop {
     Closed,
 }
 
-/// The checks made right before a request's signers are resolved: its stream is still open and
-/// its deadline has not passed.
+/// The checks made before a request's sets are decoded and right before each is resolved: its
+/// stream is still open and its admission [`Deadline`] is open on both clocks (`None`: it had
+/// already passed on admission).
 struct ResolveGate<'a> {
-    deadline_unix_ms: u64,
+    deadline: Option<Deadline>,
     closed: &'a AtomicBool,
     clock: &'a dyn WallClock,
 }
@@ -212,43 +213,62 @@ impl ResolveGate<'_> {
         if self.closed.load(AtomicOrdering::SeqCst) {
             return Err(Stop::Closed);
         }
-        if !deadline_open(self.deadline_unix_ms, self.clock.now_unix_ms()) {
+        if !self.deadline.is_some_and(|d| d.open(self.clock)) {
             return Err(Stop::Deadline);
         }
         Ok(())
     }
 }
 
-/// [`verify_request_gated`] for a stream that stays open.
+/// [`verify_request_gated`] for a stream that stays open, with the deadline read now on the
+/// system clock.
 pub fn verify_request(
     body: &VerifyBlsRequestBody,
     cache: &RwLock<PubkeyCache<PublicKey>>,
     backend: &dyn BlsBackend,
 ) -> Vec<BlsResult> {
-    verify_request_gated(body, &AtomicBool::new(false), &SystemClock, cache, backend)
-        .unwrap_or_default()
+    let gate = ResolveGate {
+        deadline: Deadline::new(body.deadline_unix_ms, &SystemClock),
+        closed: &AtomicBool::new(false),
+        clock: &SystemClock,
+    };
+    verify_request_by(body, &gate, cache, backend).unwrap_or_default()
 }
 
-/// Verifies one request: one result per set, in order, or `None` if `closed` is set before its
-/// signers are resolved (the stream is gone; nothing is answered and nothing is resolved).
+/// Verifies one request admitted with `deadline`: one result per set, in order, or `None` if
+/// `closed` is set before its sets are decoded or resolved (the stream is gone; nothing is
+/// answered and nothing is resolved).
+///
+/// The gate is the admission `deadline` on both clocks (monotonic and `clock`), so a wall clock
+/// that steps backwards cannot reopen a deadline that has passed on the monotonic clock.
 ///
 /// An origin this build does not know is IGNOREd without BLS work: every set gets an `err`
 /// (`ERROR_CODE_VERSION_MISMATCH`). The server refuses `UNSPECIFIED` before this point; should it
 /// get here, every set is a contract violation.
 pub fn verify_request_gated(
     body: &VerifyBlsRequestBody,
+    deadline: &Deadline,
     closed: &AtomicBool,
     clock: &dyn WallClock,
     cache: &RwLock<PubkeyCache<PublicKey>>,
     backend: &dyn BlsBackend,
 ) -> Option<Vec<BlsResult>> {
     let gate = ResolveGate {
-        deadline_unix_ms: body.deadline_unix_ms,
+        deadline: Some(*deadline),
         closed,
         clock,
     };
+    verify_request_by(body, &gate, cache, backend)
+}
+
+fn verify_request_by(
+    body: &VerifyBlsRequestBody,
+    gate: &ResolveGate<'_>,
+    cache: &RwLock<PubkeyCache<PublicKey>>,
+    backend: &dyn BlsBackend,
+) -> Option<Vec<BlsResult>> {
     match origin(body.origin) {
-        Some(origin) => verify_gated(&body.sets, origin, &gate, cache, backend),
+        Some(origin) => verify_gated(&body.sets, origin, gate, cache, backend, &decode_set),
         None if body.origin == VerifyOrigin::Unspecified as i32 => Some(
             body.sets
                 .iter()
@@ -269,11 +289,12 @@ pub fn verify_request_gated(
 
 /// Verifies `sets` from `origin` and returns one result per set, in request order.
 ///
-/// No signer is resolved once `deadline_unix_ms` has passed. Signatures and inline keys are
-/// decoded first, then the cache snapshot (read lock) is taken, and the deadline is checked after
-/// both, right before each set is resolved, so time spent decoding or waiting for the lock (behind
-/// a feed append, say) counts. If the deadline has gone by,
-/// every set is `DEADLINE_EXCEEDED` with no BLS work, error branches included.
+/// No signer is resolved once `deadline_unix_ms` has passed. The deadline is checked before the
+/// signatures and inline keys are decoded (a job that waited past it, or past its stream, does no
+/// decode work), again after decoding, then the cache snapshot (read lock) is taken and it is
+/// checked right before each set is resolved, so time spent decoding or waiting for the lock
+/// (behind a feed append, say) counts. If the deadline has gone by, every set is
+/// `DEADLINE_EXCEEDED` with no BLS work, error branches included.
 pub fn verify_sets(
     sets: &[BlsSet],
     origin: Origin,
@@ -283,27 +304,33 @@ pub fn verify_sets(
 ) -> Vec<BlsResult> {
     let closed = AtomicBool::new(false);
     let gate = ResolveGate {
-        deadline_unix_ms,
+        deadline: Deadline::new(deadline_unix_ms, &SystemClock),
         closed: &closed,
         clock: &SystemClock,
     };
-    verify_gated(sets, origin, &gate, cache, backend).unwrap_or_default()
+    verify_gated(sets, origin, &gate, cache, backend, &decode_set).unwrap_or_default()
 }
 
+/// `decode` is [`decode_set`] outside the tests, which count the sets it decodes.
 fn verify_gated(
     sets: &[BlsSet],
     origin: Origin,
     gate: &ResolveGate<'_>,
     cache: &RwLock<PubkeyCache<PublicKey>>,
     backend: &dyn BlsBackend,
+    decode: &dyn Fn(&BlsSet) -> Result<DecodedSet, BlsResult>,
 ) -> Option<Vec<BlsResult>> {
     let stopped = |stop: Stop| match stop {
         Stop::Closed => None,
         Stop::Deadline => Some(all_status(sets.len(), VerifyStatus::DeadlineExceeded)),
     };
+    // A job that waited in the pool past its deadline or its stream does no decode work.
+    if let Err(stop) = gate.check() {
+        return stopped(stop);
+    }
     // Cache-independent work first: signatures and inline keys are decoded and validated
-    // before the gate, so time spent on them counts against the deadline.
-    let decoded: Vec<Result<DecodedSet, BlsResult>> = sets.iter().map(decode_set).collect();
+    // before the post-decode gate, so time spent on them counts against the deadline.
+    let decoded: Vec<Result<DecodedSet, BlsResult>> = sets.iter().map(decode).collect();
     if let Err(stop) = gate.check() {
         return stopped(stop);
     }
@@ -834,12 +861,121 @@ mod tests {
             before: 9_999,
             later: 10_001,
         };
-        let got = verify_request_gated(&body, &AtomicBool::new(false), &clock, &c, &counting);
+        let deadline = Deadline::new(body.deadline_unix_ms, &clock).unwrap();
+        let got = verify_request_gated(
+            &body,
+            &deadline,
+            &AtomicBool::new(false),
+            &clock,
+            &c,
+            &counting,
+        );
         assert_eq!(
             statuses(&got.unwrap()),
             vec![Ok(VerifyStatus::DeadlineExceeded)]
         );
         assert_eq!(counting.0.load(Ordering::SeqCst), 0);
+    }
+
+    /// A wall clock the test sets by hand.
+    struct Manual(std::sync::atomic::AtomicU64);
+    impl WallClock for Manual {
+        fn now_unix_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn import_body(sets: Vec<BlsSet>, deadline_unix_ms: u64) -> VerifyBlsRequestBody {
+        VerifyBlsRequestBody {
+            request_id: 1,
+            sets,
+            deadline_unix_ms,
+            origin: VerifyOrigin::Import as i32,
+            generation: 0,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_monotonic_deadline_past_stops_resolution_though_the_wall_clock_stepped_back() {
+        let clock = Manual(std::sync::atomic::AtomicU64::new(1_000));
+        let body = import_body(vec![set(&[0], 1), set(&[1], 2)], 1_010);
+        let deadline = Deadline::new(body.deadline_unix_ms, &clock).unwrap();
+        // The job waited past its monotonic deadline; meanwhile the wall clock stepped back, so
+        // the wire deadline alone still looks open.
+        tokio::time::advance(std::time::Duration::from_millis(20)).await;
+        clock.0.store(500, Ordering::SeqCst);
+        assert!(deadline_open(body.deadline_unix_ms, clock.now_unix_ms()));
+        let c = cache(2);
+        let counting = Arc::new(Counting::default());
+        let got = verify_request_gated(
+            &body,
+            &deadline,
+            &AtomicBool::new(false),
+            &clock,
+            &c,
+            &counting,
+        );
+        assert_eq!(
+            statuses(&got.unwrap()),
+            vec![Ok(VerifyStatus::DeadlineExceeded); 2]
+        );
+        assert_eq!(counting.0.load(Ordering::SeqCst), 0, "no BLS work");
+    }
+
+    /// Runs `body` through the gate with a decoder that counts the sets it decodes.
+    fn decodes_through_gate(
+        body: &VerifyBlsRequestBody,
+        deadline: Option<Deadline>,
+        closed: bool,
+    ) -> (Option<Vec<BlsResult>>, usize) {
+        let decoded = AtomicUsize::new(0);
+        let counting_decode = |set: &BlsSet| {
+            decoded.fetch_add(1, Ordering::SeqCst);
+            decode_set(set)
+        };
+        let closed = AtomicBool::new(closed);
+        let gate = ResolveGate {
+            deadline,
+            closed: &closed,
+            clock: &SystemClock,
+        };
+        let c = cache(2);
+        let got = verify_gated(
+            &body.sets,
+            Origin::Import,
+            &gate,
+            &c,
+            &BlstBackend,
+            &counting_decode,
+        );
+        (got, decoded.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn a_job_past_its_deadline_or_stream_decodes_nothing() {
+        // Inline keys past the cache: each would be decoded and KeyValidated.
+        let sets = vec![
+            signed(vec![inline(5)], &[5], 1),
+            signed(vec![inline(6)], &[6], 2),
+        ];
+        let body = import_body(sets, crate::wire::now_unix_ms() + 60_000);
+        let open = Deadline::new(body.deadline_unix_ms, &SystemClock);
+        assert!(open.is_some());
+
+        let (got, decoded) = decodes_through_gate(&body, None, false);
+        assert_eq!(
+            statuses(&got.unwrap()),
+            vec![Ok(VerifyStatus::DeadlineExceeded); 2]
+        );
+        assert_eq!(decoded, 0, "past the deadline nothing is decoded");
+
+        let (got, decoded) = decodes_through_gate(&body, open, true);
+        assert!(got.is_none(), "a closed stream answers nothing");
+        assert_eq!(decoded, 0, "after stream close nothing is decoded");
+
+        let (got, decoded) = decodes_through_gate(&body, open, false);
+        assert_eq!(statuses(&got.unwrap()), vec![Ok(VerifyStatus::Valid); 2]);
+        assert_eq!(decoded, 2);
     }
 
     #[test]
@@ -854,11 +990,15 @@ mod tests {
             generation: 0,
         };
         let closed = AtomicBool::new(true);
-        assert!(verify_request_gated(&body, &closed, &SystemClock, &c, &counting).is_none());
+        let deadline = Deadline::new(body.deadline_unix_ms, &SystemClock).unwrap();
+        let run = |closed: &AtomicBool| {
+            verify_request_gated(&body, &deadline, closed, &SystemClock, &c, &counting)
+        };
+        assert!(run(&closed).is_none());
         assert_eq!(counting.0.load(Ordering::SeqCst), 0);
         closed.store(false, Ordering::SeqCst);
         assert_eq!(
-            statuses(&verify_request_gated(&body, &closed, &SystemClock, &c, &counting).unwrap()),
+            statuses(&run(&closed).unwrap()),
             vec![Ok(VerifyStatus::Valid), Err(ErrorCode::ContractViolation)]
         );
     }

@@ -6,20 +6,30 @@
 //! called (the digest is checked before the file is parsed) and READY is never sent. The error
 //! names the expected and actual digests.
 //!
+//! A shutdown requested before the bind (a signal that arrived while the setup was loading) ends
+//! startup there: nothing is bound and READY is never sent. One requested after the bind, before
+//! READY, unbinds and ends it likewise.
+//!
 //! Shutdown (SIGTERM or SIGINT, see [`termination`]) is graceful and bounded: open connections get
-//! [`StartupConfig::drain_timeout`] to finish, a dirty pubkey snapshot is flushed once, and the
-//! socket file this process bound is removed.
+//! [`StartupConfig::drain_timeout`] to finish, then their streams are closed and feed work stops,
+//! a dirty pubkey snapshot is flushed once (a failure is returned), and the socket file this
+//! process bound is removed. A second signal during the drain or the flush cuts it short
+//! ([`run_with_signals`], [`Stopped::Forced`]): the flush is skipped and the socket file removed.
 
 use std::ffi::OsString;
 use std::future::Future;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::Poll;
 use std::time::Duration;
 
 use crypto_kzg::SetupError;
 use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 use crate::feed::SharedCache;
 use crate::handshake::Handshake;
@@ -27,7 +37,7 @@ use crate::kzg::TrustedSetupConfig;
 use crate::notify;
 use crate::proto::common::{Hello, SpecPin};
 use crate::server::{
-    serve_uds_draining, Limits, ServerConfig, VerifyServer, DEFAULT_SNAPSHOT_INTERVAL,
+    serve_uds_draining, Limits, ServeError, ServerConfig, VerifyServer, DEFAULT_SNAPSHOT_INTERVAL,
 };
 
 /// The `api_version` this build speaks, and the lowest one it accepts.
@@ -53,7 +63,7 @@ pub struct StartupConfig {
     pub server: ServerConfig,
     pub socket_path: PathBuf,
     /// Once shutdown begins, the longest wait for open connections (cl-chain keeps its streams
-    /// open) before they are dropped; the snapshot flush follows either way.
+    /// open) before their streams are closed; the snapshot flush follows either way.
     pub drain_timeout: Duration,
 }
 
@@ -71,9 +81,22 @@ pub enum StartupError {
     #[error("cannot notify the service manager: {0}")]
     Notify(#[source] io::Error),
     #[error("serving failed: {0}")]
-    Serve(#[from] tonic::transport::Error),
+    Serve(#[source] tonic::transport::Error),
+    /// The shutdown snapshot flush failed: the appends since the last save are rebuilt on the
+    /// next start.
+    #[error("pubkey snapshot not flushed at shutdown: {0}")]
+    Flush(#[source] io::Error),
     #[error("server task failed: {0}")]
     Join(#[from] tokio::task::JoinError),
+}
+
+impl From<ServeError> for StartupError {
+    fn from(err: ServeError) -> Self {
+        match err {
+            ServeError::Transport(e) => Self::Serve(e),
+            ServeError::Flush(e) => Self::Flush(e),
+        }
+    }
 }
 
 /// How startup reports that it is serving (the READY seam).
@@ -90,32 +113,107 @@ impl Readiness for SystemdReadiness {
     }
 }
 
-/// Resolves on the first SIGTERM or SIGINT. The handlers are installed when this is called (inside
-/// a runtime), so a signal that arrives before the future is polled is not lost.
-pub fn termination() -> io::Result<impl Future<Output = ()> + Send + 'static> {
-    let mut term = signal(SignalKind::terminate())?;
-    let mut int = signal(SignalKind::interrupt())?;
-    Ok(async move {
-        let name = tokio::select! {
-            _ = term.recv() => "SIGTERM",
-            _ = int.recv() => "SIGINT",
-        };
-        tracing::info!(signal = name, "shutting down");
-    })
+/// The termination signals received so far, counted from 0 ([`termination`]). Clones share the
+/// count.
+#[derive(Clone, Debug)]
+pub struct Termination {
+    count: watch::Receiver<u32>,
 }
 
-/// [`run_with`] reporting readiness to systemd.
-pub async fn run(
+/// Delivers signals to the [`Termination`] made with it ([`Termination::channel`]).
+#[derive(Debug)]
+pub struct SignalSender(watch::Sender<u32>);
+
+impl SignalSender {
+    /// One more signal; returns how many have arrived.
+    pub fn signal(&self) -> u32 {
+        self.0.send_modify(|n| *n = n.saturating_add(1));
+        *self.0.borrow()
+    }
+}
+
+impl Termination {
+    /// A termination fed by the returned sender instead of the process's signals.
+    #[must_use]
+    pub fn channel() -> (Self, SignalSender) {
+        let (tx, count) = watch::channel(0);
+        (Self { count }, SignalSender(tx))
+    }
+
+    /// Resolves once `n` signals have arrived (at once if they already have), or never if the
+    /// source is gone before that.
+    pub fn after(&self, n: u32) -> impl Future<Output = ()> + Send + 'static {
+        let mut count = self.count.clone();
+        async move {
+            if count.wait_for(|got| *got >= n).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
+/// Counts SIGTERM and SIGINT: the first starts the shutdown, a second forces the exit
+/// ([`run_with_signals`]). The handlers are installed when this is called (inside a runtime), so a
+/// signal that arrives before anything waits on the result is not lost.
+pub fn termination() -> io::Result<Termination> {
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    let (termination, sender) = Termination::channel();
+    tokio::spawn(async move {
+        loop {
+            let name = tokio::select! {
+                Some(()) = term.recv() => "SIGTERM",
+                Some(()) = int.recv() => "SIGINT",
+                else => return,
+            };
+            if sender.signal() == 1 {
+                tracing::info!(signal = name, "shutting down");
+            } else {
+                tracing::warn!(
+                    signal = name,
+                    "second signal: exiting now, without the flush"
+                );
+            }
+        }
+    });
+    Ok(termination)
+}
+
+/// How [`run_with_signals`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stopped {
+    /// After the first signal: drained, flushed, socket removed.
+    Graceful,
+    /// A second signal arrived during the drain or the flush: stopped at once, the flush skipped,
+    /// the socket removed.
+    Forced,
+}
+
+/// [`run_with_signals`] reporting readiness to systemd.
+pub async fn run(config: StartupConfig, signals: Termination) -> Result<Stopped, StartupError> {
+    run_with_signals(config, &SystemdReadiness, signals).await
+}
+
+/// [`run_with`] that shuts down on the first of `signals` and gives up on the second: the server
+/// task is aborted at once, so the rest of the drain and the snapshot flush are skipped.
+pub async fn run_with_signals(
     config: StartupConfig,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) -> Result<(), StartupError> {
-    run_with(config, &SystemdReadiness, shutdown).await
+    readiness: &dyn Readiness,
+    signals: Termination,
+) -> Result<Stopped, StartupError> {
+    tokio::select! {
+        biased;
+        () = signals.after(2) => Ok(Stopped::Forced),
+        run = run_with(config, readiness, signals.after(1)) => run.map(|()| Stopped::Graceful),
+    }
 }
 
 /// Loads the pinned setup, binds `config.socket_path`, serves until `shutdown` resolves, and calls
-/// `readiness` once the server is running. After `shutdown`, connections get
-/// `config.drain_timeout`, the pubkey snapshot is flushed once if dirty (a failure is logged, not
-/// returned), and the socket file is removed.
+/// `readiness` once the server is running. If `shutdown` has already resolved after the setup is
+/// loaded, or right after the bind, it returns `Ok` there: nothing stays bound and READY is not
+/// sent. After `shutdown`, connections get `config.drain_timeout`, their streams are closed, the
+/// pubkey snapshot is flushed once if dirty (a failure is [`StartupError::Flush`]), and the socket
+/// file is removed. Dropping the returned future aborts the server task.
 pub async fn run_with(
     config: StartupConfig,
     readiness: &dyn Readiness,
@@ -124,22 +222,44 @@ pub async fn run_with(
     if let Some(warning) = unwired_network_warning(&config.server) {
         tracing::warn!("{warning}");
     }
+    let mut shutdown = Box::pin(shutdown);
     let server = VerifyServer::new(config.server, SharedCache::default()).map_err(setup_refused)?;
+    if has_resolved(&mut shutdown).await {
+        tracing::info!("shutdown requested during startup; not serving");
+        return Ok(());
+    }
     let (listener, _socket_file) = bind(&config.socket_path)?;
-    let serving = tokio::spawn(serve_uds_draining(
+    if has_resolved(&mut shutdown).await {
+        tracing::info!("shutdown requested during startup; not serving");
+        return Ok(());
+    }
+    let mut serving = AbortOnDrop(tokio::spawn(serve_uds_draining(
         listener,
         server,
         shutdown,
         config.drain_timeout,
-    ));
+    )));
     if let Err(e) = readiness.ready() {
-        serving.abort();
         tracing::error!(error = %e, "cannot notify the service manager");
         return Err(StartupError::Notify(e));
     }
     tracing::info!(socket = %config.socket_path.display(), "cl-verify ready");
-    serving.await??;
+    (&mut serving.0).await??;
     Ok(())
+}
+
+/// Polls `fut` once: whether it has already resolved. A resolved future is not polled again.
+async fn has_resolved<F: Future + ?Sized>(fut: &mut Pin<Box<F>>) -> bool {
+    std::future::poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx).is_ready())).await
+}
+
+/// Aborts the task when dropped (the caller gave up on it).
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn setup_refused(err: SetupError) -> StartupError {
@@ -169,15 +289,8 @@ fn bind(path: &Path) -> Result<(UnixListener, BoundSocket), StartupError> {
         Err(e) => return Err(bind_err(e)),
     }
     let listener = UnixListener::bind(path).map_err(bind_err)?;
-    let meta = std::fs::symlink_metadata(path).map_err(bind_err)?;
-    Ok((
-        listener,
-        BoundSocket {
-            path: path.to_owned(),
-            dev: meta.dev(),
-            ino: meta.ino(),
-        },
-    ))
+    let socket = BoundSocket::of(path, std::fs::symlink_metadata(path)).map_err(bind_err)?;
+    Ok((listener, socket))
 }
 
 /// The socket file this process created. Dropping it unlinks the path only while it is still that
@@ -186,6 +299,27 @@ struct BoundSocket {
     path: PathBuf,
     dev: u64,
     ino: u64,
+}
+
+impl BoundSocket {
+    /// The guard for the socket just bound at `path`, given its metadata. Without the metadata the
+    /// guard could not tell the file apart later, so the path (bound a moment ago) is unlinked now
+    /// and the error returned: no socket file is left behind.
+    fn of(path: &Path, meta: io::Result<std::fs::Metadata>) -> io::Result<Self> {
+        match meta {
+            Ok(meta) => Ok(Self {
+                path: path.to_owned(),
+                dev: meta.dev(),
+                ino: meta.ino(),
+            }),
+            Err(e) => {
+                if let Err(rm) = std::fs::remove_file(path) {
+                    tracing::warn!(socket = %path.display(), error = %rm, "cannot remove our socket");
+                }
+                Err(e)
+            }
+        }
+    }
 }
 
 impl Drop for BoundSocket {
@@ -455,6 +589,50 @@ mod tests {
         }];
         wired.handshake = Handshake::new(hello, API_VERSION);
         assert_eq!(unwired_network_warning(&wired), None);
+    }
+
+    #[test]
+    fn a_socket_whose_metadata_cannot_be_read_after_the_bind_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verify.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let err = BoundSocket::of(&path, Err(io::Error::other("stat failed"))).err();
+        assert_eq!(err.map(|e| e.to_string()).as_deref(), Some("stat failed"));
+        assert!(!path.exists(), "socket file left behind");
+        drop(listener);
+
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let guard = BoundSocket::of(&path, std::fs::symlink_metadata(&path)).unwrap();
+        assert!(path.exists());
+        drop(guard);
+        assert!(!path.exists(), "the guard removes our socket");
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn termination_counts_signals_and_resolves_at_each_count() {
+        let (signals, sender) = Termination::channel();
+        let first = tokio::spawn(signals.after(1));
+        let second = tokio::spawn(signals.after(2));
+        tokio::task::yield_now().await;
+        assert!(!first.is_finished());
+        assert_eq!(sender.signal(), 1);
+        first.await.unwrap();
+        assert!(!second.is_finished());
+        assert_eq!(sender.signal(), 2);
+        second.await.unwrap();
+        signals.after(1).await;
+
+        // A source that is gone before the count is reached never resolves.
+        let (signals, sender) = Termination::channel();
+        drop(sender);
+        let never = tokio::time::timeout(Duration::from_millis(20), signals.after(1)).await;
+        assert!(never.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_process_signal_source_installs_its_handlers() {
+        assert!(termination().is_ok());
     }
 
     #[test]
