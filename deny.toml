@@ -49,6 +49,7 @@ ignore = true   # our own unpublished workspace crates
 # from one rust-libp2p commit, and a libp2p* crate never goes into `skip` (scripts/check-libp2p-revs.sh
 # also fails on a duplicated libp2p* name in Cargo.lock).
 multiple-versions = "deny"
+multiple-versions-include-dev = true   # a duplicate pulled in only by dev-dependencies fails too
 wildcards = "deny"           # no `*` version requirements
 allow-wildcard-paths = true  # internal path deps
 highlight = "all"
@@ -86,6 +87,11 @@ skip = [
   { crate = "thiserror@1.0.69", reason = "rtnetlink 0.20 under if-watch (libp2p-tcp, Linux)" },
   { crate = "thiserror-impl@1.0.69", reason = "via thiserror 1 under rtnetlink 0.20" },
   { crate = "windows-sys@0.52.0", reason = "ring 0.17 (Windows only)" },
+  # toml: ipc and ci-checks use toml 0.8; trybuild (dev-dependency of crypto-bls and crypto-kzg) uses toml 1.
+  { crate = "toml@0.8.23", reason = "ipc and ci-checks on toml 0.8; trybuild (dev-dep of crypto-bls, crypto-kzg) on toml 1" },
+  { crate = "toml_datetime@0.6.11", reason = "via toml 0.8 (ipc, ci-checks); trybuild's toml 1 uses toml_datetime 1" },
+  { crate = "serde_spanned@0.6.9", reason = "via toml 0.8 (ipc, ci-checks); trybuild's toml 1 uses serde_spanned 1" },
+  { crate = "winnow@0.7.15", reason = "via toml_edit 0.22 under toml 0.8 (ipc, ci-checks); trybuild's toml 1 uses winnow 1" },
 ]
 skip-tree = []
 

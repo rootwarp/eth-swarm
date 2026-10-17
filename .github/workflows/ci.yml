@@ -73,8 +73,8 @@ jobs:
       - name: Every libp2p* crate from one rust-libp2p commit that has the StrictNoSign key rejection
         run: bash scripts/tests/check-libp2p-revs.test.sh && bash scripts/check-libp2p-revs.sh
       # Runs on every PR, so on every change to Cargo.toml, Cargo.lock or deny.toml.
-      - name: cargo deny fails on a second libp2p* version and on a git source outside allow-git
-        run: bash scripts/check-deny-negative.sh
+      - name: cargo deny fails on a second libp2p* version (dev-only too) and on a git source outside allow-git
+        run: bash scripts/tests/check-deny-negative.test.sh && bash scripts/check-deny-negative.sh
 
   rust:
     name: fmt, clippy, build, test

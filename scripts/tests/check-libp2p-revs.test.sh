@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tests for scripts/check-libp2p-revs.sh. Run: bash scripts/tests/check-libp2p-revs.test.sh
-# Offline: a local git repo stands in for rust-libp2p (base -> fix -> later, plus a side branch
-# without the fix), and fixture workspaces hold a Cargo.toml and a Cargo.lock pinned to its
+# Offline: a local git repo stands in for rust-libp2p (master: base -> fix -> later, plus a side
+# branch without the fix and a fork branch with it but off master), and fixture workspaces hold a Cargo.toml and a Cargo.lock pinned to its
 # commits. The real Cargo.lock is checked with the ancestry step stubbed out (CI runs the real
 # script, which fetches rust-libp2p). Works on bash 3.2.
 set -euo pipefail
@@ -15,6 +15,7 @@ trap 'rm -rf "$tmp"' EXIT
 upstream="$tmp/upstream"
 g() { git -C "$upstream" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false "$@"; }
 git init -q "$upstream"
+g symbolic-ref HEAD refs/heads/master
 g config uploadpack.allowFilter true
 g config uploadpack.allowAnySHA1InWant true
 g commit -q --allow-empty -m base
@@ -26,6 +27,15 @@ later=$(g rev-parse HEAD)
 g checkout -q -b side "$base"
 g commit -q --allow-empty -m "side branch without the fix"
 side=$(g rev-parse HEAD)
+g checkout -q -b fork "$later"
+g commit -q --allow-empty -m "fork commit on top of the fix, never merged to master"
+forked=$(g rev-parse HEAD)
+# A copy of the upstream without a master branch.
+nomaster="$tmp/nomaster"
+git clone -q --bare "$upstream" "$nomaster"
+git -C "$nomaster" update-ref -d refs/heads/master
+git -C "$nomaster" config uploadpack.allowFilter true
+git -C "$nomaster" config uploadpack.allowAnySHA1InWant true
 absent=0123456789abcdef0123456789abcdef01234567
 remote="LIBP2P_REMOTE=file://$upstream"
 fixenv="LIBP2P_FIX_COMMIT=$fix"
@@ -92,6 +102,10 @@ root=$(fixture absent "$absent")
 check fail "SHA the remote does not have: fail closed" "cannot fetch" "$root" "$remote" "$fixenv"
 root=$(fixture unreachable "$later")
 check fail "remote unreachable: fail closed" "cannot fetch" "$root" "LIBP2P_REMOTE=file://$tmp/nowhere" "$fixenv"
+root=$(fixture forked "$forked")
+check fail "SHA with the fix but not on master (a fork commit served by SHA)" "is not on rust-libp2p master" "$root" "$remote" "$fixenv"
+root=$(fixture no-master "$later")
+check fail "remote without a master branch: fail closed" "cannot fetch" "$root" "LIBP2P_REMOTE=file://$nomaster" "$fixenv"
 root=$(fixture skipped "$base")
 check pass "LIBP2P_SKIP_ANCESTRY=1 skips only the ancestry step" "SKIPPED" "$root" LIBP2P_SKIP_ANCESTRY=1
 
@@ -113,6 +127,25 @@ check fail "a libp2p* crate without a source" "libp2p-local 0.1.0 does not come 
 root=$(fixture dup-name "$later")
 pkg libp2p-swarm 0.47.1 "$(src "$later")" >> "$root/Cargo.lock"
 check fail "a libp2p* crate in two versions" "libp2p-swarm appears 2 times" "$root" "$remote" "$fixenv"
+
+# The lockfile is read as TOML, not line by line: cargo --locked accepts any layout of the same data.
+reg="registry+https://github.com/rust-lang/crates.io-index"
+root=$(fixture indented "$later")
+printf '\n[[package]]\n  name = "libp2p-swarm"\n  version = "0.47.1"\n  source = "%s"\n' "$reg" >> "$root/Cargo.lock"
+check fail "an indented crates.io libp2p-swarm entry" "libp2p-swarm 0.47.1 does not come from" "$root" "$remote" "$fixenv"
+root=$(fixture compact "$later")
+printf "\n[[ package ]]\nname='libp2p-swarm'\nversion='0.47.1'\nsource='%s'\n" "$reg" >> "$root/Cargo.lock"
+check fail "a compact single-quoted crates.io libp2p-swarm entry" "libp2p-swarm appears 2 times" "$root" "$remote" "$fixenv"
+root=$(fixture inline "$later")
+printf 'version = 4\npackage = [\n  { name = "libp2p", version = "0.57.1", source = "%s" },\n  { name = "libp2p-swarm", version = "0.47.1", source = "%s" },\n]\n' \
+  "$(src "$later")" "$reg" > "$root/Cargo.lock"
+check fail "packages as an inline array" "libp2p-swarm 0.47.1 does not come from" "$root" "$remote" "$fixenv"
+root=$(fixture indented-source "$later")
+printf '\n[[package]]\nname = "rw-stream-sink"\nversion = "0.5.0"\n    source = "%s"\n' "$(src "$side")" >> "$root/Cargo.lock"
+check fail "an indented second rust-libp2p source" "2 rust-libp2p commits" "$root" "$remote" "$fixenv"
+root=$(fixture bad-toml "$later")
+printf '\n[[package]\nname = "libp2p-swarm"\n' >> "$root/Cargo.lock"
+check fail "a lockfile that is not TOML" "Cargo.lock: not valid TOML" "$root" "$remote" "$fixenv"
 
 # The rust-libp2p source itself: https, ?rev= with the full 40-hex SHA, resolved to that SHA.
 root=$(fixture short-rev "$later")
@@ -155,6 +188,39 @@ check fail "deny.toml skip entry for a libp2p* crate" "deny.toml: libp2p* crate 
 root=$(fixture deny-skip-tree "$later")
 printf '[bans]\nskip-tree = [{ crate = "libp2p", reason = "x" }]\n' > "$root/deny.toml"
 check fail "deny.toml skip-tree entry for libp2p" "deny.toml: libp2p* crate in [bans] skip" "$root" "$remote" "$fixenv"
+
+# Every form cargo-deny accepts for a skip or skip-tree entry, in any TOML layout.
+deny_case() {
+  local name=$1 desc=$2 body=$3
+  root=$(fixture "deny-$name" "$later")
+  printf '%s\n' "$body" > "$root/deny.toml"
+  check fail "deny.toml: $desc" "deny.toml: libp2p* crate in [bans] skip" "$root" "$remote" "$fixenv"
+}
+deny_case single "single-quoted crate" "[bans]
+skip = [{ crate = 'libp2p-swarm@0.47.1', reason = 'x' }]"
+deny_case name-version "a { name, version } table" '[bans]
+skip = [{ name = "libp2p-core", version = "=0.43.0" }]'
+deny_case string-version "a plain name@version string" '[bans]
+skip = ["libp2p-core@0.43.0"]'
+deny_case string-name "a plain name string in skip-tree" '[bans]
+skip-tree = ["libp2p-core"]'
+deny_case dotted "a dotted bans.skip key" 'bans.skip = [{ crate = "libp2p-swarm@0.47.1", reason = "x" }]'
+deny_case array-table "an [[bans.skip]] array of tables" '[[bans.skip-tree]]
+crate = "libp2p"
+reason = "x"'
+deny_case multiline "an entry split over lines" '[bans]
+skip = [
+  { crate = "syn@2.0.119", reason = "x" }, { reason = "y",
+    crate = "libp2p-swarm@0.47.1" },
+]'
+deny_case quoted-key "a quoted \"crate\" key" '[bans]
+skip = [{ "crate" = "libp2p-swarm@0.47.1", reason = "x" }]'
+root=$(fixture deny-unknown "$later")
+printf '[bans]\nskip = [42]\n' > "$root/deny.toml"
+check fail "deny.toml: an entry form it does not know fails closed" "deny.toml: [bans] skip entry not understood" "$root" "$remote" "$fixenv"
+root=$(fixture deny-bad "$later")
+printf '[bans\nskip = []\n' > "$root/deny.toml"
+check fail "deny.toml that is not TOML" "deny.toml: not valid TOML" "$root" "$remote" "$fixenv"
 
 # The real lockfile (ancestry stubbed: no network in this test).
 check pass "real Cargo.lock" "libp2p revs OK" "$repo" LIBP2P_SKIP_ANCESTRY=1
