@@ -1,0 +1,6 @@
+# cargo-fuzz needs nightly (-Zsanitizer, sancov). Dated, so CI and the gate build one compiler;
+# the root rust-toolchain.toml (stable) still applies everywhere outside fuzz/.
+[toolchain]
+channel = "nightly-2026-10-17"
+components = ["llvm-tools"]
+profile = "minimal"

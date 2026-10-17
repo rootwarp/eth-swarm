@@ -1,0 +1,97 @@
+# The req/resp decoder fuzz targets (cargo-fuzz, libFuzzer).
+#
+# Its own workspace (the empty [workspace] below) with its own committed Cargo.lock, built with
+# the nightly in rust-toolchain.toml here. A [patch.crates-io] applies only in the workspace
+# that declares it, so the block below is a verbatim copy of the root Cargo.toml's: without it
+# the SSZ crates and libp2p would resolve from crates.io, not from the pinned git revisions.
+# scripts/check-fuzz-lock.sh fails CI unless the two blocks are identical and every package in
+# fuzz/Cargo.lock that the root Cargo.lock also has resolves to the same version and source, so
+# the fuzzed decoder links exactly the dependencies the session binary links.
+#
+# Build: fuzz/build-m2a.sh. Gate: fuzz/run-m2a-gate.sh. Seeds: fuzz/gen-seeds.sh.
+[package]
+name = "ethswarm-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+p2p-wire = { path = "../crates/p2p-wire", features = ["testkit"] }
+cl-p2p = { path = "../crates/cl-p2p" }
+consensus-types = { path = "../crates/consensus-types" }
+ethereum_ssz = "0.10"
+ssz_types = "0.14"
+futures = "0.3"
+
+[dev-dependencies]
+sha2 = "0.10"
+snap = "1"
+
+[workspace]
+
+[patch.crates-io]
+ethereum_ssz = { git = "https://github.com/sigp/ethereum_ssz", rev = "974f78f421fbf70cba4e8f84e0fa28c23ad54f34" }
+ethereum_ssz_derive = { git = "https://github.com/sigp/ethereum_ssz", rev = "974f78f421fbf70cba4e8f84e0fa28c23ad54f34" }
+ssz_types = { git = "https://github.com/sigp/ssz_types", rev = "8955d22edc7633f26fe3b5ac933facb5121d717a" }
+tree_hash = { git = "https://github.com/sigp/tree_hash", rev = "e5ea1875edddf12438506c3751cbb313f9c52d08" }
+tree_hash_derive = { git = "https://github.com/sigp/tree_hash", rev = "e5ea1875edddf12438506c3751cbb313f9c52d08" }
+milhouse = { git = "https://github.com/sigp/milhouse", rev = "d67aabd2a7c405b3c16f4aaff159b137dc5b5e38" }
+
+# rust-libp2p: every libp2p* crate in the graph from one commit of libp2p/rust-libp2p, enforced by
+# scripts/check-libp2p-revs.sh. 2fed78f is master after "chore: prepare v0.57.1" (2026-10-15). It
+# descends from the gossipsub StrictNoSign `key` rejection (PR 6621, ba75f82), which is not in any
+# crates.io libp2p-gossipsub: the crates carry their released versions (gossipsub 0.50.0) while the
+# gossipsub source is already the unreleased 0.51. Move back to crates.io once gossipsub 0.51 ships.
+libp2p = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-allow-block-list = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-connection-limits = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-core = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-dns = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-gossipsub = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-identify = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-identity = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-mdns = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-metrics = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-mplex = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-noise = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-quic = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-request-response = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-swarm = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-swarm-derive = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-tcp = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-tls = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-upnp = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+libp2p-yamux = { git = "https://github.com/libp2p/rust-libp2p", rev = "2fed78f074af91e0c7440eedd08b8f898ad4a3fe" }
+
+[[bin]]
+name = "status_v2"
+path = "fuzz_targets/status_v2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metadata_v3"
+path = "fuzz_targets/metadata_v3.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ping_goodbye"
+path = "fuzz_targets/ping_goodbye.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blocks_by_range_resp"
+path = "fuzz_targets/blocks_by_range_resp.rs"
+test = false
+doc = false
+bench = false

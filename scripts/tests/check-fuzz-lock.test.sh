@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Tests for scripts/check-fuzz-lock.sh. Run: bash scripts/tests/check-fuzz-lock.test.sh
+# Each case is a throwaway root with a Cargo.toml, Cargo.lock and fuzz/ pair; one runs the real
+# repo. Offline. Needs python3 >= 3.11. Works on bash 3.2.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+script="$here/../check-fuzz-lock.sh"
+repo=$(cd "$here/../.." && pwd)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+passed=0 failed=0
+check() {
+  local expect=$1 desc=$2 root=$3 want=${4:-} rc=0 out ok=0
+  out=$(bash "$script" "$root" 2>&1) || rc=$?
+  if { [[ $expect == pass ]] && ((rc == 0)); } || { [[ $expect == fail ]] && ((rc != 0)); }; then ok=1; fi
+  if ((ok)) && [[ -n $want ]] && ! grep -qF -- "$want" <<<"$out"; then ok=0; fi
+  if ((ok)); then
+    passed=$((passed + 1)); echo "ok   - $desc"
+  else
+    failed=$((failed + 1)); echo "FAIL - $desc (exit $rc)"; printf '%s\n' "$out" | sed 's/^/       /'
+  fi
+}
+
+GIT='git+https://github.com/libp2p/rust-libp2p?rev=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+REG='registry+https://github.com/rust-lang/crates.io-index'
+PATCH='[patch.crates-io]
+libp2p = { git = "https://github.com/libp2p/rust-libp2p", rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }'
+
+pkg() { # pkg <name> <version> [source]
+  printf '\n[[package]]\nname = "%s"\nversion = "%s"\n' "$1" "$2"
+  [[ -z ${3:-} ]] || printf 'source = "%s"\n' "$3"
+}
+
+# fixture <name> <root patch> <fuzz patch> <fuzz lock packages...>: the root lock always holds
+# p2p-wire (path), libp2p (git) and snap (registry).
+fixture() {
+  local root="$tmp/$1" root_patch=$2 fuzz_patch=$3
+  shift 3
+  mkdir -p "$root/fuzz"
+  printf '[workspace]\nmembers = []\n\n%s\n' "$root_patch" > "$root/Cargo.toml"
+  { echo 'version = 4'; pkg p2p-wire 0.1.0; pkg libp2p 0.57.1 "$GIT"; pkg snap 1.1.2 "$REG"; } > "$root/Cargo.lock"
+  printf '[package]\nname = "ethswarm-fuzz"\n\n[workspace]\n\n%s\n\n[[bin]]\nname = "t"\n' "$fuzz_patch" > "$root/fuzz/Cargo.toml"
+  { echo 'version = 4'; for p in "$@"; do printf '%s\n' "$p"; done; } > "$root/fuzz/Cargo.lock"
+  echo "$root"
+}
+
+shared="$(pkg p2p-wire 0.1.0)
+$(pkg libp2p 0.57.1 "$GIT")
+$(pkg snap 1.1.2 "$REG")"
+fuzz_only="$(pkg ethswarm-fuzz 0.0.0)
+$(pkg libfuzzer-sys 0.4.13 "$REG")
+$(pkg arbitrary 1.5.0 "$REG")"
+
+check pass "identical patches, shared crates resolved alike" \
+  "$(fixture ok "$PATCH" "$PATCH" "$shared" "$fuzz_only")" "fuzz lock OK"
+check pass "a subset of the root lock" \
+  "$(fixture subset "$PATCH" "$PATCH" "$(pkg p2p-wire 0.1.0)" "$fuzz_only")"
+check fail "no [patch.crates-io] in fuzz/Cargo.toml" \
+  "$(fixture nopatch "$PATCH" "" "$shared")" "[patch.crates-io]"
+check fail "a different patch rev" \
+  "$(fixture rev "$PATCH" "${PATCH//aaaa/bbbb}" "$shared")" "[patch.crates-io]"
+check fail "an extra patch entry" \
+  "$(fixture extra "$PATCH" "$PATCH
+snap = { git = \"https://github.com/BurntSushi/rust-snappy\" }" "$shared")" "[patch.crates-io]"
+check fail "libp2p from crates.io in the fuzz lock" \
+  "$(fixture registry "$PATCH" "$PATCH" "$(pkg libp2p 0.57.1 "$REG")" "$(pkg snap 1.1.2 "$REG")")" \
+  "libp2p 0.57.1"
+check fail "a shared crate at another version" \
+  "$(fixture version "$PATCH" "$PATCH" "$(pkg libp2p 0.57.1 "$GIT")" "$(pkg snap 1.1.1 "$REG")")" \
+  "snap 1.1.1"
+check fail "a crate the root lock does not have" \
+  "$(fixture unknown "$PATCH" "$PATCH" "$shared" "$(pkg evil 1.0.0 "$REG")")" "evil 1.0.0"
+check fail "a fuzz-only crate from git" \
+  "$(fixture fuzzgit "$PATCH" "$PATCH" "$shared" "$(pkg libfuzzer-sys 0.4.13 "$GIT")")" "libfuzzer-sys"
+# Dependency edges. pkgd <name> <version> <source> <dependency string...>, as Cargo.lock writes
+# them: "name", "name version" or "name version (source)".
+pkgd() {
+  local name=$1 version=$2 source=$3
+  shift 3
+  pkg "$name" "$version" "$source"
+  printf 'dependencies = [\n'
+  for d in "$@"; do printf ' "%s",\n' "$d"; done
+  printf ']\n'
+}
+# edges <name> <root lock packages> <fuzz lock packages>: identical patches, the given locks.
+edges() {
+  local root="$tmp/$1"
+  mkdir -p "$root/fuzz"
+  printf '[workspace]\nmembers = []\n\n%s\n' "$PATCH" > "$root/Cargo.toml"
+  printf '[package]\nname = "ethswarm-fuzz"\n\n[workspace]\n\n%s\n' "$PATCH" > "$root/fuzz/Cargo.toml"
+  { echo 'version = 4'; printf '%s\n' "$2"; } > "$root/Cargo.lock"
+  { echo 'version = 4'; printf '%s\n' "$3"; } > "$root/fuzz/Cargo.lock"
+  echo "$root"
+}
+itertools="$(pkg itertools 0.13.0 "$REG")
+$(pkg itertools 0.14.0 "$REG")
+$(pkg anyhow 1.0.0 "$REG")"
+root_prost="$(pkgd prost-derive 0.14.4 "$REG" anyhow "itertools 0.14.0")
+$itertools"
+check pass "dependency edges as in the root lock" \
+  "$(edges same "$root_prost" "$root_prost")" "fuzz lock OK"
+# The reviewer's repro: prost-derive pointed at another itertools the root lock also has.
+check fail "a dependency edge moved to another version" \
+  "$(edges moved "$root_prost" "$(pkgd prost-derive 0.14.4 "$REG" anyhow "itertools 0.13.0")
+$itertools")" "prost-derive 0.14.4 -> itertools 0.13.0"
+check fail "a dependency the root lock does not give the package" \
+  "$(edges extra "$root_prost" "$(pkgd prost-derive 0.14.4 "$REG" anyhow "itertools 0.14.0" "itertools 0.13.0")
+$itertools")" "prost-derive 0.14.4 -> itertools 0.13.0"
+check pass "fewer dependencies (features the fuzz build does not enable)" \
+  "$(edges fewer "$root_prost" "$(pkgd prost-derive 0.14.4 "$REG" "itertools 0.14.0")
+$itertools")"
+check fail "a dependency that names no package" \
+  "$(edges dangling "$root_prost" "$(pkgd prost-derive 0.14.4 "$REG" anyhow "itertools 0.15.0")
+$itertools")" "itertools 0.15.0"
+check fail "a bare name that two versions match" \
+  "$(edges ambiguous "$root_prost" "$(pkgd prost-derive 0.14.4 "$REG" anyhow itertools)
+$itertools")" "matches 2 packages"
+check pass "a dependency spelled with its source" \
+  "$(edges sourced "$root_prost" "$(pkgd prost-derive 0.14.4 "$REG" anyhow "itertools 0.14.0 ($REG)")
+$itertools")"
+check fail "a fuzz-only crate with an unshared dependency edge" \
+  "$(edges fuzzonly "$root_prost" "$root_prost
+$(pkgd libfuzzer-sys 0.4.13 "$REG" "itertools 0.12.0")")" "itertools 0.12.0"
+
+root="$(fixture nolock "$PATCH" "$PATCH" "$shared")"
+rm "$root/fuzz/Cargo.lock"
+check fail "no fuzz/Cargo.lock" "$root" "fuzz/Cargo.lock"
+
+check pass "real repo" "$repo"
+
+echo "# $passed passed, $failed failed"
+((failed == 0))

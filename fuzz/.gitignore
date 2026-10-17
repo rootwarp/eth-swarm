@@ -1,0 +1,7 @@
+target
+coverage
+# Crash, OOM and timeout inputs land in artifacts/<target>/. The gate's own files are kept.
+artifacts/*
+!artifacts/m2a-gate.json
+!artifacts/m2a-gate.log
+!artifacts/m2a-coverage.txt
