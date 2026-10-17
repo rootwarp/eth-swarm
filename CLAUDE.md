@@ -25,16 +25,18 @@ cargo test -p spec-tests --lib                # runner unit tests (no vectors ne
 Spec vectors: download them first, then run the `vectors` test target (libtest-mimic, `harness = false`):
 
 ```bash
-PRESETS="minimal" testing/fetch-vectors.sh    # → target/spec-vectors; tag→commit and sha256 pinned, fails closed
+PRESETS="general minimal" testing/fetch-vectors.sh   # → target/spec-vectors; tag→commit and sha256 pinned, fails closed
+INCLUDE_OPTIONAL=1 testing/fetch-vectors.sh           # everything: mainnet, cryptography-specs, bls12-381-tests, comptests
 cargo test -p spec-tests --release --test vectors
-# filter by trial name:
+SPEC_SETS="ssz-specs general minimal" cargo test -p spec-tests --release --test vectors   # what PR CI runs
+# filter by trial name (a filtered run turns the coverage guard off):
 cargo test -p spec-tests --release --test vectors -- gloas_ssz_static_minimal::BeaconState
 cargo test -p spec-tests --release --test vectors -- ssz_generic::test_basic_types
 ```
 
-- Trial names are `ssz_generic::<handler>::<case>` and `<fork>_<runner>_<preset>::<Type>::<suite>::<case>`.
+- Trial names are `ssz_generic::<handler>::<case>`, `<fork>_<runner>_<preset>::<handler>::<case>` (consensus-spec-tests), `cryptography_specs_<runner>::<handler>::<case>`, `bls12_381::<handler>::<case>`, and `comptests_<fork>_<runner>_<preset>::…`.
+- `SPEC_SETS` (space or comma separated: `ssz-specs`, `general`, `minimal`, `mainnet`, `cryptography-specs`, `bls12-381-tests`, `comptests`) picks the sets and makes each one required. Unset, ssz-specs and `minimal` are required and the others run only if extracted.
 - `SPEC_VECTORS_DIR` overrides `target/spec-vectors`.
-- The ssz-specs vectors and the `minimal` preset are required. `mainnet` runs only if it has been extracted.
 
 Policy and contract gates (CI runs these):
 
@@ -73,14 +75,16 @@ Wire rules that cut across every package (full list in `proto/README.md`):
 
 ### Spec-vector runner (`crates/spec-tests`)
 
-Flow: `discover` cases (`ssz_generic.rs` for ssz-specs JSON fixtures, `ssz_static.rs` for consensus-spec-tests `ssz_static`) → `plan::plan` against `testing/skip.toml` → one libtest trial per case (`tests/vectors.rs`). Each check is decode, re-encode to identical bytes, and compare `hash_tree_root` (`check::round_trip`).
+Flow: `suite.rs` walks every extracted set → `plan::plan` against `testing/skip.toml` → one libtest trial per case (`tests/vectors.rs`) → the coverage guard. Runners: `ssz_generic.rs` (ssz-specs JSON fixtures), `ssz_static.rs` (decode, re-encode to identical bytes, compare `hash_tree_root`; `check::round_trip`), `kzg.rs` (cell handlers through `crypto-kzg`, setup via `TrustedSetup::load_pinned`) and `bls.rs` (every handler except the skipped `hash_to_G2`, through `crypto-bls`; `sign`/`aggregate`/`aggregate_verify` via its `test-vectors` feature). A required set with no files, or without its runnable subtrees, fails setup, and setup errors exit non-zero even under a name filter. An unknown handler dir under `bls/` or `kzg/` fails the run, and no skip entry can rescue it.
+
+Coverage guard (`coverage.rs`): runners read vector files only through `coverage::Reads`. After an unfiltered run, a file under a scanned root that no runner read fails the run and is listed, unless its case is skipped or a skip entry with a `file` field excuses it (the case still runs).
 
 The skip list is strict, and the run **fails** in any of these cases:
 - a case is neither runnable nor skipped ("unaccounted")
 - a skip entry is past its `expires` date (current entries expire 2026-11-30)
-- a skip entry matches no discovered case (stale)
+- a skip entry matches no discovered case (stale). This is only checked for sets that were scanned, so a minimal-only run doesn't flag mainnet or crypto entries.
 
-A skip entry wins over a handler. When you add a type, also delete its skip entry, or the type never runs.
+Every entry needs `reason`, `owner` and `expires`. `source` and `preset` must be known values. A skip entry wins over a handler. When you add a type, also delete its skip entry, or the type never runs.
 
 To make an ssz_static handler runnable:
 1. Add the container to `crates/consensus-types/src/{fulu,gloas}/mod.rs` (`common/` if both forks share it). A new preset-dependent length goes on `EthSpec` in `preset.rs`, for both `Minimal` and `Mainnet`.

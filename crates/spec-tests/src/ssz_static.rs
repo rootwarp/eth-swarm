@@ -1,50 +1,14 @@
 //! consensus-spec-tests `tests/<preset>/<fork>/ssz_static/<Type>/<suite>/<case>/`.
 //!
-//! Each case holds `serialized.ssz_snappy` (snappy block format) and `roots.yaml`.
-//! The check is decode, re-encode to identical bytes, and `hash_tree_root`.
+//! Each case holds `serialized.ssz_snappy` (snappy block format), `roots.yaml`, `value.yaml`
+//! and `manifest.yaml`. The check is decode, re-encode to identical bytes, and
+//! `hash_tree_root`; `value.yaml` (the same value as YAML) is not read and is excused in
+//! `skip.toml`.
 
 use crate::check::{parse_hex, round_trip, Expect};
-use crate::plan::CaseKey;
-use crate::ssz_generic::{file_name, sorted_dir};
+use crate::coverage::Reads;
+use crate::plan::Case;
 use consensus_types::{fulu, gloas, EthSpec, Mainnet, Minimal};
-use std::path::{Path, PathBuf};
-
-/// A discovered ssz_static case.
-#[derive(Debug)]
-pub struct StaticCase {
-    /// Skip-list key; `case` is `<suite>/<case>`.
-    pub key: CaseKey,
-    /// The case directory.
-    pub dir: PathBuf,
-}
-
-/// Lists every case under `<root>/tests/<preset>/<fork>/ssz_static`.
-pub fn discover(root: &Path, preset: &str, fork: &str) -> std::io::Result<Vec<StaticCase>> {
-    let base = root
-        .join("tests")
-        .join(preset)
-        .join(fork)
-        .join("ssz_static");
-    let mut out = Vec::new();
-    for handler in sorted_dir(&base)? {
-        for suite in sorted_dir(&handler)? {
-            for case in sorted_dir(&suite)? {
-                out.push(StaticCase {
-                    key: CaseKey {
-                        source: "consensus-specs".into(),
-                        fork: fork.into(),
-                        preset: preset.into(),
-                        runner: "ssz_static".into(),
-                        handler: file_name(&handler),
-                        case: format!("{}/{}", file_name(&suite), file_name(&case)),
-                    },
-                    dir: case,
-                });
-            }
-        }
-    }
-    Ok(out)
-}
 
 /// Extracts `root: '0x..'` from `roots.yaml` without a YAML dependency.
 fn parse_root(yaml: &str) -> Result<[u8; 32], String> {
@@ -63,14 +27,17 @@ pub fn supported(fork: &str, preset: &str, handler: &str) -> bool {
     dispatch(fork, preset, handler, &[], &Expect::Invalid).is_some()
 }
 
-/// Runs one case. `Err` describes a failure.
-pub fn run(case: &StaticCase) -> Result<(), String> {
-    let compressed = std::fs::read(case.dir.join("serialized.ssz_snappy"))
+/// Runs one case from its `serialized.ssz_snappy` and `roots.yaml`. `Err` describes a failure.
+pub fn run(reads: &Reads, case: &Case) -> Result<(), String> {
+    let file = |name: &str| case.file(name).ok_or_else(|| format!("case has no {name}"));
+    let compressed = reads
+        .read(file("serialized.ssz_snappy")?)
         .map_err(|e| format!("serialized.ssz_snappy: {e}"))?;
     let bytes = snap::raw::Decoder::new()
         .decompress_vec(&compressed)
         .map_err(|e| format!("snappy: {e}"))?;
-    let yaml = std::fs::read_to_string(case.dir.join("roots.yaml"))
+    let yaml = reads
+        .read_to_string(file("roots.yaml")?)
         .map_err(|e| format!("roots.yaml: {e}"))?;
     let expect = Expect::Valid {
         root: parse_root(&yaml)?,

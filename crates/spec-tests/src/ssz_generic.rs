@@ -5,14 +5,15 @@
 //! across filler modules with different definitions, so lookup is by (handler, type).
 
 use crate::check::{parse_hex, round_trip, Expect};
-use crate::plan::CaseKey;
+use crate::coverage::Reads;
+use crate::plan::Case;
 use alloy_primitives::{U128, U256 as Uint256};
 use serde::Deserialize;
 use ssz::{BitList, BitVector, ProgressiveBitList};
 use ssz_derive::{Decode, Encode};
 use ssz_types::{typenum::*, FixedVector, ProgressiveVariableList, VariableList};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tree_hash_derive::TreeHash;
 
 /// One fixture case.
@@ -42,59 +43,11 @@ impl Fixture {
     }
 }
 
-/// A discovered case: its key plus the fixture file.
-#[derive(Debug)]
-pub struct GenericCase {
-    /// Skip-list key.
-    pub key: CaseKey,
-    /// Path to the JSON file.
-    pub path: PathBuf,
-}
-
-/// Lists every `*.json` case under `<root>/fixtures/ssz/ssz/`.
-pub fn discover(root: &Path) -> std::io::Result<Vec<GenericCase>> {
-    let base = root.join("fixtures/ssz/ssz");
-    let mut out = Vec::new();
-    for handler in sorted_dir(&base)? {
-        for file in sorted_dir(&handler)? {
-            if file.extension().is_some_and(|e| e == "json") {
-                out.push(GenericCase {
-                    key: CaseKey {
-                        source: "ssz-specs".into(),
-                        fork: "none".into(),
-                        preset: "none".into(),
-                        runner: "ssz".into(),
-                        handler: file_name(&handler),
-                        case: file
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                    },
-                    path: file,
-                });
-            }
-        }
-    }
-    Ok(out)
-}
-
-pub(crate) fn sorted_dir(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut v: Vec<_> = std::fs::read_dir(dir)?
-        .map(|e| e.map(|e| e.path()))
-        .collect::<Result<_, _>>()?;
-    v.sort();
-    Ok(v)
-}
-
-pub(crate) fn file_name(p: &Path) -> String {
-    p.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
 /// Loads the single fixture in a case file.
-pub fn load(path: &Path) -> Result<Fixture, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+pub fn load(reads: &Reads, path: &Path) -> Result<Fixture, String> {
+    let text = reads
+        .read_to_string(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     let map: BTreeMap<String, Fixture> =
         serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut it = map.into_values();
@@ -109,9 +62,20 @@ pub fn supported(handler: &str, type_name: &str) -> bool {
     dispatch(handler, type_name, &[], &Expect::Invalid).is_some()
 }
 
+/// The fixture file of a case: its only file, `<case>.json`.
+pub fn fixture_path(case: &Case) -> Result<&Path, String> {
+    match case.files.as_slice() {
+        [f] if f.name == format!("{}.json", case.key.case) => Ok(&f.path),
+        _ => Err(format!(
+            "expected exactly one file `{}.json` in the case",
+            case.key.case
+        )),
+    }
+}
+
 /// Runs one case. `Err` describes a failure.
-pub fn run(case: &GenericCase) -> Result<(), String> {
-    let f = load(&case.path)?;
+pub fn run(reads: &Reads, case: &Case) -> Result<(), String> {
+    let f = load(reads, fixture_path(case)?)?;
     let bytes = parse_hex(&f.serialized)?;
     let expect = f.expect()?;
     dispatch(&case.key.handler, &f.type_name, &bytes, &expect)

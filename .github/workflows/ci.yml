@@ -73,6 +73,9 @@ jobs:
     name: fmt, clippy, build, test
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      # Vector sets the spec-tests `vectors` target must find and run (crates/spec-tests/README.md).
+      SPEC_SETS: ssz-specs general minimal
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -90,6 +93,10 @@ jobs:
         run: bash scripts/tests/check-kzg-loaders.test.sh && bash scripts/check-kzg-loaders.sh
       - name: Only spec-tests may enable crypto-bls/test-vectors
         run: bash scripts/check-bls-features.sh
+      - name: cl-chain links only crypto-bls/aggregate, never crypto-bls/verify
+        run: bash scripts/tests/check-cl-chain-features.test.sh && bash scripts/check-cl-chain-features.sh
+      - name: No dependency cycles among workspace crates (cargo metadata, every edge kind)
+        run: bash scripts/tests/check-dep-cycles.test.sh && bash scripts/check-dep-cycles.sh
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Fetch and verify spec vectors (uncached)
         run: PRESETS="general minimal" bash testing/fetch-vectors.sh

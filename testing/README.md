@@ -23,7 +23,8 @@ The consensus-specs and ssz-specs sha256 values were verified on 2026-10-15 by d
 Notes:
 - `general.tar.gz` at v1.7.0-beta.4 is only 3 KB and holds only `altair/bls/eth_*` cases.
 - SSZ generic vectors come from ssz-specs instead.
-- cryptography-specs `tests.zip` and bls12-381-tests are `optional` until a runner uses them; the nightly fetches them.
+- cryptography-specs `tests.zip` and bls12-381-tests feed the spec-tests `kzg` and `bls` runners. They stay `optional`, so the PR job (minimal) skips them; the nightly fetches and runs them.
+- `comptests.tar.gz` (fork_choice_compliance vectors plus pyspec sources) has no runner. The nightly extracts it, and the coverage guard scans it under one `skip.toml` entry.
 - consensus-specs mainnet plus minimal is about 1.4 GB compressed. CI does **not** cache them: every PR run and the nightly fetch and verify fresh.
 
 ## Local

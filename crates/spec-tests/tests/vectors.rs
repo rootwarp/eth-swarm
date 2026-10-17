@@ -1,135 +1,103 @@
-//! One libtest trial per vector case. Set `SPEC_VECTORS_DIR` to override the default
-//! `target/spec-vectors` produced by `testing/fetch-vectors.sh`.
+//! One libtest trial per vector case, then the coverage guard.
+//!
+//! - `SPEC_VECTORS_DIR` overrides the default `target/spec-vectors` of `testing/fetch-vectors.sh`.
+//! - `SPEC_SETS` picks the sets to run (space or comma separated, each then required):
+//!   `ssz-specs general minimal mainnet comptests cryptography-specs bls12-381-tests`. Unset: ssz-specs
+//!   and minimal are required, the others run when extracted.
+//! - The coverage guard runs after an unfiltered run and fails it if any vector file was read by
+//!   no handler and excused by no `skip.toml` entry. A name filter, `--skip`, `--ignored`,
+//!   `--list` or `--bench` turns it off, since those runs do not execute every case. Only reads
+//!   made while a trial runs count.
+//! - Setup and skip-list errors exit 101 before any trial runs, whatever the filter.
 
 use libtest_mimic::{Arguments, Failed, Trial};
-use network_config::{ForkName, SPEC_PIN};
-use spec_tests::plan::{plan, CaseKey, Date, Disposition, SkipList};
-use spec_tests::{ssz_generic, ssz_static};
-use std::collections::HashSet;
+use spec_tests::plan::Date;
+use spec_tests::suite::{self, Config, Outcome, SuiteError};
 use std::path::PathBuf;
-use std::sync::Arc;
-
-/// Presets run when their extracted tree is present; minimal is required.
-const PRESETS: [(&str, bool); 2] = [("minimal", true), ("mainnet", false)];
-
-type Runner = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-fn main() {
-    let args = Arguments::from_args();
-    let trials = match build_trials() {
-        Ok(t) => t,
-        Err(e) => vec![Trial::test("setup", move || Err(Failed::from(e.clone())))],
-    };
-    libtest_mimic::run(&args, trials).exit();
+fn read(rel: &str) -> Result<String, String> {
+    let path = workspace_root().join(rel);
+    std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn build_trials() -> Result<Vec<Trial>, String> {
+fn main() {
+    let args = Arguments::from_args();
+    // Only a run that executes every case can vouch for coverage.
+    let guard_off = if args.bench {
+        Some("--bench runs no trial")
+    } else if args.list {
+        Some("--list runs no trial")
+    } else if args.filter.is_some() || !args.skip.is_empty() || args.ignored {
+        Some("filtered run")
+    } else {
+        None
+    };
     let root = std::env::var_os("SPEC_VECTORS_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace_root().join("target/spec-vectors"));
-    let skip_path = workspace_root().join("testing/skip.toml");
-    let skip_text = std::fs::read_to_string(&skip_path).map_err(|e| {
-        format!(
-            "{}: {e} (copy testing/skip.toml.example)",
-            skip_path.display()
-        )
-    })?;
-    let skips = SkipList::parse(&skip_text).map_err(|e| e.to_string())?;
+    let selection = std::env::var("SPEC_SETS").ok();
 
-    let mut keys: Vec<CaseKey> = Vec::new();
-    let mut runners: Vec<Option<Runner>> = Vec::new();
-
-    let ssz_specs = format!("ssz-specs/{v}/ssz-test-vectors-{v}", v = SPEC_PIN.ssz_specs);
-    let consensus = format!("consensus-specs/{}", SPEC_PIN.consensus_specs);
-
-    let generic = ssz_generic::discover(&root.join(ssz_specs))
-        .map_err(|e| format!("ssz-specs vectors missing ({e}); run testing/fetch-vectors.sh"))?;
-    for case in generic {
-        let fixture = ssz_generic::load(&case.path)?;
-        let runnable = ssz_generic::supported(&case.key.handler, &fixture.type_name);
-        keys.push(case.key.clone());
-        let case = Arc::new(case);
-        runners.push(runnable.then(|| -> Runner { Arc::new(move || ssz_generic::run(&case)) }));
-    }
-
-    for (preset, required) in PRESETS {
-        let dir = root.join(&consensus).join(preset);
-        if !dir.exists() && !required {
-            continue;
-        }
-        for fork in ForkName::ALL.map(ForkName::as_str) {
-            let statics = ssz_static::discover(&dir, preset, fork).map_err(|e| {
-                format!(
-                    "consensus-specs {preset}/{fork} vectors missing ({e}); run testing/fetch-vectors.sh"
-                )
-            })?;
-            for case in statics {
-                let runnable = ssz_static::supported(fork, preset, &case.key.handler);
-                keys.push(case.key.clone());
-                let case = Arc::new(case);
-                runners
-                    .push(runnable.then(|| -> Runner { Arc::new(move || ssz_static::run(&case)) }));
-            }
-        }
-    }
-
-    let runnable: HashSet<String> = keys
-        .iter()
-        .zip(&runners)
-        .filter(|(_, r)| r.is_some())
-        .map(|(k, _)| k.to_string())
-        .collect();
-    let planned = match plan(
-        &keys,
-        |k| runnable.contains(&k.to_string()),
-        &skips,
-        Date::today_utc(),
-    ) {
-        Ok(p) => p,
-        Err(errs) => {
-            let msg = errs
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Ok(vec![Trial::test("skip_list::rules", move || {
-                Err(msg.clone().into())
-            })]);
+    let built = read("testing/vectors.manifest.toml")
+        .and_then(|m| read("testing/skip.toml").map(|s| (m, s)))
+        .map_err(SuiteError::Setup)
+        .and_then(|(manifest, skip)| {
+            suite::build(&Config {
+                root: &root,
+                manifest: &manifest,
+                skip: &skip,
+                selection: selection.as_deref(),
+                today: Date::today_utc(),
+            })
+        });
+    // Reported before libtest runs: as a trial, a name filter could drop it and exit 0.
+    let suite = match built {
+        Ok(s) => s,
+        Err(e) => {
+            let (what, msg) = match e {
+                SuiteError::Setup(m) => ("setup", m),
+                SuiteError::Rules(m) => ("skip list rules", m),
+            };
+            eprintln!("spec vectors: {what} failed:\n{msg}");
+            std::process::exit(101);
         }
     };
+    eprintln!("vector sets scanned: {}", suite.scanned.join(" "));
 
-    Ok(planned
+    let trials = suite
+        .trials
         .into_iter()
-        .zip(runners)
-        .map(|((key, disposition), runner)| {
-            let name = trial_name(key);
-            match (disposition, runner) {
-                (Disposition::Skip(_), _) => Trial::test(name, || Ok(()))
-                    .with_ignored_flag(true)
-                    .with_kind("skip"),
-                (Disposition::Run, Some(r)) => Trial::test(name, move || r().map_err(Failed::from)),
-                (Disposition::Run, None) | (Disposition::Unaccounted, _) => {
-                    Trial::test(name, || {
-                        Err("unaccounted: no Rust type for this case and no skip entry".into())
-                    })
-                }
-            }
+        .map(|t| match t.outcome {
+            Outcome::Run(r) => Trial::test(t.name, move || r().map_err(Failed::from)),
+            Outcome::Skip(_) => Trial::test(t.name, || Ok(()))
+                .with_ignored_flag(true)
+                .with_kind("skip"),
+            Outcome::Unaccounted => Trial::test(t.name, || {
+                Err("unaccounted: no runner for this case and no skip entry".into())
+            }),
         })
-        .collect())
-}
+        .collect();
+    let conclusion = libtest_mimic::run(&args, trials);
 
-fn trial_name(k: &CaseKey) -> String {
-    let case = k.case.replace('/', "::");
-    if k.source == "ssz-specs" {
-        format!("ssz_generic::{}::{case}", k.handler)
+    if guard_off.is_none() {
+        let started = std::time::Instant::now();
+        let result = suite.guard.check(&suite.reads);
+        eprintln!(
+            "coverage guard: checked in {:.2?} (includes the re-walk)",
+            started.elapsed()
+        );
+        match result {
+            Ok(covered) => eprintln!("{covered}"),
+            Err(unread) => {
+                eprintln!("{unread}");
+                std::process::exit(101);
+            }
+        }
     } else {
-        format!(
-            "{}_{}_{}::{}::{case}",
-            k.fork, k.runner, k.preset, k.handler
-        )
+        eprintln!("coverage guard: off ({})", guard_off.unwrap_or_default());
     }
+    conclusion.exit();
 }

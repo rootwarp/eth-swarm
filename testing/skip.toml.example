@@ -1,14 +1,27 @@
 # Skip list for the spec-vector runner. The runner FAILS on any handler that is neither
 # executed nor matched by an entry here. It also fails on an entry past its expiry date,
-# and on an entry that matches nothing (stale).
+# and on an entry that matches nothing (stale). Staleness is checked only for entries that a
+# scanned set could match (its source, presets, forks and runners; see crates/spec-tests/src/
+# suite.rs SETS), so mainnet or cryptography-specs entries do not fail a run that did not
+# extract those sets, and a run of `general` alone (altair/bls only) checks only bls entries.
 #
-# Fields:
-#   source    "consensus-specs" | "ssz-specs"                       (required)
-#   fork      e.g. "fulu", "gloas"; "*" = any                       (required)
-#   preset    "minimal" | "mainnet" | "general" | "*"               (required)
-#   runner    e.g. "operations", "fork_choice"                      (required)
+# Coverage guard: after an unfiltered run, every file under the scanned vector roots must
+# have been read by a handler. Files of skipped cases are exempt; any other file needs an
+# entry with `file`. Such an entry skips nothing: the case still runs, and only the matching
+# files are excused.
+#
+# Fields (every value except `source` is a glob: `*` matches any run of characters):
+#   source    "consensus-specs" | "ssz-specs" | "cryptography-specs" | "bls12-381-tests" |
+#             "comptests" (consensus-specs comptests.tar.gz)        (required, literal)
+#   fork      e.g. "fulu", "gloas"; "none" for sources without forks (required)
+#   preset    "minimal" | "mainnet" | "general" | "none" | "*"      (required)
+#             (source "comptests": "minimal" | "core" | "formats" | "generators" | "*")
+#   runner    e.g. "operations", "fork_choice", "kzg", "bls", "ssz" (required)
 #   handler   e.g. "payload_attestation"; "*" = whole runner        (required)
-#   case      glob over case names; omit = all cases                (optional)
+#   case      glob over case names (`<suite>/<case>` for consensus-specs); omit = all cases
+#                                                                   (optional)
+#   file      glob over file paths inside the case, e.g. "value.yaml"; makes the entry a
+#             coverage excuse instead of a skip                     (optional)
 #   reason    why it is skipped                                     (required)
 #   owner     team member responsible                               (required)
 #   issue     tracking issue URL or ID                              (required)
@@ -37,6 +50,18 @@ reason  = "EXAMPLE: PTC fork-choice handling not implemented yet"
 owner   = "tess"
 issue   = "TBD"
 expires = "2026-11-15"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "ssz_static"
+handler = "*"
+file    = "value.yaml"   # the case still runs; only value.yaml is excused from the guard
+reason  = "EXAMPLE: value.yaml repeats serialized.ssz_snappy as YAML and is not decoded"
+owner   = "ian"
+issue   = "TBD"
+expires = "2026-11-30"
 
 [[skip]]
 source  = "ssz-specs"

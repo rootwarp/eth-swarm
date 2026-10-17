@@ -3082,6 +3082,8 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "consensus-types",
+ "crypto-bls",
+ "crypto-kzg",
  "ethereum_ssz",
  "ethereum_ssz_derive",
  "hex",
@@ -3091,10 +3093,12 @@ dependencies = [
  "serde_json",
  "snap",
  "ssz_types",
+ "tempfile",
  "thiserror",
  "toml 0.8.23",
  "tree_hash",
  "tree_hash_derive",
+ "yaml-rust2",
 ]
 
 [[package]]

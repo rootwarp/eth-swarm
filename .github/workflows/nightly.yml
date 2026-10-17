@@ -23,6 +23,11 @@ jobs:
     name: fetch every manifest source, full vector suite
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    env:
+      # Every set is required: mainnet ssz_static, bls (bls12-381-tests, cryptography-specs,
+      # general) and kzg (cryptography-specs) run, and comptests is scanned, with the coverage
+      # guard on.
+      SPEC_SETS: ssz-specs general minimal mainnet comptests cryptography-specs bls12-381-tests
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -40,7 +45,10 @@ jobs:
         run: INCLUDE_OPTIONAL=1 bash testing/fetch-vectors.sh
       - name: Disk usage
         run: du -sh target/spec-vectors/*/* && df -h .
-      - run: cargo test --workspace --locked
+      - name: Workspace tests (debug; the full vector sets run once, below, in release)
+        run: cargo test --workspace --locked
+        env:
+          SPEC_SETS: ssz-specs general minimal
       - run: cargo test -p spec-tests --release --locked --test vectors
 
   policy:

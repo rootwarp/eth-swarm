@@ -2,9 +2,59 @@
 //!
 //! The run fails when a case is neither run nor skipped, when a skip entry has
 //! expired, or when a skip entry matches no case (stale).
+//!
+//! An entry without `file` skips whole cases. An entry with `file` skips nothing: it only
+//! excuses the matching files of a case from the coverage guard ([`crate::coverage`]).
 
 use serde::Deserialize;
 use std::fmt;
+use std::path::PathBuf;
+
+/// Vector sources a skip entry may name (`source` is literal, not a glob). `comptests` is the
+/// consensus-specs `comptests.tar.gz` archive, keyed apart so its entries never reach the
+/// general/minimal/mainnet trees.
+pub const KNOWN_SOURCES: [&str; 5] = [
+    "consensus-specs",
+    "ssz-specs",
+    "cryptography-specs",
+    "bls12-381-tests",
+    "comptests",
+];
+
+/// Presets a skip entry may name besides `*`; `none` is the preset of sources without presets.
+pub const KNOWN_PRESETS: [&str; 4] = ["general", "minimal", "mainnet", "none"];
+
+/// The presets of source `comptests`: the compliance vectors sit under `tests/minimal`, the
+/// Python sources under `tests/{core,formats,generators}`.
+pub const COMPTESTS_PRESETS: [&str; 4] = ["minimal", "core", "formats", "generators"];
+
+/// The presets valid for `source`.
+pub fn known_presets(source: &str) -> &'static [&'static str] {
+    match source {
+        "comptests" => &COMPTESTS_PRESETS,
+        _ => &KNOWN_PRESETS,
+    }
+}
+
+/// What one scanned vector set can contain: its key source and the presets, forks and
+/// runners its keys can take (`*` = any). A skip entry is checked for staleness only if some
+/// scanned set's scope could hold a case it matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Scope {
+    /// Key `source`.
+    pub source: &'static str,
+    /// Possible `preset` values.
+    pub presets: &'static [&'static str],
+    /// Possible `fork` values.
+    pub forks: &'static [&'static str],
+    /// Possible `runner` values.
+    pub runners: &'static [&'static str],
+}
+
+/// Whether `pattern` can match one of `values`; a `*` value stands for anything.
+fn could_match(pattern: &str, values: &[&str]) -> bool {
+    values.iter().any(|v| *v == "*" || glob(pattern, v))
+}
 
 /// Identifies one test case in the vector trees.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,6 +80,34 @@ impl fmt::Display for CaseKey {
             "{}::{}::{}::{}::{}::{}",
             self.source, self.fork, self.preset, self.runner, self.handler, self.case
         )
+    }
+}
+
+/// One file of a case, as found by the coverage walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaseFile {
+    /// Absolute (or root-joined) path, as handlers open it.
+    pub path: PathBuf,
+    /// Path inside the case, e.g. `roots.yaml`; what a skip entry's `file` glob matches.
+    pub name: String,
+}
+
+/// A case and every file the vector tree holds for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Case {
+    /// Skip-list key.
+    pub key: CaseKey,
+    /// Files belonging to the case; empty for a case directory without files.
+    pub files: Vec<CaseFile>,
+}
+
+impl Case {
+    /// The path of the file named `name` inside the case.
+    pub fn file(&self, name: &str) -> Option<&std::path::Path> {
+        self.files
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.path.as_path())
     }
 }
 
@@ -124,6 +202,7 @@ struct RawEntry {
     runner: String,
     handler: String,
     case: Option<String>,
+    file: Option<String>,
     reason: String,
     owner: String,
     issue: String,
@@ -143,7 +222,16 @@ struct Entry {
 }
 
 impl Entry {
-    fn matches(&self, k: &CaseKey) -> bool {
+    /// Whether a set of scope `s` could hold a case this entry matches.
+    fn in_scope(&self, s: &Scope) -> bool {
+        let r = &self.raw;
+        glob(&r.source, s.source)
+            && could_match(&r.preset, s.presets)
+            && could_match(&r.fork, s.forks)
+            && could_match(&r.runner, s.runners)
+    }
+
+    fn matches_case(&self, k: &CaseKey) -> bool {
         let r = &self.raw;
         glob(&r.source, &k.source)
             && glob(&r.fork, &k.fork)
@@ -153,9 +241,26 @@ impl Entry {
             && r.case.as_deref().is_none_or(|c| glob(c, &k.case))
     }
 
+    fn matches_file(&self, k: &CaseKey, name: &str) -> bool {
+        self.raw
+            .file
+            .as_deref()
+            .is_some_and(|f| glob(f, name) && self.matches_case(k))
+    }
+
+    /// Whether anything in `cases` matches: a case for case entries, a file for file entries.
+    fn matches_any(&self, cases: &[Case]) -> bool {
+        match self.raw.file {
+            None => cases.iter().any(|c| self.matches_case(&c.key)),
+            Some(_) => cases
+                .iter()
+                .any(|c| c.files.iter().any(|f| self.matches_file(&c.key, &f.name))),
+        }
+    }
+
     fn summary(&self) -> String {
         let r = &self.raw;
-        format!(
+        let mut s = format!(
             "{}/{}/{}/{}/{}/{}",
             r.source,
             r.fork,
@@ -163,7 +268,11 @@ impl Entry {
             r.runner,
             r.handler,
             r.case.as_deref().unwrap_or("*")
-        )
+        );
+        if let Some(f) = &r.file {
+            s.push_str(&format!(" file {f}"));
+        }
+        s
     }
 }
 
@@ -200,12 +309,46 @@ impl SkipList {
                         return Err(invalid(&format!("`{name}` is empty")));
                     }
                 }
+                if raw.file.as_deref().is_some_and(|f| f.trim().is_empty()) {
+                    return Err(invalid("`file` is empty"));
+                }
+                if !KNOWN_SOURCES.contains(&raw.source.as_str()) {
+                    return Err(invalid(&format!(
+                        "`source` {:?} is not one of {KNOWN_SOURCES:?}",
+                        raw.source
+                    )));
+                }
+                let presets = known_presets(&raw.source);
+                if raw.preset != "*" && !presets.contains(&raw.preset.as_str()) {
+                    return Err(invalid(&format!(
+                        "`preset` {:?} is neither \"*\" nor one of {presets:?} for source {:?}",
+                        raw.preset, raw.source
+                    )));
+                }
                 let expires = Date::parse(&raw.expires)
                     .ok_or_else(|| invalid("`expires` is not YYYY-MM-DD"))?;
-                Ok(Entry { raw, expires })
+                let entry = Entry { raw, expires };
+                // An entry no set could match would never be stale-checked; a typo would
+                // then silently skip nothing forever.
+                if !crate::suite::SETS
+                    .iter()
+                    .any(|set| entry.in_scope(&set.scope))
+                {
+                    return Err(invalid(&format!(
+                        "{} matches no vector set (no set in crates/spec-tests/src/suite.rs SETS \
+                         has that source, preset, fork and runner)",
+                        entry.summary()
+                    )));
+                }
+                Ok(entry)
             })
             .collect::<Result<_, _>>()?;
         Ok(Self { entries })
+    }
+
+    /// Whether a `file` entry excuses file `name` of case `k` from the coverage guard.
+    pub fn excuses(&self, k: &CaseKey, name: &str) -> bool {
+        self.entries.iter().any(|e| e.matches_file(k, name))
     }
 }
 
@@ -240,17 +383,22 @@ pub enum Disposition {
     Unaccounted,
 }
 
-/// Decides each case's disposition. A skip entry wins over a handler so known
-/// failures can be parked explicitly. Fails on expired or stale entries.
+/// Decides each case's disposition. A case entry wins over a handler so known
+/// failures can be parked explicitly; `file` entries never change a disposition.
+/// Fails on expired or stale entries.
 ///
-/// Entries are checked for staleness only against `cases`, so pass every case of
-/// every source the skip file refers to.
+/// An entry is checked for staleness only when one of `scopes` (the scanned sets) could hold
+/// a case it matches: mainnet or cryptography-specs entries are not stale on a run that did
+/// not extract those sets, and the `preset = "*"` state-transition entries are not stale on
+/// a run of `general` alone (which holds only `altair/bls`). Pass every case of every set
+/// that was scanned.
 pub fn plan<'a>(
-    cases: &'a [CaseKey],
+    cases: &'a [Case],
     has_handler: impl Fn(&CaseKey) -> bool,
     skips: &SkipList,
     today: Date,
-) -> Result<Vec<(&'a CaseKey, Disposition)>, Vec<PlanError>> {
+    scopes: &[Scope],
+) -> Result<Vec<(&'a Case, Disposition)>, Vec<PlanError>> {
     let mut errors = Vec::new();
     for (index, e) in skips.entries.iter().enumerate() {
         if e.expires < today {
@@ -260,7 +408,8 @@ pub fn plan<'a>(
                 expires: e.raw.expires.clone(),
             });
         }
-        if !cases.iter().any(|k| e.matches(k)) {
+        let in_scope = scopes.iter().any(|s| e.in_scope(s));
+        if in_scope && !e.matches_any(cases) {
             errors.push(PlanError::Stale {
                 index,
                 summary: e.summary(),
@@ -272,13 +421,18 @@ pub fn plan<'a>(
     }
     Ok(cases
         .iter()
-        .map(|k| {
-            let d = match skips.entries.iter().find(|e| e.matches(k)) {
+        .map(|c| {
+            let k = &c.key;
+            let skip = skips
+                .entries
+                .iter()
+                .find(|e| e.raw.file.is_none() && e.matches_case(k));
+            let d = match skip {
                 Some(e) => Disposition::Skip(e.raw.reason.clone()),
                 None if has_handler(k) => Disposition::Run,
                 None => Disposition::Unaccounted,
             };
-            (k, d)
+            (c, d)
         })
         .collect())
 }
@@ -286,6 +440,7 @@ pub fn plan<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn key(handler: &str, case: &str) -> CaseKey {
         CaseKey {
@@ -309,6 +464,13 @@ mod tests {
         )
     }
 
+    const SCOPES: [Scope; 1] = [Scope {
+        source: "consensus-specs",
+        presets: &["minimal"],
+        forks: &["*"],
+        runners: &["*"],
+    }];
+
     fn today() -> Date {
         Date::parse("2026-10-15").unwrap()
     }
@@ -317,11 +479,18 @@ mod tests {
     fn classifies_run_skip_and_unaccounted() {
         let skips = SkipList::parse(&entry("BeaconState", None, "2026-12-31")).unwrap();
         let cases = [
-            key("BeaconState", "ssz_random/case_0"),
-            key("BeaconStateX", "ssz_one/case_0"),
-            key("Checkpoint", "ssz_one/case_0"),
+            case("BeaconState", "ssz_random/case_0", &[]),
+            case("BeaconStateX", "ssz_one/case_0", &[]),
+            case("Checkpoint", "ssz_one/case_0", &[]),
         ];
-        let got = plan(&cases, |k| k.handler == "Checkpoint", &skips, today()).unwrap();
+        let got = plan(
+            &cases,
+            |k| k.handler == "Checkpoint",
+            &skips,
+            today(),
+            &SCOPES,
+        )
+        .unwrap();
         let d: Vec<_> = got.into_iter().map(|(_, d)| d).collect();
         assert_eq!(
             d,
@@ -337,10 +506,10 @@ mod tests {
     fn case_glob_narrows_the_skip() {
         let skips = SkipList::parse(&entry("Foo", Some("ssz_random/*"), "2026-12-31")).unwrap();
         let cases = [
-            key("Foo", "ssz_random/case_1"),
-            key("Foo", "ssz_one/case_1"),
+            case("Foo", "ssz_random/case_1", &[]),
+            case("Foo", "ssz_one/case_1", &[]),
         ];
-        let got = plan(&cases, |_| true, &skips, today()).unwrap();
+        let got = plan(&cases, |_| true, &skips, today(), &SCOPES).unwrap();
         assert_eq!(got[0].1, Disposition::Skip("r-Foo".into()));
         assert_eq!(got[1].1, Disposition::Run);
     }
@@ -348,7 +517,14 @@ mod tests {
     #[test]
     fn expired_entry_fails_the_run() {
         let skips = SkipList::parse(&entry("Foo", None, "2026-10-14")).unwrap();
-        let errs = plan(&[key("Foo", "a/b")], |_| true, &skips, today()).unwrap_err();
+        let errs = plan(
+            &[case("Foo", "a/b", &[])],
+            |_| true,
+            &skips,
+            today(),
+            &SCOPES,
+        )
+        .unwrap_err();
         assert!(matches!(
             errs.as_slice(),
             [PlanError::Expired { index: 0, .. }]
@@ -358,13 +534,27 @@ mod tests {
     #[test]
     fn entry_expiring_today_is_still_valid() {
         let skips = SkipList::parse(&entry("Foo", None, "2026-10-15")).unwrap();
-        assert!(plan(&[key("Foo", "a/b")], |_| true, &skips, today()).is_ok());
+        assert!(plan(
+            &[case("Foo", "a/b", &[])],
+            |_| true,
+            &skips,
+            today(),
+            &SCOPES
+        )
+        .is_ok());
     }
 
     #[test]
     fn stale_entry_fails_the_run() {
         let skips = SkipList::parse(&entry("Gone", None, "2026-12-31")).unwrap();
-        let errs = plan(&[key("Foo", "a/b")], |_| true, &skips, today()).unwrap_err();
+        let errs = plan(
+            &[case("Foo", "a/b", &[])],
+            |_| true,
+            &skips,
+            today(),
+            &SCOPES,
+        )
+        .unwrap_err();
         assert!(matches!(
             errs.as_slice(),
             [PlanError::Stale { index: 0, .. }]
@@ -397,6 +587,179 @@ mod tests {
         assert!(glob("*_ptc_*", "a_multiple_ptc_members"));
         assert!(!glob("*_ptc_*", "a_not_ptc"));
         assert!(!glob("BeaconState", "BeaconStateX"));
+    }
+
+    fn case(handler: &str, case: &str, files: &[&str]) -> Case {
+        let key = key(handler, case);
+        Case {
+            files: files
+                .iter()
+                .map(|f| CaseFile {
+                    path: PathBuf::from(format!("/v/{handler}/{case}/{f}")),
+                    name: (*f).into(),
+                })
+                .collect(),
+            key,
+        }
+    }
+
+    #[test]
+    fn file_entry_excuses_files_but_does_not_skip_the_case() {
+        let text =
+            entry("Foo", None, "2026-12-31").replace("reason", "file = \"value.yaml\"\nreason");
+        let skips = SkipList::parse(&text).unwrap();
+        let cases = [case("Foo", "s/c", &["roots.yaml", "value.yaml"])];
+        let got = plan(&cases, |_| true, &skips, today(), &SCOPES).unwrap();
+        assert_eq!(got[0].1, Disposition::Run);
+        assert!(skips.excuses(&cases[0].key, "value.yaml"));
+        assert!(!skips.excuses(&cases[0].key, "roots.yaml"));
+    }
+
+    #[test]
+    fn file_entry_matching_no_file_is_stale() {
+        let text =
+            entry("Foo", None, "2026-12-31").replace("reason", "file = \"gone.yaml\"\nreason");
+        let skips = SkipList::parse(&text).unwrap();
+        let errs = plan(
+            &[case("Foo", "s/c", &["roots.yaml"])],
+            |_| true,
+            &skips,
+            today(),
+            &SCOPES,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            errs.as_slice(),
+            [PlanError::Stale { index: 0, .. }]
+        ));
+    }
+
+    #[test]
+    fn entry_for_an_unscanned_source_or_preset_is_not_stale() {
+        let crypto = entry("compute_kzg_proof", None, "2026-12-31")
+            .replace("\"consensus-specs\"", "\"cryptography-specs\"")
+            .replace("\"gloas\"", "\"none\"")
+            .replace("\"ssz_static\"", "\"kzg\"");
+        let mainnet = entry("Foo", None, "2026-12-31").replace("\"*\"", "\"mainnet\"");
+        for text in [crypto, mainnet] {
+            let skips = SkipList::parse(&text).unwrap();
+            assert!(plan(
+                &[case("Foo", "s/c", &["a"])],
+                |_| true,
+                &skips,
+                today(),
+                &SCOPES
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn scope_limits_the_stale_check_to_what_a_scanned_set_can_hold() {
+        // `general` holds only altair/bls: a phase0 or ssz_static entry is out of its scope.
+        const GENERAL: [Scope; 1] = [Scope {
+            source: "consensus-specs",
+            presets: &["general"],
+            forks: &["altair"],
+            runners: &["bls"],
+        }];
+        let general_case = |handler: &str| Case {
+            key: CaseKey {
+                preset: "general".into(),
+                fork: "altair".into(),
+                runner: "bls".into(),
+                ..key(handler, "bls/c")
+            },
+            files: Vec::new(),
+        };
+        let cases = [general_case("eth_aggregate_pubkeys")];
+        let phase0 = entry("Foo", None, "2026-12-31").replace("\"gloas\"", "\"phase0\"");
+        let ssz_static = entry("Foo", None, "2026-12-31");
+        for text in [phase0, ssz_static] {
+            let skips = SkipList::parse(&text).unwrap();
+            assert!(
+                plan(&cases, |_| true, &skips, today(), &GENERAL).is_ok(),
+                "{text}"
+            );
+        }
+        let bls_gone = entry("Gone", None, "2026-12-31")
+            .replace("\"gloas\"", "\"*\"")
+            .replace("\"ssz_static\"", "\"bls\"");
+        let skips = SkipList::parse(&bls_gone).unwrap();
+        let errs = plan(&cases, |_| true, &skips, today(), &GENERAL).unwrap_err();
+        assert!(matches!(
+            errs.as_slice(),
+            [PlanError::Stale { index: 0, .. }]
+        ));
+    }
+
+    #[test]
+    fn comptests_presets_are_valid_for_comptests_only() {
+        let core = |source: &str| {
+            entry("Foo", None, "2026-12-31")
+                .replace("\"consensus-specs\"", &format!("\"{source}\""))
+                .replace("preset = \"*\"", "preset = \"core\"")
+        };
+        assert!(SkipList::parse(&core("comptests")).is_ok());
+        assert!(matches!(
+            SkipList::parse(&core("consensus-specs")),
+            Err(PlanError::Invalid { index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_entries_outside_every_vector_set() {
+        let kzg = |runner: &str| {
+            entry("compute_cells", None, "2026-12-31")
+                .replace("\"consensus-specs\"", "\"cryptography-specs\"")
+                .replace("\"gloas\"", "\"none\"")
+                .replace("\"ssz_static\"", &format!("\"{runner}\""))
+        };
+        assert!(SkipList::parse(&kzg("kzg")).is_ok());
+        assert!(SkipList::parse(&kzg("k*")).is_ok());
+        match SkipList::parse(&kzg("kgz")) {
+            Err(PlanError::Invalid { index: 0, problem }) => assert!(
+                problem.contains("cryptography-specs/none/*/kgz/compute_cells")
+                    && problem.contains("no vector set"),
+                "{problem}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        // `general` holds only altair/bls, minimal any fork: a phase0 entry fits minimal.
+        let phase0 = entry("Foo", None, "2026-12-31").replace("\"gloas\"", "\"phase0\"");
+        assert!(SkipList::parse(&phase0).is_ok());
+        let general_fork_choice = entry("Foo", None, "2026-12-31")
+            .replace("preset = \"*\"", "preset = \"general\"")
+            .replace("\"ssz_static\"", "\"fork_choice\"");
+        assert!(SkipList::parse(&general_fork_choice).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_source_and_preset() {
+        let source =
+            entry("Foo", None, "2026-12-31").replace("\"consensus-specs\"", "\"consensus-spec\"");
+        let preset = entry("Foo", None, "2026-12-31").replace("\"*\"", "\"minmal\"");
+        let empty_file = entry("Foo", None, "2026-12-31").replace("reason", "file = \" \"\nreason");
+        for text in [source, preset, empty_file] {
+            assert!(
+                matches!(
+                    SkipList::parse(&text),
+                    Err(PlanError::Invalid { index: 0, .. })
+                ),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn committed_skip_files_parse() {
+        for rel in ["testing/skip.toml", "testing/skip.toml.example"] {
+            let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../").to_owned() + rel;
+            let text = std::fs::read_to_string(&path).unwrap();
+            if let Err(e) = SkipList::parse(&text) {
+                panic!("{rel}: {e}");
+            }
+        }
     }
 
     #[test]

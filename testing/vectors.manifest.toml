@@ -25,7 +25,7 @@ commit = "aa16bb4c156184e9548a997d53efaf2a228a6304"
   sha256 = "67762986572372a08d3b182535aa760433c86e174e14e0bbd756f350dd19398c"
 
   [[source.asset]]
-  file     = "comptests.tar.gz"   # 313,252,208 bytes; content not yet reviewed
+  file     = "comptests.tar.gz"   # 313,252,208 bytes; fork_choice_compliance vectors + pyspec sources; no runner, skipped in skip.toml
   sha256   = "ccb3149d29e4179e852499f1a3d121424dbac22745375908cd9059350aece746"
   optional = true
 
@@ -46,7 +46,7 @@ tag    = "v0.1.0"   # published 2026-05-07T05:49:27Z
 commit = "ea1716be4f4a4835799e92d182e03b5c0bc2b6b9"
 
   [[source.asset]]
-  file     = "tests.zip"   # 22,017,832 bytes; BLS/KZG vectors under tests/; no runner yet
+  file     = "tests.zip"   # 22,017,832 bytes; BLS/KZG vectors under tests/; spec-tests bls and kzg runners
   sha256   = "eeb4893eb544f770810d9499007ebb0b9319431ea412bd54736e1c274da3d037"
   optional = true
 
@@ -57,6 +57,6 @@ tag    = "v0.1.2"   # published 2023-03-01T10:13:31Z
 commit = "89ff3a86f1a9b89a555495f7535c853cda589320"
 
   [[source.asset]]
-  file     = "bls_tests_yaml.tar.gz"   # 8,319 bytes; no runner yet
+  file     = "bls_tests_yaml.tar.gz"   # 8,319 bytes; spec-tests bls runner
   sha256   = "a4ef909b6248395094949a3bcdeb4e1b5b999733d4436f2c5006edba99d29279"
   optional = true

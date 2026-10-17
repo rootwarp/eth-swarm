@@ -1,14 +1,22 @@
-//! Runner for the pinned SSZ test vectors (see `testing/vectors.manifest.toml`).
+//! Runner for the pinned test vectors (see `testing/vectors.manifest.toml`).
 //!
-//! Two vector sets are supported:
-//! - [`ssz_generic`]: the ethereum/ssz-specs JSON fixtures.
-//! - [`ssz_static`]: consensus-spec-tests `<preset>/{fulu,gloas}/ssz_static`, checked against the
-//!   production containers in `consensus-types`.
-//!
-//! Every discovered case must be either run or listed in `skip.toml` with a reason;
-//! [`plan`] reports anything else as unaccounted so the run fails.
+//! - [`suite`]: which vector sets are scanned and which runner takes each case.
+//! - [`coverage`]: the walk that turns every file into a case, and the guard that fails the run
+//!   on any file no handler read.
+//! - [`plan`]: the `skip.toml` rules. Every case must be either run or skipped with a reason;
+//!   anything else is reported as unaccounted so the run fails.
+//! - Runners: [`ssz_generic`] (ethereum/ssz-specs JSON fixtures), [`ssz_static`]
+//!   (consensus-spec-tests `<preset>/{fulu,gloas}/ssz_static` against `consensus-types`),
+//!   [`kzg`] (cryptography-specs cell handlers through `crypto-kzg`) and [`bls`] (BLS handlers
+//!   of bls12-381-tests, cryptography-specs and consensus-spec-tests `general` through
+//!   `crypto-bls`).
 
+pub mod bls;
 pub mod check;
+pub mod coverage;
+pub mod fixture;
+pub mod kzg;
 pub mod plan;
 pub mod ssz_generic;
 pub mod ssz_static;
+pub mod suite;

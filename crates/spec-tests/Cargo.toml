@@ -10,6 +10,10 @@ description = "Runner for ssz-specs and consensus-spec-tests vectors."
 [dependencies]
 consensus-types = { path = "../consensus-types" }
 network-config = { path = "../network-config" }
+crypto-kzg = { path = "../crypto-kzg" }
+# `test-vectors` (sign, aggregate_signatures, aggregate_verify) is for this runner only;
+# scripts/check-bls-features.sh keeps every other crate off it.
+crypto-bls = { path = "../crypto-bls", features = ["verify", "aggregate", "test-vectors"] }
 ethereum_ssz.workspace = true
 ethereum_ssz_derive.workspace = true
 ssz_types.workspace = true
@@ -22,9 +26,12 @@ toml = "0.8"
 hex = "0.4"
 snap = "1"
 thiserror = "2"
+# Same spec as ci-checks (one copy in the lockfile); bls/kzg fixtures are UTF-8 YAML.
+yaml-rust2 = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 libtest-mimic = "0.8"
+tempfile = "3"
 
 [[test]]
 name = "vectors"

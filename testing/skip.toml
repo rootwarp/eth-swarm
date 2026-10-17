@@ -1,6 +1,8 @@
 # Skip list for crates/spec-tests (schema: testing/skip.toml.example).
 # The run FAILS on any case that is neither run nor matched here, on an expired entry,
-# and on an entry that matches nothing.
+# and on an entry that matches nothing in a vector set that was scanned.
+# The coverage guard also FAILS the run on any vector file that no handler read, unless its
+# case is skipped here or a `file` entry excuses it.
 
 [[skip]]
 source  = "consensus-specs"
@@ -132,4 +134,437 @@ handler = "LightClientUpdate"
 reason  = "Light-client containers out of M1 scope (beacon node follows the chain; no light-client server yet)"
 owner   = "ian"
 issue   = "M1-ssz-static-coverage"
+expires = "2026-11-30"
+
+# ---------------------------------------------------------------------------------------
+# Out-of-scope forks (Fulu and Gloas only). general/altair/bls is not skipped: the bls runner
+# runs it, so altair is skipped per preset.
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "phase0"
+preset  = "*"
+runner  = "*"
+handler = "*"
+reason  = "Pre-Fulu fork phase0: out of scope (Fulu and Gloas only)"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "bellatrix"
+preset  = "*"
+runner  = "*"
+handler = "*"
+reason  = "Pre-Fulu fork bellatrix: out of scope (Fulu and Gloas only)"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "capella"
+preset  = "*"
+runner  = "*"
+handler = "*"
+reason  = "Pre-Fulu fork capella: out of scope (Fulu and Gloas only)"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "deneb"
+preset  = "*"
+runner  = "*"
+handler = "*"
+reason  = "Pre-Fulu fork deneb: out of scope (Fulu and Gloas only)"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "electra"
+preset  = "*"
+runner  = "*"
+handler = "*"
+reason  = "Pre-Fulu fork electra: out of scope (Fulu and Gloas only)"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "altair"
+preset  = "minimal"
+runner  = "*"
+handler = "*"
+reason  = "Pre-Fulu fork altair: out of scope (Fulu and Gloas only); general/altair/bls runs through the bls runner"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "altair"
+preset  = "mainnet"
+runner  = "*"
+handler = "*"
+reason  = "Pre-Fulu fork altair: out of scope (Fulu and Gloas only); general/altair/bls runs through the bls runner"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "heze"
+preset  = "*"
+runner  = "*"
+handler = "*"
+reason  = "Post-Gloas fork heze: out of scope (Fulu and Gloas only)"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+
+# ---------------------------------------------------------------------------------------
+# Fulu and Gloas format dirs without a runner yet. Pre-Fulu forks are already skipped above.
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "epoch_processing"
+handler = "*"
+reason  = "No state-transition runner yet; it lands with cl-chain's state transition"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "operations"
+handler = "*"
+reason  = "No state-transition runner yet; it lands with cl-chain's state transition"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "sanity"
+handler = "*"
+reason  = "No state-transition runner yet; it lands with cl-chain's state transition"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "finality"
+handler = "*"
+reason  = "No state-transition runner yet; it lands with cl-chain's state transition"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "random"
+handler = "*"
+reason  = "No state-transition runner yet; it lands with cl-chain's state transition"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "rewards"
+handler = "*"
+reason  = "No state-transition runner yet; it lands with cl-chain's state transition"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "fork"
+handler = "*"
+reason  = "No fork-upgrade runner yet (upgrade_to_fulu / upgrade_to_gloas); it lands with cl-chain's state transition"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "transition"
+handler = "*"
+reason  = "No cross-fork transition runner yet; it lands with cl-chain's state transition"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "fork_choice"
+handler = "*"
+reason  = "No fork-choice runner yet; it lands with cl-chain's fork choice"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "minimal"
+runner  = "fast_confirmation"
+handler = "*"
+reason  = "No fast-confirmation runner yet; it lands with cl-chain's fork choice (minimal-only vectors)"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "sync"
+handler = "*"
+reason  = "No optimistic-sync runner yet; it lands with cl-chain's engine integration"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "networking"
+handler = "*"
+reason  = "No networking runner yet (gossip validation, custody groups); it lands with cl-chain gossip validation and cl-p2p"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "light_client"
+handler = "*"
+reason  = "Light-client runners out of M1 scope (no light-client server yet)"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "merkle_proof"
+handler = "*"
+reason  = "No merkle-proof runner yet (blob/column inclusion proofs); it lands with the data-column work"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+
+# ---------------------------------------------------------------------------------------
+# Files of run cases that no handler reads.
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "ssz_static"
+handler = "*"
+file    = "value.yaml"
+reason  = "value.yaml is the YAML rendering of serialized.ssz_snappy; the runner checks the bytes by round trip and hash_tree_root and has no YAML decoder for consensus-types"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+
+# ---------------------------------------------------------------------------------------
+# cryptography-specs v0.1.0 KZG handlers the kzg runner does not run (crates/spec-tests/src/kzg.rs NOT_RUN).
+
+[[skip]]
+source  = "cryptography-specs"
+fork    = "none"
+preset  = "none"
+runner  = "kzg"
+handler = "blob_to_kzg_commitment"
+reason  = "Blob-level (EIP-4844) KZG: cl-verify checks only cell proofs since Fulu, and crypto-kzg exposes only the cell API"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "cryptography-specs"
+fork    = "none"
+preset  = "none"
+runner  = "kzg"
+handler = "compute_blob_kzg_proof"
+reason  = "Blob-level (EIP-4844) KZG: cl-verify checks only cell proofs since Fulu, and crypto-kzg exposes only the cell API"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "cryptography-specs"
+fork    = "none"
+preset  = "none"
+runner  = "kzg"
+handler = "compute_challenge"
+reason  = "Blob-level (EIP-4844) KZG: cl-verify checks only cell proofs since Fulu, and crypto-kzg exposes only the cell API"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "cryptography-specs"
+fork    = "none"
+preset  = "none"
+runner  = "kzg"
+handler = "compute_kzg_proof"
+reason  = "Blob-level (EIP-4844) KZG: cl-verify checks only cell proofs since Fulu, and crypto-kzg exposes only the cell API"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "cryptography-specs"
+fork    = "none"
+preset  = "none"
+runner  = "kzg"
+handler = "verify_blob_kzg_proof"
+reason  = "Blob-level (EIP-4844) KZG: cl-verify checks only cell proofs since Fulu, and crypto-kzg exposes only the cell API"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "cryptography-specs"
+fork    = "none"
+preset  = "none"
+runner  = "kzg"
+handler = "verify_blob_kzg_proof_batch"
+reason  = "Blob-level (EIP-4844) KZG: cl-verify checks only cell proofs since Fulu, and crypto-kzg exposes only the cell API"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "cryptography-specs"
+fork    = "none"
+preset  = "none"
+runner  = "kzg"
+handler = "verify_kzg_proof"
+reason  = "Blob-level (EIP-4844) KZG: cl-verify checks only cell proofs since Fulu, and crypto-kzg exposes only the cell API"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "cryptography-specs"
+fork    = "none"
+preset  = "none"
+runner  = "kzg"
+handler = "recover_cells_and_kzg_proofs"
+reason  = "crypto-kzg does not expose recover_cells_and_kzg_proofs yet; it lands with column reconstruction in cl-chain-columns"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "cryptography-specs"
+fork    = "none"
+preset  = "none"
+runner  = "kzg"
+handler = "compute_verify_cell_kzg_proof_batch_challenge"
+reason  = "Internal Fiat-Shamir challenge of verify_cell_kzg_proof_batch; c-kzg does not expose it, and verify_cell_kzg_proof_batch vectors cover it end to end"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+
+# ---------------------------------------------------------------------------------------
+# bls12-381-tests v0.1.2 handlers the bls runner does not run (crates/spec-tests/src/bls.rs NOT_RUN).
+
+[[skip]]
+source  = "bls12-381-tests"
+fork    = "none"
+preset  = "none"
+runner  = "bls"
+handler = "hash_to_G2"
+reason  = "crypto-bls does not expose hash-to-curve on its own; sign and verify vectors cover it through blst"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+# ---------------------------------------------------------------------------------------
+# consensus-specs comptests.tar.gz (fetched by the nightly with INCLUDE_OPTIONAL=1): the
+# fork_choice_compliance vectors and the pyspec/generator Python sources shipped with them.
+
+[[skip]]
+source  = "comptests"
+fork    = "*"
+preset  = "minimal"
+runner  = "fork_choice_compliance"
+handler = "*"
+reason  = "No fork-choice-compliance runner yet; it lands with cl-chain's state transition and fork choice"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+# The Python sources shipped in the archive, one entry per tree (preset = top-level dir).
+[[skip]]
+source  = "comptests"
+fork    = "*"
+preset  = "core"
+runner  = "*"
+handler = "*"
+reason  = "Generator code shipped in comptests.tar.gz, not vectors: pyspec sources (tests/core)"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "comptests"
+fork    = "*"
+preset  = "formats"
+runner  = "*"
+handler = "*"
+reason  = "Generator code shipped in comptests.tar.gz, not vectors: test-format docs (tests/formats)"
+owner   = "ian"
+issue   = "M1-vector-coverage"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "comptests"
+fork    = "*"
+preset  = "generators"
+runner  = "*"
+handler = "*"
+reason  = "Generator code shipped in comptests.tar.gz, not vectors: vector generator sources (tests/generators)"
+owner   = "ian"
+issue   = "M1-vector-coverage"
 expires = "2026-11-30"
