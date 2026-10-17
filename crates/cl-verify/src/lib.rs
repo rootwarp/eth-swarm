@@ -12,6 +12,7 @@ pub mod feed;
 pub mod frame;
 pub mod handshake;
 pub mod kzg;
+pub mod metrics;
 pub mod notify;
 pub mod server;
 pub mod startup;

@@ -41,6 +41,8 @@ async fn peer_with_another_uid_is_refused_on_every_rpc_and_cannot_feed() {
         count: 1,
         pubkeys: vec![pk_bytes(2)],
         finalized_registry: None,
+        feed_finalized_epoch: 0,
+        chain_finalized_epoch: 0,
     }))
     .await
     .unwrap();

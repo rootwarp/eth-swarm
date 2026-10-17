@@ -4,11 +4,13 @@
 //!   checked against its pinned sha256 on every load.
 //! - [`ForkSchedule`]: which fork ([`ForkName`]) is active at an epoch.
 //! - [`ChainConfig::get_blob_parameters`]: the EIP-7892 blob schedule lookup.
+//! - [`MAX_SEED_LOOKAHEAD`]: the preset activation lookahead.
 //! - [`SPEC_PIN`]: the spec releases every type and vector in the workspace follows.
 
 mod chain_config;
 mod flat_yaml;
 mod fork_schedule;
+mod preset;
 
 pub use chain_config::{
     BlobParameters, ChainConfig, ConfigError, Network, PinnedSource, MAX_BLOB_COMMITMENTS_PER_BLOCK,
@@ -17,6 +19,7 @@ pub use fork_schedule::{
     Epoch, ForkName, ForkSchedule, ScheduleOrderError, ScheduledFork, UnknownFork, Version,
     FAR_FUTURE_EPOCH,
 };
+pub use preset::MAX_SEED_LOOKAHEAD;
 
 /// The spec releases the workspace is pinned to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

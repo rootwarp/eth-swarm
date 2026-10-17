@@ -151,7 +151,7 @@ impl BlsBackend for Gated {
 }
 
 #[tokio::test]
-async fn inline_signers_wait_for_the_restore_reply() {
+async fn inline_signers_wait_for_the_restore_complete_reply() {
     // The snapshot holds 10 keys; cl-chain has sent no range on the new feed stream.
     let dir = tempfile::tempdir().unwrap();
     let snapshot = dir.path().join("pubkeys.bin");
@@ -175,16 +175,22 @@ async fn inline_signers_wait_for_the_restore_reply() {
     b.send(bls_body(bls_request(1, vec![inline_set(20, 1)])))
         .await;
     wait_for(|| gate.entered.load(Ordering::SeqCst) == 1).await;
-    // What the contract forbids: an inline signer sent before the restore reply. Its resolution
+    // What the contract forbids: an inline signer sent before the restore-complete reply. Its resolution
     // is delayed (the stream is not read while request 1 is in BLS) past the restore.
     b.send(bls_body(bls_request(2, vec![inline_set(5, 2)])))
         .await;
 
     let (mut f, first) = feed_open(&mut h).await;
-    assert_eq!(first, 0, "the post-hello status is not the restore reply");
+    assert_eq!(
+        first, 0,
+        "the post-hello status is not the restore-complete reply"
+    );
     f.send(feed_body(announcing(feed_frame(0, []), 10))).await;
     let acked = feed_reply(&mut f).await.high_water;
-    assert_eq!(acked, 10, "the restore reply: the whole snapshot is cached");
+    assert_eq!(
+        acked, 10,
+        "the restore-complete reply: the whole snapshot is cached"
+    );
 
     release.send(()).unwrap();
     assert_eq!(
@@ -217,6 +223,73 @@ async fn inline_signers_wait_for_the_restore_reply() {
         outcomes(&bls_reply(&mut b).await),
         vec![Ok(VerifyStatus::Valid)]
     );
+}
+
+#[tokio::test]
+async fn a_multi_frame_rebuild_stays_live_with_imports_pending() {
+    // Any BLS work would hang in the gate, and a rebuild frame later than 300 ms fails the restore:
+    // the rebuild completing shows nothing held a frame back.
+    let (release, rx) = std_mpsc::channel();
+    let gate = Arc::new(Gated {
+        release: Mutex::new(rx),
+        entered: AtomicUsize::new(0),
+    });
+    let mut h = start_with(Options {
+        bls: gate.clone(),
+        limits: Limits {
+            restore_frame_timeout: Duration::from_millis(300),
+            ..Limits::default()
+        },
+        ..Options::default()
+    })
+    .await;
+    let mut b = bls_open(&mut h).await;
+    let (mut f, _) = feed_open(&mut h).await;
+    f.send(feed_body(announcing(feed_frame(0, 0..2), 6))).await;
+    let mid = feed_reply(&mut f).await.high_water;
+    assert!(
+        mid < 6,
+        "a mid-rebuild reply is not the restore-complete reply"
+    );
+
+    // cl-chain has imports pending for validators 3 and 5. Before the restore-complete reply it
+    // sends no inline signers, so they go index-only and are IGNOREd at once (retry later), and
+    // no in-flight request holds a rebuild frame back.
+    let pending = |id: u64| bls_request(id, vec![valid_set(3, 1), valid_set(5, 2)]);
+    b.send(bls_body(pending(1))).await;
+    assert_eq!(
+        outcomes(&bls_reply(&mut b).await),
+        vec![
+            Ok(VerifyStatus::UnknownIndex),
+            Ok(VerifyStatus::UnknownIndex)
+        ]
+    );
+    f.send(feed_body(feed_frame(mid, mid..4))).await;
+    assert_eq!(feed_reply(&mut f).await.high_water, 4);
+    f.send(feed_body(feed_frame(4, 4..6))).await;
+    let acked = feed_reply(&mut f).await.high_water;
+    assert_eq!(acked, 6, "the restore-complete reply");
+    assert_eq!(
+        gate.entered.load(Ordering::SeqCst),
+        0,
+        "no BLS work held up"
+    );
+
+    // The retried import resolves from the cache; inline signers resume at acked.
+    b.send(bls_body(pending(2))).await;
+    release.send(()).unwrap();
+    assert_eq!(
+        outcomes(&bls_reply(&mut b).await),
+        vec![Ok(VerifyStatus::Valid), Ok(VerifyStatus::Valid)]
+    );
+    let inline_set = signed_set(vec![inline(acked, pk_bytes(acked))], &[acked], 3);
+    b.send(bls_body(bls_request(3, vec![inline_set]))).await;
+    release.send(()).unwrap();
+    assert_eq!(
+        outcomes(&bls_reply(&mut b).await),
+        vec![Ok(VerifyStatus::Valid)]
+    );
+    assert_eq!(h.server.contract_violations(), 0);
 }
 
 #[tokio::test]

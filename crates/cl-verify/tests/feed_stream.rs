@@ -17,6 +17,8 @@ fn frame(start: u64, keys: std::ops::Range<u64>) -> PubkeyFeedRequestBody {
         count: pubkeys.len() as u64,
         pubkeys,
         finalized_registry: None,
+        feed_finalized_epoch: 0,
+        chain_finalized_epoch: 0,
     }
 }
 

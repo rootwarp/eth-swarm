@@ -18,6 +18,11 @@
 //! The pubkey cache starts empty and is restored on the first PubkeyFeed frame, from the snapshot
 //! at [`ServerConfig::pubkey_snapshot`] or by a rebuild over that stream ([`crate::feed`]); errors
 //! during the restore fail the stream. VerifyBls reads the empty cache (`UNKNOWN_INDEX`) until then.
+//!
+//! The frame that completes the restore, and every PubkeyFeed frame applied after it, re-evaluate
+//! the feed-lag gauges from the finalized epochs they carry ([`crate::metrics`]); a frame whose
+//! epochs break the epoch rules is refused before it is applied. The metrics live on the registry
+//! from [`VerifyServer::metrics_registry`].
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -26,27 +31,30 @@ use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use crypto_kzg::SetupError;
+use prometheus_client::registry::Registry as MetricsRegistry;
 use tokio::net::UnixListener;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
+use tokio_stream::Stream;
 use tonic::transport::server::UdsConnectInfo;
 use tonic::{Code, Request, Response, Status, Streaming};
 
 use crate::bls::{self, BlsBackend, BlstBackend};
 use crate::caps::{self, CapError, MAX_MESSAGE_BYTES};
-use crate::feed::{self, Restored, SharedCache, SnapshotWriter};
+use crate::feed::{self, FrameEpochs, Restored, SharedCache, SnapshotWriter};
 use crate::frame::{InFrame, Inbound, OutFrame};
 use crate::handshake::Handshake;
 use crate::kzg::{self, KzgBackend, PinnedKzgBackend, TrustedSetupConfig};
+use crate::metrics::FeedLagMetrics;
 use crate::proto::common::{Error, ErrorCode};
 use crate::proto::verify::verify_service_server::{VerifyService, VerifyServiceServer};
 use crate::proto::verify::{
-    bls_result, PubkeyFeedRequest, PubkeyFeedResponse, VerifyBlsRequest, VerifyBlsRequestBody,
-    VerifyBlsResponse, VerifyBlsResponseBody, VerifyKzgRequest, VerifyKzgRequestBody,
-    VerifyKzgResponse, VerifyKzgResponseBody, VerifyStatus,
+    bls_result, PubkeyFeedRequest, PubkeyFeedResponse, PubkeyFeedResponseBody, VerifyBlsRequest,
+    VerifyBlsRequestBody, VerifyBlsResponse, VerifyBlsResponseBody, VerifyKzgRequest,
+    VerifyKzgRequestBody, VerifyKzgResponse, VerifyKzgResponseBody, VerifyStatus,
 };
 use crate::wire::{by_deadline, to_status, wire_error, Deadline, SystemClock, WallClock};
 
@@ -135,6 +143,9 @@ struct Inner {
     streams: Arc<Semaphore>,
     clock: Arc<dyn WallClock>,
     contract_violations: AtomicU64,
+    /// Holds every metric below; served by the service runtime.
+    metrics: MetricsRegistry,
+    feed_lag: FeedLagMetrics,
 }
 
 impl VerifyServer {
@@ -197,6 +208,8 @@ impl VerifyServer {
             .unwrap_or_else(PoisonError::into_inner)
             .high_water()
             > 0;
+        let mut metrics = MetricsRegistry::default();
+        let feed_lag = FeedLagMetrics::register(&mut metrics);
         Self {
             inner: Arc::new(Inner {
                 handshake: config.handshake,
@@ -215,6 +228,8 @@ impl VerifyServer {
                 kzg,
                 clock,
                 contract_violations: AtomicU64::new(0),
+                metrics,
+                feed_lag,
             }),
         }
     }
@@ -223,6 +238,13 @@ impl VerifyServer {
     #[must_use]
     pub fn contract_violations(&self) -> u64 {
         self.inner.contract_violations.load(Ordering::Relaxed)
+    }
+
+    /// The prometheus-client registry with cl-verify's metrics ([`crate::metrics`]), for the
+    /// service runtime to serve.
+    #[must_use]
+    pub fn metrics_registry(&self) -> &MetricsRegistry {
+        &self.inner.metrics
     }
 
     /// Snapshots written since start (the snapshot-save metric).
@@ -382,17 +404,29 @@ impl Inner {
 
     /// Logs, counts and sends the error that ends the stream.
     async fn fail<T>(&self, tx: &Tx<T>, err: Error) {
+        self.record_failure(&err);
+        let _ = tx.send(Err(to_status(&err))).await;
+    }
+
+    /// [`Self::fail`], giving up on the send after `limit`: for a peer that may have stopped
+    /// reading, whose full response queue would otherwise hold the task forever.
+    async fn fail_within<T>(&self, tx: &Tx<T>, err: Error, limit: Duration) {
+        self.record_failure(&err);
+        let _ = timeout(limit, tx.send(Err(to_status(&err)))).await;
+    }
+
+    fn record_failure(&self, err: &Error) {
         if err.code() == ErrorCode::ContractViolation {
             self.contract_violations.fetch_add(1, Ordering::Relaxed);
         }
         tracing::warn!(code = ?err.code(), detail = %err.detail, "verify stream failed");
-        let _ = tx.send(Err(to_status(&err))).await;
     }
 
     /// Reads and checks the peer's hello within the hello timeout, then sends ours. `false` if
     /// the stream already failed.
-    async fn open<Req, Resp>(&self, inbound: &mut Inbound<Streaming<Req>>, tx: &Tx<Resp>) -> bool
+    async fn open<S, Req, Resp>(&self, inbound: &mut Inbound<S>, tx: &Tx<Resp>) -> bool
     where
+        S: Stream<Item = Result<Req, Status>> + Unpin,
         Req: InFrame,
         Resp: OutFrame,
     {
@@ -417,13 +451,21 @@ impl Inner {
     }
 
     /// Restores the cache from this stream's first frame on a blocking thread (see
-    /// [`feed::restore`]) and returns the stream, or `None` once the stream has failed.
-    async fn restore_cache(
+    /// [`feed::restore`]) and returns the stream with the epochs of the frame that completed the
+    /// restore, or the error that fails it. The caller sends that error once it has released the
+    /// restore lock.
+    async fn restore_cache<S>(
         &self,
-        inbound: Inbound<Streaming<PubkeyFeedRequest>>,
+        inbound: Inbound<S>,
         tx: &Tx<PubkeyFeedResponse>,
-    ) -> Option<Inbound<Streaming<PubkeyFeedRequest>>> {
-        let permit = Arc::clone(&self.permits).acquire_owned().await.ok()?;
+    ) -> Result<(Inbound<S>, FrameEpochs), Error>
+    where
+        S: FeedInbound,
+    {
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| wire_error(ErrorCode::ResourceUnavailable, "verify server closed"))?;
         let mut link = feed::StreamLink::new(
             inbound,
             tx.clone(),
@@ -437,7 +479,7 @@ impl Inner {
             (outcome, link)
         });
         let err = match job.await {
-            Ok((Ok(outcome), link)) => {
+            Ok((Ok((outcome, epochs)), link)) => {
                 match &outcome {
                     Restored::Rebuilt(_) => self.snapshot.mark_dirty(),
                     Restored::Loaded => self.snapshot.note_committed(
@@ -457,7 +499,7 @@ impl Inner {
                         .high_water(),
                     "pubkey cache restored"
                 );
-                return Some(link.into_inbound());
+                return Ok((link.into_inbound(), epochs));
             }
             Ok((Err(err), _)) => err,
             Err(join) => wire_error(
@@ -465,8 +507,23 @@ impl Inner {
                 format!("pubkey cache restore failed: {join}"),
             ),
         };
-        self.fail(tx, err).await;
-        None
+        Err(err)
+    }
+
+    /// Publishes the lag for an applied frame's (or a completed restore's) epochs. They passed
+    /// the check before; an update that a higher chain epoch from another stream has overtaken
+    /// since is dropped, so the gauges never move back.
+    fn publish_feed_lag(&self, epochs: FrameEpochs) {
+        let FrameEpochs {
+            feed_finalized_epoch,
+            chain_finalized_epoch,
+        } = epochs;
+        if let Err(e) = self
+            .feed_lag
+            .update(feed_finalized_epoch, chain_finalized_epoch)
+        {
+            tracing::debug!(error = %e, "feed-lag update overtaken; not published");
+        }
     }
 
     /// A verifier slot for a request with `deadline_unix_ms`, or the status to answer instead.
@@ -669,6 +726,128 @@ where
     ReceiverStream::new(rx)
 }
 
+/// A PubkeyFeed request stream (tonic's `Streaming` in production).
+trait FeedInbound: Stream<Item = Result<PubkeyFeedRequest, Status>> + Unpin + Send + 'static {}
+
+impl<S> FeedInbound for S where
+    S: Stream<Item = Result<PubkeyFeedRequest, Status>> + Unpin + Send + 'static
+{
+}
+
+/// One PubkeyFeed stream: hello, the restore (or the first-frame check on a restored server),
+/// then one reply per frame.
+async fn run_feed<S: FeedInbound>(
+    inner: Arc<Inner>,
+    mut inbound: Inbound<S>,
+    tx: Tx<PubkeyFeedResponse>,
+) {
+    if !inner.open(&mut inbound, &tx).await {
+        return;
+    }
+    // One restore at a time; a stream that finds it done goes straight on.
+    let mut restored = inner.restored.lock().await;
+    // The high-water mark goes first so the sender knows where to start.
+    let first = PubkeyFeedResponse::body(feed::status(&inner.cache));
+    if tx.send(Ok(first)).await.is_err() {
+        return;
+    }
+    let mut check_first = *restored;
+    if *restored {
+        drop(restored);
+    } else {
+        let epochs;
+        (inbound, epochs) = match inner.restore_cache(inbound, &tx).await {
+            Ok(back) => back,
+            Err(err) => {
+                // Release the restore first: the peer may have stopped reading, and the next
+                // stream must not wait behind this one's last send.
+                drop(restored);
+                let limit = inner.limits.restore_frame_timeout;
+                return inner.fail_within(&tx, err, limit).await;
+            }
+        };
+        *restored = true;
+        drop(restored);
+        // The restored cache holds the announced registry: evaluate the lag once now, since a
+        // stalled finality may send no further frame for a long time.
+        inner.publish_feed_lag(epochs);
+        let reply = PubkeyFeedResponse::body(feed::status(&inner.cache));
+        if tx.send(Ok(reply)).await.is_err() {
+            return;
+        }
+    }
+    loop {
+        let body = match inbound.body().await {
+            Ok(Some(body)) => body,
+            Ok(None) if check_first => {
+                let err = wire_error(
+                    ErrorCode::ContractViolation,
+                    "pubkey feed closed before its first frame",
+                );
+                return inner.fail(&tx, err).await;
+            }
+            Ok(None) => return,
+            Err(e) => return inner.fail(&tx, e).await,
+        };
+        if std::mem::take(&mut check_first) {
+            if let Err(e) = feed::check_first_frame(&inner.cache, &body) {
+                return inner.fail(&tx, e).await;
+            }
+        }
+        let cache = Arc::clone(&inner.cache);
+        let appends = !body.pubkeys.is_empty();
+        let epochs = FrameEpochs::of(&body);
+        let reply = match inner
+            .feed_lag
+            .check(epochs.feed_finalized_epoch, epochs.chain_finalized_epoch)
+        {
+            // Refused before it is applied: the gauges keep their values.
+            Err(e) => PubkeyFeedResponseBody {
+                high_water: feed::status(&cache).high_water,
+                err: Some(wire_error(ErrorCode::ContractViolation, e.to_string())),
+            },
+            Ok(()) => {
+                // Feed frames wait for a verifier slot like any other blocking job.
+                let Ok(permit) = Arc::clone(&inner.permits).acquire_owned().await else {
+                    return;
+                };
+                let job = spawn_blocking(move || {
+                    let _permit = permit;
+                    feed::apply(&cache, &body)
+                });
+                match job.await {
+                    Ok(reply) => reply,
+                    Err(join) => {
+                        let err = wire_error(
+                            ErrorCode::ResourceUnavailable,
+                            format!("pubkey feed failed: {join}"),
+                        );
+                        return inner.fail(&tx, err).await;
+                    }
+                }
+            }
+        };
+        if reply.err.is_none() {
+            // Applied: its epochs describe the cache as it now is.
+            inner.publish_feed_lag(epochs);
+        }
+        if appends && reply.err.is_none() {
+            // high_water advanced: the snapshot is behind the cache.
+            inner.snapshot.mark_dirty();
+            inner.snapshot.start(&inner.cache);
+        }
+        if let Some(err) = &reply.err {
+            if err.code() == ErrorCode::ContractViolation {
+                inner.contract_violations.fetch_add(1, Ordering::Relaxed);
+            }
+            tracing::warn!(code = ?err.code(), detail = %err.detail, "pubkey feed frame refused");
+        }
+        if tx.send(Ok(PubkeyFeedResponse::body(reply))).await.is_err() {
+            return;
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl VerifyService for VerifyServer {
     type VerifyBlsStream = ReceiverStream<Result<VerifyBlsResponse, Status>>;
@@ -710,88 +889,10 @@ impl VerifyService for VerifyServer {
         let slot = self.inner.admit_stream(&request)?;
         let inner = Arc::clone(&self.inner);
         let (tx, rx) = mpsc::channel(RESPONSE_BUFFER);
-        let inbound = request.into_inner();
+        let inbound = Inbound::new(request.into_inner());
         tokio::spawn(async move {
             let _stream_slot = slot;
-            let mut inbound = Inbound::new(inbound);
-            if !inner.open(&mut inbound, &tx).await {
-                return;
-            }
-            // One restore at a time; a stream that finds it done goes straight on.
-            let mut restored = inner.restored.lock().await;
-            // The high-water mark goes first so the sender knows where to start.
-            let first = PubkeyFeedResponse::body(feed::status(&inner.cache));
-            if tx.send(Ok(first)).await.is_err() {
-                return;
-            }
-            let mut check_first = *restored;
-            if *restored {
-                drop(restored);
-            } else {
-                let Some(back) = inner.restore_cache(inbound, &tx).await else {
-                    return;
-                };
-                inbound = back;
-                *restored = true;
-                drop(restored);
-                let reply = PubkeyFeedResponse::body(feed::status(&inner.cache));
-                if tx.send(Ok(reply)).await.is_err() {
-                    return;
-                }
-            }
-            loop {
-                let body = match inbound.body().await {
-                    Ok(Some(body)) => body,
-                    Ok(None) if check_first => {
-                        let err = wire_error(
-                            ErrorCode::ContractViolation,
-                            "pubkey feed closed before its first frame",
-                        );
-                        return inner.fail(&tx, err).await;
-                    }
-                    Ok(None) => return,
-                    Err(e) => return inner.fail(&tx, e).await,
-                };
-                if std::mem::take(&mut check_first) {
-                    if let Err(e) = feed::check_first_frame(&inner.cache, &body) {
-                        return inner.fail(&tx, e).await;
-                    }
-                }
-                // Feed frames wait for a verifier slot like any other blocking job.
-                let Ok(permit) = Arc::clone(&inner.permits).acquire_owned().await else {
-                    return;
-                };
-                let cache = Arc::clone(&inner.cache);
-                let appends = !body.pubkeys.is_empty();
-                let job = spawn_blocking(move || {
-                    let _permit = permit;
-                    feed::apply(&cache, &body)
-                });
-                let reply = match job.await {
-                    Ok(reply) => reply,
-                    Err(join) => {
-                        let err = wire_error(
-                            ErrorCode::ResourceUnavailable,
-                            format!("pubkey feed failed: {join}"),
-                        );
-                        return inner.fail(&tx, err).await;
-                    }
-                };
-                if appends && reply.err.is_none() {
-                    // high_water advanced: the snapshot is behind the cache.
-                    inner.snapshot.mark_dirty();
-                    inner.snapshot.start(&inner.cache);
-                }
-                if let Some(err) = &reply.err {
-                    if err.code() == ErrorCode::ContractViolation {
-                        inner.contract_violations.fetch_add(1, Ordering::Relaxed);
-                    }
-                    tracing::warn!(code = ?err.code(), detail = %err.detail, "pubkey feed frame refused");
-                }
-                if tx.send(Ok(PubkeyFeedResponse::body(reply))).await.is_err() {
-                    return;
-                }
-            }
+            run_feed(inner, inbound, tx).await;
         });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
@@ -818,5 +919,154 @@ mod tests {
     #[test]
     fn request_without_uds_info_has_no_peer_uid() {
         assert_eq!(peer_uid(&Request::new(())), None);
+    }
+}
+
+#[cfg(test)]
+mod feed_tests {
+    //! PubkeyFeed streams driven directly, so a test controls each response queue.
+
+    use super::*;
+    use crate::kzg::{KzgFailure, PreparedCells};
+    use crate::proto::common::Hello;
+    use crate::proto::verify::{
+        pubkey_feed_request, pubkey_feed_response, FinalizedRegistry, PubkeyFeedRequestBody,
+    };
+    use blst::min_pk::SecretKey;
+    use cl_verify_cache::persist::Registry;
+
+    struct NoKzg;
+
+    impl KzgBackend for NoKzg {
+        fn verify(&self, _: &PreparedCells) -> Result<bool, KzgFailure> {
+            Ok(true)
+        }
+    }
+
+    fn hello() -> Hello {
+        Hello {
+            api_version: 1,
+            min_api_version: 1,
+            max_api_version: 1,
+            ..Hello::default()
+        }
+    }
+
+    fn server(dir: &tempfile::TempDir, restore_frame_timeout: Duration) -> Arc<Inner> {
+        let config = ServerConfig {
+            handshake: Handshake::new(hello(), 1),
+            peer_uid: 0,
+            trusted_setup: TrustedSetupConfig {
+                path: PathBuf::from("/unused"),
+            },
+            limits: Limits {
+                restore_frame_timeout,
+                ..Limits::default()
+            },
+            pubkey_snapshot: dir.path().join("pubkeys.bin"),
+            snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
+        };
+        let cache = SharedCache::default();
+        VerifyServer::with_backends(config, cache, Arc::new(BlstBackend), Arc::new(NoKzg)).inner
+    }
+
+    fn key(i: u64) -> Vec<u8> {
+        let mut ikm = [5u8; 32];
+        ikm[..8].copy_from_slice(&i.to_le_bytes());
+        SecretKey::key_gen(&ikm, &[])
+            .unwrap()
+            .sk_to_pk()
+            .compress()
+            .to_vec()
+    }
+
+    /// The first frame of a rebuild of `0..n`, carrying index 0 only.
+    fn announcing(n: u64) -> PubkeyFeedRequest {
+        let keys: Vec<_> = (0..n)
+            .map(|i| blst::min_pk::PublicKey::key_validate(&key(i)).unwrap())
+            .collect();
+        let registry = Registry::of(&feed::BlstCodec, &keys);
+        PubkeyFeedRequest {
+            frame: Some(pubkey_feed_request::Frame::Body(PubkeyFeedRequestBody {
+                start_index: 0,
+                count: 1,
+                pubkeys: vec![key(0)],
+                finalized_registry: Some(FinalizedRegistry {
+                    len: registry.len,
+                    sha256: registry.sha256.to_vec(),
+                }),
+                feed_finalized_epoch: 0,
+                chain_finalized_epoch: 0,
+            })),
+        }
+    }
+
+    fn hello_frame() -> PubkeyFeedRequest {
+        PubkeyFeedRequest {
+            frame: Some(pubkey_feed_request::Frame::Hello(hello())),
+        }
+    }
+
+    /// A request stream that delivers `frames`, then stays open.
+    fn inbound(
+        frames: Vec<PubkeyFeedRequest>,
+    ) -> Inbound<impl Stream<Item = Result<PubkeyFeedRequest, Status>> + Unpin + Send + 'static>
+    {
+        let frames = tokio_stream::iter(frames.into_iter().map(Ok));
+        Inbound::new(tokio_stream::StreamExt::chain(
+            frames,
+            tokio_stream::pending(),
+        ))
+    }
+
+    fn high_water(frame: Option<Result<PubkeyFeedResponse, Status>>) -> u64 {
+        match frame {
+            Some(Ok(PubkeyFeedResponse {
+                frame: Some(pubkey_feed_response::Frame::Body(b)),
+            })) => b.high_water,
+            other => panic!("expected a feed reply, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_that_stops_reading_during_a_restore_does_not_block_the_next_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = server(&dir, Duration::from_millis(200));
+        // Stream A never reads: its queue holds the hello and the status, so the rebuild's first
+        // reply times out and the restore fails while the queue is still full.
+        let (a_tx, _a_rx) = mpsc::channel(2);
+        let full = a_tx.clone();
+        let a = tokio::spawn(run_feed(
+            Arc::clone(&inner),
+            inbound(vec![hello_frame(), announcing(2)]),
+            a_tx,
+        ));
+        for _ in 0..500 {
+            if full.capacity() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(full.capacity(), 0, "stream A holds the restore");
+
+        // Stream B restores a one-entry registry once A has given up.
+        let (b_tx, mut b_rx) = mpsc::channel(RESPONSE_BUFFER);
+        tokio::spawn(run_feed(
+            Arc::clone(&inner),
+            inbound(vec![hello_frame(), announcing(1)]),
+            b_tx,
+        ));
+        let restored = tokio::time::timeout(Duration::from_secs(5), async {
+            let _hello = b_rx.recv().await;
+            (high_water(b_rx.recv().await), high_water(b_rx.recv().await))
+        })
+        .await
+        .expect("stream B restored within 5 s");
+        assert_eq!(restored, (0, 1));
+        tokio::time::timeout(Duration::from_secs(5), a)
+            .await
+            .expect("stream A ended")
+            .unwrap();
+        assert_eq!(inner.contract_violations.load(Ordering::Relaxed), 1);
     }
 }

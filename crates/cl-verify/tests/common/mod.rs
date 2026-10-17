@@ -443,6 +443,8 @@ pub fn feed_frame(start: u64, keys: impl IntoIterator<Item = u64>) -> PubkeyFeed
         count: pubkeys.len() as u64,
         pubkeys,
         finalized_registry: None,
+        feed_finalized_epoch: 0,
+        chain_finalized_epoch: 0,
     }
 }
 

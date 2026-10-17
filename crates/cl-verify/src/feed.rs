@@ -19,7 +19,9 @@
 //! the next stream restores again. A restored server only checks the announcement
 //! ([`check_first_frame`]).
 
+use std::any::Any;
 use std::io;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
@@ -39,6 +41,7 @@ use tonic::Status;
 
 use crate::bls::decode_pubkey;
 use crate::frame::{Inbound, OutFrame};
+use crate::metrics::check_epochs;
 use crate::proto::common::{Error, ErrorCode};
 use crate::proto::verify::{
     PubkeyFeedRequest, PubkeyFeedRequestBody, PubkeyFeedResponse, PubkeyFeedResponseBody,
@@ -201,26 +204,50 @@ pub enum Restored {
     Rebuilt(RebuildReason),
 }
 
+/// The finalized epochs a feed frame carries (see [`crate::metrics`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameEpochs {
+    pub feed_finalized_epoch: u64,
+    pub chain_finalized_epoch: u64,
+}
+
+impl FrameEpochs {
+    #[must_use]
+    pub fn of(body: &PubkeyFeedRequestBody) -> Self {
+        Self {
+            feed_finalized_epoch: body.feed_finalized_epoch,
+            chain_finalized_epoch: body.chain_finalized_epoch,
+        }
+    }
+}
+
 /// Restores `cache` (empty, not yet served) from the stream's first frame: loads `snapshot` if it
 /// holds exactly the announced registry, or else rebuilds from index 0 over `link`. The cache is
 /// replaced only on success. Errors are contract violations (or the link's own error); nothing is
 /// kept. The caller sends the reply to the last frame and saves a rebuilt cache (the server marks
 /// its [`SnapshotWriter`] dirty).
+///
+/// Every restore frame's epochs must pass [`check_epochs`] against the previous frame's chain
+/// epoch. On success, returns the epochs of the frame whose reply completes the restore: the
+/// announcing frame for a loaded snapshot, the last rebuild frame otherwise.
 pub fn restore<L: FeedLink>(
     cache: &RwLock<PubkeyCache<PublicKey>>,
     snapshot: &Path,
     link: &mut L,
-) -> Result<Restored, Error> {
+) -> Result<(Restored, FrameEpochs), Error> {
     let mut feed = FrameFeed {
         link,
         pending: None,
+        last: None,
     };
     let restored = startup_with(&BlstCodec, snapshot, &mut feed).map_err(|e| match e {
         StartupError::Feed(e) => e,
         other => violation(&other.map_feed(|e| e.detail).to_string()),
     })?;
+    let epochs = feed.last.unwrap_or_default();
     *cache.write().map_err(|_| poisoned())? = restored.cache;
-    Ok(restored.rebuilt.map_or(Restored::Loaded, Restored::Rebuilt))
+    let restored = restored.rebuilt.map_or(Restored::Loaded, Restored::Rebuilt);
+    Ok((restored, epochs))
 }
 
 /// Floor on the wait before retrying a failed save, so a zero interval cannot spin on a broken
@@ -246,7 +273,7 @@ pub type Saver = Arc<dyn Fn(&PubkeyCache<PublicKey>, &Path) -> io::Result<()> + 
 /// [`save_if_dirty`](Self::save_if_dirty)) does not cut that short, so saves never overlap and a
 /// failure is always recorded. Saves are monotonic: a copy shorter than the last committed
 /// snapshot is never written. A failed save is logged, leaves the snapshot dirty and is retried
-/// after `max(interval, 1 s)`; it is never fatal.
+/// after `max(interval, 1 s)`; it is never fatal. A saver that panics counts as a failed save.
 pub struct SnapshotWriter {
     interval: Duration,
     wake: Arc<Notify>,
@@ -280,7 +307,11 @@ impl SaveState {
             tracing::warn!(len, last = ?*committed, "pubkey snapshot not rolled back");
             return Ok(false);
         }
-        match (self.saver)(&copy, &self.path) {
+        // A panicking saver is a failed save, recorded here: a cancelled caller never sees the
+        // blocking job's outcome.
+        let saved = panic::catch_unwind(AssertUnwindSafe(|| (self.saver)(&copy, &self.path)))
+            .unwrap_or_else(|payload| Err(io::Error::other(panic_message(&*payload))));
+        match saved {
             Ok(()) => {
                 *committed = Some(len);
                 self.saves.fetch_add(1, Ordering::Relaxed);
@@ -298,6 +329,16 @@ impl SaveState {
         self.failures.fetch_add(1, Ordering::Relaxed);
         tracing::error!(error = %e, path = %self.path.display(), "pubkey snapshot not saved; will retry");
     }
+}
+
+/// The message of a caught panic, for the failed-save log.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|m| (*m).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned());
+    format!("pubkey snapshot saver panicked: {message}")
 }
 
 impl SnapshotWriter {
@@ -372,7 +413,8 @@ impl SnapshotWriter {
         match job.await {
             Ok(saved) => saved,
             Err(join) => {
-                // The saver panicked: record it like any failed save.
+                // The save job panicked outside the saver (which `save` catches): record it like
+                // any failed save.
                 let e = io::Error::other(join.to_string());
                 self.state.failed(&e);
                 Err(e)
@@ -423,6 +465,23 @@ impl Drop for SnapshotWriter {
 struct FrameFeed<'a, L> {
     link: &'a mut L,
     pending: Option<PubkeyFeedRequestBody>,
+    /// The epochs of the last frame received.
+    last: Option<FrameEpochs>,
+}
+
+impl<L> FrameFeed<'_, L> {
+    /// Checks `frame`'s epochs against the previous frame's and records them.
+    fn note_epochs(&mut self, frame: &PubkeyFeedRequestBody) -> Result<(), Error> {
+        let epochs = FrameEpochs::of(frame);
+        check_epochs(
+            epochs.feed_finalized_epoch,
+            epochs.chain_finalized_epoch,
+            self.last.map(|e| e.chain_finalized_epoch),
+        )
+        .map_err(|e| violation(&format!("restore frame: {e}")))?;
+        self.last = Some(epochs);
+        Ok(())
+    }
 }
 
 impl<L: FeedLink> RegistryFeed for FrameFeed<'_, L> {
@@ -434,6 +493,7 @@ impl<L: FeedLink> RegistryFeed for FrameFeed<'_, L> {
             return Ok(None);
         };
         let registry = announced(&first)?;
+        self.note_epochs(&first)?;
         if first.start_index != 0 {
             return Err(violation(&format!(
                 "first feed frame starts at {}, high_water is 0",
@@ -453,9 +513,11 @@ impl<L: FeedLink> RegistryFeed for FrameFeed<'_, L> {
                     high_water: start,
                     err: None,
                 })?;
-                self.link.recv()?.ok_or_else(|| {
+                let next = self.link.recv()?.ok_or_else(|| {
                     violation(&format!("feed closed during the rebuild, at index {start}"))
-                })?
+                })?;
+                self.note_epochs(&next)?;
+                next
             }
         };
         if frame.start_index != start {
@@ -577,6 +639,8 @@ mod tests {
             count: pubkeys.len() as u64,
             pubkeys,
             finalized_registry: None,
+            feed_finalized_epoch: 0,
+            chain_finalized_epoch: 0,
         }
     }
 
@@ -778,7 +842,10 @@ mod tests {
             frames: [announcing(body(0, 0..2), 5)].into(),
             ..Script::default()
         };
-        assert_eq!(restore(&cache, &path, &mut link), Ok(Restored::Loaded));
+        assert_eq!(
+            restore(&cache, &path, &mut link),
+            Ok((Restored::Loaded, FrameEpochs::default()))
+        );
         assert_eq!(cached_keys(&cache), (0..5).map(key).collect::<Vec<_>>());
         assert!(
             link.replies.is_empty(),
@@ -794,7 +861,7 @@ mod tests {
             frames: rebuild_frames(7, 3),
             ..Script::default()
         };
-        let outcome = restore(&cache, &path, &mut link).unwrap();
+        let (outcome, _) = restore(&cache, &path, &mut link).unwrap();
         assert!(matches!(
             outcome,
             Restored::Rebuilt(RebuildReason::LengthMismatch { file: 5, chain: 7 })
@@ -806,6 +873,53 @@ mod tests {
             matches!(load_with(&BlstCodec, &path, &r), Startup::Use(_)),
             "restore leaves saving to the caller"
         );
+    }
+
+    fn at(mut b: PubkeyFeedRequestBody, feed: u64, chain: u64) -> PubkeyFeedRequestBody {
+        b.feed_finalized_epoch = feed;
+        b.chain_finalized_epoch = chain;
+        b
+    }
+
+    #[test]
+    fn a_restore_reports_the_epochs_of_the_frame_that_completes_it() {
+        let epochs = |feed, chain| FrameEpochs {
+            feed_finalized_epoch: feed,
+            chain_finalized_epoch: chain,
+        };
+        // Loaded: the announcing frame completes it.
+        let (_dir, path) = snapshot_of(5);
+        let mut link = Script {
+            frames: [at(announcing(body(0, []), 5), 95, 100)].into(),
+            ..Script::default()
+        };
+        let (_, reported) = restore(&SharedCache::default(), &path, &mut link).unwrap();
+        assert_eq!(reported, epochs(95, 100));
+        // Rebuilt: the last rebuild frame does, at the chain's finality by then.
+        let mut frames = rebuild_frames(7, 3);
+        for (frame, chain) in frames.iter_mut().zip([99, 100, 101]) {
+            *frame = at(frame.clone(), 95, chain);
+        }
+        let mut link = Script {
+            frames,
+            ..Script::default()
+        };
+        let (_, reported) = restore(&SharedCache::default(), &path, &mut link).unwrap();
+        assert_eq!(reported, epochs(95, 101));
+    }
+
+    #[test]
+    fn restore_frames_with_impossible_epochs_are_contract_violations() {
+        // The feed ahead of the chain, on the first frame and on a later one.
+        violation_of([at(announcing(body(0, 0..2), 2), 101, 100)].into());
+        let mut ahead = rebuild_frames(4, 2);
+        ahead[1] = at(ahead[1].clone(), 101, 100);
+        violation_of(ahead);
+        // Finality moving back between restore frames.
+        let mut back = rebuild_frames(4, 2);
+        back[0] = at(back[0].clone(), 95, 100);
+        back[1] = at(back[1].clone(), 95, 99);
+        violation_of(back);
     }
 
     fn violation_of(frames: VecDeque<PubkeyFeedRequestBody>) -> String {
@@ -929,13 +1043,34 @@ mod tests {
         err.code()
     }
 
+    /// The status a tonic server stream yields for a request message whose bytes are `payload`:
+    /// one gRPC frame (uncompressed flag, big-endian length, payload) through `ProstCodec`.
+    fn decode_failure(payload: &[u8]) -> Status {
+        use prost::Message;
+        use tonic::codec::Codec;
+        use tonic_prost::ProstCodec;
+        assert!(
+            PubkeyFeedRequest::decode(payload).is_err(),
+            "payload must not decode"
+        );
+        let len = u32::try_from(payload.len()).unwrap().to_be_bytes();
+        let frame = [&[0u8][..], &len, payload].concat();
+        let body = String::from_utf8(frame).expect("an ASCII test frame");
+        let mut codec = ProstCodec::<PubkeyFeedResponse, PubkeyFeedRequest>::default();
+        let mut stream = tonic::Streaming::new_request(codec.decoder(), body, None, None);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(stream.message())
+            .expect_err("tonic refuses the frame")
+    }
+
     #[test]
     #[allow(clippy::result_large_err)] // tonic stream items
     fn restore_frame_errors_are_contract_violations_and_transport_errors_are_not() {
         let t = Duration::from_secs(5);
         let first = || req(announcing(body(0, 0..2), 4));
-        // A frame that does not decode (tonic's prost decode failure) is malformed input.
-        let undecodable = Status::internal("failed to decode Protobuf message: invalid wire type");
+        // A frame that does not decode is malformed input. The status comes from tonic's own
+        // decode path, so a rewording in tonic or prost fails here.
+        let undecodable = decode_failure(&[0x0f]);
         assert_eq!(
             restore_code_over(vec![first(), Err(undecodable)], false, t),
             ErrorCode::ContractViolation
@@ -1068,6 +1203,49 @@ mod tests {
             "still dirty: retried"
         );
         assert_eq!(writer.failures(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saver_panic_in_a_cancelled_save_is_recorded_and_retried() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let first = AtomicBool::new(true);
+        let saver: Saver = Arc::new(move |c: &PubkeyCache<PublicKey>, p: &Path| {
+            if first.swap(false, Ordering::SeqCst) {
+                release_rx.lock().unwrap().recv().unwrap();
+                panic!("saver bug");
+            }
+            save_with(&BlstCodec, c, p)
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pubkeys.bin");
+        let writer = SnapshotWriter::with_saver(path.clone(), Duration::ZERO, saver);
+        let cache = cache_with(2);
+        writer.mark_dirty();
+        let flush = tokio::time::timeout(Duration::from_millis(50), writer.save_if_dirty(&cache));
+        assert!(flush.await.is_err(), "flush cancelled");
+        release_tx.send(()).unwrap();
+        // Nobody awaits the panicked save, yet its failure is counted.
+        for _ in 0..200 {
+            if writer.failures() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(writer.failures(), 1);
+        assert!(
+            writer.save_if_dirty(&cache).await.unwrap(),
+            "still dirty: the retry saves"
+        );
+        assert_eq!((writer.saves(), file_len(&path)), (1, Some(2)));
+    }
+
+    #[test]
+    fn a_caught_panic_names_its_message() {
+        let message = |payload: Box<dyn Any + Send>| panic_message(&*payload);
+        assert!(message(Box::new("plain")).ends_with(": plain"));
+        assert!(message(Box::new(String::from("formatted"))).ends_with(": formatted"));
+        assert!(message(Box::new(7u8)).ends_with(": non-string panic payload"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

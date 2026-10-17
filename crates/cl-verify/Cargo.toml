@@ -22,6 +22,7 @@ rand = "0.8"
 hex = "0.4"
 thiserror = "2"
 tracing = "0.1"
+prometheus-client = "0.25.1"
 
 [features]
 # Test-only: exposes `VerifyServer::with_backends*` and `kzg::KzgBackend`, which build a server
@@ -34,5 +35,6 @@ ipc = { path = "../ipc", features = ["testkit"] }
 tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 sha2 = "0.10"
+tonic-prost.workspace = true
 tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }

@@ -34,12 +34,16 @@ import "ethswarm/common/v1/error.proto";
 // is the last PubkeyFeedResponseBody.high_water and sent the end of the feed range cl-chain has sent.
 // Indices below that bound go without an inline pubkey; if their append has not landed yet they get a
 // transient VERIFY_STATUS_UNKNOWN_INDEX -> IGNORE and retry.
-// Restart: after either side (re)starts, cl-chain sends NO inline signers until it has received the
-// response to its first PubkeyFeedRequestBody on the new feed stream (the restore reply; see Restore at
-// PubkeyFeedRequestBody). The PubkeyFeedResponseBody sent right after hello does not count: before a
-// restore it reports 0, and a matching snapshot then installs the whole registry 0..len at once, ranges
-// cl-chain never sent included, so the hold-back below cannot protect them. From the restore reply on,
-// acked is that reply's high_water (then each later reply's), and the inline bound above applies.
+// Restart: after either side (re)starts, cl-chain sends NO inline signers until a PubkeyFeedResponseBody
+// on the new feed stream reports high_water >= the finalized_registry.len cl-chain announced on that
+// stream's first frame (the restore-complete reply; see Restore at PubkeyFeedRequestBody). Earlier replies
+// do not count. The one sent right after hello reports 0 before a restore, and a matching snapshot then
+// installs the whole registry 0..len at once, ranges cl-chain never sent included, so the hold-back below
+// cannot protect them. The replies during a multi-frame rebuild come before the restore is complete: an
+// inline signer sent after one would make the hold-back delay the next rebuild frame until that request's
+// response, and VerifyBls deadlines can exceed the restore frame timeout, so the rebuild would fail. From
+// the restore-complete reply on, acked is that reply's high_water (then each later reply's), and the
+// inline bound above applies.
 // Feed hold-back: PubkeyFeed and VerifyBls are separate streams with no ordering between them, so a feed
 // range sent after a request could overtake it. A range [start_index, start_index + count) covers an
 // index i when start_index <= i < start_index + count. cl-chain therefore MUST NOT send a PubkeyFeed range
@@ -264,7 +268,9 @@ message VerifyKzgResponse {
 //   and each reply's high_water is the next start_index wanted. The rebuilt cache is served, and saved, only
 //   once it holds len entries whose SHA-256 equals finalized_registry.sha256; a mismatch is
 //   ERROR_CODE_CONTRACT_VIOLATION. While rebuilding, high_water counts entries received for the rebuild,
-//   which are not served yet.
+//   which are not served yet, and stays below len; the reply that reports high_water = len is the
+//   restore-complete reply. cl-chain sends no inline signers before it (see Restart above), so nothing
+//   holds a rebuild frame back.
 // Until the restore completes, VerifyBls sees an empty cache: every index is VERIFY_STATUS_UNKNOWN_INDEX
 // (IGNORE), never a partial cache. A stream that ends before its first body frame, or any error during the
 // restore, is ERROR_CODE_CONTRACT_VIOLATION; nothing is kept and the next stream restores again. During
@@ -273,7 +279,30 @@ message VerifyKzgResponse {
 // a stalled restore cannot hold back later PubkeyFeed streams. A frame that does not decode is
 // ERROR_CODE_CONTRACT_VIOLATION as well; only a broken transport is ERROR_CODE_RESOURCE_UNAVAILABLE. A
 // cl-verify that has already restored only checks that finalized_registry is present and that len is at
-// least its high-water mark, then applies the frame as usual.
+// least its high-water mark, then applies the frame as usual. Its restore-complete reply is the first
+// reply whose high_water is at least the announced len.
+//
+// Lag: every body frame carries feed_finalized_epoch and chain_finalized_epoch. Once the restore is
+// complete, cl-chain sends a frame on every finality update, even with no new entries: count = 0 at
+// cl-verify's current high-water mark is a valid no-op frame. cl-verify evaluates the lag once when the
+// restore completes, with the epochs of the frame whose reply completes it, and then on every frame it
+// applies: verify_pubkey_feed_lag_epochs = chain_finalized_epoch - feed_finalized_epoch, and
+// verify_pubkey_feed_lag_alert = 1 while that exceeds MAX_SEED_LOOKAHEAD (4 in both presets). Other
+// restore frames, and frames refused with err, are not evaluated.
+// Epoch rules: finality only moves forward, so chain_finalized_epoch is never lower than on any frame
+// cl-verify has accepted before, and feed_finalized_epoch is never higher than chain_finalized_epoch. A
+// frame that breaks either rule is ERROR_CODE_CONTRACT_VIOLATION: after the restore it is refused before it
+// is applied (high_water and the lag gauges unchanged); during the restore it fails the restore. A frame
+// that omits both fields decodes as (0, 0), so it is refused once any non-zero chain epoch was accepted.
+// A feed_finalized_epoch of 0 with a non-zero chain_finalized_epoch is allowed: it only raises the lag.
+// An evaluation that a frame with a higher chain_finalized_epoch, on another stream, has overtaken is
+// dropped, so the gauges never move back.
+// While finality advances normally, a deposit activates 1 + MAX_SEED_LOOKAHEAD epochs after the finality
+// that covers it (phase0 compute_activation_exit_epoch), so a lag of 4 cannot hide a usable signer. While
+// finality stalls it can: activation epochs follow the current epoch, not the finalized one, so a signer
+// activated since the feed's checkpoint can be missing at a lag of 4 or less. That costs gossip coverage
+// (VERIFY_STATUS_UNKNOWN_INDEX -> IGNORE), never safety. The lag is reported, never acted on: a lagging
+// cache only misses entries (see the cache-safety invariant above).
 message PubkeyFeedRequestBody {
   uint64 start_index = 1;
   // Must equal len(pubkeys); a mismatch is ERROR_CODE_CONTRACT_VIOLATION.
@@ -285,6 +314,17 @@ message PubkeyFeedRequestBody {
   // len of 0 or a sha256 that is not 32 bytes there is ERROR_CODE_CONTRACT_VIOLATION and fails the stream.
   // Ignored on later frames, where cl-chain leaves it unset.
   FinalizedRegistry finalized_registry = 4;
+  // Required on every body frame (see Lag above); 0 only at genesis. On the frames of a restore (see
+  // Restore above), the first one included even when it carries no entries: the epoch of the finalized
+  // checkpoint whose registry finalized_registry announces, the registry cl-verify holds once the restore
+  // completes. After the restore: the finalized epoch whose whole validator registry cl-verify holds once
+  // this frame is applied, i.e. the newest finalized checkpoint epoch whose state's registry has at most
+  // start_index + count entries.
+  uint64 feed_finalized_epoch = 5;
+  // Required on every body frame (see Lag above); 0 only at genesis. cl-chain's finalized checkpoint epoch
+  // when it sends this frame, on restore frames too. Never lower than on an earlier frame, never lower
+  // than feed_finalized_epoch.
+  uint64 chain_finalized_epoch = 6;
 }
 
 // The finalized validator registry prefix cl-chain feeds, as announced on the first PubkeyFeed frame.

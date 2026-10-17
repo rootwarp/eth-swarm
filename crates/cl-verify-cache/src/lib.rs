@@ -47,26 +47,33 @@
 //!   from those validators at `UnknownIndex`.
 //! - Indices below the bound go as `Validator(i)`. If their append has not landed yet, they get
 //!   a transient `UnknownIndex`: IGNORE, and cl-chain retries.
-//! - After either side (re)starts, cl-chain sends no inline signers until it has received the
-//!   reply to its first `PubkeyFeedRequestBody` on the new feed stream (the restore reply); the
-//!   status sent right after the hello does not count. Before a restore that status is 0, and a
-//!   matching snapshot then installs the whole registry `0..len` at once, ranges cl-chain never
-//!   sent included, which the hold-back cannot protect. From the restore reply on, `acked` is
-//!   that reply's `high_water`.
+//! - After either side (re)starts, cl-chain sends no inline signers until a feed reply on the new
+//!   stream reports a `high_water` of at least the `finalized_registry.len` it announced on that
+//!   stream's first frame (the restore-complete reply). Earlier replies do not count. The status
+//!   sent right after the hello is 0 before a restore, and a matching snapshot then installs the
+//!   whole registry `0..len` at once, ranges cl-chain never sent included, which the hold-back
+//!   cannot protect. The replies during a multi-frame rebuild come before the restore is
+//!   complete: an inline signer sent after one would hold the next rebuild frame back behind a
+//!   VerifyBls deadline, which can outlast the restore frame timeout and fail the rebuild. From
+//!   the restore-complete reply on, `acked` is that reply's `high_water`.
 //! - If cl-chain breaks these rules anyway, the inline signer meets a cached index and
 //!   [`PubkeyCache::resolve_signer`] returns `InlineForCachedIndex`, a contract violation. That
 //!   is the intended signal: it marks a cl-chain bug, not a benign race.
 //!
-//! A sustained lag therefore costs gossip coverage, not safety. cl-chain alerts when the cache
-//! trails the finalized registry for more than 4 epochs.
+//! A sustained lag therefore costs gossip coverage, not safety. cl-verify raises an alert
+//! (`verify_pubkey_feed_lag_alert`) when the cache trails cl-chain's finalized epoch by more than
+//! `MAX_SEED_LOOKAHEAD` (4) epochs, re-evaluated on every feed frame it applies; the bound is in
+//! [`lag`].
 
 pub mod eligibility;
+pub mod lag;
 pub mod persist;
 
 pub use eligibility::{
     split_import_batch, IgnoreReason, KeySource, Origin, Resolution, ResolvedKey, Signer,
     Violation, MAX_INLINE_KEYS_PER_BATCH, MAX_SETS_PER_BATCH,
 };
+pub use lag::{feed_lag_epochs, feed_lag_exceeded};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AppendError {
