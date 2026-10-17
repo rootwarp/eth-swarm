@@ -13,15 +13,32 @@ import "ethswarm/common/v1/error.proto";
 // Cache-safety invariant: once FINALIZED, a validator index never changes pubkey (the registry is
 // append-only, electra beacon-chain.md add_validator_to_registry). Before finality, competing branches can
 // assign the same new index to different pubkeys, so cl-chain feeds ONLY the finalized registry prefix.
-// A signer whose index is at or past the cache high-water mark must carry its pubkey inline. Such an
+// On import, a signer whose index is at or past the cache high-water mark must carry its pubkey inline
+// (gossip never carries one; see Signer). Such an
 // index with no inline pubkey yields VERIFY_STATUS_UNKNOWN_INDEX -> IGNORE (or retry), never ACCEPT.
 // A lagging cache can therefore only be missing entries, never wrong. Inline keys are used for that
 // call only and never enter the cache. The cache is append-only: a gap, an overlap or a changed key for
 // a cached index is rejected (ERROR_CODE_CONTRACT_VIOLATION on PubkeyFeed), so a cached index is never re-keyed.
 // Restart: cl-verify may load an on-disk snapshot of the cache. Any header, length or root mismatch means
 // rebuild from index 0 via PubkeyFeed, never trust; the high_water it reports covers verified entries only.
-// TODO(vera): inline cap. Inline signers grow by up to 16/epoch since finality (MAX_PENDING_DEPOSITS_PER_EPOCH);
-//   set the max inline pubkeys per request and the behaviour when it is hit.
+// Inline cap (per VerifyBlsRequestBody.origin): 0 inline pubkeys on gossip (every active validator is in
+// the finalized prefix, phase0 is_eligible_for_activation); at most 1,024 per VerifyBls request on
+// import. cl-chain splits a larger import batch into several requests in order, never rejects it. 1,024
+// is a packing cap, not a hard limit: a request of exactly one set may exceed it (e.g. one Electra
+// on-chain aggregate with more than 1,024 inline signers after a cache rebuild), and cl-verify MUST
+// accept that request. A request of more than one set whose sets together carry more than 1,024 inline
+// pubkeys is ERROR_CODE_CONTRACT_VIOLATION.
+// Inline bound: cl-chain sends a signer inline only if validator_index >= max(acked, sent), where acked
+// is the last PubkeyFeedResponseBody.high_water and sent the end of the feed range cl-chain has sent.
+// Indices below that bound go without an inline pubkey; if their append has not landed yet they get a
+// transient VERIFY_STATUS_UNKNOWN_INDEX -> IGNORE and retry. After either side restarts, cl-chain sends
+// no inline signers until the first PubkeyFeedResponseBody on the new feed stream.
+// Feed hold-back: PubkeyFeed and VerifyBls are separate streams with no ordering between them, so a feed
+// range sent after a request could overtake it. cl-chain therefore MUST NOT send a PubkeyFeed range that
+// covers an index carried inline by an in-flight VerifyBls request until that request has completed (its
+// response is received) or been cancelled; after a reconnect of either stream it drains or cancels the
+// in-flight requests before sending the range. If cl-chain breaks this, the inline signer meets a cached
+// index and the result is ERROR_CODE_CONTRACT_VIOLATION, which correctly signals a cl-chain bug.
 //
 // Deadline semantics: every request carries deadline_unix_ms. cl-verify drops work it cannot finish by
 // then and answers VERIFY_STATUS_DEADLINE_EXCEEDED. A missing, timed-out, errored or UNSPECIFIED verdict
@@ -43,10 +60,29 @@ enum VerifyStatus {
   VERIFY_STATUS_DECODE_ERROR = 6;
 }
 
+// Which cl-chain path a VerifyBls request serves; it selects the inline-signer rules (see Signer).
+enum VerifyOrigin {
+  // Contract violation if sent.
+  VERIFY_ORIGIN_UNSPECIFIED = 0;
+  // Gossip validation: no signer may carry an inline pubkey.
+  VERIFY_ORIGIN_GOSSIP = 1;
+  // Block or batch import: inline pubkeys at or past the cache high-water mark, 1,024 packing cap.
+  VERIFY_ORIGIN_IMPORT = 2;
+}
+
+// A validator-registry signer. Validator signing keys only: a Gloas builder (index into the separate
+// state.builders registry) and a key carried by the message itself with no validator index (deposits,
+// BLS-to-execution-change withdrawal keys) must not be sent as a Signer; a builder index here would
+// resolve to an unrelated validator's key.
 message Signer {
   uint64 validator_index = 1;
-  // 48 bytes compressed G1. Required iff validator_index >= the cache high-water mark (unfinalized);
-  // empty otherwise. Ignored for cached (finalized) indices: the cache is authoritative.
+  // 48 bytes compressed G1.
+  // The rules depend on the request's VerifyBlsRequestBody.origin.
+  // Gossip: always empty; a non-empty inline_pubkey is ERROR_CODE_CONTRACT_VIOLATION.
+  // Import: required iff validator_index >= the cache high-water mark (unfinalized); empty otherwise.
+  //   Empty at or past the mark yields VERIFY_STATUS_UNKNOWN_INDEX. Non-empty for a cached (finalized)
+  //   index is ERROR_CODE_CONTRACT_VIOLATION, even when it equals the cached key. See the inline bound
+  //   and the feed hold-back above.
   bytes inline_pubkey = 2;
 }
 
@@ -67,6 +103,13 @@ message VerifyBlsRequestBody {
   // TODO(vera): encoded message max in bytes.
   repeated BlsSet sets = 2;
   uint64 deadline_unix_ms = 3;
+  // The path every set in this request serves; one origin per request, as the inline cap is per request.
+  // VERIFY_ORIGIN_UNSPECIFIED (0) is ERROR_CODE_CONTRACT_VIOLATION, like every enum. An unknown non-zero
+  // value is IGNOREd: no BLS work, and no set is reported VALID.
+  // VERIFY_ORIGIN_GOSSIP: every signer with a non-empty inline_pubkey is ERROR_CODE_CONTRACT_VIOLATION.
+  // VERIFY_ORIGIN_IMPORT: inline_pubkey is required iff validator_index >= the cache high-water mark (a
+  //   cached index with one is ERROR_CODE_CONTRACT_VIOLATION), and the 1,024 inline packing cap applies.
+  VerifyOrigin origin = 4;
 }
 
 message BlsResult {
@@ -141,6 +184,8 @@ message VerifyKzgResponse {
 // finalized registry length.
 // One rule for restart and lag: cl-verify reports its high-water mark first (PubkeyFeedResponseBody
 // right after its hello), and cl-chain resends from there.
+// cl-chain holds back a range that covers an index carried inline by an in-flight VerifyBls request
+// until that request has completed or been cancelled (see the feed hold-back above).
 message PubkeyFeedRequestBody {
   uint64 start_index = 1;
   // Must equal len(pubkeys); a mismatch is ERROR_CODE_CONTRACT_VIOLATION.

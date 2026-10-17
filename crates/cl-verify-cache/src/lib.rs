@@ -6,8 +6,46 @@
 //! index at or past that must carry its pubkey inline; without one the lookup is
 //! [`Lookup::Unknown`], which callers map to IGNORE or a retry, never ACCEPT. A lagging cache can
 //! therefore only miss entries, never return a wrong key.
+//!
+//! Signers are checked with [`PubkeyCache::resolve_signer`] before any BLS work; the gossip and
+//! import rules, and how large import batches are split, are in [`eligibility`].
+//!
+//! # Feed lag
+//!
+//! cl-chain feeds the finalized registry over `PubkeyFeed`, and the cache can trail it (a slow or
+//! restarted feed, or a snapshot loaded at startup). Nothing turns wrong while it lags:
+//! - Indices between `high_water()` and cl-chain's finalized registry length are unknown here. A
+//!   gossip message signed by one is IGNOREd (`UnknownIndex`), never ACCEPTed. Gossip carries no
+//!   inline keys, so those validators' gossip is dropped until the feed catches up.
+//! - On import, cl-chain sends a signer inline only when its index is at or past
+//!   `max(acked, sent)`: `acked` is the last high-water mark cl-verify reported
+//!   (`PubkeyFeedResponseBody.high_water`), `sent` the end of the feed range cl-chain has sent.
+//!   That covers ranges sent before the request, but PubkeyFeed and VerifyBls are separate
+//!   streams with no ordering between them, so a range sent later could overtake the request.
+//! - Hold-back rule: cl-chain does not send a `PubkeyFeed` range that covers an index carried
+//!   inline by an in-flight VerifyBls request until that request has completed (its response is
+//!   received) or been cancelled. After a reconnect of either stream, cl-chain first drains or
+//!   cancels the in-flight requests, then sends the range. With both rules, a request's inline
+//!   indices stay past `high_water()` until the request is resolved.
+//! - Indices below the bound go as `Validator(i)`. If their append has not landed yet, they get
+//!   a transient `UnknownIndex`: IGNORE, and cl-chain retries.
+//! - After either side restarts, cl-chain sends no inline signers until the first
+//!   `PubkeyFeedResponseBody` on the new feed stream: a snapshot can leave cl-verify ahead of
+//!   what cl-chain knows it sent.
+//! - If cl-chain breaks these rules anyway, the inline signer meets a cached index and
+//!   [`PubkeyCache::resolve_signer`] returns `InlineForCachedIndex`, a contract violation. That
+//!   is the intended signal: it marks a cl-chain bug, not a benign race.
+//!
+//! A sustained lag therefore costs gossip coverage, not safety. cl-chain alerts when the cache
+//! trails the finalized registry for more than 4 epochs.
 
+pub mod eligibility;
 pub mod persist;
+
+pub use eligibility::{
+    split_import_batch, IgnoreReason, KeySource, Origin, Resolution, ResolvedKey, Signer,
+    Violation, MAX_INLINE_KEYS_PER_BATCH, MAX_SETS_PER_BATCH,
+};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AppendError {
@@ -77,8 +115,41 @@ impl<K: PartialEq> PubkeyCache<K> {
         }
     }
 
+    /// Applies the eligibility rules to validator signer `signer` from `origin`; see
+    /// [`eligibility`]. Builder keys and message-carried keys must not be resolved here.
+    ///
+    /// - `Validator(i)`: the cached key if `i < high_water()`, else `Ignore(UnknownIndex)`.
+    /// - `Inline` on gossip: `ContractViolation(InlineOnGossip)`.
+    /// - `Inline` on import for a cached index: `ContractViolation(InlineForCachedIndex)`.
+    /// - `Inline` on import past the cache: the inline key, for this call only.
+    pub fn resolve_signer<'a>(
+        &'a self,
+        signer: &'a Signer<K>,
+        origin: Origin,
+    ) -> Resolution<'a, K> {
+        match (signer, origin) {
+            (Signer::Validator(index), _) => match self.get(*index) {
+                Lookup::Known(key) => Resolution::Resolved(ResolvedKey::new(key, KeySource::Cache)),
+                Lookup::Unknown => Resolution::Ignore(IgnoreReason::UnknownIndex { index: *index }),
+            },
+            (Signer::Inline { index, .. }, Origin::Gossip) => {
+                Resolution::ContractViolation(Violation::InlineOnGossip { index: *index })
+            }
+            (Signer::Inline { index, key }, Origin::Import) => match self.get(*index) {
+                Lookup::Known(_) => {
+                    Resolution::ContractViolation(Violation::InlineForCachedIndex { index: *index })
+                }
+                Lookup::Unknown => Resolution::Resolved(ResolvedKey::new(key, KeySource::Inline)),
+            },
+        }
+    }
+
     /// Key for a signer: the cached finalized key if present, else the inline key, else Unknown.
     /// Inline keys are used for this call only and never enter the cache.
+    ///
+    /// A plain lookup that applies no eligibility rules (it accepts inline keys from any origin
+    /// and ignores one for a cached index). Verify requests go through
+    /// [`resolve_signer`](Self::resolve_signer).
     pub fn resolve<'a>(&'a self, index: u64, inline: Option<&'a K>) -> Lookup<'a, K> {
         match (self.get(index), inline) {
             (Lookup::Known(k), _) => Lookup::Known(k),
