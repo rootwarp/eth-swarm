@@ -2,7 +2,8 @@
 //!
 //! The contract layer still runs in front of them, so a stub service already honours the wire
 //! rules: a streaming RPC checks the peer's hello (and, on a bidi stream, every body: framing,
-//! `seq`, envelope type and digest) and sends its own hello before it fails with
+//! `seq`, envelope type and digest) and sends its own hello, with a fresh server generation
+//! ([`stream_hello`]), before it fails with
 //! `UNIMPLEMENTED`; a unary RPC checks the envelopes it carries (`seq` 0, type, digest) first.
 
 use std::future::Future;
@@ -18,6 +19,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::envelope::Envelopes;
 use crate::frame::{HelloField, InFrame, Inbound, OutFrame};
+use crate::hello::stream_hello;
 use crate::link::Link;
 
 /// The response stream of a stub streaming RPC.
@@ -52,10 +54,8 @@ where
 {
     link.accept_hello_field(request.hello_field())
         .map_err(|e| e.to_status())?;
-    let frames = vec![
-        Ok(Resp::hello(link.local().clone())),
-        Err(not_implemented(rpc)),
-    ];
+    let (_, hello) = stream_hello(link.local()).map_err(|e| e.to_status())?;
+    let frames = vec![Ok(Resp::hello(hello)), Err(not_implemented(rpc))];
     Ok(Response::new(Box::pin(tokio_stream::iter(frames))))
 }
 
@@ -77,11 +77,8 @@ where
     crate::spawn_in_span(async move {
         let end = async {
             let mut guarded = link.open(Inbound::new(request.into_inner())).await?;
-            if tx
-                .send(Ok(Resp::hello(link.local().clone())))
-                .await
-                .is_err()
-            {
+            let (_, hello) = stream_hello(link.local())?;
+            if tx.send(Ok(Resp::hello(hello))).await.is_err() {
                 return Ok(());
             }
             while guarded.body().await?.is_some() {}
@@ -216,10 +213,12 @@ mod tests {
         let mut s = server_stream::<_, GetDataColumnsResponse>(&l, "S/M", &ok)
             .unwrap()
             .into_inner();
-        assert!(matches!(
-            s.next().await.unwrap().unwrap().into_frame(),
-            Some(crate::frame::Frame::Hello(_))
-        ));
+        match s.next().await.unwrap().unwrap().into_frame() {
+            Some(crate::frame::Frame::Hello(h)) => {
+                assert!(crate::hello::Generation::from_hello(&h).is_ok(), "{h:?}");
+            }
+            other => panic!("first frame {other:?}"),
+        }
         assert_eq!(
             s.next().await.unwrap().unwrap_err().code(),
             tonic::Code::Unimplemented

@@ -46,7 +46,9 @@ async fn per_item_ok_and_error_results_are_independent() {
         bad_sig,
         valid_set(3, 4),
     ];
-    s.send(bls_body(bls_request(7, sets))).await;
+    let mut out = s.outstanding();
+    let (tag, body) = file_bls(&mut out, bls_request(7, sets));
+    s.send(bls_body(body)).await;
     let r = bls_reply(&mut s).await;
     assert_eq!(
         outcomes(&r),
@@ -60,7 +62,7 @@ async fn per_item_ok_and_error_results_are_independent() {
         ]
     );
     assert_eq!(
-        bls_verdicts(Ok(r), 7, 6),
+        bls_verdicts(Ok(r), &mut out, tag, 6),
         vec![
             Verdict::Accept,
             Verdict::Ignore,

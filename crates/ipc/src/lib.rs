@@ -10,6 +10,11 @@
 //! - [`envelope`]: `open_envelope`, which refuses a zero `payload_type`, ignores an unknown one,
 //!   drops a fork digest that does not match the slot's fork, and only then decodes.
 //! - [`error`]: [`error::ContractError`] and its `common.v1.Error` / `tonic::Status` forms.
+//! - [`fence`]: request fencing. Every request carries its `request_id` and the stream's server
+//!   generation (`Hello.generation`), every result a `common.v1.Fence`; a reordered, duplicated,
+//!   stale-generation or substituted result is a contract violation, never ACCEPT.
+//! - [`deadline`]: the client's calls over a fenced stream. At a deadline or a reconnect every
+//!   outstanding call fails locally as IGNORE, and late results are dropped and counted.
 //! - [`link`]: one service's contract configuration and the guarded inbound stream.
 //! - [`peercred`]: the Unix-socket peer's UID, checked by both ends of every link.
 //! - [`uds`]: the service-owned socket directory (`/run/ethswarm/<svc>/`, 0750, socket 0660),
@@ -22,8 +27,10 @@
 //!   and over a Unix socket.
 
 pub mod acl;
+pub mod deadline;
 pub mod envelope;
 pub mod error;
+pub mod fence;
 pub mod frame;
 pub mod hello;
 pub mod link;

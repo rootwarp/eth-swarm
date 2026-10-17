@@ -463,6 +463,7 @@ fn resolve_signer<'a>(
 fn status(s: VerifyStatus) -> BlsResult {
     BlsResult {
         result: Some(bls_result::Result::Status(s as i32)),
+        fence: None,
     }
 }
 
@@ -471,6 +472,7 @@ fn status(s: VerifyStatus) -> BlsResult {
 pub fn error(code: ErrorCode, detail: &str) -> BlsResult {
     BlsResult {
         result: Some(bls_result::Result::Err(wire_error(code, detail))),
+        fence: None,
     }
 }
 
@@ -706,6 +708,7 @@ mod tests {
             sets: vec![set(&[0], 1), set(&[1], 2)],
             deadline_unix_ms: u64::MAX,
             origin: 99,
+            generation: 0,
         };
         assert_eq!(
             statuses(&verify_request(&body, &c, &counting)),
@@ -742,6 +745,7 @@ mod tests {
             sets: vec![signed(vec![inline(1)], &[1], 1), set(&[0], 2)],
             deadline_unix_ms: crate::wire::now_unix_ms() - 1,
             origin: VerifyOrigin::Import as i32,
+            generation: 0,
         };
         assert_eq!(
             statuses(&verify_request(&body, &c, &counting)),
@@ -763,6 +767,7 @@ mod tests {
             sets: vec![signed(vec![inline(5)], &[5], 1)],
             deadline_unix_ms: crate::wire::now_unix_ms() + 100,
             origin: VerifyOrigin::Import as i32,
+            generation: 0,
         };
         let reader = {
             let c = Arc::clone(&c);
@@ -819,6 +824,7 @@ mod tests {
             }],
             deadline_unix_ms: 10_000,
             origin: VerifyOrigin::Import as i32,
+            generation: 0,
         };
         let c = cache(2);
         let counting = Arc::new(Counting::default());
@@ -845,6 +851,7 @@ mod tests {
             sets: vec![set(&[0], 1), signed(vec![inline(1)], &[1], 2)],
             deadline_unix_ms: u64::MAX,
             origin: VerifyOrigin::Import as i32,
+            generation: 0,
         };
         let closed = AtomicBool::new(true);
         assert!(verify_request_gated(&body, &closed, &SystemClock, &c, &counting).is_none());

@@ -6,10 +6,71 @@
 //! `ERROR_CODE_VERSION_MISMATCH`. Only `build` is informational. The link uses the highest
 //! common API version, `min(max_a, max_b)`, which must be at least `max(min_a, min_b)` and the
 //! receiver's configured floor. There is no fallback to a lower version or an unversioned mode.
+//!
+//! `generation` is not compared either: it is the server generation of one stream
+//! ([`Generation`]). The serving side draws a fresh one from the OS RNG for every stream it
+//! answers ([`stream_hello`]), so it changes on every restart and every reconnect; the client
+//! reads it from the server's hello ([`Generation::from_hello`], where 0 is a contract
+//! violation) and fences every request and result of the stream with it ([`crate::fence`]).
 
-use ethswarm_proto::common::{ForkName, Hello, SpecPin};
+use std::num::NonZeroU64;
+
+use ethswarm_proto::common::{ErrorCode, ForkName, Hello, SpecPin};
 
 use crate::error::ContractError;
+
+/// The server generation of one stream (`Hello.generation`): random and never 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Generation(NonZeroU64);
+
+impl Generation {
+    /// `None` for 0, which is never a generation.
+    #[must_use]
+    pub fn new(value: u64) -> Option<Self> {
+        NonZeroU64::new(value).map(Self)
+    }
+
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    /// A fresh generation from the OS RNG; `ERROR_CODE_RESOURCE_UNAVAILABLE` if the RNG fails.
+    pub fn random() -> Result<Self, ContractError> {
+        Self::draw(getrandom::u64)
+    }
+
+    /// Draws until a non-zero value. A source that keeps returning 0 is broken, so it gives up
+    /// after a few draws.
+    pub(crate) fn draw<E>(mut draw: impl FnMut() -> Result<u64, E>) -> Result<Self, ContractError> {
+        const MAX_DRAWS: usize = 8;
+        let unavailable =
+            || ContractError::new(ErrorCode::ResourceUnavailable, "OS RNG gives no generation");
+        for _ in 0..MAX_DRAWS {
+            if let Some(g) = Self::new(draw().map_err(|_| unavailable())?) {
+                return Ok(g);
+            }
+        }
+        Err(unavailable())
+    }
+
+    /// The server generation `hello` announces. 0 (also what an older peer that sets none sends)
+    /// is `ERROR_CODE_CONTRACT_VIOLATION`: its results could not be fenced.
+    pub fn from_hello(hello: &Hello) -> Result<Self, ContractError> {
+        Self::new(hello.generation)
+            .ok_or_else(|| ContractError::violation("server hello has generation 0"))
+    }
+}
+
+/// The hello a server opens one stream with: `local` with a fresh [`Generation`].
+pub fn stream_hello(local: &Hello) -> Result<(Generation, Hello), ContractError> {
+    let generation = Generation::random()?;
+    let hello = Hello {
+        generation: generation.get(),
+        ..local.clone()
+    };
+    Ok((generation, hello))
+}
 
 /// The proto API version of the `*.v1` packages.
 pub const API_VERSION_V1: u32 = 1;
@@ -32,7 +93,8 @@ pub fn from_spec_pin(pin: &network_config::SpecPin) -> SpecPin {
 /// Checks the peer's hello against ours and returns the negotiated API version.
 ///
 /// A `FORK_NAME_UNSPECIFIED` schedule entry is `ERROR_CODE_CONTRACT_VIOLATION` (the zero rule
-/// holds for every enum); every other difference is `ERROR_CODE_VERSION_MISMATCH`.
+/// holds for every enum); every other difference is `ERROR_CODE_VERSION_MISMATCH`. `build` and
+/// `generation` are not compared.
 pub fn negotiate(local: &Hello, remote: &Hello, floor: u32) -> Result<u32, ContractError> {
     if remote
         .fork_schedule
@@ -101,6 +163,7 @@ mod tests {
             }],
             min_api_version: min,
             max_api_version: max,
+            generation: 0,
         }
     }
 
@@ -192,6 +255,64 @@ mod tests {
                 "edit {i}"
             );
         }
+    }
+
+    #[test]
+    fn generation_is_not_compared() {
+        let mut theirs = hello(1, 1);
+        theirs.generation = 0x5eed;
+        assert_eq!(negotiate(&hello(1, 1), &theirs, 1), Ok(1));
+    }
+
+    #[test]
+    fn random_generations_are_non_zero_and_differ() {
+        let a = Generation::random().unwrap();
+        let b = Generation::random().unwrap();
+        assert_ne!(a.get(), 0);
+        assert_ne!(a, b, "two 64-bit draws collided");
+    }
+
+    #[test]
+    fn a_zero_draw_is_redrawn_and_a_broken_source_is_unavailable() {
+        let mut draws = [0u64, 0, 7].into_iter();
+        let g = Generation::draw(|| Ok::<_, ()>(draws.next().unwrap())).unwrap();
+        assert_eq!(g.get(), 7);
+        let zeros = Generation::draw(|| Ok::<_, ()>(0)).unwrap_err();
+        assert_eq!(zeros.code(), ErrorCode::ResourceUnavailable);
+        let failing = Generation::draw(|| Err::<u64, _>("no entropy")).unwrap_err();
+        assert_eq!(failing.code(), ErrorCode::ResourceUnavailable);
+    }
+
+    #[test]
+    fn peer_generation_zero_is_a_contract_violation() {
+        assert_eq!(
+            Generation::from_hello(&hello(1, 1)).unwrap_err().code(),
+            ErrorCode::ContractViolation
+        );
+        let mut server = hello(1, 1);
+        server.generation = 42;
+        assert_eq!(Generation::from_hello(&server).unwrap().get(), 42);
+        assert_eq!(Generation::new(0), None);
+        assert_eq!(Generation::new(42).map(Generation::get), Some(42));
+    }
+
+    #[test]
+    fn stream_hello_draws_a_fresh_generation_per_stream() {
+        let local = hello(1, 1);
+        let (g1, h1) = stream_hello(&local).unwrap();
+        let (g2, h2) = stream_hello(&local).unwrap();
+        assert_eq!(h1.generation, g1.get());
+        assert_eq!(h2.generation, g2.get());
+        assert_ne!(g1, g2);
+        // Everything else is the local hello, so negotiation is unaffected.
+        assert_eq!(negotiate(&local, &h1, 1), Ok(1));
+        assert_eq!(
+            Hello {
+                generation: 0,
+                ..h1
+            },
+            local
+        );
     }
 
     #[test]

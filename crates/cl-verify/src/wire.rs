@@ -72,8 +72,35 @@ pub async fn by_deadline<F: Future>(
     clock: &dyn WallClock,
     fut: F,
 ) -> Option<F::Output> {
-    let out = timeout_at(deadline.at, fut).await.ok()?;
-    deadline.open(clock).then_some(out)
+    match race_deadline(deadline, clock, fut).await {
+        Timed::InTime(out) => Some(out),
+        Timed::Late(_) | Timed::TimedOut => None,
+    }
+}
+
+/// What became of a future raced against a [`Deadline`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum Timed<T> {
+    /// Ready while the deadline was still open.
+    InTime(T),
+    /// Ready, but only once the deadline had passed on either clock.
+    Late(T),
+    /// Not ready by the deadline; the future was dropped.
+    TimedOut,
+}
+
+/// [`by_deadline`] that keeps a result which became ready after the deadline, so the caller
+/// can account for it ([`Timed::Late`]) instead of losing it.
+pub async fn race_deadline<F: Future>(
+    deadline: &Deadline,
+    clock: &dyn WallClock,
+    fut: F,
+) -> Timed<F::Output> {
+    match timeout_at(deadline.at, fut).await {
+        Err(_) => Timed::TimedOut,
+        Ok(out) if deadline.open(clock) => Timed::InTime(out),
+        Ok(out) => Timed::Late(out),
+    }
 }
 
 /// Milliseconds since the Unix epoch (0 if the clock is before it).

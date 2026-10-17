@@ -220,6 +220,7 @@ async fn repeated_or_decreasing_request_id_fails_the_stream() {
         request_id: id,
         cells: vec![cl_verify::proto::verify::KzgCellProof::default()],
         deadline_unix_ms: now_unix_ms() + 30_000,
+        generation: 0,
     };
     k.send(kzg_body(body(0))).await;
     assert_eq!(kzg_reply(&mut k).await.request_id, 0);

@@ -20,6 +20,8 @@ use cl_verify::proto::verify::*;
 use cl_verify::server::{serve_uds, Limits, ServerConfig, VerifyServer, DEFAULT_SNAPSHOT_INTERVAL};
 use cl_verify::wire::{error_from_status, now_unix_ms, SystemClock, WallClock};
 use hyper_util::rt::TokioIo;
+use ipc::fence::{FencedRequest, Outstanding, RequestTag};
+use ipc::hello::Generation;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -62,6 +64,7 @@ pub fn hello() -> Hello {
         }],
         min_api_version: 1,
         max_api_version: 1,
+        generation: 0,
     }
 }
 
@@ -227,11 +230,60 @@ pub async fn connect(path: &Path) -> Channel {
 pub struct Bidi<Req, Resp> {
     pub tx: mpsc::Sender<Req>,
     pub rx: Streaming<Resp>,
+    /// The server generation the server's hello announced; 0 before the hello exchange.
+    pub generation: u64,
+}
+
+/// A request that carries the stream's server generation in its body.
+pub trait Stamp {
+    /// Sets the body's `generation` to `generation` unless the test set one itself.
+    fn stamp(&mut self, generation: u64);
+}
+
+impl Stamp for VerifyBlsRequest {
+    fn stamp(&mut self, generation: u64) {
+        if let Some(verify_bls_request::Frame::Body(b)) = &mut self.frame {
+            if b.generation == 0 {
+                b.generation = generation;
+            }
+        }
+    }
+}
+
+impl Stamp for VerifyKzgRequest {
+    fn stamp(&mut self, generation: u64) {
+        if let Some(verify_kzg_request::Frame::Body(b)) = &mut self.frame {
+            if b.generation == 0 {
+                b.generation = generation;
+            }
+        }
+    }
+}
+
+impl Stamp for PubkeyFeedRequest {
+    fn stamp(&mut self, _: u64) {}
+}
+
+impl<Req: Stamp, Resp> Bidi<Req, Resp> {
+    /// Sends `req`, its body stamped with the stream's server generation (see [`Stamp`]).
+    pub async fn send(&self, mut req: Req) {
+        req.stamp(self.generation);
+        self.send_unstamped(req).await;
+    }
+
+    /// Sends `req` exactly as given.
+    pub async fn send_unstamped(&self, req: Req) {
+        self.tx.send(req).await.unwrap();
+    }
 }
 
 impl<Req, Resp> Bidi<Req, Resp> {
-    pub async fn send(&self, req: Req) {
-        self.tx.send(req).await.unwrap();
+    /// The client's table of outstanding requests for this stream, after the hello exchange.
+    pub fn outstanding(&self) -> Outstanding {
+        Outstanding::new(
+            Generation::new(self.generation).expect("hello exchange done"),
+            64,
+        )
     }
 
     pub async fn next(&mut self) -> Result<Option<Resp>, Status> {
@@ -296,7 +348,11 @@ pub async fn bls_raw(h: &mut Harness) -> BlsStream {
         .await
         .unwrap()
         .into_inner();
-    Bidi { tx, rx }
+    Bidi {
+        tx,
+        rx,
+        generation: 0,
+    }
 }
 
 /// Opens a BLS stream and completes the hello exchange.
@@ -304,10 +360,24 @@ pub async fn bls_open(h: &mut Harness) -> BlsStream {
     let mut s = bls_raw(h).await;
     s.send(bls_hello(hello())).await;
     match s.next().await.unwrap().unwrap().frame {
-        Some(verify_bls_response::Frame::Hello(server)) => assert_eq!(server, hello()),
+        Some(verify_bls_response::Frame::Hello(server)) => s.generation = server_generation(server),
         other => panic!("first server frame is not hello: {other:?}"),
     }
     s
+}
+
+/// The generation of the server's hello, which must be ours in every other field.
+pub fn server_generation(server: Hello) -> u64 {
+    assert_ne!(server.generation, 0, "server hello has generation 0");
+    let generation = server.generation;
+    assert_eq!(
+        Hello {
+            generation: 0,
+            ..server
+        },
+        hello()
+    );
+    generation
 }
 
 pub async fn kzg_raw(h: &mut Harness) -> KzgStream {
@@ -318,14 +388,18 @@ pub async fn kzg_raw(h: &mut Harness) -> KzgStream {
         .await
         .unwrap()
         .into_inner();
-    Bidi { tx, rx }
+    Bidi {
+        tx,
+        rx,
+        generation: 0,
+    }
 }
 
 pub async fn kzg_open(h: &mut Harness) -> KzgStream {
     let mut s = kzg_raw(h).await;
     s.send(kzg_hello(hello())).await;
     match s.next().await.unwrap().unwrap().frame {
-        Some(verify_kzg_response::Frame::Hello(_)) => {}
+        Some(verify_kzg_response::Frame::Hello(server)) => s.generation = server_generation(server),
         other => panic!("first server frame is not hello: {other:?}"),
     }
     s
@@ -339,7 +413,11 @@ pub async fn feed_raw(h: &mut Harness) -> FeedStream {
         .await
         .unwrap()
         .into_inner();
-    Bidi { tx, rx }
+    Bidi {
+        tx,
+        rx,
+        generation: 0,
+    }
 }
 
 /// Opens a feed stream, completes the hello exchange and returns the first high-water report.
@@ -347,7 +425,9 @@ pub async fn feed_open(h: &mut Harness) -> (FeedStream, u64) {
     let mut s = feed_raw(h).await;
     s.send(feed_hello(hello())).await;
     match s.next().await.unwrap().unwrap().frame {
-        Some(pubkey_feed_response::Frame::Hello(_)) => {}
+        Some(pubkey_feed_response::Frame::Hello(server)) => {
+            s.generation = server_generation(server)
+        }
         other => panic!("first server frame is not hello: {other:?}"),
     }
     let first = feed_reply(&mut s).await;
@@ -395,7 +475,43 @@ pub fn bls_request_from(
         sets,
         deadline_unix_ms: far_deadline(),
         origin: origin as i32,
+        generation: 0,
     }
+}
+
+/// Files `body` as the next request in `out`: its `request_id` and `generation` become the
+/// issued tag's.
+pub fn file_bls(
+    out: &mut Outstanding,
+    body: VerifyBlsRequestBody,
+) -> (RequestTag, VerifyBlsRequestBody) {
+    out.issue(|tag| {
+        let body = VerifyBlsRequestBody {
+            request_id: tag.request_id,
+            generation: tag.generation.get(),
+            ..body
+        };
+        let hashes = body.item_hashes();
+        (body, hashes)
+    })
+    .expect("room for a request")
+}
+
+/// [`file_bls`] for a KZG request.
+pub fn file_kzg(
+    out: &mut Outstanding,
+    body: VerifyKzgRequestBody,
+) -> (RequestTag, VerifyKzgRequestBody) {
+    out.issue(|tag| {
+        let body = VerifyKzgRequestBody {
+            request_id: tag.request_id,
+            generation: tag.generation.get(),
+            ..body
+        };
+        let hashes = body.item_hashes();
+        (body, hashes)
+    })
+    .expect("room for a request")
 }
 
 /// `VerifyStatus` of a result, or the error code of an `err` result.

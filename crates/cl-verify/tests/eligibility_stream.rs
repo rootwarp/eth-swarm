@@ -22,15 +22,16 @@ async fn gossip_resolves_cached_signers_and_ignores_unknown_ones() {
     let mut h = harness().await;
     let mut s = bls_open(&mut h).await;
     let sets = vec![valid_set(0, 1), valid_set(9, 4)];
-    s.send(bls_body(bls_request_from(1, sets, VerifyOrigin::Gossip)))
-        .await;
+    let mut out = s.outstanding();
+    let (tag, body) = file_bls(&mut out, bls_request_from(1, sets, VerifyOrigin::Gossip));
+    s.send(bls_body(body)).await;
     let r = bls_reply(&mut s).await;
     assert_eq!(
         outcomes(&r),
         vec![Ok(VerifyStatus::Valid), Ok(VerifyStatus::UnknownIndex)]
     );
     assert_eq!(
-        bls_verdicts(Ok(r), 1, 2),
+        bls_verdicts(Ok(r), &mut out, tag, 2),
         vec![Verdict::Accept, Verdict::Ignore]
     );
 }
@@ -96,10 +97,15 @@ async fn unknown_origin_is_ignored_without_bls_work() {
     let mut s = bls_open(&mut h).await;
     let mut body = bls_request(1, vec![valid_set(0, 1), valid_set(1, 2)]);
     body.origin = 77;
+    let mut out = s.outstanding();
+    let (tag, body) = file_bls(&mut out, body);
     s.send(bls_body(body)).await;
     let r = bls_reply(&mut s).await;
     assert_eq!(outcomes(&r), vec![Err(ErrorCode::VersionMismatch); 2]);
-    assert_eq!(bls_verdicts(Ok(r), 1, 2), vec![Verdict::Ignore; 2]);
+    assert_eq!(
+        bls_verdicts(Ok(r), &mut out, tag, 2),
+        vec![Verdict::Ignore; 2]
+    );
     // The stream survives.
     s.send(bls_body(bls_request(2, vec![valid_set(0, 1)])))
         .await;

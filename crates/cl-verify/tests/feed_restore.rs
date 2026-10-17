@@ -101,7 +101,7 @@ async fn a_missing_registry_is_a_contract_violation() {
         ErrorCode::ContractViolation
     );
     // So does a stream that ends before its first frame.
-    let (Bidi { tx, mut rx }, _) = feed_open(&mut h).await;
+    let (Bidi { tx, mut rx, .. }, _) = feed_open(&mut h).await;
     drop(tx);
     let end = tokio::time::timeout(std::time::Duration::from_secs(20), rx.message()).await;
     assert!(matches!(end, Ok(Ok(None) | Err(_))), "the stream ends");

@@ -185,6 +185,7 @@ mod tests {
             sets: vec![signers(1, false); n],
             deadline_unix_ms: 0,
             origin: 1,
+            generation: 0,
         }
     }
 
@@ -199,6 +200,7 @@ mod tests {
                 })
                 .collect(),
             deadline_unix_ms: 0,
+            generation: 0,
         }
     }
 

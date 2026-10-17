@@ -70,6 +70,7 @@ mod tests {
             }],
             min_api_version: 1,
             max_api_version: 1,
+            generation: 0,
         }
     }
 

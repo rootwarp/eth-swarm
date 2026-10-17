@@ -73,6 +73,7 @@ async fn empty_kzg_request_wins_over_a_zero_deadline() {
         request_id: 1,
         cells: vec![],
         deadline_unix_ms: 0,
+        generation: 0,
     }))
     .await;
     assert_eq!(

@@ -75,6 +75,7 @@ async fn verify_cell_kzg_proof_batch_cases() {
             request_id: id as u64,
             cells,
             deadline_unix_ms: far_deadline(),
+            generation: 0,
         }))
         .await;
         let r = kzg_reply(&mut s).await;
@@ -96,6 +97,7 @@ async fn empty_request_is_a_contract_violation_never_valid() {
         request_id: 1,
         cells,
         deadline_unix_ms: far_deadline(),
+        generation: 0,
     }))
     .await;
     assert_eq!(
@@ -120,6 +122,7 @@ async fn cell_count_over_one_block_is_refused() {
         request_id: 1,
         cells: (0..max).map(cell).collect(),
         deadline_unix_ms: far_deadline(),
+        generation: 0,
     }))
     .await;
     assert_eq!(
@@ -130,6 +133,7 @@ async fn cell_count_over_one_block_is_refused() {
         request_id: 2,
         cells: (0..=max).map(cell).collect(),
         deadline_unix_ms: far_deadline(),
+        generation: 0,
     }))
     .await;
     let err = s.expect_failure().await;

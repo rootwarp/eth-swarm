@@ -20,6 +20,9 @@ prost.workspace = true
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 thiserror = "2"
+# OS RNG for stream generations; SHA-256 for fence item hashes (both already in Cargo.lock).
+getrandom = "0.3"
+sha2 = "0.10"
 tracing = "0.1"
 # The UDS connector hands tonic a peer-checked stream, and the ACL is a tower layer over http.
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -38,6 +41,8 @@ tonic-prost = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "test-util", "io-util"] }
 tempfile = "3"
+# tests/fence.rs runs through the contract test kit (in process and over UDS).
+ipc = { path = ".", features = ["testkit"] }
 
 # Root-only tests switch one thread's credentials to play another user (Linux only).
 [target.'cfg(target_os = "linux")'.dev-dependencies]

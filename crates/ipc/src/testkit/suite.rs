@@ -151,6 +151,17 @@ fn code(e: &Option<ContractError>) -> Option<ErrorCode> {
     e.as_ref().map(ContractError::code)
 }
 
+/// A service's hello: `expected` in every field but `generation`, which must be a non-zero
+/// server generation (README, server generation).
+fn assert_server_hello(theirs: &Hello, expected: &Hello, ctx: &str) {
+    assert_ne!(theirs.generation, 0, "{ctx}: server hello has generation 0");
+    let compared = Hello {
+        generation: expected.generation,
+        ..theirs.clone()
+    };
+    assert_eq!(&compared, expected, "{ctx}");
+}
+
 fn hellos(a: &Answer) -> usize {
     a.frames
         .iter()
@@ -370,7 +381,7 @@ impl Run<'_> {
                     let theirs = answer
                         .server_hello()
                         .unwrap_or_else(|| panic!("{ctx}: no server hello: {answer:?}"));
-                    assert_eq!(theirs, &server, "{ctx}");
+                    assert_server_hello(theirs, &server, &ctx);
                     assert_eq!(negotiate(&client, theirs, 1), Ok(v), "{ctx}: peer side");
                     assert!(answer.reached_handler(), "{ctx}: {answer:?}");
                 }
@@ -533,13 +544,20 @@ impl Run<'_> {
                 "{what}: contract-violation metric"
             );
         }
-        // The service opens its own direction with exactly one hello.
+        // The service opens its own direction with exactly one hello, which carries a fresh
+        // non-zero server generation on every stream.
         let (ok, _) = self.ask(fixture::v1_link(), vec![hello()]).await;
         assert!(ok.reached_handler(), "{ok:?}");
         assert_eq!(hellos(&ok), 1, "{ok:?}");
-        assert!(
-            ok.server_hello().is_some(),
-            "the first server frame is hello"
+        let first = ok.server_hello().expect("the first server frame is hello");
+        assert_server_hello(first, &fixture::hello(1, 1), "hello once");
+        let (again, _) = self.ask(fixture::v1_link(), vec![hello()]).await;
+        let second = again
+            .server_hello()
+            .expect("the first server frame is hello");
+        assert_ne!(
+            first.generation, second.generation,
+            "each stream gets its own server generation"
         );
         // The peer refuses a service direction without exactly one leading hello.
         let refused_by_peer = [

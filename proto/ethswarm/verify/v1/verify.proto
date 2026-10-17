@@ -93,6 +93,13 @@ import "ethswarm/common/v1/error.proto";
 //
 // Streams: every stream opens with exactly one `hello` frame from each side, then only `body` frames.
 // A first frame that is not hello, or a hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+//
+// Fencing (VerifyBls, VerifyKzg; proto/README.md, request fencing): cl-verify's hello carries a fresh
+// non-zero generation for each stream, every request carries it back with its request_id, and every
+// result carries a common.v1 Fence. cl-chain sends no request on a stream before it has read
+// cl-verify's hello there. At a request's deadline, or when cl-chain replaces the stream, cl-chain
+// fails the outstanding requests locally as IGNORE; a result that arrives for them later is dropped and
+// counted, never used. The feed hold-back above still ends when that response arrives.
 
 enum VerifyStatus {
   // Contract violation if sent.
@@ -169,6 +176,9 @@ message VerifyBlsRequestBody {
   // VERIFY_ORIGIN_IMPORT: inline_pubkey is required iff validator_index >= the cache high-water mark (a
   //   cached index with one is ERROR_CODE_CONTRACT_VIOLATION), and the 1,024 inline packing cap applies.
   VerifyOrigin origin = 4;
+  // The server generation of this stream (common.v1 Hello.generation of cl-verify's hello). Any other
+  // value is ERROR_CODE_CONTRACT_VIOLATION. Item i of the request is sets[i]; BlsResult.fence answers it.
+  uint64 generation = 5;
 }
 
 message BlsResult {
@@ -176,6 +186,10 @@ message BlsResult {
     VerifyStatus status = 1;
     ethswarm.common.v1.Error err = 2;
   }
+  // Required. request_id and generation of the request, index of the set answered (equal to this
+  // result's position in results), item_hash = SHA-256 of that BlsSet's protobuf encoding. A missing or
+  // mismatched fence is ERROR_CODE_CONTRACT_VIOLATION; the whole response is dropped, never ACCEPTed.
+  ethswarm.common.v1.Fence fence = 3;
 }
 
 message VerifyBlsResponseBody {
@@ -223,6 +237,9 @@ message VerifyKzgRequestBody {
   // first: a request with zero cells or over the cell caps is ERROR_CODE_CONTRACT_VIOLATION whatever its
   // deadline.
   uint64 deadline_unix_ms = 3;
+  // The server generation of this stream (common.v1 Hello.generation of cl-verify's hello). Any other
+  // value is ERROR_CODE_CONTRACT_VIOLATION. The request is one item: the whole body.
+  uint64 generation = 4;
 }
 
 message VerifyKzgResponseBody {
@@ -230,6 +247,10 @@ message VerifyKzgResponseBody {
   // Batch verdict: VALID only if every cell verified.
   VerifyStatus status = 2;
   ethswarm.common.v1.Error err = 3;
+  // Required. request_id and generation of the request, index 0, item_hash = SHA-256 of the request
+  // body's protobuf encoding (request_id and generation included). A missing or mismatched fence is
+  // ERROR_CODE_CONTRACT_VIOLATION; the response is dropped, never ACCEPTed.
+  ethswarm.common.v1.Fence fence = 4;
 }
 
 message VerifyKzgRequest {

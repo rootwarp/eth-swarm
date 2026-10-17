@@ -15,6 +15,8 @@ use std::time::Duration;
 use ethswarm_proto::common::{Envelope, Hello};
 use ethswarm_proto::{chain, discv5, p2p, store, verify};
 use http::uri::PathAndQuery;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tonic::body::Body;
 use tonic::client::Grpc;
@@ -120,8 +122,14 @@ pub trait UnaryProbe: Send + Sync + 'static {
 }
 
 /// Builds a body from probe envelopes; `index` counts bodies from 0 on the stream.
-pub trait FromEnvelopes {
+pub trait FromEnvelopes: Sized {
     fn from_envelopes(envelopes: Vec<Envelope>, index: u64) -> Self;
+
+    /// The body as sent on a stream whose server hello announced `generation`. Fenced request
+    /// bodies carry it; every other body ignores it.
+    fn with_generation(self, _generation: u64) -> Self {
+        self
+    }
 }
 
 impl FromEnvelopes for chain::ImportBatchRequestBody {
@@ -150,6 +158,10 @@ impl FromEnvelopes for verify::VerifyBlsRequestBody {
             origin: verify::VerifyOrigin::Gossip as i32,
             ..Default::default()
         }
+    }
+
+    fn with_generation(self, generation: u64) -> Self {
+        Self { generation, ..self }
     }
 }
 
@@ -220,6 +232,15 @@ where
     M: OutFrame + Default,
     M::Body: FromEnvelopes,
 {
+    stamped_messages(steps, 0)
+}
+
+/// [`steps_to_messages`] with every body stamped with the stream's server `generation`.
+fn stamped_messages<M>(steps: &[Step], generation: u64) -> Vec<M>
+where
+    M: OutFrame + Default,
+    M::Body: FromEnvelopes,
+{
     let mut bodies = 0;
     steps
         .iter()
@@ -227,7 +248,10 @@ where
             Step::Hello(h) => M::hello(h.clone()),
             Step::Body(envelopes) => {
                 bodies += 1;
-                M::body(M::Body::from_envelopes(envelopes.clone(), bodies - 1))
+                M::body(
+                    M::Body::from_envelopes(envelopes.clone(), bodies - 1)
+                        .with_generation(generation),
+                )
             }
             Step::Empty => M::default(),
         })
@@ -239,27 +263,35 @@ fn path(rpc: &'static str) -> PathAndQuery {
 }
 
 async fn collect<M: InFrame>(response: Result<Response<Streaming<M>>, Status>) -> Answer {
-    let mut stream = match response {
-        Ok(r) => r.into_inner(),
-        Err(status) => {
-            return Answer {
-                frames: Vec::new(),
-                end: Err(status),
-            }
-        }
-    };
-    let mut frames = Vec::new();
+    match response {
+        Ok(r) => collect_rest(r.into_inner(), Vec::new()).await,
+        Err(status) => Answer {
+            frames: Vec::new(),
+            end: Err(status),
+        },
+    }
+}
+
+/// The rest of a response stream, after the `frames` already read.
+async fn collect_rest<M: InFrame>(
+    mut stream: Streaming<M>,
+    mut frames: Vec<Option<Frame<()>>>,
+) -> Answer {
     let end = loop {
         match stream.next().await {
             None => break Ok(()),
             Some(Err(status)) => break Err(status),
-            Some(Ok(msg)) => frames.push(msg.into_frame().map(|f| match f {
-                Frame::Hello(h) => Frame::Hello(h),
-                Frame::Body(_) => Frame::Body(()),
-            })),
+            Some(Ok(msg)) => frames.push(erase(msg)),
         }
     };
     Answer { frames, end }
+}
+
+fn erase<M: InFrame>(msg: M) -> Option<Frame<()>> {
+    msg.into_frame().map(|f| match f {
+        Frame::Hello(h) => Frame::Hello(h),
+        Frame::Body(_) => Frame::Body(()),
+    })
 }
 
 async fn ready(transport: Transport) -> Result<Grpc<Transport>, Status> {
@@ -367,22 +399,68 @@ where
         self.response_envelopes
     }
 
+    /// A stream that opens with our hello waits for the service's first frame before the rest,
+    /// as a client of a fenced stream must, and stamps every body with the server generation
+    /// that hello announced. Any other opening is sent in one go.
     fn call(&self, transport: Transport, steps: Vec<Step>) -> BoxFuture<Answer> {
         let rpc = self.rpc;
         Box::pin(within(rpc, async move {
-            let messages: Vec<Req> = steps_to_messages(&steps);
-            let response = match ready(transport).await {
-                Ok(mut grpc) => {
-                    grpc.streaming(
+            let mut grpc = match ready(transport).await {
+                Ok(grpc) => grpc,
+                Err(s) => return collect::<Resp>(Err(s)).await,
+            };
+            let codec = ProstCodec::<Req, Resp>::default;
+            if !matches!(steps.first(), Some(Step::Hello(_))) {
+                let messages: Vec<Req> = steps_to_messages(&steps);
+                let response = grpc
+                    .streaming(
                         Request::new(tokio_stream::iter(messages)),
                         path(rpc),
-                        ProstCodec::<Req, Resp>::default(),
+                        codec(),
                     )
-                    .await
-                }
-                Err(s) => Err(s),
+                    .await;
+                return collect(response).await;
+            }
+            let (tx, rx) = mpsc::channel(steps.len());
+            let opening: Vec<Req> = steps_to_messages(&steps[..1]);
+            for m in opening {
+                tx.send(m).await.expect("request channel open");
+            }
+            let response = grpc
+                .streaming(Request::new(ReceiverStream::new(rx)), path(rpc), codec())
+                .await;
+            let mut stream = match response {
+                Ok(r) => r.into_inner(),
+                Err(status) => return collect::<Resp>(Err(status)).await,
             };
-            collect(response).await
+            let first = match stream.next().await {
+                None => {
+                    return Answer {
+                        frames: Vec::new(),
+                        end: Ok(()),
+                    }
+                }
+                Some(Err(status)) => {
+                    return Answer {
+                        frames: Vec::new(),
+                        end: Err(status),
+                    }
+                }
+                Some(Ok(msg)) => erase(msg),
+            };
+            let generation = match &first {
+                Some(Frame::Hello(h)) => h.generation,
+                _ => 0,
+            };
+            let rest: Vec<Req> = stamped_messages(&steps, generation);
+            for m in rest.into_iter().skip(1) {
+                // The service may already have failed the stream; its answer says so.
+                if tx.send(m).await.is_err() {
+                    break;
+                }
+            }
+            drop(tx);
+            collect_rest(stream, vec![first]).await
         }))
     }
 

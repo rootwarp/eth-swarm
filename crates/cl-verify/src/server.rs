@@ -2,11 +2,13 @@
 //!
 //! Every RPC first checks the Unix-socket peer's UID against the configured cl-chain UID and takes
 //! a slot from the server-wide stream limit; then the stream must open with the hello exchange
-//! ([`crate::handshake`], [`crate::frame`]) within the hello timeout. BLS and KZG request bodies
-//! must carry strictly increasing `request_id`s, are checked against [`crate::caps`], and are then
+//! ([`crate::handshake`], [`crate::frame`]) within the hello timeout. Our hello carries a fresh
+//! non-zero server generation for each stream. BLS and KZG request bodies must carry strictly
+//! increasing `request_id`s and that generation, are checked against [`crate::caps`], and are then
 //! verified concurrently on the blocking pool, with at most `max_outstanding_per_stream` requests
 //! per stream between being read and having their response queued. Responses carry the request's
-//! `request_id` and may arrive out of order.
+//! `request_id` and may arrive out of order; every `BlsResult` and `VerifyKzgResponseBody` carries
+//! the `common.v1.Fence` of the request item it answers ([`ipc::fence`]).
 //!
 //! A request whose deadline has passed is answered `DEADLINE_EXCEEDED` without being verified, one
 //! that finds no free verifier slot is answered `OVERLOADED`, and work that finishes at or after
@@ -57,6 +59,8 @@ use crate::proto::verify::{
     VerifyKzgRequestBody, VerifyKzgResponse, VerifyKzgResponseBody, VerifyStatus,
 };
 use crate::wire::{by_deadline, to_status, wire_error, Deadline, SystemClock, WallClock};
+use ipc::fence::{check_request, FencedRequest, FencedResult};
+use ipc::hello::{stream_hello, Generation};
 
 /// Response frames buffered per stream before senders wait.
 const RESPONSE_BUFFER: usize = 64;
@@ -368,23 +372,6 @@ fn authorize(allowed: u32, peer: Option<u32>) -> Result<(), Status> {
 
 type Tx<T> = mpsc::Sender<Result<T, Status>>;
 
-/// A request body with a per-stream `request_id`.
-trait Numbered {
-    fn request_id(&self) -> u64;
-}
-
-impl Numbered for VerifyBlsRequestBody {
-    fn request_id(&self) -> u64 {
-        self.request_id
-    }
-}
-
-impl Numbered for VerifyKzgRequestBody {
-    fn request_id(&self) -> u64 {
-        self.request_id
-    }
-}
-
 impl Inner {
     /// Peer check and a stream slot, before anything is read from the stream.
     #[allow(clippy::result_large_err)] // the handler returns this Status as is
@@ -422,9 +409,14 @@ impl Inner {
         tracing::warn!(code = ?err.code(), detail = %err.detail, "verify stream failed");
     }
 
-    /// Reads and checks the peer's hello within the hello timeout, then sends ours. `false` if
-    /// the stream already failed.
-    async fn open<S, Req, Resp>(&self, inbound: &mut Inbound<S>, tx: &Tx<Resp>) -> bool
+    /// Reads and checks the peer's hello within the hello timeout, then sends ours with a fresh
+    /// server generation for this stream ([`ipc::hello::stream_hello`]). Returns that generation,
+    /// or `None` if the stream already failed.
+    async fn open<S, Req, Resp>(
+        &self,
+        inbound: &mut Inbound<S>,
+        tx: &Tx<Resp>,
+    ) -> Option<Generation>
     where
         S: Stream<Item = Result<Req, Status>> + Unpin,
         Req: InFrame,
@@ -438,14 +430,18 @@ impl Inner {
                     format!("no hello within {:?}", self.limits.hello_timeout),
                 ))
             });
-        match hello.and_then(|theirs| self.handshake.accept(&theirs)) {
-            Ok(_) => tx
-                .send(Ok(Resp::hello(self.handshake.ours().clone())))
+        let opened = hello
+            .and_then(|theirs| self.handshake.accept(&theirs))
+            .and_then(|_| stream_hello(self.handshake.ours()).map_err(Error::from));
+        match opened {
+            Ok((generation, ours)) => tx
+                .send(Ok(Resp::hello(ours)))
                 .await
-                .is_ok(),
+                .ok()
+                .map(|()| generation),
             Err(e) => {
                 self.fail(tx, e).await;
-                false
+                None
             }
         }
     }
@@ -632,13 +628,16 @@ impl Inner {
             request_id,
             status: status as i32,
             err,
+            fence: None,
         })
     }
 }
 
-/// Shared loop for the two verification RPCs: hello, then for each body a per-stream slot is
-/// taken before it is read, its `request_id` must exceed the previous one, it is cap-checked, and
-/// it is handed to `verify` on its own task, which frees the slot once the response is queued.
+/// Shared loop for the two verification RPCs: hello (with this stream's server generation), then
+/// for each body a per-stream slot is taken before it is read, its `request_id` must exceed the
+/// previous one, its `generation` must be the stream's, it is cap-checked, and it is handed to
+/// `verify` on its own task, which stamps the response with the request's fences
+/// ([`ipc::fence`]) and frees the slot once the response is queued.
 ///
 /// The stream counts as closed once the peer's side breaks, the server fails the stream, or the
 /// peer stops listening for responses; queued requests then resolve nothing and are dropped
@@ -653,9 +652,9 @@ fn spawn_verify_stream<Req, Resp, Cap, Run, Fut>(
 ) -> ReceiverStream<Result<Resp, Status>>
 where
     Req: InFrame + Send + 'static,
-    Req::Body: Numbered + Send + 'static,
+    Req::Body: FencedRequest + Send + 'static,
     Resp: OutFrame + Send + 'static,
-    Resp::Body: Send,
+    Resp::Body: FencedResult + Send,
     Cap: Fn(&Inner, &Req::Body) -> Result<(), CapError> + Send + 'static,
     Run: Fn(Arc<Inner>, Req::Body, Arc<AtomicBool>) -> Fut + Send + 'static,
     Fut: Future<Output = Option<Resp::Body>> + Send + 'static,
@@ -664,9 +663,9 @@ where
     tokio::spawn(async move {
         let _stream_slot = stream_slot;
         let mut inbound = Inbound::new(inbound);
-        if !inner.open(&mut inbound, &tx).await {
+        let Some(generation) = inner.open(&mut inbound, &tx).await else {
             return;
-        }
+        };
         let closed = Arc::new(AtomicBool::new(false));
         let watch = {
             let (tx, closed) = (tx.clone(), Arc::clone(&closed));
@@ -692,7 +691,7 @@ where
                     break;
                 }
             };
-            let id = body.request_id();
+            let (id, _) = body.wire_tag();
             if let Some(last) = last_id.filter(|last| id <= *last) {
                 let err = wire_error(
                     ErrorCode::ContractViolation,
@@ -703,15 +702,23 @@ where
                 break;
             }
             last_id = Some(id);
+            if let Err(stale) = check_request(&body, generation) {
+                close(&closed);
+                inner.fail(&tx, stale.into()).await;
+                break;
+            }
             if let Err(breach) = cap(&inner, &body) {
                 close(&closed);
                 inner.fail(&tx, breach.to_wire()).await;
                 break;
             }
+            // Hashed before the body moves into the job; every response is stamped with them.
+            let fences = body.result_fences();
             let tx = tx.clone();
             let job = verify(Arc::clone(&inner), body, Arc::clone(&closed));
             tokio::spawn(async move {
-                if let Some(reply) = job.await {
+                if let Some(mut reply) = job.await {
+                    reply.stamp(&fences);
                     let _ = tx.send(Ok(Resp::body(reply))).await;
                 }
                 drop(slot);
@@ -741,7 +748,7 @@ async fn run_feed<S: FeedInbound>(
     mut inbound: Inbound<S>,
     tx: Tx<PubkeyFeedResponse>,
 ) {
-    if !inner.open(&mut inbound, &tx).await {
+    if inner.open(&mut inbound, &tx).await.is_none() {
         return;
     }
     // One restore at a time; a stream that finds it done goes straight on.

@@ -112,9 +112,11 @@ async fn set_cap_is_checked_before_any_set_is_decoded() {
     );
 }
 
-/// A one-set BLS request padded (through an oversized `signing_root`) to `total` encoded bytes.
-fn bls_request_of_size(total: usize) -> VerifyBlsRequestBody {
+/// A one-set BLS request for a stream with server `generation`, padded (through an oversized
+/// `signing_root`) to `total` encoded bytes.
+fn bls_request_of_size(total: usize, generation: u64) -> VerifyBlsRequestBody {
     let mut body = bls_request(1, vec![garbage_set()]);
+    body.generation = generation;
     let mut pad = total as i64;
     loop {
         body.sets[0].signing_root = vec![0; pad as usize];
@@ -129,9 +131,9 @@ fn bls_request_of_size(total: usize) -> VerifyBlsRequestBody {
 #[tokio::test]
 async fn message_cap_refuses_4_mib_plus_one_before_decode() {
     let (mut h, c) = counted().await;
-    let at_cap = bls_request_of_size(MAX_MESSAGE_BYTES);
-    assert_eq!(bls_body(at_cap.clone()).encoded_len(), MAX_MESSAGE_BYTES);
     let mut s = bls_open(&mut h).await;
+    let at_cap = bls_request_of_size(MAX_MESSAGE_BYTES, s.generation);
+    assert_eq!(bls_body(at_cap.clone()).encoded_len(), MAX_MESSAGE_BYTES);
     s.send(bls_body(at_cap)).await;
     // Exactly 4 MiB is decoded; the 4 MiB root is not 32 bytes, so the set is a decode error.
     assert_eq!(
@@ -139,9 +141,9 @@ async fn message_cap_refuses_4_mib_plus_one_before_decode() {
         vec![Ok(VerifyStatus::DecodeError)]
     );
 
-    let over = bls_request_of_size(MAX_MESSAGE_BYTES + 1);
-    assert_eq!(bls_body(over.clone()).encoded_len(), MAX_MESSAGE_BYTES + 1);
     let mut s = bls_open(&mut h).await;
+    let over = bls_request_of_size(MAX_MESSAGE_BYTES + 1, s.generation);
+    assert_eq!(bls_body(over.clone()).encoded_len(), MAX_MESSAGE_BYTES + 1);
     s.send(bls_body(over)).await;
     let err = s.expect_failure().await;
     assert_eq!(err.code(), ErrorCode::ContractViolation, "{}", err.detail);
@@ -157,6 +159,7 @@ async fn message_cap_applies_to_kzg_requests() {
         request_id: 1,
         cells: vec![garbage_cell(0); n],
         deadline_unix_ms: far_deadline(),
+        generation: 0,
     };
     assert!(kzg_body(body.clone()).encoded_len() > MAX_MESSAGE_BYTES);
     let mut s = kzg_open(&mut h).await;
@@ -177,6 +180,7 @@ async fn column_cap_129_fails_the_stream_without_a_verdict() {
         request_id: 1,
         cells: (0..MAX_KZG_COLUMNS as u64).map(garbage_cell).collect(),
         deadline_unix_ms: far_deadline(),
+        generation: 0,
     }))
     .await;
     let r = kzg_reply(&mut s).await;
@@ -190,6 +194,7 @@ async fn column_cap_129_fails_the_stream_without_a_verdict() {
         request_id: 2,
         cells: (0..=MAX_KZG_COLUMNS as u64).map(garbage_cell).collect(),
         deadline_unix_ms: far_deadline(),
+        generation: 0,
     }))
     .await;
     let err = s.expect_failure().await;

@@ -101,8 +101,34 @@ message Hello {
   // an older package or an unversioned mode.
   uint32 min_api_version = 8;
   uint32 max_api_version = 9;
+  // Server generation of this stream: a random non-zero u64 the serving side draws from the OS RNG
+  // for every stream it answers, so it is new on every restart and every reconnect. The client copies
+  // it into every request it sends on the stream, and every result echoes it in its Fence. A client
+  // refuses a server hello with generation 0 as ERROR_CODE_CONTRACT_VIOLATION before it sends a fenced
+  // request. A client sends 0 in its own hello and a server does not read it. Like build, it is never
+  // compared during negotiation.
+  uint64 generation = 10;
 }
 // Receiver rule: compare the WHOLE handshake, not only current_fork_digest. Any difference in
 // api_version, genesis_validators_root, spec_pin, fork_schedule or blob_schedule fails the stream
 // with ERROR_CODE_VERSION_MISMATCH (logged + metric). Two nodes can share today's digest yet
-// disagree on a future fork or BPO epoch, which would split them at that boundary.
+// disagree on a future fork or BPO epoch, which would split them at that boundary. Only build and
+// generation are not compared.
+
+// Ties one result to the request item it answers (proto/README.md, request fencing). The client
+// accepts a result only if every field matches a request it still has outstanding on this stream,
+// and then forgets that request, so a second copy of the result fails. A missing fence, a reordered,
+// duplicated, stale-generation or substituted result, or one for a request never sent is
+// ERROR_CODE_CONTRACT_VIOLATION: the result is dropped, never ACCEPTed, and the client fails the stream.
+message Fence {
+  // The request_id of the request answered, echoed.
+  uint64 request_id = 1;
+  // The generation the request carried: the server's Hello.generation on this stream.
+  uint64 generation = 2;
+  // 0-based position of the answered item in the request. A result's own position in the response
+  // must equal it; a request with a single result uses 0.
+  uint32 index = 3;
+  // 32 bytes: SHA-256 of the answered item's request bytes (the item's deterministic protobuf
+  // encoding, see proto/README.md). Any other length is ERROR_CODE_CONTRACT_VIOLATION.
+  bytes item_hash = 4;
+}

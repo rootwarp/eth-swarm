@@ -73,7 +73,11 @@ async fn feed_dirty_snapshot(
         .await
         .unwrap()
         .into_inner();
-    let mut feed = Bidi { tx, rx };
+    let mut feed = Bidi {
+        tx,
+        rx,
+        generation: 0,
+    };
     feed.send(feed_hello(ours)).await;
     assert!(feed.next().await.unwrap().is_some(), "server hello");
     assert_eq!(feed_reply(&mut feed).await.high_water, 0);
@@ -165,7 +169,11 @@ async fn pinned_setup_binds_serves_then_reports_ready() {
         .await
         .unwrap()
         .into_inner();
-    let mut feed = Bidi { tx, rx };
+    let mut feed = Bidi {
+        tx,
+        rx,
+        generation: 0,
+    };
     feed.send(feed_hello(hello())).await;
     assert!(feed.next().await.unwrap().is_some(), "server hello");
     assert_eq!(feed_reply(&mut feed).await.high_water, 0);

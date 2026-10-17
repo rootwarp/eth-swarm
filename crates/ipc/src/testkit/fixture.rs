@@ -128,6 +128,8 @@ pub fn hello(min_api_version: u32, max_api_version: u32) -> Hello {
             .collect(),
         min_api_version,
         max_api_version,
+        // Drawn per stream by the serving side (`hello::stream_hello`).
+        generation: 0,
     }
 }
 

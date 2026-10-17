@@ -75,6 +75,7 @@ fn kzg_request(request_id: u64, deadline_unix_ms: u64) -> VerifyKzgRequestBody {
         request_id,
         cells: vec![zero_cell()],
         deadline_unix_ms,
+        generation: 0,
     }
 }
 
@@ -99,17 +100,24 @@ async fn server_deadline_miss_is_deadline_exceeded_and_ignore() {
     let mut s = bls_open(&mut h).await;
     let mut body = bls_request(5, vec![valid_set(0, 1), valid_set(1, 2)]);
     body.deadline_unix_ms = now_unix_ms() + 150;
+    let mut out = s.outstanding();
+    let (tag, body) = file_bls(&mut out, body);
     s.send(bls_body(body)).await;
     let r = bls_reply(&mut s).await;
     assert_eq!(outcomes(&r), vec![Ok(VerifyStatus::DeadlineExceeded); 2]);
     assert_no_verdict(&r);
-    assert_eq!(bls_verdicts(Ok(r), 5, 2), vec![Verdict::Ignore; 2]);
+    assert_eq!(
+        bls_verdicts(Ok(r), &mut out, tag, 2),
+        vec![Verdict::Ignore; 2]
+    );
 
     let mut k = kzg_open(&mut h).await;
-    k.send(kzg_body(kzg_request(6, now_unix_ms() + 150))).await;
+    let mut kout = k.outstanding();
+    let (ktag, kbody) = file_kzg(&mut kout, kzg_request(6, now_unix_ms() + 150));
+    k.send(kzg_body(kbody)).await;
     let r = kzg_reply(&mut k).await;
     assert_eq!(r.status, VerifyStatus::DeadlineExceeded as i32);
-    assert_eq!(kzg_verdict(Ok(r), 6), Verdict::Ignore);
+    assert_eq!(kzg_verdict(Ok(r), &mut kout, ktag), Verdict::Ignore);
 }
 
 #[tokio::test]
@@ -151,18 +159,24 @@ async fn verifier_failure_is_an_err_result_and_ignore() {
     })
     .await;
     let mut s = bls_open(&mut h).await;
-    s.send(bls_body(bls_request(
-        9,
-        vec![valid_set(0, 1), valid_set(1, 2)],
-    )))
-    .await;
+    let mut out = s.outstanding();
+    let (tag, body) = file_bls(
+        &mut out,
+        bls_request(9, vec![valid_set(0, 1), valid_set(1, 2)]),
+    );
+    s.send(bls_body(body)).await;
     let r = bls_reply(&mut s).await;
     assert_eq!(outcomes(&r), vec![Err(ErrorCode::ResourceUnavailable); 2]);
     assert_no_verdict(&r);
-    assert_eq!(bls_verdicts(Ok(r), 9, 2), vec![Verdict::Ignore; 2]);
+    assert_eq!(
+        bls_verdicts(Ok(r), &mut out, tag, 2),
+        vec![Verdict::Ignore; 2]
+    );
 
     let mut k = kzg_open(&mut h).await;
-    k.send(kzg_body(kzg_request(10, far_deadline()))).await;
+    let mut kout = k.outstanding();
+    let (ktag, kbody) = file_kzg(&mut kout, kzg_request(10, far_deadline()));
+    k.send(kzg_body(kbody)).await;
     let r = kzg_reply(&mut k).await;
     assert_ne!(r.status, VerifyStatus::Valid as i32);
     assert_ne!(r.status, VerifyStatus::Unspecified as i32);
@@ -170,7 +184,7 @@ async fn verifier_failure_is_an_err_result_and_ignore() {
         r.err.as_ref().unwrap().code(),
         ErrorCode::ResourceUnavailable
     );
-    assert_eq!(kzg_verdict(Ok(r), 10), Verdict::Ignore);
+    assert_eq!(kzg_verdict(Ok(r), &mut kout, ktag), Verdict::Ignore);
     // The stream survives a verifier failure.
     s.send(bls_body(bls_request(11, vec![]))).await;
     assert_eq!(bls_reply(&mut s).await.request_id, 11);
@@ -194,17 +208,18 @@ async fn no_free_verifier_is_overloaded_and_ignore() {
     })
     .await;
     let mut s = bls_open(&mut h).await;
-    s.send(bls_body(bls_request(1, vec![valid_set(0, 1)])))
-        .await;
+    let mut out = s.outstanding();
+    let (_, first) = file_bls(&mut out, bls_request(1, vec![valid_set(0, 1)]));
+    s.send(bls_body(first)).await;
     while gate.entered.load(Ordering::SeqCst) == 0 {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    s.send(bls_body(bls_request(2, vec![valid_set(1, 2)])))
-        .await;
+    let (tag, second) = file_bls(&mut out, bls_request(2, vec![valid_set(1, 2)]));
+    s.send(bls_body(second)).await;
     let r = bls_reply(&mut s).await;
     assert_eq!(r.request_id, 2);
     assert_eq!(outcomes(&r), vec![Ok(VerifyStatus::Overloaded)]);
-    assert_eq!(bls_verdicts(Ok(r), 2, 1), vec![Verdict::Ignore]);
+    assert_eq!(bls_verdicts(Ok(r), &mut out, tag, 1), vec![Verdict::Ignore]);
     release.send(()).unwrap();
     let r = bls_reply(&mut s).await;
     assert_eq!(
@@ -225,8 +240,9 @@ async fn caller_deadline_miss_on_a_live_stream_is_ignore() {
     .await;
     let mut s = bls_open(&mut h).await;
     // The server would answer VALID after 1 s; the caller gives up after 100 ms.
-    s.send(bls_body(bls_request(1, vec![valid_set(0, 1)])))
-        .await;
+    let mut out = s.outstanding();
+    let (tag, body) = file_bls(&mut out, bls_request(1, vec![valid_set(0, 1)]));
+    s.send(bls_body(body)).await;
     let deadline = Deadline::new(now_unix_ms() + 100, &SystemClock).unwrap();
     let next = async {
         match s.rx.message().await? {
@@ -238,12 +254,14 @@ async fn caller_deadline_miss_on_a_live_stream_is_ignore() {
         }
     };
     assert_eq!(
-        bls_verdicts_by(&deadline, &SystemClock, 1, 1, next).await,
+        bls_verdicts_by(&deadline, &SystemClock, &mut out, tag, 1, next).await,
         vec![Verdict::Ignore]
     );
 
     let mut k = kzg_open(&mut h).await;
-    k.send(kzg_body(kzg_request(2, far_deadline()))).await;
+    let mut kout = k.outstanding();
+    let (ktag, kbody) = file_kzg(&mut kout, kzg_request(2, far_deadline()));
+    k.send(kzg_body(kbody)).await;
     let deadline = Deadline::new(now_unix_ms() + 100, &SystemClock).unwrap();
     let next = async {
         k.rx.message().await.map(|m| {
@@ -254,7 +272,7 @@ async fn caller_deadline_miss_on_a_live_stream_is_ignore() {
         })
     };
     assert_eq!(
-        kzg_verdict_by(&deadline, &SystemClock, 2, next).await,
+        kzg_verdict_by(&deadline, &SystemClock, &mut kout, ktag, next).await,
         Verdict::Ignore
     );
 }
@@ -267,8 +285,9 @@ async fn failed_stream_maps_every_pending_set_to_ignore() {
     })
     .await;
     let mut s = bls_open(&mut h).await;
-    s.send(bls_body(bls_request(1, vec![valid_set(0, 1); 257])))
-        .await;
+    let mut out = s.outstanding();
+    let (tag, body) = file_bls(&mut out, bls_request(1, vec![valid_set(0, 1); 257]));
+    s.send(bls_body(body)).await;
     let status = loop {
         match s.next().await {
             Err(status) => break status,
@@ -277,7 +296,7 @@ async fn failed_stream_maps_every_pending_set_to_ignore() {
         }
     };
     assert_eq!(
-        bls_verdicts(Err(status), 1, 257),
+        bls_verdicts(Err(status), &mut out, tag, 257),
         vec![Verdict::Ignore; 257]
     );
 }
@@ -311,18 +330,20 @@ async fn wall_clock_jump_during_verification_is_deadline_exceeded_never_valid() 
     .await;
     // The monotonic deadline is 30 s away; only the wall clock passes the wire deadline.
     let mut s = bls_open(&mut h).await;
-    s.send(bls_body(bls_request(1, vec![valid_set(0, 1)])))
-        .await;
+    let mut out = s.outstanding();
+    let (tag, body) = file_bls(&mut out, bls_request(1, vec![valid_set(0, 1)]));
+    s.send(bls_body(body)).await;
     let r = bls_reply(&mut s).await;
     assert_eq!(outcomes(&r), vec![Ok(VerifyStatus::DeadlineExceeded)]);
-    assert_eq!(bls_verdicts(Ok(r), 1, 1), vec![Verdict::Ignore]);
+    assert_eq!(bls_verdicts(Ok(r), &mut out, tag, 1), vec![Verdict::Ignore]);
 
     let mut k = kzg_open(&mut h).await;
-    k.send(kzg_body(kzg_request(2, clock.now_unix_ms() + 30_000)))
-        .await;
+    let mut kout = k.outstanding();
+    let (ktag, kbody) = file_kzg(&mut kout, kzg_request(2, clock.now_unix_ms() + 30_000));
+    k.send(kzg_body(kbody)).await;
     let r = kzg_reply(&mut k).await;
     assert_eq!(r.status, VerifyStatus::DeadlineExceeded as i32);
-    assert_eq!(kzg_verdict(Ok(r), 2), Verdict::Ignore);
+    assert_eq!(kzg_verdict(Ok(r), &mut kout, ktag), Verdict::Ignore);
 }
 
 #[tokio::test]
