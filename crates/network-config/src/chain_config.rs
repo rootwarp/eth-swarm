@@ -270,6 +270,12 @@ impl ChainConfig {
         &self.fork_schedule
     }
 
+    /// `MAX_BLOBS_PER_BLOCK_ELECTRA`: the blob limit before the first `BLOB_SCHEDULE` entry, and
+    /// the starting value of `compute_max_data_column_sidecar_size` (`gloas/p2p-interface.md`).
+    pub fn max_blobs_per_block_electra(&self) -> u64 {
+        self.max_blobs_per_block_electra
+    }
+
     /// `BLOB_SCHEDULE`, sorted by epoch.
     pub fn blob_schedule(&self) -> &[BlobParameters] {
         &self.blob_schedule

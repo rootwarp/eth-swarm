@@ -121,6 +121,12 @@ eth_spec! {
     PtcWindowLength,
     /// `2 * SLOTS_PER_EPOCH` (Gloas `BuilderPendingPayments`).
     BuilderPendingPaymentsLength,
+    /// `BYTES_PER_FIELD_ELEMENT * FIELD_ELEMENTS_PER_CELL` (Fulu `Cell`).
+    BytesPerCell,
+    /// `NUMBER_OF_COLUMNS` (Fulu `DataColumnIndices`).
+    NumberOfColumns,
+    /// `KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH` (Fulu `KZGCommitmentsInclusionProof`).
+    KzgCommitmentsInclusionProofDepth,
 }
 
 /// `DEPOSIT_CONTRACT_TREE_DEPTH + 1` (`DepositProof`), the same in every preset.
@@ -184,6 +190,9 @@ impl_preset!(Minimal, "minimal", 1462 {
     MaxBuilderExitRequestsPerPayload = U16,
     PtcWindowLength = U24,
     BuilderPendingPaymentsLength = U16,
+    BytesPerCell = U2048,
+    NumberOfColumns = U128,
+    KzgCommitmentsInclusionProofDepth = U4,
 });
 
 impl_preset!(Mainnet, "mainnet", 16829 {
@@ -224,6 +233,9 @@ impl_preset!(Mainnet, "mainnet", 16829 {
     MaxBuilderExitRequestsPerPayload = U16,
     PtcWindowLength = U96,
     BuilderPendingPaymentsLength = U64,
+    BytesPerCell = U2048,
+    NumberOfColumns = U128,
+    KzgCommitmentsInclusionProofDepth = U4,
 });
 
 #[cfg(test)]
@@ -233,6 +245,10 @@ mod tests {
     /// Derived lengths must equal the products the spec defines them as.
     fn derived_lengths_hold<E: EthSpec>(min_seed_lookahead: u64, sync_subnets: u64) {
         let spe = E::SlotsPerEpoch::to_u64();
+        // BYTES_PER_FIELD_ELEMENT = 32, FIELD_ELEMENTS_PER_CELL = 64 (`presets/*/fulu.yaml`).
+        assert_eq!(E::BytesPerCell::to_u64(), 32 * 64);
+        // NUMBER_OF_COLUMNS = CELLS_PER_EXT_BLOB = 2 * FIELD_ELEMENTS_PER_BLOB // 64.
+        assert_eq!(E::NumberOfColumns::to_u64(), 2 * 4096 / 64);
         assert_eq!(
             E::MaxValidatorsPerSlot::to_u64(),
             E::MaxValidatorsPerCommittee::to_u64() * E::MaxCommitteesPerSlot::to_u64()

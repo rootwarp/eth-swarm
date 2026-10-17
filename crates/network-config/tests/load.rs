@@ -76,13 +76,16 @@ fn sepolia_schedule_matches_pinned_config() {
     assert_eq!(config.genesis_fork_version(), [0x90, 0, 0, 0x69]);
     assert_eq!(config.slot_duration_ms(), 12_000);
     assert_eq!(config.max_payload_size(), 10_485_760);
+    assert_eq!(config.max_blobs_per_block_electra(), 9);
     assert_eq!(config.get("DEPOSIT_CHAIN_ID"), Some("11155111"));
     assert_eq!(config.get("NO_SUCH_KEY"), None);
 }
 
 #[test]
 fn hoodi_schedule_matches_pinned_config() {
-    let schedule = *ChainConfig::load(Network::Hoodi).unwrap().fork_schedule();
+    let config = ChainConfig::load(Network::Hoodi).unwrap();
+    assert_eq!(config.max_blobs_per_block_electra(), 9);
+    let schedule = *config.fork_schedule();
     assert_eq!(schedule.fork_epoch(ForkName::Fulu), Some(50_688));
     assert_eq!(schedule.fork_epoch(ForkName::Gloas), Some(132_352));
     assert_eq!(schedule.fork_at(132_351), Some(ForkName::Fulu));

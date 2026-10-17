@@ -1,8 +1,12 @@
-//! Fulu containers (`specs/fulu/beacon-chain.md` and the Electra shapes Fulu inherits).
+//! Fulu containers (`specs/fulu/beacon-chain.md` and the Electra shapes Fulu inherits), and the
+//! Fulu data-column containers (`fulu/das-core.md`, `fulu/partial-columns/p2p-interface.md`;
+//! `MatrixEntry` and `DataColumnsByRootIdentifier` are shared with Gloas in [`crate::common`]).
 //!
 //! Codec only: decode, encode and `hash_tree_root`, no state transition. Fulu lists keep their
-//! spec `List[T, N]` limits, which the decoder enforces before allocating. The data-column
-//! containers (`fulu/das-core.md`, `fulu/p2p-interface.md`) are not defined here.
+//! spec `List[T, N]` limits, which the decoder enforces before allocating. The column lists are
+//! all `MAX_BLOB_COMMITMENTS_PER_BLOCK`-bounded (`DataColumn`, `BlobKZGCommitments`, Deneb
+//! `KZGProofs`, `CellsBitList`), and `KZGCommitmentsInclusionProof` is a
+//! `KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH` vector.
 
 pub use crate::common::*;
 
@@ -11,10 +15,69 @@ use crate::preset::{EthSpec, JustificationBitsLength};
 use crate::primitives::*;
 use milhouse::{List, Vector};
 use ssz::{BitList, BitVector};
+use ssz_types::typenum::U1;
 use ssz_types::{FixedVector, VariableList};
 
 /// `Transaction` (Bellatrix): an opaque EL transaction.
 pub type Transaction<E> = VariableList<u8, <E as EthSpec>::MaxBytesPerTransaction>;
+/// `DataColumn` (`fulu/das-core.md`): `List[Cell, MAX_BLOB_COMMITMENTS_PER_BLOCK]`.
+pub type DataColumn<E> = VariableList<Cell<E>, <E as EthSpec>::MaxBlobCommitmentsPerBlock>;
+/// `BlobKZGCommitments` (Deneb): `List[KZGCommitment, MAX_BLOB_COMMITMENTS_PER_BLOCK]`.
+pub type BlobKZGCommitments<E> =
+    VariableList<KZGCommitment, <E as EthSpec>::MaxBlobCommitmentsPerBlock>;
+/// `KZGProofs` (Deneb validator guide): `List[KZGProof, MAX_BLOB_COMMITMENTS_PER_BLOCK]`.
+pub type KZGProofs<E> = VariableList<KZGProof, <E as EthSpec>::MaxBlobCommitmentsPerBlock>;
+/// `KZGCommitmentsInclusionProof` (`fulu/das-core.md`):
+/// `Vector[Bytes32, KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH]`.
+pub type KZGCommitmentsInclusionProof<E> =
+    FixedVector<Bytes32, <E as EthSpec>::KzgCommitmentsInclusionProofDepth>;
+/// `CellsBitList` (`fulu/partial-columns/p2p-interface.md`):
+/// `BitList[MAX_BLOB_COMMITMENTS_PER_BLOCK]`.
+pub type CellsBitList<E> = BitList<<E as EthSpec>::MaxBlobCommitmentsPerBlock>;
+/// `OptionalPartialDataColumnHeader` (`fulu/partial-columns/p2p-interface.md`): a header that is
+/// present or not, as a list of length zero or one.
+pub type OptionalPartialDataColumnHeader<E> = VariableList<PartialDataColumnHeader<E>, U1>;
+
+container! {
+    /// `DataColumnSidecar` (`fulu/das-core.md`).
+    DataColumnSidecar<E> {
+        index: ColumnIndex,
+        column: DataColumn<E>,
+        kzg_commitments: BlobKZGCommitments<E>,
+        kzg_proofs: KZGProofs<E>,
+        signed_block_header: SignedBeaconBlockHeader,
+        kzg_commitments_inclusion_proof: KZGCommitmentsInclusionProof<E>,
+    }
+}
+
+container! {
+    /// `PartialDataColumnHeader` (`fulu/partial-columns/p2p-interface.md`).
+    PartialDataColumnHeader<E> {
+        kzg_commitments: BlobKZGCommitments<E>,
+        signed_block_header: SignedBeaconBlockHeader,
+        kzg_commitments_inclusion_proof: KZGCommitmentsInclusionProof<E>,
+    }
+}
+
+container! {
+    /// `PartialDataColumnSidecar` (`fulu/partial-columns/p2p-interface.md`).
+    PartialDataColumnSidecar<E> {
+        cells_present_bitmap: CellsBitList<E>,
+        partial_column: DataColumn<E>,
+        kzg_proofs: KZGProofs<E>,
+        header: OptionalPartialDataColumnHeader<E>,
+    }
+}
+
+container! {
+    /// `PartialDataColumnPartsMetadata` (`fulu/partial-columns/p2p-interface.md`).
+    PartialDataColumnPartsMetadata<E> { available: CellsBitList<E>, requests: CellsBitList<E> }
+}
+
+container! {
+    /// `PartialDataColumnGroupID` (`fulu/partial-columns/p2p-interface.md`).
+    PartialDataColumnGroupID { beacon_block_root: Root }
+}
 
 container! {
     /// `Attestation` (Electra).

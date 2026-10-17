@@ -12,6 +12,19 @@
 //! Where the type bound is larger than any message can be, the cap is the transport's:
 //! [`MAX_PAYLOAD_SIZE`] for p2p objects and [`MAX_SSZ_ENCODING`] for `BeaconState`.
 //!
+//! # Network-dependent caps
+//!
+//! The Gloas `DataColumnSidecar` cap is `compute_max_data_column_sidecar_size()`
+//! (`gloas/p2p-interface.md` L324-341), which depends on the network's blob schedule. Callers
+//! that decode column sidecars build a [`NetworkCaps`] once from the network's
+//! [`ChainConfig`] and pass it to [`max_size_for`], [`crate::codec::check_size_for`],
+//! [`crate::codec::decode_for`] or [`crate::forked::DataColumnSidecar::from_ssz_bytes_by_slot`].
+//! [`ObjectKind::DataColumnSidecar`] requires one ([`ObjectKind::needs_network_caps`]): the
+//! entry points without a [`NetworkCaps`] refuse it ([`max_size`] and [`type_max_len`] return
+//! `None`, the decoders [`crate::codec::DecodeError::NeedsNetworkCaps`]), so a transport caller
+//! cannot fall back to a looser cap by omission. Callers without a network (tests, tools) pass
+//! [`NetworkCaps::PRESET_BOUND`] explicitly. No other kind depends on the network.
+//!
 //! # Decode-memory budget
 //!
 //! The cap bounds the input, not the heap the decoded value needs. Gloas lists without a spec
@@ -65,8 +78,9 @@
 //! models, and fails if any figure exceeds its budget.
 
 use crate::preset::EthSpec;
-use crate::primitives::{Address, ForkName, B256, U256};
+use crate::primitives::{Address, ForkName, KZGProof, Root, B256, U256};
 use crate::{common, fulu, gloas};
+use network_config::{BlobParameters, ChainConfig, MAX_BLOB_COMMITMENTS_PER_BLOCK};
 use ssz::{BitList, BitVector, Encode, ProgressiveBitList};
 use ssz_types::{FixedVector, ProgressiveVariableList, VariableList};
 use std::fmt;
@@ -184,8 +198,6 @@ impl SszMaxLen for ProgressiveBitList {
 
 /// An object this node decodes from untrusted bytes: each p2p gossip or req/resp payload type,
 /// and `BeaconState` for checkpoint sync.
-///
-/// Data-column sidecars are not listed; they get their own kind with their size bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ObjectKind {
     /// `SignedBeaconBlock` (`beacon_block`, `BeaconBlocksByRange/Root`).
@@ -216,11 +228,14 @@ pub enum ObjectKind {
     PayloadAttestationMessage,
     /// `SignedProposerPreferences` (`proposer_preferences`, Gloas).
     SignedProposerPreferences,
+    /// `DataColumnSidecar` (`data_column_sidecar_{subnet_id}`, `DataColumnSidecarsBy*`). Its
+    /// Gloas cap depends on the blob schedule ([`NetworkCaps`]).
+    DataColumnSidecar,
 }
 
 impl ObjectKind {
     /// Every kind.
-    pub const ALL: [ObjectKind; 14] = [
+    pub const ALL: [ObjectKind; 15] = [
         ObjectKind::SignedBeaconBlock,
         ObjectKind::BeaconState,
         ObjectKind::SignedAggregateAndProof,
@@ -235,7 +250,14 @@ impl ObjectKind {
         ObjectKind::SignedExecutionPayloadEnvelope,
         ObjectKind::PayloadAttestationMessage,
         ObjectKind::SignedProposerPreferences,
+        ObjectKind::DataColumnSidecar,
     ];
+
+    /// Whether this kind's cap depends on the network, so that it decodes only with a
+    /// [`NetworkCaps`] (`DataColumnSidecar`, in both forks).
+    pub fn needs_network_caps(self) -> bool {
+        self == ObjectKind::DataColumnSidecar
+    }
 
     /// Whether `fork` defines this object.
     pub fn exists_in(self, fork: ForkName) -> bool {
@@ -263,8 +285,87 @@ impl fmt::Display for ObjectKind {
     }
 }
 
-/// The type bound of `kind` at `fork`, uncapped; `None` if `fork` does not define it.
+/// The network configuration that caps depend on: the largest blob count of the blob schedule,
+/// which bounds the Gloas `DataColumnSidecar`.
+///
+/// Build it once per network with [`NetworkCaps::from_config`] and pass it to every decode of
+/// a column sidecar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NetworkCaps {
+    max_blobs_per_block: u64,
+}
+
+impl NetworkCaps {
+    /// The bound without a network config: `MAX_BLOB_COMMITMENTS_PER_BLOCK` blobs, the most a
+    /// block can carry (`BlobKZGCommitments` in Fulu, the bid's commitments in Gloas), so no
+    /// valid sidecar of any network is larger. Every configured cap is at or below it, and the
+    /// Gloas sidecar cap here (8,585,272 bytes) is far above a configured one (44,072 on
+    /// Sepolia and Hoodi), so gossip and req/resp decoders use [`NetworkCaps::from_config`].
+    /// Only callers without a network (spec vectors, tools) pass this.
+    pub const PRESET_BOUND: NetworkCaps = NetworkCaps {
+        max_blobs_per_block: MAX_BLOB_COMMITMENTS_PER_BLOCK,
+    };
+
+    /// The caps of `config`'s network.
+    pub fn from_config(config: &ChainConfig) -> Self {
+        Self::from_blob_schedule(config.max_blobs_per_block_electra(), config.blob_schedule())
+    }
+
+    /// The largest of `MAX_BLOBS_PER_BLOCK_ELECTRA` and every `BLOB_SCHEDULE` entry's
+    /// `MAX_BLOBS_PER_BLOCK`, as `compute_max_data_column_sidecar_size()` takes it: the largest
+    /// value of the schedule, whether or not it is the current one.
+    pub fn from_blob_schedule(
+        max_blobs_per_block_electra: u64,
+        blob_schedule: &[BlobParameters],
+    ) -> Self {
+        let mut max_blobs = max_blobs_per_block_electra;
+        for entry in blob_schedule {
+            max_blobs = max_blobs.max(entry.max_blobs_per_block);
+        }
+        Self {
+            max_blobs_per_block: max_blobs,
+        }
+    }
+
+    /// The blob count the column-sidecar cap is computed for.
+    pub fn max_blobs_per_block(&self) -> u64 {
+        self.max_blobs_per_block
+    }
+}
+
+/// `compute_max_data_column_sidecar_size()` (`gloas/p2p-interface.md` L324-341): the length of a
+/// serialized Gloas `DataColumnSidecar` holding `max_blobs_per_block` cells and proofs.
+///
+/// The spec serializes such a sidecar; this adds the per-blob lengths to the serialized length
+/// of an empty one, which is the same number without allocating. `tests/columns.rs` checks it
+/// against the serialized sidecar.
+pub fn compute_max_data_column_sidecar_size<E: EthSpec>(network: &NetworkCaps) -> u64 {
+    let empty = gloas::DataColumnSidecar::<E> {
+        index: 0,
+        column: Default::default(),
+        kzg_proofs: Default::default(),
+        slot: 0,
+        beacon_block_root: Root::ZERO,
+    };
+    let per_blob = field_max_len::<common::Cell<E>>().saturating_add(field_max_len::<KZGProof>());
+    (empty.ssz_bytes_len() as u64)
+        .saturating_add(network.max_blobs_per_block.saturating_mul(per_blob))
+}
+
+/// The type bound of `kind` at `fork`, uncapped; `None` if `fork` does not define it or the
+/// kind [needs network caps](ObjectKind::needs_network_caps).
 pub fn type_max_len<E: EthSpec>(kind: ObjectKind, fork: ForkName) -> Option<u64> {
+    if kind.needs_network_caps() {
+        return None;
+    }
+    type_max_len_for::<E>(kind, fork, &NetworkCaps::PRESET_BOUND)
+}
+
+fn type_max_len_for<E: EthSpec>(
+    kind: ObjectKind,
+    fork: ForkName,
+    network: &NetworkCaps,
+) -> Option<u64> {
     use ObjectKind as K;
     if !kind.exists_in(fork) {
         return None;
@@ -303,13 +404,33 @@ pub fn type_max_len<E: EthSpec>(kind: ObjectKind, fork: ForkName) -> Option<u64>
         }
         K::PayloadAttestationMessage => gloas::PayloadAttestationMessage::ssz_max_len(),
         K::SignedProposerPreferences => gloas::SignedProposerPreferences::ssz_max_len(),
+        // Gloas: unbounded column lists, so the spec's size function is the bound.
+        K::DataColumnSidecar => match fork {
+            ForkName::Fulu => fulu::DataColumnSidecar::<E>::ssz_max_len(),
+            ForkName::Gloas => compute_max_data_column_sidecar_size::<E>(network),
+        },
     })
 }
 
 /// The byte cap for `kind` at `fork`: its type bound, or the transport limit where the type
-/// bound is larger. `None` if `fork` does not define `kind`.
+/// bound is larger. `None` if `fork` does not define `kind`, or if the kind
+/// [needs network caps](ObjectKind::needs_network_caps): use [`max_size_for`] for it.
 pub fn max_size<E: EthSpec>(kind: ObjectKind, fork: ForkName) -> Option<usize> {
-    let bound = type_max_len::<E>(kind, fork)?;
+    if kind.needs_network_caps() {
+        return None;
+    }
+    // The network does not enter any other kind's cap.
+    max_size_for::<E>(kind, fork, &NetworkCaps::PRESET_BOUND)
+}
+
+/// [`max_size`] on the network `network` was built from, for every kind. Only the Gloas
+/// `DataColumnSidecar` cap depends on it.
+pub fn max_size_for<E: EthSpec>(
+    kind: ObjectKind,
+    fork: ForkName,
+    network: &NetworkCaps,
+) -> Option<usize> {
+    let bound = type_max_len_for::<E>(kind, fork, network)?;
     let limit = kind.transport_limit();
     Some(usize::try_from(bound).map_or(limit, |b| b.min(limit)))
 }

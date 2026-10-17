@@ -1,5 +1,6 @@
-//! Gloas containers (`specs/gloas/beacon-chain.md`, plus `ProposerPreferences` from
-//! `gloas/p2p-interface.md`).
+//! Gloas containers (`specs/gloas/beacon-chain.md`, plus `ProposerPreferences` and
+//! `DataColumnSidecar` from `gloas/p2p-interface.md` and the partial-column containers from
+//! `gloas/partial-columns/p2p-interface.md`).
 //!
 //! EIP-7688 turns most lists into `ProgressiveList`s, which have no type-level limit. Every
 //! block-borne list here is a `ProgressiveVariableList<T, N>`. `N` is a bound the Gloas spec
@@ -34,6 +35,12 @@
 //!   fork choice requires them to equal `payload_expected_withdrawals`).
 //!   `transactions`, each `Transaction` and `block_access_list` are unbounded (`U0`): Gloas
 //!   asserts no count or length, so only the message cap limits them.
+//! - `DataColumn`, `KZGProofs` and `CellsBitList` (`DataColumnSidecar`, the partial-column
+//!   containers) are unbounded `ProgressiveList`s / `ProgressiveBitList`s (EIP-7688): Gloas
+//!   asserts only that their lengths match the bid's commitments, which is a validation rule,
+//!   not a type bound. The `DataColumnSidecar` byte cap is
+//!   `compute_max_data_column_sidecar_size()` over the configured blob schedule
+//!   (`gloas/p2p-interface.md` L324-341, [`crate::caps::NetworkCaps`]).
 
 pub use crate::common::*;
 
@@ -58,6 +65,12 @@ pub type Transaction = ProgressiveVariableList<u8, U0>;
 pub type BlockAccessList = ProgressiveVariableList<u8, U0>;
 /// `PayloadTimelinessCommittee`.
 pub type PayloadTimelinessCommittee<E> = FixedVector<ValidatorIndex, <E as EthSpec>::PtcSize>;
+/// `DataColumn` (EIP-7688 `ProgressiveList[Cell]`): no Gloas bound.
+pub type DataColumn<E> = ProgressiveVariableList<Cell<E>, U0>;
+/// `KZGProofs` (EIP-7688 `ProgressiveList[KZGProof]`): no Gloas bound.
+pub type KZGProofs = ProgressiveVariableList<KZGProof, U0>;
+/// `CellsBitList` (EIP-7688 `ProgressiveBitList`, `gloas/partial-columns/p2p-interface.md`).
+pub type CellsBitList = ProgressiveBitList;
 
 container! {
     /// `Attestation` (EIP-7688 progressive container).
@@ -302,6 +315,38 @@ container! {
 container! {
     /// `SignedProposerPreferences` (`gloas/p2p-interface.md`).
     SignedProposerPreferences { message: ProposerPreferences, signature: BLSSignature }
+}
+
+container! {
+    /// `DataColumnSidecar` (`gloas/p2p-interface.md`): the Fulu sidecar without
+    /// `kzg_commitments`, `signed_block_header` and `kzg_commitments_inclusion_proof`, and with
+    /// the block's `slot` and `beacon_block_root`.
+    DataColumnSidecar<E> {
+        index: ColumnIndex,
+        column: DataColumn<E>,
+        kzg_proofs: KZGProofs,
+        slot: Slot,
+        beacon_block_root: Root,
+    }
+}
+
+container! {
+    /// `PartialDataColumnSidecar` (`gloas/partial-columns/p2p-interface.md`): no `header`.
+    PartialDataColumnSidecar<E> {
+        cells_present_bitmap: CellsBitList,
+        partial_column: DataColumn<E>,
+        kzg_proofs: KZGProofs,
+    }
+}
+
+container! {
+    /// `PartialDataColumnPartsMetadata` (`gloas/partial-columns/p2p-interface.md`).
+    PartialDataColumnPartsMetadata { available: CellsBitList, requests: CellsBitList }
+}
+
+container! {
+    /// `PartialDataColumnGroupID` (`gloas/partial-columns/p2p-interface.md`): adds `slot`.
+    PartialDataColumnGroupID { beacon_block_root: Root, slot: Slot }
 }
 
 container! {

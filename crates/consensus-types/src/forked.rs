@@ -5,9 +5,14 @@
 //! [`ForkSchedule::fork_at`], and decodes with that fork's shape and cap. The fork is never taken
 //! from the current wall-clock epoch.
 //!
+//! A `DataColumnSidecar`'s slot sits at a different offset in each fork (Fulu: in
+//! `signed_block_header`; Gloas: its own `slot` field). Its first offset is the length of the
+//! fixed part, which differs between the two shapes, so it tells where to read the slot; the
+//! slot's fork then decides the shape it is decoded with.
+//!
 //! Encoding and `hash_tree_root` are those of the inner container.
 
-use crate::caps::ObjectKind;
+use crate::caps::{NetworkCaps, ObjectKind};
 use crate::codec::{decode_checked, DecodeError};
 use crate::preset::EthSpec;
 use crate::primitives::{ForkName, Slot};
@@ -41,16 +46,25 @@ macro_rules! forked {
                 }
             }
 
-            /// Decodes `bytes` with `fork`'s shape, after checking `fork`'s cap.
+            /// Decodes `bytes` with `fork`'s shape, after checking `fork`'s cap. A kind that
+            /// [needs network caps](ObjectKind::needs_network_caps) is refused with
+            /// [`DecodeError::NeedsNetworkCaps`].
             pub fn from_ssz_bytes_for_fork(
                 bytes: &[u8],
                 fork: ForkName,
             ) -> Result<Self, DecodeError> {
+                Self::decode_for_fork(bytes, fork, None)
+            }
+
+            pub(crate) fn decode_for_fork(
+                bytes: &[u8],
+                fork: ForkName,
+                network: Option<&NetworkCaps>,
+            ) -> Result<Self, DecodeError> {
+                let (kind, n) = (Self::KIND, network);
                 Ok(match fork {
-                    ForkName::Fulu => Self::Fulu(decode_checked::<E, _>(Self::KIND, fork, bytes)?),
-                    ForkName::Gloas => {
-                        Self::Gloas(decode_checked::<E, _>(Self::KIND, fork, bytes)?)
-                    }
+                    ForkName::Fulu => Self::Fulu(decode_checked::<E, _>(kind, fork, n, bytes)?),
+                    ForkName::Gloas => Self::Gloas(decode_checked::<E, _>(kind, fork, n, bytes)?),
                 })
             }
         }
@@ -77,24 +91,59 @@ forked!(
     AttesterSlashing,
     ObjectKind::AttesterSlashing
 );
+forked!(
+    /// `DataColumnSidecar` of any supported fork.
+    DataColumnSidecar,
+    ObjectKind::DataColumnSidecar
+);
 
 /// `SignedBeaconBlock`: `message` offset (4) and `signature` (96), then `BeaconBlock.slot`.
 const BLOCK_SLOT_OFFSET: usize = 4 + 96;
 /// `BeaconState`: `genesis_time` (8) and `genesis_validators_root` (32), then `slot`.
 const STATE_SLOT_OFFSET: usize = 8 + 32;
+/// `DataColumnSidecar`: `index` (8), then the `column` offset, the first offset of both shapes.
+const SIDECAR_FIRST_OFFSET_AT: usize = 8;
+/// Fulu `DataColumnSidecar` fixed part: `index` (8), three offsets (12), `signed_block_header`
+/// (208) and `kzg_commitments_inclusion_proof` (4 × 32).
+const FULU_SIDECAR_FIXED_LEN: usize = 8 + 3 * 4 + 208 + 4 * 32;
+/// Fulu `DataColumnSidecar`: `index` and three offsets, then `signed_block_header.message.slot`.
+const FULU_SIDECAR_SLOT_OFFSET: usize = 8 + 3 * 4;
+/// Gloas `DataColumnSidecar` fixed part: `index` (8), two offsets (8), `slot` (8) and
+/// `beacon_block_root` (32).
+const GLOAS_SIDECAR_FIXED_LEN: usize = 8 + 2 * 4 + 8 + 32;
+/// Gloas `DataColumnSidecar`: `index` and two offsets, then `slot`.
+const GLOAS_SIDECAR_SLOT_OFFSET: usize = 8 + 2 * 4;
 
-/// Reads the little-endian `Slot` at `at` without decoding anything else.
-fn peek_slot(bytes: &[u8], at: usize) -> Result<Slot, DecodeError> {
-    let end = at + 8;
+/// Reads the little-endian `N`-byte integer at `at` without decoding anything else.
+fn peek_le<const N: usize>(bytes: &[u8], at: usize) -> Result<[u8; N], DecodeError> {
+    let end = at + N;
     let raw = bytes
         .get(at..end)
         .ok_or(ssz::DecodeError::InvalidByteLength {
             len: bytes.len(),
             expected: end,
         })?;
-    let mut slot = [0u8; 8];
-    slot.copy_from_slice(raw);
-    Ok(Slot::from_le_bytes(slot))
+    let mut out = [0u8; N];
+    out.copy_from_slice(raw);
+    Ok(out)
+}
+
+/// Reads the little-endian `Slot` at `at` without decoding anything else.
+fn peek_slot(bytes: &[u8], at: usize) -> Result<Slot, DecodeError> {
+    peek_le::<8>(bytes, at).map(Slot::from_le_bytes)
+}
+
+/// Reads a `DataColumnSidecar`'s slot from whichever fork's shape its first offset names.
+fn peek_sidecar_slot(bytes: &[u8]) -> Result<Slot, DecodeError> {
+    let first = u32::from_le_bytes(peek_le::<4>(bytes, SIDECAR_FIRST_OFFSET_AT)?) as usize;
+    match first {
+        FULU_SIDECAR_FIXED_LEN => peek_slot(bytes, FULU_SIDECAR_SLOT_OFFSET),
+        GLOAS_SIDECAR_FIXED_LEN => peek_slot(bytes, GLOAS_SIDECAR_SLOT_OFFSET),
+        _ if first < GLOAS_SIDECAR_FIXED_LEN => {
+            Err(ssz::DecodeError::OffsetIntoFixedPortion(first).into())
+        }
+        _ => Err(ssz::DecodeError::OffsetSkipsVariableBytes(first).into()),
+    }
 }
 
 /// The fork for an object at `slot`, or [`DecodeError::PreFulu`].
@@ -142,5 +191,36 @@ impl<E: EthSpec> BeaconState<E> {
     ) -> Result<Self, DecodeError> {
         let slot = peek_slot(bytes, STATE_SLOT_OFFSET)?;
         Self::from_ssz_bytes_for_fork(bytes, fork_at_slot::<E>(schedule, slot)?)
+    }
+}
+
+impl<E: EthSpec> DataColumnSidecar<E> {
+    /// The slot of the sidecar's block: `signed_block_header.message.slot` (Fulu), `slot`
+    /// (Gloas).
+    pub fn slot(&self) -> Slot {
+        match self {
+            Self::Fulu(s) => s.signed_block_header.message.slot,
+            Self::Gloas(s) => s.slot,
+        }
+    }
+
+    /// Decodes with `fork`'s shape, after checking `fork`'s cap on `network`.
+    pub fn from_ssz_bytes_for_fork_with(
+        bytes: &[u8],
+        fork: ForkName,
+        network: &NetworkCaps,
+    ) -> Result<Self, DecodeError> {
+        Self::decode_for_fork(bytes, fork, Some(network))
+    }
+
+    /// Decodes with the fork of the sidecar's own slot, after checking that fork's cap on
+    /// `network`. Bytes of the other fork's shape fail to decode.
+    pub fn from_ssz_bytes_by_slot(
+        bytes: &[u8],
+        schedule: &ForkSchedule,
+        network: &NetworkCaps,
+    ) -> Result<Self, DecodeError> {
+        let slot = peek_sidecar_slot(bytes)?;
+        Self::decode_for_fork(bytes, fork_at_slot::<E>(schedule, slot)?, Some(network))
     }
 }

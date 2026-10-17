@@ -95,18 +95,22 @@ macro_rules! with_common {
                 SyncCommitteeContribution, AggregateAndProof, Attestation, AttesterSlashing,
                 BeaconBlock, BeaconBlockBody, BeaconState, ExecutionPayload, ExecutionRequests,
                 IndexedAttestation, NewPayloadRequest, SignedAggregateAndProof, SignedBeaconBlock,
-                $($g),*
+                DataColumnSidecar, DataColumnsByRootIdentifier, MatrixEntry,
+                PartialDataColumnSidecar, $($g),*
             ]);
     };
 }
 
-with_common!(fulu_table, fulu; plain: []; generic: [ExecutionPayloadHeader]);
+with_common!(fulu_table, fulu;
+plain: [PartialDataColumnGroupID];
+generic: [ExecutionPayloadHeader, PartialDataColumnHeader, PartialDataColumnPartsMetadata]);
 
 with_common!(gloas_table, gloas;
 plain: [
     Builder, BuilderDepositRequest, BuilderExitRequest, BuilderPendingPayment,
-    BuilderPendingWithdrawal, PayloadAttestationData, PayloadAttestationMessage,
-    ProposerPreferences, SignedProposerPreferences,
+    BuilderPendingWithdrawal, PartialDataColumnGroupID, PartialDataColumnPartsMetadata,
+    PayloadAttestationData, PayloadAttestationMessage, ProposerPreferences,
+    SignedProposerPreferences,
 ];
 generic: [
     ExecutionPayloadBid, ExecutionPayloadEnvelope, IndexedPayloadAttestation,
@@ -130,9 +134,21 @@ mod tests {
             for fork in ["fulu", "gloas"] {
                 assert!(supported(fork, preset, "BeaconState"));
                 assert!(supported(fork, preset, "Checkpoint"));
-                assert!(!supported(fork, preset, "DataColumnSidecar"));
                 assert!(!supported(fork, preset, "LightClientHeader"));
+                for column_type in [
+                    "DataColumnSidecar",
+                    "DataColumnsByRootIdentifier",
+                    "MatrixEntry",
+                    "PartialDataColumnGroupID",
+                    "PartialDataColumnPartsMetadata",
+                    "PartialDataColumnSidecar",
+                ] {
+                    assert!(supported(fork, preset, column_type), "{fork} {column_type}");
+                }
             }
+            // Gloas drops the header from the partial sidecar along with the type.
+            assert!(supported("fulu", preset, "PartialDataColumnHeader"));
+            assert!(!supported("gloas", preset, "PartialDataColumnHeader"));
             assert!(supported("gloas", preset, "ExecutionPayloadBid"));
             assert!(!supported("fulu", preset, "ExecutionPayloadBid"));
             assert!(supported("fulu", preset, "ExecutionPayloadHeader"));

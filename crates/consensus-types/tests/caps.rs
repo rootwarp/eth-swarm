@@ -3,9 +3,10 @@
 mod common;
 
 use consensus_types::caps::{
-    self, max_size, type_max_len, ObjectKind, MAX_PAYLOAD_SIZE, MAX_SSZ_ENCODING,
+    self, max_size, max_size_for, type_max_len, NetworkCaps, ObjectKind, MAX_PAYLOAD_SIZE,
+    MAX_SSZ_ENCODING,
 };
-use consensus_types::codec::{check_size, decode, DecodeError, Object};
+use consensus_types::codec::{check_size, check_size_for, decode, decode_for, DecodeError, Object};
 use consensus_types::forked::SignedBeaconBlock as SignedBeaconBlockOf;
 use consensus_types::{gloas, EthSpec, ForkName, Mainnet, Minimal};
 use ssz::Encode;
@@ -130,13 +131,56 @@ fn allocations_during<R>(f: impl FnOnce() -> R) -> (usize, R) {
     (used.allocations, r)
 }
 
-fn rejects_over_cap<E: EthSpec>() {
+/// The caps, size check and decoder of one network: the calls without a [`NetworkCaps`] when
+/// `network` is `None`, the `_for` calls with it otherwise.
+struct Caps<'a, E: EthSpec> {
+    network: Option<&'a NetworkCaps>,
+    _preset: std::marker::PhantomData<E>,
+}
+
+impl<E: EthSpec> Caps<'_, E> {
+    fn max_size(&self, kind: ObjectKind, fork: ForkName) -> Option<usize> {
+        match self.network {
+            None => max_size::<E>(kind, fork),
+            Some(n) => max_size_for::<E>(kind, fork, n),
+        }
+    }
+
+    fn check_size(&self, kind: ObjectKind, fork: ForkName, len: usize) -> Result<(), DecodeError> {
+        match self.network {
+            None => check_size::<E>(kind, fork, len),
+            Some(n) => check_size_for::<E>(kind, fork, n, len),
+        }
+    }
+
+    fn decode(&self, kind: ObjectKind, fork: ForkName, b: &[u8]) -> Result<Object<E>, DecodeError> {
+        match self.network {
+            None => decode::<E>(kind, fork, b),
+            Some(n) => decode_for::<E>(kind, fork, n, b),
+        }
+    }
+}
+
+fn rejects_over_cap<E: EthSpec>(network: Option<&NetworkCaps>) {
+    let caps = Caps::<E> {
+        network,
+        _preset: std::marker::PhantomData,
+    };
     for fork in ForkName::ALL {
         for kind in ObjectKind::ALL {
-            let Some(max) = max_size::<E>(kind, fork) else {
+            if network.is_none() && kind.needs_network_caps() {
+                // Refused without a cap: tests/columns.rs covers the typed error.
+                assert_eq!(caps.max_size(kind, fork), None);
+                assert_eq!(
+                    caps.decode(kind, fork, &[]).unwrap_err(),
+                    DecodeError::NeedsNetworkCaps { kind }
+                );
+                continue;
+            }
+            let Some(max) = caps.max_size(kind, fork) else {
                 assert!(!kind.exists_in(fork), "{kind} must have a cap at {fork}");
                 assert_eq!(
-                    decode::<E>(kind, fork, &[]).unwrap_err(),
+                    caps.decode(kind, fork, &[]).unwrap_err(),
                     DecodeError::NotInFork { kind, fork }
                 );
                 continue;
@@ -144,7 +188,7 @@ fn rejects_over_cap<E: EthSpec>() {
             if kind == ObjectKind::BeaconState {
                 // The 4 GiB cap is never allocated here: the length check alone decides.
                 assert_eq!(
-                    check_size::<E>(kind, fork, max + 1),
+                    caps.check_size(kind, fork, max + 1),
                     Err(DecodeError::TooLarge {
                         kind,
                         fork,
@@ -152,11 +196,11 @@ fn rejects_over_cap<E: EthSpec>() {
                         max
                     })
                 );
-                assert_eq!(check_size::<E>(kind, fork, max), Ok(()));
+                assert_eq!(caps.check_size(kind, fork, max), Ok(()));
                 continue;
             }
             let bytes = vec![0u8; max + 1];
-            let (allocations, over) = allocations_during(|| decode::<E>(kind, fork, &bytes));
+            let (allocations, over) = allocations_during(|| caps.decode(kind, fork, &bytes));
             assert_eq!(
                 over.unwrap_err(),
                 DecodeError::TooLarge {
@@ -172,7 +216,7 @@ fn rejects_over_cap<E: EthSpec>() {
                 "{kind} at {fork} allocated before rejecting"
             );
 
-            match decode::<E>(kind, fork, &bytes[..max]) {
+            match caps.decode(kind, fork, &bytes[..max]) {
                 Ok(object) => assert_eq!(object.kind(), kind),
                 Err(DecodeError::Ssz(_)) => {}
                 Err(other) => panic!("{kind} at {fork}: {max} bytes did not reach SSZ: {other}"),
@@ -205,8 +249,17 @@ fn states_within_cap_decode() {
 fn decode_rejects_over_cap() {
     // The counter itself must see allocations, or a zero below proves nothing.
     assert_eq!(allocations_during(|| drop(vec![1u8; 3])).0, 1);
-    rejects_over_cap::<Minimal>();
-    rejects_over_cap::<Mainnet>();
+    rejects_over_cap::<Minimal>(None);
+    rejects_over_cap::<Mainnet>(None);
+    rejects_over_cap::<Minimal>(Some(&NetworkCaps::PRESET_BOUND));
+    rejects_over_cap::<Mainnet>(Some(&NetworkCaps::PRESET_BOUND));
+    // The configured networks, whose `DataColumnSidecar` cap is their blob schedule's.
+    for network in network_config::Network::ALL {
+        let config = network_config::ChainConfig::load(network).unwrap();
+        let caps = NetworkCaps::from_config(&config);
+        rejects_over_cap::<Minimal>(Some(&caps));
+        rejects_over_cap::<Mainnet>(Some(&caps));
+    }
 }
 
 /// The type-specific SSZ bounds of `gloas/p2p-interface.md` and `presets/*/gloas.yaml`.

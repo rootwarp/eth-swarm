@@ -2,10 +2,11 @@
 //!
 //! - [`preset`]: [`EthSpec`] with the [`Minimal`] and [`Mainnet`] presets.
 //! - [`common`], [`fulu`], [`gloas`]: the containers, transcribed from consensus-specs
-//!   v1.7.0-beta.4. Fulu is codec-only (no state transition). The data-column containers are
-//!   defined elsewhere.
+//!   v1.7.0-beta.4, including the data-column containers. Fulu is codec-only (no state
+//!   transition).
 //! - [`caps`] and [`codec`]: every untrusted decode is bounded by a per-type byte cap derived
-//!   from the spec's `MAX_*` constants, checked before the SSZ decoder runs.
+//!   from the spec's `MAX_*` constants, checked before the SSZ decoder runs. The Gloas
+//!   `DataColumnSidecar` cap also depends on the network's blob schedule ([`caps::NetworkCaps`]).
 //! - [`forked`]: fork-dispatched enums; the fork comes from the object's slot.
 //! - [`signing`]: `compute_domain`, `compute_signing_root` and signature-set descriptions.
 

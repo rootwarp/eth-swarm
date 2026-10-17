@@ -39,3 +39,9 @@ pub type BLSPubkey = [u8; 48];
 pub type BLSSignature = [u8; 96];
 /// `KZGCommitment` (Deneb).
 pub type KZGCommitment = [u8; 48];
+/// `KZGProof` (Deneb).
+pub type KZGProof = [u8; 48];
+/// `ColumnIndex` (Fulu `das-core.md`).
+pub type ColumnIndex = u64;
+/// `RowIndex` (Fulu `das-core.md`).
+pub type RowIndex = u64;

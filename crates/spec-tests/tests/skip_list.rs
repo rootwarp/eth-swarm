@@ -117,24 +117,72 @@ fn state_transition_skips_point_at_their_milestone() {
     }
 }
 
-#[test]
-fn column_and_kzg_skips_point_at_their_milestone() {
-    let skips = committed();
-    for fork in ["fulu", "gloas"] {
-        for handler in [
-            "DataColumnSidecar",
-            "DataColumnsByRootIdentifier",
-            "MatrixEntry",
-            "PartialDataColumnGroupID",
-            "PartialDataColumnPartsMetadata",
-            "PartialDataColumnSidecar",
-        ] {
-            let k = consensus(fork, "minimal", "ssz_static", handler);
-            assert_eq!(issue_of(&skips, &k), "1.17", "{k}");
+/// The data-column `ssz_static` types, by the forks that define them: consensus-types defines
+/// them all, so none may be skipped again.
+const COLUMN_TYPES: [(&str, &[&str]); 7] = [
+    ("DataColumnSidecar", &["fulu", "gloas"]),
+    ("DataColumnsByRootIdentifier", &["fulu", "gloas"]),
+    ("MatrixEntry", &["fulu", "gloas"]),
+    ("PartialDataColumnGroupID", &["fulu", "gloas"]),
+    ("PartialDataColumnPartsMetadata", &["fulu", "gloas"]),
+    ("PartialDataColumnSidecar", &["fulu", "gloas"]),
+    ("PartialDataColumnHeader", &["fulu"]),
+];
+
+/// Each column type's case key that `skips` would skip in any case, as `fork/preset/handler`.
+fn skipped_column_types(skips: &SkipList) -> Vec<String> {
+    let mut skipped = Vec::new();
+    for (handler, forks) in COLUMN_TYPES {
+        for fork in forks {
+            for preset in ["minimal", "mainnet"] {
+                let k = consensus(fork, preset, "ssz_static", handler);
+                if let Some(e) = skips.skips_some_case_of(&k) {
+                    skipped.push(format!("{fork}/{preset}/{handler}: {}", e.reason));
+                }
+            }
         }
     }
-    let k = consensus("fulu", "mainnet", "ssz_static", "PartialDataColumnHeader");
-    assert_eq!(issue_of(&skips, &k), "1.17");
+    skipped
+}
+
+#[test]
+fn column_types_are_never_skipped() {
+    let skipped = skipped_column_types(&committed());
+    assert!(
+        skipped.is_empty(),
+        "testing/skip.toml skips column types: {skipped:?}"
+    );
+}
+
+/// A handler glob narrowed to one case still skips real column vectors, so the check must
+/// catch it.
+#[test]
+fn column_check_catches_a_handler_glob_narrowed_to_one_case() {
+    let skips = SkipList::parse(
+        r#"
+[[skip]]
+source  = "consensus-specs"
+fork    = "*"
+preset  = "*"
+runner  = "ssz_static"
+handler = "*DataColumn*"
+case    = "ssz_random/case_1"
+reason  = "narrow column skip"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+"#,
+    )
+    .unwrap();
+    let skipped = skipped_column_types(&skips);
+    // Every column type but MatrixEntry, in both presets: 5 * 2 forks + 1 Fulu-only, * 2.
+    assert_eq!(skipped.len(), 22, "{skipped:?}");
+    assert!(skipped.iter().all(|s| !s.contains("MatrixEntry")));
+}
+
+#[test]
+fn kzg_bls_and_light_client_skips_point_at_their_milestone() {
+    let skips = committed();
     let k = consensus("gloas", "mainnet", "ssz_static", "LightClientHeader");
     assert_eq!(issue_of(&skips, &k), "none");
 

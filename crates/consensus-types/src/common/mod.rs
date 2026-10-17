@@ -1,13 +1,19 @@
 //! Containers with the same shape in Fulu and Gloas.
 //!
-//! Transcribed from consensus-specs v1.7.0-beta.4 `specs/{phase0,altair,capella,electra}`; the
-//! fork modules re-export them next to their fork-specific containers.
+//! Transcribed from consensus-specs v1.7.0-beta.4 `specs/{phase0,altair,capella,electra}`, plus
+//! the data-column types Gloas leaves unchanged (`fulu/das-core.md`, `fulu/p2p-interface.md`);
+//! the fork modules re-export them next to their fork-specific containers.
 
 use crate::macros::container;
-use crate::preset::DepositProofLength;
+use crate::preset::{DepositProofLength, EthSpec};
 use crate::primitives::*;
 use ssz::BitVector;
-use ssz_types::FixedVector;
+use ssz_types::{FixedVector, VariableList};
+
+/// `Cell` (`fulu/das-core.md`): `ByteVector[BYTES_PER_FIELD_ELEMENT * FIELD_ELEMENTS_PER_CELL]`.
+pub type Cell<E> = FixedVector<u8, <E as EthSpec>::BytesPerCell>;
+/// `DataColumnIndices` (`fulu/p2p-interface.md`): `List[ColumnIndex, NUMBER_OF_COLUMNS]`.
+pub type DataColumnIndices<E> = VariableList<ColumnIndex, <E as EthSpec>::NumberOfColumns>;
 
 container! {
     /// `Checkpoint`.
@@ -270,4 +276,19 @@ container! {
 container! {
     /// `PendingConsolidation` (Electra).
     PendingConsolidation { source_index: ValidatorIndex, target_index: ValidatorIndex }
+}
+
+container! {
+    /// `MatrixEntry` (`fulu/das-core.md`).
+    MatrixEntry<E> {
+        cell: Cell<E>,
+        kzg_proof: KZGProof,
+        column_index: ColumnIndex,
+        row_index: RowIndex,
+    }
+}
+
+container! {
+    /// `DataColumnsByRootIdentifier` (`fulu/p2p-interface.md`).
+    DataColumnsByRootIdentifier<E> { block_root: Root, columns: DataColumnIndices<E> }
 }

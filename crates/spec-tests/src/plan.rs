@@ -231,14 +231,18 @@ impl Entry {
             && could_match(&r.runner, s.runners)
     }
 
-    fn matches_case(&self, k: &CaseKey) -> bool {
+    /// Whether the entry matches `k` in everything but the case name.
+    fn matches_handler(&self, k: &CaseKey) -> bool {
         let r = &self.raw;
         glob(&r.source, &k.source)
             && glob(&r.fork, &k.fork)
             && glob(&r.preset, &k.preset)
             && glob(&r.runner, &k.runner)
             && glob(&r.handler, &k.handler)
-            && r.case.as_deref().is_none_or(|c| glob(c, &k.case))
+    }
+
+    fn matches_case(&self, k: &CaseKey) -> bool {
+        self.matches_handler(k) && self.raw.case.as_deref().is_none_or(|c| glob(c, &k.case))
     }
 
     fn matches_file(&self, k: &CaseKey, name: &str) -> bool {
@@ -385,6 +389,16 @@ impl SkipList {
         self.entries
             .iter()
             .find(|e| e.raw.file.is_none() && e.matches_case(k))
+            .map(EntryInfo::from)
+    }
+
+    /// The first case entry (no `file`) that skips some case of `k`'s handler: it matches
+    /// `k`'s source, fork, preset, runner and handler, whatever its `case` glob. `k.case` is
+    /// ignored.
+    pub fn skips_some_case_of(&self, k: &CaseKey) -> Option<EntryInfo<'_>> {
+        self.entries
+            .iter()
+            .find(|e| e.raw.file.is_none() && e.matches_handler(k))
             .map(EntryInfo::from)
     }
 
@@ -546,6 +560,30 @@ mod tests {
                 Disposition::Run,
             ]
         );
+    }
+
+    #[test]
+    fn handler_skip_ignores_the_case_glob() {
+        let text = format!(
+            "{}{}",
+            entry("*DataColumn*", Some("ssz_random/case_1"), "2026-12-31"),
+            "[[skip]]\nsource = \"consensus-specs\"\nfork = \"*\"\npreset = \"*\"\n\
+             runner = \"ssz_static\"\nhandler = \"*\"\nfile = \"value.yaml\"\n\
+             reason = \"f\"\nowner = \"ian\"\nissue = \"none\"\nexpires = \"2026-12-31\"\n"
+        );
+        let skips = SkipList::parse(&text).unwrap();
+        // Another case of the handler is not skipped, but some case of it is.
+        let k = key("DataColumnSidecar", "ssz_random/case_0");
+        assert_eq!(skips.skipped_by(&k), None);
+        assert_eq!(
+            skips.skips_some_case_of(&k).map(|e| e.reason),
+            Some("r-*DataColumn*")
+        );
+        // A `file` entry skips no case: `Checkpoint` matches only the value.yaml excuse.
+        assert_eq!(skips.skips_some_case_of(&key("Checkpoint", "x")), None);
+        let mut other_fork = key("DataColumnSidecar", "x");
+        other_fork.fork = "fulu".into();
+        assert_eq!(skips.skips_some_case_of(&other_fork), None);
     }
 
     #[test]
