@@ -4,7 +4,11 @@
 //!   ephemeral secp256k1 key, or a 32-byte secp256k1 secret from a credential file that must be
 //!   a regular file (not a symlink) of mode 0600 owned by the effective UID. [`NodeKey`] prints
 //!   `<redacted>` in `Debug` and `Display`, and nothing here logs key material.
-//! - **Swarm** ([`Session::start`]): TCP + Noise + yamux, built from the node key. `listen_on`
+//! - **Config** ([`config`]): `/etc/ethswarm/m2a-session.toml` pins the one reference peer
+//!   (`/ip4|ip6/…/tcp/<port>/p2p/<peer id>`), the req/resp deadlines and the node key.
+//! - **Swarm** ([`Session::start`]): TCP + Noise XX + yamux, built from the node key and
+//!   negotiated with multistream-select `V1`, so an established connection proves the peer
+//!   accepted yamux ([`Session::disconnect`] then ends it, for `--dial-only`). `listen_on`
 //!   is never called, so the session has no listen address. The only dial is
 //!   `DialOpts::peer_id(pinned).addresses([addr])`, which Noise fails unless the remote proves
 //!   the pinned identity, and an allow list ([`allow_block_list`]) denies a connection to or from
@@ -17,6 +21,8 @@
 //! - **Req/resp**: one outbound-only [`request_response`] behaviour per protocol
 //!   ([`crate::rpc`]). Later work sends Status, MetaData, Ping and BlocksByRange on them.
 
+pub mod config;
+
 use crate::rpc::codec::{Deadlines, RpcCodec};
 use crate::rpc::outbound_behaviour;
 use consensus_types::EthSpec;
@@ -26,7 +32,7 @@ use libp2p::identity::{secp256k1, Keypair};
 use libp2p::multiaddr::Protocol as AddrProtocol;
 use libp2p::request_response;
 use libp2p::swarm::dial_opts::DialOpts;
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
+use libp2p::swarm::{DialError, NetworkBehaviour, SwarmEvent};
 use libp2p::{noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
 use p2p_wire::rpc::codec::ContextTable;
 use p2p_wire::rpc::protocols::Protocol;
@@ -210,21 +216,47 @@ pub enum PinnedPeerError {
     /// The multiaddr does not end in `/p2p/<peer id>`.
     #[error("the multiaddr must end in /p2p/<peer id>")]
     NoPeerId,
+    /// The part before `/p2p/` is not one dialable IP address and TCP port.
+    #[error(
+        "the address before /p2p/ must be /ip4/<addr>/tcp/<port> or /ip6/<addr>/tcp/<port> \
+         (a specified address, port 1..=65535; the session has no DNS, QUIC or relay transport)"
+    )]
+    Transport,
 }
 
 impl std::str::FromStr for PinnedPeer {
     type Err = PinnedPeerError;
 
-    /// Parses `<addr>/p2p/<peer id>`.
+    /// Parses `/ip4|ip6/<addr>/tcp/<port>/p2p/<peer id>`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut addr: Multiaddr = s
             .parse()
             .map_err(|e: libp2p::multiaddr::Error| PinnedPeerError::Multiaddr(e.to_string()))?;
-        match addr.pop() {
-            Some(AddrProtocol::P2p(peer_id)) if !addr.is_empty() => Ok(Self { peer_id, addr }),
-            _ => Err(PinnedPeerError::NoPeerId),
+        let peer_id = match addr.pop() {
+            Some(AddrProtocol::P2p(peer_id)) if !addr.is_empty() => peer_id,
+            _ => return Err(PinnedPeerError::NoPeerId),
+        };
+        if !is_tcp_dial_addr(&addr) {
+            return Err(PinnedPeerError::Transport);
         }
+        Ok(Self { peer_id, addr })
     }
+}
+
+/// `/ip4|ip6/<addr>/tcp/<port>` and nothing else: a specified address and a non-zero port. The
+/// swarm has only the TCP transport, so a DNS name would never dial.
+fn is_tcp_dial_addr(addr: &Multiaddr) -> bool {
+    let mut parts = addr.iter();
+    let ip = match parts.next() {
+        Some(AddrProtocol::Ip4(ip)) => std::net::IpAddr::V4(ip),
+        Some(AddrProtocol::Ip6(ip)) => std::net::IpAddr::V6(ip),
+        _ => return false,
+    };
+    let port = match parts.next() {
+        Some(AddrProtocol::Tcp(port)) => port,
+        _ => return false,
+    };
+    parts.next().is_none() && !ip.is_unspecified() && port != 0
 }
 
 /// The session's behaviours: the allow list, then one outbound behaviour per protocol.
@@ -268,12 +300,29 @@ pub enum Transport {
     Memory,
 }
 
+/// The identities of a [`SessionError::WrongPeerId`] (boxed: two peer IDs are large).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrongPeerId {
+    /// The pinned peer.
+    pub pinned: PeerId,
+    /// The identity the peer proved.
+    pub obtained: PeerId,
+}
+
 /// Why the session failed.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     /// The swarm could not be built.
     #[error("swarm: {0}")]
     Build(String),
+    /// The peer at the pinned address proved another identity: Noise completed, and the swarm
+    /// closed the connection because the peer ID is not the pinned one.
+    #[error(
+        "wrong peer ID: pinned {}, the peer at the address is {}",
+        .0.pinned,
+        .0.obtained
+    )]
+    WrongPeerId(Box<WrongPeerId>),
     /// The dial could not start or failed.
     #[error("dial {peer}: {reason}")]
     Dial {
@@ -306,40 +355,48 @@ fn build_swarm<E: EthSpec>(
     transport: Transport,
 ) -> Result<Swarm<SessionBehaviour<E>>, SessionError> {
     let build = |e: &dyn fmt::Display| SessionError::Build(e.to_string());
-    let config = |c: libp2p::swarm::Config| c.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT);
-    let builder = SwarmBuilder::with_existing_identity(key.0).with_tokio();
-    match transport {
-        Transport::Tcp => Ok(builder
-            .with_tcp(
-                tcp::Config::default(),
-                noise::Config::new,
-                yamux::Config::default,
-            )
-            .map_err(|e| build(&e))?
-            .with_behaviour(|_| behaviour)
-            .map_err(|e| build(&e))?
-            .with_swarm_config(config)
-            .build()),
+    let upgraded: fn(&Keypair) -> TransportResult = match transport {
+        Transport::Tcp => tcp_transport,
         #[cfg(test)]
-        Transport::Memory => Ok(builder
-            .with_other_transport(memory_transport)
-            .map_err(|e| build(&e))?
-            .with_behaviour(|_| behaviour)
-            .map_err(|e| build(&e))?
-            .with_swarm_config(config)
-            .build()),
-    }
+        Transport::Memory => memory_transport,
+    };
+    Ok(SwarmBuilder::with_existing_identity(key.0)
+        .with_tokio()
+        .with_other_transport(upgraded)
+        .map_err(|e| build(&e))?
+        .with_behaviour(|_| behaviour)
+        .map_err(|e| build(&e))?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT))
+        .build())
 }
 
-/// `MemoryTransport` + Noise + yamux: the test transport, upgraded like the TCP one.
-#[cfg(test)]
-type MemoryTransportResult = Result<
+/// An authenticated, multiplexed transport, or why it could not be built.
+type TransportResult = Result<
     libp2p::core::transport::Boxed<(PeerId, libp2p::core::muxing::StreamMuxerBox)>,
     Box<dyn std::error::Error + Send + Sync>,
 >;
 
+/// TCP + Noise XX + yamux: the production transport.
+///
+/// Negotiated with multistream-select `V1`, not the `V1Lazy` of `SwarmBuilder::with_tcp`: under
+/// `V1Lazy` a dialer offering one protocol assumes the listener accepted it, so a connection to
+/// a peer without yamux is reported established before it fails. Under `V1` the dialer waits
+/// for each confirmation, so an established connection proves the peer completed Noise (and
+/// with it the peer ID) and accepted yamux.
+fn tcp_transport(key: &Keypair) -> TransportResult {
+    use libp2p::core::upgrade::Version;
+    use libp2p::Transport as _;
+    Ok(tcp::tokio::Transport::new(tcp::Config::default())
+        .upgrade(Version::V1)
+        .authenticate(noise::Config::new(key)?)
+        .multiplex(yamux::Config::default())
+        .map(|(peer, muxer), _| (peer, libp2p::core::muxing::StreamMuxerBox::new(muxer)))
+        .boxed())
+}
+
+/// `MemoryTransport` + Noise + yamux: the test transport, upgraded like the TCP one.
 #[cfg(test)]
-fn memory_transport(key: &Keypair) -> MemoryTransportResult {
+fn memory_transport(key: &Keypair) -> TransportResult {
     use libp2p::core::{transport::MemoryTransport, upgrade::Version};
     use libp2p::Transport as _;
     Ok(MemoryTransport::default()
@@ -361,11 +418,12 @@ impl<E: EthSpec> Session<E> {
         key: NodeKey,
         pinned: PinnedPeer,
         contexts: Arc<ContextTable>,
+        deadlines: Deadlines,
         transport: Transport,
     ) -> Result<Self, SessionError> {
         let local = key.peer_id();
         tracing::info!(%local, pinned = %pinned.peer_id, addr = %pinned.addr, ?key, "m2a-session starting");
-        let behaviour = SessionBehaviour::new(pinned.peer_id, contexts, Deadlines::default());
+        let behaviour = SessionBehaviour::new(pinned.peer_id, contexts, deadlines);
         let mut swarm = build_swarm(key, behaviour, transport)?;
         let dial = DialOpts::peer_id(pinned.peer_id)
             .addresses(vec![pinned.addr.clone()])
@@ -387,6 +445,14 @@ impl<E: EthSpec> Session<E> {
         &self.pinned
     }
 
+    /// Connections the swarm has established and not yet closed.
+    pub fn open_connections(&self) -> u32 {
+        self.swarm
+            .network_info()
+            .connection_counters()
+            .num_established()
+    }
+
     /// Drives the swarm until the pinned peer is connected, or the dial failed.
     pub async fn connect(&mut self) -> Result<(), SessionError> {
         let pinned = self.pinned.peer_id;
@@ -406,10 +472,40 @@ impl<E: EthSpec> Session<E> {
                 }
                 SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                     tracing::warn!(peer = ?peer_id, %error, "dial failed");
-                    return Err(SessionError::Dial {
-                        peer: pinned,
-                        reason: error_chain(&error),
+                    return Err(match error {
+                        DialError::WrongPeerId { obtained, .. } => {
+                            SessionError::WrongPeerId(Box::new(WrongPeerId { pinned, obtained }))
+                        }
+                        error => SessionError::Dial {
+                            peer: pinned,
+                            reason: error_chain(&error),
+                        },
                     });
+                }
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    return Err(SessionError::Listening(address));
+                }
+                other => tracing::debug!(event = ?other, "swarm event"),
+            }
+        }
+    }
+
+    /// Closes every connection to the pinned peer and drives the swarm until the last one is
+    /// closed. A no-op when none is open.
+    pub async fn disconnect(&mut self) -> Result<(), SessionError> {
+        let pinned = self.pinned.peer_id;
+        if self.swarm.disconnect_peer_id(pinned).is_err() {
+            return Ok(());
+        }
+        loop {
+            match self.swarm.select_next_some().await {
+                SwarmEvent::ConnectionClosed {
+                    peer_id,
+                    num_established: 0,
+                    ..
+                } if peer_id == pinned => {
+                    tracing::info!(peer = %peer_id, "disconnected from the pinned peer");
+                    return Ok(());
                 }
                 SwarmEvent::NewListenAddr { address, .. } => {
                     return Err(SessionError::Listening(address));
@@ -573,6 +669,44 @@ mod tests {
             "nonsense".parse::<PinnedPeer>(),
             Err(PinnedPeerError::Multiaddr(_))
         ));
+        let v6: PinnedPeer = format!("/ip6/::1/tcp/9000/p2p/{id}").parse().unwrap();
+        assert_eq!(v6.addr, "/ip6/::1/tcp/9000".parse::<Multiaddr>().unwrap());
+    }
+
+    #[test]
+    fn pinned_peer_must_be_an_ip_and_a_tcp_port() {
+        let id = PeerId::random();
+        for addr in [
+            "/ip4/127.0.0.1/udp/9000/quic-v1",
+            "/ip4/127.0.0.1",
+            "/tcp/9000",
+            "/ip4/127.0.0.1/tcp/0",
+            "/ip4/0.0.0.0/tcp/9000",
+            "/ip6/::/tcp/9000",
+            "/ip4/127.0.0.1/tcp/9000/ws",
+            "/ip4/127.0.0.1/tcp/9000/tcp/9001",
+            "/dns4/localhost/tcp/9000",
+            "/dns/localhost/tcp/9000",
+            "/dnsaddr/example.org",
+            "/memory/1",
+        ] {
+            let addr = format!("{addr}/p2p/{id}");
+            assert_eq!(
+                addr.parse::<PinnedPeer>(),
+                Err(PinnedPeerError::Transport),
+                "{addr}"
+            );
+        }
+        let relayed = format!(
+            "/ip4/127.0.0.1/tcp/9000/p2p/{}/p2p-circuit/p2p/{id}",
+            PeerId::random()
+        );
+        assert_eq!(
+            relayed.parse::<PinnedPeer>(),
+            Err(PinnedPeerError::Transport)
+        );
+        let twice = format!("/ip4/127.0.0.1/tcp/9000/p2p/{}/p2p/{id}", PeerId::random());
+        assert_eq!(twice.parse::<PinnedPeer>(), Err(PinnedPeerError::Transport));
     }
 
     /// A peer on the memory transport that accepts connections and serves nothing.
@@ -605,6 +739,7 @@ mod tests {
             NodeKey::ephemeral(),
             pinned,
             Arc::new(ContextTable::new()),
+            Deadlines::default(),
             Transport::Memory,
         )
         .unwrap()
@@ -644,7 +779,7 @@ mod tests {
         });
         let err = session.connect().await.unwrap_err();
         assert!(
-            matches!(&err, SessionError::Dial { peer, reason } if *peer == pinned && reason.contains("Unexpected peer ID")),
+            matches!(&err, SessionError::WrongPeerId(ids) if ids.pinned == pinned && ids.obtained == other),
             "{err}"
         );
         assert!(!session.swarm().is_connected(&other));

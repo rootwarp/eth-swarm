@@ -11,6 +11,7 @@ mod tests {
     use cl_p2p::m2a_session::{
         preflight, KeySource, PinnedPeer, Preflight, Session, SessionError, Transport,
     };
+    use cl_p2p::rpc::codec::Deadlines;
     use consensus_types::Minimal;
     use futures::StreamExt;
     use libp2p::identity::{secp256k1, Keypair};
@@ -121,12 +122,13 @@ mod tests {
                 key,
                 pinned,
                 Arc::new(ContextTable::new()),
+                Deadlines::default(),
                 Transport::Tcp,
             )
             .unwrap();
             // Returns once the dial has failed: every session log line is written by then.
             let err = session.connect().await.unwrap_err();
-            assert!(matches!(err, SessionError::Dial { .. }), "{err}");
+            assert!(matches!(err, SessionError::WrongPeerId(_)), "{err}");
             drop(session);
         });
         drop(runtime);

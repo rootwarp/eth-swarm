@@ -24,6 +24,11 @@ rustix = { version = "1", features = ["fs", "process"] }
 thiserror = "2"
 # Wipes the node-key bytes read from a key file on every path.
 zeroize = "1"
+# The m2a-session config (/etc/ethswarm/m2a-session.toml); the same versions svc-runtime uses.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# Only `http::Uri`, to check reference_api_url; already in the tree through tonic.
+http = "1"
 
 [dev-dependencies]
 ipc = { path = "../ipc", features = ["testkit"] }
