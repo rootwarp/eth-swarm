@@ -16,9 +16,12 @@ import "ethswarm/common/v1/error.proto";
 // A signer whose index is at or past the cache high-water mark must carry its pubkey inline. Such an
 // index with no inline pubkey yields VERIFY_STATUS_UNKNOWN_INDEX -> IGNORE (or retry), never ACCEPT.
 // A lagging cache can therefore only be missing entries, never wrong. Inline keys are used for that
-// call only and never enter the cache.
-// INLINE CAP (Vera): inline signers grow by up to 16/epoch since finality (MAX_PENDING_DEPOSITS_PER_EPOCH).
-//   Max inline pubkeys per request = ___ ; behaviour when hit = ___ .
+// call only and never enter the cache. The cache is append-only: a gap, an overlap or a changed key for
+// a cached index is rejected (ERROR_CODE_CONTRACT_VIOLATION on PubkeyFeed), so a cached index is never re-keyed.
+// Restart: cl-verify may load an on-disk snapshot of the cache. Any header, length or root mismatch means
+// rebuild from index 0 via PubkeyFeed, never trust; the high_water it reports covers verified entries only.
+// TODO(vera): inline cap. Inline signers grow by up to 16/epoch since finality (MAX_PENDING_DEPOSITS_PER_EPOCH);
+//   set the max inline pubkeys per request and the behaviour when it is hit.
 //
 // Deadline semantics: every request carries deadline_unix_ms. cl-verify drops work it cannot finish by
 // then and answers VERIFY_STATUS_DEADLINE_EXCEEDED. A missing, timed-out, errored or UNSPECIFIED verdict
@@ -32,7 +35,7 @@ enum VerifyStatus {
   VERIFY_STATUS_UNSPECIFIED = 0;
   VERIFY_STATUS_VALID = 1;
   VERIFY_STATUS_INVALID = 2;
-  // Index above the cache high-water mark. Never ACCEPT.
+  // Index at or past the cache high-water mark with no inline pubkey. IGNORE (or retry), never ACCEPT.
   VERIFY_STATUS_UNKNOWN_INDEX = 3;
   VERIFY_STATUS_DEADLINE_EXCEEDED = 4;
   VERIFY_STATUS_OVERLOADED = 5;
@@ -49,7 +52,7 @@ message Signer {
 
 message BlsSet {
   // >1 signer means a fast-aggregate set (aggregates, sync contributions).
-  // SIZE CAP (Vera): max signers per set = ___ (MAX_VALIDATORS_PER_COMMITTEE = 2048 is the spec bound).
+  // TODO(vera): max signers per set (MAX_VALIDATORS_PER_COMMITTEE = 2048 is the spec bound).
   repeated Signer signers = 1;
   // 32 bytes.
   bytes signing_root = 2;
@@ -61,7 +64,7 @@ message VerifyBlsRequestBody {
   // Echoed in the response; per-stream, monotonic.
   uint64 request_id = 1;
   // At most 256 sets; more is ERROR_CODE_CONTRACT_VIOLATION.
-  // SIZE CAP (Vera): encoded message max = ___ bytes.
+  // TODO(vera): encoded message max in bytes.
   repeated BlsSet sets = 2;
   uint64 deadline_unix_ms = 3;
 }
@@ -107,7 +110,7 @@ message KzgCellProof {
 message VerifyKzgRequestBody {
   uint64 request_id = 1;
   // Cells of one or more column sidecars, checked with verify_cell_kzg_proof_batch (fulu/polynomial-commitments-sampling.md).
-  // SIZE CAP (Vera): max cells per request = ___ ; encoded message max = ___ bytes.
+  // TODO(vera): max cells per request and encoded message max in bytes.
   repeated KzgCellProof cells = 2;
   uint64 deadline_unix_ms = 3;
 }
@@ -143,7 +146,7 @@ message PubkeyFeedRequestBody {
   // Must equal len(pubkeys); a mismatch is ERROR_CODE_CONTRACT_VIOLATION.
   uint64 count = 2;
   // 48 bytes each, compressed G1; cl-verify decompresses and key_validates once on append.
-  // SIZE CAP (Vera): max count per frame = ___ .
+  // TODO(vera): max count per frame.
   repeated bytes pubkeys = 3;
 }
 

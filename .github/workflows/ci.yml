@@ -31,7 +31,7 @@ jobs:
       - run: bash scripts/check-workflows.sh
 
   proto:
-    name: buf lint, build, breaking vs develop
+    name: buf lint, build, breaking vs develop, baseline drift
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -49,6 +49,10 @@ jobs:
         run: buf lint && buf build
       - name: buf breaking against develop
         run: bash scripts/buf-breaking.sh refs/remotes/origin/develop
+      - name: Committed baseline matches a fresh buf build
+        run: bash scripts/check-proto-baseline.sh
+      - name: Baseline drift check tests
+        run: bash scripts/tests/check-proto-baseline-test.sh
 
   policy:
     name: cargo deny, ssz revs

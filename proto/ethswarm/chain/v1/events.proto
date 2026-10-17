@@ -8,6 +8,7 @@ import "ethswarm/common/v1/envelope.proto";
 // seq is strictly increasing and gap-free per chain process; cl-store applies HEAD/FINALIZED events in seq order.
 
 enum EventKind {
+  // Never valid on the wire: receiving it is ERROR_CODE_CONTRACT_VIOLATION.
   EVENT_KIND_UNSPECIFIED = 0;
   EVENT_KIND_HEAD = 1;
   EVENT_KIND_BLOCK = 2;

@@ -33,6 +33,7 @@ message Envelope {
 // Adding a value is additive; receivers on older builds treat an unknown non-zero value => IGNORE.
 // 0 (UNSPECIFIED) is never valid on the wire.
 enum PayloadType {
+  // Never valid on the wire: receiving it is ERROR_CODE_CONTRACT_VIOLATION.
   PAYLOAD_TYPE_UNSPECIFIED = 0;
   PAYLOAD_TYPE_SIGNED_BEACON_BLOCK = 1;
   PAYLOAD_TYPE_BEACON_STATE = 2;
@@ -96,6 +97,8 @@ message Hello {
   // The link uses the highest common version, min(max_a, max_b). It fails with ERROR_CODE_VERSION_MISMATCH
   // if that is below max(min_a, min_b) or below the receiver's configured floor. When N-1 support is
   // dropped the floor rises, so a peer cannot force a downgrade to an older version.
+  // No fallback: a failed negotiation closes the stream. Neither side retries with a lower version,
+  // an older package or an unversioned mode.
   uint32 min_api_version = 8;
   uint32 max_api_version = 9;
 }

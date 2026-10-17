@@ -5,6 +5,7 @@ package ethswarm.common.v1;
 // Gossipsub validation result. Timeout or overload => VERDICT_IGNORE, never VERDICT_ACCEPT.
 // VERDICT_UNSPECIFIED (0) is a contract error (ERROR_CODE_CONTRACT_VIOLATION); it is never treated as ACCEPT.
 enum Verdict {
+  // Never valid on the wire: receiving it is ERROR_CODE_CONTRACT_VIOLATION.
   VERDICT_UNSPECIFIED = 0;
   VERDICT_ACCEPT = 1;
   VERDICT_REJECT = 2;

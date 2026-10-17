@@ -3,6 +3,7 @@ syntax = "proto3";
 package ethswarm.common.v1;
 
 enum ErrorCode {
+  // Never valid on the wire: receiving it is ERROR_CODE_CONTRACT_VIOLATION.
   ERROR_CODE_UNSPECIFIED = 0;
   // Digest not in the ForkSchedule, or does not match the fork of the object's slot. Contract error: drop and log.
   ERROR_CODE_FORK_DIGEST_MISMATCH = 1;

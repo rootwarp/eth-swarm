@@ -9,6 +9,7 @@ import "ethswarm/common/v1/verdict.proto";
 // Served by cl-chain, called by cl-p2p.
 // Topic list per specs/fulu/p2p-interface.md and specs/gloas/p2p-interface.md (v1.7.0-beta.4).
 enum Topic {
+  // Never valid on the wire: receiving it is ERROR_CODE_CONTRACT_VIOLATION.
   TOPIC_UNSPECIFIED = 0;
   TOPIC_BEACON_BLOCK = 1;
   TOPIC_BEACON_AGGREGATE_AND_PROOF = 2;

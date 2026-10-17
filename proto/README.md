@@ -20,7 +20,7 @@ These are the service-to-service contracts for the ETH Swarm beacon node. They a
    - `PAYLOAD_TYPE_UNSPECIFIED` (0) is a **contract error**. The receiver logs it, increments the contract-violation metric, and fails the call or stream with `ERROR_CODE_CONTRACT_VIOLATION`.
    - An unknown **non-zero** value from outside is IGNOREd: drop it, never decode it, never REJECT.
    - The SSZ schema is selected by (`payload_type`, fork of `slot`). New values are additive.
-   - **The zero rule applies to every enum, with no exceptions** in these packages (`Verdict`, `ForkName`, `ErrorCode`, `Topic`, `DutyKind`, `ProduceKind`, `EventKind`, `SyncState`, `EngineMethodVersion`, `PayloadEncoding`, `PayloadStatusKind`, `EngineErrorKind`). An `*_UNSPECIFIED` value on the wire means `ERROR_CODE_CONTRACT_VIOLATION`. The unknown non-zero rule (IGNORE) applies to every enum as well.
+   - **The zero rule applies to every enum, with no exceptions** in these packages (`Verdict`, `ForkName`, `ErrorCode`, `Topic`, `DutyKind`, `ProduceKind`, `EventKind`, `SyncState`, `EngineMethodVersion`, `PayloadEncoding`, `PayloadStatusKind`, `EngineErrorKind`, `VerifyStatus`). An `*_UNSPECIFIED` value on the wire means `ERROR_CODE_CONTRACT_VIOLATION`. The unknown non-zero rule (IGNORE) applies to every enum as well.
 4. **Timeout or overload means IGNORE, never ACCEPT.** This applies to gossip verdicts, load shedding, and a core that isn't available. REJECT is only for a proven spec violation.
 5. **Every `bytes` field documents its maximum size in a comment.** Use spec limits where they exist (`MAX_PAYLOAD_SIZE`, `MAX_REQUEST_*`, fixed-size roots and digests). Otherwise mark it `TODO(vera)`.
 6. **Removed fields go into `reserved`** (both the number and the name).
@@ -29,9 +29,9 @@ These are the service-to-service contracts for the ETH Swarm beacon node. They a
 
 ## Compatibility (hard rule): N and N-1
 - **Additive only.** Never change a field's number, type, name or oneof membership, and never remove an RPC. A removed field goes into `reserved` (number and name). Field numbers are never reused.
-- **Version range in `Hello`.** Each side advertises `min_api_version` and `max_api_version`, and the link uses the **highest common version**, min(max_a, max_b). The link fails with `ERROR_CODE_VERSION_MISMATCH` if there is no common version.
+- **Version range in `Hello`.** Each side advertises `min_api_version` and `max_api_version`, and the link uses the **highest common version**, min(max_a, max_b). The link fails with `ERROR_CODE_VERSION_MISMATCH` if there is no common version. There is **no fallback**: neither side retries with a lower version, an older package or an unversioned mode.
 - **Floor.** Each service also enforces a **configured floor**, and a link below it fails. Every build accepts N and N-1. When we drop N-1, the floor rises to N, which prevents downgrades.
-- **CI gate.** `scripts/buf-breaking.sh refs/remotes/origin/develop` (FILE rules) must pass on every PR. Without an argument the script checks against `refs/heads/develop` (else `refs/remotes/origin/develop`), and `--baseline` checks against the frozen `proto/.baseline/v1.binpb`. Pass fully qualified refs: a short `origin/develop` resolves `refs/tags/origin/develop` first, so a pushed tag could swap the baseline.
+- **CI gate.** `scripts/buf-breaking.sh refs/remotes/origin/develop` (FILE rules) must pass on every PR. Without an argument the script checks against `refs/heads/develop` (else `refs/remotes/origin/develop`), and `--baseline` checks against the frozen `proto/.baseline/v1.binpb`. Short names are refused; pass `refs/...`.
 - **Pre-v1 contract.** The contract is not frozen until v1 is tagged. Re-baselines are allowed before then, and each one gets its own commit that touches only the baseline and one README line.
 - **After v1,** any re-baseline needs Ezra's sign-off.
 - **How to re-baseline.** Run `buf build -o .baseline/v1.binpb` from `proto/`. Commit the result on its own, with one line in the re-baseline log below.
@@ -50,6 +50,7 @@ These are the service-to-service contracts for the ETH Swarm beacon node. They a
 
 ## Tooling
 `buf.yaml` sets lint to `STANDARD` and breaking checks to `FILE`. Run `buf lint && buf build` from this directory.
+`scripts/check-proto-baseline.sh` fails if the committed `.baseline/v1.binpb` differs from a fresh `buf build -o` of the current sources (comments included), so the committed baseline stays in sync with the sources. It requires the buf version the baseline was built with (pinned in the script) and runs offline; its tests are `bash scripts/tests/check-proto-baseline-test.sh`. It does not decide what `buf breaking` compares against: `scripts/buf-breaking.sh` compares against the given `refs/...` ref (default `refs/heads/develop`, else `refs/remotes/origin/develop`), and against `.baseline/v1.binpb` only with `--baseline`.
 
 ## SSZ specification citation (pinned)
 - consensus-specs v1.7.0-beta.4 does not contain the SSZ spec. `ssz/` was removed in ethereum/consensus-specs#5523 (commit `498449f`, 2026-08-12), and the spec moved to **ethereum/ssz-specs**. The tag's `README.md` and `specs/phase0/beacon-chain.md` link to that repo without a version.

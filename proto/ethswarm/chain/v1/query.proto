@@ -23,6 +23,7 @@ message GetForkChoiceResponse {
 }
 
 enum DutyKind {
+  // Never valid on the wire: receiving it is ERROR_CODE_CONTRACT_VIOLATION.
   DUTY_KIND_UNSPECIFIED = 0;
   DUTY_KIND_ATTESTER = 1;
   DUTY_KIND_PROPOSER = 2;
@@ -44,6 +45,7 @@ message GetDutiesResponse {
 }
 
 enum ProduceKind {
+  // Never valid on the wire: receiving it is ERROR_CODE_CONTRACT_VIOLATION.
   PRODUCE_KIND_UNSPECIFIED = 0;
   PRODUCE_KIND_BLOCK = 1;
   PRODUCE_KIND_ATTESTATION_DATA = 2;
@@ -113,8 +115,9 @@ message GetStateSummaryRequest {
 
 message GetStateSummaryResponse {
   uint64 slot = 1;
-  // 32 bytes each.
+  // 32 bytes (Root).
   bytes state_root = 2;
+  // 32 bytes (Root).
   bytes block_root = 3;
   ethswarm.common.v1.Checkpoint justified = 4;
   ethswarm.common.v1.Checkpoint finalized = 5;

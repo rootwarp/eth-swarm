@@ -3,6 +3,7 @@ syntax = "proto3";
 package ethswarm.common.v1;
 
 enum ForkName {
+  // Never valid on the wire: receiving it is ERROR_CODE_CONTRACT_VIOLATION.
   FORK_NAME_UNSPECIFIED = 0;
   FORK_NAME_FULU = 1;
   FORK_NAME_GLOAS = 2;

@@ -64,6 +64,7 @@ message BlocksByRangeResponseBody {
 
 // BeaconBlocksByRoot v2. Each root 32 bytes; <= MAX_REQUEST_BLOCKS_DENEB = 128 roots.
 message BlocksByRootRequest {
+  // 32 bytes each (Root); at most MAX_REQUEST_BLOCKS_DENEB = 128 entries.
   repeated bytes roots = 1;
   // Required: the client's handshake. This server-streaming request is the client's only frame,
   // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
@@ -157,6 +158,7 @@ message PayloadEnvelopesByRangeResponseBody {
 
 // ExecutionPayloadEnvelopesByRoot v1 (Gloas). Each root 32 bytes; <= MAX_REQUEST_PAYLOADS = 128 roots.
 message PayloadEnvelopesByRootRequest {
+  // 32 bytes each (Root); at most MAX_REQUEST_PAYLOADS = 128 entries.
   repeated bytes roots = 1;
   // Required: the client's handshake. This server-streaming request is the client's only frame,
   // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.

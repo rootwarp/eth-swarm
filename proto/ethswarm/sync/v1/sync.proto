@@ -5,6 +5,7 @@ package ethswarm.sync.v1;
 // Served by cl-sync; called by cl-api (node/syncing) and operators.
 
 enum SyncState {
+  // Never valid on the wire: receiving it is ERROR_CODE_CONTRACT_VIOLATION.
   SYNC_STATE_UNSPECIFIED = 0;
   SYNC_STATE_CHECKPOINT_FETCH = 1;
   SYNC_STATE_RANGE = 2;

@@ -19,6 +19,7 @@ package ethswarm.engine.v1;
 // (bogota.md newPayloadV6/forkchoiceUpdatedV5 are a later fork and out of scope for v1.)
 
 enum EngineMethodVersion {
+  // Never valid on the wire: receiving it is ERROR_CODE_CONTRACT_VIOLATION.
   ENGINE_METHOD_VERSION_UNSPECIFIED = 0;
   ENGINE_METHOD_VERSION_FULU_OSAKA = 1;
   ENGINE_METHOD_VERSION_GLOAS_AMSTERDAM = 2;
@@ -27,6 +28,7 @@ enum EngineMethodVersion {
 // Encoding of `data` bytes fields. JSON is the Engine API JSON-RPC param/result object as specified;
 // SSZ follows the Engine API v2 SSZ sketches (refactor-ssz.md, draft) and is reserved for later.
 enum PayloadEncoding {
+  // Never valid on the wire: receiving it is ERROR_CODE_CONTRACT_VIOLATION.
   PAYLOAD_ENCODING_UNSPECIFIED = 0;
   PAYLOAD_ENCODING_JSON = 1;
   PAYLOAD_ENCODING_SSZ = 2;
@@ -40,6 +42,7 @@ message VersionedData {
 }
 
 enum PayloadStatusKind {
+  // Never valid on the wire: receiving it is ERROR_CODE_CONTRACT_VIOLATION.
   PAYLOAD_STATUS_KIND_UNSPECIFIED = 0;
   PAYLOAD_STATUS_KIND_VALID = 1;
   PAYLOAD_STATUS_KIND_INVALID = 2;
@@ -57,6 +60,7 @@ message PayloadStatus {
 }
 
 enum EngineErrorKind {
+  // Never valid on the wire: receiving it is ERROR_CODE_CONTRACT_VIOLATION.
   ENGINE_ERROR_KIND_UNSPECIFIED = 0;
   ENGINE_ERROR_KIND_EL_UNREACHABLE = 1;
   ENGINE_ERROR_KIND_TIMEOUT = 2;
@@ -94,9 +98,11 @@ message NewPayloadResponse {
 
 message ForkchoiceUpdatedRequest {
   uint64 seq = 1;
-  // 32 bytes each (ForkchoiceStateV1).
+  // 32 bytes (ForkchoiceStateV1.headBlockHash).
   bytes head_block_hash = 2;
+  // 32 bytes (ForkchoiceStateV1.safeBlockHash).
   bytes safe_block_hash = 3;
+  // 32 bytes (ForkchoiceStateV1.finalizedBlockHash).
   bytes finalized_block_hash = 4;
   // PayloadAttributes per version (V3 for Fulu, V4 for Gloas); empty = no build. Max 64 KiB (65536 bytes). PayloadAttributesV3/V4 are fixed fields plus withdrawals (MAX_WITHDRAWALS_PER_PAYLOAD = 16, capella/beacon-chain.md), well under 4 KiB in JSON; 64 KiB is headroom for later versions.
   VersionedData payload_attributes = 5;
