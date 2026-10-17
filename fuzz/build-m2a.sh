@@ -5,7 +5,9 @@
 #
 # cargo-fuzz has no --locked, so the lockfile is enforced around it: `cargo metadata --locked`
 # fails before the build if fuzz/Cargo.lock would change, and the build fails if the lockfile's
-# sha256 is not the same afterwards.
+# sha256 is not the same afterwards. Before building, scripts/check-fuzz-lock.sh must pass,
+# offline (m2a_lock_preflight): fuzz/Cargo.lock resolves every shared crate as the root
+# Cargo.lock does, so the targets link what the session binary links. Exit 2 if not.
 #
 # Usage: fuzz/build-m2a.sh [TARGET...]   (default: all four)
 # Refuses (exit 2) an environment or cargo config that changes the build (m2a_require_clean_env).
@@ -37,6 +39,7 @@ if ! m2a_cargo metadata --locked --format-version 1 >/dev/null; then
   echo "ERROR: fuzz/Cargo.lock does not match fuzz/Cargo.toml (cargo metadata --locked failed)"
   exit 1
 fi
+m2a_lock_preflight
 if (($# == 0)); then
   m2a_cargo fuzz build "${M2A_BUILD_FLAGS[@]}"
 else

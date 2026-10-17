@@ -9,6 +9,8 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 passed=0 failed=0
+ok() { passed=$((passed + 1)); echo "ok   - $1"; }
+bad() { failed=$((failed + 1)); echo "FAIL - $1"; }
 # check <expect: pass|fail> <description> <want in output or ""> <command...>
 check() {
   local expect=$1 desc=$2 want=$3 rc=0 out ok=0
@@ -217,6 +219,80 @@ for flag in assume-unchanged skip-worktree; do
   g update-index "--no-$flag" fuzz/Cargo.lock
 done
 check pass "clean again" "" bash "$checker" "$ok"
+
+# git runs scrubbed (m2a_git): no inherited GIT_* variable, no global or system config or
+# attributes. A clean copy of the tree, for GIT_WORK_TREE and core.worktree to point at.
+clean="$tmp/clean"
+mkdir -p "$clean"
+g archive HEAD | tar -x -C "$clean"
+edit=crates/p2p-wire/src/lib.rs
+# Same size as HEAD's `pub fn decode() {}`: git status reads (and filters) the file only when
+# its size is unchanged.
+echo 'pub fn DECODE() {}' > "$fx/$edit"
+check fail "a GIT_WORK_TREE at a clean copy does not hide an edit" "$edit" \
+  env GIT_WORK_TREE="$clean" bash "$checker" "$ok"
+check fail "GIT_DIR and GIT_WORK_TREE at a clean copy do not hide an edit" "$edit" \
+  env GIT_DIR="$fx/.git" GIT_WORK_TREE="$clean" bash "$checker" "$ok"
+# A clean filter that undoes the edit: git status then sees HEAD's blob.
+printf '*.rs filter=hide\n' > "$tmp/hide.attributes"
+printf '[filter "hide"]\n\tclean = sed s/DECODE/decode/\n[core]\n\tattributesFile = %s\n' \
+  "$tmp/hide.attributes" > "$tmp/hide.gitconfig"
+[[ -z $(GIT_CONFIG_GLOBAL="$tmp/hide.gitconfig" git -C "$fx" status --porcelain) ]] \
+  && ok "(a global clean filter hides the edit from plain git status)" \
+  || bad "the global filter case does not hide the edit from plain git status"
+check fail "a global clean filter (GIT_CONFIG_GLOBAL) does not hide an edit" "$edit" \
+  env GIT_CONFIG_GLOBAL="$tmp/hide.gitconfig" bash "$checker" "$ok"
+mkdir -p "$tmp/hide-home"
+cp "$tmp/hide.gitconfig" "$tmp/hide-home/.gitconfig"
+check fail "a global clean filter (HOME) does not hide an edit" "$edit" \
+  env HOME="$tmp/hide-home" bash "$checker" "$ok"
+# The repository's own config and attributes are read (git has no switch to drop them), so the
+# keyed files are compared with HEAD's blobs byte for byte, without filters.
+g config filter.hide.clean 'sed s/DECODE/decode/'
+printf '*.rs filter=hide\n' > "$fx/.git/info/attributes"
+[[ -z $(g status --porcelain) ]] && ok "(a repo-local clean filter hides the edit from git status)" \
+  || bad "the repo-local filter case does not hide the edit from git status"
+check fail "a repo-local clean filter (.git/info/attributes) does not hide an edit" \
+  "content differs from HEAD: $edit" bash "$checker" "$ok"
+g config core.worktree "$clean"
+check fail "a repo-local core.worktree at a clean copy does not hide an edit" \
+  "content differs from HEAD: $edit" bash "$checker" "$ok"
+g config --unset core.worktree
+rm "$fx/.git/info/attributes"
+g config --unset filter.hide.clean
+# Not `git checkout`: the filtered status refreshed the index with the edited file's stat
+# data, so git now takes the edit for clean even without the filter.
+g show "HEAD:$edit" > "$fx/$edit"
+# A file git ignores (.git/info/exclude) is still a file under a keyed path.
+echo 'extra.rs' >> "$fx/.git/info/exclude"
+echo 'pub fn extra() {}' > "$fx/crates/p2p-wire/src/extra.rs"
+check fail "an ignored file under a keyed path" "not in HEAD: crates/p2p-wire/src/extra.rs" \
+  bash "$checker" "$ok"
+rm "$fx/crates/p2p-wire/src/extra.rs"
+check pass "clean after the scrub cases" "" bash "$checker" "$ok"
+# A stale stat cache: a git status run through a hiding filter refreshes the index with the
+# edited file's stat data (backdated here, so git's racy-timestamp recheck cannot step in), and
+# from then on every git status, filter or not, takes the edit for clean. The byte comparison
+# reads the file itself.
+echo 'pub fn DECODE() {}' > "$fx/$edit"
+touch -t 202001010000 "$fx/$edit"
+GIT_CONFIG_GLOBAL="$tmp/hide.gitconfig" git -C "$fx" status --porcelain >/dev/null
+[[ -z $(env -i PATH="$PATH" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$fx" status --porcelain) ]] \
+  && ok "(after a filtered refresh, a scrubbed git status takes the edit for clean)" \
+  || bad "the filtered refresh did not leave a stale stat cache"
+check fail "an edit hidden by a stale stat cache is still dirty" "content differs from HEAD: $edit" \
+  bash "$checker" "$ok"
+g show "HEAD:$edit" > "$fx/$edit"
+g update-index --really-refresh >/dev/null || true
+check pass "clean after the stale-cache case" "" bash "$checker" "$ok"
+# The key comes from this checkout's HEAD, not from a GIT_DIR elsewhere.
+other="$tmp/other"
+cp -R "$fx" "$other"
+echo '// other' >> "$other/$edit"
+git -C "$other" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -q -am other
+key=$(bash "$checker" --print-key)
+check pass "a GIT_DIR at another repository does not change the key" "$key" \
+  env GIT_DIR="$other/.git" bash "$checker" --print-key
 
 check pass "the real repo's key prints" '"crates/p2p-wire"' bash "$repo/fuzz/check-m2a-gate.sh" --print-key
 check pass "the real repo's key holds the root lock" '"Cargo.lock": "' bash "$repo/fuzz/check-m2a-gate.sh" --print-key

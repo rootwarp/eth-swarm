@@ -27,6 +27,8 @@ done
 mkdir -p "$fx/fuzz/corpus-slow/blocks_by_range_resp"
 printf 'slow' > "$fx/fuzz/corpus-slow/blocks_by_range_resp/slow-seed"
 cp "$repo"/fuzz/{m2a-common.sh,build-m2a.sh,run-m2a-gate.sh,check-m2a-gate.sh} "$fx/fuzz/"
+mkdir -p "$fx/scripts"
+cp "$repo/scripts/check-fuzz-lock.sh" "$fx/scripts/"
 echo 'x' > "$fx/crates/p2p-wire/lib.rs"
 echo 'x' > "$fx/crates/consensus-types/lib.rs"
 echo 'x' > "$fx/crates/cl-p2p/src/rpc/codec.rs"
@@ -46,10 +48,12 @@ g commit -q -m fixture
 
 bin="$tmp/bin"
 mkdir -p "$bin" "$tmp/home" "$tmp/cargo-home"
-# The fake cargo: logs each call to $CALLS, then acts like cargo / cargo-fuzz.
+# The fake cargo: logs each call to $CALLS (an offline call once more, as "offline: <args>"),
+# then acts like cargo / cargo-fuzz.
 cat > "$bin/cargo" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >> "$CALLS"
+[[ ${CARGO_NET_OFFLINE:-} != true ]] || echo "offline: $*" >> "$CALLS"
 [[ ${1:-} == +* ]] && shift
 case "$1 ${2:-}" in
   "metadata "*) echo '{}'; exit "${FAKE_METADATA_RC:-0}" ;;
@@ -167,6 +171,8 @@ grep -q -- "fuzz run -O -a status_v2 .*/fuzz/corpus/status_v2 --" "$CALLS" \
 ! grep -q -- "corpus-slow" "$CALLS" && ok "the slow seeds are not fuzzed from" || bad "corpus-slow passed to libFuzzer" "$(cat "$CALLS")"
 grep -q -- "metadata --locked" "$CALLS" && grep -q -- "fuzz build -O -a" "$CALLS" \
   && ok "builds after checking the lockfile" || bad "build" "$(cat "$CALLS")"
+grep -q -- "^offline: metadata --locked --format-version 1$" "$CALLS" \
+  && ok "scripts/check-fuzz-lock.sh runs as a pre-flight, offline" || bad "offline lock pre-flight" "$(cat "$CALLS")"
 log="$tmp/ok.log"
 if [[ -f $log ]] && [[ $(grep -c '^stat::number_of_executed_units: 4242' "$log") == 4 ]] \
   && grep -q '^Done 4242 runs' "$log" && [[ $(grep -c 'DONE   cov: 3100 ft: 7000' "$log") == 4 ]]; then
@@ -271,7 +277,9 @@ for var in \
   'CC_FORCE_DISABLE=1' \
   'CC_SHELL_ESCAPED_FLAGS=1' \
   'CROSS_COMPILE=evil-' \
-  'SDKROOT=/tmp/sdk'; do
+  'SDKROOT=/tmp/sdk' \
+  'MACOSX_DEPLOYMENT_TARGET=10.9' \
+  'FUZZ_LOCK_CARGO=/usr/bin/true'; do
   # (DYLD_INSERT_LIBRARIES is refused too, but macOS strips it before a protected binary such
   # as /usr/bin/env passes it on, so it cannot be set up here.) The cc crate's target forms
   # (CC_<target>) are no shell identifiers, so bash's own variable list never shows them.
@@ -286,6 +294,8 @@ refused "build refuses CARGO_ENCODED_RUSTFLAGS" "$builder" 'CARGO_ENCODED_RUSTFL
 refused "build refuses CARGO_ALIAS_FUZZ" "$builder" 'CARGO_ALIAS_FUZZ=version'
 refused "build refuses CUSTOM_LIBFUZZER_PATH" "$builder" 'CUSTOM_LIBFUZZER_PATH=/tmp/libfuzzer.a'
 refused "build refuses CXX" "$builder" 'CXX=/bin/echo'
+refused "build refuses MACOSX_DEPLOYMENT_TARGET" "$builder" 'MACOSX_DEPLOYMENT_TARGET=10.9'
+refused "build refuses FUZZ_LOCK_CARGO" "$builder" 'FUZZ_LOCK_CARGO=/usr/bin/true'
 
 # python3 < 3.11 has no tomllib: a clear error, not a traceback, and nothing built.
 pybin="$tmp/py39"
@@ -375,9 +385,32 @@ rc=0 out=$(gate_run -- "$runner" --seconds 3 --out "$tmp/s.json" 2>&1) || rc=$?
 g reset -q --hard HEAD~1
 rc=0 out=$(gate_run FAKE_METADATA_RC=101 -- "$runner" --seconds 3 --out "$tmp/l.json" 2>&1) || rc=$?
 ((rc != 0)) && [[ ! -f $tmp/l.json ]] && ok "a stale fuzz/Cargo.lock stops the run" || bad "stale lock (exit $rc)" "$out"
+# Lockfiles that disagree (a shared crate at another version in the root lock): the session
+# binary would link a version that was never fuzzed. Committed, so the tree is clean.
+lock_pkg() { printf '\n[[package]]\nname = "snap"\nversion = "%s"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n' "$1"; }
+{ echo 'version = 4'; lock_pkg 1.1.2; } > "$fx/Cargo.lock"
+{ echo 'version = 4'; lock_pkg 1.1.1; } > "$fx/fuzz/Cargo.lock"
+g commit -q -am "lockfiles that disagree"
+for script in "$runner" "$builder"; do
+  : > "$CALLS"
+  rc=0 out=$(gate_run -- "$script" --seconds 3 --out "$tmp/lk.json" 2>&1) || rc=$?
+  if ((rc == 2)) && grep -q 'snap 1.1.1' <<<"$out" && ! grep -q "fuzz build" "$CALLS" && [[ ! -f $tmp/lk.json ]]; then
+    ok "${script##*/}: lockfiles that disagree stop it before any build"
+  else
+    bad "${script##*/}: lockfiles that disagree (exit $rc)" "$out"
+  fi
+done
+g reset -q --hard HEAD~1
 echo '// edit' >> "$fx/crates/p2p-wire/lib.rs"
 rc=0 out=$(gate_run -- "$runner" --seconds 3 --out "$tmp/d.json" 2>&1) || rc=$?
 ((rc == 2)) && grep -q 'uncommitted' <<<"$out" && ok "a dirty keyed path stops the run" || bad "dirty (exit $rc)" "$out"
+# git runs with a scrubbed environment: a GIT_WORK_TREE at a clean copy does not hide the edit.
+rm -rf "$tmp/clean"
+mkdir -p "$tmp/clean"
+g archive HEAD | tar -x -C "$tmp/clean"
+rc=0 out=$(gate_run "GIT_WORK_TREE=$tmp/clean" -- "$runner" --seconds 3 --out "$tmp/d.json" 2>&1) || rc=$?
+((rc == 2)) && grep -q 'crates/p2p-wire/lib.rs' <<<"$out" \
+  && ok "a GIT_WORK_TREE at a clean copy does not hide a dirty keyed path" || bad "GIT_WORK_TREE (exit $rc)" "$out"
 rc=0 out=$(gate_run -- "$runner" --allow-dirty --seconds 3 --out "$tmp/d.json" 2>&1) || rc=$?
 ((rc == 0)) && [[ $(field "$tmp/d.json" "gate['dirty']") == True ]] \
   && ok "--allow-dirty runs and marks the file dirty" || bad "--allow-dirty (exit $rc)" "$out"

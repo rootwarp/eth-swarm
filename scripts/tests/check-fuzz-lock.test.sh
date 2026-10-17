@@ -183,15 +183,53 @@ CARGO_NET_OFFLINE=true check_real fail "a fuzz lock without a package a path cra
   "$(crates missing "$(pkgd ethswarm-fuzz 0.0.0 "" a)
 $(pkg a 0.1.0)")" "does not satisfy"
 
+mode() { python3 -I -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$1"; }
+# The regenerated lock is a normal committed file, whatever mode the old one had.
+leftovers() { find "$1/fuzz" -maxdepth 1 -name 'Cargo.lock?*' | sed 's/^/       left over: /'; }
+
 # fuzz/regen-lock.sh repairs that lock: from the root lock, then the check passes.
 root="$(crates regen "$(pkgd ethswarm-fuzz 0.0.0 "" a)
 $(pkg a 0.1.0)")"
+chmod 600 "$root/fuzz/Cargo.lock"
 rc=0 out=$(CARGO_NET_OFFLINE=true bash "$repo/fuzz/regen-lock.sh" "$root" 2>&1) || rc=$?
 if ((rc == 0)) && grep -q '^name = "b"$' "$root/fuzz/Cargo.lock"; then
   passed=$((passed + 1)); echo "ok   - fuzz/regen-lock.sh adds the missing package"
 else
   failed=$((failed + 1)); echo "FAIL - fuzz/regen-lock.sh (exit $rc)"; printf '%s\n' "$out" | sed 's/^/       /'
 fi
+if [[ $(mode "$root/fuzz/Cargo.lock") == 644 && -z $(leftovers "$root") ]]; then
+  passed=$((passed + 1)); echo "ok   - fuzz/regen-lock.sh leaves the lock at mode 644, no temp files"
+else
+  failed=$((failed + 1)); echo "FAIL - regenerated lock mode $(mode "$root/fuzz/Cargo.lock"), want 644"; leftovers "$root"
+fi
+
+# A regeneration that fails validation leaves the old lock as it was: same bytes, same mode.
+# regen_fails <name> <description> <edit to the fixture...>: the edit runs in the fixture root.
+regen_fails() {
+  local name=$1 desc=$2 root rc=0 out
+  shift 2
+  root="$(crates "$name" "$(pkgd ethswarm-fuzz 0.0.0 "" a)
+$(pkg a 0.1.0)")"
+  (cd "$root" && "$@")
+  chmod 640 "$root/fuzz/Cargo.lock"
+  cp -p "$root/fuzz/Cargo.lock" "$tmp/$name.before"
+  out=$(CARGO_NET_OFFLINE=true bash "$repo/fuzz/regen-lock.sh" "$root" 2>&1) || rc=$?
+  if ((rc != 0)) && cmp -s "$tmp/$name.before" "$root/fuzz/Cargo.lock" \
+    && [[ $(mode "$root/fuzz/Cargo.lock") == 640 && -z $(leftovers "$root") ]]; then
+    passed=$((passed + 1)); echo "ok   - $desc"
+  else
+    failed=$((failed + 1)); echo "FAIL - $desc (exit $rc, mode $(mode "$root/fuzz/Cargo.lock"))"
+    printf '%s\n' "$out" | sed 's/^/       /'
+    diff "$tmp/$name.before" "$root/fuzz/Cargo.lock" | sed 's/^/       /' || true
+    leftovers "$root"
+  fi
+}
+# cargo metadata fails: a path dependency that does not exist.
+regen_fails regen-metadata "a failed cargo metadata leaves the old lock byte-identical, mode kept" \
+  python3 -I -c 'import pathlib; p = pathlib.Path("fuzz/Cargo.toml"); p.write_text(p.read_text().replace("[dependencies]\n", "[dependencies]\nc = { path = \"../crates/c\" }\n"))'
+# scripts/check-fuzz-lock.sh fails: the root has a [patch.crates-io] the fuzz manifest lacks.
+regen_fails regen-check "a failed lock check leaves the old lock byte-identical, mode kept" \
+  sh -c 'printf "\n[patch.crates-io]\nb = { path = \"crates/b\" }\n" >> Cargo.toml'
 CARGO_NET_OFFLINE=true check_real pass "the regenerated lock satisfies its manifests" "$root" "fuzz lock OK"
 
 check_real pass "real repo" "$repo"

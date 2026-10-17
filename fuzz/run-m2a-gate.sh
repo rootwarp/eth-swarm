@@ -30,7 +30,10 @@
 # exercise its decoder, 2 usage or setup error.
 #
 # Refuses (exit 2) any environment variable or cargo config file that would change the build or
-# the run behind the recorded policy (m2a_require_clean_env in fuzz/m2a-common.sh lists them).
+# the run behind the recorded policy (m2a_require_clean_env in fuzz/m2a-common.sh lists them),
+# and lockfiles that disagree (scripts/check-fuzz-lock.sh, offline, before anything is built).
+# The dirty check and the key read git through m2a_git (no inherited GIT_* variable, no global
+# or system config) and compare the keyed files with HEAD byte for byte (m2a_worktree_diff).
 # The tool overrides CARGO, RUSTC, FUZZ_TOOLCHAIN and RUSTUP_TOOLCHAIN are allowed only for a
 # smoke run (--seconds under 3600), and the gate file records them in `overrides`.
 #
@@ -82,6 +85,8 @@ for name in ${overrides[@]+"${overrides[@]}"}; do
   sep=', '
 done
 overrides_json="$overrides_json}"
+# The two lockfiles agree (scripts/check-fuzz-lock.sh, offline), or no gate is written.
+m2a_lock_preflight
 [[ $out == /* ]] || out="$PWD/$out"
 [[ -n $log ]] || log="${out%.json}.log"
 [[ $log == /* ]] || log="$PWD/$log"
@@ -151,7 +156,7 @@ mkdir -p "$(dirname "$out")" "$(dirname "$log")"
 KEY=$key DIRTY=$dirty SECONDS_REQ=$seconds CARGO_FUZZ=$cargo_fuzz LIMITS=$limits \
   OVERRIDES=$overrides_json FLOORS=$floors \
   CHANNEL=$channel RUSTC_COMMIT=$rustc_commit RUSTC_VERSION=$rustc_version \
-  HEAD_SHA=$(git -C "$repo" rev-parse HEAD) TARGETS="${M2A_TARGETS[*]}" \
+  HEAD_SHA=$(m2a_git rev-parse HEAD) TARGETS="${M2A_TARGETS[*]}" \
   python3 -I - "$work" "$fuzz_dir" "$out" "$log" <<'PY'
 import json, os, re, sys
 

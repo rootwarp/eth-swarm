@@ -10,6 +10,12 @@
 # and source. Offline: every package must be in the local cargo cache (`cargo fetch --locked`
 # in the root fetches the shared ones). Ends with scripts/check-fuzz-lock.sh.
 #
+# The new lock is built in a temp file and made mode 0644 (mktemp creates 0600). cargo has no
+# stable way to resolve against a lockfile at another path, so the candidate is moved into
+# place to be pruned and checked, with the old lock saved beside it: any failure (or an
+# interrupt) puts the old lock back byte for byte, with its mode; only a lock that passes both
+# `cargo metadata --offline` and scripts/check-fuzz-lock.sh stays.
+#
 # Usage: fuzz/regen-lock.sh [ROOT]   (default: this repo)
 # Exit: 0 regenerated and checked, non-zero otherwise. Needs cargo and python3 >= 3.11.
 # Works on bash 3.2.
@@ -19,8 +25,25 @@ root=${1:-$(cd "$here/.." && pwd)}
 lock="$root/fuzz/Cargo.lock"
 [[ -f $root/Cargo.lock ]] || { echo "ERROR: $root/Cargo.lock missing"; exit 2; }
 
-new=$(mktemp "$root/fuzz/Cargo.lock.XXXXXX")
-trap 'rm -f "$new"' EXIT
+new=$(mktemp "$root/fuzz/Cargo.lock.new.XXXXXX")
+saved=""
+installed=0 done=0
+restore() {
+  if ((!done && installed)); then
+    if [[ -n $saved ]]; then
+      mv -f "$saved" "$lock"
+      saved=""
+    else
+      rm -f "$lock"
+    fi
+    echo "ERROR: fuzz/regen-lock.sh failed; fuzz/Cargo.lock is unchanged" >&2
+  fi
+  rm -f "$new" ${saved:+"$saved"}
+}
+trap restore EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 # The fuzz-only names are scripts/check-fuzz-lock.sh's FUZZ_ONLY, less the fuzz crate itself
 # (cargo writes its entry afresh).
 python3 -I - "$root/Cargo.lock" "$lock" > "$new" <<'PY'
@@ -38,6 +61,14 @@ for block in re.split(r"\n(?=\[\[package\]\]\n)", fuzz)[1:]:
         print()
         print(block.rstrip("\n"))
 PY
-mv "$new" "$lock"
+chmod 644 "$new"
+if [[ -e $lock ]]; then
+  saved=$(mktemp "$root/fuzz/Cargo.lock.saved.XXXXXX")
+  cp -p "$lock" "$saved"
+fi
+installed=1
+mv -f "$new" "$lock"
 (cd "$root/fuzz" && cargo metadata --offline --format-version 1 >/dev/null)
 bash "$here/../scripts/check-fuzz-lock.sh" "$root"
+chmod 644 "$lock"
+done=1

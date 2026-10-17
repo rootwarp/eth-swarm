@@ -413,3 +413,64 @@ fn raw_secrets_error_explains_the_coarse_match() {
         assert_rejected(&body, "(any `secrets` word after `${{` on the line counts)");
     }
 }
+
+#[test]
+fn setting_fuzz_lock_cargo_is_rejected_at_every_level() {
+    let step_env = "      - run: bash scripts/check-fuzz-lock.sh\n        env:\n          FUZZ_LOCK_CARGO: /usr/bin/true\n";
+    for body in [
+        good().replace(
+            "permissions:\n",
+            "env:\n  FUZZ_LOCK_CARGO: /usr/bin/true\npermissions:\n",
+        ),
+        with_job_perms("    env:\n      FUZZ_LOCK_CARGO: /usr/bin/true\n"),
+        with_step(step_env),
+        with_step("      - run: FUZZ_LOCK_CARGO=/usr/bin/true bash scripts/check-fuzz-lock.sh\n"),
+        with_step("      - run: echo FUZZ_LOCK_CARGO=/usr/bin/true >> \"$GITHUB_ENV\"\n"),
+        with_step("      - run: |\n          export FUZZ_LOCK_CARGO=/usr/bin/true\n          bash scripts/check-fuzz-lock.sh\n"),
+        with_step(&step_env.replace("FUZZ_LOCK_CARGO", "fuzz_lock_cargo")),
+        with_step(&step_env.replace("FUZZ_LOCK_CARGO:", "\"FUZZ_LOCK\\x5FCARGO\":")),
+    ] {
+        assert_rejected(&body, "FUZZ_LOCK_CARGO");
+    }
+}
+
+#[test]
+fn fuzz_lock_cargo_is_rejected_outside_pull_request_workflows_too() {
+    let body = with_step(
+        "      - run: bash scripts/check-fuzz-lock.sh\n        env:\n          FUZZ_LOCK_CARGO: /usr/bin/true\n",
+    )
+    .replace(
+        "on:\n  pull_request:",
+        "on:\n  schedule:\n    - cron: '0 3 * * *'",
+    );
+    assert_rejected(&body, "FUZZ_LOCK_CARGO");
+}
+
+#[test]
+fn fuzz_lock_cargo_violation_names_its_line() {
+    let body = with_step(
+        "      - run: bash scripts/check-fuzz-lock.sh\n        env:\n          FUZZ_LOCK_CARGO: /usr/bin/true\n",
+    );
+    let shown: Vec<String> = check_workflow("ci.yml", &body)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        shown
+            .iter()
+            .any(|s| s.starts_with("ERROR ci.yml:13: FUZZ_LOCK_CARGO")),
+        "{shown:?}\n---\n{body}"
+    );
+}
+
+#[test]
+fn the_lock_check_without_fuzz_lock_cargo_is_allowed() {
+    assert_passes(&with_step(
+        "      - run: bash scripts/check-fuzz-lock.sh\n        env:\n          CARGO_NET_OFFLINE: 'true'\n",
+    ));
+    // A comment is not a setting.
+    assert_passes(&format!(
+        "# scripts/check-fuzz-lock.sh: FUZZ_LOCK_CARGO is for its tests only\n{}",
+        good()
+    ));
+}

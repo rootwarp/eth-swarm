@@ -77,7 +77,7 @@ llvm_cov="$(m2a_rustc --print sysroot)/lib/rustlib/$host/bin/llvm-cov"
 report=$(mktemp)
 trap 'rm -f "$report"' EXIT
 {
-  echo "m2a fuzz coverage, HEAD $(git -C "$repo" rev-parse HEAD)$([[ -z $(m2a_dirty_paths) ]] || echo ' (dirty)')"
+  echo "m2a fuzz coverage, HEAD $(m2a_git rev-parse HEAD)$([[ -z $(m2a_dirty_paths) ]] || echo ' (dirty)')"
   echo "decoder key: $(m2a_key_json 2>&1 || true)"
   echo "toolchain: $(m2a_rustc -V)"
 } > "$report"

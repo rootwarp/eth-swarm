@@ -1,5 +1,6 @@
 # Shared by fuzz/build-m2a.sh, fuzz/run-m2a-gate.sh, fuzz/check-m2a-gate.sh and
-# fuzz/coverage-m2a.sh. Source it; it sets `repo` and `fuzz_dir` from its own location.
+# fuzz/coverage-m2a.sh. Source it; it sets `repo` and `fuzz_dir` from its own location. Every
+# git call goes through m2a_git (a scrubbed environment and config).
 # Works on bash 3.2.
 
 fuzz_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -118,8 +119,11 @@ m2a_require_python() {
 #     all four of cc's spellings (CC, CC_<target>, CC_<target_with_underscores>, HOST_CC or
 #     TARGET_CC): CC, CXX, CFLAGS, CXXFLAGS, AR, ARFLAGS, RANLIB, RANLIBFLAGS, NVCC, CXXSTDLIB,
 #     CXXSTDLIB_STATIC, every CC_* (CC_FORCE_DISABLE, CC_SHELL_ESCAPED_FLAGS, ...), plus
-#     CRATE_CC_NO_DEFAULTS, CROSS_COMPILE and SDKROOT. The <target> forms hold '-' and '.', so
-#     they are no shell identifiers and bash does not list them: the names come from python;
+#     CRATE_CC_NO_DEFAULTS, CROSS_COMPILE, SDKROOT and MACOSX_DEPLOYMENT_TARGET (cc turns it
+#     into libFuzzer's -mmacosx-version-min). The <target> forms hold '-' and '.', so they are
+#     no shell identifiers and bash does not list them: the names come from python;
+#   - the lockfile pre-flight (m2a_lock_preflight): FUZZ_LOCK_CARGO, which replaces cargo in
+#     scripts/check-fuzz-lock.sh's resolution check (its tests' stub);
 #   - the run itself: RUST_LIBFUZZER_DEBUG_PATH (libfuzzer-sys then writes each input to that
 #     file and returns before the target body runs), the sanitizer options (ASAN_OPTIONS,
 #     UBSAN_OPTIONS, LSAN_OPTIONS, MSAN_OPTIONS, TSAN_OPTIONS, HWASAN_OPTIONS; none is set by
@@ -154,7 +158,8 @@ m2a_require_clean_env() {
         AR | AR_* | ARFLAGS | ARFLAGS_* | RANLIB* | NVCC | NVCC_* | \
         HOST_CC* | HOST_CXX* | HOST_CFLAGS | HOST_AR* | HOST_RANLIB* | HOST_NVCC | \
         TARGET_CC* | TARGET_CXX* | TARGET_CFLAGS | TARGET_AR* | TARGET_RANLIB* | TARGET_NVCC | \
-        CRATE_CC_NO_DEFAULTS | CROSS_COMPILE | SDKROOT)
+        CRATE_CC_NO_DEFAULTS | CROSS_COMPILE | SDKROOT | MACOSX_DEPLOYMENT_TARGET | \
+        FUZZ_LOCK_CARGO)
         bad+=("$name")
         ;;
     esac
@@ -201,6 +206,20 @@ for e in errors:
     print(f"ERROR: {e}")
 sys.exit(1 if errors else 0)
 PY
+}
+
+# m2a_lock_preflight: exit 2 unless scripts/check-fuzz-lock.sh passes: fuzz/Cargo.lock (what
+# the targets link) resolves every shared crate as the root Cargo.lock (what the session binary
+# links) does, and satisfies its manifests. Both locks are in the decoder key, but only this
+# ties one to the other: without it a tree committed with another root snap 1.x would get a
+# fresh gate for a version that was never fuzzed. Offline (CARGO_NET_OFFLINE=true): by then the
+# sources are fetched (build-m2a.sh's `cargo metadata --locked`, CI's online lock check).
+m2a_lock_preflight() {
+  if ! CARGO_NET_OFFLINE=true bash "$repo/scripts/check-fuzz-lock.sh" "$repo"; then
+    echo "ERROR: fuzz/Cargo.lock does not agree with Cargo.lock (scripts/check-fuzz-lock.sh," \
+      "offline): run fuzz/regen-lock.sh, or fetch the sources (cargo fetch --locked in fuzz/)"
+    exit 2
+  fi
 }
 
 # The channel fuzz/rust-toolchain.toml pins.
@@ -250,21 +269,117 @@ m2a_rustc() {
   (cd "$fuzz_dir" && "${RUSTC:-rustc}" ${FUZZ_TOOLCHAIN:+"+$FUZZ_TOOLCHAIN"} "$@")
 }
 
-# Prints the keyed paths that differ from HEAD (modified, staged or untracked), if any, and the
-# keyed files git is told not to look at: assume-unchanged (`git ls-files -v` prints the tag in
-# lowercase) or skip-worktree (tag S). `git status` skips an edit to either, so the flag itself
-# counts as dirty, edited or not. Fails (status 1, message on stderr) if git does.
+# m2a_git <args>: git in the repository, run the way crates/cl-p2p/build_support.rs runs it
+# (child_env): an environment cleared but for PATH, so no inherited GIT_DIR, GIT_WORK_TREE,
+# GIT_INDEX_FILE, GIT_CONFIG_* (or HOME and XDG_CONFIG_HOME, which locate the global config,
+# ignore and attributes files) can point git at another tree or filter what it sees; no system
+# or global config or attributes (GIT_CONFIG_NOSYSTEM, GIT_CONFIG_GLOBAL=/dev/null,
+# GIT_ATTR_NOSYSTEM); no optional index writes (GIT_OPTIONAL_LOCKS=0); and no fsmonitor, whose
+# hook would tell git which files changed (-c core.fsmonitor=false). Every git call in the fuzz
+# scripts goes through it. As in build_support.rs, safe.directory is not read, so a checkout
+# owned by another user fails git's ownership check (fail closed).
+m2a_git() {
+  env -i PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \
+    GIT_OPTIONAL_LOCKS=0 git -C "$repo" -c core.fsmonitor=false "$@"
+}
+
+# m2a_worktree_diff: prints how the keyed paths on disk differ from HEAD, byte for byte and
+# without git's view of the working tree: every file HEAD has under a keyed path is read from
+# $repo and its blob id computed over the raw bytes (what `git hash-object --no-filters` gives;
+# a symlink's id is over its target) and compared with HEAD's ("content differs from HEAD",
+# "missing", "type differs from HEAD"), and every file on disk under a keyed path that HEAD
+# lacks is listed ("not in HEAD"), whatever .gitignore or .git/info/exclude say. So none of
+# what git still reads from the repository itself (.git/config filters, core.worktree,
+# .git/info/attributes, the index's stat data, assume-unchanged or skip-worktree) can make a
+# changed file look clean. Fails closed: a checkout whose bytes legitimately differ from the
+# blobs (eol conversion, a smudge filter such as LFS) counts as dirty. Needs python3.
+m2a_worktree_diff() {
+  local format
+  format=$(m2a_git rev-parse --show-object-format) || {
+    echo "ERROR: git rev-parse --show-object-format failed" >&2
+    return 1
+  }
+  (
+    set -o pipefail
+    m2a_git ls-tree -r -z --full-tree HEAD -- "${M2A_KEY_PATHS[@]}" "${M2A_KEY_FILES[@]}" |
+      python3 -I -c '
+import hashlib, os, stat, sys
+
+repo, fmt, keyed = os.fsencode(sys.argv[1]), sys.argv[2], sys.argv[3:]
+head = {}
+for rec in sys.stdin.buffer.read().split(b"\0"):
+    if rec:
+        meta, path = rec.split(b"\t", 1)
+        mode, kind, oid = meta.split(b" ")
+        head[path] = (mode, kind, oid.decode())
+
+def blob_id(data):
+    h = hashlib.new(fmt)
+    h.update(b"blob %d\0" % len(data))
+    h.update(data)
+    return h.hexdigest()
+
+out = []
+for path, (mode, kind, oid) in sorted(head.items()):
+    shown, full = os.fsdecode(path), os.path.join(repo, path)
+    if kind != b"blob":
+        out.append(f"not a file in HEAD: {shown}")
+        continue
+    try:
+        st = os.lstat(full)
+    except FileNotFoundError:
+        out.append(f"missing: {shown}")
+        continue
+    link = mode == b"120000"
+    if link != stat.S_ISLNK(st.st_mode) or not (link or stat.S_ISREG(st.st_mode)):
+        out.append(f"type differs from HEAD: {shown}")
+        continue
+    if link:
+        data = os.readlink(full)
+    else:
+        with open(full, "rb") as f:
+            data = f.read()
+    if blob_id(data) != oid:
+        out.append(f"content differs from HEAD: {shown}")
+for k in keyed:
+    top = os.path.join(repo, os.fsencode(k))
+    if os.path.isdir(top) and not os.path.islink(top):
+        for dirpath, dirs, files in os.walk(top):
+            for name in files + [d for d in dirs if os.path.islink(os.path.join(dirpath, d))]:
+                rel = os.path.relpath(os.path.join(dirpath, name), repo)
+                if rel not in head:
+                    out.append(f"not in HEAD: {os.fsdecode(rel)}")
+    elif os.path.lexists(top) and os.fsencode(k) not in head:
+        out.append(f"not in HEAD: {k}")
+for line in out:
+    print(line)
+' "$repo" "$format" "${M2A_KEY_PATHS[@]}" "${M2A_KEY_FILES[@]}"
+  ) || {
+    echo "ERROR: comparing the keyed paths with HEAD failed" >&2
+    return 1
+  }
+}
+
+# Prints the keyed paths that differ from HEAD, if any: what `git status` shows (modified,
+# staged or untracked), the keyed files git is told not to look at (assume-unchanged, which
+# `git ls-files -v` prints in lowercase, or skip-worktree, tag S: `git status` skips an edit to
+# either, so the flag itself counts as dirty, edited or not), and m2a_worktree_diff's byte
+# comparison. The comparison is what the check rests on: git status trusts the index's stat
+# cache, which a status run through a hiding filter can leave stale, and runs the repository's
+# own filters; its lines only add to the list (a staged change, say), they never clear it.
+# Fails (status 1, message on stderr) if git or the comparison does.
 m2a_dirty_paths() {
-  local status listed tag path
-  status=$(git -C "$repo" status --porcelain --untracked-files=all -- \
+  local status listed diff tag path
+  status=$(m2a_git status --porcelain --untracked-files=all -- \
     "${M2A_KEY_PATHS[@]}" "${M2A_KEY_FILES[@]}") || {
     echo "ERROR: git status failed" >&2
     return 1
   }
-  listed=$(git -C "$repo" ls-files -v -- "${M2A_KEY_PATHS[@]}" "${M2A_KEY_FILES[@]}") || {
+  listed=$(m2a_git ls-files -v -- "${M2A_KEY_PATHS[@]}" "${M2A_KEY_FILES[@]}") || {
     echo "ERROR: git ls-files failed" >&2
     return 1
   }
+  diff=$(m2a_worktree_diff) || return 1
   [[ -z $status ]] || printf '%s\n' "$status"
   while IFS= read -r tag; do
     path=${tag#* }
@@ -275,6 +390,7 @@ m2a_dirty_paths() {
       [abcdefghijklmnopqrstuvwxyz]) echo "assume-unchanged: $path" ;;
     esac
   done <<<"$listed"
+  [[ -z $diff ]] || printf '%s\n' "$diff"
 }
 
 # Prints the decoder key of HEAD as one JSON object; fails if a keyed path is not in HEAD.
@@ -282,7 +398,7 @@ m2a_key_json() {
   local path sha out='{"git": {'
   local sep=''
   for path in "${M2A_KEY_PATHS[@]}"; do
-    sha=$(git -C "$repo" rev-parse --verify --quiet "HEAD:$path") || {
+    sha=$(m2a_git rev-parse --verify --quiet "HEAD:$path") || {
       echo "ERROR: $path is not in HEAD" >&2
       return 1
     }

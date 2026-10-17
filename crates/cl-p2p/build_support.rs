@@ -215,6 +215,18 @@ mod tests {
         let status = |env: &[(OsString, OsString)]| {
             git(repo.path(), &["status", "--porcelain", "--", "crates"], env).unwrap()
         };
+        // The unscrubbed probes run on a copy of the index, and take no optional lock: a
+        // `git status` through the filter would otherwise refresh the real index with the
+        // tampered file's stat data, and the scrubbed status below would then trust that stat
+        // cache and report the file clean (whether it does depends on timestamp granularity).
+        let index_copy = home.path().join("probe-index");
+        let probe = |mut env: Vec<(OsString, OsString)>| {
+            std::fs::copy(repo.path().join(".git/index"), &index_copy).unwrap();
+            env.push(("GIT_INDEX_FILE".into(), index_copy.clone().into()));
+            env.push(("GIT_OPTIONAL_LOCKS".into(), "0".into()));
+            status(&env)
+        };
+        let index_before = std::fs::read(repo.path().join(".git/index")).unwrap();
         // With the parent's HOME (or GIT_CONFIG_GLOBAL) pointing at that config, the change hides.
         let mut parent: Vec<(OsString, OsString)> = std::env::vars_os()
             .filter(|(k, _)| k != "GIT_CONFIG_GLOBAL")
@@ -222,14 +234,19 @@ mod tests {
         parent.push(("HOME".into(), home.path().into()));
         let mut with_home = parent.clone();
         with_home.retain(|(k, _)| k == "PATH" || k == "HOME");
-        assert_eq!(status(&with_home), "", "the filter hides the change");
+        assert_eq!(probe(with_home), "", "the filter hides the change");
         let mut with_global = os(&[]);
         with_global.extend(parent.iter().filter(|(k, _)| k == "PATH").cloned());
         with_global.push((
             "GIT_CONFIG_GLOBAL".into(),
             home.path().join(".gitconfig").into(),
         ));
-        assert_eq!(status(&with_global), "");
+        assert_eq!(probe(with_global), "");
+        assert_eq!(
+            std::fs::read(repo.path().join(".git/index")).unwrap(),
+            index_before,
+            "the probes leave the real index alone"
+        );
         // Scrubbed, it shows.
         let mut scrubbed_parent = parent;
         scrubbed_parent.push((

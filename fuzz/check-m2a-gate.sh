@@ -8,7 +8,9 @@
 #     sha256 of Cargo.lock and fuzz/Cargo.lock (fuzz/m2a-common.sh lists them). A keyed path with
 #     uncommitted changes fails too, and so does one git is told not to look at (assume-unchanged
 #     or skip-worktree): HEAD's key would match while the binary would be built from other
-#     sources;
+#     sources. The keyed files are compared with HEAD's blobs byte for byte, and a file on disk
+#     HEAD lacks counts, ignored or not (m2a_worktree_diff), so no git config, filter, ignore
+#     rule or stale index stat cache can hide an edit; git runs scrubbed (m2a_git);
 #   - its limits are exactly the policy in fuzz/m2a-common.sh: -malloc_limit_mb, -rss_limit_mb,
 #     -timeout, each target's -max_len and the build flags (-O -a);
 #   - it ran on the fuzz/rust-toolchain.toml channel with the pinned rustc commit, and with the

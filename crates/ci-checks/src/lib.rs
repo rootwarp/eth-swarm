@@ -17,6 +17,10 @@
 //!    and to the end of each decoded string), no `secrets` identifier anywhere in a job- or
 //!    step-level `if:` (GitHub evaluates it as an expression even without `${{`), and no
 //!    `secrets:` key with a non-empty value.
+//! 5. No workflow sets `FUZZ_LOCK_CARGO`, which replaces cargo in `scripts/check-fuzz-lock.sh`'s
+//!    resolution check and is for that script's tests only. Coarse: no mapping key or string
+//!    anywhere in the tree contains the name, in any letter case (an `env:` key at any level, a
+//!    `run:` script that exports it or writes it to `$GITHUB_ENV`). YAML comments may name it.
 //!
 //! YAML merge keys (`<<`) are rejected because GitHub does not apply them.
 
@@ -108,10 +112,18 @@ pub fn check_workflow(name: &str, text: &str) -> Vec<Violation> {
     let events = v.triggers(doc);
     v.uses(doc);
     v.permissions(doc);
+    v.fuzz_lock_cargo(doc);
     if events.iter().any(|e| e == "pull_request") {
         v.secrets(doc);
     }
     v.out
+}
+
+/// The variable rule 5 keeps out of every workflow.
+const FUZZ_LOCK_CARGO: &str = "FUZZ_LOCK_CARGO";
+
+fn names_fuzz_lock_cargo(s: &str) -> bool {
+    s.to_ascii_uppercase().contains(FUZZ_LOCK_CARGO)
 }
 
 struct Checker<'a> {
@@ -279,6 +291,35 @@ impl<'a> Checker<'a> {
                 None,
                 "YAML merge keys (<<) are not allowed; GitHub does not apply them".into(),
             );
+        }
+    }
+
+    /// Rule 5: one violation per raw line naming `FUZZ_LOCK_CARGO` outside a comment, or one
+    /// without a line when only a decoded string (an escape) names it.
+    fn fuzz_lock_cargo(&mut self, doc: &Yaml) {
+        let mut found = false;
+        each_string(doc, &mut |s| found |= names_fuzz_lock_cargo(s));
+        if !found {
+            return;
+        }
+        let message = format!(
+            "{FUZZ_LOCK_CARGO} is set: it replaces cargo in scripts/check-fuzz-lock.sh's \
+             resolution check and is for that script's tests only (any key or string naming it \
+             counts)"
+        );
+        let text: &'a str = self.text;
+        let lines: Vec<usize> = text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim_start().starts_with('#') && names_fuzz_lock_cargo(l))
+            .map(|(i, _)| i + 1)
+            .collect();
+        if lines.is_empty() {
+            self.error(None, message);
+            return;
+        }
+        for line in lines {
+            self.error(Some(line), message.clone());
         }
     }
 
