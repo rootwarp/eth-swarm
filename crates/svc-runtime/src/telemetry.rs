@@ -277,7 +277,8 @@ pub async fn bind_metrics(port: u16) -> io::Result<TcpListener> {
 /// service's descriptors or tasks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MetricsLimits {
-    /// Connections served at once; one over this is accepted and closed at once.
+    /// Connections served at once; one over this is accepted and closed at once. A config may
+    /// ask for 1..=[`MAX_METRICS_CONNECTIONS`].
     pub max_connections: usize,
     /// The longest a connection lives, request and response included.
     pub connection_timeout: Duration,
@@ -285,6 +286,13 @@ pub struct MetricsLimits {
 
 /// Default [`MetricsLimits::max_connections`].
 pub const DEFAULT_METRICS_CONNECTIONS: usize = 8;
+
+/// The most [`MetricsLimits::max_connections`] a config may ask for. A scrape is one short
+/// request per connection, so a handful is plenty; the cap keeps a typo from reserving
+/// descriptors, and stays far below tokio's `Semaphore::MAX_PERMITS`, above which the semaphore
+/// panics.
+pub const MAX_METRICS_CONNECTIONS: usize = 1024;
+const _: () = assert!(MAX_METRICS_CONNECTIONS <= tokio::sync::Semaphore::MAX_PERMITS);
 
 impl Default for MetricsLimits {
     fn default() -> Self {

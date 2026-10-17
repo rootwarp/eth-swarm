@@ -1,34 +1,47 @@
 //! Service-owned Unix sockets: `/run/ethswarm/<svc>/<svc>.sock`.
 //!
 //! ## Layout and modes
-//! The runtime root (`/run/ethswarm`, [`DEFAULT_ROOT`]) must be a real directory, owned by root
-//! or by the service user, and writable by nobody else. Under it each service owns one
-//! directory, mode `0750`, owner the service user, group the group of its allowed callers; the
-//! socket inside is `0660` with the same owner and group. A caller outside the group cannot
-//! reach the socket at all; a caller inside it is then checked per method ([`crate::acl`]).
+//! The runtime root (`/run/ethswarm`, [`DEFAULT_ROOT`]) must be a real directory, named by a path
+//! without symlinks, owned by root or by the service user, and writable by nobody else. Under it
+//! each service owns one directory, mode `0750`, owner the service user, group the group of its
+//! allowed callers; the socket inside is `0660` with the same owner and group. A caller outside
+//! the group cannot reach the socket at all; a caller inside it is then checked per method
+//! ([`crate::acl`]).
 //!
 //! ## [`bind`]
-//! The runtime root's last component is opened with `O_NOFOLLOW`, and every directory above
-//! it must be writable only by root or us (sticky directories such as `/tmp` excepted). After
-//! that, the filesystem steps are relative to directory file descriptors
+//! Nothing that is found wrong is repaired, replaced or removed (the one exception is a stale
+//! socket of the service user, step 5); startup fails instead, naming what was found.
+//!
+//! 1. The advertised socket path `<root>/<svc>/<svc>.sock` must fit a Unix socket address
+//!    (`sun_path`: 104 bytes on macOS, 108 on Linux). Clients connect to that path, so a longer
+//!    one fails startup before anything on disk is touched.
+//! 2. The runtime root must be an absolute path without `..`. It is walked from `/` one
+//!    component at a time through directory file descriptors (`openat`, `O_NOFOLLOW |
+//!    O_DIRECTORY`): a symlink anywhere in it is refused, not resolved. Every directory above
+//!    the root must be owned by root or us and not writable by group or others (sticky
+//!    directories such as `/tmp` excepted), and the root itself writable only by its owner.
+//!
+//! From there on the filesystem steps are relative to directory file descriptors
 //! (`mkdirat`/`openat`/`fstatat`/`fchownat`/`unlinkat`, `O_NOFOLLOW`), so they do not follow a
 //! symlink in place of the service directory. The two steps that take a path, the
-//! `connect()` probe and `bind(2)`, go through `/proc/thread-self/fd/<dirfd>/` on Linux; elsewhere
-//! they re-resolve the directory path, which is checked first to still name the directory
-//! held open:
+//! `connect()` probe and `bind(2)`, go through `/proc/thread-self/fd/<dirfd>/` on Linux, and
+//! startup fails if `/proc` cannot provide the directory held open; elsewhere they re-resolve
+//! the directory path, which is checked first to still name the directory held open:
 //!
-//! 1. The service directory is created `0750` with the service owner and group set explicitly,
+//! 3. The service directory is created `0750` with the service owner and group set explicitly,
 //!    or, if it exists, must already be exactly that: a looser mode, another owner or group, a
-//!    symlink or a non-directory fails startup. Nothing is repaired.
-//! 2. `<svc>.lock` in that directory is set to the service user, mode `0600` (on the inode
-//!    found, never replaced) and `flock`ed for the life of the process, so a second instance
-//!    fails with `AddrInUse` instead of touching the first one's socket. A lock that cannot be
-//!    given to the service user fails startup.
-//! 3. A leftover socket path is looked at with `lstat` (`AT_SYMLINK_NOFOLLOW`). Only a socket
+//!    symlink or a non-directory fails startup.
+//! 4. `<svc>.lock` in that directory is `flock`ed for the life of the process, so a second
+//!    instance fails with `AddrInUse` instead of touching the first one's socket. A lock this
+//!    start creates is given to the service user and group, mode `0600`. An existing lock must
+//!    already be exactly that and is refused otherwise: a chown or chmod would not revoke a
+//!    descriptor a caller opened while it was looser, and with it the caller could hold the
+//!    flock against every start.
+//! 5. A leftover socket path is looked at with `lstat` (`AT_SYMLINK_NOFOLLOW`). Only a socket
 //!    owned by the service user that refuses a `connect()` probe is stale and unlinked. A live
 //!    socket fails with `AddrInUse`; a symlink, file, directory, or a socket of another user is
 //!    left in place and fails startup.
-//! 4. The socket is bound, then its group and mode (`0660`) are set explicitly and checked
+//! 6. The socket is bound, then its group and mode (`0660`) are set explicitly and checked
 //!    before the caller is told the service is ready. The directory is writable only by the
 //!    service user, so nobody else can swap the socket afterwards.
 //!
@@ -160,6 +173,15 @@ pub enum BindError {
     Service(String),
     #[error("uid or gid {0} is not a valid id")]
     Id(u32),
+    /// The socket path cannot be a Unix socket address (too long for `sun_path`, or a NUL
+    /// byte), so no client could connect to it; nothing was changed.
+    #[error("{}: socket path is too long or invalid for a Unix socket address ({len} bytes): {source}", path.display())]
+    SocketPath {
+        path: PathBuf,
+        len: usize,
+        #[source]
+        source: io::Error,
+    },
     #[error("{op} {}: {source}", path.display())]
     Io {
         op: &'static str,
@@ -190,7 +212,7 @@ impl BindError {
     #[must_use]
     pub fn kind(&self) -> io::ErrorKind {
         match self {
-            Self::Service(_) | Self::Id(_) => io::ErrorKind::InvalidInput,
+            Self::Service(_) | Self::Id(_) | Self::SocketPath { .. } => io::ErrorKind::InvalidInput,
             Self::Io { source, .. } => source.kind(),
             Self::Insecure { .. } | Self::NotASocket { .. } | Self::ForeignSocket { .. } => {
                 io::ErrorKind::PermissionDenied
@@ -306,74 +328,98 @@ fn open_dir(parent: impl AsFd + Copy, name: &Path, path: &Path) -> Result<OwnedF
     }
 }
 
+/// Where Linux exposes this thread's open descriptors as paths. `thread-self`: a thread holding
+/// other credentials (tests) may still read its own fds.
+#[cfg(target_os = "linux")]
+const PROC_FDS: &str = "/proc/thread-self/fd";
+
 /// The path the kernel resolves to reach `name` in the directory `dir_fd`. On Linux that is
-/// `/proc/thread-self/fd/<dirfd>/<name>` (the open directory itself, whatever its path names now);
-/// elsewhere, or without `/proc`, the path, which [`same_dir`] checked.
-fn through_dir(dir_fd: &OwnedFd, name: &str, path: &Path) -> PathBuf {
+/// `/proc/thread-self/fd/<dirfd>/<name>` (the open directory itself, whatever its path names
+/// now), and startup fails if `/proc` cannot provide it; elsewhere it is the path, which
+/// [`same_dir`] checked.
+fn through_dir(dir_fd: &OwnedFd, name: &str, path: &Path) -> Result<PathBuf, BindError> {
     #[cfg(target_os = "linux")]
     {
-        use std::os::fd::AsRawFd;
-        // thread-self: a thread holding other credentials (tests) may still read its own fds.
-        let held = PathBuf::from(format!("/proc/thread-self/fd/{}", dir_fd.as_raw_fd()));
-        if held.is_dir() {
-            return held.join(name);
-        }
+        let _ = path;
+        through_proc(Path::new(PROC_FDS), dir_fd, name)
     }
-    let _ = (dir_fd, name);
-    path.to_owned()
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (dir_fd, name);
+        Ok(path.to_owned())
+    }
 }
 
-/// Every directory above the runtime root (after resolving symlinks) must be owned by root or
-/// us and not writable by group or others unless sticky: otherwise someone else could rename
-/// the root away and put their own in its place.
-fn check_parents(root: &Path) -> Result<(), BindError> {
-    let resolved = std::fs::canonicalize(root).map_err(|source| BindError::Io {
-        op: "resolve",
-        path: root.to_owned(),
-        source,
-    })?;
-    let me = peercred::effective_uid();
-    for parent in resolved.ancestors().skip(1) {
-        let m = std::fs::metadata(parent).map_err(|source| BindError::Io {
-            op: "stat",
-            path: parent.to_owned(),
-            source,
-        })?;
-        let writable = m.mode() & 0o022 != 0 && m.mode() & 0o1000 == 0;
-        if (m.uid() != 0 && m.uid() != me) || writable {
-            return Err(BindError::Insecure {
-                path: root.to_owned(),
-                reason: format!(
-                    "parent {} must be owned by root or uid {me} and not writable by others \
-                     unless sticky (owner uid {}, mode {:o})",
-                    parent.display(),
-                    m.uid(),
-                    m.mode() & 0o7777
-                ),
-            });
-        }
+/// `<fds>/<dirfd>/<name>`, once `<fds>/<dirfd>` is shown to be the directory held open.
+#[cfg(target_os = "linux")]
+fn through_proc(fds: &Path, dir_fd: &OwnedFd, name: &str) -> Result<PathBuf, BindError> {
+    use std::os::fd::AsRawFd;
+    let held = fds.join(dir_fd.as_raw_fd().to_string());
+    let want = fstat(dir_fd, &held)?;
+    let unusable = |why: String| BindError::Insecure {
+        path: held.clone(),
+        reason: format!(
+            "cannot reach the held service directory through {}: {why} (is /proc mounted?)",
+            fds.display()
+        ),
+    };
+    match std::fs::metadata(&held) {
+        Ok(m) if m.is_dir() && (m.dev(), m.ino()) == (want.dev, want.ino) => Ok(held.join(name)),
+        Ok(_) => Err(unusable("names another file".into())),
+        Err(e) => Err(unusable(e.to_string())),
     }
-    Ok(())
 }
 
-/// The runtime root: a directory owned by root or us that only its owner can write, under
-/// parents nobody else can write either.
+/// Opens the runtime root by walking its configured path from `/`, one component at a time,
+/// through directory descriptors (`openat`, `O_NOFOLLOW | O_DIRECTORY`). Every directory above
+/// the root must be owned by root or us and not writable by group or others unless sticky:
+/// otherwise someone else could rename the next component away and put their own in its place.
+/// The root itself must be owned by root or us and writable only by its owner. A symlink
+/// anywhere in the path is refused, not resolved; so are a relative path and `..`.
 fn open_root(root: &Path) -> Result<OwnedFd, BindError> {
-    let fd = open_dir(CWD, root, root)?;
-    check_parents(root)?;
-    let m = fstat(&fd, root)?;
+    use std::path::Component;
     let me = peercred::effective_uid();
-    let writable_by_others = m.mode.intersects(Mode::WGRP | Mode::WOTH);
-    if (m.uid != 0 && m.uid != me) || writable_by_others {
-        return Err(BindError::Insecure {
-            path: root.to_owned(),
-            reason: format!(
-                "runtime root must be owned by root or uid {me} and writable only by its owner \
-                 (owner uid {}, mode {:o})",
+    let insecure = |reason: String| BindError::Insecure {
+        path: root.to_owned(),
+        reason,
+    };
+    if !root.is_absolute() {
+        return Err(insecure("runtime root must be an absolute path".into()));
+    }
+    let mut walked = PathBuf::from("/");
+    let mut fd = open_dir(CWD, &walked, &walked)?;
+    for component in root.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(insecure("runtime root must not contain `..`".into()));
+            }
+        };
+        // The directory just walked holds `name`: it must be one nobody else can change.
+        let m = fstat(&fd, &walked)?;
+        let writable = m.mode.intersects(Mode::WGRP | Mode::WOTH) && !m.mode.contains(Mode::SVTX);
+        if (m.uid != 0 && m.uid != me) || writable {
+            return Err(insecure(format!(
+                "parent {} must be owned by root or uid {me} and not writable by others unless \
+                 sticky (owner uid {}, mode {:o})",
+                walked.display(),
                 m.uid,
                 mode_bits(m.mode)
-            ),
-        });
+            )));
+        }
+        walked.push(name);
+        fd = open_dir(&fd, Path::new(name), &walked)?;
+    }
+    let m = fstat(&fd, root)?;
+    let writable_by_others = m.mode.intersects(Mode::WGRP | Mode::WOTH);
+    if (m.uid != 0 && m.uid != me) || writable_by_others {
+        return Err(insecure(format!(
+            "runtime root must be owned by root or uid {me} and writable only by its owner \
+             (owner uid {}, mode {:o})",
+            m.uid,
+            mode_bits(m.mode)
+        )));
     }
     Ok(fd)
 }
@@ -417,12 +463,30 @@ fn open_service_dir(
     Ok(fd)
 }
 
-/// Takes the instance lock for the life of the returned descriptor.
+/// `uid A gid B mode C` of a file found.
+fn describe(m: &Meta) -> String {
+    format!("uid {} gid {} mode {:o}", m.uid, m.gid, mode_bits(m.mode))
+}
+
+/// Takes the instance lock for the life of the returned descriptor. A lock this call creates
+/// is given to `owner`, mode `0600`; an existing one must already be exactly that.
 fn lock(dir_fd: &OwnedFd, dir: &SocketDir, owner: Ownership) -> Result<OwnedFd, BindError> {
-    let path = dir.lock_path();
-    let flags = OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let fd = match rustix::fs::openat(dir_fd, dir.lock_name(), flags, mode(LOCK_MODE)) {
-        Ok(fd) => fd,
+    let (name, path) = (dir.lock_name(), dir.lock_path());
+    let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let opened = match rustix::fs::openat(
+        dir_fd,
+        name.as_str(),
+        flags | OFlags::CREATE | OFlags::EXCL,
+        mode(LOCK_MODE),
+    ) {
+        Ok(fd) => Ok((fd, true)),
+        Err(Errno::EXIST) => {
+            rustix::fs::openat(dir_fd, name.as_str(), flags, Mode::empty()).map(|fd| (fd, false))
+        }
+        Err(e) => Err(e),
+    };
+    let (fd, created) = match opened {
+        Ok(opened) => opened,
         Err(Errno::LOOP) => {
             return Err(BindError::NotASocket {
                 path,
@@ -430,11 +494,10 @@ fn lock(dir_fd: &OwnedFd, dir: &SocketDir, owner: Ownership) -> Result<OwnedFd, 
             })
         }
         Err(Errno::ACCESS | Errno::PERM) => {
-            let found = lstat_at(dir_fd, &dir.lock_name(), &path)?
-                .map(|m| format!("uid {} mode {:o}", m.uid, mode_bits(m.mode)));
+            let found = lstat_at(dir_fd, &name, &path)?.map(|m| describe(&m));
             return Err(BindError::Insecure {
                 reason: format!(
-                    "uid {} cannot open the lock ({})",
+                    "uid {} cannot open the lock ({}); refusing it",
                     peercred::effective_uid(),
                     found.as_deref().unwrap_or("gone")
                 ),
@@ -450,35 +513,48 @@ fn lock(dir_fd: &OwnedFd, dir: &SocketDir, owner: Ownership) -> Result<OwnedFd, 
             reason: format!("lock is a {}, not a regular file", kind_name(m.file_type)),
         });
     }
-    // Set explicitly on the inode we hold, never replaced: the umask may have loosened a fresh
-    // lock, and a lock a caller can open is a lock a caller can hold against every start.
-    let uid = (m.uid != owner.uid).then(|| Uid::from_raw(owner.uid));
-    let fixed = rustix::fs::fchown(&fd, uid, Some(Gid::from_raw(owner.gid)))
-        .and_then(|()| rustix::fs::fchmod(&fd, mode(LOCK_MODE)));
-    if let Err(e) = fixed {
+    let exact = |m: &Meta| m.uid == owner.uid && m.gid == owner.gid && m.mode == mode(LOCK_MODE);
+    if created {
+        // Set explicitly on the inode just created: neither the umask nor a setgid directory
+        // decides its owner or mode.
+        let uid = (m.uid != owner.uid).then(|| Uid::from_raw(owner.uid));
+        rustix::fs::fchown(&fd, uid, Some(Gid::from_raw(owner.gid)))
+            .and_then(|()| rustix::fs::fchmod(&fd, mode(LOCK_MODE)))
+            .map_err(|e| BindError::Insecure {
+                path: path.clone(),
+                reason: format!(
+                    "new lock is {} and cannot be made uid {} gid {} mode {:o}: {e}",
+                    describe(&m),
+                    owner.uid,
+                    owner.gid,
+                    LOCK_MODE
+                ),
+            })?;
+        let m = fstat(&fd, &path)?;
+        if !exact(&m) {
+            return Err(BindError::Insecure {
+                path,
+                reason: format!(
+                    "new lock must be uid {} gid {} mode {:o}, is {}",
+                    owner.uid,
+                    owner.gid,
+                    LOCK_MODE,
+                    describe(&m)
+                ),
+            });
+        }
+    } else if !exact(&m) {
+        // Never repaired in place: a caller that opened the lock while it was looser keeps its
+        // descriptor, and with it the flock, across a chown or chmod.
         return Err(BindError::Insecure {
             path,
             reason: format!(
-                "lock is uid {} gid {} mode {:o} and cannot be made uid {} gid {} mode {:o}: {e}",
-                m.uid,
-                m.gid,
-                mode_bits(m.mode),
+                "existing lock must be uid {} gid {} mode {:o}, is {}; refusing it (remove it \
+                 once no other process has it open)",
                 owner.uid,
                 owner.gid,
-                LOCK_MODE
-            ),
-        });
-    }
-    let m = fstat(&fd, &path)?;
-    if m.uid != owner.uid || m.mode != mode(LOCK_MODE) {
-        return Err(BindError::Insecure {
-            path,
-            reason: format!(
-                "lock must be uid {} mode {:o}, is uid {} mode {:o}",
-                owner.uid,
                 LOCK_MODE,
-                m.uid,
-                mode_bits(m.mode)
+                describe(&m)
             ),
         });
     }
@@ -526,7 +602,7 @@ fn clear_stale(dir_fd: &OwnedFd, dir: &SocketDir, owner: Ownership) -> Result<()
             expected: owner.uid,
         });
     }
-    let live = answers(&through_dir(dir_fd, &name, &path)).map_err(|source| BindError::Io {
+    let live = answers(&through_dir(dir_fd, &name, &path)?).map_err(|source| BindError::Io {
         op: "probe",
         path: path.clone(),
         source,
@@ -645,6 +721,7 @@ pub fn bind(dir: &SocketDir, owner: Ownership) -> Result<BoundSocket, BindError>
             return Err(BindError::Id(id));
         }
     }
+    check_socket_path(&dir.socket_path())?;
     let root_fd = open_root(dir.root())?;
     let dir_fd = open_service_dir(&root_fd, dir, owner)?;
     let lock_fd = lock(&dir_fd, dir, owner)?;
@@ -652,13 +729,14 @@ pub fn bind(dir: &SocketDir, owner: Ownership) -> Result<BoundSocket, BindError>
     clear_stale(&dir_fd, dir, owner)?;
 
     let (name, path) = (dir.socket_name(), dir.socket_path());
-    let listener = StdUnixListener::bind(through_dir(&dir_fd, &name, &path)).map_err(|source| {
-        BindError::Io {
-            op: "bind",
-            path: path.clone(),
-            source,
-        }
-    })?;
+    let listener =
+        StdUnixListener::bind(through_dir(&dir_fd, &name, &path)?).map_err(|source| {
+            BindError::Io {
+                op: "bind",
+                path: path.clone(),
+                source,
+            }
+        })?;
     let bound = lstat_at(&dir_fd, &name, &path)?.ok_or_else(|| BindError::Insecure {
         path: path.clone(),
         reason: "socket vanished right after bind".into(),
@@ -674,6 +752,18 @@ pub fn bind(dir: &SocketDir, owner: Ownership) -> Result<BoundSocket, BindError>
     };
     set_socket_owner_and_mode(&guard, owner)?;
     Ok(BoundSocket { listener, guard })
+}
+
+/// Clients connect to the advertised path, not the `/proc` one `bind(2)` goes through, so the
+/// advertised path must fit a `sun_path` itself.
+fn check_socket_path(path: &Path) -> Result<(), BindError> {
+    std::os::unix::net::SocketAddr::from_pathname(path)
+        .map(drop)
+        .map_err(|source| BindError::SocketPath {
+            path: path.to_owned(),
+            len: path.as_os_str().len(),
+            source,
+        })
 }
 
 /// `bind(2)` takes a path: check it still resolves to the directory we hold open.
@@ -917,7 +1007,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir_fd = open_dir(CWD, tmp.path(), tmp.path()).unwrap();
         let named = tmp.path().join("s.sock");
-        let via = through_dir(&dir_fd, "s.sock", &named);
+        let via = through_dir(&dir_fd, "s.sock", &named).unwrap();
         if cfg!(target_os = "linux") {
             assert!(
                 via.starts_with("/proc/thread-self/fd/"),
@@ -933,6 +1023,29 @@ mod tests {
         assert!(answers(&via).unwrap());
         drop(listener);
         assert!(!answers(&via).unwrap(), "stale");
+    }
+
+    /// Without a usable `/proc`, Linux refuses to start instead of falling back to the path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unusable_proc_is_an_error_not_a_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_fd = open_dir(CWD, tmp.path(), tmp.path()).unwrap();
+        let missing = tmp.path().join("no-proc");
+        let err = through_proc(&missing, &dir_fd, "s.sock").unwrap_err();
+        assert!(
+            matches!(&err, BindError::Insecure { reason, .. } if reason.contains("/proc")),
+            "{err}"
+        );
+        // A look-alike whose `<fd>` entry is some other directory.
+        use std::os::fd::AsRawFd;
+        let fake = tmp.path().join("fake");
+        std::fs::create_dir_all(fake.join(dir_fd.as_raw_fd().to_string())).unwrap();
+        let err = through_proc(&fake, &dir_fd, "s.sock").unwrap_err();
+        assert!(err.to_string().contains("another file"), "{err}");
+        // The real one works.
+        let via = through_proc(Path::new(PROC_FDS), &dir_fd, "s.sock").unwrap();
+        assert!(via.starts_with(PROC_FDS), "{}", via.display());
     }
 
     #[test]

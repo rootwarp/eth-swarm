@@ -135,6 +135,10 @@ async fn acl_per_method() {
         return;
     };
     // As root: cl-chain and cl-api are both in the socket group; only cl-chain gets cl-engine.
+    // A fresh root: the directory and lock above belong to root's own group, and an existing
+    // one of another group is refused, never repaired.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = runtime_root(tmp.path());
     let group = u.api.1;
     let text = engine_toml(&root, group, u.chain.0, &ENGINE_METHODS, only_chain, 5000).replace(
         &format!("cl-api = {}", not_me().wrapping_add(1)),

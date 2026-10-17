@@ -4,7 +4,7 @@
 //! ```toml
 //! network = "sepolia"          # resolved through network-config (embedded, sha256-pinned)
 //! metrics_port = 9104          # /metrics on 127.0.0.1 only; 9100..=9199
-//! metrics_max_connections = 8  # optional: /metrics connections served at once
+//! metrics_max_connections = 8  # optional: /metrics connections served at once; 1..=1024
 //! drain_timeout_ms = 10000     # optional: in-flight calls get this long after SIGTERM
 //! log_level = "info"           # optional: error, warn, info, debug, trace
 //!
@@ -33,7 +33,7 @@ use network_config::{ChainConfig, Network};
 use serde::Deserialize;
 use tracing_subscriber::filter::LevelFilter;
 
-use crate::telemetry::MetricsLimits;
+use crate::telemetry::{MetricsLimits, MAX_METRICS_CONNECTIONS};
 
 /// How long in-flight calls get after SIGTERM unless configured.
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -93,8 +93,8 @@ pub enum ConfigError {
     Chain(#[from] network_config::ConfigError),
     #[error("metrics_port {0} is outside 9100..=9199")]
     MetricsPort(u16),
-    #[error("metrics_max_connections must be positive")]
-    MetricsConnections,
+    #[error("metrics_max_connections {0} is outside 1..={MAX_METRICS_CONNECTIONS}")]
+    MetricsConnections(usize),
     #[error("drain_timeout_ms must be positive")]
     DrainTimeout,
     #[error("log_level {0:?} is not one of error, warn, info, debug, trace")]
@@ -154,7 +154,9 @@ impl Config {
         }
         let metrics_limits = match file.metrics_max_connections {
             None => MetricsLimits::default(),
-            Some(0) => return Err(ConfigError::MetricsConnections),
+            Some(n) if n == 0 || n > MAX_METRICS_CONNECTIONS => {
+                return Err(ConfigError::MetricsConnections(n))
+            }
             Some(n) => MetricsLimits {
                 max_connections: n,
                 ..MetricsLimits::default()
@@ -252,6 +254,19 @@ mod tests {
     }
 
     #[test]
+    fn metrics_connections_up_to_the_cap_load() {
+        for n in [1, MAX_METRICS_CONNECTIONS] {
+            let c = parse(&engine(&format!("metrics_max_connections = {n}"))).unwrap();
+            assert_eq!(c.metrics_limits.max_connections, n);
+        }
+        let err = parse(&engine("metrics_max_connections = 1025")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "metrics_max_connections 1025 is outside 1..=1024"
+        );
+    }
+
+    #[test]
     fn defaults_and_socket_root() {
         let text = engine("").replace("group = 991", "group = 991\nroot = \"/tmp/rt\"");
         let c = parse(&text).unwrap();
@@ -280,8 +295,21 @@ mod tests {
                 matches!(e, ConfigError::MetricsPort(0))
             }),
             (engine("metrics_max_connections = 0"), |e| {
-                matches!(e, ConfigError::MetricsConnections)
+                matches!(e, ConfigError::MetricsConnections(0))
             }),
+            (engine("metrics_max_connections = 1025"), |e| {
+                matches!(e, ConfigError::MetricsConnections(1025))
+            }),
+            // Above tokio's `Semaphore::MAX_PERMITS`, which would panic when /metrics starts.
+            (
+                engine("metrics_max_connections = 2305843009213693952"),
+                |e| {
+                    matches!(
+                        e,
+                        ConfigError::MetricsConnections(2_305_843_009_213_693_952)
+                    )
+                },
+            ),
             (engine("drain_timeout_ms = 0"), |e| {
                 matches!(e, ConfigError::DrainTimeout)
             }),

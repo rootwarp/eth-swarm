@@ -35,9 +35,11 @@ pub fn not_me() -> u32 {
 }
 
 /// A runtime root for one test: `<tmp>/run`, with `tmp` and it mode 0755 so other users can
-/// traverse them.
+/// traverse them. Named without symlinks, which the socket bind refuses (macOS's temp dir is
+/// under the `/var` symlink).
 pub fn runtime_root(tmp: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
+    let tmp = &std::fs::canonicalize(tmp).unwrap();
     let root = tmp.join("run");
     std::fs::create_dir(&root).unwrap();
     for dir in [tmp, &root] {

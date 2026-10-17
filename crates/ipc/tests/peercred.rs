@@ -46,9 +46,25 @@ fn not_me() -> u32 {
     }
 }
 
-/// A fresh runtime root: a temp dir owned by us, mode 0700.
-fn runtime_root() -> tempfile::TempDir {
-    tempfile::Builder::new().prefix("uds-").tempdir().unwrap()
+/// A fresh runtime root: a temp dir owned by us, mode 0700, named by a path without symlinks
+/// (`bind` refuses one; macOS's temp dir is under the `/var` symlink).
+struct RuntimeRoot {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl RuntimeRoot {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn runtime_root() -> RuntimeRoot {
+    let dir = tempfile::Builder::new().prefix("uds-").tempdir().unwrap();
+    RuntimeRoot {
+        path: std::fs::canonicalize(dir.path()).unwrap(),
+        _dir: dir,
+    }
 }
 
 fn mode_of(path: &Path) -> u32 {
@@ -704,6 +720,43 @@ async fn bind_modes() {
 
 // ---- the instance lock and the runtime root's parents -------------------------------------
 
+/// A service directory for `owner` with an existing lock file of `group` and `mode`.
+fn dir_with_lock(root: &Path, name: &str, owner: Ownership, group: u32, mode: u32) -> SocketDir {
+    let dir = SocketDir::under(root, name).unwrap();
+    premade_dir(&dir);
+    if owner.gid != effective_gid() {
+        std::os::unix::fs::chown(dir.dir(), None, Some(owner.gid)).unwrap();
+    }
+    std::fs::write(dir.lock_path(), b"").unwrap();
+    std::os::unix::fs::chown(dir.lock_path(), None, Some(group)).unwrap();
+    set_mode(&dir.lock_path(), mode);
+    dir
+}
+
+/// `bind` refuses `dir`'s existing lock, names what it found, and leaves it exactly as it was.
+fn assert_lock_refused(dir: &SocketDir, owner: Ownership, found: (u32, u32, u32)) {
+    let before = std::fs::symlink_metadata(dir.lock_path()).unwrap();
+    let err = uds::bind(dir, owner).unwrap_err();
+    let (uid, gid, mode) = found;
+    assert!(
+        matches!(&err, BindError::Insecure { path, reason }
+            if *path == dir.lock_path()
+                && reason.contains(&format!("uid {uid} gid {gid} mode {mode:o}"))),
+        "{err}"
+    );
+    assert_lock_untouched(dir, &before);
+}
+
+fn assert_lock_untouched(dir: &SocketDir, before: &std::fs::Metadata) {
+    let after = std::fs::symlink_metadata(dir.lock_path()).unwrap();
+    assert_eq!(
+        (after.ino(), after.uid(), after.gid(), after.mode()),
+        (before.ino(), before.uid(), before.gid(), before.mode()),
+        "the lock is neither repaired nor replaced"
+    );
+    assert!(!dir.socket_path().exists(), "nothing bound");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn lock_file_owner_and_mode_enforced() {
     let root = runtime_root();
@@ -712,77 +765,106 @@ async fn lock_file_owner_and_mode_enforced() {
         uid: me(),
         gid: group,
     };
-    // A lock left with a loose mode (umask, an old run, a hand edit) is reset to 0600 in place.
-    for loose in [0o644, 0o660, 0o666, 0o640] {
-        let dir = SocketDir::under(root.path(), &format!("l{loose:o}")).unwrap();
-        premade_dir(&dir);
-        if group != effective_gid() {
-            std::os::unix::fs::chown(dir.dir(), None, Some(group)).unwrap();
-        }
-        std::fs::write(dir.lock_path(), b"").unwrap();
-        set_mode(&dir.lock_path(), loose);
-        let ino = std::fs::metadata(dir.lock_path()).unwrap().ino();
-        let bound = uds::bind(&dir, owner).unwrap();
-        assert_owned(&dir.lock_path(), me(), group, 0o600);
-        assert_eq!(
-            std::fs::metadata(dir.lock_path()).unwrap().ino(),
-            ino,
-            "same inode"
+    // An existing lock with a loose mode is refused untouched: whoever opened it while it was
+    // loose may still hold a descriptor, and with it the flock, against every restart.
+    for loose in [0o640, 0o644, 0o660, 0o666, 0o700, 0o400] {
+        let dir = dir_with_lock(root.path(), &format!("l{loose:o}"), owner, group, loose);
+        assert_lock_refused(&dir, owner, (me(), group, loose));
+    }
+    // An existing lock of the right owner and mode is taken as is.
+    let dir = dir_with_lock(root.path(), "exact", owner, group, 0o600);
+    let ino = std::fs::metadata(dir.lock_path()).unwrap().ino();
+    drop(uds::bind(&dir, owner).unwrap());
+    assert_owned(&dir.lock_path(), me(), group, 0o600);
+    assert_eq!(std::fs::metadata(dir.lock_path()).unwrap().ino(), ino);
+    // An existing lock of another group is refused untouched.
+    if let Some(g) = second_group() {
+        let other = if g == group { effective_gid() } else { g };
+        let dir = dir_with_lock(root.path(), "gid", owner, other, 0o600);
+        assert_lock_refused(&dir, owner, (me(), other, 0o600));
+    } else {
+        eprintln!(
+            "lock_file_owner_and_mode_enforced: no second group; the wrong-gid case runs in \
+             the root-tests job"
         );
-        drop(bound);
     }
-    // A lock even we cannot open is refused, naming its owner and mode.
-    let dir = SocketDir::under(root.path(), "closed").unwrap();
-    premade_dir(&dir);
-    std::fs::write(dir.lock_path(), b"").unwrap();
-    set_mode(&dir.lock_path(), 0o000);
+    // A lock even we cannot open is refused, naming its owner, group and mode.
+    let dir = dir_with_lock(root.path(), "closed", owner, group, 0o000);
     if me() != 0 {
-        let err = uds::bind(&dir, Ownership::current()).unwrap_err();
+        let before = std::fs::symlink_metadata(dir.lock_path()).unwrap();
+        let err = uds::bind(&dir, owner).unwrap_err();
         assert!(err.to_string().contains("cannot open the lock"), "{err}");
+        assert!(
+            err.to_string()
+                .contains(&format!("uid {} gid {group} mode 0", me())),
+            "{err}"
+        );
+        assert_lock_untouched(&dir, &before);
     }
-    // A fresh lock is 0600 whatever the umask allowed.
+    // A fresh lock is 0600 with the service owner and group, whatever the umask allowed.
     let dir = SocketDir::under(root.path(), "fresh").unwrap();
     drop(uds::bind(&dir, owner).unwrap());
     assert_owned(&dir.lock_path(), me(), group, 0o600);
+    // And it is taken as is on the next start.
+    drop(uds::bind(&dir, owner).unwrap());
 
     let Some(u) = users("lock_file_owner_and_mode_enforced") else {
         return;
     };
-    // A lock root created for the service: a restart as the service user is refused with a
-    // clear error instead of hanging or taking over.
-    let dir = SocketDir::under(root.path(), "root-lock").unwrap();
     set_mode(root.path(), 0o755);
-    std::fs::create_dir(dir.dir()).unwrap();
-    std::os::unix::fs::chown(dir.dir(), Some(u.chain.0), Some(u.api.1)).unwrap();
-    set_mode(&dir.dir(), 0o750);
-    std::fs::write(dir.lock_path(), b"").unwrap();
-    set_mode(&dir.lock_path(), 0o600);
     let owner = Ownership {
         uid: u.chain.0,
         gid: u.api.1,
     };
-    let d = dir.clone();
-    let err = as_user(u.chain, &[u.chain.1, u.api.1], move || {
-        uds::bind(&d, owner).map(drop).unwrap_err().to_string()
-    });
-    assert!(err.contains("lock"), "{err}");
-    assert_owned(&dir.lock_path(), 0, 0, 0o600);
-    // Root, starting for the service user, takes the lock over for it.
+    // A fresh lock made by root for the service user.
+    let dir = SocketDir::under(root.path(), "fresh-for-chain").unwrap();
     drop(uds::bind(&dir, owner).unwrap());
     assert_owned(&dir.lock_path(), u.chain.0, u.api.1, 0o600);
-    // A group-readable lock of another user (a caller could hold its flock) is not trusted.
-    std::os::unix::fs::chown(dir.lock_path(), Some(u.other.0), Some(u.other.1)).unwrap();
-    set_mode(&dir.lock_path(), 0o660);
-    let d = dir.clone();
-    let err = as_user(u.chain, &[u.chain.1, u.api.1], move || {
-        uds::bind(&d, owner).map(drop).unwrap_err().to_string()
-    });
-    assert!(err.contains("lock"), "{err}");
+    // A lock of root, of another user or of another group is refused untouched, both for the
+    // service user and for root starting on its behalf.
+    for (name, found) in [
+        ("root-lock", (0, 0, 0o600)),
+        ("other-lock", (u.other.0, u.other.1, 0o660)),
+        ("gid-lock", (u.chain.0, u.other.1, 0o600)),
+    ] {
+        let dir = SocketDir::under(root.path(), name).unwrap();
+        std::fs::create_dir(dir.dir()).unwrap();
+        std::os::unix::fs::chown(dir.dir(), Some(u.chain.0), Some(u.api.1)).unwrap();
+        set_mode(&dir.dir(), 0o750);
+        std::fs::write(dir.lock_path(), b"").unwrap();
+        std::os::unix::fs::chown(dir.lock_path(), Some(found.0), Some(found.1)).unwrap();
+        set_mode(&dir.lock_path(), found.2);
+        let before = std::fs::symlink_metadata(dir.lock_path()).unwrap();
+        let d = dir.clone();
+        let err = as_user(u.chain, &[u.chain.1, u.api.1], move || {
+            uds::bind(&d, owner).map(drop).unwrap_err().to_string()
+        });
+        assert!(err.contains("lock"), "{name}: {err}");
+        assert_lock_untouched(&dir, &before);
+        assert_lock_refused(&dir, owner, found);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn root_with_a_writable_parent_refused() {
     let tmp = runtime_root();
+    // A group-writable parent anywhere above the root.
+    let shared = tmp.path().join("shared");
+    std::fs::create_dir_all(shared.join("a/run")).unwrap();
+    set_mode(&shared.join("a"), 0o755);
+    set_mode(&shared.join("a/run"), 0o755);
+    set_mode(&shared, 0o770);
+    let err = uds::bind(
+        &SocketDir::under(shared.join("a/run"), "svc").unwrap(),
+        Ownership::current(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, BindError::Insecure { reason, .. }
+            if reason.contains("parent") && reason.contains(&shared.display().to_string())),
+        "{err}"
+    );
+    assert!(!shared.join("a/run/svc").exists());
     // Anyone may rename or replace entries in a world-writable parent without the sticky bit.
     let loose = tmp.path().join("loose");
     std::fs::create_dir(&loose).unwrap();
@@ -816,4 +898,93 @@ async fn root_with_a_writable_parent_refused() {
         )
         .unwrap(),
     );
+}
+
+// ---- the socket path must fit a Unix socket address ------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overlong_socket_path_fails_before_any_change() {
+    let tmp = runtime_root();
+    // A root that exists and passes every check, deep enough that
+    // `<root>/<svc>/<svc>.sock` cannot be a `sun_path` (104 bytes on macOS, 108 on Linux).
+    let root = tmp.path().join("r".repeat(110));
+    std::fs::create_dir(&root).unwrap();
+    set_mode(&root, 0o700);
+    let dir = SocketDir::under(&root, "cl-engine").unwrap();
+    let err = uds::bind(&dir, Ownership::current()).unwrap_err();
+    assert!(
+        matches!(&err, BindError::SocketPath { path, .. } if *path == dir.socket_path()),
+        "{err}"
+    );
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("too long"), "{err}");
+    assert_eq!(
+        std::fs::read_dir(&root).unwrap().count(),
+        0,
+        "nothing created under the root"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn root_path_with_a_symlink_component_refused() {
+    let tmp = runtime_root();
+    let real = tmp.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    set_mode(&real, 0o755);
+    let run = real.join("run");
+    std::fs::create_dir(&run).unwrap();
+    set_mode(&run, 0o755);
+    // Control: the real path is accepted.
+    drop(
+        uds::bind(
+            &SocketDir::under(&run, "svc").unwrap(),
+            Ownership::current(),
+        )
+        .unwrap(),
+    );
+
+    // A symlink above the root, even one in a directory only we can write and pointing at a
+    // root that passes every check, is refused rather than followed.
+    std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+    // And one in a world-writable directory, whose target is safe: anyone could have retargeted
+    // it, but resolving first would only ever check the target's parents.
+    let loose = tmp.path().join("loose");
+    std::fs::create_dir(&loose).unwrap();
+    std::os::unix::fs::symlink(&real, loose.join("link")).unwrap();
+    set_mode(&loose, 0o777);
+    for via in [tmp.path().join("link/run"), loose.join("link/run")] {
+        let dir = SocketDir::under(&via, "other").unwrap();
+        let err = uds::bind(&dir, Ownership::current()).unwrap_err();
+        assert!(
+            matches!(&err, BindError::Insecure { reason, .. }
+                if reason.contains("symlink") || reason.contains("parent")),
+            "{}: {err}",
+            via.display()
+        );
+        assert!(!run.join("other").exists(), "nothing created through it");
+    }
+    let err = uds::bind(
+        &SocketDir::under(tmp.path().join("link/run"), "other").unwrap(),
+        Ownership::current(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, BindError::Insecure { path, reason }
+            if reason.contains("symlink") && *path == tmp.path().join("link")),
+        "{err}"
+    );
+
+    // A relative root or one with `..` is not walked from `/`: refused.
+    for odd in [PathBuf::from("run"), real.join("../real/run")] {
+        let err = uds::bind(
+            &SocketDir::under(&odd, "svc").unwrap(),
+            Ownership::current(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, BindError::Insecure { .. }),
+            "{}: {err}",
+            odd.display()
+        );
+    }
 }
