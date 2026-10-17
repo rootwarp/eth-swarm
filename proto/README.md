@@ -31,7 +31,7 @@ These are the service-to-service contracts for the ETH Swarm beacon node. They a
 - **Additive only.** Never change a field's number, type, name or oneof membership, and never remove an RPC. A removed field goes into `reserved` (number and name). Field numbers are never reused.
 - **Version range in `Hello`.** Each side advertises `min_api_version` and `max_api_version`, and the link uses the **highest common version**, min(max_a, max_b). The link fails with `ERROR_CODE_VERSION_MISMATCH` if there is no common version.
 - **Floor.** Each service also enforces a **configured floor**, and a link below it fails. Every build accepts N and N-1. When we drop N-1, the floor rises to N, which prevents downgrades.
-- **CI gate.** `scripts/buf-breaking.sh` (FILE rules) must pass. It checks against `proto/.baseline/v1.binpb` until a git `main` exists, and against `main` after that.
+- **CI gate.** `scripts/buf-breaking.sh refs/remotes/origin/develop` (FILE rules) must pass on every PR. Without an argument the script checks against `refs/heads/develop` (else `refs/remotes/origin/develop`), and `--baseline` checks against the frozen `proto/.baseline/v1.binpb`. Pass fully qualified refs: a short `origin/develop` resolves `refs/tags/origin/develop` first, so a pushed tag could swap the baseline.
 - **Pre-v1 contract.** The contract is not frozen until v1 is tagged. Re-baselines are allowed before then, and each one gets its own commit that touches only the baseline and one README line.
 - **After v1,** any re-baseline needs Ezra's sign-off.
 - **How to re-baseline.** Run `buf build -o .baseline/v1.binpb` from `proto/`. Commit the result on its own, with one line in the re-baseline log below.

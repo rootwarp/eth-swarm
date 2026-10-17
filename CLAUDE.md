@@ -25,7 +25,7 @@ cargo test -p spec-tests --lib                # runner unit tests (no vectors ne
 Spec vectors: download them first, then run the `vectors` test target (libtest-mimic, `harness = false`):
 
 ```bash
-PRESETS="minimal" testing/fetch-vectors.sh    # → target/spec-vectors, sha256-verified, cached by stamp
+PRESETS="minimal" testing/fetch-vectors.sh    # → target/spec-vectors; tag→commit and sha256 pinned, fails closed
 cargo test -p spec-tests --release --test vectors
 # filter by trial name:
 cargo test -p spec-tests --release --test vectors -- gloas_ssz_static_minimal::BeaconState
@@ -42,10 +42,12 @@ Policy and contract gates (CI runs these):
 cargo deny check
 bash scripts/check-ssz-revs.sh                # SSZ git deps must match the pinned revs exactly
 (cd proto && buf lint && buf build)
-scripts/buf-breaking.sh                       # vs git `main` if it exists, else proto/.baseline/v1.binpb
+scripts/buf-breaking.sh refs/remotes/origin/develop   # default: refs/heads/develop, else the remote ref; --baseline
+bash scripts/check-workflows.sh               # runs crates/ci-checks: parses workflows as YAML, enforces hardening
+cargo test -p ci-checks                       # workflow rules + offline tests of the CI shell scripts
 ```
 
-`scripts/check-ssz-revs.sh` (`declare -A`) and `testing/fetch-vectors.sh` (`mapfile`) need **bash ≥ 4**. On macOS `/bin/bash` is 3.2, and `check-ssz-revs.sh` fails there with "unbound variable", so run both with a Homebrew bash. `fetch-vectors.sh` also needs python3 ≥ 3.11 (`tomllib`) and `sha256sum`.
+`scripts/check-ssz-revs.sh` (`declare -A`) needs **bash ≥ 4**. On macOS `/bin/bash` is 3.2, and `check-ssz-revs.sh` fails there with "unbound variable", so run it with a Homebrew bash. `fetch-vectors.sh` needs python3 ≥ 3.11 (`tomllib`), `git`, `curl`, `sha256sum` and, for `.zip` assets, `unzip`. The script tests run `bash` from `PATH`.
 
 `bench/verify-ipc` is a **standalone workspace** (it has an empty `[workspace]` and is not a root member), and tonic-build needs `protoc`. It benchmarks BLS batch verification over UDS, comparing gRPC with raw framing. `cargo run --release --manifest-path bench/verify-ipc/Cargo.toml` runs the bench and starts its own `server` child. Its proto (`ethswarm.benchverify.v1`) is local to the bench and is not the real `proto/ethswarm/verify/v1` contract.
 

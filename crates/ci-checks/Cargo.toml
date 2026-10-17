@@ -1,0 +1,20 @@
+[package]
+name = "ci-checks"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "CI gates: GitHub Actions workflow hardening, plus tests for the CI shell scripts."
+
+[dependencies]
+# default-features off drops encoding_rs; workflows are UTF-8.
+yaml-rust2 = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
+toml = "0.8"
+
+[[bin]]
+name = "check-workflows"
+path = "src/main.rs"

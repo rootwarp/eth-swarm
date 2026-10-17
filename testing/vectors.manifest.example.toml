@@ -1,11 +1,16 @@
-# Pinned test-vector archives. Every sha256 below was verified on 2026-10-15 by downloading
-# the file and running sha256sum. Each matched GitHub's release-asset digest.
-# For ssz-specs, it also matched the upstream .sha256 file.
+# Pinned test-vector archives. Every source pins its exact tag and the commit that tag resolves
+# to (checked with `git ls-remote`, annotated tags peeled via ^{}); every asset pins a sha256.
+# testing/fetch-vectors.sh fails closed on any mismatch.
+# consensus-specs and ssz-specs sha256 values were verified on 2026-10-15 by downloading the file
+# and running sha256sum; each matched GitHub's release-asset digest, and for ssz-specs also the
+# upstream .sha256 file. Tag commits, cryptography-specs and bls12-381-tests were verified the same
+# way on 2026-10-17 (bls12-381-tests v0.1.2 predates GitHub's asset digests; download only).
 
 [[source]]
-name = "consensus-specs"
-repo = "ethereum/consensus-specs"
-tag  = "v1.7.0-beta.4"   # published 2026-10-08T19:27:03Z
+name   = "consensus-specs"
+repo   = "ethereum/consensus-specs"
+tag    = "v1.7.0-beta.4"   # published 2026-10-08T19:27:03Z
+commit = "aa16bb4c156184e9548a997d53efaf2a228a6304"
 
   [[source.asset]]
   file   = "general.tar.gz"   # 3,228 bytes; contains only tests/general/altair/bls/eth_* cases
@@ -25,10 +30,33 @@ tag  = "v1.7.0-beta.4"   # published 2026-10-08T19:27:03Z
   optional = true
 
 [[source]]
-name = "ssz-specs"
-repo = "ethereum/ssz-specs"
-tag  = "v0.1.0"
+name   = "ssz-specs"
+repo   = "ethereum/ssz-specs"
+tag    = "v0.1.0"   # published 2026-09-01T21:51:15Z
+commit = "7bce07ff7d51b1a3c66ff4e2bd3233ac248ede70"
 
   [[source.asset]]
   file   = "ssz-test-vectors-v0.1.0.tar.gz"   # 22,574 bytes; JSON fixtures under fixtures/ssz/
   sha256 = "e2a65f032b59835c26127295293ea1bc07d7ca0ea1fe0e4f1128dffed333f878"
+
+[[source]]
+name   = "cryptography-specs"
+repo   = "ethereum/cryptography-specs"
+tag    = "v0.1.0"   # published 2026-05-07T05:49:27Z
+commit = "ea1716be4f4a4835799e92d182e03b5c0bc2b6b9"
+
+  [[source.asset]]
+  file     = "tests.zip"   # 22,017,832 bytes; BLS/KZG vectors under tests/; no runner yet
+  sha256   = "eeb4893eb544f770810d9499007ebb0b9319431ea412bd54736e1c274da3d037"
+  optional = true
+
+[[source]]
+name   = "bls12-381-tests"
+repo   = "ethereum/bls12-381-tests"
+tag    = "v0.1.2"   # published 2023-03-01T10:13:31Z
+commit = "89ff3a86f1a9b89a555495f7535c853cda589320"
+
+  [[source.asset]]
+  file     = "bls_tests_yaml.tar.gz"   # 8,319 bytes; no runner yet
+  sha256   = "a4ef909b6248395094949a3bcdeb4e1b5b999733d4436f2c5006edba99d29279"
+  optional = true

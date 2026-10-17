@@ -1,0 +1,54 @@
+# Nightly, uncached: re-fetch every manifest source (all presets and optional assets), re-check
+# every tag -> commit pin and sha256, run the full vector suite, and re-run the dependency policy
+# against today's advisory database. Also runnable by hand via workflow_dispatch.
+name: nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  vectors:
+    name: fetch every manifest source, full vector suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Free disk space for the full vector set (archives are kept for re-hashing)
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc && df -h .
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - name: Fetch and verify every manifest source (no cache, no PRESETS filter)
+        run: INCLUDE_OPTIONAL=1 bash testing/fetch-vectors.sh
+      - name: Disk usage
+        run: du -sh target/spec-vectors/*/* && df -h .
+      - run: cargo test --workspace --locked
+      - run: cargo test -p spec-tests --release --locked --test vectors
+
+  policy:
+    name: cargo deny, ssz revs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+      - run: cargo deny check
+      - run: bash scripts/check-ssz-revs.sh
