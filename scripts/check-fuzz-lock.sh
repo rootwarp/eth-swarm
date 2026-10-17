@@ -17,15 +17,25 @@
 #     the root workspace has members (cl-sync, cl-api, ...) whose features the fuzz build never
 #     enables, so the fuzz lock may lack an edge. It may never point an edge at another package
 #     (another version, another source) or add one the root lock does not give that package.
+#   - fuzz/Cargo.lock satisfies its manifests: `cargo metadata --locked` in fuzz/ succeeds. The
+#     checks above only compare the two locks, so a fuzz lock that lacks a package a fuzzed
+#     crate's manifest now needs (a dependency added to crates/cl-p2p, say) passes them, and
+#     fails only here. Regenerate the lock with fuzz/regen-lock.sh whenever a fuzzed crate's
+#     dependencies change: it rebuilds it from the root lock, so every shared package keeps its
+#     root version and source.
 # scripts/check-libp2p-revs.sh and scripts/check-ssz-revs.sh then vouch for the root lock, and
 # so for both.
 #
 # Usage: scripts/check-fuzz-lock.sh [ROOT]   (default: this repo)
-# Exit: 0 OK, 1 a mismatch, 2 a file is missing or does not parse. Needs python3 >= 3.11.
+# Exit: 0 OK, 1 a mismatch or a lock cargo would have to update, 2 a file is missing or does not
+# parse. Needs python3 >= 3.11 and cargo (in fuzz/, so the fuzz/rust-toolchain.toml nightly; it
+# may fetch the locked sources unless CARGO_NET_OFFLINE=true). FUZZ_LOCK_CARGO replaces cargo
+# for the resolution check (the tests' stub).
 set -euo pipefail
 root=${1:-$(cd "$(dirname "$0")/.." && pwd)}
 
-python3 -I - "$root" <<'PY'
+rc=0
+python3 -I - "$root" <<'PY' || rc=$?
 import sys, tomllib
 from pathlib import Path
 
@@ -107,5 +117,14 @@ if errors:
     sys.exit(1)
 n = len(fuzz_lock.get("package", []))
 n_edges = sum(len(v) for v in fuzz_edges.values())
-print(f"fuzz lock OK: {n} packages and {n_edges} dependency edges, all but {sorted(FUZZ_ONLY)} resolved as in Cargo.lock")
+print(f"lockfiles agree: {n} packages and {n_edges} dependency edges, all but {sorted(FUZZ_ONLY)} resolved as in Cargo.lock")
 PY
+((rc != 2)) || exit 2
+
+if ! out=$(cd "$root/fuzz" && "${FUZZ_LOCK_CARGO:-cargo}" metadata --locked --format-version 1 2>&1 >/dev/null); then
+  echo "ERROR fuzz/Cargo.lock does not satisfy fuzz/Cargo.toml and its path crates (cargo metadata --locked failed); run fuzz/regen-lock.sh:"
+  printf '%s\n' "$out" | sed 's/^/  /'
+  exit 1
+fi
+((rc == 0)) || exit "$rc"
+echo "fuzz lock OK: fuzz/Cargo.lock agrees with Cargo.lock and satisfies its manifests"

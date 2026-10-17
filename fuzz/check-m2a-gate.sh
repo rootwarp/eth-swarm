@@ -5,8 +5,9 @@
 # ping_goodbye, blocks_by_range_resp), each run to completion for >= 3600 s with executions,
 # exit 0 and 0 crashes, 0 OOMs and 0 timeouts, from a clean tree, and:
 #   - its decoder key equals this tree's: `git rev-parse HEAD:<path>` of every keyed path and the
-#     sha256 of fuzz/Cargo.lock (fuzz/m2a-common.sh lists them). A keyed path with uncommitted
-#     changes fails too: HEAD's key would match while the binary would be built from other
+#     sha256 of Cargo.lock and fuzz/Cargo.lock (fuzz/m2a-common.sh lists them). A keyed path with
+#     uncommitted changes fails too, and so does one git is told not to look at (assume-unchanged
+#     or skip-worktree): HEAD's key would match while the binary would be built from other
 #     sources;
 #   - its limits are exactly the policy in fuzz/m2a-common.sh: -malloc_limit_mb, -rss_limit_mb,
 #     -timeout, each target's -max_len and the build flags (-O -a);

@@ -49,6 +49,7 @@ printf '[toolchain]\nchannel = "nightly-2026-10-17"\n' > "$fx/fuzz/rust-toolchai
 echo 'pub fn run() {}' > "$fx/fuzz/src/lib.rs"
 echo '#![no_main]' > "$fx/fuzz/fuzz_targets/status_v2.rs"
 echo 'version = 4' > "$fx/fuzz/Cargo.lock"
+echo 'version = 4' > "$fx/Cargo.lock"
 git init -q "$fx"
 g add -A
 g commit -q -m fixture
@@ -171,7 +172,7 @@ check fail "no argument" "Usage" bash "$checker"
 
 ok="$tmp/ok.json"
 # Every keyed path, once changed and committed, makes the old gate stale.
-for path in Cargo.toml crates/p2p-wire/src/lib.rs crates/consensus-types/src/lib.rs \
+for path in Cargo.toml Cargo.lock fuzz/Cargo.lock crates/p2p-wire/src/lib.rs crates/consensus-types/src/lib.rs \
   crates/cl-p2p/Cargo.toml crates/cl-p2p/src/rpc/mod.rs crates/cl-p2p/src/rpc/codec.rs \
   fuzz/Cargo.toml fuzz/rust-toolchain.toml fuzz/src/lib.rs fuzz/fuzz_targets/status_v2.rs \
   fuzz/corpus/status_v2/valid fuzz/corpus-slow/blocks_by_range_resp/slow-seed fuzz/m2a-common.sh fuzz/build-m2a.sh fuzz/run-m2a-gate.sh; do
@@ -188,10 +189,13 @@ g add -A
 g commit -q -m "outside the key"
 check pass "a commit outside the key keeps the gate" "" bash "$checker" "$ok"
 
-# The lockfile is keyed by its sha256, committed or not.
-echo '# edited' >> "$fx/fuzz/Cargo.lock"
-check fail "an edited fuzz/Cargo.lock" "fuzz/Cargo.lock" bash "$checker" "$ok"
-g checkout -q -- fuzz/Cargo.lock
+# Both lockfiles are keyed by their sha256 (committed: stale above) and dirty-checked: a root
+# Cargo.lock bump (snap, say) changes what the fuzzed decoder links.
+for lock in fuzz/Cargo.lock Cargo.lock; do
+  echo '# edited' >> "$fx/$lock"
+  check fail "an uncommitted edit to $lock" "M $lock" bash "$checker" "$ok"
+  g checkout -q -- "$lock"
+done
 
 # An uncommitted change to a keyed path: HEAD's key would match, the built tree would not.
 echo '// local edit' >> "$fx/crates/p2p-wire/src/lib.rs"
@@ -200,9 +204,22 @@ g checkout -q -- crates/p2p-wire/src/lib.rs
 touch "$fx/fuzz/corpus/status_v2/new-seed"
 check fail "untracked file under a keyed path" "uncommitted" bash "$checker" "$ok"
 rm "$fx/fuzz/corpus/status_v2/new-seed"
+# A keyed file git is told not to look at: `git status` would not show the edit.
+for flag in assume-unchanged skip-worktree; do
+  g update-index "--$flag" crates/p2p-wire/src/lib.rs
+  echo '// hidden edit' >> "$fx/crates/p2p-wire/src/lib.rs"
+  [[ -z $(g status --porcelain) ]] || echo "note: git status shows the $flag edit"
+  check fail "an edited keyed file with $flag set" "$flag: crates/p2p-wire/src/lib.rs" bash "$checker" "$ok"
+  g update-index "--no-$flag" crates/p2p-wire/src/lib.rs
+  g checkout -q -- crates/p2p-wire/src/lib.rs
+  g update-index "--$flag" fuzz/Cargo.lock
+  check fail "a keyed file with $flag set, even unedited" "$flag: fuzz/Cargo.lock" bash "$checker" "$ok"
+  g update-index "--no-$flag" fuzz/Cargo.lock
+done
 check pass "clean again" "" bash "$checker" "$ok"
 
 check pass "the real repo's key prints" '"crates/p2p-wire"' bash "$repo/fuzz/check-m2a-gate.sh" --print-key
+check pass "the real repo's key holds the root lock" '"Cargo.lock": "' bash "$repo/fuzz/check-m2a-gate.sh" --print-key
 check pass "the real repo's expected values print" '"max_len"' bash "$repo/fuzz/check-m2a-gate.sh" --print-expected
 
 echo "# $passed passed, $failed failed"

@@ -55,6 +55,8 @@ cargo test -p ci-checks                       # workflow rules + offline tests o
 
 `bench/verify-ipc` is a **standalone workspace** (it has an empty `[workspace]` and is not a root member), and tonic-prost-build needs `protoc`. It benchmarks BLS batch verification over UDS, comparing gRPC with raw framing. `cargo run --release --manifest-path bench/verify-ipc/Cargo.toml` runs the bench and starts its own `server` child. Its proto (`ethswarm.benchverify.v1`) is local to the bench and is not the real `proto/ethswarm/verify/v1` contract.
 
+`fuzz/` is a second **standalone workspace** with its own committed `fuzz/Cargo.lock` (nightly pinned in `fuzz/rust-toolchain.toml`): the cargo-fuzz targets for the req/resp decoders, gated by `fuzz/run-m2a-gate.sh` (writes the gate file) and `fuzz/check-m2a-gate.sh` (verifies it). Regenerate `fuzz/Cargo.lock` with `fuzz/regen-lock.sh` (from the root lock) whenever a fuzzed crate's dependencies change; `scripts/check-fuzz-lock.sh` enforces this.
+
 ## Architecture
 
 ### Service contracts (`proto/`)

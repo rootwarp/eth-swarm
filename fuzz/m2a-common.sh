@@ -14,11 +14,13 @@ M2A_BUILD_FLAGS=(-O -a)
 
 # The gate's decoder key: what the fuzzed decoder and its harness are built and run from. A
 # change to any of these makes a gate file stale. `git rev-parse HEAD:<path>` of each path, plus
-# the sha256 of fuzz/Cargo.lock. network-config is outside the key: none of its code runs on
+# the sha256 of both lockfiles. network-config is outside the key: none of its code runs on
 # peer bytes (the ContextTable is injected). The manifests are in it because features (root
 # [workspace.dependencies] included) change the build without changing the lockfile; the
 # harness, seeds and these scripts (limits, build flags) because a weaker run must not keep an
-# old gate.
+# old gate. fuzz/Cargo.lock is what the targets link; the root Cargo.lock is what the session
+# binary links, so a root bump (snap, say) makes the gate stale before fuzz/Cargo.lock follows
+# it (scripts/check-fuzz-lock.sh keeps the two alike).
 M2A_KEY_PATHS=(
   Cargo.toml
   crates/p2p-wire
@@ -36,7 +38,7 @@ M2A_KEY_PATHS=(
   fuzz/build-m2a.sh
   fuzz/run-m2a-gate.sh
 )
-M2A_KEY_FILES=(fuzz/Cargo.lock)
+M2A_KEY_FILES=(Cargo.lock fuzz/Cargo.lock)
 
 # A gate needs this long per target.
 M2A_REQUIRED_SECONDS=3600
@@ -88,6 +90,19 @@ M2A_RUSTC_COMMIT=5d8fec0669a64607db9ccbf663e7c23125bf4748
 # the gate file records them; fuzz/check-m2a-gate.sh refuses a file that records any.
 M2A_OVERRIDE_VARS=(CARGO RUSTC FUZZ_TOOLCHAIN RUSTUP_TOOLCHAIN)
 
+# m2a_require_python: exit 2 unless python3 is 3.11 or later (tomllib, which the guard below
+# needs). macOS's /usr/bin/python3 is 3.9.
+m2a_require_python() {
+  local version re='^Python ([0-9]+)\.([0-9]+)'
+  version=$(python3 -V 2>&1) || version=${version:-no python3}
+  if [[ $version =~ $re ]] &&
+    { ((BASH_REMATCH[1] > 3)) || { ((BASH_REMATCH[1] == 3)) && ((BASH_REMATCH[2] >= 11)); }; }; then
+    return 0
+  fi
+  echo "ERROR: python3 >= 3.11 needed (tomllib); python3 -V says: ${version:-nothing}"
+  exit 2
+}
+
 # m2a_require_clean_env: exit 2 unless nothing in the environment or a cargo config file can
 # change how the targets are built or run behind the recorded policy:
 #   - compiler and linker flags, wrappers and profiles: RUSTFLAGS, RUSTDOCFLAGS,
@@ -95,29 +110,55 @@ M2A_OVERRIDE_VARS=(CARGO RUSTC FUZZ_TOOLCHAIN RUSTUP_TOOLCHAIN)
 #     RUSTFLAGS and so drops cargo-fuzz's sanitizer and coverage flags), RUSTC_WRAPPER,
 #     RUSTC_WORKSPACE_WRAPPER and every CARGO_BUILD_*, CARGO_TARGET_* (per-target rustflags,
 #     runner, linker, and the target dir), CARGO_HOST_*, CARGO_PROFILE_*, CARGO_UNSTABLE_*;
+#   - which command `cargo fuzz` is: every CARGO_ALIAS_* (CARGO_ALIAS_FUZZ would run instead of
+#     cargo-fuzz), and an alias named fuzz in a cargo config file (below);
+#   - how libFuzzer itself is built (libfuzzer-sys 0.4.13's build.rs, through the cc crate):
+#     CUSTOM_LIBFUZZER_PATH and CUSTOM_LIBFUZZER_STD_CXX (link that library instead of the
+#     bundled libFuzzer), every LIBFUZZER_*, and cc's compiler, archiver and flags variables in
+#     all four of cc's spellings (CC, CC_<target>, CC_<target_with_underscores>, HOST_CC or
+#     TARGET_CC): CC, CXX, CFLAGS, CXXFLAGS, AR, ARFLAGS, RANLIB, RANLIBFLAGS, NVCC, CXXSTDLIB,
+#     CXXSTDLIB_STATIC, every CC_* (CC_FORCE_DISABLE, CC_SHELL_ESCAPED_FLAGS, ...), plus
+#     CRATE_CC_NO_DEFAULTS, CROSS_COMPILE and SDKROOT. The <target> forms hold '-' and '.', so
+#     they are no shell identifiers and bash does not list them: the names come from python;
 #   - the run itself: RUST_LIBFUZZER_DEBUG_PATH (libfuzzer-sys then writes each input to that
 #     file and returns before the target body runs), the sanitizer options (ASAN_OPTIONS,
 #     UBSAN_OPTIONS, LSAN_OPTIONS, MSAN_OPTIONS, TSAN_OPTIONS, HWASAN_OPTIONS; none is set by
 #     these scripts, so none is allowed), and library interposition (LD_PRELOAD, LD_AUDIT,
 #     DYLD_INSERT_LIBRARIES), which could replace the allocator the malloc limit watches;
+#   - a CARGO_HOME that is not an absolute path (cargo runs in fuzz/, so a relative one names
+#     another directory than the one checked here);
 #   - cargo config files cargo reads for a command run in fuzz/: .cargo/config and
 #     .cargo/config.toml in fuzz/ and every directory above it, and in CARGO_HOME (default
 #     ~/.cargo). Only tables that change neither the build nor the run are allowed (alias, doc,
 #     http, net, registries, registry, term, cargo-new, credential-alias,
-#     future-incompat-report, install, cache, and build.jobs).
+#     future-incompat-report, install, cache, and build.jobs), and alias without a fuzz key.
+# Needs python3 >= 3.11 (m2a_require_python runs first).
 m2a_require_clean_env() {
-  local name bad=()
+  if [[ -n ${CARGO_HOME+set} && $CARGO_HOME != /* ]]; then
+    echo "ERROR: CARGO_HOME='$CARGO_HOME' is not an absolute path; cargo would read it from fuzz/"
+    exit 2
+  fi
+  m2a_require_python
+  local name names bad=()
+  names=$(python3 -I -c 'import os; print("\n".join(sorted(os.environ)))') || exit 2
   while IFS= read -r name; do
     case $name in
       RUSTFLAGS | RUSTDOCFLAGS | CARGO_ENCODED_RUSTFLAGS | CARGO_ENCODED_RUSTDOCFLAGS | \
         RUSTC_WRAPPER | RUSTC_WORKSPACE_WRAPPER | CARGO_BUILD_* | CARGO_TARGET_* | \
-        CARGO_HOST_* | CARGO_PROFILE_* | CARGO_UNSTABLE_* | RUST_LIBFUZZER_DEBUG_PATH | \
+        CARGO_HOST_* | CARGO_PROFILE_* | CARGO_UNSTABLE_* | CARGO_ALIAS_* | \
+        RUST_LIBFUZZER_DEBUG_PATH | \
         ASAN_OPTIONS | UBSAN_OPTIONS | LSAN_OPTIONS | MSAN_OPTIONS | TSAN_OPTIONS | \
-        HWASAN_OPTIONS | LD_PRELOAD | LD_AUDIT | DYLD_INSERT_LIBRARIES)
+        HWASAN_OPTIONS | LD_PRELOAD | LD_AUDIT | DYLD_INSERT_LIBRARIES | \
+        CUSTOM_LIBFUZZER_* | LIBFUZZER_* | \
+        CC | CC_* | CXX | CXX_* | CFLAGS | CFLAGS_* | CXXFLAGS | CXXFLAGS_* | CXXSTDLIB* | \
+        AR | AR_* | ARFLAGS | ARFLAGS_* | RANLIB* | NVCC | NVCC_* | \
+        HOST_CC* | HOST_CXX* | HOST_CFLAGS | HOST_AR* | HOST_RANLIB* | HOST_NVCC | \
+        TARGET_CC* | TARGET_CXX* | TARGET_CFLAGS | TARGET_AR* | TARGET_RANLIB* | TARGET_NVCC | \
+        CRATE_CC_NO_DEFAULTS | CROSS_COMPILE | SDKROOT)
         bad+=("$name")
         ;;
     esac
-  done < <(compgen -e)
+  done <<<"$names"
   if ((${#bad[@]})); then
     echo "ERROR: the environment would change the fuzz build or run; unset: ${bad[*]}"
     exit 2
@@ -146,6 +187,12 @@ for path in sys.argv[1:]:
         continue
     for key, value in config.items():
         if key == "build" and isinstance(value, dict) and set(value) <= {"jobs"}:
+            continue
+        if key == "alias" and not isinstance(value, dict):
+            errors.append(f"{path}: alias is not a table")
+            continue
+        if key == "alias" and "fuzz" in value:
+            errors.append(f"{path}: [alias] fuzz would run instead of cargo-fuzz")
             continue
         if key not in ALLOWED:
             what = f"{key}.{', '.join(sorted(value))}" if key == "build" and isinstance(value, dict) else key
@@ -203,10 +250,31 @@ m2a_rustc() {
   (cd "$fuzz_dir" && "${RUSTC:-rustc}" ${FUZZ_TOOLCHAIN:+"+$FUZZ_TOOLCHAIN"} "$@")
 }
 
-# Prints the keyed paths that differ from HEAD (modified, staged or untracked), if any.
+# Prints the keyed paths that differ from HEAD (modified, staged or untracked), if any, and the
+# keyed files git is told not to look at: assume-unchanged (`git ls-files -v` prints the tag in
+# lowercase) or skip-worktree (tag S). `git status` skips an edit to either, so the flag itself
+# counts as dirty, edited or not. Fails (status 1, message on stderr) if git does.
 m2a_dirty_paths() {
-  git -C "$repo" status --porcelain --untracked-files=all -- \
-    "${M2A_KEY_PATHS[@]}" "${M2A_KEY_FILES[@]}"
+  local status listed tag path
+  status=$(git -C "$repo" status --porcelain --untracked-files=all -- \
+    "${M2A_KEY_PATHS[@]}" "${M2A_KEY_FILES[@]}") || {
+    echo "ERROR: git status failed" >&2
+    return 1
+  }
+  listed=$(git -C "$repo" ls-files -v -- "${M2A_KEY_PATHS[@]}" "${M2A_KEY_FILES[@]}") || {
+    echo "ERROR: git ls-files failed" >&2
+    return 1
+  }
+  [[ -z $status ]] || printf '%s\n' "$status"
+  while IFS= read -r tag; do
+    path=${tag#* }
+    case ${tag%% *} in
+      S) echo "skip-worktree: $path" ;;
+      s) printf 'skip-worktree: %s\nassume-unchanged: %s\n' "$path" "$path" ;;
+      # Spelled out: [a-z] follows the locale's collation in bash 3.2 and can match H.
+      [abcdefghijklmnopqrstuvwxyz]) echo "assume-unchanged: $path" ;;
+    esac
+  done <<<"$listed"
 }
 
 # Prints the decoder key of HEAD as one JSON object; fails if a keyed path is not in HEAD.

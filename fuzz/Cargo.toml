@@ -8,7 +8,8 @@
 # fuzz/Cargo.lock that the root Cargo.lock also has resolves to the same version and source, so
 # the fuzzed decoder links exactly the dependencies the session binary links.
 #
-# Build: fuzz/build-m2a.sh. Gate: fuzz/run-m2a-gate.sh. Seeds: fuzz/gen-seeds.sh.
+# Build: fuzz/build-m2a.sh. Gate: fuzz/run-m2a-gate.sh. Seeds: fuzz/gen-seeds.sh. Lock:
+# fuzz/regen-lock.sh.
 [package]
 name = "ethswarm-fuzz"
 version = "0.0.0"

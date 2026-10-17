@@ -1,16 +1,18 @@
 //! Embeds what the m2a fuzz gate must say about the decoders this crate is built from.
 //!
 //! The gate (`fuzz/check-m2a-gate.sh`) vouches for a tree: its decoder key (`git rev-parse
-//! HEAD:<path>` of every keyed path and the sha256 of `fuzz/Cargo.lock`), the libFuzzer limits,
-//! the toolchain and cargo-fuzz pins, and the seed corpora. The values are taken here, when the
-//! binary is built, not when it runs: a deployed binary has no checkout to look at, and values
-//! read at startup from whatever tree is there would describe that tree, not the binary.
+//! HEAD:<path>` of every keyed path and the sha256 of `Cargo.lock` and `fuzz/Cargo.lock`), the
+//! libFuzzer limits, the toolchain and cargo-fuzz pins, and the seed corpora. The values are
+//! taken here, when the binary is built, not when it runs: a deployed binary has no checkout to
+//! look at, and values read at startup from whatever tree is there would describe that tree, not
+//! the binary.
 //!
 //! The values come from the fuzz harness itself, so there is one definition of the key:
 //!
 //! - `fuzz/check-m2a-gate.sh --print-expected` prints them as one JSON object;
 //! - `m2a_dirty_paths` (`fuzz/m2a-common.sh`) lists keyed paths with uncommitted changes
-//!   (modified, staged or untracked). Any makes the values unavailable, as it makes the checker
+//!   (modified, staged or untracked) or with git's assume-unchanged or skip-worktree flag set
+//!   (git would not see an edit). Any makes the values unavailable, as it makes the checker
 //!   refuse: HEAD's hashes would not describe the sources being compiled.
 //!
 //! The checkout must be the one this crate sits in (`<toplevel>/crates/cl-p2p`), found by git

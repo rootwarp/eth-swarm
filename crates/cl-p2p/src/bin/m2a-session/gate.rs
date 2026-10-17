@@ -339,7 +339,7 @@ pub(crate) mod tests {
                     "crates/cl-p2p/src/rpc/codec.rs": "3333333333333333333333333333333333333333",
                     "fuzz/src": "4444444444444444444444444444444444444444"
                 },
-                "sha256": {"fuzz/Cargo.lock": "ab".repeat(32)}
+                "sha256": {"Cargo.lock": "cd".repeat(32), "fuzz/Cargo.lock": "ab".repeat(32)}
             },
             "limits": {
                 "rss_limit_mb": 2048, "malloc_limit_mb": 128, "timeout_s": 10,
@@ -455,6 +455,11 @@ pub(crate) mod tests {
             (
                 "decoder key stale: sha256 fuzz/Cargo.lock",
                 edit(|g| g["decoder_key"]["sha256"]["fuzz/Cargo.lock"] = json!("0")),
+                Refuses,
+            ),
+            (
+                "decoder key stale: sha256 Cargo.lock",
+                edit(|g| g["decoder_key"]["sha256"]["Cargo.lock"] = json!("0")),
                 Refuses,
             ),
             (

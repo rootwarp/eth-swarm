@@ -38,6 +38,7 @@ printf '[toolchain]\nchannel = "nightly-2026-10-17"\n' > "$fx/fuzz/rust-toolchai
 echo 'x' > "$fx/fuzz/src/lib.rs"
 echo 'x' > "$fx/fuzz/fuzz_targets/status_v2.rs"
 echo 'version = 4' > "$fx/fuzz/Cargo.lock"
+echo 'version = 4' > "$fx/Cargo.lock"
 printf 'target\nartifacts\n' > "$fx/fuzz/.gitignore"
 git init -q "$fx"
 g add -A
@@ -246,14 +247,67 @@ for var in \
   'LSAN_OPTIONS=detect_leaks=0' \
   'MSAN_OPTIONS=x=1' \
   'LD_PRELOAD=/tmp/malloc.so' \
-  'LD_AUDIT=/tmp/audit.so'; do
+  'LD_AUDIT=/tmp/audit.so' \
+  'CARGO_ALIAS_FUZZ=version' \
+  'CARGO_ALIAS_B=build' \
+  'CUSTOM_LIBFUZZER_PATH=/tmp/libfuzzer.a' \
+  'CUSTOM_LIBFUZZER_STD_CXX=none' \
+  'LIBFUZZER_NO_MAIN=1' \
+  'CC=/bin/echo' \
+  'CXX=/bin/echo' \
+  'CFLAGS=-O0' \
+  'CXXFLAGS=-O0' \
+  'AR=/bin/echo' \
+  'ARFLAGS=x' \
+  'RANLIB=/bin/echo' \
+  'CXXSTDLIB=c++' \
+  'NVCC=/bin/echo' \
+  'HOST_CXX=/bin/echo' \
+  'TARGET_CFLAGS=-O0' \
+  'CC_x86_64-unknown-linux-gnu=/bin/echo' \
+  'CXXFLAGS_aarch64-apple-darwin=-O0' \
+  'CXXFLAGS_aarch64_apple_darwin=-O0' \
+  'CRATE_CC_NO_DEFAULTS=1' \
+  'CC_FORCE_DISABLE=1' \
+  'CC_SHELL_ESCAPED_FLAGS=1' \
+  'CROSS_COMPILE=evil-' \
+  'SDKROOT=/tmp/sdk'; do
   # (DYLD_INSERT_LIBRARIES is refused too, but macOS strips it before a protected binary such
-  # as /usr/bin/env passes it on, so it cannot be set up here.)
+  # as /usr/bin/env passes it on, so it cannot be set up here.) The cc crate's target forms
+  # (CC_<target>) are no shell identifiers, so bash's own variable list never shows them.
   refused "run refuses ${var%%=*}" "$runner" "$var"
 done
+# A relative CARGO_HOME would be read from fuzz/, not from where the guard looked.
+refused "run refuses a relative CARGO_HOME" "$runner" 'CARGO_HOME=cargo-home'
+refused "run refuses an empty CARGO_HOME" "$runner" 'CARGO_HOME='
 refused "build refuses RUSTFLAGS" "$builder" 'RUSTFLAGS=-Coverflow-checks=no'
 refused "build refuses RUST_LIBFUZZER_DEBUG_PATH" "$builder" 'RUST_LIBFUZZER_DEBUG_PATH=/tmp/x'
 refused "build refuses CARGO_ENCODED_RUSTFLAGS" "$builder" 'CARGO_ENCODED_RUSTFLAGS='
+refused "build refuses CARGO_ALIAS_FUZZ" "$builder" 'CARGO_ALIAS_FUZZ=version'
+refused "build refuses CUSTOM_LIBFUZZER_PATH" "$builder" 'CUSTOM_LIBFUZZER_PATH=/tmp/libfuzzer.a'
+refused "build refuses CXX" "$builder" 'CXX=/bin/echo'
+
+# python3 < 3.11 has no tomllib: a clear error, not a traceback, and nothing built.
+pybin="$tmp/py39"
+mkdir -p "$pybin"
+cat > "$pybin/python3" <<'EOF'
+#!/bin/sh
+case ${1:-} in
+  -V | --version) echo "Python 3.9.6" ;;
+  *) echo "Traceback (most recent call last): ModuleNotFoundError: No module named 'tomllib'" >&2; exit 1 ;;
+esac
+EOF
+chmod +x "$pybin/python3"
+for script in "$runner" "$builder"; do
+  : > "$CALLS"
+  rc=0 out=$(gate_run "PATH=$pybin:$bin:$(dirname "$(command -v git)"):/usr/bin:/bin" -- "$script" --seconds 3 --out "$tmp/py.json" 2>&1) || rc=$?
+  if ((rc == 2)) && grep -q 'python3 >= 3.11' <<<"$out" && grep -q '3\.9' <<<"$out" \
+    && ! grep -q Traceback <<<"$out" && ! grep -q "fuzz build" "$CALLS"; then
+    ok "${script##*/} refuses python3 3.9 with a clear error"
+  else
+    bad "${script##*/} with python3 3.9 (exit $rc)" "$out"
+  fi
+done
 
 # Cargo config files cargo would read: fuzz/.cargo, the repo's, any ancestor's, CARGO_HOME's.
 config_case() {
@@ -284,8 +338,13 @@ config_case "a config with a rustc wrapper" "$fx/.cargo/config.toml" \
 config_case "a config with [unstable]" "$fx/fuzz/.cargo/config.toml" \
   $'[unstable]\nbuild-std = ["std"]'
 config_case "a config that does not parse" "$fx/fuzz/.cargo/config.toml" 'rustflags = ['
+# `cargo fuzz` runs an alias named fuzz instead of cargo-fuzz.
+config_case "CARGO_HOME/config.toml with [alias] fuzz" "$tmp/cargo-home/config.toml" \
+  $'[alias]\nfuzz = "version"'
+config_case "fuzz/.cargo/config.toml with alias.fuzz" "$fx/fuzz/.cargo/config.toml" \
+  'alias.fuzz = ["version"]'
 mkdir -p "$fx/fuzz/.cargo"
-printf '[net]\nretry = 3\n' > "$fx/fuzz/.cargo/config.toml"
+printf '[net]\nretry = 3\n\n[alias]\nb = "build"\n' > "$fx/fuzz/.cargo/config.toml"
 rc=0 out=$(gate_run -- "$runner" --allow-dirty --seconds 3 --out "$tmp/net.json" 2>&1) || rc=$?
 ((rc == 0)) && ok "a config that changes nothing the build or run uses is allowed" || bad "harmless config (exit $rc)" "$out"
 rm -rf "$fx/fuzz/.cargo"

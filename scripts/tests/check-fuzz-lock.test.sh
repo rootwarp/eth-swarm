@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Tests for scripts/check-fuzz-lock.sh. Run: bash scripts/tests/check-fuzz-lock.test.sh
 # Each case is a throwaway root with a Cargo.toml, Cargo.lock and fuzz/ pair; one runs the real
-# repo. Offline. Needs python3 >= 3.11. Works on bash 3.2.
+# repo. The lockfile cases are not real crates, so a stub (FUZZ_LOCK_CARGO) stands in for the
+# `cargo metadata --locked` resolution check; the resolution cases build real path-only crates
+# and run real cargo, offline. The real-repo case runs real cargo in fuzz/ (the pinned nightly;
+# set CARGO_NET_OFFLINE=true to keep it off the network). Needs cargo and python3 >= 3.11.
+# Works on bash 3.2.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 script="$here/../check-fuzz-lock.sh"
@@ -9,8 +13,22 @@ repo=$(cd "$here/../.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+# The resolution stub: records its directory and arguments, exits FAKE_METADATA_RC (default 0).
+stub="$tmp/fake-cargo"
+cat > "$stub" <<'EOF'
+#!/usr/bin/env bash
+echo "$PWD: $*" >> "$STUB_CALLS"
+exit "${FAKE_METADATA_RC:-0}"
+EOF
+chmod +x "$stub"
+export STUB_CALLS="$tmp/stub-calls"
+
 passed=0 failed=0
-check() {
+# check <pass|fail> <description> <root> [want in output]: with the resolution stub.
+# check_real: the same with real cargo.
+check() { FUZZ_LOCK_CARGO=$stub run_check "$@"; }
+check_real() { run_check "$@"; }
+run_check() {
   local expect=$1 desc=$2 root=$3 want=${4:-} rc=0 out ok=0
   out=$(bash "$script" "$root" 2>&1) || rc=$?
   if { [[ $expect == pass ]] && ((rc == 0)); } || { [[ $expect == fail ]] && ((rc != 0)); }; then ok=1; fi
@@ -127,7 +145,56 @@ root="$(fixture nolock "$PATCH" "$PATCH" "$shared")"
 rm "$root/fuzz/Cargo.lock"
 check fail "no fuzz/Cargo.lock" "$root" "fuzz/Cargo.lock"
 
-check pass "real repo" "$repo"
+# The resolution check: the stub is called as `cargo metadata --locked` in fuzz/, and its failure
+# fails the check.
+root="$(fixture resolve "$PATCH" "$PATCH" "$shared" "$fuzz_only")"
+: > "$STUB_CALLS"
+check pass "the resolution check runs" "$root"
+if grep -qxF "$root/fuzz: metadata --locked --format-version 1" "$STUB_CALLS"; then
+  passed=$((passed + 1)); echo "ok   - cargo metadata --locked runs in fuzz/"
+else
+  failed=$((failed + 1)); echo "FAIL - cargo metadata --locked runs in fuzz/"; sed 's/^/       /' "$STUB_CALLS"
+fi
+FAKE_METADATA_RC=101 check fail "a lock cargo would have to update" "$root" "cargo metadata --locked"
+
+# Real crates: fuzz/ depends on path crate a, which depends on path crate b. Both locks are
+# otherwise consistent, so only cargo's resolution can see what a lock lacks.
+crates() { # crates <name> <fuzz lock packages>
+  local root="$tmp/$1" c
+  mkdir -p "$root/fuzz/src"
+  for c in a b; do mkdir -p "$root/crates/$c/src"; : > "$root/crates/$c/src/lib.rs"; done
+  printf '[workspace]\nmembers = ["crates/a", "crates/b"]\nresolver = "2"\n' > "$root/Cargo.toml"
+  printf '[package]\nname = "a"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nb = { path = "../b" }\n' \
+    > "$root/crates/a/Cargo.toml"
+  printf '[package]\nname = "b"\nversion = "0.1.0"\nedition = "2021"\n' > "$root/crates/b/Cargo.toml"
+  { echo 'version = 4'; pkgd a 0.1.0 "" b; pkg b 0.1.0; } > "$root/Cargo.lock"
+  : > "$root/fuzz/src/lib.rs"
+  printf '[package]\nname = "ethswarm-fuzz"\nversion = "0.0.0"\nedition = "2021"\n\n[dependencies]\na = { path = "../crates/a" }\n\n[workspace]\n' \
+    > "$root/fuzz/Cargo.toml"
+  { echo 'version = 4'; printf '%s\n' "$2"; } > "$root/fuzz/Cargo.lock"
+  echo "$root"
+}
+CARGO_NET_OFFLINE=true check_real pass "a fuzz lock that satisfies its manifests" \
+  "$(crates complete "$(pkgd ethswarm-fuzz 0.0.0 "" a)
+$(pkgd a 0.1.0 "" b)
+$(pkg b 0.1.0)")" "fuzz lock OK"
+# The stale-lock shape: a path crate gained a dependency the fuzz lock never got.
+CARGO_NET_OFFLINE=true check_real fail "a fuzz lock without a package a path crate requires" \
+  "$(crates missing "$(pkgd ethswarm-fuzz 0.0.0 "" a)
+$(pkg a 0.1.0)")" "does not satisfy"
+
+# fuzz/regen-lock.sh repairs that lock: from the root lock, then the check passes.
+root="$(crates regen "$(pkgd ethswarm-fuzz 0.0.0 "" a)
+$(pkg a 0.1.0)")"
+rc=0 out=$(CARGO_NET_OFFLINE=true bash "$repo/fuzz/regen-lock.sh" "$root" 2>&1) || rc=$?
+if ((rc == 0)) && grep -q '^name = "b"$' "$root/fuzz/Cargo.lock"; then
+  passed=$((passed + 1)); echo "ok   - fuzz/regen-lock.sh adds the missing package"
+else
+  failed=$((failed + 1)); echo "FAIL - fuzz/regen-lock.sh (exit $rc)"; printf '%s\n' "$out" | sed 's/^/       /'
+fi
+CARGO_NET_OFFLINE=true check_real pass "the regenerated lock satisfies its manifests" "$root" "fuzz lock OK"
+
+check_real pass "real repo" "$repo"
 
 echo "# $passed passed, $failed failed"
 ((failed == 0))
