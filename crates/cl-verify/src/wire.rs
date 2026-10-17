@@ -67,14 +67,23 @@ pub fn error_from_status(status: &Status) -> Error {
     wire_error(code, status.message())
 }
 
+/// tonic's message for a request frame that prost could not decode (`Code::Internal`).
+const DECODE_FAILURE: &str = "failed to decode Protobuf message";
+
 /// Maps an error tonic raised while receiving a request frame. tonic reports a message over the
-/// decoding limit as `OutOfRange` from the frame header, before decoding it: a cap breach.
+/// decoding limit as `OutOfRange` from the frame header, before decoding it: a cap breach. A frame
+/// that does not decode as protobuf is malformed input, also a contract violation. Anything else
+/// is a transport failure.
 #[must_use]
 pub fn inbound_error(status: &Status) -> Error {
     match status.code() {
         Code::OutOfRange => wire_error(
             ErrorCode::ContractViolation,
             format!("request over the message cap: {}", status.message()),
+        ),
+        Code::Internal if status.message().starts_with(DECODE_FAILURE) => wire_error(
+            ErrorCode::ContractViolation,
+            format!("malformed request frame: {}", status.message()),
         ),
         _ => wire_error(
             ErrorCode::ResourceUnavailable,

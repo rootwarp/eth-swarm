@@ -14,15 +14,21 @@
 //! never VALID. Contract violations (peer, framing, handshake, ordering, caps) fail the stream
 //! with a status that carries the `common.v1.Error`; PubkeyFeed frame errors are answered in-band
 //! so the sender can resync.
+//!
+//! The pubkey cache starts empty and is restored on the first PubkeyFeed frame, from the snapshot
+//! at [`ServerConfig::pubkey_snapshot`] or by a rebuild over that stream ([`crate::feed`]); errors
+//! during the restore fail the stream. VerifyBls reads the empty cache (`UNKNOWN_INDEX`) until then.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use crypto_kzg::SetupError;
 use tokio::net::UnixListener;
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::runtime::Handle;
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
@@ -31,7 +37,7 @@ use tonic::{Code, Request, Response, Status, Streaming};
 
 use crate::bls::{self, BlsBackend, BlstBackend};
 use crate::caps::{self, CapError, MAX_MESSAGE_BYTES};
-use crate::feed::{self, SharedCache};
+use crate::feed::{self, Restored, SharedCache, SnapshotWriter};
 use crate::frame::{InFrame, Inbound, OutFrame};
 use crate::handshake::Handshake;
 use crate::kzg::{self, KzgBackend, PinnedKzgBackend, TrustedSetupConfig};
@@ -63,6 +69,10 @@ pub struct Limits {
     pub max_concurrent_streams_per_connection: u32,
     /// Time from stream open to the peer's hello; longer is a contract violation.
     pub hello_timeout: Duration,
+    /// During a pubkey cache restore, the longest wait for the next PubkeyFeed frame (and for
+    /// the peer to take a reply). Longer is a contract violation that fails the stream and frees
+    /// the restore for the next stream.
+    pub restore_frame_timeout: Duration,
     pub http2_keepalive_interval: Duration,
     pub http2_keepalive_timeout: Duration,
 }
@@ -75,6 +85,7 @@ impl Default for Limits {
             max_streams: 16,
             max_concurrent_streams_per_connection: 16,
             hello_timeout: Duration::from_secs(5),
+            restore_frame_timeout: Duration::from_secs(30),
             http2_keepalive_interval: Duration::from_secs(10),
             http2_keepalive_timeout: Duration::from_secs(20),
         }
@@ -90,7 +101,17 @@ pub struct ServerConfig {
     /// The digest-pinned KZG trusted setup.
     pub trusted_setup: TrustedSetupConfig,
     pub limits: Limits,
+    /// The on-disk pubkey cache snapshot (`pubkeys.bin`), in a directory only cl-verify can
+    /// write. Loaded or rebuilt on the first PubkeyFeed frame, then kept current (see
+    /// `snapshot_interval`).
+    pub pubkey_snapshot: PathBuf,
+    /// Least time between two snapshot saves after a restore ([`DEFAULT_SNAPSHOT_INTERVAL`]).
+    /// A rebuild or feed append marks the snapshot dirty; zero saves after every change.
+    pub snapshot_interval: Duration,
 }
+
+/// One mainnet epoch (32 slots of 12 s): at most one snapshot save per epoch of feed appends.
+pub const DEFAULT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(384);
 
 /// The service implementation. Cloning shares the cache, backends and counters.
 #[derive(Clone)]
@@ -104,6 +125,10 @@ struct Inner {
     limits: Limits,
     max_kzg_cells: usize,
     cache: SharedCache,
+    /// Whether `cache` has been restored (see [`crate::feed`]). Held across a restore, so a
+    /// second feed stream waits for it instead of restoring again.
+    restored: Mutex<bool>,
+    snapshot: Arc<SnapshotWriter>,
     bls: Arc<dyn BlsBackend>,
     kzg: Arc<dyn KzgBackend>,
     permits: Arc<Semaphore>,
@@ -115,6 +140,10 @@ struct Inner {
 impl VerifyServer {
     /// The production server: blst for BLS and the pinned trusted setup for KZG. Fails if the
     /// setup file is missing or its sha256 is not `config.trusted_setup.sha256`.
+    ///
+    /// Pass an empty `cache`: it is restored from `config.pubkey_snapshot` or rebuilt from the
+    /// feed on the first PubkeyFeed frame, and VerifyBls sees it empty until then. A non-empty
+    /// `cache` counts as already restored by the caller.
     pub fn new(config: ServerConfig, cache: SharedCache) -> Result<Self, SetupError> {
         let kzg = Arc::new(PinnedKzgBackend::load(&config.trusted_setup)?);
         Ok(Self::with_backends(
@@ -147,6 +176,11 @@ impl VerifyServer {
         clock: Arc<dyn WallClock>,
     ) -> Self {
         let max_kzg_cells = caps::max_kzg_cells(config.handshake.ours());
+        let restored = cache
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .high_water()
+            > 0;
         Self {
             inner: Arc::new(Inner {
                 handshake: config.handshake,
@@ -156,6 +190,11 @@ impl VerifyServer {
                 limits: config.limits,
                 max_kzg_cells,
                 cache,
+                restored: Mutex::new(restored),
+                snapshot: Arc::new(SnapshotWriter::new(
+                    config.pubkey_snapshot,
+                    config.snapshot_interval,
+                )),
                 bls,
                 kzg,
                 clock,
@@ -170,6 +209,26 @@ impl VerifyServer {
         self.inner.contract_violations.load(Ordering::Relaxed)
     }
 
+    /// Snapshots written since start (the snapshot-save metric).
+    #[must_use]
+    pub fn snapshot_saves(&self) -> u64 {
+        self.inner.snapshot.saves()
+    }
+
+    /// Snapshot saves that failed since start; each is retried on a later interval.
+    #[must_use]
+    pub fn snapshot_save_failures(&self) -> u64 {
+        self.inner.snapshot.failures()
+    }
+
+    /// Writes the pubkey snapshot now if the cache has changed since the last save, ignoring the
+    /// interval: `Ok(true)` if written. Before the cache is restored there is nothing to write.
+    /// [`serve_uds`] calls this after a graceful shutdown; process start-up code that serves
+    /// another way must call it before exiting.
+    pub async fn flush_snapshot(&self) -> std::io::Result<bool> {
+        self.inner.snapshot.save_if_dirty(&self.inner.cache).await
+    }
+
     /// The tonic service, with the message cap enforced from the frame header before decode.
     #[must_use]
     pub fn into_service(self) -> VerifyServiceServer<Self> {
@@ -180,20 +239,25 @@ impl VerifyServer {
 }
 
 /// Serves `server` on a Unix socket until `shutdown` resolves, with the configured HTTP/2
-/// keepalive and per-connection stream limit.
+/// keepalive and per-connection stream limit, then flushes a dirty pubkey snapshot
+/// ([`VerifyServer::flush_snapshot`]; a failure is logged).
 pub async fn serve_uds(
     listener: UnixListener,
     server: VerifyServer,
     shutdown: impl Future<Output = ()> + Send,
 ) -> Result<(), tonic::transport::Error> {
     let limits = server.inner.limits.clone();
-    tonic::transport::Server::builder()
+    let served = tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(limits.http2_keepalive_interval))
         .http2_keepalive_timeout(Some(limits.http2_keepalive_timeout))
         .max_concurrent_streams(limits.max_concurrent_streams_per_connection)
-        .add_service(server.into_service())
+        .add_service(server.clone().into_service())
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)
-        .await
+        .await;
+    if let Err(e) = server.flush_snapshot().await {
+        tracing::error!(error = %e, "pubkey snapshot not flushed at shutdown");
+    }
+    served
 }
 
 /// The UID of the Unix-socket peer, if the connection is a Unix socket with credentials.
@@ -297,6 +361,59 @@ impl Inner {
                 false
             }
         }
+    }
+
+    /// Restores the cache from this stream's first frame on a blocking thread (see
+    /// [`feed::restore`]) and returns the stream, or `None` once the stream has failed.
+    async fn restore_cache(
+        &self,
+        inbound: Inbound<Streaming<PubkeyFeedRequest>>,
+        tx: &Tx<PubkeyFeedResponse>,
+    ) -> Option<Inbound<Streaming<PubkeyFeedRequest>>> {
+        let permit = Arc::clone(&self.permits).acquire_owned().await.ok()?;
+        let mut link = feed::StreamLink::new(
+            inbound,
+            tx.clone(),
+            Handle::current(),
+            self.limits.restore_frame_timeout,
+        );
+        let (cache, snapshot) = (Arc::clone(&self.cache), self.snapshot.path().to_path_buf());
+        let job = spawn_blocking(move || {
+            let _permit = permit;
+            let outcome = feed::restore(&cache, &snapshot, &mut link);
+            (outcome, link)
+        });
+        let err = match job.await {
+            Ok((Ok(outcome), link)) => {
+                match &outcome {
+                    Restored::Rebuilt(_) => self.snapshot.mark_dirty(),
+                    Restored::Loaded => self.snapshot.note_committed(
+                        self.cache
+                            .read()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .high_water(),
+                    ),
+                }
+                self.snapshot.start(&self.cache);
+                tracing::info!(
+                    ?outcome,
+                    high_water = self
+                        .cache
+                        .read()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .high_water(),
+                    "pubkey cache restored"
+                );
+                return Some(link.into_inbound());
+            }
+            Ok((Err(err), _)) => err,
+            Err(join) => wire_error(
+                ErrorCode::ResourceUnavailable,
+                format!("pubkey cache restore failed: {join}"),
+            ),
+        };
+        self.fail(tx, err).await;
+        None
     }
 
     /// A verifier slot for a request with `deadline_unix_ms`, or the status to answer instead.
@@ -547,22 +664,52 @@ impl VerifyService for VerifyServer {
             if !inner.open(&mut inbound, &tx).await {
                 return;
             }
+            // One restore at a time; a stream that finds it done goes straight on.
+            let mut restored = inner.restored.lock().await;
             // The high-water mark goes first so the sender knows where to start.
             let first = PubkeyFeedResponse::body(feed::status(&inner.cache));
             if tx.send(Ok(first)).await.is_err() {
                 return;
             }
+            let mut check_first = *restored;
+            if *restored {
+                drop(restored);
+            } else {
+                let Some(back) = inner.restore_cache(inbound, &tx).await else {
+                    return;
+                };
+                inbound = back;
+                *restored = true;
+                drop(restored);
+                let reply = PubkeyFeedResponse::body(feed::status(&inner.cache));
+                if tx.send(Ok(reply)).await.is_err() {
+                    return;
+                }
+            }
             loop {
                 let body = match inbound.body().await {
                     Ok(Some(body)) => body,
+                    Ok(None) if check_first => {
+                        let err = wire_error(
+                            ErrorCode::ContractViolation,
+                            "pubkey feed closed before its first frame",
+                        );
+                        return inner.fail(&tx, err).await;
+                    }
                     Ok(None) => return,
                     Err(e) => return inner.fail(&tx, e).await,
                 };
+                if std::mem::take(&mut check_first) {
+                    if let Err(e) = feed::check_first_frame(&inner.cache, &body) {
+                        return inner.fail(&tx, e).await;
+                    }
+                }
                 // Feed frames wait for a verifier slot like any other blocking job.
                 let Ok(permit) = Arc::clone(&inner.permits).acquire_owned().await else {
                     return;
                 };
                 let cache = Arc::clone(&inner.cache);
+                let appends = !body.pubkeys.is_empty();
                 let job = spawn_blocking(move || {
                     let _permit = permit;
                     feed::apply(&cache, &body)
@@ -577,6 +724,11 @@ impl VerifyService for VerifyServer {
                         return inner.fail(&tx, err).await;
                     }
                 };
+                if appends && reply.err.is_none() {
+                    // high_water advanced: the snapshot is behind the cache.
+                    inner.snapshot.mark_dirty();
+                    inner.snapshot.start(&inner.cache);
+                }
                 if let Some(err) = &reply.err {
                     if err.code() == ErrorCode::ContractViolation {
                         inner.contract_violations.fetch_add(1, Ordering::Relaxed);

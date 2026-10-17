@@ -16,6 +16,7 @@ fn frame(start: u64, keys: std::ops::Range<u64>) -> PubkeyFeedRequestBody {
         start_index: start,
         count: pubkeys.len() as u64,
         pubkeys,
+        finalized_registry: None,
     }
 }
 
@@ -28,7 +29,7 @@ async fn high_water_is_reported_first_then_after_every_append() {
     .await;
     let (mut s, first) = feed_open(&mut h).await;
     assert_eq!(first, 3);
-    s.send(feed_body(frame(3, 3..6))).await;
+    s.send(feed_body(announcing(frame(3, 3..6), 6))).await;
     let r = feed_reply(&mut s).await;
     assert_eq!((r.high_water, r.err), (6, None));
     // A restarted feed sees the new mark first.
@@ -38,14 +39,18 @@ async fn high_water_is_reported_first_then_after_every_append() {
 
 #[tokio::test]
 async fn feed_count_check() {
-    let mut h = start().await;
+    let mut h = start_with(Options {
+        cache: cache_of(2),
+        ..Options::default()
+    })
+    .await;
     let (mut s, _) = feed_open(&mut h).await;
     for count in [0u64, 1, 3, u64::MAX] {
-        let mut b = frame(0, 0..2);
+        let mut b = announcing(frame(2, 2..4), 4);
         b.count = count;
         s.send(feed_body(b)).await;
         let r = feed_reply(&mut s).await;
-        assert_eq!(r.high_water, 0, "count {count}");
+        assert_eq!(r.high_water, 2, "count {count}");
         assert_eq!(
             r.err.unwrap().code(),
             ErrorCode::ContractViolation,
@@ -54,9 +59,9 @@ async fn feed_count_check() {
     }
     assert_eq!(h.server.contract_violations(), 4);
     // The stream stays usable: a correct frame is then applied.
-    s.send(feed_body(frame(0, 0..2))).await;
+    s.send(feed_body(frame(2, 2..4))).await;
     let r = feed_reply(&mut s).await;
-    assert_eq!((r.high_water, r.err), (2, None));
+    assert_eq!((r.high_water, r.err), (4, None));
 }
 
 #[tokio::test]
@@ -69,7 +74,7 @@ async fn gap_overlap_and_bad_keys_are_refused_whole() {
     let (mut s, _) = feed_open(&mut h).await;
     let mut bad_key = frame(2, 2..4);
     bad_key.pubkeys[1] = vec![0x01; 48];
-    for b in [frame(3, 3..4), frame(1, 1..3), bad_key] {
+    for b in [announcing(frame(3, 3..4), 4), frame(1, 1..3), bad_key] {
         s.send(feed_body(b)).await;
         let r = feed_reply(&mut s).await;
         assert_eq!(r.high_water, 2);
@@ -82,7 +87,7 @@ async fn gap_overlap_and_bad_keys_are_refused_whole() {
 async fn fed_keys_serve_bls_by_index_and_the_next_index_stays_unknown() {
     let mut h = start().await;
     let (mut s, _) = feed_open(&mut h).await;
-    s.send(feed_body(frame(0, 0..4))).await;
+    s.send(feed_body(announcing(frame(0, 0..4), 4))).await;
     assert_eq!(feed_reply(&mut s).await.high_water, 4);
     let mut b = bls_open(&mut h).await;
     b.send(bls_body(bls_request(

@@ -17,7 +17,7 @@ use cl_verify::proto::common::{
 };
 use cl_verify::proto::verify::verify_service_client::VerifyServiceClient;
 use cl_verify::proto::verify::*;
-use cl_verify::server::{serve_uds, Limits, ServerConfig, VerifyServer};
+use cl_verify::server::{serve_uds, Limits, ServerConfig, VerifyServer, DEFAULT_SNAPSHOT_INTERVAL};
 use cl_verify::wire::{error_from_status, now_unix_ms, SystemClock, WallClock};
 use hyper_util::rt::TokioIo;
 use tokio::net::{UnixListener, UnixStream};
@@ -90,12 +90,19 @@ pub fn my_uid() -> u32 {
     std::fs::metadata(dir.path()).unwrap().uid()
 }
 
+/// A snapshot path that is never written (its directory does not exist): every restore rebuilds.
+pub fn no_snapshot() -> PathBuf {
+    PathBuf::from("/nonexistent/cl-verify-test/pubkeys.bin")
+}
+
 pub fn config(peer_uid: u32, limits: Limits) -> ServerConfig {
     ServerConfig {
         handshake: Handshake::new(hello(), 1),
         peer_uid,
         trusted_setup: setup_config(),
         limits,
+        pubkey_snapshot: no_snapshot(),
+        snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
     }
 }
 
@@ -107,6 +114,10 @@ pub struct Options {
     pub peer_uid: Option<u32>,
     pub cache: SharedCache,
     pub clock: Arc<dyn WallClock>,
+    /// The pubkey snapshot path; `None` means `pubkeys.bin` in the harness's temp dir.
+    pub snapshot: Option<PathBuf>,
+    /// The snapshot save interval; `None` means the default.
+    pub snapshot_interval: Option<Duration>,
 }
 
 impl Default for Options {
@@ -118,6 +129,8 @@ impl Default for Options {
             peer_uid: None,
             cache: SharedCache::default(),
             clock: Arc::new(SystemClock),
+            snapshot: None,
+            snapshot_interval: None,
         }
     }
 }
@@ -127,7 +140,28 @@ pub struct Harness {
     pub client: VerifyServiceClient<Channel>,
     pub cache: SharedCache,
     _dir: tempfile::TempDir,
-    _shutdown: oneshot::Sender<()>,
+    shutdown: oneshot::Sender<()>,
+    serving: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+}
+
+impl Harness {
+    /// Graceful shutdown: closes the client, signals the server and waits for `serve_uds` to
+    /// return (after its snapshot flush).
+    pub async fn shutdown(self) {
+        let Harness {
+            client,
+            shutdown,
+            serving,
+            ..
+        } = self;
+        drop(client);
+        let _ = shutdown.send(());
+        tokio::time::timeout(Duration::from_secs(20), serving)
+            .await
+            .expect("server shut down within 20 s")
+            .unwrap()
+            .unwrap();
+    }
 }
 
 pub async fn start() -> Harness {
@@ -137,13 +171,13 @@ pub async fn start() -> Harness {
 pub async fn start_with(o: Options) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("verify.sock");
-    let server = VerifyServer::with_backends_and_clock(
-        config(o.peer_uid.unwrap_or_else(my_uid), o.limits),
-        o.cache.clone(),
-        o.bls,
-        o.kzg,
-        o.clock,
-    );
+    let mut config = config(o.peer_uid.unwrap_or_else(my_uid), o.limits);
+    config.pubkey_snapshot = o.snapshot.unwrap_or_else(|| dir.path().join("pubkeys.bin"));
+    if let Some(interval) = o.snapshot_interval {
+        config.snapshot_interval = interval;
+    }
+    let server =
+        VerifyServer::with_backends_and_clock(config, o.cache.clone(), o.bls, o.kzg, o.clock);
     serve_on(&path, server.clone(), dir, o.cache).await
 }
 
@@ -156,7 +190,7 @@ pub async fn serve_on(
 ) -> Harness {
     let listener = UnixListener::bind(path).unwrap();
     let (tx, rx) = oneshot::channel::<()>();
-    tokio::spawn(serve_uds(listener, server.clone(), async {
+    let serving = tokio::spawn(serve_uds(listener, server.clone(), async {
         let _ = rx.await;
     }));
     let client = VerifyServiceClient::new(connect(path).await);
@@ -165,7 +199,8 @@ pub async fn serve_on(
         client,
         cache,
         _dir: dir,
-        _shutdown: tx,
+        shutdown: tx,
+        serving,
     }
 }
 
@@ -384,6 +419,32 @@ pub fn pk_bytes(i: u64) -> Vec<u8> {
     pk(i).compress().to_vec()
 }
 
+/// cl-chain's finalized registry made of the keys of validators `keys`, in order.
+pub fn registry_of(keys: impl IntoIterator<Item = u64>) -> FinalizedRegistry {
+    let compressed: Vec<[u8; 48]> = keys.into_iter().map(|i| pk(i).compress()).collect();
+    FinalizedRegistry {
+        len: compressed.len() as u64,
+        sha256: cl_verify_cache::persist::root_of(&compressed).to_vec(),
+    }
+}
+
+/// Feed frame `start .. start + len(keys)` carrying the keys of validators `keys`.
+pub fn feed_frame(start: u64, keys: impl IntoIterator<Item = u64>) -> PubkeyFeedRequestBody {
+    let pubkeys: Vec<Vec<u8>> = keys.into_iter().map(pk_bytes).collect();
+    PubkeyFeedRequestBody {
+        start_index: start,
+        count: pubkeys.len() as u64,
+        pubkeys,
+        finalized_registry: None,
+    }
+}
+
+/// `frame` as the first frame of a stream, announcing the registry of validators `0..n`.
+pub fn announcing(mut frame: PubkeyFeedRequestBody, n: u64) -> PubkeyFeedRequestBody {
+    frame.finalized_registry = Some(registry_of(0..n));
+    frame
+}
+
 /// Cache holding validators `0..n`.
 pub fn cache_of(n: u64) -> SharedCache {
     let cache = SharedCache::default();
@@ -507,4 +568,63 @@ impl WallClock for ExpiresAfterReads {
             now_unix_ms() + 3_600_000
         }
     }
+}
+
+/// Waits up to 5 s for `cond`.
+pub async fn wait_for(cond: impl Fn() -> bool) {
+    for _ in 0..500 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("condition not met within 5 s");
+}
+
+/// Options for a server whose snapshot lives at `snapshot` (shared across restarts).
+pub fn restarted(snapshot: &Path) -> Options {
+    Options {
+        snapshot: Some(snapshot.to_path_buf()),
+        ..Options::default()
+    }
+}
+
+/// Feeds validators `0..n` to a fresh server in frames of `chunk`, following its replies.
+pub async fn rebuild_over_feed(h: &mut Harness, n: u64, chunk: u64) -> FeedStream {
+    let (mut s, first) = feed_open(h).await;
+    assert_eq!(first, 0, "nothing served before the restore");
+    let mut start = 0;
+    while start < n {
+        let end = (start + chunk).min(n);
+        let frame = feed_frame(start, start..end);
+        s.send(feed_body(if start == 0 {
+            announcing(frame, n)
+        } else {
+            frame
+        }))
+        .await;
+        let r = feed_reply(&mut s).await;
+        assert_eq!((r.high_water, r.err), (end, None));
+        start = end;
+    }
+    s
+}
+
+/// The verdict for one valid set signed by validator `index`, resolved from the cache.
+pub async fn bls_outcome(h: &mut Harness, index: u64) -> Result<VerifyStatus, ErrorCode> {
+    let mut b = bls_open(h).await;
+    b.send(bls_body(bls_request(1, vec![valid_set(index, 7)])))
+        .await;
+    outcomes(&bls_reply(&mut b).await).remove(0)
+}
+
+/// Whether the snapshot at `path` loads as exactly validators `0..n`.
+pub fn snapshot_holds(path: &Path, n: u64) -> bool {
+    use cl_verify_cache::persist::{load_with, Registry, Startup};
+    let keys: Vec<_> = (0..n).map(pk).collect();
+    let registry = Registry::of(&cl_verify::feed::BlstCodec, &keys);
+    matches!(
+        load_with(&cl_verify::feed::BlstCodec, path, &registry),
+        Startup::Use(c) if c.high_water() == n
+    )
 }

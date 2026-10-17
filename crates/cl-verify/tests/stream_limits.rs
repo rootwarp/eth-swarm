@@ -177,6 +177,7 @@ async fn feed_frames_wait_for_a_verifier_permit() {
         start_index: 2,
         count: 1,
         pubkeys: vec![pk_bytes(2)],
+        finalized_registry: Some(registry_of(0..3)),
     }))
     .await;
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -252,6 +253,7 @@ async fn buffered_request_past_its_deadline_is_never_resolved() {
         start_index: 5,
         count: 1,
         pubkeys: vec![pk_bytes(5)],
+        finalized_registry: Some(registry_of(0..6)),
     }))
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;

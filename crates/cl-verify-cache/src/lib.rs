@@ -47,9 +47,12 @@
 //!   from those validators at `UnknownIndex`.
 //! - Indices below the bound go as `Validator(i)`. If their append has not landed yet, they get
 //!   a transient `UnknownIndex`: IGNORE, and cl-chain retries.
-//! - After either side restarts, cl-chain sends no inline signers until the first
-//!   `PubkeyFeedResponseBody` on the new feed stream: a snapshot can leave cl-verify ahead of
-//!   what cl-chain knows it sent.
+//! - After either side (re)starts, cl-chain sends no inline signers until it has received the
+//!   reply to its first `PubkeyFeedRequestBody` on the new feed stream (the restore reply); the
+//!   status sent right after the hello does not count. Before a restore that status is 0, and a
+//!   matching snapshot then installs the whole registry `0..len` at once, ranges cl-chain never
+//!   sent included, which the hold-back cannot protect. From the restore reply on, `acked` is
+//!   that reply's `high_water`.
 //! - If cl-chain breaks these rules anyway, the inline signer meets a cached index and
 //!   [`PubkeyCache::resolve_signer`] returns `InlineForCachedIndex`, a contract violation. That
 //!   is the intended signal: it marks a cl-chain bug, not a benign race.

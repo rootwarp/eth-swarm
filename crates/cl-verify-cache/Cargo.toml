@@ -13,3 +13,7 @@ sha2 = "0.10"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+
+[[bench]]
+name = "persist"
+harness = false

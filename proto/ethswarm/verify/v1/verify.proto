@@ -21,6 +21,8 @@ import "ethswarm/common/v1/error.proto";
 // a cached index is rejected (ERROR_CODE_CONTRACT_VIOLATION on PubkeyFeed), so a cached index is never re-keyed.
 // Restart: cl-verify may load an on-disk snapshot of the cache. Any header, length or root mismatch means
 // rebuild from index 0 via PubkeyFeed, never trust; the high_water it reports covers verified entries only.
+// The snapshot is checked against the finalized registry cl-chain announces on the first PubkeyFeed frame
+// (see Restore at PubkeyFeedRequestBody).
 // Inline cap (per VerifyBlsRequestBody.origin): 0 inline pubkeys on gossip (every active validator is in
 // the finalized prefix, phase0 is_eligible_for_activation); at most 1,024 per VerifyBls request on
 // import. cl-chain splits a larger import batch into several requests in order, never rejects it. 1,024
@@ -31,8 +33,13 @@ import "ethswarm/common/v1/error.proto";
 // Inline bound: cl-chain sends a signer inline only if validator_index >= max(acked, sent), where acked
 // is the last PubkeyFeedResponseBody.high_water and sent the end of the feed range cl-chain has sent.
 // Indices below that bound go without an inline pubkey; if their append has not landed yet they get a
-// transient VERIFY_STATUS_UNKNOWN_INDEX -> IGNORE and retry. After either side restarts, cl-chain sends
-// no inline signers until the first PubkeyFeedResponseBody on the new feed stream.
+// transient VERIFY_STATUS_UNKNOWN_INDEX -> IGNORE and retry.
+// Restart: after either side (re)starts, cl-chain sends NO inline signers until it has received the
+// response to its first PubkeyFeedRequestBody on the new feed stream (the restore reply; see Restore at
+// PubkeyFeedRequestBody). The PubkeyFeedResponseBody sent right after hello does not count: before a
+// restore it reports 0, and a matching snapshot then installs the whole registry 0..len at once, ranges
+// cl-chain never sent included, so the hold-back below cannot protect them. From the restore reply on,
+// acked is that reply's high_water (then each later reply's), and the inline bound above applies.
 // Feed hold-back: PubkeyFeed and VerifyBls are separate streams with no ordering between them, so a feed
 // range sent after a request could overtake it. A range [start_index, start_index + count) covers an
 // index i when start_index <= i < start_index + count. cl-chain therefore MUST NOT send a PubkeyFeed range
@@ -46,8 +53,12 @@ import "ethswarm/common/v1/error.proto";
 // judged against the other side's clock.
 // Stalled stream: cl-chain MUST close a VerifyBls stream on which a request has no response by its
 // deadline_unix_ms + MAX_CLOCK_SKEW_MS (cl-chain's clock). From then on the stream is gone.
-// Stream gone: if the VerifyBls stream is gone (broken, closed by either side, or closed as stalled)
-// before a response arrived, cl-chain waits until its clock has passed the latest
+// Stream gone: a VerifyBls stream is gone once it breaks, once either side ends the whole call (cl-verify
+// ends its response side or fails the stream; cl-chain cancels the call or stops reading responses), or
+// once cl-chain closes it as stalled. A request-side half-close is NOT gone: when cl-chain ends its request
+// side and keeps reading, cl-verify still answers every request already sent, and the hold-back for those
+// requests still ends only when the matching response arrives or, if the stream then breaks or stalls, by
+// the stream-gone wait. If the stream is gone before a response arrived, cl-chain waits until its clock has passed the latest
 // deadline_unix_ms + MAX_CLOCK_SKEW_MS of the inline-carrying requests it had in flight on that stream,
 // and only then sends the covering range. This is sound because of cl-verify's deadline rules below and
 // because, on stream close, cl-verify resolves no further signers for that stream's requests.
@@ -59,11 +70,17 @@ import "ethswarm/common/v1/error.proto";
 // If cl-chain breaks these rules, the inline signer meets a cached index and the result is
 // ERROR_CODE_CONTRACT_VIOLATION, which correctly signals a cl-chain bug.
 //
+// Shape checks first: cl-verify checks a request's shape (VerifyBls: set count, signers per set and per
+// request, zero signers, origin, inline-pubkey rules and caps; VerifyKzg: zero cells and the cell caps)
+// BEFORE its deadline. A malformed request therefore fails the call or stream with
+// ERROR_CODE_CONTRACT_VIOLATION even if its deadline_unix_ms is 0 or already past; it is never answered
+// VERIFY_STATUS_DEADLINE_EXCEEDED.
+//
 // Deadline semantics: every request carries deadline_unix_ms (wall-clock ms since the Unix epoch).
 // cl-verify drops work it cannot finish by then and answers VERIFY_STATUS_DEADLINE_EXCEEDED. A request
 // with deadline_unix_ms = 0, or one already past its deadline when cl-verify reads it, gets
 // VERIFY_STATUS_DEADLINE_EXCEEDED at once (for every set, on VerifyBls), with no signer resolution and
-// no BLS or KZG work. On VerifyBls, after any queue wait, cl-verify reads the cache high-water snapshot,
+// no BLS or KZG work, provided it passed the shape checks above. On VerifyBls, after any queue wait, cl-verify reads the cache high-water snapshot,
 // then checks now <= deadline_unix_ms immediately before any cache-dependent eligibility check, error
 // branches included; past it, every set is VERIFY_STATUS_DEADLINE_EXCEEDED. So every cache-dependent
 // outcome comes from a snapshot read no later than the deadline. A missing, timed-out, errored or
@@ -114,10 +131,13 @@ message Signer {
 
 message BlsSet {
   // >1 signer means a fast-aggregate set (aggregates, sync contributions).
-  // At least one signer: a set with zero signers is ERROR_CODE_CONTRACT_VIOLATION, because
-  // eth_fast_aggregate_verify (altair/bls.md) returns true for zero pubkeys with the G2 point at infinity.
-  // cl-chain handles that case (a sync aggregate with no participants) itself and never sends it.
-  // TODO(vera): max signers per set (MAX_VALIDATORS_PER_COMMITTEE = 2048 is the spec bound).
+  // At least one and at most 131,072 signers: MAX_VALIDATORS_PER_COMMITTEE * MAX_COMMITTEES_PER_SLOT =
+  // 2,048 * 64, the bound on an Electra IndexedAttestation.attesting_indices (electra/beacon-chain.md).
+  // A set with zero signers, or with more than 131,072, fails the call or stream with
+  // ERROR_CODE_CONTRACT_VIOLATION (common.v1 Error), like the other request-shape rules; it is never an
+  // in-band BlsResult. Zero signers are refused because eth_fast_aggregate_verify (altair/bls.md) returns
+  // true for zero pubkeys with the G2 point at infinity. cl-chain handles that case (a sync aggregate with
+  // no participants) itself and never sends it.
   repeated Signer signers = 1;
   // 32 bytes.
   bytes signing_root = 2;
@@ -128,11 +148,15 @@ message BlsSet {
 message VerifyBlsRequestBody {
   // Echoed in the response; per-stream, monotonic.
   uint64 request_id = 1;
-  // At most 256 sets; more is ERROR_CODE_CONTRACT_VIOLATION.
+  // At most 256 sets, and at most 131,072 signers across all sets (equal to the per-set cap, so one maximal
+  // set always fits on its own). More of either fails the call or stream with ERROR_CODE_CONTRACT_VIOLATION.
+  // cl-chain MUST split a batch that would exceed either cap into several requests, in order; it never
+  // sends it whole.
   // TODO(vera): encoded message max in bytes.
   repeated BlsSet sets = 2;
   // Wall-clock ms since the Unix epoch. 0, or already past when cl-verify reads the request: every set is
   // VERIFY_STATUS_DEADLINE_EXCEEDED, with no signer resolution and no BLS work (see deadline semantics).
+  // The shape checks run first: a malformed request is ERROR_CODE_CONTRACT_VIOLATION whatever its deadline.
   uint64 deadline_unix_ms = 3;
   // The path every set in this request serves; one origin per request, as the inline cap is per request.
   // VERIFY_ORIGIN_UNSPECIFIED (0) is ERROR_CODE_CONTRACT_VIOLATION, like every enum. An unknown non-zero
@@ -191,7 +215,9 @@ message VerifyKzgRequestBody {
   // TODO(vera): max cells per request and encoded message max in bytes.
   repeated KzgCellProof cells = 2;
   // Wall-clock ms since the Unix epoch. 0, or already past when cl-verify reads the request:
-  // VERIFY_STATUS_DEADLINE_EXCEEDED, with no KZG work (see deadline semantics).
+  // VERIFY_STATUS_DEADLINE_EXCEEDED, with no KZG work (see deadline semantics). The shape checks run
+  // first: a request with zero cells or over the cell caps is ERROR_CODE_CONTRACT_VIOLATION whatever its
+  // deadline.
   uint64 deadline_unix_ms = 3;
 }
 
@@ -226,17 +252,53 @@ message VerifyKzgResponse {
 // the latest deadline_unix_ms + MAX_CLOCK_SKEW_MS of its in-flight inline requests has passed. A
 // cancellation or timeout on cl-chain's side does not end the hold-back, and a pending range takes
 // priority over new inline requests (see the feed hold-back and range priority above).
+// Frame errors are answered in-band (PubkeyFeedResponseBody.err, high_water unchanged) and the stream stays
+// open, except during a restore (below), where any error fails the stream.
+//
+// Restore: the first body frame of every stream carries finalized_registry. A cl-verify that has not
+// restored its cache since it started (it reports high_water 0) restores from it:
+// - If its on-disk snapshot holds exactly that registry (same len and sha256, and the file passes its
+//   owner, mode and digest checks), it loads the snapshot and replies high_water = len. The entries in
+//   that first frame are then not applied; cl-chain continues from the reported high_water.
+// - Otherwise it rebuilds the whole cache from index 0 over this stream: the first frame must start at 0,
+//   and each reply's high_water is the next start_index wanted. The rebuilt cache is served, and saved, only
+//   once it holds len entries whose SHA-256 equals finalized_registry.sha256; a mismatch is
+//   ERROR_CODE_CONTRACT_VIOLATION. While rebuilding, high_water counts entries received for the rebuild,
+//   which are not served yet.
+// Until the restore completes, VerifyBls sees an empty cache: every index is VERIFY_STATUS_UNKNOWN_INDEX
+// (IGNORE), never a partial cache. A stream that ends before its first body frame, or any error during the
+// restore, is ERROR_CODE_CONTRACT_VIOLATION; nothing is kept and the next stream restores again. During
+// the restore cl-verify waits at most its restore frame timeout (default 30 s) for each frame, and for
+// cl-chain to take each reply; a longer stall is ERROR_CODE_CONTRACT_VIOLATION and fails the stream, so
+// a stalled restore cannot hold back later PubkeyFeed streams. A frame that does not decode is
+// ERROR_CODE_CONTRACT_VIOLATION as well; only a broken transport is ERROR_CODE_RESOURCE_UNAVAILABLE. A
+// cl-verify that has already restored only checks that finalized_registry is present and that len is at
+// least its high-water mark, then applies the frame as usual.
 message PubkeyFeedRequestBody {
   uint64 start_index = 1;
   // Must equal len(pubkeys); a mismatch is ERROR_CODE_CONTRACT_VIOLATION.
   uint64 count = 2;
   // 48 bytes each, compressed G1; cl-verify decompresses and key_validates once on append.
-  // TODO(vera): max count per frame.
+  // At most 4,096 per frame (cl-verify's rebuild chunk); more is ERROR_CODE_CONTRACT_VIOLATION.
   repeated bytes pubkeys = 3;
+  // cl-chain's finalized registry. Required on the first body frame of every stream: a missing message, a
+  // len of 0 or a sha256 that is not 32 bytes there is ERROR_CODE_CONTRACT_VIOLATION and fails the stream.
+  // Ignored on later frames, where cl-chain leaves it unset.
+  FinalizedRegistry finalized_registry = 4;
+}
+
+// The finalized validator registry prefix cl-chain feeds, as announced on the first PubkeyFeed frame.
+message FinalizedRegistry {
+  // Number of finalized registry entries (indices 0 .. len). Never 0: 0 is ERROR_CODE_CONTRACT_VIOLATION.
+  uint64 len = 1;
+  // 32 bytes: SHA-256 over the concatenated 48-byte compressed pubkeys of indices 0 .. len, in index
+  // order. Any other length is ERROR_CODE_CONTRACT_VIOLATION.
+  bytes sha256 = 2;
 }
 
 message PubkeyFeedResponseBody {
-  // Entries cl-verify holds (next expected start_index). Sent once right after hello, then after every append.
+  // Entries cl-verify holds (next expected start_index). Sent once right after hello, then after every
+  // frame. During a restore it is the next start_index the rebuild wants (see Restore above).
   uint64 high_water = 1;
   ethswarm.common.v1.Error err = 2;
 }
