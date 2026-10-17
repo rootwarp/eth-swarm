@@ -489,9 +489,9 @@ fn envelope_of(tx_len: usize, count: Option<usize>) -> Vec<u8> {
 
 /// The worst cases for an envelope: empty transactions (a 4-byte offset becomes a 24-byte list
 /// header) for requested bytes, and 1-byte transactions (each its own minimum-size allocation)
-/// for the allocator-adjusted heap model. Each is decoded at the cap and at one item past a doubling step of the
-/// transactions buffer (`2^17 · 2^k + 1` items, the decoder reserving `2^17` first), where the
-/// buffer is least full and the per-byte figures are highest.
+/// for the allocator-adjusted heap model. Each is decoded at the cap and at one item past a
+/// doubling step of the transactions buffer (`2^17 · 2^k + 1` items, the decoder reserving
+/// `2^17` first), where the buffer is least full and the per-byte figures are highest.
 #[test]
 fn envelope_decode_heap_stays_within_budget() {
     let shapes = [

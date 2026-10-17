@@ -7,12 +7,16 @@
 //! 1. No `pull_request_target` trigger.
 //! 2. Every `uses:` value, anywhere in the tree, is a local `./` action, a `docker://` image
 //!    pinned by `@sha256:<64 hex>`, or `owner/repo[/path]@<40 hex>`. Each pinned value must
-//!    appear verbatim on its own (non-comment) `uses` line, followed by a `# <version>` comment.
+//!    appear verbatim on its own `uses` line, followed by a `# <version>` comment. A `uses`
+//!    line is a block entry (`[- ]uses: <value>`, key optionally quoted) or a flow mapping whose
+//!    first key is `uses` (`[- ]{ uses: <value> }`); any other line holding the text is ignored.
 //! 3. The top-level `permissions` is exactly `contents: read`, and job-level `permissions`
 //!    grant nothing above `read` (each scope `read` or `none`, or `read-all`).
 //! 4. A workflow triggered by `pull_request` references no secrets: no `secrets` identifier,
 //!    in any letter case, after a `${{` (to the end of the raw line, comment lines included,
-//!    and to the end of each decoded string), and no `secrets:` key with a non-empty value.
+//!    and to the end of each decoded string), no `secrets` identifier anywhere in a job- or
+//!    step-level `if:` (GitHub evaluates it as an expression even without `${{`), and no
+//!    `secrets:` key with a non-empty value.
 //!
 //! YAML merge keys (`<<`) are rejected because GitHub does not apply them.
 
@@ -199,31 +203,53 @@ fn is_digest_pinned(r: &str) -> bool {
 }
 
 /// True if a `secrets` identifier, in any letter case (GitHub matches context names
-/// case-insensitively), appears anywhere in `s` after its first `${{`. Deliberately coarse:
-/// it does not look for the closing `}}` (which may sit inside a quoted string), so anything
-/// after an expression opens counts, and a false positive is preferred to a miss.
-fn secrets_after_expression_open(s: &str) -> bool {
-    let Some(open) = s.find("${{") else {
-        return false;
-    };
-    let rest = s[open + 3..].to_ascii_lowercase();
+/// case-insensitively), appears anywhere in `s`: the word itself, not part of a longer
+/// identifier such as `my_secrets` or `secrets-dir`.
+fn mentions_secrets(s: &str) -> bool {
+    let s = s.to_ascii_lowercase();
     let ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
-    rest.match_indices("secrets").any(|(i, m)| {
-        let before = rest[..i].chars().next_back();
-        let after = rest[i + m.len()..].chars().next();
+    s.match_indices("secrets").any(|(i, m)| {
+        let before = s[..i].chars().next_back();
+        let after = s[i + m.len()..].chars().next();
         !before.is_some_and(ident) && !after.is_some_and(ident)
     })
 }
 
-/// True if `line` is a `uses` entry (not a comment) that holds `value` after the key.
+/// True if a `secrets` identifier appears anywhere in `s` after its first `${{`. Deliberately
+/// coarse: it does not look for the closing `}}` (which may sit inside a quoted string), so
+/// anything after an expression opens counts, and a false positive is preferred to a miss.
+fn secrets_after_expression_open(s: &str) -> bool {
+    s.find("${{")
+        .is_some_and(|open| mentions_secrets(&s[open + 3..]))
+}
+
+/// Strips `["']?uses["']?\s*:\s*["']?` (the same quote on both sides of the key) from `s`.
+fn strip_uses_key(s: &str) -> Option<&str> {
+    let quote = s.chars().next().filter(|c| matches!(c, '"' | '\''));
+    let s = match quote {
+        Some(q) => s[1..].strip_prefix("uses")?.strip_prefix(q)?,
+        None => s.strip_prefix("uses")?,
+    };
+    let s = s.trim_start_matches([' ', '\t']).strip_prefix(':')?;
+    let s = s.trim_start_matches([' ', '\t']);
+    Some(s.strip_prefix(['"', '\'']).unwrap_or(s))
+}
+
+/// True if `line` is a `uses` entry for `value`: `^\s*(-\s+)?["']?uses["']?\s*:\s*["']?<value>`,
+/// or the same inside a flow mapping whose first key is `uses` (`- { uses: <value> }`). A
+/// `run:`, `name:` or comment line that merely contains the text does not count.
 fn is_uses_line_for(line: &str, value: &str) -> bool {
-    if line.trim_start().starts_with('#') {
-        return false;
+    let mut rest = line.trim_start_matches([' ', '\t']);
+    if let Some(after_dash) = rest.strip_prefix('-') {
+        if !after_dash.starts_with([' ', '\t']) {
+            return false;
+        }
+        rest = after_dash.trim_start_matches([' ', '\t']);
     }
-    match (line.find("uses"), line.find(value)) {
-        (Some(k), Some(v)) => k < v,
-        _ => false,
+    if let Some(flow) = rest.strip_prefix('{') {
+        rest = flow.trim_start_matches([' ', '\t']);
     }
+    strip_uses_key(rest).is_some_and(|v| v.starts_with(value))
 }
 
 impl<'a> Checker<'a> {
@@ -402,9 +428,12 @@ impl<'a> Checker<'a> {
         for line in &raw {
             self.error(
                 Some(*line),
-                "secrets are forbidden in a pull_request workflow".into(),
+                "secrets are forbidden in a pull_request workflow \
+                 (any `secrets` word after `${{` on the line counts)"
+                    .into(),
             );
         }
+        self.secrets_in_conditions(doc);
         // Decoded scalars (escapes resolved, multi-line values joined): to the end of the scalar.
         let mut decoded = false;
         each_string(doc, &mut |s| decoded |= secrets_after_expression_open(s));
@@ -434,6 +463,39 @@ impl<'a> Checker<'a> {
             self.error(
                 None,
                 format!("secrets: {val} is forbidden in a pull_request workflow"),
+            );
+        }
+    }
+
+    /// Job- and step-level `if:` values are expressions even without `${{`, so any `secrets`
+    /// identifier in one counts.
+    fn secrets_in_conditions(&mut self, doc: &Yaml) {
+        let Some(Yaml::Hash(jobs)) = key(doc, "jobs") else {
+            return;
+        };
+        let mut found = Vec::new();
+        for (job, body) in jobs {
+            let job = render(job);
+            if let Some(cond) = key(body, "if").and_then(Yaml::as_str) {
+                if mentions_secrets(cond) {
+                    found.push(format!("job {job}: if: {cond}"));
+                }
+            }
+            let Some(Yaml::Array(steps)) = key(body, "steps") else {
+                continue;
+            };
+            for (i, step) in steps.iter().enumerate() {
+                if let Some(cond) = key(step, "if").and_then(Yaml::as_str) {
+                    if mentions_secrets(cond) {
+                        found.push(format!("job {job} step {}: if: {cond}", i + 1));
+                    }
+                }
+            }
+        }
+        for what in found {
+            self.error(
+                None,
+                format!("{what} references secrets; forbidden in a pull_request workflow"),
             );
         }
     }

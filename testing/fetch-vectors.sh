@@ -13,14 +13,19 @@
 #      PRESETS="minimal general"   restrict consensus-specs assets by file stem
 #      VECTORS_GIT_BASE            git host for the tag checks      (default https://github.com)
 #      VECTORS_RELEASE_BASE        host for the release downloads   (default https://github.com)
+#      FETCH_VECTORS_LOCK_WAIT     seconds to wait for another run's lock check (default 60)
 #
 # Layout under DEST/<source>/<tag>/:
 #   <file>        the verified archive, kept so later runs can re-hash it
 #   <stem>/       the extracted tree (<file> without .tar.gz / .zip)
 #   .<file>.ok    stamp holding the sha256; written only after a full extraction
-#   .<file>.lock/ held while this run works on the asset; holds the owner's PID in `pid`.
-#                 A second run fails closed (LOCKED) while that PID is alive, and takes the
-#                 lock over only once it is not (e.g. a run killed with SIGKILL).
+#   .<file>.lock/ held while this run works on the asset; holds the owner's PID in `pid`,
+#                 its `uname -n` in `host` and its PID namespace in `pidns` (`none` without
+#                 /proc). A second run fails closed (LOCKED) while that PID is alive, and takes
+#                 the lock over only once it is not (e.g. a run killed with SIGKILL), and only
+#                 from the same host and namespace.
+#   .<file>.lockf empty, kept; taking or reclaiming .<file>.lock/ happens under an flock(2) on
+#                 it, so concurrent reclaims are serialized and only one run can own the asset.
 # A stamp is never trusted on its own: a later run reuses the kept archive only if it
 # re-hashes to the pinned sha256, and then re-extracts the tree from it every time, so an
 # edited or deleted fixture never survives. A stamp without its archive (for example one
@@ -37,12 +42,15 @@ include_optional="${INCLUDE_OPTIONAL:-0}"
 presets="${PRESETS:-}"
 git_base="${VECTORS_GIT_BASE:-https://github.com}"
 release_base="${VECTORS_RELEASE_BASE:-https://github.com}"
+lock_wait="${FETCH_VECTORS_LOCK_WAIT:-60}"
 
 die() { echo "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null || { echo "$1 required${2:+ ($2)}" >&2; exit 2; }; }
 digest() { sha256sum "$1" | cut -d' ' -f1; }
 
 [[ -f "$manifest" ]] || die "manifest $manifest not found"
+[[ "$lock_wait" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+  || die "FETCH_VECTORS_LOCK_WAIT must be a number of seconds (got: $lock_wait)"
 need python3 ">=3.11, for tomllib"
 need git
 need curl
@@ -121,28 +129,69 @@ trap cleanup EXIT
 
 alive() { kill -0 "$1" 2>/dev/null || ps -p "$1" >/dev/null 2>&1; }
 
-# Takes the per-asset lock directory $1, writing our PID into it. A lock whose recorded PID
-# is no longer running is taken over; a lock with a live or unreadable PID fails closed.
+# A PID only means something on one host and inside one PID namespace, so a lock records both
+# next to it and is only ever reclaimed by a run that sees the same ones.
+my_host="$(uname -n)"
+my_pidns="$(readlink "/proc/$$/ns/pid" 2>/dev/null || echo none)"
+
+# Test-only: FETCH_VECTORS_LOCK_HOOK names a program run as `<hook> <stage> <lock>` at each
+# step of taking a lock, so tests can pause concurrent runs at chosen points. A failing hook
+# aborts the run.
+lock_hook() {
+  if [[ -n "${FETCH_VECTORS_LOCK_HOOK:-}" ]]; then
+    "$FETCH_VECTORS_LOCK_HOOK" "$1" "$2" || die "lock hook failed at $1"
+  fi
+}
+
+# Waits up to $1 seconds for an exclusive flock(2) on fd 9. The lock belongs to the open file
+# description, so it outlives python3 and is held until this shell closes fd 9 (or exits,
+# including on SIGKILL).
+flock_fd9() {
+  python3 -I -c '
+import fcntl, sys, time
+deadline = time.monotonic() + float(sys.argv[1])
+while True:
+    try:
+        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except BlockingIOError:
+        if time.monotonic() >= deadline:
+            sys.exit(1)
+        time.sleep(0.05)
+' "$1"
+}
+
+# Takes the per-asset lock directory $1, writing our PID, host and PID namespace into it. A
+# lock whose recorded PID is no longer running on this host, in this namespace, is taken over;
+# a lock with a live or unreadable PID, or from another host or namespace, fails closed.
+# Every step (mkdir, read, check, remove, mkdir, PID write) runs under an flock on $3, so two
+# runs can never both reclaim, or reclaim a lock that another run has just taken.
 take_lock() {
-  local lock="$1" label="$2" owner aside
+  local lock="$1" label="$2" lockf="$3" owner host pidns
+  lock_hook waiting "$lock"
+  exec 9>>"$lockf"
+  flock_fd9 "$lock_wait" || die "LOCKED $label: timed out waiting for $lockf"
   if ! mkdir "$lock" 2>/dev/null; then
     owner="$(cat "$lock/pid" 2>/dev/null || true)"
+    host="$(cat "$lock/host" 2>/dev/null || true)"
+    pidns="$(cat "$lock/pidns" 2>/dev/null || true)"
+    if [[ "$owner" =~ ^[0-9]+$ ]] && [[ "$host" != "$my_host" || "$pidns" != "$my_pidns" ]]; then
+      die "LOCKED $label: $lock belongs to PID $owner on host ${host:-unknown}, PID namespace ${pidns:-unknown} (this run: $my_host, $my_pidns); a lock from another host or namespace is never taken over, so remove it by hand once that run is gone"
+    fi
     if [[ ! "$owner" =~ ^[0-9]+$ ]] || alive "$owner"; then
       die "LOCKED $label: $lock is held by ${owner:-an unknown process}; another fetch-vectors run is using it"
     fi
-    # Rename first so that only one run can claim the stale lock, then re-check its owner.
-    aside="$lock.stale.$$"
-    mv "$lock" "$aside" 2>/dev/null || die "LOCKED $label: $lock changed hands; retry"
-    if [[ "$(cat "$aside/pid" 2>/dev/null || true)" != "$owner" ]]; then
-      mv "$aside" "$lock" 2>/dev/null || true
-      die "LOCKED $label: $lock changed hands; retry"
-    fi
-    rm -rf "$aside"
+    lock_hook read "$lock"
     echo "taking over stale lock $lock (PID $owner is not running)" >&2
-    mkdir "$lock" 2>/dev/null || die "LOCKED $label: $lock was taken by another run"
+    rm -rf "$lock"
+    mkdir "$lock" || die "LOCKED $label: could not recreate $lock"
   fi
   held_lock="$lock"
+  echo "$my_host" >"$lock/host"
+  echo "$my_pidns" >"$lock/pidns"
   echo "$$" >"$lock/pid"
+  exec 9>&-
+  lock_hook owned "$lock"
 }
 
 # Pass 0: pick the assets this run fetches. Only their sources get a tag check.
@@ -182,7 +231,7 @@ while IFS=$'\t' read -r -u 3 kind name repo tag file sha _; do
   outdir="$dest/$name/$tag"; mkdir -p "$outdir"
   archive="$outdir/$file"; tree="$outdir/$stem"; stamp="$outdir/.$file.ok"
   lock="$outdir/.$file.lock"
-  take_lock "$lock" "$label"
+  take_lock "$lock" "$label" "$outdir/.$file.lockf"
 
   verified=0
   if [[ -f "$stamp" && -f "$archive" && "$(<"$stamp")" == "$sha" ]]; then

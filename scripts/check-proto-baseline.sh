@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Baseline-drift gate for proto/: the committed .baseline/v1.binpb must equal a fresh
-# `buf build -o` of the current sources, so `buf breaking` compares against the accepted baseline.
+# `buf build -o` of the current sources, so the committed baseline stays in sync with the sources
+# (used by `buf-breaking.sh --baseline`).
 #   bash scripts/check-proto-baseline.sh [PROTO_DIR]   (default: proto/ of this repo)
 # Exit 0 = in sync, 1 = drift / missing baseline / build failure, 2 = usage or tooling error
 # (bad proto dir, buf missing, buf version other than BASELINE_BUF_VERSION).

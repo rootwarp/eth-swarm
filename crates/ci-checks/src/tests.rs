@@ -344,3 +344,72 @@ fn each_pinned_uses_needs_its_own_verbatim_line() {
     let body = with_step(&format!("      - uses: \"{escaped}\"\n"));
     assert_rejected(&body, "verbatim");
 }
+
+#[test]
+fn secrets_in_an_if_without_expression_braces_are_rejected() {
+    for cond in [
+        "secrets.TOKEN != ''",
+        "Secrets.TOKEN != ''",
+        "SECRETS.token",
+        "toJSON(secrets) != '{}'",
+        "toJSON(SeCrEtS) != '{}'",
+        "github.event_name == 'push' && secrets.X",
+        "\"\\u0073ecrets.X != ''\"",
+    ] {
+        let step = with_step(&format!("      - if: {cond}\n        run: echo ok\n"));
+        assert_rejected(&step, "if:");
+        let job = good().replace("    runs-on:", &format!("    if: {cond}\n    runs-on:"));
+        assert_rejected(&job, "job a: if:");
+    }
+}
+
+#[test]
+fn if_without_the_secrets_context_is_allowed() {
+    assert_passes(&with_step(
+        "      - if: github.event_name == 'pull_request' && inputs.my_secrets\n        run: echo ok\n",
+    ));
+    assert_passes(&good().replace("    runs-on:", "    if: true\n    runs-on:"));
+}
+
+#[test]
+fn uses_text_on_a_run_or_name_line_is_not_a_uses_line() {
+    let escaped = format!("actions/checkout\\x40{SHA}");
+    for decoy in [
+        format!("      - run: echo uses actions/checkout@{SHA} # v7.0.1\n"),
+        format!("      - name: uses actions/checkout@{SHA} # v7.0.1\n        run: echo\n"),
+        format!("      - run: 'echo {{ uses: actions/checkout@{SHA} }}' # v7.0.1\n"),
+        format!("      - {{ name: x, uses: actions/checkout@{SHA} }} # v7.0.1\n"),
+        format!("      - -uses: actions/checkout@{SHA} # v7.0.1\n"),
+    ] {
+        let body = good().replace(
+            &format!("      - uses: {CHECKOUT}\n"),
+            &format!("{decoy}      - uses: \"{escaped}\"\n"),
+        );
+        assert_rejected(&body, "verbatim");
+    }
+}
+
+#[test]
+fn quoted_keys_and_spaced_colons_are_still_uses_lines() {
+    for line in [
+        format!("      - \"uses\": actions/checkout@{SHA} # v7.0.1\n"),
+        format!("      - 'uses' : 'actions/checkout@{SHA}' # v7.0.1\n"),
+        format!("      -   {{uses: \"actions/checkout@{SHA}\"}} # v7.0.1\n"),
+    ] {
+        assert_passes(&good().replace(&format!("      - uses: {CHECKOUT}\n"), &line));
+    }
+}
+
+#[test]
+fn raw_secrets_error_explains_the_coarse_match() {
+    for expr in [
+        "${{ github.sha }}  # no secrets here",
+        "${{ inputs.secrets }}",
+        "${{ github.workspace }}/secrets",
+    ] {
+        let body = with_step(&format!(
+            "      - run: echo ok\n        env:\n          T: {expr}\n"
+        ));
+        assert_rejected(&body, "(any `secrets` word after `${{` on the line counts)");
+    }
+}

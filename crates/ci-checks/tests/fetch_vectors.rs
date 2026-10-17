@@ -187,6 +187,12 @@ impl Fixture {
     }
 
     fn run_with(&self, manifest: &Path, env: &[(&str, &str)]) -> Output {
+        self.command(manifest, env)
+            .output()
+            .expect("run fetch-vectors.sh")
+    }
+
+    fn command(&self, manifest: &Path, env: &[(&str, &str)]) -> Command {
         let path = format!(
             "{}:{}",
             self.root().join("bin").display(),
@@ -210,7 +216,7 @@ impl Fixture {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        cmd.output().expect("run fetch-vectors.sh")
+        cmd
     }
 
     fn run(&self, manifest: &Path) -> Output {
@@ -247,6 +253,19 @@ fn manifest_toml(tag: &str, commit: &str, assets: &[Asset]) -> String {
         ));
     }
     toml
+}
+
+/// What a failed run left under `dest`, apart from the empty per-asset `.<file>.lockf` files,
+/// which are kept on purpose (deleting a file that others may be waiting to flock reopens the
+/// race it guards against).
+fn leftovers(dest: &Path) -> Vec<PathBuf> {
+    files_under(dest)
+        .into_iter()
+        .filter(|f| {
+            let is_lockf = f.extension().is_some_and(|e| e == "lockf");
+            !(is_lockf && fs::metadata(dest.join(f)).unwrap().len() == 0)
+        })
+        .collect()
 }
 
 fn assert_ok(out: &Output) {
@@ -412,7 +431,7 @@ fn corrupted_hash_prints_sha256_mismatch_and_unpacks_nothing() {
     assert!(err.contains("SHA256 MISMATCH"), "{}", describe(&out));
     assert!(err.contains(WRONG_SHA) && err.contains(&fx.tar_sha));
     assert_eq!(
-        files_under(&fx.dest()),
+        leftovers(&fx.dest()),
         Vec::<PathBuf>::new(),
         "no archive, partial download, stamp or extracted file may remain"
     );
@@ -437,7 +456,7 @@ fn mismatch_stops_before_later_assets() {
 
     assert_exit_1(&out);
     assert_eq!(fx.curl_calls().len(), 1, "no fallback to the next asset");
-    assert_eq!(files_under(&fx.dest()), Vec::<PathBuf>::new());
+    assert_eq!(leftovers(&fx.dest()), Vec::<PathBuf>::new());
 }
 
 #[test]
@@ -454,7 +473,7 @@ fn download_failure_is_not_retried() {
         describe(&out)
     );
     assert_eq!(fx.curl_calls().len(), 1, "exactly one attempt");
-    assert_eq!(files_under(&fx.dest()), Vec::<PathBuf>::new());
+    assert_eq!(leftovers(&fx.dest()), Vec::<PathBuf>::new());
 }
 
 #[test]
@@ -564,7 +583,7 @@ fn tampered_cached_archive_fails_even_with_a_valid_stamp() {
     );
     assert!(fx.curl_calls().is_empty(), "no silent re-download fallback");
     assert_eq!(
-        files_under(&fx.dest()),
+        leftovers(&fx.dest()),
         Vec::<PathBuf>::new(),
         "poisoned archive, stamp and tree are removed"
     );
@@ -758,8 +777,7 @@ fn dead_pid() -> u32 {
 fn lock_left_by_a_dead_run_is_taken_over() {
     let fx = Fixture::new();
     let lock = fx.out_dir(LIGHT_TAG).join(format!(".{TAR}.lock"));
-    fs::create_dir_all(&lock).unwrap();
-    fs::write(lock.join("pid"), format!("{}\n", dead_pid())).unwrap();
+    write_lock(&lock, dead_pid(), &our_host(), &our_pidns());
 
     let out = fx.run(&fx.good_tar_manifest());
 
@@ -818,4 +836,289 @@ fn failed_swap_keeps_the_previous_tree() {
         .filter(|n| n.contains(".old.") || n.contains(".extracting.") || n.ends_with(".lock"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+/// `uname -n` of this machine, as the script records it next to the PID.
+fn our_host() -> String {
+    checked(Command::new("uname").arg("-n"))
+}
+
+/// The PID namespace of this process (and of the script it spawns), or `none` without `/proc`.
+fn our_pidns() -> String {
+    fs::read_link("/proc/self/ns/pid")
+        .map(|l| l.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "none".to_owned())
+}
+
+/// A lock directory as a run on `host` in PID namespace `pidns` leaves it.
+fn write_lock(lock: &Path, pid: u32, host: &str, pidns: &str) {
+    fs::create_dir_all(lock).unwrap();
+    fs::write(lock.join("pid"), format!("{pid}\n")).unwrap();
+    fs::write(lock.join("host"), format!("{host}\n")).unwrap();
+    fs::write(lock.join("pidns"), format!("{pidns}\n")).unwrap();
+}
+
+/// Drives concurrent runs through `FETCH_VECTORS_LOCK_HOOK`: each run logs `<run> <stage>`
+/// and, for the stages named in its `HOLD`, waits until the test writes `go.<run>.<stage>`.
+struct Choreography {
+    ctl: PathBuf,
+    hook: PathBuf,
+}
+
+impl Choreography {
+    fn new(fx: &Fixture) -> Self {
+        let ctl = fx.root().join("ctl");
+        fs::create_dir_all(&ctl).unwrap();
+        let hook = fx.root().join("lock-hook");
+        write_executable(
+            &hook,
+            "#!/bin/sh\n\
+             echo \"$RUN $1\" >> \"$CTL/events\"\n\
+             case \" $HOLD \" in *\" $1 \"*)\n\
+             \x20 n=0\n\
+             \x20 while [ ! -e \"$CTL/go.$RUN.$1\" ]; do\n\
+             \x20   n=$((n + 1)); [ \"$n\" -lt 1500 ] || exit 1; sleep 0.02\n\
+             \x20 done;;\n\
+             esac\n",
+        );
+        Self { ctl, hook }
+    }
+
+    fn spawn(&self, fx: &Fixture, manifest: &Path, run: &str, hold: &str) -> std::process::Child {
+        let hook = self.hook.to_str().unwrap();
+        let ctl = self.ctl.to_str().unwrap();
+        fx.command(
+            manifest,
+            &[
+                ("FETCH_VECTORS_LOCK_HOOK", hook),
+                ("CTL", ctl),
+                ("RUN", run),
+                ("HOLD", hold),
+            ],
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn fetch-vectors.sh")
+    }
+
+    fn events(&self) -> Vec<String> {
+        fs::read_to_string(self.ctl.join("events"))
+            .map(|log| log.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    fn go(&self, run: &str, stage: &str) {
+        fs::write(self.ctl.join(format!("go.{run}.{stage}")), "").unwrap();
+    }
+
+    /// Waits until one of `events` was logged or `child` exited; panics after 20 s.
+    fn wait_for(&self, events: &[&str], child: &mut std::process::Child) {
+        for _ in 0..1000 {
+            let seen = self.events();
+            if events.iter().any(|e| seen.iter().any(|s| s == e)) {
+                return;
+            }
+            if child.try_wait().expect("try_wait").is_some() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!(
+            "timed out waiting for {events:?}; events so far: {:?}",
+            self.events()
+        );
+    }
+}
+
+#[test]
+fn concurrent_reclaims_of_a_stale_lock_leave_exactly_one_owner() {
+    let fx = Fixture::new();
+    let m = fx.good_tar_manifest();
+    let dir = fx.out_dir(LIGHT_TAG);
+    let lock = dir.join(format!(".{TAR}.lock"));
+    write_lock(&lock, dead_pid(), &our_host(), &our_pidns());
+    let ch = Choreography::new(&fx);
+
+    // A and B both find the dead owner. A is paused before it reclaims; B either read the
+    // same dead PID too or is queued behind A's kernel lock.
+    let mut a = ch.spawn(&fx, &m, "A", "read owned");
+    ch.wait_for(&["A read"], &mut a);
+    let mut b = ch.spawn(&fx, &m, "B", "read renamed");
+    ch.wait_for(&["B read", "B waiting"], &mut b);
+    // A takes the lock over and keeps it.
+    ch.go("A", "read");
+    ch.wait_for(&["A owned"], &mut a);
+    // B goes on with what it read earlier, then C arrives while B is mid-reclaim.
+    ch.go("B", "read");
+    ch.wait_for(&["B renamed"], &mut b);
+    let mut c = ch.spawn(&fx, &m, "C", "owned");
+    ch.wait_for(&["C owned"], &mut c);
+    ch.go("B", "renamed");
+    let b_out = b.wait_with_output().unwrap();
+    for run in ["A", "C"] {
+        ch.go(run, "owned");
+    }
+    let a_out = a.wait_with_output().unwrap();
+    let c_out = c.wait_with_output().unwrap();
+
+    let owners: Vec<_> = ch
+        .events()
+        .into_iter()
+        .filter(|e| e.ends_with(" owned"))
+        .collect();
+    let runs = [("A", &a_out), ("B", &b_out), ("C", &c_out)];
+    let all: String = runs
+        .iter()
+        .map(|(r, o)| format!("=== {r}\n{}\n", describe(o)))
+        .collect();
+    assert_eq!(owners, ["A owned"], "only A may hold the lock\n{all}");
+    assert_ok(&a_out);
+    for (run, out) in &runs[1..] {
+        assert_exit_1(out);
+        assert!(stderr(out).contains("LOCKED"), "{run}\n{all}");
+    }
+    assert!(!lock.exists(), "A released its lock\n{all}");
+    assert!(dir.join("demo").join(PAYLOAD).is_file());
+}
+
+#[test]
+fn kernel_lock_held_too_long_fails_closed() {
+    let fx = Fixture::new();
+    let dir = fx.out_dir(LIGHT_TAG);
+    fs::create_dir_all(&dir).unwrap();
+    let lockf = dir.join(format!(".{TAR}.lockf"));
+    let mut holder = Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            "import fcntl, sys, time\n\
+             f = open(sys.argv[1], 'a')\n\
+             fcntl.flock(f, fcntl.LOCK_EX)\n\
+             print('locked', flush=True)\n\
+             time.sleep(30)\n",
+        ])
+        .arg(&lockf)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn flock holder");
+    let mut line = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(holder.stdout.take().unwrap()),
+        &mut line,
+    )
+    .unwrap();
+    assert_eq!(line.trim(), "locked");
+
+    let out = fx.run_with(
+        &fx.good_tar_manifest(),
+        &[("FETCH_VECTORS_LOCK_WAIT", "0.2")],
+    );
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+
+    assert_exit_1(&out);
+    assert!(stderr(&out).contains("LOCKED"), "{}", describe(&out));
+    assert!(stderr(&out).contains("timed out"), "{}", describe(&out));
+    assert!(fx.curl_calls().is_empty());
+    assert!(!dir.join(format!(".{TAR}.lock")).exists());
+}
+
+#[test]
+fn malformed_lock_wait_is_rejected_before_anything_runs() {
+    let fx = Fixture::new();
+
+    let out = fx.run_with(
+        &fx.good_tar_manifest(),
+        &[("FETCH_VECTORS_LOCK_WAIT", "soon")],
+    );
+
+    assert_exit_1(&out);
+    assert!(
+        stderr(&out).contains("FETCH_VECTORS_LOCK_WAIT"),
+        "{}",
+        describe(&out)
+    );
+    assert!(fx.curl_calls().is_empty());
+    assert_eq!(files_under(&fx.dest()), Vec::<PathBuf>::new());
+}
+
+/// Runs against a lock left by `pid` on `host` in `pidns`, and checks it failed closed and
+/// left that lock exactly as it was.
+fn assert_foreign_lock_is_kept(host: &str, pidns: &str, needle: &str) {
+    let fx = Fixture::new();
+    let lock = fx.out_dir(LIGHT_TAG).join(format!(".{TAR}.lock"));
+    let pid = dead_pid();
+    write_lock(&lock, pid, host, pidns);
+
+    let out = fx.run(&fx.good_tar_manifest());
+
+    assert_exit_1(&out);
+    let err = stderr(&out);
+    assert!(
+        err.contains("LOCKED") && err.contains(needle),
+        "{}",
+        describe(&out)
+    );
+    assert!(!err.contains("stale lock"), "{}", describe(&out));
+    assert!(fx.curl_calls().is_empty());
+    for (file, want) in [
+        ("pid", pid.to_string()),
+        ("host", host.into()),
+        ("pidns", pidns.into()),
+    ] {
+        assert_eq!(
+            fs::read_to_string(lock.join(file)).unwrap().trim(),
+            want,
+            "{file}"
+        );
+    }
+}
+
+#[test]
+fn lock_from_another_host_is_never_taken_over() {
+    assert_foreign_lock_is_kept("other-host.invalid", &our_pidns(), "other-host.invalid");
+}
+
+#[test]
+fn lock_from_another_pid_namespace_is_never_taken_over() {
+    assert_foreign_lock_is_kept(&our_host(), "pid:[1]", "pid:[1]");
+}
+
+#[test]
+fn lock_without_its_owner_identity_fails_closed() {
+    let fx = Fixture::new();
+    let lock = fx.out_dir(LIGHT_TAG).join(format!(".{TAR}.lock"));
+    fs::create_dir_all(&lock).unwrap();
+    fs::write(lock.join("pid"), format!("{}\n", dead_pid())).unwrap();
+
+    let out = fx.run(&fx.good_tar_manifest());
+
+    assert_exit_1(&out);
+    assert!(stderr(&out).contains("LOCKED"), "{}", describe(&out));
+    assert!(fx.curl_calls().is_empty());
+    assert!(
+        lock.join("pid").is_file(),
+        "the lock is left for manual removal"
+    );
+}
+
+#[test]
+fn taken_lock_records_pid_host_and_pid_namespace() {
+    let fx = Fixture::new();
+    let lock = fx.out_dir(LIGHT_TAG).join(format!(".{TAR}.lock"));
+    let ch = Choreography::new(&fx);
+    let mut run = ch.spawn(&fx, &fx.good_tar_manifest(), "A", "owned");
+    ch.wait_for(&["A owned"], &mut run);
+
+    let read = |f: &str| fs::read_to_string(lock.join(f)).map(|s| s.trim().to_owned());
+    let recorded = (read("pid"), read("host"), read("pidns"));
+    ch.go("A", "owned");
+    let out = run.wait_with_output().unwrap();
+
+    assert_ok(&out);
+    let (pid, host, pidns) = recorded;
+    assert!(pid.unwrap().parse::<u32>().is_ok());
+    assert_eq!(host.unwrap(), our_host());
+    assert_eq!(pidns.unwrap(), our_pidns());
 }
