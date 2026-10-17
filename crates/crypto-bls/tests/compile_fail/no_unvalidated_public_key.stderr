@@ -1,0 +1,86 @@
+error[E0599]: no associated function or constant named `from_bytes` found for struct `crypto_bls::PublicKey` in the current scope
+ --> tests/compile_fail/no_unvalidated_public_key.rs:6:24
+  |
+6 |     let _ = PublicKey::from_bytes(&bytes);
+  |                        ^^^^^^^^^^ associated function or constant not found in `crypto_bls::PublicKey`
+  |
+note: if you're trying to build a new `crypto_bls::PublicKey`, consider using `crypto_bls::PublicKey::from_validated_bytes` which returns `Result<crypto_bls::PublicKey, crypto_bls::Error>`
+ --> src/keys.rs
+  |
+  |     pub fn from_validated_bytes(bytes: &[u8; PUBLIC_KEY_BYTES_LEN]) -> Result<Self, Error> {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: there is an associated function `from_validated_bytes` with a similar name
+  |
+6 |     let _ = PublicKey::from_validated_bytes(&bytes);
+  |                             ++++++++++
+
+error[E0599]: no associated function or constant named `deserialize` found for struct `crypto_bls::PublicKey` in the current scope
+ --> tests/compile_fail/no_unvalidated_public_key.rs:7:24
+  |
+7 |     let _ = PublicKey::deserialize(&bytes);
+  |                        ^^^^^^^^^^^ associated function or constant not found in `crypto_bls::PublicKey`
+  |
+note: if you're trying to build a new `crypto_bls::PublicKey`, consider using `crypto_bls::PublicKey::from_validated_bytes` which returns `Result<crypto_bls::PublicKey, crypto_bls::Error>`
+ --> src/keys.rs
+  |
+  |     pub fn from_validated_bytes(bytes: &[u8; PUBLIC_KEY_BYTES_LEN]) -> Result<Self, Error> {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no associated function or constant named `default` found for struct `crypto_bls::PublicKey` in the current scope
+ --> tests/compile_fail/no_unvalidated_public_key.rs:8:24
+  |
+8 |     let _ = PublicKey::default();
+  |                        ^^^^^^^ associated function or constant not found in `crypto_bls::PublicKey`
+  |
+note: if you're trying to build a new `crypto_bls::PublicKey`, consider using `crypto_bls::PublicKey::from_validated_bytes` which returns `Result<crypto_bls::PublicKey, crypto_bls::Error>`
+ --> src/keys.rs
+  |
+  |     pub fn from_validated_bytes(bytes: &[u8; PUBLIC_KEY_BYTES_LEN]) -> Result<Self, Error> {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0277]: the trait bound `crypto_bls::PublicKey: From<[u8; 48]>` is not satisfied
+ --> tests/compile_fail/no_unvalidated_public_key.rs:9:30
+  |
+9 |     let _: PublicKey = bytes.into();
+  |                              ^^^^ the trait `From<[u8; 48]>` is not implemented for `crypto_bls::PublicKey`
+  |
+  = note: required for `[u8; 48]` to implement `Into<crypto_bls::PublicKey>`
+
+error[E0277]: the trait bound `crypto_bls::PublicKey: TryFrom<&[u8]>` is not satisfied
+  --> tests/compile_fail/no_unvalidated_public_key.rs:10:13
+   |
+10 |     let _ = PublicKey::try_from(&bytes[..]);
+   |             ^^^^^^^^^ the trait `From<&[u8]>` is not implemented for `crypto_bls::PublicKey`
+   |
+   = note: required for `&[u8]` to implement `Into<crypto_bls::PublicKey>`
+   = note: required for `crypto_bls::PublicKey` to implement `TryFrom<&[u8]>`
+
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/compile_fail/no_unvalidated_public_key.rs:15:13
+   |
+15 |     let _ = PublicKey(raw);
+   |             ^^^^^^^^^
+   |
+   = note: a struct named `PublicKey` exists in another namespace
+note: constructor is not visible here due to private fields
+  --> src/keys.rs
+   |
+   | pub struct PublicKey(pub(crate) min_pk::PublicKey);
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private field
+
+error[E0277]: the trait bound `crypto_bls::PublicKey: From<blst::min_pk::PublicKey>` is not satisfied
+  --> tests/compile_fail/no_unvalidated_public_key.rs:14:28
+   |
+14 |     let _: PublicKey = raw.into();
+   |                            ^^^^ the trait `From<blst::min_pk::PublicKey>` is not implemented for `crypto_bls::PublicKey`
+   |
+   = note: required for `blst::min_pk::PublicKey` to implement `Into<crypto_bls::PublicKey>`
+
+error[E0277]: the trait bound `crypto_bls::PublicKey: From<&[u8]>` is not satisfied
+  --> tests/compile_fail/no_unvalidated_public_key.rs:10:13
+   |
+10 |     let _ = PublicKey::try_from(&bytes[..]);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `From<&[u8]>` is not implemented for `crypto_bls::PublicKey`
+   |
+   = note: required for `&[u8]` to implement `Into<crypto_bls::PublicKey>`
+   = note: required for `crypto_bls::PublicKey` to implement `TryFrom<&[u8]>`

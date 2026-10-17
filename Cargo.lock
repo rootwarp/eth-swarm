@@ -898,6 +898,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypto-bls"
+version = "0.1.0"
+dependencies = [
+ "blst",
+ "getrandom 0.3.4",
+ "hex",
+ "tempfile",
+ "thiserror",
+ "trybuild",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

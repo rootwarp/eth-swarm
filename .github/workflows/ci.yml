@@ -83,7 +83,13 @@ jobs:
       - run: cargo build --workspace --locked
       - name: crypto-kzg uses only its pinned setup loader; blst is not portable
         run: bash scripts/tests/check-kzg-loaders.test.sh && bash scripts/check-kzg-loaders.sh
+      - name: Only spec-tests may enable crypto-bls/test-vectors
+        run: bash scripts/check-bls-features.sh
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Fetch and verify spec vectors (uncached)
         run: PRESETS="general minimal" bash testing/fetch-vectors.sh
       - run: cargo test --workspace --locked
+      - name: crypto-bls API tests with every feature (verify, aggregate, test-vectors)
+        run: cargo test -p crypto-bls --all-features --locked
+      - name: crypto-bls feature gate (aggregate only, trybuild)
+        run: cargo test -p crypto-bls --no-default-features --features aggregate --test compile_fail --locked

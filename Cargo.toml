@@ -8,6 +8,7 @@ members = [
     "crates/network-config",
     "crates/consensus-types",
     "crates/crypto-kzg",
+    "crates/crypto-bls",
 ]
 
 [workspace.package]

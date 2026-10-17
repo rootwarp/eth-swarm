@@ -1,0 +1,32 @@
+[package]
+name = "crypto-bls"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Subgroup-checked BLS12-381 (min_pk) on blst for the Ethereum consensus layer."
+
+[features]
+# No default: every consumer names exactly what it links. cl-chain takes only `aggregate`.
+default = []
+# Signature verification: verify, eth_fast_aggregate_verify, verify_batch.
+verify = ["dep:getrandom"]
+# Public-key aggregation: eth_aggregate_pubkeys (get_next_sync_committee).
+aggregate = []
+# Dev-only: sign, aggregate_signatures, aggregate_verify for the spec-vector `bls` runner.
+# Only spec-tests may enable it (scripts/check-bls-features.sh).
+test-vectors = []
+
+[dependencies]
+# Same spec as crypto-kzg and cl-verify so the lockfile has one blst. Never enable `portable`:
+# it swaps the ADX-optimised code for slower generic code.
+blst = "0.3.17"
+thiserror = "2"
+# OS CSPRNG for verify_batch randomizers (already in the lockfile; MIT OR Apache-2.0).
+getrandom = { version = "0.3", optional = true }
+
+[dev-dependencies]
+hex = "0.4"
+tempfile = "3"
+trybuild = "1.0.122"

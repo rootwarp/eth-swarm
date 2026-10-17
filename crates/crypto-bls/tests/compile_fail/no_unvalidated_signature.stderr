@@ -1,0 +1,86 @@
+error[E0599]: no associated function or constant named `from_bytes` found for struct `crypto_bls::Signature` in the current scope
+ --> tests/compile_fail/no_unvalidated_signature.rs:6:24
+  |
+6 |     let _ = Signature::from_bytes(&bytes);
+  |                        ^^^^^^^^^^ associated function or constant not found in `crypto_bls::Signature`
+  |
+note: if you're trying to build a new `crypto_bls::Signature`, consider using `crypto_bls::Signature::from_validated_bytes` which returns `Result<crypto_bls::Signature, crypto_bls::Error>`
+ --> src/signature.rs
+  |
+  |     pub fn from_validated_bytes(bytes: &[u8; SIGNATURE_BYTES_LEN]) -> Result<Self, Error> {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: there is an associated function `from_validated_bytes` with a similar name
+  |
+6 |     let _ = Signature::from_validated_bytes(&bytes);
+  |                             ++++++++++
+
+error[E0599]: no associated function or constant named `deserialize` found for struct `crypto_bls::Signature` in the current scope
+ --> tests/compile_fail/no_unvalidated_signature.rs:7:24
+  |
+7 |     let _ = Signature::deserialize(&bytes);
+  |                        ^^^^^^^^^^^ associated function or constant not found in `crypto_bls::Signature`
+  |
+note: if you're trying to build a new `crypto_bls::Signature`, consider using `crypto_bls::Signature::from_validated_bytes` which returns `Result<crypto_bls::Signature, crypto_bls::Error>`
+ --> src/signature.rs
+  |
+  |     pub fn from_validated_bytes(bytes: &[u8; SIGNATURE_BYTES_LEN]) -> Result<Self, Error> {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no associated function or constant named `default` found for struct `crypto_bls::Signature` in the current scope
+ --> tests/compile_fail/no_unvalidated_signature.rs:8:24
+  |
+8 |     let _ = Signature::default();
+  |                        ^^^^^^^ associated function or constant not found in `crypto_bls::Signature`
+  |
+note: if you're trying to build a new `crypto_bls::Signature`, consider using `crypto_bls::Signature::from_validated_bytes` which returns `Result<crypto_bls::Signature, crypto_bls::Error>`
+ --> src/signature.rs
+  |
+  |     pub fn from_validated_bytes(bytes: &[u8; SIGNATURE_BYTES_LEN]) -> Result<Self, Error> {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0277]: the trait bound `crypto_bls::Signature: From<[u8; 96]>` is not satisfied
+ --> tests/compile_fail/no_unvalidated_signature.rs:9:30
+  |
+9 |     let _: Signature = bytes.into();
+  |                              ^^^^ the trait `From<[u8; 96]>` is not implemented for `crypto_bls::Signature`
+  |
+  = note: required for `[u8; 96]` to implement `Into<crypto_bls::Signature>`
+
+error[E0277]: the trait bound `crypto_bls::Signature: TryFrom<&[u8]>` is not satisfied
+  --> tests/compile_fail/no_unvalidated_signature.rs:10:13
+   |
+10 |     let _ = Signature::try_from(&bytes[..]);
+   |             ^^^^^^^^^ the trait `From<&[u8]>` is not implemented for `crypto_bls::Signature`
+   |
+   = note: required for `&[u8]` to implement `Into<crypto_bls::Signature>`
+   = note: required for `crypto_bls::Signature` to implement `TryFrom<&[u8]>`
+
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/compile_fail/no_unvalidated_signature.rs:15:13
+   |
+15 |     let _ = Signature(raw);
+   |             ^^^^^^^^^
+   |
+   = note: a struct named `Signature` exists in another namespace
+note: constructor is not visible here due to private fields
+  --> src/signature.rs
+   |
+   | pub struct Signature(pub(crate) min_pk::Signature);
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private field
+
+error[E0277]: the trait bound `crypto_bls::Signature: From<blst::min_pk::Signature>` is not satisfied
+  --> tests/compile_fail/no_unvalidated_signature.rs:14:28
+   |
+14 |     let _: Signature = raw.into();
+   |                            ^^^^ the trait `From<blst::min_pk::Signature>` is not implemented for `crypto_bls::Signature`
+   |
+   = note: required for `blst::min_pk::Signature` to implement `Into<crypto_bls::Signature>`
+
+error[E0277]: the trait bound `crypto_bls::Signature: From<&[u8]>` is not satisfied
+  --> tests/compile_fail/no_unvalidated_signature.rs:10:13
+   |
+10 |     let _ = Signature::try_from(&bytes[..]);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `From<&[u8]>` is not implemented for `crypto_bls::Signature`
+   |
+   = note: required for `&[u8]` to implement `Into<crypto_bls::Signature>`
+   = note: required for `crypto_bls::Signature` to implement `TryFrom<&[u8]>`

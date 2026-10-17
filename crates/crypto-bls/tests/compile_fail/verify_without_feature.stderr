@@ -1,0 +1,20 @@
+error[E0425]: cannot find function `verify` in crate `crypto_bls`
+ --> tests/compile_fail/verify_without_feature.rs:5:17
+  |
+5 |     crypto_bls::verify(public_key, b"message", signature)
+  |                 ^^^^^^ not found in `crypto_bls`
+  |
+note: found an item that was configured out
+ --> src/lib.rs
+  |
+  | #[cfg(feature = "verify")]
+  |       ------------------ the item is gated behind the `verify` feature
+  | mod verify;
+  |     ^^^^^^
+note: found an item that was configured out
+ --> src/lib.rs
+  |
+  | #[cfg(feature = "verify")]
+  |       ------------------ the item is gated behind the `verify` feature
+  | pub use verify::{eth_fast_aggregate_verify, verify, verify_batch, SignatureSet};
+  |                                             ^^^^^^
