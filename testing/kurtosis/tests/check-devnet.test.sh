@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2016 # single-quoted stub bodies expand when the stubs run, on purpose
-# Offline tests for testing/kurtosis/check-devnet.sh. Run: bash testing/kurtosis/tests/check-devnet.test.sh
+# Offline tests for testing/kurtosis/check-devnet.sh (one enclave, and a --pair of two). Run: bash testing/kurtosis/tests/check-devnet.test.sh
 # kurtosis and curl are stubs on PATH: `kurtosis enclave inspect` prints a canned service table,
 # `kurtosis port print` a canned URL per service, and curl serves fixture files per host:port and
 # API path (a numbered file per call, for answers that change between polls). No network, no
@@ -28,11 +28,13 @@ export STUB_DIR="$tmp/stub"
 cat > "$stubs/kurtosis" <<'SH'
 #!/usr/bin/env bash
 # kurtosis stub. `enclave inspect E`: $STUB_DIR/inspect.<E> (none: exit 1). `port print E S P`:
-# $STUB_DIR/port.<S>.<P> (none: exit 1).
+# $STUB_DIR/port.<E>.<S>.<P>, else $STUB_DIR/port.<S>.<P> (neither: exit 1). With $STUB_DIR/stderr, every call first prints that
+# file to stderr (Kurtosis 1.22.1 on Docker Desktop prints an OpenTelemetry WARN on every call).
 printf '%s\n' "$*" >> "$STUB_DIR/kurtosis.log"
+if [[ -f $STUB_DIR/stderr ]]; then cat "$STUB_DIR/stderr" >&2; fi
 case "$1 $2" in
   "enclave inspect") f="$STUB_DIR/inspect.$3" ;;
-  "port print") f="$STUB_DIR/port.$4.$5" ;;
+  "port print") f="$STUB_DIR/port.$3.$4.$5"; [[ -f $f ]] || f="$STUB_DIR/port.$4.$5" ;;
   *) exit 64 ;;
 esac
 [[ -f $f ]] || { echo "stub: no $f" >&2; exit 1; }
@@ -235,6 +237,34 @@ base
 printf '127.0.0.1:32811\n' > "$STUB_DIR/port.cl-2-lodestar-geth.http"
 run 0 "a port print answer without a scheme is read as http://" '^cl-2-lodestar-geth: http://127.0.0.1:32811$' -- ethswarm-gloas
 
+# kurtosis' stderr is never read as its answer: the WARN Kurtosis 1.22.1 prints on Docker Desktop
+# (macOS) on every call, with a cl-<n>-* looking name in it so a parsed stderr would show.
+warn() {
+  printf '%s\n' \
+    '[33mWARN[0m[2026-10-18T23:04:17+09:00] Failed to start the OpenTelemetry side containers; continuing without them. Error:' \
+    'Caused by: Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running? container cl-9-otel-geth not started' \
+    > "$STUB_DIR/stderr"
+}
+
+base
+warn
+run 0 "a WARN on kurtosis' stderr does not reach the URL or the service list" \
+  '^devnet ethswarm-gloas: 2 CL services: cl-1-lighthouse-geth cl-2-lodestar-geth$' \
+  '^cl-1-lighthouse-geth: http://127.0.0.1:32801$' '^cl-2-lodestar-geth: http://127.0.0.1:32811$' \
+  '^verdict: PASS \(3/3 criteria\)$' '!WARN' '!cl-9-otel-geth' -- ethswarm-gloas
+
+base
+warn
+rm "$STUB_DIR/port.cl-2-lodestar-geth.http"
+run 2 "a failed port print shows its stderr in the error" \
+  '^ERROR: kurtosis port print ethswarm-gloas cl-2-lodestar-geth http failed: ' \
+  'stub: no .*/port\.cl-2-lodestar-geth\.http' 'Cannot connect to the Docker daemon' -- ethswarm-gloas
+
+base
+warn
+run 2 "a failed enclave inspect shows its stderr in the error" \
+  '^ERROR: kurtosis enclave inspect other failed: ' 'stub: no .*/inspect\.other' 'OpenTelemetry' -- other
+
 # --- genesis: record and reference ---------------------------------------------------------------
 
 base
@@ -342,6 +372,43 @@ print("enr:" + base64.urlsafe_b64encode(rlp).decode().rstrip("="))')
 printf '{"data":{"peer_id":"x","enr":"%s"}}\n' "$noeth2" > "$STUB_DIR/http/127.0.0.1:32811/eth_v1_node_identity"
 run 1 "an ENR without an eth2 entry fails" '^- cl-2-lodestar-geth: ENR: no eth2 entry$' -- ethswarm-gloas
 
+# The first devnet run's own answers (fixtures/run-a/<service>/: fork_schedule, the spec fields
+# the check reads, identity). Lodestar lists the unscheduled Heze fork at FAR_FUTURE_EPOCH
+# (current_version 0x90000038) and Lighthouse does not, so the raw schedules have 9 and 8 entries.
+fixtures="$here/fixtures/run-a"
+real_forks() {
+  local svc
+  for svc in cl-1-lighthouse-geth cl-2-lodestar-geth; do
+    for name in fork_schedule spec identity; do
+      cp "$fixtures/$svc/$name.json" "$STUB_DIR/http/127.0.0.1:$(port_of $svc)/eth_v1_config_$name"
+    done
+    mv "$STUB_DIR/http/127.0.0.1:$(port_of $svc)/eth_v1_config_identity" \
+      "$STUB_DIR/http/127.0.0.1:$(port_of $svc)/eth_v1_node_identity"
+  done
+}
+
+base
+real_forks
+run 0 "the first run's schedules agree once Lodestar's unscheduled Heze entry is dropped" \
+  '^cl-1-lighthouse-geth: fork_schedule 8 scheduled entries$' \
+  '^cl-2-lodestar-geth: fork_schedule 8 scheduled entries \(1 at FAR_FUTURE_EPOCH ignored\)$' \
+  '^cl-2-lodestar-geth: gloas_fork_version 0x80000038$' \
+  '^fork_schedule: PASS \(2 CLs: Gloas at epoch 0, fork digest 0x6c29705f\)$' '!fork schedules differ' \
+  -- ethswarm-gloas
+
+base
+real_forks
+edit cl-2-lodestar-geth eth_v1_config_fork_schedule 's/"current_version": "0x70000038", "epoch": "0"/"current_version": "0x70000038", "epoch": "1"/'
+run 1 "the first run's schedules with a scheduled fork moved on one CL still differ" \
+  '^- fork schedules differ: cl-1-lighthouse-geth and cl-2-lodestar-geth$' '^fork_schedule: FAIL' -- ethswarm-gloas
+
+base
+real_forks
+edit cl-1-lighthouse-geth eth_v1_config_fork_schedule 's/"current_version": "0x80000038", "epoch": "0"/"current_version": "0x80000038", "epoch": "18446744073709551615"/'
+edit cl-1-lighthouse-geth eth_v1_config_spec 's/"GLOAS_FORK_EPOCH": "0"/"GLOAS_FORK_EPOCH": "18446744073709551615"/'
+run 1 "Gloas at FAR_FUTURE_EPOCH is not dropped as unscheduled: it fails" \
+  '^- cl-1-lighthouse-geth: Gloas \(0x80000038\) at epoch 18446744073709551615, not 0$' '^fork_schedule: FAIL' -- ethswarm-gloas
+
 # --- finality ------------------------------------------------------------------------------------
 
 base
@@ -391,6 +458,120 @@ base
 edit cl-1-lighthouse-geth eth_v1_beacon_states_head_finality_checkpoints 's/"finalized":{"epoch":"4"/"finalized":{"epoch":"four"/'
 run 1 "a finalized epoch that is not an integer fails" '^- cl-1-lighthouse-geth: finalized epoch "four" is not an integer$' -- ethswarm-gloas
 
+# --- a concurrent pair: two enclaves, one genesis -------------------------------------------------
+
+# pair_base: enclaves ethswarm-gloas-a (the CLs of base, ports 32801/32811) and ethswarm-gloas-b
+# (the same CLs on ports 32901/32911), both passing, on one genesis.
+pair_base() {
+  local e svc port
+  base
+  for e in ethswarm-gloas-a ethswarm-gloas-b; do
+    sed "s/ethswarm-gloas/$e/" "$STUB_DIR/inspect.ethswarm-gloas" > "$STUB_DIR/inspect.$e"
+  done
+  for svc in cl-1-lighthouse-geth:32901 cl-2-lodestar-geth:32911; do
+    port=${svc#*:} svc=${svc%:*}
+    cp "$STUB_DIR/port.$svc.http" "$STUB_DIR/port.$svc.http.a"
+    cl "$svc" "$port"
+    mv "$STUB_DIR/port.$svc.http" "$STUB_DIR/port.ethswarm-gloas-b.$svc.http"
+    mv "$STUB_DIR/port.$svc.http.a" "$STUB_DIR/port.$svc.http"
+  done
+}
+B1="$STUB_DIR/http/127.0.0.1:32901" B2="$STUB_DIR/http/127.0.0.1:32911"
+
+pair_base
+run 0 "a pair on one genesis, each passing, is a pair PASS" \
+  '^== ethswarm-gloas-a$' '^devnet ethswarm-gloas-a: 2 CL services: ' '^cl-1-lighthouse-geth: http://127.0.0.1:32801$' \
+  '^== ethswarm-gloas-b$' '^devnet ethswarm-gloas-b: 2 CL services: ' '^cl-1-lighthouse-geth: http://127.0.0.1:32901$' \
+  "^pair: genesis_block_root $BLOCK \(both enclaves\)$" "^pair: genesis_state_root $STATE \(both enclaves\)$" \
+  "^pair: genesis_validators_root $GVR \(both enclaves\)$" \
+  '^pair genesis: PASS \(ethswarm-gloas-a and ethswarm-gloas-b: one genesis\)$' \
+  '^pair verdict: PASS \(2 enclaves: 3/3 criteria each, one genesis\)$' \
+  -- --pair ethswarm-gloas-a ethswarm-gloas-b
+if grep -q '^port print ethswarm-gloas-b cl-2-lodestar-geth http$' "$STUB_DIR/kurtosis.log" &&
+   grep -q '127.0.0.1:32911/eth/v1/beacon/states/head/finality_checkpoints$' "$STUB_DIR/curl.log"; then
+  ok "a pair checks the second enclave's own CLs"
+else
+  bad "a pair checks the second enclave's own CLs" "$(cat "$STUB_DIR/kurtosis.log")"
+fi
+
+pair_base
+for f in "$B1" "$B2"; do sed "s/$STATE/0x$(printf '55%.0s' {1..32})/" "$f/eth_v1_beacon_headers_genesis" > "$f/h" && mv "$f/h" "$f/eth_v1_beacon_headers_genesis"; done
+run 1 "a pair whose genesis state roots differ fails" \
+  "^- genesis_state_root: ethswarm-gloas-a $STATE, ethswarm-gloas-b 0x5555" '^pair genesis: FAIL$' \
+  '^pair verdict: FAIL \(pair genesis\)$' '!^pair verdict: PASS' \
+  -- --pair ethswarm-gloas-a ethswarm-gloas-b
+
+pair_base
+for f in "$B1" "$B2"; do sed "s/$GVR/0x$(printf '77%.0s' {1..32})/" "$f/eth_v1_beacon_genesis" > "$f/g" && mv "$f/g" "$f/eth_v1_beacon_genesis"; done
+run 1 "a pair whose genesis_validators_root differs fails" \
+  "^- genesis_validators_root: ethswarm-gloas-a $GVR, ethswarm-gloas-b 0x7777" '^pair genesis: FAIL$' \
+  -- --pair ethswarm-gloas-a ethswarm-gloas-b
+
+pair_base
+for f in "$B1" "$B2"; do sed 's/"finalized":{"epoch":"4"/"finalized":{"epoch":"0"/' "$f/eth_v1_beacon_states_head_finality_checkpoints" > "$f/c" && mv "$f/c" "$f/eth_v1_beacon_states_head_finality_checkpoints"; done
+run 1 "a pair whose second enclave does not finalize fails, naming it" \
+  '^== ethswarm-gloas-b: exit 1$' '^pair genesis: PASS' '^pair verdict: FAIL \(ethswarm-gloas-b\)$' \
+  -- --pair ethswarm-gloas-a ethswarm-gloas-b
+
+pair_base
+sed "s/$BLOCK/0x$(printf '66%.0s' {1..32})/" "$B2/eth_v1_beacon_headers_genesis" > "$B2/h" && mv "$B2/h" "$B2/eth_v1_beacon_headers_genesis"
+run 1 "a pair whose second enclave's CLs disagree on genesis has no genesis to compare" \
+  '^- ethswarm-gloas-b: no genesis record \(its genesis check failed\)$' '^pair genesis: FAIL$' \
+  '^pair verdict: FAIL \(ethswarm-gloas-b; pair genesis\)$' \
+  -- --pair ethswarm-gloas-a ethswarm-gloas-b
+
+pair_base
+rm "$STUB_DIR/inspect.ethswarm-gloas-b"
+run 2 "a pair with an enclave that does not exist is a setup error" \
+  '^ERROR: kurtosis enclave inspect ethswarm-gloas-b failed: ' '^pair verdict: ERROR \(setup error in ethswarm-gloas-b\)$' \
+  -- --pair ethswarm-gloas-a ethswarm-gloas-b
+
+pair_base
+run 3 "a pair of DIAGNOSTIC runs is a pair DIAGNOSTIC, never a PASS" \
+  '^pair genesis: PASS' '^pair verdict: DIAGNOSTIC \(not an acceptance run: ethswarm-gloas-a ethswarm-gloas-b\)$' '!^pair verdict: PASS' \
+  -- --pair --min-finalized-epoch 2 ethswarm-gloas-a ethswarm-gloas-b
+
+pair_base
+rm -f "$tmp/pair.json"
+run 0 "--record on a pair writes the pair's one genesis" "^pair genesis: record written to $tmp/pair.json$" \
+  -- --pair --record "$tmp/pair.json" ethswarm-gloas-a ethswarm-gloas-b
+if [[ -f $tmp/pair.json && $(cat "$tmp/pair.json") == "$want" ]]; then ok "the pair record holds the five genesis fields"; else bad "the pair record holds the five genesis fields" "$(cat "$tmp/pair.json" 2>&1)"; fi
+
+pair_base
+for f in "$B1" "$B2"; do sed "s/$STATE/0x$(printf '55%.0s' {1..32})/" "$f/eth_v1_beacon_headers_genesis" > "$f/h" && mv "$f/h" "$f/eth_v1_beacon_headers_genesis"; done
+rm -f "$tmp/pair-bad.json"
+run 1 "--record on a pair that differs writes nothing" '^pair genesis: FAIL$' -- --pair --record "$tmp/pair-bad.json" ethswarm-gloas-a ethswarm-gloas-b
+if [[ ! -e $tmp/pair-bad.json ]]; then ok "no pair record is written when the enclaves differ"; else bad "no pair record is written when the enclaves differ"; fi
+
+pair_base
+run 0 "--reference on a pair checks both enclaves against it" '^== ethswarm-gloas-b$' '^genesis: PASS .*matches the reference run' \
+  '^pair verdict: PASS' -- --pair --reference "$tmp/run-a.json" ethswarm-gloas-a ethswarm-gloas-b
+n=$(grep -c "matches the reference run" <<<"$(PATH="$stubs:$PATH" bash "$script" --interval 0 --attempts 1 --pair --reference "$tmp/run-a.json" ethswarm-gloas-a ethswarm-gloas-b 2>&1)" || true)
+if ((n == 2)); then ok "both enclaves of a pair match the reference"; else bad "both enclaves of a pair match the reference (got $n)"; fi
+
+pair_base
+run 0 "--services on a pair applies to both enclaves" '^devnet ethswarm-gloas-b: 2 CL services: cl-2-lodestar-geth cl-1-lighthouse-geth$' \
+  -- --pair --services 'cl-2-lodestar-geth cl-1-lighthouse-geth' ethswarm-gloas-a ethswarm-gloas-b
+
+# helper_pair <expect-exit> <description> <pattern> -- <pair args...>: lib/devnet.py pair directly,
+# for records check-devnet.sh itself never writes.
+helper_pair() {
+  local expect=$1 desc=$2 pattern=$3 rc=0 out
+  shift 4
+  out=$(python3 -I "$here/../lib/devnet.py" pair "$@" 2>&1) || rc=$?
+  if ((rc == expect)) && printf '%s\n' "$out" | grep -Eq -- "$pattern"; then ok "$desc"; else bad "$desc (exit $rc, want $expect)" "$out"; fi
+}
+helper_pair 1 "a pair record that is not JSON fails" '^- A: genesis record .* is not JSON' -- A "$tmp/garbage.json" B "$tmp/run-a.json"
+helper_pair 1 "a pair record without every field fails" '^- A: genesis record .* has no genesis_block_root, genesis_fork_version, genesis_state_root, genesis_validators_root$' \
+  -- A "$tmp/partial.json" B "$tmp/run-a.json"
+printf '[]\n' > "$tmp/list.json"
+helper_pair 1 "a pair record that is not an object fails" '^- B: genesis record .* is not a JSON object$' -- A "$tmp/run-a.json" B "$tmp/list.json"
+
+pair_base
+run 2 "--pair with one enclave is a usage error" '^usage: ' -- --pair ethswarm-gloas-a
+run 2 "--pair with three enclaves is a usage error" '^usage: ' -- --pair a b c
+run 2 "--pair naming one enclave twice is a usage error" 'two different enclaves' -- --pair ethswarm-gloas-a ethswarm-gloas-a
+
 # --- several criteria at once, setup and usage errors ----------------------------------------------
 
 base
@@ -407,7 +588,7 @@ run 2 "an enclave without CL services is a setup error" '^ERROR: no cl-<n>-\* se
 
 base
 rm "$STUB_DIR/port.cl-2-lodestar-geth.http"
-run 2 "a CL without an http port is a setup error" '^ERROR: kurtosis port print ethswarm-gloas cl-2-lodestar-geth http failed' -- ethswarm-gloas
+run 2 "a CL without an http port is a setup error" '^ERROR: kurtosis port print ethswarm-gloas cl-2-lodestar-geth http failed: stub: no ' -- ethswarm-gloas
 
 base
 printf 'http://127.0.0.1:32811/$(id)\n' > "$STUB_DIR/port.cl-2-lodestar-geth.http"
@@ -415,7 +596,7 @@ run 2 "a port print answer that is not a bare URL is refused" '^ERROR: kurtosis 
 
 base
 run 2 "no enclave is a usage error" '^usage: ' --
-run 2 "two enclaves are a usage error" '^usage: ' -- a b
+run 2 "two enclaves without --pair are a usage error" '^usage: ' -- a b
 run 2 "an unknown option is a usage error" '^usage: ' -- --frobnicate ethswarm-gloas
 run 2 "a non-integer --min-finalized-epoch is a usage error" 'min-finalized-epoch' -- --min-finalized-epoch x ethswarm-gloas
 run 2 "a non-integer --attempts is a usage error" 'attempts' -- --attempts 0 ethswarm-gloas

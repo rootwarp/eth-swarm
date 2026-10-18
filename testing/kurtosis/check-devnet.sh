@@ -14,12 +14,19 @@
 #                  CLs reach and agree on it over time.
 # The evidence and the rules live in lib/devnet.py (standard library Python, run with -I).
 #
+# --pair ENCLAVE_A ENCLAVE_B checks a concurrent pair (two enclaves from one rendered args file,
+# one genesis_time; README.md, "Reproducible genesis"): it runs every check above on each
+# enclave in turn, then requires both enclaves' genesis records to be equal (genesis_time,
+# genesis_validators_root, genesis_fork_version, genesis block root and state root). The other
+# options apply to both enclaves; --record writes the pair's one genesis.
+#
 # An acceptance PASS needs every CL service the enclave runs, at least 2 distinct ones, and a
 # --min-finalized-epoch of at least 3. A run that misses any of these (a --services subset, a
 # one-CL enclave, a lower threshold) still checks every criterion, but its verdict is
 # DIAGNOSTIC, never PASS: it is not acceptance evidence.
 #
 # Usage: testing/kurtosis/check-devnet.sh [options] ENCLAVE
+#        testing/kurtosis/check-devnet.sh --pair [options] ENCLAVE_A ENCLAVE_B
 #   --services "SVC ..."     the CL services to query (default: every cl-<n>-* service that
 #                            `kurtosis enclave inspect ENCLAVE` lists). Each must be one of those;
 #                            fewer than all of them makes the run DIAGNOSTIC.
@@ -28,10 +35,12 @@
 #   --min-finalized-epoch N  default 3; below 3 makes the run DIAGNOSTIC
 #   --attempts N             finality polls (default 40)
 #   --interval S             seconds between finality polls (default 12)
+#   --pair                   two enclaves, checked as a concurrent pair (see above)
 # Exit: 0 acceptance PASS (every criterion passed), 1 a criterion failed, 2 a usage or setup
 # error (kurtosis or python3 missing, unknown enclave, no CL service, a --services CL the
 # enclave does not run, a port that does not resolve), 3 DIAGNOSTIC (every criterion passed,
-# but the run is not an acceptance run).
+# but the run is not an acceptance run). With --pair: 2 if either enclave's run is a setup
+# error, else 1 if either fails or their genesis differs, else 3 if either is DIAGNOSTIC, else 0.
 # Works on bash 3.2.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -40,6 +49,7 @@ helper="$here/lib/devnet.py"
 usage() {
   echo "usage: check-devnet.sh [--services \"SVC ...\"] [--record FILE] [--reference FILE]" \
     "[--min-finalized-epoch N] [--attempts N] [--interval S] ENCLAVE" >&2
+  echo "       check-devnet.sh --pair [options] ENCLAVE_A ENCLAVE_B" >&2
   exit 2
 }
 die() { echo "ERROR: $*" >&2; exit 2; }
@@ -55,7 +65,8 @@ contains() {
   return 1
 }
 
-services='' record='' reference='' min_epoch=3 attempts=40 interval=12 enclave=''
+services='' record='' reference='' min_epoch=3 attempts=40 interval=12 pair=0
+enclaves=()
 while (($# > 0)); do
   case $1 in
     --services|--record|--reference|--min-finalized-epoch|--attempts|--interval)
@@ -69,11 +80,18 @@ while (($# > 0)); do
         --interval) interval=$2 ;;
       esac
       shift 2 ;;
+    --pair) pair=1; shift ;;
     -*) usage ;;
-    *) [[ -z $enclave ]] || usage; enclave=$1; shift ;;
+    *) enclaves+=("$1"); shift ;;
   esac
 done
-[[ -n $enclave ]] || usage
+if ((pair)); then
+  ((${#enclaves[@]} == 2)) || usage
+  [[ ${enclaves[0]} != "${enclaves[1]}" ]] || { echo "--pair needs two different enclaves" >&2; usage; }
+else
+  ((${#enclaves[@]} == 1)) || usage
+fi
+enclave=${enclaves[0]}
 is_uint "$min_epoch" || { echo "--min-finalized-epoch must be a non-negative integer" >&2; usage; }
 { is_uint "$attempts" && ((attempts >= 1)); } || { echo "--attempts must be an integer >= 1" >&2; usage; }
 is_uint "$interval" || { echo "--interval must be a non-negative integer" >&2; usage; }
@@ -85,9 +103,65 @@ command -v python3 >/dev/null 2>&1 || die "python3 not found on PATH"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
+# A concurrent pair: every check on each enclave (this script, once per enclave), then one
+# genesis across both.
+if ((pair)); then
+  sub=(--min-finalized-epoch "$min_epoch" --attempts "$attempts" --interval "$interval")
+  if [[ -n $services ]]; then sub+=(--services "$services"); fi
+  if [[ -n $reference ]]; then sub+=(--reference "$reference"); fi
+  setup=() failed=() diagnostic=() n=0
+  for e in "${enclaves[@]}"; do
+    n=$((n + 1))
+    echo "== $e"
+    rc=0
+    "${BASH:-bash}" "$here/check-devnet.sh" "${sub[@]}" --record "$work/genesis-$n.json" "$e" || rc=$?
+    echo "== $e: exit $rc"
+    case $rc in
+      0) ;;
+      1) failed+=("$e") ;;
+      3) diagnostic+=("$e") ;;
+      *) setup+=("$e") ;;
+    esac
+  done
+  pair_args=()
+  if [[ -n $record ]]; then pair_args+=(--record "$record"); fi
+  rc=0
+  python3 -I "$helper" pair ${pair_args[@]+"${pair_args[@]}"} \
+    "${enclaves[0]}" "$work/genesis-1.json" "${enclaves[1]}" "$work/genesis-2.json" || rc=$?
+  if ((rc != 0)); then failed+=("pair genesis"); fi
+  if ((${#setup[@]} > 0)); then
+    echo "pair verdict: ERROR (setup error in ${setup[*]})"
+    exit 2
+  fi
+  if ((${#failed[@]} > 0)); then
+    reasons=$(printf '%s; ' "${failed[@]}")
+    echo "pair verdict: FAIL (${reasons%; })"
+    exit 1
+  fi
+  if ((${#diagnostic[@]} > 0)); then
+    echo "pair verdict: DIAGNOSTIC (not an acceptance run: ${diagnostic[*]})"
+    exit 3
+  fi
+  echo "pair verdict: PASS (2 enclaves: 3/3 criteria each, one genesis)"
+  exit 0
+fi
+
+# kurtosis_out <name> <kurtosis args...>: the command's stdout. Its stderr goes to
+# $work/<name>.err and is shown only when the command fails: Kurtosis 1.22.1 on Docker Desktop
+# (macOS) prints an OpenTelemetry WARN to stderr on every call, which must not be parsed as the
+# answer.
+kurtosis_out() {
+  local name=$1 out
+  shift
+  if ! out=$(kurtosis "$@" 2>"$work/$name.err"); then
+    die "kurtosis $* failed: $(cat "$work/$name.err")"
+  fi
+  printf '%s' "$out"
+}
+
 # The enclave's CL services: every cl-<n>-* name in its service table, by index.
 found=()
-inspect=$(kurtosis enclave inspect "$enclave" 2>&1) || die "kurtosis enclave inspect $enclave failed: $inspect"
+inspect=$(kurtosis_out inspect enclave inspect "$enclave") || exit 2
 while IFS= read -r svc; do
   if [[ -n $svc ]]; then found+=("$svc"); fi
 done < <(printf '%s\n' "$inspect" | tr -s ' \t' '\n\n' | grep -E "$SERVICE_RE" | sort -u | sort -t- -k2,2n)
@@ -126,7 +200,7 @@ for reason in ${diagnostic[@]+"${diagnostic[@]}"}; do echo "diagnostic: $reason"
 
 # Each service's beacon API base URL, from its `http` port.
 for svc in "${list[@]}"; do
-  url=$(kurtosis port print "$enclave" "$svc" http 2>&1) || die "kurtosis port print $enclave $svc http failed: $url"
+  url=$(kurtosis_out port port print "$enclave" "$svc" http) || exit 2
   url=$(printf '%s' "$url" | tr -d '\r')
   [[ $url == *://* ]] || url="http://$url"
   [[ $url =~ ^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\]):[0-9]+$ ]] ||

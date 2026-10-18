@@ -17,10 +17,18 @@ a pass, 1 on a fail, 2 on a usage error. Standard library only, run with `python
         /eth/v1/config/fork_schedule, /eth/v1/config/spec and /eth/v1/node/identity: for each
         CL, GLOAS_FORK_EPOCH is 0, the schedule holds GLOAS_FORK_VERSION at epoch 0, and the
         fork in force at epoch 0 (the last schedule entry at epoch 0) is Gloas. Every CL must
-        serve the same schedule and advertise the same fork digest: the first 4 bytes of the
+        serve the same scheduled forks (entries at FAR_FUTURE_EPOCH, forks a client knows but
+        has not scheduled, are dropped before the comparison; Gloas there still fails the
+        epoch-0 check) and advertise the same fork digest: the first 4 bytes of the
         `eth2` entry (ENRForkID) of its own ENR, which is the digest it uses on the wire. The
         ENR signature is not checked; the record comes from the node's own API. Versions
         compare case-insensitively. Prints `fork_schedule: PASS (...)` or `fork_schedule: FAIL`.
+
+    pair [--record FILE] NAME_A RECORD_A NAME_B RECORD_B
+        Two enclaves' genesis records (the --record files of their `genesis` runs; a missing
+        file is an enclave whose genesis check failed) must hold the same five values. With
+        --record, the pair's one genesis is written to FILE (only when they agree). Prints
+        `pair genesis: PASS (...)` or `pair genesis: FAIL`.
 
     finality DIR MIN_EPOCH SERVICE...
         /eth/v1/beacon/states/head/finality_checkpoints: every CL's finalized epoch is at least
@@ -42,6 +50,9 @@ GENESIS_FIELDS = (
     "genesis_validators_root",
 )
 MAX_ENR_TEXT = 4096
+# The epoch of a fork a client knows but has not scheduled (2^64 - 1). Clients differ on whether
+# /eth/v1/config/fork_schedule lists such forks (Lodestar lists Heze there, Lighthouse does not).
+FAR_FUTURE_EPOCH = 2**64 - 1
 
 
 class Bad(Exception):
@@ -173,6 +184,51 @@ def against_reference(path, agreed):
     return out
 
 
+def read_record(name, path):
+    """An enclave's genesis record: the five GENESIS_FIELDS; raises Bad when it is unusable."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            record = json.load(f)
+    except FileNotFoundError:
+        raise Bad(f"{name}: no genesis record (its genesis check failed)") from None
+    except (OSError, ValueError) as e:
+        raise Bad(f"{name}: genesis record {path} is not JSON: {e}") from None
+    if not isinstance(record, dict):
+        raise Bad(f"{name}: genesis record {path} is not a JSON object")
+    missing = [key for key in GENESIS_FIELDS if not isinstance(record.get(key), str)]
+    if missing:
+        raise Bad(f"{name}: genesis record {path} has no {', '.join(missing)}")
+    return {key: record[key].lower() for key in GENESIS_FIELDS}
+
+
+def cmd_pair(args):
+    failures = []
+    records = {}
+    for name, path in ((args.name_a, args.record_a), (args.name_b, args.record_b)):
+        try:
+            records[name] = read_record(name, path)
+        except Bad as e:
+            failures.append(str(e))
+    if len(records) == 2:
+        a, b = records[args.name_a], records[args.name_b]
+        for key in GENESIS_FIELDS:
+            if a[key] == b[key]:
+                print(f"pair: {key} {a[key]} (both enclaves)")
+            else:
+                failures.append(f"{key}: {args.name_a} {a[key]}, {args.name_b} {b[key]}")
+    for f in failures:
+        print(f"- {f}")
+    if failures:
+        print("pair genesis: FAIL")
+        return 1
+    if args.record:
+        with open(args.record, "w", encoding="utf-8") as f:
+            f.write(json.dumps(records[args.name_a], sort_keys=True) + "\n")
+        print(f"pair genesis: record written to {args.record}")
+    print(f"pair genesis: PASS ({args.name_a} and {args.name_b}: one genesis)")
+    return 0
+
+
 # --- fork schedule ------------------------------------------------------------------------------
 
 
@@ -237,7 +293,9 @@ def enr_fork_digest(text):
 
 
 def forks_of(directory, service):
-    """(schedule, problems, digest) for one CL; raises Bad when an answer is unusable."""
+    """((gloas version, scheduled entries), unscheduled count, problems, digest) for one CL;
+    raises Bad when an answer is unusable. The scheduled entries are the schedule without its
+    FAR_FUTURE_EPOCH entries."""
     spec = data_of(load(directory, service, "spec"), "/eth/v1/config/spec")
     where = "/eth/v1/config/spec"
     gloas = hex_bytes(field(spec, "GLOAS_FORK_VERSION", where), 4, "GLOAS_FORK_VERSION")
@@ -270,7 +328,8 @@ def forks_of(directory, service):
         )
     identity = data_of(load(directory, service, "identity"), "/eth/v1/node/identity")
     digest = enr_fork_digest(identity.get("enr") if isinstance(identity, dict) else None)
-    return (gloas, schedule), problems, digest
+    scheduled = [e for e in schedule if e[2] != FAR_FUTURE_EPOCH]
+    return (gloas, scheduled), len(schedule) - len(scheduled), problems, digest
 
 
 def cmd_forks(args):
@@ -279,7 +338,7 @@ def cmd_forks(args):
     digests = {}
     for service in args.services:
         try:
-            schedule, problems, digest = forks_of(args.dir, service)
+            schedule, unscheduled, problems, digest = forks_of(args.dir, service)
         except Bad as e:
             failures.append(f"{service}: {e}")
             continue
@@ -287,7 +346,8 @@ def cmd_forks(args):
         schedules[service] = schedule
         digests[service] = digest
         print(f"{service}: gloas_fork_version {schedule[0]}")
-        print(f"{service}: fork_schedule {len(schedule[1])} entries")
+        ignored = f" ({unscheduled} at FAR_FUTURE_EPOCH ignored)" if unscheduled else ""
+        print(f"{service}: fork_schedule {len(schedule[1])} scheduled entries{ignored}")
         print(f"{service}: fork_digest {digest}")
     names = list(schedules)
     for other in names[1:]:
@@ -348,12 +408,23 @@ def main(argv):
     f = sub.add_parser("forks")
     f.add_argument("dir")
     f.add_argument("services", nargs="+")
+    p = sub.add_parser("pair")
+    p.add_argument("--record")
+    p.add_argument("name_a")
+    p.add_argument("record_a")
+    p.add_argument("name_b")
+    p.add_argument("record_b")
     n = sub.add_parser("finality")
     n.add_argument("dir")
     n.add_argument("min_epoch", type=int)
     n.add_argument("services", nargs="+")
     args = parser.parse_args(argv)
-    run = {"genesis": cmd_genesis, "forks": cmd_forks, "finality": cmd_finality}[args.command]
+    run = {
+        "genesis": cmd_genesis,
+        "forks": cmd_forks,
+        "pair": cmd_pair,
+        "finality": cmd_finality,
+    }[args.command]
     return run(args)
 
 

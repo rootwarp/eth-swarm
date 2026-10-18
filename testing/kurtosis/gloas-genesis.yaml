@@ -51,7 +51,9 @@ network_params:
   shuffle_genesis_validators: false
   # genesis_time 0: genesis is now + genesis_delay (plus the package's startup padding), so a
   # single run works as is. For the two-run genesis root check, render a copy with one fixed
-  # genesis_time for both runs (README.md, "Reproducible genesis").
+  # genesis_time and run both enclaves of a concurrent pair from it, both up before genesis
+  # (README.md, "Reproducible genesis"). port_publisher stays unset (every host port ephemeral),
+  # so the two enclaves do not collide on host ports.
   genesis_delay: 120
   genesis_time: 0
 

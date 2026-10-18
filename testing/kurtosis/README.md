@@ -18,8 +18,10 @@ Geth).
 | Explorer | dora |
 
 Status: the config, its image pin lint, the runtime checker and the block export are in the
-repo; nothing has been run yet, because Kurtosis is not installed on the dev host. The three
-runtime criteria below stay open until the first two runs.
+repo. The first two runs (2026-10-18, Kurtosis CLI and engine 1.22.1, Docker Desktop for macOS)
+were sequential: the first reached finalized epoch 3 on both CLs, and the second, started after
+genesis, reproduced the genesis root but never finalized (see "Reproducible genesis"). The
+runtime criteria stay open until a concurrent pair passes `check-devnet.sh --pair`.
 
 ## Pins
 
@@ -127,7 +129,13 @@ kurtosis clean -a                                # also removes stopped enclaves
 
 With `genesis_time: 0`, genesis is the start time plus `genesis_delay` (120 s) plus the package's
 startup padding. That is fine for a single run, but two runs get different genesis times and so
-different genesis roots (see below).
+different genesis roots. The two-run check is a concurrent pair from one rendered args file
+(see "Reproducible genesis").
+
+Kurtosis 1.22.1 on Docker Desktop for macOS prints an OpenTelemetry `WARN` to stderr on every
+CLI call (it looks for `/var/run/docker.sock`). It is harmless: `check-devnet.sh` reads only
+stdout and shows the stderr only when a call fails, and `$(kurtosis port print ...)` in the
+commands here captures stdout only.
 
 ## Read the genesis root and the fork schedule
 
@@ -166,21 +174,54 @@ To be filled in after the first pair of runs, with the args file they used (its 
 
 The validator set is fixed: the mnemonic and key count are written out in the file, shuffling is
 off, and the generator image is pinned. The genesis time is the only input that moves. The
-package accepts a fixed `genesis_time`, but a fixed value in the committed file would soon lie
-far in the past. Instead, both runs of a pair use one rendered copy with the same `genesis_time`:
+package accepts a fixed `genesis_time`, and at the pinned commit uses it literally, but a fixed
+value in the committed file would soon lie far in the past. Instead, the two runs of a pair use
+one rendered copy with one `genesis_time` T.
+
+**The two runs are a concurrent pair**: two enclaves, `ethswarm-gloas-a` and `ethswarm-gloas-b`,
+started from the same `$args` at the same time, both fully up before T. A second run started
+*after* genesis does not finalize, so there is no sequential path. In the first sequential runs,
+the second enclave started about 70 slots after genesis: Lodestar (`b3beff2`) could not
+range-sync the missed slots from Lighthouse (`DOWNLOAD_BY_RANGE_ERROR_MISSING_BLOCK_RESPONSE`;
+its only peer went to `failed_download_peers` and was never retried), and without Lodestar's 64
+validators Lighthouse could not justify an epoch. Any gap after genesis can hit this, so T must
+leave time for both `kurtosis run`s: one took 540 s on a cold engine with the images already
+pulled.
+
+Render the shared copy with T at least 900 s ahead, after pre-pulling the pinned images (203 s on
+the first run), so the clock starts only when both runs can begin:
 
 ```bash
-T=$(( $(date +%s) + 600 ))                  # genesis 10 minutes from now, shared by both runs
+for image in $(grep -oE '[A-Za-z0-9./_-]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' \
+                 testing/kurtosis/gloas-genesis.yaml | sort -u); do
+  docker pull -q "$image"
+done
+
+T=$(( $(date +%s) + 900 ))                  # genesis 15 minutes from now, shared by both enclaves
 args="$PWD/target/kurtosis/gloas-genesis-$T.yaml"; mkdir -p "${args%/*}"
 sed "s/^  genesis_time: 0$/  genesis_time: $T/" testing/kurtosis/gloas-genesis.yaml > "$args"
 test "$(grep -c "^  genesis_time: $T$" "$args")" = 1 && echo "rendered $args"
 bash scripts/check-kurtosis-pins.sh "${args%/*}"   # the rendered copy is pinned too
 ```
 
-The second run starts after the first is torn down, so its genesis is already in the past. The
-CLs start at the wall-clock slot and process the skipped slots. Keep the gap under about an hour:
-the validators' inactivity scores grow during the empty epochs. If the gap is a problem, run both
-enclaves at the same time instead (`ethswarm-gloas-a` and `ethswarm-gloas-b`, same `$args`).
+Both enclaves then run side by side on one engine:
+
+- **Memory.** One enclave peaked at about 2.7 GiB (the Lodestar CL is 1.5 GiB of it) and 116%
+  CPU, so a pair needs about 5.5 GiB: it fits the 7.7 GiB Docker Desktop VM of the first runs
+  with about 2 GiB to spare for the engine's own containers. Check the VM's size with
+  `docker info --format '{{.MemTotal}}'`, stop other containers first, and tear both enclaves
+  down when done (the last block of "Acceptance checks").
+- **Host ports.** The two enclaves do not collide. At the pinned commit every fixed host port
+  comes from `port_publisher` (`public_port_start` 32000-38000 per component), and each of its
+  sections is off by default; `gloas-genesis.yaml` does not set it. Without it, Kurtosis
+  publishes every service port on an ephemeral host port of its own choosing (the first runs
+  got `127.0.0.1:50802` and `127.0.0.1:54163`), so read each URL with
+  `kurtosis port print <enclave> <service> http`, never a fixed number. Enabling
+  `port_publisher` (or adding blockscout, whose frontend has a fixed port) would make the second
+  enclave collide with the first.
+- **Network.** Each enclave runs on its own Docker network (`kt-<enclave>`), and each enclave's
+  CLs boot from its own `cl-1-lighthouse-geth`, so the two chains share a genesis but do not
+  peer with each other.
 
 ## Acceptance checks
 
@@ -193,37 +234,61 @@ misses any of these (`--services` naming a subset of the enclave's CLs, a one-CL
 lower threshold) prints one `diagnostic:` line per reason and, if every criterion passes,
 `verdict: DIAGNOSTIC (...)` with exit 3: useful while debugging, but never acceptance evidence.
 A `--services` CL that the enclave does not run is a setup error (exit 2), and a failed
-criterion is `verdict: FAIL` (exit 1) either way. The criteria:
+criterion is `verdict: FAIL` (exit 1) either way.
+
+`check-devnet.sh --pair ENCLAVE_A ENCLAVE_B` checks a concurrent pair: every criterion on each
+enclave in turn (under a `== <enclave>` header, the same options for both), then
+`pair genesis`: both enclaves' genesis records must be equal (`genesis_time`,
+`genesis_validators_root`, `genesis_fork_version`, genesis block root and state root). It ends
+with `pair verdict: PASS` (exit 0) only when both runs are acceptance passes and the genesis is
+one; otherwise exit 2 if either enclave's run is a setup error, else 1 (`pair verdict: FAIL`,
+naming the failed enclave or `pair genesis`), else 3 (DIAGNOSTIC). `--record` writes the pair's
+one genesis, and `--reference` checks both enclaves against an earlier record. The criteria:
 
 - `genesis`: every CL reports the same `genesis_time`, `genesis_validators_root`,
   `genesis_fork_version`, genesis block root and genesis state root. With `--reference`, they
   must also equal an earlier run's record (`--record` writes one).
 - `fork_schedule`: on every CL, `GLOAS_FORK_EPOCH` is 0, `/eth/v1/config/fork_schedule` has the
-  Gloas version at epoch 0 and in force there, every CL serves the same schedule, and the fork
-  digests in the CLs' own ENRs (`eth2` entry) agree.
+  Gloas version at epoch 0 and in force there, every CL serves the same scheduled forks, and
+  the fork digests in the CLs' own ENRs (`eth2` entry) agree. Entries at FAR_FUTURE_EPOCH
+  (2^64 - 1, a fork the client knows but has not scheduled) are dropped before the schedules
+  are compared: Lodestar lists the unscheduled Heze fork there (`0x90000038`), Lighthouse does
+  not.
 - `finality`: every CL's finalized epoch (`/eth/v1/beacon/states/head/finality_checkpoints`) is
   at least 3 (`--min-finalized-epoch`; below 3 the run is DIAGNOSTIC), on one finalized
   checkpoint (epoch and root). This is polled `--attempts` times (default 40), `--interval`
   seconds apart (default 12).
 
-Two runs from a clean engine (criteria 1, 2 and 4 of the issue). Record the wall time and
-`docker stats --no-stream` for CI sizing:
+The concurrent pair from a clean engine (criteria 1, 2 and 4 of the issue), with `$args` and T
+from "Reproducible genesis". Record the wall time and `docker stats --no-stream` for CI sizing:
 
 ```bash
 pkg=github.com/ethpandaops/ethereum-package@3416a0252e5bc25a0d31d24fea9c46707447eb08
+logs=target/kurtosis/pair-$T; mkdir -p "$logs"
 
-# Run A
 kurtosis clean -a
-time kurtosis run --enclave ethswarm-gloas "$pkg" --args-file "$args"
-bash testing/kurtosis/check-devnet.sh --record target/kurtosis/run-a.json ethswarm-gloas
+# Both enclaves at once, from the one $args (one genesis_time T).
+pids=()
+for e in ethswarm-gloas-a ethswarm-gloas-b; do
+  ( time kurtosis run --enclave "$e" "$pkg" --args-file "$args" ) > "$logs/$e-run.log" 2>&1 &
+  pids+=($!)
+done
+for pid in "${pids[@]}"; do wait "$pid" || echo "a kurtosis run failed: see $logs/*-run.log"; done
+# Both must be up before genesis; otherwise tear down, render a later T and start again.
+test "$(date +%s)" -lt "$T" && echo "both enclaves up $(( T - $(date +%s) )) s before genesis"
 docker stats --no-stream
-kurtosis enclave rm -f ethswarm-gloas && kurtosis clean -a
 
-# Run B: same args file, same genesis_time
-time kurtosis run --enclave ethswarm-gloas "$pkg" --args-file "$args"
-bash testing/kurtosis/check-devnet.sh --reference target/kurtosis/run-a.json ethswarm-gloas
+# After genesis: every criterion on both enclaves, then one genesis across them (exit 0: PASS).
+until [ "$(date +%s)" -ge "$T" ]; do sleep 10; done
+( set -o pipefail
+  bash testing/kurtosis/check-devnet.sh --pair --record "$logs/genesis.json" \
+    ethswarm-gloas-a ethswarm-gloas-b 2>&1 | tee "$logs/check.log" ); echo "check-devnet exit $?"
 docker stats --no-stream
-kurtosis enclave rm -f ethswarm-gloas && kurtosis clean -a
+
+# Teardown: both enclaves, then the stopped ones (a clean engine).
+kurtosis enclave rm -f ethswarm-gloas-a
+kurtosis enclave rm -f ethswarm-gloas-b
+kurtosis clean -a
 ```
 
 The same checks by hand, one CL at a time:
@@ -269,10 +334,11 @@ Status: tested against a fixture beacon node only. It has not been run on the de
 the first run also confirms that `network-config` reads the generated `config.yaml`.
 
 Run it on a devnet whose finalized epoch is at least 3 (`check-devnet.sh` passes), from the repo
-root:
+root. For a concurrent pair, export from one of its enclaves (`ethswarm-gloas-a`) before the
+teardown:
 
 ```bash
-enclave=ethswarm-gloas
+enclave=ethswarm-gloas          # ethswarm-gloas-a for a pair
 genesis=target/kurtosis/$enclave-genesis
 export_root=target/kurtosis/export
 kurtosis files download "$enclave" el_cl_genesis_data "$genesis"   # config.yaml, genesis.ssz, ...
