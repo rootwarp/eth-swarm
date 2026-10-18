@@ -35,12 +35,15 @@
 #   --min-finalized-epoch N  default 3; below 3 makes the run DIAGNOSTIC
 #   --attempts N             finality polls (default 40)
 #   --interval S             seconds between finality polls (default 12)
+#   --kurtosis-timeout S     seconds for each kurtosis call (enclave inspect, port print; default
+#                            60); one that takes longer is stopped, a setup error
 #   --pair                   two enclaves, checked as a concurrent pair (see above)
 # Exit: 0 acceptance PASS (every criterion passed), 1 a criterion failed, 2 a usage or setup
 # error (kurtosis or python3 missing, unknown enclave, no CL service, a --services CL the
-# enclave does not run, a port that does not resolve), 3 DIAGNOSTIC (every criterion passed,
-# but the run is not an acceptance run). With --pair: 2 if either enclave's run is a setup
-# error, else 1 if either fails or their genesis differs, else 3 if either is DIAGNOSTIC, else 0.
+# enclave does not run, a port that does not resolve, a kurtosis call that timed out), 3
+# DIAGNOSTIC (every criterion passed, but the run is not an acceptance run). With --pair: 2 if
+# either enclave's run is a setup error, else 1 if either fails or their genesis differs, else 3
+# if either is DIAGNOSTIC, else 0.
 # Works on bash 3.2.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -48,7 +51,7 @@ helper="$here/lib/devnet.py"
 
 usage() {
   echo "usage: check-devnet.sh [--services \"SVC ...\"] [--record FILE] [--reference FILE]" \
-    "[--min-finalized-epoch N] [--attempts N] [--interval S] ENCLAVE" >&2
+    "[--min-finalized-epoch N] [--attempts N] [--interval S] [--kurtosis-timeout S] ENCLAVE" >&2
   echo "       check-devnet.sh --pair [options] ENCLAVE_A ENCLAVE_B" >&2
   exit 2
 }
@@ -65,11 +68,11 @@ contains() {
   return 1
 }
 
-services='' record='' reference='' min_epoch=3 attempts=40 interval=12 pair=0
+services='' record='' reference='' min_epoch=3 attempts=40 interval=12 kurtosis_timeout=60 pair=0
 enclaves=()
 while (($# > 0)); do
   case $1 in
-    --services|--record|--reference|--min-finalized-epoch|--attempts|--interval)
+    --services|--record|--reference|--min-finalized-epoch|--attempts|--interval|--kurtosis-timeout)
       (($# >= 2)) || usage
       case $1 in
         --services) services=$2 ;;
@@ -78,6 +81,7 @@ while (($# > 0)); do
         --min-finalized-epoch) min_epoch=$2 ;;
         --attempts) attempts=$2 ;;
         --interval) interval=$2 ;;
+        --kurtosis-timeout) kurtosis_timeout=$2 ;;
       esac
       shift 2 ;;
     --pair) pair=1; shift ;;
@@ -95,6 +99,8 @@ enclave=${enclaves[0]}
 is_uint "$min_epoch" || { echo "--min-finalized-epoch must be a non-negative integer" >&2; usage; }
 { is_uint "$attempts" && ((attempts >= 1)); } || { echo "--attempts must be an integer >= 1" >&2; usage; }
 is_uint "$interval" || { echo "--interval must be a non-negative integer" >&2; usage; }
+{ is_uint "$kurtosis_timeout" && ((kurtosis_timeout >= 1)); } ||
+  { echo "--kurtosis-timeout must be an integer >= 1" >&2; usage; }
 if [[ -n $reference && ! -f $reference ]]; then die "--reference $reference: no such file"; fi
 command -v kurtosis >/dev/null 2>&1 || die "kurtosis not found on PATH"
 command -v curl >/dev/null 2>&1 || die "curl not found on PATH"
@@ -106,7 +112,8 @@ trap 'rm -rf "$work"' EXIT
 # A concurrent pair: every check on each enclave (this script, once per enclave), then one
 # genesis across both.
 if ((pair)); then
-  sub=(--min-finalized-epoch "$min_epoch" --attempts "$attempts" --interval "$interval")
+  sub=(--min-finalized-epoch "$min_epoch" --attempts "$attempts" --interval "$interval"
+    --kurtosis-timeout "$kurtosis_timeout")
   if [[ -n $services ]]; then sub+=(--services "$services"); fi
   if [[ -n $reference ]]; then sub+=(--reference "$reference"); fi
   setup=() failed=() diagnostic=() n=0
@@ -146,16 +153,44 @@ if ((pair)); then
   exit 0
 fi
 
-# kurtosis_out <name> <kurtosis args...>: the command's stdout. Its stderr goes to
-# $work/<name>.err and is shown only when the command fails: Kurtosis 1.22.1 on Docker Desktop
-# (macOS) prints an OpenTelemetry WARN to stderr on every call, which must not be parsed as the
-# answer.
+# bounded_py <seconds> <command...>: runs the command (in this process group, so a signal to the
+# group reaches it) for at most that long and passes its stdout on; its exit code (128 + the signal
+# if one killed it), or 124 once it is killed at the limit. The command writes to a pipe of the
+# runner's own, so a process it left holding that pipe open cannot keep the caller's $(...) waiting
+# past the limit. TERM, INT and HUP to the runner are passed on to the command.
+bounded_py='
+import signal, subprocess, sys
+limit = int(sys.argv[1])
+try:
+    child = subprocess.Popen(sys.argv[2:], stdout=subprocess.PIPE)
+except OSError as err:
+    print(f"check-devnet.sh: {sys.argv[2]}: {err.strerror}", file=sys.stderr)
+    sys.exit(127)
+def forward(sig, _frame):
+    child.send_signal(sig)
+for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(sig, forward)
+try:
+    out, _ = child.communicate(timeout=limit)
+except subprocess.TimeoutExpired:
+    child.kill()
+    child.wait()
+    sys.exit(124)
+sys.stdout.buffer.write(out)
+sys.stdout.flush()
+code = child.returncode
+sys.exit(128 - code if code < 0 else code)
+'
+# kurtosis_out <name> <kurtosis args...>: the command's stdout, the command bounded to
+# --kurtosis-timeout seconds (a setup error past it). Its stderr goes to $work/<name>.err and is
+# shown only when the command fails: Kurtosis 1.22.1 on Docker Desktop (macOS) prints an
+# OpenTelemetry WARN to stderr on every call, which must not be parsed as the answer.
 kurtosis_out() {
-  local name=$1 out
+  local name=$1 out rc=0
   shift
-  if ! out=$(kurtosis "$@" 2>"$work/$name.err"); then
-    die "kurtosis $* failed: $(cat "$work/$name.err")"
-  fi
+  out=$(python3 -I -c "$bounded_py" "$kurtosis_timeout" kurtosis "$@" 2>"$work/$name.err") || rc=$?
+  if ((rc == 124)); then die "kurtosis $* timed out after $kurtosis_timeout s"; fi
+  if ((rc != 0)); then die "kurtosis $* failed: $(cat "$work/$name.err")"; fi
   printf '%s' "$out"
 }
 

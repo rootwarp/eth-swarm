@@ -29,66 +29,104 @@ NOW=1790000000
 
 cat > "$stubs/kurtosis" <<'SH'
 #!/usr/bin/env bash
-# kurtosis stub; every call is logged to $STUB_DIR/kurtosis.log.
-# `run --enclave E ...`: the n-th run of E exits with $STUB_DIR/run.<E>.rc.<n>, else
-#   $STUB_DIR/run.<E>.rc, else 0; it first advances the fake clock by $STUB_DIR/run.<E>.advance
-#   seconds, and with $STUB_DIR/run.<E>.block it blocks (its pid in $STUB_DIR/run.<E>.pid).
-# `enclave inspect E`: exit 0 only with $STUB_DIR/exists.<E>; with $STUB_DIR/inspect.<E>.block it
-#   first hangs for 60 s (its pid in $STUB_DIR/inspect.<E>.pid).
-# `enclave ls`: the n-th call prints $STUB_DIR/enclave-ls.<n>, else $STUB_DIR/enclave-ls, else an
-#   empty table (the header only); $STUB_DIR/ls.rc fails it.
-# `enclave rm -f E`: advances the fake clock by $STUB_DIR/rm.<E>.advance seconds; with
-#   $STUB_DIR/rm.<E>.block it blocks (its pid in $STUB_DIR/rm.<E>.pid), and with
-#   $STUB_DIR/rm.<E>.block-once the first call removes that file and hangs for 60 s (the same pid
-#   file); else it exits with $STUB_DIR/rm.<E>.rc (else 0).
-# `clean -a`: exits with $STUB_DIR/clean.rc (else 0).
+# kurtosis stub; every call is logged to $STUB_DIR/kurtosis.log. The control files are keyed by the
+# enclave name without run-pair.sh's -<T>-<pid> suffix (run.ethswarm-gloas-a.rc for
+# ethswarm-gloas-a-1790000900-4242); $STUB_DIR/exists.<full name> is an enclave on the engine.
+# `run --enclave E ...`: creates E; the n-th run of E exits with $STUB_DIR/run.<K>.rc.<n>, else
+#   $STUB_DIR/run.<K>.rc, else 0; it first advances the fake clock by $STUB_DIR/run.<K>.advance
+#   seconds; with $STUB_DIR/run.<K>.orphan it leaves a grandchild in its process group that ignores
+#   TERM (its pid in $STUB_DIR/run.<K>.orphan.pid; it runs for at most 60 s), and with
+#   $STUB_DIR/run.<K>.leftover one that does not (run.<K>.leftover.pid, at most 60 s); with
+#   $STUB_DIR/run.<K>.await (holding a pid file name) it waits up to 5 s for that process to be
+#   gone and writes `gone` or `alive` to $STUB_DIR/run.<K>.saw; and with $STUB_DIR/run.<K>.block
+#   it blocks (its pid in $STUB_DIR/run.<K>.pid).
+# `enclave ls`: the n-th call prints $STUB_DIR/enclave-ls.<n>, else $STUB_DIR/enclave-ls, else the
+#   UUID header and a row per enclave on the engine; $STUB_DIR/ls.rc or $STUB_DIR/ls.rc.<n> fails
+#   it, and with $STUB_DIR/ls.block.<n> the n-th call first hangs for 60 s (its pid in
+#   $STUB_DIR/ls.pid).
+# `enclave rm -f E`: advances the fake clock by $STUB_DIR/rm.<K>.advance seconds; with
+#   $STUB_DIR/rm.<K>.block it blocks (its pid in $STUB_DIR/rm.<K>.pid), and with
+#   $STUB_DIR/rm.<K>.block-once the first call removes that file and E (the engine did it, the CLI
+#   hangs) and hangs for 60 s (the same pid file); else it exits with $STUB_DIR/rm.<K>.rc (else 0),
+#   and removes E unless $STUB_DIR/rm.<K>.keep.
+# `clean -a`: exits with $STUB_DIR/clean.rc (else 0); with $STUB_DIR/clean.block it first hangs
+#   for 60 s (its pid in $STUB_DIR/clean.pid).
 printf '%s\n' "$*" >> "$STUB_DIR/kurtosis.log"
+key() { sed -E 's/-[0-9]+-[0-9]+$//' <<<"$1"; }
+stubborn='trap "" TERM; echo $$ > "$STUB_DIR/$0.pid"; for ((i = 0; i < 600; i++)); do /bin/sleep 0.1; done'
 case "$1 ${2:-}" in
   "run --enclave")
-    e=$3
-    counter="$STUB_DIR/run.$e.count"
+    e=$3 k=$(key "$3")
+    counter="$STUB_DIR/run.$k.count"
     n=$(( $(cat "$counter" 2>/dev/null || echo 0) + 1 ))
     echo "$n" > "$counter"
+    touch "$STUB_DIR/exists.$e"
     echo "kurtosis run stub: enclave $e"
-    if [[ -f $STUB_DIR/run.$e.advance ]]; then
-      echo $(( $(cat "$STUB_DIR/now") + $(cat "$STUB_DIR/run.$e.advance") )) > "$STUB_DIR/now"
+    if [[ -f $STUB_DIR/run.$k.advance ]]; then
+      echo $(( $(cat "$STUB_DIR/now") + $(cat "$STUB_DIR/run.$k.advance") )) > "$STUB_DIR/now"
     fi
-    if [[ -f $STUB_DIR/run.$e.block ]]; then
-      echo $$ > "$STUB_DIR/run.$e.pid"
+    if [[ -f $STUB_DIR/run.$k.orphan ]]; then
+      ( bash -c "$stubborn" "run.$k.orphan" & ) >/dev/null 2>&1
+      for ((i = 0; i < 50; i++)); do if [[ -f $STUB_DIR/run.$k.orphan.pid ]]; then break; fi; /bin/sleep 0.1; done
+    fi
+    if [[ -f $STUB_DIR/run.$k.leftover ]]; then
+      ( bash -c 'echo $$ > "$STUB_DIR/$0.pid"; for ((i = 0; i < 600; i++)); do /bin/sleep 0.1; done' "run.$k.leftover" & ) >/dev/null 2>&1
+      for ((i = 0; i < 50; i++)); do if [[ -f $STUB_DIR/run.$k.leftover.pid ]]; then break; fi; /bin/sleep 0.1; done
+    fi
+    if [[ -f $STUB_DIR/run.$k.await ]]; then
+      f="$STUB_DIR/$(cat "$STUB_DIR/run.$k.await")" saw=alive
+      for ((i = 0; i < 50; i++)); do
+        if [[ -f $f ]] && ! ps -p "$(cat "$f")" >/dev/null 2>&1; then saw=gone; break; fi
+        /bin/sleep 0.1
+      done
+      echo "$saw" > "$STUB_DIR/run.$k.saw"
+    fi
+    if [[ -f $STUB_DIR/run.$k.block ]]; then
+      echo $$ > "$STUB_DIR/run.$k.pid"
       while :; do /bin/sleep 0.1; done
     fi
-    if [[ -f $STUB_DIR/run.$e.rc.$n ]]; then exit "$(cat "$STUB_DIR/run.$e.rc.$n")"; fi
-    if [[ -f $STUB_DIR/run.$e.rc ]]; then exit "$(cat "$STUB_DIR/run.$e.rc")"; fi
+    if [[ -f $STUB_DIR/run.$k.rc.$n ]]; then exit "$(cat "$STUB_DIR/run.$k.rc.$n")"; fi
+    if [[ -f $STUB_DIR/run.$k.rc ]]; then exit "$(cat "$STUB_DIR/run.$k.rc")"; fi
     exit 0 ;;
-  "enclave inspect")
-    if [[ -f $STUB_DIR/inspect.$3.block ]]; then
-      echo $$ > "$STUB_DIR/inspect.$3.pid"
-      for ((i = 0; i < 600; i++)); do /bin/sleep 0.1; done
-    fi
-    [[ -f $STUB_DIR/exists.$3 ]] ;;
   "enclave ls")
-    if [[ -f $STUB_DIR/ls.rc ]]; then exit "$(cat "$STUB_DIR/ls.rc")"; fi
     n=$(( $(cat "$STUB_DIR/ls.count" 2>/dev/null || echo 0) + 1 ))
     echo "$n" > "$STUB_DIR/ls.count"
-    if [[ -f $STUB_DIR/enclave-ls.$n ]]; then cat "$STUB_DIR/enclave-ls.$n"
-    elif [[ -f $STUB_DIR/enclave-ls ]]; then cat "$STUB_DIR/enclave-ls"
-    else echo "UUID   Name   Status   Creation Time"; fi ;;
-  "enclave rm")
-    e=$4
-    if [[ -f $STUB_DIR/rm.$e.advance ]]; then
-      echo $(( $(cat "$STUB_DIR/now") + $(cat "$STUB_DIR/rm.$e.advance") )) > "$STUB_DIR/now"
-    fi
-    if [[ -f $STUB_DIR/rm.$e.block ]]; then
-      echo $$ > "$STUB_DIR/rm.$e.pid"
-      while :; do /bin/sleep 0.1; done
-    fi
-    if [[ -f $STUB_DIR/rm.$e.block-once ]]; then
-      rm -f "$STUB_DIR/rm.$e.block-once"
-      echo $$ > "$STUB_DIR/rm.$e.pid"
+    if [[ -f $STUB_DIR/ls.block.$n ]]; then
+      echo $$ > "$STUB_DIR/ls.pid"
       for ((i = 0; i < 600; i++)); do /bin/sleep 0.1; done
     fi
-    if [[ -f $STUB_DIR/rm.$e.rc ]]; then exit "$(cat "$STUB_DIR/rm.$e.rc")"; fi ;;
-  "clean -a") if [[ -f $STUB_DIR/clean.rc ]]; then exit "$(cat "$STUB_DIR/clean.rc")"; fi ;;
+    if [[ -f $STUB_DIR/ls.rc.$n ]]; then exit "$(cat "$STUB_DIR/ls.rc.$n")"; fi
+    if [[ -f $STUB_DIR/ls.rc ]]; then exit "$(cat "$STUB_DIR/ls.rc")"; fi
+    if [[ -f $STUB_DIR/enclave-ls.$n ]]; then cat "$STUB_DIR/enclave-ls.$n"
+    elif [[ -f $STUB_DIR/enclave-ls ]]; then cat "$STUB_DIR/enclave-ls"
+    else
+      echo "UUID   Name   Status   Creation Time"
+      for f in "$STUB_DIR"/exists.*; do
+        if [[ -f $f ]]; then echo "0a1b2c3d4e5f   ${f##*/exists.}   RUNNING   Sun, 19 Oct 2026 00:12:03 KST"; fi
+      done
+    fi ;;
+  "enclave rm")
+    e=$4 k=$(key "$4")
+    if [[ -f $STUB_DIR/rm.$k.advance ]]; then
+      echo $(( $(cat "$STUB_DIR/now") + $(cat "$STUB_DIR/rm.$k.advance") )) > "$STUB_DIR/now"
+    fi
+    if [[ -f $STUB_DIR/rm.$k.block ]]; then
+      echo $$ > "$STUB_DIR/rm.$k.pid"
+      while :; do /bin/sleep 0.1; done
+    fi
+    if [[ -f $STUB_DIR/rm.$k.block-once ]]; then
+      rm -f "$STUB_DIR/rm.$k.block-once" "$STUB_DIR/exists.$e"
+      echo $$ > "$STUB_DIR/rm.$k.pid"
+      for ((i = 0; i < 600; i++)); do /bin/sleep 0.1; done
+    fi
+    if [[ -f $STUB_DIR/rm.$k.rc ]]; then exit "$(cat "$STUB_DIR/rm.$k.rc")"; fi
+    if [[ ! -f $STUB_DIR/rm.$k.keep ]]; then rm -f "$STUB_DIR/exists.$e"; fi ;;
+  "clean -a")
+    if [[ -f $STUB_DIR/clean.block ]]; then
+      echo $$ > "$STUB_DIR/clean.pid"
+      for ((i = 0; i < 600; i++)); do /bin/sleep 0.1; done
+    fi
+    if [[ -f $STUB_DIR/clean.rc ]]; then exit "$(cat "$STUB_DIR/clean.rc")"; fi ;;
   *) exit 64 ;;
 esac
 SH
@@ -118,10 +156,12 @@ exec /bin/date "$@"
 SH
 cat > "$stubs/sleep" <<'SH'
 #!/usr/bin/env bash
-# sleep stub: advances the fake clock by $1 seconds and returns at once. With $STUB_DIR/sleep.block,
-# the first call longer than 1 s (the wait for genesis, not a 1 s poll) removes that file and
-# really sleeps 30 s (its pid in $STUB_DIR/sleep.pid).
+# sleep stub: advances the fake clock by $1 seconds and returns at once; a fraction of a second (a
+# fast poll) really sleeps and leaves the clock alone. With $STUB_DIR/sleep.block, the first call
+# longer than 1 s (the wait for genesis, not a 1 s poll) removes that file and really sleeps 30 s
+# (its pid in $STUB_DIR/sleep.pid).
 printf '%s\n' "$1" >> "$STUB_DIR/sleep.log"
+if [[ $1 == *.* ]]; then exec /bin/sleep "$1"; fi
 if [[ -f $STUB_DIR/sleep.block ]] && (($1 > 1)); then
   rm -f "$STUB_DIR/sleep.block"
   echo $$ > "$STUB_DIR/sleep.pid"
@@ -129,7 +169,24 @@ if [[ -f $STUB_DIR/sleep.block ]] && (($1 > 1)); then
 fi
 echo $(( $(cat "$STUB_DIR/now") + $1 )) > "$STUB_DIR/now"
 SH
-chmod +x "$stubs/kurtosis" "$stubs/docker" "$stubs/date" "$stubs/sleep"
+cat > "$stubs/tee" <<'SH'
+#!/usr/bin/env bash
+# tee stub: with $STUB_DIR/tee.fail it copies its input to stdout and exits 1, like a tee whose log
+# cannot be written; else the real tee.
+if [[ -f $STUB_DIR/tee.fail ]]; then cat; exit 1; fi
+for t in /usr/bin/tee /bin/tee; do if [[ -x $t ]]; then exec "$t" "$@"; fi; done
+exit 127
+SH
+cat > "$stubs/ps" <<'SH'
+#!/usr/bin/env bash
+# ps stub: with $STUB_DIR/ps.reused, `ps ... -p PID` reports every pid as a running process (as if
+# each pid were taken by another process the moment it ends); else, and always for a listing of
+# every process, the real ps.
+if [[ -f $STUB_DIR/ps.reused && " $* " == *" -p "* ]]; then echo "S"; exit 0; fi
+for p in /bin/ps /usr/bin/ps; do if [[ -x $p ]]; then exec "$p" "$@"; fi; done
+exit 127
+SH
+chmod +x "$stubs/kurtosis" "$stubs/docker" "$stubs/date" "$stubs/sleep" "$stubs/tee" "$stubs/ps"
 
 # The repo layout run-pair.sh expects, under $repo.
 repo="$tmp/repo"
@@ -144,17 +201,27 @@ base() {
 #!/usr/bin/env bash
 # check-devnet.sh stub: logs its args and the fake time, exits with $STUB_DIR/check.rc (else 0).
 # With $STUB_DIR/check.block it blocks (its pid in $STUB_DIR/check.pid), like a finality poll;
-# with $STUB_DIR/check.stubborn it first starts a child that ignores TERM (its pid in
-# $STUB_DIR/stubborn.pid), and with $STUB_DIR/check.orphan a grandchild that ignores TERM and whose
-# parent exits at once, so no walk of the check's children finds it (its pid in
-# $STUB_DIR/orphan.pid); either runs for at most 60 s.
+# with $STUB_DIR/check.advance it advances the fake clock by that many seconds, then hangs for at
+# most 60 s (its pid in $STUB_DIR/check.pid); with $STUB_DIR/check.stubborn it first starts a child
+# that ignores TERM (its pid in $STUB_DIR/stubborn.pid), and with $STUB_DIR/check.orphan a
+# grandchild that ignores TERM and whose parent exits at once, so no walk of the check's children
+# finds it (its pid in $STUB_DIR/orphan.pid); either runs for at most 60 s.
 printf '%s @%s\n' "$*" "$(cat "$STUB_DIR/now")" >> "$STUB_DIR/check.log"
 stubborn='trap "" TERM; echo $$ > "$STUB_DIR/$0.pid"; for ((i = 0; i < 600; i++)); do /bin/sleep 0.1; done'
+# started <name>: waits (up to 5 s) for $STUB_DIR/<name>.pid.
+started() { for ((i = 0; i < 50; i++)); do if [[ -f $STUB_DIR/$1.pid ]]; then return; fi; /bin/sleep 0.1; done; }
 if [[ -f $STUB_DIR/check.stubborn ]]; then
   bash -c "$stubborn" stubborn &
+  started stubborn
 fi
 if [[ -f $STUB_DIR/check.orphan ]]; then
   ( bash -c "$stubborn" orphan & ) >/dev/null 2>&1
+  started orphan
+fi
+if [[ -f $STUB_DIR/check.advance ]]; then
+  echo $(( $(cat "$STUB_DIR/now") + $(cat "$STUB_DIR/check.advance") )) > "$STUB_DIR/now"
+  echo $$ > "$STUB_DIR/check.pid"
+  for ((i = 0; i < 600; i++)); do /bin/sleep 0.1; done
 fi
 if [[ -f $STUB_DIR/check.block ]]; then
   echo $$ > "$STUB_DIR/check.pid"
@@ -172,16 +239,18 @@ SH
 }
 
 out=''
-# run <expect-exit> <description> <pattern...> -- <args...>: runs run-pair.sh and wants the exit
-# code and a line matching each extended regex; a pattern `!<regex>` wants no line matching it.
-# (Here-strings, not `printf | grep -q`: under pipefail, grep -q exiting early fails the printf.)
+run_env=()
+# run <expect-exit> <description> <pattern...> -- <args...>: runs run-pair.sh (with the NAME=value
+# entries of run_env in its environment) and wants the exit code and a line matching each extended
+# regex; a pattern `!<regex>` wants no line matching it. (Here-strings, not `printf | grep -q`:
+# under pipefail, grep -q exiting early fails the printf.)
 run() {
   local expect=$1 desc=$2 rc=0 p missing='' unwanted=''
   shift 2
   local patterns=()
   while (($# > 0)) && [[ $1 != -- ]]; do patterns+=("$1"); shift; done
   shift
-  out=$(PATH="$stubs:$PATH" bash "$script" "$@" 2>&1) || rc=$?
+  out=$(env ${run_env[@]+"${run_env[@]}"} PATH="$stubs:$PATH" bash "$script" "$@" 2>&1) || rc=$?
   for p in ${patterns[@]+"${patterns[@]}"}; do
     if [[ $p == !* ]]; then
       ! grep -Eq -- "${p#!}" <<<"$out" || unwanted="$unwanted /${p#!}/"
@@ -211,16 +280,21 @@ logged() {
   if [[ -z $missing ]]; then ok "$desc"; else bad "$desc (log $name:$missing)" "$(cat "$log" 2>&1)"; fi
 }
 
-# torn_down <description>: both enclaves removed after the last launch, and no `clean -a` after
-# the launches (it would remove every enclave on the engine, not just the pair).
+# torn_down <description>: both of the run's enclaves (named for the run: the -<T>-<pid> suffix of
+# its first launch) removed after the last launch, no other enclave removed, and no `clean -a`
+# after the launches (it would remove every enclave on the engine, not just the pair).
 torn_down() {
-  local log="$STUB_DIR/kurtosis.log" first_run last_run rm_a rm_b clean
+  local log="$STUB_DIR/kurtosis.log" first_run last_run suffix rm_a rm_b others clean
   first_run=$(grep -n '^run --enclave' "$log" 2>/dev/null | sed -n 1p | cut -d: -f1 || true)
   last_run=$(grep -n '^run --enclave' "$log" 2>/dev/null | tail -1 | cut -d: -f1 || true)
-  rm_a=$(grep -n '^enclave rm -f ethswarm-gloas-a$' "$log" 2>/dev/null | tail -1 | cut -d: -f1 || true)
-  rm_b=$(grep -n '^enclave rm -f ethswarm-gloas-b$' "$log" 2>/dev/null | tail -1 | cut -d: -f1 || true)
+  suffix=$(grep -oE '^run --enclave ethswarm-gloas-[ab]-[0-9]+-[0-9]+' "$log" 2>/dev/null |
+    sed -n '1s/^run --enclave ethswarm-gloas-[ab]-//p' || true)
+  rm_a=$(grep -nxF "enclave rm -f ethswarm-gloas-a-$suffix" "$log" 2>/dev/null | tail -1 | cut -d: -f1 || true)
+  rm_b=$(grep -nxF "enclave rm -f ethswarm-gloas-b-$suffix" "$log" 2>/dev/null | tail -1 | cut -d: -f1 || true)
+  others=$(grep '^enclave rm ' "$log" 2>/dev/null |
+    grep -vxF -e "enclave rm -f ethswarm-gloas-a-$suffix" -e "enclave rm -f ethswarm-gloas-b-$suffix" || true)
   clean=$(grep -n '^clean -a$' "$log" 2>/dev/null | tail -1 | cut -d: -f1 || true)
-  if [[ -n $rm_a && -n $rm_b ]] && ((rm_a > ${last_run:-0} && rm_b > ${last_run:-0} &&
+  if [[ -n $suffix && -n $rm_a && -n $rm_b && -z $others ]] && ((rm_a > ${last_run:-0} && rm_b > ${last_run:-0} &&
        ${clean:-0} < ${first_run:-1})); then
     ok "$1"
   else
@@ -237,6 +311,26 @@ gone() {
 
 T=$((NOW + 900))
 logs="$repo/target/kurtosis/pair-$T"
+# The pair's enclave names, as regexes: run-pair.sh names them for the run (-<T>-<its pid>).
+A="ethswarm-gloas-a-$T-[0-9]+" B="ethswarm-gloas-b-$T-[0-9]+"
+# name_of <a|b>: the full name the last run gave that enclave (from its first launch).
+name_of() {
+  grep -oE "^run --enclave ethswarm-gloas-$1-[0-9]+-[0-9]+" "$STUB_DIR/kurtosis.log" 2>/dev/null |
+    sed -n '1s/^run --enclave //p' || true
+}
+# reaped <description> <pid file>: the process in $STUB_DIR/<pid file> is gone within 5 s (a
+# survivor is reported, then killed).
+reaped() {
+  local f="$STUB_DIR/$2" p i=0
+  if [[ ! -f $f ]]; then bad "$1 (no $2: it never started)"; return; fi
+  p=$(cat "$f")
+  until gone "$p"; do
+    i=$((i + 1))
+    if ((i > 50)); then kill -KILL "$p" 2>/dev/null || true; bad "$1 (pid $p still runs)"; return; fi
+    /bin/sleep 0.1
+  done
+  ok "$1"
+}
 images=$(grep -oE '[A-Za-z0-9./_-]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' "$kurtosis_dir/gloas-genesis.yaml" | sort -u)
 n_images=$(printf '%s\n' "$images" | wc -l | tr -d ' ')
 
@@ -265,8 +359,8 @@ fi
 logged "the rendered copy's directory passes the pin lint" pins "^$logs$"
 pkg='github\.com/ethpandaops/ethereum-package@3416a0252e5bc25a0d31d24fea9c46707447eb08'
 logged "both enclaves launch from the one rendered copy" kurtosis \
-  "^run --enclave ethswarm-gloas-a $pkg --args-file $logs/gloas-genesis.yaml$" \
-  "^run --enclave ethswarm-gloas-b $pkg --args-file $logs/gloas-genesis.yaml$"
+  "^run --enclave $A $pkg --args-file $logs/gloas-genesis.yaml$" \
+  "^run --enclave $B $pkg --args-file $logs/gloas-genesis.yaml$"
 if [[ $(head -3 "$STUB_DIR/kurtosis.log" | cut -d' ' -f1-2 | tr '\n' ' ') == "enclave ls enclave ls run --enclave " ]]; then
   ok "the pair checks the engine runs no enclave, and checks again just before the launches"
 else
@@ -274,19 +368,36 @@ else
 fi
 logged "without --clean-engine the engine is never cleaned (only the pair's enclaves go)" kurtosis '!^clean'
 check=$(cat "$STUB_DIR/check.log" 2>/dev/null || true)
-if [[ $check =~ ^--pair\ --record\ $logs/genesis\.json\ ethswarm-gloas-a\ ethswarm-gloas-b\ @([0-9]+)$ ]] &&
+if [[ $check =~ ^--pair\ --record\ $logs/genesis\.json\ $A\ $B\ @([0-9]+)$ ]] &&
    ((BASH_REMATCH[1] >= T)); then
   ok "check-devnet.sh --pair runs once, at or after genesis"
 else
   bad "check-devnet.sh --pair runs once, at or after genesis" "$check"
 fi
 torn_down "a passing pair is torn down"
-if [[ -f $logs/check.log && -f $logs/ethswarm-gloas-a-run.log && -f $logs/ethswarm-gloas-b-run.log ]] &&
-   grep -q '^pair verdict: STUB$' "$logs/check.log" && grep -q 'enclave ethswarm-gloas-b' "$logs/ethswarm-gloas-b-run.log"; then
+if [[ -f $logs/check.log && -f $logs/$(name_of a)-run.log && -f $logs/$(name_of b)-run.log ]] &&
+   grep -q '^pair verdict: STUB$' "$logs/check.log" && grep -Eq "enclave $B$" "$logs/$(name_of b)-run.log"; then
   ok "the run and check logs are kept under target/kurtosis/pair-T"
 else
   bad "the run and check logs are kept" "$(ls -la "$logs" 2>&1)"
 fi
+
+# --- the pair's enclave names: this run's own --------------------------------------------------------
+
+# Both enclaves carry the run's T and pid, so another run (from another checkout, in the same
+# second) never launches into them, and this run's teardown removes only its own.
+base
+run 0 "the enclaves are named for the run (ethswarm-gloas-{a,b}-<T>-<pid>)" "^launching $A and $B$" --
+first=$(name_of a)
+if [[ -n $first && $(name_of b) == "${first/-a-/-b-}" ]]; then ok "both enclaves of a run share its suffix"; else bad "both enclaves of a run share its suffix" "$(cat "$STUB_DIR/kurtosis.log")"; fi
+base
+run 0 "a second run in the same second passes too" '^run-pair: exit 0 ' --
+if [[ -n $first && -n $(name_of a) && $(name_of a) != "$first" ]]; then
+  ok "two runs in the same second name their enclaves apart"
+else
+  bad "two runs in the same second name their enclaves apart" "$first, then $(name_of a)"
+fi
+torn_down "the second run removes its own enclaves only"
 
 base
 run 0 "--lead 1200 renders T = now + 1200" "^rendered .*/pair-$((NOW + 1200))/gloas-genesis.yaml \(genesis_time $((NOW + 1200))\)$" -- --lead 1200
@@ -308,7 +419,7 @@ if [[ ! -e $STUB_DIR/docker.log ]]; then ok "a refused engine pulls nothing"; el
 base
 other_enclaves
 run 0 "--clean-engine cleans an engine with other enclaves and goes on" '^run-pair: exit 0 ' -- --clean-engine
-logged "--clean-engine runs kurtosis clean -a before the launches" kurtosis '^clean -a$' '^run --enclave ethswarm-gloas-a '
+logged "--clean-engine runs kurtosis clean -a before the launches" kurtosis '^clean -a$' "^run --enclave $A "
 if [[ $(grep -c '^clean -a$' "$STUB_DIR/kurtosis.log") == 1 ]]; then ok "--clean-engine cleans the engine once, never in the teardown"; else bad "--clean-engine cleans the engine once" "$(cat "$STUB_DIR/kurtosis.log")"; fi
 
 # An enclave created after the first check (during the pulls, render and lint) is not removed
@@ -345,6 +456,20 @@ logged "an empty second enclave ls answer launches nothing" kurtosis '!^clean' '
 
 # --- before the launches: pull, render, pin lint -----------------------------------------------------
 
+# Two runs in one checkout in the same second render the same T: the second must not touch the
+# first's logs directory (its record of jobs, its rendered copy, its logs).
+base
+mkdir -p "$logs"
+echo "first run" > "$logs/job-groups"; echo "first run" > "$logs/gloas-genesis.yaml"
+run 2 "a logs directory that exists already (another run, the same T) is a setup error" \
+  "^ERROR: $logs exists already: another run has genesis_time $T; start again$" --
+if [[ $(cat "$logs/job-groups") == "first run" && $(cat "$logs/gloas-genesis.yaml") == "first run" ]]; then
+  ok "the other run's job-groups and rendered copy are left alone"
+else
+  bad "the other run's job-groups and rendered copy are left alone" "$(ls -la "$logs")"
+fi
+logged "a run whose logs directory exists launches nothing" kurtosis '!^run '
+
 base
 printf 'not a directory\n' > "$repo/target"
 run 2 "a logs directory that cannot be made is a setup error (exit 2)" '^ERROR: mkdir ' --
@@ -375,11 +500,20 @@ echo 1 > "$STUB_DIR/clean.rc"
 run 2 "a failed kurtosis clean stops before any launch" '^ERROR: kurtosis clean -a failed' -- --clean-engine
 logged "a failed clean launches nothing" kurtosis '!^run '
 
+base
+touch "$STUB_DIR/clean.block"
+SECONDS=0
+run 2 "a kurtosis clean -a that hangs is stopped at its limit (300 s), a setup error" \
+  '^ERROR: kurtosis clean -a timed out after 300 s$' -- --clean-engine
+if ((SECONDS < 20)); then ok "the hung clean takes no real 300 s"; else bad "the hung clean takes no real 300 s (${SECONDS} s)"; fi
+reaped "the hung clean is stopped" clean.pid
+logged "a hung clean launches nothing" kurtosis '!^run '
+
 # --- the launches: both succeed, both before genesis ---------------------------------------------
 
 base
 echo 1 > "$STUB_DIR/run.ethswarm-gloas-b.rc"
-run 2 "a failed launch exits non-zero" '^ERROR: kurtosis run failed: ethswarm-gloas-b \(exit 1\); see .*/ethswarm-gloas-b-run\.log$' \
+run 2 "a failed launch exits non-zero" "^ERROR: kurtosis run failed: $B \\(exit 1\\); see .*/$B-run\\.log$" \
   '!^both enclaves up' --
 torn_down "a failed launch is torn down"
 if [[ ! -e $STUB_DIR/check.log ]]; then ok "a failed launch never runs the check"; else bad "a failed launch never runs the check"; fi
@@ -387,13 +521,13 @@ if [[ $(grep -c '^run ' "$STUB_DIR/kurtosis.log") == 2 ]]; then ok "without --se
 
 base
 echo 1 > "$STUB_DIR/run.ethswarm-gloas-a.rc"; echo 3 > "$STUB_DIR/run.ethswarm-gloas-b.rc"
-run 2 "both failed launches are named" '^ERROR: kurtosis run failed: ethswarm-gloas-a \(exit 1\), ethswarm-gloas-b \(exit 3\);' --
+run 2 "both failed launches are named" "^ERROR: kurtosis run failed: $A \\(exit 1\\), $B \\(exit 3\\);" --
 torn_down "two failed launches are torn down"
 
 base
 echo 900 > "$STUB_DIR/run.ethswarm-gloas-a.advance"
 run 4 "launches that end at genesis (T passed) exit 4" \
-  "^ERROR: (the enclaves were up only at [0-9]+, [0-9]+ s after genesis \(T $T\)|kurtosis run still running at genesis \(T $T\): ethswarm-gloas-a); render a later T and start again$" \
+  "^ERROR: (the enclaves were up only at [0-9]+, [0-9]+ s after genesis \(T $T\)|kurtosis run still running at genesis \(T $T\): $A); render a later T and start again$" \
   '!^both enclaves up' --
 torn_down "a late start is torn down"
 if [[ ! -e $STUB_DIR/check.log ]]; then ok "a late start never runs the check"; else bad "a late start never runs the check"; fi
@@ -406,7 +540,7 @@ base
 touch "$STUB_DIR/run.ethswarm-gloas-b.block"; echo 895 > "$STUB_DIR/run.ethswarm-gloas-a.advance"
 SECONDS=0
 run 4 "a launch still running at genesis is stopped, and the run exits 4" \
-  '^ERROR: kurtosis run still running at genesis \(T [0-9]+\): ethswarm-gloas-b; render a later T and start again$' \
+  "^ERROR: kurtosis run still running at genesis \\(T [0-9]+\\): $B; render a later T and start again$" \
   '!^both enclaves up' --
 if ((SECONDS < 10)) && gone "$(cat "$STUB_DIR/run.ethswarm-gloas-b.pid" 2>/dev/null || echo 1)"; then ok "the outstanding launch is stopped"; else bad "the outstanding launch is stopped (${SECONDS} s)"; fi
 torn_down "a launch still running at genesis is torn down"
@@ -431,8 +565,8 @@ base
 touch "$STUB_DIR/rm.ethswarm-gloas-a.block"
 SECONDS=0
 run 2 "an enclave rm that hangs is stopped, the other enclave is still removed, and a PASS exits 2" \
-  '^warning: kurtosis enclave rm -f ethswarm-gloas-a failed or timed out$' '^ERROR: teardown failed' --
-logged "the second enclave is removed after the first rm hangs" kurtosis '^enclave rm -f ethswarm-gloas-b$'
+  "^warning: kurtosis enclave rm -f $A failed or timed out$" '^ERROR: teardown failed' --
+logged "the second enclave is removed after the first rm hangs" kurtosis "^enclave rm -f $B$"
 if ((SECONDS < 30)) && gone "$(cat "$STUB_DIR/rm.ethswarm-gloas-a.pid" 2>/dev/null || echo 1)"; then ok "the hung enclave rm is stopped"; else bad "the hung enclave rm is stopped (${SECONDS} s)"; fi
 
 # --- --sequential-fallback: a failed concurrent launch is relaunched alone, still before T ----------
@@ -440,24 +574,25 @@ if ((SECONDS < 30)) && gone "$(cat "$STUB_DIR/rm.ethswarm-gloas-a.pid" 2>/dev/nu
 base
 echo 1 > "$STUB_DIR/run.ethswarm-gloas-b.rc.1"
 run 0 "--sequential-fallback relaunches the failed enclave alone and goes on" \
-  '^kurtosis run failed: ethswarm-gloas-b \(exit 1\)' '^relaunching ethswarm-gloas-b alone \((8[0-9]{2}|900) s before genesis\)$' \
+  "^kurtosis run failed: $B \\(exit 1\\)" "^relaunching $B alone \\((8[0-9]{2}|900) s before genesis\\)$" \
   '^both enclaves up [0-9]+ s before genesis$' '^run-pair: exit 0 ' -- --sequential-fallback
-if [[ $(grep -c '^run --enclave ethswarm-gloas-a ' "$STUB_DIR/kurtosis.log") == 1 &&
-      $(grep -c '^run --enclave ethswarm-gloas-b ' "$STUB_DIR/kurtosis.log") == 2 ]] &&
-   [[ $(grep -A2 '^enclave rm -f ethswarm-gloas-b$' "$STUB_DIR/kurtosis.log" | sed -n 1,3p | tr '\n' ' ') == \
-      "enclave rm -f ethswarm-gloas-b enclave inspect ethswarm-gloas-b run --enclave ethswarm-gloas-b "* ]]; then
+b=$(name_of b)
+if [[ $(grep -c '^run --enclave ethswarm-gloas-a-' "$STUB_DIR/kurtosis.log") == 1 &&
+      $(grep -c "^run --enclave $b " "$STUB_DIR/kurtosis.log") == 2 ]] &&
+   [[ $(grep -A2 -xF "enclave rm -f $b" "$STUB_DIR/kurtosis.log" | sed -n 1,3p | tr '\n' ' ') == \
+      "enclave rm -f $b enclave ls run --enclave $b "* ]]; then
   ok "the failed enclave is removed, confirmed gone, then relaunched; the other is kept"
 else
   bad "the failed enclave is removed, confirmed gone, then relaunched" "$(cat "$STUB_DIR/kurtosis.log" 2>&1)"
 fi
-if [[ -f $logs/ethswarm-gloas-b-run-concurrent.log && -f $logs/ethswarm-gloas-b-run.log ]]; then ok "the failed concurrent launch's log is kept"; else bad "the failed concurrent launch's log is kept" "$(ls "$logs")"; fi
+if [[ -f $logs/$b-run-concurrent.log && -f $logs/$b-run.log ]]; then ok "the failed concurrent launch's log is kept"; else bad "the failed concurrent launch's log is kept" "$(ls "$logs")"; fi
 torn_down "a fallback pair is torn down"
 
 base
 echo 1 > "$STUB_DIR/run.ethswarm-gloas-a.rc.1"; echo 1 > "$STUB_DIR/run.ethswarm-gloas-b.rc.1"
 run 0 "--sequential-fallback relaunches both failed enclaves one after the other" \
-  '^relaunching ethswarm-gloas-a alone' '^relaunching ethswarm-gloas-b alone' '^run-pair: exit 0 ' -- --sequential-fallback
-if [[ $(grep '^run --enclave' "$STUB_DIR/kurtosis.log" | tail -2 | awk '{print $3}' | tr '\n' ' ') == "ethswarm-gloas-a ethswarm-gloas-b " ]]; then
+  "^relaunching $A alone" "^relaunching $B alone" '^run-pair: exit 0 ' -- --sequential-fallback
+if [[ $(grep '^run --enclave' "$STUB_DIR/kurtosis.log" | tail -2 | awk '{print $3}' | sed -E 's/-[0-9]+-[0-9]+$//' | tr '\n' ' ') == "ethswarm-gloas-a ethswarm-gloas-b " ]]; then
   ok "the relaunches run a, then b"
 else
   bad "the relaunches run a, then b" "$(cat "$STUB_DIR/kurtosis.log")"
@@ -465,53 +600,199 @@ fi
 
 base
 echo 1 > "$STUB_DIR/run.ethswarm-gloas-b.rc"
-run 2 "a relaunch that fails too exits 2" '^ERROR: kurtosis run failed: ethswarm-gloas-b \(exit 1\); see .*/ethswarm-gloas-b-run\.log$' \
+run 2 "a relaunch that fails too exits 2" "^ERROR: kurtosis run failed: $B \\(exit 1\\); see .*/$B-run\\.log$" \
   -- --sequential-fallback
 torn_down "a failed relaunch is torn down"
 if [[ ! -e $STUB_DIR/check.log ]]; then ok "a failed relaunch never runs the check"; else bad "a failed relaunch never runs the check"; fi
 
 base
 echo 1 > "$STUB_DIR/run.ethswarm-gloas-b.rc.1"; echo 500 > "$STUB_DIR/run.ethswarm-gloas-b.advance"
-run 4 "a relaunch that ends after genesis exits 4" '^relaunching ethswarm-gloas-b alone \((3[0-9]{2}|400) s before genesis\)$' \
+run 4 "a relaunch that ends after genesis exits 4" "^relaunching $B alone \\((3[0-9]{2}|400) s before genesis\\)$" \
   '^ERROR: (the enclaves were up only at [0-9]+, 1[0-9]{2} s after genesis|kurtosis run still running at genesis)' -- --sequential-fallback
 torn_down "a late relaunch is torn down"
 
 base
 echo 1 > "$STUB_DIR/run.ethswarm-gloas-b.rc.1"; echo 800 > "$STUB_DIR/run.ethswarm-gloas-a.advance"
 run 4 "too little time left for a relaunch exits 4 without one" \
-  '^ERROR: [0-9]+ s before genesis is too little to relaunch ethswarm-gloas-b \(it needs 120 s\); render a later T and start again$' \
+  "^ERROR: [0-9]+ s before genesis is too little to relaunch $B \\(it needs 120 s\\); render a later T and start again$" \
   -- --sequential-fallback
-if [[ $(grep -c '^run --enclave ethswarm-gloas-b ' "$STUB_DIR/kurtosis.log") == 1 ]]; then ok "no relaunch starts without the time for it"; else bad "no relaunch starts without the time for it"; fi
+if [[ $(grep -c '^run --enclave ethswarm-gloas-b-' "$STUB_DIR/kurtosis.log") == 1 ]]; then ok "no relaunch starts without the time for it"; else bad "no relaunch starts without the time for it"; fi
 torn_down "a pair without time for a relaunch is torn down"
 
 base
-echo 1 > "$STUB_DIR/run.ethswarm-gloas-b.rc.1"; touch "$STUB_DIR/exists.ethswarm-gloas-b"
+echo 1 > "$STUB_DIR/run.ethswarm-gloas-b.rc.1"; touch "$STUB_DIR/rm.ethswarm-gloas-b.keep"
 run 2 "a failed enclave that is still there after rm is not relaunched" \
-  '^ERROR: ethswarm-gloas-b still exists after kurtosis enclave rm -f; not relaunching into it$' -- --sequential-fallback
-if [[ $(grep -c '^run --enclave ethswarm-gloas-b ' "$STUB_DIR/kurtosis.log") == 1 ]]; then ok "no relaunch into a leftover enclave"; else bad "no relaunch into a leftover enclave"; fi
+  "^ERROR: $B still exists after kurtosis enclave rm -f; not relaunching into it$" -- --sequential-fallback
+if [[ $(grep -c '^run --enclave ethswarm-gloas-b-' "$STUB_DIR/kurtosis.log") == 1 ]]; then ok "no relaunch into a leftover enclave"; else bad "no relaunch into a leftover enclave"; fi
 
 base
 echo 1 > "$STUB_DIR/run.ethswarm-gloas-b.rc.1"; echo 850 > "$STUB_DIR/rm.ethswarm-gloas-b.advance"
 run 4 "the relaunch margin is checked again after the rm, just before the launch" \
-  '^ERROR: [0-9]+ s before genesis is too little to relaunch ethswarm-gloas-b \(it needs 120 s\)' -- --sequential-fallback
-if [[ $(grep -c '^run --enclave ethswarm-gloas-b ' "$STUB_DIR/kurtosis.log") == 1 ]]; then ok "no relaunch starts when the rm used up the margin"; else bad "no relaunch starts when the rm used up the margin" "$(cat "$STUB_DIR/kurtosis.log")"; fi
+  "^ERROR: [0-9]+ s before genesis is too little to relaunch $B \\(it needs 120 s\\)" -- --sequential-fallback
+if [[ $(grep -c '^run --enclave ethswarm-gloas-b-' "$STUB_DIR/kurtosis.log") == 1 ]]; then ok "no relaunch starts when the rm used up the margin"; else bad "no relaunch starts when the rm used up the margin" "$(cat "$STUB_DIR/kurtosis.log")"; fi
 
 base
 echo 1 > "$STUB_DIR/run.ethswarm-gloas-b.rc.1"; touch "$STUB_DIR/rm.ethswarm-gloas-b.block-once"
 SECONDS=0
 run 0 "a fallback enclave rm that hangs is stopped at its limit, and the relaunch goes on" \
-  '^relaunching ethswarm-gloas-b alone' '^run-pair: exit 0 ' -- --sequential-fallback
+  "^relaunching $B alone" '^run-pair: exit 0 ' -- --sequential-fallback
 if ((SECONDS < 30)) && gone "$(cat "$STUB_DIR/rm.ethswarm-gloas-b.pid" 2>/dev/null || echo 1)"; then ok "the hung fallback enclave rm is stopped"; else bad "the hung fallback enclave rm is stopped (${SECONDS} s)"; fi
 
 base
-echo 1 > "$STUB_DIR/run.ethswarm-gloas-b.rc.1"; touch "$STUB_DIR/inspect.ethswarm-gloas-b.block"
+echo 1 > "$STUB_DIR/run.ethswarm-gloas-b.rc.1"; touch "$STUB_DIR/ls.block.3"
 SECONDS=0
-run 2 "a fallback enclave inspect that hangs is stopped, and nothing is relaunched" \
-  '^ERROR: kurtosis enclave inspect ethswarm-gloas-b timed out; cannot tell whether it is gone, not relaunching into it$' \
+run 2 "a fallback enclave ls that hangs is stopped, and nothing is relaunched" \
+  "^ERROR: kurtosis enclave ls timed out after 30 s \\(is the engine running\\?\\); cannot tell whether $B is gone, not relaunching into it$" \
   -- --sequential-fallback
-if ((SECONDS < 30)) && gone "$(cat "$STUB_DIR/inspect.ethswarm-gloas-b.pid" 2>/dev/null || echo 1)"; then ok "the hung fallback enclave inspect is stopped"; else bad "the hung fallback enclave inspect is stopped (${SECONDS} s)"; fi
-if [[ $(grep -c '^run --enclave ethswarm-gloas-b ' "$STUB_DIR/kurtosis.log") == 1 ]]; then ok "no relaunch after a hung inspect"; else bad "no relaunch after a hung inspect" "$(cat "$STUB_DIR/kurtosis.log")"; fi
-torn_down "a pair whose fallback inspect hangs is torn down"
+if ((SECONDS < 30)) && gone "$(cat "$STUB_DIR/ls.pid" 2>/dev/null || echo 1)"; then ok "the hung fallback enclave ls is stopped"; else bad "the hung fallback enclave ls is stopped (${SECONDS} s)"; fi
+if [[ $(grep -c '^run --enclave ethswarm-gloas-b-' "$STUB_DIR/kurtosis.log") == 1 ]]; then ok "no relaunch after a hung enclave ls"; else bad "no relaunch after a hung enclave ls" "$(cat "$STUB_DIR/kurtosis.log")"; fi
+torn_down "a pair whose fallback enclave ls hangs is torn down"
+
+# Only a well-formed listing without the enclave proves it gone: any other failure (an engine
+# error, not just a timeout) stops the run.
+base
+echo 1 > "$STUB_DIR/run.ethswarm-gloas-b.rc.1"; echo 1 > "$STUB_DIR/ls.rc.3"
+run 2 "a fallback enclave ls that fails is not taken for the enclave being gone" \
+  "^ERROR: kurtosis enclave ls failed \\(is the engine running\\?\\); cannot tell whether $B is gone, not relaunching into it$" \
+  -- --sequential-fallback
+if [[ $(grep -c '^run --enclave ethswarm-gloas-b-' "$STUB_DIR/kurtosis.log") == 1 ]]; then ok "no relaunch after a failed enclave ls"; else bad "no relaunch after a failed enclave ls" "$(cat "$STUB_DIR/kurtosis.log")"; fi
+torn_down "a pair whose fallback enclave ls fails is torn down"
+base
+echo 1 > "$STUB_DIR/run.ethswarm-gloas-b.rc.1"; : > "$STUB_DIR/enclave-ls.3"
+run 2 "a fallback enclave ls without its UUID header is not taken for the enclave being gone" \
+  "^ERROR: kurtosis enclave ls: no UUID header, cannot tell which enclaves the engine has; cannot tell whether $B is gone" \
+  -- --sequential-fallback
+
+# --- every bound: enclave ls and the check ----------------------------------------------------------
+
+base
+touch "$STUB_DIR/ls.block.1"
+SECONDS=0
+run 2 "a kurtosis enclave ls that hangs is stopped at its limit (30 s), a setup error" \
+  '^ERROR: kurtosis enclave ls timed out after 30 s \(is the engine running\?\)$' --
+if ((SECONDS < 20)); then ok "the hung enclave ls takes no real 30 s"; else bad "the hung enclave ls takes no real 30 s (${SECONDS} s)"; fi
+reaped "the hung enclave ls is stopped" ls.pid
+logged "a hung enclave ls launches nothing" kurtosis '!^run '
+if [[ ! -e $STUB_DIR/docker.log ]]; then ok "a hung enclave ls pulls nothing"; else bad "a hung enclave ls pulls nothing"; fi
+
+base
+echo 4000 > "$STUB_DIR/check.advance"
+SECONDS=0
+run 2 "a check that runs past its limit (3600 s) is stopped, and the run exits 2" \
+  '^ERROR: check-devnet.sh ran past its limit of 3600 s and was stopped$' '^run-pair: exit 2 ' --
+if ((SECONDS < 20)); then ok "the check past its limit is stopped at once"; else bad "the check past its limit is stopped at once (${SECONDS} s)"; fi
+reaped "the check that ran past its limit is gone" check.pid
+torn_down "a check past its limit is torn down"
+
+# --- every job's process group: swept when its leader ends, recorded while it runs ----------------
+
+base
+touch "$STUB_DIR/check.orphan"
+run 0 "a check that leaves a TERM-ignoring process in its group still passes" '^run-pair: exit 0 ' --
+reaped "what a finished check left in its process group is stopped" orphan.pid
+base
+touch "$STUB_DIR/run.ethswarm-gloas-a.orphan"
+run 0 "a launch that leaves a TERM-ignoring process in its group still passes" '^run-pair: exit 0 ' --
+reaped "what a finished launch left in its process group is stopped" run.ethswarm-gloas-a.orphan.pid
+if [[ ! -e $logs/job-groups ]]; then ok "a run that ends leaves no job-groups record"; else bad "a run that ends leaves no job-groups record" "$(cat "$logs/job-groups")"; fi
+
+# A launch that ends is swept at once, not when the other launch ends: b, still running, sees what a
+# left in its group gone.
+base
+touch "$STUB_DIR/run.ethswarm-gloas-a.leftover"
+echo run.ethswarm-gloas-a.leftover.pid > "$STUB_DIR/run.ethswarm-gloas-b.await"
+run 0 "a pair whose first launch leaves a process in its group passes" '^run-pair: exit 0 ' --
+if [[ $(cat "$STUB_DIR/run.ethswarm-gloas-b.saw" 2>/dev/null) == gone ]]; then
+  ok "what a finished launch left is stopped while the other launch still runs"
+else
+  bad "what a finished launch left is stopped while the other launch still runs" "b saw: $(cat "$STUB_DIR/run.ethswarm-gloas-b.saw" 2>&1)"
+fi
+reaped "the finished launch's leftover is gone" run.ethswarm-gloas-a.leftover.pid
+
+# A job's end is what bash saw of it, never a pid lookup: a pid that another process takes the
+# moment the job ends must not count as the job still running (no false exit 4, no stop of it).
+base
+touch "$STUB_DIR/ps.reused"
+SECONDS=0
+run 0 "a pair whose jobs' pids are taken by other processes as they end still passes" \
+  '^both enclaves up [0-9]+ s before genesis$' '^run-pair: exit 0 ' --
+if ((SECONDS < 30)); then ok "the jobs are seen to end at once"; else bad "the jobs are seen to end at once (${SECONDS} s)"; fi
+
+# --- the check's wrapper: no inherited shell options ---------------------------------------------
+
+# SHELLOPTS exported (errexit and pipefail in it) reaches every bash the script starts; the check's
+# wrapper must still read the check's own exit code, so a PASS whose check.log cannot be written is
+# a 2, not tee's 1.
+base
+touch "$STUB_DIR/tee.fail"
+run_env=("SHELLOPTS=$SHELLOPTS")
+if [[ $SHELLOPTS == *errexit*pipefail* ]]; then ok "the test's SHELLOPTS has errexit and pipefail"; else bad "the test's SHELLOPTS has errexit and pipefail" "$SHELLOPTS"; fi
+run 2 "with SHELLOPTS exported, a passing check whose tee fails still exits 2" \
+  '^ERROR: tee .*/check.log failed$' '^run-pair: exit 2 ' --
+run_env=()
+
+# --- a terminal with tostop --------------------------------------------------------------------
+
+# With `stty tostop` the kernel stops a background process group that writes to its terminal
+# (SIGTTOU). The check's tee writes to the terminal from the check's own process group, so the run
+# must not stop there: on a pseudo-terminal with tostop set it must finish (exit 0, the check's
+# output on the terminal) within 20 s. pty_run kills every process of the run's session at the
+# limit.
+pty_run='
+import os, pty, select, signal, subprocess, sys, termios, time
+limit = float(sys.argv[1])
+pid, fd = pty.fork()
+if pid == 0:
+    try:
+        attrs = termios.tcgetattr(0)
+        attrs[3] |= termios.TOSTOP
+        termios.tcsetattr(0, termios.TCSANOW, attrs)
+        os.execvp(sys.argv[2], sys.argv[2:])
+    finally:
+        os._exit(127)
+out = bytearray()
+deadline = time.monotonic() + limit
+status = None
+while True:
+    if status is None:
+        done, st = os.waitpid(pid, os.WNOHANG)
+        if done:
+            status = st
+    ready, _, _ = select.select([fd], [], [], 0.1)
+    data = b""
+    if ready:
+        try:
+            data = os.read(fd, 65536)
+        except OSError:
+            data = b""
+    if data:
+        out += data
+        continue
+    if status is not None:
+        break
+    if time.monotonic() > deadline:
+        listing = subprocess.run(["ps", "-A", "-o", "pid="], capture_output=True, text=True).stdout
+        for word in listing.split():
+            try:
+                if os.getsid(int(word)) == pid:
+                    os.kill(int(word), signal.SIGKILL)
+            except OSError:
+                pass
+        os.waitpid(pid, 0)
+        sys.stdout.write(out.decode(errors="replace").replace("\r\n", "\n"))
+        print("pty_run: still running after the limit; killed")
+        sys.exit(124)
+sys.stdout.write(out.decode(errors="replace").replace("\r\n", "\n"))
+sys.exit(os.waitstatus_to_exitcode(status))
+'
+base
+rc=0
+out=$(PATH="$stubs:$PATH" python3 -I -c "$pty_run" 20 bash "$script" 2>&1) || rc=$?
+if ((rc == 0)) && grep -q '^pair verdict: STUB' <<<"$out" && grep -q '^run-pair: exit 0 ' <<<"$out"; then
+  ok "on a terminal with tostop, the check's output does not stop the run"
+else
+  bad "on a terminal with tostop, the check's output does not stop the run (exit $rc)" "$out"
+fi
 
 # --- the check's exit code ------------------------------------------------------------------------
 
@@ -522,22 +803,22 @@ for code in 1 2 3; do
   torn_down "a check that exits $code is torn down"
 done
 
-# A check.log that tee cannot write (a directory in its place) must not hide the check's own code.
+# A check.log that tee cannot write must not hide the check's own code.
 for code in 3 0; do
   base
   echo "$code" > "$STUB_DIR/check.rc"
-  mkdir -p "$logs/check.log"
+  touch "$STUB_DIR/tee.fail"
   want=$code; if ((code == 0)); then want=2; fi
   run "$want" "a check that exits $code with a failing tee exits $want" "^run-pair: exit $want " --
 done
 
 base
 echo 1 > "$STUB_DIR/rm.ethswarm-gloas-b.rc"
-run 2 "a passing pair whose teardown fails exits 2" '^warning: kurtosis enclave rm -f ethswarm-gloas-b failed or timed out$' \
+run 2 "a passing pair whose teardown fails exits 2" "^warning: kurtosis enclave rm -f $B failed or timed out$" \
   '^ERROR: teardown failed' --
 base
 echo 1 > "$STUB_DIR/check.rc"; echo 1 > "$STUB_DIR/rm.ethswarm-gloas-b.rc"
-run 1 "a failed teardown does not hide a failed check" '^warning: kurtosis enclave rm -f ethswarm-gloas-b failed or timed out$' --
+run 1 "a failed teardown does not hide a failed check" "^warning: kurtosis enclave rm -f $B failed or timed out$" --
 
 # --- an interrupt tears down ---------------------------------------------------------------------
 
@@ -547,10 +828,11 @@ run 1 "a failed teardown does not hide a failed check" '^warning: kurtosis encla
 #   whole group (a Ctrl-C), `script` to the script alone (a kill), and `piped` runs
 #   `run-pair.sh | cat` (cat writing bg.piped, apart from the launcher's bg.out) and signals the
 #   group, so the reader dies and the script's stdout is a broken pipe. Wants the exit code within
-#   10 s, and every process in the pid files gone within 5 s more (a survivor is reported, then
-#   killed).
+#   20 s of the signal (the stubs block for 30-60 s, so a hang still shows), and every process in
+#   the pid files gone within 5 s more (a survivor is reported, then killed). A watchdog KILLs the
+#   script's group 40 s after the signal.
 interrupt() {
-  local expect=$1 desc=$2 ready=$3 sig=$4 target=$5 pid i=0 rc=0 alive='' watchdog f p cmd
+  local expect=$1 desc=$2 ready=$3 sig=$4 target=$5 pid i=0 rc=0 alive='' watchdog f p cmd elapsed
   local pid_files=()
   shift 5
   while (($# > 0)) && [[ $1 != -- ]]; do pid_files+=("$1"); shift; done
@@ -571,13 +853,13 @@ signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 os.setpgid(0, 0)
 os.execvp(sys.argv[1], sys.argv[1:])' bash -c "$cmd" "$script" "$tmp/bg.rc" "$tmp/bg.piped" "$@" > "$tmp/bg.out" 2>&1 &
   pid=$!
-  ( /bin/sleep 20; kill -KILL -- -"$pid" ) >/dev/null 2>&1 &
-  watchdog=$!
   until eval "$ready"; do
     i=$((i + 1))
     if ((i > 100)); then break; fi
     /bin/sleep 0.1
   done
+  ( /bin/sleep 40; kill -KILL -- -"$pid" ) >/dev/null 2>&1 &
+  watchdog=$!
   if [[ $target == script ]]; then
     kill -"$sig" "$(pgrep -P "$pid")"
   else
@@ -585,6 +867,7 @@ os.execvp(sys.argv[1], sys.argv[1:])' bash -c "$cmd" "$script" "$tmp/bg.rc" "$tm
   fi
   SECONDS=0
   wait "$pid" || true
+  elapsed=$SECONDS
   kill "$watchdog" 2>/dev/null || true
   wait "$watchdog" 2>/dev/null || true
   rc=$(cat "$tmp/bg.rc" 2>/dev/null || echo none)
@@ -598,11 +881,11 @@ os.execvp(sys.argv[1], sys.argv[1:])' bash -c "$cmd" "$script" "$tmp/bg.rc" "$tm
       /bin/sleep 0.1
     done
   done
-  if [[ $rc == "$expect" ]] && ((SECONDS < 10)) && [[ -z $alive ]] &&
+  if [[ $rc == "$expect" ]] && ((elapsed < 20)) && [[ -z $alive ]] &&
      { [[ $target == piped ]] || grep -q "^run-pair: exit $expect " "$tmp/bg.out"; }; then
     ok "$desc"
   else
-    bad "$desc (exit $rc, want $expect, ${SECONDS} s${alive:+, still running or never started:$alive})" \
+    bad "$desc (exit $rc, want $expect, ${elapsed} s${alive:+, still running or never started:$alive})" \
       "$(cat "$tmp/bg.out"; if [[ -f $tmp/bg.piped ]]; then echo '-- the piped stdout:'; cat "$tmp/bg.piped"; fi)"
   fi
 }
@@ -652,6 +935,74 @@ interrupt 143 "TERM while a fallback enclave rm hangs exits 143 at once and stop
   '[[ -f $STUB_DIR/rm.ethswarm-gloas-b.pid ]]' TERM script rm.ethswarm-gloas-b.pid -- --sequential-fallback
 torn_down "a TERM during the fallback is torn down"
 
+# The record of the running jobs' process groups, for a run killed with SIGKILL: while the check
+# runs, job-groups holds the check's process group and nothing else; the teardown removes it.
+base
+touch "$STUB_DIR/check.block"
+rm -f "$tmp/check.pgid" "$tmp/job-groups.seen" "$tmp/job-groups.link"
+interrupt 143 "TERM during the check, with its process group on record, exits 143" \
+  '[[ -f $STUB_DIR/check.pid ]] && ps -o pgid= -p "$(cat "$STUB_DIR/check.pid")" > "$tmp/check.pgid" && cp "$logs/job-groups" "$tmp/job-groups.seen" && ln "$logs/job-groups" "$tmp/job-groups.link"' \
+  TERM script check.pid
+if [[ -s $tmp/job-groups.seen && $(tr -d ' ' < "$tmp/check.pgid") == "$(cat "$tmp/job-groups.seen")" ]]; then
+  ok "while the check runs, job-groups holds its process group, and nothing else"
+else
+  bad "while the check runs, job-groups holds its process group" "check pgid: $(cat "$tmp/check.pgid" 2>&1); job-groups: $(cat "$tmp/job-groups.seen" 2>&1)"
+fi
+if [[ ! -e $logs/job-groups ]]; then ok "the teardown removes the job-groups record"; else bad "the teardown removes the job-groups record"; fi
+# A hard link to the record taken while the check ran still holds the check's group: each new
+# list replaced the file (written apart, then renamed), so it was never truncated in place, and a
+# SIGKILL can never leave a partial record.
+if [[ -s $tmp/job-groups.link && $(cat "$tmp/job-groups.link") == "$(cat "$tmp/job-groups.seen")" ]]; then
+  ok "job-groups is replaced whole, never rewritten in place"
+else
+  bad "job-groups is replaced whole, never rewritten in place" "link: $(cat "$tmp/job-groups.link" 2>&1)"
+fi
+
+# A FIFO put in place of job-groups must not block the run: the record is written to a new file of
+# its own and renamed over it, never opened.
+base
+touch "$STUB_DIR/check.block"
+interrupt 143 "TERM during the check, with a FIFO in place of job-groups, still exits 143" \
+  '[[ -f $STUB_DIR/check.pid ]] && rm -f "$logs/job-groups" && mkfifo "$logs/job-groups"' TERM script check.pid
+torn_down "a run whose job-groups was a FIFO is torn down"
+
+# A signal that lands between a job's start and the record of its pid must not leave the job
+# untracked. No stub can hit that window reliably, so a copy of the script sends itself TERM right
+# after each job start once both listings are done (so at the first launch): the launch must still
+# be stopped with the rest.
+base
+touch "$STUB_DIR/run.ethswarm-gloas-a.block" "$STUB_DIR/run.ethswarm-gloas-b.block"
+awk '{ print } /^[[:space:]]*in_group .*&[[:space:]]*$/ { print "if [[ $(cat \"$STUB_DIR/ls.count\" 2>/dev/null) == 2 ]]; then kill -TERM $$; fi" }' \
+  "$kurtosis_dir/run-pair.sh" > "$script"
+if grep -q 'kill -TERM \$\$' "$script"; then ok "the copy sends TERM right after a job start"; else bad "the copy sends TERM right after a job start"; fi
+run 143 "TERM right after a launch starts exits 143" '^run-pair: exit 143 ' --
+/bin/sleep 0.5
+left=$(pgrep -f "$stubs/kurtosis run" || true)
+if [[ -z $left ]]; then
+  ok "a launch started just before a signal is stopped too"
+else
+  bad "a launch started just before a signal is stopped too (still running: $(tr '\n' ' ' <<<"$left"))"
+  for p in $left; do kill -KILL "$p" 2>/dev/null || true; done
+fi
+# The launch may be stopped before the stub logs it, so the removals are matched by name.
+logged "a TERM right after a launch starts removes both enclaves" kurtosis "^enclave rm -f $A$" "^enclave rm -f $B$" '!^clean'
+
+
+# A signal held while a job starts, then a second one right after the hold ends, must not leave the
+# held exit pending for the teardown: the teardown's own job starts would act on it and skip the
+# enclave removals.
+base
+touch "$STUB_DIR/run.ethswarm-gloas-a.block" "$STUB_DIR/run.ethswarm-gloas-b.block"
+awk '{ print }
+  /^[[:space:]]*in_group .*&[[:space:]]*$/ || /^[[:space:]]*held=0$/ {
+    print "if [[ $(cat \"$STUB_DIR/ls.count\" 2>/dev/null) == 2 ]]; then kill -TERM $$; fi"
+  }' "$kurtosis_dir/run-pair.sh" > "$script"
+if [[ $(grep -c 'kill -TERM \$\$' "$script") -ge 2 ]]; then ok "the copy sends TERM in the hold and right after it"; else bad "the copy sends TERM in the hold and right after it"; fi
+run 143 "a second TERM right after a held one exits 143" '^run-pair: exit 143 ' --
+logged "a second TERM right after a held one still removes both enclaves" kurtosis "^enclave rm -f $A$" "^enclave rm -f $B$"
+left=$(pgrep -f "$stubs/kurtosis run" || true)
+if [[ -z $left ]]; then ok "no launch outlives the two signals"; else bad "no launch outlives the two signals ($(tr '\n' ' ' <<<"$left"))"; for p in $left; do kill -KILL "$p" 2>/dev/null || true; done; fi
+
 # A signal that lands in the teardown before its traps are reset would run `exit` inside it and
 # skip the enclave removals; no stub can hit that window reliably, so this reads the script: the
 # teardown's first statement ignores the signals.
@@ -665,10 +1016,10 @@ fi
 # --- --keep-on-pass: a PASS leaves the pair up for the export ----------------------------------------
 
 base
-run 0 "--keep-on-pass leaves a passing pair running" '^kept ethswarm-gloas-a ethswarm-gloas-b running \(--keep-on-pass\); tear down with:$' \
-  '^  kurtosis enclave rm -f ethswarm-gloas-a; kurtosis enclave rm -f ethswarm-gloas-b$' \
+run 0 "--keep-on-pass leaves a passing pair running" "^kept $A $B running \\(--keep-on-pass\\); tear down with:$" \
+  "^  kurtosis enclave rm -f $A; kurtosis enclave rm -f $B$" \
   '!^tearing down' -- --keep-on-pass
-logged "a kept pair is not removed" kurtosis '!^enclave rm' '^run --enclave ethswarm-gloas-b '
+logged "a kept pair is not removed" kurtosis '!^enclave rm' "^run --enclave $B "
 logged "a kept pair's engine is never cleaned" kurtosis '!^clean'
 
 for code in 1 3; do

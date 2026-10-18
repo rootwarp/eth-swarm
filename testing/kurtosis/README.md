@@ -180,11 +180,12 @@ package accepts a fixed `genesis_time`, and at the pinned commit uses it literal
 value in the committed file would soon lie far in the past. Instead, the two runs of a pair use
 one rendered copy with one `genesis_time` T.
 
-**The two runs are a concurrent pair**: two enclaves, `ethswarm-gloas-a` and `ethswarm-gloas-b`,
-started from the same rendered copy at the same time, both fully up before T. A second run started
-*after* genesis does not finalize, so there is no path that launches a run after T. In the first
-sequential runs, the second enclave started about 70 slots after genesis: Lodestar (`b3beff2`)
-could not range-sync the missed slots from Lighthouse
+**The two runs are a concurrent pair**: two enclaves, `ethswarm-gloas-a-<T>-<pid>` and
+`ethswarm-gloas-b-<T>-<pid>` (T the genesis time, pid that of `run-pair.sh`, so no two runs share
+an enclave name), started from the same rendered copy at the same time, both fully up before T.
+A second run started *after* genesis does not finalize, so there is no path that launches a run
+after T. In the first sequential runs, the second enclave started about 70 slots after genesis:
+Lodestar (`b3beff2`) could not range-sync the missed slots from Lighthouse
 (`DOWNLOAD_BY_RANGE_ERROR_MISSING_BLOCK_RESPONSE`; its only peer went to `failed_download_peers`
 and was never retried), and without Lodestar's 64 validators Lighthouse could not justify an
 epoch. Any gap after genesis can hit this, so T must leave time for both `kurtosis run`s. On
@@ -239,7 +240,9 @@ enclave in turn (under a `== <enclave>` header, the same options for both), then
 with `pair verdict: PASS` (exit 0) only when both runs are acceptance passes and the genesis is
 one; otherwise exit 2 if either enclave's run is a setup error, else 1 (`pair verdict: FAIL`,
 naming the failed enclave or `pair genesis`), else 3 (DIAGNOSTIC). `--record` writes the pair's
-one genesis, and `--reference` checks both enclaves against an earlier record. The criteria:
+one genesis, and `--reference` checks both enclaves against an earlier record. Every `kurtosis`
+call (`enclave inspect`, `port print`) is bounded to `--kurtosis-timeout` seconds (default 60);
+one that takes longer is killed and is a setup error (exit 2). The criteria:
 
 - `genesis`: every CL reports the same `genesis_time`, `genesis_validators_root`,
   `genesis_fork_version`, genesis block root and genesis state root. With `--reference`, they
@@ -265,39 +268,63 @@ the engine: it lists the enclaves (`kurtosis enclave ls`) before the pulls and a
 the launches, and refuses to go on (exit 2, naming them) if there is any, so an enclave created
 in between is refused too, never removed. An answer without the `UUID` header line, an empty one
 included, is refused as well. Remove the enclaves yourself, or pass `--clean-engine`: then the
-script skips both listings and runs `kurtosis clean -a`, which removes **every** enclave on the
-engine, just before the launches. Each step fails closed:
+script skips both listings and runs `kurtosis clean -a` (bounded to 300 s; one that fails or
+times out stops the run, exit 2), which removes **every** enclave on the engine, just before the
+launches. Each step fails closed:
 
 1. **Pre-pull and render** ("Reproducible genesis"): any failed pull, render check or pin lint,
-   or a logs directory that cannot be written, stops the run before anything is launched
-   (exit 2).
+   or a logs directory that cannot be made, stops the run before anything is launched (exit 2).
+   The run makes `target/kurtosis/pair-$T` itself: one that exists already (another run in the
+   same checkout rendered the same T) stops the run too (exit 2), and is left alone.
 2. **Launches.** The second listing (or with `--clean-engine`, `kurtosis clean -a`), then both
-   `kurtosis run`s at once, each logged to `target/kurtosis/pair-$T/<enclave>-run.log`. Both
+   `kurtosis run`s at once, of `ethswarm-gloas-a-<T>-<pid>` and `ethswarm-gloas-b-<T>-<pid>`
+   (printed as `launching ...`), each logged to `target/kurtosis/pair-$T/<enclave>-run.log`. Both
    must exit 0 (else exit 2, naming the failed ones), and both must be up before T (else exit 4:
    render a later T and start again). A launch still running at T is stopped (exit 4).
 3. **Fallback** (`--sequential-fallback`, off by default): if a concurrent launch fails, each
-   failed enclave is removed (`kurtosis enclave rm -f`, bounded to 120 s), confirmed gone
-   (`kurtosis enclave inspect`, bounded to 30 s; one that times out stops the run, exit 2), and
-   launched again alone, one after the other (the failed log is kept as
+   failed enclave is removed (`kurtosis enclave rm -f`, bounded to 120 s), confirmed gone (a
+   `kurtosis enclave ls`, bounded to 30 s, that answers with its `UUID` header and does not list
+   it; a listing that fails, times out, has no header or still lists it stops the run, exit 2),
+   and launched again alone, one after the other (the failed log is kept as
    `<enclave>-run-concurrent.log`). A relaunch starts only with at least 120 s left before T,
    checked before the removal and again just before the launch, and both enclaves must still be
    up before T.
-4. **Check.** After T, `check-devnet.sh --pair --record target/kurtosis/pair-$T/genesis.json
-   ethswarm-gloas-a ethswarm-gloas-b`, shown and kept in `check.log`. The check's own exit code
-   (0 pair PASS, 1 FAIL, 2 setup error, 3 DIAGNOSTIC) is the script's exit code; a `check.log`
-   that cannot be written turns only a PASS into a 2. On 2026-10-19 (with `--attempts 80`) the
-   check ran from T+31 s to T+252 s and finality passed on poll 19, inside the default 40 polls,
-   12 s apart.
-5. **Teardown.** An EXIT/INT/TERM/HUP/PIPE trap, set before the launches, removes the pair on
-   every exit, an interrupt while waiting for genesis or finality and a closed terminal or
-   output pipe included (exit 130 on INT, 143 on TERM, 129 on HUP, 141 on PIPE). It stops the
-   background jobs, each started as the leader of its own process group: TERM to the group and
-   to every descendant, then KILL 10 s later to whatever still runs, a process that ignores TERM
-   or that left the process tree included. Then it runs `kurtosis enclave rm -f` for each
-   enclave, each bounded to 120 s and each run even if an earlier step failed. It removes
-   nothing else: no `kurtosis clean -a` at the end. A failed teardown after a PASS exits 2.
+4. **Check.** After T, `check-devnet.sh --pair --record target/kurtosis/pair-$T/genesis.json`
+   on both enclaves, shown and kept in `check.log`. The check's own exit code (0 pair PASS, 1
+   FAIL, 2 setup error, 3 DIAGNOSTIC) is the script's exit code; a `check.log` that cannot be
+   written turns only a PASS into a 2. The check is bounded to 3600 s (its own bounds, with its
+   defaults, add up to about 52 min on the two enclaves); one that runs longer is stopped, exit
+   2. On 2026-10-19 (with `--attempts 80`) the check ran from T+31 s to T+252 s and finality
+   passed on poll 19, inside the default 40 polls, 12 s apart.
+5. **Teardown.** An EXIT/INT/TERM/HUP/PIPE trap, set before the first step, stops the
+   background jobs on every exit and, from the launches on, removes the pair, an interrupt while
+   waiting for genesis or finality and a closed terminal or output pipe included (exit 130 on
+   INT, 143 on TERM, 129 on HUP, 141 on PIPE). A signal that lands while a job is starting takes
+   effect once the job is recorded, so the teardown always finds it. Every pull, `kurtosis`
+   call, `docker stats`, the wait for genesis and the check run as background jobs, each the
+   leader of its own process group; stopping one is TERM to the group and to every descendant,
+   then KILL 10 s later to whatever still runs, a process that ignores TERM or that left the
+   process tree included. When a job's leader ends, whatever is left in its group gets the same
+   TERM, then KILL, so nothing a step started outlives it; each launch is swept as soon as it
+   ends, while the other may still run. Whether a job still runs is what bash saw of it (its job
+   table), never a lookup of its pid, which another process may take once the job has ended; a
+   group whose leader has ended is signalled only while it still has a process (which keeps its
+   id from passing to another group), and a descendant only while the same process (pid and
+   start time) runs. Each job ignores SIGTTOU, so a
+   terminal with `stty tostop` cannot stop the check's output (it would hang the run). Then the
+   teardown runs `kurtosis enclave rm -f` for each of the run's two enclaves, by name, each
+   bounded to 120 s and each run even if an earlier step failed. It removes nothing else: no
+   other run's enclave and no `kurtosis clean -a` at the end. A failed teardown after a PASS
+   exits 2.
    `--keep-on-pass` leaves the pair running after a PASS only (exit 0), for "Export blocks and
    roots", and prints the teardown commands; any other exit still tears down.
+
+Each `kurtosis enclave ls` (before the pulls, before the launches and in the fallback) is
+bounded to 30 s; one that times out is a setup error (exit 2).
+
+While a job runs, `target/kurtosis/pair-$T/job-groups` lists the process group of each running
+job, one per line; the script replaces it whole (a new file renamed over it) as jobs start and
+end, and the teardown removes it.
 
 `docker stats --no-stream` (bounded to 30 s, never fatal) is kept for CI sizing as
 `stats-up.txt` (both enclaves up) and `stats-checked.txt` (after the check), and the script
@@ -308,9 +335,38 @@ bash testing/kurtosis/run-pair.sh                       # exit 0: pair PASS, the
 bash testing/kurtosis/run-pair.sh --lead 1500 --sequential-fallback --keep-on-pass
 bash testing/kurtosis/run-pair.sh --clean-engine        # removes every enclave on the engine first
 
-# Teardown by hand (after --keep-on-pass, or if the script was killed with SIGKILL):
-kurtosis enclave rm -f ethswarm-gloas-a
-kurtosis enclave rm -f ethswarm-gloas-b
+# Teardown by hand after --keep-on-pass: the two commands it printed, with the run's names.
+kurtosis enclave rm -f ethswarm-gloas-a-<T>-<pid>
+kurtosis enclave rm -f ethswarm-gloas-b-<T>-<pid>
+```
+
+A script killed with SIGKILL runs no teardown, and **its jobs keep running**: each is the leader
+of its own process group, so a `kurtosis run` can still be creating an enclave, or the check still
+polling, after the script is gone. Stop those groups first, then remove the enclaves. The jobs that
+were running are in `job-groups` (before the render, the only job is a `kurtosis enclave ls` or a
+`docker pull`, which ends on its own), and the enclave names are those of the `*-run.log` files.
+A recorded id is only a number: once its job has ended, another process (yours or not) may hold
+it. So stop only a group whose leader still runs and names this run's enclaves on its command
+line (a `kurtosis run`, a `kurtosis enclave rm`, or the check); the other jobs (`kurtosis enclave
+ls`, `kurtosis clean -a`, `docker stats`, the wait for genesis) end on their own:
+
+```bash
+logs=target/kurtosis/pair-<T>                         # the killed run's logs directory
+ls "$logs"/*-run.log                                  # <enclave>-run.log: the run's two enclaves
+run=<T>-<pid>                                         # their suffix, this run's own
+# The recorded groups whose leader (pid = pgid) still runs one of this run's commands:
+mine() {
+  while read -r g; do
+    ps -o pid=,pgid=,command= -p "$g" | awk -v g="$g" -v run="$run" '$1 == g && $2 == g && index($0, run) { print g }'
+  done < "$logs/job-groups"
+}
+for g in $(mine); do ps -A -o pid=,pgid=,command= | awk -v g="$g" '$2 == g'; done   # look first
+for g in $(mine); do kill -TERM -- "-$g"; done
+# 10 s later, for what mine() still finds:
+for g in $(mine); do kill -KILL -- "-$g"; done
+kurtosis enclave rm -f ethswarm-gloas-a-<T>-<pid>
+kurtosis enclave rm -f ethswarm-gloas-b-<T>-<pid>
+rm "$logs/job-groups"
 ```
 
 The same checks by hand, one CL at a time:
@@ -376,11 +432,11 @@ both pass `verify --sha256`, and `diff` reports identical root lists, 25 slots a
 `network-config` reads the generated `config.yaml`.
 
 Run it on a devnet whose finalized epoch is at least 3 (`check-devnet.sh` passes), from the repo
-root. For a concurrent pair, export from one of its enclaves (`ethswarm-gloas-a`) before the
-teardown:
+root. For a concurrent pair, export from one of its enclaves (`ethswarm-gloas-a-<T>-<pid>`, as
+`run-pair.sh --keep-on-pass` printed it) before the teardown:
 
 ```bash
-enclave=ethswarm-gloas          # ethswarm-gloas-a for a pair
+enclave=ethswarm-gloas          # ethswarm-gloas-a-<T>-<pid> for a pair
 genesis=target/kurtosis/$enclave-genesis
 export_root=target/kurtosis/export
 kurtosis files download "$enclave" el_cl_genesis_data "$genesis"   # config.yaml, genesis.ssz, ...
@@ -512,12 +568,13 @@ code is 0 before going on:
 bash testing/kurtosis/run-pair.sh --keep-on-pass; echo "run-pair exit $?"   # 0: the pair is up
 ```
 
-Everything below uses `ethswarm-gloas-a` and runs from the repo root.
+Everything below uses the pair's first enclave, `ethswarm-gloas-a-<T>-<pid>` as `run-pair.sh`
+printed it (`launching ...`), and runs from the repo root.
 
 The inputs, from Kurtosis and each CL's beacon API:
 
 ```bash
-enclave=ethswarm-gloas-a
+enclave=ethswarm-gloas-a-<T>-<pid>                  # the name run-pair.sh printed
 net=target/kurtosis/$enclave-genesis
 logs=target/kurtosis/probe-$enclave; mkdir -p "$logs"
 kurtosis files download "$enclave" el_cl_genesis_data "$net"   # config.yaml, genesis.ssz

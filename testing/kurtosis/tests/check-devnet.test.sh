@@ -30,8 +30,17 @@ cat > "$stubs/kurtosis" <<'SH'
 # kurtosis stub. `enclave inspect E`: $STUB_DIR/inspect.<E> (none: exit 1). `port print E S P`:
 # $STUB_DIR/port.<E>.<S>.<P>, else $STUB_DIR/port.<S>.<P> (neither: exit 1). With $STUB_DIR/stderr, every call first prints that
 # file to stderr (Kurtosis 1.22.1 on Docker Desktop prints an OpenTelemetry WARN on every call).
+# With $STUB_DIR/hang.enclave.<E> (an inspect) or $STUB_DIR/hang.port.<E> (a port print) the call
+# hangs for 30 s instead (its pid in $STUB_DIR/hang.pid); with $STUB_DIR/hang-child.enclave.<E> it
+# first starts a child that keeps its stdout open for 30 s (its pid in $STUB_DIR/hang-child.pid).
 printf '%s\n' "$*" >> "$STUB_DIR/kurtosis.log"
 if [[ -f $STUB_DIR/stderr ]]; then cat "$STUB_DIR/stderr" >&2; fi
+if [[ -f $STUB_DIR/hang-child.$1.$3 ]]; then
+  /bin/sleep 30 &
+  echo $! > "$STUB_DIR/hang-child.pid"
+  echo $$ > "$STUB_DIR/hang.pid"; exec /bin/sleep 30
+fi
+if [[ -f $STUB_DIR/hang.$1.$3 ]]; then echo $$ > "$STUB_DIR/hang.pid"; exec /bin/sleep 30; fi
 case "$1 $2" in
   "enclave inspect") f="$STUB_DIR/inspect.$3" ;;
   "port print") f="$STUB_DIR/port.$3.$4.$5"; [[ -f $f ]] || f="$STUB_DIR/port.$4.$5" ;;
@@ -589,6 +598,53 @@ pair_base
 run 2 "--pair with one enclave is a usage error" '^usage: ' -- --pair ethswarm-gloas-a
 run 2 "--pair with three enclaves is a usage error" '^usage: ' -- --pair a b c
 run 2 "--pair naming one enclave twice is a usage error" 'two different enclaves' -- --pair ethswarm-gloas-a ethswarm-gloas-a
+
+# --- every kurtosis call is bounded (--kurtosis-timeout) -------------------------------------------
+
+# hung_stopped <description>: the hung stub call ($STUB_DIR/hang.pid) is gone.
+hung_stopped() {
+  local p stat
+  if [[ ! -f $STUB_DIR/hang.pid ]]; then bad "$1 (no hang.pid: the call never hung)"; return; fi
+  p=$(cat "$STUB_DIR/hang.pid")
+  stat=$(ps -o stat= -p "$p" 2>/dev/null || true)
+  if [[ -z $stat || $stat == Z* ]]; then
+    ok "$1"
+  else
+    bad "$1 (pid $p still runs)"
+    kill -KILL "$p" 2>/dev/null || true
+  fi
+}
+base
+touch "$STUB_DIR/hang.enclave.ethswarm-gloas"
+SECONDS=0
+run 2 "an enclave inspect that hangs is stopped at --kurtosis-timeout, a setup error" \
+  '^ERROR: kurtosis enclave inspect ethswarm-gloas timed out after 1 s$' -- --kurtosis-timeout 1 ethswarm-gloas
+if ((SECONDS < 10)); then ok "the hung enclave inspect takes about 1 s"; else bad "the hung enclave inspect takes about 1 s (${SECONDS} s)"; fi
+hung_stopped "the hung enclave inspect is stopped"
+base
+touch "$STUB_DIR/hang.port.ethswarm-gloas"
+run 2 "a port print that hangs is stopped at --kurtosis-timeout, a setup error" \
+  '^ERROR: kurtosis port print ethswarm-gloas cl-1-lighthouse-geth http timed out after 1 s$' -- --kurtosis-timeout 1 ethswarm-gloas
+hung_stopped "the hung port print is stopped"
+pair_base
+touch "$STUB_DIR/hang.enclave.ethswarm-gloas-b"
+run 2 "--pair passes --kurtosis-timeout to both enclaves' runs" \
+  '^ERROR: kurtosis enclave inspect ethswarm-gloas-b timed out after 1 s$' '^pair verdict: ERROR \(setup error in ethswarm-gloas-b\)$' \
+  -- --pair --kurtosis-timeout 1 ethswarm-gloas-a ethswarm-gloas-b
+hung_stopped "the hung enclave inspect of a pair is stopped"
+# A child that keeps the call's stdout open must not hold the run past the limit either.
+base
+touch "$STUB_DIR/hang-child.enclave.ethswarm-gloas"
+SECONDS=0
+run 2 "an enclave inspect whose child keeps its stdout open still stops at --kurtosis-timeout" \
+  '^ERROR: kurtosis enclave inspect ethswarm-gloas timed out after 1 s$' -- --kurtosis-timeout 1 ethswarm-gloas
+if ((SECONDS < 10)); then ok "the open stdout does not hold the run (${SECONDS} s)"; else bad "the open stdout does not hold the run (${SECONDS} s)"; fi
+hung_stopped "the hung enclave inspect with an open child is stopped"
+kill -KILL "$(cat "$STUB_DIR/hang-child.pid")" 2>/dev/null || true
+base
+run 0 "a kurtosis call within the limit passes" '^verdict: PASS' -- --kurtosis-timeout 5 ethswarm-gloas
+run 2 "a --kurtosis-timeout of 0 is a usage error" 'kurtosis-timeout must be an integer >= 1' -- --kurtosis-timeout 0 ethswarm-gloas
+run 2 "a non-integer --kurtosis-timeout is a usage error" 'kurtosis-timeout must be an integer >= 1' -- --kurtosis-timeout soon ethswarm-gloas
 
 # --- several criteria at once, setup and usage errors ----------------------------------------------
 
