@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use cl_verify::notify;
 use cl_verify::proto::common::Hello;
 use cl_verify::proto::verify::verify_service_client::VerifyServiceClient;
 use cl_verify::server::Limits;
@@ -31,7 +32,9 @@ use tokio_stream::wrappers::ReceiverStream;
 #[derive(Default)]
 struct Recorder {
     calls: AtomicUsize,
-    socket_existed: Mutex<Vec<bool>>,
+    /// At each READY, whether `socket` accepted a connection: the path also exists between
+    /// `bind` and `listen`, when a connect is refused.
+    socket_accepted: Mutex<Vec<bool>>,
     socket: Option<std::path::PathBuf>,
     woken: Mutex<Option<oneshot::Sender<()>>>,
 }
@@ -40,7 +43,8 @@ impl Readiness for Recorder {
     fn ready(&self) -> io::Result<()> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some(path) = &self.socket {
-            self.socket_existed.lock().unwrap().push(path.exists());
+            let accepted = std::os::unix::net::UnixStream::connect(path).is_ok();
+            self.socket_accepted.lock().unwrap().push(accepted);
         }
         if let Some(tx) = self.woken.lock().unwrap().take() {
             let _ = tx.send(());
@@ -162,7 +166,7 @@ async fn pinned_setup_binds_serves_then_reports_ready() {
         .await
         .expect("READY within 30 s")
         .expect("READY sent");
-    assert_eq!(*readiness.socket_existed.lock().unwrap(), [true]);
+    assert_eq!(*readiness.socket_accepted.lock().unwrap(), [true]);
 
     // The server answers a real stream on the socket it reported ready on.
     let mut client = VerifyServiceClient::new(connect(&socket).await);
@@ -451,7 +455,7 @@ fn binary_exits_nonzero_on_a_tampered_setup_without_binding() {
     );
 }
 
-/// Starts the binary on a fresh dir and waits for its socket.
+/// Starts the binary on a fresh dir and waits for its READY.
 fn spawn_binary(dir: &Path) -> std::process::Child {
     spawn_binary_with(dir, &dir.join("pubkeys.bin"), std::process::Stdio::null())
 }
@@ -463,7 +467,15 @@ fn spawn_binary_with(
     stderr: std::process::Stdio,
 ) -> std::process::Child {
     let socket = dir.join("verify.sock");
+    // The socket file appears at bind(), before listen(): a connect in between is refused. READY
+    // comes only once the socket accepts connections, so wait for that instead.
+    let notify_path = dir.join("notify.sock");
+    let manager = std::os::unix::net::UnixDatagram::bind(&notify_path).unwrap();
+    manager
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
     let mut child = cl_verify()
+        .env("NOTIFY_SOCKET", &notify_path)
         .arg("--trusted-setup")
         .arg(setup_config().path)
         .arg("--socket")
@@ -474,15 +486,41 @@ fn spawn_binary_with(
         .stderr(stderr)
         .spawn()
         .unwrap();
-    for _ in 0..300 {
-        if socket.exists() {
-            return child;
+    match await_ready(&manager, &mut child) {
+        Ok(()) => child,
+        Err(why) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("cl-verify on {}: {why}", socket.display());
         }
-        std::thread::sleep(Duration::from_millis(100));
     }
-    let _ = child.kill();
-    let _ = child.wait();
-    panic!("cl-verify did not bind {} within 30 s", socket.display());
+}
+
+/// Waits up to 30 s for `child` to send READY to `manager` (read timeout 100 ms).
+fn await_ready(
+    manager: &std::os::unix::net::UnixDatagram,
+    child: &mut std::process::Child,
+) -> Result<(), String> {
+    let mut buf = [0u8; 64];
+    for _ in 0..300 {
+        match manager.recv(&mut buf) {
+            Ok(n) if &buf[..n] == notify::READY.as_bytes() => return Ok(()),
+            Ok(n) => {
+                let got = String::from_utf8_lossy(&buf[..n]);
+                return Err(format!("unexpected notification {got:?}"));
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => return Err(format!("cannot read the notify socket: {e}")),
+        }
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            return Err(format!("exited before READY: {status:?}"));
+        }
+    }
+    Err("no READY within 30 s".into())
 }
 
 /// Sends `signal` to `child`.
