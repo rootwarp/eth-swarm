@@ -1,17 +1,18 @@
 # cl-p2p
 
-The `ethswarm.p2p.v1` service stub, the outbound req/resp codec (`src/rpc`), the probe swarm
-(`transport::build_swarm`, `src/behaviour.rs`), and the `m2a-session` binary, which dials one
-pinned reference node and nothing else.
+The `ethswarm.p2p.v1` service stub, the req/resp codec and control protocols (`src/rpc`), the
+probe swarm (`transport::build_swarm`, `src/behaviour.rs`), and the `m2a-session` binary, which
+dials one pinned reference node and nothing else.
 
 ## Probe swarm
 
-`transport::build_swarm(keypair, &cfg)` builds the swarm on TCP (`nodelay`), Noise XX and the
-muxers yamux then mplex (mplex under the per-connection budget), and listens on every
+`transport::build_swarm(keypair, &cfg, req_resp)` builds the swarm on TCP (`nodelay`), Noise XX
+and the muxers yamux then mplex (mplex under the per-connection budget), and listens on every
 `cfg.listen_addrs` address, `/ip4/0.0.0.0/tcp/9000` by default; it dials over the same transport.
 The behaviour is `connection_limits`, identify (`eth2/1.0.0`, no address cache: nothing dials
-an address a peer advertised), and placeholder slots for req/resp and gossipsub. The connection
-caps (`SwarmConfig::caps`): one established connection per peer, 8 pending inbound per source
+an address a peer advertised), the req/resp control protocols (`req_resp`, an
+`rpc::inbound::Control`), and a placeholder slot for gossipsub. The connection caps
+(`SwarmConfig::caps`): one established connection per peer, 8 pending inbound per source
 (IPv4 address or IPv6 /58; the pinned `connection_limits` has no total pending cap), 128
 established inbound, 160 established in total.
 
@@ -29,6 +30,58 @@ connection, `connection established` with `peer`, `direction` and `addr`, and id
 `observed_addr`, the address the peer sees us on (a NAT'd host shows its public address there,
 or an address nobody can dial). The peer's identify strings are logged escaped and cut at 128
 chars.
+
+## Req/resp control protocols
+
+`rpc::inbound::Control` answers and initiates Status v2, MetaData v3, Ping v1 and Goodbye v1
+(consensus-specs v1.7.0-beta.4, `phase0`/`fulu` `p2p-interface.md`), one `request_response`
+behaviour per protocol, all `ProtocolSupport::Full`, at most 2 open streams per protocol and
+connection. Those, plus `BeaconBlocksByRange` v2, are the only protocols offered: any other
+fails multistream-select negotiation.
+
+- **Status**: sent first on every connection we dial, and answered on every one. A peer
+  Status with another fork digest, or another finalized root at our finalized epoch, gets
+  `Goodbye(2)` and the connection is closed once the Goodbye completed. A failed exchange (a
+  timeout, an error chunk) is ignored: the peer is neither valid nor invalid.
+- **MetaData**: our `seq_number` (from cl-chain), no attestation or sync subnets, and
+  `custody_group_count` equal to the ENR `cgc` (`ControlConfig::custody_group_count`; cl-p2p
+  does not link cl-discv5, so the value is passed in).
+- **Ping**: answered with our `seq_number`. A peer `seq_number` above that of the peer MetaData
+  we hold, or any while we hold none, triggers one GetMetaData; no second one while it is open.
+- **Goodbye**: no response chunk; the stream and the connection close.
+- **Rejects**: a request that breaks the wire format gets `1: InvalidRequest`. `3:
+  ResourceUnavailable` goes out only where the protocol specifies it: `BeaconBlocksByRange`,
+  answered so on every request because the probe stores no blocks. A Status we cannot answer
+  (no Status of ours yet) gets `2: ServerError`. Error chunks carry no context bytes.
+- **Deadlines** (in the codec, `tokio::time::timeout`, both directions): 5 s to the first
+  byte, 5 s per chunk, 10 s in total \[est\]; `request_response`'s own 10 s request timeout is
+  only the backstop. A silent inbound stream is dropped at 5 s and holds one of the 2 stream
+  slots until then.
+
+### What our Status advertises (probe mode)
+
+The Status comes from cl-chain (`ethswarm.chain.v1.ReqRespService/GetStatus`,
+`cl_chain::probe::StatusProvider`; `rpc::inbound::status_from_chain` maps the response):
+`fork_digest` is `compute_fork_digest` at the wall-clock epoch (BPO epochs included), the
+finalized checkpoint is the reference Beacon API's, and the head is **the finalized block**, not
+the reference node's head. The probe imports nothing past finality, so it advertises only what
+it can vouch for; `earliest_available_slot` is that head slot until the probe serves ranges of
+its own. During a reference API outage the last good sample is kept; before the first one there
+is no Status, so none is sent and none is judged.
+
+Metrics, on the same registry as the peer metrics (`rpc::metrics::RpcMetrics`):
+
+- `rpc_timeouts_total{kind="ttfb"|"per_chunk"|"total"}`: exchanges that failed on a deadline.
+- `rpc_invalid_data_total{direction}`: requests (inbound) or responses (outbound) that broke
+  the wire format. Timeouts are never counted here.
+- `p2p_goodbye_sent_total{reason, status_valid}` and `p2p_goodbye_received_total{reason,
+  status_valid}`: `reason` is the code (0–255, else `other`), `status_valid` is `true`,
+  `false` or `unknown` (no Status judged yet).
+- `p2p_status_valid_peers`: connected peers whose last Status passed.
+
+Every received Goodbye logs one `goodbye_received` line (`peer`, `reason`, `status_valid`,
+`direction`, `unix_ms`) and emits one `ControlEvent::GoodbyeReceived`; every sent one logs
+`goodbye_sent`.
 
 ## Deviations
 

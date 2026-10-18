@@ -1,21 +1,35 @@
-//! The outbound half of the req/resp codec: `write_request` and `read_response` of
-//! [`request_response::Codec`], over the `p2p-wire` framing.
+//! The req/resp codec: [`request_response::Codec`] over the `p2p-wire` framing, both halves.
+//!
+//! - Outbound: `write_request` writes one [`Request`], `read_response` reads its chunks.
+//! - Inbound: `read_request` reads one request and `write_response` writes our chunks. A
+//!   request that breaks the wire format (a wrong length, bad snappy, an early end, bytes after
+//!   it) is not an I/O error: it is returned as [`RpcRequest::Malformed`], so the responder can
+//!   answer `1: InvalidRequest` (`phase0/p2p-interface.md` L1383–1386) instead of dropping the
+//!   stream. `write_response` refuses `3: ResourceUnavailable` on a protocol that does not
+//!   specify it ([`Protocol::permits_resource_unavailable`]), and an error chunk carries no
+//!   context bytes (`altair/p2p-interface.md` L463–465).
 //!
 //! # Deadlines
 //!
 //! `request_response` has one deadline per exchange (`with_request_timeout`). The spec's
 //! response timing needs three, all local \[est\] values because consensus-specs v1.7.0-beta.4
 //! defines no `TTFB_TIMEOUT` or `RESP_TIMEOUT`; [`Deadlines`] holds them and [`read_response`]
-//! runs them with `tokio::time::timeout`:
+//! and [`read_request`] run them with `tokio::time::timeout`:
 //!
-//! - `ttfb` (5 s): from the start of the read to the first response byte;
-//! - `per_chunk` (5 s): for each response chunk, from its first read to its last byte;
-//! - `total` (10 s): for the whole response.
+//! - `ttfb` (5 s): from the start of the read to the first byte (for an empty MetaData
+//!   request, to the end of the stream);
+//! - `per_chunk` (5 s): for each chunk, from its first read to its last byte, and for the end
+//!   of the stream after the last chunk;
+//! - `total` (10 s): for the whole response or request.
+//!
+//! An inbound stream that stays silent therefore fails at 5 s and is dropped; until then it
+//! holds one of the behaviour's `max_concurrent_streams` slots.
 //!
 //! [`read_response_chunks`] is the deadline-free chunk loop under them, `pub` so that it can be
 //! fuzzed on its own.
 //!
 //! [`read_response`]: request_response::Codec::read_response
+//! [`read_request`]: request_response::Codec::read_request
 //!
 //! # Reads
 //!
@@ -38,16 +52,18 @@
 //! block's own epoch is for the caller to check
 //! ([`blocks_by_range`](super::outbound::blocks_by_range)).
 
+use super::metrics::RpcMetrics;
 use consensus_types::EthSpec;
 use consensus_types::{caps, forked};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::request_response;
 use p2p_wire::rpc::codec::{
-    decode_response_chunk, encode_request, CodecError, ContextTable, ResponseChunkScanner, Scan,
+    decode_request, decode_response_chunk, encode_error_chunk, encode_request,
+    encode_success_chunk, ChunkScanner, CodecError, ContextTable, ResponseChunkScanner, Scan,
     CONTEXT_BYTES_LEN,
 };
 use p2p_wire::rpc::messages::ForkDigest;
-use p2p_wire::rpc::protocols::{Protocol, Request, Response, ResponseChunk};
+use p2p_wire::rpc::protocols::{Protocol, Request, Response, ResponseChunk, ResultCode};
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
@@ -77,7 +93,7 @@ impl Default for Deadlines {
 }
 
 /// Which deadline passed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Deadline {
     /// [`Deadlines::ttfb`].
     Ttfb,
@@ -381,23 +397,166 @@ async fn read_response_within<E: EthSpec, T: AsyncRead + Unpin>(
     within(Some(deadlines.total), Deadline::Total, exchange).await
 }
 
-fn unsupported() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "cl-p2p serves no inbound req/resp yet",
-    )
+/// One request as the codec carries it: what we send, or what a peer sent.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RpcRequest {
+    /// A request that decoded.
+    Valid(Request),
+    /// A peer's request that broke the wire format; the responder answers `1: InvalidRequest`.
+    /// Never written.
+    Malformed(CodecError),
 }
 
-/// The req/resp codec of one outbound stream.
+impl From<Request> for RpcRequest {
+    fn from(request: Request) -> Self {
+        Self::Valid(request)
+    }
+}
+
+/// Appends exactly `len` more bytes to `buf`; a stream that ends before them is truncated.
+async fn read_exact_more<T: AsyncRead + Unpin>(
+    io: &mut T,
+    buf: &mut Vec<u8>,
+    len: usize,
+) -> Result<(), ReadError> {
+    let start = buf.len();
+    buf.resize(start + len, 0);
+    let mut filled = start;
+    while filled < buf.len() {
+        match io.read(&mut buf[filled..]).await? {
+            0 => return Err(CodecError::Truncated.into()),
+            n => filled += n,
+        }
+        tokio::task::consume_budget().await;
+    }
+    Ok(())
+}
+
+/// Reads the one request of `protocol` and the end of the stream after it, with `per_chunk`
+/// around each if given. The request's payload is read through one [`ChunkScanner`], so no
+/// read goes past it and the buffer never holds more than its bound allows.
+async fn read_request_bytes<T: AsyncRead + Unpin>(
+    io: &mut T,
+    protocol: Protocol,
+    per_chunk: Option<Duration>,
+) -> Result<Request, ReadError> {
+    let mut buf = Vec::new();
+    if let Some(max) = protocol.request_len() {
+        within(per_chunk, Deadline::PerChunk, async {
+            let mut scanner = ChunkScanner::new(max);
+            while let Scan::Incomplete { need, .. } = scanner.scan(&buf)? {
+                read_exact_more(io, &mut buf, need).await?;
+            }
+            Ok(())
+        })
+        .await?;
+    }
+    // The request ends the stream: whatever follows is a malformed request.
+    let mut rest = [0u8; 1];
+    let n = within(per_chunk, Deadline::PerChunk, async {
+        Ok(io.read(&mut rest).await?)
+    })
+    .await?;
+    if n > 0 {
+        return Err(CodecError::TrailingBytes(n).into());
+    }
+    Ok(decode_request(protocol, &buf)?)
+}
+
+/// [`read_request_bytes`] under `deadlines`: the first byte (or the end of an empty request)
+/// within `ttfb`, the rest within `per_chunk`, all of it within `total`.
+async fn read_request_within<T: AsyncRead + Unpin>(
+    io: &mut T,
+    protocol: Protocol,
+    deadlines: Deadlines,
+) -> Result<Request, ReadError> {
+    let exchange = async {
+        let mut first = [0u8; 1];
+        let n = within(Some(deadlines.ttfb), Deadline::Ttfb, async {
+            Ok(io.read(&mut first).await?)
+        })
+        .await?;
+        let mut stream = (&first[..n]).chain(&mut *io);
+        read_request_bytes(&mut stream, protocol, Some(deadlines.per_chunk)).await
+    };
+    within(Some(deadlines.total), Deadline::Total, exchange).await
+}
+
+/// Why a response cannot be written: our own mistake, never the peer's.
+fn invalid_response(why: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, why)
+}
+
+/// The wire bytes of `chunks` as the response on `protocol`: each a success chunk of the
+/// protocol's type (with context bytes exactly where the protocol has them) or an error chunk
+/// with a code the protocol allows, and only the last an error.
 ///
-/// `request_response` clones the codec for every outbound stream and calls `write_request`
-/// then `read_response` on that clone, so the clone carries the written request's chunk limit
-/// into the read.
+/// # Errors
+///
+/// `InvalidInput` for anything the protocol does not allow; nothing is written then.
+pub fn encode_response<E: EthSpec>(
+    protocol: Protocol,
+    chunks: &[ReceivedChunk<E>],
+) -> io::Result<Vec<u8>> {
+    let max = match protocol {
+        Protocol::GoodbyeV1 => 0,
+        Protocol::BlocksByRangeV2 => usize::MAX,
+        _ => 1,
+    };
+    if chunks.len() > max {
+        return Err(invalid_response(format!(
+            "{} chunks on {protocol}, at most {max}",
+            chunks.len()
+        )));
+    }
+    let mut out = Vec::new();
+    for (i, ReceivedChunk { context, chunk }) in chunks.iter().enumerate() {
+        let bytes = match chunk {
+            ResponseChunk::Success(response) => {
+                if response.protocol() != protocol {
+                    return Err(invalid_response(format!("{response:?} on {protocol}")));
+                }
+                if context.is_some() != protocol.has_context_bytes() {
+                    return Err(invalid_response(format!(
+                        "context bytes {context:?} on {protocol}"
+                    )));
+                }
+                encode_success_chunk(*context, &response.ssz_bytes())
+            }
+            ResponseChunk::Error { code, message } => {
+                if i + 1 != chunks.len() {
+                    return Err(invalid_response("an error chunk before the last".into()));
+                }
+                if context.is_some() {
+                    return Err(invalid_response("an error chunk with context bytes".into()));
+                }
+                if *code == ResultCode::ResourceUnavailable
+                    && !protocol.permits_resource_unavailable()
+                {
+                    return Err(invalid_response(format!(
+                        "{protocol} does not specify 3: ResourceUnavailable"
+                    )));
+                }
+                encode_error_chunk(*code, message)
+            }
+        };
+        out.extend(bytes.map_err(|e| invalid_response(e.to_string()))?);
+    }
+    Ok(out)
+}
+
+/// The req/resp codec of one stream.
+///
+/// `request_response` clones the codec for every stream. On an outbound stream it calls
+/// `write_request` then `read_response` on that clone, so the clone carries the written
+/// request's chunk limit into the read; on an inbound stream `read_request`, then
+/// `write_response` once the behaviour answered.
 #[derive(Debug)]
 pub struct RpcCodec<E: EthSpec> {
     contexts: Arc<ContextTable>,
     deadlines: Deadlines,
     expected_chunks: Option<u64>,
+    metrics: Option<RpcMetrics>,
     _spec: PhantomData<fn() -> E>,
 }
 
@@ -407,6 +566,7 @@ impl<E: EthSpec> Clone for RpcCodec<E> {
             contexts: Arc::clone(&self.contexts),
             deadlines: self.deadlines,
             expected_chunks: self.expected_chunks,
+            metrics: self.metrics.clone(),
             _spec: PhantomData,
         }
     }
@@ -419,21 +579,49 @@ impl<E: EthSpec> RpcCodec<E> {
             contexts,
             deadlines,
             expected_chunks: None,
+            metrics: None,
             _spec: PhantomData,
+        }
+    }
+
+    /// The codec, counting every deadline that passes in `rpc_timeouts_total{kind}`.
+    ///
+    /// The count is taken here because `request_response` reports nothing for an inbound
+    /// stream whose `read_request` failed: a silent inbound stream would go uncounted.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: RpcMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Counts `result`'s deadline, if one passed.
+    fn count<T>(&self, result: &Result<T, ReadError>) {
+        if let (Err(ReadError::Deadline(kind)), Some(metrics)) = (result, &self.metrics) {
+            metrics.timed_out(*kind);
         }
     }
 }
 
 impl<E: EthSpec> request_response::Codec for RpcCodec<E> {
     type Protocol = Protocol;
-    type Request = Request;
+    type Request = RpcRequest;
     type Response = Vec<ReceivedChunk<E>>;
 
-    async fn read_request<T>(&mut self, _: &Protocol, _: &mut T) -> io::Result<Request>
+    /// One request, under [`Deadlines`]. A passed deadline or a failed stream is an error (the
+    /// stream is dropped unanswered); a request that broke the wire format is
+    /// [`RpcRequest::Malformed`].
+    async fn read_request<T>(&mut self, protocol: &Protocol, io: &mut T) -> io::Result<RpcRequest>
     where
         T: AsyncRead + Unpin + Send,
     {
-        Err(unsupported())
+        let read = read_request_within(io, *protocol, self.deadlines).await;
+        self.count(&read);
+        // `decode_request` decodes the request type of `protocol` only.
+        match read {
+            Ok(request) => Ok(RpcRequest::Valid(request)),
+            Err(ReadError::Codec(e)) => Ok(RpcRequest::Malformed(e)),
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn read_response<T>(
@@ -449,7 +637,7 @@ impl<E: EthSpec> request_response::Codec for RpcCodec<E> {
             .take()
             .ok_or_else(|| io::Error::other("read_response before write_request"))?;
         let contexts = Arc::clone(&self.contexts);
-        Ok(read_response_within(
+        let read = read_response_within(
             io,
             *protocol,
             max_chunks,
@@ -457,18 +645,26 @@ impl<E: EthSpec> request_response::Codec for RpcCodec<E> {
             self.deadlines,
             MAX_RESPONSE_BYTES,
         )
-        .await?)
+        .await;
+        self.count(&read);
+        Ok(read?)
     }
 
     async fn write_request<T>(
         &mut self,
         protocol: &Protocol,
         io: &mut T,
-        req: Request,
+        req: RpcRequest,
     ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
+        let RpcRequest::Valid(req) = req else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a malformed request is never sent",
+            ));
+        };
         if req.protocol() != *protocol {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -485,14 +681,16 @@ impl<E: EthSpec> request_response::Codec for RpcCodec<E> {
 
     async fn write_response<T>(
         &mut self,
-        _: &Protocol,
-        _: &mut T,
-        _: Self::Response,
+        protocol: &Protocol,
+        io: &mut T,
+        chunks: Self::Response,
     ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        Err(unsupported())
+        let bytes = encode_response(*protocol, &chunks)?;
+        io.write_all(&bytes).await?;
+        io.flush().await
     }
 }
 
@@ -503,7 +701,7 @@ mod tests {
     use futures::io::Cursor;
     use libp2p::request_response::Codec as _;
     use p2p_wire::rpc::codec::{encode_error_chunk, encode_success_chunk, CodecError};
-    use p2p_wire::rpc::messages::{BlocksByRangeV2Request, Ping};
+    use p2p_wire::rpc::messages::{BlocksByRangeV2Request, Goodbye, Ping};
     use p2p_wire::rpc::protocols::{Response, ResultCode};
     use p2p_wire::testkit;
     use ssz::Encode;
@@ -541,7 +739,7 @@ mod tests {
         let protocol = request.protocol();
         let mut sink = Cursor::new(Vec::new());
         codec
-            .write_request(&protocol, &mut sink, request)
+            .write_request(&protocol, &mut sink, request.into())
             .await
             .unwrap();
         codec
@@ -776,7 +974,7 @@ mod tests {
         let mut sink = Cursor::new(Vec::new());
         let request = Request::Ping(Ping(3));
         codec
-            .write_request(&Protocol::PingV1, &mut sink, request.clone())
+            .write_request(&Protocol::PingV1, &mut sink, request.clone().into())
             .await
             .unwrap();
         let written = sink.into_inner();
@@ -787,7 +985,7 @@ mod tests {
 
         let mut sink = Cursor::new(Vec::new());
         let err = codec
-            .write_request(&Protocol::StatusV2, &mut sink, request)
+            .write_request(&Protocol::StatusV2, &mut sink, request.into())
             .await
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
@@ -799,7 +997,7 @@ mod tests {
         // MetaData writes nothing at all.
         let mut sink = Cursor::new(Vec::new());
         codec
-            .write_request(&Protocol::MetaDataV3, &mut sink, Request::MetaData)
+            .write_request(&Protocol::MetaDataV3, &mut sink, Request::MetaData.into())
             .await
             .unwrap();
         assert!(sink.into_inner().is_empty());
@@ -843,19 +1041,284 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Other);
     }
 
+    // --- the inbound half: read_request and write_response ---
+
+    /// `read_request` of `wire` on `protocol`, the stream ending after it.
+    async fn read_req(protocol: Protocol, wire: Vec<u8>) -> io::Result<RpcRequest> {
+        codec()
+            .read_request(&protocol, &mut Cursor::new(wire))
+            .await
+    }
+
+    fn malformed(got: io::Result<RpcRequest>) -> CodecError {
+        match got {
+            Ok(RpcRequest::Malformed(e)) => e,
+            other => panic!("not refused as malformed: {other:?}"),
+        }
+    }
+
     #[tokio::test]
-    async fn inbound_half_is_not_served() {
-        let mut codec = codec();
-        let err = codec
-            .read_request(&Protocol::PingV1, &mut Cursor::new(Vec::new()))
+    async fn read_request_decodes_every_request() {
+        let requests = [
+            Request::Status(testkit::status()),
+            Request::Ping(Ping(7)),
+            Request::Goodbye(Goodbye(2)),
+            Request::MetaData,
+            range(4),
+        ];
+        for request in requests {
+            let wire = p2p_wire::rpc::codec::encode_request(&request).unwrap();
+            let got = read_req(request.protocol(), wire).await.unwrap();
+            assert_eq!(got, RpcRequest::Valid(request));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_requests_are_answered_not_dropped() {
+        // A declared length over the type's: refused from the prefix.
+        let long = p2p_wire::rpc::codec::encode_chunk(&[0u8; 16]).unwrap();
+        assert!(matches!(
+            malformed(read_req(Protocol::PingV1, long).await),
+            CodecError::PayloadTooLarge { len: 16, max: 8 }
+        ));
+        // Bytes after the request.
+        let mut extra = p2p_wire::rpc::codec::encode_request(&Request::Ping(Ping(1))).unwrap();
+        extra.push(0);
+        assert_eq!(
+            malformed(read_req(Protocol::PingV1, extra).await),
+            CodecError::TrailingBytes(1)
+        );
+        // The stream ends inside the request, or before it.
+        let ping = p2p_wire::rpc::codec::encode_request(&Request::Ping(Ping(1))).unwrap();
+        let cut = ping[..ping.len() - 1].to_vec();
+        assert_eq!(
+            malformed(read_req(Protocol::PingV1, cut).await),
+            CodecError::Truncated
+        );
+        assert_eq!(
+            malformed(read_req(Protocol::StatusV2, Vec::new()).await),
+            CodecError::Truncated
+        );
+        // A MetaData request is empty.
+        assert_eq!(
+            malformed(read_req(Protocol::MetaDataV3, vec![0]).await),
+            CodecError::TrailingBytes(1)
+        );
+        // The right length, the wrong SSZ: a 7-byte Ping.
+        let short = p2p_wire::rpc::codec::encode_chunk(&[0u8; 7]).unwrap();
+        assert!(matches!(
+            malformed(read_req(Protocol::PingV1, short).await),
+            CodecError::Decode(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_request_refuses_a_malformed_request() {
+        let mut sink = Cursor::new(Vec::new());
+        let err = codec()
+            .write_request(
+                &Protocol::PingV1,
+                &mut sink,
+                RpcRequest::Malformed(CodecError::Truncated),
+            )
             .await
             .unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-        let err = codec
-            .write_response(&Protocol::PingV1, &mut Cursor::new(Vec::new()), Vec::new())
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(sink.into_inner().is_empty());
+    }
+
+    /// `read_request` of `request` on `io`, timed.
+    async fn timed_request(protocol: Protocol, mut io: Script) -> (io::Error, Duration) {
+        let start = Instant::now();
+        let err = codec().read_request(&protocol, &mut io).await.unwrap_err();
+        (err, start.elapsed())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_request_stream_hits_the_first_byte_deadline() {
+        for protocol in [Protocol::StatusV2, Protocol::MetaDataV3, Protocol::PingV1] {
+            let (err, elapsed) = timed_request(protocol, Script::new(vec![], true)).await;
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{protocol}");
+            assert!(matches!(
+                read_error(&err),
+                ReadError::Deadline(Deadline::Ttfb)
+            ));
+            assert_eq!(elapsed, Duration::from_secs(5), "{protocol}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_request_hits_the_per_chunk_deadline() {
+        // The first bytes at 1 s, then nothing: 5 s after the first byte.
+        let wire =
+            p2p_wire::rpc::codec::encode_request(&Request::Status(testkit::status())).unwrap();
+        let steps = vec![(Duration::from_secs(1), wire[..wire.len() / 2].to_vec())];
+        let (err, elapsed) = timed_request(Protocol::StatusV2, Script::new(steps, true)).await;
+        assert!(matches!(
+            read_error(&err),
+            ReadError::Deadline(Deadline::PerChunk)
+        ));
+        assert_eq!(elapsed, Duration::from_secs(6));
+        // The whole request, but the stream never ends: the end is waited for per chunk too.
+        let steps = vec![(Duration::ZERO, wire)];
+        let (err, elapsed) = timed_request(Protocol::StatusV2, Script::new(steps, true)).await;
+        assert!(matches!(
+            read_error(&err),
+            ReadError::Deadline(Deadline::PerChunk)
+        ));
+        assert_eq!(elapsed, Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_request_inside_the_deadlines_is_read() {
+        let wire = p2p_wire::rpc::codec::encode_request(&Request::Ping(Ping(4))).unwrap();
+        let (head, tail) = wire.split_at(2);
+        let steps = vec![
+            (Duration::from_secs(4), head.to_vec()),
+            (Duration::from_secs(4), tail.to_vec()),
+        ];
+        let got = codec()
+            .read_request(&Protocol::PingV1, &mut Script::new(steps, false))
             .await
-            .unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+            .unwrap();
+        assert_eq!(got, RpcRequest::Valid(Request::Ping(Ping(4))));
+    }
+
+    fn success(response: Response<E>) -> ReceivedChunk<E> {
+        ReceivedChunk {
+            context: None,
+            chunk: ResponseChunk::Success(response),
+        }
+    }
+
+    fn error(code: ResultCode, message: &[u8]) -> ReceivedChunk<E> {
+        ReceivedChunk {
+            context: None,
+            chunk: ResponseChunk::Error {
+                code,
+                message: message.to_vec().try_into().unwrap(),
+            },
+        }
+    }
+
+    async fn write_resp(protocol: Protocol, chunks: Vec<ReceivedChunk<E>>) -> io::Result<Vec<u8>> {
+        let mut sink = Cursor::new(Vec::new());
+        codec()
+            .write_response(&protocol, &mut sink, chunks)
+            .await
+            .map(|()| sink.into_inner())
+    }
+
+    #[tokio::test]
+    async fn write_response_round_trips_through_read_response() {
+        let cases: Vec<(Request, Vec<ReceivedChunk<E>>)> = vec![
+            (
+                Request::Status(testkit::status()),
+                vec![success(Response::Status(testkit::status()))],
+            ),
+            (
+                Request::MetaData,
+                vec![success(Response::MetaData(testkit::metadata()))],
+            ),
+            (
+                Request::Ping(Ping(1)),
+                vec![success(Response::Ping(Ping(9)))],
+            ),
+            (
+                Request::Ping(Ping(1)),
+                vec![error(ResultCode::InvalidRequest, b"bad")],
+            ),
+            (
+                range(2),
+                vec![
+                    ReceivedChunk {
+                        context: Some(testkit::FULU_DIGEST),
+                        chunk: ResponseChunk::Success(Response::Block(Box::new(
+                            forked::SignedBeaconBlock::Fulu(testkit::fulu_block(1)),
+                        ))),
+                    },
+                    error(ResultCode::ResourceUnavailable, b"pruned"),
+                ],
+            ),
+        ];
+        for (request, chunks) in cases {
+            let protocol = request.protocol();
+            let wire = write_resp(protocol, chunks.clone()).await.unwrap();
+            let mut codec = codec_after(request).await;
+            let back = codec
+                .read_response(&protocol, &mut Cursor::new(wire))
+                .await
+                .unwrap();
+            assert_eq!(back, chunks, "{protocol}");
+        }
+    }
+
+    #[tokio::test]
+    async fn write_response_refuses_what_the_protocol_does_not_allow() {
+        let refused = |r: io::Result<Vec<u8>>| match r {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}"),
+            Ok(bytes) => panic!("wrote {bytes:?}"),
+        };
+        // 3: ResourceUnavailable only where the protocol specifies it.
+        for protocol in [Protocol::StatusV2, Protocol::MetaDataV3, Protocol::PingV1] {
+            refused(write_resp(protocol, vec![error(ResultCode::ResourceUnavailable, b"")]).await);
+        }
+        // A response of another protocol.
+        refused(
+            write_resp(
+                Protocol::PingV1,
+                vec![success(Response::Status(testkit::status()))],
+            )
+            .await,
+        );
+        // Context bytes where the protocol has none, and none where it has them.
+        let mut ping = success(Response::Ping(Ping(1)));
+        ping.context = Some(testkit::FULU_DIGEST);
+        refused(write_resp(Protocol::PingV1, vec![ping]).await);
+        let block = success(Response::Block(Box::new(forked::SignedBeaconBlock::Fulu(
+            testkit::fulu_block(1),
+        ))));
+        refused(write_resp(Protocol::BlocksByRangeV2, vec![block]).await);
+        // An error chunk ends the response, and carries no context bytes.
+        let block = || ReceivedChunk {
+            context: Some(testkit::FULU_DIGEST),
+            chunk: ResponseChunk::Success(Response::Block(Box::new(
+                forked::SignedBeaconBlock::Fulu(testkit::fulu_block(1)),
+            ))),
+        };
+        let unavailable = error(ResultCode::ResourceUnavailable, b"");
+        refused(
+            write_resp(
+                Protocol::BlocksByRangeV2,
+                vec![unavailable.clone(), block()],
+            )
+            .await,
+        );
+        let mut with_context = unavailable;
+        with_context.context = Some(testkit::FULU_DIGEST);
+        refused(write_resp(Protocol::BlocksByRangeV2, vec![block(), with_context]).await);
+        // Goodbye has no response at all; an empty one writes nothing.
+        refused(
+            write_resp(
+                Protocol::GoodbyeV1,
+                vec![error(ResultCode::ServerError, b"")],
+            )
+            .await,
+        );
+        assert_eq!(
+            write_resp(Protocol::GoodbyeV1, Vec::new()).await.unwrap(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn goodbye_response_is_the_stream_ending() {
+        let mut codec = codec_after(Request::Goodbye(Goodbye(1))).await;
+        let got = codec
+            .read_response(&Protocol::GoodbyeV1, &mut Cursor::new(Vec::new()))
+            .await
+            .unwrap();
+        assert!(got.is_empty());
     }
 
     async fn timed_read(request: Request, mut io: Script) -> (io::Error, Duration) {
@@ -875,6 +1338,37 @@ mod tests {
             ReadError::Deadline(Deadline::Ttfb)
         ));
         assert_eq!(elapsed, Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadlines_are_counted_by_kind() {
+        let metrics = RpcMetrics::register(&mut prometheus_client::registry::Registry::default());
+        let mut codec = codec_after(Request::Ping(Ping(1)))
+            .await
+            .with_metrics(metrics.clone());
+        let err = codec
+            .read_response(&Protocol::PingV1, &mut Script::new(vec![], true))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let mut inbound = codec.clone();
+        inbound
+            .read_request(&Protocol::PingV1, &mut Script::new(vec![], true))
+            .await
+            .unwrap_err();
+        assert_eq!(metrics.timeouts(Deadline::Ttfb), 2);
+        // A refused response is not a timeout.
+        let mut codec = codec_after(Request::Ping(Ping(1)))
+            .await
+            .with_metrics(metrics.clone());
+        codec
+            .read_response(&Protocol::PingV1, &mut Cursor::new(vec![4, 0]))
+            .await
+            .unwrap_err();
+        for kind in [Deadline::Ttfb, Deadline::PerChunk, Deadline::Total] {
+            let want = u64::from(kind == Deadline::Ttfb) * 2;
+            assert_eq!(metrics.timeouts(kind), want, "{kind:?}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

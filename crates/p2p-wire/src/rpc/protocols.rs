@@ -3,10 +3,12 @@
 //! Protocol IDs follow `phase0/p2p-interface.md` "Protocol identification":
 //! `/eth2/beacon_chain/req/<message_name>/<version>/<encoding>`, always `ssz_snappy`. Only
 //! `BeaconBlocksByRange` v2 carries context bytes (`altair/p2p-interface.md`, the fork digest of
-//! the block's fork); the other three responses have one shape in every fork.
+//! the block's fork); the other responses have one shape in every fork. `Goodbye` has a request
+//! and no response: the disconnecting peer writes its reason and closes the stream.
 
 use crate::rpc::messages::{
-    BlocksByRangeV2Request, ErrorMessage, MetaDataV3, Ping, StatusV2, MAX_ERROR_MESSAGE_LEN,
+    BlocksByRangeV2Request, ErrorMessage, Goodbye, MetaDataV3, Ping, StatusV2,
+    MAX_ERROR_MESSAGE_LEN,
 };
 use consensus_types::caps::{self, ObjectKind};
 use consensus_types::{forked, EthSpec, ForkName};
@@ -28,15 +30,18 @@ pub enum Protocol {
     PingV1,
     /// `/eth2/beacon_chain/req/beacon_blocks_by_range/2/ssz_snappy`.
     BlocksByRangeV2,
+    /// `/eth2/beacon_chain/req/goodbye/1/ssz_snappy`.
+    GoodbyeV1,
 }
 
 impl Protocol {
     /// Every protocol.
-    pub const ALL: [Protocol; 4] = [
+    pub const ALL: [Protocol; 5] = [
         Protocol::StatusV2,
         Protocol::MetaDataV3,
         Protocol::PingV1,
         Protocol::BlocksByRangeV2,
+        Protocol::GoodbyeV1,
     ];
 
     /// The multistream protocol ID.
@@ -48,6 +53,7 @@ impl Protocol {
             Protocol::BlocksByRangeV2 => {
                 "/eth2/beacon_chain/req/beacon_blocks_by_range/2/ssz_snappy"
             }
+            Protocol::GoodbyeV1 => "/eth2/beacon_chain/req/goodbye/1/ssz_snappy",
         }
     }
 
@@ -57,9 +63,17 @@ impl Protocol {
     }
 
     /// Whether the response is exactly one chunk (every protocol but `BeaconBlocksByRange`,
-    /// whose response may hold anything from no blocks to `count`).
+    /// whose response may hold anything from no blocks to `count`, and `Goodbye`, which has
+    /// none).
     pub const fn single_response(self) -> bool {
-        !matches!(self, Protocol::BlocksByRangeV2)
+        !matches!(self, Protocol::BlocksByRangeV2 | Protocol::GoodbyeV1)
+    }
+
+    /// Whether a responder may answer `3: ResourceUnavailable` (`phase0/p2p-interface.md` L1291:
+    /// "only valid as a response where specified"). Of these protocols only
+    /// `BeaconBlocksByRange` specifies it (L1540, for blocks the responder does not have).
+    pub const fn permits_resource_unavailable(self) -> bool {
+        matches!(self, Protocol::BlocksByRangeV2)
     }
 
     /// The SSZ length of the request body, or `None` for a protocol whose request is empty
@@ -72,12 +86,13 @@ impl Protocol {
             Protocol::BlocksByRangeV2 => {
                 Some(<BlocksByRangeV2Request as ssz::Decode>::ssz_fixed_len())
             }
+            Protocol::GoodbyeV1 => Some(<Goodbye as ssz::Decode>::ssz_fixed_len()),
         }
     }
 
     /// The largest success payload: the type bound, capped at `MAX_PAYLOAD_SIZE`. A block's
     /// bound depends on its fork, so a protocol with context bytes needs `fork`; `None` there
-    /// means the context was not read.
+    /// means the context was not read. `Goodbye` has no response, so `None`.
     pub fn response_max_len<E: EthSpec>(self, fork: Option<ForkName>) -> Option<usize> {
         match self {
             Protocol::StatusV2 => Some(<StatusV2 as ssz::Decode>::ssz_fixed_len()),
@@ -86,6 +101,7 @@ impl Protocol {
             Protocol::BlocksByRangeV2 => {
                 fork.and_then(|f| caps::max_size::<E>(ObjectKind::SignedBeaconBlock, f))
             }
+            Protocol::GoodbyeV1 => None,
         }
     }
 
@@ -118,6 +134,8 @@ pub enum Request {
     Ping(Ping),
     /// `BeaconBlocksByRange` v2.
     BlocksByRange(BlocksByRangeV2Request),
+    /// `Goodbye`: the reason the sender is disconnecting.
+    Goodbye(Goodbye),
 }
 
 impl Request {
@@ -128,14 +146,17 @@ impl Request {
             Request::MetaData => Protocol::MetaDataV3,
             Request::Ping(_) => Protocol::PingV1,
             Request::BlocksByRange(_) => Protocol::BlocksByRangeV2,
+            Request::Goodbye(_) => Protocol::GoodbyeV1,
         }
     }
 
     /// The most response chunks the peer may send: 1 for the single-response protocols, the
-    /// request's `count` (at most [`MAX_REQUEST_BLOCKS_DENEB`]) for `BeaconBlocksByRange`.
+    /// request's `count` (at most [`MAX_REQUEST_BLOCKS_DENEB`]) for `BeaconBlocksByRange`, 0
+    /// for `Goodbye`.
     pub fn max_response_chunks(&self) -> u64 {
         match self {
             Request::BlocksByRange(r) => r.count.min(MAX_REQUEST_BLOCKS_DENEB),
+            Request::Goodbye(_) => 0,
             _ => 1,
         }
     }
@@ -147,6 +168,7 @@ impl Request {
             Request::MetaData => None,
             Request::Ping(p) => Some(p.as_ssz_bytes()),
             Request::BlocksByRange(r) => Some(r.as_ssz_bytes()),
+            Request::Goodbye(g) => Some(g.as_ssz_bytes()),
         }
     }
 }
@@ -166,6 +188,28 @@ pub enum Response<E: EthSpec> {
     /// One block of a `BeaconBlocksByRange` response, in the fork its context bytes named.
     /// Boxed: a block is far larger than the other responses.
     Block(Box<forked::SignedBeaconBlock<E>>),
+}
+
+impl<E: EthSpec> Response<E> {
+    /// The protocol this is the response of.
+    pub fn protocol(&self) -> Protocol {
+        match self {
+            Response::Status(_) => Protocol::StatusV2,
+            Response::MetaData(_) => Protocol::MetaDataV3,
+            Response::Ping(_) => Protocol::PingV1,
+            Response::Block(_) => Protocol::BlocksByRangeV2,
+        }
+    }
+
+    /// The SSZ payload of the success chunk.
+    pub fn ssz_bytes(&self) -> Vec<u8> {
+        match self {
+            Response::Status(s) => s.as_ssz_bytes(),
+            Response::MetaData(m) => m.as_ssz_bytes(),
+            Response::Ping(p) => p.as_ssz_bytes(),
+            Response::Block(b) => b.as_ssz_bytes(),
+        }
+    }
 }
 
 /// The result code of a response chunk (`phase0/p2p-interface.md` "Responding side").
@@ -200,6 +244,7 @@ pub enum ResponseChunk<E: EthSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc::messages::Goodbye;
     use consensus_types::Minimal;
 
     #[test]
@@ -212,6 +257,7 @@ mod tests {
                 "/eth2/beacon_chain/req/metadata/3/ssz_snappy",
                 "/eth2/beacon_chain/req/ping/1/ssz_snappy",
                 "/eth2/beacon_chain/req/beacon_blocks_by_range/2/ssz_snappy",
+                "/eth2/beacon_chain/req/goodbye/1/ssz_snappy",
             ]
         );
         assert_eq!(Protocol::PingV1.as_ref(), Protocol::PingV1.to_string());
@@ -221,7 +267,27 @@ mod tests {
     fn only_blocks_by_range_has_context_bytes() {
         for p in Protocol::ALL {
             assert_eq!(p.has_context_bytes(), p == Protocol::BlocksByRangeV2, "{p}");
-            assert_eq!(p.single_response(), p != Protocol::BlocksByRangeV2, "{p}");
+            let single = !matches!(p, Protocol::BlocksByRangeV2 | Protocol::GoodbyeV1);
+            assert_eq!(p.single_response(), single, "{p}");
+        }
+    }
+
+    #[test]
+    fn goodbye_has_no_response() {
+        let p = Protocol::GoodbyeV1;
+        assert_eq!(p.request_len(), Some(8));
+        assert_eq!(p.response_max_len::<Minimal>(None), None);
+        let request = Request::Goodbye(Goodbye(2));
+        assert_eq!(request.protocol(), p);
+        assert_eq!(request.max_response_chunks(), 0);
+        assert_eq!(request.ssz_body(), Some(2u64.to_le_bytes().to_vec()));
+    }
+
+    #[test]
+    fn only_blocks_by_range_permits_resource_unavailable() {
+        for p in Protocol::ALL {
+            let permits = p == Protocol::BlocksByRangeV2;
+            assert_eq!(p.permits_resource_unavailable(), permits, "{p}");
         }
     }
 
@@ -268,5 +334,24 @@ mod tests {
         assert_eq!(Request::Ping(Ping(1)).max_response_chunks(), 1);
         assert_eq!(Request::MetaData.ssz_body(), None);
         assert_eq!(Request::MetaData.protocol(), Protocol::MetaDataV3);
+    }
+
+    #[test]
+    fn responses_name_their_protocol_and_payload() {
+        use crate::testkit;
+        let status: Response<Minimal> = Response::Status(testkit::status());
+        assert_eq!(status.protocol(), Protocol::StatusV2);
+        assert_eq!(status.ssz_bytes(), testkit::status().as_ssz_bytes());
+        let metadata: Response<Minimal> = Response::MetaData(testkit::metadata());
+        assert_eq!(metadata.protocol(), Protocol::MetaDataV3);
+        assert_eq!(metadata.ssz_bytes().len(), 25);
+        let ping: Response<Minimal> = Response::Ping(Ping(3));
+        assert_eq!(ping.protocol(), Protocol::PingV1);
+        assert_eq!(ping.ssz_bytes(), 3u64.to_le_bytes());
+        let block = forked::SignedBeaconBlock::Fulu(testkit::fulu_block::<Minimal>(1));
+        let ssz = block.as_ssz_bytes();
+        let block = Response::Block(Box::new(block));
+        assert_eq!(block.protocol(), Protocol::BlocksByRangeV2);
+        assert_eq!(block.ssz_bytes(), ssz);
     }
 }

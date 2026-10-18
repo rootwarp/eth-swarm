@@ -4,6 +4,12 @@
 //! discipline, `seq`, envelope type and digest checks) and then answers `UNIMPLEMENTED`, so the
 //! service already holds its peers to the wire contract. `tests/contract.rs` runs the contract
 //! suite against it, in process and over a Unix socket.
+//!
+//! [`probe`] is probe mode's Status (`ReqRespService/GetStatus`): the wall-clock fork digest and
+//! the reference Beacon API's finalized checkpoint, with the last good value kept through an
+//! outage.
+
+pub mod probe;
 
 use ethswarm_proto::chain as pb;
 use ipc::Link;

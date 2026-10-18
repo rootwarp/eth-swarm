@@ -1,9 +1,10 @@
-//! The probe swarm's [`NetworkBehaviour`]: connection limits, identify, and the slots the
-//! req/resp and gossipsub behaviours will fill.
+//! The probe swarm's [`NetworkBehaviour`]: connection limits, identify, the req/resp control
+//! protocols ([`crate::rpc::inbound::Control`]), and the slot the gossipsub behaviour will fill.
 //!
 //! Field order is the order the swarm consults the behaviours, so [`Behaviour::limits`] comes
 //! first: a connection it denies is never handed to the others.
 
+use crate::rpc::inbound::Control;
 use libp2p::identity::PublicKey;
 use libp2p::swarm::{dummy, NetworkBehaviour};
 use libp2p::{connection_limits, identify};
@@ -42,8 +43,12 @@ impl Default for ConnectionCaps {
     }
 }
 
-/// The req/resp slot. A placeholder until the req/resp behaviour takes it.
-pub type ReqRespSlot = dummy::Behaviour;
+/// The preset the probe decodes with: every network it joins (Sepolia, Hoodi) is mainnet.
+pub type ProbeSpec = consensus_types::Mainnet;
+
+/// The req/resp slot: Status, MetaData, Ping, Goodbye (and BlocksByRange, answered
+/// `3: ResourceUnavailable`).
+pub type ReqRespSlot = Control<ProbeSpec>;
 
 /// The gossipsub slot. A placeholder until the gossipsub behaviour takes it.
 pub type GossipsubSlot = dummy::Behaviour;
@@ -61,15 +66,20 @@ pub struct Behaviour {
 
 impl Behaviour {
     /// The behaviour for the node whose public key is `local`, announcing `agent_version`,
-    /// under the default [`ConnectionCaps`].
+    /// under the default [`ConnectionCaps`], with `req_resp` answering the req/resp protocols.
     #[must_use]
-    pub fn new(local: PublicKey, agent_version: String) -> Self {
-        Self::with_caps(local, agent_version, ConnectionCaps::default())
+    pub fn new(local: PublicKey, agent_version: String, req_resp: ReqRespSlot) -> Self {
+        Self::with_caps(local, agent_version, ConnectionCaps::default(), req_resp)
     }
 
     /// [`Behaviour::new`] under `caps`.
     #[must_use]
-    pub fn with_caps(local: PublicKey, agent_version: String, caps: ConnectionCaps) -> Self {
+    pub fn with_caps(
+        local: PublicKey,
+        agent_version: String,
+        caps: ConnectionCaps,
+        req_resp: ReqRespSlot,
+    ) -> Self {
         let limits = connection_limits::ConnectionLimits::default()
             .with_max_established_per_peer(Some(MAX_ESTABLISHED_PER_PEER))
             .with_max_pending_incoming_per_source(Some(caps.max_pending_incoming_per_source))
@@ -82,7 +92,7 @@ impl Behaviour {
         Self {
             limits: connection_limits::Behaviour::new(limits),
             identify: identify::Behaviour::new(identify),
-            req_resp: dummy::Behaviour,
+            req_resp,
             gossipsub: dummy::Behaviour,
         }
     }
@@ -123,7 +133,11 @@ mod tests {
     fn new_builds_an_idle_behaviour() {
         use libp2p::swarm::NetworkBehaviour as _;
         let local = libp2p::identity::Keypair::generate_secp256k1().public();
-        let mut behaviour = Behaviour::new(local, "ethswarm/test".to_owned());
+        let (req_resp, _) = crate::testkit::control(
+            &mut prometheus_client::registry::Registry::default(),
+            crate::testkit::control_config(None),
+        );
+        let mut behaviour = Behaviour::new(local, "ethswarm/test".to_owned(), req_resp);
         // Identify starts with nothing to report: no connection, no cached address to dial.
         let waker = futures::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);

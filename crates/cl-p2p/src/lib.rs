@@ -5,10 +5,12 @@
 //! service already holds its peers to the wire contract. `tests/contract.rs` runs the contract
 //! suite against it, in process and over a Unix socket.
 //!
-//! [`rpc`] is the outbound req/resp codec over libp2p `request_response`, [`m2a_session`]
-//! the pinned-peer session the `m2a-session` binary runs, and [`transport`] the TCP muxers
-//! (yamux first, then mplex under its stream, buffer and per-connection caps) and the probe
-//! swarm over them ([`transport::build_swarm`], with [`behaviour`]).
+//! [`rpc`] is req/resp over libp2p `request_response`: the codec (both halves, deadlines
+//! inside) and the probe's control protocols ([`rpc::inbound::Control`]: Status, MetaData,
+//! Ping, Goodbye). [`m2a_session`] is the pinned-peer session the `m2a-session` binary runs,
+//! and [`transport`] the TCP muxers (yamux first, then mplex under its stream, buffer and
+//! per-connection caps) and the probe swarm over them ([`transport::build_swarm`], with
+//! [`behaviour`]).
 
 pub mod behaviour;
 pub mod m2a_session;

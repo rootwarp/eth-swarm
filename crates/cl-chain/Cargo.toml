@@ -11,6 +11,13 @@ description = "cl-chain: the ethswarm.chain.v1 service (stub: contract layer onl
 ethswarm-proto = { path = "../ethswarm-proto" }
 ipc = { path = "../ipc" }
 tonic.workspace = true
+# Probe mode's Status: compute_fork_digest at the wall-clock epoch of the pinned config.
+network-config = { path = "../network-config" }
+# The reference API's bounded timeout; the versions already in the tree through tonic.
+tokio = { version = "1", features = ["time"] }
+thiserror = "2"
+tracing = "0.1"
 
 [dev-dependencies]
 ipc = { path = "../ipc", features = ["testkit"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }

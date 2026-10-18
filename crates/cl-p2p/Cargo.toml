@@ -11,7 +11,7 @@ build = "build.rs"
 
 [features]
 # Fixtures for this crate's tests: a loopback libp2p peer that answers Status v2.
-testkit = []
+testkit = ["p2p-wire/testkit"]
 
 [dependencies]
 ethswarm-proto = { path = "../ethswarm-proto" }

@@ -11,7 +11,7 @@
 //! connection. [`LogNegotiated`] logs the muxer each connection negotiated.
 
 use super::{muxers, with_negotiating_inbound_streams, MuxerBudget, MPLEX_MAX_STREAMS};
-use crate::behaviour::{Behaviour, ConnectionCaps};
+use crate::behaviour::{Behaviour, ConnectionCaps, ReqRespSlot};
 use libp2p::core::transport::TransportError;
 use libp2p::core::upgrade::{
     InboundConnectionUpgrade, NegotiationError, OutboundConnectionUpgrade, UpgradeInfo,
@@ -103,8 +103,8 @@ pub enum BuildError {
 }
 
 /// The probe swarm for the node key `keypair`: TCP (no Nagle), Noise XX, then yamux or mplex
-/// ([`muxers`], yamux first, mplex under `cfg.budget`), [`Behaviour`], listening on every
-/// `cfg.listen_addrs` address.
+/// ([`muxers`], yamux first, mplex under `cfg.budget`), [`Behaviour`] with `req_resp` in its
+/// req/resp slot, listening on every `cfg.listen_addrs` address.
 ///
 /// Must be called within a tokio runtime, which the listeners register with.
 ///
@@ -112,7 +112,11 @@ pub enum BuildError {
 ///
 /// [`BuildError::Noise`] if Noise refuses the key, [`BuildError::Listen`] if an address cannot
 /// be listened on.
-pub fn build_swarm(keypair: Keypair, cfg: &SwarmConfig) -> Result<Swarm<Behaviour>, BuildError> {
+pub fn build_swarm(
+    keypair: Keypair,
+    cfg: &SwarmConfig,
+    req_resp: ReqRespSlot,
+) -> Result<Swarm<Behaviour>, BuildError> {
     let (yamux, mplex) = muxers(cfg.budget.clone());
     let Ok(builder) = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -125,7 +129,7 @@ pub fn build_swarm(keypair: Keypair, cfg: &SwarmConfig) -> Result<Swarm<Behaviou
             ),
         )?
         .with_behaviour(|key| {
-            Behaviour::with_caps(key.public(), cfg.agent_version.clone(), cfg.caps)
+            Behaviour::with_caps(key.public(), cfg.agent_version.clone(), cfg.caps, req_resp)
         });
     let mut swarm = builder
         .with_swarm_config(|c| {

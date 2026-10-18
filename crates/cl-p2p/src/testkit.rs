@@ -1,5 +1,6 @@
-//! Test fixtures (feature `testkit`): a loopback libp2p peer that answers Status v2 and, if
-//! asked to, MetaData v3, Ping v1 and BeaconBlocksByRange v2.
+//! Test fixtures (feature `testkit`): the probe's req/resp behaviour over fixed sources
+//! ([`control`]), and a loopback libp2p peer that answers Status v2 and, if asked to, MetaData
+//! v3, Ping v1 and BeaconBlocksByRange v2.
 //!
 //! [`StatusPeer`] listens on an ephemeral 127.0.0.1 TCP port with TCP + Noise + yamux, serves
 //! `/eth2/beacon_chain/req/status/2/ssz_snappy` (inbound), given a [`MetaDataResponder`]
@@ -8,7 +9,11 @@
 //! `/eth2/beacon_chain/req/beacon_blocks_by_range/2/ssz_snappy`, and answers each request with
 //! whatever its responder returns. Nothing here leaves the host.
 
+use crate::behaviour::ReqRespSlot;
 use crate::m2a_session::PinnedPeer;
+use crate::rpc::codec::Deadlines;
+use crate::rpc::inbound::{ControlConfig, SharedStatus};
+use crate::rpc::metrics::RpcMetrics;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
 use libp2p::identity::Keypair;
 use libp2p::request_response::{self, ProtocolSupport};
@@ -17,10 +22,32 @@ use libp2p::{noise, tcp, yamux, Multiaddr, PeerId, SwarmBuilder};
 use p2p_wire::rpc::codec::{decode_request, encode_error_chunk, encode_success_chunk};
 use p2p_wire::rpc::messages::{BlocksByRangeV2Request, ForkDigest, MetaDataV3, Ping, StatusV2};
 use p2p_wire::rpc::protocols::{Protocol, Request, ResultCode};
+use prometheus_client::registry::Registry;
 use std::io;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// The custody group count [`control`] advertises.
+pub const FIXTURE_CGC: u64 = 4;
+
+/// A config with Status `status` (and `seq_number` 1), its context bytes from
+/// `p2p_wire::testkit::context_table`.
+pub fn control_config(status: Option<StatusV2>) -> ControlConfig {
+    ControlConfig {
+        status: Arc::new(SharedStatus::new(status)),
+        metadata: Arc::new(AtomicU64::new(1)),
+        custody_group_count: FIXTURE_CGC,
+        contexts: Arc::new(p2p_wire::testkit::context_table()),
+        deadlines: Deadlines::default(),
+    }
+}
+
+/// The probe's req/resp behaviour answering with `cfg`, its metrics registered in `registry`.
+pub fn control(registry: &mut Registry, cfg: ControlConfig) -> (ReqRespSlot, RpcMetrics) {
+    let metrics = RpcMetrics::register(registry);
+    (ReqRespSlot::new(cfg, metrics.clone()), metrics)
+}
 
 /// What the peer answers one Status request with.
 #[derive(Debug, Clone, PartialEq, Eq)]

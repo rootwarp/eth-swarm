@@ -1,0 +1,352 @@
+//! The req/resp metrics, on the service's prometheus-client [`Registry`] (the one the swarm's
+//! [`PeerMetrics`](crate::transport::PeerMetrics) is on).
+//!
+//! - `rpc_timeouts_total{kind}`: exchanges that failed on a deadline, inbound or outbound:
+//!   `ttfb` (first byte), `per_chunk`, `total` (the codec's or `request_response`'s own).
+//! - `rpc_invalid_data_total{direction}`: requests (`inbound`) or responses (`outbound`) that
+//!   broke the wire format or the request's limits. A timeout is never counted here.
+//! - `p2p_goodbye_sent_total{reason, status_valid}` and `p2p_goodbye_received_total{reason,
+//!   status_valid}`: Goodbye messages by reason code and by whether the peer's Status was valid
+//!   (`true`, `false`, or `unknown` before a Status was judged).
+//! - `p2p_status_valid_peers`: connected peers whose last Status passed the relevance check.
+//!
+//! The `reason` label is the decimal code for 0 to 255 (1–3 and the client-specific codes from
+//! 128 that clients use) and `other` above, so a peer cannot grow the label set past 257 values.
+
+use super::codec::Deadline;
+use crate::transport::Direction;
+use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder};
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::registry::Registry;
+use std::fmt::Write as _;
+
+/// The highest reason code that keeps its own `reason` label value.
+pub const MAX_REASON_LABEL: u64 = 255;
+
+impl Deadline {
+    /// Every deadline.
+    pub const ALL: [Self; 3] = [Self::Ttfb, Self::PerChunk, Self::Total];
+
+    /// The `kind` label value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ttfb => "ttfb",
+            Self::PerChunk => "per_chunk",
+            Self::Total => "total",
+        }
+    }
+}
+
+impl EncodeLabelValue for Deadline {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> std::fmt::Result {
+        encoder.write_str(self.as_str())
+    }
+}
+
+/// Whether a peer's Status passed the relevance check: the `status_valid` label.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum StatusValidity {
+    /// It passed.
+    Valid,
+    /// It failed (another fork digest, a conflicting finalized checkpoint).
+    Invalid,
+    /// No Status of the peer was judged yet.
+    Unknown,
+}
+
+impl StatusValidity {
+    pub const ALL: [Self; 3] = [Self::Valid, Self::Invalid, Self::Unknown];
+
+    /// The `status_valid` label value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Valid => "true",
+            Self::Invalid => "false",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl From<Option<bool>> for StatusValidity {
+    fn from(valid: Option<bool>) -> Self {
+        match valid {
+            Some(true) => Self::Valid,
+            Some(false) => Self::Invalid,
+            None => Self::Unknown,
+        }
+    }
+}
+
+impl EncodeLabelValue for StatusValidity {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> std::fmt::Result {
+        encoder.write_str(self.as_str())
+    }
+}
+
+/// A Goodbye reason as a label value: the code up to [`MAX_REASON_LABEL`], `other` above.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct ReasonLabel(Option<u8>);
+
+impl ReasonLabel {
+    /// The label of reason code `reason`.
+    #[must_use]
+    pub fn of(reason: u64) -> Self {
+        Self(u8::try_from(reason).ok())
+    }
+}
+
+impl EncodeLabelValue for ReasonLabel {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> std::fmt::Result {
+        match self.0 {
+            Some(code) => write!(encoder, "{code}"),
+            None => encoder.write_str("other"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct KindLabel {
+    kind: Deadline,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct DirectionLabel {
+    direction: Direction,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct GoodbyeLabels {
+    reason: ReasonLabel,
+    status_valid: StatusValidity,
+}
+
+/// The req/resp metrics (see the module docs).
+#[derive(Clone, Debug)]
+pub struct RpcMetrics {
+    timeouts: Family<KindLabel, Counter>,
+    invalid_data: Family<DirectionLabel, Counter>,
+    goodbye_sent: Family<GoodbyeLabels, Counter>,
+    goodbye_received: Family<GoodbyeLabels, Counter>,
+    status_valid_peers: Gauge,
+}
+
+impl RpcMetrics {
+    /// Creates every metric, the fixed label values at 0 (for Goodbye, the three spec reasons),
+    /// and registers them in `registry`.
+    pub fn register(registry: &mut Registry) -> Self {
+        let metrics = Self {
+            timeouts: Family::default(),
+            invalid_data: Family::default(),
+            goodbye_sent: Family::default(),
+            goodbye_received: Family::default(),
+            status_valid_peers: Gauge::default(),
+        };
+        for kind in Deadline::ALL {
+            drop(metrics.timeouts.get_or_create(&KindLabel { kind }));
+        }
+        for direction in Direction::ALL {
+            drop(
+                metrics
+                    .invalid_data
+                    .get_or_create(&DirectionLabel { direction }),
+            );
+        }
+        for reason in 1..=3 {
+            for status_valid in StatusValidity::ALL {
+                let labels = GoodbyeLabels {
+                    reason: ReasonLabel::of(reason),
+                    status_valid,
+                };
+                drop(metrics.goodbye_sent.get_or_create(&labels));
+                drop(metrics.goodbye_received.get_or_create(&labels));
+            }
+        }
+        registry.register(
+            "rpc_timeouts",
+            "Req/resp exchanges that failed on a deadline, by deadline",
+            metrics.timeouts.clone(),
+        );
+        registry.register(
+            "rpc_invalid_data",
+            "Req/resp requests (inbound) or responses (outbound) that broke the wire format",
+            metrics.invalid_data.clone(),
+        );
+        registry.register(
+            "p2p_goodbye_sent",
+            "Goodbye messages sent, by reason and the peer's Status validity",
+            metrics.goodbye_sent.clone(),
+        );
+        registry.register(
+            "p2p_goodbye_received",
+            "Goodbye messages received, by reason and the peer's Status validity",
+            metrics.goodbye_received.clone(),
+        );
+        registry.register(
+            "p2p_status_valid_peers",
+            "Connected peers whose Status passed the relevance check",
+            metrics.status_valid_peers.clone(),
+        );
+        metrics
+    }
+
+    /// Counts an exchange that failed on `kind`.
+    pub fn timed_out(&self, kind: Deadline) {
+        self.timeouts.get_or_create(&KindLabel { kind }).inc();
+    }
+
+    /// Counts a request (`Inbound`) or response (`Outbound`) that broke the wire format.
+    pub fn invalid_data(&self, direction: Direction) {
+        self.invalid_data
+            .get_or_create(&DirectionLabel { direction })
+            .inc();
+    }
+
+    /// Counts a Goodbye sent.
+    pub fn goodbye_sent(&self, reason: u64, status_valid: StatusValidity) {
+        let labels = GoodbyeLabels {
+            reason: ReasonLabel::of(reason),
+            status_valid,
+        };
+        self.goodbye_sent.get_or_create(&labels).inc();
+    }
+
+    /// Counts a Goodbye received.
+    pub fn goodbye_received(&self, reason: u64, status_valid: StatusValidity) {
+        let labels = GoodbyeLabels {
+            reason: ReasonLabel::of(reason),
+            status_valid,
+        };
+        self.goodbye_received.get_or_create(&labels).inc();
+    }
+
+    /// A peer's Status became valid (`true`) or stopped being valid.
+    pub(crate) fn status_valid_peer(&self, valid: bool) {
+        if valid {
+            self.status_valid_peers.inc();
+        } else {
+            self.status_valid_peers.dec();
+        }
+    }
+
+    /// The current `rpc_timeouts_total{kind}`.
+    #[must_use]
+    pub fn timeouts(&self, kind: Deadline) -> u64 {
+        self.timeouts.get_or_create(&KindLabel { kind }).get()
+    }
+
+    /// The current `rpc_invalid_data_total{direction}`.
+    #[must_use]
+    pub fn invalid_data_count(&self, direction: Direction) -> u64 {
+        self.invalid_data
+            .get_or_create(&DirectionLabel { direction })
+            .get()
+    }
+
+    /// The current `p2p_goodbye_sent_total{reason, status_valid}`.
+    #[must_use]
+    pub fn goodbye_sent_count(&self, reason: u64, status_valid: StatusValidity) -> u64 {
+        let labels = GoodbyeLabels {
+            reason: ReasonLabel::of(reason),
+            status_valid,
+        };
+        self.goodbye_sent.get_or_create(&labels).get()
+    }
+
+    /// The current `p2p_goodbye_received_total{reason, status_valid}`.
+    #[must_use]
+    pub fn goodbye_received_count(&self, reason: u64, status_valid: StatusValidity) -> u64 {
+        let labels = GoodbyeLabels {
+            reason: ReasonLabel::of(reason),
+            status_valid,
+        };
+        self.goodbye_received.get_or_create(&labels).get()
+    }
+
+    /// The current `p2p_status_valid_peers`.
+    #[must_use]
+    pub fn status_valid_peers(&self) -> i64 {
+        self.status_valid_peers.get()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prometheus_client::encoding::text::encode;
+
+    fn text(registry: &Registry) -> String {
+        let mut out = String::new();
+        encode(&mut out, registry).unwrap();
+        out
+    }
+
+    #[test]
+    fn every_fixed_label_starts_at_zero() {
+        let mut registry = Registry::default();
+        let _metrics = RpcMetrics::register(&mut registry);
+        let text = text(&registry);
+        for line in [
+            "rpc_timeouts_total{kind=\"ttfb\"} 0",
+            "rpc_timeouts_total{kind=\"per_chunk\"} 0",
+            "rpc_timeouts_total{kind=\"total\"} 0",
+            "rpc_invalid_data_total{direction=\"inbound\"} 0",
+            "rpc_invalid_data_total{direction=\"outbound\"} 0",
+            "p2p_goodbye_sent_total{reason=\"2\",status_valid=\"true\"} 0",
+            "p2p_goodbye_received_total{reason=\"3\",status_valid=\"unknown\"} 0",
+            "p2p_status_valid_peers 0",
+        ] {
+            assert!(text.contains(line), "{line} missing from\n{text}");
+        }
+    }
+
+    #[test]
+    fn counters_count_by_label() {
+        let mut registry = Registry::default();
+        let metrics = RpcMetrics::register(&mut registry);
+        metrics.timed_out(Deadline::Ttfb);
+        metrics.invalid_data(Direction::Outbound);
+        metrics.goodbye_sent(2, StatusValidity::Invalid);
+        metrics.goodbye_received(129, StatusValidity::Valid);
+        metrics.goodbye_received(1 << 40, StatusValidity::Unknown);
+        metrics.status_valid_peer(true);
+        metrics.status_valid_peer(true);
+        metrics.status_valid_peer(false);
+        assert_eq!(metrics.timeouts(Deadline::Ttfb), 1);
+        assert_eq!(metrics.timeouts(Deadline::Total), 0);
+        assert_eq!(metrics.invalid_data_count(Direction::Outbound), 1);
+        assert_eq!(metrics.invalid_data_count(Direction::Inbound), 0);
+        assert_eq!(metrics.goodbye_sent_count(2, StatusValidity::Invalid), 1);
+        assert_eq!(metrics.goodbye_sent_count(2, StatusValidity::Valid), 0);
+        assert_eq!(
+            metrics.goodbye_received_count(129, StatusValidity::Valid),
+            1
+        );
+        assert_eq!(metrics.status_valid_peers(), 1);
+        let text = text(&registry);
+        assert!(
+            text.contains("p2p_goodbye_received_total{reason=\"129\",status_valid=\"true\"} 1"),
+            "{text}"
+        );
+        // Every code past 255 shares one label value.
+        assert!(
+            text.contains(
+                "p2p_goodbye_received_total{reason=\"other\",status_valid=\"unknown\"} 1"
+            ),
+            "{text}"
+        );
+        assert_eq!(ReasonLabel::of(256), ReasonLabel::of(u64::MAX));
+    }
+
+    #[test]
+    fn validity_from_the_peer_state() {
+        assert_eq!(StatusValidity::from(Some(true)), StatusValidity::Valid);
+        assert_eq!(StatusValidity::from(Some(false)), StatusValidity::Invalid);
+        assert_eq!(StatusValidity::from(None), StatusValidity::Unknown);
+        let kinds: Vec<_> = Deadline::ALL.iter().map(|d| d.as_str()).collect();
+        assert_eq!(kinds, ["ttfb", "per_chunk", "total"]);
+    }
+}

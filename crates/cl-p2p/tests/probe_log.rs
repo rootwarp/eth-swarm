@@ -63,7 +63,11 @@ fn spawn_probe(
     cfg.listen_addrs = vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()];
     cfg.idle_connection_timeout = Duration::from_secs(20);
     agent_version.clone_into(&mut cfg.agent_version);
-    let mut swarm = build_swarm(Keypair::generate_secp256k1(), &cfg).unwrap();
+    let (req_resp, _) = cl_p2p::testkit::control(
+        &mut registry,
+        cl_p2p::testkit::control_config(Some(p2p_wire::testkit::status())),
+    );
+    let mut swarm = build_swarm(Keypair::generate_secp256k1(), &cfg, req_resp).unwrap();
     let local = *swarm.local_peer_id();
     let (tx, rx) = futures::channel::mpsc::unbounded();
     let (dial_tx, dial_rx) = futures::channel::oneshot::channel::<Multiaddr>();

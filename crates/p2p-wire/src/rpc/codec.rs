@@ -39,7 +39,7 @@
 //! under a counting allocator.
 
 use crate::rpc::messages::{
-    BlocksByRangeV2Request, ErrorMessage, ForkDigest, MetaDataV3, Ping, StatusV2,
+    BlocksByRangeV2Request, ErrorMessage, ForkDigest, Goodbye, MetaDataV3, Ping, StatusV2,
     MAX_ERROR_MESSAGE_LEN,
 };
 use crate::rpc::protocols::{Protocol, Request, Response, ResponseChunk, ResultCode};
@@ -143,6 +143,9 @@ pub enum CodecError {
     /// A success chunk of a protocol with context bytes was handled without them.
     #[error("{0} needs context bytes")]
     MissingContext(Protocol),
+    /// A success chunk of a protocol that has no response (`Goodbye`).
+    #[error("{0} has no response")]
+    NoResponse(Protocol),
     /// The SSZ payload did not decode.
     #[error("decode: {0}")]
     Decode(DecodeError),
@@ -556,6 +559,7 @@ pub fn decode_request(protocol: Protocol, buf: &[u8]) -> Result<Request, CodecEr
         Protocol::BlocksByRangeV2 => {
             Request::BlocksByRange(BlocksByRangeV2Request::from_ssz_bytes(&ssz)?)
         }
+        Protocol::GoodbyeV1 => Request::Goodbye(Goodbye::from_ssz_bytes(&ssz)?),
         Protocol::MetaDataV3 => Request::MetaData,
     })
 }
@@ -624,9 +628,11 @@ fn parse_head<E: EthSpec>(
     } else {
         (None, 1)
     };
-    let max = protocol
-        .response_max_len::<E>(fork)
-        .ok_or(CodecError::MissingContext(protocol))?;
+    let max = match protocol.response_max_len::<E>(fork) {
+        Some(max) => max,
+        None if protocol.has_context_bytes() => return Err(CodecError::MissingContext(protocol)),
+        None => return Err(CodecError::NoResponse(protocol)),
+    };
     Ok(Ok(ChunkHead {
         code,
         fork,
@@ -736,6 +742,8 @@ pub fn decode_response_chunk<E: EthSpec>(
                 forked::SignedBeaconBlock::from_ssz_bytes_for_fork(&ssz, fork)?,
             ))
         }
+        // `parse_head` refuses a success chunk of a protocol without a response.
+        Protocol::GoodbyeV1 => return Err(CodecError::NoResponse(protocol)),
     };
     Ok(ResponseChunk::Success(response))
 }
@@ -1070,6 +1078,31 @@ mod tests {
         let back = Goodbye::from_ssz_bytes(&decode_chunk(&chunk, 8).unwrap()).unwrap();
         assert_eq!(back, goodbye);
         assert_eq!(encode_chunk(&back.as_ssz_bytes()).unwrap(), chunk);
+        // As a request on its own protocol.
+        let request = Request::Goodbye(goodbye);
+        let bytes = encode_request(&request).unwrap();
+        assert_eq!(bytes, chunk);
+        assert_eq!(decode_request(Protocol::GoodbyeV1, &bytes), Ok(request));
+        // Goodbye has no response: a success chunk is refused from its head, an error chunk
+        // still decodes.
+        let contexts = testkit::context_table();
+        let success = encode_success_chunk(None, &ssz).unwrap();
+        assert_eq!(
+            decode_response_chunk::<E>(&success, Protocol::GoodbyeV1, &contexts),
+            Err(CodecError::NoResponse(Protocol::GoodbyeV1))
+        );
+        assert_eq!(
+            scan_response_chunk::<E>(&success, Protocol::GoodbyeV1, &contexts),
+            Err(CodecError::NoResponse(Protocol::GoodbyeV1))
+        );
+        let error = encode_error_chunk(ResultCode::ServerError, b"no").unwrap();
+        assert!(matches!(
+            decode_response_chunk::<E>(&error, Protocol::GoodbyeV1, &contexts),
+            Ok(ResponseChunk::Error {
+                code: ResultCode::ServerError,
+                ..
+            })
+        ));
     }
 
     #[test]

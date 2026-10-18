@@ -2563,7 +2563,11 @@ fn chain(error: &dyn std::error::Error) -> String {
 /// Runs a probe swarm built from `cfg` on its own task, `metrics` observing every event, and
 /// waits for its listen address.
 async fn start_probe(cfg: &SwarmConfig, metrics: PeerMetrics) -> Running {
-    let mut swarm = build_swarm(Keypair::generate_secp256k1(), cfg).expect("probe swarm");
+    let (req_resp, _) = crate::testkit::control(
+        &mut Registry::default(),
+        crate::testkit::control_config(Some(p2p_wire::testkit::status())),
+    );
+    let mut swarm = build_swarm(Keypair::generate_secp256k1(), cfg, req_resp).expect("probe swarm");
     let peer = *swarm.local_peer_id();
     let (cmds, mut cmd_rx) = mpsc::unbounded::<Cmd>();
     let (tx, mut events) = mpsc::unbounded();
@@ -3037,7 +3041,11 @@ async fn quic_listen_address_is_refused() {
     let (_registry, _metrics, mut cfg) = probe_config();
     let quic: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
     cfg.listen_addrs = vec![quic.clone()];
-    match build_swarm(Keypair::generate_secp256k1(), &cfg) {
+    let (req_resp, _) = crate::testkit::control(
+        &mut Registry::default(),
+        crate::testkit::control_config(None),
+    );
+    match build_swarm(Keypair::generate_secp256k1(), &cfg, req_resp) {
         Err(BuildError::Listen {
             addr,
             source: TransportError::MultiaddrNotSupported(_),

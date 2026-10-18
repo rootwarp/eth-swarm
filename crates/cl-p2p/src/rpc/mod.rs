@@ -1,15 +1,23 @@
-//! Outbound req/resp over libp2p `request_response`.
+//! Req/resp over libp2p `request_response`.
 //!
 //! One [`request_response::Behaviour`] per protocol: `request_response` offers every protocol
 //! of a behaviour on each outbound stream and multistream-select picks the first the peer
-//! supports, so a behaviour holding all four would send a `Status` on whatever protocol came
+//! supports, so a behaviour holding all of them would send a `Status` on whatever protocol came
 //! first. One protocol per behaviour also makes `with_max_concurrent_streams(2)` the
 //! per-protocol limit `MAX_CONCURRENT_REQUESTS` (`phase0/p2p-interface.md` L309).
 //!
-//! [`outbound`] runs one exchange on a swarm (Status v2).
+//! - [`codec`]: both halves of the `ssz_snappy` codec, with the deadlines inside it.
+//! - [`outbound`]: one exchange on a swarm, for the m2a session.
+//! - [`inbound`]: the probe swarm's behaviour, answering and initiating Status, MetaData, Ping
+//!   and Goodbye ([`inbound::Control`]).
+//! - [`metrics`]: `rpc_timeouts_total`, the Goodbye counters and `p2p_status_valid_peers`.
 
 pub mod codec;
+pub mod inbound;
+pub mod metrics;
 pub mod outbound;
+#[cfg(test)]
+mod tests;
 
 use codec::RpcCodec;
 use consensus_types::EthSpec;

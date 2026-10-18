@@ -1035,7 +1035,11 @@ version = "0.1.0"
 dependencies = [
  "ethswarm-proto",
  "ipc",
+ "network-config",
+ "thiserror 2.0.21",
+ "tokio",
  "tonic",
+ "tracing",
 ]
 
 [[package]]

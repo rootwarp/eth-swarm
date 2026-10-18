@@ -32,7 +32,7 @@
 //! A response the codec refused (a wrong SSZ length, a chunk too many, …) fails as
 //! [`OutboundError::InvalidResponse`] with the codec's typed [`ReadError`].
 
-use crate::rpc::codec::{ReadError, ReceivedChunk, RpcCodec};
+use crate::rpc::codec::{ReadError, ReceivedChunk, RpcCodec, RpcRequest};
 use consensus_types::primitives::{Epoch, Slot};
 use consensus_types::{forked, EthSpec};
 use futures::StreamExt;
@@ -45,7 +45,7 @@ use p2p_wire::rpc::protocols::{
 };
 
 /// One event of an outbound `request_response` behaviour.
-pub type RpcEvent<E> = request_response::Event<Request, Vec<ReceivedChunk<E>>>;
+pub type RpcEvent<E> = request_response::Event<RpcRequest, Vec<ReceivedChunk<E>>>;
 
 /// A behaviour with a Status v2 `request_response` behaviour inside.
 pub trait StatusRpc<E: EthSpec>: NetworkBehaviour {
@@ -205,7 +205,7 @@ where
     let id = swarm
         .behaviour_mut()
         .status_rpc()
-        .send_request(&peer, Request::Status(ours.clone()));
+        .send_request(&peer, Request::Status(ours.clone()).into());
     let chunks = wait_for_response(swarm, id, B::status_event).await?;
     let theirs = single_status(without_context(chunks))?;
     if theirs.fork_digest != ours.fork_digest {
@@ -228,7 +228,7 @@ where
     let id = swarm
         .behaviour_mut()
         .metadata_rpc()
-        .send_request(&peer, Request::MetaData);
+        .send_request(&peer, Request::MetaData.into());
     let chunks = wait_for_response(swarm, id, B::metadata_event).await?;
     single_metadata(without_context(chunks))
 }
@@ -245,7 +245,7 @@ where
     let id = swarm
         .behaviour_mut()
         .ping_rpc()
-        .send_request(&peer, Request::Ping(Ping(ours)));
+        .send_request(&peer, Request::Ping(Ping(ours)).into());
     let chunks = wait_for_response(swarm, id, B::ping_event).await?;
     single_ping(without_context(chunks))
 }
@@ -269,7 +269,7 @@ where
     let id = swarm
         .behaviour_mut()
         .blocks_by_range_rpc()
-        .send_request(&peer, Request::BlocksByRange(request));
+        .send_request(&peer, Request::BlocksByRange(request).into());
     let chunks = wait_for_response(swarm, id, B::blocks_by_range_event).await?;
     check_blocks(&request, chunks, digest_at)
 }
@@ -582,7 +582,7 @@ mod tests {
             .swarm()
             .behaviour_mut()
             .status
-            .send_request(&peer.id, Request::Status(ours()));
+            .send_request(&peer.id, Request::Status(ours()).into());
         session.swarm().disconnect_peer_id(peer.id).unwrap();
         let err = wait_for_response(session.swarm(), id, SessionBehaviour::<E>::status_event)
             .await
