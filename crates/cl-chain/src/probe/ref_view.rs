@@ -13,8 +13,10 @@
 //! - at most `max_in_flight` roots are being looked up at once, and at most that many requests
 //!   run against the reference. Lookups of a root already in flight share its request; a new root
 //!   while the set is full is [`RefError::Busy`] at once, never queued. A root leaves the set when
-//!   one of its lookups finishes, or when the last caller waiting on it gives up (drops the
-//!   lookup), so abandoned lookups never hold a place;
+//!   one of its lookups resolves it, or when the last caller waiting on it is gone (its error,
+//!   its timeout, or it dropped the lookup), so abandoned lookups never hold a place. A caller
+//!   whose lookup ends in an error or a timeout leaves the root to the callers still waiting on
+//!   it, which retry it in turn; a new lookup of the root joins them rather than asking again;
 //! - at most `max_cached` resolved roots are kept, the oldest evicted first. A root the reference
 //!   does not know is not cached: it may know it a moment later.
 //!
@@ -113,22 +115,21 @@ struct State {
     in_flight: HashMap<Root, InFlight>,
 }
 
-/// One caller's share of an in-flight lookup. Dropping it, when the lookup finishes or the
-/// caller gives up first, releases the share ([`State::leave`]).
+/// One caller's share of an in-flight lookup. Dropping it, when the lookup ends for this caller
+/// or the caller gives up first, releases the share ([`State::leave`]).
 struct Waiter<'a> {
     state: &'a Mutex<State>,
     max_cached: usize,
     root: Root,
     lookup: Lookup,
-    /// Set once the lookup gave its result to this caller.
-    finished: bool,
+    /// Set once the lookup resolved the root for this caller.
     resolved: Option<Arc<RefBlock>>,
 }
 
 impl std::ops::Drop for Waiter<'_> {
     fn drop(&mut self) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.leave(self.root, &self.lookup, self.finished);
+        state.leave(self.root, &self.lookup, self.resolved.is_some());
         if let Some(block) = self.resolved.take() {
             state.cache(block, self.max_cached);
         }
@@ -195,7 +196,6 @@ impl<A: ReferenceApi + BlockApi, E: EthSpec> RefView<A, E> {
             max_cached: self.limits.max_cached,
             root,
             lookup,
-            finished: false,
             resolved: None,
         };
         let timeout = self.limits.timeout;
@@ -204,7 +204,6 @@ impl<A: ReferenceApi + BlockApi, E: EthSpec> RefView<A, E> {
                 .await
                 .unwrap_or(Err(RefError::Timeout(timeout)))
                 .cloned();
-        waiter.finished = true;
         waiter.resolved = result.as_ref().ok().cloned();
         result
     }
@@ -277,10 +276,11 @@ impl<A: ReferenceApi + BlockApi, E: EthSpec> RefView<A, E> {
 }
 
 impl State {
-    /// One waiter on `lookup` of `root` is gone: the root leaves the in-flight set if that
-    /// waiter got the lookup's result (`finished`) or was the last one waiting. A newer lookup
-    /// of the same root is left alone.
-    fn leave(&mut self, root: Root, lookup: &Lookup, finished: bool) {
+    /// One waiter on `lookup` of `root` is gone: the root leaves the in-flight set if the lookup
+    /// `resolved` it or that waiter was the last one. After an error or a timeout the waiters
+    /// still there retry through the same lookup, so the root stays theirs. A newer lookup of
+    /// the same root is left alone.
+    fn leave(&mut self, root: Root, lookup: &Lookup, resolved: bool) {
         let Some(entry) = self
             .in_flight
             .get_mut(&root)
@@ -289,7 +289,7 @@ impl State {
             return;
         };
         entry.waiters = entry.waiters.saturating_sub(1);
-        if finished || entry.waiters == 0 {
+        if resolved || entry.waiters == 0 {
             self.in_flight.remove(&root);
         }
     }
@@ -320,13 +320,25 @@ mod tests {
     use tokio::sync::watch;
 
     /// A reference node from tables: headers and block SSZ by root. While `hang` is set, every
-    /// request waits until it is cleared.
-    #[derive(Default)]
+    /// request waits until it is cleared or takes one of the `passes` handed out.
     struct Reference {
         headers: Mutex<HashMap<Root, Header>>,
         blocks: Mutex<HashMap<Root, Vec<u8>>>,
         hang: watch::Sender<bool>,
+        passes: Semaphore,
         requests: AtomicUsize,
+    }
+
+    impl Default for Reference {
+        fn default() -> Self {
+            Self {
+                headers: Mutex::default(),
+                blocks: Mutex::default(),
+                hang: watch::Sender::default(),
+                passes: Semaphore::new(0),
+                requests: AtomicUsize::default(),
+            }
+        }
     }
 
     impl Reference {
@@ -349,8 +361,12 @@ mod tests {
         async fn gate(&self) {
             self.requests.fetch_add(1, Ordering::SeqCst);
             let mut hang = self.hang.subscribe();
-            // The sender lives as long as the fixture, so this ends only when `hang` clears.
-            let _ = hang.wait_for(|hang| !hang).await;
+            // The sender lives as long as the fixture, so this ends only when `hang` clears or
+            // a pass is handed out.
+            tokio::select! {
+                _ = hang.wait_for(|hang| !hang) => {}
+                pass = self.passes.acquire() => pass.unwrap().forget(),
+            }
         }
 
         fn requests(&self) -> usize {
@@ -594,6 +610,104 @@ mod tests {
             root,
             "the remaining waiter gets the answer"
         );
+        assert_eq!(refs.in_flight(), 0);
+        assert_eq!(refs.cached(), 1);
+    }
+
+    /// Polls until `done`, within a deadline of (paused) time.
+    async fn until(done: impl Fn() -> bool) {
+        let polled = tokio::time::timeout(Duration::from_secs(5), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        polled
+            .await
+            .expect("the condition held before the deadline");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_shared_lookup_that_fails_keeps_its_root_for_the_waiters_retrying_it() {
+        let api = Reference::default();
+        let (_, ssz, root) = gloas_block(9, &[[1; 48]]);
+        api.hang.send_replace(true);
+        let refs = view(&api, RefLimits::default());
+        // The first waiter runs the request; the reference does not know the root yet.
+        let fails = refs.lookup(root);
+        let retries = async {
+            tokio::task::yield_now().await;
+            refs.lookup(root).await
+        };
+        let drive = async {
+            until(|| api.requests() == 1).await;
+            api.passes.add_permits(1);
+            // The first waiter's error; the second retries through the same lookup.
+            until(|| api.requests() == 2).await;
+            assert_eq!(
+                refs.in_flight(),
+                1,
+                "the retrying waiter still holds the root"
+            );
+            // A new lookup of the root shares the retry rather than asking again.
+            let joins = refs.lookup(root);
+            let release = async {
+                tokio::task::yield_now().await;
+                assert_eq!(refs.in_flight(), 1);
+                assert_eq!(api.requests(), 2, "one request in flight for the root");
+                api.serve_as(root, 9, ssz);
+                api.hang.send_replace(false);
+            };
+            tokio::join!(joins, release).0
+        };
+        let (failed, retried, joined) = tokio::join!(fails, retries, drive);
+        assert!(matches!(failed, Err(RefError::Api(_))), "{failed:?}");
+        assert_eq!(retried.unwrap().root, root);
+        assert_eq!(joined.unwrap().root, root);
+        assert_eq!(api.requests(), 3, "the retry's header, then its block");
+        assert_eq!(refs.in_flight(), 0);
+        assert_eq!(refs.cached(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_shared_lookup_that_times_out_keeps_its_root_for_the_waiters_retrying_it() {
+        let api = Reference::default();
+        let root = api.serve(9, 1);
+        api.hang.send_replace(true);
+        let limits = RefLimits {
+            timeout: Duration::from_millis(500),
+            ..RefLimits::default()
+        };
+        let refs = view(&api, limits);
+        let times_out = refs.lookup(root);
+        let retries = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            refs.lookup(root).await
+        };
+        let drive = async {
+            // The first waiter timed out; the second retries through the same lookup.
+            tokio::time::sleep(Duration::from_millis(550)).await;
+            assert_eq!(api.requests(), 2);
+            assert_eq!(
+                refs.in_flight(),
+                1,
+                "the retrying waiter still holds the root"
+            );
+            let joins = refs.lookup(root);
+            let release = async {
+                tokio::task::yield_now().await;
+                assert_eq!(refs.in_flight(), 1);
+                assert_eq!(api.requests(), 2, "one request in flight for the root");
+                api.hang.send_replace(false);
+            };
+            tokio::join!(joins, release).0
+        };
+        let (timed_out, retried, joined) = tokio::join!(times_out, retries, drive);
+        assert_eq!(
+            timed_out,
+            Err(RefError::Timeout(Duration::from_millis(500)))
+        );
+        assert_eq!(retried.unwrap().root, root);
+        assert_eq!(joined.unwrap().root, root);
         assert_eq!(refs.in_flight(), 0);
         assert_eq!(refs.cached(), 1);
     }
