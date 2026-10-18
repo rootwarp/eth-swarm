@@ -14,6 +14,8 @@
 //! - [`limits`]: the per-peer rate limit, the outbound semaphore and the bounded IGNORE queues.
 //! - [`metrics`]: `rpc_timeouts_total`, the Goodbye counters, `p2p_status_valid_peers` and the
 //!   limit counters.
+//! - [`unsupported`]: the MUST-support protocols the probe leaves unregistered (written
+//!   deviations), and the count of peers' proposals of them.
 
 pub mod codec;
 pub mod inbound;
@@ -22,6 +24,7 @@ pub mod metrics;
 pub mod outbound;
 #[cfg(test)]
 mod tests;
+pub mod unsupported;
 
 use codec::RpcCodec;
 use consensus_types::EthSpec;

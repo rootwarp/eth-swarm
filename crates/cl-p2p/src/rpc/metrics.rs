@@ -13,6 +13,9 @@
 //!   `MAX_CONCURRENT_REQUESTS` ([`crate::rpc::limits::OutboundSemaphore`]).
 //! - `rpc_rate_limited_total{protocol}`: response chunks withheld because the peer was over its
 //!   quota ([`crate::rpc::limits::ChunkPacer`]).
+//! - `rpc_inbound_unsupported_total{protocol}`: peers' proposals of a protocol the probe leaves
+//!   unregistered, refused at multistream-select ([`super::unsupported`]), by protocol: only
+//!   the three [`Unsupported`] names, whatever a peer proposes.
 //! - `queue_dropped_total{queue}`: items a bounded queue IGNOREd ([`QueueMetrics`]), shared with
 //!   the other queues of the service through [`RpcMetrics::queues`].
 //!
@@ -21,6 +24,7 @@
 
 use super::codec::Deadline;
 use super::limits::QueueMetrics;
+use super::unsupported::Unsupported;
 use crate::transport::Direction;
 use p2p_wire::rpc::protocols::Protocol;
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder};
@@ -149,6 +153,12 @@ impl ProtocolLabel {
             protocol: protocol_label(protocol),
         }
     }
+
+    fn unsupported(protocol: Unsupported) -> Self {
+        Self {
+            protocol: protocol.label(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -167,6 +177,7 @@ pub struct RpcMetrics {
     status_valid_peers: Gauge,
     outbound_inflight: Family<ProtocolLabel, Gauge>,
     rate_limited: Family<ProtocolLabel, Counter>,
+    inbound_unsupported: Family<ProtocolLabel, Counter>,
     queues: QueueMetrics,
 }
 
@@ -182,12 +193,20 @@ impl RpcMetrics {
             status_valid_peers: Gauge::default(),
             outbound_inflight: Family::default(),
             rate_limited: Family::default(),
+            inbound_unsupported: Family::default(),
             queues: QueueMetrics::register(registry),
         };
         for protocol in Protocol::ALL {
             let label = ProtocolLabel::of(protocol);
             drop(metrics.outbound_inflight.get_or_create(&label));
             drop(metrics.rate_limited.get_or_create(&label));
+        }
+        for protocol in Unsupported::ALL {
+            drop(
+                metrics
+                    .inbound_unsupported
+                    .get_or_create(&ProtocolLabel::unsupported(protocol)),
+            );
         }
         for kind in Deadline::ALL {
             drop(metrics.timeouts.get_or_create(&KindLabel { kind }));
@@ -244,6 +263,12 @@ impl RpcMetrics {
             "Req/resp response chunks withheld because the peer was over its quota, by protocol",
             metrics.rate_limited.clone(),
         );
+        registry.register(
+            "rpc_inbound_unsupported",
+            "Peers' proposals of a req/resp protocol we leave unregistered, refused at \
+             multistream-select, by protocol",
+            metrics.inbound_unsupported.clone(),
+        );
         metrics
     }
 
@@ -260,6 +285,21 @@ impl RpcMetrics {
         self.rate_limited
             .get_or_create(&ProtocolLabel::of(protocol))
             .inc();
+    }
+
+    /// Counts a peer's proposal of `protocol` that multistream-select refused.
+    pub(crate) fn inbound_unsupported(&self, protocol: Unsupported) {
+        self.inbound_unsupported
+            .get_or_create(&ProtocolLabel::unsupported(protocol))
+            .inc();
+    }
+
+    /// The current `rpc_inbound_unsupported_total{protocol}`.
+    #[must_use]
+    pub fn inbound_unsupported_count(&self, protocol: Unsupported) -> u64 {
+        self.inbound_unsupported
+            .get_or_create(&ProtocolLabel::unsupported(protocol))
+            .get()
     }
 
     /// `queue_dropped_total{queue}`, for every bounded queue of the service.
@@ -393,6 +433,9 @@ mod tests {
             "rpc_outbound_inflight{protocol=\"beacon_blocks_by_range\"} 0",
             "rpc_rate_limited_total{protocol=\"ping\"} 0",
             "rpc_rate_limited_total{protocol=\"goodbye\"} 0",
+            "rpc_inbound_unsupported_total{protocol=\"beacon_blocks_by_head\"} 0",
+            "rpc_inbound_unsupported_total{protocol=\"execution_payload_envelopes_by_range\"} 0",
+            "rpc_inbound_unsupported_total{protocol=\"execution_payload_envelopes_by_root\"} 0",
         ] {
             assert!(text.contains(line), "{line} missing from\n{text}");
         }
@@ -427,7 +470,23 @@ mod tests {
         assert_eq!(metrics.outbound_inflight(Protocol::PingV1), 0);
         assert_eq!(metrics.rate_limited_count(Protocol::PingV1), 1);
         assert_eq!(metrics.queues().dropped("nothing"), 0);
+        metrics.inbound_unsupported(Unsupported::EnvelopesByRootV1);
+        metrics.inbound_unsupported(Unsupported::EnvelopesByRootV1);
+        assert_eq!(
+            metrics.inbound_unsupported_count(Unsupported::EnvelopesByRootV1),
+            2
+        );
+        assert_eq!(
+            metrics.inbound_unsupported_count(Unsupported::BlocksByHeadV1),
+            0
+        );
         let text = text(&registry);
+        assert!(
+            text.contains(
+                "rpc_inbound_unsupported_total{protocol=\"execution_payload_envelopes_by_root\"} 2"
+            ),
+            "{text}"
+        );
         assert!(
             text.contains("rpc_outbound_inflight{protocol=\"metadata\"} 2"),
             "{text}"

@@ -4,7 +4,8 @@
 //! [`Control`] is the probe swarm's req/resp behaviour. It holds one [`Duplex`] per protocol
 //! ([`Protocols`], see [`crate::rpc`] for why one each): an inbound-only and an outbound-only
 //! `request_response` behaviour, so these five are what multistream-select offers and any other
-//! protocol fails negotiation (`phase0/p2p-interface.md` L187–190). It answers every inbound
+//! protocol fails negotiation (`phase0/p2p-interface.md` L187–190), among them the MUST-support
+//! ones the probe leaves out ([`super::unsupported`]). It answers every inbound
 //! request itself and reports what it learned as [`ControlEvent`]s.
 //!
 //! # Answers

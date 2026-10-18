@@ -43,7 +43,9 @@ chars.
 per protocol: an inbound-only and an outbound-only `request_response` behaviour, each at most 2
 open streams per connection, so the peer's two and our two never take each other's slots and
 a peer's third concurrent stream is reset. Those, plus `BeaconBlocksByRange` v2, are the only
-protocols offered: any other fails multistream-select negotiation.
+protocols offered: any other fails multistream-select negotiation, among them the MUST-support
+`BeaconBlocksByHead` v1 and `ExecutionPayloadEnvelopesByRange`/`ByRoot` v1 (see
+[Deviations](#beaconblocksbyhead-and-the-execution-payload-envelope-protocols-not-served)).
 
 - **Status**: sent first on every connection we dial, and answered on every one. A peer
   Status with another fork digest, or another finalized root at our finalized epoch, gets
@@ -103,6 +105,10 @@ Metrics, on the same registry as the peer metrics (`rpc::metrics::RpcMetrics`):
 - `rpc_outbound_inflight{protocol}`: our requests in flight, at most 2 per protocol.
 - `rpc_rate_limited_total{protocol}`: response chunks withheld for a peer over its quota.
 - `queue_dropped_total{queue}`: items a bounded queue IGNOREd (`rpc_outbound_<protocol>`).
+- `rpc_inbound_unsupported_total{protocol}`: peers' proposals of a protocol we leave
+  unregistered, refused at negotiation; counted only with `rpc::unsupported::layer` in the
+  tracing subscriber (see
+  [Deviations](#beaconblocksbyhead-and-the-execution-payload-envelope-protocols-not-served)).
 
 Every received Goodbye logs one `goodbye_received` line (`peer`, `reason`, `status_valid`,
 `direction`, `unix_ms`) and emits one `ControlEvent::GoodbyeReceived`; every sent one logs
@@ -157,6 +163,49 @@ the one transport we support. Peers we reach are those with a TCP address, which
 must have; a QUIC-only peer is out of reach. Closed by
 [#154](https://github.com/rootwarp/eth-swarm/issues/154): QUIC dial and listen next to TCP on
 IPv4, with at least one peer each way.
+
+### BeaconBlocksByHead and the execution payload envelope protocols not served
+
+Probe-only. These protocols are MUST-support for the forks the probe joins, and the probe
+serves none of them:
+
+- `/eth2/beacon_chain/req/beacon_blocks_by_head/1/ssz_snappy`: `fulu/p2p-interface.md`
+  (consensus-specs v1.7.0-beta.4, §BeaconBlocksByHead v1, L796–863): "Clients MUST support
+  requesting blocks on the epoch range `[current_epoch - compute_min_epochs_for_block_requests(),
+  current_epoch]`" (L835–836) and "Clients MUST respond with at least one block, if they have
+  the block at `beacon_root`" (L840–841).
+- `/eth2/beacon_chain/req/execution_payload_envelopes_by_range/1/ssz_snappy`:
+  `gloas/p2p-interface.md` (§ExecutionPayloadEnvelopesByRange v1, L1396): its rules are those
+  of BeaconBlocksByRange v2 with envelopes for blocks, so "Clients MUST keep a record of signed
+  blocks seen on the epoch range … and clients MUST support serving requests of blocks on this
+  range" (`phase0` L1527–1530), and "Clients MUST respond with execution payload envelopes from
+  their view of the current fork choice" (L1422–1423).
+- `/eth2/beacon_chain/req/execution_payload_envelopes_by_root/1/ssz_snappy`:
+  `gloas/p2p-interface.md` (§ExecutionPayloadEnvelopesByRoot v1, L1446): "Clients MUST support
+  requesting payload envelopes on the epoch range" (L1483), "MUST also keep a record of all
+  payload envelopes more recent than their latest finalized checkpoint and MUST support serving
+  requests of these payload envelopes" (L1489–1491), and "MUST respond with at least one
+  payload envelope, if they have it" (L1493).
+
+The probe registers none of the three ids, so a peer's request fails multistream-select
+negotiation (`phase0` L187–196): the probe answers the proposal `na`, no handler sees a stream,
+and the connection stays up. No error chunk is sent: `3: ResourceUnavailable` is only valid
+where a protocol specifies it, not as a generic "unsupported" answer. The probe stores no
+blocks and no envelopes, so it has nothing to serve on them anyway.
+
+Each refused proposal of one of the three ids counts in
+`rpc_inbound_unsupported_total{protocol}` (`beacon_blocks_by_head`,
+`execution_payload_envelopes_by_range`, `execution_payload_envelopes_by_root`), so the probe
+shows how often peers ask. The pinned rust-libp2p reports a failed inbound negotiation to no
+behaviour or handler, and names the refused protocol only in `multistream_select`'s
+`Listener: rejecting protocol` debug event, so the count is taken from that event:
+`rpc::unsupported::layer(metrics)` is a `tracing` layer the owner adds to its subscriber
+(without it the counter stays at 0). It enables that one debug event for itself only, and its
+label set is the three names above, whatever a peer proposes.
+
+`rpc::tests::unsupported_ids_stay_unregistered` lists the three ids. Closed by [6.42] and
+[6.19b], which register these protocols and take them off that list, `rpc::unsupported` and
+this section together.
 
 ## m2a-session
 

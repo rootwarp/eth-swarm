@@ -13,6 +13,7 @@ use super::inbound::{
     ControlConfig, ControlEvent, DuplexEvent, Protocols, ProtocolsEvent, Relevance, SharedStatus,
 };
 use super::metrics::{RpcMetrics, StatusValidity};
+use super::unsupported::Unsupported;
 use crate::behaviour::{BehaviourEvent, ProbeSpec};
 use crate::testkit;
 use crate::transport::{build_swarm, Direction, MuxerBudget, SwarmConfig, TransportMetrics};
@@ -20,7 +21,7 @@ use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
 use libp2p::identity::Keypair;
 use libp2p::request_response::{self, OutboundFailure, OutboundRequestId, ProtocolSupport};
-use libp2p::swarm::SwarmEvent;
+use libp2p::swarm::{ConnectionId, SwarmEvent};
 use libp2p::{noise, tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder};
 use p2p_wire::enr::{decode_cgc, encode_cgc};
 use p2p_wire::rpc::codec::{decode_response_chunk, encode_chunk, encode_request};
@@ -34,6 +35,7 @@ use std::io;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tracing_subscriber::layer::SubscriberExt as _;
 
 type E = ProbeSpec;
 
@@ -778,15 +780,20 @@ impl request_response::Codec for BytesCodec {
     }
 }
 
-/// A bare swarm requesting on `protocol` with [`BytesCodec`].
-fn bytes_peer(protocol: &'static str) -> Swarm<request_response::Behaviour<BytesCodec>> {
-    tcp_swarm(request_response::Behaviour::with_codec(
+/// An outbound-only behaviour requesting on `protocol` with [`BytesCodec`].
+fn bytes_behaviour(protocol: &'static str) -> request_response::Behaviour<BytesCodec> {
+    request_response::Behaviour::with_codec(
         BytesCodec,
         [(StreamProtocol::new(protocol), ProtocolSupport::Outbound)],
         request_response::Config::default()
             .with_request_timeout(Duration::from_secs(30))
             .with_max_concurrent_streams(8),
-    ))
+    )
+}
+
+/// A bare swarm requesting on `protocol` with [`BytesCodec`].
+fn bytes_peer(protocol: &'static str) -> Swarm<request_response::Behaviour<BytesCodec>> {
+    tcp_swarm(bytes_behaviour(protocol))
 }
 
 async fn bytes_connect(
@@ -986,6 +993,267 @@ async fn unadvertised_protocols_fail_negotiation() {
             other => panic!("{protocol}: {other:?}"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Unsupported protocols: written probe deviations
+
+/// The guard: the protocols the spec makes MUST-support that the probe leaves unregistered.
+/// Registering one (closing [6.42] or [6.19b]) means taking it off this list, off
+/// [`Unsupported`] and out of the README's §Deviations, together.
+#[test]
+fn unsupported_ids_stay_unregistered() {
+    assert_eq!(
+        Unsupported::ALL.map(Unsupported::id),
+        [
+            "/eth2/beacon_chain/req/beacon_blocks_by_head/1/ssz_snappy",
+            "/eth2/beacon_chain/req/execution_payload_envelopes_by_range/1/ssz_snappy",
+            "/eth2/beacon_chain/req/execution_payload_envelopes_by_root/1/ssz_snappy",
+        ]
+    );
+    for protocol in Protocol::ALL {
+        assert_eq!(Unsupported::from_id(protocol.id()), None, "{protocol}");
+    }
+    let readme = include_str!("../../README.md");
+    let deviations = readme
+        .split_once("\n## Deviations\n")
+        .map(|(_, rest)| {
+            rest.split_once("\n## ")
+                .map_or(rest, |(section, _)| section)
+        })
+        .expect("the README has a §Deviations section");
+    for unsupported in Unsupported::ALL {
+        assert!(
+            deviations.contains(unsupported.id()),
+            "README §Deviations does not name {}",
+            unsupported.id()
+        );
+        assert_eq!(Unsupported::from_id(unsupported.id()), Some(unsupported));
+    }
+    for closing in ["[6.42]", "[6.19b]"] {
+        assert!(
+            deviations.contains(closing),
+            "README §Deviations: {closing}"
+        );
+    }
+}
+
+/// A peer requesting the [`Unsupported`] protocols, one behaviour each (a behaviour offers all
+/// its protocols on every stream, so one each makes every stream propose one id), and Status.
+#[derive(libp2p::swarm::NetworkBehaviour)]
+#[behaviour(prelude = "libp2p::swarm::derive_prelude")]
+struct UnsupportedRequests {
+    blocks_by_head: request_response::Behaviour<BytesCodec>,
+    envelopes_by_range: request_response::Behaviour<BytesCodec>,
+    envelopes_by_root: request_response::Behaviour<BytesCodec>,
+    status: request_response::Behaviour<BytesCodec>,
+}
+
+/// An [`UnsupportedRequests`] swarm on one connection to a [`Node`].
+struct Requester {
+    swarm: Swarm<UnsupportedRequests>,
+    node: PeerId,
+    connection: ConnectionId,
+}
+
+/// Which behaviour of [`UnsupportedRequests`]: an [`Unsupported`] protocol, or Status.
+type Which = Option<Unsupported>;
+
+impl Requester {
+    async fn connect(node: &Node) -> Self {
+        let mut swarm = tcp_swarm(UnsupportedRequests {
+            blocks_by_head: bytes_behaviour(Unsupported::BlocksByHeadV1.id()),
+            envelopes_by_range: bytes_behaviour(Unsupported::EnvelopesByRangeV1.id()),
+            envelopes_by_root: bytes_behaviour(Unsupported::EnvelopesByRootV1.id()),
+            status: bytes_behaviour(Protocol::StatusV2.id()),
+        });
+        swarm.dial(node.addr.clone()).unwrap();
+        let connection = tokio::time::timeout(WAIT, async {
+            loop {
+                if let SwarmEvent::ConnectionEstablished { connection_id, .. } =
+                    swarm.select_next_some().await
+                {
+                    return connection_id;
+                }
+            }
+        })
+        .await
+        .expect("connected");
+        Self {
+            swarm,
+            node: node.peer,
+            connection,
+        }
+    }
+
+    fn behaviour(&mut self, which: Which) -> &mut request_response::Behaviour<BytesCodec> {
+        let requests = self.swarm.behaviour_mut();
+        match which {
+            Some(Unsupported::BlocksByHeadV1) => &mut requests.blocks_by_head,
+            Some(Unsupported::EnvelopesByRangeV1) => &mut requests.envelopes_by_range,
+            Some(Unsupported::EnvelopesByRootV1) => &mut requests.envelopes_by_root,
+            None => &mut requests.status,
+        }
+    }
+
+    /// Sends `bytes` on `which` and runs until the request ends: the response or the failure.
+    /// Panics if the connection closes or a second one opens on the way.
+    async fn request(&mut self, which: Which, bytes: Vec<u8>) -> Result<Vec<u8>, OutboundFailure> {
+        use request_response::{Event, Message};
+        let node = self.node;
+        let id = self.behaviour(which).send_request(&node, Some(bytes));
+        let connection = self.connection;
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let (from, event) = match self.swarm.select_next_some().await {
+                    SwarmEvent::Behaviour(UnsupportedRequestsEvent::BlocksByHead(e)) => {
+                        (Some(Unsupported::BlocksByHeadV1), e)
+                    }
+                    SwarmEvent::Behaviour(UnsupportedRequestsEvent::EnvelopesByRange(e)) => {
+                        (Some(Unsupported::EnvelopesByRangeV1), e)
+                    }
+                    SwarmEvent::Behaviour(UnsupportedRequestsEvent::EnvelopesByRoot(e)) => {
+                        (Some(Unsupported::EnvelopesByRootV1), e)
+                    }
+                    SwarmEvent::Behaviour(UnsupportedRequestsEvent::Status(e)) => (None, e),
+                    SwarmEvent::ConnectionClosed { cause, .. } => {
+                        panic!("the connection closed: {cause:?}")
+                    }
+                    SwarmEvent::ConnectionEstablished { .. } => panic!("a second connection"),
+                    _ => continue,
+                };
+                if from != which {
+                    continue;
+                }
+                match event {
+                    Event::Message {
+                        connection_id,
+                        message:
+                            Message::Response {
+                                request_id,
+                                response,
+                            },
+                        ..
+                    } if request_id == id => {
+                        assert_eq!(connection_id, connection, "answered on another connection");
+                        return Ok(response);
+                    }
+                    Event::OutboundFailure {
+                        request_id, error, ..
+                    } if request_id == id => return Err(error),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the request ended")
+    }
+
+    /// Requests `protocol`: the negotiation must fail.
+    async fn refused(&mut self, protocol: Unsupported) {
+        match self
+            .request(Some(protocol), unsupported_request(protocol))
+            .await
+        {
+            Err(OutboundFailure::UnsupportedProtocols) => {}
+            other => panic!("{}: {other:?}", protocol.id()),
+        }
+    }
+
+    /// A Status on the same connection is answered: it stayed up.
+    async fn still_served(&mut self) {
+        let status = encode_request(&Request::Status(status_with(DIGEST))).unwrap();
+        let wire = self.request(None, status).await.expect("Status answered");
+        assert_eq!(result_code(Protocol::StatusV2, &wire), ResultCode::Success);
+    }
+}
+
+/// A well-formed request of `protocol`, as a peer would send it.
+fn unsupported_request(protocol: Unsupported) -> Vec<u8> {
+    let ssz = match protocol {
+        // (beacon_root: Root, count: uint64)
+        Unsupported::BlocksByHeadV1 => [&[0x11; 32][..], &64u64.to_le_bytes()].concat(),
+        // (start_slot: Slot, count: uint64)
+        Unsupported::EnvelopesByRangeV1 => [64u64.to_le_bytes(), 32u64.to_le_bytes()].concat(),
+        // List[Root, MAX_REQUEST_PAYLOADS]: two roots.
+        Unsupported::EnvelopesByRootV1 => [[0x22; 32], [0x33; 32]].concat(),
+    };
+    encode_chunk(&ssz).unwrap()
+}
+
+/// The peer's request fails negotiation, the probe's inbound side never sees a stream (no
+/// handler reads a byte, so nothing is counted invalid or timed out), and the connection
+/// stays up: a Status on it is answered, and neither side saw it close.
+async fn assert_refused_cleanly(protocols: &[Unsupported]) {
+    let mut ours = Node::spawn(config(status_with(DIGEST), 1, 4)).await;
+    let mut peer = Requester::connect(&ours).await;
+    for &protocol in protocols {
+        peer.refused(protocol).await;
+    }
+    peer.still_served().await;
+    assert_eq!(ours.metrics.invalid_data_count(Direction::Inbound), 0);
+    for kind in Deadline::ALL {
+        assert_eq!(ours.metrics.timeouts(kind), 0, "{kind:?}");
+    }
+    let requester = *peer.swarm.local_peer_id();
+    let seen = ours.drain(SETTLE).await;
+    assert!(
+        !seen
+            .iter()
+            .any(|s| matches!(s, Seen::Closed(p) if *p == requester)),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn blocks_by_head_rejected() {
+    assert_refused_cleanly(&[Unsupported::BlocksByHeadV1]).await;
+}
+
+#[tokio::test]
+async fn envelopes_rejected() {
+    assert_refused_cleanly(&[
+        Unsupported::EnvelopesByRangeV1,
+        Unsupported::EnvelopesByRootV1,
+    ])
+    .await;
+}
+
+#[tokio::test]
+async fn unsupported_counted() {
+    let ours = Node::spawn(config(status_with(DIGEST), 1, 4)).await;
+    // This runtime polls the node's swarm on this thread, so a thread-scoped subscriber sees
+    // its listener's events.
+    let subscriber =
+        tracing_subscriber::registry().with(super::unsupported::layer(ours.metrics.clone()));
+    let _scoped = tracing::subscriber::set_default(subscriber);
+    let counts = || Unsupported::ALL.map(|p| ours.metrics.inbound_unsupported_count(p));
+
+    // `tracing` caches a callsite's interest process-wide, and another test may register the
+    // listener's callsite while this one sets its subscriber. A refused proposal the count
+    // ignores registers it first, then the cache is rebuilt with this subscriber in it.
+    let mut warm_up = bytes_peer("/eth2/beacon_chain/req/beacon_blocks_by_root/2/ssz_snappy");
+    bytes_connect(&mut warm_up, ours.addr.clone()).await;
+    let id = warm_up
+        .behaviour_mut()
+        .send_request(&ours.peer, Some(Vec::new()));
+    assert!(matches!(
+        bytes_outcome(&mut warm_up, id).await,
+        Err(OutboundFailure::UnsupportedProtocols)
+    ));
+    tracing::callsite::rebuild_interest_cache();
+    assert_eq!(counts(), [0, 0, 0]);
+
+    let mut peer = Requester::connect(&ours).await;
+    for (n, protocol) in Unsupported::ALL.into_iter().enumerate() {
+        for _ in 0..=n {
+            peer.refused(protocol).await;
+        }
+    }
+    assert_eq!(counts(), [1, 2, 3]);
+    // A served protocol is not counted.
+    peer.still_served().await;
+    assert_eq!(counts(), [1, 2, 3]);
 }
 
 // ---------------------------------------------------------------------------------------------
