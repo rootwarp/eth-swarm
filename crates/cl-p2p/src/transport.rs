@@ -28,9 +28,14 @@
 //! moves what mplex holds before it lets an idle stream read on. Uncounted, mplex holds at most
 //! one pass plus the one frame it is decoding, and never the 257 frames at which it resets a
 //! healthy stream. Inbound streams mplex has queued are taken into the muxer's own queue,
-//! drained and counted until the swarm takes them; that queue holds at most
-//! [`MPLEX_MAX_STREAMS`], or the connection is closed. A swarm over these muxers must take them
-//! at once: see [`MIN_NEGOTIATING_INBOUND_STREAMS`].
+//! drained and counted until the swarm takes them. A swarm over these muxers must take them at
+//! once: see [`MIN_NEGOTIATING_INBOUND_STREAMS`].
+//!
+//! mplex's own stream cap counts the streams it holds an entry for, and it forgets a stream the
+//! peer resets twice while that stream's handle lives on. [`BudgetedMuxer`] therefore counts
+//! every live stream itself, queued or handed out, until its handle is dropped
+//! ([`BudgetedMuxer::live_streams`]); a stream that would make more than [`MPLEX_MAX_STREAMS`]
+//! live closes the connection, and `p2p_conn_budget_exceeded_total` counts it.
 //!
 //! mplex resets a stream only by dropping it, and sends that Reset frame only with a flush
 //! through another stream; and it sends none for a stream whose write side we closed. A stream
@@ -367,9 +372,10 @@ pub enum BudgetedMuxerError<E> {
         window = EMPTY_FRAME_WINDOW
     )]
     EmptyFrameFlood,
-    /// More inbound streams waited for the swarm to take them than mplex may hold open.
-    #[error("{queued} inbound streams wait to be taken, over the cap of {max}")]
-    TooManyQueuedStreams { queued: usize, max: usize },
+    /// A new stream would have made more streams live, queued for the swarm or handed out,
+    /// than mplex may hold open.
+    #[error("a new stream would make {live} streams live, over the cap of {max}")]
+    TooManyStreams { live: usize, max: usize },
 }
 
 /// Why a [`BudgetedMuxer`] closed its connection, kept to answer every later call with.
@@ -378,7 +384,7 @@ enum Closed {
     Budget { buffered: usize },
     Unresettable { held: usize },
     EmptyFrames,
-    Queue { queued: usize },
+    Streams { live: usize },
 }
 
 /// A [`StreamMuxer`] whose streams' unread bytes are counted against a [`MuxerBudget`]; see
@@ -390,7 +396,10 @@ pub struct BudgetedMuxer<M: StreamMuxer> {
     pass: Arc<Pass>,
     /// The unread bytes every stream holds, together.
     buffered: Arc<AtomicUsize>,
-    /// Every stream handed out or queued; a dropped one is pruned on the next poll.
+    /// Every stream whose [`Held`] is still alive, queued or handed out; see [`LiveSlot`].
+    live: Arc<AtomicUsize>,
+    /// Every stream handed out or queued; a dropped one is pruned on the next poll. Pruning is
+    /// lazy, so [`live`](Self::live), not its length, is the count of live streams.
     streams: Vec<Weak<Mutex<Held<M::Substream>>>>,
     /// Inbound streams taken from the muxer and not yet by the swarm.
     inbound: VecDeque<BudgetedStream<M::Substream>>,
@@ -424,6 +433,7 @@ impl<M: StreamMuxer> BudgetedMuxer<M> {
             budget,
             pass,
             buffered: Arc::default(),
+            live: Arc::default(),
             streams: Vec::new(),
             inbound: VecDeque::new(),
             scratch: vec![0; RECV_CHUNK].into_boxed_slice(),
@@ -439,22 +449,33 @@ impl<M: StreamMuxer> BudgetedMuxer<M> {
         self.buffered.load(Ordering::Relaxed)
     }
 
+    /// The streams of this connection still alive: queued for the swarm or handed out, and not
+    /// yet dropped. A stream reset or failed still counts while its handle is kept.
+    #[must_use]
+    pub fn live_streams(&self) -> usize {
+        self.live.load(Ordering::Relaxed)
+    }
+
     fn closed(&self) -> Result<(), BudgetedMuxerError<M::Error>> {
-        match self.closed {
-            Some(Closed::Budget { buffered }) => Err(BudgetedMuxerError::BudgetExceeded {
+        self.closed.map_or(Ok(()), |why| Err(self.error(why)))
+    }
+
+    /// The error every call answers with once the connection is closed for `why`.
+    fn error(&self, why: Closed) -> BudgetedMuxerError<M::Error> {
+        match why {
+            Closed::Budget { buffered } => BudgetedMuxerError::BudgetExceeded {
                 buffered,
                 budget: self.budget.connection_bytes,
-            }),
-            Some(Closed::Unresettable { held }) => Err(BudgetedMuxerError::StreamUnresettable {
+            },
+            Closed::Unresettable { held } => BudgetedMuxerError::StreamUnresettable {
                 held,
                 budget: self.budget.stream_bytes,
-            }),
-            Some(Closed::EmptyFrames) => Err(BudgetedMuxerError::EmptyFrameFlood),
-            Some(Closed::Queue { queued }) => Err(BudgetedMuxerError::TooManyQueuedStreams {
-                queued,
+            },
+            Closed::EmptyFrames => BudgetedMuxerError::EmptyFrameFlood,
+            Closed::Streams { live } => BudgetedMuxerError::TooManyStreams {
+                live,
                 max: MPLEX_MAX_STREAMS,
-            }),
-            None => Ok(()),
+            },
         }
     }
 
@@ -462,16 +483,14 @@ impl<M: StreamMuxer> BudgetedMuxer<M> {
     /// failed it for one, which closes the connection.
     fn muxer_failed(&mut self, e: M::Error) -> BudgetedMuxerError<M::Error> {
         if self.pass.flooded() {
-            if let Err(flood) = self.close(Closed::EmptyFrames) {
-                return flood;
-            }
+            return self.close(Closed::EmptyFrames);
         }
         BudgetedMuxerError::Muxer(e)
     }
 
     /// Closes the connection for good: every stream fails from now on, its bytes are freed and
-    /// its waiting reader and writer are woken.
-    fn close(&mut self, why: Closed) -> Result<(), BudgetedMuxerError<M::Error>> {
+    /// its waiting reader and writer are woken. Returns the error the connection fails with.
+    fn close(&mut self, why: Closed) -> BudgetedMuxerError<M::Error> {
         match why {
             Closed::Budget { buffered } => {
                 self.budget.exceeded.inc();
@@ -491,12 +510,12 @@ impl<M: StreamMuxer> BudgetedMuxer<M> {
             }
             // The quota socket logs the flood it found.
             Closed::EmptyFrames => {}
-            Closed::Queue { queued } => {
+            Closed::Streams { live } => {
                 self.budget.exceeded.inc();
                 tracing::warn!(
-                    queued,
+                    live,
                     max = MPLEX_MAX_STREAMS,
-                    "closing a connection with more inbound streams waiting than mplex may hold"
+                    "closing a connection with more live streams than mplex may hold open"
                 );
             }
         }
@@ -505,16 +524,34 @@ impl<M: StreamMuxer> BudgetedMuxer<M> {
         for held in self.streams.drain(..).filter_map(|held| held.upgrade()) {
             lock(&held).shut(&self.buffered);
         }
-        self.closed()
+        self.error(why)
     }
 
-    fn adopt(&mut self, inner: M::Substream) -> BudgetedStream<M::Substream> {
-        let held = Arc::new(Mutex::new(Held::new(inner)));
+    /// Adopts `inner` as one more live stream, unless that would make more than
+    /// [`MPLEX_MAX_STREAMS`] live, which closes the connection.
+    ///
+    /// mplex drops its entry for a stream when the stream is dropped, and holds at most
+    /// [`MPLEX_MAX_STREAMS`] entries, so a peer within mplex's cap stays within this one. Two
+    /// handles outlive their entry: one whose stream the peer reset twice (mplex forgets the
+    /// stream at the second Reset), and one whose stream the budget reset. A peer repeating
+    /// either frees an mplex slot each time while the application may keep the handle; only
+    /// this count sees those handles pile up.
+    fn admit(
+        &mut self,
+        inner: M::Substream,
+    ) -> Result<BudgetedStream<M::Substream>, BudgetedMuxerError<M::Error>> {
+        let live = self.live_streams() + 1;
+        if live > MPLEX_MAX_STREAMS {
+            drop(inner);
+            return Err(self.close(Closed::Streams { live }));
+        }
+        let slot = LiveSlot::take(&self.live);
+        let held = Arc::new(Mutex::new(Held::new(inner, slot)));
         self.streams.push(Arc::downgrade(&held));
-        BudgetedStream {
+        Ok(BudgetedStream {
             held,
             buffered: Arc::clone(&self.buffered),
-        }
+        })
     }
 }
 
@@ -550,13 +587,13 @@ where
             }
         }
         if self.pass.flooded() {
-            return self.close(Closed::EmptyFrames);
+            return Err(self.close(Closed::EmptyFrames));
         }
         if let Some(held) = self.flush_owed {
             match self.flush(cx) {
                 Flush::Done => self.flush_owed = None,
                 Flush::Pending => {}
-                Flush::NoStream => return self.close(Closed::Unresettable { held }),
+                Flush::NoStream => return Err(self.close(Closed::Unresettable { held })),
             }
         }
         Ok(())
@@ -582,21 +619,17 @@ where
     /// it is drained and counted until the swarm takes it. mplex queues an inbound stream as
     /// soon as it reads its Open frame, and the swarm takes one per loop of its connection task,
     /// each of which begins a pass; a queued stream left inside mplex would collect a pass of
-    /// frames per loop, uncounted, and be reset at its 257th. More than [`MPLEX_MAX_STREAMS`]
-    /// queued closes the connection: mplex holds no more streams than that, except that it
-    /// forgets a stream reset twice but keeps it queued, which a peer can repeat without limit.
+    /// frames per loop, uncounted, and be reset at its 257th. Each one taken counts as live, so
+    /// one past [`MPLEX_MAX_STREAMS`] live closes the connection (see
+    /// [`admit`](Self::admit)).
     fn take_inbound(&mut self, cx: &mut Context<'_>) -> Result<(), BudgetedMuxerError<M::Error>> {
         loop {
             match self.inner.poll_inbound_unpin(cx) {
                 Poll::Pending => return Ok(()),
                 Poll::Ready(Err(e)) => return Err(self.muxer_failed(e)),
                 Poll::Ready(Ok(inner)) => {
-                    let stream = self.adopt(inner);
+                    let stream = self.admit(inner)?;
                     self.inbound.push_back(stream);
-                    let queued = self.inbound.len();
-                    if queued > MPLEX_MAX_STREAMS {
-                        return self.close(Closed::Queue { queued });
-                    }
                 }
             }
         }
@@ -621,11 +654,13 @@ where
             Drained::Reset { held } => {
                 self.flush_owed = Some(self.flush_owed.map_or(held, |owed| owed.max(held)));
             }
-            Drained::Unresettable { held } => return self.close(Closed::Unresettable { held }),
+            Drained::Unresettable { held } => {
+                return Err(self.close(Closed::Unresettable { held }));
+            }
         }
         let buffered = self.buffered.load(Ordering::Relaxed);
         if buffered > limits.connection_bytes {
-            return self.close(Closed::Budget { buffered });
+            return Err(self.close(Closed::Budget { buffered }));
         }
         Ok(())
     }
@@ -677,7 +712,7 @@ where
             Ok(stream) => stream,
             Err(e) => return Poll::Ready(Err(this.muxer_failed(e))),
         };
-        Poll::Ready(Ok(this.adopt(stream)))
+        Poll::Ready(this.admit(stream))
     }
 
     fn poll_outbound(
@@ -691,7 +726,7 @@ where
             Ok(stream) => stream,
             Err(e) => return Poll::Ready(Err(this.muxer_failed(e))),
         };
-        Poll::Ready(Ok(this.adopt(stream)))
+        Poll::Ready(this.admit(stream))
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -849,6 +884,28 @@ struct Held<S> {
     /// The application has closed, or begun to close, its side. mplex sends no Reset for such a
     /// stream when it is dropped, so it cannot be reset.
     write_closed: bool,
+    /// The stream's place in its muxer's live count, given back when this is dropped.
+    _slot: LiveSlot,
+}
+
+/// One live stream in its muxer's count of them: taken when the muxer adopts the stream, given
+/// back when the stream's [`Held`] is dropped, which is when the last of the
+/// [`BudgetedStream`] and any muxer upgrade of it goes. Tying the count to that drop gives it
+/// back on every path a handle ends by: dropped by the swarm or the application, whether its
+/// stream was open, reset or failed, or freed from the queue, also when the connection closes.
+struct LiveSlot(Arc<AtomicUsize>);
+
+impl LiveSlot {
+    fn take(live: &Arc<AtomicUsize>) -> Self {
+        live.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(live))
+    }
+}
+
+impl Drop for LiveSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -871,7 +928,7 @@ enum Drained {
 }
 
 impl<S> Held<S> {
-    fn new(inner: S) -> Self {
+    fn new(inner: S, slot: LiveSlot) -> Self {
         Self {
             inner: Some(inner),
             buf: RecvBuf::default(),
@@ -880,6 +937,7 @@ impl<S> Held<S> {
             reader: None,
             writer: None,
             write_closed: false,
+            _slot: slot,
         }
     }
 

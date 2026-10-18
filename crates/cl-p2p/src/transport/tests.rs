@@ -710,6 +710,60 @@ fn a_dropped_stream_frees_its_bytes() {
 }
 
 #[test]
+fn live_streams_count_queued_and_taken_streams_until_each_is_gone() {
+    let (_, budget) = budget(10, 8);
+    let scripts: Vec<Script> = (0..5).map(|_| Script::default()).collect();
+    let mut muxer = muxer(&scripts.iter().collect::<Vec<_>>(), budget);
+    let (first, second) = (accept(&mut muxer), accept(&mut muxer));
+    assert_eq!(muxer.live_streams(), 2);
+    // A drain queues the other three until the swarm takes them.
+    drain(&mut muxer).unwrap();
+    assert_eq!(muxer.inbound.len(), 3);
+    assert_eq!(muxer.live_streams(), 5);
+
+    drop(first);
+    assert_eq!(muxer.live_streams(), 4, "a dropped stream is given back");
+    // Closing the connection frees the queue; the stream still held stays live until dropped.
+    scripts[1].push(Read::Data(vec![1; 6]));
+    scripts[2].push(Read::Data(vec![2; 6]));
+    assert!(drain(&mut muxer).is_err());
+    assert_eq!(muxer.live_streams(), 1);
+    drop(second);
+    assert_eq!(muxer.live_streams(), 0);
+}
+
+#[test]
+fn an_outbound_stream_past_the_live_cap_closes_the_connection() {
+    let (metrics, budget) = budget(1024, 64);
+    let outbound = Script::default();
+    let inner = scripted::Muxer {
+        inbound: (0..MPLEX_MAX_STREAMS)
+            .map(|_| Script::default().stream())
+            .collect(),
+        outbound: VecDeque::from([outbound.stream()]),
+        ..scripted::Muxer::default()
+    };
+    let mut muxer = BudgetedMuxer::new(inner, budget);
+    let _kept: Vec<_> = (0..MPLEX_MAX_STREAMS).map(|_| accept(&mut muxer)).collect();
+    assert_eq!(muxer.live_streams(), MPLEX_MAX_STREAMS);
+    drain(&mut muxer).unwrap();
+
+    assert!(matches!(
+        muxer.poll_outbound_unpin(&mut noop()),
+        Poll::Ready(Err(BudgetedMuxerError::TooManyStreams {
+            live: 65,
+            max: MPLEX_MAX_STREAMS
+        }))
+    ));
+    assert!(
+        outbound.state().dropped,
+        "the stream past the cap is dropped"
+    );
+    assert_eq!(muxer.live_streams(), MPLEX_MAX_STREAMS);
+    assert_eq!(metrics.conn_budget_exceeded(), 1);
+}
+
+#[test]
 fn outbound_streams_are_drained_too() {
     let (_, budget) = budget(1024, 64);
     let script = Script::default();
@@ -1241,7 +1295,7 @@ fn streams_waiting_to_be_taken_are_counted() {
 #[test]
 fn a_peer_cycling_open_reset_reset_is_disconnected() {
     // A second Reset makes mplex forget a stream it still queues for the swarm, so the queue
-    // escapes its 64-stream cap. Each `Open, Reset, Reset` is six bytes.
+    // escapes mplex's 64-stream cap. Each `Open, Reset, Reset` is six bytes.
     let (_, metrics) = registered();
     let wire = Wire::default();
     let mut muxer = mplex_over(&wire, MuxerBudget::with_defaults(&metrics));
@@ -1252,17 +1306,134 @@ fn a_peer_cycling_open_reset_reset_is_disconnected() {
         reset(&mut frames, num);
     }
     wire.feed(&frames);
-    let mut queued = 0;
+    let (mut queued, mut live) = (0, 0);
     let error = poll_taking_one_at_a_time(&mut muxer, &wire, usize::MAX, |muxer| {
         queued = queued.max(muxer.inbound.len());
+        live = live.max(muxer.live_streams());
     })
     .map(|_| ())
     .unwrap_err();
-    assert!(error.contains("wait to be taken"), "{error}");
-    assert!(queued <= MPLEX_MAX_STREAMS + 1, "{queued} streams queued");
+    assert!(error.contains("live"), "{error}");
+    assert!(queued <= MPLEX_MAX_STREAMS, "{queued} streams queued");
+    assert!(live <= MPLEX_MAX_STREAMS, "{live} streams live");
     assert!(wire.unread() > 0, "disconnected before the wire was read");
     assert!(muxer.inbound.is_empty(), "the queue is freed");
     assert_eq!(metrics.conn_budget_exceeded(), 1);
+}
+
+#[test]
+fn a_peer_resetting_taken_streams_twice_is_disconnected_at_the_stream_cap() {
+    // The peer opens a stream and waits until the swarm has taken it, then resets it twice.
+    // mplex forgets the stream at the second Reset, which frees its slot, while the handler
+    // here keeps every stream it is given without reading it. The queue stays at most one
+    // long; only the count of live streams sees the handles pile up.
+    let (_, metrics) = registered();
+    let wire = Wire::default();
+    let mut muxer = mplex_over(&wire, MuxerBudget::with_defaults(&metrics));
+    let mut kept = Vec::new();
+    let mut worst = 0;
+    let mut closed = None;
+    for num in 0..1_000 {
+        let mut frames = Vec::new();
+        open(&mut frames, num);
+        wire.feed(&frames);
+        let taken = poll_taking_one_at_a_time(&mut muxer, &wire, 1, |muxer| {
+            worst = worst.max(muxer.live_streams());
+        });
+        match taken {
+            Ok(taken) => kept.extend(taken),
+            Err(e) => {
+                closed = Some((num, e));
+                break;
+            }
+        }
+        let mut frames = Vec::new();
+        reset(&mut frames, num);
+        reset(&mut frames, num);
+        wire.feed(&frames);
+        poll_until_read(&mut muxer, &wire).unwrap();
+        worst = worst.max(muxer.live_streams());
+    }
+    let (num, error) = closed.expect("the connection outlived every round");
+    assert_eq!(
+        num, MPLEX_MAX_STREAMS as u64,
+        "closed at the first stream past the cap"
+    );
+    assert!(error.contains("live"), "{error}");
+    assert_eq!(
+        worst, MPLEX_MAX_STREAMS,
+        "the live count never passes the cap"
+    );
+    assert_eq!(kept.len(), MPLEX_MAX_STREAMS);
+    assert_eq!(metrics.conn_budget_exceeded(), 1);
+    assert!(matches!(
+        muxer.poll_inbound_unpin(&mut noop()),
+        Poll::Ready(Err(BudgetedMuxerError::TooManyStreams {
+            live: 65,
+            max: MPLEX_MAX_STREAMS
+        }))
+    ));
+    drop(kept);
+    assert_eq!(muxer.live_streams(), 0, "every stream is given back");
+}
+
+#[test]
+fn a_peer_opening_and_ending_streams_one_after_another_never_trips_the_stream_cap() {
+    // Many times the cap of streams, one at a time: each is read to its end (a Close, or a
+    // single Reset), closed and dropped before the next opens.
+    let (_, metrics) = registered();
+    let wire = Wire::default();
+    let mut muxer = mplex_over(&wire, MuxerBudget::with_defaults(&metrics));
+    let mut worst = 0;
+    for num in 0..(8 * MPLEX_MAX_STREAMS as u64) {
+        let mut frames = Vec::new();
+        open(&mut frames, num);
+        data(&mut frames, num, b"ping");
+        if num % 2 == 0 {
+            close(&mut frames, num);
+        } else {
+            reset(&mut frames, num);
+        }
+        wire.feed(&frames);
+        let mut taken = poll_taking_one_at_a_time(&mut muxer, &wire, 1, |muxer| {
+            worst = worst.max(muxer.live_streams());
+        })
+        .unwrap();
+        let mut stream = taken.pop().unwrap();
+        assert_eq!(read_to_end(&mut stream).unwrap(), b"ping");
+        let _ = Pin::new(&mut stream).poll_close(&mut noop());
+        drop(stream);
+        assert_eq!(muxer.live_streams(), 0, "stream {num} was given back");
+    }
+    poll_until_read(&mut muxer, &wire).unwrap();
+    assert_eq!(worst, 1);
+    assert_eq!(metrics.conn_budget_exceeded(), 0);
+}
+
+#[test]
+fn a_peer_at_the_stream_cap_is_refused_by_mplex_not_disconnected() {
+    // With every stream open and kept, mplex resets a further one itself: it never reaches the
+    // muxer, so the live count stays at the cap. A stream dropped makes room for the next.
+    let (_, metrics) = registered();
+    let wire = Wire::default();
+    let mut muxer = mplex_over(&wire, MuxerBudget::with_defaults(&metrics));
+    let mut frames = Vec::new();
+    for num in 0..=MPLEX_MAX_STREAMS as u64 {
+        open(&mut frames, num);
+    }
+    wire.feed(&frames);
+    let mut kept = poll_taking_one_at_a_time(&mut muxer, &wire, MPLEX_MAX_STREAMS, |_| {}).unwrap();
+    assert_eq!(kept.len(), MPLEX_MAX_STREAMS);
+    assert_eq!(muxer.live_streams(), MPLEX_MAX_STREAMS);
+
+    drop(kept.pop());
+    let mut frames = Vec::new();
+    open(&mut frames, MPLEX_MAX_STREAMS as u64 + 1);
+    wire.feed(&frames);
+    kept.extend(poll_taking_one_at_a_time(&mut muxer, &wire, 1, |_| {}).unwrap());
+    assert_eq!(muxer.live_streams(), MPLEX_MAX_STREAMS);
+    poll_muxer(&mut muxer).unwrap();
+    assert_eq!(metrics.conn_budget_exceeded(), 0);
 }
 
 #[test]
