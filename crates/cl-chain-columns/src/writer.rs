@@ -13,10 +13,11 @@ use crate::{
     env::{self, WriterOptions},
     error::{Error, Result},
     keys::{
-        block_prefix, column_key, decode_column_key, BlockRoot, CGC_KEY, COLUMNS_TABLE,
-        FINALIZED_SLOT_KEY, META_TABLE, ROOTS_TABLE,
+        block_prefix, column_key, decode_column_key, BlockRoot, ADVERTISED_CGC_KEY, CGC_KEY,
+        CGC_SET_SLOT_KEY, COLUMNS_TABLE, FINALIZED_SLOT_KEY, METADATA_SEQ_KEY, META_TABLE,
+        ROOTS_TABLE,
     },
-    reader::{meta_u64, scan_block, stored_slot, ColumnReader},
+    reader::{meta_u64, scan_block, stored_slot, ColumnReader, CustodyRecord},
     sched::{Priority, TxnScheduler},
     NUMBER_OF_COLUMNS, NUMBER_OF_CUSTODY_GROUPS,
 };
@@ -236,14 +237,37 @@ impl ColumnWriter {
         }
     }
 
-    /// Stores the node's custody group count. Runs at import priority.
+    /// Stores the node's custody group count. Runs at import priority. A count below the
+    /// stored one is [`Error::CgcDecrease`] and writes nothing.
     pub fn set_cgc(&self, cgc: u64) -> Result<()> {
-        if cgc > NUMBER_OF_CUSTODY_GROUPS {
-            return Err(Error::CgcOutOfRange(cgc));
-        }
+        check_cgc(cgc)?;
         self.write_txn(Priority::Import, |txn| {
+            refuse_decrease(txn, cgc)?;
             let meta = txn.open_table(Some(META_TABLE))?;
             txn.put(&meta, CGC_KEY, cgc.to_be_bytes(), WriteFlags::UPSERT)?;
+            Ok(Commit::Yes(()))
+        })
+    }
+
+    /// Stores the whole custody record in one import-priority write transaction, so a crash
+    /// leaves either the old record or the new one. The check against the stored count runs
+    /// inside that transaction: a `cgc` below it is [`Error::CgcDecrease`] and writes nothing.
+    /// `cgc` and `advertised_cgc` above [`NUMBER_OF_CUSTODY_GROUPS`] are
+    /// [`Error::CgcOutOfRange`].
+    pub fn set_custody(&self, record: &CustodyRecord) -> Result<()> {
+        check_cgc(record.cgc)?;
+        check_cgc(record.advertised_cgc)?;
+        self.write_txn(Priority::Import, |txn| {
+            refuse_decrease(txn, record.cgc)?;
+            let meta = txn.open_table(Some(META_TABLE))?;
+            for (key, value) in [
+                (CGC_KEY, record.cgc),
+                (CGC_SET_SLOT_KEY, record.cgc_set_slot),
+                (METADATA_SEQ_KEY, record.metadata_seq),
+                (ADVERTISED_CGC_KEY, record.advertised_cgc),
+            ] {
+                txn.put(&meta, key, value.to_be_bytes(), WriteFlags::UPSERT)?;
+            }
             Ok(Commit::Yes(()))
         })
     }
@@ -297,6 +321,24 @@ fn validate_batch(columns: &[Column<'_>]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn check_cgc(cgc: u64) -> Result<()> {
+    if cgc > NUMBER_OF_CUSTODY_GROUPS {
+        return Err(Error::CgcOutOfRange(cgc));
+    }
+    Ok(())
+}
+
+/// [`Error::CgcDecrease`] if `cgc` is below the stored count; the txn is then dropped.
+fn refuse_decrease(txn: &RwTxn<'_>, cgc: u64) -> Result<()> {
+    match meta_u64(txn, CGC_KEY)? {
+        Some(stored) if cgc < stored => Err(Error::CgcDecrease {
+            stored,
+            requested: cgc,
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Raises the finalized-slot watermark to `finalized_slot`; returns whether it moved.
@@ -873,6 +915,94 @@ mod tests {
         assert_eq!(
             writer.reader().get(&ROOT_A, 2).unwrap(),
             Some(sidecar(1, 2))
+        );
+    }
+
+    fn custody(cgc: u64, cgc_set_slot: u64, metadata_seq: u64) -> CustodyRecord {
+        CustodyRecord {
+            cgc,
+            cgc_set_slot,
+            metadata_seq,
+            advertised_cgc: cgc,
+        }
+    }
+
+    #[test]
+    fn the_custody_record_round_trips_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let writer = ColumnWriter::open(dir.path()).unwrap();
+            assert_eq!(writer.reader().custody().unwrap(), None);
+            let before = writer.rw_txns_committed();
+            writer.set_custody(&custody(4, 10, 1)).unwrap();
+            writer.set_custody(&custody(8, 20, 2)).unwrap();
+            // One write transaction each: the four values move together.
+            assert_eq!(writer.rw_txns_committed() - before, 2);
+            assert_eq!(writer.reader().custody().unwrap(), Some(custody(8, 20, 2)));
+        }
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        assert_eq!(writer.reader().custody().unwrap(), Some(custody(8, 20, 2)));
+        assert_eq!(writer.reader().cgc().unwrap(), Some(8));
+    }
+
+    #[test]
+    fn a_lower_cgc_is_refused_and_the_stored_record_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        writer.set_custody(&custody(4, 10, 1)).unwrap();
+        let before = writer.rw_txns_committed();
+        assert!(matches!(
+            writer.set_custody(&custody(2, 11, 2)),
+            Err(Error::CgcDecrease {
+                stored: 4,
+                requested: 2
+            })
+        ));
+        assert!(matches!(
+            writer.set_cgc(3),
+            Err(Error::CgcDecrease {
+                stored: 4,
+                requested: 3
+            })
+        ));
+        assert_eq!(writer.rw_txns_committed(), before);
+        assert_eq!(writer.reader().custody().unwrap(), Some(custody(4, 10, 1)));
+        // The same count again is not a decrease: the other values may still move.
+        writer.set_custody(&custody(4, 12, 2)).unwrap();
+        assert_eq!(writer.reader().custody().unwrap(), Some(custody(4, 12, 2)));
+    }
+
+    #[test]
+    fn custody_counts_past_the_group_count_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        assert!(matches!(
+            writer.set_custody(&custody(NUMBER_OF_CUSTODY_GROUPS + 1, 0, 0)),
+            Err(Error::CgcOutOfRange(129))
+        ));
+        let mut record = custody(4, 0, 0);
+        record.advertised_cgc = NUMBER_OF_CUSTODY_GROUPS + 1;
+        assert!(matches!(
+            writer.set_custody(&record),
+            Err(Error::CgcOutOfRange(129))
+        ));
+        assert_eq!(writer.reader().custody().unwrap(), None);
+    }
+
+    /// A count stored by `set_cgc` alone reads back with the other values at 0.
+    #[test]
+    fn a_cgc_without_the_rest_of_the_record_reads_as_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        writer.set_cgc(4).unwrap();
+        assert_eq!(
+            writer.reader().custody().unwrap(),
+            Some(CustodyRecord {
+                cgc: 4,
+                cgc_set_slot: 0,
+                metadata_seq: 0,
+                advertised_cgc: 0,
+            })
         );
     }
 

@@ -9,13 +9,15 @@
 //!   (consensus-spec-tests `<preset>/{fulu,gloas}/ssz_static` against `consensus-types`),
 //!   [`kzg`] (cryptography-specs cell handlers through `crypto-kzg`) and [`bls`] (BLS handlers
 //!   of bls12-381-tests, cryptography-specs and consensus-spec-tests `general` through
-//!   `crypto-bls`).
+//!   `crypto-bls`) and [`networking`] (the custody handlers of `<preset>/{fulu,gloas}/networking`
+//!   through `consensus_types::das`).
 
 pub mod bls;
 pub mod check;
 pub mod coverage;
 pub mod fixture;
 pub mod kzg;
+pub mod networking;
 pub mod plan;
 pub mod ssz_generic;
 pub mod ssz_static;

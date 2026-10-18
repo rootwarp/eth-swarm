@@ -12,6 +12,11 @@
 //! - `max_message_size()` as the RPC cap, and the phase0 mesh and cache parameters.
 //! - A subscription filter ([`ProbeSubscriptionFilter`]): gossipsub keeps, for each peer, only
 //!   the subscriptions to topics we subscribe ourselves, from RPCs of bounded size.
+//! - One [`TopicSet`] behind both the filter and the transform: our topics. It starts as
+//!   [`GossipConfig::topics`] and only grows, all or nothing and never past [`MAX_TOPICS`], when
+//!   topics are subscribed later ([`super::IgnoreAll::subscribe`], e.g. the custody column
+//!   subnets), so a topic is decodable and its peers' subscriptions are kept from the moment
+//!   we subscribe it.
 //! - Metric labels for our own topics only ([`metrics_config`]).
 //! - Mesh push only: IHAVE is ignored, so no IWANT is sent.
 //!
@@ -22,13 +27,14 @@ use consensus_types::EthSpec;
 use libp2p::gossipsub;
 use libp2p::gossipsub::{
     DataTransform, MaxCountSubscriptionFilter, Message, MessageId, MetricsConfig, RawMessage,
-    TopicHash, WhitelistSubscriptionFilter,
+    TopicHash, TopicSubscriptionFilter,
 };
 use network_config::ChainConfig;
 use p2p_wire::gossip::{message_id_of_decompressed, GossipTopic, SnappyTransform, TopicCaps};
 use p2p_wire::rpc::codec::max_compressed_len;
 use std::collections::HashSet;
 use std::io;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 /// `MAX_PAYLOAD_SIZE` (`phase0` config).
@@ -101,10 +107,81 @@ pub fn metrics_config() -> MetricsConfig {
 /// stands, so this is a second bound, not one a peer can reach.
 pub const SUBSCRIBED_TOPICS_HEADROOM: usize = 4;
 
+/// The most topics we subscribe: [`MAX_SUBSCRIPTIONS_PER_REQUEST`], every topic of two fork
+/// digests. Our whole subscription list then fits the one RPC a new peer receives, under the
+/// same per-RPC cap and [`MAX_CONTROL_MESSAGE_SIZE`] we hold peers to.
+pub const MAX_TOPICS: usize = MAX_SUBSCRIPTIONS_PER_REQUEST;
+
+/// Our topics, shared by the subscription filter and the transform; see the module docs.
+/// Clones share one set. It never shrinks.
+#[derive(Clone, Debug, Default)]
+pub struct TopicSet(Arc<RwLock<HashSet<TopicHash>>>);
+
+impl TopicSet {
+    /// A set holding `topics`.
+    ///
+    /// # Errors
+    ///
+    /// [`GossipError::TooManyTopics`] for more than [`MAX_TOPICS`] distinct topics.
+    pub fn new(topics: impl IntoIterator<Item = TopicHash>) -> Result<Self, GossipError> {
+        let set = Self::default();
+        set.extend(&topics.into_iter().collect::<Vec<_>>())?;
+        Ok(set)
+    }
+
+    /// Whether `topic` is ours.
+    pub fn contains(&self, topic: &TopicHash) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(topic)
+    }
+
+    /// The number of topics.
+    pub fn len(&self) -> usize {
+        self.0.read().unwrap_or_else(PoisonError::into_inner).len()
+    }
+
+    /// Whether the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Adds `topics`, all of them or none; returns how many were new.
+    ///
+    /// # Errors
+    ///
+    /// [`GossipError::TooManyTopics`] if the set would pass [`MAX_TOPICS`]; it is unchanged.
+    pub fn extend(&self, topics: &[TopicHash]) -> Result<usize, GossipError> {
+        let mut set = self.0.write().unwrap_or_else(PoisonError::into_inner);
+        let new: HashSet<&TopicHash> = topics.iter().filter(|t| !set.contains(*t)).collect();
+        if set.len() + new.len() > MAX_TOPICS {
+            return Err(GossipError::TooManyTopics {
+                have: set.len(),
+                adding: new.len(),
+                max: MAX_TOPICS,
+            });
+        }
+        let added = new.len();
+        set.extend(new.into_iter().cloned());
+        Ok(added)
+    }
+}
+
+/// gossipsub's subscription whitelist over a [`TopicSet`]: a topic is allowed while it is ours.
+#[derive(Clone, Debug)]
+pub struct TopicWhitelist(TopicSet);
+
+impl TopicSubscriptionFilter for TopicWhitelist {
+    fn can_subscribe(&mut self, topic_hash: &TopicHash) -> bool {
+        self.0.contains(topic_hash)
+    }
+}
+
 /// What gossipsub keeps of a peer's subscriptions: only topics in the whitelist (ours), at
-/// most our topic count plus [`SUBSCRIBED_TOPICS_HEADROOM`], from RPCs of at most
+/// most [`MAX_TOPICS`] plus [`SUBSCRIBED_TOPICS_HEADROOM`], from RPCs of at most
 /// [`MAX_SUBSCRIPTIONS_PER_REQUEST`] subscriptions.
-pub type ProbeSubscriptionFilter = MaxCountSubscriptionFilter<WhitelistSubscriptionFilter>;
+pub type ProbeSubscriptionFilter = MaxCountSubscriptionFilter<TopicWhitelist>;
 
 /// `max_message_size()` (`phase0/p2p-interface.md`): the largest encoded RPC,
 /// `max(max_compressed_len(MAX_PAYLOAD_SIZE) + 1024, 1 MiB)`.
@@ -124,7 +201,8 @@ pub fn seen_ttl(slot_duration_ms: u64, slots_per_epoch: u64) -> Duration {
 /// What [`super::IgnoreAll::new`] builds.
 #[derive(Clone, Debug)]
 pub struct GossipConfig {
-    /// The topics subscribed at start. Every other topic stays unsubscribed.
+    /// The topics subscribed at start. Every other topic stays unsubscribed unless
+    /// [`super::IgnoreAll::subscribe`] adds it.
     pub topics: Vec<GossipTopic>,
     /// The uncompressed cap of each topic kind.
     pub caps: TopicCaps,
@@ -196,28 +274,35 @@ impl GossipConfig {
         Ok(config)
     }
 
-    /// The subscription filter for these topics: see [`ProbeSubscriptionFilter`].
-    pub fn subscription_filter(&self) -> ProbeSubscriptionFilter {
-        let whitelist = self.topic_hashes();
+    /// A new [`TopicSet`] holding these topics; the filter and the transform of one gossipsub
+    /// take the same set.
+    ///
+    /// # Errors
+    ///
+    /// [`GossipError::TooManyTopics`] for more than [`MAX_TOPICS`] topics.
+    pub fn topic_set(&self) -> Result<TopicSet, GossipError> {
+        TopicSet::new(self.topics.iter().map(topic_hash))
+    }
+
+    /// The subscription filter over `topics`: see [`ProbeSubscriptionFilter`]. The per-peer
+    /// count bound is [`MAX_TOPICS`], not the set's size now, because the set can grow to it.
+    pub fn subscription_filter(&self, topics: &TopicSet) -> ProbeSubscriptionFilter {
         MaxCountSubscriptionFilter {
-            max_subscribed_topics: whitelist.len() + SUBSCRIBED_TOPICS_HEADROOM,
+            max_subscribed_topics: MAX_TOPICS + SUBSCRIBED_TOPICS_HEADROOM,
             max_subscriptions_per_request: MAX_SUBSCRIPTIONS_PER_REQUEST,
-            filter: WhitelistSubscriptionFilter(whitelist),
+            filter: TopicWhitelist(topics.clone()),
         }
     }
 
-    /// The data transform for these caps and topics.
-    pub fn transform(&self) -> WireTransform {
-        WireTransform::new(SnappyTransform::new(self.caps), self.topic_hashes())
+    /// The data transform for these caps, over `topics`.
+    pub fn transform(&self, topics: &TopicSet) -> WireTransform {
+        WireTransform::shared(SnappyTransform::new(self.caps), topics.clone())
     }
+}
 
-    /// The `TopicHash` of every subscribed topic.
-    fn topic_hashes(&self) -> HashSet<TopicHash> {
-        self.topics
-            .iter()
-            .map(|t| TopicHash::from_raw(t.to_string()))
-            .collect()
-    }
+/// The `TopicHash` of `topic`.
+pub fn topic_hash(topic: &GossipTopic) -> TopicHash {
+    TopicHash::from_raw(topic.to_string())
 }
 
 /// The Altair message-id of a message the transform has decompressed.
@@ -237,12 +322,20 @@ pub fn message_id(message: &Message) -> MessageId {
 #[derive(Clone, Debug)]
 pub struct WireTransform {
     snappy: SnappyTransform,
-    topics: HashSet<TopicHash>,
+    topics: TopicSet,
 }
 
 impl WireTransform {
     /// `snappy` for messages on `topics`; every other topic is refused.
     pub fn new(snappy: SnappyTransform, topics: HashSet<TopicHash>) -> Self {
+        Self {
+            snappy,
+            topics: TopicSet(Arc::new(RwLock::new(topics))),
+        }
+    }
+
+    /// `snappy` for messages on the topics of `topics` as it is at each message.
+    pub fn shared(snappy: SnappyTransform, topics: TopicSet) -> Self {
         Self { snappy, topics }
     }
 
@@ -300,6 +393,11 @@ mod tests {
             caps,
             seen_ttl(12_000, 32),
         )
+    }
+
+    fn transform() -> WireTransform {
+        let c = config();
+        c.transform(&c.topic_set().unwrap())
     }
 
     fn raw(topic: &str, data: Vec<u8>) -> RawMessage {
@@ -486,8 +584,12 @@ mod tests {
     #[test]
     fn the_filter_lets_only_our_topics_through() {
         use libp2p::gossipsub::TopicSubscriptionFilter as _;
-        let mut f = config().subscription_filter();
-        assert_eq!(f.max_subscribed_topics, 1 + SUBSCRIBED_TOPICS_HEADROOM);
+        let c = config();
+        let mut f = c.subscription_filter(&c.topic_set().unwrap());
+        assert_eq!(
+            f.max_subscribed_topics,
+            MAX_TOPICS + SUBSCRIBED_TOPICS_HEADROOM
+        );
         assert_eq!(f.max_subscriptions_per_request, 418);
         assert!(f.can_subscribe(&TopicHash::from_raw(BLOCK)));
         assert!(!f.can_subscribe(&TopicHash::from_raw(
@@ -505,7 +607,7 @@ mod tests {
 
     #[test]
     fn the_transform_decompresses_inbound_and_compresses_outbound() {
-        let t = config().transform();
+        let t = transform();
         let data = t
             .outbound_transform(&TopicHash::from_raw(BLOCK), b"ssz".to_vec())
             .unwrap();
@@ -517,7 +619,7 @@ mod tests {
 
     #[test]
     fn the_transform_refuses_what_the_wire_transform_refuses() {
-        let t = config().transform();
+        let t = transform();
         let err = t
             .inbound_transform(raw("/eth2/00000000/voluntary_exit/ssz_snappy", vec![0]))
             .unwrap_err();
@@ -535,7 +637,7 @@ mod tests {
     /// anything is decompressed; our topic still decodes.
     #[test]
     fn the_transform_decodes_only_subscribed_topics() {
-        let t = config().transform();
+        let t = transform();
         let ssz = vec![7u8; 1000];
         let data = SnappyTransform::new(config().caps)
             .outbound("/eth2/00000000/beacon_aggregate_and_proof/ssz_snappy", &ssz)
@@ -552,6 +654,73 @@ mod tests {
                 .is_err());
         }
         assert_eq!(t.inbound_transform(raw(BLOCK, data)).unwrap().data, ssz);
+    }
+
+    /// The topic set grows all or nothing, never past [`MAX_TOPICS`], and duplicates are free.
+    #[test]
+    fn the_topic_set_is_bounded() {
+        assert_eq!(MAX_TOPICS, MAX_SUBSCRIPTIONS_PER_REQUEST);
+        let set = config().topic_set().unwrap();
+        assert_eq!(set.len(), 1);
+        let column = |i: u64| {
+            TopicHash::from_raw(
+                GossipTopic::new([0; 4], GossipKind::DataColumnSidecar { subnet_id: i % 128 })
+                    .to_string(),
+            )
+        };
+        assert_eq!(set.extend(&[column(1), column(1), column(2)]).unwrap(), 2);
+        assert_eq!(set.extend(&[column(2)]).unwrap(), 0);
+        assert_eq!(set.len(), 3);
+        // Digests 1.. : digest 0's beacon_block is already in the set.
+        let fill: Vec<TopicHash> = (1..=(MAX_TOPICS - 3) as u64)
+            .map(|i| TopicHash::from_raw(format!("/eth2/{i:08x}/beacon_block/ssz_snappy")))
+            .collect();
+        assert_eq!(set.extend(&fill).unwrap(), MAX_TOPICS - 3);
+        assert_eq!(set.len(), MAX_TOPICS);
+        assert!(matches!(
+            set.extend(&[column(3), column(4)]),
+            Err(GossipError::TooManyTopics {
+                have: 418,
+                adding: 2,
+                max: 418
+            })
+        ));
+        assert_eq!(set.len(), MAX_TOPICS);
+        assert!(!set.contains(&column(3)));
+
+        let mut c = config();
+        c.topics = (0..=MAX_TOPICS as u64)
+            .map(|i| GossipTopic::new((i as u32).to_be_bytes(), GossipKind::BeaconBlock))
+            .collect();
+        assert!(matches!(
+            c.topic_set(),
+            Err(GossipError::TooManyTopics { .. })
+        ));
+    }
+
+    /// The filter and the transform read one set: a topic added to it is subscribable and
+    /// decodes, through both, at once.
+    #[test]
+    fn the_filter_and_the_transform_share_the_topic_set() {
+        use libp2p::gossipsub::TopicSubscriptionFilter as _;
+        let c = config();
+        let set = c.topic_set().unwrap();
+        let mut filter = c.subscription_filter(&set);
+        let transform = c.transform(&set);
+        let column = "/eth2/00000000/data_column_sidecar_5/ssz_snappy";
+        let data = SnappyTransform::new(c.caps)
+            .outbound(column, b"col")
+            .unwrap();
+        assert!(!filter.can_subscribe(&TopicHash::from_raw(column)));
+        assert!(transform
+            .inbound_transform(raw(column, data.clone()))
+            .is_err());
+        set.extend(&[TopicHash::from_raw(column)]).unwrap();
+        assert!(filter.can_subscribe(&TopicHash::from_raw(column)));
+        assert_eq!(
+            transform.inbound_transform(raw(column, data)).unwrap().data,
+            b"col"
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@ pub mod ignore_all;
 #[cfg(test)]
 mod tests;
 
-pub use config::{GossipConfig, WireTransform};
+pub use config::{GossipConfig, TopicSet, WireTransform};
 pub use ignore_all::{
     capture_tap, CaptureReader, CaptureTap, Captured, IgnoreAll, IgnoreAllEvent, ProbeGossipsub,
     ValidationSink,
@@ -40,6 +40,14 @@ pub enum GossipError {
     /// A topic could not be subscribed.
     #[error("gossipsub subscribe: {0}")]
     Subscribe(#[from] SubscriptionError),
+    /// Subscribing would take our topic set past its bound ([`config::MAX_TOPICS`]); nothing
+    /// was added.
+    #[error("{adding} new topics on top of {have} would pass the {max}-topic bound")]
+    TooManyTopics {
+        have: usize,
+        adding: usize,
+        max: usize,
+    },
 }
 
 /// N messages injected by a forwarding neighbour: N IGNORE reports and N `Ignored` events, and

@@ -1033,9 +1033,14 @@ dependencies = [
 name = "cl-chain"
 version = "0.1.0"
 dependencies = [
+ "cl-chain-columns",
+ "cl-discv5",
+ "consensus-types",
  "ethswarm-proto",
  "ipc",
  "network-config",
+ "p2p-wire",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tonic",

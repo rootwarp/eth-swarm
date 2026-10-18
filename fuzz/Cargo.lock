@@ -896,6 +896,7 @@ dependencies = [
  "ethereum_ssz_derive",
  "milhouse",
  "network-config",
+ "sha2 0.10.9",
  "ssz_types",
  "thiserror 2.0.21",
  "tree_hash",

@@ -17,7 +17,15 @@ network-config = { path = "../network-config" }
 tokio = { version = "1", features = ["time"] }
 thiserror = "2"
 tracing = "0.1"
+# da::custody: the custody record lives in the column env until it moves into the store schema.
+cl-chain-columns = { path = "../cl-chain-columns" }
+# da::custody: get_custody_groups and the custody constants.
+consensus-types = { path = "../consensus-types" }
 
 [dev-dependencies]
 ipc = { path = "../ipc", features = ["testkit"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }
+tempfile = "3"
+# da::custody tests drive a real local ENR (re-signed, seq-bumped) through cl-discv5's `enr`.
+cl-discv5 = { path = "../cl-discv5" }
+p2p-wire = { path = "../p2p-wire" }

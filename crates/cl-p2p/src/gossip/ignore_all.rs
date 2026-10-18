@@ -15,7 +15,8 @@
 //! Each message also goes to an optional [`CaptureTap`] with its receive time: a bounded queue
 //! that drops (and counts) when the reader is behind, so capture never slows the swarm.
 
-use super::{GossipConfig, GossipError};
+use super::config::topic_hash;
+use super::{GossipConfig, GossipError, TopicSet};
 use libp2p::core::transport::PortUse;
 use libp2p::core::Endpoint;
 use libp2p::gossipsub::{
@@ -27,6 +28,7 @@ use libp2p::swarm::{
     THandlerOutEvent, ToSwarm,
 };
 use libp2p::{Multiaddr, PeerId};
+use p2p_wire::gossip::GossipTopic;
 use prometheus_client::registry::Registry;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -172,6 +174,8 @@ pub enum IgnoreAllEvent {
 /// ```
 pub struct IgnoreAll<G = ProbeGossipsub> {
     inner: G,
+    /// Our topics: the set gossipsub's filter and transform read.
+    topics: TopicSet,
     tap: Option<CaptureTap>,
     ignored: u64,
 }
@@ -191,18 +195,48 @@ impl IgnoreAll<ProbeGossipsub> {
     ///
     /// [`GossipError`] if the configuration is refused or a topic cannot be subscribed.
     pub fn new(cfg: &GossipConfig, registry: &mut Registry) -> Result<Self, GossipError> {
+        let topics = cfg.topic_set()?;
         let mut gossipsub = gossipsub::Behaviour::new_with_subscription_filter_and_transform(
             MessageAuthenticity::Anonymous,
             cfg.gossipsub()?,
-            cfg.subscription_filter(),
-            cfg.transform(),
+            cfg.subscription_filter(&topics),
+            cfg.transform(&topics),
         )
         .map_err(GossipError::Behaviour)?
         .with_metrics(registry, super::config::metrics_config());
         for topic in &cfg.topics {
             gossipsub.subscribe(&gossipsub::IdentTopic::new(topic.to_string()))?;
         }
-        Ok(Self::with_inner(gossipsub))
+        let mut ignore_all = Self::with_inner(gossipsub);
+        ignore_all.topics = topics;
+        Ok(ignore_all)
+    }
+
+    /// Subscribes `topics` on top of the ones subscribed so far (the custody column subnets
+    /// cl-chain asks for, [`crate::custody`]); returns how many were not subscribed yet.
+    ///
+    /// They join the shared [`TopicSet`] first, so the filter keeps peers' subscriptions to
+    /// them and the transform decodes their messages from the moment gossipsub announces them;
+    /// IGNORE-all applies to them like to every topic. A peer's subscription that arrived
+    /// before ours was not kept; the mesh still forms from the peer's GRAFT once it sees ours.
+    ///
+    /// # Errors
+    ///
+    /// [`GossipError::TooManyTopics`] if the set would pass [`super::config::MAX_TOPICS`];
+    /// nothing is subscribed then. [`GossipError::Subscribe`] from gossipsub.
+    pub fn subscribe(&mut self, topics: &[GossipTopic]) -> Result<usize, GossipError> {
+        let hashes: Vec<TopicHash> = topics.iter().map(topic_hash).collect();
+        self.topics.extend(&hashes)?;
+        let mut subscribed = 0;
+        for topic in topics {
+            if self
+                .inner
+                .subscribe(&gossipsub::IdentTopic::new(topic.to_string()))?
+            {
+                subscribed += 1;
+            }
+        }
+        Ok(subscribed)
     }
 }
 
@@ -212,6 +246,7 @@ impl<G> IgnoreAll<G> {
     fn with_inner(inner: G) -> Self {
         Self {
             inner,
+            topics: TopicSet::default(),
             tap: None,
             ignored: 0,
         }

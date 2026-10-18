@@ -12,9 +12,10 @@
 //! per-connection caps) and the probe swarm over them ([`transport::build_swarm`], with
 //! [`behaviour`]), and [`identity`] the service's node key from its systemd credential.
 //! [`gossip`] is the probe's gossipsub, which reports IGNORE for every message and so forwards
-//! none.
+//! none; [`custody`] subscribes it to exactly the custody column subnets cl-chain names.
 
 pub mod behaviour;
+pub mod custody;
 pub mod gossip;
 pub mod identity;
 pub mod m2a_session;

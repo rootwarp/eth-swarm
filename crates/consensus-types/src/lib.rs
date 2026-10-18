@@ -7,6 +7,8 @@
 //! - [`caps`] and [`codec`]: every untrusted decode is bounded by a per-type byte cap derived
 //!   from the spec's `MAX_*` constants, checked before the SSZ decoder runs. The Gloas
 //!   `DataColumnSidecar` cap also depends on the network's blob schedule ([`caps::NetworkCaps`]).
+//! - [`das`]: the custody helpers (`get_custody_groups`, `compute_columns_for_custody_group`,
+//!   `compute_subnet_for_data_column_sidecar`).
 //! - [`forked`]: fork-dispatched enums; the fork comes from the object's slot.
 //! - [`signing`]: `compute_domain`, `compute_signing_root` and signature-set descriptions.
 
@@ -15,6 +17,7 @@ mod macros;
 pub mod caps;
 pub mod codec;
 pub mod common;
+pub mod das;
 pub mod forked;
 pub mod fulu;
 pub mod gloas;

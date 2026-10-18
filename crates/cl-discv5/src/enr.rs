@@ -56,6 +56,10 @@ pub enum BuildError {
     /// `enr` refused the record (over 300 bytes, or signing failed).
     #[error("cannot build the local ENR: {0}")]
     Enr(String),
+    /// The key is not the one the record is signed with: re-signing would make it another
+    /// node's record.
+    #[error("the key did not sign this record")]
+    WrongKey,
 }
 
 /// Why the node key cannot sign the local record. It carries no key bytes.
@@ -93,6 +97,37 @@ pub fn build_local_enr(
         .add_value(NFD_KEY, &Bytes::from(fork.nfd.to_vec()))
         .build(key)
         .map_err(|e| BuildError::Enr(e.to_string()))
+}
+
+/// Sets the local record's `cgc` to `custody_group_count`, re-signed with `key`, which bumps
+/// its `seq` by one. The same value again leaves the record (and its `seq`) as it is, so each
+/// change is exactly one bump. Returns whether the record changed.
+///
+/// # Errors
+///
+/// [`BuildError::WrongKey`] unless `key` signed `enr`, [`BuildError::Enr`] if `enr` refuses the
+/// re-signed record; in both cases `enr` is unchanged.
+pub fn set_cgc(
+    enr: &mut Enr,
+    key: &CombinedKey,
+    custody_group_count: u64,
+) -> Result<bool, BuildError> {
+    use enr::EnrKey as _;
+    if key.public() != enr.public_key() {
+        return Err(BuildError::WrongKey);
+    }
+    let value = Bytes::from(encode_cgc(custody_group_count));
+    if value_eq(enr, CGC_KEY, &value) {
+        return Ok(false);
+    }
+    enr.insert(CGC_KEY, &value, key)
+        .map_err(|e| BuildError::Enr(e.to_string()))?;
+    Ok(true)
+}
+
+/// Whether the record holds exactly `want` under `key`.
+pub(crate) fn value_eq(enr: &Enr, key: &'static str, want: &Bytes) -> bool {
+    matches!(value(enr, key), Ok(Some(current)) if current == *want)
 }
 
 /// Why a record's consensus fields were refused.
@@ -349,6 +384,30 @@ mod tests {
             parse_enr_fields(&forged),
             Err(FieldError::Record(_))
         ));
+    }
+
+    /// A new `cgc` re-signs the record once (seq + 1); the same `cgc` again changes nothing.
+    #[test]
+    fn set_cgc_re_signs_once_per_change() {
+        let key = CombinedKey::generate_secp256k1();
+        let addr = LocalAddr::new(Ipv4Addr::LOCALHOST);
+        let mut enr = build_local_enr(&key, &sepolia_fields(274_175), 0, &addr).unwrap();
+        let seq = enr.seq();
+        assert_eq!(set_cgc(&mut enr, &key, 4), Ok(true));
+        assert_eq!(enr.seq(), seq + 1);
+        assert!(enr.verify());
+        assert_eq!(raw(&enr, "cgc"), vec![0x04]);
+        assert_eq!(EnrFields::read(&enr).unwrap().cgc, Some(4));
+        assert_eq!(set_cgc(&mut enr, &key, 4), Ok(false));
+        assert_eq!(enr.seq(), seq + 1);
+
+        // Another key would re-sign the record as another node: refused, record unchanged.
+        let other = CombinedKey::generate_secp256k1();
+        assert_eq!(set_cgc(&mut enr, &other, 8), Err(BuildError::WrongKey));
+        assert_eq!(
+            (enr.seq(), EnrFields::read(&enr).unwrap().cgc),
+            (seq + 1, Some(4))
+        );
     }
 
     #[test]

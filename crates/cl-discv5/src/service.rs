@@ -56,9 +56,11 @@
 //!   of that address family, so a session's record can pass the IP rules while the session
 //!   comes from a loopback or private address.
 
-use crate::enr::{fork_id, CombinedKey, Enr, FieldError, NodeId, DEFAULT_PORT};
+use crate::enr::{fork_id, value_eq, CombinedKey, Enr, FieldError, NodeId, DEFAULT_PORT};
 use crate::metrics::EvictionMetrics;
+use alloy_rlp::Bytes;
 use discv5::{ConfigBuilder, Discv5, Event, ListenConfig};
+use p2p_wire::enr::{encode_cgc, CGC_KEY};
 use p2p_wire::rpc::messages::ForkDigest;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -332,6 +334,9 @@ pub enum ServiceError {
     /// A lookup did not run to the end.
     #[error("lookup failed: {0}")]
     Query(String),
+    /// discv5 refused the updated local record (over 300 bytes, or signing failed).
+    #[error("local ENR update refused: {0}")]
+    UpdateEnr(String),
 }
 
 /// What removes records that fail the rules from discv5's routing table: the rules, the
@@ -474,6 +479,20 @@ impl Discovery {
     /// The local record as it is now (discv5 updates `ip`/`udp` from what peers observe).
     pub fn local_enr(&self) -> Enr {
         self.discv5.local_enr()
+    }
+
+    /// Sets the local record's `cgc` (see [`crate::enr::set_cgc`]): one `seq` bump per change,
+    /// none when the value is already there. Returns whether the record changed. The check and
+    /// the insert are two steps; cl-chain, which owns the count, is the only caller.
+    pub fn set_cgc(&self, custody_group_count: u64) -> Result<bool, ServiceError> {
+        let value = Bytes::from(encode_cgc(custody_group_count));
+        if value_eq(&self.discv5.local_enr(), CGC_KEY, &value) {
+            return Ok(false);
+        }
+        self.discv5
+            .enr_insert(CGC_KEY, &value)
+            .map_err(|e| ServiceError::UpdateEnr(e.to_string()))?;
+        Ok(true)
     }
 
     /// Adds a known record (a boot node) to the routing table, subject to the IP rules. The
@@ -1032,6 +1051,22 @@ mod tests {
         assert_eq!(public.metrics().evictions(EvictionReason::ForkDigest), 0);
         let found = ids(&public.find_peers(peer_id, 16).await.unwrap());
         assert!(!found.contains(&peer_id), "{found:?}");
+    }
+
+    /// The running node's record takes a new `cgc` with one seq bump, and only on a change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_cgc_updates_the_running_record_once() {
+        let (node, _events) = node(&sepolia_fields(274_175)).await;
+        let seq = node.local_enr().seq();
+        assert_eq!(node.set_cgc(4), Ok(false));
+        assert_eq!(node.local_enr().seq(), seq);
+        assert_eq!(node.set_cgc(8), Ok(true));
+        let enr = node.local_enr();
+        assert_eq!(enr.seq(), seq + 1);
+        assert!(enr.verify());
+        assert_eq!(crate::enr::EnrFields::read(&enr).unwrap().cgc, Some(8));
+        assert_eq!(node.set_cgc(8), Ok(false));
+        assert_eq!(node.local_enr().seq(), seq + 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

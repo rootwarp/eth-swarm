@@ -11,8 +11,10 @@
 //!   finalized slot and records that slot as a watermark; later writes at or below it are
 //!   refused. [`ColumnWriter::prune_orphaned`] removes every column of orphaned block roots
 //!   after a reorg.
-//! - **cgc.** The node's custody group count lives in the same env for now
-//!   ([`ColumnWriter::set_cgc`], [`ColumnReader::cgc`]).
+//! - **Custody.** The node's custody record lives in the same env for now
+//!   ([`ColumnWriter::set_custody`], [`ColumnReader::custody`]): the custody group count, which
+//!   never decreases ([`Error::CgcDecrease`]), the slot it was set at, the MetaData
+//!   `seq_number` and the count advertised to peers, written in one transaction.
 //! - **Single writer.** [`ColumnWriter::open`] holds an OS-level writer guard, so there is at
 //!   most one writer per env across all processes. [`ColumnReader`] opens the env read-only and
 //!   has no write methods:
@@ -37,7 +39,7 @@ mod writer;
 pub use env::{WriterOptions, DEFAULT_MAX_SIZE, MAX_SIZE_ALIGN, MIN_MAX_SIZE};
 pub use error::{Error, Result};
 pub use keys::BlockRoot;
-pub use reader::ColumnReader;
+pub use reader::{ColumnReader, CustodyRecord};
 pub use writer::{
     Column, ColumnWriter, PruneReport, WriteReport, MAX_COLUMNS_PER_TXN, MAX_ROWS_PER_PRUNE_TXN,
     MAX_SIDECAR_BYTES,

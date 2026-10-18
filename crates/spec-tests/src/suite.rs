@@ -4,7 +4,7 @@
 
 use crate::coverage::{self, CaseShape, Guard, Layout, Reads, Slot};
 use crate::plan::{plan, Case, CaseKey, Date, Disposition, Scope, SkipList, COMPTESTS_PRESETS};
-use crate::{bls, fixture, kzg, ssz_generic, ssz_static};
+use crate::{bls, fixture, kzg, networking, ssz_generic, ssz_static};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -453,6 +453,7 @@ enum Kind {
     SszStatic,
     Bls,
     Kzg,
+    Networking,
 }
 
 /// The runner for a case, or `None` if nothing in this crate runs it.
@@ -482,6 +483,9 @@ fn kind(case: &Case) -> Option<Kind> {
         ("cryptography-specs", "kzg") if kzg::handler_runs(&k.handler) == Ok(true) => {
             Some(Kind::Kzg)
         }
+        ("consensus-specs", "networking") if networking::supported(&k.fork, &k.handler) => {
+            Some(Kind::Networking)
+        }
         _ => None,
     }
 }
@@ -505,6 +509,10 @@ impl Kind {
                 bls::run(reads, handler, data(case, &name)?)
             }
             Kind::Kzg => kzg::run(reads, handler, data(case, "data.yaml")?),
+            Kind::Networking => {
+                consensus_manifest(reads, case)?;
+                networking::run(reads, handler, data(case, "meta.yaml")?)
+            }
         }
     }
 }

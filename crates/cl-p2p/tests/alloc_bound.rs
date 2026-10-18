@@ -151,7 +151,7 @@ fn gossip_transform_decodes_only_subscribed_topics() {
         caps,
         std::time::Duration::from_secs(60),
     );
-    let transform = cfg.transform();
+    let transform = cfg.transform(&cfg.topic_set().unwrap());
     let off_list = "/eth2/00000000/execution_payload/ssz_snappy";
     let ssz = vec![0u8; 4 << 20];
     let data = SnappyTransform::new(caps).outbound(off_list, &ssz).unwrap();

@@ -48,6 +48,9 @@ pub enum Error {
     SlotMismatch { stored: u64, given: u64 },
     #[error("cgc {0} exceeds NUMBER_OF_CUSTODY_GROUPS ({NUMBER_OF_CUSTODY_GROUPS})")]
     CgcOutOfRange(u64),
+    /// The custody group count never decreases (`fulu/validator.md`); nothing was written.
+    #[error("cgc {requested} is below the stored cgc {stored}")]
+    CgcDecrease { stored: u64, requested: u64 },
     /// A stored row does not match the layout in [`keys`](crate::keys).
     #[error("corrupt row in table {table}")]
     Corrupt { table: &'static str },

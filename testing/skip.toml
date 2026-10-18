@@ -303,8 +303,9 @@ issue   = "4.7"
 expires = "2026-11-30"
 
 # ---------------------------------------------------------------------------------------
-# Fork choice, networking and fast confirmation: runners land with cl-chain; no plan item
-# names them yet.
+# Fork choice, networking gossip validation and fast confirmation: runners land with
+# cl-chain; no plan item names them yet. The networking custody handlers
+# (get_custody_groups, compute_columns_for_custody_group) run.
 
 [[skip]]
 source  = "consensus-specs"
@@ -333,8 +334,8 @@ source  = "consensus-specs"
 fork    = "*"
 preset  = "*"
 runner  = "networking"
-handler = "*"
-reason  = "No networking runner yet (gossip validation, custody groups); it lands with cl-chain gossip validation and cl-p2p"
+handler = "gossip_*"
+reason  = "No gossip validation runner yet; it lands with cl-chain gossip validation and cl-p2p"
 owner   = "ian"
 issue   = "none"
 expires = "2026-11-30"

@@ -18,7 +18,8 @@ milhouse.workspace = true
 alloy-primitives.workspace = true
 typenum.workspace = true
 thiserror = "2"
+# sha256 of `get_custody_groups` (das); the version p2p-wire and network-config already use.
+sha2 = "0.10"
 
 [dev-dependencies]
 proptest = "1"
-sha2 = "0.10"

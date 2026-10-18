@@ -5,7 +5,7 @@
 //! |--------------------|-------------------------------------------------------|-----------------------------|
 //! | [`COLUMNS_TABLE`]  | `slot (u64 BE) ‖ block_root (32) ‖ column_index (u64 BE)`, 48 bytes | SSZ `DataColumnSidecar` |
 //! | [`ROOTS_TABLE`]    | `block_root (32)`                                     | `slot (u64 BE)`             |
-//! | [`META_TABLE`]     | ASCII name: [`CGC_KEY`], [`FINALIZED_SLOT_KEY`]       | `u64 BE`                    |
+//! | [`META_TABLE`]     | ASCII name: [`CGC_KEY`], [`CGC_SET_SLOT_KEY`], [`METADATA_SEQ_KEY`], [`ADVERTISED_CGC_KEY`], [`FINALIZED_SLOT_KEY`] | `u64 BE` |
 //!
 //! Big-endian slot first makes MDBX's lexicographic key order equal slot order, so finality
 //! pruning is one cursor walk from the first key up to the finalized slot. All columns of a block
@@ -19,13 +19,24 @@ pub type BlockRoot = [u8; 32];
 pub const COLUMNS_TABLE: &str = "columns";
 /// Index from block root to the slot that prefixes its column keys.
 pub const ROOTS_TABLE: &str = "column_roots";
-/// Small scalar values for this env: [`CGC_KEY`] and [`FINALIZED_SLOT_KEY`].
+/// Small scalar values for this env: the custody record ([`CGC_KEY`], [`CGC_SET_SLOT_KEY`],
+/// [`METADATA_SEQ_KEY`], [`ADVERTISED_CGC_KEY`]) and [`FINALIZED_SLOT_KEY`].
 pub const META_TABLE: &str = "meta";
 /// Every table this env holds, in creation order.
 pub const TABLES: [&str; 3] = [COLUMNS_TABLE, ROOTS_TABLE, META_TABLE];
 
-/// [`META_TABLE`] key of the node's custody group count.
+/// [`META_TABLE`] key of the node's custody group count. It never decreases
+/// ([`Error::CgcDecrease`](crate::Error::CgcDecrease)).
 pub const CGC_KEY: &[u8] = b"cgc";
+/// [`META_TABLE`] key of the slot at which [`CGC_KEY`] was last set: the slot Status
+/// `earliest_available_slot` reflects (`fulu/validator.md`).
+pub const CGC_SET_SLOT_KEY: &[u8] = b"cgc_set_slot";
+/// [`META_TABLE`] key of the node's MetaData `seq_number`, kept so it never goes back across a
+/// restart.
+pub const METADATA_SEQ_KEY: &[u8] = b"metadata_seq";
+/// [`META_TABLE`] key of the custody group count the node advertises (ENR `cgc`, MetaData
+/// `custody_group_count`); 0 while it withholds its custody from peers.
+pub const ADVERTISED_CGC_KEY: &[u8] = b"advertised_cgc";
 /// [`META_TABLE`] key of the finalized-slot watermark: the highest slot finality pruning has
 /// covered. Writes at or below it are refused, so a late write cannot undo a prune.
 pub const FINALIZED_SLOT_KEY: &[u8] = b"finalized_slot";

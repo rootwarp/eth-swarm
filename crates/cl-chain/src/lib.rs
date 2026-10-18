@@ -8,7 +8,11 @@
 //! [`probe`] is probe mode's Status (`ReqRespService/GetStatus`): the wall-clock fork digest and
 //! the reference Beacon API's finalized checkpoint, with the last good value kept through an
 //! outage.
+//!
+//! [`da::custody`] owns the node's custody group count: never decreasing, stored in the column
+//! env, advertised through the MetaData and the ENR, and the column subnets cl-p2p subscribes.
 
+pub mod da;
 pub mod probe;
 
 use ethswarm_proto::chain as pb;

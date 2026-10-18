@@ -6,10 +6,26 @@ use crate::{
     env,
     error::{Error, Result},
     keys::{
-        block_prefix, column_key, decode_column_key, BlockRoot, BLOCK_PREFIX_LEN, CGC_KEY,
-        COLUMNS_TABLE, FINALIZED_SLOT_KEY, META_TABLE, ROOTS_TABLE,
+        block_prefix, column_key, decode_column_key, BlockRoot, ADVERTISED_CGC_KEY,
+        BLOCK_PREFIX_LEN, CGC_KEY, CGC_SET_SLOT_KEY, COLUMNS_TABLE, FINALIZED_SLOT_KEY,
+        METADATA_SEQ_KEY, META_TABLE, ROOTS_TABLE,
     },
 };
+
+/// The node's custody state, stored in one write transaction
+/// ([`ColumnWriter::set_custody`](crate::ColumnWriter::set_custody)) so it survives a restart
+/// whole.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CustodyRecord {
+    /// The custody group count; it never decreases.
+    pub cgc: u64,
+    /// The slot at which `cgc` was last raised.
+    pub cgc_set_slot: u64,
+    /// The MetaData `seq_number`.
+    pub metadata_seq: u64,
+    /// The custody group count peers are told (ENR `cgc`, MetaData `custody_group_count`).
+    pub advertised_cgc: u64,
+}
 
 /// Read-only view of the column store.
 ///
@@ -73,6 +89,24 @@ impl ColumnReader {
     pub fn cgc(&self) -> Result<Option<u64>> {
         let txn = self.db.begin_ro_txn()?;
         meta_u64(&txn, CGC_KEY)
+    }
+
+    /// The stored custody record, `None` before the first
+    /// [`ColumnWriter::set_custody`](crate::ColumnWriter::set_custody) or
+    /// [`ColumnWriter::set_cgc`](crate::ColumnWriter::set_cgc). After `set_cgc` alone the other
+    /// values read 0. All four are read in one transaction.
+    pub fn custody(&self) -> Result<Option<CustodyRecord>> {
+        let txn = self.db.begin_ro_txn()?;
+        let Some(cgc) = meta_u64(&txn, CGC_KEY)? else {
+            return Ok(None);
+        };
+        let value = |key| meta_u64(&txn, key).map(Option::unwrap_or_default);
+        Ok(Some(CustodyRecord {
+            cgc,
+            cgc_set_slot: value(CGC_SET_SLOT_KEY)?,
+            metadata_seq: value(METADATA_SEQ_KEY)?,
+            advertised_cgc: value(ADVERTISED_CGC_KEY)?,
+        }))
     }
 
     /// Finalized-slot watermark: the highest slot passed to
