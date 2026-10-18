@@ -319,16 +319,34 @@ blocks (the same format and `manifest.toml` as the archiver), `genesis_state.ssz
 `export.toml`, which records the devnet name, the CL it came from, the genesis time, validators
 root, block root and state root, the config's sha256, fork schedule and digests, the image
 digests, the slot range with its empty slots, and every block's root and parent root. Replay
-opens an export only through `testkit::export_blocks::open_export`, which verifies all of it
-(each segment through `archive::open_verified`).
+opens an export only through `testkit::export_blocks::open_export_pinned`, with the export's
+`export_sha256` from the run log, which verifies all of it (each segment through
+`archive::open_verified`).
 
-Per slot it fetches `/eth/v2/beacon/blocks/{slot}` as SSZ (404 is an empty slot, recorded),
-decodes the block by the fork of its own slot, and fails the export unless our
-`hash_tree_root` equals `/eth/v1/beacon/blocks/{slot}/root` and the block's parent is the
-previous exported block (across empty slots). The genesis block must have a zero parent and the
-root of `/eth/v2/debug/beacon/states/genesis` as its `state_root`. The export slot must be at or
-before the CL's finalized block, so the roots cannot change under the export. A failed export
-writes no `export.toml`, so its directory never opens as an export.
+Per slot it fetches `/eth/v2/beacon/blocks/{slot}` as SSZ (a 404 is an empty slot, recorded,
+only if `/eth/v1/beacon/blocks/{slot}/root` answers 404 too), decodes the block by the fork of
+its own slot, and fails the export unless our `hash_tree_root` equals
+`/eth/v1/beacon/blocks/{slot}/root` and the block's parent is the previous block (across empty
+slots). The genesis block must have a zero parent; the genesis state is read by that block's
+`state_root` (`/eth/v2/debug/beacon/states/{state_root}`; Lodestar without
+`--serveHistoricalState` answers 500 for the `genesis` id) and must hash to it. The export slot must be at or before
+the CL's finalized block, so the roots cannot change under the export, and the walk continues
+(checking, not archiving) to the finalized header's block and must end on it, so the trailing
+empty slots are anchored too. A CL that also lies on `/eth/v1/beacon/headers/finalized`, or
+serves a wrong finalized chain consistently, still passes a single export; only the two-CL
+`diff` below catches that. The output directory is claimed with an exclusive `mkdir`, so a
+second export into it fails. A failed export writes no `export.toml`, so its directory never
+opens as an export. `open_export` decodes the genesis state and every block again and checks
+them against `export.toml` (genesis fields and roots, each block's slot, root, parent and fork
+digest), and refuses a genesis state file over 256 MiB before reading it.
+
+The contract: opening proves that an export holds together and is a hash chain from its genesis
+block and state, nothing more. It checks no signature and runs no state transition, so anyone
+who can write the directory can fabricate a consistent suffix (drop or replace the tip, rewrite
+the blocks after any slot) and rehash every manifest. Fork digests are not recomputed either
+(from Fulu every digest mixes in the epoch's blob parameters, which the export does not carry).
+Only the `export_sha256` that `export` printed, kept in the run log, authenticates an export:
+`verify --sha256` and `open_export_pinned` refuse any other.
 
 Status: tested against a fixture beacon node only. It has not been run on the devnet yet, so
 the first run also confirms that `network-config` reads the generated `config.yaml`.
@@ -359,24 +377,34 @@ ls=$(kurtosis port print "$enclave" cl-2-lodestar-geth http)
 finalized() { curl -s "$1/eth/v1/beacon/headers/finalized" | jq -r .data.header.message.slot; }
 a=$(finalized "$lh"); b=$(finalized "$ls"); to=$(( a < b ? a : b )); echo "export slot $to"
 
+# Each export's one-line summary goes into the run log; its last field is the export_sha256.
 "$bin" export --api "$lh" --config "$genesis/config.yaml" --devnet "$enclave" \
-  --source cl-1-lighthouse-geth --to "$to" --out "$export_root/lighthouse" "${image_args[@]}"
+  --source cl-1-lighthouse-geth --to "$to" --out "$export_root/lighthouse" "${image_args[@]}" \
+  | tee -a "$export_root/run.log"
 "$bin" export --api "$ls" --config "$genesis/config.yaml" --devnet "$enclave" \
-  --source cl-2-lodestar-geth --to "$to" --out "$export_root/lodestar" "${image_args[@]}"
+  --source cl-2-lodestar-geth --to "$to" --out "$export_root/lodestar" "${image_args[@]}" \
+  | tee -a "$export_root/run.log"
+pin() { grep -F "$1: ok," "$export_root/run.log" | tail -n 1 | awk '{print $NF}'; }
+lh_sha=$(pin "$export_root/lighthouse/$enclave"); ls_sha=$(pin "$export_root/lodestar/$enclave")
 ```
 
 Each `export` prints one line: the slot range, the block and empty-slot counts, the genesis
 block and state roots, the last block's slot and root, and the export's `export_sha256`.
-`verify` prints the same line for an existing export (exit 1 if it is refused).
+`verify --sha256 <export_sha256>` prints the same line for an existing export, and exits 1 if
+it is refused or is not the pinned export.
 
 The checks, with the two exports above:
 
 ```bash
+# Each export is the one its run-log digest pins.
+"$bin" verify --sha256 "$lh_sha" "$export_root/lighthouse/$enclave"
+"$bin" verify --sha256 "$ls_sha" "$export_root/lodestar/$enclave"
+
 # Both CLs' exports have identical root lists (exit 1 and the first differing slot otherwise).
 "$bin" diff "$export_root/lighthouse/$enclave" "$export_root/lodestar/$enclave"
 
-# Count check: the API's block count over 0..=$to equals the export's "N blocks".
-"$bin" verify "$export_root/lighthouse/$enclave"
+# Count check: the API's block count over 0..=$to equals the export's "N blocks" (printed by
+# the pinned verify above).
 n=0
 for s in $(seq 0 "$to"); do
   code=$(curl -s -o /dev/null -w '%{http_code}' "$lh/eth/v1/beacon/headers/$s")
@@ -389,7 +417,7 @@ cmp "$genesis/genesis.ssz" "$export_root/lighthouse/$enclave/genesis_state.ssz" 
 ```
 
 Keep the export with the run log: its `export_sha256` pins it, and the block replay harness loads
-it with `open_export`.
+it with `open_export_pinned` and that digest.
 
 ## How the probe attaches
 

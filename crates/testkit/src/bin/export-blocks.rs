@@ -5,7 +5,7 @@
 //! export-blocks export --api URL --config PATH --devnet NAME --source NAME --to SLOT
 //!                      --out DIR --image REF [--image REF]...
 //!                      [--timeout-secs N] [--state-timeout-secs N] [--max-state-bytes N]
-//! export-blocks verify EXPORT_DIR
+//! export-blocks verify [--sha256 HEX] EXPORT_DIR
 //! export-blocks diff EXPORT_DIR EXPORT_DIR
 //! export-blocks --help
 //! ```
@@ -13,9 +13,11 @@
 //! `export` runs [`testkit::export_blocks::export`] against one CL's beacon API (plain
 //! `http://` to a loopback host; `kurtosis port print <enclave> <service> http` gives one) with
 //! the devnet's `config.yaml`, whose preset picks the spec, and writes `OUT/<devnet>/`. `verify`
-//! opens an export through [`testkit::export_blocks::open_export`] and prints its slot range,
-//! block and empty-slot counts, genesis roots and digest. `diff` opens two exports the same way
-//! and compares their root lists ([`testkit::export_blocks::diff_root_lists`]).
+//! opens an export through [`testkit::export_blocks::open_export`], or with `--sha256` through
+//! [`testkit::export_blocks::open_export_pinned`] (the only check that authenticates an
+//! export: the digest `export` printed, from the run log), and prints its slot range, block and
+//! empty-slot counts, genesis roots and digest. `diff` opens two exports unpinned and compares
+//! their root lists ([`testkit::export_blocks::diff_root_lists`]); verify each pinned first.
 //!
 //! Exit codes: 0 done (or identical root lists), 1 the export failed, an export was refused or
 //! the root lists differ, 64 usage.
@@ -30,25 +32,26 @@ use std::process::ExitCode;
 use std::time::Duration;
 use testkit::collector::ReferenceApiUrl;
 use testkit::export_blocks::{
-    diff_root_lists, export, open_export, Export, ExportConfig, RootListDiff, SlotEntry,
-    DEFAULT_MAX_STATE_BYTES, DEFAULT_REQUEST_TIMEOUT, DEFAULT_STATE_TIMEOUT,
+    diff_root_lists, export, open_export, open_export_pinned, Export, ExportConfig, RootListDiff,
+    SlotEntry, DEFAULT_MAX_STATE_BYTES, DEFAULT_REQUEST_TIMEOUT, DEFAULT_STATE_TIMEOUT,
 };
 
 const USAGE: &str = "\
 usage: export-blocks export --api URL --config PATH --devnet NAME --source NAME --to SLOT
                             --out DIR --image REF [--image REF]...
                             [--timeout-secs N] [--state-timeout-secs N] [--max-state-bytes N]
-       export-blocks verify EXPORT_DIR
+       export-blocks verify [--sha256 HEX] EXPORT_DIR
        export-blocks diff EXPORT_DIR EXPORT_DIR
        export-blocks --help";
 const HELP: &str = "\
 Export a devnet's blocks and roots from genesis to an export slot, plus its genesis state, into
 a verified archive; verify an export; or diff the root lists of two exports.
 
-export reads GET /eth/v2/beacon/blocks/{slot} (SSZ; 404 is an empty slot) for every slot from
-0 to --to, cross-checks each block's hash_tree_root against /eth/v1/beacon/blocks/{slot}/root
-and its parent against the previous block, and writes OUT/<devnet>/: an archive segment of the
-blocks, genesis_state.ssz and export.toml.
+export reads GET /eth/v2/beacon/blocks/{slot} (SSZ) for every slot from 0 to the CL's finalized
+block, cross-checks each block's hash_tree_root against /eth/v1/beacon/blocks/{slot}/root and
+its parent against the previous block (a slot is empty only if both answer 404), requires the
+chain to end on the finalized block, and writes OUT/<devnet>/: an archive segment of the blocks
+to --to, genesis_state.ssz and export.toml.
 
   --api URL                  the CL's beacon API, http:// to a loopback host
   --config PATH              the devnet's config.yaml (its PRESET_BASE picks the spec)
@@ -59,12 +62,18 @@ blocks, genesis_state.ssz and export.toml.
   --image REF                a devnet image, repo:tag@sha256:<digest>, repeatable (at least one)
   --timeout-secs N           the deadline of each block and root request (default 30)
   --state-timeout-secs N     the deadline of the genesis state request (default 300)
-  --max-state-bytes N        the largest genesis state read (default 268435456)
+  --max-state-bytes N        the largest genesis state read (default and most 268435456)
 
 verify checks an export (manifest digest, every segment through open_verified, the block files
-against the manifest's blocks, the genesis state) and prints what it holds.
+against the manifest's blocks, then the genesis state and every block decoded again) and prints
+what it holds. That proves it holds together, not that it is the devnet's: anyone who can write
+the directory can forge a consistent chain suffix. --sha256 HEX (the export_sha256 export
+printed, from the run log) refuses any export but that one; only the pin authenticates it.
 
-diff verifies two exports and compares their root lists slot by slot from genesis.
+  --sha256 HEX               the pinned export_sha256, 64 lowercase hex digits
+
+diff verifies two exports, unpinned, and compares their root lists slot by slot from genesis;
+verify each one pinned first.
 
 Exit codes: 0 done (or identical root lists), 1 the export failed, an export was refused or the
 root lists differ, 64 usage.";
@@ -77,7 +86,7 @@ const MAX_CONFIG_BYTES: u64 = 1 << 20;
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Help,
-    Verify(PathBuf),
+    Verify(PathBuf, Option<[u8; 32]>),
     Diff(PathBuf, PathBuf),
     Export(ExportArgs),
 }
@@ -101,17 +110,43 @@ fn parse(args: &[String]) -> Result<Command, String> {
         return Ok(Command::Help);
     }
     match args.first().map(String::as_str) {
-        Some("verify") => match &args[1..] {
-            [dir] => Ok(Command::Verify(dir.into())),
-            _ => Err("verify takes exactly one EXPORT_DIR".into()),
-        },
+        Some("verify") => parse_verify(&args[1..]),
         Some("diff") => match &args[1..] {
             [a, b] => Ok(Command::Diff(a.into(), b.into())),
             _ => Err("diff takes exactly two EXPORT_DIRs".into()),
         },
         Some("export") => parse_export(&args[1..]).map(Command::Export),
-        Some(other) => Err(format!("unknown command {other:?}")),
+        Some(_) => Err("unknown command (want export, verify or diff)".into()),
         None => Err("no command".into()),
+    }
+}
+
+fn parse_verify(args: &[String]) -> Result<Command, String> {
+    let (mut dir, mut pin) = (None, None);
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--sha256" {
+            let value = it.next().ok_or("--sha256 needs a value")?;
+            if pin.replace(sha256_hex(value)?).is_some() {
+                return Err("give --sha256 once".into());
+            }
+        } else if dir.replace(PathBuf::from(arg)).is_some() {
+            return Err("verify takes exactly one EXPORT_DIR".into());
+        }
+    }
+    let dir = dir.ok_or("verify takes exactly one EXPORT_DIR")?;
+    Ok(Command::Verify(dir, pin))
+}
+
+/// 64 lowercase hex digits; the error never quotes the value.
+fn sha256_hex(value: &str) -> Result<[u8; 32], String> {
+    let lower = value
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let mut digest = [0; 32];
+    match hex::decode_to_slice(value, &mut digest) {
+        Ok(()) if lower => Ok(digest),
+        _ => Err("--sha256: want 64 lowercase hex digits".into()),
     }
 }
 
@@ -139,7 +174,7 @@ fn parse_export(args: &[String]) -> Result<ExportArgs, String> {
             "--timeout-secs" => timeout = seconds(flag, value?)?,
             "--state-timeout-secs" => state_timeout = seconds(flag, value?)?,
             "--max-state-bytes" => max_state_bytes = number(flag, value?)?,
-            other => return Err(format!("unknown argument {other:?}")),
+            other => return Err(unknown_argument(other)),
         }
     }
     fn required<T>(value: Option<T>, flag: &str) -> Result<T, String> {
@@ -162,12 +197,29 @@ fn parse_export(args: &[String]) -> Result<ExportArgs, String> {
     })
 }
 
+/// The error for an argument `export` does not take. An argument can hold a keyed URL
+/// (`--api=http://…/<key>`, or a URL where a flag was due), so, as the collector does, only a
+/// flag's key is named, and only when it looks like one; never a value.
+fn unknown_argument(arg: &str) -> String {
+    let key = arg.split_once('=').map_or(arg, |(key, _)| key);
+    let flag_like = key.len() <= 32
+        && key.strip_prefix("--").is_some_and(|name| {
+            !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    if flag_like {
+        format!("unknown argument {key} (a flag and its value are two arguments)")
+    } else {
+        "unknown argument (not shown: it may hold a URL)".into()
+    }
+}
+
+/// A decimal number; the error names the flag, never the value.
 fn number<T: std::str::FromStr>(flag: &str, value: &str) -> Result<T, String> {
     let digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
     digits
         .then(|| value.parse().ok())
         .flatten()
-        .ok_or_else(|| format!("{flag}: {value:?} is not a number"))
+        .ok_or_else(|| format!("{flag}: not a number"))
 }
 
 fn seconds(flag: &str, value: &str) -> Result<Duration, String> {
@@ -202,7 +254,7 @@ fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
             let _ = writeln!(out, "{USAGE}\n\n{HELP}");
             0
         }
-        Command::Verify(dir) => verify(&dir, out, err),
+        Command::Verify(dir, pin) => verify(&dir, pin, out, err),
         Command::Diff(a, b) => diff(&a, &b, out, err),
         Command::Export(args) => match run_export(&args) {
             Ok(export) => {
@@ -271,8 +323,12 @@ fn summary(export: &Export) -> String {
     )
 }
 
-fn open(dir: &Path, err: &mut dyn Write) -> Option<Export> {
-    match open_export(dir) {
+fn open(dir: &Path, pin: Option<[u8; 32]>, err: &mut dyn Write) -> Option<Export> {
+    let opened = match pin {
+        Some(pin) => open_export_pinned(dir, pin),
+        None => open_export(dir),
+    };
+    match opened {
         Ok(export) => Some(export),
         Err(e) => {
             let _ = writeln!(err, "export-blocks: {}: refused: {e}", dir.display());
@@ -281,8 +337,8 @@ fn open(dir: &Path, err: &mut dyn Write) -> Option<Export> {
     }
 }
 
-fn verify(dir: &Path, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
-    match open(dir, err) {
+fn verify(dir: &Path, pin: Option<[u8; 32]>, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    match open(dir, pin, err) {
         Some(export) => {
             let _ = writeln!(out, "{}", summary(&export));
             0
@@ -300,7 +356,7 @@ fn entry(e: SlotEntry) -> String {
 }
 
 fn diff(a: &Path, b: &Path, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
-    let (Some(ea), Some(eb)) = (open(a, err), open(b, err)) else {
+    let (Some(ea), Some(eb)) = (open(a, None, err), open(b, None, err)) else {
         return EXIT_FAILED;
     };
     let (ma, mb) = (ea.manifest(), eb.manifest());
@@ -343,6 +399,7 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use testkit::export_blocks::fixtures::{Devnet, CONFIG, IMAGE};
+    use testkit::export_blocks::FINALIZED_HEADER_PATH;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_owned()).collect()
@@ -411,10 +468,13 @@ mod tests {
         for (bad, why) in [
             (&full[..13], "--image is required"),
             (&full[..2], "--api needs a value"),
-            (&args(&["export", "--to", "-1"])[..], "is not a number"),
-            (&args(&["export", "--to", "+1"])[..], "is not a number"),
+            (&args(&["export", "--to", "-1"])[..], "--to: not a number"),
+            (&args(&["export", "--to", "+1"])[..], "--to: not a number"),
             (&args(&["export", "--timeout-secs", "0"])[..], "at least 1"),
-            (&args(&["export", "--bogus", "1"])[..], "unknown argument"),
+            (
+                &args(&["export", "--bogus", "1"])[..],
+                "unknown argument --bogus",
+            ),
             (&args(&["export", "--image", "a"])[..], "--api is required"),
         ] {
             let e = parse(bad).unwrap_err();
@@ -423,11 +483,63 @@ mod tests {
     }
 
     #[test]
+    fn usage_errors_never_quote_a_value() {
+        // A misplaced URL can hold a key: no value given on the command line is echoed.
+        const SECRET: &str = "hunter2";
+        for bad in [
+            &["export", "--to", "http://127.0.0.1/hunter2"][..],
+            &["export", "--max-state-bytes", "hunter2"],
+            &["export", "http://127.0.0.1/hunter2"],
+            &["export", "--api=http://127.0.0.1/hunter2"],
+            &[
+                "export",
+                "--hunter2-and-a-long-tail-of-more-characters",
+                "x",
+            ],
+            &["hunter2"],
+        ] {
+            let e = parse(&args(bad)).unwrap_err();
+            assert!(!e.contains(SECRET), "{bad:?}: {e}");
+            let (code, _, err) = run_args(bad);
+            assert_eq!(code, EXIT_USAGE);
+            assert!(!err.contains(SECRET), "{bad:?}: {err}");
+        }
+        let e = parse(&args(&["export", "--api=http://x/hunter2"])).unwrap_err();
+        assert!(e.contains("unknown argument --api"), "{e}");
+    }
+
+    #[test]
     fn commands_and_usage() {
         assert_eq!(
             parse(&args(&["verify", "x"])),
-            Ok(Command::Verify("x".into()))
+            Ok(Command::Verify("x".into(), None))
         );
+        let pin = "ab".repeat(32);
+        assert_eq!(
+            parse(&args(&["verify", "--sha256", &pin, "x"])),
+            Ok(Command::Verify("x".into(), Some([0xab; 32])))
+        );
+        assert_eq!(
+            parse(&args(&["verify", "x", "--sha256", &pin])),
+            Ok(Command::Verify("x".into(), Some([0xab; 32])))
+        );
+        for bad in [
+            vec!["verify", "--sha256"],
+            vec!["verify", "--sha256", &pin],
+            vec!["verify", "--sha256", &pin, "--sha256", &pin, "x"],
+            vec!["verify", "x", "y"],
+        ] {
+            assert!(parse(&args(&bad)).is_err(), "{bad:?}");
+        }
+        for hunter in [
+            "AB".repeat(32),
+            "ab".repeat(31),
+            format!("{}hunter2", "a".repeat(57)),
+        ] {
+            let e = parse(&args(&["verify", "--sha256", &hunter, "x"])).unwrap_err();
+            assert!(e.contains("--sha256: want 64 lowercase hex"), "{e}");
+            assert!(!e.contains(&hunter), "{e}");
+        }
         assert_eq!(
             parse(&args(&["diff", "a", "b"])),
             Ok(Command::Diff("a".into(), "b".into()))
@@ -493,9 +605,12 @@ mod tests {
         );
 
         let devnet = Devnet::new(10, &[3]);
-        let (code, out, err) = export_cli(devnet.clone(), 10, &a, &config).await;
+        let (code, exported_a, err) = export_cli(devnet.clone(), 10, &a, &config).await;
         assert_eq!(code, 0, "{err}");
-        assert!(out.contains("slots 0-10: 10 blocks, 1 empty"), "{out}");
+        assert!(
+            exported_a.contains("slots 0-10: 10 blocks, 1 empty"),
+            "{exported_a}"
+        );
         let (code, _, err) = export_cli(devnet.clone(), 10, &b, &config).await;
         assert_eq!(code, 0, "{err}");
 
@@ -506,19 +621,8 @@ mod tests {
             parent,
             consensus_types::primitives::B256::repeat_byte(0x88),
         );
-        let parent = other.root(8);
-        other.reparent(
-            9,
-            parent,
-            consensus_types::primitives::B256::repeat_byte(0x89),
-        );
-        let parent = other.root(9);
-        other.reparent(
-            10,
-            parent,
-            consensus_types::primitives::B256::repeat_byte(0x8a),
-        );
-        let (code, _, err) = export_cli(other, 10, &c, &config).await;
+        other.rechain(8);
+        let (code, exported_c, err) = export_cli(other, 10, &c, &config).await;
         assert_eq!(code, 0, "{err}");
 
         let (da, db, dc) = (
@@ -531,6 +635,18 @@ mod tests {
         assert!(
             out.contains(": ok, devnet fixture-devnet source cl-1-lighthouse-geth"),
             "{out}"
+        );
+        // Pinned by the digest the export printed; another export's digest is refused.
+        let pin = |out: &str| out.trim_end().rsplit(' ').next().unwrap().to_owned();
+        let (pin_a, pin_c) = (pin(&exported_a), pin(&exported_c));
+        let (code, out, err) = run_args(&["verify", "--sha256", &pin_a, da.to_str().unwrap()]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.ends_with(&format!("export_sha256 {pin_a}\n")), "{out}");
+        let (code, _, err) = run_args(&["verify", "--sha256", &pin_c, da.to_str().unwrap()]);
+        assert_eq!(code, EXIT_FAILED);
+        assert!(
+            err.contains("refused") && err.contains("not the pinned"),
+            "{err}"
         );
 
         let (code, out, err) = run_args(&["diff", da.to_str().unwrap(), db.to_str().unwrap()]);
@@ -570,7 +686,7 @@ mod tests {
         };
         let e = run_export(&base).unwrap_err();
         assert!(e.contains("--api") && e.contains("loopback"), "{e}");
-        base.api = "http://127.0.0.1:1".into();
+        base.api = "http://127.0.0.1:5052".into();
         let e = run_export(&base).unwrap_err();
         assert!(e.contains("config.yaml"), "missing config: {e}");
         std::fs::write(&config, "PRESET_BASE: 'minimal'\n").unwrap();
@@ -582,9 +698,13 @@ mod tests {
         std::fs::write(&config, vec![b'#'; MAX_CONFIG_BYTES as usize + 1]).unwrap();
         let e = run_export(&base).unwrap_err();
         assert!(e.contains("over"), "{e}");
-        // A mainnet config reaches the API (nothing listens on port 1).
+        // A mainnet config reaches the API: a node that hangs up on every connection.
+        let node = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        base.api = format!("http://{}", node.local_addr().unwrap());
+        let hang_up = std::thread::spawn(move || drop(node.accept()));
         std::fs::write(&config, CONFIG.replace("'minimal'", "'mainnet'")).unwrap();
         let e = run_export(&base).unwrap_err();
-        assert!(e.contains("connect"), "{e}");
+        assert!(e.contains(FINALIZED_HEADER_PATH), "{e}");
+        hang_up.join().unwrap();
     }
 }

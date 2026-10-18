@@ -649,6 +649,20 @@ fn create_dir_all_durable(dir: &Path, sync: &mut SyncFault) -> Result<(), Archiv
     Ok(())
 }
 
+/// Creates `dir` exclusively, after any missing parent ([`create_dir_all_durable`]), and makes
+/// it durable in its parent: of two callers racing for one `dir`, exactly one succeeds and the
+/// other gets `AlreadyExists`, so `dir` is claimed before anything is written into it.
+pub(crate) fn create_dir_new_durable(dir: &Path) -> Result<(), ArchiveError> {
+    let mut sync = SyncFault::default();
+    let parent = dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    create_dir_all_durable(parent, &mut sync)?;
+    create_dir(dir)?;
+    sync_dir(parent, &mut sync)
+}
+
 /// fsyncs a directory, so a create or rename in it is durable.
 fn sync_dir(dir: &Path, fault: &mut SyncFault) -> Result<(), ArchiveError> {
     File::open(dir)

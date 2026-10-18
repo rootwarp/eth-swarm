@@ -9,7 +9,8 @@
 //!   are computed from the records afterwards.
 //! - [`export_blocks`]: a devnet's blocks and roots from genesis to an export slot, plus its
 //!   genesis state, read from a beacon API into an archive segment and an `export.toml` that
-//!   [`export_blocks::open_export`] verifies (through [`archive::open_verified`]) before replay.
+//!   [`export_blocks::open_export_pinned`] verifies (through [`archive::open_verified`]) against
+//!   the `export_sha256` from the run log before replay.
 //!
 //! The crate never links `cl-sync`: replay reads `anchor-fetch`'s output directory instead.
 

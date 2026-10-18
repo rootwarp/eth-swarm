@@ -19,8 +19,10 @@ use std::time::Duration;
 pub const BLOCK_PATH: &str = "/eth/v2/beacon/blocks/{slot}";
 /// `GET /eth/v1/beacon/blocks/{slot}/root`.
 pub const BLOCK_ROOT_PATH: &str = "/eth/v1/beacon/blocks/{slot}/root";
-/// `GET /eth/v2/debug/beacon/states/genesis` (SSZ).
-pub const GENESIS_STATE_PATH: &str = "/eth/v2/debug/beacon/states/genesis";
+/// `GET /eth/v2/debug/beacon/states/{state_root}` (SSZ): the genesis state, by the genesis
+/// block's `state_root`. Every CL serves a state by its root; not every one serves the
+/// `genesis` id (Lodestar without `--serveHistoricalState` answers 500).
+pub const GENESIS_STATE_PATH: &str = "/eth/v2/debug/beacon/states/{state_root}";
 /// `GET /eth/v1/beacon/headers/finalized`.
 pub const FINALIZED_HEADER_PATH: &str = "/eth/v1/beacon/headers/finalized";
 
@@ -39,14 +41,15 @@ impl<'a> BeaconApi<'a> {
         Self { url, timeout }
     }
 
-    /// The slot of the finalized block header.
-    pub(crate) async fn finalized_slot(&self) -> Result<Slot, ExportError> {
+    /// The finalized block header's slot and root.
+    pub(crate) async fn finalized(&self) -> Result<(Slot, Root), ExportError> {
         #[derive(serde::Deserialize)]
         struct Data {
             data: Header,
         }
         #[derive(serde::Deserialize)]
         struct Header {
+            root: String,
             header: Signed,
         }
         #[derive(serde::Deserialize)]
@@ -60,22 +63,34 @@ impl<'a> BeaconApi<'a> {
         let path = FINALIZED_HEADER_PATH;
         let body = self.fetch(path, path, JSON, MAX_JSON_BYTES, None).await?;
         let d: Data = json(path, None, &body)?;
-        decimal(&d.data.header.message.slot)
-            .ok_or_else(|| bad(path, None, "the header slot is not a decimal u64"))
+        let slot = decimal(&d.data.header.message.slot)
+            .ok_or_else(|| bad(path, None, "the header slot is not a decimal u64"))?;
+        let root = root_hex(&d.data.root).ok_or_else(|| bad(path, None, NOT_A_ROOT))?;
+        Ok((slot, root))
     }
 
-    /// The genesis state's SSZ, at most `max` bytes, within `timeout`.
-    pub(crate) async fn genesis_state(
+    /// The SSZ of the state with root `state_root`, at most `max` bytes, within `timeout`;
+    /// `None` when the API answers 404.
+    pub(crate) async fn state_by_root(
         &self,
+        state_root: Root,
         max: usize,
         timeout: Duration,
-    ) -> Result<Bytes, ExportError> {
+    ) -> Result<Option<Bytes>, ExportError> {
         let path = GENESIS_STATE_PATH;
+        let path_and_query = format!("/eth/v2/debug/beacon/states/{state_root}");
         let api = Self {
             timeout,
             ..self.clone()
         };
-        api.fetch(path, path, SSZ, max, None).await
+        match api.fetch(path, &path_and_query, SSZ, max, None).await {
+            Ok(body) => Ok(Some(body)),
+            Err(ExportError::Api {
+                source: ApiError::Status { status: 404, .. },
+                ..
+            }) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// The block at `slot` as SSZ, at most `max` bytes; `None` when the API answers 404 (an
@@ -95,8 +110,8 @@ impl<'a> BeaconApi<'a> {
         }
     }
 
-    /// The API's root of the block at `slot`.
-    pub(crate) async fn block_root(&self, slot: Slot) -> Result<Root, ExportError> {
+    /// The API's root of the block at `slot`; `None` when the API answers 404 (no block).
+    pub(crate) async fn block_root(&self, slot: Slot) -> Result<Option<Root>, ExportError> {
         #[derive(serde::Deserialize)]
         struct Data {
             data: RootData,
@@ -107,16 +122,21 @@ impl<'a> BeaconApi<'a> {
         }
         let path = BLOCK_ROOT_PATH;
         let path_and_query = format!("/eth/v1/beacon/blocks/{slot}/root");
-        let body = self
+        let body = match self
             .fetch(path, &path_and_query, JSON, MAX_JSON_BYTES, Some(slot))
-            .await?;
+            .await
+        {
+            Ok(body) => body,
+            Err(ExportError::Api {
+                source: ApiError::Status { status: 404, .. },
+                ..
+            }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
         let d: Data = json(path, Some(slot), &body)?;
-        d.data
-            .root
-            .strip_prefix("0x")
-            .and_then(canonical_hex::<32>)
-            .map(Root::from)
-            .ok_or_else(|| bad(path, Some(slot), "the root is not 0x and 64 lowercase hex"))
+        root_hex(&d.data.root)
+            .map(Some)
+            .ok_or_else(|| bad(path, Some(slot), NOT_A_ROOT))
     }
 
     /// `GET`, a 200 of content type `accept`, and at most `max` body bytes, all within the
@@ -166,6 +186,15 @@ impl<'a> BeaconApi<'a> {
                 })
             })?
     }
+}
+
+const NOT_A_ROOT: &str = "the root is not 0x and 64 lowercase hex";
+
+/// A root as the API writes it: `0x` and 64 lowercase hex digits.
+fn root_hex(text: &str) -> Option<Root> {
+    text.strip_prefix("0x")
+        .and_then(canonical_hex::<32>)
+        .map(Root::from)
 }
 
 fn bad(path: &'static str, slot: Option<Slot>, reason: &str) -> ExportError {

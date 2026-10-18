@@ -51,7 +51,7 @@ pub use payload::{
 };
 pub(crate) use verify::read_regular;
 pub use verify::{open_verified, Archive};
-pub(crate) use writer::write_durable;
 #[cfg(any(test, feature = "test-support"))]
 pub use writer::Fault;
+pub(crate) use writer::{create_dir_new_durable, write_durable};
 pub use writer::{Capture, CaptureConfig, Stored, Writer, OPEN_PREFIX};

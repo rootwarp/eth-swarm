@@ -1,18 +1,18 @@
 //! [`export`]: read a devnet's blocks from genesis to an export slot, cross-check them, and
 //! write them as an archive segment with an `export.toml`.
 
-use super::api::BeaconApi;
+use super::api::{BeaconApi, BLOCK_ROOT_PATH};
 use super::manifest::{
-    validate_image, validate_label, BlockEntry, DigestEntry, ExportManifest, ForkEntry,
-    SegmentEntry, StateFile, EXPORT_FILE, GENESIS_STATE_FILE, MAX_SOURCE_LEN,
+    validate_image, validate_label, BlockEntry, DigestEntry, ExportManifest, ExportManifestError,
+    ForkEntry, SegmentEntry, StateFile, EXPORT_FILE, GENESIS_STATE_FILE, MAX_SOURCE_LEN,
 };
 use super::open::{open_export, Export};
 use super::ExportError;
 use crate::archive::{
-    open_verified, validate_network, write_durable, Capture, CaptureConfig, ChainParams,
-    ForkDigest, Writer,
+    create_dir_new_durable, open_verified, validate_network, write_durable, ArchiveError, Capture,
+    CaptureConfig, ChainParams, ForkDigest, Writer, MAX_MANIFEST_LEN,
 };
-use crate::collector::ReferenceApiUrl;
+use crate::collector::{ApiError, ReferenceApiUrl};
 use consensus_types::caps::{NetworkCaps, MAX_PAYLOAD_SIZE};
 use consensus_types::forked::{BeaconState, SignedBeaconBlock};
 use consensus_types::primitives::{Epoch, ForkName, Root, Slot};
@@ -34,10 +34,13 @@ pub const EXPORT_CLOCK_SOURCE: &str = "beacon-api";
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// The default deadline of the genesis state request.
 pub const DEFAULT_STATE_TIMEOUT: Duration = Duration::from_secs(300);
-/// The default bound on the genesis state: 256 MiB, far above a devnet's (a minimal-preset
-/// state of 128 validators is well under 1 MiB) and a mainnet-preset state of a few hundred
-/// thousand validators.
-pub const DEFAULT_MAX_STATE_BYTES: usize = 256 << 20;
+/// The largest genesis state an export reads, writes or opens: 256 MiB, far above a devnet's
+/// (a minimal-preset state of 128 validators is well under 1 MiB) and a mainnet-preset state
+/// of a few hundred thousand validators. [`ExportConfig::max_state_bytes`] may lower it, never
+/// raise it, and [`open_export`] refuses a larger file before reading it.
+pub const MAX_GENESIS_STATE_BYTES: u64 = 256 << 20;
+/// The default bound on the genesis state: [`MAX_GENESIS_STATE_BYTES`].
+pub const DEFAULT_MAX_STATE_BYTES: usize = MAX_GENESIS_STATE_BYTES as usize;
 
 /// What an export reads and records.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +60,7 @@ pub struct ExportConfig {
     pub request_timeout: Duration,
     /// The deadline of the genesis state request.
     pub state_timeout: Duration,
-    /// The most genesis state bytes read.
+    /// The most genesis state bytes read: at most [`MAX_GENESIS_STATE_BYTES`].
     pub max_state_bytes: usize,
 }
 
@@ -79,13 +82,18 @@ struct Walked {
 /// [`open_export`].
 ///
 /// It reads the finalized header (the export slot must be at or before it), then the genesis
-/// state, then every slot from 0 to the export slot: a 404 records the slot as empty; a block is
+/// block and the genesis state by that block's `state_root` (it must hash to it), claims `<out>/<devnet>` with an exclusive `mkdir` (a second export into it fails
+/// with [`ExportError::Exists`] before writing anything), then walks every slot from 0 to the
+/// finalized one. A slot is empty only when both its block and its root answer 404; a block is
 /// decoded with the fork of its own slot, must be at the slot asked for, must hash to the API's
-/// root for that slot, and must have the previous exported block as its parent (the genesis
-/// block a zero parent and the genesis state's root as its `state_root`). The blocks go into an
-/// archive segment as snappy-compressed SSZ, then the genesis state and, last, `export.toml`
-/// are written. Any failure stops the export: the segment is sealed as stopped and no
-/// `export.toml` is written, so the directory never opens as an export.
+/// root for that slot, and must have the previous block as its parent (the genesis block a zero
+/// parent and the genesis state's root as its `state_root`). The blocks to the export slot go
+/// into an archive segment as snappy-compressed SSZ; the ones after it are only checked, and
+/// the walk must end on the finalized header's block, so the export, its trailing empty slots
+/// included, is a prefix of the finalized chain. This reads every block between the export slot
+/// and the finalized one. Then the genesis state and, last, `export.toml` are written. Any
+/// failure stops the export: the segment is sealed as stopped and no `export.toml` is written,
+/// so the directory never opens as an export.
 pub async fn export<E: EthSpec>(
     url: &ReferenceApiUrl,
     chain: &ChainConfig,
@@ -103,18 +111,30 @@ pub async fn export<E: EthSpec>(
         Err(e) => return Err(ExportError::io(&dir)(e)),
     }
     let api = BeaconApi::new(url, config.request_timeout);
-    let finalized = api.finalized_slot().await?;
+    let (finalized, finalized_root) = api.finalized().await?;
     if config.to_slot > finalized {
         return Err(ExportError::NotFinalized {
             to: config.to_slot,
             finalized,
         });
     }
-    let genesis = read_genesis::<E>(&api, chain, config).await?;
+    let Some(genesis_block) = fetch_block::<E>(&api, chain, 0).await? else {
+        return Err(ExportError::Genesis(
+            "the API has no block at slot 0".into(),
+        ));
+    };
+    let genesis = read_genesis::<E>(&api, chain, config, genesis_block.state_root).await?;
     let digests: Vec<(Epoch, ForkDigest)> = digest_schedule(chain, &genesis.validators_root.0)
         .into_iter()
         .map(|d| (d.epoch, d.fork_digest))
         .collect();
+    // Claimed before anything is written: a second export into the directory fails here.
+    match create_dir_new_durable(&dir) {
+        Err(ArchiveError::Io { source, .. }) if source.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(ExportError::Exists(dir))
+        }
+        claimed => claimed?,
+    }
     let params = ChainParams {
         schedule: *chain.fork_schedule(),
         caps: NetworkCaps::from_config(chain),
@@ -134,7 +154,16 @@ pub async fn export<E: EthSpec>(
         },
         params,
     )?;
-    let walked = walk::<E>(&api, &mut writer, chain, config.to_slot, &genesis, &digests).await;
+    let walk = Walk {
+        api: &api,
+        chain,
+        to: config.to_slot,
+        finalized,
+        finalized_root,
+        genesis: &genesis,
+        digests: &digests,
+    };
+    let walked = walk.run(&mut writer).await;
     let walked = match walked {
         Ok(walked) => walked,
         Err(e) => {
@@ -196,12 +225,29 @@ pub async fn export<E: EthSpec>(
         segments,
         blocks: walked.blocks,
     };
+    let path = dir.join(EXPORT_FILE);
     let (bytes, _) = manifest.render().map_err(|source| ExportError::Manifest {
-        path: dir.join(EXPORT_FILE),
+        path: path.clone(),
         source,
     })?;
+    check_manifest_len(&path, &bytes, MAX_MANIFEST_LEN)?;
     write_durable(&dir, EXPORT_FILE, &bytes, None, &mut None)?;
     open_export(&dir)
+}
+
+/// The manifest is at most `max` bytes, the bound [`open_export`] reads one to, so an export
+/// it would refuse is never written.
+pub(super) fn check_manifest_len(path: &Path, bytes: &[u8], max: u64) -> Result<(), ExportError> {
+    if bytes.len() as u64 > max {
+        return Err(ExportError::Manifest {
+            path: path.to_owned(),
+            source: ExportManifestError::Invalid(format!(
+                "{} bytes, over {max} bytes",
+                bytes.len()
+            )),
+        });
+    }
+    Ok(())
 }
 
 fn check_config<E: EthSpec>(
@@ -220,6 +266,12 @@ fn check_config<E: EthSpec>(
     if config.to_slot > i64::MAX as u64 {
         return refuse(format!("export slot {} is out of range", config.to_slot));
     }
+    if config.max_state_bytes as u64 > MAX_GENESIS_STATE_BYTES {
+        return refuse(format!(
+            "max_state_bytes {} is over {MAX_GENESIS_STATE_BYTES}, the most an export opens",
+            config.max_state_bytes
+        ));
+    }
     if images.is_empty() {
         return refuse("name the devnet's images (repo:tag@sha256:<digest>)".into());
     }
@@ -232,15 +284,22 @@ fn check_config<E: EthSpec>(
     Ok(())
 }
 
-/// Reads the genesis state, decodes it with the fork of slot 0 and checks it is at slot 0.
+/// Reads the genesis state by `state_root`, the genesis block's, decodes it with the fork of
+/// slot 0 and checks it is at slot 0 and hashes to `state_root`.
 async fn read_genesis<E: EthSpec>(
     api: &BeaconApi<'_>,
     chain: &ChainConfig,
     config: &ExportConfig,
+    state_root: Root,
 ) -> Result<Genesis, ExportError> {
     let ssz = api
-        .genesis_state(config.max_state_bytes, config.state_timeout)
-        .await?;
+        .state_by_root(state_root, config.max_state_bytes, config.state_timeout)
+        .await?
+        .ok_or_else(|| {
+            ExportError::Genesis(format!(
+                "the API has no state at the slot 0 block's state_root {state_root}"
+            ))
+        })?;
     let state = BeaconState::<E>::from_ssz_bytes_by_slot(&ssz, chain.fork_schedule()).map_err(
         |source| ExportError::Decode {
             what: "genesis state",
@@ -259,8 +318,14 @@ async fn read_genesis<E: EthSpec>(
         BeaconState::Fulu(s) => (s.genesis_time, s.genesis_validators_root),
         BeaconState::Gloas(s) => (s.genesis_time, s.genesis_validators_root),
     };
+    let root = state.tree_hash_root();
+    if root != state_root {
+        return Err(ExportError::Genesis(format!(
+            "the state served for the slot 0 block's state_root {state_root} hashes to {root}"
+        )));
+    }
     Ok(Genesis {
-        root: state.tree_hash_root(),
+        root,
         ssz,
         time,
         validators_root,
@@ -268,7 +333,10 @@ async fn read_genesis<E: EthSpec>(
 }
 
 /// The digest of `digests` (ascending by epoch) in force at `slot`.
-fn digest_at<E: EthSpec>(digests: &[(Epoch, ForkDigest)], slot: Slot) -> Option<ForkDigest> {
+pub(super) fn digest_at<E: EthSpec>(
+    digests: &[(Epoch, ForkDigest)],
+    slot: Slot,
+) -> Option<ForkDigest> {
     let epoch = E::epoch_at_slot(slot);
     digests
         .iter()
@@ -277,26 +345,26 @@ fn digest_at<E: EthSpec>(digests: &[(Epoch, ForkDigest)], slot: Slot) -> Option<
         .map(|(_, d)| *d)
 }
 
-/// The block at `slot` continues the chain exported so far: the genesis block has a zero
-/// parent and the genesis state's root; every later one has the last exported block, before
-/// any empty slots, as its parent.
-fn check_parent(
-    exported: &[BlockEntry],
+/// The block at `slot` continues the chain walked so far: the genesis block has a zero
+/// parent and the genesis state's root; every later one has the last block before it (`tip`,
+/// across any empty slots) as its parent.
+pub(super) fn check_parent(
+    tip: Option<&BlockEntry>,
     slot: Slot,
     parent_root: Root,
     state_root: Root,
-    genesis: &Genesis,
+    genesis_state_root: Root,
 ) -> Result<(), ExportError> {
-    let Some(previous) = exported.last() else {
+    let Some(previous) = tip else {
         if parent_root != Root::ZERO {
             return Err(ExportError::Genesis(format!(
                 "the slot 0 block's parent {parent_root} is not zero"
             )));
         }
-        if state_root != genesis.root {
+        if state_root != genesis_state_root {
             return Err(ExportError::Genesis(format!(
-                "the slot 0 block's state_root {state_root} is not the genesis state's root {}",
-                genesis.root
+                "the slot 0 block's state_root {state_root} is not the genesis state's root \
+                 {genesis_state_root}"
             )));
         }
         return Ok(());
@@ -312,79 +380,167 @@ fn check_parent(
     Ok(())
 }
 
-/// Every slot from 0 to `to`: fetched, decoded, cross-checked and archived.
-async fn walk<E: EthSpec>(
-    api: &BeaconApi<'_>,
-    writer: &mut Writer<E>,
-    chain: &ChainConfig,
+/// A block as read and checked: its SSZ and its entry; and its `state_root`.
+struct Fetched {
+    ssz: bytes::Bytes,
+    entry: BlockEntry,
+    state_root: Root,
+}
+
+/// The slot walk: from genesis to the finalized block, the export slot's blocks archived.
+struct Walk<'a> {
+    api: &'a BeaconApi<'a>,
+    chain: &'a ChainConfig,
+    /// The export slot.
     to: Slot,
-    genesis: &Genesis,
-    digests: &[(Epoch, ForkDigest)],
-) -> Result<Walked, ExportError> {
-    let mut walked = Walked {
-        blocks: Vec::new(),
-        empty_slots: Vec::new(),
-    };
-    for slot in 0..=to {
-        let Some(ssz) = api.block(slot, MAX_PAYLOAD_SIZE).await? else {
-            if slot == 0 {
-                return Err(ExportError::Genesis(
-                    "the API has no block at slot 0".into(),
-                ));
-            }
-            walked.empty_slots.push(slot);
-            continue;
+    /// The finalized header's slot.
+    finalized: Slot,
+    /// The finalized header's root.
+    finalized_root: Root,
+    genesis: &'a Genesis,
+    digests: &'a [(Epoch, ForkDigest)],
+}
+
+impl Walk<'_> {
+    /// Every slot from 0 to the finalized one is fetched, decoded and cross-checked, and the
+    /// chain must end on the finalized block; the slots to the export slot are archived. The
+    /// slots after the export slot anchor its trailing empty slots: the first block after them
+    /// has the last exported block as its parent, and so on up to the finalized block.
+    async fn run<E: EthSpec>(&self, writer: &mut Writer<E>) -> Result<Walked, ExportError> {
+        let mut walked = Walked {
+            blocks: Vec::new(),
+            empty_slots: Vec::new(),
         };
-        let block = SignedBeaconBlock::<E>::from_ssz_bytes_by_slot(&ssz, chain.fork_schedule())
-            .map_err(|source| ExportError::Decode {
-                what: "block",
-                slot: Some(slot),
-                source,
-            })?;
-        if block.slot() != slot {
-            return Err(ExportError::SlotMismatch {
-                what: "block",
-                requested: slot,
-                got: block.slot(),
-            });
-        }
-        let (root, parent_root, state_root) = match &block {
-            SignedBeaconBlock::Fulu(b) => (
-                b.message.tree_hash_root(),
-                b.message.parent_root,
-                b.message.state_root,
-            ),
-            SignedBeaconBlock::Gloas(b) => (
-                b.message.tree_hash_root(),
-                b.message.parent_root,
-                b.message.state_root,
-            ),
-        };
-        let api_root = api.block_root(slot).await?;
-        if api_root != root {
-            return Err(ExportError::RootMismatch {
+        let mut tip: Option<BlockEntry> = None;
+        for slot in 0..=self.finalized {
+            let Some(block) = self.fetch::<E>(slot).await? else {
+                if slot == 0 {
+                    return Err(ExportError::Genesis(
+                        "the API has no block at slot 0".into(),
+                    ));
+                }
+                if slot <= self.to {
+                    walked.empty_slots.push(slot);
+                }
+                continue;
+            };
+            let entry = block.entry;
+            check_parent(
+                tip.as_ref(),
                 slot,
-                api: api_root,
-                computed: root,
+                entry.parent_root,
+                block.state_root,
+                self.genesis.root,
+            )?;
+            if slot <= self.to {
+                self.archive(writer, slot, &block.ssz)?;
+                walked.blocks.push(entry);
+            }
+            tip = Some(entry);
+        }
+        let tip = tip.expect("slot 0 has a block");
+        if (tip.slot, tip.root) != (self.finalized, self.finalized_root) {
+            return Err(ExportError::FinalizedMismatch {
+                slot: self.finalized,
+                root: self.finalized_root,
+                chain_slot: tip.slot,
+                chain_root: tip.root,
             });
         }
-        check_parent(&walked.blocks, slot, parent_root, state_root, genesis)?;
-        let digest = digest_at::<E>(digests, slot).ok_or_else(|| {
+        Ok(walked)
+    }
+
+    /// [`fetch_block`] from this walk's API and chain.
+    async fn fetch<E: EthSpec>(&self, slot: Slot) -> Result<Option<Fetched>, ExportError> {
+        fetch_block::<E>(self.api, self.chain, slot).await
+    }
+
+    /// Files the block's SSZ, snappy-compressed, under the digest in force at its slot.
+    fn archive<E: EthSpec>(
+        &self,
+        writer: &mut Writer<E>,
+        slot: Slot,
+        ssz: &[u8],
+    ) -> Result<(), ExportError> {
+        let digest = digest_at::<E>(self.digests, slot).ok_or_else(|| {
             ExportError::Config(format!("the config has no fork digest at slot {slot}"))
         })?;
         let payload = snap::raw::Encoder::new()
-            .compress_vec(&ssz)
+            .compress_vec(ssz)
             .map_err(|e| ExportError::Config(format!("slot {slot}: snappy: {e}")))?;
         writer.put(Capture {
             topic: BLOCK_TOPIC,
             fork_digest: digest,
             payload: &payload,
         })?;
-        walked.blocks.push(BlockEntry {
+        Ok(())
+    }
+}
+
+/// The block at `slot`, decoded with the fork of its slot, at that slot and hashing to
+/// the API's root for it; `None` when both the block and the root endpoint answer 404.
+async fn fetch_block<E: EthSpec>(
+    api: &BeaconApi<'_>,
+    chain: &ChainConfig,
+    slot: Slot,
+) -> Result<Option<Fetched>, ExportError> {
+    let Some(ssz) = api.block(slot, MAX_PAYLOAD_SIZE).await? else {
+        return match api.block_root(slot).await? {
+            None => Ok(None),
+            Some(root) => Err(ExportError::HiddenBlock { slot, root }),
+        };
+    };
+    let block = SignedBeaconBlock::<E>::from_ssz_bytes_by_slot(&ssz, chain.fork_schedule())
+        .map_err(|source| ExportError::Decode {
+            what: "block",
+            slot: Some(slot),
+            source,
+        })?;
+    if block.slot() != slot {
+        return Err(ExportError::SlotMismatch {
+            what: "block",
+            requested: slot,
+            got: block.slot(),
+        });
+    }
+    let (root, parent_root, state_root) = block_fields(&block);
+    let api_root = api.block_root(slot).await?.ok_or(ExportError::Api {
+        slot: Some(slot),
+        source: ApiError::Status {
+            path: BLOCK_ROOT_PATH,
+            status: 404,
+        },
+    })?;
+    if api_root != root {
+        return Err(ExportError::RootMismatch {
+            slot,
+            api: api_root,
+            computed: root,
+        });
+    }
+    Ok(Some(Fetched {
+        ssz,
+        entry: BlockEntry {
             slot,
             root,
             parent_root,
-        });
+        },
+        state_root,
+    }))
+}
+
+/// `hash_tree_root(message)`, `parent_root` and `state_root` of a block.
+pub(super) fn block_fields<E: EthSpec>(block: &SignedBeaconBlock<E>) -> (Root, Root, Root) {
+    match block {
+        SignedBeaconBlock::Fulu(b) => (
+            b.message.tree_hash_root(),
+            b.message.parent_root,
+            b.message.state_root,
+        ),
+        SignedBeaconBlock::Gloas(b) => (
+            b.message.tree_hash_root(),
+            b.message.parent_root,
+            b.message.state_root,
+        ),
     }
-    Ok(walked)
 }

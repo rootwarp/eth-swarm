@@ -1,7 +1,7 @@
 //! Exports from a fixture beacon node: a Minimal-preset chain with Fulu from genesis and Gloas
 //! from [`GLOAS_SLOT`], served over HTTP on 127.0.0.1.
 
-use super::fixtures::{chain, config, config_sha256, Devnet, GENESIS_TIME, IMAGE};
+use super::fixtures::{self, chain, config, config_sha256, Devnet, GENESIS_TIME, IMAGE};
 use super::*;
 use crate::archive::fixtures::{Spec, GLOAS_SLOT};
 use crate::archive::open_verified;
@@ -187,6 +187,198 @@ async fn the_genesis_block_must_commit_to_the_genesis_state() {
     );
 }
 
+/// Serves `devnet`, but answers `replies` for their paths.
+async fn serve_with(devnet: Devnet, replies: Vec<(String, Reply)>) -> FixtureServer {
+    FixtureServer::start(move |_, path| {
+        replies
+            .iter()
+            .find(|(p, _)| p == path)
+            .map_or_else(|| devnet.reply(path), |(_, r)| r.clone())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn the_genesis_state_is_read_by_its_root() {
+    // As Lodestar without --serveHistoricalState: no state by the `genesis` id or slot 0, only
+    // by its root (the genesis block's state_root).
+    let out = tempfile::tempdir().unwrap();
+    let devnet = Devnet::new(4, &[]);
+    let refused = Reply::status(500);
+    let server = serve_with(
+        devnet.clone(),
+        vec![
+            (
+                "/eth/v2/debug/beacon/states/genesis".into(),
+                refused.clone(),
+            ),
+            ("/eth/v2/debug/beacon/states/0".into(), refused),
+        ],
+    )
+    .await;
+    let export = export::<Spec>(&server.url(""), &chain(), &config(4), out.path())
+        .await
+        .unwrap();
+    assert_eq!(export.genesis_state_ssz().unwrap(), devnet.state);
+    assert_eq!(export.manifest().genesis_state_root, devnet.state_root);
+}
+
+#[tokio::test]
+async fn a_genesis_state_request_failure_names_the_endpoint_only() {
+    const KEY: &str = "/key-hunter2";
+    let devnet = Devnet::new(4, &[]);
+    let by_root = format!("/eth/v2/debug/beacon/states/{}", devnet.state_root);
+    for reply in [Reply::status(500), Reply::status(503)] {
+        let out = tempfile::tempdir().unwrap();
+        let (devnet, by_root) = (devnet.clone(), by_root.clone());
+        let server = FixtureServer::start(move |_, path| {
+            let path = path.strip_prefix(KEY).unwrap_or(path);
+            if path == by_root {
+                reply.clone()
+            } else {
+                devnet.reply(path)
+            }
+        })
+        .await;
+        let err = export::<Spec>(&server.url(KEY), &chain(), &config(4), out.path())
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(GENESIS_STATE_PATH), "{text}");
+        assert!(
+            !text.contains("hunter2") && !text.contains("127.0.0.1"),
+            "{text}"
+        );
+    }
+
+    // A state served for the root that hashes to another root.
+    let out = tempfile::tempdir().unwrap();
+    let mut devnet = Devnet::new(4, &[]);
+    let mut other = fixtures::genesis_state();
+    other.genesis_time += 1;
+    let (state_root, by_root) = (devnet.state_root, by_root.clone());
+    devnet.state = other.as_ssz_bytes();
+    let server = serve_with(
+        devnet.clone(),
+        vec![(by_root, Reply::ssz(devnet.state.clone()))],
+    )
+    .await;
+    let err = export::<Spec>(&server.url(""), &chain(), &config(4), out.path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ExportError::Genesis(m) if m.contains(&state_root.to_string())),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_block_404_with_a_served_root_fails() {
+    let out = tempfile::tempdir().unwrap();
+    let devnet = Devnet::new(6, &[]);
+    let hidden = devnet.root(3);
+    let server = serve_with(
+        devnet,
+        vec![("/eth/v2/beacon/blocks/3".into(), Reply::status(404))],
+    )
+    .await;
+    let err = export::<Spec>(&server.url(""), &chain(), &config(6), out.path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ExportError::HiddenBlock { slot: 3, root } if root == hidden),
+        "{err}"
+    );
+    assert_no_export(out.path());
+}
+
+#[tokio::test]
+async fn a_trailing_block_hidden_behind_404s_fails_against_the_finalized_chain() {
+    // The CL hides slot 6, block and root: inside the export it looks empty, but the next
+    // block on the way to the finalized one has it as its parent.
+    let out = tempfile::tempdir().unwrap();
+    let devnet = Devnet::new(6, &[]);
+    let (r5, r6) = (devnet.root(5), devnet.root(6));
+    let server = serve_with(
+        devnet,
+        vec![
+            ("/eth/v2/beacon/blocks/6".into(), Reply::status(404)),
+            ("/eth/v1/beacon/blocks/6/root".into(), Reply::status(404)),
+        ],
+    )
+    .await;
+    let err = export::<Spec>(&server.url(""), &chain(), &config(6), out.path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ExportError::ParentMismatch { slot: 7, parent_root, expected_slot: 5, expected }
+                if parent_root == r6 && expected == r5
+        ),
+        "{err}"
+    );
+    assert_no_export(out.path());
+}
+
+#[tokio::test]
+async fn the_export_is_anchored_at_the_finalized_block() {
+    // The finalized header names a root that is not the chain's block at its slot.
+    let out = tempfile::tempdir().unwrap();
+    let devnet = Devnet::new(4, &[]);
+    let finalized = devnet.finalized;
+    let chain_root = devnet.root(finalized);
+    let header = fixtures::finalized_header(finalized, B256::repeat_byte(0xfa));
+    let server = serve_with(
+        devnet,
+        vec![(FINALIZED_HEADER_PATH.into(), Reply::json(&header))],
+    )
+    .await;
+    let err = export::<Spec>(&server.url(""), &chain(), &config(4), out.path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ExportError::FinalizedMismatch { slot, root, chain_slot, chain_root: c }
+                if slot == finalized && root == B256::repeat_byte(0xfa)
+                    && chain_slot == finalized && c == chain_root
+        ),
+        "{err}"
+    );
+    assert_no_export(out.path());
+
+    // The finalized block is not at the header's slot: the chain's last block is earlier.
+    let out = tempfile::tempdir().unwrap();
+    let mut devnet = Devnet::new(4, &[]);
+    let finalized = devnet.finalized;
+    devnet.blocks.remove(&finalized);
+    let last = devnet.root(finalized - 1);
+    let header = fixtures::finalized_header(finalized, last);
+    let server = serve_with(
+        devnet,
+        vec![(FINALIZED_HEADER_PATH.into(), Reply::json(&header))],
+    )
+    .await;
+    let err = export::<Spec>(&server.url(""), &chain(), &config(4), out.path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ExportError::FinalizedMismatch { chain_slot, .. } if chain_slot == finalized - 1),
+        "{err}"
+    );
+
+    // An export to the finalized slot itself ends on the finalized block.
+    let out = tempfile::tempdir().unwrap();
+    let devnet = Devnet::new(4, &[]);
+    let finalized = devnet.finalized;
+    let export = run(devnet.clone(), finalized, out.path()).await.unwrap();
+    assert_eq!(
+        export.manifest().blocks.last().unwrap().root,
+        devnet.root(finalized)
+    );
+}
+
 #[tokio::test]
 async fn blocks_decode_by_the_fork_of_their_own_slot() {
     // Both forks export: Fulu blocks before GLOAS_SLOT, Gloas blocks from it.
@@ -368,10 +560,7 @@ async fn two_exports_of_one_chain_have_identical_root_lists() {
     let mut other = devnet.clone();
     let r5 = other.root(5);
     other.reparent(6, r5, B256::repeat_byte(0x66));
-    for slot in [7, 8, 10, 11, 12] {
-        let parent = other.blocks.range(..slot).next_back().unwrap().1.api_root;
-        other.reparent(slot, parent, B256::repeat_byte(slot as u8));
-    }
+    other.rechain(6);
     let ec = run(other.clone(), 12, c.path()).await.unwrap();
     assert_eq!(
         diff_root_lists(&ea.root_list(), &ec.root_list()),
@@ -448,6 +637,12 @@ async fn an_export_is_refused_before_it_starts() {
     let mut c = config(4);
     c.to_slot = u64::MAX;
     assert!(matches!(refuse(c).await, ExportError::Config(_)));
+    let mut c = config(4);
+    c.max_state_bytes = MAX_GENESIS_STATE_BYTES as usize + 1;
+    assert!(
+        matches!(refuse(c).await, ExportError::Config(m) if m.contains("max_state_bytes")),
+        "a state bound over what open_export reads"
+    );
     let err = export::<consensus_types::Mainnet>(&url, &chain(), &config(4), out.path())
         .await
         .unwrap_err();
@@ -479,10 +674,41 @@ async fn an_export_is_refused_before_it_starts() {
 }
 
 #[tokio::test]
+async fn concurrent_exports_into_one_directory_one_wins() {
+    let out = tempfile::tempdir().unwrap();
+    let devnet = Devnet::new(6, &[2]);
+    let (a, _) = devnet.clone().serve().await;
+    let (b, _) = devnet.serve().await;
+    let (url_a, url_b) = (a.url(""), b.url(""));
+    let (chain, config) = (chain(), config(6));
+    let (ra, rb) = tokio::join!(
+        export::<Spec>(&url_a, &chain, &config, out.path()),
+        export::<Spec>(&url_b, &chain, &config, out.path()),
+    );
+    let (won, lost) = match (ra, rb) {
+        (Ok(won), Err(lost)) | (Err(lost), Ok(won)) => (won, lost),
+        (a, b) => panic!("exactly one export wins: {:?} {:?}", a.err(), b.err()),
+    };
+    assert!(matches!(lost, ExportError::Exists(_)), "{lost}");
+    let entries: Vec<String> = std::fs::read_dir(won.dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        entries
+            .iter()
+            .all(|e| !e.starts_with(crate::archive::OPEN_PREFIX)),
+        "{entries:?}"
+    );
+    open_export(won.dir()).unwrap();
+}
+
+#[tokio::test]
 async fn api_failures_stop_the_export_without_quoting_the_url() {
     const KEY: &str = "/key-hunter2";
-    let cases: [(&str, Reply); 6] = [
+    let cases: [(&str, Reply); 8] = [
         ("/eth/v2/beacon/blocks/2", Reply::status(500)),
+        ("/eth/v1/beacon/blocks/2/root", Reply::status(500)),
         ("/eth/v2/beacon/blocks/2", Reply::json("{}")),
         (
             "/eth/v1/beacon/blocks/2/root",
@@ -492,7 +718,11 @@ async fn api_failures_stop_the_export_without_quoting_the_url() {
         ("/eth/v1/beacon/blocks/2/root", Reply::json("hunter2")),
         (
             FINALIZED_HEADER_PATH,
-            Reply::json(r#"{"data":{"header":{"message":{"slot":"+9"}}}}"#),
+            Reply::json(&fixtures::finalized_header(9, Root::ZERO).replace("\"9\"", "\"+9\"")),
+        ),
+        (
+            FINALIZED_HEADER_PATH,
+            Reply::json(r#"{"data":{"root":"0xAB","header":{"message":{"slot":"9"}}}}"#),
         ),
     ];
     for (broken, reply) in cases {
@@ -679,4 +909,367 @@ async fn open_export_checks_the_segments_against_the_manifest() {
         ExportError::Mismatch(_)
     ));
     assert_eq!(export.segments().len(), 1);
+}
+
+/// Rewrites the export's first segment from `edit` of its manifest (which may change its
+/// files), rehashing it, and returns the new archive digest.
+fn rewrite_segment(
+    export: &Export,
+    edit: impl FnOnce(&mut crate::archive::Manifest, &Path),
+) -> crate::archive::Sha256Digest {
+    use crate::archive::{Manifest, MANIFEST_FILE};
+    let dir = export.dir().join(&export.manifest().segments[0].dir);
+    let path = dir.join(MANIFEST_FILE);
+    let (mut m, _) = Manifest::parse(&std::fs::read(&path).unwrap()).unwrap();
+    edit(&mut m, &dir);
+    let (bytes, digest) = m.render().unwrap();
+    std::fs::write(path, bytes).unwrap();
+    digest
+}
+
+#[tokio::test]
+async fn open_export_refuses_a_dropped_interior_block() {
+    // The forger removes slot 4's block file and its segment entry, rehashes the segment,
+    // and lists slot 4 as empty with slot 5's parent as slot 3: every label and digest holds
+    // together, but slot 5's block says its parent is slot 4.
+    let out = tempfile::tempdir().unwrap();
+    let devnet = Devnet::new(6, &[]);
+    let export = run(devnet.clone(), 6, out.path()).await.unwrap();
+    let archive_sha256 = rewrite_segment(&export, |m, dir| {
+        let at = m.files.iter().position(|f| f.slot == 4).unwrap();
+        let file = m.files.remove(at);
+        m.total_bytes -= file.len;
+        std::fs::remove_file(dir.join(&file.path)).unwrap();
+    });
+    rewrite(&export, |m| {
+        m.blocks.retain(|b| b.slot != 4);
+        m.empty_slots = vec![4];
+        m.blocks
+            .iter_mut()
+            .find(|b| b.slot == 5)
+            .unwrap()
+            .parent_root = devnet.root(3);
+        m.segments[0].archive_sha256 = archive_sha256;
+    });
+    let err = open_export(export.dir()).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            ExportError::ParentMismatch { slot: 5, parent_root, .. } if *parent_root == devnet.root(4)
+        ),
+        "{err}"
+    );
+}
+
+/// Swaps the block file of `slot` for `ssz` (snappy-compressed), keeping its label, and
+/// rehashes the segment and the export manifest to match.
+fn replace_block(export: &Export, slot: Slot, ssz: &[u8]) {
+    use sha2::Digest;
+    let payload = crate::archive::fixtures::snappy(ssz);
+    let archive_sha256 = rewrite_segment(export, |m, dir| {
+        let file = m.files.iter_mut().find(|f| f.slot == slot).unwrap();
+        std::fs::write(dir.join(&file.path), &payload).unwrap();
+        m.total_bytes = m.total_bytes - file.len + payload.len() as u64;
+        file.len = payload.len() as u64;
+        file.sha256 = sha2::Sha256::digest(&payload).into();
+    });
+    rewrite(export, |m| m.segments[0].archive_sha256 = archive_sha256);
+}
+
+#[tokio::test]
+async fn open_export_decodes_every_block() {
+    let open = |ssz: Vec<u8>| async move {
+        let out = tempfile::tempdir().unwrap();
+        let export = run(Devnet::new(6, &[]), 6, out.path()).await.unwrap();
+        replace_block(&export, 4, &ssz);
+        open_export(export.dir()).unwrap_err()
+    };
+
+    // Bytes of the wrong fork's shape: Gloas at a Fulu slot.
+    let err = open(p2p_wire::testkit::gloas_block::<Spec>(4).as_ssz_bytes()).await;
+    assert!(
+        matches!(
+            err,
+            ExportError::Decode {
+                what: "block",
+                slot: Some(4),
+                ..
+            }
+        ),
+        "{err}"
+    );
+
+    // Another block at the slot: it does not hash to the listed root.
+    let (other, _) = fixtures::block(4, B256::repeat_byte(1), B256::repeat_byte(2));
+    let err = open(other).await;
+    assert!(
+        matches!(&err, ExportError::Mismatch(m) if m.contains("slot 4") && m.contains("root")),
+        "{err}"
+    );
+
+    // A block of another slot under slot 4's label.
+    let (other, _) = fixtures::block(3, B256::repeat_byte(1), B256::repeat_byte(2));
+    let err = open(other).await;
+    assert!(
+        matches!(&err, ExportError::Mismatch(m) if m.contains("slot 4") && m.contains("slot 3")),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn open_export_checks_the_genesis_block_against_the_genesis_state() {
+    // A genesis block whose state_root is not the export's genesis state root, relabelled
+    // and rehashed throughout.
+    let out = tempfile::tempdir().unwrap();
+    let export = run(Devnet::new(4, &[]), 4, out.path()).await.unwrap();
+    let (ssz, root) = fixtures::block(0, Root::ZERO, B256::repeat_byte(0x99));
+    let archive_sha256 = rewrite_segment(&export, |m, dir| {
+        use sha2::Digest;
+        let payload = crate::archive::fixtures::snappy(&ssz);
+        let at = m.files.iter().position(|f| f.slot == 0).unwrap();
+        let old = m.files.remove(at);
+        std::fs::remove_file(dir.join(&old.path)).unwrap();
+        let file = crate::archive::ArchiveFile {
+            path: format!("{BLOCK_TOPIC}/0_0x{}.ssz_snappy", hex::encode(root)),
+            root,
+            len: payload.len() as u64,
+            sha256: sha2::Sha256::digest(&payload).into(),
+            ..old.clone()
+        };
+        std::fs::write(dir.join(&file.path), &payload).unwrap();
+        m.total_bytes = m.total_bytes - old.len + file.len;
+        m.files.push(file);
+        m.files.sort_by(|a, b| a.path.cmp(&b.path));
+    });
+    rewrite(&export, |m| {
+        m.blocks[0].root = root;
+        m.genesis_block_root = root;
+        m.segments[0].archive_sha256 = archive_sha256;
+        // Slot 1's listed parent follows, so only its decoded parent_root disagrees.
+        m.blocks[1].parent_root = root;
+    });
+    let err = open_export(export.dir()).unwrap_err();
+    assert!(
+        matches!(&err, ExportError::Genesis(m) if m.contains("state_root")),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn open_export_decodes_the_genesis_state() {
+    use sha2::Digest;
+
+    // The manifest's genesis fields, each edited and rehashed: the state says otherwise.
+    type Edit = fn(&mut ExportManifest);
+    let edits: [(&str, Edit); 3] = [
+        ("genesis_time", |m| m.genesis_time += 1),
+        ("genesis_validators_root", |m| {
+            m.genesis_validators_root = B256::repeat_byte(0x41)
+        }),
+        ("state root", |m| {
+            m.genesis_state_root = B256::repeat_byte(0x44)
+        }),
+    ];
+    for (field, edit) in edits {
+        let out = tempfile::tempdir().unwrap();
+        let (export, dir) = exported(out.path()).await;
+        rewrite(&export, edit);
+        let err = open_export(&dir).unwrap_err();
+        assert!(
+            matches!(&err, ExportError::Mismatch(m) if m.contains(field)),
+            "{field}: {err}"
+        );
+    }
+
+    // The state file edited (its genesis_time), with the manifest's length, sha256 and
+    // genesis_time rewritten to match: its root is no longer the recorded state root.
+    let out = tempfile::tempdir().unwrap();
+    let (export, dir) = exported(out.path()).await;
+    let mut state = fixtures::genesis_state();
+    state.genesis_time += 7;
+    let bytes = state.as_ssz_bytes();
+    std::fs::write(dir.join(GENESIS_STATE_FILE), &bytes).unwrap();
+    rewrite(&export, |m| {
+        m.genesis_time += 7;
+        m.genesis_state.len = bytes.len() as u64;
+        m.genesis_state.sha256 = sha2::Sha256::digest(&bytes).into();
+    });
+    let err = open_export(&dir).unwrap_err();
+    assert!(
+        matches!(&err, ExportError::Mismatch(m) if m.contains("state root")),
+        "{err}"
+    );
+
+    // A state file that does not decode.
+    let out = tempfile::tempdir().unwrap();
+    let (export, dir) = exported(out.path()).await;
+    let bytes = vec![0u8; 64];
+    std::fs::write(dir.join(GENESIS_STATE_FILE), &bytes).unwrap();
+    rewrite(&export, |m| {
+        m.genesis_state.len = bytes.len() as u64;
+        m.genesis_state.sha256 = sha2::Sha256::digest(&bytes).into();
+    });
+    let err = open_export(&dir).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ExportError::Decode {
+                what: "genesis state",
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn open_export_checks_the_fork_digests() {
+    // Slots to GLOAS_SLOT + 2: the genesis, blob-parameter (epoch 1) and Gloas (epoch 2)
+    // digests.
+    let to = GLOAS_SLOT + 2;
+    let exported =
+        |out: std::path::PathBuf| async move { run(Devnet::new(to, &[]), to, &out).await.unwrap() };
+
+    // A changed digest: the files arrived on another one.
+    let out = tempfile::tempdir().unwrap();
+    let export = exported(out.path().to_owned()).await;
+    rewrite(&export, |m| m.fork_digests[0].digest = [9, 9, 9, 9]);
+    let err = open_export(export.dir()).unwrap_err();
+    assert!(
+        matches!(&err, ExportError::Mismatch(m) if m.contains("fork digest")),
+        "{err}"
+    );
+
+    // A dropped blob-parameter digest: epoch 1's files carry it.
+    let out = tempfile::tempdir().unwrap();
+    let export = exported(out.path().to_owned()).await;
+    rewrite(&export, |m| m.fork_digests.retain(|d| d.epoch != 1));
+    let err = open_export(export.dir()).unwrap_err();
+    assert!(
+        matches!(&err, ExportError::Mismatch(m) if m.contains("fork digest")),
+        "{err}"
+    );
+
+    // A dropped fork digest: the Gloas fork at epoch 2 has none.
+    let out = tempfile::tempdir().unwrap();
+    let export = exported(out.path().to_owned()).await;
+    let mut m = export.manifest().clone();
+    m.fork_digests.retain(|d| d.epoch != 2);
+    assert!(
+        matches!(m.validate(), Err(ExportManifestError::Invalid(e)) if e.contains("gloas")),
+        "the manifest alone is refused"
+    );
+}
+
+#[test]
+fn an_export_manifest_over_the_read_bound_is_never_written() {
+    use super::export::check_manifest_len;
+    let path = Path::new("x/export.toml");
+    check_manifest_len(path, &[0; 8], 8).unwrap();
+    let err = check_manifest_len(path, &[0; 9], 8).unwrap_err();
+    assert!(
+        matches!(&err, ExportError::Manifest { source: ExportManifestError::Invalid(m), .. }
+            if m.contains("over 8 bytes")),
+        "{err}"
+    );
+}
+
+/// A forged block: its slot, SSZ, root and parent root.
+type Forged = (Slot, Vec<u8>, Root, Root);
+
+/// Replaces every block from `from` on with `forged` (slot, ssz, root, parent): block files,
+/// segment manifest and `export.toml` relabelled and rehashed, the slots from `from` without a
+/// forged block listed empty. Open checks no signature and runs no state transition, so the
+/// result holds together.
+fn forge_suffix(export: &Export, from: Slot, forged: &[Forged]) {
+    use crate::archive::ArchiveFile;
+    use sha2::Digest;
+    let archive_sha256 = rewrite_segment(export, |m, dir| {
+        let digest = m.files[0].fork_digest;
+        for file in m.files.iter().filter(|f| f.slot >= from) {
+            std::fs::remove_file(dir.join(&file.path)).unwrap();
+        }
+        m.files.retain(|f| f.slot < from);
+        for (slot, ssz, root, _) in forged {
+            let payload = crate::archive::fixtures::snappy(ssz);
+            let file = ArchiveFile {
+                path: format!("{BLOCK_TOPIC}/{slot}_0x{}.ssz_snappy", hex::encode(root)),
+                topic: BLOCK_TOPIC.into(),
+                slot: *slot,
+                root: *root,
+                fork_digest: digest,
+                len: payload.len() as u64,
+                sha256: sha2::Sha256::digest(&payload).into(),
+            };
+            std::fs::write(dir.join(&file.path), &payload).unwrap();
+            m.files.push(file);
+        }
+        m.files.sort_by(|a, b| a.path.cmp(&b.path));
+        m.total_bytes = m.files.iter().map(|f| f.len).sum();
+    });
+    rewrite(export, |m| {
+        m.blocks.retain(|b| b.slot < from);
+        m.blocks.extend(
+            forged
+                .iter()
+                .map(|(slot, _, root, parent_root)| BlockEntry {
+                    slot: *slot,
+                    root: *root,
+                    parent_root: *parent_root,
+                }),
+        );
+        m.empty_slots = (m.slot_start..=m.slot_end)
+            .filter(|s| !m.blocks.iter().any(|b| b.slot == *s))
+            .collect();
+        m.segments[0].archive_sha256 = archive_sha256;
+    });
+}
+
+/// A forged block at `slot` with parent `parent`, as `forge_suffix` takes it.
+fn forged_block(slot: Slot, parent: Root) -> Forged {
+    let (ssz, root) = fixtures::block(slot, parent, B256::repeat_byte(0xf0 | slot as u8));
+    (slot, ssz, root, parent)
+}
+
+#[tokio::test]
+async fn only_the_pinned_export_sha256_authenticates_a_forged_suffix() {
+    let devnet = Devnet::new(6, &[]);
+    let forgeries: [(&str, Slot, Vec<Forged>); 3] = [
+        ("a dropped tip", 6, vec![]),
+        ("a replaced tip", 6, vec![forged_block(6, devnet.root(5))]),
+        ("a rehashed interior suffix", 4, {
+            let five = forged_block(5, devnet.root(3));
+            let six = forged_block(6, five.2);
+            vec![five, six]
+        }),
+    ];
+    for (what, from, forged) in forgeries {
+        let out = tempfile::tempdir().unwrap();
+        let export = run(devnet.clone(), 6, out.path()).await.unwrap();
+        let pin = export.export_sha256();
+        forge_suffix(&export, from, &forged);
+        // Internally consistent: the unpinned open cannot tell.
+        let opened = open_export(export.dir()).unwrap();
+        assert_ne!(opened.export_sha256(), pin, "{what}");
+        let err = open_export_pinned(export.dir(), pin).unwrap_err();
+        assert!(
+            matches!(&err, ExportError::NotPinned { expected, actual }
+                if *expected == hex::encode(pin) && *actual == hex::encode(opened.export_sha256())),
+            "{what}: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_pinned_export_sha256_opens_the_export() {
+    let out = tempfile::tempdir().unwrap();
+    let (export, dir) = exported(out.path()).await;
+    let opened = open_export_pinned(&dir, export.export_sha256()).unwrap();
+    assert_eq!(opened.manifest(), export.manifest());
+    let err = open_export_pinned(&dir, [0; 32]).unwrap_err();
+    assert!(matches!(err, ExportError::NotPinned { .. }), "{err}");
+    // The pin is checked against the manifest before anything else is read.
+    std::fs::write(dir.join(GENESIS_STATE_FILE), b"x").unwrap();
+    let err = open_export_pinned(&dir, [0; 32]).unwrap_err();
+    assert!(matches!(err, ExportError::NotPinned { .. }), "{err}");
 }

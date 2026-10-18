@@ -2,7 +2,7 @@
 //! Fulu from genesis and Gloas from [`GLOAS_SLOT`], whose beacon API a
 //! [`FixtureServer`] serves on 127.0.0.1; its config, and an [`ExportConfig`] for it.
 
-use super::{ExportConfig, FINALIZED_HEADER_PATH, GENESIS_STATE_PATH};
+use super::{ExportConfig, FINALIZED_HEADER_PATH};
 use crate::archive::fixtures::{Spec, GLOAS_SLOT};
 use crate::collector::testing::{FixtureServer, Reply};
 use consensus_types::fulu;
@@ -190,13 +190,16 @@ pub struct Devnet {
     pub state_root: Root,
     /// The blocks by slot; a missing slot answers 404.
     pub blocks: BTreeMap<Slot, Served>,
-    /// The finalized header's slot.
+    /// The finalized header's slot; the chain has a block there.
     pub finalized: Slot,
 }
 
+/// How far past the export slot [`Devnet::new`] finalizes.
+pub const FINALIZED_AFTER: Slot = 8;
+
 impl Devnet {
-    /// A chain from genesis to `to` with no block at the `empty` slots, each block's parent
-    /// the one before it, finalized at `to + 8`.
+    /// A chain from genesis to `to + FINALIZED_AFTER`, finalized there, with no block at the
+    /// `empty` slots (never the finalized one), each block's parent the one before it.
     pub fn new(to: Slot, empty: &[Slot]) -> Self {
         let state = genesis_state();
         let state_root = state.tree_hash_root();
@@ -209,7 +212,12 @@ impl Devnet {
                 api_root: parent,
             },
         );
-        for slot in (1..=to).filter(|s| !empty.contains(s)) {
+        let finalized = to + FINALIZED_AFTER;
+        assert!(
+            !empty.contains(&finalized),
+            "the finalized slot has a block"
+        );
+        for slot in (1..=finalized).filter(|s| !empty.contains(s)) {
             let (ssz, root) = block(slot, parent, B256::repeat_byte(slot as u8));
             blocks.insert(
                 slot,
@@ -224,7 +232,7 @@ impl Devnet {
             state: state.as_ssz_bytes(),
             state_root,
             blocks,
-            finalized: to + 8,
+            finalized,
         }
     }
 
@@ -248,13 +256,20 @@ impl Devnet {
     /// The node's answer to a request for `path`.
     pub fn reply(&self, path: &str) -> Reply {
         if path == FINALIZED_HEADER_PATH {
-            return Reply::json(&format!(
-                r#"{{"data":{{"root":"0x00","canonical":true,"header":{{"message":{{"slot":"{}"}}}}}}}}"#,
-                self.finalized
-            ));
+            let root = self
+                .blocks
+                .get(&self.finalized)
+                .map_or(Root::ZERO, |b| b.api_root);
+            return Reply::json(&finalized_header(self.finalized, root));
         }
-        if path == GENESIS_STATE_PATH {
+        // By id, as Lighthouse serves it, and by its root, as every CL does.
+        if path == "/eth/v2/debug/beacon/states/genesis"
+            || path == format!("/eth/v2/debug/beacon/states/{}", self.state_root)
+        {
             return Reply::ssz(self.state.clone());
+        }
+        if path.starts_with("/eth/v2/debug/beacon/states/") {
+            return Reply::status(404);
         }
         if let Some(slot) = path.strip_prefix("/eth/v1/beacon/blocks/") {
             let slot = slot.strip_suffix("/root").and_then(|s| s.parse().ok());
@@ -276,7 +291,30 @@ impl Devnet {
     }
 }
 
+/// The JSON of `GET /eth/v1/beacon/headers/finalized` for the block `root` at `slot`.
+pub fn finalized_header(slot: Slot, root: Root) -> String {
+    format!(
+        r#"{{"data":{{"root":"{root}","canonical":true,"header":{{"message":{{"slot":"{slot}"}}}}}}}}"#
+    )
+}
+
 impl Devnet {
+    /// Re-parents every block after `slot` onto the block before it, from `slot` up, as a
+    /// chain that forked at `slot` would have it; each gets the state root `repeat_byte(slot)`.
+    pub fn rechain(&mut self, slot: Slot) {
+        let after: Vec<Slot> = self.blocks.range(slot + 1..).map(|(s, _)| *s).collect();
+        for at in after {
+            let parent = self
+                .blocks
+                .range(..at)
+                .next_back()
+                .expect("genesis")
+                .1
+                .api_root;
+            self.reparent(at, parent, B256::repeat_byte(at as u8));
+        }
+    }
+
     /// Replaces the block at `slot` with one whose parent is `parent_root` and state root
     /// `state_root`; the root endpoint answers the new block's root.
     pub fn reparent(&mut self, slot: Slot, parent_root: Root, state_root: Root) {

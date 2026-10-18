@@ -47,10 +47,12 @@
 //! Every block's root and every segment's archive digest (which covers every block file's
 //! sha256) are in the body, so `export_sha256` pins the whole export.
 
+use super::export::MAX_GENESIS_STATE_BYTES;
 use crate::archive::{
     canonical_hex, segment_name, validate_network, ForkDigest, Sha256Digest, PRESETS,
 };
 use consensus_types::primitives::{Epoch, ForkName, Root, Slot, Version};
+use consensus_types::{EthSpec, Mainnet, Minimal};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -204,8 +206,10 @@ impl ExportManifest {
     /// preset, genesis at slot 0 up to a `slot_end` at or before `finalized_slot`, sorted
     /// unique pinned images; every slot of the range either a block or empty, never both;
     /// a genesis block with a zero parent and the recorded root, and every later block's
-    /// parent the previous block; the genesis state at [`GENESIS_STATE_FILE`]; forks and
-    /// digests ascending; and at least one segment, each named once.
+    /// parent the previous block; the genesis state at [`GENESIS_STATE_FILE`] and at most
+    /// [`MAX_GENESIS_STATE_BYTES`]; forks ascending, one from genesis, and digests ascending
+    /// from genesis to `slot_end` with one from each fork in that range; and at least one
+    /// segment, each named once.
     pub fn validate(&self) -> Result<(), ExportManifestError> {
         validate_network(&self.devnet).map_err(|e| ExportManifestError::Invalid(e.to_string()))?;
         validate_label("source", &self.source, MAX_SOURCE_LEN)?;
@@ -240,10 +244,12 @@ impl ExportManifest {
         {
             return invalid("fork_schedule epochs must not decrease".into());
         }
-        if self.fork_digests.first().map(|d| d.epoch) != Some(0)
-            || !strictly_ascending(self.fork_digests.iter().map(|d| d.epoch))
-        {
-            return invalid("fork_digests must start at epoch 0 and ascend strictly".into());
+        self.validate_digests()?;
+        if self.genesis_state.len > MAX_GENESIS_STATE_BYTES {
+            return invalid(format!(
+                "the genesis state's {} bytes are over {MAX_GENESIS_STATE_BYTES}",
+                self.genesis_state.len
+            ));
         }
         if self.segments.is_empty() {
             return invalid("an export has at least one segment".into());
@@ -256,6 +262,41 @@ impl ExportManifest {
         for dir in dirs {
             if !is_segment_name(dir) {
                 return invalid(format!("segment {dir:?} is not <slot_start>-<slot_end>"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The forks and digests cover genesis to `slot_end`: a fork from epoch 0, digests from
+    /// epoch 0 ascending strictly and none past `slot_end`'s epoch, and a digest from each
+    /// fork's epoch in that range (a fork always changes the digest).
+    ///
+    /// The digest values are not recomputed: from Fulu, `compute_fork_digest` mixes the blob
+    /// parameters of the epoch into every digest, fork epochs included, and the manifest does
+    /// not carry the blob schedule. Opening checks their presence here and their match with
+    /// the block files; the pinned `export_sha256` covers the values.
+    fn validate_digests(&self) -> Result<(), ExportManifestError> {
+        if self.fork_schedule.first().map(|f| f.epoch) != Some(0) {
+            return invalid("fork_schedule must have a fork from genesis (epoch 0)".into());
+        }
+        if self.fork_digests.first().map(|d| d.epoch) != Some(0)
+            || !strictly_ascending(self.fork_digests.iter().map(|d| d.epoch))
+        {
+            return invalid("fork_digests must start at epoch 0 and ascend strictly".into());
+        }
+        let end_epoch = self.slot_end / slots_per_epoch(&self.preset);
+        if let Some(late) = self.fork_digests.iter().find(|d| d.epoch > end_epoch) {
+            return invalid(format!(
+                "fork digest of epoch {} is past slot_end's epoch {end_epoch}",
+                late.epoch
+            ));
+        }
+        for fork in self.fork_schedule.iter().filter(|f| f.epoch <= end_epoch) {
+            if !self.fork_digests.iter().any(|d| d.epoch == fork.epoch) {
+                return invalid(format!(
+                    "no fork digest from {}'s epoch {}",
+                    fork.fork, fork.epoch
+                ));
             }
         }
         Ok(())
@@ -366,6 +407,15 @@ impl ExportManifest {
         let manifest = ExportManifest::try_from(raw)?;
         manifest.validate()?;
         Ok((manifest, computed))
+    }
+}
+
+/// `SLOTS_PER_EPOCH` of a known preset.
+fn slots_per_epoch(preset: &str) -> u64 {
+    if preset == Minimal::NAME {
+        Minimal::slots_per_epoch()
+    } else {
+        Mainnet::slots_per_epoch()
     }
 }
 
@@ -957,6 +1007,26 @@ pub(crate) mod tests {
         let mut m = manifest();
         m.fork_digests.push(m.fork_digests[0]);
         refused(m, "digests not ascending");
+
+        let mut m = manifest();
+        m.fork_digests.push(DigestEntry {
+            epoch: 1,
+            digest: [5; 4],
+        });
+        refused(m, "a digest past slot_end's epoch");
+
+        let mut m = manifest();
+        m.fork_schedule[0].epoch = 1;
+        m.fork_schedule[1].epoch = 1;
+        refused(m, "no fork at genesis");
+
+        let mut m = manifest();
+        m.fork_schedule.clear();
+        refused(m, "no fork");
+
+        let mut m = manifest();
+        m.genesis_state.len = MAX_GENESIS_STATE_BYTES + 1;
+        refused(m, "a genesis state over the bound");
 
         let mut m = manifest();
         m.segments.clear();

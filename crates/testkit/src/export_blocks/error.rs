@@ -94,6 +94,30 @@ pub enum ExportError {
         /// The previous exported block's root.
         expected: Root,
     },
+    /// The block endpoint answered 404 for a slot the root endpoint names a block at.
+    #[error("slot {slot}: the block endpoint answered 404, the root endpoint names block {root}")]
+    HiddenBlock {
+        /// The slot.
+        slot: Slot,
+        /// The root endpoint's answer.
+        root: Root,
+    },
+    /// The chain walked from genesis to the finalized slot does not end on the finalized
+    /// header's block, so the export is not the finalized chain.
+    #[error(
+        "the finalized block is slot {slot} root {root}; the chain walked to it ends at slot \
+         {chain_slot} root {chain_root}"
+    )]
+    FinalizedMismatch {
+        /// The finalized header's slot.
+        slot: Slot,
+        /// The finalized header's root.
+        root: Root,
+        /// The last block of the walked chain.
+        chain_slot: Slot,
+        /// Its root.
+        chain_root: Root,
+    },
     /// The genesis block is missing or does not commit to the genesis state.
     #[error("genesis: {0}")]
     Genesis(String),
@@ -115,6 +139,15 @@ pub enum ExportError {
         path: PathBuf,
         /// The cause.
         source: ExportManifestError,
+    },
+    /// The export's `export_sha256` is not the pinned one: it is not the export the pin
+    /// (from the run log) names, however consistent it is.
+    #[error("export_sha256 {actual} is not the pinned {expected}")]
+    NotPinned {
+        /// The pinned digest, hex.
+        expected: String,
+        /// The export's digest, hex.
+        actual: String,
     },
     /// The export directory does not match its manifest.
     #[error("{0}")]
