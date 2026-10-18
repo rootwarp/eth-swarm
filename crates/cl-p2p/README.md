@@ -11,10 +11,11 @@ and the muxers yamux then mplex (mplex under the per-connection budget), and lis
 `cfg.listen_addrs` address, `/ip4/0.0.0.0/tcp/9000` by default; it dials over the same transport.
 The behaviour is `connection_limits`, `peer_caps::PeerCaps`, identify (`eth2/1.0.0`, no address
 cache: nothing dials an address a peer advertised), the req/resp control protocols (`req_resp`,
-an `rpc::inbound::Control`), and a placeholder slot for gossipsub. The connection caps
-(`SwarmConfig::caps`): one established connection per peer, 8 pending inbound per source
-(IPv4 address or IPv6 /58), 32 pending inbound in total (`PeerCaps`: the pinned
-`connection_limits` has no total pending cap; a place is freed when the handshake ends,
+an `rpc::inbound::Control`), and gossipsub, which is off here and on in
+`transport::build_swarm_with_gossip(keypair, &cfg, req_resp, gossip)` (see [Gossip](#gossip)).
+The connection caps (`SwarmConfig::caps`): one established connection per peer, 8 pending
+inbound per source (IPv4 address or IPv6 /58), 32 pending inbound in total (`PeerCaps`: the
+pinned `connection_limits` has no total pending cap; a place is freed when the handshake ends,
 fails or times out), 8 established inbound per IP (IPv6: per /58), 128 established inbound,
 160 established in total \[est\]. `SwarmConfig::bypass` lists the peers exempt from all of
 them (the reference node): `connection_limits::Behaviour::bypass_peer_id` and the same list in
@@ -106,6 +107,36 @@ Metrics, on the same registry as the peer metrics (`rpc::metrics::RpcMetrics`):
 Every received Goodbye logs one `goodbye_received` line (`peer`, `reason`, `status_valid`,
 `direction`, `unix_ms`) and emits one `ControlEvent::GoodbyeReceived`; every sent one logs
 `goodbye_sent`.
+
+## Gossip
+
+`gossip::IgnoreAll::new(&gossip_cfg, &mut registry)` builds the probe's gossipsub (`src/gossip`):
+StrictNoSign (`ValidationMode::Anonymous`, `MessageAuthenticity::Anonymous`), manual
+validation, the Altair message-id, `max_message_size()` as the RPC cap and the phase0 mesh and
+cache parameters. It subscribes exactly `gossip_cfg.topics` (by default only
+`/eth2/<fork_digest>/beacon_block/ssz_snappy`), so more topics are configuration, not code.
+Topics, the bounded snappy transform and the message-id are `p2p-wire::gossip`: the compressed
+data is held to `max_compressed_len(MAX_PAYLOAD_SIZE)`, and the snappy header's declared length
+to the topic's Gloas SSZ cap before anything is decompressed.
+
+What this crate bounds in the probe's gossipsub:
+
+- **Subscriptions**: per peer, only subscriptions to the topics we subscribe (a whitelist), at
+  most that many plus 4; an RPC with more than 418 subscriptions (every topic of two fork
+  digests: a supernode's first RPC lists 128 column subnets alone) has its subscriptions
+  ignored.
+- **Control-message size**: 46,898 bytes of subscriptions and control per RPC, derived from
+  the two-fork topic set (418 entries for the longest topic string, 63 bytes) plus gossipsub's
+  default 16 KiB for control.
+- **Metric labels**: our topics only (`max_never_subscribed_topics` 0).
+- **Topics decoded**: the transform decodes and caches only subscribed topics; a message on
+  any other topic (another kind, or ours under another fork digest) is refused before its data
+  is decompressed.
+- **Payloads**: compressed data at most `max_compressed_len(MAX_PAYLOAD_SIZE)`, decompressed
+  data at most the topic's Gloas SSZ cap, RPCs at most `max_message_size()`.
+- **IHAVE**: ignored (`max_ihave_messages_heartbeat` 0). The probe uses mesh push only.
+
+gossipsub's other internal per-peer state is bounded only by upstream's own limits.
 
 ## Deviations
 

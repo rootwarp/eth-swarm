@@ -135,3 +135,45 @@ fn receive_buffer_never_passes_the_chunk_bound() {
         "largest {largest}, bound {bound}"
     );
 }
+
+/// The gossip transform decodes and caches only subscribed topics: a message on a supported
+/// topic we do not subscribe is refused before its data is decompressed.
+#[test]
+fn gossip_transform_decodes_only_subscribed_topics() {
+    use cl_p2p::gossip::GossipConfig;
+    use consensus_types::caps::NetworkCaps;
+    use libp2p::gossipsub::{DataTransform as _, RawMessage, TopicHash};
+    use p2p_wire::gossip::{GossipKind, GossipTopic, SnappyTransform, TopicCaps};
+    let caps =
+        TopicCaps::gloas::<consensus_types::Mainnet>(&NetworkCaps::from_blob_schedule(21, &[]));
+    let cfg = GossipConfig::new(
+        vec![GossipTopic::new([0; 4], GossipKind::BeaconBlock)],
+        caps,
+        std::time::Duration::from_secs(60),
+    );
+    let transform = cfg.transform();
+    let off_list = "/eth2/00000000/execution_payload/ssz_snappy";
+    let ssz = vec![0u8; 4 << 20];
+    let data = SnappyTransform::new(caps).outbound(off_list, &ssz).unwrap();
+    let raw = RawMessage {
+        source: None,
+        data,
+        sequence_number: None,
+        topic: TopicHash::from_raw(off_list),
+        signature: None,
+        key: None,
+        validated: false,
+    };
+    LIVE.with(|c| c.set(0));
+    PEAK.with(|c| c.set(0));
+    LARGEST.with(|c| c.set(0));
+    ON.with(|on| on.set(true));
+    let result = transform.inbound_transform(raw);
+    ON.with(|on| on.set(false));
+    assert!(result.is_err());
+    let largest = LARGEST.with(Cell::get);
+    assert!(
+        largest <= 1024,
+        "largest allocation {largest}: the data was decompressed"
+    );
+}

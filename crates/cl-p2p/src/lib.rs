@@ -11,8 +11,11 @@
 //! [`transport`] the TCP muxers (yamux first, then mplex under its stream, buffer and
 //! per-connection caps) and the probe swarm over them ([`transport::build_swarm`], with
 //! [`behaviour`]), and [`identity`] the service's node key from its systemd credential.
+//! [`gossip`] is the probe's gossipsub, which reports IGNORE for every message and so forwards
+//! none.
 
 pub mod behaviour;
+pub mod gossip;
 pub mod identity;
 pub mod m2a_session;
 pub mod peer_caps;

@@ -3549,6 +3549,7 @@ dependencies = [
  "ethereum_ssz",
  "ethereum_ssz_derive",
  "network-config",
+ "sha2 0.10.9",
  "snap",
  "ssz_types",
  "thiserror 2.0.21",

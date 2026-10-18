@@ -12,6 +12,7 @@
 
 use super::{muxers, with_negotiating_inbound_streams, MuxerBudget, MPLEX_MAX_STREAMS};
 use crate::behaviour::{Behaviour, ConnectionCaps, ReqRespSlot};
+use crate::gossip::IgnoreAll;
 use libp2p::core::transport::TransportError;
 use libp2p::core::upgrade::{
     InboundConnectionUpgrade, NegotiationError, OutboundConnectionUpgrade, UpgradeInfo,
@@ -107,7 +108,7 @@ pub enum BuildError {
 
 /// The probe swarm for the node key `keypair`: TCP (no Nagle), Noise XX, then yamux or mplex
 /// ([`muxers`], yamux first, mplex under `cfg.budget`), [`Behaviour`] with `req_resp` in its
-/// req/resp slot, listening on every `cfg.listen_addrs` address.
+/// req/resp slot and its gossipsub slot empty, listening on every `cfg.listen_addrs` address.
 ///
 /// Must be called within a tokio runtime, which the listeners register with.
 ///
@@ -119,6 +120,29 @@ pub fn build_swarm(
     keypair: Keypair,
     cfg: &SwarmConfig,
     req_resp: ReqRespSlot,
+) -> Result<Swarm<Behaviour>, BuildError> {
+    build(keypair, cfg, req_resp, None)
+}
+
+/// [`build_swarm`] with `gossip`, the ignore-all gossipsub, in the gossipsub slot.
+///
+/// # Errors
+///
+/// As [`build_swarm`].
+pub fn build_swarm_with_gossip(
+    keypair: Keypair,
+    cfg: &SwarmConfig,
+    req_resp: ReqRespSlot,
+    gossip: IgnoreAll,
+) -> Result<Swarm<Behaviour>, BuildError> {
+    build(keypair, cfg, req_resp, Some(gossip))
+}
+
+fn build(
+    keypair: Keypair,
+    cfg: &SwarmConfig,
+    req_resp: ReqRespSlot,
+    gossip: Option<IgnoreAll>,
 ) -> Result<Swarm<Behaviour>, BuildError> {
     let (yamux, mplex) = muxers(cfg.budget.clone());
     let Ok(builder) = SwarmBuilder::with_existing_identity(keypair)
@@ -132,7 +156,12 @@ pub fn build_swarm(
             ),
         )?
         .with_behaviour(|key| {
-            Behaviour::with_caps(key.public(), cfg.agent_version.clone(), cfg.caps, req_resp)
+            let behaviour =
+                Behaviour::with_caps(key.public(), cfg.agent_version.clone(), cfg.caps, req_resp);
+            match gossip {
+                Some(gossip) => behaviour.with_gossip(gossip),
+                None => behaviour,
+            }
         });
     let mut swarm = builder
         .with_swarm_config(|c| {

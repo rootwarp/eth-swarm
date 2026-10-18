@@ -1,14 +1,17 @@
 //! The probe swarm's [`NetworkBehaviour`]: connection limits (`connection_limits` and
 //! [`PeerCaps`]), identify, the req/resp control protocols ([`crate::rpc::inbound::Control`]),
-//! and the slot the gossipsub behaviour will fill.
+//! and gossipsub ([`crate::gossip::IgnoreAll`], off unless [`Behaviour::with_gossip`] turns it
+//! on).
 //!
 //! Field order is the order the swarm consults the behaviours, so [`Behaviour::limits`] comes
 //! first: a connection it denies is never handed to the others.
 
+use crate::gossip::IgnoreAll;
 use crate::peer_caps::{PeerCaps, PeerCapsConfig};
 use crate::rpc::inbound::Control;
 use libp2p::identity::PublicKey;
-use libp2p::swarm::{dummy, NetworkBehaviour};
+use libp2p::swarm::behaviour::toggle::Toggle;
+use libp2p::swarm::NetworkBehaviour;
 use libp2p::{connection_limits, identify, PeerId};
 
 /// The identify protocol version every consensus-layer client announces.
@@ -60,8 +63,8 @@ pub type ProbeSpec = consensus_types::Mainnet;
 /// `3: ResourceUnavailable`).
 pub type ReqRespSlot = Control<ProbeSpec>;
 
-/// The gossipsub slot. A placeholder until the gossipsub behaviour takes it.
-pub type GossipsubSlot = dummy::Behaviour;
+/// The gossipsub slot: ignore-all gossipsub, or nothing.
+pub type GossipsubSlot = Toggle<IgnoreAll>;
 
 /// Connection limits, identify, req/resp and gossipsub, consulted in that order.
 #[derive(NetworkBehaviour)]
@@ -109,7 +112,7 @@ impl Behaviour {
             }),
             identify: identify::Behaviour::new(identify),
             req_resp,
-            gossipsub: dummy::Behaviour,
+            gossipsub: Toggle::from(None),
         }
     }
 
@@ -117,6 +120,13 @@ impl Behaviour {
     pub fn bypass(&mut self, peer: PeerId) {
         self.limits.bypass_peer_id(&peer);
         self.peer_caps.bypass(peer);
+    }
+
+    /// The same behaviour with `gossip` in the gossipsub slot.
+    #[must_use]
+    pub fn with_gossip(mut self, gossip: IgnoreAll) -> Self {
+        self.gossipsub = Toggle::from(Some(gossip));
+        self
     }
 }
 

@@ -276,3 +276,32 @@ mod rpc {
         );
     }
 }
+
+/// The gossip transform refuses a snappy block declaring more than the topic cap from its
+/// header: nothing is allocated, however much the header declares.
+#[test]
+fn gossip_bomb_over_the_topic_cap_allocates_nothing() {
+    use consensus_types::caps::NetworkCaps;
+    use p2p_wire::gossip::{SnappyTransform, TopicCaps, TransformError};
+    let transform = SnappyTransform::new(TopicCaps::gloas::<consensus_types::Mainnet>(
+        &NetworkCaps::from_blob_schedule(21, &[]),
+    ));
+    let topic = "/eth2/00000000/beacon_block/ssz_snappy";
+    let mut bomb = Vec::new();
+    encode_varint(u64::from(u32::MAX), &mut bomb);
+    bomb.extend_from_slice(&[0u8; 1024]);
+    let m = measure(|| transform.inbound(topic, &bomb));
+    assert!(matches!(
+        m.value,
+        Err(TransformError::DeclaredTooLarge { .. })
+    ));
+    assert_eq!(m.peak, 0, "refused at the header without allocating");
+
+    // A valid message allocates its decompressed length once.
+    let data: Vec<u8> = (0..(1u32 << 20)).map(|i| (i % 253) as u8).collect();
+    let compressed = snap::raw::Encoder::new().compress_vec(&data).unwrap();
+    let m = measure(|| transform.inbound(topic, &compressed));
+    assert_eq!(m.value.as_deref(), Ok(&data[..]));
+    assert_eq!(m.largest, data.len());
+    assert!(m.peak <= data.len() + SLACK, "peak {}", m.peak);
+}

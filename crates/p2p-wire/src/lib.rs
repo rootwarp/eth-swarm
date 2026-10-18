@@ -6,12 +6,15 @@
 //! - [`rpc::messages`]: the message bodies (`Status` v2, `MetaData` v3, `Ping`, `Goodbye`,
 //!   `BeaconBlocksByRange` v2 request, `ErrorMessage`).
 //! - [`rpc::protocols`]: the protocol IDs with their payload bounds and response counts.
+//! - [`gossip`]: gossip topics, the bounded `ssz_snappy` message transform and the Altair
+//!   message-id.
 //!
 //! Everything here decodes untrusted peer bytes, so every length is checked against its bound
 //! before anything is allocated for it. The transport (`cl-p2p`) drives the sans-IO scanner
 //! ([`rpc::codec::scan_response_chunk`]) and adds the deadlines.
 
 pub mod enr;
+pub mod gossip;
 pub mod rpc;
 
 #[cfg(feature = "testkit")]

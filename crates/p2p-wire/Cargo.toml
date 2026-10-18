@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "Eth2 req/resp wire format: ssz_snappy chunk framing, response codes, context bytes and the req/resp messages. No libp2p, so it stays cheap to build and fuzz."
+description = "Eth2 wire format: req/resp ssz_snappy chunk framing, response codes, context bytes and messages; gossip topics, the bounded snappy transform and message-id. No libp2p, so it stays cheap to build and fuzz."
 
 [features]
 # Fixtures for this crate's tests and its users' tests: a Fulu + Gloas ContextTable and small blocks.
@@ -20,9 +20,9 @@ ethereum_ssz_derive.workspace = true
 ssz_types.workspace = true
 typenum.workspace = true
 snap = "1"
+# The gossip message-id (SHA256); already in the tree at this version.
+sha2 = "0.10"
 thiserror = "2"
 
 [dev-dependencies]
-# The digest a test config is checked against (ChainConfig::from_yaml).
-sha2 = "0.10"
 p2p-wire = { path = ".", features = ["testkit"] }

@@ -1140,7 +1140,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 // The probe swarm over these muxers lives in its own module.
 mod swarm;
 pub use swarm::{
-    build_swarm, BuildError, DialFailure, Direction, LogNegotiated, PeerMetrics, SwarmConfig,
-    DEFAULT_CONNECTION_TIMEOUT, DEFAULT_IDLE_CONNECTION_TIMEOUT, DEFAULT_TCP_PORT,
-    MAX_NEGOTIATING_INBOUND_STREAMS,
+    build_swarm, build_swarm_with_gossip, BuildError, DialFailure, Direction, LogNegotiated,
+    PeerMetrics, SwarmConfig, DEFAULT_CONNECTION_TIMEOUT, DEFAULT_IDLE_CONNECTION_TIMEOUT,
+    DEFAULT_TCP_PORT, MAX_NEGOTIATING_INBOUND_STREAMS,
 };
