@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "Capture and replay tooling for live-network runs: the gossip/SSE arrival collector and the block/column archiver with a verified sha256 manifest. Never links cl-sync."
+description = "Capture and replay tooling for live-network runs: the gossip/SSE arrival collector and the block/column archiver with a verified sha256 manifest, and the devnet block and root export. Never links cl-sync."
 
 [[bin]]
 name = "archiver"
@@ -15,10 +15,15 @@ path = "src/bin/archiver.rs"
 name = "collector"
 path = "src/bin/collector.rs"
 
+[[bin]]
+name = "export-blocks"
+path = "src/bin/export-blocks.rs"
+
 [features]
 # For this crate's tests and its users' tests: write-fault injection (`archive::Fault`: an
 # interrupted write, a full disk), payload fixtures (`archive::fixtures`), and the collector's
-# scripted clock and fixture beacon node (`collector::testing`, a hyper server on 127.0.0.1).
+# scripted clock and fixture beacon node (`collector::testing`, a hyper server on 127.0.0.1), and
+# the export's fixture devnet (`export_blocks::fixtures`).
 test-support = ["p2p-wire/testkit", "dep:ethereum_ssz", "dep:ssz_types", "hyper/server"]
 
 [dependencies]

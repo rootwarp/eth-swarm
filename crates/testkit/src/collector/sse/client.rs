@@ -413,7 +413,7 @@ async fn open(config: &SseConfig) -> Result<Incoming, ApiError> {
 }
 
 /// `GET <base><path_and_query>` on a fresh HTTP/1.1 connection; anything but 200 is an error.
-async fn get(
+pub(crate) async fn get(
     url: &ReferenceApiUrl,
     path: &'static str,
     path_and_query: &str,

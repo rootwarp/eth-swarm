@@ -102,6 +102,15 @@ impl Reply {
         }
     }
 
+    /// A 200 `application/octet-stream` body: SSZ, as the beacon API serves it.
+    pub fn ssz(body: Vec<u8>) -> Self {
+        Self {
+            content_type: "application/octet-stream",
+            chunks: vec![Bytes::from(body)],
+            ..Self::stream(vec![], false)
+        }
+    }
+
     /// `status` with an empty body.
     pub fn status(status: u16) -> Self {
         Self {

@@ -4,6 +4,7 @@ mod client;
 mod parse;
 mod spec;
 
+pub(crate) use client::get;
 pub use client::{
     genesis_time, run, ApiError, Backoff, Pause, SseConfig, SseConfigError, SseStats, TokioPause,
     DEFAULT_TOPICS, EVENTS_PATH, GENESIS_PATH, MAX_JSON_BYTES,

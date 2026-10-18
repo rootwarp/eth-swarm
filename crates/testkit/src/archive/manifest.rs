@@ -328,7 +328,7 @@ fn strictly_sorted<'a, T: Ord + 'a>(items: impl IntoIterator<Item = &'a T>) -> b
 }
 
 /// `N` bytes from exactly `2 * N` lowercase hex digits.
-fn canonical_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
+pub(crate) fn canonical_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
     let lower = text
         .bytes()
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));

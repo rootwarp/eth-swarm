@@ -172,7 +172,7 @@ fn entries(dir: &Path) -> Result<Vec<(String, Kind)>, ArchiveError> {
 /// Reads at most `limit + 1` bytes of the regular file at `path` (`name` in errors): a missing
 /// file is [`ArchiveError::MissingFile`], a symlink or other non-regular entry
 /// [`ArchiveError::NotRegular`].
-fn read_regular(path: &Path, name: &str, limit: u64) -> Result<Vec<u8>, ArchiveError> {
+pub(crate) fn read_regular(path: &Path, name: &str, limit: u64) -> Result<Vec<u8>, ArchiveError> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {

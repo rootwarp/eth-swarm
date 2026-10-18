@@ -17,9 +17,9 @@ Geth).
 | Load | spamoor `blobs` (2 tx per slot, 2 blobs each), so blocks carry data columns, plus `eoatx` |
 | Explorer | dora |
 
-Status: the config, its image pin lint and the runtime checker are in the repo; nothing has been
-run yet, because Kurtosis is not installed on the dev host. The three runtime criteria below stay
-open until the first two runs.
+Status: the config, its image pin lint, the runtime checker and the block export are in the
+repo; nothing has been run yet, because Kurtosis is not installed on the dev host. The three
+runtime criteria below stay open until the first two runs.
 
 ## Pins
 
@@ -245,6 +245,85 @@ The image pin lint (criterion 3) runs in CI and needs no devnet:
 bash scripts/check-kurtosis-pins.sh                       # testing/kurtosis/*.yaml
 bash testing/kurtosis/tests/check-devnet.test.sh          # check-devnet.sh against stub kurtosis/curl
 ```
+
+## Export blocks and roots
+
+`export-blocks` (`crates/testkit/src/bin/export-blocks.rs`) reads every slot from genesis to an
+export slot from one CL's beacon API and writes `OUT/<devnet>/`: an archive segment of the
+blocks (the same format and `manifest.toml` as the archiver), `genesis_state.ssz`, and
+`export.toml`, which records the devnet name, the CL it came from, the genesis time, validators
+root, block root and state root, the config's sha256, fork schedule and digests, the image
+digests, the slot range with its empty slots, and every block's root and parent root. Replay
+opens an export only through `testkit::export_blocks::open_export`, which verifies all of it
+(each segment through `archive::open_verified`).
+
+Per slot it fetches `/eth/v2/beacon/blocks/{slot}` as SSZ (404 is an empty slot, recorded),
+decodes the block by the fork of its own slot, and fails the export unless our
+`hash_tree_root` equals `/eth/v1/beacon/blocks/{slot}/root` and the block's parent is the
+previous exported block (across empty slots). The genesis block must have a zero parent and the
+root of `/eth/v2/debug/beacon/states/genesis` as its `state_root`. The export slot must be at or
+before the CL's finalized block, so the roots cannot change under the export. A failed export
+writes no `export.toml`, so its directory never opens as an export.
+
+Status: tested against a fixture beacon node only. It has not been run on the devnet yet, so
+the first run also confirms that `network-config` reads the generated `config.yaml`.
+
+Run it on a devnet whose finalized epoch is at least 3 (`check-devnet.sh` passes), from the repo
+root:
+
+```bash
+enclave=ethswarm-gloas
+genesis=target/kurtosis/$enclave-genesis
+export_root=target/kurtosis/export
+kurtosis files download "$enclave" el_cl_genesis_data "$genesis"   # config.yaml, genesis.ssz, ...
+cargo build --release --locked -p testkit --bin export-blocks
+bin=target/release/export-blocks
+
+# Every pinned image of the args file, as --image repo:tag@sha256:<digest>.
+image_args=()
+for image in $(grep -oE '[A-Za-z0-9./_-]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' \
+                 testing/kurtosis/gloas-genesis.yaml | sort -u); do
+  image_args+=(--image "$image")
+done
+
+lh=$(kurtosis port print "$enclave" cl-1-lighthouse-geth http)
+ls=$(kurtosis port print "$enclave" cl-2-lodestar-geth http)
+
+# The export slot: the lower of the two CLs' finalized block slots.
+finalized() { curl -s "$1/eth/v1/beacon/headers/finalized" | jq -r .data.header.message.slot; }
+a=$(finalized "$lh"); b=$(finalized "$ls"); to=$(( a < b ? a : b )); echo "export slot $to"
+
+"$bin" export --api "$lh" --config "$genesis/config.yaml" --devnet "$enclave" \
+  --source cl-1-lighthouse-geth --to "$to" --out "$export_root/lighthouse" "${image_args[@]}"
+"$bin" export --api "$ls" --config "$genesis/config.yaml" --devnet "$enclave" \
+  --source cl-2-lodestar-geth --to "$to" --out "$export_root/lodestar" "${image_args[@]}"
+```
+
+Each `export` prints one line: the slot range, the block and empty-slot counts, the genesis
+block and state roots, the last block's slot and root, and the export's `export_sha256`.
+`verify` prints the same line for an existing export (exit 1 if it is refused).
+
+The checks, with the two exports above:
+
+```bash
+# Both CLs' exports have identical root lists (exit 1 and the first differing slot otherwise).
+"$bin" diff "$export_root/lighthouse/$enclave" "$export_root/lodestar/$enclave"
+
+# Count check: the API's block count over 0..=$to equals the export's "N blocks".
+"$bin" verify "$export_root/lighthouse/$enclave"
+n=0
+for s in $(seq 0 "$to"); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$lh/eth/v1/beacon/headers/$s")
+  [ "$code" = 200 ] && n=$((n + 1))
+done
+echo "API blocks 0..$to: $n"
+
+# The exported genesis state is the generator's genesis.ssz, byte for byte.
+cmp "$genesis/genesis.ssz" "$export_root/lighthouse/$enclave/genesis_state.ssz" && echo "genesis state ok"
+```
+
+Keep the export with the run log: its `export_sha256` pins it, and the block replay harness loads
+it with `open_export`.
 
 ## How the probe attaches
 

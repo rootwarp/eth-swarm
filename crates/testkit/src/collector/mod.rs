@@ -58,6 +58,7 @@ pub use sink::{
     collect, read_capture, read_info, records, CaptureInfo, Collector, CollectorError, Records,
     Summary, CAPTURE_FILE, GAPS_FILE, MAX_RECORD_LINE_BYTES, NTP_FILE, RECORDS_FILE, SUMMARY_FILE,
 };
+pub(crate) use sse::get as api_get;
 pub use sse::{
     config_name, genesis_time, run as run_sse, ApiError, Backoff, Pause, SseConfig, SseConfigError,
     SseEvent, SseParser, SseStats, TokioPause, TooLarge, DEFAULT_TOPICS, EVENTS_PATH, GENESIS_PATH,

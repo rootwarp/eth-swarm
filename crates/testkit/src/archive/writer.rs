@@ -685,7 +685,7 @@ type WriteFault = Option<std::convert::Infallible>;
 /// Writes `dir/name` durably: a hidden temp file, fsync, a move that never replaces an existing
 /// `name` ([`rename_no_replace`]), directory fsync. The temp file is always removed, so no
 /// partial file is left behind but by a crash.
-fn write_durable(
+pub(crate) fn write_durable(
     dir: &Path,
     name: &str,
     bytes: &[u8],

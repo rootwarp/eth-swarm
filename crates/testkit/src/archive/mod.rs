@@ -39,15 +39,19 @@ mod verify;
 mod writer;
 
 pub use error::ArchiveError;
+pub(crate) use manifest::{canonical_hex, PRESETS};
 pub use manifest::{
     ArchiveFile, ClosedBy, ForkDigest, Manifest, ManifestError, Sha256Digest, FORMAT_VERSION,
     MANIFEST_FILE, MAX_ERROR_LEN, MAX_MANIFEST_LEN,
 };
+pub(crate) use names::{segment_name, validate_network};
 pub use names::{NameError, TopicKind};
 pub use payload::{
     decode_payload, decompress, max_compressed_payload_len, ChainParams, Decoded, PayloadError,
 };
+pub(crate) use verify::read_regular;
 pub use verify::{open_verified, Archive};
+pub(crate) use writer::write_durable;
 #[cfg(any(test, feature = "test-support"))]
 pub use writer::Fault;
 pub use writer::{Capture, CaptureConfig, Stored, Writer, OPEN_PREFIX};
