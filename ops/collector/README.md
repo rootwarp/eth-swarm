@@ -25,9 +25,30 @@ other users). The unit names no node. Each instance reads two files:
 
 The URL file is the only place the reference URL may carry a key: the unit passes its path
 (`--url-file`), never the URL, because `/proc/<pid>/cmdline` is readable by every user. The
-collector refuses a URL file that group or others may access, and never prints what it holds.
-The env file holds no secret and may set only those three keys; the unit refuses any other line,
-`STATE_DIRECTORY` above all (an env file value would override the one systemd sets).
+collector opens it without following a symlink and without blocking (`O_NOFOLLOW |
+O_NONBLOCK`, so a FIFO at the path is refused at once instead of hanging the start), then checks
+the open file: a regular file, the one the path named, owned by the user the collector runs as,
+that neither group nor others may access (0600 or 0400). It never prints what the file holds;
+an error names the path and the reason only.
+
+The env file holds no secret, and the unit's guard keeps it inside a grammar small enough that
+the guard and systemd's `EnvironmentFile=` parser read it the same way. It refuses the whole
+file otherwise, rather than guess what systemd would make of it:
+
+- **Bytes:** LF and printable ASCII only, and no quote (`"`, `'`) or backslash, comments
+  included. systemd also ends a line at a bare CR, and unquotes, unescapes and joins continued
+  lines, so any of those could hide a line such as `LD_PRELOAD=…` or `STATE_DIRECTORY=…` from a
+  line-by-line check (`#c<CR>LD_PRELOAD=…` would pass as a comment).
+- **Lines:** empty, a `#` comment, or `COLLECTOR_NETWORK`, `COLLECTOR_OUT` or `COLLECTOR_NTP`,
+  `=`, and a value of `A-Z a-z 0-9 . _ / -`, each of the three exactly once. No `export`, no
+  spaces, no `;` comment, no other key: `STATE_DIRECTORY` above all (an env file value would
+  override the one systemd sets), and `PATH`.
+- **Values:** `COLLECTOR_NETWORK` is the instance name and `COLLECTOR_OUT` its own state
+  directory, compared with the literal lines.
+
+The guard checks the file, never the environment systemd built from it: it runs under
+`/usr/bin/env -i`, every tool by its absolute path, so even a `PATH=` line could not make it run
+a planted binary.
 
 The ports are the `ops/ref-node` defaults (`BEACON_API_PORT`): the reference-node stack runs
 Sepolia and Hoodi side by side on one host, Sepolia's beacon API on 5052 and Hoodi's on 5053.
@@ -35,8 +56,8 @@ A collector reading the wrong one would record the other network's events under 
 so it is refused three times over:
 
 - the unit's `ExecStartPre` guard stops an instance whose env file names another network, sets
-  an unknown key, or writes anywhere but the instance's own state directory
-  `/var/lib/ethswarm-collector/<network>` (compared with that literal path);
+  an unknown key, leaves the grammar above, or writes anywhere but the instance's own state
+  directory `/var/lib/ethswarm-collector/<network>` (compared with that literal path);
 - the collector refuses a node whose `/eth/v1/config/spec` `CONFIG_NAME` is not
   `COLLECTOR_NETWORK` (`the node's CONFIG_NAME is sepolia, not hoodi`), and a node without the
   spec endpoint;
@@ -48,7 +69,9 @@ each instance's directory below it is the instance user's (0750).
 
 `ops/collector/tests/collector-unit.test.sh` (CI) checks the template's hardening, users, env
 and URL files, guard and state directory, that it holds no URL, that each example URL's port is
-the ref-node default, and this README's migration step.
+the ref-node default, and this README's migration step. It runs the guard on env files with a
+CR, NUL, TAB, VT, FF, non-ASCII byte, quote, backslash, continuation, `export` or `PATH=` line,
+each of which it must refuse, the last without running a tool from that `PATH`.
 
 ## What a capture holds
 
@@ -111,7 +134,8 @@ instance; a Sepolia one is the same with `sepolia` for `hoodi`.
    ```
 
 4. Install the instance's env file (root's, 0644: no secret) and URL file (the instance
-   user's, 0600: the collector refuses any other mode). Keep the URL on the Hoodi node's port; a
+   user's, 0600: the collector refuses any other mode or owner). Edit the env file in an editor
+   that keeps LF line ends and ASCII: a CR, a tab or a quote anywhere stops the unit. Keep the URL on the Hoodi node's port; a
    key, if the node needs one, goes in its path here and nowhere else. On a host that runs
    systemd-timesyncd instead of chrony, set `COLLECTOR_NTP=timesyncd`.
 
@@ -145,7 +169,7 @@ instance; a Sepolia one is the same with `sepolia` for `hoodi`.
    The first lines name the capture directory and the subscribed events; an `ntp:` line follows
    every minute and a `missing interval:` line after every reconnect. An instance that exits at
    once names the reason: `collector-hoodi.env: …` (the env file), `--url-file: …` (the URL
-   file's mode or content, never the URL), or `the node's CONFIG_NAME is sepolia, not hoodi`
+   file's type, owner, mode or content, never the URL), or `the node's CONFIG_NAME is sepolia, not hoodi`
    (the URL reaches the Sepolia node).
 
 ## Smoke capture (at least 1 h)

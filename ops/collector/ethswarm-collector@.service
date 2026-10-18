@@ -30,20 +30,37 @@ Group=ethswarm-collector-%i
 UMask=0027
 # Required: an instance without its env file does not start.
 EnvironmentFile=/etc/ethswarm/collector-%i.env
-# The env file may set only the three keys, must name this instance's network, and must write
-# into this instance's own state directory, so two instances never share or swap a capture
-# directory. The directory is compared with the literal path: an env file value overrides the
-# STATE_DIRECTORY systemd sets, so that variable proves nothing (and setting it is refused).
-ExecStartPre=/bin/sh -c 'env_file=/etc/ethswarm/collector-%i.env; \
+# The env file must stay inside a grammar small enough that the guard and systemd read it the
+# same way, and the guard refuses the whole file otherwise; it never tries to parse what
+# systemd's parser would make of anything else:
+#   - bytes: LF and printable ASCII only, and no quote (" ') or backslash. systemd also ends a
+#     line at CR, and unquotes, unescapes and joins continued lines; grep does none of that, so
+#     any of those bytes could hide a key (STATE_DIRECTORY, LD_PRELOAD) from a line check;
+#   - lines: empty, a `#` comment, or COLLECTOR_NETWORK, COLLECTOR_OUT or COLLECTOR_NTP `=` a
+#     value of [A-Za-z0-9._/-], each key exactly once. No `export`, no spaces, no other key;
+#   - values: this instance's network, and its own state directory, so two instances never
+#     share or swap a capture directory. The directory is compared with the literal path: an env
+#     file value would override the STATE_DIRECTORY systemd sets, so that variable proves
+#     nothing (and setting it is refused).
+# The guard reads the file, never its environment: it runs under `env -i`, every tool by its
+# absolute path, so a PATH= line (refused anyway) could not make it run a planted binary.
+# The byte rule deletes every allowed byte and counts what is left: the tr set is LF (systemd
+# turns the \n into one) and 0x20-0x7E without 0x22 ("), 0x27 (') and 0x5C (\). An unreadable
+# file leaves "unreadable", so the count is never 0 by accident.
+ExecStartPre=/usr/bin/env -i /bin/sh -c 'env_file=/etc/ethswarm/collector-%i.env; \
     state=/var/lib/ethswarm-collector/%i; \
-    unknown=$$(grep -Evc "^(#.*)?$$|^(COLLECTOR_NETWORK|COLLECTOR_OUT|COLLECTOR_NTP)=" "$$env_file"); \
-    if [ "$$unknown" != 0 ]; then \
-        echo "$$env_file: $${unknown:-unreadable}: want only COLLECTOR_NETWORK, COLLECTOR_OUT and COLLECTOR_NTP lines" >&2; \
-        exit 1; \
-    fi; \
-    if [ "$${COLLECTOR_NETWORK}" != "%i" ] || [ "$${COLLECTOR_OUT}" != "$$state" ]; then \
-        echo "$$env_file: COLLECTOR_NETWORK must be %i and COLLECTOR_OUT $$state" >&2; \
-        exit 1; \
+    refuse() { echo "$$env_file: $$1" >&2; exit 1; }; \
+    { [ -f "$$env_file" ] && [ -r "$$env_file" ]; } || refuse "not a readable file"; \
+    bad=$$({ /usr/bin/tr -d "\n !#-&(-[]-~" <"$$env_file" || echo unreadable; } | /usr/bin/wc -c | /usr/bin/tr -d " "); \
+    [ "$$bad" = 0 ] || refuse "$${bad:-unreadable} bytes other than LF and printable ASCII, or a quote or backslash"; \
+    unknown=$$(/usr/bin/grep -Evc "^(#.*)?$$|^(COLLECTOR_NETWORK|COLLECTOR_OUT|COLLECTOR_NTP)=[A-Za-z0-9._/-]+$$" "$$env_file"); \
+    [ "$$unknown" = 0 ] || refuse "$${unknown:-unreadable}: want only comments and COLLECTOR_NETWORK, COLLECTOR_OUT and COLLECTOR_NTP lines"; \
+    for key in COLLECTOR_NETWORK COLLECTOR_OUT COLLECTOR_NTP; do \
+        [ "$$(/usr/bin/grep -c "^$$key=" "$$env_file")" = 1 ] || refuse "want exactly one $$key line"; \
+    done; \
+    if [ "$$(/usr/bin/grep -Fxc "COLLECTOR_NETWORK=%i" "$$env_file")" != 1 ] || \
+        [ "$$(/usr/bin/grep -Fxc "COLLECTOR_OUT=$$state" "$$env_file")" != 1 ]; then \
+        refuse "COLLECTOR_NETWORK must be %i and COLLECTOR_OUT $$state"; \
     fi'
 # Plain http:// to loopback only (the binary refuses anything else). Each start writes a new
 # capture directory /var/lib/ethswarm-collector/%i/%i-<unix start seconds>/; summary.toml is

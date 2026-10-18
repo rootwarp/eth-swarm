@@ -8,8 +8,11 @@
 # (STATE_DIRECTORY). Checks each example env file (its network, its instance's state directory,
 # known keys only) and URL file (loopback on the ref-node default beacon API port: Sepolia 5052,
 # Hoodi 5053, cross-checked against BEACON_API_PORT in ops/ref-node's example env files), and
-# the README's migration from the single-network unit. Each check is also run on broken
-# copies, which must fail. No network, no root, no systemd. Works on bash 3.2.
+# the README's migration from the single-network unit. The guard must refuse any env file
+# outside its grammar (a byte other than printable ASCII and LF, a quote, a backslash, a line
+# other than a comment or KEY=value) and run no tool an env file's PATH could plant. Each check
+# is also run on broken copies, which must fail. No network, no root, no systemd. Works on
+# bash 3.2.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 collector=$(cd "$here/.." && pwd)
@@ -118,8 +121,10 @@ check_unit() {
       problems+="ExecStart= lacks $want"$'\n'
     fi
   done
-  if ! printf '%s\n' "$lines" | grep -Fq 'ExecStartPre=/bin/sh -c '; then
-    problems+="no ExecStartPre= guard tying the env file to the instance"$'\n'
+  # The guard runs without the env file's environment (env -i), so no PATH= line or other
+  # variable can change what it runs.
+  if ! printf '%s\n' "$lines" | grep -Fq 'ExecStartPre=/usr/bin/env -i /bin/sh -c '; then
+    problems+="no ExecStartPre=/usr/bin/env -i /bin/sh -c guard tying the env file to the instance"$'\n'
   fi
   if [[ -n $problems ]]; then
     printf '%s' "$problems"
@@ -145,6 +150,10 @@ check_env() {
   for key in ${ENV_KEYS//|/ }; do
     if ! env_value "$file" "$key" >/dev/null; then problems+="want exactly one $key="$'\n'; fi
   done
+  # The unit's byte rule: LF and printable ASCII only, no quote or backslash, comments too.
+  if [[ $(LC_ALL=C tr -d '\n !#-&(-[]-~' <"$file" | wc -c | tr -d ' ') != 0 ]]; then
+    problems+="a byte other than LF and printable ASCII, or a quote or backslash"$'\n'
+  fi
   # Plain KEY=value lines only: an unknown key is a typo, or a variable the unit must not take.
   while IFS= read -r line; do
     if [[ -n $line ]]; then problems+="not a known KEY=value line: $line"$'\n'; fi
@@ -234,29 +243,42 @@ awk '{ print } $0 == "[Service]" { print "Environment=COLLECTOR_NETWORK=hoodi" }
 expect_fail "a setting made by Environment= is caught" check_unit "$tmp/environment.service"
 grep -Ev '^ExecStartPre=' "$unit" >"$tmp/no-guard.service"
 expect_fail "a unit without the instance guard is caught" check_unit "$tmp/no-guard.service"
+replace "$unit" 'ExecStartPre=/usr/bin/env -i /bin/sh -c' 'ExecStartPre=/bin/sh -c' \
+  >"$tmp/guard-env.service"
+expect_fail "a guard run with the env file's environment (no env -i) is caught" \
+  check_unit "$tmp/guard-env.service"
 
 # --- the ExecStartPre guard, run the way systemd would --------------------------------------------
 
+# guard_cmd UNIT: the ExecStartPre= command before its quoted script (`/usr/bin/env -i /bin/sh -c`).
+guard_cmd() {
+  service_lines "$1" | sed -n 's/^ExecStartPre=\([^'"'"']*\) '"'"'.*'"'"'$/\1/p'
+}
+
 # guard_of UNIT ENV_FILE: the hoodi instance's guard script, `$$` a literal `$` and %i `hoodi`,
-# reading ENV_FILE in place of /etc/ethswarm/collector-hoodi.env.
+# reading ENV_FILE in place of /etc/ethswarm/collector-hoodi.env. systemd would also turn the
+# script's `\n` into a newline; tr reads both the same.
 guard_of() {
-  service_lines "$1" | sed -n 's/^ExecStartPre=\/bin\/sh -c '"'"'\(.*\)'"'"'$/\1/p' |
+  service_lines "$1" | sed -n 's/^ExecStartPre=[^'"'"']* '"'"'\(.*\)'"'"'$/\1/p' |
     sed -e 's/\$\$/$/g' -e 's/%i/hoodi/g' | replace /dev/stdin /etc/ethswarm/collector-hoodi.env "$2"
 }
 
-# run_guard UNIT ENV_FILE: the hoodi instance's guard with systemd's environment: its own
-# STATE_DIRECTORY, then every KEY=value of ENV_FILE, which overrides it.
+# run_guard UNIT ENV_FILE: the hoodi instance's guard command with systemd's environment: its
+# own PATH and STATE_DIRECTORY, then every KEY=value of ENV_FILE, which overrides them. Lines
+# are split at LF and at CR, as systemd's EnvironmentFile= parser splits them.
 run_guard() {
-  local guard line assignments=()
+  local cmd guard line assignments=()
+  cmd=$(guard_cmd "$1")
   guard=$(guard_of "$1" "$2")
-  [[ -n $guard ]] || { echo "no ExecStartPre=/bin/sh -c '<guard>'"; return 2; }
+  [[ -n $cmd && -n $guard ]] || { echo "no ExecStartPre=<command> '<guard>'"; return 2; }
   if [[ -f $2 ]]; then
     while IFS= read -r line; do
       if [[ $line == [A-Za-z_]*=* ]]; then assignments+=("$line"); fi
-    done <"$2"
+    done < <(tr '\r' '\n' <"$2")
   fi
+  # shellcheck disable=SC2086 # the command's words, split as systemd splits them
   env -i PATH=/usr/bin:/bin STATE_DIRECTORY=/var/lib/ethswarm-collector/hoodi \
-    ${assignments[@]+"${assignments[@]}"} /bin/sh -c "$guard"
+    ${assignments[@]+"${assignments[@]}"} $cmd "$guard"
 }
 
 hoodi_env="$collector/collector-hoodi.env.example"
@@ -276,6 +298,34 @@ with_env same-state 'STATE_DIRECTORY=/var/lib/ethswarm-collector/hoodi'
 with_env preload 'LD_PRELOAD=/tmp/x.so'
 with_env url "REFERENCE_API_URL=http://127.0.0.1:$HOODI_PORT"
 with_env indented '  COLLECTOR_NTP=none'
+with_env twice 'COLLECTOR_NTP=none'
+# with_ntp NAME LINE...: the hoodi example env file with its COLLECTOR_NTP line replaced by
+# LINEs, as $tmp/NAME.env.
+with_ntp() {
+  local name=$1
+  shift
+  { grep -v '^COLLECTOR_NTP=' "$hoodi_env"; printf '%s\n' "$@"; } >"$tmp/$name.env"
+}
+# Bytes systemd reads as a line end (CR) or that it may treat apart from grep: each would hide a
+# key from a line-based allow-list.
+with_env cr-comment $'#c\rSTATE_DIRECTORY=/tmp/evil'
+with_ntp cr-value $'COLLECTOR_NTP=chrony\rRUST_LOG=trace'
+{ cat "$hoodi_env"; printf '#c\000STATE_DIRECTORY=/tmp/evil\n'; } >"$tmp/nul.env"
+with_ntp tab $'COLLECTOR_NTP=chrony\t'
+with_env vt $'#c\vRUST_LOG=trace'
+with_env ff $'#c\fRUST_LOG=trace'
+with_env utf8 '# caf'$'\xc3\xa9'
+# Quotes, backslashes and export: systemd unquotes, unescapes and joins them; the guard does
+# not try to, it refuses them.
+with_ntp quoted-value 'COLLECTOR_NTP="chrony"'
+with_ntp single-quoted-value "COLLECTOR_NTP='chrony'"
+with_env quote-comment "# the node's port"
+with_env backslash-comment '# C:\collector'
+with_ntp continued "COLLECTOR_NTP=chro\\" 'ny'
+with_ntp exported 'export COLLECTOR_NTP=chrony'
+with_ntp spaced 'COLLECTOR_NTP = chrony'
+with_ntp no-ntp
+with_env semicolon '; a comment systemd reads, and the guard need not'
 
 expect_pass "the guard passes the hoodi env file on the hoodi instance" run_guard "$unit" "$hoodi_env"
 expect_fail "the guard refuses the sepolia env file on the hoodi instance" \
@@ -292,6 +342,52 @@ expect_fail "the guard refuses a URL in the env file" run_guard "$unit" "$tmp/ur
 expect_fail "the guard refuses a line systemd would read as a key the check does not see" \
   run_guard "$unit" "$tmp/indented.env"
 expect_fail "the guard refuses a missing env file" run_guard "$unit" "$tmp/missing.env"
+expect_fail "the guard refuses a CR after a comment (systemd reads a key after it)" \
+  run_guard "$unit" "$tmp/cr-comment.env"
+expect_fail "the guard refuses a CR after a value (systemd reads a key after it)" \
+  run_guard "$unit" "$tmp/cr-value.env"
+expect_fail "the guard refuses a NUL byte" run_guard "$unit" "$tmp/nul.env"
+expect_fail "the guard refuses a TAB" run_guard "$unit" "$tmp/tab.env"
+expect_fail "the guard refuses a vertical tab" run_guard "$unit" "$tmp/vt.env"
+expect_fail "the guard refuses a form feed" run_guard "$unit" "$tmp/ff.env"
+expect_fail "the guard refuses a byte outside ASCII" run_guard "$unit" "$tmp/utf8.env"
+expect_fail "the guard refuses a double-quoted value" run_guard "$unit" "$tmp/quoted-value.env"
+expect_fail "the guard refuses a single-quoted value" \
+  run_guard "$unit" "$tmp/single-quoted-value.env"
+expect_fail "the guard refuses a quote in a comment" run_guard "$unit" "$tmp/quote-comment.env"
+expect_fail "the guard refuses a backslash in a comment" \
+  run_guard "$unit" "$tmp/backslash-comment.env"
+expect_fail "the guard refuses a line continuation" run_guard "$unit" "$tmp/continued.env"
+expect_fail "the guard refuses an export prefix" run_guard "$unit" "$tmp/exported.env"
+expect_fail "the guard refuses spaces around =" run_guard "$unit" "$tmp/spaced.env"
+expect_fail "the guard refuses a second COLLECTOR_NTP line" run_guard "$unit" "$tmp/twice.env"
+expect_fail "the guard refuses an env file without COLLECTOR_NTP" run_guard "$unit" "$tmp/no-ntp.env"
+expect_fail "the guard refuses a ; comment line" run_guard "$unit" "$tmp/semicolon.env"
+
+# A PATH= line in the env file reaches the guard's environment: the guard must run no tool
+# from it. Each planted tool records that it ran and reports "nothing found".
+planted="$tmp/planted"
+mkdir -p "$planted"
+for tool in env sh grep tr wc cat; do
+  printf '#!/bin/sh\n/usr/bin/touch %s/ran\necho 0\n' "$planted" >"$planted/$tool"
+  chmod 0755 "$planted/$tool"
+done
+with_env path "PATH=$planted"
+# guard_runs_nothing_planted UNIT: the guard refuses the PATH= env file and ran no planted tool.
+guard_runs_nothing_planted() {
+  local rc=0
+  rm -f "$planted/ran"
+  run_guard "$1" "$tmp/path.env" || rc=$?
+  if [[ -e $planted/ran ]]; then echo "a tool from the env file's PATH ran"; return 1; fi
+  if ((rc == 0)); then echo "the guard passed an env file that sets PATH"; return 1; fi
+}
+expect_pass "the guard refuses a PATH= line and runs no tool from it" \
+  guard_runs_nothing_planted "$unit"
+replace "$unit" 'ExecStartPre=/usr/bin/env -i /bin/sh -c' 'ExecStartPre=/bin/sh -c' |
+  replace /dev/stdin '/usr/bin/grep' 'grep' | replace /dev/stdin '/usr/bin/tr' 'tr' |
+  replace /dev/stdin '/usr/bin/wc' 'wc' >"$tmp/bare-tools.service"
+expect_fail "a guard that runs its tools by bare name with the env file's PATH is caught" \
+  guard_runs_nothing_planted "$tmp/bare-tools.service"
 
 # The guard that compared COLLECTOR_OUT with $STATE_DIRECTORY let an env file move both.
 guard_refuses_override() { ! run_guard "$1" "$tmp/out-tmp.env" >/dev/null 2>&1; }
@@ -343,7 +439,6 @@ expect_fail "a URL file with a second line is caught" check_url "$tmp/two.url" h
 
 replace "$hoodi_env" 'COLLECTOR_NETWORK=hoodi' 'COLLECTOR_NETWORK=sepolia' >"$tmp/named.env"
 expect_fail "a Hoodi env file naming another network is caught" check_env "$tmp/named.env" hoodi
-with_env twice 'COLLECTOR_NTP=none'
 expect_fail "a second COLLECTOR_NTP line is caught" check_env "$tmp/twice.env" hoodi
 with_env typo 'COLLECTOR_NPT=none'
 expect_fail "an unknown key is caught" check_env "$tmp/typo.env" hoodi
@@ -352,6 +447,8 @@ expect_fail "a STATE_DIRECTORY line is caught" check_env "$tmp/same-state.env" h
 replace "$hoodi_env" '=chrony' '="chrony"' >"$tmp/quoted.env"
 expect_fail "a quoted value is caught" check_env "$tmp/quoted.env" hoodi
 expect_fail "an output dir shared by both instances is caught" check_env "$tmp/shared-out.env" hoodi
+expect_fail "a quote in a comment is caught" check_env "$tmp/quote-comment.env" hoodi
+expect_fail "a CR after a comment is caught" check_env "$tmp/cr-comment.env" hoodi
 
 # --- the README's migration from the single-network unit ----------------------------------------
 

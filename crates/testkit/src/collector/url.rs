@@ -97,10 +97,17 @@ impl ReferenceApiUrl {
     }
 
     /// Reads the URL from `path`, so a key in it stays out of the process's argv: a regular
-    /// file (not a symlink) that neither group nor others may access (mode 0600 or 0400), at
-    /// most [`MAX_URL_FILE_BYTES`], holding one URL and at most a trailing newline, checked as
-    /// [`ReferenceApiUrl::parse`] does. Errors name the file, never what it holds.
+    /// file (not a symlink, a FIFO or a device) owned by the effective UID that neither group
+    /// nor others may access (mode 0600 or 0400), at most [`MAX_URL_FILE_BYTES`], holding one
+    /// URL and at most a trailing newline, checked as [`ReferenceApiUrl::parse`] does. Errors
+    /// name the file, never what it holds.
     pub fn read_file(path: &Path) -> Result<Self, UrlFileError> {
+        Self::read_file_as(path, rustix::process::geteuid().as_raw())
+    }
+
+    /// [`ReferenceApiUrl::read_file`] for a process whose effective UID is `euid`.
+    fn read_file_as(path: &Path, euid: u32) -> Result<Self, UrlFileError> {
+        use rustix::fs::{Mode, OFlags};
         use std::io::Read;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let bad = |reason: String| UrlFileError {
@@ -111,13 +118,22 @@ impl ReferenceApiUrl {
         if before.file_type().is_symlink() {
             return Err(bad("a symlink (want a regular file)".into()));
         }
-        let file = std::fs::File::open(path).map_err(|e| bad(format!("open: {e}")))?;
+        // NOFOLLOW: a symlink swapped in after the lstat is not followed. NONBLOCK: a FIFO at
+        // the path is opened at once and refused below, instead of blocking until a writer
+        // comes. Every check after this one is on the open file.
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let fd = rustix::fs::open(path, flags, Mode::empty())
+            .map_err(|e| bad(format!("open: {}", std::io::Error::from(e))))?;
+        let file = std::fs::File::from(fd);
         let meta = file.metadata().map_err(|e| bad(format!("stat: {e}")))?;
         if !meta.is_file() {
             return Err(bad("not a regular file".into()));
         }
         if (meta.dev(), meta.ino()) != (before.dev(), before.ino()) {
             return Err(bad("replaced while it was opened".into()));
+        }
+        if meta.uid() != euid {
+            return Err(bad(format!("owned by uid {}, want {euid}", meta.uid())));
         }
         if meta.permissions().mode() & 0o077 != 0 {
             return Err(bad(
@@ -331,5 +347,55 @@ mod tests {
             assert!(err.contains(why), "{err} (want {why})");
             assert!(!err.contains("hunter2") && !err.contains("kkkk"), "{err}");
         }
+    }
+
+    #[test]
+    fn a_fifo_at_the_url_file_path_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg("-m")
+            .arg("0600")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo: {made}");
+        // A blocking open waits for a writer that never comes: give it 10 s, then fail.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(ReferenceApiUrl::read_file(&path).map(|_| ()));
+        });
+        let err = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("read_file blocked on a FIFO")
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with(&fifo.display().to_string()), "{err}");
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    #[test]
+    fn a_url_file_another_uid_owns_is_refused_unquoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = url_file(
+            dir.path(),
+            "theirs",
+            b"http://127.0.0.1:5053/key-hunter2\n",
+            0o600,
+        );
+        let euid = rustix::process::geteuid().as_raw();
+        assert!(ReferenceApiUrl::read_file_as(&path, euid).is_ok());
+        // The euid is injected, so another owner is testable without root.
+        let other = euid.wrapping_add(1);
+        let err = ReferenceApiUrl::read_file_as(&path, other)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with(&path.display().to_string()), "{err}");
+        assert!(
+            err.contains(&format!("owned by uid {euid}, want {other}")),
+            "{err}"
+        );
+        assert!(!err.contains("hunter2"), "{err}");
     }
 }

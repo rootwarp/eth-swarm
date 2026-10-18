@@ -48,6 +48,9 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
+# The URL file's O_NOFOLLOW | O_NONBLOCK open and geteuid, for its owner check. The version and
+# features cl-p2p and node-key use; no new crate.
+rustix = { version = "1", features = ["fs", "process"] }
 # Arrival records, gaps and NTP samples are JSON lines; beacon API and SSE event bodies are JSON.
 serde_json = "1"
 # Fixture encoding (feature `test-support`).
