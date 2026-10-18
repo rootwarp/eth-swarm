@@ -1,7 +1,9 @@
 # Reference node (Reth + Lighthouse): Sepolia and Hoodi
 
-One compose stack, run once per network, each instance a synced EL+CL pair on a Gloas-capable
-release. `NETWORK` in the `.env` picks the network; nothing else is copied per network.
+One compose stack, run once per network, each instance a synced EL+CL pair on Gloas-capable
+clients: releases on Sepolia, two dev builds pinned by digest on Hoodi until releases schedule
+its fork ([Hoodi](#hoodi)). `NETWORK` in the `.env` picks the network; nothing else is copied
+per network.
 
 | Network | Role | Gloas / Amsterdam fork | `.env` |
 |---|---|---|---|
@@ -61,7 +63,11 @@ any `COMPOSE_*` variable (`COMPOSE_FILE` would pick another file, `COMPOSE_PROFI
 services) and any `DOCKER_*` variable (`DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`,
 `DOCKER_TLS*` and `DOCKER_CERT_PATH` point docker at another daemon or client config than the
 host's, `DOCKER_DEFAULT_PLATFORM` and the rest change what it runs). `sudo` starts from a clean
-environment, so run compose through it too. Both env files are git-ignored.
+environment, so run compose through it too, and never use `sudo -E`: it keeps your `HOME`, and
+docker reads its config (the current context, so the daemon) and its CLI plugins (`docker
+compose` itself) from `$HOME/.docker`. The run log therefore points every docker call at the
+`.docker` directory of root's own home from the passwd database (`DOCKER_CONFIG`, normally
+`/root/.docker`), whatever `HOME` says. Both env files are git-ignored.
 
 The capture tools read the node's Beacon API. `ops/collector` runs one instance per network
 (`ethswarm-collector@hoodi`, `@sepolia`), each with its own URL file; its example URL files
@@ -90,10 +96,11 @@ capture window. When both data roots share a filesystem, the free space must cov
 
 ## Versions
 
-`.env.example` and `.env.hoodi.example` pin these (tag and multi-arch index digest; both
-networks run the same images today). `collect-run-log.sh` copies the network's table into the
-run log and fails if the pinned image has no row or its row says the release does not schedule
-the network's fork. The pinned configs are
+`.env.example` and `.env.hoodi.example` pin these (tag and multi-arch index digest): Sepolia
+runs releases, Hoodi two dev builds until releases schedule its fork. `preflight.sh` and
+`collect-run-log.sh` look up the pinned image, tag and digest, in the network's table below;
+both fail if it has no row or its row says it does not schedule the network's fork, and the
+run log copies the table. The pinned configs are
 `crates/network-config/networks/{sepolia,hoodi}/config.yaml`: Sepolia `GLOAS_FORK_EPOCH:
 353024`, `GLOAS_FORK_VERSION: 0x90000076`; Hoodi `GLOAS_FORK_EPOCH: 132352`,
 `GLOAS_FORK_VERSION: 0x80000910`. The EL half is Amsterdam. The consensus-specs column is the
@@ -120,33 +127,71 @@ notes: "If you are running a node on Sepolia you'll need v8.3.0-rc.0 instead").
 ### Hoodi
 
 <!-- release-notes:hoodi:begin -->
-| Image | Release | Schedules Hoodi's fork | consensus-specs | Release-note line: Hoodi Gloas / Amsterdam |
+| Image | Release | Schedules Hoodi's fork | consensus-specs | Release-note line, or a dev build's fork-schedule check: Hoodi Gloas / Amsterdam |
 |---|---|---|---|---|
+| `ghcr.io/paradigmxyz/reth:nightly@sha256:8765a1d57878bebd40362d71bbfc0834d231847952402f9a10848c14476b90d2` | dev build of [`e667968`](https://github.com/paradigmxyz/reth/commit/e667968725ff553f65dfecf161e63f6eab96fcc2) (`nightly`, built 2026-10-18; no release yet) | yes | n/a (EL) | Source check: `e667968725ff553f65dfecf161e63f6eab96fcc2` is 94 commits past `6096d25e9a50` "feat: schedule Hoodi Amsterdam activation" ([#27811](https://github.com/paradigmxyz/reth/pull/27811)) and builds with `alloy-hardforks` 0.4.10, whose `HOODI_AMSTERDAM_TIMESTAMP` is 1793036568 (2026-10-26 17:42:48 UTC, the first slot of epoch 132352). The image's SLSA provenance names this commit. |
+| `sigp/lighthouse:latest-unstable@sha256:be7fdbcd4a321647f0300ae8dc3a9542bf391129ecaf521892f0b27dfe2e9658` | dev build of [`c8ddac7`](https://github.com/sigp/lighthouse/commit/c8ddac7b79d49812283873eb6625149ef0d27f95) (`unstable`, built 2026-10-16; no release yet) | yes | v1.7.0-beta.4 | Source check: at `c8ddac7b79d49812283873eb6625149ef0d27f95` the built-in Hoodi config has `GLOAS_FORK_EPOCH: 132352`, and `testing/ef_tests/Makefile` pins `CONSENSUS_SPECS_TEST_VERSION` v1.7.0-beta.4. The Kurtosis devnet's Lighthouse image is built from the same commit; the image's SLSA provenance names it. |
 | `ghcr.io/paradigmxyz/reth:v2.7.0@sha256:a7f059d470878a5a59f3c575f3fc81b536d0d2d56d7a1cbed73e717a4f766336` | [v2.7.0](https://github.com/paradigmxyz/reth/releases/tag/v2.7.0) | no | n/a (EL) | Sepolia only: "This release schedules Amsterdam activation on Sepolia testnet". No Hoodi line; its Hoodi fork-ID test ends at Osaka and the BPO forks. |
 | `sigp/lighthouse:v8.3.0-rc.0@sha256:3e5f0609c74b824d3cb1049920169114d99fd7bc9082b996b3adae3d4e9ef8dc` | [v8.3.0-rc.0](https://github.com/sigp/lighthouse/releases/tag/v8.3.0-rc.0) | no | v1.7.0-beta.2 | "The Gloas fork is not yet scheduled on Hoodi or mainnet." Its built-in Hoodi config has `GLOAS_FORK_EPOCH: 18446744073709551615`. |
 <!-- release-notes:hoodi:end -->
 
-**Neither pinned release schedules Hoodi's fork.** As of 2026-10-18 no Reth or Lighthouse
-release does: v2.7.0 and v8.3.0-rc.0 are the latest tags, and the Hoodi announcement
+**Hoodi runs two dev builds, pinned by digest.** As of 2026-10-19 no Reth or Lighthouse
+release schedules Hoodi's fork: v2.7.0 and v8.3.0-rc.0 are the latest tags, and the Hoodi
+announcement
 ([blog.ethereum.org, 2026-10-16](https://blog.ethereum.org/en/2026/10/16/glamsterdam-hoodi-announcement))
 leaves both rows of its client tables empty ("Only use a release whose notes explicitly
 confirm support for the scheduled Glamsterdam activation on Hoodi"). The fork is scheduled only
-in unreleased code: Lighthouse `unstable` (Hoodi `GLOAS_FORK_EPOCH: 132352`, spec tests
-v1.7.0-beta.4) and `alloy-hardforks` main (`HOODI_AMSTERDAM_TIMESTAMP` 1793036568, merged
-2026-10-12), which Reth v2.7.0 does not include. No Lighthouse release both schedules Hoodi's
-Gloas fork and pins consensus-specs v1.7.0-beta.4. The reference nodes run releases that
-network operators run, never an `unstable` build.
+in unreleased code, so `.env.hoodi.example` pins the two dev images of the first two rows, the
+reference nodes' one exception to running releases, until the
+[repin to releases](#repin-to-releases) below. The Lighthouse build targets consensus-specs
+**v1.7.0-beta.4**, the same as our client. Sepolia stays on its releases, which schedule its
+fork (already past).
 
-So the Hoodi node can sync now on these releases (the chain before the fork is the same), but
-before **2026-10-25 23:59 KST** both images must move to releases whose notes schedule Hoodi's
-fork: take the index digest, put it in `.env.hoodi.example` and `.env.hoodi`, add a row here
-with `yes` and the release-note line, and recreate the services. **Until then `preflight.sh`
-fails for Hoodi** (it passes only when the README row for each pinned image says `yes`), so
-today it blocks the Hoodi start until the images are repinned; the run log fails criterion 1
-and (for Lighthouse) the spec diff. If neither team
-ships in time, the fallback is a pair the announcement lists (for example Teku 26.10.1 or
-Nimbus 26.10.1 with Nethermind 2.2.0 or Besu 26.10.0); that needs its own compose services and
-run-log checks, so decide it early.
+`preflight.sh` accepts for Hoodi exactly the images whose row here says `yes`: these two
+digests under these two tags. It refuses a tag alone (`nightly`, `latest-unstable`), the same
+tag at any other digest (both tags move every day), the same digest under another tag, any
+image with no row (no recorded fork-schedule check), and the two releases whose rows say `no`.
+The run log fails criterion 1 on the same rules.
+
+**Pull both images onto the Hoodi host now, and keep them.** An untagged dev digest stays
+pullable only while its registry keeps it, and neither ghcr.io nor Docker Hub promises that
+once the tag has moved on. So, on the Hoodi host, before anything else:
+
+```bash
+sudo docker pull ghcr.io/paradigmxyz/reth:nightly@sha256:8765a1d57878bebd40362d71bbfc0834d231847952402f9a10848c14476b90d2
+sudo docker pull sigp/lighthouse:latest-unstable@sha256:be7fdbcd4a321647f0300ae8dc3a9542bf391129ecaf521892f0b27dfe2e9658
+```
+
+Check that both are there (`sudo docker image inspect <pin>` prints the image). Until the
+repin, run no `docker image prune -a` or `docker system prune -a` on that host: before the
+containers exist, either deletes the pulled images, and the digests may be gone upstream.
+
+<!-- repin-to-releases:begin -->
+#### Repin to releases
+
+Aim to finish by **2026-10-24**, a day before the sync deadline. A repin recreates the
+containers on the same data directories, which needs no resync unless a release note says
+otherwise. Move each client on its own, as soon as its release qualifies:
+
+- [ ] **Reth:** v2.8.0 or later is tagged, its release notes confirm Hoodi's Amsterdam
+  activation, and the EF announcement's client table lists it.
+- [ ] **Lighthouse:** v8.3.0 is tagged, its release notes confirm Hoodi's Gloas fork (epoch
+  132352), and the EF announcement's client table lists it.
+- [ ] For each release: take its index digest (`docker buildx imagetools inspect
+  <image:tag>`), add a row to the table above with `yes`, the release-note line and (for
+  Lighthouse) the `CONSENSUS_SPECS_TEST_VERSION` at the tag, and put the pin in
+  `.env.hoodi.example` and the host's `.env.hoodi`. Delete the dev build's row, so that
+  `preflight.sh` refuses it again, and update the pins `tests/ref-node.test.sh` checks.
+- [ ] On the Hoodi host: `sudo docker pull <the new pin>`, `sudo ./preflight.sh --env-file
+  .env.hoodi`, then the `start:` line it prints (recreates the service), and collect a new run
+  log.
+- [ ] A client whose release is not out by 2026-10-24 keeps its dev pin through the fork; note
+  it in the run log.
+<!-- repin-to-releases:end -->
+
+If neither team ships and a dev build fails on Hoodi, the fallback is a pair the announcement
+lists (for example Teku 26.10.1 or Nimbus 26.10.1 with Nethermind 2.2.0 or Besu 26.10.0); that
+needs its own compose services and run-log checks, so decide it early.
 
 ## Migrating a Sepolia `.env` from `ops/sepolia-ref`
 
@@ -179,7 +224,8 @@ command (see above).
 1. **Pick versions.** Check the latest
    [Reth](https://github.com/paradigmxyz/reth/releases) and
    [Lighthouse](https://github.com/sigp/lighthouse/releases) releases for the network's Gloas /
-   Amsterdam support. To change a pin, take the index digest
+   Amsterdam support (Hoodi: pull and keep its dev images first, and follow
+   [Repin to releases](#repin-to-releases)). To change a pin, take the index digest
    (`docker buildx imagetools inspect <image:tag>`), update the network's `.env` example and
    its table above with the release-note line and the consensus-specs pin at that tag. If no
    Reth release supports the fork, fall back to Lighthouse + Geth (snap sync) and record the

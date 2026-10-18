@@ -6,13 +6,16 @@
 # /tmp, never TMPDIR. An .env that cannot be read so, one compose would read differently from
 # these scripts (lib/common.sh env_check: a byte other than printable ASCII and LF, `export`,
 # indentation, a key twice, a blank, quote, backslash, #, $ or backtick in a value, any
-# COMPOSE_* key), a NETWORK other than sepolia or hoodi, or any COMPOSE_* or DOCKER_* variable
+# COMPOSE_* key), an --env-file path with a control character (lib/common.sh env_path_check),
+# a NETWORK other than sepolia or hoodi, or any COMPOSE_* or DOCKER_* variable
 # in the environment (lib/common.sh docker_env_check: another project, compose file or daemon
 # than the one checked) is refused outright (exit 2). Otherwise every check runs and prints
 # one line; any FAIL fails:
 #   - RETH_IMAGE and LIGHTHOUSE_IMAGE are pinned as repo:tag@sha256:<64 lower-case hex>, and
-#     README.md's release-note table for the network has a row for each image (by digest)
-#     that says the release schedules the network's Gloas / Amsterdam fork;
+#     README.md's release-note table for the network has a row for each image (tag and
+#     digest) that says it schedules the network's Gloas / Amsterdam fork: a release whose
+#     notes say so, or (Hoodi, until releases do) a dev build whose fork-schedule check the
+#     row records;
 #   - no variable compose.yaml uses is overridden by the shell environment (compose would
 #     take the exported value over .env);
 #   - the five ports (lib/common.sh PORT_KEYS) are decimal 1-65535 and distinct;
@@ -71,6 +74,9 @@ while (($# > 0)); do
     *) usage ;;
   esac
 done
+# A control character in the path: a command substitution would drop a trailing newline and
+# check another file than the one named.
+env_path_check "$env_file" || exit 2
 # The .env, read once through fsguard into a private copy every check below reads (lib/common.sh
 # read_env), in a temp directory under /tmp whatever TMPDIR says.
 work=$(mktemp -d /tmp/ref-node.XXXXXX)

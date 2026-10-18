@@ -7,7 +7,9 @@
 #      never blocking on a FIFO), and works only on that copy, in a temp directory under /tmp
 #      (never TMPDIR). Then it refuses, before it changes anything, an .env with a
 #      line compose would read differently (lib/common.sh env_check) or a NETWORK it does not
-#      know, --test-mode as root, a DATA_ROOT with whitespace or a backslash, and any
+#      know, an --env-file path with a control character, --test-mode as root, a DATA_ROOT
+#      (from --root or .env) that is not a value .env can hold (lib/common.sh env_value_ok:
+#      printable ASCII without a blank, quote, backslash, #, $ or backtick), and any
 #      DATA_ROOT that lib/fsguard.py cannot prove safe: relative, a . or .. component, a
 #      missing directory above it (setup.sh creates DATA_ROOT at most, never a parent), a
 #      symlink anywhere from / down, a directory on the way not owned by root or open to group
@@ -69,6 +71,9 @@ while (($# > 0)); do
     *) usage ;;
   esac
 done
+# A control character in the path: $(dirname) and $(basename) below would drop a trailing
+# newline and check, read and rewrite another file than the one named.
+env_path_check "$env_file" || exit 2
 
 # The .env directory as given (never resolved: fsguard refuses a symlink on its path), made
 # absolute against the physical working directory, and the sudo user who may own it.
@@ -91,9 +96,13 @@ reth_user=$(service_user "$network" reth) lh_user=$(service_user "$network" ligh
 [[ -n $root ]] || root=$(env_get "$env_copy" DATA_ROOT)
 root=${root:-$(default_data_root "$network")}
 root=${root%/}
-# A backslash is refused too: nothing that reads DATA_ROOT back may decode it as an escape.
-if [[ $root != /* || $root =~ [[:space:]] || $root == *\\* ]]; then
-  refuse "DATA_ROOT must be an absolute path without whitespace or a backslash"
+# The root is written into .env as DATA_ROOT, so it must be a value env_check accepts there
+# (lib/common.sh env_value_ok): a # would cut the line, a quote, $ or backtick make compose read
+# another value, a non-ASCII or control byte fail env_check, and every later run would then
+# refuse the .env. No blank or backslash either: nothing that reads DATA_ROOT back may split it
+# or decode it as an escape. Checked before anything changes.
+if [[ $root != /* ]] || ! env_value_ok "$root"; then
+  refuse "DATA_ROOT must be an absolute path of printable ASCII without a blank, a quote, a backslash, a #, a \$ or a backtick"
 fi
 if ((test_mode)) && ((euid == 0)); then
   refuse "--test-mode is not for root (it would record uid 0 for both services)"

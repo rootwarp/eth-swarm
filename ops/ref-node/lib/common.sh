@@ -46,14 +46,16 @@ release_notes() {
     $0 == e { on = 0 } on { print } $0 == b { on = 1 }' "$1"
 }
 
-# release_row <README.md> <network> <image ref>: "<schedules>|<consensus-specs>" from the row
-# of the network's table whose Image cell is `<image ref>` (tag and digest, so a re-pushed
+# release_row <README.md> <network> <image ref>: "<schedules>|<consensus-specs>" from the first
+# row of the network's table whose Image cell is `<image ref>` (tag and digest, so a re-pushed
 # tag has no row), cells trimmed; nothing when there is no such row. Columns: Image,
-# Release, Schedules the fork (yes or no), consensus-specs, Release-note line.
+# Release, Schedules the fork (yes or no), consensus-specs, Release-note line or fork-schedule
+# check. The awk reads the whole table: one that stopped at the match would leave release_notes
+# writing into a closed pipe, and pipefail would turn its SIGPIPE into exit 141.
 release_row() {
   release_notes "$1" "$2" | RELEASE_IMG="\`$3\`" awk -F '|' '
     function trim(x) { gsub(/^[ \t]+|[ \t]+$/, "", x); return x }
-    NF >= 7 && trim($2) == ENVIRON["RELEASE_IMG"] { print trim($4) "|" trim($5); exit }'
+    !found && NF >= 7 && trim($2) == ENVIRON["RELEASE_IMG"] { print trim($4) "|" trim($5); found = 1 }'
 }
 
 # The ports compose.yaml binds, from .env (both .env examples set them; the second network on
@@ -151,6 +153,33 @@ env_check() {
     END { exit bad }' "$1"
 }
 
+# env_value_ok <value>: 0 if <value> is one env_check accepts as an .env value: printable ASCII
+# only (no control, TAB, newline or non-ASCII byte), with no blank, quote, backslash, #, $ or
+# backtick. For a value the scripts write into .env themselves (setup.sh --root): one that
+# breaks the rule would make every later run refuse the .env, or compose read another value.
+env_value_ok() {
+  [[ $(printf '%s' "$1" | LC_ALL=C tr -d '\041-\176' | wc -c | tr -d ' ') == 0 ]] || return 1
+  case $1 in
+    *[\'\"\\#\$\`]*) return 1 ;;
+  esac
+}
+
+# no_control_char <string>: 0 unless <string> holds a control byte (0x01-0x1f, 0x7f: a newline,
+# a TAB, a CR, an escape). For a path given on the command line: a command substitution drops a
+# trailing newline, so $(dirname -- "$p") and $(basename -- "$p") of $'/x/node.env\n' name
+# /x/node.env, which would be checked, read and written instead.
+no_control_char() {
+  [[ $(printf '%s' "$1" | LC_ALL=C tr -dc '\001-\037\177' | wc -c | tr -d ' ') == 0 ]]
+}
+
+# env_path_check <path>: 0 unless the --env-file path holds a control character; then an ERROR
+# line on stderr (never the path itself) and 1. Each script calls it before it uses the path.
+env_path_check() {
+  no_control_char "$1" && return 0
+  echo "ERROR: --env-file: the path holds a control character (a newline, a TAB, a CR, ...)" >&2
+  return 1
+}
+
 # env_get <file> <key>: the value of the last KEY=value line, as it is (env_check refuses the
 # quotes, blanks and escapes compose would read differently). The file is read, never sourced,
 # so nothing in it runs.
@@ -179,9 +208,11 @@ sudo_operator() {
 # read_env <fsguard.py> <env file> <copy>: the .env read once, through fsguard read-file (the
 # walk from / to its directory, which root, the euid or the sudo user owns and nobody else can
 # write; then a regular file with one link and such an owner, opened O_NOFOLLOW|O_NONBLOCK),
-# into <copy>; fsguard's exit code, its reason on stderr. Every later read uses the copy, so
+# into <copy>; fsguard's exit code, its reason on stderr. A path with a control character is
+# refused first (exit 2; env_path_check). Every later read uses the copy, so
 # the scripts never follow a link, block on a FIFO or see another file the second time.
 read_env() {
+  env_path_check "$2" || return 2
   python3 -I -B "$1" read-file "$(abs_dir "$(dirname -- "$2")")" "$(basename -- "$2")" "$(id -u)" "$(sudo_operator)" > "$3"
 }
 
@@ -220,6 +251,25 @@ docker_env_check() {
   return $rc
 }
 
+# docker_config_pin: export DOCKER_CONFIG as the .docker directory in the euid's home from the
+# passwd database (/root/.docker for root), never from HOME; 1 and an ERROR line when the euid
+# has no passwd entry. docker reads its config (the current context, so which daemon it talks
+# to, and the credential helpers it runs) and its CLI plugins (docker compose itself) from
+# DOCKER_CONFIG, else from $HOME/.docker, and sudo -E keeps the operator's HOME: root's docker
+# would then run the operator's ~/.docker/cli-plugins/docker-compose as root, or talk to the
+# daemon the operator's context names. docker_env_check refuses a DOCKER_CONFIG from the
+# environment first, so every docker call after this sees only the pinned one.
+docker_config_pin() {
+  local home
+  home=$(python3 -I -B -c 'import os, pwd; print(pwd.getpwuid(os.geteuid()).pw_dir)' 2>/dev/null) || home=''
+  if [[ $home != /* ]]; then
+    echo "ERROR: uid $(id -u) has no home directory in the passwd database (docker reads its config from there, never from HOME)"
+    return 1
+  fi
+  DOCKER_CONFIG="${home%/}/.docker"
+  export DOCKER_CONFIG
+}
+
 # env_overrides <env file>: one FAIL line per compose variable set in the environment (even to
 # empty) with a value other than the file's; 1 if any. Names only, never a value.
 env_overrides() {
@@ -245,7 +295,10 @@ FETCH_MAX_BYTES=1048576
 # proxy would see each URL in full, and a checkpoint provider must be checked over the direct
 # path Lighthouse takes to it (compose.yaml passes it no proxy variable). An answer over
 # FETCH_MAX_BYTES fails (exit 63, curl's own code for it) and leaves <out-file> empty: curl's
-# --max-filesize stops one that announces its length, and head stops one that does not.
+# --max-filesize stops one that announces its length, and head stops one that does not. Every
+# stage of the pipeline counts: curl's own failure is returned as it is, and printf or head
+# failing (head cannot write the answer: ENOSPC under /tmp) is exit 23, curl's code for a write
+# error; either way <out-file> is left empty, never holding part of an answer.
 fetch() {
   local url=$1 out=$2 status
   case $url in
@@ -263,6 +316,10 @@ fetch() {
   if ((status[1] != 0)); then
     : > "$out"
     return "${status[1]}"
+  fi
+  if ((status[0] != 0 || status[2] != 0)); then
+    : > "$out"
+    return 23
   fi
 }
 
@@ -301,7 +358,9 @@ check_listeners() {
     echo "$svc: no container process to match listeners to: FAIL"
     return 1
   fi
-  if ! printf '%s\n' "$ss_out" | grep -q '^LISTEN .*pid=[0-9]'; then
+  # A here-string, not printf | grep -q: grep stops at the first match, and printf writing the
+  # rest of a long listing into the closed pipe would make pipefail report "no process".
+  if ! grep -q '^LISTEN .*pid=[0-9]' <<< "$ss_out"; then
     echo "$svc: ss -ltnp shows no process for any listener (it needs root): FAIL"
     return 1
   fi

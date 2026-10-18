@@ -51,7 +51,9 @@
 # and any COMPOSE_* key in the .env, and any COMPOSE_* variable, DOCKER_HOST, DOCKER_CONTEXT,
 # DOCKER_CONFIG or DOCKER_TLS* in the environment (lib/common.sh docker_env_check), is refused,
 # so the run log never looks at another network's project, another compose file or another
-# daemon.
+# daemon. Every docker call then gets DOCKER_CONFIG=<root's passwd home>/.docker
+# (lib/common.sh docker_config_pin), so a HOME kept by sudo -E never supplies docker's config
+# or CLI plugins.
 # It reads no secret: the JWT copies are only fstat'ed, and the checkpoint URLs appear as
 # scheme and host only. compose's own stderr (which can quote .env values) is discarded. The
 # verdict line goes to stderr.
@@ -94,6 +96,9 @@ done
 # Decimal only: a leading zero is octal in bash arithmetic (08 would be an error, 010 is 8).
 if [[ ! $samples =~ ^[1-9][0-9]*$ || ! $interval =~ ^[0-9]+$ ]]; then usage; fi
 samples=$((10#$samples)) interval=$((10#$interval))
+# A control character in the path: a command substitution would drop a trailing newline and
+# check another file than the one named.
+env_path_check "$env_file" || exit 2
 # The .env, read once through fsguard into a private copy that every read below and every
 # compose call (--env-file) uses (lib/common.sh read_env), in a temp directory under /tmp
 # whatever TMPDIR says.
@@ -106,6 +111,9 @@ env_check "$envc" "$env_file" >&2 || refuse "$env_file: fix the lines above"
 network=$(env_get "$envc" NETWORK)
 network_known "$network" || refuse "NETWORK must be sepolia or hoodi (in $env_file)"
 docker_env_check >&2 || exit 2
+# Every docker call reads DOCKER_CONFIG, the .docker of root's own home, never $HOME/.docker:
+# under sudo -E that is the operator's, with its CLI plugins and its context (lib/common.sh).
+docker_config_pin >&2 || exit 2
 ports_check "$envc" >&2 || refuse "$env_file: fix the ports above"
 config=${config:-$here/../../crates/network-config/networks/$network/config.yaml}
 port() { env_get "$envc" "$1"; }
@@ -144,9 +152,10 @@ block() { { echo '```'; cat; echo '```'; } >> "$body"; }
 # get <API path> <file>: GET the local Beacon API into $work/<file>.
 get() { fetch "$api$1" "$work/$2"; }
 # running_ctr <service>: the id of the service's running container now, or nothing. compose's
-# stderr is dropped: it can quote .env values.
+# stderr is dropped: it can quote .env values. sed reads the whole answer (head -1 would close
+# the pipe on a longer one).
 running_ctr() {
-  "${compose[@]}" ps -q --status running "$1" 2>/dev/null | head -1 || true
+  "${compose[@]}" ps -q --status running "$1" 2>/dev/null | sed -n 1p || true
 }
 
 # 1. Versions, digests, release notes and the running containers.
@@ -366,7 +375,7 @@ record "Peer ID and custody_group_count recorded" $bad
 
 section "m2a-session config (/etc/ethswarm/m2a-session.toml on the test host)"
 bad=0
-multiaddr=$(sed -n 's|^multiaddr: ||p' "$work/identity.txt" | head -1)
+multiaddr=$(awk 'index($0, "multiaddr: ") == 1 && !seen { print substr($0, 12); seen = 1 }' "$work/identity.txt")
 if [[ ! $multiaddr =~ ^/ip4/[0-9.]+/tcp/[0-9]+/p2p/[1-9A-HJ-NP-Za-km-z]{32,128}$ || $multiaddr != /ip4/*/tcp/"$lh_p2p"/p2p/* ]]; then
   multiaddr=''
 fi

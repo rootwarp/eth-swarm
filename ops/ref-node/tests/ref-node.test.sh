@@ -31,13 +31,18 @@ trap 'rm -rf "$tmp"' EXIT
 tmp=$(cd -P "$tmp" && pwd -P)   # setup.sh refuses a root reached through a symlink (macOS /var)
 start_dir=$PWD
 cd "$tmp"   # a stray relative write lands in the temp dir, never in the checkout
-# A copy of the stack whose README says both pinned releases schedule Hoodi's fork (and pins
-# our consensus-specs), as it will once the images are replaced by releases that do. Its
-# ../../crates reaches the real pinned configs.
-yes_ref="$tmp/repo-yes/ops/ref-node"
-mkdir -p "$tmp/repo-yes/ops" && cp -R "$ref" "$yes_ref" && ln -s "$repo/crates" "$tmp/repo-yes/crates"
-sed -i.bak '/release-notes:hoodi:begin/,/release-notes:hoodi:end/ { s/| no |/| yes |/; s/| v1\.7\.0-beta\.2 |/| v1.7.0-beta.4 |/; }' "$yes_ref/README.md"
-rm -f "$yes_ref/README.md.bak" && rm -rf "$yes_ref/lib/__pycache__"
+# A fresh copy of the stack, which the Hoodi preflight and run-log cases run from, so the
+# __pycache__ check at the end sees only what the scripts wrote. Its ../../crates reaches the
+# real pinned configs.
+copy_ref="$tmp/repo-copy/ops/ref-node"
+mkdir -p "$tmp/repo-copy/ops" && cp -R "$ref" "$copy_ref" && ln -s "$repo/crates" "$tmp/repo-copy/crates"
+rm -rf "$copy_ref/lib/__pycache__"
+# The images Hoodi runs (.env.hoodi.example): dev builds pinned by digest, the only ones whose
+# fork-schedule check README.md records for Hoodi. Sepolia keeps its release pins.
+hoodi_reth=ghcr.io/paradigmxyz/reth:nightly@sha256:8765a1d57878bebd40362d71bbfc0834d231847952402f9a10848c14476b90d2
+hoodi_lh=sigp/lighthouse:latest-unstable@sha256:be7fdbcd4a321647f0300ae8dc3a9542bf391129ecaf521892f0b27dfe2e9658
+sepolia_reth=ghcr.io/paradigmxyz/reth:v2.7.0@sha256:a7f059d470878a5a59f3c575f3fc81b536d0d2d56d7a1cbed73e717a4f766336
+sepolia_lh=sigp/lighthouse:v8.3.0-rc.0@sha256:3e5f0609c74b824d3cb1049920169114d99fd7bc9082b996b3adae3d4e9ef8dc
 
 passed=0 failed=0
 
@@ -61,7 +66,7 @@ check_out() {
   local expect=$1 desc=$2 pattern=$3 rc=0 out
   shift 3
   out=$("$@" 2>&1) || rc=$?
-  if ((rc == expect)) && printf '%s\n' "$out" | grep -Eq -- "$pattern"; then
+  if ((rc == expect)) && grep -Eq -- "$pattern" <<< "$out"; then
     ok "$desc"
   else
     bad "$desc (exit $rc, want $expect; want a line matching /$pattern/)" "$out"
@@ -310,7 +315,7 @@ sed "s/$pid/not-a-peer-id/" "$tmp/identity.json" > "$tmp/bad-identity.json"
 check_out 1 "identity: a peer ID that is not base58 fails" '^error: peer_id is not base58 or missing$' \
   python3 -I -B "$helper" identity "$tmp/bad-identity.json" '' 9000
 out=$(python3 -I -B "$helper" identity "$tmp/bad-identity.json" '' 9000 2>&1 || true)
-if printf '%s\n' "$out" | grep -Eq '^(peer_id|custody_group_count|multiaddr): '; then
+if grep -Eq '^(peer_id|custody_group_count|multiaddr): ' <<< "$out"; then
   bad "identity: an error is never printed as a value line" "$out"
 else
   ok "identity: an error is never printed as a value line"
@@ -408,7 +413,7 @@ s.serve_forever()' "$tmp/http.port" &
   for _ in $(seq 1 100); do [[ -s $tmp/http.port ]] && break; sleep 0.1; done
   srv="http://127.0.0.1:$(cat "$tmp/http.port")"
   rc=0; out=$(HOME="$tmp/curlhome" fetch "$srv/eth/KEY555secret" "$tmp/fetched.json" 2>&1) || rc=$?
-  if ((rc == 0)) && ! printf '%s' "$out" | grep -q KEY555secret; then ok "fetch: ~/.curlrc is not read (no write-out of the URL)"; else bad "fetch: ~/.curlrc is not read (exit $rc)" "$out"; fi
+  if ((rc == 0)) && ! grep -q KEY555secret <<< "$out"; then ok "fetch: ~/.curlrc is not read (no write-out of the URL)"; else bad "fetch: ~/.curlrc is not read (exit $rc)" "$out"; fi
   rc=0; out=$(http_proxy=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 \
     fetch "$srv/eth/v1/node/syncing" "$tmp/fetched.json" 2>&1) || rc=$?
   if ((rc == 0)); then ok "fetch: no proxy from the environment is used"; else bad "fetch: no proxy from the environment is used (exit $rc)" "$out"; fi
@@ -419,6 +424,15 @@ s.serve_forever()' "$tmp/http.port" &
     rc=0; fetch "$srv$path" "$tmp/fetched.json" || rc=$?
     if ((rc != 0)) && [[ ! -s $tmp/fetched.json ]]; then ok "fetch: a 2 MiB answer ($path) is refused, nothing kept"; else bad "fetch: a 2 MiB answer ($path) is refused (exit $rc, $(wc -c < "$tmp/fetched.json") bytes kept)"; fi
   done
+  # Every stage counts: a head that fails while writing the answer (ENOSPC: the disk under /tmp
+  # is full) leaves part of it, which must not pass for the whole answer. A stand-in head writes
+  # one byte, then fails as head does on a write error.
+  mkdir -p "$tmp/fullhead"
+  printf '#!/usr/bin/env bash\n%s -c 1\ncat > /dev/null\necho "head: write error: No space left on device" >&2\nexit 1\n' "$(command -v head)" > "$tmp/fullhead/head"
+  chmod +x "$tmp/fullhead/head"
+  printf 'stale' > "$tmp/fetched.json"
+  rc=0; PATH="$tmp/fullhead:$PATH" fetch "$srv/eth/v1/node/syncing" "$tmp/fetched.json" 2>/dev/null || rc=$?
+  if ((rc == 23)) && [[ ! -s $tmp/fetched.json ]]; then ok "fetch: a head that fails to write (ENOSPC) fails the fetch (exit 23), nothing kept"; else bad "fetch: a head that fails to write fails the fetch (exit $rc, want 23; $(wc -c < "$tmp/fetched.json") bytes kept)"; fi
   kill "$http_pid" 2>/dev/null || true
   wait "$http_pid" 2>/dev/null || true
 else
@@ -490,6 +504,12 @@ listeners 1 "an ss without process information fails" '^reth: ss -ltnp shows no 
 listeners 1 "no container process to match fails" '^reth: no container process to match listeners to: FAIL$' reth '' 30303 "$ss_reth"
 listeners 0 "several pids of one container" '^reth: no non-loopback TCP listener but p2p port 30303 \(pids 812 813\): PASS$' \
   reth "812 813" 30303 "${ss_rp2p/pid=812/pid=813}"
+# A busy host lists thousands of sockets. The "does ss show processes" test reads all of them:
+# a grep -q that stopped at the first one would leave printf writing into a closed pipe, which
+# pipefail turned into "ss shows no process" (a false FAIL).
+many_ss=$(for i in $(seq 1 4000); do printf 'LISTEN 0      128          0.0.0.0:%s         0.0.0.0:*    users:(("sshd",pid=5,fd=3))\n' $((20000 + i)); done)
+listeners 0 "an ss listing of thousands of sockets is read whole (no SIGPIPE)" \
+  '^reth: no non-loopback TCP listener but p2p port 30303 \(pids 812\): PASS$' reth 812 30303 "$ss_reth" "$many_ss" "$ss_rp2p"
 
 # The network and its derived names: users, default DATA_ROOT, compose project, pinned config.
 for spec in "sepolia reth reth" "sepolia lighthouse lighthouse" "hoodi reth reth-hoodi" "hoodi lighthouse lighthouse-hoodi"; do
@@ -530,10 +550,59 @@ for spec in "$sep_ex sepolia" "$hoodi_ex hoodi"; do
     if [[ $row == yes\|* || $row == no\|* ]]; then ok "release notes: README.md has a $net row for ${ex##*/} $key ($row)"; else bad "release notes: README.md has a $net row for ${ex##*/} $key (got '$row')"; fi
   done
 done
-row=$(release_row "$ref/README.md" hoodi "$(env_get "$hoodi_ex" LIGHTHOUSE_IMAGE)")
-if [[ $row == 'no|v1.7.0-beta.2' ]]; then ok "release notes: the pinned Lighthouse does not schedule Hoodi's fork and targets beta.2"; else bad "release notes: Hoodi Lighthouse row (got '$row')"; fi
+# Hoodi runs exactly the two dev pins whose fork-schedule check README.md records; Sepolia keeps
+# its releases, which do not schedule Hoodi's fork, and the dev pins have no Sepolia row.
+for spec in "RETH_IMAGE $hoodi_reth" "LIGHTHOUSE_IMAGE $hoodi_lh"; do
+  read -r key want <<< "$spec"
+  if [[ $(env_get "$hoodi_ex" "$key") == "$want" ]]; then ok "env examples: Hoodi pins $key to the reviewed dev digest"; else bad "env examples: Hoodi $key (got '$(env_get "$hoodi_ex" "$key")', want '$want')"; fi
+done
+for spec in "RETH_IMAGE $sepolia_reth" "LIGHTHOUSE_IMAGE $sepolia_lh"; do
+  read -r key want <<< "$spec"
+  if [[ $(env_get "$sep_ex" "$key") == "$want" ]]; then ok "env examples: Sepolia keeps $key on its release pin"; else bad "env examples: Sepolia $key (got '$(env_get "$sep_ex" "$key")', want '$want')"; fi
+done
+# row_of <network> <image> <want> <description>: release_row's output is exactly <want>.
+row_of() {
+  local got
+  got=$(release_row "$ref/README.md" "$1" "$2")
+  if [[ $got == "$3" ]]; then ok "release notes: $4"; else bad "release notes: $4 (got '$got', want '$3')"; fi
+}
+row_of hoodi "$hoodi_reth" 'yes|n/a (EL)' "the Hoodi reth nightly digest schedules Hoodi's fork"
+row_of hoodi "$hoodi_lh" 'yes|v1.7.0-beta.4' "the Hoodi Lighthouse unstable digest schedules Hoodi's fork and targets beta.4"
+row_of hoodi "$sepolia_reth" 'no|n/a (EL)' "reth v2.7.0 does not schedule Hoodi's fork"
+row_of hoodi "$sepolia_lh" 'no|v1.7.0-beta.2' "Lighthouse v8.3.0-rc.0 does not schedule Hoodi's fork and targets beta.2"
+row_of hoodi "ghcr.io/paradigmxyz/reth:nightly@sha256:$d64" '' "the nightly tag at another digest has no Hoodi row"
+row_of hoodi "sigp/lighthouse:latest-unstable@sha256:$d64" '' "the latest-unstable tag at another digest has no Hoodi row"
+row_of hoodi "sigp/lighthouse:latest@sha256:${hoodi_lh##*sha256:}" '' "the reviewed digest under another tag has no Hoodi row"
+# README.md records, for the dev pins, where each digest was built from and how to leave them.
+for spec in "e667968725ff553f65dfecf161e63f6eab96fcc2|the reth nightly source commit" \
+  "c8ddac7b79d49812283873eb6625149ef0d27f95|the Lighthouse unstable source commit" \
+  "https://blog.ethereum.org/en/2026/10/16/glamsterdam-hoodi-announcement|the EF Hoodi announcement" \
+  "<!-- repin-to-releases:begin -->|the repin-to-releases checklist"; do
+  if grep -qF -- "${spec%%|*}" "$ref/README.md"; then ok "README: records ${spec#*|}"; else bad "README: records ${spec#*|} (no '${spec%%|*}')"; fi
+done
+row_of sepolia "$hoodi_reth" '' "the Hoodi dev pins have no Sepolia row"
+row_of sepolia "$hoodi_lh" '' "the Hoodi Lighthouse dev pin has no Sepolia row"
 check_out 0 "release notes: a row is matched by image digest, not by tag" '^$' \
   release_row "$ref/README.md" sepolia "sigp/lighthouse:v8.3.0-rc.0@sha256:$d64"
+# release_row reads the whole table: an awk that stopped at the first match would leave the
+# one printing the table writing into a closed pipe, which pipefail turns into exit 141 (a false
+# preflight FAIL). A long table with the row first makes that certain rather than rare.
+{
+  echo '<!-- release-notes:hoodi:begin -->'
+  echo '| Image | Release | Schedules | consensus-specs | Line |'
+  echo "| \`ghcr.io/x/reth:v1@sha256:$d64\` | v1 | yes | n/a | first |"
+  for i in $(seq 1 3000); do echo "| \`ghcr.io/x/other:v$i@sha256:$d64\` | v$i | no | n/a | padding padding padding padding |"; done
+  echo '<!-- release-notes:hoodi:end -->'
+} > "$tmp/long-readme.md"
+sed "3 { p; s/| yes |/| no |/; }" "$tmp/long-readme.md" > "$tmp/twice-readme.md"
+# row_is <description> <README> <want>: release_row's exit code is 0 and its output exactly <want>.
+row_is() {
+  local rc=0 got
+  got=$(release_row "$2" hoodi "ghcr.io/x/reth:v1@sha256:$d64") || rc=$?
+  if ((rc == 0)) && [[ $got == "$3" ]]; then ok "release notes: $1"; else bad "release notes: $1 (exit $rc, got '$got')"; fi
+}
+row_is "a row early in a long table is read under pipefail (no SIGPIPE)" "$tmp/long-readme.md" 'yes|n/a'
+row_is "of two rows for one image, only the first counts" "$tmp/twice-readme.md" 'yes|n/a'
 # README.md's migration note: a Sepolia .env from ops/sepolia-ref has no NETWORK, no
 # CHECKPOINT_SYNC_URL_2 and no port keys. The lines it lists turn such a file into one with every
 # key of .env.example, at .env.example's values, that the scripts accept.
@@ -609,6 +678,60 @@ envc_case 1 "a NUL byte is refused" 'a byte other than printable ASCII' 'X=a\000
 envc_case 1 "a quoted value is refused" 'line [0-9]+: X holds .* a quote' 'X="1001"\n'
 printf 'X="v"\n' > "$tmp/envq.env"
 check_out 0 "env_get: quotes are no longer stripped (env_check refuses them first)" '^"v"$' env_get "$tmp/envq.env" X
+# env_value_ok: a value env_check would accept in an .env line, which setup.sh holds --root to
+# before it writes DATA_ROOT there (a # would cut the line, a quote or $ make compose read it
+# differently, and every later run would refuse the .env).
+for value in /srv/ethswarm-ref-hoodi /srv/a.b_c-d:e@f+g%h=i,j /; do
+  check 0 "env_value_ok: '$value' passes" env_value_ok "$value"
+done
+for value in '/srv/a b' '/srv/a#b' "/srv/a'b" '/srv/a"b' '/srv/a$b' '/srv/a`b' '/srv/a\b' $'/srv/caf\303\251' \
+  $'/srv/a\tb' $'/srv/a\nb' $'/srv/a\rb' $'/srv/a\177b' $'/srv/a\033b'; do
+  check 1 "env_value_ok: $(printf '%q' "$value") is refused" env_value_ok "$value"
+done
+# no_control_char: a path given on the command line (--env-file) holds no control character. A
+# command substitution drops a trailing newline, so $'/x/node.env\n' would be checked, read and
+# written as /x/node.env.
+for value in /x/node.env $'/x/caf\303\251.env' '/x/a b.env'; do
+  check 0 "no_control_char: $(printf '%q' "$value") passes" no_control_char "$value"
+done
+for value in $'/x/node.env\n' $'/x/\nnode.env' $'/x/a\tb' $'/x/a\rb' $'/x/\033[31m' $'/x/a\177b' $'/x/a\001b'; do
+  check 1 "no_control_char: $(printf '%q' "$value") is refused" no_control_char "$value"
+done
+
+# docker reads its config (which daemon: the current context) and its CLI plugins (docker
+# compose itself) from DOCKER_CONFIG, else from $HOME/.docker. sudo -E keeps the operator's
+# HOME, so root's docker would run the operator's ~/.docker/cli-plugins/docker-compose.
+# docker_config_pin points DOCKER_CONFIG at the .docker of the euid's own home, from the passwd
+# database, whatever HOME says.
+pw_home=$(python3 -I -B -c 'import os, pwd; print(pwd.getpwuid(os.geteuid()).pw_dir)')
+mkdir -p "$tmp/evilhome/.docker/cli-plugins"
+printf '#!/bin/sh\ntouch "%s/evil-plugin-ran"\nexit 1\n' "$tmp" > "$tmp/evilhome/.docker/cli-plugins/docker-compose"
+chmod +x "$tmp/evilhome/.docker/cli-plugins/docker-compose"
+got=$(HOME="$tmp/evilhome" bash -c 'source "$1" && docker_config_pin && printf "%s" "$DOCKER_CONFIG"' _ "$ref/lib/common.sh" 2>&1) || got="(failed: $got)"
+if [[ $got == "${pw_home%/}/.docker" ]]; then ok "docker_config_pin: DOCKER_CONFIG is the passwd home's .docker, not HOME's"; else bad "docker_config_pin: DOCKER_CONFIG (got '$got', want '${pw_home%/}/.docker')"; fi
+# No passwd entry for the euid (a python3 that finds none stands in): refused, never HOME.
+mkdir -p "$tmp/nopasswd" && printf '#!/bin/sh\nexit 1\n' > "$tmp/nopasswd/python3" && chmod +x "$tmp/nopasswd/python3"
+check_out 1 "docker_config_pin: an euid without a passwd home is refused" '^ERROR: uid [0-9]+ has no home directory in the passwd database' \
+  env PATH="$tmp/nopasswd:$PATH" bash -c 'source "$1" && docker_config_pin' _ "$ref/lib/common.sh"
+# read_env refuses such a path itself too, before fsguard sees it.
+printf 'NETWORK=sepolia\n' > "$tmp/ctl.env"
+check_out 2 "read_env: an .env path ending in a newline is refused" '^ERROR: --env-file: the path holds a control character' \
+  read_env "$ref/lib/fsguard.py" "$tmp/ctl.env"$'\n' "$tmp/ctl.copy"
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+  # The real docker CLI, against a plugin planted under HOME: it runs without the pin (so the
+  # check can see it), never with it.
+  rm -f "$tmp/evil-plugin-ran"
+  HOME="$tmp/evilhome" docker compose version >/dev/null 2>&1 || true
+  if [[ -e $tmp/evil-plugin-ran ]]; then
+    rm -f "$tmp/evil-plugin-ran"
+    HOME="$tmp/evilhome" bash -c 'source "$1" && docker_config_pin && exec docker compose version' _ "$ref/lib/common.sh" >/dev/null 2>&1 || true
+    if [[ ! -e $tmp/evil-plugin-ran ]]; then ok "docker_config_pin: docker runs no CLI plugin from HOME's .docker"; else bad "docker_config_pin: docker ran the CLI plugin under HOME"; fi
+  else
+    echo "# skip - docker_config_pin against the real docker: this docker loads no plugin from HOME"
+  fi
+else
+  echo "# skip - docker_config_pin against the real docker: docker compose is not installed"
+fi
 
 # refusal_cases [--test-mode]: setup.sh refuses, before it changes anything, every path it
 # would follow or reown wrongly, and every .env line compose would read differently. Each
@@ -679,10 +802,25 @@ refusal_cases() {
   fi
   # A backslash or a newline in DATA_ROOT: awk would decode an escape and record another root
   # (or an extra RETH_UID line) in .env.
-  refuse_case --want 'without whitespace or a backslash' "a backslash in --root" \
+  local root_rule='DATA_ROOT must be an absolute path of printable ASCII without a blank, a quote, a backslash, a #, a \$ or a backtick'
+  refuse_case --want "$root_rule" "a backslash in --root" \
     '[[ -z $(find "$base" -maxdepth 1 -name "bs*") ]] && ! grep -q "^RETH_UID=0" "$refuse_env"' --root "$base/bs\nRETH_UID=0"
-  refuse_case --want 'without whitespace or a backslash' "a newline in --root" \
+  refuse_case --want "$root_rule" "a newline in --root" \
     '[[ -z $(find "$base" -maxdepth 1 -name "nl*") ]]' --root "$base/nl"$'\n'"RETH_UID=0"
+  # The rest of env_check's value rule: setup.sh writes the root into .env as DATA_ROOT, where a
+  # # would cut the line, a quote or $ make compose read another value, and every later run
+  # would refuse the .env. Refused before anything is created or written.
+  cp "$refuse_env" "$base/refuse.env.before"
+  local bad_root
+  for bad_root in "$base/rt#x" "$base/rt'x" "$base/rt\"x" "$base/rt\$x" "$base/rt\`x" "$base/rt"$'\303\251' "$base/rt"$'\tx'; do
+    refuse_case --want "$root_rule" "--root $(printf '%q' "${bad_root#"$base/"}")" \
+      '[[ -z $(find "$base" -maxdepth 1 -name "rt*") ]] && cmp -s "$refuse_env" "$base/refuse.env.before"' --root "$bad_root"
+  done
+  # --env-file with a control character: a command substitution would drop a trailing newline
+  # and check (and rewrite) the .env without it.
+  mkdir -m 0700 "$base/ctl" && cp "$ref/.env.example" "$base/ctl/node.env"
+  refuse_case --want '^ERROR: --env-file: the path holds a control character' "an --env-file path ending in a newline" \
+    '[[ ! -e $base/ctl-root ]] && cmp -s "$base/ctl/node.env" "$ref/.env.example"' --env-file "$base/ctl/node.env"$'\n' --root "$base/ctl-root"
   set_env "$refuse_env" DATA_ROOT "$base/bs\\x"
   refuse_case --want 'DATA_ROOT holds a blank, a quote, a backslash or a #' "a backslash in DATA_ROOT from .env" '[[ -z $(find "$base" -maxdepth 1 -name "bs*") ]]'
   cp "$ref/.env.example" "$refuse_env"
@@ -740,7 +878,7 @@ refusal_cases() {
     key=${line%%=*}
     cp "$ref/.env.example" "$refuse_env" && set_env "$refuse_env" "$key" "${line#*=}"
     refuse_case --want "line [0-9]+: $key holds a \\$ or a backtick" ".env line '$key=…' (a \$ or a backtick)" \
-      '[[ ! -e $base/env-root && $(grep -c "^$key=" "$refuse_env") == 1 ]] && ! printf "%s\n" "$out" | grep -q "set twice"' --root "$base/env-root"
+      '[[ ! -e $base/env-root && $(grep -c "^$key=" "$refuse_env") == 1 ]] && ! grep -q "set twice" <<< "$out"' --root "$base/env-root"
   done
   cp "$ref/.env.example" "$refuse_env"
 }
@@ -754,7 +892,7 @@ refuse_case() {
   shift 2
   # shellcheck disable=SC2086 # $refuse_flags is empty or one flag; $bound is empty or a command
   out=$($bound bash "$setup" $refuse_flags --env-file "$refuse_env" "$@" 2>&1) || rc=$?
-  if ((rc == 2)) && eval "$after" && { [[ -z $want ]] || printf '%s\n' "$out" | grep -Eq -- "$want"; }; then
+  if ((rc == 2)) && eval "$after" && { [[ -z $want ]] || grep -Eq -- "$want" <<< "$out"; }; then
     ok "setup refuses${refuse_flags:+ (test mode)}: $desc"
   else
     bad "setup refuses: $desc (exit $rc, check: $after${want:+, want /$want/})" "$out"
@@ -973,7 +1111,7 @@ check 1 "fsguard: same-secret: two different secrets" python3 -I -B "$guard" sam
 check 1 "fsguard: same-secret: equal copies that are not 64 hex characters" python3 -I -B "$guard" same-secret "$fg/d" "$fg/e"
 check_out 2 "fsguard: same-secret refuses a symlink" "^ERROR: $fg/sym: a symlink" python3 -I -B "$guard" same-secret "$fg/a" "$fg/sym"
 out=$(python3 -I -B "$guard" same-secret "$fg/a" "$fg/f" 2>&1 || true)
-if printf '%s' "$out" | grep -Eq '[0-9a-f]{64}'; then bad "fsguard: same-secret never prints a secret" "$out"; else ok "fsguard: same-secret never prints a secret"; fi
+if grep -Eq '[0-9a-f]{64}' <<< "$out"; then bad "fsguard: same-secret never prints a secret" "$out"; else ok "fsguard: same-secret never prints a secret"; fi
 if [[ -n $bound ]]; then
   mkfifo "$fg/fifo"
   # shellcheck disable=SC2086 # $bound is a command prefix
@@ -1031,6 +1169,7 @@ cat > "$stubs/docker" <<'SH'
 # warn on stderr the way compose does about a $ in .env, which must never reach the log.
 d=$STUB_DIR/docker
 printf '%s\n' "$*" >> "$STUB_DIR/docker.log"
+printf '%s\n' "${DOCKER_CONFIG-(unset)}" >> "$STUB_DIR/docker-config.log"
 svc_of() { case $1 in *reth*) echo reth ;; *) echo lighthouse ;; esac; }
 last=${!#}
 if [[ $1 == compose ]]; then
@@ -1111,7 +1250,7 @@ url_case() {
   local rc=0 out
   pf_base; set_env "$pf_env" "$3" "$4"
   out=$(PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env" 2>&1) || rc=$?
-  if ((rc == $1)) && { [[ -z $5 ]] || printf '%s\n' "$out" | grep -qxF -- "$5"; } && ! printf '%s' "$out" | grep -qF -- "$6"; then
+  if ((rc == $1)) && { [[ -z $5 ]] || grep -qxF -- "$5" <<< "$out"; } && ! grep -qF -- "$6" <<< "$out"; then
     ok "preflight: $2"
   else
     bad "preflight: $2 (exit $rc, want $1${5:+; want the line '$5'})" "$out"
@@ -1193,9 +1332,9 @@ for line in 'export RETH_UID=0' '  RETH_UID=0' 'RETH_UID=1' 'CHECKPOINT_SYNC_URL
     *) printf '%s\n' "$line" >> "$pf_env"; want='line [0-9]+: not KEY=value' ;;
   esac
   rc=0; out=$(env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env" 2>&1) || rc=$?
-  if ((rc == 2)) && printf '%s\n' "$out" | grep -Eq -- "$want" &&
-    { [[ $want == *'set twice' ]] || ! printf '%s\n' "$out" | grep -q 'set twice'; } &&
-    ! printf '%s' "$out" | grep -q SECRETPART; then
+  if ((rc == 2)) && grep -Eq -- "$want" <<< "$out" &&
+    { [[ $want == *'set twice' ]] || ! grep -q 'set twice' <<< "$out"; } &&
+    ! grep -q SECRETPART <<< "$out"; then
     ok "preflight: .env line '${line%%=*}=…' is refused"
   else
     bad "preflight: .env line '$line' is refused (exit $rc)" "$out"
@@ -1206,7 +1345,7 @@ done
 pf_base; set_env "$pf_env" CHECKPOINT_SYNC_URL "https://cp.example.org/base?apikey=KEY123secret"
 pf_case 1 "a checkpoint URL with a query is refused" '^CHECKPOINT_SYNC_URL: https://cp\.example\.org/… has a query or fragment \(the API path is appended to the URL; put a keyed provider behind a local proxy, README\.md\): FAIL$'
 rc=0; out=$(PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env" 2>&1) || rc=$?
-if printf '%s' "$out" | grep -q KEY123secret; then bad "preflight: the query is never printed" "$out"; else ok "preflight: the query is never printed"; fi
+if grep -q KEY123secret <<< "$out"; then bad "preflight: the query is never printed" "$out"; else ok "preflight: the query is never printed"; fi
 pf_base; set_env "$pf_env" CHECKPOINT_SYNC_URL "https://cp.example.org/#frag"
 pf_case 2 "a checkpoint URL with a fragment is refused (a # in an .env value)" 'line [0-9]+: CHECKPOINT_SYNC_URL holds .* a #'
 
@@ -1223,10 +1362,16 @@ check_out 1 "preflight: DATA_ROOT overridden in the environment is refused" '^DA
 check_out 0 "preflight: an environment value equal to .env passes" '^preflight OK \(test mode' \
   env PATH="$tmp/stubs-curl:$PATH" RETH_UID="$me_uid" bash "$preflight" --test-mode --env-file "$pf_env"
 rc=0; out=$(env PATH="$tmp/stubs-curl:$PATH" CHECKPOINT_SYNC_URL="https://other.example/KEY999secret" bash "$preflight" --test-mode --env-file "$pf_env" 2>&1) || rc=$?
-if printf '%s' "$out" | grep -q KEY999secret; then bad "preflight: an overriding value is never printed" "$out"; else ok "preflight: an overriding value is never printed"; fi
+if grep -q KEY999secret <<< "$out"; then bad "preflight: an overriding value is never printed" "$out"; else ok "preflight: an overriding value is never printed"; fi
 
 check 2 "preflight: a missing .env is refused" bash "$preflight" --env-file "$tmp/absent.env"
 check 2 "preflight: an unknown option is refused" bash "$preflight" --frobnicate
+# A command substitution drops a trailing newline: $'<.env>\n' would check <.env>.
+pf_base
+check_out 2 "preflight: an --env-file path ending in a newline is refused" '^ERROR: --env-file: the path holds a control character' \
+  env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env"$'\n'
+check_out 2 "preflight: an --env-file path with a TAB is refused" '^ERROR: --env-file: the path holds a control character' \
+  env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$tmp/a"$'\t'"b.env"
 
 # The JWT copies are opened through fsguard (no symlink, non-blocking, a regular file with one
 # link), never read by cmp, wc or grep, so a link or a FIFO at a copy fails instead of
@@ -1297,15 +1442,14 @@ pf_base; set_env "$pf_env" CHECKPOINT_SYNC_URL https://cp1.example.org; set_env 
 pf_case 0 "Sepolia: a second provider is checked when set" "^anchor: slot 4235200, block root $r1, state root $s1, the same on both providers: PASS$"
 pf_case 0 "Sepolia: the second provider's spec is checked" '^spec: https://cp2\.example\.net/… matches sepolia/config\.yaml: PASS$'
 rc=0; out=$(env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env" 2>&1) || rc=$?
-if printf '%s' "$out" | grep -q KEY777secret; then bad "preflight: the second provider's key is never printed" "$out"; else ok "preflight: the second provider's key is never printed"; fi
+if grep -q KEY777secret <<< "$out"; then bad "preflight: the second provider's key is never printed" "$out"; else ok "preflight: the second provider's key is never printed"; fi
 
 # Hoodi: two providers, run by different operators, each on the pinned Hoodi config, and
 # both holding provider 1's finalized block with the same block and state root.
 hoodi_env="$tmp/hoodi-setup.env" hroot="$tmp/hoodi-root"
-# The Hoodi cases run the copy whose README says both releases schedule the fork; the real
-# README (neither does today) fails preflight, below.
+# The Hoodi cases run from the fresh copy of the stack, with the Hoodi example's dev pins.
 hf_base() {
-  pf_script="$yes_ref/preflight.sh"
+  pf_script="$copy_ref/preflight.sh"
   cp "$hoodi_env" "$pf_env"
   set_env "$pf_env" CHECKPOINT_SYNC_URL https://cp1.example.org/KEY111secret
   set_env "$pf_env" CHECKPOINT_SYNC_URL_2 https://cp2.example.net
@@ -1318,12 +1462,36 @@ pf_case 0 "Hoodi: provider 2's spec is checked against the Hoodi config" '^spec:
 pf_case 0 "Hoodi: the providers are recorded" '^checkpoint provider 2: https://cp2\.example\.net$'
 pf_case 0 "Hoodi: the anchor is compared" "^anchor: slot 4235200, block root $r1, state root $s1, the same on both providers: PASS$"
 pf_case 0 "Hoodi: its own ports are listed" '^ports: Engine API 127\.0\.0\.1:8552, Beacon API 127\.0\.0\.1:5053, p2p reth 30304 tcp/udp, lighthouse 9002 tcp/udp and 9003 udp$'
-pf_case 0 "Hoodi: README rows that schedule the fork pass" \
-  '^release notes: lighthouse v8\.3\.0-rc\.0 schedules hoodi.s Gloas / Amsterdam fork \(README\.md\): PASS$'
-hf_base; pf_script=
-pf_case 1 "Hoodi: today's pinned releases do not schedule Hoodi's fork, so preflight fails" \
+# The reviewed dev pins pass: README.md records the fork-schedule check of exactly these
+# digests. Anything else is refused: a tag alone, the tag at another digest (a re-push), the
+# digest under another tag, and the Sepolia releases, which do not schedule Hoodi's fork.
+pf_case 0 "Hoodi: the reth nightly pin is recorded as scheduling the fork" \
+  '^release notes: reth nightly schedules hoodi.s Gloas / Amsterdam fork \(README\.md\): PASS$'
+pf_case 0 "Hoodi: the Lighthouse latest-unstable pin is recorded as scheduling the fork" \
+  '^release notes: lighthouse latest-unstable schedules hoodi.s Gloas / Amsterdam fork \(README\.md\): PASS$'
+pf_script=
+pf_case 0 "Hoodi: the dev pins pass from the checkout itself too" '^preflight OK \(test mode: not a deployment gate\)$'
+hf_base; set_env "$pf_env" LIGHTHOUSE_IMAGE sigp/lighthouse:latest-unstable
+pf_case 1 "Hoodi: the latest-unstable tag without a digest is refused" '^LIGHTHOUSE_IMAGE: not pinned as repo:tag@sha256:<64 hex>: FAIL$'
+hf_base; set_env "$pf_env" RETH_IMAGE ghcr.io/paradigmxyz/reth:nightly
+pf_case 1 "Hoodi: the nightly tag without a digest is refused" '^RETH_IMAGE: not pinned as repo:tag@sha256:<64 hex>: FAIL$'
+hf_base; set_env "$pf_env" RETH_IMAGE "ghcr.io/paradigmxyz/reth:nightly@sha256:$d64"
+pf_case 1 "Hoodi: the nightly tag at an unrecorded digest is refused" \
+  '^release notes: README\.md has no hoodi row for reth nightly at this digest: FAIL$'
+hf_base; set_env "$pf_env" LIGHTHOUSE_IMAGE "sigp/lighthouse:latest-unstable@sha256:$d64"
+pf_case 1 "Hoodi: the latest-unstable tag at an unrecorded digest is refused" \
+  '^release notes: README\.md has no hoodi row for lighthouse latest-unstable at this digest: FAIL$'
+hf_base; set_env "$pf_env" LIGHTHOUSE_IMAGE "sigp/lighthouse:latest@sha256:${hoodi_lh##*sha256:}"
+pf_case 1 "Hoodi: the reviewed digest under another tag is refused" \
+  '^release notes: README\.md has no hoodi row for lighthouse latest at this digest: FAIL$'
+hf_base; set_env "$pf_env" RETH_IMAGE "$sepolia_reth"; set_env "$pf_env" LIGHTHOUSE_IMAGE "$sepolia_lh"
+pf_case 1 "Hoodi: the Sepolia release pins do not schedule Hoodi's fork, so preflight fails" \
   '^release notes: reth v2\.7\.0 does not schedule hoodi.s Gloas / Amsterdam fork \(README\.md\): replace it before starting: FAIL$'
-pf_case 1 "Hoodi: the Lighthouse row fails too" '^release notes: lighthouse v8\.3\.0-rc\.0 does not schedule hoodi.s'
+pf_case 1 "Hoodi: the Sepolia Lighthouse release fails too" '^release notes: lighthouse v8\.3\.0-rc\.0 does not schedule hoodi.s'
+# And Sepolia never takes the Hoodi dev pins: README.md has no Sepolia row for them.
+pf_base; set_env "$pf_env" LIGHTHOUSE_IMAGE "$hoodi_lh"
+pf_case 1 "Sepolia: the Hoodi Lighthouse dev pin is refused" \
+  '^release notes: README\.md has no sepolia row for lighthouse latest-unstable at this digest: FAIL$'
 hf_base; set_env "$pf_env" CHECKPOINT_SYNC_URL_2 ''
 pf_case 1 "Hoodi: a single provider is refused" '^CHECKPOINT_SYNC_URL_2: empty \(hoodi needs 2 checkpoint providers, run by different operators\): FAIL$'
 hf_base; set_env "$pf_env" CHECKPOINT_SYNC_URL_2 https://cp1.example.org/other
@@ -1345,7 +1513,7 @@ hf_base; rm "$http/cp1.example.org/eth_v1_beacon_headers_finalized"
 pf_case 1 "Hoodi: provider 1 without a finalized header is refused" '^anchor: could not fetch the finalized header from https://cp1\.example\.org/… \(curl exit 22\): FAIL$'
 hf_base
 rc=0; out=$(env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env" 2>&1) || rc=$?
-if printf '%s' "$out" | grep -q KEY111secret; then bad "preflight: Hoodi: provider 1's key is never printed" "$out"; else ok "preflight: Hoodi: provider 1's key is never printed"; fi
+if grep -q KEY111secret <<< "$out"; then bad "preflight: Hoodi: provider 1's key is never printed" "$out"; else ok "preflight: Hoodi: provider 1's key is never printed"; fi
 if ! id -u reth-hoodi >/dev/null 2>&1; then
   hf_base
   pf_real "Hoodi: the users are the network's own (reth-hoodi)" '^user reth-hoodi: does not exist \(run setup.sh\): FAIL$'
@@ -1424,7 +1592,7 @@ printf '#!/bin/sh\ntouch "%s/pwned"\n' "$tmp" > "$tmp/pwn.sh" && chmod +x "$tmp/
 pf_base; evil_root="$tmp/m|x|;e$tmp/pwn.sh;"
 set_env "$pf_env" DATA_ROOT "$evil_root"
 rc=0; out=$(env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env" 2>&1) || rc=$?
-if ((rc == 1)) && [[ ! -e $tmp/pwned ]] && printf '%s\n' "$out" | grep -qxF "$evil_root/reth/jwt.hex: no such file (want 600 $me_uid): FAIL"; then
+if ((rc == 1)) && [[ ! -e $tmp/pwned ]] && grep -qxF "$evil_root/reth/jwt.hex: no such file (want 600 $me_uid): FAIL" <<< "$out"; then
   ok "preflight: a DATA_ROOT with | and ;e is reported literally and runs nothing"
 else
   bad "preflight: a DATA_ROOT with | and ;e (exit $rc, pwned: $([[ -e $tmp/pwned ]] && echo yes || echo no))" "$out"
@@ -1783,7 +1951,7 @@ has "reth: no p2p listener on port 30303 among pids 812: FAIL" "names the missin
 # another project, and the scripts refuse it anyway.
 cl_base; : > "$tmp/docker.log"
 cl_quick "one sample, for the compose calls"
-if grep -q '^compose ' "$tmp/docker.log" && ! grep '^compose ' "$tmp/docker.log" | grep -vq '^compose -p sepolia-ref --env-file '; then
+if grep -q '^compose ' "$tmp/docker.log" && ! grep -vq '^compose -p sepolia-ref --env-file ' <<< "$(grep '^compose ' "$tmp/docker.log")"; then
   ok "run log: every compose call passes -p sepolia-ref"
 else
   bad "run log: every compose call passes -p sepolia-ref" "$(cat "$tmp/docker.log")"
@@ -1799,7 +1967,7 @@ for assignment in COMPOSE_FILE=/tmp/evil.yaml COMPOSE_PROFILES=debug DOCKER_HOST
   DOCKER_DEFAULT_PLATFORM=linux/amd64; do
   : > "$tmp/docker.log"
   rc=0; out=$(env PATH="$stubs:$PATH" "$assignment" bash "$collect" --env-file "$cl_env" --samples 1 --interval 0 2>&1) || rc=$?
-  if ((rc == 2)) && printf '%s\n' "$out" | grep -q "^ERROR: ${assignment%%=*} is set in the environment; unset it" && [[ ! -s $tmp/docker.log ]]; then
+  if ((rc == 2)) && grep -q "^ERROR: ${assignment%%=*} is set in the environment; unset it" <<< "$out" && [[ ! -s $tmp/docker.log ]]; then
     ok "run log: '$assignment' in the environment is refused before any docker call"
   else
     bad "run log: '$assignment' in the environment is refused (exit $rc)" "$out"
@@ -1815,7 +1983,7 @@ for spec in "link.env|link\.env: a symlink or unreadable" "hard.env|hard\.env: h
   : > "$tmp/docker.log"
   # shellcheck disable=SC2086 # $bound is empty or a command prefix
   rc=0; out=$($bound env PATH="$stubs:$PATH" bash "$collect" --env-file "$cle/${spec%%|*}" --samples 1 --interval 0 2>&1) || rc=$?
-  if ((rc == 2)) && printf '%s\n' "$out" | grep -Eq "${spec#*|}" && [[ ! -s $tmp/docker.log ]]; then
+  if ((rc == 2)) && grep -Eq "${spec#*|}" <<< "$out" && [[ ! -s $tmp/docker.log ]]; then
     ok "run log: an .env ${spec#*|} is refused before any docker call"
   else
     bad "run log: an .env ${spec#*|} is refused (exit $rc)" "$out"
@@ -1823,13 +1991,25 @@ for spec in "link.env|link\.env: a symlink or unreadable" "hard.env|hard\.env: h
 done
 cl_base; : > "$tmp/docker.log"
 cl_quick "one sample, for compose's --env-file"
-if grep '^compose ' "$tmp/docker.log" | grep -q -- "--env-file $cl_env "; then
+if grep -q -- "--env-file $cl_env " <<< "$(grep '^compose ' "$tmp/docker.log")"; then
   bad "run log: compose reads the private .env copy, never the .env by path" "$(cat "$tmp/docker.log")"
 else
   ok "run log: compose reads the private .env copy, never the .env by path"
 fi
 cl_base
 no_tmpdir 1 "run log: the caller's TMPDIR is not used" "$stubs:" bash "$collect" --env-file "$cl_env" --samples 1 --interval 0
+# sudo -E keeps the operator's HOME: every docker call gets DOCKER_CONFIG, the .docker of the
+# euid's passwd home, so docker never reads its config or CLI plugins from HOME.
+cl_base; : > "$tmp/docker-config.log"
+rc=0; HOME="$tmp/evilhome" PATH="$stubs:$PATH" bash "$collect" --env-file "$cl_env" --samples 1 --interval 0 > /dev/null 2>&1 || rc=$?
+if [[ -s $tmp/docker-config.log && $(sort -u "$tmp/docker-config.log") == "${pw_home%/}/.docker" ]]; then
+  ok "run log: every docker call reads DOCKER_CONFIG=<passwd home>/.docker, whatever HOME is"
+else
+  bad "run log: every docker call reads DOCKER_CONFIG=<passwd home>/.docker (exit $rc)" "$(sort -u "$tmp/docker-config.log")"
+fi
+# A command substitution drops a trailing newline: $'<.env>\n' would check <.env>.
+check_out 2 "run log: an --env-file path ending in a newline is refused" '^ERROR: --env-file: the path holds a control character' \
+  env PATH="$stubs:$PATH" bash "$collect" --env-file "$cl_env"$'\n' --samples 1 --interval 0
 
 # Values that reach a sed or awk program are data, never program text: a container id with &
 # (sed's "the match") is printed as it is.
@@ -1906,7 +2086,7 @@ has 'trusted_by_reference = false' "TRUSTED_PEERS empty: the session config is n
 for line in 'NETWORK=mainnet' 'BEACON_API_PORT=5o52' 'LIGHTHOUSE_QUIC_PORT=9000'; do
   cl_base; set_env "$cl_env" "${line%%=*}" "${line#*=}"
   rc=0; out=$(PATH="$stubs:$PATH" bash "$collect" --env-file "$cl_env" --samples 1 --interval 0 2>&1 >/dev/null) || rc=$?
-  if ((rc == 2)) && printf '%s\n' "$out" | grep -q "^ERROR: "; then ok "run log: '$line' is refused"; else bad "run log: '$line' is refused (exit $rc)" "$out"; fi
+  if ((rc == 2)) && grep -q "^ERROR: " <<< "$out"; then ok "run log: '$line' is refused"; else bad "run log: '$line' is refused (exit $rc)" "$out"; fi
 done
 
 # Hoodi: the same stack under its own .env, root, ports and pinned config. The genesis time and
@@ -1930,22 +2110,24 @@ cl_hoodi() {
   local saved=$root
   root=$hroot
   rm -f "$tmp/docker"/*
-  cl_container reth "ghcr.io/paradigmxyz/reth@sha256:$reth_digest" sha256:1111 ctr-reth "$me_uid" "$me_gid" 812
-  cl_container lighthouse "sigp/lighthouse@sha256:$lh_digest" sha256:2222 ctr-lh "$me_uid" "$me_gid" 901
+  cl_container reth "ghcr.io/paradigmxyz/reth@sha256:${hoodi_reth##*@sha256:}" sha256:1111 ctr-reth "$me_uid" "$me_gid" 812
+  cl_container lighthouse "sigp/lighthouse@sha256:${hoodi_lh##*@sha256:}" sha256:2222 ctr-lh "$me_uid" "$me_gid" 901
   root=$saved
 }
 cl_hoodi; : > "$tmp/curl.log"; : > "$tmp/docker.log"
-collect_script="$yes_ref/collect-run-log.sh"
-cl_run 0 "Hoodi: a synced, hardened node on fork-ready releases passes" --config "$pinned_hoodi"
+collect_script="$copy_ref/collect-run-log.sh"
+cl_run 0 "Hoodi: a synced, hardened node on the reviewed dev pins passes" --config "$pinned_hoodi"
 collect_script=
 for c in 1 2 3 4 5 6 7 8 9; do verdict "$c" PASS "Hoodi: criterion $c passes on a healthy node"; done
 has "# Hoodi reference node run log" "Hoodi: the title names the network"
-if grep -q '^compose -p hoodi-ref --env-file ' "$tmp/docker.log" && ! grep '^compose ' "$tmp/docker.log" | grep -vq '^compose -p hoodi-ref '; then
+if grep -q '^compose -p hoodi-ref --env-file ' "$tmp/docker.log" && ! grep -vq '^compose -p hoodi-ref ' <<< "$(grep '^compose ' "$tmp/docker.log")"; then
   ok "run log: Hoodi: every compose call passes -p hoodi-ref"
 else
   bad "run log: Hoodi: every compose call passes -p hoodi-ref" "$(cat "$tmp/docker.log")"
 fi
-has "lighthouse v8.3.0-rc.0 targets consensus-specs v1.7.0-beta.4 (README.md), the same as ours" "Hoodi: a release on our consensus-specs version is recorded as the same"
+has "lighthouse latest-unstable targets consensus-specs v1.7.0-beta.4 (README.md), the same as ours" "Hoodi: a Lighthouse on our consensus-specs version is recorded as the same"
+has "release notes: reth nightly schedules hoodi's Gloas / Amsterdam fork (README.md): PASS" "Hoodi: the reth dev pin is recorded as scheduling the fork"
+has "ghcr.io/paradigmxyz/reth@sha256:${hoodi_reth##*@sha256:}" "Hoodi: records reth's repo digest"
 has "- Network: hoodi; checkpoint providers: https://cp1.example.org/…, https://cp2.example.net" "Hoodi: records both providers"
 has "head_slot 4235264, wall-clock slot 4235264 (lag 0)" "Hoodi: the wall-clock slot comes from the node's genesis time"
 has "port 8552: 127.0.0.1 only: PASS" "Hoodi: the Engine API is checked on its own port"
@@ -1962,8 +2144,13 @@ else
   bad "run log: Hoodi: every Beacon API request goes to the configured port" "$(cat "$tmp/curl.log")"
 fi
 if grep -q KEY111secret "$log"; then bad "run log: Hoodi: provider 1's key is never printed"; else ok "run log: Hoodi: provider 1's key is never printed"; fi
-# The real README: neither pinned release schedules Hoodi's fork, so the versions criterion fails.
+# The Sepolia releases on Hoodi: neither schedules Hoodi's fork, so the versions criterion fails.
 cl_hoodi
+set_env "$cl_env" RETH_IMAGE "$sepolia_reth"; set_env "$cl_env" LIGHTHOUSE_IMAGE "$sepolia_lh"
+root_saved=$root root=$hroot
+cl_container reth "ghcr.io/paradigmxyz/reth@sha256:$reth_digest" sha256:1111 ctr-reth "$me_uid" "$me_gid" 812
+cl_container lighthouse "sigp/lighthouse@sha256:$lh_digest" sha256:2222 ctr-lh "$me_uid" "$me_gid" 901
+root=$root_saved
 cl_run 1 "Hoodi: releases whose notes do not schedule Hoodi's fork fail"
 verdict 1 FAIL "Hoodi: a release that does not schedule the fork fails criterion 1"
 verdict 5 PASS "Hoodi: the default pinned config is the network's own"
@@ -2129,7 +2316,7 @@ PY
   # A port value reaches Lighthouse's bash wrapper only as one quoted word, never as code.
   set_env "$tmp/compose-hoodi.env" BEACON_API_PORT '5053;touch /tmp/pwned'
   argv=$(lh_argv "$tmp/compose-hoodi.env")
-  if printf '%s\n' "$argv" | grep -qx -- '5053;touch /tmp/pwned' && [[ ! -e /tmp/pwned ]]; then
+  if grep -qx -- '5053;touch /tmp/pwned' <<< "$argv" && [[ ! -e /tmp/pwned ]]; then
     ok "compose: a port value is passed to Lighthouse as one word, not run"
   else
     bad "compose: a port value is passed to Lighthouse as one word" "$argv"
@@ -2316,10 +2503,12 @@ SH
   header_json "$http/cp1.example.org/eth_v1_beacon_headers_finalized" 4235200 "$r1" "$s1"
   header_json "$http/cp2.example.net/eth_v1_beacon_headers_4235200" 4235200 "$r1" "$s1"
   set_env "$hreal_env" CHECKPOINT_SYNC_URL https://cp1.example.org; set_env "$hreal_env" CHECKPOINT_SYNC_URL_2 https://cp2.example.net
-  check_out 0 "root: Hoodi preflight passes with its real users and two providers (fork-ready README)" '^preflight OK$' \
-    env PATH="$tmp/stubs-curl:$PATH" bash "$yes_ref/preflight.sh" --env-file "$hreal_env"
-  check_out 1 "root: Hoodi preflight fails on today's pinned releases" '^release notes: reth v2\.7\.0 does not schedule hoodi.s' \
-    env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --env-file "$hreal_env"
+  check_out 0 "root: Hoodi preflight passes with its real users, two providers and the dev pins" '^preflight OK$' \
+    env PATH="$tmp/stubs-curl:$PATH" bash "$copy_ref/preflight.sh" --env-file "$hreal_env"
+  cp "$hreal_env" "$tmp/hoodi-releases.env"
+  set_env "$tmp/hoodi-releases.env" RETH_IMAGE "$sepolia_reth"; set_env "$tmp/hoodi-releases.env" LIGHTHOUSE_IMAGE "$sepolia_lh"
+  check_out 1 "root: Hoodi preflight fails on the Sepolia release pins" '^release notes: reth v2\.7\.0 does not schedule hoodi.s' \
+    env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --env-file "$tmp/hoodi-releases.env"
   cp "$hreal_env" "$tmp/hoodi-cross.env"; set_env "$tmp/hoodi-cross.env" RETH_UID "$ru"
   check_out 1 "root: Hoodi preflight refuses the Sepolia reth uid" "^RETH_UID: $ru is not user reth-hoodi's uid $hru: FAIL$" \
     env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --env-file "$tmp/hoodi-cross.env"
@@ -2331,6 +2520,19 @@ SH
     rm "$hreal/lighthouse/jwt.hex" && mv "$tmp/hoodi-jwt.keep" "$hreal/lighthouse/jwt.hex"
   fi
 
+  # sudo -E as the operator envop: root keeps envop's HOME, whose .docker holds a planted
+  # docker-compose plugin. Every docker call the run log makes reads root's own .docker.
+  mkdir -p /home/envop/.docker/cli-plugins && cp "$tmp/evilhome/.docker/cli-plugins/docker-compose" /home/envop/.docker/cli-plugins/
+  chown -R envop /home/envop/.docker
+  cp "$pf_env" "$tmp/sudo-e.env"; set_env "$tmp/sudo-e.env" RETH_UID "$ru"
+  : > "$tmp/docker-config.log"
+  (HOME=/home/envop SUDO_UID="$op" PATH="$stubs:$PATH" bash "$collect" --env-file "$tmp/sudo-e.env" --samples 1 --interval 0 >/dev/null 2>&1) || true
+  root_home=$(python3 -I -B -c 'import pwd; print(pwd.getpwuid(0).pw_dir)')
+  if [[ -s $tmp/docker-config.log && $(sort -u "$tmp/docker-config.log") == "${root_home%/}/.docker" ]]; then
+    ok "root: under sudo -E (the operator's HOME) every docker call reads root's own .docker"
+  else
+    bad "root: under sudo -E every docker call reads root's own .docker" "$(sort -u "$tmp/docker-config.log")"
+  fi
   # Regression (run-log temp-file swap): run from a directory another user owns, who swaps any
   # run-log temp file for a symlink to a root-only file. The script writes no file at all.
   out_dir="$tmp/race3-out" victim="$tmp/race3-victim"
@@ -2355,7 +2557,7 @@ fi
 
 # Python bytecode never lands in the stack: the scripts run python3 -B, and __pycache__/ is
 # ignored should anything else write it.
-if [[ -z $(find "$yes_ref" -name __pycache__) ]]; then ok "no __pycache__ written by the scripts"; else bad "no __pycache__ written by the scripts" "$(find "$yes_ref" -name __pycache__)"; fi
+if [[ -z $(find "$copy_ref" -name __pycache__) ]]; then ok "no __pycache__ written by the scripts"; else bad "no __pycache__ written by the scripts" "$(find "$copy_ref" -name __pycache__)"; fi
 if command -v git >/dev/null 2>&1 && git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   check 0 "ops/ref-node ignores __pycache__/" git -C "$repo" check-ignore -q ops/ref-node/lib/__pycache__/fsguard.cpython-312.pyc
 else
