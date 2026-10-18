@@ -153,7 +153,8 @@ TXT
 
 # run <expect-exit> <description> <pattern...> -- <args...>: runs the script (fast polls) and
 # wants the exit code and a line matching each extended regex; a pattern `!<regex>` wants no
-# line matching <regex>.
+# line matching <regex>. (Here-strings, not `printf | grep -q`: under pipefail, grep -q exiting
+# early fails the printf.)
 run() {
   local expect=$1 desc=$2 rc=0 out p missing= unwanted=
   shift 2
@@ -163,9 +164,9 @@ run() {
   out=$(PATH="$stubs:$PATH" bash "$script" --interval 0 --attempts 3 "$@" 2>&1) || rc=$?
   for p in ${patterns[@]+"${patterns[@]}"}; do
     if [[ $p == !* ]]; then
-      ! printf '%s\n' "$out" | grep -Eq -- "${p#!}" || unwanted="$unwanted /${p#!}/"
+      ! grep -Eq -- "${p#!}" <<<"$out" || unwanted="$unwanted /${p#!}/"
     else
-      printf '%s\n' "$out" | grep -Eq -- "$p" || missing="$missing /$p/"
+      grep -Eq -- "$p" <<<"$out" || missing="$missing /$p/"
     fi
   done
   if ((rc == expect)) && [[ -z $missing && -z $unwanted ]]; then
@@ -402,6 +403,23 @@ edit cl-2-lodestar-geth eth_v1_config_fork_schedule 's/"current_version": "0x700
 run 1 "the first run's schedules with a scheduled fork moved on one CL still differ" \
   '^- fork schedules differ: cl-1-lighthouse-geth and cl-2-lodestar-geth$' '^fork_schedule: FAIL' -- ethswarm-gloas
 
+# Only FAR_FUTURE_EPOCH entries are dropped: a fork one CL schedules at a real epoch while the
+# other leaves it unscheduled is a schedule difference.
+base
+real_forks
+edit cl-2-lodestar-geth eth_v1_config_fork_schedule 's/"current_version": "0x90000038", "epoch": "18446744073709551615"/"current_version": "0x90000038", "epoch": "10"/'
+run 1 "Heze scheduled at epoch 10 on Lodestar and not listed by Lighthouse fails" \
+  '^cl-2-lodestar-geth: fork_schedule 9 scheduled entries$' '^cl-1-lighthouse-geth: fork_schedule 8 scheduled entries$' \
+  '^- fork schedules differ: cl-1-lighthouse-geth and cl-2-lodestar-geth$' '^fork_schedule: FAIL' -- ethswarm-gloas
+
+base
+real_forks
+edit cl-2-lodestar-geth eth_v1_config_fork_schedule 's/"current_version": "0x90000038", "epoch": "18446744073709551615"/"current_version": "0x90000038", "epoch": "10"/'
+edit cl-1-lighthouse-geth eth_v1_config_fork_schedule 's/"epoch": "0"}]}/"epoch": "0"}, {"previous_version": "0x80000038", "current_version": "0x90000038", "epoch": "18446744073709551615"}]}/'
+run 1 "Heze at epoch 10 on Lodestar and at FAR_FUTURE_EPOCH on Lighthouse fails" \
+  '^cl-1-lighthouse-geth: fork_schedule 8 scheduled entries \(1 at FAR_FUTURE_EPOCH ignored\)$' \
+  '^- fork schedules differ: cl-1-lighthouse-geth and cl-2-lodestar-geth$' '^fork_schedule: FAIL' -- ethswarm-gloas
+
 base
 real_forks
 edit cl-1-lighthouse-geth eth_v1_config_fork_schedule 's/"current_version": "0x80000038", "epoch": "0"/"current_version": "0x80000038", "epoch": "18446744073709551615"/'
@@ -559,7 +577,7 @@ helper_pair() {
   local expect=$1 desc=$2 pattern=$3 rc=0 out
   shift 4
   out=$(python3 -I "$here/../lib/devnet.py" pair "$@" 2>&1) || rc=$?
-  if ((rc == expect)) && printf '%s\n' "$out" | grep -Eq -- "$pattern"; then ok "$desc"; else bad "$desc (exit $rc, want $expect)" "$out"; fi
+  if ((rc == expect)) && grep -Eq -- "$pattern" <<<"$out"; then ok "$desc"; else bad "$desc (exit $rc, want $expect)" "$out"; fi
 }
 helper_pair 1 "a pair record that is not JSON fails" '^- A: genesis record .* is not JSON' -- A "$tmp/garbage.json" B "$tmp/run-a.json"
 helper_pair 1 "a pair record without every field fails" '^- A: genesis record .* has no genesis_block_root, genesis_fork_version, genesis_state_root, genesis_validators_root$' \
@@ -603,7 +621,7 @@ run 2 "a non-integer --attempts is a usage error" 'attempts' -- --attempts 0 eth
 run 2 "a service name that is not a CL name is refused" 'not a cl-<n>-\* service name' -- --services 'cl-1;id' ethswarm-gloas
 
 rc=0; out=$(PATH="/usr/bin:/bin" bash "$script" ethswarm-gloas 2>&1) || rc=$?
-if ((rc == 2)) && printf '%s\n' "$out" | grep -q '^ERROR: kurtosis not found'; then ok "a missing kurtosis CLI is a setup error"; else bad "a missing kurtosis CLI is a setup error (exit $rc)" "$out"; fi
+if ((rc == 2)) && grep -q '^ERROR: kurtosis not found' <<<"$out"; then ok "a missing kurtosis CLI is a setup error"; else bad "a missing kurtosis CLI is a setup error (exit $rc)" "$out"; fi
 
 echo "# $passed passed, $failed failed"
 ((failed == 0))

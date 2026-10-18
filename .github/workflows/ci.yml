@@ -39,6 +39,8 @@ jobs:
         run: bash scripts/check-kurtosis-pins.sh
       - name: Kurtosis devnet checker (offline, stub kurtosis and curl)
         run: bash testing/kurtosis/tests/check-devnet.test.sh
+      - name: Kurtosis devnet pair runner (offline, stub kurtosis, docker and clock)
+        run: bash testing/kurtosis/tests/run-pair.test.sh
       - name: Probe systemd units (own user, nodekey credential, anchor check, hardening)
         run: bash ops/probe/tests/probe-units.test.sh
 

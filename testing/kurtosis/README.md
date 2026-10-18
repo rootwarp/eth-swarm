@@ -17,11 +17,13 @@ Geth).
 | Load | spamoor `blobs` (2 tx per slot, 2 blobs each), so blocks carry data columns, plus `eoatx` |
 | Explorer | dora |
 
-Status: the config, its image pin lint, the runtime checker and the block export are in the
-repo. The first two runs (2026-10-18, Kurtosis CLI and engine 1.22.1, Docker Desktop for macOS)
-were sequential: the first reached finalized epoch 3 on both CLs, and the second, started after
-genesis, reproduced the genesis root but never finalized (see "Reproducible genesis"). The
-runtime criteria stay open until a concurrent pair passes `check-devnet.sh --pair`.
+Status: the config, its image pin lint, the runtime checker, the pair runner and the block
+export are in the repo. The first two runs (2026-10-18, Kurtosis CLI and engine 1.22.1, Docker
+Desktop for macOS) were sequential: the first reached finalized epoch 3 on both CLs, and the
+second, started after genesis, reproduced the genesis root but never finalized (see
+"Reproducible genesis"). A concurrent pair on 2026-10-19 (same Kurtosis and Docker Desktop)
+passed `check-devnet.sh --pair` (`pair verdict: PASS`, one genesis): the check ran from T+31 s to
+T+252 s, and finality passed on poll 19 of 80 on the first enclave.
 
 ## Pins
 
@@ -179,38 +181,32 @@ value in the committed file would soon lie far in the past. Instead, the two run
 one rendered copy with one `genesis_time` T.
 
 **The two runs are a concurrent pair**: two enclaves, `ethswarm-gloas-a` and `ethswarm-gloas-b`,
-started from the same `$args` at the same time, both fully up before T. A second run started
-*after* genesis does not finalize, so there is no sequential path. In the first sequential runs,
-the second enclave started about 70 slots after genesis: Lodestar (`b3beff2`) could not
-range-sync the missed slots from Lighthouse (`DOWNLOAD_BY_RANGE_ERROR_MISSING_BLOCK_RESPONSE`;
-its only peer went to `failed_download_peers` and was never retried), and without Lodestar's 64
-validators Lighthouse could not justify an epoch. Any gap after genesis can hit this, so T must
-leave time for both `kurtosis run`s: one took 540 s on a cold engine with the images already
-pulled.
+started from the same rendered copy at the same time, both fully up before T. A second run started
+*after* genesis does not finalize, so there is no path that launches a run after T. In the first
+sequential runs, the second enclave started about 70 slots after genesis: Lodestar (`b3beff2`)
+could not range-sync the missed slots from Lighthouse
+(`DOWNLOAD_BY_RANGE_ERROR_MISSING_BLOCK_RESPONSE`; its only peer went to `failed_download_peers`
+and was never retried), and without Lodestar's 64 validators Lighthouse could not justify an
+epoch. Any gap after genesis can hit this, so T must leave time for both `kurtosis run`s. On
+2026-10-19 the two concurrent runs on one engine, with the images pre-pulled, took 61 s and 64 s;
+pulling the images cold adds a few minutes (203 s on the first run).
 
-Render the shared copy with T at least 900 s ahead, after pre-pulling the pinned images (203 s on
-the first run), so the clock starts only when both runs can begin:
-
-```bash
-for image in $(grep -oE '[A-Za-z0-9./_-]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' \
-                 testing/kurtosis/gloas-genesis.yaml | sort -u); do
-  docker pull -q "$image"
-done
-
-T=$(( $(date +%s) + 900 ))                  # genesis 15 minutes from now, shared by both enclaves
-args="$PWD/target/kurtosis/gloas-genesis-$T.yaml"; mkdir -p "${args%/*}"
-sed "s/^  genesis_time: 0$/  genesis_time: $T/" testing/kurtosis/gloas-genesis.yaml > "$args"
-test "$(grep -c "^  genesis_time: $T$" "$args")" = 1 && echo "rendered $args"
-bash scripts/check-kurtosis-pins.sh "${args%/*}"   # the rendered copy is pinned too
-```
+`run-pair.sh` (below, "Acceptance checks") pre-pulls every pinned image first, so the clock starts
+only once both runs can begin, then renders the shared copy with T at least 900 s ahead
+(`--lead S`, default and minimum 900; the 2026-10-19 pair used 1500 and was up 1,436 s before
+genesis). It writes `target/kurtosis/pair-$T/gloas-genesis.yaml`, fails unless exactly one
+`genesis_time` line holds T, and fails unless `scripts/check-kurtosis-pins.sh` passes on the
+copy's directory (the rendered copy is pinned too). If you launch by hand without pre-pulling,
+or want room for `--sequential-fallback`, leave more margin than 900 s.
 
 Both enclaves then run side by side on one engine:
 
-- **Memory.** One enclave peaked at about 2.7 GiB (the Lodestar CL is 1.5 GiB of it) and 116%
-  CPU, so a pair needs about 5.5 GiB: it fits the 7.7 GiB Docker Desktop VM of the first runs
-  with about 2 GiB to spare for the engine's own containers. Check the VM's size with
-  `docker info --format '{{.MemTotal}}'`, stop other containers first, and tear both enclaves
-  down when done (the last block of "Acceptance checks").
+- **Memory.** On 2026-10-19 the pair peaked at 4.75 GiB and 738% CPU around genesis, then held
+  about 4.56 GiB and 197% CPU (one enclave alone peaked at about 2.7 GiB on the first run, the
+  Lodestar CL 1.5 GiB of it). That fits the 7.7 GiB Docker Desktop VM of the first runs with
+  about 3 GiB to spare for the engine's own containers. Check the VM's size with
+  `docker info --format '{{.MemTotal}}'` and stop other containers first; `run-pair.sh` removes
+  both enclaves on every exit.
 - **Host ports.** The two enclaves do not collide. At the pinned commit every fixed host port
   comes from `port_publisher` (`public_port_start` 32000-38000 per component), and each of its
   sections is off by default; `gloas-genesis.yaml` does not set it. Without it, Kurtosis
@@ -259,36 +255,55 @@ one genesis, and `--reference` checks both enclaves against an earlier record. T
   checkpoint (epoch and root). This is polled `--attempts` times (default 40), `--interval`
   seconds apart (default 12).
 
-The concurrent pair from a clean engine (criteria 1, 2 and 4 of the issue), with `$args` and T
-from "Reproducible genesis". Record the wall time and `docker stats --no-stream` for CI sizing:
+The concurrent pair from a clean engine (criteria 1, 2 and 4 of the issue) is one script,
+`testing/kurtosis/run-pair.sh`, run from anywhere in the checkout. It needs `kurtosis` (with a
+running engine), `docker` and what `check-devnet.sh` and `check-kurtosis-pins.sh` need.
+
+**The engine must be dedicated to this run.** The script starts with `kurtosis clean -a`, which
+removes **every** enclave on the engine, so it first lists them (`kurtosis enclave ls`) and
+refuses to start (exit 2, naming them) if there is any. Remove them yourself, or pass
+`--clean-engine` to let `kurtosis clean -a` remove them. Each step fails closed:
+
+1. **Pre-pull and render** ("Reproducible genesis"): any failed pull, render check or pin lint,
+   or a logs directory that cannot be written, stops the run before anything is launched
+   (exit 2).
+2. **Launches.** `kurtosis clean -a`, then both `kurtosis run`s at once, each logged to
+   `target/kurtosis/pair-$T/<enclave>-run.log`. Both must exit 0 (else exit 2, naming the failed
+   ones), and both must be up before T (else exit 4: render a later T and start again). A
+   launch still running at T is stopped (exit 4).
+3. **Fallback** (`--sequential-fallback`, off by default): if a concurrent launch fails, each
+   failed enclave is removed, confirmed gone, and launched again alone, one after the other
+   (the failed log is kept as `<enclave>-run-concurrent.log`). A relaunch starts only with at
+   least 120 s left before T, checked before the removal and again just before the launch, and
+   both enclaves must still be up before T.
+4. **Check.** After T, `check-devnet.sh --pair --record target/kurtosis/pair-$T/genesis.json
+   ethswarm-gloas-a ethswarm-gloas-b`, shown and kept in `check.log`. The check's own exit code
+   (0 pair PASS, 1 FAIL, 2 setup error, 3 DIAGNOSTIC) is the script's exit code; a `check.log`
+   that cannot be written turns only a PASS into a 2. On 2026-10-19 (with `--attempts 80`) the
+   check ran from T+31 s to T+252 s and finality passed on poll 19, inside the default 40 polls,
+   12 s apart.
+5. **Teardown.** An EXIT/INT/TERM/HUP/PIPE trap, set before the launches, removes the pair on
+   every exit, an interrupt while waiting for genesis or finality and a closed terminal or
+   output pipe included (exit 130 on INT, 143 on TERM, 129 on HUP, 141 on PIPE). It stops the
+   background jobs and their descendants (TERM, then KILL 10 s later), then runs
+   `kurtosis enclave rm -f` for each enclave, each bounded to 120 s and each run even if an
+   earlier step failed. It removes nothing else: no `kurtosis clean -a` at the end. A failed
+   teardown after a PASS exits 2. `--keep-on-pass` leaves the pair running after a PASS only
+   (exit 0), for "Export blocks and roots", and prints the teardown commands; any other exit
+   still tears down.
+
+`docker stats --no-stream` (bounded to 30 s, never fatal) is kept for CI sizing as
+`stats-up.txt` (both enclaves up) and `stats-checked.txt` (after the check), and the script
+prints how long the launches took:
 
 ```bash
-pkg=github.com/ethpandaops/ethereum-package@3416a0252e5bc25a0d31d24fea9c46707447eb08
-logs=target/kurtosis/pair-$T; mkdir -p "$logs"
+bash testing/kurtosis/run-pair.sh                       # exit 0: pair PASS, then teardown
+bash testing/kurtosis/run-pair.sh --lead 1500 --sequential-fallback --keep-on-pass
+bash testing/kurtosis/run-pair.sh --clean-engine        # removes every enclave on the engine first
 
-kurtosis clean -a
-# Both enclaves at once, from the one $args (one genesis_time T).
-pids=()
-for e in ethswarm-gloas-a ethswarm-gloas-b; do
-  ( time kurtosis run --enclave "$e" "$pkg" --args-file "$args" ) > "$logs/$e-run.log" 2>&1 &
-  pids+=($!)
-done
-for pid in "${pids[@]}"; do wait "$pid" || echo "a kurtosis run failed: see $logs/*-run.log"; done
-# Both must be up before genesis; otherwise tear down, render a later T and start again.
-test "$(date +%s)" -lt "$T" && echo "both enclaves up $(( T - $(date +%s) )) s before genesis"
-docker stats --no-stream
-
-# After genesis: every criterion on both enclaves, then one genesis across them (exit 0: PASS).
-until [ "$(date +%s)" -ge "$T" ]; do sleep 10; done
-( set -o pipefail
-  bash testing/kurtosis/check-devnet.sh --pair --record "$logs/genesis.json" \
-    ethswarm-gloas-a ethswarm-gloas-b 2>&1 | tee "$logs/check.log" ); echo "check-devnet exit $?"
-docker stats --no-stream
-
-# Teardown: both enclaves, then the stopped ones (a clean engine).
+# Teardown by hand (after --keep-on-pass, or if the script was killed with SIGKILL):
 kurtosis enclave rm -f ethswarm-gloas-a
 kurtosis enclave rm -f ethswarm-gloas-b
-kurtosis clean -a
 ```
 
 The same checks by hand, one CL at a time:
@@ -309,6 +324,7 @@ The image pin lint (criterion 3) runs in CI and needs no devnet:
 ```bash
 bash scripts/check-kurtosis-pins.sh                       # testing/kurtosis/*.yaml
 bash testing/kurtosis/tests/check-devnet.test.sh          # check-devnet.sh against stub kurtosis/curl
+bash testing/kurtosis/tests/run-pair.test.sh              # run-pair.sh against stub kurtosis/docker
 ```
 
 ## Export blocks and roots
@@ -403,14 +419,16 @@ The checks, with the two exports above:
 # Both CLs' exports have identical root lists (exit 1 and the first differing slot otherwise).
 "$bin" diff "$export_root/lighthouse/$enclave" "$export_root/lodestar/$enclave"
 
-# Count check: the API's block count over 0..=$to equals the export's "N blocks" (printed by
-# the pinned verify above).
-n=0
-for s in $(seq 0 "$to"); do
-  code=$(curl -s -o /dev/null -w '%{http_code}' "$lh/eth/v1/beacon/headers/$s")
-  [ "$code" = 200 ] && n=$((n + 1))
+# Count check, on both CLs: each one's API block count over 0..=$to equals its export's
+# "N blocks" (printed by the pinned verify above).
+for c in lighthouse:$lh lodestar:$ls; do
+  n=0
+  for s in $(seq 0 "$to"); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "${c#*:}/eth/v1/beacon/headers/$s")
+    [ "$code" = 200 ] && n=$((n + 1))
+  done
+  echo "${c%%:*} API blocks 0..$to: $n"
 done
-echo "API blocks 0..$to: $n"
 
 # The exported genesis state is the generator's genesis.ssz, byte for byte.
 cmp "$genesis/genesis.ssz" "$export_root/lighthouse/$enclave/genesis_state.ssz" && echo "genesis state ok"
