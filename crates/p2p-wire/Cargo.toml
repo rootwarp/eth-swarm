@@ -13,6 +13,8 @@ testkit = []
 
 [dependencies]
 consensus-types = { path = "../consensus-types" }
+# Fork versions, epochs and the BPO-aware digest schedule the ENR fork fields are built from.
+network-config = { path = "../network-config" }
 ethereum_ssz.workspace = true
 ethereum_ssz_derive.workspace = true
 ssz_types.workspace = true
@@ -21,4 +23,6 @@ snap = "1"
 thiserror = "2"
 
 [dev-dependencies]
+# The digest a test config is checked against (ChainConfig::from_yaml).
+sha2 = "0.10"
 p2p-wire = { path = ".", features = ["testkit"] }

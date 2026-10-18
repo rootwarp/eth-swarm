@@ -46,7 +46,8 @@ prost = "0.14.4"
 prost-types = "0.14.4"
 # libp2p stack. Every libp2p* crate resolves from one rust-libp2p commit via [patch.crates-io] below.
 # libp2p 0.57 has no `connection-limits` feature: `libp2p::connection_limits` is always built.
-# discv5/enr have no user yet (cl-discv5 will be the first).
+# discv5/enr: cl-discv5 only, never cl-p2p (m2a-session has no discovery; scripts/check-m2a-deps.sh).
+# No discv5 `libp2p` feature: it would pull crates.io libp2p-identity next to the pinned commit.
 libp2p = { version = "0.57.1", default-features = false, features = ["tokio", "tcp", "noise", "yamux", "macros", "gossipsub", "request-response", "identify", "metrics"] }
 libp2p-mplex = "0.44.0"
 discv5 = "0.12.0"

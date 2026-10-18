@@ -3537,6 +3537,7 @@ dependencies = [
  "consensus-types",
  "ethereum_ssz",
  "ethereum_ssz_derive",
+ "network-config",
  "snap",
  "ssz_types",
  "thiserror 2.0.21",

@@ -5,12 +5,30 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "cl-discv5: the ethswarm.discv5.v1 service (stub: contract layer only, every RPC answers UNIMPLEMENTED)."
+description = "cl-discv5: discv5 peer discovery with the eth2/cgc/nfd ENR, and the ethswarm.discv5.v1 service (stub: contract layer only, every RPC answers UNIMPLEMENTED)."
 
 [dependencies]
 ethswarm-proto = { path = "../ethswarm-proto" }
 ipc = { path = "../ipc" }
 tonic.workspace = true
+# The ENR values (eth2, cgc, nfd) as bytes and the BPO-aware local fork fields.
+p2p-wire = { path = "../p2p-wire" }
+# No `libp2p` feature: every libp2p* crate comes from the one pinned rust-libp2p commit, and
+# discv5's would be the crates.io one (scripts/check-libp2p-revs.sh).
+discv5.workspace = true
+enr.workspace = true
+# The RLP string values of the record; already in the tree through discv5 and enr.
+alloy-rlp = "0.3"
+# The event stream discv5 hands out is a tokio mpsc receiver.
+tokio = { version = "1", features = ["sync"] }
+# Node-key file checks (O_NOFOLLOW, fstat) and wiping the secret bytes; the versions cl-p2p uses.
+rustix = { version = "1", features = ["fs"] }
+zeroize = "1"
+thiserror = "2"
 
 [dev-dependencies]
 ipc = { path = "../ipc", features = ["testkit"] }
+network-config = { path = "../network-config" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tempfile = "3"
+rustix = { version = "1", features = ["fs", "process"] }

@@ -1,9 +1,17 @@
 //! `cl-discv5`: serves `ethswarm.discv5.v1`, peer discovery.
 //!
-//! This is a stub. Every RPC runs the `ipc` contract layer first (hello negotiation, frame
-//! discipline, `seq`, envelope type and digest checks) and then answers `UNIMPLEMENTED`, so the
-//! service already holds its peers to the wire contract. `tests/contract.rs` runs the contract
-//! suite against it, in process and over a Unix socket.
+//! - [`enr`]: the local record with `eth2`, `cgc` and `nfd`, and the fields of a remote one.
+//! - [`key`]: the node key from a 0600 credential file.
+//! - [`service`]: discv5 with the routing-table IP rules and lookups filtered by fork digest.
+//!
+//! The gRPC service is a stub. Every RPC runs the `ipc` contract layer first (hello
+//! negotiation, frame discipline, `seq`, envelope type and digest checks) and then answers
+//! `UNIMPLEMENTED`, so the service already holds its peers to the wire contract.
+//! `tests/contract.rs` runs the contract suite against it, in process and over a Unix socket.
+
+pub mod enr;
+pub mod key;
+pub mod service;
 
 use ethswarm_proto::discv5 as pb;
 use ipc::Link;
