@@ -11,7 +11,9 @@
 //! One VerifyKzg stream at a time. It is opened at the first call: our hello first, then
 //! cl-verify's, compared in full ([`ipc::hello::negotiate`]) and carrying the stream's server
 //! generation. Every request is fenced with it ([`ipc::deadline::Calls`]): its `request_id`, the
-//! generation, and a response settled only through its fence. A reader task delivers the
+//! generation, and a response settled only through its fence. cl-verify fails a stream whose
+//! `request_id` does not increase, so a call holds the stream's send lock from taking its id
+//! until its frame is sent, and only then waits for its verdict. A reader task delivers the
 //! responses; when the stream ends, errs or breaks the contract, every call on it fails as
 //! [`KzgOutcome::NoVerdict`] and the next call opens a new stream. At most
 //! [`DEFAULT_MAX_OUTSTANDING`] requests are in flight on a stream; a call past that is no
@@ -74,23 +76,32 @@ pub struct KzgClient {
     stream: Mutex<Option<KzgStream>>,
 }
 
-/// One open VerifyKzg stream.
-struct KzgStream {
+/// What a call uses of the open stream.
+#[derive(Clone)]
+struct Link {
     requests: mpsc::Sender<VerifyKzgRequest>,
     calls: Calls<VerifyKzgResponseBody>,
+    /// Held from taking a `request_id` through sending its frame, so the ids go out in the
+    /// order they were taken.
+    send: Arc<Mutex<()>>,
+}
+
+/// One open VerifyKzg stream.
+struct KzgStream {
+    link: Link,
     reader: JoinHandle<()>,
 }
 
 impl KzgStream {
     fn is_live(&self) -> bool {
-        !self.reader.is_finished() && !self.requests.is_closed()
+        !self.reader.is_finished() && !self.link.requests.is_closed()
     }
 }
 
 impl std::ops::Drop for KzgStream {
     fn drop(&mut self) {
         self.reader.abort();
-        self.calls.close();
+        self.link.calls.close();
     }
 }
 
@@ -116,12 +127,16 @@ impl KzgClient {
 
     async fn call(&self, cells: Vec<KzgCellProof>, deadline: Instant, unix_ms: u64) -> KzgOutcome {
         let late = || KzgOutcome::NoVerdict("no verdict by the deadline".into());
-        let (requests, calls) = match tokio::time::timeout_at(deadline, self.live()).await {
-            Ok(Ok(stream)) => stream,
+        let link = match tokio::time::timeout_at(deadline, self.live()).await {
+            Ok(Ok(link)) => link,
             Ok(Err(why)) => return KzgOutcome::NoVerdict(why),
             Err(_) => return late(),
         };
-        let started = calls.start(|tag| {
+        // The id is taken and sent under the send lock; the verdict is awaited without it.
+        let Ok(send) = tokio::time::timeout_at(deadline, link.send.lock()).await else {
+            return late();
+        };
+        let started = link.calls.start(|tag| {
             let body = VerifyKzgRequestBody {
                 request_id: tag.request_id,
                 cells,
@@ -138,11 +153,16 @@ impl KzgClient {
         let frame = VerifyKzgRequest {
             frame: Some(verify_kzg_request::Frame::Body(body)),
         };
+        // Widens the window between taking the request id and sending it, so a test sees any
+        // reordering the code allows.
+        #[cfg(test)]
+        tokio::task::yield_now().await;
         // A send still waiting at the deadline gives up; the wait below then expires the call.
-        if let Ok(Err(_)) = tokio::time::timeout_at(deadline, requests.send(frame)).await {
-            calls.close();
+        if let Ok(Err(_)) = tokio::time::timeout_at(deadline, link.requests.send(frame)).await {
+            link.calls.close();
             return KzgOutcome::NoVerdict("the VerifyKzg stream is closed".into());
         }
+        drop(send);
         match pending.wait_until(deadline).await {
             Ok(body) => outcome(&body),
             Err(Ignored::Deadline) => late(),
@@ -150,19 +170,17 @@ impl KzgClient {
         }
     }
 
-    /// The open stream's sender and calls, opening a new stream if there is none or it ended.
-    async fn live(
-        &self,
-    ) -> Result<(mpsc::Sender<VerifyKzgRequest>, Calls<VerifyKzgResponseBody>), String> {
+    /// The open stream's link, opening a new stream if there is none or it ended.
+    async fn live(&self) -> Result<Link, String> {
         let mut slot = self.stream.lock().await;
         if let Some(stream) = slot.as_ref().filter(|s| s.is_live()) {
-            return Ok((stream.requests.clone(), stream.calls.clone()));
+            return Ok(stream.link.clone());
         }
         *slot = None;
         let stream = self.open().await?;
-        let live = (stream.requests.clone(), stream.calls.clone());
+        let link = stream.link.clone();
         *slot = Some(stream);
-        Ok(live)
+        Ok(link)
     }
 
     /// Opens a stream: our hello, then cl-verify's, compared in full.
@@ -197,8 +215,11 @@ impl KzgClient {
             Calls::with_metrics(generation, self.max_outstanding, Arc::clone(&self.metrics));
         let reader = tokio::spawn(read(responses, calls.clone()));
         Ok(KzgStream {
-            requests,
-            calls,
+            link: Link {
+                requests,
+                calls,
+                send: Arc::default(),
+            },
             reader,
         })
     }
@@ -287,6 +308,33 @@ mod tests {
                 proof: b.proof(blob, column).to_vec(),
             })
             .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_calls_send_their_ids_in_order() {
+        let served = ClVerify::start();
+        let client = Arc::new(served.kzg_client().await);
+        // One call first opens the stream, so the calls below race on one stream only.
+        assert_eq!(
+            client.verify_cells(column(0), TIMEOUT).await,
+            KzgOutcome::Valid
+        );
+        for round in 0..4 {
+            let calls: Vec<_> = (0..24)
+                .map(|i| {
+                    let client = Arc::clone(&client);
+                    tokio::spawn(async move {
+                        client
+                            .verify_cells(column([0, 47, 127][i % 3]), TIMEOUT)
+                            .await
+                    })
+                })
+                .collect();
+            for call in calls {
+                let outcome = tokio::time::timeout(TIMEOUT, call).await.unwrap().unwrap();
+                assert_eq!(outcome, KzgOutcome::Valid, "round {round}");
+            }
+        }
     }
 
     #[tokio::test]

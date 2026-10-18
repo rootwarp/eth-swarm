@@ -12,7 +12,9 @@
 //!   [`RefError::Timeout`];
 //! - at most `max_in_flight` roots are being looked up at once, and at most that many requests
 //!   run against the reference. Lookups of a root already in flight share its request; a new root
-//!   while the set is full is [`RefError::Busy`] at once, never queued;
+//!   while the set is full is [`RefError::Busy`] at once, never queued. A root leaves the set when
+//!   one of its lookups finishes, or when the last caller waiting on it gives up (drops the
+//!   lookup), so abandoned lookups never hold a place;
 //! - at most `max_cached` resolved roots are kept, the oldest evicted first. A root the reference
 //!   does not know is not cached: it may know it a moment later.
 //!
@@ -97,12 +99,40 @@ pub enum RefError {
 
 type Lookup = Arc<OnceCell<Arc<RefBlock>>>;
 
+/// One root being looked up, and how many callers are waiting on it.
+struct InFlight {
+    lookup: Lookup,
+    waiters: usize,
+}
+
 #[derive(Default)]
 struct State {
     cached: HashMap<Root, Arc<RefBlock>>,
     /// Insertion order of `cached`, oldest first.
     order: VecDeque<Root>,
-    in_flight: HashMap<Root, Lookup>,
+    in_flight: HashMap<Root, InFlight>,
+}
+
+/// One caller's share of an in-flight lookup. Dropping it, when the lookup finishes or the
+/// caller gives up first, releases the share ([`State::leave`]).
+struct Waiter<'a> {
+    state: &'a Mutex<State>,
+    max_cached: usize,
+    root: Root,
+    lookup: Lookup,
+    /// Set once the lookup gave its result to this caller.
+    finished: bool,
+    resolved: Option<Arc<RefBlock>>,
+}
+
+impl std::ops::Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.leave(self.root, &self.lookup, self.finished);
+        if let Some(block) = self.resolved.take() {
+            state.cache(block, self.max_cached);
+        }
+    }
 }
 
 /// The reference node's view of block roots (see the module docs).
@@ -139,30 +169,43 @@ impl<A: ReferenceApi + BlockApi, E: EthSpec> RefView<A, E> {
             if let Some(block) = state.cached.get(&root) {
                 return Ok(Arc::clone(block));
             }
-            match state.in_flight.get(&root) {
-                Some(lookup) => Arc::clone(lookup),
-                None if state.in_flight.len() >= self.limits.max_in_flight => {
-                    return Err(RefError::Busy(state.in_flight.len()));
+            let in_flight = state.in_flight.len();
+            match state.in_flight.get_mut(&root) {
+                Some(entry) => {
+                    entry.waiters += 1;
+                    Arc::clone(&entry.lookup)
                 }
-                None => Arc::clone(state.in_flight.entry(root).or_default()),
+                None if in_flight >= self.limits.max_in_flight => {
+                    return Err(RefError::Busy(in_flight));
+                }
+                None => {
+                    let lookup = Lookup::default();
+                    let entry = InFlight {
+                        lookup: Arc::clone(&lookup),
+                        waiters: 1,
+                    };
+                    state.in_flight.insert(root, entry);
+                    lookup
+                }
             }
         };
+        // From here on, however this future ends, the waiter releases its share.
+        let mut waiter = Waiter {
+            state: &self.state,
+            max_cached: self.limits.max_cached,
+            root,
+            lookup,
+            finished: false,
+            resolved: None,
+        };
         let timeout = self.limits.timeout;
-        let result = tokio::time::timeout(timeout, lookup.get_or_try_init(|| self.fetch(root)))
-            .await
-            .unwrap_or(Err(RefError::Timeout(timeout)))
-            .cloned();
-        let mut state = self.state();
-        if state
-            .in_flight
-            .get(&root)
-            .is_some_and(|l| Arc::ptr_eq(l, &lookup))
-        {
-            state.in_flight.remove(&root);
-        }
-        if let Ok(block) = &result {
-            state.cache(Arc::clone(block), self.limits.max_cached);
-        }
+        let result =
+            tokio::time::timeout(timeout, waiter.lookup.get_or_try_init(|| self.fetch(root)))
+                .await
+                .unwrap_or(Err(RefError::Timeout(timeout)))
+                .cloned();
+        waiter.finished = true;
+        waiter.resolved = result.as_ref().ok().cloned();
         result
     }
 
@@ -234,6 +277,23 @@ impl<A: ReferenceApi + BlockApi, E: EthSpec> RefView<A, E> {
 }
 
 impl State {
+    /// One waiter on `lookup` of `root` is gone: the root leaves the in-flight set if that
+    /// waiter got the lookup's result (`finished`) or was the last one waiting. A newer lookup
+    /// of the same root is left alone.
+    fn leave(&mut self, root: Root, lookup: &Lookup, finished: bool) {
+        let Some(entry) = self
+            .in_flight
+            .get_mut(&root)
+            .filter(|entry| Arc::ptr_eq(&entry.lookup, lookup))
+        else {
+            return;
+        };
+        entry.waiters = entry.waiters.saturating_sub(1);
+        if finished || entry.waiters == 0 {
+            self.in_flight.remove(&root);
+        }
+    }
+
     fn cache(&mut self, block: Arc<RefBlock>, max: usize) {
         if max == 0 || self.cached.contains_key(&block.root) {
             return;
@@ -255,16 +315,17 @@ mod tests {
     use super::*;
     use crate::testing::{gloas_block, schedule, Spec};
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use tokio::sync::watch;
 
-    /// A reference node from tables: headers and block SSZ by root. `hang` makes every request
-    /// wait forever.
+    /// A reference node from tables: headers and block SSZ by root. While `hang` is set, every
+    /// request waits until it is cleared.
     #[derive(Default)]
     struct Reference {
         headers: Mutex<HashMap<Root, Header>>,
         blocks: Mutex<HashMap<Root, Vec<u8>>>,
-        hang: AtomicBool,
+        hang: watch::Sender<bool>,
         requests: AtomicUsize,
     }
 
@@ -287,9 +348,9 @@ mod tests {
 
         async fn gate(&self) {
             self.requests.fetch_add(1, Ordering::SeqCst);
-            if self.hang.load(Ordering::SeqCst) {
-                std::future::pending::<()>().await;
-            }
+            let mut hang = self.hang.subscribe();
+            // The sender lives as long as the fixture, so this ends only when `hang` clears.
+            let _ = hang.wait_for(|hang| !hang).await;
         }
 
         fn requests(&self) -> usize {
@@ -401,7 +462,7 @@ mod tests {
     async fn a_silent_reference_times_out() {
         let api = Reference::default();
         let root = api.serve(9, 1);
-        api.hang.store(true, Ordering::SeqCst);
+        api.hang.send_replace(true);
         let limits = RefLimits {
             timeout: Duration::from_millis(500),
             ..RefLimits::default()
@@ -423,7 +484,7 @@ mod tests {
         let api = Reference::default();
         let first = api.serve(9, 1);
         let second = api.serve(10, 1);
-        api.hang.store(true, Ordering::SeqCst);
+        api.hang.send_replace(true);
         let limits = RefLimits {
             max_in_flight: 1,
             ..RefLimits::default()
@@ -475,5 +536,65 @@ mod tests {
         let found = refs.lookup(root).await.unwrap();
         assert_eq!((found.slot, found.commitments.clone()), (16, vec![[3; 48]]));
         assert_eq!(api.requests(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_lookups_free_their_place() {
+        let api = Reference::default();
+        let limits = RefLimits::default();
+        let roots: Vec<_> = (0..=u64::try_from(limits.max_in_flight).unwrap())
+            .map(|i| api.serve(9 + i, 1))
+            .collect();
+        let (last, cancelled) = roots.split_last().unwrap();
+        api.hang.send_replace(true);
+        let refs = view(&api, limits);
+        // Every caller gives up long before the lookup's own timeout.
+        for root in cancelled {
+            let gave_up = tokio::time::timeout(Duration::from_millis(100), refs.lookup(*root));
+            assert!(gave_up.await.is_err(), "the reference is hanging");
+        }
+        assert_eq!(
+            refs.in_flight(),
+            0,
+            "a dropped lookup leaves nothing in flight"
+        );
+        // A new root is looked up, not refused as busy.
+        api.hang.send_replace(false);
+        assert_eq!(refs.lookup(*last).await.unwrap().root, *last);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_shared_lookup_outlives_a_waiter_that_gives_up() {
+        let api = Reference::default();
+        let root = api.serve(9, 1);
+        api.hang.send_replace(true);
+        let refs = view(&api, RefLimits::default());
+        let gives_up = async {
+            let gave_up = tokio::time::timeout(Duration::from_millis(100), refs.lookup(root));
+            assert!(gave_up.await.is_err(), "the reference is hanging");
+            assert_eq!(
+                refs.in_flight(),
+                1,
+                "the other waiter still holds the lookup"
+            );
+            // A third lookup of the root shares it rather than adding a root.
+            let shared = tokio::time::timeout(Duration::from_millis(100), refs.lookup(root));
+            assert!(shared.await.is_err());
+            assert_eq!(refs.in_flight(), 1);
+            api.hang.send_replace(false);
+        };
+        // The waiter that gives up asks first, so it is the one running the request.
+        let stays = async {
+            tokio::task::yield_now().await;
+            refs.lookup(root).await
+        };
+        let ((), block) = tokio::join!(gives_up, stays);
+        assert_eq!(
+            block.unwrap().root,
+            root,
+            "the remaining waiter gets the answer"
+        );
+        assert_eq!(refs.in_flight(), 0);
+        assert_eq!(refs.cached(), 1);
     }
 }

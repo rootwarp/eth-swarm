@@ -263,3 +263,89 @@ pub fn store_verified<E: EthSpec>(
         .write_columns(sidecar.slot, &sidecar.beacon_block_root.0, &[column])
         .map(drop)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::{ApiError, Checkpoint, Header, RefLimits, Root};
+    use super::*;
+    use crate::da::custody::{Advertise, EnrCgc, EnrError};
+    use crate::testing::{gloas_block, schedule, Spec};
+    use cl_chain_columns::ColumnWriter;
+    use consensus_types::primitives::U256;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A custody column of `U256::MAX`.
+    const CUSTODY_COLUMN: u64 = 47;
+
+    /// A reference that knows nothing: the roots below are seeded instead.
+    struct NoReference;
+
+    impl ReferenceApi for NoReference {
+        async fn finalized_checkpoint(&self) -> Result<Checkpoint, ApiError> {
+            Err(ApiError("not used".into()))
+        }
+
+        async fn header(&self, _: Root) -> Result<Header, ApiError> {
+            Err(ApiError("not used".into()))
+        }
+    }
+
+    impl BlockApi for NoReference {
+        async fn block(&self, _: Root) -> Result<Vec<u8>, ApiError> {
+            Err(ApiError("not used".into()))
+        }
+    }
+
+    struct NoEnr;
+
+    impl EnrCgc for NoEnr {
+        fn set_cgc(&mut self, _: u64) -> Result<(), EnrError> {
+            Ok(())
+        }
+    }
+
+    /// A cl-verify that accepts any batch, counting the batches it was asked about.
+    #[derive(Default)]
+    struct AcceptsAll {
+        asked: AtomicUsize,
+    }
+
+    impl KzgVerifier for AcceptsAll {
+        async fn verify_cells(&self, _: Vec<KzgCellProof>, _: Duration) -> KzgOutcome {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            KzgOutcome::Valid
+        }
+    }
+
+    #[tokio::test]
+    async fn a_column_of_no_cells_is_dropped_even_for_a_bid_of_no_blobs() {
+        let refs = RefView::<_, Spec>::new(NoReference, schedule(), RefLimits::default());
+        let (block, _, root) = gloas_block(9, &[]);
+        refs.seed(&block);
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let custody = Custody::open(writer, NoEnr, U256::MAX, Advertise::Withheld, 0).unwrap();
+        assert!(custody.custody_columns().contains(&CUSTODY_COLUMN));
+        let contract = ColumnContract {
+            kzg: AcceptsAll::default(),
+            verify_timeout: Duration::from_secs(1),
+            metrics: ColumnMetrics::default(),
+        };
+        // Every later check holds: a vouched root at its slot, zero commitments for zero cells,
+        // and a verifier that accepts anything.
+        let empty = GossipColumn {
+            sidecar: gloas::DataColumnSidecar {
+                index: CUSTODY_COLUMN,
+                column: Vec::new().try_into().unwrap(),
+                kzg_proofs: Vec::new().try_into().unwrap(),
+                slot: 9,
+                beacon_block_root: root.into(),
+            },
+            subnet_id: CUSTODY_COLUMN,
+        };
+        let dropped = storage_contract(&empty, &refs, &custody, &contract).await;
+        assert_eq!(dropped.unwrap_err(), Drop::CommitmentsMismatch);
+        assert_eq!(contract.metrics.dropped(Drop::CommitmentsMismatch), 1);
+        assert_eq!(contract.kzg.asked.load(Ordering::SeqCst), 0, "never sent");
+    }
+}
