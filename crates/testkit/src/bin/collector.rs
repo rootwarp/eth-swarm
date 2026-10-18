@@ -28,7 +28,11 @@
 //! too: a sampled subnet it does not subscribe is logged.
 //!
 //! `rates` prints one JSON line per topic with its messages and bytes per slot (and the busiest
-//! slot's), and per sampled subnet for `single_attestation`; then a summary line.
+//! slot's), and per sampled subnet for `single_attestation`; then a summary line. A slot is one
+//! the topic's source recorded anything in: a slot with nothing from the source (a missing
+//! interval, say) is not in the divisor. Every configured topic and sampled subnet of
+//! `summary.toml` has its line, a 0 line when nothing was recorded (a refused topic included);
+//! a capture without `summary.toml` yet (still running) lists the recorded topics only.
 //!
 //! `offsets` prints one JSON line per record with its slot-relative offset and, for a column,
 //! its envelope-relative offset, then a summary line with the unmatched column count. It reads
@@ -47,11 +51,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use testkit::archive::ChainParams;
 use testkit::collector::{
-    collect, committees_per_slot, config_name, genesis_time, node_attnets, read_info, records,
-    run_sse, sample, supported_topics, Arrival, ArrivalReceiver, Arrivals, Backoff, CaptureInfo,
-    Clock, Collector, CollectorError, ColumnMatch, CommandDaemon, Drops, EnvelopeIndex,
-    RateCounter, ReferenceApiUrl, SlotClock, Source, SseConfig, Summary, SystemClock, TimeDaemon,
-    TokioPause, TopicConfig, DEFAULT_TOPICS, FALLBACK_SSE_EVENTS, NTP_INTERVAL, SINGLE_ATTESTATION,
+    collect, committees_per_slot, config_name, genesis_time, node_attnets, read_info, read_summary,
+    records, run_sse, sample, supported_topics, Arrival, ArrivalReceiver, Arrivals, Backoff,
+    CaptureInfo, Clock, Collector, CollectorError, ColumnMatch, CommandDaemon, Drops,
+    EnvelopeIndex, RateCounter, ReferenceApiUrl, SlotClock, Source, SseConfig, Summary,
+    SystemClock, TimeDaemon, TokioPause, TopicConfig, DEFAULT_TOPICS, FALLBACK_SSE_EVENTS,
+    NTP_INTERVAL, SINGLE_ATTESTATION,
 };
 use tokio::sync::watch;
 
@@ -98,8 +103,12 @@ offsets prints one JSON line per record of CAPTURE_DIR: its slot-relative offset
 (recv_wall - (genesis_time + slot * SLOT_DURATION_MS)) and, for a column, its offset from the
 execution_payload envelope of the same block root; then a summary with the unmatched columns.
 
-rates prints one JSON line per topic of CAPTURE_DIR: messages and bytes per slot over the slots
-its source recorded anything in, and the busiest slot's; per subnet too for single_attestation.
+rates prints one JSON line per topic of CAPTURE_DIR: messages and bytes per slot, and the
+busiest slot's; per subnet too for single_attestation. The divisor counts only the slots the
+topic's source recorded anything in: a slot with nothing from that source (a missing interval)
+is left out, not counted as empty. Every configured topic and sampled subnet of summary.toml
+gets a line, 0 when nothing was recorded (a topic the node refused included); without
+summary.toml (a capture still running) only the recorded topics are listed.
 
 Exit codes: 0 done, 1 the node, the genesis check or the capture failed, 64 usage.";
 
@@ -603,10 +612,7 @@ async fn capture_sse(
         summary.missing_intervals,
         summary.outside_sampled_subnets
     );
-    let gaps: Vec<&str> = (summary.unsupported_topics.iter())
-        .chain(&summary.missing_topics)
-        .map(String::as_str)
-        .collect();
+    let gaps = summary.topic_gaps();
     if !gaps.is_empty() {
         let _ = writeln!(out, "{}: topic gaps: {}", dir.display(), gaps.join(", "));
     }
@@ -712,7 +718,8 @@ fn offsets(dir: &Path, out: &mut dyn Write, err: &Log) -> u8 {
     0
 }
 
-/// One pass over `records.jsonl`, one record in memory at a time.
+/// One pass over `records.jsonl`, one record in memory at a time, with a 0 row for every
+/// configured topic and sampled subnet of `summary.toml` that has no record.
 fn rates(dir: &Path, out: &mut dyn Write, err: &Log) -> u8 {
     let fail = |message: String| {
         log(err, &message);
@@ -729,6 +736,17 @@ fn rates(dir: &Path, out: &mut dyn Write, err: &Log) -> u8 {
         ));
     };
     let mut counter = RateCounter::new(clock);
+    match read_summary(dir) {
+        Ok(Some(summary)) => counter.configure(&summary),
+        Ok(None) => log(
+            err,
+            &format!(
+                "{}: no summary.toml yet: topics with no records are not listed",
+                dir.display()
+            ),
+        ),
+        Err(e) => return fail(e.to_string()),
+    }
     let counted = records(dir).and_then(|mut all| {
         all.try_for_each(|record| {
             counter.add(&record?);
@@ -1427,9 +1445,22 @@ mod tests {
         assert_eq!(summary.records, 4, "{summary:?}");
         assert_eq!(summary.outside_sampled_subnets, 1);
         assert_eq!(summary.unsupported_topics, ["sse:execution_payload_bid"]);
-        assert_eq!(summary.missing_topics, ["sse:attestation_subnet_1"]);
+        // The refused topic has its n = 0 row, so it is a missing topic too, and the gaps
+        // line names it once.
+        assert_eq!(
+            summary.missing_topics,
+            ["sse:execution_payload_bid", "sse:attestation_subnet_1"]
+        );
+        let bid = summary
+            .topics
+            .iter()
+            .find(|t| t.topic == "execution_payload_bid");
+        assert_eq!(bid.map(|t| (t.n, t.bytes)), Some((0, 0)), "{summary:?}");
+        let gaps = out.lines().find(|l| l.contains("topic gaps: ")).unwrap();
         assert!(
-            out.contains("topic gaps: sse:execution_payload_bid, sse:attestation_subnet_1"),
+            gaps.ends_with(
+                "topic gaps: sse:execution_payload_bid (refused), sse:attestation_subnet_1"
+            ),
             "{out}"
         );
         // Every recorded event got its subnet and size.
@@ -1441,29 +1472,37 @@ mod tests {
         assert_eq!(attestation.subnet, Some(0));
         assert!(records.iter().all(|r| r.bytes > 0), "{records:?}");
 
-        // rates over the capture: one slot, one line per topic and one for subnet 0.
+        // rates over the capture: one slot, one line per configured topic (the refused one at
+        // 0) and one per sampled subnet (subnet 1 at 0).
         let (code, out, err) = run_args(&["rates", capture_dir.to_str().unwrap()]);
         assert_eq!(code, 0, "{err}");
         let lines: Vec<serde_json::Value> = out
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        let rows: Vec<(String, serde_json::Value, f64)> = lines[..lines.len() - 1]
+        let rows: Vec<(String, serde_json::Value, u64, f64)> = lines[..lines.len() - 1]
             .iter()
             .map(|l| {
                 (
                     l["topic"].as_str().unwrap().to_owned(),
                     l["subnet"].clone(),
+                    l["n"].as_u64().unwrap(),
                     l["msgs_per_slot"].as_f64().unwrap(),
                 )
             })
             .collect();
-        assert_eq!(rows.len(), 5, "{out}");
+        let none = serde_json::Value::Null;
+        assert_eq!(rows.len(), 7, "{out}");
+        assert_eq!(rows[3], ("execution_payload_bid".into(), none, 0, 0.0));
         assert_eq!(
-            rows[4],
-            ("single_attestation".into(), serde_json::json!(0), 1.0)
+            rows[5],
+            ("single_attestation".into(), serde_json::json!(0), 1, 1.0)
         );
-        assert_eq!(lines.last().unwrap()["summary"]["topics"], 4);
+        assert_eq!(
+            rows[6],
+            ("single_attestation".into(), serde_json::json!(1), 0, 0.0)
+        );
+        assert_eq!(lines.last().unwrap()["summary"]["topics"], 5);
     }
 
     #[tokio::test]
@@ -1541,6 +1580,37 @@ mod tests {
         let (code, _, err) = run_args(&["rates"]);
         assert_eq!(code, EXIT_USAGE);
         assert!(err.contains("rates takes exactly one CAPTURE_DIR"), "{err}");
+    }
+
+    #[test]
+    fn rates_without_a_summary_list_the_recorded_topics() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = CaptureInfo {
+            network: "sepolia".into(),
+            genesis_time: 100,
+            slot_duration_ms: 12_000,
+            sources: vec![Source::Sse],
+            sse_topics: vec!["block_gossip".into(), "data_column_sidecar".into()],
+            ..CaptureInfo::default()
+        };
+        // A capture still being written: no summary.toml yet.
+        drop(Collector::<Mainnet>::create(dir.path(), info, fixtures::chain(), None).unwrap());
+        let line = r#"{"source":"sse","topic":"block_gossip","subnet":null,"msg_id":null,"block_root":null,"slot":2,"recv_mono_ns":0,"recv_wall_ns":124000000000,"peer":null,"bytes":5}"#;
+        std::fs::write(dir.path().join("records.jsonl"), format!("{line}\n")).unwrap();
+        let (code, out, err) = run_args(&["rates", dir.path().to_str().unwrap()]);
+        assert_eq!(code, 0, "{err}");
+        assert!(
+            err.contains("no summary.toml yet: topics with no records are not listed"),
+            "{err}"
+        );
+        assert_eq!(out.lines().count(), 2, "{out}");
+        assert!(out.contains(r#""topic":"block_gossip""#), "{out}");
+        // A summary.toml that does not parse is refused.
+        std::fs::write(dir.path().join(SUMMARY_FILE), "records = 1\n").unwrap();
+        let (code, out, err) = run_args(&["rates", dir.path().to_str().unwrap()]);
+        assert_eq!(code, EXIT_FAILED);
+        assert!(err.contains("summary.toml"), "{err}");
+        assert!(out.is_empty(), "{out}");
     }
 
     #[test]

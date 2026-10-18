@@ -64,9 +64,9 @@ pub use offsets::{SlotClock, SlotOffset};
 pub use rates::{RateCounter, Rates, TopicRate};
 pub use record::{ArrivalRecord, Source};
 pub use sink::{
-    collect, read_capture, read_info, records, CaptureInfo, Collector, CollectorError, Records,
-    SubnetCount, Summary, TopicCount, CAPTURE_FILE, GAPS_FILE, MAX_RECORD_LINE_BYTES, NTP_FILE,
-    RECORDS_FILE, SUMMARY_FILE,
+    collect, read_capture, read_info, read_summary, records, CaptureInfo, Collector,
+    CollectorError, Records, SubnetCount, Summary, TopicCount, CAPTURE_FILE, GAPS_FILE,
+    MAX_RECORD_LINE_BYTES, NTP_FILE, RECORDS_FILE, SUMMARY_FILE,
 };
 pub(crate) use sse::get as api_get;
 pub use sse::{

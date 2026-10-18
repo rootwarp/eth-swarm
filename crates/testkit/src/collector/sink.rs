@@ -10,13 +10,16 @@
 //!
 //! The manifest covers the configured topic set: `capture.toml` lists the subscribed topics of
 //! each source, the ones the reference node refused, and the attestation subnets sampled;
-//! `summary.toml` gives every one of them its count `n` and bytes, zeros included, and lists as
-//! gaps the topics and subnets with nothing recorded and the refused topics. An unaggregated
-//! attestation outside the sampled subnets (or of no known subnet) is counted, never recorded.
+//! `summary.toml` gives every one of them its count `n` and bytes, zeros included (a refused
+//! topic too), and lists as gaps (`missing_topics`) the topics and subnets with nothing
+//! recorded, the refused ones among them; `unsupported_topics` names the refused ones again. An
+//! unaggregated attestation outside the sampled subnets (or of no known subnet) is counted,
+//! never recorded.
 //!
 //! Gossip payloads are decoded here (slot, block root) and handed to the archive
 //! ([`crate::archive::Writer`]) as received; SSE events are decoded from their JSON. A message
-//! that does not decode is still recorded, with no slot or root, and counted. Every file is
+//! that does not decode is still recorded, with no slot or root, and counted as undecoded
+//! (unless the subnet sample drops it). Every file is
 //! created new: a capture never overwrites another.
 
 use super::arrival::{Arrival, ArrivalReceiver, Drops, MissingInterval};
@@ -130,7 +133,8 @@ pub struct Summary {
     pub gossip_records: u64,
     /// Of which SSE.
     pub sse_records: u64,
-    /// Records whose payload or JSON did not decode (no slot or root).
+    /// Records written whose payload or JSON did not decode (no slot or root); an arrival the
+    /// subnet sample drops is not counted here.
     pub undecoded: u64,
     /// Arrivals dropped because the collector was behind.
     pub dropped: u64,
@@ -161,10 +165,12 @@ pub struct Summary {
     #[serde(default)]
     pub outside_sampled_subnets: u64,
     /// The configured topics and sampled subnets with nothing recorded (`sse:<event>`,
-    /// `gossip:<topic>`, `<source>:attestation_subnet_<n>`): gaps.
+    /// `gossip:<topic>`, `<source>:attestation_subnet_<n>`): gaps. The refused topics are
+    /// among them, so this lists every configured topic with no data.
     #[serde(default)]
     pub missing_topics: Vec<String>,
-    /// The configured topics the reference node refused at start (`sse:<event>`): gaps.
+    /// The configured topics the reference node refused at start (`sse:<event>`): gaps, also
+    /// in [`Summary::missing_topics`] with their `n = 0` row.
     #[serde(default)]
     pub unsupported_topics: Vec<String>,
     /// Every configured topic of every source with its count, zeros included, and any other
@@ -174,6 +180,28 @@ pub struct Summary {
     /// Every sampled subnet of every source with its count, zeros included.
     #[serde(default)]
     pub attestation_subnets: Vec<SubnetCount>,
+}
+
+impl Summary {
+    /// The gaps, for the log: every topic and subnet of [`Summary::missing_topics`] and
+    /// [`Summary::unsupported_topics`], each once, a refused topic marked `(refused)`. A summary
+    /// written before refused topics had rows of their own lists them in `unsupported_topics`
+    /// only; they come first.
+    pub fn topic_gaps(&self) -> Vec<String> {
+        let refused = |t: &String| self.unsupported_topics.contains(t);
+        let mark = |t: &String| {
+            if refused(t) {
+                format!("{t} (refused)")
+            } else {
+                t.clone()
+            }
+        };
+        (self.unsupported_topics.iter())
+            .filter(|t| !self.missing_topics.contains(t))
+            .chain(&self.missing_topics)
+            .map(mark)
+            .collect()
+    }
 }
 
 /// Writing the capture failed: it stops.
@@ -212,7 +240,8 @@ pub struct Collector<E: EthSpec> {
 }
 
 /// The manifest's counts while the capture runs: `(n, bytes)` per topic and per sampled
-/// subnet, the configured ones from the start.
+/// subnet, the configured ones from the start. An SSE event the node refused is configured
+/// too: it gets its `n = 0` row, so it is in `missing_topics` as well as `unsupported_topics`.
 #[derive(Debug, Default)]
 struct Manifest {
     sampled: Vec<u64>,
@@ -230,11 +259,11 @@ impl Manifest {
         m.sampled.dedup();
         for source in &info.sources {
             let configured = match source {
-                Source::Sse => &info.sse_topics,
-                Source::Gossip => &info.gossip_topics,
+                Source::Sse => [&info.sse_topics[..], &info.sse_topics_unsupported[..]].concat(),
+                Source::Gossip => info.gossip_topics.clone(),
             };
             for topic in configured {
-                m.topics.insert((*source, topic.clone()), (0, 0));
+                m.topics.insert((*source, topic), (0, 0));
             }
             for subnet in &m.sampled {
                 m.subnets.insert((*source, *subnet), (0, 0));
@@ -409,16 +438,14 @@ impl<E: EthSpec> Collector<E> {
     pub fn handle(&mut self, arrival: Arrival) -> Result<Option<String>, CollectorError> {
         match arrival {
             Arrival::Tap(tap) => {
-                let (record, notice) = self.gossip(tap);
-                self.record(&record)?;
+                let (record, undecoded, notice) = self.gossip(tap);
+                self.record(&record, undecoded)?;
                 Ok(notice)
             }
             Arrival::Sse(stamped) => {
                 let (slot, block_root, subnet) = decode_sse(&stamped.event, &self.subnets);
-                if slot.is_none() && block_root.is_none() {
-                    self.summary.undecoded += 1;
-                }
-                self.record(&ArrivalRecord {
+                let undecoded = slot.is_none() && block_root.is_none();
+                let record = ArrivalRecord {
                     source: Source::Sse,
                     topic: stamped.event.event,
                     subnet,
@@ -429,7 +456,8 @@ impl<E: EthSpec> Collector<E> {
                     recv_wall_ns: stamped.stamp.wall_ns,
                     peer: None,
                     bytes: stamped.event.data.len() as u64,
-                })?;
+                };
+                self.record(&record, undecoded)?;
                 Ok(None)
             }
             Arrival::Gap(gap) => {
@@ -450,7 +478,9 @@ impl<E: EthSpec> Collector<E> {
         }
     }
 
-    fn record(&mut self, record: &ArrivalRecord) -> Result<(), CollectorError> {
+    /// Writes `record` unless the subnet sample drops it; `undecoded` (its payload or JSON did
+    /// not decode) is counted only for a record written.
+    fn record(&mut self, record: &ArrivalRecord, undecoded: bool) -> Result<(), CollectorError> {
         if !self.manifest.sampled(record) {
             self.summary.outside_sampled_subnets += 1;
             return Ok(());
@@ -458,6 +488,7 @@ impl<E: EthSpec> Collector<E> {
         self.records.push(record)?;
         self.manifest.count(record);
         self.summary.records += 1;
+        self.summary.undecoded += u64::from(undecoded);
         match record.source {
             Source::Gossip => self.summary.gossip_records += 1,
             Source::Sse => self.summary.sse_records += 1,
@@ -465,17 +496,16 @@ impl<E: EthSpec> Collector<E> {
         Ok(())
     }
 
-    /// Decodes a tap record and archives its payload.
-    fn gossip(&mut self, tap: super::tap::TapRecord) -> (ArrivalRecord, Option<String>) {
+    /// Decodes a tap record and archives its payload: the record, whether it did not decode,
+    /// and a notice.
+    fn gossip(&mut self, tap: super::tap::TapRecord) -> (ArrivalRecord, bool, Option<String>) {
         let parsed = parse_gossip_topic(&tap.topic);
         let name = parsed.map_or(tap.topic.as_str(), |t| t.name);
         let decoded = match parsed {
             Some(_) => decode_gossip::<E>(name, &tap.payload, &self.chain),
             None => Ok(None),
         };
-        if parsed.is_none() || decoded.is_err() {
-            self.summary.undecoded += 1;
-        }
+        let undecoded = parsed.is_none() || decoded.is_err();
         let decoded = decoded.ok().flatten();
         let mut notice = None;
         if let (Some(topic), Some(archive)) = (parsed, self.archive.as_mut()) {
@@ -510,7 +540,7 @@ impl<E: EthSpec> Collector<E> {
             peer: Some(tap.peer),
             bytes: tap.payload.len() as u64,
         };
-        (record, notice)
+        (record, undecoded, notice)
     }
 
     /// Flushes the line files.
@@ -616,6 +646,23 @@ pub fn read_info(dir: &Path) -> Result<CaptureInfo, CollectorError> {
     })
 }
 
+/// Reads a capture directory's `summary.toml`: `None` while there is none yet (the capture is
+/// still being written, or stopped before it finished).
+pub fn read_summary(dir: &Path) -> Result<Option<Summary>, CollectorError> {
+    let path = dir.join(SUMMARY_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_error(&path)(e)),
+    };
+    toml::from_str(&text)
+        .map(Some)
+        .map_err(|e| CollectorError::Format {
+            path,
+            reason: e.to_string(),
+        })
+}
+
 /// The records of a capture directory's `records.jsonl`, read one line at a time: memory does
 /// not grow with the capture. Ends after the first error.
 pub fn records(dir: &Path) -> Result<Records, CollectorError> {
@@ -702,6 +749,7 @@ mod tests {
     use crate::collector::sse::SseEvent;
     use crate::collector::tap::TapRecord;
     use crate::collector::testing;
+    use crate::collector::topics::SINGLE_ATTESTATION;
     use consensus_types::primitives::Root;
 
     fn info() -> CaptureInfo {
@@ -935,6 +983,45 @@ mod tests {
     }
 
     #[test]
+    fn only_kept_records_count_as_undecoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = CaptureInfo {
+            sources: vec![Source::Sse],
+            sse_topics: vec![SINGLE_ATTESTATION.into(), "block_gossip".into()],
+            attestation_subnets: vec![3],
+            committees_per_slot: Some(64),
+            slots_per_epoch: Some(32),
+            ..info()
+        };
+        let mut c = Collector::<Spec>::create(dir.path(), info, fixtures::chain(), None).unwrap();
+        let sse = |event: &str, data: &str| {
+            Arrival::Sse(StampedEvent {
+                stamp: Stamp {
+                    mono_ns: 1,
+                    wall_ns: 2,
+                },
+                event: SseEvent {
+                    event: event.into(),
+                    data: data.into(),
+                },
+            })
+        };
+        // A malformed attestation has no subnet, so it is not sampled: dropped, not undecoded.
+        c.handle(sse(SINGLE_ATTESTATION, "garbage")).unwrap();
+        // A malformed block is kept: undecoded.
+        c.handle(sse("block_gossip", "garbage")).unwrap();
+        let summary = c.finish(0).unwrap();
+        assert_eq!(
+            (
+                summary.records,
+                summary.undecoded,
+                summary.outside_sampled_subnets
+            ),
+            (1, 1, 1)
+        );
+    }
+
+    #[test]
     fn a_capture_never_overwrites_another() {
         let dir = tempfile::tempdir().unwrap();
         let c = Collector::<Spec>::create(dir.path(), info(), fixtures::chain(), None).unwrap();
@@ -966,6 +1053,23 @@ mod tests {
         std::fs::write(dir.path().join(RECORDS_FILE), "{}\n").unwrap();
         let err = read_capture(dir.path()).unwrap_err();
         assert!(err.to_string().contains("line 1"), "{err}");
+    }
+
+    #[test]
+    fn a_summary_is_read_when_written() {
+        let dir = tempfile::tempdir().unwrap();
+        // A capture still being written has none yet.
+        assert_eq!(read_summary(dir.path()).unwrap(), None);
+        let c = Collector::<Spec>::create(dir.path(), info(), fixtures::chain(), None).unwrap();
+        let summary = c.finish(4).unwrap();
+        assert_eq!(read_summary(dir.path()).unwrap(), Some(summary));
+        std::fs::write(dir.path().join(SUMMARY_FILE), "records = \"x\"\n").unwrap();
+        let err = read_summary(dir.path()).unwrap_err();
+        assert!(matches!(err, CollectorError::Format { .. }), "{err}");
+        // Anything else that keeps it from being read is an error too.
+        let not_a_dir = dir.path().join(SUMMARY_FILE);
+        let err = read_summary(&not_a_dir).unwrap_err();
+        assert!(matches!(err, CollectorError::Io { .. }), "{err}");
     }
 
     #[test]

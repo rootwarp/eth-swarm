@@ -115,11 +115,15 @@ gossip topic's validation (Lighthouse at the Hoodi pin, `c8ddac7`, emits all of 
   (`unsupported_topics`) and in the log. `block_gossip` and `data_column_sidecar` are the
   fallback: they are required in the file, and a node that refuses either is refused, so a
   capture always has blocks and columns.
-- **What it did not see.** `summary.toml` lists every subscribed event with its count `n` and
-  bytes, zeros included, and every sampled subnet the same way; those with `n = 0` are listed in
-  `missing_topics`. On Hoodi before the Gloas fork (2026-10-26 17:42:48 UTC, 02:42:48 KST on the
-  27th) `execution_payload_gossip`, `execution_payload_bid` and `payload_attestation_message`
-  are expected there.
+- **What it did not see.** `summary.toml` lists every configured event with its count `n` and
+  bytes, zeros included (a refused one too, at `n = 0`), and every sampled subnet the same way;
+  those with `n = 0` are listed in `missing_topics`, so it holds every configured topic with no
+  data, the refused ones included (they stay in `unsupported_topics` as well). The log's
+  `topic gaps:` line names each one once, a refused one marked `(refused)`. `undecoded` counts
+  only the records written: an attestation the subnet sample drops is not one of them. On Hoodi
+  before the Gloas fork (2026-10-26 17:42:48 UTC, 02:42:48 KST on the 27th)
+  `execution_payload_gossip`, `execution_payload_bid` and `payload_attestation_message` are
+  expected there.
 - **Sampled attestation subnets.** A `single_attestation` is recorded only on a subnet in
   `attestation_subnets`; any other (or one whose subnet is unknown) is counted
   (`outside_sampled_subnets`), never written. Its subnet is `compute_subnet_for_attestation`
@@ -154,15 +158,21 @@ Each start of an instance writes a new directory
 | `records.jsonl` | one record per event: `source`, `topic`, `subnet`, `msg_id`, `block_root`, `slot`, `recv_mono_ns`, `recv_wall_ns`, `peer`, `bytes` (the event's JSON for SSE; the message data for gossip) |
 | `gaps.jsonl` | one missing interval per disconnect, and one for the time before the first stream, written when the stream is back |
 | `ntp.jsonl` | the clock error (local minus NTP) from `chronyc tracking`, every 60 s |
-| `summary.toml` | written at stop: record, drop and undecoded counts, the number and total length of the missing intervals (`gaps.jsonl` lists them), and the manifest: `n` and bytes of every subscribed event (`[[topics]]`) and sampled subnet (`[[attestation_subnets]]`), the gaps (`missing_topics`, `unsupported_topics`), and `outside_sampled_subnets` |
+| `summary.toml` | written at stop: record, drop and undecoded counts, the number and total length of the missing intervals (`gaps.jsonl` lists them), and the manifest: `n` and bytes of every configured event, refused ones included (`[[topics]]`), and sampled subnet (`[[attestation_subnets]]`), the gaps (`missing_topics`, `unsupported_topics`), and `outside_sampled_subnets` |
 
 `collector rates DIR` prints one JSON line per topic: `n`, `bytes`, `msgs_per_slot` and
-`bytes_per_slot` over the slots the source recorded anything in (a missing interval adds no
-empty slot), and the busiest slot's (`peak_msgs_per_slot`, `peak_bytes_per_slot`); a
-`single_attestation` line per sampled subnet too. A record's slot is the wall-clock slot of its
-arrival. These are the attestation, aggregate and PTC rates (`single_attestation`,
-`attestation`, `payload_attestation_message`). SSE bytes are the event's JSON, not the wire
-size; the probe's gossip tap gives the wire size.
+`bytes_per_slot`, and the busiest slot's (`peak_msgs_per_slot`, `peak_bytes_per_slot`); a
+`single_attestation` line per sampled subnet too. The per-slot divisor (`slots`) counts only the
+slots in which the topic's source recorded something: a slot with nothing from that source (a
+missing interval, a quiet stretch) is left out rather than counted as empty, so the rates are
+per slot the source was seen in. A record's slot is the wall-clock slot of its arrival; the
+busiest slot is the full count of each slot, even if the wall clock stepped back into it. Every
+configured topic and sampled subnet of `summary.toml` gets a line, `n = 0` when nothing was
+recorded (a refused event included), so the gaps show here too; a capture still running has no
+`summary.toml` yet, and then only the recorded topics are listed (said on stderr). These are
+the attestation, aggregate and PTC rates (`single_attestation`, `attestation`,
+`payload_attestation_message`). SSE bytes are the event's JSON, not the wire size; the probe's
+gossip tap gives the wire size.
 
 The stream is reconnected with backoff (1 s, doubling, up to 30 s). Beacon nodes do not replay
 missed events, so every disconnect, however short, is a missing interval: from the last bytes

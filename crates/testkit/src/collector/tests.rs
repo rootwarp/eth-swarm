@@ -290,8 +290,8 @@ fn topic_set_manifest() {
     let read = read_info(&out).unwrap();
     assert_eq!(read, info);
 
-    // summary.toml lists every configured topic with its n, zeros included, and every sampled
-    // subnet; the zeros and the refused topic are the gaps.
+    // summary.toml lists every configured topic with its n, zeros included (the refused one
+    // too), and every sampled subnet; the zeros are the gaps, the refused topic among them.
     let on_disk: Summary =
         toml::from_str(&std::fs::read_to_string(out.join(SUMMARY_FILE)).unwrap()).unwrap();
     assert_eq!(on_disk, summary);
@@ -309,6 +309,7 @@ fn topic_set_manifest() {
             ("attestation", 1),
             ("block_gossip", 1),
             ("data_column_sidecar", 2),
+            ("execution_payload_bid", 0),
             ("execution_payload_gossip", 0),
             ("payload_attestation_message", 0),
             ("single_attestation", 2),
@@ -331,12 +332,35 @@ fn topic_set_manifest() {
     assert_eq!(
         summary.missing_topics,
         [
+            "sse:execution_payload_bid",
             "sse:execution_payload_gossip",
             "sse:payload_attestation_message",
             "sse:attestation_subnet_5",
         ]
     );
     assert_eq!(summary.unsupported_topics, ["sse:execution_payload_bid"]);
+    // The gaps line names each gap once, the refused topic marked.
+    assert_eq!(
+        summary.topic_gaps(),
+        [
+            "sse:execution_payload_bid (refused)",
+            "sse:execution_payload_gossip",
+            "sse:payload_attestation_message",
+            "sse:attestation_subnet_5",
+        ]
+    );
+    // A summary written before refused topics had rows lists them on the line all the same.
+    let earlier = Summary {
+        missing_topics: vec!["sse:attestation_subnet_5".into()],
+        ..summary.clone()
+    };
+    assert_eq!(
+        earlier.topic_gaps(),
+        [
+            "sse:execution_payload_bid (refused)",
+            "sse:attestation_subnet_5"
+        ]
+    );
     // The records: every arrival but the unsampled attestation, with its size.
     let (_, records) = read_capture(&out).unwrap();
     assert_eq!(records.len(), 6);
