@@ -17,19 +17,39 @@
 //!    `p2p_conn_budget_exceeded_total` counts it.
 //!
 //! A [`StreamMuxer`] does not say how much it buffers, so [`BudgetedMuxer`] does the buffering
-//! itself: each time the connection task polls it, it reads every open stream into that
-//! stream's own buffer until the stream has nothing more, and the application reads from that
-//! buffer first. The bytes in those buffers are exactly the bytes the muxer delivered and the
-//! application has not read, and their sum is what the budget counts. Beyond them, mplex holds
-//! frames only for a stream it read past while reading another one; it wakes the connection
-//! task for them, so the next poll moves them into the counted buffers.
+//! itself: each time the connection task polls it (a *pass*), it reads every open stream into
+//! that stream's own buffer until the stream has nothing more, and the application reads from
+//! that buffer first. The bytes in those buffers are exactly the bytes the muxer delivered and
+//! the application has not read, and their sum is what the budget counts.
+//!
+//! Beyond them, mplex holds the frames it read for one stream while reading another, and a
+//! peer may send frames of up to 1 MiB. [`Budgeted`] therefore puts a [`QuotaSocket`] under
+//! mplex, which hands it at most [`PASS_BYTES`] and [`PASS_FRAMES`] per pass, and each pass
+//! moves what mplex holds before it lets an idle stream read on. Uncounted, mplex holds at most
+//! one pass plus the one frame it is decoding, and never the 257 frames at which it resets a
+//! healthy stream. Inbound streams mplex has queued are taken into the muxer's own queue,
+//! drained and counted until the swarm takes them; that queue holds at most
+//! [`MPLEX_MAX_STREAMS`], or the connection is closed. A swarm over these muxers must take them
+//! at once: see [`MIN_NEGOTIATING_INBOUND_STREAMS`].
+//!
+//! mplex resets a stream only by dropping it, and sends that Reset frame only with a flush
+//! through another stream; and it sends none for a stream whose write side we closed. A stream
+//! over its budget that mplex therefore cannot reset (closed for writing, or with no other
+//! stream to flush through) closes the connection instead, so the peer stops sending.
+//!
+//! Closing a connection fails every stream on it at once: its bytes are freed and a waiting
+//! reader or writer is woken to an error.
 //!
 //! Wrap only a muxer without flow control. yamux credits its window as data is read, so reading
 //! it eagerly would let the peer send without limit; yamux bounds its own buffers by its
 //! windows.
 
+mod quota;
 #[cfg(test)]
 mod tests;
+
+use quota::Pass;
+pub use quota::{QuotaSocket, EMPTY_FRAME_WINDOW, MAX_EMPTY_FRAMES, PASS_BYTES, PASS_FRAMES};
 
 use bytes::{Buf, Bytes, BytesMut};
 use consensus_types::caps::MAX_PAYLOAD_SIZE;
@@ -51,13 +71,42 @@ use std::task::{Context, Poll, Waker};
 /// Streams one mplex connection may have open at once (inbound and outbound together).
 pub const MPLEX_MAX_STREAMS: usize = 64;
 
+/// The least `max_negotiating_inbound_streams` a swarm over [`muxers`] may run with:
+/// [`MPLEX_MAX_STREAMS`].
+///
+/// [`BudgetedMuxer`] takes every inbound stream mplex accepts and drains and counts it until
+/// the swarm takes it. A stream the swarm leaves waiting has no reader, so what its peer sends
+/// piles up against the budget until the connection is closed. The swarm takes inbound streams
+/// only while fewer than `max_negotiating_inbound_streams` are negotiating; at
+/// [`MPLEX_MAX_STREAMS`] or more it always takes them, since mplex never holds more. The libp2p
+/// default is 128. Build the swarm config with [`with_negotiating_inbound_streams`].
+pub const MIN_NEGOTIATING_INBOUND_STREAMS: usize = MPLEX_MAX_STREAMS;
+
+/// `config` letting `streams` inbound streams negotiate at once, for a swarm over [`muxers`].
+///
+/// # Panics
+///
+/// In debug builds, if `streams` is below [`MIN_NEGOTIATING_INBOUND_STREAMS`]; release builds
+/// raise it to that.
+#[must_use]
+pub fn with_negotiating_inbound_streams(
+    config: libp2p::swarm::Config,
+    streams: usize,
+) -> libp2p::swarm::Config {
+    debug_assert!(
+        streams >= MIN_NEGOTIATING_INBOUND_STREAMS,
+        "max_negotiating_inbound_streams {streams} is below {MIN_NEGOTIATING_INBOUND_STREAMS}: \
+         mplex would hold frames for streams the budget does not see"
+    );
+    config.with_max_negotiating_inbound_streams(streams.max(MIN_NEGOTIATING_INBOUND_STREAMS))
+}
+
 /// Frames mplex holds for one stream before it resets the stream.
 ///
-/// [`BudgetedMuxer`] reads every stream each time the connection is polled, so frames wait
-/// inside mplex only for a stream mplex read past while reading another, until the next poll.
-/// 256 frames is 2 MiB of rust-libp2p's 8 KiB frames: enough that a burst on one stream is not
-/// reset just because it arrived while another stream was being read. Memory is bounded by
-/// [`MuxerBudget`], not by this count.
+/// mplex holds frames for a stream it read past while reading another. A frame may be up to
+/// 1 MiB, so this count bounds nothing in bytes: 256 frames can be 256 MiB. Bytes are bounded by
+/// [`PASS_BYTES`] per pass and by [`MuxerBudget`]. A stream gets at most two passes of
+/// [`PASS_FRAMES`] frames before it is drained, so a healthy stream never reaches this count.
 pub const MPLEX_MAX_BUFFERED_FRAMES: usize = 256;
 
 /// Unread bytes one stream may hold before it is reset: one `MAX_PAYLOAD_SIZE` message at its
@@ -227,7 +276,7 @@ impl<U: UpgradeInfo> UpgradeInfo for Budgeted<U> {
 
 impl<C, U> InboundConnectionUpgrade<C> for Budgeted<U>
 where
-    U: InboundConnectionUpgrade<C>,
+    U: InboundConnectionUpgrade<QuotaSocket<C>>,
     U::Output: StreamMuxer,
     U::Future: Unpin,
 {
@@ -236,13 +285,15 @@ where
     type Future = Budgeting<U::Future>;
 
     fn upgrade_inbound(self, socket: C, info: Self::Info) -> Self::Future {
-        Budgeting::new(self.inner.upgrade_inbound(socket, info), self.budget)
+        let pass = Arc::<Pass>::default();
+        let socket = QuotaSocket::new(socket, Arc::clone(&pass));
+        Budgeting::new(self.inner.upgrade_inbound(socket, info), self.budget, pass)
     }
 }
 
 impl<C, U> OutboundConnectionUpgrade<C> for Budgeted<U>
 where
-    U: OutboundConnectionUpgrade<C>,
+    U: OutboundConnectionUpgrade<QuotaSocket<C>>,
     U::Output: StreamMuxer,
     U::Future: Unpin,
 {
@@ -251,7 +302,9 @@ where
     type Future = Budgeting<U::Future>;
 
     fn upgrade_outbound(self, socket: C, info: Self::Info) -> Self::Future {
-        Budgeting::new(self.inner.upgrade_outbound(socket, info), self.budget)
+        let pass = Arc::<Pass>::default();
+        let socket = QuotaSocket::new(socket, Arc::clone(&pass));
+        Budgeting::new(self.inner.upgrade_outbound(socket, info), self.budget, pass)
     }
 }
 
@@ -261,14 +314,14 @@ where
 pub struct Budgeting<F> {
     inner: F,
     /// Taken when the muxer is ready.
-    budget: Option<MuxerBudget>,
+    budget: Option<(MuxerBudget, Arc<Pass>)>,
 }
 
 impl<F> Budgeting<F> {
-    fn new(inner: F, budget: MuxerBudget) -> Self {
+    fn new(inner: F, budget: MuxerBudget, pass: Arc<Pass>) -> Self {
         Self {
             inner,
-            budget: Some(budget),
+            budget: Some((budget, pass)),
         }
     }
 }
@@ -283,11 +336,11 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let muxer = ready!(this.inner.poll_unpin(cx))?;
-        let budget = this
+        let (budget, pass) = this
             .budget
             .take()
             .expect("Budgeting polled after it completed");
-        Poll::Ready(Ok(BudgetedMuxer::new(muxer, budget)))
+        Poll::Ready(Ok(BudgetedMuxer::with_pass(muxer, budget, pass)))
     }
 }
 
@@ -300,6 +353,32 @@ pub enum BudgetedMuxerError<E> {
     /// The connection's streams held more unread bytes than the budget.
     #[error("the connection's streams hold {buffered} unread bytes, over its budget of {budget}")]
     BudgetExceeded { buffered: usize, budget: usize },
+    /// A stream held more unread bytes than its budget, and mplex could not tell the peer to
+    /// stop: it sends no Reset for a stream whose write side we closed, and sends a Reset only
+    /// with a flush through another stream, of which there was none.
+    #[error(
+        "a stream holds {held} unread bytes, over its budget of {budget}, and mplex cannot reset it"
+    )]
+    StreamUnresettable { held: usize, budget: usize },
+    /// The peer sent more than [`MAX_EMPTY_FRAMES`] empty data frames in [`EMPTY_FRAME_WINDOW`].
+    #[error(
+        "the peer sent more than {max} empty data frames in {window}",
+        max = MAX_EMPTY_FRAMES,
+        window = EMPTY_FRAME_WINDOW
+    )]
+    EmptyFrameFlood,
+    /// More inbound streams waited for the swarm to take them than mplex may hold open.
+    #[error("{queued} inbound streams wait to be taken, over the cap of {max}")]
+    TooManyQueuedStreams { queued: usize, max: usize },
+}
+
+/// Why a [`BudgetedMuxer`] closed its connection, kept to answer every later call with.
+#[derive(Clone, Copy, Debug)]
+enum Closed {
+    Budget { buffered: usize },
+    Unresettable { held: usize },
+    EmptyFrames,
+    Queue { queued: usize },
 }
 
 /// A [`StreamMuxer`] whose streams' unread bytes are counted against a [`MuxerBudget`]; see
@@ -307,33 +386,50 @@ pub enum BudgetedMuxerError<E> {
 pub struct BudgetedMuxer<M: StreamMuxer> {
     inner: M,
     budget: MuxerBudget,
+    /// The read quota, which only a [`Budgeted`] upgrade puts under the muxer.
+    pass: Arc<Pass>,
     /// The unread bytes every stream holds, together.
     buffered: Arc<AtomicUsize>,
-    /// Every stream handed out; a dropped one is pruned on the next poll.
+    /// Every stream handed out or queued; a dropped one is pruned on the next poll.
     streams: Vec<Weak<Mutex<Held<M::Substream>>>>,
+    /// Inbound streams taken from the muxer and not yet by the swarm.
+    inbound: VecDeque<BudgetedStream<M::Substream>>,
     /// Where a stream is read into before its buffer.
     scratch: Box<[u8]>,
-    /// The unread bytes when the budget was exceeded; the connection is closed from then on.
-    exceeded: Option<usize>,
-    /// A stream was reset and the connection not flushed since. mplex queues the reset frame
-    /// when the stream is dropped but sends it only with the next flush, which it makes only
-    /// when writing; so the muxer flushes through another open stream. With no other stream,
-    /// the reset leaves with the next stream's flush or the connection's next write, and
-    /// meanwhile mplex discards what the peer sends on the reset stream.
-    flush_owed: bool,
+    /// Where the next pass starts, so that no stream is always read first.
+    rotation: usize,
+    /// Set once the connection is closed for good.
+    closed: Option<Closed>,
+    /// The bytes held by a stream reset since the connection was last flushed. mplex queues
+    /// the Reset frame when the stream is dropped but sends it only with the next flush, which
+    /// it makes only through a stream; so the muxer flushes through another open stream, and
+    /// with none left it closes the connection (`StreamMuxer::poll` of mplex does nothing and
+    /// its connection flush is crate-private).
+    flush_owed: Option<usize>,
 }
 
 impl<M: StreamMuxer> BudgetedMuxer<M> {
     /// `inner`, with every stream it opens or accepts from now on counted against `budget`.
+    ///
+    /// Without the socket under it, which only [`Budgeted`] wraps, there is no read quota: a
+    /// pass reads each stream for as long as it has data, and frames for one stream that the
+    /// read of another pulls in wait inside `inner` until that stream is read.
     pub fn new(inner: M, budget: MuxerBudget) -> Self {
+        Self::with_pass(inner, budget, Arc::default())
+    }
+
+    fn with_pass(inner: M, budget: MuxerBudget, pass: Arc<Pass>) -> Self {
         Self {
             inner,
             budget,
+            pass,
             buffered: Arc::default(),
             streams: Vec::new(),
+            inbound: VecDeque::new(),
             scratch: vec![0; RECV_CHUNK].into_boxed_slice(),
-            exceeded: None,
-            flush_owed: false,
+            rotation: 0,
+            closed: None,
+            flush_owed: None,
         }
     }
 
@@ -344,13 +440,72 @@ impl<M: StreamMuxer> BudgetedMuxer<M> {
     }
 
     fn closed(&self) -> Result<(), BudgetedMuxerError<M::Error>> {
-        match self.exceeded {
-            Some(buffered) => Err(BudgetedMuxerError::BudgetExceeded {
+        match self.closed {
+            Some(Closed::Budget { buffered }) => Err(BudgetedMuxerError::BudgetExceeded {
                 buffered,
                 budget: self.budget.connection_bytes,
             }),
+            Some(Closed::Unresettable { held }) => Err(BudgetedMuxerError::StreamUnresettable {
+                held,
+                budget: self.budget.stream_bytes,
+            }),
+            Some(Closed::EmptyFrames) => Err(BudgetedMuxerError::EmptyFrameFlood),
+            Some(Closed::Queue { queued }) => Err(BudgetedMuxerError::TooManyQueuedStreams {
+                queued,
+                max: MPLEX_MAX_STREAMS,
+            }),
             None => Ok(()),
         }
+    }
+
+    /// The error for `e` from the wrapped muxer: the empty-frame flood when the quota socket
+    /// failed it for one, which closes the connection.
+    fn muxer_failed(&mut self, e: M::Error) -> BudgetedMuxerError<M::Error> {
+        if self.pass.flooded() {
+            if let Err(flood) = self.close(Closed::EmptyFrames) {
+                return flood;
+            }
+        }
+        BudgetedMuxerError::Muxer(e)
+    }
+
+    /// Closes the connection for good: every stream fails from now on, its bytes are freed and
+    /// its waiting reader and writer are woken.
+    fn close(&mut self, why: Closed) -> Result<(), BudgetedMuxerError<M::Error>> {
+        match why {
+            Closed::Budget { buffered } => {
+                self.budget.exceeded.inc();
+                tracing::warn!(
+                    buffered,
+                    budget = self.budget.connection_bytes,
+                    "closing a connection whose streams hold more unread bytes than its budget"
+                );
+            }
+            Closed::Unresettable { held } => {
+                self.budget.exceeded.inc();
+                tracing::warn!(
+                    held,
+                    budget = self.budget.stream_bytes,
+                    "closing a connection with a stream over its budget that mplex cannot reset"
+                );
+            }
+            // The quota socket logs the flood it found.
+            Closed::EmptyFrames => {}
+            Closed::Queue { queued } => {
+                self.budget.exceeded.inc();
+                tracing::warn!(
+                    queued,
+                    max = MPLEX_MAX_STREAMS,
+                    "closing a connection with more inbound streams waiting than mplex may hold"
+                );
+            }
+        }
+        self.closed = Some(why);
+        self.inbound.clear();
+        for held in self.streams.drain(..).filter_map(|held| held.upgrade()) {
+            lock(&held).shut(&self.buffered);
+        }
+        self.closed()
     }
 
     fn adopt(&mut self, inner: M::Substream) -> BudgetedStream<M::Substream> {
@@ -365,48 +520,138 @@ impl<M: StreamMuxer> BudgetedMuxer<M> {
 
 impl<M> BudgetedMuxer<M>
 where
-    M: StreamMuxer,
+    M: StreamMuxer + Unpin,
     M::Substream: Unpin,
 {
-    /// Reads every open stream into its buffer, then closes the connection if they hold more
-    /// than the budget.
+    /// One pass: moves what the streams hold into their buffers, then closes the connection if
+    /// they hold more than the budget.
+    ///
+    /// The pass first sweeps every stream with the socket shut, which moves the frames mplex
+    /// already holds; then it lets one stream at a time read the socket, starting at
+    /// `rotation`, and sweeps again after each read that took anything. A
+    /// burst mplex pulled in for one stream while another read is thereby moved before any
+    /// idle stream reads further, and the quota holds what one read can pull in for the others
+    /// to [`PASS_FRAMES`].
     fn drain(&mut self, cx: &mut Context<'_>) -> Result<(), BudgetedMuxerError<M::Error>> {
         self.streams.retain(|held| held.strong_count() > 0);
-        let limits = Limits {
-            stream_bytes: self.budget.stream_bytes,
-            connection_bytes: self.budget.connection_bytes,
-        };
-        for held in self.streams.iter().filter_map(Weak::upgrade) {
-            let reset = lock(&held).drain(cx, &mut self.scratch, limits, &self.buffered);
-            self.flush_owed |= reset;
-            let buffered = self.buffered.load(Ordering::Relaxed);
-            if buffered > limits.connection_bytes {
-                self.exceeded = Some(buffered);
-                self.budget.exceeded.inc();
-                tracing::warn!(
-                    buffered,
-                    budget = limits.connection_bytes,
-                    "closing a connection whose streams hold more unread bytes than its budget"
-                );
-                return self.closed();
+        self.pass.begin(cx.waker());
+        let rotation = self.rotation;
+        self.rotation = self.rotation.wrapping_add(1);
+        self.sweep(cx, rotation)?;
+        let streams = self.streams.len();
+        for k in 0..streams {
+            if self.pass.exhausted() || self.pass.flooded() {
+                break;
+            }
+            let before = self.pass.left();
+            self.drain_stream((rotation + k) % streams, cx)?;
+            if self.pass.left() != before {
+                self.sweep(cx, rotation)?;
             }
         }
-        if self.flush_owed {
-            self.flush_owed = !self.flush(cx);
+        if self.pass.flooded() {
+            return self.close(Closed::EmptyFrames);
+        }
+        if let Some(held) = self.flush_owed {
+            match self.flush(cx) {
+                Flush::Done => self.flush_owed = None,
+                Flush::Pending => {}
+                Flush::NoStream => return self.close(Closed::Unresettable { held }),
+            }
         }
         Ok(())
     }
 
-    /// Flushes the connection through the first open stream; whether that finished.
-    fn flush(&mut self, cx: &mut Context<'_>) -> bool {
+    /// With the socket shut, takes the inbound streams the muxer has queued, then drains every
+    /// stream, starting at `rotation`.
+    fn sweep(
+        &mut self,
+        cx: &mut Context<'_>,
+        rotation: usize,
+    ) -> Result<(), BudgetedMuxerError<M::Error>> {
+        self.pass.set_open(false);
+        let swept = self.take_inbound(cx).and_then(|()| {
+            let streams = self.streams.len();
+            (0..streams).try_for_each(|k| self.drain_stream((rotation + k) % streams, cx))
+        });
+        self.pass.set_open(true);
+        swept
+    }
+
+    /// Takes every inbound stream the muxer has queued into [`inbound`](Self::inbound), where
+    /// it is drained and counted until the swarm takes it. mplex queues an inbound stream as
+    /// soon as it reads its Open frame, and the swarm takes one per loop of its connection task,
+    /// each of which begins a pass; a queued stream left inside mplex would collect a pass of
+    /// frames per loop, uncounted, and be reset at its 257th. More than [`MPLEX_MAX_STREAMS`]
+    /// queued closes the connection: mplex holds no more streams than that, except that it
+    /// forgets a stream reset twice but keeps it queued, which a peer can repeat without limit.
+    fn take_inbound(&mut self, cx: &mut Context<'_>) -> Result<(), BudgetedMuxerError<M::Error>> {
+        loop {
+            match self.inner.poll_inbound_unpin(cx) {
+                Poll::Pending => return Ok(()),
+                Poll::Ready(Err(e)) => return Err(self.muxer_failed(e)),
+                Poll::Ready(Ok(inner)) => {
+                    let stream = self.adopt(inner);
+                    self.inbound.push_back(stream);
+                    let queued = self.inbound.len();
+                    if queued > MPLEX_MAX_STREAMS {
+                        return self.close(Closed::Queue { queued });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drains stream `index`, then closes the connection if it is over budget.
+    fn drain_stream(
+        &mut self,
+        index: usize,
+        cx: &mut Context<'_>,
+    ) -> Result<(), BudgetedMuxerError<M::Error>> {
+        let Some(held) = self.streams[index].upgrade() else {
+            return Ok(());
+        };
+        let limits = Limits {
+            stream_bytes: self.budget.stream_bytes,
+            connection_bytes: self.budget.connection_bytes,
+        };
+        let drained = lock(&held).drain(cx, &mut self.scratch, limits, &self.buffered);
+        match drained {
+            Drained::Kept => {}
+            Drained::Reset { held } => {
+                self.flush_owed = Some(self.flush_owed.map_or(held, |owed| owed.max(held)));
+            }
+            Drained::Unresettable { held } => return self.close(Closed::Unresettable { held }),
+        }
+        let buffered = self.buffered.load(Ordering::Relaxed);
+        if buffered > limits.connection_bytes {
+            return self.close(Closed::Budget { buffered });
+        }
+        Ok(())
+    }
+
+    /// Flushes the connection through the first open stream.
+    fn flush(&mut self, cx: &mut Context<'_>) -> Flush {
         for held in self.streams.iter().filter_map(Weak::upgrade) {
             if let Some(inner) = lock(&held).inner.as_mut() {
                 // An error is the connection's, and the connection reports it.
-                return Pin::new(inner).poll_flush(cx).is_ready();
+                return match Pin::new(inner).poll_flush(cx) {
+                    Poll::Ready(_) => Flush::Done,
+                    Poll::Pending => Flush::Pending,
+                };
             }
         }
-        false
+        Flush::NoStream
     }
+}
+
+/// How [`BudgetedMuxer::flush`] went.
+enum Flush {
+    Done,
+    /// The socket is not writable yet; mplex wakes the connection task when it is.
+    Pending,
+    /// No open stream is left to flush through.
+    NoStream,
 }
 
 impl<M> StreamMuxer for BudgetedMuxer<M>
@@ -424,8 +669,14 @@ where
     ) -> Poll<Result<Self::Substream, Self::Error>> {
         let this = self.get_mut();
         this.closed()?;
-        let stream =
-            ready!(this.inner.poll_inbound_unpin(cx)).map_err(BudgetedMuxerError::Muxer)?;
+        this.pass.register(cx.waker());
+        if let Some(stream) = this.inbound.pop_front() {
+            return Poll::Ready(Ok(stream));
+        }
+        let stream = match ready!(this.inner.poll_inbound_unpin(cx)) {
+            Ok(stream) => stream,
+            Err(e) => return Poll::Ready(Err(this.muxer_failed(e))),
+        };
         Poll::Ready(Ok(this.adopt(stream)))
     }
 
@@ -435,8 +686,11 @@ where
     ) -> Poll<Result<Self::Substream, Self::Error>> {
         let this = self.get_mut();
         this.closed()?;
-        let stream =
-            ready!(this.inner.poll_outbound_unpin(cx)).map_err(BudgetedMuxerError::Muxer)?;
+        this.pass.register(cx.waker());
+        let stream = match ready!(this.inner.poll_outbound_unpin(cx)) {
+            Ok(stream) => stream,
+            Err(e) => return Poll::Ready(Err(this.muxer_failed(e))),
+        };
         Poll::Ready(Ok(this.adopt(stream)))
     }
 
@@ -466,6 +720,29 @@ pub struct BudgetedStream<S> {
     buffered: Arc<AtomicUsize>,
 }
 
+impl<S> BudgetedStream<S> {
+    /// Runs a write-side `op` on the inner stream, remembering the task it leaves waiting so
+    /// that a reset can wake it.
+    fn write_side<T>(
+        &self,
+        cx: &mut Context<'_>,
+        op: impl FnOnce(&mut S, &mut Context<'_>) -> Poll<io::Result<T>>,
+    ) -> Poll<io::Result<T>> {
+        let mut held = lock(&self.held);
+        let Some(inner) = held.inner.as_mut() else {
+            return Poll::Ready(Err(match held.read {
+                ReadState::Closed => closed_error(),
+                _ => reset_error(),
+            }));
+        };
+        let poll = op(inner, cx);
+        if poll.is_pending() {
+            held.writer = Some(cx.waker().clone());
+        }
+        poll
+    }
+}
+
 impl<S: AsyncRead + Unpin> AsyncRead for BudgetedStream<S> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -491,6 +768,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for BudgetedStream<S> {
             (ReadState::Eof, _) => return Poll::Ready(Ok(0)),
             (ReadState::Failed(kind), _) => return Poll::Ready(Err((*kind).into())),
             (ReadState::Open | ReadState::Reset, _) => return Poll::Ready(Err(reset_error())),
+            (ReadState::Closed, _) => return Poll::Ready(Err(closed_error())),
         };
         match Pin::new(inner).poll_read(cx, out) {
             Poll::Pending => {
@@ -516,24 +794,18 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for BudgetedStream<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match lock(&self.held).inner.as_mut() {
-            Some(inner) => Pin::new(inner).poll_write(cx, buf),
-            None => Poll::Ready(Err(reset_error())),
-        }
+        self.write_side(cx, |inner, cx| Pin::new(inner).poll_write(cx, buf))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match lock(&self.held).inner.as_mut() {
-            Some(inner) => Pin::new(inner).poll_flush(cx),
-            None => Poll::Ready(Err(reset_error())),
-        }
+        self.write_side(cx, |inner, cx| Pin::new(inner).poll_flush(cx))
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match lock(&self.held).inner.as_mut() {
-            Some(inner) => Pin::new(inner).poll_close(cx),
-            None => Poll::Ready(Err(reset_error())),
-        }
+        // mplex sends the Close frame before it flushes, so the stream counts as closed for
+        // writing from the first call, finished or not.
+        lock(&self.held).write_closed = true;
+        self.write_side(cx, |inner, cx| Pin::new(inner).poll_close(cx))
     }
 }
 
@@ -557,6 +829,8 @@ enum ReadState {
     Failed(io::ErrorKind),
     /// Reset for holding more than its budget.
     Reset,
+    /// The connection was closed.
+    Closed,
 }
 
 /// One stream, shared by the [`BudgetedStream`] and the muxer that drains it.
@@ -569,12 +843,31 @@ struct Held<S> {
     error: Option<io::Error>,
     /// The task last left waiting on a read.
     reader: Option<Waker>,
+    /// The task last left waiting on a write, flush or close; mplex wakes writers only when the
+    /// socket is writable, so a reset must wake it.
+    writer: Option<Waker>,
+    /// The application has closed, or begun to close, its side. mplex sends no Reset for such a
+    /// stream when it is dropped, so it cannot be reset.
+    write_closed: bool,
 }
 
 #[derive(Clone, Copy)]
 struct Limits {
     stream_bytes: usize,
     connection_bytes: usize,
+}
+
+/// What [`Held::drain`] did to the stream.
+enum Drained {
+    Kept,
+    /// Reset for holding `held` bytes, over its budget.
+    Reset {
+        held: usize,
+    },
+    /// Over its budget with `held` bytes, but closed for writing, so not resettable.
+    Unresettable {
+        held: usize,
+    },
 }
 
 impl<S> Held<S> {
@@ -585,23 +878,41 @@ impl<S> Held<S> {
             read: ReadState::Open,
             error: None,
             reader: None,
+            writer: None,
+            write_closed: false,
+        }
+    }
+
+    /// Fails the stream for good once its connection is closed: frees its bytes, drops the
+    /// inner stream and wakes whoever waits on it.
+    fn shut(&mut self, buffered: &AtomicUsize) {
+        buffered.fetch_sub(self.buf.len(), Ordering::Relaxed);
+        self.buf = RecvBuf::default();
+        self.inner = None;
+        self.read = ReadState::Closed;
+        self.error = None;
+        for waiter in [self.reader.take(), self.writer.take()]
+            .into_iter()
+            .flatten()
+        {
+            waiter.wake();
         }
     }
 }
 
 impl<S: AsyncRead + Unpin> Held<S> {
     /// Reads the stream into its buffer until it has nothing more, ends, fails, passes its
-    /// budget (reset), or the connection passes its budget (left for the muxer to close).
-    /// Whether it reset the stream.
+    /// budget (reset, or left for the muxer to close the connection if it cannot be reset), or
+    /// the connection passes its budget (left for the muxer to close).
     fn drain(
         &mut self,
         cx: &mut Context<'_>,
         scratch: &mut [u8],
         limits: Limits,
         buffered: &AtomicUsize,
-    ) -> bool {
+    ) -> Drained {
         let mut changed = false;
-        let mut reset = false;
+        let mut drained = Drained::Kept;
         while let (ReadState::Open, Some(inner)) = (&self.read, self.inner.as_mut()) {
             match Pin::new(inner).poll_read(cx, scratch) {
                 Poll::Pending => break,
@@ -609,9 +920,14 @@ impl<S: AsyncRead + Unpin> Held<S> {
                 Poll::Ready(Ok(n)) => {
                     self.buf.push(&scratch[..n]);
                     let total = buffered.fetch_add(n, Ordering::Relaxed) + n;
-                    if self.buf.len() > limits.stream_bytes {
+                    let held = self.buf.len();
+                    if held > limits.stream_bytes && self.write_closed {
+                        drained = Drained::Unresettable { held };
+                        changed = true;
+                        break;
+                    } else if held > limits.stream_bytes {
                         self.reset(buffered, limits.stream_bytes);
-                        reset = true;
+                        drained = Drained::Reset { held };
                     } else if total > limits.connection_bytes {
                         changed = true;
                         break;
@@ -629,10 +945,11 @@ impl<S: AsyncRead + Unpin> Held<S> {
                 reader.wake();
             }
         }
-        reset
+        drained
     }
 
-    /// Frees the buffer and drops the inner stream, which resets it.
+    /// Frees the buffer and drops the inner stream, which resets it, and wakes a waiting
+    /// writer to see the reset.
     fn reset(&mut self, buffered: &AtomicUsize, stream_bytes: usize) {
         tracing::debug!(
             held = self.buf.len(),
@@ -643,6 +960,9 @@ impl<S: AsyncRead + Unpin> Held<S> {
         self.buf = RecvBuf::default();
         self.inner = None;
         self.read = ReadState::Reset;
+        if let Some(writer) = self.writer.take() {
+            writer.wake();
+        }
     }
 }
 
@@ -704,6 +1024,13 @@ fn reset_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::ConnectionReset,
         "stream reset: it held more unread bytes than its budget",
+    )
+}
+
+fn closed_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "the connection was closed: it broke its budget",
     )
 }
 
