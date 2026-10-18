@@ -14,14 +14,19 @@
 //!    `vc_image` (unless `use_separate_vc: false`), and every `participants_matrix` `el[]`,
 //!    `cl[]` and `vc[]` entry sets its own image: an omitted image is the package default, a
 //!    floating tag.
-//! 3. Every `additional_services` entry `<svc>` sets `<svc>_params.image`. This is the
-//!    package's naming for the services this devnet uses (spamoor, dora, buildoor, assertoor,
-//!    ...); a service whose images live under other keys fails closed until the rule learns them.
+//! 3. Every `additional_services` entry `<svc>` sets each of its image keys under
+//!    `<svc>_params`, as listed in [`SERVICE_IMAGE_KEYS`] (blockscout has three). A service
+//!    that is not listed there fails closed until the list learns its keys.
 //! 4. `ethereum_genesis_generator_params.image` is set: it builds the genesis state, so a
 //!    floating generator could change the genesis root between two runs.
+//! 5. The file names at least one participant: a non-empty `participants` list, or a
+//!    `participants_matrix` whose `el` and `cl` lists are non-empty (and `count`, if set, is at
+//!    least 1). The package turns a file with neither into one default participant, which runs
+//!    the default (floating) client images.
 //!
-//! Images the package starts from its own constants (helpers such as yq or eth2-val-tools)
-//! are not in the args file; they are fixed only by the pinned package commit.
+//! Images the package starts from its own constants (helpers such as yq or eth2-val-tools, or
+//! blockscout's postgres) are not in the args file; they are fixed only by the pinned package
+//! commit.
 
 use crate::{check_yaml_dir, Report, Violation};
 use std::path::Path;
@@ -61,6 +66,7 @@ pub fn check_args_file(name: &str, text: &str) -> Vec<Violation> {
     c.image_values(doc, "");
     c.participants(doc);
     c.participants_matrix(doc);
+    c.participant_set(doc);
     c.additional_services(doc);
     if get(doc, "ethereum_genesis_generator_params")
         .and_then(|p| get(p, "image"))
@@ -125,6 +131,34 @@ fn is_component(s: &str) -> bool {
             b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
         })
 }
+
+/// The image keys under `<service>_params` of every `additional_services` entry whose images
+/// the args file can pin, sorted by service. Read from ethereum-package at the pinned commit
+/// `3416a0252e5bc25a0d31d24fea9c46707447eb08`: `src/package_io/sanity_check.star`
+/// (`SUBCATEGORY_PARAMS`, the keys the package accepts), `src/package_io/input_parser.star`
+/// (`get_default_<service>_params`, their defaults) and each service's launcher (the images it
+/// starts). Left out, so they fail closed: services the package starts only from its own
+/// constants (broadcaster, forkmon, blobscan, dugtrio, erpc, forky, apache, nginx, tracoor,
+/// otel), the unsupported `prometheus_grafana`, and zkboost, whose ere-server images the
+/// package derives from the zkboost image tag.
+pub const SERVICE_IMAGE_KEYS: &[(&str, &[&str])] = &[
+    ("assertoor", &["image"]),
+    ("blockscout", &["image", "verif_image", "frontend_image"]),
+    ("bootnodoor", &["image"]),
+    ("buildoor", &["image"]),
+    ("checkpointz", &["image"]),
+    ("disruptoor", &["image"]),
+    ("dora", &["image"]),
+    ("grafana", &["image"]),
+    ("mempool_bridge", &["image"]),
+    ("prometheus", &["image"]),
+    ("rakoon", &["image"]),
+    ("slashoor", &["image"]),
+    ("spamoor", &["image"]),
+    ("tempo", &["image"]),
+    ("trueblocks", &["image"]),
+    ("tx_fuzz", &["image"]),
+];
 
 fn is_image_key(k: &str) -> bool {
     let k = k.to_ascii_lowercase();
@@ -267,6 +301,54 @@ impl Lint<'_> {
         }
     }
 
+    /// Rule 5. Counts the participants the package would build: the `participants` entries
+    /// plus `el` x `cl` x max(`vc`, 1) x `count` from the matrix (`remote_signer` only
+    /// multiplies by at least 1). A `participants` that is not a list is reported by rule 2.
+    fn participant_set(&mut self, doc: &Yaml) {
+        let listed = get(doc, "participants");
+        let Some(matrix) = get(doc, "participants_matrix") else {
+            match listed {
+                None => self.error(
+                    "neither participants nor participants_matrix is set: the package runs one \
+                     default participant on floating images"
+                        .into(),
+                ),
+                Some(Yaml::Array(items)) if items.is_empty() => {
+                    self.error("participants is empty: the devnet has no participant".into())
+                }
+                Some(_) => {}
+            }
+            return;
+        };
+        let listed = match listed {
+            Some(Yaml::Array(items)) => items.len(),
+            _ => 0,
+        };
+        let len = |layer: &str| match get(matrix, layer) {
+            Some(Yaml::Array(items)) => items.len(),
+            _ => 0,
+        };
+        let count = match get(matrix, "count") {
+            None => 1,
+            Some(Yaml::Integer(n)) => usize::try_from(*n).unwrap_or(0),
+            Some(other) => {
+                self.error(format!(
+                    "participants_matrix.count is not an integer: {}",
+                    describe(other)
+                ));
+                return;
+            }
+        };
+        let from_matrix = len("el") * len("cl") * len("vc").max(1) * count;
+        if listed == 0 && from_matrix == 0 {
+            self.error(
+                "participants_matrix yields no participant (it needs non-empty el and cl lists \
+                 and a count of at least 1), and participants lists none"
+                    .into(),
+            );
+        }
+    }
+
     /// Rule 3.
     fn additional_services(&mut self, doc: &Yaml) {
         let services = match get(doc, "additional_services") {
@@ -283,11 +365,20 @@ impl Lint<'_> {
                 continue;
             };
             let params = format!("{svc}_params");
-            if get(doc, &params).and_then(|p| get(p, "image")).is_none() {
+            let Some((_, keys)) = SERVICE_IMAGE_KEYS.iter().find(|(s, _)| *s == svc) else {
                 self.error(format!(
-                    "additional service {svc}: {params}.image is not set: the package default \
-                     is a floating tag"
+                    "additional service {svc}: its image keys are not known to this lint: add \
+                     them to SERVICE_IMAGE_KEYS from the pinned ethereum-package, or drop it"
                 ));
+                continue;
+            };
+            for key in *keys {
+                if get(doc, &params).and_then(|p| get(p, key)).is_none() {
+                    self.error(format!(
+                        "additional service {svc}: {params}.{key} is not set: the package \
+                         default is a floating tag"
+                    ));
+                }
             }
         }
     }

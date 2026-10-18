@@ -37,7 +37,12 @@ exactly this file's builder setup; and its default genesis generator is 6.2.6, t
 below.
 
 Every image in `gloas-genesis.yaml` is pinned as `repo:tag@sha256:<index digest>`, and none is
-left to a package default. `scripts/check-kurtosis-pins.sh` (in CI) fails otherwise. The digests
+left to a package default. `scripts/check-kurtosis-pins.sh` (in CI) fails otherwise: it also
+requires every image key of each additional service (blockscout, for one, has `image`,
+`verif_image` and `frontend_image`, read from the package's `sanity_check.star` and
+`input_parser.star` at the pinned commit), fails closed on a service whose keys it does not
+know, and requires a non-empty `participants` or `participants_matrix` (without either, the
+package runs one default participant on floating images). The digests
 are the multi-arch index digests (linux/amd64 and linux/arm64) that
 `docker buildx imagetools inspect <repo:tag>` printed on **2026-10-18**.
 
@@ -58,10 +63,21 @@ pinned rather than the moving tag because its name says which source the digest 
 
 ### consensus-specs v1.7.0-beta.4, per client
 
-What was confirmed, and how. None of these images carries a source-revision label, and no
-binary was run (downloaded images are treated as data), so for each one the link from image to
-source commit rests on ethpandaops' `<branch>-<short sha>` tag naming and on the tag's push
-time on Docker Hub.
+What was confirmed, and how. No binary was run (downloaded images are treated as data). The
+image labels were read from the registry on 2026-10-18 with
+`docker buildx imagetools inspect --format '{{json .Image}}' <repo:tag@digest>`, which fetches the
+image config without pulling or running it:
+
+- `ethpandaops/lighthouse:unstable-c8ddac7` carries `commit=c8ddac7`,
+  `ethpandaops.io.repo=sigp/lighthouse` and `ethpandaops.io.commitRef=unstable` on both
+  platforms, so its link to sigp/lighthouse `c8ddac7b79d4` rests on its own labels.
+- `ethereum/client-go:v1.17.8` carries `commit=a579077007b98217c3e253a66e4b452ca0c32b96`, the
+  commit of the go-ethereum tag `v1.17.8`.
+- The Lodestar, buildoor, spamoor, dora and genesis generator images carry no labels, so for
+  those the link from image to source commit rests on ethpandaops' `<branch>-<short sha>` tag
+  naming (or the release tag) and on the tag's push time on Docker Hub.
+
+The spec version, per client:
 
 - **Lighthouse: beta.4 at the source.** At `c8ddac7b`, `testing/ef_tests/Makefile` has
   `CONSENSUS_SPECS_TEST_VERSION ?= v1.7.0-beta.4`. The commit is 26 commits after `0c3765ea`
@@ -170,7 +186,14 @@ enclaves at the same time instead (`ethswarm-gloas-a` and `ethswarm-gloas-b`, sa
 
 `check-devnet.sh ENCLAVE` finds every `cl-<n>-*` service with `kurtosis enclave inspect`, reads
 each one's beacon API through `kurtosis port print ENCLAVE <service> http`, and prints evidence
-and a verdict per criterion. It exits 0 only if every criterion passes:
+and a verdict per criterion. It prints `verdict: PASS (3/3 criteria)` and exits 0 only on an
+acceptance run where every criterion passes. An acceptance run checks every CL service the
+enclave runs, at least 2 distinct ones, with `--min-finalized-epoch` of at least 3. A run that
+misses any of these (`--services` naming a subset of the enclave's CLs, a one-CL enclave, or a
+lower threshold) prints one `diagnostic:` line per reason and, if every criterion passes,
+`verdict: DIAGNOSTIC (...)` with exit 3: useful while debugging, but never acceptance evidence.
+A `--services` CL that the enclave does not run is a setup error (exit 2), and a failed
+criterion is `verdict: FAIL` (exit 1) either way. The criteria:
 
 - `genesis`: every CL reports the same `genesis_time`, `genesis_validators_root`,
   `genesis_fork_version`, genesis block root and genesis state root. With `--reference`, they
@@ -179,8 +202,9 @@ and a verdict per criterion. It exits 0 only if every criterion passes:
   Gloas version at epoch 0 and in force there, every CL serves the same schedule, and the fork
   digests in the CLs' own ENRs (`eth2` entry) agree.
 - `finality`: every CL's finalized epoch (`/eth/v1/beacon/states/head/finality_checkpoints`) is
-  at least 3 (`--min-finalized-epoch`), on one finalized checkpoint (epoch and root). This is
-  polled `--attempts` times (default 40), `--interval` seconds apart (default 12).
+  at least 3 (`--min-finalized-epoch`; below 3 the run is DIAGNOSTIC), on one finalized
+  checkpoint (epoch and root). This is polled `--attempts` times (default 40), `--interval`
+  seconds apart (default 12).
 
 Two runs from a clean engine (criteria 1, 2 and 4 of the issue). Record the wall time and
 `docker stats --no-stream` for CI sizing:

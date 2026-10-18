@@ -344,3 +344,134 @@ fn check_dir_reads_every_yaml_file_and_fails_closed() {
     std::fs::remove_dir_all(&dir).unwrap();
     assert!(check_dir(&dir).is_err());
 }
+
+/// `good()` without its `participants` list.
+fn without_participants() -> String {
+    let start = good().find("participants:\n").unwrap();
+    let end = good().find("network_params:\n").unwrap();
+    let mut text = good();
+    text.replace_range(start..end, "");
+    text
+}
+
+/// A `participants_matrix` with one pinned EL, CL and VC entry.
+fn matrix() -> String {
+    let geth = pinned("ethereum/client-go:v1.17.8");
+    let lh = pinned("ethpandaops/lighthouse:unstable-c8ddac7");
+    format!(
+        "participants_matrix:\n  el:\n    - el_type: geth\n      el_image: {geth}\n  \
+         cl:\n    - cl_type: lighthouse\n      cl_image: {lh}\n  vc:\n    - vc_type: lighthouse\n      \
+         vc_image: {lh}\n"
+    )
+}
+
+#[test]
+fn a_file_without_participants_or_a_matrix_fails() {
+    // The package turns a missing `participants` into one default participant, which runs the
+    // default (floating) client images.
+    let text = without_participants();
+    assert!(
+        !text.contains("participants"),
+        "fixture still has participants"
+    );
+    assert_flags(&text, "neither participants nor participants_matrix is set");
+}
+
+#[test]
+fn an_empty_participant_set_fails() {
+    assert_flags(
+        &format!("{}participants: []\n", without_participants()),
+        "no participant",
+    );
+    for empty in [
+        "participants_matrix: {}\n".to_owned(),
+        matrix().replacen("  cl:\n", "  cl: []\n  unused:\n", 1),
+        matrix().replacen("  el:\n", "  el: []\n  unused:\n", 1),
+        format!("{}  count: 0\n", matrix()),
+    ] {
+        assert_flags(
+            &format!("{}{empty}", without_participants()),
+            "participants_matrix yields no participant",
+        );
+    }
+    assert_flags(
+        &format!("{}{}  count: two\n", without_participants(), matrix()),
+        "participants_matrix.count is not an integer",
+    );
+}
+
+#[test]
+fn either_participant_form_alone_passes() {
+    assert_eq!(messages(&good()), Vec::<String>::new());
+    let matrix_only = format!("{}{}", without_participants(), matrix());
+    assert_eq!(messages(&matrix_only), Vec::<String>::new());
+    let counted = format!("{matrix_only}  count: 2\n");
+    assert_eq!(messages(&counted), Vec::<String>::new());
+    // An empty list next to a matrix that yields participants is fine.
+    let both = format!("{}participants: []\n{}", without_participants(), matrix());
+    assert_eq!(messages(&both), Vec::<String>::new());
+}
+
+#[test]
+fn blockscout_must_pin_every_image_key() {
+    let only_image = format!(
+        "{}blockscout_params:\n  image: {}\n",
+        good().replacen(
+            "additional_services:\n  - spamoor\n",
+            "additional_services:\n  - spamoor\n  - blockscout\n",
+            1,
+        ),
+        pinned("ghcr.io/blockscout/blockscout:9.0.2"),
+    );
+    let found = messages(&only_image);
+    for key in ["verif_image", "frontend_image"] {
+        assert_flags(
+            &only_image,
+            &format!("additional service blockscout: blockscout_params.{key} is not set"),
+        );
+    }
+    assert!(
+        !found.iter().any(|m| m.contains("blockscout_params.image ")),
+        "{found:?}"
+    );
+    let all = format!(
+        "{only_image}  verif_image: {}\n  frontend_image: {}\n",
+        pinned("ghcr.io/blockscout/smart-contract-verifier:v1.9.0"),
+        pinned("ghcr.io/blockscout/frontend:v2.0.0"),
+    );
+    assert_eq!(messages(&all), Vec::<String>::new());
+}
+
+#[test]
+fn a_service_without_known_image_keys_fails_closed() {
+    for svc in ["forky", "zkboost", "prometheus_grafana", "made_up"] {
+        let text = good().replacen(
+            "additional_services:\n  - spamoor\n",
+            &format!(
+                "additional_services:\n  - spamoor\n  - {svc}\n{svc}_params:\n  image: {}\n",
+                pinned("x/y:z")
+            ),
+            1,
+        );
+        assert_flags(
+            &text,
+            &format!("additional service {svc}: its image keys are not known"),
+        );
+    }
+}
+
+#[test]
+fn every_known_service_names_its_image_keys() {
+    let services: Vec<&str> = SERVICE_IMAGE_KEYS.iter().map(|(s, _)| *s).collect();
+    let mut sorted = services.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(services, sorted, "SERVICE_IMAGE_KEYS is sorted and unique");
+    for (svc, keys) in SERVICE_IMAGE_KEYS {
+        assert!(!keys.is_empty(), "{svc} has no image keys");
+        assert!(keys.iter().all(|k| is_image_key(k)), "{svc}: {keys:?}");
+    }
+    for svc in ["buildoor", "dora", "spamoor"] {
+        assert!(services.contains(&svc), "the devnet's {svc} is listed");
+    }
+}

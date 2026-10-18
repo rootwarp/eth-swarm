@@ -150,21 +150,26 @@ TXT
 }
 
 # run <expect-exit> <description> <pattern...> -- <args...>: runs the script (fast polls) and
-# wants the exit code and a line matching each extended regex.
+# wants the exit code and a line matching each extended regex; a pattern `!<regex>` wants no
+# line matching <regex>.
 run() {
-  local expect=$1 desc=$2 rc=0 out p missing=
+  local expect=$1 desc=$2 rc=0 out p missing= unwanted=
   shift 2
   local patterns=()
   while (($# > 0)) && [[ $1 != -- ]]; do patterns+=("$1"); shift; done
   shift
   out=$(PATH="$stubs:$PATH" bash "$script" --interval 0 --attempts 3 "$@" 2>&1) || rc=$?
   for p in ${patterns[@]+"${patterns[@]}"}; do
-    printf '%s\n' "$out" | grep -Eq -- "$p" || missing="$missing /$p/"
+    if [[ $p == !* ]]; then
+      ! printf '%s\n' "$out" | grep -Eq -- "${p#!}" || unwanted="$unwanted /${p#!}/"
+    else
+      printf '%s\n' "$out" | grep -Eq -- "$p" || missing="$missing /$p/"
+    fi
   done
-  if ((rc == expect)) && [[ -z $missing ]]; then
+  if ((rc == expect)) && [[ -z $missing && -z $unwanted ]]; then
     ok "$desc"
   else
-    bad "$desc (exit $rc, want $expect${missing:+; no line matching$missing})" "$out"
+    bad "$desc (exit $rc, want $expect${missing:+; no line matching$missing}${unwanted:+; a line matching$unwanted})" "$out"
   fi
 }
 
@@ -176,7 +181,7 @@ run 0 "two agreeing CLs at finalized epoch 4 pass every criterion" \
   '^genesis: PASS' '^fork_schedule: PASS' '^finality: PASS' '^verdict: PASS \(3/3 criteria\)$' \
   "^cl-2-lodestar-geth: genesis_state_root $STATE$" \
   '^cl-1-lighthouse-geth: fork_digest 0x01020304$' \
-  "^cl-1-lighthouse-geth: finalized epoch 4 root $FIN$" \
+  "^cl-1-lighthouse-geth: finalized epoch 4 root $FIN$" '!^diagnostic:' \
   -- ethswarm-gloas
 if grep -q '^enclave inspect ethswarm-gloas$' "$STUB_DIR/kurtosis.log" &&
    grep -q '^port print ethswarm-gloas cl-2-lodestar-geth http$' "$STUB_DIR/kurtosis.log"; then
@@ -186,10 +191,45 @@ else
 fi
 if ! grep -q 'buildoor\|vc-1\|el-1' "$STUB_DIR/kurtosis.log"; then ok "only cl-<n>-* services are queried"; else bad "only cl-<n>-* services are queried" "$(cat "$STUB_DIR/kurtosis.log")"; fi
 
+# --- which CLs: the enclave's full set, at least two -------------------------------------------
+
 base
-run 0 "--services picks the CLs instead of enclave inspect" '^devnet ethswarm-gloas: 1 CL services: cl-2-lodestar-geth$' \
+run 3 "a --services subset is a DIAGNOSTIC run, never an acceptance PASS" \
+  '^devnet ethswarm-gloas: 1 CL services: cl-2-lodestar-geth$' \
+  '^diagnostic: --services checks 1 of the enclave.s 2 CLs \(not checked: cl-1-lighthouse-geth\)$' \
+  '^verdict: DIAGNOSTIC \(3/3 criteria passed; not an acceptance run\)$' '!^verdict: PASS' \
   -- --services cl-2-lodestar-geth ethswarm-gloas
-if ! grep -q '^enclave inspect' "$STUB_DIR/kurtosis.log"; then ok "--services skips enclave inspect"; else bad "--services skips enclave inspect"; fi
+if grep -q '^enclave inspect ethswarm-gloas$' "$STUB_DIR/kurtosis.log"; then ok "--services is checked against enclave inspect"; else bad "--services is checked against enclave inspect" "$(cat "$STUB_DIR/kurtosis.log")"; fi
+
+base
+run 0 "--services naming the enclave's every CL is an acceptance run" \
+  '^devnet ethswarm-gloas: 2 CL services: cl-2-lodestar-geth cl-1-lighthouse-geth$' \
+  '^verdict: PASS \(3/3 criteria\)$' '!^diagnostic:' \
+  -- --services 'cl-2-lodestar-geth cl-1-lighthouse-geth' ethswarm-gloas
+
+base
+run 3 "a CL named twice counts once" '^devnet ethswarm-gloas: 1 CL services: cl-1-lighthouse-geth$' \
+  '^diagnostic: only 1 distinct CL; an acceptance run needs at least 2$' '!^verdict: PASS' \
+  -- --services 'cl-1-lighthouse-geth cl-1-lighthouse-geth' ethswarm-gloas
+
+base
+run 2 "a --services CL that the enclave does not run is a setup error" \
+  '^ERROR: cl-3-teku-geth: not a CL service of enclave ethswarm-gloas' \
+  -- --services 'cl-1-lighthouse-geth cl-3-teku-geth' ethswarm-gloas
+
+base
+sed -i.bak '/cl-2-/d' "$STUB_DIR/inspect.ethswarm-gloas"
+run 3 "a one-CL enclave is a DIAGNOSTIC run, never an acceptance PASS" \
+  '^devnet ethswarm-gloas: 1 CL services: cl-1-lighthouse-geth$' \
+  '^diagnostic: only 1 distinct CL; an acceptance run needs at least 2$' \
+  '^verdict: DIAGNOSTIC \(3/3 criteria passed; not an acceptance run\)$' '!^verdict: PASS' \
+  -- ethswarm-gloas
+
+base
+sed -i.bak '/cl-2-/d' "$STUB_DIR/inspect.ethswarm-gloas"
+edit cl-1-lighthouse-geth eth_v1_config_spec 's/"GLOAS_FORK_EPOCH":"0"/"GLOAS_FORK_EPOCH":"8"/'
+run 1 "a failed criterion on a DIAGNOSTIC run is still a FAIL" '^verdict: FAIL \(fork_schedule\)$' '!^verdict: (PASS|DIAGNOSTIC)' \
+  -- ethswarm-gloas
 
 base
 printf '127.0.0.1:32811\n' > "$STUB_DIR/port.cl-2-lodestar-geth.http"
@@ -314,6 +354,17 @@ if ((n == 6)); then ok "finality is polled --attempts times per CL"; else bad "f
 base
 finalized cl-1-lighthouse-geth 2 "$FIN" 1; finalized cl-2-lodestar-geth 2 "$FIN" 1
 run 0 "finality that reaches epoch 4 on the second poll passes" '^finality: PASS on poll 2 of 3' -- ethswarm-gloas
+
+base
+for n in 0 2; do
+  run 3 "--min-finalized-epoch $n (below 3) is a DIAGNOSTIC run, never an acceptance PASS" \
+    "^diagnostic: --min-finalized-epoch $n is below 3, the acceptance threshold$" \
+    "^finality: PASS on poll 1 of 3 \(finalized epoch >= $n" \
+    '^verdict: DIAGNOSTIC \(3/3 criteria passed; not an acceptance run\)$' '!^verdict: PASS' \
+    -- --min-finalized-epoch "$n" ethswarm-gloas
+done
+run 0 "--min-finalized-epoch 3 is an acceptance run" '^verdict: PASS \(3/3 criteria\)$' '!^diagnostic:' \
+  -- --min-finalized-epoch 3 ethswarm-gloas
 
 base
 run 1 "--min-finalized-epoch 5 fails at epoch 4" '^- finalized epoch 4 is below 5 on cl-1-lighthouse-geth$' -- --min-finalized-epoch 5 ethswarm-gloas
