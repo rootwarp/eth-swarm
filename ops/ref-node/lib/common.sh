@@ -62,6 +62,42 @@ release_row() {
     }'
 }
 
+# service_repo <reth|lighthouse>: the repository the service's image must come from, spelled
+# as README.md's tables spell it; 1 for any other service. The one map of service to repository:
+# the README's Client cell is hand-editable, so it never decides alone which client an image is.
+service_repo() {
+  case $1 in
+    reth) echo ghcr.io/paradigmxyz/reth ;;
+    lighthouse) echo sigp/lighthouse ;;
+    *) return 1 ;;
+  esac
+}
+
+# image_repo <image ref>: the repository part of the ref, everything before the tag's ':' or
+# the '@'. A ':' before the last '/' is a registry port and stays (host:5000/repo).
+image_repo() {
+  local repo=${1%%@*}
+  if [[ ${repo##*/} == *:* ]]; then repo=${repo%:*}; fi
+  printf '%s\n' "$repo"
+}
+
+# repo_check <variable> <service> <image ref>: 0 if the image's repository is exactly the
+# service's own (service_repo); else one line naming the variable, the repository it has and
+# the one it wants, and 1. preflight.sh and collect-run-log.sh check it before release_row, so
+# a README.md row that names the wrong client, or a lookalike repository (reth-evil,
+# lighthouse2, docker.io/sigp/lighthouse), never vouches for an image.
+repo_check() {
+  local want got
+  if ! want=$(service_repo "$2"); then
+    echo "$1: $2 has no known image repository"
+    return 1
+  fi
+  got=$(image_repo "$3")
+  [[ $got == "$want" ]] && return 0
+  echo "$1: repository $got is not $2's (want $want)"
+  return 1
+}
+
 # release_client <README.md> <network> <image ref>: the Client cell of the first row of the
 # network's table whose Image cell is `<image ref>`; nothing when there is no such row. Only a
 # diagnosis (which client a refused pin belongs to): release_row decides.

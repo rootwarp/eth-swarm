@@ -14,10 +14,12 @@
 #      no extra group or device, no host PID/IPC/UTS namespace, a private cgroup namespace,
 #      docker's masked and read-only paths, exactly its data and read-only JWT mounts and a
 #      noexec,nosuid,nodev /tmp tmpfs), every process's ruid/euid (`docker top`) the .env uid;
-#      each container's `--version`; and the row of README.md's release-note table for the
-#      network whose Image cell is the pinned image and whose Client cell is the service
-#      (copied into the log): no row fails, so does another client's row (the pins swapped
-#      between the services) and a row that says the release does not schedule the network's
+#      each container's `--version`; each image from its service's own repository, exactly
+#      (lib/common.sh repo_check: ghcr.io/paradigmxyz/reth, sigp/lighthouse; checked first, so
+#      a hand-edited row cannot vouch for another client's image or a lookalike); and the row
+#      of README.md's release-note table for the network whose Image cell is the pinned image
+#      and whose Client cell is the service (copied into the log): no row fails, so does
+#      another client's row and a row that says the release does not schedule the network's
 #      fork. The consensus-specs release the CL row records is printed, with a "spec version
 #      differs from ours" line when it is not ours (lib/common.sh OUR_CONSENSUS_SPECS; not a
 #      FAIL);
@@ -181,9 +183,16 @@ for svc in reth lighthouse; do
       if [[ $'\n'$digests$'\n' != *"@$digest"$'\n'* ]]; then
         echo "${pre}_IMAGE: the local image's RepoDigests lack $digest: FAIL"; bad=1
       fi
-      row=$(release_row "$here/README.md" "$network" "$svc" "$image")
-      client=$(release_client "$here/README.md" "$network" "$image")
-      if [[ -z $row && -n $client ]]; then
+      # The repository first: README.md is hand-editable, so its Client cell alone never
+      # vouches; an image from another repository has no row looked up.
+      row='' client=''
+      if repo_line=$(repo_check "${pre}_IMAGE" "$svc" "$image"); then
+        row=$(release_row "$here/README.md" "$network" "$svc" "$image")
+        client=$(release_client "$here/README.md" "$network" "$image")
+      fi
+      if [[ -n $repo_line ]]; then
+        echo "$repo_line: FAIL"; bad=1
+      elif [[ -z $row && -n $client ]]; then
         echo "$svc $tag: ${pre}_IMAGE is a $client image in README.md's $network table, not $svc's: FAIL"; bad=1
       elif [[ -z $row ]]; then
         echo "$svc $tag: no $network row in README.md's release notes for this image: FAIL"; bad=1

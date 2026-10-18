@@ -98,10 +98,16 @@ capture window. When both data roots share a filesystem, the free space must cov
 
 `.env.example` and `.env.hoodi.example` pin these (tag and multi-arch index digest): Sepolia
 runs releases, Hoodi two dev builds until releases schedule its fork. `preflight.sh` and
-`collect-run-log.sh` look up the pinned image, tag and digest, in the network's table below;
-both fail if it has no row for the variable's own client (Client `reth` for `RETH_IMAGE`,
-`lighthouse` for `LIGHTHOUSE_IMAGE`, so pins swapped between the two services fail) or its row
-says it does not schedule the network's fork, and the run log copies the table. The pinned configs are
+`collect-run-log.sh` first check that each image comes from its service's own repository,
+matched exactly on the part before the tag's `:` or the `@`: `ghcr.io/paradigmxyz/reth` for
+`RETH_IMAGE`, `sigp/lighthouse` for `LIGHTHOUSE_IMAGE` (`lib/common.sh` `service_repo`, the one
+place this map lives). So a row edited by hand on the host cannot vouch for the other client's
+image or for a lookalike (`ghcr.io/paradigmxyz/reth-evil`, `sigp/lighthouse2`,
+`docker.io/sigp/lighthouse`). They then look up the pinned image, tag and digest, in the
+network's table below; both fail if it has no row for the variable's own client (Client `reth`
+for `RETH_IMAGE`, `lighthouse` for `LIGHTHOUSE_IMAGE`, so pins swapped between the two services
+fail) or its row says it does not schedule the network's fork, and the run log copies the
+table. The pinned configs are
 `crates/network-config/networks/{sepolia,hoodi}/config.yaml`: Sepolia `GLOAS_FORK_EPOCH:
 353024`, `GLOAS_FORK_VERSION: 0x90000076`; Hoodi `GLOAS_FORK_EPOCH: 132352`,
 `GLOAS_FORK_VERSION: 0x80000910`. The EL half is Amsterdam. The consensus-specs column is the

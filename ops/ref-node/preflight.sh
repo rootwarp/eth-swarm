@@ -11,10 +11,13 @@
 # in the environment (lib/common.sh docker_env_check: another project, compose file or daemon
 # than the one checked) is refused outright (exit 2). Otherwise every check runs and prints
 # one line; any FAIL fails:
-#   - RETH_IMAGE and LIGHTHOUSE_IMAGE are pinned as repo:tag@sha256:<64 lower-case hex>, and
-#     README.md's release-note table for the network has a row for each image (tag and
-#     digest) whose Client cell is the variable's service (reth, lighthouse: a pin swapped
-#     between the two fails) and that says it schedules the network's Gloas / Amsterdam fork:
+#   - RETH_IMAGE and LIGHTHOUSE_IMAGE are pinned as repo:tag@sha256:<64 lower-case hex>, each
+#     from its service's own repository, exactly (lib/common.sh repo_check:
+#     ghcr.io/paradigmxyz/reth, sigp/lighthouse; checked first, so a hand-edited row cannot
+#     vouch for another client's image or a lookalike), and README.md's release-note table
+#     for the network has a row for each image (tag and digest) whose Client cell is the
+#     variable's service (reth, lighthouse: a pin swapped between the two fails) and that
+#     says it schedules the network's Gloas / Amsterdam fork:
 #     a release whose notes say so, or (Hoodi, until releases do) a dev build whose
 #     fork-schedule check the row records;
 #   - no variable compose.yaml uses is overridden by the shell environment (compose would
@@ -128,6 +131,11 @@ for key in RETH_IMAGE LIGHTHOUSE_IMAGE; do
   pass "$key: pinned"
   tag=${image%@*} && tag=${tag##*:}
   if [[ $key == RETH_IMAGE ]]; then svc=reth; else svc=lighthouse; fi
+  # The repository first: README.md is hand-editable, so its Client cell alone never vouches.
+  if ! line=$(repo_check "$key" "$svc" "$image"); then
+    flunk "$line"
+    continue
+  fi
   row=$(release_row "$here/README.md" "$network" "$svc" "$image")
   client=$(release_client "$here/README.md" "$network" "$image")
   if [[ -z $row && -n $client ]]; then

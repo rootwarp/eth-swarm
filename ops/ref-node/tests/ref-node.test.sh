@@ -590,11 +590,81 @@ for spec in "hoodi $hoodi_reth reth" "hoodi $hoodi_lh lighthouse" "sepolia $sepo
   if [[ $got == "$want" ]]; then ok "release notes: $net row of ${image%@*} is ${want:-nobody}'s"; else bad "release notes: $net row of ${image%@*} (got '$got', want '$want')"; fi
 done
 # Every row of both tables names its client, and each client's images come from its own
-# repository, so the Client column cannot vouch for the other client's image.
+# repository (repo_check, the rule both scripts apply), so the Client column cannot vouch for
+# the other client's image.
 for net in sepolia hoodi; do
   rows=$(release_notes "$ref/README.md" "$net" | awk -F '|' 'NR > 2 { gsub(/[ \t`]/, "", $2); gsub(/[ \t]/, "", $3); print $3, $2 }')
-  wrong=$(awk '!(($1 == "reth" && index($2, "ghcr.io/paradigmxyz/reth:") == 1) || ($1 == "lighthouse" && index($2, "sigp/lighthouse:") == 1))' <<< "$rows")
+  wrong=$(while read -r client image; do repo_check "$net row" "$client" "$image" || true; done <<< "$rows")
   if [[ -n $rows && -z $wrong ]]; then ok "release notes: every $net row's client owns its image's repository"; else bad "release notes: $net rows whose client and repository differ" "${wrong:-(no rows)}"; fi
+done
+# repo_check <variable> <service> <image>: the image's repository, everything before the tag's
+# ':' or the '@', is exactly the service's own (lib/common.sh service_repo). The scripts check
+# it before they look up a row, so a hand-edited README.md row naming another client, or a
+# lookalike repository, never vouches for an image.
+for spec in "RETH_IMAGE reth $hoodi_reth" "RETH_IMAGE reth $sepolia_reth" \
+  "LIGHTHOUSE_IMAGE lighthouse $hoodi_lh" "LIGHTHOUSE_IMAGE lighthouse $sepolia_lh"; do
+  read -r key svc image <<< "$spec"
+  check_out 0 "repo_check: $key ${image%@*} is from $svc's own repository" '^$' repo_check "$key" "$svc" "$image"
+done
+# repo_refused <service> <image> <its repository>: repo_check refuses it, naming the variable,
+# the repository it wants and the one the image has.
+repo_refused() {
+  local key want got rc=0
+  if [[ $1 == reth ]]; then key=RETH_IMAGE want=ghcr.io/paradigmxyz/reth; else key=LIGHTHOUSE_IMAGE want=sigp/lighthouse; fi
+  got=$(repo_check "$key" "$1" "$2") || rc=$?
+  if ((rc == 1)) && [[ $got == "$key: repository $3 is not $1's (want $want)" ]]; then
+    ok "repo_check: $key $3 is refused"
+  else
+    bad "repo_check: $key $3 is refused (exit $rc, got '$got')"
+  fi
+}
+hr=${hoodi_reth##*@} hl=${hoodi_lh##*@}
+repo_refused lighthouse "$hoodi_reth" ghcr.io/paradigmxyz/reth
+repo_refused lighthouse "$sepolia_reth" ghcr.io/paradigmxyz/reth
+repo_refused reth "$hoodi_lh" sigp/lighthouse
+repo_refused reth "$sepolia_lh" sigp/lighthouse
+repo_refused reth "ghcr.io/paradigmxyz/reth-evil:nightly@$hr" ghcr.io/paradigmxyz/reth-evil
+repo_refused reth "ghcr.io/paradigmxyz/reth/evil:nightly@$hr" ghcr.io/paradigmxyz/reth/evil
+repo_refused reth "ghcr.io/paradigmxyz/rethx:nightly@$hr" ghcr.io/paradigmxyz/rethx
+repo_refused reth "xghcr.io/paradigmxyz/reth:nightly@$hr" xghcr.io/paradigmxyz/reth
+repo_refused reth "paradigmxyz/reth:nightly@$hr" paradigmxyz/reth
+repo_refused reth "ghcr.io:443/paradigmxyz/reth:nightly@$hr" ghcr.io:443/paradigmxyz/reth
+repo_refused lighthouse "sigp/lighthouse2:latest-unstable@$hl" sigp/lighthouse2
+repo_refused lighthouse "sigp/lighthouse-evil:latest-unstable@$hl" sigp/lighthouse-evil
+repo_refused lighthouse "docker.io/sigp/lighthouse:latest-unstable@$hl" docker.io/sigp/lighthouse
+repo_refused lighthouse "ghcr.io/sigp/lighthouse:latest-unstable@$hl" ghcr.io/sigp/lighthouse
+repo_refused lighthouse "localhost:5000/sigp/lighthouse:latest-unstable@$hl" localhost:5000/sigp/lighthouse
+check_out 1 "repo_check: a service of no known repository is refused" '^NETHERMIND_IMAGE: nethermind has no known image repository$' \
+  repo_check NETHERMIND_IMAGE nethermind "nethermind/nethermind:1.0@$hr"
+# A copy of the stack whose README.md was edited by hand: rows whose Client cell names the other
+# client for a reviewed image, rows for lookalike repositories, and a row for a reth-repository
+# image under the lighthouse client. release_row alone would vouch for each of them.
+edited_ref="$tmp/edited-copy/ops/ref-node"
+mkdir -p "$tmp/edited-copy/ops" && cp -R "$ref" "$edited_ref" && ln -s "$repo/crates" "$tmp/edited-copy/crates"
+rm -rf "$edited_ref/lib/__pycache__"
+edited_row() { printf '| `%s` | %s | hand-edited | yes | %s | hand-edited row |\n' "$1" "$2" "$3"; }
+{
+  edited_row "$hoodi_reth" lighthouse v1.7.0-beta.4
+  edited_row "$hoodi_lh" reth 'n/a (EL)'
+  edited_row "ghcr.io/paradigmxyz/reth-evil:nightly@$hr" reth 'n/a (EL)'
+  edited_row "sigp/lighthouse2:latest-unstable@$hl" lighthouse v1.7.0-beta.4
+  edited_row "docker.io/sigp/lighthouse:latest-unstable@$hl" lighthouse v1.7.0-beta.4
+  edited_row "ghcr.io/paradigmxyz/reth:edited@sha256:$d64" lighthouse v1.7.0-beta.4
+} > "$tmp/edited-hoodi.rows"
+{
+  edited_row "$sepolia_reth" lighthouse v1.7.0-beta.2
+  edited_row "$sepolia_lh" reth 'n/a (EL)'
+} > "$tmp/edited-sepolia.rows"
+EDIT_DIR=$tmp awk '
+  $0 == "<!-- release-notes:hoodi:end -->" { f = ENVIRON["EDIT_DIR"] "/edited-hoodi.rows"; while ((getline l < f) > 0) print l }
+  $0 == "<!-- release-notes:sepolia:end -->" { f = ENVIRON["EDIT_DIR"] "/edited-sepolia.rows"; while ((getline l < f) > 0) print l }
+  { print }' "$ref/README.md" > "$edited_ref/README.md"
+for spec in "hoodi lighthouse $hoodi_reth" "hoodi reth $hoodi_lh" "hoodi reth ghcr.io/paradigmxyz/reth-evil:nightly@$hr" \
+  "hoodi lighthouse sigp/lighthouse2:latest-unstable@$hl" "hoodi lighthouse docker.io/sigp/lighthouse:latest-unstable@$hl" \
+  "sepolia lighthouse $sepolia_reth" "sepolia reth $sepolia_lh"; do
+  read -r net svc image <<< "$spec"
+  got=$(release_row "$edited_ref/README.md" "$net" "$svc" "$image")
+  if [[ $got == yes\|* ]]; then ok "release notes: the hand-edited README vouches for $svc ${image%@*} on $net"; else bad "release notes: the hand-edited $net row for $svc ${image%@*} (got '$got')"; fi
 done
 # README.md records, for the dev pins, where each digest was built from and how to leave them.
 for spec in "e667968725ff553f65dfecf161e63f6eab96fcc2|the reth nightly source commit" \
@@ -1511,25 +1581,48 @@ hf_base; set_env "$pf_env" RETH_IMAGE "$sepolia_reth"; set_env "$pf_env" LIGHTHO
 pf_case 1 "Hoodi: the Sepolia release pins do not schedule Hoodi's fork, so preflight fails" \
   '^release notes: reth v2\.7\.0 does not schedule hoodi.s Gloas / Amsterdam fork \(README\.md\): replace it before starting: FAIL$'
 pf_case 1 "Hoodi: the Sepolia Lighthouse release fails too" '^release notes: lighthouse v8\.3\.0-rc\.0 does not schedule hoodi.s'
-# Each service takes only its own client's rows: the two pins swapped between the services are
-# refused on either network, though each has a row (the other client's), and so is a reviewed
-# digest under the other client's repository (no row at all).
+# Each service takes only an image from its own repository, checked before any row: the two
+# pins swapped between the services are refused on either network, though each has a row (the
+# other client's), and so is a reviewed digest under the other client's repository.
+pf_reth_repo='^RETH_IMAGE: repository sigp/lighthouse is not reth.s \(want ghcr\.io/paradigmxyz/reth\): FAIL$'
+pf_lh_repo='^LIGHTHOUSE_IMAGE: repository ghcr\.io/paradigmxyz/reth is not lighthouse.s \(want sigp/lighthouse\): FAIL$'
 hf_base; set_env "$pf_env" RETH_IMAGE "$hoodi_lh"; set_env "$pf_env" LIGHTHOUSE_IMAGE "$hoodi_reth"
-pf_case 1 "Hoodi: the Lighthouse dev pin as RETH_IMAGE is refused" \
-  '^release notes: RETH_IMAGE is a lighthouse image in README\.md.s hoodi table, not reth.s: FAIL$'
-pf_case 1 "Hoodi: the reth dev pin as LIGHTHOUSE_IMAGE is refused" \
-  '^release notes: LIGHTHOUSE_IMAGE is a reth image in README\.md.s hoodi table, not lighthouse.s: FAIL$'
+pf_case 1 "Hoodi: the Lighthouse dev pin as RETH_IMAGE is refused" "$pf_reth_repo"
+pf_case 1 "Hoodi: the reth dev pin as LIGHTHOUSE_IMAGE is refused" "$pf_lh_repo"
 pf_base; set_env "$pf_env" RETH_IMAGE "$sepolia_lh"; set_env "$pf_env" LIGHTHOUSE_IMAGE "$sepolia_reth"
-pf_case 1 "Sepolia: the Lighthouse release as RETH_IMAGE is refused" \
-  '^release notes: RETH_IMAGE is a lighthouse image in README\.md.s sepolia table, not reth.s: FAIL$'
-pf_case 1 "Sepolia: the reth release as LIGHTHOUSE_IMAGE is refused" \
-  '^release notes: LIGHTHOUSE_IMAGE is a reth image in README\.md.s sepolia table, not lighthouse.s: FAIL$'
+pf_case 1 "Sepolia: the Lighthouse release as RETH_IMAGE is refused" "$pf_reth_repo"
+pf_case 1 "Sepolia: the reth release as LIGHTHOUSE_IMAGE is refused" "$pf_lh_repo"
 hf_base; set_env "$pf_env" RETH_IMAGE "sigp/lighthouse:nightly@sha256:${hoodi_reth##*sha256:}"
-pf_case 1 "Hoodi: reth's reviewed digest under Lighthouse's repository is refused" \
-  '^release notes: README\.md has no hoodi row for reth nightly at this digest: FAIL$'
+pf_case 1 "Hoodi: reth's reviewed digest under Lighthouse's repository is refused" "$pf_reth_repo"
 hf_base; set_env "$pf_env" LIGHTHOUSE_IMAGE "ghcr.io/paradigmxyz/reth:latest-unstable@sha256:${hoodi_lh##*sha256:}"
-pf_case 1 "Hoodi: Lighthouse's reviewed digest under reth's repository is refused" \
-  '^release notes: README\.md has no hoodi row for lighthouse latest-unstable at this digest: FAIL$'
+pf_case 1 "Hoodi: Lighthouse's reviewed digest under reth's repository is refused" "$pf_lh_repo"
+# A README.md edited by hand on the host (the copy above): its rows vouch for the other client's
+# image and for lookalike repositories, and the repository check refuses each of them anyway.
+# The pins that belong pass from that copy too.
+pf_edited() { # pf_edited <hf_base|pf_base> <key> <image> <description> <pattern>
+  "$1"; pf_script="$edited_ref/preflight.sh"; set_env "$pf_env" "$2" "$3"
+  pf_case 1 "hand-edited README: $4" "$5"
+  pf_script=
+}
+pf_edited hf_base LIGHTHOUSE_IMAGE "$hoodi_reth" "Hoodi: the reth dev pin in a lighthouse row is refused as LIGHTHOUSE_IMAGE" "$pf_lh_repo"
+pf_edited hf_base RETH_IMAGE "$hoodi_lh" "Hoodi: the Lighthouse dev pin in a reth row is refused as RETH_IMAGE" "$pf_reth_repo"
+pf_edited pf_base LIGHTHOUSE_IMAGE "$sepolia_reth" "Sepolia: the reth release in a lighthouse row is refused as LIGHTHOUSE_IMAGE" "$pf_lh_repo"
+pf_edited pf_base RETH_IMAGE "$sepolia_lh" "Sepolia: the Lighthouse release in a reth row is refused as RETH_IMAGE" "$pf_reth_repo"
+pf_edited hf_base RETH_IMAGE "ghcr.io/paradigmxyz/reth-evil:nightly@$hr" "Hoodi: a reth-evil lookalike is refused" \
+  '^RETH_IMAGE: repository ghcr\.io/paradigmxyz/reth-evil is not reth.s \(want ghcr\.io/paradigmxyz/reth\): FAIL$'
+pf_edited hf_base LIGHTHOUSE_IMAGE "sigp/lighthouse2:latest-unstable@$hl" "Hoodi: a lighthouse2 lookalike is refused" \
+  '^LIGHTHOUSE_IMAGE: repository sigp/lighthouse2 is not lighthouse.s \(want sigp/lighthouse\): FAIL$'
+pf_edited hf_base LIGHTHOUSE_IMAGE "docker.io/sigp/lighthouse:latest-unstable@$hl" "Hoodi: docker.io/sigp/lighthouse, not the table's spelling, is refused" \
+  '^LIGHTHOUSE_IMAGE: repository docker\.io/sigp/lighthouse is not lighthouse.s \(want sigp/lighthouse\): FAIL$'
+# An image from the service's own repository whose only row names the other client is still
+# refused by its row, with the client that row names.
+pf_edited hf_base RETH_IMAGE "ghcr.io/paradigmxyz/reth:edited@sha256:$d64" "Hoodi: a reth image whose row says lighthouse is refused" \
+  '^release notes: RETH_IMAGE is a lighthouse image in README\.md.s hoodi table, not reth.s: FAIL$'
+hf_base; pf_script="$edited_ref/preflight.sh"
+pf_case 0 "hand-edited README: Hoodi: the reviewed dev pins still pass" '^preflight OK \(test mode: not a deployment gate\)$'
+pf_base; pf_script="$edited_ref/preflight.sh"
+pf_case 0 "hand-edited README: Sepolia: the release pins still pass" '^preflight OK \(test mode: not a deployment gate\)$'
+pf_script=
 # And Sepolia never takes the Hoodi dev pins: README.md has no Sepolia row for them.
 pf_base; set_env "$pf_env" LIGHTHOUSE_IMAGE "$hoodi_lh"
 pf_case 1 "Sepolia: the Hoodi Lighthouse dev pin is refused" \
@@ -2208,22 +2301,52 @@ cl_swapped() {
   set_env "$cl_env" RETH_IMAGE "$(env_get "$cl_env" LIGHTHOUSE_IMAGE)"; set_env "$cl_env" LIGHTHOUSE_IMAGE "$image"
   cl_inspect ctr-reth 'c["Image"] = "sha256:2222"'; cl_inspect ctr-lh 'c["Image"] = "sha256:1111"'
 }
+cl_reth_repo="RETH_IMAGE: repository sigp/lighthouse is not reth's (want ghcr.io/paradigmxyz/reth): FAIL"
+cl_lh_repo="LIGHTHOUSE_IMAGE: repository ghcr.io/paradigmxyz/reth is not lighthouse's (want sigp/lighthouse): FAIL"
 cl_hoodi; cl_swapped
 cl_quick "Hoodi: the two dev pins swapped between the services fail" --config "$pinned_hoodi"
 verdict 1 FAIL "Hoodi: swapped pins fail criterion 1"
-has "reth latest-unstable: RETH_IMAGE is a lighthouse image in README.md's hoodi table, not reth's: FAIL" "Hoodi: names the Lighthouse image pinned for reth"
-has "lighthouse nightly: LIGHTHOUSE_IMAGE is a reth image in README.md's hoodi table, not lighthouse's: FAIL" "Hoodi: names the reth image pinned for Lighthouse"
+has "$cl_reth_repo" "Hoodi: names the Lighthouse repository pinned for reth"
+has "$cl_lh_repo" "Hoodi: names the reth repository pinned for Lighthouse"
 has "reth container ctr-reth: image sha256:2222, pinned image sha256:2222: PASS" "Hoodi: the swapped containers run the images their variables name"
 cl_base; cl_swapped
 cl_quick "Sepolia: the two release pins swapped between the services fail"
 verdict 1 FAIL "Sepolia: swapped pins fail criterion 1"
-has "reth v8.3.0-rc.0: RETH_IMAGE is a lighthouse image in README.md's sepolia table, not reth's: FAIL" "Sepolia: names the Lighthouse image pinned for reth"
-has "lighthouse v2.7.0: LIGHTHOUSE_IMAGE is a reth image in README.md's sepolia table, not lighthouse's: FAIL" "Sepolia: names the reth image pinned for Lighthouse"
+has "$cl_reth_repo" "Sepolia: names the Lighthouse repository pinned for reth"
+has "$cl_lh_repo" "Sepolia: names the reth repository pinned for Lighthouse"
 cl_hoodi; set_env "$cl_env" RETH_IMAGE "sigp/lighthouse:nightly@sha256:${hoodi_reth##*sha256:}"
 printf '%s\n' "sigp/lighthouse@sha256:${hoodi_reth##*sha256:}" >> "$tmp/docker/lighthouse.digests"
 cl_quick "Hoodi: reth's reviewed digest under Lighthouse's repository fails" --config "$pinned_hoodi"
 verdict 1 FAIL "Hoodi: a digest under the other client's repository fails criterion 1"
-has "reth nightly: no hoodi row in README.md's release notes for this image: FAIL" "Hoodi: names the image without a reth row"
+has "$cl_reth_repo" "Hoodi: names the repository that is not reth's"
+# A README.md edited by hand on the host (the copy above): a row vouches for the reth dev pin as
+# Lighthouse's, or for a lookalike repository. The container runs the image its variable names
+# (the stub's ids: 1111 for a ref naming reth, 2222 otherwise) and every digest matches, so only
+# the repository check can fail criterion 1; no row is consulted for that image.
+collect_script="$edited_ref/collect-run-log.sh"
+cl_hoodi; set_env "$cl_env" LIGHTHOUSE_IMAGE "$hoodi_reth"; cl_inspect ctr-lh 'c["Image"] = "sha256:1111"'
+cl_quick "hand-edited README: Hoodi: the reth dev pin in a lighthouse row fails as LIGHTHOUSE_IMAGE" --config "$pinned_hoodi"
+verdict 1 FAIL "hand-edited README: the reth dev pin as LIGHTHOUSE_IMAGE fails criterion 1"
+has "$cl_lh_repo" "hand-edited README: names the reth repository pinned for Lighthouse"
+has "lighthouse container ctr-lh: image sha256:1111, pinned image sha256:1111: PASS" "hand-edited README: the container runs the image LIGHTHOUSE_IMAGE names"
+if grep -q "^release notes: lighthouse nightly " "$log"; then bad "run log: hand-edited README: no row is read for an image from the wrong repository" "$(cat "$log")"; else ok "run log: hand-edited README: no row is read for an image from the wrong repository"; fi
+cl_sepolia_swap() { cl_base; set_env "$cl_env" RETH_IMAGE "$sepolia_lh"; cl_inspect ctr-reth 'c["Image"] = "sha256:2222"'; }
+cl_sepolia_swap
+cl_quick "hand-edited README: Sepolia: the Lighthouse release in a reth row fails as RETH_IMAGE"
+verdict 1 FAIL "hand-edited README: the Lighthouse release as RETH_IMAGE fails criterion 1"
+has "$cl_reth_repo" "hand-edited README: names the Lighthouse repository pinned for reth"
+for spec in "RETH_IMAGE|ghcr.io/paradigmxyz/reth-evil:nightly@$hr|ghcr.io/paradigmxyz/reth-evil|reth|ghcr.io/paradigmxyz/reth" \
+  "LIGHTHOUSE_IMAGE|sigp/lighthouse2:latest-unstable@$hl|sigp/lighthouse2|lighthouse|sigp/lighthouse" \
+  "LIGHTHOUSE_IMAGE|docker.io/sigp/lighthouse:latest-unstable@$hl|docker.io/sigp/lighthouse|lighthouse|sigp/lighthouse"; do
+  IFS='|' read -r key image got svc want <<< "$spec"
+  cl_hoodi; set_env "$cl_env" "$key" "$image"
+  cl_quick "hand-edited README: Hoodi: the lookalike $got fails" --config "$pinned_hoodi"
+  verdict 1 FAIL "hand-edited README: the lookalike $got fails criterion 1"
+  has "$key: repository $got is not $svc's (want $want): FAIL" "hand-edited README: names the lookalike $got"
+done
+cl_hoodi
+cl_run 0 "hand-edited README: Hoodi: the reviewed dev pins still pass" --config "$pinned_hoodi"
+collect_script=
 cl_hoodi; cp "$tmp/hoodi-pre-gloas.json" "$http/eth_v1_config_spec"
 cl_quick "Hoodi: a node without Hoodi's Gloas epoch fails" --config "$pinned_hoodi"
 verdict 5 FAIL "Hoodi: a spec difference fails the spec criterion"
