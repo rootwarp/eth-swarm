@@ -99,8 +99,9 @@ capture window. When both data roots share a filesystem, the free space must cov
 `.env.example` and `.env.hoodi.example` pin these (tag and multi-arch index digest): Sepolia
 runs releases, Hoodi two dev builds until releases schedule its fork. `preflight.sh` and
 `collect-run-log.sh` look up the pinned image, tag and digest, in the network's table below;
-both fail if it has no row or its row says it does not schedule the network's fork, and the
-run log copies the table. The pinned configs are
+both fail if it has no row for the variable's own client (Client `reth` for `RETH_IMAGE`,
+`lighthouse` for `LIGHTHOUSE_IMAGE`, so pins swapped between the two services fail) or its row
+says it does not schedule the network's fork, and the run log copies the table. The pinned configs are
 `crates/network-config/networks/{sepolia,hoodi}/config.yaml`: Sepolia `GLOAS_FORK_EPOCH:
 353024`, `GLOAS_FORK_VERSION: 0x90000076`; Hoodi `GLOAS_FORK_EPOCH: 132352`,
 `GLOAS_FORK_VERSION: 0x80000910`. The EL half is Amsterdam. The consensus-specs column is the
@@ -111,10 +112,10 @@ log records a different one without failing it.
 ### Sepolia
 
 <!-- release-notes:sepolia:begin -->
-| Image | Release | Schedules Sepolia's fork | consensus-specs | Release-note line: Sepolia Gloas / Amsterdam |
-|---|---|---|---|---|
-| `ghcr.io/paradigmxyz/reth:v2.7.0@sha256:a7f059d470878a5a59f3c575f3fc81b536d0d2d56d7a1cbed73e717a4f766336` | [v2.7.0](https://github.com/paradigmxyz/reth/releases/tag/v2.7.0) | yes | n/a (EL) | "Reth v2.7.0 prepares Sepolia for the Glamsterdam hardfork" … "**Sepolia operators must upgrade before 6 October 2026 at 13:53:36 UTC.** This release schedules Amsterdam activation on Sepolia testnet and tests the fork ID and `eth_config` transition." |
-| `sigp/lighthouse:v8.3.0-rc.0@sha256:3e5f0609c74b824d3cb1049920169114d99fd7bc9082b996b3adae3d4e9ef8dc` | [v8.3.0-rc.0](https://github.com/sigp/lighthouse/releases/tag/v8.3.0-rc.0) | yes | v1.7.0-beta.2 | "Lighthouse v8.3.0-rc.0 is a **release candidate with support for the upcoming Gloas hard fork on Sepolia**." Its table: Sepolia, fork epoch 353024, fork slot 11296768, 6 October 2026 13:53:36 UTC. |
+| Image | Client | Release | Schedules Sepolia's fork | consensus-specs | Release-note line: Sepolia Gloas / Amsterdam |
+|---|---|---|---|---|---|
+| `ghcr.io/paradigmxyz/reth:v2.7.0@sha256:a7f059d470878a5a59f3c575f3fc81b536d0d2d56d7a1cbed73e717a4f766336` | reth | [v2.7.0](https://github.com/paradigmxyz/reth/releases/tag/v2.7.0) | yes | n/a (EL) | "Reth v2.7.0 prepares Sepolia for the Glamsterdam hardfork" … "**Sepolia operators must upgrade before 6 October 2026 at 13:53:36 UTC.** This release schedules Amsterdam activation on Sepolia testnet and tests the fork ID and `eth_config` transition." |
+| `sigp/lighthouse:v8.3.0-rc.0@sha256:3e5f0609c74b824d3cb1049920169114d99fd7bc9082b996b3adae3d4e9ef8dc` | lighthouse | [v8.3.0-rc.0](https://github.com/sigp/lighthouse/releases/tag/v8.3.0-rc.0) | yes | v1.7.0-beta.2 | "Lighthouse v8.3.0-rc.0 is a **release candidate with support for the upcoming Gloas hard fork on Sepolia**." Its table: Sepolia, fork epoch 353024, fork slot 11296768, 6 October 2026 13:53:36 UTC. |
 <!-- release-notes:sepolia:end -->
 
 Both notes name the same activation time as our pinned epoch. In a local run, the pinned
@@ -127,12 +128,12 @@ notes: "If you are running a node on Sepolia you'll need v8.3.0-rc.0 instead").
 ### Hoodi
 
 <!-- release-notes:hoodi:begin -->
-| Image | Release | Schedules Hoodi's fork | consensus-specs | Release-note line, or a dev build's fork-schedule check: Hoodi Gloas / Amsterdam |
-|---|---|---|---|---|
-| `ghcr.io/paradigmxyz/reth:nightly@sha256:8765a1d57878bebd40362d71bbfc0834d231847952402f9a10848c14476b90d2` | dev build of [`e667968`](https://github.com/paradigmxyz/reth/commit/e667968725ff553f65dfecf161e63f6eab96fcc2) (`nightly`, built 2026-10-18; no release yet) | yes | n/a (EL) | Source check: `e667968725ff553f65dfecf161e63f6eab96fcc2` is 94 commits past `6096d25e9a50` "feat: schedule Hoodi Amsterdam activation" ([#27811](https://github.com/paradigmxyz/reth/pull/27811)) and builds with `alloy-hardforks` 0.4.10, whose `HOODI_AMSTERDAM_TIMESTAMP` is 1793036568 (2026-10-26 17:42:48 UTC, the first slot of epoch 132352). The image's SLSA provenance names this commit. |
-| `sigp/lighthouse:latest-unstable@sha256:be7fdbcd4a321647f0300ae8dc3a9542bf391129ecaf521892f0b27dfe2e9658` | dev build of [`c8ddac7`](https://github.com/sigp/lighthouse/commit/c8ddac7b79d49812283873eb6625149ef0d27f95) (`unstable`, built 2026-10-16; no release yet) | yes | v1.7.0-beta.4 | Source check: at `c8ddac7b79d49812283873eb6625149ef0d27f95` the built-in Hoodi config has `GLOAS_FORK_EPOCH: 132352`, and `testing/ef_tests/Makefile` pins `CONSENSUS_SPECS_TEST_VERSION` v1.7.0-beta.4. The Kurtosis devnet's Lighthouse image is built from the same commit; the image's SLSA provenance names it. |
-| `ghcr.io/paradigmxyz/reth:v2.7.0@sha256:a7f059d470878a5a59f3c575f3fc81b536d0d2d56d7a1cbed73e717a4f766336` | [v2.7.0](https://github.com/paradigmxyz/reth/releases/tag/v2.7.0) | no | n/a (EL) | Sepolia only: "This release schedules Amsterdam activation on Sepolia testnet". No Hoodi line; its Hoodi fork-ID test ends at Osaka and the BPO forks. |
-| `sigp/lighthouse:v8.3.0-rc.0@sha256:3e5f0609c74b824d3cb1049920169114d99fd7bc9082b996b3adae3d4e9ef8dc` | [v8.3.0-rc.0](https://github.com/sigp/lighthouse/releases/tag/v8.3.0-rc.0) | no | v1.7.0-beta.2 | "The Gloas fork is not yet scheduled on Hoodi or mainnet." Its built-in Hoodi config has `GLOAS_FORK_EPOCH: 18446744073709551615`. |
+| Image | Client | Release | Schedules Hoodi's fork | consensus-specs | Release-note line, or a dev build's fork-schedule check: Hoodi Gloas / Amsterdam |
+|---|---|---|---|---|---|
+| `ghcr.io/paradigmxyz/reth:nightly@sha256:8765a1d57878bebd40362d71bbfc0834d231847952402f9a10848c14476b90d2` | reth | dev build of [`e667968`](https://github.com/paradigmxyz/reth/commit/e667968725ff553f65dfecf161e63f6eab96fcc2) (`nightly`, built 2026-10-18; no release yet) | yes | n/a (EL) | Source check: `e667968725ff553f65dfecf161e63f6eab96fcc2` is 94 commits past `6096d25e9a50` "feat: schedule Hoodi Amsterdam activation" ([#27811](https://github.com/paradigmxyz/reth/pull/27811)) and builds with `alloy-hardforks` 0.4.10, whose `HOODI_AMSTERDAM_TIMESTAMP` is 1793036568 (2026-10-26 17:42:48 UTC, the first slot of epoch 132352). The image's SLSA provenance names this commit. |
+| `sigp/lighthouse:latest-unstable@sha256:be7fdbcd4a321647f0300ae8dc3a9542bf391129ecaf521892f0b27dfe2e9658` | lighthouse | dev build of [`c8ddac7`](https://github.com/sigp/lighthouse/commit/c8ddac7b79d49812283873eb6625149ef0d27f95) (`unstable`, built 2026-10-16; no release yet) | yes | v1.7.0-beta.4 | Source check: at `c8ddac7b79d49812283873eb6625149ef0d27f95` the built-in Hoodi config has `GLOAS_FORK_EPOCH: 132352`, and `testing/ef_tests/Makefile` pins `CONSENSUS_SPECS_TEST_VERSION` v1.7.0-beta.4. The Kurtosis devnet's Lighthouse image is built from the same commit; the image's SLSA provenance names it. |
+| `ghcr.io/paradigmxyz/reth:v2.7.0@sha256:a7f059d470878a5a59f3c575f3fc81b536d0d2d56d7a1cbed73e717a4f766336` | reth | [v2.7.0](https://github.com/paradigmxyz/reth/releases/tag/v2.7.0) | no | n/a (EL) | Sepolia only: "This release schedules Amsterdam activation on Sepolia testnet". No Hoodi line; its Hoodi fork-ID test ends at Osaka and the BPO forks. |
+| `sigp/lighthouse:v8.3.0-rc.0@sha256:3e5f0609c74b824d3cb1049920169114d99fd7bc9082b996b3adae3d4e9ef8dc` | lighthouse | [v8.3.0-rc.0](https://github.com/sigp/lighthouse/releases/tag/v8.3.0-rc.0) | no | v1.7.0-beta.2 | "The Gloas fork is not yet scheduled on Hoodi or mainnet." Its built-in Hoodi config has `GLOAS_FORK_EPOCH: 18446744073709551615`. |
 <!-- release-notes:hoodi:end -->
 
 **Hoodi runs two dev builds, pinned by digest.** As of 2026-10-19 no Reth or Lighthouse
@@ -147,10 +148,11 @@ reference nodes' one exception to running releases, until the
 **v1.7.0-beta.4**, the same as our client. Sepolia stays on its releases, which schedule its
 fork (already past).
 
-`preflight.sh` accepts for Hoodi exactly the images whose row here says `yes`: these two
-digests under these two tags. It refuses a tag alone (`nightly`, `latest-unstable`), the same
+`preflight.sh` accepts for Hoodi exactly the images whose row here says `yes`, each for its
+own client: these two digests under these two tags. It refuses a tag alone (`nightly`, `latest-unstable`), the same
 tag at any other digest (both tags move every day), the same digest under another tag, any
-image with no row (no recorded fork-schedule check), and the two releases whose rows say `no`.
+image with no row (no recorded fork-schedule check), either pin under the other service's
+variable or the other client's repository, and the two releases whose rows say `no`.
 The run log fails criterion 1 on the same rules.
 
 **Pull both images onto the Hoodi host now, and keep them.** An untagged dev digest stays
@@ -178,7 +180,7 @@ otherwise. Move each client on its own, as soon as its release qualifies:
 - [ ] **Lighthouse:** v8.3.0 is tagged, its release notes confirm Hoodi's Gloas fork (epoch
   132352), and the EF announcement's client table lists it.
 - [ ] For each release: take its index digest (`docker buildx imagetools inspect
-  <image:tag>`), add a row to the table above with `yes`, the release-note line and (for
+  <image:tag>`), add a row to the table above with its client, `yes`, the release-note line and (for
   Lighthouse) the `CONSENSUS_SPECS_TEST_VERSION` at the tag, and put the pin in
   `.env.hoodi.example` and the host's `.env.hoodi`. Delete the dev build's row, so that
   `preflight.sh` refuses it again, and update the pins `tests/ref-node.test.sh` checks.

@@ -13,9 +13,10 @@
 # one line; any FAIL fails:
 #   - RETH_IMAGE and LIGHTHOUSE_IMAGE are pinned as repo:tag@sha256:<64 lower-case hex>, and
 #     README.md's release-note table for the network has a row for each image (tag and
-#     digest) that says it schedules the network's Gloas / Amsterdam fork: a release whose
-#     notes say so, or (Hoodi, until releases do) a dev build whose fork-schedule check the
-#     row records;
+#     digest) whose Client cell is the variable's service (reth, lighthouse: a pin swapped
+#     between the two fails) and that says it schedules the network's Gloas / Amsterdam fork:
+#     a release whose notes say so, or (Hoodi, until releases do) a dev build whose
+#     fork-schedule check the row records;
 #   - no variable compose.yaml uses is overridden by the shell environment (compose would
 #     take the exported value over .env);
 #   - the five ports (lib/common.sh PORT_KEYS) are decimal 1-65535 and distinct;
@@ -127,8 +128,11 @@ for key in RETH_IMAGE LIGHTHOUSE_IMAGE; do
   pass "$key: pinned"
   tag=${image%@*} && tag=${tag##*:}
   if [[ $key == RETH_IMAGE ]]; then svc=reth; else svc=lighthouse; fi
-  row=$(release_row "$here/README.md" "$network" "$image")
-  if [[ -z $row ]]; then
+  row=$(release_row "$here/README.md" "$network" "$svc" "$image")
+  client=$(release_client "$here/README.md" "$network" "$image")
+  if [[ -z $row && -n $client ]]; then
+    flunk "release notes: $key is a $client image in README.md's $network table, not $svc's"
+  elif [[ -z $row ]]; then
     flunk "release notes: README.md has no $network row for $svc $tag at this digest"
   elif [[ ${row%%|*} == yes ]]; then
     pass "release notes: $svc $tag schedules $network's Gloas / Amsterdam fork (README.md)"

@@ -545,8 +545,9 @@ fi
 for spec in "$sep_ex sepolia" "$hoodi_ex hoodi"; do
   read -r ex net <<< "$spec"
   if [[ $(env_get "$ex" NETWORK) == "$net" ]]; then ok "env examples: ${ex##*/} sets NETWORK=$net"; else bad "env examples: ${ex##*/} sets NETWORK=$net"; fi
-  for key in RETH_IMAGE LIGHTHOUSE_IMAGE; do
-    row=$(release_row "$ref/README.md" "$net" "$(env_get "$ex" "$key")")
+  for spec2 in "RETH_IMAGE reth" "LIGHTHOUSE_IMAGE lighthouse"; do
+    read -r key client <<< "$spec2"
+    row=$(release_row "$ref/README.md" "$net" "$client" "$(env_get "$ex" "$key")")
     if [[ $row == yes\|* || $row == no\|* ]]; then ok "release notes: README.md has a $net row for ${ex##*/} $key ($row)"; else bad "release notes: README.md has a $net row for ${ex##*/} $key (got '$row')"; fi
   done
 done
@@ -560,19 +561,41 @@ for spec in "RETH_IMAGE $sepolia_reth" "LIGHTHOUSE_IMAGE $sepolia_lh"; do
   read -r key want <<< "$spec"
   if [[ $(env_get "$sep_ex" "$key") == "$want" ]]; then ok "env examples: Sepolia keeps $key on its release pin"; else bad "env examples: Sepolia $key (got '$(env_get "$sep_ex" "$key")', want '$want')"; fi
 done
-# row_of <network> <image> <want> <description>: release_row's output is exactly <want>.
+# row_of <network> <client> <image> <want> <description>: release_row's output is exactly <want>.
 row_of() {
   local got
-  got=$(release_row "$ref/README.md" "$1" "$2")
-  if [[ $got == "$3" ]]; then ok "release notes: $4"; else bad "release notes: $4 (got '$got', want '$3')"; fi
+  got=$(release_row "$ref/README.md" "$1" "$2" "$3")
+  if [[ $got == "$4" ]]; then ok "release notes: $5"; else bad "release notes: $5 (got '$got', want '$4')"; fi
 }
-row_of hoodi "$hoodi_reth" 'yes|n/a (EL)' "the Hoodi reth nightly digest schedules Hoodi's fork"
-row_of hoodi "$hoodi_lh" 'yes|v1.7.0-beta.4' "the Hoodi Lighthouse unstable digest schedules Hoodi's fork and targets beta.4"
-row_of hoodi "$sepolia_reth" 'no|n/a (EL)' "reth v2.7.0 does not schedule Hoodi's fork"
-row_of hoodi "$sepolia_lh" 'no|v1.7.0-beta.2' "Lighthouse v8.3.0-rc.0 does not schedule Hoodi's fork and targets beta.2"
-row_of hoodi "ghcr.io/paradigmxyz/reth:nightly@sha256:$d64" '' "the nightly tag at another digest has no Hoodi row"
-row_of hoodi "sigp/lighthouse:latest-unstable@sha256:$d64" '' "the latest-unstable tag at another digest has no Hoodi row"
-row_of hoodi "sigp/lighthouse:latest@sha256:${hoodi_lh##*sha256:}" '' "the reviewed digest under another tag has no Hoodi row"
+row_of hoodi reth "$hoodi_reth" 'yes|n/a (EL)' "the Hoodi reth nightly digest schedules Hoodi's fork"
+row_of hoodi lighthouse "$hoodi_lh" 'yes|v1.7.0-beta.4' "the Hoodi Lighthouse unstable digest schedules Hoodi's fork and targets beta.4"
+row_of hoodi reth "$sepolia_reth" 'no|n/a (EL)' "reth v2.7.0 does not schedule Hoodi's fork"
+row_of hoodi lighthouse "$sepolia_lh" 'no|v1.7.0-beta.2' "Lighthouse v8.3.0-rc.0 does not schedule Hoodi's fork and targets beta.2"
+row_of hoodi reth "ghcr.io/paradigmxyz/reth:nightly@sha256:$d64" '' "the nightly tag at another digest has no Hoodi row"
+row_of hoodi lighthouse "sigp/lighthouse:latest-unstable@sha256:$d64" '' "the latest-unstable tag at another digest has no Hoodi row"
+row_of hoodi lighthouse "sigp/lighthouse:latest@sha256:${hoodi_lh##*sha256:}" '' "the reviewed digest under another tag has no Hoodi row"
+# A row counts only for its own client: one image pinned as the other service's (the two pins
+# swapped) has no row for that service, and a reviewed digest under the other client's
+# repository has no row at all. release_client names the client a row belongs to.
+row_of hoodi reth "$hoodi_lh" '' "the Hoodi Lighthouse dev pin has no Hoodi reth row"
+row_of hoodi lighthouse "$hoodi_reth" '' "the Hoodi reth dev pin has no Hoodi Lighthouse row"
+row_of sepolia reth "$sepolia_lh" '' "the Sepolia Lighthouse release has no Sepolia reth row"
+row_of sepolia lighthouse "$sepolia_reth" '' "the Sepolia reth release has no Sepolia Lighthouse row"
+row_of hoodi reth "sigp/lighthouse:nightly@sha256:${hoodi_reth##*sha256:}" '' "reth's reviewed digest under Lighthouse's repository has no Hoodi row"
+row_of hoodi lighthouse "ghcr.io/paradigmxyz/reth:latest-unstable@sha256:${hoodi_lh##*sha256:}" '' "Lighthouse's reviewed digest under reth's repository has no Hoodi row"
+for spec in "hoodi $hoodi_reth reth" "hoodi $hoodi_lh lighthouse" "sepolia $sepolia_reth reth" "sepolia $sepolia_lh lighthouse" "sepolia $hoodi_lh -"; do
+  read -r net image want <<< "$spec"
+  if [[ $want == - ]]; then want=''; fi
+  got=$(release_client "$ref/README.md" "$net" "$image")
+  if [[ $got == "$want" ]]; then ok "release notes: $net row of ${image%@*} is ${want:-nobody}'s"; else bad "release notes: $net row of ${image%@*} (got '$got', want '$want')"; fi
+done
+# Every row of both tables names its client, and each client's images come from its own
+# repository, so the Client column cannot vouch for the other client's image.
+for net in sepolia hoodi; do
+  rows=$(release_notes "$ref/README.md" "$net" | awk -F '|' 'NR > 2 { gsub(/[ \t`]/, "", $2); gsub(/[ \t]/, "", $3); print $3, $2 }')
+  wrong=$(awk '!(($1 == "reth" && index($2, "ghcr.io/paradigmxyz/reth:") == 1) || ($1 == "lighthouse" && index($2, "sigp/lighthouse:") == 1))' <<< "$rows")
+  if [[ -n $rows && -z $wrong ]]; then ok "release notes: every $net row's client owns its image's repository"; else bad "release notes: $net rows whose client and repository differ" "${wrong:-(no rows)}"; fi
+done
 # README.md records, for the dev pins, where each digest was built from and how to leave them.
 for spec in "e667968725ff553f65dfecf161e63f6eab96fcc2|the reth nightly source commit" \
   "c8ddac7b79d49812283873eb6625149ef0d27f95|the Lighthouse unstable source commit" \
@@ -580,25 +603,25 @@ for spec in "e667968725ff553f65dfecf161e63f6eab96fcc2|the reth nightly source co
   "<!-- repin-to-releases:begin -->|the repin-to-releases checklist"; do
   if grep -qF -- "${spec%%|*}" "$ref/README.md"; then ok "README: records ${spec#*|}"; else bad "README: records ${spec#*|} (no '${spec%%|*}')"; fi
 done
-row_of sepolia "$hoodi_reth" '' "the Hoodi dev pins have no Sepolia row"
-row_of sepolia "$hoodi_lh" '' "the Hoodi Lighthouse dev pin has no Sepolia row"
+row_of sepolia reth "$hoodi_reth" '' "the Hoodi dev pins have no Sepolia row"
+row_of sepolia lighthouse "$hoodi_lh" '' "the Hoodi Lighthouse dev pin has no Sepolia row"
 check_out 0 "release notes: a row is matched by image digest, not by tag" '^$' \
-  release_row "$ref/README.md" sepolia "sigp/lighthouse:v8.3.0-rc.0@sha256:$d64"
+  release_row "$ref/README.md" sepolia lighthouse "sigp/lighthouse:v8.3.0-rc.0@sha256:$d64"
 # release_row reads the whole table: an awk that stopped at the first match would leave the
 # one printing the table writing into a closed pipe, which pipefail turns into exit 141 (a false
 # preflight FAIL). A long table with the row first makes that certain rather than rare.
 {
   echo '<!-- release-notes:hoodi:begin -->'
-  echo '| Image | Release | Schedules | consensus-specs | Line |'
-  echo "| \`ghcr.io/x/reth:v1@sha256:$d64\` | v1 | yes | n/a | first |"
-  for i in $(seq 1 3000); do echo "| \`ghcr.io/x/other:v$i@sha256:$d64\` | v$i | no | n/a | padding padding padding padding |"; done
+  echo '| Image | Client | Release | Schedules | consensus-specs | Line |'
+  echo "| \`ghcr.io/x/reth:v1@sha256:$d64\` | reth | v1 | yes | n/a | first |"
+  for i in $(seq 1 3000); do echo "| \`ghcr.io/x/other:v$i@sha256:$d64\` | reth | v$i | no | n/a | padding padding padding padding |"; done
   echo '<!-- release-notes:hoodi:end -->'
 } > "$tmp/long-readme.md"
 sed "3 { p; s/| yes |/| no |/; }" "$tmp/long-readme.md" > "$tmp/twice-readme.md"
 # row_is <description> <README> <want>: release_row's exit code is 0 and its output exactly <want>.
 row_is() {
   local rc=0 got
-  got=$(release_row "$2" hoodi "ghcr.io/x/reth:v1@sha256:$d64") || rc=$?
+  got=$(release_row "$2" hoodi reth "ghcr.io/x/reth:v1@sha256:$d64") || rc=$?
   if ((rc == 0)) && [[ $got == "$3" ]]; then ok "release notes: $1"; else bad "release notes: $1 (exit $rc, got '$got')"; fi
 }
 row_is "a row early in a long table is read under pipefail (no SIGPIPE)" "$tmp/long-readme.md" 'yes|n/a'
@@ -1488,6 +1511,25 @@ hf_base; set_env "$pf_env" RETH_IMAGE "$sepolia_reth"; set_env "$pf_env" LIGHTHO
 pf_case 1 "Hoodi: the Sepolia release pins do not schedule Hoodi's fork, so preflight fails" \
   '^release notes: reth v2\.7\.0 does not schedule hoodi.s Gloas / Amsterdam fork \(README\.md\): replace it before starting: FAIL$'
 pf_case 1 "Hoodi: the Sepolia Lighthouse release fails too" '^release notes: lighthouse v8\.3\.0-rc\.0 does not schedule hoodi.s'
+# Each service takes only its own client's rows: the two pins swapped between the services are
+# refused on either network, though each has a row (the other client's), and so is a reviewed
+# digest under the other client's repository (no row at all).
+hf_base; set_env "$pf_env" RETH_IMAGE "$hoodi_lh"; set_env "$pf_env" LIGHTHOUSE_IMAGE "$hoodi_reth"
+pf_case 1 "Hoodi: the Lighthouse dev pin as RETH_IMAGE is refused" \
+  '^release notes: RETH_IMAGE is a lighthouse image in README\.md.s hoodi table, not reth.s: FAIL$'
+pf_case 1 "Hoodi: the reth dev pin as LIGHTHOUSE_IMAGE is refused" \
+  '^release notes: LIGHTHOUSE_IMAGE is a reth image in README\.md.s hoodi table, not lighthouse.s: FAIL$'
+pf_base; set_env "$pf_env" RETH_IMAGE "$sepolia_lh"; set_env "$pf_env" LIGHTHOUSE_IMAGE "$sepolia_reth"
+pf_case 1 "Sepolia: the Lighthouse release as RETH_IMAGE is refused" \
+  '^release notes: RETH_IMAGE is a lighthouse image in README\.md.s sepolia table, not reth.s: FAIL$'
+pf_case 1 "Sepolia: the reth release as LIGHTHOUSE_IMAGE is refused" \
+  '^release notes: LIGHTHOUSE_IMAGE is a reth image in README\.md.s sepolia table, not lighthouse.s: FAIL$'
+hf_base; set_env "$pf_env" RETH_IMAGE "sigp/lighthouse:nightly@sha256:${hoodi_reth##*sha256:}"
+pf_case 1 "Hoodi: reth's reviewed digest under Lighthouse's repository is refused" \
+  '^release notes: README\.md has no hoodi row for reth nightly at this digest: FAIL$'
+hf_base; set_env "$pf_env" LIGHTHOUSE_IMAGE "ghcr.io/paradigmxyz/reth:latest-unstable@sha256:${hoodi_lh##*sha256:}"
+pf_case 1 "Hoodi: Lighthouse's reviewed digest under reth's repository is refused" \
+  '^release notes: README\.md has no hoodi row for lighthouse latest-unstable at this digest: FAIL$'
 # And Sepolia never takes the Hoodi dev pins: README.md has no Sepolia row for them.
 pf_base; set_env "$pf_env" LIGHTHOUSE_IMAGE "$hoodi_lh"
 pf_case 1 "Sepolia: the Hoodi Lighthouse dev pin is refused" \
@@ -2157,6 +2199,31 @@ verdict 5 PASS "Hoodi: the default pinned config is the network's own"
 has "release notes: reth v2.7.0 does not schedule hoodi's Gloas / Amsterdam fork (README.md): FAIL" "Hoodi: names the reth release"
 has "release notes: lighthouse v8.3.0-rc.0 does not schedule hoodi's Gloas / Amsterdam fork (README.md): FAIL" "Hoodi: names the Lighthouse release"
 has 'Release notes (from ops/ref-node/README.md, hoodi):' "Hoodi: copies the Hoodi release-note table"
+# cl_swapped: the two pins swapped between the services. Each image is pulled, and each
+# container runs the image its service's variable names (the stub's ids: 1111 for the reth ref,
+# 2222 for the Lighthouse one), so only the client check can fail criterion 1.
+cl_swapped() {
+  local image
+  image=$(env_get "$cl_env" RETH_IMAGE)
+  set_env "$cl_env" RETH_IMAGE "$(env_get "$cl_env" LIGHTHOUSE_IMAGE)"; set_env "$cl_env" LIGHTHOUSE_IMAGE "$image"
+  cl_inspect ctr-reth 'c["Image"] = "sha256:2222"'; cl_inspect ctr-lh 'c["Image"] = "sha256:1111"'
+}
+cl_hoodi; cl_swapped
+cl_quick "Hoodi: the two dev pins swapped between the services fail" --config "$pinned_hoodi"
+verdict 1 FAIL "Hoodi: swapped pins fail criterion 1"
+has "reth latest-unstable: RETH_IMAGE is a lighthouse image in README.md's hoodi table, not reth's: FAIL" "Hoodi: names the Lighthouse image pinned for reth"
+has "lighthouse nightly: LIGHTHOUSE_IMAGE is a reth image in README.md's hoodi table, not lighthouse's: FAIL" "Hoodi: names the reth image pinned for Lighthouse"
+has "reth container ctr-reth: image sha256:2222, pinned image sha256:2222: PASS" "Hoodi: the swapped containers run the images their variables name"
+cl_base; cl_swapped
+cl_quick "Sepolia: the two release pins swapped between the services fail"
+verdict 1 FAIL "Sepolia: swapped pins fail criterion 1"
+has "reth v8.3.0-rc.0: RETH_IMAGE is a lighthouse image in README.md's sepolia table, not reth's: FAIL" "Sepolia: names the Lighthouse image pinned for reth"
+has "lighthouse v2.7.0: LIGHTHOUSE_IMAGE is a reth image in README.md's sepolia table, not lighthouse's: FAIL" "Sepolia: names the reth image pinned for Lighthouse"
+cl_hoodi; set_env "$cl_env" RETH_IMAGE "sigp/lighthouse:nightly@sha256:${hoodi_reth##*sha256:}"
+printf '%s\n' "sigp/lighthouse@sha256:${hoodi_reth##*sha256:}" >> "$tmp/docker/lighthouse.digests"
+cl_quick "Hoodi: reth's reviewed digest under Lighthouse's repository fails" --config "$pinned_hoodi"
+verdict 1 FAIL "Hoodi: a digest under the other client's repository fails criterion 1"
+has "reth nightly: no hoodi row in README.md's release notes for this image: FAIL" "Hoodi: names the image without a reth row"
 cl_hoodi; cp "$tmp/hoodi-pre-gloas.json" "$http/eth_v1_config_spec"
 cl_quick "Hoodi: a node without Hoodi's Gloas epoch fails" --config "$pinned_hoodi"
 verdict 5 FAIL "Hoodi: a spec difference fails the spec criterion"

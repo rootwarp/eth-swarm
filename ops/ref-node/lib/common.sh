@@ -46,16 +46,29 @@ release_notes() {
     $0 == e { on = 0 } on { print } $0 == b { on = 1 }' "$1"
 }
 
-# release_row <README.md> <network> <image ref>: "<schedules>|<consensus-specs>" from the first
-# row of the network's table whose Image cell is `<image ref>` (tag and digest, so a re-pushed
-# tag has no row), cells trimmed; nothing when there is no such row. Columns: Image,
-# Release, Schedules the fork (yes or no), consensus-specs, Release-note line or fork-schedule
-# check. The awk reads the whole table: one that stopped at the match would leave release_notes
-# writing into a closed pipe, and pipefail would turn its SIGPIPE into exit 141.
+# release_row <README.md> <network> <client> <image ref>: "<schedules>|<consensus-specs>" from
+# the first row of the network's table whose Image cell is `<image ref>` (tag and digest, so a
+# re-pushed tag has no row) and whose Client cell is <client> (reth or lighthouse: the service
+# the image is for, so a pin swapped between the services has no row), cells trimmed; nothing
+# when there is no such row. Columns: Image, Client, Release, Schedules the fork (yes or no),
+# consensus-specs, Release-note line or fork-schedule check. The awk reads the whole table: one
+# that stopped at the match would leave release_notes writing into a closed pipe, and pipefail
+# would turn its SIGPIPE into exit 141.
 release_row() {
+  release_notes "$1" "$2" | RELEASE_CLIENT=$3 RELEASE_IMG="\`$4\`" awk -F '|' '
+    function trim(x) { gsub(/^[ \t]+|[ \t]+$/, "", x); return x }
+    !found && NF >= 8 && trim($2) == ENVIRON["RELEASE_IMG"] && trim($3) == ENVIRON["RELEASE_CLIENT"] {
+      print trim($5) "|" trim($6); found = 1
+    }'
+}
+
+# release_client <README.md> <network> <image ref>: the Client cell of the first row of the
+# network's table whose Image cell is `<image ref>`; nothing when there is no such row. Only a
+# diagnosis (which client a refused pin belongs to): release_row decides.
+release_client() {
   release_notes "$1" "$2" | RELEASE_IMG="\`$3\`" awk -F '|' '
     function trim(x) { gsub(/^[ \t]+|[ \t]+$/, "", x); return x }
-    !found && NF >= 7 && trim($2) == ENVIRON["RELEASE_IMG"] { print trim($4) "|" trim($5); found = 1 }'
+    !found && NF >= 8 && trim($2) == ENVIRON["RELEASE_IMG"] { print trim($3); found = 1 }'
 }
 
 # The ports compose.yaml binds, from .env (both .env examples set them; the second network on
