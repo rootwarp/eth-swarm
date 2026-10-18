@@ -77,7 +77,7 @@ passed=0 failed=0
 check() {
   local expect=$1 desc=$2 want=$3 root=$4 rc=0 out ok=0
   shift 4
-  out=$(env "$@" bash "$script" "$root" 2>&1) || rc=$?; [[ $desc != cleanup* ]] || printf "DEBUG %s\n" "$out"
+  out=$(env "$@" bash "$script" "$root" 2>&1) || rc=$?
   if { [[ $expect == pass ]] && ((rc == 0)); } || { [[ $expect == fail ]] && ((rc != 0)); }; then ok=1; fi
   if ((ok)) && [[ -n $want ]] && ! grep -qF -- "$want" <<<"$out"; then ok=0; fi
   if ((ok)); then
@@ -259,7 +259,7 @@ STUB
   else
     passed=$((passed + 1)); echo "ok   - the stand-in git planted a held directory in both runs"
   fi
-  while IFS= read -r d; do echo "DEBUG $(ls "$d")"; chmod -R u+w "$d" && rm -rf "$d"; done < "$tmp/held.list"
+  while IFS= read -r d; do chmod -R u+w "$d" && rm -rf "$d"; done < "$tmp/held.list"
 fi
 
 # The real lockfile (ancestry stubbed: no network in this test).
