@@ -273,6 +273,24 @@ async fn a_genesis_state_request_failure_names_the_endpoint_only() {
 }
 
 #[tokio::test]
+async fn a_genesis_state_404_fails_as_genesis() {
+    // No state at the genesis block's state_root: the export fails, naming that root.
+    let out = tempfile::tempdir().unwrap();
+    let devnet = Devnet::new(4, &[]);
+    let by_root = format!("/eth/v2/debug/beacon/states/{}", devnet.state_root);
+    let server = serve_with(devnet.clone(), vec![(by_root, Reply::status(404))]).await;
+    let err = export::<Spec>(&server.url(""), &chain(), &config(4), out.path())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ExportError::Genesis(m)
+            if m.contains("has no state") && m.contains(&devnet.state_root.to_string())),
+        "{err}"
+    );
+    assert!(!out.path().join("fixture-devnet").join(EXPORT_FILE).exists());
+}
+
+#[tokio::test]
 async fn a_block_404_with_a_served_root_fails() {
     let out = tempfile::tempdir().unwrap();
     let devnet = Devnet::new(6, &[]);

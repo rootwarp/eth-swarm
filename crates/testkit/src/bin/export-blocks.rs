@@ -6,7 +6,7 @@
 //!                      --out DIR --image REF [--image REF]...
 //!                      [--timeout-secs N] [--state-timeout-secs N] [--max-state-bytes N]
 //! export-blocks verify [--sha256 HEX] EXPORT_DIR
-//! export-blocks diff EXPORT_DIR EXPORT_DIR
+//! export-blocks diff --sha256-a HEX --sha256-b HEX A_DIR B_DIR
 //! export-blocks --help
 //! ```
 //!
@@ -16,8 +16,10 @@
 //! opens an export through [`testkit::export_blocks::open_export`], or with `--sha256` through
 //! [`testkit::export_blocks::open_export_pinned`] (the only check that authenticates an
 //! export: the digest `export` printed, from the run log), and prints its slot range, block and
-//! empty-slot counts, genesis roots and digest. `diff` opens two exports unpinned and compares
-//! their root lists ([`testkit::export_blocks::diff_root_lists`]); verify each pinned first.
+//! empty-slot counts, genesis roots and digest. `diff` opens each of two exports through
+//! `open_export_pinned` under its own pin (`--sha256-a` for `A_DIR`, `--sha256-b` for `B_DIR`),
+//! so neither can be swapped between its pinned `verify` and the `diff`, and compares their root
+//! lists ([`testkit::export_blocks::diff_root_lists`]). There is no unpinned `diff`.
 //!
 //! Exit codes: 0 done (or identical root lists), 1 the export failed, an export was refused or
 //! the root lists differ, 64 usage.
@@ -32,8 +34,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 use testkit::collector::ReferenceApiUrl;
 use testkit::export_blocks::{
-    diff_root_lists, export, open_export, open_export_pinned, Export, ExportConfig, RootListDiff,
-    SlotEntry, DEFAULT_MAX_STATE_BYTES, DEFAULT_REQUEST_TIMEOUT, DEFAULT_STATE_TIMEOUT,
+    diff_root_lists, export, open_export, open_export_pinned, Export, ExportConfig, ExportError,
+    RootListDiff, SlotEntry, DEFAULT_MAX_STATE_BYTES, DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_STATE_TIMEOUT,
 };
 
 const USAGE: &str = "\
@@ -41,7 +44,7 @@ usage: export-blocks export --api URL --config PATH --devnet NAME --source NAME 
                             --out DIR --image REF [--image REF]...
                             [--timeout-secs N] [--state-timeout-secs N] [--max-state-bytes N]
        export-blocks verify [--sha256 HEX] EXPORT_DIR
-       export-blocks diff EXPORT_DIR EXPORT_DIR
+       export-blocks diff --sha256-a HEX --sha256-b HEX A_DIR B_DIR
        export-blocks --help";
 const HELP: &str = "\
 Export a devnet's blocks and roots from genesis to an export slot, plus its genesis state, into
@@ -72,8 +75,11 @@ printed, from the run log) refuses any export but that one; only the pin authent
 
   --sha256 HEX               the pinned export_sha256, 64 lowercase hex digits
 
-diff verifies two exports, unpinned, and compares their root lists slot by slot from genesis;
-verify each one pinned first.
+diff opens two exports, each only under its pin (as verify --sha256 does), and compares their
+root lists slot by slot from genesis. An export that is not its pinned one is refused.
+
+  --sha256-a HEX             A_DIR's export_sha256, from the run log
+  --sha256-b HEX             B_DIR's export_sha256, from the run log
 
 Exit codes: 0 done (or identical root lists), 1 the export failed, an export was refused or the
 root lists differ, 64 usage.";
@@ -87,8 +93,15 @@ const MAX_CONFIG_BYTES: u64 = 1 << 20;
 enum Command {
     Help,
     Verify(PathBuf, Option<[u8; 32]>),
-    Diff(PathBuf, PathBuf),
+    Diff(Pinned, Pinned),
     Export(ExportArgs),
+}
+
+/// An export directory and the `export_sha256` it must have.
+#[derive(Debug, PartialEq, Eq)]
+struct Pinned {
+    dir: PathBuf,
+    sha256: [u8; 32],
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -111,10 +124,7 @@ fn parse(args: &[String]) -> Result<Command, String> {
     }
     match args.first().map(String::as_str) {
         Some("verify") => parse_verify(&args[1..]),
-        Some("diff") => match &args[1..] {
-            [a, b] => Ok(Command::Diff(a.into(), b.into())),
-            _ => Err("diff takes exactly two EXPORT_DIRs".into()),
-        },
+        Some("diff") => parse_diff(&args[1..]),
         Some("export") => parse_export(&args[1..]).map(Command::Export),
         Some(_) => Err("unknown command (want export, verify or diff)".into()),
         None => Err("no command".into()),
@@ -127,7 +137,7 @@ fn parse_verify(args: &[String]) -> Result<Command, String> {
     while let Some(arg) = it.next() {
         if arg == "--sha256" {
             let value = it.next().ok_or("--sha256 needs a value")?;
-            if pin.replace(sha256_hex(value)?).is_some() {
+            if pin.replace(sha256_hex("--sha256", value)?).is_some() {
                 return Err("give --sha256 once".into());
             }
         } else if dir.replace(PathBuf::from(arg)).is_some() {
@@ -138,15 +148,53 @@ fn parse_verify(args: &[String]) -> Result<Command, String> {
     Ok(Command::Verify(dir, pin))
 }
 
-/// 64 lowercase hex digits; the error never quotes the value.
-fn sha256_hex(value: &str) -> Result<[u8; 32], String> {
+/// `diff --sha256-a HEX --sha256-b HEX A_DIR B_DIR`, flags and directories in any order: each
+/// export is opened only under its own pin.
+fn parse_diff(args: &[String]) -> Result<Command, String> {
+    let (mut pin_a, mut pin_b, mut dirs) = (None, None, Vec::new());
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let pin = match arg.as_str() {
+            "--sha256-a" => &mut pin_a,
+            "--sha256-b" => &mut pin_b,
+            flag if flag.starts_with("--") => return Err(unknown_argument(flag)),
+            dir => {
+                dirs.push(PathBuf::from(dir));
+                continue;
+            }
+        };
+        let value = it.next().ok_or_else(|| format!("{arg} needs a value"))?;
+        if pin.replace(sha256_hex(arg, value)?).is_some() {
+            return Err(format!("give {arg} once"));
+        }
+    }
+    let [a, b]: [PathBuf; 2] = dirs
+        .try_into()
+        .map_err(|_| "diff takes exactly two EXPORT_DIRs, A_DIR then B_DIR")?;
+    let required = |pin: Option<[u8; 32]>, flag: &str| {
+        pin.ok_or_else(|| format!("{flag} is required (the export_sha256 from the run log)"))
+    };
+    Ok(Command::Diff(
+        Pinned {
+            dir: a,
+            sha256: required(pin_a, "--sha256-a")?,
+        },
+        Pinned {
+            dir: b,
+            sha256: required(pin_b, "--sha256-b")?,
+        },
+    ))
+}
+
+/// 64 lowercase hex digits; the error names `flag`, never the value.
+fn sha256_hex(flag: &str, value: &str) -> Result<[u8; 32], String> {
     let lower = value
         .bytes()
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
     let mut digest = [0; 32];
     match hex::decode_to_slice(value, &mut digest) {
         Ok(()) if lower => Ok(digest),
-        _ => Err("--sha256: want 64 lowercase hex digits".into()),
+        _ => Err(format!("{flag}: want 64 lowercase hex digits")),
     }
 }
 
@@ -293,7 +341,7 @@ fn run_export(args: &ExportArgs) -> Result<Export, String> {
         match chain.preset_base() {
             "minimal" => export::<Minimal>(&url, &chain, &config, &args.out).await,
             "mainnet" => export::<Mainnet>(&url, &chain, &config, &args.out).await,
-            other => Err(testkit::export_blocks::ExportError::Config(format!(
+            other => Err(ExportError::Config(format!(
                 "unknown PRESET_BASE {other:?}"
             ))),
         }
@@ -331,9 +379,25 @@ fn open(dir: &Path, pin: Option<[u8; 32]>, err: &mut dyn Write) -> Option<Export
     match opened {
         Ok(export) => Some(export),
         Err(e) => {
-            let _ = writeln!(err, "export-blocks: {}: refused: {e}", dir.display());
+            let _ = writeln!(
+                err,
+                "export-blocks: {}: refused: {}",
+                dir.display(),
+                refusal(&e)
+            );
             None
         }
+    }
+}
+
+/// Why an export was refused. A pin mismatch names the export's own digest, never the pin given
+/// on the command line.
+fn refusal(e: &ExportError) -> String {
+    match e {
+        ExportError::NotPinned { actual, .. } => {
+            format!("export_sha256 {actual} is not the pinned digest")
+        }
+        e => e.to_string(),
     }
 }
 
@@ -355,10 +419,17 @@ fn entry(e: SlotEntry) -> String {
     }
 }
 
-fn diff(a: &Path, b: &Path, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
-    let (Some(ea), Some(eb)) = (open(a, None, err), open(b, None, err)) else {
+/// Opens each export under its pin, so neither can be swapped after its pinned `verify`, then
+/// compares their root lists.
+fn diff(a: &Pinned, b: &Pinned, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    let opened = (
+        open(&a.dir, Some(a.sha256), err),
+        open(&b.dir, Some(b.sha256), err),
+    );
+    let (Some(ea), Some(eb)) = opened else {
         return EXIT_FAILED;
     };
+    let (a, b) = (&a.dir, &b.dir);
     let (ma, mb) = (ea.manifest(), eb.manifest());
     match diff_root_lists(&ea.root_list(), &eb.root_list()) {
         RootListDiff::Identical { slots } => {
@@ -540,20 +611,102 @@ mod tests {
             assert!(e.contains("--sha256: want 64 lowercase hex"), "{e}");
             assert!(!e.contains(&hunter), "{e}");
         }
-        assert_eq!(
-            parse(&args(&["diff", "a", "b"])),
-            Ok(Command::Diff("a".into(), "b".into()))
-        );
         assert_eq!(parse(&args(&["diff", "-h"])), Ok(Command::Help));
-        for bad in [&["verify"][..], &["diff", "a"], &["frob"], &[]] {
+        for bad in [&["verify"][..], &["frob"], &[]] {
             assert!(parse(&args(bad)).is_err(), "{bad:?}");
         }
         let (code, out, _) = run_args(&["--help"]);
         assert_eq!(code, 0);
         assert!(out.contains("--image REF"), "{out}");
+        assert!(
+            out.contains("--sha256-a HEX --sha256-b HEX A_DIR B_DIR"),
+            "{out}"
+        );
         let (code, _, err) = run_args(&["frob"]);
         assert_eq!(code, EXIT_USAGE);
         assert!(err.contains("usage:"), "{err}");
+    }
+
+    #[test]
+    fn diff_takes_a_pin_for_each_export() {
+        let (pa, pb) = ("ab".repeat(32), "cd".repeat(32));
+        let pinned = Ok(Command::Diff(
+            Pinned {
+                dir: "a".into(),
+                sha256: [0xab; 32],
+            },
+            Pinned {
+                dir: "b".into(),
+                sha256: [0xcd; 32],
+            },
+        ));
+        for order in [
+            vec!["diff", "--sha256-a", &pa, "--sha256-b", &pb, "a", "b"],
+            vec!["diff", "a", "--sha256-b", &pb, "b", "--sha256-a", &pa],
+            vec!["diff", "a", "b", "--sha256-a", &pa, "--sha256-b", &pb],
+        ] {
+            assert_eq!(parse(&args(&order)), pinned, "{order:?}");
+        }
+        for (bad, why) in [
+            (vec!["diff", "a", "b"], "--sha256-a is required"),
+            (
+                vec!["diff", "--sha256-a", &pa, "a", "b"],
+                "--sha256-b is required",
+            ),
+            (
+                vec!["diff", "--sha256-b", &pb, "a", "b"],
+                "--sha256-a is required",
+            ),
+            (
+                vec!["diff", "--sha256-a", &pa, "--sha256-b", &pb, "a"],
+                "exactly two EXPORT_DIRs",
+            ),
+            (
+                vec!["diff", "--sha256-a", &pa, "--sha256-b", &pb, "a", "b", "c"],
+                "exactly two EXPORT_DIRs",
+            ),
+            (
+                vec![
+                    "diff",
+                    "--sha256-a",
+                    &pa,
+                    "--sha256-a",
+                    &pa,
+                    "--sha256-b",
+                    &pb,
+                    "a",
+                    "b",
+                ],
+                "give --sha256-a once",
+            ),
+            (
+                vec!["diff", "a", "b", "--sha256-b"],
+                "--sha256-b needs a value",
+            ),
+            (
+                vec!["diff", "--sha256", &pa, "a", "b"],
+                "unknown argument --sha256",
+            ),
+        ] {
+            let e = parse(&args(&bad)).unwrap_err();
+            assert!(e.contains(why), "{bad:?}: {e}");
+        }
+        // A malformed pin is refused by name, never quoted.
+        for hunter in [
+            "AB".repeat(32),
+            "ab".repeat(31),
+            format!("{}hunter2", "a".repeat(57)),
+        ] {
+            for flag in ["--sha256-a", "--sha256-b"] {
+                let list = ["diff", flag, &hunter, "a", "b"];
+                let e = parse(&args(&list)).unwrap_err();
+                assert!(e.contains(&format!("{flag}: want 64 lowercase hex")), "{e}");
+                assert!(!e.contains(&hunter), "{e}");
+                let (code, _, err) = run_args(&list);
+                assert_eq!(code, EXIT_USAGE);
+                assert!(!err.contains(&hunter), "{err}");
+            }
+        }
     }
 
     /// Exports `devnet` to slot `to` through the command line, into `out`.
@@ -611,7 +764,7 @@ mod tests {
             exported_a.contains("slots 0-10: 10 blocks, 1 empty"),
             "{exported_a}"
         );
-        let (code, _, err) = export_cli(devnet.clone(), 10, &b, &config).await;
+        let (code, exported_b, err) = export_cli(devnet.clone(), 10, &b, &config).await;
         assert_eq!(code, 0, "{err}");
 
         let mut other = devnet.clone();
@@ -649,13 +802,55 @@ mod tests {
             "{err}"
         );
 
-        let (code, out, err) = run_args(&["diff", da.to_str().unwrap(), db.to_str().unwrap()]);
+        // The pin of another export is never echoed: only the export's own digest is named.
+        assert!(!err.contains(&pin_c), "{err}");
+
+        let pin_b = pin(&exported_b);
+        let diff = |a: &Path, pin_a: &str, b: &Path, pin_b: &str| {
+            let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
+            run_args(&["diff", "--sha256-a", pin_a, "--sha256-b", pin_b, a, b])
+        };
+        let (code, out, err) = diff(&da, &pin_a, &db, &pin_b);
         assert_eq!(code, 0, "{err}");
         assert!(out.starts_with("identical: 11 slots, 10 blocks"), "{out}");
 
-        let (code, _, err) = run_args(&["diff", da.to_str().unwrap(), dc.to_str().unwrap()]);
+        let (code, _, err) = diff(&da, &pin_a, &dc, &pin_c);
         assert_eq!(code, EXIT_FAILED);
         assert!(err.contains("root lists differ, first at slot 8"), "{err}");
+
+        // Each export only under its own pin: a wrong pin on either side is refused, unechoed.
+        for (code, _, err) in [
+            diff(&da, &pin_c, &db, &pin_b),
+            diff(&da, &pin_a, &dc, &pin_b),
+        ] {
+            assert_eq!(code, EXIT_FAILED);
+            assert!(err.contains("not the pinned"), "{err}");
+            assert!(
+                !err.contains("identical") && !err.contains("differ"),
+                "{err}"
+            );
+        }
+        let (_, out, err) = diff(&da, &pin_c, &db, &pin_b);
+        assert!(out.is_empty(), "{out}");
+        assert!(!err.contains(&pin_c), "{err}");
+
+        // An export swapped after its pinned verify: c's directory now holds a copy of a's
+        // chain (b), which would diff identical. Under c's pin it is refused.
+        let (code, _, err) = run_args(&["verify", "--sha256", &pin_c, dc.to_str().unwrap()]);
+        assert_eq!(code, 0, "{err}");
+        let pinned_c = tmp.path().join("c-pinned");
+        std::fs::rename(&dc, &pinned_c).unwrap();
+        std::fs::rename(&db, &dc).unwrap();
+        let (code, out, err) = diff(&da, &pin_a, &dc, &pin_c);
+        assert_eq!(code, EXIT_FAILED, "{out}");
+        assert!(out.is_empty(), "{out}");
+        assert!(
+            err.contains(&format!("{}: refused", dc.display())) && err.contains("not the pinned"),
+            "{err}"
+        );
+        assert!(!err.contains(&pin_c), "{err}");
+        std::fs::rename(&dc, &db).unwrap();
+        std::fs::rename(&pinned_c, &dc).unwrap();
 
         // An export into an existing directory fails; so does a refused export dir.
         let (code, _, err) = export_cli(devnet, 10, &a, &config).await;
@@ -664,8 +859,9 @@ mod tests {
         let (code, _, err) = run_args(&["verify", tmp.path().to_str().unwrap()]);
         assert_eq!(code, EXIT_FAILED);
         assert!(err.contains("refused"), "{err}");
-        let (code, _, _) = run_args(&["diff", tmp.path().to_str().unwrap(), db.to_str().unwrap()]);
+        let (code, _, err) = diff(tmp.path(), &pin_a, &db, &pin_b);
         assert_eq!(code, EXIT_FAILED);
+        assert!(err.contains("refused"), "{err}");
     }
 
     #[test]

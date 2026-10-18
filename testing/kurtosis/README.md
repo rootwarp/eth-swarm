@@ -362,10 +362,11 @@ who can write the directory can fabricate a consistent suffix (drop or replace t
 the blocks after any slot) and rehash every manifest. Fork digests are not recomputed either
 (from Fulu every digest mixes in the epoch's blob parameters, which the export does not carry).
 Only the `export_sha256` that `export` printed, kept in the run log, authenticates an export:
-`verify --sha256` and `open_export_pinned` refuse any other.
+`verify --sha256`, `diff --sha256-a/--sha256-b` and `open_export_pinned` refuse any other.
 
-Status: tested against a fixture beacon node only. It has not been run on the devnet yet, so
-the first run also confirms that `network-config` reads the generated `config.yaml`.
+Status: run live on the local devnet pair (export slot 24): the Lighthouse and Lodestar exports
+both pass `verify --sha256`, and `diff` reports identical root lists, 25 slots and 25 blocks.
+`network-config` reads the generated `config.yaml`.
 
 Run it on a devnet whose finalized epoch is at least 3 (`check-devnet.sh` passes), from the repo
 root. For a concurrent pair, export from one of its enclaves (`ethswarm-gloas-a`) before the
@@ -393,15 +394,22 @@ ls=$(kurtosis port print "$enclave" cl-2-lodestar-geth http)
 finalized() { curl -s "$1/eth/v1/beacon/headers/finalized" | jq -r .data.header.message.slot; }
 a=$(finalized "$lh"); b=$(finalized "$ls"); to=$(( a < b ? a : b )); echo "export slot $to"
 
-# Each export's one-line summary goes into the run log; its last field is the export_sha256.
+# Each export's one-line summary goes into the run log and into this run's own summary file;
+# its last field is the export_sha256. pipefail gives each pipe the export's status, not tee's,
+# and the && chain stops at a failed export (an --out that exists already, say) and reads no
+# pin. The pins come only from this run's summary files, never from an older run-log line.
+mkdir -p "$export_root"
+set -o pipefail
+lh_sha= ls_sha=
 "$bin" export --api "$lh" --config "$genesis/config.yaml" --devnet "$enclave" \
   --source cl-1-lighthouse-geth --to "$to" --out "$export_root/lighthouse" "${image_args[@]}" \
-  | tee -a "$export_root/run.log"
-"$bin" export --api "$ls" --config "$genesis/config.yaml" --devnet "$enclave" \
+  | tee -a "$export_root/run.log" | tee "$export_root/lighthouse.summary" \
+&& "$bin" export --api "$ls" --config "$genesis/config.yaml" --devnet "$enclave" \
   --source cl-2-lodestar-geth --to "$to" --out "$export_root/lodestar" "${image_args[@]}" \
-  | tee -a "$export_root/run.log"
-pin() { grep -F "$1: ok," "$export_root/run.log" | tail -n 1 | awk '{print $NF}'; }
-lh_sha=$(pin "$export_root/lighthouse/$enclave"); ls_sha=$(pin "$export_root/lodestar/$enclave")
+  | tee -a "$export_root/run.log" | tee "$export_root/lodestar.summary" \
+&& lh_sha=$(awk '{print $NF}' "$export_root/lighthouse.summary") \
+&& ls_sha=$(awk '{print $NF}' "$export_root/lodestar.summary") \
+|| echo "an export failed: no pins read" >&2
 ```
 
 Each `export` prints one line: the slot range, the block and empty-slot counts, the genesis
@@ -417,7 +425,8 @@ The checks, with the two exports above:
 "$bin" verify --sha256 "$ls_sha" "$export_root/lodestar/$enclave"
 
 # Both CLs' exports have identical root lists (exit 1 and the first differing slot otherwise).
-"$bin" diff "$export_root/lighthouse/$enclave" "$export_root/lodestar/$enclave"
+"$bin" diff --sha256-a "$lh_sha" --sha256-b "$ls_sha" \
+  "$export_root/lighthouse/$enclave" "$export_root/lodestar/$enclave"
 
 # Count check, on both CLs: each one's API block count over 0..=$to equals its export's
 # "N blocks" (printed by the pinned verify above).
