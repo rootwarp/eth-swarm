@@ -19,14 +19,19 @@ seconds>/`:
 |---|---|
 | `capture.toml` | network, `genesis_time` (read from the node), `SLOT_DURATION_MS`, column subnet count, subscribed events, host, time daemon, start on both clocks |
 | `records.jsonl` | one record per event: `source`, `topic`, `subnet`, `msg_id`, `block_root`, `slot`, `recv_mono_ns`, `recv_wall_ns`, `peer` |
-| `gaps.jsonl` | one missing interval per disconnect, written when the stream is back |
+| `gaps.jsonl` | one missing interval per disconnect, and one for the time before the first stream, written when the stream is back |
 | `ntp.jsonl` | the clock error (local minus NTP) from `chronyc tracking`, every 60 s |
-| `summary.toml` | written at stop: record, drop and undecoded counts, and every missing interval |
+| `summary.toml` | written at stop: record, drop and undecoded counts, and the number and total length of the missing intervals (`gaps.jsonl` lists them) |
 
 The stream is reconnected with backoff (1 s, doubling, up to 30 s). Beacon nodes do not replay
 missed events, so every disconnect, however short, is a missing interval: from the last bytes
-received to the next stream's response, with its reason and failed attempts. A disconnect still
-open at stop is recorded with `open_at_shutdown = true`.
+received to the next stream's response, with its reason and failed attempts. The time from the
+start to the first stream is one too. A disconnect still open at stop is recorded with
+`open_at_shutdown = true`. Events the collector did not subscribe to are refused and counted,
+never recorded.
+
+If the capture cannot be written (a full disk, say), the collector stops reading and exits 1,
+so `Restart=on-failure` starts a new capture once there is room.
 
 ## Install
 
@@ -95,7 +100,7 @@ unit sha256:           $(sha256sum /etc/systemd/system/ethswarm-collector.servic
 git commit:            <commit the binary was built from>
 smoke capture:         /var/lib/ethswarm-collector/hoodi-<start>/  (start, stop, duration)
 records / undecoded / dropped:  from summary.toml
-missing intervals:     from summary.toml
+missing intervals:     count and total from summary.toml; each one in gaps.jsonl
 ntp clock error range: from ntp.jsonl
 ```
 

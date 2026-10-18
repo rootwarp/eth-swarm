@@ -1,5 +1,6 @@
-//! Test doubles (feature `test-support`): a scripted clock, a pause that advances it instead of sleeping, and a fixture
-//! beacon node serving scripted HTTP/1.1 replies on 127.0.0.1.
+//! Test doubles (feature `test-support`): a scripted clock, a pause that advances it instead of
+//! sleeping, a fixture beacon node serving scripted HTTP/1.1 replies on 127.0.0.1, and a
+//! server that hangs up on every connection.
 
 use super::clock::{Clock, Stamp};
 use super::sse::Pause;
@@ -11,6 +12,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -65,6 +67,7 @@ pub struct Reply {
     content_type: &'static str,
     chunks: Vec<Bytes>,
     hold: bool,
+    pace: Option<Duration>,
 }
 
 impl Reply {
@@ -79,6 +82,15 @@ impl Reply {
                 .map(|c| Bytes::copy_from_slice(c.as_bytes()))
                 .collect(),
             hold,
+            pace: None,
+        }
+    }
+
+    /// This reply with `every` between its chunks (real time), the first after `every` too.
+    pub fn paced(self, every: Duration) -> Self {
+        Self {
+            pace: Some(every),
+            ..self
         }
     }
 
@@ -107,10 +119,12 @@ impl Reply {
     }
 }
 
-/// A body that writes its chunks, then ends or stays open.
+/// A body that writes its chunks, `pace` apart if set, then ends or stays open.
 struct ChunkBody {
     chunks: VecDeque<Bytes>,
     hold: bool,
+    pace: Option<Duration>,
+    wait: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl Body for ChunkBody {
@@ -119,8 +133,17 @@ impl Body for ChunkBody {
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        if let (Some(pace), false) = (self.pace, self.chunks.is_empty()) {
+            let wait = self
+                .wait
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(pace)));
+            if wait.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.wait = None;
+        }
         match self.chunks.pop_front() {
             Some(chunk) => Poll::Ready(Some(Ok(Frame::data(chunk)))),
             // Never woken: the client ends it by closing the connection.
@@ -164,6 +187,8 @@ impl FixtureServer {
                         let body = ChunkBody {
                             chunks: r.chunks.into(),
                             hold: r.hold,
+                            pace: r.pace,
+                            wait: None,
                         };
                         Response::builder()
                             .status(r.status)
@@ -189,6 +214,35 @@ impl FixtureServer {
     /// Every request so far: path and query, headers.
     pub fn seen(&self) -> Vec<(String, HeaderMap)> {
         self.seen.lock().unwrap().clone()
+    }
+}
+
+/// A loopback server that accepts every connection and closes it at once, before reading a
+/// byte: every request to it fails. It holds its port until the test's runtime ends, so no
+/// other socket can take the port meanwhile; freeing a port and hoping nothing listens there
+/// does not hold under load.
+#[derive(Debug)]
+pub struct HangUp {
+    /// Where it listens.
+    pub addr: SocketAddr,
+}
+
+impl HangUp {
+    /// Listens on a fresh port on 127.0.0.1.
+    pub async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        Self { addr }
+    }
+
+    /// Its URL with base path `base` (`""` or `/…`).
+    pub fn url(&self, base: &str) -> ReferenceApiUrl {
+        ReferenceApiUrl::parse(&format!("http://{}{base}", self.addr)).unwrap()
     }
 }
 

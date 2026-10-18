@@ -2,14 +2,16 @@
 //!
 //! hyper 1 over plain TCP to a loopback [`ReferenceApiUrl`], HTTP/1.1, no redirects (anything
 //! but `200 text/event-stream` is a failure). Each body chunk is stamped the moment it arrives,
-//! before the parser reads it, and every event it completes carries that stamp. A stream that
-//! ends, fails, sends an oversized event or stays silent for [`SseConfig::idle_timeout`] is
-//! reconnected; the time without a stream becomes a [`MissingInterval`], from the last chunk
-//! received to the next stream's response, with the first failure's reason and the failed
-//! attempts. Beacon nodes do not replay missed events, so every disconnect is a gap, however
-//! short. Errors name the API path only, never the base URL or the query.
+//! before the parser reads it, and every event it completes carries that stamp; one whose name
+//! was not subscribed is counted, never handed over. A stream that ends, fails, sends an
+//! oversized event or stays silent for [`SseConfig::idle_timeout`] is reconnected; the time
+//! without a stream becomes a [`MissingInterval`], from the last chunk received (or the start,
+//! before the first stream) to the next stream's response, with the first failure's reason and
+//! the failed attempts. Beacon nodes do not replay missed events, so every disconnect is a gap,
+//! however short. Errors name the API path only, never the base URL, the query or a value from
+//! the response.
 
-use super::parse::{SseParser, TooLarge};
+use super::parse::{SseParser, MAX_EVENT_NAME_BYTES};
 use crate::collector::arrival::{Arrival, Arrivals, MissingInterval, StampedEvent};
 use crate::collector::clock::{Clock, Stamp};
 use crate::collector::record::Source;
@@ -95,15 +97,28 @@ pub enum SseConfigError {
     /// No topic.
     #[error("no SSE topic to subscribe")]
     NoTopic,
-    /// A topic that is not `[a-z0-9_]+`.
-    #[error("SSE topic {0:?} may only use [a-z0-9_]")]
+    /// A topic that is not 1 to [`MAX_EVENT_NAME_BYTES`] of `[a-z0-9_]`. The message does not
+    /// quote it: a misplaced argument (a keyed URL) can land here.
+    #[error("an SSE topic must be 1 to {MAX_EVENT_NAME_BYTES} of [a-z0-9_]")]
     Topic(String),
 }
 
 impl SseConfig {
-    /// `url` with `topics` (sorted, deduplicated), 1 s to 30 s backoff, a 10 s request and a
-    /// 60 s idle deadline.
+    /// `url` with `topics` ([`SseConfig::checked_topics`]), 1 s to 30 s backoff, a 10 s request
+    /// and a 60 s idle deadline.
     pub fn new(url: ReferenceApiUrl, topics: &[&str]) -> Result<Self, SseConfigError> {
+        Ok(Self {
+            url,
+            topics: Self::checked_topics(topics)?,
+            backoff: Backoff::default(),
+            request_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(60),
+        })
+    }
+
+    /// `topics` sorted and deduplicated; refused if there is none or one is not 1 to
+    /// [`MAX_EVENT_NAME_BYTES`] of `[a-z0-9_]` (it could never match an event name).
+    pub fn checked_topics(topics: &[&str]) -> Result<Vec<String>, SseConfigError> {
         let mut topics: Vec<String> = topics.iter().map(|t| (*t).to_owned()).collect();
         topics.sort();
         topics.dedup();
@@ -113,17 +128,18 @@ impl SseConfig {
         let allowed = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_';
         if let Some(bad) = topics
             .iter()
-            .find(|t| t.is_empty() || !t.bytes().all(allowed))
+            .find(|t| t.is_empty() || t.len() > MAX_EVENT_NAME_BYTES || !t.bytes().all(allowed))
         {
             return Err(SseConfigError::Topic(bad.clone()));
         }
-        Ok(Self {
-            url,
-            topics,
-            backoff: Backoff::default(),
-            request_timeout: Duration::from_secs(10),
-            idle_timeout: Duration::from_secs(60),
-        })
+        Ok(topics)
+    }
+
+    /// Whether `event` is one of the subscribed topics.
+    fn subscribed(&self, event: &str) -> bool {
+        self.topics
+            .binary_search_by(|t| t.as_str().cmp(event))
+            .is_ok()
     }
 
     fn path_and_query(&self) -> String {
@@ -175,24 +191,31 @@ pub struct SseStats {
     pub connections: u64,
     /// Events handed over (offered; drops are counted by [`Arrivals`]).
     pub events: u64,
+    /// Events refused because their name was not subscribed (a node sending what was not
+    /// asked for is not trusted to fill the channel).
+    pub unsubscribed: u64,
     /// Missing intervals recorded.
     pub gaps: u64,
 }
 
 /// Streams events into `arrivals` until `stop` turns true (or its sender is dropped),
-/// reconnecting with backoff and recording every gap. An interval still open at the stop is
-/// recorded as [`MissingInterval::open_at_shutdown`]. Returns early if the collector has
-/// stopped (the channel is closed).
+/// reconnecting with backoff and recording every gap, the time from `started` (the capture's
+/// start, as its `capture.toml` records it) to the first stream included. An interval still
+/// open at the stop is recorded as [`MissingInterval::open_at_shutdown`]. Returns early if the
+/// collector has stopped (the channel is closed).
 pub async fn run<P: Pause>(
     config: &SseConfig,
     clock: &dyn Clock,
     pause: &P,
     arrivals: &Arrivals,
+    started: Stamp,
     mut stop: watch::Receiver<bool>,
 ) -> SseStats {
     let mut stats = SseStats::default();
-    let started = clock.now();
-    let mut gap: Option<OpenGap> = None;
+    // Nothing is received until the first stream is up: the time since the capture started,
+    // its setup included, is a gap too, closed by the first 200 (or open at a stop that comes
+    // first).
+    let mut gap = Some(OpenGap::new(started, None));
     let mut delay = config.backoff.initial;
     loop {
         let attempt = tokio::select! {
@@ -202,7 +225,8 @@ pub async fn run<P: Pause>(
         };
         match attempt {
             Err(e) => {
-                let open = gap.get_or_insert_with(|| OpenGap::new(started, e.to_string()));
+                let open = gap.get_or_insert_with(|| OpenGap::new(clock.now(), None));
+                open.reason.get_or_insert_with(|| e.to_string());
                 open.failed_attempts += 1;
             }
             Ok(body) => {
@@ -217,10 +241,12 @@ pub async fn run<P: Pause>(
                 }
                 let streamed = stream(config, body, clock, arrivals, connected, &mut stop).await;
                 stats.events += streamed.events;
+                stats.unsubscribed += streamed.unsubscribed;
                 match streamed.end {
                     StreamEnd::Stopped => break,
+                    StreamEnd::Closed => return stats,
                     StreamEnd::Failed(reason) => {
-                        gap = Some(OpenGap::new(streamed.last_alive, reason));
+                        gap = Some(OpenGap::new(streamed.last_alive, Some(reason)));
                     }
                 }
                 if streamed.events > 0 {
@@ -252,12 +278,13 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
 /// A gap that has not ended yet.
 struct OpenGap {
     start: Stamp,
-    reason: String,
+    /// The first failure; `None` before the first stream while no attempt has failed.
+    reason: Option<String>,
     failed_attempts: u32,
 }
 
 impl OpenGap {
-    fn new(start: Stamp, reason: String) -> Self {
+    fn new(start: Stamp, reason: Option<String>) -> Self {
         Self {
             start,
             reason,
@@ -272,7 +299,9 @@ impl OpenGap {
             start_wall_ns: self.start.wall_ns,
             end_mono_ns: end.mono_ns,
             end_wall_ns: end.wall_ns,
-            reason: self.reason,
+            reason: self
+                .reason
+                .unwrap_or_else(|| format!("{EVENTS_PATH}: not connected yet")),
             failed_attempts: self.failed_attempts,
             open_at_shutdown,
         }
@@ -281,6 +310,8 @@ impl OpenGap {
 
 enum StreamEnd {
     Stopped,
+    /// The collector has stopped: nothing more can be handed over.
+    Closed,
     Failed(String),
 }
 
@@ -289,6 +320,7 @@ struct Streamed {
     /// The last chunk's stamp, or the connection's if none came.
     last_alive: Stamp,
     events: u64,
+    unsubscribed: u64,
 }
 
 /// Reads one stream until it ends, fails, goes idle or `stop`.
@@ -305,9 +337,10 @@ async fn stream(
         end: StreamEnd::Stopped,
         last_alive: connected,
         events: 0,
+        unsubscribed: 0,
     };
     let failed = |reason: String| StreamEnd::Failed(format!("{EVENTS_PATH}: {reason}"));
-    out.end = loop {
+    out.end = 'read: loop {
         let frame = tokio::select! {
             biased;
             () = stopped(stop) => break StreamEnd::Stopped,
@@ -328,11 +361,20 @@ async fn stream(
         match parser.feed(&chunk) {
             Ok(events) => {
                 for event in events {
-                    arrivals.offer(Arrival::Sse(StampedEvent { stamp, event }));
+                    if !config.subscribed(&event.event) {
+                        out.unsubscribed += 1;
+                        continue;
+                    }
+                    if arrivals
+                        .offer(Arrival::Sse(StampedEvent { stamp, event }))
+                        .is_err()
+                    {
+                        break 'read StreamEnd::Closed;
+                    }
                     out.events += 1;
                 }
             }
-            Err(e @ TooLarge) => break failed(e.to_string()),
+            Err(e) => break failed(e.to_string()),
         }
     };
     out
@@ -448,22 +490,30 @@ pub async fn genesis_time(url: &ReferenceApiUrl, timeout: Duration) -> Result<u6
             path: GENESIS_PATH,
             timeout,
         })??;
-    let d: Data = serde_json::from_slice(&body).map_err(|e| bad(format!("json: {e}")))?;
+    // serde's message quotes what it found: name only the kind of error and where.
+    let d: Data = serde_json::from_slice(&body).map_err(|e| {
+        bad(format!(
+            "json: {:?} error at line {} column {}",
+            e.classify(),
+            e.line(),
+            e.column()
+        ))
+    })?;
     let text = d.data.genesis_time;
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(bad(format!("genesis_time {text:?} is not a decimal u64")));
+        return Err(bad("genesis_time is not a decimal u64".into()));
     }
     text.parse()
-        .map_err(|e| bad(format!("genesis_time {text:?}: {e}")))
+        .map_err(|_| bad("genesis_time does not fit a u64".into()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collector::testing::{FixtureServer, ManualClock, ManualPause, Reply};
+    use crate::collector::testing::{FixtureServer, HangUp, ManualClock, ManualPause, Reply};
+    use crate::collector::ArrivalReceiver;
     use crate::collector::SseEvent;
     use std::sync::Arc;
-    use tokio::sync::mpsc;
 
     const KEY: &str = "/key-hunter2";
     const BLOCK: &str = "event: block_gossip\ndata: {\"slot\":\"1\",\"block\":\"0x01\"}\n\n";
@@ -479,17 +529,28 @@ mod tests {
         c
     }
 
-    /// Runs the client until `until` holds for the arrivals so far, then stops it.
+    /// Runs the client, started now, until `until` holds for the arrivals so far, then stops it.
     async fn run_until(
         config: SseConfig,
         clock: Arc<ManualClock>,
         until: impl Fn(&[Arrival]) -> bool,
     ) -> (Vec<Arrival>, SseStats) {
-        let (arrivals, mut rx) = Arrivals::channel(1024);
+        let started = clock.now();
+        run_from(config, clock, started, until).await
+    }
+
+    /// [`run_until`] for a capture that started at `started`.
+    async fn run_from(
+        config: SseConfig,
+        clock: Arc<ManualClock>,
+        started: Stamp,
+        until: impl Fn(&[Arrival]) -> bool,
+    ) -> (Vec<Arrival>, SseStats) {
+        let (arrivals, mut rx) = Arrivals::channel(1024, usize::MAX);
         let (stop_tx, stop) = watch::channel(false);
         let pause = ManualPause(Arc::clone(&clock));
         let client = tokio::spawn(async move {
-            let stats = run(&config, &*clock, &pause, &arrivals, stop).await;
+            let stats = run(&config, &*clock, &pause, &arrivals, started, stop).await;
             drop(arrivals);
             stats
         });
@@ -510,7 +571,7 @@ mod tests {
         (seen, stats)
     }
 
-    async fn drain(rx: &mut mpsc::Receiver<Arrival>) -> Vec<Arrival> {
+    async fn drain(rx: &mut ArrivalReceiver) -> Vec<Arrival> {
         let mut out = Vec::new();
         while let Some(a) = rx.recv().await {
             out.push(a);
@@ -551,12 +612,63 @@ mod tests {
             SseConfig::new(url.clone(), &[]).unwrap_err(),
             SseConfigError::NoTopic
         );
-        for bad in ["", "Head", "a&b", "a,b", "a b"] {
-            assert_eq!(
-                SseConfig::new(url.clone(), &[bad]).unwrap_err(),
-                SseConfigError::Topic(bad.into())
-            );
+        let long = "a".repeat(MAX_EVENT_NAME_BYTES + 1);
+        for bad in ["", "Head", "a&b", "a,b", "a b", "http://x/hunter2", &long] {
+            let err = SseConfig::new(url.clone(), &[bad]).unwrap_err();
+            assert_eq!(err, SseConfigError::Topic(bad.into()));
+            // A misplaced URL can land in a topic: the message never quotes it.
+            assert!(!err.to_string().contains("hunter2"), "{err}");
         }
+        let longest = "a".repeat(MAX_EVENT_NAME_BYTES);
+        assert!(SseConfig::new(url, &[&longest]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn events_that_were_not_subscribed_are_refused() {
+        // `head` was not asked for; an event without a name is a `message`, not asked for
+        // either. Neither reaches the collector.
+        let server = FixtureServer::start(|_, _| {
+            Reply::stream(
+                vec!["event: head\ndata: {}\n\n", "data: {}\n\n", BLOCK],
+                true,
+            )
+        })
+        .await;
+        let clock = ManualClock::at(0);
+        let (seen, stats) = run_until(config(&server, &["block_gossip"]), clock, |s| {
+            !events(s).is_empty()
+        })
+        .await;
+        let names: Vec<&str> = events(&seen)
+            .iter()
+            .map(|e| e.event.event.as_str())
+            .collect();
+        assert_eq!(names, ["block_gossip"]);
+        assert_eq!((stats.events, stats.unsubscribed), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_event_name_drops_the_stream() {
+        let name = format!(
+            "event: {}\ndata: {{}}\n\n",
+            "a".repeat(MAX_EVENT_NAME_BYTES + 1)
+        );
+        let server = FixtureServer::start(move |n, _| match n {
+            0 => Reply::stream(vec![&name], true),
+            _ => Reply::stream(vec![BLOCK], true),
+        })
+        .await;
+        let clock = ManualClock::at(0);
+        let (seen, stats) = run_until(config(&server, &["block_gossip"]), clock, |s| {
+            !events(s).is_empty()
+        })
+        .await;
+        let reasons: Vec<&str> = gaps(&seen).iter().map(|g| g.reason.as_str()).collect();
+        assert!(
+            reasons.contains(&"/eth/v1/events: an SSE event name is over 64 bytes"),
+            "{reasons:?}"
+        );
+        assert_eq!((stats.connections, stats.events), (2, 1));
     }
 
     #[tokio::test]
@@ -582,8 +694,11 @@ mod tests {
             }
         );
         assert_eq!(got[0].stamp.wall_ns, 1_000);
-        assert!(gaps(&seen).is_empty(), "{seen:?}");
-        assert_eq!((stats.connections, stats.events, stats.gaps), (1, 2, 0));
+        // The only gap is the time before the first stream: none on a clock that stood still.
+        let gaps = gaps(&seen);
+        assert_eq!(gaps.len(), 1, "{seen:?}");
+        assert_eq!((gaps[0].duration_ns(), gaps[0].failed_attempts), (0, 0));
+        assert_eq!((stats.connections, stats.events, stats.gaps), (1, 2, 1));
 
         let (path, headers) = &server.seen()[0];
         assert_eq!(
@@ -641,7 +756,8 @@ mod tests {
             events(s).len() == 2
         })
         .await;
-        let gaps = gaps(&seen);
+        // The time before the first stream, then one gap per dropped stream.
+        let gaps = &gaps(&seen)[1..];
         assert_eq!(gaps.len(), 3, "{seen:?}");
         assert_eq!(gaps[0].reason, "/eth/v1/events: the stream ended");
         assert!(gaps[1].reason.contains("over"), "{}", gaps[1].reason);
@@ -661,12 +777,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stop_while_down_closes_the_gap_as_open() {
-        // Nothing listens on the port.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    async fn a_slow_first_connect_is_a_gap() {
+        // The node takes 2 s (on the scripted clock) to answer the first request.
+        let clock = ManualClock::at(0);
+        let server = FixtureServer::start({
+            let clock = Arc::clone(&clock);
+            move |_, _| {
+                clock.advance(Duration::from_secs(2));
+                Reply::stream(vec![BLOCK], true)
+            }
+        })
+        .await;
+        let (seen, stats) = run_until(config(&server, &["block_gossip"]), clock, |s| {
+            !events(s).is_empty()
+        })
+        .await;
+        let gaps = gaps(&seen);
+        assert_eq!(gaps.len(), 1, "{seen:?}");
+        let g = gaps[0];
+        assert_eq!((g.start_mono_ns, g.end_mono_ns), (0, 2_000_000_000));
+        assert_eq!(g.failed_attempts, 0);
+        assert_eq!(g.reason, "/eth/v1/events: not connected yet");
+        assert!(!g.open_at_shutdown);
+        // The gap is handed over before the first event.
+        assert!(matches!(seen[0], Arrival::Gap(_)), "{seen:?}");
+        assert_eq!((stats.connections, stats.gaps), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn the_first_gap_starts_at_the_capture_start() {
+        // The capture starts at 0; its setup (files, fsync, logs) takes 3 s before the client
+        // runs, and the first stream is up at once after that.
+        let server = FixtureServer::start(|_, _| Reply::stream(vec![BLOCK], true)).await;
+        let clock = ManualClock::at(0);
+        let started = clock.now();
+        clock.advance(Duration::from_secs(3));
+        let (seen, _) = run_from(config(&server, &["block_gossip"]), clock, started, |s| {
+            !events(s).is_empty()
+        })
+        .await;
+        let gaps = gaps(&seen);
+        assert_eq!(gaps.len(), 1, "{seen:?}");
+        // The setup was not watched: it is missing too.
+        assert_eq!((gaps[0].start_mono_ns, gaps[0].start_wall_ns), (0, 0));
+        assert_eq!(gaps[0].duration_ns(), 3_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_the_first_attempt_is_an_open_gap() {
+        // Accepts and never answers: the first attempt is still running at the stop.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = ReferenceApiUrl::parse(&format!("http://{}", listener.local_addr().unwrap()));
-        drop(listener);
-        let mut c = SseConfig::new(url.unwrap(), &["head"]).unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _held = tokio::spawn({
+            let accepted = Arc::clone(&accepted);
+            async move {
+                let mut held = Vec::new();
+                while let Ok((s, _)) = listener.accept().await {
+                    accepted.store(true, std::sync::atomic::Ordering::SeqCst);
+                    held.push(s);
+                }
+            }
+        });
+        let c = SseConfig::new(url.unwrap(), &["head"]).unwrap();
+        let clock = ManualClock::at(0);
+        let (seen, stats) = run_until(c, Arc::clone(&clock), |_| {
+            let up = accepted.load(std::sync::atomic::Ordering::SeqCst);
+            if up {
+                clock.advance(Duration::from_millis(1_500));
+            }
+            up
+        })
+        .await;
+        let gaps = gaps(&seen);
+        assert_eq!(gaps.len(), 1, "{seen:?}");
+        let g = gaps[0];
+        assert!(g.open_at_shutdown);
+        assert_eq!((g.failed_attempts, g.duration_ns()), (0, 1_500_000_000));
+        assert_eq!(g.reason, "/eth/v1/events: not connected yet");
+        assert_eq!((stats.connections, stats.gaps), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn a_stop_while_down_closes_the_gap_as_open() {
+        // Every connection is closed at once, for the whole test.
+        let server = HangUp::start().await;
+        let mut c = SseConfig::new(server.url(""), &["head"]).unwrap();
         c.backoff.max = Duration::from_secs(1);
         let clock = ManualClock::at(0);
         let (seen, stats) = run_until(c, Arc::clone(&clock), |_| {
@@ -678,11 +874,39 @@ mod tests {
         assert!(gaps[0].open_at_shutdown);
         assert!(gaps[0].failed_attempts >= 3);
         assert!(
-            gaps[0].reason.starts_with("/eth/v1/events: connect"),
+            gaps[0].reason.starts_with("/eth/v1/events: http"),
             "{}",
             gaps[0].reason
         );
         assert_eq!(stats.connections, 0);
+    }
+
+    #[tokio::test]
+    async fn a_closed_channel_ends_the_stream() {
+        // An event every 20 ms; the collector stops after the first.
+        let server = FixtureServer::start(|_, _| {
+            Reply::stream(vec![BLOCK; 500], true).paced(Duration::from_millis(20))
+        })
+        .await;
+        let config = config(&server, &["block_gossip"]);
+        let clock = ManualClock::at(0);
+        let (arrivals, mut rx) = Arrivals::channel(16, usize::MAX);
+        let (_stop_tx, stop) = watch::channel(false);
+        let pause = ManualPause(Arc::clone(&clock));
+        let started = clock.now();
+        let client =
+            tokio::spawn(
+                async move { run(&config, &*clock, &pause, &arrivals, started, stop).await },
+            );
+        while !matches!(rx.recv().await, Some(Arrival::Sse(_))) {}
+        drop(rx);
+        // It returns without a stop, on the next event it cannot hand over.
+        let stats = tokio::time::timeout(Duration::from_secs(5), client)
+            .await
+            .expect("the client returns once the channel is closed")
+            .unwrap();
+        assert_eq!(stats.connections, 1);
+        assert!(stats.events >= 1, "{stats:?}");
     }
 
     #[tokio::test]
@@ -720,6 +944,33 @@ mod tests {
             }
         );
         assert_eq!(server.seen()[0].0, format!("{KEY}{GENESIS_PATH}"));
+    }
+
+    #[tokio::test]
+    async fn genesis_errors_never_quote_the_response() {
+        let replies = [
+            // serde would quote the integer it did not expect.
+            r#"{"data":{"genesis_time":4242424242}}"#,
+            r#"{"data":{"genesis_time":"hunter2"}}"#,
+            r#"{"data":{"genesis_time":"99999999999999999999999"}}"#,
+            r#"{"data":{"hunter2":"1"}}"#,
+            "hunter2",
+        ];
+        let server = FixtureServer::start(move |n, _| Reply::json(replies[n])).await;
+        let url = server.url(KEY);
+        for reply in replies {
+            let err = genesis_time(&url, Duration::from_secs(5))
+                .await
+                .unwrap_err();
+            let text = err.to_string();
+            assert!(
+                text.starts_with("/eth/v1/beacon/genesis: bad response"),
+                "{text}"
+            );
+            for quoted in ["4242424242", "hunter2", "9999"] {
+                assert!(!text.contains(quoted), "{reply}: {text}");
+            }
+        }
     }
 
     #[tokio::test]

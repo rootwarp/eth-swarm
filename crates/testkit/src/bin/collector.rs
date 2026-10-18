@@ -16,7 +16,8 @@
 //! gossip tap feeds the same collector through [`testkit::collector::Tap`].
 //!
 //! `offsets` prints one JSON line per record with its slot-relative offset and, for a column,
-//! its envelope-relative offset, then a summary line with the unmatched column count.
+//! its envelope-relative offset, then a summary line with the unmatched column count. It reads
+//! the records twice, one at a time, so a capture of any length fits.
 //!
 //! Exit codes: 0 done, 1 the node, the genesis check or the capture failed, 64 usage.
 
@@ -30,11 +31,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use testkit::archive::ChainParams;
 use testkit::collector::{
-    collect, envelope_relative, genesis_time, read_capture, run_sse, sample, Arrival, Arrivals,
-    Backoff, CaptureInfo, Clock, Collector, CommandDaemon, ReferenceApiUrl, SlotClock, Source,
-    SseConfig, SystemClock, TimeDaemon, TokioPause, DEFAULT_TOPICS, NTP_INTERVAL,
+    collect, genesis_time, read_info, records, run_sse, sample, Arrival, ArrivalReceiver, Arrivals,
+    Backoff, CaptureInfo, Clock, Collector, CollectorError, ColumnMatch, CommandDaemon, Drops,
+    EnvelopeIndex, ReferenceApiUrl, SlotClock, Source, SseConfig, Summary, SystemClock, TimeDaemon,
+    TokioPause, DEFAULT_TOPICS, NTP_INTERVAL,
 };
 use tokio::sync::watch;
+
+/// What writes the capture: [`collect`], or a fault in tests.
+type WriteCapture = fn(
+    Collector<Mainnet>,
+    ArrivalReceiver,
+    &Drops,
+    &mut dyn FnMut(&str),
+) -> Result<Summary, CollectorError>;
 
 const USAGE: &str = "\
 usage: collector sse --network hoodi|sepolia --url URL --out DIR --host HOST
@@ -69,6 +79,10 @@ const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 64;
 /// Arrivals the channel holds while the collector writes: about ten minutes of a busy stream.
 const CHANNEL_CAPACITY: usize = 1 << 16;
+/// Bytes the queued arrivals may hold: 64 MiB. Beacon API events are a few hundred bytes, so
+/// the entry cap binds first; this one binds on events near `MAX_EVENT_BYTES`, which would
+/// otherwise let the queue grow to 64 GiB.
+const CHANNEL_BYTES: usize = 64 << 20;
 const GENESIS_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,8 +138,35 @@ fn parse(args: &[String]) -> Result<Command, String> {
             _ => Err("offsets takes exactly one CAPTURE_DIR".into()),
         },
         Some("sse") => parse_sse(&args[1..]).map(|a| Command::Sse(Box::new(a))),
-        Some(other) => Err(format!("unknown command {other:?}")),
+        Some(_) => Err("unknown command (want sse or offsets)".into()),
         None => Err("no command".into()),
+    }
+}
+
+/// The flags `sse` takes, each followed by its value.
+const SSE_FLAGS: [&str; 7] = [
+    "--network",
+    "--url",
+    "--out",
+    "--host",
+    "--topic",
+    "--ntp",
+    "--max-backoff-secs",
+];
+
+/// The error for an argument `sse` does not take. Arguments can hold a keyed URL
+/// (`--url=http://…/<key>`, or a URL where a flag was due), so only a flag's key is named, and
+/// only when it looks like one; never a value.
+fn unknown_argument(arg: &str) -> String {
+    let key = arg.split_once('=').map_or(arg, |(key, _)| key);
+    let flag_like = key.len() <= 32
+        && key.strip_prefix("--").is_some_and(|name| {
+            !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    if flag_like {
+        format!("unknown argument {key} (a flag and its value are two arguments)")
+    } else {
+        "unknown argument (not shown: it may hold a URL)".into()
     }
 }
 
@@ -135,40 +176,42 @@ fn parse_sse(args: &[String]) -> Result<SseArgs, String> {
     let mut ntp = Ntp::Chrony;
     let mut max_backoff = Backoff::default().max;
     let mut it = args.iter();
-    while let Some(flag) = it.next() {
+    while let Some(arg) = it.next() {
+        // Matched before anything is said about it: only a known flag is ever quoted.
+        let Some(flag) = SSE_FLAGS.into_iter().find(|f| f == arg) else {
+            return Err(unknown_argument(arg));
+        };
+        // A value is never quoted either: a misplaced URL can land in any flag's value.
         let value = it
             .next()
-            .ok_or_else(|| format!("{flag} needs a value"))
-            .map(String::as_str);
-        match flag.as_str() {
+            .ok_or_else(|| format!("{flag} needs a value"))?
+            .as_str();
+        match flag {
             "--network" => {
-                let name = value?;
-                let found = Network::ALL.into_iter().find(|n| n.name() == name);
-                network =
-                    Some(found.ok_or_else(|| format!("--network: unknown network {name:?}"))?);
+                let found = Network::ALL.into_iter().find(|n| n.name() == value);
+                network = Some(found.ok_or("--network: want hoodi or sepolia")?);
             }
             // The error says why, never the URL (its path may hold a key).
-            "--url" => url = Some(ReferenceApiUrl::parse(value?).map_err(|e| e.to_string())?),
-            "--out" => out = Some(PathBuf::from(value?)),
-            "--host" => host = Some(value?.to_owned()),
-            "--topic" => topics.push(value?.to_owned()),
+            "--url" => url = Some(ReferenceApiUrl::parse(value).map_err(|e| e.to_string())?),
+            "--out" => out = Some(PathBuf::from(value)),
+            "--host" => host = Some(value.to_owned()),
+            "--topic" => topics.push(value.to_owned()),
             "--ntp" => {
-                ntp = match value? {
+                ntp = match value {
                     "chrony" => Ntp::Chrony,
                     "timesyncd" => Ntp::Timesyncd,
                     "none" => Ntp::None,
-                    other => return Err(format!("--ntp: unknown daemon {other:?}")),
+                    _ => return Err("--ntp: want chrony, timesyncd or none".into()),
                 }
             }
-            "--max-backoff-secs" => {
-                let secs: u64 = value?
+            _ => {
+                let secs: u64 = value
                     .parse()
                     .ok()
                     .filter(|s| *s > 0)
                     .ok_or_else(|| format!("{flag}: want a positive number of seconds"))?;
                 max_backoff = Duration::from_secs(secs);
             }
-            other => return Err(format!("unknown argument {other:?}")),
         }
     }
     fn required<T>(value: Option<T>, flag: &str) -> Result<T, String> {
@@ -177,6 +220,8 @@ fn parse_sse(args: &[String]) -> Result<SseArgs, String> {
     if topics.is_empty() {
         topics = DEFAULT_TOPICS.iter().map(|t| (*t).to_owned()).collect();
     }
+    let checked: Vec<&str> = topics.iter().map(String::as_str).collect();
+    SseConfig::checked_topics(&checked).map_err(|e| format!("--topic: {e}"))?;
     let host = required(host, "--host")?;
     if host.is_empty() {
         return Err("--host must not be empty".into());
@@ -232,7 +277,8 @@ fn run(args: &[String], out: &mut dyn Write, err: &Log) -> u8 {
                     let _ = stop_tx.send(true);
                 });
                 let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
-                capture_sse(&args, clock, args.ntp.daemon(), stop, out, err).await
+                let write: WriteCapture = collect::<Mainnet>;
+                capture_sse(&args, clock, args.ntp.daemon(), stop, write, out, err).await
             })
         }
     }
@@ -260,6 +306,7 @@ async fn capture_sse(
     clock: Arc<dyn Clock>,
     daemon: Option<Arc<dyn TimeDaemon>>,
     stop: watch::Receiver<bool>,
+    write: WriteCapture,
     out: &mut dyn Write,
     err: &Log,
 ) -> u8 {
@@ -286,8 +333,9 @@ async fn capture_sse(
     };
     if let Some(pinned) = args.network.genesis() {
         if pinned.genesis_time != genesis {
+            // The node's value is not quoted: nothing from a response goes into a message.
             return fail(format!(
-                "the node's genesis_time {genesis} is not {network}'s pinned {}",
+                "the node's genesis_time is not {network}'s pinned {}",
                 pinned.genesis_time
             ));
         }
@@ -333,21 +381,54 @@ async fn capture_sse(
         ),
     );
 
-    let (arrivals, rx) = Arrivals::channel(CHANNEL_CAPACITY);
+    let (arrivals, rx) = Arrivals::channel(CHANNEL_CAPACITY, CHANNEL_BYTES);
     let drops = arrivals.drops();
     let writer_log = Arc::clone(err);
-    let writer = tokio::task::spawn_blocking(move || {
-        collect(collector, rx, &drops, &mut |line| log(&writer_log, line))
+    let mut writer = tokio::task::spawn_blocking(move || {
+        write(collector, rx, &drops, &mut |line| log(&writer_log, line))
+    });
+    // The producers stop on `stop`, or when the writer fails: `halt` carries both.
+    let (halt_tx, halt) = watch::channel(false);
+    let halt_tx = Arc::new(halt_tx);
+    let forward = tokio::spawn({
+        let (halt_tx, mut stop) = (Arc::clone(&halt_tx), stop);
+        async move {
+            let _ = stop.wait_for(|s| *s).await;
+            let _ = halt_tx.send(true);
+        }
     });
     let ntp = daemon.map(|daemon| {
-        let (clock, arrivals, stop) = (Arc::clone(&clock), arrivals.clone(), stop.clone());
-        tokio::spawn(sample_ntp(clock, daemon, arrivals, stop))
+        let (clock, arrivals, halt) = (Arc::clone(&clock), arrivals.clone(), halt.clone());
+        tokio::spawn(sample_ntp(clock, daemon, arrivals, halt))
     });
-    let stats = run_sse(&sse, &*clock, &TokioPause, &arrivals, stop).await;
+    // The writer runs until every producer is gone; if it ends first it failed, and the
+    // capture stops with it rather than drop every event until a signal. The SSE client also
+    // returns on its own once the writer is gone (the channel closed).
+    let early = {
+        let sse_run = run_sse(&sse, &*clock, &TokioPause, &arrivals, started, halt);
+        tokio::pin!(sse_run);
+        tokio::select! {
+            stats = &mut sse_run => Ok(stats),
+            written = &mut writer => {
+                let _ = halt_tx.send(true);
+                let _ = sse_run.await;
+                Err(written)
+            }
+        }
+    };
+    // However the SSE client ended, the NTP sampler stops with it.
+    let _ = halt_tx.send(true);
     if let Some(ntp) = ntp {
         let _ = ntp.await;
     }
+    forward.abort();
     drop(arrivals);
+    let stats = match early {
+        Ok(stats) => stats,
+        Err(Ok(Ok(_))) => return fail("capture: the writer stopped before the producers".into()),
+        Err(Ok(Err(e))) => return fail(format!("capture: {e}")),
+        Err(Err(e)) => return fail(format!("capture: {e}")),
+    };
     let summary = match writer.await {
         Ok(Ok(summary)) => summary,
         Ok(Err(e)) => return fail(format!("capture: {e}")),
@@ -355,13 +436,15 @@ async fn capture_sse(
     };
     let _ = writeln!(
         out,
-        "{}: {} records, {} undecoded, {} dropped, {} connections, {} missing intervals",
+        "{}: {} records, {} undecoded, {} dropped, {} unsubscribed, {} connections, {} missing \
+         intervals",
         dir.display(),
         summary.records,
         summary.undecoded,
         summary.dropped,
+        stats.unsubscribed,
         stats.connections,
-        summary.missing.len()
+        summary.missing_intervals
     );
     0
 }
@@ -390,46 +473,75 @@ async fn sample_ntp(
     }
 }
 
+/// Two passes over `records.jsonl`, one record in memory at a time: the envelopes first, then
+/// every record's offsets. Records appended after the first pass (a capture still being
+/// written) are left out of the second.
 fn offsets(dir: &Path, out: &mut dyn Write, err: &Log) -> u8 {
-    let (info, records) = match read_capture(dir) {
-        Ok(read) => read,
-        Err(e) => {
-            log(err, &e.to_string());
-            return EXIT_FAILED;
-        }
+    let fail = |message: String| {
+        log(err, &message);
+        EXIT_FAILED
+    };
+    let info = match read_info(dir) {
+        Ok(info) => info,
+        Err(e) => return fail(e.to_string()),
     };
     let Some(clock) = SlotClock::new(info.genesis_time, info.slot_duration_ms) else {
-        log(
-            err,
-            &format!("{}: slot_duration_ms must be positive", dir.display()),
-        );
-        return EXIT_FAILED;
+        return fail(format!(
+            "{}: slot_duration_ms must be positive",
+            dir.display()
+        ));
     };
-    let matched = envelope_relative(&records);
-    let mut envelope = vec![None; records.len()];
-    for c in &matched.columns {
-        envelope[c.record] = Some(c.offset_ms());
+    let mut envelopes = EnvelopeIndex::default();
+    let mut count = 0usize;
+    let first_pass = records(dir).and_then(|mut all| {
+        all.try_for_each(|record| {
+            envelopes.add(&record?);
+            count += 1;
+            Ok::<_, CollectorError>(())
+        })
+    });
+    if let Err(e) = first_pass {
+        return fail(e.to_string());
     }
-    let mut with_offset = 0u64;
-    for (i, record) in records.iter().enumerate() {
-        let offset = clock.offset(record);
+    let second = match records(dir) {
+        Ok(all) => all,
+        Err(e) => return fail(e.to_string()),
+    };
+    let (mut with_offset, mut matched, mut unmatched) = (0u64, 0u64, 0u64);
+    for (i, record) in second.take(count).enumerate() {
+        let record = match record {
+            Ok(record) => record,
+            Err(e) => return fail(e.to_string()),
+        };
+        let offset = clock.offset(&record);
         with_offset += u64::from(offset.is_some());
+        let envelope_offset_ms = match envelopes.column(&record) {
+            ColumnMatch::Matched { offset_ns, .. } => {
+                matched += 1;
+                Some(offset_ns as f64 / 1e6)
+            }
+            ColumnMatch::Unmatched => {
+                unmatched += 1;
+                None
+            }
+            ColumnMatch::NotAColumn => None,
+        };
         let line = serde_json::json!({
             "index": i,
             "source": record.source,
             "topic": record.topic,
             "slot": offset.map(|o| o.slot),
             "slot_offset_ms": offset.map(|o| o.offset_ms()),
-            "envelope_offset_ms": envelope[i],
+            "envelope_offset_ms": envelope_offset_ms,
         });
         let _ = writeln!(out, "{line}");
     }
     let summary = serde_json::json!({
         "summary": {
-            "records": records.len(),
+            "records": count,
             "slot_offsets": with_offset,
-            "columns_matched": matched.columns.len(),
-            "unmatched_columns": matched.unmatched_columns,
+            "columns_matched": matched,
+            "unmatched_columns": unmatched,
         }
     });
     let _ = writeln!(out, "{summary}");
@@ -446,8 +558,10 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use testkit::archive::fixtures;
-    use testkit::collector::testing::{FixtureServer, Reply};
-    use testkit::collector::{ArrivalRecord, NtpSample, Summary, NTP_FILE, SUMMARY_FILE};
+    use testkit::collector::testing::{FixtureServer, HangUp, Reply};
+    use testkit::collector::{
+        read_capture, ArrivalRecord, NtpSample, MAX_RECORD_LINE_BYTES, NTP_FILE, SUMMARY_FILE,
+    };
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -531,6 +645,30 @@ mod tests {
     }
 
     #[test]
+    fn a_keyed_path_never_appears_in_stderr() {
+        const KEYED: &str = "http://127.0.0.1:5052/hunter2";
+        let flag = format!("--url={KEYED}");
+        for (list, named) in [
+            // `--url=…` is not `--url …`: an unknown argument, named by its key only.
+            (vec!["sse", "--network", "hoodi", &flag], Some("--url")),
+            (vec!["sse", &flag, "--network", "hoodi"], Some("--url")),
+            (vec!["sse", "--network", "hoodi", KEYED], None),
+            (vec![KEYED], None),
+            (vec!["sse", "--network", KEYED], None),
+            (vec!["sse", "--ntp", KEYED], None),
+            (vec!["sse", "--max-backoff-secs", KEYED], None),
+            (vec!["sse", "--topic", KEYED], None),
+        ] {
+            let (code, _, err) = run_args(&list);
+            assert_eq!(code, EXIT_USAGE, "{list:?}: {err}");
+            assert!(!err.contains("hunter2"), "{list:?}: {err}");
+            if let Some(key) = named {
+                assert!(err.contains(&format!("unknown argument {key}")), "{err}");
+            }
+        }
+    }
+
+    #[test]
     fn sse_defaults() {
         let Command::Sse(a) = parse(&sse_args("http://127.0.0.1:5052", Path::new("/out"))).unwrap()
         else {
@@ -590,6 +728,11 @@ mod tests {
 
     /// Runs `sse` until 500 ms after the first record is on disk.
     async fn capture(args: &SseArgs) -> (u8, String, String) {
+        capture_on(args, Arc::new(SystemClock::new())).await
+    }
+
+    /// [`capture`] on `clock`.
+    async fn capture_on(args: &SseArgs, clock: Arc<dyn Clock>) -> (u8, String, String) {
         let (err, buf) = buffer();
         let (stop_tx, stop) = watch::channel(false);
         let out_dir = args.out.clone();
@@ -611,9 +754,10 @@ mod tests {
         let mut out = Vec::new();
         let code = capture_sse(
             args,
-            Arc::new(SystemClock::new()),
+            clock,
             Some(Arc::new(FixedDaemon)),
             stop,
+            collect::<Mainnet>,
             &mut out,
             &err,
         )
@@ -658,7 +802,9 @@ mod tests {
             toml::from_str(&std::fs::read_to_string(capture_dir.join(SUMMARY_FILE)).unwrap())
                 .unwrap();
         assert_eq!(summary.records, 1);
-        assert!(summary.missing.is_empty(), "{summary:?}");
+        // Only the moment before the first stream is missing.
+        assert_eq!(summary.missing_intervals, 1, "{summary:?}");
+        assert_eq!(summary.missing_open_at_shutdown, 0, "{summary:?}");
         let ntp = std::fs::read_to_string(capture_dir.join(NTP_FILE)).unwrap();
         let first: NtpSample = serde_json::from_str(ntp.lines().next().unwrap()).unwrap();
         assert_eq!(first.clock_error_ns, Some(250_000));
@@ -671,6 +817,52 @@ mod tests {
         assert_eq!(last["summary"]["unmatched_columns"], 0);
     }
 
+    /// A clock that moves 1 s forward each time it is read: whatever the capture does between
+    /// two readings (creating and syncing its files, logging) takes time.
+    struct StepClock {
+        wall_ns: u64,
+        reads: std::sync::atomic::AtomicU64,
+    }
+
+    impl Clock for StepClock {
+        fn now(&self) -> testkit::collector::Stamp {
+            let n = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            testkit::collector::Stamp {
+                mono_ns: n * 1_000_000_000,
+                wall_ns: self.wall_ns + n * 1_000_000_000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_setup_before_the_first_stream_is_missing_time() {
+        let server = node("1742213400").await;
+        let dir = tempfile::tempdir().unwrap();
+        let args = parsed(&format!("http://{}", server.addr), dir.path());
+        let clock = Arc::new(StepClock {
+            wall_ns: SystemClock::new().now().wall_ns,
+            reads: Default::default(),
+        });
+        let (code, out, err) = capture_on(&args, clock).await;
+        assert_eq!(code, 0, "{err}");
+        let capture_dir = PathBuf::from(out.lines().next().unwrap());
+        let info = read_info(&capture_dir).unwrap();
+        let gaps = std::fs::read_to_string(capture_dir.join("gaps.jsonl")).unwrap();
+        let first: testkit::collector::MissingInterval =
+            serde_json::from_str(gaps.lines().next().unwrap()).unwrap();
+        // The first gap opens at the start capture.toml records, not when the client runs.
+        assert_eq!(
+            (first.start_mono_ns, first.start_wall_ns),
+            (info.started_mono_ns, info.started_wall_ns)
+        );
+        assert!(first.duration_ns() >= 1_000_000_000, "{first:?}");
+        let summary: Summary =
+            toml::from_str(&std::fs::read_to_string(capture_dir.join(SUMMARY_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(summary.missing_intervals, 1, "{summary:?}");
+        assert_eq!(summary.missing_ns, first.duration_ns());
+    }
+
     #[tokio::test]
     async fn sse_refuses_a_node_it_cannot_trust_or_reach() {
         let dir = tempfile::tempdir().unwrap();
@@ -681,18 +873,73 @@ mod tests {
         let (code, _, err) = capture(&args).await;
         assert_eq!(code, EXIT_FAILED);
         assert!(err.contains("not sepolia's pinned 1655733600"), "{err}");
+        // The node's own value is a response value: not quoted.
+        assert!(!err.contains("genesis_time 1 "), "{err}");
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/hunter2", listener.local_addr().unwrap());
-        drop(listener);
+        let server = HangUp::start().await;
+        let url = format!("http://{}/hunter2", server.addr);
         let (code, _, err) = capture(&parsed(&url, dir.path())).await;
         assert_eq!(code, EXIT_FAILED);
         assert!(
-            err.contains("genesis: /eth/v1/beacon/genesis: connect"),
+            err.contains("genesis: /eth/v1/beacon/genesis: http"),
             "{err}"
         );
         assert!(!err.contains("hunter2"), "{err}");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// A writer that takes one arrival, then fails as a full disk would.
+    fn full_disk(
+        collector: Collector<Mainnet>,
+        mut rx: ArrivalReceiver,
+        _: &Drops,
+        _: &mut dyn FnMut(&str),
+    ) -> Result<Summary, CollectorError> {
+        let _ = rx.blocking_recv();
+        drop(collector);
+        Err(CollectorError::Io {
+            path: "records.jsonl".into(),
+            source: std::io::Error::other("No space left on device"),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_writer_failure_stops_the_capture() {
+        // The node streams an event every 10 ms and never stops; nothing sends a stop.
+        let server = FixtureServer::start(move |_, path| match path {
+            "/eth/v1/beacon/genesis" => Reply::json(r#"{"data":{"genesis_time":"1742213400"}}"#),
+            _ => Reply::stream(vec![STREAM; 10_000], true).paced(Duration::from_millis(10)),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let args = parsed(&format!("http://{}", server.addr), dir.path());
+        let (err, buf) = buffer();
+        let (_stop_tx, stop) = watch::channel(false);
+        let mut out = Vec::new();
+        let started = std::time::Instant::now();
+        let capture = capture_sse(
+            &args,
+            Arc::new(SystemClock::new()),
+            Some(Arc::new(FixedDaemon)),
+            stop,
+            full_disk,
+            &mut out,
+            &err,
+        );
+        let code = tokio::time::timeout(Duration::from_secs(10), capture)
+            .await
+            .expect("the capture stops on its own once the writer fails");
+        assert_eq!(code, EXIT_FAILED);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        let err = text(&buf);
+        assert!(
+            err.contains("capture: records.jsonl: No space left on device"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -739,6 +986,19 @@ mod tests {
         assert_eq!(lines[2]["envelope_offset_ms"], serde_json::Value::Null);
         assert_eq!(lines[3]["summary"]["columns_matched"], 1);
         assert_eq!(lines[3]["summary"]["unmatched_columns"], 1);
+
+        // A line no record is that long: refused, with where, not read whole.
+        let long = format!("{{\"topic\":\"{}\"}}", "x".repeat(MAX_RECORD_LINE_BYTES));
+        let mut text = std::fs::read_to_string(dir.path().join("records.jsonl")).unwrap();
+        text.push_str(&long);
+        std::fs::write(dir.path().join("records.jsonl"), &text).unwrap();
+        let (code, out, err) = run_args(&["offsets", dir.path().to_str().unwrap()]);
+        assert_eq!(code, EXIT_FAILED);
+        assert!(
+            err.contains("records.jsonl: line 4: over 65536 bytes"),
+            "{err}"
+        );
+        assert!(out.is_empty(), "{out}");
 
         let (code, _, err) = run_args(&["offsets", "/nonexistent/capture"]);
         assert_eq!(code, EXIT_FAILED);

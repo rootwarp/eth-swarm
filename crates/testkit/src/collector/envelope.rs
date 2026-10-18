@@ -63,36 +63,80 @@ pub struct EnvelopeRelative {
     pub unmatched_columns: u64,
 }
 
-/// Matches every column in `records` to its envelope.
-pub fn envelope_relative(records: &[ArrivalRecord]) -> EnvelopeRelative {
-    let mut envelopes: HashMap<(Source, Root), u64> = HashMap::new();
-    for r in records {
-        if let (Some(ArrivalKind::Envelope), Some(root)) =
-            (ArrivalKind::of(r.source, &r.topic), r.block_root)
-        {
-            let first = envelopes.entry((r.source, root)).or_insert(r.recv_mono_ns);
-            *first = (*first).min(r.recv_mono_ns);
+/// The first envelope arrival of each source and block root, from one pass over the records:
+/// what a column is matched against. It holds one entry per envelope root, not the records, so
+/// a capture of any length is matched in two passes over its file.
+#[derive(Debug, Clone, Default)]
+pub struct EnvelopeIndex {
+    first: HashMap<(Source, Root), u64>,
+}
+
+/// How a record matched ([`EnvelopeIndex::column`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnMatch {
+    /// Not a column.
+    NotAColumn,
+    /// A column with no envelope of the same source and root (or no root, or an offset `i64`
+    /// cannot hold).
+    Unmatched,
+    /// A column and its envelope.
+    Matched {
+        /// The block root both carry.
+        block_root: Root,
+        /// Column arrival − envelope arrival (monotonic), nanoseconds.
+        offset_ns: i64,
+    },
+}
+
+impl EnvelopeIndex {
+    /// Counts `record` in if it is an envelope with a root.
+    pub fn add(&mut self, record: &ArrivalRecord) {
+        if let (Some(ArrivalKind::Envelope), Some(root)) = (
+            ArrivalKind::of(record.source, &record.topic),
+            record.block_root,
+        ) {
+            let first = self
+                .first
+                .entry((record.source, root))
+                .or_insert(record.recv_mono_ns);
+            *first = (*first).min(record.recv_mono_ns);
         }
     }
+
+    /// `record` matched against the envelopes counted in.
+    pub fn column(&self, record: &ArrivalRecord) -> ColumnMatch {
+        if ArrivalKind::of(record.source, &record.topic) != Some(ArrivalKind::Column) {
+            return ColumnMatch::NotAColumn;
+        }
+        let matched = record.block_root.and_then(|root| {
+            let at = *self.first.get(&(record.source, root))?;
+            let ns = i128::from(record.recv_mono_ns) - i128::from(at);
+            Some(ColumnMatch::Matched {
+                block_root: root,
+                offset_ns: i64::try_from(ns).ok()?,
+            })
+        });
+        matched.unwrap_or(ColumnMatch::Unmatched)
+    }
+}
+
+/// Matches every column in `records` to its envelope.
+pub fn envelope_relative(records: &[ArrivalRecord]) -> EnvelopeRelative {
+    let mut index = EnvelopeIndex::default();
+    records.iter().for_each(|r| index.add(r));
     let mut out = EnvelopeRelative::default();
     for (i, r) in records.iter().enumerate() {
-        if ArrivalKind::of(r.source, &r.topic) != Some(ArrivalKind::Column) {
-            continue;
-        }
-        let envelope = r
-            .block_root
-            .and_then(|root| Some((root, *envelopes.get(&(r.source, root))?)));
-        let offset = envelope.and_then(|(root, at)| {
-            let ns = i128::from(r.recv_mono_ns) - i128::from(at);
-            Some((root, i64::try_from(ns).ok()?))
-        });
-        match offset {
-            Some((block_root, offset_ns)) => out.columns.push(ColumnOffset {
+        match index.column(r) {
+            ColumnMatch::NotAColumn => {}
+            ColumnMatch::Unmatched => out.unmatched_columns += 1,
+            ColumnMatch::Matched {
+                block_root,
+                offset_ns,
+            } => out.columns.push(ColumnOffset {
                 record: i,
                 block_root,
                 offset_ns,
             }),
-            None => out.unmatched_columns += 1,
         }
     }
     out

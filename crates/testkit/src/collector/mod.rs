@@ -1,7 +1,8 @@
 //! The gossip/SSE arrival collector: when each block, envelope and column arrived, on a
 //! monotonic and a wall clock, and how far into its slot and after its envelope.
 //!
-//! Two sources feed one [`Collector`] through a bounded [`Arrivals`] channel:
+//! Two sources feed one [`Collector`] through a bounded [`Arrivals`] channel (by entries and by
+//! queued bytes):
 //!
 //! - **gossip**: our probe's gossipsub tap ([`Tap`]). The probe stamps a message the moment
 //!   gossipsub delivers it ([`Tap::now`]) and offers the undecoded [`TapRecord`]; it never waits.
@@ -37,12 +38,16 @@ mod sse;
 mod tap;
 mod url;
 
-pub use arrival::{Arrival, Arrivals, Closed, Drops, MissingInterval, StampedEvent};
+pub use arrival::{
+    Arrival, ArrivalReceiver, Arrivals, Closed, Drops, MissingInterval, StampedEvent,
+};
 pub use clock::{Clock, Stamp, SystemClock};
 pub use decode::{
     decode_gossip, decode_sse, parse_gossip_topic, topic_subnet, Decoded, GossipTopic,
 };
-pub use envelope::{envelope_relative, ArrivalKind, ColumnOffset, EnvelopeRelative};
+pub use envelope::{
+    envelope_relative, ArrivalKind, ColumnMatch, ColumnOffset, EnvelopeIndex, EnvelopeRelative,
+};
 pub use ntp::{
     parse_chrony_tracking, parse_timesyncd_status, sample, CommandDaemon, NtpSample, TimeDaemon,
     COMMAND_TIMEOUT, NTP_INTERVAL,
@@ -50,13 +55,13 @@ pub use ntp::{
 pub use offsets::{SlotClock, SlotOffset};
 pub use record::{ArrivalRecord, Source};
 pub use sink::{
-    collect, read_capture, CaptureInfo, Collector, CollectorError, Summary, CAPTURE_FILE,
-    GAPS_FILE, NTP_FILE, RECORDS_FILE, SUMMARY_FILE,
+    collect, read_capture, read_info, records, CaptureInfo, Collector, CollectorError, Records,
+    Summary, CAPTURE_FILE, GAPS_FILE, MAX_RECORD_LINE_BYTES, NTP_FILE, RECORDS_FILE, SUMMARY_FILE,
 };
 pub use sse::{
     genesis_time, run as run_sse, ApiError, Backoff, Pause, SseConfig, SseConfigError, SseEvent,
     SseParser, SseStats, TokioPause, TooLarge, DEFAULT_TOPICS, EVENTS_PATH, GENESIS_PATH,
-    MAX_EVENT_BYTES, MAX_JSON_BYTES,
+    MAX_EVENT_BYTES, MAX_EVENT_NAME_BYTES, MAX_JSON_BYTES,
 };
 pub use tap::{Tap, TapRecord};
 pub use url::{ReferenceApiUrl, UrlError};

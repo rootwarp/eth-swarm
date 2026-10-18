@@ -4,7 +4,7 @@
 //! anything ([`Tap::now`]), and offers it without waiting ([`Tap::offer`]). The slot and block
 //! root are decoded later, off the gossip hot path, by the collector.
 
-use super::arrival::{Arrival, Arrivals};
+use super::arrival::{Arrival, Arrivals, Closed};
 use super::clock::{Clock, Stamp};
 use std::sync::Arc;
 
@@ -47,9 +47,10 @@ impl Tap {
         self.clock.now()
     }
 
-    /// Offers `record` without waiting; `false` if the collector is behind and it was dropped
-    /// (counted in [`Arrivals::dropped`]).
-    pub fn offer(&self, record: TapRecord) -> bool {
+    /// Offers `record` without waiting: `Ok(false)` if the collector is behind and it was
+    /// dropped (counted in [`Arrivals::dropped`]), [`Closed`] if the collector has stopped (stop
+    /// tapping).
+    pub fn offer(&self, record: TapRecord) -> Result<bool, Closed> {
         self.arrivals.offer(Arrival::Tap(record))
     }
 }
@@ -61,7 +62,7 @@ mod tests {
 
     #[tokio::test]
     async fn stamps_then_offers() {
-        let (arrivals, mut rx) = Arrivals::channel(1);
+        let (arrivals, mut rx) = Arrivals::channel(1, usize::MAX);
         let tap = Tap::new(Arc::new(SystemClock::new()), arrivals.clone());
         let stamp = tap.now();
         let record = TapRecord {
@@ -71,10 +72,12 @@ mod tests {
             peer: "p".into(),
             payload: vec![2],
         };
-        assert!(tap.offer(record.clone()));
-        assert!(!tap.offer(record.clone()));
+        assert_eq!(tap.offer(record.clone()), Ok(true));
+        assert_eq!(tap.offer(record.clone()), Ok(false));
         assert_eq!(arrivals.dropped(), 1);
-        assert_eq!(rx.recv().await, Some(Arrival::Tap(record)));
+        assert_eq!(rx.recv().await, Some(Arrival::Tap(record.clone())));
+        drop(rx);
+        assert_eq!(tap.offer(record), Err(Closed));
         assert!(format!("{tap:?}").starts_with("Tap"));
     }
 }

@@ -7,6 +7,9 @@
 /// The largest line or event the parser holds: 1 MiB. Beacon API events are a few hundred
 /// bytes; anything this large is not one, and the stream is dropped.
 pub const MAX_EVENT_BYTES: usize = 1 << 20;
+/// The longest event name: 64 bytes. Beacon API event names are under 32
+/// (`execution_payload_gossip`); a longer one is not one, and the stream is dropped.
+pub const MAX_EVENT_NAME_BYTES: usize = 64;
 
 /// One dispatched event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,10 +20,19 @@ pub struct SseEvent {
     pub data: String,
 }
 
-/// A line or event over [`MAX_EVENT_BYTES`].
+/// A line or event over [`MAX_EVENT_BYTES`], or an event name over [`MAX_EVENT_NAME_BYTES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("an SSE line or event is over {MAX_EVENT_BYTES} bytes")]
-pub struct TooLarge;
+pub enum TooLarge {
+    /// A line.
+    #[error("an SSE line is over {MAX_EVENT_BYTES} bytes")]
+    Line,
+    /// An event's data.
+    #[error("an SSE event is over {MAX_EVENT_BYTES} bytes")]
+    Event,
+    /// An event's name.
+    #[error("an SSE event name is over {MAX_EVENT_NAME_BYTES} bytes")]
+    Name,
+}
 
 /// An incremental parser: feed it the body's chunks as they arrive.
 #[derive(Debug, Default)]
@@ -48,7 +60,7 @@ impl SseParser {
                 }
                 _ => {
                     if self.line.len() >= MAX_EVENT_BYTES {
-                        return Err(TooLarge);
+                        return Err(TooLarge::Line);
                     }
                     self.line.push(b);
                 }
@@ -81,10 +93,15 @@ impl SseParser {
             None => (&*line, ""),
         };
         match field {
-            "event" => self.event = value.to_owned(),
+            "event" => {
+                if value.len() > MAX_EVENT_NAME_BYTES {
+                    return Err(TooLarge::Name);
+                }
+                self.event = value.to_owned();
+            }
             "data" => {
                 if self.data.len() + value.len() >= MAX_EVENT_BYTES {
-                    return Err(TooLarge);
+                    return Err(TooLarge::Event);
                 }
                 self.data.push_str(value);
                 self.data.push('\n');
@@ -150,12 +167,24 @@ mod tests {
     fn oversized_lines_and_events_are_refused() {
         let mut p = SseParser::default();
         let long = vec![b'x'; MAX_EVENT_BYTES + 1];
-        assert_eq!(p.feed(&long), Err(TooLarge));
+        assert_eq!(p.feed(&long), Err(TooLarge::Line));
 
         let mut p = SseParser::default();
         let line = format!("data: {}\n", "y".repeat(MAX_EVENT_BYTES / 2));
         assert_eq!(p.feed(line.as_bytes()).unwrap(), vec![]);
-        assert_eq!(p.feed(line.as_bytes()), Err(TooLarge));
+        assert_eq!(p.feed(line.as_bytes()), Err(TooLarge::Event));
+    }
+
+    #[test]
+    fn an_oversized_event_name_is_refused() {
+        let mut p = SseParser::default();
+        let name = "n".repeat(MAX_EVENT_NAME_BYTES);
+        let fits = format!("event: {name}\ndata: 1\n\n");
+        assert_eq!(p.feed(fits.as_bytes()).unwrap(), vec![ev(&name, "1")]);
+        let over = format!("event: {name}x\ndata: 1\n\n");
+        let err = p.feed(over.as_bytes()).unwrap_err();
+        assert_eq!(err, TooLarge::Name);
+        assert_eq!(err.to_string(), "an SSE event name is over 64 bytes");
     }
 
     #[test]

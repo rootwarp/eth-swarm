@@ -139,13 +139,14 @@ async fn sse_gap_recorded() {
     let out = dir.path().join("capture");
     let mut collector =
         Collector::<Spec>::create(&out, info(vec![Source::Sse]), chain(), None).unwrap();
-    let (arrivals, mut rx) = Arrivals::channel(64);
+    let (arrivals, mut rx) = Arrivals::channel(64, usize::MAX);
     let (stop_tx, stop) = watch::channel(false);
     let client = tokio::spawn({
         let (clock, arrivals) = (Arc::clone(&clock), arrivals.clone());
         async move {
             let pause = ManualPause(Arc::clone(&clock));
-            run_sse(&config, &*clock, &pause, &arrivals, stop).await
+            let started = clock.now();
+            run_sse(&config, &*clock, &pause, &arrivals, started, stop).await
         }
     });
     let mut events = 0;
@@ -166,11 +167,32 @@ async fn sse_gap_recorded() {
     }
     let summary = collector.finish(0).unwrap();
 
-    // One missing interval: the 30 s the node was down, from the last bytes of the first stream
-    // to the response of the second, after 29 refused reconnects.
-    assert_eq!(stats.gaps, 1);
-    assert_eq!(summary.missing.len(), 1, "{summary:?}");
-    let gap = &summary.missing[0];
+    // Two missing intervals: the moment before the first stream (none on a clock that stood
+    // still), and the 30 s the node was down, from the last bytes of the first stream to the
+    // response of the second, after 29 refused reconnects.
+    assert_eq!(stats.gaps, 2);
+    assert_eq!(summary.missing_intervals, 2, "{summary:?}");
+    assert_eq!(summary.missing_ns, DOWN.as_nanos() as u64);
+    assert_eq!(summary.missing_open_at_shutdown, 0);
+    assert!(
+        logged.iter().any(|l| l.contains("missing interval")),
+        "{logged:?}"
+    );
+
+    // On disk: gaps.jsonl lists them, the summary counts them and points to it; the records sit
+    // on either side of the outage.
+    let gaps = std::fs::read_to_string(out.join(&summary.gaps_file)).unwrap();
+    let on_disk: Vec<MissingInterval> = gaps
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(on_disk.len(), 2);
+    assert_eq!(
+        (on_disk[0].start_wall_ns, on_disk[0].duration_ns()),
+        (start, 0)
+    );
+    assert_eq!(on_disk[0].reason, "/eth/v1/events: not connected yet");
+    let gap = &on_disk[1];
     assert_eq!(gap.source, Source::Sse);
     assert_eq!(gap.duration_ns(), DOWN.as_nanos() as u64);
     assert_eq!(
@@ -180,18 +202,6 @@ async fn sse_gap_recorded() {
     assert_eq!(gap.failed_attempts, 29);
     assert_eq!(gap.reason, "/eth/v1/events: the stream ended");
     assert!(!gap.open_at_shutdown);
-    assert!(
-        logged.iter().any(|l| l.contains("missing interval")),
-        "{logged:?}"
-    );
-
-    // On disk: gaps.jsonl and the summary carry it; the records sit on either side of it.
-    let gaps = std::fs::read_to_string(out.join(GAPS_FILE)).unwrap();
-    let on_disk: Vec<MissingInterval> = gaps
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    assert_eq!(on_disk, summary.missing);
     let toml_summary: Summary =
         toml::from_str(&std::fs::read_to_string(out.join(SUMMARY_FILE)).unwrap()).unwrap();
     assert_eq!(toml_summary, summary);

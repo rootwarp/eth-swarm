@@ -5,7 +5,7 @@
 //! <dir>/records.jsonl   one ArrivalRecord per line, in arrival order
 //! <dir>/gaps.jsonl      one MissingInterval per line, as each one closes
 //! <dir>/ntp.jsonl       one NtpSample per line
-//! <dir>/summary.toml    written at the end: counts and every missing interval, for the manifest
+//! <dir>/summary.toml    written at the end: counts, for the manifest (gaps.jsonl lists the gaps)
 //! ```
 //!
 //! Gossip payloads are decoded here (slot, block root) and handed to the archive
@@ -13,7 +13,7 @@
 //! that does not decode is still recorded, with no slot or root, and counted. Every file is
 //! created new: a capture never overwrites another.
 
-use super::arrival::{Arrival, Drops, MissingInterval};
+use super::arrival::{Arrival, ArrivalReceiver, Drops, MissingInterval};
 use super::decode::{decode_gossip, decode_sse, parse_gossip_topic, topic_subnet};
 use super::ntp::NtpSample;
 use super::record::{ArrivalRecord, Source};
@@ -21,9 +21,8 @@ use crate::archive::{ArchiveError, Capture, ChainParams, PayloadError, TopicKind
 use consensus_types::EthSpec;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use tokio::sync::mpsc;
 
 /// `capture.toml`.
 pub const CAPTURE_FILE: &str = "capture.toml";
@@ -88,8 +87,16 @@ pub struct Summary {
     pub ntp_samples: u64,
     /// Of which failed.
     pub ntp_failures: u64,
-    /// Every interval a source was down.
-    pub missing: Vec<MissingInterval>,
+    /// Intervals a source was down. Each is a line of [`Summary::gaps_file`]; the summary only
+    /// counts them, so it stays the same size however long the capture runs.
+    pub missing_intervals: u64,
+    /// Their total length, monotonic nanoseconds.
+    pub missing_ns: u64,
+    /// Of which still open when the capture stopped.
+    pub missing_open_at_shutdown: u64,
+    /// The file that lists every missing interval, relative to the capture directory:
+    /// [`GAPS_FILE`].
+    pub gaps_file: String,
 }
 
 /// Writing the capture failed: it stops.
@@ -206,7 +213,10 @@ impl<E: EthSpec> Collector<E> {
             chain,
             column_subnet_count: info.column_subnet_count,
             archive,
-            summary: Summary::default(),
+            summary: Summary {
+                gaps_file: GAPS_FILE.to_owned(),
+                ..Summary::default()
+            },
         })
     }
 
@@ -241,9 +251,11 @@ impl<E: EthSpec> Collector<E> {
             Arrival::Gap(gap) => {
                 self.gaps.push(&gap)?;
                 self.gaps.flush()?;
-                let notice = gap_notice(&gap);
-                self.summary.missing.push(gap);
-                Ok(Some(notice))
+                let summary = &mut self.summary;
+                summary.missing_intervals += 1;
+                summary.missing_ns = summary.missing_ns.saturating_add(gap.duration_ns());
+                summary.missing_open_at_shutdown += u64::from(gap.open_at_shutdown);
+                Ok(Some(gap_notice(&gap)))
             }
             Arrival::Ntp(sample) => {
                 self.ntp.push(&sample)?;
@@ -381,7 +393,7 @@ fn ntp_notice(sample: &NtpSample) -> String {
 /// worth logging.
 pub fn collect<E: EthSpec>(
     mut collector: Collector<E>,
-    mut rx: mpsc::Receiver<Arrival>,
+    mut rx: ArrivalReceiver,
     drops: &Drops,
     log: &mut dyn FnMut(&str),
 ) -> Result<Summary, CollectorError> {
@@ -391,32 +403,101 @@ pub fn collect<E: EthSpec>(
             if let Some(line) = collector.handle(arrival)? {
                 log(&line);
             }
-            next = rx.try_recv().ok();
+            next = rx.try_recv();
         }
         collector.flush()?;
     }
     collector.finish(drops.get())
 }
 
-/// Reads a capture directory's `capture.toml` and `records.jsonl`.
-pub fn read_capture(dir: &Path) -> Result<(CaptureInfo, Vec<ArrivalRecord>), CollectorError> {
-    let info_path = dir.join(CAPTURE_FILE);
-    let text = std::fs::read_to_string(&info_path).map_err(io_error(&info_path))?;
-    let info = toml::from_str(&text).map_err(|e| CollectorError::Format {
-        path: info_path.clone(),
+/// The longest line `records.jsonl` may hold: 64 KiB. A record is a few hundred bytes (its
+/// longest field is the topic: an event name is at most `MAX_EVENT_NAME_BYTES`); a longer line
+/// is not one, and is refused without being read whole.
+pub const MAX_RECORD_LINE_BYTES: usize = 64 << 10;
+
+/// Reads a capture directory's `capture.toml`.
+pub fn read_info(dir: &Path) -> Result<CaptureInfo, CollectorError> {
+    let path = dir.join(CAPTURE_FILE);
+    let text = std::fs::read_to_string(&path).map_err(io_error(&path))?;
+    toml::from_str(&text).map_err(|e| CollectorError::Format {
+        path,
         reason: e.to_string(),
-    })?;
+    })
+}
+
+/// The records of a capture directory's `records.jsonl`, read one line at a time: memory does
+/// not grow with the capture. Ends after the first error.
+pub fn records(dir: &Path) -> Result<Records, CollectorError> {
     let path = dir.join(RECORDS_FILE);
     let file = File::open(&path).map_err(io_error(&path))?;
-    let mut records = Vec::new();
-    for (i, line) in BufReader::new(file).lines().enumerate() {
-        let line = line.map_err(io_error(&path))?;
-        let record = serde_json::from_str(&line).map_err(|e| CollectorError::Format {
-            path: path.clone(),
-            reason: format!("line {}: {e}", i + 1),
-        })?;
-        records.push(record);
+    Ok(Records {
+        lines: BufReader::new(file),
+        path,
+        line: 0,
+        buf: Vec::new(),
+        failed: false,
+    })
+}
+
+/// The iterator [`records`] returns.
+#[derive(Debug)]
+pub struct Records {
+    lines: BufReader<File>,
+    path: PathBuf,
+    line: u64,
+    buf: Vec<u8>,
+    failed: bool,
+}
+
+impl Records {
+    fn format(&self, reason: String) -> CollectorError {
+        CollectorError::Format {
+            path: self.path.clone(),
+            reason: format!("line {}: {reason}", self.line),
+        }
     }
+
+    fn read_next(&mut self) -> Result<Option<ArrivalRecord>, CollectorError> {
+        self.buf.clear();
+        // One byte past the cap, to tell a line at the cap from one over it.
+        let cap = MAX_RECORD_LINE_BYTES as u64 + 1;
+        let read = (&mut self.lines)
+            .take(cap)
+            .read_until(b'\n', &mut self.buf)
+            .map_err(io_error(&self.path))?;
+        if read == 0 {
+            return Ok(None);
+        }
+        self.line += 1;
+        if self.buf.last() == Some(&b'\n') {
+            self.buf.pop();
+        } else if read as u64 == cap {
+            return Err(self.format(format!("over {MAX_RECORD_LINE_BYTES} bytes")));
+        }
+        serde_json::from_slice(&self.buf)
+            .map(Some)
+            .map_err(|e| self.format(e.to_string()))
+    }
+}
+
+impl Iterator for Records {
+    type Item = Result<ArrivalRecord, CollectorError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        let next = self.read_next().transpose();
+        self.failed = matches!(next, Some(Err(_)));
+        next
+    }
+}
+
+/// Reads a capture directory's `capture.toml` and every record of `records.jsonl` into memory.
+/// For a long capture, read [`records`] one at a time instead.
+pub fn read_capture(dir: &Path) -> Result<(CaptureInfo, Vec<ArrivalRecord>), CollectorError> {
+    let info = read_info(dir)?;
+    let records = records(dir)?.collect::<Result<_, _>>()?;
     Ok((info, records))
 }
 
@@ -624,10 +705,32 @@ mod tests {
             "missing interval: Sse down for 2000 ms (/eth/v1/events: connect: refused; \
              2 failed reconnects; still down at shutdown)"
         );
+        let closed = MissingInterval {
+            start_mono_ns: 3_000_000_000,
+            end_mono_ns: 3_500_000_000,
+            open_at_shutdown: false,
+            ..gap.clone()
+        };
+        c.handle(Arrival::Gap(closed.clone())).unwrap();
         let summary = c.finish(0).unwrap();
         assert_eq!((summary.sse_records, summary.undecoded), (2, 1));
         assert_eq!((summary.ntp_samples, summary.ntp_failures), (2, 1));
-        assert_eq!(summary.missing, vec![gap]);
+        // The summary counts the intervals; gaps.jsonl lists them.
+        assert_eq!(
+            (
+                summary.missing_intervals,
+                summary.missing_ns,
+                summary.missing_open_at_shutdown
+            ),
+            (2, 2_500_000_000, 1)
+        );
+        assert_eq!(summary.gaps_file, GAPS_FILE);
+        let listed: Vec<MissingInterval> = std::fs::read_to_string(out.join(GAPS_FILE))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(listed, vec![gap, closed]);
         let ntp: Vec<NtpSample> = std::fs::read_to_string(out.join(NTP_FILE))
             .unwrap()
             .lines()
@@ -673,15 +776,48 @@ mod tests {
         assert!(err.to_string().contains("line 1"), "{err}");
     }
 
+    #[test]
+    fn records_are_read_one_line_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        write_toml(&dir.path().join(CAPTURE_FILE), &info()).unwrap();
+        assert_eq!(read_info(dir.path()).unwrap(), info());
+        let line = r#"{"source":"sse","topic":"block_gossip","subnet":null,"msg_id":null,"block_root":null,"slot":1,"recv_mono_ns":0,"recv_wall_ns":0,"peer":null}"#;
+        let long = format!("{{\"topic\":\"{}\"}}", "x".repeat(MAX_RECORD_LINE_BYTES));
+        std::fs::write(
+            dir.path().join(RECORDS_FILE),
+            format!("{line}\n{line}\n{long}\n{line}\n"),
+        )
+        .unwrap();
+        // The records before a bad line come first: nothing reads the file whole.
+        let mut it = records(dir.path()).unwrap();
+        assert_eq!(it.next().unwrap().unwrap().slot, Some(1));
+        assert_eq!(it.next().unwrap().unwrap().slot, Some(1));
+        let err = it.next().unwrap().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{}: line 3: over {MAX_RECORD_LINE_BYTES} bytes",
+                dir.path().join(RECORDS_FILE).display()
+            )
+        );
+        assert!(it.next().is_none(), "nothing after an error");
+        // A last line without its newline (a capture still being written) is a record too.
+        std::fs::write(dir.path().join(RECORDS_FILE), format!("{line}\n{line}")).unwrap();
+        assert_eq!(records(dir.path()).unwrap().count(), 2);
+    }
+
     #[tokio::test]
     async fn collect_runs_until_every_sender_is_gone() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("c");
         let c = Collector::<Spec>::create(&out, info(), fixtures::chain(), None).unwrap();
-        let (arrivals, rx) = Arrivals::channel(16);
+        let (arrivals, rx) = Arrivals::channel(16, usize::MAX);
         let (block, _) = fixtures::block(3, 0);
         for i in 0..3 {
-            assert!(arrivals.offer(tap("beacon_block", block.clone(), i)));
+            assert_eq!(
+                arrivals.offer(tap("beacon_block", block.clone(), i)),
+                Ok(true)
+            );
         }
         arrivals
             .deliver(Arrival::Gap(MissingInterval {
@@ -706,7 +842,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!((summary.records, summary.missing.len()), (3, 1));
+        assert_eq!((summary.records, summary.missing_intervals), (3, 1));
         assert!(out.join(SUMMARY_FILE).exists());
     }
 }
