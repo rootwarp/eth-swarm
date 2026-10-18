@@ -257,6 +257,27 @@ expect 1 "StartLimitIntervalSec=10s fails" "ethswarm-chain.service: .*StartLimit
 d=$(variant limit-in-service); drop "$d" ethswarm-chain.service "^StartLimitBurst="
 append "$d" ethswarm-chain.service "StartLimitBurst=3"
 expect 1 "StartLimitBurst= outside [Unit] fails" "ethswarm-chain.service: StartLimitBurst" "$d"
+# Exit codes only: a signal name (an OOM kill is SIGKILL) would turn that kill into a stop.
+for value in SIGKILL KILL SIGTERM; do
+  d=$(variant "prevent-signal-$value"); append "$d" ethswarm-p2p.service "RestartPreventExitStatus=$value"
+  expect 1 "RestartPreventExitStatus=$value fails" "ethswarm-p2p.service: RestartPreventExitStatus=.*signal" "$d"
+done
+
+# --- the memory ceiling: MemoryHigh= below a finite MemoryMax=, no swap, an OOM kill restarts ----
+
+for unit in ethswarm-p2p ethswarm-discv5 ethswarm-chain; do
+  for key in MemoryHigh MemoryMax MemorySwapMax OOMPolicy; do
+    d=$(variant "mem-drop-$key-$unit"); drop "$d" "$unit.service" "^$key="
+    expect 1 "$unit without $key= fails" "^$unit.service: missing $key=" "$d"
+  done
+  for line in MemoryMax=infinity MemoryMax= MemoryMax=50% MemoryMax=0 MemoryMax=4Q \
+    MemoryHigh=infinity MemoryHigh= MemoryHigh=64T \
+    MemorySwapMax=1G MemorySwapMax=infinity MemorySwapMax= OOMPolicy=continue OOMPolicy=; do
+    key=${line%%=*}
+    d=$(variant "mem-weak-$line-$unit"); append "$d" "$unit.service" "$line"
+    expect 1 "$unit with a later $line fails" "^$unit.service: $key=[^ ]*, want" "$d"
+  done
+done
 
 # --- the full hardening set: removed, reset or overridden by a later line ------------------------
 
@@ -345,7 +366,7 @@ expect 1 "a backslash in a comment fails" "ethswarm-chain.service: line [0-9]+: 
 d=$(variant backslash-value); raw "$d" ethswarm-chain.service "[Install]" "SyslogIdentifier=a\\\\b\n"
 expect 1 "a backslash in a value fails" "ethswarm-chain.service: line [0-9]+: .*backslash" "$d"
 
-# --- sizes: systemd refuses a line of 1 MiB or more (ENOBUFS) before it skips a comment ---------
+# --- sizes: no line of 2048 bytes or more, which an older systemd would read as two lines -------
 
 # comment <dir> <unit> <bytes>: append one `#` comment line of exactly <bytes> bytes (newline not
 # counted) to <dir>/<unit>.
@@ -357,9 +378,22 @@ with open(path, "ab") as f:
     f.write(b"#" + b"x" * (size - 1) + b"\n")
 PY
 }
-# fill <dir> <unit> <bytes>: append one comment line so that <dir>/<unit> is exactly <bytes> long.
+# fill <dir> <unit> <bytes>: append comment lines of at most 1024 bytes (newline included) so
+# that <dir>/<unit> is exactly <bytes> long.
 fill() {
-  comment "$1" "$2" $(($3 - $(wc -c < "$1/$2") - 1))
+  python3 -I - "$1/$2" "$3" <<'PY'
+import os, sys
+path, size = sys.argv[1], int(sys.argv[2])
+left = size - os.path.getsize(path)
+with open(path, "ab") as f:
+    while left > 0:
+        # A line of `line` bytes, newline included; never leave a 1-byte rest.
+        line = min(left, 1024)
+        if left - line == 1:
+            line -= 1
+        f.write(b"\n" if line == 1 else b"#" + b"x" * (line - 2) + b"\n")
+        left -= line
+PY
 }
 # expect_without <description> <pattern> <dir>: the lint's output has no line matching <pattern>.
 expect_without() {
@@ -372,15 +406,22 @@ expect_without() {
   fi
 }
 
-d=$(variant line-at-limit); comment "$d" ethswarm-p2p.service 1048576
-expect 1 "a comment line of 1048576 bytes fails" \
-  "ethswarm-p2p.service: line [0-9]+: 1048576 bytes, systemd refuses a line of 1048576 or more" "$d"
-d=$(variant line-over-limit); comment "$d" ethswarm-chain.service 1048577
-expect 1 "a comment line of 1048577 bytes fails" "ethswarm-chain.service: line [0-9]+: 1048577 bytes" "$d"
-d=$(variant line-below-limit); comment "$d" ethswarm-p2p.service 1048575
-expect 1 "a comment line of 1048575 bytes fails on the file size" \
-  "ethswarm-p2p.service: [0-9]+ bytes, over the 65536-byte cap" "$d"
-expect_without "a comment line of 1048575 bytes is not a long line" "line [0-9]+: [0-9]+ bytes" "$d"
+d=$(variant line-below-cap); comment "$d" ethswarm-p2p.service 2047
+expect 0 "a comment line of 2047 bytes passes" "^ok: 3 units" "$d"
+for size in 2048 2049 4096 1048576 1048577; do
+  d=$(variant "line-$size"); comment "$d" ethswarm-chain.service "$size"
+  expect 1 "a comment line of $size bytes fails" \
+    "ethswarm-chain.service: line [0-9]+: $size bytes, over the 2047-byte line cap" "$d"
+done
+# The hidden setting a split would expose: the bytes from 2048 on, read as a line of their own.
+d=$(variant line-split)
+python3 -I - "$d/ethswarm-p2p.service" <<'PY'
+import sys
+with open(sys.argv[1], "ab") as f:
+    f.write(b"#" + b"x" * 2046 + b"ExecStartPost=+/usr/bin/id\n")
+PY
+expect 1 "a comment hiding a setting past byte 2047 fails" \
+  "ethswarm-p2p.service: line [0-9]+: 2073 bytes, over the 2047-byte line cap" "$d"
 d=$(variant file-at-cap); fill "$d" ethswarm-discv5.service 65536
 expect 0 "a unit of exactly 65536 bytes passes" "^ok: 3 units" "$d"
 d=$(variant file-over-cap); fill "$d" ethswarm-discv5.service 65537
@@ -402,17 +443,77 @@ done
 d=$(variant extra-other-file); printf 'notes\n' > "$d/NOTES.md"
 expect 0 "a file that is not a unit passes" "^ok: 3 units" "$d"
 
-# The README installs exactly the three units, by name: a glob would install an unlinted one.
-install_line=$(grep -E '^install .*/etc/systemd/system/' "$probe/README.md" || true)
-if [[ -n $install_line && $install_line != *'*'* && $install_line != *'{'* ]] \
-  && [[ $install_line == *" ops/probe/ethswarm-p2p.service "* ]] \
-  && [[ $install_line == *" ops/probe/ethswarm-discv5.service "* ]] \
-  && [[ $install_line == *" ops/probe/ethswarm-chain.service "* ]] \
-  && (($(printf '%s\n' "$install_line" | grep -o '\.service' | wc -l) == 3)); then
-  ok "the README installs the three units by name"
-else
-  bad "the README installs the three units by name" "${install_line:-(no install line)}"
-fi
+# --- the README installs exactly the three units, by name, and nothing else into systemd -------
+
+# The one line that puts units on the host: the three by name, never a glob, which would install
+# an unlinted one.
+INSTALL_LINE='install -m 0644 ops/probe/ethswarm-p2p.service ops/probe/ethswarm-discv5.service ops/probe/ethswarm-chain.service /etc/systemd/system/'
+# A line naming /etc/systemd (a `cd` there) or any .../systemd/system unit directory (/etc, /run,
+# /lib, /usr/lib, /usr/local/lib), however its slashes are doubled or dotted. Fail-closed: any
+# such line but the pinned one is refused, whatever command it runs.
+UNIT_DIR='/etc/+(\./+)*systemd([^-.a-z]|$)|systemd/+(\./+)*system([^-.a-z]|$)'
+
+# readme_findings <file>: one line per README line that would write a unit onto the host other
+# than through INSTALL_LINE, and one if INSTALL_LINE is not there exactly once. Empty: it holds.
+readme_findings() {
+  local n=0 number line
+  while IFS= read -r line || [[ -n $line ]]; do
+    number=${line%%:*}; line=${line#*:}
+    if [[ $line == "$INSTALL_LINE" ]]; then
+      n=$((n + 1))
+    else
+      printf 'README line %s names a systemd unit directory: %s\n' "$number" "$line"
+    fi
+  done < <(grep -nE -- "$UNIT_DIR" "$1" || true)
+  if ((n != 1)); then
+    printf 'README holds the pinned install line %d times, want once\n' "$n"
+  fi
+}
+
+# expect_readme <want: ok|refused> <description> <file>
+expect_readme() {
+  local out
+  out=$(readme_findings "$3")
+  if [[ $1 == ok && -z $out ]] || [[ $1 == refused && -n $out ]]; then
+    ok "$2"
+  else
+    bad "$2 (want $1)" "${out:-(no finding)}"
+  fi
+}
+
+expect_readme ok "the README installs the three units by name, and nothing else" "$probe/README.md"
+# readme_variant <name> <line>: the README with <line> added after its pinned install line.
+readme_variant() {
+  local file="$tmp/readme-$1.md"
+  LINE=$2 PIN=$INSTALL_LINE awk '{ print } $0 == ENVIRON["PIN"] { print ENVIRON["LINE"] }' \
+    "$probe/README.md" > "$file"
+  printf '%s' "$file"
+}
+i=0
+for line in \
+  'cp ops/probe/*.service /etc/systemd/system/' \
+  'cp ops/probe/ethswarm-p2p.service /etc/systemd/system' \
+  'sudo install -m 0644 ops/probe/ethswarm-p2p.service ops/probe/ethswarm-discv5.service ops/probe/ethswarm-chain.service /etc/systemd/system/' \
+  "  $INSTALL_LINE" \
+  'ln -s "$PWD"/ops/probe/ethswarm-p2p.service /etc/systemd/system/' \
+  'rsync -a ops/probe/ /etc/systemd/system/' \
+  'install -m 0644 ops/probe/extra.service /etc//systemd/./system/' \
+  'cat ops/probe/ethswarm-p2p.service > /etc/systemd/system/x.service' \
+  'cp ops/probe/*.service /run/systemd/system/' \
+  'cp ops/probe/*.service /usr/lib/systemd/system/' \
+  'cd /etc/systemd && cp ../../ops/probe/*.service system/' \
+  '- `cp ops/probe/*.service /etc/systemd/system/` also works'; do
+  i=$((i + 1))
+  expect_readme refused "a README line '$line' is refused" "$(readme_variant "add-$i" "$line")"
+done
+d=$tmp/readme-twice.md; { cat "$probe/README.md"; printf '%s\n' "$INSTALL_LINE"; } > "$d"
+expect_readme refused "the pinned install line twice is refused" "$d"
+d=$tmp/readme-none.md; grep -vxF -- "$INSTALL_LINE" "$probe/README.md" > "$d" || true
+expect_readme refused "a README without the pinned install line is refused" "$d"
+for line in 'systemd-analyze verify ops/probe/*.service' 'see systemd.exec(5) and systemd-system.conf(5)'; do
+  i=$((i + 1))
+  expect_readme ok "a README line '$line' passes" "$(readme_variant "add-$i" "$line")"
+done
 
 # --- a key allow-list per section: only what the committed units use ----------------------------
 

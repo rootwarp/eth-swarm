@@ -59,6 +59,19 @@ ProcSubset=pid
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged
+# Memory ceiling (README "Resource limits"), for every process of the unit, the check
+# included: past MemoryHigh= the kernel throttles and reclaims, at MemoryMax= it OOM-kills.
+# 4G/6G: peer state for up to 160 connections, the req/resp responses (2 x 256 MiB) and
+# gossip, with MemoryMax= above every connection's 32 MiB mplex budget at once, so the
+# transport's own budgets act first.
+MemoryHigh=4G
+MemoryMax=6G
+# No swap, so the ceiling cannot be dodged by swapping out.
+MemorySwapMax=0
+# An OOM kill (SIGKILL, a signal, not an exit code) stops the unit with result oom-kill,
+# a failure: Restart=on-failure restarts it, within the start limit. Set here, not left to
+# the host's DefaultOOMPolicy=.
+OOMPolicy=stop
 Restart=on-failure
 RestartSec=5min
 # No restart on a refusal that a restart cannot fix: 1 a refused credential, 2 the stub

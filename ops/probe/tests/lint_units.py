@@ -23,7 +23,11 @@ messages. Each unit must, in its [Service] section unless noted:
     backslash or a bare `;` word, which systemd resolves before it reads the prefixes;
   - give the check its time: TimeoutStartSec= at least CHECK_BUDGET + MARGIN seconds, finite;
   - not loop on a refusal: RestartSec= at least 60 s, RestartPreventExitStatus= covering
-    1 2 64, and in [Unit] StartLimitIntervalSec= at least 1 h and StartLimitBurst= 1 to 5;
+    1 2 64 with exit codes only (a signal name there would turn an OOM kill, SIGKILL, into a
+    stop), and in [Unit] StartLimitIntervalSec= at least 1 h and StartLimitBurst= 1 to 5;
+  - hold its memory: MemoryMax= a finite positive size, MemoryHigh= a finite size below it,
+    MemorySwapMax=0 (no swap to grow into) and OOMPolicy=stop or kill (never continue, and
+    never the host's DefaultOOMPolicy=), so an OOM kill fails the unit and Restart= applies;
   - carry the full hardening set of the committed units (HARDENING below, plus an empty
     CapabilityBoundingSet= and no AmbientCapabilities=, an allow-list RestrictAddressFamilies=
     within AF_UNIX AF_INET AF_INET6, StateDirectory= the user's name, and ReadWritePaths=
@@ -31,9 +35,10 @@ messages. Each unit must, in its [Service] section unless noted:
 Fail-closed reading: a unit file may hold only tab, newline and printable ASCII bytes, no
 backslash, and no line that is not blank, a comment, a [section] header or a key=value inside
 a section; anything else refuses the whole file, so there is no continuation, escape or exotic
-line end to model. No line may be LINE_MAX (1 MiB) bytes or longer, which systemd refuses
-(ENOBUFS) before it skips a comment, so the unit would not load, and no file may exceed
-FILE_MAX (64 KiB), far below that. No `*.d` drop-in directory and no `*.service` other than
+line end to model. No line may be LINE_MAX (2048) bytes or longer: a systemd that reads unit
+files through fgets() into a LINE_MAX buffer reads the bytes from 2048 on as a line of their
+own, so a long comment could hide a setting (current systemd refuses a line of 1 MiB or more
+instead). No file may exceed FILE_MAX (64 KiB). No `*.d` drop-in directory and no `*.service` other than
 the three may sit in DIR (an install by glob would pick it up unlinted). Of systemd's syntax
 the lint then models only `#`/`;` comments, an empty assignment resetting a list setting (and
 a single-valued one to its default), and the last assignment of a single-valued setting
@@ -54,11 +59,13 @@ UNITS = {
     "ethswarm-chain.service": {"user": "ethswarm-chain", "node_key": False},
 }
 CREDENTIAL = "nodekey"
-# systemd 257 reads unit files with read_line(LONG_LINE_MAX = 1 MiB) and refuses the whole file
-# on a line of that length or more, before its comment check.
-LINE_MAX = 1024 * 1024
-# A unit file's size cap: the committed units are under 3 KiB; this keeps any line far below
-# LINE_MAX.
+# The shortest line refused. systemd 257 reads unit files with read_line(LONG_LINE_MAX = 1 MiB)
+# and refuses the whole file on a line of that length or more; a systemd reading them through
+# fgets() into a LINE_MAX (2048) buffer instead splits a longer line, and its tail from byte
+# 2048 on is read as a line of its own, which could hold a setting this lint took for comment.
+# At 2047 bytes or less every systemd reads a line whole (the longest committed is under 100).
+LINE_MAX = 2048
+# A unit file's size cap: the committed units are under 4 KiB.
 FILE_MAX = 64 * 1024
 TRUE = {"yes", "y", "true", "t", "on", "1"}
 FAMILIES = {"AF_UNIX", "AF_INET", "AF_INET6"}
@@ -81,6 +88,12 @@ HARDENING = {
     "ProtectKernelModules": TRUE, "ProtectKernelLogs": TRUE, "ProtectControlGroups": TRUE,
     "ProtectClock": TRUE, "ProtectHostname": TRUE, "ProtectProc": {"invisible"},
     "ProcSubset": {"pid"}, "UMask": {"0077"},
+    # No swap: the memory ceiling is the unit's RAM, not RAM plus whatever swap it can fill.
+    "MemorySwapMax": {"0"},
+    # An OOM kill stops the unit with result oom-kill, a failure Restart=on-failure restarts
+    # (within the start limit); pinned here so the host's DefaultOOMPolicy= cannot make it
+    # `continue`.
+    "OOMPolicy": {"stop", "kill"},
 }
 # The list hardening settings and their exact effective words.
 HARDENING_LISTS = {
@@ -92,6 +105,9 @@ HARDENING_LISTS = {
 CHECK_BUDGET = 4 * 30 + 2 * (30 + 1800)
 MARGIN = 300
 PREVENT = {"1", "2", "64"}
+# The memory ceiling's sizes: systemd's parse_size(), base 1024, as bytes.
+SIZE_UNITS = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40, "P": 1 << 50,
+              "E": 1 << 60}
 TIME_UNITS = {
     "us": 1e-6, "usec": 1e-6, "ms": 1e-3, "msec": 1e-3, "s": 1, "sec": 1, "second": 1,
     "seconds": 1, "m": 60, "min": 60, "minute": 60, "minutes": 60, "h": 3600, "hr": 3600,
@@ -113,7 +129,8 @@ ALLOWED = {
         "MemoryDenyWriteExecute", "ProtectKernelTunables", "ProtectKernelModules",
         "ProtectKernelLogs", "ProtectControlGroups", "ProtectClock", "ProtectHostname",
         "ProtectProc", "ProcSubset", "SystemCallArchitectures", "SystemCallFilter", "Restart",
-        "RestartSec", "RestartPreventExitStatus",
+        "RestartSec", "RestartPreventExitStatus", "MemoryHigh", "MemoryMax", "MemorySwapMax",
+        "OOMPolicy",
     },
     "Install": {"WantedBy"},
 }
@@ -172,6 +189,10 @@ EXPECTED = {
         ('Service', 'SystemCallArchitectures', 'native'),
         ('Service', 'SystemCallFilter', '@system-service'),
         ('Service', 'SystemCallFilter', '~@privileged'),
+        ('Service', 'MemoryHigh', '4G'),
+        ('Service', 'MemoryMax', '6G'),
+        ('Service', 'MemorySwapMax', '0'),
+        ('Service', 'OOMPolicy', 'stop'),
         ('Service', 'Restart', 'on-failure'),
         ('Service', 'RestartSec', '5min'),
         ('Service', 'RestartPreventExitStatus', '1 2 64'),
@@ -224,6 +245,10 @@ EXPECTED = {
         ('Service', 'SystemCallArchitectures', 'native'),
         ('Service', 'SystemCallFilter', '@system-service'),
         ('Service', 'SystemCallFilter', '~@privileged'),
+        ('Service', 'MemoryHigh', '3G'),
+        ('Service', 'MemoryMax', '4G'),
+        ('Service', 'MemorySwapMax', '0'),
+        ('Service', 'OOMPolicy', 'stop'),
         ('Service', 'Restart', 'on-failure'),
         ('Service', 'RestartSec', '5min'),
         ('Service', 'RestartPreventExitStatus', '1 2 64'),
@@ -275,6 +300,10 @@ EXPECTED = {
         ('Service', 'SystemCallArchitectures', 'native'),
         ('Service', 'SystemCallFilter', '@system-service'),
         ('Service', 'SystemCallFilter', '~@privileged'),
+        ('Service', 'MemoryHigh', '3G'),
+        ('Service', 'MemoryMax', '4G'),
+        ('Service', 'MemorySwapMax', '0'),
+        ('Service', 'OOMPolicy', 'stop'),
         ('Service', 'Restart', 'on-failure'),
         ('Service', 'RestartSec', '5min'),
         ('Service', 'RestartPreventExitStatus', '1 2 64'),
@@ -368,8 +397,9 @@ def check_bytes(blob):
     in_section = False
     for number, line in enumerate(blob.split(b"\n"), start=1):
         if len(line) >= LINE_MAX:
-            found.append("line %d: %d bytes, systemd refuses a line of %d or more; refused"
-                         % (number, len(line), LINE_MAX))
+            found.append("line %d: %d bytes, over the %d-byte line cap (an older systemd reads "
+                         "the rest as a line of its own); refused"
+                         % (number, len(line), LINE_MAX - 1))
             continue
         bad = sorted({b for b in line if b not in allowed})
         if bad:
@@ -591,6 +621,10 @@ def lint_start_and_restart(unit_section, service):
     if restart_sec is None or (seconds(restart_sec) or 0) < 60:
         found.append("RestartSec=%s, want at least 60 s" % restart_sec)
     prevent = set(effective(service, "RestartPreventExitStatus"))
+    signals = sorted(word for word in prevent if not word.isdigit())
+    if signals:
+        found.append("RestartPreventExitStatus=%s: exit codes only; a signal name would stop the "
+                     "restart after an OOM kill (SIGKILL) or a stop" % " ".join(signals))
     if not PREVENT <= prevent:
         found.append("RestartPreventExitStatus=%s, want it to cover %s"
                      % (" ".join(sorted(prevent)) or "(missing)", " ".join(sorted(PREVENT))))
@@ -603,6 +637,35 @@ def lint_start_and_restart(unit_section, service):
     burst = last(unit_section, "StartLimitBurst")
     if burst is None or not burst.isdigit() or not 1 <= int(burst) <= 5:
         found.append("[Unit] StartLimitBurst=%s, want 1 to 5" % burst)
+    return found
+
+
+def size(value):
+    """A systemd size (parse_size, base 1024) in bytes; None for infinity, a percentage or
+    anything unparsable."""
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([KMGTPE]?)", value)
+    if not match:
+        return None
+    return int(float(match.group(1)) * SIZE_UNITS[match.group(2)])
+
+
+def lint_memory(service):
+    """The memory ceiling: MemoryMax= a finite positive size, and MemoryHigh= a finite size below
+    it, so the kernel throttles and reclaims before it OOM-kills. MemorySwapMax= and OOMPolicy=
+    are in HARDENING."""
+    found = []
+    ceiling = None
+    for key, want in (("MemoryMax", "a finite size"),
+                      ("MemoryHigh", "a finite size below MemoryMax=")):
+        got = last(service, key)
+        if got is None:
+            found.append("missing %s= (%s: the unit's memory ceiling)" % (key, want))
+            continue
+        bytes_ = size(got)
+        if key == "MemoryMax":
+            ceiling = bytes_
+        if not bytes_ or (key == "MemoryHigh" and (ceiling is None or bytes_ >= ceiling)):
+            found.append("%s=%s, want %s" % (key, got, want))
     return found
 
 
@@ -663,6 +726,7 @@ def lint(path, rules):
             + lint_exec_prefixes(service)
             + lint_anchor_check(service)
             + lint_start_and_restart(sections.get("Unit", {}), service)
+            + lint_memory(service)
             + lint_hardening(service, rules["user"]))
 
 

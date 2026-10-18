@@ -59,6 +59,18 @@ ProcSubset=pid
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged
+# Memory ceiling (README "Resource limits"), for every process of the unit, the check
+# included: past MemoryHigh= the kernel throttles and reclaims, at MemoryMax= it OOM-kills.
+# 3G/4G: cl-discv5 itself needs tens of MiB; the floor is the anchor check, which runs in
+# this unit's cgroup and holds the anchor state in memory.
+MemoryHigh=3G
+MemoryMax=4G
+# No swap, so the ceiling cannot be dodged by swapping out.
+MemorySwapMax=0
+# An OOM kill (SIGKILL, a signal, not an exit code) stops the unit with result oom-kill,
+# a failure: Restart=on-failure restarts it, within the start limit. Set here, not left to
+# the host's DefaultOOMPolicy=.
+OOMPolicy=stop
 Restart=on-failure
 RestartSec=5min
 # No restart on a refusal that a restart cannot fix: 1 a refused credential, 2 the stub
