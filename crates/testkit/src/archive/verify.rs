@@ -1,16 +1,17 @@
 //! [`open_verified`]: the only way replay opens an archive.
 
 use super::error::ArchiveError;
-use super::manifest::{ArchiveFile, Manifest, ManifestError, Sha256Digest, MANIFEST_FILE};
+use super::manifest::{
+    ArchiveFile, Manifest, ManifestError, Sha256Digest, MANIFEST_FILE, MAX_MANIFEST_LEN,
+};
+use super::names::segment_name;
 use super::payload::decompress;
+use super::writer::OPEN_PREFIX;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-
-/// The largest manifest read: far above the ~200 bytes per file of any real segment.
-pub const MAX_MANIFEST_LEN: u64 = 64 << 20;
 
 /// A segment whose manifest and every file were verified when it was opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,10 +43,19 @@ impl Archive {
         &self.manifest.files
     }
 
-    /// The file's bytes as received (snappy-compressed), re-checked against its length and
-    /// sha256: the file may have changed since the archive was opened.
+    /// The file's bytes as received (snappy-compressed), re-checked against the verified
+    /// manifest's length and sha256: the file may have changed since the archive was opened.
+    /// `file` must be one of [`Archive::files`] exactly; any other entry is
+    /// [`ArchiveError::NotListed`], so a caller's forged entry never reads a file.
     pub fn read(&self, file: &ArchiveFile) -> Result<Vec<u8>, ArchiveError> {
-        read_listed(&self.dir, file)
+        let files = &self.manifest.files;
+        let listed = files
+            .binary_search_by(|f| f.path.cmp(&file.path))
+            .ok()
+            .map(|at| &files[at])
+            .filter(|listed| *listed == file)
+            .ok_or_else(|| ArchiveError::NotListed(file.path.clone()))?;
+        read_listed(&self.dir, listed)
     }
 
     /// The file's SSZ bytes: [`Archive::read`], then decompressed within the gossip bounds.
@@ -55,12 +65,19 @@ impl Archive {
 }
 
 /// Opens the segment at `dir` after verifying all of it: the manifest's header digest and
-/// fields, and every file's presence, length and sha256. It also refuses any file or directory
-/// the manifest does not list, and any symlink or other non-regular entry, anywhere in `dir`.
+/// fields, the segment's place (`<network>/<slot_start>-<slot_end>` of its manifest, by the
+/// names `dir` resolves to), and every file's presence, length and sha256. It also refuses an
+/// unsealed `.open-*` directory, any file or directory the manifest does not list, and any
+/// symlink or other non-regular entry, anywhere in `dir`.
 pub fn open_verified(dir: &Path) -> Result<Archive, ArchiveError> {
     let meta = fs::symlink_metadata(dir).map_err(ArchiveError::io(dir))?;
     if !meta.is_dir() {
         return Err(ArchiveError::NotRegular(dir.display().to_string()));
+    }
+    let real = fs::canonicalize(dir).map_err(ArchiveError::io(dir))?;
+    let segment = name_of(Some(&real)).unwrap_or_default();
+    if segment.starts_with(OPEN_PREFIX) {
+        return Err(ArchiveError::Unsealed(dir.display().to_string()));
     }
     let manifest_path = dir.join(MANIFEST_FILE);
     let bytes = read_regular(&manifest_path, MANIFEST_FILE, MAX_MANIFEST_LEN)?;
@@ -75,6 +92,13 @@ pub fn open_verified(dir: &Path) -> Result<Archive, ArchiveError> {
             path: manifest_path,
             source,
         })?;
+    let expected = segment_name(manifest.slot_start, manifest.slot_end);
+    if segment != expected || name_of(real.parent()) != Some(manifest.network.as_str()) {
+        return Err(ArchiveError::Misplaced {
+            dir: dir.display().to_string(),
+            expected: format!("{}/{expected}", manifest.network),
+        });
+    }
     refuse_unlisted(dir, &manifest)?;
     for file in &manifest.files {
         read_listed(dir, file)?;
@@ -84,6 +108,11 @@ pub fn open_verified(dir: &Path) -> Result<Archive, ArchiveError> {
         manifest,
         archive_sha256,
     })
+}
+
+/// The last component of `path`, if it is UTF-8.
+fn name_of(path: Option<&Path>) -> Option<&str> {
+    path.and_then(Path::file_name).and_then(|n| n.to_str())
 }
 
 /// Fails on the first entry of `dir` the manifest does not account for: anything but
@@ -186,7 +215,7 @@ fn read_listed(dir: &Path, file: &ArchiveFile) -> Result<Vec<u8>, ArchiveError> 
 mod tests {
     use super::*;
     use crate::archive::fixtures::{self, Spec};
-    use crate::archive::writer::{Capture, CaptureConfig, Writer};
+    use crate::archive::writer::{Capture, CaptureConfig, Writer, OPEN_PREFIX};
     use crate::archive::ManifestError;
     use std::fs;
 
@@ -203,6 +232,7 @@ mod tests {
                 clock_source: "chrony".into(),
                 slots_per_segment: 32,
                 max_bytes: 1 << 30,
+                fork_digests: fixtures::fork_digests(),
             },
             fixtures::chain(),
         )
@@ -215,7 +245,7 @@ mod tests {
             let s = w
                 .put(Capture {
                     topic,
-                    fork_digest: [1, 2, 3, 4],
+                    fork_digest: fixtures::FULU_DIGEST,
                     payload: &payload,
                 })
                 .unwrap();
@@ -244,6 +274,72 @@ mod tests {
                 fixtures::decompressed(payload)
             );
         }
+    }
+
+    #[test]
+    fn read_trusts_only_the_verified_manifest() {
+        let out = tempfile::tempdir().unwrap();
+        let (dir, _) = segment(out.path());
+        let archive = open_verified(&dir).unwrap();
+        // An entry naming a file the manifest does not list, with that file's true length and
+        // sha256, is refused all the same.
+        let bytes = fs::read(dir.join(MANIFEST_FILE)).unwrap();
+        let forged = ArchiveFile {
+            path: MANIFEST_FILE.into(),
+            len: bytes.len() as u64,
+            sha256: Sha256::digest(&bytes).into(),
+            ..archive.files()[0].clone()
+        };
+        let e = archive.read(&forged).unwrap_err();
+        assert!(
+            matches!(&e, ArchiveError::NotListed(p) if p == MANIFEST_FILE),
+            "{e}"
+        );
+        // A listed path with any other field changed is not the listed entry.
+        let mut changed = archive.files()[0].clone();
+        changed.slot += 1;
+        assert!(matches!(
+            archive.read(&changed),
+            Err(ArchiveError::NotListed(_))
+        ));
+        assert!(matches!(
+            archive.read_ssz(&changed),
+            Err(ArchiveError::NotListed(_))
+        ));
+        archive.read(&archive.files()[0]).unwrap();
+    }
+
+    #[test]
+    fn a_segment_out_of_its_place_is_refused() {
+        let out = tempfile::tempdir().unwrap();
+        let (dir, _) = segment(out.path());
+        let net = out.path().join("devnet");
+        assert_eq!(dir, net.join("3-4"));
+        let place = |to: &Path| {
+            fs::create_dir_all(to.parent().unwrap()).unwrap();
+            fs::rename(&dir, to).unwrap();
+            let got = open_verified(to);
+            fs::rename(to, &dir).unwrap();
+            got
+        };
+        for to in [net.join("3-5"), net.join("x"), out.path().join("hoodi/3-4")] {
+            let e = place(&to).unwrap_err();
+            assert!(
+                matches!(&e, ArchiveError::Misplaced { .. }),
+                "{}: {e}",
+                to.display()
+            );
+        }
+        let e = place(&net.join(format!("{OPEN_PREFIX}0-0"))).unwrap_err();
+        assert!(matches!(&e, ArchiveError::Unsealed(_)), "{e}");
+        // A relative path is checked by the names it resolves to.
+        let e = open_verified(&dir.join(".")).map(|_| ()).err();
+        assert!(e.is_none(), "{e:?}");
+        let e = open_verified(&net.join("3-4/beacon_block/.."))
+            .map(|_| ())
+            .err();
+        assert!(e.is_none(), "{e:?}");
+        open_verified(&dir).unwrap();
     }
 
     #[test]

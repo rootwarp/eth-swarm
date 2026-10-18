@@ -5,6 +5,7 @@
 //! archiver capture --network sepolia|hoodi --input DIR --out DIR --host HOST
 //!                  --clock-source SOURCE --peer-count N [--topic TOPIC]...
 //!                  [--slots-per-segment N] [--max-bytes N]
+//!                  [--genesis-validators-root 0xROOT]
 //! archiver verify SEGMENT_DIR
 //! archiver --help
 //! ```
@@ -13,25 +14,35 @@
 //! sequence, 8 hex digits of fork digest, gossip topic name; the bytes as gossip delivered
 //! them) in sequence order and archives them with [`testkit::archive::Writer`] (mainnet preset)
 //! under `OUT/<network>/`, printing each sealed segment. The topics default to those in the
-//! input. A refused payload is reported and skipped; an error that stops the capture seals
-//! what was written, marked as stopped. `verify` runs [`testkit::archive::open_verified`] and
-//! prints the segment's slot range, file count and archive sha256.
+//! input. Each payload's fork digest must be the network's for the object's slot
+//! (`digest_schedule`, blob-parameter changes included), which takes the genesis validators
+//! root: the pinned one, or `--genesis-validators-root` for a network without one (Hoodi). A
+//! refused payload is reported and skipped; an error that stops the capture, including an input
+//! file over the gossip size bound (never read past it), seals what was written, marked as
+//! stopped. `verify` runs [`testkit::archive::open_verified`] and prints the segment's slot
+//! range, file count and archive sha256.
 //!
 //! Exit codes: 0 done, 1 a payload refused, the capture stopped or the archive refused, 64
 //! usage.
 
 use consensus_types::caps::NetworkCaps;
 use consensus_types::Mainnet;
+use network_config::digest::digest_schedule;
 use network_config::{ChainConfig, Network};
-use std::io::Write;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use testkit::archive::{open_verified, Capture, CaptureConfig, ChainParams, ForkDigest, Writer};
+use testkit::archive::{
+    max_compressed_payload_len, open_verified, Capture, CaptureConfig, ChainParams, ForkDigest,
+    Writer,
+};
 
 const USAGE: &str = "\
 usage: archiver capture --network sepolia|hoodi --input DIR --out DIR --host HOST
                         --clock-source SOURCE --peer-count N [--topic TOPIC]...
                         [--slots-per-segment N] [--max-bytes N]
+                        [--genesis-validators-root 0xROOT]
        archiver verify SEGMENT_DIR
        archiver --help";
 const HELP: &str = "\
@@ -50,6 +61,12 @@ sequence order and writes OUT/<network>/<slot_start>-<slot_end>/ segments, print
   --topic TOPIC           a subscribed topic, repeatable (default: the input's topics)
   --slots-per-segment N   the segment window (default 32)
   --max-bytes N           the payload disk budget (default 10 GiB)
+  --genesis-validators-root 0xROOT
+                          the network's genesis validators root, for its fork digests:
+                          required where none is pinned (hoodi), else must match the pinned one
+
+A payload on a fork digest other than the network's for its slot is refused; an input file
+over the gossip size bound stops the capture.
 
 verify checks a segment's manifest digest and every file's length and sha256, and refuses
 missing and extra files.
@@ -80,6 +97,7 @@ struct CaptureArgs {
     topics: Vec<String>,
     slots_per_segment: u64,
     max_bytes: u64,
+    genesis_validators_root: [u8; 32],
 }
 
 /// One captured payload file.
@@ -112,6 +130,7 @@ fn parse_capture(args: &[String]) -> Result<CaptureArgs, String> {
     let mut topics = Vec::new();
     let mut slots_per_segment = DEFAULT_SLOTS_PER_SEGMENT;
     let mut max_bytes = DEFAULT_MAX_BYTES;
+    let mut genesis_validators_root = None;
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         let value = it
@@ -133,14 +152,33 @@ fn parse_capture(args: &[String]) -> Result<CaptureArgs, String> {
             "--topic" => topics.push(value?.to_owned()),
             "--slots-per-segment" => slots_per_segment = number(flag, value?)?,
             "--max-bytes" => max_bytes = number(flag, value?)?,
+            "--genesis-validators-root" => {
+                genesis_validators_root = Some(root(flag, value?)?);
+            }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
     fn required<T>(value: Option<T>, flag: &str) -> Result<T, String> {
         value.ok_or_else(|| format!("{flag} is required"))
     }
+    let network = required(network, "--network")?;
+    let pinned = network.genesis().map(|g| g.genesis_validators_root);
+    let genesis_validators_root = match (pinned, genesis_validators_root) {
+        (Some(pinned), Some(given)) if pinned != given => {
+            return Err(format!(
+                "--genesis-validators-root is not {network}'s pinned 0x{}",
+                hex::encode(pinned)
+            ))
+        }
+        (Some(root), _) | (None, Some(root)) => root,
+        (None, None) => {
+            return Err(format!(
+                "--genesis-validators-root is required: {network} has no pinned genesis"
+            ))
+        }
+    };
     Ok(CaptureArgs {
-        network: required(network, "--network")?,
+        network,
         input: required(input, "--input")?,
         out: required(out, "--out")?,
         host: required(host, "--host")?,
@@ -149,7 +187,22 @@ fn parse_capture(args: &[String]) -> Result<CaptureArgs, String> {
         topics,
         slots_per_segment,
         max_bytes,
+        genesis_validators_root,
     })
+}
+
+/// `0x` and 64 lowercase hex digits.
+fn root(flag: &str, value: &str) -> Result<[u8; 32], String> {
+    let digits = value.strip_prefix("0x").unwrap_or_default();
+    let lower_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    let mut root = [0u8; 32];
+    if digits.len() != 64 || !digits.bytes().all(lower_hex) {
+        return Err(format!(
+            "{flag}: {value:?} is not 0x and 64 lowercase hex digits"
+        ));
+    }
+    hex::decode_to_slice(digits, &mut root).map_err(|e| format!("{flag}: {e}"))?;
+    Ok(root)
 }
 
 fn number<T: std::str::FromStr>(flag: &str, value: &str) -> Result<T, String> {
@@ -206,6 +259,23 @@ fn read_input(dir: &Path) -> Result<Vec<InputFile>, String> {
         ));
     }
     Ok(files)
+}
+
+/// The bytes of one input file, reading at most one byte past the gossip bound: a larger file
+/// is refused without being read into memory.
+fn read_payload(path: &Path) -> Result<Vec<u8>, String> {
+    let max = max_compressed_payload_len();
+    let mut payload = Vec::new();
+    File::open(path)
+        .and_then(|f| f.take(max as u64 + 1).read_to_end(&mut payload))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if payload.len() > max {
+        return Err(format!(
+            "{}: over the gossip bound of {max} compressed bytes",
+            path.display()
+        ));
+    }
+    Ok(payload)
 }
 
 fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
@@ -282,6 +352,10 @@ fn capture(args: &CaptureArgs, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
         clock_source: args.clock_source.clone(),
         slots_per_segment: args.slots_per_segment,
         max_bytes: args.max_bytes,
+        fork_digests: digest_schedule(&config, &args.genesis_validators_root)
+            .into_iter()
+            .map(|d| (d.epoch, d.fork_digest))
+            .collect(),
     };
     let mut writer = match Writer::<Mainnet>::create(&args.out, capture_config, chain) {
         Ok(w) => w,
@@ -293,10 +367,9 @@ fn capture(args: &CaptureArgs, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     writer.set_peer_count(args.peer_count);
     let mut failed = false;
     for file in &files {
-        let payload = match std::fs::read(&file.path) {
+        let payload = match read_payload(&file.path) {
             Ok(payload) => payload,
-            Err(e) => {
-                let reason = format!("{}: {e}", file.path.display());
+            Err(reason) => {
                 fail(format!("capture stopped: {reason}"));
                 writer.stop(reason);
                 failed = true;
@@ -346,7 +419,8 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use consensus_types::primitives::{Root, Slot};
-    use consensus_types::{EthSpec, ForkSchedule};
+    use consensus_types::{EthSpec, ForkName, ForkSchedule};
+    use network_config::digest::compute_fork_digest;
     use sha2::{Digest, Sha256};
     use std::fs;
     use testkit::archive::{
@@ -354,9 +428,34 @@ mod tests {
         MANIFEST_FILE, OPEN_PREFIX,
     };
 
-    const FULU_DIGEST: &str = "f0010001";
-    const GLOAS_DIGEST: &str = "610a5001";
+    const FULU_DIGEST: &str = "7e0d3447";
+    const GLOAS_DIGEST: &str = "669e6c11";
     const COLUMN: &str = "data_column_sidecar_5";
+
+    /// The test digests are Sepolia's at the first Fulu and the first Gloas epoch.
+    #[test]
+    fn the_test_digests_are_sepolias() {
+        let config = ChainConfig::load(Network::Sepolia).unwrap();
+        let gvr = Network::Sepolia.genesis().unwrap().genesis_validators_root;
+        let s = sepolia();
+        let at = |fork| {
+            let epoch = s.fork_epoch(fork).unwrap();
+            hex::encode(compute_fork_digest(&config, &gvr, epoch).unwrap())
+        };
+        assert_eq!(
+            (at(ForkName::Fulu), at(ForkName::Gloas)),
+            (FULU_DIGEST.to_owned(), GLOAS_DIGEST.to_owned())
+        );
+    }
+
+    fn sepolia_digests() -> Vec<(consensus_types::primitives::Epoch, ForkDigest)> {
+        let config = ChainConfig::load(Network::Sepolia).unwrap();
+        let gvr = Network::Sepolia.genesis().unwrap().genesis_validators_root;
+        digest_schedule(&config, &gvr)
+            .into_iter()
+            .map(|d| (d.epoch, d.fork_digest))
+            .collect()
+    }
 
     fn sepolia() -> ForkSchedule {
         *ChainConfig::load(Network::Sepolia).unwrap().fork_schedule()
@@ -679,6 +778,7 @@ mod tests {
             clock_source: "chrony".into(),
             slots_per_segment: 32,
             max_bytes: 1 << 30,
+            fork_digests: sepolia_digests(),
         };
         let put = |w: &mut Writer<Mainnet>, slot: Slot| {
             let (payload, root) = fixtures::block_on::<Mainnet>(&s, slot, 0);
@@ -735,7 +835,7 @@ mod tests {
         assert_eq!(fs::read(&partial[0]).unwrap(), payload[..payload.len() / 2]);
         assert!(matches!(
             open_verified(&open),
-            Err(ArchiveError::MissingFile(_))
+            Err(ArchiveError::Unsealed(_))
         ));
         let (code, _, _) = run_args(&["verify", open.to_str().unwrap()]);
         assert_eq!(code, EXIT_FAILED);
@@ -851,6 +951,82 @@ mod tests {
         let m = open_verified(&segment).unwrap().manifest().clone();
         assert_eq!(m.closed_by, ClosedBy::Error);
         assert_eq!(m.files.len(), 1);
+    }
+
+    #[test]
+    fn a_payload_on_the_wrong_fork_digest_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let out = tmp.path().join("archive");
+        let expected = captured(&input);
+        // The Gloas block again under the Fulu digest, as if it came in on a Fulu topic.
+        fs::write(
+            input.join(format!("9_{FULU_DIGEST}_beacon_block{INPUT_SUFFIX}")),
+            &expected[2].payload,
+        )
+        .unwrap();
+        let (code, stdout, stderr) = run_args(&capture_args(
+            input.to_str().unwrap(),
+            out.to_str().unwrap(),
+        ));
+        assert_eq!(code, EXIT_FAILED);
+        assert!(
+            stderr.contains("9_") && stderr.contains("skipped") && stderr.contains("fork digest"),
+            "{stderr}"
+        );
+        let segments: Vec<PathBuf> = stdout.lines().map(PathBuf::from).collect();
+        assert_eq!(segments.len(), 2);
+        let m = open_verified(&segments[1]).unwrap().manifest().clone();
+        assert_eq!(m.closed_by, ClosedBy::Close);
+        assert_eq!(m.fork_digests, [digest(GLOAS_DIGEST)]);
+    }
+
+    #[test]
+    fn an_input_over_the_gossip_bound_stops_the_capture_unread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let out = tmp.path().join("archive");
+        captured(&input);
+        // Sparse, so the test does not write it out; the archiver must not read it in.
+        let huge = input.join(format!("9_{GLOAS_DIGEST}_beacon_block{INPUT_SUFFIX}"));
+        fs::File::create(&huge).unwrap().set_len(64 << 30).unwrap();
+        let (code, stdout, stderr) = run_args(&capture_args(
+            input.to_str().unwrap(),
+            out.to_str().unwrap(),
+        ));
+        assert_eq!(code, EXIT_FAILED);
+        assert!(stderr.contains("over the gossip bound"), "{stderr}");
+        let segments: Vec<PathBuf> = stdout.lines().map(PathBuf::from).collect();
+        assert_eq!(segments.len(), 2);
+        let m = open_verified(&segments[1]).unwrap().manifest().clone();
+        assert_eq!(m.closed_by, ClosedBy::Error);
+        assert!(
+            m.error
+                .as_deref()
+                .unwrap()
+                .contains("over the gossip bound"),
+            "{:?}",
+            m.error
+        );
+        assert_eq!(m.files.len(), 3, "every payload before it");
+
+        // One byte over the bound is refused; exactly the bound is read (and refused later as a
+        // payload, not as an input).
+        let max = max_compressed_payload_len();
+        let file = tmp.path().join("bound");
+        fs::File::create(&file)
+            .unwrap()
+            .set_len(max as u64 + 1)
+            .unwrap();
+        assert!(read_payload(&file).is_err());
+        fs::File::create(&file)
+            .unwrap()
+            .set_len(max as u64)
+            .unwrap();
+        assert_eq!(read_payload(&file).unwrap().len(), max);
+        assert!(read_payload(&tmp.path().join("absent"))
+            .unwrap_err()
+            .contains("absent"));
     }
 
     #[test]
@@ -990,18 +1166,55 @@ mod tests {
                 topics: vec!["beacon_block".into(), COLUMN.into()],
                 slots_per_segment: 8,
                 max_bytes: 100,
+                genesis_validators_root: Network::Sepolia
+                    .genesis()
+                    .unwrap()
+                    .genesis_validators_root,
             })
         );
-        let hoodi: Vec<String> = capture_args(i, o)
+
+        // Hoodi has no pinned genesis: its root must be given.
+        let mut hoodi: Vec<String> = capture_args(i, o)
             .iter()
             .map(|a| if *a == "sepolia" { "hoodi" } else { a }.to_string())
             .collect();
+        let e = parse(&hoodi).unwrap_err();
+        assert!(e.contains("--genesis-validators-root is required"), "{e}");
+        let gvr = format!("0x{}", "ab".repeat(32));
+        hoodi.extend(["--genesis-validators-root".into(), gvr]);
         let Command::Capture(c) = parse(&hoodi).unwrap() else {
             panic!("capture");
         };
         assert_eq!(
-            (c.network, c.slots_per_segment, c.max_bytes),
-            (Network::Hoodi, DEFAULT_SLOTS_PER_SEGMENT, DEFAULT_MAX_BYTES)
+            (
+                c.network,
+                c.slots_per_segment,
+                c.max_bytes,
+                c.genesis_validators_root
+            ),
+            (
+                Network::Hoodi,
+                DEFAULT_SLOTS_PER_SEGMENT,
+                DEFAULT_MAX_BYTES,
+                [0xab; 32]
+            )
         );
+
+        // A given root must be the pinned one, and well-formed.
+        let pinned = hex::encode(Network::Sepolia.genesis().unwrap().genesis_validators_root);
+        let wrong = format!("0x{}", "ab".repeat(32));
+        let upper = format!("0x{}", pinned.to_uppercase());
+        let pinned = format!("0x{pinned}");
+        for (root, ok) in [
+            (pinned.as_str(), true),
+            (wrong.as_str(), false),
+            (upper.as_str(), false),
+            (&pinned[2..], false),
+            ("0xab", false),
+        ] {
+            let mut a = capture_args(i, o);
+            a.extend(["--genesis-validators-root", root]);
+            assert_eq!(parse(&args(&a)).is_ok(), ok, "{root}");
+        }
     }
 }

@@ -1,10 +1,12 @@
 //! Payload fixtures (feature `test-support`): a Minimal-preset fork schedule with Fulu from
-//! genesis and Gloas from slot [`GLOAS_SLOT`], and small blocks and column sidecars of either
-//! fork, snappy block-compressed as gossip carries them.
+//! genesis and Gloas from slot [`GLOAS_SLOT`], its fork digests (with a blob-parameter change
+//! at [`BPO_EPOCH`]), and small blocks and column sidecars of either fork, snappy
+//! block-compressed as gossip carries them.
 
+use super::manifest::ForkDigest;
 use super::payload::ChainParams;
 use consensus_types::caps::NetworkCaps;
-use consensus_types::primitives::{Root, Slot, B256};
+use consensus_types::primitives::{Epoch, Root, Slot, B256};
 use consensus_types::{fulu, gloas, EthSpec, ForkName, ForkSchedule, Minimal};
 use network_config::ScheduledFork;
 use ssz::Encode;
@@ -18,6 +20,36 @@ pub type Spec = Minimal;
 pub const GLOAS_EPOCH: u64 = 2;
 /// The first Gloas slot of [`schedule`] (Minimal: 8 slots per epoch).
 pub const GLOAS_SLOT: Slot = GLOAS_EPOCH * 8;
+
+/// The epoch of [`fork_digests`]' blob-parameter-only change, inside Fulu.
+pub const BPO_EPOCH: Epoch = 1;
+/// The fork digest of [`fork_digests`] from epoch 0.
+pub const FULU_DIGEST: ForkDigest = [0xf0, 1, 0, 1];
+/// The fork digest of [`fork_digests`] from [`BPO_EPOCH`].
+pub const BPO_DIGEST: ForkDigest = [0xb0, 1, 0, 1];
+/// The fork digest of [`fork_digests`] from [`GLOAS_EPOCH`].
+pub const GLOAS_DIGEST: ForkDigest = [0x70, 1, 0, 1];
+
+/// The digest schedule of [`schedule`]: [`FULU_DIGEST`], [`BPO_DIGEST`] from [`BPO_EPOCH`] and
+/// [`GLOAS_DIGEST`] from [`GLOAS_EPOCH`].
+pub fn fork_digests() -> Vec<(Epoch, ForkDigest)> {
+    vec![
+        (0, FULU_DIGEST),
+        (BPO_EPOCH, BPO_DIGEST),
+        (GLOAS_EPOCH, GLOAS_DIGEST),
+    ]
+}
+
+/// The fork digest of [`fork_digests`] for an object at `slot`.
+pub fn fork_digest(slot: Slot) -> ForkDigest {
+    let epoch = Spec::epoch_at_slot(slot);
+    fork_digests()
+        .into_iter()
+        .rev()
+        .find(|(from, _)| *from <= epoch)
+        .expect("from epoch 0")
+        .1
+}
 
 /// Fulu from epoch 0, Gloas from [`GLOAS_EPOCH`].
 pub fn schedule() -> ForkSchedule {

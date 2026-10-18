@@ -2,6 +2,7 @@
 //! bounded, decompressed and decoded by the fork of the object's own slot to read its slot and
 //! block root.
 
+use super::manifest::ForkDigest;
 use super::names::TopicKind;
 use consensus_types::caps::{NetworkCaps, MAX_PAYLOAD_SIZE};
 use consensus_types::codec::DecodeError;
@@ -60,6 +61,21 @@ pub enum PayloadError {
     /// The topic is not one the capture subscribed to.
     #[error("topic {0:?} is not subscribed by this capture")]
     Unsubscribed(String),
+    /// The topic's fork digest is not the network's for the object's slot (`None` before the
+    /// network's first digest).
+    #[error(
+        "fork digest 0x{} is not the network's for slot {slot} ({})",
+        hex::encode(got),
+        expected.map_or_else(|| "none".to_owned(), |d| format!("0x{}", hex::encode(d)))
+    )]
+    ForkDigest {
+        /// The object's slot.
+        slot: Slot,
+        /// The network's digest at that slot's epoch.
+        expected: Option<ForkDigest>,
+        /// The topic's digest.
+        got: ForkDigest,
+    },
     /// The segment already holds a file of this topic, slot and root.
     #[error("{path} is already archived ({})", if *identical { "same bytes" } else { "different bytes" })]
     Duplicate {
@@ -70,9 +86,14 @@ pub enum PayloadError {
     },
 }
 
+/// The most compressed bytes a gossip payload may have: `max_compressed_len(MAX_PAYLOAD_SIZE)`.
+pub fn max_compressed_payload_len() -> usize {
+    max_compressed_len(MAX_PAYLOAD_SIZE)
+}
+
 /// Decompresses a gossip payload after checking both length bounds.
 pub fn decompress(payload: &[u8]) -> Result<Vec<u8>, PayloadError> {
-    let max = max_compressed_len(MAX_PAYLOAD_SIZE);
+    let max = max_compressed_payload_len();
     if payload.len() > max {
         return Err(PayloadError::CompressedTooLarge {
             len: payload.len(),

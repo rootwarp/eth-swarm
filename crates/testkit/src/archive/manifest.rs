@@ -44,7 +44,17 @@ pub const MANIFEST_FILE: &str = "manifest.toml";
 pub const FORMAT_VERSION: u32 = 1;
 /// The presets a manifest may name.
 pub const PRESETS: [&str; 2] = ["mainnet", "minimal"];
+/// The largest manifest: the reader refuses a larger one, and the writer rolls a segment
+/// before its manifest would pass it. Far above the ~250 bytes per file of a real segment.
+pub const MAX_MANIFEST_LEN: u64 = 64 << 20;
+/// The longest `error` a manifest records; the writer cuts a longer one at a char boundary.
+pub const MAX_ERROR_LEN: usize = 1024;
 const HEADER_KEY: &str = "archive_sha256 = \"";
+/// The header line: the key, 64 hex digits, the closing quote and the newline.
+const HEADER_LINE_LEN: u64 = (HEADER_KEY.len() + 64 + 2) as u64;
+/// What a file adds besides its own keys: the blank line and `[[files]]` before its table, and
+/// at most one more `"0x<8 hex>", ` in `fork_digests`.
+const FILE_TABLE_OVERHEAD: u64 = ("\n[[files]]\n".len() + "\"0x00000000\", ".len()) as u64;
 
 /// A sha256 digest.
 pub type Sha256Digest = [u8; 32];
@@ -55,7 +65,8 @@ pub type ForkDigest = [u8; 4];
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ClosedBy {
-    /// The capture moved past the segment's slot window.
+    /// The capture moved past the segment's slot window (`slot_end` is the window's end), or
+    /// the manifest reached its size limit (`slot_end` is the last slot stored).
     Roll,
     /// The capture closed.
     Close,
@@ -252,6 +263,56 @@ impl Manifest {
     }
 }
 
+/// `error` cut to at most [`MAX_ERROR_LEN`] bytes, at a char boundary.
+pub(crate) fn truncate_error(error: &str) -> String {
+    let mut end = error.len().min(MAX_ERROR_LEN);
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    error[..end].to_owned()
+}
+
+/// An upper bound on the length of a manifest with these capture fields and no files: the
+/// header line and the body with every other field at its longest (the largest slots, peer
+/// count and total, the longer `closed_by`, an error of [`MAX_ERROR_LEN`] bytes that each
+/// escape to six). Add [`file_len_bound`] per file.
+pub(crate) fn base_len_bound(
+    network: &str,
+    topics: &[String],
+    capture_host: &str,
+    clock_source: &str,
+) -> u64 {
+    let largest = i64::MAX as u64;
+    let raw = RawManifest {
+        format_version: FORMAT_VERSION,
+        network: network.to_owned(),
+        preset: PRESETS
+            .iter()
+            .max_by_key(|p| p.len())
+            .copied()
+            .unwrap_or_default()
+            .to_owned(),
+        slot_start: largest,
+        slot_end: largest,
+        fork_digests: Vec::new(),
+        topics: topics.to_vec(),
+        peer_count: u32::MAX,
+        capture_host: capture_host.to_owned(),
+        clock_source: clock_source.to_owned(),
+        closed_by: ClosedBy::Error,
+        error: Some("\u{7}".repeat(MAX_ERROR_LEN)),
+        total_bytes: largest,
+        files: Vec::new(),
+    };
+    toml::to_string(&raw).map_or(u64::MAX, |body| HEADER_LINE_LEN + body.len() as u64)
+}
+
+/// An upper bound on what `file` adds to a manifest: its `[[files]]` table and its digest.
+pub(crate) fn file_len_bound(file: &ArchiveFile) -> u64 {
+    toml::to_string(&RawFile::from(file))
+        .map_or(u64::MAX, |table| table.len() as u64 + FILE_TABLE_OVERHEAD)
+}
+
 fn invalid<T>(message: String) -> Result<T, ManifestError> {
     Err(ManifestError::Invalid(message))
 }
@@ -349,19 +410,21 @@ impl From<&Manifest> for RawManifest {
             closed_by: m.closed_by,
             error: m.error.clone(),
             total_bytes: m.total_bytes,
-            files: m
-                .files
-                .iter()
-                .map(|f| RawFile {
-                    path: f.path.clone(),
-                    topic: f.topic.clone(),
-                    slot: f.slot,
-                    root: format!("0x{}", hex::encode(f.root)),
-                    fork_digest: format!("0x{}", hex::encode(f.fork_digest)),
-                    len: f.len,
-                    sha256: hex::encode(f.sha256),
-                })
-                .collect(),
+            files: m.files.iter().map(RawFile::from).collect(),
+        }
+    }
+}
+
+impl From<&ArchiveFile> for RawFile {
+    fn from(f: &ArchiveFile) -> Self {
+        Self {
+            path: f.path.clone(),
+            topic: f.topic.clone(),
+            slot: f.slot,
+            root: format!("0x{}", hex::encode(f.root)),
+            fork_digest: format!("0x{}", hex::encode(f.fork_digest)),
+            len: f.len,
+            sha256: hex::encode(f.sha256),
         }
     }
 }
@@ -488,6 +551,50 @@ pub(crate) mod tests {
             assert!(body.contains(field), "{field} in\n{body}");
         }
         assert_eq!(Manifest::parse(&bytes).unwrap(), (m, digest));
+    }
+
+    fn bound(m: &Manifest) -> u64 {
+        base_len_bound(&m.network, &m.topics, &m.capture_host, &m.clock_source)
+            + m.files.iter().map(file_len_bound).sum::<u64>()
+    }
+
+    #[test]
+    fn the_length_bound_holds_at_the_extremes() {
+        let mut m = manifest();
+        assert!(m.render().unwrap().0.len() as u64 <= bound(&m));
+
+        // Every field at its longest: a full error of control characters (each escaped to six
+        // bytes), the largest slots, peer count and total, a digest per file.
+        m.closed_by = ClosedBy::Error;
+        m.error = Some(truncate_error(&"\u{7}".repeat(MAX_ERROR_LEN + 10)));
+        m.peer_count = u32::MAX;
+        m.capture_host = "\"".repeat(40);
+        let top = i64::MAX as u64;
+        m.files = (0..20u8)
+            .map(|i| {
+                let mut f = file("data_column_sidecar_127", top - u64::from(i), i, [i; 4]);
+                f.len = max_compressed_len(MAX_PAYLOAD_SIZE) as u64;
+                f
+            })
+            .collect();
+        m.files.sort_by(|a, b| a.path.cmp(&b.path));
+        m.topics = vec!["data_column_sidecar_127".into()];
+        m.fork_digests = (0..20u8).map(|i| [i; 4]).collect();
+        m.slot_start = top - 19;
+        m.slot_end = top;
+        m.total_bytes = m.files.iter().map(|f| f.len).sum();
+        let rendered = m.render().unwrap().0.len() as u64;
+        assert!(rendered <= bound(&m), "{rendered} > {}", bound(&m));
+        assert!(bound(&m) - rendered < 1024, "the bound stays close");
+    }
+
+    #[test]
+    fn a_long_error_is_cut_at_a_char_boundary() {
+        assert_eq!(truncate_error("short"), "short");
+        let long = "é".repeat(MAX_ERROR_LEN);
+        let cut = truncate_error(&long);
+        assert!(cut.len() <= MAX_ERROR_LEN && cut.len() > MAX_ERROR_LEN - 2);
+        assert!(long.starts_with(&cut));
     }
 
     #[test]

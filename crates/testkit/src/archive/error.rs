@@ -65,6 +65,20 @@ pub enum ArchiveError {
     /// A file or directory the manifest does not list.
     #[error("file not in the manifest: {0}")]
     ExtraFile(String),
+    /// A file asked for that is not, exactly as given, an entry of the verified manifest.
+    #[error("{0} is not an entry of the verified manifest")]
+    NotListed(String),
+    /// The segment directory is not at `<network>/<slot_start>-<slot_end>` of its manifest.
+    #[error("{dir}: the manifest's segment is {expected}")]
+    Misplaced {
+        /// The directory opened.
+        dir: String,
+        /// `<network>/<slot_start>-<slot_end>` from the manifest.
+        expected: String,
+    },
+    /// An `.open-*` directory: a segment that was never sealed, which is no archive.
+    #[error("{0}: an unsealed segment is no archive")]
+    Unsealed(String),
     /// A symlink or other non-regular entry where a file or directory belongs.
     #[error("{0}: not a regular file or directory")]
     NotRegular(String),

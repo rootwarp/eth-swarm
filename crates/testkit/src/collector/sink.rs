@@ -432,8 +432,6 @@ mod tests {
     use crate::collector::testing;
     use consensus_types::primitives::Root;
 
-    const DIGEST: &str = "0a1b2c3d";
-
     fn info() -> CaptureInfo {
         CaptureInfo {
             network: "sepolia".into(),
@@ -455,7 +453,11 @@ mod tests {
                 mono_ns,
                 wall_ns: mono_ns + 1_000,
             },
-            topic: format!("/eth2/{DIGEST}/{name}/ssz_snappy"),
+            // Every payload here is at a Gloas slot, so on the Gloas digest.
+            topic: format!(
+                "/eth2/{}/{name}/ssz_snappy",
+                hex::encode(fixtures::GLOAS_DIGEST)
+            ),
             msg_id: vec![0xde, 0xad],
             peer: "16Uiu2HAm".into(),
             payload,
@@ -470,6 +472,7 @@ mod tests {
             clock_source: "chrony".into(),
             slots_per_segment: 32,
             max_bytes: 1 << 30,
+            fork_digests: fixtures::fork_digests(),
         };
         Writer::create(out, config, fixtures::chain()).unwrap()
     }

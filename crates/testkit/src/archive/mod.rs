@@ -17,7 +17,14 @@
 //! digest and sha256, all covered by the manifest's `archive_sha256`.
 //!
 //! Replay opens a segment only through [`open_verified`], which recomputes every sha256 and
-//! refuses any mismatch, missing file or extra file.
+//! refuses any mismatch, missing file or extra file, an unsealed `.open-*` directory, and a
+//! segment not at the `<network>/<slot_start>-<slot_end>` its manifest names.
+//!
+//! Segments of one capture can overlap: a late payload joins the open segment and lowers its
+//! `slot_start`, and a segment that rolls on its manifest's size limit shares its window with
+//! the next. A payload can also be in more than one segment (a restarted capture fed the same
+//! input, two captures of one network). The archive keeps both and dedups nothing across
+//! segments; replay consumers that need one copy per `(topic, slot, root)` dedup by it.
 //!
 //! Network names come from the operator and topic names from gossip; both become path
 //! components, so only `[a-z0-9_-]` and `[a-z0-9_]` are accepted ([`NameError`]).
@@ -34,11 +41,13 @@ mod writer;
 pub use error::ArchiveError;
 pub use manifest::{
     ArchiveFile, ClosedBy, ForkDigest, Manifest, ManifestError, Sha256Digest, FORMAT_VERSION,
-    MANIFEST_FILE,
+    MANIFEST_FILE, MAX_ERROR_LEN, MAX_MANIFEST_LEN,
 };
 pub use names::{NameError, TopicKind};
-pub use payload::{decode_payload, decompress, ChainParams, Decoded, PayloadError};
-pub use verify::{open_verified, Archive, MAX_MANIFEST_LEN};
+pub use payload::{
+    decode_payload, decompress, max_compressed_payload_len, ChainParams, Decoded, PayloadError,
+};
+pub use verify::{open_verified, Archive};
 #[cfg(any(test, feature = "test-support"))]
 pub use writer::Fault;
 pub use writer::{Capture, CaptureConfig, Stored, Writer, OPEN_PREFIX};
