@@ -1,6 +1,8 @@
 //! Shared harness: cl-engine configs, a recording service manager, and the multi-UID helpers.
 #![allow(dead_code)] // each test target uses part of it
 
+pub mod child;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

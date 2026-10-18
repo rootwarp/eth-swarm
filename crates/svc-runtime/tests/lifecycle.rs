@@ -2,15 +2,19 @@
 //!
 //! `lifecycle_sigterm_drains` runs a real process: this test binary re-executed to run
 //! `serve_slow_engine_child` (ignored, and a no-op without its environment), with
-//! `$NOTIFY_SOCKET` pointing at a datagram socket the test reads, as systemd would.
+//! `$NOTIFY_SOCKET` pointing at a datagram socket the test reads, as systemd would. The child
+//! is an [`OwnedChild`]: every wait on it has a deadline, its stderr is drained as it comes,
+//! and it is killed and reaped however the test ends.
 
 mod common;
 
+use std::future::Future;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use common::child::OwnedChild;
 use common::*;
 use ethswarm_proto::engine as pb;
 use ethswarm_proto::engine::engine_service_client::EngineServiceClient;
@@ -101,25 +105,112 @@ fn serve_slow_engine_child() {
     assert!(result.is_ok(), "{result:?}");
 }
 
-/// Kills the child if the test fails before it exits.
-struct Reaped(Option<Child>);
-
-impl Drop for Reaped {
-    fn drop(&mut self) {
-        if let Some(c) = &mut self.0 {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
+/// `sh -c script`.
+fn sh(script: &str) -> Command {
+    let mut command = Command::new("sh");
+    command.args(["-c", script]).stdout(Stdio::null());
+    command
 }
 
+fn in_secs(secs: u64) -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_secs(secs)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn owned_child_reports_its_exit() {
+    let mut child = OwnedChild::spawn(sh("exit 3")).unwrap();
+    let status = child.wait_until(in_secs(30)).await;
+    assert_eq!(status.and_then(|s| s.code()), Some(3), "{status:?}");
+}
+
+/// A child that logs more than a pipe holds before the test reads anything. A pipe holds 64 KiB
+/// on Linux and 16 KiB on macOS, but only 512 bytes on a macOS short of pipe memory (many
+/// parallel test runs): the service's ~6 KiB of logs then filled it, its next log write
+/// blocked a tokio worker, and that froze its runtime (no drain deadline, no SIGTERM).
+#[tokio::test(flavor = "multi_thread")]
+async fn owned_child_never_blocks_on_its_stderr() {
+    const LOGGED: usize = 1 << 20;
+    let mut child = OwnedChild::spawn(sh(&format!("head -c {LOGGED} /dev/zero >&2"))).unwrap();
+    let status = child.wait_until(in_secs(30)).await;
+    assert!(status.is_some_and(|s| s.success()), "{status:?}");
+    assert_eq!(child.stderr().len(), LOGGED, "all of stderr is kept");
+}
+
+/// A child that ignores SIGTERM, as a service stuck in its drain does. Returns once it does:
+/// a signal sent before the `trap` would kill it.
+async fn stubborn() -> OwnedChild {
+    let child = OwnedChild::spawn(sh("trap '' TERM; echo ready >&2; exec sleep 600")).unwrap();
+    assert!(
+        child.wait_for_stderr("ready", in_secs(30)).await,
+        "no handshake"
+    );
+    child
+}
+
+/// Whether `pid` names a process, a zombie included: `false` once it is killed and reaped.
+fn exists(pid: rustix::process::Pid) -> bool {
+    rustix::process::test_kill_process(pid).is_ok()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn owned_child_wait_is_bounded() {
+    let mut child = stubborn().await;
+    rustix::process::kill_process(child.pid(), rustix::process::Signal::TERM).unwrap();
+    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    assert_eq!(child.wait_until(deadline).await, None);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(exists(child.pid()), "it ignored SIGTERM");
+}
+
+#[tokio::test]
+async fn owned_child_is_killed_and_reaped_on_drop() {
+    let child = stubborn().await;
+    let pid = child.pid();
+    drop(child);
+    assert!(!exists(pid), "pid {pid:?} still there");
+}
+
+#[tokio::test]
+async fn owned_child_is_killed_and_reaped_on_panic() {
+    let child = stubborn().await;
+    let pid = child.pid();
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _child = child;
+        panic!("a failing assertion");
+    }));
+    assert!(failed.is_err());
+    assert!(!exists(pid), "pid {pid:?} still there");
+}
+
+/// The next notification the service sends.
 async fn recv(manager: &tokio::net::UnixDatagram) -> String {
     let mut buf = vec![0u8; 1024];
-    let n = tokio::time::timeout(Duration::from_secs(60), manager.recv(&mut buf))
-        .await
-        .expect("a notification in time")
-        .unwrap();
+    let n = manager.recv(&mut buf).await.unwrap();
     String::from_utf8(buf[..n].to_vec()).unwrap()
+}
+
+/// The child's drain deadline.
+const DRAIN_MS: u64 = 10_000;
+const DRAIN: Duration = Duration::from_millis(DRAIN_MS);
+/// The longest one step of `lifecycle_sigterm_drains` may take: ample on a loaded machine, and
+/// a stuck child fails the test instead of hanging it.
+const STEP: Duration = Duration::from_secs(60);
+
+/// `step`'s output if it comes within [`STEP`]; otherwise the test fails with `what` and the
+/// child's log, and the child is killed as the panic drops it.
+async fn within<T>(child: &OwnedChild, what: &str, step: impl Future<Output = T>) -> T {
+    match tokio::time::timeout(STEP, step).await {
+        Ok(out) => out,
+        Err(_) => panic!(
+            "timed out after {STEP:?} waiting for {what}; the child is killed. Its stderr:\n{}",
+            child.stderr()
+        ),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -127,11 +218,12 @@ async fn lifecycle_sigterm_drains() {
     let tmp = tempfile::tempdir().unwrap();
     let root = runtime_root(tmp.path());
     let config = tmp.path().join("cl-engine.toml");
-    std::fs::write(&config, config_text(&root, 10_000)).unwrap();
+    std::fs::write(&config, config_text(&root, DRAIN_MS)).unwrap();
     let notify = tmp.path().join("notify.sock");
     let manager = tokio::net::UnixDatagram::bind(&notify).unwrap();
 
-    let child = Command::new(std::env::current_exe().unwrap())
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
         .args([
             "--exact",
             "serve_slow_engine_child",
@@ -140,14 +232,12 @@ async fn lifecycle_sigterm_drains() {
         ])
         .env(CHILD_CONFIG, &config)
         .env("NOTIFY_SOCKET", &notify)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let pid = rustix::process::Pid::from_child(&child);
-    let mut child = Reaped(Some(child));
+        .stdout(Stdio::null());
+    // Killed and reaped on every way out of this test; its stderr is drained as it comes.
+    let mut child = OwnedChild::spawn(command).unwrap();
 
-    let ready = recv(&manager).await;
+    // The readiness handshake: `run` installs the SIGTERM handler before it sends READY=1.
+    let ready = within(&child, "READY=1", recv(&manager)).await;
     assert!(
         ready.starts_with("READY=1\nSTATUS=serving cl-engine on "),
         "{ready}"
@@ -159,37 +249,57 @@ async fn lifecycle_sigterm_drains() {
         "127.0.0.1",
         "/metrics listens on 127.0.0.1 only"
     );
-    assert!(scrape(metrics).await.contains("ethswarm_ready 1"));
+    assert!(within(&child, "a /metrics scrape", scrape(metrics))
+        .await
+        .contains("ethswarm_ready 1"));
 
     let socket = ipc::uds::SocketDir::under(&root, "cl-engine").unwrap();
-    let channel = ipc::uds::connect(&socket, me()).await.unwrap();
+    let channel = within(&child, "a connection", ipc::uds::connect(&socket, me()))
+        .await
+        .unwrap();
     let mut client = EngineServiceClient::new(channel);
     let in_flight =
         tokio::spawn(async move { client.new_payload(pb::NewPayloadRequest::default()).await });
-    wait_for_metric(metrics, "ethswarm_rpc_inflight 1").await;
+    within(
+        &child,
+        "the call in flight",
+        wait_for_metric(metrics, "ethswarm_rpc_inflight 1"),
+    )
+    .await;
 
-    rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
-    assert_eq!(recv(&manager).await, "STOPPING=1");
+    rustix::process::kill_process(child.pid(), rustix::process::Signal::TERM).unwrap();
+    assert_eq!(
+        within(&child, "STOPPING=1", recv(&manager)).await,
+        "STOPPING=1"
+    );
     // No new calls: the socket is gone and nothing accepts on its path.
     assert!(std::fs::symlink_metadata(socket.socket_path()).is_err());
     assert!(std::os::unix::net::UnixStream::connect(socket.socket_path()).is_err());
-    assert!(ipc::uds::connect(&socket, me()).await.is_err());
+    assert!(within(
+        &child,
+        "a refused connection",
+        ipc::uds::connect(&socket, me())
+    )
+    .await
+    .is_err());
 
     // The call in flight finishes within the drain deadline.
-    let answered = in_flight.await.unwrap();
+    let answered = within(&child, "the answer to the call in flight", in_flight)
+        .await
+        .unwrap();
     assert!(answered.is_ok(), "{answered:?}");
 
-    let mut process = child.0.take().unwrap();
-    let mut stderr = process.stderr.take().unwrap();
-    let status = tokio::task::spawn_blocking(move || {
-        let mut logs = String::new();
-        std::io::Read::read_to_string(&mut stderr, &mut logs).unwrap();
-        (process.wait().unwrap(), logs)
-    });
-    let (status, logs) = tokio::time::timeout(Duration::from_secs(30), status)
+    let status = child
+        .wait_until(tokio::time::Instant::now() + STEP)
         .await
-        .expect("the service exits")
-        .unwrap();
+        .unwrap_or_else(|| {
+            panic!(
+                "the service did not exit within {STEP:?} of SIGTERM (drain deadline {DRAIN:?}); \
+                 the child is killed. Its stderr:\n{}",
+                child.stderr()
+            )
+        });
+    let logs = child.stderr();
     assert!(status.success(), "exit {status:?}\n{logs}");
     assert_eq!(status.code(), Some(0));
     // The JSON log line the handler wrote carries the call's trace id.
