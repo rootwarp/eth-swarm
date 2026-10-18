@@ -26,6 +26,9 @@ network-config = { path = "../network-config" }
 # secp256k1: Ethereum node keys are secp256k1 (the peer ID must map to a discv5 node ID).
 libp2p = { workspace = true, features = ["secp256k1"] }
 libp2p-mplex.workspace = true
+# `p2p_conn_budget_exceeded_total`; the version cl-verify and svc-runtime use, already in the
+# tree through libp2p's `metrics` feature.
+prometheus-client = "0.25.1"
 tonic.workspace = true
 futures = "0.3"
 tokio = { version = "1", features = ["rt", "macros", "time", "net"] }

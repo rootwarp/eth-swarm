@@ -1042,6 +1042,7 @@ dependencies = [
  "libp2p-mplex",
  "network-config",
  "p2p-wire",
+ "prometheus-client",
  "rustix",
  "serde",
  "serde_json",
