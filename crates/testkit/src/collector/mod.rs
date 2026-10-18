@@ -18,13 +18,19 @@
 //! ([`crate::archive::Writer`]) as received. The host clock's NTP offset is sampled every
 //! [`NTP_INTERVAL`] from its time daemon ([`TimeDaemon`]) and logged.
 //!
-//! Offsets are computed from the records afterwards:
+//! What a capture subscribes is configuration ([`TopicConfig`], a topics file read as data): the
+//! SSE events of the exit-14 topic set and the attestation subnets sampled. Both go into
+//! `capture.toml` with the events the node refused at start, and `summary.toml` gives each
+//! topic and sampled subnet its count, listing those with none as gaps ([`Summary`]).
+//!
+//! Offsets and rates are computed from the records afterwards:
 //!
 //! - slot-relative ([`SlotClock::offset`]): `recv_wall − (genesis_time + slot ×
 //!   SLOT_DURATION_MS)`, from [`network_config::ChainConfig`];
 //! - envelope-relative ([`envelope_relative`]): a column's arrival minus the arrival of the
 //!   `execution_payload` envelope of the same `beacon_block_root`, on the monotonic clock;
-//!   columns without one are counted as unmatched.
+//!   columns without one are counted as unmatched;
+//! - per-topic rates ([`RateCounter`]): messages and bytes per slot, and the busiest slot's.
 
 mod arrival;
 mod clock;
@@ -32,10 +38,12 @@ mod decode;
 mod envelope;
 mod ntp;
 mod offsets;
+mod rates;
 mod record;
 mod sink;
 mod sse;
 mod tap;
+mod topics;
 mod url;
 
 pub use arrival::{
@@ -43,7 +51,7 @@ pub use arrival::{
 };
 pub use clock::{Clock, Stamp, SystemClock};
 pub use decode::{
-    decode_gossip, decode_sse, parse_gossip_topic, topic_subnet, Decoded, GossipTopic,
+    decode_gossip, decode_sse, parse_gossip_topic, topic_subnet, Decoded, GossipTopic, SseSubnets,
 };
 pub use envelope::{
     envelope_relative, ArrivalKind, ColumnMatch, ColumnOffset, EnvelopeIndex, EnvelopeRelative,
@@ -53,18 +61,26 @@ pub use ntp::{
     COMMAND_TIMEOUT, NTP_INTERVAL,
 };
 pub use offsets::{SlotClock, SlotOffset};
+pub use rates::{RateCounter, Rates, TopicRate};
 pub use record::{ArrivalRecord, Source};
 pub use sink::{
     collect, read_capture, read_info, records, CaptureInfo, Collector, CollectorError, Records,
-    Summary, CAPTURE_FILE, GAPS_FILE, MAX_RECORD_LINE_BYTES, NTP_FILE, RECORDS_FILE, SUMMARY_FILE,
+    SubnetCount, Summary, TopicCount, CAPTURE_FILE, GAPS_FILE, MAX_RECORD_LINE_BYTES, NTP_FILE,
+    RECORDS_FILE, SUMMARY_FILE,
 };
 pub(crate) use sse::get as api_get;
 pub use sse::{
-    config_name, genesis_time, run as run_sse, ApiError, Backoff, Pause, SseConfig, SseConfigError,
-    SseEvent, SseParser, SseStats, TokioPause, TooLarge, DEFAULT_TOPICS, EVENTS_PATH, GENESIS_PATH,
-    MAX_EVENT_BYTES, MAX_EVENT_NAME_BYTES, MAX_JSON_BYTES, MAX_SPEC_BYTES, SPEC_PATH,
+    committees_per_slot, config_name, genesis_time, node_attnets, run as run_sse, supported_topics,
+    ApiError, Backoff, Pause, SseConfig, SseConfigError, SseEvent, SseParser, SseStats, TokioPause,
+    TooLarge, COMMITTEES_PATH, DEFAULT_TOPICS, EVENTS_PATH, GENESIS_PATH, IDENTITY_PATH,
+    MAX_COMMITTEES_BYTES, MAX_COMMITTEES_PER_SLOT, MAX_EVENT_BYTES, MAX_EVENT_NAME_BYTES,
+    MAX_IDENTITY_BYTES, MAX_JSON_BYTES, MAX_SPEC_BYTES, SPEC_PATH,
 };
 pub use tap::{Tap, TapRecord};
+pub use topics::{
+    TopicConfig, TopicsFileError, EXIT14_SSE_EVENTS, FALLBACK_SSE_EVENTS, KNOWN_SSE_EVENTS,
+    MAX_TOPICS_FILE_BYTES, SINGLE_ATTESTATION,
+};
 pub use url::{ReferenceApiUrl, UrlError, UrlFileError, MAX_URL_FILE_BYTES};
 
 #[cfg(any(test, feature = "test-support"))]

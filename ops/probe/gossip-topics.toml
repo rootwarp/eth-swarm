@@ -1,0 +1,43 @@
+# The probe's gossip topics (Sepolia): cl-p2p subscribes each name under every fork digest it
+# follows (the current fork's, and the next one's ahead of a fork: two at most) and reports
+# IGNORE for every message, so it forwards none. Read as data by cl_p2p::gossip::TopicList:
+# each name must load through p2p-wire's GossipTopic::parse (a name it does not handle, a
+# subnet id that is not canonical decimal in range, or a name listed twice refuses the file).
+#
+# The exit-14 topic set (consensus-specs v1.7.0-beta.4, gloas/p2p-interface.md): blocks,
+# envelopes, bids, PTC messages, aggregates, the sampled attestation subnets and the custody
+# column subnets. Set the attestation and column subnets to the ones the probe samples and
+# custodies (its node ID and custody group count); the four below are placeholders.
+#
+# Bounds (cl-p2p gossip::config), checked by cl-p2p's tests against this file:
+#   - 11 topics per fork digest, 22 under two: within the 418 subscriptions one RPC may
+#     carry, and the subscription whitelist starts as exactly these;
+#   - every name is a Gloas topic name, at most 37 bytes, so the control-message size
+#     (46,898 bytes) still fits; it is computed for the two-fork set of every topic, which
+#     this list is a subset of, so nothing is recomputed.
+#
+# Byte budget on Sepolia (21 blobs at most): what one message may hold once decompressed;
+# the transform refuses more before decompressing. beacon_block and execution_payload are capped
+# at MAX_PAYLOAD_SIZE (10 MiB).
+#   beacon_block: 10485760 bytes
+#   beacon_aggregate_and_proof: 16829 bytes
+#   execution_payload_bid: 196932 bytes
+#   execution_payload: 10485760 bytes
+#   payload_attestation_message: 146 bytes
+#   beacon_attestation_{subnet_id}: 240 bytes
+#   data_column_sidecar_{subnet_id}: 44072 bytes
+# largest message: 10485760 bytes
+# one message of every topic: 21362195 bytes
+topics = [
+    "beacon_block",
+    "beacon_aggregate_and_proof",
+    "execution_payload_bid",
+    "execution_payload",
+    "payload_attestation_message",
+    "beacon_attestation_0",
+    "beacon_attestation_1",
+    "data_column_sidecar_0",
+    "data_column_sidecar_32",
+    "data_column_sidecar_64",
+    "data_column_sidecar_96",
+]

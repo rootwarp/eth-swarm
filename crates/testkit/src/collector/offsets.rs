@@ -91,6 +91,7 @@ mod tests {
             recv_mono_ns: 0,
             recv_wall_ns: wall_ns,
             peer: None,
+            bytes: 0,
         }
     }
 

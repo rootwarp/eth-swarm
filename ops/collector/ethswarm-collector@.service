@@ -8,12 +8,15 @@
 #
 # Each instance takes its settings from /etc/ethswarm/collector-<network>.env (examples:
 # ops/collector/collector-<network>.env.example): COLLECTOR_NETWORK, COLLECTOR_OUT and
-# COLLECTOR_NTP, nothing else. The reference node's URL is in /etc/ethswarm/collector-<network>.url
-# (mode 0600, the instance user's), read by --url-file, so a key in it never reaches argv
-# (/proc/<pid>/cmdline is world-readable). Nothing here names a node: on a host that runs both
-# reference nodes, Sepolia's beacon API is 127.0.0.1:5052 and Hoodi's 127.0.0.1:5053, and a
-# hardcoded URL would let a Hoodi collector record Sepolia. The binary also refuses a node whose
-# CONFIG_NAME (or, for Sepolia, genesis) is not its network's.
+# COLLECTOR_NTP, nothing else. Its topic set (the SSE events and the sampled attestation
+# subnets) is in /etc/ethswarm/collector-<network>.topics.toml (root, 0644), passed by
+# --topics-file and read by the binary as data, never through the environment. The reference
+# node's URL is in /etc/ethswarm/collector-<network>.url (mode 0600, the instance user's), read
+# by --url-file, so a key in it never reaches argv (/proc/<pid>/cmdline is world-readable).
+# Nothing here names a node: on a host that runs both reference nodes, Sepolia's beacon API is
+# 127.0.0.1:5052 and Hoodi's 127.0.0.1:5053, and a hardcoded URL would let a Hoodi collector
+# record Sepolia. The binary also refuses a node whose CONFIG_NAME (or, for Sepolia, genesis) is
+# not its network's.
 #
 # Same hardening as the probe units, plus loopback-only IP: the collector talks to the node's
 # beacon API on 127.0.0.1 and to chronyd on 127.0.0.1:323, and to nothing else. Do not weaken a
@@ -44,6 +47,10 @@ EnvironmentFile=/etc/ethswarm/collector-%i.env
 #     nothing (and setting it is refused).
 # The guard reads the file, never its environment: it runs under `env -i`, every tool by its
 # absolute path, so a PATH= line (refused anyway) could not make it run a planted binary.
+# systemd reads EnvironmentFile= itself, before this guard runs and before it checks a byte of
+# it, so `env -i` protects only the guard's own shell and the tools it starts, not systemd's
+# reading of the file. The guard is no substitute for the file's permissions: the env file and
+# /etc/ethswarm must stay root-owned and writable by root only.
 # The byte rule deletes every allowed byte and counts what is left: the tr set is LF (systemd
 # turns the \n into one) and 0x20-0x7E without 0x22 ("), 0x27 (') and 0x5C (\). An unreadable
 # file leaves "unreadable", so the count is never 0 by accident.
@@ -67,7 +74,7 @@ ExecStartPre=/usr/bin/env -i /bin/sh -c 'env_file=/etc/ethswarm/collector-%i.env
 # written when the unit stops (SIGTERM).
 ExecStart=/usr/local/bin/collector sse --network ${COLLECTOR_NETWORK} \
     --url-file /etc/ethswarm/collector-%i.url --out ${COLLECTOR_OUT} --host %H \
-    --ntp ${COLLECTOR_NTP}
+    --topics-file /etc/ethswarm/collector-%i.topics.toml --ntp ${COLLECTOR_NTP}
 # systemd creates /var/lib/ethswarm-collector root-owned 0755 and only the instance's own
 # directory below it as the instance user's, 0750.
 StateDirectory=ethswarm-collector/%i

@@ -175,6 +175,20 @@ pub struct FixtureServer {
 impl FixtureServer {
     /// Serves until the test ends.
     pub async fn start(reply: impl Fn(usize, &str) -> Reply + Send + Sync + 'static) -> Self {
+        Self::serve(reply, false).await
+    }
+
+    /// [`FixtureServer::start`], replying by the path and the query.
+    pub async fn start_with_query(
+        reply: impl Fn(usize, &str) -> Reply + Send + Sync + 'static,
+    ) -> Self {
+        Self::serve(reply, true).await
+    }
+
+    async fn serve(
+        reply: impl Fn(usize, &str) -> Reply + Send + Sync + 'static,
+        with_query: bool,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen = Seen::default();
@@ -191,7 +205,8 @@ impl FixtureServer {
                         .lock()
                         .unwrap()
                         .push((path.clone(), req.headers().clone()));
-                    let r = reply(count.fetch_add(1, Ordering::SeqCst), req.uri().path());
+                    let asked = if with_query { &path } else { req.uri().path() };
+                    let r = reply(count.fetch_add(1, Ordering::SeqCst), asked);
                     async move {
                         let body = ChunkBody {
                             chunks: r.chunks.into(),

@@ -8,18 +8,25 @@
 //! <dir>/summary.toml    written at the end: counts, for the manifest (gaps.jsonl lists the gaps)
 //! ```
 //!
+//! The manifest covers the configured topic set: `capture.toml` lists the subscribed topics of
+//! each source, the ones the reference node refused, and the attestation subnets sampled;
+//! `summary.toml` gives every one of them its count `n` and bytes, zeros included, and lists as
+//! gaps the topics and subnets with nothing recorded and the refused topics. An unaggregated
+//! attestation outside the sampled subnets (or of no known subnet) is counted, never recorded.
+//!
 //! Gossip payloads are decoded here (slot, block root) and handed to the archive
 //! ([`crate::archive::Writer`]) as received; SSE events are decoded from their JSON. A message
 //! that does not decode is still recorded, with no slot or root, and counted. Every file is
 //! created new: a capture never overwrites another.
 
 use super::arrival::{Arrival, ArrivalReceiver, Drops, MissingInterval};
-use super::decode::{decode_gossip, decode_sse, parse_gossip_topic, topic_subnet};
+use super::decode::{decode_gossip, decode_sse, parse_gossip_topic, topic_subnet, SseSubnets};
 use super::ntp::NtpSample;
 use super::record::{ArrivalRecord, Source};
 use crate::archive::{ArchiveError, Capture, ChainParams, PayloadError, TopicKind, Writer};
 use consensus_types::EthSpec;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -35,8 +42,10 @@ pub const NTP_FILE: &str = "ntp.jsonl";
 /// `summary.toml`.
 pub const SUMMARY_FILE: &str = "summary.toml";
 
-/// What a capture is: `capture.toml`, everything the offsets need besides the records.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// What a capture is: `capture.toml`, everything the offsets need besides the records, and the
+/// configured topic set. The fields after `started_wall_ns` are absent from earlier captures,
+/// and read as empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureInfo {
     /// The network (`hoodi`, `sepolia`).
@@ -59,6 +68,56 @@ pub struct CaptureInfo {
     pub started_mono_ns: u64,
     /// The capture's start, Unix nanoseconds: relates the monotonic clock to the wall.
     pub started_wall_ns: u64,
+    /// The configured SSE events the reference node refused at start (it does not emit them
+    /// at its version): never subscribed, listed as gaps.
+    #[serde(default)]
+    pub sse_topics_unsupported: Vec<String>,
+    /// The gossip topic names our probe subscribes (`beacon_block`, `beacon_attestation_3`).
+    #[serde(default)]
+    pub gossip_topics: Vec<String>,
+    /// The attestation subnets sampled, ascending: an unaggregated attestation on another
+    /// subnet, or of no known subnet, is counted and not recorded.
+    #[serde(default)]
+    pub attestation_subnets: Vec<u64>,
+    /// The attestation subnets the reference node subscribed at start (its metadata
+    /// `attnets`), when it was read.
+    #[serde(default)]
+    pub node_attnets: Option<Vec<u64>>,
+    /// The committees per slot at the start, for the subnet of an SSE `single_attestation`.
+    #[serde(default)]
+    pub committees_per_slot: Option<u64>,
+    /// `SLOTS_PER_EPOCH`, for the same.
+    #[serde(default)]
+    pub slots_per_epoch: Option<u64>,
+}
+
+/// One topic of the manifest: what a source recorded on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TopicCount {
+    /// The source.
+    pub source: Source,
+    /// The topic: a gossip topic name, or an SSE event name.
+    pub topic: String,
+    /// Records written.
+    pub n: u64,
+    /// Their [`ArrivalRecord::bytes`].
+    pub bytes: u64,
+}
+
+/// One sampled attestation subnet of the manifest: the unaggregated attestations a source
+/// recorded on it (gossip `beacon_attestation_<subnet>`, SSE `single_attestation`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubnetCount {
+    /// The source.
+    pub source: Source,
+    /// The subnet.
+    pub subnet: u64,
+    /// Records written.
+    pub n: u64,
+    /// Their [`ArrivalRecord::bytes`].
+    pub bytes: u64,
 }
 
 /// `summary.toml`: what the capture saw, and what it missed.
@@ -97,6 +156,24 @@ pub struct Summary {
     /// The file that lists every missing interval, relative to the capture directory:
     /// [`GAPS_FILE`].
     pub gaps_file: String,
+    /// Unaggregated attestations outside the sampled subnets (or of no known subnet): counted,
+    /// not recorded.
+    #[serde(default)]
+    pub outside_sampled_subnets: u64,
+    /// The configured topics and sampled subnets with nothing recorded (`sse:<event>`,
+    /// `gossip:<topic>`, `<source>:attestation_subnet_<n>`): gaps.
+    #[serde(default)]
+    pub missing_topics: Vec<String>,
+    /// The configured topics the reference node refused at start (`sse:<event>`): gaps.
+    #[serde(default)]
+    pub unsupported_topics: Vec<String>,
+    /// Every configured topic of every source with its count, zeros included, and any other
+    /// topic recorded; by source and topic.
+    #[serde(default)]
+    pub topics: Vec<TopicCount>,
+    /// Every sampled subnet of every source with its count, zeros included.
+    #[serde(default)]
+    pub attestation_subnets: Vec<SubnetCount>,
 }
 
 /// Writing the capture failed: it stops.
@@ -128,9 +205,107 @@ pub struct Collector<E: EthSpec> {
     gaps: Lines,
     ntp: Lines,
     chain: ChainParams,
-    column_subnet_count: u64,
+    subnets: SseSubnets,
     archive: Option<Writer<E>>,
     summary: Summary,
+    manifest: Manifest,
+}
+
+/// The manifest's counts while the capture runs: `(n, bytes)` per topic and per sampled
+/// subnet, the configured ones from the start.
+#[derive(Debug, Default)]
+struct Manifest {
+    sampled: Vec<u64>,
+    topics: BTreeMap<(Source, String), (u64, u64)>,
+    subnets: BTreeMap<(Source, u64), (u64, u64)>,
+}
+
+impl Manifest {
+    fn new(info: &CaptureInfo) -> Self {
+        let mut m = Manifest {
+            sampled: info.attestation_subnets.clone(),
+            ..Manifest::default()
+        };
+        m.sampled.sort_unstable();
+        m.sampled.dedup();
+        for source in &info.sources {
+            let configured = match source {
+                Source::Sse => &info.sse_topics,
+                Source::Gossip => &info.gossip_topics,
+            };
+            for topic in configured {
+                m.topics.insert((*source, topic.clone()), (0, 0));
+            }
+            for subnet in &m.sampled {
+                m.subnets.insert((*source, *subnet), (0, 0));
+            }
+        }
+        m
+    }
+
+    /// Whether `record` is kept: anything but an unaggregated attestation outside the sampled
+    /// subnets. A kept attestation is counted on its subnet.
+    fn sampled(&mut self, record: &ArrivalRecord) -> bool {
+        let attestation = match record.source {
+            Source::Sse => record.topic == super::topics::SINGLE_ATTESTATION,
+            Source::Gossip => record.topic.starts_with("beacon_attestation_"),
+        };
+        if !attestation {
+            return true;
+        }
+        let Some(subnet) = record
+            .subnet
+            .filter(|s| self.sampled.binary_search(s).is_ok())
+        else {
+            return false;
+        };
+        add(
+            self.subnets.entry((record.source, subnet)).or_default(),
+            record,
+        );
+        true
+    }
+
+    fn count(&mut self, record: &ArrivalRecord) {
+        let key = (record.source, record.topic.clone());
+        add(self.topics.entry(key).or_default(), record);
+    }
+
+    /// The summary's rows and gaps.
+    fn fill(&self, summary: &mut Summary) {
+        let prefix = |source: Source| match source {
+            Source::Sse => "sse",
+            Source::Gossip => "gossip",
+        };
+        summary.topics = (self.topics.iter())
+            .map(|((source, topic), (n, bytes))| TopicCount {
+                source: *source,
+                topic: topic.clone(),
+                n: *n,
+                bytes: *bytes,
+            })
+            .collect();
+        summary.attestation_subnets = (self.subnets.iter())
+            .map(|((source, subnet), (n, bytes))| SubnetCount {
+                source: *source,
+                subnet: *subnet,
+                n: *n,
+                bytes: *bytes,
+            })
+            .collect();
+        let empty_topics = (summary.topics.iter())
+            .filter(|t| t.n == 0)
+            .map(|t| format!("{}:{}", prefix(t.source), t.topic));
+        let empty_subnets = (summary.attestation_subnets.iter())
+            .filter(|s| s.n == 0)
+            .map(|s| format!("{}:attestation_subnet_{}", prefix(s.source), s.subnet));
+        summary.missing_topics = empty_topics.chain(empty_subnets).collect();
+    }
+}
+
+fn add(count: &mut (u64, u64), record: &ArrivalRecord) {
+    count.0 += 1;
+    count.1 = count.1.saturating_add(record.bytes);
 }
 
 /// One JSON-lines file.
@@ -205,18 +380,27 @@ impl<E: EthSpec> Collector<E> {
     ) -> Result<Self, CollectorError> {
         std::fs::create_dir_all(dir).map_err(io_error(dir))?;
         write_toml(&dir.join(CAPTURE_FILE), &info)?;
+        let info = &info;
         Ok(Self {
             dir: dir.to_owned(),
             records: Lines::create(dir, RECORDS_FILE)?,
             gaps: Lines::create(dir, GAPS_FILE)?,
             ntp: Lines::create(dir, NTP_FILE)?,
             chain,
-            column_subnet_count: info.column_subnet_count,
+            subnets: SseSubnets {
+                column_subnet_count: info.column_subnet_count,
+                committees_per_slot: info.committees_per_slot,
+                slots_per_epoch: info.slots_per_epoch,
+            },
             archive,
             summary: Summary {
                 gaps_file: GAPS_FILE.to_owned(),
+                unsupported_topics: (info.sse_topics_unsupported.iter())
+                    .map(|t| format!("sse:{t}"))
+                    .collect(),
                 ..Summary::default()
             },
+            manifest: Manifest::new(info),
         })
     }
 
@@ -230,8 +414,7 @@ impl<E: EthSpec> Collector<E> {
                 Ok(notice)
             }
             Arrival::Sse(stamped) => {
-                let (slot, block_root, subnet) =
-                    decode_sse(&stamped.event, self.column_subnet_count);
+                let (slot, block_root, subnet) = decode_sse(&stamped.event, &self.subnets);
                 if slot.is_none() && block_root.is_none() {
                     self.summary.undecoded += 1;
                 }
@@ -245,6 +428,7 @@ impl<E: EthSpec> Collector<E> {
                     recv_mono_ns: stamped.stamp.mono_ns,
                     recv_wall_ns: stamped.stamp.wall_ns,
                     peer: None,
+                    bytes: stamped.event.data.len() as u64,
                 })?;
                 Ok(None)
             }
@@ -267,7 +451,12 @@ impl<E: EthSpec> Collector<E> {
     }
 
     fn record(&mut self, record: &ArrivalRecord) -> Result<(), CollectorError> {
+        if !self.manifest.sampled(record) {
+            self.summary.outside_sampled_subnets += 1;
+            return Ok(());
+        }
         self.records.push(record)?;
+        self.manifest.count(record);
         self.summary.records += 1;
         match record.source {
             Source::Gossip => self.summary.gossip_records += 1,
@@ -319,6 +508,7 @@ impl<E: EthSpec> Collector<E> {
             recv_mono_ns: tap.stamp.mono_ns,
             recv_wall_ns: tap.stamp.wall_ns,
             peer: Some(tap.peer),
+            bytes: tap.payload.len() as u64,
         };
         (record, notice)
     }
@@ -353,6 +543,7 @@ impl<E: EthSpec> Collector<E> {
                 segments.iter().map(|p| p.display().to_string()).collect();
         }
         self.summary.dropped = dropped;
+        self.manifest.fill(&mut self.summary);
         write_toml(&self.dir.join(SUMMARY_FILE), &self.summary)?;
         Ok(self.summary)
     }
@@ -525,6 +716,7 @@ mod tests {
             time_daemon: "chrony".into(),
             started_mono_ns: 0,
             started_wall_ns: 1,
+            ..CaptureInfo::default()
         }
     }
 

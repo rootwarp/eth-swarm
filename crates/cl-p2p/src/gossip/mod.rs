@@ -6,6 +6,8 @@
 //!   bounded snappy transform from `p2p-wire`.
 //! - [`ignore_all`]: [`IgnoreAll`], the behaviour that wraps gossipsub, reports IGNORE for each
 //!   message and exposes no way to publish, with an optional bounded [`CaptureTap`].
+//! - [`topics`]: [`TopicList`], the configured topic names (`ops/probe/gossip-topics.toml`),
+//!   each loaded through `GossipTopic::parse`, and their [`ByteBudget`].
 //!
 //! The swarm takes it through [`crate::transport::build_swarm_with_gossip`]. gossipsub's own
 //! metrics (`topic_msg_sent_counts`, `topic_msg_published`, `mesh_peer_counts`, ...) go on the
@@ -13,6 +15,7 @@
 
 pub mod config;
 pub mod ignore_all;
+pub mod topics;
 
 #[cfg(test)]
 mod tests;
@@ -22,6 +25,7 @@ pub use ignore_all::{
     capture_tap, CaptureReader, CaptureTap, Captured, IgnoreAll, IgnoreAllEvent, ProbeGossipsub,
     ValidationSink,
 };
+pub use topics::{ByteBudget, TopicList, TopicListError, MAX_FORK_DIGESTS};
 
 use libp2p::gossipsub::{ConfigBuilderError, SubscriptionError};
 

@@ -1,0 +1,26 @@
+# What the sepolia collector instance subscribes and samples. Install as
+# /etc/ethswarm/collector-sepolia.topics.toml (root, 0644); ethswarm-collector@sepolia.service passes
+# it to the collector (--topics-file), which reads it as data: it is never in the environment.
+# The collector refuses a file that is not a regular file, that group or others may write, or
+# that names an unknown event; both lists are copied into each capture's capture.toml, and
+# summary.toml counts every entry.
+
+# The reference node's /eth/v1/events topics (beacon-APIs 01e99a6 eventstream): the exit-14
+# set, each the event a node emits when a message passes that gossip topic's validation.
+# block_gossip and data_column_sidecar are required (the fallback: beacon_block and columns).
+# At start the collector asks the node for each one alone; a topic the node refuses is not
+# subscribed and is listed in capture.toml and summary.toml as unsupported.
+sse_events = [
+    "block_gossip",                 # beacon_block
+    "execution_payload_gossip",     # execution_payload (the envelope)
+    "execution_payload_bid",        # execution_payload_bid
+    "payload_attestation_message",  # payload_attestation_message (PTC)
+    "attestation",                  # beacon_aggregate_and_proof (aggregates)
+    "single_attestation",           # beacon_attestation_{subnet_id}
+    "data_column_sidecar",          # data_column_sidecar_{subnet_id} (the node's custody columns)
+]
+
+# The attestation subnets sampled: a single_attestation on any other subnet is counted, not
+# recorded. Set them to the subnets the node subscribes (its metadata attnets, see the README);
+# the collector logs any it does not.
+attestation_subnets = [0, 1]

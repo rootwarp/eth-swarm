@@ -11,6 +11,7 @@ use consensus_types::caps::ObjectKind;
 use consensus_types::codec::{decode, DecodeError, Object};
 use consensus_types::primitives::{Root, Slot};
 use consensus_types::{EthSpec, ForkName};
+use p2p_wire::gossip::topic::ATTESTATION_SUBNET_COUNT;
 
 /// A gossip topic, `/eth2/<fork_digest>/<name>/ssz_snappy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,12 +111,28 @@ fn decode_envelope<E: EthSpec>(
     })
 }
 
-/// The slot, block root and subnet of an SSE event, from its JSON: `slot`, the root in
-/// `block_root` or `block`, under a `data` wrapper when the event is versioned; the subnet of a
-/// `data_column_sidecar` event is `index % subnet_count`. Missing or malformed fields are `None`.
+/// What the subnet of an SSE event is computed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SseSubnets {
+    /// `DATA_COLUMN_SIDECAR_SUBNET_COUNT`: a column's subnet is `index % count`.
+    pub column_subnet_count: u64,
+    /// The committees per slot (`get_committee_count_per_slot`), if known: without it an
+    /// unaggregated attestation has no subnet.
+    pub committees_per_slot: Option<u64>,
+    /// `SLOTS_PER_EPOCH`.
+    pub slots_per_epoch: Option<u64>,
+}
+
+/// The slot, block root and subnet of an SSE event, from its JSON, under a `data` wrapper when
+/// the event is versioned. The slot and root are the event's own (`slot`, and `block_root` or
+/// `block`), else those of its `data` (an attestation's `AttestationData`, a PTC message's
+/// `PayloadAttestationData`: `beacon_block_root`), else of its `message` (a bid's slot). The
+/// subnet of a `data_column_sidecar` is `index % column_subnet_count`; that of a
+/// `single_attestation` is `compute_subnet_for_attestation(committees_per_slot, slot,
+/// committee_index)`. Missing or malformed fields are `None`.
 pub fn decode_sse(
     event: &SseEvent,
-    subnet_count: u64,
+    subnets: &SseSubnets,
 ) -> (Option<Slot>, Option<Root>, Option<u64>) {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&event.data) else {
         return (None, None, None);
@@ -124,8 +141,9 @@ pub fn decode_sse(
         (Some(_), Some(data)) => data,
         _ => &json,
     };
-    let decimal = |key: &str| {
-        body.get(key)
+    let decimal = |object: &serde_json::Value, key: &str| {
+        object
+            .get(key)
             .and_then(serde_json::Value::as_str)
             .and_then(|s| {
                 (!s.starts_with('+'))
@@ -133,13 +151,39 @@ pub fn decode_sse(
                     .flatten()
             })
     };
-    let root = ["block_root", "block"]
+    // The first of the event, its data and its message that carries a slot.
+    let inner = [Some(body), body.get("data"), body.get("message")]
+        .into_iter()
+        .flatten()
+        .find(|o| o.get("slot").is_some())
+        .unwrap_or(body);
+    let slot = decimal(inner, "slot");
+    let root = ["block_root", "block", "beacon_block_root"]
         .iter()
-        .find_map(|key| body.get(*key)?.as_str().and_then(parse_root));
-    let subnet = (event.event == "data_column_sidecar")
-        .then(|| decimal("index")?.checked_rem(subnet_count))
-        .flatten();
-    (decimal("slot"), root, subnet)
+        .find_map(|key| inner.get(*key)?.as_str().and_then(parse_root));
+    let subnet = match event.event.as_str() {
+        "data_column_sidecar" => {
+            decimal(body, "index").and_then(|i| i.checked_rem(subnets.column_subnet_count))
+        }
+        "single_attestation" => attestation_subnet(subnets, slot, decimal(body, "committee_index")),
+        _ => None,
+    };
+    (slot, root, subnet)
+}
+
+/// `compute_subnet_for_attestation`: `(committees_per_slot * (slot % SLOTS_PER_EPOCH) +
+/// committee_index) % ATTESTATION_SUBNET_COUNT`.
+fn attestation_subnet(
+    subnets: &SseSubnets,
+    slot: Option<Slot>,
+    committee_index: Option<u64>,
+) -> Option<u64> {
+    let since_epoch_start = slot?.checked_rem(subnets.slots_per_epoch?)?;
+    let committees = subnets
+        .committees_per_slot?
+        .checked_mul(since_epoch_start)?
+        .checked_add(committee_index?)?;
+    Some(committees % ATTESTATION_SUBNET_COUNT)
 }
 
 #[cfg(test)]
@@ -251,29 +295,97 @@ mod tests {
         }
     }
 
+    /// Hoodi's parameters: 128 column subnets, 64 committees a slot, 32 slots an epoch.
+    const HOODI: SseSubnets = SseSubnets {
+        column_subnet_count: 128,
+        committees_per_slot: Some(64),
+        slots_per_epoch: Some(32),
+    };
+
+    #[test]
+    fn exit14_sse_events() {
+        let r = format!("0x{}", "ab".repeat(32));
+        let root = Some(Root::repeat_byte(0xab));
+        // An aggregate (`attestation`): the slot and root are in its data.
+        let aggregate = sse(
+            "attestation",
+            &format!(
+                r#"{{"aggregation_bits":"0x01","data":{{"slot":"12","index":"0","beacon_block_root":"{r}"}},"signature":"0x00","committee_bits":"0x01"}}"#
+            ),
+        );
+        assert_eq!(decode_sse(&aggregate, &HOODI), (Some(12), root, None));
+        // An unaggregated attestation: its subnet is compute_subnet_for_attestation.
+        let single = |slot: u64, committee: u64| {
+            sse(
+                "single_attestation",
+                &format!(
+                    r#"{{"committee_index":"{committee}","attester_index":"1","data":{{"slot":"{slot}","index":"0","beacon_block_root":"{r}"}},"signature":"0x00"}}"#
+                ),
+            )
+        };
+        assert_eq!(
+            decode_sse(&single(12, 5), &HOODI),
+            (Some(12), root, Some(5))
+        );
+        // One committee a slot: (1 * (slot % 32) + 0) % 64.
+        let sepolia = SseSubnets {
+            committees_per_slot: Some(1),
+            ..HOODI
+        };
+        assert_eq!(decode_sse(&single(45, 0), &sepolia).2, Some(13));
+        // 3 committees a slot: (3 * 30 + 2) % 64 = 28.
+        let three = SseSubnets {
+            committees_per_slot: Some(3),
+            ..HOODI
+        };
+        assert_eq!(decode_sse(&single(30, 2), &three).2, Some(28));
+        // Without the committee count there is no subnet.
+        let unknown = SseSubnets {
+            committees_per_slot: None,
+            ..HOODI
+        };
+        assert_eq!(decode_sse(&single(12, 5), &unknown), (Some(12), root, None));
+        // A PTC message: versioned, the slot and root under its data.
+        let ptc = sse(
+            "payload_attestation_message",
+            &format!(
+                r#"{{"version":"gloas","data":{{"validator_index":"123","data":{{"beacon_block_root":"{r}","slot":"10","payload_present":true,"blob_data_available":true}},"signature":"0x00"}}}}"#
+            ),
+        );
+        assert_eq!(decode_sse(&ptc, &HOODI), (Some(10), root, None));
+        // A bid: versioned, the slot in its message; it names no block root of its own.
+        let bid = sse(
+            "execution_payload_bid",
+            &format!(
+                r#"{{"version":"gloas","data":{{"message":{{"parent_block_root":"{r}","slot":"10","builder_index":"42"}},"signature":"0x00"}}}}"#
+            ),
+        );
+        assert_eq!(decode_sse(&bid, &HOODI), (Some(10), None, None));
+    }
+
     #[test]
     fn sse_events() {
         let r = format!("0x{}", "ab".repeat(32));
         let root = Some(Root::repeat_byte(0xab));
         let block = sse("block_gossip", &format!(r#"{{"slot":"10","block":"{r}"}}"#));
-        assert_eq!(decode_sse(&block, 128), (Some(10), root, None));
+        assert_eq!(decode_sse(&block, &HOODI), (Some(10), root, None));
         let column = sse(
             "data_column_sidecar",
             &format!(r#"{{"block_root":"{r}","index":"130","slot":"1"}}"#),
         );
-        assert_eq!(decode_sse(&column, 128), (Some(1), root, Some(2)));
+        assert_eq!(decode_sse(&column, &HOODI), (Some(1), root, Some(2)));
         let envelope = sse(
             "execution_payload_gossip",
             &format!(
                 r#"{{"slot":"10","builder_index":"42","block_hash":"0x12","block_root":"{r}"}}"#
             ),
         );
-        assert_eq!(decode_sse(&envelope, 128), (Some(10), root, None));
+        assert_eq!(decode_sse(&envelope, &HOODI), (Some(10), root, None));
         let versioned = sse(
             "head_v2",
             &format!(r#"{{"version":"gloas","data":{{"slot":"10","block":"{r}"}}}}"#),
         );
-        assert_eq!(decode_sse(&versioned, 128), (Some(10), root, None));
+        assert_eq!(decode_sse(&versioned, &HOODI), (Some(10), root, None));
 
         for (event, data) in [
             ("block_gossip", r#"{"slot":10,"block":"0x01"}"#),
@@ -282,13 +394,17 @@ mod tests {
             ("data_column_sidecar", r#"{"index":"x","slot":"+1"}"#),
         ] {
             assert_eq!(
-                decode_sse(&sse(event, data), 128),
+                decode_sse(&sse(event, data), &HOODI),
                 (None, None, None),
                 "{data}"
             );
         }
         // A zero subnet count gives no subnet rather than a division by zero.
         let column = sse("data_column_sidecar", r#"{"index":"3"}"#);
-        assert_eq!(decode_sse(&column, 0), (None, None, None));
+        let zero = SseSubnets {
+            column_subnet_count: 0,
+            ..HOODI
+        };
+        assert_eq!(decode_sse(&column, &zero), (None, None, None));
     }
 }

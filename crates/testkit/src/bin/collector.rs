@@ -2,8 +2,10 @@
 //!
 //! ```text
 //! collector sse --network hoodi|sepolia (--url URL | --url-file PATH) --out DIR --host HOST
-//!               [--topic EVENT]... [--ntp chrony|timesyncd|none] [--max-backoff-secs N]
+//!               [--topic EVENT... | --topics-file PATH] [--ntp chrony|timesyncd|none]
+//!               [--max-backoff-secs N]
 //! collector offsets CAPTURE_DIR
+//! collector rates CAPTURE_DIR
 //! collector --help
 //! ```
 //!
@@ -17,6 +19,17 @@
 //! `--url-file` (a 0600 file), never `--url`, so it stays out of `/proc/<pid>/cmdline`. Our
 //! probe's gossip tap feeds the same collector through [`testkit::collector::Tap`].
 //!
+//! The topic set comes from `--topics-file` ([`testkit::collector::TopicConfig`], read as data):
+//! the SSE events and the sampled attestation subnets, both copied into `capture.toml`. At the
+//! start the node is asked for each event alone; one it refuses is not subscribed and is listed
+//! as unsupported, a gap. Blocks and columns are always subscribed (the fallback), and a node
+//! that refuses them is refused. With `single_attestation` subscribed, the committees per slot
+//! are read from the node (an attestation's subnet is computed from them), and its `attnets`
+//! too: a sampled subnet it does not subscribe is logged.
+//!
+//! `rates` prints one JSON line per topic with its messages and bytes per slot (and the busiest
+//! slot's), and per sampled subnet for `single_attestation`; then a summary line.
+//!
 //! `offsets` prints one JSON line per record with its slot-relative offset and, for a column,
 //! its envelope-relative offset, then a summary line with the unmatched column count. It reads
 //! the records twice, one at a time, so a capture of any length fits.
@@ -24,6 +37,7 @@
 //! Exit codes: 0 done, 1 the node, the genesis check or the capture failed, 64 usage.
 
 use consensus_types::caps::NetworkCaps;
+use consensus_types::EthSpec;
 use consensus_types::Mainnet;
 use network_config::{ChainConfig, Network};
 use std::io::Write;
@@ -33,10 +47,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use testkit::archive::ChainParams;
 use testkit::collector::{
-    collect, config_name, genesis_time, read_info, records, run_sse, sample, Arrival,
-    ArrivalReceiver, Arrivals, Backoff, CaptureInfo, Clock, Collector, CollectorError, ColumnMatch,
-    CommandDaemon, Drops, EnvelopeIndex, ReferenceApiUrl, SlotClock, Source, SseConfig, Summary,
-    SystemClock, TimeDaemon, TokioPause, DEFAULT_TOPICS, NTP_INTERVAL,
+    collect, committees_per_slot, config_name, genesis_time, node_attnets, read_info, records,
+    run_sse, sample, supported_topics, Arrival, ArrivalReceiver, Arrivals, Backoff, CaptureInfo,
+    Clock, Collector, CollectorError, ColumnMatch, CommandDaemon, Drops, EnvelopeIndex,
+    RateCounter, ReferenceApiUrl, SlotClock, Source, SseConfig, Summary, SystemClock, TimeDaemon,
+    TokioPause, TopicConfig, DEFAULT_TOPICS, FALLBACK_SSE_EVENTS, NTP_INTERVAL, SINGLE_ATTESTATION,
 };
 use tokio::sync::watch;
 
@@ -50,8 +65,10 @@ type WriteCapture = fn(
 
 const USAGE: &str = "\
 usage: collector sse --network hoodi|sepolia (--url URL | --url-file PATH) --out DIR --host HOST
-                     [--topic EVENT]... [--ntp chrony|timesyncd|none] [--max-backoff-secs N]
+                     [--topic EVENT... | --topics-file PATH] [--ntp chrony|timesyncd|none]
+                     [--max-backoff-secs N]
        collector offsets CAPTURE_DIR
+       collector rates CAPTURE_DIR
        collector --help";
 const HELP: &str = "\
 Record gossip/SSE arrival times (monotonic and wall clock), or print their offsets.
@@ -70,6 +87,9 @@ SIGTERM or SIGINT. Disconnects are reconnected with backoff and recorded as miss
   --host HOST             the capture host, for capture.toml
   --topic EVENT           an event to subscribe, repeatable (default: block_gossip,
                           execution_payload_gossip, data_column_sidecar)
+  --topics-file PATH      the events and sampled attestation subnets instead, from a TOML file
+                          (sse_events, attestation_subnets; a regular file only its owner, root
+                          or this user, may write); events the node refuses are listed as gaps
   --ntp DAEMON            chrony (chronyc tracking), timesyncd (timedatectl timesync-status)
                           or none; sampled every 60 s (default chrony)
   --max-backoff-secs N    the longest reconnect wait (default 30)
@@ -77,6 +97,9 @@ SIGTERM or SIGINT. Disconnects are reconnected with backoff and recorded as miss
 offsets prints one JSON line per record of CAPTURE_DIR: its slot-relative offset
 (recv_wall - (genesis_time + slot * SLOT_DURATION_MS)) and, for a column, its offset from the
 execution_payload envelope of the same block root; then a summary with the unmatched columns.
+
+rates prints one JSON line per topic of CAPTURE_DIR: messages and bytes per slot over the slots
+its source recorded anything in, and the busiest slot's; per subnet too for single_attestation.
 
 Exit codes: 0 done, 1 the node, the genesis check or the capture failed, 64 usage.";
 
@@ -123,6 +146,7 @@ struct SseArgs {
     out: PathBuf,
     host: String,
     topics: Vec<String>,
+    attestation_subnets: Vec<u64>,
     ntp: Ntp,
     max_backoff: Duration,
 }
@@ -132,6 +156,7 @@ enum Command {
     Help,
     Sse(Box<SseArgs>),
     Offsets(PathBuf),
+    Rates(PathBuf),
 }
 
 fn parse(args: &[String]) -> Result<Command, String> {
@@ -143,20 +168,25 @@ fn parse(args: &[String]) -> Result<Command, String> {
             [dir] => Ok(Command::Offsets(dir.into())),
             _ => Err("offsets takes exactly one CAPTURE_DIR".into()),
         },
+        Some("rates") => match &args[1..] {
+            [dir] => Ok(Command::Rates(dir.into())),
+            _ => Err("rates takes exactly one CAPTURE_DIR".into()),
+        },
         Some("sse") => parse_sse(&args[1..]).map(|a| Command::Sse(Box::new(a))),
-        Some(_) => Err("unknown command (want sse or offsets)".into()),
+        Some(_) => Err("unknown command (want sse, offsets or rates)".into()),
         None => Err("no command".into()),
     }
 }
 
 /// The flags `sse` takes, each followed by its value.
-const SSE_FLAGS: [&str; 8] = [
+const SSE_FLAGS: [&str; 9] = [
     "--network",
     "--url",
     "--url-file",
     "--out",
     "--host",
     "--topic",
+    "--topics-file",
     "--ntp",
     "--max-backoff-secs",
 ];
@@ -180,6 +210,7 @@ fn unknown_argument(arg: &str) -> String {
 fn parse_sse(args: &[String]) -> Result<SseArgs, String> {
     let (mut network, mut url, mut out, mut host) = (None, None, None, None);
     let mut topics = Vec::new();
+    let mut topic_file: Option<TopicConfig> = None;
     let mut ntp = Ntp::Chrony;
     let mut max_backoff = Backoff::default().max;
     let mut it = args.iter();
@@ -210,7 +241,17 @@ fn parse_sse(args: &[String]) -> Result<SseArgs, String> {
             }
             "--out" => out = Some(PathBuf::from(value)),
             "--host" => host = Some(value.to_owned()),
+            "--topic" | "--topics-file" if topic_file.is_some() => {
+                return Err("give --topic or one --topics-file, not both".into())
+            }
             "--topic" => topics.push(value.to_owned()),
+            "--topics-file" if !topics.is_empty() => {
+                return Err("give --topic or one --topics-file, not both".into())
+            }
+            "--topics-file" => {
+                let read = TopicConfig::read_file(Path::new(value));
+                topic_file = Some(read.map_err(|e| format!("--topics-file: {e}"))?);
+            }
             "--ntp" => {
                 ntp = match value {
                     "chrony" => Ntp::Chrony,
@@ -232,6 +273,13 @@ fn parse_sse(args: &[String]) -> Result<SseArgs, String> {
     fn required<T>(value: Option<T>, flag: &str) -> Result<T, String> {
         value.ok_or_else(|| format!("{flag} is required"))
     }
+    let attestation_subnets = match topic_file {
+        Some(file) => {
+            topics = file.sse_events;
+            file.attestation_subnets
+        }
+        None => Vec::new(),
+    };
     if topics.is_empty() {
         topics = DEFAULT_TOPICS.iter().map(|t| (*t).to_owned()).collect();
     }
@@ -247,6 +295,7 @@ fn parse_sse(args: &[String]) -> Result<SseArgs, String> {
         out: required(out, "--out")?,
         host,
         topics,
+        attestation_subnets,
         ntp,
         max_backoff,
     })
@@ -273,6 +322,7 @@ fn run(args: &[String], out: &mut dyn Write, err: &Log) -> u8 {
             0
         }
         Command::Offsets(dir) => offsets(&dir, out, err),
+        Command::Rates(dir) => rates(&dir, out, err),
         Command::Sse(args) => {
             let args = *args;
             let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -372,7 +422,75 @@ async fn capture_sse(
         }
         Err(e) => return fail(format!("spec: {e}")),
     }
-    let topics: Vec<&str> = args.topics.iter().map(String::as_str).collect();
+    let (subscribed, unsupported) =
+        match supported_topics(&args.url, &args.topics, SPEC_TIMEOUT).await {
+            Ok(found) => found,
+            Err(e) => return fail(format!("events: {e}")),
+        };
+    if let Some(fallback) = FALLBACK_SSE_EVENTS
+        .iter()
+        .find(|f| unsupported.iter().any(|u| u == *f))
+    {
+        return fail(format!(
+            "the node does not emit {fallback}: no beacon_block and column fallback"
+        ));
+    }
+    if subscribed.is_empty() {
+        return fail("the node emits none of the configured events".into());
+    }
+    if !unsupported.is_empty() {
+        log(
+            err,
+            &format!(
+                "the node does not emit {}: not subscribed, listed as unsupported (gaps)",
+                unsupported.join(",")
+            ),
+        );
+    }
+    let slots_per_epoch = Mainnet::slots_per_epoch();
+    let (mut committees, mut attnets) = (None, None);
+    if subscribed.iter().any(|t| t == SINGLE_ATTESTATION) {
+        let now = SlotClock::new(genesis, config.slot_duration_ms())
+            .and_then(|c| c.wall_slot(clock.now().wall_ns));
+        let Some(slot) = now else {
+            return fail("committees: the wall clock is before genesis".into());
+        };
+        if args.attestation_subnets.is_empty() {
+            log(
+                err,
+                &format!(
+                    "no attestation subnet is sampled: every {SINGLE_ATTESTATION} is counted, \
+                     none recorded (name them in --topics-file)"
+                ),
+            );
+        }
+        match committees_per_slot(&args.url, slot, slots_per_epoch, SPEC_TIMEOUT).await {
+            Ok(n) => committees = Some(n),
+            Err(e) => return fail(format!("committees: {e}")),
+        }
+        // Only for the log and capture.toml: a node without its identity is still captured.
+        match node_attnets(&args.url, SPEC_TIMEOUT).await {
+            Ok(subnets) => {
+                let unsubscribed: Vec<String> = (args.attestation_subnets.iter())
+                    .filter(|s| !subnets.contains(s))
+                    .map(u64::to_string)
+                    .collect();
+                if !unsubscribed.is_empty() {
+                    log(
+                        err,
+                        &format!(
+                            "the node does not subscribe attestation subnet {} (its attnets): \
+                             expect no {SINGLE_ATTESTATION} there",
+                            unsubscribed.join(",")
+                        ),
+                    );
+                }
+                attnets = Some(subnets);
+            }
+            Err(e) => log(err, &format!("identity: {e}")),
+        }
+    }
+    let topics: Vec<&str> = subscribed.iter().map(String::as_str).collect();
     let mut sse = match SseConfig::new(args.url.clone(), &topics) {
         Ok(c) => c,
         Err(e) => return fail(e.to_string()),
@@ -390,6 +508,12 @@ async fn capture_sse(
         time_daemon: args.ntp.name().to_owned(),
         started_mono_ns: started.mono_ns,
         started_wall_ns: started.wall_ns,
+        sse_topics_unsupported: unsupported,
+        gossip_topics: Vec::new(),
+        attestation_subnets: args.attestation_subnets.clone(),
+        node_attnets: attnets,
+        committees_per_slot: committees,
+        slots_per_epoch: Some(slots_per_epoch),
     };
     let dir = args
         .out
@@ -469,15 +593,23 @@ async fn capture_sse(
     let _ = writeln!(
         out,
         "{}: {} records, {} undecoded, {} dropped, {} unsubscribed, {} connections, {} missing \
-         intervals",
+         intervals, {} outside the sampled subnets",
         dir.display(),
         summary.records,
         summary.undecoded,
         summary.dropped,
         stats.unsubscribed,
         stats.connections,
-        summary.missing_intervals
+        summary.missing_intervals,
+        summary.outside_sampled_subnets
     );
+    let gaps: Vec<&str> = (summary.unsupported_topics.iter())
+        .chain(&summary.missing_topics)
+        .map(String::as_str)
+        .collect();
+    if !gaps.is_empty() {
+        let _ = writeln!(out, "{}: topic gaps: {}", dir.display(), gaps.join(", "));
+    }
     0
 }
 
@@ -574,6 +706,58 @@ fn offsets(dir: &Path, out: &mut dyn Write, err: &Log) -> u8 {
             "slot_offsets": with_offset,
             "columns_matched": matched,
             "unmatched_columns": unmatched,
+        }
+    });
+    let _ = writeln!(out, "{summary}");
+    0
+}
+
+/// One pass over `records.jsonl`, one record in memory at a time.
+fn rates(dir: &Path, out: &mut dyn Write, err: &Log) -> u8 {
+    let fail = |message: String| {
+        log(err, &message);
+        EXIT_FAILED
+    };
+    let info = match read_info(dir) {
+        Ok(info) => info,
+        Err(e) => return fail(e.to_string()),
+    };
+    let Some(clock) = SlotClock::new(info.genesis_time, info.slot_duration_ms) else {
+        return fail(format!(
+            "{}: slot_duration_ms must be positive",
+            dir.display()
+        ));
+    };
+    let mut counter = RateCounter::new(clock);
+    let counted = records(dir).and_then(|mut all| {
+        all.try_for_each(|record| {
+            counter.add(&record?);
+            Ok::<_, CollectorError>(())
+        })
+    });
+    if let Err(e) = counted {
+        return fail(e.to_string());
+    }
+    let rates = counter.finish();
+    for r in &rates.topics {
+        let line = serde_json::json!({
+            "source": r.source,
+            "topic": r.topic,
+            "subnet": r.subnet,
+            "n": r.n,
+            "bytes": r.bytes,
+            "slots": r.slots,
+            "msgs_per_slot": r.msgs_per_slot,
+            "bytes_per_slot": r.bytes_per_slot,
+            "peak_msgs_per_slot": r.peak_msgs_per_slot,
+            "peak_bytes_per_slot": r.peak_bytes_per_slot,
+        });
+        let _ = writeln!(out, "{line}");
+    }
+    let summary = serde_json::json!({
+        "summary": {
+            "topics": rates.topics.iter().filter(|r| r.subnet.is_none()).count(),
+            "before_genesis": rates.before_genesis,
         }
     });
     let _ = writeln!(out, "{summary}");
@@ -1068,6 +1252,297 @@ mod tests {
         );
     }
 
+    /// `body` as a 0644 topics file in `dir`.
+    fn topics_file(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("collector-hoodi.topics.toml");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        path
+    }
+
+    const EXIT14: &str = "sse_events = [\"block_gossip\", \"execution_payload_bid\", \
+        \"single_attestation\", \"attestation\", \"data_column_sidecar\"]\n\
+        attestation_subnets = [0, 1]\n";
+
+    #[test]
+    fn the_topic_set_comes_from_a_topics_file_or_from_topic_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = topics_file(dir.path(), EXIT14);
+        let file_arg = file.to_str().unwrap();
+        let with = |extra: &[&str]| {
+            let mut list = sse_args("http://127.0.0.1:5053", Path::new("/out"));
+            list.extend(args(extra));
+            parse(&list)
+        };
+        let Ok(Command::Sse(a)) = with(&["--topics-file", file_arg]) else {
+            panic!("--topics-file refused");
+        };
+        assert_eq!(
+            a.topics,
+            [
+                "block_gossip",
+                "execution_payload_bid",
+                "single_attestation",
+                "attestation",
+                "data_column_sidecar"
+            ]
+        );
+        assert_eq!(a.attestation_subnets, [0, 1]);
+        for both in [
+            &["--topics-file", file_arg, "--topic", "head"][..],
+            &["--topic", "head", "--topics-file", file_arg],
+            &["--topics-file", file_arg, "--topics-file", file_arg],
+        ] {
+            let err = with(both).unwrap_err();
+            assert!(err.contains("not both"), "{both:?}: {err}");
+        }
+        // A file that is not a config is refused, naming it and why.
+        let bad = topics_file(dir.path(), "sse_events = [\"weather\"]\n");
+        let (code, _, err) = run_args(&[
+            "sse",
+            "--network",
+            "hoodi",
+            "--url",
+            "http://127.0.0.1:5053",
+            "--out",
+            "/x",
+            "--host",
+            "h",
+            "--topics-file",
+            bad.to_str().unwrap(),
+        ]);
+        assert_eq!(code, EXIT_USAGE);
+        assert!(
+            err.contains(&format!("--topics-file: {}: sse_events", bad.display())),
+            "{err}"
+        );
+    }
+
+    const EXIT14_STREAM: [&str; 5] = [
+        "event: block_gossip\ndata: {\"slot\":\"3\",\"block\":\"0x1111111111111111111111111111111111111111111111111111111111111111\"}\n\n",
+        // Committee 0 and 5 of 64: subnets 0 (sampled) and 5 (not).
+        "event: single_attestation\ndata: {\"committee_index\":\"0\",\"attester_index\":\"1\",\"data\":{\"slot\":\"3\",\"index\":\"0\",\"beacon_block_root\":\"0x1111111111111111111111111111111111111111111111111111111111111111\"}}\n\n",
+        "event: single_attestation\ndata: {\"committee_index\":\"5\",\"attester_index\":\"2\",\"data\":{\"slot\":\"3\",\"index\":\"0\",\"beacon_block_root\":\"0x1111111111111111111111111111111111111111111111111111111111111111\"}}\n\n",
+        "event: attestation\ndata: {\"aggregation_bits\":\"0x01\",\"data\":{\"slot\":\"3\",\"index\":\"0\",\"beacon_block_root\":\"0x1111111111111111111111111111111111111111111111111111111111111111\"}}\n\n",
+        "event: data_column_sidecar\ndata: {\"block_root\":\"0x1111111111111111111111111111111111111111111111111111111111111111\",\"index\":\"7\",\"slot\":\"3\"}\n\n",
+    ];
+
+    /// How the fixture node answers the committees of a slot.
+    #[derive(Clone, Copy)]
+    enum Committees {
+        /// This many, of the slot asked for.
+        Count(usize),
+        /// One, of another slot.
+        OtherSlot,
+        /// This status.
+        Status(u16),
+    }
+
+    impl Committees {
+        fn reply(self, query: &str) -> Reply {
+            let slot = query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("slot="))
+                .unwrap_or("0");
+            let (slot, n) = match self {
+                Committees::Count(n) => (slot.to_owned(), n),
+                Committees::OtherSlot => (format!("{slot}1"), 1),
+                Committees::Status(code) => return Reply::status(code),
+            };
+            let one = format!(r#"{{"index":"0","slot":"{slot}","validators":["1"]}}"#);
+            Reply::json(&format!(r#"{{"data":[{}]}}"#, vec![one; n].join(",")))
+        }
+    }
+
+    /// A Hoodi node at Lighthouse's topic set without the bid one, with attestation subnet 0
+    /// subscribed; `refuse` names a further topic it refuses.
+    async fn exit14_node(refuse: &'static str, committees: Committees) -> FixtureServer {
+        FixtureServer::start_with_query(move |_, asked| {
+            let (path, query) = asked.split_once('?').unwrap_or((asked, ""));
+            match path {
+                "/eth/v1/beacon/genesis" => {
+                    Reply::json(r#"{"data":{"genesis_time":"1742213400"}}"#)
+                }
+                "/eth/v1/config/spec" => Reply::json(r#"{"data":{"CONFIG_NAME":"hoodi"}}"#),
+                "/eth/v1/beacon/states/head/committees" => committees.reply(query),
+                "/eth/v1/node/identity" => Reply::json(
+                    r#"{"data":{"metadata":{"seq_number":"1","attnets":"0x0100000000000000"}}}"#,
+                ),
+                "/eth/v1/events" if query == "topics=execution_payload_bid" => Reply::status(400),
+                "/eth/v1/events" if query == format!("topics={refuse}") => Reply::status(400),
+                "/eth/v1/events" => Reply::stream(EXIT14_STREAM.to_vec(), true),
+                _ => Reply::status(404),
+            }
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn sse_captures_the_exit14_set_and_lists_its_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = exit14_node("none", Committees::Count(64)).await;
+        let mut args = parsed(&format!("http://{}", server.addr), dir.path());
+        args.topics = [
+            "block_gossip",
+            "execution_payload_bid",
+            "single_attestation",
+            "attestation",
+            "data_column_sidecar",
+        ]
+        .map(String::from)
+        .into();
+        args.attestation_subnets = vec![0, 1];
+        let (code, out, err) = capture(&args).await;
+        assert_eq!(code, 0, "{err}");
+        assert!(
+            err.contains("the node does not emit execution_payload_bid: not subscribed"),
+            "{err}"
+        );
+        assert!(
+            err.contains("the node does not subscribe attestation subnet 1 (its attnets)"),
+            "{err}"
+        );
+        let capture_dir = PathBuf::from(out.lines().next().unwrap());
+        let info = read_info(&capture_dir).unwrap();
+        assert_eq!(
+            info.sse_topics,
+            [
+                "attestation",
+                "block_gossip",
+                "data_column_sidecar",
+                "single_attestation"
+            ]
+        );
+        assert_eq!(info.sse_topics_unsupported, ["execution_payload_bid"]);
+        assert_eq!(info.attestation_subnets, [0, 1]);
+        assert_eq!(info.node_attnets, Some(vec![0]));
+        assert_eq!(
+            (info.committees_per_slot, info.slots_per_epoch),
+            (Some(64), Some(32))
+        );
+        let summary: Summary =
+            toml::from_str(&std::fs::read_to_string(capture_dir.join(SUMMARY_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(summary.records, 4, "{summary:?}");
+        assert_eq!(summary.outside_sampled_subnets, 1);
+        assert_eq!(summary.unsupported_topics, ["sse:execution_payload_bid"]);
+        assert_eq!(summary.missing_topics, ["sse:attestation_subnet_1"]);
+        assert!(
+            out.contains("topic gaps: sse:execution_payload_bid, sse:attestation_subnet_1"),
+            "{out}"
+        );
+        // Every recorded event got its subnet and size.
+        let (_, records) = read_capture(&capture_dir).unwrap();
+        let attestation = records
+            .iter()
+            .find(|r| r.topic == "single_attestation")
+            .unwrap();
+        assert_eq!(attestation.subnet, Some(0));
+        assert!(records.iter().all(|r| r.bytes > 0), "{records:?}");
+
+        // rates over the capture: one slot, one line per topic and one for subnet 0.
+        let (code, out, err) = run_args(&["rates", capture_dir.to_str().unwrap()]);
+        assert_eq!(code, 0, "{err}");
+        let lines: Vec<serde_json::Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let rows: Vec<(String, serde_json::Value, f64)> = lines[..lines.len() - 1]
+            .iter()
+            .map(|l| {
+                (
+                    l["topic"].as_str().unwrap().to_owned(),
+                    l["subnet"].clone(),
+                    l["msgs_per_slot"].as_f64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(rows.len(), 5, "{out}");
+        assert_eq!(
+            rows[4],
+            ("single_attestation".into(), serde_json::json!(0), 1.0)
+        );
+        assert_eq!(lines.last().unwrap()["summary"]["topics"], 4);
+    }
+
+    #[tokio::test]
+    async fn sse_refuses_a_node_without_the_fallback_or_its_committees() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = parsed("http://127.0.0.1:1", dir.path());
+        args.topics = ["block_gossip", "single_attestation", "data_column_sidecar"]
+            .map(String::from)
+            .into();
+        args.attestation_subnets = vec![0];
+        for (refuse, committees, want) in [
+            (
+                "block_gossip",
+                Committees::Count(1),
+                "the node does not emit block_gossip: no beacon_block and column fallback",
+            ),
+            (
+                "none",
+                Committees::Status(500),
+                "committees: /eth/v1/beacon/states/head/committees: HTTP 500",
+            ),
+            (
+                "none",
+                Committees::OtherSlot,
+                "committees: /eth/v1/beacon/states/head/committees: bad response",
+            ),
+        ] {
+            let server = exit14_node(refuse, committees).await;
+            args.url = ReferenceApiUrl::parse(&format!("http://{}", server.addr)).unwrap();
+            let (code, _, err) = capture(&args).await;
+            assert_eq!(code, EXIT_FAILED, "{want}: {err}");
+            assert!(err.contains(want), "{err} (want {want})");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
+        // --topic single_attestation samples no subnet: said, and the capture runs.
+        let server = exit14_node("none", Committees::Count(1)).await;
+        let mut unsampled = parsed(&format!("http://{}", server.addr), dir.path());
+        unsampled.topics = ["block_gossip", "single_attestation", "data_column_sidecar"]
+            .map(String::from)
+            .into();
+        let (code, _, err) = capture(&unsampled).await;
+        assert_eq!(code, 0, "{err}");
+        assert!(
+            err.contains("no attestation subnet is sampled: every single_attestation is counted"),
+            "{err}"
+        );
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            std::fs::remove_dir_all(entry.unwrap().path()).unwrap();
+        }
+        // A node that refuses every configured event.
+        let server = exit14_node("none", Committees::Count(1)).await;
+        args.url = ReferenceApiUrl::parse(&format!("http://{}", server.addr)).unwrap();
+        args.topics = vec!["execution_payload_bid".into()];
+        let (code, _, err) = capture(&args).await;
+        assert_eq!(code, EXIT_FAILED);
+        assert!(err.contains("emits none of the configured events"), "{err}");
+        // A node that answers neither 200 nor 400 for a topic.
+        let server = FixtureServer::start(|_, path| match path {
+            "/eth/v1/beacon/genesis" => Reply::json(r#"{"data":{"genesis_time":"1742213400"}}"#),
+            "/eth/v1/config/spec" => Reply::json(r#"{"data":{"CONFIG_NAME":"hoodi"}}"#),
+            _ => Reply::status(503),
+        })
+        .await;
+        args.url = ReferenceApiUrl::parse(&format!("http://{}", server.addr)).unwrap();
+        let (code, _, err) = capture(&args).await;
+        assert_eq!(code, EXIT_FAILED);
+        assert!(err.contains("events: /eth/v1/events: HTTP 503"), "{err}");
+    }
+
+    #[test]
+    fn rates_of_a_capture_that_cannot_be_read() {
+        let (code, _, err) = run_args(&["rates", "/nonexistent/capture"]);
+        assert_eq!(code, EXIT_FAILED);
+        assert!(err.contains("/nonexistent/capture"), "{err}");
+        let (code, _, err) = run_args(&["rates"]);
+        assert_eq!(code, EXIT_USAGE);
+        assert!(err.contains("rates takes exactly one CAPTURE_DIR"), "{err}");
+    }
+
     #[test]
     fn offsets_of_a_capture() {
         let dir = tempfile::tempdir().unwrap();
@@ -1082,6 +1557,7 @@ mod tests {
             time_daemon: "none".into(),
             started_mono_ns: 0,
             started_wall_ns: 0,
+            ..CaptureInfo::default()
         };
         let collector =
             Collector::<Mainnet>::create(dir.path(), info, fixtures::chain(), None).unwrap();

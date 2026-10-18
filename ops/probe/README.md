@@ -200,6 +200,25 @@ whatever its version. It also refuses any `*.d` drop-in directory next to the un
 `*.service` other than the three: it checks the files in this directory only, not what a host
 adds.
 
+## Gossip topics
+
+`gossip-topics.toml` is the probe's configured gossip topic list (Sepolia): the exit-14 set of
+`gloas/p2p-interface.md` (`beacon_block`, `execution_payload`, `execution_payload_bid`,
+`payload_attestation_message`, `beacon_aggregate_and_proof`, the sampled
+`beacon_attestation_{subnet_id}` and the custody `data_column_sidecar_{subnet_id}`). cl-p2p
+reads it as data (`cl_p2p::gossip::TopicList`): every name goes through p2p-wire's
+`GossipTopic::parse`, and a name it does not handle refuses the whole file. The probe
+subscribes each name under every fork digest it follows (two at most, around a fork) and
+reports IGNORE for every message, so it forwards none.
+
+The file records its bounds and byte budget, and cl-p2p's tests check them against it: 11
+topics per digest (22 under two) within the 418 subscriptions one RPC may carry, a
+subscription whitelist that starts as these topics, every name a Gloas topic name so the
+control-message size (46,898 bytes, computed for the two-fork set of every topic) still fits
+without a recompute, and each topic's decompressed cap on Sepolia (largest message 10 MiB, one
+message of every topic 21,362,195 bytes). Set the attestation and column subnets to the ones
+the probe samples and custodies before a run.
+
 ## Not covered here
 
 - A journal grep of every probe unit after a 10-minute devnet run (neither the key hex nor its

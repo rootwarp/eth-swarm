@@ -382,19 +382,52 @@ async fn stream(
 
 /// Opens the event stream: connect, `200 text/event-stream`, within the request deadline.
 async fn open(config: &SseConfig) -> Result<Incoming, ApiError> {
-    let path_and_query = config.path_and_query();
-    let request = get(
+    open_stream(
         &config.url,
-        EVENTS_PATH,
-        &path_and_query,
-        "text/event-stream",
-    );
-    let response = tokio::time::timeout(config.request_timeout, request)
-        .await
-        .map_err(|_| ApiError::Timeout {
-            path: EVENTS_PATH,
-            timeout: config.request_timeout,
-        })??;
+        &config.path_and_query(),
+        config.request_timeout,
+    )
+    .await
+}
+
+/// Asks the node for each of `topics` alone, in order: those it streams (`200
+/// text/event-stream`), and those it refuses as a bad request (`400`: a topic it does not
+/// emit at its version). Each stream is dropped as soon as it is open. Any other failure is an
+/// error: an unreachable node says nothing about its topics.
+pub async fn supported_topics(
+    url: &ReferenceApiUrl,
+    topics: &[String],
+    timeout: Duration,
+) -> Result<(Vec<String>, Vec<String>), ApiError> {
+    let (mut supported, mut unsupported) = (Vec::new(), Vec::new());
+    for topic in topics {
+        let path_and_query = format!("{EVENTS_PATH}?topics={topic}");
+        match open_stream(url, &path_and_query, timeout).await {
+            Ok(body) => {
+                drop(body);
+                supported.push(topic.clone());
+            }
+            Err(ApiError::Status { status: 400, .. }) => unsupported.push(topic.clone()),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((supported, unsupported))
+}
+
+/// `GET <path_and_query>` of the event stream: `200 text/event-stream` within `timeout`.
+async fn open_stream(
+    url: &ReferenceApiUrl,
+    path_and_query: &str,
+    timeout: Duration,
+) -> Result<Incoming, ApiError> {
+    let request = get(url, EVENTS_PATH, path_and_query, "text/event-stream");
+    let response =
+        tokio::time::timeout(timeout, request)
+            .await
+            .map_err(|_| ApiError::Timeout {
+                path: EVENTS_PATH,
+                timeout,
+            })??;
     let content_type = response
         .headers()
         .get(CONTENT_TYPE)
@@ -486,9 +519,20 @@ pub(super) async fn get_json<T: serde::de::DeserializeOwned>(
     limit: usize,
     timeout: Duration,
 ) -> Result<T, ApiError> {
+    get_json_at(url, path, path, limit, timeout).await
+}
+
+/// [`get_json`] of `path_and_query`, a query on `path` (which errors name).
+pub(super) async fn get_json_at<T: serde::de::DeserializeOwned>(
+    url: &ReferenceApiUrl,
+    path: &'static str,
+    path_and_query: &str,
+    limit: usize,
+    timeout: Duration,
+) -> Result<T, ApiError> {
     let bad = |reason: String| ApiError::BadResponse { path, reason };
     let fetch = async {
-        let response = get(url, path, path, "application/json").await?;
+        let response = get(url, path, path_and_query, "application/json").await?;
         match Limited::new(response.into_body(), limit).collect().await {
             Ok(body) => Ok(body.to_bytes()),
             Err(e) if e.is::<http_body_util::LengthLimitError>() => {
@@ -913,6 +957,68 @@ mod tests {
             .unwrap();
         assert_eq!(stats.connections, 1);
         assert!(stats.events >= 1, "{stats:?}");
+    }
+
+    #[tokio::test]
+    async fn each_topic_is_asked_for_alone_and_a_refused_one_is_unsupported() {
+        // The node knows every topic but the bid one, which it refuses as a bad request.
+        let server = FixtureServer::start(|n, _| match n {
+            1 => Reply::status(400),
+            _ => Reply::stream(vec![BLOCK], true),
+        })
+        .await;
+        let topics: Vec<String> = [
+            "block_gossip",
+            "execution_payload_bid",
+            "data_column_sidecar",
+        ]
+        .map(String::from)
+        .into();
+        let (supported, unsupported) =
+            supported_topics(&server.url(KEY), &topics, Duration::from_secs(5))
+                .await
+                .unwrap();
+        assert_eq!(supported, ["block_gossip", "data_column_sidecar"]);
+        assert_eq!(unsupported, ["execution_payload_bid"]);
+        let paths: Vec<String> = server.seen().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(
+            paths,
+            [
+                format!("{KEY}/eth/v1/events?topics=block_gossip"),
+                format!("{KEY}/eth/v1/events?topics=execution_payload_bid"),
+                format!("{KEY}/eth/v1/events?topics=data_column_sidecar"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_that_fails_otherwise_tells_nothing_about_its_topics() {
+        let server = FixtureServer::start(|n, _| match n {
+            0 => Reply::status(503),
+            _ => Reply::stream(vec![BLOCK], true).content_type("application/json"),
+        })
+        .await;
+        let topics = vec!["block_gossip".to_owned()];
+        let url = server.url(KEY);
+        let t = Duration::from_secs(5);
+        assert_eq!(
+            supported_topics(&url, &topics, t).await,
+            Err(ApiError::Status {
+                path: EVENTS_PATH,
+                status: 503
+            })
+        );
+        let err = supported_topics(&url, &topics, t).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ApiError::BadResponse {
+                    path: EVENTS_PATH,
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 
     #[tokio::test]

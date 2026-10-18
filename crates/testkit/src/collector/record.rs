@@ -43,6 +43,11 @@ pub struct ArrivalRecord {
     pub recv_wall_ns: u64,
     /// The peer that delivered it (gossip only: the propagation source's peer ID).
     pub peer: Option<String>,
+    /// Its size: gossip, the message data as the tap handed it over (snappy-compressed SSZ, as
+    /// received); SSE, the event's `data` (JSON, not the wire size). 0 in captures from before
+    /// it was recorded.
+    #[serde(default)]
+    pub bytes: u64,
 }
 
 fn ser_root<S: Serializer>(root: &Option<Root>, s: S) -> Result<S::Ok, S::Error> {
@@ -88,6 +93,7 @@ mod tests {
             recv_mono_ns: 11,
             recv_wall_ns: 12,
             peer: None,
+            bytes: 300,
         };
         let text = serde_json::to_string(&record).unwrap();
         assert!(text.contains(r#""source":"sse""#), "{text}");

@@ -6,9 +6,11 @@
 # reference URL read from a file (never in argv), and no node URL of its own. Runs its
 # ExecStartPre guard the way systemd would, env file values overriding systemd's own
 # (STATE_DIRECTORY). Checks each example env file (its network, its instance's state directory,
-# known keys only) and URL file (loopback on the ref-node default beacon API port: Sepolia 5052,
-# Hoodi 5053, cross-checked against BEACON_API_PORT in ops/ref-node's example env files), and
-# the README's migration from the single-network unit. The guard must refuse any env file
+# known keys only), URL file (loopback on the ref-node default beacon API port: Sepolia 5052,
+# Hoodi 5053, cross-checked against BEACON_API_PORT in ops/ref-node's example env files) and
+# topics file (the exit-14 events and sampled subnets, read as data by --topics-file), the
+# unit's note that systemd reads the env file before the guard, and the README's migration from
+# the single-network unit, topics file install and root-ownership note. The guard must refuse any env file
 # outside its grammar (a byte other than printable ASCII and LF, a quote, a backslash, a line
 # other than a comment or KEY=value) and run no tool an env file's PATH could plant. Each check
 # is also run on broken copies, which must fail. No network, no root, no systemd. Works on
@@ -116,7 +118,8 @@ check_unit() {
     problems+="want exactly one ExecStart="$'\n'
   fi
   for want in '--network ${COLLECTOR_NETWORK}' '--url-file /etc/ethswarm/collector-%i.url' \
-    '--out ${COLLECTOR_OUT}' '--ntp ${COLLECTOR_NTP}'; do
+    '--out ${COLLECTOR_OUT}' '--ntp ${COLLECTOR_NTP}' \
+    '--topics-file /etc/ethswarm/collector-%i.topics.toml'; do
     if [[ $exec != *" $want "* && $exec != *" $want" ]]; then
       problems+="ExecStart= lacks $want"$'\n'
     fi
@@ -126,6 +129,25 @@ check_unit() {
   if ! printf '%s\n' "$lines" | grep -Fq 'ExecStartPre=/usr/bin/env -i /bin/sh -c '; then
     problems+="no ExecStartPre=/usr/bin/env -i /bin/sh -c guard tying the env file to the instance"$'\n'
   fi
+  if [[ -n $problems ]]; then
+    printf '%s' "$problems"
+    return 1
+  fi
+}
+
+# The note next to ExecStartPre= on what the guard cannot do: systemd reads the env file first.
+UNIT_NOTE='systemd reads EnvironmentFile= itself, before this guard runs
+`env -i` protects only the guard'"'"'s own shell and the tools it starts
+/etc/ethswarm must stay root-owned and writable by root only'
+
+# check_unit_note FILE: prints each missing line of the note; fails if one is missing.
+check_unit_note() {
+  local file=$1 problems="" want joined
+  # The note's comment lines joined, so a line break inside a phrase does not matter.
+  joined=$(grep -E '^#' "$file" | sed 's/^# *//' | tr '\n' ' ')
+  while IFS= read -r want; do
+    [[ $joined == *"$want"* ]] || problems+="no note: $want"$'\n'
+  done <<<"$UNIT_NOTE"
   if [[ -n $problems ]]; then
     printf '%s' "$problems"
     return 1
@@ -165,6 +187,31 @@ check_env() {
     problems+="COLLECTOR_OUT is not the instance's state directory /var/lib/ethswarm-collector/$network"$'\n'
   value=$(env_value "$file" COLLECTOR_NTP || true)
   case $value in chrony | timesyncd | none) ;; *) problems+="COLLECTOR_NTP is not chrony, timesyncd or none"$'\n' ;; esac
+  if [[ -n $problems ]]; then
+    printf '%s' "$problems"
+    return 1
+  fi
+}
+
+# The exit-14 SSE events every example topics file subscribes (testkit EXIT14_SSE_EVENTS).
+EXIT14_EVENTS='block_gossip execution_payload_gossip execution_payload_bid payload_attestation_message
+attestation single_attestation data_column_sidecar'
+
+# check_topics FILE NETWORK: the example topics file names its instance's path, subscribes every
+# exit-14 event, samples at least one attestation subnet, and is LF and printable ASCII. The
+# collector itself checks the TOML (testkit's topics tests parse these files).
+check_topics() {
+  local file=$1 network=$2 problems="" event
+  grep -Fq "/etc/ethswarm/collector-$network.topics.toml" "$file" ||
+    problems+="does not name /etc/ethswarm/collector-$network.topics.toml"$'\n'
+  for event in $EXIT14_EVENTS; do
+    grep -Eq "^[[:space:]]*\"$event\"," "$file" || problems+="does not subscribe $event"$'\n'
+  done
+  [[ $(grep -Ec '^attestation_subnets = \[[0-9]+(, [0-9]+)*\]$' "$file" || true) == 1 ]] ||
+    problems+="want one attestation_subnets = [n, ...] line"$'\n'
+  if [[ $(LC_ALL=C tr -d '\n -~' <"$file" | wc -c | tr -d ' ') != 0 ]]; then
+    problems+="a byte other than LF and printable ASCII"$'\n'
+  fi
   if [[ -n $problems ]]; then
     printf '%s' "$problems"
     return 1
@@ -247,6 +294,16 @@ replace "$unit" 'ExecStartPre=/usr/bin/env -i /bin/sh -c' 'ExecStartPre=/bin/sh 
   >"$tmp/guard-env.service"
 expect_fail "a guard run with the env file's environment (no env -i) is caught" \
   check_unit "$tmp/guard-env.service"
+
+replace "$unit" ' --topics-file /etc/ethswarm/collector-%i.topics.toml' '' >"$tmp/no-topics.service"
+expect_fail "a unit without the topics file is caught" check_unit "$tmp/no-topics.service"
+replace "$unit" '--topics-file /etc/ethswarm/collector-%i.topics.toml' \
+  '--topics-file /etc/ethswarm/collector.topics.toml' >"$tmp/shared-topics.service"
+expect_fail "a topics file shared by every instance is caught" check_unit "$tmp/shared-topics.service"
+expect_pass "the unit notes that systemd reads the env file before the guard" \
+  check_unit_note "$unit"
+grep -Fv 'before this guard runs' "$unit" >"$tmp/no-note.service"
+expect_fail "a unit without that note is caught" check_unit_note "$tmp/no-note.service"
 
 # --- the ExecStartPre guard, run the way systemd would --------------------------------------------
 
@@ -422,6 +479,8 @@ for pair in "sepolia $SEPOLIA_PORT" "hoodi $HOODI_PORT"; do
     check_env "$collector/collector-$network.env.example" "$network"
   expect_pass "collector-$network.url.example: http://127.0.0.1:$port" \
     check_url "$collector/collector-$network.url.example" "$network" "$port"
+  expect_pass "collector-$network.topics.toml.example: the exit-14 events and sampled subnets" \
+    check_topics "$collector/collector-$network.topics.toml.example" "$network"
   found=$(ref_node_port "$network")
   if [[ $found == "$port" ]]; then
     ok "the ref-node $network beacon API default is still $port"
@@ -436,6 +495,17 @@ expect_fail "a Hoodi URL file on Sepolia's port is caught" \
   check_url "$tmp/hoodi-on-sepolia.url" hoodi "$HOODI_PORT"
 { cat "$hoodi_url"; echo "http://127.0.0.1:$SEPOLIA_PORT"; } >"$tmp/two.url"
 expect_fail "a URL file with a second line is caught" check_url "$tmp/two.url" hoodi "$HOODI_PORT"
+
+hoodi_topics="$collector/collector-hoodi.topics.toml.example"
+grep -Fv '"execution_payload_bid",' "$hoodi_topics" >"$tmp/no-bid.topics.toml"
+expect_fail "a topics file without the bid event is caught" check_topics "$tmp/no-bid.topics.toml" hoodi
+grep -v '^attestation_subnets' "$hoodi_topics" >"$tmp/no-subnets.topics.toml"
+expect_fail "a topics file without sampled subnets is caught" \
+  check_topics "$tmp/no-subnets.topics.toml" hoodi
+expect_fail "the Sepolia topics file as Hoodi's is caught" \
+  check_topics "$collector/collector-sepolia.topics.toml.example" hoodi
+{ cat "$hoodi_topics"; printf '# caf\xc3\xa9\n'; } >"$tmp/utf8.topics.toml"
+expect_fail "a topics file with a byte outside ASCII is caught" check_topics "$tmp/utf8.topics.toml" hoodi
 
 replace "$hoodi_env" 'COLLECTOR_NETWORK=hoodi' 'COLLECTOR_NETWORK=sepolia' >"$tmp/named.env"
 expect_fail "a Hoodi env file naming another network is caught" check_env "$tmp/named.env" hoodi
@@ -466,7 +536,9 @@ sudo systemctl daemon-reload
 sudo chown root:root /var/lib/ethswarm-collector
 sudo chmod 0755 /var/lib/ethswarm-collector
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin ethswarm-collector-hoodi
--m 0600 ops/collector/collector-hoodi.url.example"
+-m 0600 ops/collector/collector-hoodi.url.example
+sudo install -o root -g root -m 0644 ops/collector/collector-hoodi.topics.toml.example /etc/ethswarm/collector-hoodi.topics.toml
+must stay root-owned and"
   while IFS= read -r line; do
     if [[ -n $line ]] && ! printf '%s\n' "$MIGRATION" | grep -Fxq -- "$(printf '%s' "$line" | sed 's/^ *//')"; then
       problems+="names the old unit outside its retirement: $line"$'\n'
@@ -486,6 +558,10 @@ grep -Fv 'disable --now ethswarm-collector.service' "$readme" >"$tmp/no-disable.
 expect_fail "a README that never stops the old unit is caught" check_readme "$tmp/no-disable.md"
 grep -Fv 'chown root:root /var/lib/ethswarm-collector' "$readme" >"$tmp/no-chown.md"
 expect_fail "a README that leaves the old state dir owner is caught" check_readme "$tmp/no-chown.md"
+grep -Fv 'collector-hoodi.topics.toml.example /etc' "$readme" >"$tmp/no-topics.md"
+expect_fail "a README that never installs the topics file is caught" check_readme "$tmp/no-topics.md"
+grep -Fv 'must stay root-owned and' "$readme" >"$tmp/no-root-note.md"
+expect_fail "a README without the root-ownership note is caught" check_readme "$tmp/no-root-note.md"
 { cat "$readme"; echo 'sudo systemctl enable --now ethswarm-collector.service'; } >"$tmp/old-unit.md"
 expect_fail "a README that starts the old unit is caught" check_readme "$tmp/old-unit.md"
 { cat "$readme"; echo 'sudo useradd --system ethswarm-collector'; } >"$tmp/shared-user.md"

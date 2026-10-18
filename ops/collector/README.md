@@ -1,10 +1,12 @@
 # Arrival collector (Hoodi and Sepolia reference nodes)
 
 `collector` (`crates/testkit/src/bin/collector.rs`, library `testkit::collector`) records when
-each block, execution payload envelope and data column arrived, on a monotonic and a wall
-clock, stamped before anything decodes it. On the reference host it reads a node's
-`/eth/v1/events` stream; our probe's gossip tap feeds the same collector once the probe has
-one. Offsets are computed from the records afterwards with `collector offsets`.
+each message of the exit-14 topic set arrived (blocks, execution payload envelopes, bids, PTC
+messages, aggregates, the sampled attestation subnets and the custody data columns), on a
+monotonic and a wall clock, stamped before anything decodes it. On the reference host it reads a
+node's `/eth/v1/events` stream; our probe's gossip tap feeds the same collector once the probe
+has one. Offsets are computed from the records afterwards with `collector offsets`, and messages
+and bytes per slot with `collector rates`.
 
 The systemd template `ethswarm-collector@.service` runs one instance per network,
 `ethswarm-collector@hoodi` and `ethswarm-collector@sepolia`, with the same hardening as the
@@ -12,7 +14,7 @@ probe units; each may only reach loopback (`IPAddressAllow=localhost`): its node
 and chronyd on `127.0.0.1:323`. Each instance runs as its own system user,
 `ethswarm-collector-<network>`, so neither can read or write the other's captures (one shared
 user could, even through `/proc/<pid>/root`, which `ProtectProc=invisible` hides only from
-other users). The unit names no node. Each instance reads two files:
+other users). The unit names no node. Each instance reads three files:
 
 | File | Hoodi | Sepolia |
 |---|---|---|
@@ -22,14 +24,22 @@ other users). The unit names no node. Each instance reads two files:
 | `COLLECTOR_NTP` | `chrony` | `chrony` |
 | `/etc/ethswarm/collector-<network>.url` (the instance user's, 0600) | `collector-hoodi.url.example` | `collector-sepolia.url.example` |
 | its one line | `http://127.0.0.1:5053` | `http://127.0.0.1:5052` |
+| `/etc/ethswarm/collector-<network>.topics.toml` (root, 0644) | `collector-hoodi.topics.toml.example` | `collector-sepolia.topics.toml.example` |
+| `sse_events`, `attestation_subnets` | the exit-14 set; the node's subnets | the exit-14 set; the node's subnets |
+
+The topics file is data for the binary (`--topics-file`), not part of the environment, so the
+env file keeps its three keys and its grammar (below). The collector opens it the way it opens
+the URL file and refuses it unless it is a regular file owned by root (or the instance user)
+that group and others may not write, of known event names only; see [Topic set](#topic-set).
 
 The URL file is the only place the reference URL may carry a key: the unit passes its path
 (`--url-file`), never the URL, because `/proc/<pid>/cmdline` is readable by every user. The
-collector opens it without following a symlink and without blocking (`O_NOFOLLOW |
-O_NONBLOCK`, so a FIFO at the path is refused at once instead of hanging the start), then checks
-the open file: a regular file, the one the path named, owned by the user the collector runs as,
-that neither group nor others may access (0600 or 0400). It never prints what the file holds;
-an error names the path and the reason only.
+collector opens it without following a symlink and without blocking (`O_NOFOLLOW | O_NONBLOCK`,
+so a FIFO at the path is refused at once instead of hanging the start), after an `lstat` that
+refuses anything but a regular file (a device node at the path is never opened), then checks the
+open file: a regular file, the one the path named, owned by the user the collector runs as, that
+neither group nor others may access (0600 or 0400). It never prints what the file holds; an
+error names the path and the reason only.
 
 The env file holds no secret, and the unit's guard keeps it inside a grammar small enough that
 the guard and systemd's `EnvironmentFile=` parser read it the same way. It refuses the whole
@@ -50,6 +60,13 @@ The guard checks the file, never the environment systemd built from it: it runs 
 `/usr/bin/env -i`, every tool by its absolute path, so even a `PATH=` line could not make it run
 a planted binary.
 
+The guard does not protect systemd's own reading of the file. systemd reads the env file for
+`EnvironmentFile=` before the guard runs, before the guard has checked a byte of it, so
+`env -i` protects only the guard's shell and the tools it starts. What keeps a hostile line out
+of the file is its permissions: the env file and `/etc/ethswarm` must stay root-owned and
+writable by root only (`install -o root -g root -m 0644` and `-m 0755` below). Check them after
+any change: `stat -c '%U:%G %a %n' /etc/ethswarm /etc/ethswarm/collector-*.env`.
+
 The ports are the `ops/ref-node` defaults (`BEACON_API_PORT`): the reference-node stack runs
 Sepolia and Hoodi side by side on one host, Sepolia's beacon API on 5052 and Hoodi's on 5053.
 A collector reading the wrong one would record the other network's events under its own name,
@@ -67,11 +84,64 @@ so it is refused three times over:
 `/var/lib/ethswarm-collector` itself stays root-owned, mode 0755, as systemd creates it; only
 each instance's directory below it is the instance user's (0750).
 
-`ops/collector/tests/collector-unit.test.sh` (CI) checks the template's hardening, users, env
-and URL files, guard and state directory, that it holds no URL, that each example URL's port is
-the ref-node default, and this README's migration step. It runs the guard on env files with a
-CR, NUL, TAB, VT, FF, non-ASCII byte, quote, backslash, continuation, `export` or `PATH=` line,
-each of which it must refuse, the last without running a tool from that `PATH`.
+`ops/collector/tests/collector-unit.test.sh` (CI) checks the template's hardening, users, env,
+URL and topics files, guard and state directory, that it holds no URL, that each example URL's
+port is the ref-node default, that each example topics file holds the exit-14 events and sampled
+subnets, and this README's migration, topics file install and root-ownership note. It runs the
+guard on env files with a CR, NUL, TAB, VT, FF, non-ASCII byte, quote, backslash, continuation,
+`export` or `PATH=` line, each of which it must refuse, the last without running a tool from
+that `PATH`.
+
+## Topic set
+
+The topics file names the reference node's `/eth/v1/events` topics (beacon-APIs `01e99a6`
+eventstream) and the attestation subnets sampled. The shipped examples subscribe the exit-14
+set (`gloas/p2p-interface.md`), each as the event the node emits when a message passes that
+gossip topic's validation (Lighthouse at the Hoodi pin, `c8ddac7`, emits all of them):
+
+| SSE event | Gossip topic |
+|---|---|
+| `block_gossip` | `beacon_block` |
+| `execution_payload_gossip` | `execution_payload` (the envelope) |
+| `execution_payload_bid` | `execution_payload_bid` |
+| `payload_attestation_message` | `payload_attestation_message` (PTC) |
+| `attestation` | `beacon_aggregate_and_proof` (Lighthouse emits it for verified aggregates) |
+| `single_attestation` | `beacon_attestation_{subnet_id}` |
+| `data_column_sidecar` | `data_column_sidecar_{subnet_id}` (the node's custody and sampled columns) |
+
+- **What the node emits.** At each start the collector asks the node for each event alone. An
+  event the node refuses (`400`: unknown at its version) is not subscribed; it is listed as
+  unsupported in `capture.toml` (`sse_topics_unsupported`), in `summary.toml`
+  (`unsupported_topics`) and in the log. `block_gossip` and `data_column_sidecar` are the
+  fallback: they are required in the file, and a node that refuses either is refused, so a
+  capture always has blocks and columns.
+- **What it did not see.** `summary.toml` lists every subscribed event with its count `n` and
+  bytes, zeros included, and every sampled subnet the same way; those with `n = 0` are listed in
+  `missing_topics`. On Hoodi before the Gloas fork (2026-10-26 17:42:48 UTC, 02:42:48 KST on the
+  27th) `execution_payload_gossip`, `execution_payload_bid` and `payload_attestation_message`
+  are expected there.
+- **Sampled attestation subnets.** A `single_attestation` is recorded only on a subnet in
+  `attestation_subnets`; any other (or one whose subnet is unknown) is counted
+  (`outside_sampled_subnets`), never written. Its subnet is `compute_subnet_for_attestation`
+  from its slot and committee index and the committees per slot, which the collector reads
+  from the node at start (`/eth/v1/beacon/states/head/committees` for the current slot, kept in
+  `capture.toml`; 64 on Hoodi). A node without validators subscribes only its own two subnets,
+  which change every 256 epochs (about 27 h); set `attestation_subnets` to them. The collector
+  reads the node's `attnets` at start (`/eth/v1/node/identity`), keeps them in `capture.toml`
+  (`node_attnets`) and logs every sampled subnet the node does not subscribe:
+
+  ```bash
+  curl -s http://127.0.0.1:5053/eth/v1/node/identity | grep -o '"attnets":"[^"]*"'
+  # "attnets":"0x0003000000000000": bit i%8 of byte i/8 is subnet i, so subnets 8 and 9
+  ```
+
+- **Volume.** On Hoodi (64 committees a slot) aggregates are up to about 1,000 a slot (16
+  aggregators a committee) and two subnets' attestations about as many: roughly 2,000 records a
+  slot of a few hundred bytes, about 0.5 MB a slot or several GB a day. Watch the disk
+  (`df -h /var/lib/ethswarm-collector`); drop `attestation` from the file if it is short. Event
+  JSON is a few hundred bytes, inside every existing bound: the SSE event and name caps, the
+  channel's byte budget, and the subscribed-topic allow-list (an event not subscribed is refused
+  and counted).
 
 ## What a capture holds
 
@@ -80,11 +150,19 @@ Each start of an instance writes a new directory
 
 | File | Content |
 |---|---|
-| `capture.toml` | network, `genesis_time` (read from the node), `SLOT_DURATION_MS`, column subnet count, subscribed events, host, time daemon, start on both clocks |
-| `records.jsonl` | one record per event: `source`, `topic`, `subnet`, `msg_id`, `block_root`, `slot`, `recv_mono_ns`, `recv_wall_ns`, `peer` |
+| `capture.toml` | network, `genesis_time` (read from the node), `SLOT_DURATION_MS`, column subnet count, subscribed and unsupported events, sampled attestation subnets, the node's `attnets`, committees per slot, host, time daemon, start on both clocks |
+| `records.jsonl` | one record per event: `source`, `topic`, `subnet`, `msg_id`, `block_root`, `slot`, `recv_mono_ns`, `recv_wall_ns`, `peer`, `bytes` (the event's JSON for SSE; the message data for gossip) |
 | `gaps.jsonl` | one missing interval per disconnect, and one for the time before the first stream, written when the stream is back |
 | `ntp.jsonl` | the clock error (local minus NTP) from `chronyc tracking`, every 60 s |
-| `summary.toml` | written at stop: record, drop and undecoded counts, and the number and total length of the missing intervals (`gaps.jsonl` lists them) |
+| `summary.toml` | written at stop: record, drop and undecoded counts, the number and total length of the missing intervals (`gaps.jsonl` lists them), and the manifest: `n` and bytes of every subscribed event (`[[topics]]`) and sampled subnet (`[[attestation_subnets]]`), the gaps (`missing_topics`, `unsupported_topics`), and `outside_sampled_subnets` |
+
+`collector rates DIR` prints one JSON line per topic: `n`, `bytes`, `msgs_per_slot` and
+`bytes_per_slot` over the slots the source recorded anything in (a missing interval adds no
+empty slot), and the busiest slot's (`peak_msgs_per_slot`, `peak_bytes_per_slot`); a
+`single_attestation` line per sampled subnet too. A record's slot is the wall-clock slot of its
+arrival. These are the attestation, aggregate and PTC rates (`single_attestation`,
+`attestation`, `payload_attestation_message`). SSE bytes are the event's JSON, not the wire
+size; the probe's gossip tap gives the wire size.
 
 The stream is reconnected with backoff (1 s, doubling, up to 30 s). Beacon nodes do not replay
 missed events, so every disconnect, however short, is a missing interval: from the last bytes
@@ -133,20 +211,25 @@ instance; a Sepolia one is the same with `sepolia` for `hoodi`.
        /etc/systemd/system/ethswarm-collector@.service
    ```
 
-4. Install the instance's env file (root's, 0644: no secret) and URL file (the instance
-   user's, 0600: the collector refuses any other mode or owner). Edit the env file in an editor
-   that keeps LF line ends and ASCII: a CR, a tab or a quote anywhere stops the unit. Keep the URL on the Hoodi node's port; a
-   key, if the node needs one, goes in its path here and nowhere else. On a host that runs
-   systemd-timesyncd instead of chrony, set `COLLECTOR_NTP=timesyncd`.
+4. Install the instance's env file (root's, 0644: no secret), topics file (root's, 0644) and URL
+   file (the instance user's, 0600: the collector refuses any other mode or owner). Edit the env
+   file in an editor that keeps LF line ends and ASCII: a CR, a tab or a quote anywhere stops
+   the unit. Keep the URL on the Hoodi node's port; a key, if the node needs one, goes in its
+   path here and nowhere else. On a host that runs systemd-timesyncd instead of chrony, set
+   `COLLECTOR_NTP=timesyncd`.
 
    ```bash
    sudo install -d -o root -g root -m 0755 /etc/ethswarm
    sudo install -o root -g root -m 0644 ops/collector/collector-hoodi.env.example \
        /etc/ethswarm/collector-hoodi.env
+   sudo install -o root -g root -m 0644 ops/collector/collector-hoodi.topics.toml.example /etc/ethswarm/collector-hoodi.topics.toml
    sudo install -o ethswarm-collector-hoodi -g ethswarm-collector-hoodi \
        -m 0600 ops/collector/collector-hoodi.url.example /etc/ethswarm/collector-hoodi.url
    sudo systemd-analyze verify /etc/systemd/system/ethswarm-collector@hoodi.service
    ```
+
+   Then set `attestation_subnets` in `/etc/ethswarm/collector-hoodi.topics.toml` to the node's
+   subnets (its `attnets`, step 5) with `sudoedit`.
 
 5. Check the node and the clock first: the node answers on the URL file's port and is on
    Hoodi, and `chronyc -n tracking` works as an unprivileged user (it uses `127.0.0.1:323`):
@@ -155,6 +238,7 @@ instance; a Sepolia one is the same with `sepolia` for `hoodi`.
    curl -s http://127.0.0.1:5053/eth/v1/config/spec | grep -o '"CONFIG_NAME":"[^"]*"'
    # "CONFIG_NAME":"hoodi"
    curl -s http://127.0.0.1:5053/eth/v1/beacon/genesis
+   curl -s http://127.0.0.1:5053/eth/v1/node/identity | grep -o '"attnets":"[^"]*"'
    chronyc -n tracking
    ```
 
@@ -166,29 +250,78 @@ instance; a Sepolia one is the same with `sepolia` for `hoodi`.
    journalctl -u ethswarm-collector@hoodi -f
    ```
 
-   The first lines name the capture directory and the subscribed events; an `ntp:` line follows
+   The first lines name the events the node does not emit (if any), the capture directory and
+   the subscribed events; an `ntp:` line follows
    every minute and a `missing interval:` line after every reconnect. An instance that exits at
    once names the reason: `collector-hoodi.env: …` (the env file), `--url-file: …` (the URL
    file's type, owner, mode or content, never the URL), or `the node's CONFIG_NAME is sepolia, not hoodi`
    (the URL reaches the Sepolia node).
 
-## Smoke capture (at least 1 h)
+## Upgrade from the beacon_block-only collector
 
-Let the instance run for at least an hour, then close the capture by restarting it (the
-running capture writes `summary.toml` on SIGTERM; the restart opens a new one):
+On a host that already runs `ethswarm-collector@<network>` from the earlier template (blocks,
+envelopes and columns only): rebuild and reinstall the binary (step 2), install the new
+template and the topics file (steps 3 and 4), then restart. The running capture closes with its
+`summary.toml`; the restart opens one with the new topic set.
 
 ```bash
+git -C ~/eth-swarm fetch && git -C ~/eth-swarm checkout <commit>
+cd ~/eth-swarm
+cargo build --release --locked -p testkit --bin collector
+sudo install -o root -g root -m 0755 target/release/collector /usr/local/bin/collector
+sudo install -o root -g root -m 0644 ops/collector/ethswarm-collector@.service \
+    /etc/systemd/system/ethswarm-collector@.service
+sudo install -o root -g root -m 0644 ops/collector/collector-hoodi.topics.toml.example /etc/ethswarm/collector-hoodi.topics.toml
+sudoedit /etc/ethswarm/collector-hoodi.topics.toml   # attestation_subnets: the node's attnets
+sudo systemd-analyze verify /etc/systemd/system/ethswarm-collector@hoodi.service
+sudo systemctl daemon-reload
 sudo systemctl restart ethswarm-collector@hoodi
+journalctl -u ethswarm-collector@hoodi -n 20 --no-pager
+```
+
+## Smoke capture (at least 1 h)
+
+Run it on Sepolia first (`ethswarm-collector@sepolia`; Sepolia is past its Gloas fork, so every
+topic should have messages), then on Hoodi after the deploy. Start a fresh capture, let it run
+for at least an hour, then close it by restarting the instance (the running capture writes
+`summary.toml` on SIGTERM; the restart opens a new one):
+
+```bash
+net=sepolia   # then hoodi
+sudo systemctl restart ethswarm-collector@$net
+journalctl -u ethswarm-collector@$net -n 20 --no-pager   # unsupported events, unsubscribed subnets
+date -u; sleep 3700; date -u                              # at least an hour
+sudo systemctl restart ethswarm-collector@$net
 # The capture before the newest one (the state directory is 0750, so list it as root).
-dir=$(sudo sh -c 'ls -d /var/lib/ethswarm-collector/hoodi/hoodi-*' | sort | tail -2 | head -1)
-sudo -u ethswarm-collector-hoodi cat "$dir/summary.toml"
-sudo -u ethswarm-collector-hoodi /usr/local/bin/collector offsets "$dir" | tail -1
+dir=$(sudo sh -c "ls -d /var/lib/ethswarm-collector/$net/$net-*" | sort | tail -2 | head -1)
+sudo -u ethswarm-collector-$net cat "$dir/summary.toml"
+sudo -u ethswarm-collector-$net grep -E '^(records|dropped|outside_sampled_subnets|missing_topics|unsupported_topics) ' "$dir/summary.toml"
+sudo -u ethswarm-collector-$net /usr/local/bin/collector rates "$dir"
+sudo -u ethswarm-collector-$net /usr/local/bin/collector offsets "$dir" | tail -1
 ```
 
 The smoke passes with a non-empty `records.jsonl` covering the hour, the missing intervals
-listed, and an NTP line every minute in `ntp.jsonl`. Before Hoodi, the same run works against
-the Sepolia reference node (`ops/ref-node`) with the `ethswarm-collector@sepolia` instance,
-whose pinned genesis the collector also checks against the node's.
+listed, an NTP line every minute in `ntp.jsonl`, and `n > 0` for every subscribed event and
+sampled subnet (`missing_topics = []`, `unsupported_topics = []`), or the report names each one
+in `missing_topics` and `unsupported_topics` and why (on Hoodi before the fork, the Gloas
+events; a sampled subnet the node does not subscribe). Before Hoodi, the same run works against
+the Sepolia reference node (`ops/ref-node`), whose pinned genesis the collector also checks
+against the node's.
+
+## Hoodi deploy (before 2026-10-27 02:42:48 KST)
+
+On the Hoodi reference host, after the Sepolia smoke passed and with the Hoodi node synced on
+`127.0.0.1:5053`: a host without the collector runs [Install](#install) steps 1 to 6; a host
+that runs the earlier template runs [Upgrade](#upgrade-from-the-beacon_block-only-collector).
+Then:
+
+```bash
+systemctl is-active ethswarm-collector@hoodi
+sudo -u ethswarm-collector-hoodi sh -c 'cat /var/lib/ethswarm-collector/hoodi/hoodi-*/capture.toml' | tail -20
+```
+
+Run the smoke capture with `net=hoodi` and fill the deploy log below. Leave the instance
+running across the fork: from the fork's first slot the Gloas events leave `missing_topics`.
 
 ## Deploy log
 
@@ -202,6 +335,8 @@ reference node:        the URL file's port, and the node's CONFIG_NAME (curl …
 collector sha256:      $(sha256sum /usr/local/bin/collector)
 unit sha256:           $(sha256sum /etc/systemd/system/ethswarm-collector@.service)
 env file sha256:       $(sudo sha256sum /etc/ethswarm/collector-hoodi.env)
+topics file sha256:    $(sha256sum /etc/ethswarm/collector-hoodi.topics.toml)
+unsupported / missing: unsupported_topics and missing_topics from summary.toml
 git commit:            <commit the binary was built from>
 smoke capture:         /var/lib/ethswarm-collector/hoodi/hoodi-<start>/  (start, stop, duration)
 records / undecoded / dropped:  from summary.toml
@@ -218,5 +353,6 @@ first:
 
 ```bash
 ssh -N -L 5053:127.0.0.1:5053 ref-host &
-collector sse --network hoodi --url http://127.0.0.1:5053 --out ./captures --host "$(hostname)" --ntp none
+collector sse --network hoodi --url http://127.0.0.1:5053 --out ./captures --host "$(hostname)" --ntp none \
+    --topics-file ops/collector/collector-hoodi.topics.toml.example
 ```

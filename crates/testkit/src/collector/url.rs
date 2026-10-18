@@ -107,31 +107,13 @@ impl ReferenceApiUrl {
 
     /// [`ReferenceApiUrl::read_file`] for a process whose effective UID is `euid`.
     fn read_file_as(path: &Path, euid: u32) -> Result<Self, UrlFileError> {
-        use rustix::fs::{Mode, OFlags};
         use std::io::Read;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let bad = |reason: String| UrlFileError {
             path: path.display().to_string(),
             reason,
         };
-        let before = std::fs::symlink_metadata(path).map_err(|e| bad(format!("open: {e}")))?;
-        if before.file_type().is_symlink() {
-            return Err(bad("a symlink (want a regular file)".into()));
-        }
-        // NOFOLLOW: a symlink swapped in after the lstat is not followed. NONBLOCK: a FIFO at
-        // the path is opened at once and refused below, instead of blocking until a writer
-        // comes. Every check after this one is on the open file.
-        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-        let fd = rustix::fs::open(path, flags, Mode::empty())
-            .map_err(|e| bad(format!("open: {}", std::io::Error::from(e))))?;
-        let file = std::fs::File::from(fd);
-        let meta = file.metadata().map_err(|e| bad(format!("stat: {e}")))?;
-        if !meta.is_file() {
-            return Err(bad("not a regular file".into()));
-        }
-        if (meta.dev(), meta.ino()) != (before.dev(), before.ino()) {
-            return Err(bad("replaced while it was opened".into()));
-        }
+        let (file, meta) = open_regular_file(path).map_err(bad)?;
         if meta.uid() != euid {
             return Err(bad(format!("owned by uid {}, want {euid}", meta.uid())));
         }
@@ -174,6 +156,54 @@ impl ReferenceApiUrl {
     pub fn base_path(&self) -> &str {
         &self.base
     }
+}
+
+/// Opens `path` for reading if it is a regular file, and returns it with its metadata; the
+/// error is why not (the caller names the path).
+///
+/// The lstat comes first and refuses anything but a regular file, before any open: a symlink,
+/// a FIFO, a socket, a directory, and above all a device node, which an open alone can act on.
+/// The open then follows no symlink (`O_NOFOLLOW`: one swapped in after the lstat) and does not
+/// block (`O_NONBLOCK`: a FIFO swapped in is opened at once), and the open file must still be a
+/// regular file and the one the lstat saw. Every check after the open is on the open file.
+pub(crate) fn open_regular_file(path: &Path) -> Result<(std::fs::File, std::fs::Metadata), String> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let before = std::fs::symlink_metadata(path).map_err(|e| format!("open: {e}"))?;
+    let kind = before.file_type();
+    if kind.is_symlink() {
+        return Err("a symlink (want a regular file)".into());
+    }
+    if !kind.is_file() {
+        let what = if kind.is_dir() {
+            "a directory"
+        } else if kind.is_char_device() {
+            "a character device"
+        } else if kind.is_block_device() {
+            "a block device"
+        } else if kind.is_fifo() {
+            "a FIFO"
+        } else if kind.is_socket() {
+            "a socket"
+        } else {
+            "an unknown file type"
+        };
+        return Err(format!(
+            "not a regular file ({what}), refused before opening"
+        ));
+    }
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = rustix::fs::open(path, flags, Mode::empty())
+        .map_err(|e| format!("open: {}", std::io::Error::from(e)))?;
+    let file = std::fs::File::from(fd);
+    let meta = file.metadata().map_err(|e| format!("stat: {e}"))?;
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    if (meta.dev(), meta.ino()) != (before.dev(), before.ino()) {
+        return Err("replaced while it was opened".into());
+    }
+    Ok((file, meta))
 }
 
 /// The addresses of a loopback `host`, without a lookup: `localhost` (any case) is `127.0.0.1`
@@ -373,6 +403,25 @@ mod tests {
             .to_string();
         assert!(err.starts_with(&fifo.display().to_string()), "{err}");
         assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    #[test]
+    fn a_device_node_at_the_url_file_path_is_refused_before_it_is_opened() {
+        // The early lstat names what is at the path: a device is refused from it, never
+        // opened (an open alone can act on a device). The check after the open would only say
+        // "not a regular file".
+        let err = ReferenceApiUrl::read_file(Path::new("/dev/null"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "/dev/null: not a regular file (a character device), refused before opening"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let err = ReferenceApiUrl::read_file(dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.ends_with("not a regular file (a directory), refused before opening"));
     }
 
     #[test]
