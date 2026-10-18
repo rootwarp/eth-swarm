@@ -1,0 +1,91 @@
+# ethereum-package args: a Gloas-from-genesis devnet, minimal preset, two CL/EL pairs.
+# Built on ethereum-package's .github/tests/buildoor-genesis-builder.yaml (Gloas at genesis, one
+# genesis-registered ePBS builder driven by buildoor) and buildoor-instances.yaml (Lighthouse +
+# Geth and Lodestar + Geth). Run it at the package commit pinned in README.md; the README also
+# records the evidence behind every image pin and the reproducibility procedure.
+#
+# Every image is pinned as repo:tag@sha256:<index digest> and none is left to a package default
+# (scripts/check-kurtosis-pins.sh, run in CI, fails otherwise). Digests were read on 2026-10-18
+# with `docker buildx imagetools inspect <repo:tag>` (multi-arch index: linux/amd64 + arm64).
+participants:
+  # Lighthouse unstable at sigp/lighthouse c8ddac7, whose ef_tests pin consensus-specs
+  # v1.7.0-beta.4. ethpandaops builds include the spec-minimal feature (sigp/lighthouse release
+  # images do not, so they cannot run the minimal preset). The supernode custodies every column
+  # group: the package requires one under Fulu when no node has 128 validators, and it lets the
+  # probe fetch any column.
+  - el_type: geth
+    el_image: ethereum/client-go:v1.17.8@sha256:abf3605177f8bdcfce436985a8054cca4ae59256323a4ffb72c56c04f3d1fadd
+    cl_type: lighthouse
+    cl_image: ethpandaops/lighthouse:unstable-c8ddac7@sha256:5b666c7b7d18454828a205bd94edd76c8d19068d62365c0fa676980cdd548bdd
+    vc_type: lighthouse
+    vc_image: ethpandaops/lighthouse:unstable-c8ddac7@sha256:5b666c7b7d18454828a205bd94edd76c8d19068d62365c0fa676980cdd548bdd
+    supernode: true
+  # Lodestar unstable at ChainSafe/lodestar b3beff2, whose spec tests pin v1.7.0-beta.4
+  # (the issue's override of chainsafe/lodestar:latest; same digest as ethpandaops/lodestar:unstable
+  # on 2026-10-18). Lodestar picks the minimal preset at runtime (LODESTAR_PRESET, set by the
+  # package).
+  - el_type: geth
+    el_image: ethereum/client-go:v1.17.8@sha256:abf3605177f8bdcfce436985a8054cca4ae59256323a4ffb72c56c04f3d1fadd
+    cl_type: lodestar
+    cl_image: ethpandaops/lodestar:unstable-b3beff2@sha256:679d32d0f390840ae95b89d55bc1329f913e4a0da933faf0afd09e483dd08036
+    vc_type: lodestar
+    vc_image: ethpandaops/lodestar:unstable-b3beff2@sha256:679d32d0f390840ae95b89d55bc1329f913e4a0da933faf0afd09e483dd08036
+
+network_params:
+  # minimal: 6 s slots and 8-slot epochs, so finalized epoch 3 comes within minutes. Both pinned
+  # CL images run it; a node built for mainnet only (sigp/lighthouse, a mainnet-only probe build)
+  # cannot follow this chain.
+  preset: minimal
+  network_id: "3151908"
+  fulu_fork_epoch: 0
+  # The package default (2^64 - 1) leaves Gloas off.
+  gloas_fork_epoch: 0
+  # One builder in the genesis state (needs gloas_fork_epoch: 0); buildoor runs it.
+  builder_count: 1
+  builder_keys_mnemonic: "baby envelope toddler valid pottery buddy cash spare such hedgehog ring ramp item seminar rely select advance knife cruel cereal left father model tissue"
+  # Reproducible validator set: a fixed mnemonic, 64 keys per participant (128 validators),
+  # no shuffling. With the same genesis_time, two runs build the same genesis state.
+  preregistered_validator_keys_mnemonic: "giant issue aisle success illegal bike spike question tent bar rely arctic volcano long crawl hungry vocal artwork sniff fantasy very lucky have athlete"
+  num_validator_keys_per_node: 64
+  preregistered_validator_count: 0
+  shuffle_genesis_validators: false
+  # genesis_time 0: genesis is now + genesis_delay (plus the package's startup padding), so a
+  # single run works as is. For the two-run genesis root check, render a copy with one fixed
+  # genesis_time for both runs (README.md, "Reproducible genesis").
+  genesis_delay: 120
+  genesis_time: 0
+
+buildoor_params:
+  image: ethpandaops/buildoor:main-9f07c67@sha256:0352e947054d3195e43e8cb46b8704e16395779ba79c25d2369accb54b0bf87a
+  builder_api: false
+  epbs_builder: true
+  lifecycle: true
+  instances:
+    - participant: 1
+      count: 1
+
+additional_services:
+  - buildoor
+  - dora
+  - spamoor
+
+# Blob transactions every slot, so Fulu/Gloas blocks carry data columns.
+spamoor_params:
+  image: ethpandaops/spamoor:master-ca48df9@sha256:04e15158b1d1f941d4ff4cfc82f49c5150c23e16498f42fca95267e9c579e041
+  start_chainload: false
+  spammers:
+    - scenario: blobs
+      config:
+        throughput: 2
+        sidecars: 2
+        max_pending: 8
+    - scenario: eoatx
+      config:
+        throughput: 2
+
+dora_params:
+  image: ethpandaops/dora:master-28dc4c9@sha256:8a5a6af437f731bda765f7f4e43c425fc41909794db2723f3a9555881fc5aaf0
+
+# Builds the EL and CL genesis: pinned, so a newer generator cannot move the genesis root.
+ethereum_genesis_generator_params:
+  image: ethpandaops/ethereum-genesis-generator:6.2.6@sha256:f9a6d6b3a54942d3adbf057435a230241261d1af7d963637962d1644c29408cb

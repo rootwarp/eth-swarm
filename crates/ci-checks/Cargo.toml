@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "CI gates: GitHub Actions workflow hardening, plus tests for the CI shell scripts."
+description = "CI gates: GitHub Actions workflow hardening, Kurtosis devnet image pins, plus tests for the CI shell scripts."
 
 [dependencies]
 # default-features off drops encoding_rs; workflows are UTF-8.
@@ -18,3 +18,7 @@ toml = "0.8"
 [[bin]]
 name = "check-workflows"
 path = "src/main.rs"
+
+[[bin]]
+name = "check-kurtosis-pins"
+path = "src/kurtosis_main.rs"

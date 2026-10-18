@@ -33,6 +33,10 @@ jobs:
         run: bash scripts/tests/check-locked.test.sh && bash scripts/check-locked.sh
       - name: Sepolia reference node scripts and compose file (offline, stub commands)
         run: bash ops/sepolia-ref/tests/sepolia-ref.test.sh
+      - name: Kurtosis devnet images pinned by tag and digest (testing/kurtosis/*.yaml)
+        run: bash scripts/check-kurtosis-pins.sh
+      - name: Kurtosis devnet checker (offline, stub kurtosis and curl)
+        run: bash testing/kurtosis/tests/check-devnet.test.sh
 
   proto:
     name: buf lint, build, breaking vs develop, baseline drift

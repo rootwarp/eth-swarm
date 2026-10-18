@@ -31,6 +31,8 @@ use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
 use yaml_rust2::scanner::Marker;
 use yaml_rust2::{Yaml, YamlLoader};
 
+pub mod kurtosis;
+
 /// One broken rule, reported as `ERROR <file>[:<line>]: <message>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Violation {
@@ -58,6 +60,17 @@ pub struct Report {
 /// Checks every `*.yml` / `*.yaml` file directly in `dir`. An unreadable directory or one
 /// without workflow files is an error, never a pass.
 pub fn check_dir(dir: &Path) -> Result<Report, String> {
+    check_yaml_dir(dir, "workflow files", check_workflow)
+}
+
+/// Runs `check(file name, text)` on every `*.yml` / `*.yaml` file directly in `dir`, sorted.
+/// An unreadable directory or file, or no such file at all (`no <what> in <dir>`), is an
+/// error, so an empty or mistyped directory never passes.
+pub(crate) fn check_yaml_dir(
+    dir: &Path,
+    what: &str,
+    check: fn(&str, &str) -> Vec<Violation>,
+) -> Result<Report, String> {
     let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut paths = Vec::new();
     for entry in entries {
@@ -71,7 +84,7 @@ pub fn check_dir(dir: &Path) -> Result<Report, String> {
         }
     }
     if paths.is_empty() {
-        return Err(format!("no workflow files in {}", dir.display()));
+        return Err(format!("no {what} in {}", dir.display()));
     }
     paths.sort();
     let mut violations = Vec::new();
@@ -81,7 +94,7 @@ pub fn check_dir(dir: &Path) -> Result<Report, String> {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        violations.extend(check_workflow(&name, &text));
+        violations.extend(check(&name, &text));
     }
     Ok(Report {
         files: paths.len(),
