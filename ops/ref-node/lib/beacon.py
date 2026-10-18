@@ -1,9 +1,9 @@
 """Verdicts on beacon API answers for the reference node (ops/ref-node, Sepolia or Hoodi).
 
 Shared by preflight.sh (against the checkpoint-sync providers) and collect-run-log.sh (against
-the local node). Every command reads files the caller fetched, prints its evidence on stdout
-and exits 0 on a pass, 1 on a fail, 2 on a usage or input error. Standard library only, run
-with `python3 -I`.
+the local node). Every command reads files the caller fetched, at most MAX_ANSWER bytes of
+each (a larger one is an input error), prints its evidence on stdout and exits 0 on a pass, 1
+on a fail, 2 on a usage or input error. Standard library only, run with `python3 -I -B`.
 
     spec-diff PINNED_YAML SPEC_JSON
         /eth/v1/config/spec against the pinned network-config YAML: every *_FORK_VERSION and
@@ -66,6 +66,8 @@ import re
 import sys
 
 FAR_FUTURE_EPOCH = 2**64 - 1
+# The largest answer read, the bound lib/common.sh FETCH_MAX_BYTES puts on curl.
+MAX_ANSWER = 1048576  # bytes
 FORK_KEY = re.compile(r"^[A-Z][A-Z0-9_]*_FORK_(VERSION|EPOCH)$")
 TOP_LEVEL = re.compile(r"^([A-Z][A-Z0-9_]*):(?:[ \t]+(.*))?$")
 ITEM_FIELD = re.compile(r"^[ \t]*(-[ \t]+)?([A-Z][A-Z0-9_]*):[ \t]+(\S+)$")
@@ -171,10 +173,18 @@ def show(value):
     return value if isinstance(value, str) and re.fullmatch(r"[0-9]+|0[xX][0-9a-fA-F]+", value) else json.dumps(value)
 
 
+def read_answer(path):
+    """The file's text, at most MAX_ANSWER bytes; a larger file is an input error."""
+    with open(path, "rb") as f:
+        data = f.read(MAX_ANSWER + 1)
+    if len(data) > MAX_ANSWER:
+        raise InputError(f"{path}: larger than {MAX_ANSWER} bytes")
+    return data.decode("utf-8")
+
+
 def load_json(path):
     try:
-        with open(path, encoding="utf-8") as f:
-            doc = json.load(f)
+        doc = json.loads(read_answer(path))
     except (OSError, ValueError) as e:
         raise InputError(f"{path}: not a JSON answer ({e.__class__.__name__})") from None
     if isinstance(doc, dict) and isinstance(doc.get("data"), dict):
@@ -445,8 +455,7 @@ def own_namespace(mode, may_join):
 
 def container(inspect_path, service, data_root, uid, gid, pinned_id):
     try:
-        with open(inspect_path, encoding="utf-8") as f:
-            doc = json.load(f)
+        doc = json.loads(read_answer(inspect_path))
     except (OSError, ValueError):
         raise InputError("the docker inspect output is not JSON") from None
     c = doc[0] if isinstance(doc, list) and doc else doc

@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # One-time host setup for the reference node (compose.yaml) of the .env's NETWORK (sepolia or
 # hoodi), run as root. Idempotent:
-#   0. refuses, before it changes anything, an .env with a line compose would read differently
-#      (lib/common.sh env_check) or a NETWORK it does not know, --test-mode as root, a
-#      DATA_ROOT with whitespace or a backslash, and any DATA_ROOT that lib/fsguard.py cannot
-#      prove safe: relative, a . or .. component, a symlink anywhere from / down, a directory
-#      on the way not owned by root or open to group or others (unless root-owned and sticky,
-#      like /tmp), a DATA_ROOT open to group or others (so not /tmp itself), or below it a
-#      symlink, a wrong type, a hard-linked JWT, a foreign owner, or a .staging that is not an
-#      empty 0700 directory.
+#   0. reads the .env once, through lib/fsguard.py read-file (the walk from / described below
+#      for the .env directory, then the file O_NOFOLLOW|O_NONBLOCK: a regular file with one
+#      link owned by root or the sudo user, so never through a symlink or a hard link, and
+#      never blocking on a FIFO), and works only on that copy, in a temp directory under /tmp
+#      (never TMPDIR). Then it refuses, before it changes anything, an .env with a
+#      line compose would read differently (lib/common.sh env_check) or a NETWORK it does not
+#      know, --test-mode as root, a DATA_ROOT with whitespace or a backslash, and any
+#      DATA_ROOT that lib/fsguard.py cannot prove safe: relative, a . or .. component, a
+#      missing directory above it (setup.sh creates DATA_ROOT at most, never a parent), a
+#      symlink anywhere from / down, a directory on the way not owned by root or open to group
+#      or others (unless root-owned and sticky, like /tmp), a DATA_ROOT open to group or
+#      others (so not /tmp itself), or below it a symlink, a wrong type, a hard-linked JWT, a
+#      foreign owner, or a .staging that is not an empty 0700 directory.
 #      fsguard walks every component through directory descriptors (openat, O_NOFOLLOW) and
 #      changes things only through them, so nothing checked is resolved again. The .env
 #      directory gets the same walk: no symlink from / down to it, and every directory on the
@@ -17,8 +22,8 @@
 #   1. creates the network's system users (no login shell, no home) unless they exist:
 #      `reth` and `lighthouse` on Sepolia, `reth-<network>` and `lighthouse-<network>` on any
 #      other network (lib/common.sh service_user), so two networks never share a user;
-#   2. creates DATA_ROOT (0755) if missing, and DATA_ROOT/{reth,lighthouse}/data, each level
-#      owned by its service user, mode 0700;
+#   2. creates DATA_ROOT (0755) if missing (its parent must exist), and
+#      DATA_ROOT/{reth,lighthouse}/data, each level owned by its service user, mode 0700;
 #   3. writes ONE 32-byte hex JWT secret (os.urandom) as two copies, DATA_ROOT/reth/jwt.hex
 #      and DATA_ROOT/lighthouse/jwt.hex, each 0600 and owned by its service user, created
 #      O_EXCL in DATA_ROOT/.staging (root only, 0700), chowned there and renamed into place.
@@ -31,10 +36,11 @@
 #   5. verifies every mode and owner it set.
 #
 # Usage: sudo ops/ref-node/setup.sh [--root DIR] [--env-file FILE] [--rotate-jwt] [--test-mode]
-#   --root DIR       DATA_ROOT (absolute); default: DATA_ROOT from .env, else /srv/ethswarm-ref
-#                    on Sepolia and /srv/ethswarm-ref-<network> elsewhere
-#   --env-file FILE  default: .env next to this script; it must exist (cp .env.example .env),
-#                    in a directory only root or the sudo user can change
+#   --root DIR       DATA_ROOT (absolute, its parent existing); default: DATA_ROOT from .env,
+#                    else /srv/ethswarm-ref on Sepolia and /srv/ethswarm-ref-<network> elsewhere
+#   --env-file FILE  default: .env next to this script; it must exist (cp .env.example .env) as
+#                    a regular file with one link, in a directory only root or the sudo user
+#                    can change
 #   --rotate-jwt     replace the secret (restart both services afterwards)
 #   --test-mode      not as root (refused): create no users and chown nothing, record the
 #                    caller's own uid and gid for both services, and accept directories it owns
@@ -51,7 +57,7 @@ umask 077
 
 usage() { sed -n 's/^# \{0,1\}//; /^Usage:/,/^Exit:/p' "$0" | sed '$d' >&2; exit 2; }
 refuse() { echo "ERROR: $*" >&2; exit 2; }
-fsguard() { python3 -I "$here/lib/fsguard.py" "$@"; }
+fsguard() { python3 -I -B "$here/lib/fsguard.py" "$@"; }
 
 root='' env_file="$here/.env" rotate=0 test_mode=0
 while (($# > 0)); do
@@ -64,29 +70,31 @@ while (($# > 0)); do
   esac
 done
 
-[[ -f $env_file ]] || refuse "$env_file: no such file (cp .env.example .env and fill it first)"
-env_check "$env_file" >&2 || refuse "$env_file: fix the lines above"
-network=$(env_get "$env_file" NETWORK)
+# The .env directory as given (never resolved: fsguard refuses a symlink on its path), made
+# absolute against the physical working directory, and the sudo user who may own it.
+env_dir=$(abs_dir "$(dirname -- "$env_file")") env_name=$(basename -- "$env_file")
+operator=$(sudo_operator)
+euid=$(id -u)
+# The .env, read once through fsguard into a private copy that every step below uses: a path
+# read could follow a symlink planted there, block on a FIFO, or see another file the second
+# time. The temp directory is under /tmp whatever TMPDIR says (sudo -E could carry an
+# operator-owned one).
+work=$(mktemp -d /tmp/ref-node.XXXXXX)
+trap 'rm -rf "$work"' EXIT
+env_copy="$work/env"
+read_env "$here/lib/fsguard.py" "$env_file" "$env_copy" ||
+  refuse "$env_file: not read (it must be a regular file with one link, owned by root or you: cp .env.example .env and fill it first)"
+env_check "$env_copy" "$env_file" >&2 || refuse "$env_file: fix the lines above"
+network=$(env_get "$env_copy" NETWORK)
 network_known "$network" || refuse "NETWORK must be sepolia or hoodi (in $env_file)"
 reth_user=$(service_user "$network" reth) lh_user=$(service_user "$network" lighthouse)
-[[ -n $root ]] || root=$(env_get "$env_file" DATA_ROOT)
+[[ -n $root ]] || root=$(env_get "$env_copy" DATA_ROOT)
 root=${root:-$(default_data_root "$network")}
 root=${root%/}
 # A backslash is refused too: nothing that reads DATA_ROOT back may decode it as an escape.
 if [[ $root != /* || $root =~ [[:space:]] || $root == *\\* ]]; then
   refuse "DATA_ROOT must be an absolute path without whitespace or a backslash"
 fi
-# The .env directory as given (never resolved: fsguard refuses a symlink on its path), made
-# absolute against the physical working directory, and the sudo user who may own it.
-env_dir=$(dirname -- "$env_file") env_name=$(basename -- "$env_file")
-case $env_dir in
-  /*) ;;
-  .) env_dir=$(pwd -P) ;;
-  *) env_dir=$(pwd -P)/$env_dir ;;
-esac
-operator=-1
-if [[ ${SUDO_UID:-} =~ ^[0-9]+$ ]]; then operator=$SUDO_UID; fi
-euid=$(id -u)
 if ((test_mode)) && ((euid == 0)); then
   refuse "--test-mode is not for root (it would record uid 0 for both services)"
 fi
@@ -150,7 +158,7 @@ SETUP_SETS="DATA_ROOT=$root RETH_UID=$reth_uid RETH_GID=$reth_gid LIGHTHOUSE_UID
     print
   }
   END { for (i = 1; i <= n; i++) if (!(key[i] in done)) print line[key[i]] }
-' "$env_file" | fsguard write-file "$env_dir" "$env_name" "$euid" "$operator" || exit 2
+' "$env_copy" | fsguard write-file "$env_dir" "$env_name" "$euid" "$operator" || exit 2
 echo "env: $env_file (DATA_ROOT, RETH_UID/GID, LIGHTHOUSE_UID/GID)"
 got=$(file_mode_uid "$env_file")
 if [[ $got != "600 $euid" ]]; then

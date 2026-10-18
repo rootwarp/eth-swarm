@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # Pre-flight for the reference node of the .env's NETWORK (sepolia or hoodi): run (as root,
-# after setup.sh) before `docker compose up`. An .env with a line compose would read
-# differently from these scripts (lib/common.sh env_check: `export`, indentation, a key twice,
-# a $ or backtick in a value, any COMPOSE_* key), a NETWORK other than sepolia or hoodi, or a
-# COMPOSE_PROJECT_NAME in the environment is refused outright (exit 2). Otherwise every check runs and prints one line; any FAIL fails:
+# after setup.sh) before `docker compose up`. It reads the .env once, through lib/fsguard.py
+# read-file (lib/common.sh read_env: no symlink, FIFO or hard link, a directory and file only
+# root or the sudo user own), and checks only that private copy; its temp files go under
+# /tmp, never TMPDIR. An .env that cannot be read so, one compose would read differently from
+# these scripts (lib/common.sh env_check: a byte other than printable ASCII and LF, `export`,
+# indentation, a key twice, a blank, quote, backslash, #, $ or backtick in a value, any
+# COMPOSE_* key), a NETWORK other than sepolia or hoodi, or any COMPOSE_* or DOCKER_* variable
+# in the environment (lib/common.sh docker_env_check: another project, compose file or daemon
+# than the one checked) is refused outright (exit 2). Otherwise every check runs and prints
+# one line; any FAIL fails:
 #   - RETH_IMAGE and LIGHTHOUSE_IMAGE are pinned as repo:tag@sha256:<64 lower-case hex>, and
 #     README.md's release-note table for the network has a row for each image (by digest)
 #     that says the release schedules the network's Gloas / Amsterdam fork;
@@ -12,19 +18,23 @@
 #   - the five ports (lib/common.sh PORT_KEYS) are decimal 1-65535 and distinct;
 #   - CHECKPOINT_SYNC_URL (provider 1, which Lighthouse syncs from) and CHECKPOINT_SYNC_URL_2
 #     (provider 2: required on Hoodi, optional on Sepolia) are https:// (or http:// to a
-#     loopback host), with no query or fragment (the API path is appended to them; a
-#     provider key goes in the path), and on two different hosts; TRUSTED_PEERS is empty or
-#     a comma-separated list of base58 peer IDs;
+#     loopback host), with no query or fragment (the API path is appended to them), no
+#     credentials and no path that may hold a provider key (more than one segment, or one of
+#     16 or more characters): CHECKPOINT_SYNC_URL is on Lighthouse's command line, which any
+#     local user reads in ps, so a keyed provider goes behind a local proxy (README.md). They
+#     are on two different hosts; TRUSTED_PEERS is empty or a comma-separated list of base58
+#     peer IDs;
 #   - the ids setup.sh recorded are numbers and no uid is 0 (in --test-mode too); outside
 #     --test-mode RETH_UID and LIGHTHOUSE_UID are distinct and the uids of the network's users
 #     (lib/common.sh service_user: reth and lighthouse on Sepolia, reth-hoodi and
 #     lighthouse-hoodi on Hoodi), and RETH_GID and LIGHTHOUSE_GID are non-zero, distinct and
 #     their gids;
-#   - the data directories are 0700 and the JWT copies 0600, each owned by its service's uid,
-#     and both copies hold the same 64-hex secret. The copies are opened only through
-#     lib/fsguard.py (inspect, same-secret: no symlink anywhere on the path, non-blocking, a
-#     regular file with one link), so a link or a FIFO planted there fails instead of blocking
-#     or reading another file; the secret is never printed;
+#   - the data directories are 0700 directories and the JWT copies 0600, each owned by its
+#     service's uid, and both copies hold the same 64-hex secret. Both are opened only through
+#     lib/fsguard.py (inspect-dir; inspect, same-secret: no symlink anywhere on the path, a
+#     directory or else non-blocking and a regular file with one link), so a link, a file or
+#     a FIFO planted there fails instead of blocking or reading another file; the secret is
+#     never printed;
 #   - each provider's /eth/v1/config/spec matches the network's pinned config (lib/beacon.py
 #     spec-diff: every *_FORK_VERSION, *_FORK_EPOCH and the BLOB_SCHEDULE). Public endpoints
 #     have served pre-Gloas configs, so an endpoint is checked before it is used;
@@ -32,9 +42,11 @@
 #     (/eth/v1/beacon/headers/finalized, then /eth/v1/beacon/headers/<its slot>) with the
 #     same block root and header state_root, canonical (lib/beacon.py anchor-compare).
 # It also prints the configured ports and the free space under DATA_ROOT (df), for the
-# operator's own headroom check. The checkpoint URLs may carry a provider key in their path (a
-# query is refused): they are printed as scheme://host only, handed to curl on stdin (never
-# argv) and curl's messages are dropped.
+# operator's own headroom check, and the start command (`docker compose -p <network>-ref
+# --env-file <.env> -f <compose.yaml> up -d`, each word shell-quoted for pasting). The
+# checkpoint URLs are printed as scheme://host only, handed to curl on stdin (never argv;
+# lib/common.sh fetch, which reads no ~/.curlrc, uses no proxy and keeps no answer over 1 MiB)
+# and curl's messages are dropped.
 # A --test-mode pass prints "preflight OK (test mode: not a deployment gate)".
 #
 # Usage: ops/ref-node/preflight.sh [--env-file FILE] [--config YAML] [--test-mode]
@@ -59,45 +71,49 @@ while (($# > 0)); do
     *) usage ;;
   esac
 done
-if [[ ! -f $env_file ]]; then
-  echo "ERROR: $env_file: no such file (cp .env.example .env, fill it, run setup.sh)" >&2
+# The .env, read once through fsguard into a private copy every check below reads (lib/common.sh
+# read_env), in a temp directory under /tmp whatever TMPDIR says.
+work=$(mktemp -d /tmp/ref-node.XXXXXX)
+trap 'rm -rf "$work"' EXIT
+envc="$work/env"
+if ! read_env "$here/lib/fsguard.py" "$env_file" "$envc"; then
+  echo "ERROR: $env_file: not read (cp .env.example .env, fill it, run setup.sh; a regular file with one link, owned by root or you)" >&2
   exit 2
 fi
-if ! env_check "$env_file" >&2; then
+if ! env_check "$envc" "$env_file" >&2; then
   echo "ERROR: $env_file: fix the lines above" >&2
   exit 2
 fi
-network=$(env_get "$env_file" NETWORK)
+network=$(env_get "$envc" NETWORK)
 if ! network_known "$network"; then
   echo "ERROR: NETWORK must be sepolia or hoodi (in $env_file)" >&2
   exit 2
 fi
-if ! msg=$(project_env_check); then
-  echo "ERROR: $msg" >&2
-  exit 2
-fi
+docker_env_check >&2 || exit 2
 config=${config:-$here/../../crates/network-config/networks/$network/config.yaml}
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
 
 fail=0
 pass() { echo "$1: PASS"; }
 flunk() { echo "$1: FAIL"; fail=1; }
-fsguard() { python3 -I "$here/lib/fsguard.py" "$@"; }
-helper() { python3 -I "$here/lib/beacon.py" "$@"; }
+fsguard() { python3 -I -B "$here/lib/fsguard.py" "$@"; }
+helper() { python3 -I -B "$here/lib/beacon.py" "$@"; }
 
 if [[ $(uname -s) != Linux ]]; then
   echo "WARN: compose.yaml uses network_mode: host, which needs a Linux host"
 fi
 echo "network: $network (pinned config $(basename "$(dirname "$config")")/$(basename "$config"))"
-echo "compose project: $(compose_project "$network") (docker compose -p $(compose_project "$network") --env-file $env_file)"
+echo "compose project: $(compose_project "$network")"
+# The start command, each word shell-quoted (printf %q): it is pasted into a shell, and the
+# .env path is the operator's.
+start=(docker compose -p "$(compose_project "$network")" --env-file "$env_file" -f "$here/compose.yaml" up -d)
+printf 'start:' && printf ' %q' "${start[@]}" && printf '\n'
 
 # The shell environment must not override .env (names only, values are never printed).
-while IFS= read -r line; do flunk "${line%: FAIL}"; done < <(env_overrides "$env_file" || true)
+while IFS= read -r line; do flunk "${line%: FAIL}"; done < <(env_overrides "$envc" || true)
 
 # Images, and what README.md's release notes say about the network's fork.
 for key in RETH_IMAGE LIGHTHOUSE_IMAGE; do
-  image=$(env_get "$env_file" "$key")
+  image=$(env_get "$envc" "$key")
   if ! image_pinned "$image"; then
     flunk "$key: not pinned as repo:tag@sha256:<64 hex>"
     continue
@@ -116,29 +132,39 @@ for key in RETH_IMAGE LIGHTHOUSE_IMAGE; do
 done
 
 # Ports.
-while IFS= read -r line; do flunk "$line"; done < <(ports_check "$env_file" || true)
-port() { env_get "$env_file" "$1"; }
+while IFS= read -r line; do flunk "$line"; done < <(ports_check "$envc" || true)
+port() { env_get "$envc" "$1"; }
 echo "ports: Engine API 127.0.0.1:$(port ENGINE_PORT), Beacon API 127.0.0.1:$(port BEACON_API_PORT)," \
   "p2p reth $(port RETH_P2P_PORT) tcp/udp, lighthouse $(port LIGHTHOUSE_P2P_PORT) tcp/udp and $(port LIGHTHOUSE_QUIC_PORT) udp"
 
 # The checkpoint providers (named by scheme and host only).
 loopback_re='^http://(localhost|127\.[0-9]+\.[0-9]+\.[0-9]+|\[::1\])(:[0-9]+)?(/|$)'
+# A path segment this long, or a second segment, may be a provider key.
+KEY_SEGMENT_LEN=16
 # check_url <key>: 0 if the key's URL is usable; else a FAIL line (an empty one is the
-# caller's to judge).
+# caller's to judge). CHECKPOINT_SYNC_URL ends up on Lighthouse's command line (compose.yaml),
+# which any local user reads in ps, so neither URL may carry credentials or a path that looks
+# like a key; CHECKPOINT_SYNC_URL_2 follows the same rule, for anchor-fetch (TODO below).
 check_url() {
-  local url origin
-  url=$(env_get "$env_file" "$1") && url=${url%/}
+  local url origin authority path
+  url=$(env_get "$envc" "$1") && url=${url%/}
   origin=$(redact_url "$url")
+  authority=${url#*://} && authority=${authority%%/*}
+  path=${url#*://} && path=${path#"$authority"} && path=${path#/}
   if [[ -z $url ]]; then
     return 1
   elif case $url in *[[:space:]\"\'\\]*) true ;; *) false ;; esac then
     flunk "$1: holds whitespace, a quote or a backslash"
   elif [[ $url == *[?#]* ]]; then
-    flunk "$1: $origin has a query or fragment (put a key in the path)"
-  elif [[ $url == https://?* || $url =~ $loopback_re ]]; then
-    return 0
-  else
+    flunk "$1: $origin has a query or fragment (the API path is appended to the URL; put a keyed provider behind a local proxy, README.md)"
+  elif [[ $url != https://?* && ! $url =~ $loopback_re ]]; then
     flunk "$1: $origin is not https:// (or http:// to a loopback host)"
+  elif [[ $authority == *@* ]]; then
+    flunk "$1: $origin has credentials in it (Lighthouse's command line shows them in ps): put the provider behind a local proxy (README.md)"
+  elif [[ $path == */* ]] || ((${#path} >= KEY_SEGMENT_LEN)); then
+    flunk "$1: $origin has a path that may hold a provider key (more than one segment, or one of $KEY_SEGMENT_LEN or more characters; Lighthouse's command line shows it in ps): put the provider behind a local proxy (README.md)"
+  else
+    return 0
   fi
   return 1
 }
@@ -153,7 +179,7 @@ need=$(required_providers "$network")
 urls=() origins=()
 for n in 1 2; do
   if [[ $n == 1 ]]; then key=CHECKPOINT_SYNC_URL; else key=CHECKPOINT_SYNC_URL_2; fi
-  url=$(env_get "$env_file" "$key") && url=${url%/}
+  url=$(env_get "$envc" "$key") && url=${url%/}
   if [[ -z $url ]]; then
     if ((n <= need)); then
       if ((need == 1)); then flunk "$key: empty"; else flunk "$key: empty ($network needs $need checkpoint providers, run by different operators)"; fi
@@ -171,7 +197,7 @@ for n in 1 2; do
   echo "checkpoint provider $n: $(redact_url "$url")"
 done
 
-peers=$(env_get "$env_file" TRUSTED_PEERS)
+peers=$(env_get "$envc" TRUSTED_PEERS)
 peer_re='[1-9A-HJ-NP-Za-km-z]{32,128}'
 if [[ -z $peers ]]; then
   echo "TRUSTED_PEERS: empty (add the m2a-session peer ID before the session)"
@@ -183,20 +209,26 @@ else
 fi
 
 # Ids, directories and the JWT copies.
-root=$(env_get "$env_file" DATA_ROOT)
+root=$(env_get "$envc" DATA_ROOT)
 root=${root:-$(default_data_root "$network")}
 ids_ok=1
 for key in RETH_UID RETH_GID LIGHTHOUSE_UID LIGHTHOUSE_GID; do
-  if [[ ! $(env_get "$env_file" "$key") =~ ^[0-9]+$ ]]; then
+  if [[ ! $(env_get "$envc" "$key") =~ ^[0-9]+$ ]]; then
     flunk "$key: not a number (run setup.sh)"
     ids_ok=0
   fi
 done
-# owned <path> <mode> <uid>: one verdict line for a directory (stat never blocks on it).
+# owned <path> <mode> <uid>: one verdict line for a data directory, opened only through
+# fsguard (inspect-dir): a symlink anywhere on the path, or anything but a directory, fails.
 owned() {
-  local got
-  got=$(file_mode_uid "$1" 2>/dev/null || true)
-  if [[ $got == "$2 $3" ]]; then pass "$1: $got"; else flunk "$1: ${got:-missing} (want $2 $3)"; fi
+  local got reason
+  if got=$(fsguard inspect-dir "$1" 2> "$work/inspect.err"); then
+    if [[ $got == "$2 $3" ]]; then pass "$1: $got"; else flunk "$1: $got (want $2 $3)"; fi
+  else
+    # The path is data: strip it with a parameter expansion, never in a sed program.
+    reason=$(sed -n '1s/^ERROR: //p' "$work/inspect.err")
+    flunk "$1: ${reason#"$1: "} (want $2 $3)"
+  fi
 }
 # secret_file <path> <uid>: one verdict line for a JWT copy, opened only through fsguard.
 secret_file() {
@@ -210,15 +242,15 @@ secret_file() {
   fi
 }
 if ((ids_ok)); then
-  reth_uid=$(env_get "$env_file" RETH_UID) lh_uid=$(env_get "$env_file" LIGHTHOUSE_UID)
+  reth_uid=$(env_get "$envc" RETH_UID) lh_uid=$(env_get "$envc" LIGHTHOUSE_UID)
   for pre in RETH LIGHTHOUSE; do
-    if ((10#$(env_get "$env_file" ${pre}_UID) == 0)); then flunk "${pre}_UID: 0 is root"; fi
+    if ((10#$(env_get "$envc" ${pre}_UID) == 0)); then flunk "${pre}_UID: 0 is root"; fi
   done
   if ((test_mode == 0)); then
     for svc in reth lighthouse; do
       if [[ $svc == reth ]]; then pre=RETH; else pre=LIGHTHOUSE; fi
       user=$(service_user "$network" "$svc")
-      uid=$(env_get "$env_file" ${pre}_UID) gid=$(env_get "$env_file" ${pre}_GID)
+      uid=$(env_get "$envc" ${pre}_UID) gid=$(env_get "$envc" ${pre}_GID)
       if ((10#$gid == 0)); then flunk "${pre}_GID: 0 is root's group"; fi
       if ! id -u "$user" >/dev/null 2>&1; then
         flunk "user $user: does not exist (run setup.sh)"
@@ -228,7 +260,7 @@ if ((ids_ok)); then
       if [[ $gid != "$(id -g "$user")" ]]; then flunk "${pre}_GID: $gid is not user $user's gid $(id -g "$user")"; fi
     done
     if ((10#$reth_uid == 10#$lh_uid)); then flunk "RETH_UID, LIGHTHOUSE_UID: the same uid for both services"; fi
-    if ((10#$(env_get "$env_file" RETH_GID) == 10#$(env_get "$env_file" LIGHTHOUSE_GID))); then
+    if ((10#$(env_get "$envc" RETH_GID) == 10#$(env_get "$envc" LIGHTHOUSE_GID))); then
       flunk "RETH_GID, LIGHTHOUSE_GID: the same gid for both services"
     fi
   fi

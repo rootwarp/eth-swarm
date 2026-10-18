@@ -13,6 +13,13 @@
 # run-log temp-file swap. The rest runs as a normal user. A FIFO planted at a checked path
 # needs `timeout` to bound the run, so where it is missing (macOS) those cases are skipped.
 set -euo pipefail
+# The scripts refuse a compose or docker variable in the environment (another compose file,
+# project or daemon than the one they check), and ignore TMPDIR, so the suite runs them without
+# any. No Python bytecode is written into the checkout.
+for name in $(compgen -e); do
+  case $name in COMPOSE_* | DOCKER_*) unset "$name" ;; esac
+done
+export PYTHONDONTWRITEBYTECODE=1
 here=$(cd "$(dirname "$0")" && pwd)
 ref=$(cd "$here/.." && pwd)
 repo=$(cd "$ref/../.." && pwd)
@@ -30,7 +37,7 @@ cd "$tmp"   # a stray relative write lands in the temp dir, never in the checkou
 yes_ref="$tmp/repo-yes/ops/ref-node"
 mkdir -p "$tmp/repo-yes/ops" && cp -R "$ref" "$yes_ref" && ln -s "$repo/crates" "$tmp/repo-yes/crates"
 sed -i.bak '/release-notes:hoodi:begin/,/release-notes:hoodi:end/ { s/| no |/| yes |/; s/| v1\.7\.0-beta\.2 |/| v1.7.0-beta.4 |/; }' "$yes_ref/README.md"
-rm -f "$yes_ref/README.md.bak"
+rm -f "$yes_ref/README.md.bak" && rm -rf "$yes_ref/lib/__pycache__"
 
 passed=0 failed=0
 
@@ -104,7 +111,7 @@ spec_json() {
 
 diff_case() { # diff_case <expect-exit> <description> <pattern> <sed expression>
   spec_json "$tmp/spec.json" "$4"
-  check_out "$1" "spec-diff: $2" "$3" python3 -I "$helper" spec-diff "$tmp/pinned.yaml" "$tmp/spec.json"
+  check_out "$1" "spec-diff: $2" "$3" python3 -I -B "$helper" spec-diff "$tmp/pinned.yaml" "$tmp/spec.json"
 }
 
 diff_case 0 "a matching node passes" '^spec diff: empty \(3 fork versions, 2 fork epochs, 2 blob schedule entries\)' ''
@@ -150,23 +157,32 @@ diff_case 1 "a BLOB_SCHEDULE entry without MAX_BLOBS_PER_BLOCK fails" '^- BLOB_S
 diff_case 0 "a reordered BLOB_SCHEDULE is the same schedule" '^spec diff: empty' \
   's/\[\({"EPOCH":"274176","MAX_BLOBS_PER_BLOCK":"15"}\),\({"EPOCH":"275712","MAX_BLOBS_PER_BLOCK":"21"}\)\]/[\2,\1]/'
 
+# beacon.py reads at most 1 MiB of an answer, the bound lib/common.sh fetch puts on curl.
+{ printf '{"data":{"pad":"'; head -c 1048576 /dev/zero | tr '\0' 'a'; printf '"}}\n'; } > "$tmp/huge.json"
+check_out 2 "spec-diff: an answer over 1 MiB is an input error" 'huge\.json: larger than 1048576 bytes' \
+  python3 -I -B "$helper" spec-diff "$tmp/pinned.yaml" "$tmp/huge.json"
+if grep -q '^FETCH_MAX_BYTES=1048576$' "$ref/lib/common.sh" && grep -q '^MAX_ANSWER = 1048576 ' "$helper"; then
+  ok "fetch and beacon.py share the 1 MiB bound"
+else
+  bad "fetch and beacon.py share the 1 MiB bound"
+fi
 printf 'not json' > "$tmp/garbage.json"
 check 2 "spec-diff: an answer that is not JSON is an error" \
-  python3 -I "$helper" spec-diff "$tmp/pinned.yaml" "$tmp/garbage.json"
+  python3 -I -B "$helper" spec-diff "$tmp/pinned.yaml" "$tmp/garbage.json"
 check 2 "spec-diff: a missing pinned config is an error" \
-  python3 -I "$helper" spec-diff "$tmp/absent.yaml" "$tmp/spec.json"
+  python3 -I -B "$helper" spec-diff "$tmp/absent.yaml" "$tmp/spec.json"
 printf 'GLOAS_FORK_EPOCH: 1\nGLOAS_FORK_EPOCH: 2\nBLOB_SCHEDULE: []\n' > "$tmp/dup.yaml"
 check 2 "spec-diff: a key twice in the pinned config is an error" \
-  python3 -I "$helper" spec-diff "$tmp/dup.yaml" "$tmp/spec.json"
+  python3 -I -B "$helper" spec-diff "$tmp/dup.yaml" "$tmp/spec.json"
 printf 'GLOAS_FORK_EPOCH: 1\n' > "$tmp/no-schedule.yaml"
 check 2 "spec-diff: a pinned config without BLOB_SCHEDULE is an error" \
-  python3 -I "$helper" spec-diff "$tmp/no-schedule.yaml" "$tmp/spec.json"
+  python3 -I -B "$helper" spec-diff "$tmp/no-schedule.yaml" "$tmp/spec.json"
 printf 'BLOB_SCHEDULE: []\nSECONDS_PER_SLOT: 12\n' > "$tmp/no-forks.yaml"
 check 2 "spec-diff: a pinned config without fork keys is an error" \
-  python3 -I "$helper" spec-diff "$tmp/no-forks.yaml" "$tmp/spec.json"
+  python3 -I -B "$helper" spec-diff "$tmp/no-forks.yaml" "$tmp/spec.json"
 printf 'GLOAS_FORK_EPOCH: 1\nBLOB_SCHEDULE:\n  - EPOCH: 1\n    GAS: 2\n' > "$tmp/odd-entry.yaml"
 check 2 "spec-diff: a pinned BLOB_SCHEDULE entry with other keys is an error" \
-  python3 -I "$helper" spec-diff "$tmp/odd-entry.yaml" "$tmp/spec.json"
+  python3 -I -B "$helper" spec-diff "$tmp/odd-entry.yaml" "$tmp/spec.json"
 
 # The real pinned configs, against an answer built from their own fork lines and schedule.
 # real_spec_json <out> [config YAML, default the Sepolia one]
@@ -184,16 +200,16 @@ real_spec_json() {
 real_spec_json "$tmp/real-spec.json"
 check_out 0 "spec-diff: the real pinned config against its own answer" \
   '^spec diff: empty \(8 fork versions, 7 fork epochs, 2 blob schedule entries\)' \
-  python3 -I "$helper" spec-diff "$pinned" "$tmp/real-spec.json"
+  python3 -I -B "$helper" spec-diff "$pinned" "$tmp/real-spec.json"
 sed 's/"GLOAS_FORK_EPOCH":"353024"/"GLOAS_FORK_EPOCH":"18446744073709551615"/' "$tmp/real-spec.json" > "$tmp/pre-gloas.json"
 check_out 1 "spec-diff: the real pinned config against a pre-Gloas endpoint" \
   '^- GLOAS_FORK_EPOCH: pinned 353024, node 18446744073709551615$' \
-  python3 -I "$helper" spec-diff "$pinned" "$tmp/pre-gloas.json"
+  python3 -I -B "$helper" spec-diff "$pinned" "$tmp/pre-gloas.json"
 # Hoodi: Gloas at epoch 132352 (2026-10-26 17:42:48 UTC), its own fork versions and schedule.
 real_spec_json "$tmp/hoodi-spec.json" "$pinned_hoodi"
 check_out 0 "spec-diff: the real pinned Hoodi config against its own answer" \
   '^spec diff: empty \(8 fork versions, 7 fork epochs, 2 blob schedule entries\)' \
-  python3 -I "$helper" spec-diff "$pinned_hoodi" "$tmp/hoodi-spec.json"
+  python3 -I -B "$helper" spec-diff "$pinned_hoodi" "$tmp/hoodi-spec.json"
 if grep -q '"GLOAS_FORK_EPOCH":"132352"' "$tmp/hoodi-spec.json" && grep -q '"GLOAS_FORK_VERSION":"0x80000910"' "$tmp/hoodi-spec.json"; then
   ok "spec-diff: the Hoodi answer carries GLOAS_FORK_EPOCH 132352 and version 0x80000910"
 else
@@ -203,10 +219,10 @@ fi
 sed 's/"GLOAS_FORK_EPOCH":"132352"/"GLOAS_FORK_EPOCH":"18446744073709551615"/' "$tmp/hoodi-spec.json" > "$tmp/hoodi-pre-gloas.json"
 check_out 1 "spec-diff: the pinned Hoodi config against a node without Hoodi's Gloas epoch" \
   '^- GLOAS_FORK_EPOCH: pinned 132352, node 18446744073709551615$' \
-  python3 -I "$helper" spec-diff "$pinned_hoodi" "$tmp/hoodi-pre-gloas.json"
+  python3 -I -B "$helper" spec-diff "$pinned_hoodi" "$tmp/hoodi-pre-gloas.json"
 check_out 1 "spec-diff: a Sepolia answer against the Hoodi config fails (the other network)" \
   '^- GENESIS_FORK_VERSION: pinned 0x10000910, node 0x90000069$' \
-  python3 -I "$helper" spec-diff "$pinned_hoodi" "$tmp/real-spec.json"
+  python3 -I -B "$helper" spec-diff "$pinned_hoodi" "$tmp/real-spec.json"
 
 # --- beacon API verdicts (collect-run-log.sh's per-criterion logic) ----------------------------
 
@@ -220,7 +236,7 @@ syncing_case() {
   printf '{"data":{"head_slot":"%s","sync_distance":"0","is_syncing":%s,"is_optimistic":%s,"el_offline":%s}}\n' \
     "$4" "${5:-false}" "${6:-false}" "${7:-false}" > "$tmp/syncing.json"
   check_out "$1" "syncing: $2" "$3" \
-    python3 -I "$helper" syncing "$tmp/syncing.json" "$tmp/genesis.json" "$tmp/spec.json" "$now"
+    python3 -I -B "$helper" syncing "$tmp/syncing.json" "$tmp/genesis.json" "$tmp/spec.json" "$now"
 }
 spec_json "$tmp/spec.json"
 syncing_case 0 "head at the wall-clock slot passes" '^head_slot 1000, wall-clock slot 1000 \(lag 0\), is_syncing false, is_optimistic false, el_offline false: PASS$' 1000
@@ -233,21 +249,21 @@ syncing_case 1 "is_optimistic true fails" 'is_optimistic true.*: FAIL$' 1000 fal
 syncing_case 1 "el_offline true fails" 'el_offline true.*: FAIL$' 1000 false false true
 printf '{"data":{"head_slot":"1000","is_syncing":false,"is_optimistic":false}}\n' > "$tmp/syncing.json"
 check_out 1 "syncing: a missing el_offline fails" 'el_offline missing.*: FAIL$' \
-  python3 -I "$helper" syncing "$tmp/syncing.json" "$tmp/genesis.json" "$tmp/spec.json" "$now"
+  python3 -I -B "$helper" syncing "$tmp/syncing.json" "$tmp/genesis.json" "$tmp/spec.json" "$now"
 syncing_case 1 'is_syncing "false" (a string) fails' 'is_syncing "false".*: FAIL$' 1000 '"false"'
 printf '{"data":{"SECONDS_PER_SLOT":"0"}}\n' > "$tmp/zero-sps.json"
 check 2 "syncing: SECONDS_PER_SLOT 0 is an error" \
-  python3 -I "$helper" syncing "$tmp/syncing.json" "$tmp/genesis.json" "$tmp/zero-sps.json" "$now"
+  python3 -I -B "$helper" syncing "$tmp/syncing.json" "$tmp/genesis.json" "$tmp/zero-sps.json" "$now"
 printf '{"data":{"SLOT_DURATION_MS":"12000"}}\n' > "$tmp/ms-only.json"
 check_out 1 "syncing: SLOT_DURATION_MS stands in for a missing SECONDS_PER_SLOT" 'wall-clock slot 1000 ' \
-  python3 -I "$helper" syncing "$tmp/syncing.json" "$tmp/genesis.json" "$tmp/ms-only.json" "$now"
+  python3 -I -B "$helper" syncing "$tmp/syncing.json" "$tmp/genesis.json" "$tmp/ms-only.json" "$now"
 
 # finalized_case <expect-exit> <description> <pattern> <finalized slot> <database info JSON>
 finalized_case() {
   printf '{"data":{"root":"0xab","canonical":true,"header":{"message":{"slot":"%s","proposer_index":"1"}}}}\n' \
     "$4" > "$tmp/finalized.json"
   printf '%s\n' "$5" > "$tmp/dbinfo.json"
-  check_out "$1" "finalized: $2" "$3" python3 -I "$helper" finalized "$tmp/finalized.json" "$tmp/dbinfo.json"
+  check_out "$1" "finalized: $2" "$3" python3 -I -B "$helper" finalized "$tmp/finalized.json" "$tmp/dbinfo.json"
 }
 anchor='{"schema_version":31,"anchor":{"anchor_slot":"9000","oldest_block_slot":"%s","state_upper_limit":"9000","state_lower_limit":"0"}}'
 # shellcheck disable=SC2059
@@ -269,7 +285,7 @@ pid=16Uiu2HAmQ5L4BYrnTKcBgvYw1oSv1mYj4tsRkKaJ7NShcC5kU8Jr
 identity_case() {
   printf '{"data":{"peer_id":"%s","enr":"enr:-Iu4QA","p2p_addresses":%s,"discovery_addresses":[],"metadata":{"seq_number":"7","attnets":"0x00","syncnets":"0x00"%s}}}\n' \
     "$pid" "$5" "${6-,\"custody_group_count\":\"4\"}" > "$tmp/identity.json"
-  check_out "$1" "identity: $2" "$3" python3 -I "$helper" identity "$tmp/identity.json" "$4" "${8:-9000}"
+  check_out "$1" "identity: $2" "$3" python3 -I -B "$helper" identity "$tmp/identity.json" "$4" "${8:-9000}"
 }
 identity_case 0 "the public address of the identity is used" \
   "^multiaddr: /ip4/34\.89\.10\.7/tcp/9000/p2p/$pid$" '' \
@@ -282,9 +298,9 @@ identity_case 0 "the peer ID is recorded" "^peer_id: $pid$" '' "[\"/ip4/34.89.10
 identity_case 0 "the multiaddr uses the configured p2p TCP port" "^multiaddr: /ip4/34\.89\.10\.7/tcp/9002/p2p/$pid$" '' \
   "[\"/ip4/34.89.10.7/tcp/9002/p2p/$pid\"]" ',"custody_group_count":"4"' '' 9002
 check_out 2 "identity: a p2p port that is not a port number is an error" '^ERROR: the p2p port is not a TCP port number$' \
-  python3 -I "$helper" identity "$tmp/identity.json" '' 90a2
+  python3 -I -B "$helper" identity "$tmp/identity.json" '' 90a2
 check_out 2 "identity: p2p port 0 is an error" '^ERROR: the p2p port is not a TCP port number$' \
-  python3 -I "$helper" identity "$tmp/identity.json" '' 0
+  python3 -I -B "$helper" identity "$tmp/identity.json" '' 0
 identity_case 1 "only private addresses and no --public-ip fails" '^error: no public IPv4' '' \
   "[\"/ip4/10.0.0.5/tcp/9000\",\"/ip4/127.0.0.1/tcp/9000\"]"
 identity_case 1 "a --public-ip that is not an IPv4 address fails" '^error: --public-ip is not an IPv4 address' 'example.org' '[]'
@@ -292,14 +308,14 @@ identity_case 1 "a missing custody_group_count fails" '^error: custody_group_cou
   "[\"/ip4/34.89.10.7/tcp/9000\"]" ''
 sed "s/$pid/not-a-peer-id/" "$tmp/identity.json" > "$tmp/bad-identity.json"
 check_out 1 "identity: a peer ID that is not base58 fails" '^error: peer_id is not base58 or missing$' \
-  python3 -I "$helper" identity "$tmp/bad-identity.json" '' 9000
-out=$(python3 -I "$helper" identity "$tmp/bad-identity.json" '' 9000 2>&1 || true)
+  python3 -I -B "$helper" identity "$tmp/bad-identity.json" '' 9000
+out=$(python3 -I -B "$helper" identity "$tmp/bad-identity.json" '' 9000 2>&1 || true)
 if printf '%s\n' "$out" | grep -Eq '^(peer_id|custody_group_count|multiaddr): '; then
   bad "identity: an error is never printed as a value line" "$out"
 else
   ok "identity: an error is never printed as a value line"
 fi
-check 2 "an unknown helper command is an error" python3 -I "$helper" frobnicate
+check 2 "an unknown helper command is an error" python3 -I -B "$helper" frobnicate
 
 # anchor-compare: provider 1's finalized header against provider 2's header at the same slot.
 r1=0x$(printf 'ab%.0s' $(seq 1 32)) r2=0x$(printf 'cd%.0s' $(seq 1 32))
@@ -310,7 +326,7 @@ header_json() {
     "$3" "${5:-true}" "$2" "$4" > "$1"
 }
 anchor_case() { # anchor_case <expect-exit> <description> <pattern>
-  check_out "$1" "anchor-compare: $2" "$3" python3 -I "$helper" anchor-compare "$tmp/anchor-a.json" "$tmp/anchor-b.json"
+  check_out "$1" "anchor-compare: $2" "$3" python3 -I -B "$helper" anchor-compare "$tmp/anchor-a.json" "$tmp/anchor-b.json"
 }
 header_json "$tmp/anchor-a.json" 4235264 "$r1" "$s1"
 header_json "$tmp/anchor-b.json" 4235264 "$r1" "$s1"
@@ -333,8 +349,8 @@ anchor_case 2 "a block root that is not 32 bytes of hex is an error" '^ERROR: pr
 header_json "$tmp/anchor-a.json" 4235264 "$r1" "$s1"
 printf '{"data":{"root":"%s"}}\n' "$r1" > "$tmp/anchor-b.json"
 anchor_case 2 "a header without a slot is an error" '^ERROR: provider 2: the header answer has no header.message.slot$'
-check_out 0 "header-slot: the slot of a header answer" '^4235264$' python3 -I "$helper" header-slot "$tmp/anchor-a.json"
-check_out 2 "header-slot: a header without a slot is an error" 'no header.message.slot$' python3 -I "$helper" header-slot "$tmp/anchor-b.json"
+check_out 0 "header-slot: the slot of a header answer" '^4235264$' python3 -I -B "$helper" header-slot "$tmp/anchor-a.json"
+check_out 2 "header-slot: a header without a slot is an error" 'no header.message.slot$' python3 -I -B "$helper" header-slot "$tmp/anchor-b.json"
 
 # --- shared shell rules (lib/common.sh) --------------------------------------------------------
 
@@ -367,6 +383,47 @@ redact "a key in the path is cut" "https://eth-sepolia.example.com/v2/KEY123secr
 redact "a key in the query is cut" "https://cp.example.com?apikey=KEY123secret" "https://cp.example.com/…"
 redact "credentials are cut" "https://user:KEY123secret@cp.example.com/x" "https://cp.example.com/…"
 redact "no scheme is not echoed" "KEY123secret" "(not a URL)"
+
+# fetch runs the real curl as root: it must read no ~/.curlrc (a write-out there would print the
+# URL, key and all) and go through no proxy from the environment (a proxy would see every URL
+# in full, and preflight must reach the endpoint Lighthouse reaches). Against a loopback server.
+if command -v curl >/dev/null 2>&1; then
+  mkdir -p "$tmp/curlhome" && printf 'write-out = "WROTE %%{url_effective}\\n"\n' > "$tmp/curlhome/.curlrc"
+  python3 -I -B -c '
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        # /big: 2 MiB with a Content-Length; /bigstream: 2 MiB without one (read to the close).
+        body = b"{" + b" " * (2 << 20) + b"}" if self.path.startswith("/big") else b"{}"
+        self.send_response(200)
+        if self.path != "/bigstream":
+            self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+s = http.server.HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[1], "w").write(str(s.server_address[1]))
+s.serve_forever()' "$tmp/http.port" &
+  http_pid=$!
+  for _ in $(seq 1 100); do [[ -s $tmp/http.port ]] && break; sleep 0.1; done
+  srv="http://127.0.0.1:$(cat "$tmp/http.port")"
+  rc=0; out=$(HOME="$tmp/curlhome" fetch "$srv/eth/KEY555secret" "$tmp/fetched.json" 2>&1) || rc=$?
+  if ((rc == 0)) && ! printf '%s' "$out" | grep -q KEY555secret; then ok "fetch: ~/.curlrc is not read (no write-out of the URL)"; else bad "fetch: ~/.curlrc is not read (exit $rc)" "$out"; fi
+  rc=0; out=$(http_proxy=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 \
+    fetch "$srv/eth/v1/node/syncing" "$tmp/fetched.json" 2>&1) || rc=$?
+  if ((rc == 0)); then ok "fetch: no proxy from the environment is used"; else bad "fetch: no proxy from the environment is used (exit $rc)" "$out"; fi
+  # No answer the scripts read comes near 1 MiB (/eth/v1/config/spec is about 20 KB), so a
+  # larger one is refused and nothing of it is kept, with or without a Content-Length.
+  for path in /big /bigstream; do
+    printf 'stale' > "$tmp/fetched.json"
+    rc=0; fetch "$srv$path" "$tmp/fetched.json" || rc=$?
+    if ((rc != 0)) && [[ ! -s $tmp/fetched.json ]]; then ok "fetch: a 2 MiB answer ($path) is refused, nothing kept"; else bad "fetch: a 2 MiB answer ($path) is refused (exit $rc, $(wc -c < "$tmp/fetched.json") bytes kept)"; fi
+  done
+  kill "$http_pid" 2>/dev/null || true
+  wait "$http_pid" 2>/dev/null || true
+else
+  echo "# skip - fetch ignores ~/.curlrc and proxies: no curl"
+fi
 
 # ss -ltnp as the reference host prints it.
 ss_head='State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process'
@@ -477,6 +534,28 @@ row=$(release_row "$ref/README.md" hoodi "$(env_get "$hoodi_ex" LIGHTHOUSE_IMAGE
 if [[ $row == 'no|v1.7.0-beta.2' ]]; then ok "release notes: the pinned Lighthouse does not schedule Hoodi's fork and targets beta.2"; else bad "release notes: Hoodi Lighthouse row (got '$row')"; fi
 check_out 0 "release notes: a row is matched by image digest, not by tag" '^$' \
   release_row "$ref/README.md" sepolia "sigp/lighthouse:v8.3.0-rc.0@sha256:$d64"
+# README.md's migration note: a Sepolia .env from ops/sepolia-ref has no NETWORK, no
+# CHECKPOINT_SYNC_URL_2 and no port keys. The lines it lists turn such a file into one with every
+# key of .env.example, at .env.example's values, that the scripts accept.
+old_env="$tmp/sepolia-ref.env" migrated="$tmp/migrated.env"
+grep -Ev "^(NETWORK|CHECKPOINT_SYNC_URL_2|${PORT_KEYS// /|})=" "$sep_ex" > "$old_env"
+awk '$0 == "<!-- migration:sepolia-ref:end -->" { on = 0 } on && /^[A-Z_][A-Z0-9_]*=/ { print } $0 == "<!-- migration:sepolia-ref:begin -->" { on = 1 }' \
+  "$ref/README.md" > "$tmp/migration.lines"
+cat "$old_env" "$tmp/migration.lines" > "$migrated"
+keys_of() { sed -n 's/^\([A-Z_][A-Z0-9_]*\)=.*/\1/p' "$1" | sort; }
+check 1 "migration: an ops/sepolia-ref .env has no NETWORK the scripts know" network_known "$(env_get "$old_env" NETWORK)"
+if [[ -s $tmp/migration.lines ]] && [[ $(keys_of "$migrated") == "$(keys_of "$sep_ex")" ]]; then
+  ok "migration: README.md's lines add every missing key of .env.example"
+else
+  bad "migration: README.md's lines add every missing key of .env.example" "$(cat "$tmp/migration.lines")"
+fi
+mismatch=''
+while IFS= read -r key; do
+  if [[ $(env_get "$migrated" "$key") != "$(env_get "$sep_ex" "$key")" ]]; then mismatch="$mismatch $key"; fi
+done < <(keys_of "$tmp/migration.lines")
+if [[ -z $mismatch ]]; then ok "migration: README.md's lines carry .env.example's Sepolia values"; else bad "migration: values differ from .env.example:$mismatch"; fi
+check 0 "migration: the migrated .env reads as compose reads it" env_check "$migrated"
+check 0 "migration: the migrated .env has valid, distinct ports" ports_check "$migrated"
 for spec in "sepolia 1" "hoodi 2"; do
   read -r net want <<< "$spec"
   got=$(required_providers "$net")
@@ -496,6 +575,40 @@ set_env() {
     index($0, k "=") == 1 { if (!done) print k "=" v; done = 1; next } { print }
     END { if (!done) print k "=" v }' "$1" > "$1.new" && mv "$1.new" "$1"
 }
+
+# env_check reads an .env the way compose's dotenv parser does only if nothing in it is
+# parsed specially: compose keeps reading after a closing quote (DUMMY=''RETH_UID=0 sets
+# RETH_UID too), cuts an inline comment, trims blanks and reads a CR. So the whole file is
+# printable ASCII and LF, and a value holds no blank, quote, backslash, #, $ or backtick.
+# envc_case <expect-exit> <description> <pattern or ''> <printf format of the extra lines>
+envc_case() {
+  cp "$ref/.env.example" "$tmp/envc.env"
+  # shellcheck disable=SC2059 # the format is the case's own bytes
+  printf "$4" >> "$tmp/envc.env"
+  if [[ -n $3 ]]; then
+    check_out "$1" "env_check: $2" "$3" env_check "$tmp/envc.env"
+  else
+    check "$1" "env_check: $2" env_check "$tmp/envc.env"
+  fi
+}
+envc_case 0 "the Sepolia example (apostrophes and backticks in # comments) passes" '' ''
+check 0 "env_check: the Hoodi example passes" env_check "$ref/.env.hoodi.example"
+envc_case 1 "DUMMY=''RETH_UID=0 (a second assignment after a closing quote) is refused" \
+  'line [0-9]+: DUMMY holds a blank, a quote, a backslash or a #' "DUMMY=''RETH_UID=0\n"
+envc_case 1 'DUMMY="x"RETH_UID=0 is refused' 'line [0-9]+: DUMMY holds a blank, a quote' 'DUMMY="x"RETH_UID=0\n'
+envc_case 1 "DUMMY='' RETH_UID=0 is refused" 'line [0-9]+: DUMMY holds a blank' "DUMMY='' RETH_UID=0\n"
+envc_case 1 "an inline comment is refused" 'line [0-9]+: X holds a blank, a quote, a backslash or a #' 'X=1001 #c\n'
+envc_case 1 "a # in a value is refused" 'line [0-9]+: X holds .* a #' 'X=a#b\n'
+envc_case 1 "a trailing blank is refused" 'line [0-9]+: X holds a blank' 'X=1001 \n'
+envc_case 1 "a backslash is refused" 'line [0-9]+: X holds .* a backslash' 'X=/srv/a\\b\n'
+envc_case 1 "a CR is refused" 'line [0-9]+: a byte other than printable ASCII' 'X=1001\r\n'
+envc_case 1 "a TAB is refused" 'line [0-9]+: a byte other than printable ASCII' 'X=\t1001\n'
+envc_case 1 "a TAB in a comment is refused too" 'line [0-9]+: a byte other than printable ASCII' '#\tcomment\n'
+envc_case 1 "a non-ASCII byte is refused" 'line [0-9]+: a byte other than printable ASCII' 'X=caf\303\251\n'
+envc_case 1 "a NUL byte is refused" 'a byte other than printable ASCII' 'X=a\000b\n'
+envc_case 1 "a quoted value is refused" 'line [0-9]+: X holds .* a quote' 'X="1001"\n'
+printf 'X="v"\n' > "$tmp/envq.env"
+check_out 0 "env_get: quotes are no longer stripped (env_check refuses them first)" '^"v"$' env_get "$tmp/envq.env" X
 
 # refusal_cases [--test-mode]: setup.sh refuses, before it changes anything, every path it
 # would follow or reown wrongly, and every .env line compose would read differently. Each
@@ -571,7 +684,7 @@ refusal_cases() {
   refuse_case --want 'without whitespace or a backslash' "a newline in --root" \
     '[[ -z $(find "$base" -maxdepth 1 -name "nl*") ]]' --root "$base/nl"$'\n'"RETH_UID=0"
   set_env "$refuse_env" DATA_ROOT "$base/bs\\x"
-  refuse_case --want 'without whitespace or a backslash' "a backslash in DATA_ROOT from .env" '[[ -z $(find "$base" -maxdepth 1 -name "bs*") ]]'
+  refuse_case --want 'DATA_ROOT holds a blank, a quote, a backslash or a #' "a backslash in DATA_ROOT from .env" '[[ -z $(find "$base" -maxdepth 1 -name "bs*") ]]'
   cp "$ref/.env.example" "$refuse_env"
   # The .env directory gets the same walk from / as DATA_ROOT: no symlink anywhere on its path,
   # every directory owned by root or the operator and closed to group and others.
@@ -586,6 +699,32 @@ refusal_cases() {
   refuse_case --want 'envup: writable by group or others' "an .env below a world-writable directory" \
     '[[ ! -e $base/envdir-root ]] && cmp -s "$base/envup/cfg/.env" "$base/env.before"' --env-file "$base/envup/cfg/.env" --root "$base/envdir-root"
   chmod 0755 "$base/envup"
+  # The .env itself is read once, through fsguard: never through a symlink, a hard link or a
+  # FIFO (which a read by path would follow, or block on). The file it points at stays as it was.
+  mkdir -m 0700 "$base/envfile" && cp "$ref/.env.example" "$base/envfile.target"
+  ln -s "$base/envfile.target" "$base/envfile/.env"
+  refuse_case --want 'envfile/\.env: a symlink or unreadable' "an .env that is a symlink" \
+    '[[ -L $base/envfile/.env && ! -e $base/envfile-root ]] && cmp -s "$base/envfile.target" "$ref/.env.example"' \
+    --env-file "$base/envfile/.env" --root "$base/envfile-root"
+  rm "$base/envfile/.env" && ln "$base/envfile.target" "$base/envfile/.env"
+  refuse_case --want 'envfile/\.env: has 2 hard links' "an .env with a second hard link" \
+    '[[ ! -e $base/envfile-root ]] && cmp -s "$base/envfile.target" "$ref/.env.example"' \
+    --env-file "$base/envfile/.env" --root "$base/envfile-root"
+  rm "$base/envfile/.env"
+  if [[ -n $bound ]]; then
+    mkfifo -m 0600 "$base/envfile/.env"
+    refuse_case --want 'envfile/\.env: not a regular file' "an .env that is a FIFO, without blocking" \
+      '[[ -p $base/envfile/.env && ! -e $base/envfile-root ]]' --env-file "$base/envfile/.env" --root "$base/envfile-root"
+    rm "$base/envfile/.env"
+  else
+    echo "# skip - setup refuses a FIFO at the .env: no timeout command to bound the run"
+  fi
+  # setup.sh creates DATA_ROOT itself at most, never a missing directory above it (it would be
+  # root's, mode 0755, wherever the operator mistyped).
+  refuse_case --want 'noparent: no such directory' "a DATA_ROOT whose parent is missing" \
+    '[[ ! -e $base/noparent ]]' --root "$base/noparent/srv"
+  refuse_case --want 'noparent: no such directory' "a DATA_ROOT two missing levels down" \
+    '[[ ! -e $base/noparent ]]' --root "$base/noparent/deep/srv"
   # .env lines compose reads differently: export (last one wins), indentation, a key twice,
   # $ or a backtick (expanded). Each case breaks one rule only (a $ or backtick replaces the
   # key's line rather than adding a second one), and the refusal names that rule. setup.sh
@@ -730,6 +869,32 @@ for value in '' mainnet '../sepolia'; do
     bash "$setup" --test-mode --env-file "$tmp/net.env" --root "$tmp/net-root"
 done
 if [[ ! -e $tmp/net-root ]]; then ok "setup: a refused NETWORK creates nothing"; else bad "setup: a refused NETWORK creates nothing"; fi
+# Temp files never go where the caller's TMPDIR points (an operator-owned directory under
+# sudo -E). A python3 spy first on PATH lists TMPDIR each time a script runs Python, which
+# every script does while its temp directory exists.
+mkdir -p "$tmp/pyspy"
+cat > "$tmp/pyspy/python3" <<SH
+#!/usr/bin/env bash
+echo call >> "$tmp/optmp.calls"
+ls -A "\$TMPDIR" >> "$tmp/optmp.log" 2>/dev/null
+exec $(command -v python3) "\$@"
+SH
+chmod +x "$tmp/pyspy/python3"
+# no_tmpdir <expect-exit> <description> <PATH prefix> <command...>: the command exits
+# <expect-exit> with TMPDIR set to an empty directory, which stays empty whenever Python runs.
+no_tmpdir() {
+  local expect=$1 desc=$2 prefix=$3 rc=0 out
+  shift 3
+  rm -rf "$tmp/optmp" && mkdir -m 0700 "$tmp/optmp" && : > "$tmp/optmp.log" && : > "$tmp/optmp.calls"
+  out=$(env PATH="$tmp/pyspy:$prefix$PATH" TMPDIR="$tmp/optmp" "$@" 2>&1) || rc=$?
+  if ((rc == expect)) && [[ -s $tmp/optmp.calls && ! -s $tmp/optmp.log ]]; then
+    ok "$desc"
+  else
+    bad "$desc (exit $rc, want $expect; in TMPDIR: $(tr '\n' ' ' < "$tmp/optmp.log"))" "$out"
+  fi
+}
+cp "$ref/.env.example" "$tmp/tmpdir.env"
+no_tmpdir 0 "setup: the caller's TMPDIR is not used" '' bash "$setup" --test-mode --env-file "$tmp/tmpdir.env" --root "$tmp/tmpdir-root"
 cp "$ref/.env.hoodi.example" "$tmp/hoodi-setup.env"
 check_out 0 "setup: the Hoodi .env example sets up its own root" '^setup OK$' \
   bash "$setup" --test-mode --env-file "$tmp/hoodi-setup.env" --root "$tmp/hoodi-root"
@@ -764,10 +929,21 @@ done
 refusal_cases --test-mode
 # fsguard.py's .env-directory commands, called directly with what setup.sh never passes.
 guard="$ref/lib/fsguard.py"
-check_out 2 "fsguard: check-dir refuses a missing directory" 'absent: no such directory$' python3 -I "$guard" check-dir "$tmp/absent" "$me_uid" -1
-check_out 2 "fsguard: check-dir refuses a relative directory" '^ERROR: the \.env directory must be an absolute path$' python3 -I "$guard" check-dir rel/dir "$me_uid" -1
-check_out 2 "fsguard: an OPERATOR_UID that is not a uid is refused" "OPERATOR_UID 'x1' is not a uid or -1" python3 -I "$guard" check-dir "$tmp" "$me_uid" x1
-check_out 2 "fsguard: write-file refuses a NAME that is not a file name" "'\.\.': not a file name" python3 -I "$guard" write-file "$tmp" .. "$me_uid" -1 < /dev/null
+check_out 2 "fsguard: check-dir refuses a missing directory" 'absent: no such directory$' python3 -I -B "$guard" check-dir "$tmp/absent" "$me_uid" -1
+check_out 2 "fsguard: check-dir refuses a relative directory" '^ERROR: the \.env directory must be an absolute path$' python3 -I -B "$guard" check-dir rel/dir "$me_uid" -1
+check_out 2 "fsguard: an OPERATOR_UID that is not a uid is refused" "OPERATOR_UID 'x1' is not a uid or -1" python3 -I -B "$guard" check-dir "$tmp" "$me_uid" x1
+check_out 2 "fsguard: check refuses a DATA_ROOT whose parent is missing" "^ERROR: $tmp/absent: no such directory" \
+  python3 -I -B "$guard" check "$tmp/absent/srv" "$me_uid" "$me_uid" "$me_uid"
+check_out 0 "fsguard: check accepts a missing DATA_ROOT whose parent exists" '^checks: ' \
+  python3 -I -B "$guard" check "$tmp/absent" "$me_uid" "$me_uid" "$me_uid"
+check_out 2 "fsguard: read-file refuses a missing file" "^ERROR: $tmp/absent\\.env: no such file" \
+  python3 -I -B "$guard" read-file "$tmp" absent.env "$me_uid" -1
+printf 'NETWORK=sepolia\n' > "$tmp/read.env"
+check_out 0 "fsguard: read-file prints the file" '^NETWORK=sepolia$' python3 -I -B "$guard" read-file "$tmp" read.env "$me_uid" -1
+head -c 70000 /dev/zero | tr '\0' '#' > "$tmp/big.env"
+check_out 2 "fsguard: read-file refuses a file over 64 KiB" 'big\.env: larger than 65536 bytes' \
+  python3 -I -B "$guard" read-file "$tmp" big.env "$me_uid" -1
+check_out 2 "fsguard: write-file refuses a NAME that is not a file name" "'\.\.': not a file name" python3 -I -B "$guard" write-file "$tmp" .. "$me_uid" -1 < /dev/null
 # inspect and same-secret: what preflight.sh and collect-run-log.sh read secrets and the node key
 # through. The walk from / follows no symlink, and the file is opened non-blocking and fstat'ed
 # before anything else, so only a regular file with one link is ever looked at.
@@ -777,27 +953,33 @@ printf '%s' "$(printf 'b%.0s' $(seq 1 64))" > "$fg/c" && printf 'nothex' > "$fg/
 chmod 0600 "$fg/a" "$fg/b" "$fg/c" && chmod 0640 "$fg/d"
 mkdir -m 0700 "$fg/real" && cp "$fg/a" "$fg/real/k" && ln -s "$fg/real" "$fg/link" && ln -s "$fg/a" "$fg/sym"
 cp "$fg/c" "$fg/f" && ln "$fg/c" "$fg/c2"
-check_out 0 "fsguard: inspect prints the mode and owner uid" "^600 $me_uid$" python3 -I "$guard" inspect "$fg/a"
-check_out 0 "fsguard: inspect keeps the mode as it is" "^640 $me_uid$" python3 -I "$guard" inspect "$fg/d"
-check_out 2 "fsguard: inspect refuses a symlink" "^ERROR: $fg/sym: a symlink or unreadable" python3 -I "$guard" inspect "$fg/sym"
-check_out 2 "fsguard: inspect refuses a symlinked directory on the way" "^ERROR: $fg/link: a symlink or not a directory" python3 -I "$guard" inspect "$fg/link/k"
-check_out 2 "fsguard: inspect refuses a hard-linked file" "^ERROR: $fg/c: has 2 hard links$" python3 -I "$guard" inspect "$fg/c"
-check_out 2 "fsguard: inspect refuses a directory" "^ERROR: $fg/real: not a regular file$" python3 -I "$guard" inspect "$fg/real"
-check_out 2 "fsguard: inspect names a missing file" "^ERROR: $fg/absent: no such file$" python3 -I "$guard" inspect "$fg/absent"
-check_out 2 "fsguard: inspect names a missing directory on the way" "^ERROR: $fg/absent/k: no such file$" python3 -I "$guard" inspect "$fg/absent/k"
-check_out 2 "fsguard: inspect refuses a relative path" '^ERROR: the path must be an absolute path$' python3 -I "$guard" inspect rel/k
-check 0 "fsguard: same-secret: two copies of one 64-hex secret" python3 -I "$guard" same-secret "$fg/a" "$fg/b"
-check 1 "fsguard: same-secret: two different secrets" python3 -I "$guard" same-secret "$fg/a" "$fg/f"
-check 1 "fsguard: same-secret: equal copies that are not 64 hex characters" python3 -I "$guard" same-secret "$fg/d" "$fg/e"
-check_out 2 "fsguard: same-secret refuses a symlink" "^ERROR: $fg/sym: a symlink" python3 -I "$guard" same-secret "$fg/a" "$fg/sym"
-out=$(python3 -I "$guard" same-secret "$fg/a" "$fg/f" 2>&1 || true)
+check_out 0 "fsguard: inspect prints the mode and owner uid" "^600 $me_uid$" python3 -I -B "$guard" inspect "$fg/a"
+check_out 0 "fsguard: inspect keeps the mode as it is" "^640 $me_uid$" python3 -I -B "$guard" inspect "$fg/d"
+check_out 2 "fsguard: inspect refuses a symlink" "^ERROR: $fg/sym: a symlink or unreadable" python3 -I -B "$guard" inspect "$fg/sym"
+check_out 2 "fsguard: inspect refuses a symlinked directory on the way" "^ERROR: $fg/link: a symlink or not a directory" python3 -I -B "$guard" inspect "$fg/link/k"
+check_out 2 "fsguard: inspect refuses a hard-linked file" "^ERROR: $fg/c: has 2 hard links$" python3 -I -B "$guard" inspect "$fg/c"
+check_out 2 "fsguard: inspect refuses a directory" "^ERROR: $fg/real: not a regular file$" python3 -I -B "$guard" inspect "$fg/real"
+check_out 2 "fsguard: inspect names a missing file" "^ERROR: $fg/absent: no such file$" python3 -I -B "$guard" inspect "$fg/absent"
+check_out 2 "fsguard: inspect names a missing directory on the way" "^ERROR: $fg/absent/k: no such file$" python3 -I -B "$guard" inspect "$fg/absent/k"
+check_out 2 "fsguard: inspect refuses a relative path" '^ERROR: the path must be an absolute path$' python3 -I -B "$guard" inspect rel/k
+# inspect-dir: what preflight.sh checks the data directories through, by the same walk.
+check_out 0 "fsguard: inspect-dir prints a directory's mode and owner uid" "^700 $me_uid$" python3 -I -B "$guard" inspect-dir "$fg/real"
+check_out 2 "fsguard: inspect-dir refuses a symlink to a directory" "^ERROR: $fg/link: a symlink or not a directory" python3 -I -B "$guard" inspect-dir "$fg/link"
+check_out 2 "fsguard: inspect-dir refuses a regular file" "^ERROR: $fg/a: a symlink or not a directory" python3 -I -B "$guard" inspect-dir "$fg/a"
+check_out 2 "fsguard: inspect-dir refuses a symlinked directory on the way" "^ERROR: $fg/link: a symlink or not a directory" python3 -I -B "$guard" inspect-dir "$fg/link/sub"
+check_out 2 "fsguard: inspect-dir names a missing directory" "^ERROR: $fg/absent: no such directory$" python3 -I -B "$guard" inspect-dir "$fg/absent"
+check 0 "fsguard: same-secret: two copies of one 64-hex secret" python3 -I -B "$guard" same-secret "$fg/a" "$fg/b"
+check 1 "fsguard: same-secret: two different secrets" python3 -I -B "$guard" same-secret "$fg/a" "$fg/f"
+check 1 "fsguard: same-secret: equal copies that are not 64 hex characters" python3 -I -B "$guard" same-secret "$fg/d" "$fg/e"
+check_out 2 "fsguard: same-secret refuses a symlink" "^ERROR: $fg/sym: a symlink" python3 -I -B "$guard" same-secret "$fg/a" "$fg/sym"
+out=$(python3 -I -B "$guard" same-secret "$fg/a" "$fg/f" 2>&1 || true)
 if printf '%s' "$out" | grep -Eq '[0-9a-f]{64}'; then bad "fsguard: same-secret never prints a secret" "$out"; else ok "fsguard: same-secret never prints a secret"; fi
 if [[ -n $bound ]]; then
   mkfifo "$fg/fifo"
   # shellcheck disable=SC2086 # $bound is a command prefix
-  check_out 2 "fsguard: inspect refuses a FIFO without blocking" "^ERROR: $fg/fifo: not a regular file$" $bound python3 -I "$guard" inspect "$fg/fifo"
+  check_out 2 "fsguard: inspect refuses a FIFO without blocking" "^ERROR: $fg/fifo: not a regular file$" $bound python3 -I -B "$guard" inspect "$fg/fifo"
   # shellcheck disable=SC2086 # $bound is a command prefix
-  check_out 2 "fsguard: same-secret refuses a FIFO without blocking" "^ERROR: $fg/fifo: not a regular file$" $bound python3 -I "$guard" same-secret "$fg/a" "$fg/fifo"
+  check_out 2 "fsguard: same-secret refuses a FIFO without blocking" "^ERROR: $fg/fifo: not a regular file$" $bound python3 -I -B "$guard" same-secret "$fg/a" "$fg/fifo"
 else
   echo "# skip - fsguard inspect refuses a FIFO: no timeout command to bound the run"
 fi
@@ -830,10 +1012,11 @@ esac
 host=${url#*://} && host=${host%%/*}
 f="$STUB_DIR/http/$(printf '%s' "${api#/}" | tr '/' '_')"
 if [[ -e $STUB_DIR/http/$host/${f##*/} || -e $STUB_DIR/http/$host/${f##*/}.sh ]]; then f="$STUB_DIR/http/$host/${f##*/}"; fi
-[[ -n $out ]] || exit 22
-if [[ -x $f.sh ]]; then "$f.sh" > "$out"; exit; fi   # a generated answer (reads the clock)
+# The answer goes to --output, or to stdout without it.
+if [[ -n $out ]]; then exec > "$out"; fi
+if [[ -x $f.sh ]]; then "$f.sh"; exit; fi   # a generated answer (reads the clock)
 [[ -f $f ]] || exit 22
-cat "$f" > "$out"
+cat "$f"
 SH
 cat > "$stubs/ss" <<'SH'
 #!/usr/bin/env bash
@@ -859,7 +1042,13 @@ case "$*" in
   "inspect "*) cat "$d/$2.json" ;;
   # <ctr>.top.later, when it exists, answers every top after the first (a restarted container).
   "top "*) if [[ -f $d/$2.top.later && -f $d/$2.top.seen ]]; then cat "$d/$2.top.later"; else : > "$d/$2.top.seen"; cat "$d/$2.top"; fi ;;
-  "compose "*" ps -q --status running "*) cat "$d/$last.ctr" 2>/dev/null || true ;;
+  # <svc>.ctr.later, when it exists, answers every ps after the first, and <svc>.ctr.final every
+  # ps after the second (a container recreated during the samples, or after the listener check).
+  "compose "*" ps -q --status running "*)
+    n=$(($(cat "$d/$last.ctr.n" 2>/dev/null || echo 0) + 1)); echo "$n" > "$d/$last.ctr.n"
+    if [[ -f $d/$last.ctr.final ]] && ((n >= 3)); then cat "$d/$last.ctr.final"
+    elif [[ -f $d/$last.ctr.later ]] && ((n >= 2)); then cat "$d/$last.ctr.later"
+    else cat "$d/$last.ctr" 2>/dev/null || true; fi ;;
   *" exec -T reth "*) echo "Reth Version: 2.7.0" ;;
   *" exec -T lighthouse "*) echo "Lighthouse v8.3.0-rc.0-0123abc" ;;
   *) echo "docker stub: unexpected: $*" >&2; exit 1 ;;
@@ -912,15 +1101,35 @@ pf_base
 pf_case 0 "a set-up host and a matching endpoint pass" '^spec diff: empty \(8 fork versions'
 pf_case 0 "the endpoint is named by scheme and host" '^checkpoint provider 1: https://checkpoint\.example\.org$'
 
-set_env "$pf_env" CHECKPOINT_SYNC_URL "https://eth-sepolia.example.com/v2/KEY123secret/"
+# A checkpoint URL reaches Lighthouse's command line (compose.yaml), which any local user reads
+# in ps, so one whose path may hold a provider key is refused, and never printed: more than one
+# path segment, or one of 16 characters or more. A keyed provider goes behind a local proxy.
+keyed=" has a path that may hold a provider key (more than one segment, or one of 16 or more characters; Lighthouse's command line shows it in ps): put the provider behind a local proxy (README.md): FAIL"
+# url_case <expect-exit> <description> <key> <url> <fixed line or ''> <secret>: preflight.sh
+# with <key> set to <url>; the line, if any, appears, and <secret> is never printed.
+url_case() {
+  local rc=0 out
+  pf_base; set_env "$pf_env" "$3" "$4"
+  out=$(PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env" 2>&1) || rc=$?
+  if ((rc == $1)) && { [[ -z $5 ]] || printf '%s\n' "$out" | grep -qxF -- "$5"; } && ! printf '%s' "$out" | grep -qF -- "$6"; then
+    ok "preflight: $2"
+  else
+    bad "preflight: $2 (exit $rc, want $1${5:+; want the line '$5'})" "$out"
+  fi
+}
+url_case 1 "a key under a version path is refused" CHECKPOINT_SYNC_URL "https://eth-sepolia.example.com/v2/KEY123secret/" \
+  "CHECKPOINT_SYNC_URL: https://eth-sepolia.example.com/…$keyed" KEY123secret
+url_case 1 "a 16-character path segment is refused" CHECKPOINT_SYNC_URL "https://cp.example.org/0123456789abcdef" \
+  "CHECKPOINT_SYNC_URL: https://cp.example.org/…$keyed" 0123456789abcdef
+url_case 1 "provider 2's keyed path is refused too" CHECKPOINT_SYNC_URL_2 "https://cp2.example.net/v1/KEY777secret" \
+  "CHECKPOINT_SYNC_URL_2: https://cp2.example.net/…$keyed" KEY777secret
+url_case 1 "credentials in a checkpoint URL are refused" CHECKPOINT_SYNC_URL "https://user:KEY123secret@cp.example.org" \
+  "CHECKPOINT_SYNC_URL: https://cp.example.org/… has credentials in it (Lighthouse's command line shows them in ps): put the provider behind a local proxy (README.md): FAIL" KEY123secret
+url_case 0 "a 15-character path segment passes" CHECKPOINT_SYNC_URL "https://cp.example.org/0123456789abcde" '' 0123456789abcde
+pf_base; set_env "$pf_env" CHECKPOINT_SYNC_URL "https://eth-sepolia.example.com/beacon/"
 : > "$tmp/curl.log"
-rc=0; out=$(PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env" 2>&1) || rc=$?
-if ((rc == 0)) && ! printf '%s' "$out" | grep -q KEY123secret && printf '%s\n' "$out" | grep -qF 'https://eth-sepolia.example.com/…'; then
-  ok "preflight: a key in the URL path is never printed"
-else
-  bad "preflight: a key in the URL path is never printed (exit $rc)" "$out"
-fi
-if grep -qx 'https://eth-sepolia.example.com/v2/KEY123secret/eth/v1/config/spec' "$tmp/curl.log"; then
+pf_case 0 "a one-segment base path passes, named by scheme and host" '^checkpoint provider 1: https://eth-sepolia\.example\.com/…$'
+if grep -qx 'https://eth-sepolia.example.com/beacon/eth/v1/config/spec' "$tmp/curl.log"; then
   ok "preflight: the spec is fetched under the URL's base path, URL on curl's stdin"
 else
   bad "preflight: the spec is fetched under the URL's base path" "$(cat "$tmp/curl.log")"
@@ -936,7 +1145,7 @@ pf_base; set_env "$pf_env" CHECKPOINT_SYNC_URL "http://checkpoint.example.org"
 pf_case 1 "plain http to a remote host is refused" '^CHECKPOINT_SYNC_URL: http://checkpoint\.example\.org is not https:// \(or http:// to a loopback host\): FAIL$'
 pf_base; set_env "$pf_env" CHECKPOINT_SYNC_URL "http://127.0.0.1:5052"
 pf_case 0 "plain http to a loopback host passes" '^checkpoint provider 1: http://127\.0\.0\.1:5052$'
-pf_base; set_env "$pf_env" TRUSTED_PEERS "16Uiu2HAm,not a peer"
+pf_base; set_env "$pf_env" TRUSTED_PEERS "16Uiu2HAm,not-a-peer"
 pf_case 1 "a TRUSTED_PEERS entry that is not base58 is refused" '^TRUSTED_PEERS: .*FAIL$'
 pf_base; set_env "$pf_env" TRUSTED_PEERS "$pid,$pid"
 pf_case 0 "a comma-separated TRUSTED_PEERS list passes" '^TRUSTED_PEERS: 2 peer'
@@ -995,11 +1204,11 @@ done
 
 # A query or fragment would land after the API path (or hide it): refused, never printed.
 pf_base; set_env "$pf_env" CHECKPOINT_SYNC_URL "https://cp.example.org/base?apikey=KEY123secret"
-pf_case 1 "a checkpoint URL with a query is refused" '^CHECKPOINT_SYNC_URL: https://cp\.example\.org/… has a query or fragment \(put a key in the path\): FAIL$'
+pf_case 1 "a checkpoint URL with a query is refused" '^CHECKPOINT_SYNC_URL: https://cp\.example\.org/… has a query or fragment \(the API path is appended to the URL; put a keyed provider behind a local proxy, README\.md\): FAIL$'
 rc=0; out=$(PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env" 2>&1) || rc=$?
 if printf '%s' "$out" | grep -q KEY123secret; then bad "preflight: the query is never printed" "$out"; else ok "preflight: the query is never printed"; fi
 pf_base; set_env "$pf_env" CHECKPOINT_SYNC_URL "https://cp.example.org/#frag"
-pf_case 1 "a checkpoint URL with a fragment is refused" 'has a query or fragment .*FAIL$'
+pf_case 2 "a checkpoint URL with a fragment is refused (a # in an .env value)" 'line [0-9]+: CHECKPOINT_SYNC_URL holds .* a #'
 
 # compose lets the shell environment override .env: a differing value is refused (by name).
 pf_base
@@ -1038,6 +1247,14 @@ else
   echo "# skip - preflight refuses a FIFO at a JWT copy: no timeout command to bound the run"
 fi
 pf_base
+# The data directories are opened through fsguard too (inspect-dir: no symlink anywhere on the
+# path, and a directory), so a 0700 file or a symlink to a 0700 directory there is no data dir.
+mv "$root/reth/data" "$tmp/data.keep" && : > "$root/reth/data" && chmod 0700 "$root/reth/data"
+pf_case 1 "a 0700 regular file at a data dir is refused" "^$root/reth/data: a symlink or not a directory .*\\(want 700 $me_uid\\): FAIL$"
+rm "$root/reth/data" && ln -s "$tmp/data.keep" "$root/reth/data"
+pf_case 1 "a symlink to a 0700 directory at a data dir is refused" "^$root/reth/data: a symlink or not a directory .*\\(want 700 $me_uid\\): FAIL$"
+rm "$root/reth/data" && mv "$tmp/data.keep" "$root/reth/data"
+pf_case 0 "a data dir that is a 0700 directory passes" "^$root/reth/data: 700 $me_uid: PASS$"
 
 # NETWORK and the ports.
 for value in '' mainnet; do
@@ -1148,11 +1365,63 @@ check_out 2 "preflight: COMPOSE_PROJECT_NAME in the environment is refused" '^ER
   env PATH="$tmp/stubs-curl:$PATH" COMPOSE_PROJECT_NAME=sepolia-ref bash "$preflight" --test-mode --env-file "$pf_env"
 check_out 2 "preflight: an empty COMPOSE_PROJECT_NAME in the environment is refused too" '^ERROR: COMPOSE_PROJECT_NAME is set in the environment' \
   env PATH="$tmp/stubs-curl:$PATH" COMPOSE_PROJECT_NAME= bash "$preflight" --test-mode --env-file "$pf_env"
-pf_case 0 "the compose project is named" '^compose project: sepolia-ref \(docker compose -p sepolia-ref --env-file .*\)$'
+# Any other compose variable, or a docker one, is refused in the environment too: COMPOSE_FILE
+# picks the file `up` reads, and DOCKER_HOST, DOCKER_CONTEXT, DOCKER_CONFIG and DOCKER_TLS*
+# point docker at another daemon (or its config) than the one checked.
+for assignment in COMPOSE_FILE=/tmp/evil.yaml COMPOSE_PROFILES=debug COMPOSE_ENV_FILES=/tmp/x.env \
+  DOCKER_HOST=tcp://198.51.100.7:2375 DOCKER_CONTEXT=remote DOCKER_CONFIG=/tmp/dc DOCKER_TLS_VERIFY=1 DOCKER_TLS=1 DOCKER_HOST= \
+  DOCKER_CERT_PATH=/tmp/certs DOCKER_DEFAULT_PLATFORM=linux/amd64 DOCKER_BUILDKIT=0 DOCKER_API_VERSION=1.24; do
+  check_out 2 "preflight: '$assignment' in the environment is refused" "^ERROR: ${assignment%%=*} is set in the environment; unset it" \
+    env PATH="$tmp/stubs-curl:$PATH" "$assignment" bash "$preflight" --test-mode --env-file "$pf_env"
+done
+for name in DOCKER_HOST DOCKER_CONTEXT; do
+  check_out 2 "preflight: with two docker variables set, $name is named" "^ERROR: $name is set in the environment" \
+    env PATH="$tmp/stubs-curl:$PATH" DOCKER_HOST=unix:///x DOCKER_CONTEXT=remote bash "$preflight" --test-mode --env-file "$pf_env"
+done
+check_out 0 "preflight: a docker-unrelated DOCKERFILE variable is not refused" '^preflight OK' \
+  env PATH="$tmp/stubs-curl:$PATH" DOCKERFILE=x bash "$preflight" --test-mode --env-file "$pf_env"
+# The start line is shell input the operator pastes: every word is quoted (printf %q), so an
+# .env path with a blank, $(...) or "-p x" in it stays one argument and runs nothing.
+weird="$tmp/a b \$(touch pwned) -p x"
+mkdir -m 0700 "$weird" && cp "$pf_env" "$weird/pf.env"
+out=$(env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$weird/pf.env" 2>&1) || true
+start_line=$(printf '%s\n' "$out" | sed -n 's/^start: //p')
+# shellcheck disable=SC2329 # docker is called by the eval'd start line
+got=$(cd "$tmp" && docker() { printf '<%s>' "$@"; } && eval "$start_line") || got="(eval failed)"
+if [[ $got == "<compose><-p><sepolia-ref><--env-file><$weird/pf.env><-f><$ref/compose.yaml><up><-d>" && ! -e $tmp/pwned ]]; then
+  ok "preflight: the start line quotes an .env path with a blank, \$(...) and -p x"
+else
+  bad "preflight: the start line quotes a hostile .env path (got $got; pwned: $([[ -e $tmp/pwned ]] && echo yes || echo no))" "$start_line"
+fi
+rm -rf "$tmp/pwned" "$weird"
+no_tmpdir 0 "preflight: the caller's TMPDIR is not used" "$tmp/stubs-curl:" bash "$preflight" --test-mode --env-file "$pf_env"
+# The .env is read once, through fsguard read-file (the .env directory walk, then a regular
+# file with one link, opened O_NOFOLLOW|O_NONBLOCK), like setup.sh reads it.
+pfe="$tmp/pfe" && mkdir -m 0700 "$pfe" && cp "$pf_env" "$pfe/target.env" && ln -s target.env "$pfe/link.env"
+ln "$pfe/target.env" "$pfe/hard.env"
+mkdir -m 0770 "$tmp/pfe-gw" && cp "$pf_env" "$tmp/pfe-gw/.env"
+for spec in "link.env|link\.env: a symlink or unreadable" "hard.env|hard\.env: has 2 hard links"; do
+  check_out 2 "preflight: an .env ${spec#*|} is refused" "${spec#*|}" \
+    env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pfe/${spec%%|*}"
+done
+check_out 2 "preflight: an .env in a group-writable directory is refused" 'pfe-gw: writable by group or others' \
+  env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$tmp/pfe-gw/.env"
+if [[ -n $bound ]]; then
+  mkfifo -m 0600 "$pfe/fifo.env"
+  # shellcheck disable=SC2086 # $bound is a command prefix
+  check_out 2 "preflight: an .env that is a FIFO is refused without blocking" 'fifo\.env: not a regular file' \
+    $bound env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pfe/fifo.env"
+else
+  echo "# skip - preflight refuses a FIFO at the .env: no timeout command to bound the run"
+fi
+pf_case 0 "the start command names the project, the .env and the compose file" \
+  "^start: docker compose -p sepolia-ref --env-file $pf_env -f $ref/compose\\.yaml up -d$"
 
 # A DATA_ROOT is data, never program text: with | and ;e in it (GNU sed's e command would run
-# the rest), a missing JWT copy is reported by its literal path and nothing runs.
-pf_base; evil_root="$tmp/m|x|;etouch $tmp/pwned;#"
+# the rest, here a script that leaves a file), a missing JWT copy is reported by its literal
+# path and nothing runs.
+printf '#!/bin/sh\ntouch "%s/pwned"\n' "$tmp" > "$tmp/pwn.sh" && chmod +x "$tmp/pwn.sh"
+pf_base; evil_root="$tmp/m|x|;e$tmp/pwn.sh;"
 set_env "$pf_env" DATA_ROOT "$evil_root"
 rc=0; out=$(env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env" 2>&1) || rc=$?
 if ((rc == 1)) && [[ ! -e $tmp/pwned ]] && printf '%s\n' "$out" | grep -qxF "$evil_root/reth/jwt.hex: no such file (want 600 $me_uid): FAIL"; then
@@ -1208,7 +1477,7 @@ cl_container() {
   printf '%s\n' "$2" > "$tmp/docker/$1.digests"
   echo "$3" > "$tmp/docker/$1.image-id"
   echo "$4" > "$tmp/docker/$1.ctr"
-  python3 -I - "$tmp/docker/$4.json" "$1" "$3" "$5" "$6" "$root" <<'PY'
+  python3 -I -B - "$tmp/docker/$4.json" "$1" "$3" "$5" "$6" "$root" <<'PY'
 import json, sys
 out, svc, image, uid, gid, root = sys.argv[1:]
 json.dump([{
@@ -1231,7 +1500,7 @@ PY
 }
 # cl_inspect <container id> <python statement on c, the inspect object>: loosen one setting.
 cl_inspect() {
-  python3 -I - "$tmp/docker/$1.json" "$2" <<'PY'
+  python3 -I -B - "$tmp/docker/$1.json" "$2" <<'PY'
 import json, sys
 path, stmt = sys.argv[1:]
 doc = json.load(open(path)); c = doc[0]
@@ -1277,7 +1546,7 @@ has() { # has <fixed string> <description>
 
 cl_base
 cl_run 0 "a synced, hardened node passes (13 samples over 1 h)"
-for c in 1 2 3 4 5 6 7 8; do verdict "$c" PASS "criterion $c passes on a healthy node"; done
+for c in 1 2 3 4 5 6 7 8 9; do verdict "$c" PASS "criterion $c passes on a healthy node"; done
 has "- Overall: **PASS**" "the overall verdict is PASS"
 has "13 sample(s) taken of 13, first to last 3600 s: acceptance" "the sync run is labelled acceptance"
 has "Reth Version: 2.7.0" "records the reth --version output"
@@ -1300,6 +1569,7 @@ has "127.0.0.1:8551" "records the ss line for 8551"
 has "$jwt_r: 600 $me_uid: PASS" "records the mode and owner of reth's JWT copy"
 has "$key_path: 600 $me_uid: PASS" "records the mode and owner of the node key"
 has "reth: no non-loopback TCP listener but p2p port 30303 (pids 812): PASS" "records reth's listeners"
+has "reth: container ctr-reth, the one criterion 1 checked, still runs: PASS" "the container criterion 1 checked still runs at the end"
 has "lighthouse: p2p listener 0.0.0.0:9000 (pid 901)" "records Lighthouse's p2p listener"
 has "spec diff: empty (8 fork versions, 7 fork epochs, 2 blob schedule entries)" "records the empty spec diff"
 has "finalized slot 10128, oldest block slot 10000 (anchor.oldest_block_slot): 128 slots: PASS" "a 128-slot finalized range passes"
@@ -1475,6 +1745,31 @@ cl_base; printf '%s\n' 'RUID EUID PID COMMAND' "$me_uid $me_uid 1812 reth" > "$t
 printf '%s\n' "$ss_head" "$ss_reth" "$ss_lh" "$ss_p2p" "${ss_rp2p/pid=812/pid=1812}" > "$tmp/ss.txt"
 cl_run 0 "a container restarted during the run is checked by its new pids"
 has "reth: no non-loopback TCP listener but p2p port 30303 (pids 1812): PASS" "records the new pids"
+has "reth: container ctr-reth, the one criterion 1 checked, still runs: PASS" "a restart keeps the container criterion 1 checked"
+# Criterion 1 checks the image, the hardening and the uid once, before the hour of samples; a
+# container recreated in that hour (a new id, maybe without the hardening) fails here.
+cl_base; echo ctr-reth2 > "$tmp/docker/reth.ctr.later"
+cp "$tmp/docker/ctr-reth.json" "$tmp/docker/ctr-reth2.json" && cp "$tmp/docker/ctr-reth.top" "$tmp/docker/ctr-reth2.top"
+cl_quick "a container recreated during the run fails"
+verdict 3 FAIL "a recreated container fails criterion 3"
+has "reth: container ctr-reth2 runs now, not ctr-reth, the one criterion 1 checked (recreated during the run; its image, hardening and uid are unchecked): FAIL" "names both container ids"
+has "lighthouse: container ctr-lh, the one criterion 1 checked, still runs: PASS" "the other service's container is unchanged"
+cl_base; : > "$tmp/docker/lighthouse.ctr.later"
+cl_quick "a container gone by the end of the run fails"
+verdict 3 FAIL "a container no longer running fails criterion 3"
+has "lighthouse: container ctr-lh, the one criterion 1 checked, no longer runs: FAIL" "says the checked container is gone"
+# The ids are compared once more after the last criterion: a container recreated or stopped
+# while sections 4 to 8 ran fails too.
+cl_base; echo ctr-reth3 > "$tmp/docker/reth.ctr.final"
+cp "$tmp/docker/ctr-reth.json" "$tmp/docker/ctr-reth3.json" && cp "$tmp/docker/ctr-reth.top" "$tmp/docker/ctr-reth3.top"
+cl_run 1 "a container recreated after the listener check fails the run"
+verdict 3 PASS "the listener check still saw the checked container"
+verdict 9 FAIL "a container recreated after the listener check fails criterion 9"
+has "reth: container ctr-reth3 runs now, not ctr-reth, the one criterion 1 checked (recreated during the run; its image, hardening and uid are unchecked): FAIL" "names the late container"
+has "- Overall: **FAIL**" "a late recreate makes the run FAIL"
+cl_base; : > "$tmp/docker/lighthouse.ctr.final"
+cl_run 1 "a container stopped after the listener check fails the run"
+verdict 9 FAIL "a container stopped after the listener check fails criterion 9"
 cl_base; sed 's/ *users:.*//' "$tmp/ss.txt" > "$tmp/ss.bare" && mv "$tmp/ss.bare" "$tmp/ss.txt"
 cl_quick "an ss without process information fails"
 verdict 3 FAIL "listeners that cannot be matched to a process fail"
@@ -1499,6 +1794,42 @@ check_out 2 "run log: COMPOSE_PROJECT_NAME in .env is refused" 'COMPOSE_PROJECT_
 cl_base
 check_out 2 "run log: COMPOSE_PROJECT_NAME in the environment is refused" '^ERROR: COMPOSE_PROJECT_NAME is set in the environment' \
   env PATH="$stubs:$PATH" COMPOSE_PROJECT_NAME=hoodi-ref bash "$collect" --env-file "$cl_env" --samples 1 --interval 0
+for assignment in COMPOSE_FILE=/tmp/evil.yaml COMPOSE_PROFILES=debug DOCKER_HOST=tcp://198.51.100.7:2375 \
+  DOCKER_CONTEXT=remote DOCKER_CONFIG=/tmp/dc DOCKER_TLS_VERIFY=1 DOCKER_TLS= DOCKER_CERT_PATH=/tmp/certs \
+  DOCKER_DEFAULT_PLATFORM=linux/amd64; do
+  : > "$tmp/docker.log"
+  rc=0; out=$(env PATH="$stubs:$PATH" "$assignment" bash "$collect" --env-file "$cl_env" --samples 1 --interval 0 2>&1) || rc=$?
+  if ((rc == 2)) && printf '%s\n' "$out" | grep -q "^ERROR: ${assignment%%=*} is set in the environment; unset it" && [[ ! -s $tmp/docker.log ]]; then
+    ok "run log: '$assignment' in the environment is refused before any docker call"
+  else
+    bad "run log: '$assignment' in the environment is refused (exit $rc)" "$out"
+  fi
+done
+# The .env is read once through fsguard, and compose gets that private copy (--env-file), so
+# a symlink, a hard link or a FIFO there is refused before any docker call.
+cle="$tmp/cle" && mkdir -m 0700 "$cle" && cp "$cl_env" "$cle/target.env" && ln -s target.env "$cle/link.env"
+ln "$cle/target.env" "$cle/hard.env"
+[[ -n $bound ]] && mkfifo -m 0600 "$cle/fifo.env"
+for spec in "link.env|link\.env: a symlink or unreadable" "hard.env|hard\.env: has 2 hard links" "fifo.env|fifo\.env: not a regular file"; do
+  if [[ ${spec%%|*} == fifo.env && -z $bound ]]; then echo "# skip - run log refuses a FIFO at the .env: no timeout command"; continue; fi
+  : > "$tmp/docker.log"
+  # shellcheck disable=SC2086 # $bound is empty or a command prefix
+  rc=0; out=$($bound env PATH="$stubs:$PATH" bash "$collect" --env-file "$cle/${spec%%|*}" --samples 1 --interval 0 2>&1) || rc=$?
+  if ((rc == 2)) && printf '%s\n' "$out" | grep -Eq "${spec#*|}" && [[ ! -s $tmp/docker.log ]]; then
+    ok "run log: an .env ${spec#*|} is refused before any docker call"
+  else
+    bad "run log: an .env ${spec#*|} is refused (exit $rc)" "$out"
+  fi
+done
+cl_base; : > "$tmp/docker.log"
+cl_quick "one sample, for compose's --env-file"
+if grep '^compose ' "$tmp/docker.log" | grep -q -- "--env-file $cl_env "; then
+  bad "run log: compose reads the private .env copy, never the .env by path" "$(cat "$tmp/docker.log")"
+else
+  ok "run log: compose reads the private .env copy, never the .env by path"
+fi
+cl_base
+no_tmpdir 1 "run log: the caller's TMPDIR is not used" "$stubs:" bash "$collect" --env-file "$cl_env" --samples 1 --interval 0
 
 # Values that reach a sed or awk program are data, never program text: a container id with &
 # (sed's "the match") is printed as it is.
@@ -1607,7 +1938,7 @@ cl_hoodi; : > "$tmp/curl.log"; : > "$tmp/docker.log"
 collect_script="$yes_ref/collect-run-log.sh"
 cl_run 0 "Hoodi: a synced, hardened node on fork-ready releases passes" --config "$pinned_hoodi"
 collect_script=
-for c in 1 2 3 4 5 6 7 8; do verdict "$c" PASS "Hoodi: criterion $c passes on a healthy node"; done
+for c in 1 2 3 4 5 6 7 8 9; do verdict "$c" PASS "Hoodi: criterion $c passes on a healthy node"; done
 has "# Hoodi reference node run log" "Hoodi: the title names the network"
 if grep -q '^compose -p hoodi-ref --env-file ' "$tmp/docker.log" && ! grep '^compose ' "$tmp/docker.log" | grep -vq '^compose -p hoodi-ref '; then
   ok "run log: Hoodi: every compose call passes -p hoodi-ref"
@@ -1673,7 +2004,7 @@ else
   docker compose --env-file "$tmp/compose.env" -f "$ref/compose.yaml" config --format json > "$tmp/compose.json"
   # compose_rule <description> <python expression over c (the config) and s (its services)>
   compose_rule() {
-    check 0 "compose: $1" python3 -I -c '
+    check 0 "compose: $1" python3 -I -B -c '
 import json, sys
 c = json.load(open(sys.argv[1])); s = c["services"]
 sys.exit(0 if eval(sys.argv[2]) else 1)' "$tmp/compose.json" "$2"
@@ -1702,6 +2033,49 @@ sys.exit(0 if eval(sys.argv[2]) else 1)' "$tmp/compose.json" "$2"
     'not any(a.startswith(("--http", "--ws")) for a in s["reth"]["command"]) and all(a.startswith("--metrics=127.0.0.1:") for a in s["reth"]["command"] if a.startswith("--metrics"))'
   compose_rule "lighthouse starts after reth" '"reth" in s["lighthouse"]["depends_on"]'
 
+  # compose and the scripts read an .env env_check accepts the same way: every value compose
+  # renders is the one env_get returns. A line env_check refuses shows why: compose keeps reading
+  # after a closing quote and takes a second assignment the scripts never see.
+  cp "$ref/.env.example" "$tmp/agree.env"
+  set_env "$tmp/agree.env" CHECKPOINT_SYNC_URL https://cp.example.org/v1
+  set_env "$tmp/agree.env" TRUSTED_PEERS "$pid,$pid"
+  for key in RETH_UID RETH_GID; do set_env "$tmp/agree.env" "$key" 990; done
+  for key in LIGHTHOUSE_UID LIGHTHOUSE_GID; do set_env "$tmp/agree.env" "$key" 991; done
+  check 0 "compose: the agreement .env passes env_check" env_check "$tmp/agree.env"
+  # agree <env file> <description>: compose config against env_get, key by key.
+  agree() {
+    local want
+    want=$(for key in NETWORK RETH_IMAGE LIGHTHOUSE_IMAGE CHECKPOINT_SYNC_URL TRUSTED_PEERS DATA_ROOT RETH_UID RETH_GID LIGHTHOUSE_UID LIGHTHOUSE_GID $PORT_KEYS; do
+      printf '%s=%s\n' "$key" "$(env_get "$1" "$key")"; done)
+    docker compose --env-file "$1" -f "$ref/compose.yaml" config --format json > "$tmp/agree.json" 2>/dev/null
+    python3 -I -B - "$tmp/agree.json" > "$tmp/agree.got" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))["services"]
+r, l = s["reth"], s["lighthouse"]
+e = l["environment"]
+ru, rg = r["user"].split(":"); lu, lg = l["user"].split(":")
+root = r["volumes"][0]["source"][: -len("/reth/data")]
+got = {"NETWORK": e["NETWORK"], "RETH_IMAGE": r["image"], "LIGHTHOUSE_IMAGE": l["image"],
+       "CHECKPOINT_SYNC_URL": e["CHECKPOINT_SYNC_URL"], "TRUSTED_PEERS": e.get("TRUSTED_PEERS") or "",
+       "DATA_ROOT": root, "RETH_UID": ru, "RETH_GID": rg, "LIGHTHOUSE_UID": lu, "LIGHTHOUSE_GID": lg,
+       "ENGINE_PORT": e["ENGINE_PORT"], "BEACON_API_PORT": e["BEACON_API_PORT"],
+       "RETH_P2P_PORT": next(a.split("=", 1)[1] for a in r["command"] if a.startswith("--port=")),
+       "LIGHTHOUSE_P2P_PORT": e["LIGHTHOUSE_P2P_PORT"], "LIGHTHOUSE_QUIC_PORT": e["LIGHTHOUSE_QUIC_PORT"]}
+for k, v in got.items():
+    print(f"{k}={v}")
+PY
+    if [[ $(cat "$tmp/agree.got") == "$want" ]]; then ok "compose: $2"; else bad "compose: $2" "$(diff <(printf '%s\n' "$want") "$tmp/agree.got")"; fi
+  }
+  agree "$tmp/agree.env" "renders every value env_get reads from an accepted .env"
+  cp "$tmp/agree.env" "$tmp/smuggle.env" && printf "%s\n" "DUMMY=''RETH_UID=0" >> "$tmp/smuggle.env"
+  docker compose --env-file "$tmp/smuggle.env" -f "$ref/compose.yaml" config --format json > "$tmp/smuggle.json" 2>/dev/null
+  if python3 -I -B -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1]))["services"]["reth"]["user"].startswith("0:") else 1)' "$tmp/smuggle.json" &&
+    [[ $(env_get "$tmp/smuggle.env" RETH_UID) == 990 ]] && ! env_check "$tmp/smuggle.env" >/dev/null; then
+    ok "compose: DUMMY=''RETH_UID=0 would run reth as uid 0 under compose, and env_check refuses it"
+  else
+    bad "compose: DUMMY=''RETH_UID=0 (compose user $(python3 -I -B -c 'import json, sys; print(json.load(open(sys.argv[1]))["services"]["reth"]["user"])' "$tmp/smuggle.json" 2>&1))"
+  fi
+
   # The Lighthouse wrapper, run by bash as the container would, against a stub lighthouse that
   # prints its argv one per line.
   mkdir -p "$tmp/lh-bin"
@@ -1710,7 +2084,7 @@ sys.exit(0 if eval(sys.argv[2]) else 1)' "$tmp/compose.json" "$2"
   # lh_argv <compose env file>: the argv the wrapper hands Lighthouse.
   lh_argv() {
     docker compose --env-file "$1" -f "$ref/compose.yaml" config --format json > "$tmp/lh.json"
-    python3 -I - "$tmp/lh.json" "$tmp/lh-bin" <<'PY'
+    python3 -I -B - "$tmp/lh.json" "$tmp/lh-bin" <<'PY'
 import json, os, subprocess, sys
 svc = json.load(open(sys.argv[1]))["services"]["lighthouse"]
 assert svc["entrypoint"] == ["/bin/bash", "-c"], svc["entrypoint"]
@@ -1788,6 +2162,17 @@ if ((me_uid == 0)); then
   refuse_case "a root owned by another user" '[[ $(file_mode_uid "$tmp/oroot") == "755 65534" && -z $(ls -A "$tmp/oroot") ]]' --root "$tmp/oroot"
   mkdir -p "$tmp/oparent/node" && chown 65534 "$tmp/oparent" && chmod 0755 "$tmp/oparent" "$tmp/oparent/node"
   refuse_case "a directory above the root owned by another user" '[[ -z $(ls -A "$tmp/oparent/node") ]]' --root "$tmp/oparent/node"
+  # The .env must be owned by root, the euid or the sudo user: another user's file there is
+  # refused (read-file), even in a root-owned directory.
+  mkdir -m 0700 "$tmp/foreign-env" && cp "$ref/.env.example" "$tmp/foreign-env/.env" && chown 65534 "$tmp/foreign-env/.env"
+  check_out 2 "root: setup refuses an .env owned by another user" 'foreign-env/\.env: owned by uid 65534' \
+    env -u SUDO_UID bash "$setup" --env-file "$tmp/foreign-env/.env" --root "$tmp/foreign-root"
+  check_out 2 "root: fsguard read-file refuses a file owned by another uid" 'owned by uid 65534' \
+    python3 -I -B "$ref/lib/fsguard.py" read-file "$tmp/foreign-env" .env 0 -1
+  check_out 0 "root: fsguard read-file accepts the sudo user's file" '^NETWORK=sepolia$' \
+    python3 -I -B "$ref/lib/fsguard.py" read-file "$tmp/foreign-env" .env 0 65534
+  check_out 2 "root: preflight refuses an .env owned by another user" 'owned by uid 65534' \
+    env -u SUDO_UID PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --env-file "$tmp/foreign-env/.env"
   rc=0; bash "$setup" --test-mode --env-file "$real_env" --root "$tmp/tm-root" >/dev/null 2>&1 || rc=$?
   if ((rc == 2)) && [[ ! -e $tmp/tm-root ]]; then ok "root: setup.sh --test-mode as root is refused"; else bad "root: setup.sh --test-mode as root is refused (exit $rc)"; fi
 
@@ -1806,15 +2191,15 @@ exec $(command -v python3) "\$@"
 SH
     chmod +x "$tmp/hook/python3"
   }
-  # setup.sh's fsguard.py calls, in order: 1 check (DATA_ROOT), 2 check-dir (the .env
-  # directory), 3 install, 4 write-file (.env).
+  # setup.sh's fsguard.py calls, in order: 1 read-file (.env), 2 check (DATA_ROOT), 3 check-dir
+  # (the .env directory), 4 install, 5 write-file (.env).
   # Regression (DATA_ROOT ancestor swap): DATA_ROOT is swapped for a symlink to a victim tree
   # just before fsguard call n; nothing outside DATA_ROOT may change, and setup.sh must not
-  # report success. At call 1 another user owns the directory above DATA_ROOT (the attacker
-  # who can swap it). At calls 2 and 3 that directory is root's, so the check passes and the
+  # report success. At call 2 another user owns the directory above DATA_ROOT (the attacker
+  # who can swap it). At calls 3 and 4 that directory is root's, so the check passes and the
   # swap lands between it and install's own walk, which must not follow the symlink. Every
   # case proves the swap ran.
-  for spec in "1 65534" "2 0" "3 0"; do
+  for spec in "2 65534" "3 0" "4 0"; do
     read -r n owner <<< "$spec"
     a="$tmp/race2-$n/a" v="$tmp/race2-$n/victim"
     mkdir -p "$a/node" "$v/reth" && chown "$owner" "$a" && chmod 0755 "$a" "$a/node" "$v/reth"
@@ -1832,7 +2217,7 @@ SH
   r="$tmp/swap-data"
   cp "$ref/.env.example" "$tmp/swap.env"
   bash "$setup" --env-file "$tmp/swap.env" --root "$r" >/dev/null 2>&1
-  hooked 3 "rm -rf '$r/reth/data' && ln -s '$tmp/decoy' '$r/reth/data'"
+  hooked 4 "rm -rf '$r/reth/data' && ln -s '$tmp/decoy' '$r/reth/data'"
   rc=0; PATH="$tmp/hook:$PATH" bash "$setup" --env-file "$tmp/swap.env" --root "$r" >/dev/null 2>&1 || rc=$?
   if ((rc == 2)) && [[ $(file_mode_uid "$tmp/decoy") == "755 0" ]]; then ok "root: a data dir swapped after the checks is refused, its target untouched"; else bad "root: a data dir swapped after the checks (exit $rc, decoy $(file_mode_uid "$tmp/decoy"))"; fi
 
@@ -1883,13 +2268,13 @@ SH
   check_out 0 "root: an .env in a root-owned sticky directory is accepted" '^setup OK$' \
     env -u SUDO_UID bash "$setup" --env-file "$tmp/sticky/.env" --root "$tmp/sticky-root"
   # The swap between the checks and the write: a root-owned .env directory swapped for a
-  # symlink just before write-file (fsguard call 4). The write's own walk refuses it.
+  # symlink just before write-file (fsguard call 5). The write's own walk refuses it.
   e="$tmp/envrace"
   mkdir -m 0700 "$e" "$e/cfg" && cp "$ref/.env.example" "$e/cfg/.env"
   printf 'FOO=1\n' > "$vd/.env" && chmod 0644 "$vd/.env"
-  hooked 4 "mv '$e/cfg' '$e/cfg.saved' && ln -s '$vd' '$e/cfg'"
+  hooked 5 "mv '$e/cfg' '$e/cfg.saved' && ln -s '$vd' '$e/cfg'"
   rc=0; out=$(PATH="$tmp/hook:$PATH" bash "$setup" --env-file "$e/cfg/.env" --root "$tmp/envrace-root" 2>&1) || rc=$?
-  if ((rc == 2)) && [[ -L $e/cfg && $(cat "$tmp/hook/count") == 4 && $(cat "$vd/.env") == FOO=1 && $(file_mode_uid "$vd/.env") == "644 0" && -z $(find "$vd" -mindepth 1 ! -name .env) ]]; then
+  if ((rc == 2)) && [[ -L $e/cfg && $(cat "$tmp/hook/count") == 5 && $(cat "$vd/.env") == FOO=1 && $(file_mode_uid "$vd/.env") == "644 0" && -z $(find "$vd" -mindepth 1 ! -name .env) ]]; then
     ok "root: regression: an .env directory swapped for a symlink before the write is refused, its target untouched"
   else
     bad "root: regression: .env directory swapped before the write (exit $rc, calls $(cat "$tmp/hook/count")): $(find "$vd" -mindepth 1 | tr '\n' ' ')" "$out"
@@ -1968,6 +2353,14 @@ SH
   fi
 fi
 
+# Python bytecode never lands in the stack: the scripts run python3 -B, and __pycache__/ is
+# ignored should anything else write it.
+if [[ -z $(find "$yes_ref" -name __pycache__) ]]; then ok "no __pycache__ written by the scripts"; else bad "no __pycache__ written by the scripts" "$(find "$yes_ref" -name __pycache__)"; fi
+if command -v git >/dev/null 2>&1 && git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  check 0 "ops/ref-node ignores __pycache__/" git -C "$repo" check-ignore -q ops/ref-node/lib/__pycache__/fsguard.cpython-312.pyc
+else
+  echo "# skip - __pycache__ is git-ignored: no git work tree"
+fi
 if [[ -n $(find "$start_dir" "$tmp" -maxdepth 1 -name 'run-log-*.md') ]]; then bad "no run log written outside the tests' own files"; else ok "no run log written outside the tests' own files"; fi
 
 echo "# $passed passed, $failed failed"

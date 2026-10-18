@@ -11,7 +11,8 @@ Exit 0 done, 1 a secret or verification problem, 2 a refused path or bad usage.
         Every check `install` makes, changing nothing. A service uid of -1 means "no such
         user yet". Rules:
         - ROOT is absolute, without empty, . or .. components;
-        - every existing directory from / down to ROOT's parent is owned by root or EUID and not
+        - every directory from / down to ROOT's parent exists (only ROOT itself may be missing:
+          setup.sh never creates a directory above it), and is owned by root or EUID and not
           writable by group or others, unless it is root-owned and sticky (/tmp);
         - ROOT, if it exists, is owned by root or EUID and not writable by group or others;
         - ROOT/.staging, if it exists, is a directory owned by EUID, mode 0700 and empty;
@@ -19,9 +20,10 @@ Exit 0 done, 1 a secret or verification problem, 2 a refused path or bad usage.
           service uid; ROOT/<svc>/jwt.hex, if it exists, is a regular file with one link,
           owned the same way. Any symlink among them is refused.
     install ROOT EUID RETH_UID RETH_GID LH_UID LH_GID ROTATE CHOWN
-        The same checks, then: create the missing directories (ROOT 0755 if created here,
-        .staging 0700, the service dirs 0700), and write one JWT secret as two 0600 copies,
-        each created O_EXCL in .staging, chowned there and renamed into ROOT/<svc>/jwt.hex.
+        The same checks, then: create the missing directories (ROOT 0755 if created here, never
+        a parent of it; .staging 0700, the service dirs 0700), and write one JWT secret as two
+        0600 copies, each created O_EXCL in .staging, chowned there and renamed into
+        ROOT/<svc>/jwt.hex.
         An existing secret is kept (a missing copy restored from the other) unless ROTATE is 1;
         copies that differ, or are not 64 lower-case hex characters, exit 1. CHOWN 0 (test
         mode) chowns nothing. Ends by verifying every mode and owner through descriptors.
@@ -34,6 +36,11 @@ Exit 0 done, 1 a secret or verification problem, 2 a refused path or bad usage.
         The check-dir walk again, keeping DIR's descriptor, then replace DIR/NAME with stdin,
         mode 0600, via a file created O_EXCL|O_NOFOLLOW through that descriptor and renamed
         over NAME through it (a symlink at NAME is replaced, never followed).
+    read-file DIR NAME EUID OPERATOR_UID
+        The check-dir walk, then DIR/NAME opened through DIR's descriptor as `inspect` opens a
+        file (O_NOFOLLOW|O_NONBLOCK, fstat'ed first: a regular file with one link), owned by
+        root, EUID or OPERATOR_UID like the directories, and copied to stdout, at most 64 KiB.
+        setup.sh, preflight.sh and collect-run-log.sh read the .env this way, once.
     inspect PATH
         PATH (absolute, without empty, . or .. components) opened by a walk from / that never
         follows a symlink (every directory O_DIRECTORY|O_NOFOLLOW), the file itself
@@ -41,6 +48,10 @@ Exit 0 done, 1 a secret or verification problem, 2 a refused path or bad usage.
         one link. Prints "<octal mode> <owner uid>"; whether those are right is the caller's
         verdict. Nothing is read. A symlink, a FIFO, a directory, a hard link or a missing file
         is refused (exit 2) with the reason.
+    inspect-dir PATH
+        PATH opened by the same walk, PATH itself O_DIRECTORY|O_NOFOLLOW too, and fstat'ed.
+        Prints "<octal mode> <owner uid>". A symlink anywhere on the path, a non-directory or a
+        missing directory is refused (exit 2) with the reason.
     same-secret PATH_A PATH_B
         Both opened as `inspect` opens them; exit 0 if both hold the same 64 lower-case hex
         characters, 1 if not. The secret is never printed.
@@ -59,6 +70,8 @@ O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(o
 O_FILE = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
 SECRET = re.compile(rb"[0-9a-f]{64}")
 SERVICES = ("reth", "lighthouse")
+# The largest file read-file copies (an .env is a few hundred bytes).
+MAX_READ = 65536
 
 
 class Refused(Exception):
@@ -104,9 +117,11 @@ def check_closed(fd, path, owners, sticky_ok):
 
 def walk(root, euid, create, operator=None, what="DATA_ROOT", sticky_last=False):
     """The descriptor of ROOT (created, 0755, if `create`), or None if it does not exist and
-    `create` is false. Every component is checked on the way: owned by root or EUID (or
-    `operator`, when not None) and closed to group and others, unless root-owned and sticky.
-    ROOT itself may be root-owned and sticky only with `sticky_last` (the .env directory)."""
+    `create` is false. Every component above ROOT must exist: a missing one is refused, never
+    created (it would be root's, 0755, wherever a path was mistyped). Every component is checked
+    on the way: owned by root or EUID (or `operator`, when not None) and closed to group and
+    others, unless root-owned and sticky. ROOT itself may be root-owned and sticky only with
+    `sticky_last` (the .env directory)."""
     parts = components(root, what)
     owners = {0, euid} | ({operator} if operator is not None else set())
     fd = os.open("/", O_DIR)
@@ -117,6 +132,8 @@ def walk(root, euid, create, operator=None, what="DATA_ROOT", sticky_last=False)
             path += "/" + name
             last = i == len(parts) - 1
             nfd = open_dir(fd, name, path)
+            if nfd is None and not last:
+                raise Refused(f"{path}: no such directory (setup.sh creates none above {what}; create it first)")
             if nfd is None:
                 if not create:
                     os.close(fd)
@@ -385,20 +402,31 @@ def write_file(directory, name, euid, operator):
     return 0
 
 
-def open_path(path):
-    """PATH's descriptor, through the walk from / that follows no symlink; any owner."""
+def open_parent(path, missing):
+    """The descriptor of PATH's parent and PATH's last component, through the walk from / that
+    follows no symlink (any owner); a missing directory on the way is refused as `missing`."""
     parts = components(path, "the path")
     fd = os.open("/", O_DIR)
+    walked = ""
     try:
-        walked = ""
         for name in parts[:-1]:
             walked += "/" + name
             nfd = open_dir(fd, name, walked)
             if nfd is None:
-                raise Refused(f"{path}: no such file")
+                raise Refused(f"{path}: {missing}")
             os.close(fd)
             fd = nfd
-        ffd = open_file(fd, parts[-1], path, None)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, parts[-1]
+
+
+def open_path(path):
+    """PATH's descriptor, through the walk from / that follows no symlink; any owner."""
+    fd, name = open_parent(path, "no such file")
+    try:
+        ffd = open_file(fd, name, path, None)
     finally:
         os.close(fd)
     if ffd is None:
@@ -414,6 +442,47 @@ def inspect(path):
     return 0
 
 
+def inspect_dir(path):
+    fd, name = open_parent(path, "no such directory")
+    try:
+        dfd = open_dir(fd, name, path)
+    finally:
+        os.close(fd)
+    if dfd is None:
+        raise Refused(f"{path}: no such directory")
+    st = os.fstat(dfd)
+    os.close(dfd)
+    print(f"{mode_of(st):o} {st.st_uid}")
+    return 0
+
+
+def read_file(directory, name, euid, operator):
+    if name in ("", ".", "..") or "/" in name:
+        raise Refused(f"{name!r}: not a file name")
+    path = f"{directory.rstrip('/')}/{name}"
+    dfd = env_dir(directory, euid, operator)
+    owners = {0, int(euid)} | ({operator_uid(operator)} - {None})
+    try:
+        fd = open_file(dfd, name, path, owners)
+    finally:
+        os.close(dfd)
+    if fd is None:
+        raise Refused(f"{path}: no such file")
+    data = b""
+    try:
+        while len(data) <= MAX_READ:
+            chunk = os.read(fd, MAX_READ + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(fd)
+    if len(data) > MAX_READ:
+        raise Refused(f"{path}: larger than {MAX_READ} bytes")
+    sys.stdout.buffer.write(data)
+    return 0
+
+
 def same_secret(path_a, path_b):
     a, b = read_secret(open_path(path_a)), read_secret(open_path(path_b))
     return 0 if a == b and SECRET.fullmatch(a) else 1
@@ -424,7 +493,9 @@ COMMANDS = {
     "install": (install, 8),
     "check-dir": (check_dir, 3),
     "write-file": (write_file, 4),
+    "read-file": (read_file, 4),
     "inspect": (inspect, 1),
+    "inspect-dir": (inspect_dir, 1),
     "same-secret": (same_secret, 2),
 }
 

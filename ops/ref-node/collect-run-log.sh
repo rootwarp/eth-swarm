@@ -25,10 +25,12 @@
 #      syncing). An acceptance PASS needs every requested sample taken, at least 12 of them,
 #      and 3600 s or more from the first to the last; a shorter run that passes is DIAGNOSTIC
 #      (not acceptance), and so is the whole log;
-#   3. binds: from `ss -ltnp`, every listener on ENGINE_PORT and BEACON_API_PORT is on
-#      127.0.0.1, and every TCP listener either container's processes own is on loopback or on
-#      that service's own p2p port (lib/common.sh check_listeners), so an override that opens
-#      an RPC on a public address fails;
+#   3. binds: each service still runs the container criterion 1 checked (the same id: one
+#      recreated during the sync samples, maybe without the hardening, fails, since its image,
+#      hardening and uid were never checked); from `ss -ltnp`, every listener on ENGINE_PORT and
+#      BEACON_API_PORT is on 127.0.0.1, and every TCP listener either container's processes own
+#      is on loopback or on that service's own p2p port (lib/common.sh check_listeners), so an
+#      override that opens an RPC on a public address fails;
 #   4. file modes: both JWT copies and Lighthouse's node key (<lighthouse data>/beacon/network/
 #      key), opened only through lib/fsguard.py inspect (no symlink on the path, non-blocking,
 #      a regular file with one link; nothing is read): mode 600 and owned by the service's
@@ -39,10 +41,17 @@
 #      (/lighthouse/database/info anchor.oldest_block_slot; no anchor fails);
 #   7. identity: peer_id, p2p_addresses and metadata.custody_group_count;
 #   8. session: the m2a-session.toml lines, peer
-#      /ip4/<public ip>/tcp/<LIGHTHOUSE_P2P_PORT>/p2p/<peer_id>.
-# Every compose call is `docker compose -p <network>-ref --env-file <.env>`, and a
-# COMPOSE_PROJECT_NAME in the environment or any COMPOSE_* key in the .env is refused, so the
-# run log never looks at another network's project.
+#      /ip4/<public ip>/tcp/<LIGHTHOUSE_P2P_PORT>/p2p/<peer_id>;
+#   9. end: each service still runs the container criterion 1 checked, compared once more
+#      after everything else, so one recreated or stopped during sections 4 to 8 fails too.
+# The .env is read once, through lib/fsguard.py read-file (lib/common.sh read_env: no symlink,
+# FIFO or hard link, a directory and file only root or the sudo user own), and every read and
+# compose call uses that private copy. Temp files go under /tmp, never TMPDIR.
+# Every compose call is `docker compose -p <network>-ref --env-file <.env> -f compose.yaml`,
+# and any COMPOSE_* key in the .env, and any COMPOSE_* variable, DOCKER_HOST, DOCKER_CONTEXT,
+# DOCKER_CONFIG or DOCKER_TLS* in the environment (lib/common.sh docker_env_check), is refused,
+# so the run log never looks at another network's project, another compose file or another
+# daemon.
 # It reads no secret: the JWT copies are only fstat'ed, and the checkpoint URLs appear as
 # scheme and host only. compose's own stderr (which can quote .env values) is discarded. The
 # verdict line goes to stderr.
@@ -54,8 +63,9 @@
 #   --env-file FILE  default: .env next to this script
 #   --config YAML    default: crates/network-config/networks/<NETWORK>/config.yaml of this repo
 # Exit: 0 every criterion passed in an acceptance run, 1 a criterion failed or the run was
-# diagnostic, 2 bad usage or an .env that is missing or refused (a line compose reads
-# differently, an unknown NETWORK, a port that is not a distinct port number). Needs docker,
+# diagnostic, 2 bad usage, an .env that is missing or refused (a line compose reads
+# differently, an unknown NETWORK, a port that is not a distinct port number) or a refused
+# compose or docker variable in the environment. Needs docker,
 # curl, ss (iproute2) and python3.
 set -euo pipefail
 here=$(cd -P "$(dirname "$0")" && pwd -P)
@@ -84,32 +94,37 @@ done
 # Decimal only: a leading zero is octal in bash arithmetic (08 would be an error, 010 is 8).
 if [[ ! $samples =~ ^[1-9][0-9]*$ || ! $interval =~ ^[0-9]+$ ]]; then usage; fi
 samples=$((10#$samples)) interval=$((10#$interval))
-[[ -f $env_file ]] || refuse "$env_file: no such file"
-env_check "$env_file" >&2 || refuse "$env_file: fix the lines above"
-network=$(env_get "$env_file" NETWORK)
+# The .env, read once through fsguard into a private copy that every read below and every
+# compose call (--env-file) uses (lib/common.sh read_env), in a temp directory under /tmp
+# whatever TMPDIR says.
+work=$(mktemp -d /tmp/ref-node.XXXXXX)
+trap 'rm -rf "$work"' EXIT
+envc="$work/env"
+read_env "$here/lib/fsguard.py" "$env_file" "$envc" ||
+  refuse "$env_file: not read (a regular file with one link, owned by root or you)"
+env_check "$envc" "$env_file" >&2 || refuse "$env_file: fix the lines above"
+network=$(env_get "$envc" NETWORK)
 network_known "$network" || refuse "NETWORK must be sepolia or hoodi (in $env_file)"
-msg=$(project_env_check) || refuse "$msg"
-ports_check "$env_file" >&2 || refuse "$env_file: fix the ports above"
+docker_env_check >&2 || exit 2
+ports_check "$envc" >&2 || refuse "$env_file: fix the ports above"
 config=${config:-$here/../../crates/network-config/networks/$network/config.yaml}
-port() { env_get "$env_file" "$1"; }
+port() { env_get "$envc" "$1"; }
 engine_port=$(port ENGINE_PORT) api_port=$(port BEACON_API_PORT)
 reth_p2p=$(port RETH_P2P_PORT) lh_p2p=$(port LIGHTHOUSE_P2P_PORT)
 # Sepolia, Hoodi: the network's name as a title.
 title=$(printf '%s' "${network:0:1}" | tr '[:lower:]' '[:upper:]')${network:1}
 
 api=http://127.0.0.1:$api_port
-helper=(python3 -I "$here/lib/beacon.py")
-compose=(docker compose -p "$(compose_project "$network")" --env-file "$env_file" -f "$here/compose.yaml")
-root=$(env_get "$env_file" DATA_ROOT)
+helper=(python3 -I -B "$here/lib/beacon.py")
+compose=(docker compose -p "$(compose_project "$network")" --env-file "$envc" -f "$here/compose.yaml")
+root=$(env_get "$envc" DATA_ROOT)
 root=${root:-$(default_data_root "$network")}
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
 body="$work/body.md"
 : > "$body"
 started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 providers=''
 for key in CHECKPOINT_SYNC_URL CHECKPOINT_SYNC_URL_2; do
-  url=$(env_get "$env_file" "$key")
+  url=$(env_get "$envc" "$key")
   if [[ -n $url ]]; then providers="${providers:+$providers, }$(redact_url "${url%/}")"; fi
 done
 
@@ -128,16 +143,21 @@ section() { printf '\n## %s. %s\n\n' "$((${#names[@]} + 1))" "$1" >> "$body"; }
 block() { { echo '```'; cat; echo '```'; } >> "$body"; }
 # get <API path> <file>: GET the local Beacon API into $work/<file>.
 get() { fetch "$api$1" "$work/$2"; }
+# running_ctr <service>: the id of the service's running container now, or nothing. compose's
+# stderr is dropped: it can quote .env values.
+running_ctr() {
+  "${compose[@]}" ps -q --status running "$1" 2>/dev/null | head -1 || true
+}
 
 # 1. Versions, digests, release notes and the running containers.
 section "Client versions, image digests and running containers"
 bad=0
 v="$work/versions.txt"
-env_overrides "$env_file" >> "$v" || bad=1
+env_overrides "$envc" >> "$v" || bad=1
 for svc in reth lighthouse; do
   if [[ $svc == reth ]]; then pre=RETH; else pre=LIGHTHOUSE; fi
-  image=$(env_get "$env_file" ${pre}_IMAGE) want_uid=$(env_get "$env_file" ${pre}_UID)
-  want_gid=$(env_get "$env_file" ${pre}_GID)
+  image=$(env_get "$envc" ${pre}_IMAGE) want_uid=$(env_get "$envc" ${pre}_UID)
+  want_gid=$(env_get "$envc" ${pre}_GID)
   {
     echo "${pre}_IMAGE=$image"
     if ! image_pinned "$image"; then
@@ -170,9 +190,10 @@ for svc in reth lighthouse; do
       fi
     fi
     # The running container: the pinned image, compose.yaml's hardening, and its uid
-    # (configured and real) the .env one, never 0. compose's stderr is dropped: it can quote
-    # .env values.
-    ctr=$("${compose[@]}" ps -q --status running "$svc" 2>/dev/null | head -1) || ctr=''
+    # (configured and real) the .env one, never 0. Its id is kept: section 3 fails if the
+    # service runs another container by then.
+    ctr=$(running_ctr "$svc")
+    printf -v "checked_ctr_$svc" '%s' "$ctr"
     if [[ -z $ctr ]]; then
       echo "$svc: no running container: FAIL"; bad=1
     else
@@ -236,21 +257,37 @@ fi
 printf '\n%s sample(s) taken of %s, first to last %s s: %s\n' "$taken" "$samples" "$span" "$kind" >> "$body"
 record "Synced, not optimistic, EL online, head within 2 slots ($taken samples over $span s)" "$sync_verdict"
 
-# 3. Binds: the API ports on loopback, and no other public TCP listener of either container.
-# The containers' pids and the sockets are read together, here, not an hour earlier in section
-# 1: a container restarted during the sync samples has new pids.
+# 3. Binds: the containers criterion 1 checked, the API ports on loopback, and no other public
+# TCP listener of either container. The containers' ids and pids and the sockets are read
+# together, here, not an hour earlier in section 1: a container restarted during the sync
+# samples has new pids, and one recreated then is another container, never checked.
 section "Listening sockets: ss -ltnp"
 bad=0
-# pids_of <service>: the host pids of the service's running container now, space-separated.
+# pids_of <container id>: the container's host pids, space-separated.
 pids_of() {
-  local ctr
-  ctr=$("${compose[@]}" ps -q --status running "$1" 2>/dev/null | head -1) || ctr=''
-  [[ -n $ctr ]] || return 0
-  docker top "$ctr" -o ruid,euid,pid,comm 2>/dev/null | awk 'NR > 1 && $3 ~ /^[0-9]+$/ { print $3 }' | sort -un | tr '\n' ' ' | sed 's/ $//'
+  [[ -n $1 ]] || return 0
+  docker top "$1" -o ruid,euid,pid,comm 2>/dev/null | awk 'NR > 1 && $3 ~ /^[0-9]+$/ { print $3 }' | sort -un | tr '\n' ' ' | sed 's/ $//'
 }
-reth_pids=$(pids_of reth) lighthouse_pids=$(pids_of lighthouse)
+# same_ctr <service> <container id now>: one verdict line; 1 unless it is the one checked.
+same_ctr() {
+  local checked_var="checked_ctr_$1"
+  local checked=${!checked_var}
+  if [[ -z $checked ]]; then
+    echo "$1: no container was running for criterion 1 to check: FAIL"; return 1
+  elif [[ -z $2 ]]; then
+    echo "$1: container $checked, the one criterion 1 checked, no longer runs: FAIL"; return 1
+  elif [[ $2 != "$checked" ]]; then
+    echo "$1: container $2 runs now, not $checked, the one criterion 1 checked (recreated during the run; its image, hardening and uid are unchecked): FAIL"; return 1
+  fi
+  echo "$1: container $checked, the one criterion 1 checked, still runs: PASS"
+}
+reth_ctr=$(running_ctr reth) lighthouse_ctr=$(running_ctr lighthouse)
+reth_pids=$(pids_of "$reth_ctr") lighthouse_pids=$(pids_of "$lighthouse_ctr")
 ss_out=$(ss -ltnp 2>&1) || bad=1
 {
+  same_ctr reth "$reth_ctr" || bad=1
+  same_ctr lighthouse "$lighthouse_ctr" || bad=1
+  echo
   printf '%s\n' "$ss_out" | SS_PORTS=" $engine_port $api_port " SS_PIDS=" $reth_pids $lighthouse_pids " awk '
     BEGIN { ports = ENVIRON["SS_PORTS"]; pids = ENVIRON["SS_PIDS"] }
     NR == 1 { print; next }
@@ -263,7 +300,7 @@ ss_out=$(ss -ltnp 2>&1) || bad=1
   check_listeners "$ss_out" lighthouse "$lighthouse_pids" "$lh_p2p" || bad=1
 } > "$work/binds.txt"
 block < "$work/binds.txt"
-record "Engine ($engine_port) and Beacon ($api_port) API on 127.0.0.1 only; no other non-loopback TCP listener but the p2p ports" $bad
+record "The containers of criterion 1 still run; Engine ($engine_port) and Beacon ($api_port) API on 127.0.0.1 only; no other non-loopback TCP listener but the p2p ports" $bad
 
 # 4. File modes, through fsguard (a link or a FIFO is refused, nothing is read).
 section "File modes: mode and owner uid (lib/fsguard.py inspect)"
@@ -271,7 +308,7 @@ bad=0
 # mode_line <path> <uid>: one verdict line.
 mode_line() {
   local got reason
-  if got=$(python3 -I "$here/lib/fsguard.py" inspect "$1" 2> "$work/inspect.err"); then
+  if got=$(python3 -I -B "$here/lib/fsguard.py" inspect "$1" 2> "$work/inspect.err"); then
     check_mode_owner "$1" "$got" "$2"
   else
     reason=$(sed -n '1s/^ERROR: //p' "$work/inspect.err")
@@ -279,7 +316,7 @@ mode_line() {
     return 1
   fi
 }
-reth_uid=$(env_get "$env_file" RETH_UID) lh_uid=$(env_get "$env_file" LIGHTHOUSE_UID)
+reth_uid=$(env_get "$envc" RETH_UID) lh_uid=$(env_get "$envc" LIGHTHOUSE_UID)
 {
   echo "owners: reth $reth_uid (user $(service_user "$network" reth)), lighthouse $lh_uid (user $(service_user "$network" lighthouse))"
   mode_line "$root/reth/jwt.hex" "$reth_uid" || bad=1
@@ -337,7 +374,7 @@ if [[ -z $multiaddr ]]; then
   { grep '^error: ' "$work/identity.txt" || echo "error: no multiaddr"; } | block
   bad=1
 else
-  if [[ -n $(env_get "$env_file" TRUSTED_PEERS) ]]; then trusted=true; else trusted=false; fi
+  if [[ -n $(env_get "$envc" TRUSTED_PEERS) ]]; then trusted=true; else trusted=false; fi
   {
     echo '```toml'
     echo "network = \"$network\""
@@ -350,6 +387,17 @@ else
   } >> "$body"
 fi
 record "m2a-session peer multiaddr" $bad
+
+# 9. The containers once more, last: one recreated or stopped while sections 4 to 8 ran was
+# never checked either.
+section "Containers at the end of the run"
+bad=0
+{
+  same_ctr reth "$(running_ctr reth)" || bad=1
+  same_ctr lighthouse "$(running_ctr lighthouse)" || bad=1
+} > "$work/final.txt"
+block < "$work/final.txt"
+record "The containers of criterion 1 still run at the end" $bad
 
 # The log: header, verdict table, evidence. FAIL beats DIAGNOSTIC beats PASS.
 overall=PASS

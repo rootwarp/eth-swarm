@@ -3,3 +3,4 @@
 !.env.example
 !.env.hoodi.example
 run-log-*.md
+__pycache__/

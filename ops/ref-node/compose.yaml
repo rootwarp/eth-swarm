@@ -103,7 +103,10 @@ services:
     # split or interpreted, and no .env value is ever part of the script. $$ keeps compose
     # from interpolating them. umask 077: Lighthouse creates its node key
     # (data/beacon/network/key) 0600, not the container default 0644. --port sets the libp2p
-    # TCP and discv5 UDP port; UPnP is off on a server.
+    # TCP and discv5 UDP port; UPnP is off on a server. The checkpoint URL ends up on
+    # Lighthouse's command line, which any local user reads in ps, so preflight.sh refuses one
+    # whose credentials or path may hold a provider key; a keyed provider goes behind a local
+    # proxy (README.md, Keyed checkpoint providers).
     entrypoint: ["/bin/bash", "-c"]
     command:
       - >-

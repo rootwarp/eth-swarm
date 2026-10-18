@@ -47,16 +47,21 @@ users and ports, so neither can read the other's secret or bind the other's port
 | `LIGHTHOUSE_QUIC_PORT` (udp) | 9001 | 9003 |
 | checkpoint providers | 1 required (`CHECKPOINT_SYNC_URL`), a 2nd optional | 2 required, different operators |
 
-Pass the env file to **every** command for the second network, and the project to every
-compose command: `sudo ./setup.sh --env-file .env.hoodi`, `sudo ./preflight.sh --env-file
-.env.hoodi`, `sudo docker compose -p hoodi-ref --env-file .env.hoodi up -d`, `sudo
-./collect-run-log.sh --env-file .env.hoodi` (Sepolia: `-p sepolia-ref --env-file .env`).
-compose then reads only that file (never `.env`), and the scripts, `preflight.sh` and the run
-log check exactly the ports it sets; the run log passes the same `-p` on every compose call.
+Pass the env file to **every** command for the second network, and the project and the file to
+every compose command: `sudo ./setup.sh --env-file .env.hoodi`, `sudo ./preflight.sh --env-file
+.env.hoodi`, `sudo docker compose -p hoodi-ref --env-file .env.hoodi -f compose.yaml up -d`,
+`sudo ./collect-run-log.sh --env-file .env.hoodi` (Sepolia: `-p sepolia-ref --env-file .env -f
+compose.yaml`; `preflight.sh` prints the exact start command). compose then reads only that
+file (never `.env`), and the scripts, `preflight.sh` and the run log check exactly the ports it
+sets; the run log passes the same `-p`, `--env-file` and `-f` on every compose call.
 `-p` wins over `COMPOSE_PROJECT_NAME`, which would otherwise override `name:` (a Sepolia value
 would make the Hoodi `up` recreate the Sepolia services); all three scripts refuse any
-`COMPOSE_*` key in the `.env`, and `preflight.sh` and the run log refuse `COMPOSE_PROJECT_NAME`
-in the environment. Both env files are git-ignored.
+`COMPOSE_*` key in the `.env`. `preflight.sh` and the run log also refuse, in the environment,
+any `COMPOSE_*` variable (`COMPOSE_FILE` would pick another file, `COMPOSE_PROFILES` other
+services) and any `DOCKER_*` variable (`DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`,
+`DOCKER_TLS*` and `DOCKER_CERT_PATH` point docker at another daemon or client config than the
+host's, `DOCKER_DEFAULT_PLATFORM` and the rest change what it runs). `sudo` starts from a clean
+environment, so run compose through it too. Both env files are git-ignored.
 
 The capture tools read the node's Beacon API. `ops/collector` runs one instance per network
 (`ethswarm-collector@hoodi`, `@sepolia`), each with its own URL file; its example URL files
@@ -143,6 +148,29 @@ ships in time, the fallback is a pair the announcement lists (for example Teku 2
 Nimbus 26.10.1 with Nethermind 2.2.0 or Besu 26.10.0); that needs its own compose services and
 run-log checks, so decide it early.
 
+## Migrating a Sepolia `.env` from `ops/sepolia-ref`
+
+The stack used to live in `ops/sepolia-ref`, Sepolia only. An `.env` from there has no
+`NETWORK`, no `CHECKPOINT_SYNC_URL_2` and none of the port keys, so the scripts refuse it
+(`NETWORK must be sepolia or hoodi`). Move it to `ops/ref-node/.env` and add these lines, the
+Sepolia values of `.env.example`:
+
+<!-- migration:sepolia-ref:begin -->
+```text
+NETWORK=sepolia
+CHECKPOINT_SYNC_URL_2=
+ENGINE_PORT=8551
+BEACON_API_PORT=5052
+RETH_P2P_PORT=30303
+LIGHTHOUSE_P2P_PORT=9000
+LIGHTHOUSE_QUIC_PORT=9001
+```
+<!-- migration:sepolia-ref:end -->
+
+Each key may appear only once, so add none that the file already has. Then rerun `setup.sh`
+and `preflight.sh`: a `CHECKPOINT_SYNC_URL` that carries a key in its path is now refused (see
+[Keyed checkpoint providers](#keyed-checkpoint-providers)).
+
 ## Runbook
 
 The steps for one network; for Hoodi add `--env-file .env.hoodi` to every script and compose
@@ -162,16 +190,28 @@ command (see above).
    Lighthouse syncs from the first. Public checkpointz proxies
    (`checkpoint-sync.sepolia.ethpandaops.io`, `beaconstate-sepolia.chainsafe.io` and their
    Hoodi equivalents) serve only 24 spec keys and no fork keys, so pre-flight cannot check
-   them and refuses them. No query or fragment: the API path is appended to the URL, so a
-   provider key must sit in the path. Leave `TRUSTED_PEERS` empty for now.
+   them and refuses them. No query or fragment (the API path is appended to the URL), no
+   credentials, and no path that may hold a provider key: more than one path segment, or one
+   of 16 characters or more. `CHECKPOINT_SYNC_URL` is on Lighthouse's command line, which any
+   local user reads in `ps`, so a provider that needs a key goes behind a local proxy
+   ([Keyed checkpoint providers](#keyed-checkpoint-providers)). Leave `TRUSTED_PEERS` empty for
+   now.
 3. **Set up the host:** `sudo ./setup.sh` creates the network's users, the directories and the
    JWT copies, and writes the ids and `DATA_ROOT` into the `.env` (mode 0600). It is idempotent
-   and keeps the secret; `--rotate-jwt` replaces it. It refuses a `DATA_ROOT` that is not a
-   root-owned directory closed to group and others (so not `/tmp`), or that sits below a
-   directory anyone but root could change, or has a symlink, a `..` or a hard-linked secret
-   anywhere on its path or in its tree. It also refuses an `.env` line that compose would
-   read differently: `export`, indentation, a key set twice, or a `$` or backtick in a
-   value, and a `NETWORK` other than `sepolia` or `hoodi`.
+   and keeps the secret; `--rotate-jwt` replaces it. It creates `DATA_ROOT` itself if missing,
+   never a directory above it: create the parent first (`/srv` exists on most hosts). It
+   refuses a `DATA_ROOT` that is not a root-owned directory closed to group and others (so not
+   `/tmp`), or that sits below a missing directory or one anyone but root could change, or has
+   a symlink, a `..` or a hard-linked secret anywhere on its path or in its tree. It reads the
+   `.env` once, through `lib/fsguard.py`, and refuses one that is a symlink, a FIFO, owned by
+   anyone but root or you, or anything but a regular file with one link (`preflight.sh` and the
+   run log read it the same way). It also refuses an `.env` that compose's parser would read
+   differently: a byte other than printable ASCII and newline (a CR, a TAB, non-ASCII),
+   `export`, indentation, a key set twice, and a blank, a quote, a backslash, a `#`, a `$` or
+   a backtick in a value (compose keeps reading after a closing quote, so `DUMMY=''RETH_UID=0`
+   would set `RETH_UID` too); full-line `#` comments may hold anything printable. It refuses
+   a `NETWORK` other than `sepolia` or `hoodi` as well. The scripts keep their temp files
+   under `/tmp`, never in `TMPDIR`.
 
    **Premise: only root or you (the operator) can write to the checkout and to the `.env`
    directory.** Root runs the checkout's scripts and rewrites `.env`, so anyone else who can
@@ -188,14 +228,18 @@ command (see above).
    0755 or tighter).
 4. **Pre-flight:** `sudo ./preflight.sh` checks the pins and that this README's row for each
    pinned image says the release schedules the network's fork (it fails otherwise),
-   the ports, the ids (non-root, distinct, the network's users), the modes and owners, each
-   checkpoint provider's `/eth/v1/config/spec` against the network's pinned config, and, with
+   the ports, the ids (non-root, distinct, the network's users), the modes and owners (the
+   data directories must be directories, the JWT copies regular files, with no symlink on
+   either path), each checkpoint provider's `/eth/v1/config/spec` against the network's pinned
+   config, and, with
    two providers, that provider 2 holds provider 1's finalized block with the same block and
    state root. The providers it checked are printed (scheme and host only): keep that output
    with the run log. Public endpoints have served pre-Gloas configs: pick another if a diff is
    not empty, and abort if the providers disagree on the anchor. It also fails if the shell
    exports any variable compose reads from the `.env` with another value, since compose would
    use the exported one; run compose through `sudo`, which starts from a clean environment.
+   Its curl reads no `~/.curlrc`, uses no proxy from the environment and keeps no answer over
+   1 MiB, for every request. Paste the `start:` line it prints: every word in it is quoted.
 
    **Anchor hook:** cl-sync's `anchor-fetch` will get `--providers A,B --check`, which fetches
    the finalized state and block from both providers and compares the block root, the state
@@ -203,18 +247,23 @@ command (see above).
    the start (the `TODO` in `preflight.sh` marks the place) and feed its verified state and
    block to Lighthouse's checkpoint flags; until then the header comparison above is the
    cross-check.
-5. **Start:** `sudo docker compose -p <network>-ref --env-file <.env> up -d` (Sepolia:
-   `-p sepolia-ref --env-file .env`; Hoodi: `-p hoodi-ref --env-file .env.hoodi`).
+5. **Start:** the `start:` line `preflight.sh` printed, `sudo docker compose -p <network>-ref
+   --env-file <.env> -f <compose.yaml> up -d` (Sepolia: `-p sepolia-ref --env-file .env -f
+   compose.yaml`; Hoodi: `-p hoodi-ref --env-file .env.hoodi -f compose.yaml`).
 6. **Wait for sync** (about a day): `curl -s 127.0.0.1:<BEACON_API_PORT>/eth/v1/node/syncing`.
 7. **Trust the session's peer ID** (Sepolia). On the test host:
    `sudo -u m2a-session m2a-session --print-peer-id`. Put the ID in `TRUSTED_PEERS` in `.env`,
-   then `sudo docker compose -p sepolia-ref --env-file .env up -d lighthouse` (recreates
-   Lighthouse with `--trusted-peers`).
+   then `sudo docker compose -p sepolia-ref --env-file .env -f compose.yaml up -d lighthouse`
+   (recreates Lighthouse with `--trusted-peers`). Collect the run log after this: it fails a
+   container recreated after its versions check.
 8. **Collect the evidence:**
    `sudo ./collect-run-log.sh > run-log-$(date -u +%Y%m%dT%H%M%SZ).md` (13 samples, 5 min
    apart: 1 h; add `--public-ip <ip>` if the identity shows no public address). It prints the
    run log on stdout and writes no file itself, so the log is created by your own shell, not
-   by root. It exits non-zero if a criterion failed. A run of fewer than 12
+   by root. It exits non-zero if a criterion failed. Criteria 3 and 9 fail if either service
+   runs another container than the one criterion 1 checked (recreated or stopped during the
+   hour of samples or the checks after it, its image, hardening and uid unchecked): 3 compares
+   right after the samples, 9 once more at the very end. A run of fewer than 12
    samples, or spanning under an hour, is marked DIAGNOSTIC (not acceptance) and never
    passes. Lighthouse creates its node key
    (`$DATA_ROOT/lighthouse/data/beacon/network/key`) under umask 077, so it is 0600.
@@ -225,8 +274,25 @@ command (see above).
     (`ssh -N -L 5052:127.0.0.1:5052 <ref-host>`), write `/etc/ethswarm/m2a-session.toml` from
     the run log's last section, and run `sudo -u m2a-session m2a-session --dial-only`.
 
-Lighthouse's checkpoint URL is on its command line, so any local user can read it in `ps`;
-on a shared host, use an endpoint without a key in the URL.
+## Keyed checkpoint providers
+
+Lighthouse's checkpoint URL is on its command line (`--checkpoint-sync-url`), so any local user
+reads it in `ps`. `preflight.sh` therefore refuses a checkpoint URL with credentials or a path
+that may hold a key (more than one path segment, or one of 16 characters or more), for both
+providers. To use a provider that needs a key, run a reverse proxy on the host's loopback
+(nginx or Caddy, for example; this stack does not ship one) that forwards to the provider's
+keyed URL over https, with the key in the proxy's own root-only (0600) config file and never on
+its command line, and set `CHECKPOINT_SYNC_URL=http://127.0.0.1:<port>`: `preflight.sh` accepts
+plain http to a loopback host. Bind it to loopback only and keep its port off the firewall list.
+On Hoodi the two providers must be on different hosts, so give a second proxy another loopback
+address (`http://127.0.0.2:<port>`), and make sure the two still forward to different operators:
+`preflight.sh` and the run log then name only the proxies, so record the upstream providers
+with the run log yourself.
+
+The check is a heuristic, not a proof: it cannot see a key that sits in the host name (a
+per-customer subdomain such as `<key>.provider.example`) or a key under 16 characters in a
+single path segment. Both pass `preflight.sh` and end up readable in `ps`. If a provider puts
+any credential in its URL, use the proxy, whatever `preflight.sh` says.
 
 ## Tests
 

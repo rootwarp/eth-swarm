@@ -110,38 +110,79 @@ redact_url() {
   fi
 }
 
-# env_check <file>: 0 if every line is blank, a # comment, or a strict KEY=value line with a
-# key given once and a value without $ or a backtick, and no COMPOSE_* key; else one line per
-# problem (never a value) and 1. compose also reads `export KEY=` and indented lines, lets the
-# last of two win, and expands $ in values, so any of those could make it run what the
-# scripts never saw; and it takes COMPOSE_PROJECT_NAME, COMPOSE_FILE and the like from .env,
-# which would pick another project (another network's) or another compose file.
+# env_check <file> [name]: 0 if the file is one compose's dotenv parser and these scripts read
+# the same way; else one line per problem (never a value), naming the file <name> (default
+# <file>: the scripts check their private copy), and 1. The rule fails closed:
+#   - the whole file is printable ASCII and LF (no CR, TAB, NUL, control or non-ASCII byte);
+#   - every line is blank, a # comment from its first column (compose skips it whole), or a
+#     strict KEY=value line with a key given once and no COMPOSE_* key;
+#   - a value holds no blank, no quote, no backslash, no #, no $ and no backtick.
+# compose reads `export KEY=` and indented lines, lets the last of two win, expands $, cuts an
+# inline comment (` #`), trims blanks, unquotes, and keeps reading after a closing quote, so
+# DUMMY=''RETH_UID=0 sets RETH_UID too: any of those could make it run what the scripts never
+# saw. And it takes COMPOSE_PROJECT_NAME, COMPOSE_FILE and the like from .env, which would pick
+# another project (another network's) or another compose file.
 env_check() {
-  awk '
+  local name=${2:-$1}
+  # tr counts every byte outside the set, NUL included; awk names the lines it can see.
+  if [[ $(LC_ALL=C tr -d '\n\040-\176' < "$1" | wc -c | tr -d ' ') != 0 ]]; then
+    ENV_NAME=$name LC_ALL=C awk '
+      BEGIN { f = ENVIRON["ENV_NAME"] }
+      /[^ -~]/ { printf "%s line %d: a byte other than printable ASCII or a newline (a CR, a TAB, a control or non-ASCII byte)\n", f, NR; seen = 1 }
+      END { if (!seen) printf "%s: a byte other than printable ASCII or a newline (a NUL)\n", f }' "$1"
+    return 1
+  fi
+  ENV_NAME=$name LC_ALL=C awk '
+    BEGIN { f = ENVIRON["ENV_NAME"] }
     /^$/ || /^#/ { next }
-    !/^[A-Z_][A-Z0-9_]*=/ { printf "%s line %d: not KEY=value (no export, no leading space)\n", FILENAME, NR; bad = 1; next }
+    !/^[A-Z_][A-Z0-9_]*=/ { printf "%s line %d: not KEY=value (no export, no leading space)\n", f, NR; bad = 1; next }
     {
       k = substr($0, 1, index($0, "=") - 1)
-      if (k ~ /^COMPOSE_/) { printf "%s line %d: %s: compose reads COMPOSE_* keys from .env; none may be set\n", FILENAME, NR, k; bad = 1 }
-      if (k in seen) { printf "%s line %d: %s set twice\n", FILENAME, NR, k; bad = 1 }
+      v = substr($0, index($0, "=") + 1)
+      if (k ~ /^COMPOSE_/) { printf "%s line %d: %s: compose reads COMPOSE_* keys from .env; none may be set\n", f, NR, k; bad = 1 }
+      if (k in seen) { printf "%s line %d: %s set twice\n", f, NR, k; bad = 1 }
       seen[k] = 1
-      if (substr($0, index($0, "=") + 1) ~ /[$`]/) {
-        printf "%s line %d: %s holds a $ or a backtick (compose would expand it)\n", FILENAME, NR, k; bad = 1
+      if (v ~ /[$`]/) {
+        printf "%s line %d: %s holds a $ or a backtick (compose would expand it)\n", f, NR, k; bad = 1
+      } else if (v ~ /[ \047"\\#]/) {
+        printf "%s line %d: %s holds a blank, a quote, a backslash or a # (compose would read it differently)\n", f, NR, k; bad = 1
       }
     }
     END { exit bad }' "$1"
 }
 
-# env_get <file> <key>: the value of the last KEY=value line, surrounding quotes removed. The
-# file is read, never sourced, so nothing in it runs.
+# env_get <file> <key>: the value of the last KEY=value line, as it is (env_check refuses the
+# quotes, blanks and escapes compose would read differently). The file is read, never sourced,
+# so nothing in it runs.
 env_get() {
   ENV_KEY=$2 awk '
     BEGIN { k = ENVIRON["ENV_KEY"] }
     index($0, k "=") == 1 { v = substr($0, length(k) + 2) }
-    END {
-      if (v ~ /^".*"$/ || v ~ /^\047.*\047$/) v = substr(v, 2, length(v) - 2)
-      print v
-    }' "$1"
+    END { print v }' "$1"
+}
+
+# abs_dir <dir>: <dir> made absolute against the physical working directory, never resolved
+# (fsguard refuses a symlink anywhere on the path it gets).
+abs_dir() {
+  case $1 in
+    /*) printf '%s\n' "$1" ;;
+    .) pwd -P ;;
+    *) printf '%s/%s\n' "$(pwd -P)" "$1" ;;
+  esac
+}
+
+# sudo_operator: the sudo user (SUDO_UID) who may own the .env and its directory, or -1.
+sudo_operator() {
+  if [[ ${SUDO_UID:-} =~ ^[0-9]+$ ]]; then echo "$SUDO_UID"; else echo -1; fi
+}
+
+# read_env <fsguard.py> <env file> <copy>: the .env read once, through fsguard read-file (the
+# walk from / to its directory, which root, the euid or the sudo user owns and nobody else can
+# write; then a regular file with one link and such an owner, opened O_NOFOLLOW|O_NONBLOCK),
+# into <copy>; fsguard's exit code, its reason on stderr. Every later read uses the copy, so
+# the scripts never follow a link, block on a FIFO or see another file the second time.
+read_env() {
+  python3 -I -B "$1" read-file "$(abs_dir "$(dirname -- "$2")")" "$(basename -- "$2")" "$(id -u)" "$(sudo_operator)" > "$3"
 }
 
 # Every variable compose.yaml interpolates. compose takes a variable set in the shell
@@ -155,14 +196,28 @@ compose_project() {
   echo "$1-ref"
 }
 
-# project_env_check: 1, with a line, if COMPOSE_PROJECT_NAME is set in the environment (even
-# empty): compose would take it over compose.yaml's name:, so a Sepolia value would make a
-# Hoodi `up` recreate the Sepolia services.
-project_env_check() {
-  if [[ -n ${COMPOSE_PROJECT_NAME+set} ]]; then
-    echo "COMPOSE_PROJECT_NAME is set in the environment; unset it (the project is always -p <network>-ref)"
-    return 1
-  fi
+# docker_env_check: one "ERROR: ..." line per compose or docker variable set in the
+# environment (even empty), and 1 if any; names only, never a value. compose reads every
+# COMPOSE_* variable: COMPOSE_PROJECT_NAME would win over compose.yaml's name: (a Sepolia value
+# would make a Hoodi `up` recreate the Sepolia services), COMPOSE_FILE would pick the file a
+# bare `up` reads, COMPOSE_PROFILES and the rest change what it runs. docker reads every
+# DOCKER_* variable, and none is needed here: DOCKER_HOST, DOCKER_CONTEXT, DOCKER_CONFIG,
+# DOCKER_TLS* and DOCKER_CERT_PATH would point every docker call (and the operator's `up`) at
+# another daemon, or its config, than the host's; DOCKER_DEFAULT_PLATFORM and the rest change
+# what it pulls or runs.
+docker_env_check() {
+  local name rc=0
+  for name in $(compgen -e); do
+    case $name in
+      COMPOSE_PROJECT_NAME) echo "ERROR: $name is set in the environment; unset it (the project is always -p <network>-ref)"; rc=1 ;;
+      COMPOSE_FILE) echo "ERROR: $name is set in the environment; unset it (the compose file is always -f compose.yaml)"; rc=1 ;;
+      COMPOSE_*) echo "ERROR: $name is set in the environment; unset it (compose reads it)"; rc=1 ;;
+      DOCKER_HOST | DOCKER_CONTEXT | DOCKER_CONFIG | DOCKER_TLS* | DOCKER_CERT_PATH)
+        echo "ERROR: $name is set in the environment; unset it (it points docker at another daemon or config than the host's)"; rc=1 ;;
+      DOCKER_*) echo "ERROR: $name is set in the environment; unset it (docker reads it)"; rc=1 ;;
+    esac
+  done
+  return $rc
 }
 
 # env_overrides <env file>: one FAIL line per compose variable set in the environment (even to
@@ -178,17 +233,37 @@ env_overrides() {
   return $rc
 }
 
+# The largest answer fetch keeps. The biggest one the scripts read is /eth/v1/config/spec,
+# about 20 KB; lib/beacon.py MAX_ANSWER is the same bound.
+FETCH_MAX_BYTES=1048576
+
 # fetch <url> <out-file>: GET the URL into the file; curl's exit code. The URL goes to curl on
 # stdin (--config -), so it never shows in the process list, and curl's own messages are
-# dropped, so it never shows in a log either. No redirects are followed.
+# dropped, so it never shows in a log either. No redirects are followed. -q (first, as curl
+# requires) skips ~/.curlrc: root's could add a write-out that prints the URL, or a proxy.
+# --noproxy '*' ignores the proxy variables for every call, not only the loopback Beacon API: a
+# proxy would see each URL in full, and a checkpoint provider must be checked over the direct
+# path Lighthouse takes to it (compose.yaml passes it no proxy variable). An answer over
+# FETCH_MAX_BYTES fails (exit 63, curl's own code for it) and leaves <out-file> empty: curl's
+# --max-filesize stops one that announces its length, and head stops one that does not.
 fetch() {
-  local url=$1 out=$2
+  local url=$1 out=$2 status
   case $url in
     *[[:space:]\"\\]*) return 2 ;;
   esac
   printf 'url = "%s"\n' "$url" |
-    curl --config - --fail --silent --max-time "${FETCH_TIMEOUT:-20}" --proto '=http,https' \
-      --header 'Accept: application/json' --output "$out" 2>/dev/null
+    curl -q --config - --noproxy '*' --fail --silent --max-time "${FETCH_TIMEOUT:-20}" --proto '=http,https' \
+      --max-filesize "$FETCH_MAX_BYTES" --header 'Accept: application/json' 2>/dev/null |
+    head -c "$((FETCH_MAX_BYTES + 1))" > "$out"
+  status=("${PIPESTATUS[@]}")
+  if (($(wc -c < "$out") > FETCH_MAX_BYTES)); then
+    : > "$out"
+    return 63
+  fi
+  if ((status[1] != 0)); then
+    : > "$out"
+    return "${status[1]}"
+  fi
 }
 
 # check_binds <ss -ltn output> <port>...: one verdict line per port; 1 unless every listener on
