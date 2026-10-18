@@ -4,7 +4,9 @@
 //!   it can hold no state and carries the IP rules only, one function per [`NetworkMode`].
 //!   discv5 applies it when a lookup or [`Discovery::add_enr`] would add a record to the
 //!   routing table.
-//! - **Fork filter** ([`PeerFilter`]): our fork digest and the IP rules together. It is the
+//! - **Fork filter** ([`PeerFilter`]): our fork digest and the IP rules together. The digest is
+//!   read from the local record each time ([`Discovery::filter`]), so it follows a local-record
+//!   update at a fork or BPO boundary. It is the
 //!   `find_node_predicate` closure ([`fork_predicate`]), so a lookup returns only records whose
 //!   `eth2.fork_digest` is ours and that pass the IP rules, and it filters the event stream.
 //!   The `next_fork_*` fields and `nfd` are not compared: a peer that plans another next fork
@@ -22,9 +24,12 @@
 //!   the peer every `Discovered`, `SessionEstablished` and `NodeInserted` event names when it
 //!   fails [`PeerFilter::eviction_reason`], and a task sweeps the whole table every
 //!   [`DiscoveryConfig::sweep_interval`] ([`SWEEP_INTERVAL`], [`table_evictions`]) for what no
-//!   polled event reported. Both go through `Discv5::remove_node` and count
-//!   `discv5_table_evictions_total{reason}` ([`crate::metrics`]). A record added through
-//!   [`Discovery::add_enr`] (a boot node) is exempt from the fork rule, never from the IP rules.
+//!   polled event reported. Both judge and remove under one write lock of the routing table
+//!   (`Discv5::with_kbuckets`), on the entry the table holds then, and count
+//!   `discv5_table_evictions_total{reason}` ([`crate::metrics`]) under it. A record added
+//!   through [`Discovery::add_enr`] (a boot node) is exempt from the fork rule, never from the
+//!   IP rules. A pending entry (a full bucket's candidate) is out of reach: discv5 0.12 can show
+//!   it but not clear it, so it is judged once promoted.
 //!
 //! **What is guaranteed.** A record that fails the IP rules or is on another fork digest is never
 //! returned by [`Discovery::find_peers`] and never surfaced by [`Events::next`], and no session
@@ -59,14 +64,17 @@
 use crate::enr::{fork_id, value_eq, CombinedKey, Enr, FieldError, NodeId, DEFAULT_PORT};
 use crate::metrics::EvictionMetrics;
 use alloy_rlp::Bytes;
+use discv5::kbucket::{Entry, KBucketsTable, Key};
 use discv5::{ConfigBuilder, Discv5, Event, ListenConfig};
 use p2p_wire::enr::{encode_cgc, CGC_KEY};
 use p2p_wire::rpc::messages::ForkDigest;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 
 /// Which addresses the routing table accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,13 +273,13 @@ impl EvictionReason {
 
 /// The sweep's selection: every record of `table` that [`PeerFilter::eviction_reason`] refuses,
 /// in order, with its reason. `added` holds the records added through [`Discovery::add_enr`].
-pub fn table_evictions(
+pub fn table_evictions<'a>(
     filter: &PeerFilter,
-    table: &[Enr],
+    table: impl IntoIterator<Item = &'a Enr>,
     added: &HashSet<NodeId>,
 ) -> Vec<(NodeId, EvictionReason)> {
     table
-        .iter()
+        .into_iter()
         .filter_map(|enr| {
             let id = enr.node_id();
             filter
@@ -339,21 +347,35 @@ pub enum ServiceError {
     UpdateEnr(String),
 }
 
-/// What removes records that fail the rules from discv5's routing table: the rules, the
-/// records the operator added through [`Discovery::add_enr`], and the eviction counter. The
-/// event stream and the sweep task share it.
+/// What removes records that fail the rules from discv5's routing table: the IP rules, the
+/// local record's fork digest, the records the operator added through [`Discovery::add_enr`],
+/// and the eviction counter. The event stream and the sweep task share it.
+///
+/// **Locks.** A judgement and its removal run under one write lock of the routing table
+/// (`Discv5::with_kbuckets`), on the entry the table holds then, so a newer record that lands
+/// meanwhile is never removed for what an older one carried; the counter moves under the same
+/// lock, before anyone else can see the removal. (`Discv5::remove_node` takes that lock itself,
+/// so it would deadlock under it; the removal goes through the locked table instead.) The
+/// exemptions are locked before the table and held across
+/// the judgement, and [`Discovery::add_enr`] holds them across its insertion and rollback, so an
+/// exemption never changes under a judgement. Lock order: the local record (read and released
+/// first), the exemptions, the table.
 #[derive(Debug, Clone)]
 struct TableGuard {
-    filter: PeerFilter,
+    mode: NetworkMode,
+    /// The fork digest of the local record when it was last read (big-endian), the fork rule
+    /// for when the local record has none it can decode.
+    fork_digest: Arc<AtomicU32>,
     /// Exempt from the fork rule, never from the IP rules. Only [`Discovery::add_enr`] grows it.
     added: Arc<Mutex<HashSet<NodeId>>>,
     metrics: EvictionMetrics,
 }
 
 impl TableGuard {
-    fn new(filter: PeerFilter) -> Self {
+    fn new(mode: NetworkMode, fork_digest: ForkDigest) -> Self {
         Self {
-            filter,
+            mode,
+            fork_digest: Arc::new(AtomicU32::new(u32::from_be_bytes(fork_digest))),
             added: Arc::default(),
             metrics: EvictionMetrics::default(),
         }
@@ -363,38 +385,112 @@ impl TableGuard {
         self.added.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Removes `node_id` when its routing-table record fails the rules. The table's own copy is
+    /// The filter of the local record as it is now: its fork digest follows a local-record
+    /// update (a fork or BPO boundary). A local record without a decodable `eth2` keeps the
+    /// digest last read.
+    fn filter(&self, discv5: &Discv5) -> PeerFilter {
+        let fork_digest = match fork_id(&discv5.local_enr()) {
+            Ok(id) => {
+                self.fork_digest
+                    .store(u32::from_be_bytes(id.fork_digest), Ordering::Relaxed);
+                id.fork_digest
+            }
+            Err(error) => {
+                tracing::warn!(%error, "local ENR: the fork rule keeps the last fork digest");
+                self.last_fork_digest()
+            }
+        };
+        PeerFilter {
+            fork_digest,
+            mode: self.mode,
+        }
+    }
+
+    /// The filter as of the last read of the local record, for when the service is gone.
+    fn last_filter(&self) -> PeerFilter {
+        PeerFilter {
+            fork_digest: self.last_fork_digest(),
+            mode: self.mode,
+        }
+    }
+
+    fn last_fork_digest(&self) -> ForkDigest {
+        self.fork_digest.load(Ordering::Relaxed).to_be_bytes()
+    }
+
+    /// Removes `node_id` when its routing-table record fails `filter`. The table's own copy is
     /// judged, never the record an event carried: a third party can relay an old record of a
     /// node whose current one conforms.
-    fn evict_if_refused(&self, discv5: &Discv5, node_id: &NodeId) -> Option<EvictionReason> {
-        let enr = discv5.find_enr(node_id)?;
-        let added = self.added().contains(node_id);
-        let reason = self.filter.eviction_reason(&enr, added)?;
-        self.evict(discv5, node_id, reason).then_some(reason)
+    fn evict_if_refused(
+        &self,
+        discv5: &Discv5,
+        filter: &PeerFilter,
+        node_id: &NodeId,
+    ) -> Option<EvictionReason> {
+        let added = self.added();
+        discv5
+            .with_kbuckets(|kbuckets| self.evict_in(&mut kbuckets.write(), filter, &added, node_id))
     }
 
-    /// One sweep over the whole table ([`table_evictions`]); returns how many records it removed.
+    /// One sweep over the whole table; returns how many records it removed.
     fn sweep(&self, discv5: &Discv5) -> usize {
-        let table = discv5.table_entries_enr();
-        let evictions = table_evictions(&self.filter, &table, &self.added());
-        evictions
-            .into_iter()
-            .filter(|(node_id, reason)| self.evict(discv5, node_id, *reason))
-            .count()
+        let filter = self.filter(discv5);
+        let added = self.added();
+        discv5.with_kbuckets(|kbuckets| self.sweep_in(&mut kbuckets.write(), &filter, &added))
     }
 
-    /// Removes `node_id` and counts it, when it was in the table.
-    fn evict(&self, discv5: &Discv5, node_id: &NodeId, reason: EvictionReason) -> bool {
-        let removed = discv5.remove_node(node_id);
-        if removed {
-            self.metrics.record(reason);
-            tracing::debug!(
-                node = %node_id,
-                reason = reason.as_str(),
-                "evicted a routing-table record"
-            );
+    /// The judgement and removal of `node_id` in `table`, which the caller holds exclusively.
+    /// A pending entry is out of reach: discv5 0.12 has no way to clear one.
+    fn evict_in(
+        &self,
+        table: &mut KBucketsTable<NodeId, Enr>,
+        filter: &PeerFilter,
+        added: &HashSet<NodeId>,
+        node_id: &NodeId,
+    ) -> Option<EvictionReason> {
+        let key = Key::from(*node_id);
+        let Entry::Present(entry, _) = table.entry(&key) else {
+            return None;
+        };
+        let reason = filter.eviction_reason(entry.value(), added.contains(node_id))?;
+        entry.remove();
+        self.counted(node_id, reason);
+        Some(reason)
+    }
+
+    /// [`table_evictions`] over `table`, which the caller holds exclusively, and their removal,
+    /// until a pass finds nothing: a removal can promote a due pending entry into the bucket.
+    fn sweep_in(
+        &self,
+        table: &mut KBucketsTable<NodeId, Enr>,
+        filter: &PeerFilter,
+        added: &HashSet<NodeId>,
+    ) -> usize {
+        let mut removed = 0;
+        loop {
+            let evictions =
+                table_evictions(filter, table.iter().map(|entry| entry.node.value), added);
+            let before = removed;
+            for (node_id, reason) in evictions {
+                if table.remove(&Key::from(node_id)) {
+                    self.counted(&node_id, reason);
+                    removed += 1;
+                }
+            }
+            if removed == before {
+                return removed;
+            }
         }
-        removed
+    }
+
+    /// Counts one removal, while the table lock that made it is still held.
+    fn counted(&self, node_id: &NodeId, reason: EvictionReason) {
+        self.metrics.record(reason);
+        tracing::debug!(
+            node = %node_id,
+            reason = reason.as_str(),
+            "evicted a routing-table record"
+        );
     }
 }
 
@@ -403,6 +499,10 @@ pub struct Discovery {
     discv5: Arc<Discv5>,
     guard: TableGuard,
     sweep_interval: Duration,
+    /// The routing-table sweep, from the moment discv5 runs; aborted when this is dropped.
+    sweep: Option<AbortHandle>,
+    /// True once [`Self::start`] has handed out the event stream.
+    events_open: bool,
 }
 
 impl Discovery {
@@ -420,11 +520,10 @@ impl Discovery {
         let discv5 = Discv5::new(enr, key, discv5_config).map_err(ServiceError::Setup)?;
         Ok(Self {
             discv5: Arc::new(discv5),
-            guard: TableGuard::new(PeerFilter {
-                fork_digest,
-                mode: config.mode,
-            }),
+            guard: TableGuard::new(config.mode, fork_digest),
             sweep_interval: config.sweep_interval,
+            sweep: None,
+            events_open: false,
         })
     }
 
@@ -436,24 +535,34 @@ impl Discovery {
         self
     }
 
-    /// Binds the UDP socket, starts the service task, opens the event stream and starts the
-    /// routing-table sweep, every `sweep_interval` until the service is dropped.
+    /// Binds the UDP socket, starts the service task and, at once, the routing-table sweep
+    /// (every `sweep_interval` until the service is dropped), then opens the event stream. The
+    /// sweep never waits on the stream: a `start` dropped before the stream is open leaves
+    /// discv5 running and swept, and a retry only opens the stream. Once the stream is handed
+    /// out, `start` is refused.
     pub async fn start(&mut self) -> Result<Events, ServiceError> {
-        Arc::get_mut(&mut self.discv5)
-            .ok_or_else(|| ServiceError::Start("the service is already started".into()))?
-            .start()
-            .await
-            .map_err(|e| ServiceError::Start(e.to_string()))?;
+        if self.events_open {
+            return Err(ServiceError::Start("the service is already started".into()));
+        }
+        if self.sweep.is_none() {
+            Arc::get_mut(&mut self.discv5)
+                .ok_or_else(|| ServiceError::Start("the service is already started".into()))?
+                .start()
+                .await
+                .map_err(|e| ServiceError::Start(e.to_string()))?;
+            let sweep = tokio::spawn(sweep_table(
+                Arc::downgrade(&self.discv5),
+                self.guard.clone(),
+                self.sweep_interval,
+            ));
+            self.sweep = Some(sweep.abort_handle());
+        }
         let rx = self
             .discv5
             .event_stream()
             .await
             .map_err(|e| ServiceError::Start(e.to_string()))?;
-        tokio::spawn(sweep_table(
-            Arc::downgrade(&self.discv5),
-            self.guard.clone(),
-            self.sweep_interval,
-        ));
+        self.events_open = true;
         Ok(Events {
             rx,
             discv5: Arc::downgrade(&self.discv5),
@@ -461,14 +570,15 @@ impl Discovery {
         })
     }
 
-    /// The fork digest lookups filter on.
+    /// The fork digest lookups filter on: the local record's, as it is now.
     pub fn fork_digest(&self) -> ForkDigest {
-        self.guard.filter.fork_digest
+        self.filter().fork_digest
     }
 
-    /// The filter every lookup result and reported event passes.
+    /// The filter every lookup result, reported event and table record passes, on the fork
+    /// digest of the local record as it is now.
     pub fn filter(&self) -> PeerFilter {
-        self.guard.filter
+        self.guard.filter(&self.discv5)
     }
 
     /// The routing-table eviction counter.
@@ -499,11 +609,14 @@ impl Discovery {
     /// record stays exempt from the fork rule of the eviction ([`PeerFilter::eviction_reason`]).
     pub fn add_enr(&self, enr: Enr) -> Result<(), ServiceError> {
         let node_id = enr.node_id();
-        // Exempt before it is in the table, so a sweep in between cannot evict it.
-        let newly_added = self.guard.added().insert(node_id);
+        // One lock over the exemption, the insertion and the rollback: no judgement sees the
+        // record in the table unexempted, and a concurrent call for the same node cannot set an
+        // exemption that this one's rollback then drops.
+        let mut added = self.guard.added();
+        let newly_added = added.insert(node_id);
         self.discv5.add_enr(enr).map_err(|e| {
             if newly_added {
-                self.guard.added().remove(&node_id);
+                added.remove(&node_id);
             }
             ServiceError::AddEnr(e)
         })
@@ -518,7 +631,7 @@ impl Discovery {
         target: NodeId,
         max_peers: usize,
     ) -> Result<Vec<Enr>, ServiceError> {
-        let filter = self.guard.filter;
+        let filter = self.filter();
         self.discv5
             .find_node_predicate(target, fork_predicate(filter), max_peers)
             .await
@@ -527,8 +640,18 @@ impl Discovery {
     }
 }
 
+impl Drop for Discovery {
+    /// Ends the sweep task now rather than at its next tick.
+    fn drop(&mut self) {
+        if let Some(sweep) = &self.sweep {
+            sweep.abort();
+        }
+    }
+}
+
 /// The sweep task: every `period` (first one `period` after the start), [`TableGuard::sweep`]
-/// over the whole table. It holds the service weakly and ends once the [`Discovery`] is dropped.
+/// over the whole table. [`Discovery`] aborts it on drop; it also holds the service weakly and
+/// ends at its next tick once the service is gone.
 async fn sweep_table(discv5: Weak<Discv5>, guard: TableGuard, period: Duration) {
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -587,22 +710,27 @@ impl Events {
     pub async fn next(&mut self) -> Option<PeerEvent> {
         loop {
             let event = self.rx.recv().await?;
-            self.evict_named_peer(&event);
-            if let Some(event) = PeerEvent::classify(event, &self.guard.filter) {
+            let filter = match self.discv5.upgrade() {
+                Some(discv5) => {
+                    let filter = self.guard.filter(&discv5);
+                    self.evict_named_peer(&discv5, &filter, &event);
+                    filter
+                }
+                None => self.guard.last_filter(),
+            };
+            if let Some(event) = PeerEvent::classify(event, &filter) {
                 return Some(event);
             }
         }
     }
 
-    fn evict_named_peer(&self, event: &Event) {
+    fn evict_named_peer(&self, discv5: &Discv5, filter: &PeerFilter, event: &Event) {
         let node_id = match event {
             Event::Discovered(enr) | Event::SessionEstablished(enr, _) => enr.node_id(),
             Event::NodeInserted { node_id, .. } => *node_id,
             _ => return,
         };
-        if let Some(discv5) = self.discv5.upgrade() {
-            self.guard.evict_if_refused(&discv5, &node_id);
-        }
+        self.guard.evict_if_refused(discv5, filter, &node_id);
     }
 }
 
@@ -610,9 +738,13 @@ impl Events {
 mod tests {
     use super::*;
     use crate::enr::{build_local_enr, CombinedKey, Enr, LocalAddr, NodeId};
+    use discv5::kbucket::{
+        ConnectionDirection, ConnectionState, InsertResult, NodeStatus, MAX_NODES_PER_BUCKET,
+    };
     use network_config::{ChainConfig, Network};
     use p2p_wire::enr::{ForkFields, ETH2_KEY};
 
+    use std::future::Future as _;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
 
@@ -1004,12 +1136,89 @@ mod tests {
         node.add_enr(boot.local_enr()).unwrap();
         let (_peer, _peer_events, peer_id) = dial(&node, &other).await;
 
-        wait_evicted(&node, &peer_id, sweep * 5).await;
+        wait_evicted(&node, &peer_id, EvictionReason::ForkDigest, sweep * 5).await;
         assert_eq!(node.metrics().evictions(EvictionReason::ForkDigest), 1);
         assert_eq!(node.metrics().evictions(EvictionReason::IpRule), 0);
         tokio::time::sleep(sweep * 2).await;
         assert!(node.discv5.table_entries_id().contains(&boot_id));
         assert_eq!(node.metrics().evictions(EvictionReason::ForkDigest), 1);
+    }
+
+    /// A public-mode node on loopback, on `fork`, swept every `sweep_interval` once started;
+    /// not started yet.
+    fn unstarted(fork: &ForkFields, sweep_interval: Duration) -> Discovery {
+        let key = CombinedKey::generate_secp256k1();
+        let port = free_udp_port();
+        let addr = LocalAddr {
+            ip: Ipv4Addr::LOCALHOST,
+            tcp_port: port,
+            udp_port: port,
+        };
+        let enr = build_local_enr(&key, fork, 4, &addr).unwrap();
+        let config = DiscoveryConfig {
+            udp_port: port,
+            sweep_interval,
+            ..DiscoveryConfig::new(Ipv4Addr::LOCALHOST.into(), NetworkMode::Public)
+        };
+        Discovery::new(enr, key, &config).unwrap()
+    }
+
+    /// The sweep starts as soon as discv5 runs, before the event stream is open: a `start` that
+    /// is dropped while it waits for the stream leaves discv5 swept, and a retry opens the
+    /// stream. Once the stream is handed out, another `start` is refused.
+    #[tokio::test]
+    async fn a_start_dropped_before_its_event_stream_still_sweeps() {
+        let ours = sepolia_fields(274_175);
+        let sweep = Duration::from_millis(100);
+        let mut node = unstarted(&ours, sweep);
+        {
+            // One poll on this single-threaded runtime: discv5 starts, and the event stream
+            // request waits for the service task, which cannot run during the poll.
+            let mut start = std::pin::pin!(node.start());
+            let polled =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(start.as_mut().poll(cx))).await;
+            assert!(polled.is_pending(), "start finished in one poll");
+        }
+        let sweeper = node.sweep.clone().expect("the sweep started with discv5");
+        assert!(!sweeper.is_finished());
+
+        // A refused record that raised no event is swept out.
+        let refused = record_with(
+            &CombinedKey::generate_secp256k1(),
+            &ours,
+            Ipv4Addr::LOCALHOST,
+        );
+        let _ = insert_unchecked(&node, &refused);
+        wait_evicted(
+            &node,
+            &refused.node_id(),
+            EvictionReason::IpRule,
+            sweep * 20,
+        )
+        .await;
+
+        let _events = node.start().await.unwrap();
+        let err = node.start().await.err();
+        assert!(matches!(err, Some(ServiceError::Start(_))), "{err:?}");
+        assert!(!sweeper.is_finished());
+    }
+
+    /// Dropping the [`Discovery`] ends its sweep task at once, not one interval later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_the_service_aborts_its_sweep() {
+        let ours = sepolia_fields(274_175);
+        let (node, _events) = node_with(&ours, NetworkMode::Devnet, NO_SWEEP).await;
+        let sweeper = node.sweep.clone().expect("a started service sweeps");
+        assert!(!sweeper.is_finished());
+        drop(node);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !sweeper.is_finished() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the sweep outlived the service"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// The event stream and the sweep hold the service weakly: dropping the [`Discovery`]
@@ -1024,16 +1233,331 @@ mod tests {
         assert_eq!(end, Ok(None));
     }
 
-    /// Waits until `id` is out of `node`'s routing table, at most `limit`.
-    async fn wait_evicted(node: &Discovery, id: &NodeId, limit: Duration) {
+    /// Waits until `id` is out of `node`'s routing table and an eviction for `reason` is
+    /// counted, at most `limit`.
+    async fn wait_evicted(node: &Discovery, id: &NodeId, reason: EvictionReason, limit: Duration) {
         let deadline = tokio::time::Instant::now() + limit;
-        while node.discv5.table_entries_id().contains(id) {
+        while in_table(node, id) || node.metrics().evictions(reason) == 0 {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "{id} still in the routing table after {limit:?}"
+                "{id} not evicted and counted for {reason:?} after {limit:?}"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// A node that is not started, on loopback: its routing table is filled by hand.
+    fn idle_node(fork: &ForkFields, mode: NetworkMode) -> Discovery {
+        let key = CombinedKey::generate_secp256k1();
+        let enr = record_with(&key, fork, Ipv4Addr::LOCALHOST);
+        let config = DiscoveryConfig::new(Ipv4Addr::LOCALHOST.into(), mode);
+        Discovery::new(enr, key, &config).unwrap()
+    }
+
+    /// A record on `fork` at `ip`, signed by `key`.
+    fn record_with(key: &CombinedKey, fork: &ForkFields, ip: Ipv4Addr) -> Enr {
+        build_local_enr(key, fork, 4, &LocalAddr::new(ip)).unwrap()
+    }
+
+    /// Puts `enr` in `node`'s routing table past `table_filter`, disconnected.
+    fn insert_unchecked(node: &Discovery, enr: &Enr) -> InsertResult<NodeId> {
+        insert_in_state(node, enr, ConnectionState::Disconnected)
+    }
+
+    /// Puts `enr` in `node`'s routing table past `table_filter`, in `state`, the way an incoming
+    /// session does (connected).
+    fn insert_in_state(
+        node: &Discovery,
+        enr: &Enr,
+        state: ConnectionState,
+    ) -> InsertResult<NodeId> {
+        let status = NodeStatus {
+            state,
+            direction: ConnectionDirection::Incoming,
+        };
+        node.discv5.with_kbuckets(|kbuckets| {
+            kbuckets
+                .write()
+                .insert_or_update(&Key::from(enr.node_id()), enr.clone(), status)
+        })
+    }
+
+    fn in_table(node: &Discovery, id: &NodeId) -> bool {
+        node.discv5.table_entries_id().contains(id)
+    }
+
+    /// The entry the table holds for `id`: present, pending or absent.
+    fn table_slot(node: &Discovery, id: &NodeId) -> &'static str {
+        node.discv5
+            .with_kbuckets(|kbuckets| match kbuckets.write().entry(&Key::from(*id)) {
+                Entry::Present(..) => "present",
+                Entry::Pending(..) => "pending",
+                Entry::Absent(..) => "absent",
+                Entry::SelfEntry => "self",
+            })
+    }
+
+    /// The judgement and the removal run under one write lock of the routing table, on the
+    /// entry the table holds then. The counter moves before the removal is visible to anyone
+    /// else, and a conforming, exempt or absent entry is never removed.
+    #[tokio::test]
+    async fn one_table_lock_judges_and_removes_the_same_entry() {
+        let ours = sepolia_fields(274_175);
+        let other = sepolia_fields(274_176);
+        let node = idle_node(&ours, NetworkMode::Public);
+        let key = CombinedKey::generate_secp256k1();
+        let off = record_with(&key, &other, Ipv4Addr::new(8, 8, 8, 8));
+        let on = record_with(&key, &ours, Ipv4Addr::new(8, 8, 8, 8));
+        let id = off.node_id();
+        let filter = node.filter();
+        let none = HashSet::new();
+
+        assert!(matches!(
+            insert_unchecked(&node, &off),
+            InsertResult::Inserted
+        ));
+        let evicted = node.discv5.with_kbuckets(|kbuckets| {
+            let mut table = kbuckets.write();
+            let reason = node.guard.evict_in(&mut table, &filter, &none, &id);
+            // Still under the same lock: out of the table, and already counted.
+            assert!(matches!(table.entry(&Key::from(id)), Entry::Absent(..)));
+            assert_eq!(node.metrics().evictions(EvictionReason::ForkDigest), 1);
+            reason
+        });
+        assert_eq!(evicted, Some(EvictionReason::ForkDigest));
+
+        // The table's conforming copy is judged, whatever record an event carried.
+        assert!(matches!(
+            insert_unchecked(&node, &on),
+            InsertResult::Inserted
+        ));
+        assert_eq!(
+            node.guard.evict_if_refused(&node.discv5, &filter, &id),
+            None
+        );
+        assert!(in_table(&node, &id));
+        // An exempt off-fork entry stays; an absent one is nothing to evict.
+        let _ = insert_unchecked(&node, &off);
+        let exempt = HashSet::from([id]);
+        let kept = node.discv5.with_kbuckets(|kbuckets| {
+            node.guard
+                .evict_in(&mut kbuckets.write(), &filter, &exempt, &id)
+        });
+        assert_eq!(kept, None);
+        assert!(in_table(&node, &id));
+        assert_eq!(
+            node.guard
+                .evict_if_refused(&node.discv5, &filter, &NodeId::random()),
+            None
+        );
+        assert_eq!(node.metrics().evictions(EvictionReason::ForkDigest), 1);
+        assert_eq!(node.metrics().evictions(EvictionReason::IpRule), 0);
+    }
+
+    /// A conforming record that replaces a refused one while an eviction of that node waits is
+    /// judged as it is then: the eviction reads the table only once it holds every lock it
+    /// decides under, so it never removes the newer record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_record_replaced_while_the_eviction_waits_is_kept() {
+        let ours = sepolia_fields(274_175);
+        let other = sepolia_fields(274_176);
+        let node = idle_node(&ours, NetworkMode::Public);
+        let key = CombinedKey::generate_secp256k1();
+        let off = record_with(&key, &other, Ipv4Addr::new(8, 8, 8, 8));
+        let on = record_with(&key, &ours, Ipv4Addr::new(8, 8, 8, 8));
+        let id = off.node_id();
+        let filter = node.filter();
+        assert!(matches!(
+            insert_unchecked(&node, &off),
+            InsertResult::Inserted
+        ));
+
+        std::thread::scope(|scope| {
+            let exemptions = node.guard.added();
+            let evictor = scope.spawn(|| node.guard.evict_if_refused(&node.discv5, &filter, &id));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(matches!(
+                insert_unchecked(&node, &on),
+                InsertResult::ValueUpdated
+            ));
+            drop(exemptions);
+            assert_eq!(evictor.join().unwrap(), None);
+        });
+        assert!(in_table(&node, &id));
+        assert_eq!(node.metrics().evictions(EvictionReason::ForkDigest), 0);
+    }
+
+    /// The fork rule reads the local record each time: once its `eth2` moves to the next
+    /// digest (a fork or BPO boundary), records on the new digest are kept, reported and
+    /// returned, and records on the old one evicted. A local `eth2` that no longer decodes
+    /// keeps the digest last read.
+    #[tokio::test]
+    async fn the_fork_rule_follows_the_local_record() {
+        let ours = sepolia_fields(274_175);
+        let next = sepolia_fields(274_176);
+        let node = idle_node(&ours, NetworkMode::Public);
+        assert_eq!(node.fork_digest(), ours.eth2.fork_digest);
+        let on_old = record_with(
+            &CombinedKey::generate_secp256k1(),
+            &ours,
+            Ipv4Addr::new(8, 8, 8, 8),
+        );
+        let on_new = record_with(
+            &CombinedKey::generate_secp256k1(),
+            &next,
+            Ipv4Addr::new(8, 8, 4, 4),
+        );
+        assert!(node.filter().accepts(&on_old));
+
+        node.discv5
+            .enr_insert(
+                ETH2_KEY,
+                &alloy_rlp::Bytes::from(next.eth2.to_bytes().to_vec()),
+            )
+            .unwrap();
+        assert_eq!(node.fork_digest(), next.eth2.fork_digest);
+        assert!(node.filter().accepts(&on_new));
+        assert!(!node.filter().accepts(&on_old));
+        let _ = insert_unchecked(&node, &on_old);
+        let _ = insert_unchecked(&node, &on_new);
+        assert_eq!(node.guard.sweep(&node.discv5), 1);
+        assert!(!in_table(&node, &on_old.node_id()));
+        assert!(in_table(&node, &on_new.node_id()));
+        assert_eq!(node.metrics().evictions(EvictionReason::ForkDigest), 1);
+
+        // An `eth2` that does not decode: the rule keeps the digest last read, here and once
+        // the service is gone.
+        node.discv5
+            .enr_insert(ETH2_KEY, &alloy_rlp::Bytes::from_static(&[0xff; 3]))
+            .unwrap();
+        assert_eq!(node.fork_digest(), next.eth2.fork_digest);
+        assert_eq!(node.guard.last_filter(), node.filter());
+        assert_eq!(node.guard.sweep(&node.discv5), 0);
+        assert!(in_table(&node, &on_new.node_id()));
+    }
+
+    /// `add_enr` holds the exemptions across its insertion and its rollback: a concurrent one
+    /// (or a judgement) waits for it, so a failing `add_enr` cannot drop an exemption another
+    /// one set meanwhile. A failure rolls back only the exemption it created.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn add_enr_is_one_step_under_the_exemption_lock() {
+        let ours = sepolia_fields(274_175);
+        let other = sepolia_fields(274_176);
+        let node = idle_node(&ours, NetworkMode::Devnet);
+        let key = CombinedKey::generate_secp256k1();
+        let boot = record_with(&key, &other, Ipv4Addr::LOCALHOST);
+        let id = boot.node_id();
+
+        // With the table locked, `add_enr` stops at its insertion. It must hold the exemptions
+        // there: had it released them after setting its own, a failing call could drop an
+        // exemption another call set in between.
+        node.discv5.with_kbuckets(|kbuckets| {
+            let table = kbuckets.write();
+            std::thread::scope(|scope| {
+                let adder = scope.spawn(|| node.add_enr(boot.clone()));
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    match node.guard.added.try_lock() {
+                        Err(std::sync::TryLockError::WouldBlock) => break,
+                        Err(std::sync::TryLockError::Poisoned(_)) => panic!("poisoned"),
+                        Ok(exemptions) => assert!(
+                            !exemptions.contains(&id),
+                            "add_enr released the exemptions before its insertion"
+                        ),
+                    }
+                    assert!(std::time::Instant::now() < deadline, "add_enr never ran");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                drop(table);
+                adder.join().unwrap().unwrap();
+            });
+        });
+        assert!(in_table(&node, &id));
+        assert!(node.guard.added().contains(&id));
+
+        // The same node again, with a record the table refuses (no UDP socket): the call fails
+        // and the exemption the first one set stays.
+        let unreachable = Enr::builder().ip4(Ipv4Addr::LOCALHOST).build(&key).unwrap();
+        assert_eq!(unreachable.node_id(), id);
+        let err = node.add_enr(unreachable.clone()).err();
+        assert!(matches!(err, Some(ServiceError::AddEnr(_))), "{err:?}");
+        assert!(node.guard.added().contains(&id));
+        assert_eq!(node.guard.sweep(&node.discv5), 0);
+
+        // A first, failing add_enr leaves no exemption behind.
+        let stranger = Enr::builder()
+            .ip4(Ipv4Addr::LOCALHOST)
+            .build(&CombinedKey::generate_secp256k1())
+            .unwrap();
+        assert!(node.add_enr(stranger.clone()).is_err());
+        assert!(!node.guard.added().contains(&stranger.node_id()));
+    }
+
+    /// A record whose node id falls in the farthest bucket from `local` (log2 distance 256).
+    fn farthest(local: &NodeId, fork: &ForkFields, ip: Ipv4Addr) -> Enr {
+        loop {
+            let enr = record_with(&CombinedKey::generate_secp256k1(), fork, ip);
+            if (enr.node_id().raw()[0] ^ local.raw()[0]) & 0x80 != 0 {
+                return enr;
+            }
+        }
+    }
+
+    /// The sweep judges and removes under one table lock too. A pending entry (the candidate
+    /// waiting for a slot in a full bucket) is out of its reach: discv5 0.12 can show one but
+    /// not clear it (`PendingEntry::remove` only removes bucket nodes), so it waits for its
+    /// promotion, which the next judgement of the table catches.
+    #[tokio::test]
+    async fn the_sweep_removes_refused_entries_and_cannot_reach_a_pending_one() {
+        let ours = sepolia_fields(274_175);
+        let node = idle_node(&ours, NetworkMode::Public);
+        let local = node.local_enr().node_id();
+        let refused = farthest(&local, &ours, Ipv4Addr::LOCALHOST);
+        assert!(matches!(
+            insert_unchecked(&node, &refused),
+            InsertResult::Inserted
+        ));
+        let conforming: Vec<Enr> = (1..MAX_NODES_PER_BUCKET)
+            .map(|i| farthest(&local, &ours, Ipv4Addr::new(8, 8, 8, i as u8)))
+            .collect();
+        for enr in &conforming {
+            assert!(matches!(
+                insert_unchecked(&node, enr),
+                InsertResult::Inserted
+            ));
+        }
+        // The bucket is full of disconnected records: a refused incoming session waits in its
+        // pending slot.
+        let pending = farthest(&local, &ours, Ipv4Addr::LOCALHOST);
+        let inserted = insert_in_state(&node, &pending, ConnectionState::Connected);
+        assert!(
+            matches!(inserted, InsertResult::Pending { .. }),
+            "{inserted:?}"
+        );
+
+        assert_eq!(node.guard.sweep(&node.discv5), 1);
+        assert_eq!(node.metrics().evictions(EvictionReason::IpRule), 1);
+        assert_eq!(table_slot(&node, &refused.node_id()), "absent");
+        for enr in &conforming {
+            assert_eq!(table_slot(&node, &enr.node_id()), "present");
+        }
+        // Neither the sweep nor the event path can clear the pending entry, and discv5 cannot
+        // either: the residual the README states.
+        assert_eq!(table_slot(&node, &pending.node_id()), "pending");
+        let filter = node.filter();
+        assert_eq!(
+            node.guard
+                .evict_if_refused(&node.discv5, &filter, &pending.node_id()),
+            None
+        );
+        node.discv5.with_kbuckets(|kbuckets| {
+            if let Entry::Pending(entry, _) = kbuckets.write().entry(&Key::from(pending.node_id()))
+            {
+                entry.remove();
+            }
+        });
+        assert_eq!(table_slot(&node, &pending.node_id()), "pending");
+        assert_eq!(node.metrics().evictions(EvictionReason::IpRule), 1);
     }
 
     /// The backstop: with the event stream never polled, the sweep alone evicts the refused
@@ -1046,7 +1570,7 @@ mod tests {
         let (_peer, _peer_events, peer_id) = dial(&public, &ours).await;
 
         // One interval, plus slack for a loaded test machine.
-        wait_evicted(&public, &peer_id, sweep * 5).await;
+        wait_evicted(&public, &peer_id, EvictionReason::IpRule, sweep * 5).await;
         assert_eq!(public.metrics().evictions(EvictionReason::IpRule), 1);
         assert_eq!(public.metrics().evictions(EvictionReason::ForkDigest), 0);
         let found = ids(&public.find_peers(peer_id, 16).await.unwrap());

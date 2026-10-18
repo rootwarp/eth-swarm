@@ -23,23 +23,36 @@ discv5 0.12 skips `table_filter` on some insertions: an incoming session
 (`Service::inject_session_established` → `connection_updated`) inserts the peer unchecked, and
 `Service::discovered` sends `Event::Discovered` before it applies the filter. `table_filter`
 never sees the fork digest, so a record on another fork digest gets in through every path,
-`add_enr` included. `Discovery` therefore removes such records itself, through
-`Discv5::remove_node`:
+`add_enr` included. `Discovery` therefore removes such records itself. Each judgement and its
+removal run under one write lock of the routing table (`Discv5::with_kbuckets`), on the entry
+the table holds at that moment. A newer conforming record that lands meanwhile is never removed
+for what an older one carried. The counter moves under the same lock, so nobody sees the removal
+before the count.
 
 - **On the event.** `Events::next` judges the routing-table copy of the peer every
   `Discovered`, `SessionEstablished` and `NodeInserted` event names, and evicts it when it
   fails the IP rules (`ip_rule`) or is on another fork digest or none (`fork_digest`). The
   table's copy is judged, not the event's record, so a peer relaying an old record of a node
   cannot get that node evicted. This runs only while the stream is polled.
-- **Periodic sweep.** A task started with the service walks `table_entries_enr()` every
-  `DiscoveryConfig::sweep_interval` (`SWEEP_INTERVAL`, 5 s) and evicts by the same rules. It
-  is the backstop for an insertion that raised no event, an event dropped from a full event
-  channel, or a stream nobody polls. It holds the service weakly and ends with it.
+- **Periodic sweep.** A task walks the whole table every `DiscoveryConfig::sweep_interval`
+  (`SWEEP_INTERVAL`, 5 s) and evicts by the same rules. It is the backstop for an insertion
+  that raised no event, an event dropped from a full event channel, or a stream nobody polls.
+  It starts as soon as discv5 runs, before the event stream opens. A `Discovery::start` dropped
+  while it waits for the stream still leaves discv5 swept, and a retry only opens the stream.
+  Dropping the `Discovery` aborts it.
+- **Fork digest.** The fork rule reads the local record's `eth2` each time, so it follows a
+  local-record update at a fork or BPO boundary. A local `eth2` that stops decoding keeps the
+  digest last read.
 - **Boot nodes.** A record added through `Discovery::add_enr` is exempt from the fork rule
   (boot nodes often carry a stale digest, or none, and are the only seeds until the first
-  lookup), never from the IP rules (`add_enr` refuses those anyway).
+  lookup), never from the IP rules (`add_enr` refuses those anyway). `add_enr` holds the
+  exemptions across the insertion and its rollback, so a failing call cannot drop an exemption
+  that a concurrent call for the same node set.
 - **Metric.** `discv5_table_evictions_total{reason="ip_rule"|"fork_digest"}`, one per record
   removed, on the registry passed to `EvictionMetrics::register` (`Discovery::with_metrics`).
+  It is not exported yet. The binary (`src/main.rs`) is still a stub that exits before it
+  builds a `Discovery`, so nothing in production registers the counter. Whatever builds the
+  service must call `with_metrics` with its registry.
 
 Devnet mode is unchanged: loopback and private records stay; only the fork rule and the
 never-contactable addresses evict.
@@ -53,6 +66,15 @@ record's own event. A peer that keeps dialing gets back in on each new session, 
 at most one more interval. The record is never returned by `find_peers` and never surfaced by
 `Events::next` meanwhile. The session's source address is not a table record, so a session
 from a refused source whose record passes stays in the table (and is not surfaced).
+
+Pending kbucket entries are out of eviction's reach. When a bucket is full, discv5 keeps one
+candidate for it in a pending slot, and an incoming session can put a refused peer there. discv5
+0.12 lets the table show that entry but has no way to clear it: `PendingEntry::remove` only
+removes bucket nodes. So the refused peer holds the pending slot until discv5 promotes it, after
+its pending timeout (60 s), or drops it. While pending it is no lookup seed and is in no NODES
+response, but it keeps a conforming candidate out of the slot. Once promoted, its
+`NodeInserted` event or the next sweep evicts it. The sweep's own table walk promotes due
+entries, and it judges them under the same lock.
 
 The full fix is upstream: discv5 running `table_filter` on every insertion, including
 `connection_updated` for incoming sessions. A patched discv5 would need a git dependency

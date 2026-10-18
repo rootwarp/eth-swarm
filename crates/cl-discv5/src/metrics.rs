@@ -5,6 +5,10 @@
 //!   apply on every insertion: `ip_rule` (an address outside the IP rules of the mode, the
 //!   `table_filter`) or `fork_digest` (another fork digest, or none). Counted once per removal,
 //!   whether the event stream or the periodic sweep found the record.
+//!
+//! Not exported yet: the binary is a stub that exits before it builds a
+//! [`Discovery`](crate::service::Discovery), so nothing in production calls
+//! [`EvictionMetrics::register`] or `Discovery::with_metrics`. The service that builds one must.
 
 pub use crate::service::EvictionReason;
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder};
