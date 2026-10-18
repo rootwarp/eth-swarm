@@ -1066,6 +1066,7 @@ dependencies = [
  "network-config",
  "node-key",
  "p2p-wire",
+ "prometheus-client",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

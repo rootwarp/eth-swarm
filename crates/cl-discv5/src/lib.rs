@@ -2,7 +2,9 @@
 //!
 //! - [`enr`]: the local record with `eth2`, `cgc` and `nfd`, and the fields of a remote one;
 //!   [`enr::signing_key`] turns the node key the `node-key` crate loads into the record's key.
-//! - [`service`]: discv5 with the routing-table IP rules and lookups filtered by fork digest.
+//! - [`service`]: discv5 with the routing-table IP rules and lookups filtered by fork digest;
+//!   table records that fail either are evicted on their event and by a periodic sweep.
+//! - [`metrics`], the routing-table eviction counter `discv5_table_evictions_total{reason}`.
 //!
 //! The gRPC service is a stub. Every RPC runs the `ipc` contract layer first (hello
 //! negotiation, frame discipline, `seq`, envelope type and digest checks) and then answers
@@ -10,6 +12,7 @@
 //! `tests/contract.rs` runs the contract suite against it, in process and over a Unix socket.
 
 pub mod enr;
+pub mod metrics;
 pub mod service;
 
 use ethswarm_proto::discv5 as pb;

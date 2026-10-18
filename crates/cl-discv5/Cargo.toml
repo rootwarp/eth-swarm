@@ -19,8 +19,11 @@ discv5.workspace = true
 enr.workspace = true
 # The RLP string values of the record; already in the tree through discv5 and enr.
 alloy-rlp = "0.3"
-# The event stream discv5 hands out is a tokio mpsc receiver.
-tokio = { version = "1", features = ["sync"] }
+# The event stream discv5 hands out is a tokio mpsc receiver; the table sweep is a spawned task
+# on an interval.
+tokio = { version = "1", features = ["sync", "rt", "time"] }
+# The table-eviction counter, on the service's registry; the version the other services use.
+prometheus-client = "0.25.1"
 thiserror = "2"
 # The node key, from the systemd credential `nodekey` only (checks, zeroizing, redaction); the
 # binary loads it, `enr::signing_key` turns it into the record's key. Logs on stderr.

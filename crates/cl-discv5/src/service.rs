@@ -16,13 +16,27 @@
 //!   checks every returned record against it again ([`PeerFilter::retain`]). Events go through
 //!   [`Events::next`], which applies the [`PeerFilter`] to every record and, for a session,
 //!   the IP rules to its source address too.
+//! - **Table eviction** ([`EvictionReason`]): discv5 0.12 does not run `table_filter` on every
+//!   insertion (the gaps below), so a record that fails the IP rules, or that is on another fork
+//!   digest, can still enter the routing table. [`Events::next`] removes the table record of
+//!   the peer every `Discovered`, `SessionEstablished` and `NodeInserted` event names when it
+//!   fails [`PeerFilter::eviction_reason`], and a task sweeps the whole table every
+//!   [`DiscoveryConfig::sweep_interval`] ([`SWEEP_INTERVAL`], [`table_evictions`]) for what no
+//!   polled event reported. Both go through `Discv5::remove_node` and count
+//!   `discv5_table_evictions_total{reason}` ([`crate::metrics`]). A record added through
+//!   [`Discovery::add_enr`] (a boot node) is exempt from the fork rule, never from the IP rules.
 //!
-//! **What is guaranteed.** A record that fails the IP rules or is on another fork digest is
-//! never returned by [`Discovery::find_peers`] and never surfaced by [`Events::next`], and no
-//! session from a source address outside the IP rules is surfaced. Such a record can still
-//! sit in discv5's routing table, and discv5 can still talk to it: discv5 0.12 has these gaps,
-//! all upstream behaviour this crate cannot change, which is why the checks run on the way
-//! out and not only in `table_filter`.
+//! **What is guaranteed.** A record that fails the IP rules or is on another fork digest is never
+//! returned by [`Discovery::find_peers`] and never surfaced by [`Events::next`], and no session
+//! from a source address outside the IP rules is surfaced. Such a record does not stay in discv5's
+//! routing table: it is evicted on its event, or at the latest one sweep interval (plus the
+//! runtime's scheduling delay) after it got in. Until then it holds a table slot and discv5 can use
+//! it as a lookup seed and answer FINDNODE with it; it can get back in on its next session, for at
+//! most one more interval each time. The fix is upstream (`table_filter` on every insertion). The
+//! source address of a session is not a table record, so a session from a refused source whose
+//! record passes stays in the table (and is not surfaced). These are the discv5 0.12 gaps, all
+//! upstream behaviour this crate cannot change, which is why the checks run on the way out and the
+//! table is swept, not only `table_filter`:
 //!
 //! - `Service::inject_session_established` hands the peer of an incoming session to
 //!   `Service::connection_updated`, which inserts it into the routing table without calling
@@ -34,15 +48,22 @@
 //!   carries; and the finished query returns that first copy. So a lookup can return a stale
 //!   record the predicate never passed, and `find_peers` checks the results again.
 //! - `Service::discovered` sends `Event::Discovered` (with `report_discovered_peers`, on by
-//!   default) before it checks `table_filter`.
+//!   default) before it checks `table_filter`. It inserts nothing itself, but it replaces a
+//!   table copy with a newer record that passes `table_filter`, whatever its fork digest.
+//! - `table_filter` cannot see the fork digest, so every path above, and `add_enr`, lets a
+//!   record on another fork digest in.
 //! - The handler's `verify_enr` accepts any source address when the record has no UDP socket
 //!   of that address family, so a session's record can pass the IP rules while the session
 //!   comes from a loopback or private address.
 
 use crate::enr::{fork_id, CombinedKey, Enr, FieldError, NodeId, DEFAULT_PORT};
+use crate::metrics::EvictionMetrics;
 use discv5::{ConfigBuilder, Discv5, Event, ListenConfig};
 use p2p_wire::rpc::messages::ForkDigest;
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Which addresses the routing table accepts.
@@ -177,8 +198,26 @@ impl PeerFilter {
     /// True for a record on our fork digest whose addresses pass the IP rules. A record
     /// without a decodable `eth2` is on no fork.
     pub fn accepts(&self, enr: &Enr) -> bool {
-        table_filter(self.mode)(enr)
-            && fork_id(enr).is_ok_and(|id| id.fork_digest == self.fork_digest)
+        table_filter(self.mode)(enr) && self.on_fork(enr)
+    }
+
+    /// True for a record whose `eth2.fork_digest` is ours.
+    fn on_fork(&self, enr: &Enr) -> bool {
+        fork_id(enr).is_ok_and(|id| id.fork_digest == self.fork_digest)
+    }
+
+    /// Why a routing-table record must leave the table, or `None` when it may stay. The IP
+    /// rules bind every record; the fork digest binds every record except one the operator
+    /// `added` through [`Discovery::add_enr`] (a boot node often carries a stale digest, or
+    /// none, and is the table's only seed until the first lookup).
+    pub fn eviction_reason(&self, enr: &Enr, added: bool) -> Option<EvictionReason> {
+        if !table_filter(self.mode)(enr) {
+            Some(EvictionReason::IpRule)
+        } else if !added && !self.on_fork(enr) {
+            Some(EvictionReason::ForkDigest)
+        } else {
+            None
+        }
     }
 
     /// The records of `enrs` that [`Self::accepts`], in order.
@@ -198,12 +237,58 @@ impl PeerFilter {
     }
 }
 
+/// Why a record was evicted from the routing table: the `reason` label of
+/// `discv5_table_evictions_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EvictionReason {
+    /// An address outside the IP rules of the mode (`table_filter`).
+    IpRule,
+    /// Another fork digest than ours, or no decodable `eth2`.
+    ForkDigest,
+}
+
+impl EvictionReason {
+    /// Every reason.
+    pub const ALL: [Self; 2] = [Self::IpRule, Self::ForkDigest];
+
+    /// The `reason` label value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IpRule => "ip_rule",
+            Self::ForkDigest => "fork_digest",
+        }
+    }
+}
+
+/// The sweep's selection: every record of `table` that [`PeerFilter::eviction_reason`] refuses,
+/// in order, with its reason. `added` holds the records added through [`Discovery::add_enr`].
+pub fn table_evictions(
+    filter: &PeerFilter,
+    table: &[Enr],
+    added: &HashSet<NodeId>,
+) -> Vec<(NodeId, EvictionReason)> {
+    table
+        .iter()
+        .filter_map(|enr| {
+            let id = enr.node_id();
+            filter
+                .eviction_reason(enr, added.contains(&id))
+                .map(|reason| (id, reason))
+        })
+        .collect()
+}
+
 /// The `find_node_predicate` closure: [`PeerFilter::accepts`].
 pub fn fork_predicate(filter: PeerFilter) -> Box<dyn Fn(&Enr) -> bool + Send> {
     Box::new(move |enr| filter.accepts(enr))
 }
 
-/// Where the service listens and which addresses it accepts.
+/// How often [`Discovery`] sweeps its routing table by default: the longest a record that
+/// fails the rules and raised no event stays in the table.
+pub const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Where the service listens, which addresses it accepts and how often it sweeps the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiscoveryConfig {
     /// The UDP listen address.
@@ -212,15 +297,18 @@ pub struct DiscoveryConfig {
     pub udp_port: u16,
     /// The IP rules of the routing table.
     pub mode: NetworkMode,
+    /// The period of the routing-table sweep ([`SWEEP_INTERVAL`]); never zero.
+    pub sweep_interval: Duration,
 }
 
 impl DiscoveryConfig {
-    /// `listen_ip` on [`DEFAULT_PORT`].
+    /// `listen_ip` on [`DEFAULT_PORT`], swept every [`SWEEP_INTERVAL`].
     pub const fn new(listen_ip: IpAddr, mode: NetworkMode) -> Self {
         Self {
             listen_ip,
             udp_port: DEFAULT_PORT,
             mode,
+            sweep_interval: SWEEP_INTERVAL,
         }
     }
 }
@@ -231,7 +319,8 @@ pub enum ServiceError {
     /// The local record has no usable `eth2` field.
     #[error("local ENR: {0}")]
     LocalEnr(FieldError),
-    /// discv5 refused the record and key (the key did not sign the record).
+    /// discv5 refused the record and key (the key did not sign the record), or the
+    /// configuration is unusable (a zero sweep interval).
     #[error("discv5: {0}")]
     Setup(&'static str),
     /// The UDP socket or the service task did not start.
@@ -245,10 +334,70 @@ pub enum ServiceError {
     Query(String),
 }
 
+/// What removes records that fail the rules from discv5's routing table: the rules, the
+/// records the operator added through [`Discovery::add_enr`], and the eviction counter. The
+/// event stream and the sweep task share it.
+#[derive(Debug, Clone)]
+struct TableGuard {
+    filter: PeerFilter,
+    /// Exempt from the fork rule, never from the IP rules. Only [`Discovery::add_enr`] grows it.
+    added: Arc<Mutex<HashSet<NodeId>>>,
+    metrics: EvictionMetrics,
+}
+
+impl TableGuard {
+    fn new(filter: PeerFilter) -> Self {
+        Self {
+            filter,
+            added: Arc::default(),
+            metrics: EvictionMetrics::default(),
+        }
+    }
+
+    fn added(&self) -> MutexGuard<'_, HashSet<NodeId>> {
+        self.added.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Removes `node_id` when its routing-table record fails the rules. The table's own copy is
+    /// judged, never the record an event carried: a third party can relay an old record of a
+    /// node whose current one conforms.
+    fn evict_if_refused(&self, discv5: &Discv5, node_id: &NodeId) -> Option<EvictionReason> {
+        let enr = discv5.find_enr(node_id)?;
+        let added = self.added().contains(node_id);
+        let reason = self.filter.eviction_reason(&enr, added)?;
+        self.evict(discv5, node_id, reason).then_some(reason)
+    }
+
+    /// One sweep over the whole table ([`table_evictions`]); returns how many records it removed.
+    fn sweep(&self, discv5: &Discv5) -> usize {
+        let table = discv5.table_entries_enr();
+        let evictions = table_evictions(&self.filter, &table, &self.added());
+        evictions
+            .into_iter()
+            .filter(|(node_id, reason)| self.evict(discv5, node_id, *reason))
+            .count()
+    }
+
+    /// Removes `node_id` and counts it, when it was in the table.
+    fn evict(&self, discv5: &Discv5, node_id: &NodeId, reason: EvictionReason) -> bool {
+        let removed = discv5.remove_node(node_id);
+        if removed {
+            self.metrics.record(reason);
+            tracing::debug!(
+                node = %node_id,
+                reason = reason.as_str(),
+                "evicted a routing-table record"
+            );
+        }
+        removed
+    }
+}
+
 /// A running discv5 node whose lookups return only peers on its fork digest.
 pub struct Discovery {
-    discv5: Discv5,
-    filter: PeerFilter,
+    discv5: Arc<Discv5>,
+    guard: TableGuard,
+    sweep_interval: Duration,
 }
 
 impl Discovery {
@@ -256,23 +405,37 @@ impl Discovery {
     /// digest the lookups filter on is the one in `enr`.
     pub fn new(enr: Enr, key: CombinedKey, config: &DiscoveryConfig) -> Result<Self, ServiceError> {
         let fork_digest = fork_id(&enr).map_err(ServiceError::LocalEnr)?.fork_digest;
+        if config.sweep_interval.is_zero() {
+            return Err(ServiceError::Setup("the table sweep interval is zero"));
+        }
         let listen = ListenConfig::from_ip(config.listen_ip, config.udp_port);
         let discv5_config = ConfigBuilder::new(listen)
             .table_filter(table_filter(config.mode))
             .build();
         let discv5 = Discv5::new(enr, key, discv5_config).map_err(ServiceError::Setup)?;
         Ok(Self {
-            discv5,
-            filter: PeerFilter {
+            discv5: Arc::new(discv5),
+            guard: TableGuard::new(PeerFilter {
                 fork_digest,
                 mode: config.mode,
-            },
+            }),
+            sweep_interval: config.sweep_interval,
         })
     }
 
-    /// Binds the UDP socket, starts the service task and opens the event stream.
+    /// Counts evictions on `metrics` (registered with [`EvictionMetrics::register`]) instead of
+    /// the unregistered default. Call it before [`Self::start`], which hands the counter on.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: EvictionMetrics) -> Self {
+        self.guard.metrics = metrics;
+        self
+    }
+
+    /// Binds the UDP socket, starts the service task, opens the event stream and starts the
+    /// routing-table sweep, every `sweep_interval` until the service is dropped.
     pub async fn start(&mut self) -> Result<Events, ServiceError> {
-        self.discv5
+        Arc::get_mut(&mut self.discv5)
+            .ok_or_else(|| ServiceError::Start("the service is already started".into()))?
             .start()
             .await
             .map_err(|e| ServiceError::Start(e.to_string()))?;
@@ -281,20 +444,31 @@ impl Discovery {
             .event_stream()
             .await
             .map_err(|e| ServiceError::Start(e.to_string()))?;
+        tokio::spawn(sweep_table(
+            Arc::downgrade(&self.discv5),
+            self.guard.clone(),
+            self.sweep_interval,
+        ));
         Ok(Events {
             rx,
-            filter: self.filter,
+            discv5: Arc::downgrade(&self.discv5),
+            guard: self.guard.clone(),
         })
     }
 
     /// The fork digest lookups filter on.
     pub fn fork_digest(&self) -> ForkDigest {
-        self.filter.fork_digest
+        self.guard.filter.fork_digest
     }
 
     /// The filter every lookup result and reported event passes.
     pub fn filter(&self) -> PeerFilter {
-        self.filter
+        self.guard.filter
+    }
+
+    /// The routing-table eviction counter.
+    pub fn metrics(&self) -> &EvictionMetrics {
+        &self.guard.metrics
     }
 
     /// The local record as it is now (discv5 updates `ip`/`udp` from what peers observe).
@@ -302,9 +476,18 @@ impl Discovery {
         self.discv5.local_enr()
     }
 
-    /// Adds a known record (a boot node) to the routing table, subject to the IP rules.
+    /// Adds a known record (a boot node) to the routing table, subject to the IP rules. The
+    /// record stays exempt from the fork rule of the eviction ([`PeerFilter::eviction_reason`]).
     pub fn add_enr(&self, enr: Enr) -> Result<(), ServiceError> {
-        self.discv5.add_enr(enr).map_err(ServiceError::AddEnr)
+        let node_id = enr.node_id();
+        // Exempt before it is in the table, so a sweep in between cannot evict it.
+        let newly_added = self.guard.added().insert(node_id);
+        self.discv5.add_enr(enr).map_err(|e| {
+            if newly_added {
+                self.guard.added().remove(&node_id);
+            }
+            ServiceError::AddEnr(e)
+        })
     }
 
     /// An iterative lookup towards `target` that returns at most `max_peers` peers, every one
@@ -316,11 +499,26 @@ impl Discovery {
         target: NodeId,
         max_peers: usize,
     ) -> Result<Vec<Enr>, ServiceError> {
+        let filter = self.guard.filter;
         self.discv5
-            .find_node_predicate(target, fork_predicate(self.filter), max_peers)
+            .find_node_predicate(target, fork_predicate(filter), max_peers)
             .await
-            .map(|enrs| self.filter.retain(enrs))
+            .map(|enrs| filter.retain(enrs))
             .map_err(|e| ServiceError::Query(e.to_string()))
+    }
+}
+
+/// The sweep task: every `period` (first one `period` after the start), [`TableGuard::sweep`]
+/// over the whole table. It holds the service weakly and ends once the [`Discovery`] is dropped.
+async fn sweep_table(discv5: Weak<Discv5>, guard: TableGuard, period: Duration) {
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        let Some(discv5) = discv5.upgrade() else {
+            return;
+        };
+        guard.sweep(&discv5);
     }
 }
 
@@ -354,20 +552,37 @@ impl PeerEvent {
     }
 }
 
-/// The service's event stream, filtered to [`PeerEvent`]s.
+/// The service's event stream, filtered to [`PeerEvent`]s. It holds the service weakly: the
+/// [`Discovery`] owns it.
 pub struct Events {
     rx: mpsc::Receiver<Event>,
-    filter: PeerFilter,
+    discv5: Weak<Discv5>,
+    guard: TableGuard,
 }
 
 impl Events {
-    /// The next event to report, or `None` once the service has stopped.
+    /// The next event to report, or `None` once the service has stopped. Every event that names
+    /// a peer (`Discovered`, `SessionEstablished`, `NodeInserted`) first evicts that peer's
+    /// routing-table record if it fails the rules, so the stream must be polled for this to run;
+    /// the sweep catches what it misses.
     pub async fn next(&mut self) -> Option<PeerEvent> {
         loop {
             let event = self.rx.recv().await?;
-            if let Some(event) = PeerEvent::classify(event, &self.filter) {
+            self.evict_named_peer(&event);
+            if let Some(event) = PeerEvent::classify(event, &self.guard.filter) {
                 return Some(event);
             }
+        }
+    }
+
+    fn evict_named_peer(&self, event: &Event) {
+        let node_id = match event {
+            Event::Discovered(enr) | Event::SessionEstablished(enr, _) => enr.node_id(),
+            Event::NodeInserted { node_id, .. } => *node_id,
+            _ => return,
+        };
+        if let Some(discv5) = self.discv5.upgrade() {
+            self.guard.evict_if_refused(&discv5, &node_id);
         }
     }
 }
@@ -378,7 +593,7 @@ mod tests {
     use crate::enr::{build_local_enr, CombinedKey, Enr, LocalAddr, NodeId};
     use network_config::{ChainConfig, Network};
     use p2p_wire::enr::{ForkFields, ETH2_KEY};
-    use std::collections::HashSet;
+
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
 
@@ -639,6 +854,18 @@ mod tests {
 
     /// A started node on loopback with the given fork fields and IP rules.
     async fn node_in(fork: &ForkFields, mode: NetworkMode) -> (Discovery, Events) {
+        node_with(fork, mode, SWEEP_INTERVAL).await
+    }
+
+    /// Long enough that no sweep runs during a test: only the event stream evicts.
+    const NO_SWEEP: Duration = Duration::from_secs(3600);
+
+    /// A started node on loopback with the given fork fields, IP rules and sweep interval.
+    async fn node_with(
+        fork: &ForkFields,
+        mode: NetworkMode,
+        sweep_interval: Duration,
+    ) -> (Discovery, Events) {
         let key = CombinedKey::generate_secp256k1();
         let port = free_udp_port();
         let addr = LocalAddr {
@@ -651,6 +878,7 @@ mod tests {
             listen_ip: Ipv4Addr::LOCALHOST.into(),
             udp_port: port,
             mode,
+            sweep_interval,
         };
         let mut discovery = Discovery::new(enr, key, &config).unwrap();
         let events = discovery.start().await.unwrap();
@@ -663,11 +891,11 @@ mod tests {
 
     /// discv5 0.12 inserts the peer of an incoming session into the routing table without its
     /// `table_filter`. A loopback peer on our fork digest that dials a public-mode node must
-    /// still never come out of a lookup or the event stream.
+    /// never come out of a lookup or the event stream, and its event evicts it from the table.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn public_mode_never_surfaces_a_refused_incoming_peer() {
+    async fn public_mode_evicts_a_refused_incoming_peer_on_its_event() {
         let ours = sepolia_fields(274_175);
-        let (public, mut public_events) = node_in(&ours, NetworkMode::Public).await;
+        let (public, mut public_events) = node_with(&ours, NetworkMode::Public, NO_SWEEP).await;
         let (peer, _peer_events) = node(&ours).await;
         let peer_id = peer.local_enr().node_id();
 
@@ -681,6 +909,10 @@ mod tests {
             public.discv5.table_entries_id().contains(&peer_id),
             "the incoming peer is in the routing table"
         );
+        // The control: an unfiltered lookup returns it, so only the filter keeps it out of
+        // `find_peers` below.
+        let unfiltered = ids(&public.discv5.find_node(peer_id).await.unwrap());
+        assert!(unfiltered.contains(&peer_id), "{unfiltered:?}");
 
         let found = ids(&public.find_peers(NodeId::random(), 16).await.unwrap());
         assert!(!found.contains(&peer_id), "{found:?}");
@@ -694,6 +926,112 @@ mod tests {
                 assert_ne!(enr.node_id(), peer_id, "{enr}");
             }
         }
+        // The session's event evicted it, with no sweep.
+        assert!(!public.discv5.table_entries_id().contains(&peer_id));
+        assert_eq!(public.metrics().evictions(EvictionReason::IpRule), 1);
+        assert_eq!(public.metrics().evictions(EvictionReason::ForkDigest), 0);
+    }
+
+    /// The loopback peer that dials `node` and looks it up, which opens an incoming session
+    /// there. Returns the peer, its event stream and its id.
+    async fn dial(node: &Discovery, fork: &ForkFields) -> (Discovery, Events, NodeId) {
+        let (peer, peer_events) = node_in(fork, NetworkMode::Devnet).await;
+        let peer_id = peer.local_enr().node_id();
+        peer.add_enr(node.local_enr()).unwrap();
+        // Unfiltered: a peer on another fork must still reach `node`.
+        let found = ids(&peer.discv5.find_node(NodeId::random()).await.unwrap());
+        assert!(found.contains(&node.local_enr().node_id()), "{found:?}");
+        (peer, peer_events, peer_id)
+    }
+
+    /// Devnet mode is unchanged: the loopback peer that dials us is reported and stays in the
+    /// table past several sweeps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn devnet_mode_keeps_a_loopback_incoming_peer() {
+        let ours = sepolia_fields(274_175);
+        let sweep = Duration::from_millis(300);
+        let (devnet, mut devnet_events) = node_with(&ours, NetworkMode::Devnet, sweep).await;
+        let (_peer, _peer_events, peer_id) = dial(&devnet, &ours).await;
+
+        let mut reported = false;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(500), devnet_events.next()).await
+        {
+            if let PeerEvent::SessionEstablished(enr, _) = event {
+                reported |= enr.node_id() == peer_id;
+            }
+        }
+        assert!(reported, "the session with the loopback peer is reported");
+        tokio::time::sleep(sweep * 3).await;
+        assert!(devnet.discv5.table_entries_id().contains(&peer_id));
+        for reason in EvictionReason::ALL {
+            assert_eq!(devnet.metrics().evictions(reason), 0, "{reason:?}");
+        }
+        let found = ids(&devnet.find_peers(peer_id, 16).await.unwrap());
+        assert!(found.contains(&peer_id), "{found:?}");
+    }
+
+    /// A peer on another fork digest gets in the same way (`table_filter` holds the IP rules
+    /// only), so it is evicted for its digest; an off-fork record the operator added (a boot
+    /// node) stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_off_fork_incoming_peer_is_evicted_and_an_added_one_kept() {
+        let ours = sepolia_fields(274_175);
+        let other = sepolia_fields(274_176);
+        let sweep = Duration::from_millis(300);
+        let (node, _unpolled) = node_with(&ours, NetworkMode::Devnet, sweep).await;
+        let (boot, _boot_events) = node_in(&other, NetworkMode::Devnet).await;
+        let boot_id = boot.local_enr().node_id();
+        node.add_enr(boot.local_enr()).unwrap();
+        let (_peer, _peer_events, peer_id) = dial(&node, &other).await;
+
+        wait_evicted(&node, &peer_id, sweep * 5).await;
+        assert_eq!(node.metrics().evictions(EvictionReason::ForkDigest), 1);
+        assert_eq!(node.metrics().evictions(EvictionReason::IpRule), 0);
+        tokio::time::sleep(sweep * 2).await;
+        assert!(node.discv5.table_entries_id().contains(&boot_id));
+        assert_eq!(node.metrics().evictions(EvictionReason::ForkDigest), 1);
+    }
+
+    /// The event stream and the sweep hold the service weakly: dropping the [`Discovery`]
+    /// stops it, and the stream ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_the_service_ends_its_events() {
+        let ours = sepolia_fields(274_175);
+        let (node, mut events) =
+            node_with(&ours, NetworkMode::Devnet, Duration::from_millis(50)).await;
+        drop(node);
+        let end = tokio::time::timeout(Duration::from_secs(5), events.next()).await;
+        assert_eq!(end, Ok(None));
+    }
+
+    /// Waits until `id` is out of `node`'s routing table, at most `limit`.
+    async fn wait_evicted(node: &Discovery, id: &NodeId, limit: Duration) {
+        let deadline = tokio::time::Instant::now() + limit;
+        while node.discv5.table_entries_id().contains(id) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{id} still in the routing table after {limit:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The backstop: with the event stream never polled, the sweep alone evicts the refused
+    /// incoming peer within an interval, and counts it (so it was in the table).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_mode_sweeps_a_refused_incoming_peer_out() {
+        let ours = sepolia_fields(274_175);
+        let sweep = Duration::from_millis(300);
+        let (public, _unpolled) = node_with(&ours, NetworkMode::Public, sweep).await;
+        let (_peer, _peer_events, peer_id) = dial(&public, &ours).await;
+
+        // One interval, plus slack for a loaded test machine.
+        wait_evicted(&public, &peer_id, sweep * 5).await;
+        assert_eq!(public.metrics().evictions(EvictionReason::IpRule), 1);
+        assert_eq!(public.metrics().evictions(EvictionReason::ForkDigest), 0);
+        let found = ids(&public.find_peers(peer_id, 16).await.unwrap());
+        assert!(!found.contains(&peer_id), "{found:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -725,6 +1063,10 @@ mod tests {
         a.add_enr(b.local_enr()).unwrap();
         b.add_enr(c.local_enr()).unwrap();
         b.add_enr(d.local_enr()).unwrap();
+        // The control: without the filter the same lookup does return `c`, so only the filter
+        // keeps it out of `find_peers` below.
+        let unfiltered = ids(&a.discv5.find_node(c_id).await.unwrap());
+        assert!(unfiltered.contains(&c_id), "{unfiltered:?}");
         let found = ids(&a.find_peers(c_id, 16).await.unwrap());
         assert!(found.contains(&b_id), "{found:?}");
         assert!(!found.contains(&c_id), "{found:?}");
@@ -735,6 +1077,10 @@ mod tests {
         // In `a`'s own table `c` is still never returned, whatever the target.
         a.add_enr(c.local_enr()).unwrap();
         a.add_enr(d.local_enr()).unwrap();
+        // The control: `c` is in the unfiltered table and an unfiltered lookup returns it.
+        assert!(a.discv5.table_entries_id().contains(&c_id));
+        let unfiltered = ids(&a.discv5.find_node(NodeId::random()).await.unwrap());
+        assert!(unfiltered.contains(&c_id), "{unfiltered:?}");
         let found = ids(&a.find_peers(NodeId::random(), 16).await.unwrap());
         assert_eq!(found, HashSet::from([b_id, d_id]));
 
@@ -794,9 +1140,8 @@ mod tests {
         };
         assert!(fresh.seq() > stale.seq());
         let b_config = DiscoveryConfig {
-            listen_ip: Ipv4Addr::LOCALHOST.into(),
             udp_port: port,
-            mode: NetworkMode::Devnet,
+            ..DiscoveryConfig::new(Ipv4Addr::LOCALHOST.into(), NetworkMode::Devnet)
         };
         let mut b = Discovery::new(fresh.clone(), b_key, &b_config).unwrap();
         let _b_events = b.start().await.unwrap();
@@ -847,6 +1192,76 @@ mod tests {
             ..filter
         };
         assert_eq!(devnet.retain(results), vec![loopback_on, public_on]);
+    }
+
+    /// The sweep's selection: every table record that fails the IP rules, or that is on
+    /// another fork digest (or none) and was not added through `add_enr`, with its reason.
+    #[test]
+    fn sweep_selects_every_record_the_rules_refuse() {
+        let ours = sepolia_fields(274_175);
+        let other = sepolia_fields(274_176);
+        let record = |fork: &ForkFields, ip: Ipv4Addr| {
+            let key = CombinedKey::generate_secp256k1();
+            build_local_enr(&key, fork, 4, &LocalAddr::new(ip)).unwrap()
+        };
+        let public_on = record(&ours, Ipv4Addr::new(8, 8, 8, 8));
+        let public_off = record(&other, Ipv4Addr::new(8, 8, 4, 4));
+        let added_off = record(&other, Ipv4Addr::new(1, 1, 1, 1));
+        let loopback_on = record(&ours, Ipv4Addr::LOCALHOST);
+        let private_on = record(&ours, Ipv4Addr::new(10, 0, 0, 1));
+        let added_private = record(&ours, Ipv4Addr::new(192, 168, 1, 1));
+        let key = CombinedKey::generate_secp256k1();
+        let no_eth2 = Enr::builder()
+            .ip4(Ipv4Addr::new(9, 9, 9, 9))
+            .udp4(9000)
+            .build(&key)
+            .unwrap();
+        let table = vec![
+            public_on.clone(),
+            public_off.clone(),
+            added_off.clone(),
+            loopback_on.clone(),
+            private_on.clone(),
+            added_private.clone(),
+            no_eth2.clone(),
+        ];
+        let added = HashSet::from([added_off.node_id(), added_private.node_id()]);
+        let public = PeerFilter {
+            fork_digest: ours.eth2.fork_digest,
+            mode: NetworkMode::Public,
+        };
+        assert_eq!(
+            table_evictions(&public, &table, &added),
+            vec![
+                (public_off.node_id(), EvictionReason::ForkDigest),
+                (loopback_on.node_id(), EvictionReason::IpRule),
+                (private_on.node_id(), EvictionReason::IpRule),
+                // A record added through `add_enr` is kept off-fork, never outside the IP rules.
+                (added_private.node_id(), EvictionReason::IpRule),
+                (no_eth2.node_id(), EvictionReason::ForkDigest),
+            ]
+        );
+
+        // Devnet mode keeps loopback and private records; the fork rule is the same.
+        let devnet = PeerFilter {
+            mode: NetworkMode::Devnet,
+            ..public
+        };
+        assert_eq!(
+            table_evictions(&devnet, &table, &added),
+            vec![
+                (public_off.node_id(), EvictionReason::ForkDigest),
+                (no_eth2.node_id(), EvictionReason::ForkDigest),
+            ]
+        );
+        assert_eq!(table_evictions(&devnet, &[], &added), vec![]);
+        // Never contactable, in either mode.
+        let broadcast = record(&ours, Ipv4Addr::BROADCAST);
+        assert_eq!(
+            devnet.eviction_reason(&broadcast, false),
+            Some(EvictionReason::IpRule)
+        );
+        assert_eq!(devnet.eviction_reason(&public_on, false), None);
     }
 
     /// A handshake from an address the record does not advertise (discv5 accepts any source
@@ -1008,6 +1423,22 @@ mod tests {
         let _events = discovery.start().await.unwrap();
         let err = discovery.start().await.err();
         assert!(matches!(err, Some(ServiceError::Start(_))), "{err:?}");
+
+        // A sweep interval of zero is refused.
+        let zero = DiscoveryConfig {
+            sweep_interval: Duration::ZERO,
+            ..config
+        };
+        let err = Discovery::new(
+            discovery.local_enr(),
+            CombinedKey::generate_secp256k1(),
+            &zero,
+        )
+        .err();
+        assert_eq!(
+            err,
+            Some(ServiceError::Setup("the table sweep interval is zero"))
+        );
 
         // Public mode: a loopback record never enters the routing table.
         let peer_key = CombinedKey::generate_secp256k1();
