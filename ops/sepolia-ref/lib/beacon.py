@@ -31,14 +31,17 @@ with `python3 -I`.
         and the m2a-session multiaddr /ip4/<ip>/tcp/9000/p2p/<peer_id>. <ip> is PUBLIC_IP when
         it is not empty, else the first global IPv4 address among p2p_addresses. Value lines are
         `key: value`; anything wrong is an `error: ...` line, never a value line.
-    container INSPECT_JSON SERVICE DATA_ROOT UID PINNED_IMAGE_ID
+    container INSPECT_JSON SERVICE DATA_ROOT UID GID PINNED_IMAGE_ID
         One running container (`docker inspect <id>`) against what compose.yaml asks for, one
-        line per check: the pinned image ID; Config.User's uid is UID and not 0; ReadonlyRootfs;
-        CapDrop holds ALL and CapAdd is empty; SecurityOpt holds no-new-privileges:true; not
-        Privileged; NetworkMode host; exactly two mounts, DATA_ROOT/SERVICE/data on /data
+        line per check: the pinned image ID; Config.User is exactly UID:GID, neither 0;
+        ReadonlyRootfs; CapDrop holds ALL and CapAdd is empty; SecurityOpt is exactly
+        no-new-privileges:true (so no seccomp or AppArmor profile is switched off); not
+        Privileged; NetworkMode host; no GroupAdd and no Devices; PidMode and IpcMode neither
+        host nor another container's, UTSMode not host, and CgroupnsMode, when the engine
+        reports one, not host; exactly two mounts, DATA_ROOT/SERVICE/data on /data
         (read-write) and DATA_ROOT/SERVICE/jwt.hex on /secrets/jwt.hex (read-only), besides a
-        /tmp tmpfs; and no tmpfs other than /tmp. An override file that loosens any of these
-        fails here.
+        /tmp tmpfs; and exactly one tmpfs, /tmp, mounted noexec, nosuid and nodev (none of
+        exec, suid or dev after them). An override file that loosens any of these fails here.
 """
 
 import ipaddress
@@ -349,7 +352,31 @@ def identity(identity_path, public_ip):
     return 0 if passed else 1
 
 
-def container(inspect_path, service, data_root, uid, pinned_id):
+SECURITY_OPT = ["no-new-privileges:true"]
+TMPFS_FLAGS = {"noexec": "exec", "nosuid": "suid", "nodev": "dev"}
+
+
+def tmpfs_ok(tmpfs):
+    """Exactly a /tmp tmpfs whose options end up noexec, nosuid and nodev (mount applies the
+    options in order, so a later exec, suid or dev undoes its no-flag)."""
+    if not isinstance(tmpfs, dict) or set(tmpfs) != {"/tmp"} or not isinstance(tmpfs["/tmp"], str):
+        return False
+    final = {}
+    for opt in (o.strip() for o in tmpfs["/tmp"].split(",")):
+        for flag, opposite in TMPFS_FLAGS.items():
+            if opt in (flag, opposite):
+                final[flag] = opt == flag
+    return all(final.get(flag) for flag in TMPFS_FLAGS)
+
+
+def own_namespace(mode, may_join):
+    """A namespace mode that is neither the host's nor, if `may_join`, another container's."""
+    if not isinstance(mode, str):
+        return False
+    return mode != "host" and not (may_join and mode.startswith("container:"))
+
+
+def container(inspect_path, service, data_root, uid, gid, pinned_id):
     try:
         with open(inspect_path, encoding="utf-8") as f:
             doc = json.load(f)
@@ -369,15 +396,26 @@ def container(inspect_path, service, data_root, uid, pinned_id):
     image = c.get("Image")
     line(f"image {image}, pinned image {pinned_id}", isinstance(image, str) and image == pinned_id and image.startswith("sha256:"))
     user = config.get("User") or ""
-    user_uid = user.split(":")[0]
-    line(f"Config.User {user or '(none)'} (want {uid})", user_uid == uid and as_int(uid) not in (None, 0))
+    ids_ok = all(as_int(i) not in (None, 0) for i in (uid, gid))
+    line(f"Config.User {user or '(none)'} (want {uid}:{gid})", ids_ok and user == f"{uid}:{gid}")
     line(f"ReadonlyRootfs {json.dumps(host.get('ReadonlyRootfs'))}", host.get("ReadonlyRootfs") is True)
     cap_drop, cap_add = host.get("CapDrop") or [], host.get("CapAdd") or []
     line(f"CapDrop {json.dumps(cap_drop)}, CapAdd {json.dumps(cap_add)}", "ALL" in cap_drop and not cap_add)
     sec = host.get("SecurityOpt") or []
-    line(f"SecurityOpt {json.dumps(sec)}", "no-new-privileges:true" in sec)
+    line(f"SecurityOpt {json.dumps(sec)}", sec == SECURITY_OPT)
     line(f"Privileged {json.dumps(host.get('Privileged'))}", host.get("Privileged") is False)
     line(f"NetworkMode {json.dumps(host.get('NetworkMode'))}", host.get("NetworkMode") == "host")
+    group_add = host.get("GroupAdd")
+    line(f"GroupAdd {json.dumps(group_add)}", group_add in (None, []))
+    devices = host.get("Devices")
+    shown = [d.get("PathOnHost") if isinstance(d, dict) else d for d in devices] if isinstance(devices, list) else devices
+    line(f"Devices {json.dumps(shown)}", devices in (None, []))
+    for key, may_join in (("PidMode", True), ("IpcMode", True), ("UTSMode", False)):
+        line(f"{key} {json.dumps(host.get(key))}", own_namespace(host.get(key), may_join))
+    if "CgroupnsMode" in host:
+        line(f"CgroupnsMode {json.dumps(host['CgroupnsMode'])}", own_namespace(host["CgroupnsMode"], False))
+    else:
+        line("CgroupnsMode (none)", True)
     want = {
         "/data": (f"{data_root}/{service}/data", True),
         "/secrets/jwt.hex": (f"{data_root}/{service}/jwt.hex", False),
@@ -393,8 +431,8 @@ def container(inspect_path, service, data_root, uid, pinned_id):
             mounts_ok = False
         seen.add(dest)
     line(f"mounts {'; '.join(mounts) or 'none'}", mounts_ok and seen == set(want))
-    tmpfs = sorted((host.get("Tmpfs") or {}).keys())
-    line(f"tmpfs {json.dumps(tmpfs)}", set(tmpfs) <= {"/tmp"})
+    tmpfs = host.get("Tmpfs") or {}
+    line(f"tmpfs {json.dumps(tmpfs, sort_keys=True)}", tmpfs_ok(tmpfs))
     return 0 if all(results) else 1
 
 
@@ -403,7 +441,7 @@ COMMANDS = {
     "syncing": (syncing, 4),
     "finalized": (finalized, 2),
     "identity": (identity, 2),
-    "container": (container, 5),
+    "container": (container, 6),
 }
 
 

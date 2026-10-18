@@ -8,9 +8,10 @@
 #      compose variable overridden by the shell environment; each image's repo digests
 #      (`docker image inspect`, which must hold the .env digest); each service's running
 #      container (`docker compose ps`) checked through `docker inspect` (lib/beacon.py
-#      container: the pinned image ID, Config.User the .env uid and never 0, read-only root,
-#      CapDrop ALL and no CapAdd, no-new-privileges, not privileged, host network, exactly its
-#      data and read-only JWT mounts and a /tmp tmpfs), every process's ruid/euid
+#      container: the pinned image ID, Config.User the .env uid:gid and neither 0, read-only
+#      root, CapDrop ALL and no CapAdd, only no-new-privileges, not privileged, host network,
+#      no extra group or device, no host PID/IPC/UTS/cgroup namespace, exactly its data and
+#      read-only JWT mounts and a noexec,nosuid,nodev /tmp tmpfs), every process's ruid/euid
 #      (`docker top`) the .env uid; each container's `--version`; and the README.md
 #      release-note line for each pinned tag (copied into the log; a tag README.md does not
 #      record fails);
@@ -108,6 +109,7 @@ release_notes=$(awk '/<!-- release-notes:begin -->/ {on = 1; next} /<!-- release
 for svc in reth lighthouse; do
   if [[ $svc == reth ]]; then pre=RETH gh=paradigmxyz/reth; else pre=LIGHTHOUSE gh=sigp/lighthouse; fi
   image=$(env_get "$env_file" ${pre}_IMAGE) want_uid=$(env_get "$env_file" ${pre}_UID)
+  want_gid=$(env_get "$env_file" ${pre}_GID)
   {
     echo "${pre}_IMAGE=$image"
     if ! image_pinned "$image"; then
@@ -133,7 +135,7 @@ for svc in reth lighthouse; do
     else
       pinned_id=$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null) || pinned_id=unknown
       docker inspect "$ctr" > "$work/inspect-$svc.json" 2>/dev/null || true
-      "${helper[@]}" container "$work/inspect-$svc.json" "$svc" "$root" "$want_uid" "$pinned_id" \
+      "${helper[@]}" container "$work/inspect-$svc.json" "$svc" "$root" "$want_uid" "$want_gid" "$pinned_id" \
         > "$work/container-$svc.txt" 2>&1 || bad=1
       sed "s|^|$svc container $ctr: |" "$work/container-$svc.txt"
       procs=$(docker top "$ctr" -o ruid,euid,pid,comm 2>/dev/null | awk 'NR > 1 { print $1 "/" $2 }' | sort -u | tr '\n' ' ')

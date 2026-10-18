@@ -25,9 +25,18 @@ Exit 0 done, 1 a secret or verification problem, 2 a refused path or bad usage.
         An existing secret is kept (a missing copy restored from the other) unless ROTATE is 1;
         copies that differ, or are not 64 lower-case hex characters, exit 1. CHOWN 0 (test
         mode) chowns nothing. Ends by verifying every mode and owner through descriptors.
-    write-file DIR NAME
-        Replace DIR/NAME with stdin, mode 0600, via a file created O_EXCL|O_NOFOLLOW in DIR
-        and renamed over NAME (a symlink at NAME is replaced, never followed).
+    check-dir DIR EUID OPERATOR_UID
+        The .env directory: DIR is absolute, without empty, . or .. components, and every
+        directory from / down to DIR itself is a directory (never a symlink) owned by root,
+        EUID or OPERATOR_UID (the sudo user, SUDO_UID; -1 for none) and not writable by group
+        or others, unless it is root-owned and sticky (/tmp).
+    write-file DIR NAME EUID OPERATOR_UID
+        The check-dir walk again, keeping DIR's descriptor, then replace DIR/NAME with stdin,
+        mode 0600, via a file created O_EXCL|O_NOFOLLOW through that descriptor and renamed
+        over NAME through it (a symlink at NAME is replaced, never followed).
+
+Files are opened O_NONBLOCK and fstat'ed before any read, so a FIFO planted at a checked path is
+refused instead of blocking the run.
 """
 
 import os
@@ -35,8 +44,9 @@ import re
 import stat
 import sys
 
-O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-O_FILE = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+# O_NONBLOCK: opening a FIFO for reading would otherwise wait for a writer.
+O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+O_FILE = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
 SECRET = re.compile(rb"[0-9a-f]{64}")
 SERVICES = ("reth", "lighthouse")
 
@@ -49,12 +59,12 @@ class Bad(Exception):
     """A secret or verification problem: exit 1."""
 
 
-def components(root):
+def components(root, what="DATA_ROOT"):
     if not root.startswith("/"):
-        raise Refused("DATA_ROOT must be an absolute path")
+        raise Refused(f"{what} must be an absolute path")
     parts = root.split("/")[1:]
     if root == "/" or any(p in ("", ".", "..") for p in parts):
-        raise Refused("DATA_ROOT must not be /, or have an empty, . or .. component")
+        raise Refused(f"{what} must not be /, or have an empty, . or .. component")
     return parts
 
 
@@ -73,20 +83,24 @@ def mode_of(st):
     return stat.S_IMODE(st.st_mode)
 
 
-def check_closed(fd, path, euid, sticky_ok):
+def check_closed(fd, path, owners, sticky_ok):
     st = os.fstat(fd)
-    if st.st_uid not in (0, euid):
-        raise Refused(f"{path}: owned by uid {st.st_uid}, not root")
+    if st.st_uid not in owners:
+        who = "root" if owners == {0} else "uid " + " or ".join(str(o) for o in sorted(owners))
+        raise Refused(f"{path}: owned by uid {st.st_uid}, not {who}")
     if mode_of(st) & 0o022 and not (sticky_ok and st.st_uid == 0 and st.st_mode & stat.S_ISVTX):
         raise Refused(f"{path}: writable by group or others (mode {mode_of(st):o})")
 
 
-def walk(root, euid, create):
+def walk(root, euid, create, operator=None, what="DATA_ROOT", sticky_last=False):
     """The descriptor of ROOT (created, 0755, if `create`), or None if it does not exist and
-    `create` is false. Every component is checked on the way."""
-    parts = components(root)
+    `create` is false. Every component is checked on the way: owned by root or EUID (or
+    `operator`, when not None) and closed to group and others, unless root-owned and sticky.
+    ROOT itself may be root-owned and sticky only with `sticky_last` (the .env directory)."""
+    parts = components(root, what)
+    owners = {0, euid} | ({operator} if operator is not None else set())
     fd = os.open("/", O_DIR)
-    check_closed(fd, "/", euid, True)
+    check_closed(fd, "/", owners, True)
     path = ""
     try:
         for i, name in enumerate(parts):
@@ -102,7 +116,7 @@ def walk(root, euid, create):
                 if nfd is None or os.fstat(nfd).st_uid != euid:
                     raise Refused(f"{path}: changed while it was created")
                 os.fchmod(nfd, 0o755)
-            check_closed(nfd, path, euid, not last)
+            check_closed(nfd, path, owners, sticky_last or not last)
             os.close(fd)
             fd = nfd
         return fd
@@ -118,7 +132,8 @@ def check_owner(fd, path, owners):
 
 
 def open_file(dir_fd, name, path, owners):
-    """The file's descriptor, or None if absent; it must be a regular file with one link."""
+    """The file's descriptor, or None if absent; it must be a regular file with one link. It is
+    opened O_NONBLOCK and fstat'ed before anything reads it, so a FIFO is refused at once."""
     try:
         fd = os.open(name, O_FILE, dir_fd=dir_fd)
     except FileNotFoundError:
@@ -136,6 +151,7 @@ def open_file(dir_fd, name, path, owners):
     if problem:
         os.close(fd)
         raise Refused(f"{path}: {problem}")
+    os.set_blocking(fd, True)  # a regular file: the O_NONBLOCK that kept a FIFO from blocking is done
     return fd
 
 
@@ -311,9 +327,32 @@ def verify(root, root_fd, fds, euid, uids, secret):
     print("verify: both JWT copies hold the same 32-byte secret")
 
 
-def write_file(directory, name):
+def operator_uid(value):
+    """OPERATOR_UID as an int, or None for -1 (no sudo user)."""
+    if not re.fullmatch(r"-1|[0-9]+", value):
+        raise Refused(f"OPERATOR_UID {value!r} is not a uid or -1")
+    return None if value == "-1" else int(value)
+
+
+def env_dir(directory, euid, operator):
+    """The .env directory's descriptor, after the walk from /; a missing one is refused."""
+    fd = walk(directory, int(euid), False, operator_uid(operator), "the .env directory", sticky_last=True)
+    if fd is None:
+        raise Refused(f"{directory}: no such directory")
+    return fd
+
+
+def check_dir(directory, euid, operator):
+    os.close(env_dir(directory, euid, operator))
+    print(f"checks: {directory} (the .env directory) and every directory above it")
+    return 0
+
+
+def write_file(directory, name, euid, operator):
+    if name in ("", ".", "..") or "/" in name:
+        raise Refused(f"{name!r}: not a file name")
     data = sys.stdin.buffer.read()
-    dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    dfd = env_dir(directory, euid, operator)
     tmp = f".{name}.{os.urandom(6).hex()}"
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
@@ -335,12 +374,12 @@ def write_file(directory, name):
     return 0
 
 
-COMMANDS = {"check": (check, 4), "install": (install, 8), "write-file": (write_file, 2)}
+COMMANDS = {"check": (check, 4), "install": (install, 8), "check-dir": (check_dir, 3), "write-file": (write_file, 4)}
 
 
 def main(argv):
     if len(argv) < 2 or argv[1] not in COMMANDS or len(argv) - 2 != COMMANDS[argv[1]][1]:
-        print("usage: fsguard.py {check|install|write-file} ARGS... (see the module docstring)", file=sys.stderr)
+        print("usage: fsguard.py {check|install|check-dir|write-file} ARGS... (see the module docstring)", file=sys.stderr)
         return 2
     try:
         return COMMANDS[argv[1]][0](*argv[2:])

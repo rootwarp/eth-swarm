@@ -8,7 +8,9 @@
 # As root it runs only with ETHSWARM_ROOT_TESTS=1 (a throwaway container: it creates users),
 # and then runs, besides the pure checks, the root-only part: setup.sh and preflight.sh for
 # real (no --test-mode), every setup.sh refusal as real root, and the regression runs of the
-# DATA_ROOT ancestor swap and the run-log temp-file swap. The rest runs as a normal user.
+# DATA_ROOT ancestor swap, the .env directory redirect and the run-log temp-file swap. The
+# rest runs as a normal user. A FIFO planted at a checked path needs `timeout` to bound the
+# run, so where it is missing (macOS) those cases are skipped.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 ref=$(cd "$here/.." && pwd)
@@ -320,6 +322,14 @@ check_out 1 "mode: another owner fails" '\(want 600 lighthouse\): FAIL$' check_m
 check_out 1 "mode: a missing file fails" '^/k: no such file \(want 600 reth\): FAIL$' check_mode_owner /k "" reth
 check_out 1 "mode: 6000 is not 600" 'FAIL$' check_mode_owner /k "6000 reth" reth
 
+# set_env <file> <key> <value>: replace or append KEY=value (taken from the environment, so awk
+# decodes no backslash escape in it).
+set_env() {
+  SET_K=$2 SET_V=$3 awk 'BEGIN { k = ENVIRON["SET_K"]; v = ENVIRON["SET_V"] }
+    index($0, k "=") == 1 { if (!done) print k "=" v; done = 1; next } { print }
+    END { if (!done) print k "=" v }' "$1" > "$1.new" && mv "$1.new" "$1"
+}
+
 # refusal_cases [--test-mode]: setup.sh refuses, before it changes anything, every path it
 # would follow or reown wrongly, and every .env line compose would read differently. Each
 # case: exit 2, and the check after it holds (single-quoted on purpose: evaluated after).
@@ -374,23 +384,79 @@ refusal_cases() {
   refuse_case "a JWT copy that is a hard link" '[[ $(cat "$base/victim") == victim && $(file_mode_uid "$base/victim") == "644 $me_uid" ]]' --root "$r"
   rm "$r/reth/jwt.hex" && mkdir "$r/reth/jwt.hex"
   refuse_case "a JWT path that is a directory" '[[ -d $r/reth/jwt.hex ]]' --root "$r"
+  # A FIFO planted where a file is opened must be refused at once, never block setup.sh (a
+  # bounded run: a hang is a failure, not a stuck suite).
+  if [[ -n $bound ]]; then
+    rmdir "$r/reth/jwt.hex" && mkfifo "$r/reth/jwt.hex"
+    refuse_case --want 'reth/jwt\.hex: not a regular file' "a FIFO at a JWT path, without blocking" '[[ -p $r/reth/jwt.hex ]]' --root "$r"
+    rm "$r/reth/jwt.hex"
+    rmdir "$r/.staging" && mkfifo "$r/.staging"
+    refuse_case --want '\.staging: a symlink or not a directory' "a FIFO at the staging path, without blocking" '[[ -p $r/.staging ]]' --root "$r"
+    rm "$r/.staging" && mkdir -m 0700 "$r/.staging" && mkfifo "$r/.staging/jwt.reth.000000000000"
+    refuse_case --want '\.staging: not empty' "a FIFO inside the staging dir, without blocking" '[[ -p $r/.staging/jwt.reth.000000000000 && ! -e $r/reth/jwt.hex ]]' --root "$r"
+  else
+    echo "# skip - setup refuses a planted FIFO: no timeout command to bound the run"
+  fi
+  # A backslash or a newline in DATA_ROOT: awk would decode an escape and record another root
+  # (or an extra RETH_UID line) in .env.
+  refuse_case --want 'without whitespace or a backslash' "a backslash in --root" \
+    '[[ -z $(find "$base" -maxdepth 1 -name "bs*") ]] && ! grep -q "^RETH_UID=0" "$refuse_env"' --root "$base/bs\nRETH_UID=0"
+  refuse_case --want 'without whitespace or a backslash' "a newline in --root" \
+    '[[ -z $(find "$base" -maxdepth 1 -name "nl*") ]]' --root "$base/nl"$'\n'"RETH_UID=0"
+  set_env "$refuse_env" DATA_ROOT "$base/bs\\x"
+  refuse_case --want 'without whitespace or a backslash' "a backslash in DATA_ROOT from .env" '[[ -z $(find "$base" -maxdepth 1 -name "bs*") ]]'
+  cp "$ref/.env.example" "$refuse_env"
+  # The .env directory gets the same walk from / as DATA_ROOT: no symlink anywhere on its path,
+  # every directory owned by root or the operator and closed to group and others.
+  mkdir -m 0700 "$base/envreal" && cp "$ref/.env.example" "$base/envreal/.env" && ln -s "$base/envreal" "$base/envlink"
+  cp "$base/envreal/.env" "$base/env.before"
+  refuse_case --want 'envlink: a symlink or not a directory' "an .env reached through a symlinked directory" \
+    '[[ ! -e $base/envdir-root ]] && cmp -s "$base/envreal/.env" "$base/env.before"' --env-file "$base/envlink/.env" --root "$base/envdir-root"
+  mkdir -m 0700 "$base/envgw" && chmod 0770 "$base/envgw" && cp "$ref/.env.example" "$base/envgw/.env"
+  refuse_case --want 'envgw: writable by group or others' "an .env in a group-writable directory" \
+    '[[ ! -e $base/envdir-root ]] && cmp -s "$base/envgw/.env" "$base/env.before"' --env-file "$base/envgw/.env" --root "$base/envdir-root"
+  mkdir -p "$base/envup/cfg" && chmod 0777 "$base/envup" && chmod 0700 "$base/envup/cfg" && cp "$ref/.env.example" "$base/envup/cfg/.env"
+  refuse_case --want 'envup: writable by group or others' "an .env below a world-writable directory" \
+    '[[ ! -e $base/envdir-root ]] && cmp -s "$base/envup/cfg/.env" "$base/env.before"' --env-file "$base/envup/cfg/.env" --root "$base/envdir-root"
+  chmod 0755 "$base/envup"
   # .env lines compose reads differently: export (last one wins), indentation, a key twice,
-  # $ or a backtick (expanded). setup.sh refuses before it creates anything.
-  local line
-  for line in 'export RETH_UID=0' ' RETH_UID=0' 'RETH_IMAGE=again' 'CHECKPOINT_SYNC_URL=https://x.example/$SECRETPART' \
-    'TRUSTED_PEERS=`id`'; do
+  # $ or a backtick (expanded). Each case breaks one rule only (a $ or backtick replaces the
+  # key's line rather than adding a second one), and the refusal names that rule. setup.sh
+  # refuses before it creates anything.
+  local line key
+  for line in 'export RETH_UID=0' ' RETH_UID=0'; do
     cp "$ref/.env.example" "$refuse_env" && printf '%s\n' "$line" >> "$refuse_env"
-    refuse_case ".env line '${line%%=*}=…'" '[[ ! -e $base/env-root ]]' --root "$base/env-root"
+    refuse_case --want 'line [0-9]+: not KEY=value' ".env line '${line%%=*}=…'" '[[ ! -e $base/env-root ]]' --root "$base/env-root"
+  done
+  cp "$ref/.env.example" "$refuse_env" && printf '%s\n' 'RETH_IMAGE=again' >> "$refuse_env"
+  refuse_case --want 'line [0-9]+: RETH_IMAGE set twice' ".env line 'RETH_IMAGE=…' (a key twice)" '[[ ! -e $base/env-root ]]' --root "$base/env-root"
+  for line in 'CHECKPOINT_SYNC_URL=https://x.example/$SECRETPART' 'TRUSTED_PEERS=`id`'; do
+    key=${line%%=*}
+    cp "$ref/.env.example" "$refuse_env" && set_env "$refuse_env" "$key" "${line#*=}"
+    refuse_case --want "line [0-9]+: $key holds a \\$ or a backtick" ".env line '$key=…' (a \$ or a backtick)" \
+      '[[ ! -e $base/env-root && $(grep -c "^$key=" "$refuse_env") == 1 ]] && ! printf "%s\n" "$out" | grep -q "set twice"' --root "$base/env-root"
   done
   cp "$ref/.env.example" "$refuse_env"
 }
+# refuse_case [--want <pattern>] <description> <check> [setup.sh args...]: setup.sh exits 2, the
+# check holds (single-quoted: evaluated after the run, with the output in $out), and, with
+# --want, an output line matches the extended regex <pattern>. Bounded by $bound when set.
 refuse_case() {
-  local desc=$1 after=$2 rc=0 out
+  local want='' desc after rc=0 out
+  if [[ $1 == --want ]]; then want=$2; shift 2; fi
+  desc=$1 after=$2
   shift 2
-  # shellcheck disable=SC2086 # $refuse_flags is empty or one flag
-  out=$(bash "$setup" $refuse_flags --env-file "$refuse_env" "$@" 2>&1) || rc=$?
-  if ((rc == 2)) && eval "$after"; then ok "setup refuses${refuse_flags:+ (test mode)}: $desc"; else bad "setup refuses: $desc (exit $rc, check: $after)" "$out"; fi
+  # shellcheck disable=SC2086 # $refuse_flags is empty or one flag; $bound is empty or a command
+  out=$($bound bash "$setup" $refuse_flags --env-file "$refuse_env" "$@" 2>&1) || rc=$?
+  if ((rc == 2)) && eval "$after" && { [[ -z $want ]] || printf '%s\n' "$out" | grep -Eq -- "$want"; }; then
+    ok "setup refuses${refuse_flags:+ (test mode)}: $desc"
+  else
+    bad "setup refuses: $desc (exit $rc, check: $after${want:+, want /$want/})" "$out"
+  fi
 }
+# bound: a prefix that kills a hung run (and its children) after 30 s, where timeout exists.
+bound=
+if command -v timeout >/dev/null 2>&1; then bound="timeout -k 5 30"; fi
 
 # --- setup.sh --test-mode under a temp root (not as root) --------------------------------------
 
@@ -494,6 +560,12 @@ for svc in reth lighthouse; do
 done
 
 refusal_cases --test-mode
+# fsguard.py's .env-directory commands, called directly with what setup.sh never passes.
+guard="$ref/lib/fsguard.py"
+check_out 2 "fsguard: check-dir refuses a missing directory" 'absent: no such directory$' python3 -I "$guard" check-dir "$tmp/absent" "$me_uid" -1
+check_out 2 "fsguard: check-dir refuses a relative directory" '^ERROR: the \.env directory must be an absolute path$' python3 -I "$guard" check-dir rel/dir "$me_uid" -1
+check_out 2 "fsguard: an OPERATOR_UID that is not a uid is refused" "OPERATOR_UID 'x1' is not a uid or -1" python3 -I "$guard" check-dir "$tmp" "$me_uid" x1
+check_out 2 "fsguard: write-file refuses a NAME that is not a file name" "'\.\.': not a file name" python3 -I "$guard" write-file "$tmp" .. "$me_uid" -1 < /dev/null
 fi
 
 # --- stubs for preflight.sh and collect-run-log.sh ---------------------------------------------
@@ -579,11 +651,6 @@ SH
 chmod +x "$stubs"/*
 # preflight.sh stats real files, so it gets only the curl stub.
 mkdir -p "$tmp/stubs-curl" && cp "$stubs/curl" "$tmp/stubs-curl/"
-# set_env <file> <key> <value>: replace or append KEY=value.
-set_env() {
-  awk -v k="$2" -v v="$3" 'index($0, k "=") == 1 { if (!done) print k "=" v; done = 1; next } { print }
-    END { if (!done) print k "=" v }' "$1" > "$1.new" && mv "$1.new" "$1"
-}
 
 # --- preflight.sh (not as root) ---------------------------------------------------------------
 if ((me_uid != 0)); then
@@ -674,10 +741,18 @@ pf_real "RETH_GID 0 is refused" '^RETH_GID: 0 is root.s group: FAIL$'
 pf_base
 pf_real "one gid for both services is refused" '^RETH_GID, LIGHTHOUSE_GID: the same gid for both services: FAIL$'
 # .env lines compose reads differently are refused outright, naming the line, never the value.
+# A $ or backtick replaces the key's line, so the only rule it breaks is the $ rule.
 for line in 'export RETH_UID=0' '  RETH_UID=0' 'RETH_UID=1' 'CHECKPOINT_SYNC_URL=https://x.example/$SECRETPART' 'TRUSTED_PEERS=`id`'; do
-  pf_base; printf '%s\n' "$line" >> "$pf_env"
+  pf_base
+  case $line in
+    *[\$\`]*) set_env "$pf_env" "${line%%=*}" "${line#*=}"; want="line [0-9]+: ${line%%=*} holds a \\$ or a backtick" ;;
+    RETH_UID=*) printf '%s\n' "$line" >> "$pf_env"; want='line [0-9]+: RETH_UID set twice' ;;
+    *) printf '%s\n' "$line" >> "$pf_env"; want='line [0-9]+: not KEY=value' ;;
+  esac
   rc=0; out=$(env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env" 2>&1) || rc=$?
-  if ((rc == 2)) && printf '%s\n' "$out" | grep -q ' line [0-9]*: ' && ! printf '%s' "$out" | grep -q SECRETPART; then
+  if ((rc == 2)) && printf '%s\n' "$out" | grep -Eq -- "$want" &&
+    { [[ $want == *'set twice' ]] || ! printf '%s\n' "$out" | grep -q 'set twice'; } &&
+    ! printf '%s' "$out" | grep -q SECRETPART; then
     ok "preflight: .env line '${line%%=*}=…' is refused"
   else
     bad "preflight: .env line '$line' is refused (exit $rc)" "$out"
@@ -758,7 +833,9 @@ json.dump([{
     "Config": {"User": f"{uid}:{uid}"},
     "HostConfig": {"ReadonlyRootfs": True, "CapDrop": ["ALL"], "CapAdd": None,
                    "SecurityOpt": ["no-new-privileges:true"], "Privileged": False,
-                   "NetworkMode": "host", "Tmpfs": {"/tmp": "rw,noexec,nosuid,nodev,size=256m"}},
+                   "NetworkMode": "host", "Tmpfs": {"/tmp": "rw,noexec,nosuid,nodev,size=256m"},
+                   "GroupAdd": None, "Devices": None, "PidMode": "", "IpcMode": "private",
+                   "UTSMode": "", "CgroupnsMode": "private"},
     "Mounts": [
         {"Type": "bind", "Source": f"{root}/{svc}/data", "Destination": "/data", "RW": True},
         {"Type": "bind", "Source": f"{root}/{svc}/jwt.hex", "Destination": "/secrets/jwt.hex", "RW": False},
@@ -822,7 +899,7 @@ has "Reth Version: 2.7.0" "records the reth --version output"
 has "Lighthouse v8.3.0-rc.0-0123abc" "records the lighthouse --version output"
 has "ghcr.io/paradigmxyz/reth@sha256:$reth_digest" "records reth's repo digest"
 has "reth container ctr-reth: image sha256:1111, pinned image sha256:1111: PASS" "the running reth container runs the pinned image"
-has "reth container ctr-reth: Config.User 990:990 (want 990): PASS" "records the reth container's configured user"
+has "reth container ctr-reth: Config.User 990:990 (want 990:990): PASS" "records the reth container's configured user and group"
 has "reth container ctr-reth: processes ruid/euid 990/990 (want 990): PASS" "records the reth container's process uids"
 has "lighthouse container ctr-lh: ReadonlyRootfs true: PASS" "records the read-only root"
 has "lighthouse container ctr-lh: mounts /data <- $root/lighthouse/data (bind, rw); /secrets/jwt.hex <- $root/lighthouse/jwt.hex (bind, ro): PASS" "records the mounts"
@@ -908,7 +985,7 @@ verdict 1 FAIL "a process running as root fails criterion 1"
 cl_base; cl_inspect ctr-lh 'c["Config"]["User"] = "992:992"'
 printf '%s\n' 'RUID EUID PID COMMAND' '992 992 901 lighthouse' > "$tmp/docker/ctr-lh.top"
 cl_quick "a lighthouse container as another uid than LIGHTHOUSE_UID fails"
-has "(want 991): FAIL" "names the expected uid"
+has "(want 991:991): FAIL" "names the expected uid and gid"
 # Every hardening setting compose.yaml makes, loosened one at a time (as an extra -f override
 # file could), fails criterion 1.
 hardening() { # hardening <description> <pattern> <python statement>
@@ -927,7 +1004,28 @@ hardening "a writable JWT mount" '/secrets/jwt.hex <- '"$root"'/reth/jwt.hex (bi
 hardening "a data mount from elsewhere" '/data <- /srv/elsewhere/data (bind, rw)' 'c["Mounts"][0]["Source"] = "/srv/elsewhere/data"'
 hardening "an extra mount" '/host <- / (bind, rw)' 'c["Mounts"].append({"Type": "bind", "Source": "/", "Destination": "/host", "RW": True})'
 hardening "a missing JWT mount" 'reth container ctr-reth: mounts /data <- '"$root"'/reth/data (bind, rw): FAIL' 'c["Mounts"].pop()'
-hardening "an extra tmpfs" 'tmpfs ["/run", "/tmp"]: FAIL' 'c["HostConfig"]["Tmpfs"]["/run"] = "rw"'
+hardening "an extra tmpfs" 'tmpfs {"/run": "rw", "/tmp": "rw,noexec,nosuid,nodev,size=256m"}: FAIL' 'c["HostConfig"]["Tmpfs"]["/run"] = "rw"'
+hardening "no tmpfs at all" 'reth container ctr-reth: tmpfs {}: FAIL' 'c["HostConfig"]["Tmpfs"] = None'
+hardening "a /tmp tmpfs with exec, suid and dev" 'tmpfs {"/tmp": "rw,exec,suid,dev"}: FAIL' 'c["HostConfig"]["Tmpfs"]["/tmp"] = "rw,exec,suid,dev"'
+hardening "a /tmp tmpfs without nodev" 'tmpfs {"/tmp": "rw,noexec,nosuid"}: FAIL' 'c["HostConfig"]["Tmpfs"]["/tmp"] = "rw,noexec,nosuid"'
+hardening "a /tmp tmpfs whose later exec undoes noexec" 'tmpfs {"/tmp": "noexec,nosuid,nodev,exec"}: FAIL' 'c["HostConfig"]["Tmpfs"]["/tmp"] = "noexec,nosuid,nodev,exec"'
+# The identity half of Config.User and every namespace or device that would let a service reach
+# the host or another group's files.
+hardening "Config.User with group 0" 'Config.User 990:0 (want 990:990): FAIL' 'c["Config"]["User"] = "990:0"'
+hardening "Config.User with another group than RETH_GID" 'Config.User 990:991 (want 990:990): FAIL' 'c["Config"]["User"] = "990:991"'
+hardening "Config.User without a group" 'Config.User 990 (want 990:990): FAIL' 'c["Config"]["User"] = "990"'
+hardening "a supplementary group" 'reth container ctr-reth: GroupAdd ["0"]: FAIL' 'c["HostConfig"]["GroupAdd"] = ["0"]'
+hardening "a host device" 'reth container ctr-reth: Devices ["/dev/sda"]: FAIL' 'c["HostConfig"]["Devices"] = [{"PathOnHost": "/dev/sda", "PathInContainer": "/dev/sda", "CgroupPermissions": "rwm"}]'
+hardening "the host PID namespace" 'reth container ctr-reth: PidMode "host": FAIL' 'c["HostConfig"]["PidMode"] = "host"'
+hardening "another container's PID namespace" 'PidMode "container:ctr-lh": FAIL' 'c["HostConfig"]["PidMode"] = "container:ctr-lh"'
+hardening "the host IPC namespace" 'reth container ctr-reth: IpcMode "host": FAIL' 'c["HostConfig"]["IpcMode"] = "host"'
+hardening "the host UTS namespace" 'reth container ctr-reth: UTSMode "host": FAIL' 'c["HostConfig"]["UTSMode"] = "host"'
+hardening "the host cgroup namespace" 'reth container ctr-reth: CgroupnsMode "host": FAIL' 'c["HostConfig"]["CgroupnsMode"] = "host"'
+hardening "seccomp unconfined" 'SecurityOpt ["no-new-privileges:true", "seccomp=unconfined"]: FAIL' 'c["HostConfig"]["SecurityOpt"].append("seccomp=unconfined")'
+hardening "AppArmor unconfined" 'SecurityOpt ["no-new-privileges:true", "apparmor=unconfined"]: FAIL' 'c["HostConfig"]["SecurityOpt"].append("apparmor=unconfined")'
+cl_base; cl_inspect ctr-reth 'del c["HostConfig"]["CgroupnsMode"]'
+cl_run 0 "an engine that reports no CgroupnsMode (cgroup v1) is fine"
+has "reth container ctr-reth: CgroupnsMode (none): PASS" "records the missing cgroup namespace mode"
 cl_base; cl_inspect ctr-reth 'c["Mounts"].append({"Type": "tmpfs", "Source": "", "Destination": "/tmp", "RW": True})'
 cl_run 0 "a /tmp tmpfs listed among the mounts is fine"
 
@@ -1115,28 +1213,94 @@ exec $(command -v python3) "\$@"
 SH
     chmod +x "$tmp/hook/python3"
   }
-  # Regression (DATA_ROOT ancestor swap): another user owns a directory above DATA_ROOT and
-  # swaps DATA_ROOT for a symlink to a victim tree once setup.sh starts; nothing outside
-  # DATA_ROOT may change, and setup.sh must not report success.
-  for n in 1 2; do
+  # setup.sh's fsguard.py calls, in order: 1 check (DATA_ROOT), 2 check-dir (the .env
+  # directory), 3 install, 4 write-file (.env).
+  # Regression (DATA_ROOT ancestor swap): DATA_ROOT is swapped for a symlink to a victim tree
+  # just before fsguard call n; nothing outside DATA_ROOT may change, and setup.sh must not
+  # report success. At call 1 another user owns the directory above DATA_ROOT (the attacker
+  # who can swap it). At calls 2 and 3 that directory is root's, so the check passes and the
+  # swap lands between it and install's own walk, which must not follow the symlink. Every
+  # case proves the swap ran.
+  for spec in "1 65534" "2 0" "3 0"; do
+    read -r n owner <<< "$spec"
     a="$tmp/race2-$n/a" v="$tmp/race2-$n/victim"
-    mkdir -p "$a/node" "$v/reth" && chown 65534 "$a" && chmod 0755 "$a" "$a/node" "$v/reth"
+    mkdir -p "$a/node" "$v/reth" && chown "$owner" "$a" && chmod 0755 "$a" "$a/node" "$v/reth"
     hooked "$n" "mv '$a/node' '$a/saved' && ln -s '$v' '$a/node'"
     cp "$ref/.env.example" "$tmp/race2.env"
     rc=0; out=$(PATH="$tmp/hook:$PATH" bash "$setup" --env-file "$tmp/race2.env" --root "$a/node" 2>&1) || rc=$?
-    if ((rc != 0)) && [[ $(file_mode_uid "$v/reth") == "755 0" && -z $(ls -A "$v/reth") && $(ls -A "$v") == reth ]]; then
+    if ((rc != 0)) && [[ -L $a/node && $(cat "$tmp/hook/count") -ge $n ]] &&
+      [[ $(file_mode_uid "$v/reth") == "755 0" && -z $(ls -A "$v/reth") && $(ls -A "$v") == reth ]]; then
       ok "root: regression: DATA_ROOT swapped for a symlink before fsguard call $n changes nothing outside it"
     else
-      bad "root: regression: DATA_ROOT swapped before fsguard call $n (exit $rc, victim: $(find "$v" -exec stat -c '%a %U %n' {} \; 2>/dev/null | tr '\n' ' '))" "$out"
+      bad "root: regression: DATA_ROOT swapped before fsguard call $n (exit $rc, calls $(cat "$tmp/hook/count" 2>/dev/null), victim: $(find "$v" -exec stat -c '%a %U %n' {} \; 2>/dev/null | tr '\n' ' '))" "$out"
     fi
   done
   # A service user swaps its data dir for a symlink between the checks and the changes.
   r="$tmp/swap-data"
   cp "$ref/.env.example" "$tmp/swap.env"
   bash "$setup" --env-file "$tmp/swap.env" --root "$r" >/dev/null 2>&1
-  hooked 2 "rm -rf '$r/reth/data' && ln -s '$tmp/decoy' '$r/reth/data'"
+  hooked 3 "rm -rf '$r/reth/data' && ln -s '$tmp/decoy' '$r/reth/data'"
   rc=0; PATH="$tmp/hook:$PATH" bash "$setup" --env-file "$tmp/swap.env" --root "$r" >/dev/null 2>&1 || rc=$?
   if ((rc == 2)) && [[ $(file_mode_uid "$tmp/decoy") == "755 0" ]]; then ok "root: a data dir swapped after the checks is refused, its target untouched"; else bad "root: a data dir swapped after the checks (exit $rc, decoy $(file_mode_uid "$tmp/decoy"))"; fi
+
+  # Regression (.env directory redirect): the --env-file directory belongs to another user,
+  # who swaps it for a symlink to a root-owned directory; root must never replace the .env
+  # there. Without SUDO_UID only root may own the path; with it, the sudo user may too, and
+  # the symlink is still refused. A sticky world-writable parent (/var/tmp) changes nothing.
+  id -u envop >/dev/null 2>&1 || useradd -m -d /home/envop -s /usr/sbin/nologin envop
+  op=$(id -u envop) vd="$tmp/victimdir"
+  mkdir -m 0755 "$vd"
+  # envswap <dir>: an envop-owned <dir> with an .env, then <dir> swapped for a symlink to $vd.
+  envswap() {
+    rm -rf "$1" "$1.saved" && mkdir -m 0700 "$1" && cp "$ref/.env.example" "$1/.env" && chown -R envop "$1"
+    mv "$1" "$1.saved" && ln -s "$vd" "$1" && chown -h envop "$1"
+  }
+  # env_redirect <description> <env dir> <SUDO_UID or ''>: setup.sh refuses (exit 2) before it
+  # creates DATA_ROOT, and the victim .env is unchanged.
+  env_redirect() {
+    local rc=0 out dr="$tmp/envredir-root"
+    printf 'FOO=1\n' > "$vd/.env" && chmod 0644 "$vd/.env"
+    out=$(env -u SUDO_UID ${3:+SUDO_UID=$3} bash "$setup" --env-file "$2/.env" --root "$dr" 2>&1) || rc=$?
+    if ((rc == 2)) && [[ ! -e $dr && $(cat "$vd/.env") == FOO=1 && $(file_mode_uid "$vd/.env") == "644 0" ]]; then
+      ok "root: regression: $1"
+    else
+      bad "root: regression: $1 (exit $rc, victim $(file_mode_uid "$vd/.env"): $(head -1 "$vd/.env"))" "$out"
+    fi
+  }
+  envswap /home/envop/cfg
+  env_redirect "an .env directory another user swapped for a symlink is refused" /home/envop/cfg ''
+  env_redirect "an .env directory the sudo user swapped for a symlink is refused" /home/envop/cfg "$op"
+  envswap /var/tmp/envop-ref
+  env_redirect "an .env directory swapped for a symlink in sticky /var/tmp is refused" /var/tmp/envop-ref ''
+  env_redirect "an .env directory swapped in sticky /var/tmp is refused for the sudo user too" /var/tmp/envop-ref "$op"
+  rm -rf /var/tmp/envop-ref /var/tmp/envop-ref.saved
+  # Not swapped: the sudo user's own .env directory is accepted, and refused without SUDO_UID.
+  mkdir -m 0700 /home/envop/ok && cp "$ref/.env.example" /home/envop/ok/.env && chown -R envop /home/envop/ok
+  check_out 2 "root: an .env directory owned by another user is refused without SUDO_UID" "/home/envop: owned by uid $op" \
+    env -u SUDO_UID bash "$setup" --env-file /home/envop/ok/.env --root "$tmp/envop-root"
+  check_out 0 "root: the sudo user's own .env directory is accepted" '^setup OK$' \
+    env SUDO_UID="$op" bash "$setup" --env-file /home/envop/ok/.env --root "$tmp/envop-root"
+  if grep -qx "DATA_ROOT=$tmp/envop-root" /home/envop/ok/.env && [[ $(file_mode_uid /home/envop/ok/.env) == "600 0" ]]; then
+    ok "root: the sudo user's .env is rewritten in place, 0600"
+  else
+    bad "root: the sudo user's .env is rewritten in place, 0600 (got $(file_mode_uid /home/envop/ok/.env))"
+  fi
+  # An .env directly in a root-owned sticky directory (like /tmp) is accepted.
+  mkdir -m 1777 "$tmp/sticky" && cp "$ref/.env.example" "$tmp/sticky/.env"
+  check_out 0 "root: an .env in a root-owned sticky directory is accepted" '^setup OK$' \
+    env -u SUDO_UID bash "$setup" --env-file "$tmp/sticky/.env" --root "$tmp/sticky-root"
+  # The swap between the checks and the write: a root-owned .env directory swapped for a
+  # symlink just before write-file (fsguard call 4). The write's own walk refuses it.
+  e="$tmp/envrace"
+  mkdir -m 0700 "$e" "$e/cfg" && cp "$ref/.env.example" "$e/cfg/.env"
+  printf 'FOO=1\n' > "$vd/.env" && chmod 0644 "$vd/.env"
+  hooked 4 "mv '$e/cfg' '$e/cfg.saved' && ln -s '$vd' '$e/cfg'"
+  rc=0; out=$(PATH="$tmp/hook:$PATH" bash "$setup" --env-file "$e/cfg/.env" --root "$tmp/envrace-root" 2>&1) || rc=$?
+  if ((rc == 2)) && [[ -L $e/cfg && $(cat "$tmp/hook/count") == 4 && $(cat "$vd/.env") == FOO=1 && $(file_mode_uid "$vd/.env") == "644 0" && -z $(find "$vd" -mindepth 1 ! -name .env) ]]; then
+    ok "root: regression: an .env directory swapped for a symlink before the write is refused, its target untouched"
+  else
+    bad "root: regression: .env directory swapped before the write (exit $rc, calls $(cat "$tmp/hook/count")): $(find "$vd" -mindepth 1 | tr '\n' ' ')" "$out"
+  fi
 
   # preflight.sh with the users setup.sh created: their ids pass, another uid is refused, and
   # --test-mode never lets uid 0 through.

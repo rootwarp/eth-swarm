@@ -73,6 +73,17 @@ are running a node on Sepolia you'll need v8.3.0-rc.0 instead").
    anywhere on its path or in its tree. It also refuses an `.env` line that compose would
    read differently: `export`, indentation, a key set twice, or a `$` or backtick in a
    value.
+
+   **Premise: only root or you (the operator) can write to the checkout and to the `.env`
+   directory.** Root runs the checkout's scripts and rewrites `.env`, so anyone else who can
+   change either one can make root run their code or write where they choose. `setup.sh`
+   enforces the `.env` half: it walks the `.env` directory from `/` the way it walks
+   `DATA_ROOT`, and refuses a symlink anywhere on that path or a directory on it (the `.env`
+   directory included) that is owned by anyone but root or the sudo user (`SUDO_UID`), or
+   that group or others can write, unless it is root-owned and sticky like `/tmp`. Run it
+   with `sudo` from your own account; run straight from a root shell, it accepts only
+   root-owned directories. It cannot check the checkout, so keep the clone in a directory
+   only you can write to (for example under your home directory, mode 0755 or tighter).
 4. **Pre-flight:** `sudo ./preflight.sh` checks the pins, the ids (non-root, distinct, the
    users' own), the modes and owners, and the checkpoint endpoint's `/eth/v1/config/spec`
    against the pinned config. Public endpoints have served pre-Gloas configs: pick another if

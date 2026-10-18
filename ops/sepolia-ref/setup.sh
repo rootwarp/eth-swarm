@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # One-time host setup for the Sepolia reference node (compose.yaml), run as root. Idempotent:
 #   0. refuses, before it changes anything, an .env with a line compose would read differently
-#      (lib/common.sh env_check), --test-mode as root, and any DATA_ROOT that lib/fsguard.py
-#      cannot prove safe: relative, a . or .. component, a symlink anywhere from / down, a
-#      directory on the way not owned by root or open to group or others (unless root-owned
-#      and sticky, like /tmp), a DATA_ROOT open to group or others (so not /tmp itself), or
-#      below it a symlink, a wrong type, a hard-linked JWT, a foreign owner, or a .staging that
-#      is not an empty 0700 directory. fsguard walks every component through directory
-#      descriptors (openat, O_NOFOLLOW) and changes things only through them, so nothing
-#      checked is resolved again;
+#      (lib/common.sh env_check), --test-mode as root, a DATA_ROOT with whitespace or a
+#      backslash, and any DATA_ROOT that lib/fsguard.py cannot prove safe: relative, a . or ..
+#      component, a symlink anywhere from / down, a directory on the way not owned by root or
+#      open to group or others (unless root-owned and sticky, like /tmp), a DATA_ROOT open to
+#      group or others (so not /tmp itself), or below it a symlink, a wrong type, a
+#      hard-linked JWT, a foreign owner, or a .staging that is not an empty 0700 directory.
+#      fsguard walks every component through directory descriptors (openat, O_NOFOLLOW) and
+#      changes things only through them, so nothing checked is resolved again. The .env
+#      directory gets the same walk: no symlink from / down to it, and every directory on the
+#      way and itself owned by root or by the sudo user (SUDO_UID) and closed to group and
+#      others (unless root-owned and sticky);
 #   1. creates the system users `reth` and `lighthouse` (no login shell, no home) unless they
 #      exist;
 #   2. creates DATA_ROOT (0755) if missing, and DATA_ROOT/{reth,lighthouse}/data, each level
@@ -20,12 +23,14 @@
 #      existing secret is kept (one missing copy is restored from the other) unless
 #      --rotate-jwt is given; two copies that differ, or that are not 64 hex characters, are
 #      refused;
-#   4. writes or refreshes DATA_ROOT, RETH_UID/GID and LIGHTHOUSE_UID/GID in .env (mode 0600);
+#   4. writes or refreshes DATA_ROOT, RETH_UID/GID and LIGHTHOUSE_UID/GID in .env (mode 0600),
+#      through a descriptor of the .env directory that fsguard opens by the same walk from /;
 #   5. verifies every mode and owner it set.
 #
 # Usage: sudo ops/sepolia-ref/setup.sh [--root DIR] [--env-file FILE] [--rotate-jwt] [--test-mode]
 #   --root DIR       DATA_ROOT (absolute); default: DATA_ROOT from .env, else /srv/ethswarm-ref
-#   --env-file FILE  default: .env next to this script; it must exist (cp .env.example .env)
+#   --env-file FILE  default: .env next to this script; it must exist (cp .env.example .env),
+#                    in a directory only root or the sudo user can change
 #   --rotate-jwt     replace the secret (restart both services afterwards)
 #   --test-mode      not as root (refused): create no users and chown nothing, record the
 #                    caller's own uid and gid for both services, and accept directories it owns
@@ -58,9 +63,20 @@ env_check "$env_file" >&2 || refuse "$env_file: fix the lines above"
 [[ -n $root ]] || root=$(env_get "$env_file" DATA_ROOT)
 root=${root:-/srv/ethswarm-ref}
 root=${root%/}
-if [[ $root != /* || $root =~ [[:space:]] ]]; then
-  refuse "DATA_ROOT must be an absolute path without whitespace"
+# A backslash is refused too: nothing that reads DATA_ROOT back may decode it as an escape.
+if [[ $root != /* || $root =~ [[:space:]] || $root == *\\* ]]; then
+  refuse "DATA_ROOT must be an absolute path without whitespace or a backslash"
 fi
+# The .env directory as given (never resolved: fsguard refuses a symlink on its path), made
+# absolute against the logical working directory, and the sudo user who may own it.
+env_dir=$(dirname -- "$env_file") env_name=$(basename -- "$env_file")
+case $env_dir in
+  /*) ;;
+  .) env_dir=$PWD ;;
+  *) env_dir=$PWD/$env_dir ;;
+esac
+operator=-1
+if [[ ${SUDO_UID:-} =~ ^[0-9]+$ ]]; then operator=$SUDO_UID; fi
 euid=$(id -u)
 if ((test_mode)) && ((euid == 0)); then
   refuse "--test-mode is not for root (it would record uid 0 for both services)"
@@ -76,6 +92,7 @@ if ((test_mode)); then
 else
   fsguard check "$root" "$euid" "$(uid_of reth)" "$(uid_of lighthouse)" || exit 2
 fi
+fsguard check-dir "$env_dir" "$euid" "$operator" || exit 2
 
 # 1. Users.
 ensure_user() {
@@ -105,10 +122,12 @@ fsguard install "$root" "$euid" "$reth_uid" "$reth_gid" "$lh_uid" "$lh_gid" "$ro
 ((rc == 0)) || exit "$rc"
 
 # 4. .env: DATA_ROOT and the ids, each line replaced in place or appended once; the new file
-# is created O_EXCL next to .env and renamed over it (never reopened by name).
-awk -v sets="DATA_ROOT=$root RETH_UID=$reth_uid RETH_GID=$reth_gid LIGHTHOUSE_UID=$lh_uid LIGHTHOUSE_GID=$lh_gid" '
+# is created O_EXCL next to .env and renamed over it, both through the descriptor of the .env
+# directory that fsguard's walk from / opened (never reopened by name). The values reach awk
+# through ENVIRON, which (unlike -v) decodes no backslash escape.
+SETUP_SETS="DATA_ROOT=$root RETH_UID=$reth_uid RETH_GID=$reth_gid LIGHTHOUSE_UID=$lh_uid LIGHTHOUSE_GID=$lh_gid" awk '
   BEGIN {
-    n = split(sets, a, " ")
+    n = split(ENVIRON["SETUP_SETS"], a, " ")
     for (i = 1; i <= n; i++) { k = substr(a[i], 1, index(a[i], "=") - 1); key[i] = k; line[k] = a[i] }
   }
   {
@@ -122,7 +141,7 @@ awk -v sets="DATA_ROOT=$root RETH_UID=$reth_uid RETH_GID=$reth_gid LIGHTHOUSE_UI
     print
   }
   END { for (i = 1; i <= n; i++) if (!(key[i] in done)) print line[key[i]] }
-' "$env_file" | fsguard write-file "$(dirname "$env_file")" "$(basename "$env_file")" || exit 2
+' "$env_file" | fsguard write-file "$env_dir" "$env_name" "$euid" "$operator" || exit 2
 echo "env: $env_file (DATA_ROOT, RETH_UID/GID, LIGHTHOUSE_UID/GID)"
 got=$(file_mode_uid "$env_file")
 if [[ $got != "600 $euid" ]]; then
