@@ -47,6 +47,15 @@
 //!   closes the connection at once, since it was going to close anyway. A waiting request whose
 //!   peer has left is dropped when its turn comes.
 //!
+//! # Our BlocksByRange requests
+//!
+//! [`Control::request_blocks`] sends a BeaconBlocksByRange request under the same outbound
+//! limit and hands back a [`BlocksTicket`]. When the request ends (the response, a failure, or
+//! its peer left while it waited) its outcome is kept for [`Control::take_blocks`] and
+//! [`ControlEvent::BlocksByRange`] says so; [`Control::cancel_blocks`] forgets it.
+//! [`super::outbound::RangeRequester`] drives this. [`Control::status_valid_peers`] lists the
+//! peers whose last Status was valid, with that Status, to pick from.
+//!
 //! # Status
 //!
 //! On every connection we dial, our Status goes out first ("the dialing client MUST send a
@@ -70,6 +79,7 @@ use super::limits::{
     shared_limiter, Admit, ChunkPacer, OutboundSemaphore, RpcLimits, SharedLimiter,
 };
 use super::metrics::{RpcMetrics, StatusValidity};
+use super::outbound::{check_request, outbound_failure, OutboundError, RangeError};
 use super::{MAX_CONCURRENT_REQUESTS, REQUEST_TIMEOUT};
 use crate::transport::Direction;
 use consensus_types::EthSpec;
@@ -85,7 +95,9 @@ use libp2p::swarm::{
 };
 use libp2p::{Multiaddr, PeerId};
 use p2p_wire::rpc::codec::ContextTable;
-use p2p_wire::rpc::messages::{ErrorMessage, Goodbye, MetaDataV3, Ping, StatusV2};
+use p2p_wire::rpc::messages::{
+    BlocksByRangeV2Request, ErrorMessage, Goodbye, MetaDataV3, Ping, StatusV2,
+};
 use p2p_wire::rpc::protocols::{Protocol, Request, Response, ResponseChunk, ResultCode};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -393,6 +405,24 @@ pub enum ControlEvent {
         direction: Direction,
         at: SystemTime,
     },
+    /// One of our BlocksByRange requests ended: its outcome waits in [`Control::take_blocks`].
+    BlocksByRange { peer: PeerId, ticket: BlocksTicket },
+}
+
+/// Names one of our BlocksByRange requests ([`Control::request_blocks`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlocksTicket(u64);
+
+/// How one of our BlocksByRange requests ended: the response's chunks, or why there are none.
+pub type BlocksOutcome<E> = Result<Vec<ReceivedChunk<E>>, OutboundError>;
+
+/// One of our requests, waiting for a slot of its protocol or holding one.
+#[derive(Debug)]
+struct Outgoing {
+    peer: PeerId,
+    request: Request,
+    /// The ticket of a BlocksByRange request, for its outcome.
+    ticket: Option<BlocksTicket>,
 }
 
 /// What we know of one connected peer.
@@ -401,6 +431,8 @@ struct PeerState {
     direction: Direction,
     /// The verdict on its last judged Status.
     status_valid: Option<bool>,
+    /// Its last judged Status.
+    status: Option<StatusV2>,
     /// The `seq_number` of its last MetaData.
     metadata_seq: Option<u64>,
     /// Whether our GetMetaData request is open (in flight or waiting for a slot).
@@ -421,7 +453,13 @@ pub struct Control<E: EthSpec> {
     /// every protocol's behaviour numbers its requests on its own, so IDs repeat across them.
     in_flight: HashSet<(Protocol, OutboundRequestId)>,
     /// The outbound slots and wait queues.
-    outbound: OutboundSemaphore<(PeerId, Request)>,
+    outbound: OutboundSemaphore<Outgoing>,
+    /// The ticket of each of our BlocksByRange requests in flight, by the BlocksByRange
+    /// behaviour's request ID (each behaviour numbers its own).
+    blocks_in_flight: HashMap<OutboundRequestId, BlocksTicket>,
+    /// Every ticket neither taken nor cancelled: `None` while its request is open.
+    blocks: HashMap<BlocksTicket, Option<BlocksOutcome<E>>>,
+    next_ticket: u64,
     /// Every peer's response quota, shared with the inbound streams' writers.
     limiter: SharedLimiter,
     pending: VecDeque<ToSwarm<ControlEvent, THandlerInEvent<Protocols<E>>>>,
@@ -492,6 +530,9 @@ impl<E: EthSpec> Control<E> {
             peers: HashMap::new(),
             goodbyes: HashMap::new(),
             in_flight: HashSet::new(),
+            blocks_in_flight: HashMap::new(),
+            blocks: HashMap::new(),
+            next_ticket: 0,
             pending: VecDeque::new(),
         }
     }
@@ -510,14 +551,22 @@ impl<E: EthSpec> Control<E> {
     /// Sends `request` to `peer` in a free slot of its protocol, or queues it; `false` if the
     /// queue IGNOREd it.
     fn submit(&mut self, peer: PeerId, request: Request) -> bool {
-        let protocol = request.protocol();
-        let taken = match self.outbound.submit(protocol, (peer, request)) {
-            Admit::Start((peer, request)) => {
-                self.dispatch(peer, request);
+        self.submit_outgoing(Outgoing {
+            peer,
+            request,
+            ticket: None,
+        })
+    }
+
+    fn submit_outgoing(&mut self, outgoing: Outgoing) -> bool {
+        let protocol = outgoing.request.protocol();
+        let taken = match self.outbound.submit(protocol, outgoing) {
+            Admit::Start(outgoing) => {
+                self.dispatch(outgoing);
                 true
             }
             Admit::Queued => true,
-            Admit::Ignored((peer, request)) => {
+            Admit::Ignored(Outgoing { peer, request, .. }) => {
                 tracing::debug!(%peer, %protocol, "outbound queue full: request ignored");
                 if let Request::Goodbye(_) = request {
                     self.close(peer);
@@ -530,14 +579,22 @@ impl<E: EthSpec> Control<E> {
         taken
     }
 
-    /// Sends `request`, which holds a slot of its protocol.
-    fn dispatch(&mut self, peer: PeerId, request: Request) {
+    /// Sends `outgoing`, which holds a slot of its protocol.
+    fn dispatch(&mut self, outgoing: Outgoing) {
+        let Outgoing {
+            peer,
+            request,
+            ticket,
+        } = outgoing;
         let protocol = request.protocol();
         let goodbye = matches!(request, Request::Goodbye(_));
         let id = self.inner.of(protocol).send_request(&peer, request.into());
         self.in_flight.insert((protocol, id));
         if goodbye {
             self.goodbyes.insert(id, peer);
+        }
+        if let Some(ticket) = ticket {
+            self.blocks_in_flight.insert(id, ticket);
         }
     }
 
@@ -547,15 +604,128 @@ impl<E: EthSpec> Control<E> {
         if !self.in_flight.remove(&(protocol, id)) {
             return;
         }
-        while let Some((peer, request)) = self.outbound.release(protocol) {
-            if self.peers.contains_key(&peer) {
-                self.dispatch(peer, request);
+        while let Some(next) = self.outbound.release(protocol) {
+            let peer = next.peer;
+            let refusal = if self.peers.contains_key(&peer) {
+                // The peer's Status may have changed while the request waited.
+                match &next.request {
+                    Request::BlocksByRange(range) => self.servable(peer, range).err(),
+                    _ => None,
+                }
+            } else {
+                tracing::debug!(%peer, %protocol, "the peer left: its waiting request is dropped");
+                Some(OutboundError::Disconnected)
+            };
+            let Some(error) = refusal else {
+                self.dispatch(next);
                 break;
+            };
+            if let Some(ticket) = next.ticket {
+                self.blocks_done(peer, ticket, Err(error));
             }
-            tracing::debug!(%peer, %protocol, "the peer left: its waiting request is dropped");
         }
         self.metrics
             .set_outbound_inflight(protocol, self.outbound.in_flight(protocol));
+    }
+
+    /// Requests the blocks of `request` from `peer` in a free slot of the protocol, or queues
+    /// the request; its outcome is kept for [`Control::take_blocks`] under the returned ticket.
+    ///
+    /// The request must start at or after the peer's `earliest_available_slot`, by its last
+    /// Status, which must be valid (`fulu/p2p-interface.md` L552–561); that is checked again
+    /// when a waiting request's turn comes, and a request that fails it then ends with the
+    /// refusal.
+    ///
+    /// # Errors
+    ///
+    /// [`RangeError::Outbound`] with [`OutboundError::InvalidRequest`] for a request outside the
+    /// protocol's limits or the peer's range, or to a peer without a valid Status;
+    /// [`RangeError::Ignored`] if the wait queue is full. None is sent.
+    pub fn request_blocks(
+        &mut self,
+        peer: PeerId,
+        request: BlocksByRangeV2Request,
+    ) -> Result<BlocksTicket, RangeError> {
+        check_request(&request)?;
+        self.servable(peer, &request)?;
+        let ticket = BlocksTicket(self.next_ticket);
+        self.next_ticket += 1;
+        self.blocks.insert(ticket, None);
+        let outgoing = Outgoing {
+            peer,
+            request: Request::BlocksByRange(request),
+            ticket: Some(ticket),
+        };
+        if self.submit_outgoing(outgoing) {
+            Ok(ticket)
+        } else {
+            self.blocks.remove(&ticket);
+            Err(RangeError::Ignored)
+        }
+    }
+
+    /// Whether `peer` can serve `request` by its last Status: valid, with
+    /// `earliest_available_slot` at or before `start_slot`.
+    fn servable(
+        &self,
+        peer: PeerId,
+        request: &BlocksByRangeV2Request,
+    ) -> Result<(), OutboundError> {
+        let status = self
+            .peers
+            .get(&peer)
+            .filter(|state| state.status_valid == Some(true))
+            .and_then(|state| state.status.as_ref());
+        match status {
+            None => Err(OutboundError::InvalidRequest(format!(
+                "peer {peer} has no valid Status"
+            ))),
+            Some(s) if request.start_slot < s.earliest_available_slot => {
+                Err(OutboundError::InvalidRequest(format!(
+                    "start_slot {} is before the peer's earliest_available_slot {}",
+                    request.start_slot, s.earliest_available_slot
+                )))
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// The outcome of `ticket`'s request once it ended, taken out; `None` while it is open (or
+    /// for a ticket taken or cancelled before).
+    pub fn take_blocks(&mut self, ticket: BlocksTicket) -> Option<BlocksOutcome<E>> {
+        match self.blocks.get(&ticket) {
+            Some(Some(_)) => self.blocks.remove(&ticket).flatten(),
+            _ => None,
+        }
+    }
+
+    /// Forgets `ticket`: an outcome kept or still to come is dropped.
+    pub fn cancel_blocks(&mut self, ticket: BlocksTicket) {
+        self.blocks.remove(&ticket);
+    }
+
+    /// The outcome of `ticket`'s request, kept unless the ticket was cancelled.
+    fn blocks_done(&mut self, peer: PeerId, ticket: BlocksTicket, outcome: BlocksOutcome<E>) {
+        match self.blocks.get_mut(&ticket) {
+            Some(slot) => {
+                *slot = Some(outcome);
+                self.emit(ControlEvent::BlocksByRange { peer, ticket });
+            }
+            None => tracing::debug!(%peer, "a cancelled BlocksByRange request ended: dropped"),
+        }
+    }
+
+    /// Every peer whose last Status was valid, with that Status, by peer ID.
+    #[must_use]
+    pub fn status_valid_peers(&self) -> Vec<(PeerId, StatusV2)> {
+        let mut peers: Vec<(PeerId, StatusV2)> = self
+            .peers
+            .iter()
+            .filter(|(_, state)| state.status_valid == Some(true))
+            .filter_map(|(peer, state)| state.status.clone().map(|s| (*peer, s)))
+            .collect();
+        peers.sort_unstable_by_key(|(peer, _)| *peer);
+        peers
     }
 
     /// Sends our Status to `peer`; `false` (and nothing sent) while we have none, or if the
@@ -633,6 +803,7 @@ impl<E: EthSpec> Control<E> {
         let valid = verdict.is_relevant();
         let was_valid = state.status_valid == Some(true);
         state.status_valid = Some(valid);
+        state.status = Some(theirs.clone());
         if valid != was_valid {
             self.metrics.status_valid_peer(valid);
         }
@@ -805,9 +976,10 @@ impl<E: EthSpec> Control<E> {
                 }
                 other => tracing::debug!(%peer, ?other, "no Ping in the response"),
             },
-            Protocol::BlocksByRangeV2 => {
-                tracing::debug!(%peer, chunks = chunks.len(), "a BlocksByRange response");
-            }
+            Protocol::BlocksByRangeV2 => match self.blocks_in_flight.remove(&id) {
+                Some(ticket) => self.blocks_done(peer, ticket, Ok(chunks)),
+                None => tracing::debug!(%peer, chunks = chunks.len(), "a BlocksByRange response"),
+            },
         }
     }
 
@@ -847,6 +1019,13 @@ impl<E: EthSpec> Control<E> {
             Protocol::GoodbyeV1 => self.on_goodbye_done(id),
             Protocol::MetaDataV3 => self.metadata_done(peer),
             _ => {}
+        }
+        // Request IDs are numbered per behaviour: only a BlocksByRange ID names a ticket.
+        if protocol != Protocol::BlocksByRangeV2 {
+            return;
+        }
+        if let Some(ticket) = self.blocks_in_flight.remove(&id) {
+            self.blocks_done(peer, ticket, Err(outbound_failure(error)));
         }
     }
 
@@ -979,6 +1158,7 @@ impl<E: EthSpec> NetworkBehaviour for Control<E> {
                     PeerState {
                         direction,
                         status_valid: None,
+                        status: None,
                         metadata_seq: None,
                         metadata_open: false,
                         goodbye_sent: false,
@@ -1336,6 +1516,258 @@ mod tests {
                 proptest::prop_assert_eq!(metrics.outbound_inflight(q), 0);
             }
         }
+    }
+
+    #[test]
+    fn blocks_requests_take_outbound_slots_and_keep_their_outcome() {
+        use super::super::limits::outbound_queue_name;
+        use p2p_wire::rpc::messages::BlocksByRangeV2Request;
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = RpcMetrics::register(&mut registry);
+        let mut cfg = crate::testkit::control_config(Some(testkit::status()));
+        cfg.limits.outbound_queue_len = 1;
+        let mut control = Control::<consensus_types::Minimal>::new(cfg, metrics.clone());
+        let peers: Vec<PeerId> = (0..4).map(|_| PeerId::random()).collect();
+        for (n, peer) in peers.iter().enumerate() {
+            connection(&mut control, *peer, n, true);
+            // Status-valid, blocks from slot 5.
+            control.judge(*peer, testkit::status());
+        }
+        let range = BlocksByRangeV2Request {
+            start_slot: 8,
+            count: 8,
+            step: 1,
+        };
+        let p = Protocol::BlocksByRangeV2;
+        let tickets: Vec<_> = peers[..3]
+            .iter()
+            .map(|peer| control.request_blocks(*peer, range).unwrap())
+            .collect();
+        // Two in flight, the third waits; a fourth finds the queue full and is IGNOREd.
+        assert_eq!(control.outbound.in_flight(p), 2);
+        assert_eq!(metrics.outbound_inflight(p), 2);
+        assert_eq!(control.blocks_in_flight.len(), 2);
+        assert!(matches!(
+            control.request_blocks(peers[3], range),
+            Err(RangeError::Ignored)
+        ));
+        assert_eq!(metrics.queues().dropped(outbound_queue_name(p)), 1);
+        // A request outside the protocol's limits never takes a slot.
+        let too_many = BlocksByRangeV2Request {
+            count: 129,
+            ..range
+        };
+        assert!(matches!(
+            control.request_blocks(peers[3], too_many),
+            Err(RangeError::Outbound(OutboundError::InvalidRequest(_)))
+        ));
+        assert!(tickets.iter().all(|t| control.take_blocks(*t).is_none()));
+
+        // The first response arrives: its outcome is kept, and the waiting request goes out.
+        let (first, _) = control
+            .blocks_in_flight
+            .iter()
+            .find(|(_, t)| **t == tickets[0])
+            .map(|(id, t)| (*id, *t))
+            .unwrap();
+        control.on_response(peers[0], p, first, Vec::new());
+        assert_eq!(control.outbound.in_flight(p), 2);
+        assert!(control.blocks_in_flight.values().any(|t| *t == tickets[2]));
+        assert!(control.pending.iter().any(|e| matches!(
+            e,
+            ToSwarm::GenerateEvent(ControlEvent::BlocksByRange { ticket, .. }) if *ticket == tickets[0]
+        )));
+        assert!(matches!(control.take_blocks(tickets[0]), Some(Ok(chunks)) if chunks.is_empty()));
+        assert!(control.take_blocks(tickets[0]).is_none(), "taken once");
+
+        // Every behaviour numbers its own request IDs: another protocol's failure under the
+        // same ID leaves the ticket open.
+        let second_id = control
+            .blocks_in_flight
+            .iter()
+            .find(|(_, t)| **t == tickets[1])
+            .map(|(id, _)| *id)
+            .unwrap();
+        control.on_outbound_failure(
+            peers[1],
+            Protocol::StatusV2,
+            second_id,
+            OutboundFailure::Timeout,
+        );
+        assert!(control.blocks_in_flight.contains_key(&second_id));
+        assert!(control.take_blocks(tickets[1]).is_none());
+        assert_eq!(control.outbound.in_flight(p), 2, "nor frees its slot");
+
+        // A cancelled ticket's outcome is dropped when it comes.
+        control.cancel_blocks(tickets[1]);
+        let second = control
+            .blocks_in_flight
+            .iter()
+            .find(|(_, t)| **t == tickets[1])
+            .map(|(id, _)| *id)
+            .unwrap();
+        control.on_outbound_failure(peers[1], p, second, OutboundFailure::Timeout);
+        assert!(control.take_blocks(tickets[1]).is_none());
+        assert_eq!(control.outbound.in_flight(p), 1);
+
+        // A waiting request whose peer left ends as Disconnected when its turn comes.
+        let sent = control.request_blocks(peers[3], range).unwrap();
+        let blocked = control.request_blocks(peers[3], range).unwrap();
+        assert_eq!(control.outbound.in_flight(p), 2);
+        connection(&mut control, peers[3], 3, false);
+        let third = control
+            .blocks_in_flight
+            .iter()
+            .find(|(_, t)| **t == tickets[2])
+            .map(|(id, _)| *id)
+            .unwrap();
+        control.on_outbound_failure(peers[2], p, third, OutboundFailure::ConnectionClosed);
+        assert!(matches!(
+            control.take_blocks(tickets[2]),
+            Some(Err(OutboundError::Disconnected))
+        ));
+        assert!(matches!(
+            control.take_blocks(blocked),
+            Some(Err(OutboundError::Disconnected))
+        ));
+        assert!(control.take_blocks(sent).is_none(), "still in flight");
+    }
+
+    #[test]
+    fn blocks_requests_start_at_the_peers_earliest_available_slot() {
+        use p2p_wire::rpc::messages::BlocksByRangeV2Request;
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = RpcMetrics::register(&mut registry);
+        let mut control = Control::<consensus_types::Minimal>::new(
+            crate::testkit::control_config(Some(testkit::status())),
+            metrics.clone(),
+        );
+        let (served, unjudged, invalid) = (PeerId::random(), PeerId::random(), PeerId::random());
+        for (n, peer) in [served, unjudged, invalid].into_iter().enumerate() {
+            connection(&mut control, peer, n, true);
+        }
+        let from = |earliest_available_slot| StatusV2 {
+            earliest_available_slot,
+            ..testkit::status()
+        };
+        control.judge(served, from(64));
+        control.judge(
+            invalid,
+            StatusV2 {
+                fork_digest: [9; 4],
+                ..from(0)
+            },
+        );
+        let at = |start_slot| BlocksByRangeV2Request {
+            start_slot,
+            count: 8,
+            step: 1,
+        };
+        let refused = |control: &mut Control<consensus_types::Minimal>, peer, start| match control
+            .request_blocks(peer, at(start))
+        {
+            Err(RangeError::Outbound(OutboundError::InvalidRequest(why))) => why,
+            other => panic!("{other:?}"),
+        };
+        let p = Protocol::BlocksByRangeV2;
+        // Below the peer's earliest_available_slot, or to a peer without a valid Status: refused
+        // before it takes a slot.
+        let why = refused(&mut control, served, 56);
+        assert!(why.contains("start_slot 56") && why.contains("64"), "{why}");
+        assert!(refused(&mut control, unjudged, 64).contains("no valid Status"));
+        assert!(refused(&mut control, invalid, 64).contains("no valid Status"));
+        assert_eq!(control.outbound.in_flight(p), 0);
+
+        // Two in flight, two waiting; while they wait the peer's Status moves its
+        // earliest_available_slot past the first waiting one's start.
+        let tickets: Vec<_> = [64, 64, 64, 128]
+            .into_iter()
+            .map(|start| control.request_blocks(served, at(start)).unwrap())
+            .collect();
+        assert_eq!(control.outbound.in_flight(p), 2);
+        control.judge(served, from(100));
+        let first = control
+            .blocks_in_flight
+            .iter()
+            .find(|(_, t)| **t == tickets[0])
+            .map(|(id, _)| *id)
+            .unwrap();
+        control.on_response(served, p, first, Vec::new());
+        // The waiting request from 64 ends with the refusal; the one from 128 takes the slot.
+        match control.take_blocks(tickets[2]) {
+            Some(Err(OutboundError::InvalidRequest(why))) => {
+                assert!(why.contains("earliest_available_slot 100"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(control.blocks_in_flight.values().any(|t| *t == tickets[3]));
+        assert_eq!(control.outbound.in_flight(p), 2);
+        assert_eq!(metrics.outbound_inflight(p), 2);
+        // Both finish: the slots are free again.
+        for ticket in [tickets[1], tickets[3]] {
+            let id = control
+                .blocks_in_flight
+                .iter()
+                .find(|(_, t)| **t == ticket)
+                .map(|(id, _)| *id)
+                .unwrap();
+            control.on_outbound_failure(served, p, id, OutboundFailure::Timeout);
+        }
+        assert_eq!(control.outbound.in_flight(p), 0);
+        assert_eq!(metrics.outbound_inflight(p), 0);
+
+        // A waiting request whose peer's Status turns invalid is refused the same way.
+        control.judge(served, from(0));
+        let tickets: Vec<_> = (0..3)
+            .map(|_| control.request_blocks(served, at(64)).unwrap())
+            .collect();
+        control.judge(
+            served,
+            StatusV2 {
+                fork_digest: [9; 4],
+                ..from(0)
+            },
+        );
+        let id = control
+            .blocks_in_flight
+            .iter()
+            .find(|(_, t)| **t == tickets[0])
+            .map(|(id, _)| *id)
+            .unwrap();
+        control.on_response(served, p, id, Vec::new());
+        assert!(matches!(
+            control.take_blocks(tickets[2]),
+            Some(Err(OutboundError::InvalidRequest(_)))
+        ));
+        assert_eq!(control.outbound.in_flight(p), 1);
+    }
+
+    #[test]
+    fn status_valid_peers_carry_their_last_status() {
+        let mut control = Control::<consensus_types::Minimal>::new(
+            crate::testkit::control_config(Some(testkit::status())),
+            RpcMetrics::register(&mut prometheus_client::registry::Registry::default()),
+        );
+        let (valid, invalid, unjudged) = (PeerId::random(), PeerId::random(), PeerId::random());
+        for (n, peer) in [valid, invalid, unjudged].into_iter().enumerate() {
+            connection(&mut control, peer, n, true);
+        }
+        let theirs = StatusV2 {
+            head_slot: 99,
+            earliest_available_slot: 64,
+            ..testkit::status()
+        };
+        control.judge(valid, theirs.clone());
+        control.judge(
+            invalid,
+            StatusV2 {
+                fork_digest: [9; 4],
+                ..testkit::status()
+            },
+        );
+        assert_eq!(control.status_valid_peers(), [(valid, theirs)]);
+        connection(&mut control, valid, 0, false);
+        assert!(control.status_valid_peers().is_empty());
     }
 
     #[test]

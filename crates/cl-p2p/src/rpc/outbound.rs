@@ -31,18 +31,79 @@
 //!
 //! A response the codec refused (a wrong SSZ length, a chunk too many, …) fails as
 //! [`OutboundError::InvalidResponse`] with the codec's typed [`ReadError`].
+//!
+//! # The probe's range requester
+//!
+//! [`RangeRequester::blocks_by_range`] is the same exchange on the probe swarm: the request goes
+//! through [`Control`], so it waits for one of the
+//! [`MAX_CONCURRENT_REQUESTS`](super::MAX_CONCURRENT_REQUESTS) outbound slots of the protocol
+//! (a full wait queue IGNOREs it, [`RangeError::Ignored`]) and is read by the codec under its
+//! deadlines. The context bytes are looked up in the codec's table before the payload is decoded
+//! (an unknown digest is refused there), and each block's context must then be the digest of the
+//! block's own epoch on the BPO-aware schedule ([`ScheduleDigests`] over
+//! `network_config::digest::digest_schedule`): a block decoded in another fork's shape than its
+//! slot's fails the response. On top of [`blocks_by_range`]'s rules, each block's `parent_root`
+//! must be the root of the block before it (`phase0/p2p-interface.md` L1563–1567); skipped
+//! slots are fine.
+//!
+//! [`fetch_epoch`] (and [`fetch_range`]) fetch a range over any [`RangeSource`], one request of
+//! at most `MAX_REQUEST_BLOCKS_DENEB` after the other. [`Control::request_blocks`] refuses a
+//! request below the peer's `earliest_available_slot` by its last valid Status, and checks again
+//! when a waiting request's turn comes, so no caller can send one.
+//!
+//! - **Peers**: one snapshot of the Status-valid peers per piece of at most 128 slots, those
+//!   whose `earliest_available_slot` is at or before the first slot requested
+//!   (`fulu/p2p-interface.md` L552–561); peers whose `head_slot` reaches the end of the slots
+//!   asked for first, peers behind the first slot last, and within those the peers asked fewer
+//!   times in the piece first (so peers take turns), then the highest `head_slot`. A peer whose answer broke the rules is not asked again; one whose
+//!   request failed (a timeout, an error chunk) is not asked again until the piece moves on. A
+//!   piece takes at most [`MAX_ATTEMPTS_PER_PIECE`] requests.
+//! - **What settles a slot**: a block kept; a link (a block whose parent is the last block kept
+//!   proves the slots between them empty); or two different peers whose answers have no block
+//!   there and whose `head_slot` reaches the last of those slots (a peer behind them, syncing
+//!   say, truthfully has none, so its empty answer counts for nothing). One peer's word is never
+//!   enough: an empty answer, or an answer whose first block
+//!   is after the requested start while no earlier block is known, is held until a second peer
+//!   agrees (the same peer asked again counts only once). The slots no second peer settles are
+//!   kept as [`RangeFetch::unconfirmed`], never silently empty.
+//! - **Short answers**: a peer may stop after its first block (`phase0` L1575), so an answer
+//!   that ends before the piece does is kept and the rest is asked again, of the peer asked
+//!   fewest times in the piece first. That is not a fault.
+//! - **Links**: the first block of each answer must name the last block kept so far as its
+//!   parent, or the answer is dropped ([`RangeError::Disjoint`], not a fault: either peer may be
+//!   on another branch) and the rest is asked of another peer. After an unconfirmed gap the next
+//!   block's parent may be in the gap, so the next answer is held to the start rules instead.
+//!
+//! The trust this rests on, and what checks the rest:
+//!
+//! - **Omissions**: two peers. Two colluding peers that both claim a head past the range and
+//!   both answer a gap with no block settle it in two requests, and a peer that has the blocks
+//!   is not asked; `unconfirmed` does not show that gap. The fetcher trusts any two peers to
+//!   not lie together.
+//! - **Forgeries**: none. A peer can hand back a linked chain that is not the canonical one,
+//!   and a claimed `head_slot` is not checked.
+//!
+//! Both are caught by the probe's comparison of every slot's root with the reference node's
+//! (a block the result lacks is a slot the reference has a root for), not here.
 
 use crate::rpc::codec::{ReadError, ReceivedChunk, RpcCodec, RpcRequest};
-use consensus_types::primitives::{Epoch, Slot};
+use crate::rpc::inbound::{BlocksOutcome, BlocksTicket, Control, ControlEvent};
+use consensus_types::primitives::{Epoch, Root, Slot};
 use consensus_types::{forked, EthSpec};
 use futures::StreamExt;
 use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{PeerId, Swarm};
+use network_config::digest::DigestInputs;
 use p2p_wire::rpc::messages::{BlocksByRangeV2Request, ForkDigest, MetaDataV3, Ping, StatusV2};
 use p2p_wire::rpc::protocols::{
     Request, Response, ResponseChunk, ResultCode, MAX_REQUEST_BLOCKS_DENEB,
 };
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::marker::PhantomData;
+use tree_hash::TreeHash;
 
 /// One event of an outbound `request_response` behaviour.
 pub type RpcEvent<E> = request_response::Event<RpcRequest, Vec<ReceivedChunk<E>>>;
@@ -122,6 +183,21 @@ pub enum BlocksError {
         got: Option<ForkDigest>,
         /// `compute_fork_digest` of its epoch.
         want: Option<ForkDigest>,
+    },
+    /// A block whose `parent_root` is not the root of the block before it.
+    #[error(
+        "the block at slot {slot} has parent {parent_root}, not {previous_root}, the root of the \
+         block at slot {previous_slot} before it"
+    )]
+    BrokenParentLink {
+        /// The block's slot.
+        slot: Slot,
+        /// Its `parent_root`.
+        parent_root: Root,
+        /// The previous block's slot.
+        previous_slot: Slot,
+        /// The previous block's root.
+        previous_root: Root,
     },
 }
 
@@ -275,7 +351,7 @@ where
 }
 
 /// `count` in `1..=MAX_REQUEST_BLOCKS_DENEB`, `step` 1, and the range inside `u64` slots.
-fn check_request(request: &BlocksByRangeV2Request) -> Result<(), OutboundError> {
+pub(crate) fn check_request(request: &BlocksByRangeV2Request) -> Result<(), OutboundError> {
     let invalid = |why: String| Err(OutboundError::InvalidRequest(why));
     if !(1..=MAX_REQUEST_BLOCKS_DENEB).contains(&request.count) {
         return invalid(format!(
@@ -321,14 +397,8 @@ fn check_blocks<E: EthSpec>(
         };
         let slot = block.slot();
         let invalid = |e| Err(OutboundError::InvalidBlocks(e));
-        if !(start..end).contains(&slot) {
-            return invalid(BlocksError::SlotOutOfRange { slot, start, end });
-        }
-        if let Some(previous) = blocks.last().map(forked::SignedBeaconBlock::slot) {
-            if slot <= previous {
-                return invalid(BlocksError::NonIncreasingSlot { slot, previous });
-            }
-        }
+        let previous = blocks.last().map(forked::SignedBeaconBlock::slot);
+        check_slot(slot, previous, start, end).map_err(OutboundError::InvalidBlocks)?;
         let epoch = slot / E::slots_per_epoch();
         let want = digest_at(epoch);
         if want.is_none() || context != want {
@@ -340,6 +410,633 @@ fn check_blocks<E: EthSpec>(
             });
         }
         blocks.push(block);
+    }
+    Ok(blocks)
+}
+
+/// A block's `slot` inside `[start, end)` and above the `previous` block's.
+fn check_slot(
+    slot: Slot,
+    previous: Option<Slot>,
+    start: Slot,
+    end: Slot,
+) -> Result<(), BlocksError> {
+    if !(start..end).contains(&slot) {
+        return Err(BlocksError::SlotOutOfRange { slot, start, end });
+    }
+    match previous {
+        Some(previous) if slot <= previous => {
+            Err(BlocksError::NonIncreasingSlot { slot, previous })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// What the range checks read of a block.
+pub trait Linked {
+    /// `slot`.
+    fn slot(&self) -> Slot;
+    /// `hash_tree_root(block.message)`.
+    fn root(&self) -> Root;
+    /// `message.parent_root`.
+    fn parent_root(&self) -> Root;
+}
+
+/// `hash_tree_root(block.message)`: the block root the beacon API reports.
+pub fn block_root<E: EthSpec>(block: &forked::SignedBeaconBlock<E>) -> Root {
+    match block {
+        forked::SignedBeaconBlock::Fulu(b) => b.message.tree_hash_root(),
+        forked::SignedBeaconBlock::Gloas(b) => b.message.tree_hash_root(),
+    }
+}
+
+impl<E: EthSpec> Linked for forked::SignedBeaconBlock<E> {
+    fn slot(&self) -> Slot {
+        forked::SignedBeaconBlock::slot(self)
+    }
+
+    fn root(&self) -> Root {
+        block_root(self)
+    }
+
+    fn parent_root(&self) -> Root {
+        match self {
+            Self::Fulu(b) => b.message.parent_root,
+            Self::Gloas(b) => b.message.parent_root,
+        }
+    }
+}
+
+/// Every block's `parent_root` is the root of the block before it.
+fn check_parent_links<B: Linked>(blocks: &[B]) -> Result<(), BlocksError> {
+    for pair in blocks.windows(2) {
+        let [previous, block] = pair else { continue };
+        let previous_root = previous.root();
+        if block.parent_root() != previous_root {
+            return Err(BlocksError::BrokenParentLink {
+                slot: block.slot(),
+                parent_root: block.parent_root(),
+                previous_slot: previous.slot(),
+                previous_root,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The fork digest of every epoch from Fulu on: the BPO-aware schedule
+/// (`network_config::digest::digest_schedule`), where the digest of an epoch is the one of the
+/// last entry at or before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleDigests(Vec<(Epoch, ForkDigest)>);
+
+impl ScheduleDigests {
+    /// The digests of `schedule`'s entries.
+    #[must_use]
+    pub fn new(schedule: &[DigestInputs]) -> Self {
+        let mut entries: Vec<(Epoch, ForkDigest)> =
+            schedule.iter().map(|i| (i.epoch, i.fork_digest)).collect();
+        entries.sort_unstable_by_key(|(epoch, _)| *epoch);
+        Self(entries)
+    }
+
+    /// `compute_fork_digest` of `epoch`; `None` before the first entry (before Fulu).
+    #[must_use]
+    pub fn digest_at(&self, epoch: Epoch) -> Option<ForkDigest> {
+        self.0
+            .iter()
+            .rev()
+            .find(|(from, _)| *from <= epoch)
+            .map(|(_, digest)| *digest)
+    }
+}
+
+/// Why one range request of the probe gave no blocks.
+#[derive(Debug, thiserror::Error)]
+pub enum RangeError {
+    /// The exchange failed or its response broke the request's rules (see [`OutboundError`]).
+    #[error(transparent)]
+    Outbound(#[from] OutboundError),
+    /// The protocol's outbound wait queue was full: the request was IGNOREd, never sent.
+    #[error("the outbound BeaconBlocksByRange queue is full: the request was ignored")]
+    Ignored,
+    /// The answer's first block does not name the last block fetched before it as its parent.
+    #[error(
+        "the block at slot {slot} has parent {parent_root}, not {anchor}, the last block \
+         fetched before it"
+    )]
+    Disjoint {
+        /// The first block's slot.
+        slot: Slot,
+        /// Its `parent_root`.
+        parent_root: Root,
+        /// The root of the last block fetched before it.
+        anchor: Root,
+    },
+}
+
+impl RangeError {
+    /// Whether the peer broke a rule of the protocol: its response was malformed, more than
+    /// the request allows, or blocks outside the request's rules. A failed exchange (a
+    /// deadline, a closed stream, an error chunk), an IGNOREd request or an answer of another
+    /// branch is not.
+    #[must_use]
+    pub fn is_peer_fault(&self) -> bool {
+        matches!(
+            self,
+            Self::Outbound(
+                OutboundError::InvalidBlocks(_)
+                    | OutboundError::InvalidResponse(_)
+                    | OutboundError::UnexpectedResponse(_)
+            )
+        )
+    }
+}
+
+/// A behaviour with the probe's [`Control`] inside.
+pub trait ControlRpc<E: EthSpec>: NetworkBehaviour {
+    /// The req/resp behaviour.
+    fn control(&self) -> &Control<E>;
+
+    /// The req/resp behaviour, mutably.
+    fn control_mut(&mut self) -> &mut Control<E>;
+
+    /// The req/resp behaviour's event inside `event`, or `None` for another behaviour's.
+    fn control_event(event: Self::ToSwarm) -> Option<ControlEvent>;
+}
+
+/// The probe's BeaconBlocksByRange v2 requester: drives `swarm` through each exchange.
+///
+/// Events of other behaviours, and the req/resp behaviour's other events, that arrive meanwhile
+/// are dropped (logged at debug); [`Control`] has already acted on its own.
+pub struct RangeRequester<'a, E: EthSpec, B: ControlRpc<E>> {
+    swarm: &'a mut Swarm<B>,
+    digest_at: &'a DigestAt<'a>,
+    _spec: PhantomData<E>,
+}
+
+impl<'a, E: EthSpec, B: ControlRpc<E>> RangeRequester<'a, E, B> {
+    /// A requester on `swarm`, judging context bytes by `digest_at` (the BPO-aware schedule:
+    /// [`ScheduleDigests::digest_at`]).
+    pub fn new(swarm: &'a mut Swarm<B>, digest_at: &'a DigestAt<'a>) -> Self {
+        Self {
+            swarm,
+            digest_at,
+            _spec: PhantomData,
+        }
+    }
+
+    /// Requests the blocks of `[start_slot, start_slot + count)` from `peer` (`step` 1) and
+    /// returns them once every one passed the request's rules (see the module docs).
+    ///
+    /// # Errors
+    ///
+    /// [`RangeError`]: a request outside the protocol's limits (never sent), a full outbound
+    /// queue, a failed exchange, or a response that broke a rule (every block is dropped).
+    pub async fn blocks_by_range(
+        &mut self,
+        peer: PeerId,
+        start_slot: Slot,
+        count: u64,
+    ) -> Result<Vec<forked::SignedBeaconBlock<E>>, RangeError> {
+        self.send(
+            peer,
+            BlocksByRangeV2Request {
+                start_slot,
+                count,
+                step: 1,
+            },
+        )
+        .await
+    }
+
+    async fn send(
+        &mut self,
+        peer: PeerId,
+        request: BlocksByRangeV2Request,
+    ) -> Result<Vec<forked::SignedBeaconBlock<E>>, RangeError> {
+        let ticket = self
+            .swarm
+            .behaviour_mut()
+            .control_mut()
+            .request_blocks(peer, request)?;
+        let chunks = Pending {
+            swarm: &mut *self.swarm,
+            ticket,
+            _spec: PhantomData,
+        }
+        .outcome()
+        .await?;
+        let blocks = check_blocks(&request, chunks, self.digest_at)?;
+        check_parent_links(&blocks).map_err(OutboundError::InvalidBlocks)?;
+        Ok(blocks)
+    }
+}
+
+/// One open request of a [`RangeRequester`]; dropped before its outcome (the future was
+/// cancelled), it tells [`Control`] to forget the outcome.
+struct Pending<'s, E: EthSpec, B: ControlRpc<E>> {
+    swarm: &'s mut Swarm<B>,
+    ticket: BlocksTicket,
+    _spec: PhantomData<E>,
+}
+
+impl<E: EthSpec, B: ControlRpc<E>> Pending<'_, E, B> {
+    async fn outcome(&mut self) -> BlocksOutcome<E> {
+        loop {
+            let control = self.swarm.behaviour_mut().control_mut();
+            if let Some(outcome) = control.take_blocks(self.ticket) {
+                return outcome;
+            }
+            match self.swarm.select_next_some().await {
+                SwarmEvent::Behaviour(event) => match B::control_event(event) {
+                    Some(ControlEvent::BlocksByRange { ticket, .. }) if ticket == self.ticket => {}
+                    Some(other) => tracing::debug!(event = ?other, "req/resp event"),
+                    None => tracing::debug!("another behaviour's event"),
+                },
+                _ => tracing::trace!("swarm event while waiting for blocks"),
+            }
+        }
+    }
+}
+
+impl<E: EthSpec, B: ControlRpc<E>> Drop for Pending<'_, E, B> {
+    fn drop(&mut self) {
+        self.swarm
+            .behaviour_mut()
+            .control_mut()
+            .cancel_blocks(self.ticket);
+    }
+}
+
+/// Where [`fetch_range`] gets its peers and blocks from.
+pub trait RangeSource {
+    /// The block type.
+    type Block: Linked;
+
+    /// The Status-valid peers and their last Status.
+    fn range_peers(&self) -> Vec<(PeerId, StatusV2)>;
+
+    /// Sends `request` to `peer`; the blocks once they passed the request's rules.
+    fn request_range(
+        &mut self,
+        peer: PeerId,
+        request: BlocksByRangeV2Request,
+    ) -> impl Future<Output = Result<Vec<Self::Block>, RangeError>>;
+}
+
+impl<E: EthSpec, B: ControlRpc<E>> RangeSource for RangeRequester<'_, E, B> {
+    type Block = forked::SignedBeaconBlock<E>;
+
+    fn range_peers(&self) -> Vec<(PeerId, StatusV2)> {
+        self.swarm.behaviour().control().status_valid_peers()
+    }
+
+    fn request_range(
+        &mut self,
+        peer: PeerId,
+        request: BlocksByRangeV2Request,
+    ) -> impl Future<Output = Result<Vec<Self::Block>, RangeError>> {
+        self.send(peer, request)
+    }
+}
+
+/// Requests one piece of a range (at most `MAX_REQUEST_BLOCKS_DENEB` slots) may take before
+/// what is still open in it is given up \[est\]: room for peers that answer a few blocks at a
+/// time, and a bound on what a stream of faulty peers can cost.
+pub const MAX_ATTEMPTS_PER_PIECE: usize = 64;
+
+/// What [`fetch_range`] got.
+#[derive(Debug)]
+pub struct RangeFetch<B> {
+    /// Every block of the range, in slot order, each the child of the one before.
+    pub blocks: Vec<B>,
+    /// Every request sent, in order, with its peer.
+    pub requests: Vec<(PeerId, BlocksByRangeV2Request)>,
+    /// Every request that gave no blocks, with its peer; [`RangeError::is_peer_fault`] tells
+    /// which broke a rule.
+    pub failures: Vec<(PeerId, RangeError)>,
+    /// `[start, end)` ranges kept as empty on one peer's word (or on none, once the piece ran out
+    /// of peers or attempts): no second peer confirmed them.
+    pub unconfirmed: Vec<(Slot, Slot)>,
+}
+
+impl<B: Linked> RangeFetch<B> {
+    /// The block the next answer must link to: the last block kept, unless an unconfirmed gap
+    /// follows it (the next block's parent may be in the gap).
+    fn anchor(&self) -> Option<&B> {
+        let last = self.blocks.last()?;
+        match self.unconfirmed.last() {
+            Some((from, _)) if *from > last.slot() => None,
+            _ => Some(last),
+        }
+    }
+}
+
+/// Why [`fetch_range`] could not complete.
+#[derive(Debug, thiserror::Error)]
+pub enum FetchError {
+    /// The range is empty or ends past the last slot.
+    #[error("no range of slots: start {start_slot}, count {count}")]
+    InvalidRange {
+        /// The first slot.
+        start_slot: Slot,
+        /// The slot count.
+        count: u64,
+    },
+    /// No Status-valid peer with `earliest_available_slot` at or before `slot` was left to ask.
+    #[error(
+        "no peer left to ask for the blocks from slot {slot} ({} failed requests)",
+        failures.len()
+    )]
+    NoPeer {
+        /// The first slot no answer covered.
+        slot: Slot,
+        /// Every failed request, with its peer.
+        failures: Vec<(PeerId, RangeError)>,
+    },
+}
+
+/// Fetches every block of `epoch` (of `slots_per_epoch` slots) over `source`; see
+/// [`fetch_range`].
+///
+/// # Errors
+///
+/// [`FetchError`], as [`fetch_range`].
+pub async fn fetch_epoch<S: RangeSource>(
+    source: &mut S,
+    epoch: Epoch,
+    slots_per_epoch: u64,
+) -> Result<RangeFetch<S::Block>, FetchError> {
+    let Some(start_slot) = epoch.checked_mul(slots_per_epoch) else {
+        return Err(FetchError::InvalidRange {
+            start_slot: Slot::MAX,
+            count: slots_per_epoch,
+        });
+    };
+    fetch_range(source, start_slot, slots_per_epoch).await
+}
+
+/// Fetches every block of `[start_slot, start_slot + count)` over `source`, one request of at
+/// most `MAX_REQUEST_BLOCKS_DENEB` (`step` 1) at a time, from peers whose
+/// `earliest_available_slot` is at or before the request's first slot (see the module docs).
+///
+/// # Errors
+///
+/// [`FetchError::InvalidRange`] for an empty range or one past the last slot;
+/// [`FetchError::NoPeer`] when no peer is left for a piece no answer covered.
+pub async fn fetch_range<S: RangeSource>(
+    source: &mut S,
+    start_slot: Slot,
+    count: u64,
+) -> Result<RangeFetch<S::Block>, FetchError> {
+    let end = match start_slot.checked_add(count) {
+        Some(end) if count > 0 => end,
+        _ => return Err(FetchError::InvalidRange { start_slot, count }),
+    };
+    let mut fetch = RangeFetch {
+        blocks: Vec::new(),
+        requests: Vec::new(),
+        failures: Vec::new(),
+        unconfirmed: Vec::new(),
+    };
+    let mut faulty: HashSet<PeerId> = HashSet::new();
+    let mut from = start_slot;
+    while from < end {
+        let to = end.min(from.saturating_add(MAX_REQUEST_BLOCKS_DENEB));
+        fetch_piece(source, from, to, &mut fetch, &mut faulty).await?;
+        from = to;
+    }
+    Ok(fetch)
+}
+
+/// What is known of one piece `[.., end)` of a range: every slot before `cursor` is settled.
+struct Piece<B> {
+    cursor: Slot,
+    end: Slot,
+    /// Peers asked since `cursor` last moved.
+    asked: HashSet<PeerId>,
+    /// How many times each peer was asked in the piece: the fewer, the sooner it is asked.
+    asks: HashMap<PeerId, usize>,
+    /// Peers whose answer says `[cursor, target)` holds no block.
+    empty: HashSet<PeerId>,
+    /// An answer whose first block is after `cursor` while no block before it is known: the
+    /// slots before it rest on its peer's word alone until a second peer agrees.
+    held: Option<(PeerId, Vec<B>)>,
+}
+
+impl<B: Linked> Piece<B> {
+    /// The end of the slots asked for next: the held answer's first block, or the piece's end.
+    fn target(&self) -> Slot {
+        self.held
+            .as_ref()
+            .and_then(|(_, blocks)| blocks.first())
+            .map_or(self.end, Linked::slot)
+    }
+
+    /// Keeps `blocks` (already checked against `fetch`'s last block) and moves past them.
+    fn take(&mut self, fetch: &mut RangeFetch<B>, blocks: Vec<B>) {
+        if let Some(last) = blocks.last() {
+            self.cursor = last.slot() + 1;
+        }
+        fetch.blocks.extend(blocks);
+        self.asked.clear();
+        self.empty.clear();
+    }
+
+    /// Keeps the held answer if it is the child of the last block kept; drops it, as another
+    /// branch's, if not.
+    fn settle_held(&mut self, fetch: &mut RangeFetch<B>) {
+        let Some((peer, blocks)) = self.held.take() else {
+            return;
+        };
+        match fits(fetch.anchor(), self.cursor, self.end, blocks) {
+            Ok(blocks) => self.take(fetch, blocks),
+            Err(e) => {
+                tracing::debug!(%peer, error = %e, "a held answer does not fit: dropped");
+                fetch.failures.push((peer, e));
+            }
+        }
+    }
+}
+
+/// Fetches the piece `[start, end)` (at most `MAX_REQUEST_BLOCKS_DENEB` slots) into `fetch`,
+/// from one snapshot of the peers and in at most [`MAX_ATTEMPTS_PER_PIECE`] requests.
+///
+/// A slot is settled by a block kept, by a link (a block whose parent is the last block kept
+/// proves the slots between them empty), or by two different peers whose answers have no block
+/// there. Short answers are kept and the rest is asked again; what no second peer settles is
+/// [`RangeFetch::unconfirmed`].
+async fn fetch_piece<S: RangeSource>(
+    source: &mut S,
+    start: Slot,
+    end: Slot,
+    fetch: &mut RangeFetch<S::Block>,
+    faulty: &mut HashSet<PeerId>,
+) -> Result<(), FetchError> {
+    let peers = source.range_peers();
+    let mut piece = Piece {
+        cursor: start,
+        end,
+        asked: HashSet::new(),
+        asks: HashMap::new(),
+        empty: HashSet::new(),
+        held: None,
+    };
+    let mut attempts = 0;
+    while piece.cursor < end {
+        let next = (attempts < MAX_ATTEMPTS_PER_PIECE)
+            .then(|| {
+                let skip = |p: &PeerId| piece.asked.contains(p) || faulty.contains(p);
+                let (cursor, target) = (piece.cursor, piece.target());
+                pick_peer(&peers, cursor, target, skip, &piece.asks)
+            })
+            .flatten();
+        let Some(peer) = next else {
+            give_up(&mut piece, fetch, start)?;
+            continue;
+        };
+        attempts += 1;
+        piece.asked.insert(peer);
+        *piece.asks.entry(peer).or_default() += 1;
+        let (cursor, target) = (piece.cursor, piece.target());
+        let request = BlocksByRangeV2Request {
+            start_slot: cursor,
+            count: target - cursor,
+            step: 1,
+        };
+        fetch.requests.push((peer, request));
+        let answer = source
+            .request_range(peer, request)
+            .await
+            .and_then(|blocks| fits(fetch.anchor(), cursor, target, blocks));
+        let blocks = match answer {
+            Ok(blocks) => blocks,
+            Err(e) => {
+                tracing::debug!(%peer, start_slot = cursor, error = %e, "range request failed");
+                if e.is_peer_fault() {
+                    faulty.insert(peer);
+                }
+                fetch.failures.push((peer, e));
+                continue;
+            }
+        };
+        let Some(first) = blocks.first().map(Linked::slot) else {
+            // Only a peer whose head reaches the gap's last slot says anything by having no
+            // block in it: one behind (syncing, say) truthfully has none.
+            if covers(&peers, peer, target) {
+                piece.empty.insert(peer);
+            }
+            if piece.empty.len() >= 2 {
+                if piece.held.is_some() {
+                    piece.settle_held(fetch);
+                } else {
+                    piece.cursor = end;
+                }
+            }
+            continue;
+        };
+        // The slots before `first` are settled by a link to the last block kept, by starting
+        // at the cursor, or by another peer's answer without a block there.
+        let settled =
+            fetch.anchor().is_some() || first == cursor || piece.empty.iter().any(|p| *p != peer);
+        if settled {
+            piece.take(fetch, blocks);
+            piece.settle_held(fetch);
+        } else {
+            if covers(&peers, peer, first) {
+                piece.empty.insert(peer);
+            }
+            piece.held = Some((peer, blocks));
+        }
+    }
+    Ok(())
+}
+
+/// No peer (or no attempt) is left for the piece's open slots: a held answer is kept with the
+/// slots before it unconfirmed; else the rest of the piece is unconfirmed if anything was heard
+/// of it, and the fetch fails if nothing was.
+fn give_up<B: Linked>(
+    piece: &mut Piece<B>,
+    fetch: &mut RangeFetch<B>,
+    start: Slot,
+) -> Result<(), FetchError> {
+    if let Some((_, blocks)) = piece.held.take() {
+        let first = blocks.first().map_or(piece.end, Linked::slot);
+        fetch.unconfirmed.push((piece.cursor, first));
+        piece.take(fetch, blocks);
+    } else if piece.cursor > start || !piece.empty.is_empty() {
+        fetch.unconfirmed.push((piece.cursor, piece.end));
+        piece.cursor = piece.end;
+    } else {
+        return Err(FetchError::NoPeer {
+            slot: piece.cursor,
+            failures: std::mem::take(&mut fetch.failures),
+        });
+    }
+    Ok(())
+}
+
+/// Whether `peer`'s head, by its Status in `peers`, reaches the last slot before `target`: only
+/// then does an answer without a block in `[.., target)` say the slots are empty.
+fn covers(peers: &[(PeerId, StatusV2)], peer: PeerId, target: Slot) -> bool {
+    peers
+        .iter()
+        .find(|(p, _)| *p == peer)
+        .is_some_and(|(_, status)| status.head_slot >= target.saturating_sub(1))
+}
+
+/// The peer to ask for the blocks of `[slot, target)`: of the peers `skip` passes, those whose
+/// `earliest_available_slot` is at or before `slot`. First those whose head reaches
+/// `target - 1`, then those whose head reaches `slot` (a peer behind it is asked last); within
+/// each, those asked fewer times in the piece (`asks`) first, then the highest `head_slot`, then
+/// the lowest peer ID, so the choice is deterministic.
+fn pick_peer(
+    peers: &[(PeerId, StatusV2)],
+    slot: Slot,
+    target: Slot,
+    skip: impl Fn(&PeerId) -> bool,
+    asks: &HashMap<PeerId, usize>,
+) -> Option<PeerId> {
+    peers
+        .iter()
+        .filter(|(peer, status)| !skip(peer) && status.earliest_available_slot <= slot)
+        .max_by_key(|(peer, status)| {
+            (
+                status.head_slot >= target.saturating_sub(1),
+                status.head_slot >= slot,
+                Reverse(asks.get(peer).copied().unwrap_or(0)),
+                status.head_slot,
+                Reverse(*peer),
+            )
+        })
+        .map(|(peer, _)| *peer)
+}
+
+/// `blocks`, an answer for `[start, end)`, if their slots are inside it and strictly increase,
+/// each is the child of the one before, and the first one is the child of `anchor`, the last
+/// block fetched before.
+fn fits<B: Linked>(
+    anchor: Option<&B>,
+    start: Slot,
+    end: Slot,
+    blocks: Vec<B>,
+) -> Result<Vec<B>, RangeError> {
+    let mut previous = None;
+    for block in &blocks {
+        check_slot(block.slot(), previous, start, end).map_err(OutboundError::InvalidBlocks)?;
+        previous = Some(block.slot());
+    }
+    check_parent_links(&blocks).map_err(OutboundError::InvalidBlocks)?;
+    if let (Some(anchor), Some(first)) = (anchor, blocks.first()) {
+        let anchor = anchor.root();
+        if first.parent_root() != anchor {
+            return Err(RangeError::Disjoint {
+                slot: first.slot(),
+                parent_root: first.parent_root(),
+                anchor,
+            });
+        }
     }
     Ok(blocks)
 }
@@ -382,7 +1079,7 @@ where
 /// The error of a failed request. A codec refusal reaches `request_response` as an
 /// [`std::io::Error`] around the [`ReadError`]; that one keeps its type, unless it is a passed
 /// deadline or a stream failure, which say nothing about the peer's bytes.
-fn outbound_failure(error: request_response::OutboundFailure) -> OutboundError {
+pub(crate) fn outbound_failure(error: request_response::OutboundFailure) -> OutboundError {
     use request_response::OutboundFailure;
     match error {
         OutboundFailure::ConnectionClosed => OutboundError::Disconnected,
@@ -473,6 +1170,7 @@ mod tests {
     use p2p_wire::rpc::codec::CodecError;
     use p2p_wire::rpc::protocols::MAX_REQUEST_BLOCKS_DENEB;
     use p2p_wire::testkit;
+    use proptest::strategy::Strategy as _;
     use ssz::Encode;
     use std::sync::Arc;
 
@@ -1094,6 +1792,1066 @@ mod tests {
             outbound_failure(OutboundFailure::Timeout),
             OutboundError::Failure(_)
         ));
+    }
+
+    // The probe's range requester: the production probe swarm (Control behind the outbound
+    // semaphore) against scripted loopback peers. Mainnet preset: 32 slots per epoch, so
+    // epoch 2 (slots 64..96) is Gloas on the fixture schedule and epoch 1 is Fulu.
+
+    mod probe {
+        use super::*;
+        use crate::behaviour::{Behaviour, ProbeSpec};
+        use crate::rpc::inbound::Control;
+        use crate::testkit::{BlocksResponder, StatusPeer, StatusReply};
+        use crate::transport::{build_swarm, MuxerBudget, SwarmConfig, TransportMetrics};
+        use libp2p::identity::Keypair;
+        use prometheus_client::registry::Registry;
+        use std::time::Duration;
+
+        pub type P = ProbeSpec;
+
+        pub const WAIT: Duration = Duration::from_secs(20);
+
+        /// Our Status: the fixture digest, finalized at epoch 1.
+        pub fn status() -> StatusV2 {
+            StatusV2 {
+                fork_digest: OURS,
+                finalized_root: B256::repeat_byte(1),
+                finalized_epoch: 1,
+                head_root: B256::repeat_byte(2),
+                head_slot: 100,
+                earliest_available_slot: 0,
+            }
+        }
+
+        /// The block of the fixture chain at `slot`, its parent `parent`: Fulu before slot 64,
+        /// Gloas from it.
+        pub fn block(slot: Slot, parent: Root) -> forked::SignedBeaconBlock<P> {
+            if slot < 64 {
+                let mut b = testkit::fulu_block::<P>(slot);
+                b.message.parent_root = parent;
+                forked::SignedBeaconBlock::Fulu(b)
+            } else {
+                let mut b = testkit::gloas_block::<P>(slot);
+                b.message.parent_root = parent;
+                forked::SignedBeaconBlock::Gloas(b)
+            }
+        }
+
+        /// One block per slot of `slots`, each the child of the one before.
+        pub fn chain(slots: impl IntoIterator<Item = Slot>) -> Vec<forked::SignedBeaconBlock<P>> {
+            let mut parent = B256::repeat_byte(0x77);
+            slots
+                .into_iter()
+                .map(|slot| {
+                    let b = block(slot, parent);
+                    parent = block_root(&b);
+                    b
+                })
+                .collect()
+        }
+
+        /// `block` on the wire under its epoch's fixture digest.
+        pub fn wire(block: &forked::SignedBeaconBlock<P>) -> (ForkDigest, Vec<u8>) {
+            let digest = fixture_digest(block.slot() / 32).unwrap();
+            (digest, block.as_ssz_bytes())
+        }
+
+        /// A peer whose Status (ours, with `head_slot` and `earliest_available_slot` its own)
+        /// is valid, answering BlocksByRange with `blocks`.
+        pub async fn peer(head_slot: Slot, eas: Slot, blocks: BlocksResponder) -> StatusPeer {
+            StatusPeer::spawn_with_blocks(
+                Box::new(move |req, _| {
+                    StatusReply::Status(StatusV2 {
+                        head_slot,
+                        earliest_available_slot: eas,
+                        ..req.clone()
+                    })
+                }),
+                None,
+                None,
+                Some(blocks),
+                None,
+            )
+            .await
+        }
+
+        /// The probe swarm, connected to every peer of `peers`, each Status-valid.
+        pub async fn probe(peers: &[&StatusPeer]) -> Swarm<Behaviour> {
+            let mut registry = Registry::default();
+            let transport = TransportMetrics::register(&mut registry);
+            let mut cfg = SwarmConfig::new(MuxerBudget::with_defaults(&transport));
+            cfg.listen_addrs = Vec::new();
+            cfg.idle_connection_timeout = WAIT;
+            let (req_resp, _) = crate::testkit::control(
+                &mut registry,
+                crate::testkit::control_config(Some(status())),
+            );
+            let mut swarm = build_swarm(Keypair::generate_secp256k1(), &cfg, req_resp).unwrap();
+            for p in peers {
+                swarm.dial(p.addr.clone()).unwrap();
+            }
+            tokio::time::timeout(WAIT, async {
+                while swarm.behaviour().req_resp.status_valid_peers().len() < peers.len() {
+                    swarm.select_next_some().await;
+                }
+            })
+            .await
+            .expect("every peer Status-valid");
+            swarm
+        }
+
+        pub fn control(swarm: &mut Swarm<Behaviour>) -> &mut Control<P> {
+            &mut swarm.behaviour_mut().req_resp
+        }
+    }
+
+    /// Each broken rule fails the whole response: no block of it is returned.
+    #[tokio::test]
+    async fn response_validation() {
+        use probe::{chain, P};
+        let good = chain(64..72);
+        let wire_all = |blocks: &[forked::SignedBeaconBlock<P>]| -> BlocksReply {
+            BlocksReply::Blocks(blocks.iter().map(probe::wire).collect())
+        };
+        // A slot outside [64, 72): a block of slot 72 after the chain.
+        let out_of_range = {
+            let mut blocks = chain(64..66);
+            blocks.push(probe::block(72, block_root(&blocks[1])));
+            wire_all(&blocks)
+        };
+        // The same slot twice.
+        let non_increasing = {
+            let first = probe::block(65, B256::repeat_byte(0x77));
+            let again = probe::block(65, block_root(&first));
+            wire_all(&[first, again])
+        };
+        // Three blocks for a request of two.
+        let too_many = wire_all(&good[..3]);
+        // A Gloas-epoch slot under the Fulu digest, in the Fulu shape: it decodes, but the
+        // digest is not the one of the block's epoch.
+        let wrong_digest = {
+            let mut fulu = testkit::fulu_block::<P>(64);
+            fulu.message.parent_root = B256::repeat_byte(0x77);
+            BlocksReply::Blocks(vec![(testkit::FULU_DIGEST, fulu.as_ssz_bytes())])
+        };
+        // Slot 66 does not name slot 65's root as its parent.
+        let broken_link = {
+            let mut blocks = chain(64..66);
+            blocks.push(probe::block(66, B256::repeat_byte(0x55)));
+            wire_all(&blocks)
+        };
+        let valid = wire_all(&good);
+        let replies = [
+            out_of_range,
+            non_increasing,
+            too_many,
+            wrong_digest,
+            broken_link,
+            valid,
+        ];
+        let peer = probe::peer(
+            100,
+            0,
+            Box::new(move |_, n| replies[n.min(replies.len() - 1)].clone()),
+        )
+        .await;
+        let mut swarm = probe::probe(&[&peer]).await;
+        let mut ranges = RangeRequester::<P, _>::new(&mut swarm, &fixture_digest);
+
+        let mut faults = Vec::new();
+        let got = ranges.blocks_by_range(peer.id, 64, 8).await;
+        assert!(
+            matches!(
+                got,
+                Err(RangeError::Outbound(OutboundError::InvalidBlocks(
+                    BlocksError::SlotOutOfRange {
+                        slot: 72,
+                        start: 64,
+                        end: 72
+                    }
+                )))
+            ),
+            "{got:?}"
+        );
+        faults.push(got.unwrap_err());
+        let got = ranges.blocks_by_range(peer.id, 64, 8).await;
+        assert!(
+            matches!(
+                got,
+                Err(RangeError::Outbound(OutboundError::InvalidBlocks(
+                    BlocksError::NonIncreasingSlot {
+                        slot: 65,
+                        previous: 65
+                    }
+                )))
+            ),
+            "{got:?}"
+        );
+        faults.push(got.unwrap_err());
+        let got = ranges.blocks_by_range(peer.id, 64, 2).await;
+        assert!(
+            matches!(
+                got,
+                Err(RangeError::Outbound(OutboundError::InvalidResponse(
+                    ReadError::TooManyChunks { max: 2 }
+                )))
+            ),
+            "{got:?}"
+        );
+        faults.push(got.unwrap_err());
+        let got = ranges.blocks_by_range(peer.id, 64, 8).await;
+        assert!(
+            matches!(
+                got,
+                Err(RangeError::Outbound(OutboundError::InvalidBlocks(
+                    BlocksError::WrongContextDigest {
+                        slot: 64,
+                        epoch: 2,
+                        got: Some(testkit::FULU_DIGEST),
+                        want: Some(testkit::GLOAS_DIGEST),
+                    }
+                )))
+            ),
+            "{got:?}"
+        );
+        faults.push(got.unwrap_err());
+        let got = ranges.blocks_by_range(peer.id, 64, 8).await;
+        match &got {
+            Err(RangeError::Outbound(OutboundError::InvalidBlocks(
+                e @ BlocksError::BrokenParentLink {
+                    slot: 66,
+                    previous_slot: 65,
+                    ..
+                },
+            ))) => assert!(e.to_string().contains("slot 66"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        faults.push(got.unwrap_err());
+        // Every one of them is the peer's fault; the valid response then passes whole.
+        assert_eq!(faults.len(), 5);
+        assert!(faults.iter().all(RangeError::is_peer_fault), "{faults:?}");
+        let blocks = ranges.blocks_by_range(peer.id, 64, 8).await.unwrap();
+        assert_eq!(blocks, good);
+        let sent: Vec<(Slot, u64, u64)> = peer
+            .blocks_requests()
+            .iter()
+            .map(|r| (r.start_slot, r.count, r.step))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                (64, 8, 1),
+                (64, 8, 1),
+                (64, 2, 1),
+                (64, 8, 1),
+                (64, 8, 1),
+                (64, 8, 1)
+            ]
+        );
+        // A request the protocol forbids is refused before it reaches the semaphore.
+        let err = ranges.blocks_by_range(peer.id, 64, 129).await.unwrap_err();
+        assert!(
+            matches!(err, RangeError::Outbound(OutboundError::InvalidRequest(_))),
+            "{err}"
+        );
+        assert!(!err.is_peer_fault());
+        assert_eq!(peer.blocks_requests().len(), 6);
+        // The peer stays connected and Status-valid: a broken response is not answered with a
+        // disconnect here (scoring is the caller's).
+        assert_eq!(ranges.range_peers().len(), 1);
+        assert_eq!(probe::control(&mut swarm).status_valid_peers().len(), 1);
+    }
+
+    /// A peer that stops after 10 of the epoch's 32 blocks: the 10 are kept, the suffix comes
+    /// from the second peer, and the epoch completes with no fault on either.
+    #[tokio::test]
+    async fn partial_then_retry() {
+        use probe::{chain, wire, P};
+        let epoch: Vec<_> = chain(64..96);
+        let wire_epoch: Vec<(ForkDigest, Vec<u8>)> = epoch.iter().map(wire).collect();
+        let serve = |stop_after: usize| -> crate::testkit::BlocksResponder {
+            let all = wire_epoch.clone();
+            Box::new(move |req, _| {
+                let blocks = all
+                    .iter()
+                    .zip(64u64..)
+                    .filter(|(_, slot)| (req.start_slot..req.start_slot + req.count).contains(slot))
+                    .map(|(w, _)| w.clone())
+                    .take(stop_after)
+                    .collect();
+                BlocksReply::Blocks(blocks)
+            })
+        };
+        // The short peer has the higher head, so it is asked first.
+        let short = probe::peer(200, 0, serve(10)).await;
+        let full = probe::peer(100, 64, serve(usize::MAX)).await;
+        // Its earliest_available_slot is after the epoch: never asked.
+        let pruned = probe::peer(300, 96, serve(usize::MAX)).await;
+        let mut swarm = probe::probe(&[&short, &full, &pruned]).await;
+        let mut ranges = RangeRequester::<P, _>::new(&mut swarm, &fixture_digest);
+        let fetched = fetch_epoch(&mut ranges, 2, 32).await.unwrap();
+
+        assert_eq!(fetched.blocks.len(), 32);
+        assert_eq!(fetched.blocks, epoch, "every slot, in order, linked");
+        let first = |p: &StatusPeer| -> Vec<BlocksByRangeV2Request> { p.blocks_requests() };
+        assert_eq!(
+            first(&short),
+            [BlocksByRangeV2Request {
+                start_slot: 64,
+                count: 32,
+                step: 1
+            }]
+        );
+        assert_eq!(
+            first(&full),
+            [BlocksByRangeV2Request {
+                start_slot: 74,
+                count: 22,
+                step: 1
+            }],
+            "only the missing suffix"
+        );
+        assert!(first(&pruned).is_empty());
+        // Asked directly, a range below its earliest_available_slot is refused, never sent.
+        let err = ranges.blocks_by_range(pruned.id, 64, 32).await.unwrap_err();
+        assert!(
+            matches!(&err, RangeError::Outbound(OutboundError::InvalidRequest(m)) if m.contains("earliest_available_slot 96")),
+            "{err}"
+        );
+        assert!(first(&pruned).is_empty());
+        assert!(fetched.failures.is_empty(), "{:?}", fetched.failures);
+        assert!(fetched.unconfirmed.is_empty());
+        assert_eq!(
+            fetched.requests,
+            [
+                (
+                    short.id,
+                    BlocksByRangeV2Request {
+                        start_slot: 64,
+                        count: 32,
+                        step: 1
+                    }
+                ),
+                (
+                    full.id,
+                    BlocksByRangeV2Request {
+                        start_slot: 74,
+                        count: 22,
+                        step: 1
+                    }
+                ),
+            ]
+        );
+    }
+
+    // The epoch fetcher over a scripted source: no swarm, so every case is cheap enough for
+    // a property test.
+
+    mod scripted {
+        use super::*;
+
+        /// A block reduced to what the fetcher reads.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct Fake {
+            pub slot: Slot,
+            pub parent: Root,
+        }
+
+        pub fn root_of(slot: Slot) -> Root {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&slot.to_le_bytes());
+            bytes[31] = 1;
+            Root::from(bytes)
+        }
+
+        impl Linked for Fake {
+            fn slot(&self) -> Slot {
+                self.slot
+            }
+            fn root(&self) -> Root {
+                root_of(self.slot)
+            }
+            fn parent_root(&self) -> Root {
+                self.parent
+            }
+        }
+
+        /// A chain with a block at every slot of `present`, each the child of the one before.
+        pub fn chain(present: impl IntoIterator<Item = Slot>) -> Vec<Fake> {
+            let mut parent = B256::repeat_byte(0x77);
+            present
+                .into_iter()
+                .map(|slot| {
+                    let b = Fake { slot, parent };
+                    parent = b.root();
+                    b
+                })
+                .collect()
+        }
+
+        /// How a scripted peer answers.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Answer {
+            /// Every block of the range.
+            Full,
+            /// The first `n` (at least 1, as the spec requires) blocks of the range.
+            StopAfter(usize),
+            /// The request fails (a timeout, say): not the peer's fault.
+            Fail,
+            /// A block outside the range: the peer's fault.
+            Invalid,
+            /// Blocks of another branch: the first is not linked to the ones before.
+            OtherChain,
+            /// Lies: no block at all.
+            Empty,
+            /// Lies: only the last block of the range, a real one.
+            LastOnly,
+            /// Only the last block of the range, on another branch.
+            ForkLast,
+        }
+
+        pub struct Peer {
+            pub id: PeerId,
+            pub status: StatusV2,
+            pub answer: Answer,
+        }
+
+        pub fn peer(head_slot: Slot, earliest_available_slot: Slot, answer: Answer) -> Peer {
+            Peer {
+                id: PeerId::random(),
+                status: StatusV2 {
+                    head_slot,
+                    earliest_available_slot,
+                    ..ours()
+                },
+                answer,
+            }
+        }
+
+        pub struct Source {
+            pub chain: Vec<Fake>,
+            pub peers: Vec<Peer>,
+            pub sent: Vec<(PeerId, BlocksByRangeV2Request)>,
+        }
+
+        impl RangeSource for Source {
+            type Block = Fake;
+
+            fn range_peers(&self) -> Vec<(PeerId, StatusV2)> {
+                self.peers
+                    .iter()
+                    .map(|p| (p.id, p.status.clone()))
+                    .collect()
+            }
+
+            fn request_range(
+                &mut self,
+                peer: PeerId,
+                request: BlocksByRangeV2Request,
+            ) -> impl std::future::Future<Output = Result<Vec<Fake>, RangeError>> {
+                self.sent.push((peer, request));
+                let (answer, head) = self
+                    .peers
+                    .iter()
+                    .find(|p| p.id == peer)
+                    .map_or((Answer::Fail, 0), |p| (p.answer, p.status.head_slot));
+                let end = request.start_slot + request.count;
+                // Each peer has the chain up to its own head.
+                let in_range = self
+                    .chain
+                    .iter()
+                    .filter(|b| (request.start_slot..end).contains(&b.slot) && b.slot <= head)
+                    .copied();
+                let result = match answer {
+                    Answer::Full => Ok(in_range.collect()),
+                    Answer::StopAfter(n) => Ok(in_range.take(n.max(1)).collect()),
+                    Answer::Fail => Err(OutboundError::Failure("timeout".into()).into()),
+                    Answer::Invalid => {
+                        Err(OutboundError::InvalidBlocks(BlocksError::SlotOutOfRange {
+                            slot: end,
+                            start: request.start_slot,
+                            end,
+                        })
+                        .into())
+                    }
+                    Answer::OtherChain => Ok(in_range
+                        .enumerate()
+                        .map(|(i, b)| match i {
+                            0 => Fake {
+                                parent: B256::repeat_byte(0x99),
+                                ..b
+                            },
+                            _ => b,
+                        })
+                        .collect()),
+                    Answer::Empty => Ok(Vec::new()),
+                    Answer::LastOnly => Ok(in_range.last().into_iter().collect()),
+                    Answer::ForkLast => Ok(in_range
+                        .last()
+                        .map(|b| Fake {
+                            parent: B256::repeat_byte(0x99),
+                            ..b
+                        })
+                        .into_iter()
+                        .collect()),
+                };
+                std::future::ready(result)
+            }
+        }
+
+        pub fn run(
+            source: &mut Source,
+            start: Slot,
+            count: u64,
+        ) -> Result<RangeFetch<Fake>, FetchError> {
+            futures::executor::block_on(fetch_range(source, start, count))
+        }
+    }
+
+    #[test]
+    fn a_short_answer_is_confirmed_by_a_second_peer() {
+        use scripted::{chain, peer, run, Answer, Source};
+        // Slots 30 and 31 are empty: the first answer ends at 29, and the suffix [30, 32) is
+        // empty once two different peers answered it with no block: the second peer, then the
+        // first asked again.
+        let mut source = Source {
+            chain: chain(0..30),
+            peers: vec![peer(50, 0, Answer::Full), peer(40, 0, Answer::Full)],
+            sent: Vec::new(),
+        };
+        let fetched = run(&mut source, 0, 32).unwrap();
+        assert_eq!(fetched.blocks, chain(0..30));
+        let sent: Vec<(PeerId, Slot, u64)> = source
+            .sent
+            .iter()
+            .map(|(p, r)| (*p, r.start_slot, r.count))
+            .collect();
+        let (first, second) = (source.peers[0].id, source.peers[1].id);
+        assert_eq!(sent, [(first, 0, 32), (second, 30, 2), (first, 30, 2)]);
+        assert!(fetched.unconfirmed.is_empty() && fetched.failures.is_empty());
+
+        // With one peer only, its empty answer is not enough: the suffix is kept as
+        // unconfirmed, not failed.
+        let mut source = Source {
+            chain: chain(0..30),
+            peers: vec![peer(50, 0, Answer::Full)],
+            sent: Vec::new(),
+        };
+        let fetched = run(&mut source, 0, 32).unwrap();
+        assert_eq!(fetched.blocks.len(), 30);
+        assert_eq!(fetched.unconfirmed, [(30, 32)]);
+        // An empty epoch needs two empty answers too.
+        let mut source = Source {
+            chain: Vec::new(),
+            peers: vec![peer(50, 0, Answer::Full), peer(40, 0, Answer::Full)],
+            sent: Vec::new(),
+        };
+        let fetched = run(&mut source, 0, 32).unwrap();
+        assert!(fetched.blocks.is_empty() && fetched.unconfirmed.is_empty());
+        assert_eq!(source.sent.len(), 2);
+    }
+
+    #[test]
+    fn one_empty_answer_does_not_confirm_a_gap() {
+        use scripted::{chain, peer, run, Answer, Source};
+        // An honest peer stops after 10 of 32 blocks; a lying one answers the suffix with
+        // nothing. The suffix is asked again, of the honest peer, until it is covered.
+        let mut source = Source {
+            chain: chain(64..96),
+            peers: vec![
+                peer(200, 0, Answer::StopAfter(10)),
+                peer(100, 0, Answer::Empty),
+            ],
+            sent: Vec::new(),
+        };
+        let fetched = run(&mut source, 64, 32).unwrap();
+        assert_eq!(fetched.blocks, source.chain, "all 32 blocks");
+        assert!(fetched.unconfirmed.is_empty());
+        let (honest, liar) = (source.peers[0].id, source.peers[1].id);
+        assert_eq!(
+            source.sent[1],
+            (
+                liar,
+                BlocksByRangeV2Request {
+                    start_slot: 74,
+                    count: 22,
+                    step: 1
+                }
+            )
+        );
+        assert_eq!(
+            source.sent[2],
+            (
+                honest,
+                BlocksByRangeV2Request {
+                    start_slot: 74,
+                    count: 22,
+                    step: 1
+                }
+            )
+        );
+
+        // A liar alone: its empty answer is one voice, so the range stays unconfirmed, never
+        // silently empty.
+        let mut source = Source {
+            chain: chain(64..96),
+            peers: vec![peer(100, 0, Answer::Empty)],
+            sent: Vec::new(),
+        };
+        let fetched = run(&mut source, 64, 32).unwrap();
+        assert!(fetched.blocks.is_empty());
+        assert_eq!(fetched.unconfirmed, [(64, 96)]);
+    }
+
+    #[test]
+    fn a_behind_peers_empty_answer_settles_nothing() {
+        use scripted::{chain, peer, run, Answer, Source};
+        let range = |start_slot, count| BlocksByRangeV2Request {
+            start_slot,
+            count,
+            step: 1,
+        };
+        // H stops after 10 blocks; two honest peers whose heads (50, 40) are before the range
+        // truthfully have nothing in it. Their empty answers settle nothing: H is asked again.
+        let mut source = Source {
+            chain: chain(64..96),
+            peers: vec![
+                peer(200, 0, Answer::StopAfter(10)),
+                peer(50, 0, Answer::Full),
+                peer(40, 0, Answer::Full),
+            ],
+            sent: Vec::new(),
+        };
+        let fetched = run(&mut source, 64, 32).unwrap();
+        assert_eq!(fetched.blocks, source.chain, "all 32 blocks");
+        assert!(fetched.unconfirmed.is_empty());
+        let h = source.peers[0].id;
+        assert_eq!(
+            source.sent,
+            [
+                (h, range(64, 32)),
+                (h, range(74, 22)),
+                (h, range(84, 12)),
+                (h, range(94, 2))
+            ],
+            "the peers behind the range are asked last, so never"
+        );
+
+        // A liar claiming head 300 answers empty, an honest peer at head 40 truthfully too:
+        // only the liar's answer counts, and one is not enough.
+        let mut source = Source {
+            chain: chain(64..96),
+            peers: vec![
+                peer(300, 0, Answer::Empty),
+                peer(200, 0, Answer::StopAfter(10)),
+                peer(40, 0, Answer::Full),
+            ],
+            sent: Vec::new(),
+        };
+        let fetched = run(&mut source, 64, 32).unwrap();
+        assert_eq!(fetched.blocks, source.chain, "all 32 blocks");
+        assert!(fetched.unconfirmed.is_empty());
+
+        // A peer whose head is inside the gap covers only part of it: its empty answer to
+        // [74, 96) does not count either, so with H alone the rest stays unconfirmed.
+        let mut source = Source {
+            chain: chain(64..74),
+            peers: vec![peer(200, 0, Answer::Full), peer(80, 0, Answer::Full)],
+            sent: Vec::new(),
+        };
+        let fetched = run(&mut source, 64, 32).unwrap();
+        assert_eq!(fetched.blocks, source.chain);
+        assert_eq!(fetched.unconfirmed, [(74, 96)]);
+
+        // Peers that are all behind the range: nothing covers it.
+        let mut source = Source {
+            chain: chain(64..96),
+            peers: vec![peer(50, 0, Answer::Full), peer(40, 0, Answer::Full)],
+            sent: Vec::new(),
+        };
+        assert!(matches!(
+            run(&mut source, 64, 32),
+            Err(FetchError::NoPeer { slot: 64, .. })
+        ));
+    }
+
+    #[test]
+    fn peers_take_turns_and_an_unconfirmed_gap_breaks_no_later_link() {
+        use scripted::{chain, peer, run, Answer, Source};
+        // The highest head answers one block at a time. Its first block (5) is held, the
+        // other peer confirms [0, 5) empty, and from then on both have been asked: the one
+        // asked fewer times goes first, so the one-block peer does not use up the piece's
+        // attempts while the other has the rest.
+        let mut source = Source {
+            chain: chain(5..128),
+            peers: vec![
+                peer(300, 0, Answer::StopAfter(1)),
+                peer(200, 0, Answer::Full),
+            ],
+            sent: Vec::new(),
+        };
+        let fetched = run(&mut source, 0, 128).unwrap();
+        assert_eq!(fetched.blocks, source.chain);
+        assert!(fetched.unconfirmed.is_empty());
+        assert_eq!(source.sent.len(), 4, "{:?}", source.sent);
+
+        // [0, 128) ends with a gap only one peer answered (slots 100..128 empty to the one
+        // covering peer, whose head is 140). The next piece is not held to link to block 99:
+        // its blocks start at 130 after an unconfirmed gap, and they are kept.
+        let mut slots: Vec<Slot> = (0..100).collect();
+        slots.extend(130..140);
+        let mut source = Source {
+            chain: chain(slots),
+            peers: vec![peer(140, 0, Answer::Full)],
+            sent: Vec::new(),
+        };
+        // The chain's block 130 names 99 as its parent: make it name a block the peer
+        // never served, as after a real gap.
+        source.chain[100].parent = B256::repeat_byte(0x42);
+        let fetched = run(&mut source, 0, 140).unwrap();
+        assert_eq!(fetched.blocks, source.chain);
+        assert_eq!(fetched.unconfirmed, [(100, 128), (128, 130)]);
+        assert!(fetched.failures.is_empty(), "{:?}", fetched.failures);
+    }
+
+    #[test]
+    fn a_peer_that_skips_the_start_is_not_trusted_alone() {
+        use scripted::{chain, peer, run, Answer, Source};
+        // The peer with the highest head answers [64, 96) with only the real block 95: the
+        // slots before it are asked of the honest peer, and its blocks link up to 95.
+        let mut source = Source {
+            chain: chain(64..96),
+            peers: vec![peer(200, 0, Answer::LastOnly), peer(100, 0, Answer::Full)],
+            sent: Vec::new(),
+        };
+        let fetched = run(&mut source, 64, 32).unwrap();
+        assert_eq!(fetched.blocks, source.chain, "all 32 blocks");
+        assert!(fetched.unconfirmed.is_empty() && fetched.failures.is_empty());
+        let (liar, honest) = (source.peers[0].id, source.peers[1].id);
+        assert_eq!(
+            source.sent,
+            [
+                (
+                    liar,
+                    BlocksByRangeV2Request {
+                        start_slot: 64,
+                        count: 32,
+                        step: 1
+                    }
+                ),
+                (
+                    honest,
+                    BlocksByRangeV2Request {
+                        start_slot: 64,
+                        count: 31,
+                        step: 1
+                    }
+                ),
+            ]
+        );
+
+        // Alone, its block is kept and the slots before it are unconfirmed.
+        let mut source = Source {
+            chain: chain(64..96),
+            peers: vec![peer(200, 0, Answer::LastOnly)],
+            sent: Vec::new(),
+        };
+        let fetched = run(&mut source, 64, 32).unwrap();
+        assert_eq!(fetched.blocks, source.chain[31..]);
+        assert_eq!(fetched.unconfirmed, [(64, 95)]);
+
+        // A second peer that has no block before 95 either confirms the gap.
+        let mut source = Source {
+            chain: chain([80, 95]),
+            peers: vec![
+                peer(200, 0, Answer::LastOnly),
+                peer(100, 81, Answer::Full),
+                peer(90, 0, Answer::Empty),
+            ],
+            sent: Vec::new(),
+        };
+        let fetched = run(&mut source, 81, 15).unwrap();
+        assert_eq!(fetched.blocks, source.chain[1..]);
+        assert!(fetched.unconfirmed.is_empty());
+        // A second answer whose blocks do not lead to the held one drops it, as another
+        // branch's; the honest peer then serves the rest.
+        let mut source = Source {
+            chain: chain(64..96),
+            peers: vec![
+                peer(200, 0, Answer::ForkLast),
+                peer(150, 0, Answer::StopAfter(3)),
+                peer(100, 0, Answer::Full),
+            ],
+            sent: Vec::new(),
+        };
+        let fetched = run(&mut source, 64, 32).unwrap();
+        assert_eq!(fetched.blocks, source.chain);
+        assert!(fetched.unconfirmed.is_empty());
+        assert!(
+            matches!(
+                fetched.failures[..],
+                [(p, RangeError::Disjoint { slot: 95, .. })] if p == source.peers[0].id
+            ),
+            "{:?}",
+            fetched.failures
+        );
+    }
+
+    #[test]
+    fn an_endless_supply_of_faulty_peers_ends_the_fetch() {
+        use scripted::{Answer, Fake};
+        /// Fresh Status-valid peers on every look, each answering out of range.
+        struct Endless {
+            sent: usize,
+        }
+        impl RangeSource for Endless {
+            type Block = Fake;
+            fn range_peers(&self) -> Vec<(PeerId, StatusV2)> {
+                (0..1000)
+                    .map(|_| scripted::peer(100, 0, Answer::Invalid))
+                    .map(|p| (p.id, p.status))
+                    .collect()
+            }
+            fn request_range(
+                &mut self,
+                _: PeerId,
+                request: BlocksByRangeV2Request,
+            ) -> impl std::future::Future<Output = Result<Vec<Fake>, RangeError>> {
+                self.sent += 1;
+                let end = request.start_slot + request.count;
+                std::future::ready(Ok(vec![Fake {
+                    slot: end,
+                    parent: B256::ZERO,
+                }]))
+            }
+        }
+        let mut source = Endless { sent: 0 };
+        let err = futures::executor::block_on(fetch_range(&mut source, 0, 32)).unwrap_err();
+        match err {
+            FetchError::NoPeer { slot: 0, failures } => {
+                assert_eq!(failures.len(), MAX_ATTEMPTS_PER_PIECE);
+                assert!(failures.iter().all(|(_, e)| e.is_peer_fault()));
+            }
+            other => panic!("{other}"),
+        }
+        assert_eq!(source.sent, MAX_ATTEMPTS_PER_PIECE);
+    }
+
+    #[test]
+    fn failed_and_faulty_peers_are_passed_over() {
+        use scripted::{chain, peer, run, Answer, Source};
+        let mut source = Source {
+            chain: chain(0..32),
+            peers: vec![
+                peer(90, 0, Answer::Invalid),
+                peer(80, 0, Answer::Fail),
+                peer(75, 0, Answer::StopAfter(5)),
+                peer(70, 0, Answer::OtherChain),
+                peer(60, 0, Answer::Full),
+            ],
+            sent: Vec::new(),
+        };
+        let fetched = run(&mut source, 0, 32).unwrap();
+        assert_eq!(fetched.blocks, chain(0..32));
+        let ids: Vec<PeerId> = source.peers.iter().map(|p| p.id).collect();
+        let failed: Vec<(PeerId, bool)> = fetched
+            .failures
+            .iter()
+            .map(|(p, e)| (*p, e.is_peer_fault()))
+            .collect();
+        // The out-of-range answer is a fault, the timeout and the unlinked chain are not.
+        assert_eq!(failed, [(ids[0], true), (ids[1], false), (ids[3], false)]);
+        let disjoint = &fetched.failures[2].1;
+        assert!(
+            matches!(disjoint, RangeError::Disjoint { slot: 5, .. }),
+            "{disjoint}"
+        );
+        assert!(disjoint.to_string().contains("slot 5"), "{disjoint}");
+        assert_eq!(source.sent.len(), 5);
+
+        // Nobody left to ask for a range no answer covered: the fetch fails with every failure.
+        let mut source = Source {
+            chain: chain(0..32),
+            peers: vec![peer(90, 0, Answer::Fail), peer(80, 40, Answer::Full)],
+            sent: Vec::new(),
+        };
+        match run(&mut source, 0, 32) {
+            Err(e @ FetchError::NoPeer { slot: 0, .. }) => {
+                assert!(e.to_string().contains("slot 0"), "{e}");
+                let FetchError::NoPeer { failures, .. } = e else {
+                    unreachable!()
+                };
+                assert_eq!(failures.len(), 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(source.sent.len(), 1, "the pruned peer is never asked");
+    }
+
+    #[test]
+    fn ranges_are_split_at_the_request_cap() {
+        use scripted::{chain, peer, run, Answer, Source};
+        let mut source = Source {
+            chain: chain(100..400),
+            peers: vec![peer(500, 0, Answer::Full)],
+            sent: Vec::new(),
+        };
+        let fetched = run(&mut source, 100, 300).unwrap();
+        assert_eq!(fetched.blocks, chain(100..400));
+        let sent: Vec<(Slot, u64)> = source
+            .sent
+            .iter()
+            .map(|(_, r)| (r.start_slot, r.count))
+            .collect();
+        assert_eq!(sent, [(100, 128), (228, 128), (356, 44)]);
+        // A later piece's first block must name the earlier piece's last as its parent.
+        assert_eq!(fetched.blocks[128].parent, fetched.blocks[127].root());
+
+        for (start, count) in [(0, 0), (u64::MAX, 2)] {
+            let err = run(&mut source, start, count).unwrap_err();
+            assert!(matches!(err, FetchError::InvalidRange { .. }), "{err}");
+        }
+        let err = futures::executor::block_on(fetch_epoch(&mut source, u64::MAX, 32)).unwrap_err();
+        assert!(matches!(err, FetchError::InvalidRange { .. }), "{err}");
+        let fetched = futures::executor::block_on(fetch_epoch(&mut source, 4, 32)).unwrap();
+        assert_eq!(fetched.blocks, source.chain[28..60], "slots 128..160");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// Any range, any chain, peers that stop early, fail, are pruned or are behind (they
+        /// have the chain up to their head only), and at most one that lies by omission: every request the fetcher sends has `count` 1 to 128 and `step` 1,
+        /// lies inside the range and starts at or after its peer's `earliest_available_slot`.
+        /// Every block of the chain the result lacks is inside an `unconfirmed` range; with one
+        /// complete peer that has the whole range and no liar, the blocks are exactly the
+        /// chain's.
+        #[test]
+        fn count_cap_proptest(
+            start in 0u64..400,
+            count in 1u64..400,
+            present in proptest::collection::vec(proptest::bool::weighted(0.8), 800),
+            others in proptest::collection::vec(
+                (0u64..900, 0u64..1000, proptest::prop_oneof![
+                    proptest::strategy::Just(scripted::Answer::Full),
+                    proptest::strategy::Just(scripted::Answer::Fail),
+                    (1usize..12).prop_map(scripted::Answer::StopAfter),
+                ]),
+                0..4,
+            ),
+            honest_ahead in 0u64..200,
+            honest_eas in proptest::num::u64::ANY,
+            liar in proptest::option::of((0u64..900, 0u64..1000, proptest::prop_oneof![
+                proptest::strategy::Just(scripted::Answer::Empty),
+                proptest::strategy::Just(scripted::Answer::LastOnly),
+            ])),
+        ) {
+            use proptest::prelude::*;
+            use scripted::{chain, peer, Answer, Source};
+            let slots = (0u64..).zip(&present).filter(|(_, p)| **p).map(|(s, _)| s);
+            let mut peers: Vec<_> = others
+                .iter()
+                .map(|&(eas, head, answer)| peer(head, eas, answer))
+                .collect();
+            // The honest peer's head is at or past the range's last slot; the others' heads are
+            // anywhere, so some are behind it and have only part of the range.
+            peers.push(peer(start + count - 1 + honest_ahead, honest_eas % (start + 1), Answer::Full));
+            peers.extend(liar.map(|(eas, head, answer)| peer(head, eas, answer)));
+            let mut source = Source { chain: chain(slots), peers, sent: Vec::new() };
+            let fetched = scripted::run(&mut source, start, count);
+            let end = start + count;
+            for (peer, request) in &source.sent {
+                prop_assert!((1..=MAX_REQUEST_BLOCKS_DENEB).contains(&request.count), "{request:?}");
+                prop_assert_eq!(request.step, 1);
+                prop_assert!(request.start_slot >= start && request.start_slot + request.count <= end);
+                let eas = source.peers.iter().find(|p| p.id == *peer).unwrap().status.earliest_available_slot;
+                prop_assert!(request.start_slot >= eas, "{request:?} to a peer from {eas}");
+            }
+            let fetched = fetched.unwrap();
+            let want: Vec<_> = source.chain.iter().filter(|b| (start..end).contains(&b.slot)).copied().collect();
+            for b in want.iter().filter(|b| !fetched.blocks.contains(b)) {
+                prop_assert!(
+                    fetched.unconfirmed.iter().any(|&(from, to)| (from..to).contains(&b.slot)),
+                    "slot {} missing outside {:?}", b.slot, fetched.unconfirmed
+                );
+            }
+            prop_assert!(fetched.blocks.iter().all(|b| want.contains(b)));
+            if liar.is_none() {
+                prop_assert_eq!(fetched.blocks, want);
+                prop_assert!(fetched.failures.iter().all(|(_, e)| !e.is_peer_fault()));
+            }
+        }
+    }
+
+    #[test]
+    fn schedule_digests_follow_the_bpo_schedule() {
+        use network_config::digest::{compute_fork_digest, digest_schedule};
+        use network_config::{ChainConfig, Network};
+        for network in [Network::Sepolia, Network::Hoodi] {
+            let config = ChainConfig::load(network).unwrap();
+            // Hoodi has no pinned genesis here: any root gives the schedule's shape.
+            let gvr = network
+                .genesis()
+                .map_or([0x42; 32], |g| g.genesis_validators_root);
+            let schedule = digest_schedule(&config, &gvr);
+            assert!(
+                schedule.len() > 1,
+                "{network:?}: Fulu and a BPO epoch at least"
+            );
+            let digests = ScheduleDigests::new(&schedule);
+            for entry in &schedule {
+                for epoch in [entry.epoch.saturating_sub(1), entry.epoch, entry.epoch + 1] {
+                    assert_eq!(
+                        digests.digest_at(epoch),
+                        compute_fork_digest(&config, &gvr, epoch).ok(),
+                        "{network:?} epoch {epoch}"
+                    );
+                }
+            }
+            assert_eq!(
+                digests.digest_at(schedule[0].epoch - 1),
+                None,
+                "before Fulu"
+            );
+            let last = schedule.last().unwrap();
+            assert_eq!(digests.digest_at(u64::MAX), Some(last.fork_digest));
+            // Entries in any order give the same answers.
+            let mut reversed = schedule.clone();
+            reversed.reverse();
+            assert_eq!(ScheduleDigests::new(&reversed), digests);
+        }
+    }
+
+    #[test]
+    fn parent_links_and_slots_are_checked_on_any_source() {
+        use scripted::{chain, Fake};
+        let blocks = chain([3, 5, 6]);
+        assert!(check_parent_links(&blocks).is_ok());
+        assert!(check_parent_links::<Fake>(&[]).is_ok());
+        let mut broken = blocks.clone();
+        broken[2].parent = B256::repeat_byte(9);
+        assert!(matches!(
+            check_parent_links(&broken),
+            Err(BlocksError::BrokenParentLink {
+                slot: 6,
+                previous_slot: 5,
+                ..
+            })
+        ));
+        // A source handing back blocks outside its request, or out of order, is refused by the
+        // fetcher too: a fault.
+        for (bad, start, end) in [(chain([3, 9]), 3, 9), (vec![blocks[1], blocks[0]], 3, 9)] {
+            let err = fits(None, start, end, bad).unwrap_err();
+            assert!(err.is_peer_fault(), "{err}");
+        }
+        assert!(fits(Some(&blocks[0]), 4, 9, blocks[1..].to_vec()).is_ok());
+        assert!(matches!(
+            fits(Some(&blocks[1]), 4, 9, blocks[1..].to_vec()),
+            Err(RangeError::Disjoint { slot: 5, .. })
+        ));
+        assert!(RangeError::Ignored.to_string().contains("ignored"));
+        assert!(!RangeError::Ignored.is_peer_fault());
     }
 
     #[test]

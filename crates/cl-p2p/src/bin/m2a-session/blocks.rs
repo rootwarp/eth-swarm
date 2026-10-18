@@ -47,7 +47,6 @@ use p2p_wire::rpc::messages::{BlocksByRangeV2Request, StatusV2};
 use p2p_wire::rpc::protocols::MAX_REQUEST_BLOCKS_DENEB;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use tree_hash::TreeHash;
 
 /// Every verdict a passing step has.
 pub const FIELDS: [&str; 2] = ["request", "roots"];
@@ -86,12 +85,7 @@ pub fn range(
 }
 
 /// `hash_tree_root(block.message)`: the block root the beacon API reports.
-pub fn block_root<E: EthSpec>(block: &forked::SignedBeaconBlock<E>) -> Root {
-    match block {
-        forked::SignedBeaconBlock::Fulu(b) => b.message.tree_hash_root(),
-        forked::SignedBeaconBlock::Gloas(b) => b.message.tree_hash_root(),
-    }
-}
+pub use cl_p2p::rpc::outbound::block_root;
 
 /// What the step reads of a block before it drops it.
 pub trait Rooted {

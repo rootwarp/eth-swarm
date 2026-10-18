@@ -8,7 +8,8 @@
 
 use crate::gossip::IgnoreAll;
 use crate::peer_caps::{PeerCaps, PeerCapsConfig};
-use crate::rpc::inbound::Control;
+use crate::rpc::inbound::{Control, ControlEvent};
+use crate::rpc::outbound::ControlRpc;
 use libp2p::identity::PublicKey;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::NetworkBehaviour;
@@ -127,6 +128,23 @@ impl Behaviour {
     pub fn with_gossip(mut self, gossip: IgnoreAll) -> Self {
         self.gossipsub = Toggle::from(Some(gossip));
         self
+    }
+}
+
+impl ControlRpc<ProbeSpec> for Behaviour {
+    fn control(&self) -> &Control<ProbeSpec> {
+        &self.req_resp
+    }
+
+    fn control_mut(&mut self) -> &mut Control<ProbeSpec> {
+        &mut self.req_resp
+    }
+
+    fn control_event(event: BehaviourEvent) -> Option<ControlEvent> {
+        match event {
+            BehaviourEvent::ReqResp(event) => Some(event),
+            _ => None,
+        }
     }
 }
 
