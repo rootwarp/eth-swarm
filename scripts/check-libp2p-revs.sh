@@ -155,8 +155,13 @@ if [[ ${LIBP2P_SKIP_ANCESTRY:-} == 1 ]]; then
   echo "WARNING: ancestry check SKIPPED (LIBP2P_SKIP_ANCESTRY=1): $fix not verified in $sha"
 else
   git_dir=$(mktemp -d)
-  trap 'rm -rf "$git_dir"' EXIT
+  # Best effort: a temp dir that cannot be removed is reported, and the exit status stays the verdict.
+  trap 'rm -rf "$git_dir" 2>/dev/null || echo "WARNING: could not remove $git_dir" >&2' EXIT
   git init -q --bare "$git_dir"
+  # No auto maintenance: fetch would detach `git maintenance run --auto` (older git: `gc --auto`),
+  # whose commit-graph write can recreate files in $git_dir while the trap above removes it.
+  git -C "$git_dir" config maintenance.auto false
+  git -C "$git_dir" config gc.auto 0
   git -C "$git_dir" remote add origin "$remote"
   git -C "$git_dir" config remote.origin.promisor true
   git -C "$git_dir" config remote.origin.partialclonefilter tree:0

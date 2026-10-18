@@ -92,14 +92,27 @@ chmod +x "$work/stub/buf"
 expect "buf version mismatch fails before comparing" 2 "buf version 1.73.0, baseline built with 1.74.0" -- \
   env BUF="$work/stub/buf" bash "$check" "$dir"
 
+# The checker gets a TMPDIR of its own: counting entries in the shared TMPDIR races every other run of
+# the checker on the machine. A buf that logs its -o path shows the build output went there.
 dir="$(fresh_copy clean_tmp)"
-before="$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'check-proto-baseline.*' 2>/dev/null | wc -l)"
-bash "$check" "$dir" >/dev/null 2>&1 || true
-after="$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'check-proto-baseline.*' 2>/dev/null | wc -l)"
-if [[ "$before" == "$after" ]]; then
+own_tmp="$work/clean_tmp/tmpdir"
+outputs="$work/clean_tmp/build-outputs"
+mkdir -p "$own_tmp" "$work/logbuf"
+cat >"$work/logbuf/buf" <<STUB
+#!/bin/sh
+if [ "\$1" = build ] && [ "\$2" = -o ]; then printf '%s\n' "\$3" >>"$outputs"; fi
+exec "$real_buf" "\$@"
+STUB
+chmod +x "$work/logbuf/buf"
+expect "check passes with its own TMPDIR" 0 "proto baseline OK" -- \
+  env TMPDIR="$own_tmp" BUF="$work/logbuf/buf" bash "$check" "$dir"
+built="$(cat "$outputs" 2>/dev/null || true)"
+left="$(find "$own_tmp" -mindepth 1 | wc -l | tr -d ' ')"
+if [[ "$(wc -l <"$outputs" 2>/dev/null | tr -d ' ')" == 1 && "$built" == "$own_tmp/check-proto-baseline."*/v1.binpb \
+  && ! -e "$built" && "$left" == 0 ]]; then
   pass=$((pass + 1)); echo "ok   temp build output is removed"
 else
-  fail=$((fail + 1)); echo "FAIL temp build output is removed: $before -> $after temp dirs"
+  fail=$((fail + 1)); echo "FAIL temp build output is removed: built to '${built}', $left entries left in $own_tmp"
 fi
 
 echo "$pass passed, $fail failed"

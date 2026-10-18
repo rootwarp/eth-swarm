@@ -77,7 +77,7 @@ passed=0 failed=0
 check() {
   local expect=$1 desc=$2 want=$3 root=$4 rc=0 out ok=0
   shift 4
-  out=$(env "$@" bash "$script" "$root" 2>&1) || rc=$?
+  out=$(env "$@" bash "$script" "$root" 2>&1) || rc=$?; [[ $desc != cleanup* ]] || printf "DEBUG %s\n" "$out"
   if { [[ $expect == pass ]] && ((rc == 0)); } || { [[ $expect == fail ]] && ((rc != 0)); }; then ok=1; fi
   if ((ok)) && [[ -n $want ]] && ! grep -qF -- "$want" <<<"$out"; then ok=0; fi
   if ((ok)); then
@@ -221,6 +221,46 @@ check fail "deny.toml: an entry form it does not know fails closed" "deny.toml: 
 root=$(fixture deny-bad "$later")
 printf '[bans\nskip = []\n' > "$root/deny.toml"
 check fail "deny.toml that is not TOML" "deny.toml: not valid TOML" "$root" "$remote" "$fixenv"
+
+# The throwaway fetch repo starts no background maintenance: a detached `git maintenance run --auto`
+# (its commit-graph write) can recreate files in it while the EXIT trap removes it.
+root=$(fixture no-maintenance "$later")
+check pass "the ancestry fetch runs without auto maintenance" "libp2p revs OK" "$root" "$remote" "$fixenv" \
+  "GIT_TRACE2=$tmp/no-maintenance.trace2"
+if grep -qE 'child_start.*(maintenance run|gc --auto)' "$tmp/no-maintenance.trace2"; then
+  failed=$((failed + 1)); echo "FAIL - the ancestry fetch runs without auto maintenance (trace2 shows it started)"
+  grep -E 'child_start.*(maintenance run|gc --auto)' "$tmp/no-maintenance.trace2" | sed 's/^/       /'
+else
+  passed=$((passed + 1)); echo "ok   - trace2 shows no maintenance or gc started"
+fi
+
+# Removing the throwaway repo is best effort: a directory that rm -rf cannot empty leaves the
+# verdict, pass or fail, as the check found it. A stand-in git plants one before each merge-base.
+if [[ $(id -u) == 0 ]]; then
+  echo "skip - cleanup failure cases (root can remove a read-only directory)"
+else
+  real_git=$(command -v git)
+  mkdir -p "$tmp/held-bin"
+  cat > "$tmp/held-bin/git" <<STUB
+#!/bin/sh
+if [ "\$1" = -C ] && [ "\$3" = merge-base ] && [ ! -d "\$2/held" ]; then
+  mkdir "\$2/held" && : > "\$2/held/file" && chmod 0500 "\$2/held" && printf '%s\n' "\$2" >> "$tmp/held.list"
+fi
+exec "$real_git" "\$@"
+STUB
+  chmod +x "$tmp/held-bin/git"
+  held_path="PATH=$tmp/held-bin:$PATH"
+  root=$(fixture held-pass "$later")
+  check pass "cleanup failure keeps a pass a pass" "libp2p revs OK" "$root" "$remote" "$fixenv" "$held_path"
+  root=$(fixture held-fail "$side")
+  check fail "cleanup failure keeps a fail a fail" "does not contain" "$root" "$remote" "$fixenv" "$held_path"
+  if [[ $(wc -l < "$tmp/held.list" 2>/dev/null || echo 0) -ne 2 ]]; then
+    failed=$((failed + 1)); echo "FAIL - the stand-in git planted a held directory in both runs"
+  else
+    passed=$((passed + 1)); echo "ok   - the stand-in git planted a held directory in both runs"
+  fi
+  while IFS= read -r d; do echo "DEBUG $(ls "$d")"; chmod -R u+w "$d" && rm -rf "$d"; done < "$tmp/held.list"
+fi
 
 # The real lockfile (ancestry stubbed: no network in this test).
 check pass "real Cargo.lock" "libp2p revs OK" "$repo" LIBP2P_SKIP_ANCESTRY=1
