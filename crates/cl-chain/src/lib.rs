@@ -5,15 +5,22 @@
 //! service already holds its peers to the wire contract. `tests/contract.rs` runs the contract
 //! suite against it, in process and over a Unix socket.
 //!
-//! [`probe`] is probe mode's Status (`ReqRespService/GetStatus`): the wall-clock fork digest and
-//! the reference Beacon API's finalized checkpoint, with the last good value kept through an
-//! outage.
+//! [`probe`] is probe mode: its Status (`ReqRespService/GetStatus`: the wall-clock fork digest
+//! and the reference Beacon API's finalized checkpoint, with the last good value kept through an
+//! outage) and the storage contract for gossip column sidecars (reference root, KZG through
+//! cl-verify, custody; anything else dropped).
+//!
+//! [`verify`] is cl-chain's side of `ethswarm.verify.v1`: cl-chain never runs BLS or KZG itself.
 //!
 //! [`da::custody`] owns the node's custody group count: never decreasing, stored in the column
 //! env, advertised through the MetaData and the ENR, and the column subnets cl-p2p subscribes.
 
 pub mod da;
 pub mod probe;
+pub mod verify;
+
+#[cfg(test)]
+mod testing;
 
 use ethswarm_proto::chain as pb;
 use ipc::Link;

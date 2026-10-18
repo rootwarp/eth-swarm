@@ -1,0 +1,265 @@
+//! The storage contract for gossip column sidecars ([`storage_contract`]).
+//!
+//! With no fork choice in probe mode, a column sidecar is trusted only if all of these hold,
+//! checked in this order; the first that fails drops it with its [`Drop`] reason:
+//!
+//! 1. **Structure** (`verify_data_column_sidecar`, `gloas/p2p-interface.md`): `index <
+//!    NUMBER_OF_COLUMNS` (else `not_custody`: no custody column has that index), at least one
+//!    cell (else `commitments_mismatch`: a sidecar for zero blobs matches no bid), and as many
+//!    proofs as cells (else `kzg_invalid`).
+//! 2. **Subnet**: `compute_subnet_for_data_column_sidecar(index)` is the subnet it arrived on
+//!    (else `wrong_subnet`).
+//! 3. **Custody**: `index` is a column of one of our custody groups
+//!    (`compute_columns_for_custody_group` of `get_custody_groups`, else `not_custody`).
+//! 4. **Root**: the reference node vouches for `beacon_block_root`, at the sidecar's slot
+//!    ([`RefView`], else `unknown_root`, which includes a reference that is down, slow or busy).
+//! 5. **Commitments**: the bid of that block commits to exactly as many blobs as the sidecar
+//!    has cells (else `commitments_mismatch`).
+//! 6. **KZG** (`verify_data_column_sidecar_kzg_proofs`): cl-verify verifies every cell against
+//!    the bid's commitment of its row, at cell index `index`, by
+//!    `verify_cell_kzg_proof_batch` (else `kzg_invalid`). No verdict within the deadline, from a
+//!    silent, overloaded or absent cl-verify, is `verify_timeout`: dropped, never stored.
+//!
+//! The cheap local checks come first, so a column that cannot be ours never costs a reference
+//! request or a KZG check. Every drop increments `probe_column_dropped_total{reason}`
+//! ([`ColumnMetrics`]). Only a [`Verified`] column can be stored ([`store_verified`]), and only
+//! [`storage_contract`] makes one.
+
+use super::{BlockApi, RefView, ReferenceApi};
+use crate::da::custody::Custody;
+use crate::verify::client::{KzgOutcome, KzgVerifier};
+use consensus_types::das::{compute_subnet_for_data_column_sidecar, NUMBER_OF_COLUMNS};
+use consensus_types::{gloas, EthSpec};
+use ethswarm_proto::verify::KzgCellProof;
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
+use prometheus_client::registry::Registry;
+use ssz::Encode;
+use std::time::Duration;
+
+/// A column sidecar as it arrived on gossip.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GossipColumn<E: EthSpec> {
+    pub sidecar: gloas::DataColumnSidecar<E>,
+    /// The `data_column_sidecar_{subnet_id}` topic it arrived on.
+    pub subnet_id: u64,
+}
+
+/// Why a column is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+pub enum Drop {
+    #[error("unknown_root")]
+    UnknownRoot,
+    #[error("kzg_invalid")]
+    KzgInvalid,
+    #[error("commitments_mismatch")]
+    CommitmentsMismatch,
+    #[error("not_custody")]
+    NotCustody,
+    #[error("wrong_subnet")]
+    WrongSubnet,
+    #[error("verify_timeout")]
+    VerifyTimeout,
+}
+
+impl Drop {
+    /// Every reason.
+    pub const ALL: [Drop; 6] = [
+        Drop::UnknownRoot,
+        Drop::KzgInvalid,
+        Drop::CommitmentsMismatch,
+        Drop::NotCustody,
+        Drop::WrongSubnet,
+        Drop::VerifyTimeout,
+    ];
+
+    /// The `reason` label.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Drop::UnknownRoot => "unknown_root",
+            Drop::KzgInvalid => "kzg_invalid",
+            Drop::CommitmentsMismatch => "commitments_mismatch",
+            Drop::NotCustody => "not_custody",
+            Drop::WrongSubnet => "wrong_subnet",
+            Drop::VerifyTimeout => "verify_timeout",
+        }
+    }
+}
+
+/// A column that passed the contract.
+#[derive(Debug)]
+pub struct Verified<'a, E: EthSpec> {
+    column: &'a GossipColumn<E>,
+}
+
+impl<E: EthSpec> Verified<'_, E> {
+    #[must_use]
+    pub fn sidecar(&self) -> &gloas::DataColumnSidecar<E> {
+        &self.column.sidecar
+    }
+}
+
+type ReasonLabel = [(&'static str, &'static str); 1];
+
+/// `probe_column_dropped_total{reason}`.
+#[derive(Debug, Clone, Default)]
+pub struct ColumnMetrics {
+    dropped: Family<ReasonLabel, Counter>,
+}
+
+impl ColumnMetrics {
+    /// Registers the counter in `registry`.
+    pub fn register(registry: &mut Registry) -> Self {
+        let metrics = Self::default();
+        registry.register(
+            "probe_column_dropped",
+            "Gossip column sidecars dropped by the storage contract, by reason",
+            metrics.dropped.clone(),
+        );
+        metrics
+    }
+
+    /// Columns dropped for `reason` so far.
+    #[must_use]
+    pub fn dropped(&self, reason: Drop) -> u64 {
+        self.dropped
+            .get_or_create(&[("reason", reason.reason())])
+            .get()
+    }
+
+    fn count(&self, reason: Drop) {
+        self.dropped
+            .get_or_create(&[("reason", reason.reason())])
+            .inc();
+    }
+}
+
+/// What the contract checks KZG with.
+pub struct ColumnContract<V> {
+    pub kzg: V,
+    pub verify_timeout: Duration,
+    pub metrics: ColumnMetrics,
+}
+
+/// Checks `column` against the storage contract (see the module docs): the reference's root
+/// (`refs`), our custody (`custody`) and KZG through cl-verify (`contract`). A drop is counted in
+/// `contract.metrics` before it is returned.
+///
+/// # Errors
+///
+/// [`Drop`]: the first condition that does not hold.
+pub async fn storage_contract<'a, E, A, V, S, C>(
+    column: &'a GossipColumn<E>,
+    refs: &RefView<A, E>,
+    custody: &Custody<S, C>,
+    contract: &ColumnContract<V>,
+) -> Result<Verified<'a, E>, Drop>
+where
+    E: EthSpec,
+    A: ReferenceApi + BlockApi,
+    V: KzgVerifier,
+{
+    let checked = check(column, refs, custody, contract).await;
+    if let Err(reason) = checked {
+        contract.metrics.count(reason);
+        tracing::debug!(
+            reason = reason.reason(),
+            index = column.sidecar.index,
+            slot = column.sidecar.slot,
+            subnet = column.subnet_id,
+            "column sidecar dropped"
+        );
+    }
+    checked.map(|()| Verified { column })
+}
+
+async fn check<E, A, V, S, C>(
+    column: &GossipColumn<E>,
+    refs: &RefView<A, E>,
+    custody: &Custody<S, C>,
+    contract: &ColumnContract<V>,
+) -> Result<(), Drop>
+where
+    E: EthSpec,
+    A: ReferenceApi + BlockApi,
+    V: KzgVerifier,
+{
+    let sidecar = &column.sidecar;
+    if sidecar.index >= NUMBER_OF_COLUMNS {
+        return Err(Drop::NotCustody);
+    }
+    if sidecar.column.is_empty() {
+        return Err(Drop::CommitmentsMismatch);
+    }
+    if sidecar.kzg_proofs.len() != sidecar.column.len() {
+        return Err(Drop::KzgInvalid);
+    }
+    if compute_subnet_for_data_column_sidecar(sidecar.index) != column.subnet_id {
+        return Err(Drop::WrongSubnet);
+    }
+    if custody
+        .custody_columns()
+        .binary_search(&sidecar.index)
+        .is_err()
+    {
+        return Err(Drop::NotCustody);
+    }
+    let block = refs
+        .lookup(sidecar.beacon_block_root.0)
+        .await
+        .map_err(|e| {
+            tracing::debug!(error = %e, "column root not vouched for by the reference");
+            Drop::UnknownRoot
+        })?;
+    if block.slot != sidecar.slot {
+        return Err(Drop::UnknownRoot);
+    }
+    if block.commitments.len() != sidecar.column.len() {
+        return Err(Drop::CommitmentsMismatch);
+    }
+    let cells = block
+        .commitments
+        .iter()
+        .zip(sidecar.column.iter().zip(sidecar.kzg_proofs.iter()))
+        .map(|(commitment, (cell, proof))| KzgCellProof {
+            commitment: commitment.to_vec(),
+            cell_index: sidecar.index,
+            cell: cell.to_vec(),
+            proof: proof.to_vec(),
+        })
+        .collect();
+    match contract
+        .kzg
+        .verify_cells(cells, contract.verify_timeout)
+        .await
+    {
+        KzgOutcome::Valid => Ok(()),
+        KzgOutcome::Invalid => Err(Drop::KzgInvalid),
+        KzgOutcome::NoVerdict(why) => {
+            tracing::debug!(%why, "no KZG verdict from cl-verify");
+            Err(Drop::VerifyTimeout)
+        }
+    }
+}
+
+/// Stores a column that passed [`storage_contract`] in the column env, as its SSZ under
+/// `(slot, beacon_block_root, index)`.
+///
+/// # Errors
+///
+/// The column store's ([`cl_chain_columns::ColumnWriter::write_columns`]).
+pub fn store_verified<E: EthSpec>(
+    verified: &Verified<'_, E>,
+    writer: &cl_chain_columns::ColumnWriter,
+) -> Result<(), cl_chain_columns::Error> {
+    let sidecar = verified.sidecar();
+    let ssz = sidecar.as_ssz_bytes();
+    let column = cl_chain_columns::Column {
+        index: sidecar.index,
+        ssz: &ssz,
+    };
+    writer
+        .write_columns(sidecar.slot, &sidecar.beacon_block_root.0, &[column])
+        .map(drop)
+}

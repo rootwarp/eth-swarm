@@ -1,5 +1,15 @@
-//! Probe mode: the Status cl-chain hands cl-p2p over `ethswarm.chain.v1.ReqRespService/
-//! GetStatus` while it imports nothing of its own.
+//! Probe mode: what cl-chain does while it imports nothing of its own. It vouches for nothing
+//! itself; the reference node's Beacon API ([`BeaconApi`]) is trusted for block roots only.
+//!
+//! - **Status** ([`StatusProvider`]): what cl-chain hands cl-p2p over
+//!   `ethswarm.chain.v1.ReqRespService/GetStatus` (below).
+//! - **Storage contract** ([`storage_contract`]): a gossip column sidecar is stored only if the
+//!   reference vouches for its block root ([`RefView`]), its cells verify by KZG through
+//!   cl-verify against the bid's `blob_kzg_commitments`, and its index and subnet are a custody
+//!   column. Anything else is dropped and counted (`probe_column_dropped_total{reason}`); see
+//!   [`column`] for the order of the checks and the reasons.
+//!
+//! # Status
 //!
 //! - `fork_digest`: `compute_fork_digest(genesis_validators_root, epoch)` at the **wall-clock**
 //!   epoch of the pinned network config (`phase0/p2p-interface.md` Status: "the node's current
@@ -16,6 +26,16 @@
 //! or times out (an outage) keeps the last good one; with none yet, the Status is
 //! [`ProbeError::Unavailable`], which the RPC answers `UNAVAILABLE` and cl-p2p treats as "no
 //! Status": it sends none and judges none, never a guessed one.
+
+mod beacon_api;
+pub mod column;
+mod ref_view;
+
+pub use beacon_api::BeaconApi;
+pub use column::{
+    storage_contract, store_verified, ColumnContract, ColumnMetrics, Drop, GossipColumn, Verified,
+};
+pub use ref_view::{BlockApi, RefBlock, RefError, RefLimits, RefView};
 
 use ethswarm_proto::chain as pb;
 use ethswarm_proto::common;
@@ -363,5 +383,300 @@ mod tests {
             provider.status(at_epoch(&chain, 0)).await,
             Err(ProbeError::Clock(DigestError::BeforeFulu { .. }))
         ));
+    }
+
+    // The storage contract (`storage_contract`), end to end: a reference-API fixture server
+    // over HTTP, the in-process cl-verify with the pinned setup, the column env, and the
+    // custody of node `U256::MAX` (columns 1, 47, 87 and 102).
+
+    use crate::da::custody::{Advertise, Custody, EnrCgc, EnrError};
+    use crate::testing::{blobs, gloas_block, schedule, ClVerify, Served, Spec, Stub, StubVerify};
+    use crate::verify::client::KzgClient;
+    use cl_chain_columns::ColumnWriter;
+    use consensus_types::gloas::DataColumnSidecar;
+    use consensus_types::primitives::U256;
+    use prometheus_client::registry::Registry;
+    use std::sync::Arc;
+    use testkit::collector::testing::{FixtureServer, Reply};
+
+    /// The slot of the fixture block.
+    const SLOT: u64 = 9;
+    /// A custody column of `U256::MAX`.
+    const CUSTODY_COLUMN: u64 = 47;
+
+    /// The ENR is not under test here.
+    struct NoEnr;
+
+    impl EnrCgc for NoEnr {
+        fn set_cgc(&mut self, _: u64) -> Result<(), EnrError> {
+            Ok(())
+        }
+    }
+
+    struct Contract {
+        refs: RefView<BeaconApi, Spec>,
+        custody: Custody<Arc<ColumnWriter>, NoEnr>,
+        contract: ColumnContract<KzgClient>,
+        registry: Registry,
+        writer: Arc<ColumnWriter>,
+        /// The root of the block the reference serves, which commits to both fixture blobs.
+        root: Root,
+        /// The root of a block that commits to the first fixture blob only.
+        one_blob_root: Root,
+        _verify: Served,
+        _reference: FixtureServer,
+        _dir: tempfile::TempDir,
+    }
+
+    /// The reference serves the headers and blocks of `blocks` (root, SSZ), 404 for any other.
+    async fn reference(blocks: Vec<(Root, Vec<u8>)>) -> FixtureServer {
+        let mut replies = HashMap::new();
+        for (root, ssz) in blocks {
+            let id = format!("0x{}", hex::encode(root));
+            let header = format!(
+                r#"{{"data":{{"root":"{id}","canonical":true,"header":{{"message":{{"slot":"{SLOT}"}}}}}}}}"#
+            );
+            replies.insert(format!("/eth/v1/beacon/headers/{id}"), Reply::json(&header));
+            replies.insert(format!("/eth/v2/beacon/blocks/{id}"), Reply::ssz(ssz));
+        }
+        FixtureServer::start(move |_, path| {
+            replies
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| Reply::status(404))
+        })
+        .await
+    }
+
+    async fn contract_with(verify: Served, verify_timeout: Duration) -> Contract {
+        let b = blobs();
+        let (_, ssz, root) = gloas_block(SLOT, &b.commitments);
+        let (_, one_ssz, one_blob_root) = gloas_block(SLOT, &b.commitments[..1]);
+        let server = reference(vec![(root, ssz), (one_blob_root, one_ssz)]).await;
+        let api = BeaconApi::new(&format!("http://{}", server.addr), DEFAULT_API_TIMEOUT).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+        let custody = Custody::open(
+            Arc::clone(&writer),
+            NoEnr,
+            U256::MAX,
+            Advertise::Withheld,
+            0,
+        )
+        .unwrap();
+        assert!(custody.custody_columns().contains(&CUSTODY_COLUMN));
+        let mut registry = Registry::default();
+        let contract = ColumnContract {
+            kzg: verify.kzg_client().await,
+            verify_timeout,
+            metrics: ColumnMetrics::register(&mut registry),
+        };
+        Contract {
+            refs: RefView::new(api, schedule(), RefLimits::default()),
+            custody,
+            contract,
+            registry,
+            writer,
+            root,
+            one_blob_root,
+            _verify: verify,
+            _reference: server,
+            _dir: dir,
+        }
+    }
+
+    async fn contract() -> Contract {
+        contract_with(ClVerify::start(), Duration::from_secs(10)).await
+    }
+
+    /// Column `index` of both fixture blobs for block `root`, arriving on its own subnet.
+    fn column(root: Root, index: u64) -> GossipColumn<Spec> {
+        let b = blobs();
+        let blobs = 0..b.commitments.len();
+        let cells: Vec<_> = blobs
+            .clone()
+            .map(|blob| b.cell(blob, index % 128).to_vec().try_into().unwrap())
+            .collect();
+        let proofs: Vec<_> = blobs.map(|blob| b.proof(blob, index % 128)).collect();
+        GossipColumn {
+            sidecar: DataColumnSidecar {
+                index,
+                column: cells.try_into().unwrap(),
+                kzg_proofs: proofs.try_into().unwrap(),
+                slot: SLOT,
+                beacon_block_root: root.into(),
+            },
+            subnet_id: index % 128,
+        }
+    }
+
+    impl Contract {
+        /// The contract, then the store if it held: what gossip ingestion does.
+        async fn ingest(&self, column: &GossipColumn<Spec>) -> Result<(), Drop> {
+            let verified =
+                storage_contract(column, &self.refs, &self.custody, &self.contract).await?;
+            store_verified(&verified, &self.writer).unwrap();
+            Ok(())
+        }
+
+        fn stored(&self, column: &GossipColumn<Spec>) -> Option<Vec<u8>> {
+            let root = column.sidecar.beacon_block_root.0;
+            self.writer
+                .reader()
+                .get(&root, column.sidecar.index)
+                .unwrap()
+        }
+
+        /// `probe_column_dropped_total{reason}` as exposed, for every reason.
+        fn exposed(&self) -> HashMap<&'static str, u64> {
+            let mut text = String::new();
+            prometheus_client::encoding::text::encode(&mut text, &self.registry).unwrap();
+            Drop::ALL
+                .iter()
+                .map(|d| {
+                    let series =
+                        format!("probe_column_dropped_total{{reason=\"{}\"}} ", d.reason());
+                    let value = text
+                        .lines()
+                        .find_map(|l| l.strip_prefix(&series))
+                        .map_or(0, |v| v.parse().unwrap());
+                    assert_eq!(value, self.contract.metrics.dropped(*d), "{}", d.reason());
+                    (d.reason(), value)
+                })
+                .collect()
+        }
+
+        /// `column` is dropped for `reason`, nothing of it is stored, and the drop is counted
+        /// under that reason only, `count` times so far.
+        async fn assert_dropped(&self, column: &GossipColumn<Spec>, reason: Drop, count: u64) {
+            assert_eq!(self.ingest(column).await, Err(reason));
+            assert_eq!(
+                self.stored(column),
+                None,
+                "a dropped column is never stored"
+            );
+            let exposed = self.exposed();
+            for (label, value) in exposed {
+                let want = if label == reason.reason() { count } else { 0 };
+                assert_eq!(value, want, "probe_column_dropped_total{{reason={label}}}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_valid_stores() {
+        let c = contract().await;
+        let column = column(c.root, CUSTODY_COLUMN);
+        assert_eq!(c.ingest(&column).await, Ok(()));
+        use ssz::Encode;
+        assert_eq!(c.stored(&column), Some(column.sidecar.as_ssz_bytes()));
+        assert!(c.exposed().values().all(|&n| n == 0), "nothing dropped");
+        // Every custody column of the block is stored.
+        for index in c.custody.custody_columns() {
+            let column = self::column(c.root, index);
+            assert_eq!(c.ingest(&column).await, Ok(()), "column {index}");
+        }
+        let stored = c.writer.reader().columns_for_root(&c.root).unwrap();
+        assert_eq!(stored.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn contract_unknown_root() {
+        let c = contract().await;
+        // A root the reference has never heard of (404).
+        c.assert_dropped(&column([0x5a; 32], CUSTODY_COLUMN), Drop::UnknownRoot, 1)
+            .await;
+        // A vouched root at another slot than the reference's block.
+        let mut other_slot = column(c.root, CUSTODY_COLUMN);
+        other_slot.sidecar.slot = SLOT + 1;
+        c.assert_dropped(&other_slot, Drop::UnknownRoot, 2).await;
+    }
+
+    #[tokio::test]
+    async fn contract_kzg_invalid() {
+        let c = contract().await;
+        // One flipped cell byte (the low byte of a field element: still canonical).
+        let mut flipped = column(c.root, CUSTODY_COLUMN);
+        flipped.sidecar.column[1][31] ^= 1;
+        c.assert_dropped(&flipped, Drop::KzgInvalid, 1).await;
+        // A proof of another column.
+        let mut wrong_proof = column(c.root, CUSTODY_COLUMN);
+        wrong_proof.sidecar.kzg_proofs[0] = blobs().proof(0, 0);
+        c.assert_dropped(&wrong_proof, Drop::KzgInvalid, 2).await;
+        // One proof short: structurally invalid, never sent to cl-verify.
+        let mut short = column(c.root, CUSTODY_COLUMN);
+        short.sidecar.kzg_proofs = vec![blobs().proof(0, 47)].try_into().unwrap();
+        c.assert_dropped(&short, Drop::KzgInvalid, 3).await;
+        // The unchanged column still stores.
+        assert_eq!(c.ingest(&column(c.root, CUSTODY_COLUMN)).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn contract_commitments_mismatch() {
+        let c = contract().await;
+        // Two cells for a bid that commits to one blob.
+        c.assert_dropped(
+            &column(c.one_blob_root, CUSTODY_COLUMN),
+            Drop::CommitmentsMismatch,
+            1,
+        )
+        .await;
+        // One cell for a bid of two.
+        let mut one = column(c.root, CUSTODY_COLUMN);
+        one.sidecar.column = vec![one.sidecar.column[0].clone()].try_into().unwrap();
+        one.sidecar.kzg_proofs = vec![one.sidecar.kzg_proofs[0]].try_into().unwrap();
+        c.assert_dropped(&one, Drop::CommitmentsMismatch, 2).await;
+        // No cells at all: a sidecar for zero blobs.
+        let mut empty = column(c.root, CUSTODY_COLUMN);
+        empty.sidecar.column = Vec::new().try_into().unwrap();
+        empty.sidecar.kzg_proofs = Vec::new().try_into().unwrap();
+        c.assert_dropped(&empty, Drop::CommitmentsMismatch, 3).await;
+        // The first blob's column against the one-blob bid verifies.
+        let mut first = column(c.one_blob_root, CUSTODY_COLUMN);
+        first.sidecar.column = vec![first.sidecar.column[0].clone()].try_into().unwrap();
+        first.sidecar.kzg_proofs = vec![first.sidecar.kzg_proofs[0]].try_into().unwrap();
+        assert_eq!(c.ingest(&first).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn contract_not_custody() {
+        let c = contract().await;
+        // A valid column on its own subnet that this node does not custody.
+        assert!(!c.custody.custody_columns().contains(&5));
+        c.assert_dropped(&column(c.root, 5), Drop::NotCustody, 1)
+            .await;
+        // An index past NUMBER_OF_COLUMNS, on the subnet of its index modulo 128.
+        let mut past = column(c.root, CUSTODY_COLUMN);
+        past.sidecar.index = 128 + CUSTODY_COLUMN;
+        c.assert_dropped(&past, Drop::NotCustody, 2).await;
+    }
+
+    #[tokio::test]
+    async fn contract_wrong_subnet() {
+        let c = contract().await;
+        // A custody column on another column's subnet.
+        let mut moved = column(c.root, CUSTODY_COLUMN);
+        moved.subnet_id = CUSTODY_COLUMN + 1;
+        c.assert_dropped(&moved, Drop::WrongSubnet, 1).await;
+        // On a subnet past DATA_COLUMN_SIDECAR_SUBNET_COUNT.
+        moved.subnet_id = 128 + CUSTODY_COLUMN;
+        c.assert_dropped(&moved, Drop::WrongSubnet, 2).await;
+    }
+
+    #[tokio::test]
+    async fn verify_timeout_drops() {
+        let deadline = Duration::from_millis(300);
+        let c = contract_with(StubVerify::start(Stub::Silent), deadline).await;
+        let column = column(c.root, CUSTODY_COLUMN);
+        // The reference lookup is cached first, so the time below is cl-verify's alone.
+        c.refs.lookup(c.root).await.unwrap();
+        let start = std::time::Instant::now();
+        c.assert_dropped(&column, Drop::VerifyTimeout, 1).await;
+        let took = start.elapsed();
+        assert!(took >= deadline, "{took:?}");
+        assert!(took < deadline + Duration::from_millis(250), "{took:?}");
+        // cl-verify that is not there at all: dropped the same way.
+        let gone = contract_with(StubVerify::start(Stub::Mute), deadline).await;
+        gone.assert_dropped(&column, Drop::VerifyTimeout, 1).await;
     }
 }

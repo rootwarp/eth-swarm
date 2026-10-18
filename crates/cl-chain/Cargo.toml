@@ -14,13 +14,32 @@ tonic.workspace = true
 # Probe mode's Status: compute_fork_digest at the wall-clock epoch of the pinned config.
 network-config = { path = "../network-config" }
 # The reference API's bounded timeout; the versions already in the tree through tonic.
-tokio = { version = "1", features = ["time"] }
+# `sync`: the reference view's in-flight set and concurrency bound, the verify client's stream.
+# `net`: the reference Beacon API over TCP.
+tokio = { version = "1", features = ["time", "sync", "net", "rt"] }
+# The verify.v1 KZG client's request stream.
+tokio-stream = "0.1"
 thiserror = "2"
 tracing = "0.1"
 # da::custody: the custody record lives in the column env until it moves into the store schema.
 cl-chain-columns = { path = "../cl-chain-columns" }
 # da::custody: get_custody_groups and the custody constants.
 consensus-types = { path = "../consensus-types" }
+# probe::storage_contract: block roots of the reference node's blocks, the stored sidecar's SSZ.
+tree_hash.workspace = true
+ethereum_ssz.workspace = true
+# The reference Beacon API client (probe::BeaconApi): hyper 1 over plain TCP to a loopback host,
+# the crates and versions testkit's collector and cl-sync already use. No new HTTP client crate.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+# probe_column_dropped_total{reason}; the version cl-verify and cl-p2p use.
+prometheus-client = "0.25.1"
 
 [dev-dependencies]
 ipc = { path = "../ipc", features = ["testkit"] }
@@ -28,4 +47,13 @@ tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }
 tempfile = "3"
 # da::custody tests drive a real local ENR (re-signed, seq-bumped) through cl-discv5's `enr`.
 cl-discv5 = { path = "../cl-discv5" }
-p2p-wire = { path = "../p2p-wire" }
+p2p-wire = { path = "../p2p-wire", features = ["testkit"] }
+# probe::tests: an in-process cl-verify (the pinned trusted setup through VerifyServer::new) that
+# the verify.v1 client talks to over a Unix socket. cl-verify links blst directly, never
+# crypto-bls (scripts/check-cl-chain-features.sh).
+cl-verify = { path = "../cl-verify" }
+# tests/kzg_fixture.rs: the fixture blobs' cells and proofs, from the pinned setup.
+crypto-kzg = { path = "../crypto-kzg" }
+# The reference-API fixture server (testkit::collector::testing::FixtureServer).
+testkit = { path = "../testkit", features = ["test-support"] }
+tokio-stream = { version = "0.1", features = ["net"] }

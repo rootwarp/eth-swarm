@@ -1033,18 +1033,33 @@ dependencies = [
 name = "cl-chain"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "cl-chain-columns",
  "cl-discv5",
+ "cl-verify",
  "consensus-types",
+ "crypto-kzg",
+ "ethereum_ssz",
  "ethswarm-proto",
+ "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "ipc",
  "network-config",
  "p2p-wire",
+ "prometheus-client",
+ "serde",
+ "serde_json",
  "tempfile",
+ "testkit",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
+ "tree_hash",
 ]
 
 [[package]]
