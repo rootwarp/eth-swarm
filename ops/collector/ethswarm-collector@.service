@@ -1,0 +1,90 @@
+# ETH Swarm arrival collector, one instance per network: ethswarm-collector@hoodi.service and
+# ethswarm-collector@sepolia.service, each reading its reference node's /eth/v1/events and
+# stamping every event on arrival. See ops/collector/README.md.
+#
+# Each instance runs as its own system user, ethswarm-collector-<network>: with one shared user
+# either instance could read and write the other's state directory (through /proc/<pid>/root
+# too, since ProtectProc=invisible hides only other users' processes).
+#
+# Each instance takes its settings from /etc/ethswarm/collector-<network>.env (examples:
+# ops/collector/collector-<network>.env.example): COLLECTOR_NETWORK, COLLECTOR_OUT and
+# COLLECTOR_NTP, nothing else. The reference node's URL is in /etc/ethswarm/collector-<network>.url
+# (mode 0600, the instance user's), read by --url-file, so a key in it never reaches argv
+# (/proc/<pid>/cmdline is world-readable). Nothing here names a node: on a host that runs both
+# reference nodes, Sepolia's beacon API is 127.0.0.1:5052 and Hoodi's 127.0.0.1:5053, and a
+# hardcoded URL would let a Hoodi collector record Sepolia. The binary also refuses a node whose
+# CONFIG_NAME (or, for Sepolia, genesis) is not its network's.
+#
+# Same hardening as the probe units, plus loopback-only IP: the collector talks to the node's
+# beacon API on 127.0.0.1 and to chronyd on 127.0.0.1:323, and to nothing else. Do not weaken a
+# line without saying why.
+[Unit]
+Description=ETH Swarm arrival collector (%i reference node SSE)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ethswarm-collector-%i
+Group=ethswarm-collector-%i
+UMask=0027
+# Required: an instance without its env file does not start.
+EnvironmentFile=/etc/ethswarm/collector-%i.env
+# The env file may set only the three keys, must name this instance's network, and must write
+# into this instance's own state directory, so two instances never share or swap a capture
+# directory. The directory is compared with the literal path: an env file value overrides the
+# STATE_DIRECTORY systemd sets, so that variable proves nothing (and setting it is refused).
+ExecStartPre=/bin/sh -c 'env_file=/etc/ethswarm/collector-%i.env; \
+    state=/var/lib/ethswarm-collector/%i; \
+    unknown=$$(grep -Evc "^(#.*)?$$|^(COLLECTOR_NETWORK|COLLECTOR_OUT|COLLECTOR_NTP)=" "$$env_file"); \
+    if [ "$$unknown" != 0 ]; then \
+        echo "$$env_file: $${unknown:-unreadable}: want only COLLECTOR_NETWORK, COLLECTOR_OUT and COLLECTOR_NTP lines" >&2; \
+        exit 1; \
+    fi; \
+    if [ "$${COLLECTOR_NETWORK}" != "%i" ] || [ "$${COLLECTOR_OUT}" != "$$state" ]; then \
+        echo "$$env_file: COLLECTOR_NETWORK must be %i and COLLECTOR_OUT $$state" >&2; \
+        exit 1; \
+    fi'
+# Plain http:// to loopback only (the binary refuses anything else). Each start writes a new
+# capture directory /var/lib/ethswarm-collector/%i/%i-<unix start seconds>/; summary.toml is
+# written when the unit stops (SIGTERM).
+ExecStart=/usr/local/bin/collector sse --network ${COLLECTOR_NETWORK} \
+    --url-file /etc/ethswarm/collector-%i.url --out ${COLLECTOR_OUT} --host %H \
+    --ntp ${COLLECTOR_NTP}
+# systemd creates /var/lib/ethswarm-collector root-owned 0755 and only the instance's own
+# directory below it as the instance user's, 0750.
+StateDirectory=ethswarm-collector/%i
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/ethswarm-collector/%i
+TimeoutStopSec=30s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=multi-user.target

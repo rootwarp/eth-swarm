@@ -58,10 +58,12 @@ would make the Hoodi `up` recreate the Sepolia services); all three scripts refu
 `COMPOSE_*` key in the `.env`, and `preflight.sh` and the run log refuse `COMPOSE_PROJECT_NAME`
 in the environment. Both env files are git-ignored.
 
-The capture tools read the node's Beacon API: `ops/collector`'s unit points at
-`http://127.0.0.1:5052`. With both nodes on one host that is the Sepolia node, so point the
-Hoodi capture tools at the Hoodi `BEACON_API_PORT` (5053); on a host that runs Hoodi alone, the
-Hoodi `.env` may take the Sepolia column's ports instead.
+The capture tools read the node's Beacon API. `ops/collector` runs one instance per network
+(`ethswarm-collector@hoodi`, `@sepolia`), each with its own URL file; its example URL files
+carry these defaults, Hoodi 5053 and Sepolia 5052, and its CI test fails if they drift apart.
+On a host that runs Hoodi alone, the Hoodi `.env` may take the Sepolia column's ports instead;
+set the collector's URL file to match. A collector pointed at the other network's node
+refuses to start (its `CONFIG_NAME` differs).
 
 ## Firewall and disk
 

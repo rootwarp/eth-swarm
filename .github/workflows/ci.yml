@@ -33,6 +33,8 @@ jobs:
         run: bash scripts/tests/check-locked.test.sh && bash scripts/check-locked.sh
       - name: Reference node (Sepolia, Hoodi) scripts and compose file (offline, stub commands)
         run: bash ops/ref-node/tests/ref-node.test.sh
+      - name: Arrival collector systemd template and per-network env examples (offline)
+        run: bash ops/collector/tests/collector-unit.test.sh
       - name: Kurtosis devnet images pinned by tag and digest (testing/kurtosis/*.yaml)
         run: bash scripts/check-kurtosis-pins.sh
       - name: Kurtosis devnet checker (offline, stub kurtosis and curl)

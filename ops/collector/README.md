@@ -1,19 +1,59 @@
-# Arrival collector (Hoodi reference node)
+# Arrival collector (Hoodi and Sepolia reference nodes)
 
 `collector` (`crates/testkit/src/bin/collector.rs`, library `testkit::collector`) records when
 each block, execution payload envelope and data column arrived, on a monotonic and a wall
-clock, stamped before anything decodes it. On the Hoodi reference host it reads the node's
+clock, stamped before anything decodes it. On the reference host it reads a node's
 `/eth/v1/events` stream; our probe's gossip tap feeds the same collector once the probe has
 one. Offsets are computed from the records afterwards with `collector offsets`.
 
-`ethswarm-collector.service` runs it as its own system user with the same hardening as the
-probe units, and may only reach loopback (`IPAddressAllow=localhost`): the node's beacon API on
-`127.0.0.1:5052` and chronyd on `127.0.0.1:323`.
+The systemd template `ethswarm-collector@.service` runs one instance per network,
+`ethswarm-collector@hoodi` and `ethswarm-collector@sepolia`, with the same hardening as the
+probe units; each may only reach loopback (`IPAddressAllow=localhost`): its node's beacon API
+and chronyd on `127.0.0.1:323`. Each instance runs as its own system user,
+`ethswarm-collector-<network>`, so neither can read or write the other's captures (one shared
+user could, even through `/proc/<pid>/root`, which `ProtectProc=invisible` hides only from
+other users). The unit names no node. Each instance reads two files:
+
+| File | Hoodi | Sepolia |
+|---|---|---|
+| `/etc/ethswarm/collector-<network>.env` (root, 0644) | `collector-hoodi.env.example` | `collector-sepolia.env.example` |
+| `COLLECTOR_NETWORK` | `hoodi` | `sepolia` |
+| `COLLECTOR_OUT` | `/var/lib/ethswarm-collector/hoodi` | `/var/lib/ethswarm-collector/sepolia` |
+| `COLLECTOR_NTP` | `chrony` | `chrony` |
+| `/etc/ethswarm/collector-<network>.url` (the instance user's, 0600) | `collector-hoodi.url.example` | `collector-sepolia.url.example` |
+| its one line | `http://127.0.0.1:5053` | `http://127.0.0.1:5052` |
+
+The URL file is the only place the reference URL may carry a key: the unit passes its path
+(`--url-file`), never the URL, because `/proc/<pid>/cmdline` is readable by every user. The
+collector refuses a URL file that group or others may access, and never prints what it holds.
+The env file holds no secret and may set only those three keys; the unit refuses any other line,
+`STATE_DIRECTORY` above all (an env file value would override the one systemd sets).
+
+The ports are the `ops/ref-node` defaults (`BEACON_API_PORT`): the reference-node stack runs
+Sepolia and Hoodi side by side on one host, Sepolia's beacon API on 5052 and Hoodi's on 5053.
+A collector reading the wrong one would record the other network's events under its own name,
+so it is refused three times over:
+
+- the unit's `ExecStartPre` guard stops an instance whose env file names another network, sets
+  an unknown key, or writes anywhere but the instance's own state directory
+  `/var/lib/ethswarm-collector/<network>` (compared with that literal path);
+- the collector refuses a node whose `/eth/v1/config/spec` `CONFIG_NAME` is not
+  `COLLECTOR_NETWORK` (`the node's CONFIG_NAME is sepolia, not hoodi`), and a node without the
+  spec endpoint;
+- for Sepolia, whose genesis is pinned, it also refuses a node with another `genesis_time`.
+  Hoodi's genesis is read from the node, so `CONFIG_NAME` is what catches Sepolia's port there.
+
+`/var/lib/ethswarm-collector` itself stays root-owned, mode 0755, as systemd creates it; only
+each instance's directory below it is the instance user's (0750).
+
+`ops/collector/tests/collector-unit.test.sh` (CI) checks the template's hardening, users, env
+and URL files, guard and state directory, that it holds no URL, that each example URL's port is
+the ref-node default, and this README's migration step.
 
 ## What a capture holds
 
-Each start of the unit writes a new directory `/var/lib/ethswarm-collector/hoodi-<unix start
-seconds>/`:
+Each start of an instance writes a new directory
+`/var/lib/ethswarm-collector/<network>/<network>-<unix start seconds>/`:
 
 | File | Content |
 |---|---|
@@ -35,58 +75,96 @@ so `Restart=on-failure` starts a new capture once there is room.
 
 ## Install
 
-On the Hoodi reference host, once the node is synced and its beacon API answers on
-`127.0.0.1:5052`:
+On the reference host, once the node is synced and its beacon API answers (Hoodi on
+`127.0.0.1:5053`, Sepolia on `127.0.0.1:5052`; see `ops/ref-node`). The steps enable a Hoodi
+instance; a Sepolia one is the same with `sepolia` for `hoodi`.
 
-1. Build and install the binary (root-owned, not writable by the service user):
+1. On a host that ran the earlier single-network unit, retire it first: it reads port 5052,
+   which on a shared host is the Sepolia node, and records it as Hoodi. Stop and remove it, and
+   give `/var/lib/ethswarm-collector` back to root (that unit left it owned by its user, mode
+   0750, which would lock the new instance users out of their own directories):
+
+   ```bash
+   sudo systemctl disable --now ethswarm-collector.service
+   sudo rm -f /etc/systemd/system/ethswarm-collector.service
+   sudo systemctl daemon-reload
+   sudo chown root:root /var/lib/ethswarm-collector
+   sudo chmod 0755 /var/lib/ethswarm-collector
+   ```
+
+   Its captures (`/var/lib/ethswarm-collector/hoodi-<start>/`) stay where they are, still owned
+   by the old `ethswarm-collector` user; archive them before removing that user.
+
+2. Build and install the binary (root-owned, not writable by the service users):
 
    ```bash
    cargo build --release --locked -p testkit --bin collector
    sudo install -o root -g root -m 0755 target/release/collector /usr/local/bin/collector
    ```
 
-2. Create the service user and install the unit:
+3. Create the instance's own system user and install the template:
 
    ```bash
-   sudo useradd --system --no-create-home --shell /usr/sbin/nologin ethswarm-collector
-   sudo install -o root -g root -m 0644 ops/collector/ethswarm-collector.service \
-       /etc/systemd/system/ethswarm-collector.service
-   sudo systemd-analyze verify /etc/systemd/system/ethswarm-collector.service
+   sudo useradd --system --no-create-home --shell /usr/sbin/nologin ethswarm-collector-hoodi
+   sudo install -o root -g root -m 0644 ops/collector/ethswarm-collector@.service \
+       /etc/systemd/system/ethswarm-collector@.service
    ```
 
-3. Check the node and the clock first: `curl -s http://127.0.0.1:5052/eth/v1/beacon/genesis`
-   answers, and `chronyc -n tracking` works as an unprivileged user (it uses
-   `127.0.0.1:323`). On a host that runs systemd-timesyncd instead, change `--ntp chrony` to
-   `--ntp timesyncd` in the unit.
+4. Install the instance's env file (root's, 0644: no secret) and URL file (the instance
+   user's, 0600: the collector refuses any other mode). Keep the URL on the Hoodi node's port; a
+   key, if the node needs one, goes in its path here and nowhere else. On a host that runs
+   systemd-timesyncd instead of chrony, set `COLLECTOR_NTP=timesyncd`.
 
-4. Start it and watch the log:
+   ```bash
+   sudo install -d -o root -g root -m 0755 /etc/ethswarm
+   sudo install -o root -g root -m 0644 ops/collector/collector-hoodi.env.example \
+       /etc/ethswarm/collector-hoodi.env
+   sudo install -o ethswarm-collector-hoodi -g ethswarm-collector-hoodi \
+       -m 0600 ops/collector/collector-hoodi.url.example /etc/ethswarm/collector-hoodi.url
+   sudo systemd-analyze verify /etc/systemd/system/ethswarm-collector@hoodi.service
+   ```
+
+5. Check the node and the clock first: the node answers on the URL file's port and is on
+   Hoodi, and `chronyc -n tracking` works as an unprivileged user (it uses `127.0.0.1:323`):
+
+   ```bash
+   curl -s http://127.0.0.1:5053/eth/v1/config/spec | grep -o '"CONFIG_NAME":"[^"]*"'
+   # "CONFIG_NAME":"hoodi"
+   curl -s http://127.0.0.1:5053/eth/v1/beacon/genesis
+   chronyc -n tracking
+   ```
+
+6. Start the instance and watch its log:
 
    ```bash
    sudo systemctl daemon-reload
-   sudo systemctl enable --now ethswarm-collector
-   journalctl -u ethswarm-collector -f
+   sudo systemctl enable --now ethswarm-collector@hoodi
+   journalctl -u ethswarm-collector@hoodi -f
    ```
 
    The first lines name the capture directory and the subscribed events; an `ntp:` line follows
-   every minute and a `missing interval:` line after every reconnect.
+   every minute and a `missing interval:` line after every reconnect. An instance that exits at
+   once names the reason: `collector-hoodi.env: …` (the env file), `--url-file: …` (the URL
+   file's mode or content, never the URL), or `the node's CONFIG_NAME is sepolia, not hoodi`
+   (the URL reaches the Sepolia node).
 
 ## Smoke capture (at least 1 h)
 
-Let the unit run for at least an hour, then close the capture by restarting the unit (the
+Let the instance run for at least an hour, then close the capture by restarting it (the
 running capture writes `summary.toml` on SIGTERM; the restart opens a new one):
 
 ```bash
-sudo systemctl restart ethswarm-collector
+sudo systemctl restart ethswarm-collector@hoodi
 # The capture before the newest one (the state directory is 0750, so list it as root).
-dir=$(sudo sh -c 'ls -d /var/lib/ethswarm-collector/hoodi-*' | sort | tail -2 | head -1)
-sudo -u ethswarm-collector cat "$dir/summary.toml"
-sudo -u ethswarm-collector /usr/local/bin/collector offsets "$dir" | tail -1
+dir=$(sudo sh -c 'ls -d /var/lib/ethswarm-collector/hoodi/hoodi-*' | sort | tail -2 | head -1)
+sudo -u ethswarm-collector-hoodi cat "$dir/summary.toml"
+sudo -u ethswarm-collector-hoodi /usr/local/bin/collector offsets "$dir" | tail -1
 ```
 
 The smoke passes with a non-empty `records.jsonl` covering the hour, the missing intervals
 listed, and an NTP line every minute in `ntp.jsonl`. Before Hoodi, the same run works against
-the Sepolia reference node (`ops/ref-node`): `--network sepolia`, whose pinned genesis the
-collector checks against the node's.
+the Sepolia reference node (`ops/ref-node`) with the `ethswarm-collector@sepolia` instance,
+whose pinned genesis the collector also checks against the node's.
 
 ## Deploy log
 
@@ -95,10 +173,13 @@ Record the deploy in the run log, dated:
 ```text
 date (UTC):            2026-10-..T..:..:..Z
 host:                  <hostname>
+instance:              ethswarm-collector@hoodi (user ethswarm-collector-hoodi)
+reference node:        the URL file's port, and the node's CONFIG_NAME (curl …/eth/v1/config/spec)
 collector sha256:      $(sha256sum /usr/local/bin/collector)
-unit sha256:           $(sha256sum /etc/systemd/system/ethswarm-collector.service)
+unit sha256:           $(sha256sum /etc/systemd/system/ethswarm-collector@.service)
+env file sha256:       $(sudo sha256sum /etc/ethswarm/collector-hoodi.env)
 git commit:            <commit the binary was built from>
-smoke capture:         /var/lib/ethswarm-collector/hoodi-<start>/  (start, stop, duration)
+smoke capture:         /var/lib/ethswarm-collector/hoodi/hoodi-<start>/  (start, stop, duration)
 records / undecoded / dropped:  from summary.toml
 missing intervals:     count and total from summary.toml; each one in gaps.jsonl
 ntp clock error range: from ntp.jsonl
@@ -107,9 +188,11 @@ ntp clock error range: from ntp.jsonl
 ## Running it elsewhere
 
 The URL must be plain `http://` to a loopback host; the collector refuses anything else and
-never prints the URL's path. To read a remote node, tunnel its API to a local port first:
+never prints the URL's path. `--url` puts it in argv, so use it only for a URL without a key;
+otherwise give `--url-file` a 0600 file. To read a remote node, tunnel its API to a local port
+first:
 
 ```bash
-ssh -N -L 5052:127.0.0.1:5052 ref-host &
-collector sse --network hoodi --url http://127.0.0.1:5052 --out ./captures --host "$(hostname)" --ntp none
+ssh -N -L 5053:127.0.0.1:5053 ref-host &
+collector sse --network hoodi --url http://127.0.0.1:5053 --out ./captures --host "$(hostname)" --ntp none
 ```

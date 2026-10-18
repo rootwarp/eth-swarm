@@ -9,11 +9,25 @@
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::Path;
 
 /// Why a URL was refused. Never quotes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("reference API URL: {0}")]
 pub struct UrlError(pub &'static str);
+
+/// Cap on a URL file ([`ReferenceApiUrl::read_file`]): 4 KiB.
+pub const MAX_URL_FILE_BYTES: usize = 4 << 10;
+
+/// Why a URL file was refused: the file's path and why, never its content.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{path}: {reason}")]
+pub struct UrlFileError {
+    /// The file, as given.
+    pub path: String,
+    /// Why.
+    pub reason: String,
+}
 
 /// A checked reference API URL.
 #[derive(Clone, PartialEq, Eq)]
@@ -80,6 +94,54 @@ impl ReferenceApiUrl {
             base: uri.path().trim_end_matches('/').to_owned(),
             uri,
         })
+    }
+
+    /// Reads the URL from `path`, so a key in it stays out of the process's argv: a regular
+    /// file (not a symlink) that neither group nor others may access (mode 0600 or 0400), at
+    /// most [`MAX_URL_FILE_BYTES`], holding one URL and at most a trailing newline, checked as
+    /// [`ReferenceApiUrl::parse`] does. Errors name the file, never what it holds.
+    pub fn read_file(path: &Path) -> Result<Self, UrlFileError> {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let bad = |reason: String| UrlFileError {
+            path: path.display().to_string(),
+            reason,
+        };
+        let before = std::fs::symlink_metadata(path).map_err(|e| bad(format!("open: {e}")))?;
+        if before.file_type().is_symlink() {
+            return Err(bad("a symlink (want a regular file)".into()));
+        }
+        let file = std::fs::File::open(path).map_err(|e| bad(format!("open: {e}")))?;
+        let meta = file.metadata().map_err(|e| bad(format!("stat: {e}")))?;
+        if !meta.is_file() {
+            return Err(bad("not a regular file".into()));
+        }
+        if (meta.dev(), meta.ino()) != (before.dev(), before.ino()) {
+            return Err(bad("replaced while it was opened".into()));
+        }
+        if meta.permissions().mode() & 0o077 != 0 {
+            return Err(bad(
+                "group or others may access it (want mode 0600 or 0400)".into(),
+            ));
+        }
+        let mut body = Vec::new();
+        file.take(MAX_URL_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut body)
+            .map_err(|e| bad(format!("read: {e}")))?;
+        if body.len() > MAX_URL_FILE_BYTES {
+            return Err(bad(format!("over {MAX_URL_FILE_BYTES} bytes")));
+        }
+        let text = String::from_utf8(body).map_err(|_| bad("not UTF-8".into()))?;
+        let line = text
+            .strip_suffix('\n')
+            .map_or(text.as_str(), |t| t.strip_suffix('\r').unwrap_or(t));
+        if line.contains(['\n', '\r']) {
+            return Err(bad("more than one line (want one URL)".into()));
+        }
+        if line.is_empty() {
+            return Err(bad("empty (want one URL)".into()));
+        }
+        Self::parse(line).map_err(|e| bad(e.0.into()))
     }
 
     /// The literal loopback addresses to connect to, in order.
@@ -203,5 +265,71 @@ mod tests {
             vec!["127.0.0.2:80".parse().unwrap()]
         );
         assert_eq!(addrs("http://[::1]:1"), vec!["[::1]:1".parse().unwrap()]);
+    }
+
+    /// `body` in a fresh file of `mode` under `dir`.
+    fn url_file(dir: &Path, name: &str, body: &[u8], mode: u32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_url_file_is_read_without_its_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body, mode) in [
+            ("a", &b"http://127.0.0.1:5053/key-hunter2\n"[..], 0o600),
+            ("b", b"http://127.0.0.1:5053/key-hunter2", 0o400),
+            ("c", b"http://127.0.0.1:5053/key-hunter2\r\n", 0o600),
+        ] {
+            let path = url_file(dir.path(), name, body, mode);
+            let url = ReferenceApiUrl::read_file(&path).unwrap();
+            assert_eq!(format!("{url:?}"), "http://127.0.0.1:5053/…", "{name}");
+            assert_eq!(url.base_path(), "/key-hunter2", "{name}");
+        }
+    }
+
+    #[test]
+    fn a_url_file_others_can_read_or_that_is_not_one_url_is_refused_unquoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = b"http://127.0.0.1:5053/key-hunter2\n";
+        let mut long = b"http://127.0.0.1:5053/".to_vec();
+        long.extend(std::iter::repeat_n(b'k', MAX_URL_FILE_BYTES));
+        let cases = [
+            (url_file(dir.path(), "group", key, 0o640), "group or others"),
+            (url_file(dir.path(), "world", key, 0o604), "group or others"),
+            (url_file(dir.path(), "empty", b"\n", 0o600), "empty"),
+            (
+                url_file(
+                    dir.path(),
+                    "two",
+                    b"http://127.0.0.1:5053\nhunter2\n",
+                    0o600,
+                ),
+                "one line",
+            ),
+            (url_file(dir.path(), "long", &long, 0o600), "bytes"),
+            (
+                url_file(dir.path(), "binary", b"\xffhunter2", 0o600),
+                "UTF-8",
+            ),
+            (
+                url_file(dir.path(), "remote", b"http://192.0.2.1/hunter2\n", 0o600),
+                "loopback",
+            ),
+            (dir.path().to_path_buf(), "not a regular file"),
+            (dir.path().join("missing"), "open"),
+        ];
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(dir.path().join("group"), &link).unwrap();
+        let link_case = [(link, "symlink")];
+        for (path, why) in cases.iter().chain(&link_case) {
+            let err = ReferenceApiUrl::read_file(path).unwrap_err().to_string();
+            assert!(err.starts_with(&path.display().to_string()), "{err}");
+            assert!(err.contains(why), "{err} (want {why})");
+            assert!(!err.contains("hunter2") && !err.contains("kkkk"), "{err}");
+        }
     }
 }

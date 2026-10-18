@@ -464,47 +464,53 @@ pub async fn genesis_time(url: &ReferenceApiUrl, timeout: Duration) -> Result<u6
     struct Genesis {
         genesis_time: String,
     }
-    let bad = |reason: String| ApiError::BadResponse {
+    let bad = |reason: &str| ApiError::BadResponse {
         path: GENESIS_PATH,
-        reason,
+        reason: reason.into(),
     };
+    let d: Data = get_json(url, GENESIS_PATH, MAX_JSON_BYTES, timeout).await?;
+    let text = d.data.genesis_time;
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad("genesis_time is not a decimal u64"));
+    }
+    text.parse()
+        .map_err(|_| bad("genesis_time does not fit a u64"))
+}
+
+/// `GET <path>` as JSON: a 200 body of at most `limit` bytes, read within `timeout`, decoded
+/// into `T`. Nothing from the body goes into an error: a decode error names only its kind and
+/// position, since serde's message quotes what it found.
+pub(super) async fn get_json<T: serde::de::DeserializeOwned>(
+    url: &ReferenceApiUrl,
+    path: &'static str,
+    limit: usize,
+    timeout: Duration,
+) -> Result<T, ApiError> {
+    let bad = |reason: String| ApiError::BadResponse { path, reason };
     let fetch = async {
-        let response = get(url, GENESIS_PATH, GENESIS_PATH, "application/json").await?;
-        match Limited::new(response.into_body(), MAX_JSON_BYTES)
-            .collect()
-            .await
-        {
+        let response = get(url, path, path, "application/json").await?;
+        match Limited::new(response.into_body(), limit).collect().await {
             Ok(body) => Ok(body.to_bytes()),
             Err(e) if e.is::<http_body_util::LengthLimitError>() => {
-                Err(bad(format!("body over {MAX_JSON_BYTES} bytes")))
+                Err(bad(format!("body over {limit} bytes")))
             }
             Err(e) => Err(ApiError::Transport {
-                path: GENESIS_PATH,
+                path,
                 reason: format!("body: {e}"),
             }),
         }
     };
     let body = tokio::time::timeout(timeout, fetch)
         .await
-        .map_err(|_| ApiError::Timeout {
-            path: GENESIS_PATH,
-            timeout,
-        })??;
-    // serde's message quotes what it found: name only the kind of error and where.
-    let d: Data = serde_json::from_slice(&body).map_err(|e| {
+        .map_err(|_| ApiError::Timeout { path, timeout })??;
+    serde_json::from_slice(&body).map_err(|e| {
         bad(format!(
             "json: {:?} error at line {} column {}",
             e.classify(),
             e.line(),
             e.column()
         ))
-    })?;
-    let text = d.data.genesis_time;
-    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(bad("genesis_time is not a decimal u64".into()));
-    }
-    text.parse()
-        .map_err(|_| bad("genesis_time does not fit a u64".into()))
+    })
 }
 
 #[cfg(test)]

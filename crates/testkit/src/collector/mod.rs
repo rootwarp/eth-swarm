@@ -59,12 +59,12 @@ pub use sink::{
     Summary, CAPTURE_FILE, GAPS_FILE, MAX_RECORD_LINE_BYTES, NTP_FILE, RECORDS_FILE, SUMMARY_FILE,
 };
 pub use sse::{
-    genesis_time, run as run_sse, ApiError, Backoff, Pause, SseConfig, SseConfigError, SseEvent,
-    SseParser, SseStats, TokioPause, TooLarge, DEFAULT_TOPICS, EVENTS_PATH, GENESIS_PATH,
-    MAX_EVENT_BYTES, MAX_EVENT_NAME_BYTES, MAX_JSON_BYTES,
+    config_name, genesis_time, run as run_sse, ApiError, Backoff, Pause, SseConfig, SseConfigError,
+    SseEvent, SseParser, SseStats, TokioPause, TooLarge, DEFAULT_TOPICS, EVENTS_PATH, GENESIS_PATH,
+    MAX_EVENT_BYTES, MAX_EVENT_NAME_BYTES, MAX_JSON_BYTES, MAX_SPEC_BYTES, SPEC_PATH,
 };
 pub use tap::{Tap, TapRecord};
-pub use url::{ReferenceApiUrl, UrlError};
+pub use url::{ReferenceApiUrl, UrlError, UrlFileError, MAX_URL_FILE_BYTES};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;

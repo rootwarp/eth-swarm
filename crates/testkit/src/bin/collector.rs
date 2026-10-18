@@ -1,19 +1,21 @@
 //! `collector`: record gossip/SSE arrival times, and compute their offsets afterwards.
 //!
 //! ```text
-//! collector sse --network hoodi|sepolia --url http://127.0.0.1:5052 --out DIR --host HOST
+//! collector sse --network hoodi|sepolia (--url URL | --url-file PATH) --out DIR --host HOST
 //!               [--topic EVENT]... [--ntp chrony|timesyncd|none] [--max-backoff-secs N]
 //! collector offsets CAPTURE_DIR
 //! collector --help
 //! ```
 //!
 //! `sse` reads `genesis_time` from the reference node (checked against the pinned genesis where
-//! one is pinned), then streams its `/eth/v1/events` into a new capture directory
-//! `OUT/<network>-<unix start seconds>/` ([`testkit::collector::Collector`]) until SIGTERM or
-//! SIGINT, reconnecting with backoff and recording every disconnect as a missing interval. The
-//! host clock's NTP offset is sampled every 60 s from the time daemon and logged. The URL must
-//! be plain `http://` to a loopback host; reach a remote node through an SSH tunnel. Our probe's
-//! gossip tap feeds the same collector through [`testkit::collector::Tap`].
+//! one is pinned) and refuses a node whose `CONFIG_NAME` is not `--network`, then streams its
+//! `/eth/v1/events` into a new capture directory `OUT/<network>-<unix start seconds>/`
+//! ([`testkit::collector::Collector`]) until SIGTERM or SIGINT, reconnecting with backoff and
+//! recording every disconnect as a missing interval. The host clock's NTP offset is sampled
+//! every 60 s from the time daemon and logged. The URL must be plain `http://` to a loopback
+//! host; reach a remote node through an SSH tunnel. A URL that carries a key comes from
+//! `--url-file` (a 0600 file), never `--url`, so it stays out of `/proc/<pid>/cmdline`. Our
+//! probe's gossip tap feeds the same collector through [`testkit::collector::Tap`].
 //!
 //! `offsets` prints one JSON line per record with its slot-relative offset and, for a column,
 //! its envelope-relative offset, then a summary line with the unmatched column count. It reads
@@ -31,10 +33,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use testkit::archive::ChainParams;
 use testkit::collector::{
-    collect, genesis_time, read_info, records, run_sse, sample, Arrival, ArrivalReceiver, Arrivals,
-    Backoff, CaptureInfo, Clock, Collector, CollectorError, ColumnMatch, CommandDaemon, Drops,
-    EnvelopeIndex, ReferenceApiUrl, SlotClock, Source, SseConfig, Summary, SystemClock, TimeDaemon,
-    TokioPause, DEFAULT_TOPICS, NTP_INTERVAL,
+    collect, config_name, genesis_time, read_info, records, run_sse, sample, Arrival,
+    ArrivalReceiver, Arrivals, Backoff, CaptureInfo, Clock, Collector, CollectorError, ColumnMatch,
+    CommandDaemon, Drops, EnvelopeIndex, ReferenceApiUrl, SlotClock, Source, SseConfig, Summary,
+    SystemClock, TimeDaemon, TokioPause, DEFAULT_TOPICS, NTP_INTERVAL,
 };
 use tokio::sync::watch;
 
@@ -47,7 +49,7 @@ type WriteCapture = fn(
 ) -> Result<Summary, CollectorError>;
 
 const USAGE: &str = "\
-usage: collector sse --network hoodi|sepolia --url URL --out DIR --host HOST
+usage: collector sse --network hoodi|sepolia (--url URL | --url-file PATH) --out DIR --host HOST
                      [--topic EVENT]... [--ntp chrony|timesyncd|none] [--max-backoff-secs N]
        collector offsets CAPTURE_DIR
        collector --help";
@@ -58,9 +60,12 @@ sse streams a reference node's /eth/v1/events into OUT/<network>-<unix start sec
 (capture.toml, records.jsonl, gaps.jsonl, ntp.jsonl, and summary.toml at the end) until
 SIGTERM or SIGINT. Disconnects are reconnected with backoff and recorded as missing intervals.
 
-  --network NAME          hoodi or sepolia (the embedded config)
+  --network NAME          hoodi or sepolia (the embedded config); the node's CONFIG_NAME
+                          (/eth/v1/config/spec) must be the same
   --url URL               the node's beacon API: http:// to a loopback host only (tunnel to a
                           remote node over SSH); its genesis_time is read from it
+  --url-file PATH         the same URL read from PATH instead (one line; a regular file only
+                          its owner may access, mode 0600), so a key in it stays out of argv
   --out DIR               where the capture directory is created
   --host HOST             the capture host, for capture.toml
   --topic EVENT           an event to subscribe, repeatable (default: block_gossip,
@@ -84,6 +89,7 @@ const CHANNEL_CAPACITY: usize = 1 << 16;
 /// otherwise let the queue grow to 64 GiB.
 const CHANNEL_BYTES: usize = 64 << 20;
 const GENESIS_TIMEOUT: Duration = Duration::from_secs(10);
+const SPEC_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ntp {
@@ -144,9 +150,10 @@ fn parse(args: &[String]) -> Result<Command, String> {
 }
 
 /// The flags `sse` takes, each followed by its value.
-const SSE_FLAGS: [&str; 7] = [
+const SSE_FLAGS: [&str; 8] = [
     "--network",
     "--url",
+    "--url-file",
     "--out",
     "--host",
     "--topic",
@@ -192,7 +199,15 @@ fn parse_sse(args: &[String]) -> Result<SseArgs, String> {
                 network = Some(found.ok_or("--network: want hoodi or sepolia")?);
             }
             // The error says why, never the URL (its path may hold a key).
+            "--url" | "--url-file" if url.is_some() => {
+                return Err("give one --url or --url-file".into())
+            }
             "--url" => url = Some(ReferenceApiUrl::parse(value).map_err(|e| e.to_string())?),
+            // The URL stays out of argv; the error names the file, never what it holds.
+            "--url-file" => {
+                let read = ReferenceApiUrl::read_file(Path::new(value));
+                url = Some(read.map_err(|e| format!("--url-file: {e}"))?);
+            }
             "--out" => out = Some(PathBuf::from(value)),
             "--host" => host = Some(value.to_owned()),
             "--topic" => topics.push(value.to_owned()),
@@ -228,7 +243,7 @@ fn parse_sse(args: &[String]) -> Result<SseArgs, String> {
     }
     Ok(SseArgs {
         network: required(network, "--network")?,
-        url: required(url, "--url")?,
+        url: required(url, "--url or --url-file")?,
         out: required(out, "--out")?,
         host,
         topics,
@@ -339,6 +354,23 @@ async fn capture_sse(
                 pinned.genesis_time
             ));
         }
+    }
+    // Hoodi pins no genesis: on a host that runs both networks, a URL with the other node's
+    // port is caught here. Only a network of ours is ever named, never the node's text.
+    match config_name(&args.url, SPEC_TIMEOUT).await {
+        Ok(name) if name == network => {}
+        Ok(name) => {
+            let refusal = match Network::ALL.into_iter().find(|n| n.name() == name) {
+                Some(other) => format!(
+                    "the node's CONFIG_NAME is {}, not {network}: the URL reaches another \
+                     network's node",
+                    other.name()
+                ),
+                None => format!("the node's CONFIG_NAME is not {network}"),
+            };
+            return fail(refusal);
+        }
+        Err(e) => return fail(format!("spec: {e}")),
     }
     let topics: Vec<&str> = args.topics.iter().map(String::as_str).collect();
     let mut sse = match SseConfig::new(args.url.clone(), &topics) {
@@ -645,6 +677,56 @@ mod tests {
     }
 
     #[test]
+    fn the_url_can_come_from_a_file_and_never_from_both() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("collector-hoodi.url");
+        std::fs::write(&file, "http://127.0.0.1:5053/key-hunter2\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let file_arg = file.to_str().unwrap();
+        let with = |url_flags: &[&str]| {
+            let mut list = vec!["sse", "--network", "hoodi", "--out", "/x", "--host", "h"];
+            list.extend_from_slice(url_flags);
+            parse(&args(&list))
+        };
+        let Ok(Command::Sse(a)) = with(&["--url-file", file_arg]) else {
+            panic!("--url-file refused")
+        };
+        assert_eq!(format!("{:?}", a.url), "http://127.0.0.1:5053/…");
+        assert_eq!(a.url.base_path(), "/key-hunter2");
+
+        let both = with(&["--url-file", file_arg, "--url", "http://127.0.0.1:5053"]);
+        assert!(both.unwrap_err().contains("--url or --url-file"));
+        let twice = with(&["--url-file", file_arg, "--url-file", file_arg]);
+        assert!(twice.unwrap_err().contains("--url or --url-file"));
+        let neither = with(&[]).unwrap_err();
+        assert!(
+            neither.contains("--url or --url-file is required"),
+            "{neither}"
+        );
+
+        // A file others may read is refused, naming the file and never the URL in it.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (code, _, err) = run_args(&[
+            "sse",
+            "--network",
+            "hoodi",
+            "--url-file",
+            file_arg,
+            "--out",
+            "/x",
+            "--host",
+            "h",
+        ]);
+        assert_eq!(code, EXIT_USAGE);
+        assert!(
+            err.contains(&format!("--url-file: {file_arg}: group or others")),
+            "{err}"
+        );
+        assert!(!err.contains("hunter2"), "{err}");
+    }
+
+    #[test]
     fn a_keyed_path_never_appears_in_stderr() {
         const KEYED: &str = "http://127.0.0.1:5052/hunter2";
         let flag = format!("--url={KEYED}");
@@ -716,9 +798,17 @@ mod tests {
     const STREAM: &str = "event: block_gossip\ndata: {\"slot\":\"3\",\"block\":\"0x1111111111111111111111111111111111111111111111111111111111111111\"}\n\n";
 
     async fn node(genesis: &'static str) -> FixtureServer {
+        node_on(genesis, "hoodi").await
+    }
+
+    /// A node whose spec says `CONFIG_NAME: config_name`.
+    async fn node_on(genesis: &'static str, config_name: &'static str) -> FixtureServer {
         FixtureServer::start(move |_, path| match path {
             "/eth/v1/beacon/genesis" => {
                 Reply::json(&format!(r#"{{"data":{{"genesis_time":"{genesis}"}}}}"#))
+            }
+            "/eth/v1/config/spec" => {
+                Reply::json(&format!(r#"{{"data":{{"CONFIG_NAME":"{config_name}"}}}}"#))
             }
             "/eth/v1/events" => Reply::stream(vec![STREAM], true),
             _ => Reply::status(404),
@@ -771,6 +861,41 @@ mod tests {
             Command::Sse(a) => *a,
             _ => unreachable!(),
         }
+    }
+
+    #[tokio::test]
+    async fn sse_refuses_a_node_on_another_network() {
+        let dir = tempfile::tempdir().unwrap();
+        // Hoodi pins no genesis, so on a host that runs both, the Sepolia node's port is caught
+        // by its CONFIG_NAME only.
+        let server = node_on("1655733600", "sepolia").await;
+        let (code, out, err) =
+            capture(&parsed(&format!("http://{}", server.addr), dir.path())).await;
+        assert_eq!(code, EXIT_FAILED);
+        assert!(out.is_empty(), "{out}");
+        assert!(
+            err.contains("the node's CONFIG_NAME is sepolia, not hoodi"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        // A name that is no network of ours is refused without being quoted.
+        let server = node_on("1742213400", "devnet7").await;
+        let (code, _, err) = capture(&parsed(&format!("http://{}", server.addr), dir.path())).await;
+        assert_eq!(code, EXIT_FAILED);
+        assert!(err.contains("the node's CONFIG_NAME is not hoodi"), "{err}");
+        assert!(!err.contains("devnet7"), "{err}");
+
+        // A node without the spec endpoint is refused too: fail closed.
+        let server = FixtureServer::start(|_, path| match path {
+            "/eth/v1/beacon/genesis" => Reply::json(r#"{"data":{"genesis_time":"1742213400"}}"#),
+            _ => Reply::status(404),
+        })
+        .await;
+        let (code, _, err) = capture(&parsed(&format!("http://{}", server.addr), dir.path())).await;
+        assert_eq!(code, EXIT_FAILED);
+        assert!(err.contains("spec: /eth/v1/config/spec: HTTP 404"), "{err}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
@@ -908,6 +1033,7 @@ mod tests {
         // The node streams an event every 10 ms and never stops; nothing sends a stop.
         let server = FixtureServer::start(move |_, path| match path {
             "/eth/v1/beacon/genesis" => Reply::json(r#"{"data":{"genesis_time":"1742213400"}}"#),
+            "/eth/v1/config/spec" => Reply::json(r#"{"data":{"CONFIG_NAME":"hoodi"}}"#),
             _ => Reply::stream(vec![STREAM; 10_000], true).paced(Duration::from_millis(10)),
         })
         .await;
