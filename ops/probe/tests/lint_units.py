@@ -31,9 +31,13 @@ messages. Each unit must, in its [Service] section unless noted:
 Fail-closed reading: a unit file may hold only tab, newline and printable ASCII bytes, no
 backslash, and no line that is not blank, a comment, a [section] header or a key=value inside
 a section; anything else refuses the whole file, so there is no continuation, escape or exotic
-line end to model. No `*.d` drop-in directory may sit in DIR. Of systemd's syntax the lint then
-models only `#`/`;` comments, an empty assignment resetting a list setting (and a single-valued
-one to its default), and the last assignment of a single-valued setting winning.
+line end to model. No line may be LINE_MAX (1 MiB) bytes or longer, which systemd refuses
+(ENOBUFS) before it skips a comment, so the unit would not load, and no file may exceed
+FILE_MAX (64 KiB), far below that. No `*.d` drop-in directory and no `*.service` other than
+the three may sit in DIR (an install by glob would pick it up unlinted). Of systemd's syntax
+the lint then models only `#`/`;` comments, an empty assignment resetting a list setting (and
+a single-valued one to its default), and the last assignment of a single-valued setting
+winning.
 
 Exit: 0 every rule holds (prints "ok: 3 units"), 1 a rule fails (one line per finding,
 "<unit>: <finding>"), 2 usage or an unreadable DIR.
@@ -50,6 +54,12 @@ UNITS = {
     "ethswarm-chain.service": {"user": "ethswarm-chain", "node_key": False},
 }
 CREDENTIAL = "nodekey"
+# systemd 257 reads unit files with read_line(LONG_LINE_MAX = 1 MiB) and refuses the whole file
+# on a line of that length or more, before its comment check.
+LINE_MAX = 1024 * 1024
+# A unit file's size cap: the committed units are under 3 KiB; this keeps any line far below
+# LINE_MAX.
+FILE_MAX = 64 * 1024
 TRUE = {"yes", "y", "true", "t", "on", "1"}
 FAMILIES = {"AF_UNIX", "AF_INET", "AF_INET6"}
 # Settings whose assignments accumulate, and which an empty assignment resets.
@@ -347,12 +357,20 @@ def check_bytes(blob):
     could read differently from this lint. Allowed bytes are tab, newline and printable ASCII
     (so no NUL, which systemd reads as a line end, no CR, VT, FF, U+2028 or other byte that
     Python's line splitting treats as a line end, and no non-ASCII), and no backslash (so no
-    continuation and no escape). Each other line must be blank, a comment, a [section] header
-    or a key=value inside a section."""
+    continuation and no escape). The file is at most FILE_MAX bytes and no line (newline not
+    counted) LINE_MAX bytes or more, which systemd refuses. Each other line must be blank, a
+    comment, a [section] header or a key=value inside a section."""
     found = []
+    if len(blob) > FILE_MAX:
+        found.append("%d bytes, over the %d-byte cap for a unit file; refused"
+                     % (len(blob), FILE_MAX))
     allowed = {0x09, 0x0A} | set(range(0x20, 0x7F))
     in_section = False
     for number, line in enumerate(blob.split(b"\n"), start=1):
+        if len(line) >= LINE_MAX:
+            found.append("line %d: %d bytes, systemd refuses a line of %d or more; refused"
+                         % (number, len(line), LINE_MAX))
+            continue
         bad = sorted({b for b in line if b not in allowed})
         if bad:
             found.append("line %d: byte%s %s outside tab, newline and printable ASCII; refused"
@@ -654,10 +672,14 @@ def main(argv):
         return 2
     findings = []
     # Drop-ins (<unit>.d/*.conf, or any *.d next to the units) would change the units behind
-    # this lint's back; the host's own drop-in directories are the host check's.
+    # this lint's back; the host's own drop-in directories are the host check's. Any other
+    # *.service here is not linted, and an install by glob would put it on the host.
     for entry in sorted(os.listdir(argv[1])):
         if entry.endswith(".d"):
             findings.append("%s: a drop-in directory next to the units; refused" % entry)
+        elif entry.endswith(".service") and entry not in UNITS:
+            findings.append("%s: not one of the %d probe units, so not linted; refused"
+                            % (entry, len(UNITS)))
     for name, rules in sorted(UNITS.items()):
         path = os.path.join(argv[1], name)
         if not os.path.isfile(path):

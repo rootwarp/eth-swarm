@@ -345,11 +345,74 @@ expect 1 "a backslash in a comment fails" "ethswarm-chain.service: line [0-9]+: 
 d=$(variant backslash-value); raw "$d" ethswarm-chain.service "[Install]" "SyslogIdentifier=a\\\\b\n"
 expect 1 "a backslash in a value fails" "ethswarm-chain.service: line [0-9]+: .*backslash" "$d"
 
+# --- sizes: systemd refuses a line of 1 MiB or more (ENOBUFS) before it skips a comment ---------
+
+# comment <dir> <unit> <bytes>: append one `#` comment line of exactly <bytes> bytes (newline not
+# counted) to <dir>/<unit>.
+comment() {
+  python3 -I - "$1/$2" "$3" <<'PY'
+import sys
+path, size = sys.argv[1], int(sys.argv[2])
+with open(path, "ab") as f:
+    f.write(b"#" + b"x" * (size - 1) + b"\n")
+PY
+}
+# fill <dir> <unit> <bytes>: append one comment line so that <dir>/<unit> is exactly <bytes> long.
+fill() {
+  comment "$1" "$2" $(($3 - $(wc -c < "$1/$2") - 1))
+}
+# expect_without <description> <pattern> <dir>: the lint's output has no line matching <pattern>.
+expect_without() {
+  local desc=$1 pattern=$2 dir=$3 out
+  out=$("${lint[@]}" "$dir" 2>&1) || true
+  if printf '%s\n' "$out" | grep -Eq -- "$pattern"; then
+    bad "$desc (a line matches /$pattern/)" "$out"
+  else
+    ok "$desc"
+  fi
+}
+
+d=$(variant line-at-limit); comment "$d" ethswarm-p2p.service 1048576
+expect 1 "a comment line of 1048576 bytes fails" \
+  "ethswarm-p2p.service: line [0-9]+: 1048576 bytes, systemd refuses a line of 1048576 or more" "$d"
+d=$(variant line-over-limit); comment "$d" ethswarm-chain.service 1048577
+expect 1 "a comment line of 1048577 bytes fails" "ethswarm-chain.service: line [0-9]+: 1048577 bytes" "$d"
+d=$(variant line-below-limit); comment "$d" ethswarm-p2p.service 1048575
+expect 1 "a comment line of 1048575 bytes fails on the file size" \
+  "ethswarm-p2p.service: [0-9]+ bytes, over the 65536-byte cap" "$d"
+expect_without "a comment line of 1048575 bytes is not a long line" "line [0-9]+: [0-9]+ bytes" "$d"
+d=$(variant file-at-cap); fill "$d" ethswarm-discv5.service 65536
+expect 0 "a unit of exactly 65536 bytes passes" "^ok: 3 units" "$d"
+d=$(variant file-over-cap); fill "$d" ethswarm-discv5.service 65537
+expect 1 "a unit of 65537 bytes fails" \
+  "ethswarm-discv5.service: 65537 bytes, over the 65536-byte cap" "$d"
+expect_without "a unit of 65537 bytes has no long line" "line [0-9]+: [0-9]+ bytes" "$d"
+
 # Drop-ins would change the units behind the lint's back: none may sit next to them.
 for dropin in ethswarm-p2p.service.d ethswarm-chain.service.d other.d; do
   d=$(variant "dropin-$dropin"); mkdir "$d/$dropin"
   expect 1 "a drop-in directory $dropin fails" "$dropin: .*drop-in" "$d"
 done
+
+# Only the three pinned units: any other *.service next to them would be installed unlinted.
+for extra in ethswarm-extra.service ethswarm-p2p.service.bak.service other.service; do
+  d=$(variant "extra-$extra"); cp "$d/ethswarm-chain.service" "$d/$extra"
+  expect 1 "an extra unit $extra fails" "^$extra: not one of the 3 probe units" "$d"
+done
+d=$(variant extra-other-file); printf 'notes\n' > "$d/NOTES.md"
+expect 0 "a file that is not a unit passes" "^ok: 3 units" "$d"
+
+# The README installs exactly the three units, by name: a glob would install an unlinted one.
+install_line=$(grep -E '^install .*/etc/systemd/system/' "$probe/README.md" || true)
+if [[ -n $install_line && $install_line != *'*'* && $install_line != *'{'* ]] \
+  && [[ $install_line == *" ops/probe/ethswarm-p2p.service "* ]] \
+  && [[ $install_line == *" ops/probe/ethswarm-discv5.service "* ]] \
+  && [[ $install_line == *" ops/probe/ethswarm-chain.service "* ]] \
+  && (($(printf '%s\n' "$install_line" | grep -o '\.service' | wc -l) == 3)); then
+  ok "the README installs the three units by name"
+else
+  bad "the README installs the three units by name" "${install_line:-(no install line)}"
+fi
 
 # --- a key allow-list per section: only what the committed units use ----------------------------
 

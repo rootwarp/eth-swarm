@@ -1,7 +1,7 @@
 //! `cl-discv5`: serves `ethswarm.discv5.v1`, peer discovery.
 //!
-//! - [`enr`]: the local record with `eth2`, `cgc` and `nfd`, and the fields of a remote one.
-//! - [`key`]: the node key from a 0600 credential file.
+//! - [`enr`]: the local record with `eth2`, `cgc` and `nfd`, and the fields of a remote one;
+//!   [`enr::signing_key`] turns the node key the `node-key` crate loads into the record's key.
 //! - [`service`]: discv5 with the routing-table IP rules and lookups filtered by fork digest.
 //!
 //! The gRPC service is a stub. Every RPC runs the `ipc` contract layer first (hello
@@ -10,7 +10,6 @@
 //! `tests/contract.rs` runs the contract suite against it, in process and over a Unix socket.
 
 pub mod enr;
-pub mod key;
 pub mod service;
 
 use ethswarm_proto::discv5 as pb;

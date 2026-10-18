@@ -6,6 +6,7 @@
 //! encodings live in [`p2p_wire::enr`], which has no `enr` dependency, so this module only
 //! moves them in and out of the record's RLP string values.
 //!
+//! - [`signing_key`]: the node key from `node-key` (the systemd credential) as the record's key.
 //! - [`build_local_enr`]: the signed local record, from the BPO-aware [`ForkFields`].
 //! - [`EnrFields::read`]: the fields of a decoded record. [`parse_enr_fields`] is the same from
 //!   untrusted RLP bytes (signature checked by `enr`, at most 300 bytes, no trailing bytes), the
@@ -55,6 +56,22 @@ pub enum BuildError {
     /// `enr` refused the record (over 300 bytes, or signing failed).
     #[error("cannot build the local ENR: {0}")]
     Enr(String),
+}
+
+/// Why the node key cannot sign the local record. It carries no key bytes.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum KeyError {
+    /// `enr` refused the secret as a secp256k1 key.
+    #[error("the node key is not a secp256k1 secret key")]
+    NotSecp256k1,
+}
+
+/// The node key, loaded by `node-key` from the systemd credential `nodekey`, as the key the
+/// local record is signed with and `Discv5::new` takes. The secret is consumed: its buffer is
+/// wiped on drop, and `CombinedKey` has no `Debug`, so the key cannot be printed.
+pub fn signing_key(mut secret: node_key::NodeKeySecret) -> Result<CombinedKey, KeyError> {
+    CombinedKey::secp256k1_from_bytes(secret.expose_secret_mut())
+        .map_err(|_| KeyError::NotSecp256k1)
 }
 
 /// The signed local record: `ip` (unless unspecified), `tcp`, `udp`, `eth2`, `cgc` and `nfd`.
@@ -156,9 +173,47 @@ fn value(enr: &Enr, key: &'static str) -> Result<Option<Bytes>, FieldError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use enr::EnrKey;
     use network_config::{ChainConfig, Network};
     use p2p_wire::enr::ForkFields;
     use std::net::Ipv4Addr;
+
+    /// The node key as `node-key` hands it over: an owner-only credential in a credentials
+    /// directory, loaded for the UID that owns it.
+    fn node_key_secret(bytes: &[u8; 32]) -> node_key::NodeKeySecret {
+        use std::io::Write as _;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(node_key::CREDENTIAL);
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let owner = std::fs::metadata(&path).unwrap().uid();
+        node_key::load(
+            Some(dir.path().as_os_str()),
+            owner,
+            "ethswarm-discv5.service",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_node_key_signs_the_local_record() {
+        let key = signing_key(node_key_secret(&[7; 32])).unwrap();
+        let want = CombinedKey::secp256k1_from_bytes(&mut [7; 32]).unwrap();
+        assert_eq!(key.public(), want.public());
+        assert_eq!(key.encode(), want.encode());
+        let enr = build_local_enr(
+            &key,
+            &sepolia_fields(274_175),
+            4,
+            &LocalAddr::new(Ipv4Addr::UNSPECIFIED),
+        )
+        .unwrap();
+        assert_eq!(enr.public_key(), want.public());
+    }
 
     fn sepolia_fields(epoch: u64) -> ForkFields {
         let config = ChainConfig::load(Network::Sepolia).unwrap();

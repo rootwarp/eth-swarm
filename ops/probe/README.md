@@ -21,7 +21,8 @@ install -d -m 0700 /etc/ethswarm/credentials
 # The 32-byte secp256k1 secret, root-owned.
 install -m 0600 node.key /etc/ethswarm/credentials/nodekey
 install -m 0600 anchor-check.env /etc/ethswarm/anchor-check.env
-install -m 0644 ops/probe/ethswarm-*.service /etc/systemd/system/
+# The three units by name, never a glob: only these three are linted.
+install -m 0644 ops/probe/ethswarm-p2p.service ops/probe/ethswarm-discv5.service ops/probe/ethswarm-chain.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now ethswarm-chain ethswarm-discv5 ethswarm-p2p
 ```
 
@@ -116,9 +117,12 @@ backslash or a bare `;` word: systemd unquotes, unescapes and splits those befor
 prefixes, so they could hide one. It reads each unit as bytes and refuses the whole file on any
 byte outside tab, newline and printable ASCII (NUL, CR, VT, FF, U+2028 and every other
 non-ASCII byte), on any backslash (so no continuation or escape exists to model), and on any
-line that is not blank, a comment, a `[section]` or a `key=value` inside a section. It also
-refuses any `*.d` drop-in directory next to the units: it checks the files in this directory
-only, not what a host adds.
+line that is not blank, a comment, a `[section]` or a `key=value` inside a section. It refuses
+a unit over 64 KiB, and any line of 1 MiB (1,048,576 bytes) or more: systemd refuses such a
+line before it checks for a comment, so the unit would fail to load ("No buffer space
+available"). It also refuses any `*.d` drop-in directory next to the units, and any
+`*.service` other than the three: it checks the files in this directory only, not what a host
+adds.
 
 ## Not covered here
 
