@@ -7,8 +7,9 @@
 //!
 //! [`probe`] is probe mode: its Status (`ReqRespService/GetStatus`: the wall-clock fork digest
 //! and the reference Beacon API's finalized checkpoint, with the last good value kept through an
-//! outage) and the storage contract for gossip column sidecars (reference root, KZG through
-//! cl-verify, custody; anything else dropped).
+//! outage), the storage contract for gossip column sidecars (reference root, KZG through
+//! cl-verify, custody; anything else dropped) and the forward-only column store behind it
+//! (bounded queues, every column reported IGNORE, so none is re-broadcast).
 //!
 //! [`verify`] is cl-chain's side of `ethswarm.verify.v1`: cl-chain never runs BLS or KZG itself.
 //!

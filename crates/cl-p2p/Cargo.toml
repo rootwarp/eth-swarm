@@ -70,3 +70,8 @@ ethereum_ssz.workspace = true
 bs58 = "0.5"
 # limits::outbound_semaphore_proptest; the version cl-verify-cache already uses.
 proptest = "1"
+# gossip::tests::custody_columns: cl-chain's custody column store behind the ignore-all
+# gossipsub, on a temp column env. Test-only: the binaries link no store
+# (scripts/check-m2a-deps.sh reads the normal dependencies).
+cl-chain = { path = "../cl-chain" }
+cl-chain-columns = { path = "../cl-chain-columns" }

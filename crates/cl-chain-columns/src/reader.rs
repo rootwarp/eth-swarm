@@ -8,7 +8,7 @@ use crate::{
     keys::{
         block_prefix, column_key, decode_column_key, BlockRoot, ADVERTISED_CGC_KEY,
         BLOCK_PREFIX_LEN, CGC_KEY, CGC_SET_SLOT_KEY, COLUMNS_TABLE, FINALIZED_SLOT_KEY,
-        METADATA_SEQ_KEY, META_TABLE, ROOTS_TABLE,
+        FIRST_STORED_SLOT_KEY, METADATA_SEQ_KEY, META_TABLE, ROOTS_TABLE,
     },
 };
 
@@ -115,6 +115,14 @@ impl ColumnReader {
     pub fn finalized_slot(&self) -> Result<Option<u64>> {
         let txn = self.db.begin_ro_txn()?;
         meta_u64(&txn, FINALIZED_SLOT_KEY)
+    }
+
+    /// The lowest slot any column was ever stored at, `None` before the first column. Written in
+    /// the transaction that stores that column, so it survives any crash together with it; pruning
+    /// never moves it.
+    pub fn first_stored_slot(&self) -> Result<Option<u64>> {
+        let txn = self.db.begin_ro_txn()?;
+        meta_u64(&txn, FIRST_STORED_SLOT_KEY)
     }
 
     /// Number of stored columns across all blocks.

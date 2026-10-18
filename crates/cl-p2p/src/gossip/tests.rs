@@ -267,7 +267,7 @@ impl Probe {
 /// the taps see a node that does forward.
 async fn spawn_forwarder() -> (Center, Registry) {
     let mut registry = Registry::default();
-    let mut swarm = gossip_swarm(None, &mut registry);
+    let mut swarm = gossip_swarm(None, &mut registry, &ident_topic());
     swarm.listen_on(loopback()).unwrap();
     let answer = |swarm: &mut Swarm<gossipsub::Behaviour<WireTransform>>, query| match query {
         Query::Topics(reply) => {
@@ -499,11 +499,12 @@ fn tapped_transport(key: &Keypair, taps: Taps) -> PeerTransport {
     )
 }
 
-/// A default (forwarding) gossipsub node on the test topic: StrictNoSign and the Altair
-/// message-id like the probe, so ids agree, but no manual validation. Tapped if `taps` is set.
+/// A default (forwarding) gossipsub node on `topic`: StrictNoSign and the Altair message-id
+/// like the probe, so ids agree, but no manual validation. Tapped if `taps` is set.
 fn gossip_swarm(
     taps: Option<Taps>,
     registry: &mut Registry,
+    topic: &IdentTopic,
 ) -> Swarm<gossipsub::Behaviour<WireTransform>> {
     let config = gossipsub::ConfigBuilder::default()
         .validation_mode(gossipsub::ValidationMode::Anonymous)
@@ -518,12 +519,12 @@ fn gossip_swarm(
         config,
         WireTransform::new(
             SnappyTransform::new(caps()),
-            [ident_topic().hash()].into_iter().collect(),
+            [topic.hash()].into_iter().collect(),
         ),
     )
     .unwrap()
     .with_metrics(registry, gossipsub::MetricsConfig::default());
-    behaviour.subscribe(&ident_topic()).unwrap();
+    behaviour.subscribe(topic).unwrap();
     let builder = SwarmBuilder::with_existing_identity(Keypair::generate_secp256k1()).with_tokio();
     match taps {
         Some(taps) => builder
@@ -553,7 +554,7 @@ enum Cmd {
     Mesh(oneshot::Sender<Vec<PeerId>>),
 }
 
-/// A forwarding gossipsub neighbour on its own task, its transport tapped.
+/// A forwarding gossipsub neighbour on its own task, its transport tapped, on one topic.
 pub(super) struct Neighbour {
     pub peer: PeerId,
     addr: Multiaddr,
@@ -563,10 +564,17 @@ pub(super) struct Neighbour {
 }
 
 impl Neighbour {
+    /// A neighbour on the test topic.
     pub(super) async fn spawn() -> Self {
+        Self::spawn_on(topic()).await
+    }
+
+    /// A neighbour subscribed to `topic`, publishing there.
+    pub(super) async fn spawn_on(topic: GossipTopic) -> Self {
+        let topic = IdentTopic::new(topic.to_string());
         let taps: Taps = Arc::default();
         let mut registry = Registry::default();
-        let mut swarm = gossip_swarm(Some(taps.clone()), &mut registry);
+        let mut swarm = gossip_swarm(Some(taps.clone()), &mut registry, &topic);
         swarm.listen_on(loopback()).unwrap();
         let addr = loop {
             if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
@@ -583,12 +591,12 @@ impl Neighbour {
                         Some(Cmd::Publish(ssz, reply)) => {
                             let result = swarm
                                 .behaviour_mut()
-                                .publish(ident_topic(), ssz)
+                                .publish(topic.clone(), ssz)
                                 .map_err(|e| e.to_string());
                             let _ = reply.send(result);
                         }
                         Some(Cmd::Mesh(reply)) => {
-                            let hash = ident_topic().hash();
+                            let hash = topic.hash();
                             let _ = reply.send(swarm.behaviour().mesh_peers(&hash).copied().collect());
                         }
                         None => return,
@@ -1523,4 +1531,285 @@ async fn ihave_gets_no_iwant() {
         1,
         "the pushed marker is counted"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Storing custody columns.
+
+/// The probe on a custody column subnet, with cl-chain's column store
+/// (`cl_chain::probe::ColumnIngest`) behind it: every message is reported IGNORE, and its
+/// decoded sidecar goes from the capture tap to the store, as cl-p2p hands sidecars to cl-chain.
+/// The reference node and cl-verify are stubs (the storage contract is tested in cl-chain).
+mod custody_columns {
+    use super::*;
+    use cl_chain::da::custody::{Advertise, Custody, EnrCgc, EnrError};
+    use cl_chain::probe::{
+        ApiError, BlockApi, Checkpoint, ColumnContract, ColumnIngest, ColumnMetrics, GossipColumn,
+        Header, IngestLimits, QueueMetrics, RefLimits, RefView, ReferenceApi, Root,
+    };
+    use cl_chain::verify::client::{KzgOutcome, KzgVerifier};
+    use cl_chain_columns::ColumnWriter;
+    use consensus_types::primitives::U256;
+    use consensus_types::{forked, gloas, ForkSchedule};
+    use ethswarm_proto::common::Verdict;
+    use ethswarm_proto::verify::KzgCellProof;
+    use ssz::Encode as _;
+    use std::collections::HashMap;
+    use tree_hash::TreeHash as _;
+
+    /// A custody column of node `U256::MAX` (columns 1, 47, 87 and 102), on its own subnet.
+    const COLUMN: u64 = 47;
+    /// Blocks whose column each neighbour publishes.
+    const PER_NEIGHBOUR: usize = 4;
+
+    /// The ENR is not under test here.
+    struct NoEnr;
+
+    impl EnrCgc for NoEnr {
+        fn set_cgc(&mut self, _: u64) -> Result<(), EnrError> {
+            Ok(())
+        }
+    }
+
+    /// cl-verify that verifies every batch.
+    struct Valid;
+
+    impl KzgVerifier for Valid {
+        async fn verify_cells(&self, _: Vec<KzgCellProof>, _: Duration) -> KzgOutcome {
+            KzgOutcome::Valid
+        }
+    }
+
+    /// A reference node that vouches for its blocks: root → (slot, SSZ).
+    struct Reference(HashMap<Root, (u64, Vec<u8>)>);
+
+    impl ReferenceApi for Reference {
+        async fn finalized_checkpoint(&self) -> Result<Checkpoint, ApiError> {
+            Err(ApiError("not used".into()))
+        }
+
+        async fn header(&self, root: Root) -> Result<Header, ApiError> {
+            let (slot, _) = self.0.get(&root).ok_or_else(|| ApiError("404".into()))?;
+            Ok(Header { root, slot: *slot })
+        }
+    }
+
+    impl BlockApi for Reference {
+        async fn block(&self, root: Root) -> Result<Vec<u8>, ApiError> {
+            let (_, ssz) = self.0.get(&root).ok_or_else(|| ApiError("404".into()))?;
+            Ok(ssz.clone())
+        }
+    }
+
+    /// Gloas from epoch 1 (slot 32), Fulu before.
+    fn schedule() -> ForkSchedule {
+        use network_config::ScheduledFork;
+        ForkSchedule::new(
+            ScheduledFork {
+                version: [0x06, 0, 0, 0],
+                epoch: 0,
+            },
+            ScheduledFork {
+                version: [0x07, 0, 0, 0],
+                epoch: 1,
+            },
+        )
+        .unwrap()
+    }
+
+    /// The Gloas block at `slot` whose bid commits to one blob: its root and SSZ.
+    fn block(slot: u64) -> (Root, Vec<u8>) {
+        let mut block = p2p_wire::testkit::gloas_block::<Mainnet>(slot);
+        let bid = &mut block.message.body.signed_execution_payload_bid.message;
+        bid.blob_kzg_commitments = vec![[0xc0; 48]].try_into().unwrap();
+        (block.message.tree_hash_root().0, block.as_ssz_bytes())
+    }
+
+    /// The SSZ of column [`COLUMN`] of the block at `slot`.
+    fn sidecar(slot: u64) -> Vec<u8> {
+        let (root, _) = block(slot);
+        gloas::DataColumnSidecar::<Mainnet> {
+            index: COLUMN,
+            column: vec![vec![slot as u8; 2048].try_into().unwrap()]
+                .try_into()
+                .unwrap(),
+            kzg_proofs: vec![[0x0b; 48]].try_into().unwrap(),
+            slot,
+            beacon_block_root: root.into(),
+        }
+        .as_ssz_bytes()
+    }
+
+    /// Three forwarding neighbours and the scripted peer on a custody column subnet, around the
+    /// probe. The neighbours publish that column of twelve blocks, each message reaching the
+    /// probe through every neighbour, and every one is stored; the scripted peer then asks
+    /// IWANT for each, now and again after more than `mcache_len` heartbeats. The probe
+    /// sends no data message on the subnet (or anywhere), while the same taps see the
+    /// neighbours forward to each other.
+    #[tokio::test]
+    async fn storing_custody_columns_sends_no_data() {
+        let probe = Probe::spawn(64).await;
+        let center = &probe.center;
+        let subnet = GossipTopic::new(
+            topic().fork_digest,
+            GossipKind::DataColumnSidecar { subnet_id: COLUMN },
+        );
+        let name = subnet.to_string();
+        assert_eq!(center.subscribe(vec![subnet]).await, 1);
+
+        // cl-chain's store, custodying column 47 from slot 0.
+        let slots: Vec<u64> = (0..3 * PER_NEIGHBOUR as u64).map(|i| 40 + i).collect();
+        let reference = Reference(
+            slots
+                .iter()
+                .map(|&slot| {
+                    let (root, ssz) = block(slot);
+                    (root, (slot, ssz))
+                })
+                .collect(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+        let custody = Custody::open(
+            Arc::clone(&writer),
+            NoEnr,
+            U256::MAX,
+            Advertise::Withheld,
+            0,
+        )
+        .unwrap();
+        assert!(custody.custody_columns().contains(&COLUMN));
+        let mut registry = Registry::default();
+        let contract = ColumnContract {
+            kzg: Valid,
+            verify_timeout: Duration::from_secs(5),
+            metrics: ColumnMetrics::register(&mut registry),
+        };
+        let ingest = ColumnIngest::start(
+            RefView::<_, Mainnet>::new(reference, schedule(), RefLimits::default()),
+            custody,
+            contract,
+            Arc::clone(&writer),
+            IngestLimits::default(),
+            QueueMetrics::register(&mut registry),
+        )
+        .unwrap();
+
+        let mut neighbours = Vec::new();
+        for _ in 0..3 {
+            neighbours.push(Neighbour::spawn_on(subnet).await);
+        }
+        for (i, n) in neighbours.iter().enumerate() {
+            n.dial(center.addr.clone());
+            for other in &neighbours[i + 1..] {
+                n.dial(other.addr.clone());
+            }
+        }
+        let mut scripted = Scripted::connect(&center.addr).await;
+        scripted.send(&rpc::subscribe(&name)).await;
+        scripted.send(&rpc::graft(&name)).await;
+        for n in &neighbours {
+            n.wait_for_mesh_with(center.peer).await;
+            for other in &neighbours {
+                if other.peer != n.peer {
+                    n.wait_for_mesh_with(other.peer).await;
+                }
+            }
+        }
+
+        let mut ids = Vec::new();
+        for (n, slots) in neighbours.iter().zip(slots.chunks(PER_NEIGHBOUR)) {
+            for &slot in slots {
+                ids.push(n.publish(sidecar(slot)).await);
+            }
+        }
+        let caps = NetworkCaps::from_blob_schedule(21, &[]);
+        let schedule = schedule();
+        let mut handed = 0;
+        eventually("every column to be stored", || {
+            while let Some(captured) = probe.capture.try_next() {
+                let decoded = forked::DataColumnSidecar::<Mainnet>::from_ssz_bytes_by_slot(
+                    &captured.data,
+                    &schedule,
+                    &caps,
+                );
+                let Ok(forked::DataColumnSidecar::Gloas(sidecar)) = decoded else {
+                    panic!("not a Gloas sidecar: {decoded:?}");
+                };
+                let kind = GossipTopic::parse(&captured.topic).unwrap().kind;
+                let GossipKind::DataColumnSidecar { subnet_id } = kind else {
+                    panic!("not a column subnet: {kind:?}");
+                };
+                let column = GossipColumn { sidecar, subnet_id };
+                assert_eq!(ingest.on_column(column), Verdict::Ignore);
+                handed += 1;
+            }
+            let stored = writer.reader().column_count().unwrap();
+            (ingest.pending() == 0 && stored == slots.len() as u64).then_some(())
+        })
+        .await;
+        for &slot in &slots {
+            let stored = writer.reader().get(&block(slot).0, COLUMN).unwrap();
+            assert_eq!(stored, Some(sidecar(slot)), "slot {slot}");
+        }
+
+        // IWANT every stored column now, and again after more than mcache_len heartbeats, as
+        // run_scenarios does.
+        let wanted: Vec<&[u8]> = ids.iter().map(|id| &id.0[..]).collect();
+        scripted.send(&rpc::iwant(wanted.clone())).await;
+        let heartbeats = || probe.metrics().sum("heartbeat_duration_count");
+        let start = heartbeats();
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while heartbeats() <= start + MCACHE_LEN as u64 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the probe's heartbeat stalled"
+            );
+            scripted.send(&rpc::subscribe(&name)).await;
+            tokio::time::sleep(HEARTBEAT / 4).await;
+        }
+        scripted.send(&rpc::iwant(wanted)).await;
+        tokio::time::sleep(HEARTBEAT * 5).await;
+
+        let (traffic, from_probe) = eventually("every tap to end on a frame boundary", || {
+            let n: Result<Vec<_>, _> = neighbours.iter().map(|n| n.traffic(center.peer)).collect();
+            Some((n.ok()?, scripted.traffic().ok()?))
+        })
+        .await;
+        for (i, n) in traffic.iter().enumerate() {
+            assert_eq!(
+                (n.from_center.publish_msgs, n.from_center.publish_bytes),
+                (0, 0),
+                "neighbour {i} received column data from the probe: {n:?}"
+            );
+            assert!(n.from_center.frames > 0, "neighbour {i}: no probe traffic");
+            assert!(
+                n.from_neighbours.publish_bytes > 0,
+                "neighbour {i}: the tap saw no forwards between neighbours"
+            );
+        }
+        assert_eq!(
+            (
+                from_probe.publish_msgs,
+                from_probe.publish_bytes,
+                from_probe.ihave_ids
+            ),
+            (0, 0, 0),
+            "{from_probe:?}"
+        );
+        assert!(from_probe.frames > 0, "the scripted peer read nothing");
+
+        let metrics = probe.metrics();
+        for zero in ["topic_msg_sent_counts", "topic_msg_published"] {
+            assert_eq!(metrics.sum(zero), 0, "{zero}");
+        }
+        let delivered = center.delivered().len();
+        assert_eq!(delivered, slots.len(), "each column reached the probe once");
+        assert_eq!(
+            metrics.sum_matching("ignored_messages_per_topic", &name),
+            delivered as u64
+        );
+        assert_eq!(metrics.sum("accepted_messages_per_topic"), 0);
+        assert_eq!((handed, probe.capture.dropped()), (delivered, 0));
+    }
 }

@@ -1110,6 +1110,8 @@ version = "0.1.0"
 dependencies = [
  "bs58",
  "bytes",
+ "cl-chain",
+ "cl-chain-columns",
  "cl-p2p",
  "consensus-types",
  "data-encoding",

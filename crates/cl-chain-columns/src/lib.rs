@@ -11,6 +11,8 @@
 //!   finalized slot and records that slot as a watermark; later writes at or below it are
 //!   refused. [`ColumnWriter::prune_orphaned`] removes every column of orphaned block roots
 //!   after a reorg.
+//! - **First stored slot.** [`ColumnReader::first_stored_slot`] is the lowest slot any column
+//!   was ever stored at, written in the same transaction as that column; pruning leaves it.
 //! - **Custody.** The node's custody record lives in the same env for now
 //!   ([`ColumnWriter::set_custody`], [`ColumnReader::custody`]): the custody group count, which
 //!   never decreases ([`Error::CgcDecrease`]), the slot it was set at, the MetaData

@@ -10,7 +10,9 @@
 //! 2. **Subnet**: `compute_subnet_for_data_column_sidecar(index)` is the subnet it arrived on
 //!    (else `wrong_subnet`).
 //! 3. **Custody**: `index` is a column of one of our custody groups
-//!    (`compute_columns_for_custody_group` of `get_custody_groups`, else `not_custody`).
+//!    (`compute_columns_for_custody_group` of `get_custody_groups`, else `not_custody`), and
+//!    the sidecar's slot is at or after `cgc_set_slot`, the slot our custody count was set at
+//!    (else `before_cgc_set_slot`): columns are stored forward only, never backfilled.
 //! 4. **Root**: the reference node vouches for `beacon_block_root`, at the sidecar's slot
 //!    ([`RefView`], else `unknown_root`, which includes a reference that is down, slow or busy).
 //! 5. **Commitments**: the bid of that block commits to exactly as many blobs as the sidecar
@@ -20,10 +22,12 @@
 //!    `verify_cell_kzg_proof_batch` (else `kzg_invalid`). No verdict within the deadline, from a
 //!    silent, overloaded or absent cl-verify, is `verify_timeout`: dropped, never stored.
 //!
-//! The cheap local checks come first, so a column that cannot be ours never costs a reference
-//! request or a KZG check. Every drop increments `probe_column_dropped_total{reason}`
-//! ([`ColumnMetrics`]). Only a [`Verified`] column can be stored ([`store_verified`]), and only
-//! [`storage_contract`] makes one.
+//! The cheap local checks (1 to 3) come first, so a column that cannot be ours never costs a
+//! reference request or a KZG check. Every drop increments `probe_column_dropped_total{reason}`
+//! ([`ColumnMetrics`]); the column store ([`super::ColumnIngest`]) adds `root_timeout` (the
+//! root stayed unknown past its wait) and `store_failed` (the column env refused the write).
+//! Only a [`Verified`] column can be stored ([`store_verified`]), and only [`storage_contract`]
+//! makes one.
 
 use super::{BlockApi, RefView, ReferenceApi};
 use crate::da::custody::Custody;
@@ -60,17 +64,29 @@ pub enum Drop {
     WrongSubnet,
     #[error("verify_timeout")]
     VerifyTimeout,
+    /// The sidecar's slot is before `cgc_set_slot`: no backfill.
+    #[error("before_cgc_set_slot")]
+    BeforeCustodySlot,
+    /// The block root stayed unknown to the reference for the whole root wait.
+    #[error("root_timeout")]
+    RootTimeout,
+    /// The column passed the contract, but the column env did not store it.
+    #[error("store_failed")]
+    StoreFailed,
 }
 
 impl Drop {
     /// Every reason.
-    pub const ALL: [Drop; 6] = [
+    pub const ALL: [Drop; 9] = [
         Drop::UnknownRoot,
         Drop::KzgInvalid,
         Drop::CommitmentsMismatch,
         Drop::NotCustody,
         Drop::WrongSubnet,
         Drop::VerifyTimeout,
+        Drop::BeforeCustodySlot,
+        Drop::RootTimeout,
+        Drop::StoreFailed,
     ];
 
     /// The `reason` label.
@@ -83,6 +99,9 @@ impl Drop {
             Drop::NotCustody => "not_custody",
             Drop::WrongSubnet => "wrong_subnet",
             Drop::VerifyTimeout => "verify_timeout",
+            Drop::BeforeCustodySlot => "before_cgc_set_slot",
+            Drop::RootTimeout => "root_timeout",
+            Drop::StoreFailed => "store_failed",
         }
     }
 }
@@ -128,10 +147,22 @@ impl ColumnMetrics {
             .get()
     }
 
-    fn count(&self, reason: Drop) {
+    pub(crate) fn count(&self, reason: Drop) {
         self.dropped
             .get_or_create(&[("reason", reason.reason())])
             .inc();
+    }
+
+    /// Counts `column` as dropped for `reason`, and logs it.
+    pub(crate) fn drop_column<E: EthSpec>(&self, column: &GossipColumn<E>, reason: Drop) {
+        self.count(reason);
+        tracing::debug!(
+            reason = reason.reason(),
+            index = column.sidecar.index,
+            slot = column.sidecar.slot,
+            subnet = column.subnet_id,
+            "column sidecar dropped"
+        );
     }
 }
 
@@ -162,29 +193,17 @@ where
 {
     let checked = check(column, refs, custody, contract).await;
     if let Err(reason) = checked {
-        contract.metrics.count(reason);
-        tracing::debug!(
-            reason = reason.reason(),
-            index = column.sidecar.index,
-            slot = column.sidecar.slot,
-            subnet = column.subnet_id,
-            "column sidecar dropped"
-        );
+        contract.metrics.drop_column(column, reason);
     }
     checked.map(|()| Verified { column })
 }
 
-async fn check<E, A, V, S, C>(
+/// The contract's local checks, 1 to 3 of the module docs: structure, subnet and custody,
+/// forward-only included. They need no reference request and no KZG check.
+pub(crate) fn local_check<E: EthSpec, S, C>(
     column: &GossipColumn<E>,
-    refs: &RefView<A, E>,
     custody: &Custody<S, C>,
-    contract: &ColumnContract<V>,
-) -> Result<(), Drop>
-where
-    E: EthSpec,
-    A: ReferenceApi + BlockApi,
-    V: KzgVerifier,
-{
+) -> Result<(), Drop> {
     let sidecar = &column.sidecar;
     if sidecar.index >= NUMBER_OF_COLUMNS {
         return Err(Drop::NotCustody);
@@ -205,6 +224,25 @@ where
     {
         return Err(Drop::NotCustody);
     }
+    if sidecar.slot < custody.cgc_set_slot() {
+        return Err(Drop::BeforeCustodySlot);
+    }
+    Ok(())
+}
+
+async fn check<E, A, V, S, C>(
+    column: &GossipColumn<E>,
+    refs: &RefView<A, E>,
+    custody: &Custody<S, C>,
+    contract: &ColumnContract<V>,
+) -> Result<(), Drop>
+where
+    E: EthSpec,
+    A: ReferenceApi + BlockApi,
+    V: KzgVerifier,
+{
+    local_check(column, custody)?;
+    let sidecar = &column.sidecar;
     let block = refs
         .lookup(sidecar.beacon_block_root.0)
         .await

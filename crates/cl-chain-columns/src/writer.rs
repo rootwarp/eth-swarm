@@ -14,8 +14,8 @@ use crate::{
     error::{Error, Result},
     keys::{
         block_prefix, column_key, decode_column_key, BlockRoot, ADVERTISED_CGC_KEY, CGC_KEY,
-        CGC_SET_SLOT_KEY, COLUMNS_TABLE, FINALIZED_SLOT_KEY, METADATA_SEQ_KEY, META_TABLE,
-        ROOTS_TABLE,
+        CGC_SET_SLOT_KEY, COLUMNS_TABLE, FINALIZED_SLOT_KEY, FIRST_STORED_SLOT_KEY,
+        METADATA_SEQ_KEY, META_TABLE, ROOTS_TABLE,
     },
     reader::{meta_u64, scan_block, stored_slot, ColumnReader, CustodyRecord},
     sched::{Priority, TxnScheduler},
@@ -152,7 +152,9 @@ impl ColumnWriter {
     /// The batch is validated before the first transaction: at most [`NUMBER_OF_COLUMNS`]
     /// columns, each index below it and unique, each value non-empty and at most
     /// [`MAX_SIDECAR_BYTES`], and the slot above the finalized-slot watermark
-    /// ([`Error::SlotFinalized`]). A column already stored under the same key is replaced.
+    /// ([`Error::SlotFinalized`]). A column already stored under the same key is replaced. Each
+    /// transaction that stores a column below the first stored slot
+    /// ([`ColumnReader::first_stored_slot`]) also lowers it to `slot`.
     pub fn write_columns(
         &self,
         slot: u64,
@@ -379,6 +381,15 @@ fn write_chunk(
     for column in chunk {
         let key = column_key(slot, block_root, column.index);
         txn.put(&columns, key, column.ssz, WriteFlags::UPSERT)?;
+    }
+    if !chunk.is_empty() && meta_u64(txn, FIRST_STORED_SLOT_KEY)?.is_none_or(|first| slot < first) {
+        let meta = txn.open_table(Some(META_TABLE))?;
+        txn.put(
+            &meta,
+            FIRST_STORED_SLOT_KEY,
+            slot.to_be_bytes(),
+            WriteFlags::UPSERT,
+        )?;
     }
     Ok(())
 }
@@ -653,6 +664,45 @@ mod tests {
         );
         assert_eq!(reader.column_count().unwrap(), 1);
         assert_eq!(reader.block_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn the_first_stored_slot_is_the_lowest_slot_ever_written() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let writer = ColumnWriter::open(dir.path()).unwrap();
+            assert_eq!(writer.reader().first_stored_slot().unwrap(), None);
+            // An empty write stores nothing, so it sets nothing.
+            writer.write_columns(30, &ROOT_A, &[]).unwrap();
+            assert_eq!(writer.reader().first_stored_slot().unwrap(), None);
+            write_block(&writer, 20, &ROOT_A, &[1]);
+            assert_eq!(writer.reader().first_stored_slot().unwrap(), Some(20));
+            // A later slot leaves it; a refused write (another slot for a stored root) too.
+            write_block(&writer, 25, &ROOT_B, &[1, 2]);
+            assert!(writer
+                .write_columns(
+                    3,
+                    &ROOT_A,
+                    &[Column {
+                        index: 2,
+                        ssz: b"x"
+                    }]
+                )
+                .is_err());
+            assert_eq!(writer.reader().first_stored_slot().unwrap(), Some(20));
+            // A late column of an earlier slot lowers it, in the transaction that stores it.
+            let before = writer.rw_txns_committed();
+            write_block(&writer, 18, &[0xcc; 32], &[4]);
+            assert_eq!(writer.rw_txns_committed(), before + 1);
+            assert_eq!(writer.reader().first_stored_slot().unwrap(), Some(18));
+            // Pruning removes columns, never the record of where storing began.
+            writer.prune_finalized(20).unwrap();
+            writer.prune_orphaned(&[ROOT_B]).unwrap();
+            assert_eq!(writer.reader().column_count().unwrap(), 0);
+            assert_eq!(writer.reader().first_stored_slot().unwrap(), Some(18));
+        }
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        assert_eq!(writer.reader().first_stored_slot().unwrap(), Some(18));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! |--------------------|-------------------------------------------------------|-----------------------------|
 //! | [`COLUMNS_TABLE`]  | `slot (u64 BE) ‖ block_root (32) ‖ column_index (u64 BE)`, 48 bytes | SSZ `DataColumnSidecar` |
 //! | [`ROOTS_TABLE`]    | `block_root (32)`                                     | `slot (u64 BE)`             |
-//! | [`META_TABLE`]     | ASCII name: [`CGC_KEY`], [`CGC_SET_SLOT_KEY`], [`METADATA_SEQ_KEY`], [`ADVERTISED_CGC_KEY`], [`FINALIZED_SLOT_KEY`] | `u64 BE` |
+//! | [`META_TABLE`]     | ASCII name: [`CGC_KEY`], [`CGC_SET_SLOT_KEY`], [`METADATA_SEQ_KEY`], [`ADVERTISED_CGC_KEY`], [`FINALIZED_SLOT_KEY`], [`FIRST_STORED_SLOT_KEY`] | `u64 BE` |
 //!
 //! Big-endian slot first makes MDBX's lexicographic key order equal slot order, so finality
 //! pruning is one cursor walk from the first key up to the finalized slot. All columns of a block
@@ -20,7 +20,8 @@ pub const COLUMNS_TABLE: &str = "columns";
 /// Index from block root to the slot that prefixes its column keys.
 pub const ROOTS_TABLE: &str = "column_roots";
 /// Small scalar values for this env: the custody record ([`CGC_KEY`], [`CGC_SET_SLOT_KEY`],
-/// [`METADATA_SEQ_KEY`], [`ADVERTISED_CGC_KEY`]) and [`FINALIZED_SLOT_KEY`].
+/// [`METADATA_SEQ_KEY`], [`ADVERTISED_CGC_KEY`]), [`FINALIZED_SLOT_KEY`] and
+/// [`FIRST_STORED_SLOT_KEY`].
 pub const META_TABLE: &str = "meta";
 /// Every table this env holds, in creation order.
 pub const TABLES: [&str; 3] = [COLUMNS_TABLE, ROOTS_TABLE, META_TABLE];
@@ -40,6 +41,10 @@ pub const ADVERTISED_CGC_KEY: &[u8] = b"advertised_cgc";
 /// [`META_TABLE`] key of the finalized-slot watermark: the highest slot finality pruning has
 /// covered. Writes at or below it are refused, so a late write cannot undo a prune.
 pub const FINALIZED_SLOT_KEY: &[u8] = b"finalized_slot";
+/// [`META_TABLE`] key of the lowest slot any column was ever stored at, written in the
+/// transaction that stores that column. Pruning never moves it: it records where storing began,
+/// the slot Status `earliest_available_slot` is derived from.
+pub const FIRST_STORED_SLOT_KEY: &[u8] = b"first_stored_slot";
 
 /// Length of a [`column_key`].
 pub const COLUMN_KEY_LEN: usize = BLOCK_PREFIX_LEN + 8;
