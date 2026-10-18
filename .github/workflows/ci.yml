@@ -31,6 +31,8 @@ jobs:
       - run: bash scripts/check-workflows.sh
       - name: Every cargo command in a CI run step uses --locked
         run: bash scripts/tests/check-locked.test.sh && bash scripts/check-locked.sh
+      - name: Sepolia reference node scripts and compose file (offline, stub commands)
+        run: bash ops/sepolia-ref/tests/sepolia-ref.test.sh
 
   proto:
     name: buf lint, build, breaking vs develop, baseline drift

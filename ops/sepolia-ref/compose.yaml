@@ -1,0 +1,106 @@
+# Sepolia reference node: Reth (EL) and Lighthouse (CL), the M2-alpha static peer and Beacon
+# API oracle. Runbook: README.md. Values come from .env (copy .env.example; setup.sh writes the
+# ids and DATA_ROOT; preflight.sh checks it all before `docker compose up -d`).
+#
+# - network_mode: host (Linux only), so 127.0.0.1 is the host's loopback: the Engine API (8551)
+#   and the Beacon API (5052) are bound there and nowhere else, and `ss -ltnp` on the host
+#   shows the real binds. p2p: reth 30303 tcp/udp; lighthouse 9000 tcp/udp and 9001/udp (QUIC).
+# - Each service runs as its own OS user (setup.sh), on a read-only root filesystem with no
+#   capabilities and no-new-privileges, and mounts only its own data directory and its own
+#   read-only copy of the JWT secret. Bind sources are never created by docker: a missing
+#   directory or secret fails the start instead of appearing root-owned.
+# - No HTTP, WS or IPC RPC on reth; the Engine API is its only RPC.
+name: sepolia-ref
+
+x-hardening: &hardening
+  network_mode: host
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=256m
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  environment:
+    HOME: /tmp
+  logging:
+    driver: json-file
+    options:
+      max-size: 100m
+      max-file: "5"
+
+services:
+  reth:
+    <<: *hardening
+    image: ${RETH_IMAGE:?set RETH_IMAGE in .env}
+    user: "${RETH_UID:?run setup.sh}:${RETH_GID:?run setup.sh}"
+    # Reth flushes its database on SIGTERM; give it time rather than SIGKILL mid-write.
+    stop_grace_period: 5m
+    volumes:
+      - type: bind
+        source: ${DATA_ROOT:-/srv/ethswarm-ref}/reth/data
+        target: /data
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${DATA_ROOT:-/srv/ethswarm-ref}/reth/jwt.hex
+        target: /secrets/jwt.hex
+        read_only: true
+        bind: {create_host_path: false}
+    # The image's entrypoint is the reth binary. --full: pruned (the default is an archive
+    # node). File logs off: docker's json-file log is the log. discv5 off: discv4 on 30303/udp
+    # is enough, and keeps the firewall list to the ports README.md names.
+    command:
+      - node
+      - --chain=sepolia
+      - --full
+      - --datadir=/data
+      - --authrpc.addr=127.0.0.1
+      - --authrpc.port=8551
+      - --authrpc.jwtsecret=/secrets/jwt.hex
+      - --port=30303
+      - --discovery.port=30303
+      - --disable-discv5-discovery
+      - --ipcdisable
+      - --log.file.max-files=0
+
+  lighthouse:
+    <<: *hardening
+    image: ${LIGHTHOUSE_IMAGE:?set LIGHTHOUSE_IMAGE in .env}
+    user: "${LIGHTHOUSE_UID:?run setup.sh}:${LIGHTHOUSE_GID:?run setup.sh}"
+    stop_grace_period: 2m
+    depends_on:
+      - reth
+    environment:
+      HOME: /tmp
+      CHECKPOINT_SYNC_URL: ${CHECKPOINT_SYNC_URL:?set CHECKPOINT_SYNC_URL in .env}
+      TRUSTED_PEERS: ${TRUSTED_PEERS:-}
+    volumes:
+      - type: bind
+        source: ${DATA_ROOT:-/srv/ethswarm-ref}/lighthouse/data
+        target: /data
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${DATA_ROOT:-/srv/ethswarm-ref}/lighthouse/jwt.hex
+        target: /secrets/jwt.hex
+        read_only: true
+        bind: {create_host_path: false}
+    # The image has no entrypoint, and --trusted-peers must be left out entirely when
+    # TRUSTED_PEERS is empty (Lighthouse refuses an empty peer list), which a fixed argv cannot
+    # do. So the image's own bash adds it only when set, then execs Lighthouse (PID 1, signals
+    # reach it). Values arrive in the environment and are quoted, so a URL's ? or & is never
+    # split or interpreted. $$ keeps compose from interpolating them. umask 077: Lighthouse
+    # creates its node key (data/beacon/network/key) 0600, not the container default 0644.
+    # QUIC stays on its default (9001/udp); UPnP is off on a server.
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >-
+        umask 077 &&
+        exec lighthouse bn
+        --network sepolia
+        --datadir /data
+        --execution-endpoint http://127.0.0.1:8551
+        --execution-jwt /secrets/jwt.hex
+        --http --http-address 127.0.0.1 --http-port 5052
+        --port 9000
+        --disable-upnp
+        --checkpoint-sync-url "$$CHECKPOINT_SYNC_URL"
+        $${TRUSTED_PEERS:+--trusted-peers "$$TRUSTED_PEERS"}
