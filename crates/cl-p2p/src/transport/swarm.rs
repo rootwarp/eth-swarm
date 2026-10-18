@@ -8,11 +8,14 @@
 //!
 //! The swarm's owner runs its event loop and hands every event to [`PeerMetrics::observe`],
 //! which keeps `p2p_peers{direction}` and `p2p_dial_failures_total{reason}` and logs each
-//! connection. [`LogNegotiated`] logs the muxer each connection negotiated.
+//! connection. [`LogNegotiated`] logs the muxer each connection negotiated, and tells it to the
+//! [`MuxerObserver`] of [`SwarmConfig::muxer_observer`] if there is one.
 
 use super::{muxers, with_negotiating_inbound_streams, MuxerBudget, MPLEX_MAX_STREAMS};
-use crate::behaviour::{Behaviour, ConnectionCaps, ReqRespSlot};
+use crate::behaviour::{ConnectionCaps, SpecBehaviour};
 use crate::gossip::IgnoreAll;
+use crate::rpc::inbound::Control;
+use consensus_types::EthSpec;
 use libp2p::core::transport::TransportError;
 use libp2p::core::upgrade::{
     InboundConnectionUpgrade, NegotiationError, OutboundConnectionUpgrade, UpgradeInfo,
@@ -28,6 +31,7 @@ use prometheus_client::registry::Registry;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The TCP port a consensus-layer client listens and is dialed on.
@@ -76,6 +80,34 @@ pub struct SwarmConfig {
     pub caps: ConnectionCaps,
     /// Peers exempt from the connection caps: the reference node. None by default.
     pub bypass: Vec<PeerId>,
+    /// Told the muxer each connection negotiated; none by default. The log line is written
+    /// either way.
+    pub muxer_observer: Option<MuxerObserver>,
+}
+
+/// Hears the muxer protocol each connection negotiated (`/yamux/1.0.0` or `/mplex/6.7.0`) and
+/// our side of the connection ([`Direction::Outbound`] when we dialed).
+#[derive(Clone)]
+pub struct MuxerObserver(Arc<Hear>);
+
+/// What a [`MuxerObserver`] calls: the muxer protocol and our side of the connection.
+type Hear = dyn Fn(&str, Direction) + Send + Sync;
+
+impl MuxerObserver {
+    /// An observer calling `hear` for every negotiated muxer.
+    pub fn new(hear: impl Fn(&str, Direction) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(hear))
+    }
+
+    fn hear(&self, muxer: &str, side: Direction) {
+        (self.0)(muxer, side);
+    }
+}
+
+impl std::fmt::Debug for MuxerObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MuxerObserver")
+    }
 }
 
 impl SwarmConfig {
@@ -96,6 +128,7 @@ impl SwarmConfig {
             budget,
             caps: ConnectionCaps::default(),
             bypass: Vec::new(),
+            muxer_observer: None,
         }
     }
 }
@@ -115,8 +148,9 @@ pub enum BuildError {
 }
 
 /// The probe swarm for the node key `keypair`: TCP (no Nagle), Noise XX, then yamux or mplex
-/// ([`muxers`], yamux first, mplex under `cfg.budget`), [`Behaviour`] with `req_resp` in its
-/// req/resp slot and its gossipsub slot empty, listening on every `cfg.listen_addrs` address.
+/// ([`muxers`], yamux first, mplex under `cfg.budget`), [`SpecBehaviour`] with `req_resp` (of
+/// any preset) in its req/resp slot and its gossipsub slot empty, listening on every
+/// `cfg.listen_addrs` address.
 ///
 /// Must be called within a tokio runtime, which the listeners register with.
 ///
@@ -124,11 +158,11 @@ pub enum BuildError {
 ///
 /// [`BuildError::Noise`] if Noise refuses the key, [`BuildError::Listen`] if an address cannot
 /// be listened on.
-pub fn build_swarm(
+pub fn build_swarm<E: EthSpec>(
     keypair: Keypair,
     cfg: &SwarmConfig,
-    req_resp: ReqRespSlot,
-) -> Result<Swarm<Behaviour>, BuildError> {
+    req_resp: Control<E>,
+) -> Result<Swarm<SpecBehaviour<E>>, BuildError> {
     build(keypair, cfg, req_resp, None)
 }
 
@@ -137,35 +171,40 @@ pub fn build_swarm(
 /// # Errors
 ///
 /// As [`build_swarm`].
-pub fn build_swarm_with_gossip(
+pub fn build_swarm_with_gossip<E: EthSpec>(
     keypair: Keypair,
     cfg: &SwarmConfig,
-    req_resp: ReqRespSlot,
+    req_resp: Control<E>,
     gossip: IgnoreAll,
-) -> Result<Swarm<Behaviour>, BuildError> {
+) -> Result<Swarm<SpecBehaviour<E>>, BuildError> {
     build(keypair, cfg, req_resp, Some(gossip))
 }
 
-fn build(
+fn build<E: EthSpec>(
     keypair: Keypair,
     cfg: &SwarmConfig,
-    req_resp: ReqRespSlot,
+    req_resp: Control<E>,
     gossip: Option<IgnoreAll>,
-) -> Result<Swarm<Behaviour>, BuildError> {
+) -> Result<Swarm<SpecBehaviour<E>>, BuildError> {
     let (yamux, mplex) = muxers(cfg.budget.clone());
+    let (yamux_observer, mplex_observer) = (cfg.muxer_observer.clone(), cfg.muxer_observer.clone());
     let Ok(builder) = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
             tcp::Config::default().nodelay(true),
             noise::Config::new,
             (
-                move || LogNegotiated(yamux()),
-                move || LogNegotiated(mplex()),
+                move || LogNegotiated(yamux(), yamux_observer),
+                move || LogNegotiated(mplex(), mplex_observer),
             ),
         )?
         .with_behaviour(|key| {
-            let behaviour =
-                Behaviour::with_caps(key.public(), cfg.agent_version.clone(), cfg.caps, req_resp);
+            let behaviour = SpecBehaviour::with_caps(
+                key.public(),
+                cfg.agent_version.clone(),
+                cfg.caps,
+                req_resp,
+            );
             match gossip {
                 Some(gossip) => behaviour.with_gossip(gossip),
                 None => behaviour,
@@ -194,9 +233,10 @@ fn build(
     Ok(swarm)
 }
 
-/// A muxer upgrade that logs the muxer protocol multistream-select settled on, then applies it.
+/// A muxer upgrade that logs the muxer protocol multistream-select settled on, tells the
+/// observer if there is one, then applies it.
 #[derive(Clone, Debug)]
-pub struct LogNegotiated<U>(pub U);
+pub struct LogNegotiated<U>(pub U, pub Option<MuxerObserver>);
 
 impl<U: UpgradeInfo> UpgradeInfo for LogNegotiated<U> {
     type Info = U::Info;
@@ -221,6 +261,9 @@ where
             role = "listener",
             "negotiated a stream muxer"
         );
+        if let Some(observer) = &self.1 {
+            observer.hear(info.as_ref(), Direction::Inbound);
+        }
         self.0.upgrade_inbound(socket, info)
     }
 }
@@ -239,6 +282,9 @@ where
             role = "dialer",
             "negotiated a stream muxer"
         );
+        if let Some(observer) = &self.1 {
+            observer.hear(info.as_ref(), Direction::Outbound);
+        }
         self.0.upgrade_outbound(socket, info)
     }
 }

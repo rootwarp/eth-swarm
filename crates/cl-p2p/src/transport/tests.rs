@@ -2768,7 +2768,9 @@ impl ConnectionHandler for SinkHandler {
 // ---------------------------------------------------------------------------------------------
 // The probe swarm: `build_swarm` against test peers on 127.0.0.1.
 
-use crate::behaviour::{log_identify, BehaviourEvent, ConnectionCaps};
+use crate::behaviour::{
+    log_identify, BehaviourEvent, ConnectionCaps, SpecBehaviour, SpecBehaviourEvent,
+};
 use futures::channel::mpsc::UnboundedSender;
 use libp2p::connection_limits::Exceeded;
 use libp2p::core::transport::TransportError;
@@ -3081,6 +3083,88 @@ async fn build_swarm_muxers() {
         let mplex = Offer::Mplex(libp2p_mplex::Config::default());
         assert_eq!(probe_negotiate(mplex, dialer).await, "mplex");
     }
+}
+
+/// The observer of [`SwarmConfig::muxer_observer`] hears the muxer each connection settled on,
+/// with our side of it, whoever dialed.
+#[tokio::test]
+async fn muxer_observer_hears_each_negotiated_muxer() {
+    for (offer, want) in [
+        (Offer::YamuxThenMplex, "/yamux/1.0.0"),
+        (
+            Offer::Mplex(libp2p_mplex::Config::default()),
+            "/mplex/6.7.0",
+        ),
+    ] {
+        for dialer in [Dialer::Production, Dialer::Peer] {
+            let (_registry, metrics, mut cfg) = probe_config();
+            let heard: Arc<Mutex<Vec<(String, Direction)>>> = Arc::default();
+            let record = Arc::clone(&heard);
+            cfg.muxer_observer = Some(MuxerObserver::new(move |muxer, side| {
+                record.lock().unwrap().push((muxer.to_owned(), side));
+            }));
+            let mut ours = start_probe(&cfg, metrics).await;
+            let theirs = peer_swarm(offer.clone(), Negotiated::default(), dummy::Behaviour);
+            let peer = *theirs.local_peer_id();
+            let side = match dialer {
+                Dialer::Production => Direction::Outbound,
+                Dialer::Peer => Direction::Inbound,
+            };
+            let _theirs = match dialer {
+                Dialer::Production => {
+                    let (rx, addr) = listen(theirs, no_event).await;
+                    ours.dial(addr);
+                    rx
+                }
+                Dialer::Peer => {
+                    let mut theirs = theirs;
+                    theirs.dial(ours.addr.clone()).unwrap();
+                    run(theirs, no_event)
+                }
+            };
+            ours.established(peer).await;
+            assert_eq!(*heard.lock().unwrap(), [(want.to_owned(), side)]);
+        }
+    }
+    // Without an observer the swarm builds and connects as before (every other test).
+    let (_registry, _metrics, cfg) = probe_config();
+    assert!(cfg.muxer_observer.is_none());
+    assert_eq!(
+        format!("{:?}", MuxerObserver::new(|_, _| {})),
+        "MuxerObserver"
+    );
+}
+
+/// `build_swarm` runs the req/resp behaviour of any preset: a minimal-preset probe swarm
+/// exchanges a valid Status like the mainnet one.
+#[tokio::test]
+async fn build_swarm_takes_any_preset() {
+    use crate::rpc::inbound::{Control, ControlEvent, Relevance};
+    use consensus_types::Minimal;
+    let (mut registry, _metrics, mut cfg) = probe_config();
+    cfg.listen_addrs = Vec::new();
+    let control = Control::<Minimal>::new(
+        crate::testkit::control_config(Some(p2p_wire::testkit::status())),
+        crate::rpc::metrics::RpcMetrics::register(&mut registry),
+    );
+    let mut swarm: Swarm<SpecBehaviour<Minimal>> =
+        build_swarm(Keypair::generate_secp256k1(), &cfg, control).expect("minimal probe swarm");
+    let peer = crate::testkit::StatusPeer::echoing(p2p_wire::testkit::status()).await;
+    swarm.dial(peer.addr.clone()).unwrap();
+    let verdict = tokio::time::timeout(WAIT, async {
+        loop {
+            if let SwarmEvent::Behaviour(SpecBehaviourEvent::ReqResp(ControlEvent::Status {
+                relevance,
+                ..
+            })) = swarm.select_next_some().await
+            {
+                return relevance;
+            }
+        }
+    })
+    .await
+    .expect("a Status verdict");
+    assert_eq!(verdict, Relevance::Relevant);
 }
 
 #[tokio::test]

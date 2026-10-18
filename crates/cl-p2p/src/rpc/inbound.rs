@@ -12,7 +12,8 @@
 //!
 //! - **Status** (`fulu/p2p-interface.md` L538–571): our Status from the [`StatusSource`]; with
 //!   none known yet `2: ServerError` (Status does not specify `3`). The peer's Status is then
-//!   judged ([`relevance`]).
+//!   judged ([`relevance`]), and [`ControlEvent::StatusAnswered`] follows once our Status was
+//!   written to its stream.
 //! - **MetaData**: one snapshot of the [`MetaDataSource`] (cl-chain): its `seq_number` and the
 //!   fields it numbers, read together, so a `seq_number` bumped while an answer waits for its
 //!   token never pairs with fields of another one. The probe subscribes to no attestation or
@@ -447,14 +448,24 @@ impl<E: EthSpec> Protocols<E> {
     }
 }
 
+/// Which exchange carried a peer's Status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusVia {
+    /// The peer's request: it sent its Status, and we answered with ours.
+    Request,
+    /// The peer's response to our Status request.
+    Response,
+}
+
 /// What [`Control`] reports.
 #[derive(Debug, Clone)]
 pub enum ControlEvent {
-    /// A peer's Status (its request, or its response to ours) was judged.
+    /// A peer's Status (its request, or its response to ours: `via`) was judged.
     Status {
         peer: PeerId,
         status: StatusV2,
         relevance: Relevance,
+        via: StatusVia,
     },
     /// A peer answered our Ping with its `seq_number`.
     Pong { peer: PeerId, seq_number: u64 },
@@ -472,6 +483,9 @@ pub enum ControlEvent {
         direction: Direction,
         at: SystemTime,
     },
+    /// Our Status, the answer to the peer's Status request, was written to its stream: the
+    /// peer's side of the handshake is done (a `2: ServerError` answer is not this).
+    StatusAnswered { peer: PeerId },
     /// One of our BlocksByRange requests ended: its outcome waits in [`Control::take_blocks`].
     BlocksByRange { peer: PeerId, ticket: BlocksTicket },
 }
@@ -553,6 +567,9 @@ pub struct Control<E: EthSpec> {
     /// Wakes the behaviour when the next Ping or Goodbye close is due; `None` with neither.
     timer: Option<Pin<Box<Sleep>>>,
     pending: VecDeque<ToSwarm<ControlEvent, THandlerInEvent<Protocols<E>>>>,
+    /// The peers' Status requests we are answering with our Status, until the answer is sent
+    /// ([`ControlEvent::StatusAnswered`]) or fails.
+    status_answers: HashSet<InboundRequestId>,
 }
 
 /// The `ErrorMessage` of `text`, cut at 256 bytes.
@@ -644,6 +661,7 @@ impl<E: EthSpec> Control<E> {
             next_ticket: 0,
             timer: None,
             pending: VecDeque::new(),
+            status_answers: HashSet::new(),
         }
     }
 
@@ -1012,8 +1030,9 @@ impl<E: EthSpec> Control<E> {
         self.pending.push_back(ToSwarm::GenerateEvent(event));
     }
 
-    /// Records the verdict on `theirs`; an irrelevant peer gets `Goodbye(2)`.
-    fn judge(&mut self, peer: PeerId, theirs: StatusV2) {
+    /// Records the verdict on `theirs`, which came `via` the peer's request or its response; an
+    /// irrelevant peer gets `Goodbye(2)`.
+    fn judge(&mut self, peer: PeerId, theirs: StatusV2, via: StatusVia) {
         let Some(ours) = self.cfg.status.status() else {
             tracing::debug!(%peer, "no Status of ours yet: the peer's is not judged");
             return;
@@ -1041,6 +1060,7 @@ impl<E: EthSpec> Control<E> {
             peer,
             status: theirs,
             relevance: verdict,
+            via,
         });
         if !valid {
             self.goodbye(peer, GOODBYE_IRRELEVANT_NETWORK);
@@ -1119,11 +1139,14 @@ impl<E: EthSpec> Control<E> {
         match request {
             Request::Status(theirs) => {
                 let answer = match self.cfg.status.status() {
-                    Some(ours) => success_chunk(Response::Status(ours)),
+                    Some(ours) => {
+                        self.status_answers.insert(request_id);
+                        success_chunk(Response::Status(ours))
+                    }
                     None => error_chunk(ResultCode::ServerError, "status unavailable"),
                 };
                 self.respond(peer, protocol, channel, answer);
-                self.judge(peer, theirs);
+                self.judge(peer, theirs, StatusVia::Request);
             }
             Request::MetaData => {
                 let answer = success_chunk(Response::MetaData(self.local_metadata()));
@@ -1243,7 +1266,7 @@ impl<E: EthSpec> Control<E> {
                 }
             },
             Protocol::StatusV2 => match single_success(chunks) {
-                Some(Response::Status(theirs)) => self.judge(peer, theirs),
+                Some(Response::Status(theirs)) => self.judge(peer, theirs, StatusVia::Response),
                 other => tracing::debug!(%peer, ?other, "no Status in the response: ignored"),
             },
             Protocol::PingV1 => match single_success(chunks) {
@@ -1354,12 +1377,23 @@ impl<E: EthSpec> Control<E> {
                 if protocol == Protocol::GoodbyeV1 {
                     self.goodbye_answered(request_id);
                 }
+                if protocol == Protocol::StatusV2 {
+                    self.status_answers.remove(&request_id);
+                }
                 self.on_inbound_failure(peer, protocol, error);
             }
             DuplexEvent::Inbound(Event::ResponseSent { request_id, .. })
                 if protocol == Protocol::GoodbyeV1 =>
             {
                 self.goodbye_answered(request_id);
+            }
+            // Request IDs are numbered per behaviour: only a Status one names our answer.
+            DuplexEvent::Inbound(Event::ResponseSent {
+                peer, request_id, ..
+            }) if protocol == Protocol::StatusV2 => {
+                if self.status_answers.remove(&request_id) {
+                    self.emit(ControlEvent::StatusAnswered { peer });
+                }
             }
             DuplexEvent::Outbound(Event::Message {
                 peer,
@@ -1376,8 +1410,8 @@ impl<E: EthSpec> Control<E> {
                 error,
                 ..
             }) => self.on_outbound_failure(peer, protocol, request_id, error),
-            // Sent answers; and what each one-way behaviour never reports (a response on the
-            // inbound side, a request on the outbound side).
+            // What each one-way behaviour never reports (a response on the inbound side, a
+            // request on the outbound side).
             DuplexEvent::Inbound(_) | DuplexEvent::Outbound(_) => {}
         }
     }
@@ -1875,7 +1909,7 @@ mod tests {
         for (n, peer) in peers.iter().enumerate() {
             connection(&mut control, *peer, n, true);
             // Status-valid, blocks from slot 5.
-            control.judge(*peer, testkit::status());
+            control.judge(*peer, testkit::status(), StatusVia::Response);
         }
         let range = BlocksByRangeV2Request {
             start_slot: 8,
@@ -1994,13 +2028,14 @@ mod tests {
             earliest_available_slot,
             ..testkit::status()
         };
-        control.judge(served, from(64));
+        control.judge(served, from(64), StatusVia::Response);
         control.judge(
             invalid,
             StatusV2 {
                 fork_digest: [9; 4],
                 ..from(0)
             },
+            StatusVia::Response,
         );
         let at = |start_slot| BlocksByRangeV2Request {
             start_slot,
@@ -2029,7 +2064,7 @@ mod tests {
             .map(|start| control.request_blocks(served, at(start)).unwrap())
             .collect();
         assert_eq!(control.outbound.in_flight(p), 2);
-        control.judge(served, from(100));
+        control.judge(served, from(100), StatusVia::Response);
         let first = control
             .blocks_in_flight
             .iter()
@@ -2062,7 +2097,7 @@ mod tests {
 
         // A waiting request whose peer's Status turns invalid is dropped: that peer got our
         // Goodbye, and nothing else goes out after it.
-        control.judge(served, from(0));
+        control.judge(served, from(0), StatusVia::Response);
         let tickets: Vec<_> = (0..3)
             .map(|_| control.request_blocks(served, at(64)).unwrap())
             .collect();
@@ -2072,6 +2107,7 @@ mod tests {
                 fork_digest: [9; 4],
                 ..from(0)
             },
+            StatusVia::Response,
         );
         let id = control
             .blocks_in_flight
@@ -2102,13 +2138,14 @@ mod tests {
             earliest_available_slot: 64,
             ..testkit::status()
         };
-        control.judge(valid, theirs.clone());
+        control.judge(valid, theirs.clone(), StatusVia::Response);
         control.judge(
             invalid,
             StatusV2 {
                 fork_digest: [9; 4],
                 ..testkit::status()
             },
+            StatusVia::Response,
         );
         assert_eq!(control.status_valid_peers(), [(valid, theirs)]);
         connection(&mut control, valid, 0, false);
@@ -2434,7 +2471,7 @@ mod tests {
         // Both Status-valid. A Ping to one peer and a MetaData request to the other are open,
         // the second with a newer seq_number announced meanwhile; then both get our Goodbye.
         for peer in &peers {
-            control.judge(*peer, testkit::status());
+            control.judge(*peer, testkit::status(), StatusVia::Response);
         }
         control.ping(late_pong);
         let pong_id = control.peers[&late_pong].ping.unwrap();

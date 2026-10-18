@@ -3,13 +3,18 @@
 //! and gossipsub ([`crate::gossip::IgnoreAll`], off unless [`Behaviour::with_gossip`] turns it
 //! on).
 //!
-//! Field order is the order the swarm consults the behaviours, so [`Behaviour::limits`] comes
-//! first: a connection it denies is never handed to the others.
+//! Field order is the order the swarm consults the behaviours, so [`SpecBehaviour::limits`]
+//! comes first: a connection it denies is never handed to the others.
+//!
+//! [`SpecBehaviour`] is generic over the preset its req/resp behaviour decodes blocks with;
+//! [`Behaviour`] is the one over [`ProbeSpec`], the networks the probe joins. A minimal-preset
+//! devnet runs [`SpecBehaviour`] over `Minimal`.
 
 use crate::gossip::IgnoreAll;
 use crate::peer_caps::{PeerCaps, PeerCapsConfig};
 use crate::rpc::inbound::{Control, ControlEvent};
 use crate::rpc::outbound::ControlRpc;
+use consensus_types::EthSpec;
 use libp2p::identity::PublicKey;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::NetworkBehaviour;
@@ -60,31 +65,38 @@ impl Default for ConnectionCaps {
 /// The preset the probe decodes with: every network it joins (Sepolia, Hoodi) is mainnet.
 pub type ProbeSpec = consensus_types::Mainnet;
 
-/// The req/resp slot: Status, MetaData, Ping, Goodbye (and BlocksByRange, answered
-/// `3: ResourceUnavailable`).
+/// The req/resp slot of [`Behaviour`]: Status, MetaData, Ping, Goodbye (and BlocksByRange,
+/// answered `3: ResourceUnavailable`).
 pub type ReqRespSlot = Control<ProbeSpec>;
 
 /// The gossipsub slot: ignore-all gossipsub, or nothing.
 pub type GossipsubSlot = Toggle<IgnoreAll>;
 
-/// Connection limits, identify, req/resp and gossipsub, consulted in that order.
+/// [`SpecBehaviour`] over [`ProbeSpec`].
+pub type Behaviour = SpecBehaviour<ProbeSpec>;
+
+/// The events of [`Behaviour`].
+pub type BehaviourEvent = SpecBehaviourEvent<ProbeSpec>;
+
+/// Connection limits, identify, req/resp and gossipsub, consulted in that order; req/resp
+/// decodes blocks under the preset `E`.
 #[derive(NetworkBehaviour)]
-pub struct Behaviour {
+pub struct SpecBehaviour<E: EthSpec> {
     /// At most [`MAX_ESTABLISHED_PER_PEER`] established connections per peer.
     pub limits: connection_limits::Behaviour,
     /// The pending-total and per-IP inbound caps.
     pub peer_caps: PeerCaps,
     /// Tells each peer who we are and what address we see it on, and tells us the same.
     pub identify: identify::Behaviour,
-    pub req_resp: ReqRespSlot,
+    pub req_resp: Control<E>,
     pub gossipsub: GossipsubSlot,
 }
 
-impl Behaviour {
+impl<E: EthSpec> SpecBehaviour<E> {
     /// The behaviour for the node whose public key is `local`, announcing `agent_version`,
     /// under the default [`ConnectionCaps`], with `req_resp` answering the req/resp protocols.
     #[must_use]
-    pub fn new(local: PublicKey, agent_version: String, req_resp: ReqRespSlot) -> Self {
+    pub fn new(local: PublicKey, agent_version: String, req_resp: Control<E>) -> Self {
         Self::with_caps(local, agent_version, ConnectionCaps::default(), req_resp)
     }
 
@@ -94,7 +106,7 @@ impl Behaviour {
         local: PublicKey,
         agent_version: String,
         caps: ConnectionCaps,
-        req_resp: ReqRespSlot,
+        req_resp: Control<E>,
     ) -> Self {
         let limits = connection_limits::ConnectionLimits::default()
             .with_max_established_per_peer(Some(MAX_ESTABLISHED_PER_PEER))
@@ -131,18 +143,18 @@ impl Behaviour {
     }
 }
 
-impl ControlRpc<ProbeSpec> for Behaviour {
-    fn control(&self) -> &Control<ProbeSpec> {
+impl<E: EthSpec> ControlRpc<E> for SpecBehaviour<E> {
+    fn control(&self) -> &Control<E> {
         &self.req_resp
     }
 
-    fn control_mut(&mut self) -> &mut Control<ProbeSpec> {
+    fn control_mut(&mut self) -> &mut Control<E> {
         &mut self.req_resp
     }
 
-    fn control_event(event: BehaviourEvent) -> Option<ControlEvent> {
+    fn control_event(event: SpecBehaviourEvent<E>) -> Option<ControlEvent> {
         match event {
-            BehaviourEvent::ReqResp(event) => Some(event),
+            SpecBehaviourEvent::ReqResp(event) => Some(event),
             _ => None,
         }
     }

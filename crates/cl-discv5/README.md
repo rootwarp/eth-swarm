@@ -8,7 +8,10 @@ discv5 0.12.0 peer discovery with the `eth2`/`cgc`/`nfd` local record (`src/enr.
 
 `NetworkMode` picks the IP rules. Public mode accepts only globally routable addresses (every
 address a record advertises must pass); devnet mode also accepts loopback and private ones and
-refuses only addresses that can never be contacted (unspecified, broadcast, multicast). The
+refuses only addresses that can never be contacted (unspecified, broadcast, multicast); local
+mode accepts local addresses only (`is_local_ip`: loopback, RFC 1918, link-local, CGNAT, IPv6
+unique-local and link-local), so a node on a devnet's own network (the devnet probe) never
+queries or pings a public host, whatever record a peer hands it. The
 rules are discv5's `table_filter`, a bare `fn` pointer, so it cannot hold the fork digest.
 
 - **Lookups** (`Discovery::find_peers`) run `find_node_predicate` with the fork digest and the

@@ -1811,6 +1811,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "devnet-probe"
+version = "0.1.0"
+dependencies = [
+ "cl-chain",
+ "cl-discv5",
+ "cl-p2p",
+ "consensus-types",
+ "devnet-probe",
+ "ethereum_ssz",
+ "futures",
+ "hex",
+ "libp2p",
+ "network-config",
+ "p2p-wire",
+ "prometheus-client",
+ "serde",
+ "sha2 0.10.9",
+ "tempfile",
+ "testkit",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "digest"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

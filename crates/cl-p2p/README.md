@@ -13,6 +13,9 @@ The behaviour is `connection_limits`, `peer_caps::PeerCaps`, identify (`eth2/1.0
 cache: nothing dials an address a peer advertised), the req/resp control protocols (`req_resp`,
 an `rpc::inbound::Control`), and gossipsub, which is off here and on in
 `transport::build_swarm_with_gossip(keypair, &cfg, req_resp, gossip)` (see [Gossip](#gossip)).
+The behaviour is `behaviour::SpecBehaviour<E>`, generic over the preset its `Control<E>`
+decodes blocks with; `behaviour::Behaviour` is the one over `Mainnet` (Sepolia, Hoodi), and a
+minimal-preset devnet runs it over `Minimal` (the `devnet-probe` crate).
 The connection caps (`SwarmConfig::caps`): one established connection per peer, 8 pending
 inbound per source (IPv4 address or IPv6 /58), 32 pending inbound in total (`PeerCaps`: the
 pinned `connection_limits` has no total pending cap; a place is freed when the handshake ends,
@@ -31,7 +34,8 @@ event to `behaviour::log_identify`. Metrics, on the registry the service passes 
   `transport`, `other`.
 
 Log lines: `negotiated a stream muxer` (`muxer="/yamux/1.0.0"` or `"/mplex/6.7.0"`, `role`) per
-connection, `connection established` with `peer`, `direction` and `addr`, and identify's
+connection (`SwarmConfig::muxer_observer`, if set, is told the same muxer and our side),
+`connection established` with `peer`, `direction` and `addr`, and identify's
 `observed_addr`, the address the peer sees us on (a NAT'd host shows its public address there,
 or an address nobody can dial). The peer's identify strings are logged escaped and cut at 128
 chars.
@@ -49,7 +53,10 @@ protocols offered: any other fails multistream-select negotiation, among them th
 
 - **Status**: sent first on every connection we dial, and answered on every one. A peer
   Status with another fork digest, or another finalized root at our finalized epoch, gets
-  `Goodbye(2)` and the connection is closed once the Goodbye completed. A failed exchange (a
+  `Goodbye(2)` and the connection is closed once the Goodbye completed. Each verdict is a
+  `ControlEvent::Status`, whose `via` says whether the peer's Status was its request (we
+  answered) or its response to ours; `ControlEvent::StatusAnswered` follows once our answer to a
+  peer's Status request was written to its stream. A failed exchange (a
   timeout, an error chunk) is ignored: the peer is neither valid nor invalid.
 - **MetaData**: one snapshot of `ControlConfig::metadata` (`rpc::inbound::MetaDataSource`, from
   cl-chain): the `seq_number` and the fields it numbers are read together, so an answer that

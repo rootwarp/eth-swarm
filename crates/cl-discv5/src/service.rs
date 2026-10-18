@@ -83,6 +83,10 @@ pub enum NetworkMode {
     Public,
     /// A local devnet: loopback and private addresses are accepted too.
     Devnet,
+    /// Local addresses only ([`is_local_ip`]): loopback, private, link-local, CGNAT and IPv6
+    /// unique-local. For a probe on a devnet's own network (a Docker bridge), which must send
+    /// nothing to a public host whatever a peer hands it.
+    Local,
 }
 
 /// The `table_filter` for `mode`.
@@ -90,6 +94,7 @@ pub fn table_filter(mode: NetworkMode) -> fn(&Enr) -> bool {
     match mode {
         NetworkMode::Public => public_ip_rules,
         NetworkMode::Devnet => devnet_ip_rules,
+        NetworkMode::Local => local_ip_rules,
     }
 }
 
@@ -104,11 +109,17 @@ fn devnet_ip_rules(enr: &Enr) -> bool {
     every_address(enr, devnet_ip)
 }
 
+/// At least one address, and every address local ([`is_local_ip`]).
+fn local_ip_rules(enr: &Enr) -> bool {
+    every_address(enr, is_local_ip)
+}
+
 /// The per-address rule of `mode`, shared by the record rules and the session source check.
 fn ip_rule(mode: NetworkMode) -> fn(IpAddr) -> bool {
     match mode {
         NetworkMode::Public => public_ip,
         NetworkMode::Devnet => devnet_ip,
+        NetworkMode::Local => is_local_ip,
     }
 }
 
@@ -116,6 +127,27 @@ fn public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_global_v4(v4),
         IpAddr::V6(v6) => is_global_v6(v6),
+    }
+}
+
+/// A local address: IPv4 loopback (127/8), private (10/8, 172.16/12, 192.168/16), link-local
+/// (169.254/16) or shared CGNAT space (100.64/10); IPv6 loopback, unique-local (fc00::/7) or
+/// link-local (fe80::/10). An IPv4-mapped address is judged as its IPv4 address.
+#[must_use]
+pub fn is_local_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            let cgnat = a == 100 && (b & 0xc0) == 64;
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || cgnat
+        }
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => is_local_ip(IpAddr::V4(v4)),
+            None => {
+                let first = v6.segments()[0];
+                v6.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+            }
+        },
     }
 }
 
@@ -1591,6 +1623,121 @@ mod tests {
         assert_eq!(crate::enr::EnrFields::read(&enr).unwrap().cgc, Some(8));
         assert_eq!(node.set_cgc(8), Ok(false));
         assert_eq!(node.local_enr().seq(), seq + 1);
+    }
+
+    /// Local mode takes loopback, private (RFC 1918), link-local, CGNAT and IPv6 unique-local
+    /// and link-local addresses, and nothing else: every address of a record must be one.
+    #[test]
+    fn local_mode_takes_only_local_addresses() {
+        let local = table_filter(NetworkMode::Local);
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.10",
+            "172.31.255.254",
+            "192.168.1.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "100.127.255.254",
+        ] {
+            let ip: Ipv4Addr = ip.parse().unwrap();
+            assert!(local(&with_ip4(ip)), "{ip}");
+            assert!(is_local_ip(ip.into()), "{ip}");
+        }
+        for ip in ["::1", "fd00::1", "fc00::1", "fe80::1", "::ffff:10.0.0.1"] {
+            let ip: Ipv6Addr = ip.parse().unwrap();
+            assert!(local(&with_ip6(ip)), "{ip}");
+        }
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "192.0.2.1",
+            "172.32.0.1",
+            "100.128.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+        ] {
+            let ip: Ipv4Addr = ip.parse().unwrap();
+            assert!(!local(&with_ip4(ip)), "{ip}");
+            assert!(!is_local_ip(ip.into()), "{ip}");
+        }
+        for ip in ["2001:4860::1", "::", "ff02::1", "::ffff:8.8.8.8"] {
+            let ip: Ipv6Addr = ip.parse().unwrap();
+            assert!(!local(&with_ip6(ip)), "{ip}");
+        }
+        // A local IPv4 address does not excuse a public IPv6 one.
+        let key = CombinedKey::generate_secp256k1();
+        let mixed = Enr::builder()
+            .ip4(Ipv4Addr::LOCALHOST)
+            .udp4(9000)
+            .ip6("2001:4860::1".parse().unwrap())
+            .udp6(9000)
+            .build(&key)
+            .unwrap();
+        assert!(!local(&mixed));
+        assert!(table_filter(NetworkMode::Devnet)(&mixed));
+        let filter = PeerFilter {
+            fork_digest: [0; 4],
+            mode: NetworkMode::Local,
+        };
+        assert!(filter.accepts_source(&"10.1.2.3:9000".parse().unwrap()));
+        assert!(!filter.accepts_source(&"8.8.8.8:9000".parse().unwrap()));
+    }
+
+    /// The records `events` reports as discovered within half a second.
+    async fn discovered(events: &mut Events) -> HashSet<NodeId> {
+        let mut seen = HashSet::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(500), events.next()).await
+        {
+            if let PeerEvent::Discovered(enr) = event {
+                seen.insert(enr.node_id());
+            }
+        }
+        seen
+    }
+
+    /// A Local-mode node never queries a record whose address is not local, whoever hands it
+    /// out. discv5 takes a record a NODES response carries into the lookup (and so sends it a
+    /// FINDNODE) only if it passes `table_filter`, the rule `Events` reports `Discovered` by; a
+    /// record that fails it is neither queried, nor reported, nor put in the routing table (so
+    /// never pinged). The record's address is TEST-NET-1 (192.0.2.1): not local, and no host,
+    /// so the Devnet-mode control, which does query it, sends nothing anywhere real.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_mode_never_queries_a_record_that_is_not_local() {
+        let ours = sepolia_fields(274_175);
+        let (boot, _boot_events) = node(&ours).await;
+        let key = CombinedKey::generate_secp256k1();
+        let remote = LocalAddr {
+            ip: Ipv4Addr::new(192, 0, 2, 1),
+            tcp_port: 9000,
+            udp_port: 9000,
+        };
+        let far = build_local_enr(&key, &ours, 4, &remote).unwrap();
+        let far_id = far.node_id();
+        boot.add_enr(far).unwrap();
+
+        let (local, mut local_events) = node_in(&ours, NetworkMode::Local).await;
+        local.add_enr(boot.local_enr()).unwrap();
+        let found = ids(&local.find_peers(far_id, 16).await.unwrap());
+        assert!(found.contains(&boot.local_enr().node_id()), "{found:?}");
+        assert!(!found.contains(&far_id), "{found:?}");
+        assert!(!discovered(&mut local_events).await.contains(&far_id));
+        assert!(!local.discv5.table_entries_id().contains(&far_id));
+
+        // The control: in Devnet mode the record passes, so the same lookup queries it, and
+        // waits for that request to time out.
+        let (devnet, mut devnet_events) = node_in(&ours, NetworkMode::Devnet).await;
+        devnet.add_enr(boot.local_enr()).unwrap();
+        let started = tokio::time::Instant::now();
+        let _ = devnet.find_peers(far_id, 16).await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(900),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(discovered(&mut devnet_events).await.contains(&far_id));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

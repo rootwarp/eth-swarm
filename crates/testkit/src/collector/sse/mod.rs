@@ -6,6 +6,7 @@ mod parse;
 mod spec;
 
 pub(crate) use client::get;
+pub use client::get_json_at;
 pub use client::{
     genesis_time, run, supported_topics, ApiError, Backoff, Pause, SseConfig, SseConfigError,
     SseStats, TokioPause, DEFAULT_TOPICS, EVENTS_PATH, GENESIS_PATH, MAX_JSON_BYTES,

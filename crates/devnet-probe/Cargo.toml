@@ -1,0 +1,50 @@
+[package]
+name = "devnet-probe"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "The probe's acceptance checks against the reference CLs of a local Kurtosis devnet: discv5 discovery, TCP + Noise + yamux, Status v2 both ways with a held connection, and one finalized epoch by BlocksByRange against the beacon API's roots."
+
+[[bin]]
+name = "devnet-probe"
+path = "src/main.rs"
+
+[features]
+# The stand-in reference CLs and the fixture beacon API (`fixtures`), for this crate's tests
+# (the binary's included); built on testkit's fixture server and fixture devnet.
+test-support = ["testkit/test-support"]
+
+[dependencies]
+# The probe swarm, its req/resp and range requester (cl-p2p), our discv5 (cl-discv5) and probe
+# mode's Status provider (cl-chain) meet here: cl-p2p links neither discv5 nor cl-chain
+# (scripts/check-m2a-deps.sh), and testkit, which cl-chain's tests use, links neither.
+cl-p2p = { path = "../cl-p2p" }
+cl-discv5 = { path = "../cl-discv5" }
+cl-chain = { path = "../cl-chain" }
+# The beacon API client (collector's HTTP/1.1 GET, the loopback URL rule).
+testkit = { path = "../testkit" }
+consensus-types = { path = "../consensus-types" }
+network-config = { path = "../network-config" }
+p2p-wire = { path = "../p2p-wire" }
+# The versions cl-p2p, cl-discv5 and testkit already use.
+libp2p = { workspace = true, features = ["secp256k1"] }
+futures = "0.3"
+prometheus-client = "0.25.1"
+tokio = { version = "1", features = ["rt", "macros", "time", "net", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+serde = { version = "1", features = ["derive"] }
+hex = "0.4"
+sha2 = "0.10"
+
+[dev-dependencies]
+devnet-probe = { path = ".", features = ["test-support"] }
+# The stand-in reference CL that serves blocks: cl-p2p's scripted loopback peer.
+cl-p2p = { path = "../cl-p2p", features = ["testkit"] }
+p2p-wire = { path = "../p2p-wire", features = ["testkit"] }
+testkit = { path = "../testkit", features = ["test-support"] }
+ethereum_ssz.workspace = true
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }

@@ -11,6 +11,7 @@ mod limits;
 use super::codec::{Answer, Deadline, Deadlines, ReceivedChunk, RpcRequest};
 use super::inbound::{
     ControlConfig, ControlEvent, DuplexEvent, Protocols, ProtocolsEvent, Relevance, SharedStatus,
+    StatusVia,
 };
 use super::metrics::{RpcMetrics, StatusValidity};
 use super::unsupported::Unsupported;
@@ -484,6 +485,81 @@ async fn status_wrong_digest_goodbye_2() {
             0
         );
     }
+}
+
+/// Each Status verdict says who asked: the dialer judges the listener's response to its Status,
+/// the listener judges the dialer's request; a Status the listener sends later is a request on
+/// the dialer's side.
+#[tokio::test]
+async fn status_event_names_who_asked() {
+    let mut listener = Node::spawn(config(status_with(DIGEST), 1, 4)).await;
+    let mut dialer = Node::spawn(config(status_with(DIGEST), 1, 4)).await;
+    dialer.send(Cmd::Dial(listener.addr.clone()));
+    let via_of = |peer: PeerId| {
+        move |seen: &Seen| match seen {
+            Seen::Control(ControlEvent::Status { peer: p, via, .. }) if *p == peer => Some(*via),
+            _ => None,
+        }
+    };
+    assert_eq!(
+        listener
+            .next("the dialer's Status", via_of(dialer.peer))
+            .await,
+        StatusVia::Request
+    );
+    assert_eq!(
+        dialer
+            .next("the listener's answer", via_of(listener.peer))
+            .await,
+        StatusVia::Response
+    );
+    listener.send(Cmd::Status(dialer.peer));
+    assert_eq!(
+        dialer
+            .next("the listener's Status", via_of(listener.peer))
+            .await,
+        StatusVia::Request
+    );
+    assert_eq!(
+        listener
+            .next("the dialer's answer", via_of(dialer.peer))
+            .await,
+        StatusVia::Response
+    );
+}
+
+/// A peer's Status request counts as answered once our Status was written to its stream
+/// (`StatusAnswered`), and not when we had none to answer with (`2: ServerError`).
+#[tokio::test]
+async fn status_answered_once_our_status_is_sent() {
+    let mut listener = Node::spawn(config(status_with(DIGEST), 1, 4)).await;
+    let dialer = Node::spawn(config(status_with(DIGEST), 1, 4)).await;
+    dialer.send(Cmd::Dial(listener.addr.clone()));
+    listener
+        .next("our Status sent to the dialer", |seen| match seen {
+            Seen::Control(ControlEvent::StatusAnswered { peer }) if *peer == dialer.peer => {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+
+    let mut silent = Node::spawn(testkit::control_config(None)).await;
+    let mut asker = Node::spawn(config(status_with(DIGEST), 1, 4)).await;
+    asker.send(Cmd::Dial(silent.addr.clone()));
+    asker
+        .next("the connection", |seen| match seen {
+            Seen::Established(p) if *p == silent.peer => Some(()),
+            _ => None,
+        })
+        .await;
+    let seen = silent.drain(SETTLE).await;
+    assert!(
+        !seen
+            .iter()
+            .any(|s| matches!(s, Seen::Control(ControlEvent::StatusAnswered { .. }))),
+        "{seen:?}"
+    );
 }
 
 #[tokio::test]

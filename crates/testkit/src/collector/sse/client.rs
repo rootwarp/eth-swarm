@@ -522,8 +522,9 @@ pub(super) async fn get_json<T: serde::de::DeserializeOwned>(
     get_json_at(url, path, path, limit, timeout).await
 }
 
-/// [`get_json`] of `path_and_query`, a query on `path` (which errors name).
-pub(super) async fn get_json_at<T: serde::de::DeserializeOwned>(
+/// [`get_json`] of `path_and_query`, a query on `path` (which errors name). Public for the
+/// devnet probe's beacon API reads: a 404 is `ApiError::Status { status: 404, .. }`.
+pub async fn get_json_at<T: serde::de::DeserializeOwned>(
     url: &ReferenceApiUrl,
     path: &'static str,
     path_and_query: &str,

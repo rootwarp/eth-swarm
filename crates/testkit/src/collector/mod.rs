@@ -69,6 +69,7 @@ pub use sink::{
     MAX_RECORD_LINE_BYTES, NTP_FILE, RECORDS_FILE, SUMMARY_FILE,
 };
 pub(crate) use sse::get as api_get;
+pub use sse::get_json_at;
 pub use sse::{
     committees_per_slot, config_name, genesis_time, node_attnets, run as run_sse, supported_topics,
     ApiError, Backoff, Pause, SseConfig, SseConfigError, SseEvent, SseParser, SseStats, TokioPause,

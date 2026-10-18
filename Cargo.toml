@@ -22,6 +22,7 @@ members = [
     "crates/cl-sync",
     "crates/cl-api",
     "crates/testkit",
+    "crates/devnet-probe",
     "crates/node-key",
 ]
 

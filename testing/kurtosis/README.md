@@ -467,10 +467,124 @@ it with `open_export_pinned` and that digest.
   `/ip4/<ip>/tcp/9000/p2p/<peer_id>`. The supernode (`cl-1-lighthouse-geth`) serves every
   column.
 - **Network.** The package sets each CL's ENR address to its container IP on the enclave's
-  Docker network (`port_publisher` is off), so the probe must run on that network. Find it with
+  Docker network (`port_publisher` is off), so discovery must run on that network. Find it with
   `docker network ls --filter name=ethswarm-gloas` (Kurtosis names it `kt-ethswarm-gloas`), then
   run the probe as `docker run --network kt-ethswarm-gloas ...`. On Docker Desktop (macOS) a
-  process on the host cannot reach those IPs.
+  process on the host cannot reach those IPs. The libp2p TCP port is also published on a host
+  port (`kurtosis port print <enclave> <service> tcp-discovery`), which a process on the host
+  can dial: see "Probe checks".
+
+## Probe checks
+
+`devnet-probe` (the `devnet-probe` crate: `crates/devnet-probe/src/main.rs`, the checks in
+`crates/devnet-probe/src/`) runs our probe against the reference CLs and prints one
+`PASS`/`FAIL` line per thing it judged, a summary line per check and a last
+`verdict: PASS|FAIL|DIAGNOSTIC (...)` line. It exits 0 only for an acceptance pass, every check
+passed; 1 a failure; 2 usage, which includes an `--api` whose node (`/eth/v1/node/identity`
+`peer_id`) is not among the `--peer`s of `connect`, `status`, `fetch-epoch` or `all`, so no
+reference CL can be left out; 3 diagnostic: every check passed but one ran outside the
+acceptance rules (a `--hold-secs` under 600), which prints `DIAGNOSTIC`, never `PASS`, and is
+no acceptance evidence. Every `-secs` flag takes 1 to 86400.
+A `setup` check runs first: the devnet's `config.yaml` parses with `network-config`'s strict
+reader, and the genesis of `genesis.ssz` (its first two fields) equals every `--api`'s
+`/eth/v1/beacon/genesis`, with the config's `GENESIS_FORK_VERSION`. Every address it is given
+must be local (loopback, private, link-local, CGNAT, IPv6 unique-local), and it never starts or
+stops anything in Kurtosis or Docker.
+
+| Subcommand | Criterion | What passes |
+|---|---|---|
+| `discover` | discovery on the devnet | our discv5 (cl-discv5, local mode: a record with any other than a local address is never queried or pinged, so nothing goes to a public host), seeded with `--bootnode`, finds every `--enr` record (and every `--api`'s `/eth/v1/node/identity` ENR) on our fork digest within `--discover-secs` (60) |
+| `connect` | TCP + Noise + yamux | each `--peer`: TCP connected, Noise XX proved its peer ID, and the muxer, logged per peer, is `/yamux/1.0.0` (mplex fails) |
+| `status` | Status v2 both ways, then a held connection | each `--peer` answers our Status v2 with a relevant one, sends us its own Status (a CL's periodic re-Status, about every 5 minutes on Lighthouse and Lodestar \[est\]: the hold must outlast it) and our answer to it is sent, and keeps the connection `--hold-secs` (600; under 600 the check is `DIAGNOSTIC` and the run exits 3) with our Ping every `--ping-secs` (15) and no Goodbye either way; a Goodbye is reported with its reason |
+| `fetch-epoch` | one epoch by range, roots against the API | the finalized epoch before the first `--api`'s finalized epoch (or `--epoch`) fetched by BlocksByRange v2 from the `--peer`s; every slot's root equals that API's `/eth/v1/beacon/blocks/{slot}/root`, an empty slot is a 404 there, and nothing is `unconfirmed` |
+| `all` | the four | in that order, from one argument set |
+
+Our Status is probe mode's (`cl_chain::probe::StatusProvider`): the digest of the wall-clock
+epoch from `config.yaml` and `genesis.ssz`, the finalized checkpoint and its block from the
+first `--api`. The swarm is cl-p2p's `build_swarm` over the `Minimal` preset (the config's
+`PRESET_BASE`); `status` adds the probe's ignore-all gossipsub on `beacon_block`.
+
+Run it against the concurrent pair that `testing/kurtosis/run-pair.sh --keep-on-pass` leaves
+up after a pair PASS (both enclaves, finalized epoch at least 3); check that script's own exit
+code is 0 before going on:
+
+```bash
+bash testing/kurtosis/run-pair.sh --keep-on-pass; echo "run-pair exit $?"   # 0: the pair is up
+```
+
+Everything below uses `ethswarm-gloas-a` and runs from the repo root.
+
+The inputs, from Kurtosis and each CL's beacon API:
+
+```bash
+enclave=ethswarm-gloas-a
+net=target/kurtosis/$enclave-genesis
+logs=target/kurtosis/probe-$enclave; mkdir -p "$logs"
+kurtosis files download "$enclave" el_cl_genesis_data "$net"   # config.yaml, genesis.ssz
+
+apis=() peers=() enrs=()
+for svc in cl-1-lighthouse-geth cl-2-lodestar-geth; do
+  api=$(kurtosis port print "$enclave" "$svc" http)              # http://127.0.0.1:<port>
+  identity=$(curl -s "$api/eth/v1/node/identity")
+  id=$(jq -r .data.peer_id <<<"$identity")
+  enr=$(jq -r .data.enr <<<"$identity")
+  tcp=$(kurtosis port print "$enclave" "$svc" tcp-discovery)    # the libp2p TCP port, on the host
+  tcp=${tcp##*:}
+  echo "$svc: peer $id, host TCP $tcp, enr $enr" | tee -a "$logs/inputs.log"
+  apis+=(--api "$api"); peers+=(--peer "/ip4/127.0.0.1/tcp/$tcp/p2p/$id"); enrs+=(--enr "$enr")
+done
+# The package boots every CL from cl-1-lighthouse-geth: our discv5 starts from its record only.
+boot=$(curl -s "$(kurtosis port print "$enclave" cl-1-lighthouse-geth http)/eth/v1/node/identity" \
+  | jq -r .data.enr)
+```
+
+`kurtosis enclave inspect "$enclave"` lists each service's port IDs if `tcp-discovery` is named
+differently. The first `--api` (Lighthouse's) is the reference for our Status and the roots.
+
+`connect`, `status` and `fetch-epoch` from the host, through each CL's published TCP port
+(`status` holds for 10 minutes):
+
+```bash
+cargo build --release --locked -p devnet-probe    # or: cargo run --release --locked -p devnet-probe -- <subcommand> ...
+probe=target/release/devnet-probe
+"$probe" connect --network-dir "$net" "${apis[@]}" "${peers[@]}" 2>"$logs/connect.err" \
+  | tee "$logs/connect.log"; echo "connect exit ${PIPESTATUS[0]}"
+"$probe" status --network-dir "$net" "${apis[@]}" "${peers[@]}" 2>"$logs/status.err" \
+  | tee "$logs/status.log"; echo "status exit ${PIPESTATUS[0]}"
+"$probe" fetch-epoch --network-dir "$net" "${apis[@]}" "${peers[@]}" 2>"$logs/fetch.err" \
+  | tee "$logs/fetch-epoch.log"; echo "fetch-epoch exit ${PIPESTATUS[0]}"
+```
+
+The stderr logs keep cl-p2p's `negotiated a stream muxer` line for each connection, every
+`goodbye_received` / `goodbye_sent` event, and the Status verdicts.
+
+`discover` from a container on the enclave's Docker network, since the CLs' records carry
+their container IPs (on a Linux host, which routes to those IPs, the host binary works too).
+It needs a Linux build of the probe; this one keeps its build in `target/linux` and its crates
+in a Docker volume:
+
+```bash
+docker run --rm -v "$PWD":/src -w /src -v ethswarm-cargo:/usr/local/cargo/registry \
+  -e CARGO_TARGET_DIR=/src/target/linux rust:1.99-bookworm bash -c \
+  'apt-get update -qq && apt-get install -y -qq protobuf-compiler clang libclang-dev >/dev/null &&
+   cargo build --release --locked -p devnet-probe'
+docker run --rm --network "kt-$enclave" \
+  -v "$PWD/target/linux/release/devnet-probe:/devnet-probe:ro" -v "$PWD/$net:/net:ro" \
+  debian:bookworm-slim /devnet-probe discover --network-dir /net --bootnode "$boot" "${enrs[@]}" \
+  2>"$logs/discover.err" | tee "$logs/discover.log"; echo "discover exit ${PIPESTATUS[0]}"
+```
+
+On a Linux host the four run as one, with the CLs' container addresses as peers
+(`.data.p2p_addresses` of the identity) or the published ports above:
+
+```bash
+"$probe" all --network-dir "$net" "${apis[@]}" "${peers[@]}" --bootnode "$boot" "${enrs[@]}" \
+  2>"$logs/all.err" | tee "$logs/all.log"; echo "all exit ${PIPESTATUS[0]}"
+```
+
+Each log's last line is its verdict; keep the logs with the pair's run log. Then tear the
+pair down (the commands `run-pair.sh --keep-on-pass` printed, or `kurtosis enclave rm -f` on
+both enclaves).
 
 ## Changing a pin
 
