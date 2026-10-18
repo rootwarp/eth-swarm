@@ -1,0 +1,54 @@
+# ETH Swarm arrival collector: the Hoodi reference node's /eth/v1/events, stamped on arrival.
+# See ops/collector/README.md. Same hardening as the probe units, plus loopback-only IP: the
+# collector talks to the node's beacon API on 127.0.0.1 and to chronyd on 127.0.0.1:323, and
+# to nothing else. Do not weaken a line without saying why.
+[Unit]
+Description=ETH Swarm arrival collector (Hoodi reference node SSE)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ethswarm-collector
+Group=ethswarm-collector
+UMask=0027
+# Plain http:// to loopback only (the binary refuses anything else). Each start writes a new
+# capture directory /var/lib/ethswarm-collector/hoodi-<unix start seconds>/; summary.toml is
+# written when the unit stops (SIGTERM).
+ExecStart=/usr/local/bin/collector sse --network hoodi --url http://127.0.0.1:5052 \
+    --out /var/lib/ethswarm-collector --host %H --ntp chrony
+StateDirectory=ethswarm-collector
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/ethswarm-collector
+TimeoutStopSec=30s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=multi-user.target

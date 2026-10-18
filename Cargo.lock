@@ -5746,18 +5746,25 @@ dependencies = [
 name = "testkit"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "consensus-types",
  "ethereum_ssz",
  "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "network-config",
  "p2p-wire",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "snap",
  "ssz_types",
  "tempfile",
  "testkit",
  "thiserror 2.0.21",
+ "tokio",
  "toml 0.8.23",
  "tree_hash",
 ]

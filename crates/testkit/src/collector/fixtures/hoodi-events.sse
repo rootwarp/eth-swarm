@@ -1,0 +1,37 @@
+: an /eth/v1/events stream, topics=block_gossip,data_column_sidecar,execution_payload_gossip
+: written in the wire format of beacon-APIs 01e99a6 (apis/eventstream/index.yaml), not captured
+: from a live node; one bare ":" comment line stands for a keep-alive; slots 100 and 103
+
+event: block_gossip
+data: {"slot":"100","block":"0xad57366865126e55649ecb23ae1d48887544976efea46a48eb5d85a6eeb4d306"}
+
+event: data_column_sidecar
+data: {"block_root":"0xad57366865126e55649ecb23ae1d48887544976efea46a48eb5d85a6eeb4d306","index":"0","slot":"100"}
+
+event: data_column_sidecar
+data: {"block_root":"0xad57366865126e55649ecb23ae1d48887544976efea46a48eb5d85a6eeb4d306","index":"1","slot":"100"}
+
+event: data_column_sidecar
+data: {"block_root":"0xad57366865126e55649ecb23ae1d48887544976efea46a48eb5d85a6eeb4d306","index":"64","slot":"100"}
+
+event: execution_payload_gossip
+data: {"slot":"100","builder_index":"42","block_hash":"0xbc223a2f1ee6e231e4c94d7cc5adf174a9b27be4b7a675675f27d6f71d8f2ee4","block_root":"0xad57366865126e55649ecb23ae1d48887544976efea46a48eb5d85a6eeb4d306"}
+
+:
+
+event: data_column_sidecar
+data: {"block_root":"0xad57366865126e55649ecb23ae1d48887544976efea46a48eb5d85a6eeb4d306","index":"127","slot":"100"}
+
+: fixture: the reference node drops the stream here
+event: block_gossip
+data: {"slot":"103","block":"0x454f63ac30c8322997ef025edff6abd23e0dbe7b8a3d5126a894e4a168c1b59b"}
+
+event: execution_payload_gossip
+data: {"slot":"103","builder_index":"7","block_hash":"0x67f6d72820b2b99e79b73993c9477369c86574db0e536fc22c1af862d7b7da42","block_root":"0x454f63ac30c8322997ef025edff6abd23e0dbe7b8a3d5126a894e4a168c1b59b"}
+
+event: data_column_sidecar
+data: {"block_root":"0x454f63ac30c8322997ef025edff6abd23e0dbe7b8a3d5126a894e4a168c1b59b","index":"3","slot":"103"}
+
+event: data_column_sidecar
+data: {"block_root":"0x454f63ac30c8322997ef025edff6abd23e0dbe7b8a3d5126a894e4a168c1b59b","index":"5","slot":"103"}
+
