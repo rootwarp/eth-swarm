@@ -1,0 +1,142 @@
+//! The probe swarm's [`NetworkBehaviour`]: connection limits, identify, and the slots the
+//! req/resp and gossipsub behaviours will fill.
+//!
+//! Field order is the order the swarm consults the behaviours, so [`Behaviour::limits`] comes
+//! first: a connection it denies is never handed to the others.
+
+use libp2p::identity::PublicKey;
+use libp2p::swarm::{dummy, NetworkBehaviour};
+use libp2p::{connection_limits, identify};
+
+/// The identify protocol version every consensus-layer client announces.
+pub const IDENTIFY_PROTOCOL_VERSION: &str = "eth2/1.0.0";
+
+/// Established connections one peer may hold: one, whichever side dialed.
+pub const MAX_ESTABLISHED_PER_PEER: u32 = 1;
+
+/// The longest peer-supplied identify string logged, in chars; the rest is cut.
+pub const MAX_LOGGED_CHARS: usize = 128;
+
+/// Caps on the connections the swarm holds, enforced by `connection_limits`.
+///
+/// The pinned `connection_limits` caps pending inbound connections per source (an IPv4
+/// address, an IPv6 /58), not in total.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectionCaps {
+    /// Inbound connections from one source still in the handshake: 8 by default.
+    pub max_pending_incoming_per_source: u32,
+    /// Established inbound connections: 128 by default.
+    pub max_established_incoming: u32,
+    /// Established connections both ways: 160 by default, so at least 32 are ours to dial
+    /// whatever the inbound side holds.
+    pub max_established: u32,
+}
+
+impl Default for ConnectionCaps {
+    fn default() -> Self {
+        Self {
+            max_pending_incoming_per_source: 8,
+            max_established_incoming: 128,
+            max_established: 160,
+        }
+    }
+}
+
+/// The req/resp slot. A placeholder until the req/resp behaviour takes it.
+pub type ReqRespSlot = dummy::Behaviour;
+
+/// The gossipsub slot. A placeholder until the gossipsub behaviour takes it.
+pub type GossipsubSlot = dummy::Behaviour;
+
+/// Connection limits, identify, req/resp and gossipsub, consulted in that order.
+#[derive(NetworkBehaviour)]
+pub struct Behaviour {
+    /// At most [`MAX_ESTABLISHED_PER_PEER`] established connections per peer.
+    pub limits: connection_limits::Behaviour,
+    /// Tells each peer who we are and what address we see it on, and tells us the same.
+    pub identify: identify::Behaviour,
+    pub req_resp: ReqRespSlot,
+    pub gossipsub: GossipsubSlot,
+}
+
+impl Behaviour {
+    /// The behaviour for the node whose public key is `local`, announcing `agent_version`,
+    /// under the default [`ConnectionCaps`].
+    #[must_use]
+    pub fn new(local: PublicKey, agent_version: String) -> Self {
+        Self::with_caps(local, agent_version, ConnectionCaps::default())
+    }
+
+    /// [`Behaviour::new`] under `caps`.
+    #[must_use]
+    pub fn with_caps(local: PublicKey, agent_version: String, caps: ConnectionCaps) -> Self {
+        let limits = connection_limits::ConnectionLimits::default()
+            .with_max_established_per_peer(Some(MAX_ESTABLISHED_PER_PEER))
+            .with_max_pending_incoming_per_source(Some(caps.max_pending_incoming_per_source))
+            .with_max_established_incoming(Some(caps.max_established_incoming))
+            .with_max_established(Some(caps.max_established));
+        // No address cache: nothing dials an address a peer advertised.
+        let identify = identify::Config::new(IDENTIFY_PROTOCOL_VERSION.to_owned(), local)
+            .with_agent_version(agent_version)
+            .with_cache_size(0);
+        Self {
+            limits: connection_limits::Behaviour::new(limits),
+            identify: identify::Behaviour::new(identify),
+            req_resp: dummy::Behaviour,
+            gossipsub: dummy::Behaviour,
+        }
+    }
+}
+
+/// Logs what identify learned: above all the address the peer sees us on, so a host the peer
+/// reaches only through a NAT shows up in the log. The peer's strings are logged escaped
+/// (`Debug`) and cut at [`MAX_LOGGED_CHARS`], so they cannot forge a log line.
+pub fn log_identify(event: &identify::Event) {
+    match event {
+        identify::Event::Received { peer_id, info, .. } => tracing::info!(
+            peer = %peer_id,
+            // Peer-supplied too: a `/dns` component may hold any UTF-8.
+            observed_addr = ?capped(&info.observed_addr.to_string()),
+            agent = ?capped(&info.agent_version),
+            protocol_version = ?capped(&info.protocol_version),
+            "identify: the peer sees us at observed_addr"
+        ),
+        identify::Event::Error { peer_id, error, .. } => {
+            tracing::debug!(peer = %peer_id, %error, "identify failed");
+        }
+        identify::Event::Sent { .. } | identify::Event::Pushed { .. } => {}
+    }
+}
+
+/// `text` cut to its first [`MAX_LOGGED_CHARS`] chars.
+fn capped(text: &str) -> &str {
+    text.char_indices()
+        .nth(MAX_LOGGED_CHARS)
+        .map_or(text, |(end, _)| &text[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_builds_an_idle_behaviour() {
+        use libp2p::swarm::NetworkBehaviour as _;
+        let local = libp2p::identity::Keypair::generate_secp256k1().public();
+        let mut behaviour = Behaviour::new(local, "ethswarm/test".to_owned());
+        // Identify starts with nothing to report: no connection, no cached address to dial.
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(behaviour.poll(&mut cx).is_pending());
+    }
+
+    #[test]
+    fn logged_strings_are_capped() {
+        assert_eq!(capped("lighthouse/v8"), "lighthouse/v8");
+        let long = "é".repeat(MAX_LOGGED_CHARS + 5);
+        assert_eq!(capped(&long).chars().count(), MAX_LOGGED_CHARS);
+        assert!(long.starts_with(capped(&long)));
+        let exact = "a".repeat(MAX_LOGGED_CHARS);
+        assert_eq!(capped(&exact), exact);
+    }
+}

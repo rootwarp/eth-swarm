@@ -2492,3 +2492,862 @@ impl ConnectionHandler for SinkHandler {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The probe swarm: `build_swarm` against test peers on 127.0.0.1.
+
+use crate::behaviour::{log_identify, BehaviourEvent, ConnectionCaps};
+use futures::channel::mpsc::UnboundedSender;
+use libp2p::connection_limits::Exceeded;
+use libp2p::core::transport::TransportError;
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+use libp2p::swarm::{ConnectionDenied as Denied, DialError, ListenError};
+use libp2p::{identify, yamux as yamux_};
+
+/// What a test asks a running probe swarm to do.
+enum Cmd {
+    Dial(DialOpts),
+    Disconnect(PeerId),
+}
+
+/// A probe swarm event a test waits for.
+#[derive(Debug)]
+enum Probe {
+    Listening(Multiaddr),
+    Established {
+        peer: PeerId,
+        dialer: bool,
+    },
+    Closed(PeerId),
+    /// The dial's error, with every source under it.
+    DialFailed(String),
+    /// An inbound connection refused; the `connection_limits` limit it exceeded, if that was why.
+    IncomingRefused(Option<u32>),
+    /// Identify told us the address `peer` sees us on.
+    Identified {
+        peer: PeerId,
+        observed: Multiaddr,
+    },
+}
+
+/// A running probe swarm: its commands and its events.
+struct Running {
+    cmds: UnboundedSender<Cmd>,
+    events: UnboundedReceiver<Probe>,
+    addr: Multiaddr,
+    peer: PeerId,
+}
+
+/// A probe config listening on 127.0.0.1, its metrics and their registry.
+fn probe_config() -> (Registry, PeerMetrics, SwarmConfig) {
+    let mut registry = Registry::default();
+    let transport = TransportMetrics::register(&mut registry);
+    let peers = PeerMetrics::register(&mut registry);
+    let mut cfg = SwarmConfig::new(MuxerBudget::with_defaults(&transport));
+    cfg.listen_addrs = vec![loopback()];
+    cfg.idle_connection_timeout = WAIT;
+    (registry, peers, cfg)
+}
+
+fn chain(error: &dyn std::error::Error) -> String {
+    let mut out = error.to_string();
+    let mut next = error.source();
+    while let Some(e) = next {
+        out.push_str(": ");
+        out.push_str(&e.to_string());
+        next = e.source();
+    }
+    out
+}
+
+/// Runs a probe swarm built from `cfg` on its own task, `metrics` observing every event, and
+/// waits for its listen address.
+async fn start_probe(cfg: &SwarmConfig, metrics: PeerMetrics) -> Running {
+    let mut swarm = build_swarm(Keypair::generate_secp256k1(), cfg).expect("probe swarm");
+    let peer = *swarm.local_peer_id();
+    let (cmds, mut cmd_rx) = mpsc::unbounded::<Cmd>();
+    let (tx, mut events) = mpsc::unbounded();
+    tokio::spawn(async move {
+        loop {
+            let event = tokio::select! {
+                cmd = cmd_rx.next() => {
+                    match cmd {
+                        Some(Cmd::Dial(opts)) => {
+                            if let Err(e) = swarm.dial(opts) {
+                                metrics.observe_dial_error(&e);
+                                let _ = tx.unbounded_send(Probe::DialFailed(chain(&e)));
+                            }
+                        }
+                        Some(Cmd::Disconnect(peer)) => {
+                            let _ = swarm.disconnect_peer_id(peer);
+                        }
+                        None => return,
+                    }
+                    continue;
+                }
+                event = swarm.select_next_some() => event,
+            };
+            metrics.observe(&event);
+            let seen = match event {
+                SwarmEvent::NewListenAddr { address, .. } => Probe::Listening(address),
+                SwarmEvent::ConnectionEstablished {
+                    peer_id, endpoint, ..
+                } => Probe::Established {
+                    peer: peer_id,
+                    dialer: endpoint.is_dialer(),
+                },
+                SwarmEvent::ConnectionClosed { peer_id, .. } => Probe::Closed(peer_id),
+                SwarmEvent::OutgoingConnectionError { error, .. } => {
+                    Probe::DialFailed(chain(&error))
+                }
+                SwarmEvent::IncomingConnectionError { error, .. } => {
+                    Probe::IncomingRefused(match &error {
+                        ListenError::Denied { cause } => {
+                            cause.downcast_ref::<Exceeded>().map(Exceeded::limit)
+                        }
+                        _ => None,
+                    })
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Identify(event)) => {
+                    log_identify(&event);
+                    match event {
+                        identify::Event::Received { peer_id, info, .. } => Probe::Identified {
+                            peer: peer_id,
+                            observed: info.observed_addr,
+                        },
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+            if tx.unbounded_send(seen).is_err() {
+                return;
+            }
+        }
+    });
+    let addr = probe_wait(&mut events, "a listen address", |seen| match seen {
+        Probe::Listening(addr) => Some(addr.clone()),
+        _ => None,
+    })
+    .await;
+    Running {
+        cmds,
+        events,
+        addr,
+        peer,
+    }
+}
+
+/// The next event `pick` maps to `Some`, within [`WAIT`]; a failed dial or a refused inbound
+/// connection fails the test unless `pick` takes it.
+async fn probe_wait<T>(
+    rx: &mut UnboundedReceiver<Probe>,
+    what: &str,
+    mut pick: impl FnMut(&Probe) -> Option<T>,
+) -> T {
+    let found = tokio::time::timeout(WAIT, async {
+        while let Some(seen) = rx.next().await {
+            if let Some(found) = pick(&seen) {
+                return found;
+            }
+            if let Probe::DialFailed(_) | Probe::IncomingRefused(_) = seen {
+                panic!("{what}: {seen:?}");
+            }
+        }
+        panic!("{what}: the probe swarm stopped");
+    });
+    found
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+}
+
+impl Running {
+    fn dial(&self, addr: Multiaddr) {
+        self.cmds.unbounded_send(Cmd::Dial(addr.into())).unwrap();
+    }
+
+    fn redial(&self, peer: PeerId, addr: Multiaddr) {
+        let opts = DialOpts::peer_id(peer)
+            .addresses(vec![addr])
+            .condition(PeerCondition::Always)
+            .build();
+        self.cmds.unbounded_send(Cmd::Dial(opts)).unwrap();
+    }
+
+    fn disconnect(&self, peer: PeerId) {
+        self.cmds.unbounded_send(Cmd::Disconnect(peer)).unwrap();
+    }
+
+    /// Waits for a connection to `peer`; whether we dialed it.
+    async fn established(&mut self, peer: PeerId) -> bool {
+        probe_wait(&mut self.events, "the connection", |seen| match seen {
+            Probe::Established { peer: p, dialer } if *p == peer => Some(*dialer),
+            _ => None,
+        })
+        .await
+    }
+
+    async fn closed(&mut self, peer: PeerId) {
+        probe_wait(
+            &mut self.events,
+            "the connection to close",
+            |seen| match seen {
+                Probe::Closed(p) if *p == peer => Some(()),
+                _ => None,
+            },
+        )
+        .await;
+    }
+
+    async fn dial_failed(&mut self) -> String {
+        probe_wait(&mut self.events, "the dial to fail", |seen| match seen {
+            Probe::DialFailed(e) => Some(e.clone()),
+            _ => None,
+        })
+        .await
+    }
+}
+
+fn metrics_text(registry: &Registry) -> String {
+    let mut text = String::new();
+    encode(&mut text, registry).unwrap();
+    text
+}
+
+#[test]
+fn default_config_listens_on_tcp_9000() {
+    let (_, metrics) = registered();
+    let cfg = SwarmConfig::new(MuxerBudget::with_defaults(&metrics));
+    assert_eq!(DEFAULT_TCP_PORT, 9000);
+    assert_eq!(
+        cfg.listen_addrs,
+        vec!["/ip4/0.0.0.0/tcp/9000".parse::<Multiaddr>().unwrap()]
+    );
+}
+
+#[tokio::test]
+async fn dial_and_accept_negotiate_noise_and_yamux() {
+    // Both sides are probe swarms: Noise is the only security protocol either offers, and the
+    // log lines (the negotiated muxer, identify's observed address) are checked in
+    // tests/probe_log.rs.
+    let (_r1, m1, cfg1) = probe_config();
+    let (_r2, m2, cfg2) = probe_config();
+    let mut ours = start_probe(&cfg1, m1).await;
+    let mut theirs = start_probe(&cfg2, m2).await;
+    ours.dial(theirs.addr.clone());
+
+    // Any failed negotiation (Noise or the muxer) arrives as a failed dial or a refused
+    // inbound connection, and fails the wait.
+    assert!(ours.established(theirs.peer).await);
+    assert!(!theirs.established(ours.peer).await);
+    let observed = probe_wait(&mut ours.events, "identify", |seen| match seen {
+        Probe::Identified { peer, observed } if *peer == theirs.peer => Some(observed.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(
+        observed.to_string().starts_with("/ip4/127.0.0.1/tcp/"),
+        "{observed}"
+    );
+}
+
+/// Connects a probe swarm and a test peer offering `offer`; the muxer the peer negotiated.
+async fn probe_negotiate(offer: Offer, dialer: Dialer) -> &'static str {
+    let (_registry, metrics, cfg) = probe_config();
+    let negotiated = Negotiated::default();
+    let mut ours = start_probe(&cfg, metrics).await;
+    let theirs = peer_swarm(offer, Arc::clone(&negotiated), dummy::Behaviour);
+    let peer = *theirs.local_peer_id();
+    let _theirs = match dialer {
+        Dialer::Production => {
+            let (rx, addr) = listen(theirs, no_event).await;
+            ours.dial(addr);
+            rx
+        }
+        Dialer::Peer => {
+            let mut theirs = theirs;
+            theirs.dial(ours.addr.clone()).unwrap();
+            run(theirs, no_event)
+        }
+    };
+    ours.established(peer).await;
+    // The peer records its muxer on its own task, maybe after our side reported the connection.
+    for _ in 0..(WAIT.as_millis() / 20) {
+        if let Some(name) = negotiated.lock().unwrap().first() {
+            return name;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the test peer negotiated no muxer");
+}
+
+#[tokio::test]
+async fn build_swarm_muxers() {
+    for dialer in [Dialer::Production, Dialer::Peer] {
+        assert_eq!(
+            probe_negotiate(Offer::YamuxThenMplex, dialer).await,
+            "yamux"
+        );
+        let mplex = Offer::Mplex(libp2p_mplex::Config::default());
+        assert_eq!(probe_negotiate(mplex, dialer).await, "mplex");
+    }
+}
+
+#[tokio::test]
+async fn peer_counts_follow_direction() {
+    let (registry, metrics, cfg) = probe_config();
+    let mut ours = start_probe(&cfg, metrics.clone()).await;
+    assert_eq!(metrics.peers(Direction::Inbound), 0);
+    assert_eq!(metrics.peers(Direction::Outbound), 0);
+    let text = metrics_text(&registry);
+    assert!(
+        text.contains("p2p_peers{direction=\"inbound\"} 0"),
+        "{text}"
+    );
+    assert!(
+        text.contains("p2p_peers{direction=\"outbound\"} 0"),
+        "{text}"
+    );
+
+    // Inbound: a peer dials us.
+    let mut inbound = peer_swarm(
+        Offer::YamuxThenMplex,
+        Negotiated::default(),
+        dummy::Behaviour,
+    );
+    let inbound_peer = *inbound.local_peer_id();
+    inbound.dial(ours.addr.clone()).unwrap();
+    let _inbound = run(inbound, no_event);
+    assert!(!ours.established(inbound_peer).await);
+    assert_eq!(metrics.peers(Direction::Inbound), 1);
+    assert_eq!(metrics.peers(Direction::Outbound), 0);
+
+    // Outbound: we dial a peer.
+    let outbound = peer_swarm(
+        Offer::YamuxThenMplex,
+        Negotiated::default(),
+        dummy::Behaviour,
+    );
+    let outbound_peer = *outbound.local_peer_id();
+    let (_outbound, addr) = listen(outbound, no_event).await;
+    ours.dial(addr);
+    assert!(ours.established(outbound_peer).await);
+    assert_eq!(metrics.peers(Direction::Inbound), 1);
+    assert_eq!(metrics.peers(Direction::Outbound), 1);
+    let text = metrics_text(&registry);
+    assert!(
+        text.contains("p2p_peers{direction=\"inbound\"} 1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("p2p_peers{direction=\"outbound\"} 1"),
+        "{text}"
+    );
+
+    ours.disconnect(inbound_peer);
+    ours.closed(inbound_peer).await;
+    assert_eq!(metrics.peers(Direction::Inbound), 0);
+    assert_eq!(metrics.peers(Direction::Outbound), 1);
+    ours.disconnect(outbound_peer);
+    ours.closed(outbound_peer).await;
+    assert_eq!(metrics.peers(Direction::Outbound), 0);
+}
+
+#[tokio::test]
+async fn second_connection_same_peer_refused() {
+    let (registry, metrics, cfg) = probe_config();
+    let mut ours = start_probe(&cfg, metrics.clone()).await;
+
+    // A peer without connection limits dials us twice at once (from two ports) and listens.
+    let mut theirs = peer_swarm(
+        Offer::YamuxThenMplex,
+        Negotiated::default(),
+        dummy::Behaviour,
+    );
+    let peer = *theirs.local_peer_id();
+    theirs.listen_on(loopback()).unwrap();
+    for _ in 0..2 {
+        let opts = DialOpts::peer_id(ours.peer)
+            .addresses(vec![ours.addr.clone()])
+            .condition(PeerCondition::Always)
+            .allocate_new_port()
+            .build();
+        theirs.dial(opts).unwrap();
+    }
+    let mut theirs_rx = run(theirs, no_event);
+    let theirs_addr = wait_for(
+        &mut theirs_rx,
+        "the peer's listen address",
+        |seen| match seen {
+            Seen::Listening(addr) => Some(addr),
+            _ => None,
+        },
+    )
+    .await;
+
+    // One connection is established, the other refused at the per-peer limit of 1.
+    let mut established = 0;
+    let mut refused = Vec::new();
+    while established + refused.len() < 2 {
+        let outcome = probe_wait(
+            &mut ours.events,
+            "both inbound connections",
+            |seen| match seen {
+                Probe::Established { peer: p, .. } if *p == peer => Some(None),
+                Probe::IncomingRefused(limit) => Some(Some(*limit)),
+                _ => None,
+            },
+        )
+        .await;
+        match outcome {
+            None => established += 1,
+            Some(limit) => refused.push(limit),
+        }
+    }
+    assert_eq!(established, 1);
+    assert_eq!(refused, vec![Some(1)]);
+    assert_eq!(metrics.peers(Direction::Inbound), 1);
+
+    // Our own second dial to the peer is refused the same way, and counted.
+    ours.redial(peer, theirs_addr);
+    let error = ours.dial_failed().await;
+    assert!(error.contains("connection limit"), "{error}");
+    assert_eq!(metrics.dial_failures(DialFailure::Denied), 1);
+    assert_eq!(metrics.peers(Direction::Outbound), 0);
+    let text = metrics_text(&registry);
+    assert!(
+        text.contains("p2p_dial_failures_total{reason=\"denied\"} 1"),
+        "{text}"
+    );
+}
+
+/// A security protocol we do not support: the only one the mismatched peer offers.
+#[derive(Clone)]
+struct TlsOnly;
+
+impl UpgradeInfo for TlsOnly {
+    type Info = &'static str;
+    type InfoIter = std::iter::Once<&'static str>;
+
+    fn protocol_info(&self) -> Self::InfoIter {
+        std::iter::once("/tls/1.0.0")
+    }
+}
+
+impl<C: Send + 'static> InboundConnectionUpgrade<C> for TlsOnly {
+    type Output = (PeerId, C);
+    type Error = io::Error;
+    type Future = futures::future::Ready<Result<(PeerId, C), io::Error>>;
+
+    fn upgrade_inbound(self, _: C, _: Self::Info) -> Self::Future {
+        futures::future::ready(Err(io::ErrorKind::Unsupported.into()))
+    }
+}
+
+impl<C: Send + 'static> OutboundConnectionUpgrade<C> for TlsOnly {
+    type Output = (PeerId, C);
+    type Error = io::Error;
+    type Future = futures::future::Ready<Result<(PeerId, C), io::Error>>;
+
+    fn upgrade_outbound(self, _: C, _: Self::Info) -> Self::Future {
+        futures::future::ready(Err(io::ErrorKind::Unsupported.into()))
+    }
+}
+
+#[tokio::test]
+async fn security_mismatch_fails() {
+    let (registry, metrics, cfg) = probe_config();
+    let mut ours = start_probe(&cfg, metrics.clone()).await;
+    let theirs = SwarmBuilder::with_existing_identity(Keypair::generate_secp256k1())
+        .with_tokio()
+        .with_other_transport(|_| {
+            tcp::tokio::Transport::new(tcp::Config::default())
+                .upgrade(Version::V1)
+                .authenticate(TlsOnly)
+                .multiplex(yamux_::Config::default())
+                .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
+                .boxed()
+        })
+        .unwrap()
+        .with_behaviour(|_| dummy::Behaviour)
+        .unwrap()
+        .build();
+    let (_theirs, addr) = listen(theirs, no_event).await;
+
+    ours.dial(addr);
+    let error = ours.dial_failed().await;
+    assert!(error.contains("negotiation failed"), "{error}");
+    assert_eq!(metrics.dial_failures(DialFailure::Negotiation), 1);
+    assert_eq!(metrics.peers(Direction::Outbound), 0);
+    let text = metrics_text(&registry);
+    assert!(
+        text.contains("p2p_dial_failures_total{reason=\"negotiation\"} 1"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn refused_dial_is_counted() {
+    let (_registry, metrics, cfg) = probe_config();
+    let mut ours = start_probe(&cfg, metrics.clone()).await;
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+
+    ours.dial(format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap());
+    ours.dial_failed().await;
+    assert_eq!(metrics.dial_failures(DialFailure::Refused), 1);
+}
+
+#[tokio::test]
+async fn silent_peer_times_out() {
+    let (_registry, metrics, mut cfg) = probe_config();
+    cfg.connection_timeout = Duration::from_millis(300);
+    let mut ours = start_probe(&cfg, metrics.clone()).await;
+    // Accepts the TCP connection and never answers multistream-select.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = silent.local_addr().unwrap().port();
+    let _held = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = silent.accept().await {
+            held.push(socket);
+        }
+    });
+
+    ours.dial(format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap());
+    ours.dial_failed().await;
+    assert_eq!(metrics.dial_failures(DialFailure::Timeout), 1);
+}
+
+/// Wraps an `io::Error` and, like `Either`, reports no source.
+#[derive(Debug)]
+struct Hidden(io::Error);
+
+impl std::fmt::Display for Hidden {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for Hidden {}
+
+#[tokio::test]
+async fn quic_listen_address_is_refused() {
+    // TCP only: a QUIC listen address is not one the transport supports.
+    let (_registry, _metrics, mut cfg) = probe_config();
+    let quic: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
+    cfg.listen_addrs = vec![quic.clone()];
+    match build_swarm(Keypair::generate_secp256k1(), &cfg) {
+        Err(BuildError::Listen {
+            addr,
+            source: TransportError::MultiaddrNotSupported(_),
+        }) => assert_eq!(addr, quic),
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("listening on {quic}"),
+    }
+}
+
+#[test]
+fn dial_failure_reasons() {
+    let addr: Multiaddr = "/ip4/127.0.0.1/tcp/9000".parse().unwrap();
+    let transport =
+        |e: io::Error| DialError::Transport(vec![(addr.clone(), TransportError::Other(e))]);
+    let cases = [
+        (DialError::NoAddresses, DialFailure::Other),
+        (DialError::Aborted, DialFailure::Other),
+        (
+            DialError::LocalPeerId {
+                address: addr.clone(),
+            },
+            DialFailure::Other,
+        ),
+        (
+            DialError::DialPeerConditionFalse(PeerCondition::Disconnected),
+            DialFailure::Other,
+        ),
+        (
+            DialError::WrongPeerId {
+                obtained: PeerId::random(),
+                address: addr.clone(),
+            },
+            DialFailure::WrongPeerId,
+        ),
+        (
+            DialError::Denied {
+                cause: Denied::new(io::Error::other("no")),
+            },
+            DialFailure::Denied,
+        ),
+        (
+            transport(io::ErrorKind::ConnectionRefused.into()),
+            DialFailure::Refused,
+        ),
+        (
+            transport(io::ErrorKind::TimedOut.into()),
+            DialFailure::Timeout,
+        ),
+        (
+            transport(io::ErrorKind::BrokenPipe.into()),
+            DialFailure::Transport,
+        ),
+        (
+            transport(io::Error::other(
+                libp2p::core::upgrade::NegotiationError::Failed,
+            )),
+            DialFailure::Negotiation,
+        ),
+        (
+            transport(io::Error::other(noise::Error::BadSignature)),
+            DialFailure::Negotiation,
+        ),
+        // A Noise message that fails to decrypt or decode: the handshake failed.
+        (
+            transport(io::Error::other(noise::Error::Io(
+                io::ErrorKind::InvalidData.into(),
+            ))),
+            DialFailure::Negotiation,
+        ),
+        (
+            transport(io::Error::other(noise::Error::Io(
+                io::ErrorKind::TimedOut.into(),
+            ))),
+            DialFailure::Timeout,
+        ),
+        (
+            transport(io::Error::other(noise::Error::Io(io::Error::other(
+                libp2p::core::upgrade::NegotiationError::Failed,
+            )))),
+            DialFailure::Negotiation,
+        ),
+        (
+            DialError::Transport(vec![(
+                addr.clone(),
+                TransportError::MultiaddrNotSupported(addr.clone()),
+            )]),
+            DialFailure::Transport,
+        ),
+        (DialError::Transport(Vec::new()), DialFailure::Transport),
+        // A cause whose `source` hides the io::Error it holds, as `Either` does.
+        (
+            transport(io::Error::other(Hidden(io::ErrorKind::TimedOut.into()))),
+            DialFailure::Timeout,
+        ),
+        (
+            transport(io::Error::other(Hidden(
+                io::ErrorKind::ConnectionRefused.into(),
+            ))),
+            DialFailure::Refused,
+        ),
+        (
+            transport(io::Error::other(Hidden(io::Error::other("closed")))),
+            DialFailure::Transport,
+        ),
+    ];
+    for (error, want) in cases {
+        assert_eq!(DialFailure::of(&error), want, "{error:?}");
+    }
+    let names: Vec<_> = DialFailure::ALL.iter().map(|r| r.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "negotiation",
+            "wrong_peer_id",
+            "denied",
+            "refused",
+            "timeout",
+            "transport",
+            "other"
+        ]
+    );
+}
+
+/// The TCP port of a `/ip4/../tcp/<port>` address.
+fn tcp_port(addr: &Multiaddr) -> u16 {
+    addr.iter()
+        .find_map(|p| match p {
+            libp2p::multiaddr::Protocol::Tcp(port) => Some(port),
+            _ => None,
+        })
+        .expect("a TCP address")
+}
+
+#[tokio::test]
+async fn garbage_noise_handshake_is_negotiation() {
+    let (registry, metrics, cfg) = probe_config();
+    let mut ours = start_probe(&cfg, metrics.clone()).await;
+    // Agrees to /noise through multistream-select, then answers XX message 1 with garbage.
+    let responder = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = responder.local_addr().unwrap().port();
+    let _responder = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut socket, _) = responder.accept().await.unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0; 1024];
+        while !seen.windows(7).any(|w| w == b"/noise\n") {
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0, "the dialer closed before proposing /noise");
+            seen.extend_from_slice(&buf[..n]);
+        }
+        let mut reply = b"\x13/multistream/1.0.0\n\x07/noise\n".to_vec();
+        reply.extend_from_slice(&200u16.to_be_bytes());
+        reply.extend_from_slice(&[0xa5; 200]);
+        socket.write_all(&reply).await.unwrap();
+        // Hold the socket until the dialer gives up.
+        while socket.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+    });
+
+    ours.dial(format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap());
+    let error = ours.dial_failed().await;
+    assert_eq!(
+        metrics.dial_failures(DialFailure::Negotiation),
+        1,
+        "{error}"
+    );
+    assert_eq!(metrics.dial_failures(DialFailure::Transport), 0, "{error}");
+    let text = metrics_text(&registry);
+    assert!(
+        text.contains("p2p_dial_failures_total{reason=\"negotiation\"} 1"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn muxer_mismatch_is_negotiation() {
+    // A yamux-only dialer against an mplex-only listener: Noise succeeds, no muxer is common.
+    let (registry, metrics, _) = probe_config();
+    let listener = peer_swarm(
+        Offer::Mplex(libp2p_mplex::Config::default()),
+        Negotiated::default(),
+        dummy::Behaviour,
+    );
+    let (_listener, addr) = listen(listener, no_event).await;
+    let mut dialer = SwarmBuilder::with_existing_identity(Keypair::generate_secp256k1())
+        .with_tokio()
+        .with_other_transport(|key| -> PeerTransport {
+            Ok(tcp::tokio::Transport::new(tcp::Config::default())
+                .upgrade(Version::V1)
+                .authenticate(noise::Config::new(key)?)
+                .multiplex(yamux_::Config::default())
+                .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
+                .boxed())
+        })
+        .unwrap()
+        .with_behaviour(|_| dummy::Behaviour)
+        .unwrap()
+        .build();
+    dialer.dial(addr).unwrap();
+    let failed = tokio::time::timeout(WAIT, async {
+        loop {
+            let event = dialer.select_next_some().await;
+            metrics.observe(&event);
+            match event {
+                SwarmEvent::OutgoingConnectionError { error, .. } => return chain(&error),
+                SwarmEvent::ConnectionEstablished { .. } => {
+                    panic!("no common muxer, yet connected")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the dial to fail");
+    assert_eq!(
+        metrics.dial_failures(DialFailure::Negotiation),
+        1,
+        "{failed}"
+    );
+    let text = metrics_text(&registry);
+    assert!(
+        text.contains("p2p_dial_failures_total{reason=\"negotiation\"} 1"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn pending_inbound_over_the_cap_is_refused() {
+    let (_registry, metrics, mut cfg) = probe_config();
+    cfg.caps.max_pending_incoming_per_source = 1;
+    let mut ours = start_probe(&cfg, metrics).await;
+    // Two TCP connections that never start multistream-select stay pending.
+    let target = std::net::SocketAddr::from(([127, 0, 0, 1], tcp_port(&ours.addr)));
+    let _first = tokio::net::TcpStream::connect(target).await.unwrap();
+    let _second = tokio::net::TcpStream::connect(target).await.unwrap();
+    let limit = probe_wait(
+        &mut ours.events,
+        "a refused pending connection",
+        |seen| match seen {
+            Probe::IncomingRefused(limit) => Some(*limit),
+            _ => None,
+        },
+    )
+    .await;
+    assert_eq!(limit, Some(1));
+}
+
+#[tokio::test]
+async fn established_caps_refuse_extra_connections() {
+    let (_registry, metrics, mut cfg) = probe_config();
+    cfg.caps.max_established_incoming = 1;
+    cfg.caps.max_established = 1;
+    let mut ours = start_probe(&cfg, metrics.clone()).await;
+
+    // Two peers dial us; one is established, the other refused at the inbound cap of 1.
+    let mut peers = Vec::new();
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let mut theirs = peer_swarm(
+            Offer::YamuxThenMplex,
+            Negotiated::default(),
+            dummy::Behaviour,
+        );
+        peers.push(*theirs.local_peer_id());
+        theirs.dial(ours.addr.clone()).unwrap();
+        runs.push(run(theirs, no_event));
+    }
+    let (mut established, mut refused) = (0, Vec::new());
+    while established + refused.len() < 2 {
+        let outcome = probe_wait(
+            &mut ours.events,
+            "both inbound connections",
+            |seen| match seen {
+                Probe::Established { peer, .. } if peers.contains(peer) => Some(None),
+                Probe::IncomingRefused(limit) => Some(Some(*limit)),
+                _ => None,
+            },
+        )
+        .await;
+        match outcome {
+            None => established += 1,
+            Some(limit) => refused.push(limit),
+        }
+    }
+    assert_eq!(established, 1);
+    assert_eq!(refused, vec![Some(1)]);
+
+    // At the total cap of 1, our own dial is refused too.
+    let outbound = peer_swarm(
+        Offer::YamuxThenMplex,
+        Negotiated::default(),
+        dummy::Behaviour,
+    );
+    let (_outbound, addr) = listen(outbound, no_event).await;
+    ours.dial(addr);
+    let error = ours.dial_failed().await;
+    assert!(error.contains("connection limit"), "{error}");
+    assert_eq!(metrics.dial_failures(DialFailure::Denied), 1);
+    assert_eq!(metrics.peers(Direction::Inbound), 1);
+    assert_eq!(metrics.peers(Direction::Outbound), 0);
+}
+
+#[test]
+fn default_caps() {
+    let caps = ConnectionCaps::default();
+    assert_eq!(caps.max_pending_incoming_per_source, 8);
+    assert_eq!(caps.max_established_incoming, 128);
+    assert_eq!(caps.max_established, 160);
+    let (_, metrics) = registered();
+    assert_eq!(
+        SwarmConfig::new(MuxerBudget::with_defaults(&metrics)).caps,
+        caps
+    );
+}

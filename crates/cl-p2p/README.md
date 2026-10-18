@@ -1,7 +1,51 @@
 # cl-p2p
 
-The `ethswarm.p2p.v1` service stub, the outbound req/resp codec (`src/rpc`), and the
-`m2a-session` binary, which dials one pinned reference node and nothing else.
+The `ethswarm.p2p.v1` service stub, the outbound req/resp codec (`src/rpc`), the probe swarm
+(`transport::build_swarm`, `src/behaviour.rs`), and the `m2a-session` binary, which dials one
+pinned reference node and nothing else.
+
+## Probe swarm
+
+`transport::build_swarm(keypair, &cfg)` builds the swarm on TCP (`nodelay`), Noise XX and the
+muxers yamux then mplex (mplex under the per-connection budget), and listens on every
+`cfg.listen_addrs` address, `/ip4/0.0.0.0/tcp/9000` by default; it dials over the same transport.
+The behaviour is `connection_limits`, identify (`eth2/1.0.0`, no address cache: nothing dials
+an address a peer advertised), and placeholder slots for req/resp and gossipsub. The connection
+caps (`SwarmConfig::caps`): one established connection per peer, 8 pending inbound per source
+(IPv4 address or IPv6 /58; the pinned `connection_limits` has no total pending cap), 128
+established inbound, 160 established in total.
+
+The owner's event loop passes every swarm event to `PeerMetrics::observe` and every identify
+event to `behaviour::log_identify`. Metrics, on the registry the service passes in:
+
+- `p2p_peers{direction="inbound"|"outbound"}`: established connections by who dialed (one per
+  peer, so the peer count).
+- `p2p_dial_failures_total{reason}`: `negotiation` (no common security or muxer protocol, or
+  any Noise failure but a timeout), `wrong_peer_id`, `denied`, `refused`, `timeout`,
+  `transport`, `other`.
+
+Log lines: `negotiated a stream muxer` (`muxer="/yamux/1.0.0"` or `"/mplex/6.7.0"`, `role`) per
+connection, `connection established` with `peer`, `direction` and `addr`, and identify's
+`observed_addr`, the address the peer sees us on (a NAT'd host shows its public address there,
+or an address nobody can dial). The peer's identify strings are logged escaped and cut at 128
+chars.
+
+## Deviations
+
+### TCP only, no QUIC
+
+`phase0/p2p-interface.md` (consensus-specs v1.7.0-beta.4, §Transport, L154–161): "All
+implementations MUST support the QUIC (UDP) libp2p transport and the TCP libp2p transport. Any
+supported transport MUST be enabled for both dialing and listening", and "QUIC is the primary
+transport. When a peer is reachable over both TCP and QUIC, clients SHOULD prioritise peer's QUIC
+addresses."
+
+The probe swarm builds TCP only: it neither dials nor listens on QUIC, and it does not prefer a
+peer's QUIC addresses. TCP is enabled both ways, so the "dialing and listening" MUST holds for
+the one transport we support. Peers we reach are those with a TCP address, which every client
+must have; a QUIC-only peer is out of reach. Closed by
+[#154](https://github.com/rootwarp/eth-swarm/issues/154): QUIC dial and listen next to TCP on
+IPv4, with at least one peer each way.
 
 ## m2a-session
 

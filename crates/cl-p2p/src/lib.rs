@@ -7,8 +7,10 @@
 //!
 //! [`rpc`] is the outbound req/resp codec over libp2p `request_response`, [`m2a_session`]
 //! the pinned-peer session the `m2a-session` binary runs, and [`transport`] the TCP muxers
-//! (yamux first, then mplex under its stream, buffer and per-connection caps).
+//! (yamux first, then mplex under its stream, buffer and per-connection caps) and the probe
+//! swarm over them ([`transport::build_swarm`], with [`behaviour`]).
 
+pub mod behaviour;
 pub mod m2a_session;
 pub mod rpc;
 #[cfg(any(test, feature = "testkit"))]
