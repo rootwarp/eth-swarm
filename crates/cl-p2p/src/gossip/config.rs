@@ -14,13 +14,17 @@
 //!   the subscriptions to topics we subscribe ourselves, from RPCs of bounded size.
 //! - Metric labels for our own topics only ([`metrics_config`]).
 //! - Mesh push only: IHAVE is ignored, so no IWANT is sent.
+//!
+//! [`GossipConfig::ethereum_profile`] takes `seen_ttl` from a network's [`ChainConfig`].
 
 use super::GossipError;
+use consensus_types::EthSpec;
 use libp2p::gossipsub;
 use libp2p::gossipsub::{
     DataTransform, MaxCountSubscriptionFilter, Message, MessageId, MetricsConfig, RawMessage,
     TopicHash, WhitelistSubscriptionFilter,
 };
+use network_config::ChainConfig;
 use p2p_wire::gossip::{message_id_of_decompressed, GossipTopic, SnappyTransform, TopicCaps};
 use p2p_wire::rpc::codec::max_compressed_len;
 use std::collections::HashSet;
@@ -142,6 +146,21 @@ impl GossipConfig {
             heartbeat_interval: HEARTBEAT_INTERVAL,
             heartbeat_initial_delay: HEARTBEAT_INITIAL_DELAY,
         }
+    }
+
+    /// The Ethereum gossip profile of `chain` under the preset `E`: `topics` held to `caps`,
+    /// and seen ids remembered for [`seen_ttl`] of the network's `SLOT_DURATION_MS` and `E`'s
+    /// `SLOTS_PER_EPOCH`. [`Self::gossipsub`] builds the gossipsub `Config` from it.
+    pub fn ethereum_profile<E: EthSpec>(
+        chain: &ChainConfig,
+        topics: Vec<GossipTopic>,
+        caps: TopicCaps,
+    ) -> Self {
+        Self::new(
+            topics,
+            caps,
+            seen_ttl(chain.slot_duration_ms(), E::slots_per_epoch()),
+        )
     }
 
     /// The gossipsub configuration: see the module docs.
@@ -269,6 +288,7 @@ mod tests {
     use super::*;
     use consensus_types::caps::NetworkCaps;
     use consensus_types::Mainnet;
+    use network_config::Network;
     use p2p_wire::gossip::GossipKind;
 
     const BLOCK: &str = "/eth2/00000000/beacon_block/ssz_snappy";
@@ -324,6 +344,143 @@ mod tests {
             c.message_id(&m),
             MessageId::new(&message_id_of_decompressed(BLOCK, b"hello"))
         );
+    }
+
+    /// The phase0 gossipsub parameters, read back from the built `Config` of the Ethereum
+    /// profile of each pinned network (`phase0/p2p-interface.md` "The gossip domain").
+    #[test]
+    fn built_values() {
+        for network in Network::ALL {
+            let chain = ChainConfig::load(network).unwrap();
+            let profile = GossipConfig::ethereum_profile::<Mainnet>(
+                &chain,
+                vec![GossipTopic::new([0; 4], GossipKind::BeaconBlock)],
+                config().caps,
+            );
+            let c = profile.gossipsub().unwrap();
+            let name = network.name();
+            assert_eq!(
+                (c.mesh_n(), c.mesh_n_low(), c.mesh_n_high(), c.gossip_lazy()),
+                (8, 6, 12, 6),
+                "{name}: D, D_low, D_high, D_lazy"
+            );
+            assert_eq!(c.heartbeat_interval(), Duration::from_millis(700), "{name}");
+            assert_eq!(c.fanout_ttl(), Duration::from_secs(60), "{name}");
+            assert_eq!(
+                (c.history_length(), c.history_gossip()),
+                (6, 3),
+                "{name}: mcache_len, mcache_gossip"
+            );
+            // seen_ttl: 2 epochs of the network's SLOT_DURATION_MS.
+            assert_eq!(chain.slot_duration_ms(), 12_000, "{name}");
+            assert_eq!(
+                c.duplicate_cache_time(),
+                Duration::from_millis(2 * 32 * chain.slot_duration_ms()),
+                "{name}"
+            );
+            assert_eq!(c.duplicate_cache_time(), Duration::from_secs(768), "{name}");
+            // max_message_size() of the network's MAX_PAYLOAD_SIZE.
+            assert_eq!(chain.max_payload_size(), MAX_PAYLOAD_SIZE as u64, "{name}");
+            assert_eq!(c.max_transmit_size(), 12_234_442, "{name}");
+            assert!(
+                matches!(c.validation_mode(), gossipsub::ValidationMode::Anonymous),
+                "{name}: StrictNoSign"
+            );
+            assert!(c.validate_messages(), "{name}");
+            assert_eq!(c.max_ihave_messages_heartbeat(), 0, "{name}");
+            assert_eq!(c.max_control_message_size(), 46_898, "{name}");
+        }
+    }
+
+    /// The Altair message-id the built `Config` computes (`altair/p2p-interface.md` "Topics and
+    /// messages"): `SHA256(MESSAGE_DOMAIN_VALID_SNAPPY ‖ uint_to_bytes(Uint64(len(topic))) ‖
+    /// topic ‖ decompressed data)[:20]`. The expected ids were computed independently (Python
+    /// hashlib) from that formula; `p2p_wire::gossip::message_id`'s tests hold the raw-data rule
+    /// and its invalid-snappy branch.
+    #[test]
+    fn message_id_altair() {
+        use p2p_wire::gossip::message_id::MESSAGE_DOMAIN_VALID_SNAPPY;
+        assert_eq!(MESSAGE_DOMAIN_VALID_SNAPPY, [0x01, 0x00, 0x00, 0x00]);
+        let c = config().gossipsub().unwrap();
+        let data: Vec<u8> = (0..32).collect();
+        let id = |topic: &str| {
+            let m = Message {
+                source: None,
+                data: data.clone(),
+                sequence_number: None,
+                topic: TopicHash::from_raw(topic),
+            };
+            assert_eq!(c.message_id(&m), message_id(&m), "{topic}");
+            c.message_id(&m)
+        };
+        let hex = |id: MessageId| -> String { id.0.iter().map(|b| format!("{b:02x}")).collect() };
+        // Preimage: 01000000 ‖ 2600000000000000 (38, little-endian) ‖ topic ‖ 00 01 .. 1f.
+        assert_eq!(BLOCK.len(), 38);
+        assert_eq!(hex(id(BLOCK)), "a34b6f35360fd0be1a1eac23d85f04a71e75fc63");
+        // Only the topic's fork digest differs: another id.
+        let other = "/eth2/00000001/beacon_block/ssz_snappy";
+        assert_eq!(hex(id(other)), "5fbf5fcb0858392bfb003e3cd88252f0b5216aaf");
+        assert_ne!(id(BLOCK), id(other));
+    }
+
+    /// StrictNoSign on the wire (`phase0/p2p-interface.md` "Topics and messages"): a scripted
+    /// peer writes raw protobuf `Message`s to the probe, each carrying one of `from`, `seqno`,
+    /// `signature` and `key`. Each is refused and never delivered: a marker sent after it on
+    /// the same stream is delivered, it is not. The same data on the same topic without the
+    /// field is delivered afterwards, so only the field was refused. The `key` case holds only
+    /// at a rust-libp2p revision with the gossipsub `key` rejection.
+    #[tokio::test]
+    async fn strict_no_sign_wire() {
+        use crate::gossip::tests::{compressed, handled, id_of, payload, rpc, topic};
+        use crate::gossip::tests::{Probe, Scripted};
+        use libp2p::identity::Keypair;
+        let probe = Probe::spawn(16).await;
+        let center = &probe.center;
+        let mut scripted = Scripted::connect(&center.addr).await;
+        let topic = topic().to_string();
+        let author = Keypair::generate_secp256k1().public();
+        let from = author.to_peer_id().to_bytes();
+        let key = author.encode_protobuf();
+        let seqno = 1u64.to_be_bytes();
+        let signature = [0x5a; 64];
+        // `rpc.proto` field numbers of `Message`.
+        let forbidden: [(&str, u64, &[u8]); 4] = [
+            ("from", 1, &from),
+            ("seqno", 3, &seqno),
+            ("signature", 5, &signature),
+            ("key", 6, &key),
+        ];
+        let ssz = |name: &str| payload(name, 0, 100);
+
+        for (name, field, value) in forbidden {
+            let data = compressed(&ssz(name));
+            scripted
+                .send(&rpc::publish_with(&topic, &data, &[(field, value)]))
+                .await;
+            handled(center, &mut scripted, &format!("after-{name}")).await;
+            assert!(
+                !center.has(&id_of(&ssz(name))),
+                "a message carrying `{name}` was delivered"
+            );
+        }
+
+        for (name, _, _) in forbidden {
+            scripted
+                .send(&rpc::publish(&topic, [&compressed(&ssz(name))[..]]))
+                .await;
+        }
+        handled(center, &mut scripted, "after-clean").await;
+        for (name, _, _) in forbidden {
+            assert!(center.has(&id_of(&ssz(name))), "clean `{name}` message");
+        }
+        // Four markers, four clean messages and the last marker: nothing else reached the
+        // probe's application or its counters.
+        let delivered = 4 + 4 + 1;
+        assert_eq!(center.delivered().len(), delivered);
+        let metrics = probe.metrics();
+        assert_eq!(metrics.sum("topic_msg_recv_counts"), delivered as u64);
+        assert_eq!(metrics.sum("ignored_messages_per_topic"), delivered as u64);
+        assert_eq!(metrics.sum("accepted_messages_per_topic"), 0);
     }
 
     #[test]

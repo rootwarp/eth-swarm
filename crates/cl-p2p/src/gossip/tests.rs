@@ -71,13 +71,13 @@ pub(super) fn payload(tag: &str, i: usize, len: usize) -> Vec<u8> {
     out
 }
 
-fn compressed(ssz: &[u8]) -> Vec<u8> {
+pub(super) fn compressed(ssz: &[u8]) -> Vec<u8> {
     SnappyTransform::new(caps())
         .outbound(&topic().to_string(), ssz)
         .unwrap()
 }
 
-fn id_of(ssz: &[u8]) -> MessageId {
+pub(super) fn id_of(ssz: &[u8]) -> MessageId {
     MessageId::new(&p2p_wire::gossip::message_id_of_decompressed(
         &topic().to_string(),
         ssz,
@@ -139,7 +139,7 @@ where
 }
 
 impl Center {
-    fn delivered(&self) -> Vec<Delivered> {
+    pub(super) fn delivered(&self) -> Vec<Delivered> {
         self.delivered.lock().unwrap().clone()
     }
 
@@ -154,7 +154,7 @@ impl Center {
             .unwrap_or_default()
     }
 
-    fn has(&self, id: &MessageId) -> bool {
+    pub(super) fn has(&self, id: &MessageId) -> bool {
         self.delivered.lock().unwrap().iter().any(|d| &d.id == id)
     }
 
@@ -742,14 +742,14 @@ impl ConnectionHandler for RawHandler {
 
 /// A peer that speaks meshsub by hand: it writes RPCs on its stream to the centre, and keeps
 /// every byte the centre writes on its streams to it.
-struct Scripted {
+pub(super) struct Scripted {
     peer: PeerId,
     out: Stream,
     read: Arc<Mutex<Vec<StreamBytes>>>,
 }
 
 impl Scripted {
-    async fn connect(center: &Multiaddr) -> Self {
+    pub(super) async fn connect(center: &Multiaddr) -> Self {
         let mut swarm = SwarmBuilder::with_existing_identity(Keypair::generate_secp256k1())
             .with_tokio()
             .with_tcp(
@@ -798,7 +798,7 @@ impl Scripted {
     }
 
     /// Writes `rpc` as one length-prefixed frame.
-    async fn send(&mut self, rpc: &[u8]) {
+    pub(super) async fn send(&mut self, rpc: &[u8]) {
         let mut frame = Vec::with_capacity(rpc.len() + 10);
         encode_varint(rpc.len() as u64, &mut frame);
         frame.extend_from_slice(rpc);
@@ -817,7 +817,7 @@ impl Scripted {
 }
 
 /// gossipsub `RPC` encoders (`rpc.proto`): just the fields the scripted peer sends.
-mod rpc {
+pub(super) mod rpc {
     use super::encode_varint;
 
     fn bytes(field: u64, value: &[u8], out: &mut Vec<u8>) {
@@ -851,6 +851,20 @@ mod rpc {
             bytes(4, topic.as_bytes(), &mut message);
             bytes(2, &message, &mut out);
         }
+        out
+    }
+
+    /// One `publish` entry, `Message { data, topic }`, with each `(field, value)` of `extra`
+    /// appended as a bytes field.
+    pub fn publish_with(topic: &str, data: &[u8], extra: &[(u64, &[u8])]) -> Vec<u8> {
+        let mut message = Vec::new();
+        bytes(2, data, &mut message);
+        bytes(4, topic.as_bytes(), &mut message);
+        for (field, value) in extra {
+            bytes(*field, value, &mut message);
+        }
+        let mut out = Vec::new();
+        bytes(2, &message, &mut out);
         out
     }
 
@@ -1242,7 +1256,7 @@ fn the_parser_counts_publish_apart_from_control() {
 
 /// Sends a fresh message from `scripted` and waits until the centre delivered it: every RPC
 /// sent before it has been handled.
-async fn handled(center: &Center, scripted: &mut Scripted, tag: &str) {
+pub(super) async fn handled(center: &Center, scripted: &mut Scripted, tag: &str) {
     let marker = payload(tag, 0, 100);
     scripted
         .send(&rpc::publish(
