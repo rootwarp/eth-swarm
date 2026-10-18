@@ -1,49 +1,83 @@
-//! The harness behind the req/resp decoder fuzz targets, shared with the corpus tests and the
-//! seed generator.
+//! The harness behind the fuzz targets, shared with the corpus tests and the seed generator.
 //!
-//! Each target feeds peer bytes to the exact decoder the `m2a-session` binary runs, with the
-//! mainnet preset (the session's) and the fixture [`ContextTable`] (no network config runs on
-//! peer bytes, so none runs here either). A decode error is the expected outcome for most
-//! inputs; what must never happen is a panic, an allocation past the libFuzzer limits the gate
-//! sets, or an accepted input that breaks one of these invariants:
+//! Each target feeds peer bytes to the exact entry point the binaries run on them, with the
+//! mainnet preset (the session's and the probe's) and the fixture [`ContextTable`] (no network
+//! config runs on peer bytes, so none runs here either). A decode error is the expected outcome
+//! for most inputs; what must never happen is a panic, an allocation past the libFuzzer limits
+//! the gates set, or an accepted input that breaks one of the invariants below.
+//!
+//! The req/resp control targets (`status_v2`, `metadata_v3`, `ping_goodbye`) run the timed codec
+//! (the `timed` module: `cl_p2p::rpc::codec`'s `RpcCodec` and `InboundCodec`, under the
+//! production deadlines), both directions: the first byte selects a response read on an outbound stream or,
+//! with [`REQUEST_BIT`] (or, for `ping_goodbye`, [`GOODBYE_BIT`]), a request read on an inbound
+//! one. Each result is held to the stateless decoder's (`decode_response_chunk`,
+//! `decode_request`) on the same bytes:
 //!
 //! - an accepted chunk's payload decodes on its own through `decode_chunk` (with the bound of
 //!   its result code and context), and the decoded value re-encodes to exactly those SSZ bytes;
 //! - the scanner agrees with the decoder: an accepted chunk scans as complete at its full length;
 //! - a success chunk decodes to the protocol's own response type, a block in the fork its
 //!   context bytes name, and an error chunk carries the result byte it was sent with;
+//! - the codec accepts a response exactly when the chunk decoder accepts it (and returns that
+//!   chunk), and a request exactly when the request decoder does (and returns that request);
 //! - a `BeaconBlocksByRange` response holds at most the request's chunk limit, an error chunk
 //!   only last, and every input byte was consumed (nothing may follow an error chunk); every chunk
 //!   the reader decoded meets the chunk invariants, also when it then refuses the stream.
+//!
+//! The other targets: [`rpc_chunk`] (one chunk or request payload of any protocol, and the
+//! incremental scanners), [`gossip_transform`] and [`message_id`] (the gossip transform, the Gloas
+//! block decode and the message-id) and [`enr_fields`] (a node record's `eth2`, `cgc` and `nfd`).
 
+mod chunk;
+mod gossip;
+mod record;
 pub mod seeds;
+mod timed;
 
-use cl_p2p::rpc::codec::{read_response_chunks, ReadError};
+pub use chunk::{rpc_chunk, REQUEST_SELECTOR};
+pub use gossip::{gossip_transform, message_id, message_input, split_message, topic_caps};
+pub use record::{
+    enr_fields, signed_record, structured_input, structured_record, RecordSpec, RecordValue,
+    MAX_RECORD_LEN, STRUCTURED_BIT,
+};
+
+use cl_p2p::rpc::codec::{read_response_chunks, ReadError, ReceivedChunk, RpcRequest};
 use consensus_types::Mainnet;
 use futures::executor::block_on;
 use futures::io::Cursor;
 use p2p_wire::rpc::codec::{
-    decode_chunk, decode_response_chunk, scan_response_chunk, ContextTable, Scan, CONTEXT_BYTES_LEN,
+    decode_chunk, decode_chunk_within, decode_request, decode_response_chunk, scan_response_chunk,
+    ContextTable, Scan, CONTEXT_BYTES_LEN,
 };
-use p2p_wire::rpc::messages::{BlocksByRangeV2Request, ForkDigest, Goodbye};
+use p2p_wire::rpc::messages::{BlocksByRangeV2Request, ForkDigest, Ping};
 use p2p_wire::rpc::protocols::{Protocol, Request, Response, ResponseChunk, ResultCode};
-use ssz::{Decode, Encode};
+use ssz::Encode;
+use std::io;
 use std::sync::OnceLock;
 
-/// The preset the `m2a-session` binary decodes with.
+/// The preset the `m2a-session` binary and the probe decode with.
 pub type E = Mainnet;
 
-/// The four targets, by name.
-pub const TARGETS: [&str; 4] = [
+/// Every target, by name: the four of the m2a gate (`fuzz/run-m2a-gate.sh`), then the four
+/// `fuzz/run-gate1.sh` adds to its three control targets.
+pub const TARGETS: [&str; 8] = [
     "status_v2",
     "metadata_v3",
     "ping_goodbye",
     "blocks_by_range_resp",
+    "rpc_chunk",
+    "gossip_transform",
+    "message_id",
+    "enr_fields",
 ];
 
-/// `ping_goodbye`: a first byte with this bit clear selects a `Ping` response chunk, set a
-/// `Goodbye` payload.
+/// `ping_goodbye`: a first byte with this bit set selects a `Goodbye` request (the body a
+/// disconnecting peer sends); clear, a `Ping` (see [`REQUEST_BIT`]).
 pub const GOODBYE_BIT: u8 = 1;
+
+/// The control targets: a first byte with this bit set selects an inbound request of the
+/// protocol, clear the response to our request.
+pub const REQUEST_BIT: u8 = 2;
 
 /// The fixture context table: Fulu (two digests) and Gloas.
 pub fn contexts() -> &'static ContextTable {
@@ -60,31 +94,128 @@ pub fn run(name: &str, data: &[u8]) -> bool {
         "blocks_by_range_resp" => {
             blocks_by_range_resp(data);
         }
+        "rpc_chunk" => rpc_chunk(data),
+        "gossip_transform" => gossip_transform(data),
+        "message_id" => message_id(data),
+        "enr_fields" => enr_fields(data),
         _ => return false,
     }
     true
 }
 
-/// `status_v2`: `data` is one `Status` v2 response chunk.
+/// `status_v2`: after the selector byte, one `Status` v2 response chunk, or with
+/// [`REQUEST_BIT`] an inbound `Status` request.
 pub fn status_v2(data: &[u8]) {
-    single_chunk(Protocol::StatusV2, data);
+    control(Protocol::StatusV2, data);
 }
 
-/// `metadata_v3`: `data` is one `MetaData` v3 response chunk.
+/// `metadata_v3`: after the selector byte, one `MetaData` v3 response chunk, or with
+/// [`REQUEST_BIT`] an inbound `GetMetaData` request (which must be empty).
 pub fn metadata_v3(data: &[u8]) {
-    single_chunk(Protocol::MetaDataV3, data);
+    control(Protocol::MetaDataV3, data);
 }
 
-/// `ping_goodbye`: the first byte selects ([`GOODBYE_BIT`]) a `Ping` response chunk or a
-/// `Goodbye` payload (the request body a disconnecting peer sends) for the rest.
+/// `ping_goodbye`: after the selector byte, an inbound `Goodbye` request ([`GOODBYE_BIT`]), else
+/// an inbound `Ping` request ([`REQUEST_BIT`]) or one `Ping` response chunk.
 pub fn ping_goodbye(data: &[u8]) {
     let Some((&selector, rest)) = data.split_first() else {
         return;
     };
-    if selector & GOODBYE_BIT == 0 {
-        single_chunk(Protocol::PingV1, rest);
+    if selector & GOODBYE_BIT != 0 {
+        request(Protocol::GoodbyeV1, rest);
     } else {
-        goodbye(rest);
+        control(Protocol::PingV1, data);
+    }
+}
+
+/// The selector byte's [`REQUEST_BIT`] picks the direction of `protocol` for the rest.
+fn control(protocol: Protocol, data: &[u8]) {
+    let Some((&selector, rest)) = data.split_first() else {
+        return;
+    };
+    if selector & REQUEST_BIT != 0 {
+        request(protocol, rest);
+    } else {
+        response(protocol, rest);
+    }
+}
+
+/// The request we send on `protocol`, whose response the timed codec then reads.
+fn our_request(protocol: Protocol) -> Request {
+    match protocol {
+        Protocol::StatusV2 => Request::Status(p2p_wire::testkit::status()),
+        Protocol::MetaDataV3 => Request::MetaData,
+        Protocol::PingV1 => Request::Ping(Ping(1)),
+        other => panic!("{other} is not a single-response control protocol"),
+    }
+}
+
+/// `wire` as the response to our request on `protocol`, through the timed codec, held to the
+/// stateless chunk decoder.
+fn response(protocol: Protocol, wire: &[u8]) {
+    let read = timed::read_response(our_request(protocol), wire);
+    let direct = decode_response_chunk::<E>(wire, protocol, contexts());
+    match (read, direct) {
+        (Ok(chunks), Ok(chunk)) => {
+            let [ReceivedChunk {
+                context: None,
+                chunk: read,
+            }] = chunks.as_slice()
+            else {
+                panic!("a single-response read returned {chunks:?}");
+            };
+            assert!(*read == chunk, "the codec and the chunk decoder disagree");
+            assert_eq!(
+                complete_len(wire, protocol),
+                wire.len(),
+                "scan and decode disagree"
+            );
+            check_chunk(wire, protocol, &chunk);
+        }
+        (Err(e), Ok(_)) => panic!("the codec refused a chunk the chunk decoder accepts: {e}"),
+        (Ok(_), Err(e)) => panic!("the codec accepted a chunk the chunk decoder refuses: {e}"),
+        (Err(e), Err(_)) => assert_ne!(
+            e.kind(),
+            io::ErrorKind::TimedOut,
+            "a deadline passed on an in-memory stream: {e}"
+        ),
+    }
+}
+
+/// `wire` as an inbound request of `protocol`, through the timed codec, held to the stateless
+/// request decoder.
+fn request(protocol: Protocol, wire: &[u8]) {
+    let read = timed::read_request(protocol, wire)
+        .unwrap_or_else(|e| panic!("an in-memory request stream failed: {e}"));
+    let direct = decode_request(protocol, wire);
+    match read {
+        RpcRequest::Valid(request) => {
+            assert_eq!(
+                direct.as_ref(),
+                Ok(&request),
+                "the codec and the request decoder disagree"
+            );
+            assert_eq!(
+                request.protocol(),
+                protocol,
+                "a request of another protocol"
+            );
+            match protocol.request_bounds() {
+                Some(bounds) => {
+                    let ssz = decode_chunk_within(wire, bounds)
+                        .expect("an accepted request's payload decodes on its own");
+                    assert!(
+                        request.ssz_body() == Some(ssz),
+                        "the request re-encodes to other SSZ bytes"
+                    );
+                }
+                None => assert!(wire.is_empty(), "an empty request with bytes"),
+            }
+        }
+        RpcRequest::Malformed(e) => assert!(
+            direct.is_err(),
+            "the codec refused ({e}) a request the request decoder accepts"
+        ),
     }
 }
 
@@ -168,26 +299,6 @@ pub fn blocks_by_range_resp(data: &[u8]) -> usize {
     walked.len()
 }
 
-fn single_chunk(protocol: Protocol, data: &[u8]) {
-    if let Ok(chunk) = decode_response_chunk::<E>(data, protocol, contexts()) {
-        assert_eq!(
-            complete_len(data, protocol),
-            data.len(),
-            "scan and decode disagree"
-        );
-        check_chunk(data, protocol, &chunk);
-    }
-}
-
-fn goodbye(payload: &[u8]) {
-    let Ok(ssz) = decode_chunk(payload, <Goodbye as Decode>::ssz_fixed_len()) else {
-        return;
-    };
-    if let Ok(reason) = Goodbye::from_ssz_bytes(&ssz) {
-        assert_eq!(reason.as_ssz_bytes(), ssz, "Goodbye re-encodes differently");
-    }
-}
-
 /// The length of the complete response chunk at the start of `buf`, which the decoder accepted.
 fn complete_len(buf: &[u8], protocol: Protocol) -> usize {
     match scan_response_chunk::<E>(buf, protocol, contexts()) {
@@ -219,7 +330,7 @@ fn payload(chunk: &[u8], protocol: Protocol) -> Vec<u8> {
 }
 
 /// Checks the invariants of one accepted response chunk against its wire bytes.
-fn check_chunk(chunk: &[u8], protocol: Protocol, decoded: &ResponseChunk<E>) {
+pub(crate) fn check_chunk(chunk: &[u8], protocol: Protocol, decoded: &ResponseChunk<E>) {
     let ssz = payload(chunk, protocol);
     let reencoded = match decoded {
         ResponseChunk::Error { code, message } => {

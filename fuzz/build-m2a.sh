@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Builds the m2a fuzz targets exactly as fuzz/run-m2a-gate.sh runs them: release, with debug
-# assertions and overflow checks, AddressSanitizer, from the committed fuzz/Cargo.lock, with the
-# rustc commit and cargo-fuzz release pinned in fuzz/m2a-common.sh.
+# Builds the fuzz targets exactly as fuzz/run-m2a-gate.sh runs them, for both gates (m2a, and
+# gate 1 through fuzz/run-gate1.sh): release, with debug assertions and overflow checks,
+# AddressSanitizer, from the committed fuzz/Cargo.lock, with the rustc commit and cargo-fuzz
+# release pinned in fuzz/m2a-common.sh.
 #
 # cargo-fuzz has no --locked, so the lockfile is enforced around it: `cargo metadata --locked`
 # fails before the build if fuzz/Cargo.lock would change, and the build fails if the lockfile's
@@ -9,7 +10,7 @@
 # offline (m2a_lock_preflight): fuzz/Cargo.lock resolves every shared crate as the root
 # Cargo.lock does, so the targets link what the session binary links. Exit 2 if not.
 #
-# Usage: fuzz/build-m2a.sh [TARGET...]   (default: all four)
+# Usage: fuzz/build-m2a.sh [TARGET...]   (default: every target in fuzz/Cargo.toml)
 # Refuses (exit 2) an environment or cargo config that changes the build (m2a_require_clean_env).
 # Env: FUZZ_TOOLCHAIN (default: the nightly of fuzz/rust-toolchain.toml), CARGO (default cargo).
 # Works on bash 3.2.

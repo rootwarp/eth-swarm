@@ -46,6 +46,8 @@ echo 'pub struct Block;' > "$fx/crates/consensus-types/src/lib.rs"
 echo '[package]' > "$fx/crates/cl-p2p/Cargo.toml"
 echo 'pub mod codec;' > "$fx/crates/cl-p2p/src/rpc/mod.rs"
 echo 'pub fn read() {}' > "$fx/crates/cl-p2p/src/rpc/codec.rs"
+echo 'pub struct ChunkPacer;' > "$fx/crates/cl-p2p/src/rpc/limits.rs"
+echo 'pub struct RpcMetrics;' > "$fx/crates/cl-p2p/src/rpc/metrics.rs"
 echo '[package]' > "$fx/fuzz/Cargo.toml"
 printf '[toolchain]\nchannel = "nightly-2026-10-17"\n' > "$fx/fuzz/rust-toolchain.toml"
 echo 'pub fn run() {}' > "$fx/fuzz/src/lib.rs"
@@ -176,6 +178,7 @@ ok="$tmp/ok.json"
 # Every keyed path, once changed and committed, makes the old gate stale.
 for path in Cargo.toml Cargo.lock fuzz/Cargo.lock crates/p2p-wire/src/lib.rs crates/consensus-types/src/lib.rs \
   crates/cl-p2p/Cargo.toml crates/cl-p2p/src/rpc/mod.rs crates/cl-p2p/src/rpc/codec.rs \
+  crates/cl-p2p/src/rpc/limits.rs crates/cl-p2p/src/rpc/metrics.rs \
   fuzz/Cargo.toml fuzz/rust-toolchain.toml fuzz/src/lib.rs fuzz/fuzz_targets/status_v2.rs \
   fuzz/corpus/status_v2/valid fuzz/corpus-slow/blocks_by_range_resp/slow-seed fuzz/m2a-common.sh fuzz/build-m2a.sh fuzz/run-m2a-gate.sh; do
   echo '# changed' >> "$fx/$path"
@@ -224,7 +227,10 @@ check pass "clean again" "" bash "$checker" "$ok"
 # attributes. A clean copy of the tree, for GIT_WORK_TREE and core.worktree to point at.
 clean="$tmp/clean"
 mkdir -p "$clean"
-g archive HEAD | tar -x -C "$clean"
+# Through a file: bsdtar stops reading at the end-of-archive blocks, so a pipe can hand git
+# archive a SIGPIPE (exit 141 under pipefail) for some archive sizes.
+g archive -o "$tmp/clean.tar" HEAD
+tar -x -C "$clean" -f "$tmp/clean.tar"
 edit=crates/p2p-wire/src/lib.rs
 # Same size as HEAD's `pub fn decode() {}`: git status reads (and filters) the file only when
 # its size is unchanged.

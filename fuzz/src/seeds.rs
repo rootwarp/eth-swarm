@@ -1,18 +1,23 @@
-//! The seed corpus (`fuzz/corpus/<target>/`), built from the `p2p-wire` encoder.
+//! The seed corpus (`fuzz/corpus/<target>/`), built from the production encoders.
 //!
 //! Valid chunks are the round-trip fixtures of `p2p-wire`'s tests, plus Gloas
 //! `SignedBeaconBlock`s from the beta.4 mainnet `ssz_static` vectors, which the caller reads
 //! (`fuzz/examples/gen-seeds.rs`) and passes in as SSZ. Malformed seeds put the fuzzer next to
-//! every refusal: a length prefix over `MAX_PAYLOAD_SIZE`, snappy bombs, an 11-byte varint, a
-//! truncated chunk, trailing bytes, error chunks with result codes 1-3 and 4-255, an unknown
-//! context digest, more chunks than the request allows, the frame caps (an oversize frame body,
-//! a frame claiming more than 64 KiB, too many empty frames), data after an error chunk and a
-//! response over its byte budget.
+//! every refusal: a length prefix over `MAX_PAYLOAD_SIZE` and one over 4 GiB, snappy bombs, an
+//! 11-byte varint, a truncated chunk, trailing bytes, error chunks with result codes 1-3 and
+//! 4-255, an unknown context digest, more chunks than the request allows, the frame caps (an
+//! oversize frame body, a frame claiming more than 64 KiB and one claiming more than 4 GiB, too
+//! many empty frames), data after an error chunk and a response over its byte budget. The
+//! control targets get the same for the inbound requests, `rpc_chunk` for every protocol in both
+//! directions; the gossip and ENR seeds are in [`gossip`] and [`record`].
 //!
 //! Everything here is deterministic, so `tests/corpus.rs` can check the committed corpus is
 //! exactly what this module builds.
 
-use crate::E;
+mod gossip;
+mod record;
+
+use crate::{E, GOODBYE_BIT, REQUEST_BIT, REQUEST_SELECTOR};
 use consensus_types::caps::MAX_PAYLOAD_SIZE;
 use consensus_types::EthSpec;
 use consensus_types::ForkName;
@@ -20,7 +25,9 @@ use p2p_wire::rpc::codec::{
     decode_varint, encode_chunk, encode_error_chunk, encode_success_chunk, encode_varint,
     MAX_EMPTY_FRAMES, MAX_FRAME_BODY_LEN,
 };
-use p2p_wire::rpc::messages::{ForkDigest, Goodbye, Ping, MAX_ERROR_MESSAGE_LEN};
+use p2p_wire::rpc::messages::{
+    BlocksByRangeV2Request, ForkDigest, Goodbye, Ping, MAX_ERROR_MESSAGE_LEN,
+};
 use p2p_wire::rpc::protocols::{Protocol, ResultCode};
 use p2p_wire::testkit;
 use ssz::Encode;
@@ -75,25 +82,26 @@ const ERROR_CODES: [ResultCode; 3] = [
 const BOMB_LEN: usize = 1 << 16;
 /// 1 MiB of zeros under a 1 MiB prefix: within a block's bound, about 48 KiB compressed.
 const BLOCK_BOMB_LEN: usize = 1 << 20;
+/// A length past 4 GiB: 2^32 + 1, a 5-byte varint.
+const OVER_4GIB: usize = (1 << 32) + 1;
 
 /// Every seed, for every target.
 pub fn all(vector_blocks: &[VectorBlock]) -> Vec<Seed> {
     let mut seeds = Vec::new();
-    single_chunk(
-        &mut seeds,
-        "status_v2",
-        &[],
-        &testkit::status().as_ssz_bytes(),
-    );
-    single_chunk(
-        &mut seeds,
-        "metadata_v3",
-        &[],
-        &testkit::metadata().as_ssz_bytes(),
-    );
-    single_chunk(&mut seeds, "ping_goodbye", &[0], &Ping(9).as_ssz_bytes());
+    let status = testkit::status().as_ssz_bytes();
+    let metadata = testkit::metadata().as_ssz_bytes();
+    let ping = Ping(9).as_ssz_bytes();
+    single_chunk(&mut seeds, "status_v2", &[0], "", &status);
+    requests(&mut seeds, "status_v2", REQUEST_BIT, "", Some(&status));
+    single_chunk(&mut seeds, "metadata_v3", &[0], "", &metadata);
+    requests(&mut seeds, "metadata_v3", REQUEST_BIT, "", None);
+    single_chunk(&mut seeds, "ping_goodbye", &[0], "", &ping);
+    requests(&mut seeds, "ping_goodbye", REQUEST_BIT, "", Some(&ping));
     goodbye(&mut seeds);
     blocks_by_range(&mut seeds, vector_blocks);
+    rpc_chunk(&mut seeds, &status, &metadata, &ping);
+    gossip::all(&mut seeds, vector_blocks);
+    record::all(&mut seeds);
     seeds
 }
 
@@ -122,14 +130,16 @@ struct Sink<'a> {
     target: &'static str,
     /// Bytes before every seed: the selector or `count` byte of the target.
     lead: &'a [u8],
+    /// Before every seed name.
+    prefix: &'a str,
 }
 
 impl Sink<'_> {
-    fn add(&mut self, name: impl Into<String>, body: &[u8]) {
+    fn add(&mut self, name: impl AsRef<str>, body: &[u8]) {
         self.seeds.push(Seed {
             target: self.target,
             slow: false,
-            name: name.into(),
+            name: format!("{}{}", self.prefix, name.as_ref()),
             bytes: cat(&[self.lead, body]),
         });
     }
@@ -147,11 +157,13 @@ impl Sink<'_> {
     }
 
     /// The malformed payloads after `head` (result and context bytes, or nothing): a prefix of
-    /// `MAX_PAYLOAD_SIZE + 1`, a prefix one past `bound`, a snappy bomb under a `small` prefix
-    /// and an 11-byte varint.
+    /// `MAX_PAYLOAD_SIZE + 1` and one over 4 GiB, a prefix one past `bound`, a snappy bomb under
+    /// a `small` prefix and an 11-byte varint.
     fn bad_payloads(&mut self, head: &[u8], bound: usize, small: usize) {
         let oversize = framed(MAX_PAYLOAD_SIZE + 1, &[0; 16]);
         self.add("oversize-prefix-10mib-plus-1", &cat(&[head, &oversize]));
+        let over_4gib = framed(OVER_4GIB, &[0; 16]);
+        self.add("prefix-over-4gib", &cat(&[head, &over_4gib]));
         let over = framed(bound + 1, &[0; 16]);
         self.add("prefix-over-type-bound", &cat(&[head, &over]));
         let bomb = framed(small, &[0; BOMB_LEN]);
@@ -163,7 +175,8 @@ impl Sink<'_> {
     }
 
     /// The frame caps after `head`, under a `declared` prefix: a frame body one past
-    /// `MAX_FRAME_BODY_LEN`, a frame claiming 65,537 decompressed bytes and, after `empty` (a
+    /// `MAX_FRAME_BODY_LEN`, a frame claiming 65,537 decompressed bytes, one claiming more than
+    /// 4 GiB and, after `empty` (a
     /// head and a prefix whose `max_compressed_len` has room for 17 empty frames), more than
     /// `MAX_EMPTY_FRAMES` frames without data.
     fn bad_frames(&mut self, head: &[u8], declared: usize, empty: Option<(&[u8], usize)>) {
@@ -186,6 +199,13 @@ impl Sink<'_> {
             "frame-output-too-large",
             &cat(&[head, &prefix, STREAM_IDENTIFIER, &frame]),
         );
+        // The same, its snappy length varint claiming 2^32 + 1 bytes.
+        let body = cat(&[&[0, 0, 0, 0], &varint(OVER_4GIB)]);
+        let frame = cat(&[&[0x00, body.len() as u8, 0, 0], &body]);
+        self.add(
+            "frame-claims-over-4gib",
+            &cat(&[head, &prefix, STREAM_IDENTIFIER, &frame]),
+        );
         // The stream identifier and 16 padding frames: 17 frames without data.
         if let Some((head, declared)) = empty {
             let padding = [PADDING, 0, 0, 0].repeat(MAX_EMPTY_FRAMES);
@@ -204,11 +224,18 @@ impl Sink<'_> {
 }
 
 /// A single-response protocol whose success payload is `ssz`.
-fn single_chunk(seeds: &mut Vec<Seed>, target: &'static str, lead: &[u8], ssz: &[u8]) {
+fn single_chunk(
+    seeds: &mut Vec<Seed>,
+    target: &'static str,
+    lead: &[u8],
+    prefix: &str,
+    ssz: &[u8],
+) {
     let mut sink = Sink {
         seeds,
         target,
         lead,
+        prefix,
     };
     let valid = encode_success_chunk(None, ssz).expect("valid chunk");
     sink.add("valid", &valid);
@@ -224,35 +251,67 @@ fn single_chunk(seeds: &mut Vec<Seed>, target: &'static str, lead: &[u8], ssz: &
     sink.truncated_and_trailing(&valid);
 }
 
-/// `ping_goodbye` with the Goodbye selector: a bare payload, no result byte.
+/// The inbound requests of a protocol whose request body is `ssz` (`None`: an empty request),
+/// after the `lead` selector byte, named `{prefix}request-*`: the valid request, and for a body
+/// the malformed payloads and frames under its exact length, a prefix one under it, and the
+/// request cut short and with a byte after it.
+fn requests(
+    seeds: &mut Vec<Seed>,
+    target: &'static str,
+    lead: u8,
+    prefix: &str,
+    ssz: Option<&[u8]>,
+) {
+    let prefix = format!("{prefix}request-");
+    let mut sink = Sink {
+        seeds,
+        target,
+        lead: &[lead],
+        prefix: &prefix,
+    };
+    let Some(ssz) = ssz else {
+        sink.add("empty", &[]);
+        sink.add("trailing-byte", &[0]);
+        sink.add(
+            "with-a-payload",
+            &encode_chunk(&[]).expect("an empty payload"),
+        );
+        return;
+    };
+    let valid = encode_chunk(ssz).expect("valid request");
+    sink.add("valid", &valid);
+    sink.bad_payloads(&[], ssz.len(), ssz.len());
+    sink.add("prefix-under-type-bound", &framed(ssz.len() - 1, &[0; 16]));
+    sink.bad_frames(&[], ssz.len(), None);
+    sink.truncated_and_trailing(&valid);
+}
+
+/// `ping_goodbye` with the Goodbye selector: an inbound `Goodbye` request (a bare payload, no
+/// result byte), named `goodbye-*`.
 fn goodbye(seeds: &mut Vec<Seed>) {
     let mut sink = Sink {
         seeds,
         target: "ping_goodbye",
-        lead: &[crate::GOODBYE_BIT],
+        lead: &[GOODBYE_BIT],
+        prefix: "goodbye-",
     };
     let ssz = Goodbye(3).as_ssz_bytes();
     let valid = encode_chunk(&ssz).expect("valid payload");
-    sink.add("goodbye-valid", &valid);
+    sink.add("valid", &valid);
     let bound = ssz.len();
-    let named = |name: &str| format!("goodbye-{name}");
-    let oversize = framed(MAX_PAYLOAD_SIZE + 1, &[0; 16]);
-    sink.add(named("oversize-prefix-10mib-plus-1"), &oversize);
-    sink.add(named("snappy-bomb"), &framed(bound, &[0; BOMB_LEN]));
-    sink.add(named("varint-11-bytes"), &cat(&[&[0x80; 10], &[0x01]]));
-    let mut frames = Sink {
-        seeds: &mut *sink.seeds,
-        target: "ping_goodbye",
-        lead: &[crate::GOODBYE_BIT],
-    };
-    let before = frames.seeds.len();
+    sink.add(
+        "oversize-prefix-10mib-plus-1",
+        &framed(MAX_PAYLOAD_SIZE + 1, &[0; 16]),
+    );
+    sink.add("prefix-over-4gib", &framed(OVER_4GIB, &[0; 16]));
+    sink.add("prefix-over-type-bound", &framed(bound + 1, &[0; 16]));
+    sink.add("prefix-under-type-bound", &framed(bound - 1, &[0; 16]));
+    sink.add("snappy-bomb", &framed(bound, &[0; BOMB_LEN]));
+    sink.add("frames-past-the-prefix", &framed(bound, &[0; 8 + 16]));
+    sink.add("varint-11-bytes", &cat(&[&[0x80; 10], &[0x01]]));
     // A Goodbye's 8-byte bound leaves no room for 17 empty frames: the cut-off comes first.
-    frames.bad_frames(&[], bound, None);
-    for seed in &mut frames.seeds[before..] {
-        seed.name = named(&seed.name);
-    }
-    sink.add(named("truncated"), &valid[..valid.len() - 1]);
-    sink.add(named("trailing-byte"), &cat(&[&valid, &[0]]));
+    sink.bad_frames(&[], bound, None);
+    sink.truncated_and_trailing(&valid);
 }
 
 /// A Fulu block whose payload holds the most (empty) transactions a block may.
@@ -349,6 +408,7 @@ fn blocks_by_range(seeds: &mut Vec<Seed>, vector_blocks: &[VectorBlock]) {
         seeds,
         target,
         lead: &[1],
+        prefix: "",
     };
     sink.result_codes();
     let head = cat(&[&[ResultCode::Success.as_byte()], &testkit::GLOAS_DIGEST]);
@@ -356,6 +416,105 @@ fn blocks_by_range(seeds: &mut Vec<Seed>, vector_blocks: &[VectorBlock]) {
         .response_max_len::<E>(Some(ForkName::Gloas))
         .expect("a Gloas block has a bound");
     sink.bad_payloads(&head, bound, 1000);
+    sink.bad_frames(&head, 1000, Some((&head, 1000)));
+    let bomb = framed(BLOCK_BOMB_LEN, &vec![0; BLOCK_BOMB_LEN]);
+    sink.add("snappy-bomb-1mib-within-bound", &cat(&[&head, &bomb]));
+    sink.truncated_and_trailing(&gloas);
+}
+
+/// `rpc_chunk`: for every protocol, its response chunks after the protocol's index and its
+/// request payloads after the index with [`REQUEST_SELECTOR`], named `{protocol}-*` and
+/// `{protocol}-request-*`.
+fn rpc_chunk(seeds: &mut Vec<Seed>, status: &[u8], metadata: &[u8], ping: &[u8]) {
+    let target = "rpc_chunk";
+    let index = |protocol: Protocol| {
+        let i = Protocol::ALL
+            .iter()
+            .position(|p| *p == protocol)
+            .expect("every protocol is in ALL");
+        u8::try_from(i).expect("five protocols")
+    };
+    let range = BlocksByRangeV2Request {
+        start_slot: 7,
+        count: 4,
+        step: 1,
+    }
+    .as_ssz_bytes();
+    let goodbye = Goodbye(1).as_ssz_bytes();
+    for (protocol, name, response, request) in [
+        (Protocol::StatusV2, "status", Some(status), Some(status)),
+        (Protocol::MetaDataV3, "metadata", Some(metadata), None),
+        (Protocol::PingV1, "ping", Some(ping), Some(ping)),
+        (Protocol::GoodbyeV1, "goodbye", None, Some(&goodbye[..])),
+    ] {
+        let prefix = format!("{name}-");
+        let i = index(protocol);
+        match response {
+            Some(ssz) => single_chunk(seeds, target, &[i], &prefix, ssz),
+            None => {
+                // Goodbye has no response: a success chunk is refused, an error chunk is not.
+                let mut sink = Sink {
+                    seeds: &mut *seeds,
+                    target,
+                    lead: &[i],
+                    prefix: &prefix,
+                };
+                let chunk = encode_success_chunk(None, &goodbye).expect("small payload");
+                sink.add("success-chunk", &chunk);
+                sink.result_codes();
+            }
+        }
+        requests(seeds, target, i | REQUEST_SELECTOR, &prefix, request);
+    }
+
+    let i = index(Protocol::BlocksByRangeV2);
+    requests(seeds, target, i | REQUEST_SELECTOR, "blocks-", Some(&range));
+    let mut sink = Sink {
+        seeds,
+        target,
+        lead: &[i],
+        prefix: "blocks-",
+    };
+    let fulu = block_chunk(
+        testkit::FULU_DIGEST,
+        &testkit::fulu_block::<E>(1).as_ssz_bytes(),
+    );
+    let fulu_bpo = block_chunk(
+        testkit::FULU_BPO_DIGEST,
+        &testkit::fulu_block::<E>(2).as_ssz_bytes(),
+    );
+    let gloas = block_chunk(
+        testkit::GLOAS_DIGEST,
+        &testkit::gloas_block::<E>(3).as_ssz_bytes(),
+    );
+    sink.add("fulu-valid", &fulu);
+    sink.add("fulu-bpo-digest-valid", &fulu_bpo);
+    sink.add("gloas-valid", &gloas);
+    let fulu_ssz = testkit::fulu_block::<E>(4).as_ssz_bytes();
+    sink.add(
+        "fulu-block-under-gloas-digest",
+        &block_chunk(testkit::GLOAS_DIGEST, &fulu_ssz),
+    );
+    let unknown = cat(&[
+        &[ResultCode::Success.as_byte()],
+        &testkit::UNKNOWN_DIGEST,
+        &encode_chunk(&fulu_ssz).expect("small block"),
+    ]);
+    sink.add("unknown-context-digest", &unknown);
+    sink.add(
+        "context-cut-short",
+        &[ResultCode::Success.as_byte(), testkit::GLOAS_DIGEST[0]],
+    );
+    sink.result_codes();
+    let head = cat(&[&[ResultCode::Success.as_byte()], &testkit::GLOAS_DIGEST]);
+    let bound = Protocol::BlocksByRangeV2
+        .response_max_len::<E>(Some(ForkName::Gloas))
+        .expect("a Gloas block has a bound");
+    sink.bad_payloads(&head, bound, 1000);
+    sink.add(
+        "prefix-under-block-minimum",
+        &cat(&[&head, &framed(10, &[0; 10])]),
+    );
     sink.bad_frames(&head, 1000, Some((&head, 1000)));
     let bomb = framed(BLOCK_BOMB_LEN, &vec![0; BLOCK_BOMB_LEN]);
     sink.add("snappy-bomb-1mib-within-bound", &cat(&[&head, &bomb]));

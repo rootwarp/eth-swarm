@@ -11,26 +11,51 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The vector-framed seeds, pinned so that they hold without the vectors (CI fetches none).
-/// `fuzz/gen-seeds.sh` with the vectors rebuilds them; update these with it.
-const VECTOR_SEEDS: [(&str, &str); 4] = [
+/// The vector-framed seeds, `(target, name, sha256)`, pinned so that they hold without the
+/// vectors (CI fetches none). `fuzz/gen-seeds.sh` with the vectors rebuilds them; update these
+/// with it.
+const VECTOR_SEEDS: [(&str, &str, &str); 7] = [
     (
+        "blocks_by_range_resp",
         "gloas-vector-case_0",
         "c759a9912317cd64c16daefe0cce1a971fe8fc36e24776eba34ab0ff89c091b6",
     ),
     (
+        "blocks_by_range_resp",
         "gloas-vector-case_1",
         "738849c45074a96236255e02b73c6d08001c5aee8c5883e9620ce6a856f7e51e",
     ),
     (
+        "blocks_by_range_resp",
         "gloas-vector-case_2",
         "f8a37208e6f9b5adf09200204cafe906d10f436ddeaae1a01b107abf10297efd",
     ),
     (
+        "blocks_by_range_resp",
         "gloas-vectors-all",
         "74d84a84b5250c8035fbe3800c32765c60d398bcba005a001bdb3975cccc4746",
     ),
+    (
+        "gossip_transform",
+        "gloas-vector-case_0",
+        "76c28c90bf9e180cba0e6ef510caa3341c9324566481f967f893b2582598076a",
+    ),
+    (
+        "gossip_transform",
+        "gloas-vector-case_1",
+        "e033f7a7f9633cb64d5a1375ffad8ac59fc5f87cb632d34f86dfd20c89a5f6b6",
+    ),
+    (
+        "gossip_transform",
+        "gloas-vector-case_2",
+        "e2a13bfa700b28d80c4aa24cccfe52b85ef7a767672f940a9cd4b316c242c056",
+    ),
 ];
+
+/// Whether a seed is built from a vector case.
+fn from_vectors(name: &str) -> bool {
+    name.starts_with(VECTOR_PREFIX) || name == "gloas-vectors-all"
+}
 
 #[path = "../examples/gen-seeds/vectors.rs"]
 mod vectors;
@@ -85,85 +110,198 @@ fn committed_corpus_is_what_the_generator_builds() {
         .map(|s| ((s.target.to_string(), s.name), s.bytes))
         .collect();
     let committed = committed();
-    let from_vectors =
-        |k: &(String, String)| k.1.starts_with(VECTOR_PREFIX) || k.1 == "gloas-vectors-all";
     if blocks.is_some() {
         assert_eq!(
             committed, built,
             "fuzz/corpus differs from fuzz/gen-seeds.sh output"
         );
     } else {
-        let without = |m: &BTreeMap<_, Vec<u8>>| -> BTreeMap<(String, String), Vec<u8>> {
-            m.iter()
-                .filter(|(k, _)| !from_vectors(k))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        };
+        let without =
+            |m: &BTreeMap<(String, String), Vec<u8>>| -> BTreeMap<(String, String), Vec<u8>> {
+                m.iter()
+                    .filter(|(k, _)| !from_vectors(&k.1))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            };
         assert_eq!(without(&committed), without(&built));
-        let framed = committed.keys().filter(|k| from_vectors(k)).count();
-        assert_eq!(
-            framed,
-            vectors::CASES.len() + 1,
-            "vector-framed seeds missing"
-        );
+        let framed = committed.keys().filter(|k| from_vectors(&k.1)).count();
+        assert_eq!(framed, VECTOR_SEEDS.len(), "vector-framed seeds missing");
     }
 }
+
+/// The response-chunk seeds every single-chunk protocol gets, by name.
+const CHUNK_SEEDS: [&str; 17] = [
+    "valid",
+    "oversize-prefix-10mib-plus-1",
+    "prefix-over-4gib",
+    "snappy-bomb",
+    "varint-11-bytes",
+    "truncated",
+    "trailing-byte",
+    "error-code-1",
+    "error-code-2",
+    "error-code-3",
+    "invalid-code-4",
+    "invalid-code-255",
+    "frame-body-too-large",
+    "frame-output-too-large",
+    "frame-claims-over-4gib",
+    "too-many-empty-frames",
+    "prefix-over-type-bound",
+];
+
+/// The request seeds every protocol with a request body gets, after `request-`.
+const REQUEST_SEEDS: [&str; 13] = [
+    "valid",
+    "oversize-prefix-10mib-plus-1",
+    "prefix-over-4gib",
+    "prefix-over-type-bound",
+    "prefix-under-type-bound",
+    "snappy-bomb",
+    "varint-11-bytes",
+    "frames-past-the-prefix",
+    "frame-body-too-large",
+    "frame-output-too-large",
+    "frame-claims-over-4gib",
+    "truncated",
+    "trailing-byte",
+];
 
 #[test]
 fn every_target_has_the_required_malformed_seeds() {
     let committed = committed();
     let has = |target: &str, name: &str| committed.contains_key(&(target.into(), name.into()));
-    for target in TARGETS {
-        for name in [
-            "valid",
-            "oversize-prefix-10mib-plus-1",
-            "snappy-bomb",
-            "varint-11-bytes",
-            "truncated",
-            "trailing-byte",
-            "error-code-1",
-            "error-code-2",
-            "error-code-3",
-            "invalid-code-4",
-            "invalid-code-255",
-            "frame-body-too-large",
-            "frame-output-too-large",
-            "too-many-empty-frames",
-        ] {
+    let chunks = |target: &str, prefix: &str| {
+        for name in CHUNK_SEEDS {
             if target == "blocks_by_range_resp" && name == "valid" {
                 continue;
             }
-            assert!(has(target, name), "{target}/{name}");
+            assert!(
+                has(target, &format!("{prefix}{name}")),
+                "{target}/{prefix}{name}"
+            );
         }
+    };
+    let requests = |target: &str, prefix: &str| {
+        for name in REQUEST_SEEDS {
+            let name = format!("{prefix}request-{name}");
+            assert!(has(target, &name), "{target}/{name}");
+        }
+    };
+    for target in [
+        "status_v2",
+        "metadata_v3",
+        "ping_goodbye",
+        "blocks_by_range_resp",
+    ] {
+        chunks(target, "");
     }
-    assert!(has("ping_goodbye", "goodbye-valid"));
-    assert!(has("ping_goodbye", "goodbye-oversize-prefix-10mib-plus-1"));
+    requests("status_v2", "");
+    requests("ping_goodbye", "");
+    assert!(has("metadata_v3", "request-empty"));
+    assert!(has("metadata_v3", "request-trailing-byte"));
+    for name in REQUEST_SEEDS {
+        assert!(
+            has("ping_goodbye", &format!("goodbye-{name}")),
+            "goodbye-{name}"
+        );
+    }
     assert!(has("blocks_by_range_resp", "unknown-context-digest"));
     assert!(has("blocks_by_range_resp", "too-many-chunks"));
     assert!(has("blocks_by_range_resp", "data-after-error"));
     assert!(has("blocks_by_range_resp", "response-over-byte-budget"));
+
+    for prefix in ["status-", "metadata-", "ping-"] {
+        chunks("rpc_chunk", prefix);
+    }
+    for prefix in ["status-", "ping-", "goodbye-", "blocks-"] {
+        requests("rpc_chunk", prefix);
+    }
+    for name in CHUNK_SEEDS {
+        let name = if name == "valid" { "gloas-valid" } else { name };
+        assert!(
+            has("rpc_chunk", &format!("blocks-{name}")),
+            "rpc_chunk/blocks-{name}"
+        );
+    }
+    for name in [
+        "metadata-request-empty",
+        "goodbye-success-chunk",
+        "goodbye-error-code-1",
+        "blocks-unknown-context-digest",
+        "blocks-context-cut-short",
+        "blocks-fulu-bpo-digest-valid",
+    ] {
+        assert!(has("rpc_chunk", name), "rpc_chunk/{name}");
+    }
+
+    for target in ["gossip_transform", "message_id"] {
+        for name in [
+            "block-gloas-valid",
+            "block-declares-over-10mib",
+            "block-declares-4gib",
+            "block-declares-over-4gib",
+            "block-varint-11-bytes",
+            "block-truncated",
+            "block-trailing-byte",
+            "block-snappy-bomb-1mib",
+            "block-over-cap",
+            "block-not-snappy",
+            "aggregate-at-cap",
+            "aggregate-over-cap",
+            "topic-unknown-name",
+            "topic-cut-short",
+        ] {
+            assert!(has(target, name), "{target}/{name}");
+        }
+    }
+
+    for name in [
+        "sepolia-fulu-fork-epoch-272640",
+        "sepolia-before-bpo1-epoch-274175",
+        "sepolia-bpo1-epoch-274176",
+        "sepolia-before-bpo2-epoch-275711",
+        "sepolia-bpo2-epoch-275712",
+        "sepolia-before-gloas-epoch-353023",
+        "sepolia-gloas-epoch-353024",
+        "eth2-15-bytes",
+        "cgc-leading-zero",
+        "nfd-3-bytes",
+        "cgc-rlp-list",
+        "ed25519",
+        "truncated",
+        "trailing-byte",
+        "forged-signature",
+        "over-300-bytes",
+        "regression-structured-ed25519-broken-raw-cgc",
+    ] {
+        assert!(has("enr_fields", name), "enr_fields/{name}");
+        if !matches!(name, "truncated" | "trailing-byte" | "forged-signature")
+            && !name.starts_with("regression-")
+        {
+            let structured = format!("structured-{name}");
+            assert!(has("enr_fields", &structured), "enr_fields/{structured}");
+        }
+    }
 }
 
 #[test]
 fn vector_seeds_match_their_pinned_sha256() {
     let committed = committed();
-    let framed: Vec<&String> = committed
+    let framed: Vec<(&str, &str)> = committed
         .keys()
-        .filter(|(t, n)| {
-            t == "blocks_by_range_resp"
-                && (n.starts_with(VECTOR_PREFIX) || n == "gloas-vectors-all")
-        })
-        .map(|(_, n)| n)
+        .filter(|(_, n)| from_vectors(n))
+        .map(|(t, n)| (t.as_str(), n.as_str()))
         .collect();
-    let pinned: Vec<&str> = VECTOR_SEEDS.iter().map(|(n, _)| *n).collect();
+    let pinned: Vec<(&str, &str)> = VECTOR_SEEDS.iter().map(|(t, n, _)| (*t, *n)).collect();
     assert_eq!(framed, pinned, "vector-framed seeds and their pins");
-    for (name, sha) in VECTOR_SEEDS {
-        let bytes = &committed[&("blocks_by_range_resp".to_string(), name.to_string())];
+    for (target, name, sha) in VECTOR_SEEDS {
+        let bytes = &committed[&(target.to_string(), name.to_string())];
         let got: String = Sha256::digest(bytes)
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        assert_eq!(got, sha, "blocks_by_range_resp/{name}");
+        assert_eq!(got, sha, "{target}/{name}");
     }
 }
 

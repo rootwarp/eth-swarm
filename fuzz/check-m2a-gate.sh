@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Verifies an m2a fuzz gate file (fuzz/run-m2a-gate.sh) against this tree.
+# Verifies an m2a fuzz gate file (fuzz/run-m2a-gate.sh) against this tree. With --gate gate1
+# (fuzz/check-gate1.sh) it verifies a gate-1 file (fuzz/run-gate1.sh) instead: the same rules
+# over gate 1's targets and key (gate_select in fuzz/m2a-common.sh), and "gate": "gate1-fuzz".
 #
-# The gate holds when the file lists exactly the four targets (status_v2, metadata_v3,
-# ping_goodbye, blocks_by_range_resp), each run to completion for >= 3600 s with executions,
-# exit 0 and 0 crashes, 0 OOMs and 0 timeouts, from a clean tree, and:
+# The gate holds when the file is of this gate and lists exactly its targets (m2a: status_v2,
+# metadata_v3, ping_goodbye, blocks_by_range_resp), each run to completion for >= 3600 s with
+# executions, exit 0 and 0 crashes, 0 OOMs and 0 timeouts, from a clean tree, and:
 #   - its decoder key equals this tree's: `git rev-parse HEAD:<path>` of every keyed path and the
 #     sha256 of Cargo.lock and fuzz/Cargo.lock (fuzz/m2a-common.sh lists them). A keyed path with
 #     uncommitted changes fails too, and so does one git is told not to look at (assume-unchanged
@@ -18,13 +20,18 @@
 #   - each target's corpus_sha256 equals that of fuzz/corpus/<target> now;
 #   - each target exercised its decoder: its coverage features once the seeds were loaded
 #     (seed_ft) reach its floor (m2a_min_seed_ft) and the final count is no lower;
+#   - gate 1 only: `head` is the full lowercase hex id of a commit of this repository, an
+#     ancestor of HEAD, and the decoder key at that commit (from git, not the working tree) is
+#     the file's, so the file names a commit that was fuzzed. The m2a checker does not read
+#     `head`: the m2a-session binary mirrors its rules and would no longer agree with it;
 #   - no tool override (CARGO, RUSTC, FUZZ_TOOLCHAIN, RUSTUP_TOOLCHAIN) was in use: `overrides`
 #     is empty. fuzz/run-m2a-gate.sh refuses the environment variables and cargo config that
 #     would change the build or run, so a file it wrote holds only for a clean environment.
 #
-# Usage: fuzz/check-m2a-gate.sh <gate.json>      verify the gate file
-#        fuzz/check-m2a-gate.sh --print-key        print this tree's decoder key as JSON
-#        fuzz/check-m2a-gate.sh --print-expected   print every value a gate file must hold
+# Usage: fuzz/check-m2a-gate.sh [--gate m2a|gate1] <gate.json>      verify the gate file
+#        fuzz/check-m2a-gate.sh [--gate m2a|gate1] --print-key        print this tree's decoder key
+#        fuzz/check-m2a-gate.sh [--gate m2a|gate1] --print-expected   print every value a gate file
+#                                                                     must hold
 # Exit: 0 valid, 1 invalid or stale, 2 usage error or the key cannot be computed.
 # Needs git and python3. Works on bash 3.2.
 set -euo pipefail
@@ -32,7 +39,7 @@ set -euo pipefail
 . "$(dirname "$0")/m2a-common.sh"
 
 usage() {
-  echo "Usage: fuzz/check-m2a-gate.sh <gate.json> | --print-key | --print-expected"
+  echo "Usage: fuzz/check-m2a-gate.sh [--gate m2a|gate1] <gate.json> | --print-key | --print-expected"
   exit 2
 }
 
@@ -40,7 +47,7 @@ usage() {
 expected_json() {
   local key t sep='' corpus='{' floors='{'
   key=$(m2a_key_json) || return 1
-  for t in "${M2A_TARGETS[@]}"; do
+  for t in "${GATE_TARGETS[@]}"; do
     [[ -d $fuzz_dir/corpus/$t ]] || { echo "ERROR: fuzz/corpus/$t missing" >&2; return 1; }
     corpus="$corpus$sep\"$t\": \"$(m2a_corpus_sha256 "$fuzz_dir/corpus/$t")\""
     floors="$floors$sep\"$t\": $(m2a_min_seed_ft "$t")"
@@ -51,6 +58,10 @@ expected_json() {
     "$M2A_CARGO_FUZZ_VERSION" "$corpus" "$floors"
 }
 
+if (($# == 3)) && [[ $1 == --gate ]]; then
+  gate_select "$2" || { echo "ERROR: --gate wants m2a or gate1, not '$2'"; usage; }
+  shift 2
+fi
 (($# == 1)) || usage
 case $1 in
   --print-key)
@@ -74,10 +85,54 @@ if [[ -n $dirty ]]; then
   exit 1
 fi
 
-EXPECTED=$expected REQUIRED=$M2A_REQUIRED_SECONDS TARGETS="${M2A_TARGETS[*]}" python3 -I - "$file" <<'PY'
+# Gate 1 (GATE_CHECK_HEAD): the commit the file names must be the one it vouches for. Sets
+# head_error to why `head` cannot be, or head_key to the decoder key at it, which the checks
+# below hold to the file's: `head` is the full lowercase hex id of a commit of this repository,
+# an ancestor of HEAD (the tree may have moved on since, outside the key), and the key computed
+# at it from git (m2a_key_json <commit>, which reads no file of the working tree) is the file's.
+head_error="" head_key=""
+check_head() {
+  local head len format
+  head=$(python3 -I -c '
+import json, sys
+try:
+    gate = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    sys.exit(1)
+head = gate.get("head") if isinstance(gate, dict) else None
+if not isinstance(head, str):
+    sys.exit(1)
+print(head.encode("unicode_escape").decode("ascii"))
+' "$file") || {
+    head_error="head: missing, or not a string"
+    return 0
+  }
+  format=$(m2a_git rev-parse --show-object-format) || {
+    head_error="head: git rev-parse --show-object-format failed"
+    return 0
+  }
+  len=40
+  [[ $format != sha256 ]] || len=64
+  if ! [[ $head =~ ^[0-9a-f]+$ ]] || ((${#head} != len)); then
+    head_error="head: '${head:0:80}' is not a $len-character lowercase hex commit id"
+  elif ! m2a_git cat-file -e "$head^{commit}" 2>/dev/null; then
+    head_error="head: $head is not a commit of this repository"
+  elif ! m2a_git merge-base --is-ancestor "$head" HEAD 2>/dev/null; then
+    head_error="head: $head is not an ancestor of HEAD"
+  elif ! head_key=$(m2a_key_json "$head" 2>&1); then
+    head_error="head: the decoder key at $head cannot be computed: $head_key"
+    head_key=""
+  fi
+}
+if ((GATE_CHECK_HEAD)); then check_head; fi
+
+EXPECTED=$expected REQUIRED=$M2A_REQUIRED_SECONDS TARGETS="${GATE_TARGETS[*]}" \
+  GATE_ID=$GATE_ID GATE_LABEL=$GATE_LABEL CHECK_HEAD=$GATE_CHECK_HEAD HEAD_ERROR=$head_error \
+  HEAD_KEY=$head_key python3 -I - "$file" <<'PY'
 import json, os, sys
 
 path = sys.argv[1]
+gate_id, label = os.environ["GATE_ID"], os.environ["GATE_LABEL"]
 required = int(os.environ["REQUIRED"])
 want_targets = os.environ["TARGETS"].split()
 want = json.loads(os.environ["EXPECTED"])
@@ -97,13 +152,18 @@ def is_int(v):
 if not isinstance(gate, dict):
     print(f"ERROR: {path}: not a JSON object")
     sys.exit(1)
-if gate.get("gate") != "m2a-fuzz" or gate.get("format") != 1:
-    errors.append(f"gate/format: want m2a-fuzz format 1, got {gate.get('gate')!r} format {gate.get('format')!r}")
+if gate.get("gate") != gate_id or gate.get("format") != 1:
+    errors.append(f"gate/format: want {gate_id} format 1, got {gate.get('gate')!r} format {gate.get('format')!r}")
 req = gate.get("requested_seconds")
 if not is_int(req) or req < required:
     errors.append(f"requested_seconds: {req!r} < {required} (a smoke run is not a gate)")
 if gate.get("dirty") is not False:
     errors.append(f"dirty: {gate.get('dirty')!r}: the run was not from a clean tree")
+if os.environ["CHECK_HEAD"] == "1":
+    if os.environ["HEAD_ERROR"]:
+        errors.append(os.environ["HEAD_ERROR"])
+    elif gate.get("decoder_key") != json.loads(os.environ["HEAD_KEY"]):
+        errors.append(f"head: the decoder key at {gate.get('head')} is not the file's: it was not fuzzed at that commit")
 if gate.get("decoder_key") != key:
     got = gate.get("decoder_key") if isinstance(gate.get("decoder_key"), dict) else {}
     for kind in sorted(set(key) | set(got)):
@@ -161,5 +221,6 @@ if errors:
     for e in errors:
         print(f"ERROR {path}: {e}")
     sys.exit(1)
-print(f"m2a gate OK: {len(names)} targets x >= {required} s, 0 crashes/OOMs/timeouts, key, limits, toolchain and seeds match HEAD")
+print(f"{label} OK: {len(names)} targets x >= {required} s, 0 crashes/OOMs/timeouts, key, limits, toolchain and seeds match HEAD"
+      + (f", fuzzed at {gate.get('head')}" if os.environ["CHECK_HEAD"] == "1" else ""))
 PY

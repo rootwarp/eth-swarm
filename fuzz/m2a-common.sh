@@ -1,6 +1,8 @@
 # Shared by fuzz/build-m2a.sh, fuzz/run-m2a-gate.sh, fuzz/check-m2a-gate.sh and
-# fuzz/coverage-m2a.sh. Source it; it sets `repo` and `fuzz_dir` from its own location. Every
-# git call goes through m2a_git (a scrubbed environment and config).
+# fuzz/coverage-m2a.sh (and so by fuzz/run-gate1.sh and fuzz/check-gate1.sh, which run the gate
+# scripts with --gate gate1). Source it; it sets `repo` and `fuzz_dir` from its own location, and
+# selects the m2a gate (gate_select below). Every git call goes through m2a_git (a scrubbed
+# environment and config).
 # Works on bash 3.2.
 
 fuzz_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -9,6 +11,11 @@ repo=$(cd "$fuzz_dir/.." && pwd)
 # The four response decoders the m2a-session binary runs on peer bytes.
 M2A_TARGETS=(status_v2 metadata_v3 ping_goodbye blocks_by_range_resp)
 
+# Gate 1: the probe's control decoders in both directions (Status, MetaData, Ping and Goodbye
+# through the timed codec), one req/resp chunk of any protocol, the gossip transform with the
+# Gloas block decode, the message-id, and the ENR fields.
+GATE1_TARGETS=(rpc_chunk gossip_transform message_id enr_fields status_v2 metadata_v3 ping_goodbye)
+
 # Release, with debug assertions and overflow checks (an overflow is a crash, not a wrap), and
 # AddressSanitizer (cargo-fuzz's default). The gate runs exactly what build-m2a.sh builds.
 M2A_BUILD_FLAGS=(-O -a)
@@ -16,7 +23,8 @@ M2A_BUILD_FLAGS=(-O -a)
 # The gate's decoder key: what the fuzzed decoder and its harness are built and run from. A
 # change to any of these makes a gate file stale. `git rev-parse HEAD:<path>` of each path, plus
 # the sha256 of both lockfiles. network-config is outside the key: none of its code runs on
-# peer bytes (the ContextTable is injected). The manifests are in it because features (root
+# peer bytes (the ContextTable is injected). cl-p2p's rpc codec is keyed with the two modules it
+# imports (limits, metrics). The manifests are in it because features (root
 # [workspace.dependencies] included) change the build without changing the lockfile; the
 # harness, seeds and these scripts (limits, build flags) because a weaker run must not keep an
 # old gate. fuzz/Cargo.lock is what the targets link; the root Cargo.lock is what the session
@@ -29,6 +37,8 @@ M2A_KEY_PATHS=(
   crates/cl-p2p/Cargo.toml
   crates/cl-p2p/src/rpc/mod.rs
   crates/cl-p2p/src/rpc/codec.rs
+  crates/cl-p2p/src/rpc/limits.rs
+  crates/cl-p2p/src/rpc/metrics.rs
   fuzz/Cargo.toml
   fuzz/rust-toolchain.toml
   fuzz/src
@@ -41,42 +51,96 @@ M2A_KEY_PATHS=(
 )
 M2A_KEY_FILES=(Cargo.lock fuzz/Cargo.lock)
 
+# Gate 1's key: the m2a key, plus what its targets add: the gossip transform and message-id hook
+# (cl-p2p's gossip module), the record reader (cl-discv5's enr module and manifest),
+# network-config (the gossip caps come from the pinned Sepolia blob schedule, the ENR seeds from
+# its fork schedule) and fuzz/run-gate1.sh. Both lockfiles are keyed as for m2a.
+GATE1_KEY_PATHS=(
+  "${M2A_KEY_PATHS[@]}"
+  crates/cl-p2p/src/gossip/mod.rs
+  crates/cl-p2p/src/gossip/config.rs
+  crates/cl-discv5/Cargo.toml
+  crates/cl-discv5/src/enr.rs
+  crates/network-config
+  fuzz/run-gate1.sh
+)
+
+# gate_select <m2a|gate1>: the gate the scripts run and check. Sets GATE_ID (the gate file's
+# "gate"), GATE_LABEL (for messages), GATE_TARGETS, GATE_KEY_PATHS (the files are M2A_KEY_FILES
+# for both), GATE_FILE (the default gate file under fuzz/artifacts/), GATE_WORK (the run's work
+# directory under fuzz/target/), GATE_RUNNER and GATE_CHECKER (the scripts, for messages), and
+# GATE_CHECK_HEAD: 1 if the checker holds the file's `head` to the commit it vouches for (gate 1;
+# the m2a file's rules are mirrored in the m2a-session binary, which does not read `head`, so the
+# m2a checker keeps its rules). Status 1 for another name.
+gate_select() {
+  case $1 in
+    m2a)
+      GATE_ID=m2a-fuzz GATE_LABEL="m2a gate" GATE_FILE=m2a-gate.json GATE_WORK=m2a-gate
+      GATE_RUNNER=fuzz/run-m2a-gate.sh GATE_CHECKER=fuzz/check-m2a-gate.sh GATE_CHECK_HEAD=0
+      GATE_TARGETS=("${M2A_TARGETS[@]}")
+      GATE_KEY_PATHS=("${M2A_KEY_PATHS[@]}")
+      ;;
+    gate1)
+      GATE_ID=gate1-fuzz GATE_LABEL="gate 1" GATE_FILE=gate1.json GATE_WORK=gate1
+      GATE_RUNNER=fuzz/run-gate1.sh GATE_CHECKER=fuzz/check-gate1.sh GATE_CHECK_HEAD=1
+      GATE_TARGETS=("${GATE1_TARGETS[@]}")
+      GATE_KEY_PATHS=("${GATE1_KEY_PATHS[@]}")
+      ;;
+    *) return 1 ;;
+  esac
+}
+gate_select m2a
+
 # A gate needs this long per target.
 M2A_REQUIRED_SECONDS=3600
 
-# libFuzzer limits of a gate run; fuzz/check-m2a-gate.sh refuses a file with any other value.
+# libFuzzer limits of a gate run, the same for both gates; the checkers refuse a file with any
+# other value.
 #
 # -malloc_limit_mb=128 is the declared allocation bound. One chunk's receive buffer is at most
 # 1 + 4 + 10 + max_compressed_len(10 MiB) (about 11.7 MiB), its SSZ at most MAX_PAYLOAD_SIZE
 # (10 MiB), and a decoded block's largest vector at most 6 x its SSZ (24-byte list entries per
 # 4-byte offset), so any single allocation of 128 MiB or more is sized by something other than
-# a checked length. -rss_limit_mb=2048 bounds the whole process. -timeout=10 s per input.
+# a checked length. The gossip targets hold the same: a message decompresses to at most its
+# topic's cap (at most MAX_PAYLOAD_SIZE), checked from its header before decompressing, and the
+# block it may hold decodes as above; a node record is at most 300 bytes. -rss_limit_mb=2048
+# bounds the whole process. -timeout=10 s per input.
 #
 # -max_len (m2a_max_len): without it libFuzzer caps inputs at the largest seed (49,379 B), and
 # a BlocksByRange stream could never grow past that. blocks_by_range_resp gets 2 MiB: room for
 # multi-block responses and blocks well into their bound, and at most ~21 x that (snappy's best
-# ratio, ~42 MiB) decompressed per input, under the malloc limit per allocation. The
-# single-chunk targets get 4096 B: their largest valid chunk is an error chunk of 1 + 2 +
-# max_compressed_len(256) = 333 B (a Status is 132 B), so 4096 B is over 12 x any valid chunk,
-# past every max_compressed_len cut-off they have, and holds the 3,098 B snappy-bomb seed.
+# ratio, ~42 MiB) decompressed per input, under the malloc limit per allocation. The gossip
+# targets get the same 2 MiB for one message: blocks well into their cap, bombs past every topic
+# cap. rpc_chunk gets 1 MiB for one chunk of any protocol: blocks well into their bound and 16
+# full 64 KiB frames. The single-chunk targets get 4096 B: their largest valid chunk is an error
+# chunk of 1 + 2 + max_compressed_len(256) = 333 B (a Status is 132 B), so 4096 B is over 12 x
+# any valid chunk, past every max_compressed_len cut-off they have, and holds the 3,098 B
+# snappy-bomb seed. enr_fields gets 4096 B too: over 13 x a record's 300 bytes.
 M2A_RSS_LIMIT_MB=2048
 M2A_MALLOC_LIMIT_MB=128
 M2A_TIMEOUT_S=10
 m2a_max_len() {
   case $1 in
-    blocks_by_range_resp) echo 2097152 ;;
+    blocks_by_range_resp | gossip_transform | message_id) echo 2097152 ;;
+    rpc_chunk) echo 1048576 ;;
     *) echo 4096 ;;
   esac
 }
 
 # The coverage-feature floor (libFuzzer's `ft:` once the seed corpus is loaded, the INITED line)
 # a target must reach, so a run whose target body never executes cannot pass. Measured on the
-# committed seeds (rustc 5d8fec066): status_v2 495, metadata_v3 481, ping_goodbye 459,
-# blocks_by_range_resp 5,131; a target that returns at once (RUST_LIBFUZZER_DEBUG_PATH set) has
-# 66-80. The floors sit at well under half of the real values and well over the no-op ones.
+# committed seeds (rustc 5d8fec066): status_v2 2,065, metadata_v3 1,803, ping_goodbye 1,861 (the
+# timed codec in both directions), blocks_by_range_resp 5,257, rpc_chunk 2,352,
+# gossip_transform 3,226, message_id 1,471, enr_fields 4,151; a target that returns at once
+# (RUST_LIBFUZZER_DEBUG_PATH set) has 66-103. The floors sit at well under half of the real
+# values and well over the no-op ones.
 m2a_min_seed_ft() {
   case $1 in
     blocks_by_range_resp) echo 2000 ;;
+    gossip_transform | enr_fields) echo 1500 ;;
+    rpc_chunk) echo 1000 ;;
+    status_v2 | metadata_v3 | ping_goodbye) echo 800 ;;
+    message_id) echo 600 ;;
     *) echo 200 ;;
   esac
 }
@@ -227,7 +291,7 @@ m2a_toolchain_pin() {
   sed -n 's/^channel = "\(.*\)"$/\1/p' "$fuzz_dir/rust-toolchain.toml"
 }
 
-# The limits a gate run must use, as one JSON object.
+# The limits a run of the selected gate must use, as one JSON object.
 m2a_limits_json() {
   local t out sep=''
   out="{\"rss_limit_mb\": $M2A_RSS_LIMIT_MB, \"malloc_limit_mb\": $M2A_MALLOC_LIMIT_MB"
@@ -235,7 +299,7 @@ m2a_limits_json() {
   for t in "${M2A_BUILD_FLAGS[@]}"; do out="$out$sep\"$t\""; sep=', '; done
   out="$out], \"max_len\": {"
   sep=''
-  for t in "${M2A_TARGETS[@]}"; do out="$out$sep\"$t\": $(m2a_max_len "$t")"; sep=', '; done
+  for t in "${GATE_TARGETS[@]}"; do out="$out$sep\"$t\": $(m2a_max_len "$t")"; sep=', '; done
   printf '%s}}\n' "$out"
 }
 
@@ -301,7 +365,7 @@ m2a_worktree_diff() {
   }
   (
     set -o pipefail
-    m2a_git ls-tree -r -z --full-tree HEAD -- "${M2A_KEY_PATHS[@]}" "${M2A_KEY_FILES[@]}" |
+    m2a_git ls-tree -r -z --full-tree HEAD -- "${GATE_KEY_PATHS[@]}" "${M2A_KEY_FILES[@]}" |
       python3 -I -c '
 import hashlib, os, stat, sys
 
@@ -353,7 +417,7 @@ for k in keyed:
         out.append(f"not in HEAD: {k}")
 for line in out:
     print(line)
-' "$repo" "$format" "${M2A_KEY_PATHS[@]}" "${M2A_KEY_FILES[@]}"
+' "$repo" "$format" "${GATE_KEY_PATHS[@]}" "${M2A_KEY_FILES[@]}"
   ) || {
     echo "ERROR: comparing the keyed paths with HEAD failed" >&2
     return 1
@@ -371,11 +435,11 @@ for line in out:
 m2a_dirty_paths() {
   local status listed diff tag path
   status=$(m2a_git status --porcelain --untracked-files=all -- \
-    "${M2A_KEY_PATHS[@]}" "${M2A_KEY_FILES[@]}") || {
+    "${GATE_KEY_PATHS[@]}" "${M2A_KEY_FILES[@]}") || {
     echo "ERROR: git status failed" >&2
     return 1
   }
-  listed=$(m2a_git ls-files -v -- "${M2A_KEY_PATHS[@]}" "${M2A_KEY_FILES[@]}") || {
+  listed=$(m2a_git ls-files -v -- "${GATE_KEY_PATHS[@]}" "${M2A_KEY_FILES[@]}") || {
     echo "ERROR: git ls-files failed" >&2
     return 1
   }
@@ -393,13 +457,16 @@ m2a_dirty_paths() {
   [[ -z $diff ]] || printf '%s\n' "$diff"
 }
 
-# Prints the decoder key of HEAD as one JSON object; fails if a keyed path is not in HEAD.
+# m2a_key_json [COMMIT]: prints the selected gate's decoder key of HEAD (or of COMMIT) as one JSON
+# object; fails if a keyed path is not in it. With no argument the lockfiles are hashed as they
+# are on disk (the dirty check holds them to HEAD's); at COMMIT they are read from git, so the
+# working tree is never touched.
 m2a_key_json() {
-  local path sha out='{"git": {'
+  local rev=${1:-HEAD} path sha out='{"git": {'
   local sep=''
-  for path in "${M2A_KEY_PATHS[@]}"; do
-    sha=$(m2a_git rev-parse --verify --quiet "HEAD:$path") || {
-      echo "ERROR: $path is not in HEAD" >&2
+  for path in "${GATE_KEY_PATHS[@]}"; do
+    sha=$(m2a_git rev-parse --verify --quiet "$rev:$path") || {
+      echo "ERROR: $path is not in $rev" >&2
       return 1
     }
     out="$out$sep\"$path\": \"$sha\""
@@ -408,11 +475,20 @@ m2a_key_json() {
   out="$out}, \"sha256\": {"
   sep=''
   for path in "${M2A_KEY_FILES[@]}"; do
-    [[ -f $repo/$path ]] || {
-      echo "ERROR: $path missing" >&2
-      return 1
-    }
-    out="$out$sep\"$path\": \"$(m2a_sha256 "$repo/$path")\""
+    if (($# == 0)); then
+      [[ -f $repo/$path ]] || {
+        echo "ERROR: $path missing" >&2
+        return 1
+      }
+      sha=$(m2a_sha256 "$repo/$path")
+    else
+      m2a_git cat-file -e "$rev:$path" 2>/dev/null || {
+        echo "ERROR: $path is not in $rev" >&2
+        return 1
+      }
+      sha=$( (set -o pipefail; m2a_git show "$rev:$path" | m2a_sha256 -)) || return 1
+    fi
+    out="$out$sep\"$path\": \"$sha\""
     sep=', '
   done
   printf '%s}}\n' "$out"

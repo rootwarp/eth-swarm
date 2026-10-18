@@ -1,29 +1,36 @@
 #!/usr/bin/env bash
 # The m2a fuzz gate: runs the four response-decoder targets under cargo-fuzz and writes the gate
-# file that fuzz/check-m2a-gate.sh verifies.
+# file that fuzz/check-m2a-gate.sh verifies. With --gate gate1 (fuzz/run-gate1.sh) it runs gate 1
+# instead: the seven targets of GATE1_TARGETS (fuzz/m2a-common.sh), with the same limits, into
+# fuzz/artifacts/gate1.json, which fuzz/check-gate1.sh verifies. Everything below holds for both;
+# the target lists, keys, file names and work directories are gate_select's.
 #
 # Builds with fuzz/build-m2a.sh, then runs every target (in parallel unless --sequential) as
 #   cargo fuzz run -O -a <target> <work corpus> fuzz/corpus/<target> -- \
 #     -max_total_time=<seconds> -rss_limit_mb=2048 -malloc_limit_mb=128 -timeout=10 \
-#     -max_len=<2 MiB for blocks_by_range_resp, 4096 B otherwise> -print_final_stats=1
+#     -max_len=<m2a_max_len: 2 MiB for blocks_by_range_resp and the gossip targets, 1 MiB for
+#     rpc_chunk, 4096 B otherwise> -print_final_stats=1
 # The limits, -max_len and the build flags are the policy in fuzz/m2a-common.sh, which explains
 # each value; fuzz/check-m2a-gate.sh refuses a file with any other. A seed longer than its
 # target's -max_len stops the run (libFuzzer would cut it silently).
 # fuzz/corpus-slow is not fuzzed from: its seeds take seconds per execution (the ResponseTooLarge
 # byte budget) and would starve the run; fuzz/coverage-m2a.sh and the tests run them.
-# New inputs go to the work corpus under fuzz/target/m2a-gate/<target>/, so the committed seeds
-# stay as they are; crash, OOM and timeout inputs land in fuzz/artifacts/<target>/.
+# New inputs go to the work corpus under fuzz/target/m2a-gate/<target>/ (gate 1:
+# fuzz/target/gate1/), so the committed seeds stay as they are; crash, OOM and timeout inputs
+# land in fuzz/artifacts/<target>/.
 #
-# The gate file (default fuzz/artifacts/m2a-gate.json) holds, per target: seconds (libFuzzer's
-# "Done ... in N second(s)"), execs (stat::number_of_executed_units), crashes, ooms, timeouts,
+# The gate file (default fuzz/artifacts/m2a-gate.json; gate 1: fuzz/artifacts/gate1.json)
+# records the gate ("m2a-fuzz" or "gate1-fuzz") and the commit (head), and per target: seconds
+# (libFuzzer's "Done ... in N second(s)"), execs (stat::number_of_executed_units), crashes, ooms, timeouts,
 # whether the run completed, the exit code, the crash inputs, the sha256 of the seed corpus and
 # the largest input the run kept; plus the decoder key (fuzz/check-m2a-gate.sh --print-key), the
 # toolchain (channel, rustc commit), cargo-fuzz and the limits. The log (default: the gate file
 # with .log) keeps libFuzzer's seed-corpus and final stats lines and any error report; each
-# run's full output is in fuzz/target/m2a-gate/<target>/run.log.
+# run's full output is in run.log beside the target's work corpus.
 #
-# Usage: fuzz/run-m2a-gate.sh [--seconds N] [--out FILE] [--log FILE] [--sequential]
-#                             [--allow-dirty]
+# Usage: fuzz/run-m2a-gate.sh [--gate m2a|gate1] [--seconds N] [--out FILE] [--log FILE]
+#                             [--sequential] [--allow-dirty]
+#   --gate NAME    the gate to run (default m2a; fuzz/run-gate1.sh passes gate1)
 #   --seconds N    per target (default 3600; less is a smoke run, which the checker refuses)
 #   --allow-dirty  run although a keyed path has uncommitted changes (the file says dirty: true)
 # Exit: 0 every target clean, 1 a crash, OOM, timeout, incomplete run or a target that did not
@@ -47,17 +54,19 @@ set -euo pipefail
 . "$(dirname "$0")/m2a-common.sh"
 
 usage() {
-  echo "Usage: fuzz/run-m2a-gate.sh [--seconds N] [--out FILE] [--log FILE] [--sequential] [--allow-dirty]"
+  echo "Usage: fuzz/run-m2a-gate.sh [--gate m2a|gate1] [--seconds N] [--out FILE] [--log FILE] [--sequential] [--allow-dirty]"
   exit 2
 }
 
+gate=""
 seconds=$M2A_REQUIRED_SECONDS
-out="$fuzz_dir/artifacts/m2a-gate.json"
+out=""
 log=""
 parallel=1
 allow_dirty=0
 while (($#)); do
   case $1 in
+    --gate) (($# >= 2)) && [[ -z $gate ]] || usage; gate=$2; shift 2 ;;
     --seconds) (($# >= 2)) || usage; seconds=$2; shift 2 ;;
     --out) (($# >= 2)) || usage; out=$2; shift 2 ;;
     --log) (($# >= 2)) || usage; log=$2; shift 2 ;;
@@ -67,6 +76,8 @@ while (($#)); do
   esac
 done
 [[ $seconds =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: --seconds wants a positive integer"; usage; }
+gate_select "${gate:-m2a}" || { echo "ERROR: --gate wants m2a or gate1, not '$gate'"; usage; }
+[[ -n $out ]] || out="$fuzz_dir/artifacts/$GATE_FILE"
 
 m2a_require_clean_env
 overrides=()
@@ -103,7 +114,7 @@ if [[ -n $dirty_paths ]]; then
 fi
 key=$(m2a_key_json) || exit 2
 
-for target in "${M2A_TARGETS[@]}"; do
+for target in "${GATE_TARGETS[@]}"; do
   max=$(m2a_max_len "$target")
   for seed in "$fuzz_dir/corpus/$target"/*; do
     size=$(wc -c < "$seed" | tr -d ' ')
@@ -118,14 +129,14 @@ bash "$fuzz_dir/build-m2a.sh" || { echo "ERROR: build failed"; exit 2; }
 channel=${FUZZ_TOOLCHAIN:-${RUSTUP_TOOLCHAIN:-$(m2a_toolchain_pin)}}
 floors='{'
 sep=''
-for target in "${M2A_TARGETS[@]}"; do floors="$floors$sep\"$target\": $(m2a_min_seed_ft "$target")"; sep=', '; done
+for target in "${GATE_TARGETS[@]}"; do floors="$floors$sep\"$target\": $(m2a_min_seed_ft "$target")"; sep=', '; done
 floors="$floors}"
 rustc_commit=$(m2a_rustc -vV | sed -n 's/^commit-hash: //p')
 rustc_version=$(m2a_rustc -V)
 cargo_fuzz=$(m2a_cargo fuzz --version 2>/dev/null || echo unknown)
 limits=$(m2a_limits_json)
 
-work="$fuzz_dir/target/m2a-gate"
+work="$fuzz_dir/target/$GATE_WORK"
 run_one() {
   local target=$1 dir="$work/$1" rc=0
   rm -rf "$dir"
@@ -140,23 +151,23 @@ run_one() {
   echo "$rc" > "$dir/exit"
 }
 
-echo "fuzzing ${M2A_TARGETS[*]} for $seconds s each ($([[ $parallel == 1 ]] && echo parallel || echo sequential))"
+echo "$GATE_LABEL: fuzzing ${GATE_TARGETS[*]} for $seconds s each ($([[ $parallel == 1 ]] && echo parallel || echo sequential))"
 if ((parallel)); then
   pids=()
-  for target in "${M2A_TARGETS[@]}"; do
+  for target in "${GATE_TARGETS[@]}"; do
     run_one "$target" &
     pids+=($!)
   done
   for pid in "${pids[@]}"; do wait "$pid" || true; done
 else
-  for target in "${M2A_TARGETS[@]}"; do run_one "$target"; done
+  for target in "${GATE_TARGETS[@]}"; do run_one "$target"; done
 fi
 
 mkdir -p "$(dirname "$out")" "$(dirname "$log")"
 KEY=$key DIRTY=$dirty SECONDS_REQ=$seconds CARGO_FUZZ=$cargo_fuzz LIMITS=$limits \
   OVERRIDES=$overrides_json FLOORS=$floors \
   CHANNEL=$channel RUSTC_COMMIT=$rustc_commit RUSTC_VERSION=$rustc_version \
-  HEAD_SHA=$(m2a_git rev-parse HEAD) TARGETS="${M2A_TARGETS[*]}" \
+  HEAD_SHA=$(m2a_git rev-parse HEAD) TARGETS="${GATE_TARGETS[*]}" GATE_ID=$GATE_ID \
   python3 -I - "$work" "$fuzz_dir" "$out" "$log" <<'PY'
 import json, os, re, sys
 
@@ -234,7 +245,7 @@ for name in env["TARGETS"].split():
         log.append(f"-- last lines of {d}/run.log --\n" + "\n".join(text.splitlines()[-40:]) + "\n")
 
 gate = {
-    "gate": "m2a-fuzz",
+    "gate": env["GATE_ID"],
     "format": 1,
     "requested_seconds": int(env["SECONDS_REQ"]),
     "head": env["HEAD_SHA"],

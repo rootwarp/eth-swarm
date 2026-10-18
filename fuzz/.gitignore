@@ -5,3 +5,5 @@ artifacts/*
 !artifacts/m2a-gate.json
 !artifacts/m2a-gate.log
 !artifacts/m2a-coverage.txt
+!artifacts/gate1.json
+!artifacts/gate1.log

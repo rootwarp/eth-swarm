@@ -1,4 +1,4 @@
-# The req/resp decoder fuzz targets (cargo-fuzz, libFuzzer).
+# The peer-input decoder fuzz targets (cargo-fuzz, libFuzzer): req/resp, gossip and ENR.
 #
 # Its own workspace (the empty [workspace] below) with its own committed Cargo.lock, built with
 # the nightly in rust-toolchain.toml here. A [patch.crates-io] applies only in the workspace
@@ -8,8 +8,9 @@
 # fuzz/Cargo.lock that the root Cargo.lock also has resolves to the same version and source, so
 # the fuzzed decoder links exactly the dependencies the session binary links.
 #
-# Build: fuzz/build-m2a.sh. Gate: fuzz/run-m2a-gate.sh. Seeds: fuzz/gen-seeds.sh. Lock:
-# fuzz/regen-lock.sh.
+# Build: fuzz/build-m2a.sh. Gates: fuzz/run-m2a-gate.sh (the m2a-session decoders) and
+# fuzz/run-gate1.sh (the probe's control, gossip and ENR decoders). Seeds: fuzz/gen-seeds.sh.
+# Lock: fuzz/regen-lock.sh.
 [package]
 name = "ethswarm-fuzz"
 version = "0.0.0"
@@ -24,12 +25,26 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 p2p-wire = { path = "../crates/p2p-wire", features = ["testkit"] }
 cl-p2p = { path = "../crates/cl-p2p" }
+# parse_enr_fields, the ENR target's entry point.
+cl-discv5 = { path = "../crates/cl-discv5" }
 consensus-types = { path = "../crates/consensus-types" }
+# The pinned Sepolia schedule the ENR seeds at BPO digest boundaries are built from (seeds only;
+# no network-config code runs on fuzz input).
+network-config = { path = "../crates/network-config" }
 ethereum_ssz = "0.10"
 ssz_types = "0.14"
 futures = "0.3"
-
-[dev-dependencies]
+# The timed req/resp codec runs under tokio's timer; the versions and features cl-p2p uses.
+tokio = { version = "1", features = ["rt", "time"] }
+# request_response::Codec (the timed codec's trait) and gossipsub's DataTransform; the root
+# workspace's libp2p, which cl-p2p already links with these features.
+libp2p = { version = "0.57.1", default-features = false, features = ["gossipsub", "request-response"] }
+# Node records: the builder, a fixed key that signs deterministically (RFC 6979 over Keccak-256,
+# as enr's own k256 key does with a random nonce), and RLP. The versions cl-discv5 links.
+enr = "0.14"
+sha3 = "0.12"
+alloy-rlp = "0.3"
+# The message-id oracle and the gossip seeds; the versions p2p-wire links.
 sha2 = "0.10"
 snap = "1"
 
@@ -93,6 +108,34 @@ bench = false
 [[bin]]
 name = "blocks_by_range_resp"
 path = "fuzz_targets/blocks_by_range_resp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_chunk"
+path = "fuzz_targets/rpc_chunk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gossip_transform"
+path = "fuzz_targets/gossip_transform.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_id"
+path = "fuzz_targets/message_id.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "enr_fields"
+path = "fuzz_targets/enr_fields.rs"
 test = false
 doc = false
 bench = false
