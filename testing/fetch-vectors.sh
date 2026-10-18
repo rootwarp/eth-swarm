@@ -14,6 +14,7 @@
 #      VECTORS_GIT_BASE            git host for the tag checks      (default https://github.com)
 #      VECTORS_RELEASE_BASE        host for the release downloads   (default https://github.com)
 #      FETCH_VECTORS_LOCK_WAIT     seconds to wait for another run's lock check (default 60)
+#      FETCH_VECTORS_TEST=1        test mode: honour FETCH_VECTORS_LOCK_HOOK (see lock_hook)
 #
 # Layout under DEST/<source>/<tag>/:
 #   <file>        the verified archive, kept so later runs can re-hash it
@@ -24,8 +25,9 @@
 #                 /proc). A second run fails closed (LOCKED) while that PID is alive, and takes
 #                 the lock over only once it is not (e.g. a run killed with SIGKILL), and only
 #                 from the same host and namespace.
-#   .<file>.lockf empty, kept; taking or reclaiming .<file>.lock/ happens under an flock(2) on
-#                 it, so concurrent reclaims are serialized and only one run can own the asset.
+#   .<file>.lockf empty, kept; taking, reclaiming or releasing .<file>.lock/ happens under an
+#                 flock(2) on it, so concurrent reclaims are serialized, only one run can own
+#                 the asset, and no run sees a lock half-way through its release.
 # A stamp is never trusted on its own: a later run reuses the kept archive only if it
 # re-hashes to the pinned sha256, and then re-extracts the tree from it every time, so an
 # edited or deleted fixture never survives. A stamp without its archive (for example one
@@ -117,12 +119,12 @@ resolve_tag() {
   ' <<<"$refs"
 }
 
-part="" staging="" held_lock="" tree="" old_tree=""
+part="" staging="" held_lock="" held_lockf="" tree="" old_tree=""
 cleanup() {
   if [[ -n "$part" ]]; then rm -f "$part"; fi
   if [[ -n "$staging" ]]; then rm -rf "$staging"; fi
   if [[ -n "$old_tree" && -e "$old_tree" && ! -e "$tree" ]]; then mv "$old_tree" "$tree" || true; fi
-  if [[ -n "$held_lock" ]]; then rm -rf "$held_lock"; fi
+  release_lock cleanup || true
   return 0
 }
 trap cleanup EXIT
@@ -134,11 +136,16 @@ alive() { kill -0 "$1" 2>/dev/null || ps -p "$1" >/dev/null 2>&1; }
 my_host="$(uname -n)"
 my_pidns="$(readlink "/proc/$$/ns/pid" 2>/dev/null || echo none)"
 
-# Test-only: FETCH_VECTORS_LOCK_HOOK names a program run as `<hook> <stage> <lock>` at each
-# step of taking a lock, so tests can pause concurrent runs at chosen points. A failing hook
-# aborts the run.
+# Test-only: with FETCH_VECTORS_TEST=1, FETCH_VECTORS_LOCK_HOOK names a program run as
+# `<hook> <stage> <lock>` at each step of taking a lock (waiting, read, owned) and half-way
+# through releasing it (releasing, under the flock), so tests can pause concurrent runs at
+# chosen points. A failing hook aborts the run. Without FETCH_VECTORS_TEST=1 the hook is
+# ignored, so a stray variable in a real environment can never run code inside the lock.
+if [[ -n "${FETCH_VECTORS_LOCK_HOOK:-}" && "${FETCH_VECTORS_TEST:-}" != 1 ]]; then
+  echo "ignoring FETCH_VECTORS_LOCK_HOOK: it is test-only (FETCH_VECTORS_TEST=1)" >&2
+fi
 lock_hook() {
-  if [[ -n "${FETCH_VECTORS_LOCK_HOOK:-}" ]]; then
+  if [[ -n "${FETCH_VECTORS_LOCK_HOOK:-}" && "${FETCH_VECTORS_TEST:-}" == 1 ]]; then
     "$FETCH_VECTORS_LOCK_HOOK" "$1" "$2" || die "lock hook failed at $1"
   fi
 }
@@ -186,12 +193,29 @@ take_lock() {
     rm -rf "$lock"
     mkdir "$lock" || die "LOCKED $label: could not recreate $lock"
   fi
-  held_lock="$lock"
+  held_lock="$lock" held_lockf="$lockf"
   echo "$my_host" >"$lock/host"
   echo "$my_pidns" >"$lock/pidns"
   echo "$$" >"$lock/pid"
   exec 9>&-
   lock_hook owned "$lock"
+}
+
+# Removes the lock directory this run holds, under the same flock as take_lock, so a run that
+# arrives mid-release waits for it instead of reading a half-removed lock (no PID) and failing
+# with a spurious LOCKED. If the flock cannot be had in time the directory is removed anyway:
+# that can only make a concurrent run fail closed, never let two runs own the asset.
+# `release_lock cleanup` (the exit trap) runs no hook, so a failing hook cannot leave it behind.
+release_lock() {
+  [[ -n "$held_lock" ]] || return 0
+  local locked=0
+  exec 9>>"$held_lockf"
+  if flock_fd9 "$lock_wait"; then locked=1; fi
+  rm -f "$held_lock/pid"
+  if ((locked)) && [[ "${1:-}" != cleanup ]]; then lock_hook releasing "$held_lock"; fi
+  rm -rf "$held_lock"
+  held_lock=""
+  exec 9>&-
 }
 
 # Pass 0: pick the assets this run fetches. Only their sources get a tag check.
@@ -277,6 +301,6 @@ while IFS=$'\t' read -r -u 3 kind name repo tag file sha _; do
   staging=""
   if [[ -n "$old_tree" ]]; then rm -rf "$old_tree"; old_tree=""; fi
   echo "$sha" >"$stamp"
-  rm -rf "$held_lock"; held_lock=""
+  release_lock
   echo "ok $label"
 done 3<<<"$selected"

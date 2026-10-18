@@ -9,7 +9,8 @@
 //!    pinned by `@sha256:<64 hex>`, or `owner/repo[/path]@<40 hex>`. Each pinned value must
 //!    appear verbatim on its own `uses` line, followed by a `# <version>` comment. A `uses`
 //!    line is a block entry (`[- ]uses: <value>`, key optionally quoted) or a flow mapping whose
-//!    first key is `uses` (`[- ]{ uses: <value> }`); any other line holding the text is ignored.
+//!    first key is `uses` (`[- ]{ uses: <value> }`), and the parser must place a `uses` key's
+//!    value on it; any other line holding the text, block-scalar content included, is ignored.
 //! 3. The top-level `permissions` is exactly `contents: read`, and job-level `permissions`
 //!    grant nothing above `read` (each scope `read` or `none`, or `read-all`).
 //! 4. A workflow triggered by `pull_request` references no secrets: no `secrets` identifier,
@@ -26,6 +27,8 @@
 
 use std::fmt;
 use std::path::Path;
+use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
+use yaml_rust2::scanner::Marker;
 use yaml_rust2::{Yaml, YamlLoader};
 
 /// One broken rule, reported as `ERROR <file>[:<line>]: <message>`.
@@ -264,6 +267,90 @@ fn is_uses_line_for(line: &str, value: &str) -> bool {
     strip_uses_key(rest).is_some_and(|v| v.starts_with(value))
 }
 
+/// Where a node sits in its parent collection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Key,
+    Value,
+    Item,
+}
+
+/// A collection the parser is inside: a mapping (expecting a key next, or a value) or a
+/// sequence.
+enum Open {
+    Map { expect_key: bool },
+    Seq,
+}
+
+/// Records the line of every scalar value of a `uses` key, from the parser's event markers,
+/// so a raw line only counts as a `uses` line where the YAML tree has one (never inside a block
+/// scalar or any other string).
+#[derive(Default)]
+struct UsesValues {
+    open: Vec<Open>,
+    /// The last key seen was `uses`, and its value has not been read yet.
+    after_uses_key: bool,
+    /// `(1-based line, value)` of every scalar `uses` value.
+    found: Vec<(usize, String)>,
+}
+
+impl UsesValues {
+    /// The role of the next node in its parent, which then expects what follows it.
+    fn next_role(&mut self) -> Role {
+        match self.open.last_mut() {
+            Some(Open::Map { expect_key }) => {
+                let role = if *expect_key { Role::Key } else { Role::Value };
+                *expect_key = !*expect_key;
+                role
+            }
+            Some(Open::Seq) | None => Role::Item,
+        }
+    }
+
+    /// A node other than a `uses` key: the pending `uses` value, if any, is consumed by it.
+    fn node(&mut self, scalar: Option<&str>, mark: Marker) {
+        let role = self.next_role();
+        let after_uses_key = std::mem::take(&mut self.after_uses_key);
+        match (role, scalar) {
+            (Role::Key, Some("uses")) => self.after_uses_key = true,
+            (Role::Value, Some(v)) if after_uses_key => {
+                self.found.push((mark.line(), v.to_owned()));
+            }
+            _ => {}
+        }
+    }
+
+    /// The `uses` values of `text` (none if it does not parse).
+    fn of(text: &str) -> Vec<(usize, String)> {
+        let mut values = Self::default();
+        match Parser::new_from_str(text).load(&mut values, true) {
+            Ok(()) => values.found,
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+impl MarkedEventReceiver for UsesValues {
+    fn on_event(&mut self, ev: Event, mark: Marker) {
+        match ev {
+            Event::Scalar(v, ..) => self.node(Some(&v), mark),
+            Event::Alias(_) => self.node(None, mark),
+            Event::MappingStart(..) => {
+                self.node(None, mark);
+                self.open.push(Open::Map { expect_key: true });
+            }
+            Event::SequenceStart(..) => {
+                self.node(None, mark);
+                self.open.push(Open::Seq);
+            }
+            Event::MappingEnd | Event::SequenceEnd => {
+                self.open.pop();
+            }
+            _ => {}
+        }
+    }
+}
+
 impl<'a> Checker<'a> {
     fn error(&mut self, line: Option<usize>, message: String) {
         self.out.push(Violation {
@@ -363,6 +450,7 @@ impl<'a> Checker<'a> {
                 values.push(val);
             }
         });
+        let marked = UsesValues::of(self.text);
         let mut seen: Vec<&str> = Vec::new();
         for val in values.iter().copied() {
             let Some(r) = val.as_str() else {
@@ -383,10 +471,13 @@ impl<'a> Checker<'a> {
                 continue;
             }
             // Each occurrence needs its own plain `uses: <value>` line, so the version comment
-            // cannot be borrowed from a comment or another line holding the same text.
+            // cannot be borrowed from a comment, a block scalar or another line holding the
+            // same text: the line must hold a `uses` value as parsed.
             let uses_lines: Vec<_> = lines
                 .into_iter()
-                .filter(|(_, raw)| is_uses_line_for(raw, r))
+                .filter(|(n, raw)| {
+                    is_uses_line_for(raw, r) && marked.iter().any(|(m, v)| m == n && v == r)
+                })
                 .collect();
             let occurrences = values.iter().filter(|v| v.as_str() == Some(r)).count();
             if uses_lines.len() < occurrences {

@@ -11,6 +11,7 @@ description = "cl-store: the ethswarm.store.v1 service (stub: contract layer onl
 ethswarm-proto = { path = "../ethswarm-proto" }
 ipc = { path = "../ipc" }
 tonic.workspace = true
+prost.workspace = true
 
 [dev-dependencies]
 ipc = { path = "../ipc", features = ["testkit"] }

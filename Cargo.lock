@@ -1063,6 +1063,7 @@ dependencies = [
  "ethswarm-proto",
  "ipc",
  "network-config",
+ "prost",
  "tokio-stream",
  "tonic",
 ]

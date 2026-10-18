@@ -6,7 +6,8 @@
 # server over any KZG verifier. Without it the only constructor is `VerifyServer::new`, whose KZG
 # backend is loaded through `load_pinned` with BETA4_MAINNET_SHA256 (scripts/check-setup-pin.sh).
 # So the feature must not be a default, must not be implied by another cl-verify feature, and no
-# other crate may enable it through a dependency (normal, dev or build) or one of its features.
+# other crate may enable it through a dependency (normal, dev or build) or one of its features,
+# under the dependency's own name or a rename (`v = { package = "cl-verify" }`, `v/` or `v?/`).
 #
 # Usage: scripts/check-test-backends.sh [path/to/workspace/Cargo.toml]   (default: this repo)
 # Env: CARGO (default `cargo`). Needs python3. Works with bash 3.2.
@@ -48,8 +49,12 @@ for p in pkgs:
         errors.append("cl-verify/%s enabled by %s (%s dependency)" % (FEATURE, p["name"], d["kind"] or "normal"))
     if p["name"] == "cl-verify":
         continue
+    # A feature forwards through the dependency key, which a rename replaces:
+    # `v = { package = "cl-verify" }` is forwarded as `v/...` or `v?/...`.
+    aliases = {d.get("rename") or d["name"] for d in p["dependencies"] if d["name"] == "cl-verify"}
+    forwards = {a + sep + FEATURE for a in aliases for sep in ("/", "?/")}
     for name, enables in p["features"].items():
-        if any(e in ("cl-verify/" + FEATURE, "cl-verify?/" + FEATURE) for e in enables):
+        if forwards.intersection(enables):
             errors.append("cl-verify/%s enabled by %s (feature %s)" % (FEATURE, p["name"], name))
 
 for e in errors:

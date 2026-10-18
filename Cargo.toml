@@ -50,6 +50,10 @@ libp2p = { version = "0.57.1", default-features = false, features = ["tokio", "t
 libp2p-mplex = "0.44.0"
 discv5 = "0.12.0"
 enr = "0.14"
+# Crypto backends: one spec each, so the lockfile has one blst and one c-kzg. Never enable blst's
+# `portable` (it swaps the ADX-optimised code for slower generic code; check-kzg-loaders.sh).
+blst = "0.3.17"
+c-kzg = { version = "2.1.8", default-features = false }
 
 # Pinned to the exact revisions Lighthouse `unstable` uses (see arch/ssz-crate-check.md).
 # Progressive SSZ types (EIP-7916/7495-successor/8016) are only on these git revisions, not on crates.io.

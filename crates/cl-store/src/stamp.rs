@@ -82,6 +82,52 @@ pub const PROTOBUF_OVERHEAD_BYTES: usize = 64 * 1024;
 /// [`PROTOBUF_OVERHEAD_BYTES`]. tonic's own default (4 MiB) would refuse a valid 10 MiB block.
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = MAX_JSON_BYTES + PROTOBUF_OVERHEAD_BYTES;
 
+/// `MAX_REQUEST_DATA_COLUMN_SIDECARS` (`fulu/p2p-interface.md`: 128 blocks x 128 columns): the
+/// most bodies a by-range read can legitimately stream, and the default body cap.
+pub const DEFAULT_MAX_STREAM_BODIES: usize = 16_384;
+
+/// The default total size of one streaming read's bodies (256 MiB). The bodies are collected in
+/// memory; a caller reading bigger ranges raises it ([`StreamLimits`]) or splits the request.
+pub const DEFAULT_MAX_STREAM_BYTES: usize = 256 * 1024 * 1024;
+
+/// The totals one streaming read of a [`StoreReader`] may collect. The stream is refused (as a
+/// contract violation) as soon as a body would take it over either cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamLimits {
+    /// The most bodies.
+    pub max_bodies: usize,
+    /// The most bytes, summed over the bodies' encoded sizes.
+    pub max_bytes: usize,
+}
+
+impl Default for StreamLimits {
+    fn default() -> Self {
+        Self {
+            max_bodies: DEFAULT_MAX_STREAM_BODIES,
+            max_bytes: DEFAULT_MAX_STREAM_BYTES,
+        }
+    }
+}
+
+impl StreamLimits {
+    /// Admits one more body of `bytes` on top of `bodies` bodies of `total` bytes.
+    fn admit(&self, bodies: usize, total: usize, bytes: usize) -> Result<usize, ContractError> {
+        if bodies >= self.max_bodies {
+            return Err(ContractError::violation(format!(
+                "store stream is over its cap of {} bodies",
+                self.max_bodies
+            )));
+        }
+        match total.checked_add(bytes) {
+            Some(sum) if sum <= self.max_bytes => Ok(sum),
+            _ => Err(ContractError::violation(format!(
+                "store stream is over its cap of {} bytes",
+                self.max_bytes
+            ))),
+        }
+    }
+}
+
 /// A store response or streamed body with at most one envelope.
 pub trait StoreItem: Stamped {
     /// The envelope field, if the message has one.
@@ -117,11 +163,13 @@ impl StoreItem for pb::GetChainHeadResponse {
 /// each response and streamed body, and the envelope rules on each envelope (through `link`):
 /// `seq` 0 on a unary response and strictly from 1 on a stream, a zero `payload_type` fails the
 /// call, an unknown type or a mismatched fork digest drops the envelope (the field comes back
-/// empty). Streams also get the hello exchange and frame discipline.
+/// empty). Streams also get the hello exchange and frame discipline, and each streaming read is
+/// held to its [`StreamLimits`].
 #[derive(Clone, Debug)]
 pub struct StoreReader<T> {
     inner: StoreServiceClient<T>,
     link: Link,
+    limits: StreamLimits,
 }
 
 impl<T> StoreReader<T>
@@ -143,7 +191,15 @@ where
                 .max_decoding_message_size(max_message_bytes)
                 .max_encoding_message_size(max_message_bytes),
             link,
+            limits: StreamLimits::default(),
         }
+    }
+
+    /// The same reader with other totals per streaming read.
+    #[must_use]
+    pub fn with_stream_limits(mut self, limits: StreamLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     fn refused(&self, err: ContractError) -> ContractError {
@@ -171,22 +227,27 @@ where
         Ok(response)
     }
 
-    /// The hello exchange, then every body: stamp and envelope rules.
+    /// The hello exchange, then every body: stamp and envelope rules, within the stream limits.
     async fn stream<M>(
         &self,
         response: Result<tonic::Response<tonic::Streaming<M>>, tonic::Status>,
     ) -> Result<Vec<M::Body>, ContractError>
     where
         M: InFrame,
-        M::Body: Envelopes + StoreItem,
+        M::Body: Envelopes + StoreItem + prost::Message,
     {
         let stream = response
             .map_err(|s| ContractError::from_status(&s))?
             .into_inner();
         let mut guarded = self.link.open(Inbound::from_server(stream)).await?;
         let mut bodies = Vec::new();
+        let mut total = 0;
         while let Some(accepted) = guarded.body().await? {
             let mut body = accepted.body;
+            total = self
+                .limits
+                .admit(bodies.len(), total, prost::Message::encoded_len(&body))
+                .map_err(|e| self.refused(e))?;
             check_read_meta(&body).map_err(|e| self.refused(e))?;
             if !accepted.dropped.is_empty() {
                 if let Some(slot) = body.envelope_slot() {
@@ -275,6 +336,20 @@ mod tests {
             as_of_slot: slot,
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn stream_limits_cap_the_count_and_the_byte_total() {
+        let l = StreamLimits {
+            max_bodies: 2,
+            max_bytes: 100,
+        };
+        assert_eq!(l.admit(0, 0, 60), Ok(60));
+        assert_eq!(l.admit(1, 60, 40), Ok(100));
+        for (bodies, total, bytes) in [(2, 0, 0), (1, 60, 41), (1, usize::MAX, 1)] {
+            let err = l.admit(bodies, total, bytes).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::ContractViolation, "{err}");
+        }
     }
 
     #[test]

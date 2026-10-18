@@ -338,6 +338,26 @@ macro_rules! chunk_envelopes {
                     _ => Vec::new(),
                 }
             }
+
+            /// `oneof result { chunk; error }`: leaving both unset is a contract error, and so
+            /// is an error with the zero (`ERROR_CODE_UNSPECIFIED`) code.
+            fn check_shape(&self) -> Result<(), ContractError> {
+                match self.item.as_ref().and_then(|i| i.result.as_ref()) {
+                    Some($module::response_chunk::Result::Error(e))
+                        if e.code == ErrorCode::Unspecified as i32 =>
+                    {
+                        Err(ContractError::violation(concat!(
+                            stringify!($ty),
+                            " response chunk carries error code 0"
+                        )))
+                    }
+                    Some(_) => Ok(()),
+                    None => Err(ContractError::violation(concat!(
+                        stringify!($ty),
+                        " response chunk has neither chunk nor error"
+                    ))),
+                }
+            }
         })*
     };
 }
@@ -651,6 +671,56 @@ mod tests {
             ]
         );
         assert_eq!(object_kind(PayloadType::Unspecified), None);
+    }
+
+    /// Checks the shape rule on one req/resp body type: a chunk or an error passes, an item with
+    /// neither (or no item) is a contract violation.
+    macro_rules! assert_chunk_shape {
+        ($module:ident; $($ty:ident),* $(,)?) => {$({
+            // p2p's chunk also names the peer; chain's has only the result.
+            #[allow(clippy::needless_update)]
+            let with = |result| $module::$ty {
+                item: Some($module::ResponseChunk {
+                    result,
+                    ..Default::default()
+                }),
+            };
+            let chunk = $module::response_chunk::Result::Chunk(Envelope::default());
+            let error = |code: ErrorCode| {
+                $module::response_chunk::Result::Error(crate::error::wire_error(code, "e"))
+            };
+            assert_eq!(with(Some(chunk)).check_shape(), Ok(()), stringify!($ty));
+            let not_found = error(ErrorCode::NotFound);
+            assert_eq!(with(Some(not_found)).check_shape(), Ok(()), stringify!($ty));
+            let zero = with(Some(error(ErrorCode::Unspecified))).check_shape().unwrap_err();
+            assert_eq!(zero.code(), ErrorCode::ContractViolation, stringify!($ty));
+            assert!(zero.detail().contains("error code 0"), "{zero}");
+            for empty in [with(None), $module::$ty::default()] {
+                let err = empty.check_shape().unwrap_err();
+                assert_eq!(err.code(), ErrorCode::ContractViolation, stringify!($ty));
+                assert!(err.detail().contains("neither chunk nor error"), "{err}");
+            }
+        })*};
+    }
+
+    #[test]
+    fn response_chunk_with_neither_chunk_nor_error_is_refused() {
+        assert_chunk_shape!(chain;
+            BlocksByRangeResponseBody,
+            BlocksByRootResponseBody,
+            DataColumnsByRangeResponseBody,
+            DataColumnsByRootResponseBody,
+            PayloadEnvelopesByRangeResponseBody,
+            PayloadEnvelopesByRootResponseBody,
+        );
+        assert_chunk_shape!(p2p;
+            RequestBlocksByRangeResponseBody,
+            RequestBlocksByRootResponseBody,
+            RequestDataColumnsByRangeResponseBody,
+            RequestDataColumnsByRootResponseBody,
+            RequestPayloadEnvelopesByRangeResponseBody,
+            RequestPayloadEnvelopesByRootResponseBody,
+        );
     }
 
     #[test]

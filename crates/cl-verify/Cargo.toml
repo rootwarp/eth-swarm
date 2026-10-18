@@ -9,7 +9,7 @@ description = "cl-verify: the ethswarm.verify.v1 gRPC server (BLS batch and KZG 
 
 [dependencies]
 cl-verify-cache = { path = "../cl-verify-cache" }
-blst = "0.3.17"
+blst.workspace = true
 crypto-kzg = { path = "../crypto-kzg" }
 network-config = { path = "../network-config" }
 ethswarm-proto = { path = "../ethswarm-proto" }

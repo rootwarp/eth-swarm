@@ -390,6 +390,46 @@ fn uses_text_on_a_run_or_name_line_is_not_a_uses_line() {
 }
 
 #[test]
+fn uses_lines_inside_a_block_scalar_are_not_uses_lines() {
+    let escaped = format!("actions/checkout\\x40{SHA}");
+    let decoy = format!("- uses: actions/checkout@{SHA} # v7.0.1");
+    for block in [
+        format!("      - run: |\n          {decoy}\n"),
+        format!("      - name: |\n          {decoy}\n        run: echo\n"),
+        format!("      - run: >-\n          {decoy}\n"),
+        format!("      - run: |2\n            {decoy}\n"),
+        format!("      - env:\n          X: |\n            {decoy}\n        run: echo\n"),
+    ] {
+        let body = good().replace(
+            &format!("      - uses: {CHECKOUT}\n"),
+            &format!("{block}      - uses: \"{escaped}\"\n"),
+        );
+        assert_rejected(&body, "verbatim");
+    }
+}
+
+#[test]
+fn uses_values_are_located_by_the_parser() {
+    let text = "a:\n  - uses: x\n  - { k: uses, uses: \"y\" }\n  - [uses, z]\n  - &q uses: *q\nb: |\n  uses: w\n";
+    assert_eq!(
+        UsesValues::of(text),
+        [(2, "x".to_owned()), (3, "y".to_owned())]
+    );
+    assert!(UsesValues::of("a: [\n").is_empty());
+}
+
+#[test]
+fn a_uses_key_after_a_block_scalar_still_counts() {
+    assert_passes(&good().replace(
+        &format!("      - uses: {CHECKOUT}\n"),
+        &format!("      - run: |\n          echo {SHA}\n      - uses: {CHECKOUT}\n"),
+    ));
+    assert_passes(&with_step(&format!(
+        "      - name: |\n          uses\n        uses: {CHECKOUT}\n"
+    )));
+}
+
+#[test]
 fn quoted_keys_and_spaced_colons_are_still_uses_lines() {
     for line in [
         format!("      - \"uses\": actions/checkout@{SHA} # v7.0.1\n"),

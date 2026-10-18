@@ -5,9 +5,11 @@
 //! - `store_response_envelopes`: response envelopes pass the envelope rules (seq 0 on unary
 //!   responses, type, digest); a dropped one is removed, a broken one fails the call;
 //! - `store_message_limit`: the reader accepts a stamped block up to the SSZ limit and refuses
-//!   a response over its configured message limit.
+//!   a response over its configured message limit;
+//! - `store_stream_limits`: a streaming read refuses a stream over its configured total body
+//!   count or total bytes.
 
-use cl_store::stamp::{StoreReader, MAX_SSZ_BYTES};
+use cl_store::stamp::{StoreReader, StreamLimits, MAX_SSZ_BYTES};
 use ethswarm_proto::common::{Envelope, ErrorCode, Hello, PayloadType};
 use ethswarm_proto::store::store_service_server::{StoreService, StoreServiceServer};
 use ethswarm_proto::store::{self as pb, ReadMeta};
@@ -31,6 +33,8 @@ struct FakeStore {
     meta: Option<ReadMeta>,
     envelope: Option<Envelope>,
     hello: Hello,
+    /// Bodies per streamed response.
+    bodies: u64,
 }
 
 impl FakeStore {
@@ -39,18 +43,28 @@ impl FakeStore {
             meta,
             envelope,
             hello: fixture::hello(1, 1),
+            bodies: 1,
         }
     }
 
-    /// Our hello, then one body built by `body`.
-    fn stream<M: OutFrame + Send + 'static>(&self, body: M::Body) -> Response<StubStream<M>> {
-        let frames = vec![Ok(M::hello(self.hello.clone())), Ok(M::body(body))];
+    /// The same store with `bodies` bodies on every stream.
+    fn streaming(self, bodies: u64) -> Self {
+        Self { bodies, ..self }
+    }
+
+    /// Our hello, then the bodies, each built by `body` from the envelope at its seq.
+    fn stream<M: OutFrame + Send + 'static>(
+        &self,
+        body: impl Fn(Option<Envelope>) -> M::Body,
+    ) -> Response<StubStream<M>> {
+        let mut frames = vec![Ok(M::hello(self.hello.clone()))];
+        frames.extend((1..=self.bodies).map(|seq| Ok(M::body(body(self.streamed(seq))))));
         Response::new(Box::pin(tokio_stream::iter(frames)))
     }
 
-    /// The envelope as a streamed item: seq 1 on the stream.
-    fn streamed(&self) -> Option<Envelope> {
-        self.envelope.clone().map(|e| Envelope { seq: 1, ..e })
+    /// The envelope as the streamed item at `seq`.
+    fn streamed(&self, seq: u64) -> Option<Envelope> {
+        self.envelope.clone().map(|e| Envelope { seq, ..e })
     }
 }
 
@@ -103,8 +117,8 @@ impl StoreService for FakeStore {
         &self,
         _: Request<pb::GetDataColumnsRequest>,
     ) -> Result<Response<Self::GetDataColumnsStream>, Status> {
-        Ok(self.stream(pb::GetDataColumnsResponseBody {
-            column: self.streamed(),
+        Ok(self.stream(|column| pb::GetDataColumnsResponseBody {
+            column,
             meta: self.meta.clone(),
             error: None,
         }))
@@ -113,8 +127,8 @@ impl StoreService for FakeStore {
         &self,
         _: Request<pb::GetBlocksByRangeRequest>,
     ) -> Result<Response<Self::GetBlocksByRangeStream>, Status> {
-        Ok(self.stream(pb::GetBlocksByRangeResponseBody {
-            item: self.streamed(),
+        Ok(self.stream(|item| pb::GetBlocksByRangeResponseBody {
+            item,
             meta: self.meta.clone(),
             error: None,
         }))
@@ -123,8 +137,8 @@ impl StoreService for FakeStore {
         &self,
         _: Request<pb::GetDataColumnsByRangeRequest>,
     ) -> Result<Response<Self::GetDataColumnsByRangeStream>, Status> {
-        Ok(self.stream(pb::GetDataColumnsByRangeResponseBody {
-            column: self.streamed(),
+        Ok(self.stream(|column| pb::GetDataColumnsByRangeResponseBody {
+            column,
             meta: self.meta.clone(),
             error: None,
         }))
@@ -326,4 +340,78 @@ async fn store_message_limit(mode: Mode) {
     }
 }
 
-ipc::contract_suite!(target, extra: [store_as_of_stamp, store_response_envelopes, store_message_limit]);
+/// The body count of each streaming read of a reader with `limits` over `store`.
+async fn stream_all(
+    mode: &Mode,
+    store: FakeStore,
+    limits: StreamLimits,
+) -> Vec<(&'static str, Result<usize, ErrorCode>)> {
+    let conn = mode
+        .connect(Server::new(Routes::new(StoreServiceServer::new(store))))
+        .await;
+    let link = fixture::v1_link();
+    let mut r = StoreReader::new(conn.transport.clone(), link.clone()).with_stream_limits(limits);
+    let code = |e: ContractError| e.code();
+    let got = vec![
+        (
+            "GetDataColumns",
+            r.get_data_columns(Default::default())
+                .await
+                .map(|b| b.len())
+                .map_err(code),
+        ),
+        (
+            "GetBlocksByRange",
+            r.get_blocks_by_range(Default::default())
+                .await
+                .map(|b| b.len())
+                .map_err(code),
+        ),
+        (
+            "GetDataColumnsByRange",
+            r.get_data_columns_by_range(Default::default())
+                .await
+                .map(|b| b.len())
+                .map_err(code),
+        ),
+    ];
+    let refused = got.iter().filter(|(_, g)| g.is_err()).count() as u64;
+    assert_eq!(link.metrics().counts().contract_violations, refused);
+    got
+}
+
+async fn store_stream_limits(mode: Mode) {
+    let defaults = StreamLimits::default();
+    assert!(
+        defaults.max_bodies >= 128 * 128,
+        "a full by-range column read"
+    );
+    assert!(defaults.max_bytes >= 128 * MAX_SSZ_BYTES / 8);
+
+    // The count cap: three bodies pass a cap of three, a fourth is refused.
+    let count = StreamLimits {
+        max_bodies: 3,
+        ..defaults
+    };
+    for (bodies, want) in [(3, Ok(3)), (4, Err(ErrorCode::ContractViolation))] {
+        let store = FakeStore::new(full_stamp(), Some(block(8))).streaming(bodies);
+        for (rpc, got) in stream_all(&mode, store, count).await {
+            assert_eq!(got, want, "{rpc}, {bodies} bodies ({})", mode.name());
+        }
+    }
+
+    // The byte cap counts every body's encoded size: two 1,000-byte objects fit in 2,500
+    // bytes, a third does not.
+    let bytes = StreamLimits {
+        max_bytes: 2_500,
+        ..defaults
+    };
+    for (bodies, want) in [(2, Ok(2)), (3, Err(ErrorCode::ContractViolation))] {
+        let store = FakeStore::new(full_stamp(), Some(block(1_000))).streaming(bodies);
+        for (rpc, got) in stream_all(&mode, store, bytes).await {
+            assert_eq!(got, want, "{rpc}, {bodies} bodies ({})", mode.name());
+        }
+    }
+}
+
+ipc::contract_suite!(target, extra: [store_as_of_stamp, store_response_envelopes, store_message_limit, store_stream_limits]);

@@ -212,7 +212,9 @@ impl Fixture {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env_remove("PRESETS")
             .env_remove("INCLUDE_OPTIONAL")
-            .env_remove("FAKE_CURL_FAIL");
+            .env_remove("FAKE_CURL_FAIL")
+            .env_remove("FETCH_VECTORS_TEST")
+            .env_remove("FETCH_VECTORS_LOCK_HOOK");
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -890,6 +892,7 @@ impl Choreography {
         fx.command(
             manifest,
             &[
+                ("FETCH_VECTORS_TEST", "1"),
                 ("FETCH_VECTORS_LOCK_HOOK", hook),
                 ("CTL", ctl),
                 ("RUN", run),
@@ -1101,6 +1104,96 @@ fn lock_without_its_owner_identity_fails_closed() {
         lock.join("pid").is_file(),
         "the lock is left for manual removal"
     );
+}
+
+#[test]
+fn a_run_arriving_mid_release_waits_instead_of_failing() {
+    let fx = Fixture::new();
+    let m = fx.good_tar_manifest();
+    let lock = fx.out_dir(LIGHT_TAG).join(format!(".{TAR}.lock"));
+    let ch = Choreography::new(&fx);
+
+    // A pauses half-way through releasing its lock: its PID is gone, the directory is not.
+    let mut a = ch.spawn(&fx, &m, "A", "releasing");
+    ch.wait_for(&["A releasing"], &mut a);
+    assert!(lock.is_dir() && !lock.join("pid").exists());
+    // B arrives then and must wait for the release instead of reading a half-removed lock.
+    let mut b = ch.spawn(&fx, &m, "B", "");
+    ch.wait_for(&["B waiting"], &mut b);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    ch.go("A", "releasing");
+    let a_out = a.wait_with_output().unwrap();
+    let b_out = b.wait_with_output().unwrap();
+
+    let all = format!("=== A\n{}\n=== B\n{}", describe(&a_out), describe(&b_out));
+    assert_ok(&a_out);
+    assert_ok(&b_out);
+    assert!(!stderr(&b_out).contains("LOCKED"), "{all}");
+    assert!(ch.events().iter().any(|e| e == "B owned"), "{all}");
+    assert!(!lock.exists(), "{all}");
+}
+
+#[test]
+fn lock_hook_runs_only_in_test_mode() {
+    let fx = Fixture::new();
+    let marker = fx.root().join("hook-ran");
+    let hook = fx.root().join("failing-hook");
+    write_executable(
+        &hook,
+        &format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    );
+    let hook = hook.to_str().unwrap();
+
+    let out = fx.run_with(
+        &fx.good_tar_manifest(),
+        &[("FETCH_VECTORS_LOCK_HOOK", hook)],
+    );
+    assert_ok(&out);
+    assert!(!marker.exists(), "{}", describe(&out));
+    assert!(
+        stderr(&out).contains("ignoring FETCH_VECTORS_LOCK_HOOK"),
+        "{}",
+        describe(&out)
+    );
+
+    let out = fx.run_with(
+        &fx.good_tar_manifest(),
+        &[
+            ("FETCH_VECTORS_LOCK_HOOK", hook),
+            ("FETCH_VECTORS_TEST", "1"),
+        ],
+    );
+    assert_exit_1(&out);
+    assert!(marker.exists());
+    assert!(
+        stderr(&out).contains("lock hook failed"),
+        "{}",
+        describe(&out)
+    );
+}
+
+#[test]
+fn a_hook_failing_mid_release_still_releases_the_lock() {
+    let fx = Fixture::new();
+    let lock = fx.out_dir(LIGHT_TAG).join(format!(".{TAR}.lock"));
+    let hook = fx.root().join("release-hook");
+    write_executable(&hook, "#!/bin/sh\n[ \"$1\" != releasing ]\n");
+
+    let out = fx.run_with(
+        &fx.good_tar_manifest(),
+        &[
+            ("FETCH_VECTORS_LOCK_HOOK", hook.to_str().unwrap()),
+            ("FETCH_VECTORS_TEST", "1"),
+        ],
+    );
+
+    assert_exit_1(&out);
+    assert!(
+        stderr(&out).contains("lock hook failed at releasing"),
+        "{}",
+        describe(&out)
+    );
+    assert!(!lock.exists(), "{}", describe(&out));
 }
 
 #[test]

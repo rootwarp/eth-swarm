@@ -40,6 +40,37 @@ crate "$ws" user '[dependencies]' 'cl-verify = { path = "../cl-verify" }' '[feat
 check fail "another crate's feature enables it" "$script" \
   "$(workspace user-feature cl-verify user)" "enabled by user"
 
+ws="$tmp/renamed-feature"
+crate "$ws" cl-verify "$feature" "$defined"
+crate "$ws" user '[dependencies]' 'v = { package = "cl-verify", path = "../cl-verify" }' \
+  '[features]' 'default = ["v/test-backends"]'
+check fail "a renamed dependency's feature forward enables it" "$script" \
+  "$(workspace renamed-feature cl-verify user)" "enabled by user (feature default)"
+
+ws="$tmp/renamed-optional"
+crate "$ws" cl-verify "$feature" "$defined"
+crate "$ws" user '[dependencies]' \
+  'v = { package = "cl-verify", path = "../cl-verify", optional = true }' \
+  '[features]' 'x = ["v?/test-backends"]'
+check fail "a renamed optional dependency's weak forward enables it" "$script" \
+  "$(workspace renamed-optional cl-verify user)" "enabled by user (feature x)"
+
+ws="$tmp/renamed-dep"
+crate "$ws" cl-verify "$feature" "$defined"
+crate "$ws" user '[dev-dependencies]' \
+  'v = { package = "cl-verify", path = "../cl-verify", features = ["test-backends"] }'
+check fail "a renamed dependency's features enable it" "$script" \
+  "$(workspace renamed-dep cl-verify user)" "enabled by user (dev dependency)"
+
+ws="$tmp/renamed-other"
+crate "$ws" cl-verify "$feature" "$defined"
+crate "$ws" other "$feature" "$defined"
+crate "$ws" user '[dependencies]' 'v = { package = "cl-verify", path = "../cl-verify" }' \
+  'cl-verify = { package = "other", path = "../other" }' '[features]' \
+  'x = ["cl-verify/test-backends"]'
+check pass "another package renamed to cl-verify is not cl-verify" "$script" \
+  "$(workspace renamed-other cl-verify other user)" "test-backends OK"
+
 ws="$tmp/default"
 crate "$ws" cl-verify "$feature" "$defined" 'default = ["test-backends"]'
 check fail "a default feature" "$script" "$(workspace default cl-verify)" "cl-verify feature default"

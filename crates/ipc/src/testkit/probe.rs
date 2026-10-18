@@ -183,12 +183,21 @@ impl FromEnvelopes for store::GetDataColumnsResponseBody {
     }
 }
 
+/// A chunk carries its envelope; without one it carries an error, since a chunk with neither is
+/// a contract violation.
 impl FromEnvelopes for p2p::RequestBlocksByRangeResponseBody {
     fn from_envelopes(envelopes: Vec<Envelope>, _: u64) -> Self {
+        let result = match envelopes.into_iter().next() {
+            Some(e) => p2p::response_chunk::Result::Chunk(e),
+            None => p2p::response_chunk::Result::Error(crate::error::wire_error(
+                ethswarm_proto::common::ErrorCode::ResourceUnavailable,
+                "probe body without an envelope",
+            )),
+        };
         Self {
-            item: envelopes.into_iter().next().map(|e| p2p::ResponseChunk {
+            item: Some(p2p::ResponseChunk {
                 peer: None,
-                result: Some(p2p::response_chunk::Result::Chunk(e)),
+                result: Some(result),
             }),
         }
     }

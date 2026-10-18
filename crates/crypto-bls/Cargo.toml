@@ -19,9 +19,8 @@ aggregate = []
 test-vectors = []
 
 [dependencies]
-# Same spec as crypto-kzg and cl-verify so the lockfile has one blst. Never enable `portable`:
-# it swaps the ADX-optimised code for slower generic code.
-blst = "0.3.17"
+# The workspace spec, shared with cl-verify (and c-kzg's blst) so the lockfile has one blst.
+blst.workspace = true
 thiserror = "2"
 # OS CSPRNG for verify_batch randomizers (already in the lockfile; MIT OR Apache-2.0).
 getrandom = { version = "0.3", optional = true }

@@ -2,11 +2,22 @@
 //! process, and readers (cl-store) open it read-only.
 //!
 //! Cross-process cases re-run this test binary as a child, selected by `CHILD_MODE`.
+//!
+//! Every test here runs under [`serial`]. MDBX locks its files with open-file-description
+//! (OFD) locks, and a child spawned by one test briefly holds a copy of every fd of this
+//! process (from the fork until exec closes the `O_CLOEXEC` ones), the open file descriptions
+//! and their locks included. A test that closes an env and reopens it while another test spawns
+//! a child can then find its own released lock still held, and fail with
+//! `WriterAlreadyOpen` (seen under full-workspace load). Spawning and reopening never overlap
+//! once the tests are serialized.
 
 use std::{
     io::{BufRead, BufReader, Read, Write},
     path::Path,
     process::{Command, ExitStatus, Stdio},
+    sync::{mpsc, Mutex, MutexGuard, PoisonError},
+    thread,
+    time::{Duration, Instant},
 };
 
 use cl_chain_columns::{Column, ColumnReader, ColumnWriter, Error, WriterOptions};
@@ -16,6 +27,83 @@ const CHILD_PATH: &str = "CL_CHAIN_COLUMNS_CHILD_PATH";
 const ROOT: [u8; 32] = [0x11; 32];
 
 const READY: &str = "CL_CHAIN_COLUMNS_CHILD_READY";
+
+/// How long a child may take to get ready, or to exit, before it is killed.
+const CHILD_DEADLINE: Duration = Duration::from_secs(60);
+
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// Serializes the tests of this binary (see the module docs); a failed test does not poison it.
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A spawned child, killed and reaped if it is still running when dropped (a failed assertion
+/// never leaves it behind).
+struct Child(std::process::Child);
+
+impl Child {
+    fn spawn(command: &mut Command) -> Self {
+        Self(command.spawn().unwrap())
+    }
+
+    /// Waits until the child prints [`READY`] on its piped stdout; kills it if it has not
+    /// within `timeout`, or exits first.
+    fn wait_ready(&mut self, timeout: Duration) -> Result<(), String> {
+        let stdout = self.0.stdout.take().expect("stdout is piped");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut lines = BufReader::new(stdout).lines();
+            // libtest may print "test child_entry ... " on the same line first.
+            let ready = lines.any(|line| line.is_ok_and(|l| l.contains(READY)));
+            let _ = tx.send(ready);
+            // Keep draining, so the child's later output never meets a closed pipe.
+            lines.for_each(drop);
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(true) => Ok(()),
+            outcome => {
+                self.kill();
+                Err(match outcome {
+                    Ok(_) => "child exited before it was ready".to_owned(),
+                    Err(_) => format!("child not ready within {timeout:?}; killed"),
+                })
+            }
+        }
+    }
+
+    /// The child's exit status; kills it if it has not exited within `timeout`.
+    fn wait(&mut self, timeout: Duration) -> Result<ExitStatus, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                self.kill();
+                return Err(format!("child did not exit within {timeout:?}; killed"));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn has_exited(&mut self) -> bool {
+        self.0.try_wait().unwrap().is_some()
+    }
+
+    fn kill(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        if !self.has_exited() {
+            self.kill();
+        }
+    }
+}
 
 fn child(mode: &str, path: &Path) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
@@ -27,7 +115,9 @@ fn child(mode: &str, path: &Path) -> Command {
 }
 
 fn run_child(mode: &str, path: &Path) -> ExitStatus {
-    child(mode, path).status().unwrap()
+    Child::spawn(&mut child(mode, path))
+        .wait(CHILD_DEADLINE)
+        .unwrap()
 }
 
 /// Runs only when spawned by `run_child`; a normal test run passes it straight through.
@@ -53,6 +143,9 @@ fn child_entry() {
             // Hold the env open until the parent closes stdin.
             std::io::stdin().read_to_end(&mut Vec::new()).unwrap();
         }
+        "hang" => loop {
+            std::thread::park();
+        },
         "writer-then-crash" => {
             let _writer = ColumnWriter::open(&path).unwrap();
             std::process::abort();
@@ -63,6 +156,7 @@ fn child_entry() {
 
 #[test]
 fn second_writer_in_the_same_process_is_refused() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let writer = ColumnWriter::open(dir.path()).unwrap();
     let err = ColumnWriter::open(dir.path()).unwrap_err();
@@ -74,6 +168,7 @@ fn second_writer_in_the_same_process_is_refused() {
 
 #[test]
 fn writers_of_different_envs_do_not_conflict() {
+    let _serial = serial();
     let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let _wa = ColumnWriter::open(a.path()).unwrap();
     let _wb = ColumnWriter::open(b.path()).unwrap();
@@ -81,6 +176,7 @@ fn writers_of_different_envs_do_not_conflict() {
 
 #[test]
 fn second_writer_in_another_process_is_refused_while_readers_read() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let writer = ColumnWriter::open(dir.path()).unwrap();
     writer
@@ -101,6 +197,7 @@ fn second_writer_in_another_process_is_refused_while_readers_read() {
 
 #[test]
 fn a_crashed_writer_leaves_no_stale_lock() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     assert!(!run_child("writer-then-crash", dir.path()).success());
     ColumnWriter::open(dir.path()).expect("the OS released the dead writer's guard");
@@ -108,6 +205,7 @@ fn a_crashed_writer_leaves_no_stale_lock() {
 
 #[test]
 fn a_map_size_change_blocked_by_an_open_reader_is_an_error() {
+    let _serial = serial();
     const MIB_256: usize = 256 << 20;
     let dir = tempfile::tempdir().unwrap();
     let small = WriterOptions { max_size: MIB_256 };
@@ -116,17 +214,14 @@ fn a_map_size_change_blocked_by_an_open_reader_is_an_error() {
     };
     drop(ColumnWriter::open_with(dir.path(), small).unwrap());
 
-    let mut reader = child("hold-reader", dir.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut lines = BufReader::new(reader.stdout.take().unwrap()).lines();
-    assert!(
-        // libtest may print "test child_entry ... " on the same line first.
-        lines.any(|line| line.unwrap().contains(READY)),
-        "reader child never opened the env"
+    let mut reader = Child::spawn(
+        child("hold-reader", dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped()),
     );
+    reader
+        .wait_ready(CHILD_DEADLINE)
+        .expect("reader child opens the env");
 
     // With cl-store attached, MDBX keeps the env's geometry: say so instead of ignoring it.
     let err = ColumnWriter::open_with(dir.path(), large).unwrap_err();
@@ -140,7 +235,27 @@ fn a_map_size_change_blocked_by_an_open_reader_is_an_error() {
     );
     ColumnWriter::open_with(dir.path(), small).expect("the current geometry still opens");
 
-    drop(reader.stdin.take());
-    assert!(reader.wait().unwrap().success());
+    drop(reader.0.stdin.take());
+    assert!(reader.wait(CHILD_DEADLINE).unwrap().success());
     ColumnWriter::open_with(dir.path(), large).expect("alone, the writer applies the new size");
+}
+
+#[test]
+fn a_child_that_never_gets_ready_is_killed_at_the_deadline() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut hung = Child::spawn(child("hang", dir.path()).stdout(Stdio::piped()));
+    let err = hung.wait_ready(Duration::from_millis(300)).unwrap_err();
+    assert!(err.contains("not ready"), "{err}");
+    assert!(hung.has_exited(), "the hung child was killed");
+}
+
+#[test]
+fn a_child_that_never_exits_is_killed_at_the_deadline() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut hung = Child::spawn(&mut child("hang", dir.path()));
+    let err = hung.wait(Duration::from_millis(300)).unwrap_err();
+    assert!(err.contains("did not exit"), "{err}");
+    assert!(hung.has_exited(), "the hung child was killed");
 }

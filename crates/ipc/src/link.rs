@@ -161,11 +161,8 @@ impl Link {
             ErrorCode::ForkDigestMismatch => ContractMetrics::bump(&m.digest_mismatches),
             _ => {}
         }
-        tracing::warn!(
-            code = err.code().as_str_name(),
-            detail = err.detail(),
-            "contract error"
-        );
+        let (code, name) = logged_code(err);
+        tracing::warn!(code, name, detail = err.detail(), "contract error");
     }
 
     /// `err` recorded, as the status that fails the call or stream.
@@ -275,6 +272,17 @@ impl Link {
             peer,
         })
     }
+}
+
+/// The code [`Link::record`] logs: as on the wire, with its name. An unknown peer code maps to
+/// `ERROR_CODE_UNSPECIFIED` in [`ContractError::code`], so it is logged by number only.
+fn logged_code(err: &ContractError) -> (i32, &'static str) {
+    let name = if err.is_ignore() {
+        "unknown"
+    } else {
+        err.code().as_str_name()
+    };
+    (err.raw_code(), name)
 }
 
 /// A body whose envelopes were checked, with the ones to drop.
@@ -489,6 +497,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_response_chunk_fails_the_stream() {
+        use ethswarm_proto::p2p::{
+            response_chunk, RequestBlocksByRangeResponse as Resp,
+            RequestBlocksByRangeResponseBody as Body, ResponseChunk,
+        };
+        let chunk = |result| {
+            Resp::body(Body {
+                item: Some(ResponseChunk { peer: None, result }),
+            })
+        };
+        let l = link(1);
+        let frames = vec![
+            Ok(Resp::hello(peer())),
+            Ok(chunk(Some(response_chunk::Result::Chunk(block(1))))),
+            Ok(chunk(None)),
+        ];
+        let mut g = l
+            .open(Inbound::from_server(tokio_stream::iter(frames)))
+            .await
+            .unwrap();
+        assert!(g.body().await.unwrap().unwrap().dropped.is_empty());
+        let err = g.body().await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ContractViolation);
+        assert!(err.detail().contains("neither chunk nor error"), "{err}");
+        let c = l.metrics().counts();
+        assert_eq!((c.contract_violations, c.accepted), (1, 1));
+    }
+
+    #[tokio::test]
     async fn missing_or_mismatched_hello_fails_open() {
         let l = link(1);
         let body_first = Inbound::new(tokio_stream::iter(vec![Ok(batch(vec![]))]));
@@ -559,6 +596,22 @@ mod tests {
         assert_eq!(
             l.check_unary(&[&env(0, 0, DIGEST)]).unwrap_err().code(),
             ErrorCode::ContractViolation
+        );
+    }
+
+    #[test]
+    fn record_logs_the_code_as_on_the_wire() {
+        let unknown = ContractError::from(ethswarm_proto::common::Error {
+            code: 999,
+            detail: "newer".into(),
+        });
+        assert_eq!(logged_code(&unknown), (999, "unknown"));
+        assert_eq!(
+            logged_code(&ContractError::violation("x")),
+            (
+                ErrorCode::ContractViolation as i32,
+                "ERROR_CODE_CONTRACT_VIOLATION"
+            )
         );
     }
 

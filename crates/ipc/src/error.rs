@@ -180,12 +180,20 @@ pub fn to_status(err: &WireError) -> Status {
     )
 }
 
-/// The `common.v1.Error` a call or stream failed with. A status without (valid) details, such
-/// as one raised by the transport itself, is mapped from its gRPC code.
+/// The `common.v1.Error` a call or stream failed with. Details that decode are the peer's
+/// error, whatever the gRPC code says; their zero code is a contract violation (a sender must
+/// never put `ERROR_CODE_UNSPECIFIED` on the wire). A status with absent or undecodable
+/// details, such as one raised by the transport itself, is mapped from its gRPC code.
 #[must_use]
 pub fn error_from_status(status: &Status) -> WireError {
-    if let Ok(err) = WireError::decode(status.details()) {
-        if err.code != ErrorCode::Unspecified as i32 {
+    if !status.details().is_empty() {
+        if let Ok(err) = WireError::decode(status.details()) {
+            if err.code == ErrorCode::Unspecified as i32 {
+                return wire_error(
+                    ErrorCode::ContractViolation,
+                    format!("error code 0 from peer: {}", err.detail),
+                );
+            }
             return err;
         }
     }
@@ -277,16 +285,30 @@ mod tests {
     }
 
     #[test]
-    fn unspecified_details_fall_back_to_the_grpc_code() {
+    fn decoded_details_with_code_zero_are_a_contract_violation() {
         let zero = WireError {
             code: 0,
             detail: "zero".into(),
         };
-        let status =
-            Status::with_details(Code::FailedPrecondition, "m", zero.encode_to_vec().into());
+        for grpc in [Code::Unavailable, Code::FailedPrecondition, Code::Ok] {
+            let status = Status::with_details(grpc, "m", zero.encode_to_vec().into());
+            let got = error_from_status(&status);
+            assert_eq!(got.code(), ErrorCode::ContractViolation, "{grpc:?}");
+            assert!(got.detail.contains("zero"), "{}", got.detail);
+            let err = ContractError::from_status(&status);
+            assert_eq!(err.code(), ErrorCode::ContractViolation);
+            assert!(!err.is_ignore());
+        }
+    }
+
+    #[test]
+    fn undecodable_details_fall_back_to_the_grpc_code() {
+        // Field 1 with wire type 7 is not valid protobuf.
+        let status = Status::with_details(Code::Unavailable, "m", vec![0x0f, 0xff].into());
+        assert!(WireError::decode(status.details()).is_err());
         assert_eq!(
             error_from_status(&status).code(),
-            ErrorCode::VersionMismatch
+            ErrorCode::ResourceUnavailable
         );
     }
 
