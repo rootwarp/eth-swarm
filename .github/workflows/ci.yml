@@ -37,6 +37,8 @@ jobs:
         run: bash scripts/check-kurtosis-pins.sh
       - name: Kurtosis devnet checker (offline, stub kurtosis and curl)
         run: bash testing/kurtosis/tests/check-devnet.test.sh
+      - name: Probe systemd units (own user, nodekey credential, anchor check, hardening)
+        run: bash ops/probe/tests/probe-units.test.sh
 
   proto:
     name: buf lint, build, breaking vs develop, baseline drift
@@ -205,3 +207,34 @@ jobs:
         run: cargo test -p ipc --test peercred --locked
       - name: Method ACL against cl-engine and the SIGTERM drain
         run: cargo test -p svc-runtime --locked
+
+  credential-root-tests:
+    # The node-key credential shapes as systemd leaves them: a tmpfs at /run/credentials/<unit>,
+    # a root-owned 0400 file with an ACL read grant (and the chown fallback), remounted
+    # read-only, loaded on a thread that runs as the service's user. mount needs CAP_SYS_ADMIN,
+    # so this throwaway container is privileged; nothing else runs in it. The runner's kernel
+    # has POSIX ACLs on tmpfs, so ETHSWARM_REQUIRE_TMPFS_ACL=1 makes that part mandatory.
+    name: node-key credential on a read-only tmpfs as root
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container:
+      image: rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 # 1.99.0-bookworm
+      options: --user 0 --privileged
+    env:
+      ETHSWARM_ROOT_TESTS: "1"
+      ETHSWARM_REQUIRE_TMPFS_ACL: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Running as root
+        run: test "$(id -u)" -eq 0
+      - name: Install setfacl and create the service user
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends acl
+          useradd --no-create-home --user-group --shell /usr/sbin/nologin ethswarm-other
+          echo "ETHSWARM_OTHER_UID=$(id -u ethswarm-other)" >> "$GITHUB_ENV"
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - name: Credential shapes, ACL decoding and log hygiene
+        run: cargo test -p node-key --locked

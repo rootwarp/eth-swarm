@@ -19,12 +19,21 @@
 //!
 //! Exactly two providers. Their names, operators and hosts must all differ (compared
 //! case-insensitively): one operator, or one host behind two names, is one source of truth,
-//! not two. IP literals are compared in canonical form (`[0:0:0:0:0:0:0:1]` is `[::1]`, and an
+//! not two. Host names that end in the same two DNS labels (`a.example.com`,
+//! `b.example.com`) are refused as one domain; this is a heuristic, not a public-suffix check
+//! (`a.co.uk` and `b.co.uk` are refused too), and two domains of one operator pass. At run
+//! time the fetcher also refuses two hosts that resolve to a common address. Beyond that,
+//! operator independence rests on the `operator` names the config gives. IP literals are compared in canonical form (`[0:0:0:0:0:0:0:1]` is `[::1]`, and an
 //! IPv4-mapped IPv6 address is its IPv4 address); host names are compared as written, lower-cased
 //! and without a trailing dot, not resolved, so two names for the same machine are not caught
 //! here. URLs must be `https://` unless `allow_insecure_http` is set, and may carry a base path
 //! but no query, fragment or credentials; only `:PORT` (1..=65535, digits only) may follow
 //! the host.
+//!
+//! `anchor-fetch --check --providers A,B` builds the same [`Config`] from two URLs
+//! ([`Config::from_provider_urls`]): providers `a` and `b`, operator
+//! [`PROVIDER_URLS_OPERATOR`], the default limits, the same URL rules, and one host given twice
+//! refused.
 //!
 //! A base path may carry an API key, so the path never leaves this module in readable form:
 //! the run log, `anchor.json` and errors see [`Provider::redacted_url`]
@@ -44,6 +53,8 @@ pub const DEFAULT_MAX_BODY_BYTES: u64 = 1 << 30;
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default timeout for one SSZ body download.
 pub const DEFAULT_BODY_TIMEOUT: Duration = Duration::from_secs(1800);
+/// The operator of a provider given by URL alone (`--providers`), which names none.
+pub const PROVIDER_URLS_OPERATOR: &str = "unnamed";
 
 /// URL scheme of a provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,13 +209,7 @@ impl Config {
                 operator: a.operator,
             });
         }
-        if a.host == b.host {
-            return Err(AnchorError::SameHost {
-                a: a.name,
-                b: b.name,
-                host: a.host,
-            });
-        }
+        independent_hosts(&a, &b)?;
         let max_body_bytes = raw.max_body_bytes.unwrap_or(DEFAULT_MAX_BODY_BYTES);
         if max_body_bytes == 0 {
             return Err(AnchorError::Config(
@@ -220,6 +225,77 @@ impl Config {
             allow_insecure_http,
         })
     }
+}
+
+impl Config {
+    /// `--providers A,B` of `anchor-fetch --check`: two provider URLs, comma separated, named
+    /// `a` and `b`, with the default limits. The URL rules are the config file's. A URL list
+    /// says nothing about operators, so both are [`PROVIDER_URLS_OPERATOR`] and independence
+    /// rests on the hosts: one host given twice (the same provider twice, or one host behind
+    /// two ports or paths) is refused with [`AnchorError::SameHost`].
+    pub fn from_provider_urls(list: &str, allow_insecure_http: bool) -> Result<Self, AnchorError> {
+        let urls: Vec<&str> = list.split(',').map(str::trim).collect();
+        let [url_a, url_b] = urls[..] else {
+            return Err(AnchorError::Config(format!(
+                "--providers needs exactly two URLs, A,B; got {}",
+                urls.len()
+            )));
+        };
+        let raw = |name: &str, url: &str| RawProvider {
+            name: name.into(),
+            operator: PROVIDER_URLS_OPERATOR.into(),
+            url: url.into(),
+        };
+        let a = provider(raw("a", url_a), allow_insecure_http)?;
+        let b = provider(raw("b", url_b), allow_insecure_http)?;
+        independent_hosts(&a, &b)?;
+        Ok(Config {
+            a,
+            b,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            body_timeout: DEFAULT_BODY_TIMEOUT,
+            allow_insecure_http,
+        })
+    }
+}
+
+/// Refuses two providers on one host, or under one domain: host names that end in the same
+/// two DNS labels (`a.example.com` and `b.example.com`). This is a heuristic, not a public-suffix
+/// check: `a.co.uk` and `b.co.uk` are refused too, and `a.example.co.uk` and
+/// `b.other.co.uk` are refused although they are different registrations. IP literals are
+/// compared only for equality here; [`crate::checkpoint::fetch`] also refuses names that
+/// resolve to a common address.
+fn independent_hosts(a: &Provider, b: &Provider) -> Result<(), AnchorError> {
+    if a.host == b.host {
+        return Err(AnchorError::SameHost {
+            a: a.name.clone(),
+            b: b.name.clone(),
+            host: a.host.clone(),
+        });
+    }
+    match (domain(&a.host), domain(&b.host)) {
+        (Some(x), Some(y)) if x == y => Err(AnchorError::SameDomain {
+            a: a.name.clone(),
+            b: b.name.clone(),
+            domain: x.to_owned(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// The last two DNS labels of a host name (already lower-cased, no trailing dot); `None` for
+/// an IP literal or a single-label name.
+fn domain(host: &str) -> Option<&str> {
+    if host.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    let mut dots = host.rmatch_indices('.');
+    let _last = dots.next()?;
+    Some(match dots.next() {
+        Some((i, _)) => &host[i + 1..],
+        None => host,
+    })
 }
 
 fn timeout(secs: Option<u64>, default: Duration) -> Result<Duration, AnchorError> {
@@ -532,6 +608,119 @@ mod tests {
                 }
                 other => panic!("{url}: {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn provider_urls_are_providers_a_and_b_with_default_limits() {
+        let c =
+            Config::from_provider_urls(" https://a.example/ , https://b.example:8443/k3y/", false)
+                .unwrap();
+        assert_eq!((c.a.name.as_str(), c.b.name.as_str()), ("a", "b"));
+        assert_eq!(c.a.operator, PROVIDER_URLS_OPERATOR);
+        assert_eq!(c.a.redacted_url(), "https://a.example:443");
+        assert_eq!(c.b.redacted_url(), "https://b.example:8443/…");
+        assert_eq!(c.b.path("/x"), "/k3y/x");
+        assert_eq!(c.max_body_bytes, DEFAULT_MAX_BODY_BYTES);
+        assert_eq!(c.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(c.body_timeout, DEFAULT_BODY_TIMEOUT);
+        assert!(!c.allow_insecure_http);
+        assert!(!format!("{c:?}").contains("k3y"));
+    }
+
+    #[test]
+    fn provider_urls_refuse_one_provider_given_twice() {
+        for list in [
+            "https://a.example,https://a.example",
+            "https://a.example:1,https://A.example.:2/other",
+            "https://[::1],https://[0:0:0:0:0:0:0:1]",
+        ] {
+            let err = Config::from_provider_urls(list, false).unwrap_err();
+            assert!(
+                matches!(err, AnchorError::SameHost { .. }),
+                "{list}: {err:?}"
+            );
+            assert_eq!(err.exit_code(), 2);
+        }
+    }
+
+    #[test]
+    fn provider_urls_need_exactly_two_entries() {
+        for list in [
+            "",
+            "https://a.example",
+            "https://a.example,",
+            ",https://b.example",
+            "https://a.example,https://b.example,https://c.example",
+        ] {
+            let err = Config::from_provider_urls(list, false).unwrap_err();
+            assert!(matches!(err, AnchorError::Config(_)), "{list:?}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn provider_urls_follow_the_url_rules_and_never_echo_a_url() {
+        let local = "http://127.0.0.1:1,http://localhost:2";
+        assert!(matches!(
+            Config::from_provider_urls(local, false),
+            Err(AnchorError::Config(_))
+        ));
+        let c = Config::from_provider_urls(local, true).unwrap();
+        assert!(c.allow_insecure_http);
+        assert_eq!((c.a.scheme, c.b.scheme), (Scheme::Http, Scheme::Http));
+        for bad in [
+            "https://user:hunter2@a.example,https://b.example",
+            "https://a.example/?key=hunter2,https://b.example",
+            "https://a.example,ftp://hunter2.example",
+        ] {
+            let err = Config::from_provider_urls(bad, false).unwrap_err();
+            assert!(matches!(err, AnchorError::Config(_)), "{bad}: {err:?}");
+            assert!(!format!("{err} {err:?}").contains("hunter2"), "{err}");
+        }
+    }
+
+    #[test]
+    fn hosts_under_one_registrable_looking_domain_are_refused() {
+        for (a, b, domain) in [
+            (
+                "https://a.example.com",
+                "https://b.example.com",
+                "example.com",
+            ),
+            (
+                "https://example.com",
+                "https://beacon.Example.COM.",
+                "example.com",
+            ),
+            (
+                "https://x.y.provider.io:1",
+                "https://z.provider.io/p",
+                "provider.io",
+            ),
+        ] {
+            for err in [
+                Config::from_toml(&two(("a", "A", a), ("b", "B", b), "")).unwrap_err(),
+                Config::from_provider_urls(&format!("{a},{b}"), false).unwrap_err(),
+            ] {
+                assert!(
+                    matches!(&err, AnchorError::SameDomain { domain: d, .. } if d == domain),
+                    "{a} {b}: {err:?}"
+                );
+                assert_eq!(err.name(), "same_domain");
+                assert_eq!(err.exit_code(), 2);
+            }
+        }
+        // Different last two labels, IP literals, and single-label names pass.
+        for (a, b) in [
+            ("https://a.example.com", "https://a.example.org"),
+            ("https://beacon.a-op.net", "https://beacon.b-op.net"),
+            ("https://10.0.0.1", "https://10.0.0.2"),
+            ("https://[::1]", "https://localhost"),
+        ] {
+            assert!(
+                Config::from_provider_urls(&format!("{a},{b}"), false).is_ok(),
+                "{a} {b}"
+            );
         }
     }
 

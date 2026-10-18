@@ -1,0 +1,27 @@
+[package]
+name = "node-key"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "The probe's secp256k1 node key from the systemd credential `nodekey`: checked on the open file, zeroized, never shown."
+
+[dependencies]
+# O_NOFOLLOW open and fstat checks of the credential file; geteuid. The versions cl-p2p uses.
+rustix = { version = "1", features = ["fs", "process"] }
+# Wipes the secret bytes on every path.
+zeroize = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+# Captures every log line of a load (tests/log_capture.rs).
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+# base64 of the test key, to grep the captured logs for; already in the tree through multiaddr.
+data-encoding = "2"
+
+# The root-only ACL test plays the service's user on one thread (Linux only).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { version = "1", features = ["fs", "process", "thread"] }

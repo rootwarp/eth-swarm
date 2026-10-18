@@ -7,7 +7,9 @@
 //! trust anchors depend on the host. `http://` needs the explicit `allow_insecure_http` flag
 //! (see [`crate::checkpoint::config`]) and exists for local fixtures.
 //!
-//! One connection per request, HTTP/1.1, no redirects (a 3xx is an error). JSON bodies are
+//! One connection per request, HTTP/1.1, no redirects (a 3xx is an error). The fetcher pins
+//! each provider to the addresses its independence check resolved ([`Client::pinned`]), so
+//! the client dials those, never a second lookup's answer. JSON bodies are
 //! buffered under [`MAX_JSON_BYTES`]. SSZ bodies are streamed into a quarantine file under the
 //! caller's cap: a `Content-Length` over the cap is refused before anything is read, and the
 //! running count is checked on every chunk, so an endless body is cut at the cap. On any
@@ -25,7 +27,9 @@ use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fmt::Display;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -56,6 +60,10 @@ pub struct Client {
     tls: TlsConnector,
     request_timeout: Duration,
     body_timeout: Duration,
+    /// Host → the addresses to dial for it ([`Client::pinned`]). `None`: an unpinned client,
+    /// which dials by name. `Some`: only these hosts, at only these addresses; any other host
+    /// (an empty map included) is refused.
+    pins: Option<Arc<HashMap<String, Vec<IpAddr>>>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -86,7 +94,16 @@ impl Client {
             tls: TlsConnector::from(Arc::new(tls)),
             request_timeout,
             body_timeout,
+            pins: None,
         })
+    }
+
+    /// This client, dialing only `pins` (host → addresses): the addresses the independence
+    /// check saw, so a second lookup cannot answer differently. A host without a pin is then
+    /// refused, never looked up. TLS still verifies, and `Host` still names, the host name.
+    pub fn pinned(mut self, pins: HashMap<String, Vec<IpAddr>>) -> Self {
+        self.pins = Some(Arc::new(pins));
+        self
     }
 
     /// GETs `path` as JSON and parses it as `T`.
@@ -219,9 +236,23 @@ impl Client {
         path: &str,
         request: Request<Empty<Bytes>>,
     ) -> Result<Response<Incoming>, AnchorError> {
-        let tcp = TcpStream::connect((provider.host.as_str(), provider.port))
-            .await
-            .map_err(|e| transport(provider, path, format!("connect: {e}")))?;
+        let tcp = if let Some(pins) = &self.pins {
+            let Some(addrs) = pins.get(&provider.host).filter(|a| !a.is_empty()) else {
+                return Err(transport(
+                    provider,
+                    path,
+                    "no checked address for this host",
+                ));
+            };
+            let addrs: Vec<SocketAddr> = addrs
+                .iter()
+                .map(|ip| SocketAddr::new(*ip, provider.port))
+                .collect();
+            TcpStream::connect(&addrs[..]).await
+        } else {
+            TcpStream::connect((provider.host.as_str(), provider.port)).await
+        }
+        .map_err(|e| transport(provider, path, format!("connect: {e}")))?;
         match provider.scheme {
             Scheme::Http => send(tcp, request).await,
             Scheme::Https => {
@@ -364,6 +395,49 @@ mod tests {
     #[derive(serde::Deserialize, Debug, PartialEq)]
     struct Small {
         x: u32,
+    }
+
+    #[tokio::test]
+    async fn a_client_pinned_to_nothing_dials_nothing() {
+        // An empty pin map is a pinned client with no entries, never "dial by name".
+        let s = serve("/j", Reply::Json(r#"{"x":7}"#.into())).await;
+        let p = provider(s.addr, Scheme::Http);
+        let err = client()
+            .pinned(HashMap::new())
+            .get_json::<Small>(&p, "/j")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AnchorError::Transport { reason, .. } if reason.contains("no checked address")),
+            "{err:?}"
+        );
+        assert!(s.seen().is_empty(), "a request reached the server");
+    }
+
+    #[tokio::test]
+    async fn a_pinned_client_dials_only_its_pins() {
+        let s = serve("/j", Reply::Json(r#"{"x":7}"#.into())).await;
+        let mut p = provider(s.addr, Scheme::Http);
+        p.host = "pinned.test".into();
+        let pins = HashMap::from([(p.host.clone(), vec![s.addr.ip()])]);
+        let got: Small = client().pinned(pins).get_json(&p, "/j").await.unwrap();
+        assert_eq!(got, Small { x: 7 });
+        assert_eq!(
+            s.seen()[0].headers["host"],
+            format!("pinned.test:{}", s.addr.port())
+        );
+        // A host with no pin is refused without a lookup or a connection.
+        let other = HashMap::from([("elsewhere.test".to_owned(), vec![s.addr.ip()])]);
+        let err = client()
+            .pinned(other)
+            .get_json::<Small>(&p, "/j")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AnchorError::Transport { reason, .. } if reason.contains("no checked address")),
+            "{err:?}"
+        );
+        assert_eq!(s.seen().len(), 1);
     }
 
     #[tokio::test]

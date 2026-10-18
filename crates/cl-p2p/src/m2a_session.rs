@@ -66,6 +66,14 @@ impl NodeKey {
         Self(Keypair::generate_secp256k1())
     }
 
+    /// The key from a checked node-key credential ([`node_key::load`]); `None` if libp2p
+    /// refuses the secret. The secret's bytes are wiped either way.
+    pub fn from_secret(mut secret: node_key::NodeKeySecret) -> Option<Self> {
+        // `try_from_bytes` zeroes its input on success; `secret` zeroizes itself on drop.
+        let secret = secp256k1::SecretKey::try_from_bytes(secret.expose_secret_mut()).ok()?;
+        Some(Self(Keypair::from(secp256k1::Keypair::from(secret))))
+    }
+
     /// The peer ID the key proves (public).
     pub fn peer_id(&self) -> PeerId {
         self.0.public().to_peer_id()

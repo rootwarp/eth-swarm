@@ -8,11 +8,12 @@
 //! [`rpc`] is req/resp over libp2p `request_response`: the codec (both halves, deadlines
 //! inside) and the probe's control protocols ([`rpc::inbound::Control`]: Status, MetaData,
 //! Ping, Goodbye). [`m2a_session`] is the pinned-peer session the `m2a-session` binary runs,
-//! and [`transport`] the TCP muxers (yamux first, then mplex under its stream, buffer and
+//! [`transport`] the TCP muxers (yamux first, then mplex under its stream, buffer and
 //! per-connection caps) and the probe swarm over them ([`transport::build_swarm`], with
-//! [`behaviour`]).
+//! [`behaviour`]), and [`identity`] the service's node key from its systemd credential.
 
 pub mod behaviour;
+pub mod identity;
 pub mod m2a_session;
 pub mod rpc;
 #[cfg(any(test, feature = "testkit"))]

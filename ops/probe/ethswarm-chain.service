@@ -1,0 +1,67 @@
+# ETH Swarm probe: cl-chain (state transition and fork choice; holds no node key).
+# See ops/probe/README.md.
+# Linted by ops/probe/tests/probe-units.test.sh: its own User=, the node key only as the
+# systemd credential "nodekey" (cl-chain gets none), the two-provider anchor check before start,
+# and the hardening below. Do not weaken a line without changing the lint and saying why.
+[Unit]
+Description=ETH Swarm probe: cl-chain (state transition and fork choice; holds no node key)
+Wants=network-online.target
+After=network-online.target
+# A start that keeps failing (a provider mismatch fails ExecStartPre, which
+# RestartPreventExitStatus= does not cover) stops after 3 tries in 6 h.
+StartLimitIntervalSec=6h
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=ethswarm-chain
+Group=ethswarm-chain
+UMask=0077
+# ANCHOR_PROVIDERS=https://<provider A>,https://<provider B>: two independent beacon API
+# providers (root 0600; a URL path may hold a key, and anchor-fetch never prints one).
+EnvironmentFile=/etc/ethswarm/anchor-check.env
+# Start only if both providers agree on the finalized block root, its header state_root and
+# the state root (anchor-fetch exits non-zero otherwise, and writes nothing). No "-" prefix:
+# a failed check must fail the start.
+ExecStartPre=/usr/local/bin/anchor-fetch --providers ${ANCHOR_PROVIDERS} --check
+# The check's own worst case: 4 JSON requests at 30 s and two bodies at 30 s + 1800 s each
+# (anchor-fetch's defaults), 3780 s, plus margin.
+TimeoutStartSec=70min
+ExecStart=/usr/local/bin/cl-chain
+StateDirectory=ethswarm-chain
+StateDirectoryMode=0700
+RuntimeDirectory=ethswarm/cl-chain
+RuntimeDirectoryMode=0750
+ReadWritePaths=/var/lib/ethswarm-chain
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+Restart=on-failure
+RestartSec=5min
+# No restart on a refusal that a restart cannot fix: 1 a refused credential, 2 the stub
+# (or a refused config), 64 a usage error. Exit codes of the main process only.
+RestartPreventExitStatus=1 2 64
+
+[Install]
+WantedBy=multi-user.target

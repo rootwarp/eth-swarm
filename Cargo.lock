@@ -1058,17 +1058,21 @@ name = "cl-discv5"
 version = "0.1.0"
 dependencies = [
  "alloy-rlp",
+ "data-encoding",
  "discv5",
  "enr",
  "ethswarm-proto",
  "ipc",
  "network-config",
+ "node-key",
  "p2p-wire",
  "rustix",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tonic",
+ "tracing",
+ "tracing-subscriber",
  "zeroize",
 ]
 
@@ -1101,6 +1105,7 @@ dependencies = [
  "libp2p",
  "libp2p-mplex",
  "network-config",
+ "node-key",
  "p2p-wire",
  "prometheus-client",
  "rustix",
@@ -4026,6 +4031,19 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+]
+
+[[package]]
+name = "node-key"
+version = "0.1.0"
+dependencies = [
+ "data-encoding",
+ "rustix",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

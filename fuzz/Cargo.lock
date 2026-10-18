@@ -837,6 +837,7 @@ dependencies = [
  "libp2p",
  "libp2p-mplex",
  "network-config",
+ "node-key",
  "p2p-wire",
  "prometheus-client",
  "rustix",
@@ -3452,6 +3453,16 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+]
+
+[[package]]
+name = "node-key"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "thiserror 2.0.21",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]

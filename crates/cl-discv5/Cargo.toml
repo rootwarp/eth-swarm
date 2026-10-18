@@ -25,6 +25,10 @@ tokio = { version = "1", features = ["sync"] }
 rustix = { version = "1", features = ["fs"] }
 zeroize = "1"
 thiserror = "2"
+# The binary's node key, from the systemd credential `nodekey` only; logs on stderr.
+node-key = { path = "../node-key" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
 [dev-dependencies]
 ipc = { path = "../ipc", features = ["testkit"] }
@@ -32,3 +36,5 @@ network-config = { path = "../network-config" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tempfile = "3"
 rustix = { version = "1", features = ["fs", "process"] }
+# The node key's encodings the binary test greps its output for; already in the tree.
+data-encoding = "2"

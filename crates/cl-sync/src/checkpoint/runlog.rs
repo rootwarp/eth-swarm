@@ -5,6 +5,9 @@
 //! request; then come the candidate root, each check's result, and `anchor` or `abort`.
 //! [`verify`] rejects a run (the lines after the last `start`) that does not name both
 //! providers, so an anchor never comes without a record of where it came from.
+//!
+//! `anchor-fetch --check` writes no file: its log ([`RunLog::in_memory`]) keeps the lines in
+//! memory for [`RunLog::verify`] and echoes them to stderr.
 
 use crate::checkpoint::fetch::AnchorError;
 use crate::checkpoint::outdir::Dir;
@@ -20,12 +23,24 @@ const ROLES: [&str; 2] = ["a", "b"];
 /// The fields every provider line must carry, non-empty.
 const PROVIDER_FIELDS: [&str; 3] = ["name", "operator", "url"];
 
+/// The [`RunLog::path`] of an in-memory log, for messages.
+pub const IN_MEMORY: &str = "(in-memory run log)";
+
 /// An open run log.
 #[derive(Debug)]
 pub struct RunLog {
-    file: File,
+    sink: Sink,
     path: PathBuf,
     echo: bool,
+}
+
+/// Where the lines go besides stderr.
+#[derive(Debug)]
+enum Sink {
+    /// Appended to a file.
+    File(File),
+    /// Kept in memory (`anchor-fetch --check`, which writes no file).
+    Memory(String),
 }
 
 impl RunLog {
@@ -35,10 +50,28 @@ impl RunLog {
     /// also written to stderr.
     pub fn open_in(dir: &Dir, name: &str, echo: bool) -> Result<Self, AnchorError> {
         Ok(Self {
-            file: dir.open_private_file(name, OFlags::RDWR | OFlags::APPEND)?,
+            sink: Sink::File(dir.open_private_file(name, OFlags::RDWR | OFlags::APPEND)?),
             path: dir.join(name),
             echo,
         })
+    }
+
+    /// A run log that writes no file: its lines are kept in memory for [`RunLog::verify`]
+    /// and, with `echo`, written to stderr.
+    pub fn in_memory(echo: bool) -> Self {
+        Self {
+            sink: Sink::Memory(String::new()),
+            path: PathBuf::from(IN_MEMORY),
+            echo,
+        }
+    }
+
+    /// The lines of an in-memory log (empty for a file-backed one).
+    pub fn text(&self) -> &str {
+        match &self.sink {
+            Sink::Memory(text) => text,
+            Sink::File(_) => "",
+        }
     }
 
     /// The path the log was opened at, for messages.
@@ -48,8 +81,12 @@ impl RunLog {
 
     /// [`verify`] on this log, read back through its open descriptor.
     pub fn verify(&self) -> Result<(), AnchorError> {
+        let file = match &self.sink {
+            Sink::Memory(text) => return Ok(verify(text)?),
+            Sink::File(file) => file,
+        };
         let mut text = String::new();
-        let mut file = &self.file;
+        let mut file = file;
         file.seek(SeekFrom::Start(0))
             .and_then(|_| file.read_to_string(&mut text))
             .map_err(|source| AnchorError::Io {
@@ -74,8 +111,13 @@ impl RunLog {
         }
         let mut text = Value::Object(line).to_string();
         text.push('\n');
-        self.file.write_all(text.as_bytes())?;
-        self.file.flush()?;
+        match &mut self.sink {
+            Sink::File(file) => {
+                file.write_all(text.as_bytes())?;
+                file.flush()?;
+            }
+            Sink::Memory(lines) => lines.push_str(&text),
+        }
         if self.echo {
             eprint!("{text}");
         }
@@ -333,6 +375,30 @@ mod tests {
         let first: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
         assert_eq!(first["event"], "start");
         assert!(first["ts"].as_str().unwrap().ends_with('Z'));
+    }
+
+    #[test]
+    fn an_in_memory_log_writes_no_file_and_still_verifies() {
+        let mut log = RunLog::in_memory(false);
+        log.event("start", serde_json::json!({"mode": "check"}))
+            .unwrap();
+        assert!(matches!(
+            log.verify(),
+            Err(AnchorError::RunLog(RunLogError::MissingProvider {
+                role: "a"
+            }))
+        ));
+        for (role, name) in [("a", "alpha"), ("b", "beta")] {
+            log.event(
+                "provider",
+                serde_json::json!({"role": role, "name": name, "operator": name, "url": "u"}),
+            )
+            .unwrap();
+        }
+        assert!(log.verify().is_ok());
+        assert_eq!(log.text().lines().count(), 3);
+        assert_eq!(verify(log.text()), Ok(()));
+        assert_eq!(log.path(), Path::new(IN_MEMORY));
     }
 
     #[test]

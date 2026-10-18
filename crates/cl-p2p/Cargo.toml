@@ -38,6 +38,8 @@ rustix = { version = "1", features = ["fs", "process"] }
 thiserror = "2"
 # Wipes the node-key bytes read from a key file on every path.
 zeroize = "1"
+# The service's node key from the systemd credential `nodekey` (src/identity.rs).
+node-key = { path = "../node-key" }
 # The m2a-session config (/etc/ethswarm/m2a-session.toml); the same versions svc-runtime uses.
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

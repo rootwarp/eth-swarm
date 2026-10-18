@@ -22,7 +22,8 @@ alloy-primitives.workspace = true
 # Beacon API client: hyper 1 over TCP, TLS through rustls on the ring provider (ring is already
 # in the tree through ethereum_hashing; no aws-lc, no openssl) with the Mozilla roots of
 # webpki-roots. Pending Vera's dependency review.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "time"] }
+# `signal`: a standalone `--check` cancels and cleans up on SIGTERM/SIGINT.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "time", "signal"] }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http = "1"

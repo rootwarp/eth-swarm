@@ -4,6 +4,9 @@
 //! agree on, then fetch the block and the state by root, or abort. Equality is the fork-choice
 //! anchor condition `anchor_block.state_root == hash_tree_root(anchor_state)`.
 //!
+//! 0. **Independence.** Both providers' hosts are resolved once; a common address (one
+//!    machine behind two names) is refused ([`AnchorError::SameAddress`]) before any request,
+//!    and every request then dials exactly those addresses (TLS and `Host` keep the name).
 //! 1. **Resolve.** `GET /eth/v1/beacon/states/finalized/finality_checkpoints` on both. The
 //!    candidate is the root of the lower finalized epoch (equal epochs with different roots:
 //!    [`AnchorError::ProvidersDisagree`]). Both providers must return the same canonical
@@ -44,6 +47,11 @@
 //! rollback of a failed publish fails too: then the error and the `abort` line's `left` list
 //! name every file that may remain, and the operator deletes them.
 //!
+//! [`check`] runs steps 1 to 3 and the run-log check, and writes nothing: no output
+//! directory, run log file or anchor. Its bodies stream into a fresh private scratch directory
+//! that is removed before it returns, and its run log stays in memory (echoed to stderr). It
+//! is the probe units' `ExecStartPre=` gate (`anchor-fetch --check`).
+//!
 //! The SSZ is decoded with the Gloas shape, the fork this fetcher requests; a response that
 //! names another fork in `Eth-Consensus-Version` is refused ([`AnchorError::WrongFork`]).
 
@@ -58,8 +66,11 @@ use consensus_types::{forked, gloas, EthSpec, ForkName};
 use rustix::fs::OFlags;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::future::Future;
 use std::io::{self, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::SystemTime;
 use tree_hash::TreeHash;
 
@@ -99,6 +110,21 @@ pub enum AnchorError {
     /// Both providers sit on the same host.
     #[error("providers {a} and {b} share the host {host:?}")]
     SameHost { a: String, b: String, host: String },
+    /// Both providers' host names end in the same two DNS labels (one domain, likely one
+    /// operator; no public-suffix list is consulted).
+    #[error("providers {a} and {b} are both under the domain {domain:?}")]
+    SameDomain {
+        a: String,
+        b: String,
+        domain: String,
+    },
+    /// The providers' host names resolve to a common address: one machine behind two names.
+    #[error("providers {a} and {b} both resolve to {addr}")]
+    SameAddress {
+        a: String,
+        b: String,
+        addr: std::net::IpAddr,
+    },
     /// The output directory already holds an anchor, block or state.
     #[error("{} already exists; an anchor is never replaced", path.display())]
     OutputExists { path: PathBuf },
@@ -204,6 +230,8 @@ impl AnchorError {
             AnchorError::Config(_) => "config",
             AnchorError::SameOperator { .. } => "same_operator",
             AnchorError::SameHost { .. } => "same_host",
+            AnchorError::SameDomain { .. } => "same_domain",
+            AnchorError::SameAddress { .. } => "same_address",
             AnchorError::OutputExists { .. } => "output_exists",
             AnchorError::UnsafePath { .. } => "unsafe_path",
             AnchorError::OutDirBusy { .. } => "out_dir_busy",
@@ -244,6 +272,8 @@ impl AnchorError {
             AnchorError::Config(_)
             | AnchorError::SameOperator { .. }
             | AnchorError::SameHost { .. }
+            | AnchorError::SameDomain { .. }
+            | AnchorError::SameAddress { .. }
             | AnchorError::OutputExists { .. }
             | AnchorError::UnsafePath { .. }
             | AnchorError::OutDirBusy { .. } => 2,
@@ -314,6 +344,26 @@ pub struct Anchor {
     pub fetched_at: String,
 }
 
+/// What `anchor-fetch --check` found both providers agree on: every check of [`run`] passed,
+/// and nothing was written.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Agreement {
+    /// The agreed block root, `0x` hex.
+    pub block_root: String,
+    /// The block's (and post-block state's) slot.
+    pub slot: u64,
+    /// The finalized checkpoint epoch the root was taken from (the lower of the two).
+    pub finalized_epoch: u64,
+    /// `block.message.state_root == hash_tree_root(state)` == both headers' `state_root`.
+    pub state_root: String,
+    /// The fork of both bodies.
+    pub fork: String,
+    /// Both providers, A (block) then B (state), their URLs redacted.
+    pub providers: Vec<ProviderRecord>,
+    /// When the check passed, UTC RFC 3339.
+    pub checked_at: String,
+}
+
 /// `0x` + 64 lower-case hex digits.
 pub fn root_hex(root: &Root) -> String {
     format!("0x{}", alloy_primitives::hex::encode(root))
@@ -334,7 +384,7 @@ pub async fn run<E: EthSpec>(
     out_dir: &Path,
     echo: bool,
 ) -> Result<Anchor, AnchorError> {
-    run_with::<E>(config_path, out_dir, echo, &RealFs).await
+    run_with::<E>(config_path, out_dir, echo, &RealFs, &SystemResolver).await
 }
 
 /// [`run`] with the publish step's file operations from `fs`.
@@ -343,6 +393,7 @@ pub(crate) async fn run_with<E: EthSpec>(
     out_dir: &Path,
     echo: bool,
     fs: &dyn PublishFs,
+    resolver: &dyn Resolve,
 ) -> Result<Anchor, AnchorError> {
     let out = Dir::open_out(out_dir)?;
     let _lock = lock_out_dir(&out)?;
@@ -357,23 +408,147 @@ pub(crate) async fn run_with<E: EthSpec>(
         }),
     )?;
     let mut fetch = Fetch {
+        mode: Mode::Fetch,
         log,
         out,
         quarantine: None,
     };
-    let result = fetch.run::<E>(config_path, fs).await;
+    let result = fetch.run::<E>(config_path, fs, resolver).await;
     fetch.discard_quarantine();
-    if let Err(e) = &result {
-        let mut fields = json!({"error": e.name(), "message": e.to_string()});
-        let left = e.left_behind();
-        if !left.is_empty() {
-            let left: Vec<_> = left.iter().map(|p| p.display().to_string()).collect();
-            fields["left"] = json!(left);
-        }
-        // The abort line is best effort: the error already says what went wrong.
-        let _ = fetch.log.event("abort", fields);
+    result.map_err(|e| abort(&mut fetch.log, e))
+}
+
+/// Runs every check of [`run`] against the providers of `config` and writes nothing: no
+/// output directory, no `anchor.json`, block, state or run log. Unlike [`run`], both
+/// providers must report the same finalized checkpoint (one ahead of the other is refused,
+/// not resolved to the lower one). The bodies stream into a new private directory (mode
+/// 0700) under `scratch_parent`, removed before this returns, pass or fail, and when the
+/// returned future is dropped (a cancelled check). The run log is kept in memory and, with `echo`, written to stderr; it names both
+/// providers by their redacted URL. `Ok` only if both providers agree on the finalized root
+/// and its header, `hash_tree_root(block.message)` is that root, the block's `state_root` is
+/// the headers', and `hash_tree_root(state)` is that state root; every error is
+/// [`AnchorError`], with its non-zero [`AnchorError::exit_code`].
+pub async fn check<E: EthSpec>(
+    config: &Config,
+    scratch_parent: &Path,
+    echo: bool,
+) -> Result<Agreement, AnchorError> {
+    check_logged::<E>(
+        config,
+        scratch_parent,
+        RunLog::in_memory(echo),
+        &SystemResolver,
+    )
+    .await
+    .0
+}
+
+/// [`check`] into `log`, which is handed back.
+pub(crate) async fn check_logged<E: EthSpec>(
+    config: &Config,
+    scratch_parent: &Path,
+    mut log: RunLog,
+    resolver: &dyn Resolve,
+) -> (Result<Agreement, AnchorError>, RunLog) {
+    let start = log_event(
+        &mut log,
+        "start",
+        json!({"version": env!("CARGO_PKG_VERSION"), "mode": "check"}),
+    );
+    if let Err(e) = start {
+        return (Err(e), log);
     }
-    result
+    // Removed when it goes out of scope, so a cancelled check (a signal, a dropped future)
+    // leaves nothing behind either.
+    let mut scratch = match Scratch::create(scratch_parent) {
+        Ok(s) => s,
+        Err(e) => return (Err(abort(&mut log, e)), log),
+    };
+    let Some(out) = scratch.dir.take() else {
+        let e = io_err("open", &scratch.path, io::Error::other("not opened"));
+        return (Err(abort(&mut log, e)), log);
+    };
+    let mut fetch = Fetch {
+        mode: Mode::Check,
+        log,
+        out,
+        quarantine: None,
+    };
+    let result = fetch.check_anchor::<E>(config, resolver).await;
+    fetch.discard_quarantine();
+    let Fetch { mut log, out, .. } = fetch;
+    drop(out);
+    // A check writes nothing: a scratch directory it cannot remove fails it.
+    let removed = scratch.remove();
+    match result.and_then(|agreement| removed.map(|()| agreement)) {
+        Ok(agreement) => match log_event(
+            &mut log,
+            "agreed",
+            serde_json::to_value(&agreement).unwrap_or_default(),
+        ) {
+            Ok(()) => (Ok(agreement), log),
+            Err(e) => (Err(e), log),
+        },
+        Err(e) => (Err(abort(&mut log, e)), log),
+    }
+}
+
+/// Records `e` as the run's `abort` line (best effort: the error already says what went
+/// wrong) and returns it.
+fn abort(log: &mut RunLog, e: AnchorError) -> AnchorError {
+    let mut fields = json!({"error": e.name(), "message": e.to_string()});
+    let left = e.left_behind();
+    if !left.is_empty() {
+        let left: Vec<_> = left.iter().map(|p| p.display().to_string()).collect();
+        fields["left"] = json!(left);
+    }
+    let _ = log.event("abort", fields);
+    e
+}
+
+/// The private directory a check streams its bodies into: `<parent>/anchor-fetch-check.<random>`,
+/// created mode 0700 (never an existing one) and checked like an output directory. Dropping
+/// it removes it with everything in it.
+pub(crate) struct Scratch {
+    pub(crate) path: PathBuf,
+    /// Taken by the check that streams into it.
+    dir: Option<Dir>,
+    /// [`Scratch::remove`] already ran.
+    removed: bool,
+}
+
+impl Scratch {
+    pub(crate) fn create(parent: &Path) -> Result<Self, AnchorError> {
+        let path = parent.join(format!("anchor-fetch-check.{}", random_name()?));
+        let mut builder = std::fs::DirBuilder::new();
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(&path)
+            .map_err(|e| io_err("create", &path, e))?;
+        let mut scratch = Self {
+            path,
+            dir: None,
+            removed: false,
+        };
+        // On a refusal, dropping `scratch` removes the directory again.
+        scratch.dir = Some(Dir::open_out(&scratch.path)?);
+        Ok(scratch)
+    }
+
+    /// Removes the directory and everything in it (never following a symlink in it).
+    fn remove(&mut self) -> Result<(), AnchorError> {
+        self.dir = None;
+        self.removed = true;
+        std::fs::remove_dir_all(&self.path).map_err(|e| io_err("remove", &self.path, e))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if !self.removed {
+            let _ = self.remove();
+        }
+    }
 }
 
 /// Opens `<out>/.lock` (mode 0600, never through a symlink) and takes an exclusive,
@@ -387,6 +562,29 @@ fn lock_out_dir(out: &Dir) -> Result<std::fs::File, AnchorError> {
             path: out.path().to_owned(),
         }),
         Err(e) => Err(io_err("flock", &out.join(LOCK_FILE), e.into())),
+    }
+}
+
+/// A boxed resolution, so [`Resolve`] stays object safe.
+pub(crate) type Resolution<'a> = Pin<Box<dyn Future<Output = io::Result<Vec<IpAddr>>> + Send + 'a>>;
+
+/// Resolves a provider's host to its addresses, so tests can answer from a table.
+pub(crate) trait Resolve: Sync {
+    /// The addresses of `host` (a name or an IP literal) at `port`.
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> Resolution<'a>;
+}
+
+/// The system resolver (`getaddrinfo` through tokio).
+pub(crate) struct SystemResolver;
+
+impl Resolve for SystemResolver {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> Resolution<'a> {
+        Box::pin(async move {
+            Ok(tokio::net::lookup_host((host, port))
+                .await?
+                .map(|a| a.ip())
+                .collect())
+        })
     }
 }
 
@@ -425,6 +623,15 @@ struct Quarantine {
     run: Dir,
 }
 
+/// Everything both providers agreed on, every check passed.
+struct Agreed {
+    resolved: Resolved,
+    /// The block's body in quarantine, from A.
+    block: Download,
+    /// The state's body in quarantine, from B.
+    state: Download,
+}
+
 /// The agreed candidate after resolution.
 struct Resolved {
     root: Root,
@@ -432,7 +639,17 @@ struct Resolved {
     header: BeaconBlockHeader,
 }
 
+/// What a run does with an agreed anchor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// [`run`]: publish it. One provider may be ahead: the lower checkpoint is taken.
+    Fetch,
+    /// [`check`]: only report it. Both providers must report the same finalized checkpoint.
+    Check,
+}
+
 struct Fetch {
+    mode: Mode,
     log: RunLog,
     out: Dir,
     /// Opened first thing in [`Fetch::run`].
@@ -479,19 +696,127 @@ impl Fetch {
             })
     }
 
-    async fn run<E: EthSpec>(
-        &mut self,
-        config_path: &Path,
-        fs: &dyn PublishFs,
-    ) -> Result<Anchor, AnchorError> {
-        self.open_quarantine()?;
-        let config = Config::load(config_path)?;
+    /// Names both providers in the run log, by redacted URL.
+    fn log_providers(&mut self, config: &Config) -> Result<(), AnchorError> {
         for (role, p) in [("a", &config.a), ("b", &config.b)] {
             self.event(
                 "provider",
                 json!({"role": role, "name": p.name, "operator": p.operator, "url": p.redacted_url()}),
             )?;
         }
+        Ok(())
+    }
+
+    /// Resolves, fetches and checks the anchor (the bodies stay in quarantine), then checks
+    /// that the run log names both providers.
+    async fn agree<E: EthSpec>(
+        &mut self,
+        config: &Config,
+        resolver: &dyn Resolve,
+    ) -> Result<Agreed, AnchorError> {
+        let pins = self.addresses_apart(config, resolver).await?;
+        if config.allow_insecure_http {
+            self.event("insecure_http_allowed", json!({}))?;
+        }
+        // Every request dials the addresses just checked, never a fresh lookup.
+        let client = Client::new(config.request_timeout, config.body_timeout)?.pinned(pins);
+
+        let resolved = self.resolve::<E>(&client, config).await?;
+        let (block, block_download) = self.fetch_block::<E>(&client, config, &resolved).await?;
+        let state = self
+            .fetch_state::<E>(&client, config, &resolved, &block)
+            .await?;
+
+        self.log.verify()?;
+        self.check("run_log_names_providers", true)?;
+        Ok(Agreed {
+            resolved,
+            block: block_download,
+            state,
+        })
+    }
+
+    /// Resolves both providers' hosts, once, and refuses them if they share an address (one
+    /// machine behind two names), before any request. Returns host → addresses, which the
+    /// client is pinned to, so a later answer cannot put both on one machine.
+    async fn addresses_apart(
+        &mut self,
+        config: &Config,
+        resolver: &dyn Resolve,
+    ) -> Result<std::collections::HashMap<String, Vec<IpAddr>>, AnchorError> {
+        let mut sets = Vec::with_capacity(2);
+        for p in [&config.a, &config.b] {
+            let unresolved = |reason: String| AnchorError::Transport {
+                provider: p.name.clone(),
+                path: "(name resolution)".into(),
+                reason,
+            };
+            let mut addrs: Vec<IpAddr> = resolver
+                .resolve(&p.host, p.port)
+                .await
+                .map_err(|e| unresolved(format!("resolve: {e}")))?
+                .into_iter()
+                .map(|ip| ip.to_canonical())
+                .collect();
+            addrs.sort_unstable();
+            addrs.dedup();
+            if addrs.is_empty() {
+                return Err(unresolved("resolved to no address".into()));
+            }
+            self.event(
+                "addresses",
+                json!({"provider": p.name, "addresses": addrs.iter().map(ToString::to_string).collect::<Vec<_>>()}),
+            )?;
+            sets.push(addrs);
+        }
+        let shared = sets[0].iter().find(|ip| sets[1].contains(ip)).copied();
+        self.check("providers_resolve_apart", shared.is_none())?;
+        match shared {
+            Some(addr) => Err(AnchorError::SameAddress {
+                a: config.a.name.clone(),
+                b: config.b.name.clone(),
+                addr,
+            }),
+            None => Ok([&config.a, &config.b]
+                .into_iter()
+                .map(|p| p.host.clone())
+                .zip(sets)
+                .collect()),
+        }
+    }
+
+    /// [`check`]: every check, nothing published.
+    async fn check_anchor<E: EthSpec>(
+        &mut self,
+        config: &Config,
+        resolver: &dyn Resolve,
+    ) -> Result<Agreement, AnchorError> {
+        self.open_quarantine()?;
+        self.log_providers(config)?;
+        let Agreed { resolved, .. } = self.agree::<E>(config, resolver).await?;
+        Ok(Agreement {
+            block_root: root_hex(&resolved.root),
+            slot: resolved.header.slot,
+            finalized_epoch: resolved.finalized_epoch,
+            state_root: root_hex(&resolved.header.state_root),
+            fork: FORK.as_str().into(),
+            providers: vec![
+                provider_record("a", &config.a),
+                provider_record("b", &config.b),
+            ],
+            checked_at: runlog::rfc3339_utc(SystemTime::now()),
+        })
+    }
+
+    async fn run<E: EthSpec>(
+        &mut self,
+        config_path: &Path,
+        fs: &dyn PublishFs,
+        resolver: &dyn Resolve,
+    ) -> Result<Anchor, AnchorError> {
+        self.open_quarantine()?;
+        let config = Config::load(config_path)?;
+        self.log_providers(&config)?;
         // Checked up front so a run does not download for nothing; publish enforces it.
         for file in [ANCHOR_FILE, BLOCK_FILE, STATE_FILE] {
             if self.out.exists(file)? {
@@ -500,26 +825,12 @@ impl Fetch {
                 });
             }
         }
-        if config.allow_insecure_http {
-            self.event("insecure_http_allowed", json!({}))?;
-        }
-        let client = Client::new(config.request_timeout, config.body_timeout)?;
+        let Agreed {
+            resolved,
+            block,
+            state,
+        } = self.agree::<E>(&config, resolver).await?;
 
-        let resolved = self.resolve::<E>(&client, &config).await?;
-        let block = self.fetch_block::<E>(&client, &config, &resolved).await?;
-        let state = self
-            .fetch_state::<E>(&client, &config, &resolved, &block.0)
-            .await?;
-
-        self.log.verify()?;
-        self.check("run_log_names_providers", true)?;
-
-        let record = |role: &str, p: &Provider| ProviderRecord {
-            role: role.into(),
-            name: p.name.clone(),
-            operator: p.operator.clone(),
-            url: p.redacted_url(),
-        };
         let file = |file: &str, d: &Download, p: &Provider| FileRecord {
             file: file.into(),
             sha256: alloy_primitives::hex::encode(d.sha256),
@@ -533,9 +844,12 @@ impl Fetch {
             finalized_epoch: resolved.finalized_epoch,
             state_root: root_hex(&resolved.header.state_root),
             fork: FORK.as_str().into(),
-            block: file(BLOCK_FILE, &block.1, &config.a),
+            block: file(BLOCK_FILE, &block, &config.a),
             state: file(STATE_FILE, &state, &config.b),
-            providers: vec![record("a", &config.a), record("b", &config.b)],
+            providers: vec![
+                provider_record("a", &config.a),
+                provider_record("b", &config.b),
+            ],
             fetched_at: runlog::rfc3339_utc(SystemTime::now()),
         };
         let text = serde_json::to_vec_pretty(&anchor).map_err(|e| AnchorError::Io {
@@ -570,6 +884,13 @@ impl Fetch {
                 ));
             }
             finalized.push(cp);
+        }
+        if self.mode == Mode::Check && finalized[0].epoch != finalized[1].epoch {
+            return Err(AnchorError::ProvidersDisagree(format!(
+                "{} is finalized at epoch {} and {} at epoch {}; a check needs both at the same \
+                 checkpoint",
+                config.a.name, finalized[0].epoch, config.b.name, finalized[1].epoch
+            )));
         }
         let candidate = candidate(finalized[0], finalized[1])?;
         self.event(
@@ -766,6 +1087,16 @@ impl Fetch {
             });
         }
         Ok(d)
+    }
+}
+
+/// A provider as recorded in `anchor.json` and an [`Agreement`], its URL redacted.
+fn provider_record(role: &str, p: &Provider) -> ProviderRecord {
+    ProviderRecord {
+        role: role.into(),
+        name: p.name.clone(),
+        operator: p.operator.clone(),
+        url: p.redacted_url(),
     }
 }
 

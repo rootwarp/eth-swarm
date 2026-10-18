@@ -1,5 +1,5 @@
 //! The `anchor-fetch` binary: exit codes, stderr and output files. No network: every case
-//! here is refused before any request.
+//! here is refused before any request or fails to connect to 127.0.0.1.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -83,6 +83,17 @@ fn usage_errors_exit_64() {
         &["--config"],
         &["check-log"],
         &["check-log", "a", "b"],
+        &["--providers", "https://a.invalid,https://b.invalid"],
+        &[
+            "--check",
+            "--out",
+            "x",
+            "--providers",
+            "https://a.invalid,https://b.invalid",
+        ],
+        &["--check"],
+        &["--providers", "--help", "--check"],
+        &["--check", "--help"],
     ] {
         let o = anchor_fetch(args);
         assert_eq!(o.status.code(), Some(64), "{args:?}");
@@ -179,5 +190,144 @@ fn an_out_dir_symlink_with_a_trailing_slash_or_dot_exits_2() {
         );
         assert!(stderr.contains("symlink"), "{suffix}: {stderr}");
         assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0, "{suffix}");
+    }
+}
+
+#[test]
+fn check_refuses_one_provider_given_twice_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_anchor-fetch"))
+        .current_dir(dir.path())
+        .args([
+            "--check",
+            "--providers",
+            "https://a.invalid,https://A.invalid./other",
+            "--scratch",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(stderr.contains("aborted: same_host"), "{stderr}");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn check_against_an_unreachable_provider_exits_3_and_never_prints_a_url_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let closed = |_| {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    };
+    let (a, b) = (closed(0), closed(1));
+    // Two IP literals, so the providers resolve apart without DNS; nothing listens on either.
+    let providers = format!("http://127.0.0.1:{a}/k3y-a,http://[::1]:{b}/k3y-b");
+    let o = Command::new(env!("CARGO_BIN_EXE_anchor-fetch"))
+        .current_dir(dir.path())
+        .args([
+            "--check",
+            "--providers",
+            &providers,
+            "--allow-insecure-http",
+            "--scratch",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(stderr.contains("aborted: transport"), "{stderr}");
+    // Both providers are logged before any request, by origin.
+    assert!(
+        stderr.contains(&format!("http://127.0.0.1:{a}/…")),
+        "{stderr}"
+    );
+    assert!(stderr.contains(&format!("http://[::1]:{b}/…")), "{stderr}");
+    assert!(!stderr.contains("k3y"), "{stderr}");
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("k3y"));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn help_documents_the_check() {
+    let o = anchor_fetch(&["--help"]);
+    let help = String::from_utf8_lossy(&o.stdout);
+    for needle in ["--check", "--providers A,B", "write nothing"] {
+        assert!(help.contains(needle), "{needle}: {help}");
+    }
+}
+
+#[test]
+fn check_refuses_two_names_for_one_machine() {
+    // localhost resolves to 127.0.0.1 (or ::1 and 127.0.0.1): one machine, two names.
+    let dir = tempfile::tempdir().unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_anchor-fetch"))
+        .args([
+            "--check",
+            "--providers",
+            "http://127.0.0.1:1,http://localhost:2",
+            "--allow-insecure-http",
+            "--scratch",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(stderr.contains("aborted: same_address"), "{stderr}");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn a_signalled_check_exits_and_removes_its_scratch_dir() {
+    use std::io::Read as _;
+    // Provider A accepts the connection and never answers, so the check is mid-run (its
+    // scratch directory exists) when the signal comes.
+    let hang = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let a = hang.local_addr().unwrap().port();
+    for (signal, code) in [
+        (rustix::process::Signal::TERM, 143),
+        (rustix::process::Signal::INT, 130),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_anchor-fetch"))
+            .args([
+                "--check",
+                "--providers",
+                &format!("http://127.0.0.1:{a},http://[::1]:1"),
+                "--allow-insecure-http",
+                "--quiet",
+                "--scratch",
+                dir.path().to_str().unwrap(),
+            ])
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (mut conn, _) = hang.accept().unwrap();
+        // The request has arrived: the check is waiting for A.
+        let mut buf = [0u8; 16];
+        conn.read_exact(&mut buf).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+        rustix::process::kill_process(pid, signal).unwrap();
+        let status = child.wait().unwrap();
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert_eq!(status.code(), Some(code), "{signal:?}: {stderr}");
+        assert!(stderr.contains("interrupted"), "{stderr}");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "{signal:?}"
+        );
     }
 }

@@ -140,6 +140,8 @@ struct Net {
     _dir: tempfile::TempDir,
     config: PathBuf,
     out: PathBuf,
+    /// B's base path (empty for none).
+    b_prefix: String,
 }
 
 impl Net {
@@ -165,7 +167,9 @@ impl Net {
             .into_iter()
             .map(|(path, reply)| (format!("{b_prefix}{path}"), reply))
             .collect();
-        let b = Server::start(b_routes).await;
+        // B on another loopback address, under a name only the fixture resolver knows: the
+        // client must dial the address the independence check saw.
+        let b = Server::start_on("[::1]:0", b_routes).await;
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("anchor-fetch.toml");
         // Same machine, two host names: the config refuses one host behind both providers.
@@ -174,7 +178,7 @@ impl Net {
             format!(
                 "allow_insecure_http = true\n{extra}\n\
                  [[provider]]\nname = \"alpha\"\noperator = \"{}\"\nurl = \"http://127.0.0.1:{}\"\n\
-                 [[provider]]\nname = \"beta\"\noperator = \"{}\"\nurl = \"http://localhost:{}{b_prefix}\"\n",
+                 [[provider]]\nname = \"beta\"\noperator = \"{}\"\nurl = \"http://beta.test:{}{b_prefix}\"\n",
                 operators.0,
                 a.addr.port(),
                 operators.1,
@@ -189,15 +193,26 @@ impl Net {
             _dir: dir,
             config,
             out,
+            b_prefix: b_prefix.to_owned(),
         }
     }
 
+    /// The `--providers` value naming both fixture nodes (two host names, one machine).
+    fn provider_urls(&self) -> String {
+        format!(
+            "http://127.0.0.1:{},http://beta.test:{}{}",
+            self.a.addr.port(),
+            self.b.addr.port(),
+            self.b_prefix
+        )
+    }
+
     async fn run(&self) -> Result<Anchor, AnchorError> {
-        run::<Mainnet>(&self.config, &self.out, false).await
+        run_with::<Mainnet>(&self.config, &self.out, false, &RealFs, &apart()).await
     }
 
     async fn run_with(&self, fs: &dyn PublishFs) -> Result<Anchor, AnchorError> {
-        run_with::<Mainnet>(&self.config, &self.out, false, fs).await
+        run_with::<Mainnet>(&self.config, &self.out, false, fs, &apart()).await
     }
 
     /// Nothing published: no anchor, block or state in `out/`.
@@ -231,6 +246,34 @@ impl Net {
         assert_eq!(last["event"], "abort");
         assert_eq!(last["error"], name);
     }
+}
+
+/// A resolver that answers from a table: an IP literal resolves to itself, a listed name to
+/// its addresses (or an error), anything else fails.
+struct FixtureResolver(HashMap<&'static str, std::io::Result<Vec<std::net::IpAddr>>>);
+
+impl Resolve for FixtureResolver {
+    fn resolve<'a>(&'a self, host: &'a str, _port: u16) -> Resolution<'a> {
+        let answer = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => Ok(vec![ip]),
+            Err(_) => match self.0.get(host) {
+                Some(Ok(addrs)) => Ok(addrs.clone()),
+                Some(Err(e)) => Err(std::io::Error::new(e.kind(), e.to_string())),
+                None => Err(std::io::Error::other("no such host in the fixture")),
+            },
+        };
+        Box::pin(async move { answer })
+    }
+}
+
+/// B's name, `beta.test`, resolving to where B listens (`::1`), apart from A (127.0.0.1).
+fn apart() -> FixtureResolver {
+    resolver(Ok(vec![std::net::Ipv6Addr::LOCALHOST.into()]))
+}
+
+/// `beta.test` resolving to `answer`.
+fn resolver(answer: std::io::Result<Vec<std::net::IpAddr>>) -> FixtureResolver {
+    FixtureResolver(HashMap::from([("beta.test", answer)]))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -307,7 +350,7 @@ async fn happy_path() {
     let log = net.run_log();
     assert_eq!(runlog::verify(&log), Ok(()));
     assert!(log.contains(&format!("http://127.0.0.1:{}", net.a.addr.port())));
-    assert!(log.contains(&format!("http://localhost:{}", net.b.addr.port())));
+    assert!(log.contains(&format!("http://beta.test:{}", net.b.addr.port())));
     let last: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
     assert_eq!(last["event"], "anchor");
     assert_eq!(
@@ -600,6 +643,16 @@ fn every_error_has_a_distinct_name_and_a_non_zero_exit() {
             b: s(),
             host: s(),
         },
+        AnchorError::SameDomain {
+            a: s(),
+            b: s(),
+            domain: s(),
+        },
+        AnchorError::SameAddress {
+            a: s(),
+            b: s(),
+            addr: std::net::Ipv4Addr::LOCALHOST.into(),
+        },
         AnchorError::OutputExists {
             path: PathBuf::new(),
         },
@@ -876,7 +929,7 @@ async fn a_base_path_token_never_reaches_the_run_log_or_the_anchor() {
     for text in [&log, &anchor_json, &format!("{anchor:?}")] {
         assert!(!text.contains("tok3n-s3cret"), "{text}");
     }
-    let redacted = format!("http://localhost:{}/…", net.b.addr.port());
+    let redacted = format!("http://beta.test:{}/…", net.b.addr.port());
     assert_eq!(anchor.providers[1].url, redacted);
     assert!(log.contains(&redacted));
     assert_eq!(runlog::verify(&log), Ok(()));
@@ -1115,4 +1168,391 @@ async fn a_directory_at_the_run_log_or_lock_is_refused() {
             },
         );
     }
+}
+
+// --- anchor-fetch --check ----------------------------------------------------------------------
+
+/// Fixture nodes on their own runtime, so `cli::main` (which builds its own) can run on the
+/// test thread.
+struct CheckNet {
+    net: Net,
+    _runtime: tokio::runtime::Runtime,
+}
+
+impl CheckNet {
+    fn start(a: Node, b: Node) -> Self {
+        Self::start_with_prefix(a, b, "")
+    }
+
+    fn start_with_prefix(a: Node, b: Node, b_prefix: &str) -> Self {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let net = runtime.block_on(Net::start_full(
+            a,
+            b,
+            ("Operator A", "Operator B"),
+            "",
+            b_prefix,
+        ));
+        Self {
+            net,
+            _runtime: runtime,
+        }
+    }
+
+    /// `anchor-fetch --providers A,B --check` exactly as the binary runs it, with a fresh
+    /// scratch parent: the exit code, and the scratch parent's entries afterwards.
+    fn check(&self) -> (u8, Vec<String>) {
+        let urls = self.net.provider_urls();
+        check_cli(&urls)
+    }
+}
+
+/// Runs the CLI's check on `urls` with a fresh scratch parent; returns the exit code and what
+/// is left in the scratch parent.
+fn check_cli(urls: &str) -> (u8, Vec<String>) {
+    let scratch = tempfile::tempdir().unwrap();
+    let args: Vec<String> = [
+        "--providers",
+        urls,
+        "--allow-insecure-http",
+        "--check",
+        "--scratch",
+        scratch.path().to_str().unwrap(),
+        "--quiet",
+    ]
+    .iter()
+    .map(|a| (*a).to_owned())
+    .collect();
+    let code = crate::checkpoint::cli::main_with(&args, &apart());
+    let left = std::fs::read_dir(scratch.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    (code, left)
+}
+
+/// A non-zero exit, nothing left in the scratch parent, and no anchor, block or state in the
+/// fixture's output directory (which a check never opens).
+fn assert_check_refused(net: &Net, (code, left): (u8, Vec<String>), want: u8) {
+    assert_eq!(code, want, "exit code");
+    assert!(left.is_empty(), "left in the scratch dir: {left:?}");
+    assert!(!net.out.exists(), "a check created the output directory");
+}
+
+#[test]
+fn mismatch_exit_code() {
+    let a0 = anchor0();
+    // B's header names another state root than A's: the providers disagree on it.
+    let mut other = a0.block.clone();
+    other.message.state_root = Root::repeat_byte(0x44);
+    let mut b = Node::honest(&a0, 5);
+    b.headers = vec![(a0.root, header_json(&other, a0.root, true))];
+    let net = CheckNet::start(Node::honest(&a0, 5), b);
+    assert_check_refused(&net.net, net.check(), 1);
+    assert!(!net.net.b.paths().iter().any(|p| p.starts_with("/eth/v2/")));
+
+    // Both headers agree, but the state B serves under that root hashes to another one.
+    let mut wrong = post_state(&a0.block.message);
+    wrong.genesis_time = 1;
+    let mut b = Node::honest(&a0, 5);
+    b.state = Some((
+        a0.state_root,
+        Reply::Ssz {
+            body: Bytes::from(wrong.as_ssz_bytes()),
+            version: Some("gloas"),
+        },
+    ));
+    let net = CheckNet::start(Node::honest(&a0, 5), b);
+    assert_check_refused(&net.net, net.check(), 1);
+    let state_path = format!("/eth/v2/debug/beacon/states/{}", root_hex(&a0.state_root));
+    assert!(
+        net.net.b.paths().contains(&state_path),
+        "the state was fetched"
+    );
+}
+
+#[test]
+fn check_block_root_mismatch_exit_code() {
+    let a0 = anchor0();
+    let mut a = Node::honest(&a0, 5);
+    let mut other = a0.block.clone();
+    other.message.proposer_index += 1;
+    a.block = Some((a0.root, Bytes::from(other.as_ssz_bytes())));
+    let net = CheckNet::start(a, Node::honest(&a0, 5));
+    assert_check_refused(&net.net, net.check(), 1);
+}
+
+#[test]
+fn check_header_state_root_mismatch_exit_code() {
+    // Both headers agree on a state_root that is not the block's.
+    let a0 = anchor0();
+    let mut forged = a0.block.clone();
+    forged.message.state_root = Root::repeat_byte(0x55);
+    let header = header_json(&forged, a0.root, true);
+    let (mut a, mut b) = (Node::honest(&a0, 5), Node::honest(&a0, 5));
+    a.headers = vec![(a0.root, header.clone())];
+    b.headers = vec![(a0.root, header)];
+    let net = CheckNet::start(a, b);
+    assert_check_refused(&net.net, net.check(), 1);
+}
+
+#[test]
+fn check_unreachable_provider_exit_code() {
+    let a0 = anchor0();
+    let net = CheckNet::start(Node::honest(&a0, 5), Node::honest(&a0, 5));
+    // A port nothing listens on: bound, then released.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let urls = format!(
+        "http://127.0.0.1:{},http://beta.test:{closed}",
+        net.net.a.addr.port()
+    );
+    assert_check_refused(&net.net, check_cli(&urls), 3);
+}
+
+#[test]
+fn check_refuses_one_provider_given_twice() {
+    let a0 = anchor0();
+    let net = CheckNet::start(Node::honest(&a0, 5), Node::honest(&a0, 5));
+    let one = format!("http://127.0.0.1:{}", net.net.a.addr.port());
+    assert_check_refused(&net.net, check_cli(&format!("{one},{one}")), 2);
+    assert!(
+        net.net.a.paths().is_empty(),
+        "a refused check made a request"
+    );
+}
+
+#[test]
+fn check_passes_when_both_providers_agree_and_writes_nothing() {
+    let a0 = anchor0();
+    let net = CheckNet::start(Node::honest(&a0, 5), Node::honest(&a0, 5));
+    let (code, left) = net.check();
+    assert_eq!(code, 0);
+    assert!(left.is_empty(), "left in the scratch dir: {left:?}");
+    assert!(!net.net.out.exists());
+    // The block came from A and the state from B, both by root.
+    let block_path = format!("/eth/v2/beacon/blocks/{}", root_hex(&a0.root));
+    let state_path = format!("/eth/v2/debug/beacon/states/{}", root_hex(&a0.state_root));
+    assert!(net.net.a.paths().contains(&block_path));
+    assert!(net.net.b.paths().contains(&state_path));
+    assert!(!net.net.a.paths().contains(&state_path));
+    assert!(!net.net.b.paths().contains(&block_path));
+}
+
+#[tokio::test]
+async fn check_names_both_providers_by_origin_only() {
+    let a0 = anchor0();
+    let net = Net::start_full(
+        Node::honest(&a0, 5),
+        Node::honest(&a0, 5),
+        ("Operator A", "Operator B"),
+        "",
+        "/tok3n-s3cret",
+    )
+    .await;
+    let config = Config::from_provider_urls(&net.provider_urls(), true).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let (result, log) =
+        check_logged::<Mainnet>(&config, scratch.path(), RunLog::in_memory(false), &apart()).await;
+    let agreement = result.unwrap();
+    assert_eq!(agreement.block_root, root_hex(&a0.root));
+    assert_eq!(agreement.state_root, root_hex(&a0.state_root));
+    assert_eq!((agreement.slot, agreement.finalized_epoch), (SLOT, 5));
+    assert_eq!(agreement.fork, "gloas");
+    let urls: Vec<_> = agreement.providers.iter().map(|p| p.url.as_str()).collect();
+    let a_origin = format!("http://127.0.0.1:{}", net.a.addr.port());
+    let b_origin = format!("http://beta.test:{}/…", net.b.addr.port());
+    assert_eq!(urls, [a_origin.as_str(), b_origin.as_str()]);
+    let text = log.text();
+    assert_eq!(runlog::verify(text), Ok(()));
+    assert!(
+        text.contains(&a_origin) && text.contains(&b_origin),
+        "{text}"
+    );
+    assert!(!text.contains("tok3n-s3cret"), "{text}");
+    assert!(!format!("{agreement:?}").contains("tok3n-s3cret"));
+    let last: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    assert_eq!(last["event"], "agreed");
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn a_failed_check_logs_the_abort_and_cleans_its_scratch_dir() {
+    let a0 = anchor0();
+    let mut a = Node::honest(&a0, 5);
+    a.block = Some((a0.root, Bytes::from_static(b"not ssz")));
+    let net = Net::start(a, Node::honest(&a0, 5)).await;
+    let config = Config::from_provider_urls(&net.provider_urls(), true).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let (result, log) =
+        check_logged::<Mainnet>(&config, scratch.path(), RunLog::in_memory(false), &apart()).await;
+    let err = result.unwrap_err();
+    assert_eq!(err.name(), "decode");
+    let last: Value = serde_json::from_str(log.text().lines().last().unwrap()).unwrap();
+    assert_eq!(last["event"], "abort");
+    assert_eq!(last["error"], "decode");
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn a_check_into_a_missing_scratch_parent_is_a_local_io_error() {
+    let a0 = anchor0();
+    let net = Net::start(Node::honest(&a0, 5), Node::honest(&a0, 5)).await;
+    let config = Config::from_provider_urls(&net.provider_urls(), true).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let missing = scratch.path().join("missing");
+    let err = check::<Mainnet>(&config, &missing, false)
+        .await
+        .unwrap_err();
+    assert_eq!(err.name(), "io", "{err:?}");
+    assert!(!missing.exists());
+    assert!(net.a.paths().is_empty() && net.b.paths().is_empty());
+}
+
+#[test]
+fn check_needs_both_providers_at_the_same_finalized_epoch() {
+    // A normal fetch takes the lower checkpoint when one provider is ahead; the start gate
+    // does not: the providers must report the same finalized checkpoint.
+    let a0 = anchor0();
+    let net = CheckNet::start(Node::honest(&a0, 5), Node::honest(&a0, 6));
+    assert_check_refused(&net.net, net.check(), 1);
+    assert!(!net.net.a.paths().iter().any(|p| p.starts_with("/eth/v2/")));
+}
+
+#[tokio::test]
+async fn providers_resolving_to_a_common_address_are_refused_before_any_request() {
+    let a0 = anchor0();
+    let net = Net::start(Node::honest(&a0, 5), Node::honest(&a0, 5)).await;
+    for (answer, shared) in [
+        (vec!["192.0.2.1", "127.0.0.1"], "127.0.0.1"),
+        (vec!["::ffff:127.0.0.1"], "127.0.0.1"),
+    ] {
+        let answer = answer.iter().map(|a| a.parse().unwrap()).collect();
+        let err = run_with::<Mainnet>(&net.config, &net.out, false, &RealFs, &resolver(Ok(answer)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AnchorError::SameAddress { addr, .. } if addr.to_string() == shared),
+            "{err:?}"
+        );
+        net.assert_aborted(&err, "same_address");
+        assert_eq!(err.exit_code(), 2);
+        let config = Config::from_provider_urls(&net.provider_urls(), true).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let shared_answer = vec![shared.parse().unwrap()];
+        let (result, _) = check_logged::<Mainnet>(
+            &config,
+            scratch.path(),
+            RunLog::in_memory(false),
+            &resolver(Ok(shared_answer)),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().name(), "same_address");
+    }
+    assert!(net.a.paths().is_empty() && net.b.paths().is_empty());
+}
+
+#[tokio::test]
+async fn a_provider_that_does_not_resolve_is_unreachable() {
+    let a0 = anchor0();
+    let net = Net::start(Node::honest(&a0, 5), Node::honest(&a0, 5)).await;
+    for answer in [Err(std::io::Error::other("NXDOMAIN")), Ok(vec![])] {
+        let err = run_with::<Mainnet>(&net.config, &net.out, false, &RealFs, &resolver(answer))
+            .await
+            .unwrap_err();
+        net.assert_aborted(&err, "transport");
+        assert_eq!(err.exit_code(), 3);
+    }
+    assert!(net.a.paths().is_empty() && net.b.paths().is_empty());
+}
+
+#[test]
+fn a_scratch_dir_is_removed_when_dropped() {
+    let parent = tempfile::tempdir().unwrap();
+    let scratch = Scratch::create(parent.path()).unwrap();
+    std::fs::write(scratch.path.join("partial"), b"body").unwrap();
+    std::fs::create_dir(scratch.path.join(QUARANTINE_DIR)).unwrap();
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
+    drop(scratch);
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn a_cancelled_check_removes_its_scratch_dir() {
+    // The check is dropped mid-download (a signal, a timeout): nothing may stay behind.
+    let a0 = anchor0();
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    let mut b = Node::honest(&a0, 5);
+    let (root, reply) = b.state.take().unwrap();
+    b.state = Some((root, Reply::Gated(gate.clone(), Box::new(reply))));
+    let net = Net::start(Node::honest(&a0, 5), b).await;
+    let config = Config::from_provider_urls(&net.provider_urls(), true).unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let scratch_parent = parent.path().to_owned();
+    let task = tokio::spawn(async move {
+        check_logged::<Mainnet>(&config, &scratch_parent, RunLog::in_memory(false), &apart())
+            .await
+            .0
+    });
+    let state_path = format!("/eth/v2/debug/beacon/states/{}", root_hex(&a0.state_root));
+    while !net.b.paths().contains(&state_path) {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // The block is already in this run's quarantine.
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+}
+
+/// Answers `beta.test` with `first`, then with `later` on every further lookup.
+struct ChangingResolver {
+    first: std::net::IpAddr,
+    later: std::net::IpAddr,
+    lookups: AtomicUsize,
+}
+
+impl Resolve for ChangingResolver {
+    fn resolve<'a>(&'a self, host: &'a str, _port: u16) -> Resolution<'a> {
+        let answer = match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => vec![ip],
+            Err(_) if self.lookups.fetch_add(1, Ordering::SeqCst) == 0 => vec![self.first],
+            Err(_) => vec![self.later],
+        };
+        Box::pin(async move { Ok(answer) })
+    }
+}
+
+#[tokio::test]
+async fn the_fetch_dials_exactly_the_addresses_the_independence_check_saw() {
+    // After the check, beta.test "moves" onto A's address. The fetch still dials ::1, and the
+    // name is never looked up again: no second answer can put both providers on one machine.
+    let a0 = anchor0();
+    let net = Net::start(Node::honest(&a0, 5), Node::honest(&a0, 5)).await;
+    let resolver = ChangingResolver {
+        first: std::net::Ipv6Addr::LOCALHOST.into(),
+        later: std::net::Ipv4Addr::LOCALHOST.into(),
+        lookups: AtomicUsize::new(0),
+    };
+    let anchor = run_with::<Mainnet>(&net.config, &net.out, false, &RealFs, &resolver)
+        .await
+        .unwrap();
+    assert_eq!(anchor.block_root, root_hex(&a0.root));
+    assert_eq!(
+        resolver.lookups.load(Ordering::SeqCst),
+        1,
+        "beta.test resolved once"
+    );
+    let state_path = format!("/eth/v2/debug/beacon/states/{}", root_hex(&a0.state_root));
+    assert!(
+        net.b.paths().contains(&state_path),
+        "B, at ::1, served the state"
+    );
+    assert!(!net.a.paths().contains(&state_path));
+    // The name stays in the Host header.
+    let host = net.b.seen()[0].headers["host"].to_str().unwrap().to_owned();
+    assert_eq!(host, format!("beta.test:{}", net.b.addr.port()));
 }

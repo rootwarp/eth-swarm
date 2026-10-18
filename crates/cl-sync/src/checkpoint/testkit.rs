@@ -89,9 +89,15 @@ pub(crate) struct Server {
 }
 
 impl Server {
-    /// Serves `routes` (path → reply; anything else is 404) until the runtime ends.
+    /// Serves `routes` (path → reply; anything else is 404) on 127.0.0.1 until the runtime
+    /// ends.
     pub async fn start(routes: HashMap<String, Reply>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::start_on("127.0.0.1:0", routes).await
+    }
+
+    /// [`Server::start`] on `bind` (`[::1]:0`: another loopback address than 127.0.0.1).
+    pub async fn start_on(bind: &str, routes: HashMap<String, Reply>) -> Self {
+        let listener = TcpListener::bind(bind).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let routes = Arc::new(routes);
