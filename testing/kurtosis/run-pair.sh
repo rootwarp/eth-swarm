@@ -2,23 +2,26 @@
 # Runs the concurrent pair of the Kurtosis Gloas devnet (README.md, "Reproducible genesis" and
 # "Acceptance checks") and fails closed at every step:
 #   0. refuses an engine that has any enclave (it needs one dedicated to this run), unless
-#      --clean-engine;
+#      --clean-engine; an `enclave ls` answer without its UUID header (an empty one included) is
+#      refused too;
 #   1. pulls every pinned image of gloas-genesis.yaml (docker pull -q), so the clock starts only
 #      once both launches can begin;
 #   2. renders a copy with genesis_time T = now + --lead (at least 900 s) into
 #      target/kurtosis/pair-T/gloas-genesis.yaml, checks that exactly one genesis_time line holds
 #      T, and runs scripts/check-kurtosis-pins.sh on the copy's directory;
-#   3. cleans the engine (kurtosis clean -a, which removes EVERY enclave on it), then launches
-#      ethswarm-gloas-a and ethswarm-gloas-b at once from that copy; both must exit 0 before T (a
-#      launch still running at T is stopped);
+#   3. lists the enclaves again and refuses any (one created since step 0 is never removed), or
+#      with --clean-engine only, cleans the engine (kurtosis clean -a, which removes EVERY enclave
+#      on it); then launches ethswarm-gloas-a and ethswarm-gloas-b at once from that copy; both
+#      must exit 0 before T (a launch still running at T is stopped);
 #   4. waits for genesis and runs check-devnet.sh --pair --record target/kurtosis/pair-T/genesis.json;
 #   5. removes both enclaves (kurtosis enclave rm -f, nothing else on the engine), then exits with
 #      the check's exit code.
 # From step 3 on, an EXIT/INT/TERM/HUP/PIPE trap does the teardown on every exit (a failure, an
 # interrupt while waiting for genesis or finality, a closed terminal or output pipe): it stops the
-# background jobs and their descendants, then removes both enclaves, each step bounded and run
-# even if an earlier one failed, so no ~4.75 GiB pair is left running. The run logs, the check
-# log, the genesis record and `docker stats` snapshots stay in target/kurtosis/pair-T/.
+# background jobs (each one's whole process group) and their descendants, then removes both
+# enclaves, each step bounded and run even if an earlier one failed, so no ~4.75 GiB pair is left
+# running. The run logs, the check log, the genesis record and `docker stats` snapshots stay in
+# target/kurtosis/pair-T/.
 #
 # Usage: testing/kurtosis/run-pair.sh [--lead S] [--sequential-fallback] [--keep-on-pass]
 #                                     [--clean-engine]
@@ -29,12 +32,15 @@
 #   --keep-on-pass         on a pair PASS (exit 0), leave both enclaves running (for the block
 #                          export) and print the teardown commands; any other exit tears down
 #   --clean-engine         start even if the engine has other enclaves: kurtosis clean -a removes
-#                          them all. Without it, any enclave on the engine stops the run.
+#                          them all, just before the launches. Without it, the engine is never
+#                          cleaned, and any enclave on it (at the start or just before the
+#                          launches) stops the run.
 # Exit: the check's exit code (0 pair PASS, 1 FAIL, 2 setup error, 3 DIAGNOSTIC; 2 if the check
 # passed but its log could not be written); 2 a usage or setup error before the check (a missing
-# tool, an engine with other enclaves, a failed pull, render, pin lint or clean, a failed launch),
-# or a failed teardown after a PASS; 4 the launches did not leave both enclaves up before genesis
-# (render a later T and start again); 129 on HUP, 130 on INT, 141 on PIPE, 143 on TERM.
+# tool, an engine with other enclaves or an unreadable enclave list, a failed pull, render, pin
+# lint or clean, a failed launch, a fallback inspect that timed out), or a failed teardown after
+# a PASS; 4 the launches did not leave both enclaves up before genesis (render a later T and
+# start again); 129 on HUP, 130 on INT, 141 on PIPE, 143 on TERM.
 # Works on bash 3.2.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -46,7 +52,8 @@ MIN_LEAD=900
 # pulled (2026-10-19), so this is about twice that.
 MIN_RELAUNCH_LEFT=120
 STATS_TIMEOUT=30     # seconds for one `docker stats --no-stream`
-RM_TIMEOUT=120       # seconds for one `kurtosis enclave rm -f` in the teardown
+RM_TIMEOUT=120       # seconds for one `kurtosis enclave rm -f` (the teardown and the fallback)
+INSPECT_TIMEOUT=30   # seconds for one `kurtosis enclave inspect` (the fallback)
 GRACE=10             # seconds between TERM and KILL when stopping background jobs
 IMAGE_RE='[A-Za-z0-9./_-]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}'
 
@@ -68,25 +75,28 @@ while (($# > 0)); do
   esac
 done
 { [[ $lead =~ ^[0-9]+$ ]] && ((lead >= MIN_LEAD)); } || { echo "--lead must be an integer >= $MIN_LEAD" >&2; usage; }
-for tool in kurtosis docker; do
+for tool in kurtosis docker python3; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool not found on PATH"
 done
 args_file="$here/gloas-genesis.yaml"
 [[ -f $args_file ]] || die "$args_file: no such file"
 
-# 0. A dedicated engine: the clean below removes every enclave on it.
-if ((clean_engine == 0)); then
+# no_enclaves: dies (exit 2) unless `kurtosis enclave ls` answers with its UUID header and no
+# enclave below it; an answer without the header (an empty one included) proves nothing.
+no_enclaves() {
+  local listing others
   listing=$(kurtosis enclave ls 2>/dev/null) || die "kurtosis enclave ls failed (is the engine running?)"
-  if [[ -n $listing ]]; then
-    [[ $listing == UUID* ]] ||
-      die "kurtosis enclave ls: no UUID header, cannot tell which enclaves the engine has; pass --clean-engine to clean it anyway"
-    others=$(printf '%s\n' "$listing" | awk 'NR > 1 && NF > 0 { print $2 }' | tr '\n' ' ')
-    others=${others% }
-    [[ -z $others ]] ||
-      die "the engine has other enclaves ($others); run-pair.sh needs an engine dedicated to this run:" \
-        "remove them, or pass --clean-engine to let kurtosis clean -a remove them"
-  fi
-fi
+  [[ $listing == UUID* ]] ||
+    die "kurtosis enclave ls: no UUID header, cannot tell which enclaves the engine has; pass --clean-engine to clean it anyway"
+  others=$(printf '%s\n' "$listing" | awk 'NR > 1 && NF > 0 { print $2 }' | tr '\n' ' ')
+  others=${others% }
+  [[ -z $others ]] ||
+    die "the engine has other enclaves ($others); run-pair.sh needs an engine dedicated to this run:" \
+      "remove them, or pass --clean-engine to let kurtosis clean -a remove them"
+}
+
+# 0. A dedicated engine, checked before the pulls (and again before the launches).
+if ((clean_engine == 0)); then no_enclaves; fi
 
 # 1. Pre-pull every pinned image.
 images=()
@@ -109,18 +119,55 @@ echo "rendered $args (genesis_time $T)"
 "${BASH:-bash}" "$root/scripts/check-kurtosis-pins.sh" "$logs" ||
   die "scripts/check-kurtosis-pins.sh $logs failed"
 
-# 3. A clean engine, then both launches.
-kurtosis clean -a >/dev/null || die "kurtosis clean -a failed"
+# 3. An engine still without enclaves (one may have been created during the pulls, render and
+# lint), or with --clean-engine only, a cleaned one; then both launches.
+if ((clean_engine)); then
+  kurtosis clean -a >/dev/null || die "kurtosis clean -a failed"
+else
+  no_enclaves
+fi
 
-# Every long step (a launch, docker stats, the wait for genesis, the check) runs in the
-# background, so a signal reaches its trap within a second rather than after the step; bg_pids
-# holds the ones running.
+# Every long step (a launch, docker stats, an enclave rm or inspect, the wait for genesis, the
+# check) runs in the background, as the leader of its own process group (in_group), so a signal
+# reaches its trap within a second rather than after the step, and stop reaches every process the
+# step started; bg_pids holds the ones running.
 bg_pids=()
+# in_group <command...>: execs the command as the leader of a new process group (its pid is the
+# group id); it replaces the shell it runs in, so only ever as a background job. SIGPIPE and SIGXFSZ go back to default first: python ignores them, and an ignored
+# signal stays ignored across the exec.
+in_group() {
+  exec python3 -I -c '
+import os, signal, sys
+for sig in (signal.SIGPIPE, signal.SIGXFSZ):
+    signal.signal(sig, signal.SIG_DFL)
+os.setpgid(0, 0)
+try:
+    os.execvp(sys.argv[1], sys.argv[1:])
+except OSError as err:
+    print(f"run-pair.sh: {sys.argv[1]}: {err.strerror}", file=sys.stderr)
+    os._exit(127)' "$@"
+}
 # running <pid>: the process exists and is not a zombie.
 running() {
   local stat
   stat=$(ps -o stat= -p "$1" 2>/dev/null || true)
   [[ -n $stat && $stat != Z* ]]
+}
+# any_running <pid...>: 0 while one of the processes runs.
+any_running() {
+  local pid
+  for pid in "$@"; do if running "$pid"; then return 0; fi; done
+  return 1
+}
+# group_running <pgid>: a process of the group (a zombie aside) still runs.
+group_running() {
+  ps -A -o pgid= -o stat= 2>/dev/null | awk -v g="$1" '$1 == g && $2 !~ /^Z/ { found = 1 } END { exit !found }'
+}
+# live <pid...>: 0 while one of the processes, or one of the process group it leads, runs.
+live() {
+  local pid
+  for pid in "$@"; do if running "$pid" || group_running "$pid"; then return 0; fi; done
+  return 1
 }
 # descendants <pid>: every descendant of the process, deepest first.
 descendants() {
@@ -130,40 +177,48 @@ descendants() {
     echo "$child"
   done
 }
-# wait_until <deadline> <pid...>: 0 once none of the processes runs, 1 at the deadline (epoch s).
-wait_until() {
-  local deadline=$1 pid busy
-  shift
-  while :; do
-    busy=0
-    for pid in "$@"; do if running "$pid"; then busy=1; fi; done
-    ((busy)) || return 0
+# wait_while <deadline> <probe> <pid...>: 0 once `<probe> <pid...>` fails (nothing of it runs), 1
+# at the deadline (epoch s).
+wait_while() {
+  local deadline=$1 probe=$2
+  shift 2
+  while "$probe" "$@"; do
     (( $(now) < deadline )) || return 1
     sleep 1
   done
 }
-# stop <pid...>: TERM to each process and every descendant, KILL to whatever of them still runs
-# GRACE seconds later (a descendant that ignores TERM included), then waits for the processes.
+# signal_all <signal> <pid...> -- <pid...>: the signal to the process group of each job (before
+# the --; one the job has not made yet, right after its start, is skipped) and to each process.
+signal_all() {
+  local sig=$1 pid
+  shift
+  while (($# > 0)) && [[ $1 != -- ]]; do kill "-$sig" -- "-$1" 2>/dev/null || true; shift; done
+  shift
+  for pid in "$@"; do kill "-$sig" "$pid" 2>/dev/null || true; done
+}
+# stop <pid...>: TERM to each background job's process group, to the job and to every descendant
+# (one that left the group included), KILL to whatever of them still runs GRACE seconds later (a
+# process that ignores TERM, or that left the process tree, included), then waits for the jobs.
 stop() {
   local pid p all=()
+  (($# > 0)) || return 0
   for pid in "$@"; do
     for p in $(descendants "$pid") "$pid"; do all+=("$p"); done
   done
-  ((${#all[@]} > 0)) || return 0
-  for pid in "${all[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
-  wait_until $(( $(now) + GRACE )) "${all[@]}" ||
-    for pid in "${all[@]}"; do kill -KILL "$pid" 2>/dev/null || true; done
+  signal_all TERM "$@" -- "${all[@]}"
+  wait_while $(( $(now) + GRACE )) live "${all[@]}" || signal_all KILL "$@" -- "${all[@]}"
   for pid in "$@"; do wait "$pid" 2>/dev/null || true; done
 }
-# bounded <seconds> <command...>: runs the command in the background for at most that long; its
-# exit code, or 124 once it is stopped at the limit.
+# bounded <seconds> <file> <command...>: runs the command in the background, its stdout and stderr
+# to the file, for at most that long; its exit code, or 124 once it is stopped at the limit. Only
+# the command's output goes to the file: a trap that runs meanwhile still writes to the script's.
 bounded() {
-  local limit=$1 pid rc=0
-  shift
-  "$@" &
+  local limit=$1 file=$2 pid rc=0
+  shift 2
+  in_group "$@" > "$file" 2>&1 &
   pid=$!
   bg_pids+=("$pid")
-  if wait_until $(( $(now) + limit )) "$pid"; then
+  if wait_while $(( $(now) + limit )) any_running "$pid"; then
     wait "$pid" || rc=$?
   else
     stop "$pid"
@@ -174,7 +229,7 @@ bounded() {
 }
 # snapshot <name>: `docker stats --no-stream` into $logs/<name>.txt; never fatal.
 snapshot() {
-  bounded "$STATS_TIMEOUT" docker stats --no-stream > "$logs/$1.txt" 2>&1 ||
+  bounded "$STATS_TIMEOUT" "$logs/$1.txt" docker stats --no-stream ||
     echo "warning: docker stats failed or timed out (see $logs/$1.txt)" >&2
 }
 # say <text>: a teardown message on stdout. When stdout is gone (a closed pipe or terminal), it
@@ -192,14 +247,16 @@ warn() {
   echo "$*" >&2 || echo >/dev/null
 }
 torn_down=0
-# teardown (the EXIT trap): stops the background jobs, removes both enclaves, then exits with the
-# run's exit code (2 if only the teardown failed). It ignores further signals and write errors,
-# and runs every step even when an earlier one fails.
+# teardown <exit code> (the EXIT trap, handed the run's $?): stops the background jobs, removes
+# both enclaves, then exits with the run's exit code (2 if only the teardown failed). Its first
+# statement ignores further signals (a signal before it would run an `exit` inside the teardown and
+# skip the removals); it ignores write errors too, and runs every step even when an earlier one
+# fails.
 # shellcheck disable=SC2329 # invoked only by the EXIT trap
 teardown() {
-  local rc=$? e failed=0
-  set +e
   trap '' INT TERM HUP PIPE
+  local rc=$1 e failed=0
+  set +e
   ((torn_down == 0)) || return 0
   torn_down=1
   # The first message comes before any $(...): it also finds out whether stdout still works.
@@ -214,7 +271,7 @@ teardown() {
   stop ${bg_pids[@]+"${bg_pids[@]}"}
   bg_pids=()
   for e in "${ENCLAVES[@]}"; do
-    if ! bounded "$RM_TIMEOUT" kurtosis enclave rm -f "$e" >/dev/null 2>&1; then
+    if ! bounded "$RM_TIMEOUT" /dev/null kurtosis enclave rm -f "$e"; then
       warn "warning: kurtosis enclave rm -f $e failed or timed out"
       failed=1
     fi
@@ -226,7 +283,7 @@ teardown() {
   say "run-pair: exit $rc (logs in $logs)"
   exit "$rc"
 }
-trap teardown EXIT
+trap 'teardown $?' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
@@ -241,10 +298,10 @@ launch() {
   local started=("$@") still=()
   bg_pids=()
   for e in "$@"; do
-    kurtosis run --enclave "$e" "$PKG" --args-file "$args" > "$logs/$e-run.log" 2>&1 &
+    in_group kurtosis run --enclave "$e" "$PKG" --args-file "$args" > "$logs/$e-run.log" 2>&1 &
     bg_pids+=($!)
   done
-  if ! wait_until "$T" "${bg_pids[@]}"; then
+  if ! wait_while "$T" any_running "${bg_pids[@]}"; then
     for ((i = 0; i < ${#bg_pids[@]}; i++)); do
       if running "${bg_pids[i]}"; then still+=("${started[i]}"); fi
     done
@@ -285,14 +342,19 @@ relaunch_margin() {
 }
 # relaunch <enclave...>: --sequential-fallback; removes each failed enclave and launches it alone,
 # one after the other, each only with MIN_RELAUNCH_LEFT seconds still before T (checked before the
-# removal and again just before the launch).
+# removal and again just before the launch). The removal and the check that the enclave is gone
+# are bounded like the teardown's, so neither can hang the run or hold off a signal's trap.
 relaunch() {
-  local e left
+  local e left rc
   for e in "$@"; do
     left=$(relaunch_margin "$e") || exit 4
-    kurtosis enclave rm -f "$e" >/dev/null 2>&1 || true
-    if kurtosis enclave inspect "$e" >/dev/null 2>&1; then
+    bounded "$RM_TIMEOUT" /dev/null kurtosis enclave rm -f "$e" || true
+    rc=0
+    bounded "$INSPECT_TIMEOUT" /dev/null kurtosis enclave inspect "$e" || rc=$?
+    if ((rc == 0)); then
       die "$e still exists after kurtosis enclave rm -f; not relaunching into it"
+    elif ((rc == 124)); then
+      die "kurtosis enclave inspect $e timed out; cannot tell whether it is gone, not relaunching into it"
     fi
     mv "$logs/$e-run.log" "$logs/$e-run-concurrent.log" || die "mv $logs/$e-run.log failed"
     left=$(relaunch_margin "$e") || exit 4
@@ -329,22 +391,23 @@ snapshot stats-up
 while (( $(now) < T )); do
   left=$(( T - $(now) ))
   echo "waiting $left s for genesis"
-  sleep "$left" &
+  in_group sleep "$left" &
   bg_pids=($!)
   wait "${bg_pids[0]}"
   bg_pids=()
 done
 # The check's own exit code, not tee's: a check.log that cannot be written turns only a PASS
 # into a 2 (no record of it), never a FAIL or DIAGNOSTIC into something else.
-(
-  set +e +o pipefail
-  "${BASH:-bash}" "$here/check-devnet.sh" --pair --record "$logs/genesis.json" "${ENCLAVES[@]}" 2>&1 |
-    tee "$logs/check.log"
+# shellcheck disable=SC2016 # expanded by the inner bash, from its arguments
+in_group "${BASH:-bash}" -c '
+  check=$1 log=$2
+  shift 2
+  "$BASH" "$check" "$@" 2>&1 | tee "$log"
   codes=("${PIPESTATUS[@]}")
   if ((codes[0] != 0)); then exit "${codes[0]}"; fi
-  if ((codes[1] != 0)); then echo "ERROR: tee $logs/check.log failed" >&2; exit 2; fi
-  exit 0
-) &
+  if ((codes[1] != 0)); then echo "ERROR: tee $log failed" >&2; exit 2; fi
+  exit 0' run-pair-check "$here/check-devnet.sh" "$logs/check.log" \
+  --pair --record "$logs/genesis.json" "${ENCLAVES[@]}" &
 bg_pids=($!)
 rc=0
 wait "${bg_pids[0]}" || rc=$?

@@ -257,25 +257,31 @@ one genesis, and `--reference` checks both enclaves against an earlier record. T
 
 The concurrent pair from a clean engine (criteria 1, 2 and 4 of the issue) is one script,
 `testing/kurtosis/run-pair.sh`, run from anywhere in the checkout. It needs `kurtosis` (with a
-running engine), `docker` and what `check-devnet.sh` and `check-kurtosis-pins.sh` need.
+running engine), `docker`, `python3` and what `check-devnet.sh` and `check-kurtosis-pins.sh`
+need.
 
-**The engine must be dedicated to this run.** The script starts with `kurtosis clean -a`, which
-removes **every** enclave on the engine, so it first lists them (`kurtosis enclave ls`) and
-refuses to start (exit 2, naming them) if there is any. Remove them yourself, or pass
-`--clean-engine` to let `kurtosis clean -a` remove them. Each step fails closed:
+**The engine must be dedicated to this run.** Without `--clean-engine` the script never cleans
+the engine: it lists the enclaves (`kurtosis enclave ls`) before the pulls and again just before
+the launches, and refuses to go on (exit 2, naming them) if there is any, so an enclave created
+in between is refused too, never removed. An answer without the `UUID` header line, an empty one
+included, is refused as well. Remove the enclaves yourself, or pass `--clean-engine`: then the
+script skips both listings and runs `kurtosis clean -a`, which removes **every** enclave on the
+engine, just before the launches. Each step fails closed:
 
 1. **Pre-pull and render** ("Reproducible genesis"): any failed pull, render check or pin lint,
    or a logs directory that cannot be written, stops the run before anything is launched
    (exit 2).
-2. **Launches.** `kurtosis clean -a`, then both `kurtosis run`s at once, each logged to
-   `target/kurtosis/pair-$T/<enclave>-run.log`. Both must exit 0 (else exit 2, naming the failed
-   ones), and both must be up before T (else exit 4: render a later T and start again). A
-   launch still running at T is stopped (exit 4).
+2. **Launches.** The second listing (or with `--clean-engine`, `kurtosis clean -a`), then both
+   `kurtosis run`s at once, each logged to `target/kurtosis/pair-$T/<enclave>-run.log`. Both
+   must exit 0 (else exit 2, naming the failed ones), and both must be up before T (else exit 4:
+   render a later T and start again). A launch still running at T is stopped (exit 4).
 3. **Fallback** (`--sequential-fallback`, off by default): if a concurrent launch fails, each
-   failed enclave is removed, confirmed gone, and launched again alone, one after the other
-   (the failed log is kept as `<enclave>-run-concurrent.log`). A relaunch starts only with at
-   least 120 s left before T, checked before the removal and again just before the launch, and
-   both enclaves must still be up before T.
+   failed enclave is removed (`kurtosis enclave rm -f`, bounded to 120 s), confirmed gone
+   (`kurtosis enclave inspect`, bounded to 30 s; one that times out stops the run, exit 2), and
+   launched again alone, one after the other (the failed log is kept as
+   `<enclave>-run-concurrent.log`). A relaunch starts only with at least 120 s left before T,
+   checked before the removal and again just before the launch, and both enclaves must still be
+   up before T.
 4. **Check.** After T, `check-devnet.sh --pair --record target/kurtosis/pair-$T/genesis.json
    ethswarm-gloas-a ethswarm-gloas-b`, shown and kept in `check.log`. The check's own exit code
    (0 pair PASS, 1 FAIL, 2 setup error, 3 DIAGNOSTIC) is the script's exit code; a `check.log`
@@ -285,12 +291,13 @@ refuses to start (exit 2, naming them) if there is any. Remove them yourself, or
 5. **Teardown.** An EXIT/INT/TERM/HUP/PIPE trap, set before the launches, removes the pair on
    every exit, an interrupt while waiting for genesis or finality and a closed terminal or
    output pipe included (exit 130 on INT, 143 on TERM, 129 on HUP, 141 on PIPE). It stops the
-   background jobs and their descendants (TERM, then KILL 10 s later), then runs
-   `kurtosis enclave rm -f` for each enclave, each bounded to 120 s and each run even if an
-   earlier step failed. It removes nothing else: no `kurtosis clean -a` at the end. A failed
-   teardown after a PASS exits 2. `--keep-on-pass` leaves the pair running after a PASS only
-   (exit 0), for "Export blocks and roots", and prints the teardown commands; any other exit
-   still tears down.
+   background jobs, each started as the leader of its own process group: TERM to the group and
+   to every descendant, then KILL 10 s later to whatever still runs, a process that ignores TERM
+   or that left the process tree included. Then it runs `kurtosis enclave rm -f` for each
+   enclave, each bounded to 120 s and each run even if an earlier step failed. It removes
+   nothing else: no `kurtosis clean -a` at the end. A failed teardown after a PASS exits 2.
+   `--keep-on-pass` leaves the pair running after a PASS only (exit 0), for "Export blocks and
+   roots", and prints the teardown commands; any other exit still tears down.
 
 `docker stats --no-stream` (bounded to 30 s, never fatal) is kept for CI sizing as
 `stats-up.txt` (both enclaves up) and `stats-checked.txt` (after the check), and the script
