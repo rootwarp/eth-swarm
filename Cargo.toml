@@ -21,6 +21,7 @@ members = [
     "crates/cl-discv5",
     "crates/cl-sync",
     "crates/cl-api",
+    "crates/testkit",
 ]
 
 [workspace.package]

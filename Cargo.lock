@@ -5562,6 +5562,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "testkit"
+version = "0.1.0"
+dependencies = [
+ "consensus-types",
+ "ethereum_ssz",
+ "hex",
+ "network-config",
+ "p2p-wire",
+ "serde",
+ "sha2 0.10.9",
+ "snap",
+ "ssz_types",
+ "tempfile",
+ "testkit",
+ "thiserror 2.0.21",
+ "toml 0.8.23",
+ "tree_hash",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"

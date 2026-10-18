@@ -1,0 +1,38 @@
+[package]
+name = "testkit"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Capture and replay tooling for live-network runs: the block/column archiver with a verified sha256 manifest. Never links cl-sync."
+
+[[bin]]
+name = "archiver"
+path = "src/bin/archiver.rs"
+
+[features]
+# For this crate's tests and its users' tests: write-fault injection (`archive::Fault`: an
+# interrupted write, a full disk) and payload fixtures (`archive::fixtures`).
+test-support = ["p2p-wire/testkit", "dep:ethereum_ssz", "dep:ssz_types"]
+
+[dependencies]
+consensus-types = { path = "../consensus-types" }
+network-config = { path = "../network-config" }
+# `max_compressed_len`, the gossip snappy bound.
+p2p-wire = { path = "../p2p-wire" }
+tree_hash.workspace = true
+# Gossip payloads are snappy block-compressed SSZ; the same crate p2p-wire frames req/resp with.
+snap = "1"
+sha2 = "0.10"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+# Fixture encoding (feature `test-support`).
+ethereum_ssz = { workspace = true, optional = true }
+ssz_types = { workspace = true, optional = true }
+
+[dev-dependencies]
+testkit = { path = ".", features = ["test-support"] }
+tempfile = "3"
