@@ -120,11 +120,21 @@ pub(super) struct Center {
     pub peer: PeerId,
     pub addr: Multiaddr,
     delivered: Arc<Mutex<Vec<Delivered>>>,
-    topics: mpsc::UnboundedSender<oneshot::Sender<PeerTopics>>,
+    queries: mpsc::UnboundedSender<Query>,
 }
 
 /// Each peer gossipsub knows, with the topics it holds for it.
 type PeerTopics = Vec<(PeerId, Vec<String>)>;
+
+/// What the centre's task is asked, answered from its swarm.
+enum Query {
+    /// The topics gossipsub holds for each peer.
+    Topics(oneshot::Sender<PeerTopics>),
+    /// Subscribe these topics; how many were new.
+    Subscribe(Vec<GossipTopic>, oneshot::Sender<usize>),
+    /// The mesh of one topic.
+    Mesh(GossipTopic, oneshot::Sender<Vec<PeerId>>),
+}
 
 /// What gossipsub holds about each peer's subscriptions.
 fn peer_topics<D, F>(gossipsub: &gossipsub::Behaviour<D, F>) -> PeerTopics
@@ -145,13 +155,27 @@ impl Center {
 
     /// The topics the centre holds for `peer` (empty if it holds none, or no such peer).
     pub(super) async fn topics_of(&self, peer: PeerId) -> Vec<String> {
-        let (tx, rx) = oneshot::channel();
-        self.topics.unbounded_send(tx).unwrap();
-        let all = rx.await.unwrap();
+        let all = self.ask(Query::Topics).await;
         all.into_iter()
             .find(|(p, _)| *p == peer)
             .map(|(_, t)| t)
             .unwrap_or_default()
+    }
+
+    /// Subscribes `topics` on the centre (the probe only); returns how many were new.
+    pub(super) async fn subscribe(&self, topics: Vec<GossipTopic>) -> usize {
+        self.ask(|reply| Query::Subscribe(topics, reply)).await
+    }
+
+    /// The centre's mesh peers for `topic`.
+    pub(super) async fn mesh(&self, topic: GossipTopic) -> Vec<PeerId> {
+        self.ask(|reply| Query::Mesh(topic, reply)).await
+    }
+
+    async fn ask<T>(&self, query: impl FnOnce(oneshot::Sender<T>) -> Query) -> T {
+        let (tx, rx) = oneshot::channel();
+        self.queries.unbounded_send(query(tx)).unwrap();
+        rx.await.unwrap()
     }
 
     pub(super) fn has(&self, id: &MessageId) -> bool {
@@ -196,15 +220,23 @@ impl Probe {
         );
         let swarm =
             build_swarm_with_gossip(Keypair::generate_secp256k1(), &cfg, req_resp, gossip).unwrap();
-        let topics = |swarm: &Swarm<crate::behaviour::Behaviour>| {
-            swarm
-                .behaviour()
-                .gossipsub
-                .as_ref()
-                .map(|g| peer_topics(g.gossipsub()))
-                .unwrap_or_default()
+        let answer = |swarm: &mut Swarm<crate::behaviour::Behaviour>, query| {
+            let gossip = swarm.behaviour_mut().gossipsub.as_mut().unwrap();
+            // A reply nobody waits for any more is dropped.
+            match query {
+                Query::Topics(reply) => {
+                    let _ = reply.send(peer_topics(gossip.gossipsub()));
+                }
+                Query::Subscribe(topics, reply) => {
+                    let _ = reply.send(gossip.subscribe(&topics).unwrap());
+                }
+                Query::Mesh(topic, reply) => {
+                    let hash = super::config::topic_hash(&topic);
+                    let _ = reply.send(gossip.gossipsub().mesh_peers(&hash).copied().collect());
+                }
+            }
         };
-        let center = spawn_center(swarm, topics, |event| match event {
+        let center = spawn_center(swarm, answer, |event| match event {
             BehaviourEvent::Gossipsub(IgnoreAllEvent::Ignored {
                 source,
                 message_id,
@@ -237,9 +269,15 @@ async fn spawn_forwarder() -> (Center, Registry) {
     let mut registry = Registry::default();
     let mut swarm = gossip_swarm(None, &mut registry);
     swarm.listen_on(loopback()).unwrap();
-    let topics =
-        |swarm: &Swarm<gossipsub::Behaviour<WireTransform>>| peer_topics(swarm.behaviour());
-    let center = spawn_center(swarm, topics, |event| match event {
+    let answer = |swarm: &mut Swarm<gossipsub::Behaviour<WireTransform>>, query| match query {
+        Query::Topics(reply) => {
+            let _ = reply.send(peer_topics(swarm.behaviour()));
+        }
+        Query::Subscribe(..) | Query::Mesh(..) => {
+            unreachable!("the forwarder is asked for topics only")
+        }
+    };
+    let center = spawn_center(swarm, answer, |event| match event {
         gossipsub::Event::Message {
             propagation_source,
             message_id,
@@ -259,7 +297,7 @@ async fn spawn_forwarder() -> (Center, Registry) {
 /// `delivered` maps.
 async fn spawn_center<B>(
     mut swarm: Swarm<B>,
-    topics: fn(&Swarm<B>) -> PeerTopics,
+    answer: fn(&mut Swarm<B>, Query),
     delivered: fn(B::ToSwarm) -> Option<Delivered>,
 ) -> Center
 where
@@ -273,14 +311,12 @@ where
     let peer = *swarm.local_peer_id();
     let log = Arc::new(Mutex::new(Vec::new()));
     let sink = log.clone();
-    let (topics_tx, mut queries) = mpsc::unbounded::<oneshot::Sender<PeerTopics>>();
+    let (queries_tx, mut queries) = mpsc::unbounded::<Query>();
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 query = queries.next() => match query {
-                    Some(reply) => {
-                        let _ = reply.send(topics(&swarm));
-                    }
+                    Some(query) => answer(&mut swarm, query),
                     None => return,
                 },
                 event = swarm.select_next_some() => {
@@ -297,7 +333,7 @@ where
         peer,
         addr,
         delivered: log,
-        topics: topics_tx,
+        queries: queries_tx,
     }
 }
 
@@ -1353,7 +1389,8 @@ async fn off_list_topics_get_no_metric_labels() {
 }
 
 /// Every topic of two fork digests, by their real names, in one RPC (a supernode connecting
-/// ahead of a fork): the codec takes the RPC whole and our subscription is kept.
+/// ahead of a fork): the codec takes the RPC whole, and what is kept is our subscription and
+/// the column subnets of our fork digest, which the whitelist holds ahead of custody.
 #[tokio::test]
 async fn a_full_two_fork_announcement_is_taken() {
     use super::config::MAX_SUBSCRIPTIONS_PER_REQUEST;
@@ -1398,10 +1435,53 @@ async fn a_full_two_fork_announcement_is_taken() {
     );
     scripted.send(&announcement).await;
     handled(center, &mut scripted, "announced").await;
-    assert_eq!(
-        center.topics_of(scripted.peer).await,
-        vec![topic().to_string()]
+    let mut kept: Vec<String> = std::iter::once(topic().to_string())
+        .chain((0..128).map(|i| format!("/eth2/abcd0012/data_column_sidecar_{i}/ssz_snappy")))
+        .collect();
+    kept.sort();
+    assert_eq!(center.topics_of(scripted.peer).await, kept);
+}
+
+/// A peer announces a column subnet before the probe subscribes it, as when cl-chain names the
+/// custody subnets after peers have connected. The announcement is kept, and once the probe
+/// subscribes the subnet the peer is in its mesh and its messages there are delivered, on the
+/// same connection. Until then a message on that subnet is refused before it is decoded.
+#[tokio::test]
+async fn a_column_subnet_announced_before_we_subscribe_it_meshes() {
+    let probe = Probe::spawn(4).await;
+    let center = &probe.center;
+    let mut scripted = Scripted::connect(&center.addr).await;
+    let column = GossipTopic::new(
+        topic().fork_digest,
+        GossipKind::DataColumnSidecar { subnet_id: 5 },
     );
+    let name = column.to_string();
+    let message = |i: usize| {
+        let ssz = payload("column", i, 100);
+        let data = SnappyTransform::new(caps()).outbound(&name, &ssz).unwrap();
+        let id = MessageId::new(&p2p_wire::gossip::message_id_of_decompressed(&name, &ssz));
+        (rpc::publish(&name, [&data[..]]), id)
+    };
+
+    let block = topic().to_string();
+    scripted
+        .send(&rpc::subscribe_all([block.as_str(), name.as_str()]))
+        .await;
+    let (early, early_id) = message(0);
+    scripted.send(&early).await;
+    handled(center, &mut scripted, "announced").await;
+    let mut announced = vec![block, name.clone()];
+    announced.sort();
+    assert_eq!(center.topics_of(scripted.peer).await, announced);
+    assert!(!center.has(&early_id), "an unsubscribed subnet was decoded");
+    assert!(center.mesh(column).await.is_empty());
+
+    assert_eq!(center.subscribe(vec![column]).await, 1);
+    assert_eq!(center.mesh(column).await, vec![scripted.peer]);
+    let (late, late_id) = message(1);
+    scripted.send(&late).await;
+    handled(center, &mut scripted, "subscribed").await;
+    assert!(center.has(&late_id), "a message on the subscribed subnet");
 }
 
 /// The probe uses mesh push only: it answers no IHAVE with an IWANT, and still counts what its

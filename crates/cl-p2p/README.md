@@ -121,10 +121,13 @@ to the topic's Gloas SSZ cap before anything is decompressed.
 
 What this crate bounds in the probe's gossipsub:
 
-- **Subscriptions**: per peer, only subscriptions to the topics we subscribe (a whitelist), at
-  most that many plus 4; an RPC with more than 418 subscriptions (every topic of two fork
-  digests: a supernode's first RPC lists 128 column subnets alone) has its subscriptions
-  ignored.
+- **Subscriptions**: per peer, only subscriptions to whitelisted topics, at most 418 plus 4;
+  an RPC with more than 418 subscriptions (every topic of two fork digests: a supernode's
+  first RPC lists 128 column subnets alone) has its subscriptions ignored. The whitelist is
+  the topics we subscribe and, from the start, all 128 `data_column_sidecar_{subnet_id}`
+  subnets of each configured fork digest, so a custody subnet subscribed after peers announced
+  it still meshes with them without a reconnect. It stays within 418 topics: two digests'
+  configured topics plus their 2 × 128 column subnets are a subset of the two digests' topics.
 - **Control-message size**: 46,898 bytes of subscriptions and control per RPC, derived from
   the two-fork topic set (418 entries for the longest topic string, 63 bytes) plus gossipsub's
   default 16 KiB for control.

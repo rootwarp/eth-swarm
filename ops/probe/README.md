@@ -213,7 +213,9 @@ reports IGNORE for every message, so it forwards none.
 
 The file records its bounds and byte budget, and cl-p2p's tests check them against it: 11
 topics per digest (22 under two) within the 418 subscriptions one RPC may carry, a
-subscription whitelist that starts as these topics, every name a Gloas topic name so the
+subscription whitelist that starts as these topics plus all 128
+`data_column_sidecar_{subnet_id}` subnets of each fork digest (270 topics under two, also
+within 418), every name a Gloas topic name so the
 control-message size (46,898 bytes, computed for the two-fork set of every topic) still fits
 without a recompute, and each topic's decompressed cap on Sepolia (largest message 10 MiB, one
 message of every topic 21,362,195 bytes). Set the attestation and column subnets to the ones

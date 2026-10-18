@@ -11,7 +11,9 @@
 #
 # Bounds (cl-p2p gossip::config), checked by cl-p2p's tests against this file:
 #   - 11 topics per fork digest, 22 under two: within the 418 subscriptions one RPC may
-#     carry, and the subscription whitelist starts as exactly these;
+#     carry; the subscription whitelist starts as these plus every data_column_sidecar
+#     subnet (all 128) of each fork digest, 2 x (7 + 128) = 270 topics under two, also
+#     within 418;
 #   - every name is a Gloas topic name, at most 37 bytes, so the control-message size
 #     (46,898 bytes) still fits; it is computed for the two-fork set of every topic, which
 #     this list is a subset of, so nothing is recomputed.

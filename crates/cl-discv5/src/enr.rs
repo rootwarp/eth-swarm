@@ -120,8 +120,13 @@ pub fn set_cgc(
     if value_eq(enr, CGC_KEY, &value) {
         return Ok(false);
     }
-    enr.insert(CGC_KEY, &value, key)
+    // `insert` can fail after it has bumped `seq` and re-signed (a longer `seq` encoding past
+    // 300 bytes), so the change is made on a copy and kept only once it succeeded.
+    let mut updated = enr.clone();
+    updated
+        .insert(CGC_KEY, &value, key)
         .map_err(|e| BuildError::Enr(e.to_string()))?;
+    *enr = updated;
     Ok(true)
 }
 
@@ -408,6 +413,56 @@ mod tests {
             (enr.seq(), EnrFields::read(&enr).unwrap().cgc),
             (seq + 1, Some(4))
         );
+    }
+
+    /// A 300-byte record at `seq` 127 whose `cgc` is 4: re-signing it at `seq` 128 (two RLP
+    /// bytes, not one) makes it 301 bytes, over the limit, although the record with the new
+    /// `cgc` and the old `seq` fits.
+    fn record_at_the_seq_boundary(key: &CombinedKey) -> Enr {
+        // The builder keeps a margin under 300 bytes, so the last bytes go in by `insert`,
+        // which takes `seq` from 126 to 127.
+        let base = Enr::builder()
+            .seq(126)
+            .add_value(CGC_KEY, &Bytes::from(encode_cgc(4)))
+            .build(key)
+            .unwrap();
+        for pad in 0..300 {
+            let mut enr = base.clone();
+            if enr
+                .insert("pad", &Bytes::from(vec![0x5a; pad]), key)
+                .is_ok()
+                && enr.size() == 300
+            {
+                return enr;
+            }
+        }
+        panic!("no padding gives a 300-byte record");
+    }
+
+    /// A re-signed record that no longer fits is refused, and the record is left exactly as it
+    /// was: same `seq`, same `cgc`, still verifying. A retry sees the change again rather than
+    /// reading it as already made.
+    #[test]
+    fn set_cgc_past_the_size_limit_leaves_the_record_unchanged() {
+        let key = CombinedKey::generate_secp256k1();
+        let mut enr = record_at_the_seq_boundary(&key);
+        let before = enr.clone();
+        assert_eq!(enr.seq(), 127);
+
+        assert!(matches!(
+            set_cgc(&mut enr, &key, 8),
+            Err(BuildError::Enr(_))
+        ));
+        assert_eq!(enr, before);
+        assert_eq!(enr.size(), 300);
+        assert!(enr.verify());
+        assert_eq!(raw(&enr, "cgc"), vec![0x04]);
+
+        assert!(matches!(
+            set_cgc(&mut enr, &key, 8),
+            Err(BuildError::Enr(_))
+        ));
+        assert_eq!(enr, before);
     }
 
     #[test]

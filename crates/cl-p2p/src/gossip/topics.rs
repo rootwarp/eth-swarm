@@ -181,8 +181,13 @@ mod tests {
         let config = GossipConfig::new(topics.clone(), sepolia_caps(), seen_ttl(12_000, 32));
         let set = config.topic_set().unwrap();
         assert_eq!(set.len(), topics.len());
-        assert!(set.len() <= MAX_TOPICS);
-        let mut filter = config.subscription_filter(&set);
+        // The whitelist adds every column subnet of both digests; the 4 listed ones are among
+        // them.
+        let whitelist = config.whitelist().unwrap();
+        assert_eq!(whitelist.len(), 2 * (list.kinds().len() - columns + 128));
+        assert_eq!(whitelist.len(), 270);
+        assert!(whitelist.len() <= MAX_TOPICS);
+        let mut filter = config.subscription_filter(&whitelist);
         assert_eq!(filter.max_subscriptions_per_request, 418);
         assert_eq!(
             filter.max_subscribed_topics,
@@ -192,6 +197,9 @@ mod tests {
             let hash = TopicHash::from_raw(topic.to_string());
             assert!(filter.can_subscribe(&hash), "{topic}");
         }
+        assert!(filter.can_subscribe(&TopicHash::from_raw(
+            "/eth2/aabbcc02/data_column_sidecar_5/ssz_snappy"
+        )));
         for other in [
             "/eth2/aabbcc01/voluntary_exit/ssz_snappy",
             "/eth2/aabbcc01/beacon_attestation_63/ssz_snappy",

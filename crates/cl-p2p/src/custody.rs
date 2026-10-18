@@ -300,7 +300,8 @@ mod tests {
         }
     }
 
-    /// Past the topic bound nothing is subscribed, and the set stays as it was.
+    /// Past the topic bound nothing is subscribed, and the set stays as it was. The bound is
+    /// the whitelist's: `beacon_block` and the 128 column subnets of its fork digest.
     #[test]
     fn subscriptions_past_the_topic_bound_are_refused_whole() {
         let mut gossip = gossip();
@@ -315,7 +316,7 @@ mod tests {
         assert!(matches!(
             gossip.subscribe(&many),
             Err(GossipError::TooManyTopics {
-                have: 1,
+                have: 129,
                 adding: 418,
                 max: 418
             })

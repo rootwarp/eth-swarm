@@ -37,7 +37,7 @@ use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime};
 
 /// The probe's gossipsub: the bounded snappy transform, and peers' subscriptions held only for
-/// our own topics.
+/// the whitelist (our topics and the column subnets of their fork digests).
 pub type ProbeGossipsub =
     gossipsub::Behaviour<super::WireTransform, super::config::ProbeSubscriptionFilter>;
 
@@ -174,8 +174,10 @@ pub enum IgnoreAllEvent {
 /// ```
 pub struct IgnoreAll<G = ProbeGossipsub> {
     inner: G,
-    /// Our topics: the set gossipsub's filter and transform read.
+    /// Our subscribed topics: the set gossipsub's transform reads.
     topics: TopicSet,
+    /// The whitelist gossipsub's subscription filter reads: a superset of `topics`.
+    whitelist: TopicSet,
     tap: Option<CaptureTap>,
     ignored: u64,
 }
@@ -196,10 +198,11 @@ impl IgnoreAll<ProbeGossipsub> {
     /// [`GossipError`] if the configuration is refused or a topic cannot be subscribed.
     pub fn new(cfg: &GossipConfig, registry: &mut Registry) -> Result<Self, GossipError> {
         let topics = cfg.topic_set()?;
+        let whitelist = cfg.whitelist()?;
         let mut gossipsub = gossipsub::Behaviour::new_with_subscription_filter_and_transform(
             MessageAuthenticity::Anonymous,
             cfg.gossipsub()?,
-            cfg.subscription_filter(&topics),
+            cfg.subscription_filter(&whitelist),
             cfg.transform(&topics),
         )
         .map_err(GossipError::Behaviour)?
@@ -209,23 +212,33 @@ impl IgnoreAll<ProbeGossipsub> {
         }
         let mut ignore_all = Self::with_inner(gossipsub);
         ignore_all.topics = topics;
+        ignore_all.whitelist = whitelist;
         Ok(ignore_all)
     }
 
     /// Subscribes `topics` on top of the ones subscribed so far (the custody column subnets
     /// cl-chain asks for, [`crate::custody`]); returns how many were not subscribed yet.
     ///
-    /// They join the shared [`TopicSet`] first, so the filter keeps peers' subscriptions to
-    /// them and the transform decodes their messages from the moment gossipsub announces them;
-    /// IGNORE-all applies to them like to every topic. A peer's subscription that arrived
-    /// before ours was not kept; the mesh still forms from the peer's GRAFT once it sees ours.
+    /// They join the whitelist and then the subscribed [`TopicSet`] first, so the transform
+    /// decodes their messages from the moment gossipsub announces them; IGNORE-all applies to
+    /// them like to every topic. gossipsub keeps a peer's subscription only to a whitelisted
+    /// topic, and meshes (by our GRAFT or the peer's) only with a peer it holds subscribed. The
+    /// whitelist holds every column subnet of the configured fork digests from the start
+    /// ([`GossipConfig::whitelist`]), so peers that announced one before we subscribe it join
+    /// its mesh on the same connection. A topic outside the whitelist until now (a column
+    /// subnet under another fork digest) has its peers' subscriptions kept only from here on:
+    /// a peer that announced it earlier joins the mesh only once it reconnects.
     ///
     /// # Errors
     ///
-    /// [`GossipError::TooManyTopics`] if the set would pass [`super::config::MAX_TOPICS`];
-    /// nothing is subscribed then. [`GossipError::Subscribe`] from gossipsub.
+    /// [`GossipError::TooManyTopics`] if the whitelist would pass
+    /// [`super::config::MAX_TOPICS`]; nothing is subscribed then. [`GossipError::Subscribe`]
+    /// from gossipsub.
     pub fn subscribe(&mut self, topics: &[GossipTopic]) -> Result<usize, GossipError> {
         let hashes: Vec<TopicHash> = topics.iter().map(topic_hash).collect();
+        // The subscribed set stays within the whitelist, so it cannot pass the bound once the
+        // whitelist has taken the topics.
+        self.whitelist.extend(&hashes)?;
         self.topics.extend(&hashes)?;
         let mut subscribed = 0;
         for topic in topics {
@@ -247,6 +260,7 @@ impl<G> IgnoreAll<G> {
         Self {
             inner,
             topics: TopicSet::default(),
+            whitelist: TopicSet::default(),
             tap: None,
             ignored: 0,
         }

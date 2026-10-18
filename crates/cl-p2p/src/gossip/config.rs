@@ -11,12 +11,17 @@
 //!   snappy transform, which decodes and caches only subscribed topics.
 //! - `max_message_size()` as the RPC cap, and the phase0 mesh and cache parameters.
 //! - A subscription filter ([`ProbeSubscriptionFilter`]): gossipsub keeps, for each peer, only
-//!   the subscriptions to topics we subscribe ourselves, from RPCs of bounded size.
-//! - One [`TopicSet`] behind both the filter and the transform: our topics. It starts as
-//!   [`GossipConfig::topics`] and only grows, all or nothing and never past [`MAX_TOPICS`], when
-//!   topics are subscribed later ([`super::IgnoreAll::subscribe`], e.g. the custody column
-//!   subnets), so a topic is decodable and its peers' subscriptions are kept from the moment
-//!   we subscribe it.
+//!   the subscriptions to whitelisted topics, from RPCs of bounded size.
+//! - Two [`TopicSet`]s, which only grow, all or nothing and never past [`MAX_TOPICS`]:
+//!   - the subscribed set, behind the transform: [`GossipConfig::topics`] at start, and the
+//!     topics subscribed later ([`super::IgnoreAll::subscribe`], e.g. the custody column
+//!     subnets), so a topic is decodable from the moment we subscribe it;
+//!   - the whitelist, behind the filter ([`GossipConfig::whitelist`]): the subscribed set and,
+//!     from the start, every `data_column_sidecar_{subnet_id}` subnet of each configured fork
+//!     digest. gossipsub drops a peer's subscription to a topic it does not allow, and meshes
+//!     only with a peer it holds subscribed, so a custody subnet subscribed after peers
+//!     announced it still meshes with them on the same connection. A whitelisted topic we do
+//!     not subscribe is still refused by the transform before decompression.
 //! - Metric labels for our own topics only ([`metrics_config`]).
 //! - Mesh push only: IHAVE is ignored, so no IWANT is sent.
 //!
@@ -30,9 +35,13 @@ use libp2p::gossipsub::{
     TopicHash, TopicSubscriptionFilter,
 };
 use network_config::ChainConfig;
-use p2p_wire::gossip::{message_id_of_decompressed, GossipTopic, SnappyTransform, TopicCaps};
+use p2p_wire::gossip::topic::DATA_COLUMN_SIDECAR_SUBNET_COUNT;
+use p2p_wire::gossip::{
+    message_id_of_decompressed, GossipKind, GossipTopic, SnappyTransform, TopicCaps,
+};
 use p2p_wire::rpc::codec::max_compressed_len;
-use std::collections::HashSet;
+use p2p_wire::rpc::messages::ForkDigest;
+use std::collections::{BTreeSet, HashSet};
 use std::io;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
@@ -103,17 +112,19 @@ pub fn metrics_config() -> MetricsConfig {
     }
 }
 
-/// Topics a peer may hold subscribed beyond our own: none can be held while the whitelist
+/// Topics a peer may hold subscribed beyond the whitelist: none can be held while the whitelist
 /// stands, so this is a second bound, not one a peer can reach.
 pub const SUBSCRIBED_TOPICS_HEADROOM: usize = 4;
 
-/// The most topics we subscribe: [`MAX_SUBSCRIPTIONS_PER_REQUEST`], every topic of two fork
-/// digests. Our whole subscription list then fits the one RPC a new peer receives, under the
-/// same per-RPC cap and [`MAX_CONTROL_MESSAGE_SIZE`] we hold peers to.
+/// The most topics we subscribe or whitelist: [`MAX_SUBSCRIPTIONS_PER_REQUEST`], every topic of
+/// two fork digests. Our whole subscription list then fits the one RPC a new peer receives,
+/// under the same per-RPC cap and [`MAX_CONTROL_MESSAGE_SIZE`] we hold peers to. The whitelist
+/// of two digests' configured topics adds at most their 2 × 128 column subnets, all within the
+/// two digests' 418 topics.
 pub const MAX_TOPICS: usize = MAX_SUBSCRIPTIONS_PER_REQUEST;
 
-/// Our topics, shared by the subscription filter and the transform; see the module docs.
-/// Clones share one set. It never shrinks.
+/// A set of topics read by the subscription filter (the whitelist) or the transform (the
+/// subscribed set); see the module docs. Clones share one set. It never shrinks.
 #[derive(Clone, Debug, Default)]
 pub struct TopicSet(Arc<RwLock<HashSet<TopicHash>>>);
 
@@ -178,8 +189,8 @@ impl TopicSubscriptionFilter for TopicWhitelist {
     }
 }
 
-/// What gossipsub keeps of a peer's subscriptions: only topics in the whitelist (ours), at
-/// most [`MAX_TOPICS`] plus [`SUBSCRIBED_TOPICS_HEADROOM`], from RPCs of at most
+/// What gossipsub keeps of a peer's subscriptions: only topics in the whitelist, at most
+/// [`MAX_TOPICS`] plus [`SUBSCRIBED_TOPICS_HEADROOM`], from RPCs of at most
 /// [`MAX_SUBSCRIPTIONS_PER_REQUEST`] subscriptions.
 pub type ProbeSubscriptionFilter = MaxCountSubscriptionFilter<TopicWhitelist>;
 
@@ -274,8 +285,7 @@ impl GossipConfig {
         Ok(config)
     }
 
-    /// A new [`TopicSet`] holding these topics; the filter and the transform of one gossipsub
-    /// take the same set.
+    /// A new [`TopicSet`] holding these topics: the subscribed set the transform reads.
     ///
     /// # Errors
     ///
@@ -284,13 +294,37 @@ impl GossipConfig {
         TopicSet::new(self.topics.iter().map(topic_hash))
     }
 
-    /// The subscription filter over `topics`: see [`ProbeSubscriptionFilter`]. The per-peer
-    /// count bound is [`MAX_TOPICS`], not the set's size now, because the set can grow to it.
-    pub fn subscription_filter(&self, topics: &TopicSet) -> ProbeSubscriptionFilter {
+    /// A new [`TopicSet`] for the subscription whitelist: these topics and every
+    /// `data_column_sidecar_{subnet_id}` subnet of each of their fork digests, so peers'
+    /// subscriptions to a column subnet are kept before we subscribe it (see the module docs).
+    ///
+    /// # Errors
+    ///
+    /// [`GossipError::TooManyTopics`] for more than [`MAX_TOPICS`] topics.
+    pub fn whitelist(&self) -> Result<TopicSet, GossipError> {
+        let digests: BTreeSet<ForkDigest> = self.topics.iter().map(|t| t.fork_digest).collect();
+        let columns = digests.into_iter().flat_map(|digest| {
+            (0..DATA_COLUMN_SIDECAR_SUBNET_COUNT).map(move |subnet_id| {
+                GossipTopic::new(digest, GossipKind::DataColumnSidecar { subnet_id })
+            })
+        });
+        TopicSet::new(
+            self.topics
+                .iter()
+                .copied()
+                .chain(columns)
+                .map(|t| topic_hash(&t)),
+        )
+    }
+
+    /// The subscription filter over `whitelist` ([`Self::whitelist`]): see
+    /// [`ProbeSubscriptionFilter`]. The per-peer count bound is [`MAX_TOPICS`], not the set's
+    /// size now, because the set can grow to it.
+    pub fn subscription_filter(&self, whitelist: &TopicSet) -> ProbeSubscriptionFilter {
         MaxCountSubscriptionFilter {
             max_subscribed_topics: MAX_TOPICS + SUBSCRIBED_TOPICS_HEADROOM,
             max_subscriptions_per_request: MAX_SUBSCRIPTIONS_PER_REQUEST,
-            filter: TopicWhitelist(topics.clone()),
+            filter: TopicWhitelist(whitelist.clone()),
         }
     }
 
@@ -382,7 +416,6 @@ mod tests {
     use consensus_types::caps::NetworkCaps;
     use consensus_types::Mainnet;
     use network_config::Network;
-    use p2p_wire::gossip::GossipKind;
 
     const BLOCK: &str = "/eth2/00000000/beacon_block/ssz_snappy";
 
@@ -721,6 +754,75 @@ mod tests {
             transform.inbound_transform(raw(column, data)).unwrap().data,
             b"col"
         );
+    }
+
+    /// The whitelist holds our topics and every column subnet of each of their fork digests,
+    /// so a peer's announcement of a column subnet is kept before we subscribe it; the
+    /// transform, over the subscribed set, still refuses those subnets before decompressing.
+    #[test]
+    fn the_whitelist_holds_every_column_subnet_of_each_fork_digest() {
+        use libp2p::gossipsub::TopicSubscriptionFilter as _;
+        let mut c = config();
+        c.topics
+            .push(GossipTopic::new([1; 4], GossipKind::BeaconBlock));
+        let column = |digest: [u8; 4], subnet_id: u64| {
+            topic_hash(&GossipTopic::new(
+                digest,
+                GossipKind::DataColumnSidecar { subnet_id },
+            ))
+        };
+        let whitelist = c.whitelist().unwrap();
+        assert_eq!(whitelist.len(), 2 + 2 * 128);
+        let mut filter = c.subscription_filter(&whitelist);
+        for digest in [[0; 4], [1; 4]] {
+            for subnet_id in 0..128 {
+                assert!(filter.can_subscribe(&column(digest, subnet_id)));
+            }
+        }
+        assert!(filter.can_subscribe(&TopicHash::from_raw(BLOCK)));
+        assert!(!filter.can_subscribe(&column([2; 4], 0)));
+        assert!(!filter.can_subscribe(&TopicHash::from_raw(
+            "/eth2/00000000/beacon_aggregate_and_proof/ssz_snappy"
+        )));
+
+        let transform = c.transform(&c.topic_set().unwrap());
+        let mut bomb = Vec::new();
+        p2p_wire::rpc::codec::encode_varint(u64::from(u32::MAX), &mut bomb);
+        let err = transform
+            .inbound_transform(raw(column([0; 4], 5).as_str(), bomb))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "not a subscribed topic");
+    }
+
+    /// Column subnets already listed are not counted twice, and the whitelist holds to the
+    /// topic bound: three digests' beacon_block and column subnets fit (3 × 129 = 387), four
+    /// (516) do not.
+    #[test]
+    fn the_whitelist_is_bounded() {
+        let digests = |n: u32| (0..n).map(u32::to_be_bytes);
+        let mut c = config();
+        c.topics = digests(2)
+            .flat_map(|d| {
+                std::iter::once(GossipTopic::new(d, GossipKind::BeaconBlock)).chain((0..128).map(
+                    move |subnet_id| {
+                        GossipTopic::new(d, GossipKind::DataColumnSidecar { subnet_id })
+                    },
+                ))
+            })
+            .collect();
+        assert_eq!(c.whitelist().unwrap().len(), 2 * 129);
+
+        c.topics = digests(3)
+            .map(|d| GossipTopic::new(d, GossipKind::BeaconBlock))
+            .collect();
+        assert_eq!(c.whitelist().unwrap().len(), 3 * 129);
+        c.topics = digests(4)
+            .map(|d| GossipTopic::new(d, GossipKind::BeaconBlock))
+            .collect();
+        assert!(matches!(
+            c.whitelist(),
+            Err(GossipError::TooManyTopics { max: 418, .. })
+        ));
     }
 
     #[test]
