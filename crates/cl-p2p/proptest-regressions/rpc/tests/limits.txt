@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9e4a94133b0f4317c2c16bde19aa19411371a1e438a19ecd9310d0fb37899f3e # shrinks to steps = [Charge, Charge, Charge, Advance(2223), Charge, Dropped(8111279800049839180)], burst = 1, period_ms = 100
+cc 925878dfae8cfc26eca66930d0ad7c8847d2ef8d494b571ca97fd48ae5652aa8 # shrinks to steps = [Charge, Charge, Charge, Charge, Sent(0), Charge, Charge, Dropped(0), Dropped(0), Charge, Charge, Charge, Charge, Charge, Dropped(0), Dropped(0), Dropped(0), Advance(1738), Sent(0), Dropped(0), Advance(807), Dropped(0), Charge, Charge, Charge, Dropped(14651083718030554100), Charge, Charge, Dropped(3562263779934741102)], burst = 1, period_ms = 283

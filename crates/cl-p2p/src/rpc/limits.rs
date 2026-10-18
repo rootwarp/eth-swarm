@@ -10,9 +10,10 @@
 //! - [`ChunkPacer`]: the inbound codec's handle on one peer's bucket of one protocol. Each chunk
 //!   reserves its token when it is next to be written ([`ChunkPacer::reserve`]), so a chunk
 //!   waits for the chunks before it, never for the ones after it, and concurrent answers share
-//!   the bucket chunk by chunk. A reservation dropped before its chunk was sent (the stream or
-//!   the connection went away) gives its period back ([`RateLimiter::refund`]); a sent chunk
-//!   stays charged, so reconnecting does not refill a bucket.
+//!   the bucket chunk by chunk. A reservation dropped before its chunk was written whole (the
+//!   stream or the connection went away) gives back the part of its period still ahead
+//!   ([`RateLimiter::refund`]), nothing once that period ran out; a chunk written whole stays
+//!   charged, even if its flush failed, so reconnecting does not refill a bucket.
 //! - [`OutboundSemaphore`]: at most [`MAX_CONCURRENT_REQUESTS`] outbound requests per protocol
 //!   ID across the probe (`phase0` L309, L1228: "The requester MUST NOT make more than
 //!   `MAX_CONCURRENT_REQUESTS` concurrent requests with the same protocol ID"). A request over
@@ -139,7 +140,45 @@ impl Default for RpcLimits {
 #[derive(Debug, Clone)]
 pub struct RateLimiter {
     limits: RateLimits,
-    next: HashMap<(PeerId, Protocol), Instant>,
+    buckets: HashMap<(PeerId, Protocol), Bucket>,
+    created: u64,
+}
+
+/// One (peer, protocol) bucket.
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+    /// The theoretical arrival time of the next chunk.
+    next: Instant,
+    /// How far refunds have moved `next` back in all: no charge still held moved further.
+    refunded: Duration,
+    /// Which bucket this is, so a charge on a pruned bucket refunds nothing to its successor.
+    id: u64,
+}
+
+/// One chunk's token, as [`RateLimiter::charge`] booked it: when the chunk may go and, for
+/// [`RateLimiter::refund`], where its period sits in the bucket.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
+pub struct Charge {
+    due: Instant,
+    booked: Option<Booking>,
+}
+
+/// Where a charged period sits: its bucket, the bucket's `next` right after the charge (the
+/// end of the period) and the bucket's `refunded` then.
+#[derive(Debug, PartialEq, Eq)]
+struct Booking {
+    bucket: u64,
+    until: Instant,
+    refunded: Duration,
+}
+
+impl Charge {
+    /// When the chunk may be sent.
+    #[must_use]
+    pub fn due(&self) -> Instant {
+        self.due
+    }
 }
 
 impl RateLimiter {
@@ -148,48 +187,96 @@ impl RateLimiter {
     pub fn new(limits: RateLimits) -> Self {
         Self {
             limits,
-            next: HashMap::new(),
+            buckets: HashMap::new(),
+            created: 0,
         }
     }
 
-    /// When the next response chunk of `protocol` to `peer` may be sent: `now` while the peer
-    /// is within its quota, else the instant its token comes back. The chunk is charged either
-    /// way, so chunks are scheduled one period apart in the order they were asked for.
-    pub fn schedule(&mut self, peer: PeerId, protocol: Protocol, now: Instant) -> Instant {
+    /// Charges the next response chunk of `protocol` to `peer`: it may be sent at
+    /// [`Charge::due`], `now` while the peer is within its quota, else the instant its token
+    /// comes back. The chunk is charged either way, so chunks are scheduled one period apart in
+    /// the order they were asked for.
+    pub fn charge(&mut self, peer: PeerId, protocol: Protocol, now: Instant) -> Charge {
         let Some(quota) = self.limits.quota(protocol) else {
-            return now;
+            return Charge {
+                due: now,
+                booked: None,
+            };
         };
-        let next = self.next.entry((peer, protocol)).or_insert(now);
-        let due = (*next).max(now);
-        *next = due + quota.period;
-        due.checked_sub(quota.tolerance())
-            .map_or(now, |at| at.max(now))
+        let created = &mut self.created;
+        let bucket = self.buckets.entry((peer, protocol)).or_insert_with(|| {
+            *created += 1;
+            Bucket {
+                next: now,
+                refunded: Duration::ZERO,
+                id: *created,
+            }
+        });
+        let start = bucket.next.max(now);
+        bucket.next = start + quota.period;
+        Charge {
+            due: start
+                .checked_sub(quota.tolerance())
+                .map_or(now, |at| at.max(now)),
+            booked: Some(Booking {
+                bucket: bucket.id,
+                until: bucket.next,
+                refunded: bucket.refunded,
+            }),
+        }
     }
 
-    /// Gives back the period of one chunk of `protocol` to `peer` that was scheduled but never
-    /// sent. The bucket never moves before `now`, so refunds cannot build a burst.
-    pub fn refund(&mut self, peer: PeerId, protocol: Protocol, now: Instant) {
-        let Some(quota) = self.limits.quota(protocol) else {
+    /// [`Self::charge`], for a chunk that is never refunded: when it may be sent.
+    pub fn schedule(&mut self, peer: PeerId, protocol: Protocol, now: Instant) -> Instant {
+        self.charge(peer, protocol, now).due
+    }
+
+    /// Gives back what is still ahead of `now` of the period `charge` booked for a chunk of
+    /// `protocol` to `peer` that was never sent: at most one period, and nothing once the
+    /// period ran out, since time since spent it and later chunks may hold the bucket now.
+    ///
+    /// A refund moves the bucket back, and with it at most that far every charge after the
+    /// refunded one, so `until` less what was refunded since is never later than where the
+    /// period really ends: a refund never gives back more than the live part of its charge.
+    /// The bucket never moves before `now`, so refunds cannot build a burst.
+    pub fn refund(&mut self, peer: PeerId, protocol: Protocol, charge: Charge, now: Instant) {
+        let (Some(quota), Some(booked)) = (self.limits.quota(protocol), charge.booked) else {
             return;
         };
-        if let Some(next) = self.next.get_mut(&(peer, protocol)) {
-            *next = next
-                .checked_sub(quota.period)
-                .map_or(now, |back| back.max(now));
+        let Some(bucket) = self
+            .buckets
+            .get_mut(&(peer, protocol))
+            .filter(|bucket| bucket.id == booked.bucket)
+        else {
+            return;
+        };
+        let moved_since = bucket.refunded.saturating_sub(booked.refunded);
+        let live = booked
+            .until
+            .checked_sub(moved_since)
+            .map_or(Duration::ZERO, |until| until.saturating_duration_since(now))
+            .min(quota.period);
+        let back = bucket
+            .next
+            .checked_sub(live)
+            .map_or(now, |back| back.max(now));
+        if back < bucket.next {
+            bucket.refunded = bucket.refunded.saturating_add(bucket.next - back);
+            bucket.next = back;
         }
     }
 
     /// Forgets the buckets of every peer `connected` rejects that are full again, so a peer
     /// that leaves stops taking memory but cannot reconnect out of a bucket still in debt.
     pub fn prune(&mut self, now: Instant, connected: impl Fn(&PeerId) -> bool) {
-        self.next
-            .retain(|(peer, _), next| connected(peer) || *next > now);
+        self.buckets
+            .retain(|(peer, _), bucket| connected(peer) || bucket.next > now);
     }
 
     /// How many buckets are held.
     #[must_use]
     pub fn tracked(&self) -> usize {
-        self.next.len()
+        self.buckets.len()
     }
 }
 
@@ -246,12 +333,14 @@ impl ChunkPacer {
     }
 
     /// Charges the token of the next chunk: the chunk may be written at [`Reservation::due`].
-    /// Call [`Reservation::sent`] once it was; a reservation dropped before is refunded.
+    /// Call [`Reservation::sent`] once it was written whole; a reservation dropped before gets
+    /// back the part of its charge still ahead.
     #[must_use]
     pub fn reserve(&self) -> Reservation {
         let p = &self.0;
         let now = Instant::now();
-        let due = lock(&p.limiter).schedule(p.peer, p.protocol, now);
+        let charge = lock(&p.limiter).charge(p.peer, p.protocol, now);
+        let due = charge.due();
         if due > now {
             if let Some(metrics) = &p.metrics {
                 metrics.rate_limited(p.protocol);
@@ -266,17 +355,19 @@ impl ChunkPacer {
         Reservation {
             pacer: self.clone(),
             due,
-            sent: false,
+            charge: Some(charge),
         }
     }
 }
 
-/// The token of one chunk ([`ChunkPacer::reserve`]): refunded on drop unless the chunk was sent.
+/// The token of one chunk ([`ChunkPacer::reserve`]): on drop, unless the chunk was sent, the
+/// part of its charge still ahead is refunded ([`RateLimiter::refund`]).
 #[derive(Debug)]
 pub struct Reservation {
     pacer: ChunkPacer,
     due: Instant,
-    sent: bool,
+    /// `None` once the chunk was sent.
+    charge: Option<Charge>,
 }
 
 impl Reservation {
@@ -288,15 +379,15 @@ impl Reservation {
 
     /// The chunk was written: its token stays spent.
     pub fn sent(mut self) {
-        self.sent = true;
+        self.charge = None;
     }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        if !self.sent {
+        if let Some(charge) = self.charge.take() {
             let p = &self.pacer.0;
-            lock(&p.limiter).refund(p.peer, p.protocol, Instant::now());
+            lock(&p.limiter).refund(p.peer, p.protocol, charge, Instant::now());
         }
     }
 }
@@ -561,23 +652,145 @@ mod tests {
         let peer = PeerId::random();
         let ping = Protocol::PingV1;
         assert_eq!(limiter.schedule(peer, ping, start), start);
-        assert_eq!(limiter.schedule(peer, ping, start), at(start, 1000));
+        let second = limiter.charge(peer, ping, start);
+        assert_eq!(second.due(), at(start, 1000));
         // The second chunk was never sent: its period comes back.
-        limiter.refund(peer, ping, start);
+        limiter.refund(peer, ping, second, start);
         assert_eq!(limiter.schedule(peer, ping, start), at(start, 1000));
-        // Refunds never move a bucket before now, so they cannot buy a burst.
-        for _ in 0..5 {
-            limiter.refund(peer, ping, at(start, 500));
+        // Five chunks queued behind it (2 s to 7 s) are refunded a period each; the one sent
+        // stays charged until 2 s.
+        let queued: Vec<Charge> = (0..5).map(|_| limiter.charge(peer, ping, start)).collect();
+        for charge in queued {
+            limiter.refund(peer, ping, charge, at(start, 1500));
         }
-        assert_eq!(limiter.schedule(peer, ping, at(start, 500)), at(start, 500));
         assert_eq!(
-            limiter.schedule(peer, ping, at(start, 500)),
-            at(start, 1500)
+            limiter.schedule(peer, ping, at(start, 1500)),
+            at(start, 2000)
         );
-        // Nothing to refund: no bucket, or no quota.
-        limiter.refund(PeerId::random(), ping, start);
-        limiter.refund(peer, Protocol::GoodbyeV1, start);
+        // Refunded later than every charge ran out, a queue never moves the bucket before now,
+        // so refunds cannot buy a burst.
+        let queued: Vec<Charge> = (0..5).map(|_| limiter.charge(peer, ping, start)).collect();
+        for charge in queued.into_iter().rev() {
+            limiter.refund(peer, ping, charge, at(start, 9000));
+        }
+        assert_eq!(
+            limiter.schedule(peer, ping, at(start, 9000)),
+            at(start, 9000)
+        );
+        assert_eq!(
+            limiter.schedule(peer, ping, at(start, 9000)),
+            at(start, 10_000)
+        );
+        // Nothing to refund: no quota, no bucket, or a bucket pruned and made anew since.
+        let goodbye = limiter.charge(peer, Protocol::GoodbyeV1, start);
+        assert_eq!(goodbye.due(), start);
+        limiter.refund(peer, Protocol::GoodbyeV1, goodbye, start);
+        let gone = PeerId::random();
+        let stale = limiter.charge(gone, ping, start);
+        let other = PeerId::random();
+        let missing = limiter.charge(other, ping, start);
+        limiter.prune(at(start, 1000), |p| *p == peer);
+        limiter.refund(other, ping, missing, at(start, 1000));
         assert_eq!(limiter.tracked(), 1);
+        let later = at(start, 5000);
+        assert_eq!(limiter.schedule(gone, ping, later), later);
+        limiter.refund(gone, ping, stale, later);
+        assert_eq!(limiter.schedule(gone, ping, later), at(later, 1000));
+    }
+
+    /// The default Ping quota on one peer's bucket, and the pacer of it.
+    fn ping_pacer() -> (SharedLimiter, PeerId, ChunkPacer) {
+        let limiter = shared_limiter(RateLimits::default());
+        let peer = PeerId::random();
+        let pacer = ChunkPacer::new(limiter.clone(), peer, Protocol::PingV1, None);
+        (limiter, peer, pacer)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_chunk_whose_charge_expired_refunds_nothing() {
+        // The default Ping quota: 2 at once, then one per 2 s.
+        let (limiter, peer, pacer) = ping_pacer();
+        let start = Instant::now();
+        // A's write stalls; its charge runs out at 2 s.
+        let a = pacer.reserve();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        // B is charged from 3 s to 5 s and sent.
+        pacer.reserve().sent();
+        tokio::time::advance(Duration::from_millis(100)).await;
+        // A's stream is reset: its charge already expired, so B's must survive.
+        drop(a);
+        let now = Instant::now();
+        let mut limiter = lock(&limiter);
+        assert_eq!(limiter.schedule(peer, Protocol::PingV1, now), now);
+        assert_eq!(
+            limiter.schedule(peer, Protocol::PingV1, now),
+            at(start, 5000),
+            "B's charge was erased"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalling_and_resetting_gains_no_token() {
+        // A peer that keeps one write stalled past most of its charge and resets it after the
+        // next chunk went out. Every cycle its bucket ends no better than a peer's that never
+        // asked for the stalled chunks, and no worse than one's that was sent them all.
+        let (limiter, peer, pacer) = ping_pacer();
+        let mut never_asked = RateLimiter::new(RateLimits::default());
+        let mut all_sent = RateLimiter::new(RateLimits::default());
+        let ping = Protocol::PingV1;
+        for _ in 0..20 {
+            let stalled = pacer.reserve();
+            all_sent.schedule(peer, ping, Instant::now());
+            tokio::time::advance(Duration::from_secs(3)).await;
+            pacer.reserve().sent();
+            all_sent.schedule(peer, ping, Instant::now());
+            never_asked.schedule(peer, ping, Instant::now());
+            tokio::time::advance(Duration::from_millis(100)).await;
+            drop(stalled);
+            // Past the burst, where the bucket shows.
+            let now = Instant::now();
+            let ours = past_burst(&lock(&limiter), peer, now);
+            assert!(
+                ours >= past_burst(&never_asked, peer, now),
+                "a token was gained"
+            );
+            assert!(ours <= past_burst(&all_sent, peer, now));
+        }
+    }
+
+    /// When `peer`'s Ping chunk after a full default burst would go at `now`, without
+    /// charging it.
+    fn past_burst(limiter: &RateLimiter, peer: PeerId, now: Instant) -> Instant {
+        let mut probe = limiter.clone();
+        (0..RateLimits::default().ping.burst)
+            .fold(now, |_, _| probe.schedule(peer, Protocol::PingV1, now))
+    }
+
+    /// When `peer`'s next Ping chunk would go at `now`, without charging it.
+    fn next_ping(limiter: &SharedLimiter, peer: PeerId, now: Instant) -> Instant {
+        lock(limiter).clone().schedule(peer, Protocol::PingV1, now)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unsent_chunk_refunds_only_the_part_of_its_charge_still_ahead() {
+        // One Ping chunk per 2 s, no burst.
+        let limiter = shared_limiter(RateLimits {
+            ping: Quota::new(1, Duration::from_secs(2)),
+            ..RateLimits::default()
+        });
+        let peer = PeerId::random();
+        let pacer = ChunkPacer::new(limiter.clone(), peer, Protocol::PingV1, None);
+        let start = Instant::now();
+        // A chunk dropped at once is refunded in full.
+        drop(pacer.reserve());
+        assert_eq!(next_ping(&limiter, peer, start), start);
+        // A is charged from 0 s to 2 s, B from 2 s to 4 s and sent.
+        let a = pacer.reserve();
+        pacer.reserve().sent();
+        // A is dropped at 0.5 s: the 1.5 s of its charge still ahead comes back, not 2 s.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        drop(a);
+        assert_eq!(next_ping(&limiter, peer, Instant::now()), at(start, 2500));
     }
 
     #[test]

@@ -1,7 +1,9 @@
 //! The req/resp limits ([`crate::rpc::limits`]): the outbound semaphore as a model, and the
 //! rate limit, the outbound cap, the inbound stream cap and the IGNORE queue on local swarms.
 
-use crate::rpc::limits::{outbound_queue_name, Admit, OutboundSemaphore, QueueMetrics};
+use crate::rpc::limits::{
+    outbound_queue_name, Admit, OutboundSemaphore, QueueMetrics, RateLimiter, RateLimits,
+};
 use crate::rpc::MAX_CONCURRENT_REQUESTS;
 use p2p_wire::rpc::protocols::Protocol;
 use prometheus_client::registry::Registry;
@@ -90,6 +92,103 @@ proptest! {
             .map(|p| metrics.dropped(outbound_queue_name(*p)))
             .sum();
         prop_assert_eq!(dropped, u64::from(ignored));
+    }
+}
+
+/// One step on a rate-limited bucket: charge the next chunk, let time pass, or settle the
+/// `pick`-th chunk still open, either sent or dropped unsent.
+#[derive(Debug, Clone)]
+enum Pace {
+    Charge,
+    Advance(u64),
+    Sent(usize),
+    Dropped(usize),
+}
+
+fn pace() -> impl Strategy<Value = Pace> {
+    prop_oneof![
+        3 => Just(Pace::Charge),
+        3 => (0u64..3_000).prop_map(Pace::Advance),
+        1 => any::<usize>().prop_map(Pace::Sent),
+        2 => any::<usize>().prop_map(Pace::Dropped),
+    ]
+}
+
+/// When the chunk after a full `burst` would go at `now`, without charging anything: where
+/// the bucket stands.
+fn past_burst(
+    limiter: &RateLimiter,
+    peer: PeerId,
+    burst: u32,
+    now: tokio::time::Instant,
+) -> tokio::time::Instant {
+    let mut probe = limiter.clone();
+    (0..burst).fold(now, |_, _| probe.schedule(peer, Protocol::PingV1, now))
+}
+
+/// Every bucket position `steps` passes through from `start`: `refunding` refunds the dropped
+/// chunks, `skipped` charges are never asked for.
+fn bucket_positions(
+    start: tokio::time::Instant,
+    quota: Quota,
+    steps: &[Pace],
+    refunding: bool,
+    skipped: &[bool],
+) -> (Vec<tokio::time::Instant>, Vec<bool>) {
+    let mut limiter = RateLimiter::new(RateLimits {
+        ping: quota,
+        ..RateLimits::default()
+    });
+    let peer = PeerId::random();
+    let mut now = start;
+    let (mut open, mut dropped, mut positions) = (Vec::new(), Vec::new(), Vec::new());
+    for step in steps {
+        match *step {
+            Pace::Charge => {
+                let id = dropped.len();
+                dropped.push(false);
+                if !skipped.get(id).copied().unwrap_or(false) {
+                    open.push((id, limiter.charge(peer, Protocol::PingV1, now)));
+                }
+            }
+            Pace::Advance(ms) => now += Duration::from_millis(ms),
+            Pace::Sent(pick) if !open.is_empty() => drop(open.remove(pick % open.len())),
+            Pace::Dropped(pick) if !open.is_empty() => {
+                let (id, charge) = open.remove(pick % open.len());
+                dropped[id] = true;
+                if refunding {
+                    limiter.refund(peer, Protocol::PingV1, charge, now);
+                }
+            }
+            Pace::Sent(_) | Pace::Dropped(_) => {}
+        }
+        positions.push(past_burst(&limiter, peer, quota.burst, now));
+    }
+    (positions, dropped)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// Chunks charged, sent and dropped unsent in any order and at any time: after every step
+    /// the bucket stands no better for the peer than had it never asked for the dropped chunks,
+    /// so stalling and resetting a write gains no token, and no worse than had it been sent
+    /// them all.
+    #[test]
+    fn refunds_never_beat_not_asking(
+        steps in prop::collection::vec(pace(), 1..60),
+        burst in 1u32..4,
+        period_ms in 100u64..2_000,
+    ) {
+        let quota = Quota::new(burst, Duration::from_millis(period_ms));
+        let start = tokio::time::Instant::now();
+        let (ours, dropped) = bucket_positions(start, quota, &steps, true, &[]);
+        let (all_sent, _) = bucket_positions(start, quota, &steps, false, &[]);
+        let (never_asked, _) = bucket_positions(start, quota, &steps, false, &dropped);
+        for (i, ((ours, sent), asked)) in ours.iter().zip(&all_sent).zip(&never_asked).enumerate() {
+            prop_assert!(ours >= asked, "step {i}: a token was gained");
+            prop_assert!(ours <= sent, "step {i}: a refund charged more");
+        }
     }
 }
 

@@ -57,7 +57,8 @@
 //! The probe's inbound streams run [`InboundCodec`]: [`RpcCodec`]'s request reader, and a
 //! writer of [`Answer`]s that sends one chunk at a time, each whole and flushed, once the
 //! peer's [`ChunkPacer`] has a token for it (`phase0/p2p-interface.md` L1269–1274). A stream
-//! that goes away while a chunk waits refunds that chunk's token.
+//! that goes away before a chunk was written whole refunds what is still ahead of that chunk's
+//! token.
 
 use super::limits::ChunkPacer;
 use super::metrics::RpcMetrics;
@@ -698,7 +699,9 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
     }
 
     /// Checks the whole answer ([`encode_response`]), then writes each chunk whole once its
-    /// token is due. A chunk whose write never happened (the future was dropped) is refunded.
+    /// token is due. A chunk whose write never completed (the future was dropped, or the write
+    /// failed) gets back the part of its token still ahead; one written whole stays charged
+    /// even if the flush after it fails, since the peer may have it all.
     async fn write_response<T>(
         &mut self,
         protocol: &Protocol,
@@ -716,10 +719,10 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
                 }
             }
             io.write_all(&bytes).await?;
-            io.flush().await?;
             if let Some(reservation) = reservation {
                 reservation.sent();
             }
+            io.flush().await?;
         }
         Ok(())
     }
@@ -1903,6 +1906,55 @@ mod tests {
         // token is back, not a period later.
         let now = Instant::now();
         let due = limiter.lock().unwrap().schedule(peer, BLOCKS, now);
+        assert_eq!(due - start, Duration::from_secs(1));
+    }
+
+    /// Takes every byte, then fails to flush.
+    #[derive(Default)]
+    struct FlushFails {
+        written: usize,
+    }
+
+    impl AsyncWrite for FlushFails {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.written += buf.len();
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_chunk_written_whole_stays_charged_when_the_flush_fails() {
+        // One block a second, the bucket full.
+        let limiter = shared_limiter(RateLimits {
+            blocks_by_range: Quota::new(1, Duration::from_secs(1)),
+            ..RateLimits::default()
+        });
+        let peer = libp2p::PeerId::random();
+        let start = Instant::now();
+        let answer = Answer {
+            chunks: blocks(2),
+            pacer: Some(ChunkPacer::new(limiter.clone(), peer, BLOCKS, None)),
+        };
+        let mut io = FlushFails::default();
+        let err = inbound_codec()
+            .write_response(&BLOCKS, &mut io, answer)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+        // The first chunk went to the stream whole, so the peer may have it: it stays charged,
+        // and the next chunk waits for its token. The second was never written.
+        assert!(io.written > 0);
+        let due = limiter.lock().unwrap().schedule(peer, BLOCKS, start);
         assert_eq!(due - start, Duration::from_secs(1));
     }
 
