@@ -31,6 +31,17 @@ expect() {
   fi
 }
 
+# expect_without <description> <pattern> <dir>: the lint's output has no line matching <pattern>.
+expect_without() {
+  local desc=$1 pattern=$2 dir=$3 out
+  out=$("${lint[@]}" "$dir" 2>&1) || true
+  if printf '%s\n' "$out" | grep -Eq -- "$pattern"; then
+    bad "$desc (a line matches /$pattern/)" "$out"
+  else
+    ok "$desc"
+  fi
+}
+
 # variant <name>: a fresh copy of the committed units in $tmp/<name>, printed.
 variant() {
   local dir="$tmp/$1"
@@ -263,20 +274,71 @@ for value in SIGKILL KILL SIGTERM; do
   expect 1 "RestartPreventExitStatus=$value fails" "ethswarm-p2p.service: RestartPreventExitStatus=.*signal" "$d"
 done
 
-# --- the memory ceiling: MemoryHigh= below a finite MemoryMax=, no swap, an OOM kill restarts ----
+# --- the memory ceiling: a finite MemoryMax=, no MemoryHigh=, no swap, an OOM kill restarts ----
 
+# cl-p2p's ceiling sits above its transport's budgets (README: about 6.05 GiB), 4G for the rest.
+for case in ethswarm-p2p=7G ethswarm-discv5=4G ethswarm-chain=4G; do
+  unit=${case%%=*}
+  if grep -qx -- "MemoryMax=${case#*=}" "$probe/$unit.service"; then
+    ok "$unit has MemoryMax=${case#*=}"
+  else
+    bad "$unit has MemoryMax=${case#*=}"
+  fi
+done
 for unit in ethswarm-p2p ethswarm-discv5 ethswarm-chain; do
-  for key in MemoryHigh MemoryMax MemorySwapMax OOMPolicy; do
+  if grep -q '^MemoryHigh=' "$probe/$unit.service"; then
+    bad "$unit sets no MemoryHigh= (without swap it only throttles)"
+  else
+    ok "$unit sets no MemoryHigh= (without swap it only throttles)"
+  fi
+  for key in MemoryMax MemorySwapMax OOMPolicy; do
     d=$(variant "mem-drop-$key-$unit"); drop "$d" "$unit.service" "^$key="
     expect 1 "$unit without $key= fails" "^$unit.service: missing $key=" "$d"
   done
   for line in MemoryMax=infinity MemoryMax= MemoryMax=50% MemoryMax=0 MemoryMax=4Q \
-    MemoryHigh=infinity MemoryHigh= MemoryHigh=64T \
     MemorySwapMax=1G MemorySwapMax=infinity MemorySwapMax= OOMPolicy=continue OOMPolicy=; do
     key=${line%%=*}
     d=$(variant "mem-weak-$line-$unit"); append "$d" "$unit.service" "$line"
     expect 1 "$unit with a later $line fails" "^$unit.service: $key=[^ ]*, want" "$d"
   done
+  # MemoryHigh= is refused outright, wherever it sits and whatever its value: without swap,
+  # past it the kernel only throttles, and a throttled probe stalls instead of being killed.
+  for line in MemoryHigh=3G MemoryHigh=infinity MemoryHigh=; do
+    d=$(variant "mem-high-$line-$unit"); append "$d" "$unit.service" "$line"
+    expect 1 "$unit with $line fails (allow-list)" \
+      "^$unit.service: MemoryHigh= is not in the \[Service\] allow-list" "$d"
+    expect 1 "$unit with $line fails (no throttling)" "^$unit.service: MemoryHigh= is set.*throttle" "$d"
+  done
+  # The README's table states the unit's own ceiling.
+  max=$(sed -n 's/^MemoryMax=//p' "$probe/$unit.service")
+  if grep -qF -- "| \`$unit.service\` | $max |" "$probe/README.md"; then
+    ok "the README states $unit's MemoryMax=$max"
+  else
+    bad "the README states $unit's MemoryMax=$max"
+  fi
+  d=$(variant "mem-high-before-max-$unit")
+  edit "$d" "$unit.service" '/^MemoryMax=/ { print "MemoryHigh=1G" } { print }'
+  expect 1 "$unit with MemoryHigh= before MemoryMax= fails" "^$unit.service: line [0-9]+: expected" "$d"
+done
+
+# Sizes are digits and an optional K, M, G or T suffix, nothing else; a value too large for
+# systemd (2^64 - 1 bytes is its infinity) is a finding, never a traceback that hides the rest.
+nines=$(python3 -I -c 'print("9" * 309)')
+long=$(python3 -I -c 'print("1" * 2000)')
+i=0
+for value in "$nines" "${nines}G" "$long" 000000000000000000004G 4.5G 1e3G 1E3 -1G +4G 0x10G 4g 4GB 1P 1E 18446744073709551615 \
+  16777216T 18446744073709551616 "4 G"; do
+  i=$((i + 1))
+  d=$(variant "mem-size-$i"); append "$d" ethswarm-chain.service "MemoryMax=$value"
+  # And a second, unrelated finding in another unit: it must still be reported.
+  edit "$d" ethswarm-p2p.service '{ sub(/^User=.*/, "User=root") } { print }'
+  expect 1 "MemoryMax=${value:0:24} is a finding" "^ethswarm-chain.service: MemoryMax=.*, want a finite size" "$d"
+  expect 1 "MemoryMax=${value:0:24} leaves the other findings" "^ethswarm-p2p.service: User=root" "$d"
+  expect_without "MemoryMax=${value:0:24} raises no traceback" "Traceback|Error" "$d"
+done
+for value in 1 4096 512K 64M 4G 1T 16777215T; do
+  d=$(variant "mem-size-ok-$value"); append "$d" ethswarm-chain.service "MemoryMax=$value"
+  expect_without "MemoryMax=$value is a size" "MemoryMax=.*want" "$d"
 done
 
 # --- the full hardening set: removed, reset or overridden by a later line ------------------------
@@ -395,17 +457,6 @@ with open(path, "ab") as f:
         left -= line
 PY
 }
-# expect_without <description> <pattern> <dir>: the lint's output has no line matching <pattern>.
-expect_without() {
-  local desc=$1 pattern=$2 dir=$3 out
-  out=$("${lint[@]}" "$dir" 2>&1) || true
-  if printf '%s\n' "$out" | grep -Eq -- "$pattern"; then
-    bad "$desc (a line matches /$pattern/)" "$out"
-  else
-    ok "$desc"
-  fi
-}
-
 d=$(variant line-below-cap); comment "$d" ethswarm-p2p.service 2047
 expect 0 "a comment line of 2047 bytes passes" "^ok: 3 units" "$d"
 for size in 2048 2049 4096 1048576 1048577; do
@@ -452,9 +503,15 @@ INSTALL_LINE='install -m 0644 ops/probe/ethswarm-p2p.service ops/probe/ethswarm-
 # /lib, /usr/lib, /usr/local/lib), however its slashes are doubled or dotted. Fail-closed: any
 # such line but the pinned one is refused, whatever command it runs.
 UNIT_DIR='/etc/+(\./+)*systemd([^-.a-z]|$)|systemd/+(\./+)*system([^-.a-z]|$)'
+# A line naming a systemd path (`/systemd` or `systemd/`) that holds `..` anywhere: a parent
+# alias (`/usr/lib/systemd/user/../system/`, or a `cd` into one and a `../system` after) can
+# reach a unit directory without spelling it, so, fail-closed, no such line is resolved; it is
+# refused.
+SYSTEMD_DOTDOT='(/systemd|systemd/).*\.\.|\.\..*(/systemd|systemd/)'
 
 # readme_findings <file>: one line per README line that would write a unit onto the host other
-# than through INSTALL_LINE, and one if INSTALL_LINE is not there exactly once. Empty: it holds.
+# than through INSTALL_LINE (UNIT_DIR or SYSTEMD_DOTDOT), and one if INSTALL_LINE is not there
+# exactly once. Empty: it holds.
 readme_findings() {
   local n=0 number line
   while IFS= read -r line || [[ -n $line ]]; do
@@ -464,7 +521,7 @@ readme_findings() {
     else
       printf 'README line %s names a systemd unit directory: %s\n' "$number" "$line"
     fi
-  done < <(grep -nE -- "$UNIT_DIR" "$1" || true)
+  done < <(grep -nE -e "$UNIT_DIR" -e "$SYSTEMD_DOTDOT" -- "$1" || true)
   if ((n != 1)); then
     printf 'README holds the pinned install line %d times, want once\n' "$n"
   fi
@@ -502,7 +559,15 @@ for line in \
   'cp ops/probe/*.service /run/systemd/system/' \
   'cp ops/probe/*.service /usr/lib/systemd/system/' \
   'cd /etc/systemd && cp ../../ops/probe/*.service system/' \
-  '- `cp ops/probe/*.service /etc/systemd/system/` also works'; do
+  '- `cp ops/probe/*.service /etc/systemd/system/` also works' \
+  'cp x.service /usr/lib/systemd/user/../system/' \
+  'cp x.service /usr/lib/systemd/user/../system' \
+  'cp x.service /lib/systemd//user/./../system/' \
+  'cp x.service /run/systemd/transient/../system/' \
+  'cp x.service /usr/local/lib/systemd/user/../../systemd/system/' \
+  'install -m 0644 x.service /usr/lib/systemd/user/.././system/' \
+  'cd /usr/lib/systemd/user && cp x.service ../system/' \
+  'cp x.service ../../usr/lib/systemd/user/../system/'; do
   i=$((i + 1))
   expect_readme refused "a README line '$line' is refused" "$(readme_variant "add-$i" "$line")"
 done
@@ -510,7 +575,8 @@ d=$tmp/readme-twice.md; { cat "$probe/README.md"; printf '%s\n' "$INSTALL_LINE";
 expect_readme refused "the pinned install line twice is refused" "$d"
 d=$tmp/readme-none.md; grep -vxF -- "$INSTALL_LINE" "$probe/README.md" > "$d" || true
 expect_readme refused "a README without the pinned install line is refused" "$d"
-for line in 'systemd-analyze verify ops/probe/*.service' 'see systemd.exec(5) and systemd-system.conf(5)'; do
+for line in 'systemd-analyze verify ops/probe/*.service' 'see systemd.exec(5) and systemd-system.conf(5)' \
+  'cd ../.. && cargo build --release' 'systemd-analyze verify ../probe/ethswarm-p2p.service'; do
   i=$((i + 1))
   expect_readme ok "a README line '$line' passes" "$(readme_variant "add-$i" "$line")"
 done

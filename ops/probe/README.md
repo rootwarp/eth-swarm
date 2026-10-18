@@ -13,11 +13,11 @@ providers agree on the checkpoint anchor.
 ## Requirements
 
 - **systemd 247 or later.** `LoadCredential=` (the node key) and `ProtectProc=`/`ProcSubset=`
-  need 247; everything else the units set is older (`MemoryHigh=`/`MemoryMax=` 231,
-  `MemorySwapMax=` 232, `OOMPolicy=` 243). An older systemd logs an unknown key and runs the
+  need 247; everything else the units set is older (`MemoryMax=` 231, `MemorySwapMax=` 232,
+  `OOMPolicy=` 243). An older systemd logs an unknown key and runs the
   unit without it, so it would start unhardened or without its key: do not install there.
 - **The unified cgroup hierarchy (cgroup v2)** with the memory controller. On cgroup v1 systemd
-  ignores `MemoryHigh=` and `MemorySwapMax=`, so the memory ceiling would not hold.
+  ignores `MemorySwapMax=`, so the memory ceiling would not hold.
 
 ## Install
 
@@ -39,7 +39,11 @@ The `install -m 0644` line above is the only line in this README that writes int
 unit directory. `ops/probe/tests/probe-units.test.sh` holds it byte for byte and refuses any
 other line that names systemd's configuration directory under `/etc` or a unit directory under
 `/etc`, `/run`, `/lib`, `/usr/lib` or `/usr/local/lib`, whatever command it runs (`cp` with a
-glob, `sudo install`, `ln -s`, `rsync`, a redirect, a `cd` there first).
+glob, `sudo install`, `ln -s`, `rsync`, a redirect, a `cd` there first). It also refuses any
+other line that names a path through a `systemd` directory and holds a `..` anywhere: a parent
+alias (from systemd's user unit directory up and into its system one, or a `cd` into one and a
+relative path after) reaches a unit directory without spelling it, so such a line is refused,
+not resolved.
 
 ## Node key
 
@@ -101,18 +105,24 @@ main process only, so a failing `ExecStartPre=` check is bounded by the start li
 
 Every unit carries a memory ceiling: plain resource containment for a process whose memory
 grows past what it should ever need. It applies to the unit's whole cgroup, so the
-`ExecStartPre=` anchor check is under it too. Above `MemoryHigh=` the kernel throttles the
-unit and reclaims its memory; at `MemoryMax=` it OOM-kills. `MemorySwapMax=0` keeps the ceiling
-from being dodged through swap. Without swap, little of a growing process's memory can be
-reclaimed, so past `MemoryHigh=` it is throttled hard and may take minutes, or longer, to reach
-`MemoryMax=` and be killed; a unit stuck there shows high `memory.pressure` in its cgroup. The sizes are estimates, to be checked against each unit's
-peak (`memory.peak` in its cgroup, kernel 5.19 and later) once the services run for real.
+`ExecStartPre=` anchor check is under it too. At `MemoryMax=` the kernel OOM-kills the unit.
+`MemorySwapMax=0` keeps the ceiling from being dodged through swap. The sizes are estimates, to
+be checked against each unit's peak (`memory.peak` in its cgroup, kernel 5.19 and later) once
+the services run for real.
 
-| Unit | `MemoryHigh=` | `MemoryMax=` | What sets it |
-|---|---|---|---|
-| `ethswarm-p2p.service` | 4G | 6G | peer state, req/resp and gossip buffers |
-| `ethswarm-discv5.service` | 3G | 4G | the anchor check |
-| `ethswarm-chain.service` | 3G | 4G | the anchor check |
+There is deliberately no `MemoryHigh=`. Past it the kernel throttles the unit and reclaims its
+memory, but without swap there is little to reclaim, and it never OOM-kills: a probe there
+stalls instead. On systemd 247 a unit past `MemoryHigh=` stayed throttled, and was not killed,
+for more than 10 minutes. A stalled probe skews the measurement more than a restart does, so
+`MemoryMax=` alone is the ceiling, and the lint refuses a `MemoryHigh=` line. For an early
+warning, watch the unit's cgroup instead: `memory.current` against `MemoryMax=`, and
+`memory.events` (its `max` and `oom_kill` counters).
+
+| Unit | `MemoryMax=` | What sets it |
+|---|---|---|
+| `ethswarm-p2p.service` | 7G | peer state, req/resp and gossip buffers |
+| `ethswarm-discv5.service` | 4G | the anchor check |
+| `ethswarm-chain.service` | 4G | the anchor check |
 
 - **The anchor check, every unit's floor.** anchor-fetch reads the anchor state's SSZ (S bytes)
   into memory and decodes it into a tree that holds about 2.5 S (the validator list dominates:
@@ -120,9 +130,9 @@ peak (`memory.peak` in its cgroup, kernel 5.19 and later) once the services run 
   body also sits in the unit's `PrivateTmp=` `/tmp`, which is memory, charged to the unit and
   not reclaimable without swap, when the host's `/tmp` is a tmpfs. The peak is then about
   S + S + 2.5 S = 4.5 S: about 1.3 GiB for a state of 300 MiB, a mainnet-scale state today,
-  and 2.3 GiB for 512 MiB. `MemoryHigh=3G` leaves room for a state of over 600 MiB. A state near
-  anchor-fetch's 1 GiB body cap (`max_body_bytes`) would not fit; the check would be OOM-killed,
-  which fails the start like any other failed check.
+  and 2.3 GiB for 512 MiB. `MemoryMax=4G` leaves room for a state of up to about 900 MiB. A
+  state near anchor-fetch's 1 GiB body cap (`max_body_bytes`), about 4.5 GiB, would not fit
+  under 4G; the check would be OOM-killed, which fails the start like any other failed check.
 - **cl-discv5** itself needs tens of MiB: a routing table of at most 256 × 16 records of up to
   300 bytes, its sessions and 1280-byte packets. **cl-chain** in probe mode samples the
   reference API and holds no state. Both are set by the check's floor; when cl-chain starts
@@ -132,10 +142,12 @@ peak (`memory.peak` in its cgroup, kernel 5.19 and later) once the services run 
   normal operation (about 0.3 GiB); the req/resp responses one session may hold, 2 × 256 MiB
   (`MAX_CONCURRENT_REQUESTS` × `MAX_RESPONSE_BYTES`); a quarter of the connections holding
   their full 32 MiB mplex budget (`DEFAULT_CONNECTION_BYTES`) at once, 1.25 GiB; and 256 MiB
-  for gossip caches. That is about 2.3 GiB, under `MemoryHigh=4G`. `MemoryMax=6G` sits above
-  every connection's mplex budget full at once (160 × 32 MiB = 5 GiB) plus the responses, so
-  the transport's own budgets, which close a connection, act before the ceiling, which kills the
-  process. The ceiling catches what those budgets do not bound.
+  for gossip caches. That is about 2.3 GiB in normal operation. The worst case the transport
+  still bounds is every connection's mplex budget full at once, 160 × 32 MiB = 5 GiB, plus the
+  responses (0.5 GiB), the gossip caches (0.25 GiB) and the baseline (about 0.3 GiB): about
+  6.05 GiB. `MemoryMax=7G` sits about 0.95 GiB above that, so the transport's own budgets,
+  which close a connection, act before the ceiling, which kills the process. The ceiling
+  catches what those budgets do not bound.
 
 An OOM kill is a signal (SIGKILL), not an exit status. With `OOMPolicy=stop`, set in the unit
 rather than left to the host's `DefaultOOMPolicy=`, systemd stops the unit with result

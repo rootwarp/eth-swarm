@@ -60,12 +60,12 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged
 # Memory ceiling (README "Resource limits"), for every process of the unit, the check
-# included: past MemoryHigh= the kernel throttles and reclaims, at MemoryMax= it OOM-kills.
-# 4G/6G: peer state for up to 160 connections, the req/resp responses (2 x 256 MiB) and
-# gossip, with MemoryMax= above every connection's 32 MiB mplex budget at once, so the
-# transport's own budgets act first.
-MemoryHigh=4G
-MemoryMax=6G
+# included: at MemoryMax= the kernel OOM-kills. No MemoryHigh=: without swap, past it the
+# kernel only throttles, and a throttled probe stalls instead of being killed.
+# 7G: every connection's 32 MiB mplex budget full at once (160 x 32 MiB = 5 GiB), the
+# req/resp responses (2 x 256 MiB), gossip caches (256 MiB) and the baseline (about
+# 0.3 GiB) come to about 6.05 GiB, so the transport's own budgets act before the ceiling.
+MemoryMax=7G
 # No swap, so the ceiling cannot be dodged by swapping out.
 MemorySwapMax=0
 # An OOM kill (SIGKILL, a signal, not an exit code) stops the unit with result oom-kill,

@@ -60,10 +60,10 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged
 # Memory ceiling (README "Resource limits"), for every process of the unit, the check
-# included: past MemoryHigh= the kernel throttles and reclaims, at MemoryMax= it OOM-kills.
-# 3G/4G: cl-discv5 itself needs tens of MiB; the floor is the anchor check, which runs in
+# included: at MemoryMax= the kernel OOM-kills. No MemoryHigh=: without swap, past it the
+# kernel only throttles, and a throttled probe stalls instead of being killed.
+# 4G: cl-discv5 itself needs tens of MiB; the floor is the anchor check, which runs in
 # this unit's cgroup and holds the anchor state in memory.
-MemoryHigh=3G
 MemoryMax=4G
 # No swap, so the ceiling cannot be dodged by swapping out.
 MemorySwapMax=0

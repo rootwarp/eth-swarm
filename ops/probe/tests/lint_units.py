@@ -25,9 +25,11 @@ messages. Each unit must, in its [Service] section unless noted:
   - not loop on a refusal: RestartSec= at least 60 s, RestartPreventExitStatus= covering
     1 2 64 with exit codes only (a signal name there would turn an OOM kill, SIGKILL, into a
     stop), and in [Unit] StartLimitIntervalSec= at least 1 h and StartLimitBurst= 1 to 5;
-  - hold its memory: MemoryMax= a finite positive size, MemoryHigh= a finite size below it,
-    MemorySwapMax=0 (no swap to grow into) and OOMPolicy=stop or kill (never continue, and
-    never the host's DefaultOOMPolicy=), so an OOM kill fails the unit and Restart= applies;
+  - hold its memory: MemoryMax= a finite positive size (digits and an optional K, M, G or T
+    suffix), no MemoryHigh= (without swap, past it the kernel only throttles, so the probe
+    stalls instead of being killed), MemorySwapMax=0 (no swap to grow into) and
+    OOMPolicy=stop or kill (never continue, and never the host's DefaultOOMPolicy=), so an OOM
+    kill fails the unit and Restart= applies;
   - carry the full hardening set of the committed units (HARDENING below, plus an empty
     CapabilityBoundingSet= and no AmbientCapabilities=, an allow-list RestrictAddressFamilies=
     within AF_UNIX AF_INET AF_INET6, StateDirectory= the user's name, and ReadWritePaths=
@@ -105,9 +107,13 @@ HARDENING_LISTS = {
 CHECK_BUDGET = 4 * 30 + 2 * (30 + 1800)
 MARGIN = 300
 PREVENT = {"1", "2", "64"}
-# The memory ceiling's sizes: systemd's parse_size(), base 1024, as bytes.
-SIZE_UNITS = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40, "P": 1 << 50,
-              "E": 1 << 60}
+# The memory ceiling's sizes, base 1024 as systemd's parse_size(), as bytes. Stricter than
+# systemd: whole numbers only (no fraction, sign or exponent) and K, M, G or T at most. At most
+# 20 digits (2^64 has 20), so int() never meets Python's digit limit for str-to-int.
+SIZE_UNITS = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+SIZE = re.compile(r"([0-9]{1,20})([KMGT]?)")
+# systemd's sizes are uint64, and UINT64_MAX is its infinity: a finite size is below it.
+SIZE_LIMIT = (1 << 64) - 1
 TIME_UNITS = {
     "us": 1e-6, "usec": 1e-6, "ms": 1e-3, "msec": 1e-3, "s": 1, "sec": 1, "second": 1,
     "seconds": 1, "m": 60, "min": 60, "minute": 60, "minutes": 60, "h": 3600, "hr": 3600,
@@ -129,8 +135,7 @@ ALLOWED = {
         "MemoryDenyWriteExecute", "ProtectKernelTunables", "ProtectKernelModules",
         "ProtectKernelLogs", "ProtectControlGroups", "ProtectClock", "ProtectHostname",
         "ProtectProc", "ProcSubset", "SystemCallArchitectures", "SystemCallFilter", "Restart",
-        "RestartSec", "RestartPreventExitStatus", "MemoryHigh", "MemoryMax", "MemorySwapMax",
-        "OOMPolicy",
+        "RestartSec", "RestartPreventExitStatus", "MemoryMax", "MemorySwapMax", "OOMPolicy",
     },
     "Install": {"WantedBy"},
 }
@@ -189,8 +194,7 @@ EXPECTED = {
         ('Service', 'SystemCallArchitectures', 'native'),
         ('Service', 'SystemCallFilter', '@system-service'),
         ('Service', 'SystemCallFilter', '~@privileged'),
-        ('Service', 'MemoryHigh', '4G'),
-        ('Service', 'MemoryMax', '6G'),
+        ('Service', 'MemoryMax', '7G'),
         ('Service', 'MemorySwapMax', '0'),
         ('Service', 'OOMPolicy', 'stop'),
         ('Service', 'Restart', 'on-failure'),
@@ -245,7 +249,6 @@ EXPECTED = {
         ('Service', 'SystemCallArchitectures', 'native'),
         ('Service', 'SystemCallFilter', '@system-service'),
         ('Service', 'SystemCallFilter', '~@privileged'),
-        ('Service', 'MemoryHigh', '3G'),
         ('Service', 'MemoryMax', '4G'),
         ('Service', 'MemorySwapMax', '0'),
         ('Service', 'OOMPolicy', 'stop'),
@@ -300,7 +303,6 @@ EXPECTED = {
         ('Service', 'SystemCallArchitectures', 'native'),
         ('Service', 'SystemCallFilter', '@system-service'),
         ('Service', 'SystemCallFilter', '~@privileged'),
-        ('Service', 'MemoryHigh', '3G'),
         ('Service', 'MemoryMax', '4G'),
         ('Service', 'MemorySwapMax', '0'),
         ('Service', 'OOMPolicy', 'stop'),
@@ -641,31 +643,31 @@ def lint_start_and_restart(unit_section, service):
 
 
 def size(value):
-    """A systemd size (parse_size, base 1024) in bytes; None for infinity, a percentage or
-    anything unparsable."""
-    match = re.fullmatch(r"(\d+(?:\.\d+)?)([KMGTPE]?)", value)
+    """A finite systemd size in bytes, 1 to SIZE_LIMIT - 1; None for anything else: infinity, a
+    percentage, a fraction, a sign, an exponent, another suffix, zero or a value out of range.
+    Integer arithmetic only, so no value can overflow."""
+    match = SIZE.fullmatch(value)
     if not match:
         return None
-    return int(float(match.group(1)) * SIZE_UNITS[match.group(2)])
+    bytes_ = int(match.group(1)) * SIZE_UNITS[match.group(2)]
+    return bytes_ if 0 < bytes_ < SIZE_LIMIT else None
 
 
 def lint_memory(service):
-    """The memory ceiling: MemoryMax= a finite positive size, and MemoryHigh= a finite size below
-    it, so the kernel throttles and reclaims before it OOM-kills. MemorySwapMax= and OOMPolicy=
-    are in HARDENING."""
+    """The memory ceiling: MemoryMax= a finite positive size, and no MemoryHigh=. Without swap,
+    past MemoryHigh= the kernel can only throttle the unit, never OOM-kill it, so a probe there
+    stalls (for minutes on systemd 247) and skews the measurement more than a restart would.
+    MemorySwapMax= and OOMPolicy= are in HARDENING."""
     found = []
-    ceiling = None
-    for key, want in (("MemoryMax", "a finite size"),
-                      ("MemoryHigh", "a finite size below MemoryMax=")):
-        got = last(service, key)
-        if got is None:
-            found.append("missing %s= (%s: the unit's memory ceiling)" % (key, want))
-            continue
-        bytes_ = size(got)
-        if key == "MemoryMax":
-            ceiling = bytes_
-        if not bytes_ or (key == "MemoryHigh" and (ceiling is None or bytes_ >= ceiling)):
-            found.append("%s=%s, want %s" % (key, got, want))
+    if "MemoryHigh" in service:
+        found.append("MemoryHigh= is set; without swap, past it the kernel only throttles and "
+                     "never kills, so the probe stalls: MemoryMax= alone is the ceiling")
+    got = last(service, "MemoryMax")
+    if got is None:
+        found.append("missing MemoryMax= (a finite size: the unit's memory ceiling)")
+    elif size(got) is None:
+        found.append("MemoryMax=%s, want a finite size: 1 to 2^64 - 2 bytes, digits and an "
+                     "optional K, M, G or T suffix" % got)
     return found
 
 
