@@ -9,25 +9,33 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
+# shellcheck source=fuzz-gate-fixture.sh
+. "$here/fuzz-gate-fixture.sh"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 passed=0 failed=0
 ok() { passed=$((passed + 1)); echo "ok   - $1"; }
 bad() { failed=$((failed + 1)); echo "FAIL - $1"; }
-# check <expect: pass|fail> <description> <want in output or ""> <command...>
+# check <expect: pass|fail> <description> <want in output or ""> <command...>; with $unwanted
+# set, the output must not hold it either.
+unwanted=""
 check() {
   local expect=$1 desc=$2 want=$3 rc=0 out ok=0
   shift 3
   out=$("$@" 2>&1) || rc=$?
   if { [[ $expect == pass ]] && ((rc == 0)); } || { [[ $expect == fail ]] && ((rc != 0)); }; then ok=1; fi
   if ((ok)) && [[ -n $want ]] && ! grep -qF -- "$want" <<<"$out"; then ok=0; fi
+  if ((ok)) && [[ -n $unwanted ]] && grep -qF -- "$unwanted" <<<"$out"; then ok=0; fi
   if ((ok)); then
     passed=$((passed + 1)); echo "ok   - $desc"
   else
     failed=$((failed + 1)); echo "FAIL - $desc (exit $rc)"; printf '%s\n' "$out" | sed 's/^/       /'
   fi
 }
+
+# check_clean: check, and the output holds no Python traceback (every refusal is a message).
+check_clean() { unwanted=Traceback check "$@"; }
 
 g() { git -C "$fx" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false "$@"; }
 
@@ -49,7 +57,7 @@ echo '# build' > "$fx/fuzz/build-m2a.sh"
 echo '[workspace]' > "$fx/Cargo.toml"
 for f in crates/p2p-wire/src/lib.rs crates/consensus-types/src/lib.rs crates/cl-p2p/src/rpc/mod.rs \
   crates/cl-p2p/src/rpc/codec.rs crates/cl-p2p/src/rpc/limits.rs crates/cl-p2p/src/rpc/metrics.rs \
-  crates/cl-p2p/src/gossip/mod.rs crates/cl-p2p/src/gossip/config.rs \
+  crates/cl-p2p/src/rpc/unsupported.rs crates/cl-p2p/src/gossip/mod.rs crates/cl-p2p/src/gossip/config.rs \
   crates/cl-discv5/src/enr.rs crates/network-config/src/lib.rs fuzz/src/lib.rs \
   fuzz/fuzz_targets/enr_fields.rs; do
   echo "// $f" > "$fx/$f"
@@ -176,6 +184,32 @@ check fail "a head off this branch (not an ancestor of HEAD)" "is not an ancesto
   "$(gate gate1 "$tmp/sidehead.json" "gate['head'] = '$side'")"
 check fail "a head whose decoder key is not the file's" "the decoder key at $before_key is not the file's" \
   bash "$checker" "$(gate gate1 "$tmp/oldhead.json" "gate['head'] = '$before_key'")"
+# An ancestor that lacks a keyed path: its key cannot be computed, and git's reason is the error.
+g rm -q fuzz/run-gate1.sh
+g commit -q -m "drop a keyed path"
+dropped=$(g rev-parse HEAD)
+g checkout -q HEAD~1 -- fuzz/run-gate1.sh
+g commit -q -m "restore it"
+check pass "the file holds again once the keyed path is back" "gate 1 OK" bash "$checker" "$ok1"
+check_clean fail "a head whose decoder key cannot be computed" \
+  "head: the decoder key at $dropped cannot be computed: ERROR: fuzz/run-gate1.sh is not in $dropped" \
+  bash "$checker" "$(gate gate1 "$tmp/drophead.json" "gate['head'] = '$dropped'")"
+g reset -q --hard HEAD~2
+# git's stderr is not part of the key: a warning leaves a valid file valid.
+fake_git "$tmp/warn-bin" 'echo "warning: a harmless git warning" >&2'
+check_clean pass "a git that warns on stderr" "gate 1 OK" env PATH="$tmp/warn-bin:$PATH" bash "$checker" "$ok1"
+# A key that is not JSON is an error, not a traceback.
+fake_git "$tmp/garble-bin" "for a in \"\$@\"; do [[ \$a != $before_key:Cargo.toml ]] || echo '\"'; done"
+check_clean fail "a decoder key at head that does not parse" "head: the decoder key at $before_key" \
+  env PATH="$tmp/garble-bin:$PATH" bash "$checker" "$(gate gate1 "$tmp/garble.json" "gate['head'] = '$before_key'")"
+# The file is read once: one swapped for another between the head check and the other rules is
+# not seen, and the report names the head that was checked.
+cp "$ok1" "$tmp/swap.json"
+gate gate1 "$tmp/swapped.json" 'gate["head"] = "0" * 40' >/dev/null
+fake_git "$tmp/swap-bin" "for a in \"\$@\"; do [[ \$a != merge-base ]] || cp $(printf %q "$tmp/swapped.json") $(printf %q "$tmp/swap.json"); done"
+check pass "a file swapped during the check is checked as first read" "fuzzed at $(g rev-parse HEAD)" \
+  env PATH="$tmp/swap-bin:$PATH" bash "$checker" "$tmp/swap.json"
+if cmp -s "$tmp/swap.json" "$tmp/swapped.json"; then ok "(the swap took place)"; else bad "the swap did not take place"; fi
 # HEAD moves on outside the key: the file still names the commit it was fuzzed at.
 fuzzed=$(g rev-parse HEAD)
 echo 'notes' > "$fx/NOTES.md"
@@ -199,7 +233,8 @@ for path in crates/cl-p2p/src/gossip/mod.rs crates/cl-p2p/src/gossip/config.rs c
   check pass "the m2a gate holds after a commit to $path" "" bash "$m2a_checker" "$m2a_ok"
   g reset -q --hard HEAD~1
 done
-for path in crates/p2p-wire/src/lib.rs crates/cl-p2p/src/rpc/codec.rs crates/cl-p2p/src/rpc/limits.rs fuzz/m2a-common.sh fuzz/run-m2a-gate.sh \
+for path in crates/p2p-wire/src/lib.rs crates/cl-p2p/src/rpc/codec.rs crates/cl-p2p/src/rpc/limits.rs \
+  crates/cl-p2p/src/rpc/metrics.rs crates/cl-p2p/src/rpc/unsupported.rs fuzz/m2a-common.sh fuzz/run-m2a-gate.sh \
   fuzz/src/lib.rs fuzz/corpus/status_v2/valid fuzz/corpus/enr_fields/valid Cargo.lock; do
   echo '# changed' >> "$fx/$path"
   g commit -q -am "change $path"

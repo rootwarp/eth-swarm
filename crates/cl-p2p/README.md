@@ -302,9 +302,14 @@ Pre-flight first, before any dial:
 - the fuzz gate file (`fuzz/run-m2a-gate.sh`; default `fuzz/artifacts/m2a-gate.json` of the
   checkout the binary was built in) must pass `fuzz/check-m2a-gate.sh`'s rules for the decoders
   this binary was built from. `build.rs` embeds `check-m2a-gate.sh --print-expected` of the
-  build tree; a dirty keyed path, or a tree without the fuzz harness, embeds no expectations,
-  and every gate file is refused. So does a build outside its git checkout (`cargo package`,
-  a tarball, or `GIT_DIR`/`GIT_WORK_TREE` pointing elsewhere: the build script ignores them).
+  build tree, `heads` included: the file's `head` must be the build's commit or an ancestor of
+  it with the same decoder key (the script checks the same with git), so the file names a
+  commit that was fuzzed. `crates/cl-p2p/src/rpc/unsupported.rs` (which `rpc/metrics.rs`
+  imports) is in the key, so a gate file written before it was keyed is stale and the gate has
+  to be run again. A dirty keyed path, or a tree without the fuzz harness, embeds no
+  expectations, and every gate file is refused. So does a build outside its git checkout
+  (`cargo package`, a tarball, or `GIT_DIR`/`GIT_WORK_TREE` pointing elsewhere: the build
+  script ignores them).
   git runs with no system or global config, so a checkout owned by another user (which needs
   `safe.directory`) also embeds no expectations.
 

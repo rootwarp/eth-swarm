@@ -20,13 +20,16 @@
 #   - each target's corpus_sha256 equals that of fuzz/corpus/<target> now;
 #   - each target exercised its decoder: its coverage features once the seeds were loaded
 #     (seed_ft) reach its floor (m2a_min_seed_ft) and the final count is no lower;
-#   - gate 1 only: `head` is the full lowercase hex id of a commit of this repository, an
-#     ancestor of HEAD, and the decoder key at that commit (from git, not the working tree) is
-#     the file's, so the file names a commit that was fuzzed. The m2a checker does not read
-#     `head`: the m2a-session binary mirrors its rules and would no longer agree with it;
+#   - `head` is the full lowercase hex id of a commit of this repository, an ancestor of HEAD,
+#     and the decoder key at that commit (from git, not the working tree) is the file's, so the
+#     file names a commit that was fuzzed. The m2a-session binary mirrors the m2a rules; having
+#     no git at run time, it holds `head` to the `heads` of --print-expected (m2a_key_heads:
+#     HEAD and its ancestors with HEAD's key), embedded when it was built;
 #   - no tool override (CARGO, RUSTC, FUZZ_TOOLCHAIN, RUSTUP_TOOLCHAIN) was in use: `overrides`
 #     is empty. fuzz/run-m2a-gate.sh refuses the environment variables and cargo config that
 #     would change the build or run, so a file it wrote holds only for a clean environment.
+# The file is read once, into a private copy every rule is checked against, so a file replaced
+# while the checks run is not half seen.
 #
 # Usage: fuzz/check-m2a-gate.sh [--gate m2a|gate1] <gate.json>      verify the gate file
 #        fuzz/check-m2a-gate.sh [--gate m2a|gate1] --print-key        print this tree's decoder key
@@ -45,17 +48,18 @@ usage() {
 
 # Every value a gate file of this tree must hold, as one JSON object.
 expected_json() {
-  local key t sep='' corpus='{' floors='{'
+  local key heads t sep='' corpus='{' floors='{'
   key=$(m2a_key_json) || return 1
+  heads=$(m2a_key_heads) || return 1
   for t in "${GATE_TARGETS[@]}"; do
     [[ -d $fuzz_dir/corpus/$t ]] || { echo "ERROR: fuzz/corpus/$t missing" >&2; return 1; }
     corpus="$corpus$sep\"$t\": \"$(m2a_corpus_sha256 "$fuzz_dir/corpus/$t")\""
     floors="$floors$sep\"$t\": $(m2a_min_seed_ft "$t")"
     sep=', '
   done
-  printf '{"decoder_key": %s, "limits": %s, "toolchain": {"channel": "%s", "rustc_commit": "%s"}, "cargo_fuzz": "cargo-fuzz %s", "corpus_sha256": %s}, "min_seed_ft": %s}}\n' \
+  printf '{"decoder_key": %s, "limits": %s, "toolchain": {"channel": "%s", "rustc_commit": "%s"}, "cargo_fuzz": "cargo-fuzz %s", "corpus_sha256": %s}, "min_seed_ft": %s}, "heads": %s}\n' \
     "$key" "$(m2a_limits_json)" "$(m2a_toolchain_pin)" "$M2A_RUSTC_COMMIT" \
-    "$M2A_CARGO_FUZZ_VERSION" "$corpus" "$floors"
+    "$M2A_CARGO_FUZZ_VERSION" "$corpus" "$floors" "$heads"
 }
 
 if (($# == 3)) && [[ $1 == --gate ]]; then
@@ -76,6 +80,12 @@ case $1 in
 esac
 file=$1
 [[ -f $file ]] || { echo "ERROR: $file: no such file"; exit 2; }
+# Every check reads this copy, taken once (mktemp -d: mode 0700); stderr of the key computation
+# lands next to it.
+work=$(mktemp -d) || exit 2
+trap 'rm -rf "$work"' EXIT
+gate_copy=$work/gate.json
+cat -- "$file" >"$gate_copy" || { echo "ERROR: $file: cannot be read"; exit 1; }
 
 expected=$(expected_json) || exit 2
 dirty=$(m2a_dirty_paths)
@@ -85,11 +95,12 @@ if [[ -n $dirty ]]; then
   exit 1
 fi
 
-# Gate 1 (GATE_CHECK_HEAD): the commit the file names must be the one it vouches for. Sets
-# head_error to why `head` cannot be, or head_key to the decoder key at it, which the checks
-# below hold to the file's: `head` is the full lowercase hex id of a commit of this repository,
-# an ancestor of HEAD (the tree may have moved on since, outside the key), and the key computed
-# at it from git (m2a_key_json <commit>, which reads no file of the working tree) is the file's.
+# The commit the file names must be the one it vouches for. Sets head_error to why `head` cannot
+# be, or head_key to the decoder key at it, which the checks below hold to the file's: `head` is
+# the full lowercase hex id of a commit of this repository, an ancestor of HEAD (the tree may
+# have moved on since, outside the key), and the key computed at it from git (m2a_key_json
+# <commit>, which reads no file of the working tree) is the file's. The key is m2a_key_json's
+# stdout only; its stderr (git's warnings, or why it failed) is passed on, or is the error.
 head_error="" head_key=""
 check_head() {
   local head len format
@@ -103,7 +114,7 @@ head = gate.get("head") if isinstance(gate, dict) else None
 if not isinstance(head, str):
     sys.exit(1)
 print(head.encode("unicode_escape").decode("ascii"))
-' "$file") || {
+' "$gate_copy") || {
     head_error="head: missing, or not a string"
     return 0
   }
@@ -119,19 +130,21 @@ print(head.encode("unicode_escape").decode("ascii"))
     head_error="head: $head is not a commit of this repository"
   elif ! m2a_git merge-base --is-ancestor "$head" HEAD 2>/dev/null; then
     head_error="head: $head is not an ancestor of HEAD"
-  elif ! head_key=$(m2a_key_json "$head" 2>&1); then
-    head_error="head: the decoder key at $head cannot be computed: $head_key"
+  elif ! head_key=$(m2a_key_json "$head" 2>"$work/key.err"); then
+    head_error="head: the decoder key at $head cannot be computed: $(<"$work/key.err")"
     head_key=""
+  elif [[ -s $work/key.err ]]; then
+    cat "$work/key.err" >&2
   fi
 }
-if ((GATE_CHECK_HEAD)); then check_head; fi
+check_head
 
 EXPECTED=$expected REQUIRED=$M2A_REQUIRED_SECONDS TARGETS="${GATE_TARGETS[*]}" \
-  GATE_ID=$GATE_ID GATE_LABEL=$GATE_LABEL CHECK_HEAD=$GATE_CHECK_HEAD HEAD_ERROR=$head_error \
-  HEAD_KEY=$head_key python3 -I - "$file" <<'PY'
+  GATE_ID=$GATE_ID GATE_LABEL=$GATE_LABEL HEAD_ERROR=$head_error \
+  HEAD_KEY=$head_key python3 -I - "$file" "$gate_copy" <<'PY'
 import json, os, sys
 
-path = sys.argv[1]
+path, copy = sys.argv[1], sys.argv[2]
 gate_id, label = os.environ["GATE_ID"], os.environ["GATE_LABEL"]
 required = int(os.environ["REQUIRED"])
 want_targets = os.environ["TARGETS"].split()
@@ -140,7 +153,7 @@ key = want["decoder_key"]
 errors = []
 
 try:
-    with open(path) as f:
+    with open(copy) as f:
         gate = json.load(f)
 except (OSError, ValueError) as e:
     print(f"ERROR: {path}: not valid JSON: {e}")
@@ -159,11 +172,16 @@ if not is_int(req) or req < required:
     errors.append(f"requested_seconds: {req!r} < {required} (a smoke run is not a gate)")
 if gate.get("dirty") is not False:
     errors.append(f"dirty: {gate.get('dirty')!r}: the run was not from a clean tree")
-if os.environ["CHECK_HEAD"] == "1":
-    if os.environ["HEAD_ERROR"]:
-        errors.append(os.environ["HEAD_ERROR"])
-    elif gate.get("decoder_key") != json.loads(os.environ["HEAD_KEY"]):
-        errors.append(f"head: the decoder key at {gate.get('head')} is not the file's: it was not fuzzed at that commit")
+if os.environ["HEAD_ERROR"]:
+    errors.append(os.environ["HEAD_ERROR"])
+else:
+    try:
+        head_key = json.loads(os.environ["HEAD_KEY"])
+    except ValueError as e:
+        errors.append(f"head: the decoder key at {gate.get('head')} is not valid JSON ({e}): {os.environ['HEAD_KEY'][:200]!r}")
+    else:
+        if gate.get("decoder_key") != head_key:
+            errors.append(f"head: the decoder key at {gate.get('head')} is not the file's: it was not fuzzed at that commit")
 if gate.get("decoder_key") != key:
     got = gate.get("decoder_key") if isinstance(gate.get("decoder_key"), dict) else {}
     for kind in sorted(set(key) | set(got)):
@@ -221,6 +239,5 @@ if errors:
     for e in errors:
         print(f"ERROR {path}: {e}")
     sys.exit(1)
-print(f"{label} OK: {len(names)} targets x >= {required} s, 0 crashes/OOMs/timeouts, key, limits, toolchain and seeds match HEAD"
-      + (f", fuzzed at {gate.get('head')}" if os.environ["CHECK_HEAD"] == "1" else ""))
+print(f"{label} OK: {len(names)} targets x >= {required} s, 0 crashes/OOMs/timeouts, key, limits, toolchain and seeds match HEAD, fuzzed at {gate.get('head')}")
 PY

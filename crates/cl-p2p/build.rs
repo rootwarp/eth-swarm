@@ -2,7 +2,8 @@
 //!
 //! The gate (`fuzz/check-m2a-gate.sh`) vouches for a tree: its decoder key (`git rev-parse
 //! HEAD:<path>` of every keyed path and the sha256 of `Cargo.lock` and `fuzz/Cargo.lock`), the
-//! libFuzzer limits, the toolchain and cargo-fuzz pins, and the seed corpora. The values are
+//! libFuzzer limits, the toolchain and cargo-fuzz pins, the seed corpora, and the commits its
+//! `head` may name (`heads`: HEAD and its ancestors with HEAD's decoder key). The values are
 //! taken here, when the binary is built, not when it runs: a deployed binary has no checkout to
 //! look at, and values read at startup from whatever tree is there would describe that tree, not
 //! the binary.

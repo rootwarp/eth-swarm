@@ -36,6 +36,7 @@ cp "$repo"/fuzz/{m2a-common.sh,build-m2a.sh,run-m2a-gate.sh,check-m2a-gate.sh,ru
 cp "$repo/scripts/check-fuzz-lock.sh" "$fx/scripts/"
 for f in crates/p2p-wire/lib.rs crates/consensus-types/lib.rs crates/cl-p2p/src/rpc/codec.rs \
   crates/cl-p2p/src/rpc/mod.rs crates/cl-p2p/src/rpc/limits.rs crates/cl-p2p/src/rpc/metrics.rs \
+  crates/cl-p2p/src/rpc/unsupported.rs \
   crates/cl-p2p/src/gossip/mod.rs crates/cl-p2p/src/gossip/config.rs \
   crates/cl-discv5/src/enr.rs crates/network-config/src/lib.rs fuzz/src/lib.rs \
   fuzz/fuzz_targets/rpc_chunk.rs; do

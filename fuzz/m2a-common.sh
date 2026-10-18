@@ -23,13 +23,13 @@ M2A_BUILD_FLAGS=(-O -a)
 # The gate's decoder key: what the fuzzed decoder and its harness are built and run from. A
 # change to any of these makes a gate file stale. `git rev-parse HEAD:<path>` of each path, plus
 # the sha256 of both lockfiles. network-config is outside the key: none of its code runs on
-# peer bytes (the ContextTable is injected). cl-p2p's rpc codec is keyed with the two modules it
-# imports (limits, metrics). The manifests are in it because features (root
-# [workspace.dependencies] included) change the build without changing the lockfile; the
-# harness, seeds and these scripts (limits, build flags) because a weaker run must not keep an
-# old gate. fuzz/Cargo.lock is what the targets link; the root Cargo.lock is what the session
-# binary links, so a root bump (snap, say) makes the gate stale before fuzz/Cargo.lock follows
-# it (scripts/check-fuzz-lock.sh keeps the two alike).
+# peer bytes (the ContextTable is injected). cl-p2p's rpc codec is keyed with the modules it
+# imports (limits, metrics) and the one metrics imports (unsupported). The manifests are in it
+# because features (root [workspace.dependencies] included) change the build without changing
+# the lockfile; the harness, seeds and these scripts (limits, build flags) because a weaker run
+# must not keep an old gate. fuzz/Cargo.lock is what the targets link; the root Cargo.lock is
+# what the session binary links, so a root bump (snap, say) makes the gate stale before
+# fuzz/Cargo.lock follows it (scripts/check-fuzz-lock.sh keeps the two alike).
 M2A_KEY_PATHS=(
   Cargo.toml
   crates/p2p-wire
@@ -39,6 +39,7 @@ M2A_KEY_PATHS=(
   crates/cl-p2p/src/rpc/codec.rs
   crates/cl-p2p/src/rpc/limits.rs
   crates/cl-p2p/src/rpc/metrics.rs
+  crates/cl-p2p/src/rpc/unsupported.rs
   fuzz/Cargo.toml
   fuzz/rust-toolchain.toml
   fuzz/src
@@ -68,21 +69,19 @@ GATE1_KEY_PATHS=(
 # gate_select <m2a|gate1>: the gate the scripts run and check. Sets GATE_ID (the gate file's
 # "gate"), GATE_LABEL (for messages), GATE_TARGETS, GATE_KEY_PATHS (the files are M2A_KEY_FILES
 # for both), GATE_FILE (the default gate file under fuzz/artifacts/), GATE_WORK (the run's work
-# directory under fuzz/target/), GATE_RUNNER and GATE_CHECKER (the scripts, for messages), and
-# GATE_CHECK_HEAD: 1 if the checker holds the file's `head` to the commit it vouches for (gate 1;
-# the m2a file's rules are mirrored in the m2a-session binary, which does not read `head`, so the
-# m2a checker keeps its rules). Status 1 for another name.
+# directory under fuzz/target/), and GATE_RUNNER and GATE_CHECKER (the scripts, for messages).
+# Status 1 for another name.
 gate_select() {
   case $1 in
     m2a)
       GATE_ID=m2a-fuzz GATE_LABEL="m2a gate" GATE_FILE=m2a-gate.json GATE_WORK=m2a-gate
-      GATE_RUNNER=fuzz/run-m2a-gate.sh GATE_CHECKER=fuzz/check-m2a-gate.sh GATE_CHECK_HEAD=0
+      GATE_RUNNER=fuzz/run-m2a-gate.sh GATE_CHECKER=fuzz/check-m2a-gate.sh
       GATE_TARGETS=("${M2A_TARGETS[@]}")
       GATE_KEY_PATHS=("${M2A_KEY_PATHS[@]}")
       ;;
     gate1)
       GATE_ID=gate1-fuzz GATE_LABEL="gate 1" GATE_FILE=gate1.json GATE_WORK=gate1
-      GATE_RUNNER=fuzz/run-gate1.sh GATE_CHECKER=fuzz/check-gate1.sh GATE_CHECK_HEAD=1
+      GATE_RUNNER=fuzz/run-gate1.sh GATE_CHECKER=fuzz/check-gate1.sh
       GATE_TARGETS=("${GATE1_TARGETS[@]}")
       GATE_KEY_PATHS=("${GATE1_KEY_PATHS[@]}")
       ;;
@@ -492,4 +491,40 @@ m2a_key_json() {
     sep=', '
   done
   printf '%s}}\n' "$out"
+}
+
+# m2a_key_heads: prints, as one JSON array, HEAD and every ancestor of it (git rev-list HEAD,
+# newest first) whose decoder key is HEAD's: each keyed path names the same object there as in
+# HEAD (git cat-file --batch-check of <commit>:<path>; for the lockfiles the same blob, so the
+# same sha256). These are the commits a gate file of this tree may name as its `head`, the set
+# the checker's head rule accepts; the m2a-session binary, which has no git at run time, embeds
+# it. Fails if git or python3 does.
+m2a_key_heads() {
+  (
+    set -o pipefail
+    m2a_git rev-list HEAD |
+      python3 -I -c '
+import sys
+paths = sys.argv[1:]
+for rev in ["HEAD"] + sys.stdin.read().split():
+    for p in paths:
+        print(f"{rev}:{p} {rev}")
+' "${GATE_KEY_PATHS[@]}" "${M2A_KEY_FILES[@]}" |
+      m2a_git cat-file --batch-check='%(objectname) %(rest)' |
+      python3 -I -c '
+import json, sys
+keys = {}
+for line in sys.stdin.read().splitlines():
+    if line.endswith(" missing"):
+        rev, oid = line.split(":", 1)[0], None
+    else:
+        oid, rev = line.split(" ", 1)
+    keys.setdefault(rev, []).append(oid)
+head = keys.pop("HEAD")
+print(json.dumps([rev for rev, key in keys.items() if key == head]))
+'
+  ) || {
+    echo "ERROR: listing the commits with HEAD's decoder key failed" >&2
+    return 1
+  }
 }

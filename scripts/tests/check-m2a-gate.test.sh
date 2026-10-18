@@ -5,25 +5,33 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
+# shellcheck source=fuzz-gate-fixture.sh
+. "$here/fuzz-gate-fixture.sh"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 passed=0 failed=0
 ok() { passed=$((passed + 1)); echo "ok   - $1"; }
 bad() { failed=$((failed + 1)); echo "FAIL - $1"; }
-# check <expect: pass|fail> <description> <want in output or ""> <command...>
+# check <expect: pass|fail> <description> <want in output or ""> <command...>; with $unwanted
+# set, the output must not hold it either.
+unwanted=""
 check() {
   local expect=$1 desc=$2 want=$3 rc=0 out ok=0
   shift 3
   out=$("$@" 2>&1) || rc=$?
   if { [[ $expect == pass ]] && ((rc == 0)); } || { [[ $expect == fail ]] && ((rc != 0)); }; then ok=1; fi
   if ((ok)) && [[ -n $want ]] && ! grep -qF -- "$want" <<<"$out"; then ok=0; fi
+  if ((ok)) && [[ -n $unwanted ]] && grep -qF -- "$unwanted" <<<"$out"; then ok=0; fi
   if ((ok)); then
     passed=$((passed + 1)); echo "ok   - $desc"
   else
     failed=$((failed + 1)); echo "FAIL - $desc (exit $rc)"; printf '%s\n' "$out" | sed 's/^/       /'
   fi
 }
+
+# check_clean: check, and the output holds no Python traceback (every refusal is a message).
+check_clean() { unwanted=Traceback check "$@"; }
 
 g() { git -C "$fx" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false "$@"; }
 
@@ -48,6 +56,7 @@ echo 'pub mod codec;' > "$fx/crates/cl-p2p/src/rpc/mod.rs"
 echo 'pub fn read() {}' > "$fx/crates/cl-p2p/src/rpc/codec.rs"
 echo 'pub struct ChunkPacer;' > "$fx/crates/cl-p2p/src/rpc/limits.rs"
 echo 'pub struct RpcMetrics;' > "$fx/crates/cl-p2p/src/rpc/metrics.rs"
+echo 'pub struct Unsupported;' > "$fx/crates/cl-p2p/src/rpc/unsupported.rs"
 echo '[package]' > "$fx/fuzz/Cargo.toml"
 printf '[toolchain]\nchannel = "nightly-2026-10-17"\n' > "$fx/fuzz/rust-toolchain.toml"
 echo 'pub fn run() {}' > "$fx/fuzz/src/lib.rs"
@@ -57,6 +66,10 @@ echo 'version = 4' > "$fx/Cargo.lock"
 git init -q "$fx"
 g add -A
 g commit -q -m fixture
+# The commit before the keyed commit: a keyed file differs there, so its decoder key does too.
+before_key=$(g rev-parse HEAD)
+echo '// keyed change' >> "$fx/crates/cl-p2p/src/rpc/codec.rs"
+g commit -q -am "keyed change"
 checker="$fx/fuzz/check-m2a-gate.sh"
 
 expected=$(bash "$checker" --print-expected)
@@ -66,7 +79,7 @@ expected=$(bash "$checker" --print-expected)
 gate() {
   local file=$1
   shift
-  EXPECTED=$expected python3 -I - "$file" "$@" <<'PY'
+  EXPECTED=$expected HEAD_SHA=$(g rev-parse HEAD) python3 -I - "$file" "$@" <<'PY'
 import json, os, sys
 want = json.loads(os.environ["EXPECTED"])
 targets = ["status_v2", "metadata_v3", "ping_goodbye", "blocks_by_range_resp"]
@@ -74,6 +87,7 @@ gate = {
     "gate": "m2a-fuzz",
     "format": 1,
     "requested_seconds": 3600,
+    "head": os.environ["HEAD_SHA"],
     "dirty": False,
     "decoder_key": want["decoder_key"],
     "limits": want["limits"],
@@ -174,11 +188,82 @@ check fail "not JSON" "not valid JSON" bash "$checker" "$tmp/bad.json"
 check fail "no such file" "" bash "$checker" "$tmp/missing.json"
 check fail "no argument" "Usage" bash "$checker"
 
+# The commit the file names: a commit of this repository, an ancestor of HEAD, whose decoder key
+# is the file's (it was fuzzed at that commit; HEAD may have moved on outside the key).
+check fail "no head" "head: missing" bash "$checker" "$(gate "$tmp/nohead.json" 'del gate["head"]')"
+check fail "a head that is not a string" "head: missing" bash "$checker" \
+  "$(gate "$tmp/inthead.json" 'gate["head"] = 7')"
+for bad in "" abc "${before_key:0:39}" "${before_key}0" "$(tr '[:lower:]' '[:upper:]' <<<"$before_key")" \
+  "${before_key:0:39}g" "$before_key "; do
+  check fail "a malformed head '$bad'" "is not a 40-character lowercase hex commit id" bash "$checker" \
+    "$(gate "$tmp/badhead.json" "gate['head'] = '$bad'")"
+done
+check fail "the all-zero head" "is not a commit of this repository" bash "$checker" \
+  "$(gate "$tmp/zerohead.json" 'gate["head"] = "0" * 40')"
+check fail "an unknown head" "is not a commit of this repository" bash "$checker" \
+  "$(gate "$tmp/unknownhead.json" 'gate["head"] = "1234567" * 5 + "12345"')"
+tree=$(g rev-parse 'HEAD^{tree}')
+check fail "a head that names a tree, not a commit" "is not a commit of this repository" bash "$checker" \
+  "$(gate "$tmp/treehead.json" "gate['head'] = '$tree'")"
+g checkout -q -b side
+echo 'side' > "$fx/side.txt"
+g add side.txt
+g commit -q -m side
+side=$(g rev-parse HEAD)
+g checkout -q -
+g branch -q -D side
+check fail "a head off this branch (not an ancestor of HEAD)" "is not an ancestor of HEAD" bash "$checker" \
+  "$(gate "$tmp/sidehead.json" "gate['head'] = '$side'")"
+check fail "a head whose decoder key is not the file's" "the decoder key at $before_key is not the file's" \
+  bash "$checker" "$(gate "$tmp/oldhead.json" "gate['head'] = '$before_key'")"
+# An ancestor that lacks a keyed path: its key cannot be computed, and git's reason is the error.
+g rm -q fuzz/run-m2a-gate.sh
+g commit -q -m "drop a keyed path"
+dropped=$(g rev-parse HEAD)
+g checkout -q HEAD~1 -- fuzz/run-m2a-gate.sh
+g commit -q -m "restore it"
+check pass "the file holds again once the keyed path is back" "m2a gate OK" bash "$checker" "$tmp/ok.json"
+check_clean fail "a head whose decoder key cannot be computed" \
+  "head: the decoder key at $dropped cannot be computed: ERROR: fuzz/run-m2a-gate.sh is not in $dropped" \
+  bash "$checker" "$(gate "$tmp/drophead.json" "gate['head'] = '$dropped'")"
+g reset -q --hard HEAD~2
+# git's stderr is not part of the key: a warning leaves a valid file valid.
+fake_git "$tmp/warn-bin" 'echo "warning: a harmless git warning" >&2'
+check_clean pass "a git that warns on stderr" "m2a gate OK" env PATH="$tmp/warn-bin:$PATH" bash "$checker" "$tmp/ok.json"
+# A key that is not JSON is an error, not a traceback.
+fake_git "$tmp/garble-bin" "for a in \"\$@\"; do [[ \$a != $before_key:Cargo.toml ]] || echo '\"'; done"
+check_clean fail "a decoder key at head that does not parse" "head: the decoder key at $before_key" \
+  env PATH="$tmp/garble-bin:$PATH" bash "$checker" "$(gate "$tmp/garble.json" "gate['head'] = '$before_key'")"
+# The file is read once: one swapped for another between the head check and the other rules is
+# not seen, and the report names the head that was checked.
+cp "$tmp/ok.json" "$tmp/swap.json"
+gate "$tmp/swapped.json" 'gate["head"] = "0" * 40' >/dev/null
+fake_git "$tmp/swap-bin" "for a in \"\$@\"; do [[ \$a != merge-base ]] || cp $(printf %q "$tmp/swapped.json") $(printf %q "$tmp/swap.json"); done"
+check pass "a file swapped during the check is checked as first read" "fuzzed at $(g rev-parse HEAD)" \
+  env PATH="$tmp/swap-bin:$PATH" bash "$checker" "$tmp/swap.json"
+if cmp -s "$tmp/swap.json" "$tmp/swapped.json"; then ok "(the swap took place)"; else bad "the swap did not take place"; fi
+# HEAD moves on outside the key: the file still names the commit it was fuzzed at, and the
+# expected values (what the m2a-session binary embeds) list the commits a file may name: HEAD and
+# each ancestor with its decoder key, newest first.
+fuzzed=$(g rev-parse HEAD)
+echo 'notes' > "$fx/NOTES.md"
+g add NOTES.md
+g commit -q -m "outside the key"
+check pass "a head behind HEAD with the same key" "m2a gate OK" bash "$checker" \
+  "$(gate "$tmp/behind.json" "gate['head'] = '$fuzzed'")"
+heads=$(bash "$checker" --print-expected | python3 -I -c 'import json, sys; print(" ".join(json.load(sys.stdin)["heads"]))') || heads=""
+if [[ $heads == "$(g rev-parse HEAD) $fuzzed" ]]; then
+  ok "the expected heads are HEAD and its ancestors with its key"
+else
+  bad "expected heads: '$heads', want '$(g rev-parse HEAD) $fuzzed' (not $before_key)"
+fi
+g reset -q --hard HEAD~1
+
 ok="$tmp/ok.json"
 # Every keyed path, once changed and committed, makes the old gate stale.
 for path in Cargo.toml Cargo.lock fuzz/Cargo.lock crates/p2p-wire/src/lib.rs crates/consensus-types/src/lib.rs \
   crates/cl-p2p/Cargo.toml crates/cl-p2p/src/rpc/mod.rs crates/cl-p2p/src/rpc/codec.rs \
-  crates/cl-p2p/src/rpc/limits.rs crates/cl-p2p/src/rpc/metrics.rs \
+  crates/cl-p2p/src/rpc/limits.rs crates/cl-p2p/src/rpc/metrics.rs crates/cl-p2p/src/rpc/unsupported.rs \
   fuzz/Cargo.toml fuzz/rust-toolchain.toml fuzz/src/lib.rs fuzz/fuzz_targets/status_v2.rs \
   fuzz/corpus/status_v2/valid fuzz/corpus-slow/blocks_by_range_resp/slow-seed fuzz/m2a-common.sh fuzz/build-m2a.sh fuzz/run-m2a-gate.sh; do
   echo '# changed' >> "$fx/$path"

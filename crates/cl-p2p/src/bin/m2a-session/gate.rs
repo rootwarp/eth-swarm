@@ -9,6 +9,10 @@
 //! - `gate` is `"m2a-fuzz"` and `format` is 1;
 //! - `requested_seconds` is an integer of at least [`REQUIRED_SECONDS`];
 //! - `dirty` is `false`;
+//! - `head` is one of the expected `heads`: the build's commit or an ancestor of it with its
+//!   decoder key (`m2a_key_heads`), so the file names a commit that was fuzzed for this build.
+//!   The script checks the same with git (a commit of the repository, an ancestor of HEAD, its
+//!   key from git the file's); this binary has no git at run time, so `build.rs` embeds the set;
 //! - `decoder_key`, `limits` and `cargo_fuzz` equal the expected values exactly, and so do
 //!   `toolchain.channel` and `toolchain.rustc_commit`;
 //! - `overrides` is `{}`: no tool override (`CARGO`, `RUSTC`, `FUZZ_TOOLCHAIN`,
@@ -23,12 +27,15 @@
 //! refused files (`tests::rule_cases`), and where the harness is in the tree they run the real
 //! script on every one of them and require the same verdict.
 //!
+//! Like the script, the file is read once: every rule is checked against the one read.
+//!
 //! Where the script compares with Python's `==`, this is stricter about types: `crashes`,
 //! `ooms`, `timeouts`, `exit_code` and `format` must be JSON integers (Python would also take
 //! `false` or `0.0` for 0, or `1.0` for 1), and numbers inside `limits` compare as JSON values
 //! (`2048.0` is not `2048`). `run-m2a-gate.sh` only ever writes integers there.
 
 use serde_json::{Map, Value};
+use std::io::Read as _;
 use std::path::Path;
 
 /// `M2A_TARGETS`: the four response decoders the session runs on peer bytes.
@@ -41,13 +48,14 @@ pub const TARGETS: [&str; 4] = [
 /// `M2A_REQUIRED_SECONDS`: the fuzzing time each target needs.
 pub const REQUIRED_SECONDS: u64 = 3600;
 /// What `check-m2a-gate.sh --print-expected` prints, every one required.
-pub const EXPECTED_KEYS: [&str; 6] = [
+pub const EXPECTED_KEYS: [&str; 7] = [
     "decoder_key",
     "limits",
     "toolchain",
     "cargo_fuzz",
     "corpus_sha256",
     "min_seed_ft",
+    "heads",
 ];
 /// A gate file larger than this is not one `run-m2a-gate.sh` wrote.
 const MAX_GATE_BYTES: u64 = 1 << 20;
@@ -72,10 +80,19 @@ impl Expected {
             return Self::Unavailable(unavailable.to_owned());
         }
         match serde_json::from_str::<Value>(expected) {
-            Ok(v) if EXPECTED_KEYS.iter().all(|k| v.get(k).is_some()) => Self::Known(v),
+            Ok(v) if EXPECTED_KEYS.iter().all(|k| v.get(k).is_some()) && heads_ok(&v["heads"]) => {
+                Self::Known(v)
+            }
             _ => Self::Unavailable("the embedded gate expectations are malformed".to_owned()),
         }
     }
+}
+
+/// `heads` is a non-empty list of commit ids.
+fn heads_ok(heads: &Value) -> bool {
+    heads
+        .as_array()
+        .is_some_and(|h| !h.is_empty() && h.iter().all(Value::is_string))
 }
 
 /// The default gate file: `fuzz/artifacts/m2a-gate.json` of the checkout the binary was built
@@ -117,13 +134,23 @@ pub fn check(path: &Path, expected: &Expected) -> Result<(), GateError> {
         path: shown.clone(),
         reason,
     };
-    let meta = std::fs::metadata(path).map_err(|e| read_err(e.to_string()))?;
-    if !meta.is_file() || meta.len() > MAX_GATE_BYTES {
-        return Err(read_err(format!(
+    let too_big = || {
+        read_err(format!(
             "not a regular file of at most {MAX_GATE_BYTES} bytes"
-        )));
+        ))
+    };
+    let file = std::fs::File::open(path).map_err(|e| read_err(e.to_string()))?;
+    let meta = file.metadata().map_err(|e| read_err(e.to_string()))?;
+    if !meta.is_file() || meta.len() > MAX_GATE_BYTES {
+        return Err(too_big());
     }
-    let text = std::fs::read(path).map_err(|e| read_err(e.to_string()))?;
+    let mut text = Vec::new();
+    file.take(MAX_GATE_BYTES + 1)
+        .read_to_end(&mut text)
+        .map_err(|e| read_err(e.to_string()))?;
+    if text.len() as u64 > MAX_GATE_BYTES {
+        return Err(too_big());
+    }
     let gate: Value =
         serde_json::from_slice(&text).map_err(|e| read_err(format!("not valid JSON: {e}")))?;
     let errors = rules(&gate, want);
@@ -177,6 +204,9 @@ fn rules(gate: &Value, want: &Value) -> Vec<String> {
             show(obj.get("dirty"))
         ));
     }
+    if let Some(e) = head_rule(obj.get("head"), &want["heads"]) {
+        errors.push(e);
+    }
     if obj.get("decoder_key") != want.get("decoder_key") {
         errors.extend(key_diff(obj.get("decoder_key"), &want["decoder_key"]));
     }
@@ -216,6 +246,29 @@ fn rules(gate: &Value, want: &Value) -> Vec<String> {
     }
     errors.extend(target_rules(obj.get("targets"), required, want));
     errors
+}
+
+/// Why `head` is not one of `heads` (the build's commit and its ancestors with its decoder key),
+/// if it is not. A commit id is as long as theirs: 40 hex digits, or 64 in a sha256 repository.
+fn head_rule(head: Option<&Value>, heads: &Value) -> Option<String> {
+    let Some(Value::String(head)) = head else {
+        return Some("head: missing, or not a string".to_owned());
+    };
+    let heads = heads.as_array().map_or(&[][..], Vec::as_slice);
+    let len = heads.first().and_then(Value::as_str).map_or(40, str::len);
+    let hex = |c: char| c.is_ascii_digit() || ('a'..='f').contains(&c);
+    if head.len() != len || !head.chars().all(hex) {
+        let shown: String = head.chars().take(80).collect();
+        return Some(format!(
+            "head: {shown:?} is not a {len}-character lowercase hex commit id"
+        ));
+    }
+    if heads.iter().any(|h| h.as_str() == Some(head)) {
+        return None;
+    }
+    Some(format!(
+        "head: {head} is not the build's commit or an ancestor of it with its decoder key: it was not fuzzed for this build"
+    ))
 }
 
 /// The keyed entries where the gate's key and ours differ.
@@ -356,7 +409,8 @@ pub(crate) mod tests {
             "min_seed_ft": {
                 "status_v2": 200, "metadata_v3": 200, "ping_goodbye": 200,
                 "blocks_by_range_resp": 2000
-            }
+            },
+            "heads": ["9a".repeat(20), "8b".repeat(20)]
         })
     }
 
@@ -379,7 +433,7 @@ pub(crate) mod tests {
             .collect();
         json!({
             "gate": "m2a-fuzz", "format": 1, "requested_seconds": 3600,
-            "head": "9".repeat(40), "dirty": false, "decoder_key": want["decoder_key"],
+            "head": want["heads"][0], "dirty": false, "decoder_key": want["decoder_key"],
             "toolchain": {
                 "channel": want["toolchain"]["channel"],
                 "rustc_commit": want["toolchain"]["rustc_commit"],
@@ -639,6 +693,50 @@ pub(crate) mod tests {
                 edit(|g| g["targets"][0]["completed"] = json!(false)),
                 Refuses,
             ),
+            ("head: missing", edit(|g| g["head"] = json!(null)), Refuses),
+            (
+                "head: missing",
+                edit(|g| {
+                    g.as_object_mut().unwrap().remove("head");
+                }),
+                Refuses,
+            ),
+            ("head: missing", edit(|g| g["head"] = json!(7)), Refuses),
+            (
+                "lowercase hex commit id",
+                edit(|g| g["head"] = json!("")),
+                Refuses,
+            ),
+            (
+                "lowercase hex commit id",
+                edit(|g| g["head"] = json!(g["head"].as_str().unwrap().to_uppercase())),
+                Refuses,
+            ),
+            (
+                "lowercase hex commit id",
+                edit(|g| g["head"] = json!(format!("{}0", g["head"].as_str().unwrap()))),
+                Refuses,
+            ),
+            (
+                "lowercase hex commit id",
+                edit(|g| g["head"] = json!(g["head"].as_str().unwrap()[1..].to_owned())),
+                Refuses,
+            ),
+            (
+                "lowercase hex commit id",
+                edit(|g| g["head"] = json!(format!("{} ", g["head"].as_str().unwrap()))),
+                Refuses,
+            ),
+            (
+                "was not fuzzed for this build",
+                edit(|g| g["head"] = json!("0".repeat(40))),
+                Refuses,
+            ),
+            (
+                "was not fuzzed for this build",
+                edit(|g| g["head"] = json!("1234567".repeat(5) + "12345")),
+                Refuses,
+            ),
             ("not a JSON object", json!([1]), Refuses),
         ]
     }
@@ -653,6 +751,26 @@ pub(crate) mod tests {
                 "want {want:?} in {errors:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_head_behind_the_build_with_its_key_passes() {
+        let want = fixture_expected();
+        let mut gate = passing_gate(&want);
+        gate["head"] = want["heads"][1].clone();
+        assert!(errors_of(&gate).is_empty(), "{:?}", errors_of(&gate));
+        // The heads are 64 characters long in a sha256 repository.
+        let mut want = fixture_expected();
+        want["heads"] = json!(["ab".repeat(32)]);
+        let gate = passing_gate(&want);
+        assert!(rules(&gate, &want).is_empty(), "{:?}", rules(&gate, &want));
+        let mut short = gate.clone();
+        short["head"] = json!("ab".repeat(20));
+        let errors = rules(&short, &want);
+        assert!(
+            errors.iter().any(|e| e.contains("64-character")),
+            "{errors:?}"
+        );
     }
 
     #[test]
@@ -714,6 +832,38 @@ pub(crate) mod tests {
                 .into_iter()
                 .map(|(rule, gate, by_script)| (rule, gate, Some(by_script))),
         );
+        // The heads that need this repository: HEAD's tree (not a commit) and the newest
+        // ancestor with another decoder key (absent from a shallow clone).
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let mut tree = passing_gate(&want);
+        tree["head"] = Value::from(git(&["rev-parse", "HEAD^{tree}"]).trim());
+        cases.push(("a tree as head", tree, Some(Script::Refuses)));
+        let heads = want["heads"].as_array().unwrap();
+        if let Some(older) = git(&["rev-list", "HEAD"])
+            .lines()
+            .find(|c| !heads.contains(&Value::from(*c)))
+        {
+            let mut gate = passing_gate(&want);
+            gate["head"] = Value::from(older);
+            cases.push(("an ancestor with another key", gate, Some(Script::Refuses)));
+        }
+        if let Some(behind) = heads.get(1) {
+            let mut gate = passing_gate(&want);
+            gate["head"] = behind.clone();
+            cases.push(("a head behind HEAD with its key", gate, None));
+        }
         for (i, (rule, gate, by_script)) in cases.into_iter().enumerate() {
             let path = dir.path().join(format!("case-{i}.json"));
             std::fs::write(&path, gate.to_string()).unwrap();
@@ -725,10 +875,7 @@ pub(crate) mod tests {
                 other => panic!("{rule}: the script exited {other:?}: {out:?}"),
             };
             match by_script {
-                None => assert!(
-                    ours && theirs,
-                    "the passing file: ours {ours}, script {out:?}"
-                ),
+                None => assert!(ours && theirs, "{rule}: ours {ours}, script {out:?}"),
                 Some(Script::Refuses) => {
                     assert!(!ours && !theirs, "{rule}: ours {ours}, script {theirs}")
                 }
@@ -795,6 +942,17 @@ pub(crate) mod tests {
             Expected::from_build(&no_floors.to_string(), ""),
             Expected::Unavailable(_)
         ));
+        for heads in [json!(null), json!([]), json!("9a"), json!([7])] {
+            let mut bad = fixture_expected();
+            bad["heads"] = heads.clone();
+            assert!(
+                matches!(
+                    Expected::from_build(&bad.to_string(), ""),
+                    Expected::Unavailable(_)
+                ),
+                "{heads}"
+            );
+        }
         for bad in ["[]", "{}", "not json", r#"{"decoder_key": {}}"#] {
             assert!(
                 matches!(Expected::from_build(bad, ""), Expected::Unavailable(_)),

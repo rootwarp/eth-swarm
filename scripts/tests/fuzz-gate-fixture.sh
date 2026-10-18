@@ -1,5 +1,16 @@
-# Shared by the fuzz gate script tests (run-m2a-gate, run-gate1): offline stand-ins for
-# cargo-fuzz and the compiler. Source it. Works on bash 3.2.
+# Shared by the fuzz gate script tests (run-m2a-gate, run-gate1, check-m2a-gate, check-gate1):
+# offline stand-ins for cargo-fuzz, the compiler and git. Source it. Works on bash 3.2.
+
+fixture_real_git=$(command -v git)
+
+# fake_git <bin dir> <bash lines>: writes a `git` there (put it first on PATH) that runs the
+# lines, then the real git with the same arguments. The scripts run git with a cleared
+# environment (m2a_git), so the lines hold their values themselves, quoted (printf %q).
+fake_git() {
+  mkdir -p "$1"
+  printf '#!/usr/bin/env bash\n%s\nexec %q "$@"\n' "$2" "$fixture_real_git" > "$1/git"
+  chmod +x "$1/git"
+}
 
 # fake_fuzz_tools <bin dir>: writes a fake `cargo` and `rustc` there (put it first on PATH).
 #   - cargo logs each call to $CALLS (an offline call once more, as "offline: <args>"), then
