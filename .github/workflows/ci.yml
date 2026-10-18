@@ -43,6 +43,8 @@ jobs:
         run: bash testing/kurtosis/tests/run-pair.test.sh
       - name: Probe systemd units (own user, nodekey credential, anchor check, hardening)
         run: bash ops/probe/tests/probe-units.test.sh
+      - name: Early-exit pipe guard the ops suites run on themselves (flagged and clean snippets)
+        run: bash ops/tests/early-exit-guard.test.sh
 
   proto:
     name: buf lint, build, breaking vs develop, baseline drift

@@ -1,0 +1,113 @@
+#### a here-string
+grep -Fxq -- "$want" <<<"$lines"
+#### || is not a pipe
+grep -q x f || true
+#### >| is a redirection, not a pipe
+printf '%s\n' "$out" >| head
+#### a full-reading grep
+printf '%s\n' "$out" | grep -E y
+#### grep -c
+printf '%s\n' "$out" | grep -c x
+#### grep -A1 and -o
+printf '%s\n' "$out" | grep -o -A1 x
+#### grep -s is no-messages, not quiet
+printf '%s\n' "$out" | grep -s x
+#### grep -eq takes q as its pattern
+printf '%s\n' "$out" | grep -eq
+#### grep -e -q takes -q as its pattern
+printf '%s\n' "$out" | grep -e -q
+#### grep -- -q takes -q as its pattern
+printf '%s\n' "$out" | grep -- -q
+#### grep -f file, then a q-named file
+printf '%s\n' "$out" | grep -f q
+#### head -n -1 reads all but the last line
+printf '%s\n' "$out" | head -n -1
+#### tail reads the whole input
+printf '%s\n' "$out" | tail -n1
+#### awk without an exit
+printf '%s\n' "$out" | awk '{ print $1 }'
+#### awk with an exit only in END
+printf '%s\n' "$out" | awk '$0 == "x" { n++ } END { exit n == 0 }'
+#### awk with exit inside a longer name
+printf '%s\n' "$out" | awk '{ exit_code = 1; print exit_code }'
+#### awk -f program file
+printf '%s\n' "$out" | awk -f prog.awk
+#### sed with q in the s regex and replacement
+printf '%s\n' "$out" | sed 's/q/Q/g'
+#### sed with q in an address regex
+printf '%s\n' "$out" | sed '/quit/d'
+#### sed with q in a custom-delimited regex
+printf '%s\n' "$out" | sed 's|q|x|; \,q,d'
+#### sed y with q
+printf '%s\n' "$out" | sed 'y/abc/qqq/'
+#### sed with q in append text and a label
+printf '%s\n' "$out" | sed -e ':quit' -e 'a quit' -e 'b quit'
+#### sed -n p
+printf '%s\n' "$out" | sed -n 's/^x=//p'
+#### a pipe in single quotes
+echo 'a | grep -q x'
+#### a pipe in double quotes
+echo "a | grep -q x"
+#### a pipe in a multi-line string
+msg="a |
+head -1"
+#### a pipe in an ANSI-C string
+echo $'a | grep -q x\' | head'
+#### an escaped pipe
+echo a \| grep -q x
+#### a pipe in a parameter expansion
+x=${y//|/ grep -q }
+#### a pipe in arithmetic
+n=$(( mask | head ))
+#### a pipe in an arithmetic command
+(( n = mask | head ))
+#### a comment line
+# printf a | grep -q x
+#### a trailing comment
+echo a # | grep -q x
+#### a comment after a trailing pipe
+printf '%s\n' "$out" | # | grep -q x
+  sort
+#### a hash inside a word
+echo a#b | sort
+#### $# is not a comment
+echo $# | sort
+#### a quoted heredoc
+cat <<'EOF'
+printf a | grep -q x
+EOF
+#### an unquoted heredoc
+cat <<EOF
+printf a | head -1
+EOF
+#### a <<- heredoc with tab-indented body and terminator
+	cat <<-"END"
+	printf a | grep -q x
+	END
+#### a heredoc delimiter that only matches the whole line
+cat <<EOF
+EOF x | grep -q y
+ EOF
+EOF
+#### two heredocs on one line
+cat <<A <<'B'
+a | grep -q x
+A
+b | head -1
+B
+#### the pipeline ends at the newline
+printf '%s\n' "$out" | sort
+grep -q x f
+#### a reader in the next command after ;
+printf '%s\n' "$out" | grep x; grep -q y f
+#### a reader in the next command after &&
+printf '%s\n' "$out" | sort && head -1 f
+#### a while-read loop reads the whole input
+printf '%s\n' "$out" | while IFS= read -r line; do :; done
+#### a case pattern
+case $x in a|b) ;; esac
+#### a backslash continuation with no pipe
+grep -q x \
+  f
+#### an assignment to a variable named head
+printf '%s\n' "$out" | head_lines=3 sort

@@ -19,37 +19,11 @@ bad() {
   if [[ -n ${2:-} ]]; then printf '%s\n' "$2" | sed 's/^/       /'; fi
 }
 
-# early_exit_pipes FILE: each line where a pipe feeds grep -q, grep -m or head. Such a reader can
-# exit before its writer is done; the writer dies of SIGPIPE and, under pipefail, a match reads
-# as "not found". Checks read a here-string instead (`grep -q -- "$want" <<<"$text"`). A line
-# that ends in a pipe continues onto the next; `||` is not a pipe; comments are skipped.
-early_exit_pipes() {
-  awk '
-    { line = (prev ~ /(^|[^|])\|[[:space:]]*$/ ? "| " : "") $0; prev = $0 }
-    line ~ /^[[:space:]]*#/ { next }
-    line ~ /(^|[^|])\|[[:space:]]*(grep[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-[A-Za-z]*[qm]|head([[:space:]]|$))/ {
-      print FILENAME ":" FNR ": " $0; found = 1
-    }
-    END { exit found }
-  ' "$1"
-}
-bar='|'
-printf '%s\n' "a $bar grep -Fxq -- y" "a $bar grep -E -q y" "a $bar head -n1" "a $bar" "  grep -m1 y" \
-  >"$tmp/early-exit.sh"
-printf '%s\n' 'grep -Fxq -- "$want" <<<"$lines"' "grep -q x f $bar$bar true" "a $bar$bar" '  grep -q x f' \
-  "a $bar grep -E y" "# a $bar grep -q y" >"$tmp/no-early-exit.sh"
-if pipes=$(early_exit_pipes "$tmp/early-exit.sh"); then
-  bad "the early-exit pipe check misses a pipe into grep -q, grep -m or head"
-elif [[ $(grep -c . <<<"$pipes") != 4 ]]; then
-  bad "the early-exit pipe check flags the wrong lines (want 4)" "$pipes"
-else
-  ok "the early-exit pipe check flags pipes into grep -q, grep -m and head"
-fi
-if pipes=$(early_exit_pipes "$tmp/no-early-exit.sh"); then
-  ok "the early-exit pipe check passes here-strings, ||, comments and a full-reading grep"
-else
-  bad "the early-exit pipe check flags a line that reads its whole input" "$pipes"
-fi
+# No check here pipes into a reader that can exit early (grep -q, head, ...): under pipefail
+# the writer can die of SIGPIPE and a match reads as "not found". The guard is tested by
+# ops/tests/early-exit-guard.test.sh.
+# shellcheck source=ops/tests/early-exit-guard.sh
+. "$here/../../tests/early-exit-guard.sh"
 if pipes=$(early_exit_pipes "$here/$(basename "${BASH_SOURCE[0]}")"); then
   ok "no check in this script pipes into an early-exiting reader"
 else

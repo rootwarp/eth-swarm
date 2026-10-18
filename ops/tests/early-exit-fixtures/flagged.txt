@@ -1,0 +1,142 @@
+#### 1 grep -q
+printf '%s\n' "$out" | grep -q x
+#### 1 grep -Fxq, a cluster that ends in q
+printf '%s\n' "$out" | grep -Fxq -- "$want"
+#### 1 grep -qE, a cluster that starts with q
+printf '%s\n' "$out" | grep -qE 'a|b'
+#### 1 grep -E -q, q as a later option
+printf '%s\n' "$out" | grep -E -q x
+#### 1 grep -e pattern -q
+printf '%s\n' "$out" | grep -e x -q
+#### 1 grep pattern -q, an option after the operand
+printf '%s\n' "$out" | grep x -q
+#### 1 grep --quiet
+printf '%s\n' "$out" | grep --quiet x
+#### 1 grep --silent
+printf '%s\n' "$out" | grep --silent x
+#### 1 grep --max-count=1
+printf '%s\n' "$out" | grep --max-count=1 x
+#### 1 grep --max-count 1
+printf '%s\n' "$out" | grep --max-count 1 x
+#### 1 grep -m1
+printf '%s\n' "$out" | grep -m1 x
+#### 1 grep -m 1
+printf '%s\n' "$out" | grep -m 1 x
+#### 1 grep -cm1
+printf '%s\n' "$out" | grep -cm1 x
+#### 1 grep -l
+printf '%s\n' "$out" | grep -l x
+#### 1 grep -q with a quoted option
+printf '%s\n' "$out" | grep "-q" x
+#### 1 egrep -q
+printf '%s\n' "$out" | egrep -q 'a|b'
+#### 1 fgrep -q
+printf '%s\n' "$out" | fgrep -q x
+#### 1 head
+printf '%s\n' "$out" | head
+#### 1 head -n1
+printf '%s\n' "$out" | head -n1
+#### 1 head -n 1
+printf '%s\n' "$out" | head -n 1
+#### 1 head -1
+printf '%s\n' "$out" | head -1
+#### 1 head --lines=2
+printf '%s\n' "$out" | head --lines=2
+#### 1 head -c 4
+printf '%s\n' "$out" | head -c 4
+#### 1 awk with an exit in a rule
+printf '%s\n' "$out" | awk '/x/ { print; exit }'
+#### 1 awk -F: with an exit
+printf '%s\n' "$out" | awk -F: '$1 == "x" { found = 1; exit }'
+#### 1 awk -v with an exit status
+printf '%s\n' "$out" | awk -v want=x '$0 == want { exit 0 } END { exit 1 }'
+#### 1 awk with an exit in BEGIN
+printf '%s\n' "$out" | awk 'BEGIN { exit }'
+#### 1 gawk with an exit
+printf '%s\n' "$out" | gawk 'NR == 1 { exit }'
+#### 1 sed -n '1p;q'
+printf '%s\n' "$out" | sed -n '1p;q'
+#### 1 sed q
+printf '%s\n' "$out" | sed q
+#### 1 sed 5q
+printf '%s\n' "$out" | sed 5q
+#### 1 sed with q in a later -e
+printf '%s\n' "$out" | sed -e 's/a/b/' -e '/x/q'
+#### 1 sed Q after an address range
+printf '%s\n' "$out" | sed '/^a/,/^b/Q'
+#### 1 sed q inside a block
+printf '%s\n' "$out" | sed -n '/x/{p;q;}'
+#### 2 a trailing pipe, the reader on the next line
+printf '%s\n' "$out" |
+  grep -q x
+#### 4 a trailing pipe, then a comment line and a blank line
+printf '%s\n' "$out" |
+  # the reader
+
+  grep -q x
+#### 2 a trailing pipe with a comment after it
+printf '%s\n' "$out" | # why
+  grep -q x
+#### 2 a backslash continuation before the pipe
+printf '%s\n' "$out" \
+  | grep -q x
+#### 1 a backslash continuation inside the reader's options
+printf '%s\n' "$out" | grep \
+  -q x
+#### 3 several continuations
+printf '%s\n' \
+  "$out" \
+  | head \
+  -n1
+#### 1 command grep -q
+printf '%s\n' "$out" | command grep -q x
+#### 1 env grep -q
+printf '%s\n' "$out" | env grep -q x
+#### 1 env -i with an assignment
+printf '%s\n' "$out" | env -i LC_ALL=C grep -q x
+#### 1 an assignment prefix
+printf '%s\n' "$out" | LC_ALL=C grep -q x
+#### 1 a backslash-escaped name
+printf '%s\n' "$out" | \grep -q x
+#### 1 a full path
+printf '%s\n' "$out" | /usr/bin/grep -q x
+#### 1 a quoted name
+printf '%s\n' "$out" | "grep" -q x
+#### 1 a reader inside a command substitution
+first=$(printf '%s\n' "$out" | head -n1)
+#### 1 a command substitution inside double quotes
+echo "first: $(printf '%s\n' "$out" | head -1)"
+#### 1 backticks
+first=`printf '%s\n' "$out" | head -1`
+#### 1 a pipe before ||
+if printf '%s\n' "$out" | grep -q x || true; then :; fi
+#### 1 a pipe after !
+if ! printf '%s\n' "$out" | grep -Fxq -- "$want"; then echo missing; fi
+#### 1 |&
+printf '%s\n' "$out" |& grep -q x
+#### 1 a subshell reader
+printf '%s\n' "$out" | (grep -q x)
+#### 1 a brace-group reader
+printf '%s\n' "$out" | { grep -q x; }
+#### 1 a pipe after a heredoc operator on the same line
+cat <<EOF | grep -q x
+a
+EOF
+#### 4 code after a heredoc body
+cat <<'EOF'
+printf a | grep -q x
+EOF
+printf '%s\n' "$out" | grep -q y
+#### 4 code after a <<- heredoc body
+	cat <<-EOF
+	printf a | grep -q x
+	EOF
+	printf '%s\n' "$out" | grep -q y
+#### 3 code after a multi-line string
+msg="a |
+head"
+printf '%s\n' "$out" | grep -q y
+#### 1 the second command on a line
+printf '%s\n' "$out" | sort; printf '%s\n' "$out" | grep -q x
+#### 1 a later reader in a longer pipeline
+printf '%s\n' "$out" | sort | uniq | grep -q x
