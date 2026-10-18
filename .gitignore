@@ -23,3 +23,8 @@ rustc-ice-*.txt
 /execution-apis/
 # LLVM coverage profiles (cargo llvm-cov, instrumented nested test runs)
 *.profraw
+# The reference node moved from ops/sepolia-ref to ops/ref-node: a secret or run log left at
+# the old path must never be committed.
+/ops/sepolia-ref/.env
+/ops/sepolia-ref/.env.*
+/ops/sepolia-ref/run-log-*.md

@@ -1,0 +1,5 @@
+.env
+.env.*
+!.env.example
+!.env.hoodi.example
+run-log-*.md

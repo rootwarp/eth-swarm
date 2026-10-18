@@ -1,6 +1,6 @@
-"""Verdicts on beacon API answers for the Sepolia reference node (ops/sepolia-ref).
+"""Verdicts on beacon API answers for the reference node (ops/ref-node, Sepolia or Hoodi).
 
-Shared by preflight.sh (against the checkpoint-sync endpoint) and collect-run-log.sh (against
+Shared by preflight.sh (against the checkpoint-sync providers) and collect-run-log.sh (against
 the local node). Every command reads files the caller fetched, prints its evidence on stdout
 and exits 0 on a pass, 1 on a fail, 2 on a usage or input error. Standard library only, run
 with `python3 -I`.
@@ -26,19 +26,35 @@ with `python3 -I`.
         An anchor that is absent, null or without `oldest_block_slot` proves nothing about the
         oldest block, so it fails (closed: never read as "blocks from genesis").
 
-    identity IDENTITY_JSON PUBLIC_IP
+    identity IDENTITY_JSON PUBLIC_IP P2P_PORT
         /eth/v1/node/identity: peer_id (base58), p2p_addresses and metadata.custody_group_count,
-        and the m2a-session multiaddr /ip4/<ip>/tcp/9000/p2p/<peer_id>. <ip> is PUBLIC_IP when
-        it is not empty, else the first global IPv4 address among p2p_addresses. Value lines are
-        `key: value`; anything wrong is an `error: ...` line, never a value line.
+        and the m2a-session multiaddr /ip4/<ip>/tcp/<P2P_PORT>/p2p/<peer_id> (P2P_PORT is
+        Lighthouse's configured libp2p TCP port). <ip> is PUBLIC_IP when it is not empty, else
+        the first global IPv4 address among p2p_addresses. Value lines are `key: value`;
+        anything wrong is an `error: ...` line, never a value line.
+
+    anchor-compare HEADER_1_JSON HEADER_2_JSON
+        Two checkpoint providers agree on the anchor: HEADER_1 is provider 1's
+        /eth/v1/beacon/headers/finalized, HEADER_2 provider 2's /eth/v1/beacon/headers/<that
+        slot>. Both must name the same slot, block root and header state_root, and both must
+        hold the header as canonical. A root that is not 32 bytes of hex, or a header
+        without a slot, is an input error.
+
+    header-slot HEADER_JSON
+        The slot of a /eth/v1/beacon/headers answer (decimal), for fetching provider 2's
+        header at provider 1's finalized slot.
+
     container INSPECT_JSON SERVICE DATA_ROOT UID GID PINNED_IMAGE_ID
         One running container (`docker inspect <id>`) against what compose.yaml asks for, one
         line per check: the pinned image ID; Config.User is exactly UID:GID, neither 0;
         ReadonlyRootfs; CapDrop holds ALL and CapAdd is empty; SecurityOpt is exactly
         no-new-privileges:true (so no seccomp or AppArmor profile is switched off); not
         Privileged; NetworkMode host; no GroupAdd and no Devices; PidMode and IpcMode neither
-        host nor another container's, UTSMode not host, and CgroupnsMode, when the engine
-        reports one, not host; exactly two mounts, DATA_ROOT/SERVICE/data on /data
+        host nor another container's, UTSMode not host, and CgroupnsMode exactly "private"
+        (compose.yaml sets cgroup: private; without it a cgroup v1 engine reports "host", and
+        an engine that reports none is not checkable); MaskedPaths and ReadonlyPaths both
+        non-empty (security_opt systempaths=unconfined empties them and does not show in
+        SecurityOpt); exactly two mounts, DATA_ROOT/SERVICE/data on /data
         (read-write) and DATA_ROOT/SERVICE/jwt.hex on /secrets/jwt.hex (read-only), besides a
         /tmp tmpfs; and exactly one tmpfs, /tmp, mounted noexec, nosuid and nodev (none of
         exec, suid or dev after them). An override file that loosens any of these fails here.
@@ -229,7 +245,6 @@ def spec_diff(pinned_path, spec_path):
 
 MAX_SLOT_LAG = 2
 MIN_FINALIZED_RANGE = 128
-P2P_TCP_PORT = 9000
 PEER_ID = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,128}")
 
 
@@ -317,7 +332,10 @@ def public_ipv4(addresses):
     return None
 
 
-def identity(identity_path, public_ip):
+def identity(identity_path, public_ip, p2p_port):
+    port = as_int(p2p_port)
+    if port is None or not 0 < port < 65536 or str(port) != p2p_port:
+        raise InputError("the p2p port is not a TCP port number")
     data = load_json(identity_path)
     passed = True
     peer_id = data.get("peer_id")
@@ -348,8 +366,57 @@ def identity(identity_path, public_ip):
             print("error: no public IPv4 address in p2p_addresses; pass --public-ip")
             return 1
     if peer_id:
-        print(f"multiaddr: /ip4/{ip}/tcp/{P2P_TCP_PORT}/p2p/{peer_id}")
+        print(f"multiaddr: /ip4/{ip}/tcp/{port}/p2p/{peer_id}")
     return 0 if passed else 1
+
+
+ROOT = re.compile(r"0x[0-9a-fA-F]{64}")
+
+
+def anchor_header(path, who):
+    """(slot, block root, state root, canonical) of a /eth/v1/beacon/headers answer."""
+    try:
+        data = load_json(path)
+    except InputError as e:
+        raise InputError(f"{who}: {e}") from None
+    header = data.get("header") if isinstance(data.get("header"), dict) else {}
+    message = header.get("message") if isinstance(header.get("message"), dict) else {}
+    slot = as_int(message.get("slot"))
+    if slot is None:
+        raise InputError(f"{who}: the header answer has no header.message.slot")
+    root, state_root = data.get("root"), message.get("state_root")
+    if not (isinstance(root, str) and ROOT.fullmatch(root)):
+        raise InputError(f"{who}: the header answer has no 32-byte root")
+    if not (isinstance(state_root, str) and ROOT.fullmatch(state_root)):
+        raise InputError(f"{who}: the header answer has no 32-byte header.message.state_root")
+    return slot, root.lower(), state_root.lower(), data.get("canonical") is True
+
+
+def header_slot(path):
+    print(anchor_header(path, "provider 1")[0])
+    return 0
+
+
+def anchor_compare(path_1, path_2):
+    slot_1, root_1, state_1, canonical_1 = anchor_header(path_1, "provider 1")
+    slot_2, root_2, state_2, canonical_2 = anchor_header(path_2, "provider 2")
+    if slot_1 != slot_2:
+        print(f"anchor: slot {slot_1} on provider 1, {slot_2} on provider 2: FAIL")
+        return 1
+    problems = []
+    if root_1 != root_2:
+        problems.append(f"block root {root_1} on provider 1, {root_2} on provider 2")
+    if state_1 != state_2:
+        problems.append(f"state root {state_1} on provider 1, {state_2} on provider 2")
+    if not canonical_1:
+        problems.append("not canonical on provider 1")
+    if not canonical_2:
+        problems.append("not canonical on provider 2")
+    if problems:
+        print(f"anchor: slot {slot_1}: {'; '.join(problems)}: FAIL")
+        return 1
+    print(f"anchor: slot {slot_1}, block root {root_1}, state root {state_1}, the same on both providers: PASS")
+    return 0
 
 
 SECURITY_OPT = ["no-new-privileges:true"]
@@ -413,9 +480,12 @@ def container(inspect_path, service, data_root, uid, gid, pinned_id):
     for key, may_join in (("PidMode", True), ("IpcMode", True), ("UTSMode", False)):
         line(f"{key} {json.dumps(host.get(key))}", own_namespace(host.get(key), may_join))
     if "CgroupnsMode" in host:
-        line(f"CgroupnsMode {json.dumps(host['CgroupnsMode'])}", own_namespace(host["CgroupnsMode"], False))
+        line(f"CgroupnsMode {json.dumps(host['CgroupnsMode'])}", host["CgroupnsMode"] == "private")
     else:
-        line("CgroupnsMode (none)", True)
+        line("CgroupnsMode (none)", False)
+    masked, readonly = host.get("MaskedPaths"), host.get("ReadonlyPaths")
+    counts = [len(p) if isinstance(p, list) else 0 for p in (masked, readonly)]
+    line(f"MaskedPaths {counts[0]}, ReadonlyPaths {counts[1]}", all(counts))
     want = {
         "/data": (f"{data_root}/{service}/data", True),
         "/secrets/jwt.hex": (f"{data_root}/{service}/jwt.hex", False),
@@ -440,7 +510,9 @@ COMMANDS = {
     "spec-diff": (spec_diff, 2),
     "syncing": (syncing, 4),
     "finalized": (finalized, 2),
-    "identity": (identity, 2),
+    "identity": (identity, 3),
+    "anchor-compare": (anchor_compare, 2),
+    "header-slot": (header_slot, 1),
     "container": (container, 6),
 }
 

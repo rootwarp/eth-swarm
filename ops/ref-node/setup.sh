@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# One-time host setup for the Sepolia reference node (compose.yaml), run as root. Idempotent:
+# One-time host setup for the reference node (compose.yaml) of the .env's NETWORK (sepolia or
+# hoodi), run as root. Idempotent:
 #   0. refuses, before it changes anything, an .env with a line compose would read differently
-#      (lib/common.sh env_check), --test-mode as root, a DATA_ROOT with whitespace or a
-#      backslash, and any DATA_ROOT that lib/fsguard.py cannot prove safe: relative, a . or ..
-#      component, a symlink anywhere from / down, a directory on the way not owned by root or
-#      open to group or others (unless root-owned and sticky, like /tmp), a DATA_ROOT open to
-#      group or others (so not /tmp itself), or below it a symlink, a wrong type, a
-#      hard-linked JWT, a foreign owner, or a .staging that is not an empty 0700 directory.
+#      (lib/common.sh env_check) or a NETWORK it does not know, --test-mode as root, a
+#      DATA_ROOT with whitespace or a backslash, and any DATA_ROOT that lib/fsguard.py cannot
+#      prove safe: relative, a . or .. component, a symlink anywhere from / down, a directory
+#      on the way not owned by root or open to group or others (unless root-owned and sticky,
+#      like /tmp), a DATA_ROOT open to group or others (so not /tmp itself), or below it a
+#      symlink, a wrong type, a hard-linked JWT, a foreign owner, or a .staging that is not an
+#      empty 0700 directory.
 #      fsguard walks every component through directory descriptors (openat, O_NOFOLLOW) and
 #      changes things only through them, so nothing checked is resolved again. The .env
 #      directory gets the same walk: no symlink from / down to it, and every directory on the
 #      way and itself owned by root or by the sudo user (SUDO_UID) and closed to group and
 #      others (unless root-owned and sticky);
-#   1. creates the system users `reth` and `lighthouse` (no login shell, no home) unless they
-#      exist;
+#   1. creates the network's system users (no login shell, no home) unless they exist:
+#      `reth` and `lighthouse` on Sepolia, `reth-<network>` and `lighthouse-<network>` on any
+#      other network (lib/common.sh service_user), so two networks never share a user;
 #   2. creates DATA_ROOT (0755) if missing, and DATA_ROOT/{reth,lighthouse}/data, each level
 #      owned by its service user, mode 0700;
 #   3. writes ONE 32-byte hex JWT secret (os.urandom) as two copies, DATA_ROOT/reth/jwt.hex
@@ -27,8 +30,9 @@
 #      through a descriptor of the .env directory that fsguard opens by the same walk from /;
 #   5. verifies every mode and owner it set.
 #
-# Usage: sudo ops/sepolia-ref/setup.sh [--root DIR] [--env-file FILE] [--rotate-jwt] [--test-mode]
+# Usage: sudo ops/ref-node/setup.sh [--root DIR] [--env-file FILE] [--rotate-jwt] [--test-mode]
 #   --root DIR       DATA_ROOT (absolute); default: DATA_ROOT from .env, else /srv/ethswarm-ref
+#                    on Sepolia and /srv/ethswarm-ref-<network> elsewhere
 #   --env-file FILE  default: .env next to this script; it must exist (cp .env.example .env),
 #                    in a directory only root or the sudo user can change
 #   --rotate-jwt     replace the secret (restart both services afterwards)
@@ -38,7 +42,9 @@
 # Exit: 0 done, 1 a check failed (differing or malformed JWT copies, a wrong mode or owner),
 # 2 bad usage, a missing .env or a refused path. Needs python3.
 set -euo pipefail
-here=$(cd "$(dirname "$0")" && pwd)
+# The physical path (cd -P, pwd -P): a checkout reached through a symlinked home is checked at
+# its real path by the walk from /, instead of being refused for the symlink.
+here=$(cd -P "$(dirname "$0")" && pwd -P)
 # shellcheck source=lib/common.sh
 source "$here/lib/common.sh"
 umask 077
@@ -60,20 +66,23 @@ done
 
 [[ -f $env_file ]] || refuse "$env_file: no such file (cp .env.example .env and fill it first)"
 env_check "$env_file" >&2 || refuse "$env_file: fix the lines above"
+network=$(env_get "$env_file" NETWORK)
+network_known "$network" || refuse "NETWORK must be sepolia or hoodi (in $env_file)"
+reth_user=$(service_user "$network" reth) lh_user=$(service_user "$network" lighthouse)
 [[ -n $root ]] || root=$(env_get "$env_file" DATA_ROOT)
-root=${root:-/srv/ethswarm-ref}
+root=${root:-$(default_data_root "$network")}
 root=${root%/}
 # A backslash is refused too: nothing that reads DATA_ROOT back may decode it as an escape.
 if [[ $root != /* || $root =~ [[:space:]] || $root == *\\* ]]; then
   refuse "DATA_ROOT must be an absolute path without whitespace or a backslash"
 fi
 # The .env directory as given (never resolved: fsguard refuses a symlink on its path), made
-# absolute against the logical working directory, and the sudo user who may own it.
+# absolute against the physical working directory, and the sudo user who may own it.
 env_dir=$(dirname -- "$env_file") env_name=$(basename -- "$env_file")
 case $env_dir in
   /*) ;;
-  .) env_dir=$PWD ;;
-  *) env_dir=$PWD/$env_dir ;;
+  .) env_dir=$(pwd -P) ;;
+  *) env_dir=$(pwd -P)/$env_dir ;;
 esac
 operator=-1
 if [[ ${SUDO_UID:-} =~ ^[0-9]+$ ]]; then operator=$SUDO_UID; fi
@@ -90,7 +99,7 @@ uid_of() { id -u "$1" 2>/dev/null || echo -1; }
 if ((test_mode)); then
   fsguard check "$root" "$euid" "$euid" "$euid" || exit 2
 else
-  fsguard check "$root" "$euid" "$(uid_of reth)" "$(uid_of lighthouse)" || exit 2
+  fsguard check "$root" "$euid" "$(uid_of "$reth_user")" "$(uid_of "$lh_user")" || exit 2
 fi
 fsguard check-dir "$env_dir" "$euid" "$operator" || exit 2
 
@@ -109,10 +118,10 @@ if ((test_mode)); then
   lh_uid=$reth_uid lh_gid=$reth_gid
   echo "test mode: no users, both services as uid $reth_uid"
 else
-  ensure_user reth
-  ensure_user lighthouse
-  reth_uid=$(id -u reth) reth_gid=$(id -g reth)
-  lh_uid=$(id -u lighthouse) lh_gid=$(id -g lighthouse)
+  ensure_user "$reth_user"
+  ensure_user "$lh_user"
+  reth_uid=$(id -u "$reth_user") reth_gid=$(id -g "$reth_user")
+  lh_uid=$(id -u "$lh_user") lh_gid=$(id -g "$lh_user")
 fi
 
 # 2., 3. Directories and the JWT copies, through descriptors only (lib/fsguard.py).

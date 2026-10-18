@@ -80,7 +80,7 @@ sudo -u ethswarm-collector /usr/local/bin/collector offsets "$dir" | tail -1
 
 The smoke passes with a non-empty `records.jsonl` covering the hour, the missing intervals
 listed, and an NTP line every minute in `ntp.jsonl`. Before Hoodi, the same run works against
-the Sepolia reference node (`ops/sepolia-ref`): `--network sepolia`, whose pinned genesis the
+the Sepolia reference node (`ops/ref-node`): `--network sepolia`, whose pinned genesis the
 collector checks against the node's.
 
 ## Deploy log

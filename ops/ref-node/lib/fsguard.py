@@ -1,5 +1,5 @@
 """The file-system half of setup.sh, which runs as root over a tree that the service users own
-(and so can rename things inside).
+(and so can rename things inside), and the file reads of preflight.sh and collect-run-log.sh.
 
 No path is resolved twice. The walk opens "/" and then every component of DATA_ROOT relative to
 its parent's descriptor (openat with O_DIRECTORY|O_NOFOLLOW), checks each through its own
@@ -34,6 +34,16 @@ Exit 0 done, 1 a secret or verification problem, 2 a refused path or bad usage.
         The check-dir walk again, keeping DIR's descriptor, then replace DIR/NAME with stdin,
         mode 0600, via a file created O_EXCL|O_NOFOLLOW through that descriptor and renamed
         over NAME through it (a symlink at NAME is replaced, never followed).
+    inspect PATH
+        PATH (absolute, without empty, . or .. components) opened by a walk from / that never
+        follows a symlink (every directory O_DIRECTORY|O_NOFOLLOW), the file itself
+        O_NOFOLLOW|O_NONBLOCK and fstat'ed before anything else: it must be a regular file with
+        one link. Prints "<octal mode> <owner uid>"; whether those are right is the caller's
+        verdict. Nothing is read. A symlink, a FIFO, a directory, a hard link or a missing file
+        is refused (exit 2) with the reason.
+    same-secret PATH_A PATH_B
+        Both opened as `inspect` opens them; exit 0 if both hold the same 64 lower-case hex
+        characters, 1 if not. The secret is never printed.
 
 Files are opened O_NONBLOCK and fstat'ed before any read, so a FIFO planted at a checked path is
 refused instead of blocking the run.
@@ -132,8 +142,9 @@ def check_owner(fd, path, owners):
 
 
 def open_file(dir_fd, name, path, owners):
-    """The file's descriptor, or None if absent; it must be a regular file with one link. It is
-    opened O_NONBLOCK and fstat'ed before anything reads it, so a FIFO is refused at once."""
+    """The file's descriptor, or None if absent; it must be a regular file with one link, owned
+    by one of `owners` (any owner for None). It is opened O_NONBLOCK and fstat'ed before
+    anything reads it, so a FIFO is refused at once."""
     try:
         fd = os.open(name, O_FILE, dir_fd=dir_fd)
     except FileNotFoundError:
@@ -146,7 +157,7 @@ def open_file(dir_fd, name, path, owners):
         problem = "not a regular file"
     elif st.st_nlink != 1:
         problem = f"has {st.st_nlink} hard links"
-    elif st.st_uid not in owners:
+    elif owners is not None and st.st_uid not in owners:
         problem = f"owned by uid {st.st_uid}"
     if problem:
         os.close(fd)
@@ -374,12 +385,53 @@ def write_file(directory, name, euid, operator):
     return 0
 
 
-COMMANDS = {"check": (check, 4), "install": (install, 8), "check-dir": (check_dir, 3), "write-file": (write_file, 4)}
+def open_path(path):
+    """PATH's descriptor, through the walk from / that follows no symlink; any owner."""
+    parts = components(path, "the path")
+    fd = os.open("/", O_DIR)
+    try:
+        walked = ""
+        for name in parts[:-1]:
+            walked += "/" + name
+            nfd = open_dir(fd, name, walked)
+            if nfd is None:
+                raise Refused(f"{path}: no such file")
+            os.close(fd)
+            fd = nfd
+        ffd = open_file(fd, parts[-1], path, None)
+    finally:
+        os.close(fd)
+    if ffd is None:
+        raise Refused(f"{path}: no such file")
+    return ffd
+
+
+def inspect(path):
+    fd = open_path(path)
+    st = os.fstat(fd)
+    os.close(fd)
+    print(f"{mode_of(st):o} {st.st_uid}")
+    return 0
+
+
+def same_secret(path_a, path_b):
+    a, b = read_secret(open_path(path_a)), read_secret(open_path(path_b))
+    return 0 if a == b and SECRET.fullmatch(a) else 1
+
+
+COMMANDS = {
+    "check": (check, 4),
+    "install": (install, 8),
+    "check-dir": (check_dir, 3),
+    "write-file": (write_file, 4),
+    "inspect": (inspect, 1),
+    "same-secret": (same_secret, 2),
+}
 
 
 def main(argv):
     if len(argv) < 2 or argv[1] not in COMMANDS or len(argv) - 2 != COMMANDS[argv[1]][1]:
-        print("usage: fsguard.py {check|install|check-dir|write-file} ARGS... (see the module docstring)", file=sys.stderr)
+        print(f"usage: fsguard.py {{{'|'.join(COMMANDS)}}} ARGS... (see the module docstring)", file=sys.stderr)
         return 2
     try:
         return COMMANDS[argv[1]][0](*argv[2:])

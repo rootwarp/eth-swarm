@@ -1,27 +1,36 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2016 # single-quoted checks and stub bodies expand later, on purpose
-# Offline tests for ops/sepolia-ref. Run: bash ops/sepolia-ref/tests/sepolia-ref.test.sh
-# Covers the spec-diff helper (fixtures and the real pinned Sepolia config), the beacon API
-# verdicts, the image pin and URL redaction rules, setup.sh in --test-mode under a temp root,
-# preflight.sh and collect-run-log.sh end to end against stub curl/ss/stat/docker commands, and
-# the compose file when docker is installed. No network, no root. Works on bash 3.2.
+# Offline tests for ops/ref-node. Run: bash ops/ref-node/tests/ref-node.test.sh
+# Covers the spec-diff helper (fixtures and the real pinned Sepolia and Hoodi configs), the
+# beacon API verdicts, the two-provider anchor comparison, the image pin and URL redaction
+# rules, setup.sh in --test-mode under a temp root, preflight.sh and collect-run-log.sh end to
+# end against stub curl/ss/docker commands for both networks, and the compose file when docker
+# is installed. No network, no root. Works on bash 3.2.
 # As root it runs only with ETHSWARM_ROOT_TESTS=1 (a throwaway container: it creates users),
 # and then runs, besides the pure checks, the root-only part: setup.sh and preflight.sh for
-# real (no --test-mode), every setup.sh refusal as real root, and the regression runs of the
-# DATA_ROOT ancestor swap, the .env directory redirect and the run-log temp-file swap. The
-# rest runs as a normal user. A FIFO planted at a checked path needs `timeout` to bound the
-# run, so where it is missing (macOS) those cases are skipped.
+# real (no --test-mode) for both networks side by side, every setup.sh refusal as real root,
+# and the regression runs of the DATA_ROOT ancestor swap, the .env directory redirect and the
+# run-log temp-file swap. The rest runs as a normal user. A FIFO planted at a checked path
+# needs `timeout` to bound the run, so where it is missing (macOS) those cases are skipped.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 ref=$(cd "$here/.." && pwd)
 repo=$(cd "$ref/../.." && pwd)
 helper="$ref/lib/beacon.py"
 pinned="$repo/crates/network-config/networks/sepolia/config.yaml"
+pinned_hoodi="$repo/crates/network-config/networks/hoodi/config.yaml"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 tmp=$(cd -P "$tmp" && pwd -P)   # setup.sh refuses a root reached through a symlink (macOS /var)
 start_dir=$PWD
 cd "$tmp"   # a stray relative write lands in the temp dir, never in the checkout
+# A copy of the stack whose README says both pinned releases schedule Hoodi's fork (and pins
+# our consensus-specs), as it will once the images are replaced by releases that do. Its
+# ../../crates reaches the real pinned configs.
+yes_ref="$tmp/repo-yes/ops/ref-node"
+mkdir -p "$tmp/repo-yes/ops" && cp -R "$ref" "$yes_ref" && ln -s "$repo/crates" "$tmp/repo-yes/crates"
+sed -i.bak '/release-notes:hoodi:begin/,/release-notes:hoodi:end/ { s/| no |/| yes |/; s/| v1\.7\.0-beta\.2 |/| v1.7.0-beta.4 |/; }' "$yes_ref/README.md"
+rm -f "$yes_ref/README.md.bak"
 
 passed=0 failed=0
 
@@ -159,14 +168,16 @@ printf 'GLOAS_FORK_EPOCH: 1\nBLOB_SCHEDULE:\n  - EPOCH: 1\n    GAS: 2\n' > "$tmp
 check 2 "spec-diff: a pinned BLOB_SCHEDULE entry with other keys is an error" \
   python3 -I "$helper" spec-diff "$tmp/odd-entry.yaml" "$tmp/spec.json"
 
-# The real pinned Sepolia config, against an answer built from its own fork lines and schedule.
+# The real pinned configs, against an answer built from their own fork lines and schedule.
+# real_spec_json <out> [config YAML, default the Sepolia one]
 real_spec_json() {
+  local yaml=${2:-$pinned}
   {
     printf '{"data":{'
-    grep -E '^[A-Z0-9_]+_FORK_(VERSION|EPOCH):' "$pinned" | sed -E 's/^([A-Z0-9_]+): *([^ #]+).*/"\1":"\2",/' | tr -d '\n'
+    grep -E '^[A-Z0-9_]+_FORK_(VERSION|EPOCH):' "$yaml" | sed -E 's/^([A-Z0-9_]+): *([^ #]+).*/"\1":"\2",/' | tr -d '\n'
     printf '"SECONDS_PER_SLOT":"12","BLOB_SCHEDULE":['
     awk '/^BLOB_SCHEDULE:/ {on = 1; next} on && /^[^ #-]/ {on = 0}
-      on && /EPOCH:/ {e = $NF} on && /MAX_BLOBS_PER_BLOCK:/ {printf "%s{\"EPOCH\":\"%s\",\"MAX_BLOBS_PER_BLOCK\":\"%s\"}", sep, e, $NF; sep = ","}' "$pinned"
+      on && /EPOCH:/ {e = $NF} on && /MAX_BLOBS_PER_BLOCK:/ {printf "%s{\"EPOCH\":\"%s\",\"MAX_BLOBS_PER_BLOCK\":\"%s\"}", sep, e, $NF; sep = ","}' "$yaml"
     printf ']}}\n'
   } > "$1"
 }
@@ -178,6 +189,24 @@ sed 's/"GLOAS_FORK_EPOCH":"353024"/"GLOAS_FORK_EPOCH":"18446744073709551615"/' "
 check_out 1 "spec-diff: the real pinned config against a pre-Gloas endpoint" \
   '^- GLOAS_FORK_EPOCH: pinned 353024, node 18446744073709551615$' \
   python3 -I "$helper" spec-diff "$pinned" "$tmp/pre-gloas.json"
+# Hoodi: Gloas at epoch 132352 (2026-10-26 17:42:48 UTC), its own fork versions and schedule.
+real_spec_json "$tmp/hoodi-spec.json" "$pinned_hoodi"
+check_out 0 "spec-diff: the real pinned Hoodi config against its own answer" \
+  '^spec diff: empty \(8 fork versions, 7 fork epochs, 2 blob schedule entries\)' \
+  python3 -I "$helper" spec-diff "$pinned_hoodi" "$tmp/hoodi-spec.json"
+if grep -q '"GLOAS_FORK_EPOCH":"132352"' "$tmp/hoodi-spec.json" && grep -q '"GLOAS_FORK_VERSION":"0x80000910"' "$tmp/hoodi-spec.json"; then
+  ok "spec-diff: the Hoodi answer carries GLOAS_FORK_EPOCH 132352 and version 0x80000910"
+else
+  bad "spec-diff: the Hoodi answer carries GLOAS_FORK_EPOCH 132352" "$(cat "$tmp/hoodi-spec.json")"
+fi
+# A Hoodi node on a release that does not schedule Gloas (FAR_FUTURE_EPOCH) fails the diff.
+sed 's/"GLOAS_FORK_EPOCH":"132352"/"GLOAS_FORK_EPOCH":"18446744073709551615"/' "$tmp/hoodi-spec.json" > "$tmp/hoodi-pre-gloas.json"
+check_out 1 "spec-diff: the pinned Hoodi config against a node without Hoodi's Gloas epoch" \
+  '^- GLOAS_FORK_EPOCH: pinned 132352, node 18446744073709551615$' \
+  python3 -I "$helper" spec-diff "$pinned_hoodi" "$tmp/hoodi-pre-gloas.json"
+check_out 1 "spec-diff: a Sepolia answer against the Hoodi config fails (the other network)" \
+  '^- GENESIS_FORK_VERSION: pinned 0x10000910, node 0x90000069$' \
+  python3 -I "$helper" spec-diff "$pinned_hoodi" "$tmp/real-spec.json"
 
 # --- beacon API verdicts (collect-run-log.sh's per-criterion logic) ----------------------------
 
@@ -240,7 +269,7 @@ pid=16Uiu2HAmQ5L4BYrnTKcBgvYw1oSv1mYj4tsRkKaJ7NShcC5kU8Jr
 identity_case() {
   printf '{"data":{"peer_id":"%s","enr":"enr:-Iu4QA","p2p_addresses":%s,"discovery_addresses":[],"metadata":{"seq_number":"7","attnets":"0x00","syncnets":"0x00"%s}}}\n' \
     "$pid" "$5" "${6-,\"custody_group_count\":\"4\"}" > "$tmp/identity.json"
-  check_out "$1" "identity: $2" "$3" python3 -I "$helper" identity "$tmp/identity.json" "$4"
+  check_out "$1" "identity: $2" "$3" python3 -I "$helper" identity "$tmp/identity.json" "$4" "${8:-9000}"
 }
 identity_case 0 "the public address of the identity is used" \
   "^multiaddr: /ip4/34\.89\.10\.7/tcp/9000/p2p/$pid$" '' \
@@ -249,6 +278,13 @@ identity_case 0 "--public-ip wins over the identity" "^multiaddr: /ip4/198\.51\.
   198.51.100.9 "[\"/ip4/34.89.10.7/tcp/9000/p2p/$pid\"]"
 identity_case 0 "custody_group_count is recorded" '^custody_group_count: 4$' '' "[\"/ip4/34.89.10.7/tcp/9000\"]"
 identity_case 0 "the peer ID is recorded" "^peer_id: $pid$" '' "[\"/ip4/34.89.10.7/tcp/9000\"]"
+# The multiaddr carries the configured Lighthouse p2p port (the second network's is not 9000).
+identity_case 0 "the multiaddr uses the configured p2p TCP port" "^multiaddr: /ip4/34\.89\.10\.7/tcp/9002/p2p/$pid$" '' \
+  "[\"/ip4/34.89.10.7/tcp/9002/p2p/$pid\"]" ',"custody_group_count":"4"' '' 9002
+check_out 2 "identity: a p2p port that is not a port number is an error" '^ERROR: the p2p port is not a TCP port number$' \
+  python3 -I "$helper" identity "$tmp/identity.json" '' 90a2
+check_out 2 "identity: p2p port 0 is an error" '^ERROR: the p2p port is not a TCP port number$' \
+  python3 -I "$helper" identity "$tmp/identity.json" '' 0
 identity_case 1 "only private addresses and no --public-ip fails" '^error: no public IPv4' '' \
   "[\"/ip4/10.0.0.5/tcp/9000\",\"/ip4/127.0.0.1/tcp/9000\"]"
 identity_case 1 "a --public-ip that is not an IPv4 address fails" '^error: --public-ip is not an IPv4 address' 'example.org' '[]'
@@ -256,14 +292,49 @@ identity_case 1 "a missing custody_group_count fails" '^error: custody_group_cou
   "[\"/ip4/34.89.10.7/tcp/9000\"]" ''
 sed "s/$pid/not-a-peer-id/" "$tmp/identity.json" > "$tmp/bad-identity.json"
 check_out 1 "identity: a peer ID that is not base58 fails" '^error: peer_id is not base58 or missing$' \
-  python3 -I "$helper" identity "$tmp/bad-identity.json" ''
-out=$(python3 -I "$helper" identity "$tmp/bad-identity.json" '' 2>&1 || true)
+  python3 -I "$helper" identity "$tmp/bad-identity.json" '' 9000
+out=$(python3 -I "$helper" identity "$tmp/bad-identity.json" '' 9000 2>&1 || true)
 if printf '%s\n' "$out" | grep -Eq '^(peer_id|custody_group_count|multiaddr): '; then
   bad "identity: an error is never printed as a value line" "$out"
 else
   ok "identity: an error is never printed as a value line"
 fi
 check 2 "an unknown helper command is an error" python3 -I "$helper" frobnicate
+
+# anchor-compare: provider 1's finalized header against provider 2's header at the same slot.
+r1=0x$(printf 'ab%.0s' $(seq 1 32)) r2=0x$(printf 'cd%.0s' $(seq 1 32))
+s1=0x$(printf '12%.0s' $(seq 1 32)) s2=0x$(printf '34%.0s' $(seq 1 32))
+# header_json <file> <slot> <block root> <state root> [canonical]
+header_json() {
+  printf '{"execution_optimistic":false,"finalized":true,"data":{"root":"%s","canonical":%s,"header":{"message":{"slot":"%s","proposer_index":"7","parent_root":"0x00","state_root":"%s","body_root":"0x00"},"signature":"0x00"}}}\n' \
+    "$3" "${5:-true}" "$2" "$4" > "$1"
+}
+anchor_case() { # anchor_case <expect-exit> <description> <pattern>
+  check_out "$1" "anchor-compare: $2" "$3" python3 -I "$helper" anchor-compare "$tmp/anchor-a.json" "$tmp/anchor-b.json"
+}
+header_json "$tmp/anchor-a.json" 4235264 "$r1" "$s1"
+header_json "$tmp/anchor-b.json" 4235264 "$r1" "$s1"
+anchor_case 0 "the same slot, block root and state root on both providers pass" \
+  "^anchor: slot 4235264, block root $r1, state root $s1, the same on both providers: PASS$"
+header_json "$tmp/anchor-b.json" 4235264 "$r2" "$s1"
+anchor_case 1 "another block root on provider 2 fails" "^anchor: slot 4235264: block root $r1 on provider 1, $r2 on provider 2: FAIL$"
+header_json "$tmp/anchor-b.json" 4235264 "$r1" "$s2"
+anchor_case 1 "another state root on provider 2 fails" "^anchor: slot 4235264: state root $s1 on provider 1, $s2 on provider 2: FAIL$"
+header_json "$tmp/anchor-b.json" 4235263 "$r1" "$s1"
+anchor_case 1 "another slot on provider 2 fails" '^anchor: slot 4235264 on provider 1, 4235263 on provider 2: FAIL$'
+header_json "$tmp/anchor-b.json" 4235264 "$r1" "$s1" false
+anchor_case 1 "a header provider 2 does not hold canonical fails" '^anchor: slot 4235264: not canonical on provider 2: FAIL$'
+header_json "$tmp/anchor-a.json" 4235264 "$r1" "$s1" false
+header_json "$tmp/anchor-b.json" 4235264 "$r1" "$s1"
+anchor_case 1 "a header provider 1 does not hold canonical fails" '^anchor: slot 4235264: not canonical on provider 1: FAIL$'
+header_json "$tmp/anchor-a.json" 4235264 "$r1" "$s1"
+header_json "$tmp/anchor-a.json" 4235264 0xab "$s1"
+anchor_case 2 "a block root that is not 32 bytes of hex is an error" '^ERROR: provider 1: the header answer has no 32-byte root$'
+header_json "$tmp/anchor-a.json" 4235264 "$r1" "$s1"
+printf '{"data":{"root":"%s"}}\n' "$r1" > "$tmp/anchor-b.json"
+anchor_case 2 "a header without a slot is an error" '^ERROR: provider 2: the header answer has no header.message.slot$'
+check_out 0 "header-slot: the slot of a header answer" '^4235264$' python3 -I "$helper" header-slot "$tmp/anchor-a.json"
+check_out 2 "header-slot: a header without a slot is an error" 'no header.message.slot$' python3 -I "$helper" header-slot "$tmp/anchor-b.json"
 
 # --- shared shell rules (lib/common.sh) --------------------------------------------------------
 
@@ -315,6 +386,102 @@ binds 1 "a second listener on another address fails" '^port 5052: listening on 1
   "$ss_reth" "$ss_lh" "${ss_lh/127.0.0.1/10.0.0.5}"
 binds 1 "no listener on 8551 fails" '^port 8551: no listener: FAIL$' "$ss_lh"
 binds 1 "port 18551 is not port 8551" '^port 8551: no listener: FAIL$' "${ss_reth/:8551/:18551}" "$ss_lh"
+binds_on() { # binds_on <expect-exit> <description> <pattern> <ports> <ss lines...>: other API ports
+  local expect=$1 desc=$2 pattern=$3 ports=$4
+  shift 4
+  # shellcheck disable=SC2086 # $ports is a list of port numbers
+  check_out "$expect" "binds: $desc" "$pattern" check_binds "$(printf '%s\n' "$ss_head" "$@")" $ports
+}
+binds_on 0 "the second network's API ports on 127.0.0.1 pass" '^port 5053: 127\.0\.0\.1 only: PASS$' "8552 5053" \
+  "${ss_reth/:8551/:8552}" "${ss_lh/:5052/:5053}"
+binds_on 1 "the second network's API port on 0.0.0.0 fails" '^port 5053: listening on 0\.0\.0\.0:5053 .*FAIL$' "8552 5053" \
+  "${ss_reth/:8551/:8552}" "${ss_lh/127.0.0.1:5052/0.0.0.0:5053}"
+
+# check_listeners: every TCP listener a container's processes own is on loopback, or on one of
+# that service's declared p2p ports; a listener of another process is not its business.
+ss_rpc='LISTEN 0      1024         0.0.0.0:8545       0.0.0.0:*    users:(("reth-binary",pid=812,fd=120))'
+ss_rpc6='LISTEN 0      1024            [::]:8546          [::]:*    users:(("reth-binary",pid=812,fd=121))'
+ss_rp2p='LISTEN 0      1024               *:30303            *:*    users:(("reth-binary",pid=812,fd=30))'
+ss_lp2p6='LISTEN 0      1024            [::]:9000          [::]:*    users:(("lighthouse",pid=901,fd=32))'
+ss_lmet='LISTEN 0      1024       127.0.0.1:5054       0.0.0.0:*    users:(("lighthouse",pid=901,fd=50))'
+ss_lmet6='LISTEN 0      1024           [::1]:5055          [::]:*    users:(("lighthouse",pid=901,fd=51))'
+ss_ssh='LISTEN 0      128          0.0.0.0:22         0.0.0.0:*    users:(("sshd",pid=5,fd=3))'
+ss_two='LISTEN 0      1024        10.0.0.5:7000       0.0.0.0:*    users:(("sshd",pid=5,fd=9),("reth-binary",pid=812,fd=99))'
+listeners() { # listeners <expect-exit> <description> <pattern> <service> <pids> <ports> <ss lines...>
+  local expect=$1 desc=$2 pattern=$3 svc=$4 pids=$5 ports=$6
+  shift 6
+  check_out "$expect" "listeners: $desc" "$pattern" check_listeners "$(printf '%s\n' "$ss_head" "$@")" "$svc" "$pids" "$ports"
+}
+listeners 0 "reth: the Engine API on loopback and p2p on * pass" \
+  '^reth: no non-loopback TCP listener but p2p port 30303 \(pids 812\): PASS$' reth 812 30303 "$ss_reth" "$ss_rp2p" "$ss_lh" "$ss_ssh"
+listeners 0 "reth: the p2p listener is recorded" '^reth: p2p listener \*:30303 \(pid 812\)$' reth 812 30303 "$ss_reth" "$ss_rp2p"
+listeners 1 "reth: an HTTP RPC on 0.0.0.0 (an override's --http.addr) fails" \
+  '^reth: listener 0\.0\.0\.0:8545 \(pid 812\) is neither on loopback nor a p2p port: FAIL$' reth 812 30303 "$ss_reth" "$ss_rp2p" "$ss_rpc"
+listeners 1 "reth: a WS RPC on [::] fails" '^reth: listener \[::\]:8546 \(pid 812\) is neither' reth 812 30303 "$ss_rpc6"
+listeners 1 "reth: a socket shared with another process still counts" '^reth: listener 10\.0\.0\.5:7000 \(pid 812\)' reth 812 30303 "$ss_two"
+listeners 0 "lighthouse: p2p on [::], metrics on 127.0.0.1 and [::1] pass" '^lighthouse: no non-loopback TCP listener but p2p port 9000 \(pids 901\): PASS$' \
+  lighthouse 901 9000 "$ss_lh" "$ss_p2p" "$ss_lp2p6" "$ss_lmet" "$ss_lmet6"
+listeners 1 "lighthouse: another service's p2p port is not its own" '^lighthouse: listener \*:30303 \(pid 901\)' \
+  lighthouse 901 9000 "${ss_rp2p/pid=812/pid=901}"
+listeners 1 "lighthouse: the Beacon API on 0.0.0.0 fails here too" '^lighthouse: listener 0\.0\.0\.0:5052 \(pid 901\)' \
+  lighthouse 901 9000 "${ss_lh/127.0.0.1/0.0.0.0}"
+# A listener of another pid is not the service's; with none of its own it has no p2p listener.
+listeners 1 "pid 81 is not pid 812 (nothing matched, no p2p listener)" '^reth: no p2p listener on port 30303 among pids 81: FAIL$' reth 81 30303 "$ss_rpc" "$ss_rp2p"
+listeners 1 "a service whose p2p port has no listener fails" '^reth: no p2p listener on port 30303 among pids 812: FAIL$' reth 812 30303 "$ss_reth"
+listeners 1 "an ss without process information fails" '^reth: ss -ltnp shows no process for any listener \(it needs root\): FAIL$' \
+  reth 812 30303 "${ss_reth%%users:*}" "${ss_rp2p%%users:*}" "${ss_rpc%%users:*}"
+listeners 1 "no container process to match fails" '^reth: no container process to match listeners to: FAIL$' reth '' 30303 "$ss_reth"
+listeners 0 "several pids of one container" '^reth: no non-loopback TCP listener but p2p port 30303 \(pids 812 813\): PASS$' \
+  reth "812 813" 30303 "${ss_rp2p/pid=812/pid=813}"
+
+# The network and its derived names: users, default DATA_ROOT, compose project, pinned config.
+for spec in "sepolia reth reth" "sepolia lighthouse lighthouse" "hoodi reth reth-hoodi" "hoodi lighthouse lighthouse-hoodi"; do
+  read -r net svc want <<< "$spec"
+  got=$(service_user "$net" "$svc")
+  if [[ $got == "$want" ]]; then ok "service_user: $net $svc is $want"; else bad "service_user: $net $svc (got '$got', want '$want')"; fi
+done
+for spec in "sepolia /srv/ethswarm-ref" "hoodi /srv/ethswarm-ref-hoodi"; do
+  read -r net want <<< "$spec"
+  got=$(default_data_root "$net")
+  if [[ $got == "$want" ]]; then ok "default_data_root: $net is $want"; else bad "default_data_root: $net (got '$got', want '$want')"; fi
+done
+check 0 "network_known: sepolia" network_known sepolia
+check 0 "network_known: hoodi" network_known hoodi
+check 1 "network_known: mainnet is not a reference network here" network_known mainnet
+check 1 "network_known: empty" network_known ''
+check 1 "network_known: a path is not a network" network_known ../sepolia
+# The two .env examples run side by side: other ports, another DATA_ROOT, and images README.md
+# has a row for under each network.
+sep_ex="$ref/.env.example" hoodi_ex="$ref/.env.hoodi.example"
+check 0 "env examples: Sepolia's ports are valid and distinct" ports_check "$sep_ex"
+check 0 "env examples: Hoodi's ports are valid and distinct" ports_check "$hoodi_ex"
+clash=''
+for k1 in $PORT_KEYS; do for k2 in $PORT_KEYS; do
+  if [[ $(env_get "$sep_ex" "$k1") == "$(env_get "$hoodi_ex" "$k2")" ]]; then clash="$clash $k1/$k2"; fi
+done; done
+if [[ -z $clash ]]; then ok "env examples: no Hoodi port is a Sepolia port"; else bad "env examples: ports clash:$clash"; fi
+if [[ $(env_get "$sep_ex" DATA_ROOT) == "$(default_data_root sepolia)" && $(env_get "$hoodi_ex" DATA_ROOT) == "$(default_data_root hoodi)" ]]; then
+  ok "env examples: each DATA_ROOT is its network's default, and they differ"
+else
+  bad "env examples: each DATA_ROOT is its network's default"
+fi
+for spec in "$sep_ex sepolia" "$hoodi_ex hoodi"; do
+  read -r ex net <<< "$spec"
+  if [[ $(env_get "$ex" NETWORK) == "$net" ]]; then ok "env examples: ${ex##*/} sets NETWORK=$net"; else bad "env examples: ${ex##*/} sets NETWORK=$net"; fi
+  for key in RETH_IMAGE LIGHTHOUSE_IMAGE; do
+    row=$(release_row "$ref/README.md" "$net" "$(env_get "$ex" "$key")")
+    if [[ $row == yes\|* || $row == no\|* ]]; then ok "release notes: README.md has a $net row for ${ex##*/} $key ($row)"; else bad "release notes: README.md has a $net row for ${ex##*/} $key (got '$row')"; fi
+  done
+done
+row=$(release_row "$ref/README.md" hoodi "$(env_get "$hoodi_ex" LIGHTHOUSE_IMAGE)")
+if [[ $row == 'no|v1.7.0-beta.2' ]]; then ok "release notes: the pinned Lighthouse does not schedule Hoodi's fork and targets beta.2"; else bad "release notes: Hoodi Lighthouse row (got '$row')"; fi
+check_out 0 "release notes: a row is matched by image digest, not by tag" '^$' \
+  release_row "$ref/README.md" sepolia "sigp/lighthouse:v8.3.0-rc.0@sha256:$d64"
+for spec in "sepolia 1" "hoodi 2"; do
+  read -r net want <<< "$spec"
+  got=$(required_providers "$net")
+  if [[ $got == "$want" ]]; then ok "required_providers: $net needs $want"; else bad "required_providers: $net (got '$got', want '$want')"; fi
+done
 
 check_out 0 "mode: 600 and the service user passes" '^/k: 600 reth: PASS$' check_mode_owner /k "600 reth" reth
 check_out 1 "mode: 644 fails" '^/k: 644 reth \(want 600 reth\): FAIL$' check_mode_owner /k "644 reth" reth
@@ -550,6 +717,41 @@ if ((me_uid != 0)); then
   if ((rc == 2)) && [[ ! -e $tmp/other ]]; then ok "setup: without --test-mode it needs root"; else bad "setup: without --test-mode it needs root (exit $rc)"; fi
 fi
 
+# compose reads COMPOSE_* keys from .env (COMPOSE_PROJECT_NAME would pick another network's
+# project), so setup.sh refuses them before it changes anything.
+cp "$env_file" "$tmp/cpn.env"; printf 'COMPOSE_PROJECT_NAME=sepolia-ref\n' >> "$tmp/cpn.env"
+check_out 2 "setup: COMPOSE_PROJECT_NAME in .env is refused" 'COMPOSE_PROJECT_NAME: compose reads COMPOSE_\* keys from \.env; none may be set' \
+  bash "$setup" --test-mode --env-file "$tmp/cpn.env" --root "$tmp/cpn-root"
+if [[ ! -e $tmp/cpn-root ]]; then ok "setup: a refused COMPOSE_ key creates nothing"; else bad "setup: a refused COMPOSE_ key creates nothing"; fi
+# NETWORK picks the users and the default DATA_ROOT, so setup.sh refuses one it does not know.
+for value in '' mainnet '../sepolia'; do
+  cp "$env_file" "$tmp/net.env"; set_env "$tmp/net.env" NETWORK "$value"
+  check_out 2 "setup: NETWORK '$value' is refused" '^ERROR: NETWORK must be sepolia or hoodi' \
+    bash "$setup" --test-mode --env-file "$tmp/net.env" --root "$tmp/net-root"
+done
+if [[ ! -e $tmp/net-root ]]; then ok "setup: a refused NETWORK creates nothing"; else bad "setup: a refused NETWORK creates nothing"; fi
+cp "$ref/.env.hoodi.example" "$tmp/hoodi-setup.env"
+check_out 0 "setup: the Hoodi .env example sets up its own root" '^setup OK$' \
+  bash "$setup" --test-mode --env-file "$tmp/hoodi-setup.env" --root "$tmp/hoodi-root"
+if grep -qx "DATA_ROOT=$tmp/hoodi-root" "$tmp/hoodi-setup.env" && grep -qx 'NETWORK=hoodi' "$tmp/hoodi-setup.env" &&
+  grep -qx 'BEACON_API_PORT=5053' "$tmp/hoodi-setup.env"; then
+  ok "setup: the Hoodi .env keeps NETWORK and its ports, and records its DATA_ROOT"
+else
+  bad "setup: the Hoodi .env keeps NETWORK and its ports" "$(cat "$tmp/hoodi-setup.env")"
+fi
+# A checkout reached through a symlinked directory (a symlinked home): the script's own
+# directory and a relative --env-file resolve to the real path (cd -P, pwd -P), which the walk
+# from / then checks, instead of being refused for the symlink.
+mkdir -m 0700 "$tmp/realhome" && cp -R "$ref" "$tmp/realhome/ref-node" && ln -s "$tmp/realhome" "$tmp/linkhome"
+cp "$ref/.env.example" "$tmp/realhome/ref-node/.env"
+check_out 0 "setup: run through a symlinked checkout, the default .env is accepted" '^setup OK$' \
+  bash "$tmp/linkhome/ref-node/setup.sh" --test-mode --root "$tmp/linkhome-root"
+if grep -qx "DATA_ROOT=$tmp/linkhome-root" "$tmp/realhome/ref-node/.env"; then ok "setup: the checkout's .env was written through its real path"; else bad "setup: the checkout's .env was written"; fi
+check_out 0 "setup: a relative --env-file from a symlinked working directory is accepted" '^setup OK$' \
+  bash -c 'cd "$1" && bash "$2" --test-mode --env-file .env --root "$3"' _ "$tmp/linkhome/ref-node" "$setup" "$tmp/linkcwd-root"
+check_out 2 "setup: a symlink inside a relative --env-file is still refused" 'linkhome: a symlink or not a directory' \
+  bash -c 'cd "$1" && bash "$2" --test-mode --env-file linkhome/ref-node/.env --root "$3"' _ "$tmp" "$setup" "$tmp/linkrel-root"
+
 # The JWT copies are staged in a root-only directory, never in the service-owned ones.
 m=$(file_mode_uid "$root/.staging" 2>/dev/null || true)
 if [[ $m == "700 $me_uid" && -z $(ls -A "$root/.staging") ]]; then ok "setup: .staging is 0700, ours, and empty after a run"; else bad "setup: .staging is 0700, ours, and empty (got '$m')"; fi
@@ -566,19 +768,53 @@ check_out 2 "fsguard: check-dir refuses a missing directory" 'absent: no such di
 check_out 2 "fsguard: check-dir refuses a relative directory" '^ERROR: the \.env directory must be an absolute path$' python3 -I "$guard" check-dir rel/dir "$me_uid" -1
 check_out 2 "fsguard: an OPERATOR_UID that is not a uid is refused" "OPERATOR_UID 'x1' is not a uid or -1" python3 -I "$guard" check-dir "$tmp" "$me_uid" x1
 check_out 2 "fsguard: write-file refuses a NAME that is not a file name" "'\.\.': not a file name" python3 -I "$guard" write-file "$tmp" .. "$me_uid" -1 < /dev/null
+# inspect and same-secret: what preflight.sh and collect-run-log.sh read secrets and the node key
+# through. The walk from / follows no symlink, and the file is opened non-blocking and fstat'ed
+# before anything else, so only a regular file with one link is ever looked at.
+fg="$tmp/fg" && mkdir -m 0700 "$fg"
+printf '%s' "$(printf 'a%.0s' $(seq 1 64))" > "$fg/a" && printf '%s' "$(printf 'a%.0s' $(seq 1 64))" > "$fg/b"
+printf '%s' "$(printf 'b%.0s' $(seq 1 64))" > "$fg/c" && printf 'nothex' > "$fg/d" && printf 'nothex' > "$fg/e"
+chmod 0600 "$fg/a" "$fg/b" "$fg/c" && chmod 0640 "$fg/d"
+mkdir -m 0700 "$fg/real" && cp "$fg/a" "$fg/real/k" && ln -s "$fg/real" "$fg/link" && ln -s "$fg/a" "$fg/sym"
+cp "$fg/c" "$fg/f" && ln "$fg/c" "$fg/c2"
+check_out 0 "fsguard: inspect prints the mode and owner uid" "^600 $me_uid$" python3 -I "$guard" inspect "$fg/a"
+check_out 0 "fsguard: inspect keeps the mode as it is" "^640 $me_uid$" python3 -I "$guard" inspect "$fg/d"
+check_out 2 "fsguard: inspect refuses a symlink" "^ERROR: $fg/sym: a symlink or unreadable" python3 -I "$guard" inspect "$fg/sym"
+check_out 2 "fsguard: inspect refuses a symlinked directory on the way" "^ERROR: $fg/link: a symlink or not a directory" python3 -I "$guard" inspect "$fg/link/k"
+check_out 2 "fsguard: inspect refuses a hard-linked file" "^ERROR: $fg/c: has 2 hard links$" python3 -I "$guard" inspect "$fg/c"
+check_out 2 "fsguard: inspect refuses a directory" "^ERROR: $fg/real: not a regular file$" python3 -I "$guard" inspect "$fg/real"
+check_out 2 "fsguard: inspect names a missing file" "^ERROR: $fg/absent: no such file$" python3 -I "$guard" inspect "$fg/absent"
+check_out 2 "fsguard: inspect names a missing directory on the way" "^ERROR: $fg/absent/k: no such file$" python3 -I "$guard" inspect "$fg/absent/k"
+check_out 2 "fsguard: inspect refuses a relative path" '^ERROR: the path must be an absolute path$' python3 -I "$guard" inspect rel/k
+check 0 "fsguard: same-secret: two copies of one 64-hex secret" python3 -I "$guard" same-secret "$fg/a" "$fg/b"
+check 1 "fsguard: same-secret: two different secrets" python3 -I "$guard" same-secret "$fg/a" "$fg/f"
+check 1 "fsguard: same-secret: equal copies that are not 64 hex characters" python3 -I "$guard" same-secret "$fg/d" "$fg/e"
+check_out 2 "fsguard: same-secret refuses a symlink" "^ERROR: $fg/sym: a symlink" python3 -I "$guard" same-secret "$fg/a" "$fg/sym"
+out=$(python3 -I "$guard" same-secret "$fg/a" "$fg/f" 2>&1 || true)
+if printf '%s' "$out" | grep -Eq '[0-9a-f]{64}'; then bad "fsguard: same-secret never prints a secret" "$out"; else ok "fsguard: same-secret never prints a secret"; fi
+if [[ -n $bound ]]; then
+  mkfifo "$fg/fifo"
+  # shellcheck disable=SC2086 # $bound is a command prefix
+  check_out 2 "fsguard: inspect refuses a FIFO without blocking" "^ERROR: $fg/fifo: not a regular file$" $bound python3 -I "$guard" inspect "$fg/fifo"
+  # shellcheck disable=SC2086 # $bound is a command prefix
+  check_out 2 "fsguard: same-secret refuses a FIFO without blocking" "^ERROR: $fg/fifo: not a regular file$" $bound python3 -I "$guard" same-secret "$fg/a" "$fg/fifo"
+else
+  echo "# skip - fsguard inspect refuses a FIFO: no timeout command to bound the run"
+fi
 fi
 
 # --- stubs for preflight.sh and collect-run-log.sh ---------------------------------------------
 
 # Every external command the two scripts call is a stub on PATH: curl serves fixture files by
-# API path, ss and stat print canned output, docker answers image inspect and compose exec.
+# API path, ss prints canned output, docker answers image inspect and compose exec.
 stubs="$tmp/stubs" http="$tmp/http"
 mkdir -p "$stubs" "$http"
 export STUB_DIR="$tmp"
 cat > "$stubs/curl" <<'SH'
 #!/usr/bin/env bash
 # curl stub: the URL comes on stdin (--config -); the answer is $STUB_DIR/http/<API path with
-# / as _>, the API path being everything from /eth/ or /lighthouse/ on. No file: exit 22.
+# / as _>, the API path being everything from /eth/ or /lighthouse/ on, or the same file under
+# $STUB_DIR/http/<URL host>/ when that exists. No file: exit 22.
 out=
 while (($# > 0)); do
   case $1 in --output) out=$2; shift 2 ;; *) shift ;; esac
@@ -590,7 +826,10 @@ case $url in
   */lighthouse/*) api=/lighthouse/${url#*/lighthouse/} ;;
   *) exit 22 ;;
 esac
+# A provider's own answer, $STUB_DIR/http/<host>/<file>, wins over the shared one.
+host=${url#*://} && host=${host%%/*}
 f="$STUB_DIR/http/$(printf '%s' "${api#/}" | tr '/' '_')"
+if [[ -e $STUB_DIR/http/$host/${f##*/} || -e $STUB_DIR/http/$host/${f##*/}.sh ]]; then f="$STUB_DIR/http/$host/${f##*/}"; fi
 [[ -n $out ]] || exit 22
 if [[ -x $f.sh ]]; then "$f.sh" > "$out"; exit; fi   # a generated answer (reads the clock)
 [[ -f $f ]] || exit 22
@@ -600,21 +839,15 @@ cat > "$stubs/ss" <<'SH'
 #!/usr/bin/env bash
 cat "$STUB_DIR/ss.txt"
 SH
-cat > "$stubs/stat" <<'SH'
-#!/usr/bin/env bash
-# stat stub: `stat -c FORMAT PATH` prints the line for PATH in $STUB_DIR/stat.txt
-# ("PATH<TAB>output"); no line: "No such file", exit 1.
-line=$(awk -F '\t' -v p="${!#}" '$1 == p { print $2 }' "$STUB_DIR/stat.txt")
-[[ -n $line ]] || { echo "stat: cannot statx '${!#}': No such file or directory" >&2; exit 1; }
-printf '%s\n' "$line"
-SH
 cat > "$stubs/docker" <<'SH'
 #!/usr/bin/env bash
 # docker stub, answering from $STUB_DIR/docker/: <svc>.digests and <svc>.image-id for image
 # inspect (<svc> is reth when the ref names reth), <svc>.ctr for compose ps -q (absent: not
-# running), <ctr>.json (docker inspect) and <ctr>.top for a container. compose commands also
+# running), <ctr>.json (docker inspect) and <ctr>.top for a container. Every call is logged in
+# $STUB_DIR/docker.log. compose commands also
 # warn on stderr the way compose does about a $ in .env, which must never reach the log.
 d=$STUB_DIR/docker
+printf '%s\n' "$*" >> "$STUB_DIR/docker.log"
 svc_of() { case $1 in *reth*) echo reth ;; *) echo lighthouse ;; esac; }
 last=${!#}
 if [[ $1 == compose ]]; then
@@ -624,7 +857,8 @@ case "$*" in
   "image inspect --format {{range .RepoDigests}}"*) cat "$d/$(svc_of "$last").digests" ;;
   "image inspect --format {{.Id}} "*) cat "$d/$(svc_of "$last").image-id" ;;
   "inspect "*) cat "$d/$2.json" ;;
-  "top "*) cat "$d/$2.top" ;;
+  # <ctr>.top.later, when it exists, answers every top after the first (a restarted container).
+  "top "*) if [[ -f $d/$2.top.later && -f $d/$2.top.seen ]]; then cat "$d/$2.top.later"; else : > "$d/$2.top.seen"; cat "$d/$2.top"; fi ;;
   "compose "*" ps -q --status running "*) cat "$d/$last.ctr" 2>/dev/null || true ;;
   *" exec -T reth "*) echo "Reth Version: 2.7.0" ;;
   *" exec -T lighthouse "*) echo "Lighthouse v8.3.0-rc.0-0123abc" ;;
@@ -668,15 +902,15 @@ pf_base() {
 pf_case() {
   local expect=$1 desc=$2 pattern=$3
   shift 3
-  check_out "$expect" "preflight: $desc" "$pattern" env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env" "$@"
+  check_out "$expect" "preflight: $desc" "$pattern" env PATH="$tmp/stubs-curl:$PATH" bash "${pf_script:-$preflight}" --test-mode --env-file "$pf_env" "$@"
 }
 # pf_real <description> <pattern>: preflight.sh without --test-mode; it fails, with the line.
 pf_real() {
-  check_out 1 "preflight: $1" "$2" env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --env-file "$pf_env"
+  check_out 1 "preflight: $1" "$2" env PATH="$tmp/stubs-curl:$PATH" bash "${pf_script:-$preflight}" --env-file "$pf_env"
 }
 pf_base
 pf_case 0 "a set-up host and a matching endpoint pass" '^spec diff: empty \(8 fork versions'
-pf_case 0 "the endpoint is named by scheme and host" '^checkpoint endpoint: https://checkpoint\.example\.org$'
+pf_case 0 "the endpoint is named by scheme and host" '^checkpoint provider 1: https://checkpoint\.example\.org$'
 
 set_env "$pf_env" CHECKPOINT_SYNC_URL "https://eth-sepolia.example.com/v2/KEY123secret/"
 : > "$tmp/curl.log"
@@ -701,7 +935,7 @@ pf_case 1 "an empty CHECKPOINT_SYNC_URL is refused" '^CHECKPOINT_SYNC_URL: empty
 pf_base; set_env "$pf_env" CHECKPOINT_SYNC_URL "http://checkpoint.example.org"
 pf_case 1 "plain http to a remote host is refused" '^CHECKPOINT_SYNC_URL: http://checkpoint\.example\.org is not https:// \(or http:// to a loopback host\): FAIL$'
 pf_base; set_env "$pf_env" CHECKPOINT_SYNC_URL "http://127.0.0.1:5052"
-pf_case 0 "plain http to a loopback host passes" '^checkpoint endpoint: http://127\.0\.0\.1:5052$'
+pf_case 0 "plain http to a loopback host passes" '^checkpoint provider 1: http://127\.0\.0\.1:5052$'
 pf_base; set_env "$pf_env" TRUSTED_PEERS "16Uiu2HAm,not a peer"
 pf_case 1 "a TRUSTED_PEERS entry that is not base58 is refused" '^TRUSTED_PEERS: .*FAIL$'
 pf_base; set_env "$pf_env" TRUSTED_PEERS "$pid,$pid"
@@ -785,6 +1019,149 @@ if printf '%s' "$out" | grep -q KEY999secret; then bad "preflight: an overriding
 check 2 "preflight: a missing .env is refused" bash "$preflight" --env-file "$tmp/absent.env"
 check 2 "preflight: an unknown option is refused" bash "$preflight" --frobnicate
 
+# The JWT copies are opened through fsguard (no symlink, non-blocking, a regular file with one
+# link), never read by cmp, wc or grep, so a link or a FIFO at a copy fails instead of
+# blocking or reading another file.
+pf_base; cp "$jwt_r" "$tmp/jwt.keep"; rm "$jwt_r"; ln -s "$tmp/jwt.keep" "$jwt_r"
+pf_case 1 "a JWT copy that is a symlink is refused" "reth/jwt\.hex: a symlink or unreadable .*\(want 600 $me_uid\): FAIL$"
+pf_case 1 "a symlinked JWT copy fails the secret comparison" '^jwt: .*FAIL$'
+rm "$jwt_r"; ln "$tmp/jwt.keep" "$jwt_r"
+pf_case 1 "a hard-linked JWT copy is refused" "reth/jwt\.hex: has 2 hard links \(want 600 $me_uid\): FAIL$"
+rm "$jwt_r"; cp "$tmp/jwt.keep" "$jwt_r"
+if [[ -n $bound ]]; then
+  pf_base; rm "$jwt_l"; mkfifo "$jwt_l"
+  # shellcheck disable=SC2086 # $bound is a command prefix
+  check_out 1 "preflight: a FIFO at a JWT copy is refused without blocking" "lighthouse/jwt\.hex: not a regular file \(want 600 $me_uid\): FAIL$" \
+    $bound env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env"
+  rm "$jwt_l"; cp "$jwt_r" "$jwt_l"
+else
+  echo "# skip - preflight refuses a FIFO at a JWT copy: no timeout command to bound the run"
+fi
+pf_base
+
+# NETWORK and the ports.
+for value in '' mainnet; do
+  pf_base; set_env "$pf_env" NETWORK "$value"
+  check_out 2 "preflight: NETWORK '$value' is refused" '^ERROR: NETWORK must be sepolia or hoodi' \
+    env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env"
+done
+pf_base; set_env "$pf_env" BEACON_API_PORT abc
+pf_case 1 "a port that is not a number is refused" '^BEACON_API_PORT: not a port number \(1-65535\): FAIL$'
+pf_base; set_env "$pf_env" ENGINE_PORT 65536
+pf_case 1 "port 65536 is refused" '^ENGINE_PORT: not a port number \(1-65535\): FAIL$'
+pf_base; set_env "$pf_env" RETH_P2P_PORT 030303
+pf_case 1 "a port with a leading zero is refused" '^RETH_P2P_PORT: not a port number'
+pf_base; set_env "$pf_env" LIGHTHOUSE_QUIC_PORT 9000
+pf_case 1 "two keys on one port are refused" '^LIGHTHOUSE_QUIC_PORT: 9000 is already another port of this node: FAIL$'
+pf_base; set_env "$pf_env" ENGINE_PORT ''
+pf_case 1 "a missing port is refused" '^ENGINE_PORT: not a port number'
+pf_base
+pf_case 0 "the configured ports are listed" '^ports: Engine API 127\.0\.0\.1:8551, Beacon API 127\.0\.0\.1:5052, p2p reth 30303 tcp/udp, lighthouse 9000 tcp/udp and 9001 udp$'
+pf_case 0 "the free disk space under DATA_ROOT is shown" "^disk: $root: [0-9]+ GiB free$"
+pf_base; set_env "$pf_env" RETH_IMAGE "ghcr.io/paradigmxyz/reth:v9.9.9@sha256:$d64"
+pf_case 1 "an image README.md has no row for fails" \
+  '^release notes: README\.md has no sepolia row for reth v9\.9\.9 at this digest: FAIL$'
+pf_base
+pf_case 0 "Sepolia: the README release notes say both pinned releases schedule the fork" \
+  '^release notes: lighthouse v8\.3\.0-rc\.0 schedules sepolia.s Gloas / Amsterdam fork \(README\.md\): PASS$'
+
+# Two checkpoint providers. Sepolia: the second one is optional, and checked when set.
+pf_base
+pf_case 0 "Sepolia: one provider is enough" '^CHECKPOINT_SYNC_URL_2: empty \(one checkpoint provider; a second one, run by another operator, cross-checks the anchor\)$'
+anchor_fixture() { # anchor_fixture <host 1> <host 2> <spec JSON>: both serve <spec>, and the same finalized block
+  rm -rf "${http:?}/$1" "${http:?}/$2"
+  mkdir -p "$http/$1" "$http/$2"
+  cp "$3" "$http/$1/eth_v1_config_spec" && cp "$3" "$http/$2/eth_v1_config_spec"
+  header_json "$http/$1/eth_v1_beacon_headers_finalized" 4235200 "$r1" "$s1"
+  header_json "$http/$2/eth_v1_beacon_headers_4235200" 4235200 "$r1" "$s1"
+}
+anchor_fixture cp1.example.org cp2.example.net "$tmp/real-spec.json"
+pf_base; set_env "$pf_env" CHECKPOINT_SYNC_URL https://cp1.example.org; set_env "$pf_env" CHECKPOINT_SYNC_URL_2 https://cp2.example.net/KEY777secret
+pf_case 0 "Sepolia: a second provider is checked when set" "^anchor: slot 4235200, block root $r1, state root $s1, the same on both providers: PASS$"
+pf_case 0 "Sepolia: the second provider's spec is checked" '^spec: https://cp2\.example\.net/… matches sepolia/config\.yaml: PASS$'
+rc=0; out=$(env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env" 2>&1) || rc=$?
+if printf '%s' "$out" | grep -q KEY777secret; then bad "preflight: the second provider's key is never printed" "$out"; else ok "preflight: the second provider's key is never printed"; fi
+
+# Hoodi: two providers, run by different operators, each on the pinned Hoodi config, and
+# both holding provider 1's finalized block with the same block and state root.
+hoodi_env="$tmp/hoodi-setup.env" hroot="$tmp/hoodi-root"
+# The Hoodi cases run the copy whose README says both releases schedule the fork; the real
+# README (neither does today) fails preflight, below.
+hf_base() {
+  pf_script="$yes_ref/preflight.sh"
+  cp "$hoodi_env" "$pf_env"
+  set_env "$pf_env" CHECKPOINT_SYNC_URL https://cp1.example.org/KEY111secret
+  set_env "$pf_env" CHECKPOINT_SYNC_URL_2 https://cp2.example.net
+  anchor_fixture cp1.example.org cp2.example.net "$tmp/hoodi-spec.json"
+}
+hf_base
+pf_case 0 "Hoodi: two agreeing providers on the Hoodi config pass" '^preflight OK \(test mode: not a deployment gate\)$'
+pf_case 0 "Hoodi: provider 1's spec is checked against the Hoodi config" '^spec: https://cp1\.example\.org/… matches hoodi/config\.yaml: PASS$'
+pf_case 0 "Hoodi: provider 2's spec is checked against the Hoodi config" '^spec: https://cp2\.example\.net matches hoodi/config\.yaml: PASS$'
+pf_case 0 "Hoodi: the providers are recorded" '^checkpoint provider 2: https://cp2\.example\.net$'
+pf_case 0 "Hoodi: the anchor is compared" "^anchor: slot 4235200, block root $r1, state root $s1, the same on both providers: PASS$"
+pf_case 0 "Hoodi: its own ports are listed" '^ports: Engine API 127\.0\.0\.1:8552, Beacon API 127\.0\.0\.1:5053, p2p reth 30304 tcp/udp, lighthouse 9002 tcp/udp and 9003 udp$'
+pf_case 0 "Hoodi: README rows that schedule the fork pass" \
+  '^release notes: lighthouse v8\.3\.0-rc\.0 schedules hoodi.s Gloas / Amsterdam fork \(README\.md\): PASS$'
+hf_base; pf_script=
+pf_case 1 "Hoodi: today's pinned releases do not schedule Hoodi's fork, so preflight fails" \
+  '^release notes: reth v2\.7\.0 does not schedule hoodi.s Gloas / Amsterdam fork \(README\.md\): replace it before starting: FAIL$'
+pf_case 1 "Hoodi: the Lighthouse row fails too" '^release notes: lighthouse v8\.3\.0-rc\.0 does not schedule hoodi.s'
+hf_base; set_env "$pf_env" CHECKPOINT_SYNC_URL_2 ''
+pf_case 1 "Hoodi: a single provider is refused" '^CHECKPOINT_SYNC_URL_2: empty \(hoodi needs 2 checkpoint providers, run by different operators\): FAIL$'
+hf_base; set_env "$pf_env" CHECKPOINT_SYNC_URL_2 https://cp1.example.org/other
+pf_case 1 "Hoodi: two URLs on one host are refused" '^CHECKPOINT_SYNC_URL_2: the same host as CHECKPOINT_SYNC_URL \(want providers run by different operators\): FAIL$'
+hf_base; set_env "$pf_env" CHECKPOINT_SYNC_URL_2 http://cp2.example.net
+pf_case 1 "Hoodi: provider 2 over plain http is refused" '^CHECKPOINT_SYNC_URL_2: http://cp2\.example\.net is not https://'
+hf_base; cp "$tmp/hoodi-pre-gloas.json" "$http/cp2.example.net/eth_v1_config_spec"
+pf_case 1 "Hoodi: provider 2 without Hoodi's Gloas epoch is refused" '^spec: https://cp2\.example\.net differs from the pinned config: FAIL$'
+pf_case 1 "Hoodi: the anchor is not compared after a failed spec" '^anchor: not compared \(a provider failed a check above\)$'
+hf_base; cp "$tmp/real-spec.json" "$http/cp1.example.org/eth_v1_config_spec"
+pf_case 1 "Hoodi: a provider on the Sepolia config is refused" '^- GENESIS_FORK_VERSION: pinned 0x10000910, node 0x90000069$'
+hf_base; header_json "$http/cp2.example.net/eth_v1_beacon_headers_4235200" 4235200 "$r2" "$s1"
+pf_case 1 "Hoodi: providers that disagree on the block root are refused" "^anchor: slot 4235200: block root $r1 on provider 1, $r2 on provider 2: FAIL$"
+hf_base; header_json "$http/cp2.example.net/eth_v1_beacon_headers_4235200" 4235200 "$r1" "$s2"
+pf_case 1 "Hoodi: providers that disagree on the state root are refused" "^anchor: slot 4235200: state root $s1 on provider 1, $s2 on provider 2: FAIL$"
+hf_base; rm "$http/cp2.example.net/eth_v1_beacon_headers_4235200"
+pf_case 1 "Hoodi: provider 2 without provider 1's finalized slot is refused" '^anchor: could not fetch slot 4235200 from https://cp2\.example\.net \(curl exit 22\): FAIL$'
+hf_base; rm "$http/cp1.example.org/eth_v1_beacon_headers_finalized"
+pf_case 1 "Hoodi: provider 1 without a finalized header is refused" '^anchor: could not fetch the finalized header from https://cp1\.example\.org/… \(curl exit 22\): FAIL$'
+hf_base
+rc=0; out=$(env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env" 2>&1) || rc=$?
+if printf '%s' "$out" | grep -q KEY111secret; then bad "preflight: Hoodi: provider 1's key is never printed" "$out"; else ok "preflight: Hoodi: provider 1's key is never printed"; fi
+if ! id -u reth-hoodi >/dev/null 2>&1; then
+  hf_base
+  pf_real "Hoodi: the users are the network's own (reth-hoodi)" '^user reth-hoodi: does not exist \(run setup.sh\): FAIL$'
+fi
+pf_script=
+
+# COMPOSE_* keys in .env and COMPOSE_PROJECT_NAME in the environment are refused: compose
+# reads them, and COMPOSE_PROJECT_NAME=sepolia-ref would make the Hoodi `up` recreate the
+# Sepolia services.
+for line in 'COMPOSE_PROJECT_NAME=sepolia-ref' 'COMPOSE_FILE=/tmp/evil.yaml'; do
+  pf_base; printf '%s\n' "$line" >> "$pf_env"
+  check_out 2 "preflight: '${line%%=*}' in .env is refused" "line [0-9]+: ${line%%=*}: compose reads COMPOSE_\* keys from \.env; none may be set" \
+    env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env"
+done
+pf_base
+check_out 2 "preflight: COMPOSE_PROJECT_NAME in the environment is refused" '^ERROR: COMPOSE_PROJECT_NAME is set in the environment' \
+  env PATH="$tmp/stubs-curl:$PATH" COMPOSE_PROJECT_NAME=sepolia-ref bash "$preflight" --test-mode --env-file "$pf_env"
+check_out 2 "preflight: an empty COMPOSE_PROJECT_NAME in the environment is refused too" '^ERROR: COMPOSE_PROJECT_NAME is set in the environment' \
+  env PATH="$tmp/stubs-curl:$PATH" COMPOSE_PROJECT_NAME= bash "$preflight" --test-mode --env-file "$pf_env"
+pf_case 0 "the compose project is named" '^compose project: sepolia-ref \(docker compose -p sepolia-ref --env-file .*\)$'
+
+# A DATA_ROOT is data, never program text: with | and ;e in it (GNU sed's e command would run
+# the rest), a missing JWT copy is reported by its literal path and nothing runs.
+pf_base; evil_root="$tmp/m|x|;etouch $tmp/pwned;#"
+set_env "$pf_env" DATA_ROOT "$evil_root"
+rc=0; out=$(env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env" 2>&1) || rc=$?
+if ((rc == 1)) && [[ ! -e $tmp/pwned ]] && printf '%s\n' "$out" | grep -qxF "$evil_root/reth/jwt.hex: no such file (want 600 $me_uid): FAIL"; then
+  ok "preflight: a DATA_ROOT with | and ;e is reported literally and runs nothing"
+else
+  bad "preflight: a DATA_ROOT with | and ;e (exit $rc, pwned: $([[ -e $tmp/pwned ]] && echo yes || echo no))" "$out"
+fi
+rm -f "$tmp/pwned"
+
 fi
 
 # --- collect-run-log.sh against the stubs (not as root) ----------------------------------------
@@ -801,8 +1178,13 @@ cl_base() {
   cp "$env_file" "$cl_env"
   set_env "$cl_env" CHECKPOINT_SYNC_URL "https://eth-sepolia.example.com/v2/KEY123secret"
   set_env "$cl_env" TRUSTED_PEERS "$pid"
-  set_env "$cl_env" RETH_UID 990; set_env "$cl_env" RETH_GID 990
-  set_env "$cl_env" LIGHTHOUSE_UID 991; set_env "$cl_env" LIGHTHOUSE_GID 991
+  # The JWT copies and the node key are real files (read through fsguard), so as a normal user
+  # both services' ids are the caller's.
+  set_env "$cl_env" RETH_UID "$me_uid"; set_env "$cl_env" RETH_GID "$me_gid"
+  set_env "$cl_env" LIGHTHOUSE_UID "$me_uid"; set_env "$cl_env" LIGHTHOUSE_GID "$me_gid"
+  chmod 0600 "$jwt_r" "$jwt_l"
+  rm -rf "$root/lighthouse/data/beacon"; mkdir -p "$root/lighthouse/data/beacon/network"
+  printf 'node-key' > "$key_path" && chmod 0600 "$key_path"
   echo 1790000000 > "$tmp/clock"
   echo $((1790000000 - 12 * 1000 - 6)) > "$tmp/genesis_time"
   printf '{"data":{"genesis_time":"%s","genesis_validators_root":"0xd8ea","genesis_fork_version":"0x90000069"}}\n' \
@@ -813,36 +1195,39 @@ cl_base() {
   printf '%s\n' '{"schema_version":31,"anchor":{"anchor_slot":"10000","oldest_block_slot":"10000","state_upper_limit":"10000","state_lower_limit":"0"}}' \
     > "$http/lighthouse_database_info"
   cl_identity "[\"/ip4/34.89.10.7/tcp/9000/p2p/$pid\",\"/ip4/34.89.10.7/udp/9001/quic-v1/p2p/$pid\"]" ',"custody_group_count":"4"'
-  printf '%s\n' "$ss_head" "$ss_reth" "$ss_lh" "$ss_p2p" > "$tmp/ss.txt"
-  printf '%s\t%s\n' "$jwt_r" "600 reth" "$jwt_l" "600 lighthouse" "$key_path" "600 lighthouse" > "$tmp/stat.txt"
+  printf '%s\n' "$ss_head" "$ss_reth" "$ss_lh" "$ss_p2p" "$ss_rp2p" "$ss_ssh" > "$tmp/ss.txt"
   rm -f "$tmp/docker"/*
-  cl_container reth "ghcr.io/paradigmxyz/reth@sha256:$reth_digest" sha256:1111 ctr-reth 990
-  cl_container lighthouse "sigp/lighthouse@sha256:$lh_digest" sha256:2222 ctr-lh 991
+  cl_container reth "ghcr.io/paradigmxyz/reth@sha256:$reth_digest" sha256:1111 ctr-reth "$me_uid" "$me_gid" 812
+  cl_container lighthouse "sigp/lighthouse@sha256:$lh_digest" sha256:2222 ctr-lh "$me_uid" "$me_gid" 901
 }
-# cl_container <svc> <repo digest> <image id> <container id> <uid>: a running container of the
-# pinned image, as <uid>, hardened as compose.yaml asks (its docker inspect output).
+# cl_container <svc> <repo digest> <image id> <container id> <uid> <gid> <pid>: a running
+# container of the pinned image, as <uid>:<gid>, hardened as compose.yaml asks (its docker
+# inspect output, with the masked and read-only paths docker sets by default), its process
+# <pid> on the host.
 cl_container() {
   printf '%s\n' "$2" > "$tmp/docker/$1.digests"
   echo "$3" > "$tmp/docker/$1.image-id"
   echo "$4" > "$tmp/docker/$1.ctr"
-  python3 -I - "$tmp/docker/$4.json" "$1" "$3" "$5" "$root" <<'PY'
+  python3 -I - "$tmp/docker/$4.json" "$1" "$3" "$5" "$6" "$root" <<'PY'
 import json, sys
-out, svc, image, uid, root = sys.argv[1:]
+out, svc, image, uid, gid, root = sys.argv[1:]
 json.dump([{
     "Image": image,
-    "Config": {"User": f"{uid}:{uid}"},
+    "Config": {"User": f"{uid}:{gid}"},
     "HostConfig": {"ReadonlyRootfs": True, "CapDrop": ["ALL"], "CapAdd": None,
                    "SecurityOpt": ["no-new-privileges:true"], "Privileged": False,
                    "NetworkMode": "host", "Tmpfs": {"/tmp": "rw,noexec,nosuid,nodev,size=256m"},
                    "GroupAdd": None, "Devices": None, "PidMode": "", "IpcMode": "private",
-                   "UTSMode": "", "CgroupnsMode": "private"},
+                   "UTSMode": "", "CgroupnsMode": "private",
+                   "MaskedPaths": ["/proc/acpi", "/proc/kcore", "/proc/keys", "/sys/firmware"],
+                   "ReadonlyPaths": ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"]},
     "Mounts": [
         {"Type": "bind", "Source": f"{root}/{svc}/data", "Destination": "/data", "RW": True},
         {"Type": "bind", "Source": f"{root}/{svc}/jwt.hex", "Destination": "/secrets/jwt.hex", "RW": False},
     ],
 }], open(out, "w"))
 PY
-  printf '%s\n' 'RUID EUID PID COMMAND' "$5 $5 812 $1" > "$tmp/docker/$4.top"
+  printf '%s\n' 'RUID EUID PID COMMAND' "$5 $5 $7 $1" > "$tmp/docker/$4.top"
 }
 # cl_inspect <container id> <python statement on c, the inspect object>: loosen one setting.
 cl_inspect() {
@@ -877,11 +1262,11 @@ cl_run() {
   local expect=$1 desc=$2 rc=0
   shift 2
   n_run=$((${n_run:-0} + 1)); log="$tmp/runlog$n_run.md"
-  PATH="$stubs:$PATH" bash "$collect" --env-file "$cl_env" "$@" > "$log" 2> "$log.err" || rc=$?
+  PATH="$stubs:$PATH" bash "${collect_script:-$collect}" --env-file "$cl_env" "$@" > "$log" 2> "$log.err" || rc=$?
   if ((rc == expect)) && [[ -s $log ]]; then ok "run log: $desc"; else bad "run log: $desc (exit $rc, want $expect)" "$(cat "$log.err")"; fi
 }
 # cl_quick: one sample, no wait: a diagnostic run, so never an overall PASS (exit 1).
-cl_quick() { cl_run 1 "$1" --samples 1 --interval 0; }
+cl_quick() { local desc=$1; shift; cl_run 1 "$desc" --samples 1 --interval 0 "$@"; }
 # verdict <criterion number> <PASS|FAIL|DIAGNOSTIC> <description>: the verdict table row.
 verdict() {
   if [[ -n $log ]] && grep -Eq "^\| $1 \| .* \| $2 \|$" "$log"; then ok "run log: $3"; else bad "run log: $3 (criterion $1, want $2)" "$(cat "${log:-/dev/null}")"; fi
@@ -899,15 +1284,23 @@ has "Reth Version: 2.7.0" "records the reth --version output"
 has "Lighthouse v8.3.0-rc.0-0123abc" "records the lighthouse --version output"
 has "ghcr.io/paradigmxyz/reth@sha256:$reth_digest" "records reth's repo digest"
 has "reth container ctr-reth: image sha256:1111, pinned image sha256:1111: PASS" "the running reth container runs the pinned image"
-has "reth container ctr-reth: Config.User 990:990 (want 990:990): PASS" "records the reth container's configured user and group"
-has "reth container ctr-reth: processes ruid/euid 990/990 (want 990): PASS" "records the reth container's process uids"
+has "reth container ctr-reth: Config.User $me_uid:$me_gid (want $me_uid:$me_gid): PASS" "records the reth container's configured user and group"
+has "reth container ctr-reth: processes ruid/euid $me_uid/$me_uid (want $me_uid): PASS" "records the reth container's process uids"
+has "reth container ctr-reth: CgroupnsMode \"private\": PASS" "records the private cgroup namespace"
+has "reth container ctr-reth: MaskedPaths 4, ReadonlyPaths 5: PASS" "records the masked and read-only paths"
+has "lighthouse v8.3.0-rc.0 targets consensus-specs v1.7.0-beta.2 (README.md): spec version differs from ours (v1.7.0-beta.4); recorded, not a FAIL" \
+  "records that Lighthouse's consensus-specs version differs from ours, without failing"
+has "release notes: reth v2.7.0 schedules sepolia's Gloas / Amsterdam fork (README.md): PASS" "records that the pinned reth schedules the fork"
+has "- Network: sepolia; checkpoint providers: https://eth-sepolia.example.com/…" "records the network and the providers, scheme and host only"
 has "lighthouse container ctr-lh: ReadonlyRootfs true: PASS" "records the read-only root"
 has "lighthouse container ctr-lh: mounts /data <- $root/lighthouse/data (bind, rw); /secrets/jwt.hex <- $root/lighthouse/jwt.hex (bind, ro): PASS" "records the mounts"
 if grep -q SECRETPART "$log" "$log.err"; then bad "run log: compose's stderr never reaches the log"; else ok "run log: compose's stderr never reaches the log"; fi
 if [[ $(tail -1 "$log.err") == "run log: PASS" ]]; then ok "run log: the verdict line is on stderr"; else bad "run log: the verdict line is on stderr" "$(cat "$log.err")"; fi
 has "127.0.0.1:8551" "records the ss line for 8551"
-has "$jwt_r: 600 reth: PASS" "records stat of reth's JWT copy"
-has "$key_path: 600 lighthouse: PASS" "records stat of the node key"
+has "$jwt_r: 600 $me_uid: PASS" "records the mode and owner of reth's JWT copy"
+has "$key_path: 600 $me_uid: PASS" "records the mode and owner of the node key"
+has "reth: no non-loopback TCP listener but p2p port 30303 (pids 812): PASS" "records reth's listeners"
+has "lighthouse: p2p listener 0.0.0.0:9000 (pid 901)" "records Lighthouse's p2p listener"
 has "spec diff: empty (8 fork versions, 7 fork epochs, 2 blob schedule entries)" "records the empty spec diff"
 has "finalized slot 10128, oldest block slot 10000 (anchor.oldest_block_slot): 128 slots: PASS" "a 128-slot finalized range passes"
 has "custody_group_count: 4" "records custody_group_count"
@@ -979,13 +1372,13 @@ cl_base; cl_inspect ctr-reth 'c["Config"]["User"] = "0:0"'
 cl_quick "a reth container configured as root fails"
 has "Config.User 0:0" "records Config.User"
 verdict 1 FAIL "Config.User root fails criterion 1"
-cl_base; printf '%s\n' 'RUID EUID PID COMMAND' '990 0 812 reth' > "$tmp/docker/ctr-reth.top"
+cl_base; printf '%s\n' 'RUID EUID PID COMMAND' "$me_uid 0 812 reth" > "$tmp/docker/ctr-reth.top"
 cl_quick "a reth process with euid 0 fails"
 verdict 1 FAIL "a process running as root fails criterion 1"
 cl_base; cl_inspect ctr-lh 'c["Config"]["User"] = "992:992"'
 printf '%s\n' 'RUID EUID PID COMMAND' '992 992 901 lighthouse' > "$tmp/docker/ctr-lh.top"
 cl_quick "a lighthouse container as another uid than LIGHTHOUSE_UID fails"
-has "(want 991:991): FAIL" "names the expected uid and gid"
+has "(want $me_uid:$me_gid): FAIL" "names the expected uid and gid"
 # Every hardening setting compose.yaml makes, loosened one at a time (as an extra -f override
 # file could), fails criterion 1.
 hardening() { # hardening <description> <pattern> <python statement>
@@ -1011,9 +1404,9 @@ hardening "a /tmp tmpfs without nodev" 'tmpfs {"/tmp": "rw,noexec,nosuid"}: FAIL
 hardening "a /tmp tmpfs whose later exec undoes noexec" 'tmpfs {"/tmp": "noexec,nosuid,nodev,exec"}: FAIL' 'c["HostConfig"]["Tmpfs"]["/tmp"] = "noexec,nosuid,nodev,exec"'
 # The identity half of Config.User and every namespace or device that would let a service reach
 # the host or another group's files.
-hardening "Config.User with group 0" 'Config.User 990:0 (want 990:990): FAIL' 'c["Config"]["User"] = "990:0"'
-hardening "Config.User with another group than RETH_GID" 'Config.User 990:991 (want 990:990): FAIL' 'c["Config"]["User"] = "990:991"'
-hardening "Config.User without a group" 'Config.User 990 (want 990:990): FAIL' 'c["Config"]["User"] = "990"'
+hardening "Config.User with group 0" "Config.User $me_uid:0 (want $me_uid:$me_gid): FAIL" 'c["Config"]["User"] = c["Config"]["User"].split(":")[0] + ":0"'
+hardening "Config.User with another group than RETH_GID" "Config.User $me_uid:$((me_gid + 1)) (want $me_uid:$me_gid): FAIL" 'c["Config"]["User"] = c["Config"]["User"].split(":")[0] + ":" + str(int(c["Config"]["User"].split(":")[1]) + 1)'
+hardening "Config.User without a group" "Config.User $me_uid (want $me_uid:$me_gid): FAIL" 'c["Config"]["User"] = c["Config"]["User"].split(":")[0]'
 hardening "a supplementary group" 'reth container ctr-reth: GroupAdd ["0"]: FAIL' 'c["HostConfig"]["GroupAdd"] = ["0"]'
 hardening "a host device" 'reth container ctr-reth: Devices ["/dev/sda"]: FAIL' 'c["HostConfig"]["Devices"] = [{"PathOnHost": "/dev/sda", "PathInContainer": "/dev/sda", "CgroupPermissions": "rwm"}]'
 hardening "the host PID namespace" 'reth container ctr-reth: PidMode "host": FAIL' 'c["HostConfig"]["PidMode"] = "host"'
@@ -1023,17 +1416,25 @@ hardening "the host UTS namespace" 'reth container ctr-reth: UTSMode "host": FAI
 hardening "the host cgroup namespace" 'reth container ctr-reth: CgroupnsMode "host": FAIL' 'c["HostConfig"]["CgroupnsMode"] = "host"'
 hardening "seccomp unconfined" 'SecurityOpt ["no-new-privileges:true", "seccomp=unconfined"]: FAIL' 'c["HostConfig"]["SecurityOpt"].append("seccomp=unconfined")'
 hardening "AppArmor unconfined" 'SecurityOpt ["no-new-privileges:true", "apparmor=unconfined"]: FAIL' 'c["HostConfig"]["SecurityOpt"].append("apparmor=unconfined")'
-cl_base; cl_inspect ctr-reth 'del c["HostConfig"]["CgroupnsMode"]'
-cl_run 0 "an engine that reports no CgroupnsMode (cgroup v1) is fine"
-has "reth container ctr-reth: CgroupnsMode (none): PASS" "records the missing cgroup namespace mode"
+# On a cgroup v1 host docker defaults the cgroup namespace to the host's; compose.yaml sets
+# cgroup: private, so the engine reports "private", and anything else fails.
+hardening "a cgroup v1 engine's default (CgroupnsMode host, no cgroup: private)" 'reth container ctr-reth: CgroupnsMode "host": FAIL' \
+  'c["HostConfig"]["CgroupnsMode"] = "host"; c["HostConfig"]["Cgroup"] = ""'
+hardening "no CgroupnsMode at all" 'reth container ctr-reth: CgroupnsMode (none): FAIL' 'del c["HostConfig"]["CgroupnsMode"]'
+# security_opt systempaths=unconfined does not show in SecurityOpt: it empties the masked and
+# read-only /proc and /sys paths instead.
+hardening "systempaths=unconfined (no masked or read-only paths)" 'reth container ctr-reth: MaskedPaths 0, ReadonlyPaths 0: FAIL' \
+  'c["HostConfig"]["MaskedPaths"] = []; c["HostConfig"]["ReadonlyPaths"] = []'
+hardening "MaskedPaths null" 'MaskedPaths 0, ReadonlyPaths 5: FAIL' 'c["HostConfig"]["MaskedPaths"] = None'
+hardening "no ReadonlyPaths" 'MaskedPaths 4, ReadonlyPaths 0: FAIL' 'del c["HostConfig"]["ReadonlyPaths"]'
 cl_base; cl_inspect ctr-reth 'c["Mounts"].append({"Type": "tmpfs", "Source": "", "Destination": "/tmp", "RW": True})'
 cl_run 0 "a /tmp tmpfs listed among the mounts is fine"
 
 cl_base; set_env "$cl_env" RETH_IMAGE "ghcr.io/paradigmxyz/reth:v9.9.9@sha256:$d64"
-cl_container reth "ghcr.io/paradigmxyz/reth@sha256:$d64" sha256:1111 ctr-reth 990
+cl_container reth "ghcr.io/paradigmxyz/reth@sha256:$d64" sha256:1111 ctr-reth "$me_uid" "$me_gid" 812
 cl_quick "an image whose release note README.md does not record fails"
 verdict 1 FAIL "an unrecorded release fails the versions criterion"
-has "v9.9.9: no release-note line in README.md" "names the release that lacks a note"
+has "reth v9.9.9: no sepolia row in README.md's release notes for this image: FAIL" "names the release that lacks a note"
 cl_base; printf '%s\n' "ghcr.io/paradigmxyz/reth@sha256:$d64" > "$tmp/docker/reth.digests"
 cl_quick "a local image whose digest differs from .env fails"
 verdict 1 FAIL "a digest mismatch fails the versions criterion"
@@ -1049,16 +1450,94 @@ verdict 3 FAIL "a public bind fails the localhost criterion"
 cl_base; printf '%s\n' "$ss_head" "$ss_lh" > "$tmp/ss.txt"
 cl_quick "no Engine API listener fails"
 verdict 3 FAIL "a missing listener fails the localhost criterion"
+# Any other public TCP listener of a container's processes fails, whatever its port: an
+# override adding reth --http --http.addr=0.0.0.0 opens 8545 on every address.
+cl_base; printf '%s\n' "$ss_rpc" >> "$tmp/ss.txt"
+cl_quick "reth's HTTP RPC on 0.0.0.0 fails"
+verdict 3 FAIL "a public RPC listener fails the localhost criterion"
+has "reth: listener 0.0.0.0:8545 (pid 812) is neither on loopback nor a p2p port: FAIL" "names the listener and its process"
+cl_base; printf '%s\n' "${ss_rpc/pid=812/pid=901}" >> "$tmp/ss.txt"
+cl_quick "a public listener of Lighthouse's process fails"
+verdict 3 FAIL "Lighthouse's public listener fails the localhost criterion"
+cl_base; printf '%s\n' "$ss_lmet" >> "$tmp/ss.txt"
+cl_run 0 "a loopback-only extra listener (metrics) passes"
+cl_base; printf '%s\n' 'RUID EUID PID COMMAND' > "$tmp/docker/ctr-reth.top"
+cl_quick "a container without processes cannot be matched to its listeners"
+has "reth: no container process to match listeners to: FAIL" "says why the listeners were not checked"
+# The pids and the sockets are read together, right before the check: a container restarted
+# during the hour of sync samples has new pids, and its public RPC must not slip through.
+cl_base; printf '%s\n' 'RUID EUID PID COMMAND' "$me_uid $me_uid 1812 reth" > "$tmp/docker/ctr-reth.top.later"
+printf '%s\n' "$ss_head" "$ss_reth" "$ss_lh" "$ss_p2p" "${ss_rp2p/pid=812/pid=1812}" "${ss_rpc/pid=812/pid=1812}" > "$tmp/ss.txt"
+cl_quick "a container restarted during the run, now with a public RPC, fails"
+verdict 3 FAIL "the restarted container's public RPC fails the listener criterion"
+has "reth: listener 0.0.0.0:8545 (pid 1812) is neither on loopback nor a p2p port: FAIL" "matches the new pid"
+cl_base; printf '%s\n' 'RUID EUID PID COMMAND' "$me_uid $me_uid 1812 reth" > "$tmp/docker/ctr-reth.top.later"
+printf '%s\n' "$ss_head" "$ss_reth" "$ss_lh" "$ss_p2p" "${ss_rp2p/pid=812/pid=1812}" > "$tmp/ss.txt"
+cl_run 0 "a container restarted during the run is checked by its new pids"
+has "reth: no non-loopback TCP listener but p2p port 30303 (pids 1812): PASS" "records the new pids"
+cl_base; sed 's/ *users:.*//' "$tmp/ss.txt" > "$tmp/ss.bare" && mv "$tmp/ss.bare" "$tmp/ss.txt"
+cl_quick "an ss without process information fails"
+verdict 3 FAIL "listeners that cannot be matched to a process fail"
+has "reth: ss -ltnp shows no process for any listener (it needs root): FAIL" "says why"
+cl_base; printf '%s\n' "$ss_head" "$ss_reth" "$ss_lh" "$ss_p2p" "$ss_ssh" > "$tmp/ss.txt"
+cl_quick "a service none of whose listeners matched fails"
+verdict 3 FAIL "reth without a p2p listener fails the listener criterion"
+has "reth: no p2p listener on port 30303 among pids 812: FAIL" "names the missing p2p listener"
 
-cl_base; printf '%s\t%s\n' "$jwt_r" "600 reth" "$jwt_l" "600 lighthouse" "$key_path" "644 lighthouse" > "$tmp/stat.txt"
+# compose runs as -p <network>-ref on every call, so COMPOSE_PROJECT_NAME can never pick
+# another project, and the scripts refuse it anyway.
+cl_base; : > "$tmp/docker.log"
+cl_quick "one sample, for the compose calls"
+if grep -q '^compose ' "$tmp/docker.log" && ! grep '^compose ' "$tmp/docker.log" | grep -vq '^compose -p sepolia-ref --env-file '; then
+  ok "run log: every compose call passes -p sepolia-ref"
+else
+  bad "run log: every compose call passes -p sepolia-ref" "$(cat "$tmp/docker.log")"
+fi
+cl_base; printf '%s\n' COMPOSE_PROJECT_NAME=sepolia-ref >> "$cl_env"
+check_out 2 "run log: COMPOSE_PROJECT_NAME in .env is refused" 'COMPOSE_PROJECT_NAME: compose reads COMPOSE_\* keys' \
+  env PATH="$stubs:$PATH" bash "$collect" --env-file "$cl_env" --samples 1 --interval 0
+cl_base
+check_out 2 "run log: COMPOSE_PROJECT_NAME in the environment is refused" '^ERROR: COMPOSE_PROJECT_NAME is set in the environment' \
+  env PATH="$stubs:$PATH" COMPOSE_PROJECT_NAME=hoodi-ref bash "$collect" --env-file "$cl_env" --samples 1 --interval 0
+
+# Values that reach a sed or awk program are data, never program text: a container id with &
+# (sed's "the match") is printed as it is.
+cl_base; mv "$tmp/docker/ctr-reth.json" "$tmp/docker/ctr&x.json"; mv "$tmp/docker/ctr-reth.top" "$tmp/docker/ctr&x.top"
+echo 'ctr&x' > "$tmp/docker/reth.ctr"
+cl_quick "a container id with & in it"
+has "reth container ctr&x: image sha256:1111, pinned image sha256:1111: PASS" "prints a container id literally"
+
+cl_base; chmod 0644 "$key_path"
 cl_quick "a 0644 node key fails"
 verdict 4 FAIL "a 0644 node key fails the file-mode criterion"
-cl_base; printf '%s\t%s\n' "$jwt_r" "600 root" "$jwt_l" "600 lighthouse" "$key_path" "600 lighthouse" > "$tmp/stat.txt"
-cl_quick "a root-owned JWT copy fails"
-verdict 4 FAIL "a JWT copy owned by root fails the file-mode criterion"
-cl_base; printf '%s\t%s\n' "$jwt_r" "600 reth" "$jwt_l" "600 lighthouse" > "$tmp/stat.txt"
+cl_base; set_env "$cl_env" RETH_UID $((me_uid + 1))
+cl_quick "a JWT copy not owned by RETH_UID fails"
+verdict 4 FAIL "a JWT copy owned by another uid fails the file-mode criterion"
+has "$jwt_r: 600 $me_uid (want 600 $((me_uid + 1))): FAIL" "records the owner it found"
+cl_base; rm "$key_path"
 cl_quick "a missing node key fails"
-has "$key_path: no such file (want 600 lighthouse): FAIL" "records the missing node key"
+has "$key_path: no such file (want 600 $me_uid): FAIL" "records the missing node key"
+# The node key and the JWT copies are opened through fsguard: a symlink or a hard link there is
+# refused (the collector checked mode and owner only, so a 0600 link passed), a FIFO too.
+cl_base; mv "$key_path" "$tmp/key.elsewhere"; ln -s "$tmp/key.elsewhere" "$key_path"
+cl_quick "a symlink at the node key fails"
+has "$key_path: a symlink or unreadable" "records the refused symlink"
+verdict 4 FAIL "a symlinked node key fails the file-mode criterion"
+cl_base; ln "$key_path" "$tmp/key.link"
+cl_quick "a hard-linked node key fails"
+has "$key_path: has 2 hard links (want 600 $me_uid): FAIL" "records the extra link"
+rm -f "$tmp/key.link" "$tmp/key.elsewhere"
+if [[ -n $bound ]]; then
+  cl_base; rm "$key_path"; mkfifo -m 0600 "$key_path"
+  n_run=$((${n_run:-0} + 1)); log="$tmp/runlog$n_run.md"; rc=0
+  PATH="$stubs:$PATH" $bound bash "$collect" --env-file "$cl_env" --samples 1 --interval 0 > "$log" 2> "$log.err" || rc=$?
+  if ((rc == 1)); then ok "run log: a 0600 FIFO at the node key does not block the run"; else bad "run log: a FIFO at the node key (exit $rc)" "$(cat "$log.err")"; fi
+  has "$key_path: not a regular file (want 600 $me_uid): FAIL" "records the FIFO"
+  verdict 4 FAIL "a FIFO at the node key fails the file-mode criterion"
+  rm -f "$key_path"
+else
+  echo "# skip - run log refuses a FIFO at the node key: no timeout command to bound the run"
+fi
 
 cl_base; cp "$tmp/pre-gloas.json" "$http/eth_v1_config_spec"
 cl_quick "a node on a pre-Gloas config fails"
@@ -1092,14 +1571,88 @@ cl_base; set_env "$cl_env" TRUSTED_PEERS ""
 cl_run 0 "TRUSTED_PEERS empty still passes"
 has 'trusted_by_reference = false' "TRUSTED_PEERS empty: the session config is not trusted_by_reference"
 
+# NETWORK and the ports, refused before anything runs.
+for line in 'NETWORK=mainnet' 'BEACON_API_PORT=5o52' 'LIGHTHOUSE_QUIC_PORT=9000'; do
+  cl_base; set_env "$cl_env" "${line%%=*}" "${line#*=}"
+  rc=0; out=$(PATH="$stubs:$PATH" bash "$collect" --env-file "$cl_env" --samples 1 --interval 0 2>&1 >/dev/null) || rc=$?
+  if ((rc == 2)) && printf '%s\n' "$out" | grep -q "^ERROR: "; then ok "run log: '$line' is refused"; else bad "run log: '$line' is refused (exit $rc)" "$out"; fi
+done
+
+# Hoodi: the same stack under its own .env, root, ports and pinned config. The genesis time and
+# the slot maths come from the node's own answers.
+cl_hoodi() {
+  cl_base
+  cp "$hoodi_env" "$cl_env"
+  set_env "$cl_env" CHECKPOINT_SYNC_URL "https://cp1.example.org/KEY111secret"
+  set_env "$cl_env" CHECKPOINT_SYNC_URL_2 "https://cp2.example.net"
+  set_env "$cl_env" RETH_UID "$me_uid"; set_env "$cl_env" RETH_GID "$me_gid"
+  set_env "$cl_env" LIGHTHOUSE_UID "$me_uid"; set_env "$cl_env" LIGHTHOUSE_GID "$me_gid"
+  chmod 0600 "$hroot/reth/jwt.hex" "$hroot/lighthouse/jwt.hex"
+  rm -rf "$hroot/lighthouse/data/beacon"; mkdir -p "$hroot/lighthouse/data/beacon/network"
+  printf 'node-key' > "$hroot/lighthouse/data/beacon/network/key" && chmod 0600 "$hroot/lighthouse/data/beacon/network/key"
+  echo 1793036568 > "$tmp/clock"   # the fork's first slot, 4235264
+  echo 1742213400 > "$tmp/genesis_time"
+  printf '{"data":{"genesis_time":"1742213400","genesis_validators_root":"0x212f","genesis_fork_version":"0x10000910"}}\n' > "$http/eth_v1_beacon_genesis"
+  cp "$tmp/hoodi-spec.json" "$http/eth_v1_config_spec"
+  cl_identity "[\"/ip4/34.89.10.7/tcp/9002/p2p/$pid\"]" ',"custody_group_count":"4"'
+  printf '%s\n' "$ss_head" "${ss_reth/:8551/:8552}" "${ss_lh/:5052/:5053}" "${ss_p2p/:9000/:9002}" "${ss_rp2p/:30303/:30304}" "$ss_ssh" > "$tmp/ss.txt"
+  local saved=$root
+  root=$hroot
+  rm -f "$tmp/docker"/*
+  cl_container reth "ghcr.io/paradigmxyz/reth@sha256:$reth_digest" sha256:1111 ctr-reth "$me_uid" "$me_gid" 812
+  cl_container lighthouse "sigp/lighthouse@sha256:$lh_digest" sha256:2222 ctr-lh "$me_uid" "$me_gid" 901
+  root=$saved
+}
+cl_hoodi; : > "$tmp/curl.log"; : > "$tmp/docker.log"
+collect_script="$yes_ref/collect-run-log.sh"
+cl_run 0 "Hoodi: a synced, hardened node on fork-ready releases passes" --config "$pinned_hoodi"
+collect_script=
+for c in 1 2 3 4 5 6 7 8; do verdict "$c" PASS "Hoodi: criterion $c passes on a healthy node"; done
+has "# Hoodi reference node run log" "Hoodi: the title names the network"
+if grep -q '^compose -p hoodi-ref --env-file ' "$tmp/docker.log" && ! grep '^compose ' "$tmp/docker.log" | grep -vq '^compose -p hoodi-ref '; then
+  ok "run log: Hoodi: every compose call passes -p hoodi-ref"
+else
+  bad "run log: Hoodi: every compose call passes -p hoodi-ref" "$(cat "$tmp/docker.log")"
+fi
+has "lighthouse v8.3.0-rc.0 targets consensus-specs v1.7.0-beta.4 (README.md), the same as ours" "Hoodi: a release on our consensus-specs version is recorded as the same"
+has "- Network: hoodi; checkpoint providers: https://cp1.example.org/…, https://cp2.example.net" "Hoodi: records both providers"
+has "head_slot 4235264, wall-clock slot 4235264 (lag 0)" "Hoodi: the wall-clock slot comes from the node's genesis time"
+has "port 8552: 127.0.0.1 only: PASS" "Hoodi: the Engine API is checked on its own port"
+has "port 5053: 127.0.0.1 only: PASS" "Hoodi: the Beacon API is checked on its own port"
+has "lighthouse: no non-loopback TCP listener but p2p port 9002 (pids 901): PASS" "Hoodi: Lighthouse's own p2p port is the allowed one"
+has "reth: no non-loopback TCP listener but p2p port 30304 (pids 812): PASS" "Hoodi: reth's own p2p port is the allowed one"
+has "$hroot/lighthouse/data/beacon/network/key: 600 $me_uid: PASS" "Hoodi: the node key under its own DATA_ROOT"
+has 'network = "hoodi"' "Hoodi: the session config names the network"
+has "peer = \"/ip4/34.89.10.7/tcp/9002/p2p/$pid\"" "Hoodi: the multiaddr carries the configured p2p port"
+has '# Over the tunnel: ssh -N -L 5053:127.0.0.1:5053 <ref-host>' "Hoodi: the tunnel uses the configured Beacon API port"
+if grep -qx 'http://127.0.0.1:5053/eth/v1/node/syncing' "$tmp/curl.log" && ! grep -q ':5052/' "$tmp/curl.log"; then
+  ok "run log: Hoodi: every Beacon API request goes to the configured port"
+else
+  bad "run log: Hoodi: every Beacon API request goes to the configured port" "$(cat "$tmp/curl.log")"
+fi
+if grep -q KEY111secret "$log"; then bad "run log: Hoodi: provider 1's key is never printed"; else ok "run log: Hoodi: provider 1's key is never printed"; fi
+# The real README: neither pinned release schedules Hoodi's fork, so the versions criterion fails.
+cl_hoodi
+cl_run 1 "Hoodi: releases whose notes do not schedule Hoodi's fork fail"
+verdict 1 FAIL "Hoodi: a release that does not schedule the fork fails criterion 1"
+verdict 5 PASS "Hoodi: the default pinned config is the network's own"
+has "release notes: reth v2.7.0 does not schedule hoodi's Gloas / Amsterdam fork (README.md): FAIL" "Hoodi: names the reth release"
+has "release notes: lighthouse v8.3.0-rc.0 does not schedule hoodi's Gloas / Amsterdam fork (README.md): FAIL" "Hoodi: names the Lighthouse release"
+has 'Release notes (from ops/ref-node/README.md, hoodi):' "Hoodi: copies the Hoodi release-note table"
+cl_hoodi; cp "$tmp/hoodi-pre-gloas.json" "$http/eth_v1_config_spec"
+cl_quick "Hoodi: a node without Hoodi's Gloas epoch fails" --config "$pinned_hoodi"
+verdict 5 FAIL "Hoodi: a spec difference fails the spec criterion"
+has "- GLOAS_FORK_EPOCH: pinned 132352, node 18446744073709551615" "Hoodi: records the spec diff"
+
 rm -f "$tmp/clock"
 
 fi
 
 # --- compose.yaml -------------------------------------------------------------------------------
 
-compose_env() { # compose_env <file> <trusted peers>: .env.example with the required values set.
-  cp "$ref/.env.example" "$1"
+compose_env() { # compose_env <file> <trusted peers> [example]: an .env example with the required values set.
+  local key
+  cp "$ref/${3:-.env.example}" "$1"
   set_env "$1" CHECKPOINT_SYNC_URL 'https://cp.example.org/v1/KEY?a=1&b=two words'
   set_env "$1" TRUSTED_PEERS "$2"
   for key in RETH_UID RETH_GID; do set_env "$1" "$key" 990; done
@@ -1127,6 +1680,9 @@ sys.exit(0 if eval(sys.argv[2]) else 1)' "$tmp/compose.json" "$2"
   }
   compose_rule "exactly the reth and lighthouse services" 'sorted(s) == ["lighthouse", "reth"]'
   compose_rule "host networking for both" 'all(v["network_mode"] == "host" for v in s.values())'
+  compose_rule "the project is named after the network" 'c["name"] == "sepolia-ref"'
+  compose_rule "a private cgroup namespace for both (a cgroup v1 host defaults to the host's)" \
+    'all(v.get("cgroup") == "private" for v in s.values())'
   compose_rule "read-only root, cap_drop ALL, no-new-privileges, /tmp tmpfs" \
     'all(v["read_only"] and v["cap_drop"] == ["ALL"] and v["security_opt"] == ["no-new-privileges:true"] and any(t.startswith("/tmp:") for t in v["tmpfs"]) for v in s.values())'
   compose_rule "restart unless-stopped, rotated json-file logs" \
@@ -1138,6 +1694,10 @@ sys.exit(0 if eval(sys.argv[2]) else 1)' "$tmp/compose.json" "$2"
     'all(any(m["target"] == "/secrets/jwt.hex" and m.get("read_only") and m["source"].endswith(n + "/jwt.hex") for m in s[n]["volumes"]) and all(m["bind"]["create_host_path"] is False for m in s[n]["volumes"]) for n in s)'
   compose_rule "reth: Engine API on 127.0.0.1:8551 with the JWT, --full, Sepolia" \
     'all(a in s["reth"]["command"] for a in ["--authrpc.addr=127.0.0.1", "--authrpc.port=8551", "--authrpc.jwtsecret=/secrets/jwt.hex", "--full", "--chain=sepolia", "--ipcdisable"])'
+  compose_rule "reth: p2p and discovery on RETH_P2P_PORT" \
+    'all(a in s["reth"]["command"] for a in ["--port=30303", "--discovery.port=30303"])'
+  compose_rule "the data and JWT mounts come from DATA_ROOT" \
+    'all(m["source"].startswith("/srv/ethswarm-ref/" + n + "/") for n in s for m in s[n]["volumes"])'
   compose_rule "reth: no HTTP or WS RPC, metrics only if on loopback" \
     'not any(a.startswith(("--http", "--ws")) for a in s["reth"]["command"]) and all(a.startswith("--metrics=127.0.0.1:") for a in s["reth"]["command"] if a.startswith("--metrics"))'
   compose_rule "lighthouse starts after reth" '"reth" in s["lighthouse"]["depends_on"]'
@@ -1161,12 +1721,45 @@ PY
   }
   argv=$(lh_argv "$tmp/compose.env")
   want=$(printf '%s\n' 'umask 0077' bn --network sepolia --datadir /data --execution-endpoint http://127.0.0.1:8551 \
-    --execution-jwt /secrets/jwt.hex --http --http-address 127.0.0.1 --http-port 5052 --port 9000 \
+    --execution-jwt /secrets/jwt.hex --http --http-address 127.0.0.1 --http-port 5052 --port 9000 --quic-port 9001 \
     --disable-upnp --checkpoint-sync-url 'https://cp.example.org/v1/KEY?a=1&b=two words')
   if [[ $argv == "$want" ]]; then ok "compose: lighthouse argv without TRUSTED_PEERS (umask 077, no --trusted-peers, URL intact)"; else bad "compose: lighthouse argv without TRUSTED_PEERS" "$argv"; fi
   compose_env "$tmp/compose-peers.env" "$pid,$pid"
   argv=$(lh_argv "$tmp/compose-peers.env")
   if [[ $argv == "$(printf '%s\n' "$want" --trusted-peers "$pid,$pid")" ]]; then ok "compose: TRUSTED_PEERS adds --trusted-peers <list>"; else bad "compose: TRUSTED_PEERS adds --trusted-peers <list>" "$argv"; fi
+
+  # Every compose variable without a default must be set: NETWORK, DATA_ROOT and the ports.
+  for key in NETWORK DATA_ROOT ENGINE_PORT BEACON_API_PORT RETH_P2P_PORT LIGHTHOUSE_P2P_PORT LIGHTHOUSE_QUIC_PORT; do
+    compose_env "$tmp/compose-missing.env" ""
+    set_env "$tmp/compose-missing.env" "$key" ""
+    check_out 1 "compose: an empty $key is refused" "$key is missing a value" \
+      docker compose --env-file "$tmp/compose-missing.env" -f "$ref/compose.yaml" config --quiet
+  done
+
+  # Hoodi, from its own example: its project, chain, ports and DATA_ROOT, nothing of Sepolia's.
+  compose_env "$tmp/compose-hoodi.env" "" .env.hoodi.example
+  check 0 "compose: the Hoodi example validates with the required values set" \
+    docker compose --env-file "$tmp/compose-hoodi.env" -f "$ref/compose.yaml" config --quiet
+  docker compose --env-file "$tmp/compose-hoodi.env" -f "$ref/compose.yaml" config --format json > "$tmp/compose.json"
+  compose_rule "Hoodi: the project is hoodi-ref" 'c["name"] == "hoodi-ref"'
+  compose_rule "Hoodi: reth on the Hoodi chain, Engine API 127.0.0.1:8552, p2p 30304" \
+    'all(a in s["reth"]["command"] for a in ["--chain=hoodi", "--authrpc.addr=127.0.0.1", "--authrpc.port=8552", "--port=30304", "--discovery.port=30304"])'
+  compose_rule "Hoodi: the mounts come from its own DATA_ROOT" \
+    'all(m["source"].startswith("/srv/ethswarm-ref-hoodi/" + n + "/") for n in s for m in s[n]["volumes"])'
+  compose_rule "Hoodi: a private cgroup namespace too" 'all(v.get("cgroup") == "private" for v in s.values())'
+  argv=$(lh_argv "$tmp/compose-hoodi.env")
+  want_hoodi=$(printf '%s\n' 'umask 0077' bn --network hoodi --datadir /data --execution-endpoint http://127.0.0.1:8552 \
+    --execution-jwt /secrets/jwt.hex --http --http-address 127.0.0.1 --http-port 5053 --port 9002 --quic-port 9003 \
+    --disable-upnp --checkpoint-sync-url 'https://cp.example.org/v1/KEY?a=1&b=two words')
+  if [[ $argv == "$want_hoodi" ]]; then ok "compose: Hoodi: lighthouse argv (network, Engine and Beacon API ports, p2p and QUIC ports)"; else bad "compose: Hoodi: lighthouse argv" "$argv"; fi
+  # A port value reaches Lighthouse's bash wrapper only as one quoted word, never as code.
+  set_env "$tmp/compose-hoodi.env" BEACON_API_PORT '5053;touch /tmp/pwned'
+  argv=$(lh_argv "$tmp/compose-hoodi.env")
+  if printf '%s\n' "$argv" | grep -qx -- '5053;touch /tmp/pwned' && [[ ! -e /tmp/pwned ]]; then
+    ok "compose: a port value is passed to Lighthouse as one word, not run"
+  else
+    bad "compose: a port value is passed to Lighthouse as one word" "$argv"
+  fi
 fi
 
 # --- as root (ETHSWARM_ROOT_TESTS=1, a throwaway container) ------------------------------------
@@ -1315,6 +1908,43 @@ SH
   set_env "$pf_env" RETH_UID 0
   check_out 1 "root: preflight --test-mode refuses uid 0" '^RETH_UID: 0 is root: FAIL$' \
     env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --test-mode --env-file "$pf_env"
+
+  # Hoodi next to Sepolia on the same host: its own users, root and secret.
+  hreal="$tmp/hoodi-real" hreal_env="$tmp/hoodi-real.env"
+  cp "$ref/.env.hoodi.example" "$hreal_env"
+  check_out 0 "root: setup.sh for Hoodi next to Sepolia" '^user reth-hoodi: created$' bash "$setup" --env-file "$hreal_env" --root "$hreal"
+  hru=$(id -u reth-hoodi 2>/dev/null || echo none) hlu=$(id -u lighthouse-hoodi 2>/dev/null || echo none)
+  if [[ $(printf '%s\n' "$ru" "$lu" "$hru" "$hlu" | sort -u | wc -l | tr -d ' ') == 4 && $hru != none && $hlu != none ]]; then
+    ok "root: four distinct service uids for the two networks"
+  else
+    bad "root: four distinct service uids (reth $ru, lighthouse $lu, reth-hoodi $hru, lighthouse-hoodi $hlu)"
+  fi
+  for spec in "reth/jwt.hex 600 $hru" "lighthouse/jwt.hex 600 $hlu" "reth/data 700 $hru"; do
+    read -r rel want_mode want_uid <<< "$spec"
+    m=$(file_mode_uid "$hreal/$rel")
+    if [[ $m == "$want_mode $want_uid" ]]; then ok "root: Hoodi $rel is $m"; else bad "root: Hoodi $rel (got '$m', want '$want_mode $want_uid')"; fi
+  done
+  if ! cmp -s "$hreal/reth/jwt.hex" "$real/reth/jwt.hex"; then ok "root: the Hoodi node has its own JWT secret"; else bad "root: the Hoodi node has its own JWT secret"; fi
+  if grep -qx "RETH_UID=$hru" "$hreal_env"; then ok "root: the Hoodi .env records reth-hoodi's uid"; else bad "root: the Hoodi .env records reth-hoodi's uid" "$(cat "$hreal_env")"; fi
+  mkdir -p "$http/cp1.example.org" "$http/cp2.example.net"
+  cp "$tmp/hoodi-spec.json" "$http/cp1.example.org/eth_v1_config_spec" && cp "$tmp/hoodi-spec.json" "$http/cp2.example.net/eth_v1_config_spec"
+  header_json "$http/cp1.example.org/eth_v1_beacon_headers_finalized" 4235200 "$r1" "$s1"
+  header_json "$http/cp2.example.net/eth_v1_beacon_headers_4235200" 4235200 "$r1" "$s1"
+  set_env "$hreal_env" CHECKPOINT_SYNC_URL https://cp1.example.org; set_env "$hreal_env" CHECKPOINT_SYNC_URL_2 https://cp2.example.net
+  check_out 0 "root: Hoodi preflight passes with its real users and two providers (fork-ready README)" '^preflight OK$' \
+    env PATH="$tmp/stubs-curl:$PATH" bash "$yes_ref/preflight.sh" --env-file "$hreal_env"
+  check_out 1 "root: Hoodi preflight fails on today's pinned releases" '^release notes: reth v2\.7\.0 does not schedule hoodi.s' \
+    env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --env-file "$hreal_env"
+  cp "$hreal_env" "$tmp/hoodi-cross.env"; set_env "$tmp/hoodi-cross.env" RETH_UID "$ru"
+  check_out 1 "root: Hoodi preflight refuses the Sepolia reth uid" "^RETH_UID: $ru is not user reth-hoodi's uid $hru: FAIL$" \
+    env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --env-file "$tmp/hoodi-cross.env"
+  if [[ -n $bound ]]; then
+    mv "$hreal/lighthouse/jwt.hex" "$tmp/hoodi-jwt.keep" && mkfifo -m 0600 "$hreal/lighthouse/jwt.hex" && chown lighthouse-hoodi "$hreal/lighthouse/jwt.hex"
+    # shellcheck disable=SC2086 # $bound is a command prefix
+    check_out 1 "root: a 0600 FIFO owned by the service at a JWT copy is refused without blocking" \
+      "lighthouse/jwt\.hex: not a regular file \(want 600 $hlu\): FAIL$" $bound env PATH="$tmp/stubs-curl:$PATH" bash "$preflight" --env-file "$hreal_env"
+    rm "$hreal/lighthouse/jwt.hex" && mv "$tmp/hoodi-jwt.keep" "$hreal/lighthouse/jwt.hex"
+  fi
 
   # Regression (run-log temp-file swap): run from a directory another user owns, who swaps any
   # run-log temp file for a symlink to a root-only file. The script writes no file at all.
