@@ -348,6 +348,7 @@ pub(crate) fn check_chunk(chunk: &[u8], protocol: Protocol, decoded: &ResponseCh
                 (Protocol::StatusV2, Response::Status(status)) => status.as_ssz_bytes(),
                 (Protocol::MetaDataV3, Response::MetaData(metadata)) => metadata.as_ssz_bytes(),
                 (Protocol::PingV1, Response::Ping(ping)) => ping.as_ssz_bytes(),
+                (Protocol::GoodbyeV1, Response::Goodbye(goodbye)) => goodbye.as_ssz_bytes(),
                 (Protocol::BlocksByRangeV2, Response::Block(block)) => {
                     assert_eq!(
                         Some(block.fork_name()),

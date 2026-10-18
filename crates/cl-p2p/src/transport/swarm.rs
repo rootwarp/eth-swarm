@@ -46,9 +46,17 @@ const _: () = assert!(
     "mplex would hold frames for streams the budget does not see"
 );
 
-/// How long a connection with no open stream stays up. The req/resp and gossipsub handlers
-/// keep a live peer's connection busy; identify alone does not.
-pub const DEFAULT_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a connection with no open stream stays up: 30 s, twice
+/// [`PING_INTERVAL`](crate::rpc::inbound::PING_INTERVAL) (15 s). Our Ping to every peer opens a
+/// stream an interval after the last one ended, outside the shared outbound lane, so a
+/// connection is never quiet for longer than the interval and a live peer's never idles out. A
+/// gossipsub mesh peer is kept up by its handler too; identify alone keeps nothing.
+pub const DEFAULT_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+const _: () = assert!(
+    DEFAULT_IDLE_CONNECTION_TIMEOUT.as_secs() >= 2 * crate::rpc::inbound::PING_INTERVAL.as_secs(),
+    "a quiet connection would idle out between two Pings"
+);
 
 /// How long a connection may take from TCP connect through Noise and the muxer.
 pub const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);

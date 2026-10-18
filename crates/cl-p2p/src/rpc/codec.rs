@@ -520,8 +520,8 @@ pub fn encode_response_chunks<E: EthSpec>(
     chunks: &[ReceivedChunk<E>],
 ) -> io::Result<Vec<Vec<u8>>> {
     let max = match protocol {
-        Protocol::GoodbyeV1 => 0,
         Protocol::BlocksByRangeV2 => usize::MAX,
+        // Goodbye too: its response is one chunk (`phase0/p2p-interface.md` L1483).
         _ => 1,
     };
     if chunks.len() > max {
@@ -1424,14 +1424,23 @@ mod tests {
         let mut with_context = unavailable;
         with_context.context = Some(testkit::FULU_DIGEST);
         refused(write_resp(Protocol::BlocksByRangeV2, vec![block(), with_context]).await);
-        // Goodbye has no response at all; an empty one writes nothing.
-        refused(
-            write_resp(
-                Protocol::GoodbyeV1,
-                vec![error(ResultCode::ServerError, b"")],
-            )
-            .await,
+        // Goodbye's response is one chunk (`phase0` L1483): one Goodbye or one error chunk,
+        // never two; an empty one writes nothing.
+        let bye = success(Response::Goodbye(Goodbye(1)));
+        assert_eq!(
+            write_resp(Protocol::GoodbyeV1, vec![bye.clone()])
+                .await
+                .unwrap(),
+            encode_success_chunk(None, &1u64.to_le_bytes()).unwrap()
         );
+        assert!(!write_resp(
+            Protocol::GoodbyeV1,
+            vec![error(ResultCode::InvalidRequest, b"")]
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        refused(write_resp(Protocol::GoodbyeV1, vec![bye.clone(), bye]).await);
         assert_eq!(
             write_resp(Protocol::GoodbyeV1, Vec::new()).await.unwrap(),
             Vec::<u8>::new()
@@ -1439,13 +1448,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goodbye_response_is_the_stream_ending() {
-        let mut codec = codec_after(Request::Goodbye(Goodbye(1))).await;
-        let got = codec
-            .read_response(&Protocol::GoodbyeV1, &mut Cursor::new(Vec::new()))
-            .await
-            .unwrap();
-        assert!(got.is_empty());
+    async fn goodbye_response_is_one_chunk_or_none() {
+        let read = |wire: Vec<u8>| async move {
+            let mut codec = codec_after(Request::Goodbye(Goodbye(1))).await;
+            codec
+                .read_response(&Protocol::GoodbyeV1, &mut Cursor::new(wire))
+                .await
+        };
+        assert!(read(Vec::new()).await.unwrap().is_empty());
+        let chunk = encode_success_chunk(None, &3u64.to_le_bytes()).unwrap();
+        let got = read(chunk.clone()).await.unwrap();
+        assert_eq!(
+            got,
+            [ReceivedChunk {
+                context: None,
+                chunk: ResponseChunk::Success(Response::Goodbye(Goodbye(3))),
+            }]
+        );
+        let err = read([chunk.clone(), chunk].concat()).await.unwrap_err();
+        assert!(matches!(
+            read_error(&err),
+            ReadError::TooManyChunks { max: 1 }
+        ));
     }
 
     async fn timed_read(request: Request, mut io: Script) -> (io::Error, Duration) {

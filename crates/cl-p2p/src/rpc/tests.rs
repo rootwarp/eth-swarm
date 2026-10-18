@@ -57,8 +57,9 @@ fn status_with(fork_digest: ForkDigest) -> StatusV2 {
 fn config(status: StatusV2, seq_number: u64, cgc: u64) -> ControlConfig {
     ControlConfig {
         status: Arc::new(SharedStatus::new(Some(status))),
-        metadata: Arc::new(AtomicU64::new(seq_number)),
-        custody_group_count: cgc,
+        metadata: Arc::new(super::inbound::SharedMetaData::new(
+            testkit::local_metadata(seq_number, cgc),
+        )),
         ..testkit::control_config(None)
     }
 }
@@ -94,11 +95,16 @@ struct Node {
 
 impl Node {
     async fn spawn(cfg: ControlConfig) -> Self {
+        Self::spawn_idle(cfg, WAIT).await
+    }
+
+    /// A node whose connections close after `idle` without an open stream.
+    async fn spawn_idle(cfg: ControlConfig, idle: Duration) -> Self {
         let mut registry = Registry::default();
         let transport = TransportMetrics::register(&mut registry);
         let mut swarm_cfg = SwarmConfig::new(MuxerBudget::with_defaults(&transport));
         swarm_cfg.listen_addrs = vec![loopback()];
-        swarm_cfg.idle_connection_timeout = WAIT;
+        swarm_cfg.idle_connection_timeout = idle;
         let (req_resp, metrics) = testkit::control(&mut registry, cfg);
         let mut swarm =
             build_swarm(Keypair::generate_secp256k1(), &swarm_cfg, req_resp).expect("swarm");
@@ -942,11 +948,14 @@ async fn malformed_requests_get_invalid_request() {
         );
     }
     assert_eq!(ours.metrics.invalid_data_count(Direction::Inbound), 4);
-    // A malformed Goodbye has no response to carry the error: the stream just closes.
+    // Goodbye has a response too, so a malformed one gets the error chunk as well.
     let wire = send_bytes(&ours, Protocol::GoodbyeV1, vec![0])
         .await
         .unwrap();
-    assert!(wire.is_empty(), "{wire:?}");
+    assert_eq!(
+        result_code(Protocol::GoodbyeV1, &wire),
+        ResultCode::InvalidRequest
+    );
     assert_eq!(ours.metrics.invalid_data_count(Direction::Inbound), 5);
 }
 
@@ -1312,7 +1321,7 @@ async fn goodbye_metrics() {
     let mut raw = RawPeer::new(1);
     raw.connect(ours.addr.clone()).await;
     let id = raw.send(ours.peer, Request::Goodbye(Goodbye(3)));
-    // No response chunk: the stream (and the connection) closes.
+    // One response chunk, then the stream (and the connection) closes.
     let _ = raw.outcome(id).await;
     let (validity, direction) = ours
         .next("the peer's Goodbye", |seen| match seen {
@@ -1340,4 +1349,364 @@ async fn goodbye_metrics() {
         .filter(|s| matches!(s, Seen::Control(ControlEvent::GoodbyeReceived { .. })))
         .count();
     assert_eq!(received, 0, "{more:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// BlocksByRange bounds, the Goodbye response, MetaData snapshots and the Ping cadence
+
+#[tokio::test]
+async fn blocks_by_range_out_of_bounds_gets_invalid_request() {
+    let mut ours = Node::spawn(config(status_with(DIGEST), 1, 4)).await;
+    let mut peer = bytes_peer(Protocol::BlocksByRangeV2.id());
+    bytes_connect(&mut peer, ours.addr.clone()).await;
+    let range = |count, step| {
+        encode_request(&Request::BlocksByRange(BlocksByRangeV2Request {
+            start_slot: 64,
+            count,
+            step,
+        }))
+        .unwrap()
+    };
+    // `step` 0 and `count` above MAX_REQUEST_BLOCKS_DENEB are invalid requests; the largest
+    // valid count, and a deprecated `step` above 1, are merely unservable here.
+    for (count, step, want) in [
+        (32, 0, ResultCode::InvalidRequest),
+        (129, 1, ResultCode::InvalidRequest),
+        (u64::MAX, 1, ResultCode::InvalidRequest),
+        (128, 1, ResultCode::ResourceUnavailable),
+        (32, 2, ResultCode::ResourceUnavailable),
+    ] {
+        let id = peer
+            .behaviour_mut()
+            .send_request(&ours.peer, Some(range(count, step)));
+        let wire = bytes_outcome(&mut peer, id).await.unwrap();
+        assert_eq!(
+            result_code(Protocol::BlocksByRangeV2, &wire),
+            want,
+            "count {count}, step {step}"
+        );
+    }
+    // A clean reject: well-formed, so no invalid data, and the connection stays.
+    assert_eq!(ours.metrics.invalid_data_count(Direction::Inbound), 0);
+    let later = ours.drain(SETTLE).await;
+    assert!(
+        !later.iter().any(|s| matches!(s, Seen::Closed(_))),
+        "{later:?}"
+    );
+}
+
+/// Reads a whole request and answers it with the bytes it is given.
+#[derive(Clone, Default)]
+struct ReplyCodec;
+
+impl request_response::Codec for ReplyCodec {
+    type Protocol = StreamProtocol;
+    type Request = Vec<u8>;
+    type Response = Vec<u8>;
+
+    async fn read_request<T>(&mut self, _: &StreamProtocol, io: &mut T) -> io::Result<Vec<u8>>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut buf = Vec::new();
+        io.take(MAX_BYTES_RESPONSE).read_to_end(&mut buf).await?;
+        Ok(buf)
+    }
+
+    async fn read_response<T>(&mut self, _: &StreamProtocol, _: &mut T) -> io::Result<Vec<u8>>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _: &StreamProtocol,
+        _: &mut T,
+        _: Vec<u8>,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _: &StreamProtocol,
+        io: &mut T,
+        bytes: Vec<u8>,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        io.write_all(&bytes).await?;
+        io.flush().await
+    }
+}
+
+/// Answers every request `peer` receives with `reply`, keeping the last request in `got`.
+async fn reply_to_each(
+    peer: &mut Swarm<request_response::Behaviour<ReplyCodec>>,
+    reply: &[u8],
+    got: &mut Option<Vec<u8>>,
+) {
+    loop {
+        if let SwarmEvent::Behaviour(request_response::Event::Message {
+            message:
+                request_response::Message::Request {
+                    request, channel, ..
+                },
+            ..
+        }) = peer.select_next_some().await
+        {
+            *got = Some(request);
+            let _ = peer.behaviour_mut().send_response(channel, reply.to_vec());
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_goodbye_answered_with_one_chunk_is_no_fault() {
+    use ssz::Encode;
+    // Some clients answer a Goodbye with the single chunk `phase0` specifies (L1461, L1483).
+    let mut ours = Node::spawn(config(status_with(DIGEST), 1, 4)).await;
+    let mut peer = tcp_swarm(request_response::Behaviour::with_codec(
+        ReplyCodec,
+        [(
+            StreamProtocol::new(Protocol::GoodbyeV1.id()),
+            ProtocolSupport::Inbound,
+        )],
+        request_response::Config::default(),
+    ));
+    peer.listen_on(loopback()).unwrap();
+    let addr = loop {
+        if let SwarmEvent::NewListenAddr { address, .. } = peer.select_next_some().await {
+            break address;
+        }
+    };
+    let id = *peer.local_peer_id();
+    ours.send(Cmd::Dial(addr));
+    let reply =
+        p2p_wire::rpc::codec::encode_success_chunk(None, &Goodbye(1).as_ssz_bytes()).unwrap();
+    let mut got = None;
+    tokio::select! {
+        () = reply_to_each(&mut peer, &reply, &mut got) => unreachable!(),
+        () = ours.next("the connection", |seen| {
+            matches!(seen, Seen::Established(p) if *p == id).then_some(())
+        }) => {}
+    }
+    ours.send(Cmd::Goodbye(id, 1));
+    tokio::select! {
+        () = reply_to_each(&mut peer, &reply, &mut got) => unreachable!(),
+        () = ours.closed(id) => {}
+    }
+    assert_eq!(
+        got,
+        Some(encode_request(&Request::Goodbye(Goodbye(1))).unwrap())
+    );
+    assert_eq!(
+        ours.metrics.goodbye_sent_count(1, StatusValidity::Unknown),
+        1
+    );
+    // The reply is ignored quietly: no invalid data, no fault.
+    assert_eq!(ours.metrics.invalid_data_count(Direction::Outbound), 0);
+}
+
+/// A MetaData source that changes on every read: `seq_number` and `custody_group_count` both `n`
+/// on the `n`th.
+struct Ticking(AtomicU64);
+
+impl super::inbound::MetaDataSource for Ticking {
+    fn metadata(&self) -> MetaDataV3 {
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        testkit::local_metadata(n, n)
+    }
+}
+
+#[tokio::test]
+async fn every_metadata_answer_is_one_snapshot() {
+    // Our MetaData changes under every read, and the peer asks more often than its quota (2 at
+    // once, then one per 2 s), so later answers wait for their token: each still carries the
+    // seq_number of the very fields it holds.
+    let cfg = ControlConfig {
+        metadata: Arc::new(Ticking(AtomicU64::new(0))),
+        ..config(status_with(DIGEST), 1, 4)
+    };
+    let ours = Node::spawn(cfg).await;
+    let mut raw = RawPeer::new(1);
+    raw.connect(ours.addr.clone()).await;
+    let mut seen = Vec::new();
+    // Two at once (its two streams), then a third over the quota.
+    for batch in [2, 1] {
+        let ids: Vec<_> = (0..batch)
+            .map(|_| raw.send(ours.peer, Request::MetaData))
+            .collect();
+        for id in ids {
+            match single(raw.outcome(id).await.unwrap()) {
+                ResponseChunk::Success(Response::MetaData(m)) => {
+                    assert_eq!(m.seq_number, m.custody_group_count, "{m:?}");
+                    seen.push(m.seq_number);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), 3, "a fresh snapshot per answer: {seen:?}");
+}
+
+#[tokio::test]
+async fn our_pings_keep_an_idle_connection_up() {
+    let idle = Duration::from_secs(1);
+    // Without a Ping inside the idle timeout, a connection with no stream closes.
+    let cfg = ControlConfig {
+        ping_interval: Duration::from_secs(3600),
+        ..config(status_with(DIGEST), 1, 4)
+    };
+    let mut quiet = Node::spawn_idle(cfg, idle).await;
+    let mut raw = RawPeer::new(1);
+    raw.connect(quiet.addr.clone()).await;
+    let start = Instant::now();
+    let peer = raw.id();
+    tokio::select! {
+        () = raw.run() => unreachable!(),
+        () = quiet.closed(peer) => {}
+    }
+    assert!(start.elapsed() < idle * 3, "{:?}", start.elapsed());
+
+    // Pinging every 250 ms, four times inside it: the connection stays, each Ping answered.
+    let cfg = ControlConfig {
+        ping_interval: idle / 4,
+        ..config(status_with(DIGEST), 1, 4)
+    };
+    let mut ours = Node::spawn_idle(cfg, idle).await;
+    let mut raw = RawPeer::new(1);
+    raw.connect(ours.addr.clone()).await;
+    let peer = raw.id();
+    let seen = tokio::select! {
+        () = raw.run() => unreachable!(),
+        seen = ours.drain(idle * 4) => seen,
+    };
+    assert!(
+        !seen.iter().any(|s| matches!(s, Seen::Closed(_))),
+        "{seen:?}"
+    );
+    let pongs = seen
+        .iter()
+        .filter(|s| matches!(s, Seen::Control(ControlEvent::Pong { peer: p, .. }) if *p == peer))
+        .count();
+    assert!((8..=20).contains(&pongs), "{pongs} Pongs in 4 s");
+}
+
+#[tokio::test]
+async fn an_inbound_goodbye_gets_one_chunk_then_the_connection_closes() {
+    // "The response MUST consist of a single `response_chunk`" (`phase0` L1483), with the
+    // `uint64` content of L1461: we echo the peer's reason.
+    let mut ours = Node::spawn(config(status_with(DIGEST), 1, 4)).await;
+    let mut peer = bytes_peer(Protocol::GoodbyeV1.id());
+    bytes_connect(&mut peer, ours.addr.clone()).await;
+    let theirs = *peer.local_peer_id();
+    let request = encode_request(&Request::Goodbye(Goodbye(129))).unwrap();
+    let id = peer.behaviour_mut().send_request(&ours.peer, Some(request));
+    let wire = bytes_outcome(&mut peer, id).await.unwrap();
+    let want = p2p_wire::rpc::codec::encode_success_chunk(None, &129u64.to_le_bytes()).unwrap();
+    assert_eq!(wire, want, "exactly one Goodbye chunk, nothing after it");
+    let contexts = p2p_wire::testkit::context_table();
+    assert_eq!(
+        decode_response_chunk::<E>(&wire, Protocol::GoodbyeV1, &contexts),
+        Ok(ResponseChunk::Success(Response::Goodbye(Goodbye(129))))
+    );
+    tokio::select! {
+        () = async { loop { peer.select_next_some().await; } } => unreachable!(),
+        () = ours.closed(theirs) => {}
+    }
+    assert_eq!(
+        ours.metrics
+            .goodbye_received_count(129, StatusValidity::Unknown),
+        1
+    );
+}
+
+/// Sends `bytes` as a Goodbye request on `peer` every `every` until `node` closes the
+/// connection; how many were sent, and how long from the first until the close.
+async fn goodbyes_until_closed(
+    node: &mut Node,
+    peer: &mut Swarm<request_response::Behaviour<BytesCodec>>,
+    bytes: &[u8],
+    every: Duration,
+) -> (usize, Duration) {
+    let theirs = *peer.local_peer_id();
+    let ours = node.peer;
+    let start = Instant::now();
+    let mut sent = 0;
+    let mut tick = tokio::time::interval(every);
+    let closed = node.closed(theirs);
+    tokio::pin!(closed);
+    loop {
+        tokio::select! {
+            () = &mut closed => return (sent, start.elapsed()),
+            _ = tick.tick() => {
+                peer.behaviour_mut().send_request(&ours, Some(bytes.to_vec()));
+                sent += 1;
+            }
+            _ = peer.select_next_some() => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn goodbyes_during_the_linger_neither_extend_it_nor_count_again() {
+    // A Goodbye every 300 ms: each is answered, but the connection still closes one linger
+    // after the first answer, and only the first is counted, logged and reported.
+    let mut ours = Node::spawn(config(status_with(DIGEST), 1, 4)).await;
+    let mut peer = bytes_peer(Protocol::GoodbyeV1.id());
+    bytes_connect(&mut peer, ours.addr.clone()).await;
+    let bye = encode_request(&Request::Goodbye(Goodbye(1))).unwrap();
+    let every = Duration::from_millis(300);
+    let (sent, took) = goodbyes_until_closed(&mut ours, &mut peer, &bye, every).await;
+    assert!(sent >= 3, "{sent} Goodbyes in {took:?}");
+    assert!(
+        took < super::inbound::GOODBYE_LINGER + Duration::from_secs(2),
+        "{took:?}"
+    );
+    assert_eq!(
+        ours.metrics
+            .goodbye_received_count(1, StatusValidity::Unknown),
+        1
+    );
+    let later = ours.drain(SETTLE).await;
+    assert!(
+        !later
+            .iter()
+            .any(|s| matches!(s, Seen::Control(ControlEvent::GoodbyeReceived { .. }))),
+        "{later:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_goodbye_is_answered_then_the_connection_closes() {
+    // A Goodbye that breaks the wire format gets `1: InvalidRequest`, unpaced like any Goodbye
+    // answer; then the connection closes a linger on, so a peer cannot loop on it.
+    let mut ours = Node::spawn(config(status_with(DIGEST), 1, 4)).await;
+    let mut peer = bytes_peer(Protocol::GoodbyeV1.id());
+    bytes_connect(&mut peer, ours.addr.clone()).await;
+    let id = peer.behaviour_mut().send_request(&ours.peer, Some(vec![0]));
+    let wire = bytes_outcome(&mut peer, id).await.unwrap();
+    assert_eq!(
+        result_code(Protocol::GoodbyeV1, &wire),
+        ResultCode::InvalidRequest
+    );
+    let every = Duration::from_millis(300);
+    let (_, took) = goodbyes_until_closed(&mut ours, &mut peer, &[0], every).await;
+    assert!(
+        took < super::inbound::GOODBYE_LINGER + Duration::from_secs(2),
+        "{took:?}"
+    );
+    // A malformed Goodbye is no Goodbye: nothing counted as received.
+    for validity in StatusValidity::ALL {
+        assert_eq!(ours.metrics.goodbye_received_count(1, validity), 0);
+    }
 }

@@ -154,9 +154,6 @@ pub enum CodecError {
     /// A success chunk of a protocol with context bytes was handled without them.
     #[error("{0} needs context bytes")]
     MissingContext(Protocol),
-    /// A success chunk of a protocol that has no response (`Goodbye`).
-    #[error("{0} has no response")]
-    NoResponse(Protocol),
     /// The SSZ payload did not decode.
     #[error("decode: {0}")]
     Decode(DecodeError),
@@ -657,10 +654,9 @@ fn parse_head<E: EthSpec>(
     } else {
         (None, 1)
     };
-    let bounds = match protocol.response_bounds::<E>(fork) {
-        Some(bounds) => bounds,
-        None if protocol.has_context_bytes() => return Err(CodecError::MissingContext(protocol)),
-        None => return Err(CodecError::NoResponse(protocol)),
+    // Every protocol has a response bound; only a block's needs the fork its context names.
+    let Some(bounds) = protocol.response_bounds::<E>(fork) else {
+        return Err(CodecError::MissingContext(protocol));
     };
     Ok(Ok(ChunkHead {
         code,
@@ -771,8 +767,7 @@ pub fn decode_response_chunk<E: EthSpec>(
                 forked::SignedBeaconBlock::from_ssz_bytes_for_fork(&ssz, fork)?,
             ))
         }
-        // `parse_head` refuses a success chunk of a protocol without a response.
-        Protocol::GoodbyeV1 => return Err(CodecError::NoResponse(protocol)),
+        Protocol::GoodbyeV1 => Response::Goodbye(Goodbye::from_ssz_bytes(&ssz)?),
     };
     Ok(ResponseChunk::Success(response))
 }
@@ -1144,18 +1139,19 @@ mod tests {
         let bytes = encode_request(&request).unwrap();
         assert_eq!(bytes, chunk);
         assert_eq!(decode_request(Protocol::GoodbyeV1, &bytes), Ok(request));
-        // Goodbye has no response: a success chunk is refused from its head, an error chunk
-        // still decodes.
+        // Its response is one Goodbye chunk too; an error chunk decodes as on any protocol.
         let contexts = testkit::context_table();
         let success = encode_success_chunk(None, &ssz).unwrap();
         assert_eq!(
             decode_response_chunk::<E>(&success, Protocol::GoodbyeV1, &contexts),
-            Err(CodecError::NoResponse(Protocol::GoodbyeV1))
+            Ok(ResponseChunk::Success(Response::Goodbye(goodbye)))
         );
         assert_eq!(
             scan_response_chunk::<E>(&success, Protocol::GoodbyeV1, &contexts),
-            Err(CodecError::NoResponse(Protocol::GoodbyeV1))
+            Ok(Scan::Complete { len: success.len() })
         );
+        let long = encode_success_chunk(None, &[0; 9]).unwrap();
+        assert!(decode_response_chunk::<E>(&long, Protocol::GoodbyeV1, &contexts).is_err());
         let error = encode_error_chunk(ResultCode::ServerError, b"no").unwrap();
         assert!(matches!(
             decode_response_chunk::<E>(&error, Protocol::GoodbyeV1, &contexts),

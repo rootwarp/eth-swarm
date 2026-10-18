@@ -55,9 +55,11 @@
 //!   whose `earliest_available_slot` is at or before the first slot requested
 //!   (`fulu/p2p-interface.md` L552–561); peers whose `head_slot` reaches the end of the slots
 //!   asked for first, peers behind the first slot last, and within those the peers asked fewer
-//!   times in the piece first (so peers take turns), then the highest `head_slot`. A peer whose answer broke the rules is not asked again; one whose
-//!   request failed (a timeout, an error chunk) is not asked again until the piece moves on. A
-//!   piece takes at most [`MAX_ATTEMPTS_PER_PIECE`] requests.
+//!   times in the piece first (so peers take turns), then the highest `head_slot`. A peer whose
+//!   answer broke the rules is not asked again. One whose request failed without a fault (a
+//!   timeout, an error chunk, a full queue) and whose head reaches the slots asked for is asked
+//!   once more when no other peer is left, once per position of the piece's first open slot.
+//!   A piece takes at most [`MAX_ATTEMPTS_PER_PIECE`] requests.
 //! - **What settles a slot**: a block kept; a link (a block whose parent is the last block kept
 //!   proves the slots between them empty); or two different peers whose answers have no block
 //!   there and whose `head_slot` reaches the last of those slots (a peer behind them, syncing
@@ -551,6 +553,13 @@ impl RangeError {
             )
         )
     }
+
+    /// Whether the same request may succeed if sent again: a failed exchange or an IGNOREd
+    /// request, not a fault and not an answer of another branch.
+    #[must_use]
+    pub fn may_pass(&self) -> bool {
+        !self.is_peer_fault() && !matches!(self, Self::Disjoint { .. })
+    }
 }
 
 /// A behaviour with the probe's [`Control`] inside.
@@ -709,7 +718,9 @@ pub const MAX_ATTEMPTS_PER_PIECE: usize = 64;
 /// What [`fetch_range`] got.
 #[derive(Debug)]
 pub struct RangeFetch<B> {
-    /// Every block of the range, in slot order, each the child of the one before.
+    /// Every block of the range, in slot order, each the child of the one before, except
+    /// across an [`unconfirmed`](Self::unconfirmed) gap: the first block after one may name a
+    /// block inside it as its parent.
     pub blocks: Vec<B>,
     /// Every request sent, in order, with its peer.
     pub requests: Vec<(PeerId, BlocksByRangeV2Request)>,
@@ -816,6 +827,11 @@ struct Piece<B> {
     end: Slot,
     /// Peers asked since `cursor` last moved.
     asked: HashSet<PeerId>,
+    /// Peers whose head reaches the slots asked for and whose request failed in a way that
+    /// may pass ([`RangeError::may_pass`]): asked once more when nobody else is left.
+    retry: HashSet<PeerId>,
+    /// Peers asked that once more since `cursor` last moved.
+    retried: HashSet<PeerId>,
     /// How many times each peer was asked in the piece: the fewer, the sooner it is asked.
     asks: HashMap<PeerId, usize>,
     /// Peers whose answer says `[cursor, target)` holds no block.
@@ -841,7 +857,29 @@ impl<B: Linked> Piece<B> {
         }
         fetch.blocks.extend(blocks);
         self.asked.clear();
+        self.retry.clear();
+        self.retried.clear();
         self.empty.clear();
+    }
+
+    /// Notes that `peer`'s request failed with `error`: a covering peer whose failure may pass
+    /// is kept to be asked once more.
+    fn failed(&mut self, peer: PeerId, error: &RangeError, covering: bool) {
+        if covering && error.may_pass() && !self.retried.contains(&peer) {
+            self.retry.insert(peer);
+        }
+    }
+
+    /// Makes the peers kept by [`Piece::failed`] askable again; `false` if there are none.
+    fn ask_failed_again(&mut self) -> bool {
+        if self.retry.is_empty() {
+            return false;
+        }
+        for peer in self.retry.drain() {
+            self.asked.remove(&peer);
+            self.retried.insert(peer);
+        }
+        true
     }
 
     /// Keeps the held answer if it is the child of the last block kept; drops it, as another
@@ -879,6 +917,8 @@ async fn fetch_piece<S: RangeSource>(
         cursor: start,
         end,
         asked: HashSet::new(),
+        retry: HashSet::new(),
+        retried: HashSet::new(),
         asks: HashMap::new(),
         empty: HashSet::new(),
         held: None,
@@ -886,10 +926,13 @@ async fn fetch_piece<S: RangeSource>(
     let mut attempts = 0;
     while piece.cursor < end {
         let next = (attempts < MAX_ATTEMPTS_PER_PIECE)
-            .then(|| {
+            .then(|| loop {
                 let skip = |p: &PeerId| piece.asked.contains(p) || faulty.contains(p);
                 let (cursor, target) = (piece.cursor, piece.target());
-                pick_peer(&peers, cursor, target, skip, &piece.asks)
+                let picked = pick_peer(&peers, cursor, target, skip, &piece.asks);
+                if picked.is_some() || !piece.ask_failed_again() {
+                    break picked;
+                }
             })
             .flatten();
         let Some(peer) = next else {
@@ -917,6 +960,7 @@ async fn fetch_piece<S: RangeSource>(
                 if e.is_peer_fault() {
                     faulty.insert(peer);
                 }
+                piece.failed(peer, &e, covers(&peers, peer, target));
                 fetch.failures.push((peer, e));
                 continue;
             }
@@ -2199,6 +2243,8 @@ mod tests {
             StopAfter(usize),
             /// The request fails (a timeout, say): not the peer's fault.
             Fail,
+            /// The first request fails, then every one is answered in full.
+            FailOnce,
             /// A block outside the range: the peer's fault.
             Invalid,
             /// Blocks of another branch: the first is not linked to the ones before.
@@ -2263,8 +2309,11 @@ mod tests {
                     .iter()
                     .filter(|b| (request.start_slot..end).contains(&b.slot) && b.slot <= head)
                     .copied();
+                let asked_before = self.sent.iter().filter(|(p, _)| *p == peer).count() > 1;
                 let result = match answer {
                     Answer::Full => Ok(in_range.collect()),
+                    Answer::FailOnce if asked_before => Ok(in_range.collect()),
+                    Answer::FailOnce => Err(OutboundError::Failure("timeout".into()).into()),
                     Answer::StopAfter(n) => Ok(in_range.take(n.max(1)).collect()),
                     Answer::Fail => Err(OutboundError::Failure("timeout".into()).into()),
                     Answer::Invalid => {
@@ -2670,7 +2719,8 @@ mod tests {
         assert!(disjoint.to_string().contains("slot 5"), "{disjoint}");
         assert_eq!(source.sent.len(), 5);
 
-        // Nobody left to ask for a range no answer covered: the fetch fails with every failure.
+        // Nobody left to ask for a range no answer covered: the fetch fails with every failure,
+        // the timed-out peer's second one included.
         let mut source = Source {
             chain: chain(0..32),
             peers: vec![peer(90, 0, Answer::Fail), peer(80, 40, Answer::Full)],
@@ -2682,11 +2732,83 @@ mod tests {
                 let FetchError::NoPeer { failures, .. } = e else {
                     unreachable!()
                 };
-                assert_eq!(failures.len(), 1);
+                assert_eq!(failures.len(), 2);
             }
             other => panic!("{other:?}"),
         }
-        assert_eq!(source.sent.len(), 1, "the pruned peer is never asked");
+        let pruned = source.peers[1].id;
+        assert!(
+            source.sent.iter().all(|(p, _)| *p != pruned),
+            "the pruned peer is never asked"
+        );
+    }
+
+    #[test]
+    fn a_covering_peer_that_timed_out_is_asked_again_after_the_others() {
+        use scripted::{chain, peer, run, Answer, Source};
+        let range = BlocksByRangeV2Request {
+            start_slot: 64,
+            count: 32,
+            step: 1,
+        };
+        // The only peer with the blocks times out once; the other is behind the range. Once
+        // the behind one was tried, the covering one is asked again, and answers.
+        let mut source = Source {
+            chain: chain(64..96),
+            peers: vec![peer(200, 0, Answer::FailOnce), peer(40, 0, Answer::Full)],
+            sent: Vec::new(),
+        };
+        let fetched = run(&mut source, 64, 32).unwrap();
+        assert_eq!(fetched.blocks, source.chain);
+        assert!(fetched.unconfirmed.is_empty());
+        let (covering, behind) = (source.peers[0].id, source.peers[1].id);
+        assert_eq!(
+            source.sent,
+            [(covering, range), (behind, range), (covering, range)]
+        );
+        assert!(matches!(
+            fetched.failures[..],
+            [(p, ref e)] if p == covering && !e.is_peer_fault()
+        ));
+
+        // Once only: a peer that keeps failing is not asked a third time for the same slots.
+        let mut source = Source {
+            chain: chain(64..96),
+            peers: vec![peer(200, 0, Answer::Fail), peer(40, 0, Answer::Full)],
+            sent: Vec::new(),
+        };
+        assert!(matches!(
+            run(&mut source, 64, 32),
+            Err(FetchError::NoPeer { slot: 64, ref failures }) if failures.len() == 2
+        ));
+        assert_eq!(source.sent.len(), 3);
+
+        // A failed peer whose head is short of the slots asked for is not asked again.
+        let mut source = Source {
+            chain: chain(64..96),
+            peers: vec![peer(80, 0, Answer::Fail), peer(200, 0, Answer::Empty)],
+            sent: Vec::new(),
+        };
+        let fetched = run(&mut source, 64, 32).unwrap();
+        assert_eq!(source.sent.len(), 2, "{:?}", source.sent);
+        assert_eq!(fetched.unconfirmed, [(64, 96)]);
+
+        // Only a failure that may pass is worth a second request: not a fault, nor an answer
+        // of another branch.
+        let timeout = RangeError::from(OutboundError::Failure("timeout".into()));
+        assert!(timeout.may_pass());
+        assert!(RangeError::Ignored.may_pass());
+        assert!(!RangeError::Disjoint {
+            slot: 5,
+            parent_root: B256::ZERO,
+            anchor: B256::ZERO,
+        }
+        .may_pass());
+        let fault = OutboundError::InvalidBlocks(BlocksError::NonIncreasingSlot {
+            slot: 1,
+            previous: 1,
+        });
+        assert!(!RangeError::from(fault).may_pass());
     }
 
     #[test]
@@ -2718,15 +2840,121 @@ mod tests {
         assert_eq!(fetched.blocks, source.chain[28..60], "slots 128..160");
     }
 
+    /// One generated fetch: the range, which slots hold a block, and the peers.
+    #[derive(Debug, Clone)]
+    struct FetchCase {
+        start: Slot,
+        count: u64,
+        present: Vec<bool>,
+        /// `(earliest_available_slot, head_slot, answer)` of peers that have the chain up to
+        /// their head and never lie.
+        others: Vec<(Slot, Slot, scripted::Answer)>,
+        /// How far past the range's last slot the honest peer's head is.
+        honest_ahead: u64,
+        honest_eas: u64,
+        /// [`scripted::Answer::Full`], or [`scripted::Answer::Fail`] for a peer that times out.
+        honest: scripted::Answer,
+        /// A peer that lies by omission, if any.
+        liar: Option<(Slot, Slot, scripted::Answer)>,
+    }
+
+    /// The properties of [`count_cap_proptest`] for one case.
+    fn check_fetch(case: &FetchCase) -> Result<(), proptest::test_runner::TestCaseError> {
+        use proptest::prelude::*;
+        use scripted::{chain, peer, Answer, Source};
+        let (start, count) = (case.start, case.count);
+        let slots = (0u64..)
+            .zip(&case.present)
+            .filter(|(_, p)| **p)
+            .map(|(s, _)| s);
+        let mut peers: Vec<_> = case
+            .others
+            .iter()
+            .map(|&(eas, head, answer)| peer(head, eas, answer))
+            .collect();
+        // The honest peer's head is at or past the range's last slot; the others' heads are
+        // anywhere, so some are behind it and have only part of the range.
+        let honest_head = start + count - 1 + case.honest_ahead;
+        peers.push(peer(
+            honest_head,
+            case.honest_eas % (start + 1),
+            case.honest,
+        ));
+        peers.extend(case.liar.map(|(eas, head, answer)| peer(head, eas, answer)));
+        let mut source = Source {
+            chain: chain(slots),
+            peers,
+            sent: Vec::new(),
+        };
+        let fetched = scripted::run(&mut source, start, count);
+        let end = start + count;
+        for (peer, request) in &source.sent {
+            prop_assert!(
+                (1..=MAX_REQUEST_BLOCKS_DENEB).contains(&request.count),
+                "{request:?}"
+            );
+            prop_assert_eq!(request.step, 1);
+            prop_assert!(request.start_slot >= start && request.start_slot + request.count <= end);
+            let eas = source
+                .peers
+                .iter()
+                .find(|p| p.id == *peer)
+                .unwrap()
+                .status
+                .earliest_available_slot;
+            prop_assert!(
+                request.start_slot >= eas,
+                "{request:?} to a peer from {eas}"
+            );
+        }
+        let honest = case.honest == Answer::Full;
+        let fetched = match fetched {
+            Ok(fetched) => fetched,
+            // With the honest peer timing out, there may be nobody to ask.
+            Err(FetchError::NoPeer { .. }) if !honest => return Ok(()),
+            Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
+        };
+        let want: Vec<_> = source
+            .chain
+            .iter()
+            .filter(|b| (start..end).contains(&b.slot))
+            .copied()
+            .collect();
+        for b in want.iter().filter(|b| !fetched.blocks.contains(b)) {
+            prop_assert!(
+                fetched
+                    .unconfirmed
+                    .iter()
+                    .any(|&(from, to)| (from..to).contains(&b.slot)),
+                "slot {} missing outside {:?}",
+                b.slot,
+                fetched.unconfirmed
+            );
+        }
+        prop_assert!(fetched.blocks.iter().all(|b| want.contains(b)));
+        if case.liar.is_none() {
+            prop_assert!(fetched.failures.iter().all(|(_, e)| !e.is_peer_fault()));
+            if honest {
+                prop_assert_eq!(fetched.blocks, want);
+            }
+        }
+        Ok(())
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
 
         /// Any range, any chain, peers that stop early, fail, are pruned or are behind (they
-        /// have the chain up to their head only), and at most one that lies by omission: every request the fetcher sends has `count` 1 to 128 and `step` 1,
-        /// lies inside the range and starts at or after its peer's `earliest_available_slot`.
-        /// Every block of the chain the result lacks is inside an `unconfirmed` range; with one
-        /// complete peer that has the whole range and no liar, the blocks are exactly the
-        /// chain's.
+        /// have the chain up to their head only), an honest peer that has the whole range but
+        /// may time out, and at most one peer that lies by omission: every request the fetcher
+        /// sends has `count` 1 to 128 and `step` 1, lies inside the range and starts at or after
+        /// its peer's `earliest_available_slot`. Every block of the chain the result lacks is
+        /// inside an `unconfirmed` range; with the honest peer answering and no liar, the blocks
+        /// are exactly the chain's.
+        ///
+        /// The timing-out honest peer is what lets a liar and a peer behind the range be the
+        /// only two answers for a gap, so the head rule (`covers`) is tested here too
+        /// ([`a_liar_and_a_behind_peer_settle_nothing`] is that case on its own).
         #[test]
         fn count_cap_proptest(
             start in 0u64..400,
@@ -2742,45 +2970,47 @@ mod tests {
             ),
             honest_ahead in 0u64..200,
             honest_eas in proptest::num::u64::ANY,
+            honest in proptest::prop_oneof![
+                3 => proptest::strategy::Just(scripted::Answer::Full),
+                1 => proptest::strategy::Just(scripted::Answer::Fail),
+            ],
             liar in proptest::option::of((0u64..900, 0u64..1000, proptest::prop_oneof![
                 proptest::strategy::Just(scripted::Answer::Empty),
                 proptest::strategy::Just(scripted::Answer::LastOnly),
             ])),
         ) {
-            use proptest::prelude::*;
-            use scripted::{chain, peer, Answer, Source};
-            let slots = (0u64..).zip(&present).filter(|(_, p)| **p).map(|(s, _)| s);
-            let mut peers: Vec<_> = others
-                .iter()
-                .map(|&(eas, head, answer)| peer(head, eas, answer))
-                .collect();
-            // The honest peer's head is at or past the range's last slot; the others' heads are
-            // anywhere, so some are behind it and have only part of the range.
-            peers.push(peer(start + count - 1 + honest_ahead, honest_eas % (start + 1), Answer::Full));
-            peers.extend(liar.map(|(eas, head, answer)| peer(head, eas, answer)));
-            let mut source = Source { chain: chain(slots), peers, sent: Vec::new() };
-            let fetched = scripted::run(&mut source, start, count);
-            let end = start + count;
-            for (peer, request) in &source.sent {
-                prop_assert!((1..=MAX_REQUEST_BLOCKS_DENEB).contains(&request.count), "{request:?}");
-                prop_assert_eq!(request.step, 1);
-                prop_assert!(request.start_slot >= start && request.start_slot + request.count <= end);
-                let eas = source.peers.iter().find(|p| p.id == *peer).unwrap().status.earliest_available_slot;
-                prop_assert!(request.start_slot >= eas, "{request:?} to a peer from {eas}");
-            }
-            let fetched = fetched.unwrap();
-            let want: Vec<_> = source.chain.iter().filter(|b| (start..end).contains(&b.slot)).copied().collect();
-            for b in want.iter().filter(|b| !fetched.blocks.contains(b)) {
-                prop_assert!(
-                    fetched.unconfirmed.iter().any(|&(from, to)| (from..to).contains(&b.slot)),
-                    "slot {} missing outside {:?}", b.slot, fetched.unconfirmed
-                );
-            }
-            prop_assert!(fetched.blocks.iter().all(|b| want.contains(b)));
-            if liar.is_none() {
-                prop_assert_eq!(fetched.blocks, want);
-                prop_assert!(fetched.failures.iter().all(|(_, e)| !e.is_peer_fault()));
-            }
+            check_fetch(&FetchCase {
+                start,
+                count,
+                present,
+                others,
+                honest_ahead,
+                honest_eas,
+                honest,
+                liar,
+            })?;
+        }
+    }
+
+    /// The head rule on its own: the honest peer times out, a liar claiming a head past the
+    /// range answers it empty, and so does a peer whose head is behind it. Only the liar's
+    /// empty answer counts, and one is not enough: the range stays unconfirmed. With `covers`
+    /// always `true`, the two would settle it as empty.
+    #[test]
+    fn a_liar_and_a_behind_peer_settle_nothing() {
+        use scripted::Answer;
+        let case = FetchCase {
+            start: 64,
+            count: 32,
+            present: vec![true; 128],
+            others: vec![(0, 40, Answer::Full)],
+            honest_ahead: 100,
+            honest_eas: 0,
+            honest: Answer::Fail,
+            liar: Some((0, 900, Answer::Empty)),
+        };
+        if let Err(e) = check_fetch(&case) {
+            panic!("{e}");
         }
     }
 

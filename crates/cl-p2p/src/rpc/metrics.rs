@@ -10,7 +10,9 @@
 //!   (`true`, `false`, or `unknown` before a Status was judged).
 //! - `p2p_status_valid_peers`: connected peers whose last Status passed the relevance check.
 //! - `rpc_outbound_inflight{protocol}`: our requests in flight per protocol, at most
-//!   `MAX_CONCURRENT_REQUESTS` ([`crate::rpc::limits::OutboundSemaphore`]).
+//!   `MAX_CONCURRENT_REQUESTS` ([`crate::rpc::limits::OutboundSemaphore`]); for Ping, which
+//!   takes no shared slot, up to one per connected peer
+//!   ([`Control::ping`](crate::rpc::inbound::Control::ping)).
 //! - `rpc_rate_limited_total{protocol}`: response chunks withheld because the peer was over its
 //!   quota ([`crate::rpc::limits::ChunkPacer`]).
 //! - `rpc_inbound_unsupported_total{protocol}`: peers' proposals of a protocol the probe leaves

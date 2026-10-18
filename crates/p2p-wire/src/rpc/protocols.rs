@@ -3,8 +3,10 @@
 //! Protocol IDs follow `phase0/p2p-interface.md` "Protocol identification":
 //! `/eth2/beacon_chain/req/<message_name>/<version>/<encoding>`, always `ssz_snappy`. Only
 //! `BeaconBlocksByRange` v2 carries context bytes (`altair/p2p-interface.md`, the fork digest of
-//! the block's fork); the other responses have one shape in every fork. `Goodbye` has a request
-//! and no response: the disconnecting peer writes its reason and closes the stream.
+//! the block's fork); the other responses have one shape in every fork. `Goodbye` carries a
+//! `uint64` reason both ways ("Request, Response Content", `phase0/p2p-interface.md` L1461): the
+//! disconnecting peer writes its reason, and the response is one chunk with a reason too (L1483),
+//! though some clients send none.
 //!
 //! [`ProtocolLimits`] is the one row per protocol the codec and the transport check against: the
 //! request ceiling, the response chunk count and the SSZ length bounds of request and response
@@ -127,8 +129,8 @@ impl Protocol {
     }
 
     /// Whether the response is exactly one chunk (every protocol but `BeaconBlocksByRange`,
-    /// whose response may hold anything from no blocks to `count`, and `Goodbye`, which has
-    /// none).
+    /// whose response may hold anything from no blocks to `count`, and `Goodbye`, whose one
+    /// chunk some clients leave out).
     pub const fn single_response(self) -> bool {
         !matches!(self, Protocol::BlocksByRangeV2 | Protocol::GoodbyeV1)
     }
@@ -144,7 +146,6 @@ impl Protocol {
     pub fn limits<E: EthSpec>(self) -> ProtocolLimits {
         let (max_request_items, max_response_chunks) = match self {
             Protocol::BlocksByRangeV2 => (MAX_REQUEST_BLOCKS_DENEB, MAX_REQUEST_BLOCKS_DENEB),
-            Protocol::GoodbyeV1 => (0, 0),
             _ => (0, 1),
         };
         let (ssz_min, ssz_max) = match self {
@@ -203,7 +204,7 @@ impl Protocol {
 
     /// The largest success payload: the type bound, capped at `MAX_PAYLOAD_SIZE`. A block's
     /// bound depends on its fork, so a protocol with context bytes needs `fork`; `None` there
-    /// means the context was not read. `Goodbye` has no response, so `None`.
+    /// means the context was not read.
     pub fn response_max_len<E: EthSpec>(self, fork: Option<ForkName>) -> Option<usize> {
         match self {
             Protocol::StatusV2 => Some(<StatusV2 as ssz::Decode>::ssz_fixed_len()),
@@ -212,7 +213,7 @@ impl Protocol {
             Protocol::BlocksByRangeV2 => {
                 fork.and_then(|f| caps::max_size::<E>(ObjectKind::SignedBeaconBlock, f))
             }
-            Protocol::GoodbyeV1 => None,
+            Protocol::GoodbyeV1 => Some(<Goodbye as ssz::Decode>::ssz_fixed_len()),
         }
     }
 
@@ -269,13 +270,11 @@ impl Request {
         }
     }
 
-    /// The most response chunks the peer may send: 1 for the single-response protocols, the
-    /// request's `count` (at most [`MAX_REQUEST_BLOCKS_DENEB`]) for `BeaconBlocksByRange`, 0
-    /// for `Goodbye`.
+    /// The most response chunks the peer may send: the request's `count` (at most
+    /// [`MAX_REQUEST_BLOCKS_DENEB`]) for `BeaconBlocksByRange`, 1 for every other protocol.
     pub fn max_response_chunks(&self) -> u64 {
         match self {
             Request::BlocksByRange(r) => r.count.min(MAX_REQUEST_BLOCKS_DENEB),
-            Request::Goodbye(_) => 0,
             _ => 1,
         }
     }
@@ -307,6 +306,8 @@ pub enum Response<E: EthSpec> {
     /// One block of a `BeaconBlocksByRange` response, in the fork its context bytes named.
     /// Boxed: a block is far larger than the other responses.
     Block(Box<forked::SignedBeaconBlock<E>>),
+    /// `Goodbye`: the responder's reason.
+    Goodbye(Goodbye),
 }
 
 impl<E: EthSpec> Response<E> {
@@ -317,6 +318,7 @@ impl<E: EthSpec> Response<E> {
             Response::MetaData(_) => Protocol::MetaDataV3,
             Response::Ping(_) => Protocol::PingV1,
             Response::Block(_) => Protocol::BlocksByRangeV2,
+            Response::Goodbye(_) => Protocol::GoodbyeV1,
         }
     }
 
@@ -327,6 +329,7 @@ impl<E: EthSpec> Response<E> {
             Response::MetaData(m) => m.as_ssz_bytes(),
             Response::Ping(p) => p.as_ssz_bytes(),
             Response::Block(b) => b.as_ssz_bytes(),
+            Response::Goodbye(g) => g.as_ssz_bytes(),
         }
     }
 }
@@ -392,14 +395,20 @@ mod tests {
     }
 
     #[test]
-    fn goodbye_has_no_response() {
+    fn goodbye_has_at_most_one_response_chunk() {
+        // "Request, Response Content: (Uint64)" and "The response MUST consist of a single
+        // `response_chunk`" (`phase0/p2p-interface.md` L1461, L1483); some clients send none.
         let p = Protocol::GoodbyeV1;
         assert_eq!(p.request_len(), Some(8));
-        assert_eq!(p.response_max_len::<Minimal>(None), None);
+        assert_eq!(p.response_max_len::<Minimal>(None), Some(8));
+        assert!(!p.single_response(), "an empty response is accepted too");
         let request = Request::Goodbye(Goodbye(2));
         assert_eq!(request.protocol(), p);
-        assert_eq!(request.max_response_chunks(), 0);
+        assert_eq!(request.max_response_chunks(), 1);
         assert_eq!(request.ssz_body(), Some(2u64.to_le_bytes().to_vec()));
+        let response = Response::<Minimal>::Goodbye(Goodbye(2));
+        assert_eq!(response.protocol(), p);
+        assert_eq!(response.ssz_bytes(), 2u64.to_le_bytes());
     }
 
     #[test]
@@ -460,7 +469,14 @@ mod tests {
         assert_eq!(ping.request, Some(SszBounds::exactly(8)));
         let goodbye = Protocol::GoodbyeV1.limits::<Minimal>();
         assert_eq!(goodbye.request, Some(SszBounds::exactly(8)));
-        assert_eq!((goodbye.max_response_chunks, goodbye.ssz_max), (0, 0));
+        assert_eq!(
+            (
+                goodbye.max_response_chunks,
+                goodbye.ssz_min,
+                goodbye.ssz_max
+            ),
+            (1, 8, 8)
+        );
         // Blocks: 128 a request, the bound the largest fork's, capped at MAX_PAYLOAD_SIZE.
         for blocks in [
             Protocol::BlocksByRangeV2.limits::<Minimal>(),

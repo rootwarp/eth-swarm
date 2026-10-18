@@ -3001,6 +3001,20 @@ fn default_config_listens_on_tcp_9000() {
     );
 }
 
+#[test]
+fn idle_connections_outlive_two_ping_intervals() {
+    use crate::rpc::inbound::PING_INTERVAL;
+    let (_, metrics) = registered();
+    let cfg = SwarmConfig::new(MuxerBudget::with_defaults(&metrics));
+    assert_eq!(PING_INTERVAL, Duration::from_secs(15));
+    assert_eq!(cfg.idle_connection_timeout, Duration::from_secs(30));
+    assert_eq!(DEFAULT_IDLE_CONNECTION_TIMEOUT, 2 * PING_INTERVAL);
+    assert_eq!(
+        crate::testkit::control_config(None).ping_interval,
+        PING_INTERVAL
+    );
+}
+
 #[tokio::test]
 async fn dial_and_accept_negotiate_noise_and_yamux() {
     // Both sides are probe swarms: Noise is the only security protocol either offers, and the

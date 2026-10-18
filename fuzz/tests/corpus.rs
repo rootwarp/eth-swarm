@@ -211,7 +211,7 @@ fn every_target_has_the_required_malformed_seeds() {
     assert!(has("blocks_by_range_resp", "data-after-error"));
     assert!(has("blocks_by_range_resp", "response-over-byte-budget"));
 
-    for prefix in ["status-", "metadata-", "ping-"] {
+    for prefix in ["status-", "metadata-", "ping-", "goodbye-"] {
         chunks("rpc_chunk", prefix);
     }
     for prefix in ["status-", "ping-", "goodbye-", "blocks-"] {
@@ -226,7 +226,7 @@ fn every_target_has_the_required_malformed_seeds() {
     }
     for name in [
         "metadata-request-empty",
-        "goodbye-success-chunk",
+        "goodbye-valid",
         "goodbye-error-code-1",
         "blocks-unknown-context-digest",
         "blocks-context-cut-short",

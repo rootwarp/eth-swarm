@@ -26,6 +26,11 @@
 //! or times out (an outage) keeps the last good one; with none yet, the Status is
 //! [`ProbeError::Unavailable`], which the RPC answers `UNAVAILABLE` and cl-p2p treats as "no
 //! Status": it sends none and judges none, never a guessed one.
+//!
+//! The kept sample only moves forward: a sample whose finalized epoch or head slot is below the
+//! kept one's is ignored (and the kept one answered). Overlapping calls can finish out of order,
+//! a slow one with an older answer after a fast one with a newer answer, and the Status we
+//! advertise must never move back.
 
 mod beacon_api;
 pub mod column;
@@ -115,6 +120,13 @@ struct Sample {
     head: Header,
 }
 
+impl Sample {
+    /// Whether `self` is behind `kept` in its finalized epoch or its head slot.
+    fn is_older_than(&self, kept: &Sample) -> bool {
+        self.finalized.epoch < kept.finalized.epoch || self.head.slot < kept.head.slot
+    }
+}
+
 /// Builds the probe's Status from the wall clock and the reference API (see the module docs).
 pub struct StatusProvider<A> {
     api: A,
@@ -175,7 +187,16 @@ impl<A: ReferenceApi> StatusProvider<A> {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             match fresh {
-                Ok(sample) => *last = Some(sample),
+                Ok(sample) => match *last {
+                    Some(kept) if sample.is_older_than(&kept) => tracing::debug!(
+                        finalized_epoch = sample.finalized.epoch,
+                        head_slot = sample.head.slot,
+                        kept_epoch = kept.finalized.epoch,
+                        kept_slot = kept.head.slot,
+                        "an older reference sample than the kept one: ignored"
+                    ),
+                    _ => *last = Some(sample),
+                },
                 Err(e) => match *last {
                     Some(_) => {
                         tracing::warn!(%e, "reference API outage: keeping the last good sample")
@@ -333,6 +354,75 @@ mod tests {
         api.finalize(after, [0xcc; 32], after * 32);
         let status = provider.status(at_epoch(&chain, after)).await.unwrap();
         assert_eq!(status.finalized.unwrap().epoch, after);
+    }
+
+    /// A reference API whose `header` answers take the next scripted delay each.
+    struct Slow<'a> {
+        api: &'a Fixture,
+        delays: Mutex<std::collections::VecDeque<Duration>>,
+    }
+
+    impl ReferenceApi for &Slow<'_> {
+        async fn finalized_checkpoint(&self) -> Result<Checkpoint, ApiError> {
+            (&self.api).finalized_checkpoint().await
+        }
+
+        async fn header(&self, root: Root) -> Result<Header, ApiError> {
+            let delay = self.delays.lock().unwrap().pop_front().unwrap_or_default();
+            tokio::time::sleep(delay).await;
+            (&self.api).header(root).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_never_moves_backwards() {
+        let chain = sepolia();
+        let (before, _) = digest_boundary(&chain);
+        let now = at_epoch(&chain, before);
+        let api = Fixture::default();
+        let (old, new) = (before - 3, before - 2);
+        api.finalize(old, [0xaa; 32], old * 32);
+        let slow = Slow {
+            api: &api,
+            delays: Mutex::new([Duration::from_secs(1), Duration::ZERO].into()),
+        };
+        let provider = StatusProvider::new(&slow, chain.clone(), DEFAULT_API_TIMEOUT);
+
+        // A slow refresh reads the old checkpoint, then a fast one reads the newer one and
+        // finishes first: the slow one's older answer must not replace it.
+        let (stale, fresh) = tokio::join!(provider.status(now), async {
+            tokio::task::yield_now().await;
+            api.finalize(new, [0xbb; 32], new * 32);
+            provider.status(now).await
+        });
+        let epoch = |s: &pb::GetStatusResponse| s.finalized.as_ref().unwrap().epoch;
+        assert_eq!(epoch(&fresh.unwrap()), new);
+        let stale = stale.unwrap();
+        assert_eq!(
+            epoch(&stale),
+            new,
+            "the late, older sample is not advertised"
+        );
+        assert_eq!(stale.head_slot, new * 32);
+
+        // An outage keeps the newest sample, not the last one to arrive.
+        api.mode.store(FAILING, Ordering::SeqCst);
+        let kept = provider.status(now).await.unwrap();
+        assert_eq!(epoch(&kept), new);
+        assert_eq!(kept.head_root, vec![0xbb; 32]);
+
+        // An answer older in either field is refused too, one after the other.
+        api.mode.store(UP, Ordering::SeqCst);
+        api.finalize(old, [0xcc; 32], (new + 5) * 32);
+        assert_eq!(epoch(&provider.status(now).await.unwrap()), new);
+        api.finalize(new, [0xdd; 32], new * 32 - 1);
+        let status = provider.status(now).await.unwrap();
+        assert_eq!(status.head_root, vec![0xbb; 32]);
+        // The same epoch and slot, or newer: taken.
+        api.finalize(new + 1, [0xee; 32], (new + 1) * 32);
+        let status = provider.status(now).await.unwrap();
+        assert_eq!(epoch(&status), new + 1);
+        assert_eq!(status.head_root, vec![0xee; 32]);
     }
 
     #[tokio::test]

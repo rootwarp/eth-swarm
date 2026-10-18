@@ -51,16 +51,35 @@ protocols offered: any other fails multistream-select negotiation, among them th
   Status with another fork digest, or another finalized root at our finalized epoch, gets
   `Goodbye(2)` and the connection is closed once the Goodbye completed. A failed exchange (a
   timeout, an error chunk) is ignored: the peer is neither valid nor invalid.
-- **MetaData**: our `seq_number` (from cl-chain), no attestation or sync subnets, and
-  `custody_group_count` equal to the ENR `cgc` (`ControlConfig::custody_group_count`; cl-p2p
-  does not link cl-discv5, so the value is passed in).
+- **MetaData**: one snapshot of `ControlConfig::metadata` (`rpc::inbound::MetaDataSource`, from
+  cl-chain): the `seq_number` and the fields it numbers are read together, so an answer that
+  waits for its rate-limit token never pairs a bumped `seq_number` with old fields, or the
+  reverse. No attestation or sync subnets, and `custody_group_count` equal to the ENR `cgc`
+  (cl-p2p does not link cl-discv5, so the owner sets both).
 - **Ping**: answered with our `seq_number`. A peer `seq_number` above that of the peer MetaData
   we hold, or any while we hold none, triggers one GetMetaData; no second one while it is open.
-- **Goodbye**: no response chunk; the stream and the connection close.
-- **Rejects**: a request that breaks the wire format gets `1: InvalidRequest`. `3:
+  A higher one announced while it is open is asked for once more as soon as it ends, if its
+  answer is older. We Ping every connected peer 15 s after it connected and then 15 s after
+  its last Ping ended (`rpc::inbound::PING_INTERVAL` \[est\], Lighthouse's own cadence), at
+  most one in flight per peer, so two Pings are always 15 s apart, inside every client's Ping
+  quota (Lighthouse: 2 per 10 s). Pings go out at once, outside the shared outbound lane: one
+  per peer is within `MAX_CONCURRENT_REQUESTS`, which the spec counts per peer (`phase0`
+  L1228, L1310–1312), and no slow or silent peer can hold back another's. That is what keeps
+  a quiet connection up, since the swarm closes one with no open stream after 30 s
+  (`transport::DEFAULT_IDLE_CONNECTION_TIMEOUT`, twice the interval).
+- **Goodbye**: answered with one chunk carrying the peer's own reason (`phase0` L1461:
+  "Request, Response Content: (Uint64)"; L1483: "The response MUST consist of a single
+  `response_chunk`"); the connection closes once the peer closed it, or 1 s after the answer
+  went out (`rpc::inbound::GOODBYE_LINGER` \[est\]). Our own Goodbye accepts an answer of one
+  chunk or none (Lighthouse sends none). Once either side said Goodbye, nothing but our own
+  Goodbye goes out to that peer: no Ping, and a request still waiting for a slot is dropped.
+- **Rejects**: a request that breaks the wire format gets `1: InvalidRequest` (a Goodbye's
+  too), and so does a
+  `BeaconBlocksByRange` request with `step` 0 or a `count` above `MAX_REQUEST_BLOCKS_DENEB` (128;
+  semantically invalid, `phase0` L1286, L1514, `deneb` L876; the connection stays). `3:
   ResourceUnavailable` goes out only where the protocol specifies it: `BeaconBlocksByRange`,
-  answered so on every request because the probe stores no blocks. A Status we cannot answer
-  (no Status of ours yet) gets `2: ServerError`. Error chunks carry no context bytes.
+  answered so on every other request because the probe stores no blocks. A Status we cannot
+  answer (no Status of ours yet) gets `2: ServerError`. Error chunks carry no context bytes.
 - **Deadlines** (in the codec, `tokio::time::timeout`, both directions): 5 s to the first
   byte, 5 s per chunk, 10 s in total \[est\]; `request_response`'s own 10 s request timeout is
   only the backstop. A silent inbound stream is dropped at 5 s and holds one of the 2 stream
@@ -77,7 +96,8 @@ protocols offered: any other fails multistream-select negotiation, among them th
 - **Outbound requests** (`rpc::limits::OutboundSemaphore`): at most 2 in flight per protocol
   across the probe (`MAX_CONCURRENT_REQUESTS`, `phase0` L309, L1228); the rest wait in a
   bounded queue per protocol (256), and a full queue IGNOREs the request (an IGNOREd Goodbye
-  closes the connection at once).
+  closes the connection at once). Pings are the exception: one per peer, sent at once, and
+  `rpc_outbound_inflight{protocol="ping"}` counts them across peers.
 - **Length prefix** (`p2p_wire`): checked against the type's SSZ bounds, both ends, and
   `MAX_PAYLOAD_SIZE` before a byte of the payload is read or allocated
   (`p2p_wire::rpc::protocols::ProtocolLimits`).
@@ -91,7 +111,9 @@ finalized checkpoint is the reference Beacon API's, and the head is **the finali
 the reference node's head. The probe imports nothing past finality, so it advertises only what
 it can vouch for; `earliest_available_slot` is that head slot until the probe serves ranges of
 its own. During a reference API outage the last good sample is kept; before the first one there
-is no Status, so none is sent and none is judged.
+is no Status, so none is sent and none is judged. The kept sample never moves back: a sample
+with a lower finalized epoch or head slot than the kept one (a slow, earlier refresh finishing
+after a newer one) is ignored.
 
 Metrics, on the same registry as the peer metrics (`rpc::metrics::RpcMetrics`):
 
@@ -102,7 +124,8 @@ Metrics, on the same registry as the peer metrics (`rpc::metrics::RpcMetrics`):
   status_valid}`: `reason` is the code (0–255, else `other`), `status_valid` is `true`,
   `false` or `unknown` (no Status judged yet).
 - `p2p_status_valid_peers`: connected peers whose last Status passed.
-- `rpc_outbound_inflight{protocol}`: our requests in flight, at most 2 per protocol.
+- `rpc_outbound_inflight{protocol}`: our requests in flight, at most 2 per protocol; Ping
+  excepted, up to one per connected peer.
 - `rpc_rate_limited_total{protocol}`: response chunks withheld for a peer over its quota.
 - `queue_dropped_total{queue}`: items a bounded queue IGNOREd (`rpc_outbound_<protocol>`).
 - `rpc_inbound_unsupported_total{protocol}`: peers' proposals of a protocol we leave

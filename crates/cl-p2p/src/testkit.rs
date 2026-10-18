@@ -12,7 +12,7 @@
 use crate::behaviour::ReqRespSlot;
 use crate::m2a_session::PinnedPeer;
 use crate::rpc::codec::Deadlines;
-use crate::rpc::inbound::{ControlConfig, SharedStatus};
+use crate::rpc::inbound::{ControlConfig, SharedMetaData, SharedStatus};
 use crate::rpc::metrics::RpcMetrics;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
 use libp2p::identity::Keypair;
@@ -24,23 +24,33 @@ use p2p_wire::rpc::messages::{BlocksByRangeV2Request, ForkDigest, MetaDataV3, Pi
 use p2p_wire::rpc::protocols::{Protocol, Request, ResultCode};
 use prometheus_client::registry::Registry;
 use std::io;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The custody group count [`control`] advertises.
 pub const FIXTURE_CGC: u64 = 4;
 
-/// A config with Status `status` (and `seq_number` 1), its context bytes from
-/// `p2p_wire::testkit::context_table`.
+/// MetaData with `seq_number` and `custody_group_count`, no subnets: what the probe advertises.
+pub fn local_metadata(seq_number: u64, custody_group_count: u64) -> MetaDataV3 {
+    MetaDataV3 {
+        seq_number,
+        attnets: Default::default(),
+        syncnets: Default::default(),
+        custody_group_count,
+    }
+}
+
+/// A config with Status `status` (and MetaData `seq_number` 1, `custody_group_count`
+/// [`FIXTURE_CGC`]), its context bytes from `p2p_wire::testkit::context_table`.
 pub fn control_config(status: Option<StatusV2>) -> ControlConfig {
     ControlConfig {
         status: Arc::new(SharedStatus::new(status)),
-        metadata: Arc::new(AtomicU64::new(1)),
-        custody_group_count: FIXTURE_CGC,
+        metadata: Arc::new(SharedMetaData::new(local_metadata(1, FIXTURE_CGC))),
         contexts: Arc::new(p2p_wire::testkit::context_table()),
         deadlines: Deadlines::default(),
         limits: crate::rpc::limits::RpcLimits::default(),
+        ping_interval: crate::rpc::inbound::PING_INTERVAL,
     }
 }
 

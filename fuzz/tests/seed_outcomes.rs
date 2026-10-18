@@ -253,9 +253,12 @@ fn rpc_chunk_block_and_goodbye_seeds() {
             contexts(),
         )
     };
+    // Goodbye's response is one chunk with a reason (`phase0/p2p-interface.md` L1461, L1483).
     assert_eq!(
-        goodbye("success-chunk"),
-        Err(CodecError::NoResponse(Protocol::GoodbyeV1))
+        goodbye("valid"),
+        Ok(ResponseChunk::Success(Response::Goodbye(
+            p2p_wire::rpc::messages::Goodbye(1)
+        )))
     );
     assert!(matches!(
         goodbye("error-code-2"),

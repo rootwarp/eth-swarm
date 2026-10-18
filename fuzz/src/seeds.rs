@@ -442,28 +442,16 @@ fn rpc_chunk(seeds: &mut Vec<Seed>, status: &[u8], metadata: &[u8], ping: &[u8])
     .as_ssz_bytes();
     let goodbye = Goodbye(1).as_ssz_bytes();
     for (protocol, name, response, request) in [
-        (Protocol::StatusV2, "status", Some(status), Some(status)),
-        (Protocol::MetaDataV3, "metadata", Some(metadata), None),
-        (Protocol::PingV1, "ping", Some(ping), Some(ping)),
-        (Protocol::GoodbyeV1, "goodbye", None, Some(&goodbye[..])),
+        (Protocol::StatusV2, "status", status, Some(status)),
+        (Protocol::MetaDataV3, "metadata", metadata, None),
+        (Protocol::PingV1, "ping", ping, Some(ping)),
+        // Goodbye's response is one chunk with a reason, like its request
+        // (`phase0/p2p-interface.md` L1461, L1483).
+        (Protocol::GoodbyeV1, "goodbye", &goodbye[..], Some(&goodbye[..])),
     ] {
         let prefix = format!("{name}-");
         let i = index(protocol);
-        match response {
-            Some(ssz) => single_chunk(seeds, target, &[i], &prefix, ssz),
-            None => {
-                // Goodbye has no response: a success chunk is refused, an error chunk is not.
-                let mut sink = Sink {
-                    seeds: &mut *seeds,
-                    target,
-                    lead: &[i],
-                    prefix: &prefix,
-                };
-                let chunk = encode_success_chunk(None, &goodbye).expect("small payload");
-                sink.add("success-chunk", &chunk);
-                sink.result_codes();
-            }
-        }
+        single_chunk(seeds, target, &[i], &prefix, response);
         requests(seeds, target, i | REQUEST_SELECTOR, &prefix, request);
     }
 

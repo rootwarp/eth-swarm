@@ -73,7 +73,7 @@ impl Quota {
 /// periods: under 5 s, the requester's first-byte and per-chunk deadline (ours, and the common
 /// client default). A peer within the request limit is slowed down, never timed out. Two full
 /// `BeaconBlocksByRange` answers from an empty bucket take 256 periods, about 5 s, inside the
-/// 10 s an exchange may take. `Goodbye` has no response chunk and no quota.
+/// 10 s an exchange may take. `Goodbye` has no quota: its one response chunk ends the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateLimits {
     /// `Status`: 5 at once, then one per 2 s.
@@ -98,7 +98,7 @@ impl Default for RateLimits {
 }
 
 impl RateLimits {
-    /// The quota of `protocol`; `None` for one without response chunks (`Goodbye`).
+    /// The quota of `protocol`; `None` for `Goodbye`, whose one chunk ends the connection.
     #[must_use]
     pub fn quota(&self, protocol: Protocol) -> Option<Quota> {
         match protocol {

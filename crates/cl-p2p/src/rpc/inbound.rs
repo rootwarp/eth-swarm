@@ -13,18 +13,26 @@
 //! - **Status** (`fulu/p2p-interface.md` L538–571): our Status from the [`StatusSource`]; with
 //!   none known yet `2: ServerError` (Status does not specify `3`). The peer's Status is then
 //!   judged ([`relevance`]).
-//! - **MetaData**: `seq_number` from the [`MetaDataSource`] (cl-chain), no attestation or sync
-//!   subnets (the probe subscribes to none), `custody_group_count` the ENR `cgc`
-//!   ([`ControlConfig::custody_group_count`]).
+//! - **MetaData**: one snapshot of the [`MetaDataSource`] (cl-chain): its `seq_number` and the
+//!   fields it numbers, read together, so a `seq_number` bumped while an answer waits for its
+//!   token never pairs with fields of another one. The probe subscribes to no attestation or
+//!   sync subnets, and `custody_group_count` is the ENR `cgc`.
 //! - **Ping** (`phase0` L1628–1682): our `seq_number`. A peer `seq_number` above the one of its
 //!   MetaData we hold, or any while we hold none, triggers one GetMetaData; no second one goes
-//!   out while one is open.
-//! - **Goodbye** (`phase0` L1457–1483): no response chunk; the stream closes and so does the
-//!   connection. Counted and logged as one `goodbye_received` event.
+//!   out while one is open. One announced while it is open is kept: if the answer is older, it
+//!   is asked for once more right away, not left until the next Ping.
+//! - **Goodbye** (`phase0` L1457–1483): one response chunk, as the spec has it ("Request,
+//!   Response Content: (Uint64)", L1461; "The response MUST consist of a single
+//!   `response_chunk`", L1483), whose reason is the peer's own (the spec does not say which).
+//!   The connection closes [`GOODBYE_LINGER`] after it went out, if the peer did not close it
+//!   first. Counted and logged as one `goodbye_received` event. Our own Goodbye accepts an
+//!   answer of one chunk or none (Lighthouse sends none).
 //! - **BeaconBlocksByRange**: `3: ResourceUnavailable`, which that protocol specifies for blocks
-//!   the responder does not have (`phase0` L1540).
-//! - A request that broke the wire format: `1: InvalidRequest` (`phase0` L1383–1386), except a
-//!   Goodbye, which has no response.
+//!   the responder does not have (`phase0` L1540). A request with `step` 0 or a `count` above
+//!   `MAX_REQUEST_BLOCKS_DENEB` (128) is semantically invalid and gets `1: InvalidRequest`
+//!   (`phase0` L1286–1288, L1514; `deneb` L876); the connection stays.
+//! - A request that broke the wire format: `1: InvalidRequest` (`phase0` L1383–1386), a
+//!   Goodbye's included.
 //!
 //! Error chunks carry no context bytes and `3` only where the protocol specifies it: the codec
 //! refuses anything else ([`super::codec::encode_response`]).
@@ -46,7 +54,9 @@
 //!   every peer (`rpc_outbound_inflight{protocol}`), the rest waiting in the protocol's bounded
 //!   queue. A full queue IGNOREs the request (`queue_dropped_total{queue}`); an IGNOREd Goodbye
 //!   closes the connection at once, since it was going to close anyway. A waiting request whose
-//!   peer has left is dropped when its turn comes.
+//!   peer has left, or to a peer either side said Goodbye to (but our Goodbye), is dropped when
+//!   its turn comes. Pings take no slot here: at most one per peer, sent at once
+//!   ([`Control::ping`]).
 //!
 //! # Our BlocksByRange requests
 //!
@@ -65,6 +75,16 @@
 //! once the Goodbye completed (`phase0` L1441–1449); any other is valid
 //! (`p2p_status_valid_peers`). A Status exchange that failed (a timeout, an error chunk) says
 //! nothing about the peer's chain: it is ignored, never taken as valid or invalid.
+//!
+//! # Ping cadence
+//!
+//! Every connected peer is pinged [`ControlConfig::ping_interval`] ([`PING_INTERVAL`], 15 s)
+//! after it connected, then an interval after its last Ping ended, until either side said
+//! Goodbye. A peer has at most one Ping in flight, and it goes out at once, outside the shared
+//! outbound lane, so neither slow nor silent peers can hold back anyone's Ping. That traffic is
+//! what keeps a quiet connection up: the swarm's idle timeout
+//! ([`crate::transport::DEFAULT_IDLE_CONNECTION_TIMEOUT`], 30 s) is twice the interval, and two
+//! Pings to a peer are always at least an interval apart (Lighthouse allows 2 per 10 s).
 //!
 //! # Deadlines
 //!
@@ -88,7 +108,8 @@ use ethswarm_proto::chain as pb;
 use libp2p::core::transport::PortUse;
 use libp2p::core::Endpoint;
 use libp2p::request_response::{
-    self, InboundFailure, OutboundFailure, OutboundRequestId, ProtocolSupport, ResponseChannel,
+    self, InboundFailure, InboundRequestId, OutboundFailure, OutboundRequestId, ProtocolSupport,
+    ResponseChannel,
 };
 use libp2p::swarm::{
     CloseConnection, ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, THandler,
@@ -99,13 +120,30 @@ use p2p_wire::rpc::codec::ContextTable;
 use p2p_wire::rpc::messages::{
     BlocksByRangeV2Request, ErrorMessage, Goodbye, MetaDataV3, Ping, StatusV2,
 };
-use p2p_wire::rpc::protocols::{Protocol, Request, Response, ResponseChunk, ResultCode};
+use p2p_wire::rpc::protocols::{
+    Protocol, Request, Response, ResponseChunk, ResultCode, MAX_REQUEST_BLOCKS_DENEB,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::{Instant, Sleep};
+
+/// How long after a peer's last Ping ended (or it connected) the next one goes out \[est\]:
+/// 15 s, as Lighthouse pings the peers it dialed, so two Pings to a peer are at least 15 s
+/// apart, inside every client's Ping quota (Lighthouse allows 2 per 10 s).
+///
+/// It is also what keeps a quiet connection up: the swarm closes one with no open stream after
+/// [`crate::transport::DEFAULT_IDLE_CONNECTION_TIMEOUT`] (30 s), twice this interval. A Ping
+/// goes out when due, never waiting for a shared slot ([`Control::ping`]), so a connection is
+/// never quiet for longer than the interval.
+pub const PING_INTERVAL: Duration = Duration::from_secs(15);
+
+/// How long a connection stays up after our answer to the peer's Goodbye went out \[est\]: the
+/// peer, which said it is leaving, normally closes it at once; this bounds a peer that does not.
+pub const GOODBYE_LINGER: Duration = Duration::from_secs(1);
 
 /// Goodbye reason 1: client shut down.
 pub const GOODBYE_CLIENT_SHUTDOWN: u64 = 1;
@@ -125,11 +163,16 @@ pub trait StatusSource: Send + Sync + 'static {
     fn status(&self) -> Option<StatusV2>;
 }
 
-/// Our MetaData `seq_number`, which cl-chain owns (`ethswarm.chain.v1.ReqRespService/
+/// Our MetaData, whose `seq_number` cl-chain owns (`ethswarm.chain.v1.ReqRespService/
 /// GetMetadata`).
+///
+/// One call is one snapshot: the `seq_number` and the fields it numbers come from the same
+/// state, so an answer never pairs a new `seq_number` with old fields, or the reverse. The
+/// owner changes them together ([`SharedMetaData::set`]); `custody_group_count` is the `cgc`
+/// our ENR advertises (cl-discv5 builds the record; cl-p2p does not link it).
 pub trait MetaDataSource: Send + Sync + 'static {
-    /// Our `seq_number` now.
-    fn seq_number(&self) -> u64;
+    /// Our MetaData now.
+    fn metadata(&self) -> MetaDataV3;
 }
 
 /// A [`StatusSource`] the owner keeps current: the last good Status it was given.
@@ -161,9 +204,33 @@ impl StatusSource for SharedStatus {
     }
 }
 
-impl MetaDataSource for AtomicU64 {
-    fn seq_number(&self) -> u64 {
-        self.load(Ordering::Acquire)
+/// A [`MetaDataSource`] the owner keeps current: the last MetaData it was given, every field
+/// replaced at once.
+#[derive(Debug)]
+pub struct SharedMetaData(RwLock<MetaDataV3>);
+
+impl SharedMetaData {
+    /// A source holding `metadata`.
+    #[must_use]
+    pub fn new(metadata: MetaDataV3) -> Self {
+        Self(RwLock::new(metadata))
+    }
+
+    /// Replaces the MetaData, `seq_number` and fields together.
+    pub fn set(&self, metadata: MetaDataV3) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = metadata;
+    }
+}
+
+impl MetaDataSource for SharedMetaData {
+    fn metadata(&self) -> MetaDataV3 {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -251,27 +318,26 @@ pub fn relevance(ours: &StatusV2, theirs: &StatusV2) -> Relevance {
 pub struct ControlConfig {
     /// Our Status.
     pub status: Arc<dyn StatusSource>,
-    /// Our MetaData `seq_number`.
+    /// Our MetaData, `custody_group_count` the `cgc` our ENR advertises.
     pub metadata: Arc<dyn MetaDataSource>,
-    /// Our custody group count: the `cgc` our ENR advertises (cl-discv5 builds the record; the
-    /// value is passed in, since cl-p2p does not link cl-discv5).
-    pub custody_group_count: u64,
     /// Fork digest → fork, for the context bytes of block responses.
     pub contexts: Arc<ContextTable>,
     /// The codec's deadlines.
     pub deadlines: Deadlines,
     /// The rate limits and the outbound queue (see the module docs).
     pub limits: RpcLimits,
+    /// How often each connected peer is pinged: [`PING_INTERVAL`]; zero pings none.
+    pub ping_interval: Duration,
 }
 
 impl std::fmt::Debug for ControlConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ControlConfig")
             .field("status", &self.status.status())
-            .field("seq_number", &self.metadata.seq_number())
-            .field("custody_group_count", &self.custody_group_count)
+            .field("metadata", &self.metadata.metadata())
             .field("deadlines", &self.deadlines)
             .field("limits", &self.limits)
+            .field("ping_interval", &self.ping_interval)
             .finish_non_exhaustive()
     }
 }
@@ -438,8 +504,26 @@ struct PeerState {
     metadata_seq: Option<u64>,
     /// Whether our GetMetaData request is open (in flight or waiting for a slot).
     metadata_open: bool,
+    /// The highest `seq_number` the peer announced while our request was open, if above the
+    /// one known: asked for once more when the open request ends with an older MetaData.
+    metadata_announced: Option<u64>,
     /// Whether we sent it a Goodbye.
     goodbye_sent: bool,
+    /// Whether it sent us one.
+    goodbye_received: bool,
+    /// When its connection closes: a linger after our answer to its Goodbye went out.
+    close_at: Option<Instant>,
+    /// Our Ping to it in flight, if one is: never more than one.
+    ping: Option<OutboundRequestId>,
+    /// When our next Ping to it is due: an interval after the last one ended.
+    next_ping: Instant,
+}
+
+impl PeerState {
+    /// Whether either side said Goodbye: nothing more goes out but our own Goodbye.
+    fn leaving(&self) -> bool {
+        self.goodbye_sent || self.goodbye_received
+    }
 }
 
 /// The probe's req/resp behaviour (see the module docs).
@@ -450,6 +534,9 @@ pub struct Control<E: EthSpec> {
     peers: HashMap<PeerId, PeerState>,
     /// Our Goodbye requests still open; the connection closes when each completes.
     goodbyes: HashMap<OutboundRequestId, PeerId>,
+    /// Our answers to peers' Goodbyes still being written; the connection closes when each is
+    /// sent or fails.
+    goodbye_answers: HashMap<InboundRequestId, PeerId>,
     /// Our requests in flight, each holding a slot of its protocol. Keyed by protocol too:
     /// every protocol's behaviour numbers its requests on its own, so IDs repeat across them.
     in_flight: HashSet<(Protocol, OutboundRequestId)>,
@@ -463,6 +550,8 @@ pub struct Control<E: EthSpec> {
     next_ticket: u64,
     /// Every peer's response quota, shared with the inbound streams' writers.
     limiter: SharedLimiter,
+    /// Wakes the behaviour when the next Ping or Goodbye close is due; `None` with neither.
+    timer: Option<Pin<Box<Sleep>>>,
     pending: VecDeque<ToSwarm<ControlEvent, THandlerInEvent<Protocols<E>>>>,
 }
 
@@ -507,6 +596,24 @@ fn single_success<E: EthSpec>(chunks: Vec<ReceivedChunk<E>>) -> Option<Response<
     }
 }
 
+/// Why a peer's BeaconBlocksByRange request is semantically invalid, if it is: `step` 0 ("must
+/// be set to 1", `phase0/p2p-interface.md` L1514), or a `count` above
+/// [`MAX_REQUEST_BLOCKS_DENEB`] ("No more than `MAX_REQUEST_BLOCKS_DENEB` may be requested at a
+/// time", `deneb/p2p-interface.md` L876). A `step` above 1 is not refused: a responder may
+/// answer it with a single block during the deprecation (`phase0` L1514–1515).
+fn out_of_bounds(range: &BlocksByRangeV2Request) -> Option<String> {
+    if range.step == 0 {
+        Some("step 0, must be 1".to_owned())
+    } else if range.count > MAX_REQUEST_BLOCKS_DENEB {
+        Some(format!(
+            "count {} above MAX_REQUEST_BLOCKS_DENEB {MAX_REQUEST_BLOCKS_DENEB}",
+            range.count
+        ))
+    } else {
+        None
+    }
+}
+
 fn unix_ms(at: SystemTime) -> u128 {
     at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis())
 }
@@ -530,23 +637,20 @@ impl<E: EthSpec> Control<E> {
             metrics,
             peers: HashMap::new(),
             goodbyes: HashMap::new(),
+            goodbye_answers: HashMap::new(),
             in_flight: HashSet::new(),
             blocks_in_flight: HashMap::new(),
             blocks: HashMap::new(),
             next_ticket: 0,
+            timer: None,
             pending: VecDeque::new(),
         }
     }
 
-    /// Our MetaData now.
+    /// Our MetaData now: one snapshot of the [`MetaDataSource`].
     #[must_use]
     pub fn local_metadata(&self) -> MetaDataV3 {
-        MetaDataV3 {
-            seq_number: self.cfg.metadata.seq_number(),
-            attnets: Default::default(),
-            syncnets: Default::default(),
-            custody_group_count: self.cfg.custody_group_count,
-        }
+        self.cfg.metadata.metadata()
     }
 
     /// Sends `request` to `peer` in a free slot of its protocol, or queues it; `false` if the
@@ -561,6 +665,10 @@ impl<E: EthSpec> Control<E> {
 
     fn submit_outgoing(&mut self, outgoing: Outgoing) -> bool {
         let protocol = outgoing.request.protocol();
+        if self.leaving(outgoing.peer) && !matches!(outgoing.request, Request::Goodbye(_)) {
+            tracing::debug!(peer = %outgoing.peer, %protocol, "after a Goodbye: request not sent");
+            return false;
+        }
         let taken = match self.outbound.submit(protocol, outgoing) {
             Admit::Start(outgoing) => {
                 self.dispatch(outgoing);
@@ -605,17 +713,29 @@ impl<E: EthSpec> Control<E> {
         if !self.in_flight.remove(&(protocol, id)) {
             return;
         }
+        if protocol == Protocol::PingV1 {
+            // Pings hold no shared slot ([`Control::ping`]).
+            self.metrics
+                .set_outbound_inflight(protocol, self.pings_in_flight());
+            return;
+        }
         while let Some(next) = self.outbound.release(protocol) {
             let peer = next.peer;
-            let refusal = if self.peers.contains_key(&peer) {
+            let refusal = match self.peers.get(&peer) {
+                // Nothing but our Goodbye goes out once either side said Goodbye.
+                Some(state) if state.leaving() && !matches!(next.request, Request::Goodbye(_)) => {
+                    tracing::debug!(%peer, %protocol, "after our Goodbye: the waiting request is dropped");
+                    Some(OutboundError::Disconnected)
+                }
                 // The peer's Status may have changed while the request waited.
-                match &next.request {
+                Some(_) => match &next.request {
                     Request::BlocksByRange(range) => self.servable(peer, range).err(),
                     _ => None,
+                },
+                None => {
+                    tracing::debug!(%peer, %protocol, "the peer left: its waiting request is dropped");
+                    Some(OutboundError::Disconnected)
                 }
-            } else {
-                tracing::debug!(%peer, %protocol, "the peer left: its waiting request is dropped");
-                Some(OutboundError::Disconnected)
             };
             let Some(error) = refusal else {
                 self.dispatch(next);
@@ -640,8 +760,9 @@ impl<E: EthSpec> Control<E> {
     /// # Errors
     ///
     /// [`RangeError::Outbound`] with [`OutboundError::InvalidRequest`] for a request outside the
-    /// protocol's limits or the peer's range, or to a peer without a valid Status;
-    /// [`RangeError::Ignored`] if the wait queue is full. None is sent.
+    /// protocol's limits or the peer's range, or to a peer without a valid Status; with
+    /// [`OutboundError::Disconnected`] once either side said Goodbye; [`RangeError::Ignored`] if
+    /// the wait queue is full. None is sent.
     pub fn request_blocks(
         &mut self,
         peer: PeerId,
@@ -649,6 +770,9 @@ impl<E: EthSpec> Control<E> {
     ) -> Result<BlocksTicket, RangeError> {
         check_request(&request)?;
         self.servable(peer, &request)?;
+        if self.leaving(peer) {
+            return Err(OutboundError::Disconnected.into());
+        }
         let ticket = BlocksTicket(self.next_ticket);
         self.next_ticket += 1;
         self.blocks.insert(ticket, None);
@@ -663,6 +787,11 @@ impl<E: EthSpec> Control<E> {
             self.blocks.remove(&ticket);
             Err(RangeError::Ignored)
         }
+    }
+
+    /// Whether either side said Goodbye to `peer`: nothing but our Goodbye goes out to it.
+    fn leaving(&self, peer: PeerId) -> bool {
+        self.peers.get(&peer).is_some_and(PeerState::leaving)
     }
 
     /// Whether `peer` can serve `request` by its last Status: valid, with
@@ -739,10 +868,55 @@ impl<E: EthSpec> Control<E> {
         self.submit(peer, Request::Status(ours))
     }
 
-    /// Pings `peer` with our `seq_number`.
+    /// Pings `peer` with our `seq_number`, unless a Ping to it is in flight or either side said
+    /// Goodbye.
+    ///
+    /// A Ping takes no slot of the shared outbound lane: it goes out at once, at most one per
+    /// peer. The lane's 2 slots are shared by every peer, and a Ping waiting there opens no
+    /// stream, so the connection's idle timer would run on; at 160 peers the 10.7 Pings/s would
+    /// not fit it once Pings take over ~190 ms, and a few peers that never answer would hold
+    /// it. One Ping per peer stays within `MAX_CONCURRENT_REQUESTS` ("The requester MUST NOT
+    /// make more than `MAX_CONCURRENT_REQUESTS` concurrent requests with the same protocol
+    /// ID", `phase0/p2p-interface.md` L1228–1229). That limit is per peer: it is what each
+    /// responder counts ("peers that concurrently open more than `MAX_CONCURRENT_REQUESTS`
+    /// streams for the same request type", L1310–1312).
     pub fn ping(&mut self, peer: PeerId) {
-        let ours = self.cfg.metadata.seq_number();
-        self.submit(peer, Request::Ping(Ping(ours)));
+        let Some(state) = self.peers.get(&peer) else {
+            return;
+        };
+        if state.leaving() || state.ping.is_some() {
+            return;
+        }
+        let ours = self.local_metadata().seq_number;
+        let request = Request::Ping(Ping(ours));
+        let id = self
+            .inner
+            .of(Protocol::PingV1)
+            .send_request(&peer, request.into());
+        self.in_flight.insert((Protocol::PingV1, id));
+        if let Some(state) = self.peers.get_mut(&peer) {
+            state.ping = Some(id);
+        }
+        self.metrics
+            .set_outbound_inflight(Protocol::PingV1, self.pings_in_flight());
+    }
+
+    /// Our Pings in flight, at most one per peer.
+    fn pings_in_flight(&self) -> usize {
+        self.in_flight
+            .iter()
+            .filter(|(protocol, _)| *protocol == Protocol::PingV1)
+            .count()
+    }
+
+    /// Our Ping `id` to `peer` ended: the next is due an interval from now.
+    fn ping_done(&mut self, peer: PeerId, id: OutboundRequestId) {
+        if let Some(state) = self.peers.get_mut(&peer) {
+            if state.ping == Some(id) {
+                state.ping = None;
+                state.next_ping = Instant::now() + self.cfg.ping_interval;
+            }
+        }
     }
 
     /// Requests `peer`'s MetaData, unless a request is already open.
@@ -778,6 +952,53 @@ impl<E: EthSpec> Control<E> {
             "goodbye_sent"
         );
         self.submit(peer, Request::Goodbye(Goodbye(reason)));
+    }
+
+    /// Closes every connection whose Goodbye linger ended, pings every peer whose Ping is due
+    /// (none once either side said Goodbye, none while one is in flight), and sets the timer
+    /// for the next of these; `cx` is woken then.
+    fn poll_timers(&mut self, cx: &mut Context<'_>) {
+        let pinging = !self.cfg.ping_interval.is_zero();
+        let waiting = |state: &PeerState| pinging && !state.leaving() && state.ping.is_none();
+        loop {
+            let now = Instant::now();
+            let mut closes = Vec::new();
+            let mut pings = Vec::new();
+            for (peer, state) in &mut self.peers {
+                if state.close_at.is_some_and(|at| at <= now) {
+                    state.close_at = None;
+                    closes.push(*peer);
+                }
+                if waiting(state) && state.next_ping <= now {
+                    pings.push(*peer);
+                }
+            }
+            for peer in closes {
+                self.close(peer);
+            }
+            for peer in pings {
+                self.ping(peer);
+            }
+            let next = self
+                .peers
+                .values()
+                .flat_map(|state| [state.close_at, waiting(state).then_some(state.next_ping)])
+                .flatten()
+                .min();
+            let Some(next) = next else {
+                self.timer = None;
+                return;
+            };
+            let timer = self
+                .timer
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(next)));
+            if timer.deadline() != next {
+                timer.as_mut().reset(next);
+            }
+            if timer.as_mut().poll(cx).is_pending() {
+                return;
+            }
+        }
     }
 
     fn close(&mut self, peer: PeerId) {
@@ -826,12 +1047,18 @@ impl<E: EthSpec> Control<E> {
         }
     }
 
-    /// A `seq_number` the peer announced: fetch its MetaData if it is newer than ours of it.
+    /// A `seq_number` the peer announced: fetch its MetaData if it is newer than ours of it. While
+    /// our request is open, the announcement is kept for when it ends ([`Self::metadata_done`]).
     fn on_peer_seq(&mut self, peer: PeerId, seq_number: u64) {
-        let Some(state) = self.peers.get(&peer) else {
+        let Some(state) = self.peers.get_mut(&peer) else {
             return;
         };
-        if state.metadata_seq.is_none_or(|known| seq_number > known) {
+        if state.metadata_seq.is_some_and(|known| seq_number <= known) {
+            return;
+        }
+        if state.metadata_open {
+            state.metadata_announced = state.metadata_announced.max(Some(seq_number));
+        } else {
             self.request_metadata(peer);
         }
     }
@@ -844,7 +1071,7 @@ impl<E: EthSpec> Control<E> {
         protocol: Protocol,
         channel: ResponseChannel<Answer<E>>,
         chunks: Vec<ReceivedChunk<E>>,
-    ) {
+    ) -> bool {
         let pacer = ChunkPacer::new(
             Arc::clone(&self.limiter),
             peer,
@@ -855,20 +1082,22 @@ impl<E: EthSpec> Control<E> {
             chunks,
             pacer: Some(pacer),
         };
-        if self
+        let sent = self
             .inner
             .of(protocol)
             .send_response(channel, answer)
-            .is_err()
-        {
+            .is_ok();
+        if !sent {
             tracing::debug!(%protocol, "the stream closed before our response");
         }
+        sent
     }
 
     fn on_request(
         &mut self,
         peer: PeerId,
         protocol: Protocol,
+        request_id: InboundRequestId,
         request: RpcRequest,
         channel: ResponseChannel<Answer<E>>,
     ) {
@@ -877,9 +1106,12 @@ impl<E: EthSpec> Control<E> {
             RpcRequest::Malformed(error) => {
                 self.metrics.invalid_data(Direction::Inbound);
                 tracing::debug!(%peer, %protocol, %error, "malformed request");
-                if protocol != Protocol::GoodbyeV1 {
-                    let answer = error_chunk(ResultCode::InvalidRequest, &error.to_string());
-                    self.respond(peer, protocol, channel, answer);
+                let answer = error_chunk(ResultCode::InvalidRequest, &error.to_string());
+                let answered = self.respond(peer, protocol, channel, answer);
+                // A Goodbye answer has no quota: a malformed one ends the connection like a
+                // valid one, so a peer cannot loop on decode, error and write.
+                if protocol == Protocol::GoodbyeV1 {
+                    self.linger_after(peer, request_id, answered);
                 }
                 return;
             }
@@ -898,18 +1130,32 @@ impl<E: EthSpec> Control<E> {
                 self.respond(peer, protocol, channel, answer);
             }
             Request::Ping(Ping(seq_number)) => {
-                let ours = self.cfg.metadata.seq_number();
+                let ours = self.local_metadata().seq_number;
                 let answer = success_chunk(Response::Ping(Ping(ours)));
                 self.respond(peer, protocol, channel, answer);
                 self.on_peer_seq(peer, seq_number);
             }
             Request::Goodbye(Goodbye(reason)) => {
-                // No response chunk: dropping the channel closes the stream.
-                drop(channel);
-                self.on_goodbye(peer, reason);
+                // One chunk, its reason the peer's own: the spec says the response is a single
+                // chunk of the same `uint64` content (`phase0` L1461, L1483), not which value.
+                // The connection closes once it went out (or failed), not before.
+                // Only the first Goodbye is counted, logged and reported; a later one is still
+                // answered, and moves no close already set.
+                let answer = success_chunk(Response::Goodbye(Goodbye(reason)));
+                let answered = self.respond(peer, protocol, channel, answer);
+                self.linger_after(peer, request_id, answered);
+                if self.peers.get(&peer).is_some_and(|s| !s.goodbye_received) {
+                    self.on_goodbye(peer, reason);
+                }
             }
-            Request::BlocksByRange(_) => {
-                let answer = error_chunk(ResultCode::ResourceUnavailable, "no blocks stored");
+            Request::BlocksByRange(range) => {
+                let answer = match out_of_bounds(&range) {
+                    Some(why) => {
+                        tracing::debug!(%peer, %why, "BlocksByRange request out of bounds");
+                        error_chunk(ResultCode::InvalidRequest, &why)
+                    }
+                    None => error_chunk(ResultCode::ResourceUnavailable, "no blocks stored"),
+                };
                 self.respond(peer, protocol, channel, answer);
             }
         }
@@ -922,6 +1168,9 @@ impl<E: EthSpec> Control<E> {
         let status_valid = StatusValidity::from(state.status_valid);
         let direction = state.direction;
         let at = SystemTime::now();
+        if let Some(state) = self.peers.get_mut(&peer) {
+            state.goodbye_received = true;
+        }
         self.metrics.goodbye_received(reason, status_valid);
         tracing::info!(
             %peer,
@@ -938,7 +1187,29 @@ impl<E: EthSpec> Control<E> {
             direction,
             at,
         });
-        self.close(peer);
+    }
+
+    /// Our answer to `peer`'s Goodbye `id` was handed to its stream (`answered`), or the
+    /// stream was gone: the connection closes once the answer went out, or now.
+    fn linger_after(&mut self, peer: PeerId, id: InboundRequestId, answered: bool) {
+        if answered {
+            self.goodbye_answers.insert(id, peer);
+        } else {
+            self.close(peer);
+        }
+    }
+
+    /// Our answer to a peer's Goodbye (`id`) went out or failed: the connection closes a
+    /// [`GOODBYE_LINGER`] on, unless the peer closes it first, so the peer can read the answer
+    /// before the connection goes. A close already set stays: later Goodbyes never move it.
+    fn goodbye_answered(&mut self, id: InboundRequestId) {
+        if let Some(peer) = self.goodbye_answers.remove(&id) {
+            if let Some(state) = self.peers.get_mut(&peer) {
+                state
+                    .close_at
+                    .get_or_insert_with(|| Instant::now() + GOODBYE_LINGER);
+            }
+        }
     }
 
     fn on_response(
@@ -949,23 +1220,28 @@ impl<E: EthSpec> Control<E> {
         chunks: Vec<ReceivedChunk<E>>,
     ) {
         self.finished(protocol, id);
+        if protocol == Protocol::PingV1 {
+            self.ping_done(peer, id);
+        }
         match protocol {
             Protocol::GoodbyeV1 => self.on_goodbye_done(id),
-            Protocol::MetaDataV3 => {
-                self.metadata_done(peer);
-                match single_success(chunks) {
-                    Some(Response::MetaData(metadata)) => {
-                        if let Some(state) = self.peers.get_mut(&peer) {
-                            state.metadata_seq = Some(metadata.seq_number);
-                        }
-                        self.emit(ControlEvent::MetaData {
-                            peer,
-                            metadata: Box::new(metadata),
-                        });
+            Protocol::MetaDataV3 => match single_success(chunks) {
+                Some(Response::MetaData(metadata)) => {
+                    let seq_number = metadata.seq_number;
+                    if let Some(state) = self.peers.get_mut(&peer) {
+                        state.metadata_seq = Some(seq_number);
                     }
-                    other => tracing::debug!(%peer, ?other, "no MetaData in the response"),
+                    self.emit(ControlEvent::MetaData {
+                        peer,
+                        metadata: Box::new(metadata),
+                    });
+                    self.metadata_done(peer, Some(seq_number));
                 }
-            }
+                other => {
+                    tracing::debug!(%peer, ?other, "no MetaData in the response");
+                    self.metadata_done(peer, None);
+                }
+            },
             Protocol::StatusV2 => match single_success(chunks) {
                 Some(Response::Status(theirs)) => self.judge(peer, theirs),
                 other => tracing::debug!(%peer, ?other, "no Status in the response: ignored"),
@@ -984,10 +1260,17 @@ impl<E: EthSpec> Control<E> {
         }
     }
 
-    /// Our one MetaData request to `peer` finished.
-    fn metadata_done(&mut self, peer: PeerId) {
-        if let Some(state) = self.peers.get_mut(&peer) {
-            state.metadata_open = false;
+    /// Our one MetaData request to `peer` finished, with a MetaData of `got` if it brought one.
+    /// A `seq_number` announced meanwhile and above `got` is asked for once more now; a failed
+    /// request drops it, and the next announcement asks again.
+    fn metadata_done(&mut self, peer: PeerId, got: Option<u64>) {
+        let Some(state) = self.peers.get_mut(&peer) else {
+            return;
+        };
+        state.metadata_open = false;
+        let announced = state.metadata_announced.take();
+        if got.is_some_and(|got| announced.is_some_and(|a| a > got)) {
+            self.request_metadata(peer);
         }
     }
 
@@ -1005,6 +1288,9 @@ impl<E: EthSpec> Control<E> {
         error: OutboundFailure,
     ) {
         self.finished(protocol, id);
+        if protocol == Protocol::PingV1 {
+            self.ping_done(peer, id);
+        }
         // The codec counts its own deadlines; `request_response`'s is the whole exchange.
         match &error {
             OutboundFailure::Timeout => self.metrics.timed_out(Deadline::Total),
@@ -1016,9 +1302,9 @@ impl<E: EthSpec> Control<E> {
         }
         tracing::debug!(%peer, %protocol, %error, "outbound request failed");
         match protocol {
-            // A Goodbye has no response: a failure after sending is expected.
+            // A peer may close without answering our Goodbye: a failure after it is expected.
             Protocol::GoodbyeV1 => self.on_goodbye_done(id),
-            Protocol::MetaDataV3 => self.metadata_done(peer),
+            Protocol::MetaDataV3 => self.metadata_done(peer, None),
             _ => {}
         }
         // Request IDs are numbered per behaviour: only a BlocksByRange ID names a ticket.
@@ -1053,12 +1339,27 @@ impl<E: EthSpec> Control<E> {
                 peer,
                 message:
                     Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
-            }) => self.on_request(peer, protocol, request, channel),
-            DuplexEvent::Inbound(Event::InboundFailure { peer, error, .. }) => {
+            }) => self.on_request(peer, protocol, request_id, request, channel),
+            DuplexEvent::Inbound(Event::InboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            }) => {
+                if protocol == Protocol::GoodbyeV1 {
+                    self.goodbye_answered(request_id);
+                }
                 self.on_inbound_failure(peer, protocol, error);
+            }
+            DuplexEvent::Inbound(Event::ResponseSent { request_id, .. })
+                if protocol == Protocol::GoodbyeV1 =>
+            {
+                self.goodbye_answered(request_id);
             }
             DuplexEvent::Outbound(Event::Message {
                 peer,
@@ -1162,7 +1463,12 @@ impl<E: EthSpec> NetworkBehaviour for Control<E> {
                         status: None,
                         metadata_seq: None,
                         metadata_open: false,
+                        metadata_announced: None,
                         goodbye_sent: false,
+                        goodbye_received: false,
+                        close_at: None,
+                        ping: None,
+                        next_ping: Instant::now() + self.cfg.ping_interval,
                     },
                 );
                 if direction == Direction::Outbound {
@@ -1176,6 +1482,10 @@ impl<E: EthSpec> NetworkBehaviour for Control<E> {
                     }
                 }
                 self.goodbyes.retain(|_, peer| *peer != c.peer_id);
+                self.goodbye_answers.retain(|_, peer| *peer != c.peer_id);
+                // Its Pings in flight end with the connection; their IDs go too.
+                self.metrics
+                    .set_outbound_inflight(Protocol::PingV1, self.pings_in_flight());
                 // Its streams' unsent chunks refund themselves as the streams drop.
                 let peers = &self.peers;
                 self.limiter
@@ -1202,6 +1512,9 @@ impl<E: EthSpec> NetworkBehaviour for Control<E> {
         cx: &mut Context<'_>,
     ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         loop {
+            // Each event may have ended a Ping, whose peer is due again an interval on, or a
+            // Goodbye answer, whose connection closes a linger on.
+            self.poll_timers(cx);
             if let Some(next) = self.pending.pop_front() {
                 return Poll::Ready(next);
             }
@@ -1221,6 +1534,7 @@ mod tests {
     use super::*;
     use ethswarm_proto::common;
     use p2p_wire::testkit;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn relevance_checks_digest_then_finalized() {
@@ -1310,10 +1624,6 @@ mod tests {
         assert_eq!(shared.status(), None);
         shared.set(testkit::status());
         assert_eq!(shared.status(), Some(testkit::status()));
-        let seq = AtomicU64::new(3);
-        assert_eq!(seq.seq_number(), 3);
-        seq.store(4, Ordering::Release);
-        assert_eq!(MetaDataSource::seq_number(&seq), 4);
     }
 
     #[test]
@@ -1421,9 +1731,17 @@ mod tests {
         n: usize,
         queue_len: usize,
     ) -> (Control<consensus_types::Minimal>, RpcMetrics, Vec<PeerId>) {
-        let metrics = RpcMetrics::register(&mut prometheus_client::registry::Registry::default());
         let mut cfg = crate::testkit::control_config(Some(testkit::status()));
         cfg.limits.outbound_queue_len = queue_len;
+        control_with(cfg, n)
+    }
+
+    /// A Control under `cfg` with `n` inbound peers connected.
+    fn control_with(
+        cfg: ControlConfig,
+        n: usize,
+    ) -> (Control<consensus_types::Minimal>, RpcMetrics, Vec<PeerId>) {
+        let metrics = RpcMetrics::register(&mut prometheus_client::registry::Registry::default());
         let mut control = Control::new(cfg, metrics.clone());
         let peers: Vec<PeerId> = (0..n).map(|_| PeerId::random()).collect();
         for (i, peer) in peers.iter().enumerate() {
@@ -1474,12 +1792,29 @@ mod tests {
         }
     }
 
+    /// The peer whose Ping `id` is, if `protocol` is Ping.
+    fn pinged(
+        control: &Control<consensus_types::Minimal>,
+        id: OutboundRequestId,
+        protocol: Protocol,
+    ) -> Option<PeerId> {
+        (protocol == Protocol::PingV1)
+            .then(|| {
+                control
+                    .peers
+                    .iter()
+                    .find(|(_, state)| state.ping == Some(id))
+                    .map(|(peer, _)| *peer)
+            })
+            .flatten()
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
 
         /// Requests on three protocols to eight peers, finishing in random order: the slots a
         /// protocol holds are always its own requests in flight, never above 2, and all come
-        /// back once everything finished.
+        /// back once everything finished. Pings take no slot: at most one per peer.
         #[test]
         fn mixed_protocols_free_only_their_own_slots(
             steps in proptest::collection::vec(
@@ -1501,16 +1836,24 @@ mod tests {
                     let mut open: Vec<_> = control.in_flight.iter().copied().collect();
                     open.sort_unstable_by_key(|(p, id)| (format!("{p}"), *id));
                     let (q, id) = open[pick % open.len()];
-                    control.on_outbound_failure(peers[k], q, id, OutboundFailure::Timeout);
+                    let peer = pinged(&control, id, q).unwrap_or(peers[k]);
+                    control.on_outbound_failure(peer, q, id, OutboundFailure::Timeout);
                 }
                 for q in protocols {
                     let open = control.in_flight.iter().filter(|(p, _)| *p == q).count();
-                    proptest::prop_assert_eq!(open, control.outbound.in_flight(q));
-                    proptest::prop_assert!(open <= MAX_CONCURRENT_REQUESTS);
+                    if q == Protocol::PingV1 {
+                        let pinged = control.peers.values().filter(|s| s.ping.is_some()).count();
+                        proptest::prop_assert_eq!(open, pinged);
+                        proptest::prop_assert_eq!(control.outbound.in_flight(q), 0);
+                    } else {
+                        proptest::prop_assert_eq!(open, control.outbound.in_flight(q));
+                        proptest::prop_assert!(open <= MAX_CONCURRENT_REQUESTS);
+                    }
                 }
             }
             while let Some(&(q, id)) = control.in_flight.iter().next() {
-                control.on_outbound_failure(peers[0], q, id, OutboundFailure::Timeout);
+                let peer = pinged(&control, id, q).unwrap_or(peers[0]);
+                control.on_outbound_failure(peer, q, id, OutboundFailure::Timeout);
             }
             for q in protocols {
                 proptest::prop_assert_eq!(control.outbound.in_flight(q), 0);
@@ -1717,7 +2060,8 @@ mod tests {
         assert_eq!(control.outbound.in_flight(p), 0);
         assert_eq!(metrics.outbound_inflight(p), 0);
 
-        // A waiting request whose peer's Status turns invalid is refused the same way.
+        // A waiting request whose peer's Status turns invalid is dropped: that peer got our
+        // Goodbye, and nothing else goes out after it.
         control.judge(served, from(0));
         let tickets: Vec<_> = (0..3)
             .map(|_| control.request_blocks(served, at(64)).unwrap())
@@ -1738,7 +2082,7 @@ mod tests {
         control.on_response(served, p, id, Vec::new());
         assert!(matches!(
             control.take_blocks(tickets[2]),
-            Some(Err(OutboundError::InvalidRequest(_)))
+            Some(Err(OutboundError::Disconnected))
         ));
         assert_eq!(control.outbound.in_flight(p), 1);
     }
@@ -1771,15 +2115,386 @@ mod tests {
         assert!(control.status_valid_peers().is_empty());
     }
 
+    /// A source whose MetaData changes on every read: `seq_number` and `custody_group_count`
+    /// both `n` on the `n`th.
+    #[derive(Default)]
+    struct Ticking(AtomicU64);
+
+    impl MetaDataSource for Ticking {
+        fn metadata(&self) -> MetaDataV3 {
+            let n = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+            MetaDataV3 {
+                seq_number: n,
+                attnets: Default::default(),
+                syncnets: Default::default(),
+                custody_group_count: n,
+            }
+        }
+    }
+
+    #[test]
+    fn local_metadata_is_one_snapshot() {
+        let cfg = ControlConfig {
+            metadata: Arc::new(Ticking::default()),
+            ..crate::testkit::control_config(None)
+        };
+        let control = Control::<consensus_types::Minimal>::new(
+            cfg,
+            RpcMetrics::register(&mut prometheus_client::registry::Registry::default()),
+        );
+        // Each read is one snapshot: the seq_number numbers the fields it came with.
+        for _ in 0..3 {
+            let metadata = control.local_metadata();
+            assert_eq!(metadata.seq_number, metadata.custody_group_count);
+        }
+    }
+
+    #[test]
+    fn shared_metadata_replaces_every_field_at_once() {
+        let metadata = |seq_number, custody_group_count| MetaDataV3 {
+            seq_number,
+            attnets: Default::default(),
+            syncnets: Default::default(),
+            custody_group_count,
+        };
+        let shared = SharedMetaData::new(metadata(1, 4));
+        assert_eq!(shared.metadata(), metadata(1, 4));
+        shared.set(metadata(2, 8));
+        assert_eq!(MetaDataSource::metadata(&shared), metadata(2, 8));
+    }
+
+    #[test]
+    fn a_seq_announced_while_our_request_is_open_is_fetched_next() {
+        let (mut control, _, peers) = control_with_peers(1, 8);
+        let peer = peers[0];
+        let open = |control: &Control<consensus_types::Minimal>| -> Vec<OutboundRequestId> {
+            control
+                .in_flight
+                .iter()
+                .filter(|(p, _)| *p == Protocol::MetaDataV3)
+                .map(|(_, id)| *id)
+                .collect()
+        };
+        let answer = |seq_number| {
+            success_chunk::<consensus_types::Minimal>(Response::MetaData(MetaDataV3 {
+                seq_number,
+                ..testkit::metadata()
+            }))
+        };
+        // The peer announces 9: one request. It announces 10 while that one is open.
+        control.on_peer_seq(peer, 9);
+        let [first] = open(&control)[..] else {
+            panic!("one request")
+        };
+        control.on_peer_seq(peer, 10);
+        control.on_peer_seq(peer, 10);
+        assert_eq!(
+            open(&control),
+            [first],
+            "no second request while one is open"
+        );
+        // The answer is the old MetaData: 10 is asked for once more, right away.
+        control.on_response(peer, Protocol::MetaDataV3, first, answer(9));
+        let [second] = open(&control)[..] else {
+            panic!("one more request")
+        };
+        assert_ne!(second, first);
+        // That answer still says 9 (the peer lags its own Ping): no third request until the
+        // next announcement.
+        control.on_response(peer, Protocol::MetaDataV3, second, answer(9));
+        assert!(open(&control).is_empty());
+        assert_eq!(control.peers[&peer].metadata_seq, Some(9));
+        control.on_peer_seq(peer, 10);
+        let [third] = open(&control)[..] else {
+            panic!("a request for the next announcement")
+        };
+        // An answer that catches up with the announcement asks for nothing more, nor does a
+        // failed request leave one pending.
+        control.on_response(peer, Protocol::MetaDataV3, third, answer(10));
+        assert!(open(&control).is_empty());
+        control.on_peer_seq(peer, 11);
+        let [fourth] = open(&control)[..] else {
+            panic!("a request for 11")
+        };
+        control.on_peer_seq(peer, 12);
+        control.on_outbound_failure(peer, Protocol::MetaDataV3, fourth, OutboundFailure::Timeout);
+        assert!(open(&control).is_empty());
+        assert_eq!(control.peers[&peer].metadata_seq, Some(10));
+    }
+
+    /// Polls `control` once, as the swarm would.
+    fn poll_once(control: &mut Control<consensus_types::Minimal>) {
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        while control.poll(&mut cx).is_ready() {}
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_peer_is_pinged_each_interval_until_our_goodbye() {
+        let interval = Duration::from_secs(1);
+        let cfg = ControlConfig {
+            ping_interval: interval,
+            ..crate::testkit::control_config(Some(testkit::status()))
+        };
+        let (mut control, _, peers) = control_with(cfg, 2);
+        let pings = |control: &mut Control<consensus_types::Minimal>| {
+            let open: Vec<_> = control
+                .peers
+                .iter()
+                .filter_map(|(peer, state)| state.ping.map(|id| (*peer, id)))
+                .collect();
+            for &(peer, id) in &open {
+                control.on_outbound_failure(peer, Protocol::PingV1, id, OutboundFailure::Timeout);
+            }
+            open.len()
+        };
+        // Connected now: the first Ping is one interval away, then one each interval.
+        poll_once(&mut control);
+        assert_eq!(pings(&mut control), 0);
+        for _ in 0..2 {
+            tokio::time::advance(interval).await;
+            poll_once(&mut control);
+            assert_eq!(pings(&mut control), 2, "one each");
+        }
+        poll_once(&mut control);
+        let next = control.timer.as_ref().unwrap().deadline();
+        assert_eq!(next, control.peers[&peers[0]].next_ping);
+        // After our Goodbye a peer is pinged no more; with none left, no timer.
+        for peer in &peers {
+            control.goodbye(*peer, GOODBYE_CLIENT_SHUTDOWN);
+        }
+        tokio::time::advance(interval).await;
+        poll_once(&mut control);
+        assert_eq!(pings(&mut control), 0);
+        assert!(control.timer.is_none());
+    }
+
+    /// Answers or fails every Ping of `control` that is due by `answers` (Ping ID → when, and
+    /// whether it is answered); notes each new one, at `now`, in `sent` (peer → send times).
+    fn run_pings(
+        control: &mut Control<consensus_types::Minimal>,
+        now: Instant,
+        answers: &mut HashMap<OutboundRequestId, (PeerId, Instant, bool)>,
+        sent: &mut HashMap<PeerId, Vec<Instant>>,
+        delay: impl Fn(PeerId, usize) -> Option<Duration>,
+    ) {
+        let due: Vec<_> = answers
+            .iter()
+            .filter(|(_, (_, at, _))| *at <= now)
+            .map(|(id, (peer, _, answered))| (*id, *peer, *answered))
+            .collect();
+        for (id, peer, answered) in due {
+            answers.remove(&id);
+            if answered {
+                let pong = success_chunk(Response::Ping(Ping(1)));
+                control.on_response(peer, Protocol::PingV1, id, pong);
+            } else {
+                control.on_outbound_failure(peer, Protocol::PingV1, id, OutboundFailure::Timeout);
+            }
+        }
+        poll_once(control);
+        let open: Vec<_> = control
+            .peers
+            .iter()
+            .filter_map(|(peer, state)| state.ping.map(|id| (*peer, id)))
+            .collect();
+        for (peer, id) in open {
+            if let std::collections::hash_map::Entry::Vacant(slot) = answers.entry(id) {
+                let times = sent.entry(peer).or_default();
+                times.push(now);
+                // `None`: never answered; the first-byte deadline fails it at 5 s.
+                let (after, answered) = delay(peer, times.len() - 1)
+                    .map_or((Duration::from_secs(5), false), |d| (d, true));
+                slot.insert((peer, now + after, answered));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pings_to_160_peers_keep_every_healthy_connection_up() {
+        // A full swarm: 6 peers never answer (each Ping holds its stream for the 5 s first-byte
+        // deadline), the other 154 answer in 300 ms. Through one shared 2-slot lane that is
+        // 10.7 Pings/s needing over 3 slots: the queue would grow without end and healthy
+        // connections would sit idle past the 30 s timeout. Each peer's own Ping lane keeps
+        // every connection's quiet gaps under it.
+        let idle = crate::transport::DEFAULT_IDLE_CONNECTION_TIMEOUT;
+        let (mut control, metrics, peers) = control_with_peers(160, 256);
+        let silent: HashSet<PeerId> = peers[..6].iter().copied().collect();
+        let start = Instant::now();
+        let mut answers = HashMap::new();
+        let mut sent: HashMap<PeerId, Vec<Instant>> = HashMap::new();
+        let step = Duration::from_millis(100);
+        let mut most_open = 0;
+        while start.elapsed() < Duration::from_secs(600) {
+            tokio::time::advance(step).await;
+            let now = Instant::now();
+            run_pings(&mut control, now, &mut answers, &mut sent, |peer, _| {
+                (!silent.contains(&peer)).then_some(Duration::from_millis(300))
+            });
+            most_open = most_open.max(metrics.outbound_inflight(Protocol::PingV1));
+        }
+        for peer in peers.iter().filter(|p| !silent.contains(p)) {
+            let times = &sent[peer];
+            // Quiet from connecting until the first Ping, then between two Pings: each Ping
+            // stream lasts 300 ms, so the gap is the time between sends less that.
+            let mut quiet_from = start;
+            for at in times {
+                assert!(
+                    *at - quiet_from < idle,
+                    "{peer}: quiet {:?}",
+                    *at - quiet_from
+                );
+                quiet_from = *at + Duration::from_millis(300);
+            }
+            assert!(times.len() >= 600 / 16, "{peer}: {} Pings", times.len());
+        }
+        // More Pings than the shared lane's 2 slots were open at once.
+        assert!(most_open > MAX_CONCURRENT_REQUESTS as i64, "{most_open}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_ping_is_never_followed_by_a_burst() {
+        // The peer holds our first Ping 40 s. No second Ping goes out while it is open, and the
+        // next one comes an interval after it ended: never 3 (Lighthouse's limit is 2) in 10 s.
+        let (mut control, _, peers) = control_with_peers(1, 8);
+        let start = Instant::now();
+        let mut answers = HashMap::new();
+        let mut sent: HashMap<PeerId, Vec<Instant>> = HashMap::new();
+        while start.elapsed() < Duration::from_secs(120) {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            run_pings(
+                &mut control,
+                Instant::now(),
+                &mut answers,
+                &mut sent,
+                |_, n| Some(Duration::from_millis(if n == 0 { 40_000 } else { 50 })),
+            );
+        }
+        let times = &sent[&peers[0]];
+        let offsets: Vec<u64> = times.iter().map(|t| (*t - start).as_secs()).collect();
+        assert_eq!(offsets[..2], [15, 70], "{offsets:?}");
+        for pair in times.windows(2) {
+            assert!(pair[1] - pair[0] >= PING_INTERVAL, "{offsets:?}");
+        }
+    }
+
+    #[test]
+    fn nothing_but_the_goodbye_goes_out_after_it() {
+        let (mut control, _, peers) = control_with_peers(3, 8);
+        // Two Status requests hold the lane's slots; a third, to the peer we then say
+        // Goodbye to, waits.
+        for peer in &peers {
+            assert!(control.send_status(*peer));
+        }
+        let bye = peers[2];
+        control.goodbye(bye, GOODBYE_CLIENT_SHUTDOWN);
+        // No Ping to it from now on, by hand or by the cadence.
+        control.ping(bye);
+        assert!(control.peers[&bye].ping.is_none());
+        // The waiting Status is dropped when its turn comes, not sent after the Goodbye.
+        let first = *control
+            .in_flight
+            .iter()
+            .find(|(p, _)| *p == Protocol::StatusV2)
+            .unwrap();
+        control.on_outbound_failure(peers[0], first.0, first.1, OutboundFailure::Timeout);
+        assert_eq!(control.outbound.in_flight(Protocol::StatusV2), 1);
+        // The other peers are still pinged.
+        control.ping(peers[0]);
+        assert!(control.peers[&peers[0]].ping.is_some());
+    }
+
+    #[test]
+    fn late_answers_send_nothing_after_our_goodbye() {
+        let (mut control, _, peers) = control_with_peers(2, 8);
+        let (late_pong, refetch) = (peers[0], peers[1]);
+        let metadata_requests = |control: &Control<consensus_types::Minimal>| {
+            control
+                .in_flight
+                .iter()
+                .filter(|(p, _)| *p == Protocol::MetaDataV3)
+                .count()
+        };
+        let metadata = |seq_number| {
+            success_chunk::<consensus_types::Minimal>(Response::MetaData(MetaDataV3 {
+                seq_number,
+                ..testkit::metadata()
+            }))
+        };
+        let open_metadata = |control: &Control<consensus_types::Minimal>, n: usize| {
+            let mut ids: Vec<_> = control
+                .in_flight
+                .iter()
+                .filter(|(p, _)| *p == Protocol::MetaDataV3)
+                .map(|(_, id)| *id)
+                .collect();
+            ids.sort_unstable();
+            ids[n]
+        };
+        // Both Status-valid. A Ping to one peer and a MetaData request to the other are open,
+        // the second with a newer seq_number announced meanwhile; then both get our Goodbye.
+        for peer in &peers {
+            control.judge(*peer, testkit::status());
+        }
+        control.ping(late_pong);
+        let pong_id = control.peers[&late_pong].ping.unwrap();
+        control.on_peer_seq(refetch, 3);
+        let refetch_id = open_metadata(&control, 0);
+        control.on_peer_seq(refetch, 9);
+        control.goodbye(late_pong, GOODBYE_CLIENT_SHUTDOWN);
+        control.goodbye(refetch, GOODBYE_CLIENT_SHUTDOWN);
+        // The late Pong announces a seq_number we never fetched: no GetMetaData.
+        let pong = success_chunk(Response::Ping(Ping(7)));
+        control.on_response(late_pong, Protocol::PingV1, pong_id, pong);
+        assert_eq!(metadata_requests(&control), 1, "only the open one");
+        // The open request ends below the announced 9: no refetch.
+        control.on_response(refetch, Protocol::MetaDataV3, refetch_id, metadata(3));
+        assert_eq!(metadata_requests(&control), 0);
+        // Nor anything asked for by hand, but the Goodbye already sent.
+        control.request_metadata(late_pong);
+        assert!(!control.send_status(refetch));
+        assert_eq!(metadata_requests(&control), 0);
+        assert!(matches!(
+            control.request_blocks(
+                refetch,
+                BlocksByRangeV2Request {
+                    start_slot: 8,
+                    count: 8,
+                    step: 1
+                }
+            ),
+            Err(RangeError::Outbound(OutboundError::Disconnected))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_interval_pings_none() {
+        let cfg = ControlConfig {
+            ping_interval: Duration::ZERO,
+            ..crate::testkit::control_config(Some(testkit::status()))
+        };
+        let (mut control, _, _) = control_with(cfg, 1);
+        poll_once(&mut control);
+        tokio::time::advance(PING_INTERVAL).await;
+        poll_once(&mut control);
+        assert!(control.peers.values().all(|state| state.ping.is_none()));
+        assert!(control.timer.is_none());
+    }
+
     #[test]
     fn local_metadata_carries_the_enr_cgc() {
         let cfg = ControlConfig {
             status: Arc::new(SharedStatus::new(None)),
-            metadata: Arc::new(AtomicU64::new(11)),
-            custody_group_count: 4,
+            metadata: Arc::new(SharedMetaData::new(MetaDataV3 {
+                seq_number: 11,
+                attnets: Default::default(),
+                syncnets: Default::default(),
+                custody_group_count: 4,
+            })),
             contexts: Arc::new(testkit::context_table()),
             deadlines: Deadlines::default(),
             limits: RpcLimits::default(),
+            ping_interval: PING_INTERVAL,
         };
         let debug = format!("{cfg:?}");
         assert!(debug.contains("custody_group_count: 4"), "{debug}");
