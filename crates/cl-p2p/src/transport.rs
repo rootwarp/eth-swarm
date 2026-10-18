@@ -34,8 +34,10 @@
 //! mplex's own stream cap counts the streams it holds an entry for, and it forgets a stream the
 //! peer resets twice while that stream's handle lives on. [`BudgetedMuxer`] therefore counts
 //! every live stream itself, queued or handed out, until its handle is dropped
-//! ([`BudgetedMuxer::live_streams`]); a stream that would make more than [`MPLEX_MAX_STREAMS`]
-//! live closes the connection, and `p2p_conn_budget_exceeded_total` counts it.
+//! ([`BudgetedMuxer::live_streams`]). An inbound stream that would make more than
+//! [`MPLEX_MAX_STREAMS`] live closes the connection, and `p2p_conn_budget_exceeded_total` counts
+//! it; an outbound open waits while that many are live, since it is ours, until a handle is
+//! dropped.
 //!
 //! mplex resets a stream only by dropping it, and sends that Reset frame only with a flush
 //! through another stream; and it sends none for a stream whose write side we closed. A stream
@@ -58,6 +60,7 @@ pub use quota::{QuotaSocket, EMPTY_FRAME_WINDOW, MAX_EMPTY_FRAMES, PASS_BYTES, P
 
 use bytes::{Buf, Bytes, BytesMut};
 use consensus_types::caps::MAX_PAYLOAD_SIZE;
+use futures::task::AtomicWaker;
 use futures::{ready, AsyncRead, AsyncWrite, FutureExt as _};
 use libp2p::core::muxing::{StreamMuxer, StreamMuxerEvent, StreamMuxerExt as _};
 use libp2p::core::upgrade::{InboundConnectionUpgrade, OutboundConnectionUpgrade, UpgradeInfo};
@@ -172,7 +175,9 @@ impl TransportMetrics {
         };
         registry.register(
             "p2p_conn_budget_exceeded",
-            "Connections closed because their streams held more unread bytes than the budget",
+            "Connections closed because their streams held more unread bytes than the budget, \
+             a stream over its budget could not be reset, or the peer opened more streams than \
+             mplex may hold open",
             metrics.conn_budget_exceeded.clone(),
         );
         metrics
@@ -396,8 +401,9 @@ pub struct BudgetedMuxer<M: StreamMuxer> {
     pass: Arc<Pass>,
     /// The unread bytes every stream holds, together.
     buffered: Arc<AtomicUsize>,
-    /// Every stream whose [`Held`] is still alive, queued or handed out; see [`LiveSlot`].
-    live: Arc<AtomicUsize>,
+    /// Every stream whose [`BudgetedStream`] is not yet dropped, queued or handed out; see
+    /// [`LiveSlot`].
+    live: Arc<Live>,
     /// Every stream handed out or queued; a dropped one is pruned on the next poll. Pruning is
     /// lazy, so [`live`](Self::live), not its length, is the count of live streams.
     streams: Vec<Weak<Mutex<Held<M::Substream>>>>,
@@ -453,7 +459,15 @@ impl<M: StreamMuxer> BudgetedMuxer<M> {
     /// yet dropped. A stream reset or failed still counts while its handle is kept.
     #[must_use]
     pub fn live_streams(&self) -> usize {
-        self.live.load(Ordering::Relaxed)
+        self.live.count()
+    }
+
+    /// Whether [`MPLEX_MAX_STREAMS`] streams are live, so that an outbound open must wait; if so,
+    /// `opener` is woken once one is given back.
+    fn at_stream_cap(&self, opener: &Waker) -> bool {
+        // Registered before the count is read, so a stream given back in between still wakes it.
+        self.live.opener.register(opener);
+        self.live.count() >= MPLEX_MAX_STREAMS
     }
 
     fn closed(&self) -> Result<(), BudgetedMuxerError<M::Error>> {
@@ -528,7 +542,8 @@ impl<M: StreamMuxer> BudgetedMuxer<M> {
     }
 
     /// Adopts `inner` as one more live stream, unless that would make more than
-    /// [`MPLEX_MAX_STREAMS`] live, which closes the connection.
+    /// [`MPLEX_MAX_STREAMS`] live, which closes the connection. Only an inbound stream can: an
+    /// outbound open waits at the cap ([`at_stream_cap`](Self::at_stream_cap)).
     ///
     /// mplex drops its entry for a stream when the stream is dropped, and holds at most
     /// [`MPLEX_MAX_STREAMS`] entries, so a peer within mplex's cap stays within this one. Two
@@ -722,6 +737,12 @@ where
         let this = self.get_mut();
         this.closed()?;
         this.pass.register(cx.waker());
+        // mplex may have room while the cap is reached: a stream the budget reset is gone from
+        // mplex, but stays live while its handle is kept. Our own open must not close the
+        // connection for that, so it waits before mplex opens anything.
+        if this.at_stream_cap(cx.waker()) {
+            return Poll::Pending;
+        }
         let stream = match ready!(this.inner.poll_outbound_unpin(cx)) {
             Ok(stream) => stream,
             Err(e) => return Poll::Ready(Err(this.muxer_failed(e))),
@@ -748,8 +769,8 @@ where
 }
 
 /// A stream of a [`BudgetedMuxer`]: reads come from what the muxer drained first, then from
-/// the stream itself; writes go straight through. Dropping it frees its bytes and drops the
-/// inner stream, which resets it.
+/// the stream itself; writes go straight through. Dropping it frees its bytes, gives back its
+/// live slot and drops the inner stream, which resets it.
 pub struct BudgetedStream<S> {
     held: Arc<Mutex<Held<S>>>,
     buffered: Arc<AtomicUsize>,
@@ -849,6 +870,9 @@ impl<S> Drop for BudgetedStream<S> {
         let mut held = lock(&self.held);
         self.buffered.fetch_sub(held.buf.len(), Ordering::Relaxed);
         held.buf = RecvBuf::default();
+        // The slot goes first: mplex may hand out a replacement as soon as the inner stream frees
+        // its entry, and that one must not count this one as still live.
+        drop(held.slot.take());
         held.inner = None;
     }
 }
@@ -884,27 +908,43 @@ struct Held<S> {
     /// The application has closed, or begun to close, its side. mplex sends no Reset for such a
     /// stream when it is dropped, so it cannot be reset.
     write_closed: bool,
-    /// The stream's place in its muxer's live count, given back when this is dropped.
-    _slot: LiveSlot,
+    /// The stream's place in its muxer's live count, taken by [`BudgetedStream`]'s drop before
+    /// it drops [`inner`](Self::inner).
+    slot: Option<LiveSlot>,
 }
 
 /// One live stream in its muxer's count of them: taken when the muxer adopts the stream, given
-/// back when the stream's [`Held`] is dropped, which is when the last of the
-/// [`BudgetedStream`] and any muxer upgrade of it goes. Tying the count to that drop gives it
-/// back on every path a handle ends by: dropped by the swarm or the application, whether its
-/// stream was open, reset or failed, or freed from the queue, also when the connection closes.
-struct LiveSlot(Arc<AtomicUsize>);
+/// back when its [`BudgetedStream`] is dropped, before the inner stream. Tying the count to that
+/// drop gives it back on every path a handle ends by: dropped by the swarm or the application,
+/// whether its stream was open, reset or failed, or freed from the queue, also when the
+/// connection closes. Giving it back wakes an outbound open waiting at the cap.
+struct LiveSlot(Arc<Live>);
 
 impl LiveSlot {
-    fn take(live: &Arc<AtomicUsize>) -> Self {
-        live.fetch_add(1, Ordering::Relaxed);
+    fn take(live: &Arc<Live>) -> Self {
+        live.streams.fetch_add(1, Ordering::Relaxed);
         Self(Arc::clone(live))
     }
 }
 
 impl Drop for LiveSlot {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.streams.fetch_sub(1, Ordering::Relaxed);
+        self.0.opener.wake();
+    }
+}
+
+/// A muxer's count of its live streams; see [`LiveSlot`].
+#[derive(Debug, Default)]
+struct Live {
+    streams: AtomicUsize,
+    /// The outbound open waiting at [`MPLEX_MAX_STREAMS`], woken when a stream is given back.
+    opener: AtomicWaker,
+}
+
+impl Live {
+    fn count(&self) -> usize {
+        self.streams.load(Ordering::Relaxed)
     }
 }
 
@@ -937,7 +977,7 @@ impl<S> Held<S> {
             reader: None,
             writer: None,
             write_closed: false,
-            _slot: slot,
+            slot: Some(slot),
         }
     }
 

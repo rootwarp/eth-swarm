@@ -51,6 +51,8 @@ mod scripted {
         pub blocked: bool,
         /// Where each read is logged as `name`.
         pub log: Option<(usize, Arc<Mutex<Vec<usize>>>)>,
+        /// Run when the stream is dropped.
+        pub on_drop: Option<Box<dyn FnOnce() + Send>>,
     }
 
     /// The shared side of a scripted stream, kept by the test.
@@ -134,7 +136,14 @@ mod scripted {
 
     impl Drop for Stream {
         fn drop(&mut self) {
-            self.0.state().dropped = true;
+            let on_drop = {
+                let mut state = self.0.state();
+                state.dropped = true;
+                state.on_drop.take()
+            };
+            if let Some(on_drop) = on_drop {
+                on_drop();
+            }
         }
     }
 
@@ -733,7 +742,9 @@ fn live_streams_count_queued_and_taken_streams_until_each_is_gone() {
 }
 
 #[test]
-fn an_outbound_stream_past_the_live_cap_closes_the_connection() {
+fn an_outbound_open_at_the_live_cap_waits_for_a_stream_to_go() {
+    // Opening a stream is ours to hold back: at the cap it waits, without asking the muxer,
+    // and the drop of any handle wakes it.
     let (metrics, budget) = budget(1024, 64);
     let outbound = Script::default();
     let inner = scripted::Muxer {
@@ -744,23 +755,50 @@ fn an_outbound_stream_past_the_live_cap_closes_the_connection() {
         ..scripted::Muxer::default()
     };
     let mut muxer = BudgetedMuxer::new(inner, budget);
-    let _kept: Vec<_> = (0..MPLEX_MAX_STREAMS).map(|_| accept(&mut muxer)).collect();
+    let mut kept: Vec<_> = (0..MPLEX_MAX_STREAMS).map(|_| accept(&mut muxer)).collect();
     assert_eq!(muxer.live_streams(), MPLEX_MAX_STREAMS);
     drain(&mut muxer).unwrap();
 
-    assert!(matches!(
-        muxer.poll_outbound_unpin(&mut noop()),
-        Poll::Ready(Err(BudgetedMuxerError::TooManyStreams {
-            live: 65,
-            max: MPLEX_MAX_STREAMS
-        }))
-    ));
-    assert!(
-        outbound.state().dropped,
-        "the stream past the cap is dropped"
-    );
+    let (flag, waker) = Flag::new();
+    let mut cx = Context::from_waker(&waker);
+    assert!(muxer.poll_outbound_unpin(&mut cx).is_pending());
+    assert_eq!(muxer.inner.outbound.len(), 1, "the muxer was not asked");
+    assert!(!outbound.state().dropped);
+    assert!(!flag.woken());
+    drain(&mut muxer).unwrap();
+    assert_eq!(metrics.conn_budget_exceeded(), 0);
+
+    drop(kept.pop());
+    assert!(flag.woken(), "a stream given back wakes the open");
+    let Poll::Ready(Ok(_opened)) = muxer.poll_outbound_unpin(&mut cx) else {
+        panic!("the open completes once a stream is gone");
+    };
     assert_eq!(muxer.live_streams(), MPLEX_MAX_STREAMS);
-    assert_eq!(metrics.conn_budget_exceeded(), 1);
+    assert_eq!(metrics.conn_budget_exceeded(), 0);
+}
+
+#[test]
+fn a_dropped_stream_is_given_back_before_the_muxer_frees_it() {
+    // The muxer may hand out a replacement as soon as it frees the stream, so the live count
+    // must already be down by then.
+    let (_, budget) = budget(1024, 64);
+    let script = Script::default();
+    let mut muxer = muxer(&[&script], budget);
+    let stream = accept(&mut muxer);
+    let live = Arc::clone(&muxer.live);
+    let seen = Arc::new(AtomicUsize::new(usize::MAX));
+    let seen_at_drop = Arc::clone(&seen);
+    script.state().on_drop = Some(Box::new(move || {
+        seen_at_drop.store(live.count(), Ordering::SeqCst);
+    }));
+
+    drop(stream);
+    assert!(script.state().dropped);
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        0,
+        "live streams seen as the muxer frees the stream"
+    );
 }
 
 #[test]
@@ -913,6 +951,13 @@ fn budget_metric_is_registered_at_zero() {
         text.contains("# TYPE p2p_conn_budget_exceeded counter\n"),
         "{text}"
     );
+    let help = text
+        .lines()
+        .find(|line| line.starts_with("# HELP p2p_conn_budget_exceeded "))
+        .unwrap_or_else(|| panic!("{text}"));
+    for cause in ["unread bytes", "could not be reset", "more streams"] {
+        assert!(help.contains(cause), "{help}");
+    }
     assert!(
         text.contains("\np2p_conn_budget_exceeded_total 0\n"),
         "{text}"
@@ -1434,6 +1479,62 @@ fn a_peer_at_the_stream_cap_is_refused_by_mplex_not_disconnected() {
     assert_eq!(muxer.live_streams(), MPLEX_MAX_STREAMS);
     poll_muxer(&mut muxer).unwrap();
     assert_eq!(metrics.conn_budget_exceeded(), 0);
+}
+
+#[test]
+fn our_open_at_the_stream_cap_waits_while_a_reset_stream_is_still_held() {
+    // The budget resets one of 64 streams the peer opened, which frees its entry in mplex
+    // while the application still holds its handle. mplex would let our next open through, and
+    // counting it as the 65th live stream would close a connection to an honest peer: the open
+    // waits instead, until a handle is dropped.
+    let (_, metrics) = registered();
+    let wire = Wire::default();
+    let budget = MuxerBudget::new(1 << 20, 64 << 10, &metrics).unwrap();
+    let mut muxer = mplex_over(&wire, budget);
+    let mut frames = Vec::new();
+    for num in 0..MPLEX_MAX_STREAMS as u64 {
+        open(&mut frames, num);
+    }
+    wire.feed(&frames);
+    let mut kept = poll_taking_one_at_a_time(&mut muxer, &wire, MPLEX_MAX_STREAMS, |_| {}).unwrap();
+    let mut flood = Vec::new();
+    for _ in 0..16 {
+        data(&mut flood, 0, &[1; MPLEX_FRAME]);
+    }
+    wire.feed(&flood);
+    poll_until_read(&mut muxer, &wire).unwrap();
+    assert!(
+        wire.written_frames().contains(&(our_reset(0), 0)),
+        "the budget reset stream 0"
+    );
+    assert_eq!(
+        muxer.live_streams(),
+        MPLEX_MAX_STREAMS,
+        "its handle is held"
+    );
+
+    let (flag, waker) = Flag::new();
+    let mut cx = Context::from_waker(&waker);
+    assert!(
+        muxer.poll_outbound_unpin(&mut cx).is_pending(),
+        "the open waits"
+    );
+    poll_muxer(&mut muxer).unwrap();
+    assert!(muxer.poll_outbound_unpin(&mut cx).is_pending());
+    assert_eq!(metrics.conn_budget_exceeded(), 0);
+
+    drop(kept.remove(0));
+    assert!(flag.woken(), "the handle dropped wakes the open");
+    let opened = match muxer.poll_outbound_unpin(&mut cx) {
+        Poll::Ready(Ok(stream)) => stream,
+        Poll::Ready(Err(e)) => panic!("outbound: {e}"),
+        Poll::Pending => panic!("outbound: still pending"),
+    };
+    assert_eq!(muxer.live_streams(), MPLEX_MAX_STREAMS);
+    poll_muxer(&mut muxer).unwrap();
+    assert_eq!(metrics.conn_budget_exceeded(), 0);
+    drop((opened, kept));
+    assert_eq!(muxer.live_streams(), 0);
 }
 
 #[test]
