@@ -36,6 +36,43 @@ bad() {
   if [[ -n ${2:-} ]]; then printf '%s\n' "$2" | sed 's/^/       /'; fi
 }
 
+# early_exit_pipes FILE: each line where a pipe feeds grep -q, grep -m or head. Such a reader can
+# exit before its writer is done; the writer dies of SIGPIPE and, under pipefail, a match reads
+# as "not found". Checks read a here-string instead (`grep -q -- "$want" <<<"$text"`). A line
+# that ends in a pipe continues onto the next; `||` is not a pipe; comments are skipped.
+early_exit_pipes() {
+  awk '
+    { line = (prev ~ /(^|[^|])\|[[:space:]]*$/ ? "| " : "") $0; prev = $0 }
+    line ~ /^[[:space:]]*#/ { next }
+    line ~ /(^|[^|])\|[[:space:]]*(grep[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-[A-Za-z]*[qm]|head([[:space:]]|$))/ {
+      print FILENAME ":" FNR ": " $0; found = 1
+    }
+    END { exit found }
+  ' "$1"
+}
+bar='|'
+printf '%s\n' "a $bar grep -Fxq -- y" "a $bar grep -E -q y" "a $bar head -n1" "a $bar" "  grep -m1 y" \
+  >"$tmp/early-exit.sh"
+printf '%s\n' 'grep -Fxq -- "$want" <<<"$lines"' "grep -q x f $bar$bar true" "a $bar$bar" '  grep -q x f' \
+  "a $bar grep -E y" "# a $bar grep -q y" >"$tmp/no-early-exit.sh"
+if pipes=$(early_exit_pipes "$tmp/early-exit.sh"); then
+  bad "the early-exit pipe check misses a pipe into grep -q, grep -m or head"
+elif [[ $(grep -c . <<<"$pipes") != 4 ]]; then
+  bad "the early-exit pipe check flags the wrong lines (want 4)" "$pipes"
+else
+  ok "the early-exit pipe check flags pipes into grep -q, grep -m and head"
+fi
+if pipes=$(early_exit_pipes "$tmp/no-early-exit.sh"); then
+  ok "the early-exit pipe check passes here-strings, ||, comments and a full-reading grep"
+else
+  bad "the early-exit pipe check flags a line that reads its whole input" "$pipes"
+fi
+if pipes=$(early_exit_pipes "$here/$(basename "${BASH_SOURCE[0]}")"); then
+  ok "no check in this script pipes into an early-exiting reader"
+else
+  bad "a check in this script pipes into an early-exiting reader (read a here-string)" "$pipes"
+fi
+
 # The [Service] lines the unit must carry exactly, and no other value for their keys.
 HARDENING='UMask=0027
 StateDirectoryMode=0750
@@ -92,25 +129,25 @@ check_unit() {
   local file=$1 lines problems="" want key line exec
   lines=$(service_lines "$file")
   while IFS= read -r want; do
-    if ! printf '%s\n' "$lines" | grep -Fxq -- "$want"; then
+    if ! grep -Fxq -- "$want" <<<"$lines"; then
       problems+="missing: $want"$'\n'
     fi
     key=${want%%=*}
     while IFS= read -r line; do
-      if [[ -n $line ]] && ! printf '%s\n' "$HARDENING" | grep -Fxq -- "$line"; then
+      if [[ -n $line ]] && ! grep -Fxq -- "$line" <<<"$HARDENING"; then
         problems+="another value for $key: $line"$'\n'
       fi
     done <<<"$(printf '%s\n' "$lines" | grep -E "^$key=" || true)"
   done <<<"$HARDENING"
   # The env file and the URL file are the only sources of settings: no Environment= of the
   # unit's own, no URL, address or port in any setting, and the URL never in argv.
-  if printf '%s\n' "$lines" | grep -Eq '^Environment='; then
+  if grep -Eq '^Environment=' <<<"$lines"; then
     problems+="sets Environment= (settings belong in the env file)"$'\n'
   fi
-  if printf '%s\n' "$lines" | grep -Eiq '://|127\.0\.0\.1|localhost:|\[::1\]|:505[0-9]'; then
+  if grep -Eiq '://|127\.0\.0\.1|localhost:|\[::1\]|:505[0-9]' <<<"$lines"; then
     problems+="a hardcoded URL, address or port"$'\n'
   fi
-  if printf '%s\n' "$lines" | grep -Eq 'REFERENCE_API_URL|--url([ =]|$)'; then
+  if grep -Eq 'REFERENCE_API_URL|--url([ =]|$)' <<<"$lines"; then
     problems+="the URL goes into argv (want --url-file)"$'\n'
   fi
   exec=$(printf '%s\n' "$lines" | grep -E '^ExecStart=' || true)
@@ -126,7 +163,7 @@ check_unit() {
   done
   # The guard runs without the env file's environment (env -i), so no PATH= line or other
   # variable can change what it runs.
-  if ! printf '%s\n' "$lines" | grep -Fq 'ExecStartPre=/usr/bin/env -i /bin/sh -c '; then
+  if ! grep -Fq 'ExecStartPre=/usr/bin/env -i /bin/sh -c ' <<<"$lines"; then
     problems+="no ExecStartPre=/usr/bin/env -i /bin/sh -c guard tying the env file to the instance"$'\n'
   fi
   if [[ -n $problems ]]; then
@@ -540,7 +577,7 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin ethswarm-collec
 sudo install -o root -g root -m 0644 ops/collector/collector-hoodi.topics.toml.example /etc/ethswarm/collector-hoodi.topics.toml
 must stay root-owned and"
   while IFS= read -r line; do
-    if [[ -n $line ]] && ! printf '%s\n' "$MIGRATION" | grep -Fxq -- "$(printf '%s' "$line" | sed 's/^ *//')"; then
+    if [[ -n $line ]] && ! grep -Fxq -- "$(printf '%s' "$line" | sed 's/^ *//')" <<<"$MIGRATION"; then
       problems+="names the old unit outside its retirement: $line"$'\n'
     fi
   done <<<"$(grep -F 'ethswarm-collector.service' "$file" || true)"
