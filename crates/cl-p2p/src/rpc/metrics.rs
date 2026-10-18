@@ -9,12 +9,20 @@
 //!   status_valid}`: Goodbye messages by reason code and by whether the peer's Status was valid
 //!   (`true`, `false`, or `unknown` before a Status was judged).
 //! - `p2p_status_valid_peers`: connected peers whose last Status passed the relevance check.
+//! - `rpc_outbound_inflight{protocol}`: our requests in flight per protocol, at most
+//!   `MAX_CONCURRENT_REQUESTS` ([`crate::rpc::limits::OutboundSemaphore`]).
+//! - `rpc_rate_limited_total{protocol}`: response chunks withheld because the peer was over its
+//!   quota ([`crate::rpc::limits::ChunkPacer`]).
+//! - `queue_dropped_total{queue}`: items a bounded queue IGNOREd ([`QueueMetrics`]), shared with
+//!   the other queues of the service through [`RpcMetrics::queues`].
 //!
 //! The `reason` label is the decimal code for 0 to 255 (1–3 and the client-specific codes from
 //! 128 that clients use) and `other` above, so a peer cannot grow the label set past 257 values.
 
 use super::codec::Deadline;
+use super::limits::QueueMetrics;
 use crate::transport::Direction;
+use p2p_wire::rpc::protocols::Protocol;
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
@@ -118,6 +126,31 @@ struct DirectionLabel {
     direction: Direction,
 }
 
+/// The `protocol` label value: the message name of the protocol ID.
+#[must_use]
+pub fn protocol_label(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::StatusV2 => "status",
+        Protocol::MetaDataV3 => "metadata",
+        Protocol::PingV1 => "ping",
+        Protocol::BlocksByRangeV2 => "beacon_blocks_by_range",
+        Protocol::GoodbyeV1 => "goodbye",
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ProtocolLabel {
+    protocol: &'static str,
+}
+
+impl ProtocolLabel {
+    fn of(protocol: Protocol) -> Self {
+        Self {
+            protocol: protocol_label(protocol),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct GoodbyeLabels {
     reason: ReasonLabel,
@@ -132,6 +165,9 @@ pub struct RpcMetrics {
     goodbye_sent: Family<GoodbyeLabels, Counter>,
     goodbye_received: Family<GoodbyeLabels, Counter>,
     status_valid_peers: Gauge,
+    outbound_inflight: Family<ProtocolLabel, Gauge>,
+    rate_limited: Family<ProtocolLabel, Counter>,
+    queues: QueueMetrics,
 }
 
 impl RpcMetrics {
@@ -144,7 +180,15 @@ impl RpcMetrics {
             goodbye_sent: Family::default(),
             goodbye_received: Family::default(),
             status_valid_peers: Gauge::default(),
+            outbound_inflight: Family::default(),
+            rate_limited: Family::default(),
+            queues: QueueMetrics::register(registry),
         };
+        for protocol in Protocol::ALL {
+            let label = ProtocolLabel::of(protocol);
+            drop(metrics.outbound_inflight.get_or_create(&label));
+            drop(metrics.rate_limited.get_or_create(&label));
+        }
         for kind in Deadline::ALL {
             drop(metrics.timeouts.get_or_create(&KindLabel { kind }));
         }
@@ -190,7 +234,54 @@ impl RpcMetrics {
             "Connected peers whose Status passed the relevance check",
             metrics.status_valid_peers.clone(),
         );
+        registry.register(
+            "rpc_outbound_inflight",
+            "Our req/resp requests in flight, by protocol",
+            metrics.outbound_inflight.clone(),
+        );
+        registry.register(
+            "rpc_rate_limited",
+            "Req/resp response chunks withheld because the peer was over its quota, by protocol",
+            metrics.rate_limited.clone(),
+        );
         metrics
+    }
+
+    /// Sets `rpc_outbound_inflight{protocol}`.
+    pub(crate) fn set_outbound_inflight(&self, protocol: Protocol, in_flight: usize) {
+        let value = i64::try_from(in_flight).unwrap_or(i64::MAX);
+        self.outbound_inflight
+            .get_or_create(&ProtocolLabel::of(protocol))
+            .set(value);
+    }
+
+    /// Counts a response chunk withheld on `protocol`.
+    pub(crate) fn rate_limited(&self, protocol: Protocol) {
+        self.rate_limited
+            .get_or_create(&ProtocolLabel::of(protocol))
+            .inc();
+    }
+
+    /// `queue_dropped_total{queue}`, for every bounded queue of the service.
+    #[must_use]
+    pub fn queues(&self) -> &QueueMetrics {
+        &self.queues
+    }
+
+    /// The current `rpc_outbound_inflight{protocol}`.
+    #[must_use]
+    pub fn outbound_inflight(&self, protocol: Protocol) -> i64 {
+        self.outbound_inflight
+            .get_or_create(&ProtocolLabel::of(protocol))
+            .get()
+    }
+
+    /// The current `rpc_rate_limited_total{protocol}`.
+    #[must_use]
+    pub fn rate_limited_count(&self, protocol: Protocol) -> u64 {
+        self.rate_limited
+            .get_or_create(&ProtocolLabel::of(protocol))
+            .get()
     }
 
     /// Counts an exchange that failed on `kind`.
@@ -298,6 +389,10 @@ mod tests {
             "p2p_goodbye_sent_total{reason=\"2\",status_valid=\"true\"} 0",
             "p2p_goodbye_received_total{reason=\"3\",status_valid=\"unknown\"} 0",
             "p2p_status_valid_peers 0",
+            "rpc_outbound_inflight{protocol=\"status\"} 0",
+            "rpc_outbound_inflight{protocol=\"beacon_blocks_by_range\"} 0",
+            "rpc_rate_limited_total{protocol=\"ping\"} 0",
+            "rpc_rate_limited_total{protocol=\"goodbye\"} 0",
         ] {
             assert!(text.contains(line), "{line} missing from\n{text}");
         }
@@ -326,7 +421,17 @@ mod tests {
             1
         );
         assert_eq!(metrics.status_valid_peers(), 1);
+        metrics.set_outbound_inflight(Protocol::MetaDataV3, 2);
+        metrics.rate_limited(Protocol::PingV1);
+        assert_eq!(metrics.outbound_inflight(Protocol::MetaDataV3), 2);
+        assert_eq!(metrics.outbound_inflight(Protocol::PingV1), 0);
+        assert_eq!(metrics.rate_limited_count(Protocol::PingV1), 1);
+        assert_eq!(metrics.queues().dropped("nothing"), 0);
         let text = text(&registry);
+        assert!(
+            text.contains("rpc_outbound_inflight{protocol=\"metadata\"} 2"),
+            "{text}"
+        );
         assert!(
             text.contains("p2p_goodbye_received_total{reason=\"129\",status_valid=\"true\"} 1"),
             "{text}"

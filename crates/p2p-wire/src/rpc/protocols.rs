@@ -5,6 +5,12 @@
 //! `BeaconBlocksByRange` v2 carries context bytes (`altair/p2p-interface.md`, the fork digest of
 //! the block's fork); the other responses have one shape in every fork. `Goodbye` has a request
 //! and no response: the disconnecting peer writes its reason and closes the stream.
+//!
+//! [`ProtocolLimits`] is the one row per protocol the codec and the transport check against: the
+//! request ceiling, the response chunk count and the SSZ length bounds of request and response
+//! (`phase0/p2p-interface.md` "What are SSZ type size bounds?", L2627). The bounds are the type's
+//! own, from `consensus_types::caps`; `MAX_PAYLOAD_SIZE` caps only a type whose bound is larger
+//! (`phase0` L1365).
 
 use crate::rpc::messages::{
     BlocksByRangeV2Request, ErrorMessage, Goodbye, MetaDataV3, Ping, StatusV2,
@@ -18,6 +24,64 @@ use std::fmt;
 /// `MAX_REQUEST_BLOCKS_DENEB` (`deneb/p2p-interface.md` configuration): the most blocks a
 /// `BeaconBlocksByRange` response may hold. 128 in every known network config.
 pub const MAX_REQUEST_BLOCKS_DENEB: u64 = 128;
+
+/// `MAX_REQUEST_PAYLOADS` (`gloas/p2p-interface.md` L84): the most execution payload envelopes
+/// one `ExecutionPayloadEnvelopesByRange`/`ByRoot` request may ask for.
+pub const MAX_REQUEST_PAYLOADS: u64 = 128;
+
+/// `MAX_REQUEST_DATA_COLUMN_SIDECARS` (`fulu/p2p-interface.md` L174:
+/// `MAX_REQUEST_BLOCKS_DENEB * NUMBER_OF_COLUMNS`): the most column sidecars one
+/// `DataColumnSidecarsByRange`/`ByRoot` request may ask for.
+pub const MAX_REQUEST_DATA_COLUMN_SIDECARS: u64 = 16_384;
+
+/// The shortest `SignedBeaconBlock` of either fork, as a lower bound: the fixed parts of
+/// `SignedBeaconBlock` (the `message` offset and the 96-byte signature) and of `BeaconBlock`
+/// (`slot`, `proposer_index`, `parent_root`, `state_root` and the `body` offset). Both forks
+/// share them; the body only adds to it.
+pub const MIN_SIGNED_BEACON_BLOCK_LEN: usize = (4 + 96) + (8 + 8 + 32 + 32 + 4);
+
+/// An SSZ length range: a declared length outside it is refused at the prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SszBounds {
+    /// The shortest valid encoding.
+    pub min: usize,
+    /// The longest valid encoding, at most `MAX_PAYLOAD_SIZE`.
+    pub max: usize,
+}
+
+impl SszBounds {
+    /// Exactly `len` bytes: a fixed-size type.
+    pub const fn exactly(len: usize) -> Self {
+        Self { min: len, max: len }
+    }
+
+    /// At most `max` bytes, `max` capped at `MAX_PAYLOAD_SIZE`.
+    pub fn up_to(max: usize) -> Self {
+        Self {
+            min: 0,
+            max: max.min(caps::MAX_PAYLOAD_SIZE),
+        }
+    }
+}
+
+/// One protocol's limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolLimits {
+    /// The multistream protocol ID.
+    pub id: &'static str,
+    /// The most items one request may ask for ([`MAX_REQUEST_BLOCKS_DENEB`] for
+    /// `BeaconBlocksByRange`); 0 for a request that names no items.
+    pub max_request_items: u64,
+    /// The most response chunks one request can be answered with.
+    pub max_response_chunks: u64,
+    /// The request payload's SSZ length range; `None` for an empty request (`MetaData`).
+    pub request: Option<SszBounds>,
+    /// The shortest success payload, over every fork the protocol serves; 0 if it has none.
+    pub ssz_min: usize,
+    /// The longest success payload, over every fork, capped at `MAX_PAYLOAD_SIZE`; 0 if it has
+    /// none. A block's own bound is its fork's ([`Protocol::response_bounds`]).
+    pub ssz_max: usize,
+}
 
 /// A req/resp protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -76,6 +140,53 @@ impl Protocol {
         matches!(self, Protocol::BlocksByRangeV2)
     }
 
+    /// This protocol's row of limits.
+    pub fn limits<E: EthSpec>(self) -> ProtocolLimits {
+        let (max_request_items, max_response_chunks) = match self {
+            Protocol::BlocksByRangeV2 => (MAX_REQUEST_BLOCKS_DENEB, MAX_REQUEST_BLOCKS_DENEB),
+            Protocol::GoodbyeV1 => (0, 0),
+            _ => (0, 1),
+        };
+        let (ssz_min, ssz_max) = match self {
+            Protocol::BlocksByRangeV2 => (
+                MIN_SIGNED_BEACON_BLOCK_LEN,
+                ForkName::ALL
+                    .into_iter()
+                    .filter_map(|fork| self.response_max_len::<E>(Some(fork)))
+                    .max()
+                    .unwrap_or(0),
+            ),
+            _ => self
+                .response_max_len::<E>(None)
+                .map_or((0, 0), |len| (len, len)),
+        };
+        ProtocolLimits {
+            id: self.id(),
+            max_request_items,
+            max_response_chunks,
+            request: self.request_bounds(),
+            ssz_min,
+            ssz_max,
+        }
+    }
+
+    /// The request payload's SSZ length range: every request is fixed-size, so one length.
+    /// `None` for an empty request.
+    pub fn request_bounds(self) -> Option<SszBounds> {
+        self.request_len().map(SszBounds::exactly)
+    }
+
+    /// The success payload's SSZ length range at `fork` (which a protocol with context bytes
+    /// needs, see [`Protocol::response_max_len`]); `None` where there is no bound to read with.
+    pub fn response_bounds<E: EthSpec>(self, fork: Option<ForkName>) -> Option<SszBounds> {
+        let max = self.response_max_len::<E>(fork)?;
+        let min = match self {
+            Protocol::BlocksByRangeV2 => MIN_SIGNED_BEACON_BLOCK_LEN,
+            _ => max,
+        };
+        Some(SszBounds { min, max })
+    }
+
     /// The SSZ length of the request body, or `None` for a protocol whose request is empty
     /// (`MetaData`: nothing at all is written, not even a length prefix).
     pub fn request_len(self) -> Option<usize> {
@@ -108,6 +219,14 @@ impl Protocol {
     /// The largest error payload: `ErrorMessage` is `List[byte, 256]`.
     pub const fn error_max_len(self) -> usize {
         MAX_ERROR_MESSAGE_LEN
+    }
+
+    /// The error payload's SSZ length range: 0 to 256 bytes.
+    pub const fn error_bounds(self) -> SszBounds {
+        SszBounds {
+            min: 0,
+            max: self.error_max_len(),
+        }
     }
 }
 
@@ -313,6 +432,69 @@ mod tests {
             let max = p.response_max_len::<Minimal>(Some(fork)).unwrap();
             assert!(max <= caps::MAX_PAYLOAD_SIZE, "{fork}: {max}");
         }
+    }
+
+    #[test]
+    fn limits_table_has_one_row_per_protocol() {
+        use consensus_types::Mainnet;
+        let rows: Vec<ProtocolLimits> = Protocol::ALL
+            .iter()
+            .map(|p| p.limits::<Minimal>())
+            .collect();
+        for (row, p) in rows.iter().zip(Protocol::ALL) {
+            assert_eq!(row.id, p.id());
+            assert!(row.ssz_min <= row.ssz_max, "{p}");
+            assert!(row.ssz_max <= caps::MAX_PAYLOAD_SIZE, "{p}");
+        }
+        let status = Protocol::StatusV2.limits::<Minimal>();
+        assert_eq!(status.request, Some(SszBounds::exactly(92)));
+        assert_eq!((status.ssz_min, status.ssz_max), (92, 92));
+        assert_eq!(
+            (status.max_request_items, status.max_response_chunks),
+            (0, 1)
+        );
+        let metadata = Protocol::MetaDataV3.limits::<Minimal>();
+        assert_eq!(metadata.request, None);
+        assert_eq!((metadata.ssz_min, metadata.ssz_max), (25, 25));
+        let ping = Protocol::PingV1.limits::<Minimal>();
+        assert_eq!(ping.request, Some(SszBounds::exactly(8)));
+        let goodbye = Protocol::GoodbyeV1.limits::<Minimal>();
+        assert_eq!(goodbye.request, Some(SszBounds::exactly(8)));
+        assert_eq!((goodbye.max_response_chunks, goodbye.ssz_max), (0, 0));
+        // Blocks: 128 a request, the bound the largest fork's, capped at MAX_PAYLOAD_SIZE.
+        for blocks in [
+            Protocol::BlocksByRangeV2.limits::<Minimal>(),
+            Protocol::BlocksByRangeV2.limits::<Mainnet>(),
+        ] {
+            assert_eq!(blocks.request, Some(SszBounds::exactly(24)));
+            assert_eq!(blocks.max_request_items, MAX_REQUEST_BLOCKS_DENEB);
+            assert_eq!(blocks.max_response_chunks, 128);
+            assert_eq!(blocks.ssz_min, MIN_SIGNED_BEACON_BLOCK_LEN);
+            assert_eq!(blocks.ssz_max, caps::MAX_PAYLOAD_SIZE);
+        }
+        assert_eq!(MAX_REQUEST_PAYLOADS, 128);
+        assert_eq!(MAX_REQUEST_DATA_COLUMN_SIDECARS, 128 * 128);
+    }
+
+    #[test]
+    fn block_minimum_is_a_lower_bound() {
+        use crate::testkit;
+        let fulu = testkit::fulu_block::<Minimal>(1).as_ssz_bytes().len();
+        let gloas = testkit::gloas_block::<Minimal>(1).as_ssz_bytes().len();
+        assert!(
+            MIN_SIGNED_BEACON_BLOCK_LEN < fulu.min(gloas),
+            "{fulu} {gloas}"
+        );
+        let p = Protocol::BlocksByRangeV2;
+        assert_eq!(p.response_bounds::<Minimal>(None), None);
+        let gloas_bounds = p.response_bounds::<Minimal>(Some(ForkName::Gloas)).unwrap();
+        assert_eq!(gloas_bounds.min, MIN_SIGNED_BEACON_BLOCK_LEN);
+        assert_eq!(
+            Some(gloas_bounds.max),
+            p.response_max_len::<Minimal>(Some(ForkName::Gloas))
+        );
+        assert_eq!(p.error_bounds(), SszBounds { min: 0, max: 256 });
+        assert_eq!(SszBounds::up_to(usize::MAX).max, caps::MAX_PAYLOAD_SIZE);
     }
 
     #[test]

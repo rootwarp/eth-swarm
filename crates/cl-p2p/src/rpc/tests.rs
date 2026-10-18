@@ -6,9 +6,11 @@
 //! through the production codec and answers what the test tells it to (or nothing), and
 //! [`bytes_peer`] writes whatever bytes a test gives it, or holds its stream open and silent.
 
-use super::codec::{Deadline, Deadlines, ReceivedChunk, RpcRequest};
+mod limits;
+
+use super::codec::{Answer, Deadline, Deadlines, ReceivedChunk, RpcRequest};
 use super::inbound::{
-    ControlConfig, ControlEvent, Protocols, ProtocolsEvent, Relevance, SharedStatus,
+    ControlConfig, ControlEvent, DuplexEvent, Protocols, ProtocolsEvent, Relevance, SharedStatus,
 };
 use super::metrics::{RpcMetrics, StatusValidity};
 use crate::behaviour::{BehaviourEvent, ProbeSpec};
@@ -66,6 +68,7 @@ fn loopback() -> Multiaddr {
 /// What a test asks a running node to do.
 enum Cmd {
     Dial(Multiaddr),
+    Status(PeerId),
     Ping(PeerId),
     Goodbye(PeerId, u64),
 }
@@ -112,6 +115,9 @@ impl Node {
                         let control = &mut swarm.behaviour_mut().req_resp;
                         match cmd {
                             Some(Cmd::Dial(addr)) => swarm.dial(addr).expect("dial"),
+                            Some(Cmd::Status(peer)) => {
+                                control.send_status(peer);
+                            }
                             Some(Cmd::Ping(peer)) => control.ping(peer),
                             Some(Cmd::Goodbye(peer, reason)) => control.goodbye(peer, reason),
                             None => return,
@@ -225,13 +231,18 @@ struct RawPeer {
     metadata_requests: usize,
     /// Whether it answers Status requests (else it holds them, silent).
     answer_status: bool,
-    held: Vec<request_response::ResponseChannel<Vec<ReceivedChunk<E>>>>,
+    held: Vec<request_response::ResponseChannel<Answer<E>>>,
     /// Outcomes of our requests that completed while another was awaited.
     done: HashMap<OutboundRequestId, Outcome>,
 }
 
 fn tcp_swarm<B: libp2p::swarm::NetworkBehaviour>(behaviour: B) -> Swarm<B> {
-    SwarmBuilder::with_existing_identity(Keypair::generate_secp256k1())
+    tcp_swarm_as(Keypair::generate_secp256k1(), behaviour)
+}
+
+/// [`tcp_swarm`] with the node key `key`, so a test can reconnect as the same peer.
+fn tcp_swarm_as<B: libp2p::swarm::NetworkBehaviour>(key: Keypair, behaviour: B) -> Swarm<B> {
+    SwarmBuilder::with_existing_identity(key)
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
@@ -247,13 +258,18 @@ fn tcp_swarm<B: libp2p::swarm::NetworkBehaviour>(behaviour: B) -> Swarm<B> {
 
 impl RawPeer {
     fn new(seq_number: u64) -> Self {
+        Self::with_key(Keypair::generate_secp256k1(), seq_number)
+    }
+
+    /// A peer with the node key `key`.
+    fn with_key(key: Keypair, seq_number: u64) -> Self {
         let protocols = Protocols::new(
             Arc::new(p2p_wire::testkit::context_table()),
             Deadlines::default(),
             None,
         );
         Self {
-            swarm: tcp_swarm(protocols),
+            swarm: tcp_swarm_as(key, protocols),
             metadata: MetaDataV3 {
                 seq_number,
                 ..p2p_wire::testkit::metadata()
@@ -317,13 +333,13 @@ impl RawPeer {
             | ProtocolsEvent::BlocksByRange(e) => e,
         };
         match event {
-            Event::Message {
+            DuplexEvent::Inbound(Event::Message {
                 message:
                     Message::Request {
                         request, channel, ..
                     },
                 ..
-            } => {
+            }) => {
                 let reply = |r: Response<E>| {
                     vec![ReceivedChunk {
                         context: None,
@@ -350,17 +366,17 @@ impl RawPeer {
                 }
                 None
             }
-            Event::Message {
+            DuplexEvent::Outbound(Event::Message {
                 message:
                     Message::Response {
                         request_id,
                         response,
                     },
                 ..
-            } => Some((request_id, Ok(response))),
-            Event::OutboundFailure {
+            }) => Some((request_id, Ok(response))),
+            DuplexEvent::Outbound(Event::OutboundFailure {
                 request_id, error, ..
-            } => Some((request_id, Err(error.to_string()))),
+            }) => Some((request_id, Err(error.to_string()))),
             _ => None,
         }
     }

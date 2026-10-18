@@ -18,7 +18,7 @@ use libp2p::core::upgrade::{
 };
 use libp2p::identity::Keypair;
 use libp2p::swarm::{DialError, SwarmEvent};
-use libp2p::{noise, tcp, Multiaddr, Swarm, SwarmBuilder};
+use libp2p::{noise, tcp, Multiaddr, PeerId, Swarm, SwarmBuilder};
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
@@ -65,6 +65,8 @@ pub struct SwarmConfig {
     pub budget: MuxerBudget,
     /// The connection caps; see [`ConnectionCaps`] for the defaults.
     pub caps: ConnectionCaps,
+    /// Peers exempt from the connection caps: the reference node. None by default.
+    pub bypass: Vec<PeerId>,
 }
 
 impl SwarmConfig {
@@ -84,6 +86,7 @@ impl SwarmConfig {
             agent_version: concat!("ethswarm/", env!("CARGO_PKG_VERSION")).to_owned(),
             budget,
             caps: ConnectionCaps::default(),
+            bypass: Vec::new(),
         }
     }
 }
@@ -140,6 +143,9 @@ pub fn build_swarm(
         })
         .with_connection_timeout(cfg.connection_timeout)
         .build();
+    for peer in &cfg.bypass {
+        swarm.behaviour_mut().bypass(*peer);
+    }
     for addr in &cfg.listen_addrs {
         swarm
             .listen_on(addr.clone())

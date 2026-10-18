@@ -9,12 +9,16 @@ dials one pinned reference node and nothing else.
 `transport::build_swarm(keypair, &cfg, req_resp)` builds the swarm on TCP (`nodelay`), Noise XX
 and the muxers yamux then mplex (mplex under the per-connection budget), and listens on every
 `cfg.listen_addrs` address, `/ip4/0.0.0.0/tcp/9000` by default; it dials over the same transport.
-The behaviour is `connection_limits`, identify (`eth2/1.0.0`, no address cache: nothing dials
-an address a peer advertised), the req/resp control protocols (`req_resp`, an
-`rpc::inbound::Control`), and a placeholder slot for gossipsub. The connection caps
+The behaviour is `connection_limits`, `peer_caps::PeerCaps`, identify (`eth2/1.0.0`, no address
+cache: nothing dials an address a peer advertised), the req/resp control protocols (`req_resp`,
+an `rpc::inbound::Control`), and a placeholder slot for gossipsub. The connection caps
 (`SwarmConfig::caps`): one established connection per peer, 8 pending inbound per source
-(IPv4 address or IPv6 /58; the pinned `connection_limits` has no total pending cap), 128
-established inbound, 160 established in total.
+(IPv4 address or IPv6 /58), 32 pending inbound in total (`PeerCaps`: the pinned
+`connection_limits` has no total pending cap; a place is freed when the handshake ends,
+fails or times out), 8 established inbound per IP (IPv6: per /58), 128 established inbound,
+160 established in total \[est\]. `SwarmConfig::bypass` lists the peers exempt from all of
+them (the reference node): `connection_limits::Behaviour::bypass_peer_id` and the same list in
+`PeerCaps`; its pending connection still counts, since the peer ID is not known yet.
 
 The owner's event loop passes every swarm event to `PeerMetrics::observe` and every identify
 event to `behaviour::log_identify`. Metrics, on the registry the service passes in:
@@ -34,10 +38,11 @@ chars.
 ## Req/resp control protocols
 
 `rpc::inbound::Control` answers and initiates Status v2, MetaData v3, Ping v1 and Goodbye v1
-(consensus-specs v1.7.0-beta.4, `phase0`/`fulu` `p2p-interface.md`), one `request_response`
-behaviour per protocol, all `ProtocolSupport::Full`, at most 2 open streams per protocol and
-connection. Those, plus `BeaconBlocksByRange` v2, are the only protocols offered: any other
-fails multistream-select negotiation.
+(consensus-specs v1.7.0-beta.4, `phase0`/`fulu` `p2p-interface.md`), one `rpc::inbound::Duplex`
+per protocol: an inbound-only and an outbound-only `request_response` behaviour, each at most 2
+open streams per connection, so the peer's two and our two never take each other's slots and
+a peer's third concurrent stream is reset. Those, plus `BeaconBlocksByRange` v2, are the only
+protocols offered: any other fails multistream-select negotiation.
 
 - **Status**: sent first on every connection we dial, and answered on every one. A peer
   Status with another fork digest, or another finalized root at our finalized epoch, gets
@@ -57,6 +62,22 @@ fails multistream-select negotiation.
   byte, 5 s per chunk, 10 s in total \[est\]; `request_response`'s own 10 s request timeout is
   only the backstop. A silent inbound stream is dropped at 5 s and holds one of the 2 stream
   slots until then.
+- **Rate limits** (`rpc::limits::RateLimiter`, `ControlConfig::limits`): a token bucket per
+  peer and protocol, counted in response chunks \[est\]: Status 5 at once then one per 2 s,
+  MetaData and Ping 2 then one per 2 s, BeaconBlocksByRange 128 then one per 20 ms. A peer
+  over its quota gets no error chunk and its stream stays open: the stream's writer
+  (`rpc::codec::InboundCodec`) charges each chunk when it is next to go and withholds it until
+  its own token is free, then sends it whole (`phase0` L1269–1274). With at most 2 requests
+  open, no chunk waits the requester's 5 s first-byte or per-chunk deadline. A chunk that was
+  withheld but never sent (the peer left) is refunded; a sent one stays charged, so
+  reconnecting does not refill the bucket.
+- **Outbound requests** (`rpc::limits::OutboundSemaphore`): at most 2 in flight per protocol
+  across the probe (`MAX_CONCURRENT_REQUESTS`, `phase0` L309, L1228); the rest wait in a
+  bounded queue per protocol (256), and a full queue IGNOREs the request (an IGNOREd Goodbye
+  closes the connection at once).
+- **Length prefix** (`p2p_wire`): checked against the type's SSZ bounds, both ends, and
+  `MAX_PAYLOAD_SIZE` before a byte of the payload is read or allocated
+  (`p2p_wire::rpc::protocols::ProtocolLimits`).
 
 ### What our Status advertises (probe mode)
 
@@ -78,6 +99,9 @@ Metrics, on the same registry as the peer metrics (`rpc::metrics::RpcMetrics`):
   status_valid}`: `reason` is the code (0–255, else `other`), `status_valid` is `true`,
   `false` or `unknown` (no Status judged yet).
 - `p2p_status_valid_peers`: connected peers whose last Status passed.
+- `rpc_outbound_inflight{protocol}`: our requests in flight, at most 2 per protocol.
+- `rpc_rate_limited_total{protocol}`: response chunks withheld for a peer over its quota.
+- `queue_dropped_total{queue}`: items a bounded queue IGNOREd (`rpc_outbound_<protocol>`).
 
 Every received Goodbye logs one `goodbye_received` line (`peer`, `reason`, `status_valid`,
 `direction`, `unix_ms`) and emits one `ControlEvent::GoodbyeReceived`; every sent one logs

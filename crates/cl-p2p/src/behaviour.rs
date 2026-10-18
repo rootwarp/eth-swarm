@@ -1,13 +1,15 @@
-//! The probe swarm's [`NetworkBehaviour`]: connection limits, identify, the req/resp control
-//! protocols ([`crate::rpc::inbound::Control`]), and the slot the gossipsub behaviour will fill.
+//! The probe swarm's [`NetworkBehaviour`]: connection limits (`connection_limits` and
+//! [`PeerCaps`]), identify, the req/resp control protocols ([`crate::rpc::inbound::Control`]),
+//! and the slot the gossipsub behaviour will fill.
 //!
 //! Field order is the order the swarm consults the behaviours, so [`Behaviour::limits`] comes
 //! first: a connection it denies is never handed to the others.
 
+use crate::peer_caps::{PeerCaps, PeerCapsConfig};
 use crate::rpc::inbound::Control;
 use libp2p::identity::PublicKey;
 use libp2p::swarm::{dummy, NetworkBehaviour};
-use libp2p::{connection_limits, identify};
+use libp2p::{connection_limits, identify, PeerId};
 
 /// The identify protocol version every consensus-layer client announces.
 pub const IDENTIFY_PROTOCOL_VERSION: &str = "eth2/1.0.0";
@@ -18,10 +20,11 @@ pub const MAX_ESTABLISHED_PER_PEER: u32 = 1;
 /// The longest peer-supplied identify string logged, in chars; the rest is cut.
 pub const MAX_LOGGED_CHARS: usize = 128;
 
-/// Caps on the connections the swarm holds, enforced by `connection_limits`.
+/// Caps on the connections the swarm holds, enforced by `connection_limits` and [`PeerCaps`].
 ///
 /// The pinned `connection_limits` caps pending inbound connections per source (an IPv4
-/// address, an IPv6 /58), not in total.
+/// address, an IPv6 /58), not in total; [`PeerCaps`] adds the total and the per-IP cap on
+/// established inbound connections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectionCaps {
     /// Inbound connections from one source still in the handshake: 8 by default.
@@ -31,6 +34,10 @@ pub struct ConnectionCaps {
     /// Established connections both ways: 160 by default, so at least 32 are ours to dial
     /// whatever the inbound side holds.
     pub max_established: u32,
+    /// Inbound connections still in the handshake, from every source together: 32 by default.
+    pub max_pending_incoming: u32,
+    /// Established inbound connections from one IP (an IPv6 /58): 8 by default.
+    pub max_established_incoming_per_ip: u32,
 }
 
 impl Default for ConnectionCaps {
@@ -39,6 +46,9 @@ impl Default for ConnectionCaps {
             max_pending_incoming_per_source: 8,
             max_established_incoming: 128,
             max_established: 160,
+            max_pending_incoming: PeerCapsConfig::default().max_pending_incoming,
+            max_established_incoming_per_ip: PeerCapsConfig::default()
+                .max_established_incoming_per_ip,
         }
     }
 }
@@ -58,6 +68,8 @@ pub type GossipsubSlot = dummy::Behaviour;
 pub struct Behaviour {
     /// At most [`MAX_ESTABLISHED_PER_PEER`] established connections per peer.
     pub limits: connection_limits::Behaviour,
+    /// The pending-total and per-IP inbound caps.
+    pub peer_caps: PeerCaps,
     /// Tells each peer who we are and what address we see it on, and tells us the same.
     pub identify: identify::Behaviour,
     pub req_resp: ReqRespSlot,
@@ -91,10 +103,20 @@ impl Behaviour {
             .with_cache_size(0);
         Self {
             limits: connection_limits::Behaviour::new(limits),
+            peer_caps: PeerCaps::new(PeerCapsConfig {
+                max_pending_incoming: caps.max_pending_incoming,
+                max_established_incoming_per_ip: caps.max_established_incoming_per_ip,
+            }),
             identify: identify::Behaviour::new(identify),
             req_resp,
             gossipsub: dummy::Behaviour,
         }
+    }
+
+    /// Exempts `peer` (the reference node) from the connection caps of both limit slots.
+    pub fn bypass(&mut self, peer: PeerId) {
+        self.limits.bypass_peer_id(&peer);
+        self.peer_caps.bypass(peer);
     }
 }
 

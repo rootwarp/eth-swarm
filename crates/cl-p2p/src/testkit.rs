@@ -40,6 +40,7 @@ pub fn control_config(status: Option<StatusV2>) -> ControlConfig {
         custody_group_count: FIXTURE_CGC,
         contexts: Arc::new(p2p_wire::testkit::context_table()),
         deadlines: Deadlines::default(),
+        limits: crate::rpc::limits::RpcLimits::default(),
     }
 }
 

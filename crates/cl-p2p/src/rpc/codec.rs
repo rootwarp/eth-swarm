@@ -51,7 +51,15 @@
 //! name one fork (one per blob-parameter epoch), so whether the digest is the one of the
 //! block's own epoch is for the caller to check
 //! ([`blocks_by_range`](super::outbound::blocks_by_range)).
+//!
+//! # Answers
+//!
+//! The probe's inbound streams run [`InboundCodec`]: [`RpcCodec`]'s request reader, and a
+//! writer of [`Answer`]s that sends one chunk at a time, each whole and flushed, once the
+//! peer's [`ChunkPacer`] has a token for it (`phase0/p2p-interface.md` L1269–1274). A stream
+//! that goes away while a chunk waits refunds that chunk's token.
 
+use super::limits::ChunkPacer;
 use super::metrics::RpcMetrics;
 use consensus_types::EthSpec;
 use consensus_types::{caps, forked};
@@ -441,9 +449,9 @@ async fn read_request_bytes<T: AsyncRead + Unpin>(
     per_chunk: Option<Duration>,
 ) -> Result<Request, ReadError> {
     let mut buf = Vec::new();
-    if let Some(max) = protocol.request_len() {
+    if let Some(bounds) = protocol.request_bounds() {
         within(per_chunk, Deadline::PerChunk, async {
-            let mut scanner = ChunkScanner::new(max);
+            let mut scanner = ChunkScanner::with_bounds(bounds);
             while let Scan::Incomplete { need, .. } = scanner.scan(&buf)? {
                 read_exact_more(io, &mut buf, need).await?;
             }
@@ -498,6 +506,18 @@ pub fn encode_response<E: EthSpec>(
     protocol: Protocol,
     chunks: &[ReceivedChunk<E>],
 ) -> io::Result<Vec<u8>> {
+    Ok(encode_response_chunks(protocol, chunks)?.concat())
+}
+
+/// [`encode_response`], one buffer per chunk, so a writer can send each chunk on its own.
+///
+/// # Errors
+///
+/// `InvalidInput` for anything the protocol does not allow; nothing is encoded then.
+pub fn encode_response_chunks<E: EthSpec>(
+    protocol: Protocol,
+    chunks: &[ReceivedChunk<E>],
+) -> io::Result<Vec<Vec<u8>>> {
     let max = match protocol {
         Protocol::GoodbyeV1 => 0,
         Protocol::BlocksByRangeV2 => usize::MAX,
@@ -540,7 +560,7 @@ pub fn encode_response<E: EthSpec>(
                 encode_error_chunk(*code, message)
             }
         };
-        out.extend(bytes.map_err(|e| invalid_response(e.to_string()))?);
+        out.push(bytes.map_err(|e| invalid_response(e.to_string()))?);
     }
     Ok(out)
 }
@@ -599,6 +619,109 @@ impl<E: EthSpec> RpcCodec<E> {
         if let (Err(ReadError::Deadline(kind)), Some(metrics)) = (result, &self.metrics) {
             metrics.timed_out(*kind);
         }
+    }
+}
+
+/// Our answer to one inbound request: its chunks and, if they are rate limited, the pacer of
+/// the requester's bucket.
+#[derive(Debug, Clone)]
+pub struct Answer<E: EthSpec> {
+    /// The chunks, in order.
+    pub chunks: Vec<ReceivedChunk<E>>,
+    /// Paces the chunks; `None` sends them at once.
+    pub pacer: Option<ChunkPacer>,
+}
+
+impl<E: EthSpec> From<Vec<ReceivedChunk<E>>> for Answer<E> {
+    /// `chunks`, unpaced.
+    fn from(chunks: Vec<ReceivedChunk<E>>) -> Self {
+        Self {
+            chunks,
+            pacer: None,
+        }
+    }
+}
+
+/// The codec of an inbound-only behaviour: reads requests as [`RpcCodec`] does and writes
+/// [`Answer`]s chunk by chunk (see the module docs). It never sends a request.
+#[derive(Debug)]
+pub struct InboundCodec<E: EthSpec> {
+    inner: RpcCodec<E>,
+}
+
+impl<E: EthSpec> Clone for InboundCodec<E> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<E: EthSpec> InboundCodec<E> {
+    /// Requests read by `inner`.
+    pub fn new(inner: RpcCodec<E>) -> Self {
+        Self { inner }
+    }
+}
+
+fn inbound_only() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "an inbound-only codec sends no request",
+    )
+}
+
+impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
+    type Protocol = Protocol;
+    type Request = RpcRequest;
+    type Response = Answer<E>;
+
+    async fn read_request<T>(&mut self, protocol: &Protocol, io: &mut T) -> io::Result<RpcRequest>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        self.inner.read_request(protocol, io).await
+    }
+
+    async fn read_response<T>(&mut self, _: &Protocol, _: &mut T) -> io::Result<Answer<E>>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        Err(inbound_only())
+    }
+
+    async fn write_request<T>(&mut self, _: &Protocol, _: &mut T, _: RpcRequest) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        Err(inbound_only())
+    }
+
+    /// Checks the whole answer ([`encode_response`]), then writes each chunk whole once its
+    /// token is due. A chunk whose write never happened (the future was dropped) is refunded.
+    async fn write_response<T>(
+        &mut self,
+        protocol: &Protocol,
+        io: &mut T,
+        answer: Answer<E>,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        for bytes in encode_response_chunks(*protocol, &answer.chunks)? {
+            let reservation = answer.pacer.as_ref().map(ChunkPacer::reserve);
+            if let Some(due) = reservation.as_ref().map(|r| r.due()) {
+                if due > tokio::time::Instant::now() {
+                    tokio::time::sleep_until(due).await;
+                }
+            }
+            io.write_all(&bytes).await?;
+            io.flush().await?;
+            if let Some(reservation) = reservation {
+                reservation.sent();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -697,6 +820,7 @@ impl<E: EthSpec> request_response::Codec for RpcCodec<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc::limits::{shared_limiter, ChunkPacer, Quota, RateLimits};
     use consensus_types::{forked, Minimal};
     use futures::io::Cursor;
     use libp2p::request_response::Codec as _;
@@ -1104,12 +1228,12 @@ mod tests {
             malformed(read_req(Protocol::MetaDataV3, vec![0]).await),
             CodecError::TrailingBytes(1)
         );
-        // The right length, the wrong SSZ: a 7-byte Ping.
+        // A 7-byte Ping: below the type's one length, refused at the prefix before any SSZ.
         let short = p2p_wire::rpc::codec::encode_chunk(&[0u8; 7]).unwrap();
-        assert!(matches!(
+        assert_eq!(
             malformed(read_req(Protocol::PingV1, short).await),
-            CodecError::Decode(_)
-        ));
+            CodecError::PayloadTooSmall { len: 7, min: 8 }
+        );
     }
 
     #[tokio::test]
@@ -1635,5 +1759,170 @@ mod tests {
         assert!(decoded_size(&chunk, len) >= 2 * len);
         let ping: ResponseChunk<E> = ResponseChunk::Success(Response::Ping(Ping(1)));
         assert!(decoded_size(&ping, 8) >= 8);
+    }
+
+    // --- paced answers ---
+
+    /// Records when each write happened and how long it was; takes every byte at once.
+    #[derive(Default)]
+    struct Timed {
+        writes: Vec<(Instant, usize)>,
+    }
+
+    impl AsyncWrite for Timed {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes.push((Instant::now(), buf.len()));
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    const BLOCKS: Protocol = Protocol::BlocksByRangeV2;
+
+    fn blocks(n: u64) -> Vec<ReceivedChunk<E>> {
+        (1..=n)
+            .map(|slot| ReceivedChunk {
+                context: Some(testkit::FULU_DIGEST),
+                chunk: ResponseChunk::Success(Response::Block(Box::new(
+                    forked::SignedBeaconBlock::Fulu(testkit::fulu_block::<E>(slot)),
+                ))),
+            })
+            .collect()
+    }
+
+    fn inbound_codec() -> InboundCodec<E> {
+        InboundCodec::new(codec())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paced_answer_streams_each_chunk_on_its_token() {
+        // Two blocks at once, then one per 500 ms; the burst is already spent.
+        let limiter = shared_limiter(RateLimits {
+            blocks_by_range: Quota::new(2, Duration::from_millis(500)),
+            ..RateLimits::default()
+        });
+        let peer = libp2p::PeerId::random();
+        let start = Instant::now();
+        for _ in 0..2 {
+            limiter.lock().unwrap().schedule(peer, BLOCKS, start);
+        }
+        let metrics = RpcMetrics::register(&mut prometheus_client::registry::Registry::default());
+        let pacer = ChunkPacer::new(limiter, peer, BLOCKS, Some(metrics.clone()));
+        let chunks = blocks(4);
+        let whole: Vec<usize> = chunks
+            .iter()
+            .map(|c| {
+                encode_response(BLOCKS, std::slice::from_ref(c))
+                    .unwrap()
+                    .len()
+            })
+            .collect();
+        let answer = Answer {
+            chunks,
+            pacer: Some(pacer),
+        };
+        let mut io = Timed::default();
+        inbound_codec()
+            .write_response(&BLOCKS, &mut io, answer)
+            .await
+            .unwrap();
+        // The first chunk leaves when its own token is back, not the last one's; each chunk
+        // goes out whole, one period after the one before it.
+        let at: Vec<u128> = io
+            .writes
+            .iter()
+            .map(|(t, _)| (*t - start).as_millis())
+            .collect();
+        assert_eq!(at, [500, 1000, 1500, 2000]);
+        let lens: Vec<usize> = io.writes.iter().map(|(_, n)| *n).collect();
+        assert_eq!(lens, whole);
+        assert_eq!(metrics.rate_limited_count(BLOCKS), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unpaced_answer_goes_out_at_once() {
+        let mut io = Timed::default();
+        let start = Instant::now();
+        let answer: Answer<E> = blocks(3).into();
+        inbound_codec()
+            .write_response(&BLOCKS, &mut io, answer)
+            .await
+            .unwrap();
+        assert_eq!(io.writes.len(), 3);
+        assert!(io.writes.iter().all(|(t, _)| *t == start));
+        // A malformed answer is refused before any chunk is written.
+        let mut io = Timed::default();
+        let two_pings: Answer<E> = vec![
+            ReceivedChunk {
+                context: None,
+                chunk: ResponseChunk::Success(Response::Ping(Ping(1))),
+            };
+            2
+        ]
+        .into();
+        let err = inbound_codec()
+            .write_response(&Protocol::PingV1, &mut io, two_pings)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(io.writes.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_paced_write_refunds_its_unsent_chunk() {
+        // One block a second, the token spent: the first chunk waits a second.
+        let limiter = shared_limiter(RateLimits {
+            blocks_by_range: Quota::new(1, Duration::from_secs(1)),
+            ..RateLimits::default()
+        });
+        let peer = libp2p::PeerId::random();
+        let start = Instant::now();
+        limiter.lock().unwrap().schedule(peer, BLOCKS, start);
+        let answer = Answer {
+            chunks: blocks(3),
+            pacer: Some(ChunkPacer::new(limiter.clone(), peer, BLOCKS, None)),
+        };
+        let mut io = Timed::default();
+        let mut codec = inbound_codec();
+        // The stream goes away (the connection closed) before the chunk is due.
+        let write = codec.write_response(&BLOCKS, &mut io, answer);
+        assert!(tokio::time::timeout(Duration::from_millis(100), write)
+            .await
+            .is_err());
+        assert!(io.writes.is_empty());
+        // The chunk was never sent, so it is not charged: the next one is due when the spent
+        // token is back, not a period later.
+        let now = Instant::now();
+        let due = limiter.lock().unwrap().schedule(peer, BLOCKS, now);
+        assert_eq!(due - start, Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn the_inbound_codec_only_reads_requests_and_writes_answers() {
+        let mut codec = inbound_codec();
+        let bytes = p2p_wire::rpc::codec::encode_request(&Request::Ping(Ping(3))).unwrap();
+        let read = codec
+            .read_request(&Protocol::PingV1, &mut Cursor::new(bytes))
+            .await
+            .unwrap();
+        assert_eq!(read, RpcRequest::Valid(Request::Ping(Ping(3))));
+        let mut sink = Cursor::new(Vec::new());
+        assert!(codec
+            .write_request(&Protocol::PingV1, &mut sink, Request::Ping(Ping(3)).into())
+            .await
+            .is_err());
+        assert!(codec
+            .read_response(&Protocol::PingV1, &mut Cursor::new(Vec::new()))
+            .await
+            .is_err());
     }
 }

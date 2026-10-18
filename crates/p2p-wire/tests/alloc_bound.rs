@@ -156,3 +156,123 @@ fn valid_payload_allocates_its_length_and_the_fixed_buffers() {
         m.peak
     );
 }
+
+/// The req/resp bounds of `phase0/p2p-interface.md` "SSZ-snappy encoding strategy" (L1327–1394),
+/// measured under the counting allocator.
+mod rpc {
+    use super::*;
+    use consensus_types::Minimal;
+    use p2p_wire::rpc::codec::{
+        decode_request, decode_response_chunk, max_compressed_len, ChunkScanner, Scan,
+    };
+    use p2p_wire::rpc::protocols::Protocol;
+
+    /// Only the varint of `declared`: no frame follows.
+    fn prefix_only(declared: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_varint(declared, &mut out);
+        out
+    }
+
+    #[test]
+    fn prefix_over_bound_no_alloc() {
+        // MAX_PAYLOAD_SIZE + 1 with no body at all: the scanner refuses at the prefix instead
+        // of asking for frames, and neither it nor the decoder allocates.
+        let over = prefix_only(MAX_PAYLOAD_SIZE as u64 + 1);
+        let too_large = CodecError::PayloadTooLarge {
+            len: MAX_PAYLOAD_SIZE as u64 + 1,
+            max: MAX_PAYLOAD_SIZE,
+        };
+        let m = measure(|| {
+            (
+                ChunkScanner::new(usize::MAX).scan(&over),
+                decode_chunk(&over, usize::MAX),
+            )
+        });
+        assert_eq!(m.value, (Err(too_large.clone()), Err(too_large)));
+        assert_eq!(m.peak, 0, "refused at the prefix without allocating");
+
+        // Above the type bound: Status is 92 bytes. A 93-byte prefix followed by 1 MiB of
+        // garbage is refused at the prefix (not as bad snappy), as a request and as a response
+        // chunk, with nothing allocated.
+        let status = Protocol::StatusV2.limits::<Minimal>();
+        assert_eq!((status.ssz_min, status.ssz_max), (92, 92));
+        let mut request = prefix_only(93);
+        request.extend(vec![0xa5; 1 << 20]);
+        let mut response = vec![0];
+        response.extend_from_slice(&request);
+        let contexts = p2p_wire::testkit::context_table();
+        let m = measure(|| {
+            (
+                decode_request(Protocol::StatusV2, &request),
+                decode_response_chunk::<Minimal>(&response, Protocol::StatusV2, &contexts),
+            )
+        });
+        let over_type = CodecError::PayloadTooLarge { len: 93, max: 92 };
+        assert_eq!(m.value.0, Err(over_type.clone()));
+        assert_eq!(m.value.1.err(), Some(over_type));
+        assert_eq!(m.peak, 0, "refused at the prefix without allocating");
+
+        // Below it too: a fixed-size type has one valid length.
+        let under = prefix_only(91);
+        let m = measure(|| decode_request(Protocol::StatusV2, &under));
+        assert_eq!(
+            m.value,
+            Err(CodecError::PayloadTooSmall { len: 91, min: 92 })
+        );
+        assert_eq!(m.peak, 0);
+        let mut scanner = ChunkScanner::with_bounds(status.request.unwrap());
+        assert_eq!(
+            scanner.scan(&under),
+            Err(CodecError::PayloadTooSmall { len: 91, min: 92 })
+        );
+        // The bound itself still asks for the frames.
+        let mut scanner = ChunkScanner::with_bounds(status.request.unwrap());
+        assert!(matches!(
+            scanner.scan(&prefix_only(92)),
+            Ok(Scan::Incomplete { .. })
+        ));
+    }
+
+    #[test]
+    fn snappy_bomb() {
+        // 4 KiB declared; one snappy frame of 64 KiB of zeros, about 3 KiB compressed, so it
+        // fits under max_compressed_len(4096) and only the output bound can stop it.
+        let declared = 4096;
+        let bomb = prefixed(declared, &[0u8; 65_536]);
+        assert!(
+            bomb.len() <= 2 + max_compressed_len(declared),
+            "{}",
+            bomb.len()
+        );
+        let m = measure(|| decode_chunk(&bomb, MAX_PAYLOAD_SIZE));
+        assert_eq!(m.value, Err(CodecError::PayloadOverrun { len: declared }));
+        // The output never grows past the prefix: n bytes plus snappy's fixed buffers.
+        assert!(m.largest <= 76_490, "largest allocation {}", m.largest);
+        assert!(m.peak <= declared + SNAPPY_FIXED + SLACK, "peak {}", m.peak);
+
+        // Exactly the declared bytes decode; any byte after the last frame is refused, a whole
+        // second payload's frames included.
+        let data = vec![7u8; declared];
+        let chunk = encode_chunk(&data).unwrap();
+        assert_eq!(decode_chunk(&chunk, declared).as_deref(), Ok(&data[..]));
+        let mut one_more = chunk.clone();
+        one_more.push(0);
+        assert_eq!(
+            decode_chunk(&one_more, declared),
+            Err(CodecError::TrailingBytes(1))
+        );
+        let (_, prefix) = p2p_wire::rpc::codec::decode_varint(&chunk).unwrap();
+        let mut two = chunk.clone();
+        two.extend_from_slice(&chunk[prefix..]);
+        assert_eq!(
+            decode_chunk(&two, declared),
+            Err(CodecError::TrailingBytes(chunk.len() - prefix))
+        );
+        // An early EOF inside the frames is truncated, never a short payload.
+        assert_eq!(
+            decode_chunk(&chunk[..chunk.len() - 1], declared),
+            Err(CodecError::Truncated)
+        );
+    }
+}

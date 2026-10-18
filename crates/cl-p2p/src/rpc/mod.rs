@@ -1,19 +1,23 @@
 //! Req/resp over libp2p `request_response`.
 //!
-//! One [`request_response::Behaviour`] per protocol: `request_response` offers every protocol
-//! of a behaviour on each outbound stream and multistream-select picks the first the peer
-//! supports, so a behaviour holding all of them would send a `Status` on whatever protocol came
-//! first. One protocol per behaviour also makes `with_max_concurrent_streams(2)` the
-//! per-protocol limit `MAX_CONCURRENT_REQUESTS` (`phase0/p2p-interface.md` L309).
+//! One [`request_response::Behaviour`] per protocol (and, on the probe, per direction:
+//! [`inbound::Duplex`]): `request_response` offers every protocol of a behaviour on each
+//! outbound stream and multistream-select picks the first the peer supports, so a behaviour
+//! holding all of them would send a `Status` on whatever protocol came first. One protocol per
+//! behaviour also makes `with_max_concurrent_streams(2)` the per-protocol limit
+//! `MAX_CONCURRENT_REQUESTS` (`phase0/p2p-interface.md` L309) on each connection.
 //!
 //! - [`codec`]: both halves of the `ssz_snappy` codec, with the deadlines inside it.
 //! - [`outbound`]: one exchange on a swarm, for the m2a session.
 //! - [`inbound`]: the probe swarm's behaviour, answering and initiating Status, MetaData, Ping
 //!   and Goodbye ([`inbound::Control`]).
-//! - [`metrics`]: `rpc_timeouts_total`, the Goodbye counters and `p2p_status_valid_peers`.
+//! - [`limits`]: the per-peer rate limit, the outbound semaphore and the bounded IGNORE queues.
+//! - [`metrics`]: `rpc_timeouts_total`, the Goodbye counters, `p2p_status_valid_peers` and the
+//!   limit counters.
 
 pub mod codec;
 pub mod inbound;
+pub mod limits;
 pub mod metrics;
 pub mod outbound;
 #[cfg(test)]

@@ -13,11 +13,13 @@
 //!
 //! - The prefix is the unsigned-LEB128 (protobuf) varint of the *uncompressed* SSZ length, at
 //!   most [`MAX_VARINT_LEN`] bytes, minimally encoded.
-//! - The prefix must not exceed the smaller of the type's SSZ bound and `MAX_PAYLOAD_SIZE`
-//!   (10 MiB, `phase0` L299). It is checked **before** anything is allocated for the payload.
+//! - The prefix must lie within the type's SSZ bounds ([`SszBounds`], from the protocol's
+//!   [`ProtocolLimits`](crate::rpc::protocols::ProtocolLimits) row), its upper bound capped at
+//!   `MAX_PAYLOAD_SIZE` (10 MiB, `phase0` L299, L1365). It is checked **before** anything is
+//!   allocated for the payload or a byte of it is read.
 //! - The frames are the snappy framing format. At most [`max_compressed_len`]`(n)` =
-//!   `32 + n + n / 6` compressed bytes are read, decoding stops at `n` bytes, and fewer bytes, more
-//!   decompressed bytes or more input are each an error.
+//!   `32 + n + n / 6` compressed bytes are read, the decoder's output is read through
+//!   `take(n)`, and fewer bytes, more decompressed bytes or more input are each an error.
 //! - `result` is 0 (success) or 1-3 (error, payload `ErrorMessage` of at most 256 bytes). Any
 //!   other value is refused before the rest of the chunk is read.
 //! - Context bytes are the 4-byte fork digest, present only on a success chunk of a protocol
@@ -42,7 +44,7 @@ use crate::rpc::messages::{
     BlocksByRangeV2Request, ErrorMessage, ForkDigest, Goodbye, MetaDataV3, Ping, StatusV2,
     MAX_ERROR_MESSAGE_LEN,
 };
-use crate::rpc::protocols::{Protocol, Request, Response, ResponseChunk, ResultCode};
+use crate::rpc::protocols::{Protocol, Request, Response, ResponseChunk, ResultCode, SszBounds};
 use consensus_types::caps::MAX_PAYLOAD_SIZE;
 use consensus_types::codec::DecodeError;
 use consensus_types::{forked, EthSpec, ForkName};
@@ -97,6 +99,15 @@ pub enum CodecError {
         len: u64,
         /// The bound: min(type bound, `MAX_PAYLOAD_SIZE`).
         max: usize,
+    },
+    /// The declared SSZ length is below the type's shortest encoding; nothing was allocated
+    /// for it.
+    #[error("declared length {len} is below the type's minimum {min}")]
+    PayloadTooSmall {
+        /// The declared length.
+        len: u64,
+        /// The shortest valid encoding of the type.
+        min: usize,
     },
     /// The compressed payload runs past `max_compressed_len(len)`.
     #[error("compressed payload of a {len}-byte message exceeds {max} bytes")]
@@ -295,12 +306,17 @@ pub fn decode_varint(buf: &[u8]) -> Result<(u64, usize), CodecError> {
     read_varint(buf)?.ok_or(CodecError::Truncated)
 }
 
-/// The declared length if it is within `max` and `MAX_PAYLOAD_SIZE`.
-fn check_declared(len: u64, max: usize) -> Result<usize, CodecError> {
-    let max = max.min(MAX_PAYLOAD_SIZE);
+/// The declared length if it is within `bounds` and `MAX_PAYLOAD_SIZE`.
+fn check_declared(len: u64, bounds: SszBounds) -> Result<usize, CodecError> {
+    let max = bounds.max.min(MAX_PAYLOAD_SIZE);
     match usize::try_from(len) {
-        Ok(n) if n <= max => Ok(n),
-        _ => Err(CodecError::PayloadTooLarge { len, max }),
+        Ok(n) if n > max => Err(CodecError::PayloadTooLarge { len, max }),
+        Ok(n) if n < bounds.min => Err(CodecError::PayloadTooSmall {
+            len,
+            min: bounds.min,
+        }),
+        Ok(n) => Ok(n),
+        Err(_) => Err(CodecError::PayloadTooLarge { len, max }),
     }
 }
 
@@ -351,13 +367,14 @@ struct PayloadProgress {
     out: usize,
 }
 
-/// An incremental scanner of one payload (prefix and frames) whose SSZ bound is `max`.
+/// An incremental scanner of one payload (prefix and frames) within SSZ bounds.
 ///
 /// Each [`ChunkScanner::scan`] resumes where the last one stopped, so every frame header is
 /// parsed once however the bytes arrive: the work is linear in the payload. It fails as soon
 /// as the bytes so far break a bound:
 ///
-/// - a prefix over 10 bytes, or a declared length over `min(max, MAX_PAYLOAD_SIZE)`;
+/// - a prefix over 10 bytes, or a declared length outside the bounds (the upper one capped at
+///   `MAX_PAYLOAD_SIZE`);
 /// - a frame header that does not fit under `max_compressed_len(n)`, or whose frame would not;
 /// - a frame body over snappy's maximum for its type ([`MAX_FRAME_BODY_LEN`],
 ///   [`MAX_UNCOMPRESSED_FRAME_BODY_LEN`]), refused from the header;
@@ -366,17 +383,22 @@ struct PayloadProgress {
 /// Frame contents (CRC, stream identifier, decompression) are checked by [`decode_chunk`].
 #[derive(Debug, Clone)]
 pub struct ChunkScanner {
-    max: usize,
+    bounds: SszBounds,
     progress: Option<PayloadProgress>,
     frames: usize,
     empty_frames: usize,
 }
 
 impl ChunkScanner {
-    /// A scanner for a payload whose SSZ bound is `max`.
+    /// A scanner for a payload of at most `max` SSZ bytes.
     pub fn new(max: usize) -> Self {
+        Self::with_bounds(SszBounds { min: 0, max })
+    }
+
+    /// A scanner for a payload whose SSZ length lies within `bounds`.
+    pub fn with_bounds(bounds: SszBounds) -> Self {
         Self {
-            max,
+            bounds,
             progress: None,
             frames: 0,
             empty_frames: 0,
@@ -403,10 +425,10 @@ impl ChunkScanner {
                     return Ok(Scan::Incomplete {
                         need: 1,
                         max_len: MAX_VARINT_LEN
-                            + max_compressed_len(self.max.min(MAX_PAYLOAD_SIZE)),
+                            + max_compressed_len(self.bounds.max.min(MAX_PAYLOAD_SIZE)),
                     });
                 };
-                let n = check_declared(declared, self.max)?;
+                let n = check_declared(declared, self.bounds)?;
                 PayloadProgress {
                     prefix,
                     n,
@@ -481,7 +503,7 @@ pub fn scan_chunk(buf: &[u8], max: usize) -> Result<Scan, CodecError> {
 
 /// Encodes `ssz` as one payload: its length prefix, then snappy frames.
 pub fn encode_chunk(ssz: &[u8]) -> Result<Vec<u8>, CodecError> {
-    let n = check_declared(ssz.len() as u64, MAX_PAYLOAD_SIZE)?;
+    let n = check_declared(ssz.len() as u64, SszBounds::up_to(MAX_PAYLOAD_SIZE))?;
     let mut out = Vec::with_capacity(MAX_VARINT_LEN + max_compressed_len(n));
     encode_varint(n as u64, &mut out);
     let mut encoder = snap::write::FrameEncoder::new(&mut out);
@@ -495,7 +517,14 @@ pub fn encode_chunk(ssz: &[u8]) -> Result<Vec<u8>, CodecError> {
 
 /// Decodes `buf`, which must be exactly one payload whose SSZ bound is `max`, to its SSZ bytes.
 pub fn decode_chunk(buf: &[u8], max: usize) -> Result<Vec<u8>, CodecError> {
-    let len = match scan_chunk(buf, max)? {
+    decode_chunk_within(buf, SszBounds { min: 0, max })
+}
+
+/// Decodes `buf`, which must be exactly one payload whose SSZ length lies within `bounds`, to
+/// its SSZ bytes. The prefix is checked first, so a length outside `bounds` is refused before
+/// a frame is parsed or a byte allocated.
+pub fn decode_chunk_within(buf: &[u8], bounds: SszBounds) -> Result<Vec<u8>, CodecError> {
+    let len = match ChunkScanner::with_bounds(bounds).scan(buf)? {
         Scan::Incomplete { .. } => return Err(CodecError::Truncated),
         Scan::Complete { len } => len,
     };
@@ -503,11 +532,12 @@ pub fn decode_chunk(buf: &[u8], max: usize) -> Result<Vec<u8>, CodecError> {
         return Err(CodecError::TrailingBytes(buf.len() - len));
     }
     let (declared, prefix) = decode_varint(buf)?;
-    let n = check_declared(declared, max)?;
+    let n = check_declared(declared, bounds)?;
     decompress(&buf[prefix..], n)
 }
 
-/// Decompresses exactly `n` bytes from `frames`, reading at most `max_compressed_len(n)`.
+/// Decompresses exactly `n` bytes from `frames`, reading at most `max_compressed_len(n)` of
+/// them and at most `n` of the decoder's output (`take(n)`).
 fn decompress(frames: &[u8], n: usize) -> Result<Vec<u8>, CodecError> {
     let limit = max_compressed_len(n);
     let mut decoder = snap::read::FrameDecoder::new(frames.take(limit as u64));
@@ -519,14 +549,10 @@ fn decompress(frames: &[u8], n: usize) -> Result<Vec<u8>, CodecError> {
         }
     };
     let mut out = vec![0u8; n];
-    let mut filled = 0;
-    while filled < n {
-        match decoder.read(&mut out[filled..]) {
-            Ok(0) => return Err(ended(&decoder)),
-            Ok(k) => filled += k,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Err(ended(&decoder)),
-            Err(e) => return Err(CodecError::Snappy(e.to_string())),
-        }
+    match (&mut decoder).take(n as u64).read_exact(&mut out) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Err(ended(&decoder)),
+        Err(e) => return Err(CodecError::Snappy(e.to_string())),
     }
     // Stop at `n`: a frame that holds more than the prefix declared is an error.
     match decoder.read(&mut [0u8; 1]) {
@@ -546,13 +572,13 @@ pub fn encode_request(request: &Request) -> Result<Vec<u8>, CodecError> {
 
 /// Decodes `buf`, which must be exactly one request of `protocol`.
 pub fn decode_request(protocol: Protocol, buf: &[u8]) -> Result<Request, CodecError> {
-    let Some(max) = protocol.request_len() else {
+    let Some(bounds) = protocol.request_bounds() else {
         return match buf.len() {
             0 => Ok(Request::MetaData),
             extra => Err(CodecError::TrailingBytes(extra)),
         };
     };
-    let ssz = decode_chunk(buf, max)?;
+    let ssz = decode_chunk_within(buf, bounds)?;
     Ok(match protocol {
         Protocol::StatusV2 => Request::Status(StatusV2::from_ssz_bytes(&ssz)?),
         Protocol::PingV1 => Request::Ping(Ping::from_ssz_bytes(&ssz)?),
@@ -580,7 +606,10 @@ pub fn encode_error_chunk(code: ResultCode, message: &[u8]) -> Result<Vec<u8>, C
     if code == ResultCode::Success {
         return Err(CodecError::InvalidResultCode(code.as_byte()));
     }
-    check_declared(message.len() as u64, MAX_ERROR_MESSAGE_LEN)?;
+    check_declared(
+        message.len() as u64,
+        SszBounds::up_to(MAX_ERROR_MESSAGE_LEN),
+    )?;
     let mut out = vec![code.as_byte()];
     out.extend(encode_chunk(message)?);
     Ok(out)
@@ -593,8 +622,8 @@ struct ChunkHead {
     fork: Option<ForkName>,
     /// Bytes before the payload.
     len: usize,
-    /// The payload's SSZ bound.
-    max: usize,
+    /// The payload's SSZ bounds.
+    bounds: SszBounds,
 }
 
 /// Parses the head at the start of `buf`; `Ok(Err(need))` if more bytes are needed.
@@ -612,7 +641,7 @@ fn parse_head<E: EthSpec>(
             code,
             fork: None,
             len: 1,
-            max: protocol.error_max_len(),
+            bounds: protocol.error_bounds(),
         }));
     }
     let (fork, len) = if protocol.has_context_bytes() {
@@ -628,8 +657,8 @@ fn parse_head<E: EthSpec>(
     } else {
         (None, 1)
     };
-    let max = match protocol.response_max_len::<E>(fork) {
-        Some(max) => max,
+    let bounds = match protocol.response_bounds::<E>(fork) {
+        Some(bounds) => bounds,
         None if protocol.has_context_bytes() => return Err(CodecError::MissingContext(protocol)),
         None => return Err(CodecError::NoResponse(protocol)),
     };
@@ -637,7 +666,7 @@ fn parse_head<E: EthSpec>(
         code,
         fork,
         len,
-        max,
+        bounds,
     }))
 }
 
@@ -675,7 +704,7 @@ impl<'a, E: EthSpec> ResponseChunkScanner<'a, E> {
                     })
                 }
                 Ok(head) => {
-                    let payload = ChunkScanner::new(head.max);
+                    let payload = ChunkScanner::with_bounds(head.bounds);
                     self.head = Some((head, payload));
                 }
             }
@@ -725,7 +754,7 @@ pub fn decode_response_chunk<E: EthSpec>(
         Ok(head) => head,
         Err(_) => return Err(CodecError::Truncated),
     };
-    let ssz = decode_chunk(&buf[head.len..], head.max)?;
+    let ssz = decode_chunk_within(&buf[head.len..], head.bounds)?;
     if head.code != ResultCode::Success {
         return Ok(ResponseChunk::Error {
             code: head.code,
@@ -891,6 +920,38 @@ mod tests {
             decode_chunk(&chunk, 92),
             Err(CodecError::PayloadTooLarge { len: 93, max: 92 })
         );
+    }
+
+    #[test]
+    fn length_prefix_under_type_bound_rejected() {
+        // Status is fixed-size: a shorter payload is refused at its prefix, as a request and as
+        // a response chunk, before a frame is read.
+        let chunk = encode_chunk(&[0u8; 91]).unwrap();
+        let err = CodecError::PayloadTooSmall { len: 91, min: 92 };
+        assert_eq!(decode_request(Protocol::StatusV2, &chunk), Err(err.clone()));
+        let mut response = vec![0];
+        response.extend_from_slice(&chunk);
+        let contexts = testkit::context_table();
+        assert_eq!(
+            scan_response_chunk::<E>(&response[..2], Protocol::StatusV2, &contexts),
+            Err(err.clone())
+        );
+        assert_eq!(
+            decode_response_chunk::<E>(&response, Protocol::StatusV2, &contexts),
+            Err(err)
+        );
+        assert!(CodecError::PayloadTooSmall { len: 1, min: 2 }
+            .to_string()
+            .contains("below the type's minimum 2"));
+        // A block shorter than any block's fixed parts.
+        let tiny = encode_success_chunk(Some(testkit::GLOAS_DIGEST), &[0u8; 100]).unwrap();
+        assert!(matches!(
+            decode_response_chunk::<E>(&tiny, Protocol::BlocksByRangeV2, &contexts),
+            Err(CodecError::PayloadTooSmall { len: 100, .. })
+        ));
+        // Error messages have no minimum.
+        let empty = encode_error_chunk(ResultCode::ServerError, b"").unwrap();
+        assert!(decode_response_chunk::<E>(&empty, Protocol::StatusV2, &contexts).is_ok());
     }
 
     #[test]

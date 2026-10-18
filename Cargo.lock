@@ -1106,6 +1106,7 @@ dependencies = [
  "node-key",
  "p2p-wire",
  "prometheus-client",
+ "proptest",
  "rustix",
  "serde",
  "serde_json",

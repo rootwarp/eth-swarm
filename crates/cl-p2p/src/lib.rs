@@ -15,6 +15,7 @@
 pub mod behaviour;
 pub mod identity;
 pub mod m2a_session;
+pub mod peer_caps;
 pub mod rpc;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;

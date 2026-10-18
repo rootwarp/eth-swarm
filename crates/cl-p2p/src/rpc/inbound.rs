@@ -1,9 +1,9 @@
 //! The control protocols, both ways: Status v2, MetaData v3, Ping v1 and Goodbye v1, plus
 //! `BeaconBlocksByRange` v2 answered `3: ResourceUnavailable` (the probe stores no blocks).
 //!
-//! [`Control`] is the probe swarm's req/resp behaviour. It holds one `request_response`
-//! behaviour per protocol ([`Protocols`], see [`crate::rpc`] for why one each), every one with
-//! `ProtocolSupport::Full`, so these five are what multistream-select offers and any other
+//! [`Control`] is the probe swarm's req/resp behaviour. It holds one [`Duplex`] per protocol
+//! ([`Protocols`], see [`crate::rpc`] for why one each): an inbound-only and an outbound-only
+//! `request_response` behaviour, so these five are what multistream-select offers and any other
 //! protocol fails negotiation (`phase0/p2p-interface.md` L187–190). It answers every inbound
 //! request itself and reports what it learned as [`ControlEvent`]s.
 //!
@@ -28,6 +28,25 @@
 //! Error chunks carry no context bytes and `3` only where the protocol specifies it: the codec
 //! refuses anything else ([`super::codec::encode_response`]).
 //!
+//! # Limits
+//!
+//! [`ControlConfig::limits`] ([`super::limits`]):
+//!
+//! - **Rate**: every answer goes to its stream with the pacer of the peer's bucket of its
+//!   protocol ([`super::codec::Answer`]). The stream's writer charges each chunk when it is next
+//!   to go and, over the quota, withholds it until its token is free, then sends it whole: never
+//!   an error chunk, never a closed stream (`phase0` L1269–1274), counted in
+//!   `rpc_rate_limited_total{protocol}`. A chunk that never went out (the peer left) is
+//!   refunded; a sent one stays charged after a reconnect.
+//! - **Inbound streams**: each [`Duplex`] serves at most [`MAX_CONCURRENT_REQUESTS`] inbound
+//!   streams per connection, apart from ours, and resets the next one; a withheld chunk keeps
+//!   its stream, so a peer over its quota cannot open more.
+//! - **Outbound requests**: at most [`MAX_CONCURRENT_REQUESTS`] in flight per protocol across
+//!   every peer (`rpc_outbound_inflight{protocol}`), the rest waiting in the protocol's bounded
+//!   queue. A full queue IGNOREs the request (`queue_dropped_total{queue}`); an IGNOREd Goodbye
+//!   closes the connection at once, since it was going to close anyway. A waiting request whose
+//!   peer has left is dropped when its turn comes.
+//!
 //! # Status
 //!
 //! On every connection we dial, our Status goes out first ("the dialing client MUST send a
@@ -44,7 +63,12 @@
 //! until then it holds one of the protocol's [`MAX_CONCURRENT_REQUESTS`] stream slots on its
 //! connection. Every passed deadline counts in `rpc_timeouts_total{kind}`.
 
-use super::codec::{Deadline, Deadlines, ReadError, ReceivedChunk, RpcCodec, RpcRequest};
+use super::codec::{
+    Answer, Deadline, Deadlines, InboundCodec, ReadError, ReceivedChunk, RpcCodec, RpcRequest,
+};
+use super::limits::{
+    shared_limiter, Admit, ChunkPacer, OutboundSemaphore, RpcLimits, SharedLimiter,
+};
 use super::metrics::{RpcMetrics, StatusValidity};
 use super::{MAX_CONCURRENT_REQUESTS, REQUEST_TIMEOUT};
 use crate::transport::Direction;
@@ -63,11 +87,12 @@ use libp2p::{Multiaddr, PeerId};
 use p2p_wire::rpc::codec::ContextTable;
 use p2p_wire::rpc::messages::{ErrorMessage, Goodbye, MetaDataV3, Ping, StatusV2};
 use p2p_wire::rpc::protocols::{Protocol, Request, Response, ResponseChunk, ResultCode};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::time::Instant;
 
 /// Goodbye reason 1: client shut down.
 pub const GOODBYE_CLIENT_SHUTDOWN: u64 = 1;
@@ -222,6 +247,8 @@ pub struct ControlConfig {
     pub contexts: Arc<ContextTable>,
     /// The codec's deadlines.
     pub deadlines: Deadlines,
+    /// The rate limits and the outbound queue (see the module docs).
+    pub limits: RpcLimits,
 }
 
 impl std::fmt::Debug for ControlConfig {
@@ -231,33 +258,79 @@ impl std::fmt::Debug for ControlConfig {
             .field("seq_number", &self.metadata.seq_number())
             .field("custody_group_count", &self.custody_group_count)
             .field("deadlines", &self.deadlines)
+            .field("limits", &self.limits)
             .finish_non_exhaustive()
     }
 }
 
-/// One `request_response` behaviour per protocol, each `ProtocolSupport::Full`.
+/// One protocol both ways: an inbound-only and an outbound-only `request_response` behaviour.
+///
+/// `request_response` caps the streams of a connection per behaviour, inbound and outbound
+/// together. Apart, each direction has its own [`MAX_CONCURRENT_REQUESTS`]: our open requests
+/// never take a slot of the peer's (or make ours fail while the peer has two open), and a
+/// peer's third concurrent stream is reset, whatever we have open.
+///
+/// The inbound side writes [`Answer`]s through [`InboundCodec`], chunk by chunk under the
+/// requester's quota; the outbound side reads responses as `Vec<ReceivedChunk>`.
+#[derive(NetworkBehaviour)]
+#[behaviour(prelude = "libp2p::swarm::derive_prelude")]
+pub struct Duplex<E: EthSpec> {
+    /// Serves the peer's requests.
+    pub inbound: request_response::Behaviour<InboundCodec<E>>,
+    /// Sends ours.
+    pub outbound: request_response::Behaviour<RpcCodec<E>>,
+}
+
+impl<E: EthSpec> Duplex<E> {
+    /// `protocol` both ways, each direction on its own clone of `codec`.
+    fn new(protocol: Protocol, codec: &RpcCodec<E>) -> Self {
+        let config = || {
+            request_response::Config::default()
+                .with_request_timeout(REQUEST_TIMEOUT)
+                .with_max_concurrent_streams(MAX_CONCURRENT_REQUESTS)
+        };
+        Self {
+            inbound: request_response::Behaviour::with_codec(
+                InboundCodec::new(codec.clone()),
+                [(protocol, ProtocolSupport::Inbound)],
+                config(),
+            ),
+            outbound: request_response::Behaviour::with_codec(
+                codec.clone(),
+                [(protocol, ProtocolSupport::Outbound)],
+                config(),
+            ),
+        }
+    }
+
+    /// Sends `request` to `peer`, dialing it if need be.
+    pub fn send_request(&mut self, peer: &PeerId, request: RpcRequest) -> OutboundRequestId {
+        self.outbound.send_request(peer, request)
+    }
+
+    /// Answers the request of `channel` (unpaced, from plain chunks).
+    ///
+    /// # Errors
+    ///
+    /// The answer back if the stream is gone.
+    pub fn send_response(
+        &mut self,
+        channel: ResponseChannel<Answer<E>>,
+        answer: impl Into<Answer<E>>,
+    ) -> Result<(), Answer<E>> {
+        self.inbound.send_response(channel, answer.into())
+    }
+}
+
+/// One [`Duplex`] per protocol.
 #[derive(NetworkBehaviour)]
 #[behaviour(prelude = "libp2p::swarm::derive_prelude")]
 pub struct Protocols<E: EthSpec> {
-    pub status: request_response::Behaviour<RpcCodec<E>>,
-    pub metadata: request_response::Behaviour<RpcCodec<E>>,
-    pub ping: request_response::Behaviour<RpcCodec<E>>,
-    pub goodbye: request_response::Behaviour<RpcCodec<E>>,
-    pub blocks_by_range: request_response::Behaviour<RpcCodec<E>>,
-}
-
-/// A behaviour serving and requesting `protocol`.
-fn full_behaviour<E: EthSpec>(
-    protocol: Protocol,
-    codec: RpcCodec<E>,
-) -> request_response::Behaviour<RpcCodec<E>> {
-    request_response::Behaviour::with_codec(
-        codec,
-        [(protocol, ProtocolSupport::Full)],
-        request_response::Config::default()
-            .with_request_timeout(REQUEST_TIMEOUT)
-            .with_max_concurrent_streams(MAX_CONCURRENT_REQUESTS),
-    )
+    pub status: Duplex<E>,
+    pub metadata: Duplex<E>,
+    pub ping: Duplex<E>,
+    pub goodbye: Duplex<E>,
+    pub blocks_by_range: Duplex<E>,
 }
 
 impl<E: EthSpec> Protocols<E> {
@@ -269,24 +342,22 @@ impl<E: EthSpec> Protocols<E> {
         deadlines: Deadlines,
         metrics: Option<RpcMetrics>,
     ) -> Self {
-        let codec = || {
-            let codec = RpcCodec::new(Arc::clone(&contexts), deadlines);
-            match &metrics {
-                Some(m) => codec.with_metrics(m.clone()),
-                None => codec,
-            }
+        let codec = RpcCodec::new(contexts, deadlines);
+        let codec = match metrics {
+            Some(m) => codec.with_metrics(m),
+            None => codec,
         };
         Self {
-            status: full_behaviour(Protocol::StatusV2, codec()),
-            metadata: full_behaviour(Protocol::MetaDataV3, codec()),
-            ping: full_behaviour(Protocol::PingV1, codec()),
-            goodbye: full_behaviour(Protocol::GoodbyeV1, codec()),
-            blocks_by_range: full_behaviour(Protocol::BlocksByRangeV2, codec()),
+            status: Duplex::new(Protocol::StatusV2, &codec),
+            metadata: Duplex::new(Protocol::MetaDataV3, &codec),
+            ping: Duplex::new(Protocol::PingV1, &codec),
+            goodbye: Duplex::new(Protocol::GoodbyeV1, &codec),
+            blocks_by_range: Duplex::new(Protocol::BlocksByRangeV2, &codec),
         }
     }
 
     /// The behaviour of `protocol`.
-    pub fn of(&mut self, protocol: Protocol) -> &mut request_response::Behaviour<RpcCodec<E>> {
+    pub fn of(&mut self, protocol: Protocol) -> &mut Duplex<E> {
         match protocol {
             Protocol::StatusV2 => &mut self.status,
             Protocol::MetaDataV3 => &mut self.metadata,
@@ -332,8 +403,8 @@ struct PeerState {
     status_valid: Option<bool>,
     /// The `seq_number` of its last MetaData.
     metadata_seq: Option<u64>,
-    /// Our open GetMetaData request.
-    metadata_request: Option<OutboundRequestId>,
+    /// Whether our GetMetaData request is open (in flight or waiting for a slot).
+    metadata_open: bool,
     /// Whether we sent it a Goodbye.
     goodbye_sent: bool,
 }
@@ -346,6 +417,13 @@ pub struct Control<E: EthSpec> {
     peers: HashMap<PeerId, PeerState>,
     /// Our Goodbye requests still open; the connection closes when each completes.
     goodbyes: HashMap<OutboundRequestId, PeerId>,
+    /// Our requests in flight, each holding a slot of its protocol. Keyed by protocol too:
+    /// every protocol's behaviour numbers its requests on its own, so IDs repeat across them.
+    in_flight: HashSet<(Protocol, OutboundRequestId)>,
+    /// The outbound slots and wait queues.
+    outbound: OutboundSemaphore<(PeerId, Request)>,
+    /// Every peer's response quota, shared with the inbound streams' writers.
+    limiter: SharedLimiter,
     pending: VecDeque<ToSwarm<ControlEvent, THandlerInEvent<Protocols<E>>>>,
 }
 
@@ -404,10 +482,16 @@ impl<E: EthSpec> Control<E> {
                 cfg.deadlines,
                 Some(metrics.clone()),
             ),
+            outbound: OutboundSemaphore::new(
+                cfg.limits.outbound_queue_len,
+                metrics.queues().clone(),
+            ),
+            limiter: shared_limiter(cfg.limits.rate),
             cfg,
             metrics,
             peers: HashMap::new(),
             goodbyes: HashMap::new(),
+            in_flight: HashSet::new(),
             pending: VecDeque::new(),
         }
     }
@@ -423,39 +507,86 @@ impl<E: EthSpec> Control<E> {
         }
     }
 
-    /// Sends our Status to `peer`; `false` (and nothing sent) while we have none.
+    /// Sends `request` to `peer` in a free slot of its protocol, or queues it; `false` if the
+    /// queue IGNOREd it.
+    fn submit(&mut self, peer: PeerId, request: Request) -> bool {
+        let protocol = request.protocol();
+        let taken = match self.outbound.submit(protocol, (peer, request)) {
+            Admit::Start((peer, request)) => {
+                self.dispatch(peer, request);
+                true
+            }
+            Admit::Queued => true,
+            Admit::Ignored((peer, request)) => {
+                tracing::debug!(%peer, %protocol, "outbound queue full: request ignored");
+                if let Request::Goodbye(_) = request {
+                    self.close(peer);
+                }
+                false
+            }
+        };
+        self.metrics
+            .set_outbound_inflight(protocol, self.outbound.in_flight(protocol));
+        taken
+    }
+
+    /// Sends `request`, which holds a slot of its protocol.
+    fn dispatch(&mut self, peer: PeerId, request: Request) {
+        let protocol = request.protocol();
+        let goodbye = matches!(request, Request::Goodbye(_));
+        let id = self.inner.of(protocol).send_request(&peer, request.into());
+        self.in_flight.insert((protocol, id));
+        if goodbye {
+            self.goodbyes.insert(id, peer);
+        }
+    }
+
+    /// Request `id` of `protocol` finished: its slot goes to the next waiting request of a
+    /// connected peer.
+    fn finished(&mut self, protocol: Protocol, id: OutboundRequestId) {
+        if !self.in_flight.remove(&(protocol, id)) {
+            return;
+        }
+        while let Some((peer, request)) = self.outbound.release(protocol) {
+            if self.peers.contains_key(&peer) {
+                self.dispatch(peer, request);
+                break;
+            }
+            tracing::debug!(%peer, %protocol, "the peer left: its waiting request is dropped");
+        }
+        self.metrics
+            .set_outbound_inflight(protocol, self.outbound.in_flight(protocol));
+    }
+
+    /// Sends our Status to `peer`; `false` (and nothing sent) while we have none, or if the
+    /// outbound queue IGNOREd it.
     pub fn send_status(&mut self, peer: PeerId) -> bool {
         let Some(ours) = self.cfg.status.status() else {
             tracing::debug!(%peer, "no Status of ours yet: none sent");
             return false;
         };
-        self.inner
-            .status
-            .send_request(&peer, Request::Status(ours).into());
-        true
+        self.submit(peer, Request::Status(ours))
     }
 
     /// Pings `peer` with our `seq_number`.
     pub fn ping(&mut self, peer: PeerId) {
         let ours = self.cfg.metadata.seq_number();
-        self.inner
-            .ping
-            .send_request(&peer, Request::Ping(Ping(ours)).into());
+        self.submit(peer, Request::Ping(Ping(ours)));
     }
 
     /// Requests `peer`'s MetaData, unless a request is already open.
     pub fn request_metadata(&mut self, peer: PeerId) {
-        let Some(state) = self.peers.get_mut(&peer) else {
-            return;
-        };
-        if state.metadata_request.is_some() {
+        if self
+            .peers
+            .get(&peer)
+            .is_none_or(|state| state.metadata_open)
+        {
             return;
         }
-        let id = self
-            .inner
-            .metadata
-            .send_request(&peer, Request::MetaData.into());
-        state.metadata_request = Some(id);
+        let open = self.submit(peer, Request::MetaData);
+        if let Some(state) = self.peers.get_mut(&peer) {
+            state.metadata_open = open;
+        }
     }
 
     /// Sends `peer` a Goodbye with `reason`; the connection closes once it completed.
@@ -468,11 +599,6 @@ impl<E: EthSpec> Control<E> {
         }
         state.goodbye_sent = true;
         let status_valid = StatusValidity::from(state.status_valid);
-        let id = self
-            .inner
-            .goodbye
-            .send_request(&peer, Request::Goodbye(Goodbye(reason)).into());
-        self.goodbyes.insert(id, peer);
         self.metrics.goodbye_sent(reason, status_valid);
         tracing::info!(
             %peer,
@@ -480,6 +606,7 @@ impl<E: EthSpec> Control<E> {
             status_valid = status_valid.as_str(),
             "goodbye_sent"
         );
+        self.submit(peer, Request::Goodbye(Goodbye(reason)));
     }
 
     fn close(&mut self, peer: PeerId) {
@@ -537,16 +664,29 @@ impl<E: EthSpec> Control<E> {
         }
     }
 
+    /// Hands `chunks` to the stream with the pacer of `peer`'s `protocol` bucket: the stream
+    /// writes each chunk once its token is free.
     fn respond(
         &mut self,
+        peer: PeerId,
         protocol: Protocol,
-        channel: ResponseChannel<Vec<ReceivedChunk<E>>>,
+        channel: ResponseChannel<Answer<E>>,
         chunks: Vec<ReceivedChunk<E>>,
     ) {
+        let pacer = ChunkPacer::new(
+            Arc::clone(&self.limiter),
+            peer,
+            protocol,
+            Some(self.metrics.clone()),
+        );
+        let answer = Answer {
+            chunks,
+            pacer: Some(pacer),
+        };
         if self
             .inner
             .of(protocol)
-            .send_response(channel, chunks)
+            .send_response(channel, answer)
             .is_err()
         {
             tracing::debug!(%protocol, "the stream closed before our response");
@@ -558,7 +698,7 @@ impl<E: EthSpec> Control<E> {
         peer: PeerId,
         protocol: Protocol,
         request: RpcRequest,
-        channel: ResponseChannel<Vec<ReceivedChunk<E>>>,
+        channel: ResponseChannel<Answer<E>>,
     ) {
         let request = match request {
             RpcRequest::Valid(request) => request,
@@ -567,7 +707,7 @@ impl<E: EthSpec> Control<E> {
                 tracing::debug!(%peer, %protocol, %error, "malformed request");
                 if protocol != Protocol::GoodbyeV1 {
                     let answer = error_chunk(ResultCode::InvalidRequest, &error.to_string());
-                    self.respond(protocol, channel, answer);
+                    self.respond(peer, protocol, channel, answer);
                 }
                 return;
             }
@@ -578,16 +718,17 @@ impl<E: EthSpec> Control<E> {
                     Some(ours) => success_chunk(Response::Status(ours)),
                     None => error_chunk(ResultCode::ServerError, "status unavailable"),
                 };
-                self.respond(protocol, channel, answer);
+                self.respond(peer, protocol, channel, answer);
                 self.judge(peer, theirs);
             }
             Request::MetaData => {
                 let answer = success_chunk(Response::MetaData(self.local_metadata()));
-                self.respond(protocol, channel, answer);
+                self.respond(peer, protocol, channel, answer);
             }
             Request::Ping(Ping(seq_number)) => {
                 let ours = self.cfg.metadata.seq_number();
-                self.respond(protocol, channel, success_chunk(Response::Ping(Ping(ours))));
+                let answer = success_chunk(Response::Ping(Ping(ours)));
+                self.respond(peer, protocol, channel, answer);
                 self.on_peer_seq(peer, seq_number);
             }
             Request::Goodbye(Goodbye(reason)) => {
@@ -597,7 +738,7 @@ impl<E: EthSpec> Control<E> {
             }
             Request::BlocksByRange(_) => {
                 let answer = error_chunk(ResultCode::ResourceUnavailable, "no blocks stored");
-                self.respond(protocol, channel, answer);
+                self.respond(peer, protocol, channel, answer);
             }
         }
     }
@@ -635,10 +776,11 @@ impl<E: EthSpec> Control<E> {
         id: OutboundRequestId,
         chunks: Vec<ReceivedChunk<E>>,
     ) {
+        self.finished(protocol, id);
         match protocol {
             Protocol::GoodbyeV1 => self.on_goodbye_done(id),
             Protocol::MetaDataV3 => {
-                self.metadata_done(peer, id);
+                self.metadata_done(peer);
                 match single_success(chunks) {
                     Some(Response::MetaData(metadata)) => {
                         if let Some(state) = self.peers.get_mut(&peer) {
@@ -669,11 +811,10 @@ impl<E: EthSpec> Control<E> {
         }
     }
 
-    fn metadata_done(&mut self, peer: PeerId, id: OutboundRequestId) {
+    /// Our one MetaData request to `peer` finished.
+    fn metadata_done(&mut self, peer: PeerId) {
         if let Some(state) = self.peers.get_mut(&peer) {
-            if state.metadata_request == Some(id) {
-                state.metadata_request = None;
-            }
+            state.metadata_open = false;
         }
     }
 
@@ -690,6 +831,7 @@ impl<E: EthSpec> Control<E> {
         id: OutboundRequestId,
         error: OutboundFailure,
     ) {
+        self.finished(protocol, id);
         // The codec counts its own deadlines; `request_response`'s is the whole exchange.
         match &error {
             OutboundFailure::Timeout => self.metrics.timed_out(Deadline::Total),
@@ -703,7 +845,7 @@ impl<E: EthSpec> Control<E> {
         match protocol {
             // A Goodbye has no response: a failure after sending is expected.
             Protocol::GoodbyeV1 => self.on_goodbye_done(id),
-            Protocol::MetaDataV3 => self.metadata_done(peer, id),
+            Protocol::MetaDataV3 => self.metadata_done(peer),
             _ => {}
         }
     }
@@ -727,15 +869,18 @@ impl<E: EthSpec> Control<E> {
             ProtocolsEvent::BlocksByRange(e) => (Protocol::BlocksByRangeV2, e),
         };
         match event {
-            Event::Message {
+            DuplexEvent::Inbound(Event::Message {
                 peer,
                 message:
                     Message::Request {
                         request, channel, ..
                     },
                 ..
-            } => self.on_request(peer, protocol, request, channel),
-            Event::Message {
+            }) => self.on_request(peer, protocol, request, channel),
+            DuplexEvent::Inbound(Event::InboundFailure { peer, error, .. }) => {
+                self.on_inbound_failure(peer, protocol, error);
+            }
+            DuplexEvent::Outbound(Event::Message {
                 peer,
                 message:
                     Message::Response {
@@ -743,17 +888,16 @@ impl<E: EthSpec> Control<E> {
                         response,
                     },
                 ..
-            } => self.on_response(peer, protocol, request_id, response),
-            Event::OutboundFailure {
+            }) => self.on_response(peer, protocol, request_id, response),
+            DuplexEvent::Outbound(Event::OutboundFailure {
                 peer,
                 request_id,
                 error,
                 ..
-            } => self.on_outbound_failure(peer, protocol, request_id, error),
-            Event::InboundFailure { peer, error, .. } => {
-                self.on_inbound_failure(peer, protocol, error);
-            }
-            Event::ResponseSent { .. } => {}
+            }) => self.on_outbound_failure(peer, protocol, request_id, error),
+            // Sent answers; and what each one-way behaviour never reports (a response on the
+            // inbound side, a request on the outbound side).
+            DuplexEvent::Inbound(_) | DuplexEvent::Outbound(_) => {}
         }
     }
 }
@@ -836,7 +980,7 @@ impl<E: EthSpec> NetworkBehaviour for Control<E> {
                         direction,
                         status_valid: None,
                         metadata_seq: None,
-                        metadata_request: None,
+                        metadata_open: false,
                         goodbye_sent: false,
                     },
                 );
@@ -851,6 +995,12 @@ impl<E: EthSpec> NetworkBehaviour for Control<E> {
                     }
                 }
                 self.goodbyes.retain(|_, peer| *peer != c.peer_id);
+                // Its streams' unsent chunks refund themselves as the streams drop.
+                let peers = &self.peers;
+                self.limiter
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .prune(Instant::now(), |peer| peers.contains_key(peer));
             }
             _ => {}
         }
@@ -992,6 +1142,202 @@ mod tests {
         assert_eq!(&error_message("pruned")[..], b"pruned");
     }
 
+    /// Tells `control` an inbound connection from `peer` is up (`up`) or gone.
+    fn connection(
+        control: &mut Control<consensus_types::Minimal>,
+        peer: PeerId,
+        n: usize,
+        up: bool,
+    ) {
+        use libp2p::core::ConnectedPoint;
+        use libp2p::swarm::behaviour::{ConnectionClosed, ConnectionEstablished};
+        let endpoint = ConnectedPoint::Listener {
+            local_addr: "/ip4/127.0.0.1/tcp/9000".parse().unwrap(),
+            send_back_addr: "/ip4/127.0.0.1/tcp/1".parse().unwrap(),
+        };
+        let connection_id = ConnectionId::new_unchecked(n);
+        if up {
+            let ConnectedPoint::Listener {
+                local_addr,
+                send_back_addr,
+            } = &endpoint
+            else {
+                unreachable!()
+            };
+            assert!(control
+                .handle_established_inbound_connection(
+                    connection_id,
+                    peer,
+                    local_addr,
+                    send_back_addr
+                )
+                .is_ok());
+        }
+        control.on_swarm_event(if up {
+            FromSwarm::ConnectionEstablished(ConnectionEstablished {
+                peer_id: peer,
+                connection_id,
+                endpoint: &endpoint,
+                failed_addresses: &[],
+                other_established: 0,
+            })
+        } else {
+            FromSwarm::ConnectionClosed(ConnectionClosed {
+                peer_id: peer,
+                connection_id,
+                endpoint: &endpoint,
+                cause: None,
+                remaining_established: 0,
+            })
+        });
+    }
+
+    #[test]
+    fn an_ignored_goodbye_closes_at_once_and_a_left_peer_loses_its_turn() {
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = RpcMetrics::register(&mut registry);
+        let mut cfg = crate::testkit::control_config(Some(testkit::status()));
+        cfg.limits.outbound_queue_len = 1;
+        let mut control = Control::<consensus_types::Minimal>::new(cfg, metrics.clone());
+        let peers: Vec<PeerId> = (0..4).map(|_| PeerId::random()).collect();
+        for (n, peer) in peers.iter().enumerate() {
+            connection(&mut control, *peer, n, true);
+            control.goodbye(*peer, GOODBYE_CLIENT_SHUTDOWN);
+        }
+        // Two in flight, one waiting, the fourth IGNOREd: its connection closes now.
+        assert_eq!(control.outbound.in_flight(Protocol::GoodbyeV1), 2);
+        assert_eq!(metrics.outbound_inflight(Protocol::GoodbyeV1), 2);
+        let queue = super::super::limits::outbound_queue_name(Protocol::GoodbyeV1);
+        assert_eq!(metrics.queues().dropped(queue), 1);
+        let closes: Vec<PeerId> = control
+            .pending
+            .iter()
+            .filter_map(|e| match e {
+                ToSwarm::CloseConnection { peer_id, .. } => Some(*peer_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closes, [peers[3]]);
+        // The waiting peer leaves: when a slot frees, its Goodbye is dropped, not sent.
+        connection(&mut control, peers[2], 2, false);
+        let first = *control.goodbyes.keys().next().unwrap();
+        control.finished(Protocol::GoodbyeV1, first);
+        assert_eq!(control.outbound.in_flight(Protocol::GoodbyeV1), 1);
+        assert!(
+            !control.goodbyes.values().any(|p| *p == peers[2]),
+            "no Goodbye went to the peer that left"
+        );
+        assert_eq!(control.goodbyes.len(), 2);
+        // A finished request we do not know changes nothing, nor one of another protocol.
+        control.finished(Protocol::GoodbyeV1, first);
+        let second = *control.goodbyes.keys().find(|id| **id != first).unwrap();
+        control.finished(Protocol::StatusV2, second);
+        assert_eq!(control.outbound.in_flight(Protocol::GoodbyeV1), 1);
+    }
+
+    /// A Control under the fixture config with `n` inbound peers connected.
+    fn control_with_peers(
+        n: usize,
+        queue_len: usize,
+    ) -> (Control<consensus_types::Minimal>, RpcMetrics, Vec<PeerId>) {
+        let metrics = RpcMetrics::register(&mut prometheus_client::registry::Registry::default());
+        let mut cfg = crate::testkit::control_config(Some(testkit::status()));
+        cfg.limits.outbound_queue_len = queue_len;
+        let mut control = Control::new(cfg, metrics.clone());
+        let peers: Vec<PeerId> = (0..n).map(|_| PeerId::random()).collect();
+        for (i, peer) in peers.iter().enumerate() {
+            connection(&mut control, *peer, i, true);
+        }
+        (control, metrics, peers)
+    }
+
+    #[test]
+    fn overlapping_request_ids_free_their_own_protocols_slot() {
+        let (mut control, metrics, peers) = control_with_peers(3, 8);
+        for peer in &peers[..2] {
+            assert!(control.send_status(*peer));
+        }
+        for peer in &peers {
+            control.request_metadata(*peer);
+        }
+        // Each protocol's behaviour numbers its requests from 1: Status and MetaData share IDs.
+        assert_eq!(control.outbound.in_flight(Protocol::StatusV2), 2);
+        assert_eq!(control.outbound.in_flight(Protocol::MetaDataV3), 2);
+        let open: Vec<(Protocol, OutboundRequestId)> = control.in_flight.iter().copied().collect();
+        assert_eq!(open.len(), 4, "{open:?}");
+        let ids = |p| {
+            let mut ids: Vec<_> = open
+                .iter()
+                .filter(|(q, _)| *q == p)
+                .map(|(_, id)| *id)
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(ids(Protocol::StatusV2), ids(Protocol::MetaDataV3));
+        // Status finishes: MetaData keeps both its slots and its third request keeps waiting.
+        for id in ids(Protocol::StatusV2) {
+            control.on_outbound_failure(peers[0], Protocol::StatusV2, id, OutboundFailure::Timeout);
+        }
+        assert_eq!(control.outbound.in_flight(Protocol::StatusV2), 0);
+        assert_eq!(control.outbound.in_flight(Protocol::MetaDataV3), 2);
+        assert_eq!(metrics.outbound_inflight(Protocol::StatusV2), 0);
+        assert_eq!(metrics.outbound_inflight(Protocol::MetaDataV3), 2);
+        // MetaData finishes, the waiting one included: every slot is free.
+        while let Some(&(p, id)) = control.in_flight.iter().next() {
+            control.on_outbound_failure(peers[0], p, id, OutboundFailure::ConnectionClosed);
+        }
+        for p in Protocol::ALL {
+            assert_eq!(control.outbound.in_flight(p), 0, "{p}");
+            assert_eq!(metrics.outbound_inflight(p), 0, "{p}");
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// Requests on three protocols to eight peers, finishing in random order: the slots a
+        /// protocol holds are always its own requests in flight, never above 2, and all come
+        /// back once everything finished.
+        #[test]
+        fn mixed_protocols_free_only_their_own_slots(
+            steps in proptest::collection::vec(
+                (0..3usize, 0..8usize, proptest::prelude::any::<bool>(), proptest::prelude::any::<usize>()),
+                100,
+            ),
+        ) {
+            let (mut control, metrics, peers) = control_with_peers(8, 4);
+            let protocols = [Protocol::StatusV2, Protocol::PingV1, Protocol::MetaDataV3];
+            for (p, k, finish, pick) in steps {
+                match protocols[p] {
+                    Protocol::StatusV2 => {
+                        control.send_status(peers[k]);
+                    }
+                    Protocol::PingV1 => control.ping(peers[k]),
+                    _ => control.request_metadata(peers[k]),
+                }
+                if finish && !control.in_flight.is_empty() {
+                    let mut open: Vec<_> = control.in_flight.iter().copied().collect();
+                    open.sort_unstable_by_key(|(p, id)| (format!("{p}"), *id));
+                    let (q, id) = open[pick % open.len()];
+                    control.on_outbound_failure(peers[k], q, id, OutboundFailure::Timeout);
+                }
+                for q in protocols {
+                    let open = control.in_flight.iter().filter(|(p, _)| *p == q).count();
+                    proptest::prop_assert_eq!(open, control.outbound.in_flight(q));
+                    proptest::prop_assert!(open <= MAX_CONCURRENT_REQUESTS);
+                }
+            }
+            while let Some(&(q, id)) = control.in_flight.iter().next() {
+                control.on_outbound_failure(peers[0], q, id, OutboundFailure::Timeout);
+            }
+            for q in protocols {
+                proptest::prop_assert_eq!(control.outbound.in_flight(q), 0);
+                proptest::prop_assert_eq!(metrics.outbound_inflight(q), 0);
+            }
+        }
+    }
+
     #[test]
     fn local_metadata_carries_the_enr_cgc() {
         let cfg = ControlConfig {
@@ -1000,6 +1346,7 @@ mod tests {
             custody_group_count: 4,
             contexts: Arc::new(testkit::context_table()),
             deadlines: Deadlines::default(),
+            limits: RpcLimits::default(),
         };
         let debug = format!("{cfg:?}");
         assert!(debug.contains("custody_group_count: 4"), "{debug}");
