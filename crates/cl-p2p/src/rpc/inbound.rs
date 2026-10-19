@@ -26,8 +26,9 @@
 //!   Response Content: (Uint64)", L1461; "The response MUST consist of a single
 //!   `response_chunk`", L1483), whose reason is the peer's own (the spec does not say which).
 //!   The connection closes [`GOODBYE_LINGER`] after it went out, if the peer did not close it
-//!   first. Counted and logged as one `goodbye_received` event. Our own Goodbye accepts an
-//!   answer of one chunk or none (Lighthouse sends none).
+//!   first, and is dropped if that close has not finished [`CLOSE_DEADLINE`] later. Counted
+//!   and logged as one `goodbye_received` event. Our own Goodbye accepts an answer of one chunk
+//!   or none (Lighthouse sends none).
 //! - **BeaconBlocksByRange**: `3: ResourceUnavailable`, which that protocol specifies for blocks
 //!   the responder does not have (`phase0` L1540). A request with `step` 0 or a `count` above
 //!   `MAX_REQUEST_BLOCKS_DENEB` (128) is semantically invalid and gets `1: InvalidRequest`
@@ -144,7 +145,20 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(15);
 
 /// How long a connection stays up after our answer to the peer's Goodbye went out \[est\]: the
 /// peer, which said it is leaving, normally closes it at once; this bounds a peer that does not.
+/// The graceful close that follows is bounded by [`CLOSE_DEADLINE`].
 pub const GOODBYE_LINGER: Duration = Duration::from_secs(1);
+
+/// How long a graceful close may take once it began before the connection is dropped
+/// \[est\]: 5 s, the codec's deadline for one chunk.
+///
+/// A close writes what the muxer still holds, then the close frames, and the swarm waits for
+/// it with no deadline of its own; a peer that stopped reading with our send buffer full would
+/// hold it up for good, and the connection its slot. The probe swarm's muxers fail a close
+/// still unfinished at this deadline ([`crate::transport::CloseDeadline`]), and the swarm then
+/// drops the connection. It bounds every close the swarm begins: after the Goodbye linger, so
+/// a connection is gone at most `GOODBYE_LINGER + CLOSE_DEADLINE` (6 s) after our answer to the
+/// peer's Goodbye went out, and after our own Goodbye completed.
+pub const CLOSE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Goodbye reason 1: client shut down.
 pub const GOODBYE_CLIENT_SHUTDOWN: u64 = 1;
@@ -1019,6 +1033,8 @@ impl<E: EthSpec> Control<E> {
         }
     }
 
+    /// Asks the swarm to close every connection to `peer`. The close is graceful, and the
+    /// probe swarm's muxers drop a connection whose close outlasts [`CLOSE_DEADLINE`].
     fn close(&mut self, peer: PeerId) {
         self.pending.push_back(ToSwarm::CloseConnection {
             peer_id: peer,

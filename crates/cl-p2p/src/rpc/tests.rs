@@ -15,15 +15,22 @@ use super::inbound::{
 };
 use super::metrics::{RpcMetrics, StatusValidity};
 use super::unsupported::Unsupported;
-use crate::behaviour::{BehaviourEvent, ProbeSpec};
+use crate::behaviour::{BehaviourEvent, ProbeSpec, SpecBehaviour};
 use crate::testkit;
-use crate::transport::{build_swarm, Direction, MuxerBudget, SwarmConfig, TransportMetrics};
+use crate::transport::{
+    build_swarm, muxer_upgrades, with_negotiating_inbound_streams, Direction, MuxerBudget,
+    SwarmConfig, TransportMetrics, MAX_NEGOTIATING_INBOUND_STREAMS,
+};
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
+use libp2p::core::muxing::StreamMuxerBox;
+use libp2p::core::upgrade::{SelectUpgrade, Version};
 use libp2p::identity::Keypair;
 use libp2p::request_response::{self, OutboundFailure, OutboundRequestId, ProtocolSupport};
 use libp2p::swarm::{ConnectionId, SwarmEvent};
-use libp2p::{noise, tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder};
+use libp2p::{
+    noise, tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, Transport as _,
+};
 use p2p_wire::enr::{decode_cgc, encode_cgc};
 use p2p_wire::rpc::codec::{decode_response_chunk, encode_chunk, encode_request};
 use p2p_wire::rpc::messages::{
@@ -33,8 +40,10 @@ use p2p_wire::rpc::protocols::{Protocol, Request, Response, ResponseChunk, Resul
 use prometheus_client::registry::Registry;
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::AtomicU64;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -107,8 +116,57 @@ impl Node {
         swarm_cfg.listen_addrs = vec![loopback()];
         swarm_cfg.idle_connection_timeout = idle;
         let (req_resp, metrics) = testkit::control(&mut registry, cfg);
-        let mut swarm =
+        let swarm =
             build_swarm(Keypair::generate_secp256k1(), &swarm_cfg, req_resp).expect("swarm");
+        Self::start(swarm, metrics).await
+    }
+
+    /// A node whose socket writes stall once `stalled` is set ([`Stalling`]), over the
+    /// production muxer stack and behaviour.
+    async fn spawn_stalling(cfg: ControlConfig, stalled: Arc<AtomicBool>) -> Self {
+        let mut registry = Registry::default();
+        let transport = TransportMetrics::register(&mut registry);
+        let swarm_cfg = SwarmConfig::new(MuxerBudget::with_defaults(&transport));
+        let (req_resp, metrics) = testkit::control(&mut registry, cfg);
+        let (yamux, mplex) = muxer_upgrades(&swarm_cfg);
+        let mut swarm = SwarmBuilder::with_existing_identity(Keypair::generate_secp256k1())
+            .with_tokio()
+            .with_other_transport(|key| {
+                let stack = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
+                    .map(move |socket, _| Stalling {
+                        inner: socket,
+                        stalled,
+                    })
+                    .upgrade(Version::V1Lazy)
+                    .authenticate(noise::Config::new(key)?)
+                    .multiplex(SelectUpgrade::new(yamux(), mplex()))
+                    .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
+                    .boxed();
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(stack)
+            })
+            .expect("transport")
+            .with_behaviour(|key| {
+                SpecBehaviour::with_caps(
+                    key.public(),
+                    swarm_cfg.agent_version.clone(),
+                    swarm_cfg.caps,
+                    req_resp,
+                )
+            })
+            .expect("behaviour")
+            .with_swarm_config(|c| {
+                with_negotiating_inbound_streams(
+                    c.with_idle_connection_timeout(WAIT),
+                    MAX_NEGOTIATING_INBOUND_STREAMS,
+                )
+            })
+            .build();
+        swarm.listen_on(loopback()).expect("listen");
+        Self::start(swarm, metrics).await
+    }
+
+    /// Runs `swarm` on its own task once it listens.
+    async fn start(mut swarm: Swarm<SpecBehaviour<E>>, metrics: RpcMetrics) -> Self {
         let peer = *swarm.local_peer_id();
         let addr = loop {
             if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
@@ -202,6 +260,59 @@ impl Node {
             _ => None,
         })
         .await;
+    }
+}
+
+/// A socket whose writes, flushes and closes are pending for good once `stalled` is set: our
+/// side of a connection whose peer stopped reading, with the send buffer full.
+struct Stalling<S> {
+    inner: S,
+    stalled: Arc<AtomicBool>,
+}
+
+impl<S> Stalling<S> {
+    fn stalled(&self) -> bool {
+        self.stalled.load(Ordering::SeqCst)
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Stalling<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Stalling<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.stalled() {
+            return Poll::Pending;
+        }
+        Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.stalled() {
+            return Poll::Pending;
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.stalled() {
+            return Poll::Pending;
+        }
+        Pin::new(&mut this.inner).poll_close(cx)
     }
 }
 
@@ -1704,6 +1815,41 @@ async fn an_inbound_goodbye_gets_one_chunk_then_the_connection_closes() {
             .goodbye_received_count(129, StatusValidity::Unknown),
         1
     );
+}
+
+#[tokio::test]
+async fn a_peer_that_stops_reading_after_our_goodbye_answer_is_dropped_at_the_close_deadline() {
+    // Once our answer is out the peer reads nothing more and our send buffer stays full, so the
+    // graceful close at the end of the linger cannot write its close frames. The connection is
+    // dropped at its close deadline instead of holding its slot for good.
+    let stalled = Arc::new(AtomicBool::new(false));
+    let mut ours =
+        Node::spawn_stalling(config(status_with(DIGEST), 1, 4), Arc::clone(&stalled)).await;
+    let mut peer = bytes_peer(Protocol::GoodbyeV1.id());
+    bytes_connect(&mut peer, ours.addr.clone()).await;
+    let theirs = *peer.local_peer_id();
+    let request = encode_request(&Request::Goodbye(Goodbye(1))).unwrap();
+    let id = peer.behaviour_mut().send_request(&ours.peer, Some(request));
+    bytes_outcome(&mut peer, id)
+        .await
+        .expect("our Goodbye answer");
+    stalled.store(true, Ordering::SeqCst);
+    let answered = Instant::now();
+    let bound = super::inbound::GOODBYE_LINGER + super::inbound::CLOSE_DEADLINE;
+    let closed = tokio::time::timeout(bound + Duration::from_secs(2), async {
+        tokio::select! {
+            () = async { loop { peer.select_next_some().await; } } => unreachable!(),
+            () = ours.closed(theirs) => {}
+        }
+    })
+    .await;
+    let took = answered.elapsed();
+    assert!(
+        closed.is_ok(),
+        "still connected {took:?} after our Goodbye answer"
+    );
+    // The close did stall: it ended at its deadline, not at the end of the linger.
+    assert!(took + Duration::from_millis(500) >= bound, "{took:?}");
 }
 
 /// Sends `bytes` as a Goodbye request on `peer` every `every` until `node` closes the

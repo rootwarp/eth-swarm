@@ -153,6 +153,10 @@ mod scripted {
         pub outbound: VecDeque<Stream>,
         pub fail_poll: Option<io::ErrorKind>,
         pub closed: bool,
+        /// The close is pending for good while set, like a socket the peer stopped reading.
+        pub close_hangs: bool,
+        /// The close fails with this.
+        pub fail_close: Option<io::ErrorKind>,
     }
 
     impl StreamMuxer for Muxer {
@@ -181,6 +185,12 @@ mod scripted {
             mut self: Pin<&mut Self>,
             _: &mut Context<'_>,
         ) -> Poll<Result<(), io::Error>> {
+            if self.close_hangs {
+                return Poll::Pending;
+            }
+            if let Some(kind) = self.fail_close {
+                return Poll::Ready(Err(kind.into()));
+            }
             self.closed = true;
             Poll::Ready(Ok(()))
         }
@@ -902,6 +912,106 @@ fn recv_buf_keeps_order_across_chunks() {
     }
     assert_eq!(out, data);
     assert_eq!(buf.pop_into(&mut scratch), 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The close deadline
+
+const CLOSE_IN: Duration = Duration::from_secs(5);
+
+fn deadline_muxer(inner: scripted::Muxer) -> DeadlineMuxer<scripted::Muxer> {
+    DeadlineMuxer::new(inner, CLOSE_IN)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_close_that_never_finishes_fails_at_its_deadline() {
+    let mut muxer = deadline_muxer(scripted::Muxer {
+        close_hangs: true,
+        ..scripted::Muxer::default()
+    });
+    // The deadline counts from the close, not from the connection.
+    tokio::time::sleep(CLOSE_IN * 3).await;
+    let began = tokio::time::Instant::now();
+    let closed = futures::future::poll_fn(|cx| muxer.poll_close_unpin(cx)).await;
+    assert_eq!(began.elapsed(), CLOSE_IN);
+    match closed {
+        Err(e @ CloseDeadlineError::Expired(after)) => {
+            assert_eq!(after, CLOSE_IN);
+            assert!(e.to_string().contains("dropped"), "{e}");
+        }
+        other => panic!("expected the deadline, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_close_is_pending_until_its_deadline() {
+    let mut muxer = deadline_muxer(scripted::Muxer {
+        close_hangs: true,
+        ..scripted::Muxer::default()
+    });
+    assert!(muxer.poll_close_unpin(&mut noop()).is_pending());
+    tokio::time::sleep(CLOSE_IN - Duration::from_millis(1)).await;
+    assert!(muxer.poll_close_unpin(&mut noop()).is_pending());
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert!(matches!(
+        muxer.poll_close_unpin(&mut noop()),
+        Poll::Ready(Err(CloseDeadlineError::Expired(_)))
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_close_that_finishes_or_fails_is_passed_on() {
+    let mut muxer = deadline_muxer(scripted::Muxer::default());
+    assert!(matches!(
+        muxer.poll_close_unpin(&mut noop()),
+        Poll::Ready(Ok(()))
+    ));
+    let mut muxer = deadline_muxer(scripted::Muxer {
+        fail_close: Some(io::ErrorKind::BrokenPipe),
+        ..scripted::Muxer::default()
+    });
+    match muxer.poll_close_unpin(&mut noop()) {
+        Poll::Ready(Err(e @ CloseDeadlineError::Muxer(_))) => {
+            assert_eq!(
+                e.to_string(),
+                io::Error::from(io::ErrorKind::BrokenPipe).to_string()
+            );
+        }
+        other => panic!("expected the muxer's error, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_deadline_muxer_passes_streams_and_errors_through() {
+    let script = Script::default();
+    script.push(Read::Data(b"in".to_vec()));
+    let mut muxer = deadline_muxer(scripted::Muxer {
+        inbound: VecDeque::from([script.stream()]),
+        outbound: VecDeque::from([Script::default().stream()]),
+        fail_poll: Some(io::ErrorKind::ConnectionReset),
+        ..scripted::Muxer::default()
+    });
+    let mut inbound = match muxer.poll_inbound_unpin(&mut noop()) {
+        Poll::Ready(Ok(stream)) => stream,
+        _ => panic!("expected the inbound stream"),
+    };
+    let mut buf = [0; 2];
+    assert!(matches!(
+        Pin::new(&mut inbound).poll_read(&mut noop(), &mut buf),
+        Poll::Ready(Ok(2))
+    ));
+    assert_eq!(&buf, b"in");
+    assert!(matches!(
+        muxer.poll_outbound_unpin(&mut noop()),
+        Poll::Ready(Ok(_))
+    ));
+    assert!(muxer.poll_inbound_unpin(&mut noop()).is_pending());
+    match muxer.poll_unpin(&mut noop()) {
+        Poll::Ready(Err(CloseDeadlineError::Muxer(e))) => {
+            assert_eq!(e.kind(), io::ErrorKind::ConnectionReset);
+        }
+        _ => panic!("expected the muxer's error"),
+    }
 }
 
 #[test]

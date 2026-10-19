@@ -1,5 +1,6 @@
 //! The probe swarm: TCP, Noise XX and [`muxers`], listening and dialing, with the peer and
-//! dial-failure metrics.
+//! dial-failure metrics. A connection whose graceful close has not finished
+//! [`CLOSE_DEADLINE`] after it began is dropped ([`CloseDeadline`]).
 //!
 //! Every supported transport MUST be enabled for both dialing and listening
 //! (`phase0/p2p-interface.md`), so [`build_swarm`] starts a listener on every
@@ -11,10 +12,13 @@
 //! connection. [`LogNegotiated`] logs the muxer each connection negotiated, and tells it to the
 //! [`MuxerObserver`] of [`SwarmConfig::muxer_observer`] if there is one.
 
-use super::{muxers, with_negotiating_inbound_streams, MuxerBudget, MPLEX_MAX_STREAMS};
+use super::{
+    muxers, with_negotiating_inbound_streams, Budgeted, CloseDeadline, MuxerBudget,
+    MPLEX_MAX_STREAMS,
+};
 use crate::behaviour::{ConnectionCaps, SpecBehaviour};
 use crate::gossip::IgnoreAll;
-use crate::rpc::inbound::Control;
+use crate::rpc::inbound::{Control, CLOSE_DEADLINE};
 use consensus_types::EthSpec;
 use libp2p::core::transport::TransportError;
 use libp2p::core::upgrade::{
@@ -186,17 +190,12 @@ fn build<E: EthSpec>(
     req_resp: Control<E>,
     gossip: Option<IgnoreAll>,
 ) -> Result<Swarm<SpecBehaviour<E>>, BuildError> {
-    let (yamux, mplex) = muxers(cfg.budget.clone());
-    let (yamux_observer, mplex_observer) = (cfg.muxer_observer.clone(), cfg.muxer_observer.clone());
     let Ok(builder) = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
             tcp::Config::default().nodelay(true),
             noise::Config::new,
-            (
-                move || LogNegotiated(yamux(), yamux_observer),
-                move || LogNegotiated(mplex(), mplex_observer),
-            ),
+            muxer_upgrades(cfg),
         )?
         .with_behaviour(|key| {
             let behaviour = SpecBehaviour::with_caps(
@@ -231,6 +230,27 @@ fn build<E: EthSpec>(
             })?;
     }
     Ok(swarm)
+}
+
+/// The probe swarm's yamux upgrade ([`muxer_upgrades`]).
+pub type YamuxUpgrade = CloseDeadline<LogNegotiated<libp2p::yamux::Config>>;
+
+/// The probe swarm's mplex upgrade ([`muxer_upgrades`]).
+pub type MplexUpgrade = CloseDeadline<LogNegotiated<Budgeted<libp2p_mplex::Config>>>;
+
+/// The probe swarm's muxer upgrades for `SwarmBuilder::with_tcp`: [`muxers`] under
+/// `cfg.budget`, yamux first, each one logging what it negotiated ([`LogNegotiated`]), and
+/// each connection dropped if its graceful close outlasts [`CLOSE_DEADLINE`]
+/// ([`CloseDeadline`]).
+pub fn muxer_upgrades(
+    cfg: &SwarmConfig,
+) -> (impl FnOnce() -> YamuxUpgrade, impl FnOnce() -> MplexUpgrade) {
+    let (yamux, mplex) = muxers(cfg.budget.clone());
+    let (yamux_observer, mplex_observer) = (cfg.muxer_observer.clone(), cfg.muxer_observer.clone());
+    (
+        move || CloseDeadline::new(LogNegotiated(yamux(), yamux_observer), CLOSE_DEADLINE),
+        move || CloseDeadline::new(LogNegotiated(mplex(), mplex_observer), CLOSE_DEADLINE),
+    )
 }
 
 /// A muxer upgrade that logs the muxer protocol multistream-select settled on, tells the

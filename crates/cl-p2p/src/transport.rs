@@ -51,10 +51,12 @@
 //! it eagerly would let the peer send without limit; yamux bounds its own buffers by its
 //! windows.
 
+mod close;
 mod quota;
 #[cfg(test)]
 mod tests;
 
+pub use close::{CloseDeadline, CloseDeadlineError, DeadlineMuxer, WithDeadline};
 use quota::Pass;
 pub use quota::{QuotaSocket, EMPTY_FRAME_WINDOW, MAX_EMPTY_FRAMES, PASS_BYTES, PASS_FRAMES};
 
@@ -1140,7 +1142,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 // The probe swarm over these muxers lives in its own module.
 mod swarm;
 pub use swarm::{
-    build_swarm, build_swarm_with_gossip, BuildError, DialFailure, Direction, LogNegotiated,
-    MuxerObserver, PeerMetrics, SwarmConfig, DEFAULT_CONNECTION_TIMEOUT,
-    DEFAULT_IDLE_CONNECTION_TIMEOUT, DEFAULT_TCP_PORT, MAX_NEGOTIATING_INBOUND_STREAMS,
+    build_swarm, build_swarm_with_gossip, muxer_upgrades, BuildError, DialFailure, Direction,
+    LogNegotiated, MplexUpgrade, MuxerObserver, PeerMetrics, SwarmConfig, YamuxUpgrade,
+    DEFAULT_CONNECTION_TIMEOUT, DEFAULT_IDLE_CONNECTION_TIMEOUT, DEFAULT_TCP_PORT,
+    MAX_NEGOTIATING_INBOUND_STREAMS,
 };
