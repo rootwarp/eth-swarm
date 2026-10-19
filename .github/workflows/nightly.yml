@@ -1,7 +1,8 @@
 # Nightly, uncached: re-fetch every manifest source (all presets and optional assets), re-check
 # every tag -> commit pin and sha256, run the full vector suite, re-run the dependency policy
-# against today's advisory database, and run fuzz gate 1 (seven decoder targets, an hour each).
-# Also runnable by hand via workflow_dispatch.
+# against today's advisory database, and run fuzz gate 1 (seven decoder targets, an hour each)
+# and fuzz gate 2a (the three column decoder targets, an hour each). Also runnable by hand via
+# workflow_dispatch.
 name: nightly
 
 on:
@@ -113,3 +114,49 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  fuzz-gate2a:
+    # Fuzz gate 2a (fuzz/run-gate2a.sh): data_column_sidecar (the Gloas DataColumnSidecar as
+    # gossip and as a response chunk of both column protocols, on the pinned Sepolia blob
+    # schedule's caps), columns_by_range_req and columns_by_root_req (the column requests and
+    # their admission check), each fuzzed for 3600 s from the committed oversize and bomb seeds,
+    # in parallel, under the gate's limits (-rss_limit_mb=2048, -malloc_limit_mb=128,
+    # -timeout=10, the per-target -max_len; fuzz/m2a-common.sh). The gate file records the
+    # commit, each target's seconds, executions, crashes, OOMs, timeouts and seed-corpus sha256,
+    # and must pass fuzz/check-gate2a.sh. The file, its log and any crash inputs are kept as the
+    # run's artifact.
+    name: fuzz gate 2a, three column targets x 1 h
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned nightly (fuzz/rust-toolchain.toml)
+        working-directory: fuzz
+        run: rustup toolchain install && rustc --version
+      - name: Install protoc (ethswarm-proto build.rs runs tonic-prost-build)
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc@3.36.2
+          fallback: none
+      - name: Install cargo-fuzz (pinned)
+        working-directory: fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      # Online, so it fetches the locked sources the gate's offline lock check then needs.
+      - name: fuzz/Cargo.lock resolves every shared crate exactly as Cargo.lock does
+        run: bash scripts/check-fuzz-lock.sh
+      - name: Run gate 2a (3600 s per target)
+        run: bash fuzz/run-gate2a.sh
+      - name: The gate file passes the checker
+        run: bash fuzz/check-gate2a.sh fuzz/artifacts/gate2a.json
+      - name: Gate file and log
+        if: always()
+        run: cat fuzz/artifacts/gate2a.json fuzz/artifacts/gate2a.log
+      - name: Keep the gate file, its log and any crash inputs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-gate2a
+          path: fuzz/artifacts/
+          if-no-files-found: error
+          retention-days: 30

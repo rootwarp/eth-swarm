@@ -1,6 +1,7 @@
 # Shared by fuzz/build-m2a.sh, fuzz/run-m2a-gate.sh, fuzz/check-m2a-gate.sh and
 # fuzz/coverage-m2a.sh (and so by fuzz/run-gate1.sh and fuzz/check-gate1.sh, which run the gate
-# scripts with --gate gate1). Source it; it sets `repo` and `fuzz_dir` from its own location, and
+# scripts with --gate gate1, and fuzz/run-gate2a.sh and fuzz/check-gate2a.sh, with --gate gate2a).
+# Source it; it sets `repo` and `fuzz_dir` from its own location, and
 # selects the m2a gate (gate_select below). Every git call goes through m2a_git (a scrubbed
 # environment and config).
 # Works on bash 3.2.
@@ -15,6 +16,13 @@ M2A_TARGETS=(status_v2 metadata_v3 ping_goodbye blocks_by_range_resp)
 # through the timed codec), one req/resp chunk of any protocol, the gossip transform with the
 # Gloas block decode, the message-id, and the ENR fields.
 GATE1_TARGETS=(rpc_chunk gossip_transform message_id enr_fields status_v2 metadata_v3 ping_goodbye)
+
+# Gate 2a: the column decoders. The Gloas DataColumnSidecar as gossip (the snappy transform, then
+# the bounded decode) and as a response chunk of both column protocols (the chunk decoder, the
+# scanners and the timed codec), on the pinned Sepolia blob schedule's caps; and the two column
+# requests (DataColumnSidecarsByRange v1, DataColumnSidecarsByRoot v1) through the timed codec
+# and the request decoder, then the admission check.
+GATE2A_TARGETS=(data_column_sidecar columns_by_range_req columns_by_root_req)
 
 # Release, with debug assertions and overflow checks (an overflow is a crash, not a wrap), and
 # AddressSanitizer (cargo-fuzz's default). The gate runs exactly what build-m2a.sh builds.
@@ -66,7 +74,23 @@ GATE1_KEY_PATHS=(
   fuzz/run-gate1.sh
 )
 
-# gate_select <m2a|gate1>: the gate the scripts run and check. Sets GATE_ID (the gate file's
+# Gate 2a's key: the m2a key (p2p-wire holds the column protocols, their request and sidecar
+# bounds and column_request_error, the check cl-p2p admits a column request with; cl-p2p's rpc
+# codec reads the column responses and requests), plus the rest of the column request code:
+# cl-p2p's column answers (rpc/columns.rs: what a request names, how an answer is cut) and
+# cl-chain's ReqRespService (reqresp.rs), whose bounds on the forwarded request the harness's
+# spec rule mirrors; network-config (the column caps and the fork schedule a sidecar's slot is
+# mapped through come from the pinned Sepolia config); and fuzz/run-gate2a.sh. Both lockfiles
+# are keyed as for m2a.
+GATE2A_KEY_PATHS=(
+  "${M2A_KEY_PATHS[@]}"
+  crates/cl-p2p/src/rpc/columns.rs
+  crates/cl-chain/src/reqresp.rs
+  crates/network-config
+  fuzz/run-gate2a.sh
+)
+
+# gate_select <m2a|gate1|gate2a>: the gate the scripts run and check. Sets GATE_ID (the gate file's
 # "gate"), GATE_LABEL (for messages), GATE_TARGETS, GATE_KEY_PATHS (the files are M2A_KEY_FILES
 # for both), GATE_FILE (the default gate file under fuzz/artifacts/), GATE_WORK (the run's work
 # directory under fuzz/target/), and GATE_RUNNER and GATE_CHECKER (the scripts, for messages).
@@ -85,6 +109,12 @@ gate_select() {
       GATE_TARGETS=("${GATE1_TARGETS[@]}")
       GATE_KEY_PATHS=("${GATE1_KEY_PATHS[@]}")
       ;;
+    gate2a)
+      GATE_ID=gate2a-fuzz GATE_LABEL="gate 2a" GATE_FILE=gate2a.json GATE_WORK=gate2a
+      GATE_RUNNER=fuzz/run-gate2a.sh GATE_CHECKER=fuzz/check-gate2a.sh
+      GATE_TARGETS=("${GATE2A_TARGETS[@]}")
+      GATE_KEY_PATHS=("${GATE2A_KEY_PATHS[@]}")
+      ;;
     *) return 1 ;;
   esac
 }
@@ -93,7 +123,7 @@ gate_select m2a
 # A gate needs this long per target.
 M2A_REQUIRED_SECONDS=3600
 
-# libFuzzer limits of a gate run, the same for both gates; the checkers refuse a file with any
+# libFuzzer limits of a gate run, the same for every gate; the checkers refuse a file with any
 # other value.
 #
 # -malloc_limit_mb=128 is the declared allocation bound. One chunk's receive buffer is at most
@@ -102,7 +132,10 @@ M2A_REQUIRED_SECONDS=3600
 # 4-byte offset), so any single allocation of 128 MiB or more is sized by something other than
 # a checked length. The gossip targets hold the same: a message decompresses to at most its
 # topic's cap (at most MAX_PAYLOAD_SIZE), checked from its header before decompressing, and the
-# block it may hold decodes as above; a node record is at most 300 bytes. -rss_limit_mb=2048
+# block it may hold decodes as above; a node record is at most 300 bytes. The column targets hold
+# it too: a sidecar's SSZ is at most its fork's cap (Gloas: compute_max_data_column_sidecar_size()
+# of the Sepolia schedule, 44,072 B; Fulu: its type bound, under MAX_PAYLOAD_SIZE), its lists are
+# of fixed-size items, and a column request is at most 136,192 B. -rss_limit_mb=2048
 # bounds the whole process. -timeout=10 s per input.
 #
 # -max_len (m2a_max_len): without it libFuzzer caps inputs at the largest seed (49,379 B), and
@@ -115,13 +148,21 @@ M2A_REQUIRED_SECONDS=3600
 # chunk of 1 + 2 + max_compressed_len(256) = 333 B (a Status is 132 B), so 4096 B is over 12 x
 # any valid chunk, past every max_compressed_len cut-off they have, and holds the 3,098 B
 # snappy-bomb seed. enr_fields gets 4096 B too: over 13 x a record's 300 bytes.
+# data_column_sidecar gets 1 MiB, as rpc_chunk: one gossip message (the Sepolia column cap
+# compresses to at most max_compressed_len(44,072) = 51,449 B) or one response chunk (Fulu
+# sidecars of hundreds of cells, Gloas ones past the cap, bombs past every bound).
+# columns_by_root_req gets 256 KiB: its bound is 136,192 B (128 identifiers of 128 columns), at
+# most 158,922 B compressed plus frame headers, so a whole request fits even sent uncompressed.
+# columns_by_range_req gets 4096 B: its bound is 1,044 B (1,250 B compressed), so 4096 B is over
+# 3 x that and holds its 3,096 B snappy-bomb seed.
 M2A_RSS_LIMIT_MB=2048
 M2A_MALLOC_LIMIT_MB=128
 M2A_TIMEOUT_S=10
 m2a_max_len() {
   case $1 in
     blocks_by_range_resp | gossip_transform | message_id) echo 2097152 ;;
-    rpc_chunk) echo 1048576 ;;
+    rpc_chunk | data_column_sidecar) echo 1048576 ;;
+    columns_by_root_req) echo 262144 ;;
     *) echo 4096 ;;
   esac
 }
@@ -130,13 +171,16 @@ m2a_max_len() {
 # a target must reach, so a run whose target body never executes cannot pass. Measured on the
 # committed seeds (rustc 5d8fec066): status_v2 2,065, metadata_v3 1,803, ping_goodbye 1,861 (the
 # timed codec in both directions), blocks_by_range_resp 5,257, rpc_chunk 2,352,
-# gossip_transform 3,226, message_id 1,471, enr_fields 4,151; a target that returns at once
+# gossip_transform 3,226, message_id 1,471, enr_fields 4,151, data_column_sidecar 3,841,
+# columns_by_range_req 1,429, columns_by_root_req 1,895; a target that returns at once
 # (RUST_LIBFUZZER_DEBUG_PATH set) has 66-103. The floors sit at well under half of the real
 # values and well over the no-op ones.
 m2a_min_seed_ft() {
   case $1 in
     blocks_by_range_resp) echo 2000 ;;
-    gossip_transform | enr_fields) echo 1500 ;;
+    gossip_transform | enr_fields | data_column_sidecar) echo 1500 ;;
+    columns_by_root_req) echo 800 ;;
+    columns_by_range_req) echo 600 ;;
     rpc_chunk) echo 1000 ;;
     status_v2 | metadata_v3 | ping_goodbye) echo 800 ;;
     message_id) echo 600 ;;

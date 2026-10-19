@@ -28,15 +28,24 @@
 //!
 //! The other targets: [`rpc_chunk`] (one chunk or request payload of any protocol, and the
 //! incremental scanners), [`gossip_transform`] and [`message_id`] (the gossip transform, the Gloas
-//! block decode and the message-id) and [`enr_fields`] (a node record's `eth2`, `cgc` and `nfd`).
+//! block decode and the message-id), [`enr_fields`] (a node record's `eth2`, `cgc` and `nfd`), and
+//! the column targets of gate 2a, [`data_column_sidecar`], [`columns_by_range_req`] and
+//! [`columns_by_root_req`] (the `columns` module: the Gloas sidecar over gossip and req/resp on
+//! the Sepolia blob schedule's caps, and the two column requests with their admission check).
 
 mod chunk;
+mod columns;
 mod gossip;
 mod record;
 pub mod seeds;
 mod timed;
 
 pub use chunk::{rpc_chunk, REQUEST_SELECTOR};
+pub use columns::{
+    column_contexts, column_network, column_schedule, column_topic, columns_by_range_req,
+    columns_by_root_req, data_column_sidecar, spec_max_sidecar_size, spec_request_rule, CHUNK_BIT,
+    ROOT_BIT,
+};
 pub use gossip::{gossip_transform, message_id, message_input, split_message, topic_caps};
 pub use record::{
     enr_fields, signed_record, structured_input, structured_record, RecordSpec, RecordValue,
@@ -60,9 +69,10 @@ use std::sync::OnceLock;
 /// The preset the `m2a-session` binary and the probe decode with.
 pub type E = Mainnet;
 
-/// Every target, by name: the four of the m2a gate (`fuzz/run-m2a-gate.sh`), then the four
-/// `fuzz/run-gate1.sh` adds to its three control targets.
-pub const TARGETS: [&str; 8] = [
+/// Every target, by name: the four of the m2a gate (`fuzz/run-m2a-gate.sh`), the four
+/// `fuzz/run-gate1.sh` adds to its three control targets, then the three of gate 2a
+/// (`fuzz/run-gate2a.sh`).
+pub const TARGETS: [&str; 11] = [
     "status_v2",
     "metadata_v3",
     "ping_goodbye",
@@ -71,6 +81,9 @@ pub const TARGETS: [&str; 8] = [
     "gossip_transform",
     "message_id",
     "enr_fields",
+    "data_column_sidecar",
+    "columns_by_range_req",
+    "columns_by_root_req",
 ];
 
 /// `ping_goodbye`: a first byte with this bit set selects a `Goodbye` request (the body a
@@ -100,6 +113,9 @@ pub fn run(name: &str, data: &[u8]) -> bool {
         "gossip_transform" => gossip_transform(data),
         "message_id" => message_id(data),
         "enr_fields" => enr_fields(data),
+        "data_column_sidecar" => data_column_sidecar(data),
+        "columns_by_range_req" => columns_by_range_req(data),
+        "columns_by_root_req" => columns_by_root_req(data),
         _ => return false,
     }
     true
@@ -185,8 +201,8 @@ fn response(protocol: Protocol, wire: &[u8]) {
 }
 
 /// `wire` as an inbound request of `protocol`, through the timed codec, held to the stateless
-/// request decoder.
-fn request(protocol: Protocol, wire: &[u8]) {
+/// request decoder; the request, if both accepted it.
+pub(crate) fn request(protocol: Protocol, wire: &[u8]) -> Option<Request> {
     let read = timed::read_request(protocol, wire)
         .unwrap_or_else(|e| panic!("an in-memory request stream failed: {e}"));
     let direct = decode_request(protocol, wire);
@@ -213,11 +229,15 @@ fn request(protocol: Protocol, wire: &[u8]) {
                 }
                 None => assert!(wire.is_empty(), "an empty request with bytes"),
             }
+            Some(request)
         }
-        RpcRequest::Malformed(e) => assert!(
-            direct.is_err(),
-            "the codec refused ({e}) a request the request decoder accepts"
-        ),
+        RpcRequest::Malformed(e) => {
+            assert!(
+                direct.is_err(),
+                "the codec refused ({e}) a request the request decoder accepts"
+            );
+            None
+        }
     }
 }
 
@@ -316,13 +336,14 @@ fn digest(chunk: &[u8]) -> ForkDigest {
         .expect("an accepted chunk holds its context bytes")
 }
 
-/// The SSZ payload of an accepted `chunk`, through the payload decoder alone.
-fn payload(chunk: &[u8], protocol: Protocol) -> Vec<u8> {
+/// The SSZ payload of an accepted `chunk`, read with `contexts`, through the payload decoder
+/// alone.
+fn payload(contexts: &ContextTable, chunk: &[u8], protocol: Protocol) -> Vec<u8> {
     let (head, max) = if chunk[0] != ResultCode::Success.as_byte() {
         (1, protocol.error_max_len())
     } else if protocol.has_context_bytes() {
-        let fork = contexts().fork(&digest(chunk));
-        let max = protocol.response_max_len_with::<E>(fork, contexts().network_caps());
+        let fork = contexts.fork(&digest(chunk));
+        let max = protocol.response_max_len_with::<E>(fork, contexts.network_caps());
         (1 + CONTEXT_BYTES_LEN, max.expect("a known context"))
     } else {
         let max = protocol.response_max_len::<E>(None);
@@ -331,9 +352,20 @@ fn payload(chunk: &[u8], protocol: Protocol) -> Vec<u8> {
     decode_chunk(&chunk[head..], max).expect("an accepted chunk's payload decodes on its own")
 }
 
-/// Checks the invariants of one accepted response chunk against its wire bytes.
+/// Checks the invariants of one accepted response chunk against its wire bytes, read with the
+/// fixture [`contexts`].
 pub(crate) fn check_chunk(chunk: &[u8], protocol: Protocol, decoded: &ResponseChunk<E>) {
-    let ssz = payload(chunk, protocol);
+    check_chunk_in(contexts(), chunk, protocol, decoded);
+}
+
+/// [`check_chunk`] for a chunk read with `contexts`.
+pub(crate) fn check_chunk_in(
+    contexts: &ContextTable,
+    chunk: &[u8],
+    protocol: Protocol,
+    decoded: &ResponseChunk<E>,
+) {
+    let ssz = payload(contexts, chunk, protocol);
     let reencoded = match decoded {
         ResponseChunk::Error { code, message } => {
             assert_ne!(*code, ResultCode::Success, "an error chunk with code 0");
@@ -354,7 +386,7 @@ pub(crate) fn check_chunk(chunk: &[u8], protocol: Protocol, decoded: &ResponseCh
                 (Protocol::BlocksByRangeV2, Response::Block(block)) => {
                     assert_eq!(
                         Some(block.fork_name()),
-                        contexts().fork(&digest(chunk)),
+                        contexts.fork(&digest(chunk)),
                         "block decoded in another fork than its context names"
                     );
                     block.as_ssz_bytes()
@@ -365,7 +397,7 @@ pub(crate) fn check_chunk(chunk: &[u8], protocol: Protocol, decoded: &ResponseCh
                 ) => {
                     assert_eq!(
                         Some(sidecar.fork_name()),
-                        contexts().fork(&digest(chunk)),
+                        contexts.fork(&digest(chunk)),
                         "sidecar decoded in another fork than its context names"
                     );
                     sidecar.as_ssz_bytes()

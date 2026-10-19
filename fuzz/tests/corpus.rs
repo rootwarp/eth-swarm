@@ -173,7 +173,8 @@ fn every_target_has_the_required_malformed_seeds() {
     let has = |target: &str, name: &str| committed.contains_key(&(target.into(), name.into()));
     let chunks = |target: &str, prefix: &str| {
         for name in CHUNK_SEEDS {
-            if target == "blocks_by_range_resp" && name == "valid" {
+            // These targets name their valid chunks by what they hold.
+            if matches!(target, "blocks_by_range_resp" | "data_column_sidecar") && name == "valid" {
                 continue;
             }
             assert!(
@@ -282,6 +283,89 @@ fn every_target_has_the_required_malformed_seeds() {
             let structured = format!("structured-{name}");
             assert!(has("enr_fields", &structured), "enr_fields/{structured}");
         }
+    }
+
+    // Gate 2a: the Gloas sidecar as gossip and as a response chunk of both column protocols.
+    for name in [
+        "valid",
+        "at-cap",
+        "oversize-column-list",
+        "oversize-cells-no-proofs",
+        "cells-ne-proofs",
+        "index-128",
+        "index-u64-max",
+        "fulu-slot",
+        "declares-cap-plus-1",
+        "declares-over-10mib",
+        "declares-4gib",
+        "declares-over-4gib",
+        "snappy-bomb-at-cap",
+        "varint-11-bytes",
+        "truncated",
+        "trailing-byte",
+    ] {
+        let name = format!("gossip-{name}");
+        assert!(
+            has("data_column_sidecar", &name),
+            "data_column_sidecar/{name}"
+        );
+    }
+    for prefix in ["range-", "root-"] {
+        chunks("data_column_sidecar", prefix);
+        for name in [
+            "gloas-valid",
+            "gloas-at-cap",
+            "gloas-oversize-column-list",
+            "gloas-cells-ne-proofs",
+            "gloas-index-128",
+            "fulu-valid",
+            "fulu-cells-ne-commitments",
+            "fulu-index-128",
+            "unknown-context-digest",
+            "snappy-bomb-within-bound",
+            "empty-response",
+        ] {
+            let name = format!("{prefix}{name}");
+            assert!(
+                has("data_column_sidecar", &name),
+                "data_column_sidecar/{name}"
+            );
+        }
+    }
+    // The column requests: no selector byte, so the request seeds carry no `request-` prefix.
+    for (target, bounds) in [
+        (
+            "columns_by_range_req",
+            &[
+                "at-sidecar-bound",
+                "sidecars-past-bound",
+                "count-times-columns-overflows",
+                "columns-at-list-bound",
+                "columns-past-list-bound",
+                "index-128",
+            ][..],
+        ),
+        (
+            "columns_by_root_req",
+            &[
+                "at-both-bounds",
+                "identifiers-past-bound",
+                "identifiers-past-bound-full",
+                "identifier-columns-past-bound",
+                "index-128",
+            ][..],
+        ),
+    ] {
+        for name in REQUEST_SEEDS.iter().chain(bounds) {
+            if *name == "prefix-under-type-bound" && target == "columns_by_root_req" {
+                continue;
+            }
+            assert!(has(target, name), "{target}/{name}");
+        }
+        assert!(
+            has(target, "too-many-empty-frames"),
+            "{target}/too-many-empty-frames"
+        );
     }
 }
 

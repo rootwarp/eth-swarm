@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Builds the fuzz targets exactly as fuzz/run-m2a-gate.sh runs them, for both gates (m2a, and
-# gate 1 through fuzz/run-gate1.sh): release, with debug assertions and overflow checks,
+# Builds the fuzz targets exactly as fuzz/run-m2a-gate.sh runs them, for every gate (m2a, gate 1
+# through fuzz/run-gate1.sh and gate 2a through fuzz/run-gate2a.sh): release, with debug assertions and overflow checks,
 # AddressSanitizer, from the committed fuzz/Cargo.lock, with the rustc commit and cargo-fuzz
 # release pinned in fuzz/m2a-common.sh.
 #

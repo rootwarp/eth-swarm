@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Verifies an m2a fuzz gate file (fuzz/run-m2a-gate.sh) against this tree. With --gate gate1
 # (fuzz/check-gate1.sh) it verifies a gate-1 file (fuzz/run-gate1.sh) instead: the same rules
-# over gate 1's targets and key (gate_select in fuzz/m2a-common.sh), and "gate": "gate1-fuzz".
+# over gate 1's targets and key (gate_select in fuzz/m2a-common.sh), and "gate": "gate1-fuzz";
+# with --gate gate2a (fuzz/check-gate2a.sh) a gate-2a file (fuzz/run-gate2a.sh), over gate 2a's
+# targets and key, and "gate": "gate2a-fuzz".
 #
 # The gate holds when the file is of this gate and lists exactly its targets (m2a: status_v2,
 # metadata_v3, ping_goodbye, blocks_by_range_resp), each run to completion for >= 3600 s with
@@ -34,9 +36,9 @@
 # must be a regular file of at most 1 MiB (GATE_MAX_BYTES, the binary's bound): a FIFO is
 # refused, not waited on, and at most 1 MiB + 1 byte is copied.
 #
-# Usage: fuzz/check-m2a-gate.sh [--gate m2a|gate1] <gate.json>      verify the gate file
-#        fuzz/check-m2a-gate.sh [--gate m2a|gate1] --print-key        print this tree's decoder key
-#        fuzz/check-m2a-gate.sh [--gate m2a|gate1] --print-expected   print every value a gate file
+# Usage: fuzz/check-m2a-gate.sh [--gate m2a|gate1|gate2a] <gate.json>      verify the gate file
+#        fuzz/check-m2a-gate.sh [--gate m2a|gate1|gate2a] --print-key        print this tree's decoder key
+#        fuzz/check-m2a-gate.sh [--gate m2a|gate1|gate2a] --print-expected   print every value a gate file
 #                                                                     must hold
 # Exit: 0 valid, 1 invalid, stale or over the size bound, 2 usage error, a file that cannot be
 # opened or is not a regular file, or the key cannot be computed.
@@ -50,7 +52,7 @@ set -euo pipefail
 GATE_MAX_BYTES=1048576
 
 usage() {
-  echo "Usage: fuzz/check-m2a-gate.sh [--gate m2a|gate1] <gate.json> | --print-key | --print-expected"
+  echo "Usage: fuzz/check-m2a-gate.sh [--gate m2a|gate1|gate2a] <gate.json> | --print-key | --print-expected"
   exit 2
 }
 
@@ -71,7 +73,7 @@ expected_json() {
 }
 
 if (($# == 3)) && [[ $1 == --gate ]]; then
-  gate_select "$2" || { echo "ERROR: --gate wants m2a or gate1, not '$2'"; usage; }
+  gate_select "$2" || { echo "ERROR: --gate wants m2a, gate1 or gate2a, not '$2'"; usage; }
   shift 2
 fi
 (($# == 1)) || usage

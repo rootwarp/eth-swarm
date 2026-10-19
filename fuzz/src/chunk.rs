@@ -96,7 +96,7 @@ fn request_payload(protocol: Protocol, wire: &[u8]) {
 
 /// How a scanner fed as a transport feeds it stopped.
 #[derive(Debug)]
-struct Fed {
+pub(crate) struct Fed {
     /// Its last answer.
     outcome: Result<Scan, CodecError>,
     /// The bytes it held then.
@@ -106,7 +106,7 @@ struct Fed {
 /// Feeds `wire` to `scan` as a transport does: nothing first, then exactly the `need` more bytes
 /// each incomplete scan asks for, until the scan completes, fails, or asks for more than `wire`
 /// holds. Every request stays within the scanner's own buffer bound (`max_len`).
-fn feed(wire: &[u8], mut scan: impl FnMut(&[u8]) -> Result<Scan, CodecError>) -> Fed {
+pub(crate) fn feed(wire: &[u8], mut scan: impl FnMut(&[u8]) -> Result<Scan, CodecError>) -> Fed {
     let mut held = 0;
     loop {
         let outcome = scan(&wire[..held]);
@@ -130,7 +130,7 @@ fn feed(wire: &[u8], mut scan: impl FnMut(&[u8]) -> Result<Scan, CodecError>) ->
 /// complete length (which is where the fed scanner stopped: it never asked for a byte past the
 /// chunk), the same error, or the same end of a chunk still incomplete (the one-shot scan holds
 /// the bytes the fed one did not ask for yet, so it needs that many fewer) under the same bound.
-fn agree(fed: &Fed, wire_len: usize, whole: &Result<Scan, CodecError>) {
+pub(crate) fn agree(fed: &Fed, wire_len: usize, whole: &Result<Scan, CodecError>) {
     match (&fed.outcome, whole) {
         (
             Ok(Scan::Incomplete { need, max_len }),

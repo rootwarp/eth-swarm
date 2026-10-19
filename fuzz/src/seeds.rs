@@ -9,11 +9,13 @@
 //! oversize frame body, a frame claiming more than 64 KiB and one claiming more than 4 GiB, too
 //! many empty frames), data after an error chunk and a response over its byte budget. The
 //! control targets get the same for the inbound requests, `rpc_chunk` for every protocol in both
-//! directions (the column protocols' sidecars of both forks and their requests among them); the gossip and ENR seeds are in [`gossip`] and [`record`].
+//! directions (the column protocols' sidecars of both forks and their requests among them); the gossip and ENR seeds are in [`gossip`] and [`record`], and the gate-2a column
+//! seeds (sidecars over gossip and req/resp, the two column requests) in [`columns`].
 //!
 //! Everything here is deterministic, so `tests/corpus.rs` can check the committed corpus is
 //! exactly what this module builds.
 
+mod columns;
 mod gossip;
 mod record;
 
@@ -103,6 +105,7 @@ pub fn all(vector_blocks: &[VectorBlock]) -> Vec<Seed> {
     rpc_chunk(&mut seeds, &status, &metadata, &ping);
     gossip::all(&mut seeds, vector_blocks);
     record::all(&mut seeds);
+    columns::all(&mut seeds);
     seeds
 }
 

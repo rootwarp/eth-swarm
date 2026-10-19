@@ -2,25 +2,28 @@
 # The m2a fuzz gate: runs the four response-decoder targets under cargo-fuzz and writes the gate
 # file that fuzz/check-m2a-gate.sh verifies. With --gate gate1 (fuzz/run-gate1.sh) it runs gate 1
 # instead: the seven targets of GATE1_TARGETS (fuzz/m2a-common.sh), with the same limits, into
-# fuzz/artifacts/gate1.json, which fuzz/check-gate1.sh verifies. Everything below holds for both;
-# the target lists, keys, file names and work directories are gate_select's.
+# fuzz/artifacts/gate1.json, which fuzz/check-gate1.sh verifies, and with --gate gate2a
+# (fuzz/run-gate2a.sh) gate 2a: the three column targets of GATE2A_TARGETS into
+# fuzz/artifacts/gate2a.json, which fuzz/check-gate2a.sh verifies. Everything below holds for
+# every gate; the target lists, keys, file names and work directories are gate_select's.
 #
 # Builds with fuzz/build-m2a.sh, then runs every target (in parallel unless --sequential) as
 #   cargo fuzz run -O -a <target> <work corpus> fuzz/corpus/<target> -- \
 #     -max_total_time=<seconds> -rss_limit_mb=2048 -malloc_limit_mb=128 -timeout=10 \
 #     -max_len=<m2a_max_len: 2 MiB for blocks_by_range_resp and the gossip targets, 1 MiB for
-#     rpc_chunk, 4096 B otherwise> -print_final_stats=1
+#     rpc_chunk and data_column_sidecar, 256 KiB for columns_by_root_req, 4096 B otherwise>
+#     -print_final_stats=1
 # The limits, -max_len and the build flags are the policy in fuzz/m2a-common.sh, which explains
 # each value; fuzz/check-m2a-gate.sh refuses a file with any other. A seed longer than its
 # target's -max_len stops the run (libFuzzer would cut it silently).
 # fuzz/corpus-slow is not fuzzed from: its seeds take seconds per execution (the ResponseTooLarge
 # byte budget) and would starve the run; fuzz/coverage-m2a.sh and the tests run them.
 # New inputs go to the work corpus under fuzz/target/m2a-gate/<target>/ (gate 1:
-# fuzz/target/gate1/), so the committed seeds stay as they are; crash, OOM and timeout inputs
+# fuzz/target/gate1/, gate 2a: fuzz/target/gate2a/), so the committed seeds stay as they are; crash, OOM and timeout inputs
 # land in fuzz/artifacts/<target>/.
 #
-# The gate file (default fuzz/artifacts/m2a-gate.json; gate 1: fuzz/artifacts/gate1.json)
-# records the gate ("m2a-fuzz" or "gate1-fuzz") and the commit (head), and per target: seconds
+# The gate file (default fuzz/artifacts/m2a-gate.json; gate 1: fuzz/artifacts/gate1.json; gate
+# 2a: fuzz/artifacts/gate2a.json) records the gate ("m2a-fuzz", "gate1-fuzz" or "gate2a-fuzz") and the commit (head), and per target: seconds
 # (libFuzzer's "Done ... in N second(s)"), execs (stat::number_of_executed_units), crashes, ooms, timeouts,
 # whether the run completed, the exit code, the crash inputs, the sha256 of the seed corpus and
 # the largest input the run kept; plus the decoder key (fuzz/check-m2a-gate.sh --print-key), the
@@ -28,9 +31,10 @@
 # with .log) keeps libFuzzer's seed-corpus and final stats lines and any error report; each
 # run's full output is in run.log beside the target's work corpus.
 #
-# Usage: fuzz/run-m2a-gate.sh [--gate m2a|gate1] [--seconds N] [--out FILE] [--log FILE]
+# Usage: fuzz/run-m2a-gate.sh [--gate m2a|gate1|gate2a] [--seconds N] [--out FILE] [--log FILE]
 #                             [--sequential] [--allow-dirty]
-#   --gate NAME    the gate to run (default m2a; fuzz/run-gate1.sh passes gate1)
+#   --gate NAME    the gate to run (default m2a; fuzz/run-gate1.sh passes gate1,
+#                  fuzz/run-gate2a.sh gate2a)
 #   --seconds N    per target (default 3600; less is a smoke run, which the checker refuses)
 #   --allow-dirty  run although a keyed path has uncommitted changes (the file says dirty: true)
 # Exit: 0 every target clean, 1 a crash, OOM, timeout, incomplete run or a target that did not
@@ -54,7 +58,7 @@ set -euo pipefail
 . "$(dirname "$0")/m2a-common.sh"
 
 usage() {
-  echo "Usage: fuzz/run-m2a-gate.sh [--gate m2a|gate1] [--seconds N] [--out FILE] [--log FILE] [--sequential] [--allow-dirty]"
+  echo "Usage: fuzz/run-m2a-gate.sh [--gate m2a|gate1|gate2a] [--seconds N] [--out FILE] [--log FILE] [--sequential] [--allow-dirty]"
   exit 2
 }
 
@@ -76,7 +80,7 @@ while (($#)); do
   esac
 done
 [[ $seconds =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: --seconds wants a positive integer"; usage; }
-gate_select "${gate:-m2a}" || { echo "ERROR: --gate wants m2a or gate1, not '$gate'"; usage; }
+gate_select "${gate:-m2a}" || { echo "ERROR: --gate wants m2a, gate1 or gate2a, not '$gate'"; usage; }
 [[ -n $out ]] || out="$fuzz_dir/artifacts/$GATE_FILE"
 
 m2a_require_clean_env

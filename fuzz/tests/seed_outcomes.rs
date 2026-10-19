@@ -683,3 +683,371 @@ fn enr_seeds() {
     }
     assert_eq!(structured, 20);
 }
+
+/// The Sepolia sidecar cap the column seeds are built around.
+fn column_cap() -> usize {
+    ethswarm_fuzz::spec_max_sidecar_size(ethswarm_fuzz::column_network().max_blobs_per_block())
+        as usize
+}
+
+/// A decoded column sidecar, or why not.
+type SidecarDecode =
+    Result<consensus_types::forked::DataColumnSidecar<E>, consensus_types::codec::DecodeError>;
+
+/// A `data_column_sidecar` gossip seed's transform and Gloas decode.
+fn column_gossip(name: &str) -> (Result<Vec<u8>, TransformError>, Option<SidecarDecode>) {
+    use consensus_types::caps::ObjectKind;
+    use consensus_types::codec::{decode_for, Object};
+    let bytes = seed("data_column_sidecar", &format!("gossip-{name}"));
+    assert_eq!(
+        bytes[0] & ethswarm_fuzz::CHUNK_BIT,
+        0,
+        "{name}: a gossip selector"
+    );
+    let topic = ethswarm_fuzz::column_topic(bytes[0] >> 1);
+    let transform = SnappyTransform::new(topic_caps_on_sepolia());
+    let inbound = transform.inbound(&topic, &bytes[1..]);
+    let decoded = inbound.as_ref().ok().map(|ssz| {
+        decode_for::<E>(
+            ObjectKind::DataColumnSidecar,
+            consensus_types::ForkName::Gloas,
+            ethswarm_fuzz::column_network(),
+            ssz,
+        )
+        .map(|o| match o {
+            Object::DataColumnSidecar(s) => s,
+            other => panic!("{name}: {:?}", other.kind()),
+        })
+    });
+    (inbound, decoded)
+}
+
+fn topic_caps_on_sepolia() -> p2p_wire::gossip::TopicCaps {
+    p2p_wire::gossip::TopicCaps::gloas::<E>(ethswarm_fuzz::column_network())
+}
+
+fn by_slot(sidecar: &consensus_types::forked::DataColumnSidecar<E>) -> SidecarDecode {
+    use ssz::Encode;
+    consensus_types::forked::DataColumnSidecar::from_ssz_bytes_by_slot(
+        &sidecar.as_ssz_bytes(),
+        ethswarm_fuzz::column_schedule(),
+        ethswarm_fuzz::column_network(),
+    )
+}
+
+/// The column gossip seeds reach the Gloas sidecar decode on the Sepolia caps, or the refusal
+/// each is named for; the decoder takes counts and indices that verification refuses later.
+#[test]
+fn data_column_sidecar_gossip_seeds() {
+    use consensus_types::codec::DecodeError;
+    use consensus_types::forked::DataColumnSidecar;
+    let cap = column_cap();
+    assert_eq!(
+        topic_caps_on_sepolia().cap(GossipKind::DataColumnSidecar { subnet_id: 0 }),
+        cap
+    );
+    let gloas = |name: &str| match column_gossip(name) {
+        (Ok(_), Some(Ok(DataColumnSidecar::Gloas(s)))) => s,
+        other => panic!("{name}: {other:?}"),
+    };
+    for name in ["valid", "valid-subnet-0", "valid-subnet-127", "no-cells"] {
+        let s = gloas(name);
+        assert!(
+            by_slot(&DataColumnSidecar::Gloas(s)).is_ok(),
+            "{name}: a Gloas slot"
+        );
+    }
+    assert_eq!(gloas("valid-subnet-127").index, 127);
+    let at_cap = column_gossip("at-cap").0.unwrap();
+    assert_eq!(at_cap.len(), cap, "exactly at the cap");
+    assert_eq!(
+        gloas("at-cap").column.len() as u64,
+        ethswarm_fuzz::column_network().max_blobs_per_block()
+    );
+    let s = gloas("cells-ne-proofs");
+    assert_ne!(s.column.len(), s.kzg_proofs.len());
+    let s = gloas("proofs-far-past-cells");
+    assert!(s.kzg_proofs.len() > 100 * s.column.len());
+    assert_eq!(gloas("index-128").index, 128);
+    assert_eq!(gloas("index-u64-max").index, u64::MAX);
+    let s = DataColumnSidecar::Gloas(gloas("fulu-slot"));
+    assert!(
+        matches!(by_slot(&s), Err(DecodeError::Ssz(_))),
+        "a Fulu slot decodes as Fulu"
+    );
+    let s = DataColumnSidecar::Gloas(gloas("pre-fulu-slot"));
+    assert!(matches!(by_slot(&s), Err(DecodeError::PreFulu { slot: 9 })));
+    for name in [
+        "oversize-column-list",
+        "oversize-cells-no-proofs",
+        "declares-cap-plus-1",
+    ] {
+        match column_gossip(name).0 {
+            Err(TransformError::DeclaredTooLarge { declared, cap: c }) => {
+                assert_eq!(c, cap, "{name}");
+                assert!(declared > cap, "{name}");
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+    for name in ["declares-over-10mib", "declares-4gib"] {
+        assert!(
+            matches!(
+                column_gossip(name).0,
+                Err(TransformError::DeclaredTooLarge { .. })
+            ),
+            "{name}"
+        );
+    }
+    for name in [
+        "declares-over-4gib",
+        "varint-11-bytes",
+        "truncated",
+        "trailing-byte",
+        "not-snappy",
+        "empty-data",
+    ] {
+        assert!(
+            matches!(column_gossip(name).0, Err(TransformError::Snappy(_))),
+            "{name}"
+        );
+    }
+    for name in [
+        "snappy-bomb-at-cap",
+        "fulu-sidecar",
+        "proofs-offset-before-column",
+        "column-not-whole-cells",
+        "first-offset-of-fulu",
+        "proofs-offset-past-end",
+    ] {
+        match column_gossip(name) {
+            (Ok(_), Some(Err(DecodeError::Ssz(_)))) => {}
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+    assert_eq!(column_gossip("snappy-bomb-at-cap").0.unwrap().len(), cap);
+}
+
+/// The column response-chunk seeds of both protocols reach the sidecar decoder through the
+/// context table with the Sepolia caps, and each refusal they are named for.
+#[test]
+fn data_column_sidecar_chunk_seeds() {
+    use consensus_types::forked::DataColumnSidecar;
+    use ethswarm_fuzz::{column_contexts, CHUNK_BIT, ROOT_BIT};
+    for (lead, prefix, protocol) in [
+        (CHUNK_BIT, "range-", Protocol::DataColumnsByRangeV1),
+        (CHUNK_BIT | ROOT_BIT, "root-", Protocol::DataColumnsByRootV1),
+    ] {
+        let bytes = |name: &str| {
+            let seed = seed("data_column_sidecar", &format!("{prefix}{name}"));
+            assert_eq!(seed[0], lead, "{prefix}{name}: the selector");
+            seed[1..].to_vec()
+        };
+        let decode =
+            |name: &str| decode_response_chunk::<E>(&bytes(name), protocol, column_contexts());
+        let fork = |name: &str| match decode(name) {
+            Ok(ResponseChunk::Success(Response::DataColumn(s))) => match *s {
+                DataColumnSidecar::Fulu(_) => "fulu",
+                DataColumnSidecar::Gloas(_) => "gloas",
+            },
+            other => panic!("{prefix}{name}: {other:?}"),
+        };
+        for name in [
+            "gloas-valid",
+            "gloas-at-cap",
+            "gloas-cells-ne-proofs",
+            "gloas-index-128",
+            "gloas-fulu-slot",
+        ] {
+            assert_eq!(fork(name), "gloas", "{prefix}{name}");
+        }
+        for name in [
+            "fulu-valid",
+            "fulu-bpo-digest-valid",
+            "fulu-cells-ne-commitments",
+            "fulu-index-128",
+            "fulu-gloas-slot",
+        ] {
+            assert_eq!(fork(name), "fulu", "{prefix}{name}");
+        }
+        let err = |name: &str| decode(name).expect_err(name);
+        assert!(matches!(
+            err("gloas-oversize-column-list"),
+            CodecError::PayloadTooLarge { .. }
+        ));
+        assert!(matches!(
+            err("gloas-sidecar-under-fulu-digest"),
+            CodecError::Decode(_)
+        ));
+        assert!(matches!(
+            err("fulu-sidecar-under-gloas-digest"),
+            CodecError::Decode(_)
+        ));
+        assert!(matches!(
+            err("unknown-context-digest"),
+            CodecError::UnknownContext(_)
+        ));
+        assert_eq!(err("context-cut-short"), CodecError::Truncated);
+        assert!(matches!(
+            err("prefix-under-sidecar-minimum"),
+            CodecError::PayloadTooSmall { .. }
+        ));
+        assert!(matches!(
+            err("snappy-bomb-within-bound"),
+            CodecError::Decode(_)
+        ));
+        assert_eq!(err("empty-response"), CodecError::Truncated);
+        // The empty response is a valid (empty) column answer to the codec.
+        let empty = block_on(read_response_chunks::<E, _>(
+            &mut Cursor::new(&bytes("empty-response")[..]),
+            protocol,
+            1,
+            column_contexts(),
+        ));
+        assert!(
+            matches!(empty.map(|c| c.len()), Ok(0)),
+            "{prefix}empty-response"
+        );
+        for code in 1..=3 {
+            assert!(
+                matches!(
+                    decode(&format!("error-code-{code}")),
+                    Ok(ResponseChunk::Error { .. })
+                ),
+                "{prefix}error-code-{code}"
+            );
+        }
+        for code in [4, 128, 255] {
+            assert_eq!(
+                decode(&format!("invalid-code-{code}")),
+                Err(CodecError::InvalidResultCode(code))
+            );
+        }
+        for (name, want) in chunk_cases() {
+            let got = err(name);
+            assert!(want(&got), "{prefix}{name}: {got:?}");
+        }
+    }
+}
+
+/// What each column request seed decodes to and how cl-p2p's admission check and the spec rule
+/// judge it: `Ok(n)` admitted for `n` sidecars, `Err(())` refused as `1: InvalidRequest`.
+fn column_request_verdicts(target: &str, protocol: Protocol, cases: &[(&str, Result<u64, ()>)]) {
+    use p2p_wire::rpc::protocols::column_request_error;
+    for (name, want) in cases {
+        let request = decode_request(protocol, &seed(target, name))
+            .unwrap_or_else(|e| panic!("{target}/{name}: {e}"));
+        let admitted = column_request_error(&request).is_none();
+        let rule = ethswarm_fuzz::spec_request_rule(&request);
+        match want {
+            Ok(n) => {
+                assert!(admitted, "{target}/{name}: refused");
+                assert_eq!(rule, Ok(*n), "{target}/{name}");
+                assert_eq!(request.max_response_chunks(), *n, "{target}/{name}");
+            }
+            Err(()) => {
+                assert!(!admitted, "{target}/{name}: admitted");
+                assert!(rule.is_err(), "{target}/{name}");
+            }
+        }
+    }
+}
+
+/// The framing refusals every column request target holds, by name.
+fn column_request_framing(target: &str, protocol: Protocol, has_minimum: bool) {
+    let decode = |name: &str| decode_request(protocol, &seed(target, name));
+    for (name, want) in request_cases() {
+        if name == "prefix-under-type-bound" && !has_minimum {
+            assert!(
+                try_seed(target, name).is_none(),
+                "{target}/{name}: no minimum"
+            );
+            continue;
+        }
+        let err = decode(name).unwrap_err();
+        assert!(want(&err), "{target}/{name}: {err:?}");
+    }
+    assert_eq!(
+        decode("too-many-empty-frames"),
+        Err(CodecError::TooManyEmptyFrames {
+            max: MAX_EMPTY_FRAMES
+        })
+    );
+}
+
+#[test]
+fn columns_by_range_req_seeds() {
+    let target = "columns_by_range_req";
+    let protocol = Protocol::DataColumnsByRangeV1;
+    column_request_verdicts(
+        target,
+        protocol,
+        &[
+            ("valid", Ok(128)),
+            ("at-sidecar-bound", Ok(16_384)),
+            ("sidecars-past-bound", Err(())),
+            ("count-times-columns-overflows", Err(())),
+            ("count-u64-max-no-columns", Ok(0)),
+            ("count-0", Ok(0)),
+            ("no-columns", Ok(0)),
+            ("index-128", Err(())),
+            ("index-u64-max", Err(())),
+            ("duplicate-columns", Ok(6)),
+            ("columns-at-list-bound", Ok(128)),
+        ],
+    );
+    let decode = |name: &str| decode_request(protocol, &seed(target, name));
+    assert!(matches!(
+        decode("columns-past-list-bound"),
+        Err(CodecError::PayloadTooLarge { .. })
+    ));
+    assert!(matches!(
+        decode("columns-offset-not-20"),
+        Err(CodecError::Decode(_))
+    ));
+    assert!(matches!(
+        decode("columns-not-whole-indices"),
+        Err(CodecError::Decode(_))
+    ));
+    column_request_framing(target, protocol, true);
+}
+
+#[test]
+fn columns_by_root_req_seeds() {
+    let target = "columns_by_root_req";
+    let protocol = Protocol::DataColumnsByRootV1;
+    column_request_verdicts(
+        target,
+        protocol,
+        &[
+            ("valid", Ok(4)),
+            ("at-both-bounds", Ok(16_384)),
+            ("empty-list", Ok(0)),
+            ("identifier-no-columns", Ok(0)),
+            ("index-128", Err(())),
+            ("index-u64-max", Err(())),
+            ("duplicate-pairs", Ok(3)),
+        ],
+    );
+    let decode = |name: &str| decode_request(protocol, &seed(target, name));
+    assert!(matches!(
+        decode("identifiers-past-bound-full"),
+        Err(CodecError::PayloadTooLarge { .. })
+    ));
+    for name in [
+        "identifiers-past-bound",
+        "identifier-columns-past-bound",
+        "identifier-columns-offset-not-36",
+        "first-offset-not-a-multiple-of-4",
+        "offsets-decreasing",
+        "offset-past-end",
+        "identifier-cut-short",
+    ] {
+        assert!(
+            matches!(decode(name), Err(CodecError::Decode(_))),
+            "{name}: {:?}",
+            decode(name)
+        );
+    }
+    column_request_framing(target, protocol, false);
+}

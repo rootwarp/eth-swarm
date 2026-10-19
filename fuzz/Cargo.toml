@@ -8,8 +8,9 @@
 # fuzz/Cargo.lock that the root Cargo.lock also has resolves to the same version and source, so
 # the fuzzed decoder links exactly the dependencies the session binary links.
 #
-# Build: fuzz/build-m2a.sh. Gates: fuzz/run-m2a-gate.sh (the m2a-session decoders) and
-# fuzz/run-gate1.sh (the probe's control, gossip and ENR decoders). Seeds: fuzz/gen-seeds.sh.
+# Build: fuzz/build-m2a.sh. Gates: fuzz/run-m2a-gate.sh (the m2a-session decoders),
+# fuzz/run-gate1.sh (the probe's control, gossip and ENR decoders) and fuzz/run-gate2a.sh (the
+# column sidecar and the two column requests). Seeds: fuzz/gen-seeds.sh.
 # Lock: fuzz/regen-lock.sh.
 [package]
 name = "ethswarm-fuzz"
@@ -28,8 +29,9 @@ cl-p2p = { path = "../crates/cl-p2p" }
 # parse_enr_fields, the ENR target's entry point.
 cl-discv5 = { path = "../crates/cl-discv5" }
 consensus-types = { path = "../crates/consensus-types" }
-# The pinned Sepolia schedule the ENR seeds at BPO digest boundaries are built from (seeds only;
-# no network-config code runs on fuzz input).
+# The pinned Sepolia config: the fork schedule the ENR seeds at BPO digest boundaries are built
+# from, and the blob schedule the gossip and column caps come from (each computed once; no
+# network-config code runs on fuzz input).
 network-config = { path = "../crates/network-config" }
 ethereum_ssz = "0.10"
 ssz_types = "0.14"
@@ -136,6 +138,27 @@ bench = false
 [[bin]]
 name = "enr_fields"
 path = "fuzz_targets/enr_fields.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "data_column_sidecar"
+path = "fuzz_targets/data_column_sidecar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "columns_by_range_req"
+path = "fuzz_targets/columns_by_range_req.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "columns_by_root_req"
+path = "fuzz_targets/columns_by_root_req.rs"
 test = false
 doc = false
 bench = false

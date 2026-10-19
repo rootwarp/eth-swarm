@@ -25,18 +25,36 @@ fn runtime() -> &'static Runtime {
     })
 }
 
-/// The codec over the fixture context table, with the production deadlines.
-fn codec() -> RpcCodec<E> {
+/// The fixture context table, shared by every codec over it.
+fn fixture_table() -> &'static Arc<ContextTable> {
     static TABLE: OnceLock<Arc<ContextTable>> = OnceLock::new();
-    let table = TABLE.get_or_init(|| Arc::new(contexts().clone()));
+    TABLE.get_or_init(|| Arc::new(contexts().clone()))
+}
+
+/// The codec over `table`, with the production deadlines.
+fn codec_over(table: &Arc<ContextTable>) -> RpcCodec<E> {
     RpcCodec::new(Arc::clone(table), Deadlines::default())
+}
+
+/// The codec over the fixture context table.
+fn codec() -> RpcCodec<E> {
+    codec_over(fixture_table())
 }
 
 /// Reads `wire` as the response to `request`: the codec writes the request first, which sets
 /// the response's chunk limit, as on an outbound stream.
 pub fn read_response(request: Request, wire: &[u8]) -> io::Result<Vec<ReceivedChunk<E>>> {
+    read_response_in(fixture_table(), request, wire)
+}
+
+/// [`read_response`] with the context bytes looked up in `table`.
+pub fn read_response_in(
+    table: &Arc<ContextTable>,
+    request: Request,
+    wire: &[u8],
+) -> io::Result<Vec<ReceivedChunk<E>>> {
     let protocol = request.protocol();
-    let mut codec = codec();
+    let mut codec = codec_over(table);
     runtime().block_on(async {
         codec
             .write_request(
