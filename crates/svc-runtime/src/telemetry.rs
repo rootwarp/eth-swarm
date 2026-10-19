@@ -88,11 +88,21 @@ const UNFORMATTED: &str = "log event could not be formatted";
 /// once the panic was caught (a tokio task, a `catch_unwind`), the next event on that thread
 /// was written onto it as one line that is not JSON; each such panic grew the buffer, outside
 /// the log queue's bound. A format that failed made the fmt layer write a line of its own, not
-/// JSON either. Here the event is formatted into a buffer of its own, kept only once the
-/// format finished; otherwise the event's line is [`unformatted_line`], its level and target
-/// without its fields (a panic is logged by the panic hook too).
+/// JSON either. Here the event is formatted into a buffer of its own ([`SCRATCH`], emptied
+/// after every event), kept only once the format finished; otherwise the event's line is
+/// [`unformatted_line`], its level, target and span without its fields (a panic is logged by
+/// the panic hook too).
 #[derive(Debug)]
 struct GuardedEvent<E>(E);
+
+/// The most capacity a thread's [`SCRATCH`] keeps between events: one huge event does not
+/// keep a huge buffer alive.
+const SCRATCH_MAX_KEPT: usize = 64 << 10;
+
+thread_local! {
+    /// Each thread's buffer that [`GuardedEvent`] formats an event into, empty between events.
+    static SCRATCH: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
 
 impl<S, N, E> FormatEvent<S, N> for GuardedEvent<E>
 where
@@ -106,30 +116,74 @@ where
         mut writer: Writer<'_>,
         event: &tracing::Event<'_>,
     ) -> fmt::Result {
-        let mut formatted = String::new();
-        let done = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            self.0.format_event(ctx, Writer::new(&mut formatted), event)
-        }));
-        match done {
-            Ok(Ok(())) => writer.write_str(&formatted),
-            Ok(Err(fmt::Error)) => writer.write_str(&unformatted_line(event.metadata())),
-            Err(payload) => {
-                dispose(payload);
-                writer.write_str(&unformatted_line(event.metadata()))
-            }
+        let mut format = |formatted: &mut String| self.guarded(ctx, formatted, &mut writer, event);
+        // The thread's scratch buffer, unless it is in use (a nested event) or already gone
+        // (the thread is ending): then a fresh one.
+        let reused = SCRATCH.try_with(|scratch| {
+            let mut formatted = scratch.try_borrow_mut().ok()?;
+            formatted.clear();
+            let result = format(&mut formatted);
+            formatted.clear();
+            formatted.shrink_to(SCRATCH_MAX_KEPT);
+            Some(result)
+        });
+        match reused {
+            Ok(Some(result)) => result,
+            _ => format(&mut String::new()),
         }
     }
 }
 
+impl<E> GuardedEvent<E> {
+    /// Formats `event` into the empty `formatted`, then writes it, or its
+    /// [`unformatted_line`], to `writer`.
+    fn guarded<S, N>(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        formatted: &mut String,
+        writer: &mut Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> fmt::Result
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+        N: for<'writer> FormatFields<'writer> + 'static,
+        E: FormatEvent<S, N>,
+    {
+        let done = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            self.0.format_event(ctx, Writer::new(formatted), event)
+        }));
+        if let Ok(Ok(())) = done {
+            return writer.write_str(formatted);
+        }
+        if let Err(payload) = done {
+            dispose(payload);
+        }
+        // The span the JSON format would name: the event's explicit parent, else the current
+        // one. Only its name is read, never its fields (their extensions lock may be what
+        // failed).
+        let span = event
+            .parent()
+            .and_then(|id| ctx.span(id))
+            .or_else(|| ctx.lookup_current())
+            .map(|span| span.metadata().name());
+        writer.write_str(&unformatted_line(event.metadata(), span))
+    }
+}
+
 /// The line of an event that could not be formatted, in the subscriber's JSON shape: its level
-/// and target, and [`UNFORMATTED`] for its fields.
-fn unformatted_line(event: &tracing::Metadata<'_>) -> String {
+/// and target, [`UNFORMATTED`] for its fields, and the name of its `span` if it has one.
+fn unformatted_line(event: &tracing::Metadata<'_>, span: Option<&str>) -> String {
     let mut line = format!(
         r#"{{"timestamp":"{}","level":"{}","fields":{{"message":"{UNFORMATTED}"}},"target":"#,
         log_writer::timestamp(),
         event.level()
     );
     log_writer::push_json_str(&mut line, event.target());
+    if let Some(name) = span {
+        line.push_str(r#","span":{"name":"#);
+        log_writer::push_json_str(&mut line, name);
+        line.push('}');
+    }
     line.push_str("}\n");
     line
 }
@@ -1225,6 +1279,91 @@ mod tests {
         assert_eq!(lines.len(), 1, "{lines:#?}");
         assert!(lines[0].contains(UNFORMATTED), "{}", lines[0]);
         assert!(lines[0].contains(r#""level":"WARN""#), "{}", lines[0]);
+        assert!(!lines[0].contains(r#""span""#), "{}", lines[0]);
+    }
+
+    #[test]
+    fn events_are_formatted_into_a_reused_bounded_buffer() {
+        let buf = Buffer::default();
+        let huge = "y".repeat(4 * SCRATCH_MAX_KEPT);
+        tracing::subscriber::with_default(json_subscriber(LevelFilter::INFO, buf.clone()), || {
+            tracing::info!("small");
+            let kept = SCRATCH.with(|s| (s.borrow().len(), s.borrow().capacity()));
+            assert_eq!(kept.0, 0, "the buffer is left empty");
+            assert!(kept.1 > 0, "the buffer is kept for the next event");
+            tracing::info!(huge = %huge, "huge");
+            let kept = SCRATCH.with(|s| (s.borrow().len(), s.borrow().capacity()));
+            assert_eq!(kept.0, 0, "the buffer is left empty");
+            assert!(kept.1 <= SCRATCH_MAX_KEPT, "kept {} bytes", kept.1);
+            tracing::info!("after");
+        });
+        let lines = json_lines(&buf);
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(lines[0].contains(r#""message":"small""#), "{}", lines[0]);
+        assert!(lines[1].contains(&huge), "the huge line is whole");
+        assert!(lines[2].contains(r#""message":"after""#), "{}", lines[2]);
+    }
+
+    #[test]
+    fn an_event_formatted_while_the_buffer_is_in_use_is_whole() {
+        let buf = Buffer::default();
+        tracing::subscriber::with_default(json_subscriber(LevelFilter::INFO, buf.clone()), || {
+            SCRATCH.with(|s| {
+                let mut held = s.borrow_mut();
+                held.push_str("held");
+                tracing::info!("nested");
+                assert_eq!(*held, "held", "the held buffer is left alone");
+                held.clear();
+            });
+        });
+        let lines = json_lines(&buf);
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(lines[0].contains(r#""message":"nested""#), "{}", lines[0]);
+    }
+
+    #[test]
+    fn an_event_that_fails_to_format_names_its_span() {
+        let buf = Buffer::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .event_format(GuardedEvent(FailingEvents))
+            .with_writer(buf.clone());
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            let outer = tracing::info_span!("outer", n = 1);
+            let _entered = outer.enter();
+            tracing::warn!("fails in the current span");
+            let parent = tracing::info_span!("parent \"quoted\"");
+            tracing::warn!(parent: &parent, "fails with an explicit parent");
+        });
+        let lines = json_lines(&buf);
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert!(
+            lines[0].ends_with(r#","span":{"name":"outer"}}"#),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].ends_with(r#","span":{"name":"parent \"quoted\""}}"#),
+            "{}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn an_event_that_panics_while_formatting_names_its_span() {
+        let buf = Buffer::default();
+        tracing::subscriber::with_default(json_subscriber(LevelFilter::INFO, buf.clone()), || {
+            let span = tracing::info_span!("around", n = 7);
+            let _entered = span.enter();
+            caught(|| tracing::info!(value = ?DebugPanics, "half written"));
+        });
+        let lines = json_lines(&buf);
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(lines[0].contains(UNFORMATTED), "{}", lines[0]);
+        assert!(
+            lines[0].contains(r#""span":{"name":"around"}"#),
+            "{}",
+            lines[0]
+        );
     }
 
     #[test]

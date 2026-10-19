@@ -12,9 +12,11 @@
 mod common;
 
 use std::fmt;
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use common::child::OwnedChild;
@@ -32,6 +34,9 @@ use tracing_subscriber::layer::Identity;
 const CHILD_CONFIG: &str = "SVC_RUNTIME_STALLED_STDERR_CONFIG";
 /// Set, the child's log queue is [`ROOMY`] instead of [`SMALL`].
 const CHILD_ROOMY_QUEUE: &str = "SVC_RUNTIME_STALLED_STDERR_ROOMY_QUEUE";
+/// Set, the path of a file the child appends one byte to each time a `ForkchoiceUpdated`
+/// handler is entered: a call that failed before reaching its handler adds nothing.
+const CHILD_ENTRIES: &str = "SVC_RUNTIME_STALLED_STDERR_ENTRIES";
 /// A queue a [`BURST`] overflows.
 const SMALL: LogQueueBounds = LogQueueBounds {
     max_bytes: 64 << 10,
@@ -56,6 +61,17 @@ const SLACK: Duration = Duration::from_secs(2);
 const SPAN_PANICKED: &str = "a span field panicked";
 /// The panic message of `ForkchoiceUpdated`.
 const PANIC: &str = "chatty forkchoice_updated panics";
+
+/// The child's [`CHILD_ENTRIES`] file, opened for appending, if the test asked for it.
+static ENTRIES: OnceLock<std::fs::File> = OnceLock::new();
+
+/// Records one `ForkchoiceUpdated` handler entry, if asked to: one byte, appended (one append
+/// write, so concurrent handlers lose none).
+fn record_entry() {
+    if let Some(mut file) = ENTRIES.get() {
+        file.write_all(b".").expect("record a handler entry");
+    }
+}
 
 /// A value whose `Debug` panics.
 struct PanicsOnDebug;
@@ -89,6 +105,7 @@ impl EngineService for ChattyEngine {
         &self,
         _: Request<pb::ForkchoiceUpdatedRequest>,
     ) -> Result<Response<pb::ForkchoiceUpdatedResponse>, Status> {
+        record_entry();
         panic!("{PANIC}");
     }
     /// Panics inside the fmt layer, while it holds the entered span's extensions: the panic
@@ -131,6 +148,14 @@ fn serve_chatty_engine_child() {
     let Some(path) = std::env::var_os(CHILD_CONFIG) else {
         return;
     };
+    if let Some(entries) = std::env::var_os(CHILD_ENTRIES) {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(entries)
+            .unwrap();
+        assert!(ENTRIES.set(file).is_ok());
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(WORKERS)
         .enable_all()
@@ -239,7 +264,7 @@ fn config_text(root: &Path) -> String {
 
 /// A child's directory, config and service manager socket.
 struct Setup {
-    _tmp: tempfile::TempDir,
+    tmp: tempfile::TempDir,
     root: PathBuf,
     config: PathBuf,
     notify: PathBuf,
@@ -255,7 +280,7 @@ impl Setup {
         let notify = tmp.path().join("notify.sock");
         let manager = tokio::net::UnixDatagram::bind(&notify).unwrap();
         Self {
-            _tmp: tmp,
+            tmp,
             root,
             config,
             notify,
@@ -380,7 +405,10 @@ async fn stalled_stderr_keeps_serving_and_exits() {
                 .forkchoice_updated(pb::ForkchoiceUpdatedRequest::default()),
         )
         .await;
-        assert!(answer.is_err(), "call {call} panicked: {answer:?}");
+        assert!(
+            answer.is_err(),
+            "call {call} answered, but its handler panics: {answer:?}"
+        );
     }
     let answer = bounded(
         "NewPayload after the panics",
@@ -473,10 +501,12 @@ async fn a_burst_of_panics_does_not_hold_off_sigterm() {
     // Waiting its 100 ms flush per panic, the burst would take 12.8 s on the two workers.
     let limit = Duration::from_millis(DRAIN_MS) + svc_runtime::lifecycle::LOG_FLUSH_DEADLINE;
     let setup = Setup::new();
+    let entries = setup.tmp.path().join("entries");
     let mut command = setup.command();
     // No backtraces: resolving one per panic is not what this measures.
     command
         .env(CHILD_ROOMY_QUEUE, "1")
+        .env(CHILD_ENTRIES, &entries)
         .env_remove("RUST_BACKTRACE")
         .env_remove("RUST_LIB_BACKTRACE");
     let (mut child, pid, metrics) = start_stalled_with(&setup, command).await;
@@ -502,7 +532,10 @@ async fn a_burst_of_panics_does_not_hold_off_sigterm() {
         let mut panicked = 0;
         while let Some(answer) = calls.join_next().await {
             let answer = answer.expect("the call task");
-            assert!(answer.is_err(), "call {panicked} panicked: {answer:?}");
+            assert!(
+                answer.is_err(),
+                "call {panicked} answered, but its handler panics: {answer:?}"
+            );
             panicked += 1;
         }
         panicked
@@ -515,6 +548,15 @@ async fn a_burst_of_panics_does_not_hold_off_sigterm() {
         panicked,
         Ok(CONNECTIONS * CALLS),
         "the burst took {took:?}, past {limit:?} (+{SLACK:?})"
+    );
+    // Every call failed because its handler ran and panicked, not on the way to it. A handler
+    // records its entry before it panics, and so before its call can fail.
+    let entered = std::fs::metadata(&entries).map_or(0, |m| m.len());
+    assert_eq!(
+        entered,
+        (CONNECTIONS * CALLS) as u64,
+        "handlers entered, of {} calls",
+        CONNECTIONS * CALLS
     );
     // Each panic line was queued, not dropped.
     assert_eq!(dropped_lines(metrics).await, 0, "a panic line was dropped");

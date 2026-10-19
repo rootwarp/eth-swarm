@@ -78,6 +78,20 @@ struct Shared {
     /// [`Self::written`] when a [`LogWriter::flush_unless_stalled`] last timed out, or
     /// [`NOT_STALLED`].
     stalled_at: AtomicU64,
+    /// Run by the dying writer thread once it has released the dead queue.
+    #[cfg(test)]
+    on_dead: OnceLock<DeadHook>,
+}
+
+/// A test's hook into [`Alive`]'s drop.
+#[cfg(test)]
+struct DeadHook(Box<dyn Fn() + Send + Sync>);
+
+#[cfg(test)]
+impl std::fmt::Debug for DeadHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeadHook")
+    }
 }
 
 /// [`Shared::stalled_at`] when the last such flush did not time out.
@@ -128,6 +142,8 @@ impl LogWriter {
             thread: OnceLock::new(),
             written: AtomicU64::new(0),
             stalled_at: AtomicU64::new(NOT_STALLED),
+            #[cfg(test)]
+            on_dead: OnceLock::new(),
         });
         let thread = Arc::clone(&shared);
         std::thread::Builder::new()
@@ -210,6 +226,13 @@ impl LogWriter {
         shared.stalled_at.store(stalled_at, Ordering::SeqCst);
         flushed
     }
+
+    /// Runs `hook` on the writer thread when it dies, once it has released the dead queue and
+    /// before it wakes the flushes waiting on it.
+    #[cfg(test)]
+    fn on_dead(&self, hook: impl Fn() + Send + Sync + 'static) {
+        assert!(self.shared.on_dead.set(DeadHook(Box::new(hook))).is_ok());
+    }
 }
 
 /// The writer thread: writes each entry, in order, outside the lock.
@@ -286,8 +309,13 @@ impl Drop for Alive<'_> {
         queue.bytes = 0;
         queue.dead = true;
         queue.writing = false;
-        drop(queue);
+        // Counted under the lock: a flush that sees the queue dead sees the count too.
         self.0.dropped.inc_by(lost as u64);
+        drop(queue);
+        #[cfg(test)]
+        if let Some(DeadHook(hook)) = self.0.on_dead.get() {
+            hook();
+        }
         self.0.idle.notify_all();
     }
 }
@@ -838,6 +866,55 @@ mod tests {
         assert_eq!(dropped.get(), 9);
         assert!(!writer.push(&line(9)));
         assert_eq!(dropped.get(), 10);
+    }
+
+    #[test]
+    fn the_lost_lines_are_counted_once_a_flush_sees_the_writer_dead() {
+        use std::sync::mpsc;
+        /// Blocks its first write until released, then panics.
+        struct PanicsWhenReleased(mpsc::Receiver<()>);
+        impl io::Write for PanicsWhenReleased {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                let _ = self.0.recv();
+                panic!("a sink that panics (expected by this test)");
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (release, released) = mpsc::channel();
+        let dropped = Counter::default();
+        let writer = LogWriter::spawn(
+            PanicsWhenReleased(released),
+            bounds(1 << 20, 8),
+            dropped.clone(),
+        )
+        .unwrap();
+        // Holds the dying writer thread just after it released the queue, until this test has
+        // flushed and read the count.
+        let (dead, seen_dead) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel::<()>();
+        let resumed = Mutex::new(resumed);
+        writer.on_dead(move || {
+            let _ = dead.send(());
+            let _ = resumed
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10));
+        });
+        for n in 0..3 {
+            assert!(writer.push(&line(n)));
+        }
+        release.send(()).unwrap();
+        seen_dead
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the writer thread dies");
+        let started = Instant::now();
+        assert!(!writer.flush(Duration::from_secs(10)), "nothing writes");
+        assert!(started.elapsed() < Duration::from_secs(5), "it waited");
+        // The three lines it held are counted by the time a flush can see it dead.
+        assert_eq!(dropped.get(), 3);
+        resume.send(()).unwrap();
     }
 
     #[test]
