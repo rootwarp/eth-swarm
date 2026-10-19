@@ -1,4 +1,5 @@
-//! Test fixtures shared by [`crate::verify`] and [`crate::probe`] tests.
+//! Test fixtures shared by [`crate::verify`] and [`crate::probe`] tests, and by
+//! `tests/v2_serving.rs`, which includes this file as a module of its own.
 //!
 //! - [`Blobs`]: two deterministic blobs (the unit vectors `e_0` and `e_1`), their KZG
 //!   commitments, and the cells and proofs of some of their columns. The commitments are the

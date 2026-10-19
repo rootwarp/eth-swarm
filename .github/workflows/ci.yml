@@ -130,6 +130,8 @@ jobs:
       - name: Fetch and verify spec vectors (uncached)
         run: PRESETS="general minimal" bash testing/fetch-vectors.sh
       - run: cargo test --workspace --locked
+      - name: Bad column sidecars from gossip are never stored or served (KZG through cl-verify)
+        run: cargo test -p cl-chain --test v2_serving --locked
       - name: Every service runs the contract suite, in process and over UDS
         run: bash scripts/tests/check-contract-tests.test.sh && bash scripts/check-contract-tests.sh
       - name: crypto-bls API tests with every feature (verify, aggregate, test-vectors)
