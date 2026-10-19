@@ -13,6 +13,8 @@
 //! [`behaviour`]), and [`identity`] the service's node key from its systemd credential.
 //! [`gossip`] is the probe's gossipsub, which reports IGNORE for every message and so forwards
 //! none; [`custody`] subscribes it to exactly the custody column subnets cl-chain names.
+//! [`peers`] records what the probe learns of its peers: the Goodbye ledger
+//! ([`peers::manager::GoodbyeLedger`]), reason-3 Goodbyes from Status-valid peers per hour.
 
 pub mod behaviour;
 pub mod custody;
@@ -20,6 +22,7 @@ pub mod gossip;
 pub mod identity;
 pub mod m2a_session;
 pub mod peer_caps;
+pub mod peers;
 pub mod rpc;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;

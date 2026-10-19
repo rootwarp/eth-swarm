@@ -104,6 +104,11 @@ STATE=0x$(printf '33%.0s' {1..32})
 FIN=0x$(printf '44%.0s' {1..32})
 FAR=18446744073709551615
 
+# peer_of_port <port>: the CL's libp2p peer ID, one per port: a secp256k1 one's shape (16Uiu2HA,
+# 53 base58 chars: no 0).
+peer_of_port() { printf '16Uiu2HAmPeer%s%s' "$(printf '%s' "$1" | tr 0 z)" "$(printf '1%.0s' {1..36})"; }
+PEER1=$(peer_of_port 32801) PEER2=$(peer_of_port 32811)
+
 # cl <service> <port>: a CL whose every answer is the passing one.
 cl() {
   local d="$STUB_DIR/http/127.0.0.1:$2"
@@ -116,10 +121,10 @@ cl() {
   printf '{"data":[%s]}\n' \
     '{"previous_version":"0x10000038","current_version":"0x10000038","epoch":"0"},{"previous_version":"0x10000038","current_version":"0x20000038","epoch":"0"},{"previous_version":"0x50000038","current_version":"0x60000038","epoch":"0"},{"previous_version":"0x60000038","current_version":"0x70000038","epoch":"0"},{"previous_version":"0x70000038","current_version":"0x80000038","epoch":"'"$FAR"'"}' \
     > "$d/eth_v1_config_fork_schedule"
-  printf '{"data":{"PRESET_BASE":"minimal","FULU_FORK_EPOCH":"0","GLOAS_FORK_VERSION":"0x70000038","GLOAS_FORK_EPOCH":"0"}}\n' \
+  printf '{"data":{"PRESET_BASE":"minimal","SLOTS_PER_EPOCH":"8","SECONDS_PER_SLOT":"6","FULU_FORK_EPOCH":"0","GLOAS_FORK_VERSION":"0x70000038","GLOAS_FORK_EPOCH":"0"}}\n' \
     > "$d/eth_v1_config_spec"
-  printf '{"data":{"peer_id":"16Uiu2HAm","enr":"%s","p2p_addresses":["/ip4/172.16.0.10/tcp/9000/p2p/16Uiu2HAm"],"discovery_addresses":[],"metadata":{"seq_number":"1"}}}\n' \
-    "$(enr 01020304)" > "$d/eth_v1_node_identity"
+  printf '{"data":{"peer_id":"%s","enr":"%s","p2p_addresses":["/ip4/172.16.0.10/tcp/9000/p2p/%s"],"discovery_addresses":[],"metadata":{"seq_number":"1"}}}\n' \
+    "$(peer_of_port "$2")" "$(enr 01020304)" "$(peer_of_port "$2")" > "$d/eth_v1_node_identity"
   finalized "$1" 4 "$FIN"
 }
 
@@ -645,6 +650,261 @@ base
 run 0 "a kurtosis call within the limit passes" '^verdict: PASS' -- --kurtosis-timeout 5 ethswarm-gloas
 run 2 "a --kurtosis-timeout of 0 is a usage error" 'kurtosis-timeout must be an integer >= 1' -- --kurtosis-timeout 0 ethswarm-gloas
 run 2 "a non-integer --kurtosis-timeout is a usage error" 'kurtosis-timeout must be an integer >= 1' -- --kurtosis-timeout soon ethswarm-gloas
+
+# --- goodbye3: reason-3 Goodbyes in the probe's log (--probe-log) ---------------------------------
+
+# probe_log <file> <line spec...>: the probe's stderr log, one svc-runtime JSON line per spec
+# "<secs>|<message>[|<peer>[|<reason>]]", <secs> after 2026-10-19T00:00:00Z.
+probe_log() {
+  local out=$1
+  shift
+  python3 -I -c '
+import datetime, json, sys
+base = datetime.datetime(2026, 10, 19, tzinfo=datetime.timezone.utc)
+for spec in sys.argv[1:]:
+    parts = spec.split("|")
+    t = base + datetime.timedelta(seconds=float(parts[0]))
+    fields = {"message": parts[1]}
+    if len(parts) > 2 and parts[2]:
+        fields["peer"] = parts[2]
+    if len(parts) > 3:
+        fields["reason"] = int(parts[3])
+        fields.update(status_valid="true", direction="outbound", unix_ms=int(t.timestamp() * 1000))
+    print(json.dumps({"timestamp": t.strftime("%Y-%m-%dT%H:%M:%S.%fZ"), "level": "INFO",
+                      "fields": fields, "target": "cl_p2p::rpc::inbound"}))
+' "$@" > "$out"
+}
+# held <file> [extra line specs...]: both CLs judged at 0 s and held to 600 s (12.5 epochs of 48 s).
+held() {
+  local out=$1
+  shift
+  probe_log "$out" "0|our Status" "1|status judged|$PEER1" "2|status judged|$PEER2" ${@+"$@"} \
+    "601|status check passed|$PEER1" "602|status check passed|$PEER2"
+}
+LH_IMAGE='ethpandaops/lighthouse:unstable-c8ddac7@sha256:5b666c7b7d18454828a205bd94edd76c8d19068d62365c0fa676980cdd548bdd'
+LS_IMAGE='ethpandaops/lodestar:unstable-b3beff2@sha256:679d32d0f390840ae95b89d55bc1329f913e4a0da933faf0afd09e483dd08036'
+
+base
+held "$tmp/probe.log"
+run 0 "a probe log with no reason-3 Goodbye from either CL over 12.5 epochs passes goodbye3" \
+  "^cl-1-lighthouse-geth: image $LH_IMAGE$" "^cl-2-lodestar-geth: image $LS_IMAGE$" \
+  "^cl-1-lighthouse-geth: goodbye3 0 \(other Goodbyes 0\) in 12\.5 epochs \(600\.0 s in one log, peer $PEER1\)$" \
+  "^cl-2-lodestar-geth: goodbye3 0 \(other Goodbyes 0\) in 12\.5 epochs \(600\.0 s in one log, peer $PEER2\)$" \
+  '^goodbye3: PASS \(2 CLs: no reason-3 Goodbye, each over at least 2 epochs\)$' \
+  '^verdict: PASS \(4/4 criteria\)$' '!^diagnostic:' \
+  -- --probe-log "$tmp/probe.log" ethswarm-gloas
+
+base
+held "$tmp/probe.log" "300|goodbye_received|$PEER2|3"
+run 1 "a reason-3 Goodbye from one CL fails goodbye3, naming it" \
+  "^cl-2-lodestar-geth: goodbye3 1 \(other Goodbyes 0\) in 12\.5 epochs" \
+  "^- cl-2-lodestar-geth: 1 reason-3 Goodbye from $PEER2; exit 10 \(b\) wants none$" \
+  '^goodbye3: FAIL$' '^verdict: FAIL \(goodbye3\)$' '!^- cl-1-' \
+  -- --probe-log "$tmp/probe.log" ethswarm-gloas
+
+base
+held "$tmp/probe.log" "300|goodbye_received|$PEER1|1" "301|goodbye_received|$(peer_of_port 39999)|3"
+run 0 "Goodbyes of another reason, and reason 3 from a peer that is no CL, do not fail goodbye3" \
+  "^cl-1-lighthouse-geth: goodbye3 0 \(other Goodbyes 1\) in " '^goodbye3: PASS' \
+  -- --probe-log "$tmp/probe.log" ethswarm-gloas
+
+base
+probe_log "$tmp/probe.log" "1|status judged|$PEER1" "2|status judged|$PEER2" \
+  "91|status check passed|$PEER1" "98|status check passed|$PEER2"
+run 3 "a CL observed for under 2 epochs is a DIAGNOSTIC run, never an acceptance PASS" \
+  "^cl-1-lighthouse-geth: goodbye3 0 \(other Goodbyes 0\) in 1\.9 epochs \(90\.0 s" \
+  '^- cl-1-lighthouse-geth: observed 1\.9 epochs, under the 2 an acceptance run needs$' \
+  '^goodbye3: DIAGNOSTIC' '^diagnostic: goodbye3: a CL was observed for under 2 epochs$' \
+  '^verdict: DIAGNOSTIC \(4/4 criteria passed; not an acceptance run\)$' '!^verdict: PASS' '!^- cl-2-' \
+  -- --probe-log "$tmp/probe.log" ethswarm-gloas
+
+base
+probe_log "$tmp/probe.log" "1|status judged|$PEER1" "1|status judged|$PEER2" \
+  "97|status check passed|$PEER1" "97|status check passed|$PEER2"
+run 0 "exactly 2 epochs is enough" '^cl-1-lighthouse-geth: goodbye3 0 \(other Goodbyes 0\) in 2\.0 epochs' '^goodbye3: PASS' \
+  -- --probe-log "$tmp/probe.log" ethswarm-gloas
+
+base
+probe_log "$tmp/probe.log" "1|status judged|$PEER1" "60|goodbye_received|$PEER1|3"
+run 1 "a reason-3 Goodbye fails even under 2 epochs, and a CL missing from the log fails" \
+  "^- cl-1-lighthouse-geth: 1 reason-3 Goodbye from $PEER1" \
+  "^- cl-2-lodestar-geth: peer $PEER2 is not in the probe log$" '^verdict: FAIL \(goodbye3\)$' '!observed .* under the 2' \
+  -- --probe-log "$tmp/probe.log" ethswarm-gloas
+
+base
+probe_log "$tmp/a.log" "1|status judged|$PEER1" "601|status check passed|$PEER1"
+probe_log "$tmp/b.log" "5|status judged|$PEER2" "605|status check passed|$PEER2"
+run 0 "two probe logs are read together" '^cl-2-lodestar-geth: goodbye3 0 \(other Goodbyes 0\) in 12\.5 epochs' '^goodbye3: PASS' \
+  -- --probe-log "$tmp/a.log" --probe-log "$tmp/b.log" ethswarm-gloas
+
+# Each log is its own observation: two short runs with a gap between them never add up to one
+# window across the gap.
+base
+probe_log "$tmp/a.log" "0|status judged|$PEER1" "0|status judged|$PEER2" \
+  "40|status check passed|$PEER1" "40|status check passed|$PEER2"
+probe_log "$tmp/b.log" "640|status judged|$PEER1" "640|status judged|$PEER2" \
+  "680|status check passed|$PEER1" "680|status check passed|$PEER2"
+run 3 "two short probe logs 10 minutes apart are DIAGNOSTIC, not one 14-epoch window" \
+  "^cl-1-lighthouse-geth: goodbye3 0 \(other Goodbyes 0\) in 0\.8 epochs \(40\.0 s in one log, peer $PEER1\)$" \
+  '^- cl-2-lodestar-geth: observed 0\.8 epochs, under the 2 an acceptance run needs$' \
+  '^verdict: DIAGNOSTIC' '!^verdict: PASS' '!^goodbye3: PASS' \
+  -- --probe-log "$tmp/a.log" --probe-log "$tmp/b.log" ethswarm-gloas
+# One log that covers 2 epochs is enough, whatever the others cover.
+probe_log "$tmp/c.log" "1000|status judged|$PEER1" "1000|status judged|$PEER2" \
+  "1100|status check passed|$PEER1" "1100|status check passed|$PEER2"
+run 0 "a third log that covers 2 epochs alone passes" '^cl-1-lighthouse-geth: goodbye3 0 \(other Goodbyes 0\) in 2\.1 epochs \(100\.0 s in one log' \
+  '^goodbye3: PASS' -- --probe-log "$tmp/a.log" --probe-log "$tmp/b.log" --probe-log "$tmp/c.log" ethswarm-gloas
+
+# A goodbye_received line the check cannot read cannot prove there was no reason 3.
+for bad in '"reason":"3"' '"reason":3.0' '"reason":true' 'none'; do
+  base
+  held "$tmp/probe.log"
+  case $bad in
+    none) fields='"message":"goodbye_received","peer":"'"$PEER2"'"' ;;
+    *) fields='"message":"goodbye_received","peer":"'"$PEER2"'",'"$bad" ;;
+  esac
+  printf '{"timestamp":"2026-10-19T00:05:00.000000Z","level":"INFO","fields":{%s},"target":"cl_p2p::rpc::inbound"}\n' "$fields" >> "$tmp/probe.log"
+  run 1 "a goodbye_received line with reason $bad fails goodbye3" \
+    '^- .*probe\.log line 6: goodbye_received without an integer reason$' '^goodbye3: FAIL$' '!other Goodbyes 1' \
+    -- --probe-log "$tmp/probe.log" ethswarm-gloas
+done
+base
+held "$tmp/probe.log"
+printf '%s\n' '{"timestamp":"2026-10-19T00:05:00.000000Z","level":"INFO","fields":{"message":"goodbye_received","reason":3},"target":"cl_p2p::rpc::inbound"}' >> "$tmp/probe.log"
+run 1 "a goodbye_received line without a peer fails goodbye3" \
+  '^- .*probe\.log line 6: goodbye_received without a peer ID$' '^goodbye3: FAIL$' -- --probe-log "$tmp/probe.log" ethswarm-gloas
+# A peer that is no peer ID cannot be told apart from a reference CL's: fail, never skip it.
+# Nor is a reference CL's ID with a trailing newline (JSON-escaped).
+for bad in '""' '"x"' '"16Uiu2HAm0OIl"' '"12D3KooWshort"' '3' 'null' "\"$PEER1\\n\""; do
+  base
+  held "$tmp/probe.log"
+  printf '{"timestamp":"2026-10-19T00:05:00.000000Z","level":"INFO","fields":{"message":"goodbye_received","peer":%s,"reason":3},"target":"cl_p2p::rpc::inbound"}\n' "$bad" >> "$tmp/probe.log"
+  run 1 "a goodbye_received line with peer $bad fails goodbye3" \
+    '^- .*probe\.log line 6: goodbye_received without a peer ID$' '^goodbye3: FAIL$' '!^goodbye3: PASS' \
+    -- --probe-log "$tmp/probe.log" ethswarm-gloas
+done
+
+base
+held "$tmp/probe.log"
+sed -e "s/$PEER2/$PEER1/g" "$STUB_DIR/http/127.0.0.1:32811/eth_v1_node_identity" > "$tmp/identity" &&
+  mv "$tmp/identity" "$STUB_DIR/http/127.0.0.1:32811/eth_v1_node_identity"
+run 1 "two CLs with one peer ID fail goodbye3: their Goodbyes would merge" \
+  "^- cl-2-lodestar-geth: peer_id $PEER1 is cl-1-lighthouse-geth's too$" '^goodbye3: FAIL$' \
+  -- --probe-log "$tmp/probe.log" ethswarm-gloas
+
+base
+held "$tmp/probe.log"
+printf '%s\n' '{"timestamp":"2026-10-19T00:05:00.000000Z","level":"WARN","fields":{"message":"log lines dropped: the log queue was full or the sink refused them","dropped":12},"target":"svc_runtime::log_writer"}' >> "$tmp/probe.log"
+run 1 "a probe log that dropped lines fails goodbye3: a Goodbye may be among them" \
+  '^- .*probe\.log line 6: the probe dropped 12 log lines; a Goodbye may be among them$' '^goodbye3: FAIL$' \
+  -- --probe-log "$tmp/probe.log" ethswarm-gloas
+
+base
+held "$tmp/probe.log"
+printf 'PASS peer 16Uiu2HAm: held 600 s\n' >> "$tmp/probe.log"
+run 1 "a line that is not a JSON log line fails goodbye3 (stdout is not the log)" \
+  '^- .*probe\.log line 6: not a JSON log line$' '^goodbye3: FAIL$' -- --probe-log "$tmp/probe.log" ethswarm-gloas
+
+base
+held "$tmp/probe.log"
+printf '%s\n' '{"timestamp":"yesterday","fields":{"message":"x","peer":"'"$PEER1"'"}}' >> "$tmp/probe.log"
+run 1 "a line without an RFC 3339 timestamp fails goodbye3" '^- .*probe\.log line 6: no RFC 3339 timestamp$' \
+  -- --probe-log "$tmp/probe.log" ethswarm-gloas
+
+base
+: > "$tmp/empty.log"
+run 1 "an empty probe log fails goodbye3" '^- .*empty\.log: no log lines$' -- --probe-log "$tmp/empty.log" ethswarm-gloas
+
+base
+held "$tmp/probe.log"
+edit cl-1-lighthouse-geth eth_v1_config_spec 's/"SECONDS_PER_SLOT":"6",/"SECONDS_PER_SLOT":"6","SLOT_DURATION_MS":"12000",/'
+run 0 "SLOT_DURATION_MS, where a CL serves it, sets the epoch length" \
+  '^cl-1-lighthouse-geth: goodbye3 0 \(other Goodbyes 0\) in 6\.2 epochs' -- --probe-log "$tmp/probe.log" ethswarm-gloas
+
+base
+held "$tmp/probe.log"
+edit cl-2-lodestar-geth eth_v1_config_spec 's/"SLOTS_PER_EPOCH":"8",//'
+run 1 "a spec without SLOTS_PER_EPOCH fails goodbye3" '^- cl-2-lodestar-geth: SLOTS_PER_EPOCH missing from /eth/v1/config/spec$' \
+  -- --probe-log "$tmp/probe.log" ethswarm-gloas
+
+base
+held "$tmp/probe.log"
+sed -e 's/cl_type: lodestar/cl_type: teku/' "$here/../gloas-genesis.yaml" > "$tmp/args-teku.yaml"
+run 1 "a CL whose participant in the args file is another client fails goodbye3" \
+  '^- cl-2-lodestar-geth: participant 2 of .*args-teku\.yaml runs teku, not lodestar$' \
+  -- --probe-log "$tmp/probe.log" --args "$tmp/args-teku.yaml" ethswarm-gloas
+
+base
+held "$tmp/probe.log"
+sed -e 's/cl_image: ethpandaops\/lodestar:unstable-b3beff2@sha256:[0-9a-f]*/cl_image: ethpandaops\/lodestar:unstable/' \
+  "$here/../gloas-genesis.yaml" > "$tmp/args-tag.yaml"
+run 1 "a CL image not pinned by digest fails goodbye3" \
+  '^- cl-2-lodestar-geth: cl_image ethpandaops/lodestar:unstable of participant 2 is not pinned by digest$' \
+  -- --probe-log "$tmp/probe.log" --args "$tmp/args-tag.yaml" ethswarm-gloas
+
+base
+held "$tmp/probe.log"
+awk '/^  - el_type/ { n++ } n < 2' "$here/../gloas-genesis.yaml" > "$tmp/args-one.yaml"
+run 1 "a CL with no participant in the args file fails goodbye3" \
+  '^- cl-2-lodestar-geth: no participant 2 in .*args-one\.yaml$' \
+  -- --probe-log "$tmp/probe.log" --args "$tmp/args-one.yaml" ethswarm-gloas
+
+base
+held "$tmp/probe.log"
+run 2 "a missing --probe-log file is a usage error" 'no such file' -- --probe-log "$tmp/absent.log" ethswarm-gloas
+run 2 "a missing --args file is a usage error" 'no such file' -- --probe-log "$tmp/probe.log" --args "$tmp/absent.yaml" ethswarm-gloas
+run 2 "--probe-log with --pair is a usage error" 'probe-log checks one enclave' -- --pair --probe-log "$tmp/probe.log" a b
+base
+run 0 "without --probe-log there is no goodbye3 criterion" '^verdict: PASS \(3/3 criteria\)$' '!goodbye3' -- ethswarm-gloas
+
+# helper_goodbye3 <expect-exit> <description> <pattern> -- <goodbye3 args...>: lib/devnet.py
+# goodbye3 directly, for args files and log values check-devnet.sh itself never sees.
+helper_goodbye3() {
+  local expect=$1 desc=$2 pattern=$3 rc=0 out
+  shift 4
+  out=$(python3 -I "$here/../lib/devnet.py" goodbye3 "$@" 2>&1) || rc=$?
+  if ((rc == expect)) && grep -Eq -- "$pattern" <<<"$out"; then ok "$desc"; else bad "$desc (exit $rc, want $expect)" "$out"; fi
+}
+base
+held "$tmp/probe.log"
+d="$tmp/answers"; rm -rf "$d"; mkdir -p "$d/cl-1-lighthouse-geth"
+for name in spec identity; do
+  cp "$STUB_DIR/http/127.0.0.1:32801/eth_v1_$( [[ $name == spec ]] && echo config || echo node )_$name" "$d/cl-1-lighthouse-geth/$name.json"
+done
+printf 'network_params:\n  preset: minimal\n' > "$tmp/args-none.yaml"
+helper_goodbye3 1 "an args file without participants fails" '^- args file .*args-none\.yaml has no participants$' \
+  -- "$d" "$tmp/args-none.yaml" --log "$tmp/probe.log" cl-1-lighthouse-geth
+printf 'participants:\n  - el_type: geth\n    cl_type: lighthouse\n    cl_image: "%s"  # quoted\n    cl_extra_params:\n      - --foo\n    count: 2\n' "$LH_IMAGE" > "$tmp/args-count.yaml"
+helper_goodbye3 1 "a participant with a count fails (services no longer map to participants)" \
+  '^- cl-1-lighthouse-geth: participant 1 of .*args-count\.yaml has count 2; one node per participant is needed$' \
+  -- "$d" "$tmp/args-count.yaml" --log "$tmp/probe.log" cl-1-lighthouse-geth
+printf 'participants:\n  - el_type: geth\n    cl_type: lighthouse\n    cl_image: "%s"  # quoted\n    cl_extra_params:\n      - --foo\n' "$LH_IMAGE" > "$tmp/args-quoted.yaml"
+helper_goodbye3 0 "a quoted image with a comment, and a nested list, read as the one participant" \
+  "^cl-1-lighthouse-geth: image $LH_IMAGE$" -- "$d" "$tmp/args-quoted.yaml" --log "$tmp/probe.log" cl-1-lighthouse-geth
+{
+  printf '{"timestamp":"2026-10-19T09:00:00+09:00","fields":{"message":"status judged","peer":"%s"}}\n\n' "$PEER1"
+  printf '{"timestamp":"2026-10-19T00:10:00.5Z","fields":{"message":"status check passed","peer":"%s"}}\n' "$PEER1"
+} > "$tmp/offset.log"
+helper_goodbye3 0 "timestamps with a UTC offset, and blank lines, read right" \
+  "^cl-1-lighthouse-geth: goodbye3 0 \(other Goodbyes 0\) in 12\.5 epochs \(600\.5 s" \
+  -- "$d" "$tmp/args-quoted.yaml" --log "$tmp/offset.log" cl-1-lighthouse-geth
+printf '{"timestamp":"2026-13-40T00:00:00Z","fields":{"message":"x","peer":"%s"}}\n' "$PEER1" > "$tmp/date.log"
+helper_goodbye3 1 "a timestamp that is no date fails" '^- .*date\.log line 1: no RFC 3339 timestamp$' \
+  -- "$d" "$tmp/args-quoted.yaml" --log "$tmp/date.log" cl-1-lighthouse-geth
+cp "$d/cl-1-lighthouse-geth/spec.json" "$tmp/spec.json"
+sed -e 's/"SLOTS_PER_EPOCH":"8"/"SLOTS_PER_EPOCH":"0"/' "$tmp/spec.json" > "$d/cl-1-lighthouse-geth/spec.json"
+helper_goodbye3 1 "an epoch of 0 s fails" '^- cl-1-lighthouse-geth: an epoch of 0 s in /eth/v1/config/spec$' \
+  -- "$d" "$tmp/args-quoted.yaml" --log "$tmp/probe.log" cl-1-lighthouse-geth
+cp "$tmp/spec.json" "$d/cl-1-lighthouse-geth/spec.json"
+mkdir -p "$d/cl-x"
+helper_goodbye3 1 "an args file that cannot be read fails" \
+  '^- args file .*absent\.yaml: No such file or directory$' -- "$d" "$tmp/absent.yaml" --log "$tmp/probe.log" cl-1-lighthouse-geth
+helper_goodbye3 1 "a service that is not a cl-<n>-<client> name fails" '^- cl-x: not a cl-<n>-<client>-\.\.\. service name$' \
+  -- "$d" "$tmp/args-quoted.yaml" --log "$tmp/probe.log" cl-x
+printf '{"data":{"peer_id":"16Uiu2HAm0OIl"}}\n' > "$d/cl-1-lighthouse-geth/identity.json"
+helper_goodbye3 1 "a peer_id that is not base58 fails" '^- cl-1-lighthouse-geth: peer_id "16Uiu2HAm0OIl" is not a base58 peer ID$' \
+  -- "$d" "$tmp/args-quoted.yaml" --log "$tmp/probe.log" cl-1-lighthouse-geth
+helper_goodbye3 2 "a usage error is exit 2" 'usage' -- "$d"
 
 # --- several criteria at once, setup and usage errors ----------------------------------------------
 

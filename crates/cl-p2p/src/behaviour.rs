@@ -181,7 +181,7 @@ pub fn log_identify(event: &identify::Event) {
 }
 
 /// `text` cut to its first [`MAX_LOGGED_CHARS`] chars.
-fn capped(text: &str) -> &str {
+pub(crate) fn capped(text: &str) -> &str {
     text.char_indices()
         .nth(MAX_LOGGED_CHARS)
         .map_or(text, |(end, _)| &text[..end])

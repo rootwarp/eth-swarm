@@ -12,6 +12,15 @@
 #                  is at least --min-finalized-epoch and every CL reports the same finalized
 #                  checkpoint. Polled up to --attempts times, --interval seconds apart, since the
 #                  CLs reach and agree on it over time.
+#   goodbye3       only with --probe-log (exit 10 (b)): each CL with its client and pinned image
+#                  (participant <n> of --args for service cl-<n>-*) and the reason-3 Goodbyes
+#                  it sent the probe, from the probe's stderr logs (svc-runtime JSON lines,
+#                  `goodbye_received`), over the most epochs one log observed it (logs are
+#                  never joined: the time between two runs is no observation). Any reason-3
+#                  Goodbye from a CL fails, and so does a CL the logs never name, two CLs with
+#                  one peer ID, or a log that cannot prove there was none (not JSON lines, lines
+#                  dropped, a goodbye_received line without a peer ID or an integer reason); a CL
+#                  no single log observed for 2 epochs makes the run DIAGNOSTIC.
 # The evidence and the rules live in lib/devnet.py (standard library Python, run with -I).
 #
 # --pair ENCLAVE_A ENCLAVE_B checks a concurrent pair (two enclaves from one rendered args file,
@@ -37,6 +46,11 @@
 #   --interval S             seconds between finality polls (default 12)
 #   --kurtosis-timeout S     seconds for each kurtosis call (enclave inspect, port print; default
 #                            60); one that takes longer is stopped, a setup error
+#   --probe-log FILE         the probe's stderr log of a run against this enclave (repeatable);
+#                            adds the goodbye3 criterion. Not with --pair: the probe runs
+#                            against one enclave.
+#   --args FILE              the ethereum-package args file the enclave runs, for the images
+#                            goodbye3 lists (default: gloas-genesis.yaml next to this script)
 #   --pair                   two enclaves, checked as a concurrent pair (see above)
 # Exit: 0 acceptance PASS (every criterion passed), 1 a criterion failed, 2 a usage or setup
 # error (kurtosis or python3 missing, unknown enclave, no CL service, a --services CL the
@@ -51,7 +65,8 @@ helper="$here/lib/devnet.py"
 
 usage() {
   echo "usage: check-devnet.sh [--services \"SVC ...\"] [--record FILE] [--reference FILE]" \
-    "[--min-finalized-epoch N] [--attempts N] [--interval S] [--kurtosis-timeout S] ENCLAVE" >&2
+    "[--min-finalized-epoch N] [--attempts N] [--interval S] [--kurtosis-timeout S]" \
+    "[--probe-log FILE]... [--args FILE] ENCLAVE" >&2
   echo "       check-devnet.sh --pair [options] ENCLAVE_A ENCLAVE_B" >&2
   exit 2
 }
@@ -69,10 +84,11 @@ contains() {
 }
 
 services='' record='' reference='' min_epoch=3 attempts=40 interval=12 kurtosis_timeout=60 pair=0
-enclaves=()
+args_file="$here/gloas-genesis.yaml"
+enclaves=() probe_logs=()
 while (($# > 0)); do
   case $1 in
-    --services|--record|--reference|--min-finalized-epoch|--attempts|--interval|--kurtosis-timeout)
+    --services|--record|--reference|--min-finalized-epoch|--attempts|--interval|--kurtosis-timeout|--probe-log|--args)
       (($# >= 2)) || usage
       case $1 in
         --services) services=$2 ;;
@@ -82,6 +98,8 @@ while (($# > 0)); do
         --attempts) attempts=$2 ;;
         --interval) interval=$2 ;;
         --kurtosis-timeout) kurtosis_timeout=$2 ;;
+        --probe-log) probe_logs+=("$2") ;;
+        --args) args_file=$2 ;;
       esac
       shift 2 ;;
     --pair) pair=1; shift ;;
@@ -102,6 +120,13 @@ is_uint "$interval" || { echo "--interval must be a non-negative integer" >&2; u
 { is_uint "$kurtosis_timeout" && ((kurtosis_timeout >= 1)); } ||
   { echo "--kurtosis-timeout must be an integer >= 1" >&2; usage; }
 if [[ -n $reference && ! -f $reference ]]; then die "--reference $reference: no such file"; fi
+if ((${#probe_logs[@]} > 0)); then
+  if ((pair)); then echo "--probe-log checks one enclave, the one the probe ran against: not with --pair" >&2; usage; fi
+  for f in "${probe_logs[@]}"; do [[ -f $f ]] || die "--probe-log $f: no such file"; done
+  [[ -f $args_file ]] || die "--args $args_file: no such file"
+fi
+criteria=3
+if ((${#probe_logs[@]} > 0)); then criteria=4; fi
 command -v kurtosis >/dev/null 2>&1 || die "kurtosis not found on PATH"
 command -v curl >/dev/null 2>&1 || die "curl not found on PATH"
 command -v python3 >/dev/null 2>&1 || die "python3 not found on PATH"
@@ -307,13 +332,27 @@ else
 fi
 verdict finality "$rc"
 
+# goodbye3: the identity and spec answers the fork_schedule criterion fetched, and the probe logs.
+if ((${#probe_logs[@]} > 0)); then
+  log_args=()
+  for f in "${probe_logs[@]}"; do log_args+=(--log "$f"); done
+  rc=0
+  python3 -I "$helper" goodbye3 "$work" "$args_file" "${log_args[@]}" "${list[@]}" || rc=$?
+  if ((rc == 3)); then
+    diagnostic+=("goodbye3: a CL was observed for under 2 epochs")
+    echo "diagnostic: goodbye3: a CL was observed for under 2 epochs"
+    rc=0
+  fi
+  verdict goodbye3 "$rc"
+fi
+
 if ((${#failed[@]} > 0)); then
   echo "verdict: FAIL (${failed[*]})"
   exit 1
 fi
 if ((${#diagnostic[@]} > 0)); then
-  echo "verdict: DIAGNOSTIC (3/3 criteria passed; not an acceptance run)"
+  echo "verdict: DIAGNOSTIC ($criteria/$criteria criteria passed; not an acceptance run)"
   exit 3
 fi
-echo "verdict: PASS (3/3 criteria)"
+echo "verdict: PASS ($criteria/$criteria criteria)"
 exit 0

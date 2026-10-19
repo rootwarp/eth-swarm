@@ -198,6 +198,49 @@ Every received Goodbye logs one `goodbye_received` line (`peer`, `reason`, `stat
 `direction`, `unix_ms`) and emits one `ControlEvent::GoodbyeReceived`; every sent one logs
 `goodbye_sent`.
 
+### Goodbye ledger (exit 10 (a))
+
+`peers::manager::GoodbyeLedger` counts Goodbye reason 3 ("Fault/error", `phase0` L1457–1483)
+from Status-valid peers per wall-clock UTC hour. The owner's event loop feeds it each
+`ControlEvent` (`observe`: a judged Status, a received Goodbye) and identify event
+(`observe_identify`: the agent version), tells it when a peer disconnects and at what time
+(`disconnected`), and ticks it every minute or so (`tick`), so every hour gets its line on
+time (a skipped hour is still closed, with the peers connected throughout).
+
+- **Rate**: distinct Status-valid peers that sent reason 3 in the hour ÷ distinct Status-valid
+  peers seen in it (a peer whose Status passed in the hour, or one still connected and valid
+  from an earlier hour). A Goodbye 3 from a peer whose Status failed or was never judged is
+  logged, not counted, and a peer that sends two counts once.
+- **Threshold**: N = max(2 %, 2 × the hourly p95 of the Sepolia baseline run)
+  (`Threshold::from_baseline_p95`), 2 % until that baseline exists \[est, provisional\]. N is
+  `goodbye3_threshold_pct` in `peers::manager::GoodbyeLedgerConfig` (a `[goodbye_ledger]` TOML
+  table; unknown keys are refused, and N must be 2 to 100). `baseline_p95_pct` gives the hourly
+  p95 of the closed hours a run kept.
+- **Verdict**: when an hour ends, one `goodbye3_hourly` line: `hour_start_unix`,
+  `status_valid_peers`, `goodbye3_senders`, `rate_pct`, `threshold_pct`, `capped`,
+  `clock_stepped`, `unobserved` and `verdict`: `pass` (rate ≤ N), `fail` (logged at WARN),
+  `no_peers`, or `inconclusive`: the hour's peer set reached its cap, so the rate is over a sample (and the
+  hour after one that turned a Status-valid peer away is inconclusive too, until an hour turns
+  none away); the wall clock moved more than 60 s away from the monotonic clock within the
+  hour (`peers::manager::MAX_CLOCK_SKEW`, re-anchored at each hour close), which closes the open
+  hour and opens the new one as stepped; or the ledger went more than 5 min without a call
+  (`peers::manager::MAX_CALL_GAP` \[est\]: the probe paused or blocked), which leaves the open
+  hour, the hours skipped and the one it resumes in `unobserved`. Only `pass` and `fail` hours
+  enter `baseline_p95_pct`.
+- **Context**: next to each Goodbye 3, one `goodbye3_received` line (`peer`, `agent`,
+  `status_valid`, `direction`, `unix_ms`, `counted`, and the peer's `rate_limited` and
+  `prunes_received` totals) and one `goodbye3_context` line per kind and protocol (`kind` is
+  `rate_limited` or `prune_received`, with `protocol`, `count`, `first_unix_ms`,
+  `last_unix_ms`). These are context only; nothing infers a cause from them. They come from
+  `peers::context::layer`, a `tracing` layer the owner adds to its subscriber: it reads the
+  rate limiter's `over quota: ... withheld` debug events and the pinned gossipsub's PRUNE event,
+  for itself only, and keeps at most one entry per protocol plus one for
+  PRUNE for each of at most 256 peers (`peers::context::GoodbyeContext`).
+- **Memory**: one hour is open at a time. Its two peer sets hold at most 2,048 peers
+  (`max_peers_per_hour` \[est\], up to 16,384): with 160 connections that is every connection
+  replaced about 13 times in an hour, and about 400 KiB at about 80 bytes a peer ID. A closed
+  hour keeps only its counts, for the last 168 hours (`hours_kept`, up to 720).
+
 ## Gossip
 
 `gossip::IgnoreAll::new(&gossip_cfg, &mut registry)` builds the probe's gossipsub (`src/gossip`):

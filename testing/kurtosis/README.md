@@ -257,6 +257,23 @@ one that takes longer is killed and is a setup error (exit 2). The criteria:
   at least 3 (`--min-finalized-epoch`; below 3 the run is DIAGNOSTIC), on one finalized
   checkpoint (epoch and root). This is polled `--attempts` times (default 40), `--interval`
   seconds apart (default 12).
+- `goodbye3` (exit 10 (b), only with `--probe-log FILE`, repeatable, and not with `--pair`):
+  zero Goodbyes with reason 3 from every reference CL during the probe's run. It lists each CL
+  with its client and pinned image (`cl_image` of participant `<n>` of `--args`, default
+  `gloas-genesis.yaml`, for service `cl-<n>-<client>-*`), and the `goodbye_received` lines
+  from its peer ID (`/eth/v1/node/identity`) in the probe's stderr logs, by reason, over the
+  epochs one log observed it (first to last line naming the peer in that log; an epoch is
+  `SLOTS_PER_EPOCH` slots of `SLOT_DURATION_MS` or `SECONDS_PER_SLOT`):
+  `cl-1-lighthouse-geth: goodbye3 0 (other Goodbyes 0) in 12.5 epochs (600.0 s in one log, peer ...)`.
+  Each log is one probe run, and one run must observe a CL for 2 epochs on its own: windows
+  are never joined across logs, since the time between two runs is no observation. Any
+  reason-3 Goodbye from a CL fails, and so do a CL the logs never name, two CLs with one peer
+  ID, an args participant that runs another client or an image without `@sha256:`, and a log
+  that cannot prove there was none: an empty one, a line that is not JSON or has no timestamp,
+  the log writer's `log lines dropped` line, or a `goodbye_received` line without an integer
+  reason or a well-formed peer ID (`12D3KooW…`, `16Uiu2HA…` or `Qm…`, base58; checked before
+  the reference CLs are picked out, since a malformed one could be any CL's). A CL observed
+  for under 2 epochs makes the run DIAGNOSTIC. With it the verdict counts 4 criteria.
 
 The concurrent pair from a clean engine (criteria 1, 2 and 4 of the issue) is one script,
 `testing/kurtosis/run-pair.sh`, run from anywhere in the checkout. It needs `kurtosis` (with a
@@ -652,6 +669,17 @@ probe=target/release/devnet-probe
 
 The stderr logs keep cl-p2p's `negotiated a stream muxer` line for each connection, every
 `goodbye_received` / `goodbye_sent` event, and the Status verdicts.
+
+The Kurtosis report for exit 10 (b), zero reason-3 Goodbyes from each reference CL, reads the
+`status` log (its hold covers 600 s, 12.5 minimal-preset epochs):
+
+```bash
+bash testing/kurtosis/check-devnet.sh --probe-log "$logs/status.err" "$enclave" \
+  | tee "$logs/goodbye3.log"; echo "check-devnet exit ${PIPESTATUS[0]}"
+```
+
+It prints each CL's image and its `goodbye3` count, `goodbye3: PASS` and
+`verdict: PASS (4/4 criteria)` (exit 0) when no CL sent one.
 
 `discover` from a container on the enclave's Docker network, since the CLs' records carry
 their container IPs (on a Linux host, which routes to those IPs, the host binary works too).

@@ -34,12 +34,32 @@ a pass, 1 on a fail, 2 on a usage error. Standard library only, run with `python
         /eth/v1/beacon/states/head/finality_checkpoints: every CL's finalized epoch is at least
         MIN_EPOCH, and every CL reports the same finalized (epoch, root). Prints no verdict line
         (check-devnet.sh polls it and prints one).
+
+    goodbye3 DIR ARGS --log FILE [--log FILE...] SERVICE...
+        Exit 10 (b): no Goodbye with reason 3 from any CL during the probe's run. For each CL:
+        its client and pinned image, from participant <n> of the ethereum-package args file
+        ARGS (service cl-<n>-<client>-...: one node per participant, its cl_type the client,
+        its cl_image pinned as repo:tag@sha256:<64 hex>); its peer ID (/eth/v1/node/identity
+        peer_id); and, from the probe's svc-runtime JSON logs, the `goodbye_received` lines
+        from that peer by reason and how long the logs observed it: the longest window one log
+        gives, first to last line naming it (fields.peer) in that log. Each log is one probe run,
+        so windows are never joined across logs (two short runs an hour apart are not an hour
+        of observation), and one run must cover 2 epochs on its own. An epoch is SLOTS_PER_EPOCH slots of SLOT_DURATION_MS (or
+        SECONDS_PER_SLOT), from /eth/v1/config/spec. Fails on any reason-3 Goodbye from a CL, a
+        CL the logs never name, two CLs with one peer ID, and a log that cannot prove there was
+        none: an empty one, a line that is not JSON or has no timestamp, a "log lines dropped"
+        summary, or a goodbye_received line without a peer ID (12D3KooW…, 16Uiu2HA… or Qm…, base58)
+        or an integer reason. A CL
+        observed for under 2 epochs, with none, is DIAGNOSTIC (exit 3). Prints
+        `goodbye3: PASS (...)`, `goodbye3: FAIL` or `goodbye3: DIAGNOSTIC (...)`.
 """
 
 import argparse
 import base64
+import datetime
 import json
 import os
+import re
 import sys
 
 GENESIS_FIELDS = (
@@ -397,6 +417,269 @@ def cmd_finality(args):
     return 1 if failures else 0
 
 
+# --- goodbye3 -------------------------------------------------------------------------------------
+
+GOODBYE_FAULT = 3
+MIN_EPOCHS = 2
+PINNED_IMAGE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
+SERVICE = re.compile(r"^cl-([0-9]+)-([a-z0-9]+)(-[a-z0-9]+)*$")
+# A libp2p peer ID as text: an identity multihash of an ed25519 (12D3KooW…, 52 chars) or
+# secp256k1 (16Uiu2HA…, 53) key, or a sha256 one (Qm…, 46), in the base58 alphabet.
+PEER_ID = re.compile(r"^(12D3KooW|16Uiu2HA|Qm)[1-9A-HJ-NP-Za-km-z]{40,52}$")
+TIMESTAMP = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d{1,9})?(Z|[+-]\d\d:\d\d)$")
+DROPPED = "log lines dropped"
+
+
+def strip_comment(line):
+    """`line` without a YAML comment (a `#` at its start or after whitespace)."""
+    for i, c in enumerate(line):
+        if c == "#" and (i == 0 or line[i - 1] in " \t"):
+            return line[:i]
+    return line
+
+
+def unquote(value):
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        return value[1:-1]
+    return value
+
+
+def participants(path):
+    """The participants of an ethereum-package args file, in order, each a dict of its plain
+    `key: value` entries. Reads the YAML subset the repo's args files use: a top-level
+    `participants:` block list whose items are `- key: value` lines followed by `key: value`
+    lines at the item's indentation; deeper lines (nested lists and maps) are skipped."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        raise Bad(f"args file {path}: {e.strerror}") from None
+    items, inside, dash, keys = [], False, None, None
+    for raw in lines:
+        line = strip_comment(raw).rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        body = line.strip()
+        if indent == 0:
+            if inside:
+                break
+            inside = body == "participants:"
+            continue
+        if not inside:
+            continue
+        if body.startswith("- ") or body == "-":
+            if dash is None:
+                dash = indent
+            if indent != dash:
+                continue
+            items.append({})
+            keys = indent + 2
+            body = body[1:].strip()
+            if not body:
+                continue
+        elif keys is None or indent != keys:
+            continue
+        key, sep, value = body.partition(":")
+        if sep and value.strip():
+            items[-1][key.strip()] = unquote(value.strip())
+    if not items:
+        raise Bad(f"args file {path} has no participants")
+    return items
+
+
+def image_of(args_path, items, service):
+    """(client, pinned cl_image) of `service` from its participant."""
+    m = SERVICE.match(service)
+    if not m:
+        raise Bad("not a cl-<n>-<client>-... service name")
+    n, client = int(m.group(1)), m.group(2)
+    if not 1 <= n <= len(items):
+        raise Bad(f"no participant {n} in {args_path}")
+    item = items[n - 1]
+    count = item.get("count", "1")
+    if count != "1":
+        raise Bad(f"participant {n} of {args_path} has count {count}; one node per participant is needed")
+    if item.get("cl_type") != client:
+        raise Bad(f"participant {n} of {args_path} runs {item.get('cl_type')}, not {client}")
+    image = item.get("cl_image", "")
+    if not PINNED_IMAGE.match(image):
+        raise Bad(f"cl_image {image or '(none)'} of participant {n} is not pinned by digest")
+    return client, image
+
+
+def epoch_seconds(directory, service):
+    spec = data_of(load(directory, service, "spec"), "/eth/v1/config/spec")
+    where = "/eth/v1/config/spec"
+    slots = uint(field(spec, "SLOTS_PER_EPOCH", where), "SLOTS_PER_EPOCH")
+    if isinstance(spec, dict) and "SLOT_DURATION_MS" in spec:
+        slot_ms = uint(spec["SLOT_DURATION_MS"], "SLOT_DURATION_MS")
+    else:
+        slot_ms = 1000 * uint(field(spec, "SECONDS_PER_SLOT", where), "SECONDS_PER_SLOT")
+    if slots == 0 or slot_ms == 0:
+        raise Bad("an epoch of 0 s in /eth/v1/config/spec")
+    return slots * slot_ms / 1000
+
+
+def peer_of(directory, service):
+    identity = data_of(load(directory, service, "identity"), "/eth/v1/node/identity")
+    peer = field(identity, "peer_id", "/eth/v1/node/identity")
+    if not isinstance(peer, str) or not PEER_ID.fullmatch(peer):
+        raise Bad(f"peer_id {json.dumps(peer)} is not a base58 peer ID")
+    return peer
+
+
+def seconds(stamp):
+    """An RFC 3339 timestamp as Unix seconds; None if it is not one."""
+    m = TIMESTAMP.match(stamp) if isinstance(stamp, str) else None
+    if not m:
+        return None
+    try:
+        t = datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    zone = m.group(3)
+    offset = 0
+    if zone != "Z":
+        sign = -1 if zone[0] == "-" else 1
+        offset = sign * (int(zone[1:3]) * 3600 + int(zone[4:6]) * 60)
+    t = t.replace(tzinfo=datetime.timezone.utc)
+    return t.timestamp() - offset + float(m.group(2) or 0)
+
+
+def reason_of(fields):
+    """A goodbye_received line's reason: a JSON integer, never a string, float or bool."""
+    reason = fields.get("reason")
+    return reason if type(reason) is int and reason >= 0 else None
+
+
+def scan_logs(paths, peers):
+    """Per peer of `peers`: {"window": the longest span one log observed it, in seconds, or
+    None if no log names it; "logs": how many logs name it; "faults": reason-3 Goodbyes;
+    "others": Goodbyes of other reasons}, and the problems that keep the logs from proving there
+    was no reason-3 Goodbye. Each log is one run: a peer's window is first to last line naming
+    it within that log, never across logs, so runs with a gap between them are not one window."""
+    seen = {p: {"window": None, "logs": 0, "faults": 0, "others": 0} for p in peers}
+    problems = []
+    for path in paths:
+        lines = 0
+        spans = {}
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for no, raw in enumerate(f, 1):
+                    if not raw.strip():
+                        continue
+                    lines += 1
+                    try:
+                        line = json.loads(raw)
+                    except ValueError:
+                        line = None
+                    if not isinstance(line, dict) or not isinstance(line.get("fields"), dict):
+                        problems.append(f"{path} line {no}: not a JSON log line")
+                        continue
+                    t = seconds(line.get("timestamp"))
+                    if t is None:
+                        problems.append(f"{path} line {no}: no RFC 3339 timestamp")
+                        continue
+                    fields = line["fields"]
+                    message = fields.get("message")
+                    if isinstance(message, str) and message.startswith(DROPPED):
+                        problems.append(
+                            f"{path} line {no}: the probe dropped {fields.get('dropped')} log "
+                            "lines; a Goodbye may be among them"
+                        )
+                    peer = fields.get("peer")
+                    goodbye = message == "goodbye_received"
+                    reason = reason_of(fields) if goodbye else None
+                    # Checked before the reference peers are picked out: a line whose peer is no
+                    # peer ID could be any CL's.
+                    if goodbye and not (isinstance(peer, str) and PEER_ID.fullmatch(peer)):
+                        problems.append(f"{path} line {no}: goodbye_received without a peer ID")
+                        continue
+                    if goodbye and reason is None:
+                        problems.append(
+                            f"{path} line {no}: goodbye_received without an integer reason"
+                        )
+                        continue
+                    if not isinstance(peer, str) or peer not in seen:
+                        continue
+                    first, last = spans.get(peer, (t, t))
+                    spans[peer] = (min(first, t), max(last, t))
+                    if goodbye:
+                        seen[peer]["faults" if reason == GOODBYE_FAULT else "others"] += 1
+        except OSError as e:
+            problems.append(f"{path}: {e.strerror}")
+            continue
+        if lines == 0:
+            problems.append(f"{path}: no log lines")
+        for peer, (first, last) in spans.items():
+            s = seen[peer]
+            s["logs"] += 1
+            s["window"] = max(s["window"] or 0.0, last - first)
+    return seen, problems
+
+
+def cmd_goodbye3(args):
+    failures, short, peers = [], [], {}
+    try:
+        items = participants(args.args)
+    except Bad as e:
+        items = None
+        failures.append(str(e))
+    owner = {}
+    for service in args.services:
+        try:
+            client, image = image_of(args.args, items, service) if items else (None, None)
+            peer = peer_of(args.dir, service)
+            if peer in owner:
+                raise Bad(f"peer_id {peer} is {owner[peer]}'s too")
+            owner[peer] = service
+            peers[service] = (peer, epoch_seconds(args.dir, service))
+        except Bad as e:
+            failures.append(f"{service}: {e}")
+            continue
+        if image:
+            print(f"{service}: image {image}")
+    seen, problems = scan_logs(args.log, [p for p, _ in peers.values()])
+    failures.extend(problems)
+    for service, (peer, epoch) in peers.items():
+        s = seen[peer]
+        faults, others, observed = s["faults"], s["others"], s["window"]
+        if observed is None:
+            failures.append(f"{service}: peer {peer} is not in the probe log")
+            continue
+        epochs = observed / epoch
+        print(
+            f"{service}: goodbye3 {faults} (other Goodbyes {others}) in {epochs:.1f} epochs "
+            f"({observed:.1f} s in one log, peer {peer})"
+        )
+        if faults:
+            plural = "" if faults == 1 else "s"
+            failures.append(
+                f"{service}: {faults} reason-3 Goodbye{plural} from {peer}; exit 10 (b) wants none"
+            )
+        elif epochs < MIN_EPOCHS:
+            short.append(
+                f"{service}: observed {epochs:.1f} epochs, under the {MIN_EPOCHS} an acceptance "
+                "run needs"
+            )
+    for f in failures:
+        print(f"- {f}")
+    if failures:
+        print("goodbye3: FAIL")
+        return 1
+    for d in short:
+        print(f"- {d}")
+    if short:
+        print(f"goodbye3: DIAGNOSTIC (no reason-3 Goodbye; {len(short)} CL(s) under {MIN_EPOCHS} epochs)")
+        return 3
+    print(
+        f"goodbye3: PASS ({len(peers)} CLs: no reason-3 Goodbye, each over at least "
+        f"{MIN_EPOCHS} epochs)"
+    )
+    return 0
+
+
 def main(argv):
     parser = argparse.ArgumentParser(prog="devnet.py")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -418,12 +701,18 @@ def main(argv):
     n.add_argument("dir")
     n.add_argument("min_epoch", type=int)
     n.add_argument("services", nargs="+")
+    b = sub.add_parser("goodbye3")
+    b.add_argument("dir")
+    b.add_argument("args")
+    b.add_argument("--log", action="append", required=True)
+    b.add_argument("services", nargs="+")
     args = parser.parse_args(argv)
     run = {
         "genesis": cmd_genesis,
         "forks": cmd_forks,
         "pair": cmd_pair,
         "finality": cmd_finality,
+        "goodbye3": cmd_goodbye3,
     }[args.command]
     return run(args)
 
