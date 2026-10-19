@@ -58,7 +58,10 @@
 //!   once nothing is queued, but the writer thread's settle step after it runs later: the
 //!   harness waits for it (the store's links go from the write's to the settle step's, and to
 //!   nothing else) and never settles for the writer, so a writer that skips or botches its own
-//!   settle step fails here.
+//!   settle step fails here. Every wait on the writer thread, for the queue to drain and for a
+//!   settle step, checks the input's one wall-clock deadline ([`INPUT_DEADLINE`] from its
+//!   start), so a writer that never finishes fails with the harness's message before the gates'
+//!   per-input timeout.
 //!
 //! Every response is a hello, then sidecar chunks with `seq` from 1, each envelope passing the
 //! link's type and digest checks and naming its sidecar's slot and root, then at most one error
@@ -181,13 +184,70 @@ pub const CHAIN: [(u64, Option<usize>, usize); 8] = [
 const CHAIN_OFFSET: u64 = 63;
 /// The serve range ends this far past the first Gloas slot.
 const SERVE_SPAN: u64 = 4096;
-/// How long the harness waits on the wall clock for the writer thread's settle step after a
-/// write: 8 s, far past the few milliseconds it takes, so a writer thread that stalls on a
-/// loaded machine but settles within the input's time is not reported as a crash, and 2 s under
-/// the gates' per-input timeout (`-timeout=10`, `M2A_TIMEOUT_S` in `fuzz/m2a-common.sh`, which
-/// `tests/writer_wait.rs` holds it to), so a writer that never settles still fails with its own
-/// message, not as a timeout.
-pub const WRITER_WAIT: Duration = Duration::from_secs(8);
+/// How long one input may wait on the wall clock for the writer thread, from the input's start
+/// and over all its waits ([`Deadline`]): the drains of the column queue ([`Probe::settle`]) and
+/// the waits for the writer's settle steps ([`Probe::await_writer`]) all check this one
+/// deadline. 8 s, far past the few milliseconds an input takes, so a writer thread that stalls
+/// on a loaded machine but finishes within the input's time is not reported as a crash, and 2 s
+/// under the gates' per-input timeout (`-timeout=10`, `M2A_TIMEOUT_S` in `fuzz/m2a-common.sh`,
+/// which `tests/writer_wait.rs` holds it to), so a writer that never drains or settles fails
+/// with the harness's own message, never as a libFuzzer timeout.
+pub const INPUT_DEADLINE: Duration = Duration::from_secs(8);
+
+/// One input's wall-clock deadline: set once, when the input starts ([`Deadline::input`]), and
+/// checked by every wait, so the waits share [`INPUT_DEADLINE`] rather than each starting anew.
+#[derive(Debug, Clone, Copy)]
+struct Deadline(Instant);
+
+impl Deadline {
+    /// [`INPUT_DEADLINE`] from now, the input's start.
+    fn input() -> Self {
+        Self::after(INPUT_DEADLINE)
+    }
+
+    /// `wait` from now.
+    fn after(wait: Duration) -> Self {
+        Self(Instant::now() + wait)
+    }
+
+    /// Fails with `stuck`'s message once the deadline has passed.
+    fn check(self, stuck: impl FnOnce() -> String) {
+        assert!(
+            Instant::now() < self.0,
+            "{} (past the input's {INPUT_DEADLINE:?} deadline)",
+            stuck()
+        );
+    }
+
+    /// Polls `poll` on the wall clock until it is `Ok`, checking the deadline between tries:
+    /// past it, fails with `stuck` of the last `Err`.
+    fn wait_for<T>(self, mut poll: impl FnMut() -> Result<(), T>, stuck: impl Fn(T) -> String) {
+        loop {
+            match poll() {
+                Ok(()) => return,
+                Err(last) => self.check(|| stuck(last)),
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        }
+    }
+}
+
+/// Waits until `pending` is 0: on the paused clock, the root wait's timers fire at once; the
+/// writer thread runs on the wall clock, within `deadline`.
+async fn drain(deadline: Deadline, pending: impl Fn() -> usize) {
+    while pending() > 0 {
+        deadline.check(|| {
+            format!(
+                "the column queue never drained: {} sidecars still queued",
+                pending()
+            )
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if pending() > 0 {
+            std::thread::sleep(Duration::from_micros(20));
+        }
+    }
+}
 
 /// One block the stub reference vouches for.
 #[derive(Debug, Clone)]
@@ -1115,11 +1175,13 @@ struct Probe {
     link: Link,
     model: Model,
     events: Vec<Event>,
+    /// The input's deadline: every wait for the writer thread checks it.
+    deadline: Deadline,
 }
 
 impl Probe {
-    /// Must run within the runtime.
-    fn start(writer: &Arc<ColumnWriter>) -> Self {
+    /// Must run within the runtime; every wait checks `deadline`.
+    fn start(writer: &Arc<ColumnWriter>, deadline: Deadline) -> Self {
         let custody = Custody::open(
             Arc::clone(writer),
             NoEnr,
@@ -1161,6 +1223,7 @@ impl Probe {
             link,
             model: Model::default(),
             events: Vec::new(),
+            deadline,
         }
     }
 
@@ -1186,15 +1249,9 @@ impl Probe {
         }
     }
 
-    /// Waits until nothing is queued: on the paused clock, the root wait's timers fire at once;
-    /// the writer thread runs on the wall clock.
+    /// Waits until nothing is queued, within the input's deadline ([`drain`]).
     async fn settle(&self) {
-        while self.ingest.pending() > 0 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            if self.ingest.pending() > 0 {
-                std::thread::sleep(Duration::from_micros(20));
-            }
-        }
+        drain(self.deadline, || self.ingest.pending()).await;
     }
 
     async fn gossip(&mut self, column: GossipColumn<E>) {
@@ -1297,24 +1354,27 @@ impl Probe {
     /// Waits for the writer thread's settle step after a write: the store's links are the
     /// write's (`written`) until they are the model's, and never anything else. With nothing
     /// to settle the two are the same, and there is nothing to wait for.
+    /// It waits within the input's deadline.
     fn await_writer(&self, written: &Links) {
         let want = &self.model.links;
-        let deadline = Instant::now() + WRITER_WAIT;
-        loop {
-            let seen = observe(&self.writer);
-            if seen == *want {
-                return;
-            }
-            assert_eq!(
-                seen, *written,
-                "the store's links are neither the write's nor its settle step's {want:?}"
-            );
-            assert!(
-                Instant::now() < deadline,
-                "the writer thread never settled its pending links: {seen:?}, want {want:?}"
-            );
-            std::thread::sleep(Duration::from_micros(50));
-        }
+        self.deadline.wait_for(
+            || {
+                let seen = observe(&self.writer);
+                if seen == *want {
+                    return Ok(());
+                }
+                assert_eq!(
+                    seen, *written,
+                    "the store's links are neither the write's nor its settle step's {want:?}"
+                );
+                Err(seen)
+            },
+            |seen| {
+                format!(
+                    "the writer thread never settled its pending links: {seen:?}, want {want:?}"
+                )
+            },
+        );
     }
 
     /// `earliest_available_slot` as the harness derives it; the server must report the same.
@@ -1581,6 +1641,7 @@ pub fn column_contract(data: &[u8]) {
 
 /// [`column_contract`], returning what happened to each operation.
 pub fn column_contract_events(data: &[u8]) -> Vec<Event> {
+    let deadline = Deadline::input();
     let ops = parse(data);
     let dir = tempfile::Builder::new()
         .prefix("ethswarm-fuzz-columns-")
@@ -1601,7 +1662,7 @@ pub fn column_contract_events(data: &[u8]) -> Vec<Event> {
         .build()
         .expect("a current-thread runtime with a paused clock");
     let events = runtime.block_on(async {
-        let mut probe = Probe::start(&writer);
+        let mut probe = Probe::start(&writer, deadline);
         probe.run(ops).await;
         std::mem::take(&mut probe.events)
     });
@@ -1641,6 +1702,66 @@ mod tests {
             };
             assert!(!roots.contains(&spec.column().sidecar.beacon_block_root.0));
         }
+    }
+
+    /// The message `run` panicked with.
+    fn panic_message(run: impl FnOnce()) -> String {
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+            .expect_err("the wait never failed");
+        err.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default()
+    }
+
+    /// A wait whose writer never finishes fails at the input's deadline with the harness's own
+    /// message, the drain of the queue and the wait for a settle step alike.
+    #[test]
+    fn a_wait_past_the_input_deadline_fails_with_its_own_message() {
+        let passed = Deadline::after(Duration::ZERO);
+        let message = panic_message(|| passed.wait_for(|| Err(7), |n| format!("stuck at {n}")));
+        assert!(message.starts_with("stuck at 7"), "{message}");
+        assert!(message.contains("deadline"), "{message}");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let message = panic_message(|| runtime.block_on(drain(passed, || 3)));
+        assert!(message.contains("3 sidecars still queued"), "{message}");
+        // Nothing to wait for: no check at all, even past the deadline.
+        passed.wait_for(|| Ok::<(), ()>(()), |()| unreachable!());
+        runtime.block_on(drain(passed, || 0));
+    }
+
+    /// One deadline per input, not one per wait: a wait that starts after earlier ones took
+    /// most of the input's time fails when the input's time is up, not a fresh wait later.
+    #[test]
+    fn every_wait_of_an_input_shares_its_deadline() {
+        let budget = Duration::from_millis(400);
+        let start = Instant::now();
+        let deadline = Deadline::after(budget);
+        // An earlier wait that took 300 ms.
+        deadline.wait_for(
+            || {
+                if start.elapsed() >= Duration::from_millis(300) {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            },
+            |()| "the first wait".into(),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        panic_message(|| runtime.block_on(drain(deadline, || 1)));
+        let failed = start.elapsed();
+        // A fresh 400 ms for the drain would fail it at 700 ms.
+        assert!(failed >= budget, "{failed:?}");
+        assert!(failed < Duration::from_millis(550), "{failed:?}");
     }
 
     fn spec(block: u8, index: u8, verdict: u8) -> GossipSpec {
