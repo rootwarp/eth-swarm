@@ -1,9 +1,9 @@
 //! Random write / finality-prune / reorg-prune sequences checked against an in-memory model.
 //! After every step the store must hold exactly the model's columns, and the root index exactly
 //! the model's blocks: no orphaned row and no orphaned root entry. Writes at or below the
-//! finalized slot must be refused.
+//! finalized slot must be refused, and so must writes of a root pruned as an orphan.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cl_chain_columns::{BlockRoot, Column, ColumnWriter, Error};
 use proptest::prelude::*;
@@ -53,6 +53,8 @@ fn op() -> impl Strategy<Value = Op> {
 struct Model {
     blocks: BTreeMap<BlockRoot, (u64, BTreeMap<u64, Vec<u8>>)>,
     finalized: Option<u64>,
+    /// Roots pruned as orphans: no later write may bring them back.
+    orphaned: BTreeSet<BlockRoot>,
 }
 
 fn apply(writer: &ColumnWriter, model: &mut Model, step: usize, op: &Op) {
@@ -73,6 +75,13 @@ fn apply(writer: &ColumnWriter, model: &mut Model, step: usize, op: &Op) {
                     .write_columns(*slot, &block_root, &columns)
                     .unwrap_err();
                 assert!(matches!(err, Error::SlotFinalized { .. }), "{err:?}");
+                return;
+            }
+            if model.orphaned.contains(&block_root) {
+                let err = writer
+                    .write_columns(*slot, &block_root, &columns)
+                    .unwrap_err();
+                assert!(matches!(err, Error::RootOrphaned), "{err:?}");
                 return;
             }
             let report = writer.write_columns(*slot, &block_root, &columns).unwrap();
@@ -107,6 +116,7 @@ fn apply(writer: &ColumnWriter, model: &mut Model, step: usize, op: &Op) {
                 if let Some((_, cols)) = model.blocks.remove(block_root) {
                     expected += cols.len() as u64;
                 }
+                model.orphaned.insert(*block_root);
             }
             assert_eq!(writer.prune_orphaned(&roots).unwrap().columns, expected);
         }

@@ -43,6 +43,8 @@ prometheus-client = "0.25.1"
 
 [dev-dependencies]
 ipc = { path = "../ipc", features = ["testkit"] }
+# tests/probe_restart.rs pauses a column write before its commit and kills the process there.
+cl-chain-columns = { path = "../cl-chain-columns", features = ["test-hooks"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }
 tempfile = "3"
 # da::custody tests drive a real local ENR (re-signed, seq-bumped) through cl-discv5's `enr`.

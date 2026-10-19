@@ -1,7 +1,11 @@
-//! The probe's column store survives a killed cl-chain: a child process (this test binary,
-//! selected by `CHILD_MODE`) stores custody columns from gossip through
-//! `cl_chain::probe::ColumnIngest`, says it is ready and is then killed with SIGKILL; the parent
-//! reopens the same column env and finds the columns and `first_stored_column_slot` unchanged.
+//! The probe's column store survives a cl-chain killed mid-write: a child process (this test
+//! binary, selected by `CHILD_MODE`) stores custody columns from gossip through
+//! `cl_chain::probe::ColumnIngest`, then starts a later write that its column env's
+//! before-commit hook (`ColumnWriter::set_before_commit`, the `test-hooks` feature) holds open
+//! after its puts and before its commit. The child says so and is killed there with SIGKILL; the
+//! parent reopens the same column env and finds the earlier columns and
+//! `first_stored_column_slot` unchanged, and nothing of the interrupted write: neither its
+//! columns nor the lower first stored slot it would have committed with them.
 //!
 //! The test is `probe::tests::restart_keeps_columns`, but lives in its own test binary rather
 //! than in the library's unit tests. MDBX locks its files with open-file-description locks, and a
@@ -42,9 +46,12 @@ mod probe {
 
         const CHILD_MODE: &str = "CL_CHAIN_PROBE_CHILD_MODE";
         const CHILD_PATH: &str = "CL_CHAIN_PROBE_CHILD_PATH";
-        const READY: &str = "CL_CHAIN_PROBE_CHILD_READY";
-        /// How long the child may take to get ready, or to exit once killed.
+        /// What the child says once the write at [`PAUSED`] is held open before its commit.
+        const PAUSED_LINE: &str = "CL_CHAIN_PROBE_CHILD_PAUSED_BEFORE_COMMIT";
+        /// How long the child may take to reach the paused write, or to exit once killed.
         const CHILD_DEADLINE: Duration = Duration::from_secs(60);
+        /// How long dropping a child may wait for it to be reaped after SIGKILL.
+        const REAP_DEADLINE: Duration = Duration::from_secs(10);
         /// How long a store may take to settle.
         const SETTLE: Duration = Duration::from_secs(20);
         /// How often a wait looks again.
@@ -55,6 +62,9 @@ mod probe {
         const CGC_SET_SLOT: u64 = 16;
         /// The slots of the blocks the child stores columns of.
         const STORED: [u64; 2] = [18, 17];
+        /// The slot of the block whose write the child is killed in: below [`STORED`], so the
+        /// write would also lower the first stored slot.
+        const PAUSED: u64 = CGC_SET_SLOT;
 
         type Ingest = ColumnIngest<Reference, Minimal, Valid, Arc<ColumnWriter>, NoEnr>;
 
@@ -219,11 +229,23 @@ mod probe {
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                let (ingest, writer) = open(Path::new(&path), CGC_SET_SLOT, &STORED);
+                let (ingest, writer) = open(Path::new(&path), CGC_SET_SLOT, &[18, 17, PAUSED]);
+                // The write of the block at PAUSED stops before its commit, its columns and the
+                // lower first stored slot put but uncommitted, until the parent kills this
+                // process. It parks the columns-writer thread, not the runtime.
+                writer.set_before_commit(Box::new(|slot| {
+                    if slot == PAUSED {
+                        eprintln!("{PAUSED_LINE}");
+                        let _ = std::io::stderr().flush();
+                        loop {
+                            std::thread::park();
+                        }
+                    }
+                }));
                 store_all(&ingest, &writer).await;
-                eprintln!("{READY}");
-                std::io::stderr().flush().unwrap();
-                // Hold the env open, mid-run, until the parent kills this process.
+                for index in ingest.custody().custody_columns() {
+                    ingest.on_column(column(PAUSED, index));
+                }
                 std::future::pending::<()>().await;
             });
         }
@@ -243,10 +265,10 @@ mod probe {
                 .env(CHILD_PATH, dir.path())
                 .stdout(Stdio::null());
             let mut child = OwnedChild::spawn(command).unwrap();
-            let ready = child
-                .wait_for_stderr(READY, Instant::now() + CHILD_DEADLINE)
+            let paused = child
+                .wait_for_stderr(PAUSED_LINE, Instant::now() + CHILD_DEADLINE)
                 .await;
-            assert!(ready, "the child never got ready: {}", child.stderr());
+            assert!(paused, "the child's write never paused: {}", child.stderr());
             // SIGKILL: no destructor, no flush, no clean close of the env.
             child.kill();
             let status = child.wait_until(Instant::now() + CHILD_DEADLINE).await;
@@ -263,10 +285,14 @@ mod probe {
                     assert_eq!(stored, want, "the columns of slot {slot}");
                 }
             };
-            // Reopened after the kill: every column and the first stored slot are there.
-            let (ingest, writer) = open(dir.path(), 500, &[12, 20]);
+            // Reopened after the kill: every column stored before it and the first stored slot
+            // are there, and nothing of the interrupted write: no column, no root, and the first
+            // stored slot not lowered to it.
+            let (ingest, writer) = open(dir.path(), 500, &[12, 20, PAUSED]);
             expected(&writer);
             assert_eq!(writer.reader().column_count().unwrap(), 8);
+            assert_eq!(writer.reader().block_count().unwrap(), 2);
+            assert_eq!(writer.reader().slot_of(&block(PAUSED).0).unwrap(), None);
             assert_eq!(first_stored_column_slot(writer.reader()).unwrap(), Some(17));
             assert_eq!(ingest.first_stored_column_slot().unwrap(), Some(17));
             assert_eq!(
@@ -288,38 +314,60 @@ mod probe {
             assert_eq!(writer.reader().slot_of(&block(20).0).unwrap(), Some(20));
             assert_eq!(ingest.first_stored_column_slot().unwrap(), Some(17));
             expected(&writer);
+
+            // The interrupted block, gossiped again, is stored whole, and the first stored slot
+            // moves with its columns.
+            for index in ingest.custody().custody_columns() {
+                ingest.on_column(column(PAUSED, index));
+            }
+            settle("the interrupted block to be stored", || {
+                ingest.pending() == 0 && writer.reader().column_count().unwrap() == 13
+            })
+            .await;
+            let stored = writer.reader().columns_for_root(&block(PAUSED).0).unwrap();
+            assert_eq!(stored.len(), 4);
+            assert_eq!(ingest.first_stored_column_slot().unwrap(), Some(PAUSED));
+            expected(&writer);
         }
 
         /// A spawned child process the test owns: its stderr is drained on a thread as it
         /// arrives (a child never blocks writing to a full pipe), every wait has a deadline, and
-        /// it is killed with SIGKILL and reaped on every way out of the test.
+        /// it is killed with SIGKILL and reaped on every way out of the test, from the moment it
+        /// is spawned.
         struct OwnedChild {
-            child: Child,
+            child: Reaped,
             stderr: Arc<Mutex<Vec<u8>>>,
             /// Ends at the pipe's end of file, once the child has exited.
             reader: JoinHandle<()>,
         }
 
         impl OwnedChild {
+            /// Spawns `command` with stdin closed and stderr captured. If the stderr thread
+            /// cannot start, the child is killed and reaped and the error returned.
             fn spawn(mut command: Command) -> std::io::Result<Self> {
-                let mut child = command
+                let child = command
                     .stdin(Stdio::null())
                     .stderr(Stdio::piped())
                     .spawn()?;
-                let mut pipe = child.stderr.take().expect("stderr is piped");
+                // Guarded from here on: if the reader cannot start, the `?` below kills and
+                // reaps it.
+                let mut child = Reaped(child);
+                let mut pipe = child.0.stderr.take().expect("stderr is piped");
                 let stderr = Arc::<Mutex<Vec<u8>>>::default();
                 let sink = Arc::clone(&stderr);
-                let reader = std::thread::spawn(move || {
-                    let mut buf = [0u8; 8192];
-                    loop {
-                        match pipe.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => sink.lock().unwrap().extend_from_slice(&buf[..n]),
-                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                            Err(_) => break,
+                let reader = std::thread::Builder::new()
+                    .name("child-stderr".to_owned())
+                    .spawn(move || {
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            match pipe.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => sink.lock().unwrap().extend_from_slice(&buf[..n]),
+                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                                Err(_) => break,
+                            }
                         }
-                    }
-                });
+                    })?;
                 Ok(Self {
                     child,
                     stderr,
@@ -346,14 +394,14 @@ mod probe {
 
             /// SIGKILL (what `Child::kill` sends on Unix).
             fn kill(&mut self) {
-                self.child.kill().expect("SIGKILL the child");
+                self.child.0.kill().expect("SIGKILL the child");
             }
 
             /// The exit status, or `None` if the child still runs at `deadline`; then the rest
             /// of stderr, to the same deadline.
             async fn wait_until(&mut self, deadline: Instant) -> Option<ExitStatus> {
                 let status = loop {
-                    if let Some(status) = self.child.try_wait().expect("try_wait on the child") {
+                    if let Some(status) = self.child.0.try_wait().expect("try_wait on the child") {
                         break status;
                     }
                     if Instant::now() >= deadline {
@@ -368,10 +416,25 @@ mod probe {
             }
         }
 
-        impl Drop for OwnedChild {
+        /// A child that is killed and reaped when dropped.
+        struct Reaped(Child);
+
+        /// SIGKILL, then reap by polling `try_wait` until [`REAP_DEADLINE`]: never a `wait`
+        /// that could block the test forever. Killing a child that already exited is harmless.
+        impl Drop for Reaped {
             fn drop(&mut self) {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                let _ = self.0.kill();
+                let deadline = std::time::Instant::now() + REAP_DEADLINE;
+                loop {
+                    match self.0.try_wait() {
+                        Ok(Some(_)) | Err(_) => return,
+                        Ok(None) if std::time::Instant::now() >= deadline => {
+                            eprintln!("child {} not reaped within {REAP_DEADLINE:?}", self.0.id());
+                            return;
+                        }
+                        Ok(None) => std::thread::sleep(POLL),
+                    }
+                }
             }
         }
     }

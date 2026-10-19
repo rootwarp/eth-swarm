@@ -25,7 +25,9 @@
 //! - `head_root`, `head_slot`: the finalized block's header (`/eth/v1/beacon/headers/{root}`).
 //!   The probe advertises the newest block it can vouch for, not the reference node's head: it
 //!   imports nothing past finality, so a later head would claim blocks it cannot serve.
-//! - `earliest_available_slot`: `head_slot` until the probe serves a range of its own.
+//! - `earliest_available_slot`: `head_slot` until the probe serves a range of its own; then
+//!   [`earliest_servable_slot`] (the highest of the first stored slot, the slot after the
+//!   finalized-slot watermark and `cgc_set_slot`), never the first stored slot alone.
 //!
 //! Each [`StatusProvider::status`] samples the API under a bounded timeout. A sample that fails
 //! or times out (an outage) keeps the last good one; with none yet, the Status is
@@ -41,16 +43,20 @@ mod beacon_api;
 pub mod column;
 pub mod ingest;
 mod ref_view;
+mod root_wait;
 
 pub use beacon_api::BeaconApi;
 pub use column::{
     storage_contract, store_verified, ColumnContract, ColumnMetrics, Drop, GossipColumn, Verified,
 };
 pub use ingest::{
-    first_stored_column_slot, ColumnIngest, IngestLimits, QueueMetrics, COLUMN_BUFFER_ALERT_BYTES,
-    DEFAULT_ROOT_WAIT,
+    earliest_servable_slot, first_stored_column_slot, ColumnIngest, IngestLimits, LimitsError,
+    QueueMetrics, COLUMN_BUFFER_ALERT_BYTES, DEFAULT_FIRST_ASKS_PER_SEC, DEFAULT_FIRST_ASK_BURST,
+    DEFAULT_MAX_ASKING_COLUMNS, DEFAULT_MAX_WAITING_COLUMNS, DEFAULT_MAX_WAITING_ROOTS,
+    DEFAULT_RETRIES_PER_SEC, DEFAULT_ROOT_RETRY, DEFAULT_ROOT_WAIT, DEFAULT_UNKNOWN_ROOT_TTL,
 };
-pub use ref_view::{BlockApi, RefBlock, RefError, RefLimits, RefView};
+pub use ref_view::{BlockApi, RefBlock, RefError, RefLimits, RefView, DEFAULT_MAX_IN_FLIGHT};
+pub use root_wait::{MAX_CANDIDATES_PER_INDEX, MAX_UNKNOWN_ROOTS};
 
 use ethswarm_proto::chain as pb;
 use ethswarm_proto::common;
@@ -805,6 +811,8 @@ mod tests {
     // reported IGNORE.
 
     use ethswarm_proto::common::Verdict;
+    use ethswarm_proto::verify::KzgCellProof;
+    use root_wait::MAX_CANDIDATES_PER_INDEX;
     use ssz::Encode as _;
 
     /// How long a test waits for the store to settle before it fails.
@@ -930,6 +938,221 @@ mod tests {
         }
     }
 
+    /// A cl-verify that never answers, holding every batch of cells it was handed.
+    #[derive(Clone, Default)]
+    struct Stalled(Arc<Mutex<Vec<Vec<KzgCellProof>>>>);
+
+    impl crate::verify::client::KzgVerifier for Stalled {
+        async fn verify_cells(
+            &self,
+            cells: Vec<KzgCellProof>,
+            _: Duration,
+        ) -> crate::verify::client::KzgOutcome {
+            self.0.lock().unwrap().push(cells);
+            std::future::pending().await
+        }
+    }
+
+    impl Stalled {
+        /// The batches held now, and the heap bytes of their copies.
+        fn held(&self) -> (usize, usize) {
+            let held = self.0.lock().unwrap();
+            let bytes = held
+                .iter()
+                .map(|cells| {
+                    cells.capacity() * std::mem::size_of::<KzgCellProof>()
+                        + cells
+                            .iter()
+                            .map(|c| {
+                                c.commitment.capacity() + c.cell.capacity() + c.proof.capacity()
+                            })
+                            .sum::<usize>()
+                })
+                .sum();
+            (held.len(), bytes)
+        }
+    }
+
+    /// A cl-verify client whose calls run out of time at once with their frames still queued:
+    /// it keeps what each call held charged until [`QueuedFrames::send`].
+    #[derive(Clone, Default)]
+    struct QueuedFrames(Arc<Mutex<Vec<crate::verify::client::Held>>>);
+
+    impl crate::verify::client::KzgVerifier for QueuedFrames {
+        async fn verify_cells(
+            &self,
+            _: Vec<KzgCellProof>,
+            _: Duration,
+        ) -> crate::verify::client::KzgOutcome {
+            unreachable!("the store hands its charge over")
+        }
+
+        async fn verify_cells_holding(
+            &self,
+            _: Vec<KzgCellProof>,
+            _: Duration,
+            held: crate::verify::client::Held,
+        ) -> crate::verify::client::KzgOutcome {
+            self.0.lock().unwrap().push(held);
+            crate::verify::client::KzgOutcome::NoVerdict("no verdict by the deadline".into())
+        }
+    }
+
+    impl QueuedFrames {
+        /// The queued frames leave for the wire.
+        fn send(&self) {
+            self.0.lock().unwrap().clear();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_check_keeps_its_copies_charged_while_its_frame_is_queued() {
+        let reference = Reference::start().await;
+        let (_, ssz, root) = gloas_block(SLOT, &blobs().commitments);
+        reference.serve(root, SLOT, ssz);
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+        let custody = Custody::open(
+            Arc::clone(&writer),
+            NoEnr,
+            U256::MAX,
+            Advertise::Withheld,
+            0,
+        )
+        .unwrap();
+        let queued = QueuedFrames::default();
+        let contract = ColumnContract {
+            kzg: queued.clone(),
+            verify_timeout: Duration::from_secs(1),
+            metrics: ColumnMetrics::default(),
+        };
+        let refs = RefView::new(reference.api(), schedule(), RefLimits::default());
+        let ingest = ColumnIngest::start(
+            refs,
+            custody,
+            contract,
+            Arc::clone(&writer),
+            IngestLimits::default(),
+            QueueMetrics::default(),
+        )
+        .unwrap();
+        let column = column_at(root, SLOT, CUSTODY_COLUMN);
+        assert_eq!(ingest.on_column(column), Verdict::Ignore);
+        settle("the check to run out of time", || {
+            ingest.contract().metrics.dropped(Drop::VerifyTimeout) == 1 && ingest.pending() == 0
+        })
+        .await;
+        // The column is gone, but its cells still sit in the outbound queue: still charged.
+        let charged = ingest.copy_bytes();
+        assert!(charged > 0, "the queued cells are charged");
+        assert_eq!(queued.0.lock().unwrap().len(), 1);
+        queued.send();
+        assert_eq!(
+            ingest.copy_bytes(),
+            0,
+            "released as the frame left the queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn copies_for_the_kzg_check_are_charged() {
+        let slots = [9, 10];
+        let reference = Reference::start().await;
+        let roots: Vec<_> = slots
+            .iter()
+            .map(|&slot| {
+                let (_, ssz, root) = gloas_block(slot, &blobs().commitments);
+                reference.serve(root, slot, ssz);
+                root
+            })
+            .collect();
+        let one = column_at(roots[0], slots[0], CUSTODY_COLUMN)
+            .sidecar
+            .ssz_bytes_len();
+        let limits = IngestLimits {
+            max_copy_bytes: 8 * one,
+            ..IngestLimits::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+        let custody = Custody::open(
+            Arc::clone(&writer),
+            NoEnr,
+            U256::MAX,
+            Advertise::Withheld,
+            0,
+        )
+        .unwrap();
+        let mut registry = Registry::default();
+        let stalled = Stalled::default();
+        let contract = ColumnContract {
+            kzg: stalled.clone(),
+            verify_timeout: Duration::from_secs(600),
+            metrics: ColumnMetrics::register(&mut registry),
+        };
+        let refs = RefView::new(reference.api(), schedule(), RefLimits::default());
+        let ingest = ColumnIngest::start(
+            refs,
+            custody,
+            contract,
+            Arc::clone(&writer),
+            limits,
+            QueueMetrics::register(&mut registry),
+        )
+        .unwrap();
+        let exposed = |name: &str| {
+            let mut text = String::new();
+            prometheus_client::encoding::text::encode(&mut text, &registry).unwrap();
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{name} ")))
+                .map_or(0, |v| v.parse::<u64>().unwrap())
+        };
+        // cl-verify stalls: each column holds its copies until the copy budget is full.
+        let mut columns = slots.iter().zip(&roots).flat_map(|(&slot, &root)| {
+            ingest
+                .custody()
+                .custody_columns()
+                .into_iter()
+                .map(move |index| column_at(root, slot, index))
+        });
+        let mut sent = 0;
+        while exposed("probe_column_queue_dropped_total") == 0 {
+            let column = columns
+                .next()
+                .expect("the copy budget fills before the columns run out");
+            assert_eq!(ingest.on_column(column), Verdict::Ignore);
+            sent += 1;
+            settle("the column to reach cl-verify or be dropped", || {
+                stalled.held().0 + exposed("probe_column_queue_dropped_total") as usize == sent
+            })
+            .await;
+        }
+        let (held, copies) = stalled.held();
+        assert!(held >= 1, "at least one column fits");
+        assert_eq!(
+            ingest.pending(),
+            held,
+            "the dropped column gave its place back"
+        );
+        // What is charged bounds what is held: the queued sidecars and their copies.
+        assert!(
+            copies <= ingest.copy_bytes(),
+            "{copies} > {}",
+            ingest.copy_bytes()
+        );
+        assert!(ingest.copy_bytes() <= limits.max_copy_bytes);
+        assert_eq!(ingest.pending_bytes(), held * one);
+        assert_eq!(
+            exposed("probe_column_buffer_bytes"),
+            (ingest.pending_bytes() + ingest.copy_bytes()) as u64,
+            "the gauge reports both budgets"
+        );
+        assert!(Drop::ALL
+            .iter()
+            .all(|&d| ingest.contract().metrics.dropped(d) == 0));
+        assert_eq!(writer.reader().column_count().unwrap(), 0);
+    }
+
     #[tokio::test]
     async fn queue_full_drops() {
         let one = column_at([0; 32], 9, CUSTODY_COLUMN)
@@ -940,6 +1163,8 @@ mod tests {
             max_bytes: 3 * one + one / 2,
             root_wait: Duration::from_secs(1),
             alert_bytes: 2 * one,
+            max_waiting_columns: 3,
+            max_asking_columns: 4,
             ..IngestLimits::default()
         };
         let s = store_with(0, &[9], limits).await;
@@ -979,6 +1204,8 @@ mod tests {
         let limits = IngestLimits {
             max_items: 2,
             root_wait: Duration::from_secs(1),
+            max_waiting_columns: 0,
+            max_asking_columns: 1,
             ..IngestLimits::default()
         };
         let s = store_with(0, &[9], limits).await;
@@ -988,8 +1215,9 @@ mod tests {
         }
         assert_eq!(s.ingest.pending(), 2);
         assert_eq!(s.exposed("probe_column_queue_dropped_total"), 3);
+        // The two queued find their roots unknown, with no seat to wait in.
         settle("the root wait to end", || s.ingest.pending() == 0).await;
-        assert_eq!(s.dropped(Drop::RootTimeout), 2);
+        assert_eq!(s.dropped(Drop::RootWaitFull), 2);
     }
 
     #[tokio::test]
@@ -1026,6 +1254,7 @@ mod tests {
         let limits = IngestLimits {
             root_wait: Duration::from_secs(10),
             root_retry: Duration::from_millis(20),
+            retries_per_sec: 1000,
             ..IngestLimits::default()
         };
         let s = store_with(0, &[], limits).await;
@@ -1043,6 +1272,380 @@ mod tests {
         })
         .await;
         assert!(Drop::ALL.iter().all(|&d| s.dropped(d) == 0));
+    }
+
+    /// A made-up block root: `i` in its first bytes.
+    fn fake_root(i: u32) -> Root {
+        let mut root = [0xf0; 32];
+        root[..4].copy_from_slice(&i.to_be_bytes());
+        root
+    }
+
+    /// The custody columns of the block `root` at [`SLOT`].
+    fn custody_columns(s: &Store, root: Root) -> Vec<GossipColumn<Spec>> {
+        s.ingest
+            .custody()
+            .custody_columns()
+            .into_iter()
+            .map(|index| column_at(root, SLOT, index))
+            .collect()
+    }
+
+    /// Waits until every column of `columns` is stored as its SSZ.
+    async fn all_stored(s: &Store, columns: &[GossipColumn<Spec>]) {
+        for column in columns {
+            let want = column.sidecar.as_ssz_bytes();
+            settle("the real column to be stored", || {
+                s.stored(column).as_ref() == Some(&want)
+            })
+            .await;
+        }
+    }
+
+    /// The header requests the reference has seen for `root`.
+    fn header_requests(s: &Store, root: Root) -> usize {
+        let path = format!("/eth/v1/beacon/headers/0x{}", hex::encode(root));
+        s.reference
+            .server
+            .seen()
+            .iter()
+            .filter(|(seen, _)| *seen == path)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn made_up_roots_cannot_crowd_out_a_waiting_real_one() {
+        let limits = IngestLimits {
+            root_wait: Duration::from_secs(1),
+            root_retry: Duration::from_millis(100),
+            max_waiting_roots: 4,
+            retries_per_sec: 40,
+            ..IngestLimits::default()
+        };
+        let s = store_with(0, &[], limits).await;
+        let start = tokio::time::Instant::now();
+        // The real block's custody columns arrive before the reference has the block, and
+        // wait for it.
+        let (_, ssz, root) = gloas_block(SLOT, &blobs().commitments);
+        let real = custody_columns(&s, root);
+        for column in &real {
+            s.gossip(column);
+        }
+        settle("the real root to wait", || s.ingest.waiting_roots() == 1).await;
+        // A flood of columns of made-up roots: three more roots get a seat in the wait, and
+        // every other column is dropped, at once or after its first ask.
+        let flood = 200;
+        for i in 0..flood {
+            s.gossip(&column_at(fake_root(i), SLOT, CUSTODY_COLUMN));
+        }
+        settle("the made-up roots to take the other seats", || {
+            s.ingest.waiting_roots() == 4
+        })
+        .await;
+        // The reference learns the real block within the wait: every real column is stored.
+        s.reference.serve(root, SLOT, ssz);
+        all_stored(&s, &real).await;
+        settle("the flood's waits to end", || s.ingest.pending() == 0).await;
+        // Every made-up root is dropped: the three seated, and one more that took the real
+        // root's seat once it was known, time out; the rest find no seat.
+        let timed_out = s.dropped(Drop::RootTimeout);
+        assert!((3..=4).contains(&timed_out), "{timed_out}");
+        assert_eq!(timed_out + s.dropped(Drop::RootWaitFull), u64::from(flood));
+        assert_eq!(s.exposed("probe_column_queue_dropped_total"), 0);
+        // Requests stay within the two budgets, however many roots: the headers of the roots
+        // asked about, and the real block once (it is cached from then on).
+        let asked = s.reference.server.seen().len() as f64;
+        let elapsed = start.elapsed().as_secs_f64();
+        let budget = f64::from(limits.first_ask_burst)
+            + f64::from(limits.first_asks_per_sec) * elapsed
+            + 2.0 * 4.0
+            + f64::from(limits.retries_per_sec) * elapsed
+            + 1.0;
+        assert!(asked <= budget, "{asked} requests, budget {budget}");
+        assert!(asked < f64::from(flood), "not one request per made-up root");
+    }
+
+    /// A reference node from a table of blocks that answers a root it does not know only after
+    /// `slow`, and one it knows at once.
+    struct SlowReference {
+        blocks: HashMap<Root, (u64, Vec<u8>)>,
+        slow: Duration,
+        asked: Mutex<Vec<Root>>,
+    }
+
+    impl ReferenceApi for Arc<SlowReference> {
+        async fn finalized_checkpoint(&self) -> Result<Checkpoint, ApiError> {
+            Err(ApiError("not used".into()))
+        }
+
+        async fn header(&self, root: Root) -> Result<Header, ApiError> {
+            self.asked.lock().unwrap().push(root);
+            match self.blocks.get(&root) {
+                Some(&(slot, _)) => Ok(Header { root, slot }),
+                None => {
+                    tokio::time::sleep(self.slow).await;
+                    Err(ApiError("404".into()))
+                }
+            }
+        }
+    }
+
+    impl BlockApi for Arc<SlowReference> {
+        async fn block(&self, root: Root) -> Result<Vec<u8>, ApiError> {
+            let block = self.blocks.get(&root).map(|(_, ssz)| ssz.clone());
+            block.ok_or_else(|| ApiError("404".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_known_root_is_asked_about_while_every_seat_retries_against_a_slow_reference() {
+        // The default limits, the reference view's included.
+        let limits = IngestLimits::default();
+        let (_, ssz, root) = gloas_block(SLOT, &blobs().commitments);
+        let reference = Arc::new(SlowReference {
+            blocks: HashMap::from([(root, (SLOT, ssz))]),
+            slow: Duration::from_millis(1500),
+            asked: Mutex::default(),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+        let custody = Custody::open(
+            Arc::clone(&writer),
+            NoEnr,
+            U256::MAX,
+            Advertise::Withheld,
+            0,
+        )
+        .unwrap();
+        let verify = ClVerify::start();
+        let contract = ColumnContract {
+            kzg: verify.kzg_client().await,
+            verify_timeout: Duration::from_secs(10),
+            metrics: ColumnMetrics::default(),
+        };
+        let refs = RefView::new(Arc::clone(&reference), schedule(), RefLimits::default());
+        let ingest = ColumnIngest::start(
+            refs,
+            custody,
+            contract,
+            Arc::clone(&writer),
+            limits,
+            QueueMetrics::default(),
+        )
+        .unwrap();
+        // Made-up roots take every seat, and their retries hang on the slow reference together.
+        let seats = u32::try_from(limits.max_waiting_roots).unwrap();
+        for i in 0..seats {
+            ingest.on_column(column_at(fake_root(i), SLOT, CUSTODY_COLUMN));
+        }
+        settle("every seat to retry at once", || {
+            ingest.waiting_roots() == limits.max_waiting_roots
+                && ingest.refs_in_flight() == limits.max_waiting_roots
+        })
+        .await;
+        // A root the reference knows: its first ask still finds a place, and every one of its
+        // custody columns is stored.
+        let real: Vec<_> = ingest
+            .custody()
+            .custody_columns()
+            .into_iter()
+            .map(|index| column_at(root, SLOT, index))
+            .collect();
+        for column in &real {
+            ingest.on_column(column.clone());
+        }
+        for column in &real {
+            let want = column.sidecar.as_ssz_bytes();
+            settle("the known root's column to be stored", || {
+                writer.reader().get(&root, column.sidecar.index).unwrap() == Some(want.clone())
+            })
+            .await;
+        }
+        let metrics = &ingest.contract().metrics;
+        assert_eq!(metrics.dropped(Drop::RootWaitFull), 0);
+        let asked = reference.asked.lock().unwrap();
+        assert_eq!(asked.iter().filter(|r| **r == root).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_known_root_is_stored_behind_full_seats_and_a_resent_root() {
+        // The defaults, and no pause for the budgets to refill.
+        let limits = IngestLimits::default();
+        let s = store_with(0, &[SLOT], limits).await;
+        let (root, _) = s.blocks[0];
+        let start = tokio::time::Instant::now();
+        // Made-up roots come first and take every seat in the root wait.
+        let seats = u32::try_from(limits.max_waiting_roots).unwrap();
+        for i in 0..seats {
+            s.gossip(&column_at(fake_root(i), SLOT, CUSTODY_COLUMN));
+        }
+        // One more made-up root, resent at a high rate: past its first ask it finds no seat, and
+        // is remembered until it would be asked again.
+        let resent = fake_root(seats);
+        // Thousands a second: 20 resends, then a millisecond for the store to take them.
+        let store = &s;
+        let resend = |n| async move {
+            for i in 0..n {
+                store.gossip(&column_at(resent, SLOT, [1, 47, 87, 102][i % 4]));
+                if i % 20 == 19 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        };
+        resend(400).await;
+        // The reference already knows the real root: asked about at its turn, it needs no seat,
+        // and every one of its custody columns is stored.
+        let real = custody_columns(&s, root);
+        for column in &real {
+            s.gossip(column);
+            resend(100).await;
+        }
+        all_stored(&s, &real).await;
+        assert_eq!(s.dropped(Drop::RootTimeout), 0);
+        settle("the made-up roots to hold every seat", || {
+            s.ingest.waiting_roots() == limits.max_waiting_roots
+        })
+        .await;
+        // The resent root cost a first ask per retry interval at most, not one per resend.
+        let resent_asks = header_requests(&s, resent);
+        let intervals = start.elapsed().as_secs_f64() / limits.root_retry.as_secs_f64();
+        assert!(resent_asks as f64 <= intervals + 1.0, "{resent_asks} asks");
+        assert_eq!(header_requests(&s, root), 1, "the real root asked once");
+    }
+
+    #[tokio::test]
+    async fn a_forged_column_first_cannot_keep_the_real_one_out() {
+        let limits = IngestLimits {
+            root_wait: Duration::from_secs(10),
+            root_retry: Duration::from_millis(20),
+            retries_per_sec: 1000,
+            ..IngestLimits::default()
+        };
+        let s = store_with(0, &[], limits).await;
+        let (_, ssz, root) = gloas_block(SLOT, &blobs().commitments);
+        // A forged column of a real root still waiting for the reference: other bytes, so
+        // gossip does not deduplicate it against the real one, which comes second.
+        let mut forged = column_at(root, SLOT, CUSTODY_COLUMN);
+        forged.sidecar.column[0][31] ^= 1;
+        s.gossip(&forged);
+        settle("the forged column to wait", || {
+            s.ingest.waiting_roots() == 1
+        })
+        .await;
+        let real = column_at(root, SLOT, CUSTODY_COLUMN);
+        s.gossip(&real);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(s.ingest.pending(), 2, "both candidates wait");
+        assert_eq!(s.dropped(Drop::RootWaitFull), 0);
+        // The block becomes known: the forgery fails KZG, the real column is stored.
+        s.reference.serve(root, SLOT, ssz);
+        all_stored(&s, std::slice::from_ref(&real)).await;
+        settle("the forgery to be dropped", || {
+            s.dropped(Drop::KzgInvalid) == 1
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn four_forgeries_first_cost_the_real_column_of_their_index() {
+        let limits = IngestLimits {
+            root_wait: Duration::from_secs(10),
+            root_retry: Duration::from_millis(20),
+            retries_per_sec: 1000,
+            ..IngestLimits::default()
+        };
+        let s = store_with(0, &[], limits).await;
+        let (_, ssz, root) = gloas_block(SLOT, &blobs().commitments);
+        // MAX_CANDIDATES_PER_INDEX forgeries of one index, before the real column.
+        for byte in 0..usize::from(MAX_CANDIDATES_PER_INDEX) {
+            let mut forged = column_at(root, SLOT, CUSTODY_COLUMN);
+            forged.sidecar.column[0][byte] ^= 1;
+            s.gossip(&forged);
+        }
+        settle("the forgeries to wait", || s.ingest.waiting_roots() == 1).await;
+        // The real column, fifth, finds the index full: dropped and counted, the documented
+        // limit of the cap. Gossip delivers each message id once, so no later copy comes.
+        let real = column_at(root, SLOT, CUSTODY_COLUMN);
+        s.gossip(&real);
+        settle("the real column to be refused", || {
+            s.dropped(Drop::RootWaitFull) == 1
+        })
+        .await;
+        // The root becomes known: the forgeries fail KZG, and the index stays empty.
+        s.reference.serve(root, SLOT, ssz);
+        settle("the forgeries to be dropped", || {
+            s.dropped(Drop::KzgInvalid) == u64::from(MAX_CANDIDATES_PER_INDEX)
+        })
+        .await;
+        settle("the queue to drain", || s.ingest.pending() == 0).await;
+        assert_eq!(s.stored(&real), None, "the real column is lost");
+        assert_eq!(s.writer.reader().column_count().unwrap(), 0);
+        assert_eq!(s.dropped(Drop::RootWaitFull), 1);
+    }
+
+    #[tokio::test]
+    async fn limits_that_cannot_bound_a_store_are_refused_at_start() {
+        let defaults = IngestLimits::default();
+        let refused = [
+            (
+                IngestLimits {
+                    first_ask_burst: 0,
+                    ..defaults
+                },
+                RefLimits::default(),
+            ),
+            (
+                IngestLimits {
+                    root_retry: Duration::ZERO,
+                    ..defaults
+                },
+                RefLimits::default(),
+            ),
+            (
+                IngestLimits {
+                    retries_per_sec: 31,
+                    ..defaults
+                },
+                RefLimits::default(),
+            ),
+            // A reference view with no more lookup places than seats.
+            (
+                defaults,
+                RefLimits {
+                    max_in_flight: defaults.max_waiting_roots,
+                    ..RefLimits::default()
+                },
+            ),
+        ];
+        for (limits, ref_limits) in refused {
+            let reference = Reference::start().await;
+            let dir = tempfile::tempdir().unwrap();
+            let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+            let custody = Custody::open(
+                Arc::clone(&writer),
+                NoEnr,
+                U256::MAX,
+                Advertise::Withheld,
+                0,
+            )
+            .unwrap();
+            let contract = ColumnContract {
+                kzg: Stalled::default(),
+                verify_timeout: Duration::from_secs(1),
+                metrics: ColumnMetrics::default(),
+            };
+            let refs = RefView::<_, Spec>::new(reference.api(), schedule(), ref_limits);
+            let started = ColumnIngest::start(
+                refs,
+                custody,
+                contract,
+                writer,
+                limits,
+                QueueMetrics::default(),
+            );
+            let err = started.err().expect("refused");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+        }
     }
 
     #[tokio::test]

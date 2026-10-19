@@ -12,36 +12,63 @@
 //! 1. **The pending queue** ([`IngestLimits::max_items`], [`IngestLimits::max_bytes`]). A column
 //!    holds a place, sized by its SSZ, from its arrival until it is stored or dropped. One that
 //!    would pass either cap is dropped at once and counted in
-//!    `probe_column_queue_dropped_total`. `probe_column_buffer_bytes` is the bytes queued now,
-//!    and `probe_column_buffer_alert` is 1 while they are at or above
-//!    [`IngestLimits::alert_bytes`] ([`COLUMN_BUFFER_ALERT_BYTES`], 48 MiB).
+//!    `probe_column_queue_dropped_total`.
 //! 2. **The local checks** of the storage contract: structure, subnet, custody, and forward only
 //!    ([`super::column`]). A column before `cgc_set_slot` is dropped as `before_cgc_set_slot`:
 //!    nothing is backfilled.
-//! 3. **The root wait.** A column whose block root the reference does not know yet waits for it
-//!    (`gloas/p2p-interface.md` L1322–1324: "MAY be queued until block is retrieved"), asking
-//!    again every [`IngestLimits::root_retry`], for at most [`IngestLimits::root_wait`] from its
-//!    arrival. Then it is dropped as `root_timeout`.
-//! 4. **The storage contract** ([`storage_contract`]): root, commitments, KZG through
+//! 3. **The root** (`probe::root_wait`). A column whose block root the reference view has not
+//!    cached joins its root's entry: the first column of the root asks the reference once, at
+//!    its turn of the first-ask budget ([`IngestLimits::first_asks_per_sec`]), and the others
+//!    share the answer. A root the reference knows needs nothing more, and its block goes to the
+//!    storage contract, which so never looks it up again. A root not known yet is seated in the
+//!    wait (`gloas/p2p-interface.md` L1322–1324: "MAY be queued until block is retrieved"): one
+//!    retry per [`IngestLimits::root_retry`] for all its columns, from a budget of its own
+//!    ([`IngestLimits::retries_per_sec`]), for at most [`IngestLimits::root_wait`] from the
+//!    first one's arrival, then dropped as `root_timeout`. A root refused, or whose wait ran out,
+//!    is remembered for [`IngestLimits::unknown_root_ttl`], one not known yet that found no seat
+//!    for a retry (at most [`MAX_UNKNOWN_ROOTS`](super::MAX_UNKNOWN_ROOTS) roots). At most
+//!    [`IngestLimits::max_asking_columns`] columns wait for first asks,
+//!    [`IngestLimits::max_waiting_columns`] for [`IngestLimits::max_waiting_roots`] seated
+//!    roots, and [`MAX_CANDIDATES_PER_INDEX`](super::MAX_CANDIDATES_PER_INDEX) per index of a
+//!    root; a column past a cap is dropped as `root_wait_full`, so columns of made-up roots never
+//!    fill the queue ([`IngestLimits::validate`]). A flood of fresh made-up roots still dilutes
+//!    the first-ask budget: see the residual risk in `probe::root_wait`.
+//! 4. **The copy budget** ([`IngestLimits::max_copy_bytes`]). Before the storage contract, the
+//!    column charges the copies it is about to make: its cells for cl-verify and their
+//!    encoding, and its SSZ for the write. The SSZ copy stays charged until the column is
+//!    stored or dropped; the cells' until their request has left cl-verify's client queue, even
+//!    past a verify timeout. A column whose copies do not fit is dropped as queue-full, so a
+//!    stalled cl-verify cannot make the queue hold more than both budgets.
+//! 5. **The storage contract** ([`super::storage_contract`]): root, commitments, KZG through
 //!    cl-verify.
-//! 5. **The write**, on the [`WRITER_THREAD`] thread: the columns of one block in transactions
-//!    of at most [`MAX_COLUMNS_PER_TXN`] (16), each at the column env's background priority, so
-//!    block import goes first ([`ColumnWriter::write_columns`]). A refused write is dropped as
-//!    `store_failed`.
+//! 6. **The write**, on the [`WRITER_THREAD`] thread: the columns of one block that the writer
+//!    takes off its queue together, in one [`ColumnWriter::write_columns`] call, which commits
+//!    them in transactions of at most
+//!    [`MAX_COLUMNS_PER_TXN`](cl_chain_columns::MAX_COLUMNS_PER_TXN) (16) at the column env's
+//!    background priority, so block import goes first, while it holds off reorg pruning. A root
+//!    pruned as an orphan is refused from then on, so a later batch cannot bring it back. A
+//!    refused write is dropped as `store_failed`.
+//!
+//! `probe_column_buffer_bytes` is what the queued columns hold now, their SSZ and their copies
+//! together, and `probe_column_buffer_alert` is 1 while that is at or above
+//! [`IngestLimits::alert_bytes`] ([`COLUMN_BUFFER_ALERT_BYTES`], 48 MiB).
 //!
 //! The first stored slot ([`first_stored_column_slot`]) is written in the transaction that
-//! stores the column, so it survives a crash together with the columns. Pruning on finality and
-//! reorg stays with the column env ([`ColumnWriter::prune_finalized`],
-//! [`ColumnWriter::prune_orphaned`]).
+//! stores the column, so it survives a crash together with the columns. It is a historical
+//! minimum, not proof that the data is held; [`earliest_servable_slot`] is the slot the store
+//! may claim to serve from. Pruning on finality and reorg stays with the column env
+//! ([`ColumnWriter::prune_finalized`], [`ColumnWriter::prune_orphaned`]).
 
-use super::column::{local_check, storage_contract, ColumnContract, ColumnMetrics, Drop};
-use super::{BlockApi, GossipColumn, RefError, RefView, ReferenceApi, Root};
+use super::column::{local_check, vouched_contract, ColumnContract, ColumnMetrics, Drop};
+use super::root_wait::{Answer, RootWaits};
+use super::{BlockApi, GossipColumn, RefError, RefLimits, RefView, ReferenceApi, Root};
 use crate::da::custody::Custody;
-use crate::verify::client::KzgVerifier;
-use cl_chain_columns::{Column, ColumnReader, ColumnWriter, MAX_COLUMNS_PER_TXN};
+use crate::verify::client::{Held, KzgVerifier};
+use cl_chain_columns::{Column, ColumnReader, ColumnWriter, WriteReport};
 use consensus_types::primitives::Slot;
-use consensus_types::EthSpec;
+use consensus_types::{gloas, EthSpec};
 use ethswarm_proto::common::Verdict;
+use ethswarm_proto::verify::KzgCellProof;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
@@ -62,8 +89,38 @@ pub const COLUMN_BUFFER_ALERT_BYTES: usize = 48 << 20;
 /// reference to import a block whose columns arrived first.
 pub const DEFAULT_ROOT_WAIT: Duration = Duration::from_secs(4);
 
-/// How often a waiting column asks the reference for its root again \[est\].
-pub const DEFAULT_ROOT_RETRY: Duration = Duration::from_millis(250);
+/// How often a seated root is asked again \[est\]: eight times in a [`DEFAULT_ROOT_WAIT`].
+pub const DEFAULT_ROOT_RETRY: Duration = Duration::from_millis(500);
+
+/// Roots seated in the wait at once \[est\]: a slot's block arrives about every 12 s, and is
+/// usually known by the time its columns arrive, so real waits need a few; the rest bounds
+/// made-up roots.
+pub const DEFAULT_MAX_WAITING_ROOTS: usize = 16;
+
+/// Columns waiting for seated roots at once \[est\]: a block and a half at full custody.
+pub const DEFAULT_MAX_WAITING_COLUMNS: usize = 192;
+
+/// Columns waiting for first asks at once \[est\]. With [`DEFAULT_MAX_WAITING_COLUMNS`] it
+/// leaves a full block's places in the default queue for columns whose roots are known.
+pub const DEFAULT_MAX_ASKING_COLUMNS: usize = 192;
+
+/// First asks of column roots a second \[est\]. Each is a header request, plus a block request
+/// for a root it finds.
+pub const DEFAULT_FIRST_ASKS_PER_SEC: u32 = 32;
+
+/// First asks that may go out at once after a quiet spell \[est\]: a slot's root and a few late
+/// ones.
+pub const DEFAULT_FIRST_ASK_BURST: u32 = 16;
+
+/// Retries of seated roots a second \[est\]: exactly a retry of every seat every
+/// [`DEFAULT_ROOT_RETRY`] (16 / 0.5 s), the least [`IngestLimits::validate`] allows. With the
+/// first asks, the reference sees at most 64 lookups, 128 requests, a second from the store.
+pub const DEFAULT_RETRIES_PER_SEC: u32 = 32;
+
+/// How long a root whose wait ran out, or that the reference refused, is remembered \[est\]:
+/// one [`DEFAULT_ROOT_WAIT`], so a peer resending columns of a made-up root costs no request
+/// for that long.
+pub const DEFAULT_UNKNOWN_ROOT_TTL: Duration = DEFAULT_ROOT_WAIT;
 
 /// The name of the thread that writes the column env.
 pub const WRITER_THREAD: &str = "columns-writer";
@@ -78,25 +135,156 @@ pub struct IngestLimits {
     pub max_items: usize,
     /// Their SSZ bytes.
     pub max_bytes: usize,
-    /// Queued bytes at which `probe_column_buffer_alert` turns on.
+    /// The bytes of the copies the queued columns hold past their sidecars: their cells for the
+    /// KZG check, as `KzgCellProof`s and encoded, and the SSZ for the write. A column charges
+    /// them before the storage contract and holds them until it is stored or dropped; one whose
+    /// copies do not fit is dropped as queue-full.
+    pub max_copy_bytes: usize,
+    /// Bytes, queued and copies together, at which `probe_column_buffer_alert` turns on.
     pub alert_bytes: usize,
-    /// How long a column waits for its block root, from its arrival.
+    /// How long a column waits for its block root, from the arrival of the first column of
+    /// that root.
     pub root_wait: Duration,
-    /// How often a waiting column asks for its root again.
+    /// How often a seated root is asked again.
     pub root_retry: Duration,
+    /// Roots seated in the wait at once.
+    pub max_waiting_roots: usize,
+    /// Columns waiting for seated roots at once, over every root.
+    pub max_waiting_columns: usize,
+    /// Columns waiting for first asks at once, over every root. With `max_waiting_columns`
+    /// below `max_items`, so columns of made-up roots can never fill the queue.
+    pub max_asking_columns: usize,
+    /// How long a root whose wait ran out, or that the reference refused, is remembered, its
+    /// columns dropped without a request.
+    pub unknown_root_ttl: Duration,
+    /// First asks of column roots a second.
+    pub first_asks_per_sec: u32,
+    /// First asks saved up for a burst, at most.
+    pub first_ask_burst: u32,
+    /// Retries of seated roots a second: at least a retry of every seat every `root_retry`.
+    pub retries_per_sec: u32,
 }
 
 impl Default for IngestLimits {
-    /// 512 columns (four blocks at full custody) and 64 MiB queued \[est\], the alert at
-    /// [`COLUMN_BUFFER_ALERT_BYTES`], [`DEFAULT_ROOT_WAIT`] and [`DEFAULT_ROOT_RETRY`].
+    /// 512 columns (four blocks at full custody), 64 MiB queued and 64 MiB of copies \[est\],
+    /// the alert at [`COLUMN_BUFFER_ALERT_BYTES`], and the root wait's `DEFAULT_*` constants.
     fn default() -> Self {
         Self {
             max_items: 512,
             max_bytes: 64 << 20,
+            max_copy_bytes: 64 << 20,
             alert_bytes: COLUMN_BUFFER_ALERT_BYTES,
             root_wait: DEFAULT_ROOT_WAIT,
             root_retry: DEFAULT_ROOT_RETRY,
+            max_waiting_roots: DEFAULT_MAX_WAITING_ROOTS,
+            max_waiting_columns: DEFAULT_MAX_WAITING_COLUMNS,
+            max_asking_columns: DEFAULT_MAX_ASKING_COLUMNS,
+            unknown_root_ttl: DEFAULT_UNKNOWN_ROOT_TTL,
+            first_asks_per_sec: DEFAULT_FIRST_ASKS_PER_SEC,
+            first_ask_burst: DEFAULT_FIRST_ASK_BURST,
+            retries_per_sec: DEFAULT_RETRIES_PER_SEC,
         }
+    }
+}
+
+/// Why [`IngestLimits`] cannot bound a store ([`IngestLimits::validate`]).
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum LimitsError {
+    /// A limit that must be above zero is zero: no column would ever be queued, asked about or
+    /// waited for, or retries would spin.
+    #[error("{0} must be above zero")]
+    Zero(&'static str),
+    /// The retry budget cannot retry every seat every `root_retry`, so seated roots would take
+    /// turns and starve.
+    #[error(
+        "retries_per_sec {retries_per_sec} cannot retry {max_waiting_roots} seats every \
+         {root_retry:?}"
+    )]
+    RetryShare {
+        retries_per_sec: u32,
+        max_waiting_roots: usize,
+        root_retry: Duration,
+    },
+    /// The reference view's lookups in flight cannot exceed the seats: the seated roots'
+    /// retries, in flight together against a slow reference, would take every place, and a
+    /// first ask for a known root would find none.
+    #[error(
+        "the reference view's max_in_flight {max_in_flight} must be above max_waiting_roots \
+         {max_waiting_roots}"
+    )]
+    SeatsFillTheReference {
+        max_in_flight: usize,
+        max_waiting_roots: usize,
+    },
+    /// The root wait could hold every queue place, leaving none for columns of known roots.
+    #[error(
+        "max_waiting_columns {waiting} + max_asking_columns {asking} must stay below max_items \
+         {max_items}"
+    )]
+    WaitsFillTheQueue {
+        waiting: usize,
+        asking: usize,
+        max_items: usize,
+    },
+}
+
+impl IngestLimits {
+    /// Checks that these limits bound a store: every rate, burst and duration above zero, the
+    /// retry budget covering a retry of every seat each `root_retry`, and the root wait's
+    /// columns below the queue's places.
+    ///
+    /// # Errors
+    ///
+    /// [`LimitsError`]: the first limit that does not hold.
+    pub fn validate(&self) -> Result<(), LimitsError> {
+        let zero = [
+            ("max_items", self.max_items == 0),
+            ("root_wait", self.root_wait.is_zero()),
+            ("root_retry", self.root_retry.is_zero()),
+            ("first_asks_per_sec", self.first_asks_per_sec == 0),
+            ("first_ask_burst", self.first_ask_burst == 0),
+            ("retries_per_sec", self.retries_per_sec == 0),
+        ];
+        if let Some((name, _)) = zero.into_iter().find(|(_, zero)| *zero) {
+            return Err(LimitsError::Zero(name));
+        }
+        // Integer math: retries_per_sec × root_retry ≥ max_waiting_roots, in nanoseconds.
+        let retries = u128::from(self.retries_per_sec) * self.root_retry.as_nanos();
+        if retries < self.max_waiting_roots as u128 * 1_000_000_000 {
+            return Err(LimitsError::RetryShare {
+                retries_per_sec: self.retries_per_sec,
+                max_waiting_roots: self.max_waiting_roots,
+                root_retry: self.root_retry,
+            });
+        }
+        let waits = self
+            .max_waiting_columns
+            .saturating_add(self.max_asking_columns);
+        if waits >= self.max_items {
+            return Err(LimitsError::WaitsFillTheQueue {
+                waiting: self.max_waiting_columns,
+                asking: self.max_asking_columns,
+                max_items: self.max_items,
+            });
+        }
+        Ok(())
+    }
+
+    /// [`Self::validate`], and that the reference view's lookups in flight (`refs`) exceed the
+    /// seats, so the seated roots' retries never take every place a first ask needs.
+    ///
+    /// # Errors
+    ///
+    /// [`LimitsError`]: the first limit that does not hold.
+    pub fn validate_for(&self, refs: &RefLimits) -> Result<(), LimitsError> {
+        self.validate()?;
+        if refs.max_in_flight <= self.max_waiting_roots {
+            return Err(LimitsError::SeatsFillTheReference {
+                max_in_flight: refs.max_in_flight,
+                max_waiting_roots: self.max_waiting_roots,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -126,7 +314,8 @@ impl QueueMetrics {
         );
         registry.register(
             "probe_column_buffer_bytes",
-            "SSZ bytes of the gossip column sidecars queued, from arrival until stored or dropped",
+            "Bytes the queued gossip column sidecars hold, from arrival until stored or dropped: \
+             their SSZ and the copies for the KZG check and the write",
             metrics.buffer_bytes.clone(),
         );
         registry.register(
@@ -153,6 +342,12 @@ impl QueueMetrics {
 /// The lowest slot a column was ever stored at, as persisted with the columns; `None` before
 /// the first one.
 ///
+/// A historical minimum, not proof that anything from there on is held: one column lowers it
+/// even if the block's other custody columns never arrive, pruning (finality or reorg) leaves
+/// it below the data that remains, and raising custody does not move it. So it is never the
+/// Status `earliest_available_slot` on its own: that is [`earliest_servable_slot`], which also
+/// takes the finalized-slot watermark and `cgc_set_slot`.
+///
 /// # Errors
 ///
 /// The column env's.
@@ -162,10 +357,59 @@ pub fn first_stored_column_slot(
     reader.first_stored_slot()
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+/// The lowest slot the column store may claim to serve: the highest of `first_stored_slot`
+/// ([`first_stored_column_slot`]), the slot after the finalized-slot watermark
+/// (`finalized_slot`, [`ColumnReader::finalized_slot`]: everything at or below it is pruned) and
+/// `cgc_set_slot` (columns before it are of a smaller custody). `None` while nothing was stored,
+/// or if the watermark is the last slot. The Status `earliest_available_slot`, once the probe
+/// serves columns, is this value.
+///
+/// Still not proof that every custody column from there on is held: a block whose columns
+/// partly failed to arrive, or a later reorg prune, leaves gaps. A range request is answered
+/// from what is stored.
+#[must_use]
+pub fn earliest_servable_slot(
+    first_stored_slot: Option<Slot>,
+    finalized_slot: Option<Slot>,
+    cgc_set_slot: Slot,
+) -> Option<Slot> {
+    let after_finalized = match finalized_slot {
+        Some(slot) => slot.checked_add(1)?,
+        None => 0,
+    };
+    Some(first_stored_slot?.max(after_finalized).max(cgc_set_slot))
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Pending {
     items: usize,
+    /// The queued sidecars' SSZ bytes.
     bytes: usize,
+    /// The bytes of their copies ([`copy_bytes`]).
+    copies: usize,
+}
+
+impl Pending {
+    /// Everything the queue holds: the sidecars and their copies.
+    fn total(self) -> usize {
+        self.bytes.saturating_add(self.copies)
+    }
+}
+
+/// `KZGCommitment` and `KZGProof` are both 48-byte compressed G1 points.
+const KZG_POINT_BYTES: usize = 48;
+
+/// The bytes of the copies a column's KZG check makes: its cells as [`KzgCellProof`]s for
+/// cl-verify (`storage_contract`), and the request's protobuf encoding of them (no larger: each
+/// field's tag and length cost less than the struct they are encoded from). Held until the
+/// request leaves the verify client's outbound queue ([`KzgVerifier::verify_cells_holding`]).
+fn kzg_copy_bytes<E: EthSpec>(sidecar: &gloas::DataColumnSidecar<E>) -> usize {
+    let cells: usize = sidecar
+        .column
+        .iter()
+        .map(|cell| std::mem::size_of::<KzgCellProof>() + 2 * KZG_POINT_BYTES + cell.len())
+        .sum();
+    cells.saturating_mul(2)
 }
 
 /// The pending queue's accounting.
@@ -184,39 +428,69 @@ impl Queue {
         if items > self.limits.max_items || total > self.limits.max_bytes {
             return None;
         }
-        *pending = Pending {
-            items,
-            bytes: total,
-        };
+        pending.items = items;
+        pending.bytes = total;
         self.publish(*pending);
         Some(Place {
             queue: Arc::clone(self),
             bytes,
+            copies: 0,
         })
     }
 
-    fn release(&self, bytes: usize) {
+    /// Charges `bytes` of copies to the copy budget; `false`, charging nothing, if they would
+    /// pass [`IngestLimits::max_copy_bytes`].
+    fn charge_copies(&self, bytes: usize) -> bool {
+        let mut pending = self.lock();
+        match pending.copies.checked_add(bytes) {
+            Some(copies) if copies <= self.limits.max_copy_bytes => {
+                pending.copies = copies;
+                self.publish(*pending);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn release(&self, bytes: usize, copies: usize) {
         let mut pending = self.lock();
         pending.items -= 1;
         pending.bytes -= bytes;
+        pending.copies -= copies;
         self.publish(*pending);
+    }
+
+    fn release_copies(&self, copies: usize) {
+        let mut pending = self.lock();
+        pending.copies -= copies;
+        self.publish(*pending);
+    }
+
+    /// Counts a column dropped because the queue was full, and logs it.
+    fn drop_full<E: EthSpec>(&self, column: &GossipColumn<E>, bytes: usize) {
+        self.metrics.queue_dropped.inc();
+        tracing::debug!(
+            index = column.sidecar.index,
+            slot = column.sidecar.slot,
+            subnet = column.subnet_id,
+            bytes,
+            "column queue full: column sidecar dropped"
+        );
     }
 
     /// Sets the gauges; called under the lock, so they move in the queue's order.
     fn publish(&self, pending: Pending) {
         let metrics = &self.metrics;
+        let total = pending.total();
         metrics
             .buffer_bytes
-            .set(i64::try_from(pending.bytes).unwrap_or(i64::MAX));
-        let alert = pending.bytes >= self.limits.alert_bytes;
+            .set(i64::try_from(total).unwrap_or(i64::MAX));
+        let alert = total >= self.limits.alert_bytes;
         if alert != (metrics.buffer_alert.get() == 1) {
             if alert {
-                tracing::warn!(bytes = pending.bytes, "column buffer above its alert level");
+                tracing::warn!(bytes = total, "column buffer above its alert level");
             } else {
-                tracing::info!(
-                    bytes = pending.bytes,
-                    "column buffer back below its alert level"
-                );
+                tracing::info!(bytes = total, "column buffer back below its alert level");
             }
             metrics.buffer_alert.set(i64::from(alert));
         }
@@ -228,15 +502,45 @@ impl Queue {
     }
 }
 
-/// One column's place in the pending queue, given back when dropped.
+/// One column's place in the pending queue, and the copies it charged, given back when dropped.
 struct Place {
+    queue: Arc<Queue>,
+    bytes: usize,
+    copies: usize,
+}
+
+impl Place {
+    /// Charges the copies of the column's KZG check (`kzg`) and of its SSZ for the write
+    /// (`ssz`) together ([`Queue::charge_copies`]). The SSZ copy stays charged to this place,
+    /// which the write holds; the KZG copies go to the returned [`Charge`], which the check
+    /// hands to cl-verify's client. `None`, charging nothing, if they do not fit.
+    fn charge_copies(&mut self, kzg: usize, ssz: usize) -> Option<Charge> {
+        if !self.queue.charge_copies(kzg.checked_add(ssz)?) {
+            return None;
+        }
+        self.copies += ssz;
+        Some(Charge {
+            queue: Arc::clone(&self.queue),
+            bytes: kzg,
+        })
+    }
+}
+
+/// Copies charged apart from a place, given back when dropped.
+struct Charge {
     queue: Arc<Queue>,
     bytes: usize,
 }
 
+impl std::ops::Drop for Charge {
+    fn drop(&mut self) {
+        self.queue.release_copies(self.bytes);
+    }
+}
+
 impl std::ops::Drop for Place {
     fn drop(&mut self) {
-        self.queue.release(self.bytes);
+        self.queue.release(self.bytes, self.copies);
     }
 }
 
@@ -254,7 +558,7 @@ struct Shared<A, E, V, S, C> {
     refs: RefView<A, E>,
     custody: Custody<S, C>,
     contract: ColumnContract<V>,
-    limits: IngestLimits,
+    waits: RootWaits,
 }
 
 /// The forward-only custody column store (see the module docs).
@@ -285,7 +589,8 @@ where
     ///
     /// # Errors
     ///
-    /// The thread could not be spawned.
+    /// `InvalidInput` if `limits` do not bound a store with `refs`
+    /// ([`IngestLimits::validate_for`]); the thread could not be spawned.
     pub fn start(
         refs: RefView<A, E>,
         custody: Custody<S, C>,
@@ -294,6 +599,9 @@ where
         limits: IngestLimits,
         metrics: QueueMetrics,
     ) -> std::io::Result<Self> {
+        limits
+            .validate_for(&refs.limits())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         // Every job holds a queue place, so the channel never holds more than `max_items`.
         let (writes, jobs) = mpsc::channel(limits.max_items.max(1));
         let writer_thread = std::thread::Builder::new()
@@ -309,7 +617,7 @@ where
                 refs,
                 custody,
                 contract,
-                limits,
+                waits: RootWaits::new(limits),
             }),
             queue: Arc::new(Queue {
                 limits,
@@ -323,19 +631,18 @@ where
         })
     }
 
+    /// Roots the reference view is looking up now.
+    #[cfg(test)]
+    pub(crate) fn refs_in_flight(&self) -> usize {
+        self.shared.refs.in_flight()
+    }
+
     /// Takes a column sidecar from gossip; see the module docs. The verdict is always
     /// [`Verdict::Ignore`]: nothing is re-broadcast. Must be called within a tokio runtime.
     pub fn on_column(&self, column: GossipColumn<E>) -> Verdict {
         let bytes = column.sidecar.ssz_bytes_len();
         let Some(place) = self.queue.admit(bytes) else {
-            self.queue.metrics.queue_dropped.inc();
-            tracing::debug!(
-                index = column.sidecar.index,
-                slot = column.sidecar.slot,
-                subnet = column.subnet_id,
-                bytes,
-                "column queue full: column sidecar dropped"
-            );
+            self.queue.drop_full(&column, bytes);
             return Verdict::Ignore;
         };
         let Some(writes) = self.writes.as_ref().map(mpsc::Sender::downgrade) else {
@@ -365,6 +672,18 @@ impl<A, E, V, S, C> ColumnIngest<A, E, V, S, C> {
     #[must_use]
     pub fn pending_bytes(&self) -> usize {
         self.queue.lock().bytes
+    }
+
+    /// The bytes of their copies charged now ([`IngestLimits::max_copy_bytes`]).
+    #[must_use]
+    pub fn copy_bytes(&self) -> usize {
+        self.queue.lock().copies
+    }
+
+    /// Roots columns wait for now.
+    #[cfg(test)]
+    pub(crate) fn waiting_roots(&self) -> usize {
+        self.shared.waits.roots()
     }
 
     /// The custody the columns are checked against.
@@ -410,11 +729,11 @@ where
     E: EthSpec,
     V: KzgVerifier,
 {
-    /// Steps 2 to 4 of the module docs, then hands the column to the writer thread.
+    /// Steps 2 to 5 of the module docs, then hands the column to the writer thread.
     async fn process(
         &self,
         column: GossipColumn<E>,
-        place: Place,
+        mut place: Place,
         writes: &mpsc::WeakSender<Write>,
         arrived: Instant,
     ) {
@@ -424,16 +743,48 @@ where
             return;
         }
         let root = column.sidecar.beacon_block_root.0;
-        if !self
-            .wait_for_root(root, arrived + self.limits.root_wait)
-            .await
-        {
-            metrics.drop_column(&column, Drop::RootTimeout);
+        // A root the reference already vouched for needs no wait and no place in one. The
+        // block is handed to the contract, so it is never looked up twice.
+        let block = match self.refs.cached_block(&root) {
+            Some(block) => block,
+            None => {
+                let lookup = || async {
+                    match self.refs.lookup(root).await {
+                        Ok(block) => Answer::Known(block),
+                        // The reference names the root but its block does not establish it.
+                        Err(RefError::Block(_)) => Answer::Refused,
+                        // Not asked: every lookup place is taken.
+                        Err(RefError::Busy(_)) => Answer::Busy,
+                        // Not known yet, or the reference is slow or busy: ask again.
+                        Err(e) => {
+                            tracing::trace!(error = %e, "column root not known yet");
+                            Answer::Retry
+                        }
+                    }
+                };
+                let index = column.sidecar.index;
+                match self.waits.wait(root, index, arrived, lookup).await {
+                    Ok(block) => block,
+                    Err(reason) => {
+                        metrics.drop_column(&column, reason);
+                        return;
+                    }
+                }
+            }
+        };
+        // Charged before the copies exist: the contract copies the cells for cl-verify, and
+        // the write copies the SSZ.
+        let (kzg, ssz) = (
+            kzg_copy_bytes(&column.sidecar),
+            column.sidecar.ssz_bytes_len(),
+        );
+        let Some(charge) = place.charge_copies(kzg, ssz) else {
+            place.queue.drop_full(&column, kzg.saturating_add(ssz));
             return;
-        }
-        let Ok(verified) =
-            storage_contract(&column, &self.refs, &self.custody, &self.contract).await
-        else {
+        };
+        let held: Held = Box::new(charge);
+        let checked = vouched_contract(&column, &block, &self.custody, &self.contract, held);
+        let Ok(verified) = checked.await else {
             return;
         };
         let sidecar = verified.sidecar();
@@ -451,25 +802,27 @@ where
             metrics.drop_column(&column, Drop::StoreFailed);
         }
     }
+}
 
-    /// Whether the reference knows `root` before `deadline`, asking every `root_retry`.
-    async fn wait_for_root(&self, root: Root, deadline: Instant) -> bool {
-        loop {
-            if Instant::now() >= deadline {
-                return false;
-            }
-            match tokio::time::timeout_at(deadline, self.refs.lookup(root)).await {
-                Err(_) => return false,
-                Ok(Ok(_)) => return true,
-                // The reference names the root but its block does not establish it. Waiting
-                // changes nothing; the contract drops the column as `unknown_root`.
-                Ok(Err(RefError::Block(_))) => return true,
-                // Not known yet, or the reference is slow or busy: ask again.
-                Ok(Err(e)) => tracing::trace!(error = %e, "column root not known yet"),
-            }
-            let retry = Instant::now() + self.limits.root_retry;
-            tokio::time::sleep_until(retry.min(deadline)).await;
-        }
+/// Where the writer thread stores columns: the column env.
+trait ColumnSink {
+    /// [`ColumnWriter::write_columns`].
+    fn write_columns(
+        &self,
+        slot: Slot,
+        root: &Root,
+        columns: &[Column<'_>],
+    ) -> cl_chain_columns::Result<WriteReport>;
+}
+
+impl ColumnSink for ColumnWriter {
+    fn write_columns(
+        &self,
+        slot: Slot,
+        root: &Root,
+        columns: &[Column<'_>],
+    ) -> cl_chain_columns::Result<WriteReport> {
+        ColumnWriter::write_columns(self, slot, root, columns)
     }
 }
 
@@ -493,11 +846,17 @@ fn run_writer(
     }
 }
 
-/// Writes `batch` block by block, at most [`MAX_COLUMNS_PER_TXN`] columns per call. A column
-/// that arrived twice is written once. Each column gives its queue place back once written or
-/// dropped.
+/// Writes `batch` block by block, each block of the batch in one
+/// [`ColumnWriter::write_columns`] call. That call commits in transactions of at most
+/// [`MAX_COLUMNS_PER_TXN`](cl_chain_columns::MAX_COLUMNS_PER_TXN) columns while it holds off
+/// pruning, so a reorg prune lands before or after the batch's columns of a block, never
+/// between two of its transactions. Columns of a block that verify later come in a later batch;
+/// once the block was pruned as an orphan, the column env refuses them
+/// ([`cl_chain_columns::Error::RootOrphaned`], counted as `store_failed`), so no batch brings an
+/// orphan back with some of its columns. A column that arrived twice is written once. Each
+/// column gives its queue place back once written or dropped.
 fn write_batch(
-    writer: &ColumnWriter,
+    writer: &impl ColumnSink,
     batch: Vec<Write>,
     dropped: &ColumnMetrics,
     metrics: &QueueMetrics,
@@ -510,30 +869,27 @@ fn write_batch(
             .insert(write.index, write);
     }
     for ((slot, root), columns) in blocks {
-        let columns: Vec<Write> = columns.into_values().collect();
-        for chunk in columns.chunks(MAX_COLUMNS_PER_TXN) {
-            let ssz: Vec<Column<'_>> = chunk
-                .iter()
-                .map(|w| Column {
-                    index: w.index,
-                    ssz: &w.ssz,
-                })
-                .collect();
-            match writer.write_columns(slot, &root, &ssz) {
-                Ok(_) => {
-                    metrics.stored.inc_by(chunk.len() as u64);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        slot,
-                        root = %hex::encode(root),
-                        columns = chunk.len(),
-                        "column write failed: column sidecars dropped"
-                    );
-                    for _ in chunk {
-                        dropped.count(Drop::StoreFailed);
-                    }
+        let ssz: Vec<Column<'_>> = columns
+            .values()
+            .map(|w| Column {
+                index: w.index,
+                ssz: &w.ssz,
+            })
+            .collect();
+        match writer.write_columns(slot, &root, &ssz) {
+            Ok(_) => {
+                metrics.stored.inc_by(ssz.len() as u64);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    slot,
+                    root = %hex::encode(root),
+                    columns = ssz.len(),
+                    "column write failed: column sidecars dropped"
+                );
+                for _ in &ssz {
+                    dropped.count(Drop::StoreFailed);
                 }
             }
         }
@@ -588,6 +944,48 @@ mod tests {
         assert_eq!(queue.lock().items, 0, "every place is given back");
     }
 
+    /// A column env where a reorg prune of `orphan` lands after every `write_columns` call,
+    /// counting the calls.
+    struct PrunesBetweenCalls<'a> {
+        writer: &'a ColumnWriter,
+        orphan: Root,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl ColumnSink for PrunesBetweenCalls<'_> {
+        fn write_columns(
+            &self,
+            slot: Slot,
+            root: &Root,
+            columns: &[Column<'_>],
+        ) -> cl_chain_columns::Result<WriteReport> {
+            let written = self.writer.write_columns(slot, root, columns);
+            self.calls.set(self.calls.get() + 1);
+            self.writer.prune_orphaned(&[self.orphan]).unwrap();
+            written
+        }
+    }
+
+    #[test]
+    fn a_prune_between_writes_leaves_no_partial_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let queue = queue(IngestLimits::default());
+        let (dropped, metrics) = metrics();
+        let sink = PrunesBetweenCalls {
+            writer: &writer,
+            orphan: [1; 32],
+            calls: std::cell::Cell::new(0),
+        };
+        // More columns than one transaction carries, of a block a reorg orphans meanwhile.
+        let batch: Vec<_> = (0..20).map(|i| write(&queue, 9, [1; 32], i)).collect();
+        write_batch(&sink, batch, &dropped, &metrics);
+        assert_eq!(sink.calls.get(), 1, "the whole block in one call");
+        let stored = writer.reader().columns_for_root(&[1; 32]).unwrap();
+        assert!(stored.is_empty(), "{} columns of the orphan", stored.len());
+        assert_eq!(queue.lock().items, 0);
+    }
+
     #[test]
     fn a_refused_write_is_counted_and_gives_its_places_back() {
         let dir = tempfile::tempdir().unwrap();
@@ -600,6 +998,151 @@ mod tests {
         assert_eq!(dropped.dropped(Drop::StoreFailed), 2);
         assert_eq!(metrics.stored(), 0);
         assert_eq!(queue.lock().items, 0);
+    }
+
+    #[test]
+    fn a_later_batch_cannot_bring_back_a_pruned_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let queue = queue(IngestLimits::default());
+        let (dropped, metrics) = metrics();
+        let first: Vec<_> = (0..4).map(|i| write(&queue, 9, [1; 32], i)).collect();
+        write_batch(&writer, first, &dropped, &metrics);
+        // A reorg orphans the block between two batches of its columns.
+        writer.prune_orphaned(&[[1; 32]]).unwrap();
+        let second: Vec<_> = (4..8).map(|i| write(&queue, 9, [1; 32], i)).collect();
+        write_batch(&writer, second, &dropped, &metrics);
+        assert_eq!(writer.reader().slot_of(&[1; 32]).unwrap(), None);
+        assert_eq!(writer.reader().column_count().unwrap(), 0);
+        assert_eq!(metrics.stored(), 4);
+        assert_eq!(dropped.dropped(Drop::StoreFailed), 4);
+        assert_eq!(queue.lock().items, 0);
+    }
+
+    #[test]
+    fn limits_are_validated() {
+        let defaults = IngestLimits::default();
+        assert_eq!(defaults.validate(), Ok(()));
+        let with = |f: fn(&mut IngestLimits)| {
+            let mut limits = defaults;
+            f(&mut limits);
+            limits.validate()
+        };
+        assert_eq!(
+            with(|l| l.max_items = 0),
+            Err(LimitsError::Zero("max_items"))
+        );
+        assert_eq!(
+            with(|l| l.root_wait = Duration::ZERO),
+            Err(LimitsError::Zero("root_wait"))
+        );
+        assert_eq!(
+            with(|l| l.root_retry = Duration::ZERO),
+            Err(LimitsError::Zero("root_retry"))
+        );
+        assert_eq!(
+            with(|l| l.first_asks_per_sec = 0),
+            Err(LimitsError::Zero("first_asks_per_sec"))
+        );
+        assert_eq!(
+            with(|l| l.first_ask_burst = 0),
+            Err(LimitsError::Zero("first_ask_burst"))
+        );
+        assert_eq!(
+            with(|l| l.retries_per_sec = 0),
+            Err(LimitsError::Zero("retries_per_sec"))
+        );
+        // The default retry share is exactly a retry of every seat each root_retry.
+        let short = with(|l| l.retries_per_sec = DEFAULT_RETRIES_PER_SEC - 1);
+        assert!(
+            matches!(short, Err(LimitsError::RetryShare { .. })),
+            "{short:?}"
+        );
+        assert!(with(|l| l.max_waiting_roots += 1).is_err());
+        assert_eq!(with(|l| l.root_retry = Duration::from_secs(1)), Ok(()));
+        // The reference view must have places past the seats.
+        let refs = RefLimits::default();
+        assert_eq!(defaults.validate_for(&refs), Ok(()));
+        let tight = RefLimits {
+            max_in_flight: defaults.max_waiting_roots,
+            ..refs
+        };
+        let err = defaults.validate_for(&tight).unwrap_err();
+        assert!(
+            matches!(err, LimitsError::SeatsFillTheReference { .. }),
+            "{err}"
+        );
+        assert!(with(|l| l.root_wait = Duration::ZERO).is_err());
+        let full = with(|l| l.max_asking_columns = 320);
+        assert!(
+            matches!(full, Err(LimitsError::WaitsFillTheQueue { .. })),
+            "{full:?}"
+        );
+        assert!(full.unwrap_err().to_string().contains("below max_items"));
+    }
+
+    #[test]
+    fn the_earliest_servable_slot_is_the_highest_bound() {
+        // Nothing stored: nothing to serve, whatever the other bounds say.
+        assert_eq!(earliest_servable_slot(None, Some(40), 16), None);
+        // Each bound in turn the highest.
+        assert_eq!(earliest_servable_slot(Some(17), None, 16), Some(17));
+        assert_eq!(earliest_servable_slot(Some(17), Some(40), 16), Some(41));
+        assert_eq!(earliest_servable_slot(Some(17), Some(9), 30), Some(30));
+        // A watermark at the last slot leaves nothing servable past it.
+        assert_eq!(earliest_servable_slot(Some(1), Some(Slot::MAX), 0), None);
+    }
+
+    #[test]
+    fn copies_are_charged_to_their_own_budget_and_the_gauges_report_both() {
+        let queue = queue(IngestLimits {
+            max_bytes: 100,
+            max_copy_bytes: 100,
+            alert_bytes: 120,
+            ..IngestLimits::default()
+        });
+        let mut a = queue.admit(60).unwrap();
+        let a_kzg = a.charge_copies(50, 20).unwrap();
+        assert_eq!(queue.metrics.buffer_bytes.get(), 130);
+        assert_eq!(queue.metrics.buffer_alert.get(), 1, "the copies count too");
+        let mut b = queue.admit(40).unwrap();
+        assert!(b.charge_copies(20, 11).is_none(), "past the copy cap");
+        assert!(b.charge_copies(usize::MAX, 1).is_none(), "no overflow");
+        let b_kzg = b.charge_copies(20, 10).unwrap();
+        assert_eq!(
+            *queue.lock(),
+            Pending {
+                items: 2,
+                bytes: 100,
+                copies: 100
+            }
+        );
+        // A place and its KZG charge are given back apart, in either order.
+        drop(a);
+        assert_eq!(queue.metrics.buffer_bytes.get(), 120);
+        drop(a_kzg);
+        assert_eq!(queue.metrics.buffer_bytes.get(), 70);
+        assert_eq!(queue.metrics.buffer_alert.get(), 0);
+        drop(b_kzg);
+        assert_eq!(queue.metrics.buffer_bytes.get(), 50);
+        drop(b);
+        assert_eq!(*queue.lock(), Pending::default());
+        assert_eq!(queue.metrics.buffer_bytes.get(), 0);
+    }
+
+    #[test]
+    fn the_kzg_copy_charge_covers_the_cells_twice() {
+        let sidecar = gloas::DataColumnSidecar::<crate::testing::Spec> {
+            index: 3,
+            column: vec![vec![7; 2048].try_into().unwrap(); 2]
+                .try_into()
+                .unwrap(),
+            kzg_proofs: vec![[1; 48]; 2].try_into().unwrap(),
+            slot: 9,
+            beacon_block_root: [2; 32].into(),
+        };
+        let per_cell = std::mem::size_of::<KzgCellProof>() + 48 + 2048 + 48;
+        assert_eq!(kzg_copy_bytes(&sidecar), 2 * 2 * per_cell);
     }
 
     #[test]

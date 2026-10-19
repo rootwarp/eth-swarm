@@ -119,7 +119,8 @@ impl ColumnReader {
 
     /// The lowest slot any column was ever stored at, `None` before the first column. Written in
     /// the transaction that stores that column, so it survives any crash together with it; pruning
-    /// never moves it.
+    /// never moves it. A historical minimum, not proof that anything from there on is held (see
+    /// [`FIRST_STORED_SLOT_KEY`](crate::keys::FIRST_STORED_SLOT_KEY)).
     pub fn first_stored_slot(&self) -> Result<Option<u64>> {
         let txn = self.db.begin_ro_txn()?;
         meta_u64(&txn, FIRST_STORED_SLOT_KEY)

@@ -6,6 +6,14 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# A seam for crash tests only (`ColumnWriter::set_before_commit`): a hook that runs in every
+# column write transaction after its puts and before its commit, so a test can kill the writer
+# mid-write. Only cl-chain's dev-dependencies enable it, so a normal build of a service leaves
+# it off; `--all-features` (or a dependent's tests in the same build) turns it on, so release
+# artifacts come from per-service builds without it.
+test-hooks = []
+
 [dependencies]
 # MPL-2.0, unmodified. Builds the native mdbx-sys 12.13.2. Exact pin: bumps need a dependency review.
 libmdbx = "=0.5.6"

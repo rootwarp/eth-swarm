@@ -10,9 +10,10 @@
 //! - **Pruning.** [`ColumnWriter::prune_finalized`] removes every column at or below the
 //!   finalized slot and records that slot as a watermark; later writes at or below it are
 //!   refused. [`ColumnWriter::prune_orphaned`] removes every column of orphaned block roots
-//!   after a reorg.
+//!   after a reorg and leaves a tombstone, so later writes of those roots are refused too.
 //! - **First stored slot.** [`ColumnReader::first_stored_slot`] is the lowest slot any column
-//!   was ever stored at, written in the same transaction as that column; pruning leaves it.
+//!   was ever stored at, written in the same transaction as that column; pruning leaves it. It
+//!   is a historical minimum, not proof that the data from there on is held.
 //! - **Custody.** The node's custody record lives in the same env for now
 //!   ([`ColumnWriter::set_custody`], [`ColumnReader::custody`]): the custody group count, which
 //!   never decreases ([`Error::CgcDecrease`]), the slot it was set at, the MetaData
@@ -42,9 +43,11 @@ pub use env::{WriterOptions, DEFAULT_MAX_SIZE, MAX_SIZE_ALIGN, MIN_MAX_SIZE};
 pub use error::{Error, Result};
 pub use keys::BlockRoot;
 pub use reader::{ColumnReader, CustodyRecord};
+#[cfg(feature = "test-hooks")]
+pub use writer::BeforeCommit;
 pub use writer::{
-    Column, ColumnWriter, PruneReport, WriteReport, MAX_COLUMNS_PER_TXN, MAX_ROWS_PER_PRUNE_TXN,
-    MAX_SIDECAR_BYTES,
+    Column, ColumnWriter, PruneReport, WriteReport, MAX_COLUMNS_PER_TXN, MAX_ORPHANED_ROOTS,
+    MAX_ROWS_PER_PRUNE_TXN, MAX_SIDECAR_BYTES,
 };
 
 /// `NUMBER_OF_COLUMNS` (Fulu `das-core.md`, unchanged in Gloas).

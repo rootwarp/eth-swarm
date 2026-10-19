@@ -60,6 +60,11 @@ impl RefBlock {
     }
 }
 
+/// Roots a [`RefView`] looks up at once by default \[est\]: twice the column store's default
+/// seats, so its seated roots' retries, all in flight together against a slow reference, leave
+/// as many places for first asks (`ColumnIngest::start` checks that some are left).
+pub const DEFAULT_MAX_IN_FLIGHT: usize = 32;
+
 /// The bounds of a [`RefView`] (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefLimits {
@@ -72,11 +77,12 @@ pub struct RefLimits {
 }
 
 impl Default for RefLimits {
-    /// [`DEFAULT_API_TIMEOUT`], 16 in flight, 64 cached (two mainnet epochs of blocks) \[est\].
+    /// [`DEFAULT_API_TIMEOUT`], [`DEFAULT_MAX_IN_FLIGHT`] in flight, 64 cached (two mainnet
+    /// epochs of blocks) \[est\].
     fn default() -> Self {
         Self {
             timeout: DEFAULT_API_TIMEOUT,
-            max_in_flight: 16,
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             max_cached: 64,
         }
     }
@@ -215,6 +221,18 @@ impl<A: ReferenceApi + BlockApi, E: EthSpec> RefView<A, E> {
         let block = Arc::new(RefBlock::of(root, &block.message));
         self.state().cache(block, self.limits.max_cached);
         root
+    }
+
+    /// The block `root` if it is cached, without asking the reference.
+    #[must_use]
+    pub fn cached_block(&self, root: &Root) -> Option<Arc<RefBlock>> {
+        self.state().cached.get(root).cloned()
+    }
+
+    /// The bounds this view was made with.
+    #[must_use]
+    pub fn limits(&self) -> RefLimits {
+        self.limits
     }
 
     /// Roots being looked up now.
@@ -403,7 +421,9 @@ mod tests {
         let api = Reference::default();
         let root = api.serve(9, 2);
         let refs = view(&api, RefLimits::default());
+        assert_eq!(refs.cached_block(&root), None);
         let block = refs.lookup(root).await.unwrap();
+        assert_eq!(refs.cached_block(&root), Some(Arc::clone(&block)));
         assert_eq!(
             *block,
             RefBlock {

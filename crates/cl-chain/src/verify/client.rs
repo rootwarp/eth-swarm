@@ -44,6 +44,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 use tonic::Streaming;
 
@@ -61,6 +62,10 @@ pub enum KzgOutcome {
     NoVerdict(String),
 }
 
+/// What a caller keeps charged for a request's cells (the column store's copy budget), handed
+/// to [`KzgVerifier::verify_cells_holding`] and dropped once the cells are gone.
+pub type Held = Box<dyn Send>;
+
 /// Checks cells by KZG, through cl-verify.
 pub trait KzgVerifier: Send + Sync {
     /// `verify_cell_kzg_proof_batch` over `cells`, with a verdict within `timeout` or none.
@@ -69,6 +74,45 @@ pub trait KzgVerifier: Send + Sync {
         cells: Vec<KzgCellProof>,
         timeout: Duration,
     ) -> impl Future<Output = KzgOutcome> + Send;
+
+    /// [`Self::verify_cells`], dropping `held` once `cells` are no longer held anywhere. By
+    /// default that is when the call returns; a verifier that queues the cells past its call
+    /// (the [`KzgClient`]) keeps `held` with them until they leave its queue.
+    fn verify_cells_holding(
+        &self,
+        cells: Vec<KzgCellProof>,
+        timeout: Duration,
+        held: Held,
+    ) -> impl Future<Output = KzgOutcome> + Send {
+        async move {
+            let outcome = self.verify_cells(cells, timeout).await;
+            drop(held);
+            outcome
+        }
+    }
+}
+
+/// One frame of the outbound queue, and what it holds charged until it leaves the queue.
+struct Outbound {
+    request: VerifyKzgRequest,
+    _held: Option<Held>,
+}
+
+impl From<VerifyKzgRequest> for Outbound {
+    fn from(request: VerifyKzgRequest) -> Self {
+        Self {
+            request,
+            _held: None,
+        }
+    }
+}
+
+/// The outbound queue as the stream tonic sends: each frame drops what it holds as it is taken
+/// off the queue to be sent, and every frame still queued drops it with the stream.
+fn outbound_frames(
+    outbound: mpsc::Receiver<Outbound>,
+) -> impl tokio_stream::Stream<Item = VerifyKzgRequest> + Send + 'static {
+    ReceiverStream::new(outbound).map(|frame| frame.request)
 }
 
 /// cl-chain's VerifyKzg client (see the module docs).
@@ -80,10 +124,42 @@ pub struct KzgClient {
     stream: Mutex<Option<KzgStream>>,
 }
 
+/// A stream's outbound queue. Closed for good once the stream ends: its sender is taken, so the
+/// queue, with any frame a call sent into it after the stream stopped taking them, is dropped as
+/// soon as the calls still holding a sender return, not when the stream is next replaced.
+#[derive(Clone)]
+struct Requests(Arc<std::sync::Mutex<Option<mpsc::Sender<Outbound>>>>);
+
+impl Requests {
+    fn new(sender: mpsc::Sender<Outbound>) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(sender))))
+    }
+
+    /// A sender for one call, while the queue is open.
+    fn sender(&self) -> Option<mpsc::Sender<Outbound>> {
+        self.slot().clone()
+    }
+
+    fn close(&self) {
+        drop(self.slot().take());
+    }
+
+    fn is_closed(&self) -> bool {
+        self.slot().as_ref().is_none_or(mpsc::Sender::is_closed)
+    }
+
+    /// The slot holds a sender or none: nothing a panic could leave half-set.
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<mpsc::Sender<Outbound>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// What a call uses of the open stream.
 #[derive(Clone)]
 struct Link {
-    requests: mpsc::Sender<VerifyKzgRequest>,
+    requests: Requests,
     calls: Calls<VerifyKzgResponseBody>,
     /// Held from reserving a frame's place through taking its `request_id` and sending it, so
     /// the ids go out in the order they were taken.
@@ -92,11 +168,14 @@ struct Link {
 
 impl Link {
     /// Sends one request for `cells` on this stream and waits for its verdict until `deadline`.
+    /// `held` goes into the queue with the frame, and is dropped when the frame leaves it; a
+    /// call that queues nothing drops it on return.
     async fn request(
         &self,
         cells: Vec<KzgCellProof>,
         deadline: Instant,
         unix_ms: u64,
+        held: Held,
     ) -> KzgOutcome {
         let late = no_verdict_by_the_deadline;
         let pending = {
@@ -105,14 +184,19 @@ impl Link {
             let Ok(_send) = tokio::time::timeout_at(deadline, self.send.lock()).await else {
                 return late();
             };
+            let closed = || {
+                self.requests.close();
+                self.calls.close();
+                KzgOutcome::NoVerdict("the VerifyKzg stream is closed".into())
+            };
+            let Some(sender) = self.requests.sender() else {
+                return closed();
+            };
             // The frame's place on the stream first, so an id is taken only once its send is
             // certain: a call cancelled or out of time before then holds no id.
-            let permit = match tokio::time::timeout_at(deadline, self.requests.reserve()).await {
+            let permit = match tokio::time::timeout_at(deadline, sender.reserve()).await {
                 Ok(Ok(permit)) => permit,
-                Ok(Err(_)) => {
-                    self.calls.close();
-                    return KzgOutcome::NoVerdict("the VerifyKzg stream is closed".into());
-                }
+                Ok(Err(_)) => return closed(),
                 Err(_) => return late(),
             };
             // A seam where a test cancels a call that has its frame's place and no id yet.
@@ -132,8 +216,11 @@ impl Link {
                 Ok(started) => started,
                 Err(e) => return KzgOutcome::NoVerdict(format!("not sent: {e}")),
             };
-            permit.send(VerifyKzgRequest {
-                frame: Some(verify_kzg_request::Frame::Body(body)),
+            permit.send(Outbound {
+                request: VerifyKzgRequest {
+                    frame: Some(verify_kzg_request::Frame::Body(body)),
+                },
+                _held: Some(held),
             });
             pending
         };
@@ -160,6 +247,7 @@ impl KzgStream {
 impl std::ops::Drop for KzgStream {
     fn drop(&mut self) {
         self.reader.abort();
+        self.link.requests.close();
         self.link.calls.close();
     }
 }
@@ -184,9 +272,15 @@ impl KzgClient {
         &self.metrics
     }
 
-    async fn call(&self, cells: Vec<KzgCellProof>, deadline: Instant, unix_ms: u64) -> KzgOutcome {
+    async fn call(
+        &self,
+        cells: Vec<KzgCellProof>,
+        deadline: Instant,
+        unix_ms: u64,
+        held: Held,
+    ) -> KzgOutcome {
         match tokio::time::timeout_at(deadline, self.live()).await {
-            Ok(Ok(link)) => link.request(cells, deadline, unix_ms).await,
+            Ok(Ok(link)) => link.request(cells, deadline, unix_ms, held).await,
             Ok(Err(why)) => KzgOutcome::NoVerdict(why),
             Err(_) => no_verdict_by_the_deadline(),
         }
@@ -212,13 +306,13 @@ impl KzgClient {
             frame: Some(verify_kzg_request::Frame::Hello(self.hello.clone())),
         };
         requests
-            .send(hello)
+            .send(hello.into())
             .await
             .map_err(|_| "the VerifyKzg stream is closed".to_owned())?;
         let mut responses = self
             .client
             .clone()
-            .verify_kzg(ReceiverStream::new(outbound))
+            .verify_kzg(outbound_frames(outbound))
             .await
             .map_err(|s| format!("VerifyKzg: {s}"))?
             .into_inner();
@@ -235,7 +329,8 @@ impl KzgClient {
         let generation = Generation::from_hello(&server).map_err(|e| e.to_string())?;
         let calls =
             Calls::with_metrics(generation, self.max_outstanding, Arc::clone(&self.metrics));
-        let reader = tokio::spawn(read(responses, calls.clone()));
+        let requests = Requests::new(requests);
+        let reader = tokio::spawn(read(responses, calls.clone(), requests.clone()));
         Ok(KzgStream {
             link: Link {
                 requests,
@@ -249,20 +344,41 @@ impl KzgClient {
 
 impl KzgVerifier for KzgClient {
     async fn verify_cells(&self, cells: Vec<KzgCellProof>, timeout: Duration) -> KzgOutcome {
+        self.verify_cells_holding(cells, timeout, Box::new(()))
+            .await
+    }
+
+    /// `held` stays with the request's frame until it leaves the outbound queue: a call that
+    /// runs out of time leaves its frame queued, cells and all.
+    async fn verify_cells_holding(
+        &self,
+        cells: Vec<KzgCellProof>,
+        timeout: Duration,
+        held: Held,
+    ) -> KzgOutcome {
         if cells.is_empty() {
             // An empty batch verifies vacuously; it is never sent and never valid.
             return KzgOutcome::NoVerdict("no cells".into());
         }
         let deadline = Instant::now() + timeout;
         let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
-        self.call(cells, deadline, now_unix_ms().saturating_add(timeout_ms))
-            .await
+        self.call(
+            cells,
+            deadline,
+            now_unix_ms().saturating_add(timeout_ms),
+            held,
+        )
+        .await
     }
 }
 
 /// Delivers every response body of a stream to its calls until the stream ends, errs or
 /// breaks the contract; then fails the calls still waiting.
-async fn read(mut responses: Streaming<VerifyKzgResponse>, calls: Calls<VerifyKzgResponseBody>) {
+async fn read(
+    mut responses: Streaming<VerifyKzgResponse>,
+    calls: Calls<VerifyKzgResponseBody>,
+    requests: Requests,
+) {
     loop {
         match responses.message().await {
             Ok(Some(VerifyKzgResponse {
@@ -284,6 +400,8 @@ async fn read(mut responses: Streaming<VerifyKzgResponse>, calls: Calls<VerifyKz
             }
         }
     }
+    // Nothing more is taken off the queue: close it, so what is left in it is dropped.
+    requests.close();
     calls.close();
 }
 
@@ -431,13 +549,13 @@ mod tests {
     async fn a_closed_stream_fails_the_call_and_its_calls() {
         let (requests, outbound) = mpsc::channel(1);
         let link = Link {
-            requests,
+            requests: Requests::new(requests),
             calls: Calls::new(Generation::new(7).unwrap(), 2),
             send: Arc::default(),
         };
         drop(outbound);
         let deadline = tokio::time::Instant::now() + TIMEOUT;
-        let outcome = link.request(column(1), deadline, 0).await;
+        let outcome = link.request(column(1), deadline, 0, Box::new(())).await;
         assert_eq!(
             outcome,
             KzgOutcome::NoVerdict("the VerifyKzg stream is closed".into())
@@ -450,30 +568,112 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_queued_request_holds_its_charge_until_it_leaves_the_queue() {
+        let (requests, outbound) = mpsc::channel(4);
+        let link = Link {
+            requests: Requests::new(requests),
+            calls: Calls::new(Generation::new(7).unwrap(), 4),
+            send: Arc::default(),
+        };
+        // cl-verify takes no frame: each call runs out of time with its frame still queued.
+        let charges: Vec<_> = (0..2).map(|_| Arc::new(())).collect();
+        for charge in &charges {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+            let held: Held = Box::new(Arc::clone(charge));
+            let outcome = link.request(column(1), deadline, 0, held).await;
+            assert_eq!(outcome, super::no_verdict_by_the_deadline());
+            assert_eq!(Arc::strong_count(charge), 2, "queued: still charged");
+        }
+        // The first frame leaves the queue for the wire: its charge goes with it.
+        let mut frames = outbound_frames(outbound);
+        let frame = frames.next().await.unwrap();
+        assert!(matches!(
+            frame.frame,
+            Some(verify_kzg_request::Frame::Body(_))
+        ));
+        assert_eq!(Arc::strong_count(&charges[0]), 1);
+        assert_eq!(Arc::strong_count(&charges[1]), 2);
+        // The stream is discarded with a frame still queued: that charge goes with it.
+        drop((frames, link));
+        assert_eq!(Arc::strong_count(&charges[1]), 1);
+    }
+
+    #[tokio::test]
+    async fn a_frame_sent_into_an_ended_stream_is_released_when_its_queue_closes() {
+        let (sender, outbound) = mpsc::channel(4);
+        let requests = Requests::new(sender);
+        let charge = Arc::new(());
+        // A call reserved its frame's place just before the stream stopped taking frames, and
+        // sends after: the frame is stranded in the queue.
+        let call = requests.sender().unwrap();
+        let permit = call.reserve().await.unwrap();
+        drop(outbound);
+        permit.send(Outbound {
+            request: VerifyKzgRequest::default(),
+            _held: Some(Box::new(Arc::clone(&charge))),
+        });
+        drop(call);
+        assert_eq!(Arc::strong_count(&charge), 2, "stranded, still charged");
+        assert!(requests.is_closed());
+        // The stream's end closes the queue: the frame and its charge go with it.
+        requests.close();
+        assert_eq!(Arc::strong_count(&charge), 1);
+        assert!(requests.sender().is_none());
+    }
+
+    /// A verifier without a queue of its own holds the charge until its call returns.
+    #[tokio::test]
+    async fn the_default_holds_the_charge_for_the_call() {
+        struct Answers(Arc<()>);
+        impl KzgVerifier for Answers {
+            async fn verify_cells(&self, _: Vec<KzgCellProof>, _: Duration) -> KzgOutcome {
+                assert_eq!(Arc::strong_count(&self.0), 3, "held during the call");
+                KzgOutcome::Valid
+            }
+        }
+        let charge = Arc::new(());
+        let verifier = Answers(Arc::clone(&charge));
+        let held: Held = Box::new(Arc::clone(&charge));
+        let outcome = verifier
+            .verify_cells_holding(column(1), TIMEOUT, held)
+            .await;
+        assert_eq!(outcome, KzgOutcome::Valid);
+        assert_eq!(
+            Arc::strong_count(&charge),
+            2,
+            "only the verifier's own copy"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_send_that_times_out_holds_no_slot() {
         let capacity = 2;
         let (requests, mut outbound) = mpsc::channel(1);
         let link = Link {
-            requests,
+            requests: Requests::new(requests),
             calls: Calls::new(Generation::new(7).unwrap(), capacity),
             send: Arc::default(),
         };
         // The stream takes no frame: every send waits until its deadline.
-        link.requests.try_send(VerifyKzgRequest::default()).unwrap();
+        link.requests
+            .sender()
+            .unwrap()
+            .try_send(VerifyKzgRequest::default().into())
+            .unwrap();
         for _ in 0..=capacity {
             let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
-            let outcome = link.request(column(1), deadline, 0).await;
+            let outcome = link.request(column(1), deadline, 0, Box::new(())).await;
             assert!(matches!(outcome, KzgOutcome::NoVerdict(_)), "{outcome:?}");
         }
         // The stream drains: the next request is sent, with the first id of the stream.
         outbound.try_recv().unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
         let (outcome, sent) = tokio::join!(
-            link.request(column(1), deadline, 0),
+            link.request(column(1), deadline, 0, Box::new(())),
             tokio::time::timeout(TIMEOUT, outbound.recv()),
         );
         assert!(matches!(outcome, KzgOutcome::NoVerdict(_)), "{outcome:?}");
-        let sent = sent.expect("the request was sent").unwrap();
+        let sent = sent.expect("the request was sent").unwrap().request;
         let Some(verify_kzg_request::Frame::Body(body)) = sent.frame else {
             panic!("{sent:?}");
         };

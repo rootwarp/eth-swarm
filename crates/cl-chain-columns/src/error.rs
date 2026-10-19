@@ -43,6 +43,11 @@ pub enum Error {
     /// and must not come back.
     #[error("slot {slot} is at or below the finalized slot {finalized_slot}")]
     SlotFinalized { slot: u64, finalized_slot: u64 },
+    /// The block root was pruned as an orphan
+    /// ([`ColumnWriter::prune_orphaned`](crate::ColumnWriter::prune_orphaned)); its columns must
+    /// not come back.
+    #[error("block root was pruned as an orphan")]
+    RootOrphaned,
     /// A block root maps to exactly one slot; a write named a different one.
     #[error("block root is stored at slot {stored}, write named slot {given}")]
     SlotMismatch { stored: u64, given: u64 },

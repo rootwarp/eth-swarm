@@ -42,8 +42,13 @@ pub const ADVERTISED_CGC_KEY: &[u8] = b"advertised_cgc";
 /// covered. Writes at or below it are refused, so a late write cannot undo a prune.
 pub const FINALIZED_SLOT_KEY: &[u8] = b"finalized_slot";
 /// [`META_TABLE`] key of the lowest slot any column was ever stored at, written in the
-/// transaction that stores that column. Pruning never moves it: it records where storing began,
-/// the slot Status `earliest_available_slot` is derived from.
+/// transaction that stores that column. Pruning never moves it: it records where storing began.
+///
+/// A historical minimum, not proof that the data is held: one column lowers it even if the
+/// block's other custody columns never arrive, pruning leaves it below the data that remains,
+/// and raising the custody group count does not move it. Status `earliest_available_slot` is
+/// derived from it but never equal to it alone: it is the highest of this slot, the slot after
+/// [`FINALIZED_SLOT_KEY`] and [`CGC_SET_SLOT_KEY`].
 pub const FIRST_STORED_SLOT_KEY: &[u8] = b"first_stored_slot";
 
 /// Length of a [`column_key`].

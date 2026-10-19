@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, VecDeque},
     path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -29,6 +30,12 @@ pub const MAX_COLUMNS_PER_TXN: usize = 16;
 /// Most rows one finality-prune transaction deletes. Blocks are never split across
 /// transactions, and one block holds at most [`NUMBER_OF_COLUMNS`] rows, so this is a hard cap.
 pub const MAX_ROWS_PER_PRUNE_TXN: u64 = NUMBER_OF_COLUMNS;
+
+/// Most orphan tombstones a writer keeps \[est\]: roots [`ColumnWriter::prune_orphaned`] pruned,
+/// whose late columns [`ColumnWriter::write_columns`] refuses. A tombstone is forgotten once
+/// finality covers its slot (the watermark refuses those writes from then on), or, oldest first,
+/// once this many are kept. Reorgs orphan a block or two at a time, so this covers days of them.
+pub const MAX_ORPHANED_ROOTS: usize = 1024;
 
 /// Largest sidecar value accepted. A policy bound, not a type bound: the largest SSZ encoding of
 /// a Fulu `DataColumnSidecar`, applied to both forks.
@@ -86,6 +93,84 @@ enum Commit<T> {
 
 type RwTxn<'db> = Transaction<'db, RW, NoWriteMap>;
 
+/// Orphan tombstones: roots pruned by [`ColumnWriter::prune_orphaned`], with their slot if any
+/// column of them was stored, so no later write brings them back (see
+/// [`MAX_ORPHANED_ROOTS`]). Kept in memory: a restart forgets them, and with them the columns
+/// in flight that they guard against.
+#[derive(Debug, Default)]
+struct Orphans {
+    slots: HashMap<BlockRoot, Option<u64>>,
+    /// Insertion order of `slots`, oldest first.
+    order: VecDeque<BlockRoot>,
+}
+
+impl Orphans {
+    fn contains(&self, block_root: &BlockRoot) -> bool {
+        self.slots.contains_key(block_root)
+    }
+
+    /// Adds a tombstone for `block_root`, or fills in the slot of the one it has.
+    fn insert(&mut self, block_root: BlockRoot, slot: Option<u64>) {
+        if let Some(known) = self.slots.get_mut(&block_root) {
+            if slot.is_some() {
+                *known = slot;
+            }
+            return;
+        }
+        while self.slots.len() >= MAX_ORPHANED_ROOTS {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.slots.remove(&oldest);
+        }
+        self.order.push_back(block_root);
+        self.slots.insert(block_root, slot);
+    }
+
+    /// Forgets the tombstone of `block_root`.
+    fn remove(&mut self, block_root: &BlockRoot) {
+        if self.slots.remove(block_root).is_some() {
+            self.order.retain(|root| root != block_root);
+        }
+    }
+
+    /// Forgets the tombstones at or below `finalized_slot`.
+    fn forget_finalized(&mut self, finalized_slot: u64) {
+        self.slots
+            .retain(|_, slot| slot.is_none_or(|slot| slot > finalized_slot));
+        let slots = &self.slots;
+        self.order.retain(|root| slots.contains_key(root));
+    }
+}
+
+/// A hook run in each column write transaction after its puts and before its commit, with the
+/// block's slot ([`ColumnWriter::set_before_commit`]).
+#[cfg(feature = "test-hooks")]
+pub type BeforeCommit = Box<dyn Fn(u64) + Send + Sync>;
+
+/// The test hooks of a [`ColumnWriter`]: none in a build without the `test-hooks` feature.
+#[derive(Default)]
+struct Hooks {
+    #[cfg(feature = "test-hooks")]
+    before_commit: std::sync::OnceLock<BeforeCommit>,
+}
+
+impl std::fmt::Debug for Hooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hooks").finish_non_exhaustive()
+    }
+}
+
+impl Hooks {
+    /// Runs the before-commit hook, if one is set.
+    fn before_commit(&self, _slot: u64) {
+        #[cfg(feature = "test-hooks")]
+        if let Some(hook) = self.before_commit.get() {
+            hook(_slot);
+        }
+    }
+}
+
 /// The only handle that writes the column env. cl-chain owns it.
 ///
 /// [`ColumnWriter::open`] takes the writer guard first, so a second writer for the same path, in
@@ -105,10 +190,12 @@ pub struct ColumnWriter {
     // Field order is drop order: close the data env before releasing the guard.
     reader: ColumnReader,
     /// Serialises column writes and prunes, so a prune never lands between two chunks of one
-    /// block's write and leaves the later chunks behind as orphans.
-    column_ops: Mutex<()>,
+    /// block's write and leaves the later chunks behind as orphans. Holds the orphan
+    /// tombstones, checked by every write under the same lock.
+    column_ops: Mutex<Orphans>,
     sched: TxnScheduler,
     rw_txns: AtomicU64,
+    hooks: Hooks,
     _guard: env::Env,
 }
 
@@ -126,9 +213,10 @@ impl ColumnWriter {
         let db = env::open_rw(path, options)?;
         Ok(Self {
             reader: ColumnReader::from_env(db),
-            column_ops: Mutex::new(()),
+            column_ops: Mutex::default(),
             sched: TxnScheduler::default(),
             rw_txns: AtomicU64::new(0),
+            hooks: Hooks::default(),
             _guard: guard,
         })
     }
@@ -137,6 +225,14 @@ impl ColumnWriter {
     #[must_use]
     pub fn reader(&self) -> &ColumnReader {
         &self.reader
+    }
+
+    /// Sets the hook every column write transaction runs after its puts and before its commit,
+    /// with the block's slot; only the first call sets it. A crash-test seam: a hook that blocks
+    /// holds the transaction open, uncommitted, for as long as it blocks.
+    #[cfg(feature = "test-hooks")]
+    pub fn set_before_commit(&self, hook: BeforeCommit) {
+        let _ = self.hooks.before_commit.set(hook);
     }
 
     /// Write transactions this handle has committed since [`ColumnWriter::open`] returned.
@@ -152,7 +248,8 @@ impl ColumnWriter {
     /// The batch is validated before the first transaction: at most [`NUMBER_OF_COLUMNS`]
     /// columns, each index below it and unique, each value non-empty and at most
     /// [`MAX_SIDECAR_BYTES`], and the slot above the finalized-slot watermark
-    /// ([`Error::SlotFinalized`]). A column already stored under the same key is replaced. Each
+    /// ([`Error::SlotFinalized`]), and the root not pruned as an orphan ([`Error::RootOrphaned`],
+    /// [`Self::prune_orphaned`]). A column already stored under the same key is replaced. Each
     /// transaction that stores a column below the first stored slot
     /// ([`ColumnReader::first_stored_slot`]) also lowers it to `slot`.
     pub fn write_columns(
@@ -162,15 +259,30 @@ impl ColumnWriter {
         columns: &[Column<'_>],
     ) -> Result<WriteReport> {
         validate_batch(columns)?;
-        let _ops = lock(&self.column_ops);
-        // Under `column_ops`, so no finality prune can move the watermark until this returns.
-        if let Some(finalized_slot) = self.reader.finalized_slot()? {
-            if slot <= finalized_slot {
-                return Err(Error::SlotFinalized {
-                    slot,
-                    finalized_slot,
-                });
+        let mut orphans = lock(&self.column_ops);
+        // Under `column_ops`, so no finality prune can move the watermark, and no reorg prune
+        // can orphan the root, until this returns.
+        let finalized_slot = self.reader.finalized_slot()?;
+        let finalized = finalized_slot.filter(|&finalized_slot| slot <= finalized_slot);
+        let orphaned = orphans.contains(block_root);
+        if orphaned {
+            // A tombstone laid before any column of the root was stored learns its slot from
+            // the first late write, before any other check, so finality forgets it in its turn;
+            // at once if finality already covers that slot.
+            if finalized.is_some() {
+                orphans.remove(block_root);
+            } else {
+                orphans.insert(*block_root, Some(slot));
             }
+        }
+        if let Some(finalized_slot) = finalized {
+            return Err(Error::SlotFinalized {
+                slot,
+                finalized_slot,
+            });
+        }
+        if orphaned {
+            return Err(Error::RootOrphaned);
         }
         let mut report = WriteReport::default();
         for (i, chunk) in columns.chunks(MAX_COLUMNS_PER_TXN).enumerate() {
@@ -178,7 +290,9 @@ impl ColumnWriter {
                 thread::yield_now();
             }
             self.write_txn(Priority::Background, |txn| {
-                write_chunk(txn, slot, block_root, chunk).map(Commit::Yes)
+                write_chunk(txn, slot, block_root, chunk)?;
+                self.hooks.before_commit(slot);
+                Ok(Commit::Yes(()))
             })?;
             report.columns += chunk.len();
             report.transactions += 1;
@@ -188,22 +302,28 @@ impl ColumnWriter {
     }
 
     /// Reorg pruning: removes every column of each orphaned block root, one write transaction
-    /// per block (at most [`NUMBER_OF_COLUMNS`] rows), yielding between blocks. Unknown roots are
-    /// skipped.
+    /// per block (at most [`NUMBER_OF_COLUMNS`] rows), yielding between blocks, and leaves a
+    /// tombstone for each root, stored or not: [`Self::write_columns`] refuses the root from
+    /// then on ([`Error::RootOrphaned`]), so columns still in flight cannot bring it back. The
+    /// tombstone is laid before the root's rows are removed, so it stands even if that fails.
+    /// An orphaned root stays orphaned until finality covers its slot ([`MAX_ORPHANED_ROOTS`]):
+    /// a reorg back to it does not re-admit its columns. Unknown roots have no rows to remove.
     pub fn prune_orphaned(&self, block_roots: &[BlockRoot]) -> Result<PruneReport> {
-        let _ops = lock(&self.column_ops);
+        let mut orphans = lock(&self.column_ops);
         let mut report = PruneReport::default();
         for (i, block_root) in block_roots.iter().enumerate() {
             if i > 0 {
                 thread::yield_now();
             }
+            orphans.insert(*block_root, None);
             let removed = self.write_txn(Priority::Background, |txn| {
                 Ok(match prune_block(txn, block_root)? {
-                    Some(columns) => Commit::Yes(Some(columns)),
+                    Some(removed) => Commit::Yes(Some(removed)),
                     None => Commit::No(None),
                 })
             })?;
-            if let Some(columns) = removed {
+            if let Some((slot, columns)) = removed {
+                orphans.insert(*block_root, Some(slot));
                 report.columns += columns;
                 report.blocks += 1;
             }
@@ -218,7 +338,7 @@ impl ColumnWriter {
     /// slots. Also the backstop for orphans: any row left behind is removed once its slot
     /// finalizes.
     pub fn prune_finalized(&self, finalized_slot: u64) -> Result<PruneReport> {
-        let _ops = lock(&self.column_ops);
+        let mut orphans = lock(&self.column_ops);
         let mut report = PruneReport::default();
         loop {
             let (batch, more) = self.write_txn(Priority::Background, |txn| {
@@ -233,6 +353,9 @@ impl ColumnWriter {
             report.columns += batch.columns;
             report.blocks += batch.blocks;
             if !more {
+                // The watermark is raised by now, and refuses every write the tombstones at or
+                // below it guard against.
+                orphans.forget_finalized(finalized_slot);
                 return Ok(report);
             }
             thread::yield_now();
@@ -293,8 +416,9 @@ impl ColumnWriter {
     }
 }
 
-/// The guarded state is `()`, so a panic elsewhere cannot leave it inconsistent.
-fn lock(mutex: &Mutex<()>) -> MutexGuard<'_, ()> {
+/// Every update of the guarded tombstones is one call that cannot panic halfway, so a panic
+/// elsewhere cannot leave them inconsistent.
+fn lock(mutex: &Mutex<Orphans>) -> MutexGuard<'_, Orphans> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -394,9 +518,9 @@ fn write_chunk(
     Ok(())
 }
 
-/// Removes one block's columns and its root entry; returns the number of columns removed,
-/// `None` if the block is not stored.
-fn prune_block(txn: &RwTxn<'_>, block_root: &BlockRoot) -> Result<Option<u64>> {
+/// Removes one block's columns and its root entry; returns its slot and the number of columns
+/// removed, `None` if the block is not stored.
+fn prune_block(txn: &RwTxn<'_>, block_root: &BlockRoot) -> Result<Option<(u64, u64)>> {
     let Some(slot) = stored_slot(txn, block_root)? else {
         return Ok(None);
     };
@@ -407,7 +531,7 @@ fn prune_block(txn: &RwTxn<'_>, block_root: &BlockRoot) -> Result<Option<u64>> {
     }
     let roots = txn.open_table(Some(ROOTS_TABLE))?;
     txn.del(&roots, block_root, None)?;
-    Ok(Some(rows.len() as u64))
+    Ok(Some((slot, rows.len() as u64)))
 }
 
 /// One finality-prune transaction. Rows are deleted from the start of the key space, so the
@@ -927,6 +1051,112 @@ mod tests {
         assert_eq!(writer.rw_txns_committed() - before, 4);
         assert_eq!(writer.reader().column_count().unwrap(), 0);
         assert_eq!(writer.reader().block_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_write_cannot_bring_back_an_orphaned_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        write_block(&writer, 5, &ROOT_A, &[0, 1]);
+        writer.prune_orphaned(&[ROOT_A]).unwrap();
+        // Columns of the orphan that were still in flight when it was pruned.
+        let late = [Column {
+            index: 2,
+            ssz: b"x",
+        }];
+        assert!(matches!(
+            writer.write_columns(5, &ROOT_A, &late),
+            Err(Error::RootOrphaned)
+        ));
+        // A root pruned before any column of it was stored is refused too.
+        writer.prune_orphaned(&[ROOT_B]).unwrap();
+        assert!(matches!(
+            writer.write_columns(6, &ROOT_B, &late),
+            Err(Error::RootOrphaned)
+        ));
+        let reader = writer.reader();
+        assert_eq!(reader.slot_of(&ROOT_A).unwrap(), None);
+        assert_eq!(reader.slot_of(&ROOT_B).unwrap(), None);
+        assert_eq!(reader.column_count().unwrap(), 0);
+        // Other roots, at the same slots, still store.
+        write_block(&writer, 5, &[0xcc; 32], &[2]);
+        assert_eq!(reader.column_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_slotless_tombstone_whose_late_write_is_finalized_is_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        writer.prune_orphaned(&[ROOT_B]).unwrap();
+        writer.prune_finalized(10).unwrap();
+        assert!(lock(&writer.column_ops).contains(&ROOT_B), "no slot: kept");
+        // Its first late write lands after finality: refused by the watermark, which refuses
+        // the root's slot from now on, so the tombstone is no longer needed.
+        let late = [Column {
+            index: 2,
+            ssz: b"x",
+        }];
+        assert!(matches!(
+            writer.write_columns(5, &ROOT_B, &late),
+            Err(Error::SlotFinalized { slot: 5, .. })
+        ));
+        assert!(!lock(&writer.column_ops).contains(&ROOT_B));
+        assert_eq!(lock(&writer.column_ops).order.len(), 0);
+    }
+
+    #[test]
+    fn a_tombstone_learns_its_slot_from_a_refused_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        // Pruned before any column of it was stored: no slot yet.
+        writer.prune_orphaned(&[ROOT_B]).unwrap();
+        assert_eq!(lock(&writer.column_ops).slots.get(&ROOT_B), Some(&None));
+        let late = [Column {
+            index: 2,
+            ssz: b"x",
+        }];
+        assert!(matches!(
+            writer.write_columns(6, &ROOT_B, &late),
+            Err(Error::RootOrphaned)
+        ));
+        assert_eq!(lock(&writer.column_ops).slots.get(&ROOT_B), Some(&Some(6)));
+        // So finality at its slot forgets it.
+        writer.prune_finalized(6).unwrap();
+        assert!(!lock(&writer.column_ops).contains(&ROOT_B));
+    }
+
+    #[test]
+    fn orphan_tombstones_are_bounded_and_forgotten_once_finalized() {
+        let mut orphans = Orphans::default();
+        let root = |i: usize| {
+            let mut root = [0u8; 32];
+            root[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            root
+        };
+        for i in 0..=MAX_ORPHANED_ROOTS {
+            orphans.insert(root(i), Some(i as u64));
+        }
+        assert_eq!(orphans.slots.len(), MAX_ORPHANED_ROOTS);
+        assert!(!orphans.contains(&root(0)), "the oldest is forgotten");
+        assert!(orphans.contains(&root(1)));
+        // A root pruned again keeps its place; its slot is filled in once known.
+        orphans.insert(root(7), None);
+        orphans.insert([0xee; 32], None);
+        orphans.insert([0xee; 32], Some(3));
+        // Finality forgets the tombstones it covers: the watermark refuses those slots anyway.
+        orphans.forget_finalized(500);
+        assert!(!orphans.contains(&root(500)) && !orphans.contains(&[0xee; 32]));
+        assert!(
+            !orphans.contains(&root(7)),
+            "pruned again, it kept its known slot"
+        );
+        assert!(orphans.contains(&root(501)));
+        assert_eq!(orphans.order.len(), orphans.slots.len());
+        // A tombstone with no slot is kept until it is evicted.
+        orphans.insert([0xdd; 32], None);
+        orphans.forget_finalized(u64::MAX);
+        assert!(orphans.contains(&[0xdd; 32]));
+        assert_eq!(orphans.slots.len(), 1);
     }
 
     #[test]

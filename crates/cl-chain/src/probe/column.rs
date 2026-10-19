@@ -25,13 +25,16 @@
 //! The cheap local checks (1 to 3) come first, so a column that cannot be ours never costs a
 //! reference request or a KZG check. Every drop increments `probe_column_dropped_total{reason}`
 //! ([`ColumnMetrics`]); the column store ([`super::ColumnIngest`]) adds `root_timeout` (the
-//! root stayed unknown past its wait) and `store_failed` (the column env refused the write).
+//! root stayed unknown past its wait, or the column arrived while the root is remembered from
+//! such a wait), `root_wait_full` (the root wait had no place or turn for it) and `store_failed`
+//! (the column env refused the write), and `unknown_root` for a root its wait found refused.
+//! [`Drop::ALL`] is the whole label set: the counter's cardinality is fixed.
 //! Only a [`Verified`] column can be stored ([`store_verified`]), and only [`storage_contract`]
 //! makes one.
 
-use super::{BlockApi, RefView, ReferenceApi};
+use super::{BlockApi, RefBlock, RefView, ReferenceApi};
 use crate::da::custody::Custody;
-use crate::verify::client::{KzgOutcome, KzgVerifier};
+use crate::verify::client::{Held, KzgOutcome, KzgVerifier};
 use consensus_types::das::{compute_subnet_for_data_column_sidecar, NUMBER_OF_COLUMNS};
 use consensus_types::{gloas, EthSpec};
 use ethswarm_proto::verify::KzgCellProof;
@@ -67,17 +70,24 @@ pub enum Drop {
     /// The sidecar's slot is before `cgc_set_slot`: no backfill.
     #[error("before_cgc_set_slot")]
     BeforeCustodySlot,
-    /// The block root stayed unknown to the reference for the whole root wait.
+    /// The block root stayed unknown to the reference for the whole root wait, or the column
+    /// arrived while the root is remembered from such a wait.
     #[error("root_timeout")]
     RootTimeout,
     /// The column passed the contract, but the column env did not store it.
     #[error("store_failed")]
     StoreFailed,
+    /// Its root is not known yet and the root wait has no place for it: too many roots or
+    /// columns wait already, as many columns of the same index wait for the same root as may
+    /// ([`super::MAX_CANDIDATES_PER_INDEX`]), the root's first ask has no turn before its wait
+    /// ends, or the root is remembered from finding no seat.
+    #[error("root_wait_full")]
+    RootWaitFull,
 }
 
 impl Drop {
-    /// Every reason.
-    pub const ALL: [Drop; 9] = [
+    /// Every reason: the fixed label set of `probe_column_dropped_total{reason}`.
+    pub const ALL: [Drop; 10] = [
         Drop::UnknownRoot,
         Drop::KzgInvalid,
         Drop::CommitmentsMismatch,
@@ -87,6 +97,7 @@ impl Drop {
         Drop::BeforeCustodySlot,
         Drop::RootTimeout,
         Drop::StoreFailed,
+        Drop::RootWaitFull,
     ];
 
     /// The `reason` label.
@@ -102,6 +113,7 @@ impl Drop {
             Drop::BeforeCustodySlot => "before_cgc_set_slot",
             Drop::RootTimeout => "root_timeout",
             Drop::StoreFailed => "store_failed",
+            Drop::RootWaitFull => "root_wait_full",
         }
     }
 }
@@ -191,7 +203,46 @@ where
     A: ReferenceApi + BlockApi,
     V: KzgVerifier,
 {
-    let checked = check(column, refs, custody, contract).await;
+    let checked = async {
+        local_check(column, custody)?;
+        let root = column.sidecar.beacon_block_root.0;
+        let block = refs.lookup(root).await.map_err(|e| {
+            tracing::debug!(error = %e, "column root not vouched for by the reference");
+            Drop::UnknownRoot
+        })?;
+        check_vouched(column, &block, contract, Box::new(())).await
+    };
+    counted(column, contract, checked.await)
+}
+
+/// [`storage_contract`] for a column whose root the reference already vouched for as `block`
+/// (looked up once, by the column store's root wait), handing `held` to cl-verify's client with
+/// the cells ([`KzgVerifier::verify_cells_holding`]): it is dropped once the cells copied for
+/// the check are gone, or when the check ends before KZG.
+pub(crate) async fn vouched_contract<'a, E, V, S, C>(
+    column: &'a GossipColumn<E>,
+    block: &RefBlock,
+    custody: &Custody<S, C>,
+    contract: &ColumnContract<V>,
+    held: Held,
+) -> Result<Verified<'a, E>, Drop>
+where
+    E: EthSpec,
+    V: KzgVerifier,
+{
+    let checked = async {
+        local_check(column, custody)?;
+        check_vouched(column, block, contract, held).await
+    };
+    counted(column, contract, checked.await)
+}
+
+/// Counts a drop in `contract.metrics`, and makes a [`Verified`] of a column that passed.
+fn counted<'a, E: EthSpec, V>(
+    column: &'a GossipColumn<E>,
+    contract: &ColumnContract<V>,
+    checked: Result<(), Drop>,
+) -> Result<Verified<'a, E>, Drop> {
     if let Err(reason) = checked {
         contract.metrics.drop_column(column, reason);
     }
@@ -230,27 +281,20 @@ pub(crate) fn local_check<E: EthSpec, S, C>(
     Ok(())
 }
 
-async fn check<E, A, V, S, C>(
+/// Checks 4 (its slot) to 6 of the module docs against `block`, the block the reference
+/// vouches for as the column's root.
+async fn check_vouched<E, V>(
     column: &GossipColumn<E>,
-    refs: &RefView<A, E>,
-    custody: &Custody<S, C>,
+    block: &RefBlock,
     contract: &ColumnContract<V>,
+    held: Held,
 ) -> Result<(), Drop>
 where
     E: EthSpec,
-    A: ReferenceApi + BlockApi,
     V: KzgVerifier,
 {
-    local_check(column, custody)?;
     let sidecar = &column.sidecar;
-    let block = refs
-        .lookup(sidecar.beacon_block_root.0)
-        .await
-        .map_err(|e| {
-            tracing::debug!(error = %e, "column root not vouched for by the reference");
-            Drop::UnknownRoot
-        })?;
-    if block.slot != sidecar.slot {
+    if block.root != sidecar.beacon_block_root.0 || block.slot != sidecar.slot {
         return Err(Drop::UnknownRoot);
     }
     if block.commitments.len() != sidecar.column.len() {
@@ -269,7 +313,7 @@ where
         .collect();
     match contract
         .kzg
-        .verify_cells(cells, contract.verify_timeout)
+        .verify_cells_holding(cells, contract.verify_timeout, held)
         .await
     {
         KzgOutcome::Valid => Ok(()),
