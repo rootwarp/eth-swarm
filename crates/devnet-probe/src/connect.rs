@@ -3,26 +3,36 @@
 //!
 //! One swarm per peer, no listener, dropped once its dial ended: a dial that timed out cannot
 //! complete during the next peer's, so the muxer a swarm reports is its own peer's. The dial
-//! names the peer ID (`DialOpts::peer_id`), so an established connection means TCP connected,
-//! Noise XX proved that identity, and multistream-select confirmed a muxer (two are offered,
-//! yamux first, so the lazy negotiation of a single protocol does not apply).
+//! names the peer ID (`DialOpts::peer_id`), so an established connection means TCP connected
+//! and Noise XX proved that identity.
 //!
-//! The criterion is yamux, and a connection on yamux passes. A connection on mplex passes only
-//! as a recorded deviation, labelled `peer offers no yamux: recorded deviation` in its PASS
-//! line, and only when our dial proposed yamux before mplex ([`our_offer`], cl-p2p's
-//! [`muxers`]): as dialer we propose the muxers one at a time, in order, and the peer either
-//! accepts a proposal or refuses it (`na`). A yamux-capable peer accepts our first proposal and
-//! negotiates yamux, so mplex on our dial means the peer refused yamux: it offers none (a TCP
-//! client MUST support mplex and MAY support yamux, so it is within the spec, short of the
-//! criterion). mplex without yamux proposed before it, or any other muxer, fails.
+//! The muxer is negotiated by multistream-select in its lazy form (`Version::V1Lazy`): as
+//! dialer we propose the muxers one at a time, in order (yamux, then mplex: [`our_offer`],
+//! cl-p2p's [`muxers`]), and the peer accepts a proposal or refuses it (`na`). The dialer waits
+//! for the peer's answer to every proposal but the last; on the last it settles at once and
+//! sends its data behind it. So yamux, our first proposal, is confirmed by the peer before the
+//! connection is established, and a connection on yamux passes then. mplex, our last, is not:
+//! the mplex upgrade does no I/O of its own, so an established connection on mplex shows only
+//! that the peer refused yamux, not that it accepted mplex (a peer that refused both is
+//! established too, until its `na` is read).
 //!
-//! The swarm carries no gossipsub: the verdict is given when the connection is established,
-//! before anything runs over it.
+//! A connection on mplex therefore passes only after one confirmed round trip over it within
+//! the dial's timeout: the peer's identify answer (`identify::Event::Received` on that
+//! connection), which reaches us only if the peer accepted mplex. It then passes as a recorded
+//! deviation, labelled `peer offers no yamux: recorded deviation` in its PASS line and recorded
+//! as [`MPLEX_DEVIATION_LABEL`] for the check's summary and the verdict, and only when our dial
+//! proposed yamux before mplex: a yamux-capable peer accepts our first proposal, so mplex on
+//! our dial means the peer offers no yamux (a TCP client MUST support mplex and MAY support
+//! yamux, so it is within the spec, short of the criterion). mplex without yamux proposed
+//! before it, mplex the peer never answers over, or any other muxer, fails.
+//!
+//! The swarm carries no gossipsub: a yamux verdict waits for nothing past the connection, and
+//! an mplex verdict for nothing but identify.
 
 use super::devnet::Devnet;
 use super::report::Check;
 use super::swarm::{error_chain, probe_swarm, SwarmPlan};
-use cl_p2p::behaviour::SpecBehaviour;
+use cl_p2p::behaviour::{SpecBehaviour, SpecBehaviourEvent};
 use cl_p2p::m2a_session::PinnedPeer;
 use cl_p2p::rpc::inbound::SharedStatus;
 use cl_p2p::transport::{
@@ -31,11 +41,13 @@ use cl_p2p::transport::{
 use consensus_types::EthSpec;
 use futures::StreamExt;
 use libp2p::core::upgrade::UpgradeInfo;
+use libp2p::identify;
 use libp2p::swarm::dial_opts::DialOpts;
-use libp2p::swarm::SwarmEvent;
+use libp2p::swarm::{ConnectionId, SwarmEvent};
 use libp2p::Swarm;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
+use tokio::time::Instant;
 
 /// The check's name.
 pub const NAME: &str = "connect";
@@ -45,6 +57,9 @@ pub const YAMUX: &str = "/yamux/1.0.0";
 pub const MPLEX: &str = "/mplex/6.7.0";
 /// The label of a connection on mplex to a peer that refused our yamux proposal.
 pub const MPLEX_DEVIATION: &str = "peer offers no yamux: recorded deviation";
+/// The recorded deviation of a connection on mplex, as the check's summary and the verdict
+/// name it.
+pub const MPLEX_DEVIATION_LABEL: &str = "mplex";
 /// How long each dial may take by default \[est\].
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -83,10 +98,13 @@ pub async fn connect<E: EthSpec>(devnet: &Devnet, plan: &ConnectPlan) -> Check {
                 }
                 Ok(Some(deviation)) => {
                     tracing::warn!(peer = %peer.peer_id, addr = %peer.addr, %muxer, "connected on mplex: the peer refused our yamux proposal");
-                    check.pass(format!(
-                        "{at}: TCP connected, Noise XX proved the peer ID, muxer={muxer} \
-                         ({deviation})"
-                    ));
+                    check.pass_deviating(
+                        format!(
+                            "{at}: TCP connected, Noise XX proved the peer ID, muxer={muxer} \
+                             ({deviation}), confirmed by the peer's identify answer over it"
+                        ),
+                        MPLEX_DEVIATION_LABEL,
+                    );
                 }
                 Err(why) => {
                     tracing::warn!(peer = %peer.peer_id, addr = %peer.addr, %muxer, "connected on another muxer than yamux");
@@ -140,7 +158,9 @@ fn judge_muxer(offer: &[String], muxer: &str) -> Result<Option<&'static str>, St
 
 /// Dials `peer` from a swarm of its own, which is dropped when this returns: a dial that timed
 /// out cannot complete later, and the only muxer that swarm reports is that peer's. The dial's
-/// outcome, and the muxer the swarm negotiated as dialer (the last, if it reported more).
+/// outcome, and the muxer the swarm negotiated as dialer (the last, if it reported more). On
+/// mplex the outcome is a success only once the peer has answered over it ([`confirm`]), all
+/// within `timeout`.
 async fn dial_alone<E: EthSpec>(
     devnet: &Devnet,
     peer: &PinnedPeer,
@@ -165,23 +185,33 @@ async fn dial_alone<E: EthSpec>(
         gossip: None,
     };
     let mut swarm = probe_swarm::<E>(devnet, Arc::new(SharedStatus::new(None)), swarm_plan)?;
-    let outcome = dial(&mut swarm, peer, timeout).await;
+    let deadline = Instant::now() + timeout;
+    let muxer = || {
+        heard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last()
+            .cloned()
+    };
+    let outcome = match dial(&mut swarm, peer, deadline, timeout).await {
+        Ok(connection) if muxer().as_deref() == Some(MPLEX) => {
+            confirm(&mut swarm, connection, deadline, timeout).await
+        }
+        Ok(_) => Ok(()),
+        Err(why) => Err(why),
+    };
     drop(swarm);
-    let muxer = heard
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .last()
-        .cloned();
-    Ok((outcome, muxer))
+    Ok((outcome, muxer()))
 }
 
-/// Dials `peer` and drives the swarm until its connection is up, the dial failed, or `timeout`
-/// passed.
+/// Dials `peer` and drives the swarm until its connection is up (its ID), the dial failed, or
+/// `deadline` (`timeout` after the dial began) passed.
 async fn dial<E: EthSpec>(
     swarm: &mut Swarm<SpecBehaviour<E>>,
     peer: &PinnedPeer,
+    deadline: Instant,
     timeout: Duration,
-) -> Result<(), String> {
+) -> Result<ConnectionId, String> {
     let opts = DialOpts::peer_id(peer.peer_id)
         .addresses(vec![peer.addr.clone()])
         .build();
@@ -190,8 +220,11 @@ async fn dial<E: EthSpec>(
         loop {
             match swarm.select_next_some().await {
                 SwarmEvent::ConnectionEstablished {
-                    peer_id, endpoint, ..
-                } if peer_id == peer.peer_id && endpoint.is_dialer() => return Ok(()),
+                    peer_id,
+                    connection_id,
+                    endpoint,
+                    ..
+                } if peer_id == peer.peer_id && endpoint.is_dialer() => return Ok(connection_id),
                 SwarmEvent::OutgoingConnectionError {
                     peer_id: Some(p),
                     error,
@@ -201,9 +234,63 @@ async fn dial<E: EthSpec>(
             }
         }
     };
-    tokio::time::timeout(timeout, wait)
+    tokio::time::timeout_at(deadline, wait)
         .await
         .unwrap_or_else(|_| Err(format!("no connection within {timeout:?}")))
+}
+
+/// Drives the swarm until the peer has answered over `connection`, which our dial settled on
+/// mplex without the peer's word: its identify answer arrived on it. A failed identify, the
+/// connection closing, or `deadline` (`timeout` after the dial began) passing first is the
+/// failure's reason.
+async fn confirm<E: EthSpec>(
+    swarm: &mut Swarm<SpecBehaviour<E>>,
+    connection: ConnectionId,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<(), String> {
+    let unconfirmed = format!(
+        "TCP connected and Noise XX proved the peer ID, but the peer never confirmed {MPLEX}, \
+         our dial's last proposal"
+    );
+    let wait = async {
+        loop {
+            match swarm.select_next_some().await {
+                SwarmEvent::Behaviour(SpecBehaviourEvent::Identify(
+                    identify::Event::Received { connection_id, .. },
+                )) if connection_id == connection => return Ok(()),
+                SwarmEvent::Behaviour(SpecBehaviourEvent::Identify(identify::Event::Error {
+                    connection_id,
+                    error,
+                    ..
+                })) if connection_id == connection => {
+                    return Err(format!(
+                        "{unconfirmed}: identify over it failed: {}",
+                        error_chain(&error)
+                    ));
+                }
+                SwarmEvent::ConnectionClosed {
+                    connection_id,
+                    cause,
+                    ..
+                } if connection_id == connection => {
+                    let cause = cause.map_or_else(
+                        || "closed".to_owned(),
+                        |e| format!("closed: {}", error_chain(&e)),
+                    );
+                    return Err(format!("{unconfirmed}: the connection {cause}"));
+                }
+                other => tracing::debug!(event = ?other, "swarm event"),
+            }
+        }
+    };
+    tokio::time::timeout_at(deadline, wait)
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "{unconfirmed}: no identify answer over it within {timeout:?}"
+            ))
+        })
 }
 
 /// A failed dial: its `p2p_dial_failures_total` reason, then the whole error.
@@ -218,7 +305,9 @@ fn failure(error: &libp2p::swarm::DialError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{closed_port_peer, devnet, mplex_only_peer, StandIn};
+    use crate::fixtures::{
+        closed_port_peer, devnet, mplex_only_peer, muxer_only_peer, OnlyMuxer, StandIn,
+    };
     use consensus_types::Minimal;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -259,12 +348,64 @@ mod tests {
         );
         assert!(!lines[0].detail.contains("deviation"), "{lines:?}");
         assert!(!check.passed());
+        assert_eq!(check.deviations(), ["mplex"]);
 
         let passing = ConnectPlan {
             peers: vec![cl.pinned(), mplex],
             timeout: Duration::from_secs(10),
         };
-        assert!(connect::<Minimal>(&devnet, &passing).await.passed());
+        let check = connect::<Minimal>(&devnet, &passing).await;
+        assert!(check.passed(), "{check:?}");
+        assert_eq!(
+            check.render().last().unwrap(),
+            "connect: PASS (2/2; 1 recorded deviation: mplex)"
+        );
+    }
+
+    /// Our dial settles on mplex, its last proposal, without the peer's word, so a connection
+    /// on mplex passes only once the peer has answered over it: a peer that refused mplex as
+    /// well as yamux, or one that never answers on mplex, fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mplex_passes_only_once_the_peer_answers_over_it() {
+        let devnet = devnet();
+        let plan = ConnectPlan {
+            peers: vec![
+                muxer_only_peer(OnlyMuxer::Other).await,
+                muxer_only_peer(OnlyMuxer::SilentMplex).await,
+                muxer_only_peer(OnlyMuxer::Mplex).await,
+            ],
+            timeout: Duration::from_secs(5),
+        };
+        let check = connect::<Minimal>(&devnet, &plan).await;
+        let lines = check.lines();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        // The peer refused both of our proposals: nothing confirms mplex.
+        assert!(!lines[0].pass, "{lines:?}");
+        assert!(!lines[0].detail.contains("deviation"), "{lines:?}");
+        // Its `na` to mplex is read once data follows, before or after the connection is up.
+        assert!(
+            lines[0]
+                .detail
+                .contains("the peer never confirmed /mplex/6.7.0")
+                || lines[0].detail.contains("reason=negotiation"),
+            "{lines:?}"
+        );
+        // The peer speaks mplex but answers nothing over it: no round trip, no pass.
+        assert!(!lines[1].pass, "{lines:?}");
+        assert!(
+            lines[1]
+                .detail
+                .contains("the peer never confirmed /mplex/6.7.0"),
+            "{lines:?}"
+        );
+        assert!(lines[2].pass, "{lines:?}");
+        assert!(
+            lines[2]
+                .detail
+                .contains("muxer=/mplex/6.7.0 (peer offers no yamux: recorded deviation)"),
+            "{lines:?}"
+        );
+        assert_eq!(check.deviations(), ["mplex"]);
     }
 
     fn offer(protocols: &[&str]) -> Vec<String> {

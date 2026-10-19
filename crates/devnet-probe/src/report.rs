@@ -1,5 +1,11 @@
 //! What a probe check prints: one PASS or FAIL line per thing it judged, a summary line per
 //! check, and one verdict over every check.
+//!
+//! A line can pass as a *recorded deviation* ([`Check::pass_deviating`]): an acceptance pass
+//! short of the criterion's letter, for a reason the criterion's owner accepted. It changes
+//! neither the outcome nor the exit code, but the check's summary and the verdict name it
+//! (`verdict: PASS (2/2 checks; 1 recorded deviation: connect mplex)`), so a run with one never
+//! reads like a run without.
 
 /// One thing a check judged.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +23,8 @@ pub struct Check {
     lines: Vec<Line>,
     /// Why the check ran outside the acceptance rules: its passes are diagnostic only.
     diagnostic: Option<String>,
+    /// The recorded deviation of each line that passed as one, in order.
+    deviations: Vec<String>,
 }
 
 impl Check {
@@ -27,6 +35,7 @@ impl Check {
             name,
             lines: Vec::new(),
             diagnostic: None,
+            deviations: Vec::new(),
         }
     }
 
@@ -53,6 +62,19 @@ impl Check {
     /// Records a passed line.
     pub fn pass(&mut self, detail: impl Into<String>) {
         self.record(true, detail.into());
+    }
+
+    /// Records a line that passed as the recorded deviation `deviation` (a short label, such as
+    /// `mplex`), which the summary and the verdict name.
+    pub fn pass_deviating(&mut self, detail: impl Into<String>, deviation: impl Into<String>) {
+        self.pass(detail);
+        self.deviations.push(deviation.into());
+    }
+
+    /// The recorded deviation of each line that passed as one, in order.
+    #[must_use]
+    pub fn deviations(&self) -> &[String] {
+        &self.deviations
     }
 
     /// Records a failed line.
@@ -96,7 +118,8 @@ impl Check {
     }
 
     /// Every line as `<name>: PASS|FAIL|DIAGNOSTIC <detail>` (each on one line), then
-    /// `<name>: PASS|FAIL|DIAGNOSTIC (<passed>/<lines>[; <why diagnostic>])`.
+    /// `<name>: PASS|FAIL|DIAGNOSTIC (<passed>/<lines>[; <why diagnostic>][; <deviations>])`,
+    /// the deviations as `<n> recorded deviation[s]: <label>, ...`.
     #[must_use]
     pub fn render(&self) -> Vec<String> {
         let mut out: Vec<String> = self
@@ -112,13 +135,32 @@ impl Check {
             .diagnostic
             .as_ref()
             .map_or_else(String::new, |why| format!("; {why}"));
+        let deviations = deviations(self.deviations.iter().cloned());
         out.push(format!(
-            "{}: {} ({passed}/{}{why})",
+            "{}: {} ({passed}/{}{why}{deviations})",
             self.name,
             self.word(self.passed()),
             self.lines.len()
         ));
         out
+    }
+}
+
+/// `; <n> recorded deviation[s]: <label>, ...` over `labels`, each distinct label named once in
+/// order, or nothing if there are none.
+fn deviations(labels: impl Iterator<Item = String>) -> String {
+    let mut count = 0;
+    let mut named: Vec<String> = Vec::new();
+    for label in labels {
+        count += 1;
+        if !named.contains(&label) {
+            named.push(label);
+        }
+    }
+    match count {
+        0 => String::new(),
+        1 => format!("; 1 recorded deviation: {}", named.join(", ")),
+        n => format!("; {n} recorded deviations: {}", named.join(", ")),
     }
 }
 
@@ -148,7 +190,8 @@ impl Outcome {
 
 /// What every check comes to, and the verdict line: `verdict: PASS (<n>/<n> checks)`,
 /// `verdict: FAIL (...)` naming the failed ones, or `verdict: DIAGNOSTIC (...)` naming the
-/// diagnostic ones and why.
+/// diagnostic ones and why; each ends with the run's recorded deviations, if any, as
+/// `; <n> recorded deviation[s]: <check> <label>, ...`. A deviation never changes the outcome.
 #[must_use]
 pub fn verdict(checks: &[Check]) -> (Outcome, String) {
     if checks.is_empty() {
@@ -168,16 +211,21 @@ pub fn verdict(checks: &[Check]) -> (Outcome, String) {
                 .map(|why| format!("{}: {why}", c.name))
         })
         .collect();
+    let deviations = deviations(
+        checks
+            .iter()
+            .flat_map(|c| c.deviations.iter().map(|d| format!("{} {d}", c.name))),
+    );
     if !failed.is_empty() {
         let line = format!(
-            "verdict: FAIL ({passed}/{} checks; failed: {})",
+            "verdict: FAIL ({passed}/{} checks; failed: {}{deviations})",
             checks.len(),
             failed.join(", ")
         );
         (Outcome::Fail, line)
     } else if !diagnostic.is_empty() {
         let line = format!(
-            "verdict: DIAGNOSTIC ({passed}/{} checks passed; diagnostic: {})",
+            "verdict: DIAGNOSTIC ({passed}/{} checks passed; diagnostic: {}{deviations})",
             checks.len(),
             diagnostic.join(", ")
         );
@@ -185,7 +233,10 @@ pub fn verdict(checks: &[Check]) -> (Outcome, String) {
     } else {
         (
             Outcome::Pass,
-            format!("verdict: PASS ({passed}/{} checks)", checks.len()),
+            format!(
+                "verdict: PASS ({passed}/{} checks{deviations})",
+                checks.len()
+            ),
         )
     }
 }
@@ -288,6 +339,74 @@ mod tests {
             [Outcome::Pass, Outcome::Fail, Outcome::Diagnostic].map(Outcome::exit_code),
             [0, 1, 3]
         );
+    }
+
+    /// A recorded deviation is still a pass: the line, the check's summary and the verdict all
+    /// say PASS and the exit is 0, but the summary and the verdict name it, so a run with one
+    /// never reads like a run without.
+    #[test]
+    fn recorded_deviations_reach_the_summary_and_the_verdict() {
+        let mut connect = Check::new("connect");
+        connect.pass("peer a: muxer=/yamux/1.0.0");
+        connect.pass_deviating("peer b: muxer=/mplex/6.7.0 (recorded deviation)", "mplex");
+        assert!(connect.passed());
+        assert_eq!(connect.deviations(), ["mplex"]);
+        assert_eq!(
+            connect.render(),
+            [
+                "connect: PASS peer a: muxer=/yamux/1.0.0",
+                "connect: PASS peer b: muxer=/mplex/6.7.0 (recorded deviation)",
+                "connect: PASS (2/2; 1 recorded deviation: mplex)",
+            ]
+        );
+        let mut setup = Check::new("setup");
+        setup.pass("fine");
+        assert_eq!(
+            verdict(&[setup.clone(), connect.clone()]),
+            (
+                Outcome::Pass,
+                "verdict: PASS (2/2 checks; 1 recorded deviation: connect mplex)".into()
+            )
+        );
+        assert_eq!(verdict(&[setup.clone(), connect.clone()]).0.exit_code(), 0);
+
+        // Two peers on mplex: counted twice, named once.
+        connect.pass_deviating("peer c: muxer=/mplex/6.7.0 (recorded deviation)", "mplex");
+        assert_eq!(
+            connect.render()[3],
+            "connect: PASS (3/3; 2 recorded deviations: mplex)"
+        );
+        assert_eq!(
+            verdict(&[setup.clone(), connect.clone()]).1,
+            "verdict: PASS (2/2 checks; 2 recorded deviations: connect mplex)"
+        );
+
+        // Under a failure or a diagnostic the deviations are still named.
+        let bad = Check::failed("fetch-epoch", "no peer");
+        assert_eq!(
+            verdict(&[setup.clone(), connect.clone(), bad]),
+            (
+                Outcome::Fail,
+                "verdict: FAIL (2/3 checks; failed: fetch-epoch; \
+                 2 recorded deviations: connect mplex)"
+                    .into()
+            )
+        );
+        let mut held = Check::new("status");
+        held.pass("peer a: held 1.0 s");
+        held.mark_diagnostic("hold 1 s < 600 s");
+        assert_eq!(
+            verdict(&[connect, held]),
+            (
+                Outcome::Diagnostic,
+                "verdict: DIAGNOSTIC (2/2 checks passed; diagnostic: status: hold 1 s < 600 s; \
+                 2 recorded deviations: connect mplex)"
+                    .into()
+            )
+        );
+        // Without a deviation nothing changes.
+        assert_eq!(setup.render()[1], "setup: PASS (1/1)");
+        assert!(setup.deviations().is_empty());
     }
 
     #[test]

@@ -122,6 +122,7 @@ use cl_p2p::rpc::inbound::SharedStatus;
 use consensus_types::EthSpec;
 use futures::channel::mpsc;
 use futures::StreamExt;
+use libp2p::core::upgrade::{InboundConnectionUpgrade, OutboundConnectionUpgrade, UpgradeInfo};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId};
 use p2p_wire::rpc::messages::StatusV2;
@@ -269,23 +270,56 @@ pub fn closed_port_peer() -> PinnedPeer {
     }
 }
 
-/// A peer that offers mplex only (TCP, Noise, our capped mplex), and serves nothing.
+/// The muxer a stand-in from [`muxer_only_peer`] offers, and whether it answers identify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnlyMuxer {
+    /// mplex, answering identify: the round trip that confirms mplex comes back.
+    Mplex,
+    /// mplex, with no protocol on top: identify is refused (`na`), so nothing confirms mplex.
+    SilentMplex,
+    /// mplex under the name [`OTHER_MUXER`]: a peer that refuses both yamux and mplex.
+    Other,
+}
+
+/// The muxer protocol of [`OnlyMuxer::Other`]: neither yamux nor mplex.
+pub const OTHER_MUXER: &str = "/other-muxer/1.0.0";
+
+/// A peer that offers mplex only (TCP, Noise, our capped mplex) and answers identify, serving
+/// nothing else.
 pub async fn mplex_only_peer() -> PinnedPeer {
+    muxer_only_peer(OnlyMuxer::Mplex).await
+}
+
+/// A peer on TCP and Noise whose one muxer is `only` (our capped mplex, under its own name or
+/// [`OTHER_MUXER`]), running identify if `only` says so and nothing else.
+pub async fn muxer_only_peer(only: OnlyMuxer) -> PinnedPeer {
+    use cl_p2p::behaviour::IDENTIFY_PROTOCOL_VERSION;
     use cl_p2p::transport::{mplex_config, Budgeted, MuxerBudget, TransportMetrics};
-    use libp2p::{noise, tcp, SwarmBuilder};
+    use libp2p::swarm::behaviour::toggle::Toggle;
+    use libp2p::{identify, noise, tcp, SwarmBuilder};
     let metrics = TransportMetrics::register(&mut prometheus_client::registry::Registry::default());
     let budget = MuxerBudget::with_defaults(&metrics);
-    let mut swarm =
-        SwarmBuilder::with_existing_identity(libp2p::identity::Keypair::generate_secp256k1())
-            .with_tokio()
-            .with_tcp(tcp::Config::default(), noise::Config::new, move || {
-                Budgeted::new(mplex_config(), budget)
-            })
-            .expect("tcp")
-            .with_behaviour(|_| libp2p::swarm::dummy::Behaviour)
-            .expect("behaviour")
-            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
-            .build();
+    let name = match only {
+        OnlyMuxer::Mplex | OnlyMuxer::SilentMplex => crate::connect::MPLEX,
+        OnlyMuxer::Other => OTHER_MUXER,
+    };
+    let key = libp2p::identity::Keypair::generate_secp256k1();
+    let identify = (only == OnlyMuxer::Mplex).then(|| {
+        identify::Behaviour::new(identify::Config::new(
+            IDENTIFY_PROTOCOL_VERSION.to_owned(),
+            key.public(),
+        ))
+    });
+    let mut swarm = SwarmBuilder::with_existing_identity(key)
+        .with_tokio()
+        .with_tcp(tcp::Config::default(), noise::Config::new, move || {
+            Named::new(name, Budgeted::new(mplex_config(), budget))
+        })
+        .expect("tcp")
+        .with_behaviour(|_| Toggle::from(identify))
+        .expect("behaviour")
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        .build();
     let peer_id = *swarm.local_peer_id();
     swarm
         .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
@@ -301,4 +335,57 @@ pub async fn mplex_only_peer() -> PinnedPeer {
         }
     });
     PinnedPeer { peer_id, addr }
+}
+
+/// The connection upgrade `inner` offered under the protocol name `name` alone.
+#[derive(Clone)]
+struct Named<U> {
+    name: &'static str,
+    inner: U,
+}
+
+impl<U: UpgradeInfo> Named<U> {
+    fn new(name: &'static str, inner: U) -> Self {
+        Self { name, inner }
+    }
+
+    /// The protocol `inner` runs under.
+    fn inner_info(&self) -> U::Info {
+        self.inner
+            .protocol_info()
+            .into_iter()
+            .next()
+            .expect("the upgrade names a protocol")
+    }
+}
+
+impl<U> UpgradeInfo for Named<U> {
+    type Info = &'static str;
+    type InfoIter = std::iter::Once<&'static str>;
+
+    fn protocol_info(&self) -> Self::InfoIter {
+        std::iter::once(self.name)
+    }
+}
+
+impl<C, U: InboundConnectionUpgrade<C>> InboundConnectionUpgrade<C> for Named<U> {
+    type Output = U::Output;
+    type Error = U::Error;
+    type Future = U::Future;
+
+    fn upgrade_inbound(self, socket: C, _: Self::Info) -> Self::Future {
+        let info = self.inner_info();
+        self.inner.upgrade_inbound(socket, info)
+    }
+}
+
+impl<C, U: OutboundConnectionUpgrade<C>> OutboundConnectionUpgrade<C> for Named<U> {
+    type Output = U::Output;
+    type Error = U::Error;
+    type Future = U::Future;
+
+    fn upgrade_outbound(self, socket: C, _: Self::Info) -> Self::Future {
+        let info = self.inner_info();
+        self.inner.upgrade_outbound(socket, info)
+    }
 }

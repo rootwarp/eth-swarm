@@ -20,6 +20,10 @@
 //! Exit codes: 0 every check passed, 1 a check failed, 2 usage (an `--api` node no `--peer`
 //! names included), 3 diagnostic: every check passed, but `status` held less than
 //! [`status::ACCEPTANCE_HOLD`], so it printed `DIAGNOSTIC` instead of `PASS`.
+//!
+//! A recorded deviation (a `connect` peer on mplex, which offers no yamux) is still a pass and
+//! exits 0, but the check's summary and the verdict name it:
+//! `verdict: PASS (2/2 checks; 1 recorded deviation: connect mplex)`.
 
 use cl_discv5::enr::{Enr, EnrFields};
 use cl_p2p::m2a_session::PinnedPeer;
@@ -59,7 +63,8 @@ only.
                 --bootnode, must find every reference CL's record (--enr, and the ENR of
                 every --api's /eth/v1/node/identity)
   connect       each --peer: TCP, Noise XX (the peer ID) and the muxer, which must be yamux
-                (mplex passes, as a recorded deviation, for a peer that refuses yamux)
+                (mplex passes, as a recorded deviation, for a peer that refuses yamux and
+                then answers our identify over mplex)
   status        each --peer: our Status v2 answered, its Status answered, then the
                 connection held --hold-secs with a Ping every --ping-secs and no Goodbye
   fetch-epoch   a finalized epoch by BlocksByRange v2 from the --peers; every slot's root
@@ -90,7 +95,11 @@ Every -secs flag takes 1 to 86400.
 
 Exit codes: 0 every check passed (an acceptance pass), 1 a check failed, 2 usage (including an
 --api node no --peer names), 3 diagnostic: every check passed but one ran outside the
-acceptance rules (a hold under 600 s), so it prints DIAGNOSTIC, never PASS.";
+acceptance rules (a hold under 600 s), so it prints DIAGNOSTIC, never PASS.
+
+A recorded deviation (connect mplex) is still a pass, with exit 0, but the verdict names every
+recorded deviation, as each check's summary does:
+  verdict: PASS (2/2 checks; 1 recorded deviation: connect mplex)";
 
 const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
@@ -886,6 +895,10 @@ mod tests {
         assert_eq!(code, 0);
         assert!(out.starts_with("usage: devnet-probe"), "{out}");
         assert!(out.contains("fetch-epoch"), "{out}");
+        assert!(
+            out.contains("the verdict names every\nrecorded deviation"),
+            "{out}"
+        );
         let (code, _, err) = run_args(&["connect"]);
         assert_eq!(code, EXIT_USAGE);
         assert!(err.contains("--config or --network-dir"), "{err}");
@@ -905,7 +918,8 @@ mod tests {
         assert!(out.contains("connect: PASS peer"), "{out}");
         assert!(out.contains("/yamux/1.0.0"), "{out}");
         assert!(out.ends_with("verdict: PASS (2/2 checks)\n"), "{out}");
-        // A peer offering mplex only passes, its deviation recorded in the PASS line.
+        // A peer offering mplex only passes, exit 0, its deviation recorded in the PASS line,
+        // the check's summary and the verdict.
         let mplex = peer_arg(&rt.block_on(fixtures::mplex_only_peer()));
         let (code, out, _) = run_args(&[
             "connect",
@@ -921,7 +935,14 @@ mod tests {
             out.contains("muxer=/mplex/6.7.0 (peer offers no yamux: recorded deviation)"),
             "{out}"
         );
-        assert!(out.ends_with("verdict: PASS (2/2 checks)\n"), "{out}");
+        assert!(
+            out.contains("\nconnect: PASS (2/2; 1 recorded deviation: mplex)\n"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with("verdict: PASS (2/2 checks; 1 recorded deviation: connect mplex)\n"),
+            "{out}"
+        );
         let closed = peer_arg(&fixtures::closed_port_peer());
         let (code, out, _) = run_args(&[
             "connect",
