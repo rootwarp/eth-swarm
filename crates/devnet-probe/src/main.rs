@@ -59,6 +59,7 @@ only.
                 --bootnode, must find every reference CL's record (--enr, and the ENR of
                 every --api's /eth/v1/node/identity)
   connect       each --peer: TCP, Noise XX (the peer ID) and the muxer, which must be yamux
+                (mplex passes, as a recorded deviation, for a peer that refuses yamux)
   status        each --peer: our Status v2 answered, its Status answered, then the
                 connection held --hold-secs with a Ping every --ping-secs and no Goodbye
   fetch-epoch   a finalized epoch by BlocksByRange v2 from the --peers; every slot's root
@@ -903,6 +904,23 @@ mod tests {
         assert!(out.contains("setup: PASS config"), "{out}");
         assert!(out.contains("connect: PASS peer"), "{out}");
         assert!(out.contains("/yamux/1.0.0"), "{out}");
+        assert!(out.ends_with("verdict: PASS (2/2 checks)\n"), "{out}");
+        // A peer offering mplex only passes, its deviation recorded in the PASS line.
+        let mplex = peer_arg(&rt.block_on(fixtures::mplex_only_peer()));
+        let (code, out, _) = run_args(&[
+            "connect",
+            "--network-dir",
+            dir_arg,
+            "--peer",
+            &good,
+            "--peer",
+            &mplex,
+        ]);
+        assert_eq!(code, 0, "{out}");
+        assert!(
+            out.contains("muxer=/mplex/6.7.0 (peer offers no yamux: recorded deviation)"),
+            "{out}"
+        );
         assert!(out.ends_with("verdict: PASS (2/2 checks)\n"), "{out}");
         let closed = peer_arg(&fixtures::closed_port_peer());
         let (code, out, _) = run_args(&[

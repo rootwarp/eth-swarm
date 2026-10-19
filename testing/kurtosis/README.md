@@ -550,7 +550,7 @@ stops anything in Kurtosis or Docker.
 | Subcommand | Criterion | What passes |
 |---|---|---|
 | `discover` | discovery on the devnet | our discv5 (cl-discv5, local mode: a record with any other than a local address is never queried or pinged, so nothing goes to a public host), seeded with `--bootnode`, finds every `--enr` record (and every `--api`'s `/eth/v1/node/identity` ENR) on our fork digest within `--discover-secs` (60) |
-| `connect` | TCP + Noise + yamux | each `--peer`: TCP connected, Noise XX proved its peer ID, and the muxer, logged per peer, is `/yamux/1.0.0` (mplex fails) |
+| `connect` | TCP + Noise + yamux | each `--peer`: TCP connected, Noise XX proved its peer ID, and the muxer, logged per peer, is `/yamux/1.0.0`; `/mplex/6.7.0` passes as a recorded deviation, labelled `muxer=/mplex/6.7.0 (peer offers no yamux: recorded deviation)`, only for a peer that refused our yamux proposal (our dial proposes yamux first, then mplex, and a peer that speaks yamux accepts it; Lodestar 1.50.0 builds its node with mplex only); mplex without yamux proposed first, or another muxer, fails |
 | `status` | Status v2 both ways, then a held connection | each `--peer` answers our Status v2 with a relevant one, sends us its own Status (a CL's periodic re-Status, about every 5 minutes on Lighthouse and Lodestar \[est\]: the hold must outlast it) and our answer to it is sent, and keeps the connection `--hold-secs` (600; under 600 the check is `DIAGNOSTIC` and the run exits 3) with our Ping every `--ping-secs` (15) and no Goodbye either way; a Goodbye is reported with its reason |
 | `fetch-epoch` | one epoch by range, roots against the API | the finalized epoch before the first `--api`'s finalized epoch (or `--epoch`) fetched by BlocksByRange v2 from the `--peer`s; every slot's root equals that API's `/eth/v1/beacon/blocks/{slot}/root`, an empty slot is a 404 there, and nothing is `unconfirmed` |
 | `all` | the four | in that order, from one argument set |
@@ -558,7 +558,10 @@ stops anything in Kurtosis or Docker.
 Our Status is probe mode's (`cl_chain::probe::StatusProvider`): the digest of the wall-clock
 epoch from `config.yaml` and `genesis.ssz`, the finalized checkpoint and its block from the
 first `--api`. The swarm is cl-p2p's `build_swarm` over the `Minimal` preset (the config's
-`PRESET_BASE`); `status` adds the probe's ignore-all gossipsub on `beacon_block`.
+`PRESET_BASE`); `status` and `fetch-epoch` add the probe's ignore-all gossipsub on
+`beacon_block` at our fork digest, publishing nothing: a CL drops a peer that does not speak
+gossipsub (Lighthouse says Goodbye right after Status). `connect` judges the connection once it
+is established, so its swarm carries none.
 
 Run it against the concurrent pair that `testing/kurtosis/run-pair.sh --keep-on-pass` leaves
 up after a pair PASS (both enclaves, finalized epoch at least 3); check that script's own exit

@@ -5,7 +5,9 @@
 //!    epoch F. The epoch fetched is F − 1 (every slot of it is finalized), or the one asked for,
 //!    which must be before F; never epoch 0, whose first slot is the genesis block.
 //! 2. Every reference CL dialed; each must become Status-valid (its Status relevant to ours)
-//!    within the status deadline. One line each.
+//!    within the status deadline. One line each. The swarm carries `status`'s ignore-all
+//!    gossipsub on `beacon_block` at our fork digest, publishing nothing: a CL drops a peer
+//!    that does not speak gossipsub.
 //! 3. The epoch through cl-p2p's [`fetch_epoch`] over its [`RangeRequester`]: BlocksByRange v2,
 //!    `step` 1, `count` at most `MAX_REQUEST_BLOCKS_DENEB`, starting at or after the peer's
 //!    `earliest_available_slot`, every response checked (slots, context digest of the block's
@@ -24,6 +26,7 @@ use super::report::{Check, Line};
 use super::swarm::{error_chain, probe_swarm, SwarmPlan};
 use cl_p2p::behaviour::SpecBehaviour;
 use cl_p2p::m2a_session::PinnedPeer;
+use cl_p2p::rpc::inbound::StatusSource;
 use cl_p2p::rpc::outbound::{
     fetch_epoch as fetch_range_epoch, FetchError, Linked, RangeFetch, RangeRequester,
 };
@@ -35,9 +38,10 @@ use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{PeerId, Swarm};
 use network_config::Epoch;
-use p2p_wire::rpc::messages::StatusV2;
+use p2p_wire::rpc::messages::{ForkDigest, StatusV2};
 use p2p_wire::rpc::protocols::MAX_REQUEST_BLOCKS_DENEB;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The check's name.
@@ -97,7 +101,7 @@ pub async fn fetch_epoch<E: EthSpec>(
     clock: Clock,
     plan: &FetchPlan,
 ) -> Check {
-    let (ours, _) = match OurStatus::start(
+    let (ours, first) = match OurStatus::start(
         devnet,
         api.clone(),
         clock,
@@ -116,15 +120,7 @@ pub async fn fetch_epoch<E: EthSpec>(
         Ok(epoch) => epoch,
         Err(e) => return Check::failed(NAME, e),
     };
-    let swarm_plan = SwarmPlan {
-        listen: Vec::new(),
-        idle: IDLE,
-        bypass: plan.peers.iter().map(|p| p.peer_id).collect(),
-        muxer_observer: None,
-        ping_interval: cl_p2p::rpc::inbound::PING_INTERVAL,
-        gossip: None,
-    };
-    let mut swarm = match probe_swarm::<E>(devnet, ours.source(), swarm_plan) {
+    let mut swarm = match fetch_swarm::<E>(devnet, ours.source(), plan, first.fork_digest) {
         Ok(swarm) => swarm,
         Err(e) => return Check::failed(NAME, format!("probe swarm: {e}")),
     };
@@ -178,6 +174,27 @@ pub async fn fetch_epoch<E: EthSpec>(
     compare(&api, first..=last, &fetch, &mut check).await;
     judge_fetch(&fetch, &valid, &mut check);
     check
+}
+
+/// The swarm `fetch-epoch` dials from: our Status from `status`, no listener, every peer of
+/// `plan` exempt from the connection caps, and `status`'s ignore-all gossipsub on
+/// `beacon_block` at our fork digest `digest` (a CL drops a peer that does not speak
+/// gossipsub).
+fn fetch_swarm<E: EthSpec>(
+    devnet: &Devnet,
+    status: Arc<dyn StatusSource>,
+    plan: &FetchPlan,
+    digest: ForkDigest,
+) -> Result<Swarm<SpecBehaviour<E>>, String> {
+    let swarm_plan = SwarmPlan {
+        listen: Vec::new(),
+        idle: IDLE,
+        bypass: plan.peers.iter().map(|p| p.peer_id).collect(),
+        muxer_observer: None,
+        ping_interval: cl_p2p::rpc::inbound::PING_INTERVAL,
+        gossip: Some(digest),
+    };
+    probe_swarm::<E>(devnet, status, swarm_plan)
 }
 
 /// Dials every peer and drives the swarm until each is Status-valid or failed, or the
@@ -505,6 +522,109 @@ mod tests {
         assert!(asked
             .iter()
             .all(|r| r.count <= 128 && r.step == 1 && r.start_slot >= 24));
+    }
+
+    /// A remote that hears identify from whoever dials it, at its address.
+    async fn identify_listener() -> (
+        PinnedPeer,
+        futures::channel::oneshot::Receiver<libp2p::identify::Info>,
+    ) {
+        use libp2p::swarm::SwarmEvent;
+        use libp2p::{identify, noise, tcp, yamux, SwarmBuilder};
+        let key = libp2p::identity::Keypair::generate_secp256k1();
+        let mut swarm = SwarmBuilder::with_existing_identity(key)
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                noise::Config::new,
+                yamux::Config::default,
+            )
+            .unwrap()
+            .with_behaviour(|key| {
+                identify::Behaviour::new(identify::Config::new(
+                    cl_p2p::behaviour::IDENTIFY_PROTOCOL_VERSION.to_owned(),
+                    key.public(),
+                ))
+            })
+            .unwrap()
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
+            .build();
+        swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+                break address;
+            }
+        };
+        let peer_id = *swarm.local_peer_id();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        tokio::spawn(async move {
+            let mut tx = Some(tx);
+            loop {
+                if let SwarmEvent::Behaviour(identify::Event::Received { info, .. }) =
+                    swarm.select_next_some().await
+                {
+                    if let Some(tx) = tx.take() {
+                        let _ = tx.send(info);
+                    }
+                }
+            }
+        });
+        (PinnedPeer { peer_id, addr }, rx)
+    }
+
+    /// A CL drops a peer that does not speak gossipsub, so the fetch swarm announces it, as
+    /// `status`'s does: the ignore-all gossipsub on `beacon_block` at our fork digest.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_fetch_swarm_speaks_gossipsub() {
+        let devnet = devnet();
+        let (remote, heard) = identify_listener().await;
+        let digest = devnet.digest_at(3).unwrap();
+        let mut swarm = fetch_swarm::<P>(
+            &devnet,
+            Arc::new(cl_p2p::rpc::inbound::SharedStatus::new(None)),
+            &plan(vec![remote.clone()], None),
+            digest,
+        )
+        .unwrap();
+        let topics: Option<Vec<String>> = swarm.behaviour().gossipsub.as_ref().map(|g| {
+            g.gossipsub()
+                .topics()
+                .map(|t| t.as_str().to_owned())
+                .collect()
+        });
+        swarm
+            .dial(
+                DialOpts::peer_id(remote.peer_id)
+                    .addresses(vec![remote.addr.clone()])
+                    .build(),
+            )
+            .unwrap();
+        let driven = tokio::spawn(async move {
+            loop {
+                swarm.select_next_some().await;
+            }
+        });
+        let info = tokio::time::timeout(Duration::from_secs(10), heard)
+            .await
+            .expect("identify within 10 s")
+            .expect("identify");
+        driven.abort();
+        let protocols: Vec<String> = info.protocols.iter().map(ToString::to_string).collect();
+        assert!(
+            protocols
+                .iter()
+                .any(|p| p.starts_with("/eth2/beacon_chain/req/status/")),
+            "{protocols:?}"
+        );
+        assert!(
+            protocols.iter().any(|p| p.starts_with("/meshsub/1.")),
+            "{protocols:?}"
+        );
+        let topic =
+            p2p_wire::gossip::GossipTopic::new(digest, p2p_wire::gossip::GossipKind::BeaconBlock);
+        assert_eq!(topics, Some(vec![topic.to_string()]));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

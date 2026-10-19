@@ -6,13 +6,15 @@
 //!   to an address that is not local), seeded with the bootnode records, finds every
 //!   reference CL's record.
 //! - [`connect`]: the probe swarm dials each reference CL: TCP, Noise XX (the peer ID) and the
-//!   muxer, which must be yamux, named per peer.
+//!   muxer, which must be yamux, named per peer; mplex passes as a recorded deviation only for
+//!   a peer that refused our yamux proposal.
 //! - [`status`]: Status v2 both ways (ours answered, theirs answered and our answer sent), then
 //!   each connection held with our Ping cadence and no Goodbye; a Goodbye is reported with
 //!   its reason.
 //! - [`fetch`]: one finalized epoch by BlocksByRange v2 ([`cl_p2p::rpc::outbound::fetch_epoch`]
 //!   over the [`cl_p2p::rpc::outbound::RangeRequester`]), every slot's root compared with
-//!   `/eth/v1/beacon/blocks/{slot}/root` (404: an empty slot); nothing may be unconfirmed.
+//!   `/eth/v1/beacon/blocks/{slot}/root` (404: an empty slot); nothing may be unconfirmed. Its
+//!   swarm carries `status`'s ignore-all gossipsub.
 //!
 //! Shared parts: [`devnet`] (the devnet's config, genesis and preset, and the rule that every
 //! address the probe contacts is local), [`api`] (the reference beacon API, through

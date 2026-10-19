@@ -5,8 +5,19 @@
 //! complete during the next peer's, so the muxer a swarm reports is its own peer's. The dial
 //! names the peer ID (`DialOpts::peer_id`), so an established connection means TCP connected,
 //! Noise XX proved that identity, and multistream-select confirmed a muxer (two are offered,
-//! yamux first, so the lazy negotiation of a single protocol does not apply). The criterion is yamux: a connection on
-//! mplex is reported, and fails.
+//! yamux first, so the lazy negotiation of a single protocol does not apply).
+//!
+//! The criterion is yamux, and a connection on yamux passes. A connection on mplex passes only
+//! as a recorded deviation, labelled `peer offers no yamux: recorded deviation` in its PASS
+//! line, and only when our dial proposed yamux before mplex ([`our_offer`], cl-p2p's
+//! [`muxers`]): as dialer we propose the muxers one at a time, in order, and the peer either
+//! accepts a proposal or refuses it (`na`). A yamux-capable peer accepts our first proposal and
+//! negotiates yamux, so mplex on our dial means the peer refused yamux: it offers none (a TCP
+//! client MUST support mplex and MAY support yamux, so it is within the spec, short of the
+//! criterion). mplex without yamux proposed before it, or any other muxer, fails.
+//!
+//! The swarm carries no gossipsub: the verdict is given when the connection is established,
+//! before anything runs over it.
 
 use super::devnet::Devnet;
 use super::report::Check;
@@ -14,9 +25,12 @@ use super::swarm::{error_chain, probe_swarm, SwarmPlan};
 use cl_p2p::behaviour::SpecBehaviour;
 use cl_p2p::m2a_session::PinnedPeer;
 use cl_p2p::rpc::inbound::SharedStatus;
-use cl_p2p::transport::{DialFailure, Direction, MuxerObserver};
+use cl_p2p::transport::{
+    muxers, DialFailure, Direction, MuxerBudget, MuxerObserver, TransportMetrics,
+};
 use consensus_types::EthSpec;
 use futures::StreamExt;
+use libp2p::core::upgrade::UpgradeInfo;
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::SwarmEvent;
 use libp2p::Swarm;
@@ -27,6 +41,10 @@ use std::time::Duration;
 pub const NAME: &str = "connect";
 /// The muxer the criterion asks for.
 pub const YAMUX: &str = "/yamux/1.0.0";
+/// The muxer a peer without yamux negotiates.
+pub const MPLEX: &str = "/mplex/6.7.0";
+/// The label of a connection on mplex to a peer that refused our yamux proposal.
+pub const MPLEX_DEVIATION: &str = "peer offers no yamux: recorded deviation";
 /// How long each dial may take by default \[est\].
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -45,6 +63,7 @@ type Heard = Arc<Mutex<Vec<String>>>;
 /// Dials every peer of `plan` in turn: one line per peer.
 pub async fn connect<E: EthSpec>(devnet: &Devnet, plan: &ConnectPlan) -> Check {
     let mut check = Check::new(NAME);
+    let offer = our_offer();
     for peer in &plan.peers {
         let (outcome, muxer) = match dial_alone::<E>(devnet, peer, plan.timeout).await {
             Ok(dialled) => dialled,
@@ -55,18 +74,25 @@ pub async fn connect<E: EthSpec>(devnet: &Devnet, plan: &ConnectPlan) -> Check {
         };
         let at = format!("peer {} at {}", peer.peer_id, peer.addr);
         match (outcome, muxer) {
-            (Ok(()), Some(muxer)) if muxer == YAMUX => {
-                tracing::info!(peer = %peer.peer_id, addr = %peer.addr, %muxer, "connected: Noise XX and yamux");
-                check.pass(format!(
-                    "{at}: TCP connected, Noise XX proved the peer ID, muxer {muxer}"
-                ));
-            }
-            (Ok(()), Some(muxer)) => {
-                tracing::warn!(peer = %peer.peer_id, addr = %peer.addr, %muxer, "connected on another muxer than yamux");
-                check.fail(format!(
-                    "{at}: Noise XX proved the peer ID, but the muxer is {muxer}, not {YAMUX}"
-                ));
-            }
+            (Ok(()), Some(muxer)) => match judge_muxer(&offer, &muxer) {
+                Ok(None) => {
+                    tracing::info!(peer = %peer.peer_id, addr = %peer.addr, %muxer, "connected: Noise XX and yamux");
+                    check.pass(format!(
+                        "{at}: TCP connected, Noise XX proved the peer ID, muxer={muxer}"
+                    ));
+                }
+                Ok(Some(deviation)) => {
+                    tracing::warn!(peer = %peer.peer_id, addr = %peer.addr, %muxer, "connected on mplex: the peer refused our yamux proposal");
+                    check.pass(format!(
+                        "{at}: TCP connected, Noise XX proved the peer ID, muxer={muxer} \
+                         ({deviation})"
+                    ));
+                }
+                Err(why) => {
+                    tracing::warn!(peer = %peer.peer_id, addr = %peer.addr, %muxer, "connected on another muxer than yamux");
+                    check.fail(format!("{at}: Noise XX proved the peer ID, but {why}"));
+                }
+            },
             (Ok(()), None) => check.fail(format!("{at}: connected, but no muxer was reported")),
             (Err(why), _) => {
                 tracing::warn!(peer = %peer.peer_id, addr = %peer.addr, %why, "dial failed");
@@ -75,6 +101,41 @@ pub async fn connect<E: EthSpec>(devnet: &Devnet, plan: &ConnectPlan) -> Check {
         }
     }
     check
+}
+
+/// The muxer protocols our dial proposes, in order: those of cl-p2p's [`muxers`], the pair the
+/// probe swarm is built with, yamux first. The budget and its metrics are thrown away.
+#[must_use]
+pub fn our_offer() -> Vec<String> {
+    let mut registry = prometheus_client::registry::Registry::default();
+    let (yamux, mplex) = muxers(MuxerBudget::with_defaults(&TransportMetrics::register(
+        &mut registry,
+    )));
+    let yamux = yamux().protocol_info().map(str::to_owned);
+    yamux
+        .chain(mplex().protocol_info().map(str::to_owned))
+        .collect()
+}
+
+/// The verdict on `muxer`, negotiated on our dial with the proposals `offer`: yamux passes
+/// (`Ok(None)`); mplex passes as the recorded deviation (`Ok(Some(label))`) when yamux was
+/// proposed before it, so the peer refused yamux; anything else is the failure's reason.
+fn judge_muxer(offer: &[String], muxer: &str) -> Result<Option<&'static str>, String> {
+    if muxer == YAMUX {
+        return Ok(None);
+    }
+    let not_yamux = format!("the muxer is {muxer}, not {YAMUX}");
+    if muxer != MPLEX {
+        return Err(not_yamux);
+    }
+    // Every proposal before the one negotiated was refused.
+    if offer.iter().take_while(|p| *p != muxer).any(|p| p == YAMUX) {
+        Ok(Some(MPLEX_DEVIATION))
+    } else {
+        Err(format!(
+            "{not_yamux}, and our dial never proposed {YAMUX} before it: the peer may offer yamux"
+        ))
+    }
 }
 
 /// Dials `peer` from a swarm of its own, which is dropped when this returns: a dial that timed
@@ -161,7 +222,7 @@ mod tests {
     use consensus_types::Minimal;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn yamux_passes_and_every_other_outcome_fails() {
+    async fn yamux_and_a_refused_yamux_pass_and_every_other_outcome_fails() {
         let devnet = devnet();
         let cl = StandIn::spawn::<Minimal>(&devnet, None).await;
         let other = StandIn::spawn::<Minimal>(&devnet, None).await;
@@ -188,15 +249,55 @@ mod tests {
             !lines[2].pass && lines[2].detail.contains("refused"),
             "{lines:?}"
         );
-        assert!(!lines[3].pass, "{lines:?}");
-        assert!(lines[3].detail.contains("/mplex/6.7.0"), "{lines:?}");
+        // The mplex-only peer refused our yamux proposal: a pass, labelled as a deviation.
+        assert!(lines[3].pass, "{lines:?}");
+        assert!(
+            lines[3]
+                .detail
+                .contains("muxer=/mplex/6.7.0 (peer offers no yamux: recorded deviation)"),
+            "{lines:?}"
+        );
+        assert!(!lines[0].detail.contains("deviation"), "{lines:?}");
         assert!(!check.passed());
 
-        let only_good = ConnectPlan {
-            peers: vec![cl.pinned()],
+        let passing = ConnectPlan {
+            peers: vec![cl.pinned(), mplex],
             timeout: Duration::from_secs(10),
         };
-        assert!(connect::<Minimal>(&devnet, &only_good).await.passed());
+        assert!(connect::<Minimal>(&devnet, &passing).await.passed());
+    }
+
+    fn offer(protocols: &[&str]) -> Vec<String> {
+        protocols.iter().map(|p| (*p).to_owned()).collect()
+    }
+
+    #[test]
+    fn our_dial_proposes_yamux_before_mplex() {
+        assert_eq!(our_offer(), offer(&[YAMUX, MPLEX]));
+    }
+
+    #[test]
+    fn mplex_passes_only_after_a_refused_yamux_proposal() {
+        let ours = offer(&[YAMUX, MPLEX]);
+        assert_eq!(judge_muxer(&ours, YAMUX), Ok(None));
+        assert_eq!(
+            judge_muxer(&ours, MPLEX),
+            Ok(Some("peer offers no yamux: recorded deviation"))
+        );
+        // A peer never asked for yamux before it took mplex may well speak yamux: a failure.
+        for offered in [offer(&[MPLEX, YAMUX]), offer(&[MPLEX])] {
+            let why = judge_muxer(&offered, MPLEX).unwrap_err();
+            assert!(
+                why.contains("the muxer is /mplex/6.7.0, not /yamux/1.0.0"),
+                "{why}"
+            );
+            assert!(
+                why.contains("never proposed /yamux/1.0.0 before it"),
+                "{why}"
+            );
+        }
+        let why = judge_muxer(&ours, "/other/1.0.0").unwrap_err();
+        assert_eq!(why, "the muxer is /other/1.0.0, not /yamux/1.0.0");
     }
 
     /// A TCP proxy on 127.0.0.1 that holds each connection `delay` before it relays it to
