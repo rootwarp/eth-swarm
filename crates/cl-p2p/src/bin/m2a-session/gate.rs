@@ -27,7 +27,9 @@
 //! refused files (`tests::rule_cases`), and where the harness is in the tree they run the real
 //! script on every one of them and require the same verdict.
 //!
-//! Like the script, the file is read once: every rule is checked against the one read.
+//! Like the script, the file is read once, through one non-blocking open: the open file must be
+//! a regular file of at most 1 MiB (so a FIFO is refused, not waited on), at most 1 MiB + 1
+//! byte of it is read, and every rule is checked against that one read.
 //!
 //! Where the script compares with Python's `==`, this is stricter about types: `crashes`,
 //! `ooms`, `timeouts`, `exit_code` and `format` must be JSON integers (Python would also take
@@ -70,9 +72,13 @@ pub enum Expected {
 }
 
 impl Expected {
-    /// The values `build.rs` embedded.
+    /// The values `build.rs` wrote to `OUT_DIR` (files, not environment variables: `heads`
+    /// grows with the history), embedded.
     pub fn built() -> Self {
-        Self::from_build(env!("M2A_GATE_EXPECTED"), env!("M2A_GATE_UNAVAILABLE"))
+        Self::from_build(
+            include_str!(concat!(env!("OUT_DIR"), "/m2a-gate-expected.json")),
+            include_str!(concat!(env!("OUT_DIR"), "/m2a-gate-unavailable.txt")),
+        )
     }
 
     fn from_build(expected: &str, unavailable: &str) -> Self {
@@ -139,7 +145,7 @@ pub fn check(path: &Path, expected: &Expected) -> Result<(), GateError> {
             "not a regular file of at most {MAX_GATE_BYTES} bytes"
         ))
     };
-    let file = std::fs::File::open(path).map_err(|e| read_err(e.to_string()))?;
+    let file = open_nonblocking(path).map_err(|e| read_err(e.to_string()))?;
     let meta = file.metadata().map_err(|e| read_err(e.to_string()))?;
     if !meta.is_file() || meta.len() > MAX_GATE_BYTES {
         return Err(too_big());
@@ -162,6 +168,16 @@ pub fn check(path: &Path, expected: &Expected) -> Result<(), GateError> {
             errors,
         })
     }
+}
+
+/// Opens `path` for reading without blocking (`O_NONBLOCK`): a FIFO with no writer opens at once
+/// and is then refused by the caller's check of the open file (`fstat`), so the file checked is
+/// the file read. A symlink is followed, as the script's `open` does.
+fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    let fd = rustix::fs::open(path, flags, Mode::empty())?;
+    Ok(std::fs::File::from(fd))
 }
 
 fn as_int(v: Option<&Value>) -> Option<i128> {
@@ -864,9 +880,52 @@ pub(crate) mod tests {
             gate["head"] = behind.clone();
             cases.push(("a head behind HEAD with its key", gate, None));
         }
-        for (i, (rule, gate, by_script)) in cases.into_iter().enumerate() {
+        // An annotated tag of HEAD: it names HEAD's commit, but is not a commit id. The tag
+        // object is written to the object store with no ref (`git mktag`).
+        let tag = {
+            let mut child = std::process::Command::new("git")
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .current_dir(&repo)
+                .arg("mktag")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let body = format!(
+                "object {}\ntype commit\ntag m2a-gate-agreement\ntagger t <t@example.invalid> 0 +0000\n\nannotated\n",
+                git(&["rev-parse", "HEAD"]).trim()
+            );
+            std::io::Write::write_all(&mut child.stdin.take().unwrap(), body.as_bytes()).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "git mktag: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        let mut tagged = passing_gate(&want);
+        tagged["head"] = Value::from(tag);
+        cases.push(("an annotated tag as head", tagged, Some(Script::Refuses)));
+        let mut files: Vec<(&str, Vec<u8>, Option<Script>)> = cases
+            .into_iter()
+            .map(|(rule, gate, by_script)| (rule, gate.to_string().into_bytes(), by_script))
+            .collect();
+        // The size bound: a passing file padded with spaces to exactly the bound passes both,
+        // and one byte more fails both.
+        let padded = |size: u64| {
+            let mut text = passing_gate(&want).to_string().into_bytes();
+            text.resize(size as usize, b' ');
+            text
+        };
+        files.push(("padded to the bound", padded(MAX_GATE_BYTES), None));
+        files.push((
+            "padded past the bound",
+            padded(MAX_GATE_BYTES + 1),
+            Some(Script::Refuses),
+        ));
+        for (i, (rule, text, by_script)) in files.into_iter().enumerate() {
             let path = dir.path().join(format!("case-{i}.json"));
-            std::fs::write(&path, gate.to_string()).unwrap();
+            std::fs::write(&path, text).unwrap();
             let ours = check(&path, &Expected::Known(want.clone())).is_ok();
             let out = script(&[path.as_os_str()]);
             let theirs = match out.status.code() {
@@ -926,6 +985,32 @@ pub(crate) mod tests {
         );
     }
 
+    /// A FIFO with no writer at the gate path is refused at once, not waited on: the open does
+    /// not block, and the open file is checked before anything is read.
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("m2a-gate.json");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo: {made}");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(check(&path, &Expected::Known(fixture_expected())));
+        });
+        let verdict = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("check blocked on a FIFO with no writer");
+        let err = verdict.unwrap_err();
+        assert!(
+            matches!(&err, GateError::Read { reason, .. } if reason.contains("not a regular file")),
+            "{err}"
+        );
+    }
+
     #[test]
     fn embedded_expectations_parse() {
         assert_eq!(
@@ -959,6 +1044,17 @@ pub(crate) mod tests {
                 "{bad}"
             );
         }
+        // The build writes them to files in OUT_DIR, not to an environment variable (one is
+        // capped at 128 KiB on Linux, and `heads` grows with the history), and embeds those.
+        let out = Path::new(env!("OUT_DIR"));
+        let read = |name: &str| std::fs::read_to_string(out.join(name)).unwrap();
+        assert_eq!(
+            Expected::built(),
+            Expected::from_build(
+                &read("m2a-gate-expected.json"),
+                &read("m2a-gate-unavailable.txt")
+            )
+        );
         // This build's: either every expected value, or a reason.
         match Expected::built() {
             Expected::Known(v) => assert!(v["decoder_key"]["git"].is_object()),

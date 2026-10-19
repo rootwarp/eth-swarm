@@ -89,3 +89,42 @@ esac
 EOF
   chmod +x "$1/cargo" "$1/rustc"
 }
+
+# deadline <seconds> <command...>: runs the command, and kills it and its children (status 124)
+# if it is still running after that many seconds, so a check that blocks fails the test instead
+# of hanging it.
+deadline() {
+  local secs=$1 pid ticks=0
+  shift
+  "$@" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if ((ticks >= secs * 10)); then
+      pkill -P "$pid" 2>/dev/null || true
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      echo "deadline: still running after $secs s: $*"
+      return 124
+    fi
+    sleep 0.1
+    ticks=$((ticks + 1))
+  done
+  wait "$pid"
+}
+
+# gate_file_size_cases <passing gate file> <dir>: writes the size cases of a gate file there:
+# at-limit.json (the passing file padded with spaces to exactly 1 MiB, still valid),
+# over-limit.json (padded to 1 MiB + 1 byte) and sparse.json (a 64 MiB sparse file).
+gate_file_size_cases() {
+  python3 -I - "$1" "$2" 1048576 <<'PY'
+import os, sys
+src, out, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with open(src, "rb") as f:
+    data = f.read()
+for name, size in (("at-limit.json", limit), ("over-limit.json", limit + 1)):
+    with open(os.path.join(out, name), "wb") as f:
+        f.write(data + b" " * (size - len(data)))
+with open(os.path.join(out, "sparse.json"), "wb") as f:
+    f.truncate(64 << 20)
+PY
+}

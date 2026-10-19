@@ -173,6 +173,12 @@ check fail "an unknown head" "is not a commit of this repository" bash "$checker
 tree=$(g rev-parse 'HEAD^{tree}')
 check fail "a head that names a tree, not a commit" "is not a commit of this repository" bash "$checker" \
   "$(gate gate1 "$tmp/treehead.json" "gate['head'] = '$tree'")"
+# An annotated tag of HEAD names HEAD's commit, but is not one.
+g tag -a -m annotated annotated HEAD
+tag=$(g rev-parse annotated)
+g tag -d annotated >/dev/null
+check fail "a head that names an annotated tag, not a commit" "is not a commit of this repository" bash "$checker" \
+  "$(gate gate1 "$tmp/taghead.json" "gate['head'] = '$tag'")"
 g checkout -q -b side
 echo 'side' > "$fx/side.txt"
 g add side.txt
@@ -219,6 +225,15 @@ check pass "a head behind HEAD with the same key" "gate 1 OK" bash "$checker" \
   "$(gate gate1 "$tmp/behind.json" "gate['head'] = '$fuzzed'")"
 g reset -q --hard HEAD~1
 check fail "no argument" "Usage" bash "$checker"
+# The file is read through one bounded open (the m2a checker tests have the rest of the cases).
+mkdir -p "$tmp/sizes"
+gate_file_size_cases "$ok1" "$tmp/sizes"
+check pass "a valid file padded to exactly 1 MiB" "gate 1 OK" bash "$checker" "$tmp/sizes/at-limit.json"
+check fail "a valid file padded past 1 MiB" "not a regular file of at most 1048576 bytes" \
+  bash "$checker" "$tmp/sizes/over-limit.json"
+mkfifo "$tmp/sizes/fifo.json"
+check fail "a FIFO with no writer, refused without blocking" "not a regular file" \
+  deadline 30 bash "$checker" "$tmp/sizes/fifo.json"
 check fail "two files" "Usage" bash "$checker" "$ok1" "$ok1"
 check fail "an unknown gate" "m2a or gate1" bash "$m2a_checker" --gate gate2 "$ok1"
 

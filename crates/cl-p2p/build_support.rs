@@ -117,6 +117,32 @@ pub fn watch_path(repo: &Path, rel: &str) -> Option<PathBuf> {
     }
 }
 
+/// What the history depth of `repo` hangs on, for `rerun-if-changed`: the ancestors git lists
+/// change when a shallow clone is deepened or unshallowed, with HEAD where it was.
+///
+/// In a shallow clone that is git's `shallow` file, in the common git dir (`git rev-parse
+/// --git-path shallow`, also from a linked worktree): a deepening fetch rewrites it, and
+/// `--unshallow` removes it. In a full clone it is missing, and cargo reruns on every build for a
+/// missing path, so the watch is then the `FETCH_HEAD` that every fetch writes (the one that
+/// makes a clone shallow too), of this worktree's git dir and of the common one, where they
+/// exist. Only paths that exist are returned.
+pub fn history_watch(repo: &Path, env: &[(OsString, OsString)]) -> Vec<PathBuf> {
+    let path = |args: &[&str]| git(repo, args, env).ok().map(|p| repo.join(p.trim()));
+    if let Some(shallow) = path(&["rev-parse", "--git-path", "shallow"]).filter(|p| p.exists()) {
+        return vec![shallow];
+    }
+    let mut out = Vec::new();
+    for dir in ["--git-dir", "--git-common-dir"] {
+        let Some(fetch_head) = path(&["rev-parse", dir]).map(|d| d.join("FETCH_HEAD")) else {
+            continue;
+        };
+        if fetch_head.exists() && !out.contains(&fetch_head) {
+            out.push(fetch_head);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +335,77 @@ mod tests {
         assert!(err.starts_with("no git checkout"), "{err}");
         let err = locate_repo(dir.path(), &os(&[("PATH", "/nonexistent")])).unwrap_err();
         assert!(err.starts_with("no git checkout: cannot run git"), "{err}");
+    }
+
+    /// The history depth hangs on git's shallow file while the clone is shallow (the common git
+    /// dir's, also from a linked worktree), and on the fetch that writes FETCH_HEAD otherwise.
+    #[test]
+    fn the_history_depth_is_watched() {
+        let env = real_env();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let origin = root.join("origin");
+        init_repo(&origin);
+        for n in ["a", "b", "c"] {
+            std::fs::write(origin.join(n), n).unwrap();
+            git(&origin, &["add", n], &env).unwrap();
+            let msg = format!("commit {n}");
+            git(
+                &origin,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "-q",
+                    "-m",
+                    &msg,
+                ],
+                &env,
+            )
+            .unwrap();
+        }
+        let canonical = |paths: Vec<PathBuf>| -> Vec<PathBuf> {
+            paths.iter().map(|p| p.canonicalize().unwrap()).collect()
+        };
+        // A full clone that never fetched: nothing to watch (a missing path reruns every build).
+        assert_eq!(history_watch(&origin, &env), Vec::<PathBuf>::new());
+        git(&origin, &["fetch", "-q", ".", "HEAD"], &env).unwrap();
+        assert_eq!(
+            canonical(history_watch(&origin, &env)),
+            vec![origin.join(".git/FETCH_HEAD")]
+        );
+        let url = format!("file://{}", origin.display());
+        let shallow = root.join("shallow");
+        git(
+            &root,
+            &["clone", "-q", "--depth", "1", &url, "shallow"],
+            &env,
+        )
+        .unwrap();
+        assert_eq!(
+            canonical(history_watch(&shallow, &env)),
+            vec![shallow.join(".git/shallow")]
+        );
+        let linked = root.join("linked");
+        git(
+            &shallow,
+            &["worktree", "add", "-q", "--detach", "../linked"],
+            &env,
+        )
+        .unwrap();
+        assert_eq!(
+            canonical(history_watch(&linked, &env)),
+            vec![shallow.join(".git/shallow")],
+            "a linked worktree shares the common dir's shallow file"
+        );
+        git(&linked, &["fetch", "-q", "--unshallow"], &env).unwrap();
+        assert!(!shallow.join(".git/shallow").exists());
+        assert_eq!(
+            canonical(history_watch(&linked, &env)),
+            vec![shallow.join(".git/worktrees/linked/FETCH_HEAD")]
+        );
     }
 
     #[test]

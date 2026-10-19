@@ -23,17 +23,24 @@
 //! user, which would need `safe.directory`, fails closed).
 //!
 //! Unavailable values (no git checkout, a copy outside its checkout, no harness in the tree, a
-//! dirty or missing keyed path, a script failure) are embedded as the reason
-//! (`M2A_GATE_UNAVAILABLE`), and the binary's pre-flight then refuses every gate file. Every
-//! other part of the crate builds as usual. The scripts need bash and python3.
+//! dirty or missing keyed path, a script failure) are embedded as the reason, and the binary's
+//! pre-flight then refuses every gate file. Every other part of the crate builds as usual. The
+//! scripts need bash and python3.
+//!
+//! The values go to the binary as two files in `OUT_DIR`, which it embeds with `include_str!`:
+//! `m2a-gate-expected.json` (the JSON, or empty) and `m2a-gate-unavailable.txt` (the reason, or
+//! empty). Not as `rustc-env` variables: `heads` grows with the history, and one environment
+//! string is capped at 128 KiB on Linux.
 //!
 //! Cargo reruns this script when a keyed path or a harness script changes on disk (or, while
-//! one is missing, its nearest existing parent below the repository root), or when git's
-//! `HEAD`, the current branch ref or the index changes (a commit, checkout or `git add`).
+//! one is missing, its nearest existing parent below the repository root), when git's `HEAD`,
+//! the current branch ref or the index changes (a commit, checkout or `git add`), or when the
+//! history depth may have (`build_support::history_watch`: a shallow clone deepened or
+//! unshallowed, or a full one made shallow).
 
 mod build_support;
 
-use build_support::{child_env, command, git, locate_repo, run, watch_path};
+use build_support::{child_env, command, git, history_watch, locate_repo, run, watch_path};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -64,15 +71,20 @@ fn main() {
         "cargo:rustc-env=M2A_DEFAULT_GATE_FILE={}",
         gate_file.display()
     );
-    match expected {
-        Ok(json) => {
-            println!("cargo:rustc-env=M2A_GATE_EXPECTED={json}");
-            println!("cargo:rustc-env=M2A_GATE_UNAVAILABLE=");
-        }
-        Err(reason) => {
-            let reason = reason.replace(['\n', '\r'], " ");
-            println!("cargo:rustc-env=M2A_GATE_EXPECTED=");
-            println!("cargo:rustc-env=M2A_GATE_UNAVAILABLE={reason}");
+    let (json, reason) = match expected {
+        Ok(json) => (json, String::new()),
+        Err(reason) => (String::new(), reason.replace(['\n', '\r'], " ")),
+    };
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("set by cargo"));
+    for (name, text) in [
+        ("m2a-gate-expected.json", json),
+        ("m2a-gate-unavailable.txt", reason),
+    ] {
+        // Rewritten only on a change: the binary embeds the file, so a new mtime rebuilds it.
+        let path = out.join(name);
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+            std::fs::write(&path, text)
+                .unwrap_or_else(|e| panic!("cannot write {}: {e}", path.display()));
         }
     }
 }
@@ -93,8 +105,9 @@ fn watch(repo: &Path, rel: &str) {
     }
 }
 
-/// `rerun-if-changed` for git's HEAD, branch ref, packed refs and index. Only files that exist
-/// are listed: cargo reruns on every build for a missing one.
+/// `rerun-if-changed` for git's HEAD, branch ref, packed refs and index, and for the history
+/// depth ([`history_watch`]). Only files that exist are listed: cargo reruns on every build for
+/// a missing one.
 fn watch_git(repo: &Path, env: &Env) {
     let mut names = vec![
         "HEAD".to_owned(),
@@ -111,6 +124,9 @@ fn watch_git(repo: &Path, env: &Env) {
                 println!("cargo:rerun-if-changed={}", p.display());
             }
         }
+    }
+    for p in history_watch(repo, env) {
+        println!("cargo:rerun-if-changed={}", p.display());
     }
 }
 

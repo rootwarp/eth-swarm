@@ -187,6 +187,21 @@ printf 'not json' > "$tmp/bad.json"
 check fail "not JSON" "not valid JSON" bash "$checker" "$tmp/bad.json"
 check fail "no such file" "" bash "$checker" "$tmp/missing.json"
 check fail "no argument" "Usage" bash "$checker"
+# The file is read through one open, at most 1 MiB + 1 byte of it, and the open file must be a
+# regular file of at most 1 MiB (the m2a-session binary's bound): a FIFO with no writer is
+# refused without blocking, and neither a large sparse file nor a valid file padded past the
+# bound is copied or passes.
+mkdir -p "$tmp/sizes"
+gate_file_size_cases "$tmp/ok.json" "$tmp/sizes"
+check pass "a valid file padded to exactly 1 MiB" "m2a gate OK" bash "$checker" "$tmp/sizes/at-limit.json"
+check fail "a valid file padded past 1 MiB" "not a regular file of at most 1048576 bytes" \
+  bash "$checker" "$tmp/sizes/over-limit.json"
+check fail "a 64 MiB sparse file" "not a regular file of at most 1048576 bytes" \
+  bash "$checker" "$tmp/sizes/sparse.json"
+mkfifo "$tmp/sizes/fifo.json"
+check fail "a FIFO with no writer, refused without blocking" "not a regular file" \
+  deadline 30 bash "$checker" "$tmp/sizes/fifo.json"
+check fail "a directory" "not a regular file" bash "$checker" "$tmp/sizes"
 
 # The commit the file names: a commit of this repository, an ancestor of HEAD, whose decoder key
 # is the file's (it was fuzzed at that commit; HEAD may have moved on outside the key).
@@ -205,6 +220,13 @@ check fail "an unknown head" "is not a commit of this repository" bash "$checker
 tree=$(g rev-parse 'HEAD^{tree}')
 check fail "a head that names a tree, not a commit" "is not a commit of this repository" bash "$checker" \
   "$(gate "$tmp/treehead.json" "gate['head'] = '$tree'")"
+# An annotated tag of HEAD names HEAD's commit, but is not one: the m2a-session binary, holding
+# `head` to its list of commit ids, refuses it too.
+g tag -a -m annotated annotated HEAD
+tag=$(g rev-parse annotated)
+g tag -d annotated >/dev/null
+check fail "a head that names an annotated tag, not a commit" "is not a commit of this repository" bash "$checker" \
+  "$(gate "$tmp/taghead.json" "gate['head'] = '$tag'")"
 g checkout -q -b side
 echo 'side' > "$fx/side.txt"
 g add side.txt
@@ -384,6 +406,42 @@ git -C "$other" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign
 key=$(bash "$checker" --print-key)
 check pass "a GIT_DIR at another repository does not change the key" "$key" \
   env GIT_DIR="$other/.git" bash "$checker" --print-key
+
+# A long history with one decoder key: `heads` outgrows one environment string (128 KiB on
+# Linux; on macOS arguments and environment share ARG_MAX), so it must reach Python as a file.
+# The commits keep HEAD's tree (git fast-import), in a copy of the fixture.
+count_heads() {
+  bash "$1" --print-expected | python3 -I -c 'import json, sys; print(len(json.load(sys.stdin)["heads"]))'
+}
+want_heads=$(count_heads "$checker")
+big="$tmp/big"
+cp -R "$fx" "$big"
+if [[ $(uname -s) == Linux ]]; then
+  many=3500
+else
+  many=$(($(getconf ARG_MAX 2>/dev/null || echo 1048576) / 40 + 1000))
+fi
+python3 -I -c '
+import sys
+n, ref, head = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+out = []
+for i in range(n):
+    out.append(f"commit {ref}\ncommitter t <t@example.invalid> {i} +0000\ndata 0\n")
+    out.append(f"from {head}\n\n" if i == 0 else "\n")
+sys.stdout.write("".join(out))
+' "$many" "$(g symbolic-ref HEAD)" "$(g rev-parse HEAD)" >"$tmp/big.stream"
+git -C "$big" fast-import --quiet <"$tmp/big.stream"
+git -C "$big" reset -q --hard
+check pass "a file of a history of $many commits with one key" "m2a gate OK" \
+  bash "$big/fuzz/check-m2a-gate.sh" "$tmp/ok.json"
+want_heads=$((want_heads + many))
+big_heads=$(count_heads "$big/fuzz/check-m2a-gate.sh") || big_heads=0
+if ((big_heads == want_heads)); then
+  ok "the expected heads list every one of the $want_heads commits with the key"
+else
+  bad "expected heads: $big_heads, want $want_heads"
+fi
+rm -rf "$big" "$tmp/big.stream"
 
 check pass "the real repo's key prints" '"crates/p2p-wire"' bash "$repo/fuzz/check-m2a-gate.sh" --print-key
 check pass "the real repo's key holds the root lock" '"Cargo.lock": "' bash "$repo/fuzz/check-m2a-gate.sh" --print-key

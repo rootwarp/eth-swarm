@@ -20,26 +20,34 @@
 #   - each target's corpus_sha256 equals that of fuzz/corpus/<target> now;
 #   - each target exercised its decoder: its coverage features once the seeds were loaded
 #     (seed_ft) reach its floor (m2a_min_seed_ft) and the final count is no lower;
-#   - `head` is the full lowercase hex id of a commit of this repository, an ancestor of HEAD,
-#     and the decoder key at that commit (from git, not the working tree) is the file's, so the
-#     file names a commit that was fuzzed. The m2a-session binary mirrors the m2a rules; having
-#     no git at run time, it holds `head` to the `heads` of --print-expected (m2a_key_heads:
-#     HEAD and its ancestors with HEAD's key), embedded when it was built;
+#   - `head` is the full lowercase hex id of a commit of this repository (a commit object, not a
+#     tag that points at one), an ancestor of HEAD, and the decoder key at that commit (from git,
+#     not the working tree) is the file's, so the file names a commit that was fuzzed. The
+#     m2a-session binary mirrors the m2a rules; having no git at run time, it holds `head` to
+#     the `heads` of --print-expected (m2a_key_heads: HEAD and its ancestors with HEAD's key),
+#     embedded when it was built;
 #   - no tool override (CARGO, RUSTC, FUZZ_TOOLCHAIN, RUSTUP_TOOLCHAIN) was in use: `overrides`
 #     is empty. fuzz/run-m2a-gate.sh refuses the environment variables and cargo config that
 #     would change the build or run, so a file it wrote holds only for a clean environment.
 # The file is read once, into a private copy every rule is checked against, so a file replaced
-# while the checks run is not half seen.
+# while the checks run is not half seen. That read is one non-blocking open, and the open file
+# must be a regular file of at most 1 MiB (GATE_MAX_BYTES, the binary's bound): a FIFO is
+# refused, not waited on, and at most 1 MiB + 1 byte is copied.
 #
 # Usage: fuzz/check-m2a-gate.sh [--gate m2a|gate1] <gate.json>      verify the gate file
 #        fuzz/check-m2a-gate.sh [--gate m2a|gate1] --print-key        print this tree's decoder key
 #        fuzz/check-m2a-gate.sh [--gate m2a|gate1] --print-expected   print every value a gate file
 #                                                                     must hold
-# Exit: 0 valid, 1 invalid or stale, 2 usage error or the key cannot be computed.
+# Exit: 0 valid, 1 invalid, stale or over the size bound, 2 usage error, a file that cannot be
+# opened or is not a regular file, or the key cannot be computed.
 # Needs git and python3. Works on bash 3.2.
 set -euo pipefail
 # shellcheck source=m2a-common.sh
 . "$(dirname "$0")/m2a-common.sh"
+
+# A gate file larger than this is not one run-m2a-gate.sh wrote; the m2a-session binary
+# (MAX_GATE_BYTES in crates/cl-p2p/src/bin/m2a-session/gate.rs) holds files to the same bound.
+GATE_MAX_BYTES=1048576
 
 usage() {
   echo "Usage: fuzz/check-m2a-gate.sh [--gate m2a|gate1] <gate.json> | --print-key | --print-expected"
@@ -79,15 +87,51 @@ case $1 in
   -*) usage ;;
 esac
 file=$1
-[[ -f $file ]] || { echo "ERROR: $file: no such file"; exit 2; }
-# Every check reads this copy, taken once (mktemp -d: mode 0700); stderr of the key computation
-# lands next to it.
+# Every check reads this copy, taken once (mktemp -d: mode 0700); the expected values and the
+# stderr of the key computation land next to it.
 work=$(mktemp -d) || exit 2
 trap 'rm -rf "$work"' EXIT
 gate_copy=$work/gate.json
-cat -- "$file" >"$gate_copy" || { echo "ERROR: $file: cannot be read"; exit 1; }
+# One open of the file (O_NONBLOCK: a FIFO with no writer opens at once), and on that descriptor
+# the checks the m2a-session binary makes: a regular file (fstat) of at most GATE_MAX_BYTES, of
+# which at most GATE_MAX_BYTES + 1 bytes are read, so a file that grows past the bound after the
+# fstat is refused too. Exit 2 if it cannot be opened or is not a regular file, 1 if it is over
+# the bound.
+python3 -I - "$file" "$gate_copy" "$GATE_MAX_BYTES" <<'PY' || exit $?
+import os, stat, sys
+path, copy, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
+refused = f"ERROR: {path}: not a regular file of at most {limit} bytes"
+try:
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+except OSError as e:
+    print(f"ERROR: {path}: cannot be opened: {e.strerror}")
+    sys.exit(2)
+try:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        print(refused)
+        sys.exit(2)
+    data = bytearray()
+    while st.st_size <= limit and len(data) <= limit:
+        chunk = os.read(fd, limit + 1 - len(data))
+        if not chunk:
+            break
+        data += chunk
+except OSError as e:
+    print(f"ERROR: {path}: cannot be read: {e.strerror}")
+    sys.exit(2)
+finally:
+    os.close(fd)
+if st.st_size > limit or len(data) > limit:
+    print(refused)
+    sys.exit(1)
+with open(copy, "xb") as out:
+    out.write(data)
+PY
 
-expected=$(expected_json) || exit 2
+# The expected values go to Python as a file: `heads` grows with the history, and one
+# environment string is capped (128 KiB on Linux).
+expected_json >"$work/expected.json" || exit 2
 dirty=$(m2a_dirty_paths)
 if [[ -n $dirty ]]; then
   echo "ERROR: keyed paths have uncommitted changes; the gate cannot vouch for this tree:"
@@ -97,7 +141,8 @@ fi
 
 # The commit the file names must be the one it vouches for. Sets head_error to why `head` cannot
 # be, or head_key to the decoder key at it, which the checks below hold to the file's: `head` is
-# the full lowercase hex id of a commit of this repository, an ancestor of HEAD (the tree may
+# the full lowercase hex id of a commit object of this repository (git cat-file -t: an annotated
+# tag's id, which ^{commit} would peel, is not one), an ancestor of HEAD (the tree may
 # have moved on since, outside the key), and the key computed at it from git (m2a_key_json
 # <commit>, which reads no file of the working tree) is the file's. The key is m2a_key_json's
 # stdout only; its stderr (git's warnings, or why it failed) is passed on, or is the error.
@@ -126,7 +171,7 @@ print(head.encode("unicode_escape").decode("ascii"))
   [[ $format != sha256 ]] || len=64
   if ! [[ $head =~ ^[0-9a-f]+$ ]] || ((${#head} != len)); then
     head_error="head: '${head:0:80}' is not a $len-character lowercase hex commit id"
-  elif ! m2a_git cat-file -e "$head^{commit}" 2>/dev/null; then
+  elif [[ $(m2a_git cat-file -t "$head" 2>/dev/null) != commit ]]; then
     head_error="head: $head is not a commit of this repository"
   elif ! m2a_git merge-base --is-ancestor "$head" HEAD 2>/dev/null; then
     head_error="head: $head is not an ancestor of HEAD"
@@ -139,16 +184,17 @@ print(head.encode("unicode_escape").decode("ascii"))
 }
 check_head
 
-EXPECTED=$expected REQUIRED=$M2A_REQUIRED_SECONDS TARGETS="${GATE_TARGETS[*]}" \
+REQUIRED=$M2A_REQUIRED_SECONDS TARGETS="${GATE_TARGETS[*]}" \
   GATE_ID=$GATE_ID GATE_LABEL=$GATE_LABEL HEAD_ERROR=$head_error \
-  HEAD_KEY=$head_key python3 -I - "$file" "$gate_copy" <<'PY'
+  HEAD_KEY=$head_key python3 -I - "$file" "$gate_copy" "$work/expected.json" <<'PY'
 import json, os, sys
 
 path, copy = sys.argv[1], sys.argv[2]
 gate_id, label = os.environ["GATE_ID"], os.environ["GATE_LABEL"]
 required = int(os.environ["REQUIRED"])
 want_targets = os.environ["TARGETS"].split()
-want = json.loads(os.environ["EXPECTED"])
+with open(sys.argv[3]) as f:
+    want = json.load(f)
 key = want["decoder_key"]
 errors = []
 
