@@ -28,10 +28,12 @@
 # enclaves, each step bounded and run even if an earlier one failed, so no ~4.75 GiB pair is left
 # running. A job's process group is also stopped as soon as its leader ends (each launch's as soon
 # as that launch ends), so nothing a step left behind outlives it. Whether a job still runs is
-# what bash saw of it (its job table), never a lookup of its pid, which another process may have
-# taken once the job ended. A group that bash saw end is signalled only while, in the process list
-# read just before, it has a process and no process has its id as pid (bash has reaped the leader,
-# so a process with that pid leads another group); what that cannot rule out is in signal_left.
+# what bash saw of it (its job table, a stopped job counted as running), never a lookup of its
+# pid, which another process may have taken once the job ended. A group that bash saw end is
+# signalled only while, in the process list read just before, it has a process and no process has
+# its id as pid (bash has reaped the leader, so a process with that pid leads another group); what
+# that cannot rule out is in signal_left. No id below 2, and never the script's own pid, is
+# signalled. Every ps runs under LC_ALL=C.
 # While a job runs, target/kurtosis/pair-T/job-groups lists the process group of each (one per
 # line, replaced whole; the teardown removes the file), for a run killed with SIGKILL
 # (stop-killed-run.sh, and README.md, "Acceptance checks"). The run logs, the check log, the
@@ -187,29 +189,50 @@ spawn() {
     exit "$code"
   fi
 }
+# live_jobs: sets live to ` <pid> ... `, the jobs bash has not seen end: those it runs and those
+# it shows stopped (SIGSTOP; bash tells them apart only with job control, SHELLOPTS=monitor say).
+# A stopped job has not ended: it still counts, and gets the signals. (`jobs` straight in the
+# $(...): in a function or a group piped to another command, it sees no jobs.)
+live=''
+live_jobs() {
+  local nl=$'\n'
+  live=$(jobs -rp; jobs -sp)
+  live=" ${live//"$nl"/ } "
+}
 # jobs_running <pid...>: 0 while bash has not seen one of these jobs end. It reads bash's own job
-# table, not the pid: once a job ends, another process may take its pid, and must never count.
+# table (live_jobs), not the pid: once a job ends, another process may take its pid, and must never
+# count.
 jobs_running() {
-  local running pid
-  running=" $(jobs -rp | tr '\n' ' ') "
-  for pid in "$@"; do if [[ $running == *" $pid "* ]]; then return 0; fi; done
+  local pid
+  live_jobs
+  for pid in "$@"; do if [[ $live == *" $pid "* ]]; then return 0; fi; done
   return 1
 }
-# ps_table: one line per process, `pid pgid stat start ppid` (start: ps's lstart, its spaces as _).
+# signalable <id>: the id may be signalled, as a pid or a group: a number of 2 or more (kill -- -1
+# would reach every process the user owns, and 0 this script's own group), not this script's pid.
+signalable() {
+  [[ $1 =~ ^[1-9][0-9]{0,9}$ ]] && (($1 >= 2 && $1 != $$))
+}
+# ps_table: one line per process, `pid pgid stat start ppid` (start: ps's lstart under LC_ALL=C,
+# so in the same words whatever the locale, its spaces as _).
 ps_table() {
-  ps -A -o pid= -o pgid= -o stat= -o ppid= -o lstart= 2>/dev/null |
+  LC_ALL=C ps -A -o pid= -o pgid= -o stat= -o ppid= -o lstart= 2>/dev/null |
     awk '{ s = $5; for (i = 6; i <= NF; i++) s = s "_" $i; print $1, $2, $3, s, $4 }'
 }
 # descendants <pid> <table>: `pid@start` of every descendant of the process in the ps_table
 # <table>, deepest first. The pid and start come from one listing, so each names the process
-# that was a descendant when it was read, never one that took its pid later.
+# that was a descendant when it was read, never one that took its pid later. A pid below 2 is no
+# descendant (a listing that says so is wrong): it is left out, and so is everything below it.
 descendants() {
   awk -v root="$1" '
     { kids[$5] = kids[$5] " " $1; start[$1] = $4 }
     function walk(p,   list, n, i) {
       if (seen[p]++) return
       n = split(kids[p], list, " ")
-      for (i = 1; i <= n; i++) { walk(list[i]); print list[i] "@" start[list[i]] }
+      for (i = 1; i <= n; i++) {
+        if (list[i] + 0 < 2) continue
+        walk(list[i]); print list[i] "@" start[list[i]]
+      }
     }
     END { walk(root) }' <<<"$2"
 }
@@ -239,29 +262,38 @@ still_here() {
 # signal_left <signal> <pid...> -- <pid@start...>: the signal to each job that bash still runs
 # (its process group, and the job itself, whose group may not exist yet right after its start), to
 # the group of each job that bash saw end only while that group still holds its id (GROUP_LEFT),
-# and to each recorded process only while the same process (pid and start) runs. The job table is
-# read before the process list (see still_here), and the list just before the signals. Two cases
-# remain where a signal can reach another process's group: the group empties and its id passes to
-# a new group in the milliseconds between that list and the kill; or, before the list, the group
-# emptied, a new process took the id as its pid and group, and that process ended while its group
-# lived on. Either needs the kernel to hand the same pid out again within that time.
+# and to each recorded process only while the same process (pid and start) runs. A TERM to a job
+# is followed by CONT to it and its group, so a stopped one (live_jobs) acts on it; an id that is
+# not signalable gets no signal. The job table is read before the process list (see still_here),
+# and the list just before the signals. Two cases remain where a signal can reach another
+# process's group: the group empties and its id passes to a new group in the milliseconds between
+# that list and the kill; or, before the list, the group emptied, a new process took the id as its
+# pid and group, and that process ended while its group lived on. Either needs the kernel to hand
+# the same pid out again within that time.
 signal_left() {
   local sig=$1 g rec table running
   shift
-  running=" $(jobs -rp | tr '\n' ' ') "
+  live_jobs
+  running=$live
   table=$(ps_table)
   while (($# > 0)) && [[ $1 != -- ]]; do
     g=$1
     shift
+    if ! signalable "$g"; then continue; fi
     if [[ $running == *" $g "* ]]; then
       kill "-$sig" -- "-$g" 2>/dev/null || true
       kill "-$sig" "$g" 2>/dev/null || true
+      if [[ $sig == TERM ]]; then
+        kill -CONT -- "-$g" 2>/dev/null || true
+        kill -CONT "$g" 2>/dev/null || true
+      fi
     elif awk -v g="$g" "$GROUP_LEFT" <<<"$table"; then
       kill "-$sig" -- "-$g" 2>/dev/null || true
     fi
   done
   if (($# > 0)); then shift; fi
   for rec in "$@"; do
+    if ! signalable "${rec%%@*}"; then continue; fi
     if awk -v p="${rec%%@*}" -v s="${rec#*@}" '$1 == p && $4 == s && $3 !~ /^Z/ { found = 1 } END { exit !found }' <<<"$table"; then
       kill "-$sig" "${rec%%@*}" 2>/dev/null || true
     fi
@@ -606,11 +638,12 @@ while (( $(now) < T )); do
 done
 # The check's own exit code, not tee's: a check.log that cannot be written turns only a PASS
 # into a 2 (no record of it), never a FAIL or DIAGNOSTIC into something else. The wrapper resets
-# errexit and pipefail first: an exported SHELLOPTS would hand it the script's own.
+# errexit, pipefail and job control (monitor) first: an exported SHELLOPTS would hand it the
+# script's own, and with job control its pipeline would leave the job's process group.
 rc=0
 # shellcheck disable=SC2016 # expanded by the inner bash, from its arguments
 bounded "$CHECK_TIMEOUT" - - "${BASH:-bash}" -c '
-  set +e +o pipefail
+  set +e +m +o pipefail
   check=$1 log=$2
   shift 2
   "$BASH" "$check" "$@" 2>&1 | tee "$log"

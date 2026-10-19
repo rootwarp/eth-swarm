@@ -181,47 +181,106 @@ exit 127
 SH
 cat > "$stubs/ps" <<'SH'
 #!/usr/bin/env bash
-# ps stub: with $STUB_DIR/ps.reused, `ps ... -p PID` reports every pid as a running process (as if
-# each pid were taken by another process the moment it ends). With $STUB_DIR/ps.reuse (names of
-# pid files under $STUB_DIR, one per line), each pid in those files that the real ps no longer
-# shows is reported as taken by another process, the leader of a new group (its pgid the same
-# pid, ppid 1, its command `foreign`), in a listing of every process (-A) and for `-p` that pid;
-# the fields follow the -o lists. Else the real ps.
+# ps stub, over the real ps; a line it adds has the fields of the -o lists:
+#   $STUB_DIR/ps.reused: `ps ... -p PID` reports every pid as a running process (as if each pid
+#     were taken by another process the moment it ends).
+#   $STUB_DIR/ps.reuse (names of pid files under $STUB_DIR, one per line): each pid in those files
+#     that the real ps no longer shows is reported as taken by another process, the leader of a new
+#     group (its pgid the same pid, ppid 1, its command `foreign`), in a listing of every process
+#     (-A) and for `-p` that pid.
+#   $STUB_DIR/ps.fake (lines `<pid> <ppid> <command...>`; a ppid `@<name>` is the pid in
+#     $STUB_DIR/<name>, and the line waits for that file): each is reported, whatever the real ps
+#     shows, as a process that leads its own group (pgid the pid, stat S), in a listing of every
+#     process and for `-p` that pid. A listing that shows ppids then leaves out each real process
+#     whose ppid is 1, so no walk down from a fake pid 1 reaches a real process.
+#   $STUB_DIR/ps.fail-A: a listing of every process fails, with no output.
+#   $STUB_DIR/ps.locale: unless LC_ALL is C or POSIX, lstart comes out in seven words, as macOS
+#     words it under ko_KR.UTF-8 (the real ps runs with LC_ALL=C).
+#   An exported COLUMNS cuts each line of a listing that shows the command to that many
+#   characters unless -ww is given, as Linux procps does even when its output is a pipe.
+# Else the real ps.
+cols=${COLUMNS:-}
 if [[ -f $STUB_DIR/ps.reused && " $* " == *" -p "* ]]; then echo "S"; exit 0; fi
 real=''
 for p in /bin/ps /usr/bin/ps; do if [[ -x $p ]]; then real=$p; break; fi; done
 if [[ -z $real ]]; then exit 127; fi
-if [[ ! -f $STUB_DIR/ps.reuse ]]; then exec "$real" "$@"; fi
-rc=0
-listing=$("$real" "$@") || rc=$?
-args=("$@") fields=() want='' all=0 extra=''
+args=("$@") fields=() want='' all=0 ww=0 cmd=0 lstart=0 ppid=0 sim=0 extra='' nl=$'\n'
 for ((i = 0; i < ${#args[@]}; i++)); do
   case ${args[i]} in
     -o) IFS=, read -r -a f <<<"${args[i + 1]}"; fields+=("${f[@]}") ;;
     -p) want=${args[i + 1]} ;;
     -A) all=1 ;;
+    -ww) ww=1 ;;
   esac
 done
-while IFS= read -r name; do
-  if [[ ! -f $STUB_DIR/$name ]]; then continue; fi
-  g=$(cat "$STUB_DIR/$name")
-  if ((all == 0)) && [[ $want != "$g" ]]; then continue; fi
-  if "$real" -p "$g" >/dev/null 2>&1; then continue; fi
-  line=''
+# Word numbers in a line: every field is one word but lstart (five, under LC_ALL=C) and the
+# command (the rest of the line).
+for ((i = 0; i < ${#fields[@]}; i++)); do
+  case ${fields[i]%%=*} in
+    command | args) cmd=1 ;;
+    lstart) lstart=$((i + 1)) ;;
+    ppid) ppid=$((i + 1)) ;;
+  esac
+done
+if ((lstart && ppid > lstart)); then ppid=$((ppid + 4)); fi
+if [[ -f $STUB_DIR/ps.locale && ${LC_ALL:-} != C && ${LC_ALL:-} != POSIX ]] && ((lstart)); then sim=1; fi
+if ((cmd == 0 || ww)); then cols=''; fi
+if ((all)) && [[ -f $STUB_DIR/ps.fail-A ]]; then exit 1; fi
+if [[ ! -f $STUB_DIR/ps.reuse && ! -f $STUB_DIR/ps.fake && -z $cols ]] && ((sim == 0)); then
+  exec "$real" "$@"
+fi
+rc=0
+if ((sim)); then listing=$(LC_ALL=C "$real" "$@") || rc=$?; else listing=$("$real" "$@") || rc=$?; fi
+# add <pid> <pgid> <ppid> <command>: a line of the -o fields, to extra.
+add() {
+  local field v line=''
   for field in "${fields[@]}"; do
     case ${field%%=*} in
-      pid | pgid) v=$g ;;
-      ppid) v=1 ;;
+      pid) v=$1 ;;
+      pgid) v=$2 ;;
+      ppid) v=$3 ;;
       stat) v=S ;;
       lstart) v='Mon Oct 19 00:00:00 2026' ;;
-      *) v=foreign ;;
+      *) v=$4 ;;
     esac
     line="${line:+$line }$v"
   done
-  extra="$extra$line"$'\n'
-done < "$STUB_DIR/ps.reuse"
-if [[ -n $listing ]]; then printf '%s\n' "$listing"; fi
-printf '%s' "$extra"
+  extra="$extra$line$nl"
+}
+if [[ -f $STUB_DIR/ps.reuse ]]; then
+  while IFS= read -r name; do
+    if [[ ! -f $STUB_DIR/$name ]]; then continue; fi
+    g=$(cat "$STUB_DIR/$name")
+    if ((all == 0)) && [[ $want != "$g" ]]; then continue; fi
+    if "$real" -p "$g" >/dev/null 2>&1; then continue; fi
+    add "$g" "$g" 1 foreign
+  done < "$STUB_DIR/ps.reuse"
+fi
+if [[ -f $STUB_DIR/ps.fake ]]; then
+  if ((ppid)) && [[ -n $listing ]]; then listing=$(awk -v k="$ppid" '$k != 1' <<<"$listing"); fi
+  while read -r p pp c; do
+    if [[ $pp == @* ]]; then
+      if [[ ! -f $STUB_DIR/${pp#@} ]]; then continue; fi
+      pp=$(cat "$STUB_DIR/${pp#@}")
+    fi
+    if ((all == 0)) && [[ $want != "$p" ]]; then continue; fi
+    add "$p" "$p" "$pp" "$c"
+  done < "$STUB_DIR/ps.fake"
+fi
+out=$listing
+if [[ -n $extra ]]; then out="${out:+$out$nl}${extra%"$nl"}"; fi
+if [[ -n $out ]] && ((sim)); then
+  out=$(awk -v k="$lstart" '{
+    o = ""
+    for (i = 1; i <= NF; i++) {
+      w = (i == k) ? $(i + 4) "Y " $(i + 1) "M " $(i + 2) "D (" $i ") AM " $(i + 3) " KST" : $i
+      o = (i == 1) ? w : o " " w
+      if (i == k) i += 4
+    }
+    print o }' <<<"$out")
+fi
+if [[ -n $out && -n $cols ]]; then out=$(awk -v w="$cols" '{ print substr($0, 1, w) }' <<<"$out"); fi
+if [[ -n $out ]]; then printf '%s\n' "$out"; fi
 if [[ -n $extra ]]; then exit 0; fi
 exit "$rc"
 SH
@@ -758,12 +817,14 @@ run 0 "a pair whose jobs' pids are taken by other processes as they end still pa
 if ((SECONDS < 30)); then ok "the jobs are seen to end at once"; else bad "the jobs are seen to end at once (${SECONDS} s)"; fi
 
 # kill_logged <script> <copy>: a copy of the script whose every `kill` is logged to
-# $STUB_DIR/kill.log (its arguments, one call a line) before it runs.
+# $STUB_DIR/kill.log (its arguments, one call a line) before it runs. A kill that names 0 or 1 (a
+# pid or a group) is only logged: a script under test that got it wrong must not signal its own
+# group, or every process of the user.
 kill_logged() {
   {
     sed -n '1,/^set -euo pipefail$/p' "$1"
     # shellcheck disable=SC2028 # the line is shell source for the copy, not output
-    echo 'kill() { printf "%s\n" "$*" >> "$STUB_DIR/kill.log"; builtin kill "$@"; }'
+    echo 'kill() { printf "%s\n" "$*" >> "$STUB_DIR/kill.log"; case " $* " in *" 0 "* | *" -0 "* | *" 1 "* | *" -1 "*) return 0 ;; esac; builtin kill "$@"; }'
     sed '1,/^set -euo pipefail$/d' "$1"
   } > "$2"
 }
@@ -897,7 +958,8 @@ run 1 "a failed teardown does not hide a failed check" "^warning: kurtosis encla
 #   group, so the reader dies and the script's stdout is a broken pipe. Wants the exit code within
 #   20 s of the signal (the stubs block for 30-60 s, so a hang still shows), and every process in
 #   the pid files gone within 5 s more (a survivor is reported, then killed). A watchdog KILLs the
-#   script's group 40 s after the signal.
+#   script's group 40 s after the signal. The NAME=value entries of run_env go into the
+#   environment of the launcher, and so of the script.
 interrupt() {
   local expect=$1 desc=$2 ready=$3 sig=$4 target=$5 pid i=0 rc=0 alive='' watchdog f p cmd elapsed
   local pid_files=()
@@ -913,7 +975,7 @@ interrupt() {
   # A background job of a non-interactive shell starts with INT ignored, and bash cannot trap a
   # signal ignored on entry, so the script starts through python: INT and PIPE back to default
   # (as from a terminal), its own process group (the pid is the group id), then exec.
-  PATH="$stubs:$PATH" python3 -I -c '
+  env ${run_env[@]+"${run_env[@]}"} PATH="$stubs:$PATH" python3 -I -c '
 import os, signal, sys
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)
@@ -928,7 +990,7 @@ os.execvp(sys.argv[1], sys.argv[1:])' bash -c "$cmd" "$script" "$tmp/bg.rc" "$tm
   ( /bin/sleep 40; kill -KILL -- -"$pid" ) >/dev/null 2>&1 &
   watchdog=$!
   if [[ $target == script ]]; then
-    kill -"$sig" "$(pgrep -P "$pid")"
+    kill -"$sig" "$(pgrep -P "$pid")" || true   # none: the script has already ended
   else
     kill -"$sig" -- -"$pid"
   fi
@@ -1033,6 +1095,30 @@ interrupt 143 "TERM during the check, with a FIFO in place of job-groups, still 
   '[[ -f $STUB_DIR/check.pid ]] && rm -f "$logs/job-groups" && mkfifo "$logs/job-groups"' TERM script check.pid
 torn_down "a run whose job-groups was a FIFO is torn down"
 
+# A job stopped with SIGSTOP (here the check's, its process group from job-groups) has not ended: it
+# still gets TERM (and CONT, so the TERM lands), and the KILL if it outlives the grace period. bash
+# tells a stopped job apart only with job control (SHELLOPTS=monitor here; bash 3.2 sees no stop
+# without a terminal, so it still shows the job running).
+base
+touch "$STUB_DIR/check.block"
+run_env=(SHELLOPTS=monitor)
+interrupt 143 "TERM with the check's job stopped (SIGSTOP) exits 143 and stops the check" \
+  '[[ -f $STUB_DIR/check.pid ]] && kill -STOP -- "-$(cat "$logs/job-groups")" && /bin/sleep 0.5' \
+  TERM script check.pid
+run_env=()
+torn_down "a run whose check was stopped is torn down"
+
+# A process list that names pid 1 as a job's descendant (as the ps stub does here) must never turn
+# into a signal to pid 1 or to group 1 (kill -- -1 reaches every process of the user).
+base
+touch "$STUB_DIR/check.block"
+echo "1 @check.pid fake-init" > "$STUB_DIR/ps.fake"
+kill_logged "$kurtosis_dir/run-pair.sh" "$script"
+interrupt 143 "TERM during the check, with pid 1 listed as the check's child, exits 143" \
+  '[[ -f $STUB_DIR/check.pid ]]' TERM script check.pid
+rm -f "$STUB_DIR/ps.fake"
+logged "pid 1 and group 1 never get a signal from the teardown" kill '^-TERM -- -[0-9]+$' '!-- -1$' '!^-[A-Z]+ 1$'
+
 # A signal that lands between a job's start and the record of its pid must not leave the job
 # untracked. No stub can hit that window reliably, so a copy of the script sends itself TERM right
 # after each job start once both listings are done (so at the first launch): the launch must still
@@ -1103,21 +1189,23 @@ torn_down "--keep-on-pass with a failed launch is torn down"
 
 # --- stop-killed-run.sh: what a run killed with SIGKILL left running ---------------------------------
 
-# A process group leader for the helper to find: `bash leader.sh <name> <tag> [stubborn]` writes its
-# pid to $STUB_DIR/<name>.pid (with `stubborn`, after it starts a child in its group that ignores
-# TERM, its pid in $STUB_DIR/<name>.child.pid); <tag> is only there to be on its command line.
-# Each runs for at most 60 s.
+# A process group leader for the helper to find: `bash leader.sh <name> <tag> [stubborn|deaf]`
+# writes its pid to $STUB_DIR/<name>.pid (with `stubborn`, after it starts a child in its group
+# that ignores TERM, its pid in $STUB_DIR/<name>.child.pid; with `deaf`, the leader itself ignores
+# TERM); <tag> is only there to be on its command line. Each runs for at most 60 s.
 cat > "$tmp/leader.sh" <<'SH'
 name=$1
 if [[ ${3:-} == stubborn ]]; then
   bash -c 'trap "" TERM; echo $$ > "$STUB_DIR/$0.child.pid"; for ((i = 0; i < 600; i++)); do /bin/sleep 0.1; done' "$name" &
   for ((i = 0; i < 50; i++)); do if [[ -f $STUB_DIR/$name.child.pid ]]; then break; fi; /bin/sleep 0.1; done
 fi
+if [[ ${3:-} == deaf ]]; then trap '' TERM; fi
 echo $$ > "$STUB_DIR/$name.pid"
 for ((i = 0; i < 600; i++)); do /bin/sleep 0.1; done
 SH
-# group <name> <tag> [stubborn]: starts leader.sh as the leader of a new process group, apart from
-# this shell (an orphan, so init reaps it once it ends), and waits (up to 5 s) for its pid file.
+# group <name> <tag> [stubborn|deaf]: starts leader.sh as the leader of a new process group, apart
+# from this shell (an orphan, so init reaps it once it ends), and waits (up to 5 s) for its pid
+# file.
 group() {
   local i
   ( python3 -I -c 'import os, sys
@@ -1127,41 +1215,158 @@ os.execvp(sys.argv[1], sys.argv[1:])' bash "$tmp/leader.sh" "$@" & ) >/dev/null 
 }
 # alive <pid file>: the process in $STUB_DIR/<pid file> still runs.
 alive() { [[ -f $STUB_DIR/$1 ]] && ! gone "$(cat "$STUB_DIR/$1")"; }
+# end_groups <pid file...>: KILL to the process group each leader led.
+end_groups() {
+  local f
+  for f in "$@"; do
+    if [[ -f $STUB_DIR/$f ]]; then kill -KILL -- "-$(cat "$STUB_DIR/$f")" 2>/dev/null || true; fi
+  done
+}
+# helper_run <expect-exit> <description> <pattern...> -- <args...>: runs the helper copy (the
+# NAME=value entries of run_env in its environment, the stubs on PATH) and wants the exit code and
+# a line matching each extended regex (`!<regex>`: no line matching it).
+helper_run() {
+  local expect=$1 desc=$2 rc=0 p missing='' unwanted=''
+  shift 2
+  local patterns=()
+  while (($# > 0)) && [[ $1 != -- ]]; do patterns+=("$1"); shift; done
+  shift
+  out=$(env ${run_env[@]+"${run_env[@]}"} PATH="$stubs:$PATH" bash "$helper" "$@" 2>&1) || rc=$?
+  for p in ${patterns[@]+"${patterns[@]}"}; do
+    if [[ $p == !* ]]; then
+      ! grep -Eq -- "${p#!}" <<<"$out" || unwanted="$unwanted /${p#!}/"
+    else
+      grep -Eq -- "$p" <<<"$out" || missing="$missing /$p/"
+    fi
+  done
+  if ((rc == expect)) && [[ -z $missing && -z $unwanted ]]; then
+    ok "$desc"
+  else
+    bad "$desc (exit $rc, want $expect${missing:+; no line matching$missing}${unwanted:+; a line matching$unwanted})" "$out"
+  fi
+}
 
-# The killed run's record lists three groups: the run's launch, whose leader dies on TERM while a
-# child ignores it (the KILL must still reach the child); another run's job, never touched; and a
-# run's job whose leader dies on TERM and whose pid then passes to another process's group
-# (ps.reuse), which must get no KILL. A line that is no pid, and pid 0, are skipped.
-base
 helper="$tmp/stop-killed-run.sh"
 kill_logged "$kurtosis_dir/stop-killed-run.sh" "$helper"
 killed_run=1790000900-4242
 killed="$tmp/killed"
+
+# The killed run's record lists: the run's launch, whose leader dies on TERM while a child ignores
+# it (the KILL must still reach the child); the run's check, whose leader ignores TERM (it gets the
+# KILL); another run's job, a job of a run whose id has the killed run's as a prefix (-42420),
+# and one whose command line has the run's enclave name inside a longer word (-x.log), all never
+# touched; and a run's job whose leader dies on TERM and whose pid then passes to another
+# process's group (ps.reuse), which must get no KILL. A line that is no pid, pid 0 and
+# pid 1 (which ps here reports as a leader that names the run: kill -- -1 would reach every
+# process of the user) are skipped.
+base
 rm -rf "$killed"; mkdir -p "$killed"
 group kr.a "ethswarm-gloas-a-$killed_run" stubborn
+group kr.deaf "ethswarm-gloas-b-$killed_run" deaf
 group kr.other "ethswarm-gloas-a-1790000900-4343"
+group kr.longer "ethswarm-gloas-a-1790000900-42420"
+group kr.suffix "ethswarm-gloas-a-$killed_run-x.log"
 group kr.b "ethswarm-gloas-b-$killed_run"
-ka=$(cat "$STUB_DIR/kr.a.pid") ko=$(cat "$STUB_DIR/kr.other.pid") kb=$(cat "$STUB_DIR/kr.b.pid")
-printf '%s\n' "$ka" not-a-pid 0 "$ko" "$kb" > "$killed/job-groups"
+ka=$(cat "$STUB_DIR/kr.a.pid") kd=$(cat "$STUB_DIR/kr.deaf.pid") ko=$(cat "$STUB_DIR/kr.other.pid")
+kl=$(cat "$STUB_DIR/kr.longer.pid") ks=$(cat "$STUB_DIR/kr.suffix.pid") kb=$(cat "$STUB_DIR/kr.b.pid")
+printf '%s\n' "$ka" not-a-pid 0 1 "$kd" "$ko" "$kl" "$ks" "$kb" > "$killed/job-groups"
 echo kr.b.pid > "$STUB_DIR/ps.reuse"
-rc=0; out=$(PATH="$stubs:$PATH" bash "$helper" --list "$killed" "$killed_run" 2>&1) || rc=$?
-if ((rc == 0)) && grep -q "^group $ka:" <<<"$out" && grep -q "^group $kb:" <<<"$out" &&
-   ! grep -q "^group $ko:" <<<"$out" && [[ ! -e $STUB_DIR/kill.log ]] &&
-   alive kr.a.pid && alive kr.a.child.pid && alive kr.b.pid; then
-  ok "stop-killed-run.sh --list lists the run's groups only and signals nothing"
+echo "1 0 kurtosis run --enclave ethswarm-gloas-a-$killed_run" > "$STUB_DIR/ps.fake"
+helper_run 0 "stop-killed-run.sh --list lists the run's groups only" \
+  "^group $ka:" "^group $kd:" "^group $kb:" "!^group $ko:" "!^group $kl:" "!^group $ks:" '!^group 1:' -- --list "$killed" "$killed_run"
+if [[ ! -e $STUB_DIR/kill.log ]] && alive kr.a.pid && alive kr.a.child.pid && alive kr.deaf.pid && alive kr.b.pid; then
+  ok "stop-killed-run.sh --list signals nothing"
 else
-  bad "stop-killed-run.sh --list lists the run's groups only and signals nothing (exit $rc)" "$out"
+  bad "stop-killed-run.sh --list signals nothing" "$(cat "$STUB_DIR/kill.log" 2>&1)"
 fi
-rc=0; out=$(PATH="$stubs:$PATH" bash "$helper" "$killed" "$killed_run" 2>&1) || rc=$?
-if ((rc == 0)); then ok "stop-killed-run.sh stops a killed run's groups (exit 0)"; else bad "stop-killed-run.sh exits 0 (exit $rc)" "$out"; fi
+helper_run 0 "stop-killed-run.sh stops a killed run's groups (exit 0)" "^sent KILL to " -- "$killed" "$killed_run"
 reaped "a TERM-ignoring child whose group leader TERM ended still gets the KILL" kr.a.child.pid
+reaped "a group leader that ignores TERM gets the KILL" kr.deaf.pid
 logged "the run's groups get TERM, and KILL only while they still hold their id" kill \
-  "^-TERM -- -$ka$" "^-KILL -- -$ka$" "^-TERM -- -$kb$" "!^-KILL -- -$kb$" "!-- -$ko$" '!-- -0$'
-if alive kr.other.pid; then ok "another run's recorded group is left alone"; else bad "another run's recorded group is left alone"; fi
-rm -f "$STUB_DIR/ps.reuse"
-for g in "$ka" "$ko" "$kb"; do kill -KILL -- "-$g" 2>/dev/null || true; done
-rc=0; out=$(PATH="$stubs:$PATH" bash "$helper" "$killed" 2>&1) || rc=$?
-if ((rc == 2)) && grep -q '^usage: ' <<<"$out"; then ok "stop-killed-run.sh without the run suffix is a usage error"; else bad "stop-killed-run.sh without the run suffix is a usage error (exit $rc)" "$out"; fi
+  "^-TERM -- -$ka$" "^-KILL -- -$ka$" "^-TERM -- -$kd$" "^-KILL -- -$kd$" "^-TERM -- -$kb$" "!^-KILL -- -$kb$" \
+  "!-- -$ko$" '!-- -0$'
+logged "a run whose id has the killed run's as a prefix, or whose name holds it, gets no signal" kill \
+  "!-- -$kl$" "!-- -$ks$"
+logged "pid 1 and group 1 never get a signal" kill '!-- -1$' '!^-[A-Z]+ 1$'
+if alive kr.other.pid && alive kr.longer.pid && alive kr.suffix.pid; then ok "other runs' recorded groups are left alone"; else bad "other runs' recorded groups are left alone"; fi
+rm -f "$STUB_DIR/ps.reuse" "$STUB_DIR/ps.fake"
+end_groups kr.a.pid kr.deaf.pid kr.other.pid kr.longer.pid kr.suffix.pid kr.b.pid
+
+# The start time saved for a group and the one read before the KILL both come from ps under
+# LC_ALL=C: macOS words lstart by the locale (seven words under ko_KR.UTF-8, four under
+# ja_JP.UTF-8), and a start that never matched would leave a leader that ignores TERM running.
+base
+touch "$STUB_DIR/ps.locale"
+lst=$(LC_ALL=ko_KR.UTF-8 PATH="$stubs:$PATH" ps -o lstart= -p $$ 2>/dev/null | wc -w | tr -d ' ')
+if [[ $lst == 7 ]]; then ok "the ps stub words lstart in seven under ko_KR.UTF-8"; else bad "the ps stub words lstart in seven under ko_KR.UTF-8 ($lst words)"; fi
+rm -rf "$killed"; mkdir -p "$killed"
+group kr.deaf "ethswarm-gloas-a-$killed_run" deaf
+kd=$(cat "$STUB_DIR/kr.deaf.pid")
+echo "$kd" > "$killed/job-groups"
+run_env=(LC_ALL=ko_KR.UTF-8 LANG=ko_KR.UTF-8)
+helper_run 0 "under ko_KR.UTF-8, stop-killed-run.sh still stops a TERM-ignoring leader" "^sent KILL to $kd$" -- "$killed" "$killed_run"
+run_env=()
+reaped "under ko_KR.UTF-8, a group leader that ignores TERM gets the KILL" kr.deaf.pid
+end_groups kr.deaf.pid
+
+# An exported COLUMNS cuts ps's command column (Linux procps does so even into a pipe): the
+# helper asks for unlimited width (-ww), or it would see no run on the leader's command line.
+base
+COLUMNS=20 PATH="$stubs:$PATH" ps -o command= -p $$ > "$tmp/ps.cut"
+if (($(wc -c < "$tmp/ps.cut") <= 21)); then ok "the ps stub cuts the command at an exported COLUMNS"; else bad "the ps stub cuts the command at an exported COLUMNS" "$(cat "$tmp/ps.cut")"; fi
+rm -rf "$killed"; mkdir -p "$killed"
+group kr.wide "ethswarm-gloas-a-$killed_run"
+kw=$(cat "$STUB_DIR/kr.wide.pid")
+echo "$kw" > "$killed/job-groups"
+run_env=(COLUMNS=20)
+helper_run 0 "with COLUMNS=20 exported, stop-killed-run.sh still finds and stops the run's group" \
+  "^group $kw:" '!^no recorded group' -- "$killed" "$killed_run"
+run_env=()
+reaped "with COLUMNS=20 exported, the run's group is stopped" kr.wide.pid
+end_groups kr.wide.pid
+
+# The helper never signals its own process group, nor itself: run from a group whose leader names
+# the run, and as such a leader (exec -a puts the run's name on its own command line).
+base
+rm -rf "$killed"; mkdir -p "$killed"
+for how in 'bash "$0" "$1" "$2"; exit $?' 'exec -a "$3" bash "$0" "$1" "$2"'; do
+  rc=0
+  out=$(PATH="$stubs:$PATH" python3 -I -c 'import os, sys
+os.setpgid(0, 0)
+os.execvp(sys.argv[1], sys.argv[1:])' bash -c 'echo $$ > "$1/job-groups"; '"$how" "$helper" "$killed" "$killed_run" \
+    "ethswarm-gloas-a-$killed_run" 2>&1) || rc=$?
+  if ((rc == 0)) && grep -q "^no recorded group of run $killed_run is left$" <<<"$out" && [[ ! -e $STUB_DIR/kill.log ]]; then
+    ok "stop-killed-run.sh never signals its own group ($how)"
+  else
+    bad "stop-killed-run.sh never signals its own group ($how; exit $rc)" "$out$(cat "$STUB_DIR/kill.log" 2>/dev/null)"
+  fi
+done
+
+# A process list that cannot be read proves nothing: once TERM is sent, a failed `ps -A` is an
+# exit 2, never "nothing was left for KILL".
+base
+rm -rf "$killed"; mkdir -p "$killed"
+group kr.blind "ethswarm-gloas-a-$killed_run"
+cp "$STUB_DIR/kr.blind.pid" "$killed/job-groups"
+touch "$STUB_DIR/ps.fail-A"
+helper_run 2 "stop-killed-run.sh exits 2 when the process list cannot be read" \
+  '^ERROR: .*process list' '!nothing was left for KILL' -- "$killed" "$killed_run"
+rm -f "$STUB_DIR/ps.fail-A"
+end_groups kr.blind.pid
+
+# The run is <T>-<pid> exactly (an epoch second and a pid of 2 or more), so no short or odd
+# argument matches the names of other runs.
+base
+rm -rf "$killed"; mkdir -p "$killed"
+group kr.usage "ethswarm-gloas-a-$killed_run"
+cp "$STUB_DIR/kr.usage.pid" "$killed/job-groups"
+for arg in 0-4 0-4242 1790000900-1 1790000900-0 1790000900-4242x -1790000900-4242 1790000900--4242 \
+    123456789012345678901-4242 1790000900-12345678901 1790000900; do
+  helper_run 2 "stop-killed-run.sh with the run '$arg' is a usage error" '^usage: ' -- "$killed" "$arg"
+done
+helper_run 2 "stop-killed-run.sh without the run suffix is a usage error" '^usage: ' -- "$killed"
+if [[ ! -e $STUB_DIR/kill.log ]] && alive kr.usage.pid; then ok "a usage error signals nothing"; else bad "a usage error signals nothing" "$(cat "$STUB_DIR/kill.log" 2>&1)"; fi
+end_groups kr.usage.pid
 
 # --- usage ---------------------------------------------------------------------------------------
 
