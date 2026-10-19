@@ -35,11 +35,13 @@
 //! sidecars the requester's quota delivers in the answer window, within the byte budget, and
 //! read by the end of the window by a requester reading at the answer's pace from when the
 //! lookup ended, given when each chunk's token is due ([`PacedReader`]), the first block always
-//! in, and cut again the same way from when its writer starts (`block_lengths`); a range
-//! answer whose first block lacks a requested column is `2: ServerError` (cl-chain never sends
-//! one), and so is one whose first block holds more sidecars than were booked (the booking
-//! holds the largest block a request names, `Requested::largest_block`), so no chunk goes out
-//! unpaid. Error chunks carry a fixed message per code ([`fixed_message`]); the source's detail
+//! in if that requester has it before the answer's place goes back (the window and the write
+//! deadline), else the answer is `3: ResourceUnavailable`, as cl-chain answers a request whose
+//! first block it cannot serve, never part of a block and then a reset; it is cut again the
+//! same way from when its writer starts (`block_lengths`); a range answer whose first block
+//! lacks a requested column is `2: ServerError` (cl-chain never sends one), and so is one whose
+//! first block holds more sidecars than were booked (the booking holds the largest block a
+//! request names, `Requested::largest_block`), so no chunk goes out unpaid. Error chunks carry a fixed message per code ([`fixed_message`]); the source's detail
 //! goes to the log only.
 
 use super::codec::ReceivedChunk;
@@ -506,6 +508,11 @@ pub(crate) fn column_chunks<E: EthSpec>(
     // The first block, then while within the budget and read in the window.
     let sizes: Vec<usize> = outgoing.iter().map(|o| o.bytes).collect();
     let (keep, bytes) = reader.whole_blocks(&sizes, &blocks, budget.max_sidecars, budget.max_bytes);
+    if keep == 0 && !blocks.is_empty() {
+        // Not even the first block reaches the requester before the place goes back.
+        tracing::debug!("column answer refused: its first block is past the answer's hold");
+        return (error_answer(ResultCode::ResourceUnavailable), 0);
+    }
     outgoing.truncate(keep);
     (outgoing.into_iter().map(|o| o.chunk).collect(), bytes)
 }

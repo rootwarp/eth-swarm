@@ -61,7 +61,7 @@
 //! token. A column answer goes out at the tokens booked for it instead ([`BookedChunks`]): cut
 //! again when writing starts, and settled once, when its first chunk was written whole.
 
-use super::columns::block_lengths;
+use super::columns::{block_lengths, error_answer};
 use super::limits::{AnswerPermit, BookedChunks, ChunkPacer};
 use super::metrics::RpcMetrics;
 use consensus_types::EthSpec;
@@ -751,10 +751,12 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
     /// its token still ahead, and one written whole stays charged even if the flush after it
     /// fails, since the peer may have it all. A booked answer is first cut again, at a whole
     /// block, to what a requester reading at the answer's pace from now reads by the end of its
-    /// window ([`BookedChunks::cut`]); its unused tokens go back once its first chunk was written
-    /// and flushed (an empty one's at once, [`BookedChunks::settle_answer`]), so a stream reset
-    /// before that (the request-response handler waits on the answer, not the stream) gets
-    /// nothing back. A booked chunk not written by its place in the answer's schedule
+    /// window ([`BookedChunks::cut`]), and refused with `3: ResourceUnavailable` if not even its
+    /// first block reaches that requester before the place goes back; its unused tokens go back
+    /// once its first chunk (a refusal's error chunk too) was written and flushed (an empty
+    /// one's at once, [`BookedChunks::settle_answer`]), so a stream reset before that (the
+    /// request-response handler waits on the answer, not the stream) gets nothing back. A
+    /// booked chunk not written by its place in the answer's schedule
     /// ([`super::limits::WriteSchedule`]) ends the write with `TimedOut`. The answer's place
     /// goes back when this returns or is dropped.
     async fn write_response<T>(
@@ -778,13 +780,21 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
             // Cut again from when writing starts, at a whole block: what is left of the window
             // from here is what the requester has to read in.
             let held_since = permit.as_ref().map_or(now, |p| p.held_since());
-            let sizes: Vec<usize> = chunks.iter().map(ssz_len).collect();
+            let mut sizes: Vec<usize> = chunks.iter().map(ssz_len).collect();
             let (keep, bytes) = booked.cut(&sizes, &block_lengths(&chunks), held_since, now);
-            chunks.truncate(keep);
+            if keep == 0 && !chunks.is_empty() {
+                // Not even the first block reaches the requester before the place goes back:
+                // refused whole, never sent in part and then reset.
+                chunks = error_answer(ResultCode::ResourceUnavailable);
+                sizes = chunks.iter().map(ssz_len).collect();
+            } else {
+                chunks.truncate(keep);
+                sizes.truncate(keep);
+            }
             if let Some(permit) = permit.as_mut() {
                 permit.hold_bytes(bytes);
             }
-            booked.write_schedule(sizes.into_iter().take(keep), held_since, now)
+            booked.write_schedule(sizes, held_since, now)
         });
         let _place = permit;
         let kept = chunks.len() as u64;
@@ -2772,6 +2782,178 @@ mod tests {
         assert!(!sent.is_empty() && sent.len() < 190, "{} sent", sent.len());
     }
 
+    /// The chunks a [`SteadyReader`] read, decoded from the wire as a requester does.
+    async fn steadily_read(io: &SteadyReader) -> Vec<ResponseChunk<E>> {
+        let contexts = testkit::column_context_table();
+        let mut wire = Cursor::new(io.taken.clone());
+        read_response_within::<E, _>(
+            &mut wire,
+            ROOTS,
+            u64::MAX,
+            &contexts,
+            Deadlines::default(),
+            usize::MAX,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|chunk| chunk.chunk)
+        .collect()
+    }
+
+    const ROOTS: Protocol = Protocol::DataColumnsByRootV1;
+
+    /// All 128 columns of one 21-blob Gloas block, by root: 5.64 MB, 3.36 s at the answer's pace.
+    fn one_full_block() -> (Vec<crate::rpc::columns::ServedColumn>, Request) {
+        use p2p_wire::rpc::messages::{DataColumnsByRootIdentifier, DataColumnsByRootV1Request};
+        let stored: Vec<_> = (0..128u64)
+            .map(|index| stored_sidecar(7, index, 21))
+            .collect();
+        let id = DataColumnsByRootIdentifier {
+            block_root: stored[0].block_root.into(),
+            columns: (0..128u64).collect::<Vec<_>>().try_into().unwrap(),
+        };
+        let request =
+            Request::DataColumnsByRoot(DataColumnsByRootV1Request(vec![id].try_into().unwrap()));
+        (stored, request)
+    }
+
+    /// Serves [`one_full_block`] to `peer` from `limiter` as [`crate::rpc::inbound::Control`]
+    /// does, its lookup taking `lookup_takes` and its writer starting `delay` after that, to a
+    /// requester reading at the answer's pace. The lookup's chunks and the requester's.
+    async fn serve_one_full_block(
+        limiter: &crate::rpc::limits::SharedLimiter,
+        peer: libp2p::PeerId,
+        lookup_takes: Duration,
+        delay: Duration,
+    ) -> (Vec<ResponseChunk<E>>, Vec<ResponseChunk<E>>) {
+        use crate::rpc::columns::{
+            lookup_cost, AnswerBudget, ColumnLookup, ColumnReply, Requested,
+        };
+        use crate::rpc::inbound::answer_columns;
+        use crate::rpc::limits::{
+            BookedChunks, ColumnDeadlines, ColumnPlaces, COLUMN_ANSWER_WINDOW,
+            COLUMN_WRITE_DEADLINE, MAX_COLUMN_RESPONSE_BYTES,
+        };
+        let (stored, request) = one_full_block();
+        let requested = Requested::of(&request).unwrap();
+        let contexts = testkit::column_context_table();
+        let metrics = RpcMetrics::register(&mut prometheus_client::registry::Registry::default());
+        let places = ColumnPlaces::new(1, 1, None);
+        let booked =
+            BookedChunks::book(limiter, peer, ROOTS, 128, None, ColumnDeadlines::default())
+                .with_lookup_cost(lookup_cost(&request));
+        tokio::time::sleep_until(booked.ready_at()).await;
+        let mut permit = places.try_take(peer, None).unwrap();
+        let taken = Instant::now();
+        let reply = ColumnReply::Sidecars(stored);
+        let lookup: ColumnLookup = Box::pin(async move {
+            tokio::time::sleep(lookup_takes).await;
+            reply
+        });
+        let budget = AnswerBudget {
+            max_sidecars: booked.tokens(),
+            max_bytes: MAX_COLUMN_RESPONSE_BYTES,
+        };
+        let (chunks, bytes) = answer_columns::<E>(
+            lookup, &requested, &contexts, budget, &metrics, &permit, &booked,
+        )
+        .await;
+        let looked_up = chunks.iter().map(|c| c.chunk.clone()).collect();
+        permit.hold_bytes(bytes);
+        tokio::time::advance(delay).await;
+        let mut io = SteadyReader::new(at_the_answer_pace(), Duration::from_millis(10));
+        let answer = Answer {
+            chunks,
+            pacer: None,
+            booked: Some(Box::new(booked)),
+            permit: Some(Box::new(permit)),
+        };
+        inbound_codec()
+            .write_response(&ROOTS, &mut io, answer)
+            .await
+            .expect("a steady reader at the answer's pace is never reset");
+        assert!(taken.elapsed() <= COLUMN_ANSWER_WINDOW + COLUMN_WRITE_DEADLINE);
+        assert_eq!(places.held(), 0);
+        (looked_up, steadily_read(&io).await)
+    }
+
+    /// Whether `chunks` is the one `3: ResourceUnavailable` chunk.
+    fn unavailable(chunks: &[ResponseChunk<E>]) -> bool {
+        matches!(
+            chunks,
+            [ResponseChunk::Error {
+                code: ResultCode::ResourceUnavailable,
+                ..
+            }]
+        )
+    }
+
+    /// The first block of an answer goes whole or not at all: one too large to reach a requester
+    /// reading at the answer's pace before the place's hold ends is refused with
+    /// `3: ResourceUnavailable`, never sent in part and then reset. All 128 columns of a 21-blob
+    /// block take 3.36 s at that pace: after a 1.9 s lookup the block still reaches the requester
+    /// within the window and the write deadline (5.26 s of 6 s), but a writer starting 1.2 s
+    /// later would need until 6.46 s.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_block_past_the_hold_is_refused_and_never_sent_in_part() {
+        let limiter = shared_limiter(RateLimits::default());
+        let (lookup_takes, delay) = (Duration::from_millis(1_900), Duration::from_millis(1_200));
+        // Without the delay the whole block goes out.
+        let (looked_up, read) = serve_one_full_block(
+            &limiter,
+            libp2p::PeerId::random(),
+            lookup_takes,
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(
+            looked_up.len(),
+            128,
+            "read in the window from the lookup's end"
+        );
+        assert_eq!(read, looked_up);
+        // With it, the writer refuses the block whole.
+        let (looked_up, read) =
+            serve_one_full_block(&limiter, libp2p::PeerId::random(), lookup_takes, delay).await;
+        assert_eq!(
+            looked_up.len(),
+            128,
+            "read in the window from the lookup's end"
+        );
+        assert!(unavailable(&read), "{read:?}");
+    }
+
+    /// The same holds from the lookup's end: a block whose tokens come too late for a requester
+    /// reading at the answer's pace to have it before the place's hold ends (one token per
+    /// 50 ms, the last of 128 due 6.35 s after the lookup started) is refused there, never an
+    /// empty success, and the refusal is charged as any other: the tokens past the lookup's
+    /// cost go back once it was written.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_block_whose_tokens_come_past_the_hold_is_refused() {
+        let period = Duration::from_millis(50);
+        let limiter = shared_limiter(RateLimits {
+            data_columns_by_root: Quota::new(1, period),
+            ..RateLimits::default()
+        });
+        let peer = libp2p::PeerId::random();
+        let start = Instant::now();
+        let (looked_up, read) =
+            serve_one_full_block(&limiter, peer, Duration::ZERO, Duration::ZERO).await;
+        assert!(unavailable(&looked_up), "{looked_up:?}");
+        assert!(unavailable(&read), "{read:?}");
+        let next = limiter
+            .lock()
+            .unwrap()
+            .clone()
+            .schedule(peer, ROOTS, Instant::now());
+        assert_eq!(
+            next,
+            start + period,
+            "the lookup's one token kept, the rest back"
+        );
+    }
+
     /// Fails every write: a stream the requester reset.
     struct ResetStream;
 
@@ -2864,7 +3046,6 @@ mod tests {
         use crate::rpc::inbound::{answer_columns, column_tokens};
         use crate::rpc::limits::{BookedChunks, ColumnDeadlines, ColumnPlaces, RpcLimits};
         use p2p_wire::rpc::messages::{DataColumnsByRootIdentifier, DataColumnsByRootV1Request};
-        const ROOTS: Protocol = Protocol::DataColumnsByRootV1;
         let period = Duration::from_millis(100);
         let limits = RpcLimits {
             rate: RateLimits {

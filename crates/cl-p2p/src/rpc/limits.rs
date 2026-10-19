@@ -141,14 +141,15 @@ impl RateLimits {
 pub const DEFAULT_OUTBOUND_QUEUE_LEN: usize = 256;
 
 /// The SSZ bytes one column answer may hold: 8 MiB \[est\], read in [`COLUMN_ANSWER_WINDOW`].
-/// An answer is cut at the last whole block that fits (the first block always goes, "Clients MAY
-/// limit the number of data column sidecars in the response", `fulu/p2p-interface.md` L682), so
-/// one epoch of 4 custody columns of 21-blob Gloas blocks (32 × 4 × 44,072 bytes, 5.4 MiB) fits
-/// whole. The answer holds no more than a requester reading these bytes per window reads from
-/// the lookup's end, and again from when writing starts, to the window's end, given when each
-/// chunk's token is due ([`PacedReader`]): after the longest lookup (2 s), 3 s of the 5 s, about
-/// 4.8 MiB with the tokens due by then, and less when they are due later or writing starts
-/// later.
+/// An answer is cut at the last whole block that fits (the first block always goes if it reaches
+/// the requester before the answer's place goes back, else the answer is `3: ResourceUnavailable`;
+/// "Clients MAY limit the number of data column sidecars in the response",
+/// `fulu/p2p-interface.md` L682), so one epoch of 4 custody columns of 21-blob Gloas blocks
+/// (32 × 4 × 44,072 bytes, 5.4 MiB) fits whole. The answer holds no more than a requester
+/// reading these bytes per window reads from the lookup's end, and again from when writing
+/// starts, to the window's end, given when each chunk's token is due ([`PacedReader`]): after
+/// the longest lookup (2 s), 3 s of the 5 s, about 4.8 MiB with the tokens due by then, and less
+/// when they are due later or writing starts later.
 pub const MAX_COLUMN_RESPONSE_BYTES: usize = 8 << 20;
 
 /// How long a column answer's chunks may take to go out at the peer's quota \[est\]: 5 s, the
@@ -889,6 +890,7 @@ impl BookedChunks {
             shift,
             start: now,
             end: held_since + self.deadlines.answer_window,
+            hold_until: held_since + self.deadlines.answer_window + self.deadlines.write,
             bytes: self.deadlines.answer_bytes as u64,
             window: self.deadlines.answer_window,
         }
@@ -1064,6 +1066,8 @@ pub struct PacedReader<'a> {
     start: Instant,
     /// The end of the answer window.
     end: Instant,
+    /// When the answer's place goes back: the end of the window and the write deadline.
+    hold_until: Instant,
     /// The bytes it reads per `window`.
     bytes: u64,
     window: Duration,
@@ -1095,9 +1099,11 @@ impl PacedReader<'_> {
 
     /// How many chunks, and how many of their SSZ bytes, an answer of chunks of `sizes` SSZ
     /// bytes in whole blocks of `blocks` chunks each (in order; chunks past them are no block)
-    /// holds: the first block whole if it is within `most_chunks`, then each next whole block
-    /// while the answer stays within `most_chunks` and `most_bytes` and this reader has read it
-    /// by the end of the window ([`Self::end`]).
+    /// holds: the first block whole if it is within `most_chunks` and this reader has read it
+    /// before the place goes back (the end of the window and the write deadline), else nothing,
+    /// so it is never sent in part and then reset; then each next whole block while the answer
+    /// stays within `most_chunks` and `most_bytes` and this reader has read it by the end of the
+    /// window ([`Self::end`]).
     #[must_use]
     pub fn whole_blocks(
         &self,
@@ -1119,7 +1125,8 @@ impl PacedReader<'_> {
             let size = block.iter().fold(0usize, |n, &s| n.saturating_add(s));
             let within_tokens = (chunks + len) as u64 <= most_chunks;
             let fits = bytes.saturating_add(size) <= most_bytes && read_by <= self.end;
-            if !within_tokens || (chunks > 0 && !fits) {
+            let held = read_by <= self.hold_until;
+            if !within_tokens || !held || (chunks > 0 && !fits) {
                 break;
             }
             read = read_by;

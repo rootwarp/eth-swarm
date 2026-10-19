@@ -342,7 +342,8 @@ async fn unrequested_sidecars_are_dropped_and_counted() {
 // The shared limits
 
 /// BUG-002 and the byte budget: an answer is cut at the last whole block within the sidecars
-/// its quota delivers in the answer window, and within its bytes; the first block always goes.
+/// its quota delivers in the answer window, and within its bytes; the first block always goes
+/// if it reaches the requester before the answer's place goes back.
 #[tokio::test]
 async fn answers_are_cut_at_a_whole_block_by_count_and_bytes() {
     let stored = block_columns(9..29);
@@ -369,13 +370,24 @@ async fn answers_are_cut_at_a_whole_block_by_count_and_bytes() {
     let mut raw = requester(&ours).await;
     let id = raw.send(ours.peer, by_range(9, 2, &CUSTODY));
     assert_eq!(sidecars(raw.outcome(id).await.unwrap()), wire(&stored[..4]));
-    // Even a first block past it goes whole, as cl-chain sends it.
+    // Even a first block past it goes whole, as cl-chain sends it, while a requester reading
+    // the budget per window has it before the place goes back (the window and a second).
+    let mut cfg = with_columns(Scripted::new(ColumnReply::Sidecars(stored.clone())));
+    cfg.limits.max_column_response_bytes = one_block - 1;
+    let ours = Node::spawn(cfg).await;
+    let mut raw = requester(&ours).await;
+    let id = raw.send(ours.peer, by_range(9, 2, &CUSTODY));
+    assert_eq!(sidecars(raw.outcome(id).await.unwrap()), wire(&stored[..4]));
+    // One that requester never has by then is refused, never sent in part.
     let mut cfg = with_columns(Scripted::new(ColumnReply::Sidecars(stored.clone())));
     cfg.limits.max_column_response_bytes = 1;
     let ours = Node::spawn(cfg).await;
     let mut raw = requester(&ours).await;
     let id = raw.send(ours.peer, by_range(9, 2, &CUSTODY));
-    assert_eq!(sidecars(raw.outcome(id).await.unwrap()), wire(&stored[..4]));
+    assert_eq!(
+        refused(&raw.outcome(id).await.unwrap()),
+        ResultCode::ResourceUnavailable
+    );
     // The defaults: 8 MiB, and 756 sidecars, what cl-chain cuts at too; and no more answer
     // places than cl-chain runs reads, so a burst of lookups is never refused as overloaded.
     let limits = RpcLimits::default();
