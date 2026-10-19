@@ -38,8 +38,9 @@ cat > "$stubs/kurtosis" <<'SH'
 #   TERM (its pid in $STUB_DIR/run.<K>.orphan.pid; it runs for at most 60 s), and with
 #   $STUB_DIR/run.<K>.leftover one that does not (run.<K>.leftover.pid, at most 60 s); with
 #   $STUB_DIR/run.<K>.await (holding a pid file name) it waits up to 5 s for that process to be
-#   gone and writes `gone` or `alive` to $STUB_DIR/run.<K>.saw; and with $STUB_DIR/run.<K>.block
-#   it blocks (its pid in $STUB_DIR/run.<K>.pid).
+#   gone and writes `gone` or `alive` to $STUB_DIR/run.<K>.saw; with $STUB_DIR/run.<K>.leader it
+#   writes its own pid (the launch's process group) to $STUB_DIR/run.<K>.leader.pid; and with
+#   $STUB_DIR/run.<K>.block it blocks (its pid in $STUB_DIR/run.<K>.pid).
 # `enclave ls`: the n-th call prints $STUB_DIR/enclave-ls.<n>, else $STUB_DIR/enclave-ls, else the
 #   UUID header and a row per enclave on the engine; $STUB_DIR/ls.rc or $STUB_DIR/ls.rc.<n> fails
 #   it, and with $STUB_DIR/ls.block.<n> the n-th call first hangs for 60 s (its pid in
@@ -62,6 +63,7 @@ case "$1 ${2:-}" in
     echo "$n" > "$counter"
     touch "$STUB_DIR/exists.$e"
     echo "kurtosis run stub: enclave $e"
+    if [[ -f $STUB_DIR/run.$k.leader ]]; then echo $$ > "$STUB_DIR/run.$k.leader.pid"; fi
     if [[ -f $STUB_DIR/run.$k.advance ]]; then
       echo $(( $(cat "$STUB_DIR/now") + $(cat "$STUB_DIR/run.$k.advance") )) > "$STUB_DIR/now"
     fi
@@ -180,11 +182,48 @@ SH
 cat > "$stubs/ps" <<'SH'
 #!/usr/bin/env bash
 # ps stub: with $STUB_DIR/ps.reused, `ps ... -p PID` reports every pid as a running process (as if
-# each pid were taken by another process the moment it ends); else, and always for a listing of
-# every process, the real ps.
+# each pid were taken by another process the moment it ends). With $STUB_DIR/ps.reuse (names of
+# pid files under $STUB_DIR, one per line), each pid in those files that the real ps no longer
+# shows is reported as taken by another process, the leader of a new group (its pgid the same
+# pid, ppid 1, its command `foreign`), in a listing of every process (-A) and for `-p` that pid;
+# the fields follow the -o lists. Else the real ps.
 if [[ -f $STUB_DIR/ps.reused && " $* " == *" -p "* ]]; then echo "S"; exit 0; fi
-for p in /bin/ps /usr/bin/ps; do if [[ -x $p ]]; then exec "$p" "$@"; fi; done
-exit 127
+real=''
+for p in /bin/ps /usr/bin/ps; do if [[ -x $p ]]; then real=$p; break; fi; done
+if [[ -z $real ]]; then exit 127; fi
+if [[ ! -f $STUB_DIR/ps.reuse ]]; then exec "$real" "$@"; fi
+rc=0
+listing=$("$real" "$@") || rc=$?
+args=("$@") fields=() want='' all=0 extra=''
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case ${args[i]} in
+    -o) IFS=, read -r -a f <<<"${args[i + 1]}"; fields+=("${f[@]}") ;;
+    -p) want=${args[i + 1]} ;;
+    -A) all=1 ;;
+  esac
+done
+while IFS= read -r name; do
+  if [[ ! -f $STUB_DIR/$name ]]; then continue; fi
+  g=$(cat "$STUB_DIR/$name")
+  if ((all == 0)) && [[ $want != "$g" ]]; then continue; fi
+  if "$real" -p "$g" >/dev/null 2>&1; then continue; fi
+  line=''
+  for field in "${fields[@]}"; do
+    case ${field%%=*} in
+      pid | pgid) v=$g ;;
+      ppid) v=1 ;;
+      stat) v=S ;;
+      lstart) v='Mon Oct 19 00:00:00 2026' ;;
+      *) v=foreign ;;
+    esac
+    line="${line:+$line }$v"
+  done
+  extra="$extra$line"$'\n'
+done < "$STUB_DIR/ps.reuse"
+if [[ -n $listing ]]; then printf '%s\n' "$listing"; fi
+printf '%s' "$extra"
+if [[ -n $extra ]]; then exit 0; fi
+exit "$rc"
 SH
 chmod +x "$stubs/kurtosis" "$stubs/docker" "$stubs/date" "$stubs/sleep" "$stubs/tee" "$stubs/ps"
 
@@ -718,6 +757,34 @@ run 0 "a pair whose jobs' pids are taken by other processes as they end still pa
   '^both enclaves up [0-9]+ s before genesis$' '^run-pair: exit 0 ' --
 if ((SECONDS < 30)); then ok "the jobs are seen to end at once"; else bad "the jobs are seen to end at once (${SECONDS} s)"; fi
 
+# kill_logged <script> <copy>: a copy of the script whose every `kill` is logged to
+# $STUB_DIR/kill.log (its arguments, one call a line) before it runs.
+kill_logged() {
+  {
+    sed -n '1,/^set -euo pipefail$/p' "$1"
+    # shellcheck disable=SC2028 # the line is shell source for the copy, not output
+    echo 'kill() { printf "%s\n" "$*" >> "$STUB_DIR/kill.log"; builtin kill "$@"; }'
+    sed '1,/^set -euo pipefail$/d' "$1"
+  } > "$2"
+}
+
+# Once bash has reaped a job's leader, its process group id is a number another process may take:
+# when the group has emptied, a new process with that pid can lead a group of its own. Launch a
+# ends at once and its pid goes to such a process (ps.reuse): that group is never signalled,
+# while what launch b left in its own group still gets TERM.
+base
+touch "$STUB_DIR/run.ethswarm-gloas-a.leader" "$STUB_DIR/run.ethswarm-gloas-b.leader" \
+  "$STUB_DIR/run.ethswarm-gloas-b.leftover"
+echo run.ethswarm-gloas-a.leader.pid > "$STUB_DIR/ps.reuse"
+kill_logged "$kurtosis_dir/run-pair.sh" "$script"
+run 0 "a pair whose finished launch's group id another process's group takes still passes" '^run-pair: exit 0 ' --
+rm -f "$STUB_DIR/ps.reuse"
+ga=$(cat "$STUB_DIR/run.ethswarm-gloas-a.leader.pid" 2>/dev/null || echo none)
+gb=$(cat "$STUB_DIR/run.ethswarm-gloas-b.leader.pid" 2>/dev/null || echo none)
+logged "a group whose id a live process holds as its pid is never signalled" kill "!-- -$ga$" "!^-[A-Z]+ $ga$"
+logged "a finished launch's own group, still holding its id, gets TERM" kill "^-TERM -- -$gb$"
+reaped "what the other launch left in its group is stopped" run.ethswarm-gloas-b.leftover.pid
+
 # --- the check's wrapper: no inherited shell options ---------------------------------------------
 
 # SHELLOPTS exported (errexit and pipefail in it) reaches every bash the script starts; the check's
@@ -1033,6 +1100,68 @@ base
 echo 1 > "$STUB_DIR/run.ethswarm-gloas-a.rc"
 run 2 "--keep-on-pass still tears down a failed launch" '^tearing down' -- --keep-on-pass
 torn_down "--keep-on-pass with a failed launch is torn down"
+
+# --- stop-killed-run.sh: what a run killed with SIGKILL left running ---------------------------------
+
+# A process group leader for the helper to find: `bash leader.sh <name> <tag> [stubborn]` writes its
+# pid to $STUB_DIR/<name>.pid (with `stubborn`, after it starts a child in its group that ignores
+# TERM, its pid in $STUB_DIR/<name>.child.pid); <tag> is only there to be on its command line.
+# Each runs for at most 60 s.
+cat > "$tmp/leader.sh" <<'SH'
+name=$1
+if [[ ${3:-} == stubborn ]]; then
+  bash -c 'trap "" TERM; echo $$ > "$STUB_DIR/$0.child.pid"; for ((i = 0; i < 600; i++)); do /bin/sleep 0.1; done' "$name" &
+  for ((i = 0; i < 50; i++)); do if [[ -f $STUB_DIR/$name.child.pid ]]; then break; fi; /bin/sleep 0.1; done
+fi
+echo $$ > "$STUB_DIR/$name.pid"
+for ((i = 0; i < 600; i++)); do /bin/sleep 0.1; done
+SH
+# group <name> <tag> [stubborn]: starts leader.sh as the leader of a new process group, apart from
+# this shell (an orphan, so init reaps it once it ends), and waits (up to 5 s) for its pid file.
+group() {
+  local i
+  ( python3 -I -c 'import os, sys
+os.setpgid(0, 0)
+os.execvp(sys.argv[1], sys.argv[1:])' bash "$tmp/leader.sh" "$@" & ) >/dev/null 2>&1
+  for ((i = 0; i < 50; i++)); do if [[ -f $STUB_DIR/$1.pid ]]; then return; fi; /bin/sleep 0.1; done
+}
+# alive <pid file>: the process in $STUB_DIR/<pid file> still runs.
+alive() { [[ -f $STUB_DIR/$1 ]] && ! gone "$(cat "$STUB_DIR/$1")"; }
+
+# The killed run's record lists three groups: the run's launch, whose leader dies on TERM while a
+# child ignores it (the KILL must still reach the child); another run's job, never touched; and a
+# run's job whose leader dies on TERM and whose pid then passes to another process's group
+# (ps.reuse), which must get no KILL. A line that is no pid, and pid 0, are skipped.
+base
+helper="$tmp/stop-killed-run.sh"
+kill_logged "$kurtosis_dir/stop-killed-run.sh" "$helper"
+killed_run=1790000900-4242
+killed="$tmp/killed"
+rm -rf "$killed"; mkdir -p "$killed"
+group kr.a "ethswarm-gloas-a-$killed_run" stubborn
+group kr.other "ethswarm-gloas-a-1790000900-4343"
+group kr.b "ethswarm-gloas-b-$killed_run"
+ka=$(cat "$STUB_DIR/kr.a.pid") ko=$(cat "$STUB_DIR/kr.other.pid") kb=$(cat "$STUB_DIR/kr.b.pid")
+printf '%s\n' "$ka" not-a-pid 0 "$ko" "$kb" > "$killed/job-groups"
+echo kr.b.pid > "$STUB_DIR/ps.reuse"
+rc=0; out=$(PATH="$stubs:$PATH" bash "$helper" --list "$killed" "$killed_run" 2>&1) || rc=$?
+if ((rc == 0)) && grep -q "^group $ka:" <<<"$out" && grep -q "^group $kb:" <<<"$out" &&
+   ! grep -q "^group $ko:" <<<"$out" && [[ ! -e $STUB_DIR/kill.log ]] &&
+   alive kr.a.pid && alive kr.a.child.pid && alive kr.b.pid; then
+  ok "stop-killed-run.sh --list lists the run's groups only and signals nothing"
+else
+  bad "stop-killed-run.sh --list lists the run's groups only and signals nothing (exit $rc)" "$out"
+fi
+rc=0; out=$(PATH="$stubs:$PATH" bash "$helper" "$killed" "$killed_run" 2>&1) || rc=$?
+if ((rc == 0)); then ok "stop-killed-run.sh stops a killed run's groups (exit 0)"; else bad "stop-killed-run.sh exits 0 (exit $rc)" "$out"; fi
+reaped "a TERM-ignoring child whose group leader TERM ended still gets the KILL" kr.a.child.pid
+logged "the run's groups get TERM, and KILL only while they still hold their id" kill \
+  "^-TERM -- -$ka$" "^-KILL -- -$ka$" "^-TERM -- -$kb$" "!^-KILL -- -$kb$" "!-- -$ko$" '!-- -0$'
+if alive kr.other.pid; then ok "another run's recorded group is left alone"; else bad "another run's recorded group is left alone"; fi
+rm -f "$STUB_DIR/ps.reuse"
+for g in "$ka" "$ko" "$kb"; do kill -KILL -- "-$g" 2>/dev/null || true; done
+rc=0; out=$(PATH="$stubs:$PATH" bash "$helper" "$killed" 2>&1) || rc=$?
+if ((rc == 2)) && grep -q '^usage: ' <<<"$out"; then ok "stop-killed-run.sh without the run suffix is a usage error"; else bad "stop-killed-run.sh without the run suffix is a usage error (exit $rc)" "$out"; fi
 
 # --- usage ---------------------------------------------------------------------------------------
 

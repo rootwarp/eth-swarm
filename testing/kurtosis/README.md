@@ -307,10 +307,16 @@ launches. Each step fails closed:
    process tree included. When a job's leader ends, whatever is left in its group gets the same
    TERM, then KILL, so nothing a step started outlives it; each launch is swept as soon as it
    ends, while the other may still run. Whether a job still runs is what bash saw of it (its job
-   table), never a lookup of its pid, which another process may take once the job has ended; a
-   group whose leader has ended is signalled only while it still has a process (which keeps its
-   id from passing to another group), and a descendant only while the same process (pid and
-   start time) runs. Each job ignores SIGTTOU, so a
+   table), never a lookup of its pid, which another process may take once the job has ended. A
+   group whose leader bash has reaped is signalled only while, in the process list read just
+   before, it has a process and no process has its id as pid (the kernel gives no process a pid
+   that is still a group's id, so a process with that pid leads another group, which took the id
+   once this one emptied). Two cases remain where a signal can still reach another process's
+   group, and both need the kernel to hand the same pid out again first: the group empties and
+   its id passes to a new group in the milliseconds between that list and the kill; or, before
+   the list, the group emptied and a new process took the id as its pid and group, then ended
+   while its group lived on. A descendant is signalled only while the same process (pid and
+   start time, both from one process list) runs. Each job ignores SIGTTOU, so a
    terminal with `stty tostop` cannot stop the check's output (it would hang the run). Then the
    teardown runs `kurtosis enclave rm -f` for each of the run's two enclaves, by name, each
    bounded to 120 s and each run even if an earlier step failed. It removes nothing else: no
@@ -346,24 +352,24 @@ polling, after the script is gone. Stop those groups first, then remove the encl
 were running are in `job-groups` (before the render, the only job is a `kurtosis enclave ls` or a
 `docker pull`, which ends on its own), and the enclave names are those of the `*-run.log` files.
 A recorded id is only a number: once its job has ended, another process (yours or not) may hold
-it. So stop only a group whose leader still runs and names this run's enclaves on its command
-line (a `kurtosis run`, a `kurtosis enclave rm`, or the check); the other jobs (`kurtosis enclave
-ls`, `kurtosis clean -a`, `docker stats`, the wait for genesis) end on their own:
+it. `stop-killed-run.sh` stops only a recorded group whose leader still runs and names this run's
+enclaves on its command line (a `kurtosis run`, a `kurtosis enclave rm`, or the check); the other
+jobs (`kurtosis enclave ls`, `kurtosis clean -a`, `docker stats`, the wait for genesis) end on
+their own. It lists those groups and their processes, sends each TERM, and 10 s later (sooner once
+none is left) KILL to each that is still there: while its leader runs (the same pid and start
+time), or, once TERM has ended the leader, while a process of the group runs and no process has
+the group id as its pid (a surviving member keeps the id from passing to another group, and a
+process with that pid leads another group). So a child that ignores TERM still gets the KILL
+after its leader has died. The same two pid-reuse cases as in the teardown above remain (the
+milliseconds between a process list and a kill, and the id passing on during the 10 s through a
+process that ended while its group lived on):
 
 ```bash
 logs=target/kurtosis/pair-<T>                         # the killed run's logs directory
 ls "$logs"/*-run.log                                  # <enclave>-run.log: the run's two enclaves
 run=<T>-<pid>                                         # their suffix, this run's own
-# The recorded groups whose leader (pid = pgid) still runs one of this run's commands:
-mine() {
-  while read -r g; do
-    ps -o pid=,pgid=,command= -p "$g" | awk -v g="$g" -v run="$run" '$1 == g && $2 == g && index($0, run) { print g }'
-  done < "$logs/job-groups"
-}
-for g in $(mine); do ps -A -o pid=,pgid=,command= | awk -v g="$g" '$2 == g'; done   # look first
-for g in $(mine); do kill -TERM -- "-$g"; done
-# 10 s later, for what mine() still finds:
-for g in $(mine); do kill -KILL -- "-$g"; done
+bash testing/kurtosis/stop-killed-run.sh --list "$logs" "$run"   # look first: signals nothing
+bash testing/kurtosis/stop-killed-run.sh "$logs" "$run"          # TERM, then KILL 10 s later
 kurtosis enclave rm -f ethswarm-gloas-a-<T>-<pid>
 kurtosis enclave rm -f ethswarm-gloas-b-<T>-<pid>
 rm "$logs/job-groups"
@@ -387,7 +393,8 @@ The image pin lint (criterion 3) runs in CI and needs no devnet:
 ```bash
 bash scripts/check-kurtosis-pins.sh                       # testing/kurtosis/*.yaml
 bash testing/kurtosis/tests/check-devnet.test.sh          # check-devnet.sh against stub kurtosis/curl
-bash testing/kurtosis/tests/run-pair.test.sh              # run-pair.sh against stub kurtosis/docker
+bash testing/kurtosis/tests/run-pair.test.sh              # run-pair.sh against stub kurtosis/docker,
+                                                          # and stop-killed-run.sh
 ```
 
 ## Export blocks and roots

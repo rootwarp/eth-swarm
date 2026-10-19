@@ -29,11 +29,13 @@
 # running. A job's process group is also stopped as soon as its leader ends (each launch's as soon
 # as that launch ends), so nothing a step left behind outlives it. Whether a job still runs is
 # what bash saw of it (its job table), never a lookup of its pid, which another process may have
-# taken once the job ended; a group that bash saw end is signalled only while it has a process.
+# taken once the job ended. A group that bash saw end is signalled only while, in the process list
+# read just before, it has a process and no process has its id as pid (bash has reaped the leader,
+# so a process with that pid leads another group); what that cannot rule out is in signal_left.
 # While a job runs, target/kurtosis/pair-T/job-groups lists the process group of each (one per
-# line, replaced whole; the teardown removes the file), for a run killed with SIGKILL (README.md,
-# "Acceptance checks"). The run logs, the check log, the genesis record and
-# `docker stats` snapshots stay in target/kurtosis/pair-T/.
+# line, replaced whole; the teardown removes the file), for a run killed with SIGKILL
+# (stop-killed-run.sh, and README.md, "Acceptance checks"). The run logs, the check log, the
+# genesis record and `docker stats` snapshots stay in target/kurtosis/pair-T/.
 #
 # Usage: testing/kurtosis/run-pair.sh [--lead S] [--sequential-fallback] [--keep-on-pass]
 #                                     [--clean-engine]
@@ -193,53 +195,68 @@ jobs_running() {
   for pid in "$@"; do if [[ $running == *" $pid "* ]]; then return 0; fi; done
   return 1
 }
-# ps_table: one line per process, `pid pgid stat start` (start: ps's lstart, its spaces as _).
+# ps_table: one line per process, `pid pgid stat start ppid` (start: ps's lstart, its spaces as _).
 ps_table() {
-  ps -A -o pid= -o pgid= -o stat= -o lstart= 2>/dev/null |
-    awk '{ s = $4; for (i = 5; i <= NF; i++) s = s "_" $i; print $1, $2, $3, s }'
+  ps -A -o pid= -o pgid= -o stat= -o ppid= -o lstart= 2>/dev/null |
+    awk '{ s = $5; for (i = 6; i <= NF; i++) s = s "_" $i; print $1, $2, $3, s, $4 }'
 }
-# proc_start <pid>: the process's start (as in ps_table), empty once it is gone; with the pid, it
-# names one process.
-proc_start() {
-  ps -o lstart= -p "$1" 2>/dev/null | awk '{ s = $1; for (i = 2; i <= NF; i++) s = s "_" $i; print s }'
-}
-# descendants <pid>: every descendant of the process, deepest first.
+# descendants <pid> <table>: `pid@start` of every descendant of the process in the ps_table
+# <table>, deepest first. The pid and start come from one listing, so each names the process
+# that was a descendant when it was read, never one that took its pid later.
 descendants() {
-  local child
-  for child in $(pgrep -P "$1" 2>/dev/null || true); do
-    descendants "$child"
-    echo "$child"
-  done
+  awk -v root="$1" '
+    { kids[$5] = kids[$5] " " $1; start[$1] = $4 }
+    function walk(p,   list, n, i) {
+      if (seen[p]++) return
+      n = split(kids[p], list, " ")
+      for (i = 1; i <= n; i++) { walk(list[i]); print list[i] "@" start[list[i]] }
+    }
+    END { walk(root) }' <<<"$2"
 }
-# still_here <pid...> -- <pid@start...>: 0 while one of the jobs runs (jobs_running), a process
-# (a zombie aside) of a job's process group runs, or one of the recorded processes (the same pid
-# and start) runs.
+# GROUP_LEFT: the awk test, over a ps_table (g: the group id), that the group of a job bash saw end
+# still holds its id: a process of the group (a zombie aside) runs, and no process (a zombie
+# included) has the id as its pid. bash has reaped the job's leader, and the kernel gives no
+# process a pid that is still a group's id, so a process with that pid leads another group, one
+# that took the id once the job's group had emptied.
+# shellcheck disable=SC2016 # awk source
+GROUP_LEFT='{ pid[$1] = 1; if ($2 == g && $3 !~ /^Z/) member = 1 } END { exit !(member && !(g in pid)) }'
+# still_here <pid...> -- <pid@start...>: 0 while one of the jobs runs (jobs_running), the group of
+# a job still holds its id with a process in it (GROUP_LEFT), or one of the recorded processes (the
+# same pid and start, a zombie aside) runs. The job table is read before the process list, so a
+# job it shows ended had its leader reaped before the list was read.
 # shellcheck disable=SC2329 # invoked by wait_while, as its probe
 still_here() {
-  local groups=()
+  local groups=() g table
   while (($# > 0)) && [[ $1 != -- ]]; do groups+=("$1"); shift; done
   if (($# > 0)); then shift; fi
   if jobs_running ${groups[@]+"${groups[@]}"}; then return 0; fi
-  ps_table | awk -v g=" ${groups[*]-} " -v r=" $* " '
-    $3 !~ /^Z/ && (index(g, " " $2 " ") || index(r, " " $1 "@" $4 " ")) { found = 1 } END { exit !found }'
+  table=$(ps_table)
+  for g in ${groups[@]+"${groups[@]}"}; do
+    if awk -v g="$g" "$GROUP_LEFT" <<<"$table"; then return 0; fi
+  done
+  awk -v r=" $* " '$3 !~ /^Z/ && index(r, " " $1 "@" $4 " ") { found = 1 } END { exit !found }' <<<"$table"
 }
 # signal_left <signal> <pid...> -- <pid@start...>: the signal to each job that bash still runs
 # (its process group, and the job itself, whose group may not exist yet right after its start), to
-# the group of each job that bash saw end only while a process of that group runs (it then still
-# holds the group id), and to each recorded process only while the same process (pid and start)
-# runs. Nothing goes to a pid or group id that may have passed to another process.
+# the group of each job that bash saw end only while that group still holds its id (GROUP_LEFT),
+# and to each recorded process only while the same process (pid and start) runs. The job table is
+# read before the process list (see still_here), and the list just before the signals. Two cases
+# remain where a signal can reach another process's group: the group empties and its id passes to
+# a new group in the milliseconds between that list and the kill; or, before the list, the group
+# emptied, a new process took the id as its pid and group, and that process ended while its group
+# lived on. Either needs the kernel to hand the same pid out again within that time.
 signal_left() {
   local sig=$1 g rec table running
   shift
-  table=$(ps_table)
   running=" $(jobs -rp | tr '\n' ' ') "
+  table=$(ps_table)
   while (($# > 0)) && [[ $1 != -- ]]; do
     g=$1
     shift
     if [[ $running == *" $g "* ]]; then
       kill "-$sig" -- "-$g" 2>/dev/null || true
       kill "-$sig" "$g" 2>/dev/null || true
-    elif awk -v g="$g" '$2 == g && $3 !~ /^Z/ { found = 1 } END { exit !found }' <<<"$table"; then
+    elif awk -v g="$g" "$GROUP_LEFT" <<<"$table"; then
       kill "-$sig" -- "-$g" 2>/dev/null || true
     fi
   done
@@ -266,11 +283,13 @@ wait_while() {
 # still runs GRACE seconds later (a process that ignores TERM, or that left the process tree,
 # included), then waits for the jobs and drops them from bg_pids.
 stop() {
-  local pid p recs=()
+  local pid rec table recs=()
   (($# > 0)) || return 0
+  # The list first: a job that still runs after it was read had the same pid then.
+  table=$(ps_table)
   for pid in "$@"; do
     if jobs_running "$pid"; then
-      for p in $(descendants "$pid"); do recs+=("$p@$(proc_start "$p")"); done
+      while IFS= read -r rec; do recs+=("$rec"); done < <(descendants "$pid" "$table")
     fi
   done
   signal_left TERM "$@" -- ${recs[@]+"${recs[@]}"}
