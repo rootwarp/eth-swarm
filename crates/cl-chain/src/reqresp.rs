@@ -56,7 +56,9 @@
 //! ([`Snapshot::first_pending_target`]), and a range with nothing stored before that slot is
 //! `3: ResourceUnavailable`, never an empty success, even while settlement has not run (a quiet
 //! store). A chain whose first block waits for an ancestor before the range starts there, as one
-//! whose parent is before the range.
+//! whose parent is before the range. A pending link of a store no writer has migrated yet names
+//! no slot, so any slot below its block may be the missing one: a range starting below that
+//! block is `3: ResourceUnavailable`.
 //!
 //! # Order and completeness
 //!

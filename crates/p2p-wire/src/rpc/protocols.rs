@@ -489,6 +489,18 @@ impl<E: EthSpec> Response<E> {
             Response::DataColumn(c) => c.as_ssz_bytes(),
         }
     }
+
+    /// The length of [`Self::ssz_bytes`], without encoding it.
+    pub fn ssz_bytes_len(&self) -> usize {
+        match self {
+            Response::Status(s) => s.ssz_bytes_len(),
+            Response::MetaData(m) => m.ssz_bytes_len(),
+            Response::Ping(p) => p.ssz_bytes_len(),
+            Response::Block(b) => b.ssz_bytes_len(),
+            Response::Goodbye(g) => g.ssz_bytes_len(),
+            Response::DataColumn(c) => c.ssz_bytes_len(),
+        }
+    }
 }
 
 /// The result code of a response chunk (`phase0/p2p-interface.md` "Responding side").
@@ -726,6 +738,11 @@ mod tests {
             assert_eq!(column.answers(p), p.is_columns(), "{p}");
         }
         assert_eq!(column.ssz_bytes(), ssz);
+        for response in [status, metadata, ping, block, column] {
+            assert_eq!(response.ssz_bytes_len(), response.ssz_bytes().len());
+        }
+        let goodbye: Response<Minimal> = Response::Goodbye(Goodbye(3));
+        assert_eq!(goodbye.ssz_bytes_len(), 8);
     }
 
     fn by_range(start_slot: u64, count: u64, columns: Vec<u64>) -> Request {

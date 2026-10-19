@@ -19,7 +19,8 @@
 //!   knows which slots hold a block the store lacks ([`Snapshot::first_pending_target`]). An env
 //!   written before the links table existed is migrated when a writer opens it: contiguous only
 //!   from the slot after its highest block; so are pending links stored without their target's
-//!   slot (a parent link if the target is stored, else a gap), in the same transaction.
+//!   slot (a parent link if the target is stored, else a gap), in the same transaction. Until
+//!   then a reader serves nothing below the block of such a link.
 //! - **Snapshots.** [`ColumnReader::snapshot`] reads several values of one state.
 //! - **First stored slot.** [`ColumnReader::first_stored_slot`] is the lowest slot any column
 //!   was ever stored at, written in the same transaction as that column; pruning leaves it. It

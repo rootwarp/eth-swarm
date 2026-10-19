@@ -7,11 +7,12 @@ rust-version.workspace = true
 publish = false
 
 [features]
-# A seam for crash tests only (`ColumnWriter::set_before_commit`): a hook that runs in every
-# column write transaction after its puts and before its commit, so a test can kill the writer
-# mid-write. Only cl-chain's dev-dependencies enable it, so a normal build of a service leaves
-# it off; `--all-features` (or a dependent's tests in the same build) turns it on, so release
-# artifacts come from per-service builds without it.
+# Seams for tests only: `ColumnWriter::set_before_commit`, a hook that runs in every column
+# write transaction after its puts and before its commit, so a test can kill the writer
+# mid-write; and `ColumnWriter::put_legacy_pending_link`, a link row in the layout stores wrote
+# before, for a reader of an env not migrated yet. Only cl-chain's dev-dependencies enable it,
+# so a normal build of a service leaves it off; `--all-features` (or a dependent's tests in the
+# same build) turns it on, so release artifacts come from per-service builds without it.
 test-hooks = []
 
 [dependencies]

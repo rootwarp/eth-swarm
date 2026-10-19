@@ -77,12 +77,16 @@
 //!   ([`super::limits::ColumnPlaces`]): at most [`RpcLimits::max_column_answers`] (8) at once,
 //!   one per peer and [`RpcLimits::max_column_answers_per_ip`] (2) per IP, each at most
 //!   [`RpcLimits::max_column_response_bytes`] (8 MiB) of SSZ, encoded one chunk at a time (an
-//!   estimated 68 MiB for all, see [`super::limits::DEFAULT_MAX_COLUMN_ANSWERS`]). Each answer
-//!   is written to a schedule ([`super::limits::WriteSchedule`]): chunk `i` of `n` is due at
-//!   its booked token and no earlier than `i / n` of the way through
-//!   [`RpcLimits::column_answer_window`] from when the answer took its place, and a chunk not
-//!   written within [`RpcLimits::column_write_deadline`] (1 s) of that, or of its write's
-//!   start, resets its stream and frees the place. A requester that stops reading holds it for
+//!   estimated 68 MiB for all, see [`super::limits::DEFAULT_MAX_COLUMN_ANSWERS`]), and no more
+//!   than a requester reading those bytes per [`RpcLimits::column_answer_window`] reads in what
+//!   is left of the window when the lookup ends ([`answer_columns`]): a slow lookup shortens
+//!   the answer, at a whole block, instead of leaving the requester less time for the same
+//!   bytes. Each answer is written to a
+//!   schedule ([`super::limits::WriteSchedule`]): a chunk is due at its booked token and no
+//!   earlier than the share of the window from when the answer took its place that the
+//!   answer's bytes before it are of all of them, and a chunk not written within
+//!   [`RpcLimits::column_write_deadline`] (1 s) of that, or of its write's start, resets its
+//!   stream and frees the place. A requester that stops reading holds it for
 //!   about a second, and one that reads a chunk just inside the deadline each time falls behind
 //!   its schedule and is cut too; no place is held past the window and the write deadline, so
 //!   slow readers spread over many IPs cannot keep every place for the 10 s exchange timeout.
@@ -138,7 +142,7 @@ use super::codec::{
     Answer, Deadline, Deadlines, InboundCodec, ReadError, ReceivedChunk, RpcCodec, RpcRequest,
 };
 use super::columns::{
-    column_chunks, error_answer, AnswerBudget, ColumnReply, ColumnSource, Requested,
+    column_chunks, error_answer, AnswerBudget, ColumnLookup, ColumnReply, ColumnSource, Requested,
 };
 use super::limits::{
     shared_limiter, Admit, AnswerPermit, BookedChunks, ChunkPacer, ColumnPlaces, OutboundSemaphore,
@@ -628,6 +632,32 @@ struct ColumnAnswer<E: EthSpec> {
     chunks: Vec<ReceivedChunk<E>>,
     booked: BookedChunks,
     permit: AnswerPermit,
+}
+
+/// The chunks a column lookup's answer goes out as, and their SSZ bytes: its reply
+/// (`2: ServerError` past [`COLUMN_LOOKUP_TIMEOUT`]) held to `requested` and cut to `budget`
+/// ([`column_chunks`]), its bytes to the share of them that what is left of the answer `window`
+/// of `permit`'s place holds ([`AnswerBudget::within`]).
+pub(crate) async fn answer_columns<E: EthSpec>(
+    lookup: ColumnLookup,
+    requested: &Requested,
+    contexts: &ContextTable,
+    budget: AnswerBudget,
+    metrics: &RpcMetrics,
+    permit: &AnswerPermit,
+    window: Duration,
+) -> (Vec<ReceivedChunk<E>>, usize) {
+    let reply = tokio::time::timeout(COLUMN_LOOKUP_TIMEOUT, lookup)
+        .await
+        .unwrap_or_else(|_| ColumnReply::server_error("column lookup timed out"));
+    let left = (permit.held_since() + window).saturating_duration_since(Instant::now());
+    column_chunks(
+        reply,
+        requested,
+        contexts,
+        budget.within(left, window),
+        metrics,
+    )
 }
 
 /// A column request admitted and waiting for its tokens or a place.
@@ -1492,11 +1522,12 @@ impl<E: EthSpec> Control<E> {
             max_sidecars: booked.tokens(),
             max_bytes: self.cfg.limits.max_column_response_bytes,
         };
+        let window = self.cfg.limits.column_answer_window;
         self.lookups.push(runtime.spawn(async move {
-            let reply = tokio::time::timeout(COLUMN_LOOKUP_TIMEOUT, lookup)
-                .await
-                .unwrap_or_else(|_| ColumnReply::server_error("column lookup timed out"));
-            let (chunks, bytes) = column_chunks(reply, &requested, &contexts, budget, &metrics);
+            let (chunks, bytes) = answer_columns(
+                lookup, &requested, &contexts, budget, &metrics, &permit, window,
+            )
+            .await;
             permit.hold_bytes(bytes);
             booked.settle(chunks.len() as u64);
             ColumnAnswer {

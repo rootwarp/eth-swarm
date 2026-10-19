@@ -245,6 +245,20 @@ impl ColumnWriter {
         let _ = self.hooks.before_commit.set(hook);
     }
 
+    /// Stores `child`'s link as a pending link on `target` in the layout stores wrote before
+    /// pending links carried their target's slot (`3 ‖ root`), bypassing every rule. A seam for
+    /// reading an env no writer has migrated yet: the next [`ColumnWriter::open`] migrates it.
+    #[cfg(feature = "test-hooks")]
+    pub fn put_legacy_pending_link(&self, child: &BlockRoot, target: &BlockRoot) -> Result<()> {
+        let txn = self.reader.db.begin_rw_txn()?;
+        let links = txn.open_table(Some(LINKS_TABLE))?;
+        let mut value = vec![3];
+        value.extend_from_slice(target);
+        txn.put(&links, child, value, WriteFlags::UPSERT)?;
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Write transactions this handle has committed since [`ColumnWriter::open`] returned.
     #[must_use]
     pub fn rw_txns_committed(&self) -> u64 {

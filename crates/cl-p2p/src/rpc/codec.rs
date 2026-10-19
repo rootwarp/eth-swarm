@@ -582,6 +582,15 @@ fn check_response<E: EthSpec>(protocol: Protocol, chunks: &[ReceivedChunk<E>]) -
 }
 
 /// The wire bytes of one chunk [`check_response`] passed.
+/// The SSZ bytes of a success chunk's payload; 0 for an error chunk, which ends the answer, so
+/// no share of the answer's window follows from it ([`super::limits::WriteSchedule`]).
+fn ssz_len<E: EthSpec>(chunk: &ReceivedChunk<E>) -> usize {
+    match &chunk.chunk {
+        ResponseChunk::Success(response) => response.ssz_bytes_len(),
+        ResponseChunk::Error { .. } => 0,
+    }
+}
+
 fn encode_checked_chunk<E: EthSpec>(chunk: &ReceivedChunk<E>) -> io::Result<Vec<u8>> {
     match &chunk.chunk {
         ResponseChunk::Success(response) => {
@@ -760,7 +769,7 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
         let now = tokio::time::Instant::now();
         let schedule = booked.as_ref().map(|booked| {
             let held_since = permit.as_ref().map_or(now, |p| p.held_since());
-            booked.write_schedule(chunks.len() as u64, held_since, now)
+            booked.write_schedule(chunks.iter().map(ssz_len), held_since, now)
         });
         let _place = permit;
         for (i, chunk) in (0u64..).zip(chunks) {
@@ -2090,13 +2099,16 @@ mod tests {
     }
 
     /// A requester that reads a chunk every `every`, after a first `window` of chunks: the
-    /// muxer's window, then its own pace.
+    /// muxer's window, then its own pace; it stops reading for good after `limit` bytes.
     struct SlowReader {
         every: Duration,
         chunk: usize,
         window: usize,
         since: Instant,
         taken: usize,
+        limit: usize,
+        /// When it stopped reading, at `limit`.
+        stopped: Option<Instant>,
         wake: Pin<Box<tokio::time::Sleep>>,
     }
 
@@ -2109,8 +2121,15 @@ mod tests {
                 window,
                 since,
                 taken: 0,
+                limit: usize::MAX,
+                stopped: None,
                 wake: Box::pin(tokio::time::sleep_until(since)),
             }
+        }
+
+        /// The same reader, which stops reading after `limit` bytes.
+        fn stopping_after(self, limit: usize) -> Self {
+            Self { limit, ..self }
         }
     }
 
@@ -2120,9 +2139,15 @@ mod tests {
             cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
+            if self.taken >= self.limit {
+                self.stopped.get_or_insert_with(Instant::now);
+                return Poll::Pending;
+            }
             loop {
                 let read = (Instant::now() - self.since).as_nanos() / self.every.as_nanos();
-                let room = (self.window + self.chunk * read as usize).saturating_sub(self.taken);
+                let room = (self.window + self.chunk * read as usize)
+                    .saturating_sub(self.taken)
+                    .min(self.limit - self.taken);
                 if room > 0 {
                     let n = room.min(buf.len());
                     self.taken += n;
@@ -2252,6 +2277,205 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(taken.elapsed() <= deadlines.answer_window + deadlines.write);
         assert_eq!(places.held(), 0);
+    }
+
+    const COLUMNS: Protocol = Protocol::DataColumnsByRangeV1;
+
+    /// A Gloas sidecar of column `index` at `slot` with `blobs` incompressible cells, so its
+    /// encoded size is about its SSZ size (2 KiB a blob).
+    fn big_sidecar(
+        slot: u64,
+        index: u64,
+        blobs: usize,
+    ) -> consensus_types::gloas::DataColumnSidecar<E> {
+        let mut sidecar = testkit::gloas_sidecar::<E>(slot, index);
+        let mut x = (slot * 128 + index).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let cells: Vec<_> = (0..blobs)
+            .map(|_| {
+                let bytes: Vec<u8> = (0..2048)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        x as u8
+                    })
+                    .collect();
+                consensus_types::fulu::Cell::<E>::new(bytes).unwrap()
+            })
+            .collect();
+        sidecar.kzg_proofs = vec![[0xbb; 48]; cells.len()].try_into().unwrap();
+        sidecar.column = cells.try_into().unwrap();
+        sidecar
+    }
+
+    /// A chunk of [`big_sidecar`].
+    fn sidecar_chunk(slot: u64, blobs: usize) -> ReceivedChunk<E> {
+        ReceivedChunk {
+            context: Some(testkit::GLOAS_DIGEST),
+            chunk: ResponseChunk::Success(Response::DataColumn(Box::new(
+                forked::DataColumnSidecar::Gloas(big_sidecar(slot, 1, blobs)),
+            ))),
+        }
+    }
+
+    /// An answer of 150 sidecars of 21-blob blocks (6.5 MB) and then 600 of 1-blob blocks
+    /// (1.3 MB): under the 8 MiB budget and within the tokens it books, its bytes front-loaded.
+    fn large_first() -> Vec<ReceivedChunk<E>> {
+        (0..750)
+            .map(|i| sidecar_chunk(i, if i < 150 { 21 } else { 1 }))
+            .collect()
+    }
+
+    /// Bytes every 10 ms that read `MAX_COLUMN_RESPONSE_BYTES` in `COLUMN_ANSWER_WINDOW`: the
+    /// answer's documented pace, about 1.7 MB/s.
+    fn at_the_answer_pace() -> usize {
+        let window = crate::rpc::limits::COLUMN_ANSWER_WINDOW.as_millis() as usize;
+        crate::rpc::limits::MAX_COLUMN_RESPONSE_BYTES * 10 / window
+    }
+
+    /// A booked column answer of `chunks`, with a place taken now.
+    fn booked_columns(
+        chunks: Vec<ReceivedChunk<E>>,
+        places: &crate::rpc::limits::ColumnPlaces,
+    ) -> Answer<E> {
+        use crate::rpc::limits::{BookedChunks, ColumnDeadlines};
+        let limiter = shared_limiter(RateLimits::default());
+        let peer = libp2p::PeerId::random();
+        let n = chunks.len() as u64;
+        Answer {
+            chunks,
+            pacer: None,
+            booked: Some(Box::new(BookedChunks::book(
+                &limiter,
+                peer,
+                COLUMNS,
+                n,
+                None,
+                ColumnDeadlines::default(),
+            ))),
+            permit: places.try_take(peer, None).map(Box::new),
+        }
+    }
+
+    /// The schedule shares the window by bytes: a requester that reads at the answer's pace is
+    /// never cut, even when the large sidecars come first, and one that stops reading is still
+    /// cut a write deadline after it stopped.
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_at_the_answer_pace_is_never_cut_by_large_chunks_first() {
+        let places = crate::rpc::limits::ColumnPlaces::new(1, 1, None);
+        let pace = at_the_answer_pace();
+        let start = Instant::now();
+        let mut io = SlowReader::new(Duration::from_millis(10), pace, pace);
+        inbound_codec()
+            .write_response(&COLUMNS, &mut io, booked_columns(large_first(), &places))
+            .await
+            .expect("read at the answer's pace");
+        assert!(start.elapsed() <= crate::rpc::limits::COLUMN_ANSWER_WINDOW);
+        assert_eq!(places.held(), 0);
+        // The same reader, stopping after 2 MB: cut within a write deadline of stopping.
+        let mut io = SlowReader::new(Duration::from_millis(10), pace, pace).stopping_after(2 << 20);
+        let err = inbound_codec()
+            .write_response(&COLUMNS, &mut io, booked_columns(large_first(), &places))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let stopped = io.stopped.expect("stopped reading");
+        let cut = Instant::now();
+        assert!(cut - stopped <= crate::rpc::limits::COLUMN_WRITE_DEADLINE);
+        assert!(cut - stopped >= crate::rpc::limits::COLUMN_WRITE_DEADLINE / 2);
+        assert_eq!(places.held(), 0);
+    }
+
+    /// A slow lookup leaves less of the answer window to write in, though the answer keeps its
+    /// byte budget: the answer is cut to the whole blocks a requester reading at the answer's
+    /// pace reads in what is left of the window, so it gets a shorter answer, never a reset.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_lookup_shortens_the_answer_and_never_resets_it() {
+        use crate::rpc::columns::ServedColumn;
+        use crate::rpc::columns::{AnswerBudget, ColumnLookup, ColumnReply, Requested};
+        use crate::rpc::inbound::{answer_columns, COLUMN_LOOKUP_TIMEOUT};
+        use crate::rpc::limits::{
+            BookedChunks, ColumnDeadlines, ColumnPlaces, COLUMN_ANSWER_WINDOW,
+            MAX_COLUMN_RESPONSE_BYTES,
+        };
+        use p2p_wire::rpc::messages::DataColumnsByRangeV1Request;
+        const CUSTODY: [u64; 4] = [1, 47, 87, 102];
+        // 50 blocks of four 21-blob sidecars: 8.8 MB, past the byte budget.
+        let root = |slot: u64| [slot as u8; 32];
+        let stored: Vec<ServedColumn> = (0..50u64)
+            .flat_map(|slot| {
+                CUSTODY.map(|index| {
+                    let mut sidecar = big_sidecar(slot, index, 21);
+                    sidecar.beacon_block_root = root(slot).into();
+                    ServedColumn {
+                        context: testkit::GLOAS_DIGEST,
+                        fork: network_config::ForkName::Gloas,
+                        slot,
+                        block_root: root(slot),
+                        ssz: sidecar.as_ssz_bytes(),
+                    }
+                })
+            })
+            .collect();
+        let requested = Requested::of(&Request::DataColumnsByRange(DataColumnsByRangeV1Request {
+            start_slot: 0,
+            count: 50,
+            columns: CUSTODY.to_vec().try_into().unwrap(),
+        }))
+        .unwrap();
+        let contexts = testkit::column_context_table();
+        let metrics = RpcMetrics::register(&mut prometheus_client::registry::Registry::default());
+        let limiter = shared_limiter(RateLimits::default());
+        let places = ColumnPlaces::new(1, 1, None);
+        let pace = at_the_answer_pace();
+        let mut served = Vec::new();
+        for lookup_takes in [
+            Duration::ZERO,
+            COLUMN_LOOKUP_TIMEOUT - Duration::from_millis(100),
+        ] {
+            let peer = libp2p::PeerId::random();
+            let deadlines = ColumnDeadlines::default();
+            let mut booked = BookedChunks::book(&limiter, peer, COLUMNS, 200, None, deadlines);
+            let mut permit = places.try_take(peer, None).unwrap();
+            let reply = ColumnReply::Sidecars(stored.clone());
+            let lookup: ColumnLookup = Box::pin(async move {
+                tokio::time::sleep(lookup_takes).await;
+                reply
+            });
+            let budget = AnswerBudget {
+                max_sidecars: booked.tokens(),
+                max_bytes: MAX_COLUMN_RESPONSE_BYTES,
+            };
+            let (chunks, bytes) = answer_columns::<E>(
+                lookup,
+                &requested,
+                &contexts,
+                budget,
+                &metrics,
+                &permit,
+                COLUMN_ANSWER_WINDOW,
+            )
+            .await;
+            permit.hold_bytes(bytes);
+            booked.settle(chunks.len() as u64);
+            served.push(chunks.len());
+            assert_eq!(chunks.len() % CUSTODY.len(), 0, "whole blocks");
+            let answer = Answer {
+                chunks,
+                pacer: None,
+                booked: Some(Box::new(booked)),
+                permit: Some(Box::new(permit)),
+            };
+            let mut io = SlowReader::new(Duration::from_millis(10), pace, pace);
+            inbound_codec()
+                .write_response(&COLUMNS, &mut io, answer)
+                .await
+                .unwrap_or_else(|e| panic!("after a {lookup_takes:?} lookup: {e}"));
+        }
+        // The byte budget cut the answer of the quick lookup; the slow one's is shorter still.
+        assert!(served[0] < stored.len(), "{served:?}");
+        assert!(served[1] < served[0], "{served:?}");
+        assert!(served[1] > 0, "{served:?}");
     }
 
     #[tokio::test(start_paused = true)]

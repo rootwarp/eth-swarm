@@ -138,10 +138,12 @@ impl RateLimits {
 /// to every peer of a full swarm (160 connections) with headroom.
 pub const DEFAULT_OUTBOUND_QUEUE_LEN: usize = 256;
 
-/// The SSZ bytes one column answer may hold: 8 MiB \[est\]. An answer is cut at the last whole
-/// block that fits (the first block always goes, "Clients MAY limit the number of data column
-/// sidecars in the response", `fulu/p2p-interface.md` L682), so one epoch of 4 custody columns
-/// of 21-blob Gloas blocks (32 × 4 × 44,072 bytes, 5.4 MiB) fits whole.
+/// The SSZ bytes one column answer may hold: 8 MiB \[est\], read in [`COLUMN_ANSWER_WINDOW`].
+/// An answer is cut at the last whole block that fits (the first block always goes, "Clients MAY
+/// limit the number of data column sidecars in the response", `fulu/p2p-interface.md` L682), so
+/// one epoch of 4 custody columns of 21-blob Gloas blocks (32 × 4 × 44,072 bytes, 5.4 MiB) fits
+/// whole. A lookup that took part of the window leaves the answer that part less: after the
+/// longest (2 s), 3 s of the 5 s, about 4.8 MiB.
 pub const MAX_COLUMN_RESPONSE_BYTES: usize = 8 << 20;
 
 /// How long a column answer's chunks may take to go out at the peer's quota \[est\]: 5 s, the
@@ -176,14 +178,16 @@ pub const DEFAULT_MAX_COLUMN_ANSWERS: usize = 8;
 pub const DEFAULT_MAX_COLUMN_ANSWERS_PER_IP: usize = 2;
 
 /// How far a column chunk may fall behind its answer's schedule before its stream is reset
-/// \[est\]: 1 s. Chunk `i` of `n` is due at its token, and no earlier than `i / n` of the way
-/// through the answer window ([`COLUMN_ANSWER_WINDOW`], from when the answer took its place), so
-/// a burst never asks for the whole answer at once; it must be written and flushed within this
-/// of that, and the place goes back within the window and this of being taken
-/// ([`WriteSchedule`]). The deadline is not a new one per write: a requester that reads a chunk
-/// just inside it each time still falls behind its schedule and is reset, so it holds a place for
-/// about a second past the pace it keeps, not the 10 s exchange timeout. One that reads at the
-/// answer's pace (8 MiB in 5 s, about 1.7 MB/s) is never cut. Counted in
+/// \[est\]: 1 s. A chunk is due at its token, and no earlier than the share of the answer window
+/// ([`COLUMN_ANSWER_WINDOW`], from when the answer took its place) that the answer's SSZ bytes
+/// before it are of all of them, so a burst never asks for the whole answer at once; it must be
+/// written and flushed within this of that, and the place goes back within the window and this
+/// of being taken ([`WriteSchedule`]). The deadline is not a new one per write: a requester that
+/// reads a chunk just inside it each time still falls behind its schedule and is reset, so it
+/// holds a place for about a second past the pace it keeps, not the 10 s exchange timeout. One
+/// that reads at the answer's pace (8 MiB in 5 s, about 1.7 MB/s) is never cut, however the
+/// bytes are spread over the chunks: the answer holds no more than that pace reads in what is
+/// left of the window once its lookup ended (`super::inbound::answer_columns`). Counted in
 /// `rpc_timeouts_total{kind="per_chunk"}`.
 pub const COLUMN_WRITE_DEADLINE: Duration = Duration::from_secs(1);
 
@@ -847,19 +851,34 @@ impl BookedChunks {
         lock(&self.limiter).due_of(self.peer, self.protocol, &self.charge, 0)
     }
 
-    /// The schedule `chunks` chunks are written to from `now`, by an answer that took its place
-    /// at `held_since`: chunk `i` is due at its token ([`Self::due`]) and its share of the
-    /// window, `i / chunks` of the way from `now` to `held_since` + the answer window, and must
-    /// be written within the write deadline of the later of the two, and of its write's start
-    /// ([`WriteSchedule::written_by`]). The place is held no longer than the window and the
-    /// write deadline from `held_since`.
+    /// The schedule chunks of `sizes` SSZ bytes each are written to from `now`, by an answer
+    /// that took its place at `held_since`: chunk `i` is due at its token ([`Self::due`]) and
+    /// its share of the window, as far from `now` to `held_since` + the answer window as the
+    /// bytes before it are of the answer's, and must be written within the write deadline of the
+    /// later of the two, and of its write's start ([`WriteSchedule::written_by`]). The place is
+    /// held no longer than the window and the write deadline from `held_since`.
     #[must_use]
-    pub fn write_schedule(&self, chunks: u64, held_since: Instant, now: Instant) -> WriteSchedule {
+    pub fn write_schedule(
+        &self,
+        sizes: impl IntoIterator<Item = usize>,
+        held_since: Instant,
+        now: Instant,
+    ) -> WriteSchedule {
         let end = (held_since + self.deadlines.answer_window).max(now);
+        let mut total = 0u64;
+        let before = sizes
+            .into_iter()
+            .map(|size| {
+                let before = total;
+                total = total.saturating_add(size as u64);
+                before
+            })
+            .collect();
         WriteSchedule {
             start: now,
             span: end - now,
-            chunks: chunks.max(1),
+            before,
+            total,
             write: self.deadlines.write,
             hold_until: held_since + self.deadlines.answer_window + self.deadlines.write,
         }
@@ -903,24 +922,36 @@ impl BookedChunks {
 }
 
 /// When each chunk of a column answer must be written by ([`BookedChunks::write_schedule`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteSchedule {
     start: Instant,
     /// From `start` to the end of the answer window.
     span: Duration,
-    chunks: u64,
+    /// The SSZ bytes of the chunks before each chunk.
+    before: Vec<u64>,
+    /// The SSZ bytes of every chunk.
+    total: u64,
     write: Duration,
     hold_until: Instant,
 }
 
 impl WriteSchedule {
     /// When chunk `i`, due at `due`, must be written and flushed by if its write starts at
-    /// `now`: the write deadline after the later of `due` and its share of the window, never
+    /// `now`: the write deadline after the later of `due` and its share of the window (the
+    /// share the bytes before it have of the answer's, so a requester that reads the answer
+    /// evenly over the window keeps up however its bytes are spread over its chunks), never
     /// past the place's hold, and never more than the write deadline after the later of `due`
     /// and `now` (a requester that stopped reading is cut as soon as it holds a chunk that long).
     #[must_use]
     pub fn written_by(&self, i: u64, due: Instant, now: Instant) -> Instant {
-        let share = self.span.as_nanos() * u128::from(i.min(self.chunks)) / u128::from(self.chunks);
+        let before = usize::try_from(i)
+            .ok()
+            .and_then(|i| self.before.get(i))
+            .map_or(self.total, |&before| before);
+        let share = match self.total {
+            0 => 0,
+            total => self.span.as_nanos() * u128::from(before) / u128::from(total),
+        };
         let share = Duration::from_nanos(u64::try_from(share).unwrap_or(u64::MAX));
         (due.max(self.start + share) + self.write)
             .min(due.max(now) + self.write)

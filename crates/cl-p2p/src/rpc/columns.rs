@@ -32,8 +32,9 @@
 //! whole answer is `2: ServerError`. A sidecar the
 //! request did not name, or named once and got twice, is dropped and counted
 //! (`rpc_column_unrequested_total`). The answer is then cut at the last whole block within the
-//! sidecars the requester's quota delivers in the answer window and within the byte budget, the
-//! first block always in; a range answer whose first block lacks a requested column is
+//! sidecars the requester's quota delivers in the answer window and within the byte budget (its
+//! share left of the window once the lookup ended, [`AnswerBudget::within`]), the first block
+//! always in; a range answer whose first block lacks a requested column is
 //! `2: ServerError` (cl-chain never sends one). Error chunks carry a fixed message per code
 //! ([`fixed_message`]); the source's detail goes to the log only.
 
@@ -57,6 +58,7 @@ use pb::req_resp_service_client::ReqRespServiceClient;
 use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 use tonic::transport::Channel;
 use tonic::Status;
 use tree_hash::TreeHash;
@@ -351,6 +353,22 @@ pub(crate) struct AnswerBudget {
     pub(crate) max_bytes: usize,
 }
 
+impl AnswerBudget {
+    /// This budget for an answer with `left` of its `window` to go out in: the bytes a requester
+    /// reading `max_bytes` per `window` reads in `left`, so an answer whose lookup took part of
+    /// the window is cut shorter instead of falling behind its schedule.
+    pub(crate) fn within(self, left: Duration, window: Duration) -> Self {
+        if left >= window {
+            return self;
+        }
+        let max_bytes = self.max_bytes as u128 * left.as_nanos() / window.as_nanos();
+        Self {
+            max_bytes: usize::try_from(max_bytes).unwrap_or(self.max_bytes),
+            ..self
+        }
+    }
+}
+
 /// A decoded sidecar on its way out, with its block.
 struct Outgoing<E: EthSpec> {
     block: (u64, [u8; 32]),
@@ -485,6 +503,27 @@ mod tests {
     use network_config::{ForkSchedule, ScheduledFork};
 
     const GLOAS: ForkDigest = [0x61, 0x0a, 0x50, 0x01];
+
+    #[test]
+    fn a_budget_keeps_the_bytes_the_window_left_holds() {
+        let budget = AnswerBudget {
+            max_sidecars: 7,
+            max_bytes: 8 << 20,
+        };
+        let window = Duration::from_secs(5);
+        let within = |left| budget.within(left, window);
+        assert_eq!(within(window), budget);
+        assert_eq!(within(Duration::from_secs(9)), budget);
+        assert_eq!(
+            within(Duration::from_secs(3)),
+            AnswerBudget {
+                max_sidecars: 7,
+                max_bytes: (8 << 20) * 3 / 5,
+            }
+        );
+        assert_eq!(within(Duration::ZERO).max_bytes, 0);
+        assert_eq!(budget.within(Duration::ZERO, Duration::ZERO), budget);
+    }
 
     fn link() -> Link {
         let at = |epoch| ScheduledFork {

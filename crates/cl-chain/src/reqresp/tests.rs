@@ -226,6 +226,55 @@ fn a_pending_ancestors_slot_is_never_answered_as_empty() {
     );
 }
 
+/// A store no writer has migrated yet, read by a read-only reader (cl-store's, or a probe's
+/// before its writer opened): a pending link stored without its target's slot names no slot, so
+/// every slot below its block may be the one the store lacks. A range below that block is
+/// `3: ResourceUnavailable`, never an empty success; from the block on, it is served.
+#[test]
+fn an_unmigrated_pending_link_is_never_answered_as_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        writer
+            .set_custody(&cl_chain_columns::CustodyRecord {
+                cgc: 4,
+                cgc_set_slot: 0,
+                metadata_seq: 1,
+                advertised_cgc: 4,
+            })
+            .unwrap();
+        put_root(&writer, 10, root(10), BlockLink::Start, &CUSTODY);
+        // 14 waits for 12, written as the store wrote a pending link before.
+        put_root(&writer, 14, root(14), BlockLink::Start, &CUSTODY);
+        writer
+            .put_legacy_pending_link(&root(14), &root(12))
+            .unwrap();
+        put_root(&writer, 15, root(15), BlockLink::Parent(root(14)), &CUSTODY);
+    }
+    let reader = Arc::new(ColumnReader::open(dir.path()).unwrap());
+    assert_eq!(reader.contiguous_from().unwrap(), None, "not migrated");
+    let server = ColumnServer::new(
+        reader as Arc<dyn ColumnStore>,
+        U256::MAX,
+        Arc::new(Fixed),
+        ServeBudget::default(),
+    );
+    assert_eq!(server.earliest_available_slot(), Some(10));
+    for (start, count) in [(12, 1), (10, 1), (11, 2), (10, 4), (13, 1), (10, 6)] {
+        assert!(
+            matches!(
+                server.by_range(start, count, &[1], None),
+                Err(Refusal::Unavailable(_))
+            ),
+            "{start}+{count}"
+        );
+    }
+    // From the block on, its missing ancestor is before the range.
+    let served = server.by_range(14, 2, &[1], None).unwrap();
+    assert_eq!(keys(&served), [(14, 1), (15, 1)]);
+    assert_eq!(server.by_range(16, 4, &[1], None).unwrap(), Vec::new());
+}
+
 /// CR-003: only the block the budget cut is spared the completeness check; a block before it
 /// that lacks a requested column still ends the answer, as any such block does.
 #[test]

@@ -105,7 +105,10 @@ const DEADLINE_EVERY: usize = 64;
 /// block, as the writer's migration makes it ([`ColumnWriter::open`](
 /// crate::ColumnWriter::open)). Each [`Snapshot`] looks for the table again, so a reader opened
 /// before a writer migrated the env reads links from then on. A pending link stored without its
-/// target's slot reads as a gap, as the migration rewrites it unless its target is stored.
+/// target's slot reads as a gap, as the migration rewrites it unless its target is stored, and
+/// no range below its block is read past its start ([`Snapshot::first_pending_target`]): the
+/// slot its block waits for is unknown, and the migration's contiguous-from slot is not
+/// written yet.
 #[derive(Debug)]
 pub struct ColumnReader {
     pub(crate) db: env::Env,
@@ -317,8 +320,11 @@ impl Snapshot<'_> {
 
     /// The lowest slot in `start_slot..end_slot` of a block that a stored block is
     /// [`BlockLink::Pending`] on: a blob-carrying block known to be on that block's chain and not
-    /// held. `None` if there is none (or the env has no links table). Walks every stored link,
-    /// and stops with [`Error::Deadline`] once `deadline` passed (looked at every 64 links).
+    /// held. `None` if there is none (or the env has no links table). A pending link stored
+    /// without its target's slot ([`BlockLink::legacy_pending_target`], not migrated yet) names
+    /// no slot, so any slot below its block may be the one: `start_slot`, if its block is after
+    /// it, and nothing below the block is served. Walks every stored link, and stops with
+    /// [`Error::Deadline`] once `deadline` passed (looked at every 64 links).
     pub fn first_pending_target(
         &self,
         start_slot: u64,
@@ -332,20 +338,34 @@ impl Snapshot<'_> {
         let mut cursor = self.txn.cursor(&links)?;
         let mut first = None;
         let mut walked = 0usize;
-        let mut row = cursor.first::<(), Cow<'_, [u8]>>()?;
-        while let Some(((), value)) = row {
+        let mut row = cursor.first::<Cow<'_, [u8]>, Cow<'_, [u8]>>()?;
+        while let Some((key, value)) = row {
             if walked.is_multiple_of(DEADLINE_EVERY)
                 && deadline.is_some_and(|d| std::time::Instant::now() >= d)
             {
                 return Err(Error::Deadline);
             }
             walked += 1;
-            if let Some(BlockLink::Pending(_, slot)) = BlockLink::decode(&value) {
+            let target = match BlockLink::decode(&value) {
+                Some(BlockLink::Pending(_, slot)) => Some(slot),
+                Some(_) => None,
+                None if BlockLink::legacy_pending_target(&value).is_some() => {
+                    let child: BlockRoot = key
+                        .as_ref()
+                        .try_into()
+                        .map_err(|_| Error::Corrupt { table: LINKS_TABLE })?;
+                    stored_slot(&self.txn, &child)?
+                        .filter(|&slot| slot > start_slot)
+                        .map(|_| start_slot)
+                }
+                None => None,
+            };
+            if let Some(slot) = target {
                 if (start_slot..end_slot).contains(&slot) && first.is_none_or(|f| slot < f) {
                     first = Some(slot);
                 }
             }
-            row = cursor.next::<(), Cow<'_, [u8]>>()?;
+            row = cursor.next::<Cow<'_, [u8]>, Cow<'_, [u8]>>()?;
         }
         Ok(first)
     }
