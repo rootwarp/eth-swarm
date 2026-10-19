@@ -37,8 +37,9 @@ use tokio::net::TcpListener;
 use tracing::{Instrument, Subscriber};
 use tracing_subscriber::field::RecordFields;
 use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::fmt::format::{JsonFields, Writer};
-use tracing_subscriber::fmt::{FormatFields, FormattedFields, MakeWriter};
+use tracing_subscriber::fmt::format::{Format, Json, JsonFields, Writer};
+use tracing_subscriber::fmt::time::SystemTime;
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, FormattedFields, MakeWriter};
 use tracing_subscriber::layer::{Identity, Layer, SubscriberExt as _};
 use tracing_subscriber::registry::LookupSpan;
 
@@ -52,23 +53,97 @@ pub const METRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The JSON formatting layer, writing to `writer`. `level` filters this layer only, so another
-/// layer of the same subscriber can see more (a per-layer filter). Span fields are formatted
-/// by [`SpanFields`], so one whose `Debug` panics cannot break the subscriber.
+/// layer of the same subscriber can see more (a per-layer filter). Events are formatted by
+/// [`GuardedEvent`] and span fields by [`SpanFields`], so a field whose `Debug` panics cannot
+/// break the subscriber or a line.
 pub fn json_layer<S, W>(level: LevelFilter, writer: W) -> impl Layer<S> + Send + Sync + 'static
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
     W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
 {
     tracing_subscriber::fmt::layer()
-        .json()
-        .with_current_span(true)
-        .with_span_list(false)
+        .event_format(json_events())
         .fmt_fields(SpanFields(JsonFields::new()))
         .with_writer(writer)
         .with_filter(level)
 }
 
-/// The JSON span fields, with a panic while formatting them contained.
+/// The JSON event formatter: the current span, not the span list.
+fn json_events() -> GuardedEvent<Format<Json, SystemTime>> {
+    GuardedEvent(
+        tracing_subscriber::fmt::format()
+            .json()
+            .with_current_span(true)
+            .with_span_list(false),
+    )
+}
+
+/// The message of the line written for an event that could not be formatted.
+const UNFORMATTED: &str = "log event could not be formatted";
+
+/// An event formatter, with a panic or an error while formatting an event contained.
+///
+/// The fmt layer formats an event into a buffer of its thread's, and clears it only after a
+/// format that succeeded. A field whose `Debug` panicked left its half-written JSON there, and
+/// once the panic was caught (a tokio task, a `catch_unwind`), the next event on that thread
+/// was written onto it as one line that is not JSON; each such panic grew the buffer, outside
+/// the log queue's bound. A format that failed made the fmt layer write a line of its own, not
+/// JSON either. Here the event is formatted into a buffer of its own, kept only once the
+/// format finished; otherwise the event's line is [`unformatted_line`], its level and target
+/// without its fields (a panic is logged by the panic hook too).
+#[derive(Debug)]
+struct GuardedEvent<E>(E);
+
+impl<S, N, E> FormatEvent<S, N> for GuardedEvent<E>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+    E: FormatEvent<S, N>,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> fmt::Result {
+        let mut formatted = String::new();
+        let done = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            self.0.format_event(ctx, Writer::new(&mut formatted), event)
+        }));
+        match done {
+            Ok(Ok(())) => writer.write_str(&formatted),
+            Ok(Err(fmt::Error)) => writer.write_str(&unformatted_line(event.metadata())),
+            Err(payload) => {
+                dispose(payload);
+                writer.write_str(&unformatted_line(event.metadata()))
+            }
+        }
+    }
+}
+
+/// The line of an event that could not be formatted, in the subscriber's JSON shape: its level
+/// and target, and [`UNFORMATTED`] for its fields.
+fn unformatted_line(event: &tracing::Metadata<'_>) -> String {
+    let mut line = format!(
+        r#"{{"timestamp":"{}","level":"{}","fields":{{"message":"{UNFORMATTED}"}},"target":"#,
+        log_writer::timestamp(),
+        event.level()
+    );
+    log_writer::push_json_str(&mut line, event.target());
+    line.push_str("}\n");
+    line
+}
+
+/// Drops a caught panic's payload, where a panic of its own `Drop` must not get out (a span's
+/// extensions lock is held): that panic is caught, and its payload leaked, since dropping that
+/// one could panic again.
+fn dispose(payload: Box<dyn std::any::Any + Send>) {
+    if let Err(again) = std::panic::catch_unwind(AssertUnwindSafe(move || drop(payload))) {
+        std::mem::forget(again);
+    }
+}
+
+/// The span fields, with a panic or an error while formatting them contained.
 ///
 /// The fmt layer formats a span's fields (at creation and on each `record`) while it holds
 /// that span's extensions lock. A field whose `Debug` panicked unwound through the lock and
@@ -76,11 +151,16 @@ where
 /// panicked in the subscriber ("Mutex poisoned"), anywhere, even in a `Drop` (an abort), so
 /// one bad field could take the service down. Here the panic stops inside the formatting: the
 /// panic hook still logs it, the fields it interrupted are left out (`{}` at creation, the
-/// previous ones on `record`), and the lock is released normally.
+/// previous ones on `record`), its payload is [`dispose`]d of, and the lock is released
+/// normally. A format that fails leaves the fields out the same way, and succeeds: on a
+/// failure the fmt layer would write to stderr itself (`eprintln!`), past the log queue.
 #[derive(Debug)]
-struct SpanFields(JsonFields);
+struct SpanFields<N>(N);
 
-impl<'writer> FormatFields<'writer> for SpanFields {
+impl<'writer, N> FormatFields<'writer> for SpanFields<N>
+where
+    N: for<'w> FormatFields<'w> + 'static,
+{
     fn format_fields<R: RecordFields>(
         &self,
         mut writer: Writer<'writer>,
@@ -91,11 +171,12 @@ impl<'writer> FormatFields<'writer> for SpanFields {
             self.0.format_fields(Writer::new(&mut formatted), fields)
         }));
         match done {
-            Ok(result) => {
-                result?;
-                writer.write_str(&formatted)
+            Ok(Ok(())) => writer.write_str(&formatted),
+            Ok(Err(fmt::Error)) => writer.write_str("{}"),
+            Err(payload) => {
+                dispose(payload);
+                writer.write_str("{}")
             }
-            Err(_) => writer.write_str("{}"),
         }
     }
 
@@ -104,17 +185,15 @@ impl<'writer> FormatFields<'writer> for SpanFields {
         current: &'writer mut FormattedFields<Self>,
         fields: &tracing::span::Record<'_>,
     ) -> fmt::Result {
-        let mut merged = FormattedFields::<JsonFields>::new(current.fields.clone());
+        let mut merged = FormattedFields::<N>::new(current.fields.clone());
         let done =
             std::panic::catch_unwind(AssertUnwindSafe(|| self.0.add_fields(&mut merged, fields)));
         match done {
-            Ok(result) => {
-                result?;
-                current.fields = merged.fields;
-                Ok(())
-            }
-            Err(_) => Ok(()),
+            Ok(Ok(())) => current.fields = merged.fields,
+            Ok(Err(fmt::Error)) => {}
+            Err(payload) => dispose(payload),
         }
+        Ok(())
     }
 }
 
@@ -141,6 +220,11 @@ pub fn init_tracing(level: LevelFilter) -> bool {
 /// Installs, as the global default, a registry with `extra` and the JSON layer on stderr. The
 /// lines go through a [`LogWriter`] queue bounded by `bounds`, so no caller ever blocks on
 /// stderr; its drops count in `ethswarm_log_lines_dropped_total` ([`RuntimeMetrics`]).
+///
+/// `extra` gets none of the JSON layer's panic protection ([`json_layer`]): a panic in one of
+/// its callbacks, or in the `Drop` of data it keeps in a span's extensions, can still unwind
+/// through a span's extensions lock and poison it, and with it every later span in that slot.
+/// An owner's layer must not panic there.
 ///
 /// `false` if a subscriber was already installed (the existing one stays), or the writer
 /// thread could not start (nothing is installed).
@@ -875,6 +959,327 @@ mod tests {
             "{out}"
         );
         assert_eq!(out.matches("in the recorded span").count(), 3, "{out}");
+    }
+
+    /// A value whose `Debug` panics.
+    struct DebugPanics;
+    impl fmt::Debug for DebugPanics {
+        fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+            panic!("DebugPanics formatted (expected by this test)");
+        }
+    }
+
+    /// A panic payload whose own `Drop` panics.
+    struct DropPanics;
+    impl Drop for DropPanics {
+        fn drop(&mut self) {
+            panic!("DropPanics dropped (expected by this test)");
+        }
+    }
+
+    /// A value whose `Debug` panics with a [`DropPanics`] payload.
+    struct DebugPanicsWithADropPanic;
+    impl fmt::Debug for DebugPanicsWithADropPanic {
+        fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+            std::panic::panic_any(DropPanics);
+        }
+    }
+
+    /// `f()`, its panic caught.
+    fn caught(f: impl FnOnce()) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    }
+
+    /// The lines `buf` holds, each checked to be one JSON object.
+    fn json_lines(buf: &Buffer) -> Vec<String> {
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(out.is_empty() || out.ends_with('\n'), "{out}");
+        out.lines()
+            .map(|line| {
+                assert!(json::is_object(line), "not one JSON object: {line}");
+                line.to_owned()
+            })
+            .collect()
+    }
+
+    /// Just enough of a JSON parser to tell whether a line is one JSON object (RFC 8259).
+    mod json {
+        pub fn is_object(text: &str) -> bool {
+            let mut p = Parser(text.as_bytes(), 0);
+            p.ws();
+            p.peek() == Some(b'{') && p.value() && {
+                p.ws();
+                p.1 == p.0.len()
+            }
+        }
+
+        struct Parser<'a>(&'a [u8], usize);
+
+        impl Parser<'_> {
+            fn peek(&self) -> Option<u8> {
+                self.0.get(self.1).copied()
+            }
+            fn eat(&mut self, b: u8) -> bool {
+                let hit = self.peek() == Some(b);
+                self.1 += usize::from(hit);
+                hit
+            }
+            fn ws(&mut self) {
+                while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                    self.1 += 1;
+                }
+            }
+            fn literal(&mut self, word: &[u8]) -> bool {
+                let hit = self.0[self.1..].starts_with(word);
+                self.1 += if hit { word.len() } else { 0 };
+                hit
+            }
+            fn value(&mut self) -> bool {
+                self.ws();
+                let ok = match self.peek() {
+                    Some(b'{') => self.seq(b'{', b'}', |p| {
+                        p.ws();
+                        p.string()
+                            && {
+                                p.ws();
+                                p.eat(b':')
+                            }
+                            && p.value()
+                    }),
+                    Some(b'[') => self.seq(b'[', b']', Self::value),
+                    Some(b'"') => self.string(),
+                    Some(b't') => self.literal(b"true"),
+                    Some(b'f') => self.literal(b"false"),
+                    Some(b'n') => self.literal(b"null"),
+                    _ => self.number(),
+                };
+                self.ws();
+                ok
+            }
+            fn seq(&mut self, open: u8, close: u8, item: fn(&mut Self) -> bool) -> bool {
+                self.eat(open);
+                self.ws();
+                if self.eat(close) {
+                    return true;
+                }
+                loop {
+                    if !item(self) {
+                        return false;
+                    }
+                    self.ws();
+                    if self.eat(close) {
+                        return true;
+                    }
+                    if !self.eat(b',') {
+                        return false;
+                    }
+                }
+            }
+            fn string(&mut self) -> bool {
+                if !self.eat(b'"') {
+                    return false;
+                }
+                while let Some(b) = self.peek() {
+                    self.1 += 1;
+                    match b {
+                        b'"' => return true,
+                        b'\\' => {
+                            let Some(e) = self.peek() else { return false };
+                            self.1 += 1;
+                            if e == b'u' {
+                                let hex = self.0.get(self.1..self.1 + 4);
+                                if !hex.is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit)) {
+                                    return false;
+                                }
+                                self.1 += 4;
+                            } else if !b"\"\\/bfnrt".contains(&e) {
+                                return false;
+                            }
+                        }
+                        0..0x20 => return false,
+                        _ => {}
+                    }
+                }
+                false
+            }
+            fn digits(&mut self) -> bool {
+                let start = self.1;
+                while self.peek().is_some_and(|b| b.is_ascii_digit()) {
+                    self.1 += 1;
+                }
+                self.1 > start
+            }
+            fn number(&mut self) -> bool {
+                self.eat(b'-');
+                if !self.eat(b'0') && !self.digits() {
+                    return false;
+                }
+                if self.eat(b'.') && !self.digits() {
+                    return false;
+                }
+                if self.eat(b'e') || self.eat(b'E') {
+                    let _ = self.eat(b'+') || self.eat(b'-');
+                    return self.digits();
+                }
+                true
+            }
+        }
+
+        #[test]
+        fn it_tells_one_object_from_the_rest() {
+            for good in [
+                "{}",
+                r#"{"a":1,"b":[true,false,null,-0.5e+3],"c":{"d":"\"\\é"}}"#,
+                r#" { "a" : [ ] } "#,
+            ] {
+                assert!(is_object(good), "{good}");
+            }
+            for bad in [
+                "",
+                "[]",
+                "{",
+                r#"{"a":1}{"b":2}"#,
+                r#"{"a":1,}"#,
+                r#"{"a"}"#,
+                r#"{"a":01}"#,
+                r#"{"a":"\x"}"#,
+                "{\"a\":\"\u{1}\"}",
+                r#"{"a":tru}"#,
+                r#"{"a":"open}"#,
+                r#"{"timestamp":"t","fields":{"bad":{"timestamp":"t"}"#,
+            ] {
+                assert!(!is_object(bad), "{bad}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_event_field_whose_debug_panics_leaves_the_next_line_whole() {
+        let buf = Buffer::default();
+        tracing::subscriber::with_default(json_subscriber(LevelFilter::INFO, buf.clone()), || {
+            // The same line before the panics, after one, and after many more on the same
+            // thread: none of them leaves anything behind for the next line.
+            tracing::info!("probe");
+            caught(|| tracing::info!(value = ?DebugPanics, "half written"));
+            tracing::info!("probe");
+            for _ in 0..16 {
+                caught(|| tracing::info!(value = ?DebugPanics, "half written"));
+            }
+            tracing::info!("probe");
+        });
+        let lines = json_lines(&buf);
+        let probes: Vec<_> = lines.iter().filter(|l| l.contains("probe")).collect();
+        assert_eq!(probes.len(), 3, "{lines:#?}");
+        assert!(
+            probes.iter().all(|p| p.len() == probes[0].len()),
+            "{probes:#?}"
+        );
+        // Each event that could not be formatted is still a line, with its level and target.
+        let lost: Vec<_> = lines.iter().filter(|l| l.contains(UNFORMATTED)).collect();
+        assert_eq!(lost.len(), 17, "{lines:#?}");
+        assert!(lost[0].contains(r#""level":"INFO""#), "{}", lost[0]);
+        assert!(lost[0].contains(module_path!()), "{}", lost[0]);
+        assert!(
+            !lines.iter().any(|l| l.contains("half written")),
+            "{lines:#?}"
+        );
+    }
+
+    /// An event formatter that writes half a line and fails.
+    struct FailingEvents;
+    impl<S, N> FormatEvent<S, N> for FailingEvents
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+        N: for<'w> FormatFields<'w> + 'static,
+    {
+        fn format_event(
+            &self,
+            _: &FmtContext<'_, S, N>,
+            mut writer: Writer<'_>,
+            _: &tracing::Event<'_>,
+        ) -> fmt::Result {
+            writer.write_str(r#"{"half":"#)?;
+            Err(fmt::Error)
+        }
+    }
+
+    /// A field formatter that writes half its fields and fails.
+    struct FailingFields;
+    impl<'w> FormatFields<'w> for FailingFields {
+        fn format_fields<R: RecordFields>(&self, mut writer: Writer<'w>, _: R) -> fmt::Result {
+            writer.write_str(r#"{"half":"#)?;
+            Err(fmt::Error)
+        }
+    }
+
+    #[test]
+    fn an_event_that_fails_to_format_is_one_json_line_without_its_fields() {
+        let buf = Buffer::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .event_format(GuardedEvent(FailingEvents))
+            .with_writer(buf.clone());
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            tracing::warn!(n = 1, "fails");
+        });
+        let lines = json_lines(&buf);
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(lines[0].contains(UNFORMATTED), "{}", lines[0]);
+        assert!(lines[0].contains(r#""level":"WARN""#), "{}", lines[0]);
+    }
+
+    #[test]
+    fn span_fields_that_fail_to_format_are_left_out() {
+        let buf = Buffer::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .event_format(json_events())
+            .fmt_fields(SpanFields(FailingFields))
+            .with_writer(buf.clone());
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            let span = tracing::info_span!("failing", n = 1);
+            let _entered = span.enter();
+            tracing::info!("in the failing span");
+        });
+        let lines = json_lines(&buf);
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(
+            lines[0].contains(r#""span":{"name":"failing"}"#),
+            "{}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn a_panic_payload_whose_drop_panics_poisons_nothing() {
+        let buf = Buffer::default();
+        tracing::subscriber::with_default(json_subscriber(LevelFilter::INFO, buf.clone()), || {
+            for _ in 0..3 {
+                let span = tracing::info_span!("recorded", value = tracing::field::Empty);
+                let _entered = span.enter();
+                caught(|| {
+                    span.record("value", tracing::field::debug(DebugPanicsWithADropPanic));
+                });
+                caught(|| tracing::info!(value = ?DebugPanicsWithADropPanic, "event"));
+                tracing::info!("in the recorded span");
+            }
+            for _ in 0..3 {
+                caught(|| {
+                    let span = tracing::info_span!("created", value = ?DebugPanicsWithADropPanic);
+                    let _entered = span.enter();
+                });
+            }
+            let span = tracing::info_span!("after", n = 7);
+            let _entered = span.enter();
+            tracing::info!("still logging");
+        });
+        let lines = json_lines(&buf);
+        let last = lines.last().cloned().unwrap_or_default();
+        assert!(last.contains("still logging"), "{lines:#?}");
+        assert!(last.contains(r#""span":{"n":7,"name":"after"}"#), "{last}");
+        let recorded = lines
+            .iter()
+            .filter(|l| l.contains("in the recorded span"))
+            .count();
+        assert_eq!(recorded, 3, "{lines:#?}");
     }
 
     #[test]

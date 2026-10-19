@@ -7,7 +7,7 @@
 //! logs far more than a pipe holds, so the pipe fills on the first call; a log write, or a
 //! panic message, that blocked the calling thread would freeze the call, the metrics and the
 //! SIGTERM drain. The child's log queue is small, so it overflows and the drops show in
-//! `/metrics`.
+//! `/metrics`; the burst test gives it a roomy one instead, so the panic lines are queued.
 
 mod common;
 
@@ -30,6 +30,18 @@ use tracing_subscriber::layer::Identity;
 
 /// The environment variable that turns `serve_chatty_engine_child` on: its config path.
 const CHILD_CONFIG: &str = "SVC_RUNTIME_STALLED_STDERR_CONFIG";
+/// Set, the child's log queue is [`ROOMY`] instead of [`SMALL`].
+const CHILD_ROOMY_QUEUE: &str = "SVC_RUNTIME_STALLED_STDERR_ROOMY_QUEUE";
+/// A queue a [`BURST`] overflows.
+const SMALL: LogQueueBounds = LogQueueBounds {
+    max_bytes: 64 << 10,
+    max_lines: 256,
+};
+/// A queue that holds a [`BURST`] with plenty of room to spare.
+const ROOMY: LogQueueBounds = LogQueueBounds {
+    max_bytes: 16 << 20,
+    max_lines: 65_536,
+};
 /// Lines each `NewPayload` logs: about 1 MiB, well past any pipe's capacity.
 const BURST: usize = 4096;
 /// The child's drain deadline.
@@ -128,12 +140,13 @@ fn serve_chatty_engine_child() {
         let config = Config::load("cl-engine", path.as_ref())
             .unwrap()
             .with_ephemeral_metrics_port();
-        // A small queue, so a burst overflows it; `run` then keeps this subscriber.
-        let small = LogQueueBounds {
-            max_bytes: 64 << 10,
-            max_lines: 256,
+        // `run` keeps this subscriber.
+        let bounds = if std::env::var_os(CHILD_ROOMY_QUEUE).is_some() {
+            ROOMY
+        } else {
+            SMALL
         };
-        assert!(init_tracing_with(config.log_level, small, Identity::new()));
+        assert!(init_tracing_with(config.log_level, bounds, Identity::new()));
         svc_runtime::run(
             config,
             Services::new().add_service(EngineServiceServer::new(ChattyEngine)),
@@ -277,9 +290,17 @@ impl Setup {
     }
 }
 
-/// Starts the child with its stderr a pipe nobody reads; waits for READY.
+/// Starts the child with its stderr a pipe nobody reads; waits for READY, then fills the pipe.
 async fn start_stalled(setup: &Setup) -> (Stalled, rustix::process::Pid, SocketAddr) {
-    let mut child = setup.command().stderr(Stdio::piped()).spawn().unwrap();
+    start_stalled_with(setup, setup.command()).await
+}
+
+/// [`start_stalled`], running `command`.
+async fn start_stalled_with(
+    setup: &Setup,
+    mut command: Command,
+) -> (Stalled, rustix::process::Pid, SocketAddr) {
+    let mut child = command.stderr(Stdio::piped()).spawn().unwrap();
     let stderr = child.stderr.take().unwrap();
     let pid = rustix::process::Pid::from_child(&child);
     let mut child = Stalled {
@@ -301,6 +322,17 @@ async fn start_stalled(setup: &Setup) -> (Stalled, rustix::process::Pid, SocketA
     }
     assert!(answer.is_ok(), "{answer:?}");
     (child, pid, metrics)
+}
+
+/// The child's `ethswarm_log_lines_dropped_total`.
+async fn dropped_lines(metrics: SocketAddr) -> u64 {
+    let scraped = bounded("/metrics", scrape(metrics)).await;
+    scraped
+        .lines()
+        .find_map(|l| l.strip_prefix("ethswarm_log_lines_dropped_total "))
+        .unwrap_or_else(|| panic!("no drop counter in\n{scraped}"))
+        .parse()
+        .unwrap()
 }
 
 /// SIGTERM, then STOPPING and an exit with status 0 within the drain deadline plus the log
@@ -363,13 +395,7 @@ async fn stalled_stderr_keeps_serving_and_exits() {
     // The metrics still answer, and show the lines the full queue dropped.
     let scraped = bounded("/metrics", scrape(metrics)).await;
     assert!(scraped.contains("ethswarm_ready 1"), "{scraped}");
-    let dropped: u64 = scraped
-        .lines()
-        .find_map(|l| l.strip_prefix("ethswarm_log_lines_dropped_total "))
-        .unwrap_or_else(|| panic!("no drop counter in\n{scraped}"))
-        .parse()
-        .unwrap();
-    assert!(dropped > 0, "{scraped}");
+    assert!(dropped_lines(metrics).await > 0, "{scraped}");
 
     terminate_in_time(&setup, &mut child, pid).await;
 }
@@ -436,28 +462,63 @@ async fn a_panic_inside_the_subscriber_does_not_freeze_the_worker() {
     terminate_in_time(&setup, &mut child, pid).await;
 }
 
-/// Many panics at once with stderr stalled, SIGTERM sent in the middle of them: the hook does
-/// not wait per panic, so the workers get back to the signal and the drain timer in time.
+/// Many panics at once with stderr stalled and room in the queue, so every panic line is
+/// queued and its hook takes the wait path: the hook waits once per stall, not once per panic,
+/// so the burst is over well inside the time the SIGTERM drain allows, and SIGTERM after it
+/// still drains and exits in time.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_burst_of_panics_does_not_hold_off_sigterm() {
     const CONNECTIONS: usize = 4;
     const CALLS: usize = 64;
+    // Waiting its 100 ms flush per panic, the burst would take 12.8 s on the two workers.
+    let limit = Duration::from_millis(DRAIN_MS) + svc_runtime::lifecycle::LOG_FLUSH_DEADLINE;
     let setup = Setup::new();
-    let (mut child, pid, _) = start_stalled(&setup).await;
+    let mut command = setup.command();
+    // No backtraces: resolving one per panic is not what this measures.
+    command
+        .env(CHILD_ROOMY_QUEUE, "1")
+        .env_remove("RUST_BACKTRACE")
+        .env_remove("RUST_LIB_BACKTRACE");
+    let (mut child, pid, metrics) = start_stalled_with(&setup, command).await;
+    // The pipe is full and the writer stuck on it, but the queue took every line.
+    assert_eq!(dropped_lines(metrics).await, 0, "the queue has room");
+
+    let started = Instant::now();
     let mut calls = tokio::task::JoinSet::new();
     for _ in 0..CONNECTIONS {
         let client = setup.client().await;
         for _ in 0..CALLS {
             let mut client = client.clone();
             calls.spawn(async move {
-                let _ = client
+                client
                     .forkchoice_updated(pb::ForkchoiceUpdatedRequest::default())
-                    .await;
+                    .await
+                    .map(drop)
             });
         }
     }
-    terminate_in_time(&setup, &mut child, pid).await;
+    // Every handler has panicked (its hook returned before the call could fail) in time.
+    let panicked = tokio::time::timeout(limit + SLACK, async {
+        let mut panicked = 0;
+        while let Some(answer) = calls.join_next().await {
+            let answer = answer.expect("the call task");
+            assert!(answer.is_err(), "call {panicked} panicked: {answer:?}");
+            panicked += 1;
+        }
+        panicked
+    })
+    .await;
+    let took = started.elapsed();
     calls.abort_all();
+    child.assert_alive("the burst of panics");
+    assert_eq!(
+        panicked,
+        Ok(CONNECTIONS * CALLS),
+        "the burst took {took:?}, past {limit:?} (+{SLACK:?})"
+    );
+    // Each panic line was queued, not dropped.
+    assert_eq!(dropped_lines(metrics).await, 0, "a panic line was dropped");
+    terminate_in_time(&setup, &mut child, pid).await;
 }
 
 /// With stderr read, a panic shows as one JSON line at ERROR, with its message and location.

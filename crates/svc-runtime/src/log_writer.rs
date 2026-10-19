@@ -16,8 +16,9 @@
 //!   once the queue is empty, and a line the sink cut short is ended before the next write.
 //! - **Shutdown**: [`LogWriter::flush`] waits for the queue to empty, up to a deadline; a stuck
 //!   sink holds no one past it. [`LogWriter::flush_unless_stalled`] waits once per stall.
-//! - **A panicking sink** ends the writer thread: flushes then fail at once, and the queue
-//!   fills and drops, counted, as with a stalled sink.
+//! - **A panicking sink** ends the writer thread: the lines it held (queued, and the one being
+//!   written) are discarded and counted as dropped, every later line is refused and counted, and
+//!   flushes fail at once.
 
 use std::collections::VecDeque;
 use std::io;
@@ -90,7 +91,8 @@ struct Queue {
     lines: usize,
     /// The writer thread holds an entry it has not finished writing.
     writing: bool,
-    /// The writer thread has ended (its sink panicked): nothing will write the queue again.
+    /// The writer thread has ended (its sink panicked): the queue is empty, and nothing will
+    /// write it again.
     dead: bool,
 }
 
@@ -134,10 +136,16 @@ impl LogWriter {
         Ok(Self { shared })
     }
 
-    /// Queues `line`; `false` if it was dropped (counted). Never waits for the sink.
+    /// Queues `line`; `false` if it was dropped (counted): the queue is full, or the writer
+    /// thread has ended. Never waits for the sink.
     pub fn push(&self, line: &[u8]) -> bool {
         let bounds = self.shared.bounds;
         let mut queue = self.shared.lock();
+        if queue.dead {
+            drop(queue);
+            self.shared.dropped.inc();
+            return false;
+        }
         let fits = queue.lines < bounds.max_lines
             && queue
                 .bytes
@@ -193,12 +201,12 @@ impl LogWriter {
         if shared.stalled_at.load(Ordering::SeqCst) == shared.written.load(Ordering::SeqCst) {
             return false;
         }
+        // The progress before the wait: what the writer finishes after it, even in the moment
+        // between the timeout and this store, is progress the next caller must not take for a
+        // stall.
+        let before = shared.written.load(Ordering::SeqCst);
         let flushed = self.flush(timeout);
-        let stalled_at = if flushed {
-            NOT_STALLED
-        } else {
-            shared.written.load(Ordering::SeqCst)
-        };
+        let stalled_at = if flushed { NOT_STALLED } else { before };
         shared.stalled_at.store(stalled_at, Ordering::SeqCst);
         flushed
     }
@@ -207,9 +215,9 @@ impl LogWriter {
 /// The writer thread: writes each entry, in order, outside the lock.
 ///
 /// The critical sections cannot panic, so the lock is never poisoned; only the sink can panic,
-/// outside it. If it does, the thread ends: [`Alive`] marks the queue dead, so a flush returns
-/// `false` at once instead of waiting out its timeout, and the lines pushed after that fill the
-/// queue and are then dropped and counted, as with a stalled sink. Callers still never block.
+/// outside it. If it does, the thread ends: [`Alive`] discards and counts the lines it held and
+/// marks the queue dead, so a flush returns `false` at once instead of waiting out its timeout,
+/// and every line pushed after that is refused and counted. Callers still never block.
 fn write_out(shared: &Shared, sink: impl io::Write) {
     let _ = shared.thread.set(std::thread::current().id());
     let _alive = Alive(shared);
@@ -264,15 +272,22 @@ fn write_out(shared: &Shared, sink: impl io::Write) {
     }
 }
 
-/// Marks the queue dead when the writer thread ends (it only ends by a panic of its sink).
+/// Marks the queue dead when the writer thread ends (it only ends by a panic of its sink), and
+/// counts the lines lost with it: the queued ones and the one being written, which `lines`
+/// still holds. The lines a marker stands for, and those the sink refused, were counted
+/// already.
 struct Alive<'a>(&'a Shared);
 
 impl Drop for Alive<'_> {
     fn drop(&mut self) {
         let mut queue = self.0.lock();
+        let lost = std::mem::take(&mut queue.lines);
+        queue.entries.clear();
+        queue.bytes = 0;
         queue.dead = true;
         queue.writing = false;
         drop(queue);
+        self.0.dropped.inc_by(lost as u64);
         self.0.idle.notify_all();
     }
 }
@@ -779,13 +794,91 @@ mod tests {
         let started = Instant::now();
         assert!(!writer.flush(Duration::from_secs(10)), "nothing writes");
         assert!(started.elapsed() < Duration::from_secs(5), "it waited");
-        // Pushes still return at once, and drop once the queue is full.
+        // The line it was writing is lost, and counted.
+        assert_eq!(dropped.get(), 1);
+        // Pushes still return at once, and every one is refused and counted.
         for n in 1..10 {
-            writer.push(&line(n));
+            assert!(!writer.push(&line(n)), "line {n} was queued");
         }
-        assert!(dropped.get() > 0);
+        assert_eq!(dropped.get(), 10);
         assert!(!writer.flush_unless_stalled(Duration::from_secs(10)));
         assert!(started.elapsed() < Duration::from_secs(5), "it waited");
+    }
+
+    #[test]
+    fn the_lines_queued_when_the_writer_thread_dies_are_counted() {
+        /// Blocks its first write until released, then panics.
+        struct PanicsWhenReleased(std::sync::mpsc::Receiver<()>);
+        impl io::Write for PanicsWhenReleased {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                let _ = self.0.recv();
+                panic!("a sink that panics (expected by this test)");
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (release, released) = std::sync::mpsc::channel();
+        let dropped = Counter::default();
+        let writer = LogWriter::spawn(
+            PanicsWhenReleased(released),
+            bounds(1 << 20, 8),
+            dropped.clone(),
+        )
+        .unwrap();
+        // Eight lines held (the one being written included), and one over the bound.
+        for n in 0..8 {
+            assert!(writer.push(&line(n)));
+        }
+        assert!(!writer.push(&line(8)), "the queue holds 8");
+        assert_eq!(dropped.get(), 1);
+        release.send(()).unwrap();
+        assert!(!writer.flush(Duration::from_secs(10)), "nothing writes");
+        // The eight lines it held are lost with it, and counted.
+        assert_eq!(dropped.get(), 9);
+        assert!(!writer.push(&line(9)));
+        assert_eq!(dropped.get(), 10);
+    }
+
+    #[test]
+    fn progress_during_a_timed_out_flush_is_not_taken_for_a_stall() {
+        /// Each write takes one permit; it waits for one, or for the sender to go.
+        struct Turnstile(std::sync::mpsc::Receiver<()>);
+        impl io::Write for Turnstile {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let _ = self.0.recv();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (permits, turnstile) = std::sync::mpsc::channel();
+        let writer = LogWriter::spawn(
+            Turnstile(turnstile),
+            LogQueueBounds::default(),
+            Counter::default(),
+        )
+        .unwrap();
+        assert!(writer.push(&line(0)));
+        assert!(writer.push(&line(1)));
+        // Line 0 gets through while the flush waits; line 1 does not.
+        let permit = permits.clone();
+        let admit = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            permit.send(()).unwrap();
+        });
+        assert!(!writer.flush_unless_stalled(Duration::from_millis(400)));
+        admit.join().unwrap();
+        // The writer moved during that wait: the next caller waits again.
+        let started = Instant::now();
+        assert!(!writer.flush_unless_stalled(Duration::from_millis(200)));
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "it took progress for a stall"
+        );
+        drop(permits);
+        assert!(writer.flush(Duration::from_secs(10)));
     }
 
     #[test]
