@@ -168,7 +168,8 @@ async fn owned_child_never_blocks_on_its_stderr() {
 async fn owned_child_keeps_a_bounded_stderr() {
     const LOGGED: usize = 16 << 20;
     let script = format!("head -c {LOGGED} /dev/zero >&2; echo ready >&2; exec sleep 600");
-    let child = OwnedChild::spawn_with_handshake(sh(&script), "ready").unwrap();
+    // The whole line, so the count below cannot catch a read that ended inside it.
+    let child = OwnedChild::spawn_with_handshake(sh(&script), "ready\n").unwrap();
     assert!(child.wait_for_handshake(in_secs(30)).await, "no handshake");
     assert_eq!(
         child.stderr_read(),

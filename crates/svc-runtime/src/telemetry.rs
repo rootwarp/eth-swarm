@@ -2,20 +2,28 @@
 //!
 //! - **Logs** are JSON lines on stderr (journald keeps them) through `tracing`
 //!   ([`init_tracing`]). Every call runs in an `rpc` span carrying the method and a `trace_id`
-//!   ([`TraceLayer`]), so each line logged while serving it names the trace.
+//!   ([`TraceLayer`]), so each line logged while serving it names the trace. The subscriber is
+//!   a registry with the JSON layer under its own level filter, so an owner's extra layer
+//!   ([`init_tracing_with`]) can see more. Lines reach stderr through a bounded queue and one
+//!   writer thread ([`crate::log_writer`]): a stderr nobody drains drops lines (counted in
+//!   `ethswarm_log_lines_dropped_total`) instead of blocking a tokio worker. Panics are logged
+//!   as one JSON line on the same queue by the hook [`init_tracing_with`] installs, not written
+//!   to stderr by the default hook.
 //! - **Trace ids** are W3C trace ids: taken from the caller's `traceparent` header when it is
 //!   valid, otherwise 16 random bytes ([`trace_id`]).
 //! - **Metrics** are a prometheus-client [`Registry`] served as OpenMetrics text at `/metrics`
 //!   on `127.0.0.1` only ([`bind_metrics`], [`serve_metrics`]); there is no setting for another
 //!   address. The runtime registers [`RuntimeMetrics`] under the `ethswarm_` prefix.
 
+use std::backtrace::{Backtrace, BacktraceStatus};
 use std::convert::Infallible;
 use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -26,9 +34,16 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use tokio::net::TcpListener;
-use tracing::Instrument;
+use tracing::{Instrument, Subscriber};
+use tracing_subscriber::field::RecordFields;
 use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::fmt::format::{JsonFields, Writer};
+use tracing_subscriber::fmt::{FormatFields, FormattedFields, MakeWriter};
+use tracing_subscriber::layer::{Identity, Layer, SubscriberExt as _};
+use tracing_subscriber::registry::LookupSpan;
+
+use crate::log_writer;
+pub use crate::log_writer::{LogQueueBounds, LogWriter};
 
 /// The OpenMetrics text content type prometheus-client encodes.
 pub const METRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
@@ -36,24 +51,213 @@ pub const METRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.
 /// How long a `/metrics` client gets to send its request headers.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The JSON subscriber the runtime installs, writing to `writer`.
-pub fn json_subscriber<W>(level: LevelFilter, writer: W) -> impl tracing::Subscriber + Send + Sync
+/// The JSON formatting layer, writing to `writer`. `level` filters this layer only, so another
+/// layer of the same subscriber can see more (a per-layer filter). Span fields are formatted
+/// by [`SpanFields`], so one whose `Debug` panics cannot break the subscriber.
+pub fn json_layer<S, W>(level: LevelFilter, writer: W) -> impl Layer<S> + Send + Sync + 'static
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+    W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .json()
+        .with_current_span(true)
+        .with_span_list(false)
+        .fmt_fields(SpanFields(JsonFields::new()))
+        .with_writer(writer)
+        .with_filter(level)
+}
+
+/// The JSON span fields, with a panic while formatting them contained.
+///
+/// The fmt layer formats a span's fields (at creation and on each `record`) while it holds
+/// that span's extensions lock. A field whose `Debug` panicked unwound through the lock and
+/// poisoned it, and the registry reuses the span's slot: every later span in that slot then
+/// panicked in the subscriber ("Mutex poisoned"), anywhere, even in a `Drop` (an abort), so
+/// one bad field could take the service down. Here the panic stops inside the formatting: the
+/// panic hook still logs it, the fields it interrupted are left out (`{}` at creation, the
+/// previous ones on `record`), and the lock is released normally.
+#[derive(Debug)]
+struct SpanFields(JsonFields);
+
+impl<'writer> FormatFields<'writer> for SpanFields {
+    fn format_fields<R: RecordFields>(
+        &self,
+        mut writer: Writer<'writer>,
+        fields: R,
+    ) -> fmt::Result {
+        let mut formatted = String::new();
+        let done = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            self.0.format_fields(Writer::new(&mut formatted), fields)
+        }));
+        match done {
+            Ok(result) => {
+                result?;
+                writer.write_str(&formatted)
+            }
+            Err(_) => writer.write_str("{}"),
+        }
+    }
+
+    fn add_fields(
+        &self,
+        current: &'writer mut FormattedFields<Self>,
+        fields: &tracing::span::Record<'_>,
+    ) -> fmt::Result {
+        let mut merged = FormattedFields::<JsonFields>::new(current.fields.clone());
+        let done =
+            std::panic::catch_unwind(AssertUnwindSafe(|| self.0.add_fields(&mut merged, fields)));
+        match done {
+            Ok(result) => {
+                result?;
+                current.fields = merged.fields;
+                Ok(())
+            }
+            Err(_) => Ok(()),
+        }
+    }
+}
+
+/// The JSON subscriber the runtime installs, writing to `writer`: a registry with
+/// [`json_layer`].
+pub fn json_subscriber<W>(level: LevelFilter, writer: W) -> impl Subscriber + Send + Sync
 where
     W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
 {
-    tracing_subscriber::fmt()
-        .json()
-        .with_max_level(level)
-        .with_current_span(true)
-        .with_span_list(false)
-        .with_writer(writer)
-        .finish()
+    tracing_subscriber::registry().with(json_layer(level, writer))
 }
 
-/// Installs the JSON subscriber on stderr as the global default. `false` if one was already
-/// installed (the existing one stays).
+/// Lines the stderr log writer dropped: its queue was full, or stderr refused them.
+static STDERR_DROPPED: LazyLock<Counter> = LazyLock::new(Counter::default);
+
+/// The process's stderr log writer, once [`init_tracing_with`] started it.
+static STDERR_LOG: OnceLock<LogWriter> = OnceLock::new();
+
+/// [`init_tracing_with`] the default queue bounds and no other layer.
 pub fn init_tracing(level: LevelFilter) -> bool {
-    tracing::subscriber::set_global_default(json_subscriber(level, io::stderr)).is_ok()
+    init_tracing_with(level, LogQueueBounds::default(), Identity::new())
+}
+
+/// Installs, as the global default, a registry with `extra` and the JSON layer on stderr. The
+/// lines go through a [`LogWriter`] queue bounded by `bounds`, so no caller ever blocks on
+/// stderr; its drops count in `ethswarm_log_lines_dropped_total` ([`RuntimeMetrics`]).
+///
+/// `false` if a subscriber was already installed (the existing one stays), or the writer
+/// thread could not start (nothing is installed).
+pub fn init_tracing_with<L>(level: LevelFilter, bounds: LogQueueBounds, extra: L) -> bool
+where
+    L: Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
+{
+    if STDERR_LOG.get().is_some() {
+        return false;
+    }
+    let Ok(writer) = LogWriter::spawn(io::stderr(), bounds, STDERR_DROPPED.clone()) else {
+        return false;
+    };
+    // A racing first call has installed its own; this writer's thread stays idle.
+    if STDERR_LOG.set(writer.clone()).is_err() {
+        return false;
+    }
+    let subscriber = tracing_subscriber::registry()
+        .with(extra)
+        .with(json_layer(level, writer));
+    if tracing::subscriber::set_global_default(subscriber).is_err() {
+        return false;
+    }
+    if let Some(writer) = STDERR_LOG.get() {
+        install_panic_hook(writer);
+    }
+    true
+}
+
+/// How long the panic hook waits for the queue, its own line included, to reach stderr: long
+/// enough for a healthy stderr before a panic ends the process, short enough that a stalled
+/// one costs little, and paid once per stall, not once per panic
+/// ([`LogWriter::flush_unless_stalled`]).
+const PANIC_FLUSH: Duration = Duration::from_millis(100);
+
+/// Replaces the default panic hook, which writes the message to stderr from the panicking
+/// thread and so blocks it on a stalled stderr. The new hook builds one JSON line itself (the
+/// message, location, thread and, when `RUST_BACKTRACE` asks for one, the backtrace, at ERROR)
+/// and queues it on `writer`, then waits for the queue as [`report_panic`] says. The default
+/// hook is not called.
+///
+/// It never goes through `tracing`: the panic may come from inside the subscriber (a span
+/// field's `Debug`, formatted while the fmt layer holds that span's lock, which the hook's own
+/// event would take again on the same thread), and a layer that panicked on the hook's event
+/// would abort the process with a message written straight to stderr.
+fn install_panic_hook(writer: &'static LogWriter) {
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let panic = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("Box<dyn Any>");
+        let location = info.location().map(ToString::to_string);
+        let thread = std::thread::current();
+        let backtrace = Backtrace::capture();
+        let backtrace =
+            (backtrace.status() == BacktraceStatus::Captured).then(|| backtrace.to_string());
+        let line = panic_line(
+            panic,
+            location.as_deref(),
+            thread.name().unwrap_or("<unnamed>"),
+            backtrace.as_deref(),
+        );
+        report_panic(writer, line.as_bytes());
+    }));
+}
+
+/// Queues a panic's `line`, then waits up to [`PANIC_FLUSH`] for it to be written: not at all
+/// if the line was dropped (the queue is full), on the writer thread itself, or once a wait
+/// timed out with the writer stuck since. `true` if it was written.
+fn report_panic(writer: &LogWriter, line: &[u8]) -> bool {
+    writer.push(line) && writer.flush_unless_stalled(PANIC_FLUSH)
+}
+
+/// A panic as one line in the subscriber's JSON shape.
+fn panic_line(
+    panic: &str,
+    location: Option<&str>,
+    thread: &str,
+    backtrace: Option<&str>,
+) -> String {
+    let mut line = format!(
+        r#"{{"timestamp":"{}","level":"ERROR","fields":{{"message":"panicked","panic":"#,
+        log_writer::timestamp()
+    );
+    log_writer::push_json_str(&mut line, panic);
+    for (name, value) in [
+        ("location", location),
+        ("thread", Some(thread)),
+        ("backtrace", backtrace),
+    ] {
+        if let Some(value) = value {
+            line.push_str(&format!(r#","{name}":"#));
+            log_writer::push_json_str(&mut line, value);
+        }
+    }
+    line.push_str(&format!(r#"}},"target":"{}"}}"#, module_path!()));
+    line.push('\n');
+    line
+}
+
+/// Waits up to `timeout` for the stderr log queue to be written out ([`LogWriter::flush`]).
+/// `true` if it was, or no stderr writer was started.
+pub fn flush_logs(timeout: Duration) -> bool {
+    STDERR_LOG.get().is_none_or(|writer| writer.flush(timeout))
+}
+
+/// [`flush_logs`] from async code, on a blocking thread so no tokio worker waits on it. The
+/// deadline runs from the call: a blocking pool too busy to start the flush in time does not
+/// extend it. `false` if the queue was not written out by then.
+pub async fn flush_logs_async(timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    let flush = tokio::task::spawn_blocking(move || {
+        flush_logs(deadline.saturating_duration_since(std::time::Instant::now()))
+    });
+    matches!(tokio::time::timeout(timeout, flush).await, Ok(Ok(true)))
 }
 
 /// A W3C trace id: 16 bytes, not all zero, shown as 32 lowercase hex digits.
@@ -194,6 +398,11 @@ impl RuntimeMetrics {
             "ready",
             "1 while the service accepts calls",
             m.ready.clone(),
+        );
+        registry.register(
+            "log_lines_dropped",
+            "log lines lost: the stderr log queue was full, or stderr refused them",
+            STDERR_DROPPED.clone(),
         );
         m
     }
@@ -521,12 +730,204 @@ mod tests {
     }
 
     #[test]
+    fn the_json_layer_leaves_the_other_layers_levels_alone() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing_subscriber::layer::{Context, SubscriberExt as _};
+        use tracing_subscriber::Layer as _;
+
+        /// Counts the events it is given.
+        struct Count(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
+            fn on_event(&self, _: &tracing::Event<'_>, _: Context<'_, S>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let buf = Buffer::default();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry()
+            .with(json_layer(LevelFilter::INFO, buf.clone()))
+            .with(Count(Arc::clone(&seen)).with_filter(LevelFilter::DEBUG));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!("a debug line");
+            tracing::info!("an info line");
+        });
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            2,
+            "the counting layer sees DEBUG"
+        );
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(out.contains("an info line"), "{out}");
+    }
+
+    #[test]
+    fn a_panic_line_is_one_json_line_with_its_fields_escaped() {
+        let line = panic_line(
+            "a \"quoted\" \\ word\nand\ttab \u{1}",
+            Some("src/x.rs:1:2"),
+            "tokio-runtime-worker",
+            None,
+        );
+        assert!(line.starts_with(r#"{"timestamp":""#), "{line}");
+        assert!(line.ends_with("}\n"), "{line}");
+        assert_eq!(line.matches('\n').count(), 1, "{line}");
+        assert!(line.contains(r#""level":"ERROR""#), "{line}");
+        assert!(
+            line.contains(r#""panic":"a \"quoted\" \\ word\nand\ttab \u0001""#),
+            "{line}"
+        );
+        assert!(line.contains(r#""location":"src/x.rs:1:2""#), "{line}");
+        assert!(
+            line.contains(r#""thread":"tokio-runtime-worker""#),
+            "{line}"
+        );
+        assert!(!line.contains("backtrace"), "{line}");
+
+        let line = panic_line("p", None, "t", Some("0: main\n1: start"));
+        assert!(!line.contains("location"), "{line}");
+        assert!(
+            line.contains(r#""backtrace":"0: main\n1: start""#),
+            "{line}"
+        );
+        assert_eq!(line.matches('\n').count(), 1, "{line}");
+    }
+
+    /// A sink that blocks every write until the test ends.
+    struct Stuck(std::sync::mpsc::Receiver<()>);
+
+    impl io::Write for Stuck {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_panic_report_waits_once_on_a_stalled_sink_and_never_for_a_dropped_line() {
+        let (_release, stuck) = std::sync::mpsc::channel();
+        let bounds = LogQueueBounds {
+            max_bytes: 1 << 20,
+            max_lines: 2,
+        };
+        let writer = LogWriter::spawn(Stuck(stuck), bounds, Counter::default()).unwrap();
+        let timed = |line: &[u8]| {
+            let started = std::time::Instant::now();
+            let flushed = report_panic(&writer, line);
+            (flushed, started.elapsed())
+        };
+        // Queued; the sink is stuck, so the flush runs out its time.
+        let (flushed, took) = timed(b"first\n");
+        assert!(!flushed);
+        assert!(took >= PANIC_FLUSH, "{took:?}");
+        // Queued, but nothing was written since: no second wait.
+        let (flushed, took) = timed(b"second\n");
+        assert!(!flushed);
+        assert!(took < PANIC_FLUSH, "{took:?}");
+        // Dropped (the queue is full): nothing to wait for.
+        let (flushed, took) = timed(b"third\n");
+        assert!(!flushed);
+        assert!(took < PANIC_FLUSH, "{took:?}");
+    }
+
+    #[test]
+    fn a_span_field_whose_debug_panics_leaves_the_subscriber_usable() {
+        /// A value whose `Debug` panics.
+        struct PanicsOnDebug;
+        impl fmt::Debug for PanicsOnDebug {
+            fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+                panic!("PanicsOnDebug formatted (expected by this test)");
+            }
+        }
+
+        let buf = Buffer::default();
+        tracing::subscriber::with_default(json_subscriber(LevelFilter::INFO, buf.clone()), || {
+            // Recorded later, and given at creation: each formats the value under the span's
+            // lock. The spans are dropped at once, so the next one reuses their slot.
+            for _ in 0..3 {
+                let span = tracing::info_span!("recorded", value = tracing::field::Empty);
+                let _entered = span.enter();
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    span.record("value", tracing::field::debug(PanicsOnDebug));
+                }));
+                tracing::info!("in the recorded span");
+            }
+            for _ in 0..3 {
+                let _ = std::panic::catch_unwind(|| {
+                    let span = tracing::info_span!("created", value = ?PanicsOnDebug);
+                    let _entered = span.enter();
+                });
+            }
+            let span = tracing::info_span!("after", n = 7, later = tracing::field::Empty);
+            let _entered = span.enter();
+            span.record("later", 8);
+            tracing::info!("still logging");
+        });
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let last = out.lines().last().unwrap_or_default();
+        assert!(last.contains("still logging"), "{out}");
+        assert!(
+            last.contains(r#""span":{"later":8,"n":7,"name":"after"}"#),
+            "{out}"
+        );
+        assert_eq!(out.matches("in the recorded span").count(), 3, "{out}");
+    }
+
+    #[test]
     fn init_tracing_installs_once() {
-        let _ = init_tracing(LevelFilter::OFF);
+        // ERROR, not OFF: the panic hook it installs logs a failing test's panic at ERROR.
+        let _ = init_tracing(LevelFilter::ERROR);
         assert!(
             !init_tracing(LevelFilter::OFF),
             "a second install is refused"
         );
+        assert!(
+            !init_tracing_with(
+                LevelFilter::OFF,
+                LogQueueBounds::default(),
+                tracing_subscriber::layer::Identity::new()
+            ),
+            "so is one with another layer"
+        );
+        tracing::info!("dropped by the ERROR filter");
+        assert!(flush_logs(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn the_async_flush_holds_its_deadline_with_the_blocking_pool_busy() {
+        // A stderr writer exists, so the flush has a queue to wait on.
+        let _ = init_tracing(LevelFilter::ERROR);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        runtime.spawn_blocking(move || held.recv());
+        let started = std::time::Instant::now();
+        let flushed = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                flush_logs_async(Duration::from_millis(300)),
+            )
+            .await
+        });
+        let took = started.elapsed();
+        assert_eq!(flushed, Ok(false), "the flush never ran: it timed out");
+        assert!(took < Duration::from_secs(3), "{took:?}");
+        release.send(()).unwrap();
+        runtime.shutdown_timeout(Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn the_async_flush_reports_a_written_queue() {
+        let _ = init_tracing(LevelFilter::ERROR);
+        assert!(flush_logs_async(Duration::from_secs(10)).await);
     }
 
     #[tokio::test]
@@ -694,6 +1095,11 @@ mod tests {
         assert!(ok.contains(METRICS_CONTENT_TYPE), "{ok}");
         assert!(ok.contains("ethswarm_ready 1"), "{ok}");
         assert!(ok.contains("ethswarm_rpc_requests_total 0"), "{ok}");
+        assert!(
+            ok.lines()
+                .any(|l| l.starts_with("ethswarm_log_lines_dropped_total ")),
+            "{ok}"
+        );
         let missing = get(
             addr,
             "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",

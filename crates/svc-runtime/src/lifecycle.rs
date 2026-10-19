@@ -15,6 +15,11 @@
 //! 3. `run` returns `Ok` (exit 0) once they have, or [`RuntimeError::DrainTimeout`] (exit 1)
 //!    as soon as the deadline passes; the process then exits, which drops the calls still
 //!    running. The instance lock is released last.
+//! 4. [`run`] first logs an error [`run_with`] did not, then gives the log queue up to
+//!    [`LOG_FLUSH_DEADLINE`] to reach stderr, measured from then. Logging, panics included,
+//!    never blocks a tokio worker ([`crate::log_writer`]), so a stalled stderr delays neither
+//!    the signal nor the drain, and the exit comes at most the drain deadline plus this one
+//!    after SIGTERM.
 
 use std::future::Future;
 use std::io;
@@ -59,6 +64,16 @@ pub enum RuntimeError {
     UnservedMethods(Vec<String>),
     #[error("in-flight calls did not finish within the {0:?} drain deadline")]
     DrainTimeout(Duration),
+}
+
+impl RuntimeError {
+    /// Whether [`run_with`] logged this error where it arose.
+    fn logged(&self) -> bool {
+        matches!(
+            self,
+            Self::UnservedMethods(_) | Self::Notify(_) | Self::DrainTimeout(_)
+        )
+    }
 }
 
 fn io_err(what: &'static str) -> impl FnOnce(io::Error) -> RuntimeError {
@@ -110,11 +125,24 @@ impl Hooks {
     }
 }
 
+/// How long [`run`] waits, after the drain, for the queued log lines to reach stderr. A stderr
+/// nobody drains holds the exit back this long at most; the lines still queued are lost.
+pub const LOG_FLUSH_DEADLINE: Duration = Duration::from_secs(2);
+
 /// Runs a service with JSON logs on stderr, systemd notification and SIGTERM/SIGINT handling.
+/// Before returning, it logs its error (if [`run_with`] did not already) and flushes the log
+/// queue for up to [`LOG_FLUSH_DEADLINE`], so the error reaches stderr before the exit.
 pub async fn run(config: Config, services: Services) -> Result<(), RuntimeError> {
     telemetry::init_tracing(config.log_level);
-    let hooks = Hooks::systemd().map_err(io_err("install signal handlers"))?;
-    run_with(config, services, hooks).await
+    let result = match Hooks::systemd() {
+        Ok(hooks) => run_with(config, services, hooks).await,
+        Err(e) => Err(io_err("install signal handlers")(e)),
+    };
+    if let Some(e) = result.as_ref().err().filter(|e| !e.logged()) {
+        tracing::error!(error = %e, "the service stopped on an error");
+    }
+    telemetry::flush_logs_async(LOG_FLUSH_DEADLINE).await;
+    result
 }
 
 /// Serves `services` as `config` says until `hooks.shutdown`, then drains (module docs).
