@@ -20,6 +20,8 @@ pub struct ChainState {
     pub headers: HashMap<Root, Slot>,
     /// `/eth/v1/beacon/blocks/{slot}/root`: each slot with a block; any other answers 404.
     pub roots: BTreeMap<Slot, Root>,
+    /// `/eth/v2/beacon/blocks/{root}` as SSZ: each known block's.
+    pub blocks: HashMap<Root, Vec<u8>>,
     /// Every request answers 503 while set.
     pub down: bool,
 }
@@ -79,7 +81,12 @@ impl FixtureChain {
                     hex0x(root.as_slice())
                 )
             }),
-            other => header(&s, other).or_else(|| block_root(&s, other)),
+            other => {
+                if let Some(ssz) = block_ssz(&s, other) {
+                    return Reply::ssz(ssz);
+                }
+                header(&s, other).or_else(|| block_root(&s, other))
+            }
         };
         found.map_or_else(|| Reply::status(404), |body| Reply::json(&body))
     }
@@ -97,6 +104,14 @@ fn header(s: &ChainState, path: &str) -> Option<String> {
         hex0x(root.as_slice()),
         "00".repeat(96)
     ))
+}
+
+fn block_ssz(s: &ChainState, path: &str) -> Option<Vec<u8>> {
+    let id = path.strip_prefix("/eth/v2/beacon/blocks/")?;
+    s.blocks
+        .iter()
+        .find(|(root, _)| hex0x(root.as_slice()) == id)
+        .map(|(_, ssz)| ssz.clone())
 }
 
 fn block_root(s: &ChainState, path: &str) -> Option<String> {
@@ -199,6 +214,7 @@ impl StandIn {
             muxer_observer: None,
             ping_interval: cl_p2p::rpc::inbound::PING_INTERVAL,
             gossip: None,
+            limits: cl_p2p::rpc::limits::RpcLimits::default(),
         };
         let mut swarm =
             probe_swarm::<E>(devnet, Arc::new(SharedStatus::new(status)), plan).expect("swarm");

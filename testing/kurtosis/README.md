@@ -716,6 +716,61 @@ Each log's last line is its verdict; keep the logs with the pair's run log. Then
 pair down (the commands `run-pair.sh --keep-on-pass` printed, or `kurtosis enclave rm -f` on
 both enclaves).
 
+### Serving check
+
+`devnet-probe serve` (`crates/devnet-probe/src/serve.rs`) is the column-serving criterion: the
+probe answers `DataColumnSidecarsByRange` and `DataColumnSidecarsByRoot` for its custody
+columns, and the answers match what its store holds. It runs on its own (`all` does not run
+it), with the same inputs as the checks above:
+
+- cl-chain in probe mode stores our custody columns from the `--peer`s' gossip: the first
+  `--api` vouches for each block root, cl-verify checks the cells by KZG, and only custody
+  columns are kept. cl-chain serves `ethswarm.chain.v1.ReqRespService` on
+  `<--socket-dir>/cl-chain/cl-chain.sock` behind its method ACL: only `cl-p2p` (our own UID)
+  may call `GetStatus`, `DataColumnsByRange` and `DataColumnsByRoot`.
+- cl-p2p's probe swarm listens on `--listen` (default `/ip4/0.0.0.0/tcp/9000`), subscribes
+  to our custody column subnets, and answers column requests and Status through that socket.
+- After `--serve-secs` (default 300) it asks itself for the columns over libp2p, as a peer
+  would. Every by-range sidecar must be stored bytes in `(slot, column_index)` order with the
+  context of its slot's epoch and whole blocks only, a by-root answer must be exactly the
+  stored sidecars with an unknown root left out, and a column we do not custody must get
+  `3: ResourceUnavailable`.
+
+cl-verify runs next to it, as our own user, on the pinned trusted setup. `--socket-dir` must be
+an absolute path without symlinks that only we can write, short enough for a socket path (104
+bytes on macOS). On macOS, `/tmp` is a symlink, so use the canonical form:
+
+```bash
+cargo build --release --locked -p cl-verify -p devnet-probe
+run=$(cd "$(mktemp -d)" && pwd -P); chmod 700 "$run"                 # the socket root
+state=target/kurtosis/serve-$enclave; mkdir -p "$state"
+target/release/cl-verify --trusted-setup crates/crypto-kzg/data/trusted_setup_4096.json \
+  --socket "$run/verify.sock" --peer-uid "$(id -u)" --pubkey-snapshot "$state/pubkeys.bin" \
+  2>"$logs/cl-verify.err" &
+verify=$!
+target/release/devnet-probe serve --network-dir "$net" "${apis[@]}" "${peers[@]}" \
+  --columns-dir "$state/columns" --socket-dir "$run" --verify-socket "$run/verify.sock" \
+  --answer-prefix-v4 32 --answer-prefix-v6 128 \
+  2>"$logs/serve.err" | tee "$logs/serve.log"; echo "serve exit ${PIPESTATUS[0]}"
+kill "$verify"
+```
+
+`--answer-prefix-v4 32` and `--answer-prefix-v6 128` count the column answer places per
+address. By default the places are counted per IPv4 /24 (IPv6 /48), 2 per block, so that one
+host cannot take more of them through neighbouring addresses; on the devnet every CL sits in
+the enclave's one Docker network, so with the default they would all share 2 places.
+
+Each run takes a fresh node key, and the custody columns follow it, so `--columns-dir` must
+not exist yet: `serve` refuses an existing one (or a symlink there), creates it 0700, and
+removes it again if the start fails. The probe subscribes to the column subnets of the fork
+digest of its start, so a run never crosses the next digest change (a BPO or fork epoch):
+`--serve-secs` is cut short to end 30 s before it (a pass line says so), and a start closer
+to it than that is refused. Our Status is read from cl-chain afresh for every Status the
+probe sends or answers, so its `earliest_available_slot` is never below what the store serves
+from; when that read fails, no Status goes out (`2: ServerError` to a request). The stored line names how many custody columns were stored and every drop
+reason counted (`not_custody`, `unknown_root`, ...). The reference CLs reach the probe only
+through its own dials, since it publishes no record while it serves.
+
 ## Changing a pin
 
 1. Pick the new tag and confirm its spec version at the source commit (Lighthouse

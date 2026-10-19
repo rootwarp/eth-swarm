@@ -204,6 +204,16 @@ impl<E: EthSpec> DataColumnSidecar<E> {
         }
     }
 
+    /// The slot of a sidecar's SSZ, of either fork's shape, read without decoding the rest:
+    /// what a check of the fork digest it came with needs before anything is decoded.
+    ///
+    /// # Errors
+    ///
+    /// The bytes are of neither shape.
+    pub fn peek_slot(bytes: &[u8]) -> Result<Slot, DecodeError> {
+        peek_sidecar_slot(bytes)
+    }
+
     /// Decodes with `fork`'s shape, after checking `fork`'s cap on `network`.
     pub fn from_ssz_bytes_for_fork_with(
         bytes: &[u8],

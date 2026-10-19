@@ -1,9 +1,13 @@
 //! `cl-chain`: serves `ethswarm.chain.v1`, the single writer: state transition, fork choice, DA status and ePBS.
 //!
-//! This is a stub. Every RPC runs the `ipc` contract layer first (hello negotiation, frame
-//! discipline, `seq`, envelope type and digest checks) and then answers `UNIMPLEMENTED`, so the
-//! service already holds its peers to the wire contract. `tests/contract.rs` runs the contract
-//! suite against it, in process and over a Unix socket.
+//! This is mostly a stub. Every RPC runs the `ipc` contract layer first (hello negotiation,
+//! frame discipline, `seq`, envelope type and digest checks) and then answers `UNIMPLEMENTED`,
+//! so the service already holds its peers to the wire contract. `tests/contract.rs` runs the
+//! contract suite against it, in process and over a Unix socket. The exception is probe mode's
+//! `ReqRespService`: [`ChainStub::serving`] mounts [`reqresp::ReqRespServer`] over the probe's
+//! column store in place of the stub, which serves `DataColumnsByRange`, `DataColumnsByRoot`
+//! and `GetStatus` ([`probe::StatusProvider`], with the column server's
+//! `earliest_available_slot`).
 //!
 //! [`probe`] is probe mode: its Status (`ReqRespService/GetStatus`: the wall-clock fork digest
 //! and the reference Beacon API's finalized checkpoint, with the last good value kept through an
@@ -37,16 +41,35 @@ use pb::query_service_server::{QueryService, QueryServiceServer};
 use pb::req_resp_service_server::{ReqRespService, ReqRespServiceServer};
 use tonic::service::Routes;
 
-/// The `cl-chain` service: contract checks, then `UNIMPLEMENTED`.
+/// The `cl-chain` service: contract checks, then `UNIMPLEMENTED`, except `ReqRespService`
+/// once it is given the probe's column server ([`Self::serving`]).
 #[derive(Clone, Debug)]
 pub struct ChainStub {
     link: Link,
+    req_resp: Option<reqresp::ReqRespServer>,
 }
 
 impl ChainStub {
     #[must_use]
     pub fn new(link: Link) -> Self {
-        Self { link }
+        Self {
+            link,
+            req_resp: None,
+        }
+    }
+
+    /// The same service with `ReqRespService` served by `req_resp` (the column RPCs from the
+    /// probe's column store, and `GetStatus` if it serves one) instead of the stub.
+    #[must_use]
+    pub fn serving(mut self, req_resp: reqresp::ReqRespServer) -> Self {
+        self.req_resp = Some(req_resp);
+        self
+    }
+
+    /// Whether `ReqRespService` is served by the column server.
+    #[must_use]
+    pub fn serves_columns(&self) -> bool {
+        self.req_resp.is_some()
     }
 
     /// The contract configuration every RPC is checked against.
@@ -58,8 +81,12 @@ impl ChainStub {
     /// Every `ethswarm.chain.v1` service, ready to serve.
     #[must_use]
     pub fn routes(self) -> Routes {
-        Routes::new(GossipServiceServer::new(self.clone()))
-            .add_service(ReqRespServiceServer::new(self.clone()))
+        let routes = Routes::new(GossipServiceServer::new(self.clone()));
+        let routes = match self.req_resp.clone() {
+            Some(server) => routes.add_service(server.into_service()),
+            None => routes.add_service(ReqRespServiceServer::new(self.clone())),
+        };
+        routes
             .add_service(ImportServiceServer::new(self.clone()))
             .add_service(QueryServiceServer::new(self.clone()))
             .add_service(EventsServiceServer::new(self.clone()))
@@ -144,3 +171,132 @@ ipc::stub_service!(ChainStub => EventsService {
     bidi: [
     ],
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reqresp::{ColumnServer, ColumnStore, ServeBudget, ServeClock};
+    use cl_chain_columns::ColumnWriter;
+    use consensus_types::primitives::U256;
+    use ethswarm_proto::common::{ErrorCode, Hello};
+    use ipc::envelope::DigestTable;
+    use network_config::{ForkName, ForkSchedule, ScheduledFork};
+    use pb::req_resp_service_client::ReqRespServiceClient;
+    use std::sync::Arc;
+
+    struct Always;
+
+    impl ServeClock for Always {
+        fn serve_range(&self) -> Option<(u64, u64)> {
+            Some((0, 1000))
+        }
+
+        fn fork_digest(&self, _: u64) -> Option<[u8; 4]> {
+            Some([1, 2, 3, 4])
+        }
+    }
+
+    fn link() -> Link {
+        let at = |epoch| ScheduledFork {
+            version: [7, 0, 0, 0],
+            epoch,
+        };
+        let hello = Hello {
+            api_version: 1,
+            min_api_version: 1,
+            max_api_version: 1,
+            ..Default::default()
+        };
+        let digests = DigestTable::new(vec![(0, ForkName::Gloas, [1, 2, 3, 4])]).unwrap();
+        Link::new::<consensus_types::Mainnet>(
+            hello,
+            1,
+            ForkSchedule::new(at(0), at(0)).unwrap(),
+            digests,
+        )
+    }
+
+    /// The first error code of a column response, `None` without one.
+    async fn first_code(
+        mut stream: tonic::Streaming<pb::DataColumnsByRangeResponse>,
+    ) -> Option<i32> {
+        while let Some(frame) = stream.message().await.unwrap() {
+            if let Some(pb::data_columns_by_range_response::Frame::Body(body)) = frame.frame {
+                if let Some(pb::response_chunk::Result::Error(e)) = body.item.and_then(|i| i.result)
+                {
+                    return Some(e.code);
+                }
+            }
+        }
+        None
+    }
+
+    /// The routes mount the column server once it is given one: a column request is answered
+    /// from the store (nothing stored: `3: ResourceUnavailable`), not `UNIMPLEMENTED`.
+    #[tokio::test]
+    async fn the_routes_mount_the_column_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Arc::new(ColumnWriter::open(dir.path().join("columns")).unwrap());
+        let columns = Arc::new(ColumnServer::new(
+            writer as Arc<dyn ColumnStore>,
+            U256::MAX,
+            Arc::new(Always),
+            ServeBudget::default(),
+        ));
+        let served = ChainStub::new(link())
+            .serving(reqresp::ReqRespServer::new(link(), columns))
+            .routes();
+        let socket = dir.path().join("chain.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(ipc::stub::serve_uds(listener, served, async {
+            let _ = stopped.await;
+        }));
+        let uid = ipc::uds::Ownership::current().uid;
+        let channel = ipc::uds::connect_path(&socket, uid).await.unwrap();
+        let mut client = ReqRespServiceClient::new(channel);
+        let request = pb::DataColumnsByRangeRequest {
+            start_slot: 0,
+            count: 1,
+            columns: vec![1],
+            hello: Some(link().local().clone()),
+        };
+        let stream = client
+            .data_columns_by_range(request)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            first_code(stream).await,
+            Some(ErrorCode::ResourceUnavailable as i32)
+        );
+        // GetStatus without a Status source is still the stub.
+        let err = client
+            .get_status(pb::GetStatusRequest {})
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        let _ = stop.send(());
+    }
+
+    /// Without a column server the routes are the stub's: our hello, then `UNIMPLEMENTED`.
+    #[tokio::test]
+    async fn the_stub_routes_answer_unimplemented() {
+        use tokio_stream::StreamExt;
+        let stub = ChainStub::new(link());
+        assert!(!stub.serves_columns());
+        let request = pb::DataColumnsByRangeRequest {
+            start_slot: 0,
+            count: 1,
+            columns: vec![1],
+            hello: Some(link().local().clone()),
+        };
+        let mut stream = ReqRespService::data_columns_by_range(&stub, tonic::Request::new(request))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(stream.next().await.unwrap().is_ok());
+        let err = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+    }
+}

@@ -36,9 +36,9 @@
 //! behaviour serves at most [`MAX_CONCURRENT_REQUESTS`] streams per connection and resets the
 //! next one ([`super::inbound::Duplex`]), and a peer holds one connection.
 
+use super::answer_bucket::{AnswerBucket, AnswerPrefixes};
 use super::metrics::RpcMetrics;
 use super::MAX_CONCURRENT_REQUESTS;
-use crate::peer_caps::IpBucket;
 use futures::task::AtomicWaker;
 use libp2p::PeerId;
 use p2p_wire::rpc::protocols::{Protocol, MAX_REQUEST_DATA_COLUMN_SIDECARS};
@@ -178,9 +178,10 @@ pub const COLUMN_ANSWER_WINDOW: Duration = Duration::from_secs(5);
 /// ≈ 25 MB per answer.
 pub const DEFAULT_MAX_COLUMN_ANSWERS: usize = 8;
 
-/// Column answers held at once by the peers of one IP (an IPv6 /58) \[est\]: 2, so one IP
-/// with its 8 inbound connections (`ConnectionCaps::max_established_incoming_per_ip`) cannot
-/// take all [`DEFAULT_MAX_COLUMN_ANSWERS`] places.
+/// Column answers held at once by the peers of one address block (an IPv4 /24 or an IPv6 /48,
+/// [`RpcLimits::column_answer_prefixes`]) \[est\]: 2, so one host with its 8 inbound
+/// connections (`ConnectionCaps::max_established_incoming_per_ip`), or with a block of
+/// neighbouring addresses, cannot take all [`DEFAULT_MAX_COLUMN_ANSWERS`] places.
 pub const DEFAULT_MAX_COLUMN_ANSWERS_PER_IP: usize = 2;
 
 /// How far a column chunk may fall behind its answer's schedule before its stream is reset
@@ -250,8 +251,12 @@ pub struct RpcLimits {
     pub column_answer_window: Duration,
     /// The SSZ bytes one column answer may hold.
     pub max_column_response_bytes: usize,
-    /// Column answers held at once by the peers of one IP (an IPv6 /58).
+    /// Column answers held at once by the peers of one address block
+    /// ([`Self::column_answer_prefixes`]).
     pub max_column_answers_per_ip: usize,
+    /// How wide that block is: an IPv4 /24 and an IPv6 /48 by default, an IPv4-mapped IPv6
+    /// address counted as its IPv4 address ([`super::answer_bucket`]).
+    pub column_answer_prefixes: AnswerPrefixes,
     /// How far a column chunk may fall behind its answer's schedule before its stream is reset
     /// and its place given back ([`COLUMN_WRITE_DEADLINE`]).
     pub column_write_deadline: Duration,
@@ -268,6 +273,7 @@ impl Default for RpcLimits {
             column_answer_window: COLUMN_ANSWER_WINDOW,
             max_column_response_bytes: MAX_COLUMN_RESPONSE_BYTES,
             max_column_answers_per_ip: DEFAULT_MAX_COLUMN_ANSWERS_PER_IP,
+            column_answer_prefixes: AnswerPrefixes::default(),
             column_write_deadline: COLUMN_WRITE_DEADLINE,
         }
     }
@@ -1161,7 +1167,7 @@ struct Places {
 #[derive(Default)]
 struct PlacesState {
     peers: HashSet<PeerId>,
-    per_ip: HashMap<IpBucket, usize>,
+    per_ip: HashMap<AnswerBucket, usize>,
     bytes: usize,
 }
 
@@ -1175,7 +1181,7 @@ impl fmt::Debug for ColumnPlaces {
 }
 
 impl ColumnPlaces {
-    /// `max` places, at most `max_per_ip` to the peers of one IP, reported in
+    /// `max` places, at most `max_per_ip` to the peers of one address block, reported in
     /// `rpc_column_answers` and `rpc_column_answer_bytes` if `metrics` is given.
     #[must_use]
     pub fn new(max: usize, max_per_ip: usize, metrics: Option<RpcMetrics>) -> Self {
@@ -1192,10 +1198,10 @@ impl ColumnPlaces {
         self.0.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A place for `peer` at `ip` (its IP's bucket, `None` without one), unless every place
+    /// A place for `peer` at `ip` (its address block, `None` without one), unless every place
     /// is held, `peer` holds one, or the peers of `ip` hold their most.
     #[must_use]
-    pub(crate) fn try_take(&self, peer: PeerId, ip: Option<IpBucket>) -> Option<AnswerPermit> {
+    pub(crate) fn try_take(&self, peer: PeerId, ip: Option<AnswerBucket>) -> Option<AnswerPermit> {
         let mut state = self.state();
         let ip_full =
             ip.is_some_and(|ip| state.per_ip.get(&ip).copied().unwrap_or(0) >= self.0.max_per_ip);
@@ -1244,7 +1250,7 @@ impl ColumnPlaces {
 pub struct AnswerPermit {
     places: ColumnPlaces,
     peer: PeerId,
-    ip: Option<IpBucket>,
+    ip: Option<AnswerBucket>,
     bytes: usize,
     /// When it was taken.
     since: Instant,
@@ -1767,21 +1773,36 @@ mod tests {
         assert_eq!(metrics.column_answer_bytes_held(), 0);
         assert!(places.try_take(c, None).is_some());
         drop(second);
-        // At most two places per IP, whatever the peers.
+        // At most two places per address block, whatever the peers and addresses in it.
         let places = ColumnPlaces::new(8, 2, None);
-        let one = Some(crate::peer_caps::IpBucket::V4(
-            std::net::Ipv4Addr::LOCALHOST,
-        ));
-        let other = Some(crate::peer_caps::IpBucket::V4(std::net::Ipv4Addr::new(
-            10, 0, 0, 1,
-        )));
-        let held: Vec<_> = (0..2)
-            .map(|_| places.try_take(PeerId::random(), one).unwrap())
+        let prefixes = AnswerPrefixes::default();
+        let at = |ip: &str| Some(prefixes.bucket(ip.parse().unwrap()));
+        let one = at("10.0.0.1");
+        let other = at("10.0.1.1");
+        let held: Vec<_> = ["10.0.0.1", "10.0.0.2"]
+            .iter()
+            .map(|&ip| places.try_take(PeerId::random(), at(ip)).unwrap())
+            .collect();
+        for neighbour in ["10.0.0.3", "::ffff:10.0.0.4"] {
+            assert!(
+                places.try_take(PeerId::random(), at(neighbour)).is_none(),
+                "the /24's two are held: {neighbour}"
+            );
+        }
+        let v6: Vec<_> = ["2001:db8:1::1", "2001:db8:1:2::1"]
+            .iter()
+            .map(|&ip| places.try_take(PeerId::random(), at(ip)).unwrap())
             .collect();
         assert!(
-            places.try_take(PeerId::random(), one).is_none(),
-            "the IP's two are held"
+            places
+                .try_take(PeerId::random(), at("2001:db8:1:3::1"))
+                .is_none(),
+            "the /48's two are held"
         );
+        assert!(places
+            .try_take(PeerId::random(), at("2001:db8:2::1"))
+            .is_some());
+        drop(v6);
         assert!(places.try_take(PeerId::random(), other).is_some());
         drop(held);
         assert!(places.try_take(PeerId::random(), one).is_some());

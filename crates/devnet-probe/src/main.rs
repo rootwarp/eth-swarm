@@ -7,13 +7,18 @@
 //!              [--api URL]... [--peer MULTIADDR]... [--enr ENR]... [--bootnode ENR]...
 //!              [--discv5-listen IP:PORT] [--discover-secs N] [--connect-secs N]
 //!              [--status-secs N] [--hold-secs N] [--ping-secs N] [--fetch-secs N] [--epoch N]
+//! devnet-probe serve (--network-dir DIR | --config PATH [--genesis PATH]) --api URL...
+//!              --peer MULTIADDR... --columns-dir DIR --socket-dir DIR --verify-socket PATH
+//!              [--verify-uid UID] [--listen MULTIADDR]... [--serve-secs N]
+//!              [--answer-prefix-v4 BITS] [--answer-prefix-v6 BITS]
 //! devnet-probe --help
 //! ```
 //!
 //! Each check prints one `PASS` or `FAIL` line per thing it judged and a summary line, and the
 //! run ends with one `verdict:` line (`devnet_probe::report`). The checks are in
 //! `devnet_probe`: `discover`, `connect`, `status` and `fetch-epoch`; `all` runs the
-//! four in that order. A `setup` check runs first: the config parses, and the genesis (from the
+//! four in that order. `serve` (`devnet_probe::serve`) runs on its own: it stores our custody
+//! columns from gossip and serves them, then checks its answers against its store. A `setup` check runs first: the config parses, and the genesis (from the
 //! genesis state and every `--api`) is one, and for the checks that dial, every `--api`'s node
 //! is one of the `--peer`s.
 //!
@@ -32,8 +37,12 @@
 //! with [`EXIT_NO_LOG_WRITER`](svc_runtime::telemetry::EXIT_NO_LOG_WRITER) (71), writing
 //! nothing.
 
+use cl_chain::probe::BeaconApi;
+use cl_chain::verify::client::KzgClient;
 use cl_discv5::enr::{Enr, EnrFields};
+use cl_p2p::gossip::capture_tap;
 use cl_p2p::m2a_session::PinnedPeer;
+use cl_p2p::rpc::answer_bucket::AnswerPrefixes;
 use consensus_types::{EthSpec, Mainnet, Minimal};
 use devnet_probe::api::{ProbeApi, DEFAULT_API_TIMEOUT};
 use devnet_probe::connect::{self, ConnectPlan};
@@ -42,8 +51,10 @@ use devnet_probe::discover::{self, DiscoverPlan};
 use devnet_probe::fetch::{self, FetchPlan};
 use devnet_probe::ours::{Clock, DEFAULT_REFRESH_INTERVAL};
 use devnet_probe::report::{verdict, Check, Outcome};
+use devnet_probe::serve::{self, ServePlan};
 use devnet_probe::status::{self, StatusPlan};
-use libp2p::PeerId;
+use ethswarm_proto::verify::verify_service_client::VerifyServiceClient;
+use libp2p::{Multiaddr, PeerId};
 use network_config::{Epoch, Genesis};
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
@@ -63,6 +74,10 @@ usage: devnet-probe <discover|connect|status|fetch-epoch|all>
                     [--discv5-listen IP:PORT] [--discover-secs N] [--connect-secs N]
                     [--status-secs N] [--hold-secs N] [--ping-secs N] [--fetch-secs N]
                     [--epoch N]
+       devnet-probe serve (--network-dir DIR | --config PATH [--genesis PATH]) --api URL...
+                    --peer MULTIADDR... --columns-dir DIR --socket-dir DIR
+                    --verify-socket PATH [--verify-uid UID] [--listen MULTIADDR]...
+                    [--serve-secs N] [--answer-prefix-v4 BITS] [--answer-prefix-v6 BITS]
        devnet-probe --help";
 const HELP: &str = "\
 Check our probe against the reference CLs of a local devnet. Every address must be local
@@ -80,6 +95,11 @@ only.
   fetch-epoch   a finalized epoch by BlocksByRange v2 from the --peers; every slot's root
                 must equal the first --api's /eth/v1/beacon/blocks/{slot}/root (404: empty)
   all           the four, in that order
+  serve         store our custody columns from the --peers' gossip (the first --api vouches
+                for each block root, cl-verify at --verify-socket checks the cells) and serve
+                them by DataColumnSidecarsByRange/ByRoot for --serve-secs, cl-p2p asking
+                cl-chain over cl-chain's socket under --socket-dir; then ask ourselves for
+                them as a peer would: every answer must be what the store holds
 
   --network-dir DIR      the devnet's genesis data: DIR/config.yaml and DIR/genesis.ssz
   --config PATH          the devnet's config.yaml (PRESET_BASE picks the preset)
@@ -100,6 +120,19 @@ only.
   --ping-secs N          our Ping cadence while holding (default 15)
   --fetch-secs N         how long fetch-epoch's range fetch may take (default 120)
   --epoch N              the epoch fetch-epoch fetches (default: finalized epoch - 1)
+  --columns-dir DIR      serve: the column store, created; it must not exist yet (every run
+                         serves under a fresh node key, which its custody columns follow)
+  --socket-dir DIR       serve: the socket root, an absolute path without symlinks writable
+                         only by us; cl-chain's socket is DIR/cl-chain/cl-chain.sock
+  --verify-socket PATH   serve: cl-verify's socket (cl-verify --socket PATH --peer-uid <our UID>)
+  --verify-uid UID       serve: the UID cl-verify runs as (default: ours)
+  --listen MULTIADDR     serve: where the probe swarm listens, repeatable
+                         (default /ip4/0.0.0.0/tcp/9000)
+  --serve-secs N         serve: how long it serves before it checks its answers (default 300);
+                         cut short to end before the next fork digest, which it does not cross
+  --answer-prefix-v4 BITS  serve: the IPv4 prefix whose peers share 2 column answer places,
+                         1 to 32 (default 24; 32 on a devnet, whose CLs share one /24)
+  --answer-prefix-v6 BITS  serve: the same for IPv6, 1 to 128 (default 48)
 
 Every -secs flag takes 1 to 86400.
 
@@ -125,6 +158,7 @@ enum Command {
     Status,
     FetchEpoch,
     All,
+    Serve,
 }
 
 impl Command {
@@ -135,17 +169,18 @@ impl Command {
             "status" => Self::Status,
             "fetch-epoch" => Self::FetchEpoch,
             "all" => Self::All,
+            "serve" => Self::Serve,
             _ => return None,
         })
     }
 
     fn runs(self, check: Self) -> bool {
-        self == check || self == Self::All
+        self == check || (self == Self::All && check != Self::Serve)
     }
 
     /// Whether it dials the `--peer`s.
     fn dials(self) -> bool {
-        [Self::Connect, Self::Status, Self::FetchEpoch]
+        [Self::Connect, Self::Status, Self::FetchEpoch, Self::Serve]
             .into_iter()
             .any(|c| self.runs(c))
     }
@@ -175,6 +210,19 @@ struct Args {
     ping: Duration,
     fetch: Duration,
     epoch: Option<Epoch>,
+    serve: ServeArgs,
+}
+
+/// The flags of `serve` alone.
+#[derive(Debug, PartialEq)]
+struct ServeArgs {
+    columns_dir: Option<PathBuf>,
+    socket_dir: Option<PathBuf>,
+    verify_socket: Option<PathBuf>,
+    verify_uid: Option<u32>,
+    listen: Vec<Multiaddr>,
+    serve_for: Duration,
+    answer_prefixes: AnswerPrefixes,
 }
 
 /// The error for an argument the probe does not take: only a flag's key is named, never a
@@ -202,6 +250,15 @@ fn seconds(flag: &str, value: &str) -> Result<Duration, String> {
         Some(0) => Err(format!("{flag} must be at least 1")),
         Some(s) if s > MAX_SECONDS => Err(format!("{flag} must be at most {MAX_SECONDS}")),
         Some(s) => Ok(Duration::from_secs(s)),
+    }
+}
+
+/// A prefix length of 1 to `max` bits.
+fn prefix_bits(flag: &str, value: &str, max: u8) -> Result<u8, String> {
+    let digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+    match digits.then(|| value.parse::<u8>().ok()).flatten() {
+        Some(bits) if (1..=max).contains(&bits) => Ok(bits),
+        _ => Err(format!("{flag}: want 1 to {max} bits")),
     }
 }
 
@@ -240,7 +297,7 @@ fn parse(argv: &[String]) -> Result<Parsed, String> {
     let command = match argv.first() {
         None => return Err("no command".into()),
         Some(c) => Command::parse(c).ok_or_else(|| {
-            "unknown command (want discover, connect, status, fetch-epoch or all)".to_owned()
+            "unknown command (want discover, connect, status, fetch-epoch, all or serve)".to_owned()
         })?,
     };
     let (mut network_dir, mut config, mut genesis) = (None, None, None);
@@ -260,6 +317,15 @@ fn parse(argv: &[String]) -> Result<Parsed, String> {
         ping: status::DEFAULT_PING_INTERVAL,
         fetch: fetch::DEFAULT_FETCH_TIMEOUT,
         epoch: None,
+        serve: ServeArgs {
+            columns_dir: None,
+            socket_dir: None,
+            verify_socket: None,
+            verify_uid: None,
+            listen: Vec::new(),
+            serve_for: serve::DEFAULT_SERVE,
+            answer_prefixes: AnswerPrefixes::default(),
+        },
     };
     let mut it = argv[1..].iter();
     while let Some(flag) = it.next() {
@@ -293,6 +359,31 @@ fn parse(argv: &[String]) -> Result<Parsed, String> {
             "--hold-secs" => args.hold = seconds(flag, value?)?,
             "--ping-secs" => args.ping = seconds(flag, value?)?,
             "--fetch-secs" => args.fetch = seconds(flag, value?)?,
+            "--serve-secs" => args.serve.serve_for = seconds(flag, value?)?,
+            "--answer-prefix-v4" => {
+                args.serve.answer_prefixes.ipv4 = prefix_bits(flag, value?, 32)?;
+            }
+            "--answer-prefix-v6" => {
+                args.serve.answer_prefixes.ipv6 = prefix_bits(flag, value?, 128)?;
+            }
+            "--columns-dir" => args.serve.columns_dir = Some(PathBuf::from(value?)),
+            "--socket-dir" => args.serve.socket_dir = Some(PathBuf::from(value?)),
+            "--verify-socket" => args.serve.verify_socket = Some(PathBuf::from(value?)),
+            "--verify-uid" => {
+                let v = value?;
+                let uid = v
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+                    .then(|| v.parse().ok())
+                    .flatten()
+                    .ok_or("--verify-uid: not a UID")?;
+                args.serve.verify_uid = Some(uid);
+            }
+            "--listen" => args.serve.listen.push(
+                value?
+                    .parse()
+                    .map_err(|_| "--listen: not a multiaddr".to_owned())?,
+            ),
             "--epoch" => {
                 let v = value?;
                 let epoch = v
@@ -337,7 +428,89 @@ fn parse(argv: &[String]) -> Result<Parsed, String> {
     if (cmd.runs(Command::Status) || cmd.runs(Command::FetchEpoch)) && args.apis.is_empty() {
         return Err("status and fetch-epoch need the reference --api".into());
     }
+    if cmd == Command::Serve {
+        let s = &args.serve;
+        if args.apis.is_empty() || args.peers.is_empty() {
+            return Err("serve needs the reference --api and the --peers to gossip with".into());
+        }
+        if s.columns_dir.is_none() || s.socket_dir.is_none() || s.verify_socket.is_none() {
+            return Err("serve needs --columns-dir, --socket-dir and --verify-socket".into());
+        }
+    } else if args.serve != ServeArgs::unset() {
+        return Err(
+            "--columns-dir, --socket-dir, --verify-socket, --verify-uid, --listen, \
+                    --serve-secs and --answer-prefix-v4/v6 are serve's only"
+                .into(),
+        );
+    }
     Ok(Parsed::Run(Box::new(args)))
+}
+
+impl ServeArgs {
+    /// No `serve` flag given.
+    fn unset() -> Self {
+        Self {
+            columns_dir: None,
+            socket_dir: None,
+            verify_socket: None,
+            verify_uid: None,
+            listen: Vec::new(),
+            serve_for: serve::DEFAULT_SERVE,
+            answer_prefixes: AnswerPrefixes::default(),
+        }
+    }
+}
+
+/// The default listen address of `serve`: cl-p2p's.
+fn default_listen() -> Multiaddr {
+    "/ip4/0.0.0.0/tcp/9000".parse().expect("a multiaddr")
+}
+
+/// The `serve` check: cl-verify at `--verify-socket` for the KZG checks, the first `--api` as
+/// the reference.
+async fn serve_check<E: EthSpec>(args: &Args, devnet: &Devnet) -> Check {
+    let s = &args.serve;
+    let (Some(columns_dir), Some(socket_root), Some(verify_socket)) =
+        (&s.columns_dir, &s.socket_dir, &s.verify_socket)
+    else {
+        return Check::failed(serve::NAME, "serve needs its directories and cl-verify");
+    };
+    let url = &args.apis[0];
+    if !url.base_path().is_empty() {
+        return Check::failed(serve::NAME, "the reference --api must have no base path");
+    }
+    let reference =
+        match BeaconApi::new(&format!("http://{}", url.authority()), DEFAULT_API_TIMEOUT) {
+            Ok(api) => api,
+            Err(e) => return Check::failed(serve::NAME, e.to_string()),
+        };
+    let uid = s
+        .verify_uid
+        .unwrap_or_else(|| ipc::uds::Ownership::current().uid);
+    let kzg = match ipc::uds::connect_path(verify_socket, uid).await {
+        Ok(channel) => KzgClient::new(VerifyServiceClient::new(channel), serve::verify_hello()),
+        Err(e) => {
+            return Check::failed(
+                serve::NAME,
+                format!("cl-verify at {}: {e}", verify_socket.display()),
+            )
+        }
+    };
+    let plan = ServePlan {
+        listen: if s.listen.is_empty() {
+            vec![default_listen()]
+        } else {
+            s.listen.clone()
+        },
+        peers: args.peers.clone(),
+        serve_for: s.serve_for,
+        columns_dir: columns_dir.clone(),
+        socket_root: socket_root.clone(),
+        verify_timeout: serve::DEFAULT_VERIFY_TIMEOUT,
+        answer_prefixes: s.answer_prefixes,
+    };
+    let tap = capture_tap(serve::TAP_CAPACITY);
+    serve::serve::<E, KzgClient>(devnet, reference, kzg, &plan, tap, system_ms()).await
 }
 
 /// Unix milliseconds of the system clock.
@@ -491,6 +664,9 @@ async fn checks<E: EthSpec>(args: &Args, devnet: &Devnet, out: &mut dyn Write) -
             ));
         }
         emit(check, out);
+    }
+    if args.command == Command::Serve {
+        emit(serve_check::<E>(args, devnet).await, out);
     }
     if args.command.runs(Command::FetchEpoch) {
         let plan = FetchPlan {
@@ -904,6 +1080,171 @@ mod tests {
 
     fn peer_arg(p: &PinnedPeer) -> String {
         format!("{}/p2p/{}", p.addr, p.peer_id)
+    }
+
+    /// `serve`'s command line: its own flags, required together, and taken by no other
+    /// command; `all` never runs it.
+    #[test]
+    fn serve_arguments() {
+        let base = [
+            "serve",
+            "--network-dir",
+            "/net",
+            "--api",
+            "http://127.0.0.1:5052",
+            "--peer",
+            PEER,
+        ];
+        let serving = [
+            "--columns-dir",
+            "/state/columns",
+            "--socket-dir",
+            "/run/probe",
+            "--verify-socket",
+            "/run/verify.sock",
+        ];
+        let full: Vec<&str> = base
+            .iter()
+            .chain(&serving)
+            .chain(&[
+                "--verify-uid",
+                "990",
+                "--listen",
+                "/ip4/127.0.0.1/tcp/9100",
+                "--listen",
+                "/ip6/::1/tcp/9100",
+                "--serve-secs",
+                "30",
+                "--answer-prefix-v4",
+                "32",
+                "--answer-prefix-v6",
+                "128",
+            ])
+            .copied()
+            .collect();
+        let Parsed::Run(a) = parse(&args(&full)).unwrap() else {
+            panic!()
+        };
+        assert_eq!(a.command, Command::Serve);
+        assert!(a.command.dials(), "every --api's node must be a --peer");
+        assert_eq!(a.serve.columns_dir, Some(PathBuf::from("/state/columns")));
+        assert_eq!(a.serve.socket_dir, Some(PathBuf::from("/run/probe")));
+        assert_eq!(
+            a.serve.verify_socket,
+            Some(PathBuf::from("/run/verify.sock"))
+        );
+        assert_eq!(a.serve.verify_uid, Some(990));
+        assert_eq!(a.serve.listen.len(), 2);
+        assert_eq!(a.serve.serve_for, Duration::from_secs(30));
+        assert_eq!(
+            a.serve.answer_prefixes,
+            AnswerPrefixes {
+                ipv4: 32,
+                ipv6: 128
+            }
+        );
+        let defaults: Vec<&str> = base.iter().chain(&serving).copied().collect();
+        let Parsed::Run(a) = parse(&args(&defaults)).unwrap() else {
+            panic!()
+        };
+        assert_eq!(a.serve.serve_for, serve::DEFAULT_SERVE);
+        assert!(a.serve.listen.is_empty());
+        assert_eq!(a.serve.answer_prefixes, AnswerPrefixes::default());
+        assert_eq!(default_listen().to_string(), "/ip4/0.0.0.0/tcp/9000");
+        let err = parse(&args(&base)).unwrap_err();
+        assert!(
+            err.contains("--columns-dir, --socket-dir and --verify-socket"),
+            "{err}"
+        );
+        let no_peer: Vec<&str> = base[..5].iter().chain(&serving).copied().collect();
+        assert!(parse(&args(&no_peer)).unwrap_err().contains("--peers"));
+        for (flag, value) in [
+            ("--verify-uid", "x"),
+            ("--listen", "nonsense"),
+            ("--serve-secs", "0"),
+            ("--answer-prefix-v4", "0"),
+            ("--answer-prefix-v4", "33"),
+            ("--answer-prefix-v6", "129"),
+            ("--answer-prefix-v6", "x"),
+        ] {
+            let mut bad = defaults.clone();
+            bad.extend([flag, value]);
+            assert!(parse(&args(&bad)).unwrap_err().contains(flag), "{flag}");
+        }
+        let mut connect = vec!["connect", "--network-dir", "/net", "--peer", PEER];
+        connect.extend(&serving);
+        assert!(parse(&args(&connect)).unwrap_err().contains("serve's only"));
+        assert!(!Command::All.runs(Command::Serve));
+        assert!(Command::All.runs(Command::FetchEpoch));
+    }
+
+    /// `serve` refuses a reference with a base path, and a cl-verify it cannot reach, before
+    /// anything is opened.
+    #[test]
+    fn serve_needs_its_reference_and_cl_verify() {
+        let rt = runtime();
+        let devnet = fixtures::devnet();
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_owned();
+        let argv = |api: &str| {
+            args(&[
+                "serve",
+                "--config",
+                "/c.yaml",
+                "--api",
+                api,
+                "--peer",
+                PEER,
+                "--columns-dir",
+                &path("columns"),
+                "--socket-dir",
+                &path("run"),
+                "--verify-socket",
+                &path("verify.sock"),
+            ])
+        };
+        let check = |api: &str| {
+            let Parsed::Run(a) = parse(&argv(api)).unwrap() else {
+                panic!()
+            };
+            rt.block_on(serve_check::<Minimal>(&a, &devnet))
+        };
+        let based = check("http://127.0.0.1:5052/base");
+        assert!(
+            based.lines()[0].detail.contains("no base path"),
+            "{:?}",
+            based.lines()
+        );
+        let unreachable = check("http://127.0.0.1:5052");
+        assert!(!unreachable.passed());
+        assert!(
+            unreachable.lines()[0].detail.contains("cl-verify at"),
+            "{:?}",
+            unreachable.lines()
+        );
+        assert!(!dir.path().join("columns").exists(), "nothing opened");
+        // With cl-verify there, serve starts: this config has no serve range, so it ends there.
+        let _listener = rt.block_on(async {
+            tokio::net::UnixListener::bind(dir.path().join("verify.sock")).unwrap()
+        });
+        let served = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                let Parsed::Run(a) = parse(&argv("http://127.0.0.1:5052")).unwrap() else {
+                    panic!()
+                };
+                serve_check::<Minimal>(&a, &devnet).await
+            })
+            .await
+            .unwrap()
+        });
+        assert!(!served.passed());
+        assert!(
+            served.lines()[0]
+                .detail
+                .contains("MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS"),
+            "{:?}",
+            served.lines()
+        );
     }
 
     #[test]

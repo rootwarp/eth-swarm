@@ -2224,13 +2224,13 @@ mod tests {
     }
 
     /// SEC-001: a booked answer keeps to its schedule, not to a deadline per write. Requesters
-    /// reading a chunk every 0.9 s, each within the 1 s write deadline, two per IP on four IPs,
+    /// reading a chunk every 0.9 s, each within the 1 s write deadline, two per /24 on four,
     /// take all eight places and still give every one back before an honest requester's wait
     /// for a place runs out ([`crate::rpc::limits::COLUMN_QUEUE_WAIT`]), so it is served; one
     /// that reads at the answer's own pace is never cut.
     #[tokio::test(start_paused = true)]
     async fn slow_readers_on_many_ips_cannot_keep_every_place() {
-        use crate::peer_caps::IpBucket;
+        use crate::rpc::answer_bucket::AnswerBucket;
         use crate::rpc::limits::{BookedChunks, ColumnDeadlines, ColumnPlaces};
         use std::net::Ipv4Addr;
         let limiter = shared_limiter(RateLimits::default());
@@ -2244,7 +2244,7 @@ mod tests {
                 &limiter, peer, BLOCKS, 40, None, deadlines,
             ))),
             permit: places
-                .try_take(peer, Some(IpBucket::V4(Ipv4Addr::new(10, 0, 0, ip))))
+                .try_take(peer, Some(AnswerBucket::V4(Ipv4Addr::new(10, 0, ip, 0))))
                 .map(Box::new),
         };
         let start = Instant::now();

@@ -11,6 +11,10 @@
 //! - [`status`]: Status v2 both ways (ours answered, theirs answered and our answer sent), then
 //!   each connection held with our Ping cadence and no Goodbye; a Goodbye is reported with
 //!   its reason.
+//! - [`serve`]: the probe stores its custody columns from gossip (cl-chain's probe mode) and
+//!   serves them by `DataColumnSidecarsByRange` and `DataColumnSidecarsByRoot` through cl-p2p,
+//!   the two connected over cl-chain's Unix socket and its ACL, then asks itself for them as a
+//!   peer would and compares every answer with the store.
 //! - [`fetch`]: one finalized epoch by BlocksByRange v2 ([`cl_p2p::rpc::outbound::fetch_epoch`]
 //!   over the [`cl_p2p::rpc::outbound::RangeRequester`]), every slot's root compared with
 //!   `/eth/v1/beacon/blocks/{slot}/root` (404: an empty slot); nothing may be unconfirmed. Its
@@ -39,5 +43,6 @@ pub mod fetch;
 pub mod fixtures;
 pub mod ours;
 pub mod report;
+pub mod serve;
 pub mod status;
 pub mod swarm;

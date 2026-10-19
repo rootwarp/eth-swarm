@@ -5,8 +5,9 @@
 
 use super::devnet::Devnet;
 use cl_p2p::behaviour::SpecBehaviour;
-use cl_p2p::gossip::{GossipConfig, IgnoreAll};
+use cl_p2p::gossip::{CaptureTap, GossipConfig, IgnoreAll};
 use cl_p2p::rpc::codec::Deadlines;
+use cl_p2p::rpc::columns::ColumnSource;
 use cl_p2p::rpc::inbound::{Control, ControlConfig, SharedMetaData, StatusSource};
 use cl_p2p::rpc::limits::RpcLimits;
 use cl_p2p::rpc::metrics::RpcMetrics;
@@ -41,6 +42,8 @@ pub struct SwarmPlan {
     /// The ignore-all gossipsub, subscribed to `beacon_block` at this fork digest; none if
     /// `None`. It reports IGNORE for every message, so it forwards nothing.
     pub gossip: Option<ForkDigest>,
+    /// The req/resp limits: the quotas, and the column answer places and their address blocks.
+    pub limits: RpcLimits,
 }
 
 /// The probe swarm for `devnet` under the preset `E`, with an ephemeral secp256k1 node key, our
@@ -57,6 +60,55 @@ pub fn probe_swarm<E: EthSpec>(
     status: Arc<dyn StatusSource>,
     plan: SwarmPlan,
 ) -> Result<Swarm<SpecBehaviour<E>>, String> {
+    let gossip = plan.gossip.map(|digest| Gossip {
+        topics: vec![GossipTopic::new(digest, GossipKind::BeaconBlock)],
+        tap: None,
+    });
+    let sources = Sources {
+        status,
+        custody_group_count: CUSTODY_REQUIREMENT,
+        // The devnet probe's checks store no columns.
+        columns: None,
+    };
+    serving_swarm(devnet, Keypair::generate_secp256k1(), sources, plan, gossip)
+}
+
+/// Where the probe swarm's answers come from.
+pub struct Sources {
+    /// Our Status.
+    pub status: Arc<dyn StatusSource>,
+    /// The MetaData `custody_group_count` (`seq_number` 0, no attestation or sync subnets).
+    pub custody_group_count: u64,
+    /// The custody columns' source; `None` answers every column request
+    /// `3: ResourceUnavailable`.
+    pub columns: Option<Arc<dyn ColumnSource>>,
+}
+
+/// The ignore-all gossipsub's topics, and the tap each message also goes to.
+pub struct Gossip {
+    /// The topics it subscribes.
+    pub topics: Vec<GossipTopic>,
+    /// Every message, as gossipsub delivers it.
+    pub tap: Option<CaptureTap>,
+}
+
+/// The probe swarm for `devnet` under the preset `E`, with the node key `key`, answering from
+/// `sources`, with the ignore-all gossipsub on `gossip`'s topics if given (`plan.gossip` is not
+/// read). Every column answer is read and served under the devnet's caps
+/// ([`Devnet::context_table`]). Its metrics go to a registry of its own.
+///
+/// Must be called within a tokio runtime.
+///
+/// # Errors
+///
+/// The swarm could not be built or could not listen.
+pub fn serving_swarm<E: EthSpec>(
+    devnet: &Devnet,
+    key: Keypair,
+    sources: Sources,
+    plan: SwarmPlan,
+    gossip: Option<Gossip>,
+) -> Result<Swarm<SpecBehaviour<E>>, String> {
     let mut registry = Registry::default();
     let transport = TransportMetrics::register(&mut registry);
     let mut cfg = SwarmConfig::new(MuxerBudget::with_defaults(&transport));
@@ -66,32 +118,33 @@ pub fn probe_swarm<E: EthSpec>(
     cfg.muxer_observer = plan.muxer_observer;
     let control = Control::<E>::new(
         ControlConfig {
-            status,
+            status: sources.status,
             metadata: Arc::new(SharedMetaData::new(MetaDataV3 {
                 seq_number: 0,
                 attnets: Default::default(),
                 syncnets: Default::default(),
-                custody_group_count: CUSTODY_REQUIREMENT,
+                custody_group_count: sources.custody_group_count,
             })),
             contexts: Arc::new(devnet.context_table()),
             deadlines: Deadlines::default(),
-            limits: RpcLimits::default(),
+            limits: plan.limits,
             ping_interval: plan.ping_interval,
-            // The devnet probe stores no columns.
-            columns: None,
+            columns: sources.columns,
         },
         RpcMetrics::register(&mut registry),
     );
-    let key = Keypair::generate_secp256k1();
-    match plan.gossip {
+    match gossip {
         None => build_swarm(key, &cfg, control).map_err(|e| e.to_string()),
-        Some(digest) => {
+        Some(gossip) => {
             let caps = TopicCaps::gloas::<E>(&NetworkCaps::from_config(devnet.config()));
-            let topics = vec![GossipTopic::new(digest, GossipKind::BeaconBlock)];
-            let gossip_cfg = GossipConfig::ethereum_profile::<E>(devnet.config(), topics, caps);
-            let gossip = IgnoreAll::new(&gossip_cfg, &mut registry)
+            let gossip_cfg =
+                GossipConfig::ethereum_profile::<E>(devnet.config(), gossip.topics, caps);
+            let mut ignore_all = IgnoreAll::new(&gossip_cfg, &mut registry)
                 .map_err(|e| format!("gossipsub: {e}"))?;
-            build_swarm_with_gossip(key, &cfg, control, gossip).map_err(|e| e.to_string())
+            if let Some(tap) = gossip.tap {
+                ignore_all = ignore_all.with_tap(tap);
+            }
+            build_swarm_with_gossip(key, &cfg, control, ignore_all).map_err(|e| e.to_string())
         }
     }
 }
@@ -123,6 +176,7 @@ mod tests {
             muxer_observer: None,
             ping_interval: cl_p2p::rpc::inbound::PING_INTERVAL,
             gossip,
+            limits: RpcLimits::default(),
         }
     }
 

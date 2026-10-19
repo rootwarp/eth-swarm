@@ -183,6 +183,7 @@ async fn dial_alone<E: EthSpec>(
         muxer_observer: Some(observer),
         ping_interval: cl_p2p::rpc::inbound::PING_INTERVAL,
         gossip: None,
+        limits: cl_p2p::rpc::limits::RpcLimits::default(),
     };
     let mut swarm = probe_swarm::<E>(devnet, Arc::new(SharedStatus::new(None)), swarm_plan)?;
     let deadline = Instant::now() + timeout;

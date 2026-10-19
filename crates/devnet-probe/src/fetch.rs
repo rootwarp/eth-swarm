@@ -193,6 +193,7 @@ fn fetch_swarm<E: EthSpec>(
         muxer_observer: None,
         ping_interval: cl_p2p::rpc::inbound::PING_INTERVAL,
         gossip: Some(digest),
+        limits: cl_p2p::rpc::limits::RpcLimits::default(),
     };
     probe_swarm::<E>(devnet, status, swarm_plan)
 }

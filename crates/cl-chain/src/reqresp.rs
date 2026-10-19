@@ -3,6 +3,10 @@
 //! `DataColumnSidecarsByRange` v1 or `DataColumnSidecarsByRoot` v1 request
 //! (`fulu/p2p-interface.md` L605–775). cl-p2p opens no database: the answer is read here, from
 //! the `cl-chain-columns` store the probe fills from gossip ([`crate::probe::ColumnIngest`]).
+//! Given a [`ChainStatus`] ([`ReqRespServer::serving_status`]: in probe mode the
+//! [`StatusProvider`], whose `earliest_available_slot` is [`ColumnServer`]'s), it also serves
+//! `GetStatus`, a unary call with no hello, `UNAVAILABLE` while there is no Status yet. The other
+//! RPCs of the service are still stubs. [`crate::ChainStub::serving`] mounts it.
 //!
 //! # What is served
 //!
@@ -24,7 +28,8 @@
 //!   block it knows of. For a node that stores forward from the slot `cgc` was set at, without
 //!   a gap, it is that slot (`fulu/validator.md` L173–175: "the `earliest_available_slot` field
 //!   … SHOULD reflect the slot at which the `custody_group_count` was updated"), and the Status
-//!   says so ([`crate::probe::StatusProvider::serving_columns`]).
+//!   says so ([`crate::probe::StatusProvider::serving_columns`], [`ColumnServer::status_floor`]:
+//!   with nothing stored yet, the higher of `cgc_set_slot` and the slot after the watermark).
 //! - **Within `data_column_serve_range`**: `[max(current_epoch -
 //!   MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS, FULU_FORK_EPOCH), current_epoch]` by the wall
 //!   clock (L647–651, [`ServeClock`]).
@@ -96,7 +101,9 @@
 //! rule 4). Each read stops at [`READ_DEADLINE`], so a read whose caller gave up does not run
 //! on. Error details stay in the log: the stream carries a fixed message per code.
 
-use crate::probe::{earliest_servable_slot, ProbeChain, Root};
+use crate::probe::{
+    earliest_servable_slot, ProbeChain, ProbeError, ReferenceApi, Root, StatusProvider,
+};
 use cl_chain_columns::{BlockLink, ColumnReader, ColumnWriter, RangeBudget, Snapshot};
 use consensus_types::das;
 use consensus_types::primitives::{Slot, U256};
@@ -110,6 +117,8 @@ use network_config::digest::{compute_fork_digest, current_epoch};
 use network_config::{Epoch, ForkName};
 use pb::req_resp_service_server::{ReqRespService, ReqRespServiceServer};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
@@ -715,8 +724,33 @@ impl ColumnServer {
         })
     }
 
-    /// The Status `earliest_available_slot` while columns are served: `None` while nothing
-    /// is (or the store cannot be read).
+    /// The Status `earliest_available_slot`: [`Self::earliest_available_slot`] once a column
+    /// is stored; before that the slot the store serves from at the earliest, the higher of
+    /// `cgc_set_slot` and the slot after the finality watermark. Never below what
+    /// [`columns_by_range`] serves from, so a peer asking from there is never refused for it.
+    ///
+    /// # Errors
+    ///
+    /// The store cannot be read, or holds no custody record.
+    pub fn status_floor(&self) -> Result<Slot, String> {
+        let snapshot = self.store.reader().snapshot().map_err(|e| e.to_string())?;
+        let view = self.view_in(&snapshot).map_err(|e| e.to_string())?;
+        if let Some(earliest) = view.earliest {
+            return Ok(earliest);
+        }
+        let record = snapshot
+            .custody()
+            .map_err(|e| e.to_string())?
+            .ok_or("no custody record")?;
+        let after_finality = snapshot
+            .finalized_slot()
+            .map_err(|e| e.to_string())?
+            .map_or(0, |f| f.saturating_add(1));
+        Ok(record.cgc_set_slot.max(after_finality))
+    }
+
+    /// The slot columns are served from while they are: `None` while nothing is (or the
+    /// store cannot be read).
     #[must_use]
     pub fn earliest_available_slot(&self) -> Option<Slot> {
         match self.view() {
@@ -790,8 +824,26 @@ impl ColumnServer {
 }
 
 impl crate::probe::ServedColumns for ColumnServer {
-    fn earliest_available_slot(&self) -> Option<Slot> {
-        ColumnServer::earliest_available_slot(self)
+    fn status_floor(&self) -> Result<Slot, String> {
+        ColumnServer::status_floor(self)
+    }
+}
+
+/// One Status lookup in flight.
+pub type StatusLookup<'a> =
+    Pin<Box<dyn Future<Output = Result<pb::GetStatusResponse, ProbeError>> + Send + 'a>>;
+
+/// The Status `ReqRespService/GetStatus` serves: in probe mode the [`StatusProvider`], whose
+/// `earliest_available_slot` is the column server's ([`StatusProvider::serving_columns`]).
+pub trait ChainStatus: Send + Sync + 'static {
+    /// The Status now; [`ProbeError`] while there is none, which the call answers
+    /// `UNAVAILABLE` (cl-p2p then sends and judges no Status).
+    fn status(&self) -> StatusLookup<'_>;
+}
+
+impl<A: ReferenceApi + 'static> ChainStatus for StatusProvider<A> {
+    fn status(&self) -> StatusLookup<'_> {
+        Box::pin(StatusProvider::status(self, now_ms()))
     }
 }
 
@@ -819,13 +871,25 @@ fn refusal_chunk(refusal: &Refusal) -> Result<pb::ResponseChunk, Status> {
     })
 }
 
-/// `ethswarm.chain.v1.ReqRespService` with the column RPCs served from a [`ColumnServer`] and
-/// the rest still stubs (contract checks, then `UNIMPLEMENTED`).
-#[derive(Clone, Debug)]
+/// `ethswarm.chain.v1.ReqRespService` with the column RPCs served from a [`ColumnServer`],
+/// `GetStatus` from a [`ChainStatus`] once it is given one ([`Self::serving_status`]), and the
+/// rest still stubs (contract checks, then `UNIMPLEMENTED`).
+#[derive(Clone)]
 pub struct ReqRespServer {
     link: Link,
     columns: Arc<ColumnServer>,
     reads: Arc<Semaphore>,
+    status: Option<Arc<dyn ChainStatus>>,
+}
+
+impl std::fmt::Debug for ReqRespServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReqRespServer")
+            .field("link", &self.link)
+            .field("columns", &self.columns)
+            .field("serves_status", &self.status.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ReqRespServer {
@@ -843,7 +907,15 @@ impl ReqRespServer {
             link,
             columns,
             reads: Arc::new(Semaphore::new(max_reads)),
+            status: None,
         }
+    }
+
+    /// The same server, answering `GetStatus` from `status`.
+    #[must_use]
+    pub fn serving_status(mut self, status: Arc<dyn ChainStatus>) -> Self {
+        self.status = Some(status);
+        self
     }
 
     /// The tonic service.
@@ -921,7 +993,16 @@ impl ReqRespService for ReqRespServer {
         &self,
         _: Request<pb::GetStatusRequest>,
     ) -> Result<Response<pb::GetStatusResponse>, Status> {
-        ipc::stub::unary(&self.link, "get_status", &[])
+        let Some(status) = &self.status else {
+            return ipc::stub::unary(&self.link, "get_status", &[]);
+        };
+        // A unary call: no hello, no envelope.
+        self.link.check_unary(&[]).map_err(|e| e.to_status())?;
+        status
+            .status()
+            .await
+            .map(Response::new)
+            .map_err(Status::from)
     }
 
     async fn get_metadata(

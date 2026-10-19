@@ -24,6 +24,14 @@ test-support = ["testkit/test-support", "cl-p2p/testkit"]
 cl-p2p = { path = "../cl-p2p" }
 cl-discv5 = { path = "../cl-discv5" }
 cl-chain = { path = "../cl-chain" }
+# serve: probe mode's column store, and cl-chain's chain.v1 socket (ipc's bind, connector and
+# method ACL) that cl-p2p's column responders call; the versions cl-chain and cl-p2p use.
+cl-chain-columns = { path = "../cl-chain-columns" }
+ipc = { path = "../ipc" }
+ethswarm-proto = { path = "../ethswarm-proto" }
+tonic.workspace = true
+tokio-stream = { version = "0.1", features = ["net"] }
+ethereum_ssz.workspace = true
 # The beacon API client (collector's HTTP/1.1 GET, the loopback URL rule).
 testkit = { path = "../testkit" }
 consensus-types = { path = "../consensus-types" }
@@ -48,7 +56,7 @@ devnet-probe = { path = ".", features = ["test-support"] }
 cl-p2p = { path = "../cl-p2p", features = ["testkit"] }
 p2p-wire = { path = "../p2p-wire", features = ["testkit"] }
 testkit = { path = "../testkit", features = ["test-support"] }
-ethereum_ssz.workspace = true
+tree_hash.workspace = true
 tempfile = "3"
 # The stalled-stderr test fills a pipe without blocking (`fcntl` O_NONBLOCK).
 rustix = { version = "1", features = ["fs"] }

@@ -51,7 +51,6 @@ use cl_p2p::m2a_session::{
 };
 use consensus_types::{EthSpec, Mainnet};
 use gate::Expected;
-use network_config::digest::digest_schedule;
 use network_config::{ChainConfig, Network};
 use p2p_wire::rpc::codec::ContextTable;
 use probe::{Chain, Probe, Verdict};
@@ -222,13 +221,9 @@ fn chain(network: SessionNetwork) -> Result<Chain, String> {
     })
 }
 
-/// Every digest of the schedule, from Fulu on.
+/// Every digest of the schedule, from Fulu on, and the network's caps.
 fn context_table(chain: &Chain) -> ContextTable {
-    let mut table = ContextTable::new();
-    for entry in digest_schedule(&chain.config, &chain.genesis.genesis_validators_root) {
-        table.insert(entry.fork_digest, entry.fork);
-    }
-    table
+    cl_p2p::rpc::network_context_table(&chain.config, &chain.genesis.genesis_validators_root)
 }
 
 /// What the session summary needs besides the report, fixed once the pre-flight passed.
@@ -790,6 +785,13 @@ mod tests {
             assert_eq!(table.fork(&digest), Some(fork), "{digest:02x?}");
         }
         assert_eq!(table.fork(&[0; 4]), None);
+        // The network's caps: without them every column chunk would be refused.
+        assert_eq!(
+            table.network_caps(),
+            Some(&consensus_types::caps::NetworkCaps::from_config(
+                &chain.config
+            ))
+        );
     }
 
     // The Status probe against a loopback peer and a mock reference API.

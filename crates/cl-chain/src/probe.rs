@@ -27,13 +27,16 @@
 //!   imports nothing past finality, so a later head would claim blocks it cannot serve.
 //! - `earliest_available_slot`: once the probe serves its custody columns
 //!   ([`StatusProvider::serving_columns`]), the slot it serves them from
-//!   ([`crate::reqresp::ColumnServer::earliest_available_slot`]): [`earliest_servable_slot`],
-//!   the highest of the first stored column slot, the slot after the finalized-slot watermark,
-//!   `cgc_set_slot` and the store's contiguous-from slot, never the first stored slot alone (a
-//!   historical minimum that pruning leaves below the data). A node storing forward from the
-//!   slot its `cgc` was set at advertises that slot (`fulu/p2p-interface.md` L552–561,
-//!   `fulu/validator.md` L173–175). Until a column is stored, and without a column store,
-//!   `head_slot`.
+//!   ([`crate::reqresp::ColumnServer::status_floor`]), read from the store on every call:
+//!   [`earliest_servable_slot`], the highest of the first stored column slot, the slot after
+//!   the finalized-slot watermark, `cgc_set_slot` and the store's contiguous-from slot, never
+//!   the first stored slot alone (a historical minimum that pruning leaves below the data). A
+//!   node storing forward from the slot its `cgc` was set at advertises that slot
+//!   (`fulu/p2p-interface.md` L552–561, `fulu/validator.md` L173–175). Until a column is
+//!   stored, the slot it serves from at the earliest: the higher of `cgc_set_slot` and the slot
+//!   after the watermark, never `head_slot` below it. A store that cannot be read (or holds no
+//!   custody record) gives no Status ([`ProbeError::Unavailable`]): never a lower value.
+//!   Without a column store, `head_slot`.
 //!
 //!   **Deviation: it may sit above `head_slot`.** The probe's head is its finalized block, two
 //!   to three epochs behind the wall clock, while it stores columns from the slot it started
@@ -158,8 +161,13 @@ impl Sample {
 
 /// The slot the probe serves its custody columns from, for the Status.
 pub trait ServedColumns: Send + Sync {
-    /// `earliest_available_slot` while columns are served; `None` while none is.
-    fn earliest_available_slot(&self) -> Option<u64>;
+    /// The Status `earliest_available_slot`: never below the slot a range request is served
+    /// from ([`crate::reqresp::ColumnServer::status_floor`]).
+    ///
+    /// # Errors
+    ///
+    /// The store cannot say: the Status is then refused, never advertised lower.
+    fn status_floor(&self) -> Result<u64, String>;
 }
 
 /// Builds the probe's Status from the wall clock and the reference API (see the module docs).
@@ -169,6 +177,10 @@ pub struct StatusProvider<A> {
     timeout: Duration,
     last_good: Mutex<Option<Sample>>,
     columns: Option<std::sync::Arc<dyn ServedColumns>>,
+    /// How long a good sample is reused before the API is sampled again.
+    reuse: Duration,
+    /// When the kept sample was taken.
+    sampled_at: Mutex<Option<tokio::time::Instant>>,
 }
 
 impl<A: ReferenceApi> StatusProvider<A> {
@@ -180,7 +192,33 @@ impl<A: ReferenceApi> StatusProvider<A> {
             timeout,
             last_good: Mutex::new(None),
             columns: None,
+            reuse: Duration::ZERO,
+            sampled_at: Mutex::new(None),
         }
+    }
+
+    /// The same provider, reusing a good sample for `age` before it samples the API again: a
+    /// Status read for every peer then costs the API one call per `age`. The column floor is
+    /// read on every call all the same.
+    #[must_use]
+    pub fn reusing_samples(mut self, age: Duration) -> Self {
+        self.reuse = age;
+        self
+    }
+
+    /// The kept sample, if it is younger than the reuse age.
+    fn recent(&self) -> Option<Sample> {
+        let at = (*self
+            .sampled_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner))?;
+        if at.elapsed() >= self.reuse {
+            return None;
+        }
+        *self
+            .last_good
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The same provider, its `earliest_available_slot` the slot `columns` serves from.
@@ -224,6 +262,18 @@ impl<A: ReferenceApi> StatusProvider<A> {
         )?;
         let fork_digest =
             compute_fork_digest(&chain.config, &chain.genesis.genesis_validators_root, epoch)?;
+        // The floor first: a store that cannot say what it serves gives no Status.
+        let floor = match &self.columns {
+            Some(columns) => Some(
+                columns
+                    .status_floor()
+                    .map_err(|e| ProbeError::Unavailable(format!("column store: {e}")))?,
+            ),
+            None => None,
+        };
+        if let Some(sample) = self.recent() {
+            return Ok(Self::response(fork_digest, sample, floor));
+        }
         let fresh = self.sample().await;
         let sample = {
             let mut last = self
@@ -239,7 +289,14 @@ impl<A: ReferenceApi> StatusProvider<A> {
                         kept_slot = kept.head.slot,
                         "an older reference sample than the kept one: ignored"
                     ),
-                    _ => *last = Some(sample),
+                    _ => {
+                        *last = Some(sample);
+                        *self
+                            .sampled_at
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) =
+                            Some(tokio::time::Instant::now());
+                    }
                 },
                 Err(e) => match *last {
                     Some(_) => {
@@ -250,7 +307,13 @@ impl<A: ReferenceApi> StatusProvider<A> {
             }
             last.expect("set or kept above")
         };
-        Ok(pb::GetStatusResponse {
+        Ok(Self::response(fork_digest, sample, floor))
+    }
+
+    /// The Status of `sample` at `fork_digest`, its `earliest_available_slot` the column
+    /// `floor` if columns are served, else the head slot.
+    fn response(fork_digest: [u8; 4], sample: Sample, floor: Option<u64>) -> pb::GetStatusResponse {
+        pb::GetStatusResponse {
             fork_digest: fork_digest.to_vec(),
             finalized: Some(common::Checkpoint {
                 epoch: sample.finalized.epoch,
@@ -258,12 +321,8 @@ impl<A: ReferenceApi> StatusProvider<A> {
             }),
             head_root: sample.head.root.to_vec(),
             head_slot: sample.head.slot,
-            earliest_available_slot: self
-                .columns
-                .as_ref()
-                .and_then(|c| c.earliest_available_slot())
-                .unwrap_or(sample.head.slot),
-        })
+            earliest_available_slot: floor.unwrap_or(sample.head.slot),
+        }
     }
 }
 
@@ -505,6 +564,27 @@ mod tests {
         assert!(err.to_string().contains("names root"), "{err}");
     }
 
+    /// The provider is what `ReqRespService/GetStatus` serves ([`crate::reqresp::ChainStatus`]),
+    /// at the wall clock.
+    #[tokio::test]
+    async fn the_provider_is_the_status_get_status_serves() {
+        use crate::reqresp::ChainStatus;
+        let api: &'static Fixture = Box::leak(Box::default());
+        api.finalize(7, [7; 32], 224);
+        let provider = StatusProvider::new(api, sepolia(), DEFAULT_API_TIMEOUT);
+        let source: std::sync::Arc<dyn ChainStatus> = std::sync::Arc::new(provider);
+        let status = source.status().await.unwrap();
+        assert_eq!(status.head_root, [7; 32]);
+        assert_eq!(
+            (status.head_slot, status.earliest_available_slot),
+            (224, 224)
+        );
+        assert_eq!(status.fork_digest.len(), 4);
+        api.mode.store(FAILING, Ordering::SeqCst);
+        // An outage keeps the last good sample.
+        assert_eq!(source.status().await.unwrap().head_slot, 224);
+    }
+
     #[tokio::test]
     async fn the_clock_must_have_a_digest() {
         let chain = sepolia();
@@ -573,11 +653,11 @@ mod tests {
         let provider =
             StatusProvider::new(&api, chain.clone(), DEFAULT_API_TIMEOUT).serving_columns(server);
         let now = at_epoch(&chain, before);
-        // No column stored yet: the head slot, as before.
-        assert_eq!(
-            provider.status(now).await.unwrap().earliest_available_slot,
-            head
-        );
+        // No column stored yet: the slot it serves from at the earliest, cgc_set_slot, never
+        // the head slot below it (a peer asking from there would get `3`).
+        let empty = provider.status(now).await.unwrap();
+        assert_eq!(empty.earliest_available_slot, cgc_set_slot);
+        assert!(empty.earliest_available_slot > empty.head_slot);
         // Forward from cgc_set_slot: the first stored column slot is the slot cgc was set at.
         let store = |slot: u64, root: u8, link: BlockLink| {
             let columns: Vec<_> = custody
@@ -608,6 +688,88 @@ mod tests {
         assert_eq!(first_stored_column_slot(writer.reader()).unwrap(), first);
         let status = provider.status(now).await.unwrap();
         assert_eq!(status.earliest_available_slot, cgc_set_slot + 2);
+    }
+
+    /// With nothing stored, a finality watermark above `cgc_set_slot` is the floor: the slot
+    /// after it. A column store that cannot say what it serves gives no Status at all, never
+    /// a lower one.
+    #[tokio::test(start_paused = true)]
+    async fn the_advertised_floor_with_nothing_stored_and_without_a_store() {
+        use crate::reqresp::{ColumnServer, ColumnStore, ServeBudget, ServeClock};
+        use cl_chain_columns::ColumnWriter;
+        use consensus_types::primitives::U256;
+        use std::sync::Arc;
+        struct Always;
+        impl ServeClock for Always {
+            fn serve_range(&self) -> Option<(u64, u64)> {
+                Some((0, u64::MAX))
+            }
+            fn fork_digest(&self, _: u64) -> Option<[u8; 4]> {
+                Some([1, 2, 3, 4])
+            }
+        }
+        let chain = sepolia();
+        let (before, _) = digest_boundary(&chain);
+        let api = Fixture::default();
+        api.finalize(before - 2, [0xaa; 32], (before - 2) * 32);
+        let now = at_epoch(&chain, before);
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+        let server = || {
+            Arc::new(ColumnServer::new(
+                Arc::clone(&writer) as Arc<dyn ColumnStore>,
+                U256::MAX,
+                Arc::new(Always),
+                ServeBudget::default(),
+            ))
+        };
+        // No custody record: nothing to say what is served.
+        let provider =
+            StatusProvider::new(&api, chain.clone(), DEFAULT_API_TIMEOUT).serving_columns(server());
+        assert!(matches!(
+            provider.status(now).await,
+            Err(ProbeError::Unavailable(_))
+        ));
+        writer
+            .set_custody(&cl_chain_columns::CustodyRecord {
+                cgc: 4,
+                cgc_set_slot: 100,
+                metadata_seq: 0,
+                advertised_cgc: 4,
+            })
+            .unwrap();
+        assert_eq!(
+            provider.status(now).await.unwrap().earliest_available_slot,
+            100
+        );
+        writer.prune_finalized(130).unwrap();
+        assert_eq!(
+            provider.status(now).await.unwrap().earliest_available_slot,
+            131
+        );
+    }
+
+    /// Within `reusing_samples`' age a Status reuses the last good sample, so a Status read
+    /// fresh for every peer costs the reference API one call per age, not one per peer.
+    #[tokio::test(start_paused = true)]
+    async fn a_recent_sample_is_reused() {
+        let chain = sepolia();
+        let (before, _) = digest_boundary(&chain);
+        let api = Fixture::default();
+        api.finalize(before - 2, [0xaa; 32], (before - 2) * 32);
+        let now = at_epoch(&chain, before);
+        let provider = StatusProvider::new(&api, chain.clone(), DEFAULT_API_TIMEOUT)
+            .reusing_samples(Duration::from_secs(2));
+        provider.status(now).await.unwrap();
+        api.finalize(before - 1, [0xbb; 32], (before - 1) * 32);
+        let reused = provider.status(now).await.unwrap();
+        assert_eq!(
+            reused.head_root, [0xaa; 32],
+            "within its age: no new sample"
+        );
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let fresh = provider.status(now).await.unwrap();
+        assert_eq!(fresh.head_root, [0xbb; 32], "past its age: sampled again");
     }
 
     // The storage contract (`storage_contract`), end to end: a reference-API fixture server

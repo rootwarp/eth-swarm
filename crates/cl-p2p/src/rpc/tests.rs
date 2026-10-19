@@ -726,6 +726,73 @@ async fn our_status_goes_out_on_every_dial_and_conflicts_are_irrelevant() {
     );
 }
 
+/// A Status source that reads a fresh Status for each use, as the service's does from
+/// cl-chain: the cached one for judging, the next scripted read for each Status that goes out.
+struct FreshReads {
+    cached: StatusV2,
+    reads: std::sync::Mutex<Vec<Option<StatusV2>>>,
+}
+
+impl super::inbound::StatusSource for FreshReads {
+    fn status(&self) -> Option<StatusV2> {
+        Some(self.cached.clone())
+    }
+
+    fn fresh(&self) -> Option<super::inbound::StatusLookup> {
+        let next = self.reads.lock().unwrap().remove(0);
+        Some(Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            next
+        }))
+    }
+}
+
+#[tokio::test]
+async fn a_fresh_status_read_is_what_goes_out() {
+    // The cached Status is behind the store (earliest 10); each read says what it is now. An
+    // answer and a dial send the fresh read; a read that fails answers `2: ServerError`.
+    let at = |earliest_available_slot| StatusV2 {
+        earliest_available_slot,
+        ..status_with(DIGEST)
+    };
+    let source = FreshReads {
+        cached: at(10),
+        reads: std::sync::Mutex::new(vec![Some(at(50)), None, Some(at(60))]),
+    };
+    let cfg = ControlConfig {
+        status: Arc::new(source),
+        ..config(status_with(DIGEST), 1, 4)
+    };
+    let mut ours = Node::spawn(cfg).await;
+    let mut raw = RawPeer::new(1);
+    raw.connect(ours.addr.clone()).await;
+    let id = raw.send(ours.peer, Request::Status(status_with(DIGEST)));
+    match single(raw.outcome(id).await.unwrap()) {
+        ResponseChunk::Success(Response::Status(s)) => assert_eq!(s.earliest_available_slot, 50),
+        other => panic!("{other:?}"),
+    }
+    let id = raw.send(ours.peer, Request::Status(status_with(DIGEST)));
+    match single(raw.outcome(id).await.unwrap()) {
+        ResponseChunk::Error { code, .. } => assert_eq!(code, ResultCode::ServerError),
+        other => panic!("{other:?}"),
+    }
+    // A dial sends the next read; the dialed peer echoes it back.
+    let mut dialed = RawPeer::new(1);
+    let addr = dialed.listen().await;
+    ours.send(Cmd::Dial(addr));
+    let dialed_id = dialed.id();
+    let sent = tokio::select! {
+        () = dialed.run() => unreachable!(),
+        sent = ours.next("the dialed peer's echo", |seen| match seen {
+            Seen::Control(ControlEvent::Status { peer, status, .. }) if *peer == dialed_id => {
+                Some(status.clone())
+            }
+            _ => None,
+        }) => sent,
+    };
+    assert_eq!(sent.earliest_available_slot, 60);
+}
+
 #[tokio::test]
 async fn without_a_status_of_ours_nothing_is_judged() {
     // The source has no Status yet (cl-chain unreachable): an inbound Status is answered

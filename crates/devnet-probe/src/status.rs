@@ -134,6 +134,7 @@ pub async fn status<E: EthSpec>(
         // cl-p2p's own Ping cadence, at the plan's interval.
         ping_interval: plan.ping_interval,
         gossip: Some(first.fork_digest),
+        limits: cl_p2p::rpc::limits::RpcLimits::default(),
     };
     let mut swarm = match probe_swarm::<E>(devnet, ours.source(), swarm_plan) {
         Ok(swarm) => swarm,

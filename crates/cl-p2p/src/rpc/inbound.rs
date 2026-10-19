@@ -13,9 +13,12 @@
 //! # Answers
 //!
 //! - **Status** (`fulu/p2p-interface.md` L538–571): our Status from the [`StatusSource`]; with
-//!   none known yet `2: ServerError` (Status does not specify `3`). The peer's Status is then
-//!   judged ([`relevance`]), and [`ControlEvent::StatusAnswered`] follows once our Status was
-//!   written to its stream.
+//!   none known yet `2: ServerError` (Status does not specify `3`). A source that reads a fresh
+//!   Status ([`StatusSource::fresh`], the service's from cl-chain) is read once for every Status
+//!   we send or answer, so its `earliest_available_slot` never lags the column store; a read
+//!   that fails sends nothing and answers `2: ServerError`. The peer's Status is then judged
+//!   ([`relevance`], against the last known Status), and [`ControlEvent::StatusAnswered`]
+//!   follows once our Status was written to its stream.
 //! - **MetaData**: one snapshot of the [`MetaDataSource`] (cl-chain): its `seq_number` and the
 //!   fields it numbers, read together, so a `seq_number` bumped while an answer waits for its
 //!   token never pairs with fields of another one. The probe subscribes to no attestation or
@@ -91,7 +94,8 @@
 //!   away later pays for the whole answer as cut, as one that read it does.
 //!   Answers hold a place from the lookup until the stream's writer returns
 //!   ([`super::limits::ColumnPlaces`]): at most [`RpcLimits::max_column_answers`] (8) at once,
-//!   one per peer and [`RpcLimits::max_column_answers_per_ip`] (2) per IP, each at most
+//!   one per peer and [`RpcLimits::max_column_answers_per_ip`] (2) per address block (an IPv4
+//!   /24 or IPv6 /48, [`RpcLimits::column_answer_prefixes`]), each at most
 //!   [`RpcLimits::max_column_response_bytes`] (8 MiB) of SSZ, encoded one chunk at a time (an
 //!   estimated 68 MiB for all, see [`super::limits::DEFAULT_MAX_COLUMN_ANSWERS`]), and no more
 //!   than the whole blocks a requester reading those bytes per
@@ -255,9 +259,39 @@ pub const GOODBYE_FAULT: u64 = 3;
 /// [`status_from_chain`]). `None` while no good value is known: nothing is sent, and an
 /// inbound Status is answered `2: ServerError`.
 pub trait StatusSource: Send + Sync + 'static {
-    /// Our Status now.
+    /// Our Status now, as last known: what a peer's Status is judged against.
     fn status(&self) -> Option<StatusV2>;
+
+    /// A fresh read of our Status for one Status that goes out (sent on a dial, or answered),
+    /// if this source reads one: its `earliest_available_slot` is then what the column store
+    /// serves from at that moment, never a cached value the store has since passed. The read
+    /// bounds its own time; `None` from it means no Status: the request is answered
+    /// `2: ServerError` and nothing is sent. Without one (the default), [`Self::status`] goes
+    /// out at once.
+    fn fresh(&self) -> Option<StatusLookup> {
+        None
+    }
 }
+
+/// A fresh read of our Status ([`StatusSource::fresh`]).
+pub type StatusLookup = Pin<Box<dyn Future<Output = Option<StatusV2>> + Send>>;
+
+/// What a fresh Status read is for.
+enum StatusUse<E: EthSpec> {
+    /// Our Status to `peer`, on a dial.
+    Send(PeerId),
+    /// The answer to `peer`'s Status request.
+    Answer {
+        peer: PeerId,
+        protocol: Protocol,
+        request_id: InboundRequestId,
+        channel: ResponseChannel<Answer<E>>,
+        theirs: StatusV2,
+    },
+}
+
+/// A fresh Status read in flight, and what it is for.
+type StatusRead<E> = Pin<Box<dyn Future<Output = (StatusUse<E>, Option<StatusV2>)> + Send>>;
 
 /// Our MetaData, whose `seq_number` cl-chain owns (`ethswarm.chain.v1.ReqRespService/
 /// GetMetadata`).
@@ -615,8 +649,8 @@ struct Outgoing {
 #[derive(Debug, Clone)]
 struct PeerState {
     direction: Direction,
-    /// The bucket of its remote IP, for the per-IP column answer places.
-    ip: Option<crate::peer_caps::IpBucket>,
+    /// The address block of its remote IP, for the per-IP column answer places.
+    ip: Option<super::answer_bucket::AnswerBucket>,
     /// The verdict on its last judged Status.
     status_valid: Option<bool>,
     /// Its last judged Status.
@@ -746,6 +780,8 @@ pub struct Control<E: EthSpec> {
     /// The peers' Status requests we are answering with our Status, until the answer is sent
     /// ([`ControlEvent::StatusAnswered`]) or fails.
     status_answers: HashSet<InboundRequestId>,
+    /// Fresh Status reads in flight ([`StatusSource::fresh`]).
+    status_reads: FuturesUnordered<StatusRead<E>>,
     /// Column lookups open, each on its own task, each holding a place: `None` from one whose
     /// stream closed during it.
     lookups: FuturesUnordered<JoinHandle<Option<ColumnAnswer<E>>>>,
@@ -853,6 +889,7 @@ impl<E: EthSpec> Control<E> {
             timer: None,
             pending: VecDeque::new(),
             status_answers: HashSet::new(),
+            status_reads: FuturesUnordered::new(),
             lookups: FuturesUnordered::new(),
             places,
             column_queue: VecDeque::new(),
@@ -1072,8 +1109,14 @@ impl<E: EthSpec> Control<E> {
     }
 
     /// Sends our Status to `peer`; `false` (and nothing sent) while we have none, or if the
-    /// outbound queue IGNOREd it.
+    /// outbound queue IGNOREd it. A source that reads a fresh Status ([`StatusSource::fresh`])
+    /// sends it once the read ends: `true` means it was asked for.
     pub fn send_status(&mut self, peer: PeerId) -> bool {
+        if let Some(read) = self.cfg.status.fresh() {
+            self.status_reads
+                .push(Box::pin(async move { (StatusUse::Send(peer), read.await) }));
+            return true;
+        }
         let Some(ours) = self.cfg.status.status() else {
             tracing::debug!(%peer, "no Status of ours yet: none sent");
             return false;
@@ -1337,6 +1380,18 @@ impl<E: EthSpec> Control<E> {
         };
         match request {
             Request::Status(theirs) => {
+                if let Some(read) = self.cfg.status.fresh() {
+                    let to = StatusUse::Answer {
+                        peer,
+                        protocol,
+                        request_id,
+                        channel,
+                        theirs,
+                    };
+                    self.status_reads
+                        .push(Box::pin(async move { (to, read.await) }));
+                    return;
+                }
                 let answer = match self.cfg.status.status() {
                     Some(ours) => {
                         self.status_answers.insert(request_id);
@@ -1578,6 +1633,38 @@ impl<E: EthSpec> Control<E> {
                 permit,
             })
         }));
+    }
+
+    /// Sends or answers with every fresh Status read that ended.
+    fn poll_status_reads(&mut self, cx: &mut Context<'_>) {
+        while let Poll::Ready(Some((to, ours))) = self.status_reads.poll_next_unpin(cx) {
+            match to {
+                StatusUse::Send(peer) => match ours {
+                    Some(ours) if self.peers.contains_key(&peer) => {
+                        self.submit(peer, Request::Status(ours));
+                    }
+                    Some(_) => {}
+                    None => tracing::debug!(%peer, "no fresh Status of ours: none sent"),
+                },
+                StatusUse::Answer {
+                    peer,
+                    protocol,
+                    request_id,
+                    channel,
+                    theirs,
+                } => {
+                    let answer = match ours {
+                        Some(ours) => {
+                            self.status_answers.insert(request_id);
+                            success_chunk(Response::Status(ours))
+                        }
+                        None => error_chunk(ResultCode::ServerError, "status unavailable"),
+                    };
+                    self.respond(peer, protocol, channel, answer);
+                    self.judge(peer, theirs, StatusVia::Request);
+                }
+            }
+        }
     }
 
     /// Sends every column answer whose lookup ended, at its booked tokens, holding its place.
@@ -1923,7 +2010,11 @@ impl<E: EthSpec> NetworkBehaviour for Control<E> {
                     c.peer_id,
                     PeerState {
                         direction,
-                        ip: crate::peer_caps::IpBucket::of(c.endpoint.get_remote_address()),
+                        ip: self
+                            .cfg
+                            .limits
+                            .column_answer_prefixes
+                            .of(c.endpoint.get_remote_address()),
                         status_valid: None,
                         status: None,
                         metadata_seq: None,
@@ -1983,6 +2074,7 @@ impl<E: EthSpec> NetworkBehaviour for Control<E> {
             // Lookups the pump starts are polled right after, so their tasks can wake us.
             self.pump_columns(cx);
             self.poll_lookups(cx);
+            self.poll_status_reads(cx);
             if let Some(next) = self.pending.pop_front() {
                 return Poll::Ready(next);
             }

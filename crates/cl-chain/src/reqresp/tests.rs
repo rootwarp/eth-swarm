@@ -1048,3 +1048,92 @@ async fn the_service_refuses_exactly_what_the_bounds_refuse() {
         }
     }
 }
+
+/// The link of the GetStatus tests: one Gloas digest from genesis.
+fn status_link() -> Link {
+    use ipc::envelope::DigestTable;
+    use network_config::{ForkSchedule, ScheduledFork};
+    let at = |epoch| ScheduledFork {
+        version: [7, 0, 0, 0],
+        epoch,
+    };
+    let hello = common::Hello {
+        api_version: 1,
+        min_api_version: 1,
+        max_api_version: 1,
+        ..Default::default()
+    };
+    let digests = DigestTable::new(vec![(0, ForkName::Gloas, [0x61, 0x0a, 0x50, 0x01])]).unwrap();
+    Link::new::<consensus_types::Mainnet>(
+        hello,
+        1,
+        ForkSchedule::new(at(0), at(0)).unwrap(),
+        digests,
+    )
+}
+
+/// A Status source answering from its list, one entry per call.
+struct ScriptedStatus(
+    std::sync::Mutex<Vec<Result<pb::GetStatusResponse, crate::probe::ProbeError>>>,
+);
+
+impl ChainStatus for ScriptedStatus {
+    fn status(&self) -> StatusLookup<'_> {
+        let next = self.0.lock().unwrap().remove(0);
+        Box::pin(async move { next })
+    }
+}
+
+fn a_status() -> pb::GetStatusResponse {
+    pb::GetStatusResponse {
+        fork_digest: vec![0x61, 0x0a, 0x50, 0x01],
+        finalized: Some(common::Checkpoint {
+            epoch: 3,
+            root: vec![0xaa; 32],
+        }),
+        head_root: vec![0xaa; 32],
+        head_slot: 96,
+        earliest_available_slot: 120,
+    }
+}
+
+/// `GetStatus` serves the Status source it is given (the probe's `StatusProvider`, its
+/// `earliest_available_slot` the column server's), `UNAVAILABLE` while the source has none,
+/// and is the stub (`UNIMPLEMENTED`) without a source.
+#[tokio::test]
+async fn get_status_serves_the_status_source() {
+    let (_dir, writer) = store();
+    let columns = Arc::new(ColumnServer::new(
+        Arc::new(writer) as Arc<dyn ColumnStore>,
+        U256::MAX,
+        Arc::new(Fixed),
+        ServeBudget::default(),
+    ));
+    let stub = ReqRespServer::new(status_link(), Arc::clone(&columns));
+    let err = stub
+        .get_status(Request::new(pb::GetStatusRequest {}))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unimplemented);
+
+    let source = ScriptedStatus(std::sync::Mutex::new(vec![
+        Ok(a_status()),
+        Err(crate::probe::ProbeError::Unavailable(
+            "no sample yet".into(),
+        )),
+    ]));
+    let served = ReqRespServer::new(status_link(), columns).serving_status(Arc::new(source));
+    assert!(format!("{stub:?}").contains("serves_status: false"));
+    assert!(format!("{served:?}").contains("serves_status: true"));
+    let got = served
+        .get_status(Request::new(pb::GetStatusRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(got, a_status());
+    let err = served
+        .get_status(Request::new(pb::GetStatusRequest {}))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unavailable);
+}

@@ -11,7 +11,7 @@ use cl_chain::probe::ProbeChain;
 use cl_p2p::m2a_session::PinnedPeer;
 use consensus_types::{EthSpec, Mainnet, Minimal};
 use libp2p::multiaddr::Protocol;
-use network_config::digest::{compute_fork_digest, current_epoch, digest_schedule, DigestError};
+use network_config::digest::{compute_fork_digest, current_epoch, DigestError};
 use network_config::{ChainConfig, Epoch, Genesis};
 use p2p_wire::enr::ForkFields;
 use p2p_wire::rpc::codec::ContextTable;
@@ -138,15 +138,12 @@ impl Devnet {
         compute_fork_digest(&self.config, &self.genesis.genesis_validators_root, epoch).ok()
     }
 
-    /// Fork digest to fork, for every digest of the schedule: the context bytes the codec
-    /// decodes block responses by.
+    /// Fork digest to fork, for every digest of the schedule (the context bytes the codec
+    /// decodes responses by), and the devnet's caps, which every column sidecar is read and
+    /// served under ([`cl_p2p::rpc::network_context_table`]).
     #[must_use]
     pub fn context_table(&self) -> ContextTable {
-        let mut table = ContextTable::new();
-        for entry in digest_schedule(&self.config, &self.genesis.genesis_validators_root) {
-            table.insert(entry.fork_digest, entry.fork);
-        }
-        table
+        cl_p2p::rpc::network_context_table(&self.config, &self.genesis.genesis_validators_root)
     }
 
     /// The chain probe mode's Status provider builds our Status for.
@@ -338,6 +335,13 @@ mod tests {
         for entry in &schedule {
             assert_eq!(table.fork(&entry.fork_digest), Some(entry.fork));
         }
+        // The devnet's caps: without them every column answer is `2: ServerError`.
+        assert_eq!(
+            table.network_caps(),
+            Some(&consensus_types::caps::NetworkCaps::from_config(
+                devnet.config()
+            ))
+        );
         let chain = devnet.probe_chain();
         assert_eq!(chain.slots_per_epoch, 8);
         assert_eq!(chain.genesis, genesis());

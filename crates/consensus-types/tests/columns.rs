@@ -102,6 +102,9 @@ fn column_sidecar_max_size() {
         )
         .unwrap();
         assert_eq!(by_slot, DataColumnSidecar::Gloas(sidecar));
+        // Its slot, read without decoding it: what a digest check needs first.
+        assert_eq!(DataColumnSidecar::<Mainnet>::peek_slot(&bytes), Ok(slot));
+        assert!(DataColumnSidecar::<Mainnet>::peek_slot(&bytes[..7]).is_err());
 
         // One byte more is refused before decoding.
         let mut over = bytes;

@@ -105,8 +105,11 @@ protocols offered: any other fails multistream-select negotiation, among them th
     a booking behind it up. A reset gives back nothing.
   - **Places** (`rpc::limits::ColumnPlaces`): at most 8 column answers held at once
     (`RpcLimits::max_column_answers` \[est\], as many as cl-chain's reads), one per peer and 2
-    per IP (`max_column_answers_per_ip` \[est\]), from the lookup until the stream's writer
-    returns. Each holds at most 8 MiB of SSZ (`MAX_COLUMN_RESPONSE_BYTES` \[est\]) and is
+    per address block (`max_column_answers_per_ip` \[est\]), from the lookup until the stream's
+    writer returns. An address block is an IPv4 /24 or an IPv6 /48
+    (`RpcLimits::column_answer_prefixes`, `rpc::answer_bucket` \[est\]), and an IPv4-mapped IPv6
+    address counts as its IPv4 address, so one host cannot take more places by using
+    neighbouring addresses. Peers of one devnet network (one /24) share their 2 places too. Each holds at most 8 MiB of SSZ (`MAX_COLUMN_RESPONSE_BYTES` \[est\]) and is
     encoded one chunk at a time: an estimated 8.5 MiB per answer with its copies, about 68 MiB
     in all (`rpc_column_answers`, `rpc_column_answer_bytes`). A due chunk not written within
     1 s (`column_write_deadline` \[est\]) resets its stream and frees the place, so a requester
@@ -120,6 +123,24 @@ protocols offered: any other fails multistream-select negotiation, among them th
     `2: ServerError`.
   - **Answer budget**: an answer is cut at the last whole block within its sidecars and its
     8 MiB (the first block always goes), the rule cl-chain cuts by too.
+  - **Residual: a requester that half-closes, then drops its stream.** A rust-libp2p
+    requester that closes its write side and then drops the stream is not seen until our first
+    data frame reaches it, so its answer is booked, looked up and cut as for any requester, and
+    it pays for the whole cut answer, never less than an honest reader. Seeing it earlier needs
+    a request-response handler that watches the stream while the lookup runs; until then this
+    stays as is.
+  - **Wiring** (`devnet-probe serve`): cl-chain serves `ReqRespService` (`GetStatus`,
+    `DataColumnsByRange`, `DataColumnsByRoot`) on its own Unix socket behind its method ACL,
+    which lets only the caller `cl-p2p` call those three; the swarm's `ChainColumns` and
+    `rpc::chain_status::ChainStatusSource` connect to it through `ipc::uds`'s peer-checked
+    connector. Our Status is read from `GetStatus` afresh for every Status we send or answer
+    (`StatusSource::fresh`), so its `earliest_available_slot` never lags the store; a read that
+    fails or passes its 2 s deadline sends no Status and answers `2: ServerError`, never the
+    cached one. The cached Status (refreshed every 12 s, each call within the same deadline)
+    is what a peer's Status is judged against. Every table built for serving comes from
+    `rpc::network_context_table` and carries the network's caps
+    (`NetworkCaps::from_config`): without them every column answer would be
+    `2: ServerError`.
 - **Rejects**: a request that breaks the wire format gets `1: InvalidRequest` (a Goodbye's
   too), and so does a
   `BeaconBlocksByRange` request with `step` 0 or a `count` above `MAX_REQUEST_BLOCKS_DENEB` (128;
