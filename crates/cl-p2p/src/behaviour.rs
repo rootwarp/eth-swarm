@@ -65,8 +65,8 @@ impl Default for ConnectionCaps {
 /// The preset the probe decodes with: every network it joins (Sepolia, Hoodi) is mainnet.
 pub type ProbeSpec = consensus_types::Mainnet;
 
-/// The req/resp slot of [`Behaviour`]: Status, MetaData, Ping, Goodbye (and BlocksByRange,
-/// answered `3: ResourceUnavailable`).
+/// The req/resp slot of [`Behaviour`]: Status, MetaData, Ping, Goodbye, BlocksByRange
+/// (answered `3: ResourceUnavailable`) and the custody columns by range and by root.
 pub type ReqRespSlot = Control<ProbeSpec>;
 
 /// The gossipsub slot: ignore-all gossipsub, or nothing.

@@ -25,9 +25,22 @@
 //! - `head_root`, `head_slot`: the finalized block's header (`/eth/v1/beacon/headers/{root}`).
 //!   The probe advertises the newest block it can vouch for, not the reference node's head: it
 //!   imports nothing past finality, so a later head would claim blocks it cannot serve.
-//! - `earliest_available_slot`: `head_slot` until the probe serves a range of its own; then
-//!   [`earliest_servable_slot`] (the highest of the first stored slot, the slot after the
-//!   finalized-slot watermark and `cgc_set_slot`), never the first stored slot alone.
+//! - `earliest_available_slot`: once the probe serves its custody columns
+//!   ([`StatusProvider::serving_columns`]), the slot it serves them from
+//!   ([`crate::reqresp::ColumnServer::earliest_available_slot`]): [`earliest_servable_slot`],
+//!   the highest of the first stored column slot, the slot after the finalized-slot watermark,
+//!   `cgc_set_slot` and the store's contiguous-from slot, never the first stored slot alone (a
+//!   historical minimum that pruning leaves below the data). A node storing forward from the
+//!   slot its `cgc` was set at advertises that slot (`fulu/p2p-interface.md` L552–561,
+//!   `fulu/validator.md` L173–175). Until a column is stored, and without a column store,
+//!   `head_slot`.
+//!
+//!   **Deviation: it may sit above `head_slot`.** The probe's head is its finalized block, two
+//!   to three epochs behind the wall clock, while it stores columns from the slot it started
+//!   at, so for those epochs after a first start `earliest_available_slot > head_slot`. The spec
+//!   defines it as "The slot of earliest available block" (L558–559) and states no relation to
+//!   `head_slot`; clamping it to `head_slot + 1` would claim slots the probe cannot serve, so it
+//!   is not clamped.
 //!
 //! Each [`StatusProvider::status`] samples the API under a bounded timeout. A sample that fails
 //! or times out (an outage) keeps the last good one; with none yet, the Status is
@@ -143,12 +156,19 @@ impl Sample {
     }
 }
 
+/// The slot the probe serves its custody columns from, for the Status.
+pub trait ServedColumns: Send + Sync {
+    /// `earliest_available_slot` while columns are served; `None` while none is.
+    fn earliest_available_slot(&self) -> Option<u64>;
+}
+
 /// Builds the probe's Status from the wall clock and the reference API (see the module docs).
 pub struct StatusProvider<A> {
     api: A,
     chain: ProbeChain,
     timeout: Duration,
     last_good: Mutex<Option<Sample>>,
+    columns: Option<std::sync::Arc<dyn ServedColumns>>,
 }
 
 impl<A: ReferenceApi> StatusProvider<A> {
@@ -159,7 +179,15 @@ impl<A: ReferenceApi> StatusProvider<A> {
             chain,
             timeout,
             last_good: Mutex::new(None),
+            columns: None,
         }
+    }
+
+    /// The same provider, its `earliest_available_slot` the slot `columns` serves from.
+    #[must_use]
+    pub fn serving_columns(mut self, columns: std::sync::Arc<dyn ServedColumns>) -> Self {
+        self.columns = Some(columns);
+        self
     }
 
     /// The finalized checkpoint and its block, if the API gives both in time and they agree.
@@ -230,7 +258,11 @@ impl<A: ReferenceApi> StatusProvider<A> {
             }),
             head_root: sample.head.root.to_vec(),
             head_slot: sample.head.slot,
-            earliest_available_slot: sample.head.slot,
+            earliest_available_slot: self
+                .columns
+                .as_ref()
+                .and_then(|c| c.earliest_available_slot())
+                .unwrap_or(sample.head.slot),
         })
     }
 }
@@ -489,6 +521,93 @@ mod tests {
             provider.status(at_epoch(&chain, 0)).await,
             Err(ProbeError::Clock(DigestError::BeforeFulu { .. }))
         ));
+    }
+
+    /// Exit 9c: with the custody columns served, Status v2 `earliest_available_slot` is the first
+    /// stored column slot, which for a node storing forward from its `cgc` is the slot `cgc` was
+    /// set at (`fulu/p2p-interface.md` L552–561, `fulu/validator.md` L173–175).
+    #[tokio::test(start_paused = true)]
+    async fn earliest_available_slot_is_the_first_stored_column_slot() {
+        use crate::da::custody::{Advertise, Custody, EnrCgc, EnrError};
+        use crate::reqresp::{ColumnServer, ColumnStore, ServeBudget, ServeClock};
+        use cl_chain_columns::{BlockLink, Column, ColumnWriter};
+        use consensus_types::primitives::U256;
+        use std::sync::Arc;
+        struct NoEnr;
+        impl EnrCgc for NoEnr {
+            fn set_cgc(&mut self, _: u64) -> Result<(), EnrError> {
+                Ok(())
+            }
+        }
+        struct Always;
+        impl ServeClock for Always {
+            fn serve_range(&self) -> Option<(u64, u64)> {
+                Some((0, u64::MAX))
+            }
+            fn fork_digest(&self, _: u64) -> Option<[u8; 4]> {
+                Some([1, 2, 3, 4])
+            }
+        }
+        let chain = sepolia();
+        let (before, _) = digest_boundary(&chain);
+        let api = Fixture::default();
+        let head = (before - 2) * 32;
+        api.finalize(before - 2, [0xaa; 32], head);
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+        let cgc_set_slot = head + 40;
+        let custody = Custody::open(
+            Arc::clone(&writer),
+            NoEnr,
+            U256::MAX,
+            Advertise::Custody,
+            cgc_set_slot,
+        )
+        .unwrap();
+        let server = Arc::new(ColumnServer::new(
+            Arc::clone(&writer) as Arc<dyn ColumnStore>,
+            U256::MAX,
+            Arc::new(Always),
+            ServeBudget::default(),
+        ));
+        let provider =
+            StatusProvider::new(&api, chain.clone(), DEFAULT_API_TIMEOUT).serving_columns(server);
+        let now = at_epoch(&chain, before);
+        // No column stored yet: the head slot, as before.
+        assert_eq!(
+            provider.status(now).await.unwrap().earliest_available_slot,
+            head
+        );
+        // Forward from cgc_set_slot: the first stored column slot is the slot cgc was set at.
+        let store = |slot: u64, root: u8, link: BlockLink| {
+            let columns: Vec<_> = custody
+                .custody_columns()
+                .into_iter()
+                .map(|index| Column {
+                    index,
+                    ssz: b"sidecar",
+                })
+                .collect();
+            writer
+                .write_block_columns(slot, &[root; 32], link, &columns)
+                .unwrap();
+        };
+        store(cgc_set_slot + 3, 2, BlockLink::Parent([1; 32]));
+        store(cgc_set_slot, 1, BlockLink::Start);
+        let first = first_stored_column_slot(writer.reader()).unwrap();
+        assert_eq!(first, Some(cgc_set_slot));
+        let status = provider.status(now).await.unwrap();
+        assert_eq!(status.earliest_available_slot, cgc_set_slot);
+        assert_eq!(Some(status.earliest_available_slot), first);
+        assert_eq!(custody.cgc_set_slot(), status.earliest_available_slot);
+        // Above the head the probe advertises (its finalized block): see the module docs.
+        assert!(status.earliest_available_slot > status.head_slot);
+        // Finality prunes the first block: the first stored slot stays, the Status moves on to
+        // the slot after the watermark, which the store can still serve.
+        writer.prune_finalized(cgc_set_slot + 1).unwrap();
+        assert_eq!(first_stored_column_slot(writer.reader()).unwrap(), first);
+        let status = provider.status(now).await.unwrap();
+        assert_eq!(status.earliest_available_slot, cgc_set_slot + 2);
     }
 
     // The storage contract (`storage_contract`), end to end: a reference-API fixture server
@@ -1247,6 +1366,122 @@ mod tests {
             Some(17)
         );
         assert_eq!(s.writer.reader().slot_of(&root).unwrap(), None);
+    }
+
+    /// Each stored block is linked to the stored blob-carrying block before it on its chain,
+    /// through blocks without blobs, and a blob-carrying block that is not held is a gap that
+    /// raises the contiguous-from slot.
+    #[tokio::test]
+    async fn blocks_are_stored_with_their_chain_link() {
+        use crate::testing::gloas_block_on;
+        use cl_chain_columns::BlockLink;
+        let cgc_set_slot = 16;
+        let s = store_with(cgc_set_slot, &[], IngestLimits::default()).await;
+        let b = blobs();
+        let serve = |slot, commitments: &[[u8; 48]], parent| {
+            let (_, ssz, root) = gloas_block_on(slot, commitments, parent);
+            s.reference.serve(root, slot, ssz);
+            root
+        };
+        // Below cgc_set_slot: nothing before it is to be held.
+        let old = serve(15, &b.commitments, [0x0f; 32]);
+        let b17 = serve(17, &b.commitments, old);
+        let b18 = serve(18, &b.commitments, b17);
+        // 19 carries no blobs: 20 links to 18 through it.
+        let e19 = serve(19, &[], b18);
+        let b20 = serve(20, &b.commitments, e19);
+        // 21 carries blobs but none of its columns arrive: 22 is a gap.
+        let m21 = serve(21, &b.commitments, b20);
+        let b22 = serve(22, &b.commitments, m21);
+        for (root, slot) in [(b17, 17), (b18, 18), (b20, 20), (b22, 22)] {
+            s.store(&column_at(root, slot, CUSTODY_COLUMN)).await;
+        }
+        let reader = s.writer.reader();
+        assert_eq!(reader.link_of(&b17).unwrap(), Some(BlockLink::Start));
+        assert_eq!(reader.link_of(&b18).unwrap(), Some(BlockLink::Parent(b17)));
+        assert_eq!(reader.link_of(&b20).unwrap(), Some(BlockLink::Parent(b18)));
+        // 21's columns may still come: 22 waits for it, and raises nothing yet.
+        assert_eq!(reader.link_of(&b22).unwrap(), Some(BlockLink::Pending(m21)));
+        assert_eq!(reader.contiguous_from().unwrap(), None);
+        // A parent the reference does not know: a gap at once. Once the store is past 22 by
+        // the pending wait, 22 is settled as a gap too.
+        let lost = serve(30, &b.commitments, [0x5e; 32]);
+        s.store(&column_at(lost, 30, CUSTODY_COLUMN)).await;
+        assert_eq!(reader.link_of(&lost).unwrap(), Some(BlockLink::Gap));
+        assert_eq!(reader.link_of(&b22).unwrap(), Some(BlockLink::Gap));
+        assert_eq!(reader.contiguous_from().unwrap(), Some(30));
+    }
+
+    /// A child checked or written before its parent still links to it, whichever comes first:
+    /// the link is decided on the writer thread, and a child waits for a parent on its way.
+    #[tokio::test]
+    async fn a_parent_and_child_released_together_link_in_either_order() {
+        use crate::testing::gloas_block_on;
+        use cl_chain_columns::BlockLink;
+        let b = blobs();
+        for order in ["parent-first", "child-first", "together"] {
+            let limits = IngestLimits {
+                root_wait: Duration::from_secs(10),
+                root_retry: Duration::from_millis(20),
+                retries_per_sec: 1000,
+                ..IngestLimits::default()
+            };
+            let s = store_with(16, &[], limits).await;
+            let (_, old_ssz, old) = gloas_block_on(15, &b.commitments, [0x0f; 32]);
+            let (_, parent_ssz, parent) = gloas_block_on(17, &b.commitments, old);
+            let (_, child_ssz, child) = gloas_block_on(18, &b.commitments, parent);
+            s.reference.serve(old, 15, old_ssz);
+            let parent_column = column_at(parent, 17, CUSTODY_COLUMN);
+            let child_column = column_at(child, 18, CUSTODY_COLUMN);
+            match order {
+                "parent-first" => {
+                    s.reference.serve(parent, 17, parent_ssz);
+                    s.reference.serve(child, 18, child_ssz);
+                    s.store(&parent_column).await;
+                    s.store(&child_column).await;
+                }
+                "child-first" => {
+                    s.reference.serve(parent, 17, parent_ssz);
+                    s.reference.serve(child, 18, child_ssz);
+                    s.store(&child_column).await;
+                    assert_eq!(
+                        s.writer.reader().link_of(&child).unwrap(),
+                        Some(BlockLink::Pending(parent))
+                    );
+                    s.store(&parent_column).await;
+                }
+                _ => {
+                    // Both wait for their roots, and are released at once.
+                    s.gossip(&child_column);
+                    s.gossip(&parent_column);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    s.reference.serve(child, 18, child_ssz);
+                    s.reference.serve(parent, 17, parent_ssz);
+                    let want = [
+                        child_column.sidecar.as_ssz_bytes(),
+                        parent_column.sidecar.as_ssz_bytes(),
+                    ];
+                    settle("both columns to be stored", || {
+                        s.stored(&child_column).as_ref() == Some(&want[0])
+                            && s.stored(&parent_column).as_ref() == Some(&want[1])
+                            && s.ingest.pending() == 0
+                    })
+                    .await;
+                }
+            }
+            let reader = s.writer.reader();
+            assert_eq!(
+                reader.link_of(&parent).unwrap(),
+                Some(BlockLink::Start),
+                "{order}"
+            );
+            assert_eq!(
+                reader.link_of(&child).unwrap(),
+                Some(BlockLink::Parent(parent)),
+                "{order}"
+            );
+            assert_eq!(reader.contiguous_from().unwrap(), None, "{order}");
+        }
     }
 
     #[tokio::test]

@@ -1,8 +1,9 @@
 //! The harness behind the fuzz targets, shared with the corpus tests and the seed generator.
 //!
 //! Each target feeds peer bytes to the exact entry point the binaries run on them, with the
-//! mainnet preset (the session's and the probe's) and the fixture [`ContextTable`] (no network
-//! config runs on peer bytes, so none runs here either). A decode error is the expected outcome
+//! mainnet preset (the session's and the probe's) and the fixture [`ContextTable`] with the
+//! preset's column-sidecar caps (no network config runs on peer bytes, so none runs here
+//! either; the caps let the column protocols' sidecars decode, `from_ssz_bytes_for_fork_with`). A decode error is the expected outcome
 //! for most inputs; what must never happen is a panic, an allocation past the libFuzzer limits
 //! the gates set, or an accepted input that breaks one of the invariants below.
 //!
@@ -16,8 +17,9 @@
 //! - an accepted chunk's payload decodes on its own through `decode_chunk` (with the bound of
 //!   its result code and context), and the decoded value re-encodes to exactly those SSZ bytes;
 //! - the scanner agrees with the decoder: an accepted chunk scans as complete at its full length;
-//! - a success chunk decodes to the protocol's own response type, a block in the fork its
-//!   context bytes name, and an error chunk carries the result byte it was sent with;
+//! - a success chunk decodes to the protocol's own response type, a block or a column sidecar
+//!   in the fork its context bytes name, and an error chunk carries the result byte it was sent
+//!   with;
 //! - the codec accepts a response exactly when the chunk decoder accepts it (and returns that
 //!   chunk), and a request exactly when the request decoder does (and returns that request);
 //! - a `BeaconBlocksByRange` response holds at most the request's chunk limit, an error chunk
@@ -79,10 +81,10 @@ pub const GOODBYE_BIT: u8 = 1;
 /// protocol, clear the response to our request.
 pub const REQUEST_BIT: u8 = 2;
 
-/// The fixture context table: Fulu (two digests) and Gloas.
+/// The fixture context table: Fulu (two digests) and Gloas, with the preset's column caps.
 pub fn contexts() -> &'static ContextTable {
     static TABLE: OnceLock<ContextTable> = OnceLock::new();
-    TABLE.get_or_init(p2p_wire::testkit::context_table)
+    TABLE.get_or_init(p2p_wire::testkit::column_context_table)
 }
 
 /// Runs target `name` on `data`; `false` if there is no such target.
@@ -320,7 +322,7 @@ fn payload(chunk: &[u8], protocol: Protocol) -> Vec<u8> {
         (1, protocol.error_max_len())
     } else if protocol.has_context_bytes() {
         let fork = contexts().fork(&digest(chunk));
-        let max = protocol.response_max_len::<E>(fork);
+        let max = protocol.response_max_len_with::<E>(fork, contexts().network_caps());
         (1 + CONTEXT_BYTES_LEN, max.expect("a known context"))
     } else {
         let max = protocol.response_max_len::<E>(None);
@@ -356,6 +358,17 @@ pub(crate) fn check_chunk(chunk: &[u8], protocol: Protocol, decoded: &ResponseCh
                         "block decoded in another fork than its context names"
                     );
                     block.as_ssz_bytes()
+                }
+                (
+                    Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1,
+                    Response::DataColumn(sidecar),
+                ) => {
+                    assert_eq!(
+                        Some(sidecar.fork_name()),
+                        contexts().fork(&digest(chunk)),
+                        "sidecar decoded in another fork than its context names"
+                    );
+                    sidecar.as_ssz_bytes()
                 }
                 (protocol, response) => panic!("a {protocol} chunk decoded to {response:?}"),
             }

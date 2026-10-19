@@ -6,6 +6,7 @@
 //! through the production codec and answers what the test tells it to (or nothing), and
 //! [`bytes_peer`] writes whatever bytes a test gives it, or holds its stream open and silent.
 
+mod columns;
 mod limits;
 
 use super::codec::{Answer, Deadline, Deadlines, ReceivedChunk, RpcRequest};
@@ -384,7 +385,7 @@ impl RawPeer {
     /// A peer with the node key `key`.
     fn with_key(key: Keypair, seq_number: u64) -> Self {
         let protocols = Protocols::new(
-            Arc::new(p2p_wire::testkit::context_table()),
+            Arc::new(p2p_wire::testkit::column_context_table()),
             Deadlines::default(),
             None,
         );
@@ -450,7 +451,9 @@ impl RawPeer {
             | ProtocolsEvent::Metadata(e)
             | ProtocolsEvent::Ping(e)
             | ProtocolsEvent::Goodbye(e)
-            | ProtocolsEvent::BlocksByRange(e) => e,
+            | ProtocolsEvent::BlocksByRange(e)
+            | ProtocolsEvent::DataColumnsByRange(e)
+            | ProtocolsEvent::DataColumnsByRoot(e) => e,
         };
         match event {
             DuplexEvent::Inbound(Event::Message {
@@ -1176,7 +1179,7 @@ async fn unadvertised_protocols_fail_negotiation() {
         "/eth2/beacon_chain/req/status/1/ssz_snappy",
         "/eth2/beacon_chain/req/metadata/2/ssz_snappy",
         "/eth2/beacon_chain/req/beacon_blocks_by_root/2/ssz_snappy",
-        "/eth2/beacon_chain/req/data_column_sidecars_by_range/1/ssz_snappy",
+        "/eth2/beacon_chain/req/data_column_sidecars_by_range/2/ssz_snappy",
         "/eth2/beacon_chain/req/execution_payload_envelopes_by_range/1/ssz_snappy",
     ] {
         let mut peer = bytes_peer(protocol);

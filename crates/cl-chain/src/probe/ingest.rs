@@ -41,7 +41,21 @@
 //!    stalled cl-verify cannot make the queue hold more than both budgets.
 //! 5. **The storage contract** ([`super::storage_contract`]): root, commitments, KZG through
 //!    cl-verify.
-//! 6. **The write**, on the [`WRITER_THREAD`] thread: the columns of one block that the writer
+//! 6. **The link** ([`BlockLink`]): how the block ties to the stored block before it on its
+//!    chain, from the parent roots of the blocks the reference vouches for. The column's task
+//!    finds the nearest ancestor that is stored or carries blobs, passing through ancestors
+//!    without blobs (they have no columns), at most [`MAX_LINK_WALK`] blocks back, and hands it
+//!    to the writer as [`BlockLink::Pending`]. An ancestor before `cgc_set_slot` or at or below
+//!    the finalized watermark is [`BlockLink::Start`]; one the reference cannot vouch for, or a
+//!    walk past its bound, is [`BlockLink::Gap`]. The writer decides at write time, after every
+//!    earlier batch committed: an ancestor stored by then is the block's
+//!    [`BlockLink::Parent`]; one not stored yet leaves the block pending, and it links as soon
+//!    as the ancestor's columns are written, so a parent and child released together link
+//!    whatever order they are written in. A block still pending once the store is
+//!    [`PENDING_LINK_SLOTS`] past it is settled as a [`BlockLink::Gap`]
+//!    ([`ColumnWriter::settle_pending`]), and the store's contiguous-from slot rises to it
+//!    ([`ColumnReader::contiguous_from`]): the Status never claims the slots before a gap.
+//! 7. **The write**, on the [`WRITER_THREAD`] thread: the columns of one block that the writer
 //!    takes off its queue together, in one [`ColumnWriter::write_columns`] call, which commits
 //!    them in transactions of at most
 //!    [`MAX_COLUMNS_PER_TXN`](cl_chain_columns::MAX_COLUMNS_PER_TXN) (16) at the column env's
@@ -61,10 +75,10 @@
 
 use super::column::{local_check, vouched_contract, ColumnContract, ColumnMetrics, Drop};
 use super::root_wait::{Answer, RootWaits};
-use super::{BlockApi, GossipColumn, RefError, RefLimits, RefView, ReferenceApi, Root};
+use super::{BlockApi, GossipColumn, RefBlock, RefError, RefLimits, RefView, ReferenceApi, Root};
 use crate::da::custody::Custody;
 use crate::verify::client::{Held, KzgVerifier};
-use cl_chain_columns::{Column, ColumnReader, ColumnWriter, WriteReport};
+use cl_chain_columns::{BlockLink, Column, ColumnReader, ColumnWriter, WriteReport};
 use consensus_types::primitives::Slot;
 use consensus_types::{gloas, EthSpec};
 use ethswarm_proto::common::Verdict;
@@ -121,6 +135,14 @@ pub const DEFAULT_RETRIES_PER_SEC: u32 = 32;
 /// one [`DEFAULT_ROOT_WAIT`], so a peer resending columns of a made-up root costs no request
 /// for that long.
 pub const DEFAULT_UNKNOWN_ROOT_TTL: Duration = DEFAULT_ROOT_WAIT;
+
+/// How many blocks without blobs a column's chain link passes through at most \[est\]: two
+/// epochs. Past it the block is a gap.
+pub const MAX_LINK_WALK: usize = 64;
+
+/// How many slots past a pending block the store writes before the block is settled as a gap
+/// \[est\]: four slots (48 s), far past the root wait (4 s) a late parent's columns can take.
+pub const PENDING_LINK_SLOTS: u64 = 4;
 
 /// The name of the thread that writes the column env.
 pub const WRITER_THREAD: &str = "columns-writer";
@@ -359,25 +381,32 @@ pub fn first_stored_column_slot(
 
 /// The lowest slot the column store may claim to serve: the highest of `first_stored_slot`
 /// ([`first_stored_column_slot`]), the slot after the finalized-slot watermark
-/// (`finalized_slot`, [`ColumnReader::finalized_slot`]: everything at or below it is pruned) and
-/// `cgc_set_slot` (columns before it are of a smaller custody). `None` while nothing was stored,
-/// or if the watermark is the last slot. The Status `earliest_available_slot`, once the probe
-/// serves columns, is this value.
+/// (`finalized_slot`, [`ColumnReader::finalized_slot`]: everything at or below it is pruned),
+/// `cgc_set_slot` (columns before it are of a smaller custody) and `contiguous_from`
+/// ([`ColumnReader::contiguous_from`]: a blob-carrying block before it is not held, after
+/// downtime or a block whose columns all missed gossip). `None` while nothing was stored, or if
+/// the watermark is the last slot. The Status `earliest_available_slot`, once the probe serves
+/// columns, is this value.
 ///
 /// Still not proof that every custody column from there on is held: a block whose columns
-/// partly failed to arrive, or a later reorg prune, leaves gaps. A range request is answered
-/// from what is stored.
+/// partly arrived is stored, and a range answer ends before it (`crate::reqresp`).
 #[must_use]
 pub fn earliest_servable_slot(
     first_stored_slot: Option<Slot>,
     finalized_slot: Option<Slot>,
     cgc_set_slot: Slot,
+    contiguous_from: Option<Slot>,
 ) -> Option<Slot> {
     let after_finalized = match finalized_slot {
         Some(slot) => slot.checked_add(1)?,
         None => 0,
     };
-    Some(first_stored_slot?.max(after_finalized).max(cgc_set_slot))
+    Some(
+        first_stored_slot?
+            .max(after_finalized)
+            .max(cgc_set_slot)
+            .max(contiguous_from.unwrap_or(0)),
+    )
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -550,6 +579,8 @@ struct Write {
     root: Root,
     index: u64,
     ssz: Vec<u8>,
+    /// The block's link to the stored block before it on its chain.
+    link: BlockLink,
     _place: Place,
 }
 
@@ -559,6 +590,8 @@ struct Shared<A, E, V, S, C> {
     custody: Custody<S, C>,
     contract: ColumnContract<V>,
     waits: RootWaits,
+    /// The column env, for the chain links.
+    store: Arc<ColumnWriter>,
 }
 
 /// The forward-only custody column store (see the module docs).
@@ -618,6 +651,7 @@ where
                 custody,
                 contract,
                 waits: RootWaits::new(limits),
+                store: Arc::clone(&writer),
             }),
             queue: Arc::new(Queue {
                 limits,
@@ -787,12 +821,14 @@ where
         let Ok(verified) = checked.await else {
             return;
         };
+        let link = self.link(&block).await;
         let sidecar = verified.sidecar();
         let write = Write {
             slot: sidecar.slot,
             root,
             index: sidecar.index,
             ssz: sidecar.as_ssz_bytes(),
+            link,
             _place: place,
         };
         // Never blocks: the channel has room for every queue place. A store being dropped has
@@ -804,25 +840,65 @@ where
     }
 }
 
+impl<A, E, V, S, C> Shared<A, E, V, S, C>
+where
+    A: ReferenceApi + BlockApi,
+    E: EthSpec,
+{
+    /// What the writer links `block` by (step 6 of the module docs): [`BlockLink::Pending`] of
+    /// the nearest ancestor that is stored or carries blobs, [`BlockLink::Start`] or
+    /// [`BlockLink::Gap`].
+    async fn link(&self, block: &RefBlock) -> BlockLink {
+        let reader = self.store.reader();
+        let cgc_set_slot = self.custody.cgc_set_slot();
+        let Ok(finalized) = reader.finalized_slot() else {
+            return BlockLink::Gap;
+        };
+        let held_before = |slot: Slot| slot < cgc_set_slot || finalized.is_some_and(|f| slot <= f);
+        let mut parent = block.parent_root;
+        for _ in 0..=MAX_LINK_WALK {
+            match reader.slot_of(&parent) {
+                Ok(Some(_)) => return BlockLink::Pending(parent),
+                Ok(None) => {}
+                Err(_) => return BlockLink::Gap,
+            }
+            let Ok(ancestor) = self.refs.lookup(parent).await else {
+                return BlockLink::Gap;
+            };
+            if held_before(ancestor.slot) {
+                return BlockLink::Start;
+            }
+            if !ancestor.commitments.is_empty() {
+                // Not stored yet: the writer decides once the batches before this one are in.
+                return BlockLink::Pending(ancestor.root);
+            }
+            parent = ancestor.parent_root;
+        }
+        BlockLink::Gap
+    }
+}
+
 /// Where the writer thread stores columns: the column env.
 trait ColumnSink {
-    /// [`ColumnWriter::write_columns`].
-    fn write_columns(
+    /// [`ColumnWriter::write_block_columns`].
+    fn write_block_columns(
         &self,
         slot: Slot,
         root: &Root,
+        link: BlockLink,
         columns: &[Column<'_>],
     ) -> cl_chain_columns::Result<WriteReport>;
 }
 
 impl ColumnSink for ColumnWriter {
-    fn write_columns(
+    fn write_block_columns(
         &self,
         slot: Slot,
         root: &Root,
+        link: BlockLink,
         columns: &[Column<'_>],
     ) -> cl_chain_columns::Result<WriteReport> {
-        ColumnWriter::write_columns(self, slot, root, columns)
+        ColumnWriter::write_block_columns(self, slot, root, link, columns)
     }
 }
 
@@ -842,11 +918,17 @@ fn run_writer(
                 Err(_) => break,
             }
         }
-        write_batch(writer, batch, dropped, metrics);
+        let highest = write_batch(writer, batch, dropped, metrics);
+        // Blocks still waiting for an ancestor that never came, once the store is past them.
+        if let Some(highest) = highest {
+            if let Err(e) = writer.settle_pending(highest.saturating_sub(PENDING_LINK_SLOTS)) {
+                tracing::warn!(error = %e, "pending column links not settled");
+            }
+        }
     }
 }
 
-/// Writes `batch` block by block, each block of the batch in one
+/// Writes `batch` block by block, in slot order, each block of the batch in one
 /// [`ColumnWriter::write_columns`] call. That call commits in transactions of at most
 /// [`MAX_COLUMNS_PER_TXN`](cl_chain_columns::MAX_COLUMNS_PER_TXN) columns while it holds off
 /// pruning, so a reorg prune lands before or after the batch's columns of a block, never
@@ -860,7 +942,8 @@ fn write_batch(
     batch: Vec<Write>,
     dropped: &ColumnMetrics,
     metrics: &QueueMetrics,
-) {
+) -> Option<Slot> {
+    let mut highest = None;
     let mut blocks: BTreeMap<(Slot, Root), BTreeMap<u64, Write>> = BTreeMap::new();
     for write in batch {
         blocks
@@ -876,7 +959,15 @@ fn write_batch(
                 ssz: &w.ssz,
             })
             .collect();
-        match writer.write_columns(slot, &root, &ssz) {
+        // The columns of one block agree on its link but for a walk that failed: any link
+        // beats a gap.
+        let link = columns
+            .values()
+            .map(|w| w.link)
+            .find(|link| *link != BlockLink::Gap)
+            .unwrap_or(BlockLink::Gap);
+        highest = highest.max(Some(slot));
+        match writer.write_block_columns(slot, &root, link, &ssz) {
             Ok(_) => {
                 metrics.stored.inc_by(ssz.len() as u64);
             }
@@ -894,6 +985,7 @@ fn write_batch(
             }
         }
     }
+    highest
 }
 
 #[cfg(test)]
@@ -920,6 +1012,7 @@ mod tests {
             index,
             _place: queue.admit(ssz.len()).unwrap(),
             ssz,
+            link: BlockLink::Gap,
         }
     }
 
@@ -953,13 +1046,14 @@ mod tests {
     }
 
     impl ColumnSink for PrunesBetweenCalls<'_> {
-        fn write_columns(
+        fn write_block_columns(
             &self,
             slot: Slot,
             root: &Root,
+            link: BlockLink,
             columns: &[Column<'_>],
         ) -> cl_chain_columns::Result<WriteReport> {
-            let written = self.writer.write_columns(slot, root, columns);
+            let written = self.writer.write_block_columns(slot, root, link, columns);
             self.calls.set(self.calls.get() + 1);
             self.writer.prune_orphaned(&[self.orphan]).unwrap();
             written
@@ -1084,13 +1178,31 @@ mod tests {
     #[test]
     fn the_earliest_servable_slot_is_the_highest_bound() {
         // Nothing stored: nothing to serve, whatever the other bounds say.
-        assert_eq!(earliest_servable_slot(None, Some(40), 16), None);
+        assert_eq!(earliest_servable_slot(None, Some(40), 16, None), None);
         // Each bound in turn the highest.
-        assert_eq!(earliest_servable_slot(Some(17), None, 16), Some(17));
-        assert_eq!(earliest_servable_slot(Some(17), Some(40), 16), Some(41));
-        assert_eq!(earliest_servable_slot(Some(17), Some(9), 30), Some(30));
+        assert_eq!(earliest_servable_slot(Some(17), None, 16, None), Some(17));
+        assert_eq!(
+            earliest_servable_slot(Some(17), Some(40), 16, None),
+            Some(41)
+        );
+        assert_eq!(
+            earliest_servable_slot(Some(17), Some(9), 30, None),
+            Some(30)
+        );
+        // A gap: only from the block after it on.
+        assert_eq!(
+            earliest_servable_slot(Some(17), Some(9), 30, Some(50)),
+            Some(50)
+        );
+        assert_eq!(
+            earliest_servable_slot(Some(17), Some(60), 30, Some(50)),
+            Some(61)
+        );
         // A watermark at the last slot leaves nothing servable past it.
-        assert_eq!(earliest_servable_slot(Some(1), Some(Slot::MAX), 0), None);
+        assert_eq!(
+            earliest_servable_slot(Some(1), Some(Slot::MAX), 0, None),
+            None
+        );
     }
 
     #[test]

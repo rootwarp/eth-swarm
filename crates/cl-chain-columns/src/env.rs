@@ -5,12 +5,13 @@
 use std::path::Path;
 
 use libmdbx::{
-    Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, SyncMode, TableFlags,
+    Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, SyncMode, TableFlags, WriteFlags,
 };
 
 use crate::{
     error::{Error, Result},
-    keys::TABLES,
+    keys::{CONTIGUOUS_FROM_KEY, LINKS_TABLE, META_TABLE, TABLES},
+    reader::{after_highest_block, meta_u64},
 };
 
 pub(crate) type Env = Database<NoWriteMap>;
@@ -106,8 +107,28 @@ pub(crate) fn open_rw(path: &Path, opts: WriterOptions) -> Result<Env> {
         });
     }
     let txn = env.begin_rw_txn()?;
+    let had_links = match txn.open_table(Some(LINKS_TABLE)) {
+        Ok(_) => true,
+        Err(libmdbx::Error::NotFound) => false,
+        Err(e) => return Err(e.into()),
+    };
     for table in TABLES {
         txn.create_table(Some(table), TableFlags::empty())?;
+    }
+    // An env written before the links table existed: its blocks have no links, so none of
+    // them can be chained to; claim nothing up to and including its highest stored block.
+    if !had_links {
+        if let Some(after) = after_highest_block(&txn)? {
+            let meta = txn.open_table(Some(META_TABLE))?;
+            let current = meta_u64(&txn, CONTIGUOUS_FROM_KEY)?;
+            let from = current.map_or(after, |c| c.max(after));
+            txn.put(
+                &meta,
+                CONTIGUOUS_FROM_KEY,
+                from.to_be_bytes(),
+                WriteFlags::UPSERT,
+            )?;
+        }
     }
     txn.commit()?;
     Ok(env)

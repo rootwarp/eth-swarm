@@ -1,9 +1,11 @@
 //! The control protocols, both ways: Status v2, MetaData v3, Ping v1 and Goodbye v1, plus
-//! `BeaconBlocksByRange` v2 answered `3: ResourceUnavailable` (the probe stores no blocks).
+//! `BeaconBlocksByRange` v2 answered `3: ResourceUnavailable` (the probe stores no blocks), and
+//! the custody columns served by `DataColumnSidecarsByRange` v1 and `DataColumnSidecarsByRoot`
+//! v1.
 //!
 //! [`Control`] is the probe swarm's req/resp behaviour. It holds one [`Duplex`] per protocol
 //! ([`Protocols`], see [`crate::rpc`] for why one each): an inbound-only and an outbound-only
-//! `request_response` behaviour, so these five are what multistream-select offers and any other
+//! `request_response` behaviour, so these seven are what multistream-select offers and any other
 //! protocol fails negotiation (`phase0/p2p-interface.md` L187–190), among them the MUST-support
 //! ones the probe leaves out ([`super::unsupported`]). It answers every inbound
 //! request itself and reports what it learned as [`ControlEvent`]s.
@@ -33,8 +35,19 @@
 //!   the responder does not have (`phase0` L1540). A request with `step` 0 or a `count` above
 //!   `MAX_REQUEST_BLOCKS_DENEB` (128) is semantically invalid and gets `1: InvalidRequest`
 //!   (`phase0` L1286–1288, L1514; `deneb` L876); the connection stays.
+//! - **DataColumnSidecarsByRange / ByRoot** (`fulu/p2p-interface.md` L605–775): the custody
+//!   columns cl-chain stores, from the [`ColumnSource`] ([`ControlConfig::columns`]; cl-p2p
+//!   opens no database, see [`super::columns`]). A request naming an index at or past
+//!   `NUMBER_OF_COLUMNS` or more than `MAX_REQUEST_DATA_COLUMN_SIDECARS` (16,384) sidecars gets
+//!   `1: InvalidRequest` (L746–747), and one naming none an empty answer. The source's answer
+//!   is held to the request and cut at a whole block ([`super::columns`]): each chunk carries
+//!   the fork digest of its sidecar's slot's epoch as context bytes (L700–702, L766–768). Its
+//!   refusals go out with the fixed message of their code: `3: ResourceUnavailable` below
+//!   `earliest_available_slot` or before `data_column_serve_range` (L652–656), never an empty
+//!   success. No source is `3`; a lookup past [`COLUMN_LOOKUP_TIMEOUT`] is `2: ServerError`.
 //! - A request that broke the wire format: `1: InvalidRequest` (`phase0` L1383–1386), a
-//!   Goodbye's included.
+//!   Goodbye's included; a column request whose list is past its SSZ limit too
+//!   (`MAX_REQUEST_BLOCKS_DENEB` identifiers, `NUMBER_OF_COLUMNS` indices).
 //!
 //! Error chunks carry no context bytes and `3` only where the protocol specifies it: the codec
 //! refuses anything else ([`super::codec::encode_response`]).
@@ -51,7 +64,27 @@
 //!   refunded; a sent one stays charged after a reconnect.
 //! - **Inbound streams**: each [`Duplex`] serves at most [`MAX_CONCURRENT_REQUESTS`] inbound
 //!   streams per connection, apart from ours, and resets the next one; a withheld chunk keeps
-//!   its stream, so a peer over its quota cannot open more.
+//!   its stream, so a peer over its quota cannot open more. A column stream holds its slot
+//!   while its lookup runs, too.
+//! - **Columns**: a column request books its tokens when it is admitted
+//!   ([`super::limits::BookedChunks`]): as many sidecars as it names, at most an answer's
+//!   share of what the quota delivers in [`RpcLimits::column_answer_window`] and at most what
+//!   the bucket can still deliver in that window, at least one whole block. Its lookup waits
+//!   until the first token is due, so a peer over its quota costs no lookup, and its chunks go
+//!   out at the booked tokens; a booking behind another moves up as that one's unused tokens go
+//!   back. A reset, before or after, gives back nothing, so a peer cannot request and reset its
+//!   way past its quota. Answers hold a place from the lookup until the stream's writer returns
+//!   ([`super::limits::ColumnPlaces`]): at most [`RpcLimits::max_column_answers`] (8) at once,
+//!   one per peer and [`RpcLimits::max_column_answers_per_ip`] (2) per IP, each at most
+//!   [`RpcLimits::max_column_response_bytes`] (8 MiB) of SSZ, encoded one chunk at a time (an
+//!   estimated 68 MiB for all, see [`super::limits::DEFAULT_MAX_COLUMN_ANSWERS`]). A due chunk
+//!   not written within [`RpcLimits::column_write_deadline`] (1 s) resets its stream and frees
+//!   the place, so a requester that stops reading holds it for about a second, not the 10 s
+//!   exchange timeout. A request whose tokens are due waits for a place up to
+//!   [`RpcLimits::column_queue_wait`] (2 s), then gets `2: ServerError`; at most
+//!   [`RpcLimits::column_queue_len`] (64) wait, and one past them gets `2` at once (both counted
+//!   in `queue_dropped_total{queue="rpc_column_queue"}`). A request waiting for its tokens is
+//!   never refused (L1269–1274): it waits until its stream closes.
 //! - **Outbound requests**: at most [`MAX_CONCURRENT_REQUESTS`] in flight per protocol across
 //!   every peer (`rpc_outbound_inflight{protocol}`), the rest waiting in the protocol's bounded
 //!   queue. A full queue IGNOREs the request (`queue_dropped_total{queue}`); an IGNOREd Goodbye
@@ -98,8 +131,12 @@
 use super::codec::{
     Answer, Deadline, Deadlines, InboundCodec, ReadError, ReceivedChunk, RpcCodec, RpcRequest,
 };
+use super::columns::{
+    column_chunks, error_answer, AnswerBudget, ColumnReply, ColumnSource, Requested,
+};
 use super::limits::{
-    shared_limiter, Admit, ChunkPacer, OutboundSemaphore, RpcLimits, SharedLimiter,
+    shared_limiter, Admit, AnswerPermit, BookedChunks, ChunkPacer, ColumnPlaces, OutboundSemaphore,
+    RpcLimits, SharedLimiter,
 };
 use super::metrics::{RpcMetrics, StatusValidity};
 use super::outbound::{check_request, outbound_failure, OutboundError, RangeError};
@@ -107,6 +144,7 @@ use super::{MAX_CONCURRENT_REQUESTS, REQUEST_TIMEOUT};
 use crate::transport::Direction;
 use consensus_types::EthSpec;
 use ethswarm_proto::chain as pb;
+use futures::stream::{FuturesUnordered, StreamExt as _};
 use libp2p::core::transport::PortUse;
 use libp2p::core::Endpoint;
 use libp2p::request_response::{
@@ -123,7 +161,8 @@ use p2p_wire::rpc::messages::{
     BlocksByRangeV2Request, ErrorMessage, Goodbye, MetaDataV3, Ping, StatusV2,
 };
 use p2p_wire::rpc::protocols::{
-    Protocol, Request, Response, ResponseChunk, ResultCode, MAX_REQUEST_BLOCKS_DENEB,
+    column_request_error, Protocol, Request, Response, ResponseChunk, ResultCode,
+    MAX_REQUEST_BLOCKS_DENEB,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -131,6 +170,7 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, Sleep};
 
 /// How long after a peer's last Ping ended (or it connected) the next one goes out \[est\]:
@@ -159,6 +199,15 @@ pub const GOODBYE_LINGER: Duration = Duration::from_secs(1);
 /// a connection is gone at most `GOODBYE_LINGER + CLOSE_DEADLINE` (6 s) after our answer to the
 /// peer's Goodbye went out, and after our own Goodbye completed.
 pub const CLOSE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How long one column lookup may take before its request gets `2: ServerError` \[est\]: 2 s,
+/// cl-chain's read deadline, so with [`RpcLimits::column_queue_wait`] before it the error chunk
+/// still beats the requester's 5 s first-byte deadline.
+pub const COLUMN_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The `queue` label of column requests refused because the queue was full or no place freed
+/// in time.
+pub const COLUMN_QUEUE: &str = "rpc_column_queue";
 
 /// Goodbye reason 1: client shut down.
 pub const GOODBYE_CLIENT_SHUTDOWN: u64 = 1;
@@ -343,6 +392,9 @@ pub struct ControlConfig {
     pub limits: RpcLimits,
     /// How often each connected peer is pinged: [`PING_INTERVAL`]; zero pings none.
     pub ping_interval: Duration,
+    /// Where the column answers come from (cl-chain); `None` answers every column request
+    /// `3: ResourceUnavailable`.
+    pub columns: Option<Arc<dyn ColumnSource>>,
 }
 
 impl std::fmt::Debug for ControlConfig {
@@ -353,6 +405,7 @@ impl std::fmt::Debug for ControlConfig {
             .field("deadlines", &self.deadlines)
             .field("limits", &self.limits)
             .field("ping_interval", &self.ping_interval)
+            .field("columns", &self.columns.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -425,6 +478,8 @@ pub struct Protocols<E: EthSpec> {
     pub ping: Duplex<E>,
     pub goodbye: Duplex<E>,
     pub blocks_by_range: Duplex<E>,
+    pub data_columns_by_range: Duplex<E>,
+    pub data_columns_by_root: Duplex<E>,
 }
 
 impl<E: EthSpec> Protocols<E> {
@@ -447,6 +502,8 @@ impl<E: EthSpec> Protocols<E> {
             ping: Duplex::new(Protocol::PingV1, &codec),
             goodbye: Duplex::new(Protocol::GoodbyeV1, &codec),
             blocks_by_range: Duplex::new(Protocol::BlocksByRangeV2, &codec),
+            data_columns_by_range: Duplex::new(Protocol::DataColumnsByRangeV1, &codec),
+            data_columns_by_root: Duplex::new(Protocol::DataColumnsByRootV1, &codec),
         }
     }
 
@@ -458,6 +515,8 @@ impl<E: EthSpec> Protocols<E> {
             Protocol::PingV1 => &mut self.ping,
             Protocol::GoodbyeV1 => &mut self.goodbye,
             Protocol::BlocksByRangeV2 => &mut self.blocks_by_range,
+            Protocol::DataColumnsByRangeV1 => &mut self.data_columns_by_range,
+            Protocol::DataColumnsByRootV1 => &mut self.data_columns_by_root,
         }
     }
 }
@@ -524,6 +583,8 @@ struct Outgoing {
 #[derive(Debug, Clone)]
 struct PeerState {
     direction: Direction,
+    /// The bucket of its remote IP, for the per-IP column answer places.
+    ip: Option<crate::peer_caps::IpBucket>,
     /// The verdict on its last judged Status.
     status_valid: Option<bool>,
     /// Its last judged Status.
@@ -551,6 +612,33 @@ impl PeerState {
     /// Whether either side said Goodbye: nothing more goes out but our own Goodbye.
     fn leaving(&self) -> bool {
         self.goodbye_sent || self.goodbye_received
+    }
+}
+
+/// A column answer ready to go out: its request's stream, chunks, tokens and place.
+struct ColumnAnswer<E: EthSpec> {
+    protocol: Protocol,
+    channel: ResponseChannel<Answer<E>>,
+    chunks: Vec<ReceivedChunk<E>>,
+    booked: BookedChunks,
+    permit: AnswerPermit,
+}
+
+/// A column request admitted and waiting for its tokens or a place.
+struct QueuedColumn<E: EthSpec> {
+    peer: PeerId,
+    protocol: Protocol,
+    channel: ResponseChannel<Answer<E>>,
+    request: Request,
+    booked: BookedChunks,
+    /// When it was admitted.
+    since: Instant,
+}
+
+impl<E: EthSpec> QueuedColumn<E> {
+    /// When it may start waiting for a place: its first token due, and admitted.
+    fn ready_at(&self) -> Instant {
+        self.booked.ready_at().max(self.since)
     }
 }
 
@@ -584,6 +672,14 @@ pub struct Control<E: EthSpec> {
     /// The peers' Status requests we are answering with our Status, until the answer is sent
     /// ([`ControlEvent::StatusAnswered`]) or fails.
     status_answers: HashSet<InboundRequestId>,
+    /// Column lookups open, each on its own task, each holding a place.
+    lookups: FuturesUnordered<JoinHandle<ColumnAnswer<E>>>,
+    /// The column answers' places, shared with the streams' writers.
+    places: ColumnPlaces,
+    /// Column requests waiting for their tokens or a place, in arrival order.
+    column_queue: VecDeque<QueuedColumn<E>>,
+    /// Wakes the behaviour when the next queued column request is due or times out.
+    queue_timer: Option<Pin<Box<Sleep>>>,
 }
 
 /// The `ErrorMessage` of `text`, cut at 256 bytes.
@@ -653,6 +749,12 @@ impl<E: EthSpec> Control<E> {
     /// The behaviour answering with `cfg`, counting in `metrics`.
     #[must_use]
     pub fn new(cfg: ControlConfig, metrics: RpcMetrics) -> Self {
+        metrics.queues().declare(COLUMN_QUEUE);
+        let places = ColumnPlaces::new(
+            cfg.limits.max_column_answers,
+            cfg.limits.max_column_answers_per_ip,
+            Some(metrics.clone()),
+        );
         Self {
             inner: Protocols::new(
                 Arc::clone(&cfg.contexts),
@@ -676,6 +778,10 @@ impl<E: EthSpec> Control<E> {
             timer: None,
             pending: VecDeque::new(),
             status_answers: HashSet::new(),
+            lookups: FuturesUnordered::new(),
+            places,
+            column_queue: VecDeque::new(),
+            queue_timer: None,
         }
     }
 
@@ -1117,6 +1223,8 @@ impl<E: EthSpec> Control<E> {
         let answer = Answer {
             chunks,
             pacer: Some(pacer),
+            booked: None,
+            permit: None,
         };
         let sent = self
             .inner
@@ -1196,6 +1304,228 @@ impl<E: EthSpec> Control<E> {
                     None => error_chunk(ResultCode::ResourceUnavailable, "no blocks stored"),
                 };
                 self.respond(peer, protocol, channel, answer);
+            }
+            request @ (Request::DataColumnsByRange(_) | Request::DataColumnsByRoot(_)) => {
+                self.serve_columns(peer, protocol, channel, request);
+            }
+        }
+    }
+
+    /// Admits a peer's column request (see the module docs): answers it at once if it is out of
+    /// bounds, names nothing or finds no store or no room, else books its tokens and queues it.
+    fn serve_columns(
+        &mut self,
+        peer: PeerId,
+        protocol: Protocol,
+        channel: ResponseChannel<Answer<E>>,
+        request: Request,
+    ) {
+        if let Some(why) = column_request_error(&request) {
+            tracing::debug!(%peer, %protocol, %why, "column request out of bounds");
+            self.respond(
+                peer,
+                protocol,
+                channel,
+                error_answer(ResultCode::InvalidRequest),
+            );
+            return;
+        }
+        let max_chunks = request.max_response_chunks();
+        if max_chunks == 0 {
+            self.respond(peer, protocol, channel, Vec::new());
+            return;
+        }
+        if self.cfg.columns.is_none() {
+            let answer = error_answer(ResultCode::ResourceUnavailable);
+            self.respond(peer, protocol, channel, answer);
+            return;
+        }
+        if self.column_queue.len() >= self.cfg.limits.column_queue_len {
+            self.metrics.queues().count(COLUMN_QUEUE);
+            tracing::debug!(%peer, %protocol, "the column queue is full");
+            self.respond(
+                peer,
+                protocol,
+                channel,
+                error_answer(ResultCode::ServerError),
+            );
+            return;
+        }
+        // What the bucket can still deliver within the window, at most an answer's share, and
+        // at least one whole block: a peer over its quota still gets its first block, late.
+        let limits = &self.cfg.limits;
+        let deliverable = self
+            .limiter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .deliverable(peer, protocol, limits.column_answer_window, Instant::now());
+        let block = match &request {
+            Request::DataColumnsByRange(r) => r.columns.len() as u64,
+            Request::DataColumnsByRoot(r) => {
+                r.0.iter()
+                    .map(|id| id.columns.len() as u64)
+                    .max()
+                    .unwrap_or(1)
+            }
+            _ => 1,
+        };
+        let tokens = max_chunks
+            .min(limits.column_answer_sidecars(protocol))
+            .min(deliverable)
+            .max(block.min(max_chunks));
+        let booked = BookedChunks::book(
+            &self.limiter,
+            peer,
+            protocol,
+            tokens,
+            Some(self.metrics.clone()),
+            limits.column_write_deadline,
+        );
+        self.column_queue.push_back(QueuedColumn {
+            peer,
+            protocol,
+            channel,
+            request,
+            booked,
+            since: Instant::now(),
+        });
+    }
+
+    /// Goes through the queued column requests in order: drops those whose stream closed
+    /// (their tokens stay spent), starts those whose tokens are due and whose peer gets a
+    /// place, and refuses those that waited for a place past the queue wait. Then sets the
+    /// queue timer for the next of these; `cx` is woken then, or when a place is given back.
+    fn pump_columns(&mut self, cx: &mut Context<'_>) {
+        self.places.register(cx.waker());
+        let wait = self.cfg.limits.column_queue_wait;
+        loop {
+            let now = Instant::now();
+            let mut next: Option<Instant> = None;
+            let mut i = 0;
+            while i < self.column_queue.len() {
+                let queued = &self.column_queue[i];
+                if !queued.channel.is_open() {
+                    tracing::debug!(peer = %queued.peer, "a queued column request's stream closed");
+                    self.column_queue.remove(i);
+                    continue;
+                }
+                let ready = queued.ready_at();
+                if ready > now {
+                    next = Some(next.map_or(ready, |n| n.min(ready)));
+                    i += 1;
+                    continue;
+                }
+                let ip = self.peers.get(&queued.peer).and_then(|p| p.ip);
+                if let Some(permit) = self.places.try_take(queued.peer, ip) {
+                    let queued = self.column_queue.remove(i).expect("at i");
+                    self.start_lookup(queued, permit);
+                    continue;
+                }
+                if now >= ready + wait {
+                    let mut queued = self.column_queue.remove(i).expect("at i");
+                    self.metrics.queues().count(COLUMN_QUEUE);
+                    tracing::debug!(peer = %queued.peer, "no column answer place in time");
+                    // Not served: every booked token goes back; the error chunk pays its own.
+                    queued.booked.settle(0);
+                    let answer = error_answer(ResultCode::ServerError);
+                    self.respond(queued.peer, queued.protocol, queued.channel, answer);
+                    continue;
+                }
+                let at = ready + wait;
+                next = Some(next.map_or(at, |n| n.min(at)));
+                i += 1;
+            }
+            let Some(next) = next else {
+                self.queue_timer = None;
+                return;
+            };
+            let timer = self
+                .queue_timer
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(next)));
+            if timer.deadline() != next {
+                timer.as_mut().reset(next);
+            }
+            if timer.as_mut().poll(cx).is_pending() {
+                return;
+            }
+        }
+    }
+
+    /// Runs the lookup of `queued` on its own task, holding `permit`.
+    fn start_lookup(&mut self, queued: QueuedColumn<E>, mut permit: AnswerPermit) {
+        let QueuedColumn {
+            peer,
+            protocol,
+            channel,
+            request,
+            mut booked,
+            ..
+        } = queued;
+        let (Some(source), Some(requested), Ok(runtime)) = (
+            self.cfg.columns.clone(),
+            Requested::of(&request),
+            tokio::runtime::Handle::try_current(),
+        ) else {
+            self.respond(
+                peer,
+                protocol,
+                channel,
+                error_answer(ResultCode::ServerError),
+            );
+            return;
+        };
+        let lookup = match &request {
+            Request::DataColumnsByRange(range) => source.by_range(range),
+            Request::DataColumnsByRoot(roots) => source.by_root(roots),
+            other => unreachable!("{other:?} is not a column request"),
+        };
+        drop(request);
+        let contexts = Arc::clone(&self.cfg.contexts);
+        let metrics = self.metrics.clone();
+        let budget = AnswerBudget {
+            max_sidecars: booked.tokens(),
+            max_bytes: self.cfg.limits.max_column_response_bytes,
+        };
+        self.lookups.push(runtime.spawn(async move {
+            let reply = tokio::time::timeout(COLUMN_LOOKUP_TIMEOUT, lookup)
+                .await
+                .unwrap_or_else(|_| ColumnReply::server_error("column lookup timed out"));
+            let (chunks, bytes) = column_chunks(reply, &requested, &contexts, budget, &metrics);
+            permit.hold_bytes(bytes);
+            booked.settle(chunks.len() as u64);
+            ColumnAnswer {
+                protocol,
+                channel,
+                chunks,
+                booked,
+                permit,
+            }
+        }));
+    }
+
+    /// Sends every column answer whose lookup ended, at its booked tokens, holding its place.
+    fn poll_lookups(&mut self, cx: &mut Context<'_>) {
+        while let Poll::Ready(Some(done)) = self.lookups.poll_next_unpin(cx) {
+            match done {
+                Ok(done) => {
+                    let answer = Answer {
+                        chunks: done.chunks,
+                        pacer: None,
+                        booked: Some(Box::new(done.booked)),
+                        permit: Some(Box::new(done.permit)),
+                    };
+                    let protocol = done.protocol;
+                    if self
+                        .inner
+                        .of(protocol)
+                        .send_response(done.channel, answer)
+                        .is_err()
+                    {
+                        tracing::debug!(%protocol, "the stream closed before our column answer");
+                    }
+                }
+                // The stream drops unanswered with the task's channel, and the place with it.
+                Err(e) => tracing::error!(error = %e, "a column lookup task ended abnormally"),
             }
         }
     }
@@ -1296,6 +1626,10 @@ impl<E: EthSpec> Control<E> {
                 Some(ticket) => self.blocks_done(peer, ticket, Ok(chunks)),
                 None => tracing::debug!(%peer, chunks = chunks.len(), "a BlocksByRange response"),
             },
+            // We send no column request yet.
+            Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1 => {
+                tracing::debug!(%peer, %protocol, chunks = chunks.len(), "a column response");
+            }
         }
     }
 
@@ -1372,6 +1706,8 @@ impl<E: EthSpec> Control<E> {
             ProtocolsEvent::Ping(e) => (Protocol::PingV1, e),
             ProtocolsEvent::Goodbye(e) => (Protocol::GoodbyeV1, e),
             ProtocolsEvent::BlocksByRange(e) => (Protocol::BlocksByRangeV2, e),
+            ProtocolsEvent::DataColumnsByRange(e) => (Protocol::DataColumnsByRangeV1, e),
+            ProtocolsEvent::DataColumnsByRoot(e) => (Protocol::DataColumnsByRootV1, e),
         };
         match event {
             DuplexEvent::Inbound(Event::Message {
@@ -1509,6 +1845,7 @@ impl<E: EthSpec> NetworkBehaviour for Control<E> {
                     c.peer_id,
                     PeerState {
                         direction,
+                        ip: crate::peer_caps::IpBucket::of(c.endpoint.get_remote_address()),
                         status_valid: None,
                         status: None,
                         metadata_seq: None,
@@ -1563,8 +1900,11 @@ impl<E: EthSpec> NetworkBehaviour for Control<E> {
     ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         loop {
             // Each event may have ended a Ping, whose peer is due again an interval on, or a
-            // Goodbye answer, whose connection closes a linger on.
+            // Goodbye answer, whose connection closes a linger on; or started a column lookup.
             self.poll_timers(cx);
+            // Lookups the pump starts are polled right after, so their tasks can wake us.
+            self.pump_columns(cx);
+            self.poll_lookups(cx);
             if let Some(next) = self.pending.pop_front() {
                 return Poll::Ready(next);
             }
@@ -2548,6 +2888,7 @@ mod tests {
             deadlines: Deadlines::default(),
             limits: RpcLimits::default(),
             ping_interval: PING_INTERVAL,
+            columns: None,
         };
         let debug = format!("{cfg:?}");
         assert!(debug.contains("custody_group_count: 4"), "{debug}");

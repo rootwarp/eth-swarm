@@ -45,6 +45,8 @@ pub trait BlockApi: Send + Sync {
 pub struct RefBlock {
     pub root: Root,
     pub slot: Slot,
+    /// The block's `parent_root`.
+    pub parent_root: Root,
     /// The bid's `blob_kzg_commitments`.
     pub commitments: Vec<KZGCommitment>,
 }
@@ -55,6 +57,7 @@ impl RefBlock {
         Self {
             root,
             slot: block.slot,
+            parent_root: block.parent_root.0,
             commitments: bid.blob_kzg_commitments.iter().copied().collect(),
         }
     }
@@ -429,6 +432,7 @@ mod tests {
             RefBlock {
                 root,
                 slot: 9,
+                parent_root: block.parent_root,
                 commitments: vec![[0xc0; 48], [0xc1; 48]],
             }
         );

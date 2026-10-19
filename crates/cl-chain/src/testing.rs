@@ -367,18 +367,31 @@ pub fn schedule() -> consensus_types::ForkSchedule {
     .unwrap()
 }
 
-/// A Gloas block at `slot` whose bid commits to `commitments`, its SSZ and its root.
-pub fn gloas_block(
-    slot: u64,
-    commitments: &[[u8; 48]],
-) -> (
+/// A Gloas block, its SSZ and its root.
+pub type FixtureBlock = (
     consensus_types::gloas::SignedBeaconBlock<Spec>,
     Vec<u8>,
     [u8; 32],
-) {
+);
+
+/// A Gloas block at `slot` whose bid commits to `commitments`, its SSZ and its root.
+pub fn gloas_block(slot: u64, commitments: &[[u8; 48]]) -> FixtureBlock {
+    gloas_block_on(
+        slot,
+        commitments,
+        p2p_wire::testkit::gloas_block::<Spec>(slot)
+            .message
+            .parent_root
+            .0,
+    )
+}
+
+/// [`gloas_block`] whose parent is `parent`.
+pub fn gloas_block_on(slot: u64, commitments: &[[u8; 48]], parent: [u8; 32]) -> FixtureBlock {
     use ssz::Encode;
     use tree_hash::TreeHash;
     let mut block = p2p_wire::testkit::gloas_block::<Spec>(slot);
+    block.message.parent_root = parent.into();
     block
         .message
         .body

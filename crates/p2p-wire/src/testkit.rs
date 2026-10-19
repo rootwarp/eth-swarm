@@ -5,6 +5,7 @@
 
 use crate::rpc::codec::ContextTable;
 use crate::rpc::messages::{ForkDigest, MetaDataV3, StatusV2};
+use consensus_types::caps::NetworkCaps;
 use consensus_types::primitives::{Address, BLSSignature, Root, Slot, B256, U256};
 use consensus_types::{fulu, gloas, EthSpec, ForkName};
 use ssz::BitVector;
@@ -29,6 +30,51 @@ pub fn context_table() -> ContextTable {
     table.insert(FULU_BPO_DIGEST, ForkName::Fulu);
     table.insert(GLOAS_DIGEST, ForkName::Gloas);
     table
+}
+
+/// [`context_table`] with the preset's column-sidecar caps ([`NetworkCaps::PRESET_BOUND`]), so
+/// the column protocols' chunks can be read: no fixture network has a blob schedule.
+pub fn column_context_table() -> ContextTable {
+    context_table().with_network_caps(NetworkCaps::PRESET_BOUND)
+}
+
+/// A Gloas `DataColumnSidecar` of column `index` at `slot`: one cell, `index` in its bytes, and
+/// one proof. Not KZG-valid: for the wire, which never verifies.
+pub fn gloas_sidecar<E: EthSpec>(slot: Slot, index: u64) -> gloas::DataColumnSidecar<E> {
+    gloas::DataColumnSidecar {
+        index,
+        column: vec![cell::<E>(index)].try_into().expect("one cell"),
+        kzg_proofs: vec![PUBKEY].try_into().expect("one proof"),
+        slot,
+        beacon_block_root: root(0x40),
+    }
+}
+
+/// A Fulu `DataColumnSidecar` of column `index` at `slot`: one cell, commitment and proof, and
+/// a header at `slot`. Not KZG-valid either.
+pub fn fulu_sidecar<E: EthSpec>(slot: Slot, index: u64) -> fulu::DataColumnSidecar<E> {
+    fulu::DataColumnSidecar {
+        index,
+        column: vec![cell::<E>(index)].try_into().expect("one cell"),
+        kzg_commitments: vec![PUBKEY].try_into().expect("one commitment"),
+        kzg_proofs: vec![PUBKEY].try_into().expect("one proof"),
+        signed_block_header: fulu::SignedBeaconBlockHeader {
+            message: fulu::BeaconBlockHeader {
+                slot,
+                proposer_index: 3,
+                parent_root: root(1),
+                state_root: root(2),
+                body_root: root(3),
+            },
+            signature: SIG,
+        },
+        kzg_commitments_inclusion_proof: FixedVector::default(),
+    }
+}
+
+/// A cell whose bytes are all `index`'s low byte.
+fn cell<E: EthSpec>(index: u64) -> fulu::Cell<E> {
+    FixedVector::from_elem(index as u8)
 }
 
 fn root(byte: u8) -> Root {

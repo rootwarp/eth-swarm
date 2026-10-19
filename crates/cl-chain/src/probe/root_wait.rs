@@ -580,6 +580,7 @@ mod tests {
         Arc::new(RefBlock {
             root,
             slot: 9,
+            parent_root: [0; 32],
             commitments: Vec::new(),
         })
     }

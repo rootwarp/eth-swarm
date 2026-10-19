@@ -8,9 +8,11 @@
 //! `MAX_CONCURRENT_REQUESTS` (`phase0/p2p-interface.md` L309) on each connection.
 //!
 //! - [`codec`]: both halves of the `ssz_snappy` codec, with the deadlines inside it.
+//! - [`columns`]: where column answers come from ([`columns::ColumnSource`]): cl-chain's
+//!   `ReqRespService` ([`columns::ChainColumns`]).
 //! - [`outbound`]: one exchange on a swarm, for the m2a session.
 //! - [`inbound`]: the probe swarm's behaviour, answering and initiating Status, MetaData, Ping
-//!   and Goodbye ([`inbound::Control`]).
+//!   and Goodbye, and serving the custody columns ([`inbound::Control`]).
 //! - [`limits`]: the per-peer rate limit, the outbound semaphore and the bounded IGNORE queues.
 //! - [`metrics`]: `rpc_timeouts_total`, the Goodbye counters, `p2p_status_valid_peers` and the
 //!   limit counters.
@@ -18,6 +20,7 @@
 //!   deviations), and the count of peers' proposals of them.
 
 pub mod codec;
+pub mod columns;
 pub mod inbound;
 pub mod limits;
 pub mod metrics;

@@ -100,14 +100,14 @@ impl CapExceeded {
 
 /// The per-IP bucket of a remote address: an IPv4 address, or the /58 of an IPv6 one.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-enum IpBucket {
+pub(crate) enum IpBucket {
     V4(Ipv4Addr),
     V6(u64),
 }
 
 impl IpBucket {
     /// The bucket of `remote`, `None` if it starts with no IP.
-    fn of(remote: &Multiaddr) -> Option<Self> {
+    pub(crate) fn of(remote: &Multiaddr) -> Option<Self> {
         match remote.iter().next()? {
             Protocol::Ip4(ip) => Some(Self::V4(ip)),
             Protocol::Ip6(ip) => {

@@ -4,7 +4,8 @@
 //!   the local values at an epoch of the BPO-aware fork schedule (no `enr`/`discv5` dependency).
 //! - [`rpc::codec`]: `ssz_snappy` chunk framing, response result codes and context bytes.
 //! - [`rpc::messages`]: the message bodies (`Status` v2, `MetaData` v3, `Ping`, `Goodbye`,
-//!   `BeaconBlocksByRange` v2 request, `ErrorMessage`).
+//!   `BeaconBlocksByRange` v2 request, the `DataColumnSidecarsByRange` and `ByRoot` v1 requests,
+//!   `ErrorMessage`).
 //! - [`rpc::protocols`]: the protocol IDs with their payload bounds and response counts.
 //! - [`gossip`]: gossip topics, the bounded `ssz_snappy` message transform and the Altair
 //!   message-id.

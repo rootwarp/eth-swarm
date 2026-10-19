@@ -77,6 +77,8 @@ pub fn probe_swarm<E: EthSpec>(
             deadlines: Deadlines::default(),
             limits: RpcLimits::default(),
             ping_interval: plan.ping_interval,
+            // The devnet probe stores no columns.
+            columns: None,
         },
         RpcMetrics::register(&mut registry),
     );

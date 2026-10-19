@@ -11,6 +11,10 @@
 //! cl-verify, custody; anything else dropped) and the forward-only column store behind it
 //! (bounded queues, every column reported IGNORE, so none is re-broadcast).
 //!
+//! [`reqresp`] serves the custody columns of that store to cl-p2p (`ReqRespService`
+//! `DataColumnsByRange` and `DataColumnsByRoot`), for peers' `DataColumnSidecarsByRange` and
+//! `DataColumnSidecarsByRoot` requests.
+//!
 //! [`verify`] is cl-chain's side of `ethswarm.verify.v1`: cl-chain never runs BLS or KZG itself.
 //!
 //! [`da::custody`] owns the node's custody group count: never decreasing, stored in the column
@@ -18,6 +22,7 @@
 
 pub mod da;
 pub mod probe;
+pub mod reqresp;
 pub mod verify;
 
 #[cfg(test)]

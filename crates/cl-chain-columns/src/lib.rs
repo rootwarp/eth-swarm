@@ -11,6 +11,13 @@
 //!   finalized slot and records that slot as a watermark; later writes at or below it are
 //!   refused. [`ColumnWriter::prune_orphaned`] removes every column of orphaned block roots
 //!   after a reorg and leaves a tombstone, so later writes of those roots are refused too.
+//! - **Links.** Each stored block carries a [`BlockLink`] to the stored block before it on its
+//!   chain ([`ColumnWriter::write_block_columns`]); a block waiting for an ancestor not stored
+//!   yet links once that block is written, or is settled as a gap
+//!   ([`ColumnWriter::settle_pending`]), and a gap raises the contiguous-from slot
+//!   ([`ColumnReader::contiguous_from`]). An env written before the links table existed is
+//!   migrated when a writer opens it: contiguous only from the slot after its highest block.
+//! - **Snapshots.** [`ColumnReader::snapshot`] reads several values of one state.
 //! - **First stored slot.** [`ColumnReader::first_stored_slot`] is the lowest slot any column
 //!   was ever stored at, written in the same transaction as that column; pruning leaves it. It
 //!   is a historical minimum, not proof that the data from there on is held.
@@ -41,8 +48,10 @@ mod writer;
 
 pub use env::{WriterOptions, DEFAULT_MAX_SIZE, MAX_SIZE_ALIGN, MIN_MAX_SIZE};
 pub use error::{Error, Result};
-pub use keys::BlockRoot;
-pub use reader::{ColumnReader, CustodyRecord};
+pub use keys::{BlockLink, BlockRoot};
+pub use reader::{
+    ColumnReader, CustodyRecord, RangeBlock, RangeBudget, RangeColumn, RangeRead, Snapshot,
+};
 #[cfg(feature = "test-hooks")]
 pub use writer::BeforeCommit;
 pub use writer::{

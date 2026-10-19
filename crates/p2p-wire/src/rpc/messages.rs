@@ -4,17 +4,22 @@
 //! - [`MetaDataV3`]: `fulu/p2p-interface.md` "GetMetaData v3" (adds `custody_group_count`).
 //! - [`Ping`] and [`Goodbye`]: `phase0/p2p-interface.md`, a bare `uint64` each.
 //! - [`BlocksByRangeV2Request`]: `phase0/p2p-interface.md` "BeaconBlocksByRange v2" request.
+//! - [`DataColumnsByRangeV1Request`] and [`DataColumnsByRootV1Request`]:
+//!   `fulu/p2p-interface.md` "DataColumnSidecarsByRange v1" (L605–710) and
+//!   "DataColumnSidecarsByRoot v1" (L712–775), with `DataColumnIndices` (L74–83),
+//!   `DataColumnsByRootIdentifiers` (L85–94) and `DataColumnsByRootIdentifier` (L111–117).
 //! - [`ErrorMessage`]: `phase0/p2p-interface.md` "Responding side", `List[byte, 256]`.
 //!
 //! Every type here is fixed-size except [`ErrorMessage`], whose bound is
-//! [`MAX_ERROR_MESSAGE_LEN`]; [`crate::rpc::protocols`] holds the length bounds the codec checks
-//! before decoding.
+//! [`MAX_ERROR_MESSAGE_LEN`], and the two column requests, whose lists are bounded by
+//! `NUMBER_OF_COLUMNS` and `MAX_REQUEST_BLOCKS_DENEB`; [`crate::rpc::protocols`] holds the length
+//! bounds the codec checks before decoding.
 
 use consensus_types::primitives::{Epoch, Root, Slot};
 use ssz::BitVector;
 use ssz_derive::{Decode, Encode};
 use ssz_types::VariableList;
-use typenum::{U256, U4, U64};
+use typenum::{U128, U256, U4, U64};
 
 /// `ForkDigest`: the first four bytes of `compute_fork_data_root` (or the BPO-adjusted digest
 /// from Fulu on).
@@ -78,6 +83,58 @@ pub struct BlocksByRangeV2Request {
     pub count: u64,
     /// Deprecated, must be 1.
     pub step: u64,
+}
+
+/// `NUMBER_OF_COLUMNS` (`fulu/das-core.md`): 128 in both presets, so the column lists here are
+/// preset-free (`consensus_types` checks the preset value against it).
+pub type NumberOfColumns = U128;
+
+/// `MAX_REQUEST_BLOCKS_DENEB` as a type: the `DataColumnsByRootIdentifiers` limit (L85–94).
+pub type MaxRequestBlocksDeneb = U128;
+
+/// `DataColumnIndices` (`fulu/p2p-interface.md` L74–83): `List[ColumnIndex, NUMBER_OF_COLUMNS]`.
+pub type DataColumnIndices = VariableList<u64, NumberOfColumns>;
+
+/// The `DataColumnSidecarsByRange` v1 request (`fulu/p2p-interface.md` L611–618).
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct DataColumnsByRangeV1Request {
+    /// The first slot of the range.
+    pub start_slot: Slot,
+    /// How many slots the range covers.
+    pub count: u64,
+    /// The column indices asked for at each slot.
+    pub columns: DataColumnIndices,
+}
+
+impl DataColumnsByRangeV1Request {
+    /// How many sidecars the request asks for at most: `count × len(columns)`, saturating.
+    pub fn requested_sidecars(&self) -> u64 {
+        self.count.saturating_mul(self.columns.len() as u64)
+    }
+}
+
+/// `DataColumnsByRootIdentifier` (`fulu/p2p-interface.md` L111–117).
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct DataColumnsByRootIdentifier {
+    /// The block whose columns are asked for.
+    pub block_root: Root,
+    /// The column indices asked for.
+    pub columns: DataColumnIndices,
+}
+
+/// The `DataColumnSidecarsByRoot` v1 request (`fulu/p2p-interface.md` L718–724):
+/// `DataColumnsByRootIdentifiers`, `List[DataColumnsByRootIdentifier, MAX_REQUEST_BLOCKS_DENEB]`.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[ssz(struct_behaviour = "transparent")]
+pub struct DataColumnsByRootV1Request(
+    pub VariableList<DataColumnsByRootIdentifier, MaxRequestBlocksDeneb>,
+);
+
+impl DataColumnsByRootV1Request {
+    /// `requested_columns_count = sum(len(r.columns) for r in request)` (L728–730).
+    pub fn requested_sidecars(&self) -> u64 {
+        self.0.iter().map(|id| id.columns.len() as u64).sum()
+    }
 }
 
 /// `ErrorMessage`: the payload of a response chunk with result code 1, 2 or 3. Usually UTF-8,

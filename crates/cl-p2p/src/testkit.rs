@@ -42,15 +42,17 @@ pub fn local_metadata(seq_number: u64, custody_group_count: u64) -> MetaDataV3 {
 }
 
 /// A config with Status `status` (and MetaData `seq_number` 1, `custody_group_count`
-/// [`FIXTURE_CGC`]), its context bytes from `p2p_wire::testkit::context_table`.
+/// [`FIXTURE_CGC`]), its context bytes from `p2p_wire::testkit::column_context_table`, and no
+/// column store.
 pub fn control_config(status: Option<StatusV2>) -> ControlConfig {
     ControlConfig {
         status: Arc::new(SharedStatus::new(status)),
         metadata: Arc::new(SharedMetaData::new(local_metadata(1, FIXTURE_CGC))),
-        contexts: Arc::new(p2p_wire::testkit::context_table()),
+        contexts: Arc::new(p2p_wire::testkit::column_context_table()),
         deadlines: Deadlines::default(),
         limits: crate::rpc::limits::RpcLimits::default(),
         ping_interval: crate::rpc::inbound::PING_INTERVAL,
+        columns: None,
     }
 }
 

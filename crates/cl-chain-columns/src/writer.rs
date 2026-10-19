@@ -14,11 +14,11 @@ use crate::{
     env::{self, WriterOptions},
     error::{Error, Result},
     keys::{
-        block_prefix, column_key, decode_column_key, BlockRoot, ADVERTISED_CGC_KEY, CGC_KEY,
-        CGC_SET_SLOT_KEY, COLUMNS_TABLE, FINALIZED_SLOT_KEY, FIRST_STORED_SLOT_KEY,
-        METADATA_SEQ_KEY, META_TABLE, ROOTS_TABLE,
+        block_prefix, column_key, decode_column_key, BlockLink, BlockRoot, ADVERTISED_CGC_KEY,
+        CGC_KEY, CGC_SET_SLOT_KEY, COLUMNS_TABLE, CONTIGUOUS_FROM_KEY, FINALIZED_SLOT_KEY,
+        FIRST_STORED_SLOT_KEY, LINKS_TABLE, METADATA_SEQ_KEY, META_TABLE, ROOTS_TABLE,
     },
-    reader::{meta_u64, scan_block, stored_slot, ColumnReader, CustodyRecord},
+    reader::{meta_u64, scan_block, stored_link, stored_slot, ColumnReader, CustodyRecord},
     sched::{Priority, TxnScheduler},
     NUMBER_OF_COLUMNS, NUMBER_OF_CUSTODY_GROUPS,
 };
@@ -102,6 +102,9 @@ struct Orphans {
     slots: HashMap<BlockRoot, Option<u64>>,
     /// Insertion order of `slots`, oldest first.
     order: VecDeque<BlockRoot>,
+    /// The blocks stored with [`BlockLink::Pending`], by the root they wait for, with their
+    /// slots. Rebuilt from the links table at open.
+    pending: HashMap<BlockRoot, Vec<(BlockRoot, u64)>>,
 }
 
 impl Orphans {
@@ -211,9 +214,16 @@ impl ColumnWriter {
         let path = path.as_ref();
         let guard = env::lock_writer(path)?;
         let db = env::open_rw(path, options)?;
+        let pending = {
+            let txn = db.begin_ro_txn()?;
+            pending_links(&txn)?
+        };
         Ok(Self {
             reader: ColumnReader::from_env(db),
-            column_ops: Mutex::default(),
+            column_ops: Mutex::new(Orphans {
+                pending,
+                ..Orphans::default()
+            }),
             sched: TxnScheduler::default(),
             rw_txns: AtomicU64::new(0),
             hooks: Hooks::default(),
@@ -252,10 +262,32 @@ impl ColumnWriter {
     /// [`Self::prune_orphaned`]). A column already stored under the same key is replaced. Each
     /// transaction that stores a column below the first stored slot
     /// ([`ColumnReader::first_stored_slot`]) also lowers it to `slot`.
+    ///
+    /// The block is stored with [`BlockLink::Gap`]: nothing is known of its chain
+    /// ([`Self::write_block_columns`]).
     pub fn write_columns(
         &self,
         slot: u64,
         block_root: &BlockRoot,
+        columns: &[Column<'_>],
+    ) -> Result<WriteReport> {
+        self.write_block_columns(slot, block_root, BlockLink::Gap, columns)
+    }
+
+    /// [`Self::write_columns`], the block stored with `link`, in the first transaction.
+    ///
+    /// - [`BlockLink::Pending`] of a root that is stored is [`BlockLink::Parent`] of it.
+    /// - A [`BlockLink::Gap`] or a pending link never replaces a [`BlockLink::Start`] or
+    ///   [`BlockLink::Parent`] the block was stored with, and a pending link never replaces a
+    ///   gap; any other link replaces the stored one.
+    /// - A gap that is kept raises the contiguous-from slot ([`ColumnReader::contiguous_from`])
+    ///   to `slot` in the same transaction; a pending link raises nothing.
+    /// - Every stored block pending on this block's root links to it, in the same transaction.
+    pub fn write_block_columns(
+        &self,
+        slot: u64,
+        block_root: &BlockRoot,
+        link: BlockLink,
         columns: &[Column<'_>],
     ) -> Result<WriteReport> {
         validate_batch(columns)?;
@@ -289,11 +321,23 @@ impl ColumnWriter {
             if i > 0 {
                 thread::yield_now();
             }
-            self.write_txn(Priority::Background, |txn| {
+            let written = self.write_txn(Priority::Background, |txn| {
                 write_chunk(txn, slot, block_root, chunk)?;
+                if i == 0 {
+                    write_link(txn, slot, block_root, link, &mut orphans.pending)?;
+                }
                 self.hooks.before_commit(slot);
                 Ok(Commit::Yes(()))
-            })?;
+            });
+            if let Err(e) = written {
+                // The pending index may have moved with a transaction that never committed.
+                if let Ok(txn) = self.reader.db.begin_ro_txn() {
+                    if let Ok(pending) = pending_links(&txn) {
+                        orphans.pending = pending;
+                    }
+                }
+                return Err(e);
+            }
             report.columns += chunk.len();
             report.transactions += 1;
             report.max_columns_per_txn = report.max_columns_per_txn.max(chunk.len());
@@ -360,6 +404,46 @@ impl ColumnWriter {
             }
             thread::yield_now();
         }
+    }
+
+    /// Settles every block stored [`BlockLink::Pending`] at a slot below `before_slot` whose
+    /// root never came: it becomes a [`BlockLink::Gap`], raising the contiguous-from slot to its
+    /// slot. Returns how many were settled.
+    pub fn settle_pending(&self, before_slot: u64) -> Result<usize> {
+        let mut orphans = lock(&self.column_ops);
+        let due: Vec<(BlockRoot, BlockRoot, u64)> = orphans
+            .pending
+            .iter()
+            .flat_map(|(target, children)| {
+                children
+                    .iter()
+                    .filter(|(_, slot)| *slot < before_slot)
+                    .map(move |(child, slot)| (*target, *child, *slot))
+            })
+            .collect();
+        if due.is_empty() {
+            return Ok(0);
+        }
+        let settled = self.write_txn(Priority::Background, |txn| {
+            let mut settled = 0;
+            for (target, child, slot) in &due {
+                if stored_link(txn, child)? == Some(BlockLink::Pending(*target)) {
+                    put_link(txn, child, BlockLink::Gap)?;
+                    raise_contiguous(txn, *slot)?;
+                    settled += 1;
+                }
+            }
+            Ok(Commit::Yes(settled))
+        })?;
+        for (target, child, _) in due {
+            if let Some(children) = orphans.pending.get_mut(&target) {
+                children.retain(|(c, _)| *c != child);
+                if children.is_empty() {
+                    orphans.pending.remove(&target);
+                }
+            }
+        }
+        Ok(settled)
     }
 
     /// Stores the node's custody group count. Runs at import priority. A count below the
@@ -518,6 +602,118 @@ fn write_chunk(
     Ok(())
 }
 
+/// Stores `link` for `block_root` at `slot`, and links the blocks pending on it (see
+/// [`ColumnWriter::write_block_columns`]).
+fn write_link(
+    txn: &RwTxn<'_>,
+    slot: u64,
+    block_root: &BlockRoot,
+    link: BlockLink,
+    pending: &mut HashMap<BlockRoot, Vec<(BlockRoot, u64)>>,
+) -> Result<()> {
+    let link = match link {
+        BlockLink::Pending(target) if stored_slot(txn, &target)?.is_some() => {
+            BlockLink::Parent(target)
+        }
+        other => other,
+    };
+    let stored = stored_link(txn, block_root)?;
+    let linked = |l: BlockLink| matches!(l, BlockLink::Start | BlockLink::Parent(_));
+    let keep = match (stored, link) {
+        (Some(s), BlockLink::Gap | BlockLink::Pending(_)) if linked(s) => true,
+        (Some(BlockLink::Gap), BlockLink::Pending(_)) => true,
+        _ => false,
+    };
+    if !keep {
+        put_link(txn, block_root, link)?;
+        if link == BlockLink::Gap {
+            raise_contiguous(txn, slot)?;
+        }
+        if let Some(BlockLink::Pending(old)) = stored {
+            if let Some(children) = pending.get_mut(&old) {
+                children.retain(|(c, _)| c != block_root);
+            }
+        }
+        if let BlockLink::Pending(target) = link {
+            let children = pending.entry(target).or_default();
+            if !children.iter().any(|(c, _)| c == block_root) {
+                children.push((*block_root, slot));
+            }
+        }
+    }
+    for (child, _) in pending.remove(block_root).unwrap_or_default() {
+        if stored_link(txn, &child)? == Some(BlockLink::Pending(*block_root)) {
+            put_link(txn, &child, BlockLink::Parent(*block_root))?;
+        }
+    }
+    Ok(())
+}
+
+fn put_link(txn: &RwTxn<'_>, block_root: &BlockRoot, link: BlockLink) -> Result<()> {
+    let links = txn.open_table(Some(LINKS_TABLE))?;
+    txn.put(&links, block_root, link.encode(), WriteFlags::UPSERT)?;
+    Ok(())
+}
+
+/// Raises the contiguous-from slot to `slot`; it never goes down.
+fn raise_contiguous(txn: &RwTxn<'_>, slot: u64) -> Result<()> {
+    if meta_u64(txn, CONTIGUOUS_FROM_KEY)?.is_none_or(|from| slot > from) {
+        let meta = txn.open_table(Some(META_TABLE))?;
+        txn.put(
+            &meta,
+            CONTIGUOUS_FROM_KEY,
+            slot.to_be_bytes(),
+            WriteFlags::UPSERT,
+        )?;
+    }
+    Ok(())
+}
+
+/// Every stored block's pending link, by the root it waits for.
+fn pending_links<K: libmdbx::TransactionKind>(
+    txn: &Transaction<'_, K, NoWriteMap>,
+) -> Result<HashMap<BlockRoot, Vec<(BlockRoot, u64)>>> {
+    let links = txn.open_table(Some(LINKS_TABLE))?;
+    let mut cursor = txn.cursor(&links)?;
+    let mut out: HashMap<BlockRoot, Vec<(BlockRoot, u64)>> = HashMap::new();
+    let mut row = cursor.first::<Vec<u8>, Vec<u8>>()?;
+    while let Some((key, value)) = row {
+        if let Some(BlockLink::Pending(target)) = BlockLink::decode(&value) {
+            let child: BlockRoot = key
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::Corrupt { table: LINKS_TABLE })?;
+            if let Some(slot) = stored_slot(txn, &child)? {
+                out.entry(target).or_default().push((child, slot));
+            }
+        }
+        row = cursor.next::<Vec<u8>, Vec<u8>>()?;
+    }
+    Ok(out)
+}
+
+/// Makes the env look as one written before the links table existed: drops the table and the
+/// contiguous-from slot.
+#[cfg(test)]
+pub(crate) fn make_legacy_for_test(writer: &ColumnWriter) {
+    let txn = writer.reader.db.begin_rw_txn().unwrap();
+    let links = txn.open_table(Some(LINKS_TABLE)).unwrap();
+    // SAFETY: no other handle of the table is open in this test.
+    unsafe { txn.drop_table(links).unwrap() };
+    let meta = txn.open_table(Some(META_TABLE)).unwrap();
+    let _ = txn.del(&meta, CONTIGUOUS_FROM_KEY, None);
+    txn.commit().unwrap();
+}
+
+/// Removes `block_root`'s link, if it has one.
+fn del_link(txn: &RwTxn<'_>, block_root: &BlockRoot) -> Result<()> {
+    let links = txn.open_table(Some(LINKS_TABLE))?;
+    match txn.del(&links, block_root, None) {
+        Ok(_) | Err(libmdbx::Error::NotFound) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Removes one block's columns and its root entry; returns its slot and the number of columns
 /// removed, `None` if the block is not stored.
 fn prune_block(txn: &RwTxn<'_>, block_root: &BlockRoot) -> Result<Option<(u64, u64)>> {
@@ -531,6 +727,7 @@ fn prune_block(txn: &RwTxn<'_>, block_root: &BlockRoot) -> Result<Option<(u64, u
     }
     let roots = txn.open_table(Some(ROOTS_TABLE))?;
     txn.del(&roots, block_root, None)?;
+    del_link(txn, block_root)?;
     Ok(Some((slot, rows.len() as u64)))
 }
 
@@ -559,6 +756,7 @@ fn prune_finalized_batch(txn: &RwTxn<'_>, finalized_slot: u64) -> Result<(PruneR
             txn.del(&columns, key, None)?;
         }
         txn.del(&roots, block_root, None)?;
+        del_link(txn, &block_root)?;
         report.columns += rows_len;
         report.blocks += 1;
     }
@@ -618,6 +816,116 @@ mod tests {
             .map(|(&index, ssz)| Column { index, ssz })
             .collect();
         writer.write_columns(slot, root, &columns).unwrap()
+    }
+
+    fn write_linked(writer: &ColumnWriter, slot: u64, root: &BlockRoot, link: BlockLink) {
+        let ssz = sidecar(slot, 1);
+        writer
+            .write_block_columns(
+                slot,
+                root,
+                link,
+                &[Column {
+                    index: 1,
+                    ssz: &ssz,
+                }],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_block_keeps_its_link_and_a_gap_raises_the_contiguous_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let reader = writer.reader();
+        assert_eq!(reader.contiguous_from().unwrap(), None);
+        write_linked(&writer, 10, &ROOT_A, BlockLink::Start);
+        assert_eq!(reader.link_of(&ROOT_A).unwrap(), Some(BlockLink::Start));
+        assert_eq!(reader.contiguous_from().unwrap(), None, "a start is no gap");
+        write_linked(&writer, 12, &ROOT_B, BlockLink::Parent(ROOT_A));
+        assert_eq!(
+            reader.link_of(&ROOT_B).unwrap(),
+            Some(BlockLink::Parent(ROOT_A))
+        );
+        // A gap moves the contiguous slot up to the block's slot, never down.
+        write_linked(&writer, 20, &[0xcc; 32], BlockLink::Gap);
+        assert_eq!(reader.contiguous_from().unwrap(), Some(20));
+        write_linked(&writer, 15, &[0xdd; 32], BlockLink::Gap);
+        assert_eq!(reader.contiguous_from().unwrap(), Some(20));
+        // A later write of a linked block never turns it into a gap; a gap block learns a link.
+        write_linked(&writer, 12, &ROOT_B, BlockLink::Gap);
+        assert_eq!(
+            reader.link_of(&ROOT_B).unwrap(),
+            Some(BlockLink::Parent(ROOT_A))
+        );
+        write_linked(&writer, 20, &[0xcc; 32], BlockLink::Parent(ROOT_B));
+        assert_eq!(
+            reader.link_of(&[0xcc; 32]).unwrap(),
+            Some(BlockLink::Parent(ROOT_B))
+        );
+        assert_eq!(reader.contiguous_from().unwrap(), Some(20));
+        // `write_columns` knows no link: a gap.
+        write_block(&writer, 30, &[0xee; 32], &[1]);
+        assert_eq!(reader.link_of(&[0xee; 32]).unwrap(), Some(BlockLink::Gap));
+        assert_eq!(reader.contiguous_from().unwrap(), Some(30));
+        assert_eq!(reader.link_of(&[0x11; 32]).unwrap(), None);
+    }
+
+    /// A child written before its parent waits for it without raising the contiguous slot, and
+    /// links once the parent is written; one whose parent never comes is settled as a gap.
+    #[test]
+    fn a_pending_link_resolves_when_its_target_is_written_or_settles_as_a_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let reader = writer.reader();
+        write_linked(&writer, 12, &ROOT_B, BlockLink::Pending(ROOT_A));
+        assert_eq!(
+            reader.link_of(&ROOT_B).unwrap(),
+            Some(BlockLink::Pending(ROOT_A))
+        );
+        assert_eq!(reader.contiguous_from().unwrap(), None);
+        write_linked(&writer, 10, &ROOT_A, BlockLink::Start);
+        assert_eq!(
+            reader.link_of(&ROOT_B).unwrap(),
+            Some(BlockLink::Parent(ROOT_A))
+        );
+        // A target already stored: linked at once.
+        write_linked(&writer, 14, &[0xcc; 32], BlockLink::Pending(ROOT_B));
+        assert_eq!(
+            reader.link_of(&[0xcc; 32]).unwrap(),
+            Some(BlockLink::Parent(ROOT_B))
+        );
+        // A target that never comes: pending until settled, then a gap at its slot.
+        write_linked(&writer, 20, &[0xdd; 32], BlockLink::Pending([0x99; 32]));
+        assert_eq!(writer.settle_pending(20).unwrap(), 0, "not before its slot");
+        assert_eq!(reader.contiguous_from().unwrap(), None);
+        // The pending index survives a reopen.
+        drop(writer);
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        assert_eq!(writer.settle_pending(21).unwrap(), 1);
+        assert_eq!(
+            writer.reader().link_of(&[0xdd; 32]).unwrap(),
+            Some(BlockLink::Gap)
+        );
+        assert_eq!(writer.reader().contiguous_from().unwrap(), Some(20));
+        // A gap block never goes back to pending; a pending one learns its link later.
+        write_linked(&writer, 20, &[0xdd; 32], BlockLink::Pending([0x99; 32]));
+        assert_eq!(
+            writer.reader().link_of(&[0xdd; 32]).unwrap(),
+            Some(BlockLink::Gap)
+        );
+    }
+
+    #[test]
+    fn pruning_removes_the_links_of_the_blocks_it_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        write_linked(&writer, 10, &ROOT_A, BlockLink::Start);
+        write_linked(&writer, 12, &ROOT_B, BlockLink::Parent(ROOT_A));
+        writer.prune_orphaned(&[ROOT_B]).unwrap();
+        assert_eq!(writer.reader().link_of(&ROOT_B).unwrap(), None);
+        writer.prune_finalized(10).unwrap();
+        assert_eq!(writer.reader().link_of(&ROOT_A).unwrap(), None);
     }
 
     #[test]

@@ -46,7 +46,8 @@ chars.
 (consensus-specs v1.7.0-beta.4, `phase0`/`fulu` `p2p-interface.md`), one `rpc::inbound::Duplex`
 per protocol: an inbound-only and an outbound-only `request_response` behaviour, each at most 2
 open streams per connection, so the peer's two and our two never take each other's slots and
-a peer's third concurrent stream is reset. Those, plus `BeaconBlocksByRange` v2, are the only
+a peer's third concurrent stream is reset. Those, plus `BeaconBlocksByRange` v2 and the column
+protocols `DataColumnSidecarsByRange` v1 and `DataColumnSidecarsByRoot` v1, are the only
 protocols offered: any other fails multistream-select negotiation, among them the MUST-support
 `BeaconBlocksByHead` v1 and `ExecutionPayloadEnvelopesByRange`/`ByRoot` v1 (see
 [Deviations](#beaconblocksbyhead-and-the-execution-payload-envelope-protocols-not-served)).
@@ -80,12 +81,52 @@ protocols offered: any other fails multistream-select negotiation, among them th
   went out (`rpc::inbound::GOODBYE_LINGER` \[est\]). Our own Goodbye accepts an answer of one
   chunk or none (Lighthouse sends none). Once either side said Goodbye, nothing but our own
   Goodbye goes out to that peer: no Ping, and a request still waiting for a slot is dropped.
+- **Custody columns** (`fulu/p2p-interface.md` L605–775): `DataColumnSidecarsByRange` v1 and
+  `DataColumnSidecarsByRoot` v1 are answered from cl-chain's column store; cl-p2p opens no
+  database. `ControlConfig::columns` is the source (`rpc::columns::ColumnSource`), in the
+  service `rpc::columns::ChainColumns`, the `ethswarm.chain.v1.ReqRespService`
+  `DataColumnsByRange`/`DataColumnsByRoot` client, whose server is `cl_chain::reqresp`. cl-chain
+  answers one chain of linked blocks in `(slot, column_index)` order with every requested
+  column of each block it includes, from our `earliest_available_slot` (which also moves past
+  any gap the store detects). Each chunk carries the fork digest of its sidecar's slot's epoch
+  as context bytes, and every sidecar is decoded by that fork, at its slot and root, before it
+  goes out. A sidecar the request did not name is dropped and counted
+  (`rpc_column_unrequested_total`). A range starting below `earliest_available_slot`, or before
+  `data_column_serve_range`, gets `3: ResourceUnavailable` (L652–656), never an empty success;
+  so does every request with no column store. An index at or past 128, more than 16,384
+  sidecars, or more than 128 identifiers is `1: InvalidRequest`. Error chunks carry a fixed
+  message per code; details stay in the log.
+  - **Admission** (`rpc::limits::BookedChunks`): a request books its tokens when it arrives,
+    as many sidecars as it names, at most its share of what the quota delivers in 5 s (half,
+    for the two streams a peer may open: `RpcLimits::column_answer_sidecars`, 756 by default)
+    and what the bucket can still deliver in that window, at least one whole block. Its lookup
+    waits until its first token is due, so a peer over its quota costs no lookup; the answer
+    goes out at the booked tokens, and those it does not use go back once it is known, moving
+    a booking behind it up. A reset gives back nothing.
+  - **Places** (`rpc::limits::ColumnPlaces`): at most 8 column answers held at once
+    (`RpcLimits::max_column_answers` \[est\], as many as cl-chain's reads), one per peer and 2
+    per IP (`max_column_answers_per_ip` \[est\]), from the lookup until the stream's writer
+    returns. Each holds at most 8 MiB of SSZ (`MAX_COLUMN_RESPONSE_BYTES` \[est\]) and is
+    encoded one chunk at a time: an estimated 8.5 MiB per answer with its copies, about 68 MiB
+    in all (`rpc_column_answers`, `rpc_column_answer_bytes`). A due chunk not written within
+    1 s (`column_write_deadline` \[est\]) resets its stream and frees the place, so a requester
+    that stops reading cannot hold one for the 10 s exchange timeout.
+  - **Queue**: a request whose tokens are due waits up to 2 s for a place
+    (`RpcLimits::column_queue_wait` \[est\]), at most 64 wait (`column_queue_len` \[est\]);
+    past either it gets `2: ServerError`, counted in
+    `queue_dropped_total{queue="rpc_column_queue"}`. A request waiting for its tokens is never
+    refused: it waits until its stream closes. A lookup past 2 s
+    (`rpc::inbound::COLUMN_LOOKUP_TIMEOUT` \[est\], cl-chain's read deadline) is
+    `2: ServerError`.
+  - **Answer budget**: an answer is cut at the last whole block within its sidecars and its
+    8 MiB (the first block always goes), the rule cl-chain cuts by too.
 - **Rejects**: a request that breaks the wire format gets `1: InvalidRequest` (a Goodbye's
   too), and so does a
   `BeaconBlocksByRange` request with `step` 0 or a `count` above `MAX_REQUEST_BLOCKS_DENEB` (128;
   semantically invalid, `phase0` L1286, L1514, `deneb` L876; the connection stays). `3:
   ResourceUnavailable` goes out only where the protocol specifies it: `BeaconBlocksByRange`,
-  answered so on every other request because the probe stores no blocks. A Status we cannot
+  answered so on every other request because the probe stores no blocks, and the two column
+  protocols. A Status we cannot
   answer (no Status of ours yet) gets `2: ServerError`. Error chunks carry no context bytes.
 - **Deadlines** (in the codec, `tokio::time::timeout`, both directions): 5 s to the first
   byte, 5 s per chunk, 10 s in total \[est\]; `request_response`'s own 10 s request timeout is
@@ -93,7 +134,8 @@ protocols offered: any other fails multistream-select negotiation, among them th
   slots until then.
 - **Rate limits** (`rpc::limits::RateLimiter`, `ControlConfig::limits`): a token bucket per
   peer and protocol, counted in response chunks \[est\]: Status 5 at once then one per 2 s,
-  MetaData and Ping 2 then one per 2 s, BeaconBlocksByRange 128 then one per 20 ms. A peer
+  MetaData and Ping 2 then one per 2 s, BeaconBlocksByRange 128 then one per 20 ms, each
+  column protocol 512 sidecars then one per 5 ms. A peer
   over its quota gets no error chunk and its stream stays open: the stream's writer
   (`rpc::codec::InboundCodec`) charges each chunk when it is next to go and withholds it until
   its own token is free, then sends it whole (`phase0` L1269–1274). With at most 2 requests
@@ -116,8 +158,15 @@ The Status comes from cl-chain (`ethswarm.chain.v1.ReqRespService/GetStatus`,
 `fork_digest` is `compute_fork_digest` at the wall-clock epoch (BPO epochs included), the
 finalized checkpoint is the reference Beacon API's, and the head is **the finalized block**, not
 the reference node's head. The probe imports nothing past finality, so it advertises only what
-it can vouch for; `earliest_available_slot` is that head slot until the probe serves ranges of
-its own. During a reference API outage the last good sample is kept; before the first one there
+it can vouch for. `earliest_available_slot` is the slot the probe serves its custody columns
+from (`cl_chain::reqresp::ColumnServer::earliest_available_slot`): the highest of the first
+stored column slot, the slot after the finalized-slot watermark, the slot `cgc` was set at and
+the slot after the last gap in the store (a blob-carrying block it never held), which for a
+store filled forward from the slot `cgc` was set at without a gap is that slot
+(`fulu/p2p-interface.md` L552–561, `fulu/validator.md` L173–175); the head slot until a column
+is stored. It may sit above the head slot for the first epochs after a start (the head is the
+finalized block): a recorded deviation, not clamped, since a lower value would claim slots the
+probe cannot serve (`cl_chain::probe`). During a reference API outage the last good sample is kept; before the first one there
 is no Status, so none is sent and none is judged. The kept sample never moves back: a sample
 with a lower finalized epoch or head slot than the kept one (a slow, earlier refresh finishing
 after a newer one) is ignored.
@@ -134,7 +183,12 @@ Metrics, on the same registry as the peer metrics (`rpc::metrics::RpcMetrics`):
 - `rpc_outbound_inflight{protocol}`: our requests in flight, at most 2 per protocol; Ping
   excepted, up to one per connected peer.
 - `rpc_rate_limited_total{protocol}`: response chunks withheld for a peer over its quota.
-- `queue_dropped_total{queue}`: items a bounded queue IGNOREd (`rpc_outbound_<protocol>`).
+- `queue_dropped_total{queue}`: items a bounded queue IGNOREd (`rpc_outbound_<protocol>`), and
+  column requests refused because the column queue was full or no place freed in time
+  (`rpc_column_queue`).
+- `rpc_column_answers`, `rpc_column_answer_bytes`: column answers held now and their SSZ
+  bytes; `rpc_column_unrequested_total`: sidecars a source handed over that the request did not
+  name, dropped.
 - `rpc_inbound_unsupported_total{protocol}`: peers' proposals of a protocol we leave
   unregistered, refused at negotiation; counted only with `rpc::unsupported::layer` in the
   tracing subscriber (see

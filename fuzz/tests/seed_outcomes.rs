@@ -269,6 +269,65 @@ fn rpc_chunk_block_and_goodbye_seeds() {
     assert_eq!(seed("rpc_chunk", "goodbye-request-valid")[0], 4 | 8);
 }
 
+/// The column protocols' seeds reach the sidecar decoder under the fixture caps, and each
+/// refusal it is named for.
+#[test]
+fn rpc_chunk_column_seeds() {
+    use consensus_types::forked;
+    for (protocol, prefix) in [
+        (Protocol::DataColumnsByRangeV1, "columns-range-"),
+        (Protocol::DataColumnsByRootV1, "columns-root-"),
+    ] {
+        let chunk = |name: &str| {
+            decode_response_chunk::<E>(
+                &body("rpc_chunk", &format!("{prefix}{name}")),
+                protocol,
+                contexts(),
+            )
+        };
+        assert!(matches!(
+            chunk("gloas-valid"),
+            Ok(ResponseChunk::Success(Response::DataColumn(s))) if matches!(*s, forked::DataColumnSidecar::Gloas(_))
+        ));
+        for name in ["fulu-valid", "fulu-bpo-digest-valid"] {
+            assert!(matches!(
+                chunk(name),
+                Ok(ResponseChunk::Success(Response::DataColumn(s))) if matches!(*s, forked::DataColumnSidecar::Fulu(_))
+            ), "{name}");
+        }
+        assert!(matches!(
+            chunk("gloas-sidecar-under-fulu-digest"),
+            Err(CodecError::Decode(_))
+        ));
+        assert!(matches!(
+            chunk("unknown-context-digest"),
+            Err(CodecError::UnknownContext(_))
+        ));
+        assert!(matches!(
+            chunk("prefix-under-sidecar-minimum"),
+            Err(CodecError::PayloadTooSmall { .. })
+        ));
+        assert!(matches!(
+            chunk("prefix-over-type-bound"),
+            Err(CodecError::PayloadTooLarge { .. })
+        ));
+        let request = |name: &str| {
+            decode_request(protocol, &body("rpc_chunk", &format!("{prefix}request-{name}")))
+        };
+        assert!(request("valid").is_ok());
+        assert!(matches!(
+            request("list-past-its-limit"),
+            Err(CodecError::Decode(_)) | Err(CodecError::PayloadTooLarge { .. })
+        ));
+        assert!(matches!(
+            request("prefix-over-type-bound"),
+            Err(CodecError::PayloadTooLarge { .. })
+        ));
+        assert!(request("truncated").is_err());
+        assert!(request("trailing-byte").is_err());
+    }
+}
+
 #[test]
 fn goodbye_seeds() {
     let goodbye = Request::Goodbye(p2p_wire::rpc::messages::Goodbye(3));

@@ -60,7 +60,7 @@
 //! that goes away before a chunk was written whole refunds what is still ahead of that chunk's
 //! token.
 
-use super::limits::ChunkPacer;
+use super::limits::{AnswerPermit, BookedChunks, ChunkPacer};
 use super::metrics::RpcMetrics;
 use consensus_types::EthSpec;
 use consensus_types::{caps, forked};
@@ -72,7 +72,9 @@ use p2p_wire::rpc::codec::{
     CONTEXT_BYTES_LEN,
 };
 use p2p_wire::rpc::messages::ForkDigest;
-use p2p_wire::rpc::protocols::{Protocol, Request, Response, ResponseChunk, ResultCode};
+use p2p_wire::rpc::protocols::{
+    Protocol, Request, Response, ResponseChunk, ResultCode, MAX_REQUEST_DATA_COLUMN_SIDECARS,
+};
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
@@ -192,7 +194,8 @@ pub const PER_TRANSACTION_HEAP: usize = 2 * 24 + caps::MIN_ALLOCATION_BYTES;
 ///   whose decoded size can grow far past its wire size (`consensus_types::caps`).
 /// - Gloas block: [`BLOCK_DECODE_PEAK_HEAP_MODEL_PER_INPUT_BYTE`](caps::BLOCK_DECODE_PEAK_HEAP_MODEL_PER_INPUT_BYTE)
 ///   per SSZ byte, the budget `consensus_types::caps` derives for it.
-/// - Anything else: fixed-size or at most 256 bytes, so its SSZ length.
+/// - Anything else: fixed-size, at most 256 bytes, or a column sidecar, whose cells and proofs
+///   are fixed-size items of its lists: its SSZ length.
 fn decoded_size<E: EthSpec>(chunk: &ResponseChunk<E>, ssz_len: usize) -> usize {
     let held = match chunk {
         ResponseChunk::Success(Response::Block(block)) => {
@@ -519,8 +522,24 @@ pub fn encode_response_chunks<E: EthSpec>(
     protocol: Protocol,
     chunks: &[ReceivedChunk<E>],
 ) -> io::Result<Vec<Vec<u8>>> {
+    check_response(protocol, chunks)?;
+    chunks.iter().map(encode_checked_chunk).collect()
+}
+
+/// Whether `chunks` may be the response on `protocol` ([`encode_response`]'s rules), without
+/// encoding them.
+///
+/// # Errors
+///
+/// `InvalidInput` for anything the protocol does not allow.
+fn check_response<E: EthSpec>(protocol: Protocol, chunks: &[ReceivedChunk<E>]) -> io::Result<()> {
     let max = match protocol {
         Protocol::BlocksByRangeV2 => usize::MAX,
+        // No more than `compute_max_request_data_column_sidecars()` (`fulu/p2p-interface.md`
+        // L667–670, L746–747).
+        Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1 => {
+            MAX_REQUEST_DATA_COLUMN_SIDECARS as usize
+        }
         // Goodbye too: its response is one chunk (`phase0/p2p-interface.md` L1483).
         _ => 1,
     };
@@ -530,11 +549,10 @@ pub fn encode_response_chunks<E: EthSpec>(
             chunks.len()
         )));
     }
-    let mut out = Vec::new();
     for (i, ReceivedChunk { context, chunk }) in chunks.iter().enumerate() {
-        let bytes = match chunk {
+        match chunk {
             ResponseChunk::Success(response) => {
-                if response.protocol() != protocol {
+                if !response.answers(protocol) {
                     return Err(invalid_response(format!("{response:?} on {protocol}")));
                 }
                 if context.is_some() != protocol.has_context_bytes() {
@@ -542,9 +560,8 @@ pub fn encode_response_chunks<E: EthSpec>(
                         "context bytes {context:?} on {protocol}"
                     )));
                 }
-                encode_success_chunk(*context, &response.ssz_bytes())
             }
-            ResponseChunk::Error { code, message } => {
+            ResponseChunk::Error { code, .. } => {
                 if i + 1 != chunks.len() {
                     return Err(invalid_response("an error chunk before the last".into()));
                 }
@@ -558,12 +575,21 @@ pub fn encode_response_chunks<E: EthSpec>(
                         "{protocol} does not specify 3: ResourceUnavailable"
                     )));
                 }
-                encode_error_chunk(*code, message)
             }
-        };
-        out.push(bytes.map_err(|e| invalid_response(e.to_string()))?);
+        }
     }
-    Ok(out)
+    Ok(())
+}
+
+/// The wire bytes of one chunk [`check_response`] passed.
+fn encode_checked_chunk<E: EthSpec>(chunk: &ReceivedChunk<E>) -> io::Result<Vec<u8>> {
+    match &chunk.chunk {
+        ResponseChunk::Success(response) => {
+            encode_success_chunk(chunk.context, &response.ssz_bytes())
+        }
+        ResponseChunk::Error { code, message } => encode_error_chunk(*code, message),
+    }
+    .map_err(|e| invalid_response(e.to_string()))
 }
 
 /// The req/resp codec of one stream.
@@ -623,14 +649,20 @@ impl<E: EthSpec> RpcCodec<E> {
     }
 }
 
-/// Our answer to one inbound request: its chunks and, if they are rate limited, the pacer of
-/// the requester's bucket.
-#[derive(Debug, Clone)]
+/// Our answer to one inbound request: its chunks and how they are paced, by the pacer of the
+/// requester's bucket (each chunk charged as it goes) or by the tokens booked for a column
+/// answer, and the place a column answer holds until the writer returns.
+#[derive(Debug)]
 pub struct Answer<E: EthSpec> {
     /// The chunks, in order.
     pub chunks: Vec<ReceivedChunk<E>>,
-    /// Paces the chunks; `None` sends them at once.
+    /// Paces the chunks, each charged as it is next to go; `None` with `booked` neither sends
+    /// them at once.
     pub pacer: Option<ChunkPacer>,
+    /// The tokens booked for the chunks when the request was admitted; used before `pacer`.
+    pub booked: Option<Box<BookedChunks>>,
+    /// The column answer's place, given back when the writer returns or is dropped.
+    pub permit: Option<Box<AnswerPermit>>,
 }
 
 impl<E: EthSpec> From<Vec<ReceivedChunk<E>>> for Answer<E> {
@@ -639,6 +671,8 @@ impl<E: EthSpec> From<Vec<ReceivedChunk<E>>> for Answer<E> {
         Self {
             chunks,
             pacer: None,
+            booked: None,
+            permit: None,
         }
     }
 }
@@ -698,10 +732,13 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
         Err(inbound_only())
     }
 
-    /// Checks the whole answer ([`encode_response`]), then writes each chunk whole once its
-    /// token is due. A chunk whose write never completed (the future was dropped, or the write
-    /// failed) gets back the part of its token still ahead; one written whole stays charged
-    /// even if the flush after it fails, since the peer may have it all.
+    /// Checks the whole answer ([`encode_response`]'s rules), then encodes and writes each chunk
+    /// whole once its token is due, dropping each decoded chunk as it is encoded, so the answer
+    /// never holds more than its decoded chunks and one encoded one. With a pacer, a chunk whose
+    /// write never completed (the future was dropped, or the write failed) gets back the part of
+    /// its token still ahead, and one written whole stays charged even if the flush after it
+    /// fails, since the peer may have it all. Booked tokens are never given back here. The
+    /// answer's place goes back when this returns or is dropped.
     async fn write_response<T>(
         &mut self,
         protocol: &Protocol,
@@ -711,12 +748,50 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        for bytes in encode_response_chunks(*protocol, &answer.chunks)? {
-            let reservation = answer.pacer.as_ref().map(ChunkPacer::reserve);
-            if let Some(due) = reservation.as_ref().map(|r| r.due()) {
+        check_response(*protocol, &answer.chunks)?;
+        let Answer {
+            chunks,
+            pacer,
+            booked,
+            permit,
+        } = answer;
+        let _place = permit;
+        for (i, chunk) in (0u64..).zip(chunks) {
+            let bytes = encode_checked_chunk(&chunk)?;
+            drop(chunk);
+            let reservation = match &booked {
+                Some(_) => None,
+                None => pacer.as_ref().map(ChunkPacer::reserve),
+            };
+            let due = match &booked {
+                Some(booked) => Some(booked.due(i)),
+                None => reservation.as_ref().map(|r| r.due()),
+            };
+            if let Some(due) = due {
                 if due > tokio::time::Instant::now() {
                     tokio::time::sleep_until(due).await;
                 }
+            }
+            if let Some(booked) = &booked {
+                // A column chunk: written and flushed within the deadline, or the stream is
+                // reset and the answer's place goes back.
+                let write = async {
+                    io.write_all(&bytes).await?;
+                    io.flush().await
+                };
+                match tokio::time::timeout(booked.write_deadline(), write).await {
+                    Ok(written) => written?,
+                    Err(_) => {
+                        if let Some(metrics) = &self.inner.metrics {
+                            metrics.timed_out(Deadline::PerChunk);
+                        }
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "a column chunk was not written within its deadline",
+                        ));
+                    }
+                }
+                continue;
             }
             io.write_all(&bytes).await?;
             if let Some(reservation) = reservation {
@@ -1856,6 +1931,8 @@ mod tests {
         let answer = Answer {
             chunks,
             pacer: Some(pacer),
+            booked: None,
+            permit: None,
         };
         let mut io = Timed::default();
         inbound_codec()
@@ -1873,6 +1950,115 @@ mod tests {
         let lens: Vec<usize> = io.writes.iter().map(|(_, n)| *n).collect();
         assert_eq!(lens, whole);
         assert_eq!(metrics.rate_limited_count(BLOCKS), 4);
+    }
+
+    /// BUG-001, SEC-001: a column answer goes out at the tokens booked for it, holds its place
+    /// until the writer returns, written or not, and a write dropped midway refunds nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_booked_answer_paces_holds_its_place_and_never_refunds() {
+        use crate::rpc::limits::{BookedChunks, ColumnPlaces};
+        let limiter = shared_limiter(RateLimits {
+            blocks_by_range: Quota::new(1, Duration::from_secs(1)),
+            ..RateLimits::default()
+        });
+        let peer = libp2p::PeerId::random();
+        let places = ColumnPlaces::new(1, 1, None);
+        let start = Instant::now();
+        let booked = BookedChunks::book(&limiter, peer, BLOCKS, 3, None, Duration::from_secs(10));
+        let answer = Answer {
+            chunks: blocks(3),
+            pacer: None,
+            booked: Some(Box::new(booked)),
+            permit: places.try_take(peer, None).map(Box::new),
+        };
+        assert_eq!(places.held(), 1);
+        let mut io = Timed::default();
+        inbound_codec()
+            .write_response(&BLOCKS, &mut io, answer)
+            .await
+            .unwrap();
+        let at: Vec<u128> = io
+            .writes
+            .iter()
+            .map(|(t, _)| (*t - start).as_millis())
+            .collect();
+        assert_eq!(at, [0, 1000, 2000]);
+        assert_eq!(places.held(), 0, "given back once written");
+        // A write dropped before its second chunk: the place goes back, the tokens do not.
+        let start = Instant::now();
+        let booked = BookedChunks::book(&limiter, peer, BLOCKS, 3, None, Duration::from_secs(10));
+        let answer = Answer {
+            chunks: blocks(3),
+            pacer: None,
+            booked: Some(Box::new(booked)),
+            permit: places.try_take(peer, None).map(Box::new),
+        };
+        let mut io = Timed::default();
+        let mut codec = inbound_codec();
+        let write = codec.write_response(&BLOCKS, &mut io, answer);
+        assert!(tokio::time::timeout(Duration::from_millis(1500), write)
+            .await
+            .is_err());
+        assert_eq!(places.held(), 0, "given back when the write is dropped");
+        let due = limiter
+            .lock()
+            .unwrap()
+            .schedule(peer, BLOCKS, Instant::now());
+        assert!(
+            due - start >= Duration::from_secs(3),
+            "refunded: {:?}",
+            due - start
+        );
+    }
+
+    /// Accepts nothing: a requester that stopped reading, its window full.
+    struct NeverWrites;
+
+    impl AsyncWrite for NeverWrites {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    /// SEC-001: a due column chunk that cannot be written within the write deadline ends the
+    /// write, so the answer's place goes back long before the exchange timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_booked_chunk_not_written_in_time_gives_its_place_back() {
+        use crate::rpc::limits::{BookedChunks, ColumnPlaces};
+        let limiter = shared_limiter(RateLimits::default());
+        let peer = libp2p::PeerId::random();
+        let places = ColumnPlaces::new(1, 1, None);
+        let deadline = Duration::from_secs(1);
+        let answer = Answer {
+            chunks: blocks(2),
+            pacer: None,
+            booked: Some(Box::new(BookedChunks::book(
+                &limiter, peer, BLOCKS, 2, None, deadline,
+            ))),
+            permit: places.try_take(peer, None).map(Box::new),
+        };
+        let start = Instant::now();
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = RpcMetrics::register(&mut registry);
+        let mut codec = InboundCodec::new(codec().with_metrics(metrics.clone()));
+        let err = codec
+            .write_response(&BLOCKS, &mut NeverWrites, answer)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(start.elapsed(), deadline);
+        assert_eq!(places.held(), 0);
+        assert_eq!(metrics.timeouts(Deadline::PerChunk), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1917,6 +2103,8 @@ mod tests {
         let answer = Answer {
             chunks: blocks(3),
             pacer: Some(ChunkPacer::new(limiter.clone(), peer, BLOCKS, None)),
+            booked: None,
+            permit: None,
         };
         let mut io = Timed::default();
         let mut codec = inbound_codec();
@@ -1968,6 +2156,8 @@ mod tests {
         let answer = Answer {
             chunks: blocks(2),
             pacer: Some(ChunkPacer::new(limiter.clone(), peer, BLOCKS, None)),
+            booked: None,
+            permit: None,
         };
         let mut io = FlushFails::default();
         let err = inbound_codec()

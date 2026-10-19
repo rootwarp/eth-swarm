@@ -18,6 +18,12 @@
 //!   ID across the probe (`phase0` L309, L1228: "The requester MUST NOT make more than
 //!   `MAX_CONCURRENT_REQUESTS` concurrent requests with the same protocol ID"). A request over
 //!   it waits in that protocol's bounded queue; a full queue IGNOREs it.
+//! - [`BookedChunks`]: a column answer's tokens, booked in one go when its request is admitted
+//!   ([`RateLimiter::charge_block`]), so a peer pays for its request before any lookup runs and
+//!   cannot reset its way out of the bill: once the answer's size is known the tokens it does not
+//!   use are given back ([`BookedChunks::settle`]), never more, and a reset refunds nothing.
+//! - [`ColumnPlaces`]: the column answers held at once, from the lookup until the stream's
+//!   writer returns, at most one per peer ([`AnswerPermit`]).
 //! - [`ignore_queue`]: a bounded `tokio::sync::mpsc` queue fed with `try_send`. Overload never
 //!   blocks the swarm and never ACCEPTs: an item that does not fit is IGNOREd (dropped) and
 //!   counted in `queue_dropped_total{queue}`.
@@ -28,13 +34,16 @@
 
 use super::metrics::RpcMetrics;
 use super::MAX_CONCURRENT_REQUESTS;
+use crate::peer_caps::IpBucket;
+use futures::task::AtomicWaker;
 use libp2p::PeerId;
-use p2p_wire::rpc::protocols::Protocol;
+use p2p_wire::rpc::protocols::{Protocol, MAX_REQUEST_DATA_COLUMN_SIDECARS};
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -73,7 +82,10 @@ impl Quota {
 /// periods: under 5 s, the requester's first-byte and per-chunk deadline (ours, and the common
 /// client default). A peer within the request limit is slowed down, never timed out. Two full
 /// `BeaconBlocksByRange` answers from an empty bucket take 256 periods, about 5 s, inside the
-/// 10 s an exchange may take. `Goodbye` has no quota: its one response chunk ends the connection.
+/// 10 s an exchange may take. The column protocols count sidecars, and an answer holds no more
+/// than its quota delivers in [`COLUMN_ANSWER_WINDOW`] ([`RpcLimits::column_answer_sidecars`]:
+/// 512 + 5 s / 5 ms = 1,512 by default), so a paced answer is never cut by the requester's
+/// deadline. `Goodbye` has no quota: its one response chunk ends the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateLimits {
     /// `Status`: 5 at once, then one per 2 s.
@@ -84,6 +96,10 @@ pub struct RateLimits {
     pub ping: Quota,
     /// `BeaconBlocksByRange`, in blocks: 128 at once, then one per 20 ms (50 a second).
     pub blocks_by_range: Quota,
+    /// `DataColumnSidecarsByRange`, in sidecars: 512 at once, then one per 5 ms (200 a second).
+    pub data_columns_by_range: Quota,
+    /// `DataColumnSidecarsByRoot`, in sidecars: as by range.
+    pub data_columns_by_root: Quota,
 }
 
 impl Default for RateLimits {
@@ -93,6 +109,8 @@ impl Default for RateLimits {
             metadata: Quota::new(2, Duration::from_secs(2)),
             ping: Quota::new(2, Duration::from_secs(2)),
             blocks_by_range: Quota::new(128, Duration::from_millis(20)),
+            data_columns_by_range: Quota::new(512, Duration::from_millis(5)),
+            data_columns_by_root: Quota::new(512, Duration::from_millis(5)),
         }
     }
 }
@@ -107,6 +125,8 @@ impl RateLimits {
             Protocol::PingV1 => Some(self.ping),
             Protocol::BlocksByRangeV2 => Some(self.blocks_by_range),
             Protocol::GoodbyeV1 => None,
+            Protocol::DataColumnsByRangeV1 => Some(self.data_columns_by_range),
+            Protocol::DataColumnsByRootV1 => Some(self.data_columns_by_root),
         }
     }
 }
@@ -115,6 +135,58 @@ impl RateLimits {
 /// to every peer of a full swarm (160 connections) with headroom.
 pub const DEFAULT_OUTBOUND_QUEUE_LEN: usize = 256;
 
+/// The SSZ bytes one column answer may hold: 8 MiB \[est\]. An answer is cut at the last whole
+/// block that fits (the first block always goes, "Clients MAY limit the number of data column
+/// sidecars in the response", `fulu/p2p-interface.md` L682), so one epoch of 4 custody columns
+/// of 21-blob Gloas blocks (32 × 4 × 44,072 bytes, 5.4 MiB) fits whole.
+pub const MAX_COLUMN_RESPONSE_BYTES: usize = 8 << 20;
+
+/// How long a column answer's chunks may take to go out at the peer's quota \[est\]: 5 s, the
+/// requester's 10 s total less the queue wait and the lookup (2 s each) and a second to spare.
+pub const COLUMN_ANSWER_WINDOW: Duration = Duration::from_secs(5);
+
+/// Column answers held at once, over every peer, from the lookup until the stream's writer
+/// returns \[est\]. cl-chain runs as many reads at once (`cl_chain::reqresp::DEFAULT_MAX_READS`),
+/// so no lookup is refused there as overloaded.
+///
+/// Memory, an estimate and not a bound (allocator overhead and freed-but-kept heap aside), per
+/// held answer of at most [`MAX_COLUMN_RESPONSE_BYTES`] (8 MiB) of SSZ, with the network's caps
+/// (a 21-blob Gloas sidecar is 44 KB):
+///
+/// - the chain.v1 client's copy of the answer's SSZ, then its decoded sidecars, which replace
+///   it one sidecar at a time: about 8 MiB (the decoded form adds well under 1 % in headers),
+///   plus tonic's receive buffer of the message being decoded (one sidecar) and the HTTP/2
+///   window (64 KiB);
+/// - the chunk being written: its re-encoded SSZ, its snappy frames and the chunk buffer,
+///   three sidecars (about 130 KB);
+/// - the stream's muxer send buffer, up to its window (yamux: 256 KiB).
+///
+/// About 8.5 MiB per answer, so 8 × 8.5 MiB ≈ 68 MiB in cl-p2p, and cl-chain holds up to
+/// 8 reads × 8 MiB ≈ 64 MiB more while its answers are sent. With the preset's caps (no network
+/// config) one sidecar may be up to 8.5 MB, and the per-chunk copies alone could reach
+/// ≈ 25 MB per answer.
+pub const DEFAULT_MAX_COLUMN_ANSWERS: usize = 8;
+
+/// Column answers held at once by the peers of one IP (an IPv6 /58) \[est\]: 2, so one IP
+/// with its 8 inbound connections (`ConnectionCaps::max_established_incoming_per_ip`) cannot
+/// take all [`DEFAULT_MAX_COLUMN_ANSWERS`] places.
+pub const DEFAULT_MAX_COLUMN_ANSWERS_PER_IP: usize = 2;
+
+/// How long a due column chunk may take to be written \[est\]: 1 s. A requester that stopped
+/// reading fills its stream's window and then holds the next chunk; past this its stream is
+/// reset and the answer's place given back, so it cannot hold a place for the 10 s exchange
+/// timeout. Counted in `rpc_timeouts_total{kind="per_chunk"}`.
+pub const COLUMN_WRITE_DEADLINE: Duration = Duration::from_secs(1);
+
+/// Column requests waiting for their tokens or a place, over every peer \[est\]: at most 64 × a
+/// by-root request (136 KiB) held. Past it a request gets `2: ServerError`.
+pub const DEFAULT_COLUMN_QUEUE_LEN: usize = 64;
+
+/// How long an admitted column request waits for a place once its tokens are due \[est\]: 2 s,
+/// so that with a 2 s lookup its first byte goes out before the requester's 5 s deadline. Past
+/// it the request gets `2: ServerError`, counted.
+pub const COLUMN_QUEUE_WAIT: Duration = Duration::from_secs(2);
+
 /// The req/resp limits [`super::inbound::Control`] runs under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RpcLimits {
@@ -122,6 +194,22 @@ pub struct RpcLimits {
     pub rate: RateLimits,
     /// Outbound requests of one protocol that wait for a free slot; more are IGNOREd.
     pub outbound_queue_len: usize,
+    /// Column answers held at once, one per peer at most ([`ColumnPlaces`]).
+    pub max_column_answers: usize,
+    /// Column requests waiting at once; past it a request gets `2: ServerError` and counts in
+    /// `queue_dropped_total{queue="rpc_column_queue"}`.
+    pub column_queue_len: usize,
+    /// How long a request whose tokens are due waits for a place before `2: ServerError`.
+    pub column_queue_wait: Duration,
+    /// How long an answer's chunks may take at the quota ([`Self::column_answer_sidecars`]).
+    pub column_answer_window: Duration,
+    /// The SSZ bytes one column answer may hold.
+    pub max_column_response_bytes: usize,
+    /// Column answers held at once by the peers of one IP (an IPv6 /58).
+    pub max_column_answers_per_ip: usize,
+    /// How long a due column chunk may take to be written before its stream is reset and its
+    /// place given back.
+    pub column_write_deadline: Duration,
 }
 
 impl Default for RpcLimits {
@@ -129,7 +217,35 @@ impl Default for RpcLimits {
         Self {
             rate: RateLimits::default(),
             outbound_queue_len: DEFAULT_OUTBOUND_QUEUE_LEN,
+            max_column_answers: DEFAULT_MAX_COLUMN_ANSWERS,
+            column_queue_len: DEFAULT_COLUMN_QUEUE_LEN,
+            column_queue_wait: COLUMN_QUEUE_WAIT,
+            column_answer_window: COLUMN_ANSWER_WINDOW,
+            max_column_response_bytes: MAX_COLUMN_RESPONSE_BYTES,
+            max_column_answers_per_ip: DEFAULT_MAX_COLUMN_ANSWERS_PER_IP,
+            column_write_deadline: COLUMN_WRITE_DEADLINE,
         }
+    }
+}
+
+impl RpcLimits {
+    /// The most sidecars one answer of `protocol` holds: its share of what the quota delivers
+    /// from a full bucket within [`Self::column_answer_window`], `burst + window / period`,
+    /// split between the [`MAX_CONCURRENT_REQUESTS`] streams a peer may hold open, so two
+    /// answers at once both go out within the window; at most
+    /// `MAX_REQUEST_DATA_COLUMN_SIDECARS`. A booking also never takes more than the bucket
+    /// still delivers in the window ([`RateLimiter::deliverable`]).
+    #[must_use]
+    pub fn column_answer_sidecars(&self, protocol: Protocol) -> u64 {
+        let Some(quota) = self.rate.quota(protocol) else {
+            return MAX_REQUEST_DATA_COLUMN_SIDECARS;
+        };
+        let paced = match quota.period.as_nanos() {
+            0 => return MAX_REQUEST_DATA_COLUMN_SIDECARS,
+            period => self.column_answer_window.as_nanos() / period,
+        };
+        let full = u64::from(quota.burst).saturating_add(u64::try_from(paced).unwrap_or(u64::MAX));
+        (full / MAX_CONCURRENT_REQUESTS as u64).min(MAX_REQUEST_DATA_COLUMN_SIDECARS)
     }
 }
 
@@ -153,6 +269,52 @@ struct Bucket {
     refunded: Duration,
     /// Which bucket this is, so a charge on a pruned bucket refunds nothing to its successor.
     id: u64,
+}
+
+/// `n` chunks' tokens booked at once ([`RateLimiter::charge_block`]): chunk `i` may go at
+/// [`BlockCharge::due`] of `i`.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
+pub struct BlockCharge {
+    /// When the first token's period starts, and the earliest any chunk goes.
+    start: Instant,
+    /// The earliest any chunk goes: when the block was booked.
+    booked_at: Instant,
+    period: Duration,
+    tolerance: Duration,
+    /// Tokens still booked.
+    n: u64,
+    booked: Option<Booking>,
+}
+
+impl BlockCharge {
+    /// When chunk `i` (0-based) may be sent, as booked.
+    #[must_use]
+    pub fn due(&self, i: u64) -> Instant {
+        self.due_after(i, Duration::ZERO)
+    }
+
+    /// When chunk `i` may be sent once the bucket moved back `shift` since the booking (a
+    /// refund of a booking before it): the whole booking moves up by that much, never to before
+    /// it was booked.
+    fn due_after(&self, i: u64, shift: Duration) -> Instant {
+        let start = self
+            .start
+            .checked_sub(shift)
+            .map_or(self.booked_at, |s| s.max(self.booked_at));
+        let at = start
+            + self
+                .period
+                .saturating_mul(u32::try_from(i).unwrap_or(u32::MAX));
+        at.checked_sub(self.tolerance)
+            .map_or(self.booked_at, |at| at.max(self.booked_at))
+    }
+
+    /// The tokens booked.
+    #[must_use]
+    pub fn tokens(&self) -> u64 {
+        self.n
+    }
 }
 
 /// One chunk's token, as [`RateLimiter::charge`] booked it: when the chunk may go and, for
@@ -226,6 +388,129 @@ impl RateLimiter {
         }
     }
 
+    /// Charges `n` response chunks of `protocol` to `peer` at once, one period after the other
+    /// from the bucket's next free period: what [`Self::charge`] `n` times does, in one step.
+    pub fn charge_block(
+        &mut self,
+        peer: PeerId,
+        protocol: Protocol,
+        n: u64,
+        now: Instant,
+    ) -> BlockCharge {
+        let Some(quota) = self.limits.quota(protocol) else {
+            return BlockCharge {
+                start: now,
+                booked_at: now,
+                period: Duration::ZERO,
+                tolerance: Duration::ZERO,
+                n,
+                booked: None,
+            };
+        };
+        let created = &mut self.created;
+        let bucket = self.buckets.entry((peer, protocol)).or_insert_with(|| {
+            *created += 1;
+            Bucket {
+                next: now,
+                refunded: Duration::ZERO,
+                id: *created,
+            }
+        });
+        let start = bucket.next.max(now);
+        let span = quota
+            .period
+            .saturating_mul(u32::try_from(n).unwrap_or(u32::MAX));
+        bucket.next = start + span;
+        BlockCharge {
+            start,
+            booked_at: now,
+            period: quota.period,
+            tolerance: quota.tolerance(),
+            n,
+            booked: Some(Booking {
+                bucket: bucket.id,
+                until: bucket.next,
+                refunded: bucket.refunded,
+            }),
+        }
+    }
+
+    /// How many chunks of `protocol` the bucket of `peer` can still deliver from `now` within
+    /// `window`: the chunks a booking now would have due by `now + window`.
+    #[must_use]
+    pub fn deliverable(
+        &self,
+        peer: PeerId,
+        protocol: Protocol,
+        window: Duration,
+        now: Instant,
+    ) -> u64 {
+        let Some(quota) = self.limits.quota(protocol) else {
+            return u64::MAX;
+        };
+        let start = self
+            .buckets
+            .get(&(peer, protocol))
+            .map_or(now, |b| b.next.max(now));
+        let horizon = now + window + quota.tolerance();
+        let Some(span) = horizon.checked_duration_since(start) else {
+            return 0;
+        };
+        match quota.period.as_nanos() {
+            0 => u64::MAX,
+            period => u64::try_from(span.as_nanos() / period)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        }
+    }
+
+    /// When chunk `i` of `charge` may be sent now: as booked, moved up by every refund of
+    /// `peer`'s `protocol` bucket since the booking.
+    #[must_use]
+    pub fn due_of(
+        &self,
+        peer: PeerId,
+        protocol: Protocol,
+        charge: &BlockCharge,
+        i: u64,
+    ) -> Instant {
+        let shift = charge
+            .booked
+            .as_ref()
+            .and_then(|booked| {
+                self.buckets
+                    .get(&(peer, protocol))
+                    .filter(|b| b.id == booked.bucket)
+                    .map(|b| b.refunded.saturating_sub(booked.refunded))
+            })
+            .unwrap_or_default();
+        charge.due_after(i, shift)
+    }
+
+    /// Gives back the last `unused` tokens of `charge`, as far as they are still ahead of
+    /// `now` (see [`Self::refund`]); `charge` keeps the rest.
+    pub fn refund_tail(
+        &mut self,
+        peer: PeerId,
+        protocol: Protocol,
+        charge: &mut BlockCharge,
+        unused: u64,
+        now: Instant,
+    ) {
+        let unused = unused.min(charge.n);
+        if unused == 0 {
+            return;
+        }
+        charge.n -= unused;
+        let Some(booked) = &charge.booked else {
+            return;
+        };
+        let back = charge
+            .period
+            .saturating_mul(u32::try_from(unused).unwrap_or(u32::MAX));
+        self.give_back(peer, protocol, booked, back, now);
+    }
+
     /// [`Self::charge`], for a chunk that is never refunded: when it may be sent.
     pub fn schedule(&mut self, peer: PeerId, protocol: Protocol, now: Instant) -> Instant {
         self.charge(peer, protocol, now).due
@@ -243,6 +528,19 @@ impl RateLimiter {
         let (Some(quota), Some(booked)) = (self.limits.quota(protocol), charge.booked) else {
             return;
         };
+        self.give_back(peer, protocol, &booked, quota.period, now);
+    }
+
+    /// Moves `peer`'s `protocol` bucket back by what is still ahead of `now` of the last `most`
+    /// of the span `booked` ends, at most `most`.
+    fn give_back(
+        &mut self,
+        peer: PeerId,
+        protocol: Protocol,
+        booked: &Booking,
+        most: Duration,
+        now: Instant,
+    ) {
         let Some(bucket) = self
             .buckets
             .get_mut(&(peer, protocol))
@@ -255,7 +553,7 @@ impl RateLimiter {
             .until
             .checked_sub(moved_since)
             .map_or(Duration::ZERO, |until| until.saturating_duration_since(now))
-            .min(quota.period);
+            .min(most);
         let back = bucket
             .next
             .checked_sub(live)
@@ -392,6 +690,241 @@ impl Drop for Reservation {
     }
 }
 
+/// One column answer's tokens, booked when its request was admitted (see the module docs).
+/// Dropping it refunds nothing.
+pub struct BookedChunks {
+    limiter: SharedLimiter,
+    peer: PeerId,
+    protocol: Protocol,
+    charge: BlockCharge,
+    metrics: Option<RpcMetrics>,
+    write_deadline: Duration,
+}
+
+impl fmt::Debug for BookedChunks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BookedChunks")
+            .field("peer", &self.peer)
+            .field("protocol", &self.protocol)
+            .field("charge", &self.charge)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BookedChunks {
+    /// Books `n` chunks of `protocol` to `peer` in `limiter`, each to be written within
+    /// `write_deadline` once due, counting every withheld chunk in
+    /// `rpc_rate_limited_total{protocol}` if `metrics` is given.
+    #[must_use]
+    pub fn book(
+        limiter: &SharedLimiter,
+        peer: PeerId,
+        protocol: Protocol,
+        n: u64,
+        metrics: Option<RpcMetrics>,
+        write_deadline: Duration,
+    ) -> Self {
+        let charge = lock(limiter).charge_block(peer, protocol, n, Instant::now());
+        Self {
+            limiter: Arc::clone(limiter),
+            peer,
+            protocol,
+            charge,
+            metrics,
+            write_deadline,
+        }
+    }
+
+    /// When the first chunk may go: the lookup waits for it.
+    #[must_use]
+    pub fn ready_at(&self) -> Instant {
+        lock(&self.limiter).due_of(self.peer, self.protocol, &self.charge, 0)
+    }
+
+    /// How long a due chunk may take to be written.
+    #[must_use]
+    pub fn write_deadline(&self) -> Duration {
+        self.write_deadline
+    }
+
+    /// The tokens still booked.
+    #[must_use]
+    pub fn tokens(&self) -> u64 {
+        self.charge.tokens()
+    }
+
+    /// The answer holds `used` chunks: the tokens past them go back, as far as still ahead.
+    pub fn settle(&mut self, used: u64) {
+        let unused = self.charge.tokens().saturating_sub(used);
+        lock(&self.limiter).refund_tail(
+            self.peer,
+            self.protocol,
+            &mut self.charge,
+            unused,
+            Instant::now(),
+        );
+    }
+
+    /// When chunk `i` may be written; counts it as withheld if that is still ahead.
+    #[must_use]
+    pub fn due(&self, i: u64) -> Instant {
+        let due = lock(&self.limiter).due_of(self.peer, self.protocol, &self.charge, i);
+        if due > Instant::now() {
+            if let Some(metrics) = &self.metrics {
+                metrics.rate_limited(self.protocol);
+            }
+            tracing::debug!(
+                peer = %self.peer,
+                protocol = %self.protocol,
+                chunk = i,
+                "over quota: column chunk withheld"
+            );
+        }
+        due
+    }
+}
+
+/// The column answers held at once (see the module docs). Cheap to clone: every clone is the
+/// same set of places.
+#[derive(Clone)]
+pub struct ColumnPlaces(Arc<Places>);
+
+struct Places {
+    max: usize,
+    max_per_ip: usize,
+    state: Mutex<PlacesState>,
+    waker: AtomicWaker,
+    metrics: Option<RpcMetrics>,
+}
+
+#[derive(Default)]
+struct PlacesState {
+    peers: HashSet<PeerId>,
+    per_ip: HashMap<IpBucket, usize>,
+    bytes: usize,
+}
+
+impl fmt::Debug for ColumnPlaces {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ColumnPlaces")
+            .field("max", &self.0.max)
+            .field("held", &self.held())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ColumnPlaces {
+    /// `max` places, at most `max_per_ip` to the peers of one IP, reported in
+    /// `rpc_column_answers` and `rpc_column_answer_bytes` if `metrics` is given.
+    #[must_use]
+    pub fn new(max: usize, max_per_ip: usize, metrics: Option<RpcMetrics>) -> Self {
+        Self(Arc::new(Places {
+            max,
+            max_per_ip,
+            state: Mutex::default(),
+            waker: AtomicWaker::new(),
+            metrics,
+        }))
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, PlacesState> {
+        self.0.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A place for `peer` at `ip` (its IP's bucket, `None` without one), unless every place
+    /// is held, `peer` holds one, or the peers of `ip` hold their most.
+    #[must_use]
+    pub(crate) fn try_take(&self, peer: PeerId, ip: Option<IpBucket>) -> Option<AnswerPermit> {
+        let mut state = self.state();
+        let ip_full =
+            ip.is_some_and(|ip| state.per_ip.get(&ip).copied().unwrap_or(0) >= self.0.max_per_ip);
+        if state.peers.len() >= self.0.max || ip_full || !state.peers.insert(peer) {
+            return None;
+        }
+        if let Some(ip) = ip {
+            *state.per_ip.entry(ip).or_default() += 1;
+        }
+        self.report(&state);
+        Some(AnswerPermit {
+            places: self.clone(),
+            peer,
+            ip,
+            bytes: 0,
+        })
+    }
+
+    /// Places held now.
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.state().peers.len()
+    }
+
+    /// Whether `peer` holds a place.
+    #[must_use]
+    pub fn holds(&self, peer: &PeerId) -> bool {
+        self.state().peers.contains(peer)
+    }
+
+    /// Wakes `waker` once a place is given back.
+    pub fn register(&self, waker: &std::task::Waker) {
+        self.0.waker.register(waker);
+    }
+
+    fn report(&self, state: &PlacesState) {
+        if let Some(metrics) = &self.0.metrics {
+            metrics.set_column_answers(state.peers.len(), state.bytes);
+        }
+    }
+}
+
+/// One held column answer's place ([`ColumnPlaces::try_take`]), given back on drop: when the
+/// stream's writer returns, or when the answer never got there.
+pub struct AnswerPermit {
+    places: ColumnPlaces,
+    peer: PeerId,
+    ip: Option<IpBucket>,
+    bytes: usize,
+}
+
+impl fmt::Debug for AnswerPermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnswerPermit")
+            .field("peer", &self.peer)
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnswerPermit {
+    /// The answer holds `bytes` of SSZ from now on.
+    pub fn hold_bytes(&mut self, bytes: usize) {
+        let mut state = self.places.state();
+        state.bytes = state.bytes.saturating_sub(self.bytes).saturating_add(bytes);
+        self.bytes = bytes;
+        self.places.report(&state);
+    }
+}
+
+impl Drop for AnswerPermit {
+    fn drop(&mut self) {
+        {
+            let mut state = self.places.state();
+            state.peers.remove(&self.peer);
+            if let Some(ip) = self.ip {
+                if let Some(n) = state.per_ip.get_mut(&ip) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        state.per_ip.remove(&ip);
+                    }
+                }
+            }
+            state.bytes = state.bytes.saturating_sub(self.bytes);
+            self.places.report(&state);
+        }
+        self.places.0.waker.wake();
+    }
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct QueueLabel {
     queue: &'static str,
@@ -423,7 +956,7 @@ impl QueueMetrics {
         drop(self.dropped.get_or_create(&QueueLabel { queue }));
     }
 
-    fn count(&self, queue: &'static str) {
+    pub(crate) fn count(&self, queue: &'static str) {
         self.dropped.get_or_create(&QueueLabel { queue }).inc();
     }
 
@@ -513,6 +1046,8 @@ pub fn outbound_queue_name(protocol: Protocol) -> &'static str {
         Protocol::PingV1 => "rpc_outbound_ping",
         Protocol::BlocksByRangeV2 => "rpc_outbound_blocks_by_range",
         Protocol::GoodbyeV1 => "rpc_outbound_goodbye",
+        Protocol::DataColumnsByRangeV1 => "rpc_outbound_data_columns_by_range",
+        Protocol::DataColumnsByRootV1 => "rpc_outbound_data_columns_by_root",
     }
 }
 
@@ -614,6 +1149,134 @@ mod tests {
 
     fn at(start: Instant, ms: u64) -> Instant {
         start + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn a_block_charge_books_its_tokens_and_gives_back_only_the_unused_tail() {
+        let quota = Quota::new(2, Duration::from_secs(1));
+        let mut limiter = RateLimiter::new(RateLimits {
+            data_columns_by_range: quota,
+            ..RateLimits::default()
+        });
+        let peer = PeerId::random();
+        let p = Protocol::DataColumnsByRangeV1;
+        let now = Instant::now();
+        let mut block = limiter.charge_block(peer, p, 5, now);
+        assert_eq!(block.tokens(), 5);
+        // Two at once (the burst), then one a second.
+        assert_eq!(block.due(0), now);
+        assert_eq!(block.due(1), now);
+        assert_eq!(block.due(2), now + Duration::from_secs(1));
+        assert_eq!(block.due(4), now + Duration::from_secs(3));
+        // The answer used two: three periods go back; the bucket is where two chunks leave it.
+        limiter.refund_tail(peer, p, &mut block, 3, now);
+        assert_eq!(block.tokens(), 2);
+        assert_eq!(limiter.schedule(peer, p, now), now + Duration::from_secs(1));
+        // Nothing past what was booked goes back.
+        limiter.refund_tail(peer, p, &mut block, 10, now);
+        assert_eq!(block.tokens(), 0);
+        let goodbye = limiter.charge_block(peer, Protocol::GoodbyeV1, 3, now);
+        assert_eq!(goodbye.due(2), now);
+    }
+
+    #[test]
+    fn column_answers_hold_what_their_quota_delivers_in_the_window() {
+        let limits = RpcLimits::default();
+        assert_eq!(
+            limits.column_answer_sidecars(Protocol::DataColumnsByRangeV1),
+            756
+        );
+        assert_eq!(
+            limits.column_answer_sidecars(Protocol::DataColumnsByRootV1),
+            756
+        );
+        assert_eq!(
+            limits.column_answer_sidecars(Protocol::GoodbyeV1),
+            MAX_REQUEST_DATA_COLUMN_SIDECARS
+        );
+        let fast = RpcLimits {
+            rate: RateLimits {
+                data_columns_by_range: Quota::new(1, Duration::ZERO),
+                ..RateLimits::default()
+            },
+            ..limits
+        };
+        assert_eq!(
+            fast.column_answer_sidecars(Protocol::DataColumnsByRangeV1),
+            MAX_REQUEST_DATA_COLUMN_SIDECARS
+        );
+    }
+
+    /// BUG-002: a booking takes what the bucket can still deliver within the window, and a
+    /// tail refund brings the bookings behind it forward.
+    #[test]
+    fn bookings_fit_the_window_and_follow_a_refund() {
+        let quota = Quota::new(2, Duration::from_secs(1));
+        let mut limiter = RateLimiter::new(RateLimits {
+            data_columns_by_range: quota,
+            ..RateLimits::default()
+        });
+        let peer = PeerId::random();
+        let p = Protocol::DataColumnsByRangeV1;
+        let now = Instant::now();
+        let window = Duration::from_secs(4);
+        // A full bucket: two at once, then one a second for four seconds.
+        assert_eq!(limiter.deliverable(peer, p, window, now), 6);
+        let mut first = limiter.charge_block(peer, p, 4, now);
+        assert_eq!(limiter.deliverable(peer, p, window, now), 2);
+        let second = limiter.charge_block(peer, p, 2, now);
+        assert_eq!(limiter.deliverable(peer, p, window, now), 0);
+        assert_eq!(
+            limiter.due_of(peer, p, &second, 0),
+            now + Duration::from_secs(3)
+        );
+        // The first answer used one: its three unused periods go back, and the second moves up
+        // behind the one that was used.
+        limiter.refund_tail(peer, p, &mut first, 3, now);
+        assert_eq!(limiter.due_of(peer, p, &second, 0), now);
+        assert_eq!(
+            limiter.due_of(peer, p, &second, 1),
+            now + Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn column_places_hold_one_answer_per_peer_up_to_the_most() {
+        let metrics = RpcMetrics::register(&mut Registry::default());
+        let places = ColumnPlaces::new(2, 2, Some(metrics.clone()));
+        let (a, b, c) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let mut first = places.try_take(a, None).unwrap();
+        assert!(places.try_take(a, None).is_none(), "one per peer");
+        let second = places.try_take(b, None).unwrap();
+        assert!(places.try_take(c, None).is_none(), "every place held");
+        first.hold_bytes(10);
+        assert!(places.holds(&a));
+        assert_eq!((places.held(), metrics.column_answers_held()), (2, 2));
+        assert_eq!(metrics.column_answer_bytes_held(), 10);
+        drop(first);
+        assert_eq!(places.held(), 1);
+        assert_eq!(metrics.column_answer_bytes_held(), 0);
+        assert!(places.try_take(c, None).is_some());
+        drop(second);
+        // At most two places per IP, whatever the peers.
+        let places = ColumnPlaces::new(8, 2, None);
+        let one = Some(crate::peer_caps::IpBucket::V4(
+            std::net::Ipv4Addr::LOCALHOST,
+        ));
+        let other = Some(crate::peer_caps::IpBucket::V4(std::net::Ipv4Addr::new(
+            10, 0, 0, 1,
+        )));
+        let held: Vec<_> = (0..2)
+            .map(|_| places.try_take(PeerId::random(), one).unwrap())
+            .collect();
+        assert!(
+            places.try_take(PeerId::random(), one).is_none(),
+            "the IP's two are held"
+        );
+        assert!(places.try_take(PeerId::random(), other).is_some());
+        drop(held);
+        assert!(places.try_take(PeerId::random(), one).is_some());
+        assert!(format!("{places:?}").contains("max: 8"));
     }
 
     #[test]

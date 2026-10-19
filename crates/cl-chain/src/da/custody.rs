@@ -19,11 +19,11 @@
 //! # Advertising: [`Advertise`]
 //!
 //! What peers are told (ENR `cgc`, MetaData `custody_group_count`) is a separate switch from
-//! what the node custodies. Until cl-chain serves `DataColumnsByRange`/`DataColumnsByRoot`, a
-//! node that advertises 4 groups would be asked for columns it cannot return, so the default is
-//! [`Advertise::Withheld`]: peers are told 0 while the node still custodies and subscribes to
-//! its 4 groups. [`Advertise::Custody`] advertises the stored count; turn it on for public
-//! peers once column serving lands. Peers MAY reject a count below `CUSTODY_REQUIREMENT`
+//! what the node custodies. cl-chain serves its custody columns by range and by root
+//! ([`crate::reqresp`]), so the default is [`Advertise::Custody`]: peers are told the stored
+//! count, 4 groups on a first start, and may ask for those columns. [`Advertise::Withheld`]
+//! tells them 0 while the node still custodies and subscribes to its groups, for a node that
+//! must not be asked for columns. Peers MAY reject a count below `CUSTODY_REQUIREMENT`
 //! (`fulu/p2p-interface.md`), so the choice is made before the first public advertisement.
 
 use cl_chain_columns::{ColumnWriter, CustodyRecord};
@@ -81,10 +81,10 @@ pub struct EnrError(pub String);
 /// What peers are told the custody group count is; see the module docs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Advertise {
-    /// The stored count.
-    Custody,
-    /// 0, whatever the node custodies: the default until column serving lands.
+    /// The stored count: the default, since the custody columns are served.
     #[default]
+    Custody,
+    /// 0, whatever the node custodies.
     Withheld,
 }
 
@@ -347,6 +347,20 @@ mod tests {
         Custody::open(writer, LocalEnr::new(), NODE, advertise, 100).unwrap()
     }
 
+    /// Exit 9c: by default the ENR advertises `cgc` = 4, the custody the node serves.
+    #[test]
+    fn by_default_the_enr_advertises_cgc_4() {
+        let dir = tempfile::tempdir().unwrap();
+        let custody = open(&dir, Advertise::default());
+        assert_eq!(custody.enr().cgc(), Some(CUSTODY_REQUIREMENT));
+        assert_eq!(custody.enr().cgc(), Some(4));
+        assert_eq!(custody.advertised_cgc(), 4);
+        assert_eq!(custody.metadata().custody_group_count, 4);
+        // Across a restart too.
+        drop(custody);
+        assert_eq!(open(&dir, Advertise::default()).enr().cgc(), Some(4));
+    }
+
     #[test]
     fn a_first_start_custodies_four_groups_and_the_enr_says_four() {
         let dir = tempfile::tempdir().unwrap();
@@ -411,7 +425,7 @@ mod tests {
     #[test]
     fn a_withheld_count_advertises_zero() {
         let dir = tempfile::tempdir().unwrap();
-        let mut custody = open(&dir, Advertise::default());
+        let mut custody = open(&dir, Advertise::Withheld);
         assert_eq!(custody.advertised_cgc(), 0);
         assert_eq!(custody.enr().cgc(), Some(0));
         assert_eq!(custody.custody_columns().len(), 4);

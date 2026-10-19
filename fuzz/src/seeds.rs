@@ -9,7 +9,7 @@
 //! oversize frame body, a frame claiming more than 64 KiB and one claiming more than 4 GiB, too
 //! many empty frames), data after an error chunk and a response over its byte budget. The
 //! control targets get the same for the inbound requests, `rpc_chunk` for every protocol in both
-//! directions; the gossip and ENR seeds are in [`gossip`] and [`record`].
+//! directions (the column protocols' sidecars of both forks and their requests among them); the gossip and ENR seeds are in [`gossip`] and [`record`].
 //!
 //! Everything here is deterministic, so `tests/corpus.rs` can check the committed corpus is
 //! exactly what this module builds.
@@ -26,7 +26,8 @@ use p2p_wire::rpc::codec::{
     MAX_EMPTY_FRAMES, MAX_FRAME_BODY_LEN,
 };
 use p2p_wire::rpc::messages::{
-    BlocksByRangeV2Request, ForkDigest, Goodbye, Ping, MAX_ERROR_MESSAGE_LEN,
+    BlocksByRangeV2Request, DataColumnsByRangeV1Request, DataColumnsByRootIdentifier,
+    DataColumnsByRootV1Request, ForkDigest, Goodbye, Ping, MAX_ERROR_MESSAGE_LEN,
 };
 use p2p_wire::rpc::protocols::{Protocol, ResultCode};
 use p2p_wire::testkit;
@@ -432,7 +433,7 @@ fn rpc_chunk(seeds: &mut Vec<Seed>, status: &[u8], metadata: &[u8], ping: &[u8])
             .iter()
             .position(|p| *p == protocol)
             .expect("every protocol is in ALL");
-        u8::try_from(i).expect("five protocols")
+        u8::try_from(i).expect("seven protocols")
     };
     let range = BlocksByRangeV2Request {
         start_slot: 7,
@@ -507,4 +508,111 @@ fn rpc_chunk(seeds: &mut Vec<Seed>, status: &[u8], metadata: &[u8], ping: &[u8])
     let bomb = framed(BLOCK_BOMB_LEN, &vec![0; BLOCK_BOMB_LEN]);
     sink.add("snappy-bomb-1mib-within-bound", &cat(&[&head, &bomb]));
     sink.truncated_and_trailing(&gloas);
+
+    for (protocol, name) in [
+        (Protocol::DataColumnsByRangeV1, "columns-range-"),
+        (Protocol::DataColumnsByRootV1, "columns-root-"),
+    ] {
+        columns(seeds, target, index(protocol), protocol, name);
+    }
+}
+
+/// `rpc_chunk` for a column protocol, after its index `i`: its request (valid, past its lists'
+/// limits, cut short, with a byte after it, over its bound) and its sidecar chunks (Gloas and
+/// Fulu, a sidecar under another fork's digest, an unknown digest, the result codes and the
+/// malformed payloads), named `{prefix}*`.
+fn columns(seeds: &mut Vec<Seed>, target: &'static str, i: u8, protocol: Protocol, prefix: &str) {
+    let id = |byte: u8, columns: Vec<u64>| DataColumnsByRootIdentifier {
+        block_root: [byte; 32].into(),
+        columns: columns.try_into().expect("within NUMBER_OF_COLUMNS"),
+    };
+    let request = match protocol {
+        Protocol::DataColumnsByRangeV1 => DataColumnsByRangeV1Request {
+            start_slot: 64,
+            count: 32,
+            columns: vec![1, 47, 87, 102].try_into().expect("four columns"),
+        }
+        .as_ssz_bytes(),
+        _ => DataColumnsByRootV1Request(
+            vec![id(1, vec![1, 47]), id(2, vec![87, 102])]
+                .try_into()
+                .expect("two identifiers"),
+        )
+        .as_ssz_bytes(),
+    };
+    let bounds = protocol
+        .request_bounds()
+        .expect("a column request has a body");
+    let request_prefix = format!("{prefix}request-");
+    let mut sink = Sink {
+        seeds,
+        target,
+        lead: &[i | REQUEST_SELECTOR],
+        prefix: &request_prefix,
+    };
+    let valid = encode_chunk(&request).expect("valid request");
+    sink.add("valid", &valid);
+    sink.add("prefix-over-type-bound", &framed(bounds.max + 1, &[0; 16]));
+    // A list one past its limit.
+    let past = match protocol {
+        Protocol::DataColumnsByRangeV1 => {
+            let mut ssz = cat(&[
+                &64u64.to_le_bytes(),
+                &1u64.to_le_bytes(),
+                &20u32.to_le_bytes(),
+            ]);
+            ssz.extend(std::iter::repeat_n(0u8, 129 * 8));
+            ssz
+        }
+        _ => {
+            let mut ssz: Vec<u8> = (0..129u32)
+                .flat_map(|n| (129 * 4 + n * 40).to_le_bytes())
+                .collect();
+            for _ in 0..129 {
+                ssz.extend(cat(&[&[0; 32], &36u32.to_le_bytes(), &[0; 4]]));
+            }
+            ssz
+        }
+    };
+    sink.add(
+        "list-past-its-limit",
+        &encode_chunk(&past).expect("within MAX_PAYLOAD_SIZE"),
+    );
+    sink.bad_frames(&[], request.len(), None);
+    sink.truncated_and_trailing(&valid);
+
+    let mut sink = Sink {
+        seeds,
+        target,
+        lead: &[i],
+        prefix,
+    };
+    let gloas = testkit::gloas_sidecar::<E>(9, 47).as_ssz_bytes();
+    let fulu = testkit::fulu_sidecar::<E>(9, 47).as_ssz_bytes();
+    let gloas_chunk = block_chunk(testkit::GLOAS_DIGEST, &gloas);
+    sink.add("gloas-valid", &gloas_chunk);
+    sink.add("fulu-valid", &block_chunk(testkit::FULU_DIGEST, &fulu));
+    sink.add(
+        "fulu-bpo-digest-valid",
+        &block_chunk(testkit::FULU_BPO_DIGEST, &fulu),
+    );
+    sink.add(
+        "gloas-sidecar-under-fulu-digest",
+        &block_chunk(testkit::FULU_DIGEST, &gloas),
+    );
+    sink.add(
+        "unknown-context-digest",
+        &block_chunk(testkit::UNKNOWN_DIGEST, &gloas),
+    );
+    sink.result_codes();
+    let head = cat(&[&[ResultCode::Success.as_byte()], &testkit::GLOAS_DIGEST]);
+    let bound = protocol
+        .response_max_len_with::<E>(Some(ForkName::Gloas), crate::contexts().network_caps())
+        .expect("a Gloas sidecar has a bound under the preset caps");
+    sink.bad_payloads(&head, bound, 1000);
+    sink.add(
+        "prefix-under-sidecar-minimum",
+        &cat(&[&head, &framed(10, &[0; 10])]),
+    );
+    sink.truncated_and_trailing(&gloas_chunk);
 }

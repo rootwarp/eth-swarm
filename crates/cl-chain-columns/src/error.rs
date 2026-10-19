@@ -56,6 +56,9 @@ pub enum Error {
     /// The custody group count never decreases (`fulu/validator.md`); nothing was written.
     #[error("cgc {requested} is below the stored cgc {stored}")]
     CgcDecrease { stored: u64, requested: u64 },
+    /// A read ran past its deadline and stopped.
+    #[error("the read ran past its deadline")]
+    Deadline,
     /// A stored row does not match the layout in [`keys`](crate::keys).
     #[error("corrupt row in table {table}")]
     Corrupt { table: &'static str },

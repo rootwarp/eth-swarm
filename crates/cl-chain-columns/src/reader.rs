@@ -1,14 +1,15 @@
 use std::{borrow::Cow, path::Path};
 
-use libmdbx::{Decodable, NoWriteMap, Table, Transaction, TransactionKind};
+use libmdbx::{Decodable, NoWriteMap, Table, Transaction, TransactionKind, RO};
 
 use crate::{
     env,
     error::{Error, Result},
     keys::{
-        block_prefix, column_key, decode_column_key, BlockRoot, ADVERTISED_CGC_KEY,
-        BLOCK_PREFIX_LEN, CGC_KEY, CGC_SET_SLOT_KEY, COLUMNS_TABLE, FINALIZED_SLOT_KEY,
-        FIRST_STORED_SLOT_KEY, METADATA_SEQ_KEY, META_TABLE, ROOTS_TABLE,
+        block_prefix, column_key, decode_column_key, BlockLink, BlockRoot, ADVERTISED_CGC_KEY,
+        BLOCK_PREFIX_LEN, CGC_KEY, CGC_SET_SLOT_KEY, COLUMNS_TABLE, CONTIGUOUS_FROM_KEY,
+        FINALIZED_SLOT_KEY, FIRST_STORED_SLOT_KEY, LINKS_TABLE, METADATA_SEQ_KEY, META_TABLE,
+        ROOTS_TABLE,
     },
 };
 
@@ -27,43 +28,137 @@ pub struct CustodyRecord {
     pub advertised_cgc: u64,
 }
 
+/// One stored column read by [`ColumnReader::columns_in_range`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeColumn {
+    /// The slot of its block.
+    pub slot: u64,
+    /// Its block.
+    pub block_root: BlockRoot,
+    /// Its column index.
+    pub index: u64,
+    /// Its SSZ, as stored.
+    pub ssz: Vec<u8>,
+}
+
+/// One block of a range read, with its link ([`BlockLink::Gap`] for a block stored without
+/// one).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeBlock {
+    /// Its slot.
+    pub slot: u64,
+    /// Its root.
+    pub block_root: BlockRoot,
+    /// How it ties to the stored block before it on its chain.
+    pub link: BlockLink,
+}
+
+/// What [`ColumnReader::columns_in_range`] read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RangeRead {
+    /// The columns, in key order: slot, then block root, then column index.
+    pub columns: Vec<RangeColumn>,
+    /// Every block of the range read, in key order, whether or not it holds a wanted column.
+    pub blocks: Vec<RangeBlock>,
+    /// Whether it stopped at its budget before the end of the range: the last block read may
+    /// be missing columns that are stored.
+    pub truncated: bool,
+}
+
+/// How much one [`ColumnReader::columns_in_range`] may read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeBudget {
+    /// The SSZ bytes of the columns read, at most.
+    pub max_bytes: usize,
+    /// The columns read, at most.
+    pub max_columns: usize,
+    /// The read stops with [`Error::Deadline`] once this passes.
+    pub deadline: Option<std::time::Instant>,
+}
+
+impl RangeBudget {
+    /// No bound at all.
+    #[must_use]
+    pub fn unbounded() -> Self {
+        Self {
+            max_bytes: usize::MAX,
+            max_columns: usize::MAX,
+            deadline: None,
+        }
+    }
+}
+
+/// How many rows a range read walks between two looks at its deadline.
+const DEADLINE_EVERY: usize = 64;
+
 /// Read-only view of the column store.
 ///
 /// [`ColumnReader::open`] opens the env with `MDBX_RDONLY`, so a reader process cannot start a
 /// write transaction at all, and this type has no write methods. Inside the writer process use
 /// [`ColumnWriter::reader`](crate::ColumnWriter::reader): MDBX refuses a second open of one env
 /// in the same process.
+///
+/// An env written before the links table existed (a reader of it that no writer has opened
+/// since) reads every block as [`BlockLink::Gap`] and as contiguous only from the slot after its
+/// highest stored block, as the writer's migration makes it ([`ColumnWriter::open`](
+/// crate::ColumnWriter::open)).
 #[derive(Debug)]
 pub struct ColumnReader {
     pub(crate) db: env::Env,
+    /// The env has no links table yet.
+    legacy: bool,
+}
+
+/// One read transaction over the store: every value read through it is of the same state
+/// ([`ColumnReader::snapshot`]).
+pub struct Snapshot<'r> {
+    txn: Transaction<'r, RO, NoWriteMap>,
+    legacy: bool,
+}
+
+impl std::fmt::Debug for Snapshot<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("legacy", &self.legacy)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ColumnReader {
     /// Opens an env the writer has already created.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Ok(Self {
-            db: env::open_ro(path.as_ref())?,
-        })
+        let db = env::open_ro(path.as_ref())?;
+        let legacy = {
+            let txn = db.begin_ro_txn()?;
+            match txn.open_table(Some(LINKS_TABLE)) {
+                Ok(_) => false,
+                Err(libmdbx::Error::NotFound) => true,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        Ok(Self { db, legacy })
     }
 
     pub(crate) fn from_env(db: env::Env) -> Self {
-        Self { db }
+        Self { db, legacy: false }
+    }
+
+    /// One read transaction to read several values of one state through.
+    pub fn snapshot(&self) -> Result<Snapshot<'_>> {
+        Ok(Snapshot {
+            txn: self.db.begin_ro_txn()?,
+            legacy: self.legacy,
+        })
     }
 
     /// Slot of a stored block, `None` if no column of it is stored.
     pub fn slot_of(&self, block_root: &BlockRoot) -> Result<Option<u64>> {
-        let txn = self.db.begin_ro_txn()?;
-        stored_slot(&txn, block_root)
+        self.snapshot()?.slot_of(block_root)
     }
 
     /// One column of a block.
     pub fn get(&self, block_root: &BlockRoot, column_index: u64) -> Result<Option<Vec<u8>>> {
-        let txn = self.db.begin_ro_txn()?;
-        let Some(slot) = stored_slot(&txn, block_root)? else {
-            return Ok(None);
-        };
-        let columns = txn.open_table(Some(COLUMNS_TABLE))?;
-        Ok(txn.get(&columns, &column_key(slot, block_root, column_index))?)
+        self.snapshot()?.get(block_root, column_index)
     }
 
     /// Every stored column of a block as `(column_index, ssz)`, in index order.
@@ -84,6 +179,18 @@ impl ColumnReader {
             .collect()
     }
 
+    /// [`Snapshot::columns_in_range`] in a transaction of its own.
+    pub fn columns_in_range(
+        &self,
+        start_slot: u64,
+        end_slot: u64,
+        wanted: impl Fn(u64) -> bool,
+        budget: RangeBudget,
+    ) -> Result<RangeRead> {
+        self.snapshot()?
+            .columns_in_range(start_slot, end_slot, wanted, budget)
+    }
+
     /// Stored custody group count, `None` before the first
     /// [`ColumnWriter::set_cgc`](crate::ColumnWriter::set_cgc).
     pub fn cgc(&self) -> Result<Option<u64>> {
@@ -91,39 +198,29 @@ impl ColumnReader {
         meta_u64(&txn, CGC_KEY)
     }
 
-    /// The stored custody record, `None` before the first
-    /// [`ColumnWriter::set_custody`](crate::ColumnWriter::set_custody) or
-    /// [`ColumnWriter::set_cgc`](crate::ColumnWriter::set_cgc). After `set_cgc` alone the other
-    /// values read 0. All four are read in one transaction.
+    /// [`Snapshot::custody`] in a transaction of its own.
     pub fn custody(&self) -> Result<Option<CustodyRecord>> {
-        let txn = self.db.begin_ro_txn()?;
-        let Some(cgc) = meta_u64(&txn, CGC_KEY)? else {
-            return Ok(None);
-        };
-        let value = |key| meta_u64(&txn, key).map(Option::unwrap_or_default);
-        Ok(Some(CustodyRecord {
-            cgc,
-            cgc_set_slot: value(CGC_SET_SLOT_KEY)?,
-            metadata_seq: value(METADATA_SEQ_KEY)?,
-            advertised_cgc: value(ADVERTISED_CGC_KEY)?,
-        }))
+        self.snapshot()?.custody()
     }
 
-    /// Finalized-slot watermark: the highest slot passed to
-    /// [`ColumnWriter::prune_finalized`](crate::ColumnWriter::prune_finalized), `None` before
-    /// the first prune.
+    /// [`Snapshot::finalized_slot`] in a transaction of its own.
     pub fn finalized_slot(&self) -> Result<Option<u64>> {
-        let txn = self.db.begin_ro_txn()?;
-        meta_u64(&txn, FINALIZED_SLOT_KEY)
+        self.snapshot()?.finalized_slot()
     }
 
-    /// The lowest slot any column was ever stored at, `None` before the first column. Written in
-    /// the transaction that stores that column, so it survives any crash together with it; pruning
-    /// never moves it. A historical minimum, not proof that anything from there on is held (see
-    /// [`FIRST_STORED_SLOT_KEY`](crate::keys::FIRST_STORED_SLOT_KEY)).
+    /// [`Snapshot::first_stored_slot`] in a transaction of its own.
     pub fn first_stored_slot(&self) -> Result<Option<u64>> {
-        let txn = self.db.begin_ro_txn()?;
-        meta_u64(&txn, FIRST_STORED_SLOT_KEY)
+        self.snapshot()?.first_stored_slot()
+    }
+
+    /// [`Snapshot::link_of`] in a transaction of its own.
+    pub fn link_of(&self, block_root: &BlockRoot) -> Result<Option<BlockLink>> {
+        self.snapshot()?.link_of(block_root)
+    }
+
+    /// [`Snapshot::contiguous_from`] in a transaction of its own.
+    pub fn contiguous_from(&self) -> Result<Option<u64>> {
+        self.snapshot()?.contiguous_from()
     }
 
     /// Number of stored columns across all blocks.
@@ -143,12 +240,196 @@ impl ColumnReader {
     }
 }
 
+impl Snapshot<'_> {
+    /// Slot of a stored block, `None` if no column of it is stored.
+    pub fn slot_of(&self, block_root: &BlockRoot) -> Result<Option<u64>> {
+        stored_slot(&self.txn, block_root)
+    }
+
+    /// One column of a block.
+    pub fn get(&self, block_root: &BlockRoot, column_index: u64) -> Result<Option<Vec<u8>>> {
+        let Some(slot) = stored_slot(&self.txn, block_root)? else {
+            return Ok(None);
+        };
+        let columns = self.txn.open_table(Some(COLUMNS_TABLE))?;
+        Ok(self
+            .txn
+            .get(&columns, &column_key(slot, block_root, column_index))?)
+    }
+
+    /// The link `block_root` was stored with, `None` if the block is not stored.
+    pub fn link_of(&self, block_root: &BlockRoot) -> Result<Option<BlockLink>> {
+        if stored_slot(&self.txn, block_root)?.is_none() {
+            return Ok(None);
+        }
+        self.link(block_root).map(Some)
+    }
+
+    /// The link of a stored block: [`BlockLink::Gap`] without one.
+    fn link(&self, block_root: &BlockRoot) -> Result<BlockLink> {
+        if self.legacy {
+            return Ok(BlockLink::Gap);
+        }
+        Ok(stored_link(&self.txn, block_root)?.unwrap_or(BlockLink::Gap))
+    }
+
+    /// The stored custody record, `None` before the first
+    /// [`ColumnWriter::set_custody`](crate::ColumnWriter::set_custody) or
+    /// [`ColumnWriter::set_cgc`](crate::ColumnWriter::set_cgc). After `set_cgc` alone the other
+    /// values read 0.
+    pub fn custody(&self) -> Result<Option<CustodyRecord>> {
+        let txn = &self.txn;
+        let Some(cgc) = meta_u64(txn, CGC_KEY)? else {
+            return Ok(None);
+        };
+        let value = |key| meta_u64(txn, key).map(Option::unwrap_or_default);
+        Ok(Some(CustodyRecord {
+            cgc,
+            cgc_set_slot: value(CGC_SET_SLOT_KEY)?,
+            metadata_seq: value(METADATA_SEQ_KEY)?,
+            advertised_cgc: value(ADVERTISED_CGC_KEY)?,
+        }))
+    }
+
+    /// Finalized-slot watermark: the highest slot passed to
+    /// [`ColumnWriter::prune_finalized`](crate::ColumnWriter::prune_finalized), `None` before
+    /// the first prune.
+    pub fn finalized_slot(&self) -> Result<Option<u64>> {
+        meta_u64(&self.txn, FINALIZED_SLOT_KEY)
+    }
+
+    /// The lowest slot any column was ever stored at, `None` before the first column. Written in
+    /// the transaction that stores that column, so it survives any crash together with it; pruning
+    /// never moves it. A historical minimum, not proof that anything from there on is held (see
+    /// [`FIRST_STORED_SLOT_KEY`](crate::keys::FIRST_STORED_SLOT_KEY)).
+    pub fn first_stored_slot(&self) -> Result<Option<u64>> {
+        meta_u64(&self.txn, FIRST_STORED_SLOT_KEY)
+    }
+
+    /// The slot from which the stored blocks are contiguous
+    /// ([`CONTIGUOUS_FROM_KEY`](crate::keys::CONTIGUOUS_FROM_KEY)): `None` before the first
+    /// gap. An env without the links table: the slot after its highest stored block.
+    pub fn contiguous_from(&self) -> Result<Option<u64>> {
+        if self.legacy {
+            return after_highest_block(&self.txn);
+        }
+        meta_u64(&self.txn, CONTIGUOUS_FROM_KEY)
+    }
+
+    /// The stored columns at slots `start_slot..end_slot` whose index `wanted` takes, in key
+    /// order (slot, then block root, then column index), and every block of the range read,
+    /// whether or not it holds a wanted column, with its link ([`RangeRead::blocks`]). The first
+    /// block is read whole; it stops before the first column of a later block that would take it
+    /// past `budget`'s bytes or columns ([`RangeRead::truncated`]), and with [`Error::Deadline`]
+    /// once its deadline passed (looked at every 64 rows). Only the columns taken are copied; a
+    /// key past the range ends the walk before its value is read.
+    pub fn columns_in_range(
+        &self,
+        start_slot: u64,
+        end_slot: u64,
+        wanted: impl Fn(u64) -> bool,
+        budget: RangeBudget,
+    ) -> Result<RangeRead> {
+        let mut read = RangeRead::default();
+        if start_slot >= end_slot {
+            return Ok(read);
+        }
+        let txn = &self.txn;
+        let table = txn.open_table(Some(COLUMNS_TABLE))?;
+        let mut cursor = txn.cursor(&table)?;
+        let corrupt = || Error::Corrupt {
+            table: COLUMNS_TABLE,
+        };
+        let mut bytes = 0usize;
+        let mut walked = 0usize;
+        let mut row = cursor.set_range::<Cow<'_, [u8]>, ()>(&start_slot.to_be_bytes())?;
+        while let Some((key, ())) = row {
+            if walked.is_multiple_of(DEADLINE_EVERY)
+                && budget
+                    .deadline
+                    .is_some_and(|d| std::time::Instant::now() >= d)
+            {
+                return Err(Error::Deadline);
+            }
+            walked += 1;
+            let (slot, block_root, index) = decode_column_key(&key).ok_or_else(corrupt)?;
+            if slot >= end_slot {
+                break;
+            }
+            let new_block = read
+                .blocks
+                .last()
+                .is_none_or(|b| (b.slot, b.block_root) != (slot, block_root));
+            let first_block = read.blocks.is_empty() || (read.blocks.len() == 1 && !new_block);
+            if wanted(index) {
+                let ((), ssz) = cursor.get_current::<(), Vec<u8>>()?.ok_or_else(corrupt)?;
+                let over = read.columns.len() >= budget.max_columns
+                    || bytes.saturating_add(ssz.len()) > budget.max_bytes;
+                if over && !first_block {
+                    read.truncated = true;
+                    break;
+                }
+                bytes = bytes.saturating_add(ssz.len());
+                if new_block {
+                    read.blocks.push(RangeBlock {
+                        slot,
+                        block_root,
+                        link: self.link(&block_root)?,
+                    });
+                }
+                read.columns.push(RangeColumn {
+                    slot,
+                    block_root,
+                    index,
+                    ssz,
+                });
+            } else if new_block {
+                read.blocks.push(RangeBlock {
+                    slot,
+                    block_root,
+                    link: self.link(&block_root)?,
+                });
+            }
+            row = cursor.next::<Cow<'_, [u8]>, ()>()?;
+        }
+        Ok(read)
+    }
+}
+
+/// The slot after the highest stored column's, `None` with no column.
+pub(crate) fn after_highest_block<K: TransactionKind>(
+    txn: &Transaction<'_, K, NoWriteMap>,
+) -> Result<Option<u64>> {
+    let columns = txn.open_table(Some(COLUMNS_TABLE))?;
+    let Some((key, ())) = txn.cursor(&columns)?.last::<Vec<u8>, ()>()? else {
+        return Ok(None);
+    };
+    let (slot, _, _) = decode_column_key(&key).ok_or(Error::Corrupt {
+        table: COLUMNS_TABLE,
+    })?;
+    Ok(Some(slot.saturating_add(1)))
+}
+
 /// Slot recorded for `block_root` in [`ROOTS_TABLE`].
 pub(crate) fn stored_slot<K: TransactionKind>(
     txn: &Transaction<'_, K, NoWriteMap>,
     block_root: &BlockRoot,
 ) -> Result<Option<u64>> {
     get_u64(txn, ROOTS_TABLE, block_root)
+}
+
+/// The link stored for `block_root`, `None` without one; other bytes are [`Error::Corrupt`].
+pub(crate) fn stored_link<K: TransactionKind>(
+    txn: &Transaction<'_, K, NoWriteMap>,
+    block_root: &BlockRoot,
+) -> Result<Option<BlockLink>> {
+    let links = txn.open_table(Some(LINKS_TABLE))?;
+    match txn.get::<Vec<u8>>(&links, block_root)? {
+        None => Ok(None),
+        Some(bytes) => BlockLink::decode(&bytes)
+            .map(Some)
+            .ok_or(Error::Corrupt { table: LINKS_TABLE }),
+    }
 }
 
 /// A `u64 BE` value from [`META_TABLE`].
@@ -203,7 +484,176 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Column, ColumnWriter};
+    use crate::{BlockLink, Column, ColumnWriter, RangeBudget};
+
+    #[test]
+    fn a_range_reads_the_wanted_columns_in_key_order_within_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let col = |index| Column { index, ssz: b"xyz" };
+        // Two blocks at slot 9 (two roots), one at 10, one at 11 without a wanted column, one
+        // at 12; written out of order.
+        writer.write_columns(12, &[3; 32], &[col(1)]).unwrap();
+        writer
+            .write_columns(9, &[2; 32], &[col(47), col(1), col(5)])
+            .unwrap();
+        writer.write_columns(9, &[1; 32], &[col(87)]).unwrap();
+        writer
+            .write_columns(10, &[4; 32], &[col(1), col(47)])
+            .unwrap();
+        writer.write_columns(11, &[5; 32], &[col(5)]).unwrap();
+        let reader = writer.reader();
+        let keys = |read: &RangeRead| -> Vec<(u64, u8, u64)> {
+            read.columns
+                .iter()
+                .map(|c| (c.slot, c.block_root[0], c.index))
+                .collect()
+        };
+        let blocks = |read: &RangeRead| -> Vec<(u64, u8)> {
+            read.blocks
+                .iter()
+                .map(|b| (b.slot, b.block_root[0]))
+                .collect()
+        };
+        let custody = |i: u64| [1, 47, 87].contains(&i);
+        let all = RangeBudget::unbounded();
+        let read = reader.columns_in_range(9, 12, custody, all).unwrap();
+        assert_eq!(
+            keys(&read),
+            [(9, 1, 87), (9, 2, 1), (9, 2, 47), (10, 4, 1), (10, 4, 47)]
+        );
+        // Every block in the range, whether or not it holds a wanted column, with its link:
+        // `write_columns` stores none, a gap.
+        assert_eq!(blocks(&read), [(9, 1), (9, 2), (10, 4), (11, 5)]);
+        assert!(read.blocks.iter().all(|b| b.link == BlockLink::Gap));
+        assert!(!read.truncated);
+        assert!(read.columns.iter().all(|c| c.ssz == b"xyz"));
+        // The end is exclusive, the start inclusive, and an empty range reads nothing.
+        let read = reader.columns_in_range(10, 13, custody, all).unwrap();
+        assert_eq!(keys(&read), [(10, 4, 1), (10, 4, 47), (12, 3, 1)]);
+        assert_eq!(
+            reader.columns_in_range(11, 11, custody, all).unwrap(),
+            RangeRead::default()
+        );
+        // The byte budget stops before the block past it, and so does the column budget; the
+        // first block is read whole whatever the budget.
+        let bytes = RangeBudget {
+            max_bytes: 7,
+            ..all
+        };
+        let read = reader.columns_in_range(9, 12, custody, bytes).unwrap();
+        assert_eq!(keys(&read), [(9, 1, 87), (9, 2, 1)]);
+        assert!(read.truncated);
+        let nothing = RangeBudget {
+            max_bytes: 0,
+            max_columns: 0,
+            ..all
+        };
+        let read = reader.columns_in_range(9, 12, custody, nothing).unwrap();
+        assert_eq!(keys(&read), [(9, 1, 87)]);
+        assert_eq!(blocks(&read), [(9, 1)]);
+        assert!(read.truncated);
+        let columns = RangeBudget {
+            max_columns: 3,
+            ..all
+        };
+        let read = reader.columns_in_range(9, 12, custody, columns).unwrap();
+        assert_eq!(keys(&read), [(9, 1, 87), (9, 2, 1), (9, 2, 47)]);
+        assert!(read.truncated);
+        // A read past its deadline stops with an error.
+        let late = RangeBudget {
+            deadline: Some(std::time::Instant::now()),
+            ..all
+        };
+        assert!(matches!(
+            reader.columns_in_range(9, 12, custody, late),
+            Err(Error::Deadline)
+        ));
+        // One snapshot reads the view and the range in one transaction.
+        let snapshot = reader.snapshot().unwrap();
+        assert_eq!(snapshot.first_stored_slot().unwrap(), Some(9));
+        assert_eq!(snapshot.contiguous_from().unwrap(), Some(12));
+        assert_eq!(
+            keys(&snapshot.columns_in_range(12, 13, custody, all).unwrap()),
+            [(12, 3, 1)]
+        );
+    }
+
+    /// An env written before the links table existed: the writer adds the table and claims
+    /// nothing before the slot after its highest stored block, in one transaction; a reader of
+    /// it not yet opened by a writer behaves the same without writing.
+    #[test]
+    fn an_env_without_links_reads_as_contiguous_only_past_its_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let writer = ColumnWriter::open(dir.path()).unwrap();
+            writer
+                .write_block_columns(
+                    7,
+                    &[1; 32],
+                    BlockLink::Start,
+                    &[Column {
+                        index: 1,
+                        ssz: b"a",
+                    }],
+                )
+                .unwrap();
+            writer
+                .write_block_columns(
+                    9,
+                    &[2; 32],
+                    BlockLink::Parent([1; 32]),
+                    &[Column {
+                        index: 1,
+                        ssz: b"b",
+                    }],
+                )
+                .unwrap();
+            crate::writer::make_legacy_for_test(&writer);
+        }
+        let reader = ColumnReader::open(dir.path()).unwrap();
+        assert_eq!(reader.contiguous_from().unwrap(), Some(10));
+        assert_eq!(reader.link_of(&[2; 32]).unwrap(), Some(BlockLink::Gap));
+        let read = reader
+            .columns_in_range(0, 100, |_| true, RangeBudget::unbounded())
+            .unwrap();
+        assert!(read.blocks.iter().all(|b| b.link == BlockLink::Gap));
+        drop(reader);
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        assert_eq!(writer.reader().contiguous_from().unwrap(), Some(10));
+        assert_eq!(
+            writer.reader().link_of(&[2; 32]).unwrap(),
+            Some(BlockLink::Gap)
+        );
+        // New blocks link as usual; the old ones stay claimed past.
+        writer
+            .write_block_columns(
+                11,
+                &[3; 32],
+                BlockLink::Parent([2; 32]),
+                &[Column {
+                    index: 1,
+                    ssz: b"c",
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            writer.reader().link_of(&[3; 32]).unwrap(),
+            Some(BlockLink::Parent([2; 32]))
+        );
+        assert_eq!(writer.reader().contiguous_from().unwrap(), Some(10));
+        // An empty old env claims nothing.
+        let empty = tempfile::tempdir().unwrap();
+        crate::writer::make_legacy_for_test(&ColumnWriter::open(empty.path()).unwrap());
+        assert_eq!(
+            ColumnWriter::open(empty.path())
+                .unwrap()
+                .reader()
+                .contiguous_from()
+                .unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn reader_env_is_read_only() {

@@ -18,6 +18,10 @@
 //! - `rpc_inbound_unsupported_total{protocol}`: peers' proposals of a protocol the probe leaves
 //!   unregistered, refused at multistream-select ([`super::unsupported`]), by protocol: only
 //!   the three [`Unsupported`] names, whatever a peer proposes.
+//! - `rpc_column_answers` and `rpc_column_answer_bytes`: the column answers held now (lookup to
+//!   the end of the write) and the SSZ bytes they hold ([`crate::rpc::limits::ColumnPlaces`]).
+//! - `rpc_column_unrequested_total`: sidecars a column source handed over that the request did
+//!   not name (or named once and got twice), dropped, never sent.
 //! - `queue_dropped_total{queue}`: items a bounded queue IGNOREd ([`QueueMetrics`]), shared with
 //!   the other queues of the service through [`RpcMetrics::queues`].
 //!
@@ -141,6 +145,8 @@ pub fn protocol_label(protocol: Protocol) -> &'static str {
         Protocol::PingV1 => "ping",
         Protocol::BlocksByRangeV2 => "beacon_blocks_by_range",
         Protocol::GoodbyeV1 => "goodbye",
+        Protocol::DataColumnsByRangeV1 => "data_column_sidecars_by_range",
+        Protocol::DataColumnsByRootV1 => "data_column_sidecars_by_root",
     }
 }
 
@@ -180,6 +186,9 @@ pub struct RpcMetrics {
     outbound_inflight: Family<ProtocolLabel, Gauge>,
     rate_limited: Family<ProtocolLabel, Counter>,
     inbound_unsupported: Family<ProtocolLabel, Counter>,
+    column_answers: Gauge,
+    column_answer_bytes: Gauge,
+    column_unrequested: Counter,
     queues: QueueMetrics,
 }
 
@@ -196,6 +205,9 @@ impl RpcMetrics {
             outbound_inflight: Family::default(),
             rate_limited: Family::default(),
             inbound_unsupported: Family::default(),
+            column_answers: Gauge::default(),
+            column_answer_bytes: Gauge::default(),
+            column_unrequested: Counter::default(),
             queues: QueueMetrics::register(registry),
         };
         for protocol in Protocol::ALL {
@@ -271,7 +283,53 @@ impl RpcMetrics {
              multistream-select, by protocol",
             metrics.inbound_unsupported.clone(),
         );
+        registry.register(
+            "rpc_column_answers",
+            "Column answers held now, from the lookup until the stream's writer returns",
+            metrics.column_answers.clone(),
+        );
+        registry.register(
+            "rpc_column_answer_bytes",
+            "SSZ bytes of the column answers held now",
+            metrics.column_answer_bytes.clone(),
+        );
+        registry.register(
+            "rpc_column_unrequested",
+            "Column sidecars a source handed over that the request did not name, dropped",
+            metrics.column_unrequested.clone(),
+        );
         metrics
+    }
+
+    /// Sets `rpc_column_answers` and `rpc_column_answer_bytes`.
+    pub(crate) fn set_column_answers(&self, held: usize, bytes: usize) {
+        self.column_answers
+            .set(i64::try_from(held).unwrap_or(i64::MAX));
+        self.column_answer_bytes
+            .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+    }
+
+    /// Counts `n` sidecars dropped as unrequested.
+    pub(crate) fn unrequested(&self, n: u64) {
+        self.column_unrequested.inc_by(n);
+    }
+
+    /// The current `rpc_column_answers`.
+    #[must_use]
+    pub fn column_answers_held(&self) -> u64 {
+        u64::try_from(self.column_answers.get()).unwrap_or(0)
+    }
+
+    /// The current `rpc_column_answer_bytes`.
+    #[must_use]
+    pub fn column_answer_bytes_held(&self) -> u64 {
+        u64::try_from(self.column_answer_bytes.get()).unwrap_or(0)
+    }
+
+    /// The current `rpc_column_unrequested_total`.
+    #[must_use]
+    pub fn column_unrequested(&self) -> u64 {
+        self.column_unrequested.get()
     }
 
     /// Sets `rpc_outbound_inflight{protocol}`.

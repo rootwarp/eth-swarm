@@ -25,7 +25,9 @@
 //! - Context bytes are the 4-byte fork digest, present only on a success chunk of a protocol
 //!   that has them ([`Protocol::has_context_bytes`]); an error chunk's context is empty. The
 //!   digest is looked up in an injected [`ContextTable`], and an unknown digest is refused before
-//!   the payload is read.
+//!   the payload is read. A column sidecar's bound also needs the network's caps, which the table
+//!   carries ([`ContextTable::with_network_caps`]); without them a column success chunk is refused
+//!   at its head ([`DecodeError::NeedsNetworkCaps`]).
 //!
 //! # Work and allocation
 //!
@@ -41,11 +43,11 @@
 //! under a counting allocator.
 
 use crate::rpc::messages::{
-    BlocksByRangeV2Request, ErrorMessage, ForkDigest, Goodbye, MetaDataV3, Ping, StatusV2,
-    MAX_ERROR_MESSAGE_LEN,
+    BlocksByRangeV2Request, DataColumnsByRangeV1Request, DataColumnsByRootV1Request, ErrorMessage,
+    ForkDigest, Goodbye, MetaDataV3, Ping, StatusV2, MAX_ERROR_MESSAGE_LEN,
 };
 use crate::rpc::protocols::{Protocol, Request, Response, ResponseChunk, ResultCode, SszBounds};
-use consensus_types::caps::MAX_PAYLOAD_SIZE;
+use consensus_types::caps::{NetworkCaps, ObjectKind, MAX_PAYLOAD_SIZE};
 use consensus_types::codec::DecodeError;
 use consensus_types::{forked, EthSpec, ForkName};
 use ssz::Decode;
@@ -189,7 +191,8 @@ impl ResultCode {
     }
 }
 
-/// Fork digest → fork, for the context bytes of a response chunk.
+/// Fork digest → fork, for the context bytes of a response chunk, and the network's caps for a
+/// column sidecar's bound.
 ///
 /// Injected by the caller, so that decoding peer bytes runs no network-config code. From Fulu
 /// on, a blob-parameter-only fork changes the digest without changing the fork, so several
@@ -197,12 +200,26 @@ impl ResultCode {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextTable {
     entries: Vec<(ForkDigest, ForkName)>,
+    network: Option<NetworkCaps>,
 }
 
 impl ContextTable {
-    /// An empty table: every digest is unknown.
+    /// An empty table: every digest is unknown, and no column sidecar is read.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The same table, reading column sidecars under the network's `caps`
+    /// (`NetworkCaps::from_config`).
+    #[must_use]
+    pub fn with_network_caps(mut self, caps: NetworkCaps) -> Self {
+        self.network = Some(caps);
+        self
+    }
+
+    /// The network's caps, if the table has them.
+    pub fn network_caps(&self) -> Option<&NetworkCaps> {
+        self.network.as_ref()
     }
 
     /// Maps `digest` to `fork`, returning the fork it named before.
@@ -584,6 +601,12 @@ pub fn decode_request(protocol: Protocol, buf: &[u8]) -> Result<Request, CodecEr
         }
         Protocol::GoodbyeV1 => Request::Goodbye(Goodbye::from_ssz_bytes(&ssz)?),
         Protocol::MetaDataV3 => Request::MetaData,
+        Protocol::DataColumnsByRangeV1 => {
+            Request::DataColumnsByRange(DataColumnsByRangeV1Request::from_ssz_bytes(&ssz)?)
+        }
+        Protocol::DataColumnsByRootV1 => {
+            Request::DataColumnsByRoot(DataColumnsByRootV1Request::from_ssz_bytes(&ssz)?)
+        }
     })
 }
 
@@ -654,8 +677,16 @@ fn parse_head<E: EthSpec>(
     } else {
         (None, 1)
     };
-    // Every protocol has a response bound; only a block's needs the fork its context names.
-    let Some(bounds) = protocol.response_bounds::<E>(fork) else {
+    // Every protocol has a response bound; a block's needs the fork its context names, and a
+    // column sidecar's the network's caps too.
+    let network = contexts.network_caps();
+    if protocol.is_columns() && network.is_none() {
+        return Err(DecodeError::NeedsNetworkCaps {
+            kind: ObjectKind::DataColumnSidecar,
+        }
+        .into());
+    }
+    let Some(bounds) = protocol.response_bounds_with::<E>(fork, network) else {
         return Err(CodecError::MissingContext(protocol));
     };
     Ok(Ok(ChunkHead {
@@ -768,6 +799,15 @@ pub fn decode_response_chunk<E: EthSpec>(
             ))
         }
         Protocol::GoodbyeV1 => Response::Goodbye(Goodbye::from_ssz_bytes(&ssz)?),
+        Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1 => {
+            let fork = head.fork.ok_or(CodecError::MissingContext(protocol))?;
+            let network = contexts
+                .network_caps()
+                .ok_or(CodecError::MissingContext(protocol))?;
+            Response::DataColumn(Box::new(
+                forked::DataColumnSidecar::from_ssz_bytes_for_fork_with(&ssz, fork, network)?,
+            ))
+        }
     };
     Ok(ResponseChunk::Success(response))
 }
@@ -1178,6 +1218,133 @@ mod tests {
             decode_request(Protocol::PingV1, &bytes),
             Err(CodecError::PayloadTooLarge { len: 24, max: 8 })
         ));
+    }
+
+    #[test]
+    fn roundtrip_column_requests() {
+        let range = Request::DataColumnsByRange(DataColumnsByRangeV1Request {
+            start_slot: 64,
+            count: 32,
+            columns: vec![1, 47, 87, 102].try_into().unwrap(),
+        });
+        let bytes = encode_request(&range).unwrap();
+        let back = decode_request(Protocol::DataColumnsByRangeV1, &bytes).unwrap();
+        assert_eq!(back, range);
+        assert_eq!(encode_request(&back).unwrap(), bytes);
+        let id = DataColumnsByRootIdentifier {
+            block_root: [7; 32].into(),
+            columns: vec![47].try_into().unwrap(),
+        };
+        let root = Request::DataColumnsByRoot(DataColumnsByRootV1Request(
+            vec![id.clone(), id].try_into().unwrap(),
+        ));
+        let bytes = encode_request(&root).unwrap();
+        assert_eq!(
+            decode_request(Protocol::DataColumnsByRootV1, &bytes),
+            Ok(root)
+        );
+        // The empty list is a valid request of no sidecars.
+        let empty = encode_chunk(&[]).unwrap();
+        assert_eq!(
+            decode_request(Protocol::DataColumnsByRootV1, &empty),
+            Ok(Request::DataColumnsByRoot(DataColumnsByRootV1Request(
+                Default::default()
+            )))
+        );
+    }
+
+    #[test]
+    fn column_lists_past_their_limits_are_malformed() {
+        // 129 identifiers of no columns: within the byte bound, past the list's 128.
+        let ids: Vec<u8> = (0..129u32)
+            .flat_map(|i| {
+                let mut id = vec![0u8; 40];
+                id[32..36].copy_from_slice(&36u32.to_le_bytes());
+                id[..4].copy_from_slice(&i.to_le_bytes());
+                id
+            })
+            .collect();
+        let mut ssz: Vec<u8> = (0..129u32)
+            .flat_map(|i| (129 * 4 + i * 40).to_le_bytes())
+            .collect();
+        ssz.extend(ids);
+        let wire = encode_chunk(&ssz).unwrap();
+        assert!(matches!(
+            decode_request(Protocol::DataColumnsByRootV1, &wire),
+            Err(CodecError::Decode(_))
+        ));
+        // 129 column indices: past the byte bound already, refused at the prefix.
+        let mut range = vec![0u8; 20];
+        range[16..20].copy_from_slice(&20u32.to_le_bytes());
+        range.extend(std::iter::repeat_n(0u8, 129 * 8));
+        let wire = encode_chunk(&range).unwrap();
+        assert!(matches!(
+            decode_request(Protocol::DataColumnsByRangeV1, &wire),
+            Err(CodecError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn column_chunks_decode_by_their_context_with_the_network_caps() {
+        let contexts = testkit::column_context_table();
+        let gloas = testkit::gloas_sidecar::<E>(9, 47);
+        let fulu = testkit::fulu_sidecar::<E>(9, 47);
+        for protocol in [
+            Protocol::DataColumnsByRangeV1,
+            Protocol::DataColumnsByRootV1,
+        ] {
+            let chunk =
+                encode_success_chunk(Some(testkit::GLOAS_DIGEST), &gloas.as_ssz_bytes()).unwrap();
+            assert_eq!(
+                decode_response_chunk::<E>(&chunk, protocol, &contexts),
+                Ok(ResponseChunk::Success(Response::DataColumn(Box::new(
+                    forked::DataColumnSidecar::Gloas(gloas.clone())
+                ))))
+            );
+            assert_eq!(
+                scan_response_chunk::<E>(&chunk, protocol, &contexts),
+                Ok(Scan::Complete { len: chunk.len() })
+            );
+            // Without the network's caps the bound is unknown: refused at the head.
+            let refused = decode_response_chunk::<E>(&chunk, protocol, &testkit::context_table());
+            assert!(
+                matches!(
+                    refused,
+                    Err(CodecError::Decode(DecodeError::NeedsNetworkCaps { .. }))
+                ),
+                "{refused:?}"
+            );
+            assert!(scan_response_chunk::<E>(&chunk, protocol, &testkit::context_table()).is_err());
+            let fulu_chunk =
+                encode_success_chunk(Some(testkit::FULU_DIGEST), &fulu.as_ssz_bytes()).unwrap();
+            assert_eq!(
+                decode_response_chunk::<E>(&fulu_chunk, protocol, &contexts),
+                Ok(ResponseChunk::Success(Response::DataColumn(Box::new(
+                    forked::DataColumnSidecar::Fulu(fulu.clone())
+                ))))
+            );
+            // A Gloas sidecar under a Fulu digest does not decode in the Fulu shape.
+            let wrong =
+                encode_success_chunk(Some(testkit::FULU_DIGEST), &gloas.as_ssz_bytes()).unwrap();
+            assert!(matches!(
+                decode_response_chunk::<E>(&wrong, protocol, &contexts),
+                Err(CodecError::Decode(_))
+            ));
+            // Error chunks need no caps.
+            let error = encode_error_chunk(ResultCode::ResourceUnavailable, b"pruned").unwrap();
+            assert!(matches!(
+                decode_response_chunk::<E>(&error, protocol, &testkit::context_table()),
+                Ok(ResponseChunk::Error {
+                    code: ResultCode::ResourceUnavailable,
+                    ..
+                })
+            ));
+        }
+        assert_eq!(testkit::context_table().network_caps(), None);
+        assert_eq!(
+            contexts.network_caps(),
+            Some(&consensus_types::caps::NetworkCaps::PRESET_BOUND)
+        );
     }
 
     #[test]

@@ -5,7 +5,8 @@
 //! |--------------------|-------------------------------------------------------|-----------------------------|
 //! | [`COLUMNS_TABLE`]  | `slot (u64 BE) ‖ block_root (32) ‖ column_index (u64 BE)`, 48 bytes | SSZ `DataColumnSidecar` |
 //! | [`ROOTS_TABLE`]    | `block_root (32)`                                     | `slot (u64 BE)`             |
-//! | [`META_TABLE`]     | ASCII name: [`CGC_KEY`], [`CGC_SET_SLOT_KEY`], [`METADATA_SEQ_KEY`], [`ADVERTISED_CGC_KEY`], [`FINALIZED_SLOT_KEY`], [`FIRST_STORED_SLOT_KEY`] | `u64 BE` |
+//! | [`LINKS_TABLE`]    | `block_root (32)`                                     | [`BlockLink`]: `kind (1) ‖ root (32)` |
+//! | [`META_TABLE`]     | ASCII name: [`CGC_KEY`], [`CGC_SET_SLOT_KEY`], [`METADATA_SEQ_KEY`], [`ADVERTISED_CGC_KEY`], [`FINALIZED_SLOT_KEY`], [`FIRST_STORED_SLOT_KEY`], [`CONTIGUOUS_FROM_KEY`] | `u64 BE` |
 //!
 //! Big-endian slot first makes MDBX's lexicographic key order equal slot order, so finality
 //! pruning is one cursor walk from the first key up to the finalized slot. All columns of a block
@@ -19,12 +20,15 @@ pub type BlockRoot = [u8; 32];
 pub const COLUMNS_TABLE: &str = "columns";
 /// Index from block root to the slot that prefixes its column keys.
 pub const ROOTS_TABLE: &str = "column_roots";
+/// Index from block root to the block's [`BlockLink`]: how it ties to the stored block before
+/// it on its chain.
+pub const LINKS_TABLE: &str = "column_links";
 /// Small scalar values for this env: the custody record ([`CGC_KEY`], [`CGC_SET_SLOT_KEY`],
 /// [`METADATA_SEQ_KEY`], [`ADVERTISED_CGC_KEY`]), [`FINALIZED_SLOT_KEY`] and
 /// [`FIRST_STORED_SLOT_KEY`].
 pub const META_TABLE: &str = "meta";
 /// Every table this env holds, in creation order.
-pub const TABLES: [&str; 3] = [COLUMNS_TABLE, ROOTS_TABLE, META_TABLE];
+pub const TABLES: [&str; 4] = [COLUMNS_TABLE, ROOTS_TABLE, META_TABLE, LINKS_TABLE];
 
 /// [`META_TABLE`] key of the node's custody group count. It never decreases
 /// ([`Error::CgcDecrease`](crate::Error::CgcDecrease)).
@@ -50,6 +54,71 @@ pub const FINALIZED_SLOT_KEY: &[u8] = b"finalized_slot";
 /// derived from it but never equal to it alone: it is the highest of this slot, the slot after
 /// [`FINALIZED_SLOT_KEY`] and [`CGC_SET_SLOT_KEY`].
 pub const FIRST_STORED_SLOT_KEY: &[u8] = b"first_stored_slot";
+
+/// [`META_TABLE`] key of the slot from which the stored blocks are contiguous: the highest slot
+/// of a block written with [`BlockLink::Gap`] (a blob-carrying block before it on its chain is
+/// not held), or the slot after the highest block of an env written before [`LINKS_TABLE`]
+/// existed (its blocks have no links). It only rises. Status `earliest_available_slot` is never
+/// below it.
+pub const CONTIGUOUS_FROM_KEY: &[u8] = b"contiguous_from";
+
+/// How a stored block ties to the stored block before it on its chain, as cl-chain learned when
+/// it stored the block (the parent roots come from the blocks the reference vouched for, through
+/// any blocks without blobs, which hold no columns).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BlockLink {
+    /// Nothing before it on its chain is to be held: it is the first block from the slot custody
+    /// was set at, or its chain reaches the finalized watermark first.
+    Start,
+    /// The nearest blob-carrying block before it on its chain is this stored root.
+    Parent(BlockRoot),
+    /// A blob-carrying block before it on its chain is not held, or its chain could not be
+    /// followed: the store is contiguous only from this block on.
+    Gap,
+    /// The nearest blob-carrying block before it on its chain is this root, not stored yet: its
+    /// columns may still be on their way. It links once that block is written, or is settled as
+    /// a [`BlockLink::Gap`] ([`ColumnWriter::settle_pending`](crate::ColumnWriter::settle_pending)).
+    /// Until then it ties to nothing and raises nothing.
+    Pending(BlockRoot),
+}
+
+/// Length of a [`BlockLink`] value.
+pub const LINK_LEN: usize = 1 + 32;
+
+impl BlockLink {
+    /// The value stored in [`LINKS_TABLE`].
+    #[must_use]
+    pub fn encode(&self) -> [u8; LINK_LEN] {
+        let mut out = [0u8; LINK_LEN];
+        match self {
+            BlockLink::Start => out[0] = 0,
+            BlockLink::Parent(root) => {
+                out[0] = 1;
+                out[1..].copy_from_slice(root);
+            }
+            BlockLink::Gap => out[0] = 2,
+            BlockLink::Pending(root) => {
+                out[0] = 3;
+                out[1..].copy_from_slice(root);
+            }
+        }
+        out
+    }
+
+    /// The link a [`LINKS_TABLE`] value holds; `None` for any other bytes.
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; LINK_LEN] = bytes.try_into().ok()?;
+        let root: BlockRoot = bytes[1..].try_into().ok()?;
+        match bytes[0] {
+            0 if root == [0; 32] => Some(BlockLink::Start),
+            1 => Some(BlockLink::Parent(root)),
+            2 if root == [0; 32] => Some(BlockLink::Gap),
+            3 => Some(BlockLink::Pending(root)),
+            _ => None,
+        }
+    }
+}
 
 /// Length of a [`column_key`].
 pub const COLUMN_KEY_LEN: usize = BLOCK_PREFIX_LEN + 8;
@@ -132,6 +201,23 @@ mod tests {
     fn block_prefix_is_the_first_forty_key_bytes() {
         let key = column_key(9, &ROOT_B, 3);
         assert_eq!(block_prefix(9, &ROOT_B), key[..BLOCK_PREFIX_LEN]);
+    }
+
+    #[test]
+    fn links_round_trip_and_refuse_other_bytes() {
+        for link in [
+            BlockLink::Start,
+            BlockLink::Parent(ROOT_A),
+            BlockLink::Gap,
+            BlockLink::Pending(ROOT_B),
+        ] {
+            assert_eq!(BlockLink::decode(&link.encode()), Some(link));
+        }
+        assert_eq!(BlockLink::decode(&[1; 32]), None);
+        assert_eq!(BlockLink::decode(&[4; LINK_LEN]), None);
+        let mut gap = BlockLink::Gap.encode();
+        gap[5] = 1;
+        assert_eq!(BlockLink::decode(&gap), None);
     }
 
     #[test]
