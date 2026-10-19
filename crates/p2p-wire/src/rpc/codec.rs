@@ -278,6 +278,28 @@ pub fn max_compressed_len(n: usize) -> usize {
     n.saturating_add(n / 6).saturating_add(32)
 }
 
+/// The snappy stream identifier frame `snap` writes before the first data frame.
+const STREAM_IDENTIFIER_LEN: usize = 10;
+
+/// The most bytes [`encode_chunk`] writes for `n` SSZ bytes: the length prefix, the stream
+/// identifier, and per data frame of at most 64 KiB its header and CRC over at most the frame's
+/// own bytes (`snap` stores a frame that does not compress by at least an eighth uncompressed).
+/// Exact for data that does not compress; saturates at `usize::MAX`.
+#[must_use]
+pub fn max_encoded_chunk_len(n: usize) -> usize {
+    let prefix = (64 - (n as u64 | 1).leading_zeros() as usize).div_ceil(7);
+    let frames = n.div_ceil(MAX_FRAME_OUTPUT_LEN);
+    n.saturating_add(prefix + STREAM_IDENTIFIER_LEN)
+        .saturating_add(frames.saturating_mul(FRAME_HEADER_LEN + FRAME_CRC_LEN))
+}
+
+/// The most bytes [`encode_success_chunk`] writes for `n` SSZ bytes: the result byte, the
+/// context bytes, and [`max_encoded_chunk_len`]`(n)`.
+#[must_use]
+pub fn max_response_chunk_len(n: usize) -> usize {
+    max_encoded_chunk_len(n).saturating_add(1 + CONTEXT_BYTES_LEN)
+}
+
 /// Appends the unsigned-LEB128 encoding of `n`.
 pub fn encode_varint(mut n: u64, out: &mut Vec<u8>) {
     while n >= 0x80 {
@@ -845,6 +867,54 @@ mod tests {
         let chunk = encode_chunk(data).unwrap();
         let (_, hdr) = decode_varint(&chunk).unwrap();
         chunk[hdr..].to_vec()
+    }
+
+    /// `n` bytes snappy cannot compress (xorshift64).
+    fn incompressible(n: usize) -> Vec<u8> {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ n as u64;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    /// The framed bounds are exact for data that does not compress, at every frame boundary,
+    /// and hold for data that does.
+    #[test]
+    fn framed_chunk_bounds_are_exact_for_incompressible_data() {
+        const BLOCK: usize = MAX_FRAME_OUTPUT_LEN;
+        let digest = Some([1, 2, 3, 4]);
+        for n in [
+            1,
+            127,
+            128,
+            44_072,
+            BLOCK - 1,
+            BLOCK,
+            BLOCK + 1,
+            3 * BLOCK + 5,
+        ] {
+            let data = incompressible(n);
+            assert_eq!(
+                encode_chunk(&data).unwrap().len(),
+                max_encoded_chunk_len(n),
+                "{n}"
+            );
+            assert_eq!(
+                encode_success_chunk(digest, &data).unwrap().len(),
+                max_response_chunk_len(n),
+                "{n}"
+            );
+            assert!(encode_chunk(&vec![0; n]).unwrap().len() <= max_encoded_chunk_len(n));
+        }
+        assert!(encode_chunk(&[]).unwrap().len() <= max_encoded_chunk_len(0));
+        // A 21-blob sidecar: 26 bytes on top of its SSZ.
+        assert_eq!(max_response_chunk_len(44_072), 44_072 + 26);
+        assert_eq!(max_encoded_chunk_len(usize::MAX), usize::MAX);
     }
 
     // --- varint ---

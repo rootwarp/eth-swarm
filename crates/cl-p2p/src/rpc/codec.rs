@@ -751,8 +751,9 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
     /// its token still ahead, and one written whole stays charged even if the flush after it
     /// fails, since the peer may have it all. A booked answer is first cut again, at a whole
     /// block, to what a requester reading at the answer's pace from now reads by the end of its
-    /// window ([`BookedChunks::cut`]), and refused with `3: ResourceUnavailable` if not even its
-    /// first block reaches that requester before the place goes back; its unused tokens go back
+    /// window ([`BookedChunks::cut`]), and an answer of sidecars is refused with
+    /// `3: ResourceUnavailable` if not even its first block reaches that requester before the
+    /// place goes back (an error answer goes out with its own code); its unused tokens go back
     /// once its first chunk (a refusal's error chunk too) was written and flushed (an empty
     /// one's at once, [`BookedChunks::settle_answer`]), so a stream reset before that (the
     /// request-response handler waits on the answer, not the stream) gets nothing back. A
@@ -782,15 +783,19 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
             let held_since = permit.as_ref().map_or(now, |p| p.held_since());
             let mut sizes: Vec<usize> = chunks.iter().map(ssz_len).collect();
             let (keep, bytes) = booked.cut(&sizes, &block_lengths(&chunks), held_since, now);
-            if keep == 0 && !chunks.is_empty() {
+            let sidecars = chunks
+                .first()
+                .is_some_and(|c| matches!(c.chunk, ResponseChunk::Success(_)));
+            if keep == 0 && sidecars {
                 // Not even the first block reaches the requester before the place goes back:
                 // refused whole, never sent in part and then reset.
                 chunks = error_answer(ResultCode::ResourceUnavailable);
                 sizes = chunks.iter().map(ssz_len).collect();
-            } else {
+            } else if keep > 0 {
                 chunks.truncate(keep);
                 sizes.truncate(keep);
             }
+            // Else an error answer: it holds no block to send in part, and keeps its own code.
             if let Some(permit) = permit.as_mut() {
                 permit.hold_bytes(bytes);
             }
@@ -2537,6 +2542,8 @@ mod tests {
         wake: Pin<Box<Sleep>>,
         /// Every byte taken.
         taken: Vec<u8>,
+        /// Reading from then on with no gap ([`Self::from_now`]).
+        from: Option<Instant>,
     }
 
     impl SteadyReader {
@@ -2548,6 +2555,17 @@ mod tests {
                 read_by: now,
                 wake: Box::pin(tokio::time::sleep_until(now)),
                 taken: Vec::new(),
+                from: None,
+            }
+        }
+
+        /// One that reads `bytes` every `every` from now on with no gap, its `n`th byte read
+        /// `n` bytes' time after now however late the timer wakes it: for an answer whose
+        /// tokens are all due, so it never waits for one.
+        fn from_now(bytes: usize, every: Duration) -> Self {
+            Self {
+                from: Some(Instant::now()),
+                ..Self::new(bytes, every)
             }
         }
 
@@ -2595,8 +2613,12 @@ mod tests {
             }
             let n = buf.len().min(self.bytes);
             self.taken.extend_from_slice(&buf[..n]);
-            let nanos = self.every.as_nanos() * n as u128 / self.bytes as u128;
-            self.read_by = Instant::now() + Duration::from_nanos(nanos as u64);
+            let (from, read) = match self.from {
+                Some(from) => (from, self.taken.len()),
+                None => (Instant::now(), n),
+            };
+            let nanos = self.every.as_nanos() * read as u128 / self.bytes as u128;
+            self.read_by = from + Duration::from_nanos(nanos as u64);
             Poll::Ready(Ok(n))
         }
         fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -2827,6 +2849,18 @@ mod tests {
         lookup_takes: Duration,
         delay: Duration,
     ) -> (Vec<ResponseChunk<E>>, Vec<ResponseChunk<E>>) {
+        let steady = || SteadyReader::new(at_the_answer_pace(), Duration::from_millis(10));
+        serve_one_full_block_to(limiter, peer, lookup_takes, delay, steady).await
+    }
+
+    /// [`serve_one_full_block`] to the requester `reader` makes when the writer starts.
+    async fn serve_one_full_block_to(
+        limiter: &crate::rpc::limits::SharedLimiter,
+        peer: libp2p::PeerId,
+        lookup_takes: Duration,
+        delay: Duration,
+        reader: impl FnOnce() -> SteadyReader,
+    ) -> (Vec<ResponseChunk<E>>, Vec<ResponseChunk<E>>) {
         use crate::rpc::columns::{
             lookup_cost, AnswerBudget, ColumnLookup, ColumnReply, Requested,
         };
@@ -2862,7 +2896,7 @@ mod tests {
         let looked_up = chunks.iter().map(|c| c.chunk.clone()).collect();
         permit.hold_bytes(bytes);
         tokio::time::advance(delay).await;
-        let mut io = SteadyReader::new(at_the_answer_pace(), Duration::from_millis(10));
+        let mut io = reader();
         let answer = Answer {
             chunks,
             pacer: None,
@@ -2952,6 +2986,89 @@ mod tests {
             start + period,
             "the lookup's one token kept, the rest back"
         );
+    }
+
+    /// Only an answer of sidecars is refused past the hold: an error answer (the lookup's
+    /// `2: ServerError` here) whose writer starts after the place's hold ended goes out with its
+    /// own code, never replaced by `3: ResourceUnavailable`.
+    #[tokio::test(start_paused = true)]
+    async fn an_error_answer_written_past_the_hold_keeps_its_code() {
+        use crate::rpc::columns::error_answer;
+        use crate::rpc::limits::{ColumnPlaces, COLUMN_ANSWER_WINDOW, COLUMN_WRITE_DEADLINE};
+        let places = ColumnPlaces::new(1, 1, None);
+        for code in [ResultCode::ServerError, ResultCode::InvalidRequest] {
+            let answer = booked_columns(error_answer(code), &places);
+            tokio::time::advance(COLUMN_ANSWER_WINDOW + COLUMN_WRITE_DEADLINE * 2).await;
+            let mut io = SteadyReader::new(1 << 20, Duration::ZERO);
+            inbound_codec()
+                .write_response(&COLUMNS, &mut io, answer)
+                .await
+                .unwrap();
+            let read = read_response_within::<E, _>(
+                &mut Cursor::new(io.taken.clone()),
+                COLUMNS,
+                u64::MAX,
+                &testkit::column_context_table(),
+                Deadlines::default(),
+                usize::MAX,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(&read[..], [chunk] if matches!(chunk.chunk, ResponseChunk::Error { code: c, .. } if c == code)),
+                "{code:?}: {read:?}"
+            );
+            assert_eq!(places.held(), 0);
+        }
+    }
+
+    /// The hold check sizes the first block by what goes on the wire, not by its SSZ: each
+    /// chunk's result byte, context bytes, length prefix and snappy frames add 26 bytes to a
+    /// 21-blob sidecar, 3,328 bytes and about 2 ms at the answer's pace for all 128 columns. A
+    /// writer that starts when the block's SSZ would be read just before the hold ends refuses
+    /// it, where a requester reading its framed bytes at that pace would be reset partway;
+    /// one that starts when its framed bytes would be read just before then serves it whole.
+    #[tokio::test(start_paused = true)]
+    async fn the_hold_check_counts_the_framed_bytes_of_the_first_block() {
+        use crate::rpc::limits::{
+            COLUMN_ANSWER_WINDOW, COLUMN_WRITE_DEADLINE, MAX_COLUMN_RESPONSE_BYTES,
+        };
+        use p2p_wire::rpc::codec::max_response_chunk_len;
+        let at_pace = |bytes: usize| {
+            let window = COLUMN_ANSWER_WINDOW.as_nanos();
+            let nanos = window * bytes as u128 / MAX_COLUMN_RESPONSE_BYTES as u128;
+            Duration::from_nanos(nanos as u64)
+        };
+        let (stored, _) = one_full_block();
+        let ssz: Duration = stored.iter().map(|s| at_pace(s.ssz.len())).sum();
+        let framed: Duration = stored
+            .iter()
+            .map(|s| at_pace(max_response_chunk_len(s.ssz.len())))
+            .sum();
+        assert!(
+            framed - ssz > Duration::from_millis(1),
+            "{ssz:?} {framed:?}"
+        );
+        let limiter = shared_limiter(RateLimits::default());
+        let lookup_takes = Duration::from_millis(1_900);
+        let hold = COLUMN_ANSWER_WINDOW + COLUMN_WRITE_DEADLINE;
+        let exact = || SteadyReader::from_now(MAX_COLUMN_RESPONSE_BYTES, COLUMN_ANSWER_WINDOW);
+        let serve = |delay| {
+            let peer = libp2p::PeerId::random();
+            serve_one_full_block_to(&limiter, peer, lookup_takes, delay, exact)
+        };
+        // The timer wakes the lookup and the requester up to 1 ms late each, so the writer
+        // starts up to 1 ms after `delay` and the requester's last read lands up to 1 ms late.
+        // Its SSZ is read 1.5 ms before the hold ends, its framed bytes after it: refused.
+        let (looked_up, read) =
+            serve(hold - lookup_takes - ssz - Duration::from_micros(1_500)).await;
+        assert_eq!(looked_up.len(), 128);
+        assert!(unavailable(&read), "{} chunks read", read.len());
+        // Its framed bytes are read 3 ms before the hold ends: served whole.
+        let (looked_up, read) =
+            serve(hold - lookup_takes - framed - Duration::from_millis(3)).await;
+        assert_eq!(read, looked_up);
+        assert_eq!(read.len(), 128);
     }
 
     /// Fails every write: a stream the requester reset.

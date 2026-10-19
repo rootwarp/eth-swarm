@@ -54,7 +54,7 @@ pub struct SwarmPlan {
 ///
 /// # Errors
 ///
-/// The swarm could not be built or could not listen.
+/// The req/resp limits were refused, or the swarm could not be built or could not listen.
 pub fn probe_swarm<E: EthSpec>(
     devnet: &Devnet,
     status: Arc<dyn StatusSource>,
@@ -101,7 +101,8 @@ pub struct Gossip {
 ///
 /// # Errors
 ///
-/// The swarm could not be built or could not listen.
+/// The req/resp limits were refused ([`RpcLimits::validate`]), or the swarm could not be built
+/// or could not listen.
 pub fn serving_swarm<E: EthSpec>(
     devnet: &Devnet,
     key: Keypair,
@@ -109,6 +110,9 @@ pub fn serving_swarm<E: EthSpec>(
     plan: SwarmPlan,
     gossip: Option<Gossip>,
 ) -> Result<Swarm<SpecBehaviour<E>>, String> {
+    plan.limits
+        .validate()
+        .map_err(|e| format!("req/resp limits: {e}"))?;
     let mut registry = Registry::default();
     let transport = TransportMetrics::register(&mut registry);
     let mut cfg = SwarmConfig::new(MuxerBudget::with_defaults(&transport));
@@ -197,6 +201,22 @@ mod tests {
             .collect();
         assert_eq!(topics, [want]);
         assert_eq!(gossip.ignored(), 0);
+    }
+
+    /// The req/resp limits are checked before the swarm is built: a column quota too slow for
+    /// the largest block is refused with its field, the defaults are taken.
+    #[tokio::test]
+    async fn a_column_quota_too_slow_for_the_largest_block_is_refused() {
+        let devnet = devnet();
+        let status = || Arc::new(SharedStatus::new(None));
+        let mut slow = plan(None);
+        slow.limits.rate.data_columns_by_root =
+            cl_p2p::rpc::limits::Quota::new(512, Duration::from_millis(50));
+        let err = probe_swarm::<Minimal>(&devnet, status(), slow)
+            .err()
+            .expect("refused");
+        assert!(err.contains("rate.data_columns_by_root"), "{err}");
+        assert!(probe_swarm::<Minimal>(&devnet, status(), plan(None)).is_ok());
     }
 
     #[test]

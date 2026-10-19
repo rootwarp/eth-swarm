@@ -39,8 +39,10 @@
 use super::answer_bucket::{AnswerBucket, AnswerPrefixes};
 use super::metrics::RpcMetrics;
 use super::MAX_CONCURRENT_REQUESTS;
+use consensus_types::das::NUMBER_OF_COLUMNS;
 use futures::task::AtomicWaker;
 use libp2p::PeerId;
+use p2p_wire::rpc::codec::max_response_chunk_len;
 use p2p_wire::rpc::protocols::{Protocol, MAX_REQUEST_DATA_COLUMN_SIDECARS};
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
@@ -308,6 +310,65 @@ impl RpcLimits {
         let full = u64::from(quota.burst).saturating_add(u64::try_from(paced).unwrap_or(u64::MAX));
         (full / MAX_CONCURRENT_REQUESTS as u64).min(MAX_REQUEST_DATA_COLUMN_SIDECARS)
     }
+
+    /// Checks the limits when they are loaded: each column quota delivers the tokens of the
+    /// largest block a request may name (every column, [`NUMBER_OF_COLUMNS`]) within the answer
+    /// window and the write deadline, how long an answer holds its place. A booking's first
+    /// token is due before its answer takes a place and the rest follow at most one per period
+    /// whatever the bucket holds, so with these limits a first block whose tokens come past the
+    /// hold (refused `3: ResourceUnavailable`) is a matter of timing only, never of the quota.
+    ///
+    /// # Errors
+    ///
+    /// [`RpcLimitsError::ColumnQuotaTooSlow`] for the first column quota that does not.
+    pub fn validate(&self) -> Result<(), RpcLimitsError> {
+        let hold = self
+            .column_answer_window
+            .saturating_add(self.column_write_deadline);
+        let tokens = NUMBER_OF_COLUMNS;
+        let after_first = u32::try_from(tokens - 1).unwrap_or(u32::MAX);
+        for (field, quota) in [
+            (
+                "rate.data_columns_by_range",
+                self.rate.data_columns_by_range,
+            ),
+            ("rate.data_columns_by_root", self.rate.data_columns_by_root),
+        ] {
+            let delivered_in = quota.period.saturating_mul(after_first);
+            if delivered_in > hold {
+                return Err(RpcLimitsError::ColumnQuotaTooSlow {
+                    field,
+                    period: quota.period,
+                    tokens,
+                    delivered_in,
+                    hold,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Limits [`RpcLimits::validate`] refuses.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RpcLimitsError {
+    /// A column quota whose tokens for the largest block come past the answer's hold.
+    #[error(
+        "{field}: one token per {period:?} delivers the {tokens} tokens of the largest block in \
+         {delivered_in:?}, past the column answer window and write deadline ({hold:?})"
+    )]
+    ColumnQuotaTooSlow {
+        /// The quota's field.
+        field: &'static str,
+        /// Its period.
+        period: Duration,
+        /// The tokens of the largest block: one per column.
+        tokens: u64,
+        /// How long the last of them comes after the first: `tokens - 1` periods.
+        delivered_in: Duration,
+        /// How long an answer holds its place: the window and the write deadline.
+        hold: Duration,
+    },
 }
 
 /// Every peer's token buckets, one per protocol (see the module docs).
@@ -1105,11 +1166,14 @@ impl PacedReader<'_> {
 
     /// How many chunks, and how many of their SSZ bytes, an answer of chunks of `sizes` SSZ
     /// bytes in whole blocks of `blocks` chunks each (in order; chunks past them are no block)
-    /// holds: the first block whole if it is within `most_chunks` and this reader has read it
-    /// before the place goes back (the end of the window and the write deadline), else nothing,
-    /// so it is never sent in part and then reset; then each next whole block while the answer
-    /// stays within `most_chunks` and `most_bytes` and this reader has read it by the end of the
-    /// window ([`Self::end`]).
+    /// holds: the first block whole if it is within `most_chunks` and this reader has read its
+    /// bytes on the wire (each chunk at most [`max_response_chunk_len`] of its SSZ: the result
+    /// and context bytes, the length prefix and the snappy frames of data that does not
+    /// compress) before the place goes back (the end of the window and the write deadline),
+    /// else nothing, so it is never sent in part and then reset; then each next whole block
+    /// while the answer stays within `most_chunks` and `most_bytes`, this reader has read its
+    /// SSZ by the end of the window ([`Self::end`]) and its bytes on the wire before the place
+    /// goes back.
     #[must_use]
     pub fn whole_blocks(
         &self,
@@ -1119,7 +1183,7 @@ impl PacedReader<'_> {
         most_bytes: usize,
     ) -> (usize, usize) {
         let (mut chunks, mut bytes) = (0usize, 0usize);
-        let mut read = self.start;
+        let (mut read, mut framed_read) = (self.start, self.start);
         for &len in blocks {
             let Some(block) = sizes.get(chunks..chunks.saturating_add(len)) else {
                 break;
@@ -1128,14 +1192,22 @@ impl PacedReader<'_> {
                 .iter()
                 .zip(chunks as u64..)
                 .fold(read, |prev, (&size, i)| self.read(i, size, prev));
+            // The hold has no margin left, so it counts the bytes on the wire.
+            let framed_by = block
+                .iter()
+                .zip(chunks as u64..)
+                .fold(framed_read, |prev, (&size, i)| {
+                    self.read(i, max_response_chunk_len(size), prev)
+                });
             let size = block.iter().fold(0usize, |n, &s| n.saturating_add(s));
             let within_tokens = (chunks + len) as u64 <= most_chunks;
             let fits = bytes.saturating_add(size) <= most_bytes && read_by <= self.end;
-            let held = read_by <= self.hold_until;
+            let held = framed_by <= self.hold_until;
             if !within_tokens || !held || (chunks > 0 && !fits) {
                 break;
             }
             read = read_by;
+            framed_read = framed_by;
             chunks += len;
             bytes = bytes.saturating_add(size);
         }
@@ -1581,6 +1653,85 @@ mod tests {
             fast.column_answer_sidecars(Protocol::DataColumnsByRangeV1),
             MAX_REQUEST_DATA_COLUMN_SIDECARS
         );
+    }
+
+    /// A column quota is checked when the limits are loaded: one that cannot deliver the
+    /// tokens of a block of every column (128) within the answer window and the write deadline
+    /// is refused, naming the field and the numbers, so a first block whose tokens come past
+    /// the answer's hold is a matter of timing only. The defaults deliver them in 635 ms.
+    #[test]
+    fn a_column_quota_too_slow_for_the_largest_block_is_refused_at_load() {
+        assert_eq!(RpcLimits::default().validate(), Ok(()));
+        // 127 periods after the first token, the 128th: 6.35 s, past the 6 s hold.
+        let slow = Quota::new(512, Duration::from_millis(50));
+        let limits = RpcLimits {
+            rate: RateLimits {
+                data_columns_by_root: slow,
+                ..RateLimits::default()
+            },
+            ..RpcLimits::default()
+        };
+        let err = limits.validate().unwrap_err();
+        assert_eq!(
+            err,
+            RpcLimitsError::ColumnQuotaTooSlow {
+                field: "rate.data_columns_by_root",
+                period: Duration::from_millis(50),
+                tokens: 128,
+                delivered_in: Duration::from_millis(6_350),
+                hold: Duration::from_secs(6),
+            }
+        );
+        let message = err.to_string();
+        for part in ["rate.data_columns_by_root", "50ms", "128", "6.35s", "6s"] {
+            assert!(message.contains(part), "{message}");
+        }
+        // By range too, and a quota just inside the hold is accepted: 127 × 47 ms = 5.969 s.
+        let limits = RpcLimits {
+            rate: RateLimits {
+                data_columns_by_range: slow,
+                ..RateLimits::default()
+            },
+            ..RpcLimits::default()
+        };
+        assert!(matches!(
+            limits.validate(),
+            Err(RpcLimitsError::ColumnQuotaTooSlow {
+                field: "rate.data_columns_by_range",
+                ..
+            })
+        ));
+        let limits = RpcLimits {
+            rate: RateLimits {
+                data_columns_by_range: Quota::new(1, Duration::from_millis(47)),
+                data_columns_by_root: Quota::new(1, Duration::from_millis(47)),
+                ..RateLimits::default()
+            },
+            ..RpcLimits::default()
+        };
+        assert_eq!(limits.validate(), Ok(()));
+        // A shorter hold refuses the default quota: 635 ms past a 600 ms window and deadline.
+        let limits = RpcLimits {
+            column_answer_window: Duration::from_millis(500),
+            column_write_deadline: Duration::from_millis(100),
+            ..RpcLimits::default()
+        };
+        assert!(matches!(
+            limits.validate(),
+            Err(RpcLimitsError::ColumnQuotaTooSlow { hold, .. }) if hold == Duration::from_millis(600)
+        ));
+        // A period too long to multiply out is refused, not wrapped.
+        let limits = RpcLimits {
+            rate: RateLimits {
+                data_columns_by_root: Quota::new(1, Duration::MAX),
+                ..RateLimits::default()
+            },
+            ..RpcLimits::default()
+        };
+        assert!(matches!(
+            limits.validate(),
+            Err(RpcLimitsError::ColumnQuotaTooSlow { delivered_in, .. }) if delivered_in == Duration::MAX
+        ));
     }
 
     /// BUG-002: a booking takes what the bucket can still deliver within the window, and a
