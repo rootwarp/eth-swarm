@@ -32,13 +32,15 @@
 //! whole answer is `2: ServerError`. A sidecar the
 //! request did not name, or named once and got twice, is dropped and counted
 //! (`rpc_column_unrequested_total`). The answer is then cut at the last whole block within the
-//! sidecars the requester's quota delivers in the answer window and within the byte budget (its
-//! share left of the window once the lookup ended, [`AnswerBudget::within`]), the first block
-//! always in; a range answer whose first block lacks a requested column is
+//! sidecars the requester's quota delivers in the answer window, within the byte budget, and
+//! read by the end of the window by a requester reading at the answer's pace from when the
+//! lookup ended, given when each chunk's token is due ([`PacedReader`]), the first block always
+//! in; a range answer whose first block lacks a requested column is
 //! `2: ServerError` (cl-chain never sends one). Error chunks carry a fixed message per code
 //! ([`fixed_message`]); the source's detail goes to the log only.
 
 use super::codec::ReceivedChunk;
+use super::limits::PacedReader;
 use super::metrics::RpcMetrics;
 use consensus_types::{forked, EthSpec};
 use ethswarm_proto::chain as pb;
@@ -58,7 +60,6 @@ use pb::req_resp_service_client::ReqRespServiceClient;
 use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
 use tonic::transport::Channel;
 use tonic::Status;
 use tree_hash::TreeHash;
@@ -353,22 +354,6 @@ pub(crate) struct AnswerBudget {
     pub(crate) max_bytes: usize,
 }
 
-impl AnswerBudget {
-    /// This budget for an answer with `left` of its `window` to go out in: the bytes a requester
-    /// reading `max_bytes` per `window` reads in `left`, so an answer whose lookup took part of
-    /// the window is cut shorter instead of falling behind its schedule.
-    pub(crate) fn within(self, left: Duration, window: Duration) -> Self {
-        if left >= window {
-            return self;
-        }
-        let max_bytes = self.max_bytes as u128 * left.as_nanos() / window.as_nanos();
-        Self {
-            max_bytes: usize::try_from(max_bytes).unwrap_or(self.max_bytes),
-            ..self
-        }
-    }
-}
-
 /// A decoded sidecar on its way out, with its block.
 struct Outgoing<E: EthSpec> {
     block: (u64, [u8; 32]),
@@ -382,6 +367,7 @@ pub(crate) fn column_chunks<E: EthSpec>(
     requested: &Requested,
     contexts: &ContextTable,
     budget: AnswerBudget,
+    reader: &PacedReader<'_>,
     metrics: &RpcMetrics,
 ) -> (Vec<ReceivedChunk<E>>, usize) {
     let refuse = |why: String| {
@@ -456,9 +442,10 @@ pub(crate) fn column_chunks<E: EthSpec>(
         metrics.unrequested(unrequested);
         tracing::warn!(unrequested, "unrequested column sidecars dropped");
     }
-    // Whole blocks, the first always, then while within the budget.
+    // Whole blocks, the first always, then while within the budget and read in the window.
     let mut keep = 0usize;
     let (mut sidecars, mut bytes) = (0u64, 0usize);
+    let mut read = reader.start();
     let mut at = 0usize;
     while at < outgoing.len() {
         let block = outgoing[at].block;
@@ -480,11 +467,17 @@ pub(crate) fn column_chunks<E: EthSpec>(
             }
             break;
         }
-        let fits =
-            sidecars + len <= budget.max_sidecars && bytes.saturating_add(size) <= budget.max_bytes;
+        let read_by = outgoing[at..end]
+            .iter()
+            .zip(sidecars..)
+            .fold(read, |prev, (o, i)| reader.read(i, o.bytes, prev));
+        let fits = sidecars + len <= budget.max_sidecars
+            && bytes.saturating_add(size) <= budget.max_bytes
+            && read_by <= reader.end();
         if keep > 0 && !fits {
             break;
         }
+        read = read_by;
         sidecars += len;
         bytes = bytes.saturating_add(size);
         keep = end;
@@ -503,27 +496,6 @@ mod tests {
     use network_config::{ForkSchedule, ScheduledFork};
 
     const GLOAS: ForkDigest = [0x61, 0x0a, 0x50, 0x01];
-
-    #[test]
-    fn a_budget_keeps_the_bytes_the_window_left_holds() {
-        let budget = AnswerBudget {
-            max_sidecars: 7,
-            max_bytes: 8 << 20,
-        };
-        let window = Duration::from_secs(5);
-        let within = |left| budget.within(left, window);
-        assert_eq!(within(window), budget);
-        assert_eq!(within(Duration::from_secs(9)), budget);
-        assert_eq!(
-            within(Duration::from_secs(3)),
-            AnswerBudget {
-                max_sidecars: 7,
-                max_bytes: (8 << 20) * 3 / 5,
-            }
-        );
-        assert_eq!(within(Duration::ZERO).max_bytes, 0);
-        assert_eq!(budget.within(Duration::ZERO, Duration::ZERO), budget);
-    }
 
     fn link() -> Link {
         let at = |epoch| ScheduledFork {

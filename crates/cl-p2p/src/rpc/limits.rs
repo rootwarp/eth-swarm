@@ -21,7 +21,8 @@
 //! - [`BookedChunks`]: a column answer's tokens, booked in one go when its request is admitted
 //!   ([`RateLimiter::charge_block`]), so a peer pays for its request before any lookup runs and
 //!   cannot reset its way out of the bill: once the answer's size is known the tokens it does not
-//!   use are given back ([`BookedChunks::settle`]), never more, and a reset refunds nothing.
+//!   use are given back ([`BookedChunks::settle`]), never more, and a reset (or a close during
+//!   the lookup) refunds nothing.
 //! - [`ColumnPlaces`]: the column answers held at once, from the lookup until the stream's
 //!   writer returns, at most one per peer ([`AnswerPermit`]), each written to its booked
 //!   schedule and held no longer than the answer window and the write deadline
@@ -142,8 +143,10 @@ pub const DEFAULT_OUTBOUND_QUEUE_LEN: usize = 256;
 /// An answer is cut at the last whole block that fits (the first block always goes, "Clients MAY
 /// limit the number of data column sidecars in the response", `fulu/p2p-interface.md` L682), so
 /// one epoch of 4 custody columns of 21-blob Gloas blocks (32 × 4 × 44,072 bytes, 5.4 MiB) fits
-/// whole. A lookup that took part of the window leaves the answer that part less: after the
-/// longest (2 s), 3 s of the 5 s, about 4.8 MiB.
+/// whole. The answer holds no more than a requester reading these bytes per window reads from
+/// the lookup's end to the window's end, given when each chunk's token is due
+/// ([`PacedReader`]): after the longest lookup (2 s), 3 s of the 5 s, about 4.8 MiB with the
+/// tokens due by then, and less when they are due later.
 pub const MAX_COLUMN_RESPONSE_BYTES: usize = 8 << 20;
 
 /// How long a column answer's chunks may take to go out at the peer's quota \[est\]: 5 s, the
@@ -178,16 +181,18 @@ pub const DEFAULT_MAX_COLUMN_ANSWERS: usize = 8;
 pub const DEFAULT_MAX_COLUMN_ANSWERS_PER_IP: usize = 2;
 
 /// How far a column chunk may fall behind its answer's schedule before its stream is reset
-/// \[est\]: 1 s. A chunk is due at its token, and no earlier than the share of the answer window
+/// \[est\]: 1 s. A chunk is due at its token, no earlier than the share of the answer window
 /// ([`COLUMN_ANSWER_WINDOW`], from when the answer took its place) that the answer's SSZ bytes
-/// before it are of all of them, so a burst never asks for the whole answer at once; it must be
+/// before it are of all of them, so a burst never asks for the whole answer at once, and no
+/// earlier than a requester reading at the answer's pace has it ([`PacedReader`]); it must be
 /// written and flushed within this of that, and the place goes back within the window and this
 /// of being taken ([`WriteSchedule`]). The deadline is not a new one per write: a requester that
 /// reads a chunk just inside it each time still falls behind its schedule and is reset, so it
 /// holds a place for about a second past the pace it keeps, not the 10 s exchange timeout. One
-/// that reads at the answer's pace (8 MiB in 5 s, about 1.7 MB/s) is never cut, however the
-/// bytes are spread over the chunks: the answer holds no more than that pace reads in what is
-/// left of the window once its lookup ended (`super::inbound::answer_columns`). Counted in
+/// that reads at the answer's pace (8 MiB in 5 s, about 1.7 MB/s) whenever a chunk is there to
+/// read is never cut, however the bytes are spread over the chunks and however long they wait
+/// for their tokens: the answer holds no more than the whole blocks that pace reads by the end
+/// of the window from when its lookup ended (`super::inbound::answer_columns`). Counted in
 /// `rpc_timeouts_total{kind="per_chunk"}`.
 pub const COLUMN_WRITE_DEADLINE: Duration = Duration::from_secs(1);
 
@@ -198,14 +203,18 @@ pub struct ColumnDeadlines {
     pub answer_window: Duration,
     /// How far a chunk may fall behind the answer's schedule ([`COLUMN_WRITE_DEADLINE`]).
     pub write: Duration,
+    /// The SSZ bytes a requester reads in `answer_window`: the pace each chunk's deadline
+    /// leaves its bytes, and an answer is cut to ([`PacedReader`]).
+    pub answer_bytes: usize,
 }
 
 impl Default for ColumnDeadlines {
-    /// [`COLUMN_ANSWER_WINDOW`] and [`COLUMN_WRITE_DEADLINE`].
+    /// [`COLUMN_ANSWER_WINDOW`], [`COLUMN_WRITE_DEADLINE`] and [`MAX_COLUMN_RESPONSE_BYTES`].
     fn default() -> Self {
         Self {
             answer_window: COLUMN_ANSWER_WINDOW,
             write: COLUMN_WRITE_DEADLINE,
+            answer_bytes: MAX_COLUMN_RESPONSE_BYTES,
         }
     }
 }
@@ -267,6 +276,7 @@ impl RpcLimits {
         ColumnDeadlines {
             answer_window: self.column_answer_window,
             write: self.column_write_deadline,
+            answer_bytes: self.max_column_response_bytes,
         }
     }
 
@@ -575,7 +585,12 @@ impl RateLimiter {
         charge: &BlockCharge,
         i: u64,
     ) -> Instant {
-        let shift = charge
+        charge.due_after(i, self.shift_of(peer, protocol, charge))
+    }
+
+    /// How far the refunds of the charges booked before `charge` moved it up ([`Self::due_of`]).
+    fn shift_of(&self, peer: PeerId, protocol: Protocol, charge: &BlockCharge) -> Duration {
+        charge
             .booked
             .as_ref()
             .and_then(|booked| {
@@ -584,8 +599,7 @@ impl RateLimiter {
                     .filter(|b| b.id == booked.bucket)
                     .map(|b| b.moved_before(booked).unwrap_or_else(|known| known))
             })
-            .unwrap_or_default();
-        charge.due_after(i, shift)
+            .unwrap_or_default()
     }
 
     /// Gives back the last `unused` tokens of `charge`, as far as they are still ahead of
@@ -851,11 +865,27 @@ impl BookedChunks {
         lock(&self.limiter).due_of(self.peer, self.protocol, &self.charge, 0)
     }
 
+    /// The requester an answer of these tokens that took its place at `held_since` is written
+    /// to from `now`, reading at the answer's pace ([`PacedReader`]).
+    #[must_use]
+    pub fn reader(&self, held_since: Instant, now: Instant) -> PacedReader<'_> {
+        let shift = lock(&self.limiter).shift_of(self.peer, self.protocol, &self.charge);
+        PacedReader {
+            charge: &self.charge,
+            shift,
+            start: now,
+            end: held_since + self.deadlines.answer_window,
+            bytes: self.deadlines.answer_bytes as u64,
+            window: self.deadlines.answer_window,
+        }
+    }
+
     /// The schedule chunks of `sizes` SSZ bytes each are written to from `now`, by an answer
-    /// that took its place at `held_since`: chunk `i` is due at its token ([`Self::due`]) and
-    /// its share of the window, as far from `now` to `held_since` + the answer window as the
-    /// bytes before it are of the answer's, and must be written within the write deadline of the
-    /// later of the two, and of its write's start ([`WriteSchedule::written_by`]). The place is
+    /// that took its place at `held_since`: chunk `i` is due at the latest of its token
+    /// ([`Self::due`]), its share of the window (as far from `now` to `held_since` + the answer
+    /// window as the bytes before it are of the answer's) and when a requester reading at the
+    /// answer's pace from `now` has it ([`Self::reader`]), and must be written within the write
+    /// deadline of that, and of its write's start ([`WriteSchedule::written_by`]). The place is
     /// held no longer than the window and the write deadline from `held_since`.
     #[must_use]
     pub fn write_schedule(
@@ -865,20 +895,25 @@ impl BookedChunks {
         now: Instant,
     ) -> WriteSchedule {
         let end = (held_since + self.deadlines.answer_window).max(now);
+        let reader = self.reader(held_since, now);
         let mut total = 0u64;
-        let before = sizes
+        let mut read = now;
+        let (before, read_by) = sizes
             .into_iter()
-            .map(|size| {
+            .zip(0u64..)
+            .map(|(size, i)| {
                 let before = total;
                 total = total.saturating_add(size as u64);
-                before
+                read = reader.read(i, size, read);
+                (before, read)
             })
-            .collect();
+            .unzip();
         WriteSchedule {
             start: now,
             span: end - now,
             before,
             total,
+            read_by,
             write: self.deadlines.write,
             hold_until: held_since + self.deadlines.answer_window + self.deadlines.write,
         }
@@ -931,31 +966,84 @@ pub struct WriteSchedule {
     before: Vec<u64>,
     /// The SSZ bytes of every chunk.
     total: u64,
+    /// When a requester reading at the answer's pace has each chunk ([`PacedReader::read`]).
+    read_by: Vec<Instant>,
     write: Duration,
     hold_until: Instant,
 }
 
 impl WriteSchedule {
     /// When chunk `i`, due at `due`, must be written and flushed by if its write starts at
-    /// `now`: the write deadline after the later of `due` and its share of the window (the
-    /// share the bytes before it have of the answer's, so a requester that reads the answer
-    /// evenly over the window keeps up however its bytes are spread over its chunks), never
-    /// past the place's hold, and never more than the write deadline after the later of `due`
-    /// and `now` (a requester that stopped reading is cut as soon as it holds a chunk that long).
+    /// `now`: the write deadline after the latest of `due`, its share of the window (the share
+    /// the bytes before it have of the answer's, so a requester that reads the answer evenly
+    /// over the window keeps up however its bytes are spread over its chunks) and when a
+    /// requester reading at the answer's pace has it (so the time the chunks before it waited
+    /// for their tokens is not counted as reading time it had), never past the place's hold,
+    /// and never more than the write deadline after the later of `due` and `now` (a requester
+    /// that stopped reading is cut as soon as it holds a chunk that long).
     #[must_use]
     pub fn written_by(&self, i: u64, due: Instant, now: Instant) -> Instant {
-        let before = usize::try_from(i)
-            .ok()
+        let at = usize::try_from(i).ok();
+        let before = at
             .and_then(|i| self.before.get(i))
             .map_or(self.total, |&before| before);
+        let read = at
+            .and_then(|i| self.read_by.get(i))
+            .map_or(due, |&read| read);
         let share = match self.total {
             0 => 0,
             total => self.span.as_nanos() * u128::from(before) / u128::from(total),
         };
         let share = Duration::from_nanos(u64::try_from(share).unwrap_or(u64::MAX));
-        (due.max(self.start + share) + self.write)
+        (due.max(self.start + share).max(read) + self.write)
             .min(due.max(now) + self.write)
             .min(self.hold_until)
+    }
+}
+
+/// A requester reading a column answer at the answer's pace ([`ColumnDeadlines::answer_bytes`]
+/// per answer window) whenever there is a chunk to read ([`BookedChunks::reader`]): it reads
+/// chunk `i` once its token is due and the chunk before it is read, so it banks no reading time
+/// while a chunk waits for its token. An answer is cut at the last whole block it has read by
+/// the end of the window ([`Self::end`]), and each chunk's deadline leaves it the time it needs
+/// ([`WriteSchedule::written_by`]).
+#[derive(Debug)]
+pub struct PacedReader<'a> {
+    charge: &'a BlockCharge,
+    /// How far the refunds of earlier charges moved `charge` up, when the reader was made.
+    shift: Duration,
+    /// When the first byte can go out.
+    start: Instant,
+    /// The end of the answer window.
+    end: Instant,
+    /// The bytes it reads per `window`.
+    bytes: u64,
+    window: Duration,
+}
+
+impl PacedReader<'_> {
+    /// When the first byte can go out: the reader has read nothing before.
+    #[must_use]
+    pub fn start(&self) -> Instant {
+        self.start
+    }
+
+    /// The end of the answer window: an answer holds no more than the whole blocks read by then.
+    #[must_use]
+    pub fn end(&self) -> Instant {
+        self.end
+    }
+
+    /// When it has read chunk `i`, of `size` SSZ bytes, if it had read the chunk before it by
+    /// `prev`: the chunk's bytes' time at the answer's pace after the later of `prev` and the
+    /// chunk's token (a pace of 0 bytes reads 1 byte per window).
+    #[must_use]
+    pub fn read(&self, i: u64, size: usize, prev: Instant) -> Instant {
+        let from = self.charge.due_after(i, self.shift).max(prev);
+        let nanos = self.window.as_nanos() * size as u128 / u128::from(self.bytes.max(1));
+        let transfer = Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
+        from.checked_add(transfer)
+            .unwrap_or_else(|| from.max(self.end) + self.window)
     }
 }
 
@@ -1474,6 +1562,60 @@ mod tests {
         for (i, &at) in (0..756).zip(&booked) {
             assert_eq!(limiter.due_of(peer, p, &first, i), at, "chunk {i}");
         }
+    }
+
+    /// BUG-001: a requester reading at the answer's pace reads each chunk from the later of its
+    /// token and the chunk before it: waiting for a token banks it no reading time.
+    #[tokio::test(start_paused = true)]
+    async fn a_paced_reader_reads_each_chunk_after_its_token_and_the_one_before() {
+        let limiter = shared_limiter(RateLimits {
+            data_columns_by_range: Quota::new(1, Duration::from_secs(1)),
+            ..RateLimits::default()
+        });
+        let peer = PeerId::random();
+        let p = Protocol::DataColumnsByRangeV1;
+        // 1,000 bytes a second.
+        let deadlines = ColumnDeadlines {
+            answer_bytes: 5_000,
+            ..ColumnDeadlines::default()
+        };
+        let now = Instant::now();
+        let booked = BookedChunks::book(&limiter, peer, p, 3, None, deadlines);
+        let reader = booked.reader(now, at(now, 200));
+        assert_eq!(reader.start(), at(now, 200));
+        assert_eq!(reader.end(), now + COLUMN_ANSWER_WINDOW);
+        // Due at once: read half a second after the one before.
+        assert_eq!(reader.read(0, 500, reader.start()), at(now, 700));
+        // Due a second on: half a second after its token, nothing read ahead while it waited.
+        assert_eq!(reader.read(1, 500, at(now, 700)), at(now, 1_500));
+        // Due two seconds on, but the one before is read later: half a second after that.
+        assert_eq!(reader.read(2, 500, at(now, 2_700)), at(now, 3_200));
+        // A pace of 0 bytes reads one byte per window; its token is due when the three are.
+        let slow = BookedChunks::book(
+            &limiter,
+            peer,
+            p,
+            1,
+            None,
+            ColumnDeadlines {
+                answer_bytes: 0,
+                ..deadlines
+            },
+        );
+        let reader = slow.reader(now, now);
+        assert_eq!(
+            reader.read(0, 2, now),
+            at(now, 3_000) + COLUMN_ANSWER_WINDOW * 2
+        );
+        // A read too long to tell lands past the window all the same.
+        let huge = ColumnDeadlines {
+            answer_window: Duration::from_secs(1 << 30),
+            answer_bytes: 1,
+            ..deadlines
+        };
+        let endless = BookedChunks::book(&limiter, peer, p, 1, None, huge);
+        let reader = endless.reader(now, now);
+        assert!(reader.read(0, usize::MAX, now) > reader.end());
     }
 
     /// CR-002: past the refunds a bucket remembers, a booking's due times never move up and a

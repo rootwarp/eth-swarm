@@ -1979,6 +1979,7 @@ mod tests {
     const LONG: crate::rpc::limits::ColumnDeadlines = crate::rpc::limits::ColumnDeadlines {
         answer_window: Duration::from_secs(10),
         write: Duration::from_secs(10),
+        answer_bytes: crate::rpc::limits::MAX_COLUMN_RESPONSE_BYTES,
     };
 
     /// BUG-001, SEC-001: a column answer goes out at the tokens booked for it, holds its place
@@ -2395,8 +2396,7 @@ mod tests {
         use crate::rpc::columns::{AnswerBudget, ColumnLookup, ColumnReply, Requested};
         use crate::rpc::inbound::{answer_columns, COLUMN_LOOKUP_TIMEOUT};
         use crate::rpc::limits::{
-            BookedChunks, ColumnDeadlines, ColumnPlaces, COLUMN_ANSWER_WINDOW,
-            MAX_COLUMN_RESPONSE_BYTES,
+            BookedChunks, ColumnDeadlines, ColumnPlaces, MAX_COLUMN_RESPONSE_BYTES,
         };
         use p2p_wire::rpc::messages::DataColumnsByRangeV1Request;
         const CUSTODY: [u64; 4] = [1, 47, 87, 102];
@@ -2447,13 +2447,7 @@ mod tests {
                 max_bytes: MAX_COLUMN_RESPONSE_BYTES,
             };
             let (chunks, bytes) = answer_columns::<E>(
-                lookup,
-                &requested,
-                &contexts,
-                budget,
-                &metrics,
-                &permit,
-                COLUMN_ANSWER_WINDOW,
+                lookup, &requested, &contexts, budget, &metrics, &permit, &booked,
             )
             .await;
             permit.hold_bytes(bytes);
@@ -2476,6 +2470,158 @@ mod tests {
         assert!(served[0] < stored.len(), "{served:?}");
         assert!(served[1] < served[0], "{served:?}");
         assert!(served[1] > 0, "{served:?}");
+    }
+
+    /// A requester that reads `bytes` every `every` whenever there is something to read, with
+    /// no window to buffer into: it banks no read time while it waits for a chunk (one withheld
+    /// for its token), so a chunk takes its own bytes' time from when it is offered.
+    struct SteadyReader {
+        bytes: usize,
+        every: Duration,
+        /// When it has read every byte taken so far.
+        read_by: Instant,
+        wake: Pin<Box<Sleep>>,
+    }
+
+    impl SteadyReader {
+        fn new(bytes: usize, every: Duration) -> Self {
+            let now = Instant::now();
+            Self {
+                bytes,
+                every,
+                read_by: now,
+                wake: Box::pin(tokio::time::sleep_until(now)),
+            }
+        }
+
+        /// Ready once every byte taken so far is read.
+        fn poll_read_up(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+            if self.read_by <= Instant::now() {
+                return Poll::Ready(());
+            }
+            let at = self.read_by;
+            self.wake.as_mut().reset(at);
+            self.wake.as_mut().poll(cx)
+        }
+    }
+
+    impl AsyncWrite for SteadyReader {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.poll_read_up(cx).is_pending() {
+                return Poll::Pending;
+            }
+            let n = buf.len().min(self.bytes);
+            let nanos = self.every.as_nanos() * n as u128 / self.bytes as u128;
+            self.read_by = Instant::now() + Duration::from_nanos(nanos as u64);
+            Poll::Ready(Ok(n))
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.poll_read_up(cx).map(Ok)
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A stored Gloas sidecar of column `index` at `slot` with `blobs` cells ([`big_sidecar`]).
+    fn stored_sidecar(slot: u64, index: u64, blobs: usize) -> crate::rpc::columns::ServedColumn {
+        let mut root = [0x5a; 32];
+        root[..8].copy_from_slice(&slot.to_be_bytes());
+        let mut sidecar = big_sidecar(slot, index, blobs);
+        sidecar.beacon_block_root = root.into();
+        crate::rpc::columns::ServedColumn {
+            context: testkit::GLOAS_DIGEST,
+            fork: network_config::ForkName::Gloas,
+            slot,
+            block_root: root,
+            ssz: sidecar.as_ssz_bytes(),
+        }
+    }
+
+    /// BUG-001: a chunk that waits for its token gives the requester nothing to read meanwhile.
+    /// With the burst spent, 500 one-blob sidecars before 165 of 21 blobs take 2.5 s at the
+    /// token rate, and a requester reading at the answer's pace from when each byte is offered
+    /// then needs 4.3 s more for the large ones. The answer is cut, at a whole block, to what it
+    /// reads in the window given when each token is due: a shorter, valid answer, never a reset.
+    #[tokio::test(start_paused = true)]
+    async fn a_spent_bucket_cuts_a_small_first_answer_to_what_a_steady_reader_reads() {
+        use crate::rpc::columns::{AnswerBudget, ColumnLookup, ColumnReply, Requested};
+        use crate::rpc::inbound::answer_columns;
+        use crate::rpc::limits::{
+            BookedChunks, ColumnDeadlines, ColumnPlaces, COLUMN_ANSWER_WINDOW,
+            COLUMN_WRITE_DEADLINE, MAX_COLUMN_RESPONSE_BYTES,
+        };
+        use p2p_wire::rpc::messages::DataColumnsByRangeV1Request;
+        let stored: Vec<_> = (0..665u64)
+            .map(|slot| stored_sidecar(slot, 1, if slot < 500 { 1 } else { 21 }))
+            .collect();
+        let total: usize = stored.iter().map(|s| s.ssz.len()).sum();
+        assert!(
+            total <= MAX_COLUMN_RESPONSE_BYTES,
+            "within the byte budget: {total}"
+        );
+        let requested = Requested::of(&Request::DataColumnsByRange(DataColumnsByRangeV1Request {
+            start_slot: 0,
+            count: 665,
+            columns: vec![1].try_into().unwrap(),
+        }))
+        .unwrap();
+        let contexts = testkit::column_context_table();
+        let metrics = RpcMetrics::register(&mut prometheus_client::registry::Registry::default());
+        let limiter = shared_limiter(RateLimits::default());
+        let places = ColumnPlaces::new(1, 1, None);
+        let peer = libp2p::PeerId::random();
+        // The burst went on an earlier answer.
+        let _spent = limiter
+            .lock()
+            .unwrap()
+            .charge_block(peer, COLUMNS, 512, Instant::now());
+        let deadlines = ColumnDeadlines::default();
+        let mut booked = BookedChunks::book(&limiter, peer, COLUMNS, 665, None, deadlines);
+        assert_eq!(booked.tokens(), 665);
+        let mut permit = places.try_take(peer, None).unwrap();
+        let taken = Instant::now();
+        let reply = ColumnReply::Sidecars(stored.clone());
+        let lookup: ColumnLookup = Box::pin(async move { reply });
+        let budget = AnswerBudget {
+            max_sidecars: booked.tokens(),
+            max_bytes: MAX_COLUMN_RESPONSE_BYTES,
+        };
+        let (chunks, bytes) = answer_columns::<E>(
+            lookup, &requested, &contexts, budget, &metrics, &permit, &booked,
+        )
+        .await;
+        permit.hold_bytes(bytes);
+        booked.settle(chunks.len() as u64);
+        let sent: Vec<Vec<u8>> = chunks
+            .iter()
+            .map(|chunk| match &chunk.chunk {
+                ResponseChunk::Success(Response::DataColumn(sidecar)) => sidecar.as_ssz_bytes(),
+                other => panic!("not a sidecar: {other:?}"),
+            })
+            .collect();
+        let answer = Answer {
+            chunks,
+            pacer: None,
+            booked: Some(Box::new(booked)),
+            permit: Some(Box::new(permit)),
+        };
+        let mut io = SteadyReader::new(at_the_answer_pace(), Duration::from_millis(10));
+        inbound_codec()
+            .write_response(&COLUMNS, &mut io, answer)
+            .await
+            .expect("a steady reader at the answer's pace is never reset");
+        assert!(taken.elapsed() <= COLUMN_ANSWER_WINDOW + COLUMN_WRITE_DEADLINE);
+        assert_eq!(places.held(), 0);
+        // A valid prefix of the stored answer: every small sidecar, cut among the large ones.
+        let prefix: Vec<_> = stored[..sent.len()].iter().map(|s| s.ssz.clone()).collect();
+        assert_eq!(sent, prefix);
+        assert!(sent.len() > 500, "{} sent", sent.len());
+        assert!(sent.len() < stored.len(), "{} sent", sent.len());
     }
 
     #[tokio::test(start_paused = true)]

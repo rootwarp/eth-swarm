@@ -73,18 +73,21 @@
 //!   until the first token is due, so a peer over its quota costs no lookup, and its chunks go
 //!   out at the booked tokens; a booking behind another moves up as that one's unused tokens go
 //!   back. A reset, before or after, gives back nothing, so a peer cannot request and reset its
-//!   way past its quota. Answers hold a place from the lookup until the stream's writer returns
+//!   way past its quota; nor does a close during the lookup, whose answer is dropped unsettled.
+//!   Answers hold a place from the lookup until the stream's writer returns
 //!   ([`super::limits::ColumnPlaces`]): at most [`RpcLimits::max_column_answers`] (8) at once,
 //!   one per peer and [`RpcLimits::max_column_answers_per_ip`] (2) per IP, each at most
 //!   [`RpcLimits::max_column_response_bytes`] (8 MiB) of SSZ, encoded one chunk at a time (an
 //!   estimated 68 MiB for all, see [`super::limits::DEFAULT_MAX_COLUMN_ANSWERS`]), and no more
-//!   than a requester reading those bytes per [`RpcLimits::column_answer_window`] reads in what
-//!   is left of the window when the lookup ends ([`answer_columns`]): a slow lookup shortens
-//!   the answer, at a whole block, instead of leaving the requester less time for the same
-//!   bytes. Each answer is written to a
-//!   schedule ([`super::limits::WriteSchedule`]): a chunk is due at its booked token and no
+//!   than the whole blocks a requester reading those bytes per
+//!   [`RpcLimits::column_answer_window`] reads from the lookup's end to the end of the window,
+//!   given when each chunk's token is due ([`answer_columns`], [`super::limits::PacedReader`]):
+//!   a slow lookup or tokens due late shorten the answer, at a whole block, instead of leaving
+//!   the requester less time for the same bytes. Each answer is written to a
+//!   schedule ([`super::limits::WriteSchedule`]): a chunk is due at its booked token, no
 //!   earlier than the share of the window from when the answer took its place that the
-//!   answer's bytes before it are of all of them, and a chunk not written within
+//!   answer's bytes before it are of all of them, and no earlier than such a requester has it,
+//!   and a chunk not written within
 //!   [`RpcLimits::column_write_deadline`] (1 s) of that, or of its write's start, resets its
 //!   stream and frees the place. A requester that stops reading holds it for
 //!   about a second, and one that reads a chunk just inside the deadline each time falls behind
@@ -636,8 +639,9 @@ struct ColumnAnswer<E: EthSpec> {
 
 /// The chunks a column lookup's answer goes out as, and their SSZ bytes: its reply
 /// (`2: ServerError` past [`COLUMN_LOOKUP_TIMEOUT`]) held to `requested` and cut to `budget`
-/// ([`column_chunks`]), its bytes to the share of them that what is left of the answer `window`
-/// of `permit`'s place holds ([`AnswerBudget::within`]).
+/// and to the whole blocks a requester reading at the answer's pace from the lookup's end has
+/// by the end of the window of `permit`'s place, given when each of `booked`'s tokens is due
+/// ([`column_chunks`], [`BookedChunks::reader`]).
 pub(crate) async fn answer_columns<E: EthSpec>(
     lookup: ColumnLookup,
     requested: &Requested,
@@ -645,19 +649,13 @@ pub(crate) async fn answer_columns<E: EthSpec>(
     budget: AnswerBudget,
     metrics: &RpcMetrics,
     permit: &AnswerPermit,
-    window: Duration,
+    booked: &BookedChunks,
 ) -> (Vec<ReceivedChunk<E>>, usize) {
     let reply = tokio::time::timeout(COLUMN_LOOKUP_TIMEOUT, lookup)
         .await
         .unwrap_or_else(|_| ColumnReply::server_error("column lookup timed out"));
-    let left = (permit.held_since() + window).saturating_duration_since(Instant::now());
-    column_chunks(
-        reply,
-        requested,
-        contexts,
-        budget.within(left, window),
-        metrics,
-    )
+    let reader = booked.reader(permit.held_since(), Instant::now());
+    column_chunks(reply, requested, contexts, budget, &reader, metrics)
 }
 
 /// A column request admitted and waiting for its tokens or a place.
@@ -708,8 +706,9 @@ pub struct Control<E: EthSpec> {
     /// The peers' Status requests we are answering with our Status, until the answer is sent
     /// ([`ControlEvent::StatusAnswered`]) or fails.
     status_answers: HashSet<InboundRequestId>,
-    /// Column lookups open, each on its own task, each holding a place.
-    lookups: FuturesUnordered<JoinHandle<ColumnAnswer<E>>>,
+    /// Column lookups open, each on its own task, each holding a place: `None` from one whose
+    /// stream closed during it.
+    lookups: FuturesUnordered<JoinHandle<Option<ColumnAnswer<E>>>>,
     /// The column answers' places, shared with the streams' writers.
     places: ColumnPlaces,
     /// Column requests waiting for their tokens or a place, in arrival order.
@@ -1522,21 +1521,25 @@ impl<E: EthSpec> Control<E> {
             max_sidecars: booked.tokens(),
             max_bytes: self.cfg.limits.max_column_response_bytes,
         };
-        let window = self.cfg.limits.column_answer_window;
         self.lookups.push(runtime.spawn(async move {
             let (chunks, bytes) = answer_columns(
-                lookup, &requested, &contexts, budget, &metrics, &permit, window,
+                lookup, &requested, &contexts, budget, &metrics, &permit, &booked,
             )
             .await;
+            if !channel.is_open() {
+                // Gone during the lookup: its tokens stay spent, as on a reset.
+                tracing::debug!(%peer, "a column request's stream closed during its lookup");
+                return None;
+            }
             permit.hold_bytes(bytes);
             booked.settle(chunks.len() as u64);
-            ColumnAnswer {
+            Some(ColumnAnswer {
                 protocol,
                 channel,
                 chunks,
                 booked,
                 permit,
-            }
+            })
         }));
     }
 
@@ -1544,7 +1547,8 @@ impl<E: EthSpec> Control<E> {
     fn poll_lookups(&mut self, cx: &mut Context<'_>) {
         while let Poll::Ready(Some(done)) = self.lookups.poll_next_unpin(cx) {
             match done {
-                Ok(done) => {
+                Ok(None) => {}
+                Ok(Some(done)) => {
                     let answer = Answer {
                         chunks: done.chunks,
                         pacer: None,

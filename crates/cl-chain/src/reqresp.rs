@@ -78,7 +78,9 @@
 //! [`cl_chain_columns::RangeRead::cut`], and only that one is spared the completeness check); the
 //! first block always goes whole, past the budget if it must. A by-root answer ends before the
 //! identifier that would take it past the budget, its first identifier's sidecars always in.
-//! cl-p2p cuts any answer by the same rule with the same budget, so both ends agree.
+//! cl-p2p cuts any answer at a whole block too, within the same budget and also to what the
+//! requester's quota and reading pace deliver in what is left of its answer window, so what goes
+//! out is this answer or a shorter prefix of it, never more.
 //!
 //! The view (custody, `earliest_available_slot`) and the read come from one read transaction
 //! ([`Snapshot`]), so a finality prune between them cannot make a pruned slot look empty.

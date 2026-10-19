@@ -192,6 +192,55 @@ proptest! {
     }
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// BUG-001: a requester that reads a column answer at the answer's pace whenever a chunk is
+    /// there to read, banking no reading time while one waits for its token, has each chunk by
+    /// its deadline, however much of the burst was spent before and however the bytes are
+    /// spread: chunk `i` is read the chunk's bytes' time after the later of its token and the
+    /// chunk before it, and the writer asks for it once that one is read. Only the place's hold
+    /// may come first, which the answer's cut to the window is for.
+    #[test]
+    fn a_steady_reader_has_every_column_chunk_by_its_deadline(
+        sizes in prop::collection::vec(1usize..120_000, 1..400),
+        spent in 0u64..700,
+        burst in 1u32..600,
+        period_us in 1_000u64..20_000,
+    ) {
+        use crate::rpc::limits::{shared_limiter, BookedChunks, ColumnDeadlines};
+        let quota = Quota::new(burst, Duration::from_micros(period_us));
+        let limiter = shared_limiter(RateLimits {
+            data_columns_by_range: quota,
+            ..RateLimits::default()
+        });
+        let peer = PeerId::random();
+        let p = Protocol::DataColumnsByRangeV1;
+        let start = tokio::time::Instant::now();
+        let _spent = limiter.lock().unwrap().charge_block(peer, p, spent, start);
+        let deadlines = ColumnDeadlines::default();
+        let booked = BookedChunks::book(&limiter, peer, p, sizes.len() as u64, None, deadlines);
+        let schedule = booked.write_schedule(sizes.iter().copied(), start, start);
+        let hold_until = start + deadlines.answer_window + deadlines.write;
+        let transfer = |size: usize| {
+            let nanos = deadlines.answer_window.as_nanos() * size as u128
+                / deadlines.answer_bytes as u128;
+            Duration::from_nanos(nanos as u64)
+        };
+        let mut read = start;
+        for (i, size) in (0u64..).zip(&sizes) {
+            let due = booked.due(i);
+            let asked = read;
+            read = due.max(asked) + transfer(*size);
+            if read > hold_until {
+                break;
+            }
+            let by = schedule.written_by(i, due, asked);
+            prop_assert!(read <= by, "chunk {i} read {:?} after its deadline", read - by);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // On local swarms
 

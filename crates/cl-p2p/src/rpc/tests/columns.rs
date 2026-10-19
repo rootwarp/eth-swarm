@@ -605,6 +605,44 @@ async fn a_reset_does_not_refund_the_booked_quota() {
     assert!(took >= Duration::from_millis(700), "refunded: {took:?}");
 }
 
+/// BUG-002: an answer whose stream closed during its lookup is dropped, its booked tokens
+/// unsettled: a peer that leaves and comes back gets none of them back, even those its answer
+/// would not have used.
+#[tokio::test]
+async fn a_close_during_the_lookup_refunds_no_unused_token() {
+    // One sidecar per 200 ms, no burst: two blocks book eight sidecars, 1.6 s, and the store
+    // holds one block, so a settled answer would give four of them, 0.8 s, back.
+    let gate = Arc::new(Semaphore::new(0));
+    let source = Scripted::gated(ColumnReply::Sidecars(block_columns(9..10)), gate.clone());
+    let mut cfg = with_columns(source.clone());
+    cfg.limits.rate.data_columns_by_range = Quota::new(1, Duration::from_millis(200));
+    let mut ours = Node::spawn(cfg).await;
+    let key = libp2p::identity::Keypair::generate_secp256k1();
+    let mut raw = RawPeer::with_key(key.clone(), 1);
+    raw.connect(ours.addr.clone()).await;
+    let start = Instant::now();
+    raw.send(ours.peer, by_range(9, 2, &CUSTODY));
+    tokio::time::timeout(WAIT, async {
+        while source.asked() == 0 {
+            raw.run_for(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the lookup started");
+    // The peer leaves during the lookup; the lookup then ends with its one block.
+    let peer = raw.id();
+    drop(raw);
+    ours.closed(peer).await;
+    gate.add_permits(100);
+    // Back at once, as the same peer: its one sidecar waits for all eight booked.
+    let mut raw = RawPeer::with_key(key, 1);
+    raw.connect(ours.addr.clone()).await;
+    let id = raw.send(ours.peer, by_range(9, 1, &[47]));
+    assert_eq!(sidecars(raw.outcome(id).await.unwrap()).len(), 1);
+    let took = start.elapsed();
+    assert!(took >= Duration::from_millis(1_300), "refunded: {took:?}");
+}
+
 /// SEC-001: peers that request and reset at once cannot keep an honest peer from a place.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reset_flood_cannot_starve_an_honest_peer() {
