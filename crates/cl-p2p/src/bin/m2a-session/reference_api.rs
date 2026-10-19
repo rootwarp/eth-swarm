@@ -802,9 +802,8 @@ mod tests {
 
     #[tokio::test]
     async fn failures_are_typed() {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = closed.local_addr().unwrap();
-        drop(closed);
+        // A refused connection.
+        let addr = cl_p2p::testkit::refused_tcp_addr(std::net::Ipv4Addr::LOCALHOST.into());
         let c = ReferenceApi::new(&url(&format!("http://{addr}")), REQUEST_TIMEOUT);
         assert!(matches!(
             c.genesis().await.unwrap_err(),

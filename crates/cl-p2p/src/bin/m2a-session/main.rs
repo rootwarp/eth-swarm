@@ -522,14 +522,15 @@ mod tests {
             .into_iter()
     }
 
-    /// A loopback address nothing listens on: bound once, then released.
+    /// A loopback address that refuses every dial ([`cl_p2p::testkit::refused_tcp_addr`]).
     fn closed_port_peer() -> String {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", libp2p::PeerId::random())
+        let addr = cl_p2p::testkit::refused_tcp_addr(std::net::Ipv4Addr::LOCALHOST.into());
+        format!(
+            "/ip4/{}/tcp/{}/p2p/{}",
+            addr.ip(),
+            addr.port(),
+            libp2p::PeerId::random()
+        )
     }
 
     /// A config dir pinning `peer` and the reference API at `api`, plus `extra` config lines.

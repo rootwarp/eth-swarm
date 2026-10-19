@@ -696,9 +696,8 @@ mod tests {
 
     #[tokio::test]
     async fn connection_refused_is_a_transport_error() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let addr =
+            crate::checkpoint::refused::refused_tcp_addr(std::net::Ipv4Addr::LOCALHOST.into());
         let err = client()
             .get_json::<Small>(&provider(addr, Scheme::Http), "/j")
             .await

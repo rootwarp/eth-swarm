@@ -63,7 +63,7 @@ async fn ignore_all_reports_every_message() {
     const N: usize = 25;
     let probe = tests::Probe::spawn(N).await;
     let neighbour = tests::Neighbour::spawn().await;
-    neighbour.dial(probe.center.addr.clone());
+    neighbour.dial(probe.center.addr.clone()).await;
     neighbour.wait_for_mesh_with(probe.center.peer).await;
 
     let mut sent = HashSet::new();

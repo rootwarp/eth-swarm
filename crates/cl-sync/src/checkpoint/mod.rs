@@ -21,6 +21,8 @@ pub mod outdir;
 pub mod runlog;
 
 #[cfg(test)]
+mod refused;
+#[cfg(test)]
 mod testkit;
 
 mod api;

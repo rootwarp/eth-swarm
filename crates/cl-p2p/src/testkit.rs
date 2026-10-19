@@ -475,3 +475,56 @@ impl StatusPeer {
         self.connections.load(Ordering::SeqCst)
     }
 }
+
+/// The TCP port of [`refused_tcp_addr`]: tcpmux, which nothing serves.
+pub const REFUSED_PORT: u16 = 1;
+
+/// A TCP address on loopback `ip` that refuses every connection, for a test whose dial must be
+/// refused.
+///
+/// A port bound and then released can be taken by another socket before the test dials it,
+/// which then connects instead of being refused. [`REFUSED_PORT`] lies below every ephemeral
+/// port range, so the system never hands it to a socket that binds port 0; it is dialed once
+/// here, and the test fails at once if anything accepts there.
+pub fn refused_tcp_addr(ip: std::net::IpAddr) -> std::net::SocketAddr {
+    refused(std::net::SocketAddr::new(ip, REFUSED_PORT)).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// `addr` if a dial to it is refused; why not otherwise.
+fn refused(addr: std::net::SocketAddr) -> Result<std::net::SocketAddr, String> {
+    match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => Ok(addr),
+        Err(e) => Err(format!(
+            "a dial to {addr} must be refused, it failed with: {e}"
+        )),
+        Ok(_) => Err(format!("a dial to {addr} must be refused, it connected")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+
+    #[test]
+    fn the_refused_address_refuses_a_dial() {
+        for ip in [
+            IpAddr::from(Ipv4Addr::LOCALHOST),
+            Ipv6Addr::LOCALHOST.into(),
+        ] {
+            let addr = refused_tcp_addr(ip);
+            assert_eq!(addr, SocketAddr::new(ip, REFUSED_PORT));
+            let err = TcpStream::connect(addr).expect_err("nothing accepts there");
+            assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused, "{err}");
+        }
+    }
+
+    /// An address that accepts is never handed out as a refused one.
+    #[test]
+    fn an_address_that_accepts_is_not_refused() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let err = refused(addr).expect_err("the listener accepts");
+        assert!(err.contains(&addr.to_string()), "{err}");
+    }
+}

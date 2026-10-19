@@ -1300,12 +1300,9 @@ fn check_header_state_root_mismatch_exit_code() {
 fn check_unreachable_provider_exit_code() {
     let a0 = anchor0();
     let net = CheckNet::start(Node::honest(&a0, 5), Node::honest(&a0, 5));
-    // A port nothing listens on: bound, then released.
-    let closed = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // A port that refuses every connection on beta.test (::1).
+    let closed =
+        crate::checkpoint::refused::refused_tcp_addr(std::net::Ipv6Addr::LOCALHOST.into()).port();
     let urls = format!(
         "http://127.0.0.1:{},http://beta.test:{closed}",
         net.net.a.addr.port()

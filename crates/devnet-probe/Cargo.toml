@@ -13,8 +13,9 @@ path = "src/main.rs"
 
 [features]
 # The stand-in reference CLs and the fixture beacon API (`fixtures`), for this crate's tests
-# (the binary's included); built on testkit's fixture server and fixture devnet.
-test-support = ["testkit/test-support"]
+# (the binary's included); built on testkit's fixture server and fixture devnet, and on cl-p2p's
+# fixtures for the address that refuses every dial.
+test-support = ["testkit/test-support", "cl-p2p/testkit"]
 
 [dependencies]
 # The probe swarm, its req/resp and range requester (cl-p2p), our discv5 (cl-discv5) and probe

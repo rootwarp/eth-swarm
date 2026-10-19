@@ -257,16 +257,15 @@ impl StandIn {
     }
 }
 
-/// A peer at a loopback address nothing listens on: bound once, then released.
+/// A peer at a loopback address that refuses every dial
+/// ([`cl_p2p::testkit::refused_tcp_addr`]).
 pub fn closed_port_peer() -> PinnedPeer {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let addr = cl_p2p::testkit::refused_tcp_addr(std::net::Ipv4Addr::LOCALHOST.into());
     PinnedPeer {
         peer_id: PeerId::random(),
-        addr: format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap(),
+        addr: format!("/ip4/{}/tcp/{}", addr.ip(), addr.port())
+            .parse()
+            .unwrap(),
     }
 }
 
@@ -414,7 +413,8 @@ pub fn port_taken(detail: &str) -> bool {
 }
 
 /// `run` on a port from `ports`, then on the next one while its error reports the port taken
-/// ([`port_taken`]), for at most [`PORT_ATTEMPTS`] ports. Any other error ends it at once.
+/// ([`port_taken`]), for at most [`PORT_ATTEMPTS`] ports. Any other error ends it at once; a
+/// run that gives up names the ports it tried and keeps the last error.
 pub async fn on_ports<T, E, Fut>(
     mut ports: impl FnMut() -> u16,
     mut run: impl FnMut(u16) -> Fut,
@@ -424,16 +424,24 @@ where
     Fut: std::future::Future<Output = Result<T, E>>,
 {
     let mut taken = Vec::with_capacity(PORT_ATTEMPTS);
+    let mut last = String::new();
     for _ in 0..PORT_ATTEMPTS {
         let port = ports();
         match run(port).await {
             Ok(done) => return Ok(done),
-            Err(e) if port_taken(&e.to_string()) => taken.push(port),
-            Err(e) => return Err(format!("port {port}: {e}")),
+            Err(e) => {
+                let e = e.to_string();
+                if !port_taken(&e) {
+                    return Err(format!("port {port}: {e}"));
+                }
+                taken.push(port);
+                last = e;
+            }
         }
     }
     Err(format!(
-        "every one of {PORT_ATTEMPTS} ports was taken before it was bound: {taken:?}"
+        "every one of {PORT_ATTEMPTS} ports was taken before it was bound: {taken:?}; \
+         the last attempt failed with: {last}"
     ))
 }
 
@@ -504,9 +512,11 @@ mod tests {
         let (node, _events) = on_ports(ports, |port| discv5_node_on(port, &fork))
             .await
             .unwrap();
-        assert_eq!(tried.len(), 2, "{tried:?}");
-        assert_eq!(tried[0], taken);
-        assert_eq!(node.local_enr().udp4(), Some(tried[1]));
+        // The ports after the held one come from free_udp_port, which another process can
+        // race too: the node runs on whichever was tried last.
+        assert_eq!(tried[0], taken, "{tried:?}");
+        assert!(tried.len() >= 2, "{tried:?}");
+        assert_eq!(node.local_enr().udp4(), tried.last().copied());
         drop(holder);
     }
 
@@ -528,6 +538,8 @@ mod tests {
         assert_eq!(tried, PORT_ATTEMPTS);
         assert!(err.contains(&format!("{PORT_ATTEMPTS} ")), "{err}");
         assert!(err.contains(&taken.to_string()), "{err}");
+        // The last error is kept, not just the ports.
+        assert!(err.contains("kind: AddrInUse"), "{err}");
         drop(holder);
     }
 

@@ -1181,6 +1181,107 @@ mod tests {
         assert!(out.contains("setup: FAIL api 0: identity"), "{out}");
     }
 
+    /// What an `all` run against the fixture reference CL reports, check by check.
+    const ALL_EXPECTED: [&str; 5] = [
+        "setup: PASS",
+        "discover: PASS",
+        "connect: PASS",
+        // A 1 s hold is no acceptance hold.
+        "status: DIAGNOSTIC",
+        // The stand-in stores no blocks: it answers 3: ResourceUnavailable.
+        "fetch-epoch: FAIL",
+    ];
+
+    /// The summary line of each check in `out`, in order.
+    fn summaries(out: &str) -> Vec<&str> {
+        out.lines()
+            .filter(|l| l.ends_with(')') && !l.starts_with("verdict"))
+            .filter(|l| {
+                [": PASS (", ": FAIL (", ": DIAGNOSTIC ("]
+                    .iter()
+                    .any(|w| l.contains(w))
+            })
+            .collect()
+    }
+
+    /// Whether an `all` run with `--discv5-listen listen` lost nothing but its port: our node
+    /// found `listen` itself taken, and every check other than discover reported what
+    /// [`ALL_EXPECTED`] says. Only such a run is run again; any other is a result.
+    fn only_the_port_was_taken(out: &str, listen: &str) -> bool {
+        let ours = format!("discover: FAIL discv5 on {listen}: ");
+        let taken = out
+            .lines()
+            .any(|l| l.starts_with(&ours) && fixtures::port_taken(l));
+        let summaries = summaries(out);
+        let rest_as_expected = summaries.len() == ALL_EXPECTED.len()
+            && summaries
+                .iter()
+                .zip(ALL_EXPECTED)
+                .all(|(line, want)| want.starts_with("discover:") || line.starts_with(want));
+        taken && rest_as_expected
+    }
+
+    /// An `all` run's output: `discover` is its discover lines, and every other check reports
+    /// `connect` for connect and what [`ALL_EXPECTED`] says for the rest.
+    fn all_output(discover: &[&str], connect: &str) -> String {
+        let (line, summary) = (
+            format!("connect: {connect} peer 0: yamux"),
+            format!("connect: {connect} (1/1)"),
+        );
+        let mut out = vec!["setup: PASS api 0: identity", "setup: PASS (1/1)"];
+        out.extend_from_slice(discover);
+        out.extend([
+            line.as_str(),
+            summary.as_str(),
+            "status: DIAGNOSTIC peer 0: held 1.0 s",
+            "status: DIAGNOSTIC (1/1; hold under the acceptance hold)",
+            "fetch-epoch: FAIL peer 0: 3: ResourceUnavailable",
+            "fetch-epoch: FAIL (0/1)",
+            "verdict: FAIL (3/5 checks; failed: discover, fetch-epoch)",
+        ]);
+        out.iter().map(|l| format!("{l}\n")).collect()
+    }
+
+    /// Our node's start on 127.0.0.1:9100 finding the port taken, as the discover check
+    /// reports it.
+    const TAKEN: &str = "discover: FAIL discv5 on 127.0.0.1:9100: discv5 did not start: \
+                         Io(Os { code: 48, kind: AddrInUse, message: \"Address already in use\" })";
+
+    #[test]
+    fn an_all_run_that_lost_only_its_port_is_run_again() {
+        let out = all_output(&[TAKEN, "discover: FAIL (0/1)"], "PASS");
+        assert!(only_the_port_was_taken(&out, "127.0.0.1:9100"), "{out}");
+    }
+
+    /// A taken port must not hide a real failure elsewhere in the same run.
+    #[test]
+    fn an_all_run_with_a_taken_port_and_another_failure_is_a_result() {
+        let out = all_output(&[TAKEN, "discover: FAIL (0/1)"], "FAIL");
+        assert!(!only_the_port_was_taken(&out, "127.0.0.1:9100"), "{out}");
+        // A check that never reported is no match either.
+        let short: String = out.lines().take(4).map(|l| format!("{l}\n")).collect();
+        assert!(
+            !only_the_port_was_taken(&short, "127.0.0.1:9100"),
+            "{short}"
+        );
+    }
+
+    /// The taken port must be this run's own listen address.
+    #[test]
+    fn an_all_run_whose_taken_port_is_not_its_own_is_a_result() {
+        let out = all_output(&[TAKEN, "discover: FAIL (0/1)"], "PASS");
+        assert!(!only_the_port_was_taken(&out, "127.0.0.1:9101"), "{out}");
+        assert!(!only_the_port_was_taken(&out, "127.0.0.1:910"), "{out}");
+        // A discover failure that is not a taken port is a result.
+        let other = "discover: FAIL discv5 on 127.0.0.1:9100: discv5 did not start: refused";
+        let out = all_output(&[other, "discover: FAIL (0/1)"], "PASS");
+        assert!(!only_the_port_was_taken(&out, "127.0.0.1:9100"), "{out}");
+        // AddrInUse from another check, with discover passing, is a result.
+        let elsewhere = "discover: PASS kind: AddrInUse";
+        let out = all_output(&[elsewhere, "discover: PASS (1/1)"], "PASS");
+        assert!(!only_the_port_was_taken(&out, "127.0.0.1:9100"), "{out}");
+    }
+
     #[test]
     fn all_runs_every_check_in_order() {
         let rt = runtime();
@@ -1221,7 +1322,9 @@ mod tests {
         let peer = peer_arg(&cl.pinned());
         let boot = record.to_base64();
         // `run` builds its own runtime, so the retry runs off any tokio runtime; our discv5
-        // node moves to a fresh port while it finds its port taken.
+        // node moves to a fresh port while it finds that very port taken and every other
+        // check reported what it should (`only_the_port_was_taken`). Any other run is the
+        // result, so a race on the port never hides a failure elsewhere in the same run.
         let all = |port: u16| {
             let listen = format!("127.0.0.1:{port}");
             let (code, out, _) = run_args(&[
@@ -1247,7 +1350,7 @@ mod tests {
                 "--fetch-secs",
                 "5",
             ]);
-            if fixtures::port_taken(&out) {
+            if only_the_port_was_taken(&out, &listen) {
                 Err(out)
             } else {
                 Ok((code, out))
@@ -1257,25 +1360,9 @@ mod tests {
             std::future::ready(all(port))
         }));
         assert_eq!(code, EXIT_FAILED, "{out}");
-        let summaries: Vec<&str> = out
-            .lines()
-            .filter(|l| l.ends_with(')') && !l.starts_with("verdict"))
-            .filter(|l| {
-                [": PASS (", ": FAIL (", ": DIAGNOSTIC ("]
-                    .iter()
-                    .any(|w| l.contains(w))
-            })
-            .collect();
-        assert_eq!(summaries.len(), 5, "{out}");
-        for (line, want) in summaries.iter().zip([
-            "setup: PASS",
-            "discover: PASS",
-            "connect: PASS",
-            // A 1 s hold is no acceptance hold.
-            "status: DIAGNOSTIC",
-            // The stand-in stores no blocks: it answers 3: ResourceUnavailable.
-            "fetch-epoch: FAIL",
-        ]) {
+        let summaries = summaries(&out);
+        assert_eq!(summaries.len(), ALL_EXPECTED.len(), "{out}");
+        for (line, want) in summaries.iter().zip(ALL_EXPECTED) {
             assert!(line.starts_with(want), "{want}: {out}");
         }
         assert!(

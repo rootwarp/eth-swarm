@@ -1040,7 +1040,8 @@ mod tests {
     }
 
     /// `start` on a port from `ports`, then on the next one while the start finds its port
-    /// taken, for at most [`START_ATTEMPTS`] ports. Any other error ends it at once.
+    /// taken, for at most [`START_ATTEMPTS`] ports. Any other error ends it at once; a start
+    /// that gives up names the ports it tried and keeps the last error.
     async fn start_on_ports<T, Fut>(
         mut ports: impl FnMut() -> u16,
         mut start: impl FnMut(u16) -> Fut,
@@ -1049,17 +1050,22 @@ mod tests {
         Fut: std::future::Future<Output = Result<T, ServiceError>>,
     {
         let mut taken = Vec::with_capacity(START_ATTEMPTS);
+        let mut last = None;
         for _ in 0..START_ATTEMPTS {
             let port = ports();
             match start(port).await {
                 Ok(started) => return Ok(started),
-                Err(e) if port_taken(&e) => taken.push(port),
+                Err(e) if port_taken(&e) => {
+                    taken.push(port);
+                    last = Some(e);
+                }
                 Err(e) => return Err(format!("the test node on port {port} did not start: {e}")),
             }
         }
+        let last = last.map_or_else(String::new, |e| e.to_string());
         Err(format!(
             "every one of {START_ATTEMPTS} ports was taken before the test node bound it: \
-             {taken:?}"
+             {taken:?}; the last start failed with: {last}"
         ))
     }
 
@@ -1149,9 +1155,11 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(tried.len(), 2, "{tried:?}");
-        assert_eq!(tried[0], taken);
-        assert_eq!(node.local_enr().udp4(), Some(tried[1]));
+        // The ports after the held one come from free_udp_port, which another process can
+        // race too: the node runs on whichever was tried last.
+        assert_eq!(tried[0], taken, "{tried:?}");
+        assert!(tried.len() >= 2, "{tried:?}");
+        assert_eq!(node.local_enr().udp4(), tried.last().copied());
         drop(holder);
     }
 
@@ -1176,6 +1184,8 @@ mod tests {
         assert_eq!(tried, START_ATTEMPTS);
         assert!(err.contains(&format!("{START_ATTEMPTS} ")), "{err}");
         assert!(err.contains(&taken.to_string()), "{err}");
+        // The last start error is kept, not just the ports.
+        assert!(err.contains("kind: AddrInUse"), "{err}");
         drop(holder);
     }
 

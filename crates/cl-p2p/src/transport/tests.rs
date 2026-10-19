@@ -3474,11 +3474,14 @@ async fn security_mismatch_fails() {
 async fn refused_dial_is_counted() {
     let (_registry, metrics, cfg) = probe_config();
     let mut ours = start_probe(&cfg, metrics.clone()).await;
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = closed.local_addr().unwrap().port();
-    drop(closed);
+    // Nothing accepts there, and the port is never handed out to a socket binding port 0.
+    let closed = crate::testkit::refused_tcp_addr(std::net::Ipv4Addr::LOCALHOST.into());
 
-    ours.dial(format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap());
+    ours.dial(
+        format!("/ip4/{}/tcp/{}", closed.ip(), closed.port())
+            .parse()
+            .unwrap(),
+    );
     ours.dial_failed().await;
     assert_eq!(metrics.dial_failures(DialFailure::Refused), 1);
 }

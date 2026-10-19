@@ -1,8 +1,12 @@
 //! The `anchor-fetch` binary: exit codes, stderr and output files. No network: every case
 //! here is refused before any request or fails to connect to 127.0.0.1.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::process::{Command, Output};
+
+#[path = "../src/checkpoint/refused.rs"]
+mod refused;
 
 fn anchor_fetch(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_anchor-fetch"))
@@ -216,15 +220,11 @@ fn check_refuses_one_provider_given_twice_and_writes_nothing() {
 #[test]
 fn check_against_an_unreachable_provider_exits_3_and_never_prints_a_url_path() {
     let dir = tempfile::tempdir().unwrap();
-    let closed = |_| {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    };
-    let (a, b) = (closed(0), closed(1));
-    // Two IP literals, so the providers resolve apart without DNS; nothing listens on either.
+    let (a, b) = (
+        refused::refused_tcp_addr(Ipv4Addr::LOCALHOST.into()).port(),
+        refused::refused_tcp_addr(Ipv6Addr::LOCALHOST.into()).port(),
+    );
+    // Two IP literals, so the providers resolve apart without DNS; both refuse the connection.
     let providers = format!("http://127.0.0.1:{a}/k3y-a,http://[::1]:{b}/k3y-b");
     let o = Command::new(env!("CARGO_BIN_EXE_anchor-fetch"))
         .current_dir(dir.path())

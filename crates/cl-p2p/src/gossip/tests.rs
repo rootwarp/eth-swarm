@@ -23,6 +23,7 @@ use libp2p::core::upgrade::{ReadyUpgrade, Version};
 use libp2p::core::Endpoint;
 use libp2p::gossipsub::{self, IdentTopic, MessageAuthenticity, MessageId};
 use libp2p::identity::Keypair;
+use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::handler::{ConnectionEvent, FullyNegotiatedInbound, FullyNegotiatedOutbound};
 use libp2p::swarm::{
     ConnectionDenied, ConnectionHandler, ConnectionHandlerEvent, ConnectionId, FromSwarm,
@@ -34,7 +35,7 @@ use p2p_wire::gossip::{GossipKind, GossipTopic, SnappyTransform, TopicCaps};
 use p2p_wire::rpc::codec::encode_varint;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::registry::Registry;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::io;
 use std::pin::Pin;
@@ -44,7 +45,7 @@ use std::time::Duration;
 
 /// Heartbeat of every node in these tests, so meshes form and caches shift quickly.
 const HEARTBEAT: Duration = Duration::from_millis(100);
-/// How long any one wait may take.
+/// How long any one wait may take, and any one connection's handshake.
 const WAIT: Duration = Duration::from_secs(20);
 /// The protocol the scripted peer speaks.
 const MESHSUB: StreamProtocol = StreamProtocol::new("/meshsub/1.1.0");
@@ -207,6 +208,8 @@ impl Probe {
         let mut cfg = SwarmConfig::new(MuxerBudget::with_defaults(&transport));
         cfg.listen_addrs = vec![loopback()];
         cfg.idle_connection_timeout = WAIT;
+        // A handshake on a loaded host can take longer than the production timeout.
+        cfg.connection_timeout = WAIT;
         let mut gossip_cfg = GossipConfig::new(vec![topic()], caps(), Duration::from_secs(60));
         gossip_cfg.heartbeat_interval = HEARTBEAT;
         gossip_cfg.heartbeat_initial_delay = HEARTBEAT;
@@ -533,6 +536,7 @@ fn gossip_swarm(
             .with_behaviour(|_| behaviour)
             .unwrap()
             .with_swarm_config(|c| c.with_idle_connection_timeout(WAIT))
+            .with_connection_timeout(WAIT)
             .build(),
         None => builder
             .with_tcp(
@@ -544,14 +548,24 @@ fn gossip_swarm(
             .with_behaviour(|_| behaviour)
             .unwrap()
             .with_swarm_config(|c| c.with_idle_connection_timeout(WAIT))
+            .with_connection_timeout(WAIT)
             .build(),
     }
 }
 
+/// How a dial ended: connected, or why not.
+type DialResult = Result<(), String>;
+
 enum Cmd {
-    Dial(Multiaddr),
+    Dial(Multiaddr, oneshot::Sender<DialResult>),
     Publish(Vec<u8>, oneshot::Sender<Result<MessageId, String>>),
-    Mesh(oneshot::Sender<Vec<PeerId>>),
+    Mesh(oneshot::Sender<MeshView>),
+}
+
+/// A neighbour's mesh for its topic, and every peer it is connected to.
+struct MeshView {
+    mesh: Vec<PeerId>,
+    connected: Vec<PeerId>,
 }
 
 /// A forwarding gossipsub neighbour on its own task, its transport tapped, on one topic.
@@ -584,10 +598,23 @@ impl Neighbour {
         let peer = *swarm.local_peer_id();
         let (cmds, mut rx) = mpsc::unbounded::<Cmd>();
         tokio::spawn(async move {
+            // Each dial in flight, answered when its connection is established or fails.
+            let mut dials: HashMap<ConnectionId, oneshot::Sender<DialResult>> = HashMap::new();
             loop {
                 tokio::select! {
                     cmd = rx.next() => match cmd {
-                        Some(Cmd::Dial(addr)) => swarm.dial(addr).unwrap(),
+                        Some(Cmd::Dial(addr, reply)) => {
+                            let opts = DialOpts::unknown_peer_id().address(addr).build();
+                            let id = opts.connection_id();
+                            match swarm.dial(opts) {
+                                Ok(()) => {
+                                    dials.insert(id, reply);
+                                }
+                                Err(e) => {
+                                    let _ = reply.send(Err(e.to_string()));
+                                }
+                            }
+                        }
                         Some(Cmd::Publish(ssz, reply)) => {
                             let result = swarm
                                 .behaviour_mut()
@@ -597,11 +624,26 @@ impl Neighbour {
                         }
                         Some(Cmd::Mesh(reply)) => {
                             let hash = topic.hash();
-                            let _ = reply.send(swarm.behaviour().mesh_peers(&hash).copied().collect());
+                            let _ = reply.send(MeshView {
+                                mesh: swarm.behaviour().mesh_peers(&hash).copied().collect(),
+                                connected: swarm.connected_peers().copied().collect(),
+                            });
                         }
                         None => return,
                     },
-                    _ = swarm.select_next_some() => {}
+                    event = swarm.select_next_some() => match event {
+                        SwarmEvent::ConnectionEstablished { connection_id, .. } => {
+                            if let Some(reply) = dials.remove(&connection_id) {
+                                let _ = reply.send(Ok(()));
+                            }
+                        }
+                        SwarmEvent::OutgoingConnectionError { connection_id, error, .. } => {
+                            if let Some(reply) = dials.remove(&connection_id) {
+                                let _ = reply.send(Err(error.to_string()));
+                            }
+                        }
+                        _ => {}
+                    },
                 }
             }
         });
@@ -619,8 +661,19 @@ impl Neighbour {
         Metrics::scrape(&self.registry)
     }
 
-    pub(super) fn dial(&self, addr: Multiaddr) {
-        self.cmds.unbounded_send(Cmd::Dial(addr)).unwrap();
+    /// Dials `addr` and returns once the connection is established. A dial that fails fails
+    /// the test with its error, so a missing connection is never reported as a missing mesh.
+    pub(super) async fn dial(&self, addr: Multiaddr) {
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .unbounded_send(Cmd::Dial(addr.clone(), tx))
+            .unwrap();
+        match tokio::time::timeout(WAIT, rx).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => panic!("{} could not dial {addr}: {e}", self.peer),
+            Ok(Err(_)) => panic!("{}'s task ended while it dialed {addr}", self.peer),
+            Err(_) => panic!("{} not connected to {addr} after {WAIT:?}", self.peer),
+        }
     }
 
     /// Publishes `ssz` and returns its id.
@@ -630,19 +683,26 @@ impl Neighbour {
         rx.await.unwrap().expect("publish")
     }
 
-    async fn mesh(&self) -> Vec<PeerId> {
+    async fn mesh(&self) -> MeshView {
         let (tx, rx) = oneshot::channel();
         self.cmds.unbounded_send(Cmd::Mesh(tx)).unwrap();
         rx.await.unwrap()
     }
 
-    /// Waits until `peer` is in this neighbour's mesh for the topic.
+    /// Waits until `peer` is in this neighbour's mesh for the topic, for at most [`WAIT`]; the
+    /// failure names the mesh it had and the peers it was connected to.
     pub(super) async fn wait_for_mesh_with(&self, peer: PeerId) {
         let deadline = tokio::time::Instant::now() + WAIT;
-        while !self.mesh().await.contains(&peer) {
+        loop {
+            let view = self.mesh().await;
+            if view.mesh.contains(&peer) {
+                return;
+            }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "no mesh with {peer}"
+                "no mesh with {peer} after {WAIT:?}: mesh {:?}, connected to {:?}",
+                view.mesh,
+                view.connected
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -805,6 +865,7 @@ impl Scripted {
             .with_behaviour(|_| Raw::default())
             .unwrap()
             .with_swarm_config(|c| c.with_idle_connection_timeout(WAIT))
+            .with_connection_timeout(WAIT)
             .build();
         swarm.dial(center.clone()).unwrap();
         let peer = *swarm.local_peer_id();
@@ -1131,9 +1192,9 @@ pub(super) async fn run_scenarios(center: &Center, heartbeats: impl Fn() -> u64)
         neighbours.push(Neighbour::spawn().await);
     }
     for (i, n) in neighbours.iter().enumerate() {
-        n.dial(center.addr.clone());
+        n.dial(center.addr.clone()).await;
         for other in &neighbours[i + 1..] {
-            n.dial(other.addr.clone());
+            n.dial(other.addr.clone()).await;
         }
     }
     let mut scripted = Scripted::connect(&center.addr).await;
@@ -1533,6 +1594,21 @@ async fn ihave_gets_no_iwant() {
     );
 }
 
+/// A neighbour's dial that fails ends the test with the dial's own error, before any mesh wait.
+#[tokio::test]
+#[should_panic(expected = "could not dial /ip4/127.0.0.1/tcp/1")]
+async fn a_neighbour_dial_that_fails_names_the_address() {
+    let refused = crate::testkit::refused_tcp_addr(std::net::Ipv4Addr::LOCALHOST.into());
+    let neighbour = Neighbour::spawn().await;
+    neighbour
+        .dial(
+            format!("/ip4/{}/tcp/{}", refused.ip(), refused.port())
+                .parse()
+                .unwrap(),
+        )
+        .await;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Storing custody columns.
 
@@ -1700,9 +1776,9 @@ mod custody_columns {
             neighbours.push(Neighbour::spawn_on(subnet).await);
         }
         for (i, n) in neighbours.iter().enumerate() {
-            n.dial(center.addr.clone());
+            n.dial(center.addr.clone()).await;
             for other in &neighbours[i + 1..] {
-                n.dial(other.addr.clone());
+                n.dial(other.addr.clone()).await;
             }
         }
         let mut scripted = Scripted::connect(&center.addr).await;
