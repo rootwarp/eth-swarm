@@ -1188,7 +1188,7 @@ mod tests {
         "connect: PASS",
         // A 1 s hold is no acceptance hold.
         "status: DIAGNOSTIC",
-        // The stand-in stores no blocks: it answers 3: ResourceUnavailable.
+        // The stand-in stores no blocks: it answers 3: ResourceUnavailable ([`UNAVAILABLE`]).
         "fetch-epoch: FAIL",
     ];
 
@@ -1204,26 +1204,61 @@ mod tests {
             .collect()
     }
 
+    /// The FAIL detail lines of check `name` in `out`: every FAIL line but its summary.
+    fn fail_details<'a>(out: &'a str, name: &str) -> Vec<&'a str> {
+        let (fail, summary) = (format!("{name}: FAIL "), format!("{name}: FAIL ("));
+        out.lines()
+            .filter(|l| l.starts_with(&fail) && !l.starts_with(&summary))
+            .collect()
+    }
+
+    /// Whether `line` is a fetch-epoch failure in which every request was refused with
+    /// `3: ResourceUnavailable`, as the fixture reference CL (which stores no blocks) refuses.
+    fn every_fetch_unavailable(line: &str) -> bool {
+        let mut parts = line.split("; ");
+        let _epoch = parts.next();
+        let failures: Vec<&str> = parts.collect();
+        !failures.is_empty()
+            && failures
+                .iter()
+                .all(|f| f.contains(": error response ResourceUnavailable: "))
+    }
+
     /// Whether an `all` run with `--discv5-listen listen` lost nothing but its port: our node
-    /// found `listen` itself taken, and every check other than discover reported what
+    /// found `listen` itself taken and that is discover's only failure (an `--api` identity
+    /// failure recorded on the same check is a result), fetch-epoch failed only with the
+    /// fixture's `3: ResourceUnavailable`, and every check other than discover reported what
     /// [`ALL_EXPECTED`] says. Only such a run is run again; any other is a result.
     fn only_the_port_was_taken(out: &str, listen: &str) -> bool {
         let ours = format!("discover: FAIL discv5 on {listen}: ");
-        let taken = out
-            .lines()
-            .any(|l| l.starts_with(&ours) && fixtures::port_taken(l));
+        let only_taken = matches!(
+            fail_details(out, discover::NAME).as_slice(),
+            [line] if line.starts_with(&ours) && fixtures::port_taken(line)
+        );
+        let fetch_unavailable = matches!(
+            fail_details(out, fetch::NAME).as_slice(),
+            [line] if every_fetch_unavailable(line)
+        );
         let summaries = summaries(out);
         let rest_as_expected = summaries.len() == ALL_EXPECTED.len()
             && summaries
                 .iter()
                 .zip(ALL_EXPECTED)
                 .all(|(line, want)| want.starts_with("discover:") || line.starts_with(want));
-        taken && rest_as_expected
+        only_taken && fetch_unavailable && rest_as_expected
     }
 
+    /// The fixture reference CL's answer to fetch-epoch, as the check reports it: it stores no
+    /// blocks, so every request for them gets `3: ResourceUnavailable`.
+    const UNAVAILABLE: &str = "fetch-epoch: FAIL epoch 3 (slots 24..=31): no peer left to ask for \
+                               the blocks from slot 24 (2 failed requests); 16Uiu2HAmPeer: error \
+                               response ResourceUnavailable: no blocks stored; 16Uiu2HAmPeer: \
+                               error response ResourceUnavailable: no blocks stored";
+
     /// An `all` run's output: `discover` is its discover lines, and every other check reports
-    /// `connect` for connect and what [`ALL_EXPECTED`] says for the rest.
-    fn all_output(discover: &[&str], connect: &str) -> String {
+    /// `connect` for connect, `fetch` as fetch-epoch's failure and what [`ALL_EXPECTED`] says
+    /// for the rest.
+    fn all_output(discover: &[&str], connect: &str, fetch: &str) -> String {
         let (line, summary) = (
             format!("connect: {connect} peer 0: yamux"),
             format!("connect: {connect} (1/1)"),
@@ -1235,8 +1270,9 @@ mod tests {
             summary.as_str(),
             "status: DIAGNOSTIC peer 0: held 1.0 s",
             "status: DIAGNOSTIC (1/1; hold under the acceptance hold)",
-            "fetch-epoch: FAIL peer 0: 3: ResourceUnavailable",
-            "fetch-epoch: FAIL (0/1)",
+            "fetch-epoch: PASS peer 0: Status-valid",
+            fetch,
+            "fetch-epoch: FAIL (1/2)",
             "verdict: FAIL (3/5 checks; failed: discover, fetch-epoch)",
         ]);
         out.iter().map(|l| format!("{l}\n")).collect()
@@ -1249,14 +1285,14 @@ mod tests {
 
     #[test]
     fn an_all_run_that_lost_only_its_port_is_run_again() {
-        let out = all_output(&[TAKEN, "discover: FAIL (0/1)"], "PASS");
+        let out = all_output(&[TAKEN, "discover: FAIL (0/1)"], "PASS", UNAVAILABLE);
         assert!(only_the_port_was_taken(&out, "127.0.0.1:9100"), "{out}");
     }
 
     /// A taken port must not hide a real failure elsewhere in the same run.
     #[test]
     fn an_all_run_with_a_taken_port_and_another_failure_is_a_result() {
-        let out = all_output(&[TAKEN, "discover: FAIL (0/1)"], "FAIL");
+        let out = all_output(&[TAKEN, "discover: FAIL (0/1)"], "FAIL", UNAVAILABLE);
         assert!(!only_the_port_was_taken(&out, "127.0.0.1:9100"), "{out}");
         // A check that never reported is no match either.
         let short: String = out.lines().take(4).map(|l| format!("{l}\n")).collect();
@@ -1269,16 +1305,57 @@ mod tests {
     /// The taken port must be this run's own listen address.
     #[test]
     fn an_all_run_whose_taken_port_is_not_its_own_is_a_result() {
-        let out = all_output(&[TAKEN, "discover: FAIL (0/1)"], "PASS");
+        let out = all_output(&[TAKEN, "discover: FAIL (0/1)"], "PASS", UNAVAILABLE);
         assert!(!only_the_port_was_taken(&out, "127.0.0.1:9101"), "{out}");
         assert!(!only_the_port_was_taken(&out, "127.0.0.1:910"), "{out}");
         // A discover failure that is not a taken port is a result.
         let other = "discover: FAIL discv5 on 127.0.0.1:9100: discv5 did not start: refused";
-        let out = all_output(&[other, "discover: FAIL (0/1)"], "PASS");
+        let out = all_output(&[other, "discover: FAIL (0/1)"], "PASS", UNAVAILABLE);
         assert!(!only_the_port_was_taken(&out, "127.0.0.1:9100"), "{out}");
         // AddrInUse from another check, with discover passing, is a result.
         let elsewhere = "discover: PASS kind: AddrInUse";
-        let out = all_output(&[elsewhere, "discover: PASS (1/1)"], "PASS");
+        let out = all_output(&[elsewhere, "discover: PASS (1/1)"], "PASS", UNAVAILABLE);
+        assert!(!only_the_port_was_taken(&out, "127.0.0.1:9100"), "{out}");
+    }
+
+    /// A taken port must not hide an identity failure of the same discover check: an attempt
+    /// whose discover also failed an `--api` identity is a result, never run again.
+    #[test]
+    fn an_all_run_with_a_taken_port_and_an_identity_failure_is_a_result() {
+        let identity = "discover: FAIL api 0: identity: timed out";
+        let out = all_output(
+            &[TAKEN, identity, "discover: FAIL (0/2)"],
+            "PASS",
+            UNAVAILABLE,
+        );
+        assert!(!only_the_port_was_taken(&out, "127.0.0.1:9100"), "{out}");
+        let out = all_output(
+            &[identity, TAKEN, "discover: FAIL (0/2)"],
+            "PASS",
+            UNAVAILABLE,
+        );
+        assert!(!only_the_port_was_taken(&out, "127.0.0.1:9100"), "{out}");
+    }
+
+    /// fetch-epoch fails against the fixture only with `3: ResourceUnavailable` (it stores no
+    /// blocks): any other fetch failure in an attempt with a taken port is a result.
+    #[test]
+    fn an_all_run_with_a_taken_port_and_another_fetch_failure_is_a_result() {
+        let discover = [TAKEN, "discover: FAIL (0/1)"];
+        let timed_out = "fetch-epoch: FAIL epoch 3 (slots 24..=31): not fetched within 5s";
+        let mixed = "fetch-epoch: FAIL epoch 3 (slots 24..=31): no peer left to ask for the \
+                     blocks from slot 24 (2 failed requests); 16Uiu2HAmPeer: error response \
+                     ResourceUnavailable: no blocks stored; 16Uiu2HAmPeer: request failed: timeout";
+        let server_error = "fetch-epoch: FAIL epoch 3 (slots 24..=31): no peer left to ask for \
+                            the blocks from slot 24 (1 failed requests); 16Uiu2HAmPeer: error \
+                            response ServerError: busy";
+        for fetch in [timed_out, mixed, server_error] {
+            let out = all_output(&discover, "PASS", fetch);
+            assert!(!only_the_port_was_taken(&out, "127.0.0.1:9100"), "{out}");
+        }
+        // A second fetch failure beside the expected one is a result too.
+        let twice = format!("{UNAVAILABLE}\nfetch-epoch: FAIL unconfirmed: slots 24..32");
+        let out = all_output(&discover, "PASS", &twice);
         assert!(!only_the_port_was_taken(&out, "127.0.0.1:9100"), "{out}");
     }
 
