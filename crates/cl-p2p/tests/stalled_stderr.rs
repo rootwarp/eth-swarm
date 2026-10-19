@@ -19,6 +19,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use svc_runtime::lifecycle::LOG_FLUSH_DEADLINE;
+use svc_runtime::telemetry::EXIT_NO_LOG_WRITER;
 use tokio::time::Instant;
 
 /// What an exit may take past its own deadlines: process start-up and teardown on a loaded
@@ -28,6 +29,9 @@ const SLACK: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(20);
 /// The most a pipe is written while filling it: far past any pipe's capacity.
 const FILL_CAP: usize = 16 << 20;
+/// A minimum thread stack (1 PiB, `RUST_MIN_STACK`) that no address space holds: in a child
+/// given it, every thread spawn fails, the log writer's included.
+const NO_THREAD_STACK: &str = "1125899906842624";
 /// The session's dial deadline (`--connect-timeout-secs`).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// The node key the session's key file holds.
@@ -63,26 +67,36 @@ fn full_pipe() -> (PipeReader, PipeWriter) {
     (reader, writer)
 }
 
-/// A child whose stderr is a [`full_pipe`] the test holds and never reads. Killed and reaped on
-/// every way out of the test: a pass, a failed assertion, a deadline.
+/// A child whose stderr is a [`full_pipe`] the test holds and never reads, or a file. Killed
+/// and reaped on every way out of the test: a pass, a failed assertion, a deadline.
 struct Stalled {
     child: Child,
-    _stderr: PipeReader,
+    _stderr: Option<PipeReader>,
 }
 
 impl Stalled {
     /// Spawns `command` with stdin and stdout closed and stderr full.
-    fn spawn(mut command: Command) -> Self {
+    fn spawn(command: Command) -> Self {
         let (reader, writer) = full_pipe();
+        Self::spawn_with_stderr(command, writer.into(), Some(reader))
+    }
+
+    /// Spawns `command` with stdin and stdout closed and stderr written to `file`.
+    fn spawn_to_file(command: Command, file: &Path) -> Self {
+        let file = std::fs::File::create(file).unwrap();
+        Self::spawn_with_stderr(command, file.into(), None)
+    }
+
+    fn spawn_with_stderr(mut command: Command, stderr: Stdio, held: Option<PipeReader>) -> Self {
         let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(writer)
+            .stderr(stderr)
             .spawn()
             .unwrap();
         Self {
             child,
-            _stderr: reader,
+            _stderr: held,
         }
     }
 
@@ -152,6 +166,30 @@ async fn cl_p2p_loads_its_identity_and_exits_with_a_full_stderr() {
     let mut child = Stalled::spawn(cl_p2p(Some(dir.path())));
     let code = child.exit_code_by(flush_deadline(), "cl-p2p").await;
     assert_eq!(code, Some(2), "loaded, not runnable yet");
+}
+
+/// `command` exits [`EXIT_NO_LOG_WRITER`] at once, with stderr full and with stderr a file it
+/// writes nothing to, when no thread can start (`what` names it).
+async fn exits_silently_without_a_log_writer(command: impl Fn() -> Command, what: &str) {
+    let no_writer = || {
+        let mut command = command();
+        command.env("RUST_MIN_STACK", NO_THREAD_STACK);
+        command
+    };
+    let mut child = Stalled::spawn(no_writer());
+    let code = child.exit_code_by(flush_deadline(), what).await;
+    assert_eq!(code, Some(i32::from(EXIT_NO_LOG_WRITER)), "{what}");
+    let dir = tempfile::tempdir().unwrap();
+    let stderr = dir.path().join("stderr");
+    let mut child = Stalled::spawn_to_file(no_writer(), &stderr);
+    let code = child.exit_code_by(flush_deadline(), what).await;
+    assert_eq!(code, Some(i32::from(EXIT_NO_LOG_WRITER)), "{what}");
+    assert_eq!(std::fs::read_to_string(&stderr).unwrap(), "", "{what}");
+}
+
+#[tokio::test]
+async fn cl_p2p_exits_at_once_writing_nothing_when_its_log_writer_cannot_start() {
+    exits_silently_without_a_log_writer(|| cl_p2p(None), "cl-p2p").await;
 }
 
 // m2a-session: a dial of the pinned peer, and refusals.
@@ -254,4 +292,11 @@ async fn m2a_session_refusals_exit_with_a_full_stderr() {
         let code = child.exit_code_by(flush_deadline(), "m2a-session").await;
         assert_eq!(code, Some(2), "{args:?}: refused");
     }
+}
+
+#[tokio::test]
+async fn m2a_session_exits_at_once_writing_nothing_when_its_log_writer_cannot_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.toml");
+    exits_silently_without_a_log_writer(|| m2a_session(&missing, &[]), "m2a-session").await;
 }

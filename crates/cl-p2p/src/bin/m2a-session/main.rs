@@ -31,7 +31,8 @@
 //!
 //! Logs are svc-runtime's JSON lines on stderr, at INFO, through its bounded writer: a stderr
 //! nobody reads drops lines instead of blocking the session, and every exit waits for the queue
-//! at most [`LOG_FLUSH_DEADLINE`].
+//! at most [`LOG_FLUSH_DEADLINE`]. If that writer cannot start, it exits at once with
+//! [`EXIT_NO_LOG_WRITER`](svc_runtime::telemetry::EXIT_NO_LOG_WRITER) (71), writing nothing.
 
 mod blocks;
 mod enr;
@@ -61,9 +62,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use svc_runtime::lifecycle::LOG_FLUSH_DEADLINE;
-use svc_runtime::telemetry::{flush_logs, init_tracing_with, LogQueueBounds};
+use svc_runtime::telemetry::{flush_logs, init_binary_tracing};
 use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::layer::Identity;
 
 const USAGE: &str = "usage: m2a-session [--config <path>] [--dial-only | --print-peer-id] \
                      [--connect-timeout-secs <n>] [--gate-file <path>]";
@@ -189,13 +189,9 @@ fn key_handling(key: &KeySource, euid: u32) -> Verdict {
 }
 
 fn main() -> ExitCode {
-    // `false` only if the writer thread could not start; the session then runs without logs,
-    // as svc-runtime's own `run` does.
-    init_tracing_with(
-        LevelFilter::INFO,
-        LogQueueBounds::default(),
-        Identity::new(),
-    );
+    if let Err(no_log_writer) = init_binary_tracing(LevelFilter::INFO) {
+        return no_log_writer;
+    }
     let euid = rustix::process::geteuid().as_raw();
     let env = RunEnv::production();
     let code = run(std::env::args().skip(1), euid, &mut std::io::stdout(), &env);

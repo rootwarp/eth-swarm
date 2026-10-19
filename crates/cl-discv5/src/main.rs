@@ -7,26 +7,22 @@
 //!
 //! Logs are svc-runtime's JSON lines on stderr, at INFO, through its bounded writer: a stderr
 //! nobody reads drops lines instead of blocking the binary, and every exit waits for the queue
-//! at most [`LOG_FLUSH_DEADLINE`].
+//! at most [`LOG_FLUSH_DEADLINE`]. If that writer cannot start, it exits at once with
+//! [`EXIT_NO_LOG_WRITER`](svc_runtime::telemetry::EXIT_NO_LOG_WRITER) (71), writing nothing.
 
 use std::process::ExitCode;
 use svc_runtime::lifecycle::LOG_FLUSH_DEADLINE;
-use svc_runtime::telemetry::{flush_logs, init_tracing_with, LogQueueBounds};
+use svc_runtime::telemetry::{flush_logs, init_binary_tracing};
 use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::layer::Identity;
 
 /// The probe unit this service runs as: a root-owned, ACL-granted credential is accepted only
 /// from `/run/credentials/<UNIT>`.
 const UNIT: &str = "ethswarm-discv5.service";
 
 fn main() -> ExitCode {
-    // `false` only if the writer thread could not start; the binary then runs without logs, as
-    // svc-runtime's own `run` does.
-    init_tracing_with(
-        LevelFilter::INFO,
-        LogQueueBounds::default(),
-        Identity::new(),
-    );
+    if let Err(no_log_writer) = init_binary_tracing(LevelFilter::INFO) {
+        return no_log_writer;
+    }
     let code = run();
     flush_logs(LOG_FLUSH_DEADLINE);
     ExitCode::from(code)

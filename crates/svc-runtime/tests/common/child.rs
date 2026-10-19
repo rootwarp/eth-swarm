@@ -230,3 +230,74 @@ impl Drop for Reaped {
         let _ = self.0.wait();
     }
 }
+
+/// A minimum thread stack (1 PiB, `RUST_MIN_STACK`) that no address space holds: in a child
+/// given it, every thread spawn fails with `EAGAIN`, the log writer's included.
+pub const NO_THREAD_STACK: &str = "1125899906842624";
+
+/// The most a pipe is written while filling it: far past any pipe's capacity.
+const FILL_CAP: usize = 16 << 20;
+
+/// Writes `chunk` to `writer` (non-blocking) until the pipe takes no more of it.
+fn fill_with(writer: &std::io::PipeWriter, chunk: &[u8], written: &mut usize) {
+    use std::io::Write as _;
+    loop {
+        assert!(
+            *written <= FILL_CAP,
+            "the pipe took {written} bytes, still not full"
+        );
+        match (&*writer).write(chunk) {
+            Ok(n) => *written += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => panic!("filling the pipe: {e}"),
+        }
+    }
+}
+
+/// A pipe with a full buffer and a blocking write end: the next write to it blocks until the
+/// read end is read. Large chunks first, then single bytes, so no room is left (a write of up
+/// to `PIPE_BUF` bytes waits for room for all of it).
+pub fn full_pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
+    use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+    let (reader, writer) = std::io::pipe().unwrap();
+    let blocking = fcntl_getfl(&writer).unwrap();
+    fcntl_setfl(&writer, blocking | OFlags::NONBLOCK).unwrap();
+    let mut written = 0;
+    fill_with(&writer, &[b'\n'; 64 << 10], &mut written);
+    fill_with(&writer, b"\n", &mut written);
+    fcntl_setfl(&writer, blocking).unwrap();
+    (reader, writer)
+}
+
+/// A child whose stderr is a [`full_pipe`] held here and never read, killed and reaped when
+/// dropped.
+pub struct Stalled {
+    child: Reaped,
+    _stderr: std::io::PipeReader,
+}
+
+impl Stalled {
+    /// Spawns `command` with stdin closed and stderr full.
+    pub fn spawn(mut command: Command) -> std::io::Result<Self> {
+        let (reader, writer) = full_pipe();
+        let child = command.stdin(Stdio::null()).stderr(writer).spawn()?;
+        Ok(Self {
+            child: Reaped(child),
+            _stderr: reader,
+        })
+    }
+
+    /// The exit status, or `None` if the child still runs at `deadline`. Polls `try_wait`.
+    pub async fn wait_until(&mut self, deadline: Instant) -> Option<ExitStatus> {
+        loop {
+            if let Some(status) = self.child.0.try_wait().expect("try_wait on the child") {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+}

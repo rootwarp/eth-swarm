@@ -34,7 +34,9 @@ futures = "0.3"
 prometheus-client = "0.25.1"
 tokio = { version = "1", features = ["rt", "macros", "time", "net", "sync"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+# The JSON logs on stderr through the bounded writer (`svc_runtime::telemetry`), as the service
+# binaries log; already in the tree through cl-p2p.
+svc-runtime = { path = "../svc-runtime" }
 serde = { version = "1", features = ["derive"] }
 hex = "0.4"
 sha2 = "0.10"
@@ -47,4 +49,6 @@ p2p-wire = { path = "../p2p-wire", features = ["testkit"] }
 testkit = { path = "../testkit", features = ["test-support"] }
 ethereum_ssz.workspace = true
 tempfile = "3"
+# The stalled-stderr test fills a pipe without blocking (`fcntl` O_NONBLOCK).
+rustix = { version = "1", features = ["fs"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }

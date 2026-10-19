@@ -39,7 +39,7 @@ use tower::ServiceBuilder;
 use crate::config::Config;
 use crate::notify::{Notifier, Systemd, STOPPING};
 use crate::services::Services;
-use crate::telemetry::{self, RuntimeMetrics, TraceLayer};
+use crate::telemetry::{self, RuntimeMetrics, TraceLayer, TracingInitError, EXIT_NO_LOG_WRITER};
 
 /// Why a service stopped other than cleanly.
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +64,9 @@ pub enum RuntimeError {
     UnservedMethods(Vec<String>),
     #[error("in-flight calls did not finish within the {0:?} drain deadline")]
     DrainTimeout(Duration),
+    /// The stderr log writer could not start ([`telemetry::TracingInitError::WriterUnavailable`]).
+    #[error("the stderr log writer could not start: {0}")]
+    LogWriter(#[source] io::Error),
 }
 
 impl RuntimeError {
@@ -80,11 +83,13 @@ fn io_err(what: &'static str) -> impl FnOnce(io::Error) -> RuntimeError {
     move |source| RuntimeError::Io { what, source }
 }
 
-/// The process exit status for `run`'s result: 0 after a clean drain, 1 otherwise.
+/// The process exit status for `run`'s result: 0 after a clean drain, [`EXIT_NO_LOG_WRITER`]
+/// if the log writer could not start, 1 otherwise.
 #[must_use]
 pub fn exit_code(result: &Result<(), RuntimeError>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        Err(RuntimeError::LogWriter(_)) => ExitCode::from(EXIT_NO_LOG_WRITER),
         Err(_) => ExitCode::FAILURE,
     }
 }
@@ -132,8 +137,19 @@ pub const LOG_FLUSH_DEADLINE: Duration = Duration::from_secs(2);
 /// Runs a service with JSON logs on stderr, systemd notification and SIGTERM/SIGINT handling.
 /// Before returning, it logs its error (if [`run_with`] did not already) and flushes the log
 /// queue for up to [`LOG_FLUSH_DEADLINE`], so the error reaches stderr before the exit.
+///
+/// A service does not run without its logs: if the stderr log writer cannot start, `run`
+/// returns [`RuntimeError::LogWriter`] at once, before binding anything and without writing
+/// to stderr, and [`exit_code`] makes it [`EXIT_NO_LOG_WRITER`]. An owner that would rather
+/// serve without logs calls [`telemetry::try_init_tracing`] first and carries on past
+/// [`TracingInitError::WriterUnavailable`]: that first call settles the process's logging, so
+/// `run` then goes on.
 pub async fn run(config: Config, services: Services) -> Result<(), RuntimeError> {
-    telemetry::init_tracing(config.log_level);
+    if let Err(TracingInitError::WriterUnavailable(e)) =
+        telemetry::try_init_tracing(config.log_level)
+    {
+        return Err(RuntimeError::LogWriter(e));
+    }
     let result = match Hooks::systemd() {
         Ok(hooks) => run_with(config, services, hooks).await,
         Err(e) => Err(io_err("install signal handlers")(e)),
@@ -271,6 +287,12 @@ mod tests {
         assert_eq!(
             exit_code(&Err(RuntimeError::DrainTimeout(Duration::from_secs(1)))),
             ExitCode::FAILURE
+        );
+        assert_eq!(
+            exit_code(&Err(RuntimeError::LogWriter(
+                io::ErrorKind::WouldBlock.into()
+            ))),
+            ExitCode::from(EXIT_NO_LOG_WRITER)
         );
     }
 

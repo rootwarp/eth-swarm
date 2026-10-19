@@ -24,6 +24,13 @@
 //! A recorded deviation (a `connect` peer on mplex, which offers no yamux) is still a pass and
 //! exits 0, but the check's summary and the verdict name it:
 //! `verdict: PASS (2/2 checks; 1 recorded deviation: connect mplex)`.
+//!
+//! The report lines go to stdout. Logs are svc-runtime's JSON lines on stderr, at INFO,
+//! through its bounded writer, and a usage error's plain text goes through the same queue: a
+//! stderr nobody reads drops lines instead of blocking the probe, and every exit waits for the
+//! queue at most [`LOG_FLUSH_DEADLINE`]. If that writer cannot start, the probe exits at once
+//! with [`EXIT_NO_LOG_WRITER`](svc_runtime::telemetry::EXIT_NO_LOG_WRITER) (71), writing
+//! nothing.
 
 use cl_discv5::enr::{Enr, EnrFields};
 use cl_p2p::m2a_session::PinnedPeer;
@@ -44,7 +51,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use svc_runtime::lifecycle::LOG_FLUSH_DEADLINE;
+use svc_runtime::telemetry::{flush_logs, init_binary_tracing, queue_stderr};
 use testkit::collector::ReferenceApiUrl;
+use tracing::level_filters::LevelFilter;
 
 const USAGE: &str = "\
 usage: devnet-probe <discover|connect|status|fetch-epoch|all>
@@ -586,12 +596,19 @@ async fn api_nodes(args: &Args, check: &mut Check) -> Vec<(usize, PeerId)> {
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(std::io::stderr)
-        .init();
+    if let Err(no_log_writer) = init_binary_tracing(LevelFilter::INFO) {
+        return no_log_writer;
+    }
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    ExitCode::from(run(&argv, &mut std::io::stdout(), &mut std::io::stderr()))
+    // `run` writes its usage errors here just before it returns; they reach stderr unchanged,
+    // queued behind the logs, so a stderr nobody reads cannot block the exit either.
+    let mut err = Vec::new();
+    let code = run(&argv, &mut std::io::stdout(), &mut err);
+    if !err.is_empty() {
+        queue_stderr(&err);
+    }
+    flush_logs(LOG_FLUSH_DEADLINE);
+    ExitCode::from(code)
 }
 
 #[cfg(test)]

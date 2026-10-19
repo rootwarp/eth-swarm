@@ -40,8 +40,8 @@ cl-engine = { path = "../cl-engine" }
 ipc = { path = "../ipc", features = ["testkit"] }
 tokio = { version = "1", features = ["io-util", "test-util"] }
 tempfile = "3"
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["fs", "process"] }
 
 # Root-only tests switch one thread's credentials to play another user (Linux only).
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-rustix = { version = "1", features = ["process", "thread"] }
+rustix = { version = "1", features = ["fs", "process", "thread"] }

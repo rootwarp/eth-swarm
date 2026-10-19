@@ -3,6 +3,8 @@
 //! ```ignore
 //! let config = svc_runtime::Config::load("cl-engine", &svc_runtime::config::config_path("cl-engine"))?;
 //! let services = svc_runtime::Services::new().add_service(EngineServiceServer::new(engine));
+//! // A log writer that cannot start ends `run` at once, writing nothing:
+//! // `exit_code` is then `telemetry::EXIT_NO_LOG_WRITER`.
 //! let result = svc_runtime::run(config, services).await;
 //! // `run` has logged its error and flushed the log queue. Anything logged after it goes
 //! // through `tracing` too (never `eprintln!`: stderr may be stalled), then flush again:
