@@ -190,45 +190,40 @@ pub async fn discover(plan: &DiscoverPlan) -> Check {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{devnet, now_ms};
+    use crate::fixtures::{devnet, discv5_node as node, now_ms, on_free_udp_port, port_taken};
     use cl_discv5::enr::{build_local_enr, LocalAddr};
-    use cl_discv5::service::{Discovery, DiscoveryConfig, Events, NetworkMode};
     use std::net::Ipv4Addr;
 
-    /// A loopback UDP port nothing listens on right now.
-    fn free_udp_port() -> u16 {
-        std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
-    /// A stand-in CL's discv5 node on loopback with `fork`.
-    async fn node(fork: &ForkFields) -> (Discovery, Events) {
-        let key = CombinedKey::generate_secp256k1();
-        let port = free_udp_port();
-        let addr = LocalAddr {
-            ip: Ipv4Addr::LOCALHOST,
-            tcp_port: port,
-            udp_port: port,
-        };
-        let enr = build_local_enr(&key, fork, 4, &addr).unwrap();
-        let mut config = DiscoveryConfig::new(Ipv4Addr::LOCALHOST.into(), NetworkMode::Devnet);
-        config.udp_port = port;
-        let mut discovery = Discovery::new(enr, key, &config).unwrap();
-        let events = discovery.start().await.unwrap();
-        (discovery, events)
-    }
-
+    /// A plan on loopback; [`discover_on_free_port`] picks its port.
     fn plan(fork: ForkFields, bootnodes: Vec<Enr>, expected: Vec<Enr>) -> DiscoverPlan {
         DiscoverPlan {
             fork,
-            listen: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), free_udp_port()),
+            listen: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
             bootnodes,
             expected,
             deadline: Duration::from_secs(5),
         }
+    }
+
+    /// [`discover`] with our node on a fresh loopback port, run again on another one while
+    /// our node finds its port taken.
+    async fn discover_on_free_port(plan: &DiscoverPlan) -> Check {
+        on_free_udp_port(|port| {
+            let mut plan = plan.clone();
+            plan.listen.set_port(port);
+            async move {
+                let check = discover(&plan).await;
+                match check
+                    .lines()
+                    .iter()
+                    .find(|l| !l.pass && port_taken(&l.detail))
+                {
+                    Some(taken) => Err(taken.detail.clone()),
+                    None => Ok(check),
+                }
+            }
+        })
+        .await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -240,7 +235,7 @@ mod tests {
         boot.add_enr(c.local_enr()).unwrap();
         boot.add_enr(d.local_enr()).unwrap();
         let expected = vec![boot.local_enr(), c.local_enr(), d.local_enr()];
-        let check = discover(&plan(fork, vec![boot.local_enr()], expected)).await;
+        let check = discover_on_free_port(&plan(fork, vec![boot.local_enr()], expected)).await;
         assert!(check.passed(), "{check:#?}");
         let lines = check.lines();
         assert!(lines[0].detail.starts_with("bootnode"), "{lines:#?}");
@@ -274,7 +269,7 @@ mod tests {
             vec![off_fork.local_enr(), unknown.local_enr()],
         );
         plan.deadline = Duration::from_secs(2);
-        let check = discover(&plan).await;
+        let check = discover_on_free_port(&plan).await;
         assert!(!check.passed());
         let failed: Vec<&str> = check
             .lines()
@@ -293,7 +288,7 @@ mod tests {
         let fork = devnet().fork_fields(now_ms()).unwrap();
         let mut plan = plan(fork, Vec::new(), Vec::new());
         plan.deadline = Duration::MAX;
-        let check = discover(&plan).await;
+        let check = discover_on_free_port(&plan).await;
         assert!(!check.passed());
         assert!(check.lines()[0].detail.contains("deadline"), "{check:#?}");
     }
@@ -308,7 +303,7 @@ mod tests {
         let far = build_local_enr(&key, &fork, 4, &addr).unwrap();
         let mut plan = plan(fork, vec![far.clone()], vec![far]);
         plan.deadline = Duration::from_millis(300);
-        let check = discover(&plan).await;
+        let check = discover_on_free_port(&plan).await;
         assert!(!check.passed());
         assert!(
             check.lines()[0].detail.contains("routing table refused"),
@@ -324,7 +319,7 @@ mod tests {
         let no_udp = Enr::builder().ip4(Ipv4Addr::LOCALHOST).build(&key).unwrap();
         let mut plan = plan(fork, vec![no_udp.clone()], vec![no_udp]);
         plan.deadline = Duration::from_millis(300);
-        let check = discover(&plan).await;
+        let check = discover_on_free_port(&plan).await;
         assert!(!check.passed());
         assert!(
             check.lines()[0].detail.contains("routing table refused"),

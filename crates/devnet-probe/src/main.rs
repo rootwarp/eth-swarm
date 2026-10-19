@@ -1164,41 +1164,16 @@ mod tests {
         assert!(out.contains("setup: FAIL api 0: identity"), "{out}");
     }
 
-    /// A loopback UDP port nothing listens on right now.
-    fn free_udp_port() -> u16 {
-        std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
     #[test]
     fn all_runs_every_check_in_order() {
-        use cl_discv5::enr::{build_local_enr, CombinedKey, LocalAddr};
-        use cl_discv5::service::{Discovery, DiscoveryConfig, NetworkMode};
         let rt = runtime();
         let devnet = fixtures::devnet();
         // A reference CL: its discv5 node (found through itself as the bootnode), its probe
         // swarm (which re-Statuses us and holds the connection, but serves no blocks), and its
         // beacon API.
         let fork = devnet.fork_fields(fixtures::now_ms()).unwrap();
-        let port = free_udp_port();
-        let key = CombinedKey::generate_secp256k1();
-        let addr = LocalAddr {
-            ip: std::net::Ipv4Addr::LOCALHOST,
-            tcp_port: port,
-            udp_port: port,
-        };
-        let record = build_local_enr(&key, &fork, 4, &addr).unwrap();
-        let mut config =
-            DiscoveryConfig::new(std::net::Ipv4Addr::LOCALHOST.into(), NetworkMode::Devnet);
-        config.udp_port = port;
-        let (_node, _events) = rt.block_on(async {
-            let mut node = Discovery::new(record.clone(), key, &config).unwrap();
-            let events = node.start().await.unwrap();
-            (node, events)
-        });
+        let (node, _events) = rt.block_on(fixtures::discv5_node(&fork));
+        let record = node.local_enr();
         let finalized = consensus_types::primitives::Root::repeat_byte(0xf4);
         let ours = p2p_wire::rpc::messages::StatusV2 {
             fork_digest: devnet.fork_digest(fixtures::now_ms()).unwrap(),
@@ -1226,32 +1201,44 @@ mod tests {
         let server = rt.block_on(chain.serve());
         let api = format!("http://{}", server.addr);
         let dir = network_dir();
-        let listen = format!("127.0.0.1:{}", free_udp_port());
         let peer = peer_arg(&cl.pinned());
         let boot = record.to_base64();
-        let (code, out, _) = run_args(&[
-            "all",
-            "--network-dir",
-            dir.path().to_str().unwrap(),
-            "--api",
-            &api,
-            "--peer",
-            &peer,
-            "--bootnode",
-            &boot,
-            "--discv5-listen",
-            &listen,
-            "--discover-secs",
-            "5",
-            "--hold-secs",
-            "1",
-            "--ping-secs",
-            "1",
-            "--status-secs",
-            "5",
-            "--fetch-secs",
-            "5",
-        ]);
+        // `run` builds its own runtime, so the retry runs off any tokio runtime; our discv5
+        // node moves to a fresh port while it finds its port taken.
+        let all = |port: u16| {
+            let listen = format!("127.0.0.1:{port}");
+            let (code, out, _) = run_args(&[
+                "all",
+                "--network-dir",
+                dir.path().to_str().unwrap(),
+                "--api",
+                &api,
+                "--peer",
+                &peer,
+                "--bootnode",
+                &boot,
+                "--discv5-listen",
+                &listen,
+                "--discover-secs",
+                "5",
+                "--hold-secs",
+                "1",
+                "--ping-secs",
+                "1",
+                "--status-secs",
+                "5",
+                "--fetch-secs",
+                "5",
+            ]);
+            if fixtures::port_taken(&out) {
+                Err(out)
+            } else {
+                Ok((code, out))
+            }
+        };
+        let (code, out) = futures::executor::block_on(fixtures::on_free_udp_port(|port| {
+            std::future::ready(all(port))
+        }));
         assert_eq!(code, EXIT_FAILED, "{out}");
         let summaries: Vec<&str> = out
             .lines()

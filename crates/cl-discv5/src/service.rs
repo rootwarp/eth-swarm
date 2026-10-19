@@ -1021,13 +1021,67 @@ mod tests {
         ForkFields::from_schedule(&config, &gvr, epoch).unwrap()
     }
 
-    /// A loopback UDP port nothing listens on right now.
+    /// A loopback UDP port nothing listens on right now. Another process can take it before
+    /// the test binds it: start a node on it through [`start_on_free_port`].
     fn free_udp_port() -> u16 {
         std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .unwrap()
             .local_addr()
             .unwrap()
             .port()
+    }
+
+    /// How many ports a test node tries before the test fails.
+    const START_ATTEMPTS: usize = 10;
+
+    /// Whether `err` is a start whose UDP port another socket took first.
+    fn port_taken(err: &ServiceError) -> bool {
+        matches!(err, ServiceError::Start(io) if io.contains("kind: AddrInUse"))
+    }
+
+    /// `start` on a port from `ports`, then on the next one while the start finds its port
+    /// taken, for at most [`START_ATTEMPTS`] ports. Any other error ends it at once.
+    async fn start_on_ports<T, Fut>(
+        mut ports: impl FnMut() -> u16,
+        mut start: impl FnMut(u16) -> Fut,
+    ) -> Result<T, String>
+    where
+        Fut: std::future::Future<Output = Result<T, ServiceError>>,
+    {
+        let mut taken = Vec::with_capacity(START_ATTEMPTS);
+        for _ in 0..START_ATTEMPTS {
+            let port = ports();
+            match start(port).await {
+                Ok(started) => return Ok(started),
+                Err(e) if port_taken(&e) => taken.push(port),
+                Err(e) => return Err(format!("the test node on port {port} did not start: {e}")),
+            }
+        }
+        Err(format!(
+            "every one of {START_ATTEMPTS} ports was taken before the test node bound it: \
+             {taken:?}"
+        ))
+    }
+
+    /// `start` on a fresh loopback port, retried on a taken one ([`start_on_ports`]); the
+    /// test fails if it never starts.
+    async fn start_on_free_port<T, Fut>(start: impl FnMut(u16) -> Fut) -> T
+    where
+        Fut: std::future::Future<Output = Result<T, ServiceError>>,
+    {
+        start_on_ports(free_udp_port, start)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// A record on `fork` for loopback `port` (UDP and TCP), signed by `key`.
+    fn loopback_enr(key: &CombinedKey, fork: &ForkFields, port: u16) -> Enr {
+        let addr = LocalAddr {
+            ip: Ipv4Addr::LOCALHOST,
+            tcp_port: port,
+            udp_port: port,
+        };
+        build_local_enr(key, fork, 4, &addr).unwrap()
     }
 
     /// A started devnet node on loopback with the given fork fields.
@@ -1049,14 +1103,19 @@ mod tests {
         mode: NetworkMode,
         sweep_interval: Duration,
     ) -> (Discovery, Events) {
+        start_on_free_port(|port| started_on(port, fork, mode, sweep_interval)).await
+    }
+
+    /// A node on loopback `port` with the given fork fields, IP rules and sweep interval, and
+    /// its start.
+    async fn started_on(
+        port: u16,
+        fork: &ForkFields,
+        mode: NetworkMode,
+        sweep_interval: Duration,
+    ) -> Result<(Discovery, Events), ServiceError> {
         let key = CombinedKey::generate_secp256k1();
-        let port = free_udp_port();
-        let addr = LocalAddr {
-            ip: Ipv4Addr::LOCALHOST,
-            tcp_port: port,
-            udp_port: port,
-        };
-        let enr = build_local_enr(&key, fork, 4, &addr).unwrap();
+        let enr = loopback_enr(&key, fork, port);
         let config = DiscoveryConfig {
             listen_ip: Ipv4Addr::LOCALHOST.into(),
             udp_port: port,
@@ -1064,8 +1123,77 @@ mod tests {
             sweep_interval,
         };
         let mut discovery = Discovery::new(enr, key, &config).unwrap();
-        let events = discovery.start().await.unwrap();
-        (discovery, events)
+        let events = discovery.start().await?;
+        Ok((discovery, events))
+    }
+
+    /// A port another socket holds: the start on it fails with `AddrInUse` and the next port
+    /// is tried.
+    #[tokio::test]
+    async fn a_test_node_whose_port_was_taken_starts_on_the_next_one() {
+        let ours = sepolia_fields(274_175);
+        let holder = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let taken = holder.local_addr().unwrap().port();
+        let mut tried = Vec::new();
+        let ports = || {
+            let port = if tried.is_empty() {
+                taken
+            } else {
+                free_udp_port()
+            };
+            tried.push(port);
+            port
+        };
+        let (node, _events) = start_on_ports(ports, |port| {
+            started_on(port, &ours, NetworkMode::Devnet, NO_SWEEP)
+        })
+        .await
+        .unwrap();
+        assert_eq!(tried.len(), 2, "{tried:?}");
+        assert_eq!(tried[0], taken);
+        assert_eq!(node.local_enr().udp4(), Some(tried[1]));
+        drop(holder);
+    }
+
+    /// A port that stays taken: the helper gives up after [`START_ATTEMPTS`] ports and names
+    /// them.
+    #[tokio::test]
+    async fn a_test_node_gives_up_when_every_port_is_taken() {
+        let ours = sepolia_fields(274_175);
+        let holder = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let taken = holder.local_addr().unwrap().port();
+        let mut tried = 0;
+        let ports = || {
+            tried += 1;
+            taken
+        };
+        let err = start_on_ports(ports, |port| {
+            started_on(port, &ours, NetworkMode::Devnet, NO_SWEEP)
+        })
+        .await
+        .err()
+        .expect("a held port never starts");
+        assert_eq!(tried, START_ATTEMPTS);
+        assert!(err.contains(&format!("{START_ATTEMPTS} ")), "{err}");
+        assert!(err.contains(&taken.to_string()), "{err}");
+        drop(holder);
+    }
+
+    /// Any other start error ends the helper at once: only a taken port is retried.
+    #[tokio::test]
+    async fn a_test_node_start_error_that_is_not_a_taken_port_is_not_retried() {
+        let mut tried = 0;
+        let ports = || {
+            tried += 1;
+            free_udp_port()
+        };
+        let err = start_on_ports(ports, |_| async {
+            Err::<(), _>(ServiceError::Start("the service is already started".into()))
+        })
+        .await
+        .expect_err("the start failed");
+        assert_eq!(tried, 1);
+        assert!(err.contains("already started"), "{err}");
     }
 
     fn ids(enrs: &[Enr]) -> HashSet<NodeId> {
@@ -1178,15 +1306,9 @@ mod tests {
 
     /// A public-mode node on loopback, on `fork`, swept every `sweep_interval` once started;
     /// not started yet.
-    fn unstarted(fork: &ForkFields, sweep_interval: Duration) -> Discovery {
+    fn unstarted(port: u16, fork: &ForkFields, sweep_interval: Duration) -> Discovery {
         let key = CombinedKey::generate_secp256k1();
-        let port = free_udp_port();
-        let addr = LocalAddr {
-            ip: Ipv4Addr::LOCALHOST,
-            tcp_port: port,
-            udp_port: port,
-        };
-        let enr = build_local_enr(&key, fork, 4, &addr).unwrap();
+        let enr = loopback_enr(&key, fork, port);
         let config = DiscoveryConfig {
             udp_port: port,
             sweep_interval,
@@ -1202,15 +1324,22 @@ mod tests {
     async fn a_start_dropped_before_its_event_stream_still_sweeps() {
         let ours = sepolia_fields(274_175);
         let sweep = Duration::from_millis(100);
-        let mut node = unstarted(&ours, sweep);
-        {
-            // One poll on this single-threaded runtime: discv5 starts, and the event stream
-            // request waits for the service task, which cannot run during the poll.
-            let mut start = std::pin::pin!(node.start());
-            let polled =
-                std::future::poll_fn(|cx| std::task::Poll::Ready(start.as_mut().poll(cx))).await;
-            assert!(polled.is_pending(), "start finished in one poll");
-        }
+        // One poll on this single-threaded runtime: discv5 starts, and the event stream request
+        // waits for the service task, which cannot run during the poll. A taken port fails
+        // that poll and is retried.
+        let mut node = start_on_free_port(|port| async move {
+            let mut node = unstarted(port, &ours, sweep);
+            let polled = {
+                let mut start = std::pin::pin!(node.start());
+                std::future::poll_fn(|cx| std::task::Poll::Ready(start.as_mut().poll(cx))).await
+            };
+            match polled {
+                std::task::Poll::Pending => Ok(node),
+                std::task::Poll::Ready(Err(e)) => Err(e),
+                std::task::Poll::Ready(Ok(_)) => panic!("start finished in one poll"),
+            }
+        })
+        .await;
         let sweeper = node.sweep.clone().expect("the sweep started with discv5");
         assert!(!sweeper.is_finished());
 
@@ -1816,41 +1945,38 @@ mod tests {
         let (a, _a_events) = node(&ours).await;
         let (x, _x_events) = node(&other).await;
         // `b` runs on our fork (`fresh`); `a` holds an older off-fork copy of its record.
-        let b_key = CombinedKey::generate_secp256k1();
-        let port = free_udp_port();
-        let b_addr = LocalAddr {
-            ip: Ipv4Addr::LOCALHOST,
-            tcp_port: port,
-            udp_port: port,
-        };
-        let b_enr = build_local_enr(&b_key, &ours, 4, &b_addr).unwrap();
-        let mut stale = b_enr.clone();
-        stale
-            .insert(
-                ETH2_KEY,
-                &alloy_rlp::Bytes::from(other.eth2.to_bytes().to_vec()),
-                &b_key,
-            )
-            .unwrap();
-        // The stale copy must look older to `a`'s query than the one `x` hands out.
-        let fresh = {
-            let mut fresh = stale.clone();
-            fresh
-                .insert(
-                    ETH2_KEY,
-                    &alloy_rlp::Bytes::from(ours.eth2.to_bytes().to_vec()),
-                    &b_key,
-                )
-                .unwrap();
-            fresh
-        };
-        assert!(fresh.seq() > stale.seq());
-        let b_config = DiscoveryConfig {
-            udp_port: port,
-            ..DiscoveryConfig::new(Ipv4Addr::LOCALHOST.into(), NetworkMode::Devnet)
-        };
-        let mut b = Discovery::new(fresh.clone(), b_key, &b_config).unwrap();
-        let _b_events = b.start().await.unwrap();
+        let (b, _b_events, stale, fresh) = start_on_free_port(|port| {
+            let (ours, other) = (&ours, &other);
+            async move {
+                let b_key = CombinedKey::generate_secp256k1();
+                let mut stale = loopback_enr(&b_key, ours, port);
+                stale
+                    .insert(
+                        ETH2_KEY,
+                        &alloy_rlp::Bytes::from(other.eth2.to_bytes().to_vec()),
+                        &b_key,
+                    )
+                    .unwrap();
+                // The stale copy must look older to `a`'s query than the one `x` hands out.
+                let mut fresh = stale.clone();
+                fresh
+                    .insert(
+                        ETH2_KEY,
+                        &alloy_rlp::Bytes::from(ours.eth2.to_bytes().to_vec()),
+                        &b_key,
+                    )
+                    .unwrap();
+                assert!(fresh.seq() > stale.seq());
+                let b_config = DiscoveryConfig {
+                    udp_port: port,
+                    ..DiscoveryConfig::new(Ipv4Addr::LOCALHOST.into(), NetworkMode::Devnet)
+                };
+                let mut b = Discovery::new(fresh.clone(), b_key, &b_config).unwrap();
+                let b_events = b.start().await?;
+                Ok((b, b_events, stale, fresh))
+            }
+        })
+        .await;
 
         // A target `x` is strictly closer to than `b`, at a distance whose FINDNODE to `x`
         // covers log2(x, b): the lookup seeds `x` alone (max_peers = 1) and learns the fresh
@@ -2093,21 +2219,13 @@ mod tests {
     #[tokio::test]
     async fn service_errors() {
         let fields = sepolia_fields(300_000);
-        let key = CombinedKey::generate_secp256k1();
-        let port = free_udp_port();
-        let addr = LocalAddr {
-            ip: Ipv4Addr::LOCALHOST,
-            tcp_port: port,
-            udp_port: port,
-        };
-        let enr = build_local_enr(&key, &fields, 4, &addr).unwrap();
-        let config = DiscoveryConfig {
-            udp_port: port,
-            ..DiscoveryConfig::new(Ipv4Addr::LOCALHOST.into(), NetworkMode::Public)
-        };
-        assert_eq!(
-            DiscoveryConfig::new(Ipv4Addr::LOCALHOST.into(), NetworkMode::Public).udp_port,
-            9000
+        // Setup binds nothing: the default port is never bound here.
+        let config = DiscoveryConfig::new(Ipv4Addr::LOCALHOST.into(), NetworkMode::Public);
+        assert_eq!(config.udp_port, 9000);
+        let enr = record_with(
+            &CombinedKey::generate_secp256k1(),
+            &fields,
+            Ipv4Addr::LOCALHOST,
         );
 
         // A local record without eth2, and a key that did not sign the record.
@@ -2119,14 +2237,27 @@ mod tests {
         let err = Discovery::new(bare, bare_key, &config).err();
         assert_eq!(err, Some(ServiceError::LocalEnr(FieldError::NoEth2)));
         let stranger = CombinedKey::generate_secp256k1();
-        let err = Discovery::new(enr.clone(), stranger, &config).err();
+        let err = Discovery::new(enr, stranger, &config).err();
         assert!(matches!(err, Some(ServiceError::Setup(_))), "{err:?}");
 
-        let mut discovery = Discovery::new(enr, key, &config).unwrap();
-        // Not started: no lookup.
-        let err = discovery.find_peers(NodeId::random(), 1).await;
-        assert!(matches!(err, Err(ServiceError::Query(_))), "{err:?}");
-        let _events = discovery.start().await.unwrap();
+        let (mut discovery, _events) = start_on_free_port(|port| {
+            let fields = &fields;
+            async move {
+                let key = CombinedKey::generate_secp256k1();
+                let enr = loopback_enr(&key, fields, port);
+                let config = DiscoveryConfig {
+                    udp_port: port,
+                    ..config
+                };
+                let mut discovery = Discovery::new(enr, key, &config).unwrap();
+                // Not started: no lookup.
+                let err = discovery.find_peers(NodeId::random(), 1).await;
+                assert!(matches!(err, Err(ServiceError::Query(_))), "{err:?}");
+                let events = discovery.start().await?;
+                Ok((discovery, events))
+            }
+        })
+        .await;
         let err = discovery.start().await.err();
         assert!(matches!(err, Some(ServiceError::Start(_))), "{err:?}");
 

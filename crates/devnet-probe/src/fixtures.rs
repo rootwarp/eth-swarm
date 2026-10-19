@@ -389,3 +389,160 @@ impl<C, U: OutboundConnectionUpgrade<C>> OutboundConnectionUpgrade<C> for Named<
         self.inner.upgrade_outbound(socket, info)
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Loopback UDP ports for discv5 nodes: a port picked free can be taken by another process
+// before the node binds it, so a bind that finds it taken moves on to a fresh one.
+
+/// A loopback UDP port nothing listens on right now. Another process can take it before the
+/// test binds it: bind it through [`on_free_udp_port`].
+pub fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// How many ports a test tries before it fails.
+pub const PORT_ATTEMPTS: usize = 10;
+
+/// Whether `detail` reports a bind whose port another socket took first (the `Debug` of an
+/// `AddrInUse` I/O error, which discv5's start error carries).
+pub fn port_taken(detail: &str) -> bool {
+    detail.contains("kind: AddrInUse")
+}
+
+/// `run` on a port from `ports`, then on the next one while its error reports the port taken
+/// ([`port_taken`]), for at most [`PORT_ATTEMPTS`] ports. Any other error ends it at once.
+pub async fn on_ports<T, E, Fut>(
+    mut ports: impl FnMut() -> u16,
+    mut run: impl FnMut(u16) -> Fut,
+) -> Result<T, String>
+where
+    E: std::fmt::Display,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut taken = Vec::with_capacity(PORT_ATTEMPTS);
+    for _ in 0..PORT_ATTEMPTS {
+        let port = ports();
+        match run(port).await {
+            Ok(done) => return Ok(done),
+            Err(e) if port_taken(&e.to_string()) => taken.push(port),
+            Err(e) => return Err(format!("port {port}: {e}")),
+        }
+    }
+    Err(format!(
+        "every one of {PORT_ATTEMPTS} ports was taken before it was bound: {taken:?}"
+    ))
+}
+
+/// `run` on a fresh loopback port, retried on a taken one ([`on_ports`]); panics if it never
+/// succeeds.
+pub async fn on_free_udp_port<T, E, Fut>(run: impl FnMut(u16) -> Fut) -> T
+where
+    E: std::fmt::Display,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    on_ports(free_udp_port, run)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// A stand-in CL's discv5 node on a fresh loopback port, in devnet mode, with `fork`.
+pub async fn discv5_node(
+    fork: &p2p_wire::enr::ForkFields,
+) -> (cl_discv5::service::Discovery, cl_discv5::service::Events) {
+    on_free_udp_port(|port| discv5_node_on(port, fork)).await
+}
+
+/// A stand-in CL's discv5 node on loopback `port`, in devnet mode, with `fork`, and its start.
+pub async fn discv5_node_on(
+    port: u16,
+    fork: &p2p_wire::enr::ForkFields,
+) -> Result<
+    (cl_discv5::service::Discovery, cl_discv5::service::Events),
+    cl_discv5::service::ServiceError,
+> {
+    use cl_discv5::enr::{build_local_enr, CombinedKey, LocalAddr};
+    use cl_discv5::service::{Discovery, DiscoveryConfig, NetworkMode};
+    let key = CombinedKey::generate_secp256k1();
+    let addr = LocalAddr {
+        ip: std::net::Ipv4Addr::LOCALHOST,
+        tcp_port: port,
+        udp_port: port,
+    };
+    let enr = build_local_enr(&key, fork, 4, &addr).unwrap();
+    let mut config =
+        DiscoveryConfig::new(std::net::Ipv4Addr::LOCALHOST.into(), NetworkMode::Devnet);
+    config.udp_port = port;
+    let mut node = Discovery::new(enr, key, &config).unwrap();
+    let events = node.start().await?;
+    Ok((node, events))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A port another socket holds: `run` reports it taken and the next port is tried.
+    #[tokio::test]
+    async fn a_taken_port_moves_on_to_the_next_one() {
+        let fork = devnet().fork_fields(now_ms()).unwrap();
+        let holder = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let taken = holder.local_addr().unwrap().port();
+        let mut tried = Vec::new();
+        let ports = || {
+            let port = if tried.is_empty() {
+                taken
+            } else {
+                free_udp_port()
+            };
+            tried.push(port);
+            port
+        };
+        let (node, _events) = on_ports(ports, |port| discv5_node_on(port, &fork))
+            .await
+            .unwrap();
+        assert_eq!(tried.len(), 2, "{tried:?}");
+        assert_eq!(tried[0], taken);
+        assert_eq!(node.local_enr().udp4(), Some(tried[1]));
+        drop(holder);
+    }
+
+    /// A port that stays taken: it gives up after [`PORT_ATTEMPTS`] ports and names them.
+    #[tokio::test]
+    async fn every_port_taken_gives_up() {
+        let fork = devnet().fork_fields(now_ms()).unwrap();
+        let holder = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let taken = holder.local_addr().unwrap().port();
+        let mut tried = 0;
+        let ports = || {
+            tried += 1;
+            taken
+        };
+        let err = on_ports(ports, |port| discv5_node_on(port, &fork))
+            .await
+            .err()
+            .expect("a held port never starts");
+        assert_eq!(tried, PORT_ATTEMPTS);
+        assert!(err.contains(&format!("{PORT_ATTEMPTS} ")), "{err}");
+        assert!(err.contains(&taken.to_string()), "{err}");
+        drop(holder);
+    }
+
+    /// Any other error ends it at once: only a taken port is retried.
+    #[tokio::test]
+    async fn an_error_that_is_not_a_taken_port_is_not_retried() {
+        let mut tried = 0;
+        let ports = || {
+            tried += 1;
+            free_udp_port()
+        };
+        let err = on_ports(ports, |_| async { Err::<(), _>("refused") })
+            .await
+            .expect_err("the run failed");
+        assert_eq!(tried, 1);
+        assert!(err.contains("refused"), "{err}");
+    }
+}
