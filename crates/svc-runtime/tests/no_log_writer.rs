@@ -26,12 +26,18 @@ use tokio::time::Instant;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::Identity;
 
-/// What `no_log_writer_child` does: [`PANIC`], [`RUN`] or [`OWNER`].
+/// What `no_log_writer_child` does: [`PANIC`], [`SCOPE_ENDED`], [`IN_SCOPE`], [`RUN`] or
+/// [`OWNER`].
 const CHILD_MODE: &str = "SVC_RUNTIME_NO_LOG_WRITER_MODE";
 /// The config `run` loads in [`RUN`] mode.
 const CHILD_CONFIG: &str = "SVC_RUNTIME_NO_LOG_WRITER_CONFIG";
 /// Carry on without logs past the failed start, then panic with stderr full.
 const PANIC: &str = "panic";
+/// [`PANIC`], after a thread-local default subscriber's scope has ended: it was never the
+/// global default, so the dropping panic hook is still installed.
+const SCOPE_ENDED: &str = "scope-ended";
+/// [`PANIC`], with the init made inside a thread-local default subscriber's scope.
+const IN_SCOPE: &str = "in-scope";
 /// `svc_runtime::run`, which must stop on the failed start.
 const RUN: &str = "run";
 /// An embedding owner's own subscriber and panic hook are in place before the failed start.
@@ -53,6 +59,15 @@ fn no_log_writer_child() {
     };
     match mode.as_str() {
         PANIC => panic_child(),
+        SCOPE_ENDED => {
+            tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+                tracing::info!("logged in a scope that ends before the init");
+            });
+            panic_child();
+        }
+        IN_SCOPE => {
+            tracing::subscriber::with_default(tracing_subscriber::registry(), panic_child);
+        }
         RUN => run_child(),
         OWNER => owner_child(),
         other => panic!("unknown mode {other}"),
@@ -80,7 +95,9 @@ fn panic_child() {
         "{again:?}"
     );
     assert!(init_binary_tracing(LevelFilter::INFO).is_ok());
-    tracing::error!("no subscriber: goes nowhere");
+    // The process's global default is settled too: one that discards everything.
+    assert!(tracing::subscriber::set_global_default(tracing_subscriber::registry()).is_err());
+    tracing::error!("no global subscriber: goes nowhere, or to the scope's");
     // The default hook would write this to the full stderr and block here for good.
     let caught = std::panic::catch_unwind(|| panic!("after the log writer failed to start"));
     assert!(caught.is_err());
@@ -100,7 +117,7 @@ fn panic_child() {
 static OWNER_HOOK_RAN: AtomicBool = AtomicBool::new(false);
 
 fn owner_child() {
-    tracing::subscriber::set_global_default(tracing::subscriber::NoSubscriber::default()).unwrap();
+    tracing::subscriber::set_global_default(tracing_subscriber::registry()).unwrap();
     std::panic::set_hook(Box::new(|_| OWNER_HOOK_RAN.store(true, Ordering::SeqCst)));
     let init = try_init_tracing(LevelFilter::INFO);
     println!("init: {init:?}");
@@ -158,9 +175,14 @@ fn read(path: &Path) -> String {
 
 #[tokio::test]
 async fn a_panic_after_the_writer_failed_to_start_does_not_block_on_a_full_stderr() {
+    panic_survives(PANIC).await;
+}
+
+/// Runs [`panic_child`] in `mode` with stderr full: it must get through its panic.
+async fn panic_survives(mode: &str) {
     let tmp = tempfile::tempdir().unwrap();
     let stdout = tmp.path().join("stdout");
-    let mut stalled = Stalled::spawn(child(PANIC, &stdout)).unwrap();
+    let mut stalled = Stalled::spawn(child(mode, &stdout)).unwrap();
     let status = stalled
         .wait_until(Instant::now() + STEP)
         .await
@@ -171,6 +193,16 @@ async fn a_panic_after_the_writer_failed_to_start_does_not_block_on_a_full_stder
             )
         });
     assert_eq!(status.code(), Some(PANIC_SURVIVED), "{}", read(&stdout));
+}
+
+#[tokio::test]
+async fn a_scoped_subscriber_that_ended_is_not_an_owners_global_one() {
+    panic_survives(SCOPE_ENDED).await;
+}
+
+#[tokio::test]
+async fn a_scoped_subscriber_still_in_effect_is_not_an_owners_global_one() {
+    panic_survives(IN_SCOPE).await;
 }
 
 #[tokio::test]

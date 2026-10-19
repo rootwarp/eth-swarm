@@ -76,9 +76,11 @@ RestartSec=5min
 # No restart on a refusal that a restart cannot fix: 1 a refused credential, 2 the stub
 # (or a refused config), 64 a usage error. Exit codes of the main process only.
 # Not listed, so restarted: 71 EXIT_NO_LOG_WRITER (EX_OSERR), cl-discv5 could not start its
-# log-writer thread and exited at once, leaving stderr empty on purpose (no journal line).
-# A thread limit can lift; check the unit's thread/process limits (TasksMax=, ulimit -u)
-# and free memory (README "Anchor check").
+# log-writer thread and exited at once, leaving stderr empty on purpose:
+# no application stderr line, though systemd still logs the exit. A thread limit can lift;
+# check the unit's own limits (TasksMax=, LimitNPROC=; systemctl show) and free memory.
+# Past the start limit the unit stays failed, the cause gone or not: once it is fixed,
+# systemctl reset-failed the unit, then start it (README "Anchor check").
 RestartPreventExitStatus=1 2 64
 
 [Install]

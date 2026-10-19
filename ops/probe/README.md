@@ -105,9 +105,12 @@ Exit 71 (`EXIT_NO_LOG_WRITER`, `EX_OSERR`) is deliberately not in that list, so 
 restarted. cl-p2p and cl-discv5 exit 71 at once when their log-writer thread cannot start, and
 they write nothing to stderr on purpose (stderr may be the cause), so the journal shows only
 the exit status (`systemctl status`, `journalctl -u <unit>`). A thread limit can lift, so the
-restart may succeed. If it keeps failing, check the unit's thread and process limits
-(`systemctl show -p TasksMax,TasksCurrent <unit>`, `ulimit -u` for the service user) and
-the host's free memory.
+restart may succeed. If it keeps failing, check the limits systemd gives the unit, not those of
+a login shell (`LimitNPROC=` comes from the unit or the manager's `DefaultLimitNPROC=`):
+`systemctl show -p TasksMax,TasksCurrent,LimitNPROC,LimitNPROCSoft <unit>`, and the host's free
+memory. Once the start limit is used up (`StartLimitBurst=3` in `StartLimitIntervalSec=6h`) the
+unit stays failed even after the cause is gone; once it is fixed, recover the unit with
+`systemctl reset-failed <unit> && systemctl start <unit>`.
 
 ## Resource limits
 

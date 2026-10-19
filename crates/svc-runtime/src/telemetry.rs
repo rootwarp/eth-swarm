@@ -19,6 +19,7 @@
 //!   address. The runtime registers [`RuntimeMetrics`] under the `ethswarm_` prefix.
 
 use std::backtrace::{Backtrace, BacktraceStatus};
+use std::cell::Cell;
 use std::convert::Infallible;
 use std::fmt;
 use std::future::Future;
@@ -285,12 +286,19 @@ pub enum TracingInitError {
     /// another subscriber is the global default: what is in place stays.
     #[error("tracing is already initialized")]
     AlreadyInitialized,
-    /// The log-writer thread could not start. No subscriber is installed, so nothing is
-    /// logged, and the panic hook drops each panic's message (counted in
+    /// The log-writer thread could not start. The global default becomes a subscriber that
+    /// discards everything, so nothing is logged and no other subscriber can become the
+    /// global default later, and the panic hook drops each panic's message (counted in
     /// `ethswarm_log_lines_dropped_total`) instead of writing it to stderr. If another
-    /// subscriber is already the global default, its owner's panic hook stays instead.
+    /// subscriber is already the global default, it and its owner's panic hook stay instead.
+    /// A thread's scoped default (`with_default`) is not a global default.
     #[error("the stderr log writer could not start: {0}")]
     WriterUnavailable(#[source] io::Error),
+    /// Called on a thread already inside a call of its own (from an owner's `extra` layer,
+    /// which runs under it): the outer call settles the logging, and this one returns at once
+    /// instead of waiting for it for good.
+    #[error("tracing init called from inside itself")]
+    Reentrant,
 }
 
 /// [`init_tracing_with`] the default queue bounds and no other layer.
@@ -313,13 +321,14 @@ where
 
 /// [`try_init_tracing`] under the policy every ETH Swarm binary follows: a binary does not run
 /// without its logs. `Err` is the status `main` returns at once, [`EXIT_NO_LOG_WRITER`], when
-/// the writer thread could not start; it writes nothing to stderr. An earlier initialization
-/// is not an error. A binary that would rather run without logs calls [`try_init_tracing`]
-/// itself and carries on past [`TracingInitError::WriterUnavailable`] instead.
+/// the writer thread could not start; it writes nothing to stderr. An earlier initialization,
+/// or one this thread is inside (that call settles it), is not an error. A binary that would
+/// rather run without logs calls [`try_init_tracing`] itself and carries on past
+/// [`TracingInitError::WriterUnavailable`] instead.
 pub fn init_binary_tracing(level: LevelFilter) -> Result<(), ExitCode> {
     match try_init_tracing(level) {
         Err(TracingInitError::WriterUnavailable(_)) => Err(ExitCode::from(EXIT_NO_LOG_WRITER)),
-        Ok(()) | Err(TracingInitError::AlreadyInitialized) => Ok(()),
+        Ok(()) | Err(TracingInitError::AlreadyInitialized | TracingInitError::Reentrant) => Ok(()),
     }
 }
 
@@ -337,12 +346,16 @@ pub fn init_binary_tracing(level: LevelFilter) -> Result<(), ExitCode> {
 /// [`TracingInitError::AlreadyInitialized`]. Either way the default panic hook, which writes
 /// to stderr from the panicking thread, is replaced by one that never blocks on stderr: once
 /// the subscriber is installed, by the hook that queues a panic's line; if the writer cannot
-/// start, by one that drops it. If another subscriber is already the global default, the
-/// panic hook is left alone.
+/// start, by one that drops it, and a subscriber that discards everything becomes the global
+/// default. If another subscriber is already the global default, the panic hook is left
+/// alone; a thread's scoped default does not count.
 ///
 /// Calls are serialized, and the first holds the others off until it has installed its panic
 /// hook: a call that returns [`TracingInitError::AlreadyInitialized`] because an earlier one
-/// settled the logging returns only after that hook is in place.
+/// settled the logging returns only after that hook is in place. A call from inside one on
+/// the same thread (from `extra`) is [`TracingInitError::Reentrant`] at once. A call whose
+/// `extra` panicked settled nothing and leaves the writer thread it started to the next call,
+/// with the queue bounds it was started with: retries never start a second one.
 pub fn try_init_tracing_with<L>(
     level: LevelFilter,
     bounds: LogQueueBounds,
@@ -351,24 +364,32 @@ pub fn try_init_tracing_with<L>(
 where
     L: Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
 {
+    // Before the lock: an owner's `extra` calling back in would wait on it for good.
+    let Some(_inside) = InitInProgress::enter() else {
+        return Err(TracingInitError::Reentrant);
+    };
     // Held to the end, so a racing call that finds logging settled finds the panic hook in
-    // place too. A call that panicked under it (in an owner's `extra`) settled nothing, so
-    // the lock it poisoned guards nothing half done.
-    let _init = TRACING_INIT
+    // place too. A call that panicked under it (in an owner's `extra`) settled nothing, and
+    // left only its writer behind, so the lock it poisoned guards nothing half done.
+    let mut provisional = TRACING_INIT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if STDERR_LOG.get().is_some() {
         return Err(TracingInitError::AlreadyInitialized);
     }
-    let writer = match LogWriter::spawn(io::stderr(), bounds, STDERR_DROPPED.clone()) {
-        Ok(writer) => writer,
-        Err(e) => {
-            if !tracing::dispatcher::has_been_set() {
-                install_dropping_panic_hook();
+    let writer = match &*provisional {
+        Some(writer) => writer.clone(),
+        None => match LogWriter::spawn(io::stderr(), bounds, STDERR_DROPPED.clone()) {
+            // Kept before `extra` runs, for a retry if it panics.
+            Ok(writer) => provisional.insert(writer).clone(),
+            Err(e) => {
+                if claim_global_default() {
+                    install_dropping_panic_hook();
+                }
+                settle(None);
+                return Err(TracingInitError::WriterUnavailable(e));
             }
-            settle(None);
-            return Err(TracingInitError::WriterUnavailable(e));
-        }
+        },
     };
     let subscriber = tracing_subscriber::registry()
         .with(extra)
@@ -377,6 +398,7 @@ where
     if installed {
         install_panic_hook(writer.clone());
     }
+    *provisional = None;
     settle(Some(writer));
     if installed {
         Ok(())
@@ -385,8 +407,49 @@ where
     }
 }
 
-/// Held across all of [`try_init_tracing_with`], which sets [`STDERR_LOG`] last.
-static TRACING_INIT: Mutex<()> = Mutex::new(());
+/// Makes a subscriber that discards everything the global default, if no other is: `true` if
+/// it did. Only a global default counts, never a thread's scoped one (`with_default`,
+/// `set_default`), ended or still in effect on this or another thread: the scope's owner
+/// installs no panic hook for the whole process, and the scope may end at any time.
+/// `tracing::dispatcher::has_been_set` cannot tell them apart (a scoped default sets it for
+/// good), nor can the current thread's default (its own scope hides the global one); the
+/// atomic claim can, and no other subscriber can become the global default after it.
+fn claim_global_default() -> bool {
+    tracing::subscriber::set_global_default(tracing::subscriber::NoSubscriber::default()).is_ok()
+}
+
+/// Held across all of [`try_init_tracing_with`], which sets [`STDERR_LOG`] last. It holds the
+/// writer thread a call started until that call settles: one whose `extra` panicked leaves it
+/// to the next call.
+static TRACING_INIT: Mutex<Option<LogWriter>> = Mutex::new(None);
+
+thread_local! {
+    /// This thread is inside [`try_init_tracing_with`].
+    static IN_INIT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// This thread inside [`try_init_tracing_with`], until dropped, an unwind included.
+struct InitInProgress;
+
+impl InitInProgress {
+    /// `None` if this thread is inside already. A thread whose locals are gone (it is ending)
+    /// cannot tell, and enters.
+    fn enter() -> Option<Self> {
+        let inside = IN_INIT.try_with(|inside| inside.replace(true));
+        // Built only on entry: a guard dropped here would end the outer call's entry.
+        if inside.unwrap_or(false) {
+            None
+        } else {
+            Some(Self)
+        }
+    }
+}
+
+impl Drop for InitInProgress {
+    fn drop(&mut self) {
+        let _ = IN_INIT.try_with(|inside| inside.set(false));
+    }
+}
 
 /// Publishes the process's stderr log writer, or that it could not start. Only
 /// [`try_init_tracing_with`] calls it, under [`TRACING_INIT`] and after it found

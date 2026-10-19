@@ -16,7 +16,7 @@ static OWNER_HOOK_RAN: AtomicBool = AtomicBool::new(false);
 
 #[test]
 fn an_owners_subscriber_keeps_its_panic_hook_and_gets_the_writer() {
-    tracing::subscriber::set_global_default(tracing::subscriber::NoSubscriber::default()).unwrap();
+    tracing::subscriber::set_global_default(tracing_subscriber::registry()).unwrap();
     std::panic::set_hook(Box::new(|_| OWNER_HOOK_RAN.store(true, Ordering::SeqCst)));
 
     let init = try_init_tracing(LevelFilter::INFO);

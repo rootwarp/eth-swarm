@@ -293,11 +293,39 @@ for unit in ethswarm-p2p ethswarm-discv5; do
   else
     bad "$unit documents exit 71 in a comment"
   fi
+  # systemd still logs the exit; only the service's own stderr is empty. The limits that
+  # apply are the unit's (LimitNPROC=), not a login shell's, and a unit past its start limit
+  # stays failed until reset.
+  if grep -q '^# .*no application stderr line' "$probe/$unit.service" &&
+    ! grep -q 'no journal line' "$probe/$unit.service"; then
+    ok "$unit says exit 71 leaves no application stderr line, not no journal line"
+  else
+    bad "$unit says exit 71 leaves no application stderr line, not no journal line"
+  fi
+  if grep -q '^# .*LimitNPROC=' "$probe/$unit.service" && ! grep -q 'ulimit' "$probe/$unit.service" &&
+    grep -q '^# .*systemctl reset-failed' "$probe/$unit.service"; then
+    ok "$unit points at the unit's own limits and the reset after the start limit"
+  else
+    bad "$unit points at the unit's own limits and the reset after the start limit"
+  fi
 done
-if grep -qF -- '`EXIT_NO_LOG_WRITER`' "$probe/README.md" && grep -qF -- 'ulimit -u' "$probe/README.md"; then
-  ok "the README documents exit 71 and what to check"
+if grep -qF -- '`EXIT_NO_LOG_WRITER`' "$probe/README.md" &&
+  grep -qF -- 'systemctl show -p TasksMax,TasksCurrent,LimitNPROC,LimitNPROCSoft <unit>' "$probe/README.md"; then
+  ok "the README documents exit 71 and the unit's limits to check"
 else
-  bad "the README documents exit 71 and what to check"
+  bad "the README documents exit 71 and the unit's limits to check"
+fi
+# `ulimit -u` in a shell shows that shell's limit: systemd sets the unit's own.
+if grep -qF -- 'ulimit' "$probe/README.md"; then
+  bad "the README does not send the operator to a shell's ulimit"
+else
+  ok "the README does not send the operator to a shell's ulimit"
+fi
+# Past StartLimitBurst= the unit stays failed, the cause gone or not.
+if grep -qF -- 'systemctl reset-failed <unit> && systemctl start <unit>' "$probe/README.md"; then
+  ok "the README says how to recover a unit past its start limit"
+else
+  bad "the README says how to recover a unit past its start limit"
 fi
 # Exit codes only: a signal name (an OOM kill is SIGKILL) would turn that kill into a stop.
 for value in SIGKILL KILL SIGTERM; do
