@@ -211,7 +211,9 @@ fn a_range_follows_one_chain_of_whole_blocks() {
     ]
     .concat();
     assert_eq!(trace("parent-after-child"), pending);
-    // B's parent never came: B is settled as a gap, and nothing before it is served.
+    // B's parent never came: the writer thread settles B as a gap after H's write (the harness
+    // waits for that step and never takes it itself), earliest_available_slot rises to B's
+    // slot, and nothing before it is served, A's late columns included.
     let gap = [
         stored(8),
         vec![
@@ -226,7 +228,8 @@ fn a_range_follows_one_chain_of_whole_blocks() {
     ]
     .concat();
     assert_eq!(trace("gap-after-a-missing-block"), gap);
-    // B misses two columns: a range of all four ends before it, one of the two it has does not.
+    // B misses two columns: a range of all four ends before it (A alone, never A then D), one
+    // of the two it has does not.
     assert_eq!(
         trace("partial-block"),
         [

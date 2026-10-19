@@ -51,7 +51,14 @@
 //! - cl-verify was asked about exactly the sidecar's cells against its block's bid commitments,
 //!   at its index, if and only if the sidecar passed every check before KZG;
 //! - the store holds exactly the copies the contract accepted, the last one per
-//!   `(root, index)`.
+//!   `(root, index)`;
+//! - the store's chain links, first stored slot, contiguous-from slot and finalized watermark
+//!   are the harness's own model of them ([`Links`]): the link walk and the writer's link rules
+//!   written out on their own, from the accepted writes alone. A stored sidecar's write is in
+//!   once nothing is queued, but the writer thread's settle step after it runs later: the
+//!   harness waits for it (the store's links go from the write's to the settle step's, and to
+//!   nothing else) and never settles for the writer, so a writer that skips or botches its own
+//!   settle step fails here.
 //!
 //! Every response is a hello, then sidecar chunks with `seq` from 1, each envelope passing the
 //! link's type and digest checks and naming its sidecar's slot and root, then at most one error
@@ -59,27 +66,35 @@
 //!
 //! - **a sidecar the contract rejected never appears in a response**: every sidecar served was
 //!   accepted earlier, and is the copy stored last for its `(root, index)`;
+//! - `earliest_available_slot` is the harness's ([`Links::earliest`]: the first stored slot,
+//!   the slot after the finalized watermark, `cgc_set_slot` and the contiguous-from slot, all
+//!   from the model), the server reports exactly that, and every expectation below uses the
+//!   harness's value, never the server's;
 //! - a request is refused `1: InvalidRequest` exactly when cl-chain's bounds refuse it
 //!   (`range_request_bounds`, `root_request_bounds`), which agree with the spec rule and with
-//!   cl-p2p's admission check; any other refusal is `3: ResourceUnavailable`;
-//! - by range: nothing below `earliest_available_slot` or outside the range, only requested
-//!   custody columns, every block whole, in `(slot, index)` order, one chain (each block an
-//!   ancestor of the next); naming nothing is an empty success, and anything else with nothing
-//!   stored is `3`;
-//! - by root: exactly the requested pairs stored at or above `earliest_available_slot`, per
-//!   identifier in request order, each pair once.
+//!   cl-p2p's admission check;
+//! - by range, within bounds, the answer is exactly the one the serving rules give, computed by
+//!   the harness from its model ([`Model::expected_range`]): an empty success only for a
+//!   request naming nothing, one starting past the serve range, or a range with no stored block
+//!   and none waited for; `3: ResourceUnavailable` exactly where the rules refuse; else the
+//!   chain prefix of whole blocks, each the next blob-carrying block after the one before it
+//!   (never a block further down its chain). cl-chain cuts an answer short only at its budget,
+//!   and everything this harness can store fits one answer (checked), so no shorter answer is
+//!   allowed (cl-p2p's window and token cuts are not in this harness);
+//! - by root: exactly the requested pairs stored at or above the harness's
+//!   `earliest_available_slot`, per identifier in request order, each pair once.
 
 use crate::columns::request_verdicts;
 use crate::{column_network, column_schedule, column_topic, column_transform, E};
 use cl_chain::da::custody::{Advertise, Custody, EnrCgc, EnrError};
-use cl_chain::probe::ingest::PENDING_LINK_SLOTS;
+use cl_chain::probe::ingest::{MAX_LINK_WALK, PENDING_LINK_SLOTS};
 use cl_chain::probe::{
     ApiError, BlockApi, Checkpoint, ColumnContract, ColumnIngest, ColumnMetrics, Drop,
     GossipColumn, Header, IngestLimits, QueueMetrics, RefLimits, RefView, ReferenceApi, Root,
 };
 use cl_chain::reqresp::{ColumnServer, ColumnStore, ReqRespServer, ServeBudget, ServeClock};
 use cl_chain::verify::client::{KzgOutcome, KzgVerifier};
-use cl_chain_columns::{ColumnWriter, WriterOptions, MIN_MAX_SIZE};
+use cl_chain_columns::{BlockLink, ColumnWriter, WriterOptions, MIN_MAX_SIZE};
 use consensus_types::das::compute_subnet_for_data_column_sidecar;
 use consensus_types::primitives::U256;
 use consensus_types::{forked, gloas, EthSpec, ForkName};
@@ -100,7 +115,7 @@ use ssz::{Decode, Encode};
 use ssz_types::typenum::Unsigned;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tree_hash::TreeHash;
 
 /// A structured sidecar of a fixed block ([`GossipSpec`]).
@@ -166,6 +181,10 @@ pub const CHAIN: [(u64, Option<usize>, usize); 8] = [
 const CHAIN_OFFSET: u64 = 63;
 /// The serve range ends this far past the first Gloas slot.
 const SERVE_SPAN: u64 = 4096;
+/// How long the harness waits on the wall clock for the writer thread's settle step after a
+/// write: far past the few milliseconds it takes, and well under the gate's 10 s per-input
+/// timeout, so a writer that never settles fails with its own message, not as a timeout.
+const WRITER_WAIT: Duration = Duration::from_secs(2);
 
 /// One block the stub reference vouches for.
 #[derive(Debug, Clone)]
@@ -231,6 +250,30 @@ pub fn known_blocks() -> &'static [KnownBlock] {
 
 fn known(root: &Root) -> Option<&'static KnownBlock> {
     known_blocks().iter().find(|b| b.root == *root)
+}
+
+/// The place of `root` in [`CHAIN`].
+fn known_index(root: &Root) -> Option<usize> {
+    known_blocks().iter().position(|b| b.root == *root)
+}
+
+/// The nearest blob-carrying ancestor of `root` in [`CHAIN`], passing through blocks without
+/// blobs: the block a range answer may hold right before it.
+fn blob_parent(root: &Root) -> Option<Root> {
+    let blocks = known_blocks();
+    let mut at = blocks[known_index(root)?].parent;
+    while let Some(i) = at {
+        if !blocks[i].commitments.is_empty() {
+            return Some(blocks[i].root);
+        }
+        at = blocks[i].parent;
+    }
+    None
+}
+
+/// `data_column_serve_range` of the stub clock, as inclusive slots.
+fn serve_range() -> (u64, u64) {
+    (gloas_slot(), gloas_slot() + SERVE_SPAN)
 }
 
 /// The stub cl-verify's verdict on a batch whose first proof is `first_proof`: by its first
@@ -641,7 +684,7 @@ struct Clock;
 
 impl ServeClock for Clock {
     fn serve_range(&self) -> Option<(u64, u64)> {
-        Some((gloas_slot(), gloas_slot() + SERVE_SPAN))
+        Some(serve_range())
     }
 
     fn fork_digest(&self, slot: u64) -> Option<[u8; 4]> {
@@ -731,7 +774,7 @@ fn expected(column: &GossipColumn<E>) -> Expected {
     }
 }
 
-/// What the harness knows the store must hold.
+/// What the harness knows the store must hold, from the sidecars the contract accepted alone.
 #[derive(Default)]
 struct Model {
     /// The copy stored last per `(root, index)`.
@@ -740,6 +783,314 @@ struct Model {
     accepted: HashSet<Vec<u8>>,
     /// Every sidecar the contract rejected, as SSZ.
     rejected: HashSet<Vec<u8>>,
+    /// The store's links and slots after every write and its settle step.
+    links: Links,
+}
+
+/// The store's chain links and the slots `earliest_available_slot` comes from, as the harness
+/// models them ([`Model::links`]) or reads them from the store ([`observe`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Links {
+    /// Each stored block's link, by its place in [`CHAIN`].
+    by_block: BTreeMap<usize, BlockLink>,
+    /// The lowest slot a column was ever stored at.
+    first_stored: Option<u64>,
+    /// The highest slot a gap raised it to; `None` before the first gap.
+    contiguous_from: Option<u64>,
+    /// The finalized-slot watermark: nothing finalizes in this harness.
+    finalized: Option<u64>,
+}
+
+impl Links {
+    /// The link the column's task walks for block `b` (`cl_chain::probe::ingest`, step 6): its
+    /// nearest stored ancestor, through ancestors without blobs; a start at an ancestor before
+    /// `cgc_set_slot`; pending on a blob-carrying ancestor not stored; a gap if the reference
+    /// knows no parent, or past [`MAX_LINK_WALK`] blocks.
+    fn walk(&self, b: usize) -> BlockLink {
+        let blocks = known_blocks();
+        let mut parent = blocks[b].parent;
+        for _ in 0..=MAX_LINK_WALK {
+            let Some(p) = parent else {
+                return BlockLink::Gap;
+            };
+            let ancestor = &blocks[p];
+            if self.by_block.contains_key(&p) {
+                return BlockLink::Parent(ancestor.root);
+            }
+            if ancestor.slot < cgc_set_slot() {
+                return BlockLink::Start;
+            }
+            if !ancestor.commitments.is_empty() {
+                return BlockLink::Pending(ancestor.root, ancestor.slot);
+            }
+            parent = ancestor.parent;
+        }
+        BlockLink::Gap
+    }
+
+    /// A write of block `b`: the walked link replaces the stored one unless the stored one is
+    /// linked and the walk is not, or one is a gap and the other pending; a gap it stores raises
+    /// the contiguous-from slot; every block pending on `b` links to it.
+    fn write(&mut self, b: usize) {
+        let block = &known_blocks()[b];
+        let walked = self.walk(b);
+        let kept = matches!(
+            (self.by_block.get(&b), walked),
+            (
+                Some(BlockLink::Start | BlockLink::Parent(_)),
+                BlockLink::Gap | BlockLink::Pending(..)
+            ) | (Some(BlockLink::Gap), BlockLink::Pending(..))
+                | (Some(BlockLink::Pending(..)), BlockLink::Gap)
+        );
+        if !kept {
+            self.by_block.insert(b, walked);
+            if walked == BlockLink::Gap {
+                self.raise(block.slot);
+            }
+        }
+        for link in self.by_block.values_mut() {
+            if matches!(link, BlockLink::Pending(target, _) if *target == block.root) {
+                *link = BlockLink::Parent(block.root);
+            }
+        }
+        self.first_stored = Some(self.first_stored.map_or(block.slot, |s| s.min(block.slot)));
+    }
+
+    /// The writer's settle step after a write at `slot`: a block still pending at a slot more
+    /// than [`PENDING_LINK_SLOTS`] below it is a gap from then on (no finality covers its
+    /// ancestor here), raising the contiguous-from slot to its own.
+    fn settle(&mut self, slot: u64) {
+        let before = slot.saturating_sub(PENDING_LINK_SLOTS);
+        let blocks = known_blocks();
+        let mut gaps = Vec::new();
+        for (&b, link) in &mut self.by_block {
+            if matches!(link, BlockLink::Pending(..)) && blocks[b].slot < before {
+                *link = BlockLink::Gap;
+                gaps.push(blocks[b].slot);
+            }
+        }
+        for slot in gaps {
+            self.raise(slot);
+        }
+    }
+
+    fn raise(&mut self, slot: u64) {
+        self.contiguous_from = Some(self.contiguous_from.map_or(slot, |c| c.max(slot)));
+    }
+
+    /// `earliest_available_slot` (`cl_chain::reqresp`, `# What is served`): the highest of the
+    /// first stored slot, the slot after the finalized watermark, `cgc_set_slot` and the
+    /// contiguous-from slot; `None` while nothing is stored.
+    fn earliest(&self) -> Option<u64> {
+        let after_finalized = self.finalized.map_or(0, |f| f.saturating_add(1));
+        Some(
+            self.first_stored?
+                .max(after_finalized)
+                .max(cgc_set_slot())
+                .max(self.contiguous_from.unwrap_or(0)),
+        )
+    }
+
+    /// The chain a range answer follows among the stored blocks `read` (in `(slot, root)`
+    /// order): the longest chain of parent links within them, ties to the higher tip, and of
+    /// tips still tied, only the blocks every tied chain holds.
+    fn one_chain(&self, read: &[usize]) -> Vec<usize> {
+        let blocks = known_blocks();
+        let chain_to = |tip: usize| {
+            let mut chain = vec![tip];
+            while let Some(BlockLink::Parent(parent)) =
+                chain.last().and_then(|b| self.by_block.get(b))
+            {
+                match read.iter().find(|&&b| blocks[b].root == *parent) {
+                    Some(&p) => chain.push(p),
+                    None => break,
+                }
+            }
+            chain.reverse();
+            chain
+        };
+        let chains: Vec<Vec<usize>> = read.iter().map(|&b| chain_to(b)).collect();
+        let key = |chain: &[usize]| (chain.len(), chain.last().map(|&b| blocks[b].slot));
+        let Some(best) = chains.iter().map(|c| key(c)).max() else {
+            return Vec::new();
+        };
+        let tied: Vec<&Vec<usize>> = chains.iter().filter(|c| key(c) == best).collect();
+        tied[0]
+            .iter()
+            .copied()
+            .filter(|b| tied.iter().all(|c| c.contains(b)))
+            .collect()
+    }
+}
+
+/// The store's [`Links`], read in one transaction.
+fn observe(writer: &ColumnWriter) -> Links {
+    let snapshot = writer.reader().snapshot().expect("read the column env");
+    let by_block = known_blocks()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| {
+            let link = snapshot.link_of(&b.root).expect("read a block's link");
+            link.map(|link| (i, link))
+        })
+        .collect();
+    Links {
+        by_block,
+        first_stored: snapshot.first_stored_slot().expect("the first stored slot"),
+        contiguous_from: snapshot
+            .contiguous_from()
+            .expect("the contiguous-from slot"),
+        finalized: snapshot.finalized_slot().expect("the finalized watermark"),
+    }
+}
+
+impl Model {
+    /// The accepted copy `ssz` of block `b`'s column `index`, stored as one write of the writer
+    /// thread. Returns the links as of the write, before the writer's settle step; the model's
+    /// links are as of after it.
+    fn store(&mut self, b: usize, index: u64, ssz: Vec<u8>) -> Links {
+        let block = &known_blocks()[b];
+        self.accepted.insert(ssz.clone());
+        self.stored.insert((block.root, index), ssz);
+        self.links.write(b);
+        let written = self.links.clone();
+        self.links.settle(block.slot);
+        written
+    }
+
+    /// Whether block `b` holds every column of `wanted`.
+    fn whole(&self, b: usize, wanted: &BTreeSet<u64>) -> bool {
+        let root = known_blocks()[b].root;
+        wanted.iter().all(|&i| self.stored.contains_key(&(root, i)))
+    }
+
+    /// cl-chain cuts an answer short only at its budget ([`ServeBudget::default`]); everything
+    /// this harness stores fits in one answer, so it never cuts one.
+    fn assert_under_budget(&self) {
+        let budget = ServeBudget::default();
+        let bytes: usize = self.stored.values().map(Vec::len).sum();
+        assert!(
+            bytes <= budget.max_bytes && self.stored.len() <= budget.max_sidecars,
+            "the store holds more than one answer's budget: the harness has no model of the cut"
+        );
+    }
+
+    /// The by-range answer the serving rules give (`cl_chain::reqresp`, `# What is served`,
+    /// `# One chain` and `# Order and completeness`) to a request within bounds, from the model
+    /// alone.
+    fn expected_range(&self, start: u64, count: u64, columns: &[u64]) -> Answer {
+        self.assert_under_budget();
+        let unavailable = Answer::Refused(ErrorCode::ResourceUnavailable);
+        let nothing = Answer::Sidecars(Vec::new());
+        let wanted: BTreeSet<u64> = columns.iter().copied().collect();
+        if wanted.is_empty() || count == 0 {
+            return nothing;
+        }
+        let Some(earliest) = self.links.earliest() else {
+            return unavailable;
+        };
+        let (first, last) = serve_range();
+        if start > last {
+            // The future: no column exists there yet.
+            return nothing;
+        }
+        if start < earliest.max(first) || !wanted.iter().all(|i| CUSTODY.contains(i)) {
+            return unavailable;
+        }
+        let end = start.saturating_add(count).min(last.saturating_add(1));
+        let blocks = known_blocks();
+        // A blob-carrying block a stored block waits for: the read ends before it.
+        let missing = self
+            .links
+            .by_block
+            .values()
+            .filter_map(|link| match *link {
+                BlockLink::Pending(_, slot) => Some(slot),
+                _ => None,
+            })
+            .filter(|slot| (start..end).contains(slot))
+            .min();
+        let mut read: Vec<usize> = self
+            .links
+            .by_block
+            .keys()
+            .copied()
+            .filter(|&b| (start..missing.unwrap_or(end)).contains(&blocks[b].slot))
+            .collect();
+        read.sort_by_key(|&b| (blocks[b].slot, blocks[b].root));
+        let chain = self.links.one_chain(&read);
+        let (Some(&head), Some(&tip)) = (chain.first(), chain.last()) else {
+            return if read.is_empty() && missing.is_none() {
+                nothing
+            } else {
+                unavailable
+            };
+        };
+        // The chain's first block must be the first blob-carrying block of the range on it.
+        let starts_the_range = match self.links.by_block[&head] {
+            BlockLink::Start => true,
+            BlockLink::Parent(parent) => known(&parent).expect("a stored parent").slot < start,
+            BlockLink::Pending(_, slot) => slot < start,
+            BlockLink::Gap => blocks[head].slot <= start,
+        };
+        if !starts_the_range {
+            return unavailable;
+        }
+        // A block after the tip whose link was never followed may be on the chain: the answer
+        // ends before its slot.
+        let after_tip = read
+            .iter()
+            .position(|&b| b == tip)
+            .expect("the tip was read")
+            + 1;
+        let unlinked = read[after_tip..]
+            .iter()
+            .find(|b| {
+                matches!(
+                    self.links.by_block[b],
+                    BlockLink::Gap | BlockLink::Pending(..)
+                )
+            })
+            .map(|&b| blocks[b].slot);
+        let mut out = Vec::new();
+        for &b in &chain {
+            let block = &blocks[b];
+            if unlinked.is_some_and(|slot| block.slot >= slot) || !self.whole(b, &wanted) {
+                break;
+            }
+            out.extend(wanted.iter().map(|&i| (block.slot, block.root, i)));
+        }
+        if out.is_empty() {
+            unavailable
+        } else {
+            Answer::Sidecars(out)
+        }
+    }
+
+    /// The by-root answer: per identifier in request order, its columns in index order, each
+    /// pair once, the ones stored for a block at or above the model's
+    /// `earliest_available_slot` and within the serve range.
+    fn expected_by_root(&self, ids: &[(Root, Vec<u64>)]) -> Vec<(u64, Root, u64)> {
+        self.assert_under_budget();
+        let (first, last) = serve_range();
+        let earliest = self.links.earliest();
+        let servable = |slot: u64| earliest.is_some_and(|e| slot >= e.max(first)) && slot <= last;
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for (root, columns) in ids {
+            let columns: BTreeSet<u64> = columns.iter().copied().collect();
+            for index in columns {
+                if !seen.insert((*root, index)) || !self.stored.contains_key(&(*root, index)) {
+                    continue;
+                }
+                let slot = known(root).expect("only known roots are stored").slot;
+                if servable(slot) {
+                    out.push((slot, *root, index));
+                }
+            }
+        }
+        out
+    }
 }
 
 /// The counters a sidecar's end moves.
@@ -869,12 +1220,6 @@ impl Probe {
             "one sidecar at a time filled the queue"
         );
         let actual = if stored == 1 {
-            // The writer settles pending links once the column's place is back; settle the
-            // same slots here, so the writer's own call finds them done and every later read
-            // sees one state.
-            self.writer
-                .settle_pending(s.slot.saturating_sub(PENDING_LINK_SLOTS))
-                .expect("settle pending links");
             Ok(())
         } else {
             let at = deltas.iter().position(|&d| d == 1).expect("one drop");
@@ -917,11 +1262,17 @@ impl Probe {
         let ssz = s.as_ssz_bytes();
         match actual {
             Ok(()) => {
-                self.model.stored.insert((root, index), ssz.clone());
-                self.model.accepted.insert(ssz);
+                let block = known_index(&root).expect("only known roots are stored");
+                let written = self.model.store(block, index, ssz);
+                self.await_writer(&written);
             }
             Err(_) => {
                 self.model.rejected.insert(ssz);
+                assert_eq!(
+                    observe(&self.writer),
+                    self.model.links,
+                    "a dropped sidecar moved the store's links"
+                );
             }
         }
         // The store holds exactly what the contract accepted.
@@ -940,10 +1291,44 @@ impl Probe {
         self.events.push(Event::Gossip(Some(actual)));
     }
 
+    /// Waits for the writer thread's settle step after a write: the store's links are the
+    /// write's (`written`) until they are the model's, and never anything else. With nothing
+    /// to settle the two are the same, and there is nothing to wait for.
+    fn await_writer(&self, written: &Links) {
+        let want = &self.model.links;
+        let deadline = Instant::now() + WRITER_WAIT;
+        loop {
+            let seen = observe(&self.writer);
+            if seen == *want {
+                return;
+            }
+            assert_eq!(
+                seen, *written,
+                "the store's links are neither the write's nor its settle step's {want:?}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the writer thread never settled its pending links: {seen:?}, want {want:?}"
+            );
+            std::thread::sleep(Duration::from_micros(50));
+        }
+    }
+
+    /// `earliest_available_slot` as the harness derives it; the server must report the same.
+    fn check_earliest(&self) -> Option<u64> {
+        let earliest = self.model.links.earliest();
+        assert_eq!(
+            self.columns.earliest_available_slot(),
+            earliest,
+            "the server's earliest_available_slot"
+        );
+        earliest
+    }
+
     async fn by_range(&mut self, r: DataColumnsByRangeV1Request) {
         let columns = r.columns.to_vec();
         let bounds = request_verdicts(&Request::DataColumnsByRange(r.clone()));
-        let earliest = self.columns.earliest_available_slot();
+        let earliest = self.check_earliest();
         let request = pb::DataColumnsByRangeRequest {
             start_slot: r.start_slot,
             count: r.count,
@@ -969,38 +1354,31 @@ impl Probe {
                 assert_eq!(answer, Read::Refused(ErrorCode::Invalid), "out of bounds");
                 Answer::Refused(ErrorCode::Invalid)
             }
-            (Ok(_), Read::Refused(code)) => {
-                assert_eq!(code, ErrorCode::ResourceUnavailable, "within bounds");
-                assert!(
-                    r.count > 0 && !wanted.is_empty(),
-                    "a request naming nothing refused"
-                );
-                Answer::Refused(code)
-            }
-            (Ok(_), Read::Sidecars(served)) => {
-                let names_nothing = r.count == 0 || wanted.is_empty();
-                assert!(
-                    !names_nothing || served.is_empty(),
-                    "a request naming nothing answered with sidecars"
-                );
-                assert!(
-                    names_nothing || !self.model.stored.is_empty(),
-                    "an empty store answered a request with success, not 3: ResourceUnavailable"
-                );
-                self.check_range(&r, &wanted, earliest, &served)
+            (Ok(_), answer) => {
+                let got = match answer {
+                    Read::Refused(code) => Answer::Refused(code),
+                    Read::Sidecars(served) => {
+                        Answer::Sidecars(self.check_range(&r, &wanted, earliest, &served))
+                    }
+                };
+                let want = self.model.expected_range(r.start_slot, r.count, &columns);
+                assert_eq!(got, want, "the by-range answer to {r:?}");
+                got
             }
         };
         self.events.push(Event::Answer(Some(summary)));
     }
 
-    /// The by-range rules of the module docs, on a success.
+    /// The shape of a by-range success, on its own: every sidecar served was accepted, within
+    /// the range and at or above `earliest`, a requested custody column; whole blocks in
+    /// `(slot, index)` order, each the next blob-carrying block after the one before it.
     fn check_range(
         &self,
         r: &DataColumnsByRangeV1Request,
         wanted: &BTreeSet<u64>,
         earliest: Option<u64>,
         served: &[Envelope],
-    ) -> Answer {
+    ) -> Vec<(u64, Root, u64)> {
         let end = r.start_slot.saturating_add(r.count);
         let mut out = Vec::new();
         let mut blocks: Vec<(u64, Root, BTreeSet<u64>)> = Vec::new();
@@ -1045,14 +1423,15 @@ impl Probe {
             assert_eq!(indices, wanted, "the block at slot {slot} is not whole");
         }
         for pair in blocks.windows(2) {
-            assert!(
-                ancestor(&pair[0].1, &pair[1].1),
-                "the block at slot {} does not descend from the one at slot {}",
+            assert_eq!(
+                blob_parent(&pair[1].1),
+                Some(pair[0].1),
+                "the block at slot {} is not the next blob-carrying block after the one at slot {}",
                 pair[1].0,
                 pair[0].0
             );
         }
-        Answer::Sidecars(out)
+        out
     }
 
     async fn by_root(&mut self, r: DataColumnsByRootV1Request) {
@@ -1061,7 +1440,7 @@ impl Probe {
                 .map(|id| (id.block_root.0, id.columns.to_vec()))
                 .collect();
         let bounds = request_verdicts(&Request::DataColumnsByRoot(r.clone()));
-        let earliest = self.columns.earliest_available_slot();
+        self.check_earliest();
         let request = pb::DataColumnsByRootRequest {
             ids: ids
                 .iter()
@@ -1096,37 +1475,12 @@ impl Probe {
             (Ok(_), Read::Sidecars(served)) => {
                 let got: Vec<(u64, Root, u64)> =
                     served.iter().map(|e| self.check_served(e)).collect();
-                let want = self.expected_by_root(&ids, earliest);
+                let want = self.model.expected_by_root(&ids);
                 assert_eq!(got, want, "the by-root answer");
                 Answer::Sidecars(got)
             }
         };
         self.events.push(Event::Answer(Some(summary)));
-    }
-
-    /// Per identifier in request order, its columns in index order, each pair once: the ones
-    /// stored for a block at or above `earliest`.
-    fn expected_by_root(
-        &self,
-        ids: &[(Root, Vec<u64>)],
-        earliest: Option<u64>,
-    ) -> Vec<(u64, Root, u64)> {
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for (root, columns) in ids {
-            let columns: BTreeSet<u64> = columns.iter().copied().collect();
-            for index in columns {
-                if !seen.insert((*root, index)) || !self.model.stored.contains_key(&(*root, index))
-                {
-                    continue;
-                }
-                let slot = known(root).expect("only known roots are stored").slot;
-                if earliest.is_some_and(|e| slot >= e) {
-                    out.push((slot, *root, index));
-                }
-            }
-        }
-        out
     }
 
     /// One served envelope: a Gloas sidecar the contract accepted, the copy stored last for its
@@ -1213,19 +1567,6 @@ enum Read {
     Refused(ErrorCode),
 }
 
-/// Whether `older` is an ancestor of `newer` in [`CHAIN`].
-fn ancestor(older: &Root, newer: &Root) -> bool {
-    let blocks = known_blocks();
-    let mut at = blocks.iter().position(|b| b.root == *newer);
-    while let Some(i) = at {
-        at = blocks[i].parent;
-        if at.is_some_and(|p| blocks[p].root == *older) {
-            return true;
-        }
-    }
-    false
-}
-
 fn hex(root: &Root) -> String {
     root[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -1279,8 +1620,11 @@ mod tests {
         assert_eq!(blocks[1].slot, cgc_set_slot());
         assert!(blocks[3].commitments.is_empty());
         assert_eq!(blocks[4].slot, blocks[5].slot);
-        assert!(ancestor(&blocks[2].root, &blocks[4].root));
-        assert!(!ancestor(&blocks[4].root, &blocks[5].root));
+        // D's next blob-carrying block back is B, through C; F's is B too; P has none.
+        assert_eq!(blob_parent(&blocks[4].root), Some(blocks[2].root));
+        assert_eq!(blob_parent(&blocks[5].root), Some(blocks[2].root));
+        assert_eq!(blob_parent(&blocks[2].root), Some(blocks[1].root));
+        assert_eq!(blob_parent(&blocks[0].root), None);
         let roots: HashSet<Root> = blocks.iter().map(|b| b.root).collect();
         assert_eq!(roots.len(), CHAIN.len());
         // UNKNOWN_ROOT names no block of the chain.
@@ -1344,6 +1688,128 @@ mod tests {
                 Event::Answer(Some(Answer::Sidecars(vec![(a.slot, a.root, 47)]))),
             ]
         );
+    }
+
+    /// A model with these columns stored, in order: `(block, columns)`.
+    fn model_of(writes: &[(usize, &[u64])]) -> Model {
+        let mut model = Model::default();
+        for &(block, columns) in writes {
+            for &index in columns {
+                model.store(block, index, vec![block as u8, index as u8]);
+            }
+        }
+        model
+    }
+
+    /// Block `b`'s `columns`, as an answer lists them.
+    fn whole(b: usize, columns: &[u64]) -> Vec<(u64, Root, u64)> {
+        let block = &known_blocks()[b];
+        columns
+            .iter()
+            .map(|&i| (block.slot, block.root, i))
+            .collect()
+    }
+
+    const UNAVAILABLE: Answer = Answer::Refused(ErrorCode::ResourceUnavailable);
+
+    #[test]
+    fn a_range_ends_before_a_partial_block_and_never_jumps_past_it() {
+        let blocks = known_blocks();
+        // A whole, B with two columns of four, D whole.
+        let model = model_of(&[(1, &CUSTODY), (2, &[1, 47]), (4, &CUSTODY)]);
+        assert_eq!(model.links.by_block[&4], BlockLink::Parent(blocks[2].root));
+        assert_eq!(
+            model.expected_range(blocks[1].slot, 8, &CUSTODY),
+            Answer::Sidecars(whole(1, &CUSTODY)),
+            "A, then nothing past B: not A then D"
+        );
+        assert_eq!(
+            model.expected_range(blocks[1].slot, 8, &[47, 1, 47]),
+            Answer::Sidecars([whole(1, &[1, 47]), whole(2, &[1, 47]), whole(4, &[1, 47])].concat())
+        );
+        // From B's slot the first block lacks columns: nothing can be served.
+        assert_eq!(
+            model.expected_range(blocks[2].slot, 8, &CUSTODY),
+            UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn a_range_refuses_or_answers_nothing_only_where_the_rules_say() {
+        let blocks = known_blocks();
+        let empty = Model::default();
+        assert_eq!(empty.links.earliest(), None);
+        assert_eq!(empty.expected_range(blocks[1].slot, 1, &[1]), UNAVAILABLE);
+        assert_eq!(empty.expected_range(u64::MAX, 1, &[1]), UNAVAILABLE);
+        assert_eq!(
+            empty.expected_range(blocks[1].slot, 0, &[1]),
+            Answer::Sidecars(Vec::new())
+        );
+        assert_eq!(
+            empty.expected_range(blocks[1].slot, 4, &[]),
+            Answer::Sidecars(Vec::new())
+        );
+        let model = model_of(&[(1, &CUSTODY)]);
+        // Below earliest_available_slot, another column, or a range before A: refused.
+        assert_eq!(model.expected_range(blocks[0].slot, 4, &[1]), UNAVAILABLE);
+        assert_eq!(model.expected_range(blocks[1].slot, 4, &[2]), UNAVAILABLE);
+        // Past the serve range: the future, an empty success.
+        assert_eq!(
+            model.expected_range(serve_range().1 + 1, 4, &[1]),
+            Answer::Sidecars(Vec::new())
+        );
+        // In range, after the stored blocks: nothing stored there and nothing waited for.
+        assert_eq!(
+            model.expected_range(blocks[2].slot, 4, &[1]),
+            Answer::Sidecars(Vec::new())
+        );
+        // D waits for B: a range over B's slot is refused until B is stored.
+        let waiting = model_of(&[(1, &CUSTODY), (4, &CUSTODY)]);
+        assert_eq!(
+            waiting.links.by_block[&4],
+            BlockLink::Pending(blocks[2].root, blocks[2].slot)
+        );
+        assert_eq!(waiting.expected_range(blocks[2].slot, 8, &[1]), UNAVAILABLE);
+        assert_eq!(
+            waiting.expected_range(blocks[1].slot, 8, &[1]),
+            Answer::Sidecars(whole(1, &[1]))
+        );
+    }
+
+    #[test]
+    fn the_writer_settles_a_block_left_waiting_and_earliest_rises_to_it() {
+        let blocks = known_blocks();
+        let (a, b) = (&blocks[1], &blocks[2]);
+        let mut model = model_of(&[(2, &[1])]);
+        assert_eq!(model.links.by_block[&2], BlockLink::Pending(a.root, a.slot));
+        assert_eq!(model.links.contiguous_from, None);
+        // H, five slots past B: the write leaves B waiting, the settle step after it a gap.
+        let written = model.store(7, 1, vec![7]);
+        assert_eq!(written.by_block[&2], BlockLink::Pending(a.root, a.slot));
+        assert_eq!(model.links.by_block[&2], BlockLink::Gap);
+        assert_eq!(model.links.contiguous_from, Some(b.slot));
+        // A comes late: stored, but below earliest_available_slot, so never served.
+        model.store(1, 1, vec![1]);
+        assert_eq!(model.links.by_block[&1], BlockLink::Start);
+        assert_eq!(model.links.by_block[&2], BlockLink::Gap);
+        assert_eq!(model.links.first_stored, Some(a.slot));
+        assert_eq!(model.links.earliest(), Some(b.slot));
+        assert!(model.expected_by_root(&[(a.root, vec![1])]).is_empty());
+        assert_eq!(model.expected_by_root(&[(b.root, vec![1])]), whole(2, &[1]));
+        assert_eq!(model.expected_range(a.slot, 8, &[1]), UNAVAILABLE);
+    }
+
+    #[test]
+    fn of_two_tied_branches_a_range_serves_only_what_they_share() {
+        let blocks = known_blocks();
+        // D and F, both on B at one slot: tied, so the answer ends with B.
+        let model = model_of(&[(1, &[1]), (2, &[1]), (4, &[1]), (5, &[1])]);
+        assert_eq!(
+            model.expected_range(blocks[1].slot, 8, &[1]),
+            Answer::Sidecars([whole(1, &[1]), whole(2, &[1])].concat())
+        );
+        // From D's slot they share nothing.
+        assert_eq!(model.expected_range(blocks[4].slot, 8, &[1]), UNAVAILABLE);
     }
 
     #[test]
