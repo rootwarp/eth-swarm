@@ -23,10 +23,12 @@
 //!   undecoded. `ethswarm.chain.v1.GossipService/Validate`, its wire form, is still a stub.
 //!
 //! [`serve`] runs it all for a while on the devnet, dialling the reference CLs so their column
-//! gossip reaches us, never across a fork digest change ([`clip_serve`]: the subscriptions are
-//! of the digest at its start), then stops the hand-off, lets the store settle, asks the probe
-//! what it stored, as a peer would ([`ColumnRequester`] over libp2p), and compares every answer
-//! with the store ([`self_check`]).
+//! gossip reaches us, never across a fork digest change ([`clip_until`]: the subscriptions are
+//! of the digest at its start, and every deadline is counted back from its end, again once the
+//! start is done), then stops the hand-off, lets the store settle ([`settle`]: a store still
+//! changing is reported, never checked), asks the probe what it stored, as a peer would
+//! ([`ColumnRequester`] over libp2p), and compares every answer with the store
+//! ([`self_check`]), all by [`AFTER_SERVING`] after serving and before the digest change.
 
 use super::devnet::Devnet;
 use super::report::Check;
@@ -111,11 +113,13 @@ pub const TAP_CAPACITY: usize = 1024;
 /// How often the hand-off drains the tap.
 const PUMP_EVERY: Duration = Duration::from_millis(20);
 
-/// How long the columns still on their way into the store get once serving ends.
+/// How long the columns still on their way into the store get once serving ends ([`settle`]):
+/// a store still changing after it is not checked.
 const SETTLE_WAIT: Duration = Duration::from_secs(10);
 
-/// How long `serve` keeps after serving for the settle wait and its own check \[est\]: the
-/// run ends before the next fork digest by at least this ([`clip_serve`]).
+/// How long `serve` keeps after serving for the settle wait and its own check \[est\]: both
+/// end by then ([`check_by`]), and serving ends at least this before the next fork digest
+/// ([`clip_until`]).
 pub const AFTER_SERVING: Duration = Duration::from_secs(30);
 
 /// How long a reference sample is reused for our Status \[est\]: every Status that goes out
@@ -300,6 +304,7 @@ pub struct ChainSide<E: EthSpec, V> {
     ingest: Ingest<E, V>,
     writer: Arc<ColumnWriter>,
     columns: Arc<ColumnServer>,
+    status: Arc<StatusProvider<BeaconApi>>,
     custody: Vec<u64>,
     cgc: u64,
     socket: PathBuf,
@@ -367,11 +372,13 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ChainSide<E, V> {
             Arc::new(clock),
             ServeBudget::default(),
         ));
-        let status = StatusProvider::new(plan.reference, devnet.probe_chain(), DEFAULT_API_TIMEOUT)
-            .serving_columns(Arc::clone(&columns) as Arc<dyn cl_chain::probe::ServedColumns>)
-            .reusing_samples(STATUS_SAMPLE_REUSE);
+        let status = Arc::new(
+            StatusProvider::new(plan.reference, devnet.probe_chain(), DEFAULT_API_TIMEOUT)
+                .serving_columns(Arc::clone(&columns) as Arc<dyn cl_chain::probe::ServedColumns>)
+                .reusing_samples(STATUS_SAMPLE_REUSE),
+        );
         let req_resp = ReqRespServer::new(plan.link.clone(), Arc::clone(&columns))
-            .serving_status(Arc::new(status));
+            .serving_status(Arc::clone(&status) as Arc<dyn cl_chain::reqresp::ChainStatus>);
         let routes = ChainStub::new(plan.link).serving(req_resp).routes();
         let server = tokio::spawn(async move {
             let served = tonic::transport::Server::builder()
@@ -387,6 +394,7 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ChainSide<E, V> {
             ingest,
             writer,
             columns,
+            status,
             custody: columns_of,
             cgc,
             socket: dir.socket_path(),
@@ -444,6 +452,16 @@ impl<E: EthSpec, V> ChainSide<E, V> {
     #[must_use]
     pub fn pending(&self) -> usize {
         self.ingest.pending()
+    }
+
+    /// Samples the reference API for our Status now, so the first `GetStatus` has one: a
+    /// Status never waits on the API, and before its first good sample is `UNAVAILABLE`.
+    ///
+    /// # Errors
+    ///
+    /// The sample failed or timed out; a later Status refreshes it in the background.
+    pub async fn sample_reference(&self) -> Result<(), String> {
+        self.status.refresh().await.map_err(|e| e.to_string())
     }
 }
 
@@ -1136,11 +1154,19 @@ fn epoch_start_ms(devnet: &Devnet, epoch: u64) -> u128 {
         + u128::from(epoch) * u128::from(devnet.slots_per_epoch()) * slot_ms
 }
 
-/// How long a run started at `now_ms` may serve: `serve_for`, unless the fork digest changes
-/// before the run (and its [`AFTER_SERVING`] check) would end. The probe subscribes to the
-/// column subnets of one digest, the one at its start, so it does not run across a digest
-/// change: it serves until [`AFTER_SERVING`] before it, and says so (`Some` of the epoch the
-/// next digest starts at).
+/// The next fork digest change after `now_ms`: the epoch it starts at, and when, as Unix
+/// milliseconds; `None` if no digest follows.
+#[must_use]
+pub fn next_digest_change(devnet: &Devnet, now_ms: u128) -> Option<(u64, u128)> {
+    let gvr = devnet.genesis().genesis_validators_root;
+    digest_schedule(devnet.config(), &gvr)
+        .into_iter()
+        .map(|e| (e.epoch, epoch_start_ms(devnet, e.epoch)))
+        .find(|&(_, at)| at > now_ms)
+}
+
+/// How long a run started at `now_ms` may serve: [`clip_until`] the next fork digest change
+/// after `now_ms`.
 ///
 /// # Errors
 ///
@@ -1150,17 +1176,36 @@ pub fn clip_serve(
     now_ms: u128,
     serve_for: Duration,
 ) -> Result<(Duration, Option<u64>), String> {
-    let gvr = devnet.genesis().genesis_validators_root;
-    let next = digest_schedule(devnet.config(), &gvr)
-        .into_iter()
-        .map(|e| e.epoch)
-        .find(|&epoch| epoch_start_ms(devnet, epoch) > now_ms);
-    let Some(epoch) = next else {
+    clip_until(
+        devnet,
+        next_digest_change(devnet, now_ms),
+        now_ms,
+        serve_for,
+    )
+}
+
+/// How long a run may serve from `now_ms` when the digest it subscribed to ends at `change`
+/// (the epoch and its start, [`next_digest_change`] of the run's start): `serve_for`, unless
+/// serving and its [`AFTER_SERVING`] check would not end before `change`. The probe subscribes
+/// to the column subnets of one digest, so it does not run across a digest change: it serves
+/// until [`AFTER_SERVING`] before it, and says so (`Some` of the epoch). The deadline is
+/// absolute, counted back from `change`, so `now_ms` can be after a slow start and the run
+/// still ends before the same change.
+///
+/// # Errors
+///
+/// `change` is too soon (or past) to serve one slot and check before it.
+pub fn clip_until(
+    devnet: &Devnet,
+    change: Option<(u64, u128)>,
+    now_ms: u128,
+    serve_for: Duration,
+) -> Result<(Duration, Option<u64>), String> {
+    let Some((epoch, at_ms)) = change else {
         return Ok((serve_for, None));
     };
-    let until = Duration::from_millis(
-        u64::try_from(epoch_start_ms(devnet, epoch) - now_ms).unwrap_or(u64::MAX),
-    );
+    let until =
+        Duration::from_millis(u64::try_from(at_ms.saturating_sub(now_ms)).unwrap_or(u64::MAX));
     if serve_for + AFTER_SERVING <= until {
         return Ok((serve_for, None));
     }
@@ -1175,10 +1220,88 @@ pub fn clip_serve(
     }
 }
 
-/// Creates the column store's directory, mode 0700. It must not exist yet, not even as a
-/// symlink: every run serves under a fresh node key, whose custody columns are its own.
+/// When the digest change `change` comes on the monotonic clock, given that `started` was at
+/// `started_ms` on the wall clock.
+fn boundary_at(
+    started: tokio::time::Instant,
+    started_ms: u128,
+    change: Option<(u64, u128)>,
+) -> Option<tokio::time::Instant> {
+    change.map(|(_, at_ms)| {
+        let ahead = u64::try_from(at_ms.saturating_sub(started_ms)).unwrap_or(u64::MAX);
+        started + Duration::from_millis(ahead)
+    })
+}
+
+/// When the settle wait and the self-check must have ended, serving having ended at `ended`:
+/// [`AFTER_SERVING`] later, and before the digest change at `boundary`.
+fn check_by(
+    ended: tokio::time::Instant,
+    boundary: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    let by = ended + AFTER_SERVING;
+    boundary.map_or(by, |b| by.min(b))
+}
+
+/// Waits for the store to settle: `pending` (the columns on their way into it) 0 for three
+/// polls in a row, [`PUMP_EVERY`] apart, within `wait`. `Err` of the last count if it did not:
+/// the store is still changing, and nothing may be compared against it.
+pub async fn settle(pending: impl Fn() -> usize, wait: Duration) -> Result<(), usize> {
+    let by = tokio::time::Instant::now() + wait;
+    let mut quiet = 0;
+    loop {
+        let left = pending();
+        quiet = if left == 0 { quiet + 1 } else { 0 };
+        if quiet >= 3 {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= by {
+            return Err(left);
+        }
+        tokio::time::sleep(PUMP_EVERY.min(by - tokio::time::Instant::now())).await;
+    }
+}
+
+/// Refuses a parent directory of the new store that other users can write: one owned by
+/// neither `uid` nor root, or group or world writable without the sticky bit. The store is
+/// created here and opened again by path ([`ColumnWriter::open`]); under such a parent another
+/// user could swap it for a directory of theirs in between.
+fn check_store_parent(parent: &Path, uid: u32) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let shown = parent.display();
+    let meta =
+        std::fs::metadata(parent).map_err(|e| format!("column store parent {shown}: {e}"))?;
+    if !meta.is_dir() {
+        return Err(format!("column store parent {shown} is not a directory"));
+    }
+    if meta.uid() != uid && meta.uid() != 0 {
+        return Err(format!(
+            "column store parent {shown} is writable by other users: owned by UID {}, not \
+             {uid} or root",
+            meta.uid()
+        ));
+    }
+    let mode = meta.mode();
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Err(format!(
+            "column store parent {shown} is writable by other users: mode {:o} is group or \
+             world writable without the sticky bit",
+            mode & 0o7777
+        ));
+    }
+    Ok(())
+}
+
+/// Creates the column store's directory, mode 0700, under a parent no other user can write
+/// ([`check_store_parent`]). It must not exist yet, not even as a symlink: every run serves
+/// under a fresh node key, whose custody columns are its own.
 fn create_store_dir(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::DirBuilderExt;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    check_store_parent(parent, Ownership::current().uid)?;
     match std::fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
@@ -1192,8 +1315,9 @@ fn create_store_dir(path: &Path) -> Result<(), String> {
 
 /// The `serve` check: cl-chain and cl-p2p as [`ChainSide`] and [`p2p_swarm`], connected over
 /// cl-chain's socket, the reference CLs `plan.peers` dialled, served for `plan.serve_for`
-/// (clipped before a fork digest change, [`clip_serve`]), then [`self_check`]ed with the
-/// hand-off to the store stopped. `reference` is the first reference CL's beacon API, `kzg`
+/// (clipped before the next fork digest change after `now_ms`, [`clip_until`], again once the
+/// start is done), then [`self_check`]ed with the hand-off to the store stopped, once the store
+/// settled ([`settle`]), and by [`check_by`]. `reference` is the first reference CL's beacon API, `kzg`
 /// cl-verify, and `tap` the capture queue between the swarm and the store. `now_ms` is the
 /// wall clock. The column store's directory is created here, and removed again if the start
 /// fails.
@@ -1206,10 +1330,13 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
     now_ms: u128,
 ) -> Check {
     let mut check = Check::new(NAME);
-    let (serve_for, clipped) = match clip_serve(devnet, now_ms, plan.serve_for) {
-        Ok(clip) => clip,
-        Err(e) => return Check::failed(NAME, e),
-    };
+    let started_at = tokio::time::Instant::now();
+    // The digest whose column subnets the run subscribes to ends here: every deadline of the
+    // run is counted back from it.
+    let change = next_digest_change(devnet, now_ms);
+    if let Err(e) = clip_until(devnet, change, now_ms, plan.serve_for) {
+        return Check::failed(NAME, e);
+    }
     if let Err(e) = create_store_dir(&plan.columns_dir) {
         return Check::failed(NAME, e);
     }
@@ -1238,6 +1365,10 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
             },
             &mut registry,
         )?;
+        // A Status never waits on the reference API: sampled now, so the first has one.
+        if let Err(e) = chain.sample_reference().await {
+            tracing::warn!(error = %e, "no reference sample for our Status yet");
+        }
         let swarm_plan = SwarmPlan {
             listen: plan.listen.clone(),
             idle: Duration::from_secs(60),
@@ -1286,13 +1417,6 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
         chain.custody_group_count(),
         chain.socket().display()
     ));
-    if let Some(epoch) = clipped {
-        check.pass(format!(
-            "serving for {} s, not {} s: the fork digest changes at epoch {epoch}",
-            serve_for.as_secs(),
-            plan.serve_for.as_secs()
-        ));
-    }
     // Where it listens, before anything else.
     let mut listening = Vec::new();
     let deadline = tokio::time::Instant::now() + REQUEST_DEADLINE;
@@ -1327,6 +1451,25 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
             check.fail(format!("dial {}: {e}", p.peer_id));
         }
     }
+    // The start took its time: clipped again from the clock now, before the same change.
+    let serving_from = now_ms + started_at.elapsed().as_millis();
+    let (serve_for, clipped) = match clip_until(devnet, change, serving_from, plan.serve_for) {
+        Ok(clip) => clip,
+        Err(e) => {
+            check.fail(format!(
+                "after a start of {} s: {e}",
+                started_at.elapsed().as_secs()
+            ));
+            return check;
+        }
+    };
+    if let Some(epoch) = clipped {
+        check.pass(format!(
+            "serving for {} s, not {} s: the fork digest changes at epoch {epoch}",
+            serve_for.as_secs(),
+            plan.serve_for.as_secs()
+        ));
+    }
     let chain = Arc::new(chain);
     let pumping = Arc::new(AtomicBool::new(true));
     let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -1338,14 +1481,15 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
         stopped,
     ));
     tokio::time::sleep(serve_for).await;
-    // The hand-off stops, and what is on its way in settles: the check reads one store.
+    // The hand-off stops, and what is on its way in settles: the check reads one store. Both
+    // end by `check_by`, before the digest change.
     pumping.store(false, Ordering::SeqCst);
-    let settle_by = tokio::time::Instant::now() + SETTLE_WAIT;
-    let mut quiet = 0;
-    while quiet < 3 && tokio::time::Instant::now() < settle_by {
-        quiet = if chain.pending() == 0 { quiet + 1 } else { 0 };
-        tokio::time::sleep(PUMP_EVERY).await;
-    }
+    let by = check_by(
+        tokio::time::Instant::now(),
+        boundary_at(started_at, now_ms, change),
+    );
+    let wait = SETTLE_WAIT.min(by.saturating_duration_since(tokio::time::Instant::now()));
+    let settled = settle(|| chain.pending(), wait).await;
     let stored = chain.reader().column_count().unwrap_or(0);
     check.record(
         stored > 0,
@@ -1357,10 +1501,28 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
         ),
     );
     // To the end of the epoch serving ended in: the serve range ends there.
-    let last_slot = slot_at(devnet, now_ms + serve_for.as_millis())
+    let last_slot = slot_at(devnet, serving_from + serve_for.as_millis())
         .unwrap_or(u64::MAX)
         .saturating_add(devnet.slots_per_epoch());
-    self_check(&mut check, &chain, devnet, peer, target, digest, last_slot).await;
+    match settled {
+        Err(left) => check.fail(format!(
+            "ingest did not settle: {left} columns still on their way into the store after {} \
+             s, so no answer is checked against it",
+            wait.as_secs()
+        )),
+        Ok(()) => {
+            let checked = self_check(&mut check, &chain, devnet, peer, target, digest, last_slot);
+            if tokio::time::timeout_at(by, checked).await.is_err() {
+                check.fail(format!(
+                    "the self-check did not end within {} s of serving{}",
+                    AFTER_SERVING.as_secs(),
+                    change.map_or_else(String::new, |(epoch, _)| format!(
+                        " and before the fork digest changes at epoch {epoch}"
+                    ))
+                ));
+            }
+        }
+    }
     let _ = stop.send(());
     let _ = driver.await;
     check
@@ -1439,6 +1601,135 @@ mod tests {
         // Past every digest change: as asked.
         let long = Duration::from_secs(86_400);
         assert_eq!(clip_serve(&devnet, at(5, 0), long), Ok((long, None)));
+    }
+
+    /// After startup the run is clipped again from where the clock is, against the digest it
+    /// subscribed to at its start: never against a later change once startup ran past it.
+    #[test]
+    fn the_clip_counts_from_the_digest_boundary_after_startup() {
+        let devnet = devnet();
+        // The fixture: Fulu at 0, a blob change at 1, Gloas at 2; 6 s slots, 8 per epoch.
+        let at = |epoch: u64, slot: u64| {
+            u128::from(devnet.genesis().genesis_time) * 1000 + u128::from(epoch * 8 + slot) * 6_000
+        };
+        let long = Duration::from_secs(300);
+        let change = next_digest_change(&devnet, at(1, 0));
+        assert_eq!(change, Some((2, at(2, 0))));
+        assert_eq!(
+            clip_until(&devnet, change, at(1, 0), long),
+            clip_serve(&devnet, at(1, 0), long)
+        );
+        // A 10 s start: 10 s less to serve, the same boundary.
+        assert_eq!(
+            clip_until(&devnet, change, at(1, 0) + 10_000, long),
+            Ok((Duration::from_secs(8), Some(2)))
+        );
+        // A start that leaves less than a slot to serve before the check: refused.
+        let late = clip_until(&devnet, change, at(1, 0) + 13_000, long).unwrap_err();
+        assert!(late.contains("epoch 2"), "{late}");
+        // A start that ran past the boundary: refused, where a clip from the clock alone
+        // would find no later change and serve as asked.
+        let past = at(2, 0) + 1_000;
+        let five = Duration::from_secs(5);
+        assert!(clip_until(&devnet, change, past, five)
+            .unwrap_err()
+            .contains("epoch 2"));
+        assert_eq!(clip_serve(&devnet, past, five), Ok((five, None)));
+        // No change ahead: as asked.
+        assert_eq!(clip_until(&devnet, None, past, long), Ok((long, None)));
+    }
+
+    /// The settle wait and the self-check end by [`AFTER_SERVING`] after serving, and before
+    /// the digest the run subscribed to ends.
+    #[test]
+    fn the_check_ends_before_the_digest_boundary() {
+        let start = tokio::time::Instant::now();
+        let boundary = boundary_at(start, 1_000, Some((2, 49_000)));
+        assert_eq!(boundary, Some(start + Duration::from_secs(48)));
+        assert_eq!(boundary_at(start, 1_000, None), None);
+        let ended = start + Duration::from_secs(10);
+        assert_eq!(check_by(ended, None), ended + AFTER_SERVING);
+        assert_eq!(check_by(ended, boundary), ended + AFTER_SERVING);
+        let late = start + Duration::from_secs(40);
+        assert_eq!(check_by(late, boundary), boundary.unwrap());
+    }
+
+    /// The self-check runs only on a store that settled: nothing pending for three polls in a
+    /// row. One still changing at the end of the wait is reported, never compared.
+    #[tokio::test(start_paused = true)]
+    async fn the_store_settles_or_the_check_does_not_run() {
+        use std::sync::atomic::AtomicUsize;
+        let left = Arc::new(AtomicUsize::new(5));
+        let draining = Arc::clone(&left);
+        tokio::spawn(async move {
+            while draining.load(Ordering::SeqCst) > 0 {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                draining.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            settle(|| left.load(Ordering::SeqCst), SETTLE_WAIT).await,
+            Ok(())
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+        // Never drained: not settled, at the end of the wait.
+        let start = tokio::time::Instant::now();
+        assert_eq!(settle(|| 2, SETTLE_WAIT).await, Err(2));
+        assert!(start.elapsed() >= SETTLE_WAIT);
+        assert!(start.elapsed() <= SETTLE_WAIT + PUMP_EVERY);
+        // Empty now and then, never three polls in a row: not settled either.
+        let polls = AtomicUsize::new(0);
+        let flapping = || usize::from(polls.fetch_add(1, Ordering::SeqCst) % 3 == 2);
+        assert!(settle(flapping, SETTLE_WAIT).await.is_err());
+        // No wait left: one look.
+        assert_eq!(settle(|| 0, Duration::ZERO).await, Err(0));
+    }
+
+    /// The new store's parent must not let other users swap the store between its creation
+    /// and its opening by path: owned by us or root, and writable by no one else unless
+    /// sticky.
+    #[test]
+    fn the_store_parent_is_closed_to_other_users() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = Ownership::current().uid;
+        let dir = tempfile::tempdir().unwrap();
+        let set = |mode| {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        for (mode, ok) in [
+            (0o700, true),
+            (0o755, true),
+            (0o1777, true),
+            (0o1770, true),
+            (0o777, false),
+            (0o770, false),
+            (0o702, false),
+        ] {
+            set(mode);
+            let checked = check_store_parent(dir.path(), uid);
+            assert_eq!(checked.is_ok(), ok, "{mode:o}: {checked:?}");
+            if let Err(e) = checked {
+                assert!(e.contains("writable by other users"), "{e}");
+            }
+        }
+        // Under such a parent nothing is created.
+        set(0o777);
+        let columns = dir.path().join("columns");
+        let refused = create_store_dir(&columns).unwrap_err();
+        assert!(refused.starts_with("column store"), "{refused}");
+        assert!(!columns.exists());
+        set(0o700);
+        create_store_dir(&columns).unwrap();
+        // Owned by another user than us (and not root): refused.
+        if uid != 0 {
+            let other = check_store_parent(dir.path(), uid + 1).unwrap_err();
+            assert!(other.contains("owned by"), "{other}");
+        }
+        // A parent that is not a directory.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let not_dir = check_store_parent(file.path(), uid).unwrap_err();
+        assert!(not_dir.contains("not a directory"), "{not_dir}");
     }
 
     #[test]

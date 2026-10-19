@@ -121,7 +121,8 @@ only.
   --fetch-secs N         how long fetch-epoch's range fetch may take (default 120)
   --epoch N              the epoch fetch-epoch fetches (default: finalized epoch - 1)
   --columns-dir DIR      serve: the column store, created; it must not exist yet (every run
-                         serves under a fresh node key, which its custody columns follow)
+                         serves under a fresh node key, which its custody columns follow),
+                         under a parent no other user can write
   --socket-dir DIR       serve: the socket root, an absolute path without symlinks writable
                          only by us; cl-chain's socket is DIR/cl-chain/cl-chain.sock
   --verify-socket PATH   serve: cl-verify's socket (cl-verify --socket PATH --peer-uid <our UID>)

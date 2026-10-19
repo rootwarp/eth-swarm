@@ -45,15 +45,24 @@
 //!   `head_slot`; clamping it to `head_slot + 1` would claim slots the probe cannot serve, so it
 //!   is not clamped.
 //!
-//! Each [`StatusProvider::status`] samples the API under a bounded timeout. A sample that fails
-//! or times out (an outage) keeps the last good one; with none yet, the Status is
-//! [`ProbeError::Unavailable`], which the RPC answers `UNAVAILABLE` and cl-p2p treats as "no
-//! Status": it sends none and judges none, never a guessed one.
+//! A Status never waits on the reference API. [`StatusProvider::status`] answers from the last
+//! good sample and a fresh read of the column floor, at once, and keeps the sample current in
+//! the background: once the kept sample is older than its reuse age
+//! ([`StatusProvider::reusing_samples`], [`DEFAULT_SAMPLE_REUSE`]), a Status starts one refresh
+//! of it, under the API timeout, and every Status (and [`StatusProvider::refresh`]) meanwhile
+//! shares that one; none is ever started twice at once. A refresh that fails or times out (an
+//! outage) keeps the last good sample, and no Status starts the next one for a backoff
+//! ([`REFRESH_BACKOFF`], doubled after each failure in a row up to [`MAX_REFRESH_BACKOFF`],
+//! reset by a good sample). So a stalled API costs one refresh per backoff, never a Status.
+//! Before the first good sample there is no Status: [`ProbeError::Unavailable`], which the RPC
+//! answers `UNAVAILABLE` and cl-p2p treats as "no Status": it sends none and judges none, never
+//! a guessed one. [`StatusProvider::refresh`] waits for a sample (the one in flight, or a new
+//! one, whatever the backoff), for callers that must have one first.
 //!
 //! The kept sample only moves forward: a sample whose finalized epoch or head slot is below the
-//! kept one's is ignored (and the kept one answered). Overlapping calls can finish out of order,
-//! a slow one with an older answer after a fast one with a newer answer, and the Status we
-//! advertise must never move back.
+//! kept one's is ignored (and the kept one answered), so the Status we advertise never moves
+//! back. The floor is read last, after the sample is taken, so it is the store's at the moment
+//! the response is built.
 
 mod beacon_api;
 pub mod column;
@@ -79,14 +88,28 @@ use ethswarm_proto::common;
 use network_config::digest::{compute_fork_digest, current_epoch, DigestError};
 use network_config::{ChainConfig, Epoch, Genesis};
 use std::future::Future;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
+use tokio::sync::watch;
+use tokio::time::Instant;
 
 /// A block root.
 pub type Root = [u8; 32];
 
 /// How long one sample of the reference API may take \[est\].
 pub const DEFAULT_API_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a good sample is reused by default before a Status refreshes it \[est\]: 2 s, so a
+/// Status read for every peer costs the reference API one sample per 2 s at most.
+pub const DEFAULT_SAMPLE_REUSE: Duration = Duration::from_secs(2);
+
+/// How long no Status starts a refresh after one failed \[est\]: 1 s, doubled after each
+/// failure in a row up to [`MAX_REFRESH_BACKOFF`].
+pub const REFRESH_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The longest backoff after failed refreshes \[est\]: 16 s, about a mainnet slot, so a
+/// reference API that comes back is sampled again within a slot of it.
+pub const MAX_REFRESH_BACKOFF: Duration = Duration::from_secs(16);
 
 /// A finalized checkpoint, as the reference API reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +182,25 @@ impl Sample {
     }
 }
 
+/// One sample of `api`: the finalized checkpoint and its block, if the API gives both within
+/// `timeout` and they agree.
+async fn sample<A: ReferenceApi>(api: &A, timeout: Duration) -> Result<Sample, ApiError> {
+    let read = async {
+        let finalized = api.finalized_checkpoint().await?;
+        let head = api.header(finalized.root).await?;
+        if head.root != finalized.root {
+            return Err(ApiError(format!(
+                "header of {:02x?} names root {:02x?}",
+                finalized.root, head.root
+            )));
+        }
+        Ok(Sample { finalized, head })
+    };
+    tokio::time::timeout(timeout, read)
+        .await
+        .map_err(|_| ApiError(format!("no answer within {timeout:?}")))?
+}
+
 /// The slot the probe serves its custody columns from, for the Status.
 pub trait ServedColumns: Send + Sync {
     /// The Status `earliest_available_slot`: never below the slot a range request is served
@@ -170,35 +212,114 @@ pub trait ServedColumns: Send + Sync {
     fn status_floor(&self) -> Result<u64, String>;
 }
 
-/// Builds the probe's Status from the wall clock and the reference API (see the module docs).
-pub struct StatusProvider<A> {
-    api: A,
-    chain: ProbeChain,
-    timeout: Duration,
-    last_good: Mutex<Option<Sample>>,
-    columns: Option<std::sync::Arc<dyn ServedColumns>>,
-    /// How long a good sample is reused before the API is sampled again.
-    reuse: Duration,
-    /// When the kept sample was taken.
-    sampled_at: Mutex<Option<tokio::time::Instant>>,
+/// The outcome of one refresh, once it ended.
+type Refreshed = Option<Result<(), ApiError>>;
+
+/// The kept sample and its refresh.
+#[derive(Debug)]
+struct Samples {
+    /// The newest good sample.
+    last_good: Option<Sample>,
+    /// When the API last gave a good answer.
+    sampled_at: Option<Instant>,
+    /// Why the last refresh failed, while no good sample came since.
+    last_error: Option<ApiError>,
+    /// The refresh in flight, if one is: its outcome once it ends.
+    in_flight: Option<watch::Receiver<Refreshed>>,
+    /// No Status starts a refresh before this: the backoff after a failure.
+    retry_at: Option<Instant>,
+    /// The backoff after the next failure.
+    backoff: Duration,
 }
 
-impl<A: ReferenceApi> StatusProvider<A> {
-    /// A provider sampling `api` for `chain`, each sample within `timeout`.
+impl Samples {
+    /// The refresh in flight, if its task still runs.
+    fn running(&self) -> Option<watch::Receiver<Refreshed>> {
+        self.in_flight
+            .as_ref()
+            .filter(|done| done.has_changed().is_ok())
+            .cloned()
+    }
+
+    /// Whether a Status should start a refresh at `now`: none in flight, no backoff running,
+    /// and the kept sample (if any) at least `reuse` old.
+    fn due(&self, now: Instant, reuse: Duration) -> bool {
+        self.running().is_none()
+            && self.retry_at.is_none_or(|at| now >= at)
+            && self.sampled_at.is_none_or(|at| now >= at + reuse)
+    }
+
+    /// Takes in the outcome of the refresh that ended at `now` (see the module docs).
+    fn settle(&mut self, outcome: Result<Sample, ApiError>, now: Instant) -> Result<(), ApiError> {
+        self.in_flight = None;
+        match outcome {
+            Ok(sample) => {
+                self.sampled_at = Some(now);
+                self.retry_at = None;
+                self.backoff = REFRESH_BACKOFF;
+                self.last_error = None;
+                match self.last_good {
+                    Some(kept) if sample.is_older_than(&kept) => tracing::debug!(
+                        finalized_epoch = sample.finalized.epoch,
+                        head_slot = sample.head.slot,
+                        kept_epoch = kept.finalized.epoch,
+                        kept_slot = kept.head.slot,
+                        "an older reference sample than the kept one: ignored"
+                    ),
+                    _ => self.last_good = Some(sample),
+                }
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %e,
+                    backoff_ms = self.backoff.as_millis() as u64,
+                    kept = self.last_good.is_some(),
+                    "reference API: no sample, the last good one kept"
+                );
+                self.retry_at = Some(now + self.backoff);
+                self.backoff = (self.backoff * 2).min(MAX_REFRESH_BACKOFF);
+                self.last_error = Some(e.clone());
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Builds the probe's Status from the wall clock and the reference API (see the module docs).
+pub struct StatusProvider<A> {
+    api: Arc<A>,
+    chain: ProbeChain,
+    timeout: Duration,
+    columns: Option<Arc<dyn ServedColumns>>,
+    /// How long a good sample is reused before a Status refreshes it.
+    reuse: Duration,
+    samples: Arc<Mutex<Samples>>,
+}
+
+impl<A: ReferenceApi + 'static> StatusProvider<A> {
+    /// A provider sampling `api` for `chain`, each sample within `timeout`, a good one reused
+    /// for [`DEFAULT_SAMPLE_REUSE`].
     pub fn new(api: A, chain: ProbeChain, timeout: Duration) -> Self {
         Self {
-            api,
+            api: Arc::new(api),
             chain,
             timeout,
-            last_good: Mutex::new(None),
             columns: None,
-            reuse: Duration::ZERO,
-            sampled_at: Mutex::new(None),
+            reuse: DEFAULT_SAMPLE_REUSE,
+            samples: Arc::new(Mutex::new(Samples {
+                last_good: None,
+                sampled_at: None,
+                last_error: None,
+                in_flight: None,
+                retry_at: None,
+                backoff: REFRESH_BACKOFF,
+            })),
         }
     }
 
-    /// The same provider, reusing a good sample for `age` before it samples the API again: a
-    /// Status read for every peer then costs the API one call per `age`. The column floor is
+    /// The same provider, reusing a good sample for `age` before a Status refreshes it: a
+    /// Status read for every peer then costs the API one sample per `age`. The column floor is
     /// read on every call all the same.
     #[must_use]
     pub fn reusing_samples(mut self, age: Duration) -> Self {
@@ -206,53 +327,77 @@ impl<A: ReferenceApi> StatusProvider<A> {
         self
     }
 
-    /// The kept sample, if it is younger than the reuse age.
-    fn recent(&self) -> Option<Sample> {
-        let at = (*self
-            .sampled_at
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner))?;
-        if at.elapsed() >= self.reuse {
-            return None;
-        }
-        *self
-            .last_good
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
     /// The same provider, its `earliest_available_slot` the slot `columns` serves from.
     #[must_use]
-    pub fn serving_columns(mut self, columns: std::sync::Arc<dyn ServedColumns>) -> Self {
+    pub fn serving_columns(mut self, columns: Arc<dyn ServedColumns>) -> Self {
         self.columns = Some(columns);
         self
     }
 
-    /// The finalized checkpoint and its block, if the API gives both in time and they agree.
-    async fn sample(&self) -> Result<Sample, ApiError> {
-        let read = async {
-            let finalized = self.api.finalized_checkpoint().await?;
-            let head = self.api.header(finalized.root).await?;
-            if head.root != finalized.root {
-                return Err(ApiError(format!(
-                    "header of {:02x?} names root {:02x?}",
-                    finalized.root, head.root
-                )));
-            }
-            Ok(Sample { finalized, head })
-        };
-        tokio::time::timeout(self.timeout, read)
-            .await
-            .map_err(|_| ApiError(format!("no answer within {:?}", self.timeout)))?
+    fn samples(&self) -> std::sync::MutexGuard<'_, Samples> {
+        self.samples.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The Status at `now_ms` (Unix milliseconds) as `GetStatusResponse`.
+    /// The refresh in flight, or a new one: started if `forced`, or if it is due (see the
+    /// module docs). `None` if none runs, or no Tokio runtime can run one.
+    fn start_refresh(&self, forced: bool) -> Option<watch::Receiver<Refreshed>> {
+        let mut samples = self.samples();
+        if let Some(running) = samples.running() {
+            return Some(running);
+        }
+        if !forced && !samples.due(Instant::now(), self.reuse) {
+            return None;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!("no runtime to refresh the reference sample on");
+            return None;
+        };
+        let (done, outcome) = watch::channel(None);
+        samples.in_flight = Some(outcome.clone());
+        drop(samples);
+        let (api, timeout, kept) = (
+            Arc::clone(&self.api),
+            self.timeout,
+            Arc::clone(&self.samples),
+        );
+        runtime.spawn(async move {
+            let sampled = sample(&*api, timeout).await;
+            let settled = kept
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .settle(sampled, Instant::now());
+            let _ = done.send(Some(settled));
+        });
+        Some(outcome)
+    }
+
+    /// Waits for a sample of the API: the refresh in flight, or a new one even within a
+    /// backoff. A good one is kept as any refresh's is.
+    ///
+    /// # Errors
+    ///
+    /// The refresh failed or timed out (the last good sample, if any, is kept), or there is no
+    /// Tokio runtime to run it on.
+    pub async fn refresh(&self) -> Result<(), ApiError> {
+        let Some(mut outcome) = self.start_refresh(true) else {
+            return Err(ApiError("no runtime to sample on".into()));
+        };
+        let ended = outcome.wait_for(Option::is_some).await.map(|o| o.clone());
+        match ended {
+            Ok(Some(settled)) => settled,
+            _ => Err(ApiError("the refresh ended without an outcome".into())),
+        }
+    }
+
+    /// The Status at `now_ms` (Unix milliseconds) as `GetStatusResponse`, at once: the last
+    /// good sample, a refresh of it started if due (never waited on), and the column floor read
+    /// last. Must run on a Tokio runtime for the refresh to start.
     ///
     /// # Errors
     ///
     /// [`ProbeError::Clock`] if the wall clock has no digest; [`ProbeError::Unavailable`] while
-    /// the API has never given a good sample.
-    pub async fn status(&self, now_ms: u128) -> Result<pb::GetStatusResponse, ProbeError> {
+    /// the API has never given a good sample, or the column store cannot say what it serves.
+    pub fn status(&self, now_ms: u128) -> Result<pb::GetStatusResponse, ProbeError> {
         let chain = &self.chain;
         let epoch = current_epoch(
             chain.genesis.genesis_time,
@@ -262,7 +407,19 @@ impl<A: ReferenceApi> StatusProvider<A> {
         )?;
         let fork_digest =
             compute_fork_digest(&chain.config, &chain.genesis.genesis_validators_root, epoch)?;
-        // The floor first: a store that cannot say what it serves gives no Status.
+        let _ = self.start_refresh(false);
+        let (kept, last_error) = {
+            let samples = self.samples();
+            (samples.last_good, samples.last_error.clone())
+        };
+        let Some(sample) = kept else {
+            return Err(ProbeError::Unavailable(last_error.map_or_else(
+                || "no good sample yet".to_owned(),
+                |e| e.to_string(),
+            )));
+        };
+        // The floor last: what the store serves from as the response is built. A store that
+        // cannot say gives no Status.
         let floor = match &self.columns {
             Some(columns) => Some(
                 columns
@@ -270,42 +427,6 @@ impl<A: ReferenceApi> StatusProvider<A> {
                     .map_err(|e| ProbeError::Unavailable(format!("column store: {e}")))?,
             ),
             None => None,
-        };
-        if let Some(sample) = self.recent() {
-            return Ok(Self::response(fork_digest, sample, floor));
-        }
-        let fresh = self.sample().await;
-        let sample = {
-            let mut last = self
-                .last_good
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            match fresh {
-                Ok(sample) => match *last {
-                    Some(kept) if sample.is_older_than(&kept) => tracing::debug!(
-                        finalized_epoch = sample.finalized.epoch,
-                        head_slot = sample.head.slot,
-                        kept_epoch = kept.finalized.epoch,
-                        kept_slot = kept.head.slot,
-                        "an older reference sample than the kept one: ignored"
-                    ),
-                    _ => {
-                        *last = Some(sample);
-                        *self
-                            .sampled_at
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner) =
-                            Some(tokio::time::Instant::now());
-                    }
-                },
-                Err(e) => match *last {
-                    Some(_) => {
-                        tracing::warn!(%e, "reference API outage: keeping the last good sample")
-                    }
-                    None => return Err(ProbeError::Unavailable(e.to_string())),
-                },
-            }
-            last.expect("set or kept above")
         };
         Ok(Self::response(fork_digest, sample, floor))
     }
@@ -331,18 +452,20 @@ mod tests {
     use super::*;
     use network_config::Network;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
     const UP: u8 = 0;
     const FAILING: u8 = 1;
     const HANGING: u8 = 2;
 
-    /// A reference API that answers from its tables, fails, or never answers.
+    /// A reference API that answers from its tables, fails, or never answers; it counts the
+    /// samples asked of it.
     #[derive(Default)]
     struct Fixture {
         mode: AtomicU8,
         finalized: Mutex<Option<Checkpoint>>,
         headers: Mutex<HashMap<Root, Header>>,
+        samples: AtomicUsize,
     }
 
     impl Fixture {
@@ -361,10 +484,15 @@ mod tests {
                 _ => Ok(()),
             }
         }
+
+        fn sampled(&self) -> usize {
+            self.samples.load(Ordering::SeqCst)
+        }
     }
 
-    impl ReferenceApi for &Fixture {
+    impl ReferenceApi for Arc<Fixture> {
         async fn finalized_checkpoint(&self) -> Result<Checkpoint, ApiError> {
+            self.samples.fetch_add(1, Ordering::SeqCst);
             self.gate().await?;
             self.finalized
                 .lock()
@@ -413,16 +541,38 @@ mod tests {
         (next - 1, next)
     }
 
+    /// Lets the refresh tasks run as far as they can without time passing.
+    async fn run_refreshes() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A column floor the test moves, counting its reads.
+    #[derive(Default)]
+    struct Floor {
+        slot: AtomicU64,
+        reads: AtomicUsize,
+    }
+
+    impl ServedColumns for Floor {
+        fn status_floor(&self) -> Result<u64, String> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(self.slot.load(Ordering::SeqCst))
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn status_provider() {
         let chain = sepolia();
         let (before, after) = digest_boundary(&chain);
-        let api = Fixture::default();
+        let api = Arc::new(Fixture::default());
         api.finalize(before - 2, [0xaa; 32], (before - 2) * 32);
-        let provider = StatusProvider::new(&api, chain.clone(), DEFAULT_API_TIMEOUT);
+        let provider = StatusProvider::new(Arc::clone(&api), chain.clone(), DEFAULT_API_TIMEOUT);
 
         // The fixture's finalized checkpoint and its block, the wall-clock digest.
-        let status = provider.status(at_epoch(&chain, before)).await.unwrap();
+        provider.refresh().await.unwrap();
+        let status = provider.status(at_epoch(&chain, before)).unwrap();
         let want = pb::GetStatusResponse {
             fork_digest: digest_at(&chain, before),
             finalized: Some(common::Checkpoint {
@@ -435,9 +585,14 @@ mod tests {
         };
         assert_eq!(status, want);
 
-        // Finality moves: the next Status follows it.
+        // Finality moves: once the sample is due again, a Status refreshes it in the
+        // background and the next one follows it.
         api.finalize(before - 1, [0xbb; 32], (before - 1) * 32);
-        let status = provider.status(at_epoch(&chain, before)).await.unwrap();
+        tokio::time::advance(DEFAULT_SAMPLE_REUSE).await;
+        let status = provider.status(at_epoch(&chain, before)).unwrap();
+        assert_eq!(status.head_slot, (before - 2) * 32, "not waited on");
+        run_refreshes().await;
+        let status = provider.status(at_epoch(&chain, before)).unwrap();
         assert_eq!(status.finalized.as_ref().unwrap().root, vec![0xbb; 32]);
         assert_eq!(status.head_slot, (before - 1) * 32);
         let good = status;
@@ -445,40 +600,128 @@ mod tests {
         // An outage (refused, then silent past the timeout) keeps the last good sample, and the
         // digest still follows the clock across the BPO epoch.
         api.mode.store(FAILING, Ordering::SeqCst);
-        let status = provider.status(at_epoch(&chain, after)).await.unwrap();
+        assert!(provider.refresh().await.is_err());
+        let status = provider.status(at_epoch(&chain, after)).unwrap();
         assert_ne!(digest_at(&chain, after), digest_at(&chain, before));
         assert_eq!(status.fork_digest, digest_at(&chain, after));
         assert_eq!(status.finalized, good.finalized);
         assert_eq!(status.head_root, good.head_root);
         api.mode.store(HANGING, Ordering::SeqCst);
-        let start = tokio::time::Instant::now();
-        let status = provider.status(at_epoch(&chain, after)).await.unwrap();
+        let start = Instant::now();
+        let refreshed = provider.refresh().await;
         assert_eq!(start.elapsed(), DEFAULT_API_TIMEOUT);
+        assert!(refreshed.unwrap_err().0.contains("no answer within"));
+        let status = provider.status(at_epoch(&chain, after)).unwrap();
         assert_eq!(status.finalized, good.finalized);
 
         // Back up: fresh values again.
         api.mode.store(UP, Ordering::SeqCst);
         api.finalize(after, [0xcc; 32], after * 32);
-        let status = provider.status(at_epoch(&chain, after)).await.unwrap();
+        provider.refresh().await.unwrap();
+        let status = provider.status(at_epoch(&chain, after)).unwrap();
         assert_eq!(status.finalized.unwrap().epoch, after);
     }
 
-    /// A reference API whose `header` answers take the next scripted delay each.
-    struct Slow<'a> {
-        api: &'a Fixture,
-        delays: Mutex<std::collections::VecDeque<Duration>>,
+    /// A stalled reference API holds up no Status: it is answered at once from the last good
+    /// sample, with the floor the store serves from as it is built.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_reference_api_still_gets_a_status_with_a_fresh_floor() {
+        let chain = sepolia();
+        let (before, _) = digest_boundary(&chain);
+        let now = at_epoch(&chain, before);
+        let api = Arc::new(Fixture::default());
+        api.finalize(before - 2, [0xaa; 32], (before - 2) * 32);
+        let floor = Arc::new(Floor::default());
+        floor.slot.store(100, Ordering::SeqCst);
+        let provider = StatusProvider::new(Arc::clone(&api), chain.clone(), DEFAULT_API_TIMEOUT)
+            .serving_columns(Arc::clone(&floor) as Arc<dyn ServedColumns>);
+        provider.refresh().await.unwrap();
+        api.mode.store(HANGING, Ordering::SeqCst);
+        tokio::time::advance(DEFAULT_SAMPLE_REUSE).await;
+        for raised in [140, 141] {
+            floor.slot.store(raised, Ordering::SeqCst);
+            let start = Instant::now();
+            let status = provider.status(now).unwrap();
+            assert_eq!(start.elapsed(), Duration::ZERO, "the API is not waited on");
+            assert_eq!(status.earliest_available_slot, raised);
+            assert_eq!(status.head_root, [0xaa; 32]);
+            run_refreshes().await;
+        }
+        assert_eq!(api.sampled(), 2, "one refresh, stalled, in flight");
+        // The stalled refresh times out: the Status stays the last good one.
+        tokio::time::advance(DEFAULT_API_TIMEOUT).await;
+        run_refreshes().await;
+        let status = provider.status(now).unwrap();
+        assert_eq!(status.head_root, [0xaa; 32]);
+        assert_eq!(
+            floor.reads.load(Ordering::SeqCst),
+            3,
+            "read for every Status"
+        );
     }
 
-    impl ReferenceApi for &Slow<'_> {
-        async fn finalized_checkpoint(&self) -> Result<Checkpoint, ApiError> {
-            (&self.api).finalized_checkpoint().await
+    /// Concurrent Status requests start one refresh between them, and explicit refreshes join
+    /// it; a failure backs off before a Status starts the next, longer after each failure in a
+    /// row, and a good sample resets it.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_statuses_share_one_refresh_and_back_off_after_a_failure() {
+        let chain = sepolia();
+        let (before, _) = digest_boundary(&chain);
+        let now = at_epoch(&chain, before);
+        let api = Arc::new(Fixture::default());
+        api.finalize(before - 2, [0xaa; 32], (before - 2) * 32);
+        let provider = StatusProvider::new(Arc::clone(&api), chain.clone(), DEFAULT_API_TIMEOUT)
+            .reusing_samples(Duration::ZERO);
+        provider.refresh().await.unwrap();
+        assert_eq!(api.sampled(), 1);
+        api.mode.store(HANGING, Ordering::SeqCst);
+        for _ in 0..16 {
+            provider.status(now).unwrap();
         }
+        run_refreshes().await;
+        assert_eq!(api.sampled(), 2, "one refresh for every Status");
+        let (a, b) = tokio::join!(provider.refresh(), provider.refresh());
+        assert!(a.is_err() && b.is_err());
+        assert_eq!(api.sampled(), 2, "the explicit refreshes joined it");
 
-        async fn header(&self, root: Root) -> Result<Header, ApiError> {
-            let delay = self.delays.lock().unwrap().pop_front().unwrap_or_default();
-            tokio::time::sleep(delay).await;
-            (&self.api).header(root).await
+        // It timed out: no Status starts another before the backoff ends, then one does.
+        let mut backoff = REFRESH_BACKOFF;
+        for _ in 0..6 {
+            tokio::time::advance(backoff - Duration::from_millis(1)).await;
+            let sampled = api.sampled();
+            provider.status(now).unwrap();
+            run_refreshes().await;
+            assert_eq!(api.sampled(), sampled, "within the backoff of {backoff:?}");
+            tokio::time::advance(Duration::from_millis(1)).await;
+            provider.status(now).unwrap();
+            run_refreshes().await;
+            assert_eq!(
+                api.sampled(),
+                sampled + 1,
+                "after the backoff of {backoff:?}"
+            );
+            tokio::time::advance(DEFAULT_API_TIMEOUT).await;
+            run_refreshes().await;
+            backoff = (backoff * 2).min(MAX_REFRESH_BACKOFF);
         }
+        assert_eq!(backoff, MAX_REFRESH_BACKOFF);
+
+        // Back up: past the backoff a Status refreshes, and the next one has the new sample.
+        api.mode.store(UP, Ordering::SeqCst);
+        api.finalize(before - 1, [0xbb; 32], (before - 1) * 32);
+        tokio::time::advance(MAX_REFRESH_BACKOFF).await;
+        provider.status(now).unwrap();
+        run_refreshes().await;
+        assert_eq!(provider.status(now).unwrap().head_root, [0xbb; 32]);
+        // The backoff was reset: a failure now waits the first backoff again.
+        api.mode.store(FAILING, Ordering::SeqCst);
+        provider.status(now).unwrap();
+        run_refreshes().await;
+        let sampled = api.sampled();
+        tokio::time::advance(REFRESH_BACKOFF).await;
+        provider.status(now).unwrap();
+        run_refreshes().await;
+        assert_eq!(api.sampled(), sampled + 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -486,48 +729,32 @@ mod tests {
         let chain = sepolia();
         let (before, _) = digest_boundary(&chain);
         let now = at_epoch(&chain, before);
-        let api = Fixture::default();
-        let (old, new) = (before - 3, before - 2);
-        api.finalize(old, [0xaa; 32], old * 32);
-        let slow = Slow {
-            api: &api,
-            delays: Mutex::new([Duration::from_secs(1), Duration::ZERO].into()),
-        };
-        let provider = StatusProvider::new(&slow, chain.clone(), DEFAULT_API_TIMEOUT);
-
-        // A slow refresh reads the old checkpoint, then a fast one reads the newer one and
-        // finishes first: the slow one's older answer must not replace it.
-        let (stale, fresh) = tokio::join!(provider.status(now), async {
-            tokio::task::yield_now().await;
-            api.finalize(new, [0xbb; 32], new * 32);
-            provider.status(now).await
-        });
+        let api = Arc::new(Fixture::default());
+        let new = before - 2;
+        api.finalize(new, [0xbb; 32], new * 32);
+        let provider = StatusProvider::new(Arc::clone(&api), chain.clone(), DEFAULT_API_TIMEOUT);
+        provider.refresh().await.unwrap();
         let epoch = |s: &pb::GetStatusResponse| s.finalized.as_ref().unwrap().epoch;
-        assert_eq!(epoch(&fresh.unwrap()), new);
-        let stale = stale.unwrap();
-        assert_eq!(
-            epoch(&stale),
-            new,
-            "the late, older sample is not advertised"
-        );
-        assert_eq!(stale.head_slot, new * 32);
 
-        // An outage keeps the newest sample, not the last one to arrive.
+        // An outage keeps the newest sample.
         api.mode.store(FAILING, Ordering::SeqCst);
-        let kept = provider.status(now).await.unwrap();
+        assert!(provider.refresh().await.is_err());
+        let kept = provider.status(now).unwrap();
         assert_eq!(epoch(&kept), new);
         assert_eq!(kept.head_root, vec![0xbb; 32]);
 
-        // An answer older in either field is refused too, one after the other.
+        // An answer older in either field is refused, one after the other.
         api.mode.store(UP, Ordering::SeqCst);
-        api.finalize(old, [0xcc; 32], (new + 5) * 32);
-        assert_eq!(epoch(&provider.status(now).await.unwrap()), new);
+        api.finalize(new - 1, [0xcc; 32], (new + 5) * 32);
+        provider.refresh().await.unwrap();
+        assert_eq!(epoch(&provider.status(now).unwrap()), new);
         api.finalize(new, [0xdd; 32], new * 32 - 1);
-        let status = provider.status(now).await.unwrap();
-        assert_eq!(status.head_root, vec![0xbb; 32]);
+        provider.refresh().await.unwrap();
+        assert_eq!(provider.status(now).unwrap().head_root, vec![0xbb; 32]);
         // The same epoch and slot, or newer: taken.
         api.finalize(new + 1, [0xee; 32], (new + 1) * 32);
-        let status = provider.status(now).await.unwrap();
+        provider.refresh().await.unwrap();
+        let status = provider.status(now).unwrap();
         assert_eq!(epoch(&status), new + 1);
         assert_eq!(status.head_root, vec![0xee; 32]);
     }
@@ -536,20 +763,27 @@ mod tests {
     async fn no_status_before_one_good_sample() {
         let chain = sepolia();
         let (before, _) = digest_boundary(&chain);
-        let api = Fixture::default();
+        let now = at_epoch(&chain, before);
+        let api = Arc::new(Fixture::default());
         api.mode.store(FAILING, Ordering::SeqCst);
-        let provider = StatusProvider::new(&api, chain.clone(), DEFAULT_API_TIMEOUT);
-        let err = provider.status(at_epoch(&chain, before)).await.unwrap_err();
+        let provider = StatusProvider::new(Arc::clone(&api), chain.clone(), DEFAULT_API_TIMEOUT);
+        // None yet, nor waited for: `UNAVAILABLE`, a refresh started meanwhile.
+        let err = provider.status(now).unwrap_err();
         assert!(matches!(err, ProbeError::Unavailable(_)), "{err}");
+        assert!(err.to_string().contains("no good sample yet"), "{err}");
         assert_eq!(tonic::Status::from(err).code(), tonic::Code::Unavailable);
+        assert!(provider.refresh().await.is_err());
+        let err = provider.status(now).unwrap_err();
+        assert!(err.to_string().contains("connection refused"), "{err}");
         // A finalized root the API has no header for is no good sample either.
         api.mode.store(UP, Ordering::SeqCst);
         *api.finalized.lock().unwrap() = Some(Checkpoint {
             epoch: 1,
             root: [1; 32],
         });
+        assert!(provider.refresh().await.is_err());
         assert!(matches!(
-            provider.status(at_epoch(&chain, before)).await,
+            provider.status(now),
             Err(ProbeError::Unavailable(_))
         ));
         // Nor is a header that names another root.
@@ -560,8 +794,67 @@ mod tests {
                 slot: 32,
             },
         );
-        let err = provider.status(at_epoch(&chain, before)).await.unwrap_err();
+        assert!(provider.refresh().await.is_err());
+        let err = provider.status(now).unwrap_err();
         assert!(err.to_string().contains("names root"), "{err}");
+    }
+
+    /// Without a Tokio runtime nothing can refresh: no Status, and an explicit refresh says why.
+    #[test]
+    fn no_refresh_without_a_runtime() {
+        let chain = sepolia();
+        let (before, _) = digest_boundary(&chain);
+        let api = Arc::new(Fixture::default());
+        let provider = StatusProvider::new(Arc::clone(&api), chain.clone(), DEFAULT_API_TIMEOUT);
+        assert!(provider.status(at_epoch(&chain, before)).is_err());
+        assert_eq!(api.sampled(), 0);
+        let refreshed = block_on(provider.refresh());
+        assert!(refreshed.unwrap_err().0.contains("no runtime"));
+    }
+
+    /// Polls `fut` to its end on this thread, outside any runtime.
+    fn block_on<F: Future>(fut: F) -> F::Output {
+        use std::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut fut = std::pin::pin!(fut);
+        loop {
+            if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+                return out;
+            }
+        }
+    }
+
+    /// A refresh whose task ended without an outcome (its runtime went away) holds up no
+    /// later one.
+    #[test]
+    fn a_refresh_that_never_ended_is_not_waited_on() {
+        let chain = sepolia();
+        let (before, _) = digest_boundary(&chain);
+        let api = Arc::new(Fixture::default());
+        api.finalize(before - 2, [0xaa; 32], (before - 2) * 32);
+        api.mode.store(HANGING, Ordering::SeqCst);
+        let provider = StatusProvider::new(Arc::clone(&api), chain.clone(), DEFAULT_API_TIMEOUT);
+        {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                assert!(provider.status(at_epoch(&chain, before)).is_err());
+                run_refreshes().await;
+            });
+            // Dropped with its refresh task stalled.
+        }
+        api.mode.store(UP, Ordering::SeqCst);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            provider.refresh().await.unwrap();
+            assert_eq!(api.sampled(), 2);
+            assert!(provider.status(at_epoch(&chain, before)).is_ok());
+        });
     }
 
     /// The provider is what `ReqRespService/GetStatus` serves ([`crate::reqresp::ChainStatus`]),
@@ -569,10 +862,11 @@ mod tests {
     #[tokio::test]
     async fn the_provider_is_the_status_get_status_serves() {
         use crate::reqresp::ChainStatus;
-        let api: &'static Fixture = Box::leak(Box::default());
+        let api = Arc::new(Fixture::default());
         api.finalize(7, [7; 32], 224);
-        let provider = StatusProvider::new(api, sepolia(), DEFAULT_API_TIMEOUT);
-        let source: std::sync::Arc<dyn ChainStatus> = std::sync::Arc::new(provider);
+        let provider = StatusProvider::new(Arc::clone(&api), sepolia(), DEFAULT_API_TIMEOUT);
+        provider.refresh().await.unwrap();
+        let source: Arc<dyn ChainStatus> = Arc::new(provider);
         let status = source.status().await.unwrap();
         assert_eq!(status.head_root, [7; 32]);
         assert_eq!(
@@ -588,17 +882,18 @@ mod tests {
     #[tokio::test]
     async fn the_clock_must_have_a_digest() {
         let chain = sepolia();
-        let api = Fixture::default();
+        let api = Arc::new(Fixture::default());
         api.finalize(1, [1; 32], 32);
-        let provider = StatusProvider::new(&api, chain.clone(), DEFAULT_API_TIMEOUT);
+        let provider = StatusProvider::new(api, chain.clone(), DEFAULT_API_TIMEOUT);
+        provider.refresh().await.unwrap();
         // Before genesis, and after genesis but before Fulu.
         let before_genesis = u128::from(chain.genesis.genesis_time) * 1000 - 1;
         assert!(matches!(
-            provider.status(before_genesis).await,
+            provider.status(before_genesis),
             Err(ProbeError::Clock(DigestError::BeforeGenesis { .. }))
         ));
         assert!(matches!(
-            provider.status(at_epoch(&chain, 0)).await,
+            provider.status(at_epoch(&chain, 0)),
             Err(ProbeError::Clock(DigestError::BeforeFulu { .. }))
         ));
     }
@@ -612,7 +907,6 @@ mod tests {
         use crate::reqresp::{ColumnServer, ColumnStore, ServeBudget, ServeClock};
         use cl_chain_columns::{BlockLink, Column, ColumnWriter};
         use consensus_types::primitives::U256;
-        use std::sync::Arc;
         struct NoEnr;
         impl EnrCgc for NoEnr {
             fn set_cgc(&mut self, _: u64) -> Result<(), EnrError> {
@@ -630,7 +924,7 @@ mod tests {
         }
         let chain = sepolia();
         let (before, _) = digest_boundary(&chain);
-        let api = Fixture::default();
+        let api = Arc::new(Fixture::default());
         let head = (before - 2) * 32;
         api.finalize(before - 2, [0xaa; 32], head);
         let dir = tempfile::tempdir().unwrap();
@@ -651,11 +945,12 @@ mod tests {
             ServeBudget::default(),
         ));
         let provider =
-            StatusProvider::new(&api, chain.clone(), DEFAULT_API_TIMEOUT).serving_columns(server);
+            StatusProvider::new(api, chain.clone(), DEFAULT_API_TIMEOUT).serving_columns(server);
+        provider.refresh().await.unwrap();
         let now = at_epoch(&chain, before);
         // No column stored yet: the slot it serves from at the earliest, cgc_set_slot, never
         // the head slot below it (a peer asking from there would get `3`).
-        let empty = provider.status(now).await.unwrap();
+        let empty = provider.status(now).unwrap();
         assert_eq!(empty.earliest_available_slot, cgc_set_slot);
         assert!(empty.earliest_available_slot > empty.head_slot);
         // Forward from cgc_set_slot: the first stored column slot is the slot cgc was set at.
@@ -676,7 +971,7 @@ mod tests {
         store(cgc_set_slot, 1, BlockLink::Start);
         let first = first_stored_column_slot(writer.reader()).unwrap();
         assert_eq!(first, Some(cgc_set_slot));
-        let status = provider.status(now).await.unwrap();
+        let status = provider.status(now).unwrap();
         assert_eq!(status.earliest_available_slot, cgc_set_slot);
         assert_eq!(Some(status.earliest_available_slot), first);
         assert_eq!(custody.cgc_set_slot(), status.earliest_available_slot);
@@ -686,7 +981,7 @@ mod tests {
         // the slot after the watermark, which the store can still serve.
         writer.prune_finalized(cgc_set_slot + 1).unwrap();
         assert_eq!(first_stored_column_slot(writer.reader()).unwrap(), first);
-        let status = provider.status(now).await.unwrap();
+        let status = provider.status(now).unwrap();
         assert_eq!(status.earliest_available_slot, cgc_set_slot + 2);
     }
 
@@ -698,7 +993,6 @@ mod tests {
         use crate::reqresp::{ColumnServer, ColumnStore, ServeBudget, ServeClock};
         use cl_chain_columns::ColumnWriter;
         use consensus_types::primitives::U256;
-        use std::sync::Arc;
         struct Always;
         impl ServeClock for Always {
             fn serve_range(&self) -> Option<(u64, u64)> {
@@ -710,24 +1004,23 @@ mod tests {
         }
         let chain = sepolia();
         let (before, _) = digest_boundary(&chain);
-        let api = Fixture::default();
+        let api = Arc::new(Fixture::default());
         api.finalize(before - 2, [0xaa; 32], (before - 2) * 32);
         let now = at_epoch(&chain, before);
         let dir = tempfile::tempdir().unwrap();
         let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
-        let server = || {
-            Arc::new(ColumnServer::new(
-                Arc::clone(&writer) as Arc<dyn ColumnStore>,
-                U256::MAX,
-                Arc::new(Always),
-                ServeBudget::default(),
-            ))
-        };
+        let server = Arc::new(ColumnServer::new(
+            Arc::clone(&writer) as Arc<dyn ColumnStore>,
+            U256::MAX,
+            Arc::new(Always),
+            ServeBudget::default(),
+        ));
         // No custody record: nothing to say what is served.
         let provider =
-            StatusProvider::new(&api, chain.clone(), DEFAULT_API_TIMEOUT).serving_columns(server());
+            StatusProvider::new(api, chain.clone(), DEFAULT_API_TIMEOUT).serving_columns(server);
+        provider.refresh().await.unwrap();
         assert!(matches!(
-            provider.status(now).await,
+            provider.status(now),
             Err(ProbeError::Unavailable(_))
         ));
         writer
@@ -738,37 +1031,37 @@ mod tests {
                 advertised_cgc: 4,
             })
             .unwrap();
-        assert_eq!(
-            provider.status(now).await.unwrap().earliest_available_slot,
-            100
-        );
+        assert_eq!(provider.status(now).unwrap().earliest_available_slot, 100);
         writer.prune_finalized(130).unwrap();
-        assert_eq!(
-            provider.status(now).await.unwrap().earliest_available_slot,
-            131
-        );
+        assert_eq!(provider.status(now).unwrap().earliest_available_slot, 131);
     }
 
     /// Within `reusing_samples`' age a Status reuses the last good sample, so a Status read
-    /// fresh for every peer costs the reference API one call per age, not one per peer.
+    /// for every peer costs the reference API one sample per age, not one per peer.
     #[tokio::test(start_paused = true)]
     async fn a_recent_sample_is_reused() {
         let chain = sepolia();
         let (before, _) = digest_boundary(&chain);
-        let api = Fixture::default();
+        let api = Arc::new(Fixture::default());
         api.finalize(before - 2, [0xaa; 32], (before - 2) * 32);
         let now = at_epoch(&chain, before);
-        let provider = StatusProvider::new(&api, chain.clone(), DEFAULT_API_TIMEOUT)
-            .reusing_samples(Duration::from_secs(2));
-        provider.status(now).await.unwrap();
+        let provider = StatusProvider::new(Arc::clone(&api), chain.clone(), DEFAULT_API_TIMEOUT)
+            .reusing_samples(Duration::from_secs(3));
+        provider.refresh().await.unwrap();
         api.finalize(before - 1, [0xbb; 32], (before - 1) * 32);
-        let reused = provider.status(now).await.unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        provider.status(now).unwrap();
+        run_refreshes().await;
+        let reused = provider.status(now).unwrap();
         assert_eq!(
             reused.head_root, [0xaa; 32],
             "within its age: no new sample"
         );
-        tokio::time::advance(Duration::from_secs(3)).await;
-        let fresh = provider.status(now).await.unwrap();
+        assert_eq!(api.sampled(), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        provider.status(now).unwrap();
+        run_refreshes().await;
+        let fresh = provider.status(now).unwrap();
         assert_eq!(fresh.head_root, [0xbb; 32], "past its age: sampled again");
     }
 

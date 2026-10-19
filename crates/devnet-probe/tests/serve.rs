@@ -299,6 +299,8 @@ async fn custody_columns_from_gossip_are_served_byte_for_byte() {
         &mut Registry::default(),
     )
     .unwrap();
+    // A Status never waits on the reference API: the first needs a sample.
+    probe.sample_reference().await.unwrap();
     assert_eq!(probe.custody_columns(), custody);
     assert_eq!(probe.custody_group_count(), 4);
     assert_eq!(

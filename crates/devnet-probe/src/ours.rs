@@ -28,9 +28,13 @@ pub struct OurStatus {
     task: AbortHandle,
 }
 
-/// One sample of `provider` as a Status.
+/// One sample of `provider` as a Status: the reference API sampled now (a failed sample keeps
+/// the last good one), then the Status from it.
 async fn sample(provider: &StatusProvider<ProbeApi>, clock: &Clock) -> Result<StatusV2, String> {
-    let response = provider.status(clock()).await.map_err(|e| e.to_string())?;
+    if let Err(e) = provider.refresh().await {
+        tracing::debug!(error = %e, "our Status: no new reference sample");
+    }
+    let response = provider.status(clock()).map_err(|e| e.to_string())?;
     status_from_chain(&response).map_err(|e| e.to_string())
 }
 

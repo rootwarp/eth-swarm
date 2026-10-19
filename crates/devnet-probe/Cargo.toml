@@ -60,4 +60,4 @@ tree_hash.workspace = true
 tempfile = "3"
 # The stalled-stderr test fills a pipe without blocking (`fcntl` O_NONBLOCK).
 rustix = { version = "1", features = ["fs"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "test-util"] }

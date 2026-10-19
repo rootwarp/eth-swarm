@@ -5,7 +5,9 @@
 //! fork digest, the reference node's finalized checkpoint and block, and the slot the custody
 //! columns are served from as `earliest_available_slot`); cl-p2p only maps it
 //! ([`status_from_chain`]). Every call has a deadline ([`DEFAULT_CALL_DEADLINE`]), so a
-//! cl-chain that never answers one costs that call only.
+//! cl-chain that never answers one costs that call only. cl-chain answers at once, from its
+//! last good reference sample and a fresh read of its store, never waiting on the reference
+//! API, so a stalled reference node does not run this deadline out.
 //!
 //! [`ChainStatusSource`] is the swarm's [`StatusSource`]: a peer's Status is judged against
 //! the last good Status ([`ChainStatus::keep_current`] refreshes it), and every Status that

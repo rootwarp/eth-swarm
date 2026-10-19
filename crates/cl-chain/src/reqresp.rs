@@ -842,8 +842,9 @@ pub trait ChainStatus: Send + Sync + 'static {
 }
 
 impl<A: ReferenceApi + 'static> ChainStatus for StatusProvider<A> {
+    /// At once: the provider never waits on the reference API (see [`crate::probe`]).
     fn status(&self) -> StatusLookup<'_> {
-        Box::pin(StatusProvider::status(self, now_ms()))
+        Box::pin(std::future::ready(StatusProvider::status(self, now_ms())))
     }
 }
 

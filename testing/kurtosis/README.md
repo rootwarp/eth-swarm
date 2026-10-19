@@ -761,14 +761,21 @@ host cannot take more of them through neighbouring addresses; on the devnet ever
 the enclave's one Docker network, so with the default they would all share 2 places.
 
 Each run takes a fresh node key, and the custody columns follow it, so `--columns-dir` must
-not exist yet: `serve` refuses an existing one (or a symlink there), creates it 0700, and
-removes it again if the start fails. The probe subscribes to the column subnets of the fork
-digest of its start, so a run never crosses the next digest change (a BPO or fork epoch):
-`--serve-secs` is cut short to end 30 s before it (a pass line says so), and a start closer
-to it than that is refused. Our Status is read from cl-chain afresh for every Status the
-probe sends or answers, so its `earliest_available_slot` is never below what the store serves
-from; when that read fails, no Status goes out (`2: ServerError` to a request). The stored line names how many custody columns were stored and every drop
-reason counted (`not_custody`, `unknown_root`, ...). The reference CLs reach the probe only
+not exist yet: `serve` refuses an existing one (or a symlink there), and a parent directory
+other users can write (one owned by neither us nor root, or group or world writable without
+the sticky bit), creates it 0700, and removes it again if the start fails. The probe
+subscribes to the column subnets of the fork digest of its start, so a run never crosses the
+next digest change (a BPO or fork epoch): `--serve-secs` is cut short to end 30 s before it
+(a pass line says so), counted from the change itself and again once the start is done, a
+start closer to it than that is refused, and the settle wait and the self-check end by then.
+A store whose ingest has not settled 10 s after serving fails the check (`ingest did not
+settle`) instead of being compared. Our Status is read from cl-chain afresh for every Status
+the probe sends or answers, so its `earliest_available_slot` is never below what the store
+serves from; cl-chain answers it at once from its last good reference sample, refreshed in
+the background, so a stalled reference API delays no Status. When that read fails, no Status
+goes out (`2: ServerError` to a request); on a dial it is read again, up to 4 times within
+10 s. The stored line names how many custody columns were stored and every drop reason
+counted (`not_custody`, `unknown_root`, ...). The reference CLs reach the probe only
 through its own dials, since it publishes no record while it serves.
 
 ## Changing a pin

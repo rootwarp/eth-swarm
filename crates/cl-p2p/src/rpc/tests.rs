@@ -750,14 +750,15 @@ impl super::inbound::StatusSource for FreshReads {
 #[tokio::test]
 async fn a_fresh_status_read_is_what_goes_out() {
     // The cached Status is behind the store (earliest 10); each read says what it is now. An
-    // answer and a dial send the fresh read; a read that fails answers `2: ServerError`.
+    // answer and a dial send the fresh read; a read that fails answers `2: ServerError`, and on
+    // a dial is read again after a backoff.
     let at = |earliest_available_slot| StatusV2 {
         earliest_available_slot,
         ..status_with(DIGEST)
     };
     let source = FreshReads {
         cached: at(10),
-        reads: std::sync::Mutex::new(vec![Some(at(50)), None, Some(at(60))]),
+        reads: std::sync::Mutex::new(vec![Some(at(50)), None, None, Some(at(60))]),
     };
     let cfg = ControlConfig {
         status: Arc::new(source),
@@ -776,7 +777,7 @@ async fn a_fresh_status_read_is_what_goes_out() {
         ResponseChunk::Error { code, .. } => assert_eq!(code, ResultCode::ServerError),
         other => panic!("{other:?}"),
     }
-    // A dial sends the next read; the dialed peer echoes it back.
+    // A dial's read fails; the next read is sent, and the dialed peer echoes it back.
     let mut dialed = RawPeer::new(1);
     let addr = dialed.listen().await;
     ours.send(Cmd::Dial(addr));
@@ -791,6 +792,103 @@ async fn a_fresh_status_read_is_what_goes_out() {
         }) => sent,
     };
     assert_eq!(sent.earliest_available_slot, 60);
+}
+
+/// A Status source whose fresh reads read the store's floor when they run, not when they are
+/// asked for, counting them.
+#[derive(Default)]
+struct LiveFloor {
+    floor: AtomicU64,
+    reads: AtomicU64,
+}
+
+struct LiveReads(Arc<LiveFloor>);
+
+impl super::inbound::StatusSource for LiveReads {
+    fn status(&self) -> Option<StatusV2> {
+        Some(status_with(DIGEST))
+    }
+
+    fn fresh(&self) -> Option<super::inbound::StatusLookup> {
+        let live = Arc::clone(&self.0);
+        Some(Box::pin(async move {
+            live.reads.fetch_add(1, Ordering::SeqCst);
+            Some(StatusV2 {
+                earliest_available_slot: live.floor.load(Ordering::SeqCst),
+                ..status_with(DIGEST)
+            })
+        }))
+    }
+}
+
+#[tokio::test]
+async fn a_queued_status_carries_the_floor_of_when_it_goes_out() {
+    // Two dialed peers hold our Status unanswered, so both outbound Status slots are taken and
+    // a third dial's Status waits. The store's floor rises meanwhile: it is what goes out.
+    let live = Arc::new(LiveFloor::default());
+    live.floor.store(100, Ordering::SeqCst);
+    let cfg = ControlConfig {
+        status: Arc::new(LiveReads(Arc::clone(&live))),
+        ..config(status_with(DIGEST), 1, 4)
+    };
+    let mut ours = Node::spawn(cfg).await;
+    let mut holders = Vec::new();
+    for _ in 0..2 {
+        let mut holder = RawPeer::new(1);
+        holder.answer_status = false;
+        let addr = holder.listen().await;
+        ours.send(Cmd::Dial(addr));
+        tokio::time::timeout(WAIT, async {
+            while holder.held.is_empty() {
+                let event = holder.swarm.select_next_some().await;
+                holder.handle(event);
+            }
+        })
+        .await
+        .expect("our Status arrived");
+        holders.push(holder);
+    }
+    let mut third = RawPeer::new(1);
+    let addr = third.listen().await;
+    ours.send(Cmd::Dial(addr));
+    let third_id = third.id();
+    tokio::select! {
+        () = third.run() => unreachable!(),
+        () = ours.next("the third connection", |seen| {
+            matches!(seen, Seen::Established(p) if *p == third_id).then_some(())
+        }) => {}
+    }
+    third.run_for(SETTLE).await;
+    assert_eq!(
+        live.reads.load(Ordering::SeqCst),
+        2,
+        "the waiting Status is not read yet"
+    );
+    live.floor.store(140, Ordering::SeqCst);
+    let mut first = holders.remove(0);
+    let channel = first.held.pop().unwrap();
+    let answer = vec![ReceivedChunk {
+        context: None,
+        chunk: ResponseChunk::Success(Response::Status(status_with(DIGEST))),
+    }];
+    first
+        .swarm
+        .behaviour_mut()
+        .status
+        .send_response(channel, answer)
+        .unwrap();
+    let sent = tokio::select! {
+        () = first.run() => unreachable!(),
+        () = third.run() => unreachable!(),
+        sent = ours.next("the third peer's echo", |seen| match seen {
+            Seen::Control(ControlEvent::Status { peer, status, .. }) if *peer == third_id => {
+                Some(status.clone())
+            }
+            _ => None,
+        }) => sent,
+    };
+    assert_eq!(sent.earliest_available_slot, 140);
+    assert_eq!(live.reads.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]

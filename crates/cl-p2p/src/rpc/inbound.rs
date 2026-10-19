@@ -12,13 +12,19 @@
 //!
 //! # Answers
 //!
-//! - **Status** (`fulu/p2p-interface.md` L538–571): our Status from the [`StatusSource`]; with
-//!   none known yet `2: ServerError` (Status does not specify `3`). A source that reads a fresh
-//!   Status ([`StatusSource::fresh`], the service's from cl-chain) is read once for every Status
-//!   we send or answer, so its `earliest_available_slot` never lags the column store; a read
-//!   that fails sends nothing and answers `2: ServerError`. The peer's Status is then judged
-//!   ([`relevance`], against the last known Status), and [`ControlEvent::StatusAnswered`]
-//!   follows once our Status was written to its stream.
+//! - **Status** (`fulu/p2p-interface.md` L538–571): our Status from the [`StatusSource`]. A
+//!   source that reads a fresh Status ([`StatusSource::fresh`], the service's from cl-chain) is
+//!   read once for every Status we send or answer, so its `earliest_available_slot` never lags
+//!   the column store: an answer's read starts when the request arrives, and ours on a dial
+//!   when its request gets its outbound slot (see [Status](#status)). The answer is
+//!   `2: ServerError` (Status does not specify `3`) when there is no Status of ours:
+//!   - none known yet, from a source that reads none fresh;
+//!   - the fresh read failed or passed its deadline: cl-chain is down or refused it, has no
+//!     reference sample yet (`UNAVAILABLE` before its first), or its column store cannot say
+//!     what it serves from.
+//!
+//!   The peer's Status is then judged ([`relevance`], against the last known Status), and
+//!   [`ControlEvent::StatusAnswered`] follows once our Status was written to its stream.
 //! - **MetaData**: one snapshot of the [`MetaDataSource`] (cl-chain): its `seq_number` and the
 //!   fields it numbers, read together, so a `seq_number` bumped while an answer waits for its
 //!   token never pairs with fields of another one. The probe subscribes to no attestation or
@@ -45,9 +51,16 @@
 //!   `1: InvalidRequest` (L746–747), and one naming none an empty answer. The source's answer
 //!   is held to the request and cut at a whole block ([`super::columns`]): each chunk carries
 //!   the fork digest of its sidecar's slot's epoch as context bytes (L700–702, L766–768). Its
-//!   refusals go out with the fixed message of their code: `3: ResourceUnavailable` below
-//!   `earliest_available_slot` or before `data_column_serve_range` (L652–656), never an empty
-//!   success. No source is `3`; a lookup past [`COLUMN_LOOKUP_TIMEOUT`] is `2: ServerError`.
+//!   refusals go out with the fixed message of their code, never as an empty success:
+//!   - `3: ResourceUnavailable`: below `earliest_available_slot` or before
+//!     `data_column_serve_range` (cl-chain's answer, L652–656); no [`ColumnSource`]; and an
+//!     answer whose first block would not reach a requester reading at the answer's pace
+//!     before its place goes back (its hold: the window and the write deadline, checked at
+//!     the lookup's cut and again by the stream's writer, [`BookedChunks::cut`]), refused whole
+//!     rather than sent in part and reset;
+//!   - `2: ServerError`: a lookup past [`COLUMN_LOOKUP_TIMEOUT`], or one cl-chain failed (its
+//!     store); a full column queue, or no place within the queue wait (see Limits); no
+//!     runtime to run the lookup on.
 //! - A request that broke the wire format: `1: InvalidRequest` (`phase0` L1383–1386), a
 //!   Goodbye's included; a column request whose list is past its SSZ limit too
 //!   (`MAX_REQUEST_BLOCKS_DENEB` identifiers, `NUMBER_OF_COLUMNS` indices).
@@ -125,8 +138,10 @@
 //!   queue. A full queue IGNOREs the request (`queue_dropped_total{queue}`); an IGNOREd Goodbye
 //!   closes the connection at once, since it was going to close anyway. A waiting request whose
 //!   peer has left, or to a peer either side said Goodbye to (but our Goodbye), is dropped when
-//!   its turn comes. Pings take no slot here: at most one per peer, sent at once
-//!   ([`Control::ping`]).
+//!   its turn comes. Our Status from a source read fresh waits there as the intent to send,
+//!   not a value: it is read when its turn comes, and the read holds the slot until the Status
+//!   goes out, or gives it back if the read fails or the peer left meanwhile. Pings take no
+//!   slot here: at most one per peer, sent at once ([`Control::ping`]).
 //!
 //! # Our BlocksByRange requests
 //!
@@ -140,7 +155,12 @@
 //! # Status
 //!
 //! On every connection we dial, our Status goes out first ("the dialing client MUST send a
-//! Status request upon connection", `phase0` L1437). A Status with another fork digest, or a
+//! Status request upon connection", `phase0` L1437), and a reference CL drops a dialer that
+//! sends none, so a fresh read that fails is retried while the connection lasts and neither
+//! side said Goodbye: after [`STATUS_RETRY_BACKOFF`] (500 ms), doubled before each next retry,
+//! at most [`STATUS_SEND_ATTEMPTS`] (4) reads, none starting later than
+//! [`STATUS_HANDSHAKE_DEADLINE`] (10 s) after the dial. Each read bounds its own time, so the
+//! Status goes out at most the deadline and one read after the dial, or not at all (logged). A Status with another fork digest, or a
 //! finalized checkpoint that conflicts with ours, gets `Goodbye(2)` and the connection is closed
 //! once the Goodbye completed (`phase0` L1441–1449); any other is valid
 //! (`p2p_status_valid_peers`). A Status exchange that failed (a timeout, an error chunk) says
@@ -241,6 +261,19 @@ pub const CLOSE_DEADLINE: Duration = Duration::from_secs(5);
 /// still beats the requester's 5 s first-byte deadline.
 pub const COLUMN_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How many fresh reads our Status on a dial gets at most \[est\]: the first and 3 retries
+/// ([`StatusSource::fresh`]; a reference CL drops a dialer that sends no Status).
+pub const STATUS_SEND_ATTEMPTS: u32 = 4;
+
+/// The wait before the first retry of a failed fresh Status read on a dial, doubled before
+/// each next one \[est\]: 500 ms, 1 s, 2 s.
+pub const STATUS_RETRY_BACKOFF: Duration = Duration::from_millis(500);
+
+/// How long after a dial a retry of its Status read may start \[est\]: 10 s, a few failed
+/// reads of cl-chain's 2 s deadline and their backoff. With the reads' own deadline, the last
+/// Status of a dial goes out at most this plus one read after it.
+pub const STATUS_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+
 /// The `queue` label of column requests refused because the queue was full or no place freed
 /// in time.
 pub const COLUMN_QUEUE: &str = "rpc_column_queue";
@@ -273,13 +306,47 @@ pub trait StatusSource: Send + Sync + 'static {
     }
 }
 
-/// A fresh read of our Status ([`StatusSource::fresh`]).
+/// A fresh read of our Status ([`StatusSource::fresh`]). It reads when first polled, not when
+/// made: a Status on a dial is asked for at once and read once it has its outbound slot.
 pub type StatusLookup = Pin<Box<dyn Future<Output = Option<StatusV2>> + Send>>;
+
+/// Where one Status on a dial is in its fresh reads.
+#[derive(Debug, Clone, Copy)]
+struct StatusAttempt {
+    /// The reads that failed so far.
+    failed: u32,
+    /// No retry starts after this: [`STATUS_HANDSHAKE_DEADLINE`] after the dial.
+    deadline: Instant,
+}
+
+impl StatusAttempt {
+    /// The first read of a dial now.
+    fn first() -> Self {
+        Self {
+            failed: 0,
+            deadline: Instant::now() + STATUS_HANDSHAKE_DEADLINE,
+        }
+    }
+
+    /// When the retry after this attempt's failed read is due, if one is within the bound:
+    /// [`STATUS_SEND_ATTEMPTS`] reads, none starting past the deadline.
+    fn retry(self, now: Instant) -> Option<(Instant, Self)> {
+        let failed = self.failed + 1;
+        if failed >= STATUS_SEND_ATTEMPTS {
+            return None;
+        }
+        let due = now + STATUS_RETRY_BACKOFF * 2u32.pow(failed - 1);
+        (due <= self.deadline).then_some((due, Self { failed, ..self }))
+    }
+}
 
 /// What a fresh Status read is for.
 enum StatusUse<E: EthSpec> {
-    /// Our Status to `peer`, on a dial.
-    Send(PeerId),
+    /// Our Status to `peer`, on a dial: the read holds the Status lane's slot.
+    Send {
+        peer: PeerId,
+        attempt: StatusAttempt,
+    },
     /// The answer to `peer`'s Status request.
     Answer {
         peer: PeerId,
@@ -637,12 +704,36 @@ pub struct BlocksTicket(u64);
 pub type BlocksOutcome<E> = Result<Vec<ReceivedChunk<E>>, OutboundError>;
 
 /// One of our requests, waiting for a slot of its protocol or holding one.
-#[derive(Debug)]
 struct Outgoing {
     peer: PeerId,
-    request: Request,
+    request: Pending,
     /// The ticket of a BlocksByRange request, for its outcome.
     ticket: Option<BlocksTicket>,
+}
+
+/// What one of our requests sends once it has its slot.
+enum Pending {
+    /// This request.
+    Request(Request),
+    /// Our Status, from this read, made once the request has its slot: what the store serves
+    /// from when it goes out, not when it was queued.
+    FreshStatus {
+        read: StatusLookup,
+        attempt: StatusAttempt,
+    },
+}
+
+impl Pending {
+    fn protocol(&self) -> Protocol {
+        match self {
+            Self::Request(request) => request.protocol(),
+            Self::FreshStatus { .. } => Protocol::StatusV2,
+        }
+    }
+
+    fn is_goodbye(&self) -> bool {
+        matches!(self, Self::Request(Request::Goodbye(_)))
+    }
 }
 
 /// What we know of one connected peer.
@@ -672,6 +763,8 @@ struct PeerState {
     ping: Option<OutboundRequestId>,
     /// When our next Ping to it is due: an interval after the last one ended.
     next_ping: Instant,
+    /// The retry of our Status after a failed fresh read on a dial, and when it is due.
+    status_retry: Option<(Instant, StatusAttempt)>,
 }
 
 impl PeerState {
@@ -908,14 +1001,14 @@ impl<E: EthSpec> Control<E> {
     fn submit(&mut self, peer: PeerId, request: Request) -> bool {
         self.submit_outgoing(Outgoing {
             peer,
-            request,
+            request: Pending::Request(request),
             ticket: None,
         })
     }
 
     fn submit_outgoing(&mut self, outgoing: Outgoing) -> bool {
         let protocol = outgoing.request.protocol();
-        if self.leaving(outgoing.peer) && !matches!(outgoing.request, Request::Goodbye(_)) {
+        if self.leaving(outgoing.peer) && !outgoing.request.is_goodbye() {
             tracing::debug!(peer = %outgoing.peer, %protocol, "after a Goodbye: request not sent");
             return false;
         }
@@ -927,7 +1020,7 @@ impl<E: EthSpec> Control<E> {
             Admit::Queued => true,
             Admit::Ignored(Outgoing { peer, request, .. }) => {
                 tracing::debug!(%peer, %protocol, "outbound queue full: request ignored");
-                if let Request::Goodbye(_) = request {
+                if request.is_goodbye() {
                     self.close(peer);
                 }
                 false
@@ -938,13 +1031,28 @@ impl<E: EthSpec> Control<E> {
         taken
     }
 
-    /// Sends `outgoing`, which holds a slot of its protocol.
+    /// Sends `outgoing`, which holds a slot of its protocol; a Status read fresh starts its
+    /// read now, holding the slot until it is sent ([`Self::poll_status_reads`]).
     fn dispatch(&mut self, outgoing: Outgoing) {
         let Outgoing {
             peer,
             request,
             ticket,
         } = outgoing;
+        let request = match request {
+            Pending::Request(request) => request,
+            Pending::FreshStatus { read, attempt } => {
+                let to = StatusUse::Send { peer, attempt };
+                self.status_reads
+                    .push(Box::pin(async move { (to, read.await) }));
+                return;
+            }
+        };
+        self.send_now(peer, request, ticket);
+    }
+
+    /// Sends `request` to `peer` in the slot of its protocol it holds.
+    fn send_now(&mut self, peer: PeerId, request: Request, ticket: Option<BlocksTicket>) {
         let protocol = request.protocol();
         let goodbye = matches!(request, Request::Goodbye(_));
         let id = self.inner.of(protocol).send_request(&peer, request.into());
@@ -969,17 +1077,25 @@ impl<E: EthSpec> Control<E> {
                 .set_outbound_inflight(protocol, self.pings_in_flight());
             return;
         }
+        self.release(protocol);
+    }
+
+    /// A slot of `protocol` is free again: it goes to the next waiting request of a connected
+    /// peer.
+    fn release(&mut self, protocol: Protocol) {
         while let Some(next) = self.outbound.release(protocol) {
             let peer = next.peer;
             let refusal = match self.peers.get(&peer) {
                 // Nothing but our Goodbye goes out once either side said Goodbye.
-                Some(state) if state.leaving() && !matches!(next.request, Request::Goodbye(_)) => {
+                Some(state) if state.leaving() && !next.request.is_goodbye() => {
                     tracing::debug!(%peer, %protocol, "after our Goodbye: the waiting request is dropped");
                     Some(OutboundError::Disconnected)
                 }
                 // The peer's Status may have changed while the request waited.
                 Some(_) => match &next.request {
-                    Request::BlocksByRange(range) => self.servable(peer, range).err(),
+                    Pending::Request(Request::BlocksByRange(range)) => {
+                        self.servable(peer, range).err()
+                    }
                     _ => None,
                 },
                 None => {
@@ -1028,7 +1144,7 @@ impl<E: EthSpec> Control<E> {
         self.blocks.insert(ticket, None);
         let outgoing = Outgoing {
             peer,
-            request: Request::BlocksByRange(request),
+            request: Pending::Request(Request::BlocksByRange(request)),
             ticket: Some(ticket),
         };
         if self.submit_outgoing(outgoing) {
@@ -1110,12 +1226,20 @@ impl<E: EthSpec> Control<E> {
 
     /// Sends our Status to `peer`; `false` (and nothing sent) while we have none, or if the
     /// outbound queue IGNOREd it. A source that reads a fresh Status ([`StatusSource::fresh`])
-    /// sends it once the read ends: `true` means it was asked for.
+    /// is read once the request has its slot, and sent once the read ends: `true` means it was
+    /// asked for. A read that fails is retried within the bound of
+    /// [`STATUS_SEND_ATTEMPTS`] and [`STATUS_HANDSHAKE_DEADLINE`] while the peer stays.
     pub fn send_status(&mut self, peer: PeerId) -> bool {
+        self.send_status_attempt(peer, StatusAttempt::first())
+    }
+
+    fn send_status_attempt(&mut self, peer: PeerId, attempt: StatusAttempt) -> bool {
         if let Some(read) = self.cfg.status.fresh() {
-            self.status_reads
-                .push(Box::pin(async move { (StatusUse::Send(peer), read.await) }));
-            return true;
+            return self.submit_outgoing(Outgoing {
+                peer,
+                request: Pending::FreshStatus { read, attempt },
+                ticket: None,
+            });
         }
         let Some(ours) = self.cfg.status.status() else {
             tracing::debug!(%peer, "no Status of ours yet: none sent");
@@ -1220,6 +1344,7 @@ impl<E: EthSpec> Control<E> {
             let now = Instant::now();
             let mut closes = Vec::new();
             let mut pings = Vec::new();
+            let mut statuses = Vec::new();
             for (peer, state) in &mut self.peers {
                 if state.close_at.is_some_and(|at| at <= now) {
                     state.close_at = None;
@@ -1228,6 +1353,9 @@ impl<E: EthSpec> Control<E> {
                 if waiting(state) && state.next_ping <= now {
                     pings.push(*peer);
                 }
+                if let Some((_, attempt)) = state.status_retry.take_if(|(due, _)| *due <= now) {
+                    statuses.push((*peer, attempt));
+                }
             }
             for peer in closes {
                 self.close(peer);
@@ -1235,10 +1363,19 @@ impl<E: EthSpec> Control<E> {
             for peer in pings {
                 self.ping(peer);
             }
+            for (peer, attempt) in statuses {
+                self.send_status_attempt(peer, attempt);
+            }
             let next = self
                 .peers
                 .values()
-                .flat_map(|state| [state.close_at, waiting(state).then_some(state.next_ping)])
+                .flat_map(|state| {
+                    [
+                        state.close_at,
+                        waiting(state).then_some(state.next_ping),
+                        state.status_retry.map(|(due, _)| due),
+                    ]
+                })
                 .flatten()
                 .min();
             let Some(next) = next else {
@@ -1635,16 +1772,51 @@ impl<E: EthSpec> Control<E> {
         }));
     }
 
-    /// Sends or answers with every fresh Status read that ended.
-    fn poll_status_reads(&mut self, cx: &mut Context<'_>) {
+    /// Schedules the retry of our Status to `peer` after `attempt`'s read failed, within the
+    /// bound ([`StatusAttempt::retry`]), while the peer stays and neither side said Goodbye;
+    /// `true` if it did.
+    fn retry_status(&mut self, peer: PeerId, attempt: StatusAttempt) -> bool {
+        let Some(state) = self.peers.get_mut(&peer).filter(|s| !s.leaving()) else {
+            tracing::debug!(%peer, "no fresh Status of ours, and the peer is gone: none sent");
+            return false;
+        };
+        match attempt.retry(Instant::now()) {
+            Some(retry) => {
+                tracing::debug!(%peer, failed = retry.1.failed, "no fresh Status of ours: retrying");
+                state.status_retry = Some(retry);
+                true
+            }
+            None => {
+                tracing::warn!(
+                    %peer,
+                    reads = attempt.failed + 1,
+                    "no fresh Status of ours within the handshake bound: none sent"
+                );
+                false
+            }
+        }
+    }
+
+    /// Sends or answers with every fresh Status read that ended; `true` if a retry was
+    /// scheduled, whose timer is still to be set ([`Self::poll_timers`]).
+    fn poll_status_reads(&mut self, cx: &mut Context<'_>) -> bool {
+        let mut retrying = false;
         while let Poll::Ready(Some((to, ours))) = self.status_reads.poll_next_unpin(cx) {
             match to {
-                StatusUse::Send(peer) => match ours {
-                    Some(ours) if self.peers.contains_key(&peer) => {
-                        self.submit(peer, Request::Status(ours));
+                // The read held the Status lane's slot: the Status goes out in it, or it is
+                // given back.
+                StatusUse::Send { peer, attempt } => match ours {
+                    Some(ours) if self.peers.get(&peer).is_some_and(|s| !s.leaving()) => {
+                        self.send_now(peer, Request::Status(ours), None);
                     }
-                    Some(_) => {}
-                    None => tracing::debug!(%peer, "no fresh Status of ours: none sent"),
+                    Some(_) => {
+                        tracing::debug!(%peer, "gone or leaving during our Status read: none sent");
+                        self.release(Protocol::StatusV2);
+                    }
+                    None => {
+                        self.release(Protocol::StatusV2);
+                        retrying |= self.retry_status(peer, attempt);
+                    }
                 },
                 StatusUse::Answer {
                     peer,
@@ -1665,6 +1837,7 @@ impl<E: EthSpec> Control<E> {
                 }
             }
         }
+        retrying
     }
 
     /// Sends every column answer whose lookup ended, at its booked tokens, holding its place.
@@ -2025,6 +2198,7 @@ impl<E: EthSpec> NetworkBehaviour for Control<E> {
                         close_at: None,
                         ping: None,
                         next_ping: Instant::now() + self.cfg.ping_interval,
+                        status_retry: None,
                     },
                 );
                 if direction == Direction::Outbound {
@@ -2074,7 +2248,10 @@ impl<E: EthSpec> NetworkBehaviour for Control<E> {
             // Lookups the pump starts are polled right after, so their tasks can wake us.
             self.pump_columns(cx);
             self.poll_lookups(cx);
-            self.poll_status_reads(cx);
+            if self.poll_status_reads(cx) {
+                // A retry is due later: its timer is set on the next turn.
+                continue;
+            }
             if let Some(next) = self.pending.pop_front() {
                 return Poll::Ready(next);
             }
@@ -3075,6 +3252,206 @@ mod tests {
             ),
             Err(RangeError::Outbound(OutboundError::Disconnected))
         ));
+    }
+
+    /// A Status source read fresh, as the service's from cl-chain: each read runs when first
+    /// polled, takes `delay`, and reads the floor then; the next `failing` reads fail.
+    #[derive(Default)]
+    struct LiveFloor {
+        floor: AtomicU64,
+        failing: AtomicU64,
+        delay_ms: AtomicU64,
+        /// The floor each good read returned, in order; a failed read is `None`.
+        reads: std::sync::Mutex<Vec<Option<u64>>>,
+    }
+
+    struct LiveReads(Arc<LiveFloor>);
+
+    impl StatusSource for LiveReads {
+        fn status(&self) -> Option<StatusV2> {
+            Some(testkit::status())
+        }
+
+        fn fresh(&self) -> Option<StatusLookup> {
+            let live = Arc::clone(&self.0);
+            Some(Box::pin(async move {
+                let delay = live.delay_ms.load(Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                // One task polls the reads at a time: a load and a store suffice.
+                let failing = live.failing.load(Ordering::SeqCst);
+                let failed = failing > 0;
+                if failed {
+                    live.failing.store(failing - 1, Ordering::SeqCst);
+                }
+                let read = (!failed).then(|| live.floor.load(Ordering::SeqCst));
+                live.reads.lock().unwrap().push(read);
+                read.map(|earliest_available_slot| StatusV2 {
+                    earliest_available_slot,
+                    ..testkit::status()
+                })
+            }))
+        }
+    }
+
+    impl LiveFloor {
+        fn reads(&self) -> Vec<Option<u64>> {
+            self.reads.lock().unwrap().clone()
+        }
+    }
+
+    /// A Control reading its Status fresh from `live`, with `n` peers connected.
+    fn control_reading(
+        live: &Arc<LiveFloor>,
+        n: usize,
+    ) -> (Control<consensus_types::Minimal>, RpcMetrics, Vec<PeerId>) {
+        let cfg = ControlConfig {
+            status: Arc::new(LiveReads(Arc::clone(live))),
+            ..crate::testkit::control_config(None)
+        };
+        control_with(cfg, n)
+    }
+
+    fn statuses_in_flight(control: &Control<consensus_types::Minimal>) -> Vec<OutboundRequestId> {
+        control
+            .in_flight
+            .iter()
+            .filter(|(p, _)| *p == Protocol::StatusV2)
+            .map(|(_, id)| *id)
+            .collect()
+    }
+
+    /// A Status waiting for its slot is read when it gets the slot, not when it was asked
+    /// for: a floor that rose meanwhile is what it carries.
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_status_is_read_when_it_gets_its_slot() {
+        let live = Arc::new(LiveFloor::default());
+        live.floor.store(100, Ordering::SeqCst);
+        let (mut control, metrics, peers) = control_reading(&live, 3);
+        for peer in &peers {
+            assert!(control.send_status(*peer));
+        }
+        poll_once(&mut control);
+        assert_eq!(
+            live.reads(),
+            [Some(100), Some(100)],
+            "the third waits, unread"
+        );
+        assert_eq!(statuses_in_flight(&control).len(), 2);
+        assert_eq!(metrics.outbound_inflight(Protocol::StatusV2), 2);
+        live.floor.store(140, Ordering::SeqCst);
+        let first = statuses_in_flight(&control)[0];
+        control.on_outbound_failure(
+            peers[0],
+            Protocol::StatusV2,
+            first,
+            OutboundFailure::Timeout,
+        );
+        poll_once(&mut control);
+        assert_eq!(live.reads(), [Some(100), Some(100), Some(140)]);
+        assert_eq!(statuses_in_flight(&control).len(), 2);
+        assert_eq!(control.outbound.in_flight(Protocol::StatusV2), 2);
+        // While a read runs it holds the slot; a peer gone by its end gives it back.
+        live.delay_ms.store(100, Ordering::SeqCst);
+        for id in statuses_in_flight(&control) {
+            control.on_outbound_failure(peers[1], Protocol::StatusV2, id, OutboundFailure::Timeout);
+        }
+        assert!(control.send_status(peers[1]));
+        poll_once(&mut control);
+        assert_eq!(control.outbound.in_flight(Protocol::StatusV2), 1);
+        connection(&mut control, peers[1], 1, false);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        poll_once(&mut control);
+        assert_eq!(live.reads().len(), 4);
+        assert!(
+            statuses_in_flight(&control).is_empty(),
+            "none sent to a peer gone"
+        );
+        assert_eq!(control.outbound.in_flight(Protocol::StatusV2), 0);
+        assert_eq!(metrics.outbound_inflight(Protocol::StatusV2), 0);
+    }
+
+    /// A failed fresh read on a dial is retried after a backoff, the slot free meanwhile, and
+    /// the Status goes out once a read succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_status_read_on_a_dial_is_retried() {
+        let live = Arc::new(LiveFloor::default());
+        live.floor.store(100, Ordering::SeqCst);
+        live.failing.store(1, Ordering::SeqCst);
+        let (mut control, _, peers) = control_reading(&live, 1);
+        assert!(control.send_status(peers[0]));
+        poll_once(&mut control);
+        assert_eq!(live.reads(), [None]);
+        assert!(statuses_in_flight(&control).is_empty());
+        assert_eq!(
+            control.outbound.in_flight(Protocol::StatusV2),
+            0,
+            "free meanwhile"
+        );
+        tokio::time::advance(STATUS_RETRY_BACKOFF - Duration::from_millis(1)).await;
+        poll_once(&mut control);
+        assert_eq!(live.reads(), [None], "not before the backoff");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        poll_once(&mut control);
+        assert_eq!(live.reads(), [None, Some(100)]);
+        assert_eq!(statuses_in_flight(&control).len(), 1, "sent");
+        assert!(control.peers[&peers[0]].status_retry.is_none());
+    }
+
+    /// Reads that keep failing give up after [`STATUS_SEND_ATTEMPTS`], or when the next
+    /// would start past [`STATUS_HANDSHAKE_DEADLINE`] after the dial; a peer that leaves or
+    /// gets our Goodbye stops them.
+    #[tokio::test(start_paused = true)]
+    async fn repeated_failed_status_reads_give_up_after_the_bound() {
+        // Instant reads: the attempt bound, at 0, 0.5, 1.5 and 3.5 s.
+        let live = Arc::new(LiveFloor::default());
+        live.failing.store(u64::MAX, Ordering::SeqCst);
+        let (mut control, _, peers) = control_reading(&live, 3);
+        assert!(control.send_status(peers[0]));
+        let start = Instant::now();
+        let mut at = Vec::new();
+        for _ in 0..300 {
+            poll_once(&mut control);
+            if live.reads().len() > at.len() {
+                at.push((Instant::now() - start).as_millis());
+            }
+            tokio::time::advance(Duration::from_millis(50)).await;
+        }
+        assert_eq!(at, [0, 500, 1_500, 3_500]);
+        assert_eq!(STATUS_SEND_ATTEMPTS, 4);
+        assert!(statuses_in_flight(&control).is_empty());
+        assert!(control.peers[&peers[0]].status_retry.is_none());
+        assert_eq!(control.outbound.in_flight(Protocol::StatusV2), 0);
+
+        // Slow reads (4 s each): the deadline bounds them first. The third read starts at
+        // 9.5 s; the next would start at 15.5 s, past 10 s.
+        let slow = Arc::new(LiveFloor::default());
+        slow.failing.store(u64::MAX, Ordering::SeqCst);
+        slow.delay_ms.store(4_000, Ordering::SeqCst);
+        let (mut control, _, peers) = control_reading(&slow, 1);
+        assert!(control.send_status(peers[0]));
+        for _ in 0..600 {
+            poll_once(&mut control);
+            tokio::time::advance(Duration::from_millis(50)).await;
+        }
+        assert_eq!(slow.reads().len(), 3);
+        assert!(control.peers[&peers[0]].status_retry.is_none());
+
+        // A peer that leaves, or that we say Goodbye to, during the backoff: no more reads.
+        let gone = Arc::new(LiveFloor::default());
+        gone.failing.store(u64::MAX, Ordering::SeqCst);
+        let (mut control, _, peers) = control_reading(&gone, 2);
+        assert!(control.send_status(peers[0]));
+        assert!(control.send_status(peers[1]));
+        poll_once(&mut control);
+        assert_eq!(gone.reads().len(), 2);
+        connection(&mut control, peers[0], 0, false);
+        control.goodbye(peers[1], GOODBYE_CLIENT_SHUTDOWN);
+        for _ in 0..100 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            poll_once(&mut control);
+        }
+        assert_eq!(gone.reads().len(), 2);
+        assert!(!control.send_status(peers[1]), "after our Goodbye");
     }
 
     #[tokio::test(start_paused = true)]
