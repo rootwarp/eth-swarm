@@ -160,14 +160,15 @@ cat > "$stubs/sleep" <<'SH'
 #!/usr/bin/env bash
 # sleep stub: advances the fake clock by $1 seconds and returns at once; a fraction of a second (a
 # fast poll) really sleeps and leaves the clock alone. With $STUB_DIR/sleep.block, the first call
-# longer than 1 s (the wait for genesis, not a 1 s poll) removes that file and really sleeps 30 s
-# (its pid in $STUB_DIR/sleep.pid).
+# longer than 1 s (the wait for genesis, not a 1 s poll) removes that file and really sleeps for
+# the seconds it holds (empty: 30), the fake clock left alone (its pid in $STUB_DIR/sleep.pid).
 printf '%s\n' "$1" >> "$STUB_DIR/sleep.log"
 if [[ $1 == *.* ]]; then exec /bin/sleep "$1"; fi
 if [[ -f $STUB_DIR/sleep.block ]] && (($1 > 1)); then
+  real=$(cat "$STUB_DIR/sleep.block")
   rm -f "$STUB_DIR/sleep.block"
   echo $$ > "$STUB_DIR/sleep.pid"
-  exec /bin/sleep 30
+  exec /bin/sleep "${real:-30}"
 fi
 echo $(( $(cat "$STUB_DIR/now") + $1 )) > "$STUB_DIR/now"
 SH
@@ -194,6 +195,10 @@ cat > "$stubs/ps" <<'SH'
 #     process and for `-p` that pid. A listing that shows ppids then leaves out each real process
 #     whose ppid is 1, so no walk down from a fake pid 1 reaches a real process.
 #   $STUB_DIR/ps.fail-A: a listing of every process fails, with no output.
+#   $STUB_DIR/ps.fail-A.after-kill (a number N): once $STUB_DIR/kill.log exists (a kill_logged
+#     copy has signalled), the next N listings of every process fail, with no output.
+#   $STUB_DIR/ps.A.count (a counter the test starts at 0): each listing of every process counts
+#     itself there, and the n-th first runs $STUB_DIR/ps.before-A.<n> (shell source) if it exists.
 #   $STUB_DIR/ps.locale: unless LC_ALL is C or POSIX, lstart comes out in seven words, as macOS
 #     words it under ko_KR.UTF-8 (the real ps runs with LC_ALL=C).
 #   An exported COLUMNS cuts each line of a listing that shows the command to that many
@@ -225,7 +230,16 @@ done
 if ((lstart && ppid > lstart)); then ppid=$((ppid + 4)); fi
 if [[ -f $STUB_DIR/ps.locale && ${LC_ALL:-} != C && ${LC_ALL:-} != POSIX ]] && ((lstart)); then sim=1; fi
 if ((cmd == 0 || ww)); then cols=''; fi
+if ((all)) && [[ -f $STUB_DIR/ps.A.count ]]; then
+  n=$(( $(cat "$STUB_DIR/ps.A.count") + 1 ))
+  echo "$n" > "$STUB_DIR/ps.A.count"
+  if [[ -f $STUB_DIR/ps.before-A.$n ]]; then bash "$STUB_DIR/ps.before-A.$n"; fi
+fi
 if ((all)) && [[ -f $STUB_DIR/ps.fail-A ]]; then exit 1; fi
+if ((all)) && [[ -f $STUB_DIR/ps.fail-A.after-kill && -f $STUB_DIR/kill.log ]]; then
+  n=$(cat "$STUB_DIR/ps.fail-A.after-kill")
+  if ((n > 0)); then echo $((n - 1)) > "$STUB_DIR/ps.fail-A.after-kill"; exit 1; fi
+fi
 if [[ ! -f $STUB_DIR/ps.reuse && ! -f $STUB_DIR/ps.fake && -z $cols ]] && ((sim == 0)); then
   exec "$real" "$@"
 fi
@@ -865,7 +879,9 @@ run_env=()
 # (SIGTTOU). The check's tee writes to the terminal from the check's own process group, so the run
 # must not stop there: on a pseudo-terminal with tostop set it must finish (exit 0, the check's
 # output on the terminal) within 20 s. pty_run kills every process of the run's session at the
-# limit.
+# limit. The run goes once with the bash on PATH and once with /bin/bash when that is another
+# bash (bash 3.2 on macOS): the script and its check wrapper run on the bash that started them, and
+# bash 3.2 sets SIGTTOU back to its default in every child it forks, even one ignored on entry.
 pty_run='
 import os, pty, select, signal, subprocess, sys, termios, time
 limit = float(sys.argv[1])
@@ -913,14 +929,19 @@ while True:
 sys.stdout.write(out.decode(errors="replace").replace("\r\n", "\n"))
 sys.exit(os.waitstatus_to_exitcode(status))
 '
-base
-rc=0
-out=$(PATH="$stubs:$PATH" python3 -I -c "$pty_run" 20 bash "$script" 2>&1) || rc=$?
-if ((rc == 0)) && grep -q '^pair verdict: STUB' <<<"$out" && grep -q '^run-pair: exit 0 ' <<<"$out"; then
-  ok "on a terminal with tostop, the check's output does not stop the run"
-else
-  bad "on a terminal with tostop, the check's output does not stop the run (exit $rc)" "$out"
-fi
+tostop_bashes=("$(command -v bash)")
+if [[ -x /bin/bash && ! /bin/bash -ef ${tostop_bashes[0]} ]]; then tostop_bashes+=(/bin/bash); fi
+for sh in "${tostop_bashes[@]}"; do
+  base
+  rc=0
+  version=$("$sh" -c 'echo "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"')
+  out=$(PATH="$stubs:$PATH" python3 -I -c "$pty_run" 20 "$sh" "$script" 2>&1) || rc=$?
+  if ((rc == 0)) && grep -q '^pair verdict: STUB' <<<"$out" && grep -q '^run-pair: exit 0 ' <<<"$out"; then
+    ok "on a terminal with tostop, the check's output does not stop the run ($sh, bash $version)"
+  else
+    bad "on a terminal with tostop, the check's output does not stop the run ($sh, bash $version; exit $rc)" "$out"
+  fi
+done
 
 # --- the check's exit code ------------------------------------------------------------------------
 
@@ -955,7 +976,8 @@ run 1 "a failed teardown does not hide a failed check" "^warning: kurtosis encla
 #   10 s) until the shell condition holds, and sends the signal. Target `group` sends it to the
 #   whole group (a Ctrl-C), `script` to the script alone (a kill), and `piped` runs
 #   `run-pair.sh | cat` (cat writing bg.piped, apart from the launcher's bg.out) and signals the
-#   group, so the reader dies and the script's stdout is a broken pipe. Wants the exit code within
+#   group, so the reader dies and the script's stdout is a broken pipe; `none` sends no signal (the
+#   ready condition acts on the run, and the signal is only a placeholder). Wants the exit code within
 #   20 s of the signal (the stubs block for 30-60 s, so a hang still shows), and every process in
 #   the pid files gone within 5 s more (a survivor is reported, then killed). A watchdog KILLs the
 #   script's group 40 s after the signal. The NAME=value entries of run_env go into the
@@ -989,7 +1011,9 @@ os.execvp(sys.argv[1], sys.argv[1:])' bash -c "$cmd" "$script" "$tmp/bg.rc" "$tm
   done
   ( /bin/sleep 40; kill -KILL -- -"$pid" ) >/dev/null 2>&1 &
   watchdog=$!
-  if [[ $target == script ]]; then
+  if [[ $target == none ]]; then
+    :
+  elif [[ $target == script ]]; then
     kill -"$sig" "$(pgrep -P "$pid")" || true   # none: the script has already ended
   else
     kill -"$sig" -- -"$pid"
@@ -1107,6 +1131,26 @@ interrupt 143 "TERM with the check's job stopped (SIGSTOP) exits 143 and stops t
   TERM script check.pid
 run_env=()
 torn_down "a run whose check was stopped is torn down"
+
+# The wait for genesis polls the job table, so a genesis sleep stopped with SIGSTOP is no failure
+# (with job control, `wait` would return at once with 128 + the signal, and errexit would end the
+# run): a sleep continued later ends as it would have, and one still stopped at T is stopped, and
+# the check runs. The second run moves the fake clock to T while the sleep is stopped.
+base
+echo 2 > "$STUB_DIR/sleep.block"
+run_env=(SHELLOPTS=monitor)
+interrupt 0 "a genesis sleep stopped (SIGSTOP), then continued, does not end the run" \
+  '[[ -f $STUB_DIR/sleep.pid ]] && kill -STOP "$(cat "$STUB_DIR/sleep.pid")" && /bin/sleep 0.5 && kill -CONT "$(cat "$STUB_DIR/sleep.pid")"' \
+  TERM none sleep.pid
+logged "the check runs after a genesis sleep that was stopped and continued" check "^--pair .* @[0-9]+$"
+base
+touch "$STUB_DIR/sleep.block"
+interrupt 0 "a genesis sleep still stopped (SIGSTOP) at genesis is stopped, and the check runs" \
+  '[[ -f $STUB_DIR/sleep.pid ]] && kill -STOP "$(cat "$STUB_DIR/sleep.pid")" && echo "$T" > "$STUB_DIR/now"' \
+  TERM none sleep.pid
+run_env=()
+logged "the check runs at genesis after a genesis sleep that stayed stopped" check "^--pair .* @$T$"
+torn_down "a run whose genesis sleep stayed stopped is torn down"
 
 # A process list that names pid 1 as a job's descendant (as the ps stub does here) must never turn
 # into a signal to pid 1 or to group 1 (kill -- -1 reaches every process of the user).
@@ -1342,17 +1386,66 @@ os.execvp(sys.argv[1], sys.argv[1:])' bash -c 'echo $$ > "$1/job-groups"; '"$how
   fi
 done
 
-# A process list that cannot be read proves nothing: once TERM is sent, a failed `ps -A` is an
-# exit 2, never "nothing was left for KILL".
+# A process list that cannot be read proves nothing: once TERM is sent, a `ps -A` that keeps
+# failing is an exit 2, never "nothing was left for KILL", and the message points at a check by
+# hand: a second run would not find a group whose leader the TERM ended.
 base
 rm -rf "$killed"; mkdir -p "$killed"
 group kr.blind "ethswarm-gloas-a-$killed_run"
 cp "$STUB_DIR/kr.blind.pid" "$killed/job-groups"
-touch "$STUB_DIR/ps.fail-A"
-helper_run 2 "stop-killed-run.sh exits 2 when the process list cannot be read" \
-  '^ERROR: .*process list' '!nothing was left for KILL' -- "$killed" "$killed_run"
-rm -f "$STUB_DIR/ps.fail-A"
+echo 1000 > "$STUB_DIR/ps.fail-A.after-kill"
+helper_run 2 "stop-killed-run.sh exits 2 when the process list cannot be read after the TERM" \
+  '^ERROR: .*process list' 'by hand' '!run stop-killed-run.sh again' '!nothing was left for KILL' -- "$killed" "$killed_run"
+logged "the groups got TERM before the process list failed" kill "^-TERM -- -$(cat "$STUB_DIR/kr.blind.pid")$"
+rm -f "$STUB_DIR/ps.fail-A.after-kill"
 end_groups kr.blind.pid
+
+# A process list that fails once after the TERM is read again in the same run: the KILL still
+# reaches a TERM-ignoring child whose leader the TERM ended (a second run would not find it).
+base
+rm -rf "$killed"; mkdir -p "$killed"
+group kr.retry "ethswarm-gloas-a-$killed_run" stubborn
+kt=$(cat "$STUB_DIR/kr.retry.pid")
+echo "$kt" > "$killed/job-groups"
+echo 1 > "$STUB_DIR/ps.fail-A.after-kill"
+helper_run 0 "stop-killed-run.sh reads a process list that failed once again, and goes on" \
+  "^sent KILL to $kt$" -- "$killed" "$killed_run"
+reaped "after a failed process list, a TERM-ignoring child still gets the KILL" kr.retry.child.pid
+rm -f "$STUB_DIR/ps.fail-A.after-kill"
+end_groups kr.retry.pid
+
+# A process list that cannot be read when the groups are looked for proves nothing either: an
+# exit 2, never "no recorded group ... is left", and nothing is signalled.
+base
+rm -rf "$killed"; mkdir -p "$killed"
+group kr.unread "ethswarm-gloas-a-$killed_run"
+cp "$STUB_DIR/kr.unread.pid" "$killed/job-groups"
+touch "$STUB_DIR/ps.fail-A"
+helper_run 2 "stop-killed-run.sh exits 2 when the process list cannot be read to find the groups" \
+  '^ERROR: .*process list' '!no recorded group' -- "$killed" "$killed_run"
+rm -f "$STUB_DIR/ps.fail-A"
+if [[ ! -e $STUB_DIR/kill.log ]] && alive kr.unread.pid; then ok "an unread process list signals nothing"; else bad "an unread process list signals nothing" "$(cat "$STUB_DIR/kill.log" 2>&1)"; fi
+end_groups kr.unread.pid
+
+# The TERM goes only to a group that still holds its id just before it: a leader that ended after
+# it was found, its pid then taken by another process (ps.reuse) with another start time, gets no
+# TERM. The ps stub ends the leader just before the second listing of every process (the first
+# finds the groups).
+base
+rm -rf "$killed"; mkdir -p "$killed"
+group kr.swap "ethswarm-gloas-a-$killed_run"
+kx=$(cat "$STUB_DIR/kr.swap.pid")
+echo "$kx" > "$killed/job-groups"
+echo kr.swap.pid > "$STUB_DIR/ps.reuse"
+echo 0 > "$STUB_DIR/ps.A.count"
+printf '%s\n' "kill -KILL -- -$kx 2>/dev/null || true" \
+  "for ((i = 0; i < 50; i++)); do if ! /bin/ps -p $kx >/dev/null 2>&1; then break; fi; /bin/sleep 0.1; done" \
+  > "$STUB_DIR/ps.before-A.2"
+helper_run 0 "stop-killed-run.sh sends no TERM to a group whose leader ended after it was found" \
+  "^group $kx:" -- "$killed" "$killed_run"
+logged "a group whose id another process took before the TERM gets no signal" kill "!-- -$kx$"
+rm -f "$STUB_DIR/ps.reuse" "$STUB_DIR/ps.A.count" "$STUB_DIR/ps.before-A.2"
+end_groups kr.swap.pid
 
 # The run is <T>-<pid> exactly (an epoch second and a pid of 2 or more), so no short or odd
 # argument matches the names of other runs.

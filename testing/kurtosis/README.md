@@ -313,35 +313,37 @@ launches. Each step fails closed:
    defaults, add up to about 52 min on the two enclaves); one that runs longer is stopped, exit
    2. On 2026-10-19 (with `--attempts 80`) the check ran from T+31 s to T+252 s and finality
    passed on poll 19, inside the default 40 polls, 12 s apart.
-5. **Teardown.** An EXIT/INT/TERM/HUP/PIPE trap, set before the first step, stops the
-   background jobs on every exit and, from the launches on, removes the pair, an interrupt while
-   waiting for genesis or finality and a closed terminal or output pipe included (exit 130 on
-   INT, 143 on TERM, 129 on HUP, 141 on PIPE). A signal that lands while a job is starting takes
-   effect once the job is recorded, so the teardown always finds it. Every pull, `kurtosis`
-   call, `docker stats`, the wait for genesis and the check run as background jobs, each the
-   leader of its own process group; stopping one is TERM to the group and to every descendant,
-   then KILL 10 s later to whatever still runs, a process that ignores TERM or that left the
-   process tree included. When a job's leader ends, whatever is left in its group gets the same
-   TERM, then KILL, so nothing a step started outlives it; each launch is swept as soon as it
-   ends, while the other may still run. Whether a job still runs is what bash saw of it (its job
-   table), never a lookup of its pid, which another process may take once the job has ended. A
-   job stopped with SIGSTOP counts as running: it gets the TERM, then CONT so the TERM lands, and
-   the KILL if it outlives the 10 s. No pid or group below 2 (`kill -- -1` reaches every process
-   the user owns) and never the script's own pid gets a signal, and every `ps` runs under
-   `LC_ALL=C`, so start times read the same whatever the locale. A group whose leader bash has
-   reaped is signalled only while, in the process list read just before, it has a process and no
-   process has its id as pid (the kernel gives no process a pid that is still a group's id, so a
-   process with that pid leads another group, which took the id once this one emptied). Two cases
-   remain where a signal can still reach another process's group, and both need the kernel to
-   hand the same pid out again first: the group empties and its id passes to a new group in the
-   milliseconds between that list and the kill; or, before the list, the group emptied and a new
-   process took the id as its pid and group, then ended while its group lived on. A descendant is
-   signalled only while the same process (pid and start time, both from one process list) runs.
-   Each job ignores SIGTTOU, so a terminal with `stty tostop` cannot stop the check's output (it would hang the run). Then the
-   teardown runs `kurtosis enclave rm -f` for each of the run's two enclaves, by name, each
-   bounded to 120 s and each run even if an earlier step failed. It removes nothing else: no
-   other run's enclave and no `kurtosis clean -a` at the end. A failed teardown after a PASS
-   exits 2.
+5. **Teardown.** An EXIT/INT/TERM/HUP/PIPE trap, set before the first step, stops the background
+   jobs on every exit and, from the launches on, removes the pair, an interrupt while waiting for
+   genesis or finality and a closed terminal or output pipe included (exit 130 on INT, 143 on TERM,
+   129 on HUP, 141 on PIPE). A signal that lands while a job is starting takes effect once the job
+   is recorded, so the teardown always finds it. Every pull, `kurtosis` call, `docker stats`, the
+   wait for genesis and the check run as background jobs, each the leader of its own process group;
+   stopping one is TERM to the group and to every descendant, then KILL 10 s later to whatever still
+   runs, a process that ignores TERM or that left the process tree included. When a job's leader
+   ends, whatever is left in its group gets the same TERM, then KILL, so nothing a step started
+   outlives it; each launch is swept as soon as it ends, while the other may still run. Whether a
+   job still runs is what bash saw of it (its job table), never a lookup of its pid, which another
+   process may take once the job has ended. A job stopped with SIGSTOP counts as running: it gets
+   the TERM, then CONT so the TERM lands, and the KILL if it outlives the 10 s. The wait for genesis
+   polls that job table too, so a genesis sleep stopped with SIGSTOP does not end the run:
+   continued, it ends as it would have, and one still stopped at genesis is stopped and the check
+   runs. No pid or group below 2 (`kill -- -1` reaches every process the user owns) and never the
+   script's own pid gets a signal, and every `ps` runs under `LC_ALL=C`, so start times read the
+   same whatever the locale. A group whose leader bash has reaped is signalled only while, in the
+   process list read just before, it has a process and no process has its id as pid (the kernel
+   gives no process a pid that is still a group's id, so a process with that pid leads another
+   group, which took the id once this one emptied). Two cases remain where a signal can still reach
+   another process's group, and both need the kernel to hand the same pid out again first: the group
+   empties and its id passes to a new group in the milliseconds between that list and the kill; or,
+   before the list, the group emptied and a new process took the id as its pid and group, then ended
+   while its group lived on. A descendant is signalled only while the same process (pid and start
+   time, both from one process list) runs. Each job ignores SIGTTOU, so a terminal with `stty
+   tostop` cannot stop the check's output (it would hang the run); bash 3.2 sets SIGTTOU back to its
+   default in every child it forks, so the check's `tee` ignores it again as it starts. Then the
+   teardown runs `kurtosis enclave rm -f` for each of the run's two enclaves, by name, each bounded
+   to 120 s and each run even if an earlier step failed. It removes nothing else: no other run's
+   enclave and no `kurtosis clean -a` at the end. A failed teardown after a PASS exits 2.
    `--keep-on-pass` leaves the pair running after a PASS only (exit 0), for "Export blocks and
    roots", and prints the teardown commands; any other exit still tears down.
 
@@ -379,17 +381,22 @@ or `-` on either side, so run `…-4242` never matches `…-42420` or `…-4242-
 `<T>-<pid>` exactly (an epoch second of 9 to 11 digits and a pid of 2 or more), else it is a usage
 error (exit 2). It never signals an id below 2, its own process group or its own pid, and runs every
 `ps` under `LC_ALL=C` (macOS words a start time by the locale) and with `-ww` where it reads a
-command line (Linux procps cuts it at an exported `COLUMNS`, even into a pipe). A process list that
-cannot be read after the TERM is an exit 2, never "nothing was left"; run it again. The other jobs
-(`kurtosis enclave ls`, `kurtosis clean -a`, `docker stats`, the wait for genesis) end on their own.
-It lists those groups and their processes, sends each TERM, and 10 s later (sooner once none is
-left) KILL to each that is still there: while its leader runs (the same pid and start time), or,
-once TERM has ended the leader, while a process of the group runs and no process has the group id as
-its pid (a surviving member keeps the id from passing to another group, and a process with that pid
-leads another group). So a child that ignores TERM still gets the KILL after its leader has died.
-The same two pid-reuse cases as in the teardown above remain (the milliseconds between a process
-list and a kill, and the id passing on during the 10 s through a process that ended while its group
-lived on):
+command line (Linux procps cuts it at an exported `COLUMNS`, even into a pipe). It finds the groups
+in one process list, and a list that fails or is empty is read again, 1 s later, up to 3 times. A
+list that still cannot be read is an exit 2, never "no recorded group is left" or "nothing was
+left": before the TERM nothing has been signalled, so run it again; after the TERM, check by hand
+(`LC_ALL=C ps -ww -A -o pid,pgid,command`, then `kill -KILL -- -<pgid>` for what is left of the
+listed groups), since another run no longer finds a group whose leader the TERM ended. The other
+jobs (`kurtosis enclave ls`, `kurtosis clean -a`, `docker stats`, the wait for genesis) end on their
+own. It lists those groups and their processes, sends TERM to each that is still there in a process
+list read just before (a leader that ended since it was found, its pid then taken by another
+process, gets none), and 10 s later (sooner once none is left) KILL to each that is still there:
+while its leader runs (the same pid and start time), or, once TERM has ended the leader, while a
+process of the group runs and no process has the group id as its pid (a surviving member keeps the
+id from passing to another group, and a process with that pid leads another group). So a child that
+ignores TERM still gets the KILL after its leader has died. The same two pid-reuse cases as in the
+teardown above remain (the milliseconds between a process list and a kill, and the id passing on
+during the 10 s through a process that ended while its group lived on):
 
 ```bash
 logs=target/kurtosis/pair-<T>                         # the killed run's logs directory

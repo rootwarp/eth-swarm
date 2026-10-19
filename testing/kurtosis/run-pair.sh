@@ -115,23 +115,30 @@ args_file="$here/gloas-genesis.yaml"
 bg_pids=()
 jobs_file=''
 last_job=''
-# in_group <command...>: execs the command as the leader of a new process group (its pid is the
-# group id); it replaces the shell it runs in, so only ever as a background job. SIGPIPE and
-# SIGXFSZ go back to default first: python ignores them, and an ignored signal stays ignored across
-# the exec. SIGTTOU is ignored: the job is a background process group, and with `stty tostop` the
-# kernel would stop it on a write to the terminal (the check's tee), which would hang the run.
-in_group() {
-  exec python3 -I -c '
+# JOB_EXEC: python source, run as `python3 -I -c "$JOB_EXEC" <group|-> <command...>`, that execs
+# the command (with `group`, as the leader of a new process group first). SIGPIPE and SIGXFSZ go
+# back to default: python ignores them, and an ignored signal stays ignored across the exec.
+# SIGTTOU is ignored: a job runs in a background process group, and with `stty tostop` the kernel
+# would stop it on a write to the terminal (the check's tee), which would hang the run. bash 3.2
+# sets SIGTTOU back to its default in every child it forks, even one ignored on entry, so a
+# command that a job's bash forks and that writes to the terminal goes through JOB_EXEC too.
+# shellcheck disable=SC2016 # python source
+JOB_EXEC='
 import os, signal, sys
 for sig in (signal.SIGPIPE, signal.SIGXFSZ):
     signal.signal(sig, signal.SIG_DFL)
 signal.signal(signal.SIGTTOU, signal.SIG_IGN)
-os.setpgid(0, 0)
+if sys.argv[1] == "group":
+    os.setpgid(0, 0)
 try:
-    os.execvp(sys.argv[1], sys.argv[1:])
+    os.execvp(sys.argv[2], sys.argv[2:])
 except OSError as err:
-    print(f"run-pair.sh: {sys.argv[1]}: {err.strerror}", file=sys.stderr)
-    os._exit(127)' "$@"
+    print(f"run-pair.sh: {sys.argv[2]}: {err.strerror}", file=sys.stderr)
+    os._exit(127)'
+# in_group <command...>: execs the command as the leader of a new process group (its pid is the
+# group id), through JOB_EXEC; it replaces the shell it runs in, so only ever as a background job.
+in_group() {
+  exec python3 -I -c "$JOB_EXEC" group "$@"
 }
 # record_jobs: writes bg_pids, one per line, to $jobs_file (once there is one): into a new file
 # of its own (mktemp, so never a FIFO or a link put there), renamed over $jobs_file, so the record
@@ -628,29 +635,38 @@ echo "launches took $(( $(now) - start )) s"
 echo "both enclaves up $(( T - $(now) )) s before genesis"
 snapshot stats-up
 
-# 4. After genesis: every criterion on both enclaves, then one genesis across them.
+# 4. After genesis: every criterion on both enclaves, then one genesis across them. The wait polls
+# the job table (wait_while), never `wait` on a running job: with job control, `wait` returns at
+# once when the job is stopped (SIGSTOP), and errexit would end the run. A sleep still running (or
+# stopped) at T is stopped; one that ended fails the run as before if it failed.
 while (( $(now) < T )); do
   left=$(( T - $(now) ))
   echo "waiting $left s for genesis"
   spawn - - sleep "$left"
-  wait "$last_job"
-  sweep "$last_job"
+  if wait_while "$T" jobs_running "$last_job"; then
+    sweep "$last_job"
+    wait "$last_job"
+  else
+    stop "$last_job"
+  fi
 done
 # The check's own exit code, not tee's: a check.log that cannot be written turns only a PASS
 # into a 2 (no record of it), never a FAIL or DIAGNOSTIC into something else. The wrapper resets
 # errexit, pipefail and job control (monitor) first: an exported SHELLOPTS would hand it the
-# script's own, and with job control its pipeline would leave the job's process group.
+# script's own, and with job control its pipeline would leave the job's process group. Its tee,
+# the one process of it that writes to the terminal, starts through JOB_EXEC (SIGTTOU ignored
+# again after bash 3.2's fork; it stays in the job's process group).
 rc=0
 # shellcheck disable=SC2016 # expanded by the inner bash, from its arguments
 bounded "$CHECK_TIMEOUT" - - "${BASH:-bash}" -c '
   set +e +m +o pipefail
-  check=$1 log=$2
-  shift 2
-  "$BASH" "$check" "$@" 2>&1 | tee "$log"
+  job_exec=$1 check=$2 log=$3
+  shift 3
+  "$BASH" "$check" "$@" 2>&1 | python3 -I -c "$job_exec" - tee "$log"
   codes=("${PIPESTATUS[@]}")
   if ((codes[0] != 0)); then exit "${codes[0]}"; fi
   if ((codes[1] != 0)); then echo "ERROR: tee $log failed" >&2; exit 2; fi
-  exit 0' run-pair-check "$here/check-devnet.sh" "$logs/check.log" \
+  exit 0' run-pair-check "$JOB_EXEC" "$here/check-devnet.sh" "$logs/check.log" \
   --pair --record "$logs/genesis.json" "${ENCLAVES[@]}" || rc=$?
 if ((rc == 124)); then
   echo "ERROR: check-devnet.sh ran past its limit of $CHECK_TIMEOUT s and was stopped" >&2
