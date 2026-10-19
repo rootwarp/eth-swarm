@@ -34,13 +34,14 @@
 //! `ERROR_CODE_RESOURCE_UNAVAILABLE` is `3: ResourceUnavailable`.
 //!
 //! **What the answers must be.** After each injection the store has settled (the pending queue
-//! empty, the drop counted under its reason) before the queries go out, and the answers follow
-//! the serving rules (`cl_chain::reqresp`): a range is answered with the longest prefix of whole
-//! blocks of its one chain, an empty success for a range where the store knows of no block, and
-//! `3` for a range below `earliest_available_slot`, one that names a column we do not custody,
-//! one whose first block lacks a requested column, or one that covers the slot of a
-//! blob-carrying block a stored block waits for; a by-root request leaves out what is not
-//! stored.
+//! empty, the drop counted under its reason) before the queries go out, except where a test
+//! queries on purpose while columns are on their way in (waiting for a root, or a write held
+//! before its commit). The answers follow the serving rules (`cl_chain::reqresp`): a range is
+//! answered with the longest prefix of whole blocks of its one chain, an empty success for a
+//! range where the store knows of no block, and `3` for a range below `earliest_available_slot`,
+//! one that names a column we do not custody, one whose first block lacks a requested column, or
+//! one that covers the slot of a blob-carrying block a stored block waits for; a by-root request
+//! leaves out what is not stored.
 //!
 //! Every block is a Gloas block (the preset is minimal, Gloas from slot 8) whose bid commits to
 //! the fixture blobs `e_0` and `e_1` (`tests/kzg_fixture.rs`), in the order it names. A valid
@@ -81,7 +82,7 @@ use pb::req_resp_service_client::ReqRespServiceClient;
 use prometheus_client::registry::Registry;
 use ssz::Encode;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 use testing::{blobs, gloas_block, gloas_block_on, hello, my_uid, schedule, ClVerify, Spec};
 use testkit::collector::testing::{FixtureServer, Reply};
@@ -100,18 +101,25 @@ const FULU_DIGEST: [u8; 4] = [0x99, 0x88, 0x77, 0x66];
 const GLOAS_DIGEST: [u8; 4] = [0xaa, 0xbb, 0xcc, 0xdd];
 /// How long the store may take to settle.
 const SETTLE: Duration = Duration::from_secs(20);
-/// How long a column waits for its root here: long enough for a test to query the store and
-/// then let the reference learn the root, short enough for a made-up root to time out soon.
-const ROOT_WAIT: Duration = Duration::from_secs(3);
+/// How long a column waits for its root in every test but one: far past what a test does while
+/// columns wait (a few queries, or seeing the root missed and retried), so a stalled runner
+/// cannot time out a column whose root the test is about to let the reference learn. No test
+/// waits for it to run out: each lets the reference learn the root as soon as it has seen what
+/// it waits for.
+const ROOT_WAIT: Duration = Duration::from_secs(20);
+/// The root wait of [`wrong_root_never_served`], which waits for a made-up root to time out.
+const SHORT_ROOT_WAIT: Duration = Duration::from_secs(3);
+/// How often a waiting root is asked again.
+const ROOT_RETRY: Duration = Duration::from_millis(100);
 
-/// The store's bounds: the defaults, with a shorter root wait retried more often.
-fn limits() -> IngestLimits {
+/// The store's bounds: the defaults, with the root wait `root_wait`, retried more often.
+fn limits(root_wait: Duration) -> IngestLimits {
     IngestLimits {
-        root_wait: ROOT_WAIT,
-        root_retry: Duration::from_millis(100),
+        root_wait,
+        root_retry: ROOT_RETRY,
         // One retry of each of the 16 seats every 100 ms.
         retries_per_sec: 160,
-        unknown_root_ttl: ROOT_WAIT,
+        unknown_root_ttl: root_wait,
         ..IngestLimits::default()
     }
 }
@@ -234,26 +242,36 @@ fn claiming(
     sidecar
 }
 
-/// A reference node over HTTP: the headers and blocks it serves, 404 for any other.
+/// A reference node over HTTP: the headers and blocks it serves, 404 for any other, counted by
+/// path.
 struct Reference {
     server: FixtureServer,
     replies: Arc<Mutex<HashMap<String, Reply>>>,
+    misses: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl Reference {
     async fn start() -> Self {
         let replies = Arc::<Mutex<HashMap<String, Reply>>>::default();
-        let served = Arc::clone(&replies);
+        let misses = Arc::<Mutex<HashMap<String, usize>>>::default();
+        let (served, missed) = (Arc::clone(&replies), Arc::clone(&misses));
         let server = FixtureServer::start(move |_, path| {
-            served
-                .lock()
-                .unwrap()
-                .get(path)
-                .cloned()
-                .unwrap_or_else(|| Reply::status(404))
+            let reply = served.lock().unwrap().get(path).cloned();
+            reply.unwrap_or_else(|| {
+                *missed.lock().unwrap().entry(path.to_owned()).or_default() += 1;
+                Reply::status(404)
+            })
         })
         .await;
-        Self { server, replies }
+        Self {
+            server,
+            replies,
+            misses,
+        }
+    }
+
+    fn header_path(root: &Root) -> String {
+        format!("/eth/v1/beacon/headers/0x{}", hex::encode(root))
     }
 
     /// From now on, vouches for `block`: its header and its SSZ.
@@ -264,15 +282,89 @@ impl Reference {
             r#"{{"data":{{"root":"{id}","canonical":true,"header":{{"message":{{"slot":"{slot}"}}}}}}}}"#
         );
         let mut replies = self.replies.lock().unwrap();
-        replies.insert(format!("/eth/v1/beacon/headers/{id}"), Reply::json(&header));
+        replies.insert(Self::header_path(&block.root), Reply::json(&header));
         replies.insert(
             format!("/eth/v2/beacon/blocks/{id}"),
             Reply::ssz(block.ssz.clone()),
         );
     }
 
+    /// How many times the header of `block` was asked for and answered 404.
+    fn header_misses(&self, block: &Block) -> usize {
+        let misses = self.misses.lock().unwrap();
+        misses
+            .get(&Self::header_path(&block.root))
+            .copied()
+            .unwrap_or(0)
+    }
+
     fn api(&self) -> BeaconApi {
         BeaconApi::new(&format!("http://{}", self.server.addr), DEFAULT_API_TIMEOUT).unwrap()
+    }
+}
+
+/// Waits until `done` holds; fails after [`SETTLE`].
+async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + SETTLE;
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The column env's writes of one slot, held open after their puts and before their commit
+/// (`ColumnWriter::set_before_commit`) until [`Self::release`]d or dropped. A held column has
+/// passed the contract and still holds its place in the pending queue.
+struct HeldWrites {
+    gate: Arc<(Mutex<Hold>, Condvar)>,
+}
+
+#[derive(Default)]
+struct Hold {
+    released: bool,
+    /// The held writes that reached the hook.
+    entered: usize,
+}
+
+impl HeldWrites {
+    /// Holds every write of `slot` through `writer`, which no hook was set on before.
+    fn new(writer: &ColumnWriter, slot: u64) -> Self {
+        let gate = Arc::new((Mutex::new(Hold::default()), Condvar::new()));
+        let hook = Arc::clone(&gate);
+        writer.set_before_commit(Box::new(move |written| {
+            if written != slot {
+                return;
+            }
+            let (hold, changed) = &*hook;
+            let mut hold = hold.lock().unwrap_or_else(PoisonError::into_inner);
+            hold.entered += 1;
+            while !hold.released {
+                hold = changed.wait(hold).unwrap_or_else(PoisonError::into_inner);
+            }
+        }));
+        Self { gate }
+    }
+
+    /// Waits until a held write reached the hook: its puts are made and not committed.
+    async fn entered(&self) {
+        wait_for("a held write", || self.lock().entered > 0).await;
+    }
+
+    /// Lets every held write, and every later one, commit.
+    fn release(&self) {
+        self.lock().released = true;
+        self.gate.1.notify_all();
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Hold> {
+        self.gate.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl std::ops::Drop for HeldWrites {
+    /// Released, so the store's writer thread can finish and be joined.
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -389,7 +481,13 @@ struct Node {
 }
 
 impl Node {
+    /// The probe with the root wait [`ROOT_WAIT`].
     async fn start() -> Self {
+        Self::start_with(ROOT_WAIT).await
+    }
+
+    /// The probe with the root wait `root_wait`.
+    async fn start_with(root_wait: Duration) -> Self {
         let reference = Reference::start().await;
         let anchor = Block::anchor();
         reference.serve(&anchor);
@@ -416,7 +514,7 @@ impl Node {
             custody,
             contract,
             Arc::clone(&writer),
-            limits(),
+            limits(root_wait),
             QueueMetrics::register(&mut registry),
         )
         .unwrap();
@@ -510,11 +608,7 @@ impl Node {
 
     /// Waits until nothing is queued and `done` holds; fails after [`SETTLE`].
     async fn settle(&self, what: &str, mut done: impl FnMut() -> bool) {
-        let deadline = Instant::now() + SETTLE;
-        while !(self.ingest.pending() == 0 && done()) {
-            assert!(Instant::now() < deadline, "timed out waiting for {what}");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_for(what, || self.ingest.pending() == 0 && done()).await;
     }
 
     /// Waits until `count` columns were dropped as `reason` and nothing is queued.
@@ -668,7 +762,7 @@ async fn kzg_invalid_never_served() {
 /// stored or served, and the block's real sidecars still are.
 #[tokio::test]
 async fn wrong_root_never_served() {
-    let node = Node::start().await;
+    let node = Node::start_with(SHORT_ROOT_WAIT).await;
     let block = node.block(9, &node.anchor);
     let unknown = [0x5a; 32];
     let columns = block.sidecars(&CUSTODY);
@@ -762,7 +856,11 @@ async fn other_block_commitments_never_served() {
     node.gossip_all(&swapped_columns).await;
     assert_eq!(node.stored(&block), CUSTODY);
     assert_eq!(node.stored(&swapped), CUSTODY);
-    assert_eq!(node.drops().len(), 2, "no new drop: {:?}", node.drops());
+    // No new drop.
+    assert_eq!(
+        node.drops(),
+        [("kzg_invalid", 4), ("commitments_mismatch", 4)]
+    );
     let both = [columns.clone(), swapped_columns.clone()].concat();
     assert_eq!(node.by_range(9, 2, &CUSTODY).await, served(&both));
     assert_eq!(
@@ -779,15 +877,29 @@ async fn non_custody_never_served() {
     let node = Node::start().await;
     let block = node.block(9, &node.anchor);
     let columns = block.sidecars(&CUSTODY);
-    node.gossip_all(&columns).await;
+
+    // Custody column 47 on subnet 5, while the block holds every custody column but 47: kept
+    // out, so the block still lacks it.
+    let others = block.sidecars(&[1, 87, 102]);
+    node.gossip_all(&others).await;
+    node.publish(&block.sidecar(47), 5);
+    node.dropped(Drop::WrongSubnet, 1).await;
+    assert_eq!(node.stored(&block), [1, 87, 102]);
+    assert_eq!(node.by_root(&[(block.root, &[47])]).await, none());
+    assert_eq!(
+        node.by_root(&[(block.root, &CUSTODY)]).await,
+        served(&others)
+    );
+    assert_eq!(node.by_range(9, 1, &[47]).await, UNAVAILABLE);
+    assert_eq!(node.by_range(9, 1, &CUSTODY).await, UNAVAILABLE);
+    // On its own subnet it is stored.
+    node.gossip_all(&[block.sidecar(47)]).await;
     assert_eq!(node.stored(&block), CUSTODY);
 
-    // Valid columns we do not custody, on their own subnets.
+    // Valid columns we do not custody, on their own subnets, and column 5 on custody subnet 47.
     node.gossip_all(&block.sidecars(&NOT_CUSTODY)).await;
     node.dropped(Drop::NotCustody, 3).await;
-    // Column 5 on custody subnet 47, and custody column 47 on subnet 5.
     node.publish(&block.sidecar(5), 47);
-    node.publish(&block.sidecar(47), 5);
     node.dropped(Drop::WrongSubnet, 2).await;
     assert_eq!(node.drops(), [("not_custody", 3), ("wrong_subnet", 2)]);
     assert_eq!(node.stored(&block), CUSTODY);
@@ -807,8 +919,8 @@ async fn non_custody_never_served() {
 
 /// An invalid copy of an identifier that arrives first does not keep out the valid copy: it is
 /// stored and served, whether the invalid one was dropped before it came, is checked beside it,
-/// or waited with it for a root the reference did not know yet. Nothing ahead of the contract
-/// remembers an identifier it has seen.
+/// or waited with it for a root the reference did not know yet, through a missed first ask and
+/// a missed retry. Nothing ahead of the contract remembers an identifier it has seen.
 #[tokio::test]
 async fn invalid_then_valid_copy() {
     let node = Node::start().await;
@@ -845,14 +957,23 @@ async fn invalid_then_valid_copy() {
         served(&block.sidecars(&CUSTODY))
     );
 
-    // Waiting together: the reference learns the block at 10 only after both copies of each
-    // column arrived.
+    // Waiting together: both copies of each column of the block at 10 wait for its root, which
+    // the reference learns only once its header was missed twice: on the root's first ask and
+    // on a retry (one header request each).
     let later = Block::on(10, &block, &[0, 1]);
     for index in CUSTODY {
         node.gossip(&flipped(later.sidecar(index)));
         node.gossip(&later.sidecar(index));
     }
+    wait_for("the later root to be missed and retried", || {
+        node.reference.header_misses(&later) >= 2
+    })
+    .await;
+    // All eight still wait: none checked, none dropped, none stored.
     assert_eq!(node.ingest.pending(), 8);
+    assert_eq!(node.drops(), [("kzg_invalid", 4)]);
+    assert_eq!(node.stored(&later), Vec::<u64>::new());
+    assert_eq!(node.by_root(&[(later.root, &CUSTODY)]).await, none());
     node.reference.serve(&later);
     node.dropped(Drop::KzgInvalid, 8).await;
     node.settle("the later block to be stored", || {
@@ -868,34 +989,69 @@ async fn invalid_then_valid_copy() {
     assert_eq!(node.by_range(9, 2, &CUSTODY).await, served(&both));
 }
 
-/// The column RPCs answer from the column store alone: columns still in the pending queue, waiting
-/// for a root the reference does not know yet, are not served by range or by root, and are
-/// served once they passed the contract and were written.
+/// The column RPCs answer from the column store alone, never from a column still on its way in:
+/// not a column of a stored block that passed the contract and whose write is held open before
+/// its commit, and not columns waiting for a root the reference does not know yet. Each is
+/// served once it was written. No serving path can reach the pending queue (`ColumnServer`
+/// holds only a `ColumnStore`, whose one method is the column env's `ColumnReader`); this test
+/// shows the answers agree with that while columns of a block it already stores are in flight.
 #[tokio::test]
 async fn serving_reads_contract_store_only() {
     let node = Node::start().await;
-    let block = Block::on(9, &node.anchor, &[0, 1]);
-    let columns = block.sidecars(&CUSTODY);
-    for sidecar in &columns {
+    let anchor = served(&node.anchor.sidecars(&CUSTODY));
+    // 9: three custody columns stored, then 47 checked and put, its commit held.
+    let block = node.block(9, &node.anchor);
+    let stored = block.sidecars(&[1, 87, 102]);
+    node.gossip_all(&stored).await;
+    let held = HeldWrites::new(&node.writer, block.slot);
+    node.gossip(&block.sidecar(47));
+    held.entered().await;
+    // 10, its child: every custody column waits for a root the reference does not know yet.
+    let later = Block::on(10, &block, &[0, 1]);
+    let waiting = later.sidecars(&CUSTODY);
+    for sidecar in &waiting {
         node.gossip(sidecar);
     }
-    assert_eq!(node.ingest.pending(), 4);
+    wait_for("the later root to be missed", || {
+        node.reference.header_misses(&later) >= 1
+    })
+    .await;
+    assert_eq!(node.ingest.pending(), 5);
 
-    let anchor = served(&node.anchor.sidecars(&CUSTODY));
-    assert_eq!(node.by_root(&[(block.root, &CUSTODY)]).await, none());
-    assert_eq!(node.by_range(9, 1, &CUSTODY).await, none());
-    assert_eq!(node.by_range(8, 2, &CUSTODY).await, anchor);
-    // Still queued through every query: none was answered from the queue.
-    assert_eq!(node.ingest.pending(), 4);
-    assert_eq!(node.stored(&block), Vec::<u64>::new());
-
-    node.reference.serve(&block);
-    node.settle("the block to be stored", || node.stored(&block) == CUSTODY)
-        .await;
-    assert!(node.drops().is_empty(), "{:?}", node.drops());
+    // By root: the stored columns only.
+    assert_eq!(node.by_root(&[(block.root, &[47])]).await, none());
     assert_eq!(
-        node.by_root(&[(block.root, &CUSTODY)]).await,
-        served(&columns)
+        node.by_root(&[(block.root, &CUSTODY), (later.root, &CUSTODY)])
+            .await,
+        served(&stored)
     );
-    assert_eq!(node.by_range(9, 1, &CUSTODY).await, served(&columns));
+    // By range: the block at 9 lacks 47, so a range from it that asks for 47 is unavailable
+    // and one from the anchor ends before it; the store knows of no block at 10.
+    assert_eq!(node.by_range(9, 1, &[47]).await, UNAVAILABLE);
+    assert_eq!(node.by_range(9, 2, &CUSTODY).await, UNAVAILABLE);
+    assert_eq!(node.by_range(9, 2, &[1, 87, 102]).await, served(&stored));
+    assert_eq!(node.by_range(8, 3, &CUSTODY).await, anchor);
+    assert_eq!(node.by_range(10, 1, &CUSTODY).await, none());
+    // Still on their way in through every query: none was answered from the queue.
+    assert_eq!(node.ingest.pending(), 5);
+    assert_eq!(node.stored(&block), [1, 87, 102]);
+    assert_eq!(node.stored(&later), Vec::<u64>::new());
+
+    held.release();
+    node.reference.serve(&later);
+    node.settle("both blocks to be stored", || {
+        node.stored(&block) == CUSTODY && node.stored(&later) == CUSTODY
+    })
+    .await;
+    assert!(node.drops().is_empty(), "{:?}", node.drops());
+    let columns = block.sidecars(&CUSTODY);
+    assert_eq!(
+        node.by_root(&[(block.root, &CUSTODY), (later.root, &CUSTODY)])
+            .await,
+        served(&[columns.clone(), waiting.clone()].concat())
+    );
+    assert_eq!(
+        node.by_range(8, 3, &CUSTODY).await,
+        served(&[node.anchor.sidecars(&CUSTODY), columns, waiting].concat())
+    );
 }
