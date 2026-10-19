@@ -101,6 +101,14 @@ unit stays failed. `RestartPreventExitStatus=1 2 64` stops restarts of the servi
 refused credential (1), the stub's exit (2) and a usage error (64); systemd applies it to the
 main process only, so a failing `ExecStartPre=` check is bounded by the start limit instead.
 
+Exit 71 (`EXIT_NO_LOG_WRITER`, `EX_OSERR`) is deliberately not in that list, so it is
+restarted. cl-p2p and cl-discv5 exit 71 at once when their log-writer thread cannot start, and
+they write nothing to stderr on purpose (stderr may be the cause), so the journal shows only
+the exit status (`systemctl status`, `journalctl -u <unit>`). A thread limit can lift, so the
+restart may succeed. If it keeps failing, check the unit's thread and process limits
+(`systemctl show -p TasksMax,TasksCurrent <unit>`, `ulimit -u` for the service user) and
+the host's free memory.
+
 ## Resource limits
 
 Every unit carries a memory ceiling: plain resource containment for a process whose memory

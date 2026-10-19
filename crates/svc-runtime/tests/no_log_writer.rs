@@ -10,21 +10,23 @@ mod common;
 
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use common::child::{OwnedChild, Stalled, NO_THREAD_STACK};
 use common::*;
 use ethswarm_proto::engine::engine_service_server::EngineServiceServer;
+use prometheus_client::registry::Registry;
 use svc_runtime::telemetry::{
-    init_binary_tracing, try_init_tracing, try_init_tracing_with, LogQueueBounds, TracingInitError,
-    EXIT_NO_LOG_WRITER,
+    init_binary_tracing, try_init_tracing, try_init_tracing_with, LogQueueBounds, RuntimeMetrics,
+    TracingInitError, EXIT_NO_LOG_WRITER,
 };
 use svc_runtime::{exit_code, Config, RuntimeError, Services};
 use tokio::time::Instant;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::Identity;
 
-/// What `no_log_writer_child` does: [`PANIC`] or [`RUN`].
+/// What `no_log_writer_child` does: [`PANIC`], [`RUN`] or [`OWNER`].
 const CHILD_MODE: &str = "SVC_RUNTIME_NO_LOG_WRITER_MODE";
 /// The config `run` loads in [`RUN`] mode.
 const CHILD_CONFIG: &str = "SVC_RUNTIME_NO_LOG_WRITER_CONFIG";
@@ -32,6 +34,8 @@ const CHILD_CONFIG: &str = "SVC_RUNTIME_NO_LOG_WRITER_CONFIG";
 const PANIC: &str = "panic";
 /// `svc_runtime::run`, which must stop on the failed start.
 const RUN: &str = "run";
+/// An embedding owner's own subscriber and panic hook are in place before the failed start.
+const OWNER: &str = "owner";
 /// The exit status of a [`PANIC`] child that got through.
 const PANIC_SURVIVED: i32 = 0;
 /// Every wait on a child is bounded by this.
@@ -50,11 +54,14 @@ fn no_log_writer_child() {
     match mode.as_str() {
         PANIC => panic_child(),
         RUN => run_child(),
+        OWNER => owner_child(),
         other => panic!("unknown mode {other}"),
     }
 }
 
 fn panic_child() {
+    let mut registry = Registry::with_prefix("ethswarm");
+    RuntimeMetrics::register(&mut registry);
     let first = try_init_tracing_with(
         LevelFilter::INFO,
         LogQueueBounds::default(),
@@ -78,7 +85,34 @@ fn panic_child() {
     let caught = std::panic::catch_unwind(|| panic!("after the log writer failed to start"));
     assert!(caught.is_err());
     println!("survived the panic");
+    // The hook dropped the panic's line and counted it: nothing else was logged or dropped.
+    let mut metrics = String::new();
+    prometheus_client::encoding::text::encode(&mut metrics, &registry).unwrap();
+    println!("{metrics}");
+    assert!(
+        metrics.contains("\nethswarm_log_lines_dropped_total 1\n"),
+        "{metrics}"
+    );
     std::process::exit(PANIC_SURVIVED);
+}
+
+/// Set by the owner's panic hook in [`owner_child`].
+static OWNER_HOOK_RAN: AtomicBool = AtomicBool::new(false);
+
+fn owner_child() {
+    tracing::subscriber::set_global_default(tracing::subscriber::NoSubscriber::default()).unwrap();
+    std::panic::set_hook(Box::new(|_| OWNER_HOOK_RAN.store(true, Ordering::SeqCst)));
+    let init = try_init_tracing(LevelFilter::INFO);
+    println!("init: {init:?}");
+    assert!(
+        matches!(init, Err(TracingInitError::WriterUnavailable(_))),
+        "{init:?}"
+    );
+    let caught = std::panic::catch_unwind(|| panic!("with the owner's hook in place"));
+    assert!(caught.is_err());
+    let ran = OWNER_HOOK_RAN.load(Ordering::SeqCst);
+    println!("owner hook ran: {ran}");
+    std::process::exit(if ran { PANIC_SURVIVED } else { 1 });
 }
 
 fn run_child() {
@@ -136,6 +170,18 @@ async fn a_panic_after_the_writer_failed_to_start_does_not_block_on_a_full_stder
                 read(&stdout)
             )
         });
+    assert_eq!(status.code(), Some(PANIC_SURVIVED), "{}", read(&stdout));
+}
+
+#[tokio::test]
+async fn a_failed_start_leaves_an_owners_panic_hook_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stdout = tmp.path().join("stdout");
+    let mut stalled = Stalled::spawn(child(OWNER, &stdout)).unwrap();
+    let status = stalled
+        .wait_until(Instant::now() + STEP)
+        .await
+        .unwrap_or_else(|| panic!("still running after {STEP:?}\n{}", read(&stdout)));
     assert_eq!(status.code(), Some(PANIC_SURVIVED), "{}", read(&stdout));
 }
 

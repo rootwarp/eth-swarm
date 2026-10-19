@@ -11,6 +11,7 @@
 //!   to stderr by the default hook. If the writer thread cannot start, nothing is logged and
 //!   a binary exits [`EXIT_NO_LOG_WRITER`] at once, writing nothing ([`init_binary_tracing`]);
 //!   the panic hook then drops each panic's line, so no thread ever blocks on stderr either way.
+//!   An owner that installed its own subscriber first keeps its own panic hook.
 //! - **Trace ids** are W3C trace ids: taken from the caller's `traceparent` header when it is
 //!   valid, otherwise 16 random bytes ([`trace_id`]).
 //! - **Metrics** are a prometheus-client [`Registry`] served as OpenMetrics text at `/metrics`
@@ -26,7 +27,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::process::ExitCode;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -268,7 +269,8 @@ where
 static STDERR_DROPPED: LazyLock<Counter> = LazyLock::new(Counter::default);
 
 /// The process's stderr log writer, settled by the first [`try_init_tracing_with`]: `Some` if
-/// it started the writer, `None` if the writer thread could not start.
+/// it started the writer, `None` if the writer thread could not start. It is set only once that
+/// call has installed whatever panic hook it installs.
 static STDERR_LOG: OnceLock<Option<LogWriter>> = OnceLock::new();
 
 /// The exit status of a binary whose stderr log writer could not start: `EX_OSERR` of
@@ -285,7 +287,8 @@ pub enum TracingInitError {
     AlreadyInitialized,
     /// The log-writer thread could not start. No subscriber is installed, so nothing is
     /// logged, and the panic hook drops each panic's message (counted in
-    /// `ethswarm_log_lines_dropped_total`) instead of writing it to stderr.
+    /// `ethswarm_log_lines_dropped_total`) instead of writing it to stderr. If another
+    /// subscriber is already the global default, its owner's panic hook stays instead.
     #[error("the stderr log writer could not start: {0}")]
     WriterUnavailable(#[source] io::Error),
 }
@@ -336,6 +339,10 @@ pub fn init_binary_tracing(level: LevelFilter) -> Result<(), ExitCode> {
 /// the subscriber is installed, by the hook that queues a panic's line; if the writer cannot
 /// start, by one that drops it. If another subscriber is already the global default, the
 /// panic hook is left alone.
+///
+/// Calls are serialized, and the first holds the others off until it has installed its panic
+/// hook: a call that returns [`TracingInitError::AlreadyInitialized`] because an earlier one
+/// settled the logging returns only after that hook is in place.
 pub fn try_init_tracing_with<L>(
     level: LevelFilter,
     bounds: LogQueueBounds,
@@ -344,31 +351,48 @@ pub fn try_init_tracing_with<L>(
 where
     L: Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
 {
-    let mut outcome = Err(TracingInitError::AlreadyInitialized);
-    let writer = STDERR_LOG.get_or_init(|| {
-        match LogWriter::spawn(io::stderr(), bounds, STDERR_DROPPED.clone()) {
-            Ok(writer) => {
-                outcome = Ok(());
-                Some(writer)
-            }
-            Err(e) => {
-                install_dropping_panic_hook();
-                outcome = Err(TracingInitError::WriterUnavailable(e));
-                None
-            }
-        }
-    });
-    outcome?;
-    let Some(writer) = writer.as_ref() else {
+    // Held to the end, so a racing call that finds logging settled finds the panic hook in
+    // place too. A call that panicked under it (in an owner's `extra`) settled nothing, so
+    // the lock it poisoned guards nothing half done.
+    let _init = TRACING_INIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if STDERR_LOG.get().is_some() {
         return Err(TracingInitError::AlreadyInitialized);
+    }
+    let writer = match LogWriter::spawn(io::stderr(), bounds, STDERR_DROPPED.clone()) {
+        Ok(writer) => writer,
+        Err(e) => {
+            if !tracing::dispatcher::has_been_set() {
+                install_dropping_panic_hook();
+            }
+            settle(None);
+            return Err(TracingInitError::WriterUnavailable(e));
+        }
     };
     let subscriber = tracing_subscriber::registry()
         .with(extra)
         .with(json_layer(level, writer.clone()));
-    tracing::subscriber::set_global_default(subscriber)
-        .map_err(|_| TracingInitError::AlreadyInitialized)?;
-    install_panic_hook(writer);
-    Ok(())
+    let installed = tracing::subscriber::set_global_default(subscriber).is_ok();
+    if installed {
+        install_panic_hook(writer.clone());
+    }
+    settle(Some(writer));
+    if installed {
+        Ok(())
+    } else {
+        Err(TracingInitError::AlreadyInitialized)
+    }
+}
+
+/// Held across all of [`try_init_tracing_with`], which sets [`STDERR_LOG`] last.
+static TRACING_INIT: Mutex<()> = Mutex::new(());
+
+/// Publishes the process's stderr log writer, or that it could not start. Only
+/// [`try_init_tracing_with`] calls it, under [`TRACING_INIT`] and after it found
+/// [`STDERR_LOG`] unset, so the set never fails.
+fn settle(writer: Option<LogWriter>) {
+    let _ = STDERR_LOG.set(writer);
 }
 
 /// How long the panic hook waits for the queue, its own line included, to reach stderr: long
@@ -387,7 +411,7 @@ const PANIC_FLUSH: Duration = Duration::from_millis(100);
 /// field's `Debug`, formatted while the fmt layer holds that span's lock, which the hook's own
 /// event would take again on the same thread), and a layer that panicked on the hook's event
 /// would abort the process with a message written straight to stderr.
-fn install_panic_hook(writer: &'static LogWriter) {
+fn install_panic_hook(writer: LogWriter) {
     std::panic::set_hook(Box::new(move |info| {
         let payload = info.payload();
         let panic = payload
@@ -406,7 +430,7 @@ fn install_panic_hook(writer: &'static LogWriter) {
             thread.name().unwrap_or("<unnamed>"),
             backtrace.as_deref(),
         );
-        report_panic(writer, line.as_bytes());
+        report_panic(&writer, line.as_bytes());
     }));
 }
 
@@ -1547,14 +1571,6 @@ mod tests {
         let _ = init_tracing(LevelFilter::ERROR);
         assert!(queue_stderr(b"plain text queued by a test\n"));
         assert!(flush_logs(Duration::from_secs(10)));
-    }
-
-    #[test]
-    fn a_panic_with_no_writer_is_dropped_and_counted() {
-        let before = STDERR_DROPPED.get();
-        drop_panic_line();
-        // Other tests may drop lines meanwhile; this one is counted either way.
-        assert!(STDERR_DROPPED.get() > before);
     }
 
     #[test]

@@ -279,6 +279,26 @@ expect 1 "StartLimitIntervalSec=10s fails" "ethswarm-chain.service: .*StartLimit
 d=$(variant limit-in-service); drop "$d" ethswarm-chain.service "^StartLimitBurst="
 append "$d" ethswarm-chain.service "StartLimitBurst=3"
 expect 1 "StartLimitBurst= outside [Unit] fails" "ethswarm-chain.service: StartLimitBurst" "$d"
+# Exit 71 (EXIT_NO_LOG_WRITER, EX_OSERR: no log writer, so nothing on stderr) is restarted: a
+# thread limit can lift. The units that run an svc-runtime binary say so; the README too.
+for unit in ethswarm-p2p ethswarm-discv5; do
+  prevent=$(sed -n 's/^RestartPreventExitStatus=//p' "$probe/$unit.service")
+  if [[ " $prevent " == *" 71 "* ]]; then
+    bad "$unit restarts on exit 71 (RestartPreventExitStatus=$prevent)"
+  else
+    ok "$unit restarts on exit 71 (RestartPreventExitStatus=$prevent)"
+  fi
+  if grep -q '^# .*71 EXIT_NO_LOG_WRITER' "$probe/$unit.service"; then
+    ok "$unit documents exit 71 in a comment"
+  else
+    bad "$unit documents exit 71 in a comment"
+  fi
+done
+if grep -qF -- '`EXIT_NO_LOG_WRITER`' "$probe/README.md" && grep -qF -- 'ulimit -u' "$probe/README.md"; then
+  ok "the README documents exit 71 and what to check"
+else
+  bad "the README documents exit 71 and what to check"
+fi
 # Exit codes only: a signal name (an OOM kill is SIGKILL) would turn that kill into a stop.
 for value in SIGKILL KILL SIGTERM; do
   d=$(variant "prevent-signal-$value"); append "$d" ethswarm-p2p.service "RestartPreventExitStatus=$value"

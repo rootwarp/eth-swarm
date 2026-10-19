@@ -11,7 +11,8 @@ call settles the process's logging. If that thread cannot start:
 
 - no subscriber is installed, so nothing is logged;
 - the panic hook drops each panic's message (counted in `ethswarm_log_lines_dropped_total`)
-  instead of writing it to stderr, so no thread ever blocks on a stalled stderr;
+  instead of writing it to stderr, so no thread ever blocks on a stalled stderr. If another
+  subscriber is already the global default, its owner's panic hook is left in place;
 - `run` returns `RuntimeError::LogWriter` before binding anything, and `exit_code` makes it
   `EXIT_NO_LOG_WRITER` (71, `EX_OSERR`);
 - the binaries (`cl-p2p`, `cl-discv5`, `m2a-session`, `devnet-probe`) call
@@ -21,6 +22,10 @@ Nothing is written to stderr on this path, because stderr may be the reason the 
 not start. An owner that would rather run without logs calls `try_init_tracing` itself first
 and carries on past `TracingInitError::WriterUnavailable`. Later calls, `run`'s included, then
 find logging settled and go on.
+
+Calls are serialized, and the first one holds the others until its panic hook is installed.
+So a call that finds logging settled, from any thread, returns only after the bounded hook is
+in place.
 
 ## What `m2a-session` links through this crate
 
