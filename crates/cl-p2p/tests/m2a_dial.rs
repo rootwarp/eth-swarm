@@ -310,6 +310,18 @@ fn config_dir(addr: &Multiaddr, peer_id: PeerId) -> tempfile::TempDir {
     dir
 }
 
+/// Every stderr line is one JSON object with a level, fields and a target, as svc-runtime logs
+/// them.
+fn assert_json_lines(stderr: &str) {
+    for line in stderr.lines() {
+        let event: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("not a JSON line ({e}): {line}"));
+        assert!(event["level"].is_string(), "{line}");
+        assert!(event["fields"].is_object(), "{line}");
+        assert!(event["target"].is_string(), "{line}");
+    }
+}
+
 /// Runs the binary off the runtime thread, so the reference peer keeps running meanwhile.
 async fn run_bin(dir: &Path, args: &[&str]) -> Output {
     let config = dir.join("m2a-session.toml");
@@ -332,6 +344,7 @@ async fn dial_only_binary_connects_and_exits_0() {
     }
     assert_eq!(out.status.code(), Some(0), "{stderr}");
     assert!(stderr.contains("dial-only"), "{stderr}");
+    assert_json_lines(&stderr);
     peer.wait_for_upgrades(1).await;
     assert_eq!(peer.upgrades(), vec![(secret_peer_id(), "yamux")]);
     peer.wait_until_every_connection_closed().await;
@@ -350,6 +363,7 @@ async fn dial_only_binary_wrong_peer_id_exits_1() {
     }
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("wrong peer ID"), "{stderr}");
+    assert_json_lines(&stderr);
     peer.wait_until_every_connection_closed().await;
 }
 

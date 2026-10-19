@@ -4,10 +4,12 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use ethswarm_proto::chain as pb;
 use ethswarm_proto::chain::import_batch_request::Frame;
 use ethswarm_proto::chain::import_service_client::ImportServiceClient;
-use ethswarm_proto::chain::import_service_server::ImportServiceServer;
+use ethswarm_proto::chain::import_service_server::{ImportService, ImportServiceServer};
 use ethswarm_proto::chain::{ImportBatchRequest, ImportBatchRequestBody};
+use ipc::Link;
 use svc_runtime::telemetry::{json_subscriber, TraceLayer};
 use tokio_stream::wrappers::UnixListenerStream;
 use tracing_subscriber::filter::LevelFilter;
@@ -36,6 +38,34 @@ impl<'a> MakeWriter<'a> for Buffer {
     }
 }
 
+/// `ethswarm.chain.v1.ImportService` as cl-chain's stub serves it: the `ipc` contract layer,
+/// whose bidi stream worker runs on a task of its own, then `UNIMPLEMENTED`. Defined here, not
+/// taken from cl-chain, whose tests depend on a crate that depends on this one.
+#[derive(Clone)]
+struct ImportStub {
+    link: Link,
+}
+
+impl ImportStub {
+    fn link(&self) -> &Link {
+        &self.link
+    }
+}
+
+ipc::stub_service!(ImportStub => ImportService {
+    unary: [
+        get_chain_status(pb::GetChainStatusRequest) -> pb::GetChainStatusResponse,
+    ],
+    unary_envelopes: [
+        bootstrap(pb::BootstrapRequest) -> pb::BootstrapResponse => |r| r.state.iter().chain(&r.block).chain(&r.payload_envelope).collect(),
+    ],
+    server_stream: [
+    ],
+    bidi: [
+        import_batch(pb::ImportBatchRequest) -> pb::ImportBatchResponse as ImportBatchStream,
+    ],
+});
+
 // One thread, so the thread-local subscriber sees every task, the spawned worker included.
 #[tokio::test(flavor = "current_thread")]
 async fn bidi_worker_logs_carry_the_trace_id() {
@@ -46,7 +76,9 @@ async fn bidi_worker_logs_carry_the_trace_id() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("chain.sock");
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
-    let chain = cl_chain::ChainStub::new(ipc::testkit::fixture::v1_link());
+    let chain = ImportStub {
+        link: ipc::testkit::fixture::v1_link(),
+    };
     tokio::spawn(
         tonic::transport::Server::builder()
             .layer(TraceLayer)

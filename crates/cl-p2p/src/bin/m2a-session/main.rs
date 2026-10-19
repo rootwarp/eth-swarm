@@ -28,6 +28,10 @@
 //!
 //! Exit 0 on success (every check of the summary passed), 1 if the dial, an exchange or a verdict
 //! fails, 2 on bad arguments, a refused config or a failed pre-flight.
+//!
+//! Logs are svc-runtime's JSON lines on stderr, at INFO, through its bounded writer: a stderr
+//! nobody reads drops lines instead of blocking the session, and every exit waits for the queue
+//! at most [`LOG_FLUSH_DEADLINE`].
 
 mod blocks;
 mod enr;
@@ -56,6 +60,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use svc_runtime::lifecycle::LOG_FLUSH_DEADLINE;
+use svc_runtime::telemetry::{flush_logs, init_tracing_with, LogQueueBounds};
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::layer::Identity;
 
 const USAGE: &str = "usage: m2a-session [--config <path>] [--dial-only | --print-peer-id] \
                      [--connect-timeout-secs <n>] [--gate-file <path>]";
@@ -181,18 +189,18 @@ fn key_handling(key: &KeySource, euid: u32) -> Verdict {
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(std::io::stderr)
-        .init();
+    // `false` only if the writer thread could not start; the session then runs without logs,
+    // as svc-runtime's own `run` does.
+    init_tracing_with(
+        LevelFilter::INFO,
+        LogQueueBounds::default(),
+        Identity::new(),
+    );
     let euid = rustix::process::geteuid().as_raw();
     let env = RunEnv::production();
-    ExitCode::from(run(
-        std::env::args().skip(1),
-        euid,
-        &mut std::io::stdout(),
-        &env,
-    ))
+    let code = run(std::env::args().skip(1), euid, &mut std::io::stdout(), &env);
+    flush_logs(LOG_FLUSH_DEADLINE);
+    ExitCode::from(code)
 }
 
 /// The pinned chain of `network`, checked against the session's preset.
@@ -300,7 +308,7 @@ fn run(argv: impl Iterator<Item = String>, euid: u32, out: &mut dyn Write, env: 
     let args = match parse_args(argv) {
         Ok(args) => args,
         Err(e) => {
-            eprintln!("m2a-session: {e}\n{USAGE}");
+            tracing::error!(error = %e, usage = USAGE, "bad arguments");
             return EXIT_REFUSED;
         }
     };

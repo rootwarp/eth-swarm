@@ -1,5 +1,6 @@
 //! The `cl-p2p` binary reads its node key only from `$CREDENTIALS_DIRECTORY/nodekey`: exit 1
-//! when the credential is missing or refused, and its output never shows the key.
+//! when the credential is missing or refused, and its output never shows the key. Its stderr is
+//! JSON lines, one object per line.
 
 use data_encoding::{BASE64, HEXLOWER};
 use std::io::Write as _;
@@ -36,6 +37,20 @@ fn output(o: &Output) -> String {
     )
 }
 
+/// Every stderr line is one JSON object with a level, fields and a target, as svc-runtime logs
+/// them.
+fn assert_json_lines(o: &Output) {
+    let text = String::from_utf8_lossy(&o.stderr);
+    assert!(!text.is_empty(), "nothing logged");
+    for line in text.lines() {
+        let event: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("not a JSON line ({e}): {line}"));
+        assert!(event["level"].is_string(), "{line}");
+        assert!(event["fields"].is_object(), "{line}");
+        assert!(event["target"].is_string(), "{line}");
+    }
+}
+
 fn assert_no_key(text: &str) {
     assert!(!text.contains(&HEXLOWER.encode(&SECRET)), "{text}");
     assert!(!text.contains(&BASE64.encode(&SECRET)), "{text}");
@@ -45,6 +60,7 @@ fn assert_no_key(text: &str) {
 fn without_the_credential_it_refuses_to_start() {
     let o = cl_p2p(None);
     assert_eq!(o.status.code(), Some(1));
+    assert_json_lines(&o);
     assert!(
         output(&o).contains("CREDENTIALS_DIRECTORY"),
         "{}",
@@ -60,6 +76,7 @@ fn a_credential_others_can_read_is_refused() {
     let text = output(&o);
     assert!(text.contains("mode 0644"), "{text}");
     assert_no_key(&text);
+    assert_json_lines(&o);
 }
 
 #[test]
@@ -72,4 +89,5 @@ fn a_good_credential_loads_and_the_stub_stops_without_showing_the_key() {
     assert!(text.contains("cl-p2p identity loaded"), "{text}");
     assert!(text.contains("not runnable yet"), "{text}");
     assert_no_key(&text);
+    assert_json_lines(&o);
 }

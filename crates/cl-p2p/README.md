@@ -330,7 +330,9 @@ v3, sample again (once more if `seq_number` moved in between), and judge it fiel
 Then hold the connection 10 s and send a second Status on it (built afresh, so a hold across a
 digest boundary sends the new digest).
 
-One JSON line per step on stdout. The `m2a-status` line records both Status values, the digest
+One JSON line per step on stdout. Logs go to stderr as svc-runtime's JSON lines, through its
+bounded writer: a stderr nobody reads drops lines instead of stalling the session. The
+`m2a-status` line records both Status values, the digest
 inputs (epoch, fork, fork version, blob parameters, genesis validators root), the ENR digest,
 both API samples, the peer's `earliest_available_slot` and a verdict per field (`genesis`,
 `fork_digest`, `enr_fork_digest`, `finalized_root`, `finalized_epoch`, `head_root`,

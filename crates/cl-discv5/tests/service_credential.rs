@@ -1,5 +1,6 @@
 //! The `cl-discv5` binary reads its node key only from `$CREDENTIALS_DIRECTORY/nodekey`: exit 1
-//! when the credential is missing or refused, and its output never shows the key.
+//! when the credential is missing or refused, and its output never shows the key. Its stderr is
+//! JSON lines, one object per line.
 
 use data_encoding::{BASE64, HEXLOWER};
 use std::io::Write as _;
@@ -36,6 +37,22 @@ fn output(o: &Output) -> String {
     )
 }
 
+/// Every stderr line is one JSON object in svc-runtime's shape: it opens with the timestamp and
+/// level, and closes with the target.
+fn assert_json_lines(o: &Output) {
+    let text = String::from_utf8_lossy(&o.stderr);
+    assert!(!text.is_empty(), "nothing logged");
+    for line in text.lines() {
+        assert!(line.starts_with(r#"{"timestamp":""#), "{line}");
+        assert!(line.contains(r#"","level":""#), "{line}");
+        assert!(line.contains(r#","fields":{"#), "{line}");
+        assert!(
+            line.contains(r#","target":""#) && line.ends_with("\"}"),
+            "{line}"
+        );
+    }
+}
+
 fn assert_no_key(text: &str) {
     assert!(!text.contains(&HEXLOWER.encode(&SECRET)), "{text}");
     assert!(!text.contains(&BASE64.encode(&SECRET)), "{text}");
@@ -45,6 +62,7 @@ fn assert_no_key(text: &str) {
 fn without_the_credential_it_refuses_to_start() {
     let o = cl_discv5(None);
     assert_eq!(o.status.code(), Some(1));
+    assert_json_lines(&o);
     assert!(
         output(&o).contains("CREDENTIALS_DIRECTORY"),
         "{}",
@@ -60,6 +78,7 @@ fn a_credential_others_can_read_is_refused() {
     let text = output(&o);
     assert!(text.contains("mode 0644"), "{text}");
     assert_no_key(&text);
+    assert_json_lines(&o);
 }
 
 #[test]
@@ -72,4 +91,5 @@ fn a_good_credential_loads_and_the_stub_stops_without_showing_the_key() {
     assert!(text.contains("node key loaded"), "{text}");
     assert!(text.contains("not runnable yet"), "{text}");
     assert_no_key(&text);
+    assert_json_lines(&o);
 }

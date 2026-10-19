@@ -36,7 +36,6 @@ thiserror = "2"
 rand = "0.8"
 
 [dev-dependencies]
-cl-chain = { path = "../cl-chain" }
 cl-engine = { path = "../cl-engine" }
 ipc = { path = "../ipc", features = ["testkit"] }
 tokio = { version = "1", features = ["io-util", "test-util"] }

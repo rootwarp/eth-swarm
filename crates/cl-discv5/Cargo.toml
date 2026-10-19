@@ -30,6 +30,9 @@ thiserror = "2"
 node-key = { path = "../node-key" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+# The binary's logging: JSON lines through the bounded stderr writer (a stalled stderr drops
+# lines, never blocks it) and the bounded flush before each exit.
+svc-runtime = { path = "../svc-runtime" }
 
 [dev-dependencies]
 ipc = { path = "../ipc", features = ["testkit"] }
@@ -38,3 +41,5 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tempfile = "3"
 # The node key's encodings the binary test greps its output for; already in the tree.
 data-encoding = "2"
+# The binary test's full stderr pipe (O_NONBLOCK while it fills); the version cl-p2p uses.
+rustix = { version = "1", features = ["fs"] }
