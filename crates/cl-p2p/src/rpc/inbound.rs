@@ -77,10 +77,16 @@
 //!   ([`super::limits::ColumnPlaces`]): at most [`RpcLimits::max_column_answers`] (8) at once,
 //!   one per peer and [`RpcLimits::max_column_answers_per_ip`] (2) per IP, each at most
 //!   [`RpcLimits::max_column_response_bytes`] (8 MiB) of SSZ, encoded one chunk at a time (an
-//!   estimated 68 MiB for all, see [`super::limits::DEFAULT_MAX_COLUMN_ANSWERS`]). A due chunk
-//!   not written within [`RpcLimits::column_write_deadline`] (1 s) resets its stream and frees
-//!   the place, so a requester that stops reading holds it for about a second, not the 10 s
-//!   exchange timeout. A request whose tokens are due waits for a place up to
+//!   estimated 68 MiB for all, see [`super::limits::DEFAULT_MAX_COLUMN_ANSWERS`]). Each answer
+//!   is written to a schedule ([`super::limits::WriteSchedule`]): chunk `i` of `n` is due at
+//!   its booked token and no earlier than `i / n` of the way through
+//!   [`RpcLimits::column_answer_window`] from when the answer took its place, and a chunk not
+//!   written within [`RpcLimits::column_write_deadline`] (1 s) of that, or of its write's
+//!   start, resets its stream and frees the place. A requester that stops reading holds it for
+//!   about a second, and one that reads a chunk just inside the deadline each time falls behind
+//!   its schedule and is cut too; no place is held past the window and the write deadline, so
+//!   slow readers spread over many IPs cannot keep every place for the 10 s exchange timeout.
+//!   A request whose tokens are due waits for a place up to
 //!   [`RpcLimits::column_queue_wait`] (2 s), then gets `2: ServerError`; at most
 //!   [`RpcLimits::column_queue_len`] (64) wait, and one past them gets `2` at once (both counted
 //!   in `queue_dropped_total{queue="rpc_column_queue"}`). A request waiting for its tokens is
@@ -1379,7 +1385,7 @@ impl<E: EthSpec> Control<E> {
             protocol,
             tokens,
             Some(self.metrics.clone()),
-            limits.column_write_deadline,
+            limits.column_deadlines(),
         );
         self.column_queue.push_back(QueuedColumn {
             peer,

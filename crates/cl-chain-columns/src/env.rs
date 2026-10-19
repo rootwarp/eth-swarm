@@ -130,6 +130,8 @@ pub(crate) fn open_rw(path: &Path, opts: WriterOptions) -> Result<Env> {
             )?;
         }
     }
+    // Pending links stored without their target's slot.
+    crate::writer::migrate_legacy_pending(&txn)?;
     txn.commit()?;
     Ok(env)
 }

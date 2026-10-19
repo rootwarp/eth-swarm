@@ -737,8 +737,10 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
     /// never holds more than its decoded chunks and one encoded one. With a pacer, a chunk whose
     /// write never completed (the future was dropped, or the write failed) gets back the part of
     /// its token still ahead, and one written whole stays charged even if the flush after it
-    /// fails, since the peer may have it all. Booked tokens are never given back here. The
-    /// answer's place goes back when this returns or is dropped.
+    /// fails, since the peer may have it all. Booked tokens are never given back here, and a
+    /// booked chunk not written by its place in the answer's schedule
+    /// ([`super::limits::WriteSchedule`]) ends the write with `TimedOut`. The answer's place
+    /// goes back when this returns or is dropped.
     async fn write_response<T>(
         &mut self,
         protocol: &Protocol,
@@ -755,6 +757,11 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
             booked,
             permit,
         } = answer;
+        let now = tokio::time::Instant::now();
+        let schedule = booked.as_ref().map(|booked| {
+            let held_since = permit.as_ref().map_or(now, |p| p.held_since());
+            booked.write_schedule(chunks.len() as u64, held_since, now)
+        });
         let _place = permit;
         for (i, chunk) in (0u64..).zip(chunks) {
             let bytes = encode_checked_chunk(&chunk)?;
@@ -767,21 +774,23 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
                 Some(booked) => Some(booked.due(i)),
                 None => reservation.as_ref().map(|r| r.due()),
             };
-            if let Some(due) = due {
-                if due > tokio::time::Instant::now() {
+            if let (Some(due), Some(schedule)) = (due, &schedule) {
+                // A column chunk: written and flushed by its place in the answer's schedule, or
+                // the stream is reset and the answer's place goes back.
+                let by = schedule.written_by(i, due, tokio::time::Instant::now());
+                let written = if due < by {
                     tokio::time::sleep_until(due).await;
-                }
-            }
-            if let Some(booked) = &booked {
-                // A column chunk: written and flushed within the deadline, or the stream is
-                // reset and the answer's place goes back.
-                let write = async {
-                    io.write_all(&bytes).await?;
-                    io.flush().await
+                    let write = async {
+                        io.write_all(&bytes).await?;
+                        io.flush().await
+                    };
+                    tokio::time::timeout_at(by, write).await.ok()
+                } else {
+                    None
                 };
-                match tokio::time::timeout(booked.write_deadline(), write).await {
-                    Ok(written) => written?,
-                    Err(_) => {
+                match written {
+                    Some(written) => written?,
+                    None => {
                         if let Some(metrics) = &self.inner.metrics {
                             metrics.timed_out(Deadline::PerChunk);
                         }
@@ -792,6 +801,11 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
                     }
                 }
                 continue;
+            }
+            if let Some(due) = due {
+                if due > tokio::time::Instant::now() {
+                    tokio::time::sleep_until(due).await;
+                }
             }
             io.write_all(&bytes).await?;
             if let Some(reservation) = reservation {
@@ -1952,6 +1966,12 @@ mod tests {
         assert_eq!(metrics.rate_limited_count(BLOCKS), 4);
     }
 
+    /// Deadlines long enough that no test write here meets them.
+    const LONG: crate::rpc::limits::ColumnDeadlines = crate::rpc::limits::ColumnDeadlines {
+        answer_window: Duration::from_secs(10),
+        write: Duration::from_secs(10),
+    };
+
     /// BUG-001, SEC-001: a column answer goes out at the tokens booked for it, holds its place
     /// until the writer returns, written or not, and a write dropped midway refunds nothing.
     #[tokio::test(start_paused = true)]
@@ -1964,7 +1984,7 @@ mod tests {
         let peer = libp2p::PeerId::random();
         let places = ColumnPlaces::new(1, 1, None);
         let start = Instant::now();
-        let booked = BookedChunks::book(&limiter, peer, BLOCKS, 3, None, Duration::from_secs(10));
+        let booked = BookedChunks::book(&limiter, peer, BLOCKS, 3, None, LONG);
         let answer = Answer {
             chunks: blocks(3),
             pacer: None,
@@ -1986,7 +2006,7 @@ mod tests {
         assert_eq!(places.held(), 0, "given back once written");
         // A write dropped before its second chunk: the place goes back, the tokens do not.
         let start = Instant::now();
-        let booked = BookedChunks::book(&limiter, peer, BLOCKS, 3, None, Duration::from_secs(10));
+        let booked = BookedChunks::book(&limiter, peer, BLOCKS, 3, None, LONG);
         let answer = Answer {
             chunks: blocks(3),
             pacer: None,
@@ -2034,7 +2054,7 @@ mod tests {
     /// write, so the answer's place goes back long before the exchange timeout.
     #[tokio::test(start_paused = true)]
     async fn a_booked_chunk_not_written_in_time_gives_its_place_back() {
-        use crate::rpc::limits::{BookedChunks, ColumnPlaces};
+        use crate::rpc::limits::{BookedChunks, ColumnDeadlines, ColumnPlaces};
         let limiter = shared_limiter(RateLimits::default());
         let peer = libp2p::PeerId::random();
         let places = ColumnPlaces::new(1, 1, None);
@@ -2043,7 +2063,15 @@ mod tests {
             chunks: blocks(2),
             pacer: None,
             booked: Some(Box::new(BookedChunks::book(
-                &limiter, peer, BLOCKS, 2, None, deadline,
+                &limiter,
+                peer,
+                BLOCKS,
+                2,
+                None,
+                ColumnDeadlines {
+                    write: deadline,
+                    ..ColumnDeadlines::default()
+                },
             ))),
             permit: places.try_take(peer, None).map(Box::new),
         };
@@ -2059,6 +2087,171 @@ mod tests {
         assert_eq!(start.elapsed(), deadline);
         assert_eq!(places.held(), 0);
         assert_eq!(metrics.timeouts(Deadline::PerChunk), 1);
+    }
+
+    /// A requester that reads a chunk every `every`, after a first `window` of chunks: the
+    /// muxer's window, then its own pace.
+    struct SlowReader {
+        every: Duration,
+        chunk: usize,
+        window: usize,
+        since: Instant,
+        taken: usize,
+        wake: Pin<Box<tokio::time::Sleep>>,
+    }
+
+    impl SlowReader {
+        fn new(every: Duration, chunk: usize, window: usize) -> Self {
+            let since = Instant::now();
+            Self {
+                every,
+                chunk,
+                window,
+                since,
+                taken: 0,
+                wake: Box::pin(tokio::time::sleep_until(since)),
+            }
+        }
+    }
+
+    impl AsyncWrite for SlowReader {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            loop {
+                let read = (Instant::now() - self.since).as_nanos() / self.every.as_nanos();
+                let room = (self.window + self.chunk * read as usize).saturating_sub(self.taken);
+                if room > 0 {
+                    let n = room.min(buf.len());
+                    self.taken += n;
+                    return Poll::Ready(Ok(n));
+                }
+                let next = self.since + self.every * (read as u32 + 1);
+                self.wake.as_mut().reset(next);
+                if self.wake.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+            }
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// SEC-001: a booked answer keeps to its schedule, not to a deadline per write. Requesters
+    /// reading a chunk every 0.9 s, each within the 1 s write deadline, two per IP on four IPs,
+    /// take all eight places and still give every one back before an honest requester's wait
+    /// for a place runs out ([`crate::rpc::limits::COLUMN_QUEUE_WAIT`]), so it is served; one
+    /// that reads at the answer's own pace is never cut.
+    #[tokio::test(start_paused = true)]
+    async fn slow_readers_on_many_ips_cannot_keep_every_place() {
+        use crate::peer_caps::IpBucket;
+        use crate::rpc::limits::{BookedChunks, ColumnDeadlines, ColumnPlaces};
+        use std::net::Ipv4Addr;
+        let limiter = shared_limiter(RateLimits::default());
+        let places = ColumnPlaces::new(8, 2, None);
+        let deadlines = ColumnDeadlines::default();
+        let chunk = encode_response(BLOCKS, &blocks(1)).unwrap().len();
+        let answer = |peer, ip: u8| Answer {
+            chunks: blocks(40),
+            pacer: None,
+            booked: Some(Box::new(BookedChunks::book(
+                &limiter, peer, BLOCKS, 40, None, deadlines,
+            ))),
+            permit: places
+                .try_take(peer, Some(IpBucket::V4(Ipv4Addr::new(10, 0, 0, ip))))
+                .map(Box::new),
+        };
+        let start = Instant::now();
+        let slow: Vec<_> = (0..8)
+            .map(|i| {
+                let answer = answer(libp2p::PeerId::random(), i / 2);
+                assert!(answer.permit.is_some(), "place {i}");
+                async move {
+                    let mut io = SlowReader::new(Duration::from_millis(900), chunk, 2 * chunk);
+                    inbound_codec()
+                        .write_response(&BLOCKS, &mut io, answer)
+                        .await
+                }
+            })
+            .collect();
+        assert_eq!(places.held(), 8);
+        let honest = libp2p::PeerId::random();
+        let mut io = Timed::default();
+        let served = async {
+            let wait = crate::rpc::limits::COLUMN_QUEUE_WAIT;
+            let mut answer = answer(honest, 9);
+            while answer.permit.is_none() {
+                assert!(start.elapsed() <= wait, "every place still held");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                answer = answer_again(answer, &places, honest);
+            }
+            inbound_codec()
+                .write_response(&BLOCKS, &mut io, answer)
+                .await
+        };
+        let (slow, served) = tokio::join!(futures::future::join_all(slow), served);
+        served.expect("the honest requester is served");
+        assert_eq!(io.writes.len(), 40);
+        for written in slow {
+            assert_eq!(written.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        }
+        assert!(start.elapsed() < crate::rpc::limits::COLUMN_QUEUE_WAIT);
+        assert_eq!(places.held(), 0);
+        // A requester that keeps up with the answer's share of the window is never cut.
+        let peer = libp2p::PeerId::random();
+        let answer = answer(peer, 1);
+        let mut io = SlowReader::new(Duration::from_millis(100), chunk, chunk);
+        inbound_codec()
+            .write_response(&BLOCKS, &mut io, answer)
+            .await
+            .expect("read at the answer's pace");
+    }
+
+    /// `answer` with a place for `peer`, if one is free now.
+    fn answer_again(
+        mut answer: Answer<E>,
+        places: &crate::rpc::limits::ColumnPlaces,
+        peer: libp2p::PeerId,
+    ) -> Answer<E> {
+        answer.permit = places.try_take(peer, None).map(Box::new);
+        answer
+    }
+
+    /// SEC-001: a place is held at most the answer window and the write deadline, counted from
+    /// when it was taken: a lookup that took long leaves less of the window to write in.
+    #[tokio::test(start_paused = true)]
+    async fn a_place_is_held_at_most_the_window_and_the_write_deadline() {
+        use crate::rpc::limits::{BookedChunks, ColumnDeadlines, ColumnPlaces};
+        let limiter = shared_limiter(RateLimits::default());
+        let places = ColumnPlaces::new(1, 1, None);
+        let deadlines = ColumnDeadlines::default();
+        let peer = libp2p::PeerId::random();
+        let chunk = encode_response(BLOCKS, &blocks(1)).unwrap().len();
+        let taken = Instant::now();
+        let answer = Answer {
+            chunks: blocks(40),
+            pacer: None,
+            booked: Some(Box::new(BookedChunks::book(
+                &limiter, peer, BLOCKS, 40, None, deadlines,
+            ))),
+            permit: places.try_take(peer, None).map(Box::new),
+        };
+        // The lookup took 3 s; then a requester reading a chunk every 100 ms needs 4 s more.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let mut io = SlowReader::new(Duration::from_millis(100), chunk, chunk);
+        let err = inbound_codec()
+            .write_response(&BLOCKS, &mut io, answer)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(taken.elapsed() <= deadlines.answer_window + deadlines.write);
+        assert_eq!(places.held(), 0);
     }
 
     #[tokio::test(start_paused = true)]

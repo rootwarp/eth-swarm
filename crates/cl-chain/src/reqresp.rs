@@ -10,7 +10,7 @@
 //!   nothing else is ever stored. A range request that names another column gets
 //!   `3: ResourceUnavailable`: every block it would include lacks that column, and "Clients
 //!   MUST include all data column sidecars of each block from which they include data column
-//!   sidecars" (L672–673). A by-root request just gets no such sidecar ("It may be less in the
+//!   sidecars" (L672–673), so the answer below would be empty. A by-root request just gets no such sidecar ("It may be less in the
 //!   case that the responding peer is missing blocks or sidecars", L728–733).
 //! - **From `earliest_available_slot`.** That is [`ColumnServer::earliest_available_slot`]:
 //!   [`earliest_servable_slot`] of the store's first stored slot, its finalized-slot watermark,
@@ -46,25 +46,37 @@
 //! in the range (every stored one, whether or not it holds a requested column), the longest
 //! chain of links (ties to the one with the higher tip, and if still tied, only the blocks the
 //! tied chains share). Blocks off it on another branch are left out. Blocks in the range but
-//! no chain left to serve (a tie with nothing shared), or a block past the chain whose link was
-//! never followed (a gap, or a block still pending its ancestor), get `3: ResourceUnavailable`:
-//! it may be on the chain, so it is never silently skipped.
+//! no chain left to serve (a tie with nothing shared) get `3: ResourceUnavailable`. A block
+//! past the chain whose link was never followed (a gap, or a block still pending its ancestor)
+//! may be on the chain, so it is never silently skipped: the answer ends before it.
+//!
+//! A block stored [`BlockLink::Pending`] names the slot of the ancestor it waits for: a
+//! blob-carrying block the store knows it lacks, whether or not any block of the range is
+//! stored. The range is read only up to the first such slot in it
+//! ([`Snapshot::first_pending_target`]), and a range with nothing stored before that slot is
+//! `3: ResourceUnavailable`, never an empty success, even while settlement has not run (a quiet
+//! store). A chain whose first block waits for an ancestor before the range starts there, as one
+//! whose parent is before the range.
 //!
 //! # Order and completeness
 //!
 //! The answer is in `(slot, column_index)` order (L675–676) and includes a block only with
-//! every requested column (L672–673). A block of the chain that lacks a requested column (some
-//! of its columns never arrived, or it holds none of them), first, in the middle or last, makes
-//! the request `3: ResourceUnavailable`: an answer without it would claim it carries no blobs
+//! every requested column (L672–673): it is the longest prefix of the chain whose blocks each
+//! hold every requested column, ending before the first block that lacks one (some of its
+//! columns never arrived, or it holds none of them) and before any slot it may lack (above).
+//! "Clients MAY limit the number of data column sidecars in the response" (L682), so a column
+//! missed on gossip shortens an answer instead of refusing it; partial blocks are never sent.
+//! When that prefix is empty the request is `3: ResourceUnavailable`: "Clients MUST respond with
+//! at least the data column sidecars of the first blob-carrying block that exists in the range,
+//! if they have it" (L668–670), and an empty answer would claim the range carries no blobs
 //! (L678–680, "Slots that do not contain known data columns MUST be skipped" only for slots
 //! without known columns). So does a blob-carrying block before the chain's first in the range,
-//! held without the requested columns, since the first blob-carrying block's sidecars must be
-//! sent if held (L667–670). Only the budget ([`ServeBudget`]: bytes and sidecars) ends an
-//! answer early, as "Clients MAY limit the number of data column sidecars in the response"
-//! (L682), before the block that would pass it; the first block always goes whole, past the
-//! budget if it must. A by-root answer ends before the identifier that would take it past the
-//! budget, its first identifier's sidecars always in. cl-p2p cuts any answer by the same rule
-//! with the same budget, so both ends agree.
+//! held without the requested columns. The budget ([`ServeBudget`]: bytes and sidecars) ends an
+//! answer the same way, before the block that would pass it (the block the read was cut at,
+//! [`cl_chain_columns::RangeRead::cut`], and only that one is spared the completeness check); the
+//! first block always goes whole, past the budget if it must. A by-root answer ends before the
+//! identifier that would take it past the budget, its first identifier's sidecars always in.
+//! cl-p2p cuts any answer by the same rule with the same budget, so both ends agree.
 //!
 //! The view (custody, `earliest_available_slot`) and the read come from one read transaction
 //! ([`Snapshot`]), so a finality prune between them cannot make a pruned slot look empty.
@@ -273,7 +285,7 @@ fn one_chain(blocks: &[ReadBlock]) -> Vec<usize> {
         .collect();
     let parent = |i: usize| match blocks[i].link {
         BlockLink::Parent(root) => at.get(&root).copied().filter(|&p| p < i),
-        BlockLink::Start | BlockLink::Gap | BlockLink::Pending(_) => None,
+        BlockLink::Start | BlockLink::Gap | BlockLink::Pending(..) => None,
     };
     // Parents come before their children in slot order.
     let mut depth = vec![0usize; blocks.len()];
@@ -340,9 +352,12 @@ pub fn columns_by_range(
         )));
     }
     let end = start_slot.saturating_add(count).min(last.saturating_add(1));
+    // A blob-carrying block the store lacks though a stored block waits for it: the answer
+    // ends before it, and with nothing before it the range is unavailable.
+    let missing = snapshot.first_pending_target(start_slot, end, view.deadline)?;
     let read = snapshot.columns_in_range(
         start_slot,
-        end,
+        missing.unwrap_or(end),
         |i| wanted.contains(&i),
         view.range_budget(),
     )?;
@@ -366,29 +381,21 @@ pub fn columns_by_range(
     }
     let chain = one_chain(&blocks);
     let Some(&first) = chain.first() else {
-        return if blocks.is_empty() {
-            Ok(Vec::new())
-        } else {
-            Err(Refusal::Unavailable(
+        return match (blocks.is_empty(), missing) {
+            (true, None) => Ok(Vec::new()),
+            (true, Some(slot)) => Err(Refusal::Unavailable(format!(
+                "the block at slot {slot} is not held"
+            ))),
+            (false, _) => Err(Refusal::Unavailable(
                 "the blocks of the range share no chain".into(),
-            ))
+            )),
         };
     };
-    let tip = *chain.last().expect("not empty");
-    // A block past the chain whose link was not followed may be on it: never skip it.
-    if let Some(unlinked) = blocks[tip + 1..]
-        .iter()
-        .find(|b| matches!(b.link, BlockLink::Gap | BlockLink::Pending(_)))
-    {
-        return Err(Refusal::Unavailable(format!(
-            "the block at slot {} does not link to the chain",
-            unlinked.slot
-        )));
-    }
     // The chain's first block must be the range's first blob-carrying block on it.
     let unservable_start = match blocks[first].link {
         BlockLink::Parent(parent) => snapshot.slot_of(&parent)?.is_some_and(|s| s >= start_slot),
-        BlockLink::Gap | BlockLink::Pending(_) => blocks[first].slot > start_slot,
+        BlockLink::Pending(_, target) => target >= start_slot,
+        BlockLink::Gap => blocks[first].slot > start_slot,
         BlockLink::Start => false,
     };
     if unservable_start {
@@ -397,19 +404,33 @@ pub fn columns_by_range(
             blocks[first].slot
         )));
     }
-    let last_read = blocks.len() - 1;
+    // A block past the chain whose link was not followed may be on it: the answer ends before
+    // it, never skips it.
+    let tip = *chain.last().expect("not empty");
+    let unlinked = blocks[tip + 1..]
+        .iter()
+        .find(|b| matches!(b.link, BlockLink::Gap | BlockLink::Pending(..)))
+        .map(|b| b.slot);
     let mut served = Vec::new();
+    let mut ended = None;
     for &i in &chain {
         let block = &mut blocks[i];
+        if let Some(slot) = unlinked.filter(|&slot| block.slot >= slot) {
+            ended = Some(format!(
+                "the block at slot {slot} does not link to the chain"
+            ));
+            break;
+        }
+        // The budget cut this block: the answer ends before it.
+        if read.cut == Some((block.slot, block.root)) {
+            break;
+        }
         if block.columns.len() != wanted.len() {
-            // Only the budget may end an answer early, and only before a block it cut.
-            if read.truncated && i == last_read && i != first {
-                break;
-            }
-            return Err(Refusal::Unavailable(format!(
+            ended = Some(format!(
                 "the block at slot {} lacks requested columns",
                 block.slot
-            )));
+            ));
+            break;
         }
         served.extend(block.columns.drain(..).map(|r| Served {
             slot: r.slot,
@@ -417,6 +438,15 @@ pub fn columns_by_range(
             index: r.index,
             ssz: r.ssz,
         }));
+    }
+    // The chain holds a blob-carrying block: an empty answer would claim it holds none.
+    if served.is_empty() {
+        return Err(Refusal::Unavailable(ended.unwrap_or_else(|| {
+            format!(
+                "the budget cut the first block, at slot {}",
+                blocks[first].slot
+            )
+        })));
     }
     Ok(served)
 }

@@ -20,13 +20,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cl_chain_columns::{Column, ColumnReader, ColumnWriter, Error, WriterOptions};
+use cl_chain_columns::{BlockLink, Column, ColumnReader, ColumnWriter, Error, WriterOptions};
 
 const CHILD_MODE: &str = "CL_CHAIN_COLUMNS_CHILD_MODE";
 const CHILD_PATH: &str = "CL_CHAIN_COLUMNS_CHILD_PATH";
 const ROOT: [u8; 32] = [0x11; 32];
 
 const READY: &str = "CL_CHAIN_COLUMNS_CHILD_READY";
+
+/// A block the `migrate-and-link` child stores linked to [`ROOT`].
+const LINKED: [u8; 32] = [0x22; 32];
 
 /// How long a child may take to get ready, or to exit, before it is killed.
 const CHILD_DEADLINE: Duration = Duration::from_secs(60);
@@ -146,6 +149,20 @@ fn child_entry() {
         "hang" => loop {
             std::thread::park();
         },
+        "migrate-and-link" => {
+            let writer = ColumnWriter::open(&path).unwrap();
+            writer
+                .write_block_columns(
+                    11,
+                    &LINKED,
+                    BlockLink::Parent(ROOT),
+                    &[Column {
+                        index: 3,
+                        ssz: b"linked",
+                    }],
+                )
+                .unwrap();
+        }
         "writer-then-crash" => {
             let _writer = ColumnWriter::open(&path).unwrap();
             std::process::abort();
@@ -258,4 +275,67 @@ fn a_child_that_never_exits_is_killed_at_the_deadline() {
     let err = hung.wait(Duration::from_millis(300)).unwrap_err();
     assert!(err.contains("did not exit"), "{err}");
     assert!(hung.has_exited(), "the hung child was killed");
+}
+
+/// Makes the env at `path` look as one written before the links table existed: drops the table
+/// and the contiguous-from slot, through MDBX itself.
+fn make_legacy(path: &Path) {
+    use cl_chain_columns::keys::{CONTIGUOUS_FROM_KEY, LINKS_TABLE, META_TABLE, TABLES};
+    use libmdbx::{Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, SyncMode};
+    let db = Database::<NoWriteMap>::open_with_options(
+        path,
+        DatabaseOptions {
+            max_tables: Some(TABLES.len() as u64),
+            mode: Mode::ReadWrite(ReadWriteOptions {
+                sync_mode: SyncMode::Durable,
+                // The writer's geometry, so this open leaves it as it is.
+                max_size: Some(cl_chain_columns::DEFAULT_MAX_SIZE as isize),
+                growth_step: Some(256 << 20),
+                ..ReadWriteOptions::default()
+            }),
+            ..DatabaseOptions::default()
+        },
+    )
+    .unwrap();
+    let txn = db.begin_rw_txn().unwrap();
+    let links = txn.open_table(Some(LINKS_TABLE)).unwrap();
+    // SAFETY: no other handle of the table is open in this process.
+    unsafe { txn.drop_table(links).unwrap() };
+    let meta = txn.open_table(Some(META_TABLE)).unwrap();
+    let _ = txn.del(&meta, CONTIGUOUS_FROM_KEY, None);
+    txn.commit().unwrap();
+}
+
+/// CR-005: a reader (cl-store) opened on an env without the links table reads the links a
+/// writer in another process migrated and wrote after it opened, from its next snapshot on.
+#[test]
+fn a_reader_opened_before_the_migration_reads_links_after_it() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        writer
+            .write_block_columns(
+                9,
+                &ROOT,
+                BlockLink::Start,
+                &[Column {
+                    index: 3,
+                    ssz: b"col-3",
+                }],
+            )
+            .unwrap();
+    }
+    make_legacy(dir.path());
+    let reader = ColumnReader::open(dir.path()).unwrap();
+    assert_eq!(reader.link_of(&ROOT).unwrap(), Some(BlockLink::Gap));
+    assert_eq!(reader.contiguous_from().unwrap(), Some(10));
+    assert!(run_child("migrate-and-link", dir.path()).success());
+    // The old block stays claimed past; the new one reads its link, not a legacy gap.
+    assert_eq!(reader.contiguous_from().unwrap(), Some(10));
+    assert_eq!(reader.link_of(&ROOT).unwrap(), Some(BlockLink::Gap));
+    assert_eq!(
+        reader.link_of(&LINKED).unwrap(),
+        Some(BlockLink::Parent(ROOT))
+    );
 }

@@ -23,7 +23,9 @@
 //!   cannot reset its way out of the bill: once the answer's size is known the tokens it does not
 //!   use are given back ([`BookedChunks::settle`]), never more, and a reset refunds nothing.
 //! - [`ColumnPlaces`]: the column answers held at once, from the lookup until the stream's
-//!   writer returns, at most one per peer ([`AnswerPermit`]).
+//!   writer returns, at most one per peer ([`AnswerPermit`]), each written to its booked
+//!   schedule and held no longer than the answer window and the write deadline
+//!   ([`WriteSchedule`]).
 //! - [`ignore_queue`]: a bounded `tokio::sync::mpsc` queue fed with `try_send`. Overload never
 //!   blocks the swarm and never ACCEPTs: an item that does not fit is IGNOREd (dropped) and
 //!   counted in `queue_dropped_total{queue}`.
@@ -44,6 +46,7 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -172,11 +175,36 @@ pub const DEFAULT_MAX_COLUMN_ANSWERS: usize = 8;
 /// take all [`DEFAULT_MAX_COLUMN_ANSWERS`] places.
 pub const DEFAULT_MAX_COLUMN_ANSWERS_PER_IP: usize = 2;
 
-/// How long a due column chunk may take to be written \[est\]: 1 s. A requester that stopped
-/// reading fills its stream's window and then holds the next chunk; past this its stream is
-/// reset and the answer's place given back, so it cannot hold a place for the 10 s exchange
-/// timeout. Counted in `rpc_timeouts_total{kind="per_chunk"}`.
+/// How far a column chunk may fall behind its answer's schedule before its stream is reset
+/// \[est\]: 1 s. Chunk `i` of `n` is due at its token, and no earlier than `i / n` of the way
+/// through the answer window ([`COLUMN_ANSWER_WINDOW`], from when the answer took its place), so
+/// a burst never asks for the whole answer at once; it must be written and flushed within this
+/// of that, and the place goes back within the window and this of being taken
+/// ([`WriteSchedule`]). The deadline is not a new one per write: a requester that reads a chunk
+/// just inside it each time still falls behind its schedule and is reset, so it holds a place for
+/// about a second past the pace it keeps, not the 10 s exchange timeout. One that reads at the
+/// answer's pace (8 MiB in 5 s, about 1.7 MB/s) is never cut. Counted in
+/// `rpc_timeouts_total{kind="per_chunk"}`.
 pub const COLUMN_WRITE_DEADLINE: Duration = Duration::from_secs(1);
+
+/// The deadlines a column answer is written under ([`RpcLimits::column_deadlines`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnDeadlines {
+    /// How long the answer's chunks may take, from when it took its place.
+    pub answer_window: Duration,
+    /// How far a chunk may fall behind the answer's schedule ([`COLUMN_WRITE_DEADLINE`]).
+    pub write: Duration,
+}
+
+impl Default for ColumnDeadlines {
+    /// [`COLUMN_ANSWER_WINDOW`] and [`COLUMN_WRITE_DEADLINE`].
+    fn default() -> Self {
+        Self {
+            answer_window: COLUMN_ANSWER_WINDOW,
+            write: COLUMN_WRITE_DEADLINE,
+        }
+    }
+}
 
 /// Column requests waiting for their tokens or a place, over every peer \[est\]: at most 64 × a
 /// by-root request (136 KiB) held. Past it a request gets `2: ServerError`.
@@ -207,8 +235,8 @@ pub struct RpcLimits {
     pub max_column_response_bytes: usize,
     /// Column answers held at once by the peers of one IP (an IPv6 /58).
     pub max_column_answers_per_ip: usize,
-    /// How long a due column chunk may take to be written before its stream is reset and its
-    /// place given back.
+    /// How far a column chunk may fall behind its answer's schedule before its stream is reset
+    /// and its place given back ([`COLUMN_WRITE_DEADLINE`]).
     pub column_write_deadline: Duration,
 }
 
@@ -229,6 +257,15 @@ impl Default for RpcLimits {
 }
 
 impl RpcLimits {
+    /// The deadlines a column answer is written under.
+    #[must_use]
+    pub fn column_deadlines(&self) -> ColumnDeadlines {
+        ColumnDeadlines {
+            answer_window: self.column_answer_window,
+            write: self.column_write_deadline,
+        }
+    }
+
     /// The most sidecars one answer of `protocol` holds: its share of what the quota delivers
     /// from a full bucket within [`Self::column_answer_window`], `burst + window / period`,
     /// split between the [`MAX_CONCURRENT_REQUESTS`] streams a peer may hold open, so two
@@ -260,8 +297,14 @@ pub struct RateLimiter {
     created: u64,
 }
 
+/// How many of its latest refunds a bucket remembers, by the charge each gave back from \[est\]:
+/// a peer has at most [`MAX_CONCURRENT_REQUESTS`] answers of a protocol open, and each column
+/// answer refunds once. Past it a booking errs on the side of the bucket
+/// ([`Bucket::moved_before`]).
+pub(crate) const REFUND_LOG_LEN: usize = 16;
+
 /// One (peer, protocol) bucket.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Bucket {
     /// The theoretical arrival time of the next chunk.
     next: Instant,
@@ -269,6 +312,69 @@ struct Bucket {
     refunded: Duration,
     /// Which bucket this is, so a charge on a pruned bucket refunds nothing to its successor.
     id: u64,
+    /// Charges made on this bucket so far: the number of the next one.
+    charges: u64,
+    /// The latest refunds, oldest first: the number of the charge each gave back from, and how
+    /// far it moved `next` back.
+    refunds: VecDeque<(u64, Duration)>,
+    /// Refunds ever made: one past the last of `refunds`.
+    logged: u64,
+}
+
+impl Bucket {
+    fn new(now: Instant, id: u64) -> Self {
+        Self {
+            next: now,
+            refunded: Duration::ZERO,
+            id,
+            charges: 0,
+            refunds: VecDeque::new(),
+            logged: 0,
+        }
+    }
+
+    /// Where a charge that moves `next` to `until` sits, as its [`Booking`].
+    fn book(&mut self, until: Instant) -> Booking {
+        self.next = until;
+        let booking = Booking {
+            bucket: self.id,
+            seq: self.charges,
+            until,
+            refunded: self.refunded,
+            logged: self.logged,
+        };
+        self.charges += 1;
+        booking
+    }
+
+    /// How far the refunds of the charges before `booked` moved `next` back since it was
+    /// booked: what moved `booked` itself. `Err` with the part still logged if some of them
+    /// were forgotten ([`REFUND_LOG_LEN`]), a lower bound.
+    fn moved_before(&self, booked: &Booking) -> Result<Duration, Duration> {
+        let first_kept = self.logged - self.refunds.len() as u64;
+        let skip = usize::try_from(booked.logged.saturating_sub(first_kept)).unwrap_or(usize::MAX);
+        let moved = self
+            .refunds
+            .iter()
+            .skip(skip)
+            .filter(|(seq, _)| *seq < booked.seq)
+            .fold(Duration::ZERO, |sum, (_, d)| sum.saturating_add(*d));
+        if booked.logged < first_kept {
+            Err(moved)
+        } else {
+            Ok(moved)
+        }
+    }
+
+    /// Logs a refund of the charge numbered `seq` that moved `next` back by `moved`.
+    fn log_refund(&mut self, seq: u64, moved: Duration) {
+        if self.refunds.len() >= REFUND_LOG_LEN {
+            self.refunds.pop_front();
+        }
+        self.refunds.push_back((seq, moved));
+        self.logged += 1;
+        self.refunded = self.refunded.saturating_add(moved);
+    }
 }
 
 /// `n` chunks' tokens booked at once ([`RateLimiter::charge_block`]): chunk `i` may go at
@@ -326,13 +432,16 @@ pub struct Charge {
     booked: Option<Booking>,
 }
 
-/// Where a charged period sits: its bucket, the bucket's `next` right after the charge (the
-/// end of the period) and the bucket's `refunded` then.
+/// Where a charged span sits: its bucket, its number there, its end (the bucket's `next` right
+/// after the charge, less what it gave back since), and the bucket's `refunded` and refunds
+/// logged then.
 #[derive(Debug, PartialEq, Eq)]
 struct Booking {
     bucket: u64,
+    seq: u64,
     until: Instant,
     refunded: Duration,
+    logged: u64,
 }
 
 impl Charge {
@@ -365,27 +474,24 @@ impl RateLimiter {
                 booked: None,
             };
         };
-        let created = &mut self.created;
-        let bucket = self.buckets.entry((peer, protocol)).or_insert_with(|| {
-            *created += 1;
-            Bucket {
-                next: now,
-                refunded: Duration::ZERO,
-                id: *created,
-            }
-        });
+        let bucket = self.bucket(peer, protocol, now);
         let start = bucket.next.max(now);
-        bucket.next = start + quota.period;
+        let booked = bucket.book(start + quota.period);
         Charge {
             due: start
                 .checked_sub(quota.tolerance())
                 .map_or(now, |at| at.max(now)),
-            booked: Some(Booking {
-                bucket: bucket.id,
-                until: bucket.next,
-                refunded: bucket.refunded,
-            }),
+            booked: Some(booked),
         }
+    }
+
+    /// `peer`'s `protocol` bucket, a full one made at `now` if there is none.
+    fn bucket(&mut self, peer: PeerId, protocol: Protocol, now: Instant) -> &mut Bucket {
+        let created = &mut self.created;
+        self.buckets.entry((peer, protocol)).or_insert_with(|| {
+            *created += 1;
+            Bucket::new(now, *created)
+        })
     }
 
     /// Charges `n` response chunks of `protocol` to `peer` at once, one period after the other
@@ -407,31 +513,19 @@ impl RateLimiter {
                 booked: None,
             };
         };
-        let created = &mut self.created;
-        let bucket = self.buckets.entry((peer, protocol)).or_insert_with(|| {
-            *created += 1;
-            Bucket {
-                next: now,
-                refunded: Duration::ZERO,
-                id: *created,
-            }
-        });
+        let bucket = self.bucket(peer, protocol, now);
         let start = bucket.next.max(now);
         let span = quota
             .period
             .saturating_mul(u32::try_from(n).unwrap_or(u32::MAX));
-        bucket.next = start + span;
+        let booked = bucket.book(start + span);
         BlockCharge {
             start,
             booked_at: now,
             period: quota.period,
             tolerance: quota.tolerance(),
             n,
-            booked: Some(Booking {
-                bucket: bucket.id,
-                until: bucket.next,
-                refunded: bucket.refunded,
-            }),
+            booked: Some(booked),
         }
     }
 
@@ -464,8 +558,11 @@ impl RateLimiter {
         }
     }
 
-    /// When chunk `i` of `charge` may be sent now: as booked, moved up by every refund of
-    /// `peer`'s `protocol` bucket since the booking.
+    /// When chunk `i` of `charge` may be sent now: as booked, moved up by the refunds of the
+    /// charges booked before it on `peer`'s `protocol` bucket, made since. Its own refunds and
+    /// those of later charges move only the charges after them. If the bucket forgot some of
+    /// those refunds, it moves up by the ones it still knows: later than it could, never
+    /// earlier.
     #[must_use]
     pub fn due_of(
         &self,
@@ -481,7 +578,7 @@ impl RateLimiter {
                 self.buckets
                     .get(&(peer, protocol))
                     .filter(|b| b.id == booked.bucket)
-                    .map(|b| b.refunded.saturating_sub(booked.refunded))
+                    .map(|b| b.moved_before(booked).unwrap_or_else(|known| known))
             })
             .unwrap_or_default();
         charge.due_after(i, shift)
@@ -502,13 +599,15 @@ impl RateLimiter {
             return;
         }
         charge.n -= unused;
-        let Some(booked) = &charge.booked else {
+        let Some(booked) = &mut charge.booked else {
             return;
         };
         let back = charge
             .period
             .saturating_mul(u32::try_from(unused).unwrap_or(u32::MAX));
-        self.give_back(peer, protocol, booked, back, now);
+        let moved = self.give_back(peer, protocol, booked, back, now);
+        // Its span now ends that much earlier.
+        booked.until = booked.until.checked_sub(moved).unwrap_or(booked.until);
     }
 
     /// [`Self::charge`], for a chunk that is never refunded: when it may be sent.
@@ -520,10 +619,11 @@ impl RateLimiter {
     /// `protocol` to `peer` that was never sent: at most one period, and nothing once the
     /// period ran out, since time since spent it and later chunks may hold the bucket now.
     ///
-    /// A refund moves the bucket back, and with it at most that far every charge after the
-    /// refunded one, so `until` less what was refunded since is never later than where the
-    /// period really ends: a refund never gives back more than the live part of its charge.
-    /// The bucket never moves before `now`, so refunds cannot build a burst.
+    /// A refund moves the bucket back, and with it every charge after the refunded one, so a
+    /// charge's period ends where it was booked less the refunds of the charges before it made
+    /// since (`Bucket::moved_before`; every refund since, if the bucket forgot some, which is
+    /// never less): a refund never gives back more than the live part of its charge. The
+    /// bucket never moves before `now`, so refunds cannot build a burst.
     pub fn refund(&mut self, peer: PeerId, protocol: Protocol, charge: Charge, now: Instant) {
         let (Some(quota), Some(booked)) = (self.limits.quota(protocol), charge.booked) else {
             return;
@@ -532,7 +632,8 @@ impl RateLimiter {
     }
 
     /// Moves `peer`'s `protocol` bucket back by what is still ahead of `now` of the last `most`
-    /// of the span `booked` ends, at most `most`.
+    /// of the span `booked` ends, at most `most`, and logs it as a refund of `booked`. Returns
+    /// how far it moved.
     fn give_back(
         &mut self,
         peer: PeerId,
@@ -540,15 +641,17 @@ impl RateLimiter {
         booked: &Booking,
         most: Duration,
         now: Instant,
-    ) {
+    ) -> Duration {
         let Some(bucket) = self
             .buckets
             .get_mut(&(peer, protocol))
             .filter(|bucket| bucket.id == booked.bucket)
         else {
-            return;
+            return Duration::ZERO;
         };
-        let moved_since = bucket.refunded.saturating_sub(booked.refunded);
+        let moved_since = bucket
+            .moved_before(booked)
+            .unwrap_or_else(|_| bucket.refunded.saturating_sub(booked.refunded));
         let live = booked
             .until
             .checked_sub(moved_since)
@@ -558,10 +661,13 @@ impl RateLimiter {
             .next
             .checked_sub(live)
             .map_or(now, |back| back.max(now));
-        if back < bucket.next {
-            bucket.refunded = bucket.refunded.saturating_add(bucket.next - back);
-            bucket.next = back;
+        if back >= bucket.next {
+            return Duration::ZERO;
         }
+        let moved = bucket.next - back;
+        bucket.next = back;
+        bucket.log_refund(booked.seq, moved);
+        moved
     }
 
     /// Forgets the buckets of every peer `connected` rejects that are full again, so a peer
@@ -698,7 +804,7 @@ pub struct BookedChunks {
     protocol: Protocol,
     charge: BlockCharge,
     metrics: Option<RpcMetrics>,
-    write_deadline: Duration,
+    deadlines: ColumnDeadlines,
 }
 
 impl fmt::Debug for BookedChunks {
@@ -712,8 +818,8 @@ impl fmt::Debug for BookedChunks {
 }
 
 impl BookedChunks {
-    /// Books `n` chunks of `protocol` to `peer` in `limiter`, each to be written within
-    /// `write_deadline` once due, counting every withheld chunk in
+    /// Books `n` chunks of `protocol` to `peer` in `limiter`, to be written under `deadlines`
+    /// ([`Self::write_schedule`]), counting every withheld chunk in
     /// `rpc_rate_limited_total{protocol}` if `metrics` is given.
     #[must_use]
     pub fn book(
@@ -722,7 +828,7 @@ impl BookedChunks {
         protocol: Protocol,
         n: u64,
         metrics: Option<RpcMetrics>,
-        write_deadline: Duration,
+        deadlines: ColumnDeadlines,
     ) -> Self {
         let charge = lock(limiter).charge_block(peer, protocol, n, Instant::now());
         Self {
@@ -731,7 +837,7 @@ impl BookedChunks {
             protocol,
             charge,
             metrics,
-            write_deadline,
+            deadlines,
         }
     }
 
@@ -741,10 +847,22 @@ impl BookedChunks {
         lock(&self.limiter).due_of(self.peer, self.protocol, &self.charge, 0)
     }
 
-    /// How long a due chunk may take to be written.
+    /// The schedule `chunks` chunks are written to from `now`, by an answer that took its place
+    /// at `held_since`: chunk `i` is due at its token ([`Self::due`]) and its share of the
+    /// window, `i / chunks` of the way from `now` to `held_since` + the answer window, and must
+    /// be written within the write deadline of the later of the two, and of its write's start
+    /// ([`WriteSchedule::written_by`]). The place is held no longer than the window and the
+    /// write deadline from `held_since`.
     #[must_use]
-    pub fn write_deadline(&self) -> Duration {
-        self.write_deadline
+    pub fn write_schedule(&self, chunks: u64, held_since: Instant, now: Instant) -> WriteSchedule {
+        let end = (held_since + self.deadlines.answer_window).max(now);
+        WriteSchedule {
+            start: now,
+            span: end - now,
+            chunks: chunks.max(1),
+            write: self.deadlines.write,
+            hold_until: held_since + self.deadlines.answer_window + self.deadlines.write,
+        }
     }
 
     /// The tokens still booked.
@@ -781,6 +899,32 @@ impl BookedChunks {
             );
         }
         due
+    }
+}
+
+/// When each chunk of a column answer must be written by ([`BookedChunks::write_schedule`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteSchedule {
+    start: Instant,
+    /// From `start` to the end of the answer window.
+    span: Duration,
+    chunks: u64,
+    write: Duration,
+    hold_until: Instant,
+}
+
+impl WriteSchedule {
+    /// When chunk `i`, due at `due`, must be written and flushed by if its write starts at
+    /// `now`: the write deadline after the later of `due` and its share of the window, never
+    /// past the place's hold, and never more than the write deadline after the later of `due`
+    /// and `now` (a requester that stopped reading is cut as soon as it holds a chunk that long).
+    #[must_use]
+    pub fn written_by(&self, i: u64, due: Instant, now: Instant) -> Instant {
+        let share = self.span.as_nanos() * u128::from(i.min(self.chunks)) / u128::from(self.chunks);
+        let share = Duration::from_nanos(u64::try_from(share).unwrap_or(u64::MAX));
+        (due.max(self.start + share) + self.write)
+            .min(due.max(now) + self.write)
+            .min(self.hold_until)
     }
 }
 
@@ -850,6 +994,7 @@ impl ColumnPlaces {
             peer,
             ip,
             bytes: 0,
+            since: Instant::now(),
         })
     }
 
@@ -884,6 +1029,8 @@ pub struct AnswerPermit {
     peer: PeerId,
     ip: Option<IpBucket>,
     bytes: usize,
+    /// When it was taken.
+    since: Instant,
 }
 
 impl fmt::Debug for AnswerPermit {
@@ -896,6 +1043,12 @@ impl fmt::Debug for AnswerPermit {
 }
 
 impl AnswerPermit {
+    /// When the place was taken: its answer's window starts then ([`WriteSchedule`]).
+    #[must_use]
+    pub fn held_since(&self) -> Instant {
+        self.since
+    }
+
     /// The answer holds `bytes` of SSZ from now on.
     pub fn hold_bytes(&mut self, bytes: usize) {
         let mut state = self.places.state();
@@ -1237,6 +1390,91 @@ mod tests {
         assert_eq!(
             limiter.due_of(peer, p, &second, 1),
             now + Duration::from_secs(1)
+        );
+    }
+
+    /// CR-002: a booking moves up only for the refunds of bookings before it. Its own unused
+    /// tail and the refunds of bookings after it leave its due times as booked, so no more than
+    /// the burst is ever due at once.
+    #[test]
+    fn a_booking_moves_up_only_for_refunds_of_bookings_before_it() {
+        let limits = RateLimits::default();
+        let quota = limits.data_columns_by_range;
+        let period = quota.period;
+        let p = Protocol::DataColumnsByRangeV1;
+        let peer = PeerId::random();
+        let now = Instant::now();
+        let mut limiter = RateLimiter::new(limits);
+        let first = limiter.charge_block(peer, p, 756, now);
+        let mut second = limiter.charge_block(peer, p, 756, now);
+        let booked: Vec<Instant> = (0..756)
+            .map(|i| limiter.due_of(peer, p, &second, i))
+            .collect();
+        assert_eq!(booked[0], now + period * (756 - 511));
+        // The second answer holds 376: its own tail goes back, its due times stay.
+        limiter.refund_tail(peer, p, &mut second, 380, now);
+        assert_eq!(second.tokens(), 376);
+        for (i, &at) in (0..376).zip(&booked) {
+            assert_eq!(limiter.due_of(peer, p, &second, i), at, "chunk {i}");
+        }
+        let due_at = |limiter: &RateLimiter, at: Instant| {
+            (0..first.tokens())
+                .filter(|&i| limiter.due_of(peer, p, &first, i) <= at)
+                .count()
+                + (0..second.tokens())
+                    .filter(|&i| limiter.due_of(peer, p, &second, i) <= at)
+                    .count()
+        };
+        assert_eq!(due_at(&limiter, now), quota.burst as usize, "the burst");
+        // What went back is free: a third booking goes right after the second's kept tokens.
+        let third = limiter.charge_block(peer, p, 1, now);
+        assert_eq!(
+            limiter.due_of(peer, p, &third, 0),
+            now + period * (756 + 376 - 511)
+        );
+        // A refund of a later booking leaves an earlier one as booked.
+        let mut limiter = RateLimiter::new(limits);
+        let first = limiter.charge_block(peer, p, 756, now);
+        let mut second = limiter.charge_block(peer, p, 756, now);
+        let booked: Vec<Instant> = (0..756)
+            .map(|i| limiter.due_of(peer, p, &first, i))
+            .collect();
+        limiter.refund_tail(peer, p, &mut second, 756, now);
+        for (i, &at) in (0..756).zip(&booked) {
+            assert_eq!(limiter.due_of(peer, p, &first, i), at, "chunk {i}");
+        }
+    }
+
+    /// CR-002: past the refunds a bucket remembers, a booking's due times never move up and a
+    /// refund never gives back more than the live part of its charge.
+    #[test]
+    fn forgotten_refunds_err_on_the_side_of_the_bucket() {
+        let quota = Quota::new(1, Duration::from_secs(1));
+        let mut limiter = RateLimiter::new(RateLimits {
+            data_columns_by_range: quota,
+            ..RateLimits::default()
+        });
+        let p = Protocol::DataColumnsByRangeV1;
+        let peer = PeerId::random();
+        let now = Instant::now();
+        let early: Vec<BlockCharge> = (0..=REFUND_LOG_LEN)
+            .map(|_| limiter.charge_block(peer, p, 1, now))
+            .collect();
+        let mut last = limiter.charge_block(peer, p, 2, now);
+        let booked = limiter.due_of(peer, p, &last, 0);
+        // More refunds of earlier bookings than the bucket remembers.
+        for mut charge in early {
+            limiter.refund_tail(peer, p, &mut charge, 1, now);
+        }
+        let moved = limiter.due_of(peer, p, &last, 0);
+        assert!(moved <= booked && moved > now, "{moved:?}");
+        // Its own tail is still given back, no more than it booked.
+        let next = limiter.clone().schedule(peer, p, now);
+        limiter.refund_tail(peer, p, &mut last, 1, now);
+        let after = limiter.clone().schedule(peer, p, now);
+        assert!(
+            after < next && next - after <= quota.period,
+            "{next:?} {after:?}"
         );
     }
 

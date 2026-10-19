@@ -45,16 +45,20 @@
 //!    chain, from the parent roots of the blocks the reference vouches for. The column's task
 //!    finds the nearest ancestor that is stored or carries blobs, passing through ancestors
 //!    without blobs (they have no columns), at most [`MAX_LINK_WALK`] blocks back, and hands it
-//!    to the writer as [`BlockLink::Pending`]. An ancestor before `cgc_set_slot` or at or below
-//!    the finalized watermark is [`BlockLink::Start`]; one the reference cannot vouch for, or a
-//!    walk past its bound, is [`BlockLink::Gap`]. The writer decides at write time, after every
-//!    earlier batch committed: an ancestor stored by then is the block's
-//!    [`BlockLink::Parent`]; one not stored yet leaves the block pending, and it links as soon
+//!    to the writer as [`BlockLink::Pending`] with the ancestor's slot. An ancestor before
+//!    `cgc_set_slot` or at or below the finalized watermark is [`BlockLink::Start`]; one the
+//!    reference cannot vouch for, or a walk past its bound, is [`BlockLink::Gap`]. The writer
+//!    decides at write time, after every earlier batch committed: an ancestor stored by then is
+//!    the block's [`BlockLink::Parent`], and one finality covers by then (pruned, or refused) a
+//!    [`BlockLink::Start`]; one not stored yet leaves the block pending, and it links as soon
 //!    as the ancestor's columns are written, so a parent and child released together link
-//!    whatever order they are written in. A block still pending once the store is
-//!    [`PENDING_LINK_SLOTS`] past it is settled as a [`BlockLink::Gap`]
-//!    ([`ColumnWriter::settle_pending`]), and the store's contiguous-from slot rises to it
-//!    ([`ColumnReader::contiguous_from`]): the Status never claims the slots before a gap.
+//!    whatever order they are written in. A gap from a later walk that failed does not replace
+//!    a pending link. A block still pending once the store is [`PENDING_LINK_SLOTS`] past it is
+//!    settled: a start if finality covers the ancestor's slot by then, else a
+//!    [`BlockLink::Gap`] ([`ColumnWriter::settle_pending`]), and the store's contiguous-from
+//!    slot rises to it ([`ColumnReader::contiguous_from`]): the Status never claims the slots
+//!    before a gap. Until then a range answer never passes the ancestor's slot
+//!    ([`crate::reqresp`]).
 //! 7. **The write**, on the [`WRITER_THREAD`] thread: the columns of one block that the writer
 //!    takes off its queue together, in one [`ColumnWriter::write_columns`] call, which commits
 //!    them in transactions of at most
@@ -858,7 +862,9 @@ where
         let mut parent = block.parent_root;
         for _ in 0..=MAX_LINK_WALK {
             match reader.slot_of(&parent) {
-                Ok(Some(_)) => return BlockLink::Pending(parent),
+                // Stored now; the writer links it, or starts the chain there if finality pruned
+                // it before the write.
+                Ok(Some(slot)) => return BlockLink::Pending(parent, slot),
                 Ok(None) => {}
                 Err(_) => return BlockLink::Gap,
             }
@@ -870,7 +876,7 @@ where
             }
             if !ancestor.commitments.is_empty() {
                 // Not stored yet: the writer decides once the batches before this one are in.
-                return BlockLink::Pending(ancestor.root);
+                return BlockLink::Pending(ancestor.root, ancestor.slot);
             }
             parent = ancestor.parent_root;
         }

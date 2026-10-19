@@ -1401,7 +1401,10 @@ mod tests {
         assert_eq!(reader.link_of(&b18).unwrap(), Some(BlockLink::Parent(b17)));
         assert_eq!(reader.link_of(&b20).unwrap(), Some(BlockLink::Parent(b18)));
         // 21's columns may still come: 22 waits for it, and raises nothing yet.
-        assert_eq!(reader.link_of(&b22).unwrap(), Some(BlockLink::Pending(m21)));
+        assert_eq!(
+            reader.link_of(&b22).unwrap(),
+            Some(BlockLink::Pending(m21, 21))
+        );
         assert_eq!(reader.contiguous_from().unwrap(), None);
         // A parent the reference does not know: a gap at once. Once the store is past 22 by
         // the pending wait, 22 is settled as a gap too.
@@ -1446,7 +1449,7 @@ mod tests {
                     s.store(&child_column).await;
                     assert_eq!(
                         s.writer.reader().link_of(&child).unwrap(),
-                        Some(BlockLink::Pending(parent))
+                        Some(BlockLink::Pending(parent, 17))
                     );
                     s.store(&parent_column).await;
                 }

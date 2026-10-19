@@ -111,8 +111,12 @@ fn by_range_order() {
         .all(|w| (w[0].slot, w[0].index) < (w[1].slot, w[1].index)));
 }
 
+/// A block of the chain without a requested column ends the answer before it: the complete
+/// blocks before it go out ("Clients MAY limit the number of data column sidecars in the
+/// response", `fulu/p2p-interface.md` L682), never the block in part and never the blocks after
+/// it; with no complete block before it the range is unavailable, never an empty answer.
 #[test]
-fn by_range_never_skips_a_block_it_cannot_serve_whole() {
+fn by_range_serves_the_complete_blocks_before_one_it_cannot_serve_whole() {
     let (_dir, writer) = store();
     put_root(&writer, 10, root(10), BlockLink::Start, &CUSTODY);
     put_root(
@@ -124,11 +128,15 @@ fn by_range_never_skips_a_block_it_cannot_serve_whole() {
     ); // 102 missed
     put_root(&writer, 12, root(12), BlockLink::Parent(root(11)), &CUSTODY);
     let v = view(Some(10));
-    // A block in the range without a requested column: unavailable, whether it is first, in
-    // the middle or last, never an answer that leaves it out.
-    for (start, count) in [(10, 3), (11, 2), (10, 2), (11, 1)] {
-        let why = unavailable(columns_by_range(&snap(&writer), start, count, &CUSTODY, &v));
-        assert!(why.contains("slot 11"), "{start}+{count}: {why}");
+    let block_10: Vec<_> = CUSTODY.iter().map(|&i| (10, i)).collect();
+    for count in [2, 3] {
+        let served = columns_by_range(&snap(&writer), 10, count, &CUSTODY, &v).unwrap();
+        assert_eq!(keys(&served), block_10, "10+{count}");
+    }
+    // First: nothing complete before it.
+    for count in [1, 2] {
+        let why = unavailable(columns_by_range(&snap(&writer), 11, count, &CUSTODY, &v));
+        assert!(why.contains("slot 11"), "11+{count}: {why}");
     }
     // Asking for the columns it has, it goes on.
     let served = columns_by_range(&snap(&writer), 10, 3, &[1, 47], &v).unwrap();
@@ -139,11 +147,118 @@ fn by_range_never_skips_a_block_it_cannot_serve_whole() {
     put_root(&writer, 22, root(22), BlockLink::Parent(root(21)), &[87]);
     let why = unavailable(columns_by_range(&snap(&writer), 20, 2, &[1], &v));
     assert!(why.contains("slot 20"), "{why}");
-    let why = unavailable(columns_by_range(&snap(&writer), 21, 2, &[47], &v));
-    assert!(why.contains("slot 22"), "{why}");
+    assert_eq!(
+        keys(&columns_by_range(&snap(&writer), 21, 2, &[47], &v).unwrap()),
+        [(21, 47)]
+    );
     assert_eq!(
         keys(&columns_by_range(&snap(&writer), 21, 1, &[1], &v).unwrap()),
         [(21, 1)]
+    );
+}
+
+/// A block past the chain that does not link to it may be on it: the answer ends before it.
+#[test]
+fn by_range_ends_before_a_block_that_does_not_link() {
+    let (_dir, writer) = store();
+    chain(&writer, &[10, 11], &CUSTODY);
+    put_root(&writer, 13, root(13), BlockLink::Gap, &CUSTODY);
+    let v = view(Some(10));
+    let served = columns_by_range(&snap(&writer), 10, 5, &[1], &v).unwrap();
+    assert_eq!(keys(&served), [(10, 1), (11, 1)]);
+    // From the gap on, it starts the chain; before it, the range may lack a block.
+    assert_eq!(
+        keys(&columns_by_range(&snap(&writer), 13, 1, &[1], &v).unwrap()),
+        [(13, 1)]
+    );
+    let why = unavailable(columns_by_range(&snap(&writer), 12, 2, &[1], &v));
+    assert!(why.contains("before slot 13"), "{why}");
+    // One at the tip's own slot that does not link may be the chain's block there instead.
+    put_root(&writer, 11, fork(11), BlockLink::Gap, &CUSTODY);
+    assert_eq!(
+        keys(&columns_by_range(&snap(&writer), 10, 2, &[1], &v).unwrap()),
+        [(10, 1)]
+    );
+    // From 11, the two tie with nothing shared.
+    unavailable(columns_by_range(&snap(&writer), 11, 1, &[1], &v));
+}
+
+/// SEC-007, BUG-010: a block waiting for an ancestor the store lacks names its slot. A range
+/// over that slot is never an empty success, even with no block of it stored, and the answer
+/// ends before it; a pending block whose ancestor is before the range starts the chain.
+#[test]
+fn a_pending_ancestors_slot_is_never_answered_as_empty() {
+    let (_dir, writer) = store();
+    put_root(&writer, 10, root(10), BlockLink::Start, &CUSTODY);
+    // 12 carries blobs but none of its columns arrived (yet): 14 waits for it.
+    put_root(
+        &writer,
+        14,
+        root(14),
+        BlockLink::Pending(root(12), 12),
+        &CUSTODY,
+    );
+    put_root(&writer, 15, root(15), BlockLink::Parent(root(14)), &CUSTODY);
+    let v = view(Some(10));
+    for (start, count) in [(12, 1), (11, 2), (11, 5), (12, 4)] {
+        let why = unavailable(columns_by_range(&snap(&writer), start, count, &[1], &v));
+        assert!(why.contains("slot 12"), "{start}+{count}: {why}");
+    }
+    // The complete blocks before it go out.
+    assert_eq!(
+        keys(&columns_by_range(&snap(&writer), 10, 6, &[1], &v).unwrap()),
+        [(10, 1)]
+    );
+    // Past it, the pending block starts the chain: its ancestor is before the range.
+    assert_eq!(
+        keys(&columns_by_range(&snap(&writer), 13, 3, &[1], &v).unwrap()),
+        [(14, 1), (15, 1)]
+    );
+    assert_eq!(
+        columns_by_range(&snap(&writer), 13, 1, &[1], &v).unwrap(),
+        Vec::new()
+    );
+    // Once the ancestor is written, the chain runs through it.
+    put_root(&writer, 12, root(12), BlockLink::Parent(root(10)), &CUSTODY);
+    assert_eq!(
+        keys(&columns_by_range(&snap(&writer), 10, 6, &[1], &v).unwrap()),
+        [(10, 1), (12, 1), (14, 1), (15, 1)]
+    );
+}
+
+/// CR-003: only the block the budget cut is spared the completeness check; a block before it
+/// that lacks a requested column still ends the answer, as any such block does.
+#[test]
+fn only_the_block_the_budget_cut_is_spared() {
+    let (_dir, writer) = store();
+    chain(&writer, &[10], &CUSTODY);
+    put_root(&writer, 11, root(11), BlockLink::Parent(root(10)), &[1, 47]);
+    put_root(&writer, 12, root(12), BlockLink::Parent(root(11)), &CUSTODY);
+    put_root(&writer, 13, root(13), BlockLink::Parent(root(12)), &CUSTODY);
+    let at = |max_sidecars| ServeView {
+        budget: ServeBudget {
+            max_bytes: usize::MAX,
+            max_sidecars,
+        },
+        ..view(Some(10))
+    };
+    // Cut inside 12: 11 lacks a column and ends the answer, 12 is the budget's.
+    let served = columns_by_range(&snap(&writer), 10, 4, &CUSTODY, &at(8)).unwrap();
+    assert_eq!(keys(&served).len(), 4);
+    // Cut before 13 (not read at all): 12 is whole and goes out.
+    let served = columns_by_range(&snap(&writer), 11, 3, &[1, 47], &at(4)).unwrap();
+    assert_eq!(keys(&served), [(11, 1), (11, 47), (12, 1), (12, 47)]);
+    let served = columns_by_range(&snap(&writer), 12, 2, &CUSTODY, &at(6)).unwrap();
+    assert_eq!(keys(&served), CUSTODY.map(|i| (12, i)));
+    // The block read whole is off the chain, and the chain's first is the one cut: nothing
+    // whole to send, never an empty answer.
+    let (_dir, writer) = store();
+    put_root(&writer, 10, fork(10), BlockLink::Start, &CUSTODY);
+    put_root(&writer, 11, root(11), BlockLink::Start, &CUSTODY);
+    let why = unavailable(columns_by_range(&snap(&writer), 10, 2, &CUSTODY, &at(5)));
+    assert!(
+        why.contains("budget cut the first block, at slot 11"),
+        "{why}"
     );
 }
 
@@ -162,24 +277,22 @@ fn a_tie_with_nothing_shared_is_unavailable() {
         &view(Some(10)),
     ));
     assert!(why.contains("chain"), "{why}");
-    // A pending block ties to nothing either.
+    // A pending block ties to nothing either: with its ancestor in the range, the range up
+    // to that ancestor is all there is; without, it is the higher tip.
     let (_dir, writer) = store();
     put_root(&writer, 10, root(10), BlockLink::Start, &CUSTODY);
     put_root(
         &writer,
         12,
         root(12),
-        BlockLink::Pending([0x77; 32]),
+        BlockLink::Pending([0x77; 32], 11),
         &CUSTODY,
     );
-    let why = unavailable(columns_by_range(
-        &snap(&writer),
-        10,
-        3,
-        &[1],
-        &view(Some(10)),
-    ));
-    assert!(why.contains("slot 12"), "{why}");
+    let v = view(Some(10));
+    let served = columns_by_range(&snap(&writer), 10, 3, &[1], &v).unwrap();
+    assert_eq!(keys(&served), [(10, 1)]);
+    let why = unavailable(columns_by_range(&snap(&writer), 11, 2, &[1], &v));
+    assert!(why.contains("slot 11"), "{why}");
 }
 
 /// BUG-003, BUG-007: a range answer is one chain of linked blocks, whatever other branches

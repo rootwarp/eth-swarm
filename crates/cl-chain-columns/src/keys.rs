@@ -5,7 +5,7 @@
 //! |--------------------|-------------------------------------------------------|-----------------------------|
 //! | [`COLUMNS_TABLE`]  | `slot (u64 BE) ‖ block_root (32) ‖ column_index (u64 BE)`, 48 bytes | SSZ `DataColumnSidecar` |
 //! | [`ROOTS_TABLE`]    | `block_root (32)`                                     | `slot (u64 BE)`             |
-//! | [`LINKS_TABLE`]    | `block_root (32)`                                     | [`BlockLink`]: `kind (1) ‖ root (32)` |
+//! | [`LINKS_TABLE`]    | `block_root (32)`                                     | [`BlockLink`]: `kind (1) ‖ root (32)`, and for kind 3 `‖ slot (u64 BE)` |
 //! | [`META_TABLE`]     | ASCII name: [`CGC_KEY`], [`CGC_SET_SLOT_KEY`], [`METADATA_SEQ_KEY`], [`ADVERTISED_CGC_KEY`], [`FINALIZED_SLOT_KEY`], [`FIRST_STORED_SLOT_KEY`], [`CONTIGUOUS_FROM_KEY`] | `u64 BE` |
 //!
 //! Big-endian slot first makes MDBX's lexicographic key order equal slot order, so finality
@@ -75,46 +75,62 @@ pub enum BlockLink {
     /// A blob-carrying block before it on its chain is not held, or its chain could not be
     /// followed: the store is contiguous only from this block on.
     Gap,
-    /// The nearest blob-carrying block before it on its chain is this root, not stored yet: its
-    /// columns may still be on their way. It links once that block is written, or is settled as
-    /// a [`BlockLink::Gap`] ([`ColumnWriter::settle_pending`](crate::ColumnWriter::settle_pending)).
-    /// Until then it ties to nothing and raises nothing.
-    Pending(BlockRoot),
+    /// The nearest blob-carrying block before it on its chain is this root, at this slot, not
+    /// stored yet: its columns may still be on their way. It links once that block is written,
+    /// or is settled ([`ColumnWriter::settle_pending`](crate::ColumnWriter::settle_pending)): a
+    /// [`BlockLink::Start`] once finality covers the slot, else a [`BlockLink::Gap`]. Until then
+    /// it ties to nothing and raises nothing, and the slot is known to hold a block the store
+    /// lacks ([`Snapshot::first_pending_target`](crate::Snapshot::first_pending_target)).
+    Pending(BlockRoot, u64),
 }
 
-/// Length of a [`BlockLink`] value.
+/// Length of a [`BlockLink`] value of kinds 0 to 2: `kind ‖ root`.
 pub const LINK_LEN: usize = 1 + 32;
+/// Length of a [`BlockLink::Pending`] value: `3 ‖ root ‖ slot BE`.
+pub const PENDING_LINK_LEN: usize = LINK_LEN + 8;
 
 impl BlockLink {
-    /// The value stored in [`LINKS_TABLE`].
+    /// The value stored in [`LINKS_TABLE`]: [`LINK_LEN`] bytes, [`PENDING_LINK_LEN`] for a
+    /// pending link.
     #[must_use]
-    pub fn encode(&self) -> [u8; LINK_LEN] {
-        let mut out = [0u8; LINK_LEN];
-        match self {
-            BlockLink::Start => out[0] = 0,
-            BlockLink::Parent(root) => {
-                out[0] = 1;
-                out[1..].copy_from_slice(root);
-            }
-            BlockLink::Gap => out[0] = 2,
-            BlockLink::Pending(root) => {
-                out[0] = 3;
-                out[1..].copy_from_slice(root);
-            }
+    pub fn encode(&self) -> Vec<u8> {
+        let (kind, root) = match self {
+            BlockLink::Start => (0, [0; 32]),
+            BlockLink::Parent(root) => (1, *root),
+            BlockLink::Gap => (2, [0; 32]),
+            BlockLink::Pending(root, _) => (3, *root),
+        };
+        let mut out = Vec::with_capacity(PENDING_LINK_LEN);
+        out.push(kind);
+        out.extend_from_slice(&root);
+        if let BlockLink::Pending(_, slot) = self {
+            out.extend_from_slice(&slot.to_be_bytes());
         }
         out
     }
 
-    /// The link a [`LINKS_TABLE`] value holds; `None` for any other bytes.
+    /// The link a [`LINKS_TABLE`] value holds; `None` for any other bytes, a pending link
+    /// without its slot ([`Self::legacy_pending_target`]) included.
     #[must_use]
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let bytes: &[u8; LINK_LEN] = bytes.try_into().ok()?;
-        let root: BlockRoot = bytes[1..].try_into().ok()?;
-        match bytes[0] {
-            0 if root == [0; 32] => Some(BlockLink::Start),
-            1 => Some(BlockLink::Parent(root)),
-            2 if root == [0; 32] => Some(BlockLink::Gap),
-            3 => Some(BlockLink::Pending(root)),
+        let (&kind, rest) = bytes.split_first()?;
+        let root: BlockRoot = rest.get(..32)?.try_into().ok()?;
+        match (kind, &rest[32..]) {
+            (0, []) if root == [0; 32] => Some(BlockLink::Start),
+            (1, []) => Some(BlockLink::Parent(root)),
+            (2, []) if root == [0; 32] => Some(BlockLink::Gap),
+            (3, slot) => Some(BlockLink::Pending(root, decode_u64(slot)?)),
+            _ => None,
+        }
+    }
+
+    /// The target of a pending link as stores before pending links carried their target's slot
+    /// wrote it (`3 ‖ root`, [`LINK_LEN`] bytes); `None` for any other bytes. The writer migrates
+    /// such a link when it opens the env, and a reader reads it as a [`BlockLink::Gap`].
+    #[must_use]
+    pub fn legacy_pending_target(bytes: &[u8]) -> Option<BlockRoot> {
+        match bytes.split_first()? {
+            (3, root) => root.try_into().ok(),
             _ => None,
         }
     }
@@ -209,15 +225,34 @@ mod tests {
             BlockLink::Start,
             BlockLink::Parent(ROOT_A),
             BlockLink::Gap,
-            BlockLink::Pending(ROOT_B),
+            BlockLink::Pending(ROOT_B, 77),
         ] {
             assert_eq!(BlockLink::decode(&link.encode()), Some(link));
+            assert_eq!(BlockLink::legacy_pending_target(&link.encode()), None);
         }
+        assert_eq!(BlockLink::Gap.encode().len(), LINK_LEN);
+        let pending = BlockLink::Pending(ROOT_B, 0x0102).encode();
+        assert_eq!(pending.len(), PENDING_LINK_LEN);
+        assert_eq!(pending[0], 3);
+        assert_eq!(&pending[1..33], &ROOT_B);
+        assert_eq!(&pending[33..], &0x0102u64.to_be_bytes());
         assert_eq!(BlockLink::decode(&[1; 32]), None);
         assert_eq!(BlockLink::decode(&[4; LINK_LEN]), None);
+        assert_eq!(BlockLink::decode(&[]), None);
         let mut gap = BlockLink::Gap.encode();
         gap[5] = 1;
         assert_eq!(BlockLink::decode(&gap), None);
+        // Only a pending link carries a slot.
+        let mut parent = BlockLink::Parent(ROOT_A).encode();
+        parent.extend_from_slice(&9u64.to_be_bytes());
+        assert_eq!(BlockLink::decode(&parent), None);
+        assert_eq!(BlockLink::decode(&pending[..PENDING_LINK_LEN - 1]), None);
+        // A pending link without its slot, as stores wrote it before: not a link of today.
+        let mut legacy = vec![3];
+        legacy.extend_from_slice(&ROOT_B);
+        assert_eq!(BlockLink::decode(&legacy), None);
+        assert_eq!(BlockLink::legacy_pending_target(&legacy), Some(ROOT_B));
+        assert_eq!(BlockLink::legacy_pending_target(&[3; 20]), None);
     }
 
     #[test]
