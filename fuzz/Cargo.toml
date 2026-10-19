@@ -9,8 +9,9 @@
 # the fuzzed decoder links exactly the dependencies the session binary links.
 #
 # Build: fuzz/build-m2a.sh. Gates: fuzz/run-m2a-gate.sh (the m2a-session decoders),
-# fuzz/run-gate1.sh (the probe's control, gossip and ENR decoders) and fuzz/run-gate2a.sh (the
-# column sidecar and the two column requests). Seeds: fuzz/gen-seeds.sh.
+# fuzz/run-gate1.sh (the probe's control, gossip and ENR decoders), fuzz/run-gate2a.sh (the
+# column sidecar and the two column requests) and fuzz/run-gate2b.sh (cl-chain's column
+# handlers). Seeds: fuzz/gen-seeds.sh.
 # Lock: fuzz/regen-lock.sh.
 [package]
 name = "ethswarm-fuzz"
@@ -37,7 +38,22 @@ ethereum_ssz = "0.10"
 ssz_types = "0.14"
 futures = "0.3"
 # The timed req/resp codec runs under tokio's timer; the versions and features cl-p2p uses.
-tokio = { version = "1", features = ["rt", "time"] }
+# `test-util`: column_contract runs the column store on a paused clock (its root waits and
+# retries take no wall time), as cl-chain's own tests do.
+tokio = { version = "1", features = ["rt", "time", "test-util"] }
+# column_contract: cl-chain's storage contract and column store (probe::ColumnIngest), the
+# column env behind it (MDBX through cl-chain-columns, one temp env per input) and its column
+# RPCs (reqresp::ReqRespServer, called in process with the chain.v1 messages and link cl-p2p
+# uses). The request targets also run cl-chain's request bounds. tonic and tempfile are the
+# versions cl-chain and its tests link.
+cl-chain = { path = "../crates/cl-chain" }
+cl-chain-columns = { path = "../crates/cl-chain-columns" }
+ethswarm-proto = { path = "../crates/ethswarm-proto" }
+ipc = { path = "../crates/ipc" }
+tonic = "0.14.6"
+tempfile = "3"
+# The fixed blocks' roots, as the reference view checks them; the version consensus-types links.
+tree_hash = "0.12"
 # request_response::Codec (the timed codec's trait) and gossipsub's DataTransform; the root
 # workspace's libp2p, which cl-p2p already links with these features.
 libp2p = { version = "0.57.1", default-features = false, features = ["gossipsub", "request-response"] }
@@ -159,6 +175,13 @@ bench = false
 [[bin]]
 name = "columns_by_root_req"
 path = "fuzz_targets/columns_by_root_req.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "column_contract"
+path = "fuzz_targets/column_contract.rs"
 test = false
 doc = false
 bench = false

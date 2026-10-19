@@ -46,6 +46,7 @@ for f in crates/p2p-wire/lib.rs crates/consensus-types/lib.rs crates/cl-p2p/src/
 done
 echo '[package]' > "$fx/crates/cl-p2p/Cargo.toml"
 echo '[package]' > "$fx/crates/cl-discv5/Cargo.toml"
+echo '[package]' > "$fx/crates/cl-chain/Cargo.toml"
 echo '[workspace]' > "$fx/Cargo.toml"
 echo '[package]' > "$fx/fuzz/Cargo.toml"
 printf '[toolchain]\nchannel = "nightly-2026-10-17"\n' > "$fx/fuzz/rust-toolchain.toml"
@@ -113,6 +114,7 @@ done
 [[ -z $others ]] && ok "no other gate's target is run" || bad "ran:$others"
 key=$(gate_run -- "$fx/fuzz/check-gate2a.sh" --print-key)
 grep -q '"crates/cl-p2p/src/rpc/columns.rs"' <<<"$key" && grep -q '"crates/cl-chain/src/reqresp.rs"' <<<"$key" \
+  && grep -q '"crates/cl-chain/Cargo.toml"' <<<"$key" \
   && grep -q '"crates/cl-p2p/src/rpc/codec.rs"' <<<"$key" && grep -q '"crates/p2p-wire"' <<<"$key" \
   && grep -q '"fuzz/run-gate2a.sh"' <<<"$key" && grep -q '"crates/network-config"' <<<"$key" \
   && ok "gate 2a's key holds the column codec, request and network-config paths" || bad "key" "$key"
@@ -158,8 +160,8 @@ for args in "--gate bogus" "--gate gate1" "--seconds 0" "--bogus"; do
   rc=0 out=$(gate_run -- "$runner" $args 2>&1) || rc=$?
   ((rc == 2)) && ok "usage error: run-gate2a.sh $args" || bad "usage error: $args (exit $rc)" "$out"
 done
-rc=0 out=$(gate_run -- "$fx/fuzz/run-m2a-gate.sh" --gate gate2b 2>&1) || rc=$?
-((rc == 2)) && grep -q "m2a, gate1 or gate2a" <<<"$out" && ok "run-m2a-gate.sh refuses an unknown gate" || bad "unknown gate (exit $rc)" "$out"
+rc=0 out=$(gate_run -- "$fx/fuzz/run-m2a-gate.sh" --gate gate3 2>&1) || rc=$?
+((rc == 2)) && grep -q "m2a, gate1, gate2a or gate2b" <<<"$out" && ok "run-m2a-gate.sh refuses an unknown gate" || bad "unknown gate (exit $rc)" "$out"
 head -c 262145 /dev/zero > "$fx/fuzz/corpus/columns_by_root_req/too-long"
 g add -A && g commit -q -m "long seed"
 rc=0 out=$(gate_run -- "$runner" --seconds 3 --out "$tmp/s.json" 2>&1) || rc=$?

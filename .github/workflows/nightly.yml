@@ -1,8 +1,8 @@
 # Nightly, uncached: re-fetch every manifest source (all presets and optional assets), re-check
 # every tag -> commit pin and sha256, run the full vector suite, re-run the dependency policy
-# against today's advisory database, and run fuzz gate 1 (seven decoder targets, an hour each)
-# and fuzz gate 2a (the three column decoder targets, an hour each). Also runnable by hand via
-# workflow_dispatch.
+# against today's advisory database, and run fuzz gate 1 (seven decoder targets, an hour each),
+# fuzz gate 2a (the three column decoder targets, an hour each) and fuzz gate 2b (the column
+# handler target, an hour). Also runnable by hand via workflow_dispatch.
 name: nightly
 
 on:
@@ -157,6 +157,54 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-gate2a
+          path: fuzz/artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+  fuzz-gate2b:
+    # Fuzz gate 2b (fuzz/run-gate2b.sh): column_contract, cl-chain's storage contract, column
+    # store and column RPCs driven with sequences of gossip sidecars and range and root requests
+    # (a temp column env per input, a stub reference and a stub cl-verify), fuzzed for 3600 s
+    # from gate 2a's seeds and the negative serving cases, under the gate's limits
+    # (-rss_limit_mb=2048, which covers the column env's map, -malloc_limit_mb=128, -timeout=10,
+    # the target's -max_len; fuzz/m2a-common.sh). A sidecar the contract rejected appearing in an
+    # answer, or any other broken invariant, is a crash. The gate file records the commit, the
+    # target's seconds, executions, crashes, OOMs, timeouts and seed-corpus sha256, and must pass
+    # fuzz/check-gate2b.sh. The file, its log and any crash inputs are kept as the run's
+    # artifact.
+    name: fuzz gate 2b, the column handler target x 1 h
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned nightly (fuzz/rust-toolchain.toml)
+        working-directory: fuzz
+        run: rustup toolchain install && rustc --version
+      - name: Install protoc (ethswarm-proto build.rs runs tonic-prost-build)
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc@3.36.2
+          fallback: none
+      - name: Install cargo-fuzz (pinned)
+        working-directory: fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      # Online, so it fetches the locked sources the gate's offline lock check then needs.
+      - name: fuzz/Cargo.lock resolves every shared crate exactly as Cargo.lock does
+        run: bash scripts/check-fuzz-lock.sh
+      - name: Run gate 2b (3600 s)
+        run: bash fuzz/run-gate2b.sh
+      - name: The gate file passes the checker
+        run: bash fuzz/check-gate2b.sh fuzz/artifacts/gate2b.json
+      - name: Gate file and log
+        if: always()
+        run: cat fuzz/artifacts/gate2b.json fuzz/artifacts/gate2b.log
+      - name: Keep the gate file, its log and any crash inputs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-gate2b
           path: fuzz/artifacts/
           if-no-files-found: error
           retention-days: 30

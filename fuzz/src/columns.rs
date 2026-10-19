@@ -21,7 +21,8 @@
 //! - `columns_by_range_req` / `columns_by_root_req`: the input is one inbound request, read by
 //!   the timed codec and `decode_request` (held to each other as for the control targets), then
 //!   judged by `column_request_error`, the check cl-p2p admits a column request with
-//!   (`fulu/p2p-interface.md` L746–747), and its chunk limit `max_response_chunks`.
+//!   (`fulu/p2p-interface.md` L746–747), by cl-chain's bounds on the request cl-p2p forwards, and
+//!   its chunk limit `max_response_chunks`.
 //!
 //! The invariants, past those the shared harness holds every chunk and request to:
 //!
@@ -37,9 +38,11 @@
 //!   empty response), and the codec records the chunk's context digest;
 //! - a request's verdict is the spec rule's ([`spec_request_rule`]: every index below
 //!   `NUMBER_OF_COLUMNS`, at most `MAX_REQUEST_DATA_COLUMN_SIDECARS` sidecars, counted without
-//!   saturation), its chunk limit is the sidecars it names (at most the bound), and its lists are
-//!   within their SSZ limits. cl-chain's `ReqRespService` holds the same bounds on what cl-p2p
-//!   forwards (`cl_chain::reqresp`), so the rule is cl-chain's too.
+//!   saturation) and cl-chain's: the bounds its `ReqRespService` holds what cl-p2p forwards to
+//!   (`cl_chain::reqresp::range_request_bounds` and `root_request_bounds`, run here on the
+//!   request as cl-p2p forwards it), all three naming the same number of sidecars
+//!   ([`request_verdicts`]); its chunk limit is the sidecars it names (at most the bound), and
+//!   its lists are within their SSZ limits.
 //!
 //! The decoders do not check that a sidecar's cells, proofs and commitments line up, or that its
 //! index is below `NUMBER_OF_COLUMNS`: those are `verify_data_column_sidecar` rules, which gossip
@@ -48,6 +51,7 @@
 
 use crate::chunk::{agree, feed};
 use crate::{check_chunk_in, timed, E};
+use cl_chain::reqresp::{range_request_bounds, root_request_bounds, Refusal};
 use consensus_types::caps::{
     compute_max_data_column_sidecar_size, NetworkCaps, ObjectKind, MAX_PAYLOAD_SIZE,
 };
@@ -108,6 +112,11 @@ pub fn column_network() -> &'static NetworkCaps {
 /// The fork schedule a sidecar's slot is mapped through: the pinned Sepolia one.
 pub fn column_schedule() -> &'static ForkSchedule {
     &columns().schedule
+}
+
+/// The gossip transform on the Gloas topics, with [`column_network`]'s caps.
+pub(crate) fn column_transform() -> &'static SnappyTransform {
+    &columns().snappy
 }
 
 /// The fixture context table (Fulu, a Fulu BPO digest, Gloas) with [`column_network`]'s caps.
@@ -377,6 +386,47 @@ pub fn spec_request_rule(request: &Request) -> Result<u64, &'static str> {
         .ok_or("more sidecars than MAX_REQUEST_DATA_COLUMN_SIDECARS")
 }
 
+/// cl-chain's bounds on `request` as cl-p2p forwards it over chain.v1 (each identifier's root
+/// and columns, in order): [`range_request_bounds`] or [`root_request_bounds`].
+pub fn chain_request_bounds(request: &Request) -> Result<u64, Refusal> {
+    match request {
+        Request::DataColumnsByRange(r) => range_request_bounds(r.count, &r.columns),
+        Request::DataColumnsByRoot(r) => {
+            let ids: Vec<([u8; 32], Vec<u64>)> =
+                r.0.iter()
+                    .map(|id| (id.block_root.0, id.columns.to_vec()))
+                    .collect();
+            root_request_bounds(&ids)
+        }
+        other => panic!("{other:?} is not a column request"),
+    }
+}
+
+/// The three verdicts on a decoded column request agree: cl-p2p's admission check
+/// (`column_request_error`), the spec rule ([`spec_request_rule`]) and cl-chain's bounds
+/// ([`chain_request_bounds`]), which refuse only as `1: InvalidRequest` and name the spec's
+/// number of sidecars. Returns that number, or `Err` if all three refuse.
+pub(crate) fn request_verdicts(request: &Request) -> Result<u64, ()> {
+    let rule = spec_request_rule(request);
+    let error = column_request_error(request);
+    let chain = chain_request_bounds(request);
+    match (&rule, &error) {
+        (Ok(_), Some(why)) => panic!("a request the spec allows refused: {why}"),
+        (Err(why), None) => panic!("a request the spec refuses ({why}) admitted"),
+        _ => {}
+    }
+    match (&rule, &chain) {
+        (Ok(sidecars), Ok(named)) => assert_eq!(sidecars, named, "cl-chain counts the sidecars"),
+        (Ok(_), Err(refusal)) => panic!("cl-chain refuses ({refusal}) a request the spec allows"),
+        (Err(why), Ok(_)) => panic!("cl-chain admits a request the spec refuses ({why})"),
+        (Err(_), Err(refusal)) => assert!(
+            matches!(refusal, Refusal::Invalid(_)),
+            "cl-chain refuses an out-of-bounds request as {refusal:?}, not InvalidRequest"
+        ),
+    }
+    rule.map_err(drop)
+}
+
 /// A column request through the timed codec and the request decoder, then its verdict.
 fn column_request(protocol: Protocol, wire: &[u8]) {
     let Some(request) = crate::request(protocol, wire) else {
@@ -410,13 +460,7 @@ fn column_request(protocol: Protocol, wire: &[u8]) {
         }
         other => panic!("a {protocol} request decoded to {other:?}"),
     }
-    let rule = spec_request_rule(&request);
-    let error = column_request_error(&request);
-    match (&rule, &error) {
-        (Ok(_), Some(why)) => panic!("a request the spec allows refused: {why}"),
-        (Err(why), None) => panic!("a request the spec refuses ({why}) admitted"),
-        _ => {}
-    }
+    let rule = request_verdicts(&request);
     let chunks = request.max_response_chunks();
     assert!(
         chunks <= MAX_REQUEST_DATA_COLUMN_SIDECARS,
@@ -473,6 +517,45 @@ mod tests {
         assert_eq!(spec_request_rule(&range(u64::MAX, vec![])), Ok(0));
         assert!(spec_request_rule(&range(1, vec![128])).is_err());
         assert!(spec_request_rule(&Request::MetaData).is_err());
+    }
+
+    #[test]
+    fn cl_chain_holds_the_spec_rule() {
+        let range = |count, columns: Vec<u64>| {
+            Request::DataColumnsByRange(DataColumnsByRangeV1Request {
+                start_slot: 0,
+                count,
+                columns: columns.try_into().unwrap(),
+            })
+        };
+        let root = |ids: usize, columns: Vec<u64>| {
+            Request::DataColumnsByRoot(p2p_wire::rpc::messages::DataColumnsByRootV1Request(
+                vec![
+                    DataColumnsByRootIdentifier {
+                        block_root: Default::default(),
+                        columns: columns.try_into().unwrap(),
+                    };
+                    ids
+                ]
+                .try_into()
+                .unwrap(),
+            ))
+        };
+        assert_eq!(
+            request_verdicts(&range(128, (0..128).collect())),
+            Ok(16_384)
+        );
+        assert_eq!(request_verdicts(&range(8_192, vec![3, 3])), Ok(16_384));
+        assert_eq!(request_verdicts(&range(u64::MAX, vec![])), Ok(0));
+        assert_eq!(request_verdicts(&range(129, (0..128).collect())), Err(()));
+        assert_eq!(request_verdicts(&range(1, vec![128])), Err(()));
+        assert_eq!(request_verdicts(&root(128, (0..128).collect())), Ok(16_384));
+        assert_eq!(request_verdicts(&root(2, vec![5, 5])), Ok(4));
+        assert_eq!(request_verdicts(&root(1, vec![u64::MAX])), Err(()));
+        assert!(matches!(
+            chain_request_bounds(&range(1, vec![128])),
+            Err(Refusal::Invalid(_))
+        ));
     }
 
     #[test]

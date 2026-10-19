@@ -68,6 +68,7 @@ for f in crates/p2p-wire/src/lib.rs crates/consensus-types/src/lib.rs crates/cl-
 done
 echo '[package]' > "$fx/crates/cl-p2p/Cargo.toml"
 echo '[package]' > "$fx/crates/cl-discv5/Cargo.toml"
+echo '[package]' > "$fx/crates/cl-chain/Cargo.toml"
 echo '[package]' > "$fx/fuzz/Cargo.toml"
 printf '[toolchain]\nchannel = "nightly-2026-10-17"\n' > "$fx/fuzz/rust-toolchain.toml"
 echo 'version = 4' > "$fx/fuzz/Cargo.lock"
@@ -202,13 +203,14 @@ check fail "a valid file padded past 1 MiB" "not a regular file of at most 10485
 mkfifo "$tmp/sizes/fifo.json"
 check fail "a FIFO with no writer, refused without blocking" "not a regular file" \
   deadline 30 bash "$checker" "$tmp/sizes/fifo.json"
-check fail "an unknown gate" "m2a, gate1 or gate2a" bash "$m2a_checker" --gate gate2b "$ok2a"
+check fail "an unknown gate" "m2a, gate1, gate2a or gate2b" bash "$m2a_checker" --gate gate3 "$ok2a"
 
 # Every path only gate 2a keys makes a gate-2a file stale and leaves the gate-1 and m2a files
 # valid (network-config is gate 1's too); a path every gate keys makes all three stale.
 gate1_ok="$tmp/gate1.json"
 m2a_ok="$tmp/m2a.json"
-for path in crates/cl-p2p/src/rpc/columns.rs crates/cl-chain/src/reqresp.rs fuzz/run-gate2a.sh; do
+for path in crates/cl-p2p/src/rpc/columns.rs crates/cl-chain/Cargo.toml crates/cl-chain/src/reqresp.rs \
+  fuzz/run-gate2a.sh; do
   echo '# changed' >> "$fx/$path"
   g commit -q -am "change $path"
   check fail "gate 2a stale after a commit to $path" "stale" bash "$checker" "$ok2a"

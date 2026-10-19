@@ -9,3 +9,5 @@ artifacts/*
 !artifacts/gate1.log
 !artifacts/gate2a.json
 !artifacts/gate2a.log
+!artifacts/gate2b.json
+!artifacts/gate2b.log

@@ -235,7 +235,7 @@ mkfifo "$tmp/sizes/fifo.json"
 check fail "a FIFO with no writer, refused without blocking" "not a regular file" \
   deadline 30 bash "$checker" "$tmp/sizes/fifo.json"
 check fail "two files" "Usage" bash "$checker" "$ok1" "$ok1"
-check fail "an unknown gate" "m2a, gate1 or gate2a" bash "$m2a_checker" --gate gate2 "$ok1"
+check fail "an unknown gate" "m2a, gate1, gate2a or gate2b" bash "$m2a_checker" --gate gate2 "$ok1"
 
 # Every path only gate 1 keys makes a gate-1 file stale, and leaves the m2a file valid; a path
 # both key makes both stale (the m2a key holds all of fuzz/corpus, the gate-1 seeds too).

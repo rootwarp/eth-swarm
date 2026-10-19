@@ -9,13 +9,15 @@
 //! oversize frame body, a frame claiming more than 64 KiB and one claiming more than 4 GiB, too
 //! many empty frames), data after an error chunk and a response over its byte budget. The
 //! control targets get the same for the inbound requests, `rpc_chunk` for every protocol in both
-//! directions (the column protocols' sidecars of both forks and their requests among them); the gossip and ENR seeds are in [`gossip`] and [`record`], and the gate-2a column
-//! seeds (sidecars over gossip and req/resp, the two column requests) in [`columns`].
+//! directions (the column protocols' sidecars of both forks and their requests among them); the gossip and ENR seeds are in [`gossip`] and [`record`], the gate-2a column
+//! seeds (sidecars over gossip and req/resp, the two column requests) in [`columns`], and the
+//! gate-2b `column_contract` operation sequences in [`contract`].
 //!
 //! Everything here is deterministic, so `tests/corpus.rs` can check the committed corpus is
 //! exactly what this module builds.
 
 mod columns;
+mod contract;
 mod gossip;
 mod record;
 
@@ -106,6 +108,7 @@ pub fn all(vector_blocks: &[VectorBlock]) -> Vec<Seed> {
     gossip::all(&mut seeds, vector_blocks);
     record::all(&mut seeds);
     columns::all(&mut seeds);
+    contract::all(&mut seeds);
     seeds
 }
 
@@ -451,7 +454,12 @@ fn rpc_chunk(seeds: &mut Vec<Seed>, status: &[u8], metadata: &[u8], ping: &[u8])
         (Protocol::PingV1, "ping", ping, Some(ping)),
         // Goodbye's response is one chunk with a reason, like its request
         // (`phase0/p2p-interface.md` L1461, L1483).
-        (Protocol::GoodbyeV1, "goodbye", &goodbye[..], Some(&goodbye[..])),
+        (
+            Protocol::GoodbyeV1,
+            "goodbye",
+            &goodbye[..],
+            Some(&goodbye[..]),
+        ),
     ] {
         let prefix = format!("{name}-");
         let i = index(protocol);

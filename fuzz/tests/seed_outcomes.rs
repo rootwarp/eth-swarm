@@ -290,10 +290,13 @@ fn rpc_chunk_column_seeds() {
             Ok(ResponseChunk::Success(Response::DataColumn(s))) if matches!(*s, forked::DataColumnSidecar::Gloas(_))
         ));
         for name in ["fulu-valid", "fulu-bpo-digest-valid"] {
-            assert!(matches!(
-                chunk(name),
-                Ok(ResponseChunk::Success(Response::DataColumn(s))) if matches!(*s, forked::DataColumnSidecar::Fulu(_))
-            ), "{name}");
+            assert!(
+                matches!(
+                    chunk(name),
+                    Ok(ResponseChunk::Success(Response::DataColumn(s))) if matches!(*s, forked::DataColumnSidecar::Fulu(_))
+                ),
+                "{name}"
+            );
         }
         assert!(matches!(
             chunk("gloas-sidecar-under-fulu-digest"),
@@ -312,7 +315,10 @@ fn rpc_chunk_column_seeds() {
             Err(CodecError::PayloadTooLarge { .. })
         ));
         let request = |name: &str| {
-            decode_request(protocol, &body("rpc_chunk", &format!("{prefix}request-{name}")))
+            decode_request(
+                protocol,
+                &body("rpc_chunk", &format!("{prefix}request-{name}")),
+            )
         };
         assert!(request("valid").is_ok());
         assert!(matches!(

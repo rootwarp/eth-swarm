@@ -28,23 +28,35 @@
 //!
 //! The other targets: [`rpc_chunk`] (one chunk or request payload of any protocol, and the
 //! incremental scanners), [`gossip_transform`] and [`message_id`] (the gossip transform, the Gloas
-//! block decode and the message-id), [`enr_fields`] (a node record's `eth2`, `cgc` and `nfd`), and
+//! block decode and the message-id), [`enr_fields`] (a node record's `eth2`, `cgc` and `nfd`),
 //! the column targets of gate 2a, [`data_column_sidecar`], [`columns_by_range_req`] and
 //! [`columns_by_root_req`] (the `columns` module: the Gloas sidecar over gossip and req/resp on
-//! the Sepolia blob schedule's caps, and the two column requests with their admission check).
+//! the Sepolia blob schedule's caps, and the two column requests with their admission check and
+//! cl-chain's bounds), and gate 2b's [`column_contract`] (the `contract` module: cl-chain's
+//! storage contract, column store and column RPCs, driven with sequences of sidecars and
+//! requests).
 
 mod chunk;
 mod columns;
+mod contract;
 mod gossip;
 mod record;
 pub mod seeds;
 mod timed;
 
 pub use chunk::{rpc_chunk, REQUEST_SELECTOR};
+pub(crate) use columns::column_transform;
 pub use columns::{
-    column_contexts, column_network, column_schedule, column_topic, columns_by_range_req,
-    columns_by_root_req, data_column_sidecar, spec_max_sidecar_size, spec_request_rule, CHUNK_BIT,
-    ROOT_BIT,
+    chain_request_bounds, column_contexts, column_network, column_schedule, column_topic,
+    columns_by_range_req, columns_by_root_req, data_column_sidecar, spec_max_sidecar_size,
+    spec_request_rule, CHUNK_BIT, ROOT_BIT,
+};
+pub use contract::{
+    cgc_set_slot, column_contract, column_contract_events, gloas_slot, known_blocks, kzg_verdict,
+    raw_gossip, raw_request, Answer, Event, GossipSpec, KnownBlock, RangeSpec, RootSpec, CHAIN,
+    CUSTODY, EXTRA_CELL, KZG_INVALID, KZG_NO_VERDICT, KZG_VALID, MAX_GOSSIP, MAX_REQUESTS,
+    MISSING_CELL, MISSING_PROOF, OPS, OP_GOSSIP, OP_RANGE, OP_RAW_GOSSIP, OP_RAW_RANGE,
+    OP_RAW_ROOT, OP_ROOT, SLOT_AFTER, UNKNOWN_ROOT, WRONG_SUBNET,
 };
 pub use gossip::{gossip_transform, message_id, message_input, split_message, topic_caps};
 pub use record::{
@@ -71,8 +83,8 @@ pub type E = Mainnet;
 
 /// Every target, by name: the four of the m2a gate (`fuzz/run-m2a-gate.sh`), the four
 /// `fuzz/run-gate1.sh` adds to its three control targets, then the three of gate 2a
-/// (`fuzz/run-gate2a.sh`).
-pub const TARGETS: [&str; 11] = [
+/// (`fuzz/run-gate2a.sh`) and the one of gate 2b (`fuzz/run-gate2b.sh`).
+pub const TARGETS: [&str; 12] = [
     "status_v2",
     "metadata_v3",
     "ping_goodbye",
@@ -84,6 +96,7 @@ pub const TARGETS: [&str; 11] = [
     "data_column_sidecar",
     "columns_by_range_req",
     "columns_by_root_req",
+    "column_contract",
 ];
 
 /// `ping_goodbye`: a first byte with this bit set selects a `Goodbye` request (the body a
@@ -116,6 +129,7 @@ pub fn run(name: &str, data: &[u8]) -> bool {
         "data_column_sidecar" => data_column_sidecar(data),
         "columns_by_range_req" => columns_by_range_req(data),
         "columns_by_root_req" => columns_by_root_req(data),
+        "column_contract" => column_contract(data),
         _ => return false,
     }
     true

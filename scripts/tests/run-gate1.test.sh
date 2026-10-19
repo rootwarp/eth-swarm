@@ -144,7 +144,7 @@ for args in "--gate bogus" "--gate m2a" "--seconds 0" "--bogus"; do
   ((rc == 2)) && ok "usage error: run-gate1.sh $args" || bad "usage error: $args (exit $rc)" "$out"
 done
 rc=0 out=$(gate_run -- "$fx/fuzz/run-m2a-gate.sh" --gate bogus 2>&1) || rc=$?
-((rc == 2)) && grep -q "m2a, gate1 or gate2a" <<<"$out" && ok "run-m2a-gate.sh refuses an unknown gate" || bad "unknown gate (exit $rc)" "$out"
+((rc == 2)) && grep -q "m2a, gate1, gate2a or gate2b" <<<"$out" && ok "run-m2a-gate.sh refuses an unknown gate" || bad "unknown gate (exit $rc)" "$out"
 head -c 4097 /dev/zero > "$fx/fuzz/corpus/enr_fields/too-long"
 g add -A && g commit -q -m "long seed"
 rc=0 out=$(gate_run -- "$runner" --seconds 3 --out "$tmp/s.json" 2>&1) || rc=$?

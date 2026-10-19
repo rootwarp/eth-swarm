@@ -116,7 +116,7 @@ use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 
 /// `NUMBER_OF_COLUMNS` (`fulu/das-core.md`).
-pub const NUMBER_OF_COLUMNS: u64 = cl_chain_columns::NUMBER_OF_COLUMNS;
+pub const NUMBER_OF_COLUMNS: u64 = das::NUMBER_OF_COLUMNS;
 
 /// `MAX_REQUEST_DATA_COLUMN_SIDECARS` (`fulu/p2p-interface.md` L170–175).
 pub const MAX_REQUEST_DATA_COLUMN_SIDECARS: u64 = 16_384;
@@ -260,15 +260,61 @@ impl ServeView {
     }
 }
 
-/// The requested indices, sorted and deduplicated; an index at or past `NUMBER_OF_COLUMNS` is
-/// invalid.
-fn requested(columns: &[u64]) -> Result<BTreeSet<u64>, Refusal> {
+/// An index at or past `NUMBER_OF_COLUMNS` is invalid.
+fn check_indices(columns: &[u64]) -> Result<(), Refusal> {
     match columns.iter().find(|&&i| i >= NUMBER_OF_COLUMNS) {
         Some(i) => Err(Refusal::Invalid(format!(
             "column index {i} is not below NUMBER_OF_COLUMNS {NUMBER_OF_COLUMNS}"
         ))),
-        None => Ok(columns.iter().copied().collect()),
+        None => Ok(()),
     }
+}
+
+/// More than `MAX_REQUEST_DATA_COLUMN_SIDECARS` sidecars is invalid.
+fn check_sidecars(sidecars: u64) -> Result<u64, Refusal> {
+    if sidecars > MAX_REQUEST_DATA_COLUMN_SIDECARS {
+        return Err(Refusal::Invalid(format!(
+            "{sidecars} sidecars requested, above MAX_REQUEST_DATA_COLUMN_SIDECARS \
+             {MAX_REQUEST_DATA_COLUMN_SIDECARS}"
+        )));
+    }
+    Ok(sidecars)
+}
+
+/// The bounds of a `DataColumnSidecarsByRange` request (see the module docs, `# Bounds`), which
+/// need no store: every index below `NUMBER_OF_COLUMNS`, and at most
+/// `MAX_REQUEST_DATA_COLUMN_SIDECARS` sidecars, `count × len(columns)` with a column named twice
+/// counted twice. [`columns_by_range`] holds every request to them before it reads; the fuzz
+/// targets hold them to the spec rule and to cl-p2p's admission check.
+///
+/// # Errors
+///
+/// [`Refusal::Invalid`]: a bound does not hold. Else the number of sidecars the request names.
+pub fn range_request_bounds(count: u64, columns: &[u64]) -> Result<u64, Refusal> {
+    check_indices(columns)?;
+    check_sidecars(count.saturating_mul(columns.len() as u64))
+}
+
+/// The bounds of a `DataColumnSidecarsByRoot` request, as [`range_request_bounds`]: at most
+/// `MAX_REQUEST_BLOCKS_DENEB` identifiers, at most `MAX_REQUEST_DATA_COLUMN_SIDECARS` sidecars
+/// (every identifier's columns, a pair named twice counted twice) and every index below
+/// `NUMBER_OF_COLUMNS`. [`columns_by_root`] holds every request to them before it reads.
+///
+/// # Errors
+///
+/// [`Refusal::Invalid`]: a bound does not hold. Else the number of sidecars the request names.
+pub fn root_request_bounds(ids: &[(Root, Vec<u64>)]) -> Result<u64, Refusal> {
+    if ids.len() > MAX_REQUEST_BLOCKS_DENEB {
+        return Err(Refusal::Invalid(format!(
+            "{} identifiers, above MAX_REQUEST_BLOCKS_DENEB {MAX_REQUEST_BLOCKS_DENEB}",
+            ids.len()
+        )));
+    }
+    let sidecars = check_sidecars(ids.iter().map(|(_, c)| c.len() as u64).sum())?;
+    for (_, columns) in ids {
+        check_indices(columns)?;
+    }
+    Ok(sidecars)
 }
 
 /// One block of a range read.
@@ -331,14 +377,8 @@ pub fn columns_by_range(
     columns: &[u64],
     view: &ServeView,
 ) -> Result<Vec<Served>, Refusal> {
-    let wanted = requested(columns)?;
-    let sidecars = count.saturating_mul(columns.len() as u64);
-    if sidecars > MAX_REQUEST_DATA_COLUMN_SIDECARS {
-        return Err(Refusal::Invalid(format!(
-            "{sidecars} sidecars requested, above MAX_REQUEST_DATA_COLUMN_SIDECARS \
-             {MAX_REQUEST_DATA_COLUMN_SIDECARS}"
-        )));
-    }
+    range_request_bounds(count, columns)?;
+    let wanted: BTreeSet<u64> = columns.iter().copied().collect();
     if wanted.is_empty() || count == 0 {
         return Ok(Vec::new());
     }
@@ -466,23 +506,10 @@ pub fn columns_by_root(
     ids: &[(Root, Vec<u64>)],
     view: &ServeView,
 ) -> Result<Vec<Served>, Refusal> {
-    if ids.len() > MAX_REQUEST_BLOCKS_DENEB {
-        return Err(Refusal::Invalid(format!(
-            "{} identifiers, above MAX_REQUEST_BLOCKS_DENEB {MAX_REQUEST_BLOCKS_DENEB}",
-            ids.len()
-        )));
-    }
-    let sidecars: u64 = ids.iter().map(|(_, c)| c.len() as u64).sum();
-    if sidecars > MAX_REQUEST_DATA_COLUMN_SIDECARS {
-        return Err(Refusal::Invalid(format!(
-            "{sidecars} sidecars requested, above MAX_REQUEST_DATA_COLUMN_SIDECARS \
-             {MAX_REQUEST_DATA_COLUMN_SIDECARS}"
-        )));
-    }
+    root_request_bounds(ids)?;
     let wanted = ids
         .iter()
-        .map(|(root, columns)| Ok((root, requested(columns)?)))
-        .collect::<Result<Vec<_>, Refusal>>()?;
+        .map(|(root, columns)| (root, columns.iter().copied().collect::<BTreeSet<u64>>()));
     let mut seen: HashSet<(Root, u64)> = HashSet::new();
     let mut served = Vec::new();
     let mut bytes = 0usize;

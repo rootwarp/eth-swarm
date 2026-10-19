@@ -640,6 +640,54 @@ fn range_bounds_are_invalid() {
         .is_empty());
 }
 
+/// The request bounds need no store: every index below `NUMBER_OF_COLUMNS`, and at most
+/// `MAX_REQUEST_DATA_COLUMN_SIDECARS` sidecars counted as named, duplicates included; by root
+/// also at most `MAX_REQUEST_BLOCKS_DENEB` identifiers. A request within them gets the number of
+/// sidecars it names.
+#[test]
+fn request_bounds_hold_without_a_store() {
+    let all: Vec<u64> = (0..128).collect();
+    assert_eq!(range_request_bounds(128, &all), Ok(16_384));
+    assert_eq!(range_request_bounds(8_192, &[1, 1]), Ok(16_384));
+    assert_eq!(range_request_bounds(u64::MAX, &[]), Ok(0));
+    assert_eq!(range_request_bounds(0, &[127]), Ok(0));
+    for (count, columns) in [
+        (1, vec![128]),
+        (0, vec![u64::MAX]),
+        (129, all.clone()),
+        (8_193, vec![1, 1]),
+        (u64::MAX, vec![1]),
+    ] {
+        assert!(
+            matches!(
+                range_request_bounds(count, &columns),
+                Err(Refusal::Invalid(_))
+            ),
+            "{count} x {columns:?}"
+        );
+    }
+
+    let ids = |n: usize, columns: Vec<u64>| -> Vec<(Root, Vec<u64>)> {
+        (0..n).map(|i| ([i as u8; 32], columns.clone())).collect()
+    };
+    assert_eq!(root_request_bounds(&[]), Ok(0));
+    assert_eq!(root_request_bounds(&ids(128, all.clone())), Ok(16_384));
+    assert_eq!(root_request_bounds(&ids(128, vec![5; 128])), Ok(16_384));
+    assert_eq!(root_request_bounds(&ids(3, vec![])), Ok(0));
+    for bad in [
+        ids(129, vec![1]),
+        ids(128, (0..129).map(|i| i % 128).collect()),
+        ids(1, vec![1, 128]),
+        ids(1, vec![u64::MAX]),
+    ] {
+        assert!(
+            matches!(root_request_bounds(&bad), Err(Refusal::Invalid(_))),
+            "{} identifiers",
+            bad.len()
+        );
+    }
+}
+
 /// A clock with every slot in range and one Gloas digest.
 struct Fixed;
 
@@ -868,4 +916,135 @@ fn the_wall_clock_serve_range() {
     let mut hoodi = chain;
     hoodi.config = ChainConfig::load(Network::Hoodi).unwrap();
     assert!(WallClock::new(hoodi).is_ok());
+}
+
+/// `ReqRespService` refuses a column request as `1: InvalidRequest` exactly when
+/// [`range_request_bounds`] or [`root_request_bounds`] refuses it, with a store or without one:
+/// the bounds are the service's, not a copy of them.
+#[tokio::test]
+async fn the_service_refuses_exactly_what_the_bounds_refuse() {
+    use ipc::envelope::DigestTable;
+    use network_config::{ForkSchedule, ScheduledFork};
+    use tokio_stream::StreamExt;
+    let at = |epoch| ScheduledFork {
+        version: [7, 0, 0, 0],
+        epoch,
+    };
+    let hello = common::Hello {
+        api_version: 1,
+        min_api_version: 1,
+        max_api_version: 1,
+        ..Default::default()
+    };
+    let digests = DigestTable::new(vec![(0, ForkName::Gloas, [0x61, 0x0a, 0x50, 0x01])]).unwrap();
+    let link = Link::new::<consensus_types::Mainnet>(
+        hello.clone(),
+        1,
+        ForkSchedule::new(at(0), at(0)).unwrap(),
+        digests,
+    );
+    /// The error codes of a response's chunks.
+    fn codes(item: Option<pb::ResponseChunk>) -> Option<i32> {
+        match item.and_then(|i| i.result) {
+            Some(pb::response_chunk::Result::Error(e)) => Some(e.code),
+            _ => None,
+        }
+    }
+    let all: Vec<u64> = (0..128).collect();
+    let ranges = [
+        (0, vec![1]),
+        (5, vec![]),
+        (128, all.clone()),
+        (8_192, vec![47, 47]),
+        (1, vec![128]),
+        (129, all.clone()),
+        (8_193, vec![47, 47]),
+        (u64::MAX, vec![1]),
+        (u64::MAX, vec![]),
+    ];
+    let ids = |n: usize, columns: Vec<u64>| -> Vec<(Root, Vec<u64>)> {
+        (0..n).map(|i| ([i as u8; 32], columns.clone())).collect()
+    };
+    let roots = [
+        vec![],
+        ids(1, vec![1, 1]),
+        ids(128, all.clone()),
+        ids(129, vec![1]),
+        ids(128, (0..129).map(|i| i % 128).collect()),
+        ids(1, vec![128]),
+    ];
+    for stored in [false, true] {
+        let (_dir, writer) = store();
+        if stored {
+            chain(&writer, &[10, 11], &CUSTODY);
+        }
+        let server = ReqRespServer::new(
+            link.clone(),
+            Arc::new(ColumnServer::new(
+                Arc::new(writer) as Arc<dyn ColumnStore>,
+                U256::MAX,
+                Arc::new(Fixed),
+                ServeBudget::default(),
+            )),
+        );
+        for (count, columns) in &ranges {
+            let request = pb::DataColumnsByRangeRequest {
+                start_slot: 10,
+                count: *count,
+                columns: columns.clone(),
+                hello: Some(hello.clone()),
+            };
+            let mut stream = server
+                .data_columns_by_range(Request::new(request))
+                .await
+                .unwrap()
+                .into_inner();
+            let mut refused = Vec::new();
+            while let Some(frame) = stream.next().await {
+                if let Some(pb::data_columns_by_range_response::Frame::Body(body)) =
+                    frame.unwrap().frame
+                {
+                    refused.extend(codes(body.item));
+                }
+            }
+            let invalid = refused == [ErrorCode::Invalid as i32];
+            assert_eq!(
+                invalid,
+                range_request_bounds(*count, columns).is_err(),
+                "stored {stored}: {count} x {columns:?} refused with {refused:?}"
+            );
+        }
+        for ids in &roots {
+            let request = pb::DataColumnsByRootRequest {
+                ids: ids
+                    .iter()
+                    .map(|(root, columns)| pb::DataColumnsByRootIdentifier {
+                        block_root: root.to_vec(),
+                        columns: columns.clone(),
+                    })
+                    .collect(),
+                hello: Some(hello.clone()),
+            };
+            let mut stream = server
+                .data_columns_by_root(Request::new(request))
+                .await
+                .unwrap()
+                .into_inner();
+            let mut refused = Vec::new();
+            while let Some(frame) = stream.next().await {
+                if let Some(pb::data_columns_by_root_response::Frame::Body(body)) =
+                    frame.unwrap().frame
+                {
+                    refused.extend(codes(body.item));
+                }
+            }
+            let invalid = refused == [ErrorCode::Invalid as i32];
+            assert_eq!(
+                invalid,
+                root_request_bounds(ids).is_err(),
+                "stored {stored}: {} identifiers refused with {refused:?}",
+                ids.len()
+            );
+        }
+    }
 }

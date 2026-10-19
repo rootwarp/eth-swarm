@@ -143,8 +143,9 @@ jobs:
     # The decoder fuzz targets (fuzz/, its own workspace and Cargo.lock) build as the gates run
     # them, on the nightly pinned in fuzz/rust-toolchain.toml. cargo-fuzz has no --locked:
     # fuzz/build-m2a.sh runs `cargo metadata --locked` first and fails if the build touched
-    # fuzz/Cargo.lock. The fuzzing itself (fuzz/run-m2a-gate.sh, fuzz/run-gate1.sh and
-    # fuzz/run-gate2a.sh, 1 h per target) is not run here; gates 1 and 2a run nightly.
+    # fuzz/Cargo.lock. The fuzzing itself (fuzz/run-m2a-gate.sh, fuzz/run-gate1.sh,
+    # fuzz/run-gate2a.sh and fuzz/run-gate2b.sh, 1 h per target) is not run here; gates 1, 2a and
+    # 2b run nightly.
     name: fuzz targets build, seed corpus, gate scripts
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -170,11 +171,12 @@ jobs:
       - name: Seed corpus is what fuzz/gen-seeds.sh builds and runs clean under every target
         working-directory: fuzz
         run: cargo test --locked
-      - name: Gate runners and gate file checkers (m2a, gate 1 and gate 2a)
+      - name: Gate runners and gate file checkers (m2a, gate 1, gate 2a and gate 2b)
         run: |
           bash scripts/tests/run-m2a-gate.test.sh && bash scripts/tests/check-m2a-gate.test.sh
           bash scripts/tests/run-gate1.test.sh && bash scripts/tests/check-gate1.test.sh
           bash scripts/tests/run-gate2a.test.sh && bash scripts/tests/check-gate2a.test.sh
+          bash scripts/tests/run-gate2b.test.sh && bash scripts/tests/check-gate2b.test.sh
 
   root-tests:
     # Tests that need more than one UID: file owner checks, and the Unix-socket peer checks

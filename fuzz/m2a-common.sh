@@ -1,6 +1,7 @@
 # Shared by fuzz/build-m2a.sh, fuzz/run-m2a-gate.sh, fuzz/check-m2a-gate.sh and
 # fuzz/coverage-m2a.sh (and so by fuzz/run-gate1.sh and fuzz/check-gate1.sh, which run the gate
-# scripts with --gate gate1, and fuzz/run-gate2a.sh and fuzz/check-gate2a.sh, with --gate gate2a).
+# scripts with --gate gate1, fuzz/run-gate2a.sh and fuzz/check-gate2a.sh, with --gate gate2a, and
+# fuzz/run-gate2b.sh and fuzz/check-gate2b.sh, with --gate gate2b).
 # Source it; it sets `repo` and `fuzz_dir` from its own location, and
 # selects the m2a gate (gate_select below). Every git call goes through m2a_git (a scrubbed
 # environment and config).
@@ -23,6 +24,11 @@ GATE1_TARGETS=(rpc_chunk gossip_transform message_id enr_fields status_v2 metada
 # requests (DataColumnSidecarsByRange v1, DataColumnSidecarsByRoot v1) through the timed codec
 # and the request decoder, then the admission check.
 GATE2A_TARGETS=(data_column_sidecar columns_by_range_req columns_by_root_req)
+
+# Gate 2b: the column handlers. cl-chain's storage contract and column store (ColumnIngest on a
+# temp column env, a stub reference and a stub cl-verify) and its column RPCs (ReqRespServer),
+# driven with sequences of gossip sidecars and range and root requests.
+GATE2B_TARGETS=(column_contract)
 
 # Release, with debug assertions and overflow checks (an overflow is a crash, not a wrap), and
 # AddressSanitizer (cargo-fuzz's default). The gate runs exactly what build-m2a.sh builds.
@@ -76,23 +82,45 @@ GATE1_KEY_PATHS=(
 
 # Gate 2a's key: the m2a key (p2p-wire holds the column protocols, their request and sidecar
 # bounds and column_request_error, the check cl-p2p admits a column request with; cl-p2p's rpc
-# codec reads the column responses and requests), plus the rest of the column request code:
-# cl-p2p's column answers (rpc/columns.rs: what a request names, how an answer is cut) and
-# cl-chain's ReqRespService (reqresp.rs), whose bounds on the forwarded request the harness's
-# spec rule mirrors; network-config (the column caps and the fork schedule a sidecar's slot is
-# mapped through come from the pinned Sepolia config); and fuzz/run-gate2a.sh. Both lockfiles
-# are keyed as for m2a.
+# codec reads the column responses and requests; consensus-types holds NUMBER_OF_COLUMNS), plus
+# the rest of the column request code: cl-p2p's column answers (rpc/columns.rs: what a request
+# names, how an answer is cut) and cl-chain's request bounds (reqresp.rs, with its manifest),
+# which the request targets run on every decoded request; network-config (the column caps and
+# the fork schedule a sidecar's slot is mapped through come from the pinned Sepolia config); and
+# fuzz/run-gate2a.sh. Both lockfiles are keyed as for m2a.
 GATE2A_KEY_PATHS=(
   "${M2A_KEY_PATHS[@]}"
   crates/cl-p2p/src/rpc/columns.rs
+  crates/cl-chain/Cargo.toml
   crates/cl-chain/src/reqresp.rs
   crates/network-config
   fuzz/run-gate2a.sh
 )
 
-# gate_select <m2a|gate1|gate2a>: the gate the scripts run and check. Sets GATE_ID (the gate file's
+# Gate 2b's key: the m2a key (the gossip transform and the column request decoders are
+# p2p-wire's, the sidecar and block types consensus-types', the timed request codec cl-p2p's),
+# plus everything column_contract runs past them: cl-chain's source and manifest (the probe's
+# storage contract, reference view, root wait and column store, the custody record, the
+# verify.v1 client's trait and the column RPCs), the column env (cl-chain-columns, its MDBX
+# binding pinned in the lockfiles), the chain.v1 messages and their sources (ethswarm-proto,
+# proto/ethswarm), the contract layer the RPCs and the harness hold every stream to (ipc),
+# network-config (the Sepolia schedule and caps) and fuzz/run-gate2b.sh. Both lockfiles are
+# keyed as for m2a.
+GATE2B_KEY_PATHS=(
+  "${M2A_KEY_PATHS[@]}"
+  crates/cl-chain/Cargo.toml
+  crates/cl-chain/src
+  crates/cl-chain-columns
+  crates/ethswarm-proto
+  proto/ethswarm
+  crates/ipc
+  crates/network-config
+  fuzz/run-gate2b.sh
+)
+
+# gate_select <m2a|gate1|gate2a|gate2b>: the gate the scripts run and check. Sets GATE_ID (the gate file's
 # "gate"), GATE_LABEL (for messages), GATE_TARGETS, GATE_KEY_PATHS (the files are M2A_KEY_FILES
-# for both), GATE_FILE (the default gate file under fuzz/artifacts/), GATE_WORK (the run's work
+# for every gate), GATE_FILE (the default gate file under fuzz/artifacts/), GATE_WORK (the run's work
 # directory under fuzz/target/), and GATE_RUNNER and GATE_CHECKER (the scripts, for messages).
 # Status 1 for another name.
 gate_select() {
@@ -115,6 +143,12 @@ gate_select() {
       GATE_TARGETS=("${GATE2A_TARGETS[@]}")
       GATE_KEY_PATHS=("${GATE2A_KEY_PATHS[@]}")
       ;;
+    gate2b)
+      GATE_ID=gate2b-fuzz GATE_LABEL="gate 2b" GATE_FILE=gate2b.json GATE_WORK=gate2b
+      GATE_RUNNER=fuzz/run-gate2b.sh GATE_CHECKER=fuzz/check-gate2b.sh
+      GATE_TARGETS=("${GATE2B_TARGETS[@]}")
+      GATE_KEY_PATHS=("${GATE2B_KEY_PATHS[@]}")
+      ;;
     *) return 1 ;;
   esac
 }
@@ -135,8 +169,13 @@ M2A_REQUIRED_SECONDS=3600
 # block it may hold decodes as above; a node record is at most 300 bytes. The column targets hold
 # it too: a sidecar's SSZ is at most its fork's cap (Gloas: compute_max_data_column_sidecar_size()
 # of the Sepolia schedule, 44,072 B; Fulu: its type bound, under MAX_PAYLOAD_SIZE), its lists are
-# of fixed-size items, and a column request is at most 136,192 B. -rss_limit_mb=2048
-# bounds the whole process. -timeout=10 s per input.
+# of fixed-size items, and a column request is at most 136,192 B. column_contract holds it as
+# well: its gossip messages are those sidecars (each message at most 65,535 B, its 2-byte
+# length), its requests those requests, and a sidecar it builds holds at most four cells; its
+# column env is a memory map, not an allocation. -rss_limit_mb=2048 bounds the whole process,
+# column_contract's column env included: one env at a time (one per input, removed after it),
+# its map at most cl-chain-columns' MIN_MAX_SIZE (256 MiB) even with every page resident.
+# -timeout=10 s per input.
 #
 # -max_len (m2a_max_len): without it libFuzzer caps inputs at the largest seed (49,379 B), and
 # a BlocksByRange stream could never grow past that. blocks_by_range_resp gets 2 MiB: room for
@@ -154,7 +193,10 @@ M2A_REQUIRED_SECONDS=3600
 # columns_by_root_req gets 256 KiB: its bound is 136,192 B (128 identifiers of 128 columns), at
 # most 158,922 B compressed plus frame headers, so a whole request fits even sent uncompressed.
 # columns_by_range_req gets 4096 B: its bound is 1,044 B (1,250 B compressed), so 4096 B is over
-# 3 x that and holds its 3,096 B snappy-bomb seed.
+# 3 x that and holds its 3,096 B snappy-bomb seed. column_contract gets 256 KiB, as
+# columns_by_root_req: room for a whole by-root request at its bound as one raw operation, or a
+# few column messages at the cap, besides the anchor and queries every seed carries; an input
+# holds at most 24 sidecars and 24 requests whatever its length.
 M2A_RSS_LIMIT_MB=2048
 M2A_MALLOC_LIMIT_MB=128
 M2A_TIMEOUT_S=10
@@ -162,7 +204,7 @@ m2a_max_len() {
   case $1 in
     blocks_by_range_resp | gossip_transform | message_id) echo 2097152 ;;
     rpc_chunk | data_column_sidecar) echo 1048576 ;;
-    columns_by_root_req) echo 262144 ;;
+    columns_by_root_req | column_contract) echo 262144 ;;
     *) echo 4096 ;;
   esac
 }
@@ -172,11 +214,13 @@ m2a_max_len() {
 # committed seeds (rustc 5d8fec066): status_v2 2,065, metadata_v3 1,803, ping_goodbye 1,861 (the
 # timed codec in both directions), blocks_by_range_resp 5,257, rpc_chunk 2,352,
 # gossip_transform 3,226, message_id 1,471, enr_fields 4,151, data_column_sidecar 3,841,
-# columns_by_range_req 1,429, columns_by_root_req 1,895; a target that returns at once
+# columns_by_range_req 1,429, columns_by_root_req 1,895, column_contract 21,950 (cl-chain's
+# column store and RPCs past the decoders); a target that returns at once
 # (RUST_LIBFUZZER_DEBUG_PATH set) has 66-103. The floors sit at well under half of the real
 # values and well over the no-op ones.
 m2a_min_seed_ft() {
   case $1 in
+    column_contract) echo 5000 ;;
     blocks_by_range_resp) echo 2000 ;;
     gossip_transform | enr_fields | data_column_sidecar) echo 1500 ;;
     columns_by_root_req) echo 800 ;;
