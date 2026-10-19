@@ -175,7 +175,8 @@ M2A_REQUIRED_SECONDS=3600
 # column env is a memory map, not an allocation. -rss_limit_mb=2048 bounds the whole process,
 # column_contract's column env included: one env at a time (one per input, removed after it),
 # its map at most cl-chain-columns' MIN_MAX_SIZE (256 MiB) even with every page resident.
-# -timeout=10 s per input.
+# -timeout=10 s per input; column_contract's wait for its writer thread (WRITER_WAIT in
+# fuzz/src/contract.rs, 8 s) stays 2 s under it, which fuzz/tests/writer_wait.rs checks.
 #
 # -max_len (m2a_max_len): without it libFuzzer caps inputs at the largest seed (49,379 B), and
 # a BlocksByRange stream could never grow past that. blocks_by_range_resp gets 2 MiB: room for

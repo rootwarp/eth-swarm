@@ -56,7 +56,7 @@ pub use contract::{
     raw_gossip, raw_request, Answer, Event, GossipSpec, KnownBlock, RangeSpec, RootSpec, CHAIN,
     CUSTODY, EXTRA_CELL, KZG_INVALID, KZG_NO_VERDICT, KZG_VALID, MAX_GOSSIP, MAX_REQUESTS,
     MISSING_CELL, MISSING_PROOF, OPS, OP_GOSSIP, OP_RANGE, OP_RAW_GOSSIP, OP_RAW_RANGE,
-    OP_RAW_ROOT, OP_ROOT, SLOT_AFTER, UNKNOWN_ROOT, WRONG_SUBNET,
+    OP_RAW_ROOT, OP_ROOT, SLOT_AFTER, UNKNOWN_ROOT, WRITER_WAIT, WRONG_SUBNET,
 };
 pub use gossip::{gossip_transform, message_id, message_input, split_message, topic_caps};
 pub use record::{

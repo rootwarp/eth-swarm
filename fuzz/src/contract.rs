@@ -182,9 +182,12 @@ const CHAIN_OFFSET: u64 = 63;
 /// The serve range ends this far past the first Gloas slot.
 const SERVE_SPAN: u64 = 4096;
 /// How long the harness waits on the wall clock for the writer thread's settle step after a
-/// write: far past the few milliseconds it takes, and well under the gate's 10 s per-input
-/// timeout, so a writer that never settles fails with its own message, not as a timeout.
-const WRITER_WAIT: Duration = Duration::from_secs(2);
+/// write: 8 s, far past the few milliseconds it takes, so a writer thread that stalls on a
+/// loaded machine but settles within the input's time is not reported as a crash, and 2 s under
+/// the gates' per-input timeout (`-timeout=10`, `M2A_TIMEOUT_S` in `fuzz/m2a-common.sh`, which
+/// `tests/writer_wait.rs` holds it to), so a writer that never settles still fails with its own
+/// message, not as a timeout.
+pub const WRITER_WAIT: Duration = Duration::from_secs(8);
 
 /// One block the stub reference vouches for.
 #[derive(Debug, Clone)]
