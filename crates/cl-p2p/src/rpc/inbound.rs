@@ -67,13 +67,28 @@
 //!   its stream, so a peer over its quota cannot open more. A column stream holds its slot
 //!   while its lookup runs, too.
 //! - **Columns**: a column request books its tokens when it is admitted
-//!   ([`super::limits::BookedChunks`]): as many sidecars as it names, at most an answer's
-//!   share of what the quota delivers in [`RpcLimits::column_answer_window`] and at most what
-//!   the bucket can still deliver in that window, at least one whole block. Its lookup waits
-//!   until the first token is due, so a peer over its quota costs no lookup, and its chunks go
-//!   out at the booked tokens; a booking behind another moves up as that one's unused tokens go
-//!   back. A reset, before or after, gives back nothing, so a peer cannot request and reset its
-//!   way past its quota; nor does a close during the lookup, whose answer is dropped unsettled.
+//!   ([`super::limits::BookedChunks`], `column_tokens`): as many sidecars as it names, at most
+//!   an answer's share of what the quota delivers in [`RpcLimits::column_answer_window`] and at
+//!   most what the bucket can still deliver in that window, at least its largest block (for
+//!   roots, every column named for one root over all its identifiers, each once: the first
+//!   block always goes out, so every chunk sent is paid for) and at least its lookup's cost.
+//!   Its lookup waits until the first token is due, so a peer over its quota costs no lookup,
+//!   and its chunks go out at the booked tokens; a booking behind another moves up as that
+//!   one's unused tokens go back. Those go back once, when the answer's first chunk was written
+//!   whole (an empty answer: when its writer starts), past the chunks it holds and its lookup's
+//!   cost, which stays charged however little the lookup found: one token per identifier
+//!   naming a column (the store looks its root up), one per range (`lookup_cost`). At the
+//!   default quota (512 at once, then 200 a second) a peer naming 128 unknown roots a time
+//!   keeps 128 tokens (640 ms) per lookup, so past its burst its empty lookups run at no more
+//!   than 200 roots a second. The cost never exceeds the sidecars a request names (each such
+//!   identifier names one at least), so no peer pays more for an empty answer than for the
+//!   same request answered in full, and a pattern its quota serves in time with full answers
+//!   is served in time with empty ones.
+//!   A reset before that first chunk, or a close during the lookup (its answer dropped), gives
+//!   back nothing, so a peer cannot request and reset its way past its quota: the
+//!   request-response handler waits on its response channel, not the stream, so a reset
+//!   during the lookup shows only when the answer's first write fails. A requester that goes
+//!   away later pays for the whole answer as cut, as one that read it does.
 //!   Answers hold a place from the lookup until the stream's writer returns
 //!   ([`super::limits::ColumnPlaces`]): at most [`RpcLimits::max_column_answers`] (8) at once,
 //!   one per peer and [`RpcLimits::max_column_answers_per_ip`] (2) per IP, each at most
@@ -81,16 +96,19 @@
 //!   estimated 68 MiB for all, see [`super::limits::DEFAULT_MAX_COLUMN_ANSWERS`]), and no more
 //!   than the whole blocks a requester reading those bytes per
 //!   [`RpcLimits::column_answer_window`] reads from the lookup's end to the end of the window,
-//!   given when each chunk's token is due ([`answer_columns`], [`super::limits::PacedReader`]):
-//!   a slow lookup or tokens due late shorten the answer, at a whole block, instead of leaving
-//!   the requester less time for the same bytes. Each answer is written to a
+//!   given when each chunk's token is due ([`answer_columns`], [`super::limits::PacedReader`]);
+//!   the stream's writer cuts it again, at a whole block, to what that requester reads from
+//!   when writing starts ([`super::limits::BookedChunks::cut`]): a slow lookup, a delay before
+//!   writing or tokens due late shorten the answer instead of leaving the requester less time
+//!   for the same bytes. Each answer is written to a
 //!   schedule ([`super::limits::WriteSchedule`]): a chunk is due at its booked token, no
 //!   earlier than the share of the window from when the answer took its place that the
 //!   answer's bytes before it are of all of them, and no earlier than such a requester has it,
 //!   and a chunk not written within
-//!   [`RpcLimits::column_write_deadline`] (1 s) of that, or of its write's start, resets its
-//!   stream and frees the place. A requester that stops reading holds it for
-//!   about a second, and one that reads a chunk just inside the deadline each time falls behind
+//!   [`RpcLimits::column_write_deadline`] (1 s) of that, or within its own bytes' time at the
+//!   answer's pace and the write deadline of its write's start, resets its stream and frees
+//!   the place. A requester that stops reading holds it for about a second and its chunk's
+//!   bytes' time, and one that reads a chunk just inside the deadline each time falls behind
 //!   its schedule and is cut too; no place is held past the window and the write deadline, so
 //!   slow readers spread over many IPs cannot keep every place for the 10 s exchange timeout.
 //!   A request whose tokens are due waits for a place up to
@@ -145,7 +163,8 @@ use super::codec::{
     Answer, Deadline, Deadlines, InboundCodec, ReadError, ReceivedChunk, RpcCodec, RpcRequest,
 };
 use super::columns::{
-    column_chunks, error_answer, AnswerBudget, ColumnLookup, ColumnReply, ColumnSource, Requested,
+    column_chunks, error_answer, lookup_cost, AnswerBudget, ColumnLookup, ColumnReply,
+    ColumnSource, Requested,
 };
 use super::limits::{
     shared_limiter, Admit, AnswerPermit, BookedChunks, ChunkPacer, ColumnPlaces, OutboundSemaphore,
@@ -628,7 +647,8 @@ impl PeerState {
     }
 }
 
-/// A column answer ready to go out: its request's stream, chunks, tokens and place.
+/// A column answer ready to go out: its request's stream, chunks, tokens (settled by the
+/// stream's writer) and place.
 struct ColumnAnswer<E: EthSpec> {
     protocol: Protocol,
     channel: ResponseChannel<Answer<E>>,
@@ -641,7 +661,8 @@ struct ColumnAnswer<E: EthSpec> {
 /// (`2: ServerError` past [`COLUMN_LOOKUP_TIMEOUT`]) held to `requested` and cut to `budget`
 /// and to the whole blocks a requester reading at the answer's pace from the lookup's end has
 /// by the end of the window of `permit`'s place, given when each of `booked`'s tokens is due
-/// ([`column_chunks`], [`BookedChunks::reader`]).
+/// ([`column_chunks`], [`BookedChunks::reader`]). The stream's writer cuts it again from when
+/// it starts, and settles `booked` then ([`super::codec::Answer`]).
 pub(crate) async fn answer_columns<E: EthSpec>(
     lookup: ColumnLookup,
     requested: &Requested,
@@ -656,6 +677,25 @@ pub(crate) async fn answer_columns<E: EthSpec>(
         .unwrap_or_else(|_| ColumnReply::server_error("column lookup timed out"));
     let reader = booked.reader(permit.held_since(), Instant::now());
     column_chunks(reply, requested, contexts, budget, &reader, metrics)
+}
+
+/// The tokens column `request`, naming `requested`, books when it is admitted: as many
+/// sidecars as it names, at most an answer's `share` of the window and the `deliverable` tokens
+/// its bucket still delivers in it, and at least its largest block
+/// ([`Requested::largest_block`]), which always goes out, so every chunk sent is paid for, and
+/// its lookup's cost ([`lookup_cost`]), which stays charged.
+pub(crate) fn column_tokens(
+    request: &Request,
+    requested: &Requested,
+    share: u64,
+    deliverable: u64,
+) -> u64 {
+    let max_chunks = request.max_response_chunks();
+    max_chunks
+        .min(share)
+        .min(deliverable)
+        .max(requested.largest_block().min(max_chunks))
+        .max(lookup_cost(request).min(max_chunks))
 }
 
 /// A column request admitted and waiting for its tokens or a place.
@@ -1394,20 +1434,15 @@ impl<E: EthSpec> Control<E> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .deliverable(peer, protocol, limits.column_answer_window, Instant::now());
-        let block = match &request {
-            Request::DataColumnsByRange(r) => r.columns.len() as u64,
-            Request::DataColumnsByRoot(r) => {
-                r.0.iter()
-                    .map(|id| id.columns.len() as u64)
-                    .max()
-                    .unwrap_or(1)
-            }
-            _ => 1,
+        let Some(requested) = Requested::of(&request) else {
+            unreachable!("{request:?} is not a column request")
         };
-        let tokens = max_chunks
-            .min(limits.column_answer_sidecars(protocol))
-            .min(deliverable)
-            .max(block.min(max_chunks));
+        let tokens = column_tokens(
+            &request,
+            &requested,
+            limits.column_answer_sidecars(protocol),
+            deliverable,
+        );
         let booked = BookedChunks::book(
             &self.limiter,
             peer,
@@ -1415,7 +1450,9 @@ impl<E: EthSpec> Control<E> {
             tokens,
             Some(self.metrics.clone()),
             limits.column_deadlines(),
-        );
+        )
+        .with_lookup_cost(lookup_cost(&request));
+        drop(requested);
         self.column_queue.push_back(QueuedColumn {
             peer,
             protocol,
@@ -1493,7 +1530,7 @@ impl<E: EthSpec> Control<E> {
             protocol,
             channel,
             request,
-            mut booked,
+            booked,
             ..
         } = queued;
         let (Some(source), Some(requested), Ok(runtime)) = (
@@ -1527,12 +1564,12 @@ impl<E: EthSpec> Control<E> {
             )
             .await;
             if !channel.is_open() {
-                // Gone during the lookup: its tokens stay spent, as on a reset.
+                // Gone during the lookup: its tokens stay spent, as on a reset. (A reset of the
+                // stream alone leaves the channel open; the writer sees it.)
                 tracing::debug!(%peer, "a column request's stream closed during its lookup");
                 return None;
             }
             permit.hold_bytes(bytes);
-            booked.settle(chunks.len() as u64);
             Some(ColumnAnswer {
                 protocol,
                 channel,
@@ -1966,6 +2003,53 @@ mod tests {
     use ethswarm_proto::common;
     use p2p_wire::testkit;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn by_root(ids: &[([u8; 32], &[u64])]) -> Request {
+        use p2p_wire::rpc::messages::{DataColumnsByRootIdentifier, DataColumnsByRootV1Request};
+        let ids: Vec<_> = ids
+            .iter()
+            .map(|(root, columns)| DataColumnsByRootIdentifier {
+                block_root: (*root).into(),
+                columns: columns.to_vec().try_into().unwrap(),
+            })
+            .collect();
+        Request::DataColumnsByRoot(DataColumnsByRootV1Request(ids.try_into().unwrap()))
+    }
+
+    /// SEC-002: the first block of an answer always goes out, so a request books at least the
+    /// most sidecars one block can hold: for roots, every column named for a root over all its
+    /// identifiers, each once, however the identifiers split them.
+    #[test]
+    fn a_request_books_its_largest_block_however_its_identifiers_split_it() {
+        let (r, s) = ([1; 32], [2; 32]);
+        let request = by_root(&[(r, &[0, 1]), (s, &[0]), (r, &[2, 1]), (r, &[3])]);
+        assert_eq!(request.max_response_chunks(), 6);
+        let split = Requested::of(&request).unwrap();
+        // A spent bucket: the four columns of `r` all the same.
+        assert_eq!(column_tokens(&request, &split, 756, 0), 4);
+        // As many as it names when the bucket and the share have them.
+        assert_eq!(column_tokens(&request, &split, 756, 1_000), 6);
+        // A range: its columns, each once.
+        let range =
+            Request::DataColumnsByRange(p2p_wire::rpc::messages::DataColumnsByRangeV1Request {
+                start_slot: 0,
+                count: 32,
+                columns: vec![1, 47, 47].try_into().unwrap(),
+            });
+        let ranged = Requested::of(&range).unwrap();
+        assert_eq!(column_tokens(&range, &ranged, 756, 0), 2);
+        // SEC-001: and at least the lookup's cost, one token per identifier naming a column
+        // (the store looks each up), one per range.
+        assert_eq!(lookup_cost(&request), 4);
+        assert_eq!(lookup_cost(&by_root(&[(r, &[]), (s, &[4])])), 1);
+        assert_eq!(lookup_cost(&range), 1);
+        let ids: Vec<([u8; 32], &[u64])> = (0..8u8).map(|i| ([i; 32], &[5u64][..])).collect();
+        let roots = by_root(&ids);
+        assert_eq!(
+            column_tokens(&roots, &Requested::of(&roots).unwrap(), 756, 0),
+            8
+        );
+    }
 
     #[test]
     fn relevance_checks_digest_then_finalized() {

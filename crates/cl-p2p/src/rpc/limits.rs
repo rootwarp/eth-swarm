@@ -20,9 +20,10 @@
 //!   it waits in that protocol's bounded queue; a full queue IGNOREs it.
 //! - [`BookedChunks`]: a column answer's tokens, booked in one go when its request is admitted
 //!   ([`RateLimiter::charge_block`]), so a peer pays for its request before any lookup runs and
-//!   cannot reset its way out of the bill: once the answer's size is known the tokens it does not
-//!   use are given back ([`BookedChunks::settle`]), never more, and a reset (or a close during
-//!   the lookup) refunds nothing.
+//!   cannot reset its way out of the bill: once the answer's first chunk was written whole the
+//!   tokens it does not use, past its lookup's cost, are given back
+//!   ([`BookedChunks::settle_answer`]), once and never more, and a reset before that (or a close
+//!   during the lookup) refunds nothing.
 //! - [`ColumnPlaces`]: the column answers held at once, from the lookup until the stream's
 //!   writer returns, at most one per peer ([`AnswerPermit`]), each written to its booked
 //!   schedule and held no longer than the answer window and the write deadline
@@ -144,9 +145,10 @@ pub const DEFAULT_OUTBOUND_QUEUE_LEN: usize = 256;
 /// limit the number of data column sidecars in the response", `fulu/p2p-interface.md` L682), so
 /// one epoch of 4 custody columns of 21-blob Gloas blocks (32 × 4 × 44,072 bytes, 5.4 MiB) fits
 /// whole. The answer holds no more than a requester reading these bytes per window reads from
-/// the lookup's end to the window's end, given when each chunk's token is due
-/// ([`PacedReader`]): after the longest lookup (2 s), 3 s of the 5 s, about 4.8 MiB with the
-/// tokens due by then, and less when they are due later.
+/// the lookup's end, and again from when writing starts, to the window's end, given when each
+/// chunk's token is due ([`PacedReader`]): after the longest lookup (2 s), 3 s of the 5 s, about
+/// 4.8 MiB with the tokens due by then, and less when they are due later or writing starts
+/// later.
 pub const MAX_COLUMN_RESPONSE_BYTES: usize = 8 << 20;
 
 /// How long a column answer's chunks may take to go out at the peer's quota \[est\]: 5 s, the
@@ -185,15 +187,16 @@ pub const DEFAULT_MAX_COLUMN_ANSWERS_PER_IP: usize = 2;
 /// ([`COLUMN_ANSWER_WINDOW`], from when the answer took its place) that the answer's SSZ bytes
 /// before it are of all of them, so a burst never asks for the whole answer at once, and no
 /// earlier than a requester reading at the answer's pace has it ([`PacedReader`]); it must be
-/// written and flushed within this of that, and the place goes back within the window and this
-/// of being taken ([`WriteSchedule`]). The deadline is not a new one per write: a requester that
+/// written and flushed within this of that, and within this and its own bytes' time at that
+/// pace of its write's start, and the place goes back within the window and this of being
+/// taken ([`WriteSchedule`]). The deadline is not a new one per write: a requester that
 /// reads a chunk just inside it each time still falls behind its schedule and is reset, so it
-/// holds a place for about a second past the pace it keeps, not the 10 s exchange timeout. One
-/// that reads at the answer's pace (8 MiB in 5 s, about 1.7 MB/s) whenever a chunk is there to
-/// read is never cut, however the bytes are spread over the chunks and however long they wait
-/// for their tokens: the answer holds no more than the whole blocks that pace reads by the end
-/// of the window from when its lookup ended (`super::inbound::answer_columns`). Counted in
-/// `rpc_timeouts_total{kind="per_chunk"}`.
+/// holds a place for about a second (and a chunk's bytes' time) past the pace it keeps, not the
+/// 10 s exchange timeout. One that reads at the answer's pace (8 MiB in 5 s, about 1.7 MB/s)
+/// whenever a chunk is there to read is never cut, however the bytes are spread over the chunks,
+/// however large one chunk is and however long they wait for their tokens: the answer holds no
+/// more than the whole blocks that pace reads by the end of the window from when its writer
+/// started ([`BookedChunks::cut`]). Counted in `rpc_timeouts_total{kind="per_chunk"}`.
 pub const COLUMN_WRITE_DEADLINE: Duration = Duration::from_secs(1);
 
 /// The deadlines a column answer is written under ([`RpcLimits::column_deadlines`]).
@@ -815,7 +818,7 @@ impl Drop for Reservation {
 }
 
 /// One column answer's tokens, booked when its request was admitted (see the module docs).
-/// Dropping it refunds nothing.
+/// Dropping it unsettled refunds nothing.
 pub struct BookedChunks {
     limiter: SharedLimiter,
     peer: PeerId,
@@ -823,6 +826,8 @@ pub struct BookedChunks {
     charge: BlockCharge,
     metrics: Option<RpcMetrics>,
     deadlines: ColumnDeadlines,
+    /// The tokens that stay charged however short the answer ([`Self::with_lookup_cost`]).
+    lookup_cost: u64,
 }
 
 impl fmt::Debug for BookedChunks {
@@ -856,7 +861,16 @@ impl BookedChunks {
             charge,
             metrics,
             deadlines,
+            lookup_cost: 0,
         }
+    }
+
+    /// The same booking, of which `tokens` (at most those booked) stay charged once its lookup
+    /// ran, however short the answer ([`Self::settle_answer`]).
+    #[must_use]
+    pub fn with_lookup_cost(mut self, tokens: u64) -> Self {
+        self.lookup_cost = tokens.min(self.charge.tokens());
+        self
     }
 
     /// When the first chunk may go: the lookup waits for it.
@@ -898,22 +912,21 @@ impl BookedChunks {
         let reader = self.reader(held_since, now);
         let mut total = 0u64;
         let mut read = now;
-        let (before, read_by) = sizes
-            .into_iter()
-            .zip(0u64..)
-            .map(|(size, i)| {
-                let before = total;
-                total = total.saturating_add(size as u64);
-                read = reader.read(i, size, read);
-                (before, read)
-            })
-            .unzip();
+        let (mut before, mut read_by, mut transfer) = (Vec::new(), Vec::new(), Vec::new());
+        for (size, i) in sizes.into_iter().zip(0u64..) {
+            before.push(total);
+            total = total.saturating_add(size as u64);
+            read = reader.read(i, size, read);
+            read_by.push(read);
+            transfer.push(reader.transfer(size).unwrap_or(Duration::MAX));
+        }
         WriteSchedule {
             start: now,
             span: end - now,
             before,
             total,
             read_by,
+            transfer,
             write: self.deadlines.write,
             hold_until: held_since + self.deadlines.answer_window + self.deadlines.write,
         }
@@ -923,6 +936,30 @@ impl BookedChunks {
     #[must_use]
     pub fn tokens(&self) -> u64 {
         self.charge.tokens()
+    }
+
+    /// How many chunks, and how many of their SSZ bytes, of an answer of chunks of `sizes` SSZ
+    /// bytes in whole blocks of `blocks` chunks each, whose writer starts at `now`, its place
+    /// taken at `held_since`, goes out: the whole blocks a requester reading at the answer's pace
+    /// from `now` has by the end of the window, within these tokens
+    /// ([`PacedReader::whole_blocks`]).
+    #[must_use]
+    pub fn cut(
+        &self,
+        sizes: &[usize],
+        blocks: &[usize],
+        held_since: Instant,
+        now: Instant,
+    ) -> (usize, usize) {
+        self.reader(held_since, now)
+            .whole_blocks(sizes, blocks, self.tokens(), usize::MAX)
+    }
+
+    /// The answer goes out with `kept` chunks: the tokens past them, and past the lookup's cost,
+    /// go back, as far as still ahead. Its writer calls this once, when the first chunk was
+    /// written whole (the stream was still there), or at once for an answer of no chunks.
+    pub fn settle_answer(&mut self, kept: u64) {
+        self.settle(kept.max(self.lookup_cost));
     }
 
     /// The answer holds `used` chunks: the tokens past them go back, as far as still ahead.
@@ -968,6 +1005,8 @@ pub struct WriteSchedule {
     total: u64,
     /// When a requester reading at the answer's pace has each chunk ([`PacedReader::read`]).
     read_by: Vec<Instant>,
+    /// How long each chunk's own bytes take at the answer's pace ([`PacedReader::transfer`]).
+    transfer: Vec<Duration>,
     write: Duration,
     hold_until: Instant,
 }
@@ -979,8 +1018,10 @@ impl WriteSchedule {
     /// over the window keeps up however its bytes are spread over its chunks) and when a
     /// requester reading at the answer's pace has it (so the time the chunks before it waited
     /// for their tokens is not counted as reading time it had), never past the place's hold,
-    /// and never more than the write deadline after the later of `due` and `now` (a requester
-    /// that stopped reading is cut as soon as it holds a chunk that long).
+    /// and never more than the chunk's own bytes' time at the answer's pace and the write
+    /// deadline after the later of `due` and `now` (a requester that stopped reading is cut as
+    /// soon as it holds a chunk that long; one reading at the pace has a chunk of any size by
+    /// then).
     #[must_use]
     pub fn written_by(&self, i: u64, due: Instant, now: Instant) -> Instant {
         let at = usize::try_from(i).ok();
@@ -990,13 +1031,20 @@ impl WriteSchedule {
         let read = at
             .and_then(|i| self.read_by.get(i))
             .map_or(due, |&read| read);
+        let transfer = at
+            .and_then(|i| self.transfer.get(i))
+            .map_or(Duration::ZERO, |&transfer| transfer);
         let share = match self.total {
             0 => 0,
             total => self.span.as_nanos() * u128::from(before) / u128::from(total),
         };
         let share = Duration::from_nanos(u64::try_from(share).unwrap_or(u64::MAX));
+        let started = due.max(now);
+        let held = started
+            .checked_add(transfer.saturating_add(self.write))
+            .unwrap_or(self.hold_until);
         (due.max(self.start + share).max(read) + self.write)
-            .min(due.max(now) + self.write)
+            .min(held)
             .min(self.hold_until)
     }
 }
@@ -1040,10 +1088,53 @@ impl PacedReader<'_> {
     #[must_use]
     pub fn read(&self, i: u64, size: usize, prev: Instant) -> Instant {
         let from = self.charge.due_after(i, self.shift).max(prev);
-        let nanos = self.window.as_nanos() * size as u128 / u128::from(self.bytes.max(1));
-        let transfer = Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
-        from.checked_add(transfer)
+        self.transfer(size)
+            .and_then(|transfer| from.checked_add(transfer))
             .unwrap_or_else(|| from.max(self.end) + self.window)
+    }
+
+    /// How many chunks, and how many of their SSZ bytes, an answer of chunks of `sizes` SSZ
+    /// bytes in whole blocks of `blocks` chunks each (in order; chunks past them are no block)
+    /// holds: the first block whole if it is within `most_chunks`, then each next whole block
+    /// while the answer stays within `most_chunks` and `most_bytes` and this reader has read it
+    /// by the end of the window ([`Self::end`]).
+    #[must_use]
+    pub fn whole_blocks(
+        &self,
+        sizes: &[usize],
+        blocks: &[usize],
+        most_chunks: u64,
+        most_bytes: usize,
+    ) -> (usize, usize) {
+        let (mut chunks, mut bytes) = (0usize, 0usize);
+        let mut read = self.start;
+        for &len in blocks {
+            let Some(block) = sizes.get(chunks..chunks.saturating_add(len)) else {
+                break;
+            };
+            let read_by = block
+                .iter()
+                .zip(chunks as u64..)
+                .fold(read, |prev, (&size, i)| self.read(i, size, prev));
+            let size = block.iter().fold(0usize, |n, &s| n.saturating_add(s));
+            let within_tokens = (chunks + len) as u64 <= most_chunks;
+            let fits = bytes.saturating_add(size) <= most_bytes && read_by <= self.end;
+            if !within_tokens || (chunks > 0 && !fits) {
+                break;
+            }
+            read = read_by;
+            chunks += len;
+            bytes = bytes.saturating_add(size);
+        }
+        (chunks, bytes)
+    }
+
+    /// How long `size` SSZ bytes take at the answer's pace (a pace of 0 bytes reads 1 byte per
+    /// window); `None` if too long to tell.
+    #[must_use]
+    pub fn transfer(&self, size: usize) -> Option<Duration> {
+        let nanos = self.window.as_nanos() * size as u128 / u128::from(self.bytes.max(1));
+        u64::try_from(nanos).ok().map(Duration::from_nanos)
     }
 }
 

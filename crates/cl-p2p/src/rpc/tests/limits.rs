@@ -200,10 +200,15 @@ proptest! {
     /// its deadline, however much of the burst was spent before and however the bytes are
     /// spread: chunk `i` is read the chunk's bytes' time after the later of its token and the
     /// chunk before it, and the writer asks for it once that one is read. Only the place's hold
-    /// may come first, which the answer's cut to the window is for.
+    /// may come first, which the answer's cut to the window is for. Some chunks are larger
+    /// than the pace reads in a write deadline (about 1.68 MB): each has its own bytes' time
+    /// on top of the deadline.
     #[test]
     fn a_steady_reader_has_every_column_chunk_by_its_deadline(
-        sizes in prop::collection::vec(1usize..120_000, 1..400),
+        sizes in prop::collection::vec(
+            prop_oneof![9 => 1usize..120_000, 1 => 120_000usize..4_000_000],
+            1..400,
+        ),
         spent in 0u64..700,
         burst in 1u32..600,
         period_us in 1_000u64..20_000,

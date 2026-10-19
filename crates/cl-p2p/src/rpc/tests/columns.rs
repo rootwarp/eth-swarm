@@ -643,6 +643,151 @@ async fn a_close_during_the_lookup_refunds_no_unused_token() {
     assert!(took >= Duration::from_millis(1_300), "refunded: {took:?}");
 }
 
+/// A requester that writes its request and then fails the write: its request-response handler
+/// drops the stream before closing it, so the muxer resets the stream (we read the request, then
+/// its end) and the connection stays.
+#[derive(Clone, Default)]
+struct ResetAfterRequest;
+
+impl request_response::Codec for ResetAfterRequest {
+    type Protocol = StreamProtocol;
+    type Request = Vec<u8>;
+    type Response = ();
+
+    async fn read_request<T>(&mut self, _: &StreamProtocol, _: &mut T) -> io::Result<Vec<u8>>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    async fn read_response<T>(&mut self, _: &StreamProtocol, _: &mut T) -> io::Result<()>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _: &StreamProtocol,
+        io: &mut T,
+        request: Vec<u8>,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        io.write_all(&request).await?;
+        io.flush().await?;
+        Err(io::ErrorKind::ConnectionReset.into())
+    }
+
+    async fn write_response<T>(&mut self, _: &StreamProtocol, _: &mut T, _: ()) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// BUG-004: a requester whose stream is reset while its lookup runs, its connection kept, gets
+/// none of its booked tokens back. The request-response handler waits on the response channel,
+/// not the stream, so the channel is still open when the lookup ends; the answer's first write
+/// then fails on the reset stream, and only a first chunk written whole settles.
+#[tokio::test]
+async fn a_stream_reset_during_the_lookup_refunds_no_unused_token() {
+    // One sidecar per 200 ms, no burst: four blocks book 13 sidecars (an answer's share of what
+    // the quota delivers in the window), 2.6 s, and the store holds one block, so a settled
+    // answer would give nine of them, 1.8 s, back.
+    let gate = Arc::new(Semaphore::new(0));
+    let source = Scripted::gated(ColumnReply::Sidecars(block_columns(9..10)), gate.clone());
+    let mut cfg = with_columns(source.clone());
+    cfg.limits.rate.data_columns_by_range = Quota::new(1, Duration::from_millis(200));
+    assert_eq!(
+        cfg.limits
+            .column_answer_sidecars(Protocol::DataColumnsByRangeV1),
+        13
+    );
+    let mut ours = Node::spawn(cfg).await;
+    let key = libp2p::identity::Keypair::generate_secp256k1();
+    let mut swarm = super::tcp_swarm_as(
+        key.clone(),
+        request_response::Behaviour::with_codec(
+            ResetAfterRequest,
+            [(
+                StreamProtocol::new(Protocol::DataColumnsByRangeV1.id()),
+                ProtocolSupport::Outbound,
+            )],
+            request_response::Config::default().with_request_timeout(Duration::from_secs(60)),
+        ),
+    );
+    swarm.dial(ours.addr.clone()).unwrap();
+    // Drives the requester until `done`; its connection never closes meanwhile.
+    async fn drive<F: Fn(&request_response::Event<Vec<u8>, ()>) -> bool>(
+        what: &str,
+        swarm: &mut libp2p::Swarm<request_response::Behaviour<ResetAfterRequest>>,
+        done: impl Fn() -> bool,
+        event: F,
+    ) {
+        tokio::time::timeout(WAIT, async {
+            while !done() {
+                let next =
+                    tokio::time::timeout(Duration::from_millis(20), swarm.select_next_some());
+                match next.await {
+                    Ok(SwarmEvent::ConnectionClosed { .. }) => panic!("the connection closed"),
+                    Ok(SwarmEvent::Behaviour(e)) if event(&e) => return,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+    }
+    tokio::time::timeout(WAIT, async {
+        while !matches!(
+            swarm.select_next_some().await,
+            SwarmEvent::ConnectionEstablished { .. }
+        ) {}
+    })
+    .await
+    .expect("connected");
+    let start = Instant::now();
+    swarm.behaviour_mut().send_request(
+        &ours.peer,
+        encode_request(&by_range(9, 4, &CUSTODY)).unwrap(),
+    );
+    // The requester resets its stream; the connection stays, and the lookup runs.
+    drive(
+        "the reset",
+        &mut swarm,
+        || false,
+        |e| matches!(e, request_response::Event::OutboundFailure { .. }),
+    )
+    .await;
+    drive("the lookup", &mut swarm, || source.asked() > 0, |_| false).await;
+    // The lookup ends with its one block, and the answer meets the reset stream.
+    let metrics = ours.metrics.clone();
+    assert_eq!(metrics.column_answers_held(), 1);
+    gate.add_permits(100);
+    drive(
+        "the answer",
+        &mut swarm,
+        || metrics.column_answers_held() == 0,
+        |_| false,
+    )
+    .await;
+    let peer = *swarm.local_peer_id();
+    drop(swarm);
+    ours.closed(peer).await;
+    // Back as the same peer: its one sidecar waits for all 13 booked.
+    let mut raw = RawPeer::with_key(key, 1);
+    raw.connect(ours.addr.clone()).await;
+    let id = raw.send(ours.peer, by_range(9, 1, &[47]));
+    assert_eq!(sidecars(raw.outcome(id).await.unwrap()).len(), 1);
+    let took = start.elapsed();
+    assert!(took >= Duration::from_millis(2_200), "refunded: {took:?}");
+}
+
 /// SEC-001: peers that request and reset at once cannot keep an honest peer from a place.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reset_flood_cannot_starve_an_honest_peer() {

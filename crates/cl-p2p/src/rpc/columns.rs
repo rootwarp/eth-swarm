@@ -35,9 +35,12 @@
 //! sidecars the requester's quota delivers in the answer window, within the byte budget, and
 //! read by the end of the window by a requester reading at the answer's pace from when the
 //! lookup ended, given when each chunk's token is due ([`PacedReader`]), the first block always
-//! in; a range answer whose first block lacks a requested column is
-//! `2: ServerError` (cl-chain never sends one). Error chunks carry a fixed message per code
-//! ([`fixed_message`]); the source's detail goes to the log only.
+//! in, and cut again the same way from when its writer starts (`block_lengths`); a range
+//! answer whose first block lacks a requested column is `2: ServerError` (cl-chain never sends
+//! one), and so is one whose first block holds more sidecars than were booked (the booking
+//! holds the largest block a request names, `Requested::largest_block`), so no chunk goes out
+//! unpaid. Error chunks carry a fixed message per code ([`fixed_message`]); the source's detail
+//! goes to the log only.
 
 use super::codec::ReceivedChunk;
 use super::limits::PacedReader;
@@ -57,7 +60,7 @@ use p2p_wire::rpc::messages::{
 };
 use p2p_wire::rpc::protocols::{Request, Response, ResponseChunk, ResultCode};
 use pb::req_resp_service_client::ReqRespServiceClient;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use tonic::transport::Channel;
@@ -335,12 +338,39 @@ impl Requested {
         }
     }
 
+    /// The most sidecars one block of the answer can hold: the requested columns of a range;
+    /// for roots, the columns named for one root over every identifier naming it, each once.
+    pub(crate) fn largest_block(&self) -> u64 {
+        match self {
+            Requested::Range { columns, .. } => columns.len() as u64,
+            Requested::Root(pairs) => {
+                let mut per_root: HashMap<&[u8; 32], u64> = HashMap::new();
+                for (root, _) in pairs {
+                    *per_root.entry(root).or_default() += 1;
+                }
+                per_root.into_values().max().unwrap_or(0)
+            }
+        }
+    }
+
     /// The sidecars every block of the answer must hold: the requested columns of a range.
     fn per_block(&self) -> Option<usize> {
         match self {
             Requested::Range { columns, .. } => Some(columns.len()),
             Requested::Root(_) => None,
         }
+    }
+}
+
+/// What a lookup of column `request` costs its peer however little it finds, in tokens: one per
+/// identifier that names a column (the store looks its root up), one for a range (one read of
+/// it). Never more than the sidecars the request names.
+pub(crate) fn lookup_cost(request: &Request) -> u64 {
+    match request {
+        Request::DataColumnsByRoot(r) => {
+            r.0.iter().filter(|id| !id.columns.is_empty()).count() as u64
+        }
+        _ => 1,
     }
 }
 
@@ -442,24 +472,17 @@ pub(crate) fn column_chunks<E: EthSpec>(
         metrics.unrequested(unrequested);
         tracing::warn!(unrequested, "unrequested column sidecars dropped");
     }
-    // Whole blocks, the first always, then while within the budget and read in the window.
-    let mut keep = 0usize;
-    let (mut sidecars, mut bytes) = (0u64, 0usize);
-    let mut read = reader.start();
+    // Whole blocks, up to the first one that lacks a requested column.
+    let mut blocks = Vec::new();
     let mut at = 0usize;
     while at < outgoing.len() {
         let block = outgoing[at].block;
-        let end = outgoing[at..]
+        let len = outgoing[at..]
             .iter()
             .position(|o| o.block != block)
-            .map_or(outgoing.len(), |n| at + n);
-        let len = (end - at) as u64;
-        let size = outgoing[at..end]
-            .iter()
-            .fold(0usize, |n, o| n.saturating_add(o.bytes));
-        let complete = requested.per_block().is_none_or(|n| n == end - at);
-        if !complete {
-            if keep == 0 {
+            .unwrap_or(outgoing.len() - at);
+        if requested.per_block().is_some_and(|n| n != len) {
+            if blocks.is_empty() {
                 return refuse(format!(
                     "the first block, at slot {}, lacks requested columns",
                     block.0
@@ -467,24 +490,56 @@ pub(crate) fn column_chunks<E: EthSpec>(
             }
             break;
         }
-        let read_by = outgoing[at..end]
-            .iter()
-            .zip(sidecars..)
-            .fold(read, |prev, (o, i)| reader.read(i, o.bytes, prev));
-        let fits = sidecars + len <= budget.max_sidecars
-            && bytes.saturating_add(size) <= budget.max_bytes
-            && read_by <= reader.end();
-        if keep > 0 && !fits {
-            break;
-        }
-        read = read_by;
-        sidecars += len;
-        bytes = bytes.saturating_add(size);
-        keep = end;
-        at = end;
+        blocks.push(len);
+        at += len;
     }
+    // The first block always goes, so it must be paid for: the booking holds the most sidecars
+    // one block of the request can have ([`Requested::largest_block`]).
+    if let Some(&first) = blocks.first() {
+        if first as u64 > budget.max_sidecars {
+            return refuse(format!(
+                "the first block holds {first} sidecars, {} booked",
+                budget.max_sidecars
+            ));
+        }
+    }
+    // The first block, then while within the budget and read in the window.
+    let sizes: Vec<usize> = outgoing.iter().map(|o| o.bytes).collect();
+    let (keep, bytes) = reader.whole_blocks(&sizes, &blocks, budget.max_sidecars, budget.max_bytes);
     outgoing.truncate(keep);
     (outgoing.into_iter().map(|o| o.chunk).collect(), bytes)
+}
+
+/// The block a column answer's chunk carries a sidecar of: its slot and block root (Gloas:
+/// `beacon_block_root`; Fulu: the root of its block header), `None` for any other chunk.
+fn block_of<E: EthSpec>(chunk: &ReceivedChunk<E>) -> Option<(u64, [u8; 32])> {
+    let ResponseChunk::Success(Response::DataColumn(sidecar)) = &chunk.chunk else {
+        return None;
+    };
+    Some(match &**sidecar {
+        forked::DataColumnSidecar::Fulu(s) => (
+            s.signed_block_header.message.slot,
+            s.signed_block_header.message.tree_hash_root().0,
+        ),
+        forked::DataColumnSidecar::Gloas(s) => (s.slot, s.beacon_block_root.0),
+    })
+}
+
+/// The whole blocks of an answer of `chunks`, in order: how many chunks each holds, a run of
+/// sidecars of one block (any other chunk is a block of its own). [`column_chunks`] made the
+/// answer of whole blocks, so its writer cuts it again at one ([`super::codec::Answer`]).
+pub(crate) fn block_lengths<E: EthSpec>(chunks: &[ReceivedChunk<E>]) -> Vec<usize> {
+    let mut blocks: Vec<usize> = Vec::new();
+    let mut last = None;
+    for chunk in chunks {
+        let block = block_of(chunk);
+        match blocks.last_mut() {
+            Some(len) if block.is_some() && block == last => *len += 1,
+            _ => blocks.push(1),
+        }
+        last = block;
+    }
+    blocks
 }
 
 #[cfg(test)]
