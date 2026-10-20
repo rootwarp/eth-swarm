@@ -60,8 +60,9 @@
 //!   nothing else) and never settles for the writer, so a writer that skips or botches its own
 //!   settle step fails here. Every wait on the writer thread, for the queue to drain and for a
 //!   settle step, checks the input's one wall-clock deadline ([`INPUT_DEADLINE`] from its
-//!   start), so a writer that never finishes fails with the harness's message before the gates'
-//!   per-input timeout.
+//!   start), so a writer that never drains or settles fails with the harness's message before
+//!   the gates' per-input timeout. The teardown's join of the writer thread is not bounded by
+//!   it: a writer stuck there surfaces as a libFuzzer timeout, which the gates reject too.
 //!
 //! Every response is a hello, then sidecar chunks with `seq` from 1, each envelope passing the
 //! link's type and digest checks and naming its sidecar's slot and root, then at most one error
@@ -190,8 +191,12 @@ const SERVE_SPAN: u64 = 4096;
 /// deadline. 8 s, far past the few milliseconds an input takes, so a writer thread that stalls
 /// on a loaded machine but finishes within the input's time is not reported as a crash, and 2 s
 /// under the gates' per-input timeout (`-timeout=10`, `M2A_TIMEOUT_S` in `fuzz/m2a-common.sh`,
-/// which `tests/writer_wait.rs` holds it to), so a writer that never drains or settles fails
-/// with the harness's own message, never as a libFuzzer timeout.
+/// which `tests/writer_wait.rs` holds it to), so a writer that never drains the queue or never
+/// settles, in any drain or settle wait, fails with the harness's own message rather than as a
+/// libFuzzer timeout. The teardown is not bounded by this deadline: dropping the column ingest
+/// joins the writer thread with no limit, so a writer thread stuck in a settle step that
+/// changed nothing (one no settle wait watches) blocks that join and surfaces as a libFuzzer
+/// timeout. That is never a pass by mistake: the gates reject any timeout.
 pub const INPUT_DEADLINE: Duration = Duration::from_secs(8);
 
 /// One input's wall-clock deadline: set once, when the input starts ([`Deadline::input`]), and
@@ -1734,34 +1739,40 @@ mod tests {
         runtime.block_on(drain(passed, || 0));
     }
 
-    /// One deadline per input, not one per wait: a wait that starts after earlier ones took
-    /// most of the input's time fails when the input's time is up, not a fresh wait later.
+    /// One deadline per input, not one per wait: once earlier work took the input's whole
+    /// time, a later wait fails at its first check instead of starting a fresh deadline. Only
+    /// the later waits are timed, against the whole budget: a fresh deadline per wait makes each
+    /// take at least the budget, while the shared one fails within microseconds, so only a
+    /// pause as long as the budget itself could fail a correct wait here.
     #[test]
     fn every_wait_of_an_input_shares_its_deadline() {
-        let budget = Duration::from_millis(400);
-        let start = Instant::now();
+        let budget = Duration::from_secs(1);
         let deadline = Deadline::after(budget);
-        // An earlier wait that took 300 ms.
-        deadline.wait_for(
-            || {
-                if start.elapsed() >= Duration::from_millis(300) {
-                    Ok(())
-                } else {
-                    Err(())
-                }
-            },
-            |()| "the first wait".into(),
+        // An earlier wait, done at once, then the rest of the input's time spent elsewhere.
+        deadline.wait_for(|| Ok::<(), ()>(()), |()| unreachable!());
+        std::thread::sleep(budget);
+        assert!(
+            Instant::now() >= deadline.0,
+            "the input's time is not up yet"
         );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .start_paused(true)
             .build()
             .unwrap();
-        panic_message(|| runtime.block_on(drain(deadline, || 1)));
-        let failed = start.elapsed();
-        // A fresh 400 ms for the drain would fail it at 700 ms.
-        assert!(failed >= budget, "{failed:?}");
-        assert!(failed < Duration::from_millis(550), "{failed:?}");
+        let drained = Instant::now();
+        let message = panic_message(|| runtime.block_on(drain(deadline, || 1)));
+        let took = drained.elapsed();
+        assert!(message.contains("1 sidecars still queued"), "{message}");
+        assert!(
+            took < budget,
+            "the drain started a fresh deadline: {took:?}"
+        );
+        let waited = Instant::now();
+        let message = panic_message(|| deadline.wait_for(|| Err(2), |n| format!("stuck at {n}")));
+        let took = waited.elapsed();
+        assert!(message.starts_with("stuck at 2"), "{message}");
+        assert!(took < budget, "the wait started a fresh deadline: {took:?}");
     }
 
     fn spec(block: u8, index: u8, verdict: u8) -> GossipSpec {
