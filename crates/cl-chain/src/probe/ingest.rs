@@ -65,7 +65,10 @@
 //!    [`MAX_COLUMNS_PER_TXN`](cl_chain_columns::MAX_COLUMNS_PER_TXN) (16) at the column env's
 //!    background priority, so block import goes first, while it holds off reorg pruning. A root
 //!    pruned as an orphan is refused from then on, so a later batch cannot bring it back. A
-//!    refused write is dropped as `store_failed`.
+//!    refused write is dropped as `store_failed`. A column gives its queue place back once
+//!    written, and the writer settles the pending links after each batch, so
+//!    [`ColumnIngest::settled`] is what shows the store stopped changing: a barrier on the
+//!    writer's queue, confirmed once everything before it is written and settled.
 //!
 //! `probe_column_buffer_bytes` is what the queued columns hold now, their SSZ and their copies
 //! together, and `probe_column_buffer_alert` is 1 while that is at or above
@@ -588,6 +591,20 @@ struct Write {
     _place: Place,
 }
 
+/// What the writer thread takes off its queue.
+enum Job {
+    /// A column to store.
+    Write(Write),
+    /// Confirmed once every job before it is done, the settle of pending links after them
+    /// included ([`ColumnIngest::settled`]).
+    Barrier {
+        ack: tokio::sync::oneshot::Sender<()>,
+        /// The one barrier's turn on the queue, held until the writer took it: a wait given up
+        /// meanwhile leaves the barrier queued, and no second one joins it.
+        one: tokio::sync::OwnedMutexGuard<()>,
+    },
+}
+
 /// What a column's task works with.
 struct Shared<A, E, V, S, C> {
     refs: RefView<A, E>,
@@ -608,7 +625,9 @@ pub struct ColumnIngest<A, E, V, S, C> {
     queue: Arc<Queue>,
     tasks: Mutex<JoinSet<()>>,
     /// The only strong sender: the writer thread ends once it is dropped and its queue drained.
-    writes: Option<mpsc::Sender<Write>>,
+    writes: Option<mpsc::Sender<Job>>,
+    /// Held by the one barrier on the writer's queue, so the queue keeps room for every place.
+    barrier: Arc<tokio::sync::Mutex<()>>,
     writer_thread: Option<JoinHandle<()>>,
     writer: Arc<ColumnWriter>,
 }
@@ -639,15 +658,16 @@ where
         limits
             .validate_for(&refs.limits())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        // Every job holds a queue place, so the channel never holds more than `max_items`.
-        let (writes, jobs) = mpsc::channel(limits.max_items.max(1));
+        // Every write holds a queue place, and one barrier at most is queued ([`Self::settled`]),
+        // so the channel never holds more than `max_items` writes and that barrier.
+        let (writes, jobs) = mpsc::channel(limits.max_items.max(1) + 1);
         let writer_thread = std::thread::Builder::new()
             .name(WRITER_THREAD.into())
             .spawn({
                 let writer = Arc::clone(&writer);
                 let dropped = contract.metrics.clone();
                 let metrics = metrics.clone();
-                move || run_writer(&writer, jobs, &dropped, &metrics)
+                move || run_writer(writer.as_ref(), jobs, &dropped, &metrics)
             })?;
         Ok(Self {
             shared: Arc::new(Shared {
@@ -664,6 +684,7 @@ where
             }),
             tasks: Mutex::default(),
             writes: Some(writes),
+            barrier: Arc::default(),
             writer_thread: Some(writer_thread),
             writer,
         })
@@ -700,6 +721,18 @@ where
 }
 
 impl<A, E, V, S, C> ColumnIngest<A, E, V, S, C> {
+    /// Waits until the writer has done everything handed to it so far: the writes, and the
+    /// settle of pending links after them ([`ColumnWriter::settle_pending`]). A column gives its
+    /// queue place back once written, before that settle, so [`Self::pending`] at 0 alone does
+    /// not show that the store stopped changing; 0 again after this does. `false` if the writer
+    /// is gone.
+    pub async fn settled(&self) -> bool {
+        match self.writes.as_ref() {
+            Some(writes) => barrier(writes, &self.barrier).await,
+            None => false,
+        }
+    }
+
     /// Columns queued now: arrived, neither stored nor dropped yet.
     #[must_use]
     pub fn pending(&self) -> usize {
@@ -772,7 +805,7 @@ where
         &self,
         column: GossipColumn<E>,
         mut place: Place,
-        writes: &mpsc::WeakSender<Write>,
+        writes: &mpsc::WeakSender<Job>,
         arrived: Instant,
     ) {
         let metrics = &self.contract.metrics;
@@ -837,7 +870,9 @@ where
         };
         // Never blocks: the channel has room for every queue place. A store being dropped has
         // no writer any more.
-        let sent = writes.upgrade().map(|tx| tx.try_send(write).is_ok());
+        let sent = writes
+            .upgrade()
+            .map(|tx| tx.try_send(Job::Write(write)).is_ok());
         if sent != Some(true) {
             metrics.drop_column(&column, Drop::StoreFailed);
         }
@@ -894,6 +929,9 @@ trait ColumnSink {
         link: BlockLink,
         columns: &[Column<'_>],
     ) -> cl_chain_columns::Result<WriteReport>;
+
+    /// [`ColumnWriter::settle_pending`].
+    fn settle_pending(&self, before_slot: Slot) -> cl_chain_columns::Result<usize>;
 }
 
 impl ColumnSink for ColumnWriter {
@@ -906,22 +944,48 @@ impl ColumnSink for ColumnWriter {
     ) -> cl_chain_columns::Result<WriteReport> {
         ColumnWriter::write_block_columns(self, slot, root, link, columns)
     }
+
+    fn settle_pending(&self, before_slot: Slot) -> cl_chain_columns::Result<usize> {
+        ColumnWriter::settle_pending(self, before_slot)
+    }
 }
 
-/// The writer thread: takes what is queued, up to [`MAX_BATCH`] columns, and writes it, until
-/// every sender is gone.
+/// Queues a barrier on the writer's queue `writes` and waits until the writer confirms it
+/// ([`ColumnIngest::settled`]); `false` if the writer is gone. `one` keeps one barrier at most
+/// on the queue, so it keeps room for every place's write: its guard goes with the barrier and
+/// is released by the writer, so a wait given up after queueing it still holds the turn.
+async fn barrier(writes: &mpsc::Sender<Job>, one: &Arc<tokio::sync::Mutex<()>>) -> bool {
+    let one = Arc::clone(one).lock_owned().await;
+    let (ack, acked) = tokio::sync::oneshot::channel();
+    if writes.send(Job::Barrier { ack, one }).await.is_err() {
+        return false;
+    }
+    acked.await.is_ok()
+}
+
+/// The writer thread: takes what is queued, up to [`MAX_BATCH`] columns or a barrier, writes
+/// it, settles the pending links, and then confirms the barrier, until every sender is gone.
 fn run_writer(
-    writer: &ColumnWriter,
-    mut jobs: mpsc::Receiver<Write>,
+    writer: &impl ColumnSink,
+    mut jobs: mpsc::Receiver<Job>,
     dropped: &ColumnMetrics,
     metrics: &QueueMetrics,
 ) {
     while let Some(first) = jobs.blocking_recv() {
-        let mut batch = vec![first];
-        while batch.len() < MAX_BATCH {
-            match jobs.try_recv() {
-                Ok(write) => batch.push(write),
-                Err(_) => break,
+        let mut batch = Vec::new();
+        let mut barrier = None;
+        let mut next = Some(first);
+        while let Some(job) = next.take() {
+            match job {
+                Job::Write(write) => batch.push(write),
+                // What comes after it waits for the next turn.
+                Job::Barrier { ack, one } => {
+                    barrier = Some((ack, one));
+                    break;
+                }
+            }
+            if batch.len() < MAX_BATCH {
+                next = jobs.try_recv().ok();
             }
         }
         let highest = write_batch(writer, batch, dropped, metrics);
@@ -930,6 +994,11 @@ fn run_writer(
             if let Err(e) = writer.settle_pending(highest.saturating_sub(PENDING_LINK_SLOTS)) {
                 tracing::warn!(error = %e, "pending column links not settled");
             }
+        }
+        if let Some((ack, one)) = barrier {
+            // Nobody waits for it any more if the receiver is gone.
+            let _ = ack.send(());
+            drop(one);
         }
     }
 }
@@ -1064,6 +1133,124 @@ mod tests {
             self.writer.prune_orphaned(&[self.orphan]).unwrap();
             written
         }
+
+        fn settle_pending(&self, before_slot: Slot) -> cl_chain_columns::Result<usize> {
+            self.writer.settle_pending(before_slot)
+        }
+    }
+
+    /// A barrier job confirmed to `ack`, holding a turn of its own.
+    fn barrier_job(ack: tokio::sync::oneshot::Sender<()>) -> Job {
+        let one = Arc::new(tokio::sync::Mutex::new(()))
+            .try_lock_owned()
+            .unwrap();
+        Job::Barrier { ack, one }
+    }
+
+    /// A column env whose pending-link settle begins, says so, and waits for `go`.
+    struct SlowSettle<'a> {
+        writer: &'a ColumnWriter,
+        began: std::sync::mpsc::Sender<()>,
+        go: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl ColumnSink for SlowSettle<'_> {
+        fn write_block_columns(
+            &self,
+            slot: Slot,
+            root: &Root,
+            link: BlockLink,
+            columns: &[Column<'_>],
+        ) -> cl_chain_columns::Result<WriteReport> {
+            self.writer.write_block_columns(slot, root, link, columns)
+        }
+
+        fn settle_pending(&self, before_slot: Slot) -> cl_chain_columns::Result<usize> {
+            self.began.send(()).unwrap();
+            self.go.lock().unwrap().recv().unwrap();
+            self.writer.settle_pending(before_slot)
+        }
+    }
+
+    /// The queue empties once the batch is written, before its pending links are settled: the
+    /// barrier is confirmed only after that settle, so the store has stopped changing then.
+    #[test]
+    fn the_barrier_is_confirmed_after_the_settle_of_the_batch_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let queue = queue(IngestLimits::default());
+        let (dropped, metrics) = metrics();
+        let (began, settling) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel();
+        let sink = SlowSettle {
+            writer: &writer,
+            began,
+            go: Mutex::new(wait),
+        };
+        let (jobs, received) = mpsc::channel(8);
+        std::thread::scope(|scope| {
+            scope.spawn(|| run_writer(&sink, received, &dropped, &metrics));
+            jobs.blocking_send(Job::Write(write(&queue, 9, [1; 32], 0)))
+                .unwrap();
+            settling.recv().unwrap();
+            assert_eq!(queue.lock().items, 0, "the place is back while it settles");
+            let (ack, mut acked) = tokio::sync::oneshot::channel();
+            jobs.blocking_send(barrier_job(ack)).unwrap();
+            assert!(acked.try_recv().is_err(), "not confirmed while settling");
+            go.send(()).unwrap();
+            acked.blocking_recv().unwrap();
+            assert_eq!(writer.reader().column_count().unwrap(), 1);
+            // A barrier with nothing before it is confirmed at once, and writes after it wait
+            // for the next turn.
+            let (ack, acked) = tokio::sync::oneshot::channel();
+            jobs.blocking_send(barrier_job(ack)).unwrap();
+            acked.blocking_recv().unwrap();
+            drop(jobs);
+        });
+    }
+
+    /// A wait for the barrier that is given up leaves its barrier queued, and the next wait
+    /// queues none until the writer took it: the queue keeps its room for every place's write.
+    #[tokio::test]
+    async fn a_given_up_barrier_wait_queues_no_second_barrier() {
+        // The queue of a store of one place: its write, and one barrier.
+        let (writes, mut jobs) = mpsc::channel(2);
+        let one: Arc<tokio::sync::Mutex<()>> = Arc::default();
+        // Queued, then given up while it waits for the writer.
+        assert!(
+            tokio::time::timeout(Duration::ZERO, barrier(&writes, &one))
+                .await
+                .is_err(),
+            "it waits for the writer"
+        );
+        assert_eq!(jobs.len(), 1);
+        // A second wait: its barrier waits for the first to be taken.
+        let second = tokio::spawn({
+            let (writes, one) = (writes.clone(), Arc::clone(&one));
+            async move { barrier(&writes, &one).await }
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(jobs.len(), 1, "one barrier queued");
+        let queue = queue(IngestLimits::default());
+        assert!(
+            writes
+                .try_send(Job::Write(write(&queue, 9, [1; 32], 0)))
+                .is_ok(),
+            "the place's write has its room"
+        );
+        // The writer takes the first barrier: the second is queued, and confirmed.
+        let Some(Job::Barrier { ack: first, .. }) = jobs.recv().await else {
+            panic!("the first barrier");
+        };
+        drop(first);
+        assert!(matches!(jobs.recv().await, Some(Job::Write(_))));
+        let Some(Job::Barrier { ack, .. }) = jobs.recv().await else {
+            panic!("the second barrier");
+        };
+        ack.send(()).unwrap();
+        assert!(second.await.unwrap());
     }
 
     #[test]

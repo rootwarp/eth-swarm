@@ -403,22 +403,79 @@ fn through_proc(fds: &Path, dir_fd: &OwnedFd, name: &str) -> Result<PathBuf, Bin
     }
 }
 
-/// Opens the runtime root by walking its configured path from `/`, one component at a time,
-/// through directory descriptors (`openat`, `O_NOFOLLOW | O_DIRECTORY`). Every directory above
-/// the root must be owned by root or us and not writable by group or others unless sticky:
-/// otherwise someone else could rename the next component away and put their own in its place.
-/// The root itself must be owned by root or us and writable only by its owner. A symlink
-/// anywhere in the path is refused, not resolved; so are a relative path and `..`. That
-/// includes `/var/run`, a symlink to `/run` on most distributions: configure `/run/...`.
+/// Opens the runtime root by walking its configured path from `/` ([`walk_closed`]). The root
+/// itself must be owned by root or us and writable only by its owner. That includes
+/// `/var/run`, a symlink to `/run` on most distributions: configure `/run/...`.
 fn open_root(root: &Path) -> Result<OwnedFd, BindError> {
-    use std::path::Component;
     let me = peercred::effective_uid();
+    let fd = walk_closed(root, me)?;
+    let m = fstat(&fd, root)?;
+    let writable_by_others = m.mode.intersects(Mode::WGRP | Mode::WOTH);
+    if (m.uid != 0 && m.uid != me) || writable_by_others {
+        return Err(BindError::Insecure {
+            path: root.to_owned(),
+            reason: format!(
+                "runtime root must be owned by root or uid {me} and writable only by its owner \
+                 (owner uid {}, mode {:o})",
+                m.uid,
+                mode_bits(m.mode)
+            ),
+        });
+    }
+    Ok(fd)
+}
+
+/// Opens `dir` for creating a name in it that is then reached by its path, as the runtime root
+/// is walked ([`walk_closed`]): `dir` too must be owned by root or `uid` and not writable by
+/// group or others unless sticky. Nobody but root and `uid` can then rename, replace or
+/// retarget any directory on the path, so a name created in `dir` stays the one the path
+/// reaches.
+///
+/// # Errors
+///
+/// [`BindError::Insecure`] for a relative path, `..`, a symlink or a non-directory anywhere in
+/// it, or a directory on it that another user could change; [`BindError::Io`] if a directory
+/// on it cannot be opened.
+pub fn open_closed_dir(dir: &Path, uid: u32) -> Result<OwnedFd, BindError> {
+    let fd = walk_closed(dir, uid)?;
+    check_closed(&fd, dir, uid, dir)?;
+    Ok(fd)
+}
+
+/// Fails unless the directory `fd` (named `walked`) is one only root and `me` can change:
+/// owned by one of them, and not writable by group or others unless sticky. Otherwise someone
+/// else could rename what it holds away and put their own in its place. `path` is what the
+/// error names as checked.
+fn check_closed(fd: &OwnedFd, walked: &Path, me: u32, path: &Path) -> Result<(), BindError> {
+    let m = fstat(fd, walked)?;
+    let writable = m.mode.intersects(Mode::WGRP | Mode::WOTH) && !m.mode.contains(Mode::SVTX);
+    if (m.uid != 0 && m.uid != me) || writable {
+        return Err(BindError::Insecure {
+            path: path.to_owned(),
+            reason: format!(
+                "parent {} must be owned by root or uid {me} and not writable by others unless \
+                 sticky (owner uid {}, mode {:o})",
+                walked.display(),
+                m.uid,
+                mode_bits(m.mode)
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Opens `root` by walking its path from `/`, one component at a time, through directory
+/// descriptors (`openat`, `O_NOFOLLOW | O_DIRECTORY`). Every directory above `root` must be
+/// owned by root or `me` and not writable by group or others unless sticky ([`check_closed`]).
+/// A symlink anywhere in the path is refused, not resolved; so are a relative path and `..`.
+fn walk_closed(root: &Path, me: u32) -> Result<OwnedFd, BindError> {
+    use std::path::Component;
     let insecure = |reason: String| BindError::Insecure {
         path: root.to_owned(),
         reason,
     };
     if !root.is_absolute() {
-        return Err(insecure("runtime root must be an absolute path".into()));
+        return Err(insecure("must be an absolute path".into()));
     }
     let mut walked = PathBuf::from("/");
     let mut fd = open_ancestor(CWD, &walked, &walked)?;
@@ -427,33 +484,13 @@ fn open_root(root: &Path) -> Result<OwnedFd, BindError> {
             Component::RootDir | Component::CurDir => continue,
             Component::Normal(name) => name,
             Component::ParentDir | Component::Prefix(_) => {
-                return Err(insecure("runtime root must not contain `..`".into()));
+                return Err(insecure("must not contain `..`".into()));
             }
         };
         // The directory just walked holds `name`: it must be one nobody else can change.
-        let m = fstat(&fd, &walked)?;
-        let writable = m.mode.intersects(Mode::WGRP | Mode::WOTH) && !m.mode.contains(Mode::SVTX);
-        if (m.uid != 0 && m.uid != me) || writable {
-            return Err(insecure(format!(
-                "parent {} must be owned by root or uid {me} and not writable by others unless \
-                 sticky (owner uid {}, mode {:o})",
-                walked.display(),
-                m.uid,
-                mode_bits(m.mode)
-            )));
-        }
+        check_closed(&fd, &walked, me, root)?;
         walked.push(name);
         fd = open_ancestor(&fd, Path::new(name), &walked)?;
-    }
-    let m = fstat(&fd, root)?;
-    let writable_by_others = m.mode.intersects(Mode::WGRP | Mode::WOTH);
-    if (m.uid != 0 && m.uid != me) || writable_by_others {
-        return Err(insecure(format!(
-            "runtime root must be owned by root or uid {me} and writable only by its owner \
-             (owner uid {}, mode {:o})",
-            m.uid,
-            mode_bits(m.mode)
-        )));
     }
     Ok(fd)
 }
@@ -1277,6 +1314,44 @@ mod tests {
             "{err}"
         );
         assert_eq!(entries(&dir), ["svc.lock"]);
+    }
+
+    /// A directory to create a name in is walked as the runtime root is, and must itself be
+    /// closed to others too: owned by us or root, not writable by others unless sticky.
+    #[test]
+    fn a_closed_dir_and_every_directory_above_it_are_closed_to_others() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let me = peercred::effective_uid();
+        let set = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let dir = root.join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        for (mode, ok) in [
+            (0o700, true),
+            (0o1777, true),
+            (0o777, false),
+            (0o770, false),
+        ] {
+            set(&dir, mode);
+            let opened = open_closed_dir(&dir, me);
+            assert_eq!(opened.is_ok(), ok, "{mode:o}");
+            if let Err(e) = opened {
+                assert!(e.to_string().contains("not writable by others"), "{e}");
+            }
+        }
+        set(&dir, 0o700);
+        if me != 0 {
+            let err = open_closed_dir(&dir, me + 1).unwrap_err();
+            assert!(err.to_string().contains("owned by root or uid"), "{err}");
+        }
+        std::os::unix::fs::symlink(&dir, root.join("link")).unwrap();
+        let err = open_closed_dir(&root.join("link"), me).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        let err = open_closed_dir(Path::new("relative"), me).unwrap_err();
+        assert!(err.to_string().contains("absolute"), "{err}");
     }
 
     #[test]

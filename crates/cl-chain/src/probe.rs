@@ -1616,6 +1616,10 @@ mod tests {
             ingest.contract().metrics.dropped(Drop::VerifyTimeout) == 1 && ingest.pending() == 0
         })
         .await;
+        assert!(
+            ingest.settled().await,
+            "the writer confirms what it was handed"
+        );
         // The column is gone, but its cells still sit in the outbound queue: still charged.
         let charged = ingest.copy_bytes();
         assert!(charged > 0, "the queued cells are charged");

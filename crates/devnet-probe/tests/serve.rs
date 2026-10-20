@@ -191,8 +191,8 @@ fn gossip(devnet: &Devnet, chain: &Chain, tap: &CaptureTap, indices: &[u64]) {
     }
 }
 
-/// A socket root the bind accepts: a fresh directory without symlinks, short enough for a
-/// socket path.
+/// A socket root the bind accepts, or a column store's parent `serve` accepts: a fresh
+/// directory named without symlinks (macOS's `/var` is one), short enough for a socket path.
 fn socket_root() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::Builder::new().prefix("sv-").tempdir().unwrap();
     let path = std::fs::canonicalize(dir.path()).unwrap();
@@ -538,13 +538,9 @@ async fn serve_stores_and_answers_on_a_devnet_of_one() {
     let reference = FixtureChain::default();
     let chain = Chain::new(&reference);
     let server = reference.serve().await;
-    let columns_dir = tempfile::tempdir().unwrap();
+    let (_columns_dir, columns_dir) = socket_root();
     let (_root_dir, root) = socket_root();
-    let plan = serve_plan(
-        Duration::from_secs(4),
-        columns_dir.path().join("columns"),
-        root,
-    );
+    let plan = serve_plan(Duration::from_secs(4), columns_dir.join("columns"), root);
     // The probe's node key, and so its custody, is its own: every column is gossiped, a
     // block's 128 at a time, below the store's pending queue (512). Gossip goes on while it
     // checks its answers, which hold all the same: nothing enters the store meanwhile.
@@ -608,7 +604,7 @@ async fn serve_with_nothing_stored_fails() {
     let reference = FixtureChain::default();
     reference.finalize(11, Root::from([7; 32]), 88);
     let server = reference.serve().await;
-    let columns_dir = tempfile::tempdir().unwrap();
+    let (_columns_dir, columns_dir) = socket_root();
     let (_root_dir, root) = socket_root();
     let closed = cl_p2p::testkit::refused_tcp_addr(std::net::Ipv4Addr::LOCALHOST.into());
     let peer = format!(
@@ -618,11 +614,7 @@ async fn serve_with_nothing_stored_fails() {
     );
     let plan = ServePlan {
         peers: vec![devnet_probe::devnet::parse_peer(&peer).unwrap()],
-        ..serve_plan(
-            Duration::from_secs(1),
-            columns_dir.path().join("columns"),
-            root,
-        )
+        ..serve_plan(Duration::from_secs(1), columns_dir.join("columns"), root)
     };
     let check = serve::serve::<E, Valid>(
         &devnet,
@@ -656,8 +648,8 @@ async fn serve_needs_a_new_store_it_can_open() {
     let devnet = devnet();
     let reference = FixtureChain::default();
     let server = reference.serve().await;
-    let file = tempfile::NamedTempFile::new().unwrap();
     let (_root_dir, root) = socket_root();
+    let file = tempfile::NamedTempFile::new_in(&root).unwrap();
     let run = |columns_dir: PathBuf, socket_root: PathBuf| {
         let plan = serve_plan(Duration::from_secs(1), columns_dir, socket_root);
         let api = reference_api(&server);
@@ -684,8 +676,8 @@ async fn serve_needs_a_new_store_it_can_open() {
     );
     // A start that fails after the store was created (no socket under a file) leaves no store
     // behind, so the next run is not refused for it.
-    let dir = tempfile::tempdir().unwrap();
-    let columns = dir.path().join("columns");
+    let (_dir, dir) = socket_root();
+    let columns = dir.join("columns");
     let check = run(columns.clone(), file.path().to_owned()).await;
     assert!(!check.passed());
     assert!(
@@ -695,7 +687,7 @@ async fn serve_needs_a_new_store_it_can_open() {
     );
     assert!(!columns.exists(), "the new store was removed");
     // A symlink in its place is refused, not followed.
-    std::os::unix::fs::symlink(dir.path(), &columns).unwrap();
+    std::os::unix::fs::symlink(&dir, &columns).unwrap();
     let check = run(columns.clone(), root.clone()).await;
     assert!(
         check.lines()[0].detail.contains("must be new"),
@@ -713,9 +705,9 @@ async fn serve_does_not_cross_a_fork_digest() {
     let devnet = devnet_at(103, more);
     let reference = FixtureChain::default();
     let server = reference.serve().await;
-    let dir = tempfile::tempdir().unwrap();
+    let (_dir, dir) = socket_root();
     let (_root_dir, root) = socket_root();
-    let plan = serve_plan(Duration::from_secs(60), dir.path().join("columns"), root);
+    let plan = serve_plan(Duration::from_secs(60), dir.join("columns"), root);
     let check = serve::serve::<E, Valid>(
         &devnet,
         reference_api(&server),
@@ -731,8 +723,48 @@ async fn serve_does_not_cross_a_fork_digest() {
         "{:?}",
         check.lines()
     );
+    assert!(!dir.join("columns").exists(), "refused before the store");
+}
+
+/// A start that took so long that the clip after it fails ends the run as a failed start
+/// does: the new store is removed, so a rerun with the same arguments is not refused for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clip_that_fails_after_the_start_removes_the_new_store() {
+    // A blob change at epoch 14 (slot 112), 6 slots after the clock's: the run starts one
+    // slot and the check's time before it, so the start's own time leaves less than a slot to
+    // serve.
+    let more = "  - EPOCH: 14\n    MAX_BLOBS_PER_BLOCK: 15\n";
+    let devnet = devnet_at(106, more);
+    let (epoch, change) = serve::next_digest_change(&devnet, now_ms()).unwrap();
+    assert_eq!(epoch, 14);
+    let started = change - (serve::AFTER_SERVING + Duration::from_secs(6)).as_millis();
+    let reference = FixtureChain::default();
+    reference.finalize(12, Root::from([7; 32]), 96);
+    let server = reference.serve().await;
+    let (_dir, dir) = socket_root();
+    let (_root_dir, root) = socket_root();
+    let columns = dir.join("columns");
+    let plan = serve_plan(Duration::from_secs(60), columns.clone(), root);
+    let check = serve::serve::<E, Valid>(
+        &devnet,
+        reference_api(&server),
+        Valid,
+        &plan,
+        capture_tap(1),
+        started,
+    )
+    .await;
+    let lines: Vec<_> = check
+        .lines()
+        .iter()
+        .map(|l| (l.pass, l.detail.clone()))
+        .collect();
+    assert!(!check.passed(), "{lines:#?}");
     assert!(
-        !dir.path().join("columns").exists(),
-        "refused before the store"
+        lines
+            .iter()
+            .any(|(pass, detail)| !pass && detail.contains("after a start of")),
+        "{lines:#?}"
     );
+    assert!(!columns.exists(), "the new store was removed");
 }

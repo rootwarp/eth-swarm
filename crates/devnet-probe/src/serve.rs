@@ -25,8 +25,9 @@
 //! [`serve`] runs it all for a while on the devnet, dialling the reference CLs so their column
 //! gossip reaches us, never across a fork digest change ([`clip_until`]: the subscriptions are
 //! of the digest at its start, and every deadline is counted back from its end, again once the
-//! start is done), then stops the hand-off, lets the store settle ([`settle`]: a store still
-//! changing is reported, never checked), asks the probe what it stored, as a peer would
+//! start is done), then stops the hand-off, lets the store settle ([`settle`]: the queue empty
+//! and the writer's confirmation that it is done, links included; a store still changing is
+//! reported, never checked), asks the probe what it stored, as a peer would
 //! ([`ColumnRequester`] over libp2p), and compares every answer with the store
 //! ([`self_check`]), all by [`AFTER_SERVING`] after serving and before the digest change.
 
@@ -452,6 +453,12 @@ impl<E: EthSpec, V> ChainSide<E, V> {
     #[must_use]
     pub fn pending(&self) -> usize {
         self.ingest.pending()
+    }
+
+    /// Waits until the store's writer has done everything handed to it so far, the settle of
+    /// pending links after it included ([`ColumnIngest::settled`]); `false` if it is gone.
+    pub async fn settled(&self) -> bool {
+        self.ingest.settled().await
     }
 
     /// Samples the reference API for our Status now, so the first `GetStatus` has one: a
@@ -1243,74 +1250,129 @@ fn check_by(
     boundary.map_or(by, |b| by.min(b))
 }
 
-/// Waits for the store to settle: `pending` (the columns on their way into it) 0 for three
-/// polls in a row, [`PUMP_EVERY`] apart, within `wait`. `Err` of the last count if it did not:
-/// the store is still changing, and nothing may be compared against it.
-pub async fn settle(pending: impl Fn() -> usize, wait: Duration) -> Result<(), usize> {
+/// Why the store did not settle ([`settle`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unsettled {
+    /// Columns still on their way into the store at the end of the wait: the last count.
+    Queued(usize),
+    /// The queue was empty, but the writer did not confirm within the wait that it was done
+    /// (or is gone): it may still be settling the links of what it wrote.
+    Writing,
+}
+
+/// Waits for the store to settle within `wait`: `pending` (the columns on their way into it)
+/// 0, polled every [`PUMP_EVERY`], then the writer's `barrier` confirmed
+/// ([`ColumnIngest::settled`]: everything handed to it written and its pending links settled
+/// after that), then `pending` still 0. A column gives its queue place back once written,
+/// before the writer settles the links after it, so an empty queue alone does not show that
+/// the store stopped changing. `Err` if it did not settle: nothing may be compared against it.
+///
+/// # Errors
+///
+/// [`Unsettled`]: columns still queued, or no confirmation from the writer, by the end of
+/// `wait`.
+pub async fn settle<B>(
+    pending: impl Fn() -> usize,
+    barrier: impl Fn() -> B,
+    wait: Duration,
+) -> Result<(), Unsettled>
+where
+    B: std::future::Future<Output = bool>,
+{
     let by = tokio::time::Instant::now() + wait;
-    let mut quiet = 0;
     loop {
-        let left = pending();
-        quiet = if left == 0 { quiet + 1 } else { 0 };
-        if quiet >= 3 {
-            return Ok(());
+        let mut left = pending();
+        if left == 0 {
+            match tokio::time::timeout_at(by, barrier()).await {
+                Ok(true) => {
+                    left = pending();
+                    if left == 0 {
+                        return Ok(());
+                    }
+                }
+                Ok(false) | Err(_) => return Err(Unsettled::Writing),
+            }
         }
         if tokio::time::Instant::now() >= by {
-            return Err(left);
+            return Err(Unsettled::Queued(left));
         }
         tokio::time::sleep(PUMP_EVERY.min(by - tokio::time::Instant::now())).await;
     }
 }
 
-/// Refuses a parent directory of the new store that other users can write: one owned by
-/// neither `uid` nor root, or group or world writable without the sticky bit. The store is
-/// created here and opened again by path ([`ColumnWriter::open`]); under such a parent another
-/// user could swap it for a directory of theirs in between.
+/// Refuses a parent directory of the new store that other users could change, or the way to
+/// it ([`ipc::uds::open_closed_dir`], as for the socket root): walked from `/` without
+/// following a symlink, it and every directory above it must be owned by `uid` or root and
+/// not group or world writable unless sticky. The store is created here and opened again by
+/// path ([`ColumnWriter::open`]); with any such directory on the way another user could
+/// rename one away and put theirs in its place in between, or point the failed start's
+/// cleanup elsewhere.
 fn check_store_parent(parent: &Path, uid: u32) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    let shown = parent.display();
-    let meta =
-        std::fs::metadata(parent).map_err(|e| format!("column store parent {shown}: {e}"))?;
-    if !meta.is_dir() {
-        return Err(format!("column store parent {shown} is not a directory"));
-    }
-    if meta.uid() != uid && meta.uid() != 0 {
-        return Err(format!(
-            "column store parent {shown} is writable by other users: owned by UID {}, not \
-             {uid} or root",
-            meta.uid()
-        ));
-    }
-    let mode = meta.mode();
-    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
-        return Err(format!(
-            "column store parent {shown} is writable by other users: mode {:o} is group or \
-             world writable without the sticky bit",
-            mode & 0o7777
-        ));
-    }
-    Ok(())
+    ipc::uds::open_closed_dir(parent, uid)
+        .map(drop)
+        .map_err(|e| format!("column store parent {e}"))
 }
 
-/// Creates the column store's directory, mode 0700, under a parent no other user can write
-/// ([`check_store_parent`]). It must not exist yet, not even as a symlink: every run serves
-/// under a fresh node key, whose custody columns are its own.
-fn create_store_dir(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::DirBuilderExt;
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
+/// The column store's directory this run created ([`create_store_dir`]).
+#[derive(Debug)]
+struct NewStore {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl NewStore {
+    /// Removes the store after a failed start, but only while its path still names the
+    /// directory this run created (same device and inode, not followed through a symlink):
+    /// whatever is in its place by then is left alone.
+    fn remove(self) {
+        use std::os::unix::fs::MetadataExt;
+        let ours = std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|m| m.is_dir() && (m.dev(), m.ino()) == (self.dev, self.ino));
+        if !ours {
+            tracing::warn!(
+                path = %self.path.display(),
+                "the new column store is no longer there: nothing removed"
+            );
+            return;
+        }
+        if let Err(e) = std::fs::remove_dir_all(&self.path) {
+            tracing::warn!(error = %e, "the new column store is left behind");
+        }
+    }
+}
+
+/// Creates the column store's directory, mode 0700, under a parent no other user can change
+/// ([`check_store_parent`]); a relative path is taken from the working directory. It must not
+/// exist yet, not even as a symlink: every run serves under a fresh node key, whose custody
+/// columns are its own.
+fn create_store_dir(path: &Path) -> Result<NewStore, String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let shown = path.display();
+    let path = std::env::current_dir()
+        .map_err(|e| format!("column store {shown}: the working directory: {e}"))?
+        .join(path);
+    let (Some(parent), Some(_)) = (path.parent(), path.file_name()) else {
+        return Err(format!("column store {shown} names no new directory"));
     };
     check_store_parent(parent, Ownership::current().uid)?;
-    match std::fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
-            "{} exists: every run serves under a fresh node key, whose custody columns are \
-             its own, so its column store must be new",
-            path.display()
-        )),
-        Err(e) => Err(format!("column store {}: {e}", path.display())),
+    match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(format!(
+                "{shown} exists: every run serves under a fresh node key, whose custody \
+                 columns are its own, so its column store must be new"
+            ))
+        }
+        Err(e) => return Err(format!("column store {shown}: {e}")),
     }
+    let created =
+        std::fs::symlink_metadata(&path).map_err(|e| format!("column store {shown}: {e}"))?;
+    Ok(NewStore {
+        path,
+        dev: created.dev(),
+        ino: created.ino(),
+    })
 }
 
 /// The `serve` check: cl-chain and cl-p2p as [`ChainSide`] and [`p2p_swarm`], connected over
@@ -1319,7 +1381,8 @@ fn create_store_dir(path: &Path) -> Result<(), String> {
 /// start is done), then [`self_check`]ed with the hand-off to the store stopped, once the store
 /// settled ([`settle`]), and by [`check_by`]. `reference` is the first reference CL's beacon API, `kzg`
 /// cl-verify, and `tap` the capture queue between the swarm and the store. `now_ms` is the
-/// wall clock. The column store's directory is created here, and removed again if the start
+/// wall clock. The column store's directory is created here, and removed again if the run
+/// ends before serving: the start fails, the swarm listens nowhere, or the clip after the start
 /// fails.
 pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
     devnet: &Devnet,
@@ -1337,9 +1400,10 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
     if let Err(e) = clip_until(devnet, change, now_ms, plan.serve_for) {
         return Check::failed(NAME, e);
     }
-    if let Err(e) = create_store_dir(&plan.columns_dir) {
-        return Check::failed(NAME, e);
-    }
+    let store = match create_store_dir(&plan.columns_dir) {
+        Ok(store) => store,
+        Err(e) => return Check::failed(NAME, e),
+    };
     let key = Keypair::generate_secp256k1();
     let mut registry = Registry::default();
     let started = async {
@@ -1399,9 +1463,7 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
     let (chain, p2p, digest) = match started.await {
         Ok(started) => started,
         Err(e) => {
-            if let Err(rm) = std::fs::remove_dir_all(&plan.columns_dir) {
-                tracing::warn!(error = %rm, "the new column store is left behind");
-            }
+            store.remove();
             return Check::failed(NAME, e);
         }
     };
@@ -1429,6 +1491,9 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
     }
     let Some(target) = requester_target(&listening) else {
         check.fail("the probe swarm listens nowhere");
+        // Nothing served: the store goes, as after a failed start, once nothing holds it.
+        drop((swarm, status, chain));
+        store.remove();
         return check;
     };
     // Our Status first: a reference CL we dial without one would drop us.
@@ -1460,6 +1525,8 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
                 "after a start of {} s: {e}",
                 started_at.elapsed().as_secs()
             ));
+            drop((swarm, status, chain));
+            store.remove();
             return check;
         }
     };
@@ -1489,7 +1556,7 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
         boundary_at(started_at, now_ms, change),
     );
     let wait = SETTLE_WAIT.min(by.saturating_duration_since(tokio::time::Instant::now()));
-    let settled = settle(|| chain.pending(), wait).await;
+    let settled = settle(|| chain.pending(), || chain.settled(), wait).await;
     let stored = chain.reader().column_count().unwrap_or(0);
     check.record(
         stored > 0,
@@ -1505,9 +1572,14 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
         .unwrap_or(u64::MAX)
         .saturating_add(devnet.slots_per_epoch());
     match settled {
-        Err(left) => check.fail(format!(
+        Err(Unsettled::Queued(left)) => check.fail(format!(
             "ingest did not settle: {left} columns still on their way into the store after {} \
              s, so no answer is checked against it",
+            wait.as_secs()
+        )),
+        Err(Unsettled::Writing) => check.fail(format!(
+            "ingest did not settle: the store's writer did not confirm it was done within {} s, \
+             so no answer is checked against it",
             wait.as_secs()
         )),
         Ok(()) => {
@@ -1654,11 +1726,13 @@ mod tests {
         assert_eq!(check_by(late, boundary), boundary.unwrap());
     }
 
-    /// The self-check runs only on a store that settled: nothing pending for three polls in a
-    /// row. One still changing at the end of the wait is reported, never compared.
+    /// The self-check runs only on a store that settled: nothing pending, the writer's
+    /// barrier confirmed after that, and still nothing pending. One still changing at the end
+    /// of the wait is reported, never compared.
     #[tokio::test(start_paused = true)]
     async fn the_store_settles_or_the_check_does_not_run() {
         use std::sync::atomic::AtomicUsize;
+        let confirmed = || async { true };
         let left = Arc::new(AtomicUsize::new(5));
         let draining = Arc::clone(&left);
         tokio::spawn(async move {
@@ -1669,21 +1743,66 @@ mod tests {
         });
         let start = tokio::time::Instant::now();
         assert_eq!(
-            settle(|| left.load(Ordering::SeqCst), SETTLE_WAIT).await,
+            settle(|| left.load(Ordering::SeqCst), confirmed, SETTLE_WAIT).await,
             Ok(())
         );
         assert!(start.elapsed() < Duration::from_secs(1));
         // Never drained: not settled, at the end of the wait.
         let start = tokio::time::Instant::now();
-        assert_eq!(settle(|| 2, SETTLE_WAIT).await, Err(2));
+        assert_eq!(
+            settle(|| 2, confirmed, SETTLE_WAIT).await,
+            Err(Unsettled::Queued(2))
+        );
         assert!(start.elapsed() >= SETTLE_WAIT);
         assert!(start.elapsed() <= SETTLE_WAIT + PUMP_EVERY);
-        // Empty now and then, never three polls in a row: not settled either.
+        // Empty while the barrier went through, then not: not settled either.
         let polls = AtomicUsize::new(0);
-        let flapping = || usize::from(polls.fetch_add(1, Ordering::SeqCst) % 3 == 2);
-        assert!(settle(flapping, SETTLE_WAIT).await.is_err());
+        let flapping = || usize::from(polls.fetch_add(1, Ordering::SeqCst) % 2 == 1);
+        assert!(settle(flapping, confirmed, SETTLE_WAIT).await.is_err());
         // No wait left: one look.
-        assert_eq!(settle(|| 0, Duration::ZERO).await, Err(0));
+        assert_eq!(
+            settle(|| 1, confirmed, Duration::ZERO).await,
+            Err(Unsettled::Queued(1))
+        );
+    }
+
+    /// A writer still settling links once the queue is empty does not let the self-check
+    /// start: the settle waits for its barrier, and one that never comes fails the wait.
+    #[tokio::test(start_paused = true)]
+    async fn the_settle_waits_for_the_writers_barrier() {
+        let settling_until = tokio::time::Instant::now() + Duration::from_millis(700);
+        let barrier = || async move {
+            tokio::time::sleep_until(settling_until).await;
+            true
+        };
+        let start = tokio::time::Instant::now();
+        assert_eq!(settle(|| 0, barrier, SETTLE_WAIT).await, Ok(()));
+        assert_eq!(start.elapsed(), Duration::from_millis(700), "not before it");
+        // A writer that never confirms, or is gone.
+        let never = || std::future::pending::<bool>();
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            settle(|| 0, never, SETTLE_WAIT).await,
+            Err(Unsettled::Writing)
+        );
+        assert_eq!(start.elapsed(), SETTLE_WAIT);
+        let gone = || async { false };
+        assert_eq!(
+            settle(|| 0, gone, SETTLE_WAIT).await,
+            Err(Unsettled::Writing)
+        );
+    }
+
+    /// A temporary directory named without symlinks (macOS's `/var` is one).
+    fn real_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(dir.path()).unwrap();
+        (dir, path)
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
     /// The new store's parent must not let other users swap the store between its creation
@@ -1691,12 +1810,8 @@ mod tests {
     /// sticky.
     #[test]
     fn the_store_parent_is_closed_to_other_users() {
-        use std::os::unix::fs::PermissionsExt;
         let uid = Ownership::current().uid;
-        let dir = tempfile::tempdir().unwrap();
-        let set = |mode| {
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
-        };
+        let (_tmp, dir) = real_tempdir();
         for (mode, ok) in [
             (0o700, true),
             (0o755, true),
@@ -1706,30 +1821,133 @@ mod tests {
             (0o770, false),
             (0o702, false),
         ] {
-            set(mode);
-            let checked = check_store_parent(dir.path(), uid);
+            set_mode(&dir, mode);
+            let checked = check_store_parent(&dir, uid);
             assert_eq!(checked.is_ok(), ok, "{mode:o}: {checked:?}");
             if let Err(e) = checked {
-                assert!(e.contains("writable by other users"), "{e}");
+                assert!(e.contains("not writable by others"), "{e}");
             }
         }
         // Under such a parent nothing is created.
-        set(0o777);
-        let columns = dir.path().join("columns");
+        set_mode(&dir, 0o777);
+        let columns = dir.join("columns");
         let refused = create_store_dir(&columns).unwrap_err();
         assert!(refused.starts_with("column store"), "{refused}");
         assert!(!columns.exists());
-        set(0o700);
+        set_mode(&dir, 0o700);
         create_store_dir(&columns).unwrap();
         // Owned by another user than us (and not root): refused.
         if uid != 0 {
-            let other = check_store_parent(dir.path(), uid + 1).unwrap_err();
+            let other = check_store_parent(&dir, uid + 1).unwrap_err();
             assert!(other.contains("owned by"), "{other}");
         }
         // A parent that is not a directory.
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let not_dir = check_store_parent(file.path(), uid).unwrap_err();
+        let file = dir.join("file");
+        std::fs::write(&file, b"").unwrap();
+        let not_dir = check_store_parent(&file, uid).unwrap_err();
         assert!(not_dir.contains("not a directory"), "{not_dir}");
+    }
+
+    /// Every directory on the way to the store is checked, not only its parent: under a
+    /// directory others can write, the next one down could be renamed away and replaced.
+    #[test]
+    fn every_ancestor_of_the_store_is_closed_to_other_users() {
+        let (_tmp, dir) = real_tempdir();
+        // `shared` (0777, no sticky bit) / `mine` (0700) / `columns`.
+        let shared = dir.join("shared");
+        let mine = shared.join("mine");
+        std::fs::create_dir_all(&mine).unwrap();
+        set_mode(&mine, 0o700);
+        set_mode(&shared, 0o777);
+        let columns = mine.join("columns");
+        let refused = create_store_dir(&columns).unwrap_err();
+        assert!(refused.contains("not writable by others"), "{refused}");
+        assert!(refused.contains("shared"), "names the ancestor: {refused}");
+        assert!(!columns.exists(), "nothing created under it");
+        // Sticky, as /tmp is: nobody else can rename `mine`.
+        set_mode(&shared, 0o1777);
+        create_store_dir(&columns).unwrap();
+        set_mode(&shared, 0o755);
+    }
+
+    /// A symlink anywhere on the way to the store is refused, not followed, even one only we
+    /// can change: the path is checked as it is named.
+    #[test]
+    fn a_symlinked_ancestor_of_the_store_is_refused() {
+        let (_tmp, dir) = real_tempdir();
+        let real = dir.join("real");
+        std::fs::create_dir(&real).unwrap();
+        set_mode(&real, 0o700);
+        std::os::unix::fs::symlink(&real, dir.join("link")).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("up")).unwrap();
+        for via in [dir.join("link/columns"), dir.join("up/real/columns")] {
+            let refused = create_store_dir(&via).unwrap_err();
+            assert!(refused.contains("symlink"), "{}: {refused}", via.display());
+            assert!(!real.join("columns").exists(), "nothing created through it");
+        }
+        // A relative path or one with `..` is not walked from `/`.
+        let odd = create_store_dir(&real.join("../real/columns")).unwrap_err();
+        assert!(odd.contains(".."), "{odd}");
+    }
+
+    /// A root-owned sticky ancestor, such as /tmp, is closed enough: nobody else can rename
+    /// or replace what we create in it.
+    #[test]
+    fn a_root_owned_sticky_ancestor_is_accepted() {
+        use std::os::unix::fs::MetadataExt;
+        let sticky = ["/tmp", "/private/tmp", "/var/tmp"].into_iter().find(|p| {
+            std::fs::symlink_metadata(p)
+                .is_ok_and(|m| m.is_dir() && m.uid() == 0 && m.mode() & 0o1002 == 0o1002)
+        });
+        let Some(sticky) = sticky else {
+            eprintln!("a_root_owned_sticky_ancestor_is_accepted: no root-owned sticky /tmp here");
+            return;
+        };
+        let uid = Ownership::current().uid;
+        assert_eq!(check_store_parent(Path::new(sticky), uid), Ok(()));
+        let dir = tempfile::Builder::new()
+            .prefix("store-")
+            .tempdir_in(sticky)
+            .unwrap();
+        let columns = dir.path().join("columns");
+        create_store_dir(&columns).unwrap();
+        assert!(columns.is_dir());
+    }
+
+    /// The cleanup of a failed start removes the directory this run created and nothing
+    /// else: whatever is in its place by then, a directory or a symlink, is left alone.
+    #[test]
+    fn the_cleanup_removes_only_the_store_this_run_created() {
+        let (_tmp, dir) = real_tempdir();
+        let columns = dir.join("columns");
+        // The store, with something in it: removed whole.
+        let store = create_store_dir(&columns).unwrap();
+        std::fs::write(columns.join("data.mdb"), b"x").unwrap();
+        store.remove();
+        assert!(!columns.exists());
+        // Another directory in its place: left alone, with what it holds.
+        let store = create_store_dir(&columns).unwrap();
+        let moved = dir.join("moved");
+        std::fs::rename(&columns, &moved).unwrap();
+        std::fs::create_dir(&columns).unwrap();
+        std::fs::write(columns.join("theirs"), b"x").unwrap();
+        store.remove();
+        assert!(
+            columns.join("theirs").exists(),
+            "another directory is not removed"
+        );
+        assert!(moved.is_dir(), "nor the moved store, by another name");
+        // A symlink in its place: neither it nor its target is touched.
+        std::fs::remove_dir_all(&columns).unwrap();
+        let store = create_store_dir(&columns).unwrap();
+        std::fs::remove_dir(&columns).unwrap();
+        std::os::unix::fs::symlink(&moved, &columns).unwrap();
+        store.remove();
+        assert!(std::fs::symlink_metadata(&columns)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(moved.is_dir());
     }
 
     #[test]

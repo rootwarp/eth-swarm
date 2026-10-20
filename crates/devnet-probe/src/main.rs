@@ -122,7 +122,7 @@ only.
   --epoch N              the epoch fetch-epoch fetches (default: finalized epoch - 1)
   --columns-dir DIR      serve: the column store, created; it must not exist yet (every run
                          serves under a fresh node key, which its custody columns follow),
-                         under a parent no other user can write
+                         on a path without symlinks no other user can change
   --socket-dir DIR       serve: the socket root, an absolute path without symlinks writable
                          only by us; cl-chain's socket is DIR/cl-chain/cl-chain.sock
   --verify-socket PATH   serve: cl-verify's socket (cl-verify --socket PATH --peer-uid <our UID>)
@@ -1185,8 +1185,10 @@ mod tests {
     fn serve_needs_its_reference_and_cl_verify() {
         let rt = runtime();
         let devnet = fixtures::devnet();
-        let dir = tempfile::tempdir().unwrap();
-        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_owned();
+        let tmp = tempfile::tempdir().unwrap();
+        // Named without symlinks, as the store's path must be (macOS's `/var` is one).
+        let dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let path = |name: &str| dir.join(name).to_str().unwrap().to_owned();
         let argv = |api: &str| {
             args(&[
                 "serve",
@@ -1223,11 +1225,10 @@ mod tests {
             "{:?}",
             unreachable.lines()
         );
-        assert!(!dir.path().join("columns").exists(), "nothing opened");
+        assert!(!dir.join("columns").exists(), "nothing opened");
         // With cl-verify there, serve starts: this config has no serve range, so it ends there.
-        let _listener = rt.block_on(async {
-            tokio::net::UnixListener::bind(dir.path().join("verify.sock")).unwrap()
-        });
+        let _listener =
+            rt.block_on(async { tokio::net::UnixListener::bind(dir.join("verify.sock")).unwrap() });
         let served = rt.block_on(async {
             tokio::time::timeout(Duration::from_secs(30), async {
                 let Parsed::Run(a) = parse(&argv("http://127.0.0.1:5052")).unwrap() else {

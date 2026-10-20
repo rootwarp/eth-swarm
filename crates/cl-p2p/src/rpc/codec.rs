@@ -62,7 +62,7 @@
 //! again when writing starts, and settled once, when its first chunk was written whole.
 
 use super::columns::{block_lengths, error_answer};
-use super::limits::{AnswerPermit, BookedChunks, ChunkPacer};
+use super::limits::{AnswerPermit, BookedChunks, ChunkPacer, Reservation};
 use super::metrics::RpcMetrics;
 use consensus_types::EthSpec;
 use consensus_types::{caps, forked};
@@ -667,9 +667,13 @@ impl<E: EthSpec> RpcCodec<E> {
 pub struct Answer<E: EthSpec> {
     /// The chunks, in order.
     pub chunks: Vec<ReceivedChunk<E>>,
-    /// Paces the chunks, each charged as it is next to go; `None` with `booked` neither sends
-    /// them at once.
+    /// Paces the chunks, each charged as it is next to go; `None` with `booked` and `token`
+    /// neither sends them at once.
     pub pacer: Option<ChunkPacer>,
+    /// The first chunk's token, reserved before the answer was made (our Status, read once
+    /// the token is due): that chunk goes out at it instead of a token of `pacer`, and gets
+    /// back what is still ahead of it if never written whole.
+    pub token: Option<Box<Reservation>>,
     /// The tokens booked for the chunks when the request was admitted, settled by the writer;
     /// used before `pacer`.
     pub booked: Option<Box<BookedChunks>>,
@@ -683,6 +687,7 @@ impl<E: EthSpec> From<Vec<ReceivedChunk<E>>> for Answer<E> {
         Self {
             chunks,
             pacer: None,
+            token: None,
             booked: None,
             permit: None,
         }
@@ -746,10 +751,11 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
 
     /// Checks the whole answer ([`encode_response`]'s rules), then encodes and writes each chunk
     /// whole once its token is due, dropping each decoded chunk as it is encoded, so the answer
-    /// never holds more than its decoded chunks and one encoded one. With a pacer, a chunk whose
-    /// write never completed (the future was dropped, or the write failed) gets back the part of
-    /// its token still ahead, and one written whole stays charged even if the flush after it
-    /// fails, since the peer may have it all. A booked answer is first cut again, at a whole
+    /// never holds more than its decoded chunks and one encoded one. With a pacer (or the first
+    /// chunk's token reserved before, [`Answer::token`]), a chunk whose write never completed
+    /// (the future was dropped, or the write failed) gets back the part of its token still
+    /// ahead, and one written whole stays charged even if the flush after it fails, since the
+    /// peer may have it all. A booked answer is first cut again, at a whole
     /// block, to what a requester reading at the answer's pace from now reads by the end of its
     /// window ([`BookedChunks::cut`]), and an answer of sidecars is refused with
     /// `3: ResourceUnavailable` if not even its first block reaches that requester before the
@@ -773,6 +779,7 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
         let Answer {
             mut chunks,
             pacer,
+            mut token,
             mut booked,
             mut permit,
         } = answer;
@@ -813,7 +820,10 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
             drop(chunk);
             let reservation = match &booked {
                 Some(_) => None,
-                None => pacer.as_ref().map(ChunkPacer::reserve),
+                None => token
+                    .take()
+                    .map(|token| *token)
+                    .or_else(|| pacer.as_ref().map(ChunkPacer::reserve)),
             };
             let due = match &booked {
                 Some(booked) => Some(booked.due(i)),
@@ -1998,6 +2008,7 @@ mod tests {
         let answer = Answer {
             chunks,
             pacer: Some(pacer),
+            token: None,
             booked: None,
             permit: None,
         };
@@ -2042,6 +2053,7 @@ mod tests {
         let answer = Answer {
             chunks: blocks(3),
             pacer: None,
+            token: None,
             booked: Some(Box::new(booked)),
             permit: places.try_take(peer, None).map(Box::new),
         };
@@ -2064,6 +2076,7 @@ mod tests {
         let answer = Answer {
             chunks: blocks(3),
             pacer: None,
+            token: None,
             booked: Some(Box::new(booked)),
             permit: places.try_take(peer, None).map(Box::new),
         };
@@ -2125,6 +2138,7 @@ mod tests {
         let answer = Answer {
             chunks: blocks(2),
             pacer: None,
+            token: None,
             booked: Some(Box::new(BookedChunks::book(
                 &limiter,
                 peer,
@@ -2245,6 +2259,7 @@ mod tests {
         let answer = |peer, ip: u8| Answer {
             chunks: blocks(40),
             pacer: None,
+            token: None,
             booked: Some(Box::new(BookedChunks::book(
                 &limiter, peer, BLOCKS, 40, None, deadlines,
             ))),
@@ -2322,6 +2337,7 @@ mod tests {
         let answer = Answer {
             chunks: blocks(40),
             pacer: None,
+            token: None,
             booked: Some(Box::new(BookedChunks::book(
                 &limiter, peer, BLOCKS, 40, None, deadlines,
             ))),
@@ -2405,6 +2421,7 @@ mod tests {
         Answer {
             chunks,
             pacer: None,
+            token: None,
             booked: Some(Box::new(BookedChunks::book(
                 &limiter,
                 peer,
@@ -2516,6 +2533,7 @@ mod tests {
             let answer = Answer {
                 chunks,
                 pacer: None,
+                token: None,
                 booked: Some(Box::new(booked)),
                 permit: Some(Box::new(permit)),
             };
@@ -2708,6 +2726,7 @@ mod tests {
         let answer = Answer {
             chunks,
             pacer: None,
+            token: None,
             booked: Some(Box::new(booked)),
             permit: Some(Box::new(permit)),
         };
@@ -2788,6 +2807,7 @@ mod tests {
         let answer = Answer {
             chunks,
             pacer: None,
+            token: None,
             booked: Some(Box::new(booked)),
             permit: Some(Box::new(permit)),
         };
@@ -2947,6 +2967,7 @@ mod tests {
         let answer = Answer {
             chunks,
             pacer: None,
+            token: None,
             booked: Some(Box::new(booked)),
             permit: Some(Box::new(permit)),
         };
@@ -3230,6 +3251,7 @@ mod tests {
         let answer = |peer| Answer {
             chunks: vec![sidecar_chunk(0, 1), sidecar_chunk(1, 1)],
             pacer: None,
+            token: None,
             booked: Some(Box::new(BookedChunks::book(
                 &limiter,
                 peer,
@@ -3346,6 +3368,7 @@ mod tests {
         let answer = Answer {
             chunks,
             pacer: None,
+            token: None,
             booked: Some(Box::new(booked)),
             permit: Some(Box::new(permit)),
         };
@@ -3429,6 +3452,7 @@ mod tests {
         let answer = Answer {
             chunks: Vec::new(),
             pacer: None,
+            token: None,
             booked: Some(Box::new(booked)),
             permit: None,
         };
@@ -3543,6 +3567,7 @@ mod tests {
         let answer = Answer {
             chunks: blocks(3),
             pacer: Some(ChunkPacer::new(limiter.clone(), peer, BLOCKS, None)),
+            token: None,
             booked: None,
             permit: None,
         };
@@ -3596,6 +3621,7 @@ mod tests {
         let answer = Answer {
             chunks: blocks(2),
             pacer: Some(ChunkPacer::new(limiter.clone(), peer, BLOCKS, None)),
+            token: None,
             booked: None,
             permit: None,
         };

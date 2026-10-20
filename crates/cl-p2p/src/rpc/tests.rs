@@ -12,7 +12,7 @@ mod limits;
 use super::codec::{Answer, Deadline, Deadlines, ReceivedChunk, RpcRequest};
 use super::inbound::{
     ControlConfig, ControlEvent, DuplexEvent, Protocols, ProtocolsEvent, Relevance, SharedStatus,
-    StatusVia,
+    StatusBacklog, StatusVia,
 };
 use super::metrics::{RpcMetrics, StatusValidity};
 use super::unsupported::Unsupported;
@@ -54,6 +54,8 @@ type E = ProbeSpec;
 const WAIT: Duration = Duration::from_secs(20);
 /// How long a test lets the swarms run to see that something does not happen.
 const SETTLE: Duration = Duration::from_millis(500);
+/// How long a [`RawPeer::patient`] waits for the first byte of an answer.
+const PATIENT: Duration = Duration::from_secs(9);
 
 const DIGEST: ForkDigest = [0x0a, 0x0b, 0x0c, 0x0d];
 const OTHER_DIGEST: ForkDigest = [0x01, 0x02, 0x03, 0x04];
@@ -85,6 +87,8 @@ enum Cmd {
     Status(PeerId),
     Ping(PeerId),
     Goodbye(PeerId, u64),
+    /// What our Status answers to the peer hold now.
+    Backlog(PeerId, futures::channel::oneshot::Sender<StatusBacklog>),
 }
 
 /// A node event a test waits for.
@@ -188,6 +192,9 @@ impl Node {
                             }
                             Some(Cmd::Ping(peer)) => control.ping(peer),
                             Some(Cmd::Goodbye(peer, reason)) => control.goodbye(peer, reason),
+                            Some(Cmd::Backlog(peer, tx)) => {
+                                let _ = tx.send(control.status_backlog(peer));
+                            }
                             None => return,
                         }
                         continue;
@@ -253,6 +260,32 @@ impl Node {
             _ => None,
         })
         .await
+    }
+
+    /// What our Status answers to `peer` hold now.
+    async fn backlog(&self, peer: PeerId) -> StatusBacklog {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.send(Cmd::Backlog(peer, tx));
+        rx.await.expect("node running")
+    }
+
+    /// Polls [`Self::backlog`] until `done` holds, within [`WAIT`].
+    async fn backlog_until(
+        &self,
+        peer: PeerId,
+        done: impl Fn(&StatusBacklog) -> bool,
+    ) -> StatusBacklog {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let backlog = self.backlog(peer).await;
+                if done(&backlog) {
+                    return backlog;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the backlog")
     }
 
     async fn closed(&mut self, peer: PeerId) {
@@ -384,9 +417,25 @@ impl RawPeer {
 
     /// A peer with the node key `key`.
     fn with_key(key: Keypair, seq_number: u64) -> Self {
+        Self::with_deadlines(key, seq_number, Deadlines::default())
+    }
+
+    /// A peer that waits [`PATIENT`] for the first byte of an answer, inside the 10 s an
+    /// exchange may take: a test of when our answer comes has seconds to spare either way.
+    fn patient(seq_number: u64) -> Self {
+        let deadlines = Deadlines {
+            ttfb: PATIENT,
+            total: PATIENT,
+            per_chunk: PATIENT,
+        };
+        Self::with_deadlines(Keypair::generate_secp256k1(), seq_number, deadlines)
+    }
+
+    /// A peer with the node key `key`, reading answers within `deadlines`.
+    fn with_deadlines(key: Keypair, seq_number: u64, deadlines: Deadlines) -> Self {
         let protocols = Protocols::new(
             Arc::new(p2p_wire::testkit::column_context_table()),
-            Deadlines::default(),
+            deadlines,
             None,
         );
         Self {
@@ -795,11 +844,38 @@ async fn a_fresh_status_read_is_what_goes_out() {
 }
 
 /// A Status source whose fresh reads read the store's floor when they run, not when they are
-/// asked for, counting them.
-#[derive(Default)]
+/// asked for, counting them. The first `held` reads wait for a permit of `gate` before they
+/// read: a read holds its outbound slot until it ends, so those slots stay taken for as long
+/// as the test says, whatever the clock.
 struct LiveFloor {
     floor: AtomicU64,
     reads: AtomicU64,
+    held: AtomicU64,
+    gate: tokio::sync::Semaphore,
+}
+
+impl Default for LiveFloor {
+    fn default() -> Self {
+        Self {
+            floor: AtomicU64::default(),
+            reads: AtomicU64::default(),
+            held: AtomicU64::default(),
+            gate: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+impl LiveFloor {
+    /// Waits until `n` reads have started.
+    async fn started(&self, n: u64) {
+        tokio::time::timeout(WAIT, async {
+            while self.reads.load(Ordering::SeqCst) < n {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the reads started");
+    }
 }
 
 struct LiveReads(Arc<LiveFloor>);
@@ -812,7 +888,10 @@ impl super::inbound::StatusSource for LiveReads {
     fn fresh(&self) -> Option<super::inbound::StatusLookup> {
         let live = Arc::clone(&self.0);
         Some(Box::pin(async move {
-            live.reads.fetch_add(1, Ordering::SeqCst);
+            let n = live.reads.fetch_add(1, Ordering::SeqCst);
+            if n < live.held.load(Ordering::SeqCst) {
+                live.gate.acquire().await.unwrap().forget();
+            }
             Some(StatusV2 {
                 earliest_available_slot: live.floor.load(Ordering::SeqCst),
                 ..status_with(DIGEST)
@@ -823,10 +902,13 @@ impl super::inbound::StatusSource for LiveReads {
 
 #[tokio::test]
 async fn a_queued_status_carries_the_floor_of_when_it_goes_out() {
-    // Two dialed peers hold our Status unanswered, so both outbound Status slots are taken and
-    // a third dial's Status waits. The store's floor rises meanwhile: it is what goes out.
+    // Two dials' reads are held, so both outbound Status slots are taken (a read holds its
+    // slot until it ends) and a third dial's Status waits. The store's floor rises meanwhile:
+    // it is what goes out. Nothing here waits on a deadline: the slots are held until the
+    // test lets one go.
     let live = Arc::new(LiveFloor::default());
     live.floor.store(100, Ordering::SeqCst);
+    live.held.store(2, Ordering::SeqCst);
     let cfg = ControlConfig {
         status: Arc::new(LiveReads(Arc::clone(&live))),
         ..config(status_with(DIGEST), 1, 4)
@@ -835,19 +917,18 @@ async fn a_queued_status_carries_the_floor_of_when_it_goes_out() {
     let mut holders = Vec::new();
     for _ in 0..2 {
         let mut holder = RawPeer::new(1);
-        holder.answer_status = false;
         let addr = holder.listen().await;
         ours.send(Cmd::Dial(addr));
-        tokio::time::timeout(WAIT, async {
-            while holder.held.is_empty() {
-                let event = holder.swarm.select_next_some().await;
-                holder.handle(event);
-            }
-        })
-        .await
-        .expect("our Status arrived");
+        let id = holder.id();
+        tokio::select! {
+            () = holder.run() => unreachable!(),
+            () = ours.next("a holder's connection", |seen| {
+                matches!(seen, Seen::Established(p) if *p == id).then_some(())
+            }) => {}
+        }
         holders.push(holder);
     }
+    live.started(2).await;
     let mut third = RawPeer::new(1);
     let addr = third.listen().await;
     ours.send(Cmd::Dial(addr));
@@ -864,21 +945,13 @@ async fn a_queued_status_carries_the_floor_of_when_it_goes_out() {
         2,
         "the waiting Status is not read yet"
     );
+    // One held read ends: its Status goes out and is answered, and its slot is the third's.
     live.floor.store(140, Ordering::SeqCst);
-    let mut first = holders.remove(0);
-    let channel = first.held.pop().unwrap();
-    let answer = vec![ReceivedChunk {
-        context: None,
-        chunk: ResponseChunk::Success(Response::Status(status_with(DIGEST))),
-    }];
-    first
-        .swarm
-        .behaviour_mut()
-        .status
-        .send_response(channel, answer)
-        .unwrap();
+    live.gate.add_permits(1);
+    let (first, second) = holders.split_at_mut(1);
     let sent = tokio::select! {
-        () = first.run() => unreachable!(),
+        () = first[0].run() => unreachable!(),
+        () = second[0].run() => unreachable!(),
         () = third.run() => unreachable!(),
         sent = ours.next("the third peer's echo", |seen| match seen {
             Seen::Control(ControlEvent::Status { peer, status, .. }) if *peer == third_id => {
@@ -889,6 +962,148 @@ async fn a_queued_status_carries_the_floor_of_when_it_goes_out() {
     };
     assert_eq!(sent.earliest_available_slot, 140);
     assert_eq!(live.reads.load(Ordering::SeqCst), 3);
+}
+
+/// A peer's Status past its quota waits for its token before our Status is read for it: a
+/// floor that rises while it waits is what the answer carries. The token is due 6 s on, so a
+/// stall of 5 s still finds it unread; the patient peer waits 9 s for the answer.
+#[tokio::test]
+async fn an_inbound_status_is_read_once_its_token_is_due() {
+    let live = Arc::new(LiveFloor::default());
+    let (ours, mut raw) = status_quota(&live, Duration::from_secs(6), PATIENT).await;
+    let floor_of = |chunk: ResponseChunk<E>| match chunk {
+        ResponseChunk::Success(Response::Status(status)) => status.earliest_available_slot,
+        other => panic!("{other:?}"),
+    };
+    let second = raw.send(ours.peer, Request::Status(status_with(DIGEST)));
+    raw.run_for(SETTLE).await;
+    assert_eq!(
+        live.reads.load(Ordering::SeqCst),
+        1,
+        "not read before its token"
+    );
+    live.floor.store(140, Ordering::SeqCst);
+    assert_eq!(floor_of(single(raw.outcome(second).await.unwrap())), 140);
+    assert_eq!(live.reads.load(Ordering::SeqCst), 2);
+}
+
+/// Status answers waiting for their token go with their connection and give their tokens
+/// back: a peer that reconnects and asks again and again holds no more answers, reads or debt
+/// than one that asked once. A minute's period: nothing here comes due on any clock.
+#[tokio::test]
+async fn answers_waiting_for_their_token_go_with_their_connection() {
+    let live = Arc::new(LiveFloor::default());
+    live.floor.store(100, Ordering::SeqCst);
+    let mut cfg = ControlConfig {
+        status: Arc::new(LiveReads(Arc::clone(&live))),
+        ..config(status_with(DIGEST), 1, 4)
+    };
+    cfg.limits.rate.status = super::limits::Quota::new(1, Duration::from_secs(60));
+    let mut ours = Node::spawn(cfg).await;
+    let mut raw = RawPeer::new(1);
+    let me = raw.id();
+    raw.connect(ours.addr.clone()).await;
+    let first = raw.send(ours.peer, Request::Status(status_with(DIGEST)));
+    assert!(matches!(
+        single(raw.outcome(first).await.unwrap()),
+        ResponseChunk::Success(Response::Status(_))
+    ));
+    let baseline = ours.backlog_until(me, |b| b.answering == 0).await;
+    assert!(baseline.token_in > Duration::from_secs(50), "{baseline:?}");
+    for round in 1..=3u64 {
+        // Two more, each withheld for its token, then the connection goes.
+        raw.send(ours.peer, Request::Status(status_with(DIGEST)));
+        raw.send(ours.peer, Request::Status(status_with(DIGEST)));
+        let withheld = || ours.metrics.rate_limited_count(Protocol::StatusV2) == 2 * round;
+        tokio::select! {
+            () = raw.run() => unreachable!(),
+            () = async {
+                while !withheld() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            } => {}
+            () = tokio::time::sleep(WAIT) => panic!("the requests were not withheld"),
+        }
+        assert!(raw.swarm.disconnect_peer_id(ours.peer).is_ok());
+        tokio::select! {
+            () = raw.run() => unreachable!(),
+            () = ours.closed(me) => {}
+        }
+        raw.connect(ours.addr.clone()).await;
+    }
+    let after = ours.backlog(me).await;
+    assert_eq!(
+        (after.waiting, after.reading, after.answering),
+        (0, 0, 0),
+        "{after:?}"
+    );
+    assert!(
+        after.token_in <= baseline.token_in,
+        "the debt grew: {after:?} after {baseline:?}"
+    );
+    assert_eq!(
+        live.reads.load(Ordering::SeqCst),
+        1,
+        "none read for nothing"
+    );
+}
+
+/// Our node, reading its Status from `live`, past a burst of 1 Status token every `period`,
+/// keeping our Status answers within a first-byte deadline of `ttfb`; and a patient peer
+/// connected to it whose first Status was answered, from a floor of 100.
+async fn status_quota(live: &Arc<LiveFloor>, period: Duration, ttfb: Duration) -> (Node, RawPeer) {
+    live.floor.store(100, Ordering::SeqCst);
+    let mut cfg = ControlConfig {
+        status: Arc::new(LiveReads(Arc::clone(live))),
+        ..config(status_with(DIGEST), 1, 4)
+    };
+    cfg.limits.rate.status = super::limits::Quota::new(1, period);
+    cfg.deadlines.ttfb = ttfb;
+    let ours = Node::spawn(cfg).await;
+    let mut raw = RawPeer::patient(1);
+    raw.connect(ours.addr.clone()).await;
+    let first = raw.send(ours.peer, Request::Status(status_with(DIGEST)));
+    assert!(matches!(
+        single(raw.outcome(first).await.unwrap()),
+        ResponseChunk::Success(Response::Status(_))
+    ));
+    (ours, raw)
+}
+
+/// A fresh read that would run past the requester's first-byte deadline is cut there: the
+/// answer is `2: ServerError` in time, never one the requester has stopped waiting for.
+#[tokio::test]
+async fn a_status_read_too_slow_for_the_first_byte_deadline_is_refused_in_time() {
+    // The token is due 1 s on, and the read never ends: refused at 3 s less the slack.
+    let live = Arc::new(LiveFloor::default());
+    let (ours, mut raw) = status_quota(&live, Duration::from_secs(1), Duration::from_secs(3)).await;
+    live.held.store(2, Ordering::SeqCst);
+    let start = Instant::now();
+    let second = raw.send(ours.peer, Request::Status(status_with(DIGEST)));
+    match single(raw.outcome(second).await.unwrap()) {
+        ResponseChunk::Error { code, .. } => assert_eq!(code, ResultCode::ServerError),
+        other => panic!("{other:?}"),
+    }
+    assert!(start.elapsed() < PATIENT, "{:?}", start.elapsed());
+    assert_eq!(
+        live.reads.load(Ordering::SeqCst),
+        2,
+        "it was read, too slowly"
+    );
+}
+
+/// A token due past the requester's first-byte deadline starts no read: the answer is
+/// `2: ServerError` at the token.
+#[tokio::test]
+async fn a_status_token_due_past_the_first_byte_deadline_is_refused_unread() {
+    let live = Arc::new(LiveFloor::default());
+    let (ours, mut raw) = status_quota(&live, Duration::from_secs(3), Duration::from_secs(3)).await;
+    let second = raw.send(ours.peer, Request::Status(status_with(DIGEST)));
+    match single(raw.outcome(second).await.unwrap()) {
+        ResponseChunk::Error { code, .. } => assert_eq!(code, ResultCode::ServerError),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(live.reads.load(Ordering::SeqCst), 1, "not read");
 }
 
 #[tokio::test]
