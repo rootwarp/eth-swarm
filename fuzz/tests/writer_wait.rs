@@ -4,19 +4,66 @@
 //! writer that stalls under load but finishes within the input's time is not reported as a
 //! crash, and one that never drains or settles still fails with the harness's own message before
 //! libFuzzer calls the input a timeout.
+//!
+//! The relation test reads the timeout from the scripts, so it has to see every write to
+//! `M2A_TIMEOUT_S`. It guards against an accidental edit, not a deliberately hostile script, and
+//! it is a line scanner, not a shell parser. It joins backslash-continued lines first, then
+//! catches: the one definition in `fuzz/m2a-common.sh` changing; any later or second write
+//! there (`export`, `readonly`, `declare`, indented, `+=`, `${…:=…}`, a function body, …); any
+//! write in another `fuzz/*.sh` (assignment, `read`, `printf -v`, …); and any `eval`, `source`
+//! or `.` it cannot follow, apart from the one line that sources `m2a-common.sh`. It does not
+//! catch a name built in pieces (`+=` onto a partial name, `printf -v "$n"`, quoted fragments
+//! such as `M2A_"TIMEOUT"_S`), nor anything else a shell evaluates before naming the variable.
 
 use ethswarm_fuzz::INPUT_DEADLINE;
 use std::time::Duration;
 
-/// What the input runs outside its deadline, at most: libFuzzer's call before the input's first
-/// line, and the one wait step after the deadline passed before its check fails (microseconds).
+/// The configured margin between the input's deadline and the gates' per-input timeout. It covers
+/// what the input runs outside its deadline: libFuzzer's call before the input's first line, and
+/// the one wait step after the deadline passed before its check fails (microseconds). Teardown is
+/// not in it: dropping the column ingest joins the writer thread with no limit, so a writer stuck
+/// there surfaces as a libFuzzer timeout, which the gates reject.
 const OUTSIDE_THE_DEADLINE: Duration = Duration::from_secs(2);
 
 const NAME: &str = "M2A_TIMEOUT_S";
 
-/// The one line by which a gate script reads `fuzz/m2a-common.sh`; any other `source`, `.` or
-/// `eval` could set `M2A_TIMEOUT_S` out of the parser's sight, so it is refused.
+/// The one line by which a gate script reads `fuzz/m2a-common.sh`, exactly (a comment goes on
+/// its own line); any other `source`, `.` or `eval` could set `M2A_TIMEOUT_S` out of the
+/// scanner's sight, so it is refused.
 const SOURCE_COMMON: &str = r#". "$(dirname "$0")/m2a-common.sh""#;
+
+/// Whether `line` is a comment line: `#` after any indentation.
+fn is_comment(line: &str) -> bool {
+    line.trim_start().starts_with('#')
+}
+
+/// `script`'s lines with backslash continuations joined, each with the number of its first
+/// line. A line ending in an odd number of backslashes goes on with the next, the backslash and
+/// line break dropped as the shell drops them; a comment line's backslash is comment text, so
+/// a comment line is never continued.
+fn logical_lines(script: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut open: Option<(usize, String)> = None;
+    for (n, line) in (1..).zip(script.lines()) {
+        let (first, mut joined) = match open.take() {
+            Some((first, text)) => (first, text + line),
+            None if is_comment(line) => {
+                out.push((n, line.to_owned()));
+                continue;
+            }
+            None => (n, line.to_owned()),
+        };
+        let backslashes = joined.len() - joined.trim_end_matches('\\').len();
+        if backslashes % 2 == 1 {
+            joined.pop();
+            open = Some((first, joined));
+        } else {
+            out.push((first, joined));
+        }
+    }
+    out.extend(open);
+    out
+}
 
 /// Whether `line[at..]`, where `NAME` starts, is the whole name and not part of a longer one.
 fn is_the_name(line: &str, at: usize) -> bool {
@@ -58,10 +105,11 @@ fn tokens(line: &str) -> Vec<(&str, usize)> {
     out
 }
 
-/// Refuses a line that runs code the parser cannot read: any `eval` or `source` word, and a
-/// `.` in a command's place (line start, after `;`, `&`, `|`, `(`, `{`, `` ` ``, `!`, a keyword
-/// or a command prefix), unless the line is exactly [`SOURCE_COMMON`]. Comment lines are skipped
-/// by the caller; anything else that merely looks like one is refused, never overlooked.
+/// Refuses a line that runs code the scanner cannot follow: any `eval` or `source` word, and a
+/// `.` (or a quoted `"."`, `'.'`) in a command's place (line start, after `;`, `&`, `|`, `(`,
+/// `{`, `` ` ``, `!`, a keyword, a command prefix, or an option after `command`, `builtin` or
+/// `exec`), unless the line is exactly [`SOURCE_COMMON`]. Comment lines are skipped by the
+/// caller; anything else that merely looks like one is refused, never overlooked.
 fn readable(n: usize, line: &str) -> Result<(), String> {
     if line == SOURCE_COMMON {
         return Ok(());
@@ -71,10 +119,15 @@ fn readable(n: usize, line: &str) -> Result<(), String> {
             .match_indices(word)
             .any(|(at, _)| is_word_at(line, at, word.len()))
         {
-            return Err(format!("line {n} uses `{word}`: {line}"));
+            return Err(format!(
+                "line {n} uses `{word}`, which this test cannot follow: move text that only \
+                 mentions it to its own comment line or reword it, and source m2a-common.sh only \
+                 as `{SOURCE_COMMON}`: {line}"
+            ));
         }
     }
     let mut command_place = true;
+    let mut after_wrapper = false;
     for (token, end) in tokens(line) {
         let separator = token.len() == 1 && SEPARATORS.contains(token);
         let prefix = matches!(
@@ -92,14 +145,20 @@ fn readable(n: usize, line: &str) -> Result<(), String> {
                 | "env"
                 | "nohup"
         ) || (token.contains('=') && !token.starts_with('='));
+        // `command -p`, `exec -a`: the command still comes after the wrapper's options.
+        let option = after_wrapper && token.starts_with('-');
         // `.` runs a file only as a whole word: `{key}.{…}` in a heredoc is no command.
         let whole = line[end..].chars().next().is_none_or(char::is_whitespace);
-        if token == "." && whole && command_place {
+        let dot = matches!(token, "." | "\".\"" | "'.'");
+        if dot && whole && command_place {
             return Err(format!(
-                "line {n} sources a file other than m2a-common.sh: {line}"
+                "line {n} sources a file with `.`: the one line allowed to is exactly \
+                 `{SOURCE_COMMON}`, with any comment on its own line: {line}"
             ));
         }
-        command_place = separator || (command_place && prefix);
+        command_place = separator || (command_place && (prefix || option));
+        after_wrapper =
+            command_place && (option || matches!(token, "command" | "builtin" | "exec"));
     }
     Ok(())
 }
@@ -120,11 +179,13 @@ fn writes(line: &str) -> impl Iterator<Item = usize> + '_ {
 /// The one value `script` sets `M2A_TIMEOUT_S` to. Every other mention outside a comment line
 /// must be a plain read (`$M2A_TIMEOUT_S` or `${M2A_TIMEOUT_S}`), so a later reassignment
 /// (`export`, `readonly`, `declare`, indented, `${…:=…}`, …) is refused, not overlooked, and so
-/// is any line the parser cannot read ([`readable`]).
+/// is any line the scanner cannot follow ([`readable`]). Lines are read joined
+/// ([`logical_lines`]).
 fn timeout_in(script: &str) -> Result<Duration, String> {
     let mut value = None;
-    for (n, line) in (1..).zip(script.lines()) {
-        if line.trim_start().starts_with('#') {
+    for (n, line) in logical_lines(script) {
+        let line = line.as_str();
+        if is_comment(line) {
             continue;
         }
         readable(n, line)?;
@@ -147,11 +208,13 @@ fn timeout_in(script: &str) -> Result<Duration, String> {
 }
 
 /// Whether `script` only reads `M2A_TIMEOUT_S`: no mention outside a comment line is anything
-/// but a plain read, and every line is [`readable`]. Holds for every gate script other than
-/// `fuzz/m2a-common.sh`, whose value they all run with once they source it.
+/// but a plain read, and every line, read joined ([`logical_lines`]), is [`readable`]. Holds
+/// for every gate script other than `fuzz/m2a-common.sh`, whose value they all run with once
+/// they source it.
 fn only_reads(script: &str) -> Result<(), String> {
-    for (n, line) in (1..).zip(script.lines()) {
-        if line.trim_start().starts_with('#') {
+    for (n, line) in logical_lines(script) {
+        let line = line.as_str();
+        if is_comment(line) {
             continue;
         }
         readable(n, line)?;
@@ -189,7 +252,10 @@ fn gate_timeout() -> Duration {
             continue;
         }
         only_reads(&script).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        if script.lines().any(|line| line == SOURCE_COMMON) {
+        if logical_lines(&script)
+            .iter()
+            .any(|(_, line)| line == SOURCE_COMMON)
+        {
             sourcing.push(name.to_owned());
         }
     }
@@ -228,6 +294,7 @@ fn the_timeout_is_set_once_and_only_read_after() {
         "declare -r M2A_TIMEOUT_S=20",
         "  M2A_TIMEOUT_S=20",
         "\tM2A_TIMEOUT_S=20",
+        "M2A_TIMEOUT_\\\nS=20",
         "f() { M2A_TIMEOUT_S=20; }",
         "M2A_TIMEOUT_S=20",
         "M2A_TIMEOUT_S+=0",
@@ -301,6 +368,14 @@ fn a_line_the_parser_cannot_read_is_refused() {
         "x=$(. ./other.sh)",
         "x=`. ./other.sh`",
         "f() { . ./other.sh; }",
+        ". \"$(dirname \"$0\")/m2a-common.sh\" # a trailing comment",
+        "M2A_TIMEOUT_\\\nS=20",
+        ".\\\n ./other.sh",
+        "\".\" ./other.sh",
+        "'.' ./other.sh",
+        "\"source\" ./other.sh",
+        "command -p . ./other.sh",
+        "exec -- . ./other.sh",
     ] {
         assert!(
             only_reads(&format!("{unreadable}\n")).is_err(),
@@ -312,4 +387,32 @@ fn a_line_the_parser_cannot_read_is_refused() {
             "{unreadable:?} was overlooked"
         );
     }
+}
+
+#[test]
+fn a_refusal_says_how_to_fix_the_line() {
+    let commented = format!("{SOURCE_COMMON} # read the shared settings\n");
+    let refused = only_reads(&commented).expect_err("a trailing comment was taken");
+    assert!(
+        refused.contains(SOURCE_COMMON) && refused.contains("own line"),
+        "{refused}"
+    );
+    let refused = only_reads("echo do not source this\n").expect_err("`source` was taken");
+    assert!(refused.contains("own comment line"), "{refused}");
+}
+
+#[test]
+fn a_continued_line_is_read_joined() {
+    assert_eq!(
+        logical_lines("a \\\n b\n# c \\\nd\ne \\\\\nf \\"),
+        [
+            (1, "a  b".to_owned()),
+            (3, "# c \\".to_owned()),
+            (4, "d".to_owned()),
+            (5, "e \\\\".to_owned()),
+            (6, "f ".to_owned()),
+        ]
+    );
+    let reads = "run \\\n  -timeout=$M2A_TIMEOUT_S\n# M2A_TIMEOUT_S=1 \\\nM2A_TIMEOUT_S_X=3\n";
+    assert_eq!(only_reads(reads), Ok(()));
 }
