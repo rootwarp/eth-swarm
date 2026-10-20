@@ -24,7 +24,8 @@
 //!     reference sample yet (`UNAVAILABLE` before its first), or its column store cannot say
 //!     what it serves from;
 //!   - the read would end past the requester's first-byte deadline less
-//!     [`STATUS_ANSWER_SLACK`] (it is cut there), or its token is due past it (no read);
+//!     [`STATUS_ANSWER_SLACK`] (it is cut there), or its token is due past it (refused on
+//!     arrival, unread, its token given back);
 //!   - cl-chain's answer breaks the contract: a field of the wrong length, or no finalized
 //!     checkpoint ([`status_from_chain`]).
 //!
@@ -90,10 +91,13 @@
 //!   refunded; a sent one stays charged after a reconnect. Our Status answered from a fresh
 //!   read takes its token when the request arrives and is read once the token is due, then
 //!   goes out at that token ([`super::codec::Answer::token`]). Until then the request waits
-//!   with its peer's session: a failed request or a closed connection drops it, and its token
-//!   gives back what is still ahead of it, so a peer that reconnects and asks again holds no
-//!   more waiting answers, reads or debt than one that stayed; a stream that closed before
-//!   its token is not read for.
+//!   with its peer's session: a failed request or a closed connection drops it, its token
+//!   gives back what is still ahead of it and a read it started is cancelled, so a peer that
+//!   reconnects and asks again holds no more waiting answers, reads or debt than one that
+//!   stayed. A request whose connection closed before its token is not read for. A stream the
+//!   peer reset on a connection that stays still looks open, so it is read for and waits
+//!   until its request fails, at the handler's [`REQUEST_TIMEOUT`] at the latest; no more than
+//!   [`MAX_CONCURRENT_REQUESTS`] such streams per connection wait at once.
 //! - **Inbound streams**: each [`Duplex`] serves at most [`MAX_CONCURRENT_REQUESTS`] inbound
 //!   streams per connection, apart from ours, and resets the next one; a withheld chunk keeps
 //!   its stream, so a peer over its quota cannot open more. A column stream holds its slot
@@ -223,6 +227,7 @@ use super::{MAX_CONCURRENT_REQUESTS, REQUEST_TIMEOUT};
 use crate::transport::Direction;
 use consensus_types::EthSpec;
 use ethswarm_proto::chain as pb;
+use futures::future::{abortable, AbortHandle};
 use futures::stream::{FuturesUnordered, StreamExt as _};
 use libp2p::core::transport::PortUse;
 use libp2p::core::Endpoint;
@@ -405,7 +410,7 @@ enum StatusUse {
 /// A peer's Status request we answer from a fresh read, from when it arrived until the
 /// answer goes to its stream. It lives in its session's [`PeerState::status_waits`], so a
 /// failed request or a closed connection drops it at once, and with it its token, which gives
-/// back what is still ahead of it.
+/// back what is still ahead of it, and its read, which is cancelled if it started.
 struct StatusWait<E: EthSpec> {
     protocol: Protocol,
     channel: ResponseChannel<Answer<E>>,
@@ -415,9 +420,21 @@ struct StatusWait<E: EthSpec> {
     token: Reservation,
     /// The read, until it starts.
     read: Option<StatusLookup>,
+    /// Cancels the read once it started, when the wait is dropped.
+    reading: Option<CancelOnDrop>,
     /// The requester's first-byte deadline less [`STATUS_ANSWER_SLACK`]: the read ends by then,
     /// or the answer is `2: ServerError`.
     answer_by: Instant,
+}
+
+/// Cancels a started Status read when dropped: whatever removes its [`StatusWait`] ends the
+/// read, so no read runs for a request that is gone.
+struct CancelOnDrop(AbortHandle);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl<E: EthSpec> std::fmt::Debug for StatusWait<E> {
@@ -1932,7 +1949,9 @@ impl<E: EthSpec> Control<E> {
 
     /// Takes `peer`'s Status request `request_id` to answer from a fresh `read`: its token is
     /// taken now, and the read starts once it is due ([`Self::read_status_answer`]), so the
-    /// answer carries the floor of when it goes out, not of when it arrived.
+    /// answer carries the floor of when it goes out, not of when it arrived. A token due at or
+    /// past the requester's first-byte deadline less [`STATUS_ANSWER_SLACK`] is given back and
+    /// the request answered `2: ServerError` at once, unread.
     fn wait_status(
         &mut self,
         peer: PeerId,
@@ -1945,21 +1964,34 @@ impl<E: EthSpec> Control<E> {
         let token = self.pacer(peer, protocol).reserve();
         let answer_by =
             Instant::now() + self.cfg.deadlines.ttfb.saturating_sub(STATUS_ANSWER_SLACK);
-        let Some(state) = self.peers.get_mut(&peer) else {
+        if !self.peers.contains_key(&peer) {
             // Not connected: the stream goes, and the token back.
             return;
-        };
-        state.status_waits.insert(
-            request_id,
-            StatusWait {
-                protocol,
-                channel,
-                theirs,
-                token,
-                read: Some(read),
-                answer_by,
-            },
-        );
+        }
+        if token.due() >= answer_by {
+            // A token due that late leaves no time to read and answer before the requester's
+            // first-byte deadline: refused now, and the token goes back unspent.
+            tracing::debug!(%peer, "a Status token due past the first-byte deadline: refused");
+            drop(token);
+            let answer = error_chunk(ResultCode::ServerError, "status unavailable");
+            self.send_answer(protocol, channel, Answer::from(answer));
+            self.judge(peer, theirs, StatusVia::Request);
+            return;
+        }
+        if let Some(state) = self.peers.get_mut(&peer) {
+            state.status_waits.insert(
+                request_id,
+                StatusWait {
+                    protocol,
+                    channel,
+                    theirs,
+                    token,
+                    read: Some(read),
+                    reading: None,
+                    answer_by,
+                },
+            );
+        }
     }
 
     /// Starts the read of `peer`'s Status request `request_id`, whose token is due, bounded by
@@ -1987,12 +2019,19 @@ impl<E: EthSpec> Control<E> {
             self.answer_status(peer, request_id, None);
             return;
         }
+        let (read, cancel) = abortable(tokio::time::timeout_at(by, read));
+        wait.reading = Some(CancelOnDrop(cancel));
         let to = StatusUse::Answer { peer, request_id };
         self.status_reads.push(Box::pin(async move {
-            let ours = tokio::time::timeout_at(by, read).await.unwrap_or_else(|_| {
-                tracing::debug!(%peer, "our Status read ran past the first-byte deadline");
-                None
-            });
+            // A cancelled read answers nothing: its request is gone.
+            let ours = match read.await {
+                Ok(Ok(ours)) => ours,
+                Ok(Err(_)) => {
+                    tracing::debug!(%peer, "our Status read ran past the first-byte deadline");
+                    None
+                }
+                Err(_) => None,
+            };
             (to, ours)
         }));
     }

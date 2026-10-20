@@ -99,6 +99,7 @@ impl Quota {
 /// than its quota delivers in [`COLUMN_ANSWER_WINDOW`] ([`RpcLimits::column_answer_sidecars`]:
 /// 512 + 5 s / 5 ms = 1,512 by default), so a paced answer is never cut by the requester's
 /// deadline. `Goodbye` has no quota: its one response chunk ends the connection.
+/// A Status read fresh reserves its token on arrival ([`super::inbound::STATUS_ANSWER_SLACK`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateLimits {
     /// `Status`: 5 at once, then one per 2 s.
