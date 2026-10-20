@@ -2840,6 +2840,41 @@ mod tests {
         (stored, request)
     }
 
+    /// All 128 columns of one 21-blob Fulu block, by root: the largest sidecars of a network of
+    /// at most 21 blobs a block (45,380 bytes each), their cells random so nothing compresses.
+    fn one_full_fulu_block() -> (Vec<crate::rpc::columns::ServedColumn>, Request) {
+        use p2p_wire::rpc::messages::{DataColumnsByRootIdentifier, DataColumnsByRootV1Request};
+        use tree_hash::TreeHash;
+        let slot = 7;
+        let stored: Vec<_> = (0..128u64)
+            .map(|index| {
+                let cells: Vec<_> = big_sidecar(slot, index, 21)
+                    .column
+                    .iter()
+                    .cloned()
+                    .collect();
+                let mut sidecar = testkit::fulu_sidecar::<E>(slot, index);
+                sidecar.column = cells.try_into().unwrap();
+                sidecar.kzg_commitments = vec![[0xcc; 48]; 21].try_into().unwrap();
+                sidecar.kzg_proofs = vec![[0xbb; 48]; 21].try_into().unwrap();
+                crate::rpc::columns::ServedColumn {
+                    context: testkit::FULU_DIGEST,
+                    fork: network_config::ForkName::Fulu,
+                    slot,
+                    block_root: sidecar.signed_block_header.message.tree_hash_root().0,
+                    ssz: sidecar.as_ssz_bytes(),
+                }
+            })
+            .collect();
+        let id = DataColumnsByRootIdentifier {
+            block_root: stored[0].block_root.into(),
+            columns: (0..128u64).collect::<Vec<_>>().try_into().unwrap(),
+        };
+        let request =
+            Request::DataColumnsByRoot(DataColumnsByRootV1Request(vec![id].try_into().unwrap()));
+        (stored, request)
+    }
+
     /// Serves [`one_full_block`] to `peer` from `limiter` as [`crate::rpc::inbound::Control`]
     /// does, its lookup taking `lookup_takes` and its writer starting `delay` after that, to a
     /// requester reading at the answer's pace. The lookup's chunks and the requester's.
@@ -2861,6 +2896,18 @@ mod tests {
         delay: Duration,
         reader: impl FnOnce() -> SteadyReader,
     ) -> (Vec<ResponseChunk<E>>, Vec<ResponseChunk<E>>) {
+        serve_full_block_to(limiter, peer, lookup_takes, delay, reader, one_full_block()).await
+    }
+
+    /// [`serve_one_full_block_to`] with the sidecars and the request of `block`.
+    async fn serve_full_block_to(
+        limiter: &crate::rpc::limits::SharedLimiter,
+        peer: libp2p::PeerId,
+        lookup_takes: Duration,
+        delay: Duration,
+        reader: impl FnOnce() -> SteadyReader,
+        block: (Vec<crate::rpc::columns::ServedColumn>, Request),
+    ) -> (Vec<ResponseChunk<E>>, Vec<ResponseChunk<E>>) {
         use crate::rpc::columns::{
             lookup_cost, AnswerBudget, ColumnLookup, ColumnReply, Requested,
         };
@@ -2869,7 +2916,7 @@ mod tests {
             BookedChunks, ColumnDeadlines, ColumnPlaces, COLUMN_ANSWER_WINDOW,
             COLUMN_WRITE_DEADLINE, MAX_COLUMN_RESPONSE_BYTES,
         };
-        let (stored, request) = one_full_block();
+        let (stored, request) = block;
         let requested = Requested::of(&request).unwrap();
         let contexts = testkit::column_context_table();
         let metrics = RpcMetrics::register(&mut prometheus_client::registry::Registry::default());
@@ -2986,6 +3033,74 @@ mod tests {
             start + period,
             "the lookup's one token kept, the rest back"
         );
+    }
+
+    /// A column quota the load check accepts serves the largest first block whole with an
+    /// instant lookup, with no burst to spend: a period 100 µs shorter than the longest it
+    /// accepts (about 47.03 ms, so the 128th token comes 5.96 s after the first) and the
+    /// block's 128 Fulu 21-blob sidecars reach a requester reading at the answer's pace 13 ms
+    /// before the 6 s hold ends. One token per 47.2 ms, which a check of the token times alone accepted,
+    /// is refused at load, and its block is refused `3: ResourceUnavailable` at the hold.
+    #[tokio::test(start_paused = true)]
+    async fn a_quota_the_load_check_accepts_serves_a_full_first_block_after_an_instant_lookup() {
+        use crate::rpc::limits::{
+            largest_column_sidecar, RpcLimits, COLUMN_ANSWER_WINDOW, COLUMN_WRITE_DEADLINE,
+            MAX_COLUMN_RESPONSE_BYTES,
+        };
+        use consensus_types::caps::NetworkCaps;
+        use p2p_wire::rpc::codec::max_response_chunk_len;
+        let network = NetworkCaps::from_blob_schedule(21, &[]);
+        let largest = largest_column_sidecar::<E>(&network);
+        let block = one_full_fulu_block();
+        assert!(block.0.iter().all(|s| s.ssz.len() == largest));
+        let on_wire = {
+            let window = COLUMN_ANSWER_WINDOW.as_nanos();
+            let bytes = max_response_chunk_len(largest) as u128;
+            Duration::from_nanos((window * bytes / MAX_COLUMN_RESPONSE_BYTES as u128) as u64)
+        };
+        let slowest = (COLUMN_ANSWER_WINDOW + COLUMN_WRITE_DEADLINE - on_wire) / 127;
+        let by_root = |period| RpcLimits {
+            rate: RateLimits {
+                data_columns_by_root: Quota::new(1, period),
+                ..RateLimits::default()
+            },
+            ..RpcLimits::default()
+        };
+        let steady = || SteadyReader::new(at_the_answer_pace(), Duration::from_millis(10));
+        let inside = by_root(slowest - Duration::from_micros(100));
+        assert_eq!(inside.validate::<E>(&network), Ok(()));
+        let limiter = shared_limiter(inside.rate);
+        let peer = libp2p::PeerId::random();
+        let (looked_up, read) = serve_full_block_to(
+            &limiter,
+            peer,
+            Duration::ZERO,
+            Duration::ZERO,
+            steady,
+            block.clone(),
+        )
+        .await;
+        assert_eq!(looked_up.len(), 128);
+        assert_eq!(read, looked_up);
+        let past = by_root(Duration::from_micros(47_200));
+        assert!(past.validate::<E>(&network).is_err());
+        let limiter = shared_limiter(past.rate);
+        let peer = libp2p::PeerId::random();
+        let (looked_up, read) = serve_full_block_to(
+            &limiter,
+            peer,
+            Duration::ZERO,
+            Duration::ZERO,
+            steady,
+            block,
+        )
+        .await;
+        assert!(
+            unavailable(&looked_up),
+            "{} chunks looked up",
+            looked_up.len()
+        );
+        assert!(unavailable(&read), "{} chunks read", read.len());
     }
 
     /// Only an answer of sidecars is refused past the hold: an error answer (the lookup's

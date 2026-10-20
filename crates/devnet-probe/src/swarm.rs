@@ -101,8 +101,8 @@ pub struct Gossip {
 ///
 /// # Errors
 ///
-/// The req/resp limits were refused ([`RpcLimits::validate`]), or the swarm could not be built
-/// or could not listen.
+/// The req/resp limits were refused for the devnet's blob schedule ([`RpcLimits::validate`]),
+/// or the swarm could not be built or could not listen.
 pub fn serving_swarm<E: EthSpec>(
     devnet: &Devnet,
     key: Keypair,
@@ -111,7 +111,7 @@ pub fn serving_swarm<E: EthSpec>(
     gossip: Option<Gossip>,
 ) -> Result<Swarm<SpecBehaviour<E>>, String> {
     plan.limits
-        .validate()
+        .validate::<E>(&NetworkCaps::from_config(devnet.config()))
         .map_err(|e| format!("req/resp limits: {e}"))?;
     let mut registry = Registry::default();
     let transport = TransportMetrics::register(&mut registry);
