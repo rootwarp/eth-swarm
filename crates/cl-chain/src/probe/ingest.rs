@@ -16,11 +16,16 @@
 //! 2. **The local checks** of the storage contract: structure, subnet, custody, and forward only
 //!    ([`super::column`]). A column before `cgc_set_slot` is dropped as `before_cgc_set_slot`:
 //!    nothing is backfilled.
-//! 3. **The root** (`probe::root_wait`). A column whose block root the reference view has not
-//!    cached joins its root's entry: the first column of the root asks the reference once, at
-//!    its turn of the first-ask budget ([`IngestLimits::first_asks_per_sec`]), and the others
-//!    share the answer. A root the reference knows needs nothing more, and its block goes to the
-//!    storage contract, which so never looks it up again. A root not known yet is seated in the
+//! 3. **The root** (`probe::root_wait`). A column whose block root the reference view has
+//!    cached goes on at once. A column of a root the reference announced on its `block` event
+//!    stream ([`ColumnIngest::follow_head`], `probe::head`) shares that root's lookup in places
+//!    of its own, with no turn in the first-ask budget and no place in the root wait, at most
+//!    [`IngestLimits::max_announced_columns`] such columns at once, asking again while the
+//!    announcement lives. Any other column, or one past those bounds, joins its root's entry:
+//!    the first column of the root asks the reference once, at its turn of the first-ask
+//!    budget ([`IngestLimits::first_asks_per_sec`]), and the others share the answer. A root
+//!    the reference knows needs nothing more, and its block goes to the storage contract,
+//!    which so never looks it up again. A root not known yet is seated in the
 //!    wait (`gloas/p2p-interface.md` L1322–1324: "MAY be queued until block is retrieved"): one
 //!    retry per [`IngestLimits::root_retry`] for all its columns, from a budget of its own
 //!    ([`IngestLimits::retries_per_sec`]), for at most [`IngestLimits::root_wait`] from the
@@ -32,7 +37,8 @@
 //!    roots, and [`MAX_CANDIDATES_PER_INDEX`](super::MAX_CANDIDATES_PER_INDEX) per index of a
 //!    root; a column past a cap is dropped as `root_wait_full`, so columns of made-up roots never
 //!    fill the queue ([`IngestLimits::validate`]). A flood of fresh made-up roots still dilutes
-//!    the first-ask budget: see the residual risk in `probe::root_wait`.
+//!    the first-ask budget for the roots not announced: see the residual risk in
+//!    `probe::root_wait`.
 //! 4. **The copy budget** ([`IngestLimits::max_copy_bytes`]). Before the storage contract, the
 //!    column charges the copies it is about to make: its cells for cl-verify and their
 //!    encoding, and its SSZ for the write. The SSZ copy stays charged until the column is
@@ -81,11 +87,12 @@
 //! ([`ColumnWriter::prune_finalized`], [`ColumnWriter::prune_orphaned`]).
 
 use super::column::{local_check, vouched_contract, ColumnContract, ColumnMetrics, Drop};
+use super::head::{follow_head, HeadFollow, HeadSource};
 use super::root_wait::{Answer, RootWaits};
 use super::{BlockApi, GossipColumn, RefBlock, RefError, RefLimits, RefView, ReferenceApi, Root};
 use crate::da::custody::Custody;
 use crate::verify::client::{Held, KzgVerifier};
-use cl_chain_columns::{BlockLink, Column, ColumnReader, ColumnWriter, WriteReport};
+use cl_chain_columns::{BlockLink, Column, ColumnReader, ColumnWriter, WriteFailed, WriteReport};
 use consensus_types::primitives::Slot;
 use consensus_types::{gloas, EthSpec};
 use ethswarm_proto::common::Verdict;
@@ -134,9 +141,25 @@ pub const DEFAULT_FIRST_ASKS_PER_SEC: u32 = 32;
 pub const DEFAULT_FIRST_ASK_BURST: u32 = 16;
 
 /// Retries of seated roots a second \[est\]: exactly a retry of every seat every
-/// [`DEFAULT_ROOT_RETRY`] (16 / 0.5 s), the least [`IngestLimits::validate`] allows. With the
-/// first asks, the reference sees at most 64 lookups, 128 requests, a second from the store.
+/// [`DEFAULT_ROOT_RETRY`] (16 / 0.5 s), the least [`IngestLimits::validate`] allows.
+///
+/// What the root wait asks of the reference with the defaults, in three separate bounds:
+/// - **Sustained rate:** 32 first asks and 32 retries a second, 64 lookups, so at most 128
+///   requests a second (a header, and the block for a root it finds).
+/// - **Burst:** after a quiet spell, up to [`DEFAULT_FIRST_ASK_BURST`] first asks go out at
+///   once on top of that rate. Retries do not burst: a seat asks again once per root retry.
+/// - **Concurrency:** at most 96 lookups in flight at once, the seats' 16 retries and 80 first
+///   asks within the 2 s lookup timeout ([`IngestLimits::validate_for`]), within the reference
+///   view's `max_in_flight`.
+///
+/// The head seed adds a lookup per block the reference announces, in places of its own.
 pub const DEFAULT_RETRIES_PER_SEC: u32 = 32;
+
+/// Columns waiting on the lookups of announced roots at once \[est\]: a quarter of a block at
+/// full custody. A root is usually cached before its columns arrive, so few ever wait; the cap
+/// keeps forged columns of an announced root out of the places of known roots, and with the
+/// root wait's caps it leaves 96 of the default queue's places to them.
+pub const DEFAULT_MAX_ANNOUNCED_COLUMNS: usize = 32;
 
 /// How long a root whose wait ran out, or that the reference refused, is remembered \[est\]:
 /// one [`DEFAULT_ROOT_WAIT`], so a peer resending columns of a made-up root costs no request
@@ -192,6 +215,9 @@ pub struct IngestLimits {
     pub first_ask_burst: u32,
     /// Retries of seated roots a second: at least a retry of every seat every `root_retry`.
     pub retries_per_sec: u32,
+    /// Columns waiting on the lookups of announced roots at once, over every root. A column
+    /// past it takes the root wait, with its caps.
+    pub max_announced_columns: usize,
 }
 
 impl Default for IngestLimits {
@@ -212,6 +238,7 @@ impl Default for IngestLimits {
             first_asks_per_sec: DEFAULT_FIRST_ASKS_PER_SEC,
             first_ask_burst: DEFAULT_FIRST_ASK_BURST,
             retries_per_sec: DEFAULT_RETRIES_PER_SEC,
+            max_announced_columns: DEFAULT_MAX_ANNOUNCED_COLUMNS,
         }
     }
 }
@@ -234,25 +261,29 @@ pub enum LimitsError {
         max_waiting_roots: usize,
         root_retry: Duration,
     },
-    /// The reference view's lookups in flight cannot exceed the seats: the seated roots'
-    /// retries, in flight together against a slow reference, would take every place, and a
-    /// first ask for a known root would find none.
+    /// The reference view has fewer lookup places than the lookups the root wait can hold in
+    /// flight at once: a retry of every seat and every first ask still waiting on a slow
+    /// reference ([`IngestLimits::first_asks_in_flight`]). A first ask for a known root could
+    /// then find every place taken.
     #[error(
-        "the reference view's max_in_flight {max_in_flight} must be above max_waiting_roots \
-         {max_waiting_roots}"
+        "the reference view's max_in_flight {max_in_flight} must be at least max_waiting_roots \
+         {max_waiting_roots} + first asks in flight {first_asks_in_flight}"
     )]
-    SeatsFillTheReference {
+    LookupPlacesShort {
         max_in_flight: usize,
         max_waiting_roots: usize,
+        first_asks_in_flight: usize,
     },
-    /// The root wait could hold every queue place, leaving none for columns of known roots.
+    /// The root wait and the announced lookups could hold every queue place, leaving none for
+    /// columns of known roots.
     #[error(
-        "max_waiting_columns {waiting} + max_asking_columns {asking} must stay below max_items \
-         {max_items}"
+        "max_waiting_columns {waiting} + max_asking_columns {asking} + max_announced_columns \
+         {announced} must stay below max_items {max_items}"
     )]
     WaitsFillTheQueue {
         waiting: usize,
         asking: usize,
+        announced: usize,
         max_items: usize,
     },
 }
@@ -288,29 +319,51 @@ impl IngestLimits {
         }
         let waits = self
             .max_waiting_columns
-            .saturating_add(self.max_asking_columns);
+            .saturating_add(self.max_asking_columns)
+            .saturating_add(self.max_announced_columns);
         if waits >= self.max_items {
             return Err(LimitsError::WaitsFillTheQueue {
                 waiting: self.max_waiting_columns,
                 asking: self.max_asking_columns,
+                announced: self.max_announced_columns,
                 max_items: self.max_items,
             });
         }
         Ok(())
     }
 
-    /// [`Self::validate`], and that the reference view's lookups in flight (`refs`) exceed the
-    /// seats, so the seated roots' retries never take every place a first ask needs.
+    /// First asks that can be in flight at once against a reference view whose lookups end
+    /// within `timeout`: `first_ask_burst`, and one turn per first-ask interval through the
+    /// whole timeout, rounded up. The first-ask budget books turns by the generic cell rate
+    /// algorithm, so any `timeout` of time holds at most that many turns, and a first ask that
+    /// found no place asked nothing and holds none.
+    #[must_use]
+    pub fn first_asks_in_flight(&self, timeout: Duration) -> usize {
+        // Integer math: ceil(first_asks_per_sec × timeout), in nanoseconds.
+        let turns =
+            (u128::from(self.first_asks_per_sec) * timeout.as_nanos()).div_ceil(1_000_000_000);
+        let burst = usize::try_from(self.first_ask_burst).unwrap_or(usize::MAX);
+        usize::try_from(turns)
+            .unwrap_or(usize::MAX)
+            .saturating_add(burst)
+    }
+
+    /// [`Self::validate`], and that the reference view's lookup places (`refs`) cover every
+    /// lookup the root wait can hold in flight at once: a retry of each seat (one at a time per
+    /// seat) and [`Self::first_asks_in_flight`] for the view's timeout. So retries and first
+    /// asks that all hang on a slow reference never take the place of a first ask.
     ///
     /// # Errors
     ///
     /// [`LimitsError`]: the first limit that does not hold.
     pub fn validate_for(&self, refs: &RefLimits) -> Result<(), LimitsError> {
         self.validate()?;
-        if refs.max_in_flight <= self.max_waiting_roots {
-            return Err(LimitsError::SeatsFillTheReference {
+        let first_asks_in_flight = self.first_asks_in_flight(refs.timeout);
+        if refs.max_in_flight < self.max_waiting_roots.saturating_add(first_asks_in_flight) {
+            return Err(LimitsError::LookupPlacesShort {
                 max_in_flight: refs.max_in_flight,
                 max_waiting_roots: self.max_waiting_roots,
+                first_asks_in_flight,
             });
         }
         Ok(())
@@ -607,7 +660,7 @@ enum Job {
 
 /// What a column's task works with.
 struct Shared<A, E, V, S, C> {
-    refs: RefView<A, E>,
+    refs: Arc<RefView<A, E>>,
     custody: Custody<S, C>,
     contract: ColumnContract<V>,
     waits: RootWaits,
@@ -671,7 +724,7 @@ where
             })?;
         Ok(Self {
             shared: Arc::new(Shared {
-                refs,
+                refs: Arc::new(refs),
                 custody,
                 contract,
                 waits: RootWaits::new(limits),
@@ -694,6 +747,24 @@ where
     #[cfg(test)]
     pub(crate) fn refs_in_flight(&self) -> usize {
         self.shared.refs.in_flight()
+    }
+
+    /// Whether the reference view has cached `root`.
+    #[cfg(test)]
+    pub(crate) fn refs_cached(&self, root: &Root) -> bool {
+        self.shared.refs.cached_block(root).is_some()
+    }
+
+    /// Follows the reference's head from `source` ([`follow_head`]) on a task of this store,
+    /// until the store is dropped: each root the reference announces is looked up ahead of its
+    /// columns, in places of its own. Must be called within a tokio runtime.
+    pub fn follow_head<H>(&self, source: H, config: HeadFollow)
+    where
+        H: HeadSource + 'static,
+    {
+        let refs = Arc::clone(&self.shared.refs);
+        let mut tasks = self.tasks.lock().unwrap_or_else(PoisonError::into_inner);
+        tasks.spawn(follow_head(source, refs, config));
     }
 
     /// Takes a column sidecar from gossip; see the module docs. The verdict is always
@@ -814,33 +885,12 @@ where
             return;
         }
         let root = column.sidecar.beacon_block_root.0;
-        // A root the reference already vouched for needs no wait and no place in one. The
-        // block is handed to the contract, so it is never looked up twice.
-        let block = match self.refs.cached_block(&root) {
-            Some(block) => block,
-            None => {
-                let lookup = || async {
-                    match self.refs.lookup(root).await {
-                        Ok(block) => Answer::Known(block),
-                        // The reference names the root but its block does not establish it.
-                        Err(RefError::Block(_)) => Answer::Refused,
-                        // Not asked: every lookup place is taken.
-                        Err(RefError::Busy(_)) => Answer::Busy,
-                        // Not known yet, or the reference is slow or busy: ask again.
-                        Err(e) => {
-                            tracing::trace!(error = %e, "column root not known yet");
-                            Answer::Retry
-                        }
-                    }
-                };
-                let index = column.sidecar.index;
-                match self.waits.wait(root, index, arrived, lookup).await {
-                    Ok(block) => block,
-                    Err(reason) => {
-                        metrics.drop_column(&column, reason);
-                        return;
-                    }
-                }
+        let index = column.sidecar.index;
+        let block = match vouched_block(&self.refs, &self.waits, root, index, arrived).await {
+            Ok(block) => block,
+            Err(reason) => {
+                metrics.drop_column(&column, reason);
+                return;
             }
         };
         // Charged before the copies exist: the contract copies the cells for cl-verify, and
@@ -877,6 +927,77 @@ where
             metrics.drop_column(&column, Drop::StoreFailed);
         }
     }
+}
+
+/// Step 3 of the module docs: the block the reference vouches for as `root`, for the column
+/// `index` that arrived at `arrived`.
+/// - A root the reference view has cached needs no wait and no place in one, and its block goes
+///   to the contract, so it is never looked up twice.
+/// - A root with a live announcement shares its lookup in the announced places, with no
+///   first-ask turn and no place in the root wait, if fewer than
+///   [`IngestLimits::max_announced_columns`] columns wait so. A round without an answer is
+///   asked again once per [`IngestLimits::root_retry`], or at once when the root is cached,
+///   while the announcement lives and the wait lasts.
+/// - Any other root, or an announced one past those bounds, waits in `waits`.
+async fn vouched_block<A, E>(
+    refs: &RefView<A, E>,
+    waits: &RootWaits,
+    root: Root,
+    index: u64,
+    arrived: Instant,
+) -> Result<Arc<RefBlock>, Drop>
+where
+    A: ReferenceApi + BlockApi,
+    E: EthSpec,
+{
+    if let Some(block) = refs.cached_block(&root) {
+        return Ok(block);
+    }
+    // A place among the columns waiting on announced lookups, taken only for a root with a
+    // live announcement, and held while the column asks.
+    let limits = waits.limits();
+    let deadline = arrived + limits.root_wait;
+    if refs.is_announced(&root) {
+        if let Some(_place) = waits.hold_announced() {
+            // `None` once the announcement is spent or past its life: the root wait.
+            loop {
+                let ask = tokio::time::timeout_at(deadline, refs.lookup_announced(root));
+                let e = match ask.await {
+                    Err(_) => return Err(Drop::RootTimeout),
+                    Ok(None) => break,
+                    Ok(Some(Ok(block))) => return Ok(block),
+                    Ok(Some(Err(e))) => e,
+                };
+                tracing::debug!(error = %e, "announced root not looked up yet");
+                let next = Instant::now() + limits.root_retry;
+                if next >= deadline {
+                    break;
+                }
+                tokio::select! {
+                    () = tokio::time::sleep_until(next) => {}
+                    () = refs.until_cached(root) => {}
+                }
+            }
+        }
+    }
+    let lookup = || async {
+        match refs.lookup(root).await {
+            Ok(block) => Answer::Known(block),
+            // The reference names the root but its block does not establish it.
+            Err(RefError::Block(_)) => Answer::Refused,
+            // Not asked: every lookup place is taken.
+            Err(RefError::Busy(_)) => Answer::Busy,
+            // Not known yet, or the reference is slow or busy: ask again.
+            Err(e) => {
+                tracing::trace!(error = %e, "column root not known yet");
+                Answer::Retry
+            }
+        }
+    };
+    let cached = refs.until_cached(root);
+    waits
+        .wait_or_cached(root, index, arrived, cached, lookup)
+        .await
 }
 
 impl<A, E, V, S, C> Shared<A, E, V, S, C>
@@ -921,14 +1042,14 @@ where
 
 /// Where the writer thread stores columns: the column env.
 trait ColumnSink {
-    /// [`ColumnWriter::write_block_columns`].
+    /// [`ColumnWriter::write_block_columns_partial`]: on a failure, what was committed first.
     fn write_block_columns(
         &self,
         slot: Slot,
         root: &Root,
         link: BlockLink,
         columns: &[Column<'_>],
-    ) -> cl_chain_columns::Result<WriteReport>;
+    ) -> Result<WriteReport, WriteFailed>;
 
     /// [`ColumnWriter::settle_pending`].
     fn settle_pending(&self, before_slot: Slot) -> cl_chain_columns::Result<usize>;
@@ -941,8 +1062,8 @@ impl ColumnSink for ColumnWriter {
         root: &Root,
         link: BlockLink,
         columns: &[Column<'_>],
-    ) -> cl_chain_columns::Result<WriteReport> {
-        ColumnWriter::write_block_columns(self, slot, root, link, columns)
+    ) -> Result<WriteReport, WriteFailed> {
+        ColumnWriter::write_block_columns_partial(self, slot, root, link, columns)
     }
 
     fn settle_pending(&self, before_slot: Slot) -> cl_chain_columns::Result<usize> {
@@ -1010,8 +1131,10 @@ fn run_writer(
 /// between two of its transactions. Columns of a block that verify later come in a later batch;
 /// once the block was pruned as an orphan, the column env refuses them
 /// ([`cl_chain_columns::Error::RootOrphaned`], counted as `store_failed`), so no batch brings an
-/// orphan back with some of its columns. A column that arrived twice is written once. Each
-/// column gives its queue place back once written or dropped.
+/// orphan back with some of its columns. A call that fails partway leaves the transactions
+/// before the failed one committed: those columns count as stored, the rest as `store_failed`.
+/// A column that arrived twice is written once. Each column gives its queue place back once
+/// written or dropped.
 fn write_batch(
     writer: &impl ColumnSink,
     batch: Vec<Write>,
@@ -1043,18 +1166,23 @@ fn write_batch(
             .unwrap_or(BlockLink::Gap);
         highest = highest.max(Some(slot));
         match writer.write_block_columns(slot, &root, link, &ssz) {
-            Ok(_) => {
-                metrics.stored.inc_by(ssz.len() as u64);
+            Ok(report) => {
+                metrics.stored.inc_by(report.columns as u64);
             }
-            Err(e) => {
+            Err(failed) => {
+                // The transactions before the failed one stay committed: their columns are
+                // stored, and only the rest is dropped.
+                let committed = failed.committed.columns.min(ssz.len());
+                metrics.stored.inc_by(committed as u64);
                 tracing::warn!(
-                    error = %e,
+                    error = %failed.error,
                     slot,
                     root = %hex::encode(root),
-                    columns = ssz.len(),
+                    committed,
+                    dropped = ssz.len() - committed,
                     "column write failed: column sidecars dropped"
                 );
-                for _ in &ssz {
+                for _ in committed..ssz.len() {
                     dropped.count(Drop::StoreFailed);
                 }
             }
@@ -1065,7 +1193,10 @@ fn write_batch(
 
 #[cfg(test)]
 mod tests {
+    use super::super::fake::Silent;
+    use super::super::DEFAULT_API_TIMEOUT;
     use super::*;
+    use cl_chain_columns::MAX_COLUMNS_PER_TXN;
 
     fn metrics() -> (ColumnMetrics, QueueMetrics) {
         (ColumnMetrics::default(), QueueMetrics::default())
@@ -1127,8 +1258,10 @@ mod tests {
             root: &Root,
             link: BlockLink,
             columns: &[Column<'_>],
-        ) -> cl_chain_columns::Result<WriteReport> {
-            let written = self.writer.write_block_columns(slot, root, link, columns);
+        ) -> Result<WriteReport, WriteFailed> {
+            let written = self
+                .writer
+                .write_block_columns_partial(slot, root, link, columns);
             self.calls.set(self.calls.get() + 1);
             self.writer.prune_orphaned(&[self.orphan]).unwrap();
             written
@@ -1161,8 +1294,9 @@ mod tests {
             root: &Root,
             link: BlockLink,
             columns: &[Column<'_>],
-        ) -> cl_chain_columns::Result<WriteReport> {
-            self.writer.write_block_columns(slot, root, link, columns)
+        ) -> Result<WriteReport, WriteFailed> {
+            self.writer
+                .write_block_columns_partial(slot, root, link, columns)
         }
 
         fn settle_pending(&self, before_slot: Slot) -> cl_chain_columns::Result<usize> {
@@ -1287,6 +1421,50 @@ mod tests {
         assert_eq!(queue.lock().items, 0);
     }
 
+    /// A column env that commits the first transaction of a block's columns, then fails.
+    struct FailsAfterOneTxn<'a>(&'a ColumnWriter);
+
+    impl ColumnSink for FailsAfterOneTxn<'_> {
+        fn write_block_columns(
+            &self,
+            slot: Slot,
+            root: &Root,
+            link: BlockLink,
+            columns: &[Column<'_>],
+        ) -> Result<WriteReport, WriteFailed> {
+            let first = &columns[..columns.len().min(MAX_COLUMNS_PER_TXN)];
+            let committed = self
+                .0
+                .write_block_columns_partial(slot, root, link, first)?;
+            if committed.columns == columns.len() {
+                return Ok(committed);
+            }
+            Err(WriteFailed {
+                committed,
+                error: cl_chain_columns::Error::MapFull,
+            })
+        }
+
+        fn settle_pending(&self, before_slot: Slot) -> cl_chain_columns::Result<usize> {
+            self.0.settle_pending(before_slot)
+        }
+    }
+
+    #[test]
+    fn a_write_that_fails_partway_counts_what_it_committed_as_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let queue = queue(IngestLimits::default());
+        let (dropped, metrics) = metrics();
+        let batch: Vec<_> = (0..20).map(|i| write(&queue, 9, [1; 32], i)).collect();
+        write_batch(&FailsAfterOneTxn(&writer), batch, &dropped, &metrics);
+        let stored = writer.reader().columns_for_root(&[1; 32]).unwrap().len();
+        assert_eq!(stored, MAX_COLUMNS_PER_TXN);
+        assert_eq!(metrics.stored(), 16, "the first transaction's columns");
+        assert_eq!(dropped.dropped(Drop::StoreFailed), 4, "the rest only");
+        assert_eq!(queue.lock().items, 0);
+    }
+
     #[test]
     fn a_later_batch_cannot_bring_back_a_pruned_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -1347,25 +1525,414 @@ mod tests {
         );
         assert!(with(|l| l.max_waiting_roots += 1).is_err());
         assert_eq!(with(|l| l.root_retry = Duration::from_secs(1)), Ok(()));
-        // The reference view must have places past the seats.
+        // The reference view must have a place for every seat's retry and every first ask that
+        // can be in flight at once: the burst, and a turn per interval through the timeout.
         let refs = RefLimits::default();
+        assert_eq!(defaults.first_asks_in_flight(refs.timeout), 16 + 32 * 2);
         assert_eq!(defaults.validate_for(&refs), Ok(()));
+        let needed = defaults.max_waiting_roots + defaults.first_asks_in_flight(refs.timeout);
+        let exact = RefLimits {
+            max_in_flight: needed,
+            ..refs
+        };
+        assert_eq!(defaults.validate_for(&exact), Ok(()));
         let tight = RefLimits {
-            max_in_flight: defaults.max_waiting_roots,
+            max_in_flight: needed - 1,
             ..refs
         };
         let err = defaults.validate_for(&tight).unwrap_err();
-        assert!(
-            matches!(err, LimitsError::SeatsFillTheReference { .. }),
-            "{err}"
+        assert_eq!(
+            err,
+            LimitsError::LookupPlacesShort {
+                max_in_flight: needed - 1,
+                max_waiting_roots: 16,
+                first_asks_in_flight: 80,
+            }
         );
+        // A slower reference holds each first ask longer: more places.
+        let slow = RefLimits {
+            timeout: Duration::from_millis(2500),
+            ..refs
+        };
+        assert_eq!(defaults.first_asks_in_flight(slow.timeout), 16 + 80);
+        assert!(defaults.validate_for(&slow).is_err());
+        // A rate that does not divide the timeout is rounded up.
+        let odd = IngestLimits {
+            first_asks_per_sec: 3,
+            ..defaults
+        };
+        assert_eq!(odd.first_asks_in_flight(Duration::from_millis(500)), 16 + 2);
         assert!(with(|l| l.root_wait = Duration::ZERO).is_err());
+        // The columns waiting on announced lookups count against the queue too.
+        let announced = with(|l| l.max_announced_columns = 128);
+        assert!(
+            matches!(announced, Err(LimitsError::WaitsFillTheQueue { .. })),
+            "{announced:?}"
+        );
         let full = with(|l| l.max_asking_columns = 320);
         assert!(
             matches!(full, Err(LimitsError::WaitsFillTheQueue { .. })),
             "{full:?}"
         );
         assert!(full.unwrap_err().to_string().contains("below max_items"));
+    }
+
+    type SilentView = RefView<Arc<Silent>, crate::testing::Spec>;
+
+    /// A made-up block root: `i` in its first bytes.
+    fn fake_root(i: u32) -> Root {
+        let mut root = [0xf0; 32];
+        root[..4].copy_from_slice(&i.to_be_bytes());
+        root
+    }
+
+    /// The root step of a column of `root` arriving now, on a task of its own.
+    fn column_of(
+        refs: &Arc<SilentView>,
+        waits: &Arc<RootWaits>,
+        root: Root,
+    ) -> tokio::task::JoinHandle<Result<Root, Drop>> {
+        let (refs, waits) = (Arc::clone(refs), Arc::clone(waits));
+        tokio::spawn(async move {
+            let block = vouched_block(&refs, &waits, root, 1, Instant::now()).await?;
+            Ok(block.root)
+        })
+    }
+
+    /// The lookup places under the heaviest mix of the root wait: every seat retrying, and a
+    /// first-ask burst after a quiet spell, then the full first-ask rate, all hanging on a
+    /// silent reference. A known root's first ask comes at the turn that makes the most
+    /// lookups in flight. Returns the lookups in flight just before that turn, the busy
+    /// refusals, and how the known root's column ended.
+    async fn heaviest_mix(max_in_flight: usize) -> (usize, u64, Result<Root, Drop>) {
+        // Retries one after another, a lookup timeout that is no whole number of first-ask
+        // intervals (so no turn starts as a lookup ends), and a wait that outlasts the test.
+        let limits = IngestLimits {
+            root_wait: Duration::from_secs(20),
+            root_retry: Duration::from_millis(10),
+            retries_per_sec: 1600,
+            ..IngestLimits::default()
+        };
+        let ref_limits = RefLimits {
+            timeout: Duration::from_millis(2010),
+            max_in_flight,
+            ..RefLimits::default()
+        };
+        let reference = Arc::new(Silent::default());
+        let refs = Arc::new(SilentView::new(
+            Arc::clone(&reference),
+            crate::testing::schedule(),
+            ref_limits,
+        ));
+        let waits = Arc::new(RootWaits::new(limits));
+        let start = Instant::now();
+        // A burst of made-up roots: their first asks time out at 2.01 s, and they take every
+        // seat, retrying from 2.02 s with no pause but the 10 ms between retries.
+        let mut fakes: Vec<_> = (0..16)
+            .map(|i| column_of(&refs, &waits, fake_root(i)))
+            .collect();
+        // Quiet until then: the first-ask burst is whole again. Then a burst, and a turn every
+        // 31.25 ms: 16 at 2.02 s, the 64th turn after them at 4.02 s, before any of them ends.
+        tokio::time::sleep_until(start + Duration::from_millis(2020)).await;
+        fakes.extend((16..96).map(|i| column_of(&refs, &waits, fake_root(i))));
+        let root = reference.serve(9);
+        let known = column_of(&refs, &waits, root);
+        tokio::time::sleep_until(start + Duration::from_millis(4019)).await;
+        assert_eq!(
+            waits.roots(),
+            limits.max_waiting_roots,
+            "every seat retries"
+        );
+        let in_flight = refs.in_flight();
+        let known = known.await.unwrap();
+        for fake in fakes {
+            fake.abort();
+        }
+        (in_flight, refs.busy(), known)
+    }
+
+    /// The Medium finding of the lookup places: the places that `validate_for` requires hold
+    /// the heaviest mix, and one place fewer than that mix needs starves a known root's first
+    /// ask into `Busy`.
+    #[tokio::test(start_paused = true)]
+    async fn a_known_roots_first_ask_finds_a_place_while_retries_and_first_asks_hang() {
+        // 16 seats, and the burst of 16 with 32 a second over 2.01 s, rounded up: 65.
+        let limits = IngestLimits::default();
+        let needed =
+            limits.max_waiting_roots + limits.first_asks_in_flight(Duration::from_millis(2010));
+        assert_eq!(needed, 16 + 16 + 65);
+        let (in_flight, busy, known) = heaviest_mix(needed).await;
+        assert_eq!(in_flight, 95, "16 retries, 16 + 63 first asks");
+        assert_eq!(known.map(|_| ()), Ok(()));
+        assert_eq!(busy, 0, "the 96th lookup found a place");
+        // 96 places hold that mix too; 95 do not.
+        assert_eq!(heaviest_mix(96).await.1, 0);
+        let (_, busy, known) = heaviest_mix(95).await;
+        assert!(
+            busy > 0,
+            "the known root's first ask found every place taken"
+        );
+        assert!(known.is_ok(), "it asks again at a later turn");
+    }
+
+    /// The acceptance of the head seed: a flood of fresh made-up roots far above the first-ask
+    /// rate delays, and then refuses, a real root the reference has not announced, but never
+    /// one it has: that root needs no first-ask turn and no asking place.
+    #[tokio::test(start_paused = true)]
+    async fn a_flood_above_the_first_ask_rate_cannot_delay_an_announced_root() {
+        let limits = IngestLimits::default();
+        let reference = Arc::new(Silent::default());
+        let refs = Arc::new(SilentView::new(
+            Arc::clone(&reference),
+            crate::testing::schedule(),
+            RefLimits::default(),
+        ));
+        let waits = Arc::new(RootWaits::new(limits));
+        // 400 made-up roots at once, more than twelve times the first-ask rate: the burst goes
+        // out, the next turns are booked through the wait, and the rest are refused.
+        let flood = 400;
+        let fakes: Vec<_> = (0..flood)
+            .map(|i| column_of(&refs, &waits, fake_root(i)))
+            .collect();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let (asking, _) = waits.columns();
+        assert!(asking > 100, "{asking} made-up roots wait for a turn");
+        let start = Instant::now();
+        // A root the reference knows but has not announced takes its turn behind the flood.
+        let unannounced = reference.serve(9);
+        let behind = column_of(&refs, &waits, unannounced);
+        // The reference announces a root: its columns are answered at once, the flood's turns
+        // and caps notwithstanding.
+        let announced = reference.serve(10);
+        refs.announce(announced);
+        for _ in 0..4 {
+            let column = column_of(&refs, &waits, announced);
+            assert_eq!(column.await.unwrap(), Ok(announced));
+            assert_eq!(start.elapsed(), Duration::ZERO, "not delayed");
+        }
+        assert_eq!(reference.asked(announced), 1, "one lookup for its columns");
+        assert_eq!(refs.busy(), 0);
+        // The root not announced is delayed by the flood, or refused.
+        match behind.await.unwrap() {
+            Ok(root) => {
+                assert_eq!(root, unannounced);
+                assert!(start.elapsed() > Duration::from_secs(1), "delayed");
+            }
+            Err(reason) => assert_eq!(reason, Drop::RootWaitFull),
+        }
+        for fake in fakes {
+            assert!(fake.await.unwrap().is_err());
+        }
+    }
+
+    /// An announced root whose first lookup timed out on a slow reference keeps its hint: a
+    /// column of it under a flood still shares a lookup in the announced places, with no
+    /// first-ask turn.
+    #[tokio::test(start_paused = true)]
+    async fn an_announced_root_whose_first_lookup_timed_out_still_skips_the_flood() {
+        let reference = Arc::new(Silent::default());
+        let refs = Arc::new(SilentView::new(
+            Arc::clone(&reference),
+            crate::testing::schedule(),
+            RefLimits::default(),
+        ));
+        let waits = Arc::new(RootWaits::new(IngestLimits::default()));
+        // Announced before the reference serves it: the follower's lookup times out.
+        let (_, ssz, root) = crate::testing::gloas_block(10, &[[1; 48]]);
+        refs.announce(root);
+        let first = refs.lookup_as_announced(root).await;
+        assert_eq!(first, Err(RefError::Timeout(DEFAULT_API_TIMEOUT)));
+        reference.blocks.lock().unwrap().insert(root, (10, ssz));
+        let fakes: Vec<_> = (0..400)
+            .map(|i| column_of(&refs, &waits, fake_root(i)))
+            .collect();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let start = Instant::now();
+        assert_eq!(column_of(&refs, &waits, root).await.unwrap(), Ok(root));
+        assert_eq!(start.elapsed(), Duration::ZERO, "not delayed");
+        assert_eq!(reference.asked(root), 2);
+        for fake in fakes {
+            fake.abort();
+        }
+    }
+
+    /// A column that booked a first-ask turn behind a flood before its root was announced does
+    /// not sleep to that turn once the announced lookup caches the root: it, and the columns
+    /// following it, go on at once, and its turn asks nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_column_waiting_for_its_turn_goes_on_once_its_root_is_cached() {
+        let reference = Arc::new(Silent::default());
+        let refs = Arc::new(SilentView::new(
+            Arc::clone(&reference),
+            crate::testing::schedule(),
+            RefLimits::default(),
+        ));
+        let waits = Arc::new(RootWaits::new(IngestLimits::default()));
+        // The burst and three seconds of turns go to made-up roots.
+        let fakes: Vec<_> = (0..112)
+            .map(|i| column_of(&refs, &waits, fake_root(i)))
+            .collect();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let root = reference.serve(9);
+        let start = Instant::now();
+        let first = column_of(&refs, &waits, root);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let follower = column_of(&refs, &waits, root);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(reference.asked(root), 0, "its turn is seconds away");
+        // The reference announces the root, and the follower of its stream caches it.
+        refs.announce(root);
+        assert_eq!(refs.lookup_as_announced(root).await.unwrap().root, root);
+        assert_eq!(first.await.unwrap(), Ok(root));
+        assert_eq!(follower.await.unwrap(), Ok(root));
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(reference.asked(root), 1, "the turn asked nothing");
+        for fake in fakes {
+            fake.abort();
+        }
+    }
+
+    /// Columns of an announced root that wait for its lookup are capped: forged columns of the
+    /// root cannot take the queue places of known roots. Past the cap, a column takes the root
+    /// wait, with its caps, and still shares the lookup in flight.
+    #[tokio::test(start_paused = true)]
+    async fn columns_waiting_on_an_announced_lookup_are_capped() {
+        let limits = IngestLimits {
+            max_announced_columns: 2,
+            ..IngestLimits::default()
+        };
+        let reference = Arc::new(Silent::default());
+        let refs = Arc::new(SilentView::new(
+            Arc::clone(&reference),
+            crate::testing::schedule(),
+            RefLimits::default(),
+        ));
+        let waits = Arc::new(RootWaits::new(limits));
+        // Announced, and the reference does not answer: every column of it waits.
+        let root = [0x99; 32];
+        refs.announce(root);
+        let columns: Vec<_> = (0..3).map(|_| column_of(&refs, &waits, root)).collect();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(waits.announced_columns(), 2);
+        assert_eq!(waits.columns(), (1, 0), "the third waits in the root wait");
+        assert_eq!(reference.asked(root), 1, "one lookup for all three");
+        for column in columns {
+            column.abort();
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(waits.announced_columns(), 0, "places given back");
+    }
+
+    /// The columns of an announced root that arrive during its first lookup, which gets no
+    /// answer, keep asking in the announced places while the hint lives: under a flood that
+    /// leaves the root wait no turn, they still get the block once the reference serves it.
+    #[tokio::test(start_paused = true)]
+    async fn columns_waiting_on_an_announced_lookup_that_times_out_ask_again() {
+        let reference = Arc::new(Silent::default());
+        let refs = Arc::new(SilentView::new(
+            Arc::clone(&reference),
+            crate::testing::schedule(),
+            RefLimits::default(),
+        ));
+        let waits = Arc::new(RootWaits::new(IngestLimits::default()));
+        let start = Instant::now();
+        let fakes: Vec<_> = (0..400)
+            .map(|i| column_of(&refs, &waits, fake_root(i)))
+            .collect();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        // Announced before the reference serves it: the follower's lookup will time out, and
+        // the root's columns arrive while it hangs.
+        let (_, ssz, root) = crate::testing::gloas_block(10, &[[1; 48]]);
+        refs.announce(root);
+        let follower = {
+            let refs = Arc::clone(&refs);
+            tokio::spawn(async move { refs.lookup_as_announced(root).await })
+        };
+        // At the same instant: every waiter on the lookup times out together.
+        let columns: Vec<_> = (0..3).map(|_| column_of(&refs, &waits, root)).collect();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        reference.blocks.lock().unwrap().insert(root, (10, ssz));
+        assert!(
+            follower.await.unwrap().is_err(),
+            "the first lookup timed out"
+        );
+        for column in columns {
+            assert_eq!(column.await.unwrap(), Ok(root));
+        }
+        // Asked again one root retry after the timeout, not at a turn behind the flood.
+        let asked_again = DEFAULT_API_TIMEOUT + DEFAULT_ROOT_RETRY;
+        assert!(
+            start.elapsed() <= asked_again + Duration::from_millis(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(reference.asked(root), 2);
+        for fake in fakes {
+            fake.abort();
+        }
+    }
+
+    /// A root whose announcement is spent, or never came (the stream is down), takes the root
+    /// wait's path as before: a first ask at its turn.
+    #[tokio::test(start_paused = true)]
+    async fn a_root_not_announced_takes_the_root_wait() {
+        let reference = Arc::new(Silent::default());
+        let refs = Arc::new(SilentView::new(
+            Arc::clone(&reference),
+            crate::testing::schedule(),
+            RefLimits::default(),
+        ));
+        let waits = Arc::new(RootWaits::new(IngestLimits::default()));
+        let known = reference.serve(9);
+        assert_eq!(column_of(&refs, &waits, known).await.unwrap(), Ok(known));
+        assert_eq!(reference.asked(known), 1);
+        assert_eq!(refs.announced(), 0);
+        // An announced root whose block does not establish it: the refusal spends the hint,
+        // and the column falls back to the root wait, whose first ask is refused too.
+        let (_, _, refused) = crate::testing::gloas_block(10, &[[1; 48]]);
+        let (_, other, _) = crate::testing::gloas_block(11, &[[1; 48]]);
+        reference
+            .blocks
+            .lock()
+            .unwrap()
+            .insert(refused, (11, other));
+        refs.announce(refused);
+        let column = column_of(&refs, &waits, refused);
+        assert_eq!(column.await.unwrap(), Err(Drop::UnknownRoot));
+        assert_eq!(
+            reference.asked(refused),
+            2,
+            "the announced round, then the first ask"
+        );
+        assert_eq!(refs.announced(), 0, "the hint is spent");
+    }
+
+    /// The asks of an announced root end with the column's wait.
+    #[tokio::test(start_paused = true)]
+    async fn the_asks_of_an_announced_root_end_with_the_wait() {
+        let reference = Arc::new(Silent::default());
+        let refs = Arc::new(SilentView::new(
+            Arc::clone(&reference),
+            crate::testing::schedule(),
+            RefLimits::default(),
+        ));
+        let waits = Arc::new(RootWaits::new(IngestLimits::default()));
+        let (_, _, never) = crate::testing::gloas_block(10, &[[1; 48]]);
+        refs.announce(never);
+        let start = Instant::now();
+        let column = column_of(&refs, &waits, never);
+        assert_eq!(column.await.unwrap(), Err(Drop::RootTimeout));
+        assert_eq!(start.elapsed(), DEFAULT_ROOT_WAIT);
+        assert_eq!(
+            reference.asked(never),
+            2,
+            "at 0 s, then at 2.5 s, cut at 4 s"
+        );
+        assert_eq!(waits.announced_columns(), 0);
     }
 
     #[test]

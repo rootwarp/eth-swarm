@@ -59,8 +59,8 @@ pub use reader::{
 #[cfg(feature = "test-hooks")]
 pub use writer::BeforeCommit;
 pub use writer::{
-    Column, ColumnWriter, PruneReport, WriteReport, MAX_COLUMNS_PER_TXN, MAX_ORPHANED_ROOTS,
-    MAX_ROWS_PER_PRUNE_TXN, MAX_SIDECAR_BYTES,
+    Column, ColumnWriter, PruneReport, WriteFailed, WriteReport, MAX_COLUMNS_PER_TXN,
+    MAX_ORPHANED_ROOTS, MAX_ROWS_PER_PRUNE_TXN, MAX_SIDECAR_BYTES,
 };
 
 /// `NUMBER_OF_COLUMNS` (Fulu `das-core.md`, unchanged in Gloas).

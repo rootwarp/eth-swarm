@@ -4,7 +4,8 @@
 //!
 //! - **cl-chain** ([`ChainSide`]): probe mode's column store ([`ColumnIngest`]: the reference
 //!   node vouches for each block root, cl-verify checks the cells by KZG, only custody columns
-//!   are kept), the column server over it ([`ColumnServer`]) and our Status
+//!   are kept, and the reference's `block` events announce its roots ahead of their columns,
+//!   [`ColumnIngest::follow_head`]), the column server over it ([`ColumnServer`]) and our Status
 //!   ([`StatusProvider`], its `earliest_available_slot` the column server's), all on
 //!   `ethswarm.chain.v1.ReqRespService` ([`ReqRespServer`] mounted by [`ChainStub::serving`]).
 //!   It is served on a Unix socket of its own, `<socket root>/cl-chain/cl-chain.sock`, bound by
@@ -36,7 +37,7 @@ use super::report::Check;
 use super::swarm::{serving_swarm, Gossip, Sources, SwarmPlan};
 use cl_chain::da::custody::{Advertise, Custody, EnrCgc, EnrError};
 use cl_chain::probe::{
-    BeaconApi, ColumnContract, ColumnIngest, ColumnMetrics, GossipColumn, IngestLimits,
+    BeaconApi, ColumnContract, ColumnIngest, ColumnMetrics, GossipColumn, HeadFollow, IngestLimits,
     QueueMetrics, RefLimits, RefView, StatusProvider, DEFAULT_API_TIMEOUT,
 };
 use cl_chain::reqresp::{ColumnServer, ColumnStore, ReqRespServer, ServeBudget, WallClock};
@@ -367,6 +368,9 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ChainSide<E, V> {
             QueueMetrics::register(registry),
         )
         .map_err(|e| format!("column ingest: {e}"))?;
+        // The reference's block events seed its view: a root it imports is looked up before its
+        // columns arrive, so a flood of made-up roots cannot delay them.
+        ingest.follow_head(plan.reference.clone(), HeadFollow::default());
         let columns = Arc::new(ColumnServer::new(
             Arc::clone(&writer) as Arc<dyn ColumnStore>,
             plan.node_id,

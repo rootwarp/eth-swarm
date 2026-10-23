@@ -4,6 +4,17 @@
 //! A column is reported IGNORE whatever happens to it, so a peer pays nothing for columns of
 //! made-up roots. What they can cost is bounded, so they cannot crowd out real columns or flood
 //! the reference with requests. Columns of a root the reference view has cached never get here.
+//! Columns of a root the reference announced (`probe::head`) share its lookup in the announced
+//! roots' own places, and ask again once per [`IngestLimits::root_retry`] after a round without
+//! an answer. They come here only in these cases:
+//! - [`IngestLimits::max_announced_columns`] columns already wait on announced lookups;
+//! - the hint is gone: forgotten past `max_announced`, past its life after a round without an
+//!   answer, after `MAX_ANNOUNCED_FAILURES` such rounds, or the reference refused the root;
+//! - the next try would come after the end of the wait.
+//!
+//! Here they still share a lookup in flight, and a column waiting for its first-ask turn goes on
+//! as soon as the reference view caches its root (the announced lookup, or any other), so its
+//! turn asks nothing.
 //!
 //! - **One entry per root.** The first column of a root opens its entry and asks the reference;
 //!   every later column of the root joins the entry and shares its answer, the block the
@@ -21,12 +32,15 @@
 //!   is never starved of its retries. Each lookup is a header request, and the block once the
 //!   header is known.
 //! - **Lookup places.** The reference view runs at most `RefLimits::max_in_flight` lookups at
-//!   once, and `ColumnIngest::start` requires more places than seats
-//!   ([`IngestLimits::validate_for`]), so the seated roots' retries, all in flight together
-//!   against a slow reference, never take every place. A lookup that still finds none
-//!   ([`Answer::Busy`]) asked nothing: a first ask takes a new turn, at least one first-ask
-//!   interval on, while its wait lasts (then `root_wait_full`, not remembered), never a seat; a
-//!   retry waits for the next. So a first ask for a known root never depends on a free seat.
+//!   once, and `ColumnIngest::start` requires a place for each lookup the wait can hold in
+//!   flight at once ([`IngestLimits::validate_for`]): a retry of every seat, and every first
+//!   ask booked within one lookup timeout ([`IngestLimits::first_asks_in_flight`]). So retries
+//!   and first asks that all hang on a slow reference never take the place of a first ask. A
+//!   lookup that still finds none ([`Answer::Busy`]: the chain-link walks of known roots take
+//!   places outside the budgets) asked nothing: a first ask takes a new turn, at least one
+//!   first-ask interval on, while its wait lasts (then `root_wait_full`, not remembered), never a
+//!   seat; a retry waits for the next. So a first ask for a known root never depends on a free
+//!   seat.
 //! - **Caps.** At most [`IngestLimits::max_asking_columns`] columns wait for first asks and
 //!   [`IngestLimits::max_waiting_columns`] for seated roots, at most
 //!   [`IngestLimits::max_waiting_roots`] roots are seated, and at most
@@ -47,15 +61,26 @@
 //! and holding any number of candidates is the memory a flood would take. That is the limit of
 //! the cap, and the real column is **lost**, with no recovery from gossip: its message id is a
 //! hash of the topic and the data, and seen ids are kept for 768 s, so a copy from any other
-//! peer is a duplicate that never reaches the store, and the store is forward only. Tracked in
-//! issue #242.
+//! peer is a duplicate that never reaches the store, and the store is forward only. A root the
+//! reference announced before its columns arrive never waits here, so its forgeries go
+//! straight to the KZG check and fail there; the limit holds for the roots it has not announced
+//! yet.
 //!
 //! **Residual risk.** A flood of *fresh* made-up roots, each new to the negative cache, books a
 //! first ask per root: above [`IngestLimits::first_asks_per_sec`] it delays the turn of every
-//! later root, a real one included, and past [`IngestLimits::max_asking_columns`] it refuses
-//! them. The budget bounds the reference's load, not the flood's share of it. Closing that needs
-//! a per-peer cost (IGNORE-all has none) or seeding the reference view from the reference's head,
-//! so real roots are cached before their columns arrive.
+//! later root, and past [`IngestLimits::max_asking_columns`] it refuses them. The budget bounds
+//! the reference's load, not the flood's share of it. The head seed takes the real roots the
+//! reference announced out of that share: they never book a turn or take an asking place. Still
+//! open:
+//! - a real root whose columns arrive before the reference announces it (it imports the block
+//!   late, or its stream is down) and that is never cached meanwhile takes its turn behind the
+//!   flood, as before the seed; once it is announced and cached, its waiting columns go on;
+//! - a root announced in one of the cases above takes its turn behind the flood too;
+//! - the candidates' limit above, for those roots.
+//!
+//! The remaining option for them is a per-peer cost: count unknown-root columns per sending
+//! peer and stop taking a peer's once it is over budget. IGNORE-all has none, and it needs the
+//! sender's peer id passed through to ingest.
 
 use super::column::Drop;
 use super::ingest::IngestLimits;
@@ -167,6 +192,8 @@ struct State {
     /// Columns waiting for seated roots, over every root.
     seated_columns: usize,
     seated_roots: usize,
+    /// Columns waiting on the lookups of announced roots ([`RootWaits::hold_announced`]).
+    announced_columns: usize,
     /// Remembered roots: until when, and why.
     unknown: HashMap<Root, (Instant, Drop)>,
     /// Remembering order of `unknown`, oldest first.
@@ -278,6 +305,23 @@ impl std::ops::Drop for Member<'_> {
     }
 }
 
+/// The first ask's turn: its start, and a future that resolves once the root is cached.
+struct Turn<C> {
+    start: Instant,
+    cached: C,
+}
+
+/// A column's place among those waiting on announced lookups ([`RootWaits::hold_announced`]).
+pub(crate) struct AnnouncedPlace<'a> {
+    waits: &'a RootWaits,
+}
+
+impl std::ops::Drop for AnnouncedPlace<'_> {
+    fn drop(&mut self) {
+        self.waits.lock().announced_columns -= 1;
+    }
+}
+
 /// How the asking column's wait ended, and for how long to remember the root.
 struct Settled {
     outcome: Outcome,
@@ -297,6 +341,7 @@ impl RootWaits {
                 asking_columns: 0,
                 seated_columns: 0,
                 seated_roots: 0,
+                announced_columns: 0,
                 unknown: HashMap::new(),
                 unknown_order: VecDeque::new(),
                 first_asks: Pace::new(limits.first_asks_per_sec, limits.first_ask_burst),
@@ -305,14 +350,8 @@ impl RootWaits {
         }
     }
 
-    /// The block the reference vouches for as `root`, for the column `index` that arrived at
-    /// `arrived`, asking it through `lookup` (see the module docs).
-    ///
-    /// # Errors
-    ///
-    /// [`Drop::RootWaitFull`] past a cap, or without a first-ask turn within the wait;
-    /// [`Drop::RootTimeout`] if the wait ran out; [`Drop::UnknownRoot`] if the reference
-    /// refused the root; any of them, at once, for a root the negative cache remembers.
+    /// [`Self::wait_or_cached`] with a root that is never cached meanwhile.
+    #[cfg(test)]
     pub(crate) async fn wait<F, Fut>(
         &self,
         root: Root,
@@ -324,6 +363,34 @@ impl RootWaits {
         F: FnMut() -> Fut,
         Fut: Future<Output = Answer>,
     {
+        let never = std::future::pending();
+        self.wait_or_cached(root, index, arrived, never, lookup)
+            .await
+    }
+
+    /// The block the reference vouches for as `root`, for the column `index` that arrived at
+    /// `arrived`, asking it through `lookup` (see the module docs). The first ask goes out at
+    /// its turn, or as soon as `cached` resolves (the reference view cached the root), so its
+    /// lookup asks nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Drop::RootWaitFull`] past a cap, or without a first-ask turn within the wait;
+    /// [`Drop::RootTimeout`] if the wait ran out; [`Drop::UnknownRoot`] if the reference
+    /// refused the root; any of them, at once, for a root the negative cache remembers.
+    pub(crate) async fn wait_or_cached<C, F, Fut>(
+        &self,
+        root: Root,
+        index: u64,
+        arrived: Instant,
+        cached: C,
+        lookup: F,
+    ) -> Outcome
+    where
+        C: Future<Output = ()>,
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Answer>,
+    {
         let index = usize::try_from(index)
             .ok()
             .filter(|&i| i < NUMBER_OF_COLUMNS as usize)
@@ -332,7 +399,8 @@ impl RootWaits {
         let (role, member) = self.join(root, index, deadline)?;
         match role {
             Role::Asks { tell, start } => {
-                let settled = self.ask(root, &member.wait, start, deadline, lookup).await;
+                let turn = Turn { start, cached };
+                let settled = self.ask(root, &member.wait, turn, deadline, lookup).await;
                 {
                     let mut state = self.lock();
                     state.end(&root, &member.wait);
@@ -418,15 +486,16 @@ impl RootWaits {
 
     /// The asking column's part: the first ask at `start`, then, for a root not known yet, the
     /// seat and a retry every `root_retry` until `deadline`.
-    async fn ask<F, Fut>(
+    async fn ask<C, F, Fut>(
         &self,
         root: Root,
         wait: &watch::Receiver<Option<Outcome>>,
-        start: Instant,
+        turn: Turn<C>,
         deadline: Instant,
         mut lookup: F,
     ) -> Settled
     where
+        C: Future<Output = ()>,
         F: FnMut() -> Fut,
         Fut: Future<Output = Answer>,
     {
@@ -435,9 +504,15 @@ impl RootWaits {
             outcome: Err(Drop::RootTimeout),
             remember_for,
         };
-        let mut start = start;
+        let mut start = turn.start;
+        let mut cached = std::pin::pin!(turn.cached);
+        let mut was_cached = false;
         loop {
-            tokio::time::sleep_until(start).await;
+            // The turn, or the root cached first: then the lookup finds it and asks nothing.
+            tokio::select! {
+                () = tokio::time::sleep_until(start) => {}
+                () = &mut cached, if !was_cached => was_cached = true,
+            }
             match tokio::time::timeout_at(deadline, lookup()).await {
                 // Asked, but no answer: not known for certain.
                 Err(_) => return timed_out(Some(limits.root_retry)),
@@ -480,7 +555,15 @@ impl RootWaits {
         let mut retried = false;
         loop {
             let retry = Instant::now() + limits.root_retry;
-            tokio::time::sleep_until(retry.min(deadline)).await;
+            // The next retry, or the root cached first: then the lookup finds it, asks
+            // nothing, and takes no retry token.
+            let woke_cached = tokio::select! {
+                () = tokio::time::sleep_until(retry.min(deadline)) => false,
+                () = &mut cached, if !was_cached => {
+                    was_cached = true;
+                    true
+                }
+            };
             let now = Instant::now();
             if now >= deadline {
                 // Remembered for the whole ttl only if the wait asked again: a root never
@@ -492,7 +575,7 @@ impl RootWaits {
                 };
                 return timed_out(Some(ttl));
             }
-            if !self.lock().retries.take(now) {
+            if !woke_cached && !self.lock().retries.take(now) {
                 continue;
             }
             match tokio::time::timeout_at(deadline, lookup()).await {
@@ -536,6 +619,28 @@ impl RootWaits {
         true
     }
 
+    /// The limits of this wait.
+    pub(crate) fn limits(&self) -> &IngestLimits {
+        &self.limits
+    }
+
+    /// A place for a column that waits on the lookup of an announced root, given back when
+    /// dropped; `None` once [`IngestLimits::max_announced_columns`] columns wait so.
+    pub(crate) fn hold_announced(&self) -> Option<AnnouncedPlace<'_>> {
+        let mut state = self.lock();
+        if state.announced_columns >= self.limits.max_announced_columns {
+            return None;
+        }
+        state.announced_columns += 1;
+        Some(AnnouncedPlace { waits: self })
+    }
+
+    /// Columns waiting on announced lookups now.
+    #[cfg(test)]
+    pub(crate) fn announced_columns(&self) -> usize {
+        self.lock().announced_columns
+    }
+
     /// Seated roots now.
     #[cfg(test)]
     pub(crate) fn roots(&self) -> usize {
@@ -544,7 +649,7 @@ impl RootWaits {
 
     /// Columns waiting now: for first asks, and for seated roots.
     #[cfg(test)]
-    fn columns(&self) -> (usize, usize) {
+    pub(crate) fn columns(&self) -> (usize, usize) {
         let state = self.lock();
         (state.asking_columns, state.seated_columns)
     }
@@ -826,6 +931,52 @@ mod tests {
         let fake = |i| waits.wait(root(i), 1, now, api.lookup(root(i)));
         let (a, b, ()) = tokio::join!(fake(0), fake(1), known);
         assert!(a.is_err() && b.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_seated_root_goes_on_once_cached_without_a_retry_token() {
+        let limits = IngestLimits {
+            root_retry: Duration::from_secs(1),
+            retries_per_sec: 2,
+            ..limits()
+        };
+        let waits = RootWaits::new(limits);
+        // Not known at the first ask; known once cached.
+        let asked = AtomicUsize::new(0);
+        let lookup = busy_then(0, Answer::Retry, &asked);
+        let cached = Arc::new(tokio::sync::Notify::new());
+        let start = Instant::now();
+        let wait = waits.wait_or_cached([1; 32], 1, start, cached.notified(), {
+            let mut lookup = lookup;
+            let asked = &asked;
+            move || {
+                if asked.load(Ordering::SeqCst) == 0 {
+                    lookup()
+                } else {
+                    asked.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Answer::Known(block([1; 32])))
+                }
+            }
+        });
+        let cache = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(waits.roots(), 1, "seated");
+            cached.notify_one();
+        };
+        let booked_to = waits.lock().retries.booked_to;
+        let (waited, ()) = tokio::join!(wait, cache);
+        assert_eq!(waited, Ok(block([1; 32])));
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(100),
+            "not at the next retry"
+        );
+        assert_eq!(
+            waits.lock().retries.booked_to,
+            booked_to,
+            "no retry token taken"
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(start_paused = true)]

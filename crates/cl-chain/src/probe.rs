@@ -9,7 +9,8 @@
 //!   column. Anything else is dropped and counted (`probe_column_dropped_total{reason}`); see
 //!   [`column`] for the order of the checks and the reasons.
 //! - **Column store** ([`ColumnIngest`]): gossip column sidecars from cl-p2p, through a
-//!   bounded pending queue and a bounded wait for their block root, then the storage contract,
+//!   bounded pending queue and a bounded wait for their block root (a root the reference
+//!   announced on its `block` events skips the wait: [`follow_head`]), then the storage contract,
 //!   written on the `columns-writer` thread. Forward only, from `cgc_set_slot`; the first stored
 //!   slot ([`first_stored_column_slot`]) is persisted with the columns. Every column is reported
 //!   IGNORE, so nothing is re-broadcast; see [`ingest`].
@@ -66,21 +67,33 @@
 
 mod beacon_api;
 pub mod column;
+#[cfg(test)]
+mod fake;
+mod head;
 pub mod ingest;
 mod ref_view;
 mod root_wait;
 
 pub use beacon_api::BeaconApi;
+pub use beacon_api::BlockEvents;
 pub use column::{
     storage_contract, store_verified, ColumnContract, ColumnMetrics, Drop, GossipColumn, Verified,
+};
+pub use head::{
+    follow_head, HeadFollow, HeadSource, HeadStream, SseError, EVENTS_PATH, MAX_EVENT_BYTES,
+    MIN_BACKOFF,
 };
 pub use ingest::{
     earliest_servable_slot, first_stored_column_slot, ColumnIngest, IngestLimits, LimitsError,
     QueueMetrics, COLUMN_BUFFER_ALERT_BYTES, DEFAULT_FIRST_ASKS_PER_SEC, DEFAULT_FIRST_ASK_BURST,
-    DEFAULT_MAX_ASKING_COLUMNS, DEFAULT_MAX_WAITING_COLUMNS, DEFAULT_MAX_WAITING_ROOTS,
-    DEFAULT_RETRIES_PER_SEC, DEFAULT_ROOT_RETRY, DEFAULT_ROOT_WAIT, DEFAULT_UNKNOWN_ROOT_TTL,
+    DEFAULT_MAX_ANNOUNCED_COLUMNS, DEFAULT_MAX_ASKING_COLUMNS, DEFAULT_MAX_WAITING_COLUMNS,
+    DEFAULT_MAX_WAITING_ROOTS, DEFAULT_RETRIES_PER_SEC, DEFAULT_ROOT_RETRY, DEFAULT_ROOT_WAIT,
+    DEFAULT_UNKNOWN_ROOT_TTL,
 };
-pub use ref_view::{BlockApi, RefBlock, RefError, RefLimits, RefView, DEFAULT_MAX_IN_FLIGHT};
+pub use ref_view::{
+    BlockApi, RefBlock, RefError, RefLimits, RefView, DEFAULT_MAX_ANNOUNCED,
+    DEFAULT_MAX_ANNOUNCED_IN_FLIGHT, DEFAULT_MAX_IN_FLIGHT, MAX_ANNOUNCED_FAILURES,
+};
 pub use root_wait::{MAX_CANDIDATES_PER_INDEX, MAX_UNKNOWN_ROOTS};
 
 use ethswarm_proto::chain as pb;
@@ -1743,6 +1756,7 @@ mod tests {
             alert_bytes: 2 * one,
             max_waiting_columns: 3,
             max_asking_columns: 4,
+            max_announced_columns: 0,
             ..IngestLimits::default()
         };
         let s = store_with(0, &[9], limits).await;
@@ -1784,6 +1798,7 @@ mod tests {
             root_wait: Duration::from_secs(1),
             max_waiting_columns: 0,
             max_asking_columns: 1,
+            max_announced_columns: 0,
             ..IngestLimits::default()
         };
         let s = store_with(0, &[9], limits).await;
@@ -1969,6 +1984,52 @@ mod tests {
         })
         .await;
         assert!(Drop::ALL.iter().all(|&d| s.dropped(d) == 0));
+    }
+
+    /// The store follows the reference's block events: an announced root is looked up before
+    /// its first column arrives, and its columns are stored behind a flood of made-up roots
+    /// that holds every first-ask turn of the wait.
+    #[tokio::test]
+    async fn an_announced_root_is_looked_up_before_its_columns_and_stored_behind_a_flood() {
+        let limits = IngestLimits {
+            first_asks_per_sec: 1,
+            first_ask_burst: 1,
+            ..IngestLimits::default()
+        };
+        let s = store_with(0, &[SLOT], limits).await;
+        let (root, _) = s.blocks[0];
+        let event = format!(
+            "event: block\ndata: {{\"slot\":\"{SLOT}\",\"block\":\"0x{}\"}}\n\n",
+            hex::encode(root)
+        );
+        s.reference.replies.lock().unwrap().insert(
+            "/eth/v1/events".into(),
+            Reply::stream(vec![event.as_str()], true),
+        );
+        s.ingest
+            .follow_head(s.reference.api(), HeadFollow::default());
+        settle("the announced root to be cached", || {
+            header_requests(&s, root) == 1 && s.ingest.refs_cached(&root)
+        })
+        .await;
+        // Made-up roots take the one first-ask turn a second, and book the next ones.
+        for i in 0..8 {
+            s.gossip(&column_at(fake_root(i), SLOT, CUSTODY_COLUMN));
+        }
+        let real = custody_columns(&s, root);
+        for column in &real {
+            s.gossip(column);
+        }
+        all_stored(&s, &real).await;
+        assert_eq!(
+            header_requests(&s, root),
+            1,
+            "looked up once, by the follower"
+        );
+        let seen = s.reference.server.seen();
+        assert!(seen
+            .iter()
+            .any(|(path, _)| path == "/eth/v1/events?topics=block"));
     }
 
     /// A made-up block root: `i` in its first bytes.

@@ -77,6 +77,15 @@ pub struct WriteReport {
     pub max_columns_per_txn: usize,
 }
 
+/// A [`ColumnWriter::write_block_columns_partial`] call that failed, and what it committed
+/// before that: its first `committed.columns` columns, in the order given, are stored.
+#[derive(Debug, thiserror::Error)]
+#[error("{error} ({} columns committed before it)", committed.columns)]
+pub struct WriteFailed {
+    pub committed: WriteReport,
+    pub error: Error,
+}
+
 /// What one prune call removed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PruneReport {
@@ -307,11 +316,29 @@ impl ColumnWriter {
         link: BlockLink,
         columns: &[Column<'_>],
     ) -> Result<WriteReport> {
-        validate_batch(columns)?;
+        self.write_block_columns_partial(slot, block_root, link, columns)
+            .map_err(|failed| failed.error)
+    }
+
+    /// [`Self::write_block_columns`], and on a failure what was committed before it: the
+    /// transactions before the one that failed stay committed, so their columns are stored.
+    /// A batch refused before its first transaction committed nothing.
+    pub fn write_block_columns_partial(
+        &self,
+        slot: u64,
+        block_root: &BlockRoot,
+        link: BlockLink,
+        columns: &[Column<'_>],
+    ) -> std::result::Result<WriteReport, WriteFailed> {
+        let refused = |error| WriteFailed {
+            committed: WriteReport::default(),
+            error,
+        };
+        validate_batch(columns).map_err(refused)?;
         let mut orphans = lock(&self.column_ops);
         // Under `column_ops`, so no finality prune can move the watermark, and no reorg prune
         // can orphan the root, until this returns.
-        let finalized_slot = self.reader.finalized_slot()?;
+        let finalized_slot = self.reader.finalized_slot().map_err(refused)?;
         let finalized = finalized_slot.filter(|&finalized_slot| slot <= finalized_slot);
         let orphaned = orphans.contains(block_root);
         if orphaned {
@@ -325,19 +352,15 @@ impl ColumnWriter {
             }
         }
         if let Some(finalized_slot) = finalized {
-            return Err(Error::SlotFinalized {
+            return Err(refused(Error::SlotFinalized {
                 slot,
                 finalized_slot,
-            });
+            }));
         }
         if orphaned {
-            return Err(Error::RootOrphaned);
+            return Err(refused(Error::RootOrphaned));
         }
-        let mut report = WriteReport::default();
-        for (i, chunk) in columns.chunks(MAX_COLUMNS_PER_TXN).enumerate() {
-            if i > 0 {
-                thread::yield_now();
-            }
+        commit_chunks(columns, |i, chunk| {
             let written = self.write_txn(Priority::Background, |txn| {
                 write_chunk(txn, slot, block_root, chunk)?;
                 if i == 0 {
@@ -346,20 +369,16 @@ impl ColumnWriter {
                 self.hooks.before_commit(slot);
                 Ok(Commit::Yes(()))
             });
-            if let Err(e) = written {
+            if written.is_err() {
                 // The pending index may have moved with a transaction that never committed.
                 if let Ok(txn) = self.reader.db.begin_ro_txn() {
                     if let Ok(pending) = pending_links(&txn) {
                         orphans.pending = pending;
                     }
                 }
-                return Err(e);
             }
-            report.columns += chunk.len();
-            report.transactions += 1;
-            report.max_columns_per_txn = report.max_columns_per_txn.max(chunk.len());
-        }
-        Ok(report)
+            written
+        })
     }
 
     /// Reorg pruning: removes every column of each orphaned block root, one write transaction
@@ -526,6 +545,31 @@ impl ColumnWriter {
 /// elsewhere cannot leave them inconsistent.
 fn lock(mutex: &Mutex<Orphans>) -> MutexGuard<'_, Orphans> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Commits `columns` in chunks of at most [`MAX_COLUMNS_PER_TXN`] through `commit`, which gets
+/// the chunk's number and the chunk, yielding the thread between chunks. Stops at the first
+/// chunk that fails, with the report of the chunks committed before it.
+fn commit_chunks(
+    columns: &[Column<'_>],
+    mut commit: impl FnMut(usize, &[Column<'_>]) -> Result<()>,
+) -> std::result::Result<WriteReport, WriteFailed> {
+    let mut report = WriteReport::default();
+    for (i, chunk) in columns.chunks(MAX_COLUMNS_PER_TXN).enumerate() {
+        if i > 0 {
+            thread::yield_now();
+        }
+        if let Err(error) = commit(i, chunk) {
+            return Err(WriteFailed {
+                committed: report,
+                error,
+            });
+        }
+        report.columns += chunk.len();
+        report.transactions += 1;
+        report.max_columns_per_txn = report.max_columns_per_txn.max(chunk.len());
+    }
+    Ok(report)
 }
 
 fn validate_batch(columns: &[Column<'_>]) -> Result<()> {
@@ -1220,6 +1264,59 @@ mod tests {
             })
         ));
         assert_eq!(writer.reader().columns_for_root(&ROOT_A).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_chunk_reports_the_chunks_committed_before_it() {
+        let bytes: Vec<Vec<u8>> = (0..40).map(|i| sidecar(9, i)).collect();
+        let columns: Vec<Column<'_>> = (0..40)
+            .zip(&bytes)
+            .map(|(index, ssz)| Column { index, ssz })
+            .collect();
+        // The first chunk commits; the second fails, so the third is never tried.
+        let mut tried = Vec::new();
+        let failed = commit_chunks(&columns, |i, chunk| {
+            tried.push((i, chunk.len()));
+            if i == 1 {
+                Err(Error::MapFull)
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(tried, [(0, 16), (1, 16)]);
+        assert!(matches!(failed.error, Error::MapFull));
+        assert_eq!(
+            failed.committed,
+            WriteReport {
+                columns: 16,
+                transactions: 1,
+                max_columns_per_txn: 16
+            }
+        );
+        assert!(failed.to_string().contains("16 columns"), "{failed}");
+        // Every chunk commits: the whole report.
+        let report = commit_chunks(&columns, |_, _| Ok(())).unwrap();
+        assert_eq!((report.columns, report.transactions), (40, 3));
+    }
+
+    #[test]
+    fn a_write_refused_before_its_first_chunk_reports_nothing_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        writer.prune_finalized(20).unwrap();
+        let ssz = sidecar(9, 1);
+        let column = Column {
+            index: 1,
+            ssz: &ssz,
+        };
+        let failed = writer
+            .write_block_columns_partial(9, &ROOT_A, BlockLink::Gap, &[column])
+            .unwrap_err();
+        assert!(matches!(failed.error, Error::SlotFinalized { .. }));
+        assert_eq!(failed.committed, WriteReport::default());
+        let written = writer.write_block_columns_partial(21, &ROOT_A, BlockLink::Gap, &[column]);
+        assert_eq!(written.unwrap().columns, 1);
     }
 
     #[test]

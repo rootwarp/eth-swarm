@@ -12,17 +12,23 @@
 //! - `/eth/v1/beacon/states/head/finality_checkpoints` ([`ReferenceApi::finalized_checkpoint`]).
 //! - `/eth/v1/beacon/headers/{block_id}`, the root as block id ([`ReferenceApi::header`]).
 //! - `/eth/v2/beacon/blocks/{block_id}` as SSZ ([`BlockApi::block`]).
+//! - `/eth/v1/events?topics=block` as `text/event-stream` ([`HeadSource::open`]): only the
+//!   connect and the response's head run within the timeout, and the stream's lines and events
+//!   are capped (`probe::head`).
 
+use super::head::{block_event_root, HeadSource, HeadStream, SseParser, BLOCK_EVENT, EVENTS_PATH};
 use super::{ApiError, BlockApi, Checkpoint, Header, ReferenceApi, Root};
 use bytes::Bytes;
 use consensus_types::caps::ObjectKind;
 use http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, HOST};
 use http::uri::{Authority, Scheme};
-use http::{Request, StatusCode, Uri};
+use http::{Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Empty, Limited};
+use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
@@ -31,6 +37,7 @@ pub const MAX_JSON_BYTES: usize = 1 << 20;
 
 const JSON: &str = "application/json";
 const SSZ: &str = "application/octet-stream";
+const EVENT_STREAM: &str = "text/event-stream";
 const FINALITY_PATH: &str = "/eth/v1/beacon/states/head/finality_checkpoints";
 const HEADER_PATH: &str = "/eth/v1/beacon/headers/{block_id}";
 const BLOCK_PATH: &str = "/eth/v2/beacon/blocks/{block_id}";
@@ -80,6 +87,46 @@ impl BeaconApi {
         }
     }
 
+    /// `GET path` on a fresh connection: a 200 of content type `accept`, its body not read yet,
+    /// and the connection's task, which ends when dropped. `fail` names the request in errors.
+    async fn send(
+        &self,
+        path: &str,
+        accept: &'static str,
+        fail: impl Fn(String) -> ApiError,
+    ) -> Result<(Response<Incoming>, AbortOnDrop<hyper::Result<()>>), ApiError> {
+        let host = self.authority.host().trim_matches(|c| c == '[' || c == ']');
+        let port = self.authority.port_u16().unwrap_or(80);
+        let stream = TcpStream::connect((host, port))
+            .await
+            .map_err(|e| fail(format!("connect: {}", e.kind())))?;
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .map_err(|e| fail(format!("handshake: {e}")))?;
+        let connection = AbortOnDrop(tokio::spawn(connection));
+        let request = Request::get(path)
+            .header(HOST, self.authority.as_str())
+            .header(ACCEPT, accept)
+            .body(Empty::<Bytes>::new())
+            .map_err(|e| fail(format!("request: {e}")))?;
+        let response = sender
+            .send_request(request)
+            .await
+            .map_err(|e| fail(format!("request: {e}")))?;
+        if response.status() != StatusCode::OK {
+            return Err(fail(format!("HTTP {}", response.status().as_u16())));
+        }
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        if !content_type.to_ascii_lowercase().starts_with(accept) {
+            return Err(fail(format!("the content type is not {accept}")));
+        }
+        Ok((response, connection))
+    }
+
     /// `GET path`: a 200 of content type `accept` with at most `max` body bytes, all within the
     /// timeout. `template` names the request in errors.
     async fn get(
@@ -91,36 +138,7 @@ impl BeaconApi {
     ) -> Result<Bytes, ApiError> {
         let fail = |why: String| ApiError(format!("{template}: {why}"));
         let get = async {
-            let host = self.authority.host().trim_matches(|c| c == '[' || c == ']');
-            let port = self.authority.port_u16().unwrap_or(80);
-            let stream = TcpStream::connect((host, port))
-                .await
-                .map_err(|e| fail(format!("connect: {}", e.kind())))?;
-            let (mut sender, connection) =
-                hyper::client::conn::http1::handshake(TokioIo::new(stream))
-                    .await
-                    .map_err(|e| fail(format!("handshake: {e}")))?;
-            let connection = AbortOnDrop(tokio::spawn(connection));
-            let request = Request::get(path)
-                .header(HOST, self.authority.as_str())
-                .header(ACCEPT, accept)
-                .body(Empty::<Bytes>::new())
-                .map_err(|e| fail(format!("request: {e}")))?;
-            let response = sender
-                .send_request(request)
-                .await
-                .map_err(|e| fail(format!("request: {e}")))?;
-            if response.status() != StatusCode::OK {
-                return Err(fail(format!("HTTP {}", response.status().as_u16())));
-            }
-            let content_type = response
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or_default();
-            if !content_type.to_ascii_lowercase().starts_with(accept) {
-                return Err(fail(format!("the content type is not {accept}")));
-            }
+            let (response, connection) = self.send(path, accept, fail).await?;
             let declared = response
                 .headers()
                 .get(CONTENT_LENGTH)
@@ -206,7 +224,7 @@ struct HeaderMessage {
 }
 
 /// `0x` and 64 hex digits.
-fn root(template: &'static str, text: &str) -> Result<Root, ApiError> {
+pub(super) fn root(template: &'static str, text: &str) -> Result<Root, ApiError> {
     text.strip_prefix("0x")
         .and_then(|h| hex::decode(h).ok())
         .and_then(|b| Root::try_from(b).ok())
@@ -214,7 +232,7 @@ fn root(template: &'static str, text: &str) -> Result<Root, ApiError> {
 }
 
 /// A decimal `u64` without sign or other characters, as the API writes integers.
-fn decimal(template: &'static str, text: &str) -> Result<u64, ApiError> {
+pub(super) fn decimal(template: &'static str, text: &str) -> Result<u64, ApiError> {
     let digits = !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
     digits
         .then(|| text.parse().ok())
@@ -245,6 +263,84 @@ impl ReferenceApi for BeaconApi {
     }
 }
 
+/// The reference's `block` events, one stream ([`HeadSource`] of [`BeaconApi`]).
+pub struct BlockEvents {
+    body: Incoming,
+    parser: SseParser,
+    /// Roots of a chunk's events not handed over yet.
+    ready: VecDeque<Root>,
+    /// The fault that ends the stream, given once `ready` is empty.
+    failed: Option<ApiError>,
+    _connection: AbortOnDrop<hyper::Result<()>>,
+}
+
+fn events_error(why: impl std::fmt::Display) -> ApiError {
+    ApiError(format!("{EVENTS_PATH}: {why}"))
+}
+
+impl HeadSource for BeaconApi {
+    type Stream = BlockEvents;
+
+    /// `GET /eth/v1/events?topics=block`: connect and the response's head within the timeout;
+    /// the stream itself has no deadline here (see [`super::HeadFollow::idle_timeout`]).
+    async fn open(&self) -> Result<BlockEvents, ApiError> {
+        let path = format!("{EVENTS_PATH}?topics={BLOCK_EVENT}");
+        let send = self.send(&path, EVENT_STREAM, events_error);
+        let (response, connection) = tokio::time::timeout(self.timeout, send)
+            .await
+            .map_err(|_| events_error(format!("no answer within {:?}", self.timeout)))??;
+        Ok(BlockEvents {
+            body: response.into_body(),
+            parser: SseParser::default(),
+            ready: VecDeque::new(),
+            failed: None,
+            _connection: connection,
+        })
+    }
+}
+
+impl HeadStream for BlockEvents {
+    /// The next `block` event's root, or `None` after a chunk with none. A chunk's events are
+    /// bounded by the parser's caps on a line and an event; its roots wait in `ready`, and a
+    /// fault in the chunk is given after the roots before it.
+    async fn next_root(&mut self) -> Result<Option<Root>, ApiError> {
+        if let Some(root) = self.ready.pop_front() {
+            return Ok(Some(root));
+        }
+        if let Some(e) = &self.failed {
+            return Err(e.clone());
+        }
+        let frame = match self.body.frame().await {
+            None => return Err(events_error("the stream ended")),
+            Some(Err(e)) => return Err(events_error(format!("body: {e}"))),
+            Some(Ok(frame)) => frame,
+        };
+        // Trailers carry no events.
+        let Ok(chunk) = frame.into_data() else {
+            return Ok(None);
+        };
+        let mut events = Vec::new();
+        let fed = self.parser.feed_into(&chunk, &mut events);
+        for event in events.iter().filter(|event| event.name == BLOCK_EVENT) {
+            match block_event_root(&event.data) {
+                Ok(root) => self.ready.push_back(root),
+                Err(e) => {
+                    self.failed = Some(e);
+                    break;
+                }
+            }
+        }
+        if let (None, Err(e)) = (&self.failed, fed) {
+            self.failed = Some(events_error(e));
+        }
+        match (self.ready.pop_front(), &self.failed) {
+            (Some(root), _) => Ok(Some(root)),
+            (None, Some(e)) => Err(e.clone()),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
 impl BlockApi for BeaconApi {
     async fn block(&self, block: Root) -> Result<Vec<u8>, ApiError> {
         let path = format!("/eth/v2/beacon/blocks/{}", block_id(block));
@@ -257,6 +353,7 @@ impl BlockApi for BeaconApi {
 
 #[cfg(test)]
 mod tests {
+    use super::super::head::{HeadSource, HeadStream, MAX_EVENT_BYTES};
     use super::*;
     use testkit::collector::testing::{FixtureServer, HangUp, Reply};
 
@@ -385,6 +482,129 @@ mod tests {
         let gone = HangUp::start().await;
         let api = BeaconApi::new(&format!("http://{}", gone.addr), timeout).unwrap();
         assert!(api.block(ROOT).await.is_err());
+    }
+
+    fn block_event(root: &str, slot: &str) -> String {
+        format!(
+            "event: block\ndata: {{\"slot\":\"{slot}\",\"block\":\"{root}\",\"execution_optimistic\":false}}\n\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn block_events_announce_each_root() {
+        let first = format!("0x{}", "ab".repeat(32));
+        let second = format!("0x{}", "cd".repeat(32));
+        let chunks = [
+            ": keep-alive\n\n".to_owned(),
+            block_event(&first, "10"),
+            // Another event name is skipped; an event split over two chunks is whole.
+            "event: head\ndata: {}\n\n".to_owned(),
+            block_event(&second, "11")[..20].to_owned(),
+            block_event(&second, "11")[20..].to_owned(),
+        ];
+        let server = FixtureServer::start_with_query(move |_, _| {
+            Reply::stream(chunks.iter().map(String::as_str).collect(), false)
+        })
+        .await;
+        let mut events = api(&server).open().await.unwrap();
+        // The keep-alive alone: bytes, no root.
+        assert_eq!(events.next_root().await, Ok(None));
+        assert_eq!(events.next_root().await, Ok(Some(ROOT)));
+        assert_eq!(next_root(&mut events).await, Ok([0xcd; 32]));
+        let end = next_root(&mut events).await.unwrap_err();
+        assert!(end.0.contains("ended"), "{end}");
+        let (path, headers) = server.seen().remove(0);
+        assert_eq!(path, "/eth/v1/events?topics=block");
+        assert_eq!(headers["accept"], "text/event-stream");
+    }
+
+    #[tokio::test]
+    async fn a_bad_event_ends_the_stream_and_quotes_nothing() {
+        let host = |server: &FixtureServer| server.addr.to_string();
+        let long_line = format!("data: {}\n", "x".repeat(MAX_EVENT_BYTES + 1));
+        let long_event = format!("data: {}\n", "y".repeat(MAX_EVENT_BYTES / 2)).repeat(2);
+        let cases = [
+            (
+                "malformed json",
+                "event: block\ndata: {\"slot\":\n\n".to_owned(),
+                "json",
+            ),
+            ("wrong-length root", block_event("0xabcdef", "10"), "64 hex"),
+            ("oversize line", long_line, "line"),
+            ("oversize event", long_event, "event is over"),
+        ];
+        for (what, body, says) in cases {
+            let server = FixtureServer::start_with_query(move |_, _| {
+                Reply::stream(vec![body.as_str()], true)
+            })
+            .await;
+            let mut events = api(&server).open().await.unwrap();
+            let err = next_root(&mut events).await.unwrap_err();
+            assert!(err.0.contains(says), "{what}: {err}");
+            assert!(err.0.starts_with("/eth/v1/events"), "{what}: {err}");
+            assert!(!err.0.contains(&host(&server)), "{what}: {err}");
+            assert!(!err.0.contains("abcdef"), "{what}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_events_stream_that_is_not_one_is_refused() {
+        let server = FixtureServer::start(|_, _| Reply::status(503)).await;
+        let err = api(&server).open().await.err().unwrap();
+        assert!(err.0.contains("503"), "{err}");
+        assert!(!err.0.contains("127.0.0.1"), "{err}");
+        let server = FixtureServer::start(|_, _| Reply::json("{}")).await;
+        let err = api(&server).open().await.err().unwrap();
+        assert!(err.0.contains("text/event-stream"), "{err}");
+        let gone = HangUp::start().await;
+        let api = BeaconApi::new(&format!("http://{}", gone.addr), Duration::from_secs(1));
+        assert!(api.unwrap().open().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_events_stream_outlives_the_request_timeout() {
+        // Events paced past the request timeout: only opening the stream is timed.
+        let event = block_event(&format!("0x{}", "ab".repeat(32)), "10");
+        let server = FixtureServer::start_with_query(move |_, _| {
+            Reply::stream(vec![event.as_str(), event.as_str()], true)
+                .paced(Duration::from_millis(150))
+        })
+        .await;
+        let api = BeaconApi::new(
+            &format!("http://{}", server.addr),
+            Duration::from_millis(100),
+        );
+        let mut events = api.unwrap().open().await.unwrap();
+        assert_eq!(next_root(&mut events).await, Ok(ROOT));
+        assert_eq!(next_root(&mut events).await, Ok(ROOT));
+    }
+
+    /// The next root of `events`, past the chunks with none.
+    async fn next_root(events: &mut BlockEvents) -> Result<Root, ApiError> {
+        loop {
+            if let Some(root) = events.next_root().await? {
+                return Ok(root);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_roots_before_a_bad_event_in_a_chunk_are_announced_first() {
+        let good = block_event(&format!("0x{}", "ab".repeat(32)), "10");
+        let long_line = format!("data: {}\n", "x".repeat(MAX_EVENT_BYTES + 1));
+        let bad_json = "event: block\ndata: {\"slot\":\n\n".to_owned();
+        for (what, bad, says) in [("json", bad_json, "json"), ("line", long_line, "line")] {
+            let chunk = format!("{good}{good}{bad}");
+            let server = FixtureServer::start_with_query(move |_, _| {
+                Reply::stream(vec![chunk.as_str()], true)
+            })
+            .await;
+            let mut events = api(&server).open().await.unwrap();
+            assert_eq!(events.next_root().await, Ok(Some(ROOT)), "{what}");
+            assert_eq!(events.next_root().await, Ok(Some(ROOT)), "{what}");
+            let err = events.next_root().await.unwrap_err();
+            assert!(err.0.contains(says), "{what}: {err}");
+        }
     }
 
     #[test]
