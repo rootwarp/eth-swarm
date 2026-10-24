@@ -12,6 +12,20 @@ build = "build.rs"
 [features]
 # Fixtures for this crate's tests: a loopback libp2p peer that answers Status v2.
 testkit = ["p2p-wire/testkit"]
+# Builds the test binary m2a-session-test (below), which passes test_build = true to the
+# m2a-session pre-flight: it takes a run_as other than m2a-session, keeps that user's groups and
+# accepts a config the test user owns, so the integration tests can run it as the developer's
+# user. Only cl-p2p's own dev-dependency turns it on. The feature changes no code of the library
+# or of m2a-session, which always passes test_build = false, whatever is built with it.
+test-run-as = []
+
+# The test binary of the session: the same code as m2a-session with test_build = true. Built
+# only with the test-run-as feature; its unit tests are m2a-session's, so it has none of its own.
+[[bin]]
+name = "m2a-session-test"
+path = "src/bin/m2a-session-test/main.rs"
+required-features = ["test-run-as"]
+test = false
 
 [dependencies]
 ethswarm-proto = { path = "../ethswarm-proto" }
@@ -39,6 +53,11 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # lines, never blocks the session) and the bounded flush before each exit.
 svc-runtime = { path = "../svc-runtime" }
 rustix = { version = "1", features = ["fs", "process"] }
+# getpwnam_r for the m2a-session pre-flight (m2a_session::os_user): the UID of the run_as user,
+# through the system's name service. rustix has no getpwnam. The version already in the
+# dependency graph (through tokio, socket2 and others), so no new crate; the one call is the
+# crate's only unsafe code.
+libc = "0.2.190"
 thiserror = "2"
 # Wipes the node-key bytes read from a key file on every path.
 zeroize = "1"
@@ -62,7 +81,8 @@ serde_json = "1"
 data-encoding = "2"
 
 [dev-dependencies]
-cl-p2p = { path = ".", features = ["testkit"] }
+# test-run-as: the integration tests run the test binary m2a-session-test.
+cl-p2p = { path = ".", features = ["testkit", "test-run-as"] }
 ipc = { path = "../ipc", features = ["testkit"] }
 # The mock reference beacon API: plain HTTP/1.1 on 127.0.0.1.
 hyper = { version = "1", features = ["server", "http1"] }

@@ -240,23 +240,54 @@ fn secret_peer_id() -> PeerId {
         .to_peer_id()
 }
 
-/// A config pinning `peer_id` at `addr`, with a 0600 key file holding [`SECRET`].
-fn session_config(addr: &Multiaddr, peer_id: PeerId) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
+/// A config pinning `peer_id` at `addr`, with a 0600 key file holding [`SECRET`], for the session
+/// user the tests run as; `None` (and `test` is skipped, with the reason printed) if that user has
+/// no portable passwd entry ([`cl_p2p::testkit::os_user_name`]).
+/// A config directory the real binary takes: under [`cl_p2p::testkit::config_root`] (no symlink
+/// on the path), and read-only while it lives, because the test user owns it and the session
+/// refuses a config in a directory its own user can write.
+struct ConfigDir {
+    // Dropped first: the directory is writable again before it is removed.
+    _sealed: cl_p2p::testkit::Sealed,
+    dir: tempfile::TempDir,
+}
+
+impl ConfigDir {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+fn config_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .tempdir_in(cl_p2p::testkit::config_root())
+        .unwrap()
+}
+
+fn session_config(addr: &Multiaddr, peer_id: PeerId, test: &str) -> Option<ConfigDir> {
+    let run_as = cl_p2p::testkit::os_user_name(test)?;
+    let dir = config_tempdir();
     let key = dir.path().join("node.key");
     std::fs::write(&key, SECRET).unwrap();
     std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
     let text = format!(
         "network = \"sepolia\"\npeer = \"{addr}/p2p/{peer_id}\"\n\
-         reference_api_url = \"http://127.0.0.1:5052\"\nnode_key = \"{}\"\n",
+         reference_api_url = \"http://127.0.0.1:5052\"\nnode_key = \"{}\"\nrun_as = \"{run_as}\"\n",
         key.display()
     );
-    std::fs::write(dir.path().join("m2a-session.toml"), text).unwrap();
-    dir
+    let config = dir.path().join("m2a-session.toml");
+    std::fs::write(&config, text).unwrap();
+    // Read-only: the session refuses a config its own effective UID can write.
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o444)).unwrap();
+    Some(ConfigDir {
+        _sealed: cl_p2p::testkit::Sealed::new(dir.path()),
+        dir,
+    })
 }
 
 fn m2a_session(config: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_m2a-session"));
+    // The test binary: it takes the test user's config and run_as (`test_build = true`).
+    let mut command = Command::new(env!("CARGO_BIN_EXE_m2a-session-test"));
     command.arg("--config").arg(config).args(args);
     command
 }
@@ -264,7 +295,10 @@ fn m2a_session(config: &Path, args: &[&str]) -> Command {
 #[tokio::test]
 async fn m2a_session_dials_and_exits_with_a_full_stderr() {
     let (id, addr, connected) = loopback_peer().await;
-    let dir = session_config(&addr, id);
+    let Some(dir) = session_config(&addr, id, "m2a_session_dials_and_exits_with_a_full_stderr")
+    else {
+        return;
+    };
     let secs = CONNECT_TIMEOUT.as_secs().to_string();
     let mut child = Stalled::spawn(m2a_session(
         &dir.path().join("m2a-session.toml"),

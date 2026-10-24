@@ -406,6 +406,9 @@ else
     echo "reference_api_url = \"http://127.0.0.1:$api_port\""
     echo 'node_key = "/var/lib/m2a-session/node.key"'
     echo "trusted_by_reference = $trusted   # true only once TRUSTED_PEERS holds the session's peer ID"
+    echo 'run_as = "m2a-session"   # the only run_as the session takes'
+    echo '# Install it owned by root, mode 0644, in the root-owned /etc/ethswarm: the session'
+    echo '# refuses a config or a directory on its path that its own user can write.'
     echo '```'
   } >> "$body"
 fi

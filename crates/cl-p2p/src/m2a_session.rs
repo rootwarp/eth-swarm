@@ -1,8 +1,13 @@
 //! The `m2a-session` skeleton: one pinned outbound peer, no listener, its own OS user.
 //!
-//! - **Pre-flight** ([`preflight`]): refuses to run as root, and loads the node key: an
-//!   ephemeral secp256k1 key, or a 32-byte secp256k1 secret from a credential file that must be
-//!   a regular file (not a symlink) of mode 0600 owned by the effective UID. [`NodeKey`] prints
+//! - **Pre-flight** ([`preflight`], with `test_build = false` in the deployed `m2a-session` and
+//!   `true` only in the test binary `m2a-session-test`): refuses a platform other than Linux in
+//!   production, and refuses to run as root, with a real or saved UID other than the effective
+//!   one ([`check_process`]; macOS cannot read the saved UID, see [`os_user`]), or as any
+//!   effective UID other than the session user's (the config's `run_as`, default
+//!   `m2a-session`, resolved through `getpwnam_r`), and loads the node key: an ephemeral
+//!   secp256k1 key, or a 32-byte secp256k1 secret from a credential file that must be a
+//!   regular file (not a symlink) of mode 0600 owned by the effective UID. [`NodeKey`] prints
 //!   `<redacted>` in `Debug` and `Display`, and nothing here logs key material.
 //! - **Config** ([`config`]): `/etc/ethswarm/m2a-session.toml` pins the one reference peer
 //!   (`/ip4|ip6/…/tcp/<port>/p2p/<peer id>`), the req/resp deadlines and the node key.
@@ -25,6 +30,7 @@
 //!   [`crate::rpc::outbound::blocks_by_range`].
 
 pub mod config;
+pub mod os_user;
 
 use crate::rpc::codec::{Deadlines, RpcCodec};
 use crate::rpc::outbound::OutboundError;
@@ -101,13 +107,89 @@ pub enum KeySource {
     File(PathBuf),
 }
 
+/// Whether `run_as` may name `name`: the session account [`config::DEFAULT_RUN_AS`] only, or any
+/// name in a test build. `test_build` is the caller's: the `m2a-session` binary passes `false`,
+/// and only the test binary `m2a-session-test` passes `true`.
+fn run_as_allowed(name: &str, test_build: bool) -> bool {
+    name == config::DEFAULT_RUN_AS || test_build
+}
+
+/// Whether the session user's supplementary groups are checked: always for the session account,
+/// and for any user outside a test build. A test build runs as the developer's own user, with
+/// that user's groups.
+fn groups_checked(name: &str, test_build: bool) -> bool {
+    name == config::DEFAULT_RUN_AS || !test_build
+}
+
+/// Whether the pre-flight runs on `os` (`std::env::consts::OS`): Linux only in production, any
+/// platform in a test build. On macOS `initgroups` adds system groups (12, 61, 100, 701 and
+/// others) to every user, which the supplementary-group rule refuses, so a production run
+/// there could never pass; this says so at once.
+fn platform_allowed(os: &str, test_build: bool) -> bool {
+    os == "linux" || test_build
+}
+
+/// Refuses a platform `os` other than Linux, unless `test_build` (see [`platform_allowed`]). The
+/// binary runs it right after [`check_process`], before it reads the config.
+///
+/// # Errors
+///
+/// [`PreflightError::NotLinux`].
+pub fn check_platform(os: &str, test_build: bool) -> Result<(), PreflightError> {
+    if platform_allowed(os, test_build) {
+        Ok(())
+    } else {
+        Err(PreflightError::NotLinux(os.to_owned()))
+    }
+}
+
+/// Refuses a `run_as` other than the session account [`config::DEFAULT_RUN_AS`], unless
+/// `test_build` (see [`run_as_allowed`]). The binary runs it before it asks the name service
+/// for the user.
+///
+/// # Errors
+///
+/// [`PreflightError::NotTheSessionAccount`].
+pub fn check_run_as(name: &str, test_build: bool) -> Result<(), PreflightError> {
+    if run_as_allowed(name, test_build) {
+        Ok(())
+    } else {
+        Err(PreflightError::NotTheSessionAccount(name.to_owned()))
+    }
+}
+
+/// The OS user the session must run as: the config's `run_as`, and the UID and primary GID its
+/// passwd entry gives ([`os_user::user_of`] in production).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionUser {
+    /// The user name.
+    pub name: String,
+    /// Its UID.
+    pub uid: u32,
+    /// Its primary GID.
+    pub gid: u32,
+}
+
 /// What the session checks before it touches the network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preflight {
-    /// The effective UID the process runs as (`geteuid()` in production).
-    pub euid: u32,
+    /// The process's real, effective and saved UIDs ([`os_user::process_uids`] in production).
+    pub uids: os_user::ProcessUids,
+    /// The process's GIDs and supplementary groups ([`os_user::process_gids`] in production).
+    pub gids: os_user::ProcessGids,
+    /// The platform ([`Preflight::os_of_this_build`] in production).
+    pub os: String,
+    /// The session user: the effective UID must be its UID.
+    pub user: SessionUser,
     /// The node key.
     pub key: KeySource,
+}
+
+impl Preflight {
+    /// The platform this binary was built for: `std::env::consts::OS`.
+    pub fn os_of_this_build() -> &'static str {
+        std::env::consts::OS
+    }
 }
 
 /// Why a key file was refused. The key bytes are never part of the error.
@@ -147,6 +229,90 @@ pub enum PreflightError {
     /// The process runs as root; the session must run as its own OS user.
     #[error("refusing to run as root: run m2a-session as its own OS user")]
     Root,
+    /// The real UID, or the saved UID where the platform reads it, differs from the effective
+    /// UID: the process could switch back to that UID (as after `setpriv --euid` from root).
+    #[error(
+        "refusing to run with real UID {real}, effective UID {effective} and saved UID {}: the \
+         process could switch back to another UID; run m2a-session with all three set to its own \
+         user",
+        saved.map_or_else(|| "unknown".to_owned(), |s| s.to_string())
+    )]
+    MixedUids {
+        /// The real UID.
+        real: u32,
+        /// The effective UID.
+        effective: u32,
+        /// The saved UID; `None` where the platform cannot read it.
+        saved: Option<u32>,
+    },
+    /// A real, effective or saved GID is 0 (as after `setpriv --reuid` without `--regid`).
+    #[error(
+        "refusing to run with GID 0 (real, effective or saved): run m2a-session with its own \
+         user's group"
+    )]
+    RootGroup,
+    /// The real GID, or the saved GID where the platform reads it, differs from the effective
+    /// GID.
+    #[error(
+        "refusing to run with real GID {real}, effective GID {effective} and saved GID {}: the \
+         process could switch back to another group",
+        saved.map_or_else(|| "unknown".to_owned(), |s| s.to_string())
+    )]
+    MixedGids {
+        /// The real GID.
+        real: u32,
+        /// The effective GID.
+        effective: u32,
+        /// The saved GID; `None` where the platform cannot read it.
+        saved: Option<u32>,
+    },
+    /// A production run on a platform other than Linux.
+    #[error(
+        "refusing to run on {0}: m2a-session runs in production on Linux only (on other \
+         platforms the system adds groups that the session account must not have)"
+    )]
+    NotLinux(String),
+    /// `run_as` names another user than the session account, outside a test build.
+    #[error("refusing run_as {0:?}: m2a-session runs only as its own account \"m2a-session\"")]
+    NotTheSessionAccount(String),
+    /// The process runs as a UID other than the session user's: a shared login account can
+    /// hold other credentials, so the session runs only as its own user.
+    #[error(
+        "refusing to run as effective UID {euid}: run m2a-session as its own OS user {user:?} \
+         (UID {uid}), as run_as names it"
+    )]
+    WrongUser {
+        /// The effective UID.
+        euid: u32,
+        /// The session user's name.
+        user: String,
+        /// The session user's UID.
+        uid: u32,
+    },
+    /// The effective GID is not the session user's primary GID.
+    #[error(
+        "refusing to run as effective GID {egid}: run m2a-session with the primary group of \
+         {user:?} (GID {gid})"
+    )]
+    WrongGroup {
+        /// The effective GID.
+        egid: u32,
+        /// The session user's name.
+        user: String,
+        /// Its primary GID.
+        gid: u32,
+    },
+    /// Supplementary groups other than the session user's primary GID (root's groups, say).
+    #[error(
+        "refusing to run with supplementary groups {groups:?}: run m2a-session with only the \
+         primary group of {user:?}"
+    )]
+    ExtraGroups {
+        /// The session user's name.
+        user: String,
+        /// The groups other than its primary GID.
+        groups: Vec<u32>,
+    },
     /// The node-key file was refused.
     #[error("node key {path}: {reason}")]
     KeyFile {
@@ -157,15 +323,84 @@ pub enum PreflightError {
     },
 }
 
-/// Runs the pre-flight and returns the node key.
-pub fn preflight(check: &Preflight) -> Result<NodeKey, PreflightError> {
-    if check.euid == 0 {
+/// The checks of the process alone, which need no lookup: an effective UID of root, a real or
+/// saved UID other than the effective one, a GID of 0, then a real or saved GID other than the
+/// effective one. The binary runs it before it reads the config or asks the name service for
+/// the session user.
+///
+/// # Errors
+///
+/// [`PreflightError::Root`], [`PreflightError::MixedUids`], [`PreflightError::RootGroup`] or
+/// [`PreflightError::MixedGids`].
+pub fn check_process(
+    uids: &os_user::ProcessUids,
+    gids: &os_user::ProcessGids,
+) -> Result<(), PreflightError> {
+    if uids.effective == 0 {
         return Err(PreflightError::Root);
+    }
+    if !uids.all_equal() {
+        return Err(PreflightError::MixedUids {
+            real: uids.real,
+            effective: uids.effective,
+            saved: uids.saved,
+        });
+    }
+    if gids.has_root_group() {
+        return Err(PreflightError::RootGroup);
+    }
+    if !gids.all_equal() {
+        return Err(PreflightError::MixedGids {
+            real: gids.real,
+            effective: gids.effective,
+            saved: gids.saved,
+        });
+    }
+    Ok(())
+}
+
+/// Runs the pre-flight and returns the node key: [`check_process`], the platform (Linux only
+/// outside a test build), [`check_run_as`], then an effective UID other than the session
+/// user's, an effective GID other than its primary GID, supplementary groups other than that
+/// GID, then a node-key file that fails its checks. `test_build` is `false` in the
+/// `m2a-session` binary, and `true` only in the test binary `m2a-session-test`.
+pub fn preflight(check: &Preflight, test_build: bool) -> Result<NodeKey, PreflightError> {
+    check_process(&check.uids, &check.gids)?;
+    check_platform(&check.os, test_build)?;
+    let user = &check.user;
+    check_run_as(&user.name, test_build)?;
+    let euid = check.uids.effective;
+    if euid != user.uid {
+        return Err(PreflightError::WrongUser {
+            euid,
+            user: user.name.clone(),
+            uid: user.uid,
+        });
+    }
+    if check.gids.effective != user.gid {
+        return Err(PreflightError::WrongGroup {
+            egid: check.gids.effective,
+            user: user.name.clone(),
+            gid: user.gid,
+        });
+    }
+    let extra: Vec<u32> = check
+        .gids
+        .groups
+        .iter()
+        .copied()
+        .filter(|g| *g != user.gid)
+        .collect();
+    if !extra.is_empty() && groups_checked(&user.name, test_build) {
+        return Err(PreflightError::ExtraGroups {
+            user: user.name.clone(),
+            groups: extra,
+        });
     }
     match &check.key {
         KeySource::Ephemeral => Ok(NodeKey::ephemeral()),
         KeySource::File(path) => {
-            load_key_file(path, check.euid).map_err(|reason| PreflightError::KeyFile {
+            load_key_file(path, euid).map_err(|reason| PreflightError::KeyFile {
                 path: path.clone(),
                 reason,
             })
@@ -629,6 +864,7 @@ impl<E: EthSpec> Session<E> {
 
 #[cfg(test)]
 mod tests {
+    use super::os_user::{ProcessGids, ProcessUids};
     use super::*;
     use consensus_types::Minimal;
     use libp2p::swarm::dummy;
@@ -639,6 +875,213 @@ mod tests {
 
     fn euid() -> u32 {
         rustix::process::geteuid().as_raw()
+    }
+
+    /// The session user `m2a-session`, injected as UID `uid` with primary GID `uid`.
+    fn user(uid: u32) -> SessionUser {
+        SessionUser {
+            name: "m2a-session".into(),
+            uid,
+            gid: uid,
+        }
+    }
+
+    /// GID 0 (real, effective or saved) and mixed GIDs are refused with the process checks:
+    /// `setpriv --reuid` without `--regid` keeps root's GID.
+    #[test]
+    fn refuses_the_root_group_and_mixed_gids() {
+        let uids = ProcessUids::same(1000);
+        for gids in [
+            ProcessGids::same(0),
+            ProcessGids {
+                real: 0,
+                ..ProcessGids::same(1000)
+            },
+            ProcessGids {
+                saved: Some(0),
+                ..ProcessGids::same(1000)
+            },
+        ] {
+            assert_eq!(
+                check_process(&uids, &gids),
+                Err(PreflightError::RootGroup),
+                "{gids:?}"
+            );
+        }
+        let mixed = ProcessGids {
+            real: 1001,
+            ..ProcessGids::same(1000)
+        };
+        assert_eq!(
+            check_process(&uids, &mixed),
+            Err(PreflightError::MixedGids {
+                real: 1001,
+                effective: 1000,
+                saved: Some(1000)
+            })
+        );
+        assert_eq!(
+            PreflightError::RootGroup.to_string(),
+            "refusing to run with GID 0 (real, effective or saved): run m2a-session with its own \
+             user's group"
+        );
+        // Root's UID is refused before its group.
+        assert_eq!(
+            check_process(&ProcessUids::same(0), &ProcessGids::same(0)),
+            Err(PreflightError::Root)
+        );
+    }
+
+    /// The effective GID must be the session user's primary GID, and every supplementary group
+    /// that GID: root's groups do not stay with the session.
+    #[test]
+    fn refuses_a_group_other_than_the_session_users() {
+        let check = |gids: ProcessGids| {
+            strict(&Preflight {
+                uids: ProcessUids::same(1000),
+                gids,
+                user: user(1000),
+                os: "linux".into(),
+                key: KeySource::Ephemeral,
+            })
+            .map(|_| ())
+        };
+        assert_eq!(
+            check(ProcessGids::same(1001)),
+            Err(PreflightError::WrongGroup {
+                egid: 1001,
+                user: "m2a-session".into(),
+                gid: 1000
+            })
+        );
+        assert_eq!(
+            check(ProcessGids {
+                groups: vec![1000, 27, 4],
+                ..ProcessGids::same(1000)
+            }),
+            Err(PreflightError::ExtraGroups {
+                user: "m2a-session".into(),
+                groups: vec![27, 4]
+            })
+        );
+        assert_eq!(
+            PreflightError::ExtraGroups {
+                user: "m2a-session".into(),
+                groups: vec![27, 4]
+            }
+            .to_string(),
+            "refusing to run with supplementary groups [27, 4]: run m2a-session with only the \
+             primary group of \"m2a-session\""
+        );
+        assert_eq!(
+            check(ProcessGids {
+                groups: vec![1000],
+                ..ProcessGids::same(1000)
+            }),
+            Ok(())
+        );
+        assert_eq!(check(ProcessGids::same(1000)), Ok(()));
+    }
+
+    /// The pre-flight runs only as the session account `m2a-session` unless its caller passes
+    /// `test_build = true`, which only the test binary `m2a-session-test` does; then it takes
+    /// another `run_as`,
+    /// and then it does not hold that user to the session account's groups.
+    #[test]
+    fn the_session_account_is_the_only_run_as_outside_a_test_build() {
+        assert!(run_as_allowed("m2a-session", false));
+        assert!(!run_as_allowed("alice", false));
+        assert!(run_as_allowed("alice", true));
+        assert!(groups_checked("m2a-session", false));
+        assert!(groups_checked("m2a-session", true));
+        assert!(groups_checked("alice", false));
+        assert!(!groups_checked("alice", true));
+        assert_eq!(
+            check_run_as("alice", false),
+            Err(PreflightError::NotTheSessionAccount("alice".into()))
+        );
+        assert_eq!(check_run_as("m2a-session", false), Ok(()));
+        assert_eq!(check_run_as("alice", true), Ok(()));
+        assert_eq!(
+            PreflightError::NotTheSessionAccount("alice".into()).to_string(),
+            "refusing run_as \"alice\": m2a-session runs only as its own account \"m2a-session\""
+        );
+        let alice = Preflight {
+            uids: ProcessUids::same(1000),
+            gids: ProcessGids {
+                groups: vec![1000, 20, 80],
+                ..ProcessGids::same(1000)
+            },
+            user: SessionUser {
+                name: "alice".into(),
+                uid: 1000,
+                gid: 1000,
+            },
+            os: "linux".into(),
+            key: KeySource::Ephemeral,
+        };
+        // The production binary passes `test_build = false`: refused, whatever the build.
+        assert_eq!(
+            strict(&alice).unwrap_err(),
+            PreflightError::NotTheSessionAccount("alice".into())
+        );
+        // A test build takes another name, and its own groups.
+        assert!(preflight(&alice, true).is_ok());
+    }
+
+    /// The production pre-flight runs on Linux only: on macOS `initgroups` adds system groups
+    /// (12, 61, 100, 701 and others) that the supplementary-group rule refuses, so a `sudo -u`
+    /// run there could never pass. A test build runs on any platform; the Linux rule is the
+    /// same in both.
+    #[test]
+    fn production_runs_on_linux_only() {
+        assert!(platform_allowed("linux", false));
+        assert!(!platform_allowed("macos", false));
+        assert!(platform_allowed("macos", true));
+        let on = |os: &str| Preflight {
+            os: os.into(),
+            ..ok_check()
+        };
+        assert_eq!(
+            strict(&on("macos")).unwrap_err(),
+            PreflightError::NotLinux("macos".into())
+        );
+        assert_eq!(
+            PreflightError::NotLinux("macos".into()).to_string(),
+            "refusing to run on macos: m2a-session runs in production on Linux only (on other \
+             platforms the system adds groups that the session account must not have)"
+        );
+        assert!(strict(&on("linux")).is_ok());
+        assert!(preflight(&on("macos"), true).is_ok());
+        // macOS's own groups are still refused for the session account on Linux.
+        let linux_extra = Preflight {
+            gids: ProcessGids {
+                groups: vec![1000, 12, 61, 100, 701],
+                ..ProcessGids::same(1000)
+            },
+            ..ok_check()
+        };
+        assert!(matches!(
+            preflight(&linux_extra, true),
+            Err(PreflightError::ExtraGroups { .. })
+        ));
+        assert_eq!(Preflight::os_of_this_build(), std::env::consts::OS);
+    }
+
+    /// A check that passes: the session account on Linux, its own IDs, an ephemeral key.
+    fn ok_check() -> Preflight {
+        Preflight {
+            uids: ProcessUids::same(1000),
+            gids: ProcessGids::same(1000),
+            user: user(1000),
+            os: "linux".into(),
+            key: KeySource::Ephemeral,
+        }
+    }
+
+    /// The production pre-flight: `test_build = false`.
+    fn strict(check: &Preflight) -> Result<NodeKey, PreflightError> {
+        preflight(check, false)
     }
 
     fn key_file(mode: u32, bytes: &[u8]) -> tempfile::NamedTempFile {
@@ -660,11 +1103,21 @@ mod tests {
     #[test]
     fn refuses_root() {
         for key in [KeySource::Ephemeral, KeySource::File("/nonexistent".into())] {
-            let err = preflight(&Preflight { euid: 0, key }).unwrap_err();
+            let err = strict(&Preflight {
+                uids: ProcessUids::same(0),
+                gids: ProcessGids::same(0),
+                user: user(0),
+                os: "linux".into(),
+                key,
+            })
+            .unwrap_err();
             assert_eq!(err, PreflightError::Root);
         }
-        let key = preflight(&Preflight {
-            euid: 1000,
+        let key = strict(&Preflight {
+            uids: ProcessUids::same(1000),
+            gids: ProcessGids::same(1000),
+            user: user(1000),
+            os: "linux".into(),
             key: KeySource::Ephemeral,
         })
         .unwrap();
@@ -674,11 +1127,148 @@ mod tests {
         );
     }
 
+    /// A process whose real or saved UID differs from its effective UID can switch back (as after
+    /// `setpriv --euid` from root), so it is refused before the session user is compared. A
+    /// saved UID the platform cannot read (macOS) leaves the real and effective UIDs to compare.
+    #[test]
+    fn refuses_mixed_real_effective_or_saved_uids() {
+        for (uids, real, saved) in [
+            (
+                ProcessUids {
+                    real: 0,
+                    effective: 1000,
+                    saved: Some(1000),
+                },
+                0,
+                Some(1000),
+            ),
+            (
+                ProcessUids {
+                    real: 1000,
+                    effective: 1000,
+                    saved: Some(0),
+                },
+                1000,
+                Some(0),
+            ),
+            (
+                ProcessUids {
+                    real: 1001,
+                    effective: 1000,
+                    saved: None,
+                },
+                1001,
+                None,
+            ),
+        ] {
+            let check = Preflight {
+                uids,
+                gids: ProcessGids::same(1000),
+                user: user(1000),
+                os: "linux".into(),
+                key: KeySource::Ephemeral,
+            };
+            let want = PreflightError::MixedUids {
+                real,
+                effective: 1000,
+                saved,
+            };
+            assert_eq!(
+                check_process(&uids, &ProcessGids::same(1000)),
+                Err(want.clone())
+            );
+            assert_eq!(strict(&check).unwrap_err(), want);
+        }
+        assert_eq!(
+            PreflightError::MixedUids {
+                real: 0,
+                effective: 1000,
+                saved: Some(1000)
+            }
+            .to_string(),
+            "refusing to run with real UID 0, effective UID 1000 and saved UID 1000: the process \
+             could switch back to another UID; run m2a-session with all three set to its own user"
+        );
+        assert_eq!(
+            PreflightError::MixedUids {
+                real: 1001,
+                effective: 1000,
+                saved: None
+            }
+            .to_string(),
+            "refusing to run with real UID 1001, effective UID 1000 and saved UID unknown: the \
+             process could switch back to another UID; run m2a-session with all three set to its \
+             own user"
+        );
+        let macos = ProcessUids {
+            real: 1000,
+            effective: 1000,
+            saved: None,
+        };
+        assert_eq!(check_process(&macos, &ProcessGids::same(1000)), Ok(()));
+        assert_eq!(
+            check_process(&ProcessUids::same(0), &ProcessGids::same(0)),
+            Err(PreflightError::Root)
+        );
+    }
+
+    /// A non-root effective UID that is not the session user's is refused before the key is
+    /// read, and the error names the user and both UIDs. Root stays refused even if the
+    /// session user is root.
+    #[test]
+    fn refuses_an_euid_other_than_the_session_user() {
+        for key in [KeySource::Ephemeral, KeySource::File("/nonexistent".into())] {
+            let err = strict(&Preflight {
+                uids: ProcessUids::same(1000),
+                gids: ProcessGids::same(1000),
+                user: user(1001),
+                os: "linux".into(),
+                key,
+            })
+            .unwrap_err();
+            assert_eq!(
+                err,
+                PreflightError::WrongUser {
+                    euid: 1000,
+                    user: "m2a-session".into(),
+                    uid: 1001,
+                }
+            );
+            assert_eq!(
+                err.to_string(),
+                "refusing to run as effective UID 1000: run m2a-session as its own OS user \
+                 \"m2a-session\" (UID 1001), as run_as names it"
+            );
+        }
+        assert_eq!(
+            strict(&Preflight {
+                uids: ProcessUids::same(0),
+                gids: ProcessGids::same(0),
+                user: user(0),
+                os: "linux".into(),
+                key: KeySource::Ephemeral,
+            })
+            .unwrap_err(),
+            PreflightError::Root
+        );
+        assert!(strict(&Preflight {
+            uids: ProcessUids::same(1001),
+            gids: ProcessGids::same(1001),
+            user: user(1001),
+            os: "linux".into(),
+            key: KeySource::Ephemeral,
+        })
+        .is_ok());
+    }
+
     #[test]
     fn refuses_key_mode_0644() {
         let file = key_file(0o644, &[7; 32]);
-        let err = preflight(&Preflight {
-            euid: euid(),
+        let err = strict(&Preflight {
+            uids: ProcessUids::same(euid()),
+            gids: ProcessGids::same(euid()),
+            user: user(euid()),
+            os: "linux".into(),
             key: KeySource::File(file.path().into()),
         });
         assert!(
@@ -696,8 +1286,11 @@ mod tests {
     #[test]
     fn key_file_0600_owned_by_euid_loads() {
         let file = key_file(0o600, &[7; 32]);
-        let key = preflight(&Preflight {
-            euid: euid(),
+        let key = strict(&Preflight {
+            uids: ProcessUids::same(euid()),
+            gids: ProcessGids::same(euid()),
+            user: user(euid()),
+            os: "linux".into(),
             key: KeySource::File(file.path().into()),
         })
         .unwrap();
@@ -706,8 +1299,11 @@ mod tests {
 
     #[test]
     fn key_file_refusals() {
-        let check = |path: &Path, euid| match preflight(&Preflight {
-            euid,
+        let check = |path: &Path, euid| match strict(&Preflight {
+            uids: ProcessUids::same(euid),
+            gids: ProcessGids::same(euid),
+            user: user(euid),
+            os: "linux".into(),
             key: KeySource::File(path.into()),
         }) {
             Err(PreflightError::KeyFile { reason, .. }) => reason,

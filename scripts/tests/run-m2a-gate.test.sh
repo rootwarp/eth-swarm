@@ -47,6 +47,18 @@ echo 'x' > "$fx/fuzz/fuzz_targets/status_v2.rs"
 echo 'version = 4' > "$fx/fuzz/Cargo.lock"
 echo 'version = 4' > "$fx/Cargo.lock"
 printf 'target\nartifacts\n' > "$fx/fuzz/.gitignore"
+# The modules the keyed files import, which the keys hold too (fuzz/m2a-common.sh).
+for f in crates/cl-p2p/src/transport.rs crates/cl-p2p/src/transport/quota.rs \
+  crates/cl-p2p/src/behaviour.rs crates/cl-p2p/src/peer_caps.rs crates/cl-p2p/src/gossip/mod.rs \
+  crates/cl-p2p/src/lib.rs crates/cl-p2p/src/custody.rs crates/cl-p2p/src/identity.rs \
+  crates/cl-p2p/src/m2a_session.rs crates/cl-p2p/src/m2a_session/config.rs crates/cl-p2p/src/peers/mod.rs \
+  crates/cl-p2p/src/testkit.rs crates/cl-discv5/src/lib.rs crates/cl-discv5/src/enr.rs \
+  crates/cl-discv5/src/metrics.rs crates/cl-discv5/src/service.rs crates/cl-chain-columns/src/lib.rs \
+  crates/ethswarm-proto/src/lib.rs crates/ipc/src/lib.rs proto/ethswarm/chain/v1/reqresp.proto \
+  crates/network-config/src/lib.rs; do
+  mkdir -p "$(dirname "$fx/$f")"
+  [[ -e $fx/$f ]] || echo 'x' > "$fx/$f"
+done
 git init -q "$fx"
 g add -A
 g commit -q -m fixture

@@ -38,7 +38,8 @@ g() { git -C "$fx" -c user.name=t -c user.email=t@example.invalid -c commit.gpgs
 # The fixture repo: every keyed path, the scripts, one commit.
 fx="$tmp/repo"
 mkdir -p "$fx/fuzz/src" "$fx/fuzz/fuzz_targets" \
-  "$fx/crates/p2p-wire/src" "$fx/crates/consensus-types/src" "$fx/crates/cl-p2p/src/rpc"
+  "$fx/crates/p2p-wire/src" "$fx/crates/consensus-types/src" "$fx/crates/cl-p2p/src/rpc" \
+  "$fx/crates/cl-p2p/src/transport" "$fx/crates/cl-p2p/src/gossip"
 for t in status_v2 metadata_v3 ping_goodbye blocks_by_range_resp; do
   mkdir -p "$fx/fuzz/corpus/$t"
   printf 'seed-%s' "$t" > "$fx/fuzz/corpus/$t/valid"
@@ -57,6 +58,20 @@ echo 'pub fn read() {}' > "$fx/crates/cl-p2p/src/rpc/codec.rs"
 echo 'pub struct ChunkPacer;' > "$fx/crates/cl-p2p/src/rpc/limits.rs"
 echo 'pub struct RpcMetrics;' > "$fx/crates/cl-p2p/src/rpc/metrics.rs"
 echo 'pub struct Unsupported;' > "$fx/crates/cl-p2p/src/rpc/unsupported.rs"
+echo 'pub struct AnswerBucket;' > "$fx/crates/cl-p2p/src/rpc/answer_bucket.rs"
+echo 'pub struct Columns;' > "$fx/crates/cl-p2p/src/rpc/columns.rs"
+echo 'mod quota;' > "$fx/crates/cl-p2p/src/transport.rs"
+echo 'pub struct Budget;' > "$fx/crates/cl-p2p/src/transport/quota.rs"
+echo 'pub struct SpecBehaviour;' > "$fx/crates/cl-p2p/src/behaviour.rs"
+echo 'pub struct PeerCaps;' > "$fx/crates/cl-p2p/src/peer_caps.rs"
+echo 'pub mod config;' > "$fx/crates/cl-p2p/src/gossip/mod.rs"
+echo 'pub struct GossipConfig;' > "$fx/crates/cl-p2p/src/gossip/config.rs"
+mkdir -p "$fx/crates/cl-p2p/src/m2a_session" "$fx/crates/cl-p2p/src/peers" "$fx/crates/network-config/src"
+echo 'pub struct ChainConfig;' > "$fx/crates/network-config/src/lib.rs"
+echo 'pub mod rpc;' > "$fx/crates/cl-p2p/src/lib.rs"
+for f in custody.rs identity.rs m2a_session.rs m2a_session/config.rs peers/mod.rs testkit.rs; do
+  echo "// $f" > "$fx/crates/cl-p2p/src/$f"
+done
 echo '[package]' > "$fx/fuzz/Cargo.toml"
 printf '[toolchain]\nchannel = "nightly-2026-10-17"\n' > "$fx/fuzz/rust-toolchain.toml"
 echo 'pub fn run() {}' > "$fx/fuzz/src/lib.rs"
@@ -286,7 +301,11 @@ ok="$tmp/ok.json"
 for path in Cargo.toml Cargo.lock fuzz/Cargo.lock crates/p2p-wire/src/lib.rs crates/consensus-types/src/lib.rs \
   crates/cl-p2p/Cargo.toml crates/cl-p2p/src/rpc/mod.rs crates/cl-p2p/src/rpc/codec.rs \
   crates/cl-p2p/src/rpc/limits.rs crates/cl-p2p/src/rpc/metrics.rs crates/cl-p2p/src/rpc/unsupported.rs \
-  fuzz/Cargo.toml fuzz/rust-toolchain.toml fuzz/src/lib.rs fuzz/fuzz_targets/status_v2.rs \
+  crates/cl-p2p/src/rpc/answer_bucket.rs crates/cl-p2p/src/rpc/columns.rs crates/cl-p2p/src/transport.rs \
+  crates/cl-p2p/src/transport/quota.rs crates/cl-p2p/src/behaviour.rs crates/cl-p2p/src/peer_caps.rs \
+  crates/cl-p2p/src/gossip/mod.rs crates/cl-p2p/src/gossip/config.rs crates/cl-p2p/src/lib.rs \
+  crates/cl-p2p/src/identity.rs crates/cl-p2p/src/m2a_session/config.rs crates/cl-p2p/src/peers/mod.rs \
+  crates/network-config/src/lib.rs fuzz/Cargo.toml fuzz/rust-toolchain.toml fuzz/src/lib.rs fuzz/fuzz_targets/status_v2.rs \
   fuzz/corpus/status_v2/valid fuzz/corpus-slow/blocks_by_range_resp/slow-seed fuzz/m2a-common.sh fuzz/build-m2a.sh fuzz/run-m2a-gate.sh; do
   echo '# changed' >> "$fx/$path"
   g commit -q -am "change $path"
@@ -296,7 +315,7 @@ done
 check pass "valid again at the keyed commit" "" bash "$checker" "$ok"
 
 # A change outside the key does not.
-echo 'pub fn other() {}' > "$fx/crates/cl-p2p/src/lib.rs"
+echo 'fn main() {}' > "$fx/crates/cl-p2p/src/main.rs"
 g add -A
 g commit -q -m "outside the key"
 check pass "a commit outside the key keeps the gate" "" bash "$checker" "$ok"

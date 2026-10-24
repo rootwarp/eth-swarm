@@ -148,7 +148,7 @@ fn gossip_transform_decodes_only_subscribed_topics() {
         TopicCaps::gloas::<consensus_types::Mainnet>(&NetworkCaps::from_blob_schedule(21, &[]));
     let cfg = GossipConfig::new(
         vec![GossipTopic::new([0; 4], GossipKind::BeaconBlock)],
-        caps,
+        caps.clone(),
         std::time::Duration::from_secs(60),
     );
     let transform = cfg.transform(&cfg.topic_set().unwrap());

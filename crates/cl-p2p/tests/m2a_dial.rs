@@ -277,7 +277,10 @@ async fn disconnect_without_a_connection_is_a_no_op() {
 
 // The binary, end to end.
 
-const BIN: &str = env!("CARGO_BIN_EXE_m2a-session");
+/// The test binary: the session's code with `test_build = true`, so it runs as the test user.
+const BIN: &str = env!("CARGO_BIN_EXE_m2a-session-test");
+/// The deployed binary, `test_build = false`.
+const PRODUCTION_BIN: &str = env!("CARGO_BIN_EXE_m2a-session");
 const SECRET: [u8; 32] = [7; 32];
 
 fn euid() -> u32 {
@@ -293,9 +296,38 @@ fn secret_peer_id() -> PeerId {
         .to_peer_id()
 }
 
-/// A config file pinning `peer_id` at `addr`, with the 0600 key file holding [`SECRET`].
-fn config_dir(addr: &Multiaddr, peer_id: PeerId) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
+/// A config file pinning `peer_id` at `addr`, with the 0600 key file holding [`SECRET`], for
+/// the session user the tests run as; `None` (and `test` is skipped, with the reason printed)
+/// if that user has no portable passwd entry ([`cl_p2p::testkit::os_user_name`]).
+/// A config directory the real binary takes: under [`cl_p2p::testkit::config_root`] (no symlink
+/// on the path), and read-only while it lives, because the test user owns it and the session
+/// refuses a config in a directory its own user can write.
+struct ConfigDir {
+    // Dropped first: the directory is writable again before it is removed.
+    _sealed: cl_p2p::testkit::Sealed,
+    dir: tempfile::TempDir,
+}
+
+impl ConfigDir {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+fn config_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .tempdir_in(cl_p2p::testkit::config_root())
+        .unwrap()
+}
+
+fn config_dir(addr: &Multiaddr, peer_id: PeerId, test: &str) -> Option<ConfigDir> {
+    let name = cl_p2p::testkit::os_user_name(test)?;
+    Some(config_dir_as(addr, peer_id, &name))
+}
+
+/// [`config_dir`] with `run_as` set to `run_as`.
+fn config_dir_as(addr: &Multiaddr, peer_id: PeerId, run_as: &str) -> ConfigDir {
+    let dir = config_tempdir();
     let key = dir.path().join("node.key");
     let mut file = std::fs::File::create(&key).unwrap();
     file.write_all(&SECRET).unwrap();
@@ -303,11 +335,17 @@ fn config_dir(addr: &Multiaddr, peer_id: PeerId) -> tempfile::TempDir {
     let text = format!(
         "network = \"sepolia\"\npeer = \"{addr}/p2p/{peer_id}\"\n\
          reference_api_url = \"http://127.0.0.1:5052\"\nnode_key = \"{}\"\n\
-         trusted_by_reference = true\n",
+         trusted_by_reference = true\nrun_as = \"{run_as}\"\n",
         key.display()
     );
-    std::fs::write(dir.path().join("m2a-session.toml"), text).unwrap();
-    dir
+    let config = dir.path().join("m2a-session.toml");
+    std::fs::write(&config, text).unwrap();
+    // Read-only: the session refuses a config its own effective UID can write.
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o444)).unwrap();
+    ConfigDir {
+        _sealed: cl_p2p::testkit::Sealed::new(dir.path()),
+        dir,
+    }
 }
 
 /// Every stderr line is one JSON object with a level, fields and a target, as svc-runtime logs
@@ -332,10 +370,51 @@ async fn run_bin(dir: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+/// The deployed binary is strict in every build, this test build included: with the config, the
+/// key and the `run_as` the test binary takes, it refuses before it dials (the config is the test
+/// user's, not root's; `run_as` is not `m2a-session`), and it never says it is a test build. The
+/// test binary says so first.
+#[tokio::test]
+async fn the_production_binary_refuses_what_the_test_binary_takes() {
+    let peer = RefPeer::spawn(Offers::MplexAndYamux).await;
+    let Some(dir) = config_dir(
+        &peer.addr,
+        peer.id,
+        "the_production_binary_refuses_what_the_test_binary_takes",
+    ) else {
+        return;
+    };
+    let config = dir.path().join("m2a-session.toml");
+    let out = tokio::task::spawn_blocking(move || {
+        Command::new(PRODUCTION_BIN)
+            .arg("--config")
+            .arg(config)
+            .arg("--dial-only")
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("refused"), "{stderr}");
+    assert!(!stderr.contains("TEST BUILD"), "{stderr}");
+    assert!(peer.upgrades().is_empty(), "no dial");
+    let test = run_bin(dir.path(), &["--dial-only", "--connect-timeout-secs", "20"]).await;
+    let test_stderr = String::from_utf8_lossy(&test.stderr);
+    if euid() != 0 {
+        assert_eq!(test.status.code(), Some(0), "{test_stderr}");
+    }
+    let first = test_stderr.lines().next().unwrap_or_default();
+    assert!(first.contains("TEST BUILD"), "{test_stderr}");
+}
+
 #[tokio::test]
 async fn dial_only_binary_connects_and_exits_0() {
     let peer = RefPeer::spawn(Offers::MplexAndYamux).await;
-    let dir = config_dir(&peer.addr, peer.id);
+    let Some(dir) = config_dir(&peer.addr, peer.id, "dial_only_binary_connects_and_exits_0") else {
+        return;
+    };
     let out = run_bin(dir.path(), &["--dial-only", "--connect-timeout-secs", "20"]).await;
     let stderr = String::from_utf8_lossy(&out.stderr);
     if euid() == 0 {
@@ -350,11 +429,38 @@ async fn dial_only_binary_connects_and_exits_0() {
     peer.wait_until_every_connection_closed().await;
 }
 
+/// A run as a login user that is not `run_as` exits 2 before it dials, and the error names the
+/// session user: `root` is UID 0 on every host, so a non-root test user is never it.
+#[tokio::test]
+async fn binary_refuses_a_user_other_than_run_as() {
+    let peer = RefPeer::spawn(Offers::MplexAndYamux).await;
+    let dir = config_dir_as(&peer.addr, peer.id, "root");
+    let out = run_bin(dir.path(), &["--dial-only", "--connect-timeout-secs", "20"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    if euid() != 0 {
+        assert!(
+            stderr.contains(&format!("refusing to run as effective UID {}", euid())),
+            "{stderr}"
+        );
+        assert!(stderr.contains("\\\"root\\\" (UID 0)"), "{stderr}");
+    }
+    assert_json_lines(&stderr);
+    assert!(peer.upgrades().is_empty(), "no dial");
+    let dir = config_dir_as(&peer.addr, peer.id, "ethswarm-no-such-u");
+    let out = run_bin(dir.path(), &["--dial-only"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("no OS user"), "{stderr}");
+}
+
 #[tokio::test]
 async fn dial_only_binary_wrong_peer_id_exits_1() {
     let peer = RefPeer::spawn(Offers::MplexAndYamux).await;
     let pinned = PeerId::from(Keypair::generate_secp256k1().public());
-    let dir = config_dir(&peer.addr, pinned);
+    let Some(dir) = config_dir(&peer.addr, pinned, "dial_only_binary_wrong_peer_id_exits_1") else {
+        return;
+    };
     let out = run_bin(dir.path(), &["--dial-only", "--connect-timeout-secs", "20"]).await;
     let stderr = String::from_utf8_lossy(&out.stderr);
     if euid() == 0 {
@@ -371,7 +477,13 @@ async fn dial_only_binary_wrong_peer_id_exits_1() {
 async fn print_peer_id_binary_prints_the_key_files_peer_id() {
     // Nothing listens at the pinned address: printing the peer ID never dials.
     let addr: Multiaddr = "/ip4/127.0.0.1/tcp/9".parse().unwrap();
-    let dir = config_dir(&addr, PeerId::random());
+    let Some(dir) = config_dir(
+        &addr,
+        PeerId::random(),
+        "print_peer_id_binary_prints_the_key_files_peer_id",
+    ) else {
+        return;
+    };
     let out = run_bin(dir.path(), &["--print-peer-id"]).await;
     let stderr = String::from_utf8_lossy(&out.stderr);
     if euid() == 0 {

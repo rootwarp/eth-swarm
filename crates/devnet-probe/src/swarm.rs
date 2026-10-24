@@ -19,7 +19,7 @@ use consensus_types::das::CUSTODY_REQUIREMENT;
 use consensus_types::EthSpec;
 use libp2p::identity::Keypair;
 use libp2p::{Multiaddr, PeerId, Swarm};
-use p2p_wire::gossip::{GossipKind, GossipTopic, TopicCaps};
+use p2p_wire::gossip::{GossipKind, GossipTopic};
 use p2p_wire::rpc::messages::{ForkDigest, MetaDataV3};
 use prometheus_client::registry::Registry;
 use std::sync::Arc;
@@ -140,9 +140,11 @@ pub fn serving_swarm<E: EthSpec>(
     match gossip {
         None => build_swarm(key, &cfg, control).map_err(|e| e.to_string()),
         Some(gossip) => {
-            let caps = TopicCaps::gloas::<E>(&NetworkCaps::from_config(devnet.config()));
-            let gossip_cfg =
-                GossipConfig::ethereum_profile::<E>(devnet.config(), gossip.topics, caps);
+            let gossip_cfg = GossipConfig::ethereum_profile::<E>(
+                devnet.config(),
+                gossip.topics,
+                devnet.topic_caps::<E>(),
+            );
             let mut ignore_all = IgnoreAll::new(&gossip_cfg, &mut registry)
                 .map_err(|e| format!("gossipsub: {e}"))?;
             if let Some(tap) = gossip.tap {

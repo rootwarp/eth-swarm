@@ -31,6 +31,87 @@ use std::time::Duration;
 /// The custody group count [`control`] advertises.
 pub const FIXTURE_CGC: u64 = 4;
 
+/// The name of the OS user the tests run as: the `run_as` a test gives the `m2a-session`
+/// binary, so its pre-flight takes the test's own effective UID. `None`, with the reason printed
+/// to stderr for `test`, if there is no such name ([`session_user_name`]): the caller skips.
+pub fn os_user_name(test: &str) -> Option<String> {
+    let out = std::process::Command::new("id").arg("-un").output().ok();
+    let name = out
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok());
+    let euid = rustix::process::geteuid().as_raw();
+    match session_user_name(name.as_deref(), crate::m2a_session::os_user::uid_of, euid) {
+        Ok(name) => Some(name),
+        Err(why) => {
+            eprintln!("{test}: skipped: {why}");
+            None
+        }
+    }
+}
+
+/// The session user of a test from the output of `id -un`: a portable name
+/// ([`crate::m2a_session::os_user::is_valid_name`]) whose passwd entry (`uid_of`) is `euid`.
+///
+/// # Errors
+///
+/// Why there is none: no output (`id -un` failed, as under `docker --user <uid>` with no
+/// passwd entry), a name that is not portable, or one with no entry or another UID.
+pub fn session_user_name(
+    id_un: Option<&str>,
+    uid_of: fn(&str) -> Result<u32, crate::m2a_session::os_user::UserError>,
+    euid: u32,
+) -> Result<String, String> {
+    let Some(name) = id_un.map(str::trim) else {
+        return Err("`id -un` failed: the effective UID has no passwd entry".into());
+    };
+    if !crate::m2a_session::os_user::is_valid_name(name) {
+        return Err(format!("the user name {name:?} is not portable"));
+    }
+    match uid_of(name) {
+        Ok(uid) if uid == euid => Ok(name.to_owned()),
+        Ok(uid) => Err(format!(
+            "the user {name:?} is UID {uid}, not the effective UID {euid}"
+        )),
+        Err(_) => Err(format!("the user {name:?} has no passwd entry")),
+    }
+}
+
+/// Where a test puts an m2a-session config: a root-owned, sticky temp directory reached
+/// with no symlink (`/private/tmp` on macOS, whose `/tmp` and `/var` are symlinks; `/tmp`
+/// elsewhere), so the session's config check takes every directory above the test's own.
+pub fn config_root() -> std::path::PathBuf {
+    let private = std::path::Path::new("/private/tmp");
+    match std::fs::symlink_metadata(private) {
+        Ok(meta) if meta.is_dir() => private.to_path_buf(),
+        _ => std::path::PathBuf::from("/tmp"),
+    }
+}
+
+/// A directory made read-only (0555) for as long as this lives, then 0700 again (so its temp
+/// directory can be removed): a test that runs as the directory's owner needs it so, because
+/// the session refuses a config in a directory its own user can write.
+pub struct Sealed(std::path::PathBuf);
+
+impl Sealed {
+    /// Makes `dir` read-only.
+    ///
+    /// # Panics
+    ///
+    /// If its mode cannot be set.
+    pub fn new(dir: &std::path::Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).expect("chmod 0555");
+        Self(dir.to_path_buf())
+    }
+}
+
+impl Drop for Sealed {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
 /// MetaData with `seq_number` and `custody_group_count`, no subnets: what the probe advertises.
 pub fn local_metadata(seq_number: u64, custody_group_count: u64) -> MetaDataV3 {
     MetaDataV3 {
@@ -503,6 +584,45 @@ fn refused(addr: std::net::SocketAddr) -> Result<std::net::SocketAddr, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::session_user_name;
+    use crate::m2a_session::os_user::UserError;
+
+    fn uid_of(name: &str) -> Result<u32, UserError> {
+        match name {
+            "alice" => Ok(1000),
+            "bob" => Ok(1001),
+            other => Err(UserError::NotFound(other.to_owned())),
+        }
+    }
+
+    /// The tests' session user: the `id -un` name, if it is a portable name whose passwd entry
+    /// gives the effective UID. Else none, and the test that needs one is skipped: `id -un`
+    /// fails under `docker --user <uid>` with no passwd entry.
+    #[test]
+    fn the_session_user_needs_a_portable_name_with_the_euid() {
+        assert_eq!(
+            session_user_name(Some("alice\n"), uid_of, 1000),
+            Ok("alice".to_owned())
+        );
+        for (output, why) in [
+            (
+                None,
+                "`id -un` failed: the effective UID has no passwd entry",
+            ),
+            (Some("a b\n"), "the user name \"a b\" is not portable"),
+            (
+                Some("bob\n"),
+                "the user \"bob\" is UID 1001, not the effective UID 1000",
+            ),
+            (Some("carol\n"), "the user \"carol\" has no passwd entry"),
+        ] {
+            assert_eq!(
+                session_user_name(output, uid_of, 1000),
+                Err(why.to_owned()),
+                "{output:?}"
+            );
+        }
+    }
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 

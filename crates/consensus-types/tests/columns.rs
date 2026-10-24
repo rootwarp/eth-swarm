@@ -4,8 +4,8 @@
 mod common;
 
 use consensus_types::caps::{
-    compute_max_data_column_sidecar_size, max_size, max_size_for, type_max_len, NetworkCaps,
-    ObjectKind,
+    compute_max_data_column_sidecar_size, fulu_data_column_sidecar_size, max_size, max_size_for,
+    type_max_len, NetworkCaps, ObjectKind,
 };
 use consensus_types::codec::{check_size, check_size_for, decode, decode_for, DecodeError, Object};
 use consensus_types::forked::DataColumnSidecar;
@@ -205,6 +205,32 @@ fn fulu_cap_is_the_type_bound() {
         decode_for::<Minimal>(KIND, ForkName::Fulu, &NetworkCaps::PRESET_BOUND, &full).unwrap(),
         Object::DataColumnSidecar(DataColumnSidecar::Fulu(s)) if s.column.len() == 4_096
     ));
+}
+
+/// The Fulu sidecar of `n` blobs is 356 fixed bytes and 2,144 per blob (a cell, a commitment
+/// and a proof), as serialized, in both presets: 45,380 at 21 blobs, the BPO2 limit of Sepolia
+/// and Hoodi.
+#[test]
+fn fulu_sidecar_size_is_the_serialized_length() {
+    for blobs in [0_u64, 1, 9, 15, 21, 4_096] {
+        let n = blobs as usize;
+        assert_eq!(
+            fulu_data_column_sidecar_size::<Mainnet>(blobs),
+            fulu_sidecar::<Mainnet>(n, 0).as_ssz_bytes().len() as u64,
+            "{blobs}"
+        );
+        assert_eq!(
+            fulu_data_column_sidecar_size::<Minimal>(blobs),
+            fulu_sidecar::<Minimal>(n, 0).as_ssz_bytes().len() as u64,
+            "{blobs}"
+        );
+        assert_eq!(
+            fulu_data_column_sidecar_size::<Mainnet>(blobs),
+            356 + blobs * 2_144
+        );
+    }
+    assert_eq!(fulu_data_column_sidecar_size::<Mainnet>(21), 45_380);
+    assert_eq!(fulu_data_column_sidecar_size::<Mainnet>(u64::MAX), u64::MAX);
 }
 
 /// Fulu keeps `MAX_BLOB_COMMITMENTS_PER_BLOCK`, `NUMBER_OF_COLUMNS` and the `LIMIT = 1` of

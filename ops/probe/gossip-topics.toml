@@ -18,18 +18,20 @@
 #     (46,898 bytes) still fits; it is computed for the two-fork set of every topic, which
 #     this list is a subset of, so nothing is recomputed.
 #
-# Byte budget on Sepolia (21 blobs at most): what one message may hold once decompressed;
-# the transform refuses more before decompressing. beacon_block and execution_payload are capped
-# at MAX_PAYLOAD_SIZE (10 MiB).
+# Byte budget on Sepolia (21 blobs at most): what one message may hold once decompressed, the
+# largest cap of each topic over the fork digests of the schedule; the transform refuses more
+# before decompressing, each digest at its own fork's cap. beacon_block and execution_payload
+# are capped at MAX_PAYLOAD_SIZE (10 MiB). data_column_sidecar is the Fulu sidecar of 21 blobs
+# (the BPO2 digest), over the Gloas digest's 44072 bytes.
 #   beacon_block: 10485760 bytes
 #   beacon_aggregate_and_proof: 16829 bytes
 #   execution_payload_bid: 196932 bytes
 #   execution_payload: 10485760 bytes
 #   payload_attestation_message: 146 bytes
 #   beacon_attestation_{subnet_id}: 240 bytes
-#   data_column_sidecar_{subnet_id}: 44072 bytes
+#   data_column_sidecar_{subnet_id}: 45380 bytes
 # largest message: 10485760 bytes
-# one message of every topic: 21362195 bytes
+# one message of every topic: 21367427 bytes
 topics = [
     "beacon_block",
     "beacon_aggregate_and_proof",

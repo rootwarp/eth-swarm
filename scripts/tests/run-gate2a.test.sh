@@ -53,6 +53,19 @@ printf '[toolchain]\nchannel = "nightly-2026-10-17"\n' > "$fx/fuzz/rust-toolchai
 echo 'version = 4' > "$fx/fuzz/Cargo.lock"
 echo 'version = 4' > "$fx/Cargo.lock"
 printf 'target\nartifacts\n' > "$fx/fuzz/.gitignore"
+# The modules the keyed files import, which the keys hold too (fuzz/m2a-common.sh).
+for f in crates/cl-p2p/src/transport.rs crates/cl-p2p/src/transport/quota.rs \
+  crates/cl-p2p/src/behaviour.rs crates/cl-p2p/src/peer_caps.rs crates/cl-p2p/src/gossip/mod.rs \
+  crates/cl-chain/src/probe.rs crates/cl-chain/src/probe/ingest.rs crates/cl-chain/src/da/custody.rs \
+  crates/cl-chain/src/verify/client.rs \
+  crates/cl-p2p/src/lib.rs crates/cl-p2p/src/custody.rs crates/cl-p2p/src/identity.rs \
+  crates/cl-p2p/src/m2a_session.rs crates/cl-p2p/src/m2a_session/config.rs crates/cl-p2p/src/peers/mod.rs \
+  crates/cl-p2p/src/testkit.rs crates/cl-discv5/src/lib.rs crates/cl-discv5/src/enr.rs \
+  crates/cl-discv5/src/metrics.rs crates/cl-discv5/src/service.rs crates/cl-chain-columns/src/lib.rs \
+  crates/ethswarm-proto/src/lib.rs crates/ipc/src/lib.rs proto/ethswarm/chain/v1/reqresp.proto; do
+  mkdir -p "$(dirname "$fx/$f")"
+  [[ -e $fx/$f ]] || echo 'x' > "$fx/$f"
+done
 git init -q "$fx"
 g add -A
 g commit -q -m fixture
@@ -113,9 +126,9 @@ for t in rpc_chunk gossip_transform message_id enr_fields status_v2 metadata_v3 
 done
 [[ -z $others ]] && ok "no other gate's target is run" || bad "ran:$others"
 key=$(gate_run -- "$fx/fuzz/check-gate2a.sh" --print-key)
-grep -q '"crates/cl-p2p/src/rpc/columns.rs"' <<<"$key" && grep -q '"crates/cl-chain/src/reqresp.rs"' <<<"$key" \
-  && grep -q '"crates/cl-chain/Cargo.toml"' <<<"$key" \
-  && grep -q '"crates/cl-p2p/src/rpc/codec.rs"' <<<"$key" && grep -q '"crates/p2p-wire"' <<<"$key" \
+grep -q '"crates/cl-p2p/src/rpc"' <<<"$key" && grep -q '"crates/cl-chain/src"' <<<"$key" \
+  && grep -q '"crates/cl-chain/Cargo.toml"' <<<"$key" && grep -q '"crates/ethswarm-proto"' <<<"$key" \
+  && grep -q '"crates/cl-p2p/src/transport"' <<<"$key" && grep -q '"crates/p2p-wire"' <<<"$key" \
   && grep -q '"fuzz/run-gate2a.sh"' <<<"$key" && grep -q '"crates/network-config"' <<<"$key" \
   && ok "gate 2a's key holds the column codec, request and network-config paths" || bad "key" "$key"
 ! grep -q '"crates/cl-discv5/src/enr.rs"' <<<"$key" && ! grep -q '"fuzz/run-gate1.sh"' <<<"$key" \

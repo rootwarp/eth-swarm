@@ -5,7 +5,7 @@ use cl_discv5::enr::{parse_enr_fields, EnrFields, FieldError};
 use cl_p2p::rpc::codec::{read_response_chunks, ReadError, MAX_RESPONSE_BYTES};
 use consensus_types::caps::MAX_PAYLOAD_SIZE;
 use ethswarm_fuzz::seeds::{self, Seed};
-use ethswarm_fuzz::{contexts, split_message, structured_record, topic_caps, E};
+use ethswarm_fuzz::{contexts, gossip_digests, split_message, structured_record, topic_caps, E};
 use futures::executor::block_on;
 use futures::io::Cursor;
 use network_config::{ChainConfig, Network};
@@ -466,6 +466,10 @@ fn inbound(target: &str, name: &str) -> (String, Result<Vec<u8>, TransformError>
 fn gossip_seeds() {
     let caps = topic_caps();
     let block_cap = caps.cap(GossipKind::BeaconBlock);
+    assert_eq!(
+        caps.cap(GossipKind::DataColumnSidecar { subnet_id: 0 }),
+        45_380
+    );
     for target in ["gossip_transform", "message_id"] {
         let got = |name: &str| inbound(target, name).1;
         let declared = |name: &str| match got(name) {
@@ -478,12 +482,43 @@ fn gossip_seeds() {
             consensus_types::ForkName::Gloas,
         )
         .expect("a Gloas block");
-        assert!(got("block-fulu-digest-valid").is_ok());
-        assert!(got("block-fulu-bpo-digest-valid").is_ok());
-        assert!(
-            got("block-unsubscribed-digest").is_ok(),
-            "the digest is not subscribed, but parses"
-        );
+        // One valid block under each digest of the Sepolia schedule, held to that digest's
+        // caps (`TopicCaps::from_config`).
+        let digests = gossip_digests();
+        assert_eq!(digests.len(), 4);
+        for (name, (digest, _, _)) in [
+            "block-fulu-digest-valid",
+            "block-fulu-bpo1-digest-valid",
+            "block-fulu-bpo2-digest-valid",
+            "block-gloas-valid",
+        ]
+        .into_iter()
+        .zip(digests)
+        {
+            let (topic, ssz) = inbound(target, name);
+            assert_eq!(
+                GossipTopic::parse(&topic).unwrap().fork_digest,
+                *digest,
+                "{name}"
+            );
+            assert!(ssz.is_ok(), "{target}/{name}");
+        }
+        // No cap: a digest off the schedule, and a Gloas topic under a Fulu digest.
+        for name in ["block-unsubscribed-digest", "bid-on-fulu-digest"] {
+            assert!(
+                matches!(got(name), Err(TransformError::NoCap(_))),
+                "{target}/{name}: {:?}",
+                got(name)
+            );
+        }
+        // The column sidecar under each Fulu digest: its blob limit's sidecar passes, a byte
+        // more is refused (Sepolia: 9, 15 and 21 blobs).
+        for (n, cap) in [(1, 19_652), (2, 32_516), (3, 45_380)] {
+            let at = format!("column-0-fulu-{n}-at-cap");
+            assert_eq!(got(&at).map(|d| d.len()), Ok(cap), "{target}/{at}");
+            let over = format!("column-0-fulu-{n}-over-cap");
+            assert_eq!(declared(&over), (cap + 1, cap), "{target}/{over}");
+        }
         assert_eq!(
             declared("block-declares-over-10mib"),
             (MAX_PAYLOAD_SIZE + 1, block_cap)
@@ -532,8 +567,8 @@ fn gossip_seeds() {
         ] {
             let (topic, empty) = inbound(target, &format!("{name}-empty"));
             assert_eq!(empty, Ok(Vec::new()), "{target}/{name}-empty");
-            let kind = GossipTopic::parse(&topic).unwrap().kind;
-            let cap = caps.cap(kind);
+            let topic = GossipTopic::parse(&topic).unwrap();
+            let cap = caps.cap_at(topic.fork_digest, topic.kind).unwrap();
             assert_eq!(
                 declared(&format!("{name}-over-cap")),
                 (cap + 1, cap),

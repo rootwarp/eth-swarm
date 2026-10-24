@@ -38,17 +38,17 @@ const VECTOR_SEEDS: [(&str, &str, &str); 7] = [
     (
         "gossip_transform",
         "gloas-vector-case_0",
-        "76c28c90bf9e180cba0e6ef510caa3341c9324566481f967f893b2582598076a",
+        "a579cdc043877c62e2a69a7e38dae05807496a08653fc4e2b04fd19bd0425622",
     ),
     (
         "gossip_transform",
         "gloas-vector-case_1",
-        "e033f7a7f9633cb64d5a1375ffad8ac59fc5f87cb632d34f86dfd20c89a5f6b6",
+        "8fafb36a1127dd9412b0781821fecdfdb09a79e1002323c1ea935cde0c2587bd",
     ),
     (
         "gossip_transform",
         "gloas-vector-case_2",
-        "e2a13bfa700b28d80c4aa24cccfe52b85ef7a767672f940a9cd4b316c242c056",
+        "6b50382bd86443ef7d89659015129a89c87c8976208bd63157f8159a598bb5d9",
     ),
 ];
 

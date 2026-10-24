@@ -215,7 +215,8 @@ pub struct GossipConfig {
     /// The topics subscribed at start. Every other topic stays unsubscribed unless
     /// [`super::IgnoreAll::subscribe`] adds it.
     pub topics: Vec<GossipTopic>,
-    /// The uncompressed cap of each topic kind.
+    /// The uncompressed cap of each topic kind under each fork digest
+    /// (`TopicCaps::from_config` on a real network).
     pub caps: TopicCaps,
     /// How long a seen message-id is remembered.
     pub seen_ttl: Duration,
@@ -330,7 +331,7 @@ impl GossipConfig {
 
     /// The data transform for these caps, over `topics`.
     pub fn transform(&self, topics: &TopicSet) -> WireTransform {
-        WireTransform::shared(SnappyTransform::new(self.caps), topics.clone())
+        WireTransform::shared(SnappyTransform::new(self.caps.clone()), topics.clone())
     }
 }
 

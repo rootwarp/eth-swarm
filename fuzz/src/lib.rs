@@ -58,7 +58,9 @@ pub use contract::{
     MAX_REQUESTS, MISSING_CELL, MISSING_PROOF, OPS, OP_GOSSIP, OP_RANGE, OP_RAW_GOSSIP,
     OP_RAW_RANGE, OP_RAW_ROOT, OP_ROOT, SLOT_AFTER, UNKNOWN_ROOT, WRONG_SUBNET,
 };
-pub use gossip::{gossip_transform, message_id, message_input, split_message, topic_caps};
+pub use gossip::{
+    gossip_digests, gossip_transform, message_id, message_input, split_message, topic_caps,
+};
 pub use record::{
     enr_fields, signed_record, structured_input, structured_record, RecordSpec, RecordValue,
     MAX_RECORD_LEN, STRUCTURED_BIT,

@@ -36,9 +36,18 @@ M2A_BUILD_FLAGS=(-O -a)
 
 # The gate's decoder key: what the fuzzed decoder and its harness are built and run from. A
 # change to any of these makes a gate file stale. `git rev-parse HEAD:<path>` of each path, plus
-# the sha256 of both lockfiles. network-config is outside the key: none of its code runs on
-# peer bytes (the ContextTable is injected). cl-p2p's rpc codec is keyed with the modules it
-# imports (limits, metrics) and the one metrics imports (unsupported). The manifests are in it
+# the sha256 of both lockfiles. network-config is keyed: consensus-types' by-slot decoders map a
+# peer's slot through its ForkSchedule, and the caps come from its pinned configs. cl-p2p's
+# library is keyed from its crate root
+# (lib.rs, so a #[path] or mod edit there makes the gate stale) through every module a keyed
+# file imports, transitively: the rpc directory whole, transport (metrics imports its
+# Direction) and its child modules, behaviour and peer_caps (the swarm builder imports them),
+# gossip, and the modules lib.rs declares. Its binaries (main.rs, src/bin) are not keyed.
+# crates/ci-checks/tests/fuzz_keys.rs fails if a keyed file imports a module (crate::, super::,
+# self::, a child mod) that no key holds, if a keyed module's crate root is not keyed, or if
+# keyed code imports a workspace path crate that the gate neither keys nor allows for that
+# importing file with a reason (its ALLOWED list: ethswarm-proto, ipc, node-key and the crates
+# only other gates' targets import). The manifests are in it
 # because features (root [workspace.dependencies] included) change the build without changing
 # the lockfile; the harness, seeds and these scripts (limits, build flags) because a weaker run
 # must not keep an old gate. fuzz/Cargo.lock is what the targets link; the root Cargo.lock is
@@ -48,12 +57,21 @@ M2A_KEY_PATHS=(
   Cargo.toml
   crates/p2p-wire
   crates/consensus-types
+  crates/network-config
   crates/cl-p2p/Cargo.toml
-  crates/cl-p2p/src/rpc/mod.rs
-  crates/cl-p2p/src/rpc/codec.rs
-  crates/cl-p2p/src/rpc/limits.rs
-  crates/cl-p2p/src/rpc/metrics.rs
-  crates/cl-p2p/src/rpc/unsupported.rs
+  crates/cl-p2p/src/lib.rs
+  crates/cl-p2p/src/rpc
+  crates/cl-p2p/src/transport.rs
+  crates/cl-p2p/src/transport
+  crates/cl-p2p/src/behaviour.rs
+  crates/cl-p2p/src/peer_caps.rs
+  crates/cl-p2p/src/gossip
+  crates/cl-p2p/src/custody.rs
+  crates/cl-p2p/src/identity.rs
+  crates/cl-p2p/src/m2a_session.rs
+  crates/cl-p2p/src/m2a_session
+  crates/cl-p2p/src/peers
+  crates/cl-p2p/src/testkit.rs
   fuzz/Cargo.toml
   fuzz/rust-toolchain.toml
   fuzz/src
@@ -66,34 +84,39 @@ M2A_KEY_PATHS=(
 )
 M2A_KEY_FILES=(Cargo.lock fuzz/Cargo.lock)
 
-# Gate 1's key: the m2a key, plus what its targets add: the gossip transform and message-id hook
-# (cl-p2p's gossip module), the record reader (cl-discv5's enr module and manifest),
-# network-config (the gossip caps come from the pinned Sepolia blob schedule, the ENR seeds from
-# its fork schedule) and fuzz/run-gate1.sh. Both lockfiles are keyed as for m2a.
+# Gate 1's key: the m2a key (which holds cl-p2p's gossip module: the gossip transform and the
+# message-id hook), plus what its targets add: the record reader (cl-discv5's library, from its
+# crate root through the enr, metrics and service modules it declares, and its manifest; not
+# its main.rs) and fuzz/run-gate1.sh. network-config (the gossip caps and the ENR seeds come
+# from the pinned Sepolia schedules) is in the m2a key. Both lockfiles are keyed as for m2a.
 GATE1_KEY_PATHS=(
   "${M2A_KEY_PATHS[@]}"
-  crates/cl-p2p/src/gossip/mod.rs
-  crates/cl-p2p/src/gossip/config.rs
   crates/cl-discv5/Cargo.toml
+  crates/cl-discv5/src/lib.rs
   crates/cl-discv5/src/enr.rs
-  crates/network-config
+  crates/cl-discv5/src/metrics.rs
+  crates/cl-discv5/src/service.rs
   fuzz/run-gate1.sh
 )
 
 # Gate 2a's key: the m2a key (p2p-wire holds the column protocols, their request and sidecar
 # bounds and column_request_error, the check cl-p2p admits a column request with; cl-p2p's rpc
-# codec reads the column responses and requests; consensus-types holds NUMBER_OF_COLUMNS), plus
-# the rest of the column request code: cl-p2p's column answers (rpc/columns.rs: what a request
-# names, how an answer is cut) and cl-chain's request bounds (reqresp.rs, with its manifest),
-# which the request targets run on every decoded request; network-config (the column caps and
-# the fork schedule a sidecar's slot is mapped through come from the pinned Sepolia config); and
-# fuzz/run-gate2a.sh. Both lockfiles are keyed as for m2a.
+# codec reads the column responses and requests, and its rpc directory holds the column answers,
+# rpc/columns.rs: what a request names, how an answer is cut; consensus-types holds
+# NUMBER_OF_COLUMNS), plus cl-chain's request bounds (reqresp.rs), which the request targets run
+# on every decoded request: cl-chain's source whole (its crate root declares every module) and
+# manifest, and the workspace crates it imports (cl-chain-columns, the chain.v1 messages in
+# ethswarm-proto and their sources in proto/ethswarm, the contract layer ipc); and
+# fuzz/run-gate2a.sh. network-config (the column caps and the fork schedule a sidecar's slot is
+# mapped through) is in the m2a key. Both lockfiles are keyed as for m2a.
 GATE2A_KEY_PATHS=(
   "${M2A_KEY_PATHS[@]}"
-  crates/cl-p2p/src/rpc/columns.rs
   crates/cl-chain/Cargo.toml
-  crates/cl-chain/src/reqresp.rs
-  crates/network-config
+  crates/cl-chain/src
+  crates/cl-chain-columns
+  crates/ethswarm-proto
+  proto/ethswarm
+  crates/ipc
   fuzz/run-gate2a.sh
 )
 
@@ -103,9 +126,9 @@ GATE2A_KEY_PATHS=(
 # storage contract, reference view, root wait and column store, the custody record, the
 # verify.v1 client's trait and the column RPCs), the column env (cl-chain-columns, its MDBX
 # binding pinned in the lockfiles), the chain.v1 messages and their sources (ethswarm-proto,
-# proto/ethswarm), the contract layer the RPCs and the harness hold every stream to (ipc),
-# network-config (the Sepolia schedule and caps) and fuzz/run-gate2b.sh. Both lockfiles are
-# keyed as for m2a.
+# proto/ethswarm), the contract layer the RPCs and the harness hold every stream to (ipc), and
+# fuzz/run-gate2b.sh. network-config (the Sepolia schedule and caps) is in the m2a key. Both
+# lockfiles are keyed as for m2a.
 GATE2B_KEY_PATHS=(
   "${M2A_KEY_PATHS[@]}"
   crates/cl-chain/Cargo.toml
@@ -114,7 +137,6 @@ GATE2B_KEY_PATHS=(
   crates/ethswarm-proto
   proto/ethswarm
   crates/ipc
-  crates/network-config
   fuzz/run-gate2b.sh
 )
 

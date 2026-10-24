@@ -50,6 +50,17 @@ printf '[toolchain]\nchannel = "nightly-2026-10-17"\n' > "$fx/fuzz/rust-toolchai
 echo 'version = 4' > "$fx/fuzz/Cargo.lock"
 echo 'version = 4' > "$fx/Cargo.lock"
 printf 'target\nartifacts\n' > "$fx/fuzz/.gitignore"
+# The modules the keyed files import, which the keys hold too (fuzz/m2a-common.sh).
+for f in crates/cl-p2p/src/transport.rs crates/cl-p2p/src/transport/quota.rs \
+  crates/cl-p2p/src/behaviour.rs crates/cl-p2p/src/peer_caps.rs crates/cl-p2p/src/gossip/mod.rs \
+  crates/cl-p2p/src/lib.rs crates/cl-p2p/src/custody.rs crates/cl-p2p/src/identity.rs \
+  crates/cl-p2p/src/m2a_session.rs crates/cl-p2p/src/m2a_session/config.rs crates/cl-p2p/src/peers/mod.rs \
+  crates/cl-p2p/src/testkit.rs crates/cl-discv5/src/lib.rs crates/cl-discv5/src/enr.rs \
+  crates/cl-discv5/src/metrics.rs crates/cl-discv5/src/service.rs crates/cl-chain-columns/src/lib.rs \
+  crates/ethswarm-proto/src/lib.rs crates/ipc/src/lib.rs proto/ethswarm/chain/v1/reqresp.proto; do
+  mkdir -p "$(dirname "$fx/$f")"
+  [[ -e $fx/$f ]] || echo 'x' > "$fx/$f"
+done
 git init -q "$fx"
 g add -A
 g commit -q -m fixture
@@ -105,7 +116,7 @@ done
   || bad "fuzz run of$missing" "$(grep "fuzz run" "$CALLS")"
 ! grep -q "fuzz run -O -a blocks_by_range_resp" "$CALLS" && ok "the m2a-only target is not run" || bad "blocks_by_range_resp ran"
 key=$(gate_run -- "$fx/fuzz/check-gate1.sh" --print-key)
-grep -q '"crates/cl-discv5/src/enr.rs"' <<<"$key" && grep -q '"crates/cl-p2p/src/gossip/config.rs"' <<<"$key" \
+grep -q '"crates/cl-discv5/src/enr.rs"' <<<"$key" && grep -q '"crates/cl-p2p/src/gossip"' <<<"$key" \
   && grep -q '"fuzz/run-gate1.sh"' <<<"$key" && grep -q '"crates/network-config"' <<<"$key" \
   && ok "gate 1's key holds the gossip, ENR and network-config paths" || bad "key" "$key"
 [[ $(field "$file" "json.dumps(gate['decoder_key'], sort_keys=True)") \

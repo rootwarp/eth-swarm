@@ -8,8 +8,9 @@
 //! default, installed before any callsite is hit, in a process where nothing else runs.
 
 mod tests {
+    use cl_p2p::m2a_session::os_user::{ProcessGids, ProcessUids};
     use cl_p2p::m2a_session::{
-        preflight, KeySource, PinnedPeer, Preflight, Session, SessionError, Transport,
+        preflight, KeySource, PinnedPeer, Preflight, Session, SessionError, SessionUser, Transport,
     };
     use cl_p2p::rpc::codec::Deadlines;
     use consensus_types::Minimal;
@@ -95,10 +96,22 @@ mod tests {
         file.write_all(&SECRET).unwrap();
         std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
         let euid = rustix::process::geteuid().as_raw();
-        let key = preflight(&Preflight {
-            euid,
-            key: KeySource::File(file.path().into()),
-        })
+        let egid = rustix::process::getegid().as_raw();
+        let key = preflight(
+            &Preflight {
+                uids: ProcessUids::same(euid),
+                gids: ProcessGids::same(egid),
+                user: SessionUser {
+                    name: "m2a-session".into(),
+                    uid: euid,
+                    gid: egid,
+                },
+                // Injected: the production rules, on the platform they are for.
+                os: "linux".into(),
+                key: KeySource::File(file.path().into()),
+            },
+            false,
+        )
         .unwrap();
         let local = key.peer_id();
         let reference = Keypair::from(secp256k1::Keypair::from(

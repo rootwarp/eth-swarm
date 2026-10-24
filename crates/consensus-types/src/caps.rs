@@ -78,7 +78,9 @@
 //! models, and fails if any figure exceeds its budget.
 
 use crate::preset::EthSpec;
-use crate::primitives::{Address, ForkName, KZGProof, Root, B256, U256};
+use crate::primitives::{
+    Address, ColumnIndex, ForkName, KZGCommitment, KZGProof, Root, B256, U256,
+};
 use crate::{common, fulu, gloas};
 use network_config::{BlobParameters, ChainConfig, MAX_BLOB_COMMITMENTS_PER_BLOCK};
 use ssz::{BitList, BitVector, Encode, ProgressiveBitList};
@@ -350,6 +352,28 @@ pub fn compute_max_data_column_sidecar_size<E: EthSpec>(network: &NetworkCaps) -
     let per_blob = field_max_len::<common::Cell<E>>().saturating_add(field_max_len::<KZGProof>());
     (empty.ssz_bytes_len() as u64)
         .saturating_add(network.max_blobs_per_block.saturating_mul(per_blob))
+}
+
+/// The length of a serialized Fulu `DataColumnSidecar` (`fulu/das-core.md`) that holds `blobs`
+/// cells, commitments and proofs.
+///
+/// Fulu has no size function like Gloas's `compute_max_data_column_sidecar_size()`. Its bound
+/// at an epoch comes from `verify_data_column_sidecar` (`fulu/p2p-interface.md`): at most
+/// `get_blob_parameters(epoch).max_blobs_per_block` commitments, and exactly one cell and one
+/// proof for each. So this size at that blob limit is the largest valid sidecar of the epoch:
+/// 356 fixed bytes and 2,144 per blob in both presets, 45,380 at 21 blobs. `tests/columns.rs`
+/// checks it against the serialized sidecar. It saturates at `u64::MAX`.
+pub fn fulu_data_column_sidecar_size<E: EthSpec>(blobs: u64) -> u64 {
+    // `index`, the `column`, `kzg_commitments` and `kzg_proofs` offsets, the signed header and
+    // the inclusion proof.
+    let fixed = field_max_len::<ColumnIndex>()
+        .saturating_add(3 * OFFSET)
+        .saturating_add(field_max_len::<common::SignedBeaconBlockHeader>())
+        .saturating_add(field_max_len::<fulu::KZGCommitmentsInclusionProof<E>>());
+    let per_blob = field_max_len::<common::Cell<E>>()
+        .saturating_add(field_max_len::<KZGCommitment>())
+        .saturating_add(field_max_len::<KZGProof>());
+    fixed.saturating_add(blobs.saturating_mul(per_blob))
 }
 
 /// The type bound of `kind` at `fork`, uncapped; `None` if `fork` does not define it or the

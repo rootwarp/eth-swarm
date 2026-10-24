@@ -14,6 +14,7 @@ use libp2p::multiaddr::Protocol;
 use network_config::digest::{compute_fork_digest, current_epoch, DigestError};
 use network_config::{ChainConfig, Epoch, Genesis};
 use p2p_wire::enr::ForkFields;
+use p2p_wire::gossip::TopicCaps;
 use p2p_wire::rpc::codec::ContextTable;
 use p2p_wire::rpc::messages::ForkDigest;
 use sha2::{Digest, Sha256};
@@ -144,6 +145,14 @@ impl Devnet {
     #[must_use]
     pub fn context_table(&self) -> ContextTable {
         cl_p2p::rpc::network_context_table(&self.config, &self.genesis.genesis_validators_root)
+    }
+
+    /// The gossip caps of preset `E` under each fork digest of the schedule, BPO digests
+    /// included (`p2p_wire::gossip::TopicCaps::from_config`): every digest is held to its own
+    /// fork and blob limit, and a digest off the schedule to none.
+    #[must_use]
+    pub fn topic_caps<E: EthSpec>(&self) -> TopicCaps {
+        TopicCaps::from_config::<E>(&self.config, &self.genesis.genesis_validators_root)
     }
 
     /// The chain probe mode's Status provider builds our Status for.
@@ -345,6 +354,63 @@ mod tests {
         let chain = devnet.probe_chain();
         assert_eq!(chain.slots_per_epoch, 8);
         assert_eq!(chain.genesis, genesis());
+    }
+
+    /// The gossip caps follow each digest of the schedule: a Fulu digest caps a column sidecar
+    /// at the Fulu sidecar of the largest Fulu blob limit at or before it, the Gloas digest at
+    /// `compute_max_data_column_sidecar_size()`, and a digest off the schedule has no cap.
+    #[test]
+    fn gossip_caps_follow_each_digest_of_the_schedule() {
+        use consensus_types::caps::{
+            compute_max_data_column_sidecar_size, fulu_data_column_sidecar_size, NetworkCaps,
+        };
+        use consensus_types::ForkName;
+        use p2p_wire::gossip::GossipKind;
+        let devnet = Devnet::new(CONFIG.as_bytes(), genesis()).unwrap();
+        let caps = devnet.topic_caps::<Minimal>();
+        let column = GossipKind::DataColumnSidecar { subnet_id: 0 };
+        let schedule = digest_schedule(devnet.config(), &GVR);
+        assert_eq!(schedule.len(), 3);
+        for entry in &schedule {
+            let want = match entry.fork {
+                ForkName::Fulu => fulu_data_column_sidecar_size::<Minimal>(
+                    entry.blob_parameters.max_blobs_per_block,
+                ),
+                ForkName::Gloas => compute_max_data_column_sidecar_size::<Minimal>(
+                    &NetworkCaps::from_config(devnet.config()),
+                ),
+            };
+            assert_eq!(
+                caps.cap_at(entry.fork_digest, column),
+                Some(want as usize),
+                "{:?}",
+                entry.fork
+            );
+        }
+        // The blob change inside Fulu changes the column cap.
+        assert_ne!(
+            caps.cap_at(schedule[0].fork_digest, column),
+            caps.cap_at(schedule[1].fork_digest, column)
+        );
+        assert_eq!(caps.cap_at([0xee; 4], GossipKind::BeaconBlock), None);
+    }
+
+    /// A devnet whose BPO entry lowers the blob limit (9, then 6): the lowered digest keeps the
+    /// cap of 9 blobs, because a late sidecar of epoch 0 can arrive under it.
+    #[test]
+    fn a_lowered_blob_limit_keeps_the_earlier_column_cap() {
+        use consensus_types::caps::fulu_data_column_sidecar_size;
+        use p2p_wire::gossip::GossipKind;
+        let lowered = CONFIG.replace("    MAX_BLOBS_PER_BLOCK: 12", "    MAX_BLOBS_PER_BLOCK: 6");
+        assert_ne!(lowered, CONFIG, "the fixture's BPO entry");
+        let devnet = Devnet::new(lowered.as_bytes(), genesis()).unwrap();
+        let schedule = digest_schedule(devnet.config(), &GVR);
+        assert_eq!(schedule[1].blob_parameters.max_blobs_per_block, 6);
+        let caps = devnet.topic_caps::<Minimal>();
+        let column = GossipKind::DataColumnSidecar { subnet_id: 0 };
+        let nine = Some(fulu_data_column_sidecar_size::<Minimal>(9) as usize);
+        assert_eq!(caps.cap_at(schedule[0].fork_digest, column), nine);
+        assert_eq!(caps.cap_at(schedule[1].fork_digest, column), nine);
     }
 
     #[test]

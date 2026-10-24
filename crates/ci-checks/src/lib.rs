@@ -31,6 +31,7 @@ use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
 use yaml_rust2::scanner::Marker;
 use yaml_rust2::{Yaml, YamlLoader};
 
+pub mod fuzz_keys;
 pub mod kurtosis;
 
 /// One broken rule, reported as `ERROR <file>[:<line>]: <message>`.

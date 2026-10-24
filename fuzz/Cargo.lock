@@ -962,6 +962,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ipc",
+ "libc",
  "libp2p",
  "libp2p-mplex",
  "network-config",

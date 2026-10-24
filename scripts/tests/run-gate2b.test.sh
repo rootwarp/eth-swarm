@@ -56,6 +56,19 @@ printf '[toolchain]\nchannel = "nightly-2026-10-17"\n' > "$fx/fuzz/rust-toolchai
 echo 'version = 4' > "$fx/fuzz/Cargo.lock"
 echo 'version = 4' > "$fx/Cargo.lock"
 printf 'target\nartifacts\n' > "$fx/fuzz/.gitignore"
+# The modules the keyed files import, which the keys hold too (fuzz/m2a-common.sh).
+for f in crates/cl-p2p/src/transport.rs crates/cl-p2p/src/transport/quota.rs \
+  crates/cl-p2p/src/behaviour.rs crates/cl-p2p/src/peer_caps.rs crates/cl-p2p/src/gossip/mod.rs \
+  crates/cl-chain/src/probe.rs crates/cl-chain/src/probe/ingest.rs crates/cl-chain/src/da/custody.rs \
+  crates/cl-chain/src/verify/client.rs crates/cl-chain/src/lib.rs \
+  crates/cl-p2p/src/lib.rs crates/cl-p2p/src/custody.rs crates/cl-p2p/src/identity.rs \
+  crates/cl-p2p/src/m2a_session.rs crates/cl-p2p/src/m2a_session/config.rs crates/cl-p2p/src/peers/mod.rs \
+  crates/cl-p2p/src/testkit.rs crates/cl-discv5/src/lib.rs crates/cl-discv5/src/enr.rs \
+  crates/cl-discv5/src/metrics.rs crates/cl-discv5/src/service.rs crates/cl-chain-columns/src/lib.rs \
+  crates/ethswarm-proto/src/lib.rs crates/ipc/src/lib.rs proto/ethswarm/chain/v1/reqresp.proto; do
+  mkdir -p "$(dirname "$fx/$f")"
+  [[ -e $fx/$f ]] || echo 'x' > "$fx/$f"
+done
 git init -q "$fx"
 g add -A
 g commit -q -m fixture
@@ -114,14 +127,14 @@ done
 key=$(gate_run -- "$fx/fuzz/check-gate2b.sh" --print-key)
 missing=""
 for path in crates/cl-chain/Cargo.toml crates/cl-chain/src crates/cl-chain-columns crates/ethswarm-proto \
-  proto/ethswarm crates/ipc crates/network-config crates/p2p-wire crates/cl-p2p/src/rpc/codec.rs \
+  proto/ethswarm crates/ipc crates/network-config crates/p2p-wire crates/cl-p2p/src/rpc \
   fuzz/src fuzz/corpus fuzz/run-gate2b.sh fuzz/m2a-common.sh; do
   grep -q "\"$path\"" <<<"$key" || missing="$missing $path"
 done
 [[ -z $missing ]] && ok "gate 2b's key holds cl-chain, the column env, the chain.v1 contract and the shared fuzz sources" \
   || bad "key lacks$missing" "$key"
 ! grep -q '"crates/cl-discv5/src/enr.rs"' <<<"$key" && ! grep -q '"fuzz/run-gate2a.sh"' <<<"$key" \
-  && ! grep -q '"crates/cl-p2p/src/rpc/columns.rs"' <<<"$key" \
+  && ! grep -q '"crates/cl-chain/src/reqresp.rs"' <<<"$key" \
   && ok "gate 2b's key leaves out the other gates' own paths" || bad "key" "$key"
 [[ $(field "$file" "json.dumps(gate['decoder_key'], sort_keys=True)") \
   == $(python3 -I -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1]), sort_keys=True))' "$key") ]] \
@@ -175,16 +188,16 @@ g add -A && g commit -q -m "seed at max_len"
 rc=0 out=$(gate_run -- "$runner" --seconds 3 --out "$tmp/s.json" 2>&1) || rc=$?
 ((rc == 0)) && ok "a seed at its -max_len runs" || bad "seed at max_len (exit $rc)" "$out"
 g reset -q --hard HEAD~1
-# A path only gate 2b keys: dirty for gate 2b, not for gate 2a.
-echo '// edit' >> "$fx/crates/cl-chain/src/probe/ingest.rs"
+# The path only gate 2b keys: dirty for gate 2b, not for gate 2a.
+echo '# edit' >> "$fx/fuzz/run-gate2b.sh"
 rc=0 out=$(gate_run -- "$runner" --seconds 3 --out "$tmp/d.json" 2>&1) || rc=$?
-((rc == 2)) && grep -q 'crates/cl-chain/src' <<<"$out" && ok "an edit to a gate-2b keyed path stops the gate-2b run" || bad "dirty (exit $rc)" "$out"
+((rc == 2)) && grep -q 'fuzz/run-gate2b.sh' <<<"$out" && ok "an edit to a gate-2b keyed path stops the gate-2b run" || bad "dirty (exit $rc)" "$out"
 rc=0 out=$(gate_run -- "$runner" --seconds 3 --allow-dirty --out "$tmp/d.json" 2>&1) || rc=$?
 ((rc == 0)) && [[ $(field "$tmp/d.json" "gate['dirty']") == True ]] && ok "--allow-dirty runs it and records dirty" || bad "allow-dirty (exit $rc)" "$out"
 rc=0 out=$(gate_run -- "$fx/fuzz/run-gate2a.sh" --seconds 3 --out "$tmp/m.json" 2>&1) || rc=$?
 ((rc == 0)) && [[ $(field "$tmp/m.json" "(gate['gate'], gate['dirty'], len(gate['targets']))") == "('gate2a-fuzz', False, 3)" ]] \
   && ok "the same edit leaves gate 2a clean (outside its key)" || bad "gate-2a run with a gate-2b edit (exit $rc)" "$out"
-g checkout -q -- crates/cl-chain/src/probe/ingest.rs
+g checkout -q -- fuzz/run-gate2b.sh
 
 echo "# $passed passed, $failed failed"
 ((failed == 0))

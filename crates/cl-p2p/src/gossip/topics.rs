@@ -132,7 +132,6 @@ mod tests {
         SUBSCRIBED_TOPICS_HEADROOM,
     };
     use super::*;
-    use consensus_types::caps::NetworkCaps;
     use consensus_types::Mainnet;
     use libp2p::gossipsub::{TopicHash, TopicSubscriptionFilter as _};
     use network_config::{ChainConfig, Network};
@@ -140,9 +139,12 @@ mod tests {
     /// The probe's configured topic list, as shipped.
     const SHIPPED: &str = include_str!("../../../../ops/probe/gossip-topics.toml");
 
+    /// The probe's caps on Sepolia: each digest of the schedule held to its own fork and blob
+    /// limit.
     fn sepolia_caps() -> TopicCaps {
         let config = ChainConfig::load(Network::Sepolia).unwrap();
-        TopicCaps::gloas::<Mainnet>(&NetworkCaps::from_config(&config))
+        let gvr = Network::Sepolia.genesis().unwrap().genesis_validators_root;
+        TopicCaps::from_config::<Mainnet>(&config, &gvr)
     }
 
     /// The shipped list holds the exit-14 topics, every name loads through

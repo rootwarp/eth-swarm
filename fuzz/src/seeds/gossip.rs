@@ -1,15 +1,17 @@
 //! The gossip seeds (`gossip_transform`, `message_id`): `[topic length][topic][data]`.
 //!
-//! Valid messages on every topic kind (the testkit blocks and, for `gossip_transform`, the
-//! vector blocks on `beacon_block`; a message at its cap for the small caps), and the refusals:
+//! Valid messages on every topic kind (the testkit blocks under each digest of the Sepolia
+//! schedule and, for `gossip_transform`, the vector blocks on the Gloas `beacon_block`; a message
+//! at its cap for the small caps, and the column sidecar at the cap of each Fulu digest's blob
+//! limit), and the refusals:
 //! a snappy header declaring one byte over the topic's cap, over `MAX_PAYLOAD_SIZE`, 4 GiB and
 //! more than 4 GiB, an 11-byte header varint, a block cut short or with a byte after it, a
-//! decompression bomb within the cap, the req/resp framing format instead of a raw block, an
-//! unsubscribed digest, an unknown topic name, an upper-case digest, an empty and a cut-short
+//! decompression bomb within the cap, the req/resp framing format instead of a raw block, a
+//! digest off the schedule and a Gloas topic under a Fulu digest (no cap), an unknown topic name, an upper-case digest, an empty and a cut-short
 //! topic, and data that is no snappy block at all (the invalid-snappy message-id).
 
 use super::{Seed, VectorBlock, OVER_4GIB, VECTOR_PREFIX};
-use crate::gossip::topic_caps;
+use crate::gossip::{gossip_digests, topic_caps};
 use crate::{message_input, E};
 use consensus_types::caps::MAX_PAYLOAD_SIZE;
 use p2p_wire::gossip::{GossipKind, GossipTopic};
@@ -53,7 +55,7 @@ pub fn all(seeds: &mut Vec<Seed>, vector_blocks: &[VectorBlock]) {
             });
         }
     }
-    let block = topic(testkit::GLOAS_DIGEST, GossipKind::BeaconBlock);
+    let block = topic(digest(3), GossipKind::BeaconBlock);
     for vector in vector_blocks {
         seeds.push(Seed {
             target: "gossip_transform",
@@ -64,10 +66,15 @@ pub fn all(seeds: &mut Vec<Seed>, vector_blocks: &[VectorBlock]) {
     }
 }
 
+/// The `n`th digest of the Sepolia schedule: 0 Fulu, 1 and 2 its BPO digests, 3 Gloas.
+fn digest(n: usize) -> [u8; 4] {
+    gossip_digests()[n].0
+}
+
 /// `(name, input)` of the seeds both gossip targets share.
 fn messages() -> Vec<(String, Vec<u8>)> {
     let caps = topic_caps();
-    let gloas = topic(testkit::GLOAS_DIGEST, GossipKind::BeaconBlock);
+    let gloas = topic(digest(3), GossipKind::BeaconBlock);
     let gloas_block = compress(&testkit::gloas_block::<E>(3).as_ssz_bytes());
     let fulu_block = compress(&testkit::fulu_block::<E>(1).as_ssz_bytes());
     let mut out = vec![
@@ -78,13 +85,23 @@ fn messages() -> Vec<(String, Vec<u8>)> {
         ),
         (
             "block-fulu-digest-valid".to_owned(),
-            topic(testkit::FULU_DIGEST, GossipKind::BeaconBlock),
+            topic(digest(0), GossipKind::BeaconBlock),
             fulu_block.clone(),
         ),
         (
-            "block-fulu-bpo-digest-valid".to_owned(),
-            topic(testkit::FULU_BPO_DIGEST, GossipKind::BeaconBlock),
+            "block-fulu-bpo1-digest-valid".to_owned(),
+            topic(digest(1), GossipKind::BeaconBlock),
+            fulu_block.clone(),
+        ),
+        (
+            "block-fulu-bpo2-digest-valid".to_owned(),
+            topic(digest(2), GossipKind::BeaconBlock),
             fulu_block,
+        ),
+        (
+            "bid-on-fulu-digest".to_owned(),
+            topic(digest(2), GossipKind::ExecutionPayloadBid),
+            compress(b"x"),
         ),
         (
             "block-fulu-block-on-gloas-topic".to_owned(),
@@ -149,12 +166,12 @@ fn messages() -> Vec<(String, Vec<u8>)> {
         ),
         (
             "topic-unknown-name".to_owned(),
-            "/eth2/610a5001/voluntary_exit/ssz_snappy".to_owned(),
+            "/eth2/669e6c11/voluntary_exit/ssz_snappy".to_owned(),
             compress(b"x"),
         ),
         (
             "topic-upper-case-digest".to_owned(),
-            "/eth2/610A5001/beacon_block/ssz_snappy".to_owned(),
+            "/eth2/669E6C11/beacon_block/ssz_snappy".to_owned(),
             gloas_block.clone(),
         ),
         ("topic-empty".to_owned(), String::new(), compress(b"x")),
@@ -182,8 +199,8 @@ fn messages() -> Vec<(String, Vec<u8>)> {
         ("block", GossipKind::BeaconBlock),
     ];
     for (name, kind) in kinds {
-        let text = topic(testkit::GLOAS_DIGEST, kind);
-        let cap = caps.cap(kind);
+        let text = topic(digest(3), kind);
+        let cap = caps.cap_at(digest(3), kind).expect("a Gloas topic");
         if kind != GossipKind::BeaconBlock {
             out.push((format!("{name}-empty"), text.clone(), compress(&[])));
         }
@@ -195,6 +212,22 @@ fn messages() -> Vec<(String, Vec<u8>)> {
         if cap <= SMALL_CAP {
             out.push((format!("{name}-at-cap"), text, compress(&vec![0; cap])));
         }
+    }
+    // The column sidecar under each Fulu digest, at and over the cap of its blob limit.
+    for n in 0..3 {
+        let column = GossipKind::DataColumnSidecar { subnet_id: 0 };
+        let cap = caps.cap_at(digest(n), column).expect("a Fulu topic");
+        let text = topic(digest(n), column);
+        out.push((
+            format!("column-0-fulu-{}-at-cap", n + 1),
+            text.clone(),
+            compress(&vec![0; cap]),
+        ));
+        out.push((
+            format!("column-0-fulu-{}-over-cap", n + 1),
+            text,
+            declaring(cap as u64 + 1),
+        ));
     }
     let mut inputs: Vec<(String, Vec<u8>)> = out
         .into_iter()

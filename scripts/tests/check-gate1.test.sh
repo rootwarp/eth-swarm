@@ -68,6 +68,17 @@ echo '[package]' > "$fx/fuzz/Cargo.toml"
 printf '[toolchain]\nchannel = "nightly-2026-10-17"\n' > "$fx/fuzz/rust-toolchain.toml"
 echo 'version = 4' > "$fx/fuzz/Cargo.lock"
 echo 'version = 4' > "$fx/Cargo.lock"
+# The modules the keyed files import, which the keys hold too (fuzz/m2a-common.sh).
+for f in crates/cl-p2p/src/transport.rs crates/cl-p2p/src/transport/quota.rs \
+  crates/cl-p2p/src/behaviour.rs crates/cl-p2p/src/peer_caps.rs crates/cl-p2p/src/gossip/mod.rs \
+  crates/cl-p2p/src/lib.rs crates/cl-p2p/src/custody.rs crates/cl-p2p/src/identity.rs \
+  crates/cl-p2p/src/m2a_session.rs crates/cl-p2p/src/m2a_session/config.rs crates/cl-p2p/src/peers/mod.rs \
+  crates/cl-p2p/src/testkit.rs crates/cl-discv5/src/lib.rs crates/cl-discv5/src/enr.rs \
+  crates/cl-discv5/src/metrics.rs crates/cl-discv5/src/service.rs crates/cl-chain-columns/src/lib.rs \
+  crates/ethswarm-proto/src/lib.rs crates/ipc/src/lib.rs proto/ethswarm/chain/v1/reqresp.proto; do
+  mkdir -p "$(dirname "$fx/$f")"
+  [[ -e $fx/$f ]] || echo 'x' > "$fx/$f"
+done
 git init -q "$fx"
 g add -A
 g commit -q -m fixture
@@ -240,16 +251,17 @@ check fail "an unknown gate" "m2a, gate1, gate2a or gate2b" bash "$m2a_checker" 
 # Every path only gate 1 keys makes a gate-1 file stale, and leaves the m2a file valid; a path
 # both key makes both stale (the m2a key holds all of fuzz/corpus, the gate-1 seeds too).
 m2a_ok="$tmp/m2a.json"
-for path in crates/cl-p2p/src/gossip/mod.rs crates/cl-p2p/src/gossip/config.rs crates/cl-discv5/Cargo.toml \
-  crates/cl-discv5/src/enr.rs crates/network-config/src/lib.rs fuzz/run-gate1.sh; do
+for path in crates/cl-discv5/Cargo.toml crates/cl-discv5/src/enr.rs fuzz/run-gate1.sh; do
   echo '# changed' >> "$fx/$path"
   g commit -q -am "change $path"
   check fail "gate 1 stale after a commit to $path" "stale" bash "$checker" "$ok1"
   check pass "the m2a gate holds after a commit to $path" "" bash "$m2a_checker" "$m2a_ok"
   g reset -q --hard HEAD~1
 done
-for path in crates/p2p-wire/src/lib.rs crates/cl-p2p/src/rpc/codec.rs crates/cl-p2p/src/rpc/limits.rs \
-  crates/cl-p2p/src/rpc/metrics.rs crates/cl-p2p/src/rpc/unsupported.rs fuzz/m2a-common.sh fuzz/run-m2a-gate.sh \
+for path in crates/p2p-wire/src/lib.rs crates/network-config/src/lib.rs crates/cl-p2p/src/rpc/codec.rs \
+  crates/cl-p2p/src/rpc/limits.rs \
+  crates/cl-p2p/src/rpc/metrics.rs crates/cl-p2p/src/rpc/unsupported.rs crates/cl-p2p/src/gossip/mod.rs \
+  crates/cl-p2p/src/gossip/config.rs crates/cl-p2p/src/transport.rs fuzz/m2a-common.sh fuzz/run-m2a-gate.sh \
   fuzz/src/lib.rs fuzz/corpus/status_v2/valid fuzz/corpus/enr_fields/valid Cargo.lock; do
   echo '# changed' >> "$fx/$path"
   g commit -q -am "change $path"

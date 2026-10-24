@@ -305,9 +305,25 @@ command (see above).
    --env-file <.env> -f <compose.yaml> up -d` (Sepolia: `-p sepolia-ref --env-file .env -f
    compose.yaml`; Hoodi: `-p hoodi-ref --env-file .env.hoodi -f compose.yaml`).
 6. **Wait for sync** (about a day): `curl -s 127.0.0.1:<BEACON_API_PORT>/eth/v1/node/syncing`.
-7. **Trust the session's peer ID** (Sepolia). On the test host:
-   `sudo -u m2a-session m2a-session --print-peer-id`. Put the ID in `TRUSTED_PEERS` in `.env`,
-   then `sudo docker compose -p sepolia-ref --env-file .env -f compose.yaml up -d lighthouse`
+7. **Trust the session's peer ID** (Sepolia). `--print-peer-id` reads the session's config and
+   node key, so make both first. On the test host:
+   1. Create the session's own account, with the key's directory as its home:
+      `sudo useradd --system --create-home --home-dir /var/lib/m2a-session --shell
+      /usr/sbin/nologin m2a-session`. The session runs only as this account.
+   2. Write its node key as that user, mode 0600: `sudo -u m2a-session sh -c 'umask 077 &&
+      head -c 32 /dev/urandom > /var/lib/m2a-session/node.key'`.
+   3. Write a first `/etc/ethswarm/m2a-session.toml`, owned by root with mode 0644, in the
+      root-owned `/etc/ethswarm` (`sudo install -d -m 0755 /etc/ethswarm`, then
+      `sudo tee /etc/ethswarm/m2a-session.toml` and `sudo chmod 0644` on it). It holds
+      `network = "sepolia"`, `peer = "<multiaddr>"` and
+      `node_key = "/var/lib/m2a-session/node.key"`. Take the multiaddr from
+      `curl -s 127.0.0.1:<BEACON_API_PORT>/eth/v1/node/identity` on the reference host (its
+      `p2p_addresses` entry with the public IP). The session refuses a config that its own user
+      could change.
+   4. Run `sudo -u m2a-session m2a-session --print-peer-id`. It does not dial.
+
+   Put the ID in `TRUSTED_PEERS` in `.env`, then
+   `sudo docker compose -p sepolia-ref --env-file .env -f compose.yaml up -d lighthouse`
    (recreates Lighthouse with `--trusted-peers`). Collect the run log after this: it fails a
    container recreated after its versions check.
 8. **Collect the evidence:**
@@ -325,8 +341,10 @@ command (see above).
    only fstat'ed, through `lib/fsguard.py`, and the checkpoint URLs appear as scheme and host
    only.
 10. **Run the session** on the test host (Sepolia): open the tunnel
-    (`ssh -N -L 5052:127.0.0.1:5052 <ref-host>`), write `/etc/ethswarm/m2a-session.toml` from
-    the run log's last section, and run `sudo -u m2a-session m2a-session --dial-only`.
+    (`ssh -N -L 5052:127.0.0.1:5052 <ref-host>`), replace `/etc/ethswarm/m2a-session.toml` of
+    step 7 with the run log's last section, owned by root with mode 0644 as before, and run
+    `sudo -u m2a-session m2a-session --dial-only`. The `m2a-summary` line names the user
+    (`os_user`).
 
 ## Keyed checkpoint providers
 

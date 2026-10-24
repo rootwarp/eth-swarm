@@ -6,6 +6,7 @@
 //! reference_api_url = "http://127.0.0.1:5052"           # its beacon API, on loopback
 //! node_key = "/var/lib/m2a-session/node.key"            # optional: absent means ephemeral
 //! trusted_by_reference = true                           # optional (false): see below
+//! run_as = "m2a-session"                                # optional (the only value): see below
 //!
 //! [deadlines]                                           # optional, per req/resp exchange
 //! ttfb_ms = 5000                                        # first response byte
@@ -34,8 +35,20 @@
 //!   peer (Lighthouse `--trusted-peers`), so it does not descore us for refusing its inbound
 //!   MetaData and Ping. That needs a peer ID that survives a restart: an ephemeral key would
 //!   change it, so the flag requires `node_key`.
+//! - **`run_as`**: the OS user the session must run as, default [`DEFAULT_RUN_AS`]. It must be
+//!   a portable user name ([`super::os_user::is_valid_name`]). The pre-flight
+//!   ([`super::preflight`]) refuses any other name outside the test binary
+//!   `m2a-session-test`, resolves it with `getpwnam_r`, and refuses any other effective UID or
+//!   group, so a run under a shared login account, which can hold SSH keys or the reference
+//!   node's `.env`, never starts.
 //!
-//! Unknown keys are refused, so a typo fails startup instead of falling back to a default.
+//! Unknown keys are refused, so a typo fails startup instead of falling back to a default. The
+//! binary loads the file with [`M2aConfig::load_for`]: it walks the path from `/` without
+//! following a symlink, refuses a directory on it or the file that root does not own (in the
+//! deployed binary), and refuses a directory on it or the file that the session's own
+//! effective UID can write by its mode bits (or that group or others can write, a directory
+//! unless sticky). ACLs are not read, so a grant by ACL is not seen, and an owner can change a
+//! mode: the check stops a mistake and a replaced config, not a determined owner.
 
 use super::{KeySource, PinnedPeer, PinnedPeerError};
 use crate::rpc::codec::Deadlines;
@@ -46,6 +59,9 @@ use std::time::Duration;
 
 /// `/etc/ethswarm/m2a-session.toml`.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/ethswarm/m2a-session.toml";
+
+/// The default `run_as`: the session's own OS user.
+pub const DEFAULT_RUN_AS: &str = "m2a-session";
 
 /// The longest deadline a config may set: `request_response`'s own per-exchange timeout, which
 /// would cut a longer one short.
@@ -103,6 +119,8 @@ pub struct M2aConfig {
     pub node_key: KeySource,
     /// `trusted_by_reference`: the reference node lists our peer ID as trusted.
     pub trusted_by_reference: bool,
+    /// `run_as`: the OS user the session must run as.
+    pub run_as: String,
 }
 
 /// Why a config was refused. Errors never quote `reference_api_url`.
@@ -163,6 +181,65 @@ pub enum ConfigError {
          and an ephemeral key changes it on every start"
     )]
     EphemeralKeyTrusted,
+    /// The config path is not absolute, holds `..`, or reaches a symlink: nothing on it is
+    /// followed.
+    #[error("the config path {}: {reason}", path.display())]
+    Path {
+        /// The path.
+        path: PathBuf,
+        /// Why.
+        reason: String,
+    },
+    /// A directory on the config's path that the session user, or group or others without the
+    /// sticky bit, could write: the session user could replace the config.
+    #[error(
+        "the config's directory {} is writable by the session's effective UID {euid}, or by group \
+         or others without the sticky bit (owner UID {owner}, mode {mode:04o}): the session user \
+         could replace the config",
+        dir.display()
+    )]
+    OpenDirectory {
+        /// The directory.
+        dir: PathBuf,
+        /// The effective UID.
+        euid: u32,
+        /// The directory's owner.
+        owner: u32,
+        /// Its permission bits.
+        mode: u32,
+    },
+    /// A directory on the config's path, or the file, is owned by someone other than root (or
+    /// the one other owner a test binary accepts).
+    #[error("the config's path: {} is owned by UID {owner}, not root", path.display())]
+    Owner {
+        /// The directory or the file.
+        path: PathBuf,
+        /// Its owner.
+        owner: u32,
+        /// The owner accepted besides root (0: root only).
+        accepted: u32,
+    },
+    /// The config file is not a regular file.
+    #[error("the config is not a regular file")]
+    NotRegular,
+    /// The session's own effective UID could write the config, so the session user could
+    /// change the rules it runs under (`run_as`, the pinned peer). The config is not read.
+    #[error(
+        "the config is writable by the session's effective UID {euid} (owner UID {owner}, mode \
+         {mode:04o}): install it so that the session user cannot change it, for example owned \
+         by root with mode 0644"
+    )]
+    Writable {
+        /// The effective UID.
+        euid: u32,
+        /// The file's owner.
+        owner: u32,
+        /// The permission bits.
+        mode: u32,
+    },
+    /// `run_as` is not a portable user name. The value is not quoted.
+    #[error("run_as must be an OS user name: 1 to 32 of A-Z a-z 0-9 . _ -, not starting with -")]
+    RunAs,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,6 +253,7 @@ struct RawConfig {
     node_key: Option<PathBuf>,
     #[serde(default)]
     trusted_by_reference: bool,
+    run_as: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -202,6 +280,53 @@ impl M2aConfig {
         Self::from_toml(&text)
     }
 
+    /// Loads the config from `path` for a session that runs as effective UID `euid`: as
+    /// [`M2aConfig::load`], but nothing on the path is one the session user could change.
+    ///
+    /// - `path` must be absolute, without `..`. It is walked from `/` one directory at a time
+    ///   (`openat` with `O_NOFOLLOW | O_DIRECTORY`, as `ipc::uds::open_closed_dir` walks a
+    ///   socket path), so a symlink anywhere on it is refused, not followed.
+    /// - Each directory on it, `/` included, and the file must be owned by root, or by
+    ///   `accepted_owner` (0: root only, what `m2a-session` passes; the test binary passes its
+    ///   own UID), as `ipc::uds::check_closed` holds a socket's directories to root or the
+    ///   caller.
+    /// - Each directory on it must not be writable by `euid` as its owner, nor group- or
+    ///   world-writable unless sticky (`/tmp`): else the session user could replace the config
+    ///   with its own file.
+    /// - The open file (`fstat`, so the file checked is the file read) must be a regular file
+    ///   that `euid` cannot write by its mode bits: owner-writable when `euid` owns it, or
+    ///   group- or world-writable, is refused.
+    ///
+    /// Only the mode bits are read, never ACLs: an ACL that grants the session user write
+    /// access is not seen. A file or a directory that `euid` owns but cannot write (mode 0444,
+    /// 0555) passes: its owner could change the mode, so this check stops a mistake, not a
+    /// determined login user. The pre-flight holds the user to [`DEFAULT_RUN_AS`] as well.
+    pub fn load_for(path: &Path, euid: u32, accepted_owner: u32) -> Result<Self, ConfigError> {
+        use std::io::Read as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let read_error = |source| ConfigError::Read {
+            path: path.to_owned(),
+            source,
+        };
+        let mut file = open_closed(path, euid, accepted_owner)?;
+        let meta = file.metadata().map_err(read_error)?;
+        if !meta.file_type().is_file() {
+            return Err(ConfigError::NotRegular);
+        }
+        let mode = meta.mode() & 0o7777;
+        let owner_writes = meta.uid() == euid && mode & 0o200 != 0;
+        if owner_writes || mode & 0o022 != 0 {
+            return Err(ConfigError::Writable {
+                euid,
+                owner: meta.uid(),
+                mode,
+            });
+        }
+        let mut text = String::new();
+        file.read_to_string(&mut text).map_err(read_error)?;
+        Self::from_toml(&text)
+    }
+
     /// Parses and checks config text.
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(text).map_err(|e| parse_error(text, &e))?;
@@ -224,6 +349,10 @@ impl M2aConfig {
         if raw.trusted_by_reference && node_key == KeySource::Ephemeral {
             return Err(ConfigError::EphemeralKeyTrusted);
         }
+        let run_as = raw.run_as.unwrap_or_else(|| DEFAULT_RUN_AS.to_owned());
+        if !super::os_user::is_valid_name(&run_as) {
+            return Err(ConfigError::RunAs);
+        }
         Ok(Self {
             network,
             peer,
@@ -231,8 +360,110 @@ impl M2aConfig {
             deadlines,
             node_key,
             trusted_by_reference: raw.trusted_by_reference,
+            run_as,
         })
     }
+}
+
+/// Opens the config at `path` by walking it from `/` (see [`M2aConfig::load_for`]).
+fn open_closed(path: &Path, euid: u32, accepted: u32) -> Result<std::fs::File, ConfigError> {
+    use rustix::fs::{openat, Mode, OFlags, CWD};
+    use std::path::Component;
+    let refused = |reason: String| ConfigError::Path {
+        path: path.to_owned(),
+        reason,
+    };
+    if !path.is_absolute() {
+        return Err(refused("must be an absolute path".into()));
+    }
+    let mut names = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => names.push(name),
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(refused("must not contain `..`".into()))
+            }
+        }
+    }
+    let Some((file, dirs)) = names.split_last() else {
+        return Err(refused("names no file".into()));
+    };
+    let open_error = |walked: &Path, e: rustix::io::Errno| match e {
+        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => refused(format!(
+            "{} is a symlink or not a directory",
+            walked.display()
+        )),
+        other => ConfigError::Read {
+            path: walked.to_owned(),
+            source: other.into(),
+        },
+    };
+    let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut walked = PathBuf::from("/");
+    let mut fd = openat(CWD, "/", dir_flags, Mode::empty()).map_err(|e| open_error(&walked, e))?;
+    check_directory(&fd, &walked, euid, accepted)?;
+    for name in dirs {
+        walked.push(name);
+        fd = openat(&fd, *name, dir_flags, Mode::empty()).map_err(|e| open_error(&walked, e))?;
+        check_directory(&fd, &walked, euid, accepted)?;
+    }
+    // O_NONBLOCK: a FIFO is refused by the caller instead of blocking the open.
+    let file_flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = openat(&fd, *file, file_flags, Mode::empty()).map_err(|e| match e {
+        rustix::io::Errno::LOOP => refused("the config is a symlink".into()),
+        other => ConfigError::Read {
+            path: path.to_owned(),
+            source: other.into(),
+        },
+    })?;
+    check_owner(&fd, path, accepted)?;
+    Ok(std::fs::File::from(fd))
+}
+
+/// Fails unless the open `fd` (named `path`) is owned by root or by `accepted` (0: root only),
+/// as `ipc::uds::check_closed` holds a socket's directories to root or the caller.
+fn check_owner(fd: &rustix::fd::OwnedFd, path: &Path, accepted: u32) -> Result<(), ConfigError> {
+    let stat = rustix::fs::fstat(fd).map_err(|e| ConfigError::Read {
+        path: path.to_owned(),
+        source: e.into(),
+    })?;
+    if stat.st_uid != 0 && stat.st_uid != accepted {
+        return Err(ConfigError::Owner {
+            path: path.to_owned(),
+            owner: stat.st_uid,
+            accepted,
+        });
+    }
+    Ok(())
+}
+
+/// Fails if the directory `fd` (named `dir`) is writable by `euid` as its owner, or by group or
+/// others without the sticky bit.
+fn check_directory(
+    fd: &rustix::fd::OwnedFd,
+    dir: &Path,
+    euid: u32,
+    accepted: u32,
+) -> Result<(), ConfigError> {
+    check_owner(fd, dir, accepted)?;
+    let stat = rustix::fs::fstat(fd).map_err(|e| ConfigError::Read {
+        path: dir.to_owned(),
+        source: e.into(),
+    })?;
+    let mode = u32::from(stat.st_mode) & 0o7777;
+    let owner = stat.st_uid;
+    let owner_writes = owner == euid && mode & 0o200 != 0;
+    let others_write = mode & 0o022 != 0 && mode & 0o1000 == 0;
+    if owner_writes || others_write {
+        return Err(ConfigError::OpenDirectory {
+            dir: dir.to_owned(),
+            euid,
+            owner,
+            mode,
+        });
+    }
+    Ok(())
 }
 
 /// The parser's message and line, without the snippet of input `toml` would quote.
@@ -402,6 +633,8 @@ mod tests {
         assert_eq!(c.deadlines, Deadlines::default());
         assert_eq!(c.node_key, KeySource::Ephemeral);
         assert!(!c.trusted_by_reference);
+        assert_eq!(c.run_as, "m2a-session");
+        assert_eq!(c.run_as, DEFAULT_RUN_AS);
     }
 
     #[test]
@@ -409,6 +642,7 @@ mod tests {
         let c = parse(&format!(
             "network = \"sepolia\"\nreference_api_url = \"http://localhost:5052/\"\n\
              node_key = \"/var/lib/m2a-session/node.key\"\ntrusted_by_reference = true\n\
+             run_as = \"probe_1\"\n\
              [peer]\nmultiaddr = \"{}\"\n\
              [deadlines]\nttfb_ms = 1500\ntotal_ms = 8000\nper_chunk_ms = 2500\n",
             peer()
@@ -428,6 +662,7 @@ mod tests {
             KeySource::File("/var/lib/m2a-session/node.key".into())
         );
         assert!(c.trusted_by_reference);
+        assert_eq!(c.run_as, "probe_1");
         assert_eq!(
             format!("{:?}", c.reference_api_url.unwrap()),
             "http://localhost:5052"
@@ -751,6 +986,37 @@ mod tests {
         }
     }
 
+    /// `run_as` must be a portable user name; the error does not quote it.
+    #[test]
+    fn run_as_must_be_a_user_name() {
+        for bad in [
+            "\"\"",
+            "\"-x\"",
+            "\"a b\"",
+            "\"root:0\"",
+            "\"a\\u0000b\"",
+            "1",
+        ] {
+            let err = parse(&with_peer(&format!("run_as = {bad}")));
+            assert!(
+                matches!(err, Err(ConfigError::RunAs | ConfigError::Parse { .. })),
+                "{bad}: {err:?}"
+            );
+        }
+        let err = parse(&with_peer("run_as = \"a b\""))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "run_as must be an OS user name: 1 to 32 of A-Z a-z 0-9 . _ -, not starting with -"
+        );
+        let long = "a".repeat(33);
+        assert!(matches!(
+            parse(&with_peer(&format!("run_as = \"{long}\""))),
+            Err(ConfigError::RunAs)
+        ));
+    }
+
     #[test]
     fn unknown_keys_rejected() {
         let text = with_peer("listen = \"/ip4/0.0.0.0/tcp/9000\"");
@@ -783,5 +1049,217 @@ mod tests {
             "{err}"
         );
         assert_eq!(DEFAULT_CONFIG_PATH, "/etc/ethswarm/m2a-session.toml");
+    }
+
+    /// The test's own UID: the owner the tests accept besides root, as the test binary does.
+    fn me() -> u32 {
+        rustix::process::geteuid().as_raw()
+    }
+
+    /// Every directory on the path and the file must be owned by root, or by the one other
+    /// owner the caller accepts (the test binary's own UID; none in production). A config of
+    /// another login account, or a tree of the session user, is refused.
+    #[test]
+    fn refuses_a_config_path_owned_by_anyone_but_root() {
+        use std::os::unix::fs::PermissionsExt;
+        if me() == 0 {
+            // As root the temp directory is root's: nothing to refuse.
+            eprintln!("refuses_a_config_path_owned_by_anyone_but_root: skipped as root");
+            return;
+        }
+        let dir = config_tempdir();
+        let path = dir.path().join("m2a-session.toml");
+        std::fs::write(&path, with_peer("")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let _sealed = crate::testkit::Sealed::new(dir.path());
+        let other = me() + 1;
+        assert!(
+            M2aConfig::load_for(&path, other, me()).is_ok(),
+            "the accepted owner"
+        );
+        // Production accepts root only: the test's directory is the first refused.
+        for (accepted, refused) in [(0, dir.path()), (other, dir.path())] {
+            let got = M2aConfig::load_for(&path, other, accepted);
+            assert!(
+                matches!(&got, Err(ConfigError::Owner { path: p, owner, .. })
+                    if p == refused && *owner == me()),
+                "accepting {accepted}: {got:?}"
+            );
+        }
+        let err = M2aConfig::load_for(&path, other, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "{} is owned by UID {}, not root",
+                dir.path().display(),
+                me()
+            )),
+            "{err}"
+        );
+    }
+
+    /// A temp directory on a path with no symlink and no directory the test user can write
+    /// ([`crate::testkit::config_root`]), as the config check needs.
+    fn config_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .tempdir_in(crate::testkit::config_root())
+            .unwrap()
+    }
+
+    /// The session user could replace a config in a directory it can write, whatever the
+    /// file's mode: every directory on the path, from `/`, must not be writable by the
+    /// effective UID, nor by group or others unless sticky (`/tmp`). A symlink anywhere on the
+    /// path, and a relative path, are refused, not followed.
+    #[test]
+    fn refuses_a_config_in_a_directory_the_euid_can_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let euid = rustix::process::geteuid().as_raw();
+        let dir = config_tempdir();
+        let sub = dir.path().join("etc");
+        std::fs::create_dir(&sub).unwrap();
+        let path = sub.join("m2a-session.toml");
+        std::fs::write(&path, with_peer("")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let dir_link = dir.path().join("link");
+        std::os::unix::fs::symlink(&sub, &dir_link).unwrap();
+        let file_link = dir.path().join("file-link.toml");
+        std::os::unix::fs::symlink(&path, &file_link).unwrap();
+        // The test user owns the temp directory above `sub`: read-only, so `sub` is the one
+        // tested.
+        let _sealed = crate::testkit::Sealed::new(dir.path());
+        let chmod = |mode| {
+            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let want = parse(&with_peer("")).unwrap();
+        for (mode, as_euid, refused) in [
+            (0o755, euid, true),
+            (0o755, euid + 1, false),
+            (0o555, euid, false),
+            (0o775, euid + 1, true),
+            (0o757, euid + 1, true),
+            (0o1777, euid + 1, false),
+            (0o1777, euid, true),
+        ] {
+            chmod(mode);
+            let got = M2aConfig::load_for(&path, as_euid, me());
+            if refused {
+                assert!(
+                    matches!(&got, Err(ConfigError::OpenDirectory { dir, mode: m, .. })
+                        if *dir == sub && *m == mode),
+                    "{mode:04o} as {as_euid}: {got:?}"
+                );
+            } else {
+                assert_eq!(
+                    got.as_ref().ok(),
+                    Some(&want),
+                    "{mode:04o} as {as_euid}: {got:?}"
+                );
+            }
+        }
+        chmod(0o755);
+        let err = M2aConfig::load_for(&path, euid, me())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "{} is writable by the session's effective UID",
+                sub.display()
+            )),
+            "{err}"
+        );
+        // A symlink on the path, to a directory or to the file, is refused.
+        for through in [dir_link.join("m2a-session.toml"), file_link] {
+            assert!(
+                matches!(
+                    M2aConfig::load_for(&through, euid + 1, me()),
+                    Err(ConfigError::Path { .. })
+                ),
+                "{}",
+                through.display()
+            );
+        }
+        for bad in ["m2a-session.toml", "/etc/../etc/m2a-session.toml", "/"] {
+            assert!(
+                matches!(
+                    M2aConfig::load_for(Path::new(bad), euid + 1, me()),
+                    Err(ConfigError::Path { .. })
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    /// The session's config must not be writable by its own effective UID: owner-writable by
+    /// that UID, or group- or world-writable, is refused before the text is read. The euid is
+    /// injected, so another UID is testable without root.
+    #[test]
+    fn refuses_a_config_the_euid_can_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let euid = rustix::process::geteuid().as_raw();
+        let dir = config_tempdir();
+        let path = dir.path().join("m2a-session.toml");
+        std::fs::write(&path, with_peer("")).unwrap();
+        // The test user owns the directory: read-only, so only the file's mode is tested here.
+        let _sealed = crate::testkit::Sealed::new(dir.path());
+        let chmod = |mode| {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let want = parse(&with_peer("")).unwrap();
+        for (mode, as_euid, writable) in [
+            (0o644, euid, true),
+            (0o600, euid, true),
+            (0o644, euid + 1, false),
+            (0o444, euid, false),
+            (0o400, euid, false),
+            (0o664, euid + 1, true),
+            (0o646, euid + 1, true),
+        ] {
+            chmod(mode);
+            let got = M2aConfig::load_for(&path, as_euid, me());
+            if writable {
+                assert!(
+                    matches!(&got, Err(ConfigError::Writable { mode: m, euid: e, .. })
+                        if *m == mode && *e == as_euid),
+                    "{mode:04o} as {as_euid}: {got:?}"
+                );
+            } else {
+                assert_eq!(
+                    got.as_ref().ok(),
+                    Some(&want),
+                    "{mode:04o} as {as_euid}: {got:?}"
+                );
+            }
+        }
+        chmod(0o644);
+        let err = M2aConfig::load_for(&path, euid, me())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("writable by the session's effective UID {euid}"))
+                && err.contains("mode 0644"),
+            "{err}"
+        );
+        assert!(matches!(
+            M2aConfig::load_for(dir.path(), euid + 1, me()),
+            Err(ConfigError::NotRegular)
+        ));
+        drop(_sealed);
+        let fifo = dir.path().join("fifo.toml");
+        let made = std::process::Command::new("mkfifo")
+            .arg("-m")
+            .arg("0444")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert!(matches!(
+            M2aConfig::load_for(&fifo, euid + 1, me()),
+            Err(ConfigError::NotRegular)
+        ));
+        assert!(matches!(
+            M2aConfig::load_for(&dir.path().join("missing.toml"), euid + 1, me()),
+            Err(ConfigError::Read { .. })
+        ));
     }
 }

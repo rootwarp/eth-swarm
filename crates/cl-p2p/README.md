@@ -271,7 +271,13 @@ cache parameters. It subscribes exactly `gossip_cfg.topics` (by default only
 `/eth2/<fork_digest>/beacon_block/ssz_snappy`), so more topics are configuration, not code.
 Topics, the bounded snappy transform and the message-id are `p2p-wire::gossip`: the compressed
 data is held to `max_compressed_len(MAX_PAYLOAD_SIZE)`, and the snappy header's declared length
-to the topic's Gloas SSZ cap before anything is decompressed.
+to the topic's SSZ cap before anything is decompressed. The cap is that of the fork the topic's
+digest names (`TopicCaps::from_config`, BPO digests included): on a Fulu digest the column
+sidecar of the largest Fulu blob limit at or before the digest (45,380 bytes at 21 blobs on
+Mainnet; a BPO entry that lowers the limit keeps the larger cap, for late sidecars), on a Gloas
+digest `compute_max_data_column_sidecar_size()` (44,072 bytes on Sepolia and Hoodi). A digest
+off the schedule, or a Gloas topic under a Fulu digest, has no cap, and its message is refused
+unread.
 
 What this crate bounds in the probe's gossipsub:
 
@@ -290,7 +296,7 @@ What this crate bounds in the probe's gossipsub:
   any other topic (another kind, or ours under another fork digest) is refused before its data
   is decompressed.
 - **Payloads**: compressed data at most `max_compressed_len(MAX_PAYLOAD_SIZE)`, decompressed
-  data at most the topic's Gloas SSZ cap, RPCs at most `max_message_size()`.
+  data at most the topic's SSZ cap at its fork digest, RPCs at most `max_message_size()`.
 - **IHAVE**: ignored (`max_ihave_messages_heartbeat` 0). The probe uses mesh push only.
 
 gossipsub's other internal per-peer state is bounded only by upstream's own limits.
@@ -357,9 +363,55 @@ this section together.
 
 ## m2a-session
 
-The session runs as its own OS user (it refuses root), has no listener and no discovery, and
-dials only the peer pinned in `/etc/ethswarm/m2a-session.toml`. Noise must prove the pinned
-peer ID, or the dial fails with `wrong peer ID` and no connection stays open.
+The session runs as its own OS user, has no listener and no discovery, and dials only the peer
+pinned in `/etc/ethswarm/m2a-session.toml`. Noise must prove the pinned peer ID, or the dial
+fails with `wrong peer ID` and no connection stays open.
+
+The session runs in production on Linux only. On macOS, `initgroups` adds system groups (12,
+61, 100, 701 and others) to every user, which the supplementary-group rule below refuses, so the
+production binary refuses to run on any other platform. It checks the platform right after the
+process IDs, before it reads the config, so the error names the platform.
+
+The pre-flight checks the OS identity before anything else:
+
+1. It refuses an effective UID of root. It also refuses a real or saved UID that differs from
+   the effective UID (as after `setpriv --euid` from root), because the process could switch
+   back. It refuses a GID of 0 and a real or saved GID that differs from the effective GID (as
+   after `setpriv --reuid` without `--regid`). Linux reads all three IDs with `getresuid` and
+   `getresgid`. macOS cannot read the saved IDs, so there only the real and effective IDs are
+   compared. These checks run before the config is read and before any name-service lookup.
+2. It refuses a config on a path that the session user could change. The path is walked from
+   `/` without following a symlink. Each directory on it and the file must be owned by root.
+   No directory may be writable by the session's effective UID, nor by group or others unless
+   sticky, and the file must not be writable by that UID, group or others. Install it owned by
+   root, mode 0644, in a root-owned directory. Only the mode bits are read, not ACLs.
+3. It refuses a `run_as` other than the session account `m2a-session`.
+4. It finds the UID and primary GID of `run_as` with `getpwnam_r`, through the system's name
+   service, and refuses a `run_as` that the system does not know. It refuses every effective
+   UID other than that UID, an effective GID other than that GID, and supplementary groups
+   other than that GID.
+
+So a run under a shared login account, which can hold SSH keys or the reference node's `.env`,
+does not start, even with that account's own 0600 key and its own config. The `m2a-summary`
+line names the user and its UID (`os_user`, `euid`), and `own_os_user` passes only for
+`m2a-session`.
+
+### Build
+
+Build and install the deployed binary (root-owned, not writable by the session user):
+
+```bash
+cargo build --release --locked -p cl-p2p --bin m2a-session
+sudo install -o root -g root -m 0755 target/release/m2a-session /usr/local/bin/m2a-session
+```
+
+`m2a-session` always runs the strict pre-flight above. The same code is also built as the test
+binary `m2a-session-test`, only with the cargo feature `test-run-as`, which only cl-p2p's own
+dev-dependency turns on (so `cargo test` and `cargo build --all-targets` build it). The test
+binary takes a `run_as` other than `m2a-session` with that user's groups, accepts a config the
+test user owns, and runs on any platform. Its first log line says `TEST BUILD`, its summary has
+`"test_build": true`, and that summary fails its `production_build` check, so a gate that reads
+the summary fails a test-binary run. Never deploy it.
 
 ### Node key
 
@@ -387,6 +439,8 @@ reference_api_url = "http://127.0.0.1:5052"
 node_key = "/var/lib/m2a-session/node.key"
 # The reference node lists our peer ID as trusted; refused without node_key.
 trusted_by_reference = true
+# The OS user the session runs as: the default shown, the only value a release build takes.
+run_as = "m2a-session"
 
 [deadlines]           # optional; milliseconds, the defaults shown
 ttfb_ms = 5000
@@ -429,10 +483,12 @@ Pre-flight first, before any dial:
   this binary was built from. `build.rs` embeds `check-m2a-gate.sh --print-expected` of the
   build tree, `heads` included: the file's `head` must be the build's commit or an ancestor of
   it with the same decoder key (the script checks the same with git), so the file names a
-  commit that was fuzzed. `crates/cl-p2p/src/rpc/unsupported.rs` (which `rpc/metrics.rs`
-  imports) is in the key, so a gate file written before it was keyed is stale and the gate has
-  to be run again. A dirty keyed path, or a tree without the fuzz harness, embeds no
-  expectations, and every gate file is refused. So does a build outside its git checkout
+  commit that was fuzzed. The cl-p2p library from its crate root `lib.rs`, every module that a
+  keyed file imports, and each workspace crate that keyed code imports (or a written reason why
+  not) are in the key (`crates/ci-checks/tests/fuzz_keys.rs` checks this), so a
+  gate file written before they were keyed is stale and the gate has to be run again. A dirty
+  keyed path, or a tree without the fuzz harness, embeds no expectations, and every gate file is
+  refused. So does a build outside its git checkout
   (`cargo package`, a tarball, or `GIT_DIR`/`GIT_WORK_TREE` pointing elsewhere: the build
   script ignores them).
   git runs with no system or global config, so a checkout owned by another user (which needs
