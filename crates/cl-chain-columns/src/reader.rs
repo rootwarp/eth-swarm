@@ -9,7 +9,7 @@ use crate::{
         block_prefix, column_key, decode_column_key, BlockLink, BlockRoot, ADVERTISED_CGC_KEY,
         BLOCK_PREFIX_LEN, CGC_KEY, CGC_SET_SLOT_KEY, COLUMNS_TABLE, CONTIGUOUS_FROM_KEY,
         FINALIZED_SLOT_KEY, FIRST_STORED_SLOT_KEY, LINKS_TABLE, METADATA_SEQ_KEY, META_TABLE,
-        ROOTS_TABLE,
+        RETAINED_FROM_KEY, ROOTS_TABLE,
     },
 };
 
@@ -210,6 +210,11 @@ impl ColumnReader {
         self.snapshot()?.finalized_slot()
     }
 
+    /// [`Snapshot::retained_from`] in a transaction of its own.
+    pub fn retained_from(&self) -> Result<Option<u64>> {
+        self.snapshot()?.retained_from()
+    }
+
     /// [`Snapshot::first_stored_slot`] in a transaction of its own.
     pub fn first_stored_slot(&self) -> Result<Option<u64>> {
         self.snapshot()?.first_stored_slot()
@@ -294,10 +299,18 @@ impl Snapshot<'_> {
     }
 
     /// Finalized-slot watermark: the highest slot passed to
+    /// [`ColumnWriter::finalize`](crate::ColumnWriter::finalize) or
     /// [`ColumnWriter::prune_finalized`](crate::ColumnWriter::prune_finalized), `None` before
-    /// the first prune.
+    /// the first. Every block stored at or below it, from the contiguous-from slot on, is on
+    /// the finalized chain ([`FINALIZED_SLOT_KEY`](crate::keys::FINALIZED_SLOT_KEY)).
     pub fn finalized_slot(&self) -> Result<Option<u64>> {
         meta_u64(&self.txn, FINALIZED_SLOT_KEY)
+    }
+
+    /// The slot the store keeps columns from: every column below it was pruned
+    /// ([`RETAINED_FROM_KEY`](crate::keys::RETAINED_FROM_KEY)). `None` before the first prune.
+    pub fn retained_from(&self) -> Result<Option<u64>> {
+        retained_from(&self.txn)
     }
 
     /// The lowest slot any column was ever stored at, `None` before the first column. Written in
@@ -306,6 +319,11 @@ impl Snapshot<'_> {
     /// [`FIRST_STORED_SLOT_KEY`](crate::keys::FIRST_STORED_SLOT_KEY)).
     pub fn first_stored_slot(&self) -> Result<Option<u64>> {
         meta_u64(&self.txn, FIRST_STORED_SLOT_KEY)
+    }
+
+    /// The slot after the highest stored block, `None` with no block stored.
+    pub fn after_last_block(&self) -> Result<Option<u64>> {
+        after_highest_block(&self.txn)
     }
 
     /// The slot from which the stored blocks are contiguous
@@ -487,6 +505,16 @@ pub(crate) fn stored_link<K: TransactionKind>(
             None if BlockLink::legacy_pending_target(&bytes).is_some() => Ok(Some(BlockLink::Gap)),
             None => Err(Error::Corrupt { table: LINKS_TABLE }),
         },
+    }
+}
+
+/// [`RETAINED_FROM_KEY`], or for an env written before it, the slot after the watermark.
+pub(crate) fn retained_from<K: TransactionKind>(
+    txn: &Transaction<'_, K, NoWriteMap>,
+) -> Result<Option<u64>> {
+    match meta_u64(txn, RETAINED_FROM_KEY)? {
+        Some(slot) => Ok(Some(slot)),
+        None => Ok(meta_u64(txn, FINALIZED_SLOT_KEY)?.map(|f| f.saturating_add(1))),
     }
 }
 

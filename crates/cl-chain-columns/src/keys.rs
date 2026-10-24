@@ -6,7 +6,7 @@
 //! | [`COLUMNS_TABLE`]  | `slot (u64 BE) ‖ block_root (32) ‖ column_index (u64 BE)`, 48 bytes | SSZ `DataColumnSidecar` |
 //! | [`ROOTS_TABLE`]    | `block_root (32)`                                     | `slot (u64 BE)`             |
 //! | [`LINKS_TABLE`]    | `block_root (32)`                                     | [`BlockLink`]: `kind (1) ‖ root (32)`, and for kind 3 `‖ slot (u64 BE)` |
-//! | [`META_TABLE`]     | ASCII name: [`CGC_KEY`], [`CGC_SET_SLOT_KEY`], [`METADATA_SEQ_KEY`], [`ADVERTISED_CGC_KEY`], [`FINALIZED_SLOT_KEY`], [`FIRST_STORED_SLOT_KEY`], [`CONTIGUOUS_FROM_KEY`] | `u64 BE` |
+//! | [`META_TABLE`]     | ASCII name: [`CGC_KEY`], [`CGC_SET_SLOT_KEY`], [`METADATA_SEQ_KEY`], [`ADVERTISED_CGC_KEY`], [`FINALIZED_SLOT_KEY`], [`RETAINED_FROM_KEY`], [`FIRST_STORED_SLOT_KEY`], [`CONTIGUOUS_FROM_KEY`] | `u64 BE` |
 //!
 //! Big-endian slot first makes MDBX's lexicographic key order equal slot order, so finality
 //! pruning is one cursor walk from the first key up to the finalized slot. All columns of a block
@@ -24,8 +24,8 @@ pub const ROOTS_TABLE: &str = "column_roots";
 /// it on its chain.
 pub const LINKS_TABLE: &str = "column_links";
 /// Small scalar values for this env: the custody record ([`CGC_KEY`], [`CGC_SET_SLOT_KEY`],
-/// [`METADATA_SEQ_KEY`], [`ADVERTISED_CGC_KEY`]), [`FINALIZED_SLOT_KEY`] and
-/// [`FIRST_STORED_SLOT_KEY`].
+/// [`METADATA_SEQ_KEY`], [`ADVERTISED_CGC_KEY`]), [`FINALIZED_SLOT_KEY`],
+/// [`RETAINED_FROM_KEY`], [`FIRST_STORED_SLOT_KEY`] and [`CONTIGUOUS_FROM_KEY`].
 pub const META_TABLE: &str = "meta";
 /// Every table this env holds, in creation order.
 pub const TABLES: [&str; 4] = [COLUMNS_TABLE, ROOTS_TABLE, META_TABLE, LINKS_TABLE];
@@ -42,17 +42,28 @@ pub const METADATA_SEQ_KEY: &[u8] = b"metadata_seq";
 /// [`META_TABLE`] key of the custody group count the node advertises (ENR `cgc`, MetaData
 /// `custody_group_count`); 0 while it withholds its custody from peers.
 pub const ADVERTISED_CGC_KEY: &[u8] = b"advertised_cgc";
-/// [`META_TABLE`] key of the finalized-slot watermark: the highest slot finality pruning has
-/// covered. Writes at or below it are refused, so a late write cannot undo a prune.
+/// [`META_TABLE`] key of the finalized-slot watermark: the highest slot finality has covered.
+/// Every block stored at or below it and at or above [`CONTIGUOUS_FROM_KEY`] is on the
+/// finalized chain: finality removed the others, or raised the contiguous-from slot past a block
+/// it could not place ([`ColumnWriter::finalize`](crate::ColumnWriter::finalize)). Writes at or
+/// below it are refused, so a late write cannot bring one back. It only rises.
 pub const FINALIZED_SLOT_KEY: &[u8] = b"finalized_slot";
+/// [`META_TABLE`] key of the slot the store keeps columns from: every column below it was
+/// pruned ([`ColumnWriter::prune_before`](crate::ColumnWriter::prune_before), or
+/// [`ColumnWriter::prune_finalized`](crate::ColumnWriter::prune_finalized) up to the slot after
+/// its watermark). It only rises, and it rises in the first transaction of its prune, so a
+/// reader never sees a pruned column claimed. An env written before this key existed pruned
+/// every column at or below its watermark: it keeps from the slot after the watermark, and the
+/// first transaction that raises the watermark writes that value here.
+pub const RETAINED_FROM_KEY: &[u8] = b"retained_from";
 /// [`META_TABLE`] key of the lowest slot any column was ever stored at, written in the
 /// transaction that stores that column. Pruning never moves it: it records where storing began.
 ///
 /// A historical minimum, not proof that the data is held: one column lowers it even if the
 /// block's other custody columns never arrive, pruning leaves it below the data that remains,
 /// and raising the custody group count does not move it. Status `earliest_available_slot` is
-/// derived from it but never equal to it alone: it is the highest of this slot, the slot after
-/// [`FINALIZED_SLOT_KEY`] and [`CGC_SET_SLOT_KEY`].
+/// derived from it but never equal to it alone: it is the highest of this slot,
+/// [`RETAINED_FROM_KEY`] and [`CGC_SET_SLOT_KEY`].
 pub const FIRST_STORED_SLOT_KEY: &[u8] = b"first_stored_slot";
 
 /// [`META_TABLE`] key of the slot from which the stored blocks are contiguous: the highest slot

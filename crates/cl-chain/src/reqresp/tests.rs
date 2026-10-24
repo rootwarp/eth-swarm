@@ -1,5 +1,7 @@
 use super::*;
+use crate::probe::{CanonicalChain, ChainView};
 use cl_chain_columns::Column;
+use std::sync::OnceLock;
 
 /// The custody columns of node `U256::MAX` (`get_custody_groups(U256::MAX, 4)`).
 const CUSTODY: [u64; 4] = [1, 47, 87, 102];
@@ -56,6 +58,22 @@ fn snap(writer: &ColumnWriter) -> cl_chain_columns::Snapshot<'_> {
     writer.reader().snapshot().unwrap()
 }
 
+/// A chain that holds every block these tests store, [`root`] and [`fork`] alike, at slots 0 to
+/// 1000: the tests of the store's own chain rules, which hold under the reference's chain too.
+fn every_block() -> Arc<ChainView> {
+    static VIEW: OnceLock<Arc<ChainView>> = OnceLock::new();
+    let view = VIEW.get_or_init(|| {
+        let blocks = (0..=1000).flat_map(|slot| [(slot, root(slot)), (slot, fork(slot))]);
+        Arc::new(ChainView::new(blocks).unwrap())
+    });
+    Arc::clone(view)
+}
+
+/// [`every_block`] as the column server follows it.
+fn following_every_block() -> Arc<CanonicalChain> {
+    Arc::new(CanonicalChain::fixed((*every_block()).clone()))
+}
+
 fn view(earliest: Option<Slot>) -> ServeView {
     ServeView {
         custody: CUSTODY.to_vec(),
@@ -63,7 +81,253 @@ fn view(earliest: Option<Slot>) -> ServeView {
         serve_range: Some((0, 1000)),
         budget: ServeBudget::default(),
         deadline: None,
+        chain: Some(every_block()),
     }
+}
+
+/// [`view`] on the reference's chain of `blocks` (slots of [`root`]s).
+fn on_chain(earliest: Option<Slot>, blocks: &[u64]) -> ServeView {
+    let chain = ChainView::new(blocks.iter().map(|&slot| (slot, root(slot))));
+    ServeView {
+        chain: chain.map(Arc::new),
+        ..view(earliest)
+    }
+}
+
+/// A block off the reference's chain is never served, even alone in its range
+/// (`fulu/p2p-interface.md`, `DataColumnSidecarsByRange v1`: "data column sidecars as included
+/// by blocks from the single chain defined by the current head"): the chain 10 to 12, and an
+/// orphan at 11 whose parent is 10, which the store's links alone would serve.
+#[test]
+fn an_orphan_alone_in_its_range_is_never_served() {
+    let (_dir, writer) = store();
+    chain(&writer, &[10, 12], &CUSTODY);
+    put_root(&writer, 11, fork(11), BlockLink::Parent(root(10)), &CUSTODY);
+    let v = on_chain(Some(10), &[10, 12]);
+    let snapshot = snap(&writer);
+    let served = columns_by_range(&snapshot, 11, 1, &CUSTODY, &v).unwrap();
+    assert!(
+        served.iter().all(|s| s.block_root != fork(11)),
+        "{served:?}"
+    );
+    // The reference's chain has no block at 11: nothing to serve there.
+    assert_eq!(served, Vec::new());
+    // Around it, the chain's blocks, and never the orphan.
+    let served = columns_by_range(&snapshot, 10, 3, &[1], &v).unwrap();
+    assert_eq!(keys(&served), [(10, 1), (12, 1)]);
+    assert!(served.iter().all(|s| s.block_root == root(s.slot)));
+    drop(snapshot);
+    // The same through the column server, which follows the reference's chain.
+    let writer = Arc::new(writer);
+    open_custody(&writer, 10);
+    let server = ColumnServer::new(
+        Arc::clone(&writer) as Arc<dyn ColumnStore>,
+        U256::MAX,
+        Arc::new(Fixed),
+        ServeBudget::default(),
+    )
+    .following(Arc::new(CanonicalChain::fixed(
+        ChainView::new([(10, root(10)), (12, root(12))]).unwrap(),
+    )));
+    assert_eq!(server.by_range(11, 1, &CUSTODY, None).unwrap(), Vec::new());
+    let served = server.by_range(10, 3, &[1], None).unwrap();
+    assert_eq!(keys(&served), [(10, 1), (12, 1)]);
+}
+
+/// While the reference's chain is not known, a range with a stored block is
+/// `3: ResourceUnavailable`, never a possible orphan; and a block past either end of the known
+/// chain ends the answer before it.
+#[test]
+fn an_unknown_chain_serves_no_block() {
+    let (_dir, writer) = store();
+    chain(&writer, &[10, 12], &CUSTODY);
+    put_root(&writer, 11, fork(11), BlockLink::Parent(root(10)), &CUSTODY);
+    let snapshot = snap(&writer);
+    let unknown = ServeView {
+        chain: None,
+        ..view(Some(10))
+    };
+    for (start, count) in [(11, 1), (10, 3), (12, 1)] {
+        let why = unavailable(columns_by_range(&snapshot, start, count, &[1], &unknown));
+        assert!(why.contains("not known"), "{start}+{count}: {why}");
+    }
+    // A range with no stored block needs no chain: nothing to serve, as before.
+    assert_eq!(
+        columns_by_range(&snapshot, 13, 2, &[1], &unknown).unwrap(),
+        Vec::new()
+    );
+    // The chain is known up to 10: 12 may be on it or not, so the answer ends before it.
+    let to_10 = on_chain(Some(10), &[10]);
+    let served = columns_by_range(&snapshot, 10, 3, &[1], &to_10).unwrap();
+    assert_eq!(keys(&served), [(10, 1)]);
+    let why = unavailable(columns_by_range(&snapshot, 12, 1, &[1], &to_10));
+    assert!(why.contains("slot 12"), "{why}");
+    // Known from 12 on: 10 is before it, so a range from 10 has no block to start with.
+    let from_12 = on_chain(Some(10), &[12]);
+    let why = unavailable(columns_by_range(&snapshot, 10, 3, &[1], &from_12));
+    assert!(why.contains("slot 10"), "{why}");
+    assert_eq!(
+        keys(&columns_by_range(&snapshot, 12, 1, &[1], &from_12).unwrap()),
+        [(12, 1)]
+    );
+    // A column server that follows no chain serves no range.
+    drop(snapshot);
+    let writer = Arc::new(writer);
+    open_custody(&writer, 10);
+    let server = ColumnServer::new(
+        Arc::clone(&writer) as Arc<dyn ColumnStore>,
+        U256::MAX,
+        Arc::new(Fixed),
+        ServeBudget::default(),
+    );
+    assert!(matches!(
+        server.by_range(10, 3, &[1], None),
+        Err(Refusal::Unavailable(_))
+    ));
+    // Before its first view it claims nothing unfinalized, so by root leaves its blocks out
+    // too; with a chain known, by root answers what it holds: a root names its block.
+    assert_eq!(
+        server.by_root(&[(fork(11), vec![1])], None).unwrap(),
+        Vec::new()
+    );
+    let server = server.following(following_every_block());
+    let served = server.by_root(&[(fork(11), vec![1])], None).unwrap();
+    assert_eq!(keys(&served), [(11, 1)]);
+}
+
+/// The column server never claims a slot before the first block of the reference's chain it
+/// knows above the store's finalized slot: a range from there would be refused. Once finality
+/// covers those slots, the store serves them without the chain.
+#[test]
+fn earliest_available_slot_never_claims_a_slot_before_the_known_chain() {
+    let (_dir, writer) = store();
+    chain(&writer, &[10, 11, 12], &CUSTODY);
+    let writer = Arc::new(writer);
+    open_custody(&writer, 10);
+    let server = ColumnServer::new(
+        Arc::clone(&writer) as Arc<dyn ColumnStore>,
+        U256::MAX,
+        Arc::new(Fixed),
+        ServeBudget::default(),
+    )
+    .following(Arc::new(CanonicalChain::fixed(
+        ChainView::new([(11, root(11)), (12, root(12))]).unwrap(),
+    )));
+    assert_eq!(server.earliest_available_slot(), Some(11));
+    assert_eq!(server.status_floor(), Ok(11));
+    let served = server.by_range(11, 2, &[1], None).unwrap();
+    assert_eq!(keys(&served), [(11, 1), (12, 1)]);
+    let why = unavailable(server.by_range(10, 3, &[1], None));
+    assert!(why.contains("below earliest_available_slot 11"), "{why}");
+    writer
+        .finalize(10, &std::collections::HashSet::from([root(10)]), 11)
+        .unwrap();
+    assert_eq!(server.earliest_available_slot(), Some(10));
+    let served = server.by_range(10, 3, &[1], None).unwrap();
+    assert_eq!(keys(&served), [(10, 1), (11, 1), (12, 1)]);
+}
+
+/// While the chain is not known (the stream down, a walk waiting), the first slot of the last
+/// view still bounds the claim: a range from below it would be refused once the chain is known
+/// again, so it is never claimed.
+#[test]
+fn the_last_known_chain_bounds_the_claim_while_the_chain_is_unknown() {
+    let (_dir, writer) = store();
+    chain(&writer, &[10, 11, 12], &CUSTODY);
+    let writer = Arc::new(writer);
+    open_custody(&writer, 10);
+    let canonical = Arc::new(CanonicalChain::fixed(
+        ChainView::new([(11, root(11)), (12, root(12))]).unwrap(),
+    ));
+    let server = ColumnServer::new(
+        Arc::clone(&writer) as Arc<dyn ColumnStore>,
+        U256::MAX,
+        Arc::new(Fixed),
+        ServeBudget::default(),
+    )
+    .following(Arc::clone(&canonical));
+    assert_eq!(server.earliest_available_slot(), Some(11));
+    canonical.set(None);
+    assert_eq!(server.earliest_available_slot(), Some(11));
+    assert_eq!(canonical.known_from(), Some(11));
+}
+
+/// Before the first view of the reference's chain (a start with the event stream down), no
+/// stored block above the finalized slot has a known place: a store with nothing finalized
+/// claims nothing it holds, and a range from what it claims is never refused. Once finality
+/// covers its first blocks, it claims them.
+#[test]
+fn before_the_first_view_nothing_unfinalized_is_claimed() {
+    let (_dir, writer) = store();
+    chain(&writer, &[10, 11, 12], &CUSTODY);
+    let writer = Arc::new(writer);
+    open_custody(&writer, 10);
+    let canonical = Arc::new(CanonicalChain::default());
+    let server = ColumnServer::new(
+        Arc::clone(&writer) as Arc<dyn ColumnStore>,
+        U256::MAX,
+        Arc::new(Fixed),
+        ServeBudget::default(),
+    )
+    .following(Arc::clone(&canonical));
+    assert_eq!(server.earliest_available_slot(), Some(13));
+    assert_eq!(server.status_floor(), Ok(13));
+    assert_eq!(server.by_range(13, 2, &[1], None), Ok(Vec::new()));
+    writer
+        .finalize(
+            11,
+            &std::collections::HashSet::from([root(10), root(11)]),
+            12,
+        )
+        .unwrap();
+    assert_eq!(server.earliest_available_slot(), Some(10));
+    let served = server.by_range(10, 3, &[1], None).unwrap();
+    assert_eq!(keys(&served), [(10, 1), (11, 1)]);
+    canonical.set(ChainView::new([(12, root(12))]));
+    assert_eq!(server.earliest_available_slot(), Some(10));
+}
+
+/// Every block at or below the store's finalized slot is on the finalized chain: those blocks
+/// are served while the reference's chain is not known, and the answer ends before the first
+/// block above it.
+#[test]
+fn finalized_blocks_are_served_without_the_chain() {
+    let (_dir, writer) = store();
+    chain(&writer, &[10, 11, 12], &CUSTODY);
+    put_root(&writer, 11, fork(11), BlockLink::Parent(root(10)), &CUSTODY);
+    let canonical = std::collections::HashSet::from([root(10), root(11)]);
+    writer.finalize(11, &canonical, 12).unwrap();
+    assert_eq!(writer.reader().slot_of(&fork(11)).unwrap(), None);
+    let unknown = ServeView {
+        chain: None,
+        ..view(Some(10))
+    };
+    let snapshot = snap(&writer);
+    for count in [2, 3] {
+        let served = columns_by_range(&snapshot, 10, count, &[1], &unknown).unwrap();
+        assert_eq!(keys(&served), [(10, 1), (11, 1)], "10+{count}");
+    }
+    let why = unavailable(columns_by_range(&snapshot, 12, 1, &[1], &unknown));
+    assert!(why.contains("not known"), "{why}");
+}
+
+/// The custody record of node `U256::MAX` in `writer`, set at `slot`.
+fn open_custody(writer: &Arc<ColumnWriter>, slot: Slot) {
+    use crate::da::custody::{Advertise, Custody, EnrCgc, EnrError};
+    struct NoEnr;
+    impl EnrCgc for NoEnr {
+        fn set_cgc(&mut self, _: u64) -> Result<(), EnrError> {
+            Ok(())
+        }
+    }
+    Custody::open(
+        Arc::clone(writer),
+        NoEnr,
+        U256::MAX,
+        Advertise::Custody,
+        slot,
+    )
+    .unwrap();
 }
 
 fn keys(served: &[Served]) -> Vec<(u64, u64)> {
@@ -258,7 +522,8 @@ fn an_unmigrated_pending_link_is_never_answered_as_empty() {
         U256::MAX,
         Arc::new(Fixed),
         ServeBudget::default(),
-    );
+    )
+    .following(following_every_block());
     assert_eq!(server.earliest_available_slot(), Some(10));
     for (start, count) in [(12, 1), (10, 1), (11, 2), (10, 4), (13, 1), (10, 6)] {
         assert!(
@@ -434,7 +699,8 @@ fn a_gap_moves_earliest_available_slot_past_it() {
         U256::MAX,
         Arc::new(Fixed),
         ServeBudget::default(),
-    );
+    )
+    .following(following_every_block());
     chain(&writer, &[10, 11], &CUSTODY);
     assert_eq!(server.earliest_available_slot(), Some(10));
     // 12 was never held (downtime): 13 is stored as a gap.
@@ -717,7 +983,8 @@ fn the_server_reads_its_view_from_the_store() {
         U256::MAX,
         Arc::new(Fixed),
         ServeBudget::default(),
-    );
+    )
+    .following(following_every_block());
     // No custody record yet: nothing to serve.
     assert_eq!(server.earliest_available_slot(), None);
     Custody::open(
@@ -826,12 +1093,15 @@ async fn reads_past_the_places_are_overloaded() {
         digests,
     );
     let (_dir, writer) = store();
-    let columns = Arc::new(ColumnServer::new(
-        Arc::new(writer) as Arc<dyn ColumnStore>,
-        U256::MAX,
-        Arc::new(Fixed),
-        ServeBudget::default(),
-    ));
+    let columns = Arc::new(
+        ColumnServer::new(
+            Arc::new(writer) as Arc<dyn ColumnStore>,
+            U256::MAX,
+            Arc::new(Fixed),
+            ServeBudget::default(),
+        )
+        .following(following_every_block()),
+    );
     let codes = |server: ReqRespServer| {
         let hello = hello.clone();
         async move {
@@ -980,12 +1250,15 @@ async fn the_service_refuses_exactly_what_the_bounds_refuse() {
         }
         let server = ReqRespServer::new(
             link.clone(),
-            Arc::new(ColumnServer::new(
-                Arc::new(writer) as Arc<dyn ColumnStore>,
-                U256::MAX,
-                Arc::new(Fixed),
-                ServeBudget::default(),
-            )),
+            Arc::new(
+                ColumnServer::new(
+                    Arc::new(writer) as Arc<dyn ColumnStore>,
+                    U256::MAX,
+                    Arc::new(Fixed),
+                    ServeBudget::default(),
+                )
+                .following(following_every_block()),
+            ),
         );
         for (count, columns) in &ranges {
             let request = pb::DataColumnsByRangeRequest {
@@ -1103,12 +1376,15 @@ fn a_status() -> pb::GetStatusResponse {
 #[tokio::test]
 async fn get_status_serves_the_status_source() {
     let (_dir, writer) = store();
-    let columns = Arc::new(ColumnServer::new(
-        Arc::new(writer) as Arc<dyn ColumnStore>,
-        U256::MAX,
-        Arc::new(Fixed),
-        ServeBudget::default(),
-    ));
+    let columns = Arc::new(
+        ColumnServer::new(
+            Arc::new(writer) as Arc<dyn ColumnStore>,
+            U256::MAX,
+            Arc::new(Fixed),
+            ServeBudget::default(),
+        )
+        .following(following_every_block()),
+    );
     let stub = ReqRespServer::new(status_link(), Arc::clone(&columns));
     let err = stub
         .get_status(Request::new(pb::GetStatusRequest {}))

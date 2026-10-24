@@ -52,10 +52,11 @@
 //!    finds the nearest ancestor that is stored or carries blobs, passing through ancestors
 //!    without blobs (they have no columns), at most [`MAX_LINK_WALK`] blocks back, and hands it
 //!    to the writer as [`BlockLink::Pending`] with the ancestor's slot. An ancestor before
-//!    `cgc_set_slot` or at or below the finalized watermark is [`BlockLink::Start`]; one the
+//!    `cgc_set_slot` or below the slot the store keeps columns from
+//!    ([`ColumnReader::retained_from`]) is [`BlockLink::Start`]; one the
 //!    reference cannot vouch for, or a walk past its bound, is [`BlockLink::Gap`]. The writer
 //!    decides at write time, after every earlier batch committed: an ancestor stored by then is
-//!    the block's [`BlockLink::Parent`], and one finality covers by then (pruned, or refused) a
+//!    the block's [`BlockLink::Parent`], and one pruned by then (below the retained-from slot) a
 //!    [`BlockLink::Start`]; one not stored yet leaves the block pending, and it links as soon
 //!    as the ancestor's columns are written, so a parent and child released together link
 //!    whatever order they are written in. A gap from a later walk that failed does not replace
@@ -80,19 +81,40 @@
 //! together, and `probe_column_buffer_alert` is 1 while that is at or above
 //! [`IngestLimits::alert_bytes`] ([`COLUMN_BUFFER_ALERT_BYTES`], 48 MiB).
 //!
+//! **Pruning** runs on the [`WRITER_THREAD`] thread too, from the reference's chain
+//! ([`ColumnIngest::follow_head`], `probe::canon`), behind the writes queued before it:
+//!
+//! - at a finalized checkpoint the follower took, the blocks at or below the finalized slot
+//!   that are off the finalized chain ([`ColumnWriter::finalize`]). The finalized chain's
+//!   columns stay for their retention window, and the watermark rises over them only once the
+//!   others are gone;
+//! - every column below the first slot of `data_column_serve_range` by the wall clock, out of
+//!   the retention window (`fulu/p2p-interface.md`, `DataColumnSidecarsByRange v1`:
+//!   `MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS`; [`ColumnWriter::prune_before`]). The
+//!   retained-from slot rises in its first transaction, so `earliest_available_slot` never
+//!   claims a pruned slot.
+//!
+//! A head change prunes nothing. At most one prune waits on the writer's queue at a time, so
+//! the queue keeps its room for every place's write: the follower puts it into the room kept
+//! for it without waiting for room (it holds no sender while it waits), and waits for the
+//! writer's answer before its next prune.
+//!
 //! The first stored slot ([`first_stored_column_slot`]) is written in the transaction that
 //! stores the column, so it survives a crash together with the columns. It is a historical
 //! minimum, not proof that the data is held; [`earliest_servable_slot`] is the slot the store
-//! may claim to serve from. Pruning on finality and reorg stays with the column env
-//! ([`ColumnWriter::prune_finalized`], [`ColumnWriter::prune_orphaned`]).
+//! may claim to serve from.
 
+use super::canon::{CanonicalChain, Prune, PruneSink, Pruned};
 use super::column::{local_check, vouched_contract, ColumnContract, ColumnMetrics, Drop};
 use super::head::{follow_head, HeadFollow, HeadSource};
 use super::root_wait::{Answer, RootWaits};
 use super::{BlockApi, GossipColumn, RefBlock, RefError, RefLimits, RefView, ReferenceApi, Root};
 use crate::da::custody::Custody;
+use crate::reqresp::ServeClock;
 use crate::verify::client::{Held, KzgVerifier};
-use cl_chain_columns::{BlockLink, Column, ColumnReader, ColumnWriter, WriteFailed, WriteReport};
+use cl_chain_columns::{
+    BlockLink, Column, ColumnReader, ColumnWriter, PruneReport, WriteFailed, WriteReport,
+};
 use consensus_types::primitives::Slot;
 use consensus_types::{gloas, EthSpec};
 use ethswarm_proto::common::Verdict;
@@ -101,7 +123,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use ssz::Encode;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -428,7 +450,7 @@ impl QueueMetrics {
 /// even if the block's other custody columns never arrive, pruning (finality or reorg) leaves
 /// it below the data that remains, and raising custody does not move it. So it is never the
 /// Status `earliest_available_slot` on its own: that is [`earliest_servable_slot`], which also
-/// takes the finalized-slot watermark and `cgc_set_slot`.
+/// takes the retained-from slot and `cgc_set_slot`.
 ///
 /// # Errors
 ///
@@ -440,30 +462,25 @@ pub fn first_stored_column_slot(
 }
 
 /// The lowest slot the column store may claim to serve: the highest of `first_stored_slot`
-/// ([`first_stored_column_slot`]), the slot after the finalized-slot watermark
-/// (`finalized_slot`, [`ColumnReader::finalized_slot`]: everything at or below it is pruned),
-/// `cgc_set_slot` (columns before it are of a smaller custody) and `contiguous_from`
-/// ([`ColumnReader::contiguous_from`]: a blob-carrying block before it is not held, after
-/// downtime or a block whose columns all missed gossip). `None` while nothing was stored, or if
-/// the watermark is the last slot. The Status `earliest_available_slot`, once the probe serves
-/// columns, is this value.
+/// ([`first_stored_column_slot`]), `retained_from` ([`ColumnReader::retained_from`]: every
+/// column below it is pruned), `cgc_set_slot` (columns before it are of a smaller custody) and
+/// `contiguous_from` ([`ColumnReader::contiguous_from`]: a blob-carrying block before it is not
+/// held, after downtime or a block whose columns all missed gossip). `None` while nothing was
+/// stored. The column server also never claims a slot before the reference's chain it knows
+/// (`crate::reqresp::ColumnServer::earliest_available_slot`).
 ///
 /// Still not proof that every custody column from there on is held: a block whose columns
 /// partly arrived is stored, and a range answer ends before it (`crate::reqresp`).
 #[must_use]
 pub fn earliest_servable_slot(
     first_stored_slot: Option<Slot>,
-    finalized_slot: Option<Slot>,
+    retained_from: Option<Slot>,
     cgc_set_slot: Slot,
     contiguous_from: Option<Slot>,
 ) -> Option<Slot> {
-    let after_finalized = match finalized_slot {
-        Some(slot) => slot.checked_add(1)?,
-        None => 0,
-    };
     Some(
         first_stored_slot?
-            .max(after_finalized)
+            .max(retained_from.unwrap_or(0))
             .max(cgc_set_slot)
             .max(contiguous_from.unwrap_or(0)),
     )
@@ -656,6 +673,14 @@ enum Job {
         /// meanwhile leaves the barrier queued, and no second one joins it.
         one: tokio::sync::OwnedMutexGuard<()>,
     },
+    /// The prunes of the reference's chain, after every job before it (see the module docs).
+    Prune {
+        prune: Prune,
+        /// The one prune's turn on the queue, held until the writer took it.
+        one: tokio::sync::OwnedMutexGuard<()>,
+        /// Told whether every part of the prune is done.
+        done: tokio::sync::oneshot::Sender<bool>,
+    },
 }
 
 /// What a column's task works with.
@@ -681,6 +706,10 @@ pub struct ColumnIngest<A, E, V, S, C> {
     writes: Option<mpsc::Sender<Job>>,
     /// Held by the one barrier on the writer's queue, so the queue keeps room for every place.
     barrier: Arc<tokio::sync::Mutex<()>>,
+    /// Held by the one prune on the writer's queue, for the same reason.
+    prune_turn: Arc<tokio::sync::Mutex<()>>,
+    /// The reference's chain, as [`Self::follow_head`] keeps it: unknown until then.
+    chain: Arc<CanonicalChain>,
     writer_thread: Option<JoinHandle<()>>,
     writer: Arc<ColumnWriter>,
 }
@@ -711,9 +740,9 @@ where
         limits
             .validate_for(&refs.limits())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        // Every write holds a queue place, and one barrier at most is queued ([`Self::settled`]),
-        // so the channel never holds more than `max_items` writes and that barrier.
-        let (writes, jobs) = mpsc::channel(limits.max_items.max(1) + 1);
+        // Every write holds a queue place, one barrier at most is queued ([`Self::settled`]) and
+        // one prune at most, so the channel never holds more than `max_items` writes and those.
+        let (writes, jobs) = mpsc::channel(limits.max_items.max(1) + 2);
         let writer_thread = std::thread::Builder::new()
             .name(WRITER_THREAD.into())
             .spawn({
@@ -738,6 +767,8 @@ where
             tasks: Mutex::default(),
             writes: Some(writes),
             barrier: Arc::default(),
+            prune_turn: Arc::default(),
+            chain: Arc::default(),
             writer_thread: Some(writer_thread),
             writer,
         })
@@ -755,16 +786,31 @@ where
         self.shared.refs.cached_block(root).is_some()
     }
 
-    /// Follows the reference's head from `source` ([`follow_head`]) on a task of this store,
-    /// until the store is dropped: each root the reference announces is looked up ahead of its
-    /// columns, in places of its own. Must be called within a tokio runtime.
-    pub fn follow_head<H>(&self, source: H, config: HeadFollow)
+    /// Follows the reference's events from `source` ([`follow_head`]) on a task of this
+    /// store, until the store is dropped: each root the reference announces is looked up ahead
+    /// of its columns, in places of its own; its chain is kept in [`Self::canonical`]; and the
+    /// blocks off its finalized chain and the columns out of the retention window by `clock`
+    /// are pruned on the writer thread (see the module docs). Must be called within a tokio
+    /// runtime.
+    pub fn follow_head<H>(&self, source: H, config: HeadFollow, clock: Arc<dyn ServeClock>)
     where
         H: HeadSource + 'static,
     {
         let refs = Arc::clone(&self.shared.refs);
+        let prunes = WriterPrunes {
+            writes: self.writes.as_ref().map(mpsc::Sender::downgrade),
+            turn: Arc::clone(&self.prune_turn),
+        };
+        let chain = Arc::clone(&self.chain);
+        // The walks stop at the store's watermark, as they did before a restart.
+        let finalized = self.writer.reader().finalized_slot().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "the column store's finalized slot not read");
+            None
+        });
         let mut tasks = self.tasks.lock().unwrap_or_else(PoisonError::into_inner);
-        tasks.spawn(follow_head(source, refs, config));
+        tasks.spawn(follow_head(
+            source, refs, config, chain, clock, finalized, prunes,
+        ));
     }
 
     /// Takes a column sidecar from gossip; see the module docs. The verdict is always
@@ -802,6 +848,14 @@ impl<A, E, V, S, C> ColumnIngest<A, E, V, S, C> {
             Some(writes) => barrier(writes, &self.barrier).await,
             None => false,
         }
+    }
+
+    /// The reference's chain, which a column server over this store follows
+    /// ([`crate::reqresp::ColumnServer::following`]): unknown until [`Self::follow_head`] sees
+    /// a head, and whenever the reference's events are down.
+    #[must_use]
+    pub fn canonical(&self) -> Arc<CanonicalChain> {
+        Arc::clone(&self.chain)
     }
 
     /// Columns queued now: arrived, neither stored nor dropped yet.
@@ -1011,15 +1065,15 @@ where
     async fn link(&self, block: &RefBlock) -> BlockLink {
         let reader = self.store.reader();
         let cgc_set_slot = self.custody.cgc_set_slot();
-        let Ok(finalized) = reader.finalized_slot() else {
+        let Ok(retained) = reader.retained_from() else {
             return BlockLink::Gap;
         };
-        let held_before = |slot: Slot| slot < cgc_set_slot || finalized.is_some_and(|f| slot <= f);
+        let held_before = |slot: Slot| slot < cgc_set_slot || retained.is_some_and(|r| slot < r);
         let mut parent = block.parent_root;
         for _ in 0..=MAX_LINK_WALK {
             match reader.slot_of(&parent) {
-                // Stored now; the writer links it, or starts the chain there if finality pruned
-                // it before the write.
+                // Stored now; the writer links it, or starts the chain there if it was pruned
+                // before the write.
                 Ok(Some(slot)) => return BlockLink::Pending(parent, slot),
                 Ok(None) => {}
                 Err(_) => return BlockLink::Gap,
@@ -1053,6 +1107,17 @@ trait ColumnSink {
 
     /// [`ColumnWriter::settle_pending`].
     fn settle_pending(&self, before_slot: Slot) -> cl_chain_columns::Result<usize>;
+
+    /// [`ColumnWriter::finalize`].
+    fn finalize(
+        &self,
+        finalized_slot: Slot,
+        canonical: &HashSet<Root>,
+        known_from: Slot,
+    ) -> cl_chain_columns::Result<PruneReport>;
+
+    /// [`ColumnWriter::prune_before`].
+    fn prune_before(&self, slot: Slot) -> cl_chain_columns::Result<PruneReport>;
 }
 
 impl ColumnSink for ColumnWriter {
@@ -1069,6 +1134,94 @@ impl ColumnSink for ColumnWriter {
     fn settle_pending(&self, before_slot: Slot) -> cl_chain_columns::Result<usize> {
         ColumnWriter::settle_pending(self, before_slot)
     }
+
+    fn finalize(
+        &self,
+        finalized_slot: Slot,
+        canonical: &HashSet<Root>,
+        known_from: Slot,
+    ) -> cl_chain_columns::Result<PruneReport> {
+        ColumnWriter::finalize(self, finalized_slot, canonical, known_from)
+    }
+
+    fn prune_before(&self, slot: Slot) -> cl_chain_columns::Result<PruneReport> {
+        ColumnWriter::prune_before(self, slot)
+    }
+}
+
+/// The follower's prunes, queued on the writer's queue one at a time (see the module docs).
+struct WriterPrunes {
+    writes: Option<mpsc::WeakSender<Job>>,
+    /// The one prune's turn on the queue: its guard goes with the prune and is released by
+    /// the writer, as a barrier's is.
+    turn: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl PruneSink for WriterPrunes {
+    /// Takes the one prune's turn, puts the prune into the room the queue keeps for it, and
+    /// waits for the writer's answer. No sender is held while it waits, so a store being
+    /// dropped never waits on this task to let its writer go.
+    async fn prune(&self, prune: Prune) -> Pruned {
+        let one = Arc::clone(&self.turn).lock_owned().await;
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let Some(writes) = self.writes.as_ref().and_then(mpsc::WeakSender::upgrade) else {
+            return Pruned::Gone;
+        };
+        let queued = writes.try_send(Job::Prune { prune, one, done });
+        drop(writes);
+        match queued {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => return Pruned::Gone,
+            // Never: the queue keeps room for the one prune.
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("column prune not queued: no room");
+                return Pruned::Failed;
+            }
+        }
+        match finished.await {
+            Ok(true) => Pruned::Done,
+            Ok(false) => Pruned::Failed,
+            // The writer went without an answer.
+            Err(_) => Pruned::Gone,
+        }
+    }
+}
+
+/// Prunes `prune` from `writer`: the blocks off the finalized chain, then the columns out of
+/// the retention window. Whether both are done; a failed part is logged and left to the next
+/// prune, which covers it again.
+fn apply_prune(writer: &impl ColumnSink, prune: &Prune) -> bool {
+    let mut done = true;
+    if let Some(finality) = &prune.finalized {
+        let canonical: HashSet<Root> = finality.canonical.iter().copied().collect();
+        match writer.finalize(finality.slot, &canonical, finality.known_from) {
+            Ok(report) => tracing::info!(
+                finalized_slot = finality.slot,
+                blocks = report.blocks,
+                columns = report.columns,
+                "blocks off the finalized chain pruned from the column store"
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, finalized_slot = finality.slot, "the column store is not finalized");
+                done = false;
+            }
+        }
+    }
+    if let Some(slot) = prune.retain_from {
+        match writer.prune_before(slot) {
+            Ok(report) => tracing::info!(
+                retained_from = slot,
+                blocks = report.blocks,
+                columns = report.columns,
+                "columns out of the retention window pruned from the column store"
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, retained_from = slot, "columns out of retention not pruned");
+                done = false;
+            }
+        }
+    }
+    done
 }
 
 /// Queues a barrier on the writer's queue `writes` and waits until the writer confirms it
@@ -1084,8 +1237,9 @@ async fn barrier(writes: &mpsc::Sender<Job>, one: &Arc<tokio::sync::Mutex<()>>) 
     acked.await.is_ok()
 }
 
-/// The writer thread: takes what is queued, up to [`MAX_BATCH`] columns or a barrier, writes
-/// it, settles the pending links, and then confirms the barrier, until every sender is gone.
+/// The writer thread: takes what is queued, up to [`MAX_BATCH`] columns, a barrier or a prune,
+/// writes it, settles the pending links, and then prunes or confirms the barrier, until every
+/// sender is gone.
 fn run_writer(
     writer: &impl ColumnSink,
     mut jobs: mpsc::Receiver<Job>,
@@ -1095,6 +1249,7 @@ fn run_writer(
     while let Some(first) = jobs.blocking_recv() {
         let mut batch = Vec::new();
         let mut barrier = None;
+        let mut prune = None;
         let mut next = Some(first);
         while let Some(job) = next.take() {
             match job {
@@ -1102,6 +1257,14 @@ fn run_writer(
                 // What comes after it waits for the next turn.
                 Job::Barrier { ack, one } => {
                     barrier = Some((ack, one));
+                    break;
+                }
+                Job::Prune {
+                    prune: job,
+                    one,
+                    done,
+                } => {
+                    prune = Some((job, one, done));
                     break;
                 }
             }
@@ -1115,6 +1278,11 @@ fn run_writer(
             if let Err(e) = writer.settle_pending(highest.saturating_sub(PENDING_LINK_SLOTS)) {
                 tracing::warn!(error = %e, "pending column links not settled");
             }
+        }
+        if let Some((job, one, done)) = prune {
+            // The next prune may queue while this one runs: it lands after it.
+            drop(one);
+            let _ = done.send(apply_prune(writer, &job));
         }
         if let Some((ack, one)) = barrier {
             // Nobody waits for it any more if the receiver is gone.
@@ -1194,7 +1362,8 @@ fn write_batch(
 #[cfg(test)]
 mod tests {
     use super::super::fake::Silent;
-    use super::super::DEFAULT_API_TIMEOUT;
+    use super::super::head::{HeadStream, RefEvent};
+    use super::super::{ApiError, DEFAULT_API_TIMEOUT};
     use super::*;
     use cl_chain_columns::MAX_COLUMNS_PER_TXN;
 
@@ -1270,6 +1439,19 @@ mod tests {
         fn settle_pending(&self, before_slot: Slot) -> cl_chain_columns::Result<usize> {
             self.writer.settle_pending(before_slot)
         }
+
+        fn finalize(
+            &self,
+            slot: Slot,
+            canonical: &HashSet<Root>,
+            known_from: Slot,
+        ) -> cl_chain_columns::Result<PruneReport> {
+            self.writer.finalize(slot, canonical, known_from)
+        }
+
+        fn prune_before(&self, slot: Slot) -> cl_chain_columns::Result<PruneReport> {
+            self.writer.prune_before(slot)
+        }
     }
 
     /// A barrier job confirmed to `ack`, holding a turn of its own.
@@ -1303,6 +1485,19 @@ mod tests {
             self.began.send(()).unwrap();
             self.go.lock().unwrap().recv().unwrap();
             self.writer.settle_pending(before_slot)
+        }
+
+        fn finalize(
+            &self,
+            slot: Slot,
+            canonical: &HashSet<Root>,
+            known_from: Slot,
+        ) -> cl_chain_columns::Result<PruneReport> {
+            self.writer.finalize(slot, canonical, known_from)
+        }
+
+        fn prune_before(&self, slot: Slot) -> cl_chain_columns::Result<PruneReport> {
+            self.writer.prune_before(slot)
         }
     }
 
@@ -1341,6 +1536,72 @@ mod tests {
             acked.blocking_recv().unwrap();
             drop(jobs);
         });
+    }
+
+    /// A prune lands after the writes queued before it, on the writer thread: a block off the
+    /// finalized chain written just before its prune is gone, the finalized chain stays, and
+    /// retention then removes what is below its slot; the follower is told it is done.
+    #[test]
+    fn a_prune_lands_after_the_writes_before_it() {
+        use super::super::canon::Finality;
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let queue = queue(IngestLimits::default());
+        let (dropped, metrics) = metrics();
+        let (jobs, received) = mpsc::channel(8);
+        let turn = || {
+            Arc::new(tokio::sync::Mutex::new(()))
+                .try_lock_owned()
+                .unwrap()
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| run_writer(&writer, received, &dropped, &metrics));
+            for (slot, root) in [(9, [1; 32]), (10, [2; 32]), (10, [3; 32]), (11, [4; 32])] {
+                jobs.blocking_send(Job::Write(write(&queue, slot, root, 0)))
+                    .unwrap();
+            }
+            let finality = Prune {
+                finalized: Some(Finality {
+                    slot: 10,
+                    canonical: vec![[1; 32], [3; 32]],
+                    known_from: 9,
+                }),
+                retain_from: None,
+            };
+            let (done, finished) = tokio::sync::oneshot::channel();
+            jobs.blocking_send(Job::Prune {
+                prune: finality,
+                one: turn(),
+                done,
+            })
+            .unwrap();
+            assert!(finished.blocking_recv().unwrap());
+            let reader = writer.reader();
+            assert_eq!(reader.slot_of(&[2; 32]).unwrap(), None, "off the chain");
+            assert_eq!(reader.slot_of(&[1; 32]).unwrap(), Some(9), "on it");
+            assert_eq!(reader.slot_of(&[3; 32]).unwrap(), Some(10), "on it");
+            assert_eq!(reader.finalized_slot().unwrap(), Some(10));
+            let retention = Prune {
+                finalized: None,
+                retain_from: Some(10),
+            };
+            let (done, finished) = tokio::sync::oneshot::channel();
+            jobs.blocking_send(Job::Prune {
+                prune: retention,
+                one: turn(),
+                done,
+            })
+            .unwrap();
+            assert!(finished.blocking_recv().unwrap());
+            drop(jobs);
+        });
+        let reader = writer.reader();
+        assert_eq!(reader.slot_of(&[1; 32]).unwrap(), None, "out of retention");
+        assert_eq!(reader.slot_of(&[3; 32]).unwrap(), Some(10));
+        assert_eq!(reader.slot_of(&[4; 32]).unwrap(), Some(11));
+        assert_eq!(reader.retained_from().unwrap(), Some(10));
+        assert_eq!(metrics.stored(), 4);
+        assert_eq!(queue.lock().items, 0);
     }
 
     /// A wait for the barrier that is given up leaves its barrier queued, and the next wait
@@ -1447,6 +1708,19 @@ mod tests {
 
         fn settle_pending(&self, before_slot: Slot) -> cl_chain_columns::Result<usize> {
             self.0.settle_pending(before_slot)
+        }
+
+        fn finalize(
+            &self,
+            slot: Slot,
+            canonical: &HashSet<Root>,
+            known_from: Slot,
+        ) -> cl_chain_columns::Result<PruneReport> {
+            self.0.finalize(slot, canonical, known_from)
+        }
+
+        fn prune_before(&self, slot: Slot) -> cl_chain_columns::Result<PruneReport> {
+            self.0.prune_before(slot)
         }
     }
 
@@ -1935,33 +2209,548 @@ mod tests {
         assert_eq!(waits.announced_columns(), 0);
     }
 
+    /// A source of the reference's events that the test sends one by one: one stream, which
+    /// fails once the test's sender is gone; it is never opened again.
+    struct Events(Mutex<Option<mpsc::UnboundedReceiver<RefEvent>>>);
+
+    struct EventStream(mpsc::UnboundedReceiver<RefEvent>);
+
+    impl HeadStream for EventStream {
+        async fn next_event(&mut self) -> Result<Option<RefEvent>, ApiError> {
+            match self.0.recv().await {
+                Some(event) => Ok(Some(event)),
+                None => Err(ApiError("the stream ended".into())),
+            }
+        }
+    }
+
+    impl HeadSource for Arc<Events> {
+        type Stream = EventStream;
+
+        async fn open(&self) -> Result<EventStream, ApiError> {
+            let events = self.0.lock().unwrap().take();
+            match events {
+                Some(events) => Ok(EventStream(events)),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    /// Passes every cell.
+    struct Valid;
+
+    impl KzgVerifier for Valid {
+        async fn verify_cells(
+            &self,
+            _: Vec<KzgCellProof>,
+            _: Duration,
+        ) -> crate::verify::client::KzgOutcome {
+            crate::verify::client::KzgOutcome::Valid
+        }
+    }
+
+    struct NoEnr;
+
+    impl crate::da::custody::EnrCgc for NoEnr {
+        fn set_cgc(&mut self, _: u64) -> Result<(), crate::da::custody::EnrError> {
+            Ok(())
+        }
+    }
+
+    /// Polls `done` on the wall clock until it holds; fails after 10 s.
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    const CUSTODY: [u64; 4] = [1, 47, 87, 102];
+
+    /// A column store following the reference's events from `events`, with the column server
+    /// over it, its custody set at slot 16 (epoch 2 of the minimal preset, in Gloas).
+    struct Following {
+        ingest: ColumnIngest<Arc<Silent>, crate::testing::Spec, Valid, Arc<ColumnWriter>, NoEnr>,
+        server: crate::reqresp::ColumnServer,
+        writer: Arc<ColumnWriter>,
+        events: mpsc::UnboundedSender<RefEvent>,
+        clock: Arc<super::super::fake::Clock>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Following {
+        /// A new store, the wall clock in epoch 9, nothing out of retention yet.
+        fn start(reference: &Arc<Silent>) -> Self {
+            let clock = Arc::new(super::super::fake::Clock::at(0, 80));
+            Self::open(reference, tempfile::tempdir().unwrap(), clock)
+        }
+
+        /// The store in `dir`, as a probe opens it when it starts again.
+        fn open(
+            reference: &Arc<Silent>,
+            dir: tempfile::TempDir,
+            clock: Arc<super::super::fake::Clock>,
+        ) -> Self {
+            use crate::da::custody::{Advertise, Custody};
+            use crate::reqresp::{ColumnServer, ColumnStore, ServeBudget};
+            use consensus_types::primitives::U256;
+            let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+            let custody = Custody::open(
+                Arc::clone(&writer),
+                NoEnr,
+                U256::MAX,
+                Advertise::Custody,
+                16,
+            )
+            .unwrap();
+            assert_eq!(custody.custody_columns(), CUSTODY);
+            // A parent the reference does not know ends a walk after 50 ms.
+            let refs = SilentView::new(
+                Arc::clone(reference),
+                crate::testing::schedule(),
+                RefLimits {
+                    timeout: Duration::from_millis(50),
+                    ..RefLimits::default()
+                },
+            );
+            let contract = ColumnContract {
+                kzg: Valid,
+                verify_timeout: Duration::from_secs(1),
+                metrics: ColumnMetrics::default(),
+            };
+            let ingest = ColumnIngest::start(
+                refs,
+                custody,
+                contract,
+                Arc::clone(&writer),
+                IngestLimits::default(),
+                QueueMetrics::default(),
+            )
+            .unwrap();
+            let server = ColumnServer::new(
+                Arc::clone(&writer) as Arc<dyn ColumnStore>,
+                U256::MAX,
+                Arc::clone(&clock) as Arc<dyn crate::reqresp::ServeClock>,
+                ServeBudget::default(),
+            )
+            .following(ingest.canonical());
+            let (events, source) = mpsc::unbounded_channel();
+            ingest.follow_head(
+                Arc::new(Events(Mutex::new(Some(source)))),
+                HeadFollow::default(),
+                Arc::clone(&clock) as Arc<dyn crate::reqresp::ServeClock>,
+            );
+            Self {
+                ingest,
+                server,
+                writer,
+                events,
+                clock,
+                _dir: dir,
+            }
+        }
+
+        /// Stops the probe and gives its store's directory back.
+        fn stop(self) -> tempfile::TempDir {
+            let Self {
+                ingest,
+                server,
+                writer,
+                _dir: dir,
+                ..
+            } = self;
+            drop((server, ingest, writer));
+            dir
+        }
+
+        /// Stores every custody column of the block `root` at `slot`, linked by `link`.
+        fn store(&self, slot: Slot, root: Root, link: BlockLink) {
+            let ssz = format!("sidecar {slot}").into_bytes();
+            let columns: Vec<_> = CUSTODY
+                .iter()
+                .map(|&index| Column { index, ssz: &ssz })
+                .collect();
+            self.writer
+                .write_block_columns(slot, &root, link, &columns)
+                .unwrap();
+        }
+
+        fn send(&self, event: RefEvent) {
+            self.events.send(event).unwrap();
+        }
+
+        /// The slots of the blocks a range answer serves, or the refusal.
+        fn slots(&self, start: Slot, count: u64) -> Result<Vec<Slot>, crate::reqresp::Refusal> {
+            let served = self.server.by_range(start, count, &CUSTODY, None)?;
+            let mut slots: Vec<Slot> = served.iter().map(|s| s.slot).collect();
+            slots.dedup();
+            Ok(slots)
+        }
+
+        /// Waits until a range answer from `start` serves the blocks of `slots`.
+        async fn serves(&self, start: Slot, count: u64, slots: &[Slot]) {
+            until(&format!("{start}+{count} to serve {slots:?}"), || {
+                self.slots(start, count).as_deref() == Ok(slots)
+            })
+            .await;
+        }
+    }
+
+    /// The column server over a store that follows the reference's events: a head stored and
+    /// served, a re-org that leaves it off the chain, then finality and retention. Finality
+    /// prunes only the blocks off the finalized chain, whose blocks are still served inside the
+    /// retention window; retention prunes the columns before it and raises
+    /// `earliest_available_slot` past them, through the writer thread.
+    #[tokio::test]
+    async fn follow_finality_prunes_and_raises_earliest() {
+        // b16, b17, b19 and b24 on the chain; o18 on b17, the reference's head for a while.
+        let reference = Arc::new(Silent::default());
+        let b16 = reference.serve(16);
+        let b17 = reference.serve_on(17, b16);
+        let o18 = reference.serve_on(18, b17);
+        let b19 = reference.serve_on(19, b17);
+        let b24 = reference.serve_on(24, b19);
+        let f = Following::start(&reference);
+        f.store(16, b16, BlockLink::Start);
+        f.store(17, b17, BlockLink::Parent(b16));
+        f.store(18, o18, BlockLink::Parent(b17));
+        f.store(19, b19, BlockLink::Parent(b17));
+        f.store(24, b24, BlockLink::Parent(b19));
+        // Before any head the chain is not known: no range is served.
+        assert!(matches!(
+            f.slots(16, 4),
+            Err(crate::reqresp::Refusal::Unavailable(_))
+        ));
+        f.send(RefEvent::Head(o18));
+        f.serves(16, 4, &[16, 17, 18]).await;
+        // A re-org to b19: o18 is off the chain and never served, but still stored.
+        f.send(RefEvent::Reorg(b19));
+        f.serves(16, 4, &[16, 17, 19]).await;
+        assert_eq!(f.writer.reader().slot_of(&o18).unwrap(), Some(18));
+        // Epoch 2 finalized at b16: its block stays, inside the retention window.
+        f.send(RefEvent::Finalized(super::super::Checkpoint {
+            epoch: 2,
+            root: b16,
+        }));
+        until("epoch 2 finalized", || {
+            f.writer.reader().finalized_slot().unwrap() == Some(16)
+        })
+        .await;
+        assert!(f.ingest.settled().await);
+        f.serves(16, 4, &[16, 17, 19]).await;
+        assert_eq!(f.server.earliest_available_slot(), Some(16));
+        // Epoch 3 finalized at b24: o18 is off the finalized chain and goes; the chain stays.
+        f.send(RefEvent::Head(b24));
+        f.serves(16, 9, &[16, 17, 19, 24]).await;
+        f.send(RefEvent::Finalized(super::super::Checkpoint {
+            epoch: 3,
+            root: b24,
+        }));
+        // The watermark rises last, once o18 is gone.
+        until("epoch 3 finalized", || {
+            f.writer.reader().finalized_slot().unwrap() == Some(24)
+        })
+        .await;
+        assert_eq!(f.writer.reader().slot_of(&o18).unwrap(), None);
+        f.serves(16, 9, &[16, 17, 19, 24]).await;
+        assert_eq!(f.server.earliest_available_slot(), Some(16));
+        assert_eq!(f.server.status_floor(), Ok(16));
+        // The serve range moves on to slot 20: what is before it goes, and the store claims
+        // from 20.
+        f.clock.set(Some((20, 88)));
+        f.send(RefEvent::Head(b24));
+        until("slot 19 out of retention", || {
+            f.writer.reader().slot_of(&b19).unwrap().is_none()
+        })
+        .await;
+        assert_eq!(f.server.earliest_available_slot(), Some(20));
+        assert_eq!(f.server.status_floor(), Ok(20));
+        assert!(matches!(
+            f.slots(16, 9),
+            Err(crate::reqresp::Refusal::Unavailable(_))
+        ));
+        assert_eq!(f.slots(20, 5), Ok(vec![24]));
+    }
+
+    /// The chain `first..=last` of blocks the reference serves, each on the one before (the
+    /// first on a parent nobody knows), all stored and linked; their roots by slot.
+    fn stored_chain(
+        reference: &Silent,
+        f: &Following,
+        first: Slot,
+        last: Slot,
+    ) -> BTreeMap<Slot, Root> {
+        let mut roots = BTreeMap::new();
+        let mut link = BlockLink::Start;
+        let mut parent = [0x99; 32];
+        for slot in first..=last {
+            let root = reference.serve_on(slot, parent);
+            f.store(slot, root, link);
+            roots.insert(slot, root);
+            (parent, link) = (root, BlockLink::Parent(root));
+        }
+        roots
+    }
+
+    /// A record that starts above the store's watermark (the walk after a restart, after the
+    /// stream was down for long, or one that hit `MAX_CANON_WALK`) finalizes the store without
+    /// one canonical block lost: the stored links lead from the record down to the watermark.
+    #[tokio::test]
+    async fn a_record_that_starts_above_the_watermark_keeps_every_canonical_block() {
+        let reference = Arc::new(Silent::default());
+        let f = Following::start(&reference);
+        let last = 16 + super::super::MAX_CANON_WALK as u64 + 30;
+        let roots = stored_chain(&reference, &f, 16, last);
+        // An orphan at 20, on the chain's block at 19.
+        let orphan = reference.serve_fork(20, roots[&19]);
+        f.store(20, orphan, BlockLink::Parent(roots[&19]));
+        f.send(RefEvent::Head(roots[&last]));
+        until("the chain walked", || {
+            f.ingest
+                .canonical()
+                .view()
+                .is_some_and(|v| v.head_slot() == last)
+        })
+        .await;
+        let floor = f.ingest.canonical().view().unwrap().floor();
+        assert!(floor > 24, "the walk stopped at its bound, at {floor}");
+        // Epoch 3 finalized at slot 24: the record is walked down to it, and the store keeps
+        // every canonical block in (watermark, 24].
+        f.send(RefEvent::Finalized(super::super::Checkpoint {
+            epoch: 3,
+            root: roots[&24],
+        }));
+        until("epoch 3 finalized", || {
+            f.writer.reader().finalized_slot().unwrap() == Some(24)
+        })
+        .await;
+        for (slot, root) in roots.range(..=24) {
+            assert_eq!(
+                f.writer.reader().slot_of(root).unwrap(),
+                Some(*slot),
+                "{slot}"
+            );
+        }
+        assert_eq!(f.writer.reader().slot_of(&orphan).unwrap(), None);
+        assert_eq!(f.server.earliest_available_slot(), Some(16));
+        f.serves(16, 9, &(16..=24).collect::<Vec<_>>()).await;
+    }
+
+    /// A first walk that failed partway, with no record to keep, leaves a record that starts
+    /// above the stored chain: finality keeps the blocks below the record's first block.
+    #[tokio::test]
+    async fn a_record_from_a_failed_first_walk_keeps_the_blocks_below_it() {
+        let reference = Arc::new(Silent::default());
+        let f = Following::start(&reference);
+        let roots = stored_chain(&reference, &f, 16, 30);
+        // The reference forgets the block at 20 for a while: the first walk stops above it.
+        let b20 = reference
+            .blocks
+            .lock()
+            .unwrap()
+            .remove(&roots[&20])
+            .unwrap();
+        f.send(RefEvent::Head(roots[&30]));
+        until("the chain walked", || {
+            f.ingest.canonical().view().is_some_and(|v| v.floor() == 21)
+        })
+        .await;
+        reference.blocks.lock().unwrap().insert(roots[&20], b20);
+        f.send(RefEvent::Finalized(super::super::Checkpoint {
+            epoch: 3,
+            root: roots[&24],
+        }));
+        until("epoch 3 finalized", || {
+            f.writer.reader().finalized_slot().unwrap() == Some(24)
+        })
+        .await;
+        assert_eq!(
+            f.writer.reader().block_count().unwrap(),
+            15,
+            "every block stays"
+        );
+        assert_eq!(f.server.earliest_available_slot(), Some(16));
+    }
+
+    /// A probe that starts again on a finalized store walks the reference's chain down to the
+    /// store's watermark, not past it.
+    #[tokio::test]
+    async fn a_restart_walks_down_to_the_watermark_only() {
+        let reference = Arc::new(Silent::default());
+        let f = Following::start(&reference);
+        let roots = stored_chain(&reference, &f, 16, 30);
+        f.send(RefEvent::Head(roots[&30]));
+        f.serves(16, 15, &(16..=30).collect::<Vec<_>>()).await;
+        f.send(RefEvent::Finalized(super::super::Checkpoint {
+            epoch: 3,
+            root: roots[&24],
+        }));
+        until("epoch 3 finalized", || {
+            f.writer.reader().finalized_slot().unwrap() == Some(24)
+        })
+        .await;
+        let clock = Arc::clone(&f.clock);
+        let f = Following::open(&reference, f.stop(), clock);
+        let asked = reference.asked(roots[&23]);
+        f.send(RefEvent::Head(roots[&30]));
+        until("the chain walked", || f.ingest.canonical().view().is_some()).await;
+        assert_eq!(f.ingest.canonical().view().unwrap().floor(), 24);
+        assert_eq!(
+            reference.asked(roots[&23]),
+            asked,
+            "never walked past the watermark"
+        );
+        f.serves(16, 15, &(16..=30).collect::<Vec<_>>()).await;
+    }
+
+    /// Dropping the store while a prune waits for the writer's answer, on a current-thread
+    /// runtime, never waits on the follower's task: the task holds no sender of the writer's
+    /// queue while it waits, so the writer thread ends once its own work is done.
+    #[tokio::test]
+    async fn dropping_the_store_while_a_prune_waits_does_not_hang() {
+        use std::sync::Condvar;
+        let reference = Arc::new(Silent::default());
+        let f = Following::start(&reference);
+        let roots = stored_chain(&reference, &f, 16, 17);
+        f.send(RefEvent::Head(roots[&17]));
+        f.serves(16, 2, &[16, 17]).await;
+        // A write that holds the column env's lock until the test lets it go: the writer
+        // thread's prune waits for it.
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let hook = Arc::clone(&gate);
+        f.writer.set_before_commit(Box::new(move |slot| {
+            if slot == 99 {
+                let (state, changed) = &*hook;
+                let mut state = state.lock().unwrap();
+                state.0 = true;
+                changed.notify_all();
+                while !state.1 {
+                    state = changed.wait(state).unwrap();
+                }
+            }
+        }));
+        let writer = Arc::clone(&f.writer);
+        let held = std::thread::spawn(move || {
+            let ssz = b"sidecar 99".to_vec();
+            let column = [Column {
+                index: 1,
+                ssz: &ssz,
+            }];
+            writer.write_block_columns(99, &[0x99; 32], BlockLink::Start, &column)
+        });
+        until("the write to hold the env", || gate.0.lock().unwrap().0).await;
+        f.send(RefEvent::Finalized(super::super::Checkpoint {
+            epoch: 2,
+            root: roots[&16],
+        }));
+        // The follower hands the prune over and waits for its answer.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let release = Arc::clone(&gate);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let (state, changed) = &*release;
+            state.lock().unwrap().1 = true;
+            changed.notify_all();
+        });
+        let start = std::time::Instant::now();
+        drop(f.stop());
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
+        releaser.join().unwrap();
+        held.join().unwrap().unwrap();
+    }
+
+    /// A head change prunes nothing: with heads a17, b18, then a17 again and its child c19,
+    /// a17's columns are still there and served, and so is the chain before it.
+    #[tokio::test]
+    async fn a_head_that_comes_back_keeps_its_blocks_served() {
+        let reference = Arc::new(Silent::default());
+        let p16 = reference.serve(16);
+        let a17 = reference.serve_on(17, p16);
+        let b18 = reference.serve_on(18, p16);
+        let c19 = reference.serve_on(19, a17);
+        let f = Following::start(&reference);
+        f.store(16, p16, BlockLink::Start);
+        f.store(17, a17, BlockLink::Parent(p16));
+        f.store(18, b18, BlockLink::Parent(p16));
+        f.send(RefEvent::Head(a17));
+        f.serves(16, 4, &[16, 17]).await;
+        f.send(RefEvent::Reorg(b18));
+        f.serves(16, 4, &[16, 18]).await;
+        f.send(RefEvent::Reorg(a17));
+        f.serves(16, 4, &[16, 17]).await;
+        f.store(19, c19, BlockLink::Parent(a17));
+        f.send(RefEvent::Head(c19));
+        f.serves(16, 4, &[16, 17, 19]).await;
+        assert_eq!(f.writer.reader().block_count().unwrap(), 4);
+    }
+
+    /// A finalized checkpoint past the wall clock, or one whose block the reference's chain
+    /// does not hold, prunes nothing and leaves the watermark: writes go on, and the store
+    /// claims what it did.
+    #[tokio::test]
+    async fn a_checkpoint_from_the_future_or_off_the_chain_leaves_the_watermark() {
+        let reference = Arc::new(Silent::default());
+        let b16 = reference.serve(16);
+        let b17 = reference.serve_on(17, b16);
+        let o17 = reference.serve_on(17, [0x99; 32]);
+        let f = Following::start(&reference);
+        f.store(16, b16, BlockLink::Start);
+        f.store(17, b17, BlockLink::Parent(b16));
+        f.store(17, o17, BlockLink::Start);
+        f.send(RefEvent::Head(b17));
+        f.serves(16, 2, &[16, 17]).await;
+        let at = |epoch, root| RefEvent::Finalized(super::super::Checkpoint { epoch, root });
+        for event in [
+            at(u64::MAX / 8, b16),
+            at(1 << 40, b16),
+            at(2, [0x55; 32]),
+            at(2, o17),
+        ] {
+            f.send(event);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(f.ingest.settled().await);
+            let reader = f.writer.reader();
+            assert_eq!(reader.finalized_slot().unwrap(), None, "{event:?}");
+            assert_eq!(reader.block_count().unwrap(), 3, "{event:?}");
+        }
+        assert_eq!(f.server.earliest_available_slot(), Some(16));
+        // Writes are not refused: the store was never finalized.
+        f.store(18, reference.serve_on(18, b17), BlockLink::Parent(b17));
+        // A checkpoint on the chain is taken.
+        f.send(at(2, b16));
+        until("epoch 2 finalized", || {
+            f.writer.reader().finalized_slot().unwrap() == Some(16)
+        })
+        .await;
+    }
+
     #[test]
     fn the_earliest_servable_slot_is_the_highest_bound() {
         // Nothing stored: nothing to serve, whatever the other bounds say.
-        assert_eq!(earliest_servable_slot(None, Some(40), 16, None), None);
+        assert_eq!(earliest_servable_slot(None, Some(41), 16, None), None);
         // Each bound in turn the highest.
         assert_eq!(earliest_servable_slot(Some(17), None, 16, None), Some(17));
         assert_eq!(
-            earliest_servable_slot(Some(17), Some(40), 16, None),
+            earliest_servable_slot(Some(17), Some(41), 16, None),
             Some(41)
         );
         assert_eq!(
-            earliest_servable_slot(Some(17), Some(9), 30, None),
+            earliest_servable_slot(Some(17), Some(10), 30, None),
             Some(30)
         );
         // A gap: only from the block after it on.
         assert_eq!(
-            earliest_servable_slot(Some(17), Some(9), 30, Some(50)),
+            earliest_servable_slot(Some(17), Some(10), 30, Some(50)),
             Some(50)
         );
         assert_eq!(
-            earliest_servable_slot(Some(17), Some(60), 30, Some(50)),
+            earliest_servable_slot(Some(17), Some(61), 30, Some(50)),
             Some(61)
-        );
-        // A watermark at the last slot leaves nothing servable past it.
-        assert_eq!(
-            earliest_servable_slot(Some(1), Some(Slot::MAX), 0, None),
-            None
         );
     }
 

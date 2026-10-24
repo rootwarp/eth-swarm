@@ -7,10 +7,17 @@
 //! - **Chunked writes.** [`ColumnWriter::write_columns`] commits at most
 //!   [`MAX_COLUMNS_PER_TXN`] (16) columns per write transaction and lets import go first between
 //!   transactions, because MDBX allows one write transaction per env at a time.
-//! - **Pruning.** [`ColumnWriter::prune_finalized`] removes every column at or below the
-//!   finalized slot and records that slot as a watermark; later writes at or below it are
-//!   refused. [`ColumnWriter::prune_orphaned`] removes every column of orphaned block roots
-//!   after a reorg and leaves a tombstone, so later writes of those roots are refused too.
+//! - **Pruning.** Finality and retention are separate. [`ColumnWriter::finalize`] removes the
+//!   blocks at or below the finalized slot that are off the finalized chain (the chain the
+//!   stored links lead down from the blocks the caller names), keeps a block it cannot place
+//!   below the contiguous-from slot, and raises the finalized-slot watermark: every block stored
+//!   at or below it, from the contiguous-from slot on, is on that chain, and later writes at or
+//!   below it are refused. [`ColumnWriter::prune_before`] removes every column
+//!   below a slot (out of the retention window) and raises the retained-from slot
+//!   ([`ColumnReader::retained_from`]), from which the store may claim to serve.
+//!   [`ColumnWriter::prune_finalized`] does both at once: everything at or below the finalized
+//!   slot. [`ColumnWriter::prune_orphaned`] removes every column of orphaned block roots and
+//!   leaves a tombstone, so later writes of those roots are refused too.
 //! - **Links.** Each stored block carries a [`BlockLink`] to the stored block before it on its
 //!   chain ([`ColumnWriter::write_block_columns`]); a block waiting for an ancestor not stored
 //!   yet links once that block is written, or is settled as a gap

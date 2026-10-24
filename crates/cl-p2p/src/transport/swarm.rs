@@ -233,7 +233,7 @@ fn build<E: EthSpec>(
 }
 
 /// The probe swarm's yamux upgrade ([`muxer_upgrades`]).
-pub type YamuxUpgrade = CloseDeadline<LogNegotiated<libp2p::yamux::Config>>;
+pub type YamuxUpgrade = CloseDeadline<LogNegotiated<super::Capped<libp2p::yamux::Config>>>;
 
 /// The probe swarm's mplex upgrade ([`muxer_upgrades`]).
 pub type MplexUpgrade = CloseDeadline<LogNegotiated<Budgeted<libp2p_mplex::Config>>>;

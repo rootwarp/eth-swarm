@@ -1,25 +1,37 @@
 //! The reference node's head: the roots of the blocks it imports, announced to the [`RefView`]
-//! ahead of their columns ([`follow_head`]).
+//! ahead of their columns, and its canonical chain, which the column server follows
+//! ([`follow_head`]).
 //!
-//! The reference streams `/eth/v1/events?topics=block` (beacon-APIs eventstream): one `block`
-//! event, `{"slot", "block", "execution_optimistic"}`, per block it imports. [`follow_head`]
-//! reads each event's root and announces it ([`RefView::announce`]), then looks it up in the
-//! announced roots' own places ([`RefView::lookup_as_announced`]). In Gloas the block is gossiped
-//! before its payload's columns, so a real root is usually cached, or its lookup in flight,
-//! before its first column arrives, and that column never waits for a first-ask turn
-//! (`probe::root_wait`). An announcement is only a hint: the root is still established by the
-//! header and the block, decoded and hashed, never by the event.
+//! The reference streams `/eth/v1/events` (beacon-APIs eventstream) with four topics:
+//!
+//! - `block`, `{"slot", "block", "execution_optimistic"}`, per block it imports.
+//!   [`follow_head`] reads each event's root and announces it ([`RefView::announce`]), then looks
+//!   it up in the announced roots' own places ([`RefView::lookup_as_announced`]). In Gloas the
+//!   block is gossiped before its payload's columns, so a real root is usually cached, or its
+//!   lookup in flight, before its first column arrives, and that column never waits for a
+//!   first-ask turn (`probe::root_wait`). An announcement is only a hint: the root is still
+//!   established by the header and the block, decoded and hashed, never by the event.
+//! - `head`, `{"slot", "block", …}`, per new head, and `chain_reorg`, `{"slot", "depth",
+//!   "old_head_block", "new_head_block", …}`, per re-org: the head (the reorg's new head) goes to
+//!   the chain's tracker (`probe::canon`), which walks the reference's chain from it.
+//! - `finalized_checkpoint`, `{"block", "state", "epoch", …}`, per new finalized checkpoint: to
+//!   the tracker, which checks it against the wall clock and its record before the column store
+//!   prunes anything for it.
+//!
+//! The tracker takes only the latest head and the latest checkpoint, so a slow walk never holds
+//! up the stream, and heads it had no time for are passed by the walk of the next one.
 //!
 //! Bounds:
-//! - a line or an event over [`MAX_EVENT_BYTES`] ends the stream, and so does an event that
-//!   is not a `block` event of the beacon API (bad JSON, a root that is not 32 bytes, a slot
-//!   that is not a decimal `u64`); events of other names and comments are skipped;
+//! - a line or an event over [`MAX_EVENT_BYTES`] ends the stream, and so does an event of one of
+//!   the four topics that is not as the beacon API writes it (bad JSON, a root that is not 32
+//!   bytes, a slot, depth or epoch that is not a decimal `u64`); events of other names and
+//!   comments are skipped;
 //! - a stream that sends no bytes for [`HeadFollow::idle_timeout`] ends (a keep-alive comment
 //!   counts);
 //! - after a stream ends or fails to open, it is opened again after a backoff:
 //!   [`HeadFollow::backoff`] (at least [`MIN_BACKOFF`]), doubled after each failure in a row,
-//!   up to [`HeadFollow::max_backoff`]. A stream that announced a root, or opened and went
-//!   quiet, starts again from [`HeadFollow::backoff`];
+//!   up to [`HeadFollow::max_backoff`]. A stream that sent an event, or opened and went quiet,
+//!   starts again from [`HeadFollow::backoff`];
 //! - at most `max_announced_in_flight` announced roots are looked up at once
 //!   ([`super::RefLimits`]); a root announced past that stays a hint, which the first column of
 //!   the root uses, and at most `max_announced` hints are kept, the oldest forgotten first. A
@@ -27,22 +39,28 @@
 //!   lookup without an answer for a while more (`probe::ref_view`).
 //!
 //! While the stream is down, nothing is announced, and every root takes the root wait as it did
-//! without the stream. Errors name the API path only, never the base URL or a value from the
-//! stream.
+//! without the stream. The chain is unknown from the stream's end until the next head, so the
+//! column server serves no range meanwhile (`probe::canon`). Errors name the API path only,
+//! never the base URL or a value from the stream.
 
-use super::{ApiError, BlockApi, RefView, ReferenceApi, Root};
+use super::canon::{track_chain, CanonicalChain, ChainEvent, PruneSink, Tracker};
+use super::{ApiError, BlockApi, Checkpoint, RefView, ReferenceApi, Root};
+use crate::reqresp::ServeClock;
+use consensus_types::primitives::Slot;
 use consensus_types::EthSpec;
 use serde::Deserialize;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 /// The event stream's API path.
 pub const EVENTS_PATH: &str = "/eth/v1/events";
 
 /// The largest line, and the largest event's data, the parser holds: 4 KiB \[est\]. A `block`
-/// event is about 150 bytes; anything this large is not one, and the stream ends.
+/// event is about 150 bytes and a `chain_reorg` event, the largest of the four, about 500;
+/// anything this large is none of them, and the stream ends.
 pub const MAX_EVENT_BYTES: usize = 4 << 10;
 
 /// The shortest wait before a stream is opened again, whatever [`HeadFollow`] says, so a
@@ -51,8 +69,29 @@ pub const MIN_BACKOFF: Duration = Duration::from_millis(1);
 
 /// The name of the event that announces a root.
 pub(super) const BLOCK_EVENT: &str = "block";
+/// The name of the event of a new head.
+pub(super) const HEAD_EVENT: &str = "head";
+/// The name of the event of a re-org.
+pub(super) const REORG_EVENT: &str = "chain_reorg";
+/// The name of the event of a new finalized checkpoint.
+pub(super) const FINALIZED_EVENT: &str = "finalized_checkpoint";
+/// The topics the follower asks for, in this order.
+pub const EVENT_TOPICS: [&str; 4] = [BLOCK_EVENT, HEAD_EVENT, REORG_EVENT, FINALIZED_EVENT];
 
-/// A stream of the roots the reference node imports, opened again after it ends.
+/// One event of the reference's stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefEvent {
+    /// `block`: it imported the block of this root.
+    Block(Root),
+    /// `head`: its head is now the block of this root.
+    Head(Root),
+    /// `chain_reorg`: it re-orged, and its head is now the block of this root.
+    Reorg(Root),
+    /// `finalized_checkpoint`: it finalized this checkpoint.
+    Finalized(Checkpoint),
+}
+
+/// A stream of the reference node's events, opened again after it ends.
 pub trait HeadSource: Send + Sync {
     /// One open stream.
     type Stream: HeadStream + Send;
@@ -63,9 +102,9 @@ pub trait HeadSource: Send + Sync {
 
 /// One open stream of [`HeadSource`].
 pub trait HeadStream {
-    /// The next root the reference announces, or `None` for bytes that announce none (a
-    /// keep-alive comment, another event). An error ends the stream, its end included.
-    fn next_root(&mut self) -> impl Future<Output = Result<Option<Root>, ApiError>> + Send;
+    /// The next event of the four topics, or `None` for bytes that carry none (a keep-alive
+    /// comment, another event). An error ends the stream, its end included.
+    fn next_event(&mut self) -> impl Future<Output = Result<Option<RefEvent>, ApiError>> + Send;
 }
 
 /// How [`follow_head`] keeps its stream (see the module docs).
@@ -198,26 +237,107 @@ struct BlockEvent {
     block: String,
 }
 
-/// The root a `block` event's data announces: JSON with a decimal `slot` and a `0x` root of 32
-/// bytes. The error names the path and the fault, never a value.
-pub(super) fn block_event_root(data: &str) -> Result<Root, ApiError> {
-    let event: BlockEvent = serde_json::from_str(data).map_err(|e| {
+#[derive(Deserialize)]
+struct ReorgEvent {
+    slot: String,
+    depth: String,
+    new_head_block: String,
+}
+
+#[derive(Deserialize)]
+struct FinalizedEvent {
+    block: String,
+    epoch: String,
+}
+
+/// `data` as JSON of `T`; the error names the path, the event and the fault, never a value.
+fn event_json<T: serde::de::DeserializeOwned>(name: &str, data: &str) -> Result<T, ApiError> {
+    serde_json::from_str(data).map_err(|e| {
         ApiError(format!(
-            "{EVENTS_PATH}: block event: json: {:?} error at line {} column {}",
+            "{EVENTS_PATH}: {name} event: json: {:?} error at line {} column {}",
             e.classify(),
             e.line(),
             e.column()
         ))
-    })?;
+    })
+}
+
+/// The root a `block` event's data announces: JSON with a decimal `slot` and a `0x` root of 32
+/// bytes. The error names the path and the fault, never a value.
+pub(super) fn block_event_root(data: &str) -> Result<Root, ApiError> {
+    let event: BlockEvent = event_json(BLOCK_EVENT, data)?;
     super::beacon_api::decimal(EVENTS_PATH, &event.slot)?;
     super::beacon_api::root(EVENTS_PATH, &event.block)
 }
 
-/// Follows `source` until dropped: announces each root to `refs` and looks it up there, in the
-/// announced places, opening the stream again after the backoff whenever it ends (see the
-/// module docs).
-pub async fn follow_head<H, A, E>(source: H, refs: Arc<RefView<A, E>>, config: HeadFollow)
-where
+/// The event `name` with `data`, if it is one of the four topics (`None` for another name).
+/// A `head` event is read as a `block` event is (`slot`, `block`); a `chain_reorg` event gives
+/// its `new_head_block`, with a decimal `slot` and `depth`; a `finalized_checkpoint` event its
+/// `block` and decimal `epoch`. The error names the path and the fault, never a value.
+pub(super) fn ref_event(name: &str, data: &str) -> Result<Option<RefEvent>, ApiError> {
+    use super::beacon_api::{decimal, root};
+    Ok(Some(match name {
+        BLOCK_EVENT => RefEvent::Block(block_event_root(data)?),
+        HEAD_EVENT => {
+            let event: BlockEvent = event_json(HEAD_EVENT, data)?;
+            decimal(EVENTS_PATH, &event.slot)?;
+            RefEvent::Head(root(EVENTS_PATH, &event.block)?)
+        }
+        REORG_EVENT => {
+            let event: ReorgEvent = event_json(REORG_EVENT, data)?;
+            decimal(EVENTS_PATH, &event.slot)?;
+            decimal(EVENTS_PATH, &event.depth)?;
+            RefEvent::Reorg(root(EVENTS_PATH, &event.new_head_block)?)
+        }
+        FINALIZED_EVENT => {
+            let event: FinalizedEvent = event_json(FINALIZED_EVENT, data)?;
+            RefEvent::Finalized(Checkpoint {
+                epoch: decimal(EVENTS_PATH, &event.epoch)?,
+                root: root(EVENTS_PATH, &event.block)?,
+            })
+        }
+        _ => return Ok(None),
+    }))
+}
+
+/// Follows `source` until dropped: announces each block's root to `refs` and looks it up there,
+/// in the announced places, and keeps `chain` on the reference's chain, handing each prune of
+/// the column store to `prunes` (finality and retention by `clock`, `probe::canon`; the store
+/// is finalized at `store_finalized` now), opening the stream again after the backoff whenever it
+/// ends (see the module docs).
+pub async fn follow_head<H, A, E, P>(
+    source: H,
+    refs: Arc<RefView<A, E>>,
+    config: HeadFollow,
+    chain: Arc<CanonicalChain>,
+    clock: Arc<dyn ServeClock>,
+    store_finalized: Option<Slot>,
+    prunes: P,
+) where
+    H: HeadSource,
+    A: ReferenceApi + BlockApi + 'static,
+    E: EthSpec,
+    P: PruneSink,
+{
+    let (heads, heads_seen) = watch::channel(None);
+    let (finalized, finalized_seen) = watch::channel(None);
+    let tracker = Tracker::new(Arc::clone(&refs), chain, clock, store_finalized);
+    let read = read_events(source, refs, config, heads, finalized);
+    tokio::join!(
+        read,
+        track_chain(tracker, heads_seen, finalized_seen, prunes)
+    );
+}
+
+/// The stream side of [`follow_head`]: the latest head and finalized checkpoint go to `heads`
+/// and `finalized`, and [`ChainEvent::Down`] to `heads` whenever the stream ends.
+async fn read_events<H, A, E>(
+    source: H,
+    refs: Arc<RefView<A, E>>,
+    config: HeadFollow,
+    heads: watch::Sender<Option<ChainEvent>>,
+    finalized: watch::Sender<Option<Checkpoint>>,
+) where
     H: HeadSource,
     A: ReferenceApi + BlockApi + 'static,
     E: EthSpec,
@@ -228,17 +348,17 @@ where
     let mut lookups = JoinSet::new();
     let mut delay = backoff;
     loop {
-        // A stream that announced a root, or opened and went quiet, starts the backoff again.
+        // A stream that sent an event, or opened and went quiet, starts the backoff again.
         let mut worked = false;
         let ended = match tokio::time::timeout(idle, source.open()).await {
             Err(_) => Some(ApiError(format!("{EVENTS_PATH}: not open within {idle:?}"))),
             Ok(Err(e)) => Some(e),
             Ok(Ok(mut stream)) => {
-                tracing::info!("following the reference's block events");
+                tracing::info!("following the reference's events");
                 loop {
                     // Every chunk, a keep-alive too, starts the idle timeout again.
-                    let root = match tokio::time::timeout(idle, stream.next_root()).await {
-                        Ok(Ok(Some(root))) => root,
+                    let event = match tokio::time::timeout(idle, stream.next_event()).await {
+                        Ok(Ok(Some(event))) => event,
                         Ok(Ok(None)) => continue,
                         Ok(Err(e)) => break Some(e),
                         Err(_) => {
@@ -247,6 +367,17 @@ where
                         }
                     };
                     worked = true;
+                    let root = match event {
+                        RefEvent::Block(root) => root,
+                        RefEvent::Head(root) | RefEvent::Reorg(root) => {
+                            heads.send_replace(Some(ChainEvent::Head(root)));
+                            continue;
+                        }
+                        RefEvent::Finalized(checkpoint) => {
+                            finalized.send_replace(Some(checkpoint));
+                            continue;
+                        }
+                    };
                     // The hint first, so a column that comes before the lookup starts uses it.
                     refs.announce(root);
                     while lookups.try_join_next().is_some() {}
@@ -262,6 +393,8 @@ where
                 }
             }
         };
+        // The reference may move while nothing tells us: the chain is unknown until a head.
+        heads.send_replace(Some(ChainEvent::Down));
         if worked {
             delay = backoff;
         }
@@ -269,12 +402,13 @@ where
             Some(e) => tracing::warn!(
                 error = %e,
                 retry_in = ?delay,
-                "the reference's block events are down: column roots take the root wait"
+                "the reference's events are down: column roots take the root wait, and no \
+                 range is served"
             ),
             None => tracing::info!(
                 idle = ?idle,
                 retry_in = ?delay,
-                "the reference's block events went quiet: opening them again"
+                "the reference's events went quiet: opening them again"
             ),
         }
         tokio::time::sleep(delay).await;
@@ -384,7 +518,86 @@ mod tests {
         }
     }
 
-    use super::super::fake::Silent;
+    #[test]
+    fn the_chain_events_give_their_roots_and_checkpoint() {
+        let head = format!(
+            r#"{{"slot":"10","block":"{ROOT_HEX}","state":"{ROOT_HEX}","epoch_transition":false,"previous_duty_dependent_root":"{ROOT_HEX}","current_duty_dependent_root":"{ROOT_HEX}","execution_optimistic":false}}"#
+        );
+        assert_eq!(
+            ref_event(HEAD_EVENT, &head),
+            Ok(Some(RefEvent::Head([0xab; 32])))
+        );
+        let reorg = format!(
+            r#"{{"slot":"200","depth":"50","old_head_block":"0x{z}","new_head_block":"{ROOT_HEX}","old_head_state":"0x{z}","new_head_state":"0x{z}","epoch":"2","execution_optimistic":false}}"#,
+            z = "00".repeat(32)
+        );
+        assert_eq!(
+            ref_event(REORG_EVENT, &reorg),
+            Ok(Some(RefEvent::Reorg([0xab; 32])))
+        );
+        let finalized = format!(
+            r#"{{"block":"{ROOT_HEX}","state":"0x{}","epoch":"2","execution_optimistic":false}}"#,
+            "00".repeat(32)
+        );
+        assert_eq!(
+            ref_event(FINALIZED_EVENT, &finalized),
+            Ok(Some(RefEvent::Finalized(Checkpoint {
+                epoch: 2,
+                root: [0xab; 32]
+            })))
+        );
+        let block = format!(r#"{{"slot":"10","block":"{ROOT_HEX}"}}"#);
+        assert_eq!(
+            ref_event(BLOCK_EVENT, &block),
+            Ok(Some(RefEvent::Block([0xab; 32])))
+        );
+        // Another topic is skipped, whatever its data.
+        assert_eq!(ref_event("attestation", "not json"), Ok(None));
+        assert_eq!(
+            EVENT_TOPICS,
+            ["block", "head", "chain_reorg", "finalized_checkpoint"]
+        );
+    }
+
+    #[test]
+    fn a_bad_chain_event_is_an_error_that_quotes_nothing() {
+        let short = "0xabab";
+        let cases = [
+            (HEAD_EVENT, r#"{"slot":"987654"}"#.to_owned()),
+            (
+                HEAD_EVENT,
+                format!(r#"{{"slot":"-1","block":"{ROOT_HEX}"}}"#),
+            ),
+            (
+                REORG_EVENT,
+                format!(r#"{{"slot":"987654","depth":"x1","new_head_block":"{ROOT_HEX}"}}"#),
+            ),
+            (
+                REORG_EVENT,
+                format!(r#"{{"slot":"987654","depth":"1","new_head_block":"{short}"}}"#),
+            ),
+            (REORG_EVENT, r#"{"slot":"987654","depth":"1"}"#.to_owned()),
+            (
+                FINALIZED_EVENT,
+                format!(r#"{{"block":"{ROOT_HEX}","epoch":"-987654"}}"#),
+            ),
+            (
+                FINALIZED_EVENT,
+                format!(r#"{{"block":"{short}","epoch":"987654"}}"#),
+            ),
+            (FINALIZED_EVENT, "{\"epoch\":".to_owned()),
+        ];
+        for (name, data) in cases {
+            let err = ref_event(name, &data).unwrap_err();
+            assert!(err.0.starts_with(EVENTS_PATH), "{name} {data}: {err}");
+            for value in ["abab", "-1", "987654", "x1"] {
+                assert!(!err.0.contains(value), "{name} {data}: {err}");
+            }
+        }
+    }
+
+    use super::super::canon::{Canonical, Finality, Prune, Pruned};
+    use super::super::fake::{Clock, Silent};
     use super::super::RefLimits;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -393,7 +606,10 @@ mod tests {
     /// What a scripted stream does next.
     #[derive(Debug, Clone)]
     enum Step {
+        /// A `block` event.
         Root(Root),
+        /// Any other event.
+        Event(RefEvent),
         /// Bytes with no root (a keep-alive comment), after this long.
         KeepAlive(Duration),
         Fail,
@@ -412,9 +628,10 @@ mod tests {
     struct Scripted(VecDeque<Step>);
 
     impl HeadStream for Scripted {
-        async fn next_root(&mut self) -> Result<Option<Root>, ApiError> {
+        async fn next_event(&mut self) -> Result<Option<RefEvent>, ApiError> {
             match self.0.pop_front() {
-                Some(Step::Root(root)) => Ok(Some(root)),
+                Some(Step::Root(root)) => Ok(Some(RefEvent::Block(root))),
+                Some(Step::Event(event)) => Ok(Some(event)),
                 Some(Step::KeepAlive(after)) => {
                     tokio::time::sleep(after).await;
                     Ok(None)
@@ -478,6 +695,10 @@ mod tests {
             Arc::clone(&script),
             Arc::clone(&refs),
             HeadFollow::default(),
+            Arc::default(),
+            Arc::new(Clock::default()),
+            None,
+            (),
         ));
         tokio::time::sleep(Duration::from_millis(1)).await;
         // Cached before any column asked: a column of either root hits the cache.
@@ -486,6 +707,93 @@ mod tests {
             assert_eq!(reference.asked(*root), 1);
         }
         assert_eq!(refs.announced(), 0, "every hint spent");
+        follow.abort();
+    }
+
+    /// The prunes handed over, in order.
+    #[derive(Default)]
+    struct Prunes(Mutex<Vec<Prune>>);
+
+    impl PruneSink for Arc<Prunes> {
+        async fn prune(&self, prune: Prune) -> Pruned {
+            self.0.lock().unwrap().push(prune);
+            Pruned::Done
+        }
+    }
+
+    fn status(chain: &CanonicalChain, slot: u64, root: &Root) -> Canonical {
+        chain
+            .view()
+            .map_or(Canonical::Unknown, |view| view.status(slot, root))
+    }
+
+    /// The chain events reach the tracker through the stream: a head, then a re-org that
+    /// leaves a block off the chain, then finality, which the store is to finalize; and the
+    /// chain is unknown once the stream is down.
+    #[tokio::test(start_paused = true)]
+    async fn heads_reorgs_and_finality_on_the_stream_keep_the_chain() {
+        use consensus_types::EthSpec as _;
+        // Epoch 2 of the fixture, in Gloas; the wall clock is past it.
+        let spe = crate::testing::Spec::slots_per_epoch();
+        let reference = Arc::new(Silent::default());
+        let b16 = reference.serve(2 * spe);
+        let b17 = reference.serve_on(2 * spe + 1, b16);
+        let b18 = reference.serve_on(2 * spe + 2, b16);
+        let refs = view(&reference, RefLimits::default());
+        let chain = Arc::new(CanonicalChain::default());
+        let prunes = Arc::new(Prunes::default());
+        // A step every 3 s: the walk of the first head waits out the 2 s lookup of b16's
+        // parent, which the reference does not know.
+        let pause = || Step::KeepAlive(Duration::from_secs(3));
+        let script = Script::new(vec![Some(vec![
+            Step::Root(b17),
+            Step::Event(RefEvent::Head(b17)),
+            pause(),
+            Step::Root(b18),
+            Step::Event(RefEvent::Reorg(b18)),
+            pause(),
+            Step::Event(RefEvent::Finalized(Checkpoint {
+                epoch: 2,
+                root: b16,
+            })),
+            pause(),
+            Step::Fail,
+        ])]);
+        let follow = tokio::spawn(follow_head(
+            Arc::clone(&script),
+            Arc::clone(&refs),
+            HeadFollow::default(),
+            Arc::clone(&chain),
+            Arc::new(Clock::at(0, 10 * spe)),
+            None,
+            Arc::clone(&prunes),
+        ));
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(status(&chain, 2 * spe + 1, &b17), Canonical::Yes);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(status(&chain, 2 * spe + 1, &b17), Canonical::No);
+        assert_eq!(status(&chain, 2 * spe + 2, &b18), Canonical::Yes);
+        assert!(
+            prunes.0.lock().unwrap().is_empty(),
+            "a re-org prunes nothing"
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let seen = prunes.0.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![Prune {
+                finalized: Some(Finality {
+                    slot: 2 * spe,
+                    canonical: vec![b16, b18],
+                    known_from: 2 * spe,
+                }),
+                retain_from: None,
+            }]
+        );
+        assert!(chain.view().is_some());
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        // The stream failed after finality: unknown until the next head.
+        assert_eq!(chain.view(), None);
         follow.abort();
     }
 
@@ -506,6 +814,10 @@ mod tests {
             Arc::clone(&script),
             Arc::clone(&refs),
             HeadFollow::default(),
+            Arc::default(),
+            Arc::new(Clock::default()),
+            None,
+            (),
         ));
         tokio::time::sleep(Duration::from_millis(1)).await;
         assert_eq!(refs.in_flight(), 2);
@@ -535,6 +847,10 @@ mod tests {
             Arc::clone(&script),
             Arc::clone(&refs),
             HeadFollow::default(),
+            Arc::default(),
+            Arc::new(Clock::default()),
+            None,
+            (),
         ));
         tokio::time::sleep(Duration::from_secs(120)).await;
         // Open at 0; down, 1 s; down, 2 s; announced and failed, 1 s; idle for 60 s, 1 s.
@@ -556,6 +872,10 @@ mod tests {
             Arc::clone(&script),
             Arc::clone(&refs),
             HeadFollow::default(),
+            Arc::default(),
+            Arc::new(Clock::default()),
+            None,
+            (),
         ));
         tokio::time::sleep(Duration::from_secs(200)).await;
         assert_eq!(script.opened(), [0]);
@@ -571,6 +891,10 @@ mod tests {
             Arc::clone(&script),
             Arc::clone(&refs),
             HeadFollow::default(),
+            Arc::default(),
+            Arc::new(Clock::default()),
+            None,
+            (),
         ));
         tokio::time::sleep(Duration::from_secs(200)).await;
         // Idle for 60 s each time, then the first backoff, never a longer one.
@@ -588,7 +912,15 @@ mod tests {
             max_backoff: Duration::ZERO,
             ..HeadFollow::default()
         };
-        let follow = tokio::spawn(follow_head(Arc::clone(&script), refs, config));
+        let follow = tokio::spawn(follow_head(
+            Arc::clone(&script),
+            refs,
+            config,
+            Arc::default(),
+            Arc::new(Clock::default()),
+            None,
+            (),
+        ));
         tokio::time::sleep(Duration::from_millis(10)).await;
         let opens = script.opened.lock().unwrap().len();
         assert!(opens <= 11, "{opens} opens in 10 ms");
@@ -604,6 +936,10 @@ mod tests {
             Arc::clone(&script),
             Arc::clone(&refs),
             HeadFollow::default(),
+            Arc::default(),
+            Arc::new(Clock::default()),
+            None,
+            (),
         ));
         tokio::time::sleep(Duration::from_secs(200)).await;
         // 1, 2, 4, 8, 16, then 30 s at most between opens.

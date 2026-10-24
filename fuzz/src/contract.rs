@@ -16,7 +16,11 @@
 //!   ([`kzg_verdict`]).
 //! - **Custody**: node `U256::MAX` (columns [`CUSTODY`]), set at [`cgc_set_slot`].
 //! - **The column RPCs**: `ReqRespServer` over `ColumnServer`, called in process with the
-//!   chain.v1 requests cl-p2p sends (our hello in line) and read as cl-p2p reads them.
+//!   chain.v1 requests cl-p2p sends (our hello in line) and read as cl-p2p reads them. The
+//!   server follows a fixed reference chain that holds every block of [`CHAIN`], both branches
+//!   (`CanonicalChain::fixed`), so the answers are the store's own chain rules, which the model
+//!   below writes out. Which branch the reference's head is on is not fuzzed here: cl-chain's
+//!   `reqresp` and `probe::canon` tests cover it.
 //!
 //! The runtime's clock is paused, so the root wait and its retries take no wall time.
 //!
@@ -93,8 +97,9 @@ use crate::{column_network, column_schedule, column_topic, column_transform, E};
 use cl_chain::da::custody::{Advertise, Custody, EnrCgc, EnrError};
 use cl_chain::probe::ingest::{MAX_LINK_WALK, PENDING_LINK_SLOTS};
 use cl_chain::probe::{
-    ApiError, BlockApi, Checkpoint, ColumnContract, ColumnIngest, ColumnMetrics, Drop,
-    GossipColumn, Header, IngestLimits, QueueMetrics, RefLimits, RefView, ReferenceApi, Root,
+    ApiError, BlockApi, CanonicalChain, ChainView, Checkpoint, ColumnContract, ColumnIngest,
+    ColumnMetrics, Drop, GossipColumn, Header, IngestLimits, QueueMetrics, RefLimits, RefView,
+    ReferenceApi, Root,
 };
 use cl_chain::reqresp::{ColumnServer, ColumnStore, ReqRespServer, ServeBudget, ServeClock};
 use cl_chain::verify::client::{KzgOutcome, KzgVerifier};
@@ -1211,12 +1216,17 @@ impl Probe {
             queue.clone(),
         )
         .expect("the column store");
-        let columns = Arc::new(ColumnServer::new(
-            Arc::clone(writer) as Arc<dyn ColumnStore>,
-            U256::MAX,
-            Arc::new(Clock),
-            ServeBudget::default(),
-        ));
+        let every_block = ChainView::new(known_blocks().iter().map(|b| (b.slot, b.root)))
+            .expect("the blocks of CHAIN");
+        let columns = Arc::new(
+            ColumnServer::new(
+                Arc::clone(writer) as Arc<dyn ColumnStore>,
+                U256::MAX,
+                Arc::new(Clock),
+                ServeBudget::default(),
+            )
+            .following(Arc::new(CanonicalChain::fixed(every_block))),
+        );
         let link = link();
         Self {
             ingest,

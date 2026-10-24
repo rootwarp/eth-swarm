@@ -12,11 +12,13 @@
 //! - `/eth/v1/beacon/states/head/finality_checkpoints` ([`ReferenceApi::finalized_checkpoint`]).
 //! - `/eth/v1/beacon/headers/{block_id}`, the root as block id ([`ReferenceApi::header`]).
 //! - `/eth/v2/beacon/blocks/{block_id}` as SSZ ([`BlockApi::block`]).
-//! - `/eth/v1/events?topics=block` as `text/event-stream` ([`HeadSource::open`]): only the
-//!   connect and the response's head run within the timeout, and the stream's lines and events
-//!   are capped (`probe::head`).
+//! - `/eth/v1/events?topics=block&topics=head&topics=chain_reorg&topics=finalized_checkpoint`
+//!   as `text/event-stream` ([`HeadSource::open`]): only the connect and the response's head
+//!   run within the timeout, and the stream's lines and events are capped (`probe::head`).
 
-use super::head::{block_event_root, HeadSource, HeadStream, SseParser, BLOCK_EVENT, EVENTS_PATH};
+use super::head::{
+    ref_event, HeadSource, HeadStream, RefEvent, SseParser, EVENTS_PATH, EVENT_TOPICS,
+};
 use super::{ApiError, BlockApi, Checkpoint, Header, ReferenceApi, Root};
 use bytes::Bytes;
 use consensus_types::caps::ObjectKind;
@@ -263,12 +265,13 @@ impl ReferenceApi for BeaconApi {
     }
 }
 
-/// The reference's `block` events, one stream ([`HeadSource`] of [`BeaconApi`]).
+/// The reference's events of the four topics (`probe::head`), one stream ([`HeadSource`] of
+/// [`BeaconApi`]).
 pub struct BlockEvents {
     body: Incoming,
     parser: SseParser,
-    /// Roots of a chunk's events not handed over yet.
-    ready: VecDeque<Root>,
+    /// A chunk's events not handed over yet.
+    ready: VecDeque<RefEvent>,
     /// The fault that ends the stream, given once `ready` is empty.
     failed: Option<ApiError>,
     _connection: AbortOnDrop<hyper::Result<()>>,
@@ -281,10 +284,12 @@ fn events_error(why: impl std::fmt::Display) -> ApiError {
 impl HeadSource for BeaconApi {
     type Stream = BlockEvents;
 
-    /// `GET /eth/v1/events?topics=block`: connect and the response's head within the timeout;
-    /// the stream itself has no deadline here (see [`super::HeadFollow::idle_timeout`]).
+    /// `GET /eth/v1/events` of [`EVENT_TOPICS`], each as a `topics` parameter: connect and the
+    /// response's head within the timeout; the stream itself has no deadline here (see
+    /// [`super::HeadFollow::idle_timeout`]).
     async fn open(&self) -> Result<BlockEvents, ApiError> {
-        let path = format!("{EVENTS_PATH}?topics={BLOCK_EVENT}");
+        let topics: Vec<String> = EVENT_TOPICS.iter().map(|t| format!("topics={t}")).collect();
+        let path = format!("{EVENTS_PATH}?{}", topics.join("&"));
         let send = self.send(&path, EVENT_STREAM, events_error);
         let (response, connection) = tokio::time::timeout(self.timeout, send)
             .await
@@ -300,12 +305,12 @@ impl HeadSource for BeaconApi {
 }
 
 impl HeadStream for BlockEvents {
-    /// The next `block` event's root, or `None` after a chunk with none. A chunk's events are
-    /// bounded by the parser's caps on a line and an event; its roots wait in `ready`, and a
-    /// fault in the chunk is given after the roots before it.
-    async fn next_root(&mut self) -> Result<Option<Root>, ApiError> {
-        if let Some(root) = self.ready.pop_front() {
-            return Ok(Some(root));
+    /// The next event of the four topics, or `None` after a chunk with none. A chunk's events
+    /// are bounded by the parser's caps on a line and an event; they wait in `ready`, and a
+    /// fault in the chunk is given after the events before it.
+    async fn next_event(&mut self) -> Result<Option<RefEvent>, ApiError> {
+        if let Some(event) = self.ready.pop_front() {
+            return Ok(Some(event));
         }
         if let Some(e) = &self.failed {
             return Err(e.clone());
@@ -321,9 +326,10 @@ impl HeadStream for BlockEvents {
         };
         let mut events = Vec::new();
         let fed = self.parser.feed_into(&chunk, &mut events);
-        for event in events.iter().filter(|event| event.name == BLOCK_EVENT) {
-            match block_event_root(&event.data) {
-                Ok(root) => self.ready.push_back(root),
+        for event in &events {
+            match ref_event(&event.name, &event.data) {
+                Ok(Some(event)) => self.ready.push_back(event),
+                Ok(None) => {}
                 Err(e) => {
                     self.failed = Some(e);
                     break;
@@ -334,7 +340,7 @@ impl HeadStream for BlockEvents {
             self.failed = Some(events_error(e));
         }
         match (self.ready.pop_front(), &self.failed) {
-            (Some(root), _) => Ok(Some(root)),
+            (Some(event), _) => Ok(Some(event)),
             (None, Some(e)) => Err(e.clone()),
             (None, None) => Ok(None),
         }
@@ -353,7 +359,7 @@ impl BlockApi for BeaconApi {
 
 #[cfg(test)]
 mod tests {
-    use super::super::head::{HeadSource, HeadStream, MAX_EVENT_BYTES};
+    use super::super::head::{HeadSource, HeadStream, RefEvent, MAX_EVENT_BYTES};
     use super::*;
     use testkit::collector::testing::{FixtureServer, HangUp, Reply};
 
@@ -498,7 +504,7 @@ mod tests {
             ": keep-alive\n\n".to_owned(),
             block_event(&first, "10"),
             // Another event name is skipped; an event split over two chunks is whole.
-            "event: head\ndata: {}\n\n".to_owned(),
+            "event: attestation\ndata: {}\n\n".to_owned(),
             block_event(&second, "11")[..20].to_owned(),
             block_event(&second, "11")[20..].to_owned(),
         ];
@@ -508,13 +514,17 @@ mod tests {
         .await;
         let mut events = api(&server).open().await.unwrap();
         // The keep-alive alone: bytes, no root.
-        assert_eq!(events.next_root().await, Ok(None));
-        assert_eq!(events.next_root().await, Ok(Some(ROOT)));
+        assert_eq!(events.next_event().await, Ok(None));
+        assert_eq!(events.next_event().await, Ok(Some(RefEvent::Block(ROOT))));
         assert_eq!(next_root(&mut events).await, Ok([0xcd; 32]));
         let end = next_root(&mut events).await.unwrap_err();
         assert!(end.0.contains("ended"), "{end}");
         let (path, headers) = server.seen().remove(0);
-        assert_eq!(path, "/eth/v1/events?topics=block");
+        assert_eq!(
+            path,
+            "/eth/v1/events?topics=block&topics=head&topics=chain_reorg\
+             &topics=finalized_checkpoint"
+        );
         assert_eq!(headers["accept"], "text/event-stream");
     }
 
@@ -530,6 +540,11 @@ mod tests {
                 "json",
             ),
             ("wrong-length root", block_event("0xabcdef", "10"), "64 hex"),
+            (
+                "a head event without its block",
+                "event: head\ndata: {\"slot\":\"10\"}\n\n".to_owned(),
+                "head event: json",
+            ),
             ("oversize line", long_line, "line"),
             ("oversize event", long_event, "event is over"),
         ];
@@ -579,13 +594,54 @@ mod tests {
         assert_eq!(next_root(&mut events).await, Ok(ROOT));
     }
 
-    /// The next root of `events`, past the chunks with none.
+    /// The next `block` root of `events`, past the chunks with no event.
     async fn next_root(events: &mut BlockEvents) -> Result<Root, ApiError> {
         loop {
-            if let Some(root) = events.next_root().await? {
-                return Ok(root);
+            match events.next_event().await? {
+                Some(RefEvent::Block(root)) => return Ok(root),
+                Some(other) => panic!("not a block event: {other:?}"),
+                None => {}
             }
         }
+    }
+
+    #[tokio::test]
+    async fn the_chain_events_come_in_stream_order() {
+        let root = format!("0x{}", "ab".repeat(32));
+        let z = format!("0x{}", "00".repeat(32));
+        let body = [
+            block_event(&root, "10"),
+            format!("event: head\ndata: {{\"slot\":\"10\",\"block\":\"{root}\",\"state\":\"{z}\"}}\n\n"),
+            format!(
+                "event: chain_reorg\ndata: {{\"slot\":\"11\",\"depth\":\"1\",\"old_head_block\":\"{z}\",\"new_head_block\":\"{root}\"}}\n\n"
+            ),
+            format!(
+                "event: finalized_checkpoint\ndata: {{\"block\":\"{root}\",\"state\":\"{z}\",\"epoch\":\"3\"}}\n\n"
+            ),
+        ]
+        .concat();
+        let server =
+            FixtureServer::start_with_query(move |_, _| Reply::stream(vec![body.as_str()], true))
+                .await;
+        let mut events = api(&server).open().await.unwrap();
+        let mut got = Vec::new();
+        while got.len() < 4 {
+            if let Some(event) = events.next_event().await.unwrap() {
+                got.push(event);
+            }
+        }
+        assert_eq!(
+            got,
+            [
+                RefEvent::Block(ROOT),
+                RefEvent::Head(ROOT),
+                RefEvent::Reorg(ROOT),
+                RefEvent::Finalized(Checkpoint {
+                    epoch: 3,
+                    root: ROOT
+                }),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -600,9 +656,10 @@ mod tests {
             })
             .await;
             let mut events = api(&server).open().await.unwrap();
-            assert_eq!(events.next_root().await, Ok(Some(ROOT)), "{what}");
-            assert_eq!(events.next_root().await, Ok(Some(ROOT)), "{what}");
-            let err = events.next_root().await.unwrap_err();
+            let block = Ok(Some(RefEvent::Block(ROOT)));
+            assert_eq!(events.next_event().await, block, "{what}");
+            assert_eq!(events.next_event().await, block, "{what}");
+            let err = events.next_event().await.unwrap_err();
             assert!(err.0.contains(says), "{what}: {err}");
         }
     }

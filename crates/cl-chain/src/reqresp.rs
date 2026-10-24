@@ -17,10 +17,13 @@
 //!   sidecars" (L672–673), so the answer below would be empty. A by-root request just gets no such sidecar ("It may be less in the
 //!   case that the responding peer is missing blocks or sidecars", L728–733).
 //! - **From `earliest_available_slot`.** That is [`ColumnServer::earliest_available_slot`]:
-//!   [`earliest_servable_slot`] of the store's first stored slot, its finalized-slot watermark,
-//!   `cgc_set_slot` and its contiguous-from slot. The first stored slot alone is a historical
-//!   minimum, not proof that anything from there is held: pruning on finality removes the
-//!   columns at and below the watermark and leaves it in place, columns stored before
+//!   [`earliest_servable_slot`] of the store's first stored slot, its retained-from slot,
+//!   `cgc_set_slot` and its contiguous-from slot, and never before the first block of the
+//!   reference's chain the follower knows past the store's finalized slot (a range there would
+//!   be refused, below; before the first view, past every stored block, unless the claim starts
+//!   at or below the finalized slot). The first stored slot alone is a historical minimum, not proof that
+//!   anything from there is held: retention pruning removes the columns below the retained-from
+//!   slot and leaves it in place, columns stored before
 //!   `cgc_set_slot` are of a smaller custody, and a blob-carrying block that was never stored
 //!   (downtime, or every one of its columns missed gossip) leaves a gap the store detects
 //!   through the chain links of the blocks after it ([`cl_chain_columns::BlockLink::Gap`]).
@@ -29,7 +32,7 @@
 //!   a gap, it is that slot (`fulu/validator.md` L173–175: "the `earliest_available_slot` field
 //!   … SHOULD reflect the slot at which the `custody_group_count` was updated"), and the Status
 //!   says so ([`crate::probe::StatusProvider::serving_columns`], [`ColumnServer::status_floor`]:
-//!   with nothing stored yet, the higher of `cgc_set_slot` and the slot after the watermark).
+//!   with nothing stored yet, the higher of `cgc_set_slot` and the retained-from slot).
 //! - **Within `data_column_serve_range`**: `[max(current_epoch -
 //!   MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS, FULU_FORK_EPOCH), current_epoch]` by the wall
 //!   clock (L647–651, [`ServeClock`]).
@@ -46,14 +49,31 @@
 //!
 //! # One chain ([`columns_by_range`])
 //!
-//! The probe runs no fork choice. Each stored block carries its link to the stored block before
-//! it on its chain, and a range answer is one chain of linked blocks (L691–695): of the blocks
-//! in the range (every stored one, whether or not it holds a requested column), the longest
-//! chain of links (ties to the one with the higher tip, and if still tied, only the blocks the
-//! tied chains share). Blocks off it on another branch are left out. Blocks in the range but
-//! no chain left to serve (a tie with nothing shared) get `3: ResourceUnavailable`. A block
-//! past the chain whose link was never followed (a gap, or a block still pending its ancestor)
-//! may be on the chain, so it is never silently skipped: the answer ends before it.
+//! A range answer comes "from the single chain defined by the current head", and blocks before
+//! finalization "MUST lead to the finalized block reported in the `Status` handshake" (L687–691).
+//! The probe runs no fork choice, so that chain is the reference node's, as its event stream
+//! tells it ([`ServeView::chain`], [`ColumnServer::following`], `probe::canon`). Of the stored
+//! blocks in the range (every one, whether or not it holds a requested column):
+//!
+//! - a block at or below the store's finalized slot is on the finalized chain: finality removed
+//!   every other block there from the contiguous-from slot on (a block it could not place stays
+//!   below that slot, which `earliest_available_slot` never passes below), and refuses later
+//!   writes there ([`cl_chain_columns::ColumnWriter::finalize`]). It is served whether or not
+//!   the chain is known, and it leads to the finalized block;
+//! - a block above it and off the reference's chain (an orphan) is left out;
+//! - a block above it whose place is not known (before the first block of the chain the
+//!   follower knows, past its head, or any block while the chain is not known at all, the event
+//!   stream down) may be an orphan, so the answer ends before it, and with nothing before it
+//!   the range is `3: ResourceUnavailable`.
+//!
+//! The blocks left must also be one chain of the store's own links (L691–695). Each stored
+//! block carries its link to the stored block before it on its chain: of those blocks, the
+//! longest chain of links (ties to the one with the higher tip, and if still tied, only the
+//! blocks the tied chains share). Blocks in the range but no chain left to serve (a tie with
+//! nothing shared) get `3: ResourceUnavailable`. A block past the chain whose link was never
+//! followed (a gap, or a block still pending its ancestor) may be on the chain, so it is never
+//! silently skipped: the answer ends before it. A range whose stored blocks are all orphans
+//! holds no block of the reference's chain the store knows of, as a range with no stored block.
 //!
 //! A block stored [`BlockLink::Pending`] names the slot of the ancestor it waits for: a
 //! blob-carrying block the store knows it lacks, whether or not any block of the range is
@@ -88,7 +108,8 @@
 //! out is this answer or a shorter prefix of it, never more.
 //!
 //! The view (custody, `earliest_available_slot`) and the read come from one read transaction
-//! ([`Snapshot`]), so a finality prune between them cannot make a pruned slot look empty.
+//! ([`Snapshot`]), so a prune between them cannot make a pruned slot look empty, and the
+//! finalized slot and the blocks at or below it are of one state.
 //!
 //! # Bounds
 //!
@@ -102,7 +123,8 @@
 //! on. Error details stay in the log: the stream carries a fixed message per code.
 
 use crate::probe::{
-    earliest_servable_slot, ProbeChain, ProbeError, ReferenceApi, Root, StatusProvider,
+    earliest_servable_slot, Canonical, CanonicalChain, ChainView, ProbeChain, ProbeError,
+    ReferenceApi, Root, StatusProvider,
 };
 use cl_chain_columns::{BlockLink, ColumnReader, ColumnWriter, RangeBudget, Snapshot};
 use consensus_types::das;
@@ -221,6 +243,9 @@ pub struct ServeView {
     pub budget: ServeBudget,
     /// The read stops with [`Refusal::Store`] once this passes.
     pub deadline: Option<Instant>,
+    /// The reference's canonical chain, which a range answer follows (see the module docs);
+    /// `None` while it is not known.
+    pub chain: Option<Arc<ChainView>>,
 }
 
 /// Whether a block at `slot` is servable: at or above `earliest_available_slot` and within the
@@ -334,6 +359,46 @@ struct ReadBlock {
     columns: Vec<cl_chain_columns::RangeColumn>,
 }
 
+/// The blocks of a range read `read` (in slot order) on the reference's `chain`: every block
+/// up to the first one whose place is not known, but the orphans. A block at or below the
+/// store's `finalized` slot is on the finalized chain: from the contiguous-from slot on, below
+/// which no range starts, the store holds no other there. The
+/// second value says why the blocks end early, if they do (see the module docs).
+fn on_the_chain(
+    read: &[cl_chain_columns::RangeBlock],
+    finalized: Option<Slot>,
+    chain: Option<&ChainView>,
+) -> (Vec<ReadBlock>, Option<String>) {
+    let mut blocks = Vec::new();
+    for b in read {
+        let status = if finalized.is_some_and(|f| b.slot <= f) {
+            Canonical::Yes
+        } else {
+            chain.map_or(Canonical::Unknown, |c| c.status(b.slot, &b.block_root))
+        };
+        match status {
+            Canonical::Yes => blocks.push(ReadBlock {
+                slot: b.slot,
+                root: b.block_root,
+                link: b.link,
+                columns: Vec::new(),
+            }),
+            Canonical::No => {}
+            Canonical::Unknown => {
+                let why = match chain {
+                    None => "the reference's chain is not known".to_owned(),
+                    Some(_) => format!(
+                        "the block at slot {} is not known to be on the reference's chain",
+                        b.slot
+                    ),
+                };
+                return (blocks, Some(why));
+            }
+        }
+    }
+    (blocks, None)
+}
+
 /// The blocks of `blocks` (in slot order) on the one chain the answer follows (see the module
 /// docs), as indices in slot order.
 fn one_chain(blocks: &[ReadBlock]) -> Vec<usize> {
@@ -414,16 +479,8 @@ pub fn columns_by_range(
         |i| wanted.contains(&i),
         view.range_budget(),
     )?;
-    let mut blocks: Vec<ReadBlock> = read
-        .blocks
-        .iter()
-        .map(|b| ReadBlock {
-            slot: b.slot,
-            root: b.block_root,
-            link: b.link,
-            columns: Vec::new(),
-        })
-        .collect();
+    let finalized = snapshot.finalized_slot()?;
+    let (mut blocks, unknown) = on_the_chain(&read.blocks, finalized, view.chain.as_deref());
     for column in read.columns {
         if let Some(b) = blocks
             .iter_mut()
@@ -434,12 +491,13 @@ pub fn columns_by_range(
     }
     let chain = one_chain(&blocks);
     let Some(&first) = chain.first() else {
-        return match (blocks.is_empty(), missing) {
-            (true, None) => Ok(Vec::new()),
-            (true, Some(slot)) => Err(Refusal::Unavailable(format!(
+        return match (blocks.is_empty(), unknown, missing) {
+            (true, Some(why), _) => Err(Refusal::Unavailable(why)),
+            (true, None, None) => Ok(Vec::new()),
+            (true, None, Some(slot)) => Err(Refusal::Unavailable(format!(
                 "the block at slot {slot} is not held"
             ))),
-            (false, _) => Err(Refusal::Unavailable(
+            (false, ..) => Err(Refusal::Unavailable(
                 "the blocks of the range share no chain".into(),
             )),
         };
@@ -494,12 +552,14 @@ pub fn columns_by_range(
     }
     // The chain holds a blob-carrying block: an empty answer would claim it holds none.
     if served.is_empty() {
-        return Err(Refusal::Unavailable(ended.unwrap_or_else(|| {
-            format!(
-                "the budget cut the first block, at slot {}",
-                blocks[first].slot
-            )
-        })));
+        return Err(Refusal::Unavailable(ended.or(unknown).unwrap_or_else(
+            || {
+                format!(
+                    "the budget cut the first block, at slot {}",
+                    blocks[first].slot
+                )
+            },
+        )));
     }
     Ok(served)
 }
@@ -662,6 +722,7 @@ pub struct ColumnServer {
     node_id: U256,
     clock: Arc<dyn ServeClock>,
     budget: ServeBudget,
+    chain: Arc<CanonicalChain>,
 }
 
 impl std::fmt::Debug for ColumnServer {
@@ -674,7 +735,8 @@ impl std::fmt::Debug for ColumnServer {
 
 impl ColumnServer {
     /// Serves the custody columns of `node_id` from `store`, under `clock`, at most `budget`
-    /// per answer ([`ServeBudget::default`]: cl-p2p's defaults).
+    /// per answer ([`ServeBudget::default`]: cl-p2p's defaults). It follows no chain: no range
+    /// is served until [`Self::following`] gives it one.
     pub fn new(
         store: Arc<dyn ColumnStore>,
         node_id: U256,
@@ -686,7 +748,16 @@ impl ColumnServer {
             node_id,
             clock,
             budget,
+            chain: Arc::default(),
         }
+    }
+
+    /// The same server, its range answers on `chain`: in probe mode the reference's
+    /// ([`crate::probe::ColumnIngest::canonical`]).
+    #[must_use]
+    pub fn following(mut self, chain: Arc<CanonicalChain>) -> Self {
+        self.chain = chain;
+        self
     }
 
     /// The custody, `earliest_available_slot` and serve range now, no deadline.
@@ -699,18 +770,38 @@ impl ColumnServer {
     }
 
     /// [`Self::view`] as of `snapshot`, so a read through the same snapshot sees the store the
-    /// view was taken of (no prune lands between the two).
+    /// view was taken of (no prune lands between the two). The chain is read after the
+    /// snapshot: a re-org that orphans a block is published before its prune, so a snapshot that
+    /// still holds the orphan is read with a chain that leaves it out, or an older one.
     fn view_in(&self, reader: &Snapshot<'_>) -> Result<ServeView, Refusal> {
+        let chain = self.chain.view();
         let (custody, earliest) = match reader.custody()? {
             Some(record) => {
                 let custody = das::custody_columns(self.node_id, record.cgc)
                     .map_err(|e| Refusal::Store(format!("custody: {e:?}")))?;
                 let earliest = earliest_servable_slot(
                     reader.first_stored_slot()?,
-                    reader.finalized_slot()?,
+                    reader.retained_from()?,
                     record.cgc_set_slot,
                     reader.contiguous_from()?,
                 );
+                // A block between the finalized slot and the first block of the chain known
+                // has no known place: a range from there would be refused, so it is not claimed.
+                // While the chain is unknown, the first slot of the last view still holds.
+                let known_from = self.chain.known_from();
+                let after_finalized = reader.finalized_slot()?.map_or(0, |f| f.saturating_add(1));
+                let earliest = match known_from {
+                    Some(floor) if floor > after_finalized => earliest.map(|e| e.max(floor)),
+                    Some(_) => earliest,
+                    // Before the first view no block above the finalized slot has a known
+                    // place: a claim that starts there passes every stored block.
+                    None => match earliest {
+                        Some(e) if e > after_finalized => {
+                            Some(e.max(reader.after_last_block()?.unwrap_or(e)))
+                        }
+                        other => other,
+                    },
+                };
                 (custody, earliest)
             }
             None => (Vec::new(), None),
@@ -721,12 +812,13 @@ impl ColumnServer {
             serve_range: self.clock.serve_range(),
             budget: self.budget,
             deadline: None,
+            chain,
         })
     }
 
     /// The Status `earliest_available_slot`: [`Self::earliest_available_slot`] once a column
     /// is stored; before that the slot the store serves from at the earliest, the higher of
-    /// `cgc_set_slot` and the slot after the finality watermark. Never below what
+    /// `cgc_set_slot` and the retained-from slot. Never below what
     /// [`columns_by_range`] serves from, so a peer asking from there is never refused for it.
     ///
     /// # Errors
@@ -742,11 +834,11 @@ impl ColumnServer {
             .custody()
             .map_err(|e| e.to_string())?
             .ok_or("no custody record")?;
-        let after_finality = snapshot
-            .finalized_slot()
+        let retained = snapshot
+            .retained_from()
             .map_err(|e| e.to_string())?
-            .map_or(0, |f| f.saturating_add(1));
-        Ok(record.cgc_set_slot.max(after_finality))
+            .unwrap_or(0);
+        Ok(record.cgc_set_slot.max(retained))
     }
 
     /// The slot columns are served from while they are: `None` while nothing is (or the

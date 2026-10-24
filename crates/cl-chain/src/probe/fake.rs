@@ -1,4 +1,5 @@
-//! Test fixtures of the probe: [`Silent`], a reference node in memory.
+//! Test fixtures of the probe: [`Silent`], a reference node in memory, and [`Clock`], a wall
+//! clock the test sets.
 
 use super::{ApiError, BlockApi, Checkpoint, Header, ReferenceApi, Root};
 use consensus_types::primitives::Slot;
@@ -17,6 +18,20 @@ impl Silent {
     /// Serves a Gloas block at `slot`; returns its root.
     pub(crate) fn serve(&self, slot: Slot) -> Root {
         let (_, ssz, root) = crate::testing::gloas_block(slot, &[[1; 48]]);
+        self.blocks.lock().unwrap().insert(root, (slot, ssz));
+        root
+    }
+
+    /// Serves a Gloas block at `slot` whose parent is `parent`; returns its root.
+    pub(crate) fn serve_on(&self, slot: Slot, parent: Root) -> Root {
+        let (_, ssz, root) = crate::testing::gloas_block_on(slot, &[[1; 48]], parent);
+        self.blocks.lock().unwrap().insert(root, (slot, ssz));
+        root
+    }
+
+    /// [`Self::serve_on`], a block of another bid: another root at the same slot and parent.
+    pub(crate) fn serve_fork(&self, slot: Slot, parent: Root) -> Root {
+        let (_, ssz, root) = crate::testing::gloas_block_on(slot, &[[2; 48]], parent);
         self.blocks.lock().unwrap().insert(root, (slot, ssz));
         root
     }
@@ -64,5 +79,32 @@ impl BlockApi for Arc<Silent> {
             Some(ssz) => Ok(ssz),
             None => std::future::pending().await,
         }
+    }
+}
+
+/// A wall clock whose `data_column_serve_range` the test sets: `None` (before Fulu) by
+/// default. Every slot has one digest.
+#[derive(Debug, Default)]
+pub(crate) struct Clock(Mutex<Option<(Slot, Slot)>>);
+
+impl Clock {
+    /// A clock whose serve range is `first` to `last`.
+    pub(crate) fn at(first: Slot, last: Slot) -> Self {
+        Self(Mutex::new(Some((first, last))))
+    }
+
+    /// Moves the serve range to `range`.
+    pub(crate) fn set(&self, range: Option<(Slot, Slot)>) {
+        *self.0.lock().unwrap() = range;
+    }
+}
+
+impl crate::reqresp::ServeClock for Clock {
+    fn serve_range(&self) -> Option<(Slot, Slot)> {
+        *self.0.lock().unwrap()
+    }
+
+    fn fork_digest(&self, _: Slot) -> Option<[u8; 4]> {
+        Some([1, 2, 3, 4])
     }
 }

@@ -85,7 +85,8 @@ impl RefBlock {
 /// [`IngestLimits::validate_for`](super::IngestLimits::validate_for) needs 96: a retry of each
 /// of the 16 seats, and the first asks that can hang together on a slow reference within the
 /// 2 s timeout (16 at once, then 32 a second: 80). The 8 past that are for the chain-link walks
-/// of known roots, which ask outside the root wait's budgets, and for timers that fire late.
+/// of known roots (the column links, and the walk of the reference's chain, `probe::canon`),
+/// which ask outside the root wait's budgets one root at a time, and for timers that fire late.
 pub const DEFAULT_MAX_IN_FLIGHT: usize = 104;
 
 /// Lookups of announced roots at once by default \[est\]: the reference imports about a block a

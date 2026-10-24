@@ -14,6 +14,11 @@
 //!   written on the `columns-writer` thread. Forward only, from `cgc_set_slot`; the first stored
 //!   slot ([`first_stored_column_slot`]) is persisted with the columns. Every column is reported
 //!   IGNORE, so nothing is re-broadcast; see [`ingest`].
+//! - **The reference's chain** ([`CanonicalChain`]): the follower of the reference's events
+//!   ([`follow_head`]) keeps a bounded record of its canonical chain from its `head`,
+//!   `chain_reorg` and `finalized_checkpoint` events. A range answer serves only blocks on it,
+//!   and the column store prunes the orphans and the finalized slots through its writer; see
+//!   `probe::canon`.
 //!
 //! # Status
 //!
@@ -29,13 +34,14 @@
 //! - `earliest_available_slot`: once the probe serves its custody columns
 //!   ([`StatusProvider::serving_columns`]), the slot it serves them from
 //!   ([`crate::reqresp::ColumnServer::status_floor`]), read from the store on every call:
-//!   [`earliest_servable_slot`], the highest of the first stored column slot, the slot after
-//!   the finalized-slot watermark, `cgc_set_slot` and the store's contiguous-from slot, never
-//!   the first stored slot alone (a historical minimum that pruning leaves below the data). A
-//!   node storing forward from the slot its `cgc` was set at advertises that slot
-//!   (`fulu/p2p-interface.md` L552–561, `fulu/validator.md` L173–175). Until a column is
-//!   stored, the slot it serves from at the earliest: the higher of `cgc_set_slot` and the slot
-//!   after the watermark, never `head_slot` below it. A store that cannot be read (or holds no
+//!   [`earliest_servable_slot`], the highest of the first stored column slot, the slot the
+//!   store keeps columns from (retention pruning raises it), `cgc_set_slot` and the store's
+//!   contiguous-from slot, and never before the first block of the reference's chain it knows
+//!   past the store's finalized slot; never the first stored slot alone (a historical minimum
+//!   that pruning leaves below the data). A node storing forward from the slot its `cgc` was
+//!   set at advertises that slot (`fulu/p2p-interface.md` L552–561, `fulu/validator.md`
+//!   L173–175). Until a column is stored, the slot it serves from at the earliest: the higher
+//!   of `cgc_set_slot` and the retained-from slot, never `head_slot` below it. A store that cannot be read (or holds no
 //!   custody record) gives no Status ([`ProbeError::Unavailable`]): never a lower value.
 //!   Without a column store, `head_slot`.
 //!
@@ -66,6 +72,7 @@
 //! the response is built.
 
 mod beacon_api;
+mod canon;
 pub mod column;
 #[cfg(test)]
 mod fake;
@@ -76,12 +83,15 @@ mod root_wait;
 
 pub use beacon_api::BeaconApi;
 pub use beacon_api::BlockEvents;
+pub use canon::{
+    Canonical, CanonicalChain, ChainView, Prune, PruneSink, MAX_CANON_BLOCKS, MAX_CANON_WALK,
+};
 pub use column::{
     storage_contract, store_verified, ColumnContract, ColumnMetrics, Drop, GossipColumn, Verified,
 };
 pub use head::{
-    follow_head, HeadFollow, HeadSource, HeadStream, SseError, EVENTS_PATH, MAX_EVENT_BYTES,
-    MIN_BACKOFF,
+    follow_head, HeadFollow, HeadSource, HeadStream, RefEvent, SseError, EVENTS_PATH, EVENT_TOPICS,
+    MAX_EVENT_BYTES, MIN_BACKOFF,
 };
 pub use ingest::{
     earliest_servable_slot, first_stored_column_slot, ColumnIngest, IngestLimits, LimitsError,
@@ -951,12 +961,21 @@ mod tests {
             cgc_set_slot,
         )
         .unwrap();
-        let server = Arc::new(ColumnServer::new(
-            Arc::clone(&writer) as Arc<dyn ColumnStore>,
-            U256::MAX,
-            Arc::new(Always),
-            ServeBudget::default(),
-        ));
+        let server = Arc::new(
+            ColumnServer::new(
+                Arc::clone(&writer) as Arc<dyn ColumnStore>,
+                U256::MAX,
+                Arc::new(Always),
+                ServeBudget::default(),
+            )
+            .following(Arc::new(crate::probe::CanonicalChain::fixed(
+                crate::probe::ChainView::new([
+                    (cgc_set_slot, [1; 32]),
+                    (cgc_set_slot + 3, [2; 32]),
+                ])
+                .unwrap(),
+            ))),
+        );
         let provider =
             StatusProvider::new(api, chain.clone(), DEFAULT_API_TIMEOUT).serving_columns(server);
         provider.refresh().await.unwrap();
@@ -2006,8 +2025,11 @@ mod tests {
             "/eth/v1/events".into(),
             Reply::stream(vec![event.as_str()], true),
         );
-        s.ingest
-            .follow_head(s.reference.api(), HeadFollow::default());
+        s.ingest.follow_head(
+            s.reference.api(),
+            HeadFollow::default(),
+            Arc::new(fake::Clock::default()),
+        );
         settle("the announced root to be cached", || {
             header_requests(&s, root) == 1 && s.ingest.refs_cached(&root)
         })
@@ -2029,7 +2051,7 @@ mod tests {
         let seen = s.reference.server.seen();
         assert!(seen
             .iter()
-            .any(|(path, _)| path == "/eth/v1/events?topics=block"));
+            .any(|(path, _)| path.starts_with("/eth/v1/events?topics=block&")));
     }
 
     /// A made-up block root: `i` in its first bytes.

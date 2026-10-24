@@ -1128,6 +1128,7 @@ mod end_to_end {
     use crate::rpc::columns::ChainColumns;
     use crate::rpc::limits::MAX_COLUMN_RESPONSE_BYTES;
     use cl_chain::da::custody::{Advertise, Custody, EnrCgc, EnrError};
+    use cl_chain::probe::{CanonicalChain, ChainView};
     use cl_chain::reqresp::{ColumnServer, ColumnStore, ReqRespServer, ServeBudget, ServeClock};
     use cl_chain_columns::{BlockLink, Column, ColumnWriter};
     use consensus_types::primitives::U256;
@@ -1232,12 +1233,17 @@ mod end_to_end {
                 .unwrap();
             parent = BlockLink::Parent(block_root(slot));
         }
+        // The reference's chain is the stored one, the slots without blobs included.
+        let canonical =
+            ChainView::new((CGC_SET_SLOT..CGC_SET_SLOT + 32).map(|slot| (slot, block_root(slot))))
+                .unwrap();
         let server = ColumnServer::new(
             Arc::clone(&writer) as Arc<dyn ColumnStore>,
             U256::MAX,
             Arc::new(GloasClock),
             ServeBudget::default(),
-        );
+        )
+        .following(Arc::new(CanonicalChain::fixed(canonical)));
         let socket = dir.path().join("chain.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let routes = tonic::service::Routes::new(

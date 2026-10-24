@@ -2553,6 +2553,249 @@ async fn sixty_fifth_stream_is_refused() {
     assert_still_connected(&mut pair.ours, Duration::from_millis(200)).await;
 }
 
+/// yamux holds at most [`YAMUX_MAX_STREAMS`] streams: a peer whose yamux allows 512 opens 65
+/// at once, and the 65th closes the connection (yamux 0.14 answers it with a `GoAway`), so the
+/// application never holds more than 64 of its streams.
+#[tokio::test]
+async fn sixty_fifth_yamux_stream_is_refused() {
+    let (_, metrics) = registered();
+    let pair = |open| {
+        connect(
+            MuxerBudget::with_defaults(&metrics),
+            Plan::default(),
+            Offer::YamuxThenMplex,
+            Plan {
+                open,
+                ..Plan::default()
+            },
+        )
+    };
+    // 64 streams: every one is taken, and the connection stays.
+    let mut at_cap = pair(YAMUX_MAX_STREAMS).await;
+    for _ in 0..YAMUX_MAX_STREAMS {
+        wait_for(&mut at_cap.ours, "an inbound stream", |seen| match seen {
+            Seen::Hold(HoldEvent::Inbound) => Some(()),
+            _ => None,
+        })
+        .await;
+    }
+    assert_still_connected(&mut at_cap.ours, Duration::from_millis(200)).await;
+    // 65: the connection closes, with at most 64 of them taken.
+    let mut over = pair(YAMUX_MAX_STREAMS + 1).await;
+    let mut inbound = 0;
+    let closed = wait_for(
+        &mut over.ours,
+        "the connection to close",
+        |seen| match seen {
+            Seen::Hold(HoldEvent::Inbound) => {
+                inbound += 1;
+                None
+            }
+            Seen::Closed(peer, _) => Some(peer),
+            _ => None,
+        },
+    )
+    .await;
+    assert_eq!(closed, over.peer);
+    assert!(inbound <= YAMUX_MAX_STREAMS, "{inbound} streams taken");
+}
+
+/// The streams the application does not read fit the mplex connection budget: such a stream
+/// takes at most its initial window, [`YAMUX_STREAM_WINDOW`], since yamux grants more only as
+/// the application reads, and at most [`YAMUX_MAX_STREAMS`] streams are open. (A stream the
+/// application reads can grow its window up to yamux's connection cap: see the module docs.)
+#[tokio::test]
+async fn the_yamux_window_bound_holds() {
+    const { assert!(YAMUX_MAX_STREAMS * YAMUX_STREAM_WINDOW <= DEFAULT_CONNECTION_BYTES) };
+    assert_eq!(YAMUX_STREAM_WINDOW, 256 << 10);
+    let (_, metrics) = registered();
+    // Within the window, less the few bytes of the protocol negotiation: every write ends,
+    // on all 64 streams, though we never read.
+    let fits = YAMUX_STREAM_WINDOW - FLOOD_CHUNK;
+    let mut pair = connect(
+        MuxerBudget::with_defaults(&metrics),
+        Plan::default(),
+        Offer::YamuxThenMplex,
+        Plan {
+            open: YAMUX_MAX_STREAMS,
+            write_outbound: fits,
+            ..Plan::default()
+        },
+    )
+    .await;
+    for _ in 0..YAMUX_MAX_STREAMS {
+        let wrote = wait_for(&mut pair.theirs, "a write to end", |seen| match seen {
+            Seen::Hold(HoldEvent::Wrote { result }) => Some(result),
+            _ => None,
+        })
+        .await;
+        assert_eq!(wrote, Ok(fits));
+    }
+    assert_still_connected(&mut pair.ours, Duration::from_millis(200)).await;
+    // Past the window: the write waits for credit we never grant.
+    let mut pair = connect(
+        MuxerBudget::with_defaults(&metrics),
+        Plan::default(),
+        Offer::YamuxThenMplex,
+        Plan {
+            open: 1,
+            write_outbound: YAMUX_STREAM_WINDOW + FLOOD_CHUNK,
+            ..Plan::default()
+        },
+    )
+    .await;
+    let ended = tokio::time::timeout(Duration::from_millis(500), async {
+        while let Some(seen) = pair.theirs.next().await {
+            if let Seen::Hold(HoldEvent::Wrote { result }) = seen {
+                return result;
+            }
+        }
+        Err(io::ErrorKind::BrokenPipe)
+    })
+    .await;
+    assert!(ended.is_err(), "a write past the window ended: {ended:?}");
+    assert_still_connected(&mut pair.ours, Duration::from_millis(100)).await;
+}
+
+/// Our yamux opens wait below the cap, and never close the connection: a peer that holds 24
+/// streams while we ask for 48 gets all of its own, and we get [`YAMUX_MAX_OPENS`] at once; the
+/// others wait for a stream to go (yamux 0.14 refuses an open past its cap with
+/// `TooManyStreams`, and the connection closes).
+#[tokio::test]
+async fn our_yamux_opens_wait_below_the_cap() {
+    let (_, metrics) = registered();
+    let mut pair = connect(
+        MuxerBudget::with_defaults(&metrics),
+        Plan {
+            open: 48,
+            ..Plan::default()
+        },
+        Offer::YamuxThenMplex,
+        Plan {
+            open: 24,
+            ..Plan::default()
+        },
+    )
+    .await;
+    let (mut outbound, mut inbound) = (0, 0);
+    while (outbound, inbound) != (YAMUX_MAX_OPENS, 24) {
+        wait_for(
+            &mut pair.ours,
+            "our streams and the peer's",
+            |seen| match seen {
+                Seen::Hold(HoldEvent::Outbound) => {
+                    outbound += 1;
+                    Some(())
+                }
+                Seen::Hold(HoldEvent::Inbound) => {
+                    inbound += 1;
+                    Some(())
+                }
+                Seen::Hold(HoldEvent::OutboundFailed(e)) => panic!("an open failed: {e}"),
+                Seen::Closed(_, cause) => panic!("the connection closed: {cause}"),
+                _ => None,
+            },
+        )
+        .await;
+    }
+    let more = tokio::time::timeout(Duration::from_millis(300), async {
+        while let Some(seen) = pair.ours.next().await {
+            match seen {
+                Seen::Hold(HoldEvent::Outbound | HoldEvent::OutboundFailed(_))
+                | Seen::Closed(..) => return Some(seen),
+                _ => {}
+            }
+        }
+        None
+    })
+    .await;
+    assert!(more.is_err(), "past our opens' cap: {more:?}");
+}
+
+/// With our opens at their cap, the peer still has room for as many streams of its own:
+/// together they fill yamux's cap, and the connection stays.
+#[tokio::test]
+async fn the_peer_keeps_room_under_the_yamux_cap() {
+    let (_, metrics) = registered();
+    let theirs = YAMUX_MAX_STREAMS - YAMUX_MAX_OPENS;
+    let mut pair = connect(
+        MuxerBudget::with_defaults(&metrics),
+        Plan {
+            open: YAMUX_MAX_OPENS,
+            ..Plan::default()
+        },
+        Offer::YamuxThenMplex,
+        Plan {
+            open: theirs,
+            ..Plan::default()
+        },
+    )
+    .await;
+    let (mut outbound, mut inbound) = (0, 0);
+    while (outbound, inbound) != (YAMUX_MAX_OPENS, theirs) {
+        wait_for(
+            &mut pair.ours,
+            "our streams and the peer's",
+            |seen| match seen {
+                Seen::Hold(HoldEvent::Outbound) => {
+                    outbound += 1;
+                    Some(())
+                }
+                Seen::Hold(HoldEvent::Inbound) => {
+                    inbound += 1;
+                    Some(())
+                }
+                Seen::Closed(_, cause) => panic!("the connection closed: {cause}"),
+                _ => None,
+            },
+        )
+        .await;
+    }
+    assert_still_connected(&mut pair.ours, Duration::from_millis(200)).await;
+}
+
+/// [`CappedMuxer`] over a scripted muxer: an open waits once [`YAMUX_MAX_OPENS`] of ours are
+/// live, or once the connection's streams, the peer's included, reach the cap less
+/// [`YAMUX_OPEN_MARGIN`]; it goes on, woken, once a stream is dropped.
+#[test]
+fn capped_opens_wait_and_go_on_once_a_stream_is_dropped() {
+    let mut inner = scripted::Muxer::default();
+    for _ in 0..YAMUX_MAX_STREAMS {
+        inner.outbound.push_back(Script::default().stream());
+        inner.inbound.push_back(Script::default().stream());
+    }
+    let mut muxer = CappedMuxer::new(inner);
+    let open = |muxer: &mut CappedMuxer<scripted::Muxer>, cx: &mut Context<'_>| match muxer
+        .poll_outbound_unpin(cx)
+    {
+        Poll::Ready(Ok(stream)) => Some(stream),
+        Poll::Ready(Err(e)) => panic!("{e}"),
+        Poll::Pending => None,
+    };
+    let mut ours: Vec<_> = (0..YAMUX_MAX_OPENS)
+        .map(|_| open(&mut muxer, &mut noop()).expect("below the cap"))
+        .collect();
+    let (flag, waker) = Flag::new();
+    let mut cx = Context::from_waker(&waker);
+    assert!(open(&mut muxer, &mut cx).is_none(), "at our opens' cap");
+    drop(ours.pop());
+    assert!(flag.woken(), "woken once a stream went");
+    ours.push(open(&mut muxer, &mut noop()).expect("room again"));
+    assert_eq!(muxer.live_streams(), YAMUX_MAX_OPENS);
+    // The peer's streams: ours wait once the connection is near the cap.
+    drop(ours.drain(..8));
+    let mut theirs = Vec::new();
+    while muxer.live_streams() < YAMUX_MAX_STREAMS - YAMUX_OPEN_MARGIN {
+        match muxer.poll_inbound_unpin(&mut noop()) {
+            Poll::Ready(Ok(stream)) => theirs.push(stream),
+            _ => panic!("an inbound stream"),
+        }
+    }
+    assert!(open(&mut muxer, &mut noop()).is_none(), "near yamux's cap");
+    drop(theirs.pop());
+    assert!(open(&mut muxer, &mut noop()).is_some());
+}
+
 #[tokio::test]
 async fn stream_overflow_resets_the_stream() {
     let (_, metrics) = registered();

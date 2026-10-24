@@ -22,6 +22,9 @@ pub struct ChainState {
     pub roots: BTreeMap<Slot, Root>,
     /// `/eth/v2/beacon/blocks/{root}` as SSZ: each known block's.
     pub blocks: HashMap<Root, Vec<u8>>,
+    /// `/eth/v1/events`: a stream of one `head` event of this slot and root, held open; 404
+    /// without one.
+    pub head: Option<(Slot, Root)>,
     /// Every request answers 503 while set.
     pub down: bool,
 }
@@ -74,6 +77,18 @@ impl FixtureChain {
                     r#"{{"data":{{"peer_id":"{peer_id}","enr":"{enr}","p2p_addresses":[],"discovery_addresses":[],"metadata":{{"seq_number":"1","attnets":"0x0000000000000000","syncnets":"0x00"}}}}}}"#
                 )
             }),
+            "/eth/v1/events" => {
+                return s.head.map_or_else(
+                    || Reply::status(404),
+                    |(slot, root)| {
+                        let event = format!(
+                            "event: head\ndata: {{\"slot\":\"{slot}\",\"block\":\"{}\"}}\n\n",
+                            hex0x(root.as_slice())
+                        );
+                        Reply::stream(vec![event.as_str()], true)
+                    },
+                )
+            }
             "/eth/v1/beacon/states/head/finality_checkpoints" => s.finalized.map(|(epoch, root)| {
                 let zero = hex0x(&[0; 32]);
                 format!(

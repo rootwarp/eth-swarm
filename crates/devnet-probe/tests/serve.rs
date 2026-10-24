@@ -112,7 +112,8 @@ fn block(slot: u64, parent: [u8; 32]) -> ([u8; 32], Vec<u8>) {
 }
 
 /// The test chain: an anchor before [`SLOTS`] (its parent unknown) and a block at each of
-/// them, each on the one before; `(slot, root)` of each, anchor first.
+/// them, each on the one before; `(slot, root)` of each, anchor first. It is the reference's
+/// canonical chain, to its head in the slot before [`CHAIN_END`].
 #[derive(Clone)]
 struct Chain {
     blocks: Vec<(u64, [u8; 32])>,
@@ -141,6 +142,9 @@ impl Chain {
         let (gap, ssz) = block(GAP_SLOT, [0x77; 32]);
         serve(GAP_SLOT, gap, ssz);
         reference.finalize(11, Root::from(blocks[0].1), NOW_SLOT - 1);
+        // Its head, whose chain the probe's range answers follow, is the chain's last block.
+        let (slot, head) = blocks[blocks.len() - 1];
+        reference.with(|s| s.head = Some((slot, Root::from(head))));
         Self { blocks, gap }
     }
 

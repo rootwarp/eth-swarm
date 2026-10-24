@@ -50,12 +50,41 @@
 //! Wrap only a muxer without flow control. yamux credits its window as data is read, so reading
 //! it eagerly would let the peer send without limit; yamux bounds its own buffers by its
 //! windows.
+//!
+//! yamux runs bare under caps of its own:
+//!
+//! - **Streams** ([`yamux_config`]): at most [`YAMUX_MAX_STREAMS`], ours and the peer's together.
+//!   A peer's stream past them closes the connection (yamux 0.14 answers it with a `GoAway`).
+//! - **Our opens** ([`Capped`], [`CappedMuxer`]): an open of ours waits while
+//!   [`YAMUX_MAX_OPENS`] of our streams are live, or while the connection's streams are within
+//!   [`YAMUX_OPEN_MARGIN`] of the cap. So our opens never meet yamux's cap, where yamux refuses
+//!   them with `TooManyStreams` and the swarm closes the connection, and a peer always has room
+//!   for [`YAMUX_MAX_STREAMS`] − [`YAMUX_MAX_OPENS`] streams of its own. Our own use stays far
+//!   below both: at most `MAX_CONCURRENT_REQUESTS` (2) requests per req/resp protocol, plus
+//!   gossipsub, identify and ping. The margin is not a bound while the TCP send side is full:
+//!   yamux then counts streams whose handles were dropped for longer (see [`Capped`]).
+//!
+//! **What yamux holds unread.** A stream starts with a receive window of
+//! [`YAMUX_STREAM_WINDOW`], and yamux grants a peer more only after the application read what
+//! it sent. So a stream the application does not read holds at most 256 KiB, and 64 of them at
+//! most 16 MiB, within [`DEFAULT_CONNECTION_BYTES`]. A max-size message still fits: the
+//! application reads it as it arrives, and each read opens the window again.
+//!
+//! **Limit: the windows of streams the application reads.** yamux's auto-tuning doubles the
+//! window of a stream the application reads when the peer used half of it within two round
+//! trips. The peer sets that round trip itself with its Pong, so it can grow the window of any
+//! stream the application reads, and then send a full window that the application does not
+//! read yet. The only bound on what the windows hold together is yamux 0.14's connection cap,
+//! `max_connection_receive_window`, 1 GiB by default, and `libp2p-yamux` 0.48 at the pinned
+//! rust-libp2p SHA has no setter for it, only `set_max_num_streams`. That bound is accepted.
 
+mod capped;
 mod close;
 mod quota;
 #[cfg(test)]
 mod tests;
 
+pub use capped::{Capped, CappedMuxer, CappedStream, Capping};
 pub use close::{CloseDeadline, CloseDeadlineError, DeadlineMuxer, WithDeadline};
 use quota::Pass;
 pub use quota::{QuotaSocket, EMPTY_FRAME_WINDOW, MAX_EMPTY_FRAMES, PASS_BYTES, PASS_FRAMES};
@@ -80,6 +109,26 @@ use std::task::{Context, Poll, Waker};
 
 /// Streams one mplex connection may have open at once (inbound and outbound together).
 pub const MPLEX_MAX_STREAMS: usize = 64;
+
+/// Streams one yamux connection may have open at once: [`MPLEX_MAX_STREAMS`], not yamux
+/// 0.14's 512. yamux answers a peer's stream past it with a `GoAway`, which closes the
+/// connection.
+pub const YAMUX_MAX_STREAMS: usize = MPLEX_MAX_STREAMS;
+
+/// The receive window a yamux stream starts with, 256 KiB (the yamux spec's initial window,
+/// yamux 0.14's `DEFAULT_CREDIT`).
+pub const YAMUX_STREAM_WINDOW: usize = 256 << 10;
+
+/// Our own streams one yamux connection holds at once before our next open waits
+/// ([`CappedMuxer`]) \[est\]: half the cap, so a peer always has room for 32 of its own, and
+/// past our own use (2 requests per req/resp protocol, gossipsub, identify, ping).
+pub const YAMUX_MAX_OPENS: usize = YAMUX_MAX_STREAMS / 2;
+
+/// How close to [`YAMUX_MAX_STREAMS`] a connection's live streams may come before our next open
+/// waits ([`CappedMuxer`]) \[est\]: room for the streams yamux still counts after their handles
+/// are dropped, in the usual case. Not a bound while the TCP send side is full (see
+/// [`Capped`]).
+pub const YAMUX_OPEN_MARGIN: usize = 4;
 
 /// The least `max_negotiating_inbound_streams` a swarm over [`muxers`] may run with:
 /// [`MPLEX_MAX_STREAMS`].
@@ -129,8 +178,9 @@ pub const DEFAULT_STREAM_BYTES: usize = MAX_PAYLOAD_SIZE + MAX_PAYLOAD_SIZE / 6 
 ///
 /// Two streams can each hold a full [`DEFAULT_STREAM_BYTES`] message (a gossip message and a
 /// req/resp chunk the application is behind on at the same time), with about 8.7 MiB to spare. At
-/// 100 mplex peers that is at most 3.2 GiB, against the 1 GiB per connection yamux's default
-/// receive window would allow.
+/// 100 mplex peers that is at most 3.2 GiB. yamux's streams that the application does not read
+/// fit it too; the windows of the streams it reads are bounded only by yamux's 1 GiB
+/// connection cap (see the module docs).
 pub const DEFAULT_CONNECTION_BYTES: usize = 32 << 20;
 
 /// What [`BudgetedMuxer`] reads from a stream at a time, and the size of its buffer's chunks.
@@ -150,17 +200,31 @@ pub fn mplex_config() -> libp2p_mplex::Config {
     config
 }
 
-/// The muxers for `SwarmBuilder::with_tcp(tcp, noise::Config::new, muxers(budget))`: yamux
-/// first, then [`mplex_config`] under `budget`.
+/// yamux with [`YAMUX_MAX_STREAMS`] streams (the library default is 512). Meant to run bare,
+/// with our opens held below the cap ([`yamux_upgrade`]): yamux bounds its own buffers by its
+/// windows (see the module docs).
+#[must_use]
+pub fn yamux_config() -> yamux::Config {
+    let mut config = yamux::Config::default();
+    config.set_max_num_streams(YAMUX_MAX_STREAMS);
+    config
+}
+
+/// [`yamux_config`] whose muxers hold our opens below the cap ([`CappedMuxer`]).
+#[must_use]
+pub fn yamux_upgrade() -> Capped<yamux::Config> {
+    Capped(yamux_config())
+}
+
+/// The muxers for `SwarmBuilder::with_tcp(tcp, noise::Config::new, muxers(budget))`:
+/// [`yamux_upgrade`] first, then [`mplex_config`] under `budget`.
 pub fn muxers(
     budget: MuxerBudget,
 ) -> (
-    fn() -> yamux::Config,
+    fn() -> Capped<yamux::Config>,
     impl FnOnce() -> Budgeted<libp2p_mplex::Config>,
 ) {
-    (yamux::Config::default, move || {
-        Budgeted::new(mplex_config(), budget)
-    })
+    (yamux_upgrade, move || Budgeted::new(mplex_config(), budget))
 }
 
 /// The transport metrics, on the service's prometheus-client [`Registry`].

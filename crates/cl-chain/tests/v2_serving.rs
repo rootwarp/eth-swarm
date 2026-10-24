@@ -10,7 +10,9 @@
 //!   its verify.v1 client.
 //! - **The reference node** is an HTTP fixture of the Beacon API (`testkit`'s `FixtureServer`)
 //!   that serves the headers and blocks of the test's blocks, and 404 for any other root. A test
-//!   adds a block to it when the reference should learn it.
+//!   adds a block to it when the reference should learn it. Its canonical chain, which the
+//!   column server follows, holds every block it serves: the chain is not under test here
+//!   (`cl_chain::probe::CanonicalChain`; `reqresp::tests` and `probe::ingest::tests` test it).
 //! - **cl-chain** is the probe's column store (`ColumnIngest`: pending queue, root wait,
 //!   storage contract, writer thread) on a temp column env, custody of node `U256::MAX`
 //!   (columns 1, 47, 87 and 102) from [`CGC_SET_SLOT`], and its `ReqRespService` column RPCs
@@ -61,8 +63,8 @@ mod verify {
 
 use cl_chain::da::custody::{Advertise, Custody, EnrCgc, EnrError};
 use cl_chain::probe::{
-    BeaconApi, ColumnContract, ColumnIngest, ColumnMetrics, Drop, GossipColumn, IngestLimits,
-    QueueMetrics, RefLimits, RefView, Root, DEFAULT_API_TIMEOUT,
+    BeaconApi, CanonicalChain, ChainView, ColumnContract, ColumnIngest, ColumnMetrics, Drop,
+    GossipColumn, IngestLimits, QueueMetrics, RefLimits, RefView, Root, DEFAULT_API_TIMEOUT,
 };
 use cl_chain::reqresp::{ColumnServer, ColumnStore, ReqRespServer, ServeBudget, ServeClock};
 use cl_chain::verify::client::KzgClient;
@@ -243,11 +245,13 @@ fn claiming(
 }
 
 /// A reference node over HTTP: the headers and blocks it serves, 404 for any other, counted by
-/// path.
+/// path; and its canonical chain, every block it serves.
 struct Reference {
     server: FixtureServer,
     replies: Arc<Mutex<HashMap<String, Reply>>>,
     misses: Arc<Mutex<HashMap<String, usize>>>,
+    chain: Arc<CanonicalChain>,
+    served: Mutex<Vec<(u64, Root)>>,
 }
 
 impl Reference {
@@ -267,6 +271,8 @@ impl Reference {
             server,
             replies,
             misses,
+            chain: Arc::default(),
+            served: Mutex::default(),
         }
     }
 
@@ -287,6 +293,9 @@ impl Reference {
             format!("/eth/v2/beacon/blocks/{id}"),
             Reply::ssz(block.ssz.clone()),
         );
+        let mut served = self.served.lock().unwrap();
+        served.push((block.slot, block.root));
+        self.chain.set(ChainView::new(served.iter().copied()));
     }
 
     /// How many times the header of `block` was asked for and answered 404.
@@ -525,7 +534,8 @@ impl Node {
             U256::MAX,
             Arc::new(TestClock),
             ServeBudget::default(),
-        );
+        )
+        .following(Arc::clone(&reference.chain));
         let socket = dir.path().join("chain.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let routes = tonic::service::Routes::new(

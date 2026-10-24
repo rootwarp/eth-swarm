@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -16,9 +16,13 @@ use crate::{
     keys::{
         block_prefix, column_key, decode_column_key, BlockLink, BlockRoot, ADVERTISED_CGC_KEY,
         CGC_KEY, CGC_SET_SLOT_KEY, COLUMNS_TABLE, CONTIGUOUS_FROM_KEY, FINALIZED_SLOT_KEY,
-        FIRST_STORED_SLOT_KEY, LINKS_TABLE, METADATA_SEQ_KEY, META_TABLE, ROOTS_TABLE,
+        FIRST_STORED_SLOT_KEY, LINKS_TABLE, METADATA_SEQ_KEY, META_TABLE, RETAINED_FROM_KEY,
+        ROOTS_TABLE,
     },
-    reader::{meta_u64, scan_block, stored_link, stored_slot, ColumnReader, CustodyRecord},
+    reader::{
+        meta_u64, retained_from, scan_block, stored_link, stored_slot, ColumnReader, CustodyRecord,
+        RangeBudget,
+    },
     sched::{Priority, TxnScheduler},
     NUMBER_OF_COLUMNS, NUMBER_OF_CUSTODY_GROUPS,
 };
@@ -300,8 +304,8 @@ impl ColumnWriter {
     /// [`Self::write_columns`], the block stored with `link`, in the first transaction.
     ///
     /// - [`BlockLink::Pending`] of a root that is stored is [`BlockLink::Parent`] of it, and one
-    ///   of a slot at or below the finalized-slot watermark is [`BlockLink::Start`]: finality
-    ///   pruned the target, or refuses it, and nothing before it is to be held.
+    ///   of a slot below the retained-from slot ([`ColumnReader::retained_from`]) is
+    ///   [`BlockLink::Start`]: the target was pruned, and nothing before it is to be held.
     /// - A [`BlockLink::Gap`] or a pending link never replaces a [`BlockLink::Start`] or
     ///   [`BlockLink::Parent`] the block was stored with, a pending link never replaces a gap,
     ///   and a gap never replaces a pending link (a walk that failed once says nothing of the
@@ -411,18 +415,20 @@ impl ColumnWriter {
         Ok(report)
     }
 
-    /// Finality pruning: removes every column at or below `finalized_slot`, whole blocks at a
-    /// time and at most [`MAX_ROWS_PER_PRUNE_TXN`] rows per write transaction, yielding between
-    /// transactions. The first transaction also raises the finalized-slot watermark to
-    /// `finalized_slot` (it never lowers), after which [`Self::write_columns`] refuses those
-    /// slots. Also the backstop for orphans: any row left behind is removed once its slot
-    /// finalizes.
+    /// Finality and retention at once: removes every column at or below `finalized_slot`,
+    /// whole blocks at a time and at most [`MAX_ROWS_PER_PRUNE_TXN`] rows per write
+    /// transaction, yielding between transactions. The first transaction also raises the
+    /// finalized-slot watermark to `finalized_slot` and the retained-from slot to the slot after
+    /// it (neither lowers), after which [`Self::write_columns`] refuses those slots. A store that
+    /// keeps finalized columns for their retention window uses [`Self::finalize`] and
+    /// [`Self::prune_before`] instead.
     pub fn prune_finalized(&self, finalized_slot: u64) -> Result<PruneReport> {
         let mut orphans = lock(&self.column_ops);
         let mut report = PruneReport::default();
         loop {
             let (batch, more) = self.write_txn(Priority::Background, |txn| {
-                let advanced = raise_watermark(txn, finalized_slot)?;
+                let kept = raise_retained(txn, finalized_slot.saturating_add(1))?;
+                let advanced = raise_watermark(txn, finalized_slot)? || kept;
                 let (batch, more) = prune_finalized_batch(txn, finalized_slot)?;
                 Ok(if advanced || batch.blocks > 0 {
                     Commit::Yes((batch, more))
@@ -442,10 +448,132 @@ impl ColumnWriter {
         }
     }
 
+    /// Finality that keeps the finalized chain. `canonical` holds the blocks of the finalized
+    /// chain the caller knows, every one of them from `known_from` on (its record's first slot:
+    /// a block there that is not in `canonical` is off the chain), and maybe only the top of
+    /// it. The chain in the store is those that are stored above the watermark, and the stored
+    /// blocks their [`BlockLink::Parent`] links lead down to, as far as the watermark. Of the
+    /// stored blocks above the watermark and at or below `finalized_slot`:
+    ///
+    /// - a block on that chain stays: its columns are kept for their retention window
+    ///   ([`Self::prune_before`]);
+    /// - a block off it goes, one write transaction per block, if the chain is known down to
+    ///   the block's slot: the block is at or above `known_from`, or the links lead down to the
+    ///   watermark, or to a [`BlockLink::Start`] or a parent that retention pruned, below which
+    ///   the store holds no block of the chain;
+    /// - a block below a link that breaks the chain ([`BlockLink::Gap`],
+    ///   [`BlockLink::Pending`]), or any block with no block of the chain stored above the
+    ///   watermark, cannot be placed: it stays, and the contiguous-from slot rises to the break
+    ///   (the slot after `finalized_slot` with no block of the chain), so the store never claims
+    ///   it as served.
+    ///
+    /// The watermark then rises to `finalized_slot` in a last transaction. So a reader that sees
+    /// the new watermark sees every block at or below it, from the contiguous-from slot on, on
+    /// the finalized chain. Writes at or below the watermark are refused from then on. A
+    /// `finalized_slot` at or below the watermark does nothing.
+    pub fn finalize(
+        &self,
+        finalized_slot: u64,
+        canonical: &HashSet<BlockRoot>,
+        known_from: u64,
+    ) -> Result<PruneReport> {
+        let mut orphans = lock(&self.column_ops);
+        let watermark = self.reader.finalized_slot()?;
+        if watermark.is_some_and(|w| w >= finalized_slot) {
+            return Ok(PruneReport::default());
+        }
+        let from = watermark.map_or(0, |w| w.saturating_add(1));
+        let (chain, placed_from) = {
+            let snapshot = self.reader.snapshot()?;
+            stored_chain(&snapshot, canonical, from, finalized_slot)?
+        };
+        // From the caller's first slot on, its chain places every block itself.
+        let placed_from = placed_from.min(known_from.max(from));
+        let blocks = self
+            .reader
+            .snapshot()?
+            .columns_in_range(
+                from,
+                finalized_slot.saturating_add(1),
+                |_| false,
+                RangeBudget::unbounded(),
+            )?
+            .blocks;
+        let off_chain = |b: &&crate::reader::RangeBlock| !chain.contains(&b.block_root);
+        let unplaced = blocks
+            .iter()
+            .filter(off_chain)
+            .any(|b| b.slot < placed_from);
+        let off: Vec<_> = blocks
+            .iter()
+            .filter(off_chain)
+            .filter(|b| b.slot >= placed_from)
+            .collect();
+        let mut report = PruneReport::default();
+        for (i, block) in off.iter().enumerate() {
+            if i > 0 {
+                thread::yield_now();
+            }
+            let removed = self.write_txn(Priority::Background, |txn| {
+                Ok(match prune_block(txn, &block.block_root)? {
+                    Some(removed) => Commit::Yes(Some(removed)),
+                    None => Commit::No(None),
+                })
+            })?;
+            if let Some((_, columns)) = removed {
+                report.columns += columns;
+                report.blocks += 1;
+            }
+        }
+        self.write_txn(Priority::Background, |txn| {
+            // Before the watermark moves, so an env without the key keeps what it pruned.
+            keep_retained(txn)?;
+            if unplaced {
+                raise_contiguous(txn, placed_from)?;
+            }
+            raise_watermark(txn, finalized_slot)?;
+            Ok(Commit::Yes(()))
+        })?;
+        orphans.forget_finalized(finalized_slot);
+        Ok(report)
+    }
+
+    /// Retention pruning: removes every column below `slot`, finalized or not, whole blocks at
+    /// a time and at most [`MAX_ROWS_PER_PRUNE_TXN`] rows per write transaction, yielding
+    /// between transactions. The first transaction raises the retained-from slot to `slot` (it
+    /// never lowers), so a reader never sees a pruned column claimed. A `slot` at or below the
+    /// retained-from slot does nothing.
+    pub fn prune_before(&self, slot: u64) -> Result<PruneReport> {
+        let _ops = lock(&self.column_ops);
+        let mut report = PruneReport::default();
+        let Some(last) = slot.checked_sub(1) else {
+            return Ok(report);
+        };
+        loop {
+            let (batch, more) = self.write_txn(Priority::Background, |txn| {
+                let advanced = raise_retained(txn, slot)?;
+                let (batch, more) = prune_finalized_batch(txn, last)?;
+                Ok(if advanced || batch.blocks > 0 {
+                    Commit::Yes((batch, more))
+                } else {
+                    Commit::No((batch, more))
+                })
+            })?;
+            report.columns += batch.columns;
+            report.blocks += batch.blocks;
+            if !more {
+                return Ok(report);
+            }
+            thread::yield_now();
+        }
+    }
+
     /// Settles every block stored [`BlockLink::Pending`] at a slot below `before_slot` whose
-    /// root never came: a [`BlockLink::Start`] if finality covers the target's slot by now
-    /// (nothing before it is to be held), else a [`BlockLink::Gap`], raising the
-    /// contiguous-from slot to the block's slot. Returns how many were settled.
+    /// root never came: a [`BlockLink::Start`] if the target's slot is below the retained-from
+    /// slot by now (it was pruned, and nothing before it is to be held), else a
+    /// [`BlockLink::Gap`], raising the contiguous-from slot to the block's slot. A target at or
+    /// below the watermark that was never stored will never come: its writes are refused.
+    /// Returns how many were settled.
     pub fn settle_pending(&self, before_slot: u64) -> Result<usize> {
         let mut orphans = lock(&self.column_ops);
         let due: Vec<(BlockRoot, BlockRoot, u64)> = orphans
@@ -462,7 +590,7 @@ impl ColumnWriter {
             return Ok(0);
         }
         let settled = self.write_txn(Priority::Background, |txn| {
-            let finalized = meta_u64(txn, FINALIZED_SLOT_KEY)?;
+            let retained = retained_from(txn)?;
             let mut settled = 0;
             for (target, child, slot) in &due {
                 let Some(BlockLink::Pending(stored, target_slot)) = stored_link(txn, child)? else {
@@ -471,7 +599,7 @@ impl ColumnWriter {
                 if stored != *target {
                     continue;
                 }
-                if finalized.is_some_and(|f| target_slot <= f) {
+                if retained.is_some_and(|r| target_slot < r) {
                     put_link(txn, child, BlockLink::Start)?;
                 } else {
                     put_link(txn, child, BlockLink::Gap)?;
@@ -617,6 +745,86 @@ fn refuse_decrease(txn: &RwTxn<'_>, cgc: u64) -> Result<()> {
     }
 }
 
+/// The blocks of the finalized chain stored at or above `from` (see
+/// [`ColumnWriter::finalize`]): those of `canonical`, and the stored blocks their parent links
+/// lead down to. Also the slot from which every block of the chain up to `finalized_slot` is
+/// known: `from` if the links lead down to the watermark, a [`BlockLink::Start`] or a parent no
+/// longer stored; the slot of the block whose link breaks the chain; or the slot after
+/// `finalized_slot` with no block of the chain stored at or above `from`.
+fn stored_chain(
+    snapshot: &crate::reader::Snapshot<'_>,
+    canonical: &HashSet<BlockRoot>,
+    from: u64,
+    finalized_slot: u64,
+) -> Result<(HashSet<BlockRoot>, u64)> {
+    let mut chain = HashSet::new();
+    let mut lowest: Option<(u64, BlockRoot)> = None;
+    for root in canonical {
+        if let Some(slot) = snapshot.slot_of(root)?.filter(|&slot| slot >= from) {
+            chain.insert(*root);
+            if lowest.is_none_or(|(low, _)| slot < low) {
+                lowest = Some((slot, *root));
+            }
+        }
+    }
+    let Some((mut slot, mut root)) = lowest else {
+        return Ok((chain, finalized_slot.saturating_add(1)));
+    };
+    loop {
+        match snapshot.link_of(&root)? {
+            Some(BlockLink::Parent(parent)) => match snapshot.slot_of(&parent)? {
+                Some(parent_slot) if parent_slot >= from && parent_slot < slot => {
+                    chain.insert(parent);
+                    (slot, root) = (parent_slot, parent);
+                }
+                // At or below the watermark, or pruned by retention.
+                Some(parent_slot) if parent_slot < from => return Ok((chain, from)),
+                None => return Ok((chain, from)),
+                // A parent at or above its child: the links are not to be followed.
+                Some(_) => return Ok((chain, slot)),
+            },
+            Some(BlockLink::Start) => return Ok((chain, from)),
+            Some(BlockLink::Gap | BlockLink::Pending(..)) | None => return Ok((chain, slot)),
+        }
+    }
+}
+
+/// Writes the retained-from slot as the env reads it now ([`retained_from`]: for an env without
+/// the key, the slot after its watermark), or 0 with nothing pruned yet, if the key is absent;
+/// returns whether it wrote it.
+fn keep_retained(txn: &RwTxn<'_>) -> Result<bool> {
+    if meta_u64(txn, RETAINED_FROM_KEY)?.is_some() {
+        return Ok(false);
+    }
+    let slot = retained_from(txn)?.unwrap_or(0);
+    let meta = txn.open_table(Some(META_TABLE))?;
+    txn.put(
+        &meta,
+        RETAINED_FROM_KEY,
+        slot.to_be_bytes(),
+        WriteFlags::UPSERT,
+    )?;
+    Ok(true)
+}
+
+/// Raises the retained-from slot to `slot` (it never lowers), writing the key if it is absent;
+/// returns whether it wrote it.
+fn raise_retained(txn: &RwTxn<'_>, slot: u64) -> Result<bool> {
+    let current = retained_from(txn)?;
+    let target = current.map_or(slot, |current| current.max(slot));
+    if current == Some(target) && meta_u64(txn, RETAINED_FROM_KEY)?.is_some() {
+        return Ok(false);
+    }
+    let meta = txn.open_table(Some(META_TABLE))?;
+    txn.put(
+        &meta,
+        RETAINED_FROM_KEY,
+        target.to_be_bytes(),
+        WriteFlags::UPSERT,
+    )?;
+    Ok(true)
+}
+
 /// Raises the finalized-slot watermark to `finalized_slot`; returns whether it moved.
 fn raise_watermark(txn: &RwTxn<'_>, finalized_slot: u64) -> Result<bool> {
     if meta_u64(txn, FINALIZED_SLOT_KEY)?.is_some_and(|current| current >= finalized_slot) {
@@ -677,12 +885,12 @@ fn write_link(
     link: BlockLink,
     pending: &mut HashMap<BlockRoot, Vec<(BlockRoot, u64)>>,
 ) -> Result<()> {
-    let finalized = meta_u64(txn, FINALIZED_SLOT_KEY)?;
+    let retained = retained_from(txn)?;
     let link = match link {
         BlockLink::Pending(target, _) if stored_slot(txn, &target)?.is_some() => {
             BlockLink::Parent(target)
         }
-        BlockLink::Pending(_, target_slot) if finalized.is_some_and(|f| target_slot <= f) => {
+        BlockLink::Pending(_, target_slot) if retained.is_some_and(|r| target_slot < r) => {
             BlockLink::Start
         }
         other => other,
@@ -886,6 +1094,7 @@ mod tests {
     use crate::env::MIN_MAX_SIZE;
     use crate::sched::Priority;
     use crate::{keys::TABLES, Error, NUMBER_OF_COLUMNS, NUMBER_OF_CUSTODY_GROUPS};
+    use std::collections::HashSet;
 
     #[test]
     fn env_opens_with_max_tables() {
@@ -934,6 +1143,19 @@ mod tests {
             .map(|(&index, ssz)| Column { index, ssz })
             .collect();
         writer.write_columns(slot, root, &columns).unwrap()
+    }
+
+    /// [`write_block`], the block a start: nothing before it is to be held.
+    fn write_start(writer: &ColumnWriter, slot: u64, root: &BlockRoot, indices: &[u64]) {
+        let bytes: Vec<Vec<u8>> = indices.iter().map(|&i| sidecar(slot, i)).collect();
+        let columns: Vec<Column<'_>> = indices
+            .iter()
+            .zip(&bytes)
+            .map(|(&index, ssz)| Column { index, ssz })
+            .collect();
+        writer
+            .write_block_columns(slot, root, BlockLink::Start, &columns)
+            .unwrap();
     }
 
     fn write_linked(writer: &ColumnWriter, slot: u64, root: &BlockRoot, link: BlockLink) {
@@ -1394,6 +1616,257 @@ mod tests {
         );
         assert_eq!(reader.column_count().unwrap(), 1);
         assert_eq!(reader.block_count().unwrap(), 1);
+    }
+
+    /// Finality keeps the finalized chain: only the blocks at or below the finalized slot that
+    /// are off it go, and the watermark rises over what is left.
+    #[test]
+    fn finalize_removes_only_the_blocks_off_the_finalized_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let reader = writer.reader();
+        let (root_c, root_d) = ([0xcc; 32], [0xdd; 32]);
+        write_start(&writer, 3, &ROOT_A, &[0, 1]);
+        write_start(&writer, 4, &ROOT_B, &[5]);
+        write_start(&writer, 4, &root_c, &[6, 7]);
+        write_start(&writer, 5, &root_d, &[0]);
+        let canonical = HashSet::from([ROOT_A, root_c]);
+        let report = writer.finalize(4, &canonical, 5).unwrap();
+        assert_eq!(
+            report,
+            PruneReport {
+                columns: 1,
+                blocks: 1
+            }
+        );
+        assert_eq!(reader.slot_of(&ROOT_B).unwrap(), None);
+        for (root, slot) in [(ROOT_A, 3), (root_c, 4), (root_d, 5)] {
+            assert_eq!(reader.slot_of(&root).unwrap(), Some(slot));
+        }
+        assert_eq!(reader.finalized_slot().unwrap(), Some(4));
+        // Nothing was pruned for retention: canonical columns stay servable.
+        assert_eq!(reader.retained_from().unwrap(), Some(0));
+        assert_eq!(reader.contiguous_from().unwrap(), None);
+        // Writes at or below the watermark are refused, and finality never goes back.
+        let ssz = sidecar(4, 9);
+        let late = [Column {
+            index: 9,
+            ssz: &ssz,
+        }];
+        assert!(matches!(
+            writer.write_columns(4, &[0xee; 32], &late),
+            Err(Error::SlotFinalized { .. })
+        ));
+        assert_eq!(
+            writer.finalize(4, &HashSet::new(), 5).unwrap(),
+            PruneReport::default()
+        );
+        assert_eq!(reader.slot_of(&ROOT_A).unwrap(), Some(3));
+    }
+
+    /// The caller may know only the top of the finalized chain (a record that starts above the
+    /// watermark): the stored links lead from it down to the watermark, and every block on them
+    /// stays. Below a link that breaks the chain (a gap) the place of a block is not known: it
+    /// stays too, and the store claims nothing before the break. With no block of the chain
+    /// stored above the watermark, nothing can be placed, and nothing goes.
+    #[test]
+    fn finalize_keeps_the_stored_chain_below_the_blocks_it_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let reader = writer.reader();
+        let root = |n: u8| [n; 32];
+        write_linked(&writer, 3, &root(3), BlockLink::Start);
+        write_linked(&writer, 4, &root(4), BlockLink::Parent(root(3)));
+        write_linked(&writer, 5, &root(5), BlockLink::Parent(root(4)));
+        write_linked(&writer, 6, &root(6), BlockLink::Parent(root(5)));
+        // An orphan on 4, and one that starts a chain of its own.
+        write_linked(&writer, 5, &root(0x50), BlockLink::Parent(root(4)));
+        write_linked(&writer, 4, &root(0x40), BlockLink::Start);
+        let report = writer.finalize(6, &HashSet::from([root(6)]), 6).unwrap();
+        assert_eq!(report.blocks, 2);
+        for n in [3, 4, 5, 6] {
+            assert_eq!(reader.slot_of(&root(n)).unwrap(), Some(u64::from(n)), "{n}");
+        }
+        for orphan in [root(0x50), root(0x40)] {
+            assert_eq!(reader.slot_of(&orphan).unwrap(), None);
+        }
+        assert_eq!(reader.contiguous_from().unwrap(), None);
+        // Above the watermark: a gap at 9, and a block at 8 that is off the chain above the gap
+        // or on it below the gap; nobody can tell.
+        write_linked(&writer, 8, &root(8), BlockLink::Start);
+        write_linked(&writer, 9, &root(9), BlockLink::Gap);
+        write_linked(&writer, 10, &root(10), BlockLink::Parent(root(9)));
+        writer.finalize(10, &HashSet::from([root(10)]), 10).unwrap();
+        assert_eq!(reader.slot_of(&root(8)).unwrap(), Some(8), "kept");
+        assert_eq!(reader.contiguous_from().unwrap(), Some(9));
+        assert_eq!(reader.finalized_slot().unwrap(), Some(10));
+        // No block of the chain stored above the watermark: the block at 12 stays, and the
+        // store claims nothing up to the finalized slot.
+        write_linked(&writer, 12, &root(12), BlockLink::Start);
+        writer
+            .finalize(13, &HashSet::from([root(0x77)]), 14)
+            .unwrap();
+        assert_eq!(reader.slot_of(&root(12)).unwrap(), Some(12), "kept");
+        assert_eq!(reader.contiguous_from().unwrap(), Some(14));
+    }
+
+    /// A caller whose chain covers every slot from `known_from` places every block there: a
+    /// stored block at or above it off its chain is off the finalized chain, whether or not a
+    /// block of the chain is stored near it. So an orphan among canonical slots without
+    /// columns never raises the contiguous-from slot past the retained finalized history.
+    #[test]
+    fn finalize_places_every_block_from_the_callers_first_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let reader = writer.reader();
+        let root = |n: u8| [n; 32];
+        write_linked(&writer, 3, &root(3), BlockLink::Start);
+        for n in 4..=9 {
+            write_linked(
+                &writer,
+                u64::from(n),
+                &root(n),
+                BlockLink::Parent(root(n - 1)),
+            );
+        }
+        writer.finalize(9, &(3..=9).map(root).collect(), 3).unwrap();
+        // Slots 10 to 30 of the chain carry no blobs: none is stored. An orphan with blobs at 20.
+        let record: HashSet<BlockRoot> = (10..=30).map(|n| [0xa0 | (n & 0x1f); 32]).collect();
+        write_linked(&writer, 20, &root(0x20), BlockLink::Start);
+        writer.finalize(30, &record, 10).unwrap();
+        assert_eq!(reader.slot_of(&root(0x20)).unwrap(), None, "off the chain");
+        assert_eq!(reader.contiguous_from().unwrap(), None);
+        for n in 3..=9 {
+            assert_eq!(reader.slot_of(&root(n)).unwrap(), Some(u64::from(n)), "{n}");
+        }
+        // The chain's lowest stored block waits for its ancestor: the record still places the
+        // blocks from its first slot.
+        write_linked(&writer, 35, &root(0x35), BlockLink::Pending(root(0x34), 34));
+        write_linked(&writer, 33, &root(0x33), BlockLink::Start);
+        writer
+            .finalize(36, &HashSet::from([root(0x35), root(0x34)]), 31)
+            .unwrap();
+        assert_eq!(reader.slot_of(&root(0x33)).unwrap(), None, "off the chain");
+        assert_eq!(reader.slot_of(&root(0x35)).unwrap(), Some(35));
+        assert_eq!(reader.contiguous_from().unwrap(), None);
+    }
+
+    /// Each way the stored links end, with nothing placed by the caller: a block waiting for
+    /// its ancestor, a parent that retention pruned, and a parent at or above its child.
+    #[test]
+    fn finalize_follows_each_kind_of_link() {
+        let root = |n: u8| [n; 32];
+        let open = || {
+            let dir = tempfile::tempdir().unwrap();
+            let writer = ColumnWriter::open(dir.path()).unwrap();
+            (dir, writer)
+        };
+        // Pending: below the waiting block nothing is placed; the orphan stays, unclaimed.
+        let (_dir, writer) = open();
+        write_linked(&writer, 3, &root(3), BlockLink::Start);
+        write_linked(&writer, 5, &root(5), BlockLink::Pending(root(4), 4));
+        writer.finalize(5, &HashSet::from([root(5)]), 6).unwrap();
+        assert_eq!(writer.reader().slot_of(&root(3)).unwrap(), Some(3), "kept");
+        assert_eq!(writer.reader().contiguous_from().unwrap(), Some(5));
+        // A parent that retention pruned: nothing of the chain is held below it, and the
+        // orphan above it goes.
+        let (_dir, writer) = open();
+        write_linked(&writer, 3, &root(3), BlockLink::Start);
+        write_linked(&writer, 5, &root(5), BlockLink::Parent(root(3)));
+        writer.prune_before(4).unwrap();
+        write_linked(&writer, 4, &root(0x40), BlockLink::Start);
+        writer.finalize(5, &HashSet::from([root(5)]), 6).unwrap();
+        assert_eq!(
+            writer.reader().slot_of(&root(0x40)).unwrap(),
+            None,
+            "off the chain"
+        );
+        assert_eq!(writer.reader().slot_of(&root(5)).unwrap(), Some(5));
+        // A parent at or above its child: the links are not followed, and nothing below the
+        // child is placed.
+        let (_dir, writer) = open();
+        write_linked(&writer, 6, &root(6), BlockLink::Start);
+        write_linked(&writer, 5, &root(5), BlockLink::Parent(root(6)));
+        write_linked(&writer, 4, &root(0x40), BlockLink::Start);
+        writer.finalize(5, &HashSet::from([root(5)]), 6).unwrap();
+        assert_eq!(
+            writer.reader().slot_of(&root(0x40)).unwrap(),
+            Some(4),
+            "kept"
+        );
+        assert_eq!(writer.reader().contiguous_from().unwrap(), Some(5));
+    }
+
+    /// Retention pruning removes every column below a slot, finalized or not, and records the
+    /// slot it keeps from in its first transaction.
+    #[test]
+    fn prune_before_removes_the_slots_out_of_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let reader = writer.reader();
+        write_block(&writer, 3, &ROOT_A, &[0, 1]);
+        write_block(&writer, 4, &ROOT_B, &[5]);
+        write_block(&writer, 5, &[0xcc; 32], &[0]);
+        writer
+            .finalize(4, &HashSet::from([ROOT_A, ROOT_B]), 5)
+            .unwrap();
+        let report = writer.prune_before(5).unwrap();
+        assert_eq!(
+            report,
+            PruneReport {
+                columns: 3,
+                blocks: 2
+            }
+        );
+        assert_eq!(reader.retained_from().unwrap(), Some(5));
+        assert_eq!(reader.column_count().unwrap(), 1);
+        assert_eq!(
+            reader.first_stored_slot().unwrap(),
+            Some(3),
+            "a historical minimum"
+        );
+        // It never goes back.
+        assert_eq!(writer.prune_before(4).unwrap(), PruneReport::default());
+        assert_eq!(reader.retained_from().unwrap(), Some(5));
+        // Finality prunes everything at or below its slot and keeps from the slot after it.
+        writer.prune_finalized(9).unwrap();
+        assert_eq!(reader.retained_from().unwrap(), Some(10));
+    }
+
+    /// A pending target pruned for retention starts the chain; one at or below the finality
+    /// watermark that was never stored will never come, since its writes are refused: a gap.
+    #[test]
+    fn a_pending_target_kept_by_finality_but_never_stored_is_a_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let reader = writer.reader();
+        writer.finalize(10, &HashSet::new(), 11).unwrap();
+        write_linked(&writer, 12, &ROOT_B, BlockLink::Pending(ROOT_A, 10));
+        assert_eq!(writer.settle_pending(100).unwrap(), 1);
+        assert_eq!(reader.link_of(&ROOT_B).unwrap(), Some(BlockLink::Gap));
+        assert_eq!(reader.contiguous_from().unwrap(), Some(12));
+        writer.prune_before(11).unwrap();
+        write_linked(&writer, 14, &[0xcc; 32], BlockLink::Pending([0x11; 32], 10));
+        assert_eq!(reader.link_of(&[0xcc; 32]).unwrap(), Some(BlockLink::Start));
+    }
+
+    /// An env whose watermark was written before the retention slot was recorded pruned every
+    /// column at or below it: it is retained from the slot after it, and stays so once finality
+    /// moves on.
+    #[test]
+    fn an_env_finalized_before_retention_was_recorded_keeps_from_the_slot_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let reader = writer.reader();
+        {
+            let txn = writer.reader.db.begin_rw_txn().unwrap();
+            raise_watermark(&txn, 10).unwrap();
+            txn.commit().unwrap();
+        }
+        assert_eq!(reader.retained_from().unwrap(), Some(11));
+        writer.finalize(12, &HashSet::new(), 13).unwrap();
+        assert_eq!(reader.finalized_slot().unwrap(), Some(12));
+        assert_eq!(reader.retained_from().unwrap(), Some(11));
     }
 
     #[test]

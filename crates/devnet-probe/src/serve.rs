@@ -5,7 +5,10 @@
 //! - **cl-chain** ([`ChainSide`]): probe mode's column store ([`ColumnIngest`]: the reference
 //!   node vouches for each block root, cl-verify checks the cells by KZG, only custody columns
 //!   are kept, and the reference's `block` events announce its roots ahead of their columns,
-//!   [`ColumnIngest::follow_head`]), the column server over it ([`ColumnServer`]) and our Status
+//!   [`ColumnIngest::follow_head`]), the column server over it ([`ColumnServer`], its range
+//!   answers on the reference's canonical chain from the same events, and the store pruned of
+//!   the blocks off its finalized chain and of the columns out of retention by the wall clock:
+//!   `cl_chain::probe::CanonicalChain`) and our Status
 //!   ([`StatusProvider`], its `earliest_available_slot` the column server's), all on
 //!   `ethswarm.chain.v1.ReqRespService` ([`ReqRespServer`] mounted by [`ChainStub::serving`]).
 //!   It is served on a Unix socket of its own, `<socket root>/cl-chain/cl-chain.sock`, bound by
@@ -328,7 +331,8 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ChainSide<E, V> {
         registry: &mut Registry,
     ) -> Result<Self, String> {
         // Everything that can be checked first is, so a refused start leaves no store behind.
-        let clock = WallClock::new(devnet.probe_chain())?;
+        let clock: Arc<dyn cl_chain::reqresp::ServeClock> =
+            Arc::new(WallClock::new(devnet.probe_chain())?);
         let acl = chain_acl(plan.caller_uid)?;
         let dir = SocketDir::under(&plan.socket_root, CHAIN_SERVICE).map_err(|e| e.to_string())?;
         let (listener, guard) = ipc::uds::bind(&dir, Ownership::current())
@@ -369,14 +373,23 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ChainSide<E, V> {
         )
         .map_err(|e| format!("column ingest: {e}"))?;
         // The reference's block events seed its view: a root it imports is looked up before its
-        // columns arrive, so a flood of made-up roots cannot delay them.
-        ingest.follow_head(plan.reference.clone(), HeadFollow::default());
-        let columns = Arc::new(ColumnServer::new(
-            Arc::clone(&writer) as Arc<dyn ColumnStore>,
-            plan.node_id,
-            Arc::new(clock),
-            ServeBudget::default(),
-        ));
+        // columns arrive, so a flood of made-up roots cannot delay them. Its head, re-org and
+        // finality events keep its chain, which range answers follow, and with the wall clock
+        // they prune the store of the blocks off the finalized chain and out of retention.
+        ingest.follow_head(
+            plan.reference.clone(),
+            HeadFollow::default(),
+            Arc::clone(&clock),
+        );
+        let columns = Arc::new(
+            ColumnServer::new(
+                Arc::clone(&writer) as Arc<dyn ColumnStore>,
+                plan.node_id,
+                clock,
+                ServeBudget::default(),
+            )
+            .following(ingest.canonical()),
+        );
         let status = Arc::new(
             StatusProvider::new(plan.reference, devnet.probe_chain(), DEFAULT_API_TIMEOUT)
                 .serving_columns(Arc::clone(&columns) as Arc<dyn cl_chain::probe::ServedColumns>)
