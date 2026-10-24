@@ -51,6 +51,8 @@ hex = "0.4"
 
 [dev-dependencies]
 devnet-probe = { path = ".", features = ["test-support"] }
+# The fixture devnet's helpers (ipc::testkit::devnet): network files written with mode 0644.
+ipc = { path = "../ipc", features = ["testkit"] }
 # The stand-in reference CL that serves blocks: cl-p2p's scripted loopback peer.
 cl-p2p = { path = "../cl-p2p", features = ["testkit"] }
 p2p-wire = { path = "../p2p-wire", features = ["testkit"] }

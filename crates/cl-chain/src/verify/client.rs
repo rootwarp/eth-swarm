@@ -10,25 +10,34 @@
 //!
 //! One VerifyKzg stream at a time. It is opened at the first call: our hello first, then
 //! cl-verify's, compared in full ([`ipc::hello::negotiate`]) and carrying the stream's server
-//! generation. Every request is fenced with it ([`ipc::deadline::Calls`]): its `request_id`, the
-//! generation, and a response settled only through its fence. cl-verify fails a stream whose
-//! `request_id` does not increase, so a call holds the stream's send lock from reserving its
-//! frame's place on the stream until the frame is sent, and only then waits for its verdict. It
-//! takes its id only once that place is reserved, and sends without waiting: a call that is
-//! cancelled, or runs out of time, before its send holds no id. A call dropped after its send
-//! keeps its id until cl-verify's answer settles it, as one past its deadline does; cl-verify
+//! generation. A network client ([`KzgClient::network`]) computes its hello again at each
+//! stream open, with the fork digest of the wall clock at that time ([`NetworkHello::at`]), as
+//! cl-verify does. So a stream opened after a fork or BPO epoch carries the new digest. We read
+//! the clock before the hello goes out and cl-verify reads its clock after the hello comes in,
+//! so a boundary between the two reads refuses the stream with `VERSION_MISMATCH`. The client
+//! then reads its clock again and, if the digest changed, opens again one time within the same
+//! deadline. Before genesis or Fulu there is no digest, and the call is no verdict without a
+//! stream.
+//!
+//! Every request is fenced with the stream's generation ([`ipc::deadline::Calls`]): its
+//! `request_id`, the generation, and a response settled only through its fence. cl-verify fails a
+//! stream whose `request_id` does not increase, so a call holds the stream's send lock from
+//! reserving its frame's place on the stream until the frame is sent, and only then waits for its
+//! verdict. It takes its id only once that place is reserved, and sends without waiting: a call
+//! that is cancelled, or runs out of time, before its send holds no id. A call dropped after its
+//! send keeps its id until cl-verify's answer settles it, as one past its deadline does; cl-verify
 //! answers every request it reads (`DEADLINE_EXCEEDED` when too late). A reader task delivers the
 //! responses; when the stream ends, errs or breaks the contract, every call on it fails as
 //! [`KzgOutcome::NoVerdict`] and the next call opens a new stream. At most
-//! [`DEFAULT_MAX_OUTSTANDING`] requests are in flight on a stream; a call past that is no
-//! verdict, never queued without bound. A request whose deadline passed still counts until its
-//! late answer arrives ([`ipc::fence::Outstanding`]), so a cl-verify that stops answering makes
-//! every call no verdict until it answers again or the stream ends.
+//! [`DEFAULT_MAX_OUTSTANDING`] requests are in flight on a stream; a call past that is no verdict,
+//! never queued without bound. A request whose deadline passed still counts until its late answer
+//! arrives ([`ipc::fence::Outstanding`]), so a cl-verify that stops answering makes every call no
+//! verdict until it answers again or the stream ends.
 //!
 //! Each call carries its deadline twice: on the wire (`deadline_unix_ms`, so cl-verify drops work
 //! it cannot finish in time) and locally, over the whole call, the stream's opening included.
 
-use ethswarm_proto::common::Hello;
+use ethswarm_proto::common::{ErrorCode, Hello};
 use ethswarm_proto::verify::verify_service_client::VerifyServiceClient;
 use ethswarm_proto::verify::{
     verify_kzg_request, verify_kzg_response, KzgCellProof, VerifyKzgRequest, VerifyKzgRequestBody,
@@ -36,7 +45,7 @@ use ethswarm_proto::verify::{
 };
 use ipc::deadline::{Calls, FenceMetrics, Ignored};
 use ipc::fence::FencedRequest;
-use ipc::hello::{negotiate, Generation, API_VERSION_V1};
+use ipc::hello::{negotiate, Generation, NetworkHello, API_VERSION_V1};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -115,10 +124,36 @@ fn outbound_frames(
     ReceiverStream::new(outbound).map(|frame| frame.request)
 }
 
+/// Unix milliseconds of a wall clock.
+pub type UnixClock = Arc<dyn Fn() -> u128 + Send + Sync>;
+
+/// The hello a client opens each stream with.
+enum OurHello {
+    /// The same hello on every stream.
+    Fixed(Hello),
+    /// The network's hello at the time of `clock` when the stream opens.
+    Network {
+        network: Arc<NetworkHello>,
+        clock: UnixClock,
+    },
+}
+
+impl OurHello {
+    /// The hello for a stream that opens now.
+    fn now(&self) -> Result<Hello, String> {
+        match self {
+            Self::Fixed(hello) => Ok(hello.clone()),
+            Self::Network { network, clock } => network
+                .at(clock())
+                .map_err(|e| format!("no fork digest yet: {e}")),
+        }
+    }
+}
+
 /// cl-chain's VerifyKzg client (see the module docs).
 pub struct KzgClient {
     client: VerifyServiceClient<Channel>,
-    hello: Hello,
+    hello: OurHello,
     max_outstanding: usize,
     metrics: Arc<FenceMetrics>,
     stream: Mutex<Option<KzgStream>>,
@@ -253,9 +288,32 @@ impl std::ops::Drop for KzgStream {
 }
 
 impl KzgClient {
-    /// A client that opens its stream on `client` with `hello` at the first call.
+    /// A client that opens each stream on `client` with the same `hello`. Its
+    /// `current_fork_digest` does not follow the clock, so use it only for a link without a
+    /// network; a client of a network is [`Self::network`].
     #[must_use]
     pub fn new(client: VerifyServiceClient<Channel>, hello: Hello) -> Self {
+        Self::with_hello(client, OurHello::Fixed(hello))
+    }
+
+    /// A client that opens each stream on `client` with `network`'s hello at the system clock
+    /// when the stream opens.
+    #[must_use]
+    pub fn network(client: VerifyServiceClient<Channel>, network: Arc<NetworkHello>) -> Self {
+        Self::network_with_clock(client, network, Arc::new(|| u128::from(now_unix_ms())))
+    }
+
+    /// [`Self::network`] on `clock` (Unix milliseconds) in place of the system clock.
+    #[must_use]
+    pub fn network_with_clock(
+        client: VerifyServiceClient<Channel>,
+        network: Arc<NetworkHello>,
+        clock: UnixClock,
+    ) -> Self {
+        Self::with_hello(client, OurHello::Network { network, clock })
+    }
+
+    fn with_hello(client: VerifyServiceClient<Channel>, hello: OurHello) -> Self {
         Self {
             client,
             hello,
@@ -293,40 +351,64 @@ impl KzgClient {
             return Ok(stream.link.clone());
         }
         *slot = None;
-        let stream = self.open().await?;
+        let ours = self.hello.now()?;
+        let stream = match self.open(&ours).await {
+            Ok(stream) => stream,
+            // Our clock was read before the hello went out, cl-verify's after it came in: a
+            // boundary in between refuses the stream. Read the clock again, and open again one
+            // time if the digest changed. The caller's deadline covers both opens.
+            Err(refused) if refused.version_mismatch => {
+                let again = self.hello.now()?;
+                if again.current_fork_digest == ours.current_fork_digest {
+                    return Err(refused.why);
+                }
+                tracing::debug!(
+                    why = %refused.why,
+                    "VerifyKzg refused across a digest change; opening again"
+                );
+                self.open(&again).await.map_err(|e| e.why)?
+            }
+            Err(failed) => return Err(failed.why),
+        };
         let link = stream.link.clone();
         *slot = Some(stream);
         Ok(link)
     }
 
-    /// Opens a stream: our hello, then cl-verify's, compared in full.
-    async fn open(&self) -> Result<KzgStream, String> {
+    /// Opens a stream: `ours`, then cl-verify's hello, compared in full.
+    async fn open(&self, ours: &Hello) -> Result<KzgStream, OpenFailure> {
         let (requests, outbound) = mpsc::channel(self.max_outstanding);
         let hello = VerifyKzgRequest {
-            frame: Some(verify_kzg_request::Frame::Hello(self.hello.clone())),
+            frame: Some(verify_kzg_request::Frame::Hello(ours.clone())),
         };
         requests
             .send(hello.into())
             .await
-            .map_err(|_| "the VerifyKzg stream is closed".to_owned())?;
+            .map_err(|_| OpenFailure::other("the VerifyKzg stream is closed"))?;
         let mut responses = self
             .client
             .clone()
             .verify_kzg(outbound_frames(outbound))
             .await
-            .map_err(|s| format!("VerifyKzg: {s}"))?
+            .map_err(|s| OpenFailure::status(&s))?
             .into_inner();
         let first = responses
             .message()
             .await
-            .map_err(|s| format!("VerifyKzg: {s}"))?
-            .ok_or("VerifyKzg ended before cl-verify's hello")?;
+            .map_err(|s| OpenFailure::status(&s))?
+            .ok_or_else(|| OpenFailure::other("VerifyKzg ended before cl-verify's hello"))?;
         let Some(verify_kzg_response::Frame::Hello(server)) = first.frame else {
             tracing::warn!("contract violation: cl-verify's first VerifyKzg frame is not hello");
-            return Err("cl-verify's first VerifyKzg frame is not hello".into());
+            return Err(OpenFailure::other(
+                "cl-verify's first VerifyKzg frame is not hello",
+            ));
         };
-        negotiate(&self.hello, &server, API_VERSION_V1).map_err(|e| e.to_string())?;
-        let generation = Generation::from_hello(&server).map_err(|e| e.to_string())?;
+        negotiate(ours, &server, API_VERSION_V1).map_err(|e| OpenFailure {
+            version_mismatch: e.code() == ErrorCode::VersionMismatch,
+            why: e.to_string(),
+        })?;
+        let generation =
+            Generation::from_hello(&server).map_err(|e| OpenFailure::other(e.to_string()))?;
         let calls =
             Calls::with_metrics(generation, self.max_outstanding, Arc::clone(&self.metrics));
         let requests = Requests::new(requests);
@@ -339,6 +421,32 @@ impl KzgClient {
             },
             reader,
         })
+    }
+}
+
+/// Why a stream did not open.
+struct OpenFailure {
+    /// For the log and the no-verdict reason.
+    why: String,
+    /// The hellos differ (`ERROR_CODE_VERSION_MISMATCH`, from cl-verify or from our check).
+    version_mismatch: bool,
+}
+
+impl OpenFailure {
+    fn other(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            version_mismatch: false,
+        }
+    }
+
+    /// The status cl-verify failed the stream with, by its `common.v1.Error`.
+    fn status(status: &tonic::Status) -> Self {
+        let err = ipc::error::error_from_status(status);
+        Self {
+            why: format!("VerifyKzg: {:?}: {}", err.code(), err.detail),
+            version_mismatch: err.code() == ErrorCode::VersionMismatch,
+        }
     }
 }
 
@@ -437,7 +545,9 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{blobs, ClVerify, Stub, StubVerify};
+    use crate::testing::{blobs, ClVerify, ManualClock, Served, Stub, StubVerify};
+    use cl_verify::handshake::Handshake;
+    use ipc::testkit::devnet::{devnet_hello, devnet_ms};
     use std::time::Instant;
 
     const TIMEOUT: Duration = Duration::from_secs(10);
@@ -793,6 +903,129 @@ mod tests {
         let client = served.kzg_client().await;
         let outcome = client.verify_cells(column(1), TIMEOUT).await;
         assert!(matches!(outcome, KzgOutcome::NoVerdict(_)), "{outcome:?}");
+    }
+
+    /// cl-verify checks each stream's hello against the digest of its clock at the stream open.
+    /// Slot 8 of the devnet is epoch 1, after a blob change: another digest.
+    fn across_a_digest_change(clock: &Arc<ManualClock>) -> Served {
+        clock.set(devnet_ms(0));
+        let ours = Handshake::network(devnet_hello("cl-verify/test"), 1);
+        StubVerify::start_network(Stub::HangsUp, ours, Arc::clone(clock))
+    }
+
+    #[tokio::test]
+    async fn a_network_client_sends_the_digest_of_each_stream_open() {
+        let clock = ManualClock::at(0);
+        let served = across_a_digest_change(&clock);
+        let client = served
+            .network_kzg_client(devnet_hello("cl-chain/test"), Arc::clone(&clock))
+            .await;
+        // Each stream ends at its first request, so each call opens a new stream.
+        let first = client.verify_cells(column(1), TIMEOUT).await;
+        assert!(matches!(first, KzgOutcome::NoVerdict(_)), "{first:?}");
+        clock.set(devnet_ms(8));
+        let second = client.verify_cells(column(1), TIMEOUT).await;
+        assert!(matches!(second, KzgOutcome::NoVerdict(_)), "{second:?}");
+        let digest = |slot| {
+            devnet_hello("x")
+                .at(u128::from(devnet_ms(slot)))
+                .unwrap()
+                .current_fork_digest
+        };
+        assert_ne!(digest(0), digest(8));
+        assert_eq!(served.handshakes(), [Ok(digest(0)), Ok(digest(8))]);
+    }
+
+    /// The hello of the client's start, sent again after a digest change, is refused: why a
+    /// production client opens each stream with the hello of the clock.
+    #[tokio::test]
+    async fn a_fixed_hello_is_refused_after_a_digest_change() {
+        let clock = ManualClock::at(0);
+        let served = across_a_digest_change(&clock);
+        let channel = ipc::uds::connect_path(&served.socket, crate::testing::my_uid())
+            .await
+            .unwrap();
+        let start = devnet_hello("cl-chain/test")
+            .at(u128::from(devnet_ms(0)))
+            .unwrap();
+        let client = KzgClient::new(VerifyServiceClient::new(channel), start);
+        let _ = client.verify_cells(column(1), TIMEOUT).await;
+        clock.set(devnet_ms(8));
+        let refused = client.verify_cells(column(1), TIMEOUT).await;
+        assert!(matches!(refused, KzgOutcome::NoVerdict(_)), "{refused:?}");
+        let handshakes = served.handshakes();
+        assert!(handshakes[0].is_ok(), "{handshakes:?}");
+        assert_eq!(handshakes[1], Err(ErrorCode::VersionMismatch));
+    }
+
+    /// The client reads its clock before it sends its hello, and cl-verify reads its own after
+    /// it receives the hello. A boundary between the two reads gives `VERSION_MISMATCH`; the
+    /// client then reads its clock again, finds another digest and opens again, one time.
+    #[tokio::test]
+    async fn a_stream_refused_across_a_digest_change_is_opened_again() {
+        let clock = ManualClock::at(0);
+        let served = across_a_digest_change(&clock);
+        clock.set(devnet_ms(8) - 1);
+        let jumped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reads = Arc::clone(&clock);
+        let client_clock: UnixClock = Arc::new(move || {
+            let now = reads.0.load(std::sync::atomic::Ordering::SeqCst);
+            // The boundary passes right after the first read.
+            if !jumped.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                reads.set(devnet_ms(8));
+            }
+            u128::from(now)
+        });
+        let client = served
+            .network_kzg_client_on(devnet_hello("cl-chain/test"), client_clock)
+            .await;
+        let outcome = client.verify_cells(column(1), TIMEOUT).await;
+        assert!(matches!(outcome, KzgOutcome::NoVerdict(_)), "{outcome:?}");
+        let digest_8 = devnet_hello("x")
+            .at(u128::from(devnet_ms(8)))
+            .unwrap()
+            .current_fork_digest;
+        assert_eq!(
+            served.handshakes(),
+            [Err(ErrorCode::VersionMismatch), Ok(digest_8)]
+        );
+    }
+
+    /// A `VERSION_MISMATCH` with the same digest on the next clock read is not tried again:
+    /// the hellos differ for good.
+    #[tokio::test]
+    async fn a_mismatch_without_a_digest_change_is_not_tried_again() {
+        let clock = ManualClock::at(devnet_ms(0));
+        let theirs = Handshake::network(devnet_hello("cl-verify/test"), 1);
+        let served = StubVerify::start_network(Stub::HangsUp, theirs, Arc::clone(&clock));
+        let client = served
+            .network_kzg_client(
+                ipc::testkit::devnet::kurtosis_hello("cl-chain/test"),
+                Arc::clone(&clock),
+            )
+            .await;
+        match client.verify_cells(column(1), TIMEOUT).await {
+            KzgOutcome::NoVerdict(why) => assert!(why.contains("VersionMismatch"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(served.handshakes(), [Err(ErrorCode::VersionMismatch)]);
+        assert_eq!(served.streams_opened(), 1);
+    }
+
+    /// Before genesis there is no fork digest: no stream opens and the call is no verdict.
+    #[tokio::test]
+    async fn a_network_client_before_genesis_opens_no_stream() {
+        let clock = ManualClock::at(0);
+        let served = across_a_digest_change(&clock);
+        let client = served
+            .network_kzg_client(devnet_hello("cl-chain/test"), Arc::clone(&clock))
+            .await;
+        clock.set(devnet_ms(0) - 1);
+        match client.verify_cells(column(1), TIMEOUT).await {
+            KzgOutcome::NoVerdict(why) => assert!(why.contains("no fork digest"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(served.streams_opened(), 0);
     }
 
     #[test]

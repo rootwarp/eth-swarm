@@ -17,6 +17,7 @@
 //! names our UID or another one: the kernel credentials of the connection (over UDS) or this
 //! process's credentials read from a socket pair (in process) are what the ACL checks.
 
+pub mod devnet;
 pub mod fixture;
 pub mod probe;
 pub mod suite;

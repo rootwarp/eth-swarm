@@ -27,8 +27,9 @@ use cl_verify::startup::{
 };
 use common::*;
 use crypto_kzg::{SetupError, BETA4_MAINNET_SHA256};
-use ipc::hello::NetworkHello;
-use network_config::{ChainConfig, Genesis};
+use ipc::testkit::devnet::{
+    devnet_genesis_state, kurtosis_hello, write_network_file, KURTOSIS_CONFIG, KURTOSIS_MAX_BLOBS,
+};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -413,49 +414,20 @@ async fn shutdown_flushes_a_dirty_snapshot_within_the_drain_timeout() {
 
 // ---- the real binary ----
 
-/// A devnet as the Kurtosis genesis generator writes it: Fulu from genesis, a blob change to 12
-/// at epoch 1, Gloas at epoch 2, minimal preset with 6 s slots.
-const DEVNET_CONFIG: &str = "\
-PRESET_BASE: 'minimal'
-CONFIG_NAME: 'fixture-devnet'
-GENESIS_FORK_VERSION: 0x00000001
-ELECTRA_FORK_EPOCH: 0
-FULU_FORK_VERSION: 0x60000001
-FULU_FORK_EPOCH: 0
-GLOAS_FORK_VERSION: 0x70000001
-GLOAS_FORK_EPOCH: 2
-SLOT_DURATION_MS: 6000
-MAX_PAYLOAD_SIZE: 10485760
-MAX_BLOBS_PER_BLOCK_ELECTRA: 9
-BLOB_SCHEDULE:
-  - EPOCH: 1
-    MAX_BLOBS_PER_BLOCK: 12
-";
-
-/// The devnet's genesis, in the past, so the clock is in Gloas.
-const DEVNET_GENESIS: Genesis = Genesis {
-    genesis_time: 1_760_800_000,
-    genesis_validators_root: [0x42; 32],
-};
-
-/// Writes the devnet's `config.yaml` and `genesis.ssz` to `dir/net` and returns that directory.
+/// Writes the `config.yaml` (the shape of our Kurtosis devnet: Fulu and Gloas at epoch 0) and
+/// `genesis.ssz` of the devnet to `dir/net`, mode 0644, and returns that directory.
 fn network_dir(dir: &Path) -> std::path::PathBuf {
     let net = dir.join("net");
     std::fs::create_dir_all(&net).unwrap();
-    std::fs::write(net.join("config.yaml"), DEVNET_CONFIG).unwrap();
-    let mut state = DEVNET_GENESIS.genesis_time.to_le_bytes().to_vec();
-    state.extend_from_slice(&DEVNET_GENESIS.genesis_validators_root);
-    state.extend_from_slice(&[0xee; 256]);
-    std::fs::write(net.join("genesis.ssz"), state).unwrap();
+    write_network_file(net.join("config.yaml"), KURTOSIS_CONFIG);
+    write_network_file(net.join("genesis.ssz"), devnet_genesis_state(256));
     net
 }
 
 /// The hello cl-chain's side of the verify.v1 link sends for the devnet now: the network hello
 /// of the same files, the way the probe builds it.
 fn chain_hello() -> Hello {
-    let config = ChainConfig::from_devnet_yaml(DEVNET_CONFIG.as_bytes()).unwrap();
-    NetworkHello::new("devnet-probe/test", &config, DEVNET_GENESIS)
-        .unwrap()
+    kurtosis_hello("devnet-probe/test")
         .at(u128::from(cl_verify::wire::now_unix_ms()))
         .unwrap()
 }
@@ -685,7 +657,8 @@ fn binary_sigint_exits_0_and_removes_the_socket() {
 
 /// The binary's hello from `--network-dir` is what cl-chain's side sends for the same files:
 /// the handshake passes (no `VERSION_MISMATCH`), and the KZG cell cap is one block at the
-/// devnet's largest blob count (12), not 0.
+/// devnet's largest blob count (21), not 0. The devnet has the shape of our Kurtosis devnet:
+/// Fulu and Gloas at epoch 0.
 #[tokio::test(flavor = "multi_thread")]
 async fn binary_hello_from_the_network_dir_matches_cl_chain_and_caps_kzg_by_its_blobs() {
     let dir = tempfile::tempdir().unwrap();
@@ -730,7 +703,7 @@ async fn binary_hello_from_the_network_dir_matches_cl_chain_and_caps_kzg_by_its_
         cell: vec![],
         proof: vec![],
     };
-    let max = MAX_KZG_COLUMNS * 12;
+    let max = MAX_KZG_COLUMNS * KURTOSIS_MAX_BLOBS as usize;
     kzg.send(kzg_body(VerifyKzgRequestBody {
         request_id: 1,
         cells: (0..max).map(cell).collect(),

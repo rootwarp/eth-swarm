@@ -10,7 +10,8 @@
 
 use cl_chain::probe::ProbeChain;
 use cl_p2p::m2a_session::PinnedPeer;
-use consensus_types::{EthSpec, Mainnet, Minimal};
+use consensus_types::EthSpec;
+use ipc::hello::NetworkHello;
 use libp2p::multiaddr::Protocol;
 use network_config::digest::{compute_fork_digest, current_epoch, DigestError};
 use network_config::network_dir;
@@ -21,24 +22,22 @@ use p2p_wire::rpc::codec::ContextTable;
 use p2p_wire::rpc::messages::ForkDigest;
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::Arc;
 
 pub use network_config::network_dir::{GENESIS_PREFIX_BYTES, MAX_CONFIG_BYTES};
 
-/// The preset a devnet's `PRESET_BASE` names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Preset {
-    /// `minimal`: 8-slot epochs, what the Kurtosis devnet runs.
-    Minimal,
-    /// `mainnet`: 32-slot epochs.
-    Mainnet,
-}
+/// The preset a devnet's `PRESET_BASE` names ([`ipc::hello::Preset`]).
+pub use ipc::hello::Preset;
 
-/// A devnet: its config, its genesis and its preset.
+/// The build string of the probe's hellos.
+const BUILD: &str = concat!("devnet-probe/", env!("CARGO_PKG_VERSION"));
+
+/// A devnet: its config, its genesis and its network hello, which gives its preset.
 #[derive(Debug, Clone)]
 pub struct Devnet {
     config: ChainConfig,
     genesis: Genesis,
-    preset: Preset,
+    network: Arc<NetworkHello>,
 }
 
 impl Devnet {
@@ -46,22 +45,16 @@ impl Devnet {
     ///
     /// # Errors
     ///
-    /// The config does not parse, or its `PRESET_BASE` is neither `minimal` nor `mainnet`.
+    /// The config does not parse, or it gives no network hello ([`NetworkHello::new`]): its
+    /// `PRESET_BASE` is neither `minimal` nor `mainnet`, its `SLOT_DURATION_MS` is 0, or it
+    /// schedules no Fulu.
     pub fn new(config_yaml: &[u8], genesis: Genesis) -> Result<Self, String> {
         let config = ChainConfig::from_devnet_yaml(config_yaml).map_err(|e| e.to_string())?;
-        let preset = match config.preset_base() {
-            p if p == Minimal::NAME => Preset::Minimal,
-            p if p == Mainnet::NAME => Preset::Mainnet,
-            other => {
-                return Err(format!(
-                    "PRESET_BASE {other:?} is neither minimal nor mainnet"
-                ))
-            }
-        };
+        let network = NetworkHello::new(BUILD, &config, genesis).map_err(|e| e.to_string())?;
         Ok(Self {
             config,
             genesis,
-            preset,
+            network: Arc::new(network),
         })
     }
 
@@ -80,16 +73,21 @@ impl Devnet {
     /// The preset `PRESET_BASE` names.
     #[must_use]
     pub fn preset(&self) -> Preset {
-        self.preset
+        self.network.preset()
     }
 
     /// `SLOTS_PER_EPOCH` of the preset.
     #[must_use]
     pub fn slots_per_epoch(&self) -> u64 {
-        match self.preset {
-            Preset::Minimal => Minimal::slots_per_epoch(),
-            Preset::Mainnet => Mainnet::slots_per_epoch(),
-        }
+        self.network.slots_per_epoch()
+    }
+
+    /// The network hello of the devnet, sent with the probe's build: the hello of its chain.v1
+    /// and verify.v1 links. cl-verify builds its own from the same files in the same way, so
+    /// the two differ only in `build`.
+    #[must_use]
+    pub fn network(&self) -> &Arc<NetworkHello> {
+        &self.network
     }
 
     /// The wall-clock epoch at `now_ms` (Unix milliseconds).
@@ -224,6 +222,8 @@ pub fn parse_peer(text: &str) -> Result<PinnedPeer, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use consensus_types::Minimal;
+    use ipc::testkit::devnet::write_network_file;
     use network_config::digest::digest_schedule;
     use testkit::export_blocks::fixtures::{CONFIG, GENESIS_TIME};
 
@@ -260,11 +260,11 @@ mod tests {
     fn the_genesis_file_is_read_by_its_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("genesis.ssz");
-        std::fs::write(&path, state_prefix(GENESIS_TIME, GVR, 4096)).unwrap();
+        write_network_file(&path, state_prefix(GENESIS_TIME, GVR, 4096));
         assert_eq!(read_genesis(&path).unwrap(), genesis());
         let missing = dir.path().join("missing.ssz");
         assert!(read_genesis(&missing).unwrap_err().contains("missing.ssz"));
-        std::fs::write(&path, [1, 2, 3]).unwrap();
+        write_network_file(&path, [1, 2, 3]);
         assert!(read_genesis(&path).unwrap_err().contains("3 bytes"));
     }
 
@@ -284,15 +284,20 @@ mod tests {
         assert!(err.contains("gnosis"), "{err}");
         let broken = CONFIG.replace("FULU_FORK_EPOCH: 0", "FULU_FORK_EPOCH: x");
         assert!(Devnet::new(broken.as_bytes(), genesis()).is_err());
+        // The preset is the network hello's, so a config without a hello is refused too.
+        let zero = CONFIG.replace("SLOT_DURATION_MS: 6000", "SLOT_DURATION_MS: 0");
+        let err = Devnet::new(zero.as_bytes(), genesis()).unwrap_err();
+        assert!(err.contains("SLOT_DURATION_MS"), "{err}");
+        assert_eq!(devnet.network().preset(), devnet.preset());
     }
 
     #[test]
     fn the_config_file_is_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
-        std::fs::write(&path, CONFIG).unwrap();
+        write_network_file(&path, CONFIG);
         assert_eq!(read_config(&path).unwrap(), CONFIG.as_bytes());
-        std::fs::write(&path, vec![b'#'; MAX_CONFIG_BYTES as usize + 1]).unwrap();
+        write_network_file(&path, vec![b'#'; MAX_CONFIG_BYTES as usize + 1]);
         assert!(read_config(&path).unwrap_err().contains("over"));
         assert!(read_config(&dir.path().join("none.yaml")).is_err());
     }

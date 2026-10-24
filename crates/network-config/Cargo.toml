@@ -10,6 +10,10 @@ description = "Pinned eth-clients network configs, the Fulu/Gloas fork schedule 
 [dependencies]
 sha2 = "0.10"
 thiserror = "2"
+# The network files are opened with O_NOFOLLOW | O_NONBLOCK and their owner is checked against
+# the effective UID (geteuid): the version and features node-key and svc-runtime use, already in
+# Cargo.lock.
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 proptest = "1"

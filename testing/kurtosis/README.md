@@ -151,6 +151,7 @@ curl -s "$cl/eth/v1/config/spec" | jq '.data | {PRESET_BASE, GLOAS_FORK_VERSION,
 
 # The generated network config (config.yaml, genesis.ssz, the EL genesis.json, ...):
 kurtosis files download ethswarm-gloas el_cl_genesis_data ./ethswarm-gloas-genesis
+chmod go-w ./ethswarm-gloas-genesis/config.yaml ./ethswarm-gloas-genesis/genesis.ssz
 ```
 
 "Genesis root" in the checks means the genesis block root and the genesis state root
@@ -481,6 +482,7 @@ enclave=ethswarm-gloas          # ethswarm-gloas-a-<T>-<pid> for a pair
 genesis=target/kurtosis/$enclave-genesis
 export_root=target/kurtosis/export
 kurtosis files download "$enclave" el_cl_genesis_data "$genesis"   # config.yaml, genesis.ssz, ...
+chmod go-w "$genesis"/config.yaml "$genesis"/genesis.ssz        # umask 002 gives 0664
 cargo build --release --locked -p testkit --bin export-blocks
 bin=target/release/export-blocks
 
@@ -640,6 +642,7 @@ enclave=ethswarm-gloas-a-<T>-<pid>                  # the name run-pair.sh print
 net=target/kurtosis/$enclave-genesis
 logs=target/kurtosis/probe-$enclave; mkdir -p "$logs"
 kurtosis files download "$enclave" el_cl_genesis_data "$net"   # config.yaml, genesis.ssz
+chmod go-w "$net"/config.yaml "$net"/genesis.ssz        # umask 002 gives 0664: refused
 
 apis=() peers=() enrs=()
 for svc in cl-1-lighthouse-geth cl-2-lodestar-geth; do
@@ -691,14 +694,16 @@ It prints each CL's image and its `goodbye3` count, `goodbye3: PASS` and
 `discover` from a container on the enclave's Docker network, since the CLs' records carry
 their container IPs (on a Linux host, which routes to those IPs, the host binary works too).
 It needs a Linux build of the probe; this one keeps its build in `target/linux` and its crates
-in a Docker volume:
+in a Docker volume. The probe container runs as our user (`--user`): the probe reads the
+network files only if they are owned by its effective UID or root, and on a Linux host the
+mounted files keep our UID.
 
 ```bash
 docker run --rm -v "$PWD":/src -w /src -v ethswarm-cargo:/usr/local/cargo/registry \
   -e CARGO_TARGET_DIR=/src/target/linux rust:1.99-bookworm bash -c \
   'apt-get update -qq && apt-get install -y -qq protobuf-compiler clang libclang-dev >/dev/null &&
    cargo build --release --locked -p devnet-probe'
-docker run --rm --network "kt-$enclave" \
+docker run --rm --network "kt-$enclave" --user "$(id -u):$(id -g)" \
   -v "$PWD/target/linux/release/devnet-probe:/devnet-probe:ro" -v "$PWD/$net:/net:ro" \
   debian:bookworm-slim /devnet-probe discover --network-dir /net --bootnode "$boot" "${enrs[@]}" \
   2>"$logs/discover.err" | tee "$logs/discover.log"; echo "discover exit ${PIPESTATUS[0]}"
@@ -744,7 +749,10 @@ blob count. cl-verify does not start without `--network-dir` (exit 2). If the he
 every KZG stream fails with `VERSION_MISMATCH` and the store gets no columns. `serve` waits up
 to 30 s for `--verify-socket` to accept, so it can start right after cl-verify. `--socket-dir`
 must be an absolute path without symlinks that only we can write, short enough for a socket
-path (104 bytes on macOS). On macOS, `/tmp` is a symlink, so use the canonical form:
+path (104 bytes on macOS). `serve` checks the directory of `--verify-socket` in the same way,
+with cl-verify's user in place of ours. The network files (`config.yaml`, `genesis.ssz`) must
+be regular files, owned by you or root, that the group and others cannot write, in a directory
+that only its owner can write. On macOS, `/tmp` is a symlink, so use the canonical form:
 
 ```bash
 cargo build --release --locked -p cl-verify -p devnet-probe

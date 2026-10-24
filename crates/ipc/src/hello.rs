@@ -98,10 +98,53 @@ pub fn from_spec_pin(pin: &network_config::SpecPin) -> SpecPin {
     }
 }
 
-/// A network's `PRESET_BASE` that is neither `minimal` nor `mainnet`.
+/// The preset a network's `PRESET_BASE` names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Preset {
+    /// `minimal`: 8-slot epochs.
+    Minimal,
+    /// `mainnet`: 32-slot epochs.
+    Mainnet,
+}
+
+impl Preset {
+    /// The preset `config`'s `PRESET_BASE` names.
+    ///
+    /// # Errors
+    ///
+    /// [`NetworkHelloError::UnknownPreset`]: neither `minimal` nor `mainnet`.
+    pub fn of(config: &ChainConfig) -> Result<Self, NetworkHelloError> {
+        match config.preset_base() {
+            p if p == Minimal::NAME => Ok(Self::Minimal),
+            p if p == Mainnet::NAME => Ok(Self::Mainnet),
+            other => Err(NetworkHelloError::UnknownPreset(other.to_owned())),
+        }
+    }
+
+    /// `SLOTS_PER_EPOCH` of the preset.
+    #[must_use]
+    pub fn slots_per_epoch(self) -> u64 {
+        match self {
+            Self::Minimal => Minimal::slots_per_epoch(),
+            Self::Mainnet => Mainnet::slots_per_epoch(),
+        }
+    }
+}
+
+/// Why a network has no hello: it could never give a fork digest, so every stream of it would
+/// fail.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("PRESET_BASE {0:?} is neither minimal nor mainnet")]
-pub struct UnknownPreset(pub String);
+pub enum NetworkHelloError {
+    /// `PRESET_BASE` is neither `minimal` nor `mainnet`.
+    #[error("PRESET_BASE {0:?} is neither minimal nor mainnet")]
+    UnknownPreset(String),
+    /// `SLOT_DURATION_MS` is 0: the wall clock has no epoch.
+    #[error("SLOT_DURATION_MS is 0, so the wall clock has no epoch")]
+    ZeroSlotDuration,
+    /// The fork schedule has no Fulu entry: no epoch has a fork digest.
+    #[error("the fork schedule has no Fulu entry, so no epoch has a fork digest")]
+    NoFulu,
+}
 
 /// The hello of one network: the genesis validators root, every fork-schedule entry with its
 /// digest, fork version and blob limit (`network_config::digest::digest_schedule`, BPO epochs
@@ -112,22 +155,36 @@ pub struct NetworkHello {
     schedule: Hello,
     config: ChainConfig,
     genesis: Genesis,
-    slots_per_epoch: u64,
+    preset: Preset,
 }
 
 impl NetworkHello {
     /// The hello of the network of `config` and `genesis`, sent with `build`. The epoch length is
-    /// the one of the preset that `PRESET_BASE` names.
+    /// the one of the preset that `PRESET_BASE` names ([`Preset::of`]).
     ///
     /// # Errors
     ///
-    /// `PRESET_BASE` is neither `minimal` nor `mainnet`.
-    pub fn new(build: &str, config: &ChainConfig, genesis: Genesis) -> Result<Self, UnknownPreset> {
-        let slots_per_epoch = match config.preset_base() {
-            p if p == Minimal::NAME => Minimal::slots_per_epoch(),
-            p if p == Mainnet::NAME => Mainnet::slots_per_epoch(),
-            other => return Err(UnknownPreset(other.to_owned())),
-        };
+    /// `PRESET_BASE` is neither `minimal` nor `mainnet`, `SLOT_DURATION_MS` is 0, or the fork
+    /// schedule has no Fulu entry ([`NetworkHelloError`]). A service then stops before it binds,
+    /// because no stream of it could open.
+    pub fn new(
+        build: &str,
+        config: &ChainConfig,
+        genesis: Genesis,
+    ) -> Result<Self, NetworkHelloError> {
+        let preset = Preset::of(config)?;
+        if config.slot_duration_ms() == 0 {
+            return Err(NetworkHelloError::ZeroSlotDuration);
+        }
+        // The config, not the entry labels: an entry carries the newest fork of its epoch, so
+        // with Fulu and Gloas at one epoch the only entry is labelled Gloas.
+        if config
+            .fork_schedule()
+            .fork_epoch(network_config::ForkName::Fulu)
+            .is_none()
+        {
+            return Err(NetworkHelloError::NoFulu);
+        }
         let gvr = genesis.genesis_validators_root;
         let wire = |fork: network_config::ForkName| match fork {
             network_config::ForkName::Fulu => ForkName::Fulu,
@@ -165,8 +222,14 @@ impl NetworkHello {
             schedule,
             config: config.clone(),
             genesis,
-            slots_per_epoch,
+            preset,
         })
+    }
+
+    /// The preset that the network's `PRESET_BASE` names.
+    #[must_use]
+    pub fn preset(&self) -> Preset {
+        self.preset
     }
 
     /// The hello without the clock: `current_fork_digest` is empty. The schedules in it give
@@ -179,7 +242,7 @@ impl NetworkHello {
     /// `SLOTS_PER_EPOCH` of the network's preset.
     #[must_use]
     pub fn slots_per_epoch(&self) -> u64 {
-        self.slots_per_epoch
+        self.preset.slots_per_epoch()
     }
 
     /// The hello at `now_ms` (Unix milliseconds): [`Self::schedule`] with the fork digest of the
@@ -192,7 +255,7 @@ impl NetworkHello {
         let epoch = current_epoch(
             self.genesis.genesis_time,
             self.config.slot_duration_ms(),
-            self.slots_per_epoch,
+            self.slots_per_epoch(),
             now_ms,
         )?;
         let digest =
@@ -442,43 +505,20 @@ mod network_tests {
     use super::*;
     use ethswarm_proto::common::{BlobScheduleEntry, ForkScheduleEntry};
     use network_config::digest::{compute_fork_digest, digest_schedule};
-    use network_config::{ChainConfig, Genesis};
+    use network_config::Genesis;
 
-    /// Fulu from genesis, a blob change at epoch 1, Gloas at epoch 2; 6 s slots.
-    const CONFIG: &str = "\
-PRESET_BASE: 'minimal'
-CONFIG_NAME: 'fixture-devnet'
-GENESIS_FORK_VERSION: 0x00000001
-ELECTRA_FORK_EPOCH: 0
-FULU_FORK_VERSION: 0x60000001
-FULU_FORK_EPOCH: 0
-GLOAS_FORK_VERSION: 0x70000001
-GLOAS_FORK_EPOCH: 2
-SLOT_DURATION_MS: 6000
-MAX_PAYLOAD_SIZE: 10485760
-MAX_BLOBS_PER_BLOCK_ELECTRA: 9
-BLOB_SCHEDULE:
-  - EPOCH: 1
-    MAX_BLOBS_PER_BLOCK: 12
-";
+    use crate::testkit::devnet::{devnet_config, devnet_config_with, devnet_ms, DEVNET_GENESIS};
 
-    const GENESIS: Genesis = Genesis {
-        genesis_time: 1_760_800_000,
-        genesis_validators_root: [0x42; 32],
-    };
-
-    fn config(yaml: &str) -> ChainConfig {
-        ChainConfig::from_devnet_yaml(yaml.as_bytes()).unwrap()
-    }
+    const GENESIS: Genesis = DEVNET_GENESIS;
 
     /// Unix milliseconds at `slot` of the fixture (8-slot epochs of 6 s slots).
     fn at_slot(slot: u64) -> u128 {
-        u128::from(GENESIS.genesis_time) * 1000 + u128::from(slot) * 6_000
+        u128::from(devnet_ms(slot))
     }
 
     #[test]
     fn the_network_hello_carries_the_genesis_root_and_every_schedule_entry() {
-        let config = config(CONFIG);
+        let config = devnet_config();
         let net = NetworkHello::new("svc/1", &config, GENESIS).unwrap();
         let hello = net.schedule();
         assert_eq!(hello.api_version, API_VERSION_V1);
@@ -524,7 +564,7 @@ BLOB_SCHEDULE:
 
     #[test]
     fn the_current_fork_digest_follows_the_clock() {
-        let config = config(CONFIG);
+        let config = devnet_config();
         let net = NetworkHello::new("svc/1", &config, GENESIS).unwrap();
         let gvr = GENESIS.genesis_validators_root;
         for (slot, epoch) in [(0, 0), (7, 0), (8, 1), (16, 2), (400, 50)] {
@@ -554,7 +594,7 @@ BLOB_SCHEDULE:
 
     #[test]
     fn the_preset_gives_the_epoch_length_and_an_unknown_one_is_refused() {
-        let mainnet = config(&CONFIG.replace("'minimal'", "'mainnet'"));
+        let mainnet = devnet_config_with("'minimal'", "'mainnet'");
         let net = NetworkHello::new("svc/1", &mainnet, GENESIS).unwrap();
         assert_eq!(net.slots_per_epoch(), 32);
         // Slot 8 is still epoch 0 on 32-slot epochs, so before the blob change.
@@ -562,8 +602,54 @@ BLOB_SCHEDULE:
             net.at(at_slot(8)).unwrap().current_fork_digest,
             compute_fork_digest(&mainnet, &GENESIS.genesis_validators_root, 0).unwrap()
         );
-        let gnosis = config(&CONFIG.replace("'minimal'", "'gnosis'"));
+        assert_eq!(net.preset(), Preset::Mainnet);
+        let minimal = NetworkHello::new("svc/1", &devnet_config(), GENESIS).unwrap();
+        assert_eq!(minimal.preset(), Preset::Minimal);
+        assert_eq!(minimal.slots_per_epoch(), 8);
+        let gnosis = devnet_config_with("'minimal'", "'gnosis'");
         let err = NetworkHello::new("svc/1", &gnosis, GENESIS).unwrap_err();
+        assert_eq!(err, NetworkHelloError::UnknownPreset("gnosis".into()));
         assert!(err.to_string().contains("gnosis"), "{err}");
+    }
+
+    /// Our Kurtosis devnet has Fulu and Gloas both at epoch 0. Its schedule has one entry,
+    /// labelled Gloas, and its hello is still good.
+    #[test]
+    fn fulu_and_gloas_at_one_epoch_give_a_hello() {
+        use crate::testkit::devnet::{kurtosis_config, KURTOSIS_MAX_BLOBS};
+        let config = kurtosis_config();
+        let net = NetworkHello::new("svc/1", &config, GENESIS).unwrap();
+        let schedule = &net.schedule().fork_schedule;
+        assert_eq!(schedule.len(), 1, "{schedule:?}");
+        assert_eq!(schedule[0].fork, ForkName::Gloas as i32);
+        assert_eq!(schedule[0].max_blobs_per_block, KURTOSIS_MAX_BLOBS);
+        let hello = net.at(at_slot(0)).unwrap();
+        assert_eq!(
+            hello.current_fork_digest,
+            compute_fork_digest(&config, &GENESIS.genesis_validators_root, 0).unwrap()
+        );
+        assert_eq!(net.at(at_slot(1_000)).unwrap(), hello);
+    }
+
+    /// A network that gives no digest at any time is refused before a service binds: every
+    /// stream of it would fail `RESOURCE_UNAVAILABLE`.
+    #[test]
+    fn a_network_without_slots_or_fulu_is_refused() {
+        let zero = devnet_config_with("SLOT_DURATION_MS: 6000", "SLOT_DURATION_MS: 0");
+        let err = NetworkHello::new("svc/1", &zero, GENESIS).unwrap_err();
+        assert_eq!(err, NetworkHelloError::ZeroSlotDuration);
+        assert!(err.to_string().contains("SLOT_DURATION_MS"), "{err}");
+        let far = network_config::FAR_FUTURE_EPOCH.to_string();
+        let yaml = crate::testkit::devnet::DEVNET_CONFIG
+            .replace("FULU_FORK_EPOCH: 0", &format!("FULU_FORK_EPOCH: {far}"))
+            .replace("GLOAS_FORK_EPOCH: 2", &format!("GLOAS_FORK_EPOCH: {far}"))
+            .replace(
+                "BLOB_SCHEDULE:\n  - EPOCH: 1\n    MAX_BLOBS_PER_BLOCK: 12\n",
+                "",
+            );
+        let no_fulu = network_config::ChainConfig::from_devnet_yaml(yaml.as_bytes()).unwrap();
+        let err = NetworkHello::new("svc/1", &no_fulu, GENESIS).unwrap_err();
+        assert_eq!(err, NetworkHelloError::NoFulu);
+        assert!(err.to_string().contains("Fulu"), "{err}");
     }
 }

@@ -148,42 +148,7 @@ pub(crate) mod tests {
         h.accept(theirs, &At(0)).map(|(version, _)| version)
     }
 
-    /// A devnet config: Fulu from genesis, a blob change at epoch 1, Gloas at epoch 2; minimal
-    /// preset (8-slot epochs) with 6 s slots.
-    pub(crate) const DEVNET_CONFIG: &str = "\
-PRESET_BASE: 'minimal'
-CONFIG_NAME: 'fixture-devnet'
-GENESIS_FORK_VERSION: 0x00000001
-ELECTRA_FORK_EPOCH: 0
-FULU_FORK_VERSION: 0x60000001
-FULU_FORK_EPOCH: 0
-GLOAS_FORK_VERSION: 0x70000001
-GLOAS_FORK_EPOCH: 2
-SLOT_DURATION_MS: 6000
-MAX_PAYLOAD_SIZE: 10485760
-MAX_BLOBS_PER_BLOCK_ELECTRA: 9
-BLOB_SCHEDULE:
-  - EPOCH: 1
-    MAX_BLOBS_PER_BLOCK: 12
-";
-
-    /// The devnet's genesis.
-    pub(crate) const DEVNET_GENESIS: network_config::Genesis = network_config::Genesis {
-        genesis_time: 1_760_800_000,
-        genesis_validators_root: [0x42; 32],
-    };
-
-    /// The devnet's hello, sent with `build`.
-    pub(crate) fn devnet(build: &str) -> NetworkHello {
-        let config =
-            network_config::ChainConfig::from_devnet_yaml(DEVNET_CONFIG.as_bytes()).unwrap();
-        NetworkHello::new(build, &config, DEVNET_GENESIS).unwrap()
-    }
-
-    /// Unix milliseconds at `slot` of the devnet.
-    pub(crate) fn devnet_ms(slot: u64) -> u64 {
-        DEVNET_GENESIS.genesis_time * 1000 + slot * 6_000
-    }
+    use ipc::testkit::devnet::{devnet_hello as devnet, devnet_ms};
 
     #[test]
     fn a_network_handshake_sends_the_digest_of_the_stream_open_time() {

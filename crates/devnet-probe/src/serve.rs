@@ -44,7 +44,7 @@ use cl_chain::probe::{
     QueueMetrics, RefLimits, RefView, StatusProvider, DEFAULT_API_TIMEOUT,
 };
 use cl_chain::reqresp::{ColumnServer, ColumnStore, ReqRespServer, ServeBudget, WallClock};
-use cl_chain::verify::client::KzgVerifier;
+use cl_chain::verify::client::{KzgClient, KzgVerifier};
 use cl_chain::ChainStub;
 use cl_chain_columns::{ColumnReader, ColumnWriter, RangeBudget};
 use cl_p2p::behaviour::{SpecBehaviour, SpecBehaviourEvent};
@@ -61,10 +61,10 @@ use consensus_types::das::NUMBER_OF_COLUMNS;
 use consensus_types::primitives::U256;
 use consensus_types::{forked, EthSpec};
 use ethswarm_proto::common::Hello;
+use ethswarm_proto::verify::verify_service_client::VerifyServiceClient;
 use futures::StreamExt;
 use ipc::acl::{AclLayer, AclTables, MethodAcl};
 use ipc::envelope::DigestTable;
-use ipc::hello::NetworkHello;
 use ipc::uds::{Ownership, SocketDir, SocketGuard};
 use ipc::Link;
 use libp2p::identity::Keypair;
@@ -145,14 +145,13 @@ const BY_ROOT_BLOCKS: usize = 4;
 /// The `api_version` of the probe's chain.v1 and verify.v1 links.
 const API_VERSION: u32 = 1;
 
-/// The network hello of the devnet at `now_ms` ([`ipc::hello::NetworkHello`]): its genesis
-/// validators root, the digest of the wall clock at `now_ms`, every fork and blob-schedule
-/// entry, our spec pin and API version. cl-verify builds its own hello from the same files
+/// The network hello of the devnet at `now_ms` ([`Devnet::network`]): its genesis validators
+/// root, the digest of the wall clock at `now_ms`, every fork and blob-schedule entry, our spec
+/// pin and API version. cl-verify builds its own hello from the same files
 /// (`cl-verify --network-dir`) in the same way, so the two differ only in `build`.
 fn network_hello(devnet: &Devnet, now_ms: u128) -> Result<Hello, String> {
-    let build = concat!("devnet-probe/", env!("CARGO_PKG_VERSION"));
-    NetworkHello::new(build, devnet.config(), devnet.genesis())
-        .map_err(|e| e.to_string())?
+    devnet
+        .network()
         .at(now_ms)
         .map_err(|e| format!("our fork digest: {e}"))
 }
@@ -181,32 +180,72 @@ pub fn chain_link<E: EthSpec>(devnet: &Devnet, now_ms: u128) -> Result<Link, Str
     ))
 }
 
-/// The hello of cl-chain's side of the verify.v1 link at `now_ms`: the devnet's network hello
-/// ([`network_hello`]), equal to the one cl-verify sends for `--network-dir` of the same
-/// devnet apart from `build`. A run ends before the next fork digest ([`clip_until`]), so the
-/// hello of its start holds for the whole run.
+/// cl-chain's side of the verify.v1 link on `channel`: a KZG client that opens each stream
+/// with the devnet's network hello at the time of the stream open ([`KzgClient::network`]).
+/// That hello is equal to the one cl-verify sends for `--network-dir` of the same devnet apart
+/// from `build`, before and after each fork or BPO digest change.
+#[must_use]
+pub fn verify_client(devnet: &Devnet, channel: tonic::transport::Channel) -> KzgClient {
+    KzgClient::network(
+        VerifyServiceClient::new(channel),
+        Arc::clone(devnet.network()),
+    )
+}
+
+/// Refuses a verify socket whose directory other users could change, or the way to it
+/// ([`ipc::uds::open_closed_dir`], as for the socket root and the store's parent): walked from `/`
+/// without following a symlink, it and every directory above it must be owned by `uid` (cl-verify's
+/// user) or root, and not group or world writable unless sticky. The directory itself must be
+/// writable only by its owner, also when it is sticky, as the socket root. Otherwise another user
+/// could put a socket of their own in its place. The connector refuses a server of another user
+/// anyway, so such a socket could only stop the run. A relative `socket` is taken from the working
+/// directory.
 ///
 /// # Errors
 ///
-/// The clock is before genesis or Fulu.
-pub fn verify_hello(devnet: &Devnet, now_ms: u128) -> Result<Hello, String> {
-    network_hello(devnet, now_ms)
+/// The directory is not closed, cannot be opened, or `socket` names no file in it.
+pub fn check_verify_socket_dir(socket: &Path, uid: u32) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let shown = socket.display();
+    let path = std::env::current_dir()
+        .map_err(|e| format!("verify socket {shown}: the working directory: {e}"))?
+        .join(socket);
+    let (Some(dir), Some(_)) = (path.parent(), path.file_name()) else {
+        return Err(format!("verify socket {shown} names no file"));
+    };
+    let fd =
+        ipc::uds::open_closed_dir(dir, uid).map_err(|e| format!("verify socket directory {e}"))?;
+    // The directory itself, as the socket root ([`ipc::uds::bind`]): writable only by its
+    // owner, sticky or not. In a sticky directory that others can write (`/tmp`), another
+    // user could create the socket name first.
+    let meta = std::fs::File::from(fd)
+        .metadata()
+        .map_err(|e| format!("verify socket directory {}: {e}", dir.display()))?;
+    let mode = meta.mode() & 0o7777;
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "verify socket directory {} must be writable only by its owner (mode {mode:o})",
+            dir.display()
+        ));
+    }
+    Ok(())
 }
 
 /// A channel to cl-verify at `path`, which must run as `uid` ([`ipc::uds::connect_path`]). While
 /// the socket is not there yet or refuses connections ([`is_not_ready`]), the connection is tried
-/// again every 200 ms until `wait` is over; any other error (a server of another user included)
-/// is returned at once.
+/// again every 200 ms until `wait` is over, and the wait is logged once. Any other error (a
+/// server of another user included) is returned at once.
 ///
 /// # Errors
 ///
-/// The last connection error.
+/// The last connection error. [`error_chain`] shows it with its causes.
 pub async fn connect_verify(
     path: &Path,
     uid: u32,
     wait: Duration,
 ) -> Result<tonic::transport::Channel, tonic::transport::Error> {
     let deadline = tokio::time::Instant::now() + wait;
+    let mut logged = false;
     loop {
         match ipc::uds::connect_path(path, uid).await {
             Ok(channel) => return Ok(channel),
@@ -214,7 +253,15 @@ pub async fn connect_verify(
                 if is_not_ready(&e)
                     && tokio::time::Instant::now() + VERIFY_SOCKET_RETRY <= deadline =>
             {
-                tracing::info!(socket = %path.display(), "cl-verify is not accepting yet; trying again");
+                if !logged {
+                    tracing::info!(
+                        socket = %path.display(),
+                        wait_ms = wait.as_millis() as u64,
+                        retry_ms = VERIFY_SOCKET_RETRY.as_millis() as u64,
+                        "cl-verify is not accepting yet; trying again until the wait is over"
+                    );
+                    logged = true;
+                }
                 tokio::time::sleep(VERIFY_SOCKET_RETRY).await;
             }
             Err(e) => return Err(e),
@@ -223,9 +270,13 @@ pub async fn connect_verify(
 }
 
 /// Whether `err` is a socket that is not there yet (`NotFound`) or that nobody listens on yet
-/// (`ConnectionRefused`), anywhere in its source chain.
+/// (`ConnectionRefused`), anywhere in its source chain. A peer check that failed
+/// ([`ipc::uds::peer_refusal`]) is never "not ready", whatever I/O error it carries.
 #[must_use]
 pub fn is_not_ready(err: &(dyn std::error::Error + 'static)) -> bool {
+    if ipc::uds::peer_refusal(err).is_some() {
+        return false;
+    }
     let mut next = Some(err);
     while let Some(e) = next {
         if let Some(io) = e.downcast_ref::<std::io::Error>() {
@@ -239,6 +290,20 @@ pub fn is_not_ready(err: &(dyn std::error::Error + 'static)) -> bool {
         next = e.source();
     }
     false
+}
+
+/// `err` and each error in its source chain, joined by `": "`. A tonic transport error alone
+/// shows only "transport error".
+#[must_use]
+pub fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut shown = err.to_string();
+    let mut next = err.source();
+    while let Some(e) = next {
+        shown.push_str(": ");
+        shown.push_str(&e.to_string());
+        next = e.source();
+    }
+    shown
 }
 
 /// The discv5 node ID of `key` as the spec's `uint256`: what the custody columns are drawn
@@ -1690,7 +1755,7 @@ mod tests {
     fn the_verify_hello_is_the_network_hello_cl_verify_sends() {
         let devnet = devnet();
         let now = crate::fixtures::now_ms();
-        let ours = verify_hello(&devnet, now).unwrap();
+        let ours = network_hello(&devnet, now).unwrap();
         assert_eq!(&ours, chain_link::<Minimal>(&devnet, now).unwrap().local());
         let cl_verify =
             ipc::hello::NetworkHello::new("cl-verify/0", devnet.config(), devnet.genesis())
@@ -1707,7 +1772,7 @@ mod tests {
         assert_eq!(ipc::hello::negotiate(&cl_verify, &ours, API_VERSION), Ok(1));
         assert!(ours.fork_schedule.iter().all(|e| e.max_blobs_per_block > 0));
         let before = u128::from(devnet.genesis().genesis_time) * 1000 - 1;
-        assert!(verify_hello(&devnet, before).is_err());
+        assert!(network_hello(&devnet, before).is_err());
     }
 
     /// A run ends before the next fork digest, by [`AFTER_SERVING`]: cut short when it would
@@ -2187,6 +2252,164 @@ mod tests {
         let waited = started.elapsed();
         assert!(waited >= Duration::from_millis(400), "{waited:?}");
         assert!(waited < Duration::from_secs(3), "{waited:?}");
+    }
+
+    /// An error whose source is `source`, as a connector wraps what it met.
+    #[derive(Debug)]
+    struct Wrapped(Box<dyn std::error::Error + Send + Sync + 'static>);
+
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("transport error")
+        }
+    }
+
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.0.as_ref())
+        }
+    }
+
+    /// A peer check that failed is never "not ready", whatever I/O error it carries: it is
+    /// returned at once, not tried again for the whole wait.
+    #[test]
+    fn a_refused_peer_check_is_not_waited_for() {
+        use std::io::{Error, ErrorKind};
+        let not_found = Wrapped(Box::new(Error::from(ErrorKind::NotFound)));
+        assert!(is_not_ready(&not_found));
+        for kind in [ErrorKind::NotFound, ErrorKind::ConnectionRefused] {
+            let unavailable = Wrapped(Box::new(ipc::peercred::PeerCredError::Unavailable(
+                Error::from(kind),
+            )));
+            assert!(!is_not_ready(&unavailable), "{kind:?}");
+        }
+    }
+
+    /// The error of a failed wait names its cause, not only "transport error".
+    #[tokio::test]
+    async fn a_failed_wait_names_the_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_in(&dir);
+        let uid = Ownership::current().uid;
+        let err = connect_verify(&path, uid, Duration::ZERO)
+            .await
+            .unwrap_err();
+        let shown = error_chain(&err);
+        assert!(shown.starts_with(&err.to_string()), "{shown}");
+        assert!(shown.contains("os error"), "{shown}");
+        let nested = Wrapped(Box::new(Wrapped(Box::new(std::io::Error::other("deep")))));
+        assert_eq!(
+            error_chain(&nested),
+            "transport error: transport error: deep"
+        );
+    }
+
+    /// Counts the `info` events of each `socket` field value. It is the global subscriber of
+    /// the test binary: a scoped one can miss events while other threads register the same
+    /// callsite.
+    #[derive(Default)]
+    struct InfoBySocket(std::sync::Mutex<std::collections::HashMap<String, usize>>);
+
+    impl InfoBySocket {
+        /// The subscriber of the test binary, set at the first call.
+        fn global() -> &'static Arc<Self> {
+            static GLOBAL: std::sync::OnceLock<Arc<InfoBySocket>> = std::sync::OnceLock::new();
+            GLOBAL.get_or_init(|| {
+                let counts = Arc::new(Self::default());
+                tracing::subscriber::set_global_default(Arc::clone(&counts))
+                    .expect("no other global subscriber in this test binary");
+                counts
+            })
+        }
+
+        fn count(&self, socket: &Path) -> usize {
+            let counts = self.0.lock().unwrap();
+            counts
+                .get(&socket.display().to_string())
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    /// Finds the `socket` field of an event.
+    struct SocketField(Option<String>);
+
+    impl tracing::field::Visit for SocketField {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "socket" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for InfoBySocket {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() != tracing::Level::INFO {
+                return;
+            }
+            let mut socket = SocketField(None);
+            event.record(&mut socket);
+            if let Some(socket) = socket.0 {
+                *self.0.lock().unwrap().entry(socket).or_default() += 1;
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A wait of many retries logs one `info` line, not one for each retry.
+    #[tokio::test]
+    async fn the_wait_for_the_verify_socket_is_logged_once() {
+        let counts = InfoBySocket::global();
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_in(&dir);
+        let uid = Ownership::current().uid;
+        let err = connect_verify(&path, uid, Duration::from_millis(900))
+            .await
+            .unwrap_err();
+        assert!(is_not_ready(&err), "{err:?}");
+        assert_eq!(counts.count(&path), 1);
+    }
+
+    /// The directory of the verify socket, and every directory above it, must be one only
+    /// root and cl-verify's user can change, as the socket root is checked.
+    #[test]
+    fn the_verify_socket_directory_is_closed_to_other_users() {
+        let uid = Ownership::current().uid;
+        let (_tmp, dir) = real_tempdir();
+        let socket = dir.join("verify.sock");
+        set_mode(&dir, 0o750);
+        check_verify_socket_dir(&socket, uid).unwrap();
+        set_mode(&dir, 0o777);
+        let open = check_verify_socket_dir(&socket, uid).unwrap_err();
+        assert!(open.contains("verify socket"), "{open}");
+        assert!(open.contains("not writable by others"), "{open}");
+        // A sticky directory that others can write, such as `/tmp`: another user could put a
+        // socket in the name first. Refused as the socket root is.
+        for sticky in [0o1777, 0o1770, 0o1702] {
+            set_mode(&dir, sticky);
+            let shared = check_verify_socket_dir(&socket, uid).unwrap_err();
+            assert!(
+                shared.contains("writable only by its owner"),
+                "{sticky:o}: {shared}"
+            );
+        }
+        set_mode(&dir, 0o750);
+        if uid != 0 {
+            let other = check_verify_socket_dir(&socket, uid + 1).unwrap_err();
+            assert!(other.contains("owned by"), "{other}");
+        }
+        let missing = check_verify_socket_dir(&dir.join("none").join("verify.sock"), uid);
+        assert!(missing.is_err());
+        assert!(check_verify_socket_dir(Path::new("/"), uid).is_err());
     }
 
     #[tokio::test]

@@ -27,7 +27,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use crypto_kzg::SetupError;
-use ipc::hello::{NetworkHello, UnknownPreset};
+use ipc::hello::{NetworkHello, NetworkHelloError};
 use network_config::network_dir::{NetworkDir, NetworkDirError};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, SignalKind};
@@ -82,8 +82,9 @@ pub struct StartupConfig {
 pub enum NetworkError {
     #[error(transparent)]
     Dir(#[from] NetworkDirError),
+    /// The network gives no hello: an unknown preset, 0 ms slots or no Fulu entry.
     #[error(transparent)]
-    Preset(#[from] UnknownPreset),
+    Hello(#[from] NetworkHelloError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -471,8 +472,8 @@ impl Args {
 ///
 /// # Errors
 ///
-/// A file cannot be read, the config is not valid, or its `PRESET_BASE` is neither `minimal`
-/// nor `mainnet`.
+/// A file cannot be read, the config is not valid, or it gives no hello: its `PRESET_BASE` is
+/// neither `minimal` nor `mainnet`, its `SLOT_DURATION_MS` is 0, or it schedules no Fulu.
 pub fn network_hello(dir: &Path) -> Result<NetworkHello, NetworkError> {
     let network = NetworkDir::read(dir)?;
     Ok(NetworkHello::new(BUILD, &network.config, network.genesis)?)
@@ -597,15 +598,12 @@ mod tests {
         );
     }
 
-    /// A network directory with the devnet of [`crate::handshake::tests::DEVNET_CONFIG`].
+    /// A network directory with the devnet of [`ipc::testkit::devnet::DEVNET_CONFIG`].
     fn devnet_dir() -> tempfile::TempDir {
-        use crate::handshake::tests::{DEVNET_CONFIG, DEVNET_GENESIS};
+        use ipc::testkit::devnet::{devnet_genesis_state, write_network_file, DEVNET_CONFIG};
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.yaml"), DEVNET_CONFIG).unwrap();
-        let mut state = DEVNET_GENESIS.genesis_time.to_le_bytes().to_vec();
-        state.extend_from_slice(&DEVNET_GENESIS.genesis_validators_root);
-        state.extend_from_slice(&[0xee; 64]);
-        std::fs::write(dir.path().join("genesis.ssz"), state).unwrap();
+        write_network_file(dir.path().join("config.yaml"), DEVNET_CONFIG);
+        write_network_file(dir.path().join("genesis.ssz"), devnet_genesis_state(64));
         dir
     }
 
@@ -632,7 +630,8 @@ mod tests {
     /// network's largest blob count.
     #[test]
     fn the_network_dir_gives_the_hello_of_the_network() {
-        use crate::handshake::tests::{devnet, devnet_ms, At};
+        use crate::handshake::tests::At;
+        use ipc::testkit::devnet::{devnet_hello as devnet, devnet_ms};
         let dir = devnet_dir();
         let cfg = with_network(dir.path()).into_config().unwrap();
         let ours = cfg.server.handshake.ours();
@@ -666,10 +665,23 @@ mod tests {
         assert!(err.to_string().contains("config.yaml"), "{err}");
 
         let devnet = devnet_dir();
-        let yaml = crate::handshake::tests::DEVNET_CONFIG.replace("'minimal'", "'gnosis'");
-        std::fs::write(devnet.path().join("config.yaml"), yaml).unwrap();
+        let yaml = ipc::testkit::devnet::DEVNET_CONFIG.replace("'minimal'", "'gnosis'");
+        ipc::testkit::devnet::write_network_file(devnet.path().join("config.yaml"), yaml);
         let err = with_network(devnet.path()).into_config().unwrap_err();
         assert!(err.to_string().contains("gnosis"), "{err}");
+
+        // 0 ms slots give no epoch, so no stream could open: refused before the bind.
+        let yaml = ipc::testkit::devnet::DEVNET_CONFIG
+            .replace("SLOT_DURATION_MS: 6000", "SLOT_DURATION_MS: 0");
+        ipc::testkit::devnet::write_network_file(devnet.path().join("config.yaml"), yaml);
+        let err = with_network(devnet.path()).into_config().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StartupError::Network(NetworkError::Hello(NetworkHelloError::ZeroSlotDuration))
+            ),
+            "{err:?}"
+        );
     }
 
     /// Until network config reaches cl-verify, the unwired hello fails closed: a real cl-chain

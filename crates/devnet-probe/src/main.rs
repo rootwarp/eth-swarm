@@ -53,7 +53,6 @@ use devnet_probe::ours::{Clock, DEFAULT_REFRESH_INTERVAL};
 use devnet_probe::report::{verdict, Check, Outcome};
 use devnet_probe::serve::{self, ServePlan};
 use devnet_probe::status::{self, StatusPlan};
-use ethswarm_proto::verify::verify_service_client::VerifyServiceClient;
 use libp2p::{Multiaddr, PeerId};
 use network_config::{Epoch, Genesis};
 use std::io::Write;
@@ -493,22 +492,26 @@ async fn serve_check<E: EthSpec>(args: &Args, devnet: &Devnet) -> Check {
     let uid = s
         .verify_uid
         .unwrap_or_else(|| ipc::uds::Ownership::current().uid);
+    if let Err(e) = serve::check_verify_socket_dir(verify_socket, uid) {
+        return Check::failed(serve::NAME, e);
+    }
     let channel = match serve::connect_verify(verify_socket, uid, s.verify_wait).await {
         Ok(channel) => channel,
         Err(e) => {
             return Check::failed(
                 serve::NAME,
-                format!("cl-verify at {}: {e}", verify_socket.display()),
+                format!(
+                    "cl-verify at {}: {}",
+                    verify_socket.display(),
+                    serve::error_chain(&e)
+                ),
             )
         }
     };
-    // The clock of the run: our verify.v1 hello and every deadline of `serve` start here.
+    // The clock of the run: every deadline of `serve` starts here. The verify.v1 hello is
+    // computed again at each stream open, so it follows each digest change.
     let now = system_ms();
-    let hello = match serve::verify_hello(devnet, now) {
-        Ok(hello) => hello,
-        Err(e) => return Check::failed(serve::NAME, e),
-    };
-    let kzg = KzgClient::new(VerifyServiceClient::new(channel), hello);
+    let kzg = serve::verify_client(devnet, channel);
     let plan = ServePlan {
         listen: if s.listen.is_empty() {
             vec![default_listen()]
@@ -804,6 +807,7 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use devnet_probe::fixtures;
+    use ipc::testkit::devnet::write_network_file;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_owned()).collect()
@@ -1060,16 +1064,15 @@ mod tests {
     /// A devnet directory: the fixture config and a genesis state prefix.
     fn network_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
+        write_network_file(
             dir.path().join("config.yaml"),
             testkit::export_blocks::fixtures::CONFIG,
-        )
-        .unwrap();
+        );
         let genesis = fixtures::devnet().genesis();
         let mut state = genesis.genesis_time.to_le_bytes().to_vec();
         state.extend_from_slice(&genesis.genesis_validators_root);
         state.extend_from_slice(&[0xee; 64]);
-        std::fs::write(dir.path().join("genesis.ssz"), state).unwrap();
+        write_network_file(dir.path().join("genesis.ssz"), state);
         dir
     }
 
@@ -1339,11 +1342,10 @@ mod tests {
             "{out}"
         );
         // A preset this probe has no spec for is a failed setup.
-        std::fs::write(
+        write_network_file(
             dir.path().join("config.yaml"),
             testkit::export_blocks::fixtures::CONFIG.replace("'minimal'", "'gnosis'"),
-        )
-        .unwrap();
+        );
         let (code, out, _) = run_args(&["connect", "--network-dir", dir_arg, "--peer", &good]);
         assert_eq!(code, EXIT_FAILED);
         assert!(out.contains("setup: FAIL config"), "{out}");
@@ -1390,7 +1392,7 @@ mod tests {
         assert_eq!(code, EXIT_FAILED);
         assert!(out.contains("setup: FAIL config"), "{out}");
         let bad_genesis = dir.path().join("short.ssz");
-        std::fs::write(&bad_genesis, [1, 2, 3]).unwrap();
+        write_network_file(&bad_genesis, [1, 2, 3]);
         let config = dir.path().join("config.yaml");
         let (code, out, _) = run_args(&[
             "connect",

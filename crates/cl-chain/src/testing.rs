@@ -11,6 +11,8 @@
 //! - [`ClVerify`]: an in-process cl-verify (`VerifyServer::new`: the pinned trusted setup) on a
 //!   Unix socket in a temp dir.
 //! - [`StubVerify`]: a VerifyKzg server that misbehaves on purpose (silent, mute, hangs up).
+//!   [`StubVerify::start_network`] checks each client hello as cl-verify does, with the
+//!   network hello at the time of a [`ManualClock`] ([`Handshake::accept`]).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use crate::verify::client::KzgClient;
@@ -18,7 +20,10 @@ use cl_verify::feed::SharedCache;
 use cl_verify::handshake::Handshake;
 use cl_verify::kzg::TrustedSetupConfig;
 use cl_verify::server::{serve_uds, Limits, ServerConfig, VerifyServer, DEFAULT_SNAPSHOT_INTERVAL};
-use ethswarm_proto::common::{BlobScheduleEntry, ForkName, ForkScheduleEntry, Hello, SpecPin};
+use cl_verify::wire::WallClock;
+use ethswarm_proto::common::{
+    BlobScheduleEntry, ErrorCode, ForkName, ForkScheduleEntry, Hello, SpecPin,
+};
 use ethswarm_proto::verify::verify_service_client::VerifyServiceClient;
 use ethswarm_proto::verify::verify_service_server::{VerifyService, VerifyServiceServer};
 use ethswarm_proto::verify::{
@@ -29,7 +34,7 @@ use ethswarm_proto::verify::{
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
@@ -154,11 +159,39 @@ pub fn my_uid() -> u32 {
     ipc::uds::Ownership::current().uid
 }
 
+/// A wall clock that the test sets by hand, in Unix milliseconds.
+#[derive(Debug, Default)]
+pub struct ManualClock(pub AtomicU64);
+
+impl ManualClock {
+    /// A clock that reads `unix_ms`.
+    pub fn at(unix_ms: u64) -> Arc<Self> {
+        Arc::new(Self(AtomicU64::new(unix_ms)))
+    }
+
+    /// Sets the clock to `unix_ms`.
+    pub fn set(&self, unix_ms: u64) {
+        self.0.store(unix_ms, Ordering::SeqCst);
+    }
+}
+
+impl WallClock for ManualClock {
+    fn now_unix_ms(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// What a network stub ([`StubVerify::start_network`]) found in each client hello, in stream
+/// order: the accepted `current_fork_digest`, or the error code of the refusal.
+pub type Handshakes = Arc<Mutex<Vec<Result<Vec<u8>, ErrorCode>>>>;
+
 /// A server task on a Unix socket in its own temp dir, stopped when this is dropped.
 pub struct Served {
     pub socket: PathBuf,
     /// VerifyKzg streams the server has answered (counted by [`StubVerify`] only).
     opened: Arc<AtomicUsize>,
+    /// The client hellos a network stub checked.
+    handshakes: Handshakes,
     _dir: tempfile::TempDir,
     _stop: oneshot::Sender<()>,
 }
@@ -172,9 +205,44 @@ impl Served {
         KzgClient::new(VerifyServiceClient::new(channel), hello())
     }
 
+    /// A verify.v1 client to this server that opens each stream with `network`'s hello at the
+    /// time of `clock`.
+    pub async fn network_kzg_client(
+        &self,
+        network: ipc::hello::NetworkHello,
+        clock: Arc<ManualClock>,
+    ) -> KzgClient {
+        let channel = ipc::uds::connect_path(&self.socket, my_uid())
+            .await
+            .unwrap();
+        KzgClient::network_with_clock(
+            VerifyServiceClient::new(channel),
+            Arc::new(network),
+            Arc::new(move || u128::from(clock.now_unix_ms())),
+        )
+    }
+
+    /// A verify.v1 client to this server that opens each stream with `network`'s hello at the
+    /// time of `clock` (Unix milliseconds).
+    pub async fn network_kzg_client_on(
+        &self,
+        network: ipc::hello::NetworkHello,
+        clock: crate::verify::client::UnixClock,
+    ) -> KzgClient {
+        let channel = ipc::uds::connect_path(&self.socket, my_uid())
+            .await
+            .unwrap();
+        KzgClient::network_with_clock(VerifyServiceClient::new(channel), Arc::new(network), clock)
+    }
+
     /// VerifyKzg streams opened so far.
     pub fn streams_opened(&self) -> usize {
         self.opened.load(Ordering::SeqCst)
+    }
+
+    /// What a network stub found in each client hello so far, in stream order.
+    pub fn handshakes(&self) -> Vec<Result<Vec<u8>, ErrorCode>> {
+        self.handshakes.lock().unwrap().clone()
     }
 }
 
@@ -207,6 +275,7 @@ impl ClVerify {
         Served {
             socket,
             opened: Arc::default(),
+            handshakes: Arc::default(),
             _dir: dir,
             _stop: stop,
         }
@@ -237,6 +306,10 @@ pub struct StubVerify {
     mode: Stub,
     opened: Arc<AtomicUsize>,
     open: Mutex<Vec<mpsc::Sender<Result<VerifyKzgResponse, Status>>>>,
+    /// cl-verify's side of the handshake and its clock: each client hello is checked against
+    /// it before the stub answers ([`Self::start_network`]).
+    network: Option<(Handshake, Arc<ManualClock>)>,
+    handshakes: Handshakes,
 }
 
 type Frames<T> = Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send>>;
@@ -259,11 +332,39 @@ impl VerifyService for StubVerify {
         request: Request<Streaming<VerifyKzgRequest>>,
     ) -> Result<Response<Self::VerifyKzgStream>, Status> {
         self.opened.fetch_add(1, Ordering::SeqCst);
+        let mut inbound = request.into_inner();
+        // A network stub reads and checks the client's hello first, as cl-verify does.
+        let ours = match &self.network {
+            Some((handshake, clock)) => {
+                let theirs = match inbound.message().await {
+                    Ok(Some(VerifyKzgRequest {
+                        frame: Some(verify_kzg_request::Frame::Hello(theirs)),
+                    })) => theirs,
+                    _ => return Err(Status::invalid_argument("no client hello")),
+                };
+                match handshake.accept(&theirs, clock.as_ref()) {
+                    Ok((_, ours)) => {
+                        let digest = ours.current_fork_digest.clone();
+                        self.handshakes.lock().unwrap().push(Ok(digest));
+                        ours
+                    }
+                    Err(e) => {
+                        // As cl-verify fails a stream: the error is its first response.
+                        self.handshakes.lock().unwrap().push(Err(e.code()));
+                        let (tx, rx) = mpsc::channel(1);
+                        tx.send(Err(cl_verify::wire::to_status(&e))).await.unwrap();
+                        return Ok(Response::new(ReceiverStream::new(rx)));
+                    }
+                }
+            }
+            None => hello(),
+        };
+        let hello_read = self.network.is_some();
         let (tx, rx) = mpsc::channel(16);
-        let server_hello = |generation| VerifyKzgResponse {
+        let server_hello = move |generation| VerifyKzgResponse {
             frame: Some(verify_kzg_response::Frame::Hello(Hello {
                 generation,
-                ..hello()
+                ..ours.clone()
             })),
         };
         match self.mode {
@@ -271,13 +372,14 @@ impl VerifyService for StubVerify {
             Stub::ZeroGeneration => tx.send(Ok(server_hello(0))).await.unwrap(),
             _ => tx.send(Ok(server_hello(0x5eed))).await.unwrap(),
         }
-        let mut inbound = request.into_inner();
         let mode = self.mode;
         match mode {
             Stub::HangsUp => {
                 tokio::spawn(async move {
                     // The client's hello, then its first request: end the stream there.
-                    let _ = inbound.message().await;
+                    if !hello_read {
+                        let _ = inbound.message().await;
+                    }
                     let _ = inbound.message().await;
                     drop(tx);
                 });
@@ -325,12 +427,26 @@ impl VerifyService for StubVerify {
 
 impl StubVerify {
     pub fn start(mode: Stub) -> Served {
+        Self::serve(mode, None)
+    }
+
+    /// A stub that checks each client hello against `handshake` at the time of `clock`, as
+    /// cl-verify does at each stream open, and answers by `mode` after a hello it accepts. A
+    /// refused hello fails the stream. [`Served::handshakes`] records each outcome.
+    pub fn start_network(mode: Stub, handshake: Handshake, clock: Arc<ManualClock>) -> Served {
+        Self::serve(mode, Some((handshake, clock)))
+    }
+
+    fn serve(mode: Stub, network: Option<(Handshake, Arc<ManualClock>)>) -> Served {
         let (dir, socket, listener) = socket();
         let opened = Arc::<AtomicUsize>::default();
+        let handshakes = Handshakes::default();
         let stub = StubVerify {
             mode,
             opened: Arc::clone(&opened),
             open: Mutex::default(),
+            network,
+            handshakes: Arc::clone(&handshakes),
         };
         let (stop, stopped) = oneshot::channel::<()>();
         tokio::spawn(
@@ -343,6 +459,7 @@ impl StubVerify {
         Served {
             socket,
             opened,
+            handshakes,
             _dir: dir,
             _stop: stop,
         }
