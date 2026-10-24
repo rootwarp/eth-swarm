@@ -14,16 +14,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use cl_verify::caps::MAX_KZG_COLUMNS;
 use cl_verify::notify;
 use cl_verify::proto::common::Hello;
 use cl_verify::proto::verify::verify_service_client::VerifyServiceClient;
+use cl_verify::proto::verify::{
+    verify_kzg_response, KzgCellProof, VerifyKzgRequestBody, VerifyStatus,
+};
 use cl_verify::server::Limits;
 use cl_verify::startup::{
-    local_hello, run_with, run_with_signals, Readiness, StartupConfig, StartupError, Stopped,
-    Termination,
+    run_with, run_with_signals, Readiness, StartupConfig, StartupError, Stopped, Termination,
 };
 use common::*;
 use crypto_kzg::{SetupError, BETA4_MAINNET_SHA256};
+use ipc::hello::NetworkHello;
+use network_config::{ChainConfig, Genesis};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -408,6 +413,53 @@ async fn shutdown_flushes_a_dirty_snapshot_within_the_drain_timeout() {
 
 // ---- the real binary ----
 
+/// A devnet as the Kurtosis genesis generator writes it: Fulu from genesis, a blob change to 12
+/// at epoch 1, Gloas at epoch 2, minimal preset with 6 s slots.
+const DEVNET_CONFIG: &str = "\
+PRESET_BASE: 'minimal'
+CONFIG_NAME: 'fixture-devnet'
+GENESIS_FORK_VERSION: 0x00000001
+ELECTRA_FORK_EPOCH: 0
+FULU_FORK_VERSION: 0x60000001
+FULU_FORK_EPOCH: 0
+GLOAS_FORK_VERSION: 0x70000001
+GLOAS_FORK_EPOCH: 2
+SLOT_DURATION_MS: 6000
+MAX_PAYLOAD_SIZE: 10485760
+MAX_BLOBS_PER_BLOCK_ELECTRA: 9
+BLOB_SCHEDULE:
+  - EPOCH: 1
+    MAX_BLOBS_PER_BLOCK: 12
+";
+
+/// The devnet's genesis, in the past, so the clock is in Gloas.
+const DEVNET_GENESIS: Genesis = Genesis {
+    genesis_time: 1_760_800_000,
+    genesis_validators_root: [0x42; 32],
+};
+
+/// Writes the devnet's `config.yaml` and `genesis.ssz` to `dir/net` and returns that directory.
+fn network_dir(dir: &Path) -> std::path::PathBuf {
+    let net = dir.join("net");
+    std::fs::create_dir_all(&net).unwrap();
+    std::fs::write(net.join("config.yaml"), DEVNET_CONFIG).unwrap();
+    let mut state = DEVNET_GENESIS.genesis_time.to_le_bytes().to_vec();
+    state.extend_from_slice(&DEVNET_GENESIS.genesis_validators_root);
+    state.extend_from_slice(&[0xee; 256]);
+    std::fs::write(net.join("genesis.ssz"), state).unwrap();
+    net
+}
+
+/// The hello cl-chain's side of the verify.v1 link sends for the devnet now: the network hello
+/// of the same files, the way the probe builds it.
+fn chain_hello() -> Hello {
+    let config = ChainConfig::from_devnet_yaml(DEVNET_CONFIG.as_bytes()).unwrap();
+    NetworkHello::new("devnet-probe/test", &config, DEVNET_GENESIS)
+        .unwrap()
+        .at(u128::from(cl_verify::wire::now_unix_ms()))
+        .unwrap()
+}
+
 fn cl_verify() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cl-verify"));
     cmd.env_remove("NOTIFY_SOCKET");
@@ -434,6 +486,8 @@ fn binary_exits_nonzero_on_a_tampered_setup_without_binding() {
         .args(["--peer-uid", &my_uid().to_string()])
         .arg("--pubkey-snapshot")
         .arg(dir.path().join("pubkeys.bin"))
+        .arg("--network-dir")
+        .arg(network_dir(dir.path()))
         .output()
         .unwrap();
 
@@ -445,7 +499,7 @@ fn binary_exits_nonzero_on_a_tampered_setup_without_binding() {
         "{stderr}"
     );
     assert!(stderr.contains(&hex::encode(actual)), "{stderr}");
-    assert!(stderr.contains("network config is not wired"), "{stderr}");
+    assert!(!stderr.contains("network config is not wired"), "{stderr}");
     assert!(!socket.exists(), "socket bound despite a refused setup");
     let mut buf = [0u8; 64];
     assert_eq!(
@@ -483,6 +537,8 @@ fn spawn_binary_with(
         .args(["--peer-uid", &my_uid().to_string()])
         .arg("--pubkey-snapshot")
         .arg(snapshot)
+        .arg("--network-dir")
+        .arg(network_dir(dir))
         .stderr(stderr)
         .spawn()
         .unwrap();
@@ -552,7 +608,7 @@ async fn binary_sigterm_flushes_the_snapshot_removes_the_socket_and_exits_0() {
     let socket = dir.path().join("verify.sock");
     let snapshot = dir.path().join("pubkeys.bin");
     let mut child = spawn_binary(dir.path());
-    let (client, feed) = feed_dirty_snapshot(&socket, local_hello(), &snapshot, 3, 5).await;
+    let (client, feed) = feed_dirty_snapshot(&socket, chain_hello(), &snapshot, 3, 5).await;
     drop((feed, client));
 
     let status = tokio::task::block_in_place(|| signal_and_wait(&mut child, "-TERM"));
@@ -568,7 +624,7 @@ async fn binary_second_sigterm_exits_3_at_once_without_the_flush() {
     let snapshot = dir.path().join("pubkeys.bin");
     let mut child = spawn_binary(dir.path());
     // The feed stream stays open, so the first SIGTERM drains for the default 10 s.
-    let (_client, _feed) = feed_dirty_snapshot(&socket, local_hello(), &snapshot, 3, 5).await;
+    let (_client, _feed) = feed_dirty_snapshot(&socket, chain_hello(), &snapshot, 3, 5).await;
     send_signal(&child, "-TERM");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(child.try_wait().unwrap().is_none(), "draining");
@@ -603,7 +659,7 @@ async fn binary_reports_a_failed_shutdown_flush_and_exits_1() {
             rx,
             generation: 0,
         };
-        feed.send(feed_hello(local_hello())).await;
+        feed.send(feed_hello(chain_hello())).await;
         assert!(feed.next().await.unwrap().is_some(), "server hello");
         assert_eq!(feed_reply(&mut feed).await.high_water, 0);
         feed.send(feed_body(announcing(feed_frame(0, 0..3), 3)))
@@ -625,6 +681,130 @@ fn binary_sigint_exits_0_and_removes_the_socket() {
     let status = signal_and_wait(&mut child, "-INT");
     assert_eq!(status.code(), Some(0), "{status:?}");
     assert!(!dir.path().join("verify.sock").exists(), "socket removed");
+}
+
+/// The binary's hello from `--network-dir` is what cl-chain's side sends for the same files:
+/// the handshake passes (no `VERSION_MISMATCH`), and the KZG cell cap is one block at the
+/// devnet's largest blob count (12), not 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn binary_hello_from_the_network_dir_matches_cl_chain_and_caps_kzg_by_its_blobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("verify.sock");
+    let mut child = spawn_binary(dir.path());
+    let mut client = VerifyServiceClient::new(connect(&socket).await);
+    let (tx, rx) = mpsc::channel(8);
+    let rx = client
+        .verify_kzg(ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut kzg = Bidi {
+        tx,
+        rx,
+        generation: 0,
+    };
+    let ours = chain_hello();
+    kzg.send(kzg_hello(ours.clone())).await;
+    let server = match kzg.next().await {
+        Ok(Some(r)) => match r.frame {
+            Some(verify_kzg_response::Frame::Hello(server)) => server,
+            other => panic!("first server frame is not hello: {other:?}"),
+        },
+        other => panic!("no server hello: {other:?}"),
+    };
+    assert!(server.build.starts_with("cl-verify/"), "{}", server.build);
+    assert_ne!(server.generation, 0);
+    assert_eq!(
+        Hello {
+            build: ours.build.clone(),
+            generation: 0,
+            ..server.clone()
+        },
+        ours
+    );
+    kzg.generation = server.generation;
+
+    let cell = |i: usize| KzgCellProof {
+        commitment: vec![],
+        cell_index: (i % MAX_KZG_COLUMNS) as u64,
+        cell: vec![],
+        proof: vec![],
+    };
+    let max = MAX_KZG_COLUMNS * 12;
+    kzg.send(kzg_body(VerifyKzgRequestBody {
+        request_id: 1,
+        cells: (0..max).map(cell).collect(),
+        deadline_unix_ms: far_deadline(),
+        generation: 0,
+    }))
+    .await;
+    let reply = kzg_reply(&mut kzg).await;
+    assert_eq!(reply.err, None);
+    assert_eq!(reply.status, VerifyStatus::DecodeError as i32);
+    kzg.send(kzg_body(VerifyKzgRequestBody {
+        request_id: 2,
+        cells: (0..=max).map(cell).collect(),
+        deadline_unix_ms: far_deadline(),
+        generation: 0,
+    }))
+    .await;
+    let err = kzg.expect_failure().await;
+    assert_eq!(
+        err.code(),
+        cl_verify::proto::common::ErrorCode::ContractViolation
+    );
+    assert!(
+        err.detail.contains(&format!("cap of {max}")),
+        "{}",
+        err.detail
+    );
+    drop((kzg, client));
+
+    let status = tokio::task::block_in_place(|| signal_and_wait(&mut child, "-TERM"));
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+#[test]
+fn binary_without_a_network_dir_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = cl_verify()
+        .arg("--trusted-setup")
+        .arg(setup_config().path)
+        .arg("--socket")
+        .arg(dir.path().join("verify.sock"))
+        .args(["--peer-uid", &my_uid().to_string()])
+        .arg("--pubkey-snapshot")
+        .arg(dir.path().join("pubkeys.bin"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--network-dir is required"), "{stderr}");
+    assert!(!dir.path().join("verify.sock").exists());
+}
+
+#[test]
+fn binary_exits_1_on_a_network_dir_that_does_not_read_without_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let net = network_dir(dir.path());
+    std::fs::remove_file(net.join("genesis.ssz")).unwrap();
+    let out = cl_verify()
+        .arg("--trusted-setup")
+        .arg(setup_config().path)
+        .arg("--socket")
+        .arg(dir.path().join("verify.sock"))
+        .args(["--peer-uid", &my_uid().to_string()])
+        .arg("--pubkey-snapshot")
+        .arg(dir.path().join("pubkeys.bin"))
+        .arg("--network-dir")
+        .arg(&net)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("network config refused"), "{stderr}");
+    assert!(stderr.contains("genesis.ssz"), "{stderr}");
+    assert!(!dir.path().join("verify.sock").exists());
 }
 
 #[test]

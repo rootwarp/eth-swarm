@@ -125,7 +125,8 @@ only.
                          on a path without symlinks no other user can change
   --socket-dir DIR       serve: the socket root, an absolute path without symlinks writable
                          only by us; cl-chain's socket is DIR/cl-chain/cl-chain.sock
-  --verify-socket PATH   serve: cl-verify's socket (cl-verify --socket PATH --peer-uid <our UID>)
+  --verify-socket PATH   serve: cl-verify's socket (cl-verify --socket PATH --peer-uid <our UID>
+                         --network-dir <the devnet's DIR>), waited for up to 30 s to accept
   --verify-uid UID       serve: the UID cl-verify runs as (default: ours)
   --listen MULTIADDR     serve: where the probe swarm listens, repeatable
                          (default /ip4/0.0.0.0/tcp/9000)
@@ -224,6 +225,8 @@ struct ServeArgs {
     listen: Vec<Multiaddr>,
     serve_for: Duration,
     answer_prefixes: AnswerPrefixes,
+    /// How long `serve` waits for `--verify-socket` to accept ([`serve::VERIFY_SOCKET_WAIT`]).
+    verify_wait: Duration,
 }
 
 /// The error for an argument the probe does not take: only a flag's key is named, never a
@@ -326,6 +329,7 @@ fn parse(argv: &[String]) -> Result<Parsed, String> {
             listen: Vec::new(),
             serve_for: serve::DEFAULT_SERVE,
             answer_prefixes: AnswerPrefixes::default(),
+            verify_wait: serve::VERIFY_SOCKET_WAIT,
         },
     };
     let mut it = argv[1..].iter();
@@ -458,6 +462,7 @@ impl ServeArgs {
             listen: Vec::new(),
             serve_for: serve::DEFAULT_SERVE,
             answer_prefixes: AnswerPrefixes::default(),
+            verify_wait: serve::VERIFY_SOCKET_WAIT,
         }
     }
 }
@@ -488,8 +493,8 @@ async fn serve_check<E: EthSpec>(args: &Args, devnet: &Devnet) -> Check {
     let uid = s
         .verify_uid
         .unwrap_or_else(|| ipc::uds::Ownership::current().uid);
-    let kzg = match ipc::uds::connect_path(verify_socket, uid).await {
-        Ok(channel) => KzgClient::new(VerifyServiceClient::new(channel), serve::verify_hello()),
+    let channel = match serve::connect_verify(verify_socket, uid, s.verify_wait).await {
+        Ok(channel) => channel,
         Err(e) => {
             return Check::failed(
                 serve::NAME,
@@ -497,6 +502,13 @@ async fn serve_check<E: EthSpec>(args: &Args, devnet: &Devnet) -> Check {
             )
         }
     };
+    // The clock of the run: our verify.v1 hello and every deadline of `serve` start here.
+    let now = system_ms();
+    let hello = match serve::verify_hello(devnet, now) {
+        Ok(hello) => hello,
+        Err(e) => return Check::failed(serve::NAME, e),
+    };
+    let kzg = KzgClient::new(VerifyServiceClient::new(channel), hello);
     let plan = ServePlan {
         listen: if s.listen.is_empty() {
             vec![default_listen()]
@@ -511,7 +523,7 @@ async fn serve_check<E: EthSpec>(args: &Args, devnet: &Devnet) -> Check {
         answer_prefixes: s.answer_prefixes,
     };
     let tap = capture_tap(serve::TAP_CAPACITY);
-    serve::serve::<E, KzgClient>(devnet, reference, kzg, &plan, tap, system_ms()).await
+    serve::serve::<E, KzgClient>(devnet, reference, kzg, &plan, tap, now).await
 }
 
 /// Unix milliseconds of the system clock.
@@ -1207,9 +1219,12 @@ mod tests {
             ])
         };
         let check = |api: &str| {
-            let Parsed::Run(a) = parse(&argv(api)).unwrap() else {
+            let Parsed::Run(mut a) = parse(&argv(api)).unwrap() else {
                 panic!()
             };
+            assert_eq!(a.serve.verify_wait, serve::VERIFY_SOCKET_WAIT);
+            // A cl-verify that is not there is not waited for here.
+            a.serve.verify_wait = Duration::ZERO;
             rt.block_on(serve_check::<Minimal>(&a, &devnet))
         };
         let based = check("http://127.0.0.1:5052/base");
@@ -1227,17 +1242,22 @@ mod tests {
         );
         assert!(!dir.join("columns").exists(), "nothing opened");
         // With cl-verify there, serve starts: this config has no serve range, so it ends there.
-        let _listener =
-            rt.block_on(async { tokio::net::UnixListener::bind(dir.join("verify.sock")).unwrap() });
-        let served = rt.block_on(async {
-            tokio::time::timeout(Duration::from_secs(30), async {
+        // cl-verify binds its socket only after serve starts: serve waits for it.
+        let socket = dir.join("verify.sock");
+        let (served, _listener) = rt.block_on(async {
+            let listener = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                tokio::net::UnixListener::bind(socket).unwrap()
+            });
+            let served = tokio::time::timeout(Duration::from_secs(30), async {
                 let Parsed::Run(a) = parse(&argv("http://127.0.0.1:5052")).unwrap() else {
                     panic!()
                 };
                 serve_check::<Minimal>(&a, &devnet).await
             })
             .await
-            .unwrap()
+            .unwrap();
+            (served, listener.await.unwrap())
         });
         assert!(!served.passed());
         assert!(

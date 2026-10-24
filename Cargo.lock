@@ -1835,7 +1835,6 @@ dependencies = [
  "prometheus-client",
  "rustix",
  "serde",
- "sha2 0.10.9",
  "svc-runtime",
  "tempfile",
  "testkit",

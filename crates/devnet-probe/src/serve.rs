@@ -60,12 +60,11 @@ use consensus_types::caps::NetworkCaps;
 use consensus_types::das::NUMBER_OF_COLUMNS;
 use consensus_types::primitives::U256;
 use consensus_types::{forked, EthSpec};
-use ethswarm_proto::common::{
-    BlobScheduleEntry, ForkName as WireForkName, ForkScheduleEntry, Hello, SpecPin,
-};
+use ethswarm_proto::common::Hello;
 use futures::StreamExt;
 use ipc::acl::{AclLayer, AclTables, MethodAcl};
 use ipc::envelope::DigestTable;
+use ipc::hello::NetworkHello;
 use ipc::uds::{Ownership, SocketDir, SocketGuard};
 use ipc::Link;
 use libp2p::identity::Keypair;
@@ -73,7 +72,6 @@ use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::swarm::{dial_opts::DialOpts, NetworkBehaviour, SwarmEvent};
 use libp2p::{noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
 use network_config::digest::digest_schedule;
-use network_config::ForkName;
 use p2p_wire::gossip::{GossipKind, GossipTopic};
 use p2p_wire::rpc::messages::{
     DataColumnsByRangeV1Request, DataColumnsByRootIdentifier, DataColumnsByRootV1Request,
@@ -111,6 +109,13 @@ pub const DEFAULT_SERVE: Duration = Duration::from_secs(300);
 /// How long cl-verify may take for one column's cells \[est\].
 pub const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long `serve` waits for cl-verify's socket to accept a connection \[est\]: a cl-verify
+/// started a moment before loads its trusted setup before it binds.
+pub const VERIFY_SOCKET_WAIT: Duration = Duration::from_secs(30);
+
+/// The pause between two connection attempts to cl-verify's socket.
+const VERIFY_SOCKET_RETRY: Duration = Duration::from_millis(200);
+
 /// How many captured gossip messages wait for the hand-off at most \[est\]: a few slots of
 /// the custody subnets' columns; past it the tap drops and counts them.
 pub const TAP_CAPACITY: usize = 1024;
@@ -140,62 +145,29 @@ const BY_ROOT_BLOCKS: usize = 4;
 /// The `api_version` of the probe's chain.v1 and verify.v1 links.
 const API_VERSION: u32 = 1;
 
-/// The spec pin every hello carries.
-fn spec_pin() -> SpecPin {
-    SpecPin {
-        consensus_specs_tag: network_config::SPEC_PIN.consensus_specs.into(),
-        ssz_specs_tag: network_config::SPEC_PIN.ssz_specs.into(),
-    }
+/// The network hello of the devnet at `now_ms` ([`ipc::hello::NetworkHello`]): its genesis
+/// validators root, the digest of the wall clock at `now_ms`, every fork and blob-schedule
+/// entry, our spec pin and API version. cl-verify builds its own hello from the same files
+/// (`cl-verify --network-dir`) in the same way, so the two differ only in `build`.
+fn network_hello(devnet: &Devnet, now_ms: u128) -> Result<Hello, String> {
+    let build = concat!("devnet-probe/", env!("CARGO_PKG_VERSION"));
+    NetworkHello::new(build, devnet.config(), devnet.genesis())
+        .map_err(|e| e.to_string())?
+        .at(now_ms)
+        .map_err(|e| format!("our fork digest: {e}"))
 }
 
-/// The chain.v1 link both ends of cl-chain's socket hold: our hello (the devnet's genesis
-/// validators root, the digest of the wall clock at `now_ms`, every fork and blob-schedule
-/// entry) and every digest of the schedule.
+/// The chain.v1 link both ends of cl-chain's socket hold: our hello ([`network_hello`] at
+/// `now_ms`) and every digest of the schedule.
 ///
 /// # Errors
 ///
 /// The clock is before genesis or Fulu, or the schedule has no digest.
 pub fn chain_link<E: EthSpec>(devnet: &Devnet, now_ms: u128) -> Result<Link, String> {
     let config = devnet.config();
-    let gvr = devnet.genesis().genesis_validators_root;
-    let current = devnet
-        .fork_digest(now_ms)
-        .map_err(|e| format!("our fork digest: {e}"))?;
-    let schedule = digest_schedule(config, &gvr);
-    let wire = |fork: ForkName| match fork {
-        ForkName::Fulu => WireForkName::Fulu,
-        ForkName::Gloas => WireForkName::Gloas,
-    };
-    let hello = Hello {
-        api_version: API_VERSION,
-        build: concat!("devnet-probe/", env!("CARGO_PKG_VERSION")).into(),
-        genesis_validators_root: gvr.to_vec(),
-        current_fork_digest: current.to_vec(),
-        spec_pin: Some(spec_pin()),
-        fork_schedule: schedule
-            .iter()
-            .map(|e| ForkScheduleEntry {
-                epoch: e.epoch,
-                fork_digest: e.fork_digest.to_vec(),
-                fork: wire(e.fork) as i32,
-                fork_version: e.fork_version.to_vec(),
-                max_blobs_per_block: e.blob_parameters.max_blobs_per_block,
-            })
-            .collect(),
-        blob_schedule: config
-            .blob_schedule()
-            .iter()
-            .map(|b| BlobScheduleEntry {
-                epoch: b.epoch,
-                max_blobs_per_block: b.max_blobs_per_block,
-            })
-            .collect(),
-        min_api_version: API_VERSION,
-        max_api_version: API_VERSION,
-        generation: 0,
-    };
+    let hello = network_hello(devnet, now_ms)?;
     let digests = DigestTable::new(
-        schedule
+        digest_schedule(config, &devnet.genesis().genesis_validators_root)
             .iter()
             .map(|e| (e.epoch, e.fork, e.fork_digest))
             .collect(),
@@ -209,18 +181,64 @@ pub fn chain_link<E: EthSpec>(devnet: &Devnet, now_ms: u128) -> Result<Link, Str
     ))
 }
 
-/// The hello of cl-chain's side of the verify.v1 link, as cl-verify's own: the spec pin and
-/// the API version, nothing of the network.
-#[must_use]
-pub fn verify_hello() -> Hello {
-    Hello {
-        api_version: API_VERSION,
-        build: concat!("devnet-probe/", env!("CARGO_PKG_VERSION")).into(),
-        spec_pin: Some(spec_pin()),
-        min_api_version: API_VERSION,
-        max_api_version: API_VERSION,
-        ..Hello::default()
+/// The hello of cl-chain's side of the verify.v1 link at `now_ms`: the devnet's network hello
+/// ([`network_hello`]), equal to the one cl-verify sends for `--network-dir` of the same
+/// devnet apart from `build`. A run ends before the next fork digest ([`clip_until`]), so the
+/// hello of its start holds for the whole run.
+///
+/// # Errors
+///
+/// The clock is before genesis or Fulu.
+pub fn verify_hello(devnet: &Devnet, now_ms: u128) -> Result<Hello, String> {
+    network_hello(devnet, now_ms)
+}
+
+/// A channel to cl-verify at `path`, which must run as `uid` ([`ipc::uds::connect_path`]). While
+/// the socket is not there yet or refuses connections ([`is_not_ready`]), the connection is tried
+/// again every 200 ms until `wait` is over; any other error (a server of another user included)
+/// is returned at once.
+///
+/// # Errors
+///
+/// The last connection error.
+pub async fn connect_verify(
+    path: &Path,
+    uid: u32,
+    wait: Duration,
+) -> Result<tonic::transport::Channel, tonic::transport::Error> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match ipc::uds::connect_path(path, uid).await {
+            Ok(channel) => return Ok(channel),
+            Err(e)
+                if is_not_ready(&e)
+                    && tokio::time::Instant::now() + VERIFY_SOCKET_RETRY <= deadline =>
+            {
+                tracing::info!(socket = %path.display(), "cl-verify is not accepting yet; trying again");
+                tokio::time::sleep(VERIFY_SOCKET_RETRY).await;
+            }
+            Err(e) => return Err(e),
+        }
     }
+}
+
+/// Whether `err` is a socket that is not there yet (`NotFound`) or that nobody listens on yet
+/// (`ConnectionRefused`), anywhere in its source chain.
+#[must_use]
+pub fn is_not_ready(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut next = Some(err);
+    while let Some(e) = next {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) {
+                return true;
+            }
+        }
+        next = e.source();
+    }
+    false
 }
 
 /// The discv5 node ID of `key` as the spec's `uint256`: what the custody columns are drawn
@@ -1660,11 +1678,36 @@ mod tests {
         assert_eq!(hello.current_fork_digest, devnet.fork_digest(now).unwrap());
         assert_eq!(hello.fork_schedule.len(), 3);
         assert_eq!(hello.blob_schedule.len(), 1);
-        assert_eq!(hello.spec_pin, Some(spec_pin()));
-        assert_eq!(verify_hello().spec_pin, Some(spec_pin()));
-        assert!(verify_hello().genesis_validators_root.is_empty());
+        assert_eq!(hello.spec_pin, Some(ipc::hello::spec_pin()));
         let before = u128::from(devnet.genesis().genesis_time) * 1000 - 1;
         assert!(chain_link::<Minimal>(&devnet, before).is_err());
+    }
+
+    /// cl-chain's verify.v1 hello is the devnet's network hello at the clock: what cl-verify
+    /// sends for `--network-dir` of the same files, apart from `build`, so the handshake passes
+    /// and the KZG cell cap is the devnet's.
+    #[test]
+    fn the_verify_hello_is_the_network_hello_cl_verify_sends() {
+        let devnet = devnet();
+        let now = crate::fixtures::now_ms();
+        let ours = verify_hello(&devnet, now).unwrap();
+        assert_eq!(&ours, chain_link::<Minimal>(&devnet, now).unwrap().local());
+        let cl_verify =
+            ipc::hello::NetworkHello::new("cl-verify/0", devnet.config(), devnet.genesis())
+                .unwrap()
+                .at(now)
+                .unwrap();
+        assert_eq!(
+            Hello {
+                build: cl_verify.build.clone(),
+                ..ours.clone()
+            },
+            cl_verify
+        );
+        assert_eq!(ipc::hello::negotiate(&cl_verify, &ours, API_VERSION), Ok(1));
+        assert!(ours.fork_schedule.iter().all(|e| e.max_blobs_per_block > 0));
+        let before = u128::from(devnet.genesis().genesis_time) * 1000 - 1;
+        assert!(verify_hello(&devnet, before).is_err());
     }
 
     /// A run ends before the next fork digest, by [`AFTER_SERVING`]: cut short when it would
@@ -2097,5 +2140,66 @@ mod tests {
         assert!(!text.contains("wrong_subnet"), "{text}");
         assert!(text.contains("not_custody=2"), "{text}");
         assert!(text.contains("kzg_invalid=1"), "{text}");
+    }
+
+    /// A path for a socket in a fresh directory, short enough for a socket path.
+    fn socket_in(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("verify.sock")
+    }
+
+    #[tokio::test]
+    async fn the_verify_socket_is_waited_for_until_it_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_in(&dir);
+        let uid = Ownership::current().uid;
+        let later = path.clone();
+        let bound = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::net::UnixListener::bind(later).unwrap()
+        });
+        let started = std::time::Instant::now();
+        let channel = connect_verify(&path, uid, Duration::from_secs(10)).await;
+        assert!(channel.is_ok(), "{:?}", channel.err());
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        drop(bound.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_verify_socket_wait_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_in(&dir);
+        let uid = Ownership::current().uid;
+        // No wait: one attempt.
+        let started = std::time::Instant::now();
+        let err = connect_verify(&path, uid, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(is_not_ready(&err), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // A socket file nobody listens on refuses connections: still not ready, until the wait
+        // is over.
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        let started = std::time::Instant::now();
+        let err = connect_verify(&path, uid, Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert!(is_not_ready(&err), "{err:?}");
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(400), "{waited:?}");
+        assert!(waited < Duration::from_secs(3), "{waited:?}");
+    }
+
+    #[tokio::test]
+    async fn a_verify_socket_of_another_user_is_refused_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_in(&dir);
+        let _listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let other = Ownership::current().uid.wrapping_add(1);
+        let started = std::time::Instant::now();
+        let err = connect_verify(&path, other, Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(!is_not_ready(&err), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

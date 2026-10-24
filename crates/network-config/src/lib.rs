@@ -7,6 +7,7 @@
 //! - [`digest`]: `compute_fork_digest` with the Fulu blob-parameter rule, and the wall-clock
 //!   epoch.
 //! - [`Network::genesis`]: the pinned genesis time and validators root.
+//! - [`network_dir`]: a devnet's `config.yaml` and `genesis.ssz`, read from one directory.
 //! - [`MAX_SEED_LOOKAHEAD`]: the preset activation lookahead.
 //! - [`SPEC_PIN`]: the spec releases every type and vector in the workspace follows.
 
@@ -14,6 +15,7 @@ mod chain_config;
 pub mod digest;
 mod flat_yaml;
 mod fork_schedule;
+pub mod network_dir;
 mod preset;
 
 pub use chain_config::{

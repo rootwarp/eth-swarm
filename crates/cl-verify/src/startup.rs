@@ -1,4 +1,5 @@
-//! Process startup, in this order: load the KZG trusted setup and check its sha256 against
+//! Process startup, in this order: read the network ([`Args::into_config`]: `--network-dir`
+//! gives the hello of every stream), load the KZG trusted setup and check its sha256 against
 //! [`crypto_kzg::BETA4_MAINNET_SHA256`], bind the Unix socket, start serving, then report READY to
 //! the service manager.
 //!
@@ -26,6 +27,8 @@ use std::task::Poll;
 use std::time::Duration;
 
 use crypto_kzg::SetupError;
+use ipc::hello::{NetworkHello, UnknownPreset};
+use network_config::network_dir::{NetworkDir, NetworkDirError};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch;
@@ -43,16 +46,23 @@ use crate::server::{
 /// The `api_version` this build speaks, and the lowest one it accepts.
 pub const API_VERSION: u32 = 1;
 
+/// The `build` of every hello this binary sends.
+pub const BUILD: &str = concat!("cl-verify/", env!("CARGO_PKG_VERSION"));
+
 /// Command-line usage.
 pub const USAGE: &str = "\
 usage: cl-verify --trusted-setup <PATH> --socket <PATH> --peer-uid <UID> --pubkey-snapshot <PATH>
+                 --network-dir <DIR>
 
   --trusted-setup    consensus-specs v1.7.0-beta.4
                      presets/mainnet/trusted_setups/trusted_setup_4096.json
   --socket           Unix socket to serve ethswarm.verify.v1 on
   --peer-uid         the only peer UID served (cl-chain's)
   --pubkey-snapshot  pubkey cache snapshot file (pubkeys.bin); its directory must be writable
-                     only by the cl-verify user (e.g. the service's state directory)";
+                     only by the cl-verify user (e.g. the service's state directory)
+  --network-dir      the network's genesis data: DIR/config.yaml and DIR/genesis.ssz, the same
+                     files cl-chain reads; every hello carries their genesis validators root,
+                     fork and blob schedules, and the KZG cell cap follows the blob schedule";
 
 /// How long open connections get to finish once shutdown begins.
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -67,8 +77,20 @@ pub struct StartupConfig {
     pub drain_timeout: Duration,
 }
 
+/// Why the network of `--network-dir` was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum NetworkError {
+    #[error(transparent)]
+    Dir(#[from] NetworkDirError),
+    #[error(transparent)]
+    Preset(#[from] UnknownPreset),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StartupError {
+    /// `--network-dir` cannot be read, or its config is not valid.
+    #[error("network config refused: {0}")]
+    Network(#[from] NetworkError),
     /// The trusted setup is missing, unreadable, or not the pinned file.
     #[error("trusted setup refused: {0}")]
     Setup(#[from] SetupError),
@@ -353,6 +375,7 @@ pub struct Args {
     pub socket: PathBuf,
     pub peer_uid: u32,
     pub pubkey_snapshot: PathBuf,
+    pub network_dir: PathBuf,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -372,13 +395,18 @@ pub enum UsageError {
 }
 
 impl Args {
-    /// Parses `--trusted-setup <PATH> --socket <PATH> --peer-uid <UID> --pubkey-snapshot <PATH>`
-    /// (any order, all required), or `--help`.
+    /// Parses `--trusted-setup <PATH> --socket <PATH> --peer-uid <UID> --pubkey-snapshot <PATH>
+    /// --network-dir <DIR>` (any order, all required), or `--help`.
+    ///
+    /// `--network-dir` is required: without the network, every cl-chain hello fails with
+    /// `VERSION_MISMATCH` and the KZG cell cap is 0, so a process that started would serve
+    /// nothing.
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, UsageError> {
         let mut setup = None;
         let mut socket = None;
         let mut uid = None;
         let mut snapshot = None;
+        let mut network = None;
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             let (name, slot) = match arg.to_str() {
@@ -387,6 +415,7 @@ impl Args {
                 Some("--socket") => ("--socket", &mut socket),
                 Some("--peer-uid") => ("--peer-uid", &mut uid),
                 Some("--pubkey-snapshot") => ("--pubkey-snapshot", &mut snapshot),
+                Some("--network-dir") => ("--network-dir", &mut network),
                 _ => return Err(UsageError::Unknown(arg)),
             };
             let value = args.next().ok_or(UsageError::MissingValue(name))?;
@@ -401,6 +430,7 @@ impl Args {
             pubkey_snapshot: snapshot
                 .ok_or(UsageError::Required("--pubkey-snapshot"))?
                 .into(),
+            network_dir: network.ok_or(UsageError::Required("--network-dir"))?.into(),
             peer_uid: uid
                 .to_str()
                 .and_then(|s| s.parse().ok())
@@ -408,13 +438,19 @@ impl Args {
         })
     }
 
-    /// The startup configuration, with default limits, the default snapshot interval and
-    /// [`local_hello`]. This is the one place a production [`ServerConfig`] is built.
-    #[must_use]
-    pub fn into_config(self) -> StartupConfig {
-        StartupConfig {
+    /// The startup configuration, with default limits, the default snapshot interval and the
+    /// hello of `--network-dir` ([`network_hello`]). This is the one place a production
+    /// [`ServerConfig`] is built.
+    ///
+    /// # Errors
+    ///
+    /// The network directory cannot be read or its config is not valid
+    /// ([`StartupError::Network`]).
+    pub fn into_config(self) -> Result<StartupConfig, StartupError> {
+        let network = network_hello(&self.network_dir)?;
+        Ok(StartupConfig {
             server: ServerConfig {
-                handshake: Handshake::new(local_hello(), API_VERSION),
+                handshake: Handshake::network(network, API_VERSION),
                 peer_uid: self.peer_uid,
                 trusted_setup: TrustedSetupConfig {
                     path: self.trusted_setup,
@@ -425,22 +461,35 @@ impl Args {
             },
             socket_path: self.socket,
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
-        }
+        })
     }
 }
 
-/// The hello this build sends: API version, build and spec pin only.
+/// The hello of the network in `dir` (`config.yaml` and `genesis.ssz`, read by
+/// [`NetworkDir::read`]), sent with [`BUILD`]. cl-chain's side builds its verify.v1 hello the
+/// same way from the same files ([`NetworkHello`]), so the two are equal apart from `build`.
 ///
-/// No network configuration reaches cl-verify yet (that needs fork-digest computation), so the
-/// genesis root, fork digest and schedules are empty, and this fails closed: the hello of a real
-/// cl-chain, which carries them, is refused with `VERSION_MISMATCH`, and with no blob schedule the
-/// KZG cell cap ([`crate::caps::max_kzg_cells`]) is 0, so every KZG batch is refused before it is
-/// verified. Startup warns about it ([`unwired_network_warning`]).
+/// # Errors
+///
+/// A file cannot be read, the config is not valid, or its `PRESET_BASE` is neither `minimal`
+/// nor `mainnet`.
+pub fn network_hello(dir: &Path) -> Result<NetworkHello, NetworkError> {
+    let network = NetworkDir::read(dir)?;
+    Ok(NetworkHello::new(BUILD, &network.config, network.genesis)?)
+}
+
+/// A hello without a network: API version, build and spec pin only.
+///
+/// The binary never sends it (`--network-dir` is required). It fails closed for a
+/// [`StartupConfig`] built with it: the hello of a real cl-chain, which carries the network, is
+/// refused with `VERSION_MISMATCH`, and with no blob schedule the KZG cell cap
+/// ([`crate::caps::max_kzg_cells`]) is 0, so every KZG batch is refused before it is verified.
+/// [`run_with`] warns about it ([`unwired_network_warning`]).
 #[must_use]
 pub fn local_hello() -> Hello {
     Hello {
         api_version: API_VERSION,
-        build: concat!("cl-verify/", env!("CARGO_PKG_VERSION")).into(),
+        build: BUILD.into(),
         spec_pin: Some(SpecPin {
             consensus_specs_tag: network_config::SPEC_PIN.consensus_specs.into(),
             ssz_specs_tag: network_config::SPEC_PIN.ssz_specs.into(),
@@ -456,7 +505,7 @@ mod tests {
     use super::*;
 
     /// A complete command line.
-    const OK: [&str; 8] = [
+    const OK: [&str; 10] = [
         "--trusted-setup",
         "s",
         "--socket",
@@ -465,6 +514,8 @@ mod tests {
         "1",
         "--pubkey-snapshot",
         "p",
+        "--network-dir",
+        "n",
     ];
 
     fn parse(args: &[&str]) -> Result<Args, UsageError> {
@@ -472,12 +523,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_the_four_flags_in_any_order() {
+    fn parses_the_five_flags_in_any_order() {
         let want = Args {
             trusted_setup: "/etc/setup.json".into(),
             socket: "/run/verify.sock".into(),
             peer_uid: 990,
             pubkey_snapshot: "/var/lib/cl-verify/pubkeys.bin".into(),
+            network_dir: "/etc/ethswarm/network".into(),
         };
         let a = [
             "--trusted-setup",
@@ -488,9 +540,11 @@ mod tests {
             "990",
             "--pubkey-snapshot",
             "/var/lib/cl-verify/pubkeys.bin",
+            "--network-dir",
+            "/etc/ethswarm/network",
         ];
         assert_eq!(parse(&a), Ok(want.clone()));
-        let b = [a[6], a[7], a[4], a[5], a[2], a[3], a[0], a[1]];
+        let b = [a[8], a[9], a[6], a[7], a[4], a[5], a[2], a[3], a[0], a[1]];
         assert_eq!(parse(&b), Ok(want));
     }
 
@@ -524,8 +578,18 @@ mod tests {
             Err(UsageError::Required("--peer-uid"))
         );
         assert_eq!(
-            parse(&ok[..6]),
+            parse(&[&ok[..6], &ok[8..]].concat()),
             Err(UsageError::Required("--pubkey-snapshot"))
+        );
+        // Without a network, no cl-chain hello can match and the KZG cell cap is 0.
+        assert_eq!(parse(&ok[..8]), Err(UsageError::Required("--network-dir")));
+        assert_eq!(
+            parse(&[&ok[..8], &["--network-dir"]].concat()),
+            Err(UsageError::MissingValue("--network-dir"))
+        );
+        assert_eq!(
+            parse(&[&ok[..], &["--network-dir", "m"]].concat()),
+            Err(UsageError::Duplicate("--network-dir"))
         );
         assert_eq!(
             parse(&[&ok[..4], &["--peer-uid", "-1"], &ok[6..]].concat()),
@@ -533,15 +597,79 @@ mod tests {
         );
     }
 
+    /// A network directory with the devnet of [`crate::handshake::tests::DEVNET_CONFIG`].
+    fn devnet_dir() -> tempfile::TempDir {
+        use crate::handshake::tests::{DEVNET_CONFIG, DEVNET_GENESIS};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.yaml"), DEVNET_CONFIG).unwrap();
+        let mut state = DEVNET_GENESIS.genesis_time.to_le_bytes().to_vec();
+        state.extend_from_slice(&DEVNET_GENESIS.genesis_validators_root);
+        state.extend_from_slice(&[0xee; 64]);
+        std::fs::write(dir.path().join("genesis.ssz"), state).unwrap();
+        dir
+    }
+
+    /// [`OK`] with `dir` as the network directory.
+    fn with_network(dir: &Path) -> Args {
+        let mut argv = OK.to_vec();
+        argv[9] = dir.to_str().unwrap();
+        parse(&argv).unwrap()
+    }
+
     #[test]
     fn config_uses_the_given_paths_and_uid() {
-        let cfg = parse(&OK).unwrap().into_config();
+        let dir = devnet_dir();
+        let cfg = with_network(dir.path()).into_config().unwrap();
         assert_eq!(cfg.socket_path, PathBuf::from("k"));
         assert_eq!(cfg.server.peer_uid, 1);
         assert_eq!(cfg.server.pubkey_snapshot, PathBuf::from("p"));
         assert_eq!(cfg.server.snapshot_interval, DEFAULT_SNAPSHOT_INTERVAL);
         assert_eq!(cfg.server.trusted_setup.path, PathBuf::from("s"));
-        assert_eq!(cfg.server.handshake.ours(), &local_hello());
+    }
+
+    /// The hello of `--network-dir` is the network's: what cl-chain's side of the link sends
+    /// for the same directory, so the handshake passes, and the KZG cell cap is one block at the
+    /// network's largest blob count.
+    #[test]
+    fn the_network_dir_gives_the_hello_of_the_network() {
+        use crate::handshake::tests::{devnet, devnet_ms, At};
+        let dir = devnet_dir();
+        let cfg = with_network(dir.path()).into_config().unwrap();
+        let ours = cfg.server.handshake.ours();
+        assert_eq!(ours, network_hello(dir.path()).unwrap().schedule());
+        assert_eq!(ours.genesis_validators_root, [0x42; 32]);
+        assert_eq!(ours.fork_schedule.len(), 3);
+        assert_eq!(ours.build, BUILD);
+        assert_eq!(unwired_network_warning(&cfg.server), None);
+        assert_eq!(crate::caps::max_kzg_cells(ours), 128 * 12);
+
+        let chain = devnet("cl-chain/test");
+        for slot in [0, 8, 16, 1_000] {
+            let now = devnet_ms(slot);
+            let theirs = chain.at(u128::from(now)).unwrap();
+            let (_, sent) = cfg.server.handshake.accept(&theirs, &At(now)).unwrap();
+            assert_eq!(
+                Hello {
+                    build: theirs.build.clone(),
+                    ..sent
+                },
+                theirs
+            );
+        }
+    }
+
+    #[test]
+    fn a_network_dir_that_does_not_read_fails_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = with_network(dir.path()).into_config().unwrap_err();
+        assert!(matches!(err, StartupError::Network(_)), "{err:?}");
+        assert!(err.to_string().contains("config.yaml"), "{err}");
+
+        let devnet = devnet_dir();
+        let yaml = crate::handshake::tests::DEVNET_CONFIG.replace("'minimal'", "'gnosis'");
+        std::fs::write(devnet.path().join("config.yaml"), yaml).unwrap();
+        let err = with_network(devnet.path()).into_config().unwrap_err();
+        assert!(err.to_string().contains("gnosis"), "{err}");
     }
 
     /// Until network config reaches cl-verify, the unwired hello fails closed: a real cl-chain
@@ -569,14 +697,16 @@ mod tests {
             ..ours.clone()
         };
         let err = Handshake::new(ours, API_VERSION)
-            .accept(&chain)
+            .accept(&chain, &crate::wire::SystemClock)
             .unwrap_err();
         assert_eq!(err.code(), crate::proto::common::ErrorCode::VersionMismatch);
     }
 
     #[test]
     fn unwired_network_config_is_warned_about() {
-        let unwired = parse(&OK).unwrap().into_config();
+        let dir = devnet_dir();
+        let mut unwired = with_network(dir.path()).into_config().unwrap();
+        unwired.server.handshake = Handshake::new(local_hello(), API_VERSION);
         let warning = unwired_network_warning(&unwired.server).expect("a warning");
         assert!(warning.contains("not wired"), "{warning}");
 

@@ -574,8 +574,9 @@ impl Inner {
         tracing::warn!(code = ?err.code(), detail = %err.detail, "verify stream failed");
     }
 
-    /// Reads and checks the peer's hello within the hello timeout, then sends ours with a fresh
-    /// server generation for this stream ([`ipc::hello::stream_hello`]). Returns that generation,
+    /// Reads and checks the peer's hello within the hello timeout against ours at the wall clock
+    /// ([`Handshake::accept`]), then sends ours with a fresh server generation for this stream
+    /// ([`ipc::hello::stream_hello`]). Returns that generation,
     /// or `None` if the stream already failed.
     async fn open<S, Req, Q>(
         &self,
@@ -597,8 +598,8 @@ impl Inner {
                 ))
             });
         let opened = hello
-            .and_then(|theirs| self.handshake.accept(&theirs))
-            .and_then(|_| stream_hello(self.handshake.ours()).map_err(Error::from));
+            .and_then(|theirs| self.handshake.accept(&theirs, self.clock.as_ref()))
+            .and_then(|(_, ours)| stream_hello(&ours).map_err(Error::from));
         match opened {
             Ok((generation, ours)) => tx
                 .send(Q::plain(Ok(Q::Frame::hello(ours))))

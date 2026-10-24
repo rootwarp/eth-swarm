@@ -12,10 +12,18 @@
 //! answers ([`stream_hello`]), so it changes on every restart and every reconnect; the client
 //! reads it from the server's hello ([`Generation::from_hello`], where 0 is a contract
 //! violation) and fences every request and result of the stream with it ([`crate::fence`]).
+//!
+//! [`NetworkHello`] builds the network part of a hello from a network's config and genesis, so
+//! every service of one node that reads the same network sends the same hello.
 
 use std::num::NonZeroU64;
 
-use ethswarm_proto::common::{ErrorCode, ForkName, Hello, SpecPin};
+use consensus_types::{EthSpec, Mainnet, Minimal};
+use ethswarm_proto::common::{
+    BlobScheduleEntry, ErrorCode, ForkName, ForkScheduleEntry, Hello, SpecPin,
+};
+use network_config::digest::{compute_fork_digest, current_epoch, digest_schedule, DigestError};
+use network_config::{ChainConfig, Genesis};
 
 use crate::error::ContractError;
 
@@ -87,6 +95,112 @@ pub fn from_spec_pin(pin: &network_config::SpecPin) -> SpecPin {
     SpecPin {
         consensus_specs_tag: pin.consensus_specs.to_owned(),
         ssz_specs_tag: pin.ssz_specs.to_owned(),
+    }
+}
+
+/// A network's `PRESET_BASE` that is neither `minimal` nor `mainnet`.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("PRESET_BASE {0:?} is neither minimal nor mainnet")]
+pub struct UnknownPreset(pub String);
+
+/// The hello of one network: the genesis validators root, every fork-schedule entry with its
+/// digest, fork version and blob limit (`network_config::digest::digest_schedule`, BPO epochs
+/// included), the BPO blob schedule, the spec pin and API version [`API_VERSION_V1`]. Only
+/// `current_fork_digest` depends on the clock ([`Self::at`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetworkHello {
+    schedule: Hello,
+    config: ChainConfig,
+    genesis: Genesis,
+    slots_per_epoch: u64,
+}
+
+impl NetworkHello {
+    /// The hello of the network of `config` and `genesis`, sent with `build`. The epoch length is
+    /// the one of the preset that `PRESET_BASE` names.
+    ///
+    /// # Errors
+    ///
+    /// `PRESET_BASE` is neither `minimal` nor `mainnet`.
+    pub fn new(build: &str, config: &ChainConfig, genesis: Genesis) -> Result<Self, UnknownPreset> {
+        let slots_per_epoch = match config.preset_base() {
+            p if p == Minimal::NAME => Minimal::slots_per_epoch(),
+            p if p == Mainnet::NAME => Mainnet::slots_per_epoch(),
+            other => return Err(UnknownPreset(other.to_owned())),
+        };
+        let gvr = genesis.genesis_validators_root;
+        let wire = |fork: network_config::ForkName| match fork {
+            network_config::ForkName::Fulu => ForkName::Fulu,
+            network_config::ForkName::Gloas => ForkName::Gloas,
+        };
+        let schedule = Hello {
+            api_version: API_VERSION_V1,
+            build: build.to_owned(),
+            genesis_validators_root: gvr.to_vec(),
+            current_fork_digest: Vec::new(),
+            spec_pin: Some(spec_pin()),
+            fork_schedule: digest_schedule(config, &gvr)
+                .iter()
+                .map(|e| ForkScheduleEntry {
+                    epoch: e.epoch,
+                    fork_digest: e.fork_digest.to_vec(),
+                    fork: wire(e.fork) as i32,
+                    fork_version: e.fork_version.to_vec(),
+                    max_blobs_per_block: e.blob_parameters.max_blobs_per_block,
+                })
+                .collect(),
+            blob_schedule: config
+                .blob_schedule()
+                .iter()
+                .map(|b| BlobScheduleEntry {
+                    epoch: b.epoch,
+                    max_blobs_per_block: b.max_blobs_per_block,
+                })
+                .collect(),
+            min_api_version: API_VERSION_V1,
+            max_api_version: API_VERSION_V1,
+            generation: 0,
+        };
+        Ok(Self {
+            schedule,
+            config: config.clone(),
+            genesis,
+            slots_per_epoch,
+        })
+    }
+
+    /// The hello without the clock: `current_fork_digest` is empty. The schedules in it give
+    /// the network's limits (for example the largest blob count).
+    #[must_use]
+    pub fn schedule(&self) -> &Hello {
+        &self.schedule
+    }
+
+    /// `SLOTS_PER_EPOCH` of the network's preset.
+    #[must_use]
+    pub fn slots_per_epoch(&self) -> u64 {
+        self.slots_per_epoch
+    }
+
+    /// The hello at `now_ms` (Unix milliseconds): [`Self::schedule`] with the fork digest of the
+    /// wall-clock epoch as `current_fork_digest`.
+    ///
+    /// # Errors
+    ///
+    /// The clock is before genesis, or the epoch is before Fulu.
+    pub fn at(&self, now_ms: u128) -> Result<Hello, DigestError> {
+        let epoch = current_epoch(
+            self.genesis.genesis_time,
+            self.config.slot_duration_ms(),
+            self.slots_per_epoch,
+            now_ms,
+        )?;
+        let digest =
+            compute_fork_digest(&self.config, &self.genesis.genesis_validators_root, epoch)?;
+        Ok(Hello {
+            current_fork_digest: digest.to_vec(),
+            ..self.schedule.clone()
+        })
     }
 }
 
@@ -320,5 +434,136 @@ mod tests {
         let mut theirs = hello(1, 1);
         theirs.fork_schedule[0].fork = ForkName::Unspecified as i32;
         assert_eq!(code(&hello(1, 1), &theirs, 1), ErrorCode::ContractViolation);
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+    use ethswarm_proto::common::{BlobScheduleEntry, ForkScheduleEntry};
+    use network_config::digest::{compute_fork_digest, digest_schedule};
+    use network_config::{ChainConfig, Genesis};
+
+    /// Fulu from genesis, a blob change at epoch 1, Gloas at epoch 2; 6 s slots.
+    const CONFIG: &str = "\
+PRESET_BASE: 'minimal'
+CONFIG_NAME: 'fixture-devnet'
+GENESIS_FORK_VERSION: 0x00000001
+ELECTRA_FORK_EPOCH: 0
+FULU_FORK_VERSION: 0x60000001
+FULU_FORK_EPOCH: 0
+GLOAS_FORK_VERSION: 0x70000001
+GLOAS_FORK_EPOCH: 2
+SLOT_DURATION_MS: 6000
+MAX_PAYLOAD_SIZE: 10485760
+MAX_BLOBS_PER_BLOCK_ELECTRA: 9
+BLOB_SCHEDULE:
+  - EPOCH: 1
+    MAX_BLOBS_PER_BLOCK: 12
+";
+
+    const GENESIS: Genesis = Genesis {
+        genesis_time: 1_760_800_000,
+        genesis_validators_root: [0x42; 32],
+    };
+
+    fn config(yaml: &str) -> ChainConfig {
+        ChainConfig::from_devnet_yaml(yaml.as_bytes()).unwrap()
+    }
+
+    /// Unix milliseconds at `slot` of the fixture (8-slot epochs of 6 s slots).
+    fn at_slot(slot: u64) -> u128 {
+        u128::from(GENESIS.genesis_time) * 1000 + u128::from(slot) * 6_000
+    }
+
+    #[test]
+    fn the_network_hello_carries_the_genesis_root_and_every_schedule_entry() {
+        let config = config(CONFIG);
+        let net = NetworkHello::new("svc/1", &config, GENESIS).unwrap();
+        let hello = net.schedule();
+        assert_eq!(hello.api_version, API_VERSION_V1);
+        assert_eq!(hello.min_api_version, API_VERSION_V1);
+        assert_eq!(hello.max_api_version, API_VERSION_V1);
+        assert_eq!(hello.build, "svc/1");
+        assert_eq!(hello.spec_pin, Some(spec_pin()));
+        assert_eq!(hello.genesis_validators_root, [0x42; 32]);
+        assert!(hello.current_fork_digest.is_empty());
+        assert_eq!(hello.generation, 0);
+        let digests = digest_schedule(&config, &GENESIS.genesis_validators_root);
+        let want: Vec<ForkScheduleEntry> = digests
+            .iter()
+            .map(|d| ForkScheduleEntry {
+                epoch: d.epoch,
+                fork_digest: d.fork_digest.to_vec(),
+                fork: match d.fork {
+                    network_config::ForkName::Fulu => ForkName::Fulu,
+                    network_config::ForkName::Gloas => ForkName::Gloas,
+                } as i32,
+                fork_version: d.fork_version.to_vec(),
+                max_blobs_per_block: d.blob_parameters.max_blobs_per_block,
+            })
+            .collect();
+        assert_eq!(hello.fork_schedule, want);
+        assert_eq!(
+            hello
+                .fork_schedule
+                .iter()
+                .map(|e| (e.epoch, e.max_blobs_per_block))
+                .collect::<Vec<_>>(),
+            [(0, 9), (1, 12), (2, 12)]
+        );
+        assert_eq!(
+            hello.blob_schedule,
+            [BlobScheduleEntry {
+                epoch: 1,
+                max_blobs_per_block: 12
+            }]
+        );
+        assert_eq!(net.slots_per_epoch(), 8);
+    }
+
+    #[test]
+    fn the_current_fork_digest_follows_the_clock() {
+        let config = config(CONFIG);
+        let net = NetworkHello::new("svc/1", &config, GENESIS).unwrap();
+        let gvr = GENESIS.genesis_validators_root;
+        for (slot, epoch) in [(0, 0), (7, 0), (8, 1), (16, 2), (400, 50)] {
+            let hello = net.at(at_slot(slot)).unwrap();
+            assert_eq!(
+                hello.current_fork_digest,
+                compute_fork_digest(&config, &gvr, epoch).unwrap(),
+                "slot {slot}"
+            );
+            assert_eq!(
+                Hello {
+                    current_fork_digest: Vec::new(),
+                    ..hello
+                },
+                *net.schedule()
+            );
+        }
+        // The same inputs give the same hello, so two services of one node agree.
+        let other = NetworkHello::new("svc/1", &config, GENESIS).unwrap();
+        assert_eq!(other.at(at_slot(9)), net.at(at_slot(9)));
+        let before = at_slot(0) - 1;
+        assert!(matches!(
+            net.at(before),
+            Err(network_config::digest::DigestError::BeforeGenesis { .. })
+        ));
+    }
+
+    #[test]
+    fn the_preset_gives_the_epoch_length_and_an_unknown_one_is_refused() {
+        let mainnet = config(&CONFIG.replace("'minimal'", "'mainnet'"));
+        let net = NetworkHello::new("svc/1", &mainnet, GENESIS).unwrap();
+        assert_eq!(net.slots_per_epoch(), 32);
+        // Slot 8 is still epoch 0 on 32-slot epochs, so before the blob change.
+        assert_eq!(
+            net.at(at_slot(8)).unwrap().current_fork_digest,
+            compute_fork_digest(&mainnet, &GENESIS.genesis_validators_root, 0).unwrap()
+        );
+        let gnosis = config(&CONFIG.replace("'minimal'", "'gnosis'"));
+        let err = NetworkHello::new("svc/1", &gnosis, GENESIS).unwrap_err();
+        assert!(err.to_string().contains("gnosis"), "{err}");
     }
 }

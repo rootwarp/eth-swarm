@@ -736,9 +736,15 @@ it), with the same inputs as the checks above:
   stored sidecars with an unknown root left out, and a column we do not custody must get
   `3: ResourceUnavailable`.
 
-cl-verify runs next to it, as our own user, on the pinned trusted setup. `--socket-dir` must be
-an absolute path without symlinks that only we can write, short enough for a socket path (104
-bytes on macOS). On macOS, `/tmp` is a symlink, so use the canonical form:
+cl-verify runs next to it, as our own user, on the pinned trusted setup. `--network-dir` gives
+cl-verify the devnet: the same `config.yaml` and `genesis.ssz` that the probe reads. Its hello
+then carries the devnet's genesis validators root, fork schedule and blob schedule, the same
+hello as the probe's cl-chain side, and its KZG cell cap is one block at the devnet's largest
+blob count. cl-verify does not start without `--network-dir` (exit 2). If the hellos differ,
+every KZG stream fails with `VERSION_MISMATCH` and the store gets no columns. `serve` waits up
+to 30 s for `--verify-socket` to accept, so it can start right after cl-verify. `--socket-dir`
+must be an absolute path without symlinks that only we can write, short enough for a socket
+path (104 bytes on macOS). On macOS, `/tmp` is a symlink, so use the canonical form:
 
 ```bash
 cargo build --release --locked -p cl-verify -p devnet-probe
@@ -746,7 +752,7 @@ run=$(cd "$(mktemp -d)" && pwd -P); chmod 700 "$run"                 # the socke
 state=target/kurtosis/serve-$enclave; mkdir -p "$state"
 target/release/cl-verify --trusted-setup crates/crypto-kzg/data/trusted_setup_4096.json \
   --socket "$run/verify.sock" --peer-uid "$(id -u)" --pubkey-snapshot "$state/pubkeys.bin" \
-  2>"$logs/cl-verify.err" &
+  --network-dir "$net" 2>"$logs/cl-verify.err" &
 verify=$!
 target/release/devnet-probe serve --network-dir "$net" "${apis[@]}" "${peers[@]}" \
   --columns-dir "$state/columns" --socket-dir "$run" --verify-socket "$run/verify.sock" \

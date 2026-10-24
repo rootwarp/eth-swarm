@@ -1,34 +1,28 @@
 //! The devnet the probe runs on: its `config.yaml`, its genesis, the preset they name, and the
 //! rule that the probe only ever talks to loopback and private addresses.
 //!
-//! The config goes through `network-config`'s strict reader ([`ChainConfig::from_yaml`], over
-//! the bytes' own sha256: a devnet has no pinned digest). The genesis comes from the genesis
-//! state ([`read_genesis`]: `genesis_time` and `genesis_validators_root` are its first two
-//! fields, both fixed-size, so they are its first 40 bytes in every fork) or from a reference
-//! CL's beacon API (`/eth/v1/beacon/genesis`), and every fork digest from the two.
+//! The config goes through `network-config`'s strict reader ([`ChainConfig::from_devnet_yaml`],
+//! over the bytes' own sha256: a devnet has no pinned digest). The genesis comes from the
+//! genesis state ([`read_genesis`]: `genesis_time` and `genesis_validators_root` are its first
+//! two fields, both fixed-size, so they are its first 40 bytes in every fork) or from a reference
+//! CL's beacon API (`/eth/v1/beacon/genesis`), and every fork digest from the two. The readers
+//! are `network_config::network_dir`'s, which cl-verify's `--network-dir` reads with too.
 
 use cl_chain::probe::ProbeChain;
 use cl_p2p::m2a_session::PinnedPeer;
 use consensus_types::{EthSpec, Mainnet, Minimal};
 use libp2p::multiaddr::Protocol;
 use network_config::digest::{compute_fork_digest, current_epoch, DigestError};
+use network_config::network_dir;
 use network_config::{ChainConfig, Epoch, Genesis};
 use p2p_wire::enr::ForkFields;
 use p2p_wire::gossip::TopicCaps;
 use p2p_wire::rpc::codec::ContextTable;
 use p2p_wire::rpc::messages::ForkDigest;
-use sha2::{Digest, Sha256};
-use std::fs::File;
-use std::io::Read;
 use std::net::IpAddr;
 use std::path::Path;
 
-/// The largest `config.yaml` read: far above any network's.
-pub const MAX_CONFIG_BYTES: u64 = 1 << 20;
-
-/// The bytes of a genesis state that hold `genesis_time` (8) and `genesis_validators_root`
-/// (32).
-pub const GENESIS_PREFIX_BYTES: usize = 40;
+pub use network_config::network_dir::{GENESIS_PREFIX_BYTES, MAX_CONFIG_BYTES};
 
 /// The preset a devnet's `PRESET_BASE` names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,8 +48,7 @@ impl Devnet {
     ///
     /// The config does not parse, or its `PRESET_BASE` is neither `minimal` nor `mainnet`.
     pub fn new(config_yaml: &[u8], genesis: Genesis) -> Result<Self, String> {
-        let sha256: [u8; 32] = Sha256::digest(config_yaml).into();
-        let config = ChainConfig::from_yaml(config_yaml, &sha256).map_err(|e| e.to_string())?;
+        let config = ChainConfig::from_devnet_yaml(config_yaml).map_err(|e| e.to_string())?;
         let preset = match config.preset_base() {
             p if p == Minimal::NAME => Preset::Minimal,
             p if p == Mainnet::NAME => Preset::Mainnet,
@@ -166,54 +159,34 @@ impl Devnet {
     }
 }
 
-/// The genesis of a genesis state's SSZ: its first two fields.
+/// The genesis of a genesis state's SSZ: its first two fields
+/// ([`network_config::network_dir::genesis_from_state`]).
 ///
 /// # Errors
 ///
 /// Fewer than [`GENESIS_PREFIX_BYTES`] bytes.
 pub fn genesis_from_state(ssz: &[u8]) -> Result<Genesis, String> {
-    let Some(prefix) = ssz.get(..GENESIS_PREFIX_BYTES) else {
-        return Err(format!(
-            "a genesis state is at least {GENESIS_PREFIX_BYTES} bytes, this one {} bytes",
-            ssz.len()
-        ));
-    };
-    let (time, root) = prefix.split_at(8);
-    Ok(Genesis {
-        genesis_time: u64::from_le_bytes(time.try_into().expect("8 bytes")),
-        genesis_validators_root: root.try_into().expect("32 bytes"),
-    })
+    network_dir::genesis_from_state(ssz).map_err(|e| e.to_string())
 }
 
 /// The genesis of the genesis state at `path` (the generator's `genesis.ssz`), from its first
-/// [`GENESIS_PREFIX_BYTES`] bytes.
+/// [`GENESIS_PREFIX_BYTES`] bytes ([`network_config::network_dir::read_genesis`]).
 ///
 /// # Errors
 ///
 /// The file cannot be read or is too short.
 pub fn read_genesis(path: &Path) -> Result<Genesis, String> {
-    let mut prefix = Vec::with_capacity(GENESIS_PREFIX_BYTES);
-    File::open(path)
-        .and_then(|f| f.take(GENESIS_PREFIX_BYTES as u64).read_to_end(&mut prefix))
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    genesis_from_state(&prefix).map_err(|e| format!("{}: {e}", path.display()))
+    network_dir::read_genesis(path).map_err(|e| e.to_string())
 }
 
 /// The bytes of the `config.yaml` at `path`, reading at most one byte past
-/// [`MAX_CONFIG_BYTES`].
+/// [`MAX_CONFIG_BYTES`] ([`network_config::network_dir::read_config`]).
 ///
 /// # Errors
 ///
 /// The file cannot be read or is too large.
 pub fn read_config(path: &Path) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|f| f.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes))
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    if bytes.len() as u64 > MAX_CONFIG_BYTES {
-        return Err(format!("{}: over {MAX_CONFIG_BYTES} bytes", path.display()));
-    }
-    Ok(bytes)
+    network_dir::read_config(path).map_err(|e| e.to_string())
 }
 
 /// Whether `ip` is a devnet address: a local one, by the rule our discv5 runs in local mode

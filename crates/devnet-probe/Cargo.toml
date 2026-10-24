@@ -48,7 +48,6 @@ tracing = "0.1"
 svc-runtime = { path = "../svc-runtime" }
 serde = { version = "1", features = ["derive"] }
 hex = "0.4"
-sha2 = "0.10"
 
 [dev-dependencies]
 devnet-probe = { path = ".", features = ["test-support"] }
