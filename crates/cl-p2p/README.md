@@ -413,12 +413,31 @@ test user owns, and runs on any platform. Its first log line says `TEST BUILD`, 
 `"test_build": true`, and that summary fails its `production_build` check, so a gate that reads
 the summary fails a test-binary run. Never deploy it.
 
-`build.rs` also records the build commit (git's `HEAD`) and if the build tree was clean. The
-tree is clean only if `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `crates` and `proto`
-have no uncommitted change, no untracked file and no assume-unchanged or skip-worktree flag.
-The summary writes them as `build_commit` and `build_dirty`. Its `clean_build` check fails a
-binary that was built from a tree that was not clean, or with no git checkout. Build the
-deployed binary from a clean checkout: `build_commit` is then the commit that you post.
+`build.rs` also records the build commit (git's `HEAD`), the commit hash of the compiler
+(`rustc -vV`) and if the build was clean. The build is clean only if four conditions are true:
+
+- The build paths have no uncommitted change, no untracked or ignored file and no
+  assume-unchanged or skip-worktree flag. The build paths are `Cargo.toml`, `Cargo.lock`,
+  `rust-toolchain.toml`, `.cargo`, `proto` and the crates that the binaries compile
+  (`BUILD_PATHS` in `build_support.rs`, held to cargo's resolve by a test).
+- No rustflags variable, rustc wrapper or linker is set (`RUSTFLAGS`,
+  `CARGO_ENCODED_RUSTFLAGS`, `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER` or `RUSTC_LINKER`).
+  Cargo gives the build script these values from each cargo config, also one outside the
+  repository, and from `CARGO_TARGET_<triple>_LINKER`.
+- No C or proto build variable is set (`CC`, `CXX`, `CFLAGS`, `CXXFLAGS`, `AR`, `ARFLAGS`, also
+  with a target suffix or as `TARGET_<name>` and `HOST_<name>`, `CRATE_CC_NO_DEFAULTS` and
+  `PROTOC`). They change the C code of ring and blst, and the proto build.
+- The compiler is the official pinned one. Its release (`$RUSTC -vV`) is the `channel` of
+  `rust-toolchain.toml`, its commit hash is the one of `PINNED_RUSTC` in `build_support.rs`, and
+  `RUSTC` (and `CARGO_BUILD_RUSTC`, if set) is, by its canonical path, the `rustc` of the rustup
+  toolchain `<channel>-*` under `$RUSTUP_HOME` (default `~/.rustup`). `RUSTC`,
+  `RUSTUP_TOOLCHAIN`, a rustup override, `cargo +<toolchain>` or a wrapper can replace the pin.
+  Change `PINNED_RUSTC` together with `rust-toolchain.toml`: a test fails if they differ.
+
+The Status probe refuses to dial with a build that was not clean. The summary writes the values
+as `build_commit`, `build_rustc_commit` and `build_dirty`. Its `clean_build` check fails a
+binary whose build was not clean, or that had no git checkout. Build the deployed binary from
+a clean checkout: `build_commit` is then the commit that you post.
 
 ### Node key
 
@@ -486,6 +505,10 @@ sudo -u m2a-session m2a-session                       # --gate-file <path> to po
 
 Pre-flight first, before any dial:
 
+- the build must be clean (see [Build](#build)): the binary refuses to dial with a build tree
+  that was not clean, with a rustflags variable, a rustc wrapper, a linker or a C build
+  variable set, with a compiler other than the official pinned one, or with no build commit.
+  A session from such a build would fail its `clean_build` check only at the end.
 - the fuzz gate file (`fuzz/run-m2a-gate.sh`; default `fuzz/artifacts/m2a-gate.json` of the
   checkout the binary was built in) must pass `fuzz/check-m2a-gate.sh`'s rules for the decoders
   this binary was built from. `build.rs` embeds `check-m2a-gate.sh --print-expected` of the

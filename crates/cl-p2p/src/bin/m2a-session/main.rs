@@ -10,9 +10,10 @@
 //! peer, the reference API, the deadlines, the node key and `run_as`. The pre-flight runs before
 //! anything else: it refuses root and any effective UID other than that of the `run_as` user.
 //!
-//! - default: the Status probe ([`probe`]). The pre-flight also requires a passing m2a fuzz
-//!   gate for the decoders this binary was built from ([`gate`]; `--gate-file`, default the
-//!   checkout's `fuzz/artifacts/m2a-gate.json`), and refuses before dialling without one. Then:
+//! - default: the Status probe ([`probe`]). The pre-flight also requires a clean build
+//!   ([`build_info`]) and a passing m2a fuzz gate for the decoders this binary was built from
+//!   ([`gate`]; `--gate-file`, default the checkout's `fuzz/artifacts/m2a-gate.json`), and
+//!   refuses before dialling without them. Then:
 //!   dial, send our Status v2 at the pinned Sepolia fork digest, judge the peer's against the
 //!   reference beacon API ([`reference_api`]); request the peer's MetaData v3 on the same
 //!   connection and judge it against the node's `/eth/v1/node/identity` ([`metadata`]); Ping

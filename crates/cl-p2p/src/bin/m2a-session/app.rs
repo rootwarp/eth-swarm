@@ -403,6 +403,16 @@ fn run(
         };
     }
     let probe_api = if args.mode == Mode::Session {
+        // A build that was not clean fails `clean_build`, so the session would give no
+        // evidence: refuse it before the dial, not after the whole run.
+        if !env.build.is_clean() {
+            tracing::error!(
+                commit = ?env.build.commit,
+                error = env.build.unclean.as_deref().unwrap_or_default(),
+                "pre-flight refused: the Status probe needs a clean build"
+            );
+            return EXIT_REFUSED;
+        }
         if let Err(e) = gate::check(&args.gate_file, &env.gate) {
             tracing::error!(error = %e, "pre-flight refused: no passing m2a fuzz gate");
             return EXIT_REFUSED;
@@ -1245,6 +1255,8 @@ mod tests {
         root_failures: Vec<Slot>,
         /// Our side's idle connection timeout.
         idle_timeout: Duration,
+        /// What `build.rs` recorded about the build.
+        build: BuildInfo,
     }
 
     impl Scenario {
@@ -1265,6 +1277,7 @@ mod tests {
                 root_delay: Duration::ZERO,
                 root_failures: Vec::new(),
                 idle_timeout: IDLE_CONNECTION_TIMEOUT,
+                build: BuildInfo::fixture(),
             }
         }
     }
@@ -1493,6 +1506,7 @@ mod tests {
         let env = RunEnv {
             now_ms: clock(s.clock.clone()),
             idle_timeout: s.idle_timeout,
+            build: s.build.clone(),
             ..test_env()
         };
         let (code, out) = tokio::task::spawn_blocking(move || {
@@ -2286,6 +2300,41 @@ mod tests {
             assert_eq!(out.peer.connections(), 0, "refused before dialling");
             assert!(out.api.seen().is_empty(), "and before the API");
         }
+    }
+
+    /// The probe refuses to dial with a build that was not clean (an ignored file in a build
+    /// crate, say, or no build commit): the session would only fail its `clean_build` check
+    /// at the end. The pre-check `--dial-only` gives no evidence, and still dials.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unclean_build_is_refused_before_the_probe() {
+        for build in [
+            BuildInfo::from_build(
+                crate::build_info::FIXTURE_COMMIT,
+                "uncommitted changes in the build tree: not in HEAD: crates/cl-p2p/a.profraw",
+            ),
+            BuildInfo::from_build(
+                crate::build_info::FIXTURE_COMMIT,
+                "built with RUSTFLAGS set",
+            ),
+            BuildInfo::from_build("", ""),
+        ] {
+            let mut s = Scenario::new(peer_status(F1, 0, 0));
+            s.build = build.clone();
+            let out = probe(s).await;
+            assert_eq!(out.code, EXIT_REFUSED, "{build:?}");
+            assert!(out.lines.is_empty(), "refused before the session");
+            assert_eq!(out.peer.connections(), 0, "refused before dialling");
+            assert!(out.api.seen().is_empty(), "and before the API");
+        }
+        let peer = StatusPeer::echoing(peer_status(F1, 0, 0)).await;
+        let (_dir, path) = config_without_api(&format!("{}/p2p/{}", peer.addr, peer.id));
+        let env = RunEnv {
+            build: BuildInfo::from_build("", ""),
+            ..test_env()
+        };
+        let (code, _) = run_off_runtime(path, vec!["--dial-only".into()], env).await;
+        assert_eq!(code, EXIT_CONNECTED);
+        assert_eq!(peer.connections(), 1);
     }
 
     async fn missing_gate_refused(s: Scenario) {

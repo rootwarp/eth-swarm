@@ -404,7 +404,7 @@ else
     echo "peer = \"$multiaddr\""
     # Loopback only, so the forward is not open to the network, and ssh exits if another local
     # account holds the port first.
-    echo "# Over the tunnel: ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:$api_port:127.0.0.1:$api_port <ref-host>"
+    echo "# Over the tunnel: ssh -f -N -o ExitOnForwardFailure=yes -L 127.0.0.1:$api_port:127.0.0.1:$api_port <ref-host>"
     echo "reference_api_url = \"http://127.0.0.1:$api_port\""
     echo 'node_key = "/var/lib/m2a-session/node.key"'
     echo "trusted_by_reference = $trusted   # true only once TRUSTED_PEERS holds the session's peer ID"

@@ -2,9 +2,11 @@
 //!
 //! The same rule as `m2a-session`'s `reference_api_url` (`cl_p2p::m2a_session::config`): the
 //! collector has no TLS stack, and plaintext over any other path could be forged or read by
-//! anyone on it, so a remote node is reached through an SSH tunnel to a local port
-//! (`ssh -L 5052:127.0.0.1:5052 ref-host`). No credentials, query or fragment. The base path
-//! may carry a key, so errors never quote the URL and `Debug` shows `scheme://host:port` only.
+//! anyone on it, so a remote node is reached through an SSH tunnel to a local port that listens
+//! on loopback only, and ssh exits if another process holds the port
+//! (`ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:5052:127.0.0.1:5052 ref-host`). No
+//! credentials, query or fragment. The base path may carry a key, so errors never quote the
+//! URL and `Debug` shows `scheme://host:port` only.
 //! Hosts are never resolved: `localhost` is `127.0.0.1` then `::1`.
 
 use std::fmt;

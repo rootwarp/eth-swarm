@@ -23,9 +23,11 @@
 //!   `[::1]`), an optional port (1..=65535) and base path, and no credentials, query or
 //!   fragment. The API's answers decide the verdicts, and plaintext over any other path could be
 //!   forged by anyone on it, so a remote node is reached through an SSH tunnel to a local port
-//!   (`ssh -L 5052:127.0.0.1:5052 ref-host`). This is the only place the rule lives: a
-//!   [`ReferenceApiUrl`] exists only once it passed. The URL may still carry a key in its path,
-//!   so errors never quote it and `Debug` shows `scheme://host:port` only.
+//!   that listens on loopback only, and ssh exits if another process holds the port
+//!   (`ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:5052:127.0.0.1:5052 ref-host`). This is
+//!   the only place the rule lives: a [`ReferenceApiUrl`] exists only once it passed. The URL
+//!   may still carry a key in its path, so errors never quote it and `Debug` shows
+//!   `scheme://host:port` only.
 //! - **`deadlines`**: milliseconds, each positive; `ttfb_ms` and `per_chunk_ms` at most
 //!   `total_ms`, and `total_ms` at most [`MAX_DEADLINE`], the `request_response` backstop
 //!   ([`crate::rpc::REQUEST_TIMEOUT`]), so the configured total is the one that applies.

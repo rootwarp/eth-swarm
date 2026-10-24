@@ -32,49 +32,72 @@
 //! empty). Not as `rustc-env` variables: `heads` grows with the history, and one environment
 //! string is capped at 128 KiB on Linux.
 //!
-//! It also records the build commit and why the build tree was not clean, for the
-//! `m2a-summary` line (`src/bin/m2a-session/build_info.rs`): `m2a-build-commit.txt` (git's
-//! `HEAD`, or empty) and `m2a-build-unclean.txt` (empty for a clean tree, else the reason). The
-//! tree is clean only if `m2a_dirty_paths` finds nothing under [`BUILD_PATHS`], the paths that
-//! can change what the binary compiles. A tree without git, or without the harness, is not
-//! clean. Cargo reruns this script when a file under a build path changes.
+//! It also records the build commit and why the build was not clean, for the `m2a-summary`
+//! line (`src/bin/m2a-session/build_info.rs`): `m2a-build-commit.txt` (git's `HEAD`, or empty),
+//! `m2a-build-rustc.txt` (the compiler's commit hash, or empty) and `m2a-build-unclean.txt`
+//! (empty for a clean build, else the reason). The build is clean only if four conditions are
+//! true:
 //!
-//! Cargo reruns this script when a keyed path or a harness script changes on disk (or, while
-//! one is missing, its nearest existing parent below the repository root), when git's `HEAD`,
-//! the current branch ref or the index changes (a commit, checkout or `git add`), or when the
-//! history depth may have (`build_support::history_watch`: a shallow clone deepened or
-//! unshallowed, or a full one made shallow).
+//! - `m2a_dirty_paths` finds nothing under [`BUILD_PATHS`] (the paths that can change what the
+//!   binaries compile; an ignored file there counts too).
+//! - No variable of [`BUILD_FLAG_VARS`] (rustflags, a rustc wrapper, a linker) is set.
+//! - No C or proto build variable is set (`CC`, `CFLAGS`, `PROTOC` and the rest:
+//!   `build_support::is_c_build_var`).
+//! - The compiler's release is the `channel` of `rust-toolchain.toml`, with the official commit
+//!   of `build_support::PINNED_RUSTC` (`build_support::compiler_state`), and the compiler is the
+//!   `rustc` of that rustup toolchain by its canonical path (`build_support::rustc_location`).
+//!
+//! A tree without git, or without the harness, is not clean.
+//!
+//! Cargo reruns this script when a build path, a keyed path or a harness script changes on disk
+//! (or, while one is missing, its nearest existing parent below the repository root), when a
+//! variable of [`BUILD_FLAG_VARS`], [`COMPILER_VARS`] or a C or proto build variable changes,
+//! when git's `HEAD`, the current branch ref or the index changes (a commit, checkout, reset or
+//! `git add`), or when the history depth may have (`build_support::history_watch`: a shallow
+//! clone deepened or unshallowed, or a full one made shallow). While `git pack-refs` holds the branch ref, the nearest existing
+//! directory of its loose file is watched (`build_support::git_watch`). A missing `.cargo` is
+//! not watched (the repository root would rerun every build): step 10.2 of the runbook
+//! (`ops/ref-node/README.md`) checks the tree again after the build. A new compiler rebuilds
+//! every crate, and so reruns this script.
 
 mod build_support;
 
-use build_support::{child_env, command, git, history_watch, locate_repo, run, watch_path};
+use build_support::{
+    bash, build_flags_unclean, build_state, c_build_watch, child_env, command, compiler_state,
+    git_watch, is_c_build_var, locate_repo, run, rustc_location, rustc_version, unclean_reason,
+    watch_path, BUILD_FLAG_VARS, BUILD_PATHS, COMMON, COMPILER_VARS,
+};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-const COMMON: &str = "fuzz/m2a-common.sh";
 const CHECKER: &str = "fuzz/check-m2a-gate.sh";
-/// The paths that can change what the binary compiles: the workspace manifest and lock file,
-/// the toolchain pin, every crate (the binary's path dependencies are among them), and `proto`
-/// (ethswarm-proto compiles it). `fuzz/` is not among them: the binary does not compile it,
-/// and the gate expectations already refuse a dirty keyed path there.
-const BUILD_PATHS: [&str; 5] = [
-    "Cargo.toml",
-    "Cargo.lock",
-    "rust-toolchain.toml",
-    "crates",
-    "proto",
-];
 
 type Env = [(OsString, OsString)];
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build_support.rs");
+    for name in BUILD_FLAG_VARS.iter().chain(&COMPILER_VARS) {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let host = std::env::var("HOST").unwrap_or_default();
+    let set_c_vars = std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .filter(|k| is_c_build_var(k));
+    for name in c_build_watch(&target, &host).into_iter().chain(set_c_vars) {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("set by cargo"));
     let env = child_env(std::env::vars_os());
     let (gate_file, expected, build) = match locate_repo(&manifest, &env) {
         Ok(repo) => {
-            watch_git(&repo, &env);
+            for p in git_watch(&repo, &env) {
+                println!("cargo:rerun-if-changed={}", p.display());
+            }
+            for path in BUILD_PATHS {
+                watch(&repo, path);
+            }
             (
                 repo.join("fuzz/artifacts/m2a-gate.json"),
                 expected(&repo, &env),
@@ -95,12 +118,29 @@ fn main() {
         Ok(json) => (json, String::new()),
         Err(reason) => (String::new(), reason.replace(['\n', '\r'], " ")),
     };
-    let (commit, unclean) = build;
+    let (commit, tree) = build;
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let toolchain = std::fs::read_to_string(manifest.join("../../rust-toolchain.toml"))
+        .map_err(|e| format!("rust-toolchain.toml: {e}"));
+    let (rustc_commit, compiler) =
+        compiler_state(rustc_version(&rustc, &manifest), toolchain.clone());
+    let unclean = unclean_reason(
+        &tree,
+        [
+            compiler,
+            compiler_location(&rustc, toolchain.as_deref().ok()),
+            std::env::var_os("CARGO_BUILD_RUSTC")
+                .filter(|v| !v.is_empty())
+                .and_then(|other| compiler_location(&other, toolchain.as_deref().ok())),
+            build_flags_unclean(std::env::vars_os()),
+        ],
+    );
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("set by cargo"));
     for (name, text) in [
         ("m2a-gate-expected.json", json),
         ("m2a-gate-unavailable.txt", reason),
         ("m2a-build-commit.txt", commit),
+        ("m2a-build-rustc.txt", rustc_commit),
         ("m2a-build-unclean.txt", unclean.replace(['\n', '\r'], " ")),
     ] {
         // Rewritten only on a change: the binary embeds the file, so a new mtime rebuilds it.
@@ -112,44 +152,29 @@ fn main() {
     }
 }
 
-/// Runs `script` (with `fuzz/m2a-common.sh` as `$1`) in bash, in `repo`.
-fn bash(repo: &Path, script: &str, env: &Env) -> Result<String, String> {
-    run(
-        command("bash", env)
-            .current_dir(repo)
-            .args(["-c", script, "build.rs", COMMON]),
-        &format!("bash -c '{script}'"),
+/// Why the compiler `rustc` is not the rustc of the pinned rustup toolchain, or `None`
+/// ([`rustc_location`]). `RUSTUP_HOME` is rustup's directory, by default `~/.rustup`. With no
+/// toolchain file, [`compiler_state`] already gives the reason.
+fn compiler_location(rustc: &std::ffi::OsStr, toolchain: Option<&str>) -> Option<String> {
+    let toolchain = toolchain?;
+    let rustup_home = std::env::var_os("RUSTUP_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")));
+    let Some(rustup_home) = rustup_home else {
+        return Some("compiler: neither RUSTUP_HOME nor HOME is set".to_owned());
+    };
+    rustc_location(
+        rustc,
+        std::env::var_os("PATH").as_deref(),
+        &rustup_home,
+        toolchain,
     )
 }
 
 fn watch(repo: &Path, rel: &str) {
     if let Some(path) = watch_path(repo, rel) {
         println!("cargo:rerun-if-changed={}", path.display());
-    }
-}
-
-/// `rerun-if-changed` for git's HEAD, branch ref, packed refs and index, and for the history
-/// depth ([`history_watch`]). Only files that exist are listed: cargo reruns on every build for
-/// a missing one.
-fn watch_git(repo: &Path, env: &Env) {
-    let mut names = vec![
-        "HEAD".to_owned(),
-        "index".to_owned(),
-        "packed-refs".to_owned(),
-    ];
-    if let Ok(branch) = git(repo, &["symbolic-ref", "-q", "HEAD"], env) {
-        names.push(branch.trim().to_owned());
-    }
-    for name in names {
-        if let Ok(p) = git(repo, &["rev-parse", "--git-path", &name], env) {
-            let p = repo.join(p.trim());
-            if p.exists() {
-                println!("cargo:rerun-if-changed={}", p.display());
-            }
-        }
-    }
-    for p in history_watch(repo, env) {
-        println!("cargo:rerun-if-changed={}", p.display());
     }
 }
 
@@ -186,49 +211,4 @@ fn expected(repo: &Path, env: &Env) -> Result<String, String> {
         &format!("{CHECKER} --print-expected"),
     )?;
     Ok(json.trim().to_owned())
-}
-
-/// The build commit (git's `HEAD`, or empty) and why the build tree was not clean (empty if it
-/// was): `m2a_dirty_paths` of the harness over [`BUILD_PATHS`]. At most five paths are named.
-fn build_state(repo: &Path, env: &Env) -> (String, String) {
-    for path in BUILD_PATHS {
-        watch(repo, path);
-    }
-    let commit = match git(repo, &["rev-parse", "--verify", "HEAD^{commit}"], env) {
-        Ok(commit) => commit.trim().to_owned(),
-        Err(e) => return (String::new(), format!("no build commit: {e}")),
-    };
-    if !repo.join(COMMON).is_file() {
-        return (commit, format!("{COMMON} is not in this tree"));
-    }
-    // M2A_KEY_FILES stays non-empty (bash 3.2 under `set -u` refuses an empty array): the lock
-    // file is a build path too, and a path named twice is reported once below.
-    let script = format!(
-        r#". "$1" && GATE_KEY_PATHS=({}) && M2A_KEY_FILES=(Cargo.lock) && m2a_dirty_paths"#,
-        BUILD_PATHS.join(" ")
-    );
-    let unclean = match bash(repo, &script, env) {
-        Ok(dirty) => {
-            let mut lines: Vec<&str> = Vec::new();
-            for line in dirty.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                if !lines.contains(&line) {
-                    lines.push(line);
-                }
-            }
-            match lines.len() {
-                0 => String::new(),
-                n if n <= 5 => format!(
-                    "uncommitted changes in the build tree: {}",
-                    lines.join(", ")
-                ),
-                n => format!(
-                    "uncommitted changes in the build tree: {}, and {} more",
-                    lines[..5].join(", "),
-                    n - 5
-                ),
-            }
-        }
-        Err(e) => format!("cannot check the build tree: {e}"),
-    };
-    (commit, unclean)
 }

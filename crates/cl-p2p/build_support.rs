@@ -14,10 +14,122 @@
 //!   `<toplevel>/crates/cl-p2p`. A copy elsewhere (`cargo package` under `target/package/`, a
 //!   vendored tree) would otherwise find the enclosing repository and embed its key.
 //! - [`watch_path`]: what to watch for a path that may not exist yet.
+//! - [`git_watch`]: the git files that the build commit hangs on.
+//! - [`build_state`]: the build commit and the tree check over [`BUILD_PATHS`], and
+//!   [`build_flags_unclean`]: the variables that make a build unclean whatever the tree holds.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// The fuzz harness that holds the dirty check, relative to the repository root.
+pub const COMMON: &str = "fuzz/m2a-common.sh";
+
+/// The paths that can change what the binaries of cl-p2p compile: the workspace manifest and
+/// lock file, the toolchain pin, the repository's own cargo config (`.cargo`), `proto`
+/// (ethswarm-proto compiles it) and the path packages that cargo
+/// compiles for them, cl-p2p with its normal and build dependencies, transitively (a test holds
+/// the list to cargo's resolve). Not the other crates: an edit there changes no binary, and a
+/// watch on all of `crates` reruns the build script, and so recompiles cl-p2p, after an edit in
+/// any crate. `fuzz/` is not among them: the binaries do not compile it, and the gate
+/// expectations already refuse a dirty keyed path there.
+pub const BUILD_PATHS: [&str; 13] = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    ".cargo",
+    "proto",
+    "crates/cl-p2p",
+    "crates/consensus-types",
+    "crates/ethswarm-proto",
+    "crates/ipc",
+    "crates/network-config",
+    "crates/node-key",
+    "crates/p2p-wire",
+    "crates/svc-runtime",
+];
+
+/// The variables of a build script that change how rustc compiles or links, whatever the tree
+/// holds: the rustflags (`CARGO_ENCODED_RUSTFLAGS` holds them from every source: `RUSTFLAGS`,
+/// `CARGO_BUILD_RUSTFLAGS` and any cargo config), the rustc wrappers and the linker
+/// (`RUSTC_LINKER`: from any cargo config or `CARGO_TARGET_<triple>_LINKER`). A cargo config
+/// outside the repository (in `$CARGO_HOME` or a parent `.cargo`) is not a build path, so
+/// these variables are what the build script sees of it, and step 10.2 of the runbook
+/// (`ops/ref-node/README.md`) requires that none exists. A build with any of them set and not
+/// empty is not clean.
+pub const BUILD_FLAG_VARS: [&str; 5] = [
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTC_LINKER",
+];
+
+/// The variables that select the compiler: cargo's `RUSTC` (also set from a cargo config or by
+/// `cargo +<toolchain>` through rustup), `CARGO_BUILD_RUSTC`, and rustup's `RUSTUP_TOOLCHAIN`
+/// and `RUSTUP_HOME`.
+pub const COMPILER_VARS: [&str; 4] = [
+    "RUSTC",
+    "CARGO_BUILD_RUSTC",
+    "RUSTUP_TOOLCHAIN",
+    "RUSTUP_HOME",
+];
+
+/// The release and the official commit hash of the compiler that `rust-toolchain.toml` pins
+/// (`rustc +1.99.0 -vV` of the rustup distribution). Change it together with the pin: a test
+/// fails if the two releases differ.
+pub const PINNED_RUSTC: (&str, &str) = ("1.99.0", "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4");
+
+/// The variables of the C builds that cc reads (ring and blst compile C), also with a target
+/// suffix (`CC_<target>`, with dashes or underscores) and as `TARGET_<name>` or `HOST_<name>`.
+pub const C_BUILD_BASES: [&str; 6] = ["CC", "CXX", "CFLAGS", "CXXFLAGS", "AR", "ARFLAGS"];
+
+/// The other variables that change the C and proto builds: cc's `CRATE_CC_NO_DEFAULTS`, and
+/// `PROTOC`, the protobuf compiler of ethswarm-proto.
+pub const C_BUILD_VARS: [&str; 2] = ["CRATE_CC_NO_DEFAULTS", "PROTOC"];
+
+/// Whether `name` is a variable of the C or proto build ([`C_BUILD_BASES`], [`C_BUILD_VARS`]).
+pub fn is_c_build_var(name: &str) -> bool {
+    C_BUILD_VARS.contains(&name)
+        || C_BUILD_BASES.iter().any(|base| {
+            name == *base
+                || name
+                    .strip_prefix(base)
+                    .and_then(|rest| rest.strip_prefix('_'))
+                    .is_some_and(|target| !target.is_empty())
+                || ["TARGET_", "HOST_"]
+                    .iter()
+                    .any(|prefix| name.strip_prefix(prefix) == Some(base))
+        })
+}
+
+/// The C and proto build variables to watch with `rerun-if-env-changed` for `target` and
+/// `host`: each form that cc reads.
+pub fn c_build_watch(target: &str, host: &str) -> Vec<String> {
+    let mut names: Vec<String> = C_BUILD_VARS.iter().map(|v| (*v).to_owned()).collect();
+    for base in C_BUILD_BASES {
+        names.push(base.to_owned());
+        names.push(format!("TARGET_{base}"));
+        names.push(format!("HOST_{base}"));
+        for triple in [target, host] {
+            names.push(format!("{base}_{triple}"));
+            names.push(format!("{base}_{}", triple.replace('-', "_")));
+        }
+    }
+    let mut unique = Vec::new();
+    for name in names {
+        if !unique.contains(&name) {
+            unique.push(name);
+        }
+    }
+    unique
+}
+
+/// How the reason of [`compiler_state`] starts.
+pub const COMPILER_REASON: &str = "compiler: ";
+
+/// How the reason of [`build_flags_unclean`] starts.
+pub const FLAGS_REASON: &str = "built with ";
 
 /// The only variable a child inherits.
 pub const KEPT_VARS: [&str; 1] = ["PATH"];
@@ -96,6 +208,260 @@ pub fn check_toplevel(manifest_dir: &Path, toplevel: &Path) -> Result<PathBuf, S
             top.display()
         ))
     }
+}
+
+/// Runs `script` (with [`COMMON`] as `$1`) in bash, in `repo`.
+pub fn bash(repo: &Path, script: &str, env: &[(OsString, OsString)]) -> Result<String, String> {
+    run(
+        command("bash", env)
+            .current_dir(repo)
+            .args(["-c", script, "build.rs", COMMON]),
+        &format!("bash -c '{script}'"),
+    )
+}
+
+/// Why the build is not clean because of its variables ([`BUILD_FLAG_VARS`], then the C and
+/// proto build variables of [`is_c_build_var`] by name), or `None`. Only the names are given: a
+/// flag can hold a path or a secret.
+pub fn build_flags_unclean(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Option<String> {
+    let vars: Vec<(OsString, OsString)> = vars.into_iter().collect();
+    let mut set: Vec<&str> = BUILD_FLAG_VARS
+        .iter()
+        .copied()
+        .filter(|name| vars.iter().any(|(k, v)| k == name && !v.is_empty()))
+        .collect();
+    let mut c_build: Vec<&str> = vars
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .filter_map(|(k, _)| k.to_str())
+        .filter(|k| is_c_build_var(k))
+        .collect();
+    c_build.sort_unstable();
+    c_build.dedup();
+    set.extend(c_build);
+    (!set.is_empty()).then(|| format!("{FLAGS_REASON}{} set", set.join(", ")))
+}
+
+/// The reason that `build.rs` embeds: the tree's reason (empty for a clean tree), then each
+/// other reason that is given ([`compiler_state`], [`build_flags_unclean`]), joined by `; `.
+pub fn unclean_reason(tree: &str, others: impl IntoIterator<Item = Option<String>>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !tree.is_empty() {
+        parts.push(tree.to_owned());
+    }
+    parts.extend(others.into_iter().flatten());
+    parts.join("; ")
+}
+
+/// The `channel` of the `[toolchain]` table of a `rust-toolchain.toml`, if there is one.
+pub fn pinned_channel(toolchain: &str) -> Option<String> {
+    let mut in_toolchain = false;
+    for line in toolchain.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_toolchain = line == "[toolchain]";
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=').filter(|_| in_toolchain) else {
+            continue;
+        };
+        if key.trim() == "channel" {
+            let value = value.trim();
+            let unquoted = ['"', '\'']
+                .iter()
+                .find_map(|q| value.strip_prefix(*q).and_then(|v| v.strip_suffix(*q)));
+            return unquoted.map(str::to_owned);
+        }
+    }
+    None
+}
+
+/// `<rustc> -vV`, run in `dir` with the environment of this process: the compiler that cargo
+/// runs (a rustup proxy resolves it by `RUSTUP_TOOLCHAIN` and the toolchain file of `dir`).
+pub fn rustc_version(rustc: &std::ffi::OsStr, dir: &Path) -> Result<String, String> {
+    run(
+        Command::new(rustc).current_dir(dir).arg("-vV"),
+        &format!("{} -vV", Path::new(rustc).display()),
+    )
+}
+
+/// Why the compiler at `rustc` makes the build unclean, or `None`: it must be, by its canonical
+/// path, the `rustc` of the rustup toolchain of the pinned channel,
+/// `<rustup_home>/toolchains/<channel>-<host>/bin/rustc`. A bare name is looked up on `path`.
+/// Otherwise a wrapper that prints the real `-vV` would pass [`compiler_state`].
+pub fn rustc_location(
+    rustc: &std::ffi::OsStr,
+    path: Option<&std::ffi::OsStr>,
+    rustup_home: &Path,
+    toolchain: &str,
+) -> Option<String> {
+    let reason = |why: String| Some(format!("{COMPILER_REASON}{why}"));
+    let Some(channel) = pinned_channel(toolchain) else {
+        return reason("rust-toolchain.toml pins no channel".to_owned());
+    };
+    let given = Path::new(rustc);
+    let found = if given.components().count() > 1 {
+        Some(given.to_path_buf())
+    } else {
+        path.and_then(|path| {
+            std::env::split_paths(path)
+                .map(|dir| dir.join(given))
+                .find(|candidate| candidate.is_file())
+        })
+    };
+    let Some(canonical) = found.and_then(|f| f.canonicalize().ok()) else {
+        return reason(format!("cannot find the rustc {}", given.display()));
+    };
+    let toolchains = rustup_home.join("toolchains");
+    let bin = canonical.parent();
+    let toolchain_dir = bin.and_then(Path::parent);
+    let pinned = canonical.file_name() == Some("rustc".as_ref())
+        && bin.and_then(Path::file_name) == Some("bin".as_ref())
+        && toolchain_dir
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(&format!("{channel}-")))
+        && toolchain_dir.and_then(Path::parent) == toolchains.canonicalize().ok().as_deref();
+    if pinned {
+        None
+    } else {
+        reason(format!(
+            "{} is not the rustc of the rustup toolchain {channel}-* in {}",
+            canonical.display(),
+            toolchains.display()
+        ))
+    }
+}
+
+/// The compiler's commit hash (from `rustc -vV`, or empty) and why the compiler makes the
+/// build unclean, or `None`: its `release` must be the `channel` that `rust-toolchain.toml`
+/// pins, and its commit hash the official one of [`PINNED_RUSTC`]. `RUSTC`, `RUSTUP_TOOLCHAIN`,
+/// a rustup override or `cargo +<toolchain>` can replace the pin, and the build tree does not
+/// show it.
+pub fn compiler_state(
+    version: Result<String, String>,
+    toolchain: Result<String, String>,
+) -> (String, Option<String>) {
+    let reason = |why: String| Some(format!("{COMPILER_REASON}{why}"));
+    let version = match version {
+        Ok(version) => version,
+        Err(e) => return (String::new(), reason(e)),
+    };
+    let field = |name: &str| {
+        version
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    };
+    let (Some(hash), Some(release)) = (field("commit-hash:"), field("release:")) else {
+        return (
+            String::new(),
+            reason("rustc -vV gave no commit-hash or no release".to_owned()),
+        );
+    };
+    let pinned = match toolchain {
+        Ok(toolchain) => pinned_channel(&toolchain),
+        Err(e) => return (hash, reason(e)),
+    };
+    match pinned {
+        None => (
+            hash,
+            reason("rust-toolchain.toml pins no channel".to_owned()),
+        ),
+        Some(pinned) if pinned == release && PINNED_RUSTC.0 != release => {
+            let why = format!("no official commit of rustc {release} is pinned (PINNED_RUSTC)");
+            (hash, reason(why))
+        }
+        Some(pinned) if pinned == release && hash != PINNED_RUSTC.1 => {
+            let why = format!(
+                "rustc {release} has commit {hash}, not the official {}",
+                PINNED_RUSTC.1
+            );
+            (hash, reason(why))
+        }
+        Some(pinned) if pinned == release => (hash, None),
+        Some(pinned) => (
+            hash,
+            reason(format!(
+                "rustc {release} is not the release {pinned} that rust-toolchain.toml pins"
+            )),
+        ),
+    }
+}
+
+/// The build commit (git's `HEAD`, or empty) and why the build tree was not clean (empty if it
+/// was): `m2a_dirty_paths` of the harness over [`BUILD_PATHS`]. That check also lists ignored
+/// files. At most five paths are named.
+pub fn build_state(repo: &Path, env: &[(OsString, OsString)]) -> (String, String) {
+    let commit = match git(repo, &["rev-parse", "--verify", "HEAD^{commit}"], env) {
+        Ok(commit) => commit.trim().to_owned(),
+        Err(e) => return (String::new(), format!("no build commit: {e}")),
+    };
+    if !repo.join(COMMON).is_file() {
+        return (commit, format!("{COMMON} is not in this tree"));
+    }
+    // M2A_KEY_FILES stays non-empty (bash 3.2 under `set -u` refuses an empty array): the lock
+    // file is a build path too, and a path named twice is reported once below.
+    let script = format!(
+        r#". "$1" && GATE_KEY_PATHS=({}) && M2A_KEY_FILES=(Cargo.lock) && m2a_dirty_paths"#,
+        BUILD_PATHS.join(" ")
+    );
+    let unclean = match bash(repo, &script, env) {
+        Ok(dirty) => {
+            let mut lines: Vec<&str> = Vec::new();
+            for line in dirty.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                if !lines.contains(&line) {
+                    lines.push(line);
+                }
+            }
+            match lines.len() {
+                0 => String::new(),
+                n if n <= 5 => format!(
+                    "uncommitted changes in the build tree: {}",
+                    lines.join(", ")
+                ),
+                n => format!(
+                    "uncommitted changes in the build tree: {}, and {} more",
+                    lines[..5].join(", "),
+                    n - 5
+                ),
+            }
+        }
+        Err(e) => format!("cannot check the build tree: {e}"),
+    };
+    (commit, unclean)
+}
+
+/// The git files that the build commit hangs on, for `rerun-if-changed`: HEAD, the index,
+/// `packed-refs`, the current branch's ref and the history depth ([`history_watch`]). Only
+/// paths that exist are returned: cargo reruns on every build for a missing one.
+///
+/// The branch ref is a loose file until `git pack-refs` moves it into `packed-refs`. A later
+/// update (a `reset --soft`, an `update-ref`) writes the loose file again and changes no other
+/// watched file. So while the loose file is missing, its nearest existing ancestor below the
+/// common git dir is watched (`refs/heads`, say), never the git dir itself.
+pub fn git_watch(repo: &Path, env: &[(OsString, OsString)]) -> Vec<PathBuf> {
+    let path = |args: &[&str]| git(repo, args, env).ok().map(|p| repo.join(p.trim()));
+    let mut out = Vec::new();
+    for name in ["HEAD", "index", "packed-refs"] {
+        if let Some(p) = path(&["rev-parse", "--git-path", name]).filter(|p| p.exists()) {
+            out.push(p);
+        }
+    }
+    if let Ok(branch) = git(repo, &["symbolic-ref", "-q", "HEAD"], env) {
+        let branch = branch.trim();
+        if let Some(common) = path(&["rev-parse", "--git-common-dir"]) {
+            if let Some(p) = watch_path(&common, branch) {
+                out.push(p);
+            }
+        }
+    }
+    for p in history_watch(repo, env) {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 /// What to watch for `rel` under `repo`: the path if it exists, else its nearest existing
@@ -425,5 +791,491 @@ mod tests {
             "never the repo root"
         );
         assert_eq!(watch_path(root, ""), None);
+    }
+
+    fn commit_all(repo: &Path, msg: &str) {
+        let env = real_env();
+        git(repo, &["add", "-A"], &env).unwrap();
+        git(
+            repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                msg,
+            ],
+            &env,
+        )
+        .unwrap();
+    }
+
+    /// The crates of [`BUILD_PATHS`] are exactly the path packages that the binaries of cl-p2p
+    /// compile: cl-p2p and its normal and build dependencies, transitively, on every target
+    /// (cargo's resolve). A dev-dependency (cl-chain, say) is not among them.
+    #[test]
+    fn the_build_paths_are_the_closure_of_the_binarys_path_dependencies() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let out = Command::new(env!("CARGO"))
+            .args(["metadata", "--locked", "--offline", "--format-version", "1"])
+            .arg("--manifest-path")
+            .arg(repo.join("Cargo.toml"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "cargo metadata: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let meta: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let packages = meta["packages"].as_array().unwrap();
+        let root = packages
+            .iter()
+            .find(|p| p["name"] == "cl-p2p")
+            .map(|p| p["id"].as_str().unwrap())
+            .unwrap();
+        let nodes: std::collections::HashMap<&str, &serde_json::Value> = meta["resolve"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| (n["id"].as_str().unwrap(), n))
+            .collect();
+        let mut seen = vec![root];
+        let mut next = vec![root];
+        while let Some(id) = next.pop() {
+            for dep in nodes[id]["deps"].as_array().unwrap() {
+                let compiled = dep["dep_kinds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|k| k["kind"].is_null() || k["kind"] == "build");
+                let pkg = dep["pkg"].as_str().unwrap();
+                if compiled && !seen.contains(&pkg) {
+                    seen.push(pkg);
+                    next.push(pkg);
+                }
+            }
+        }
+        let mut closure: Vec<String> = packages
+            .iter()
+            .filter(|p| p["source"].is_null() && seen.contains(&p["id"].as_str().unwrap()))
+            .map(|p| {
+                let manifest = Path::new(p["manifest_path"].as_str().unwrap());
+                let dir = manifest.parent().unwrap().canonicalize().unwrap();
+                dir.strip_prefix(&repo).unwrap().display().to_string()
+            })
+            .collect();
+        closure.sort();
+        let mut listed: Vec<String> = BUILD_PATHS
+            .iter()
+            .filter(|p| p.starts_with("crates/"))
+            .map(|p| (*p).to_owned())
+            .collect();
+        listed.sort();
+        assert_eq!(listed, closure);
+        assert!(!closure.contains(&"crates/cl-chain".to_owned()));
+        for path in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            ".cargo",
+            "proto",
+        ] {
+            assert!(BUILD_PATHS.contains(&path), "{path}");
+        }
+    }
+
+    /// After `git pack-refs --all` the branch has no loose ref, and a later reset writes one
+    /// again without a change to HEAD, the index or `packed-refs`. A watched path holds it.
+    #[test]
+    fn a_packed_branch_ref_is_still_watched() {
+        let env = real_env();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        init_repo(&repo);
+        for n in ["a", "b"] {
+            std::fs::write(repo.join(n), n).unwrap();
+            commit_all(&repo, n);
+        }
+        let branch = git(&repo, &["symbolic-ref", "-q", "HEAD"], &env).unwrap();
+        let loose = repo.join(".git").join(branch.trim());
+        assert!(loose.is_file());
+        assert!(git_watch(&repo, &env).contains(&loose));
+        git(&repo, &["pack-refs", "--all"], &env).unwrap();
+        assert!(!loose.exists(), "pack-refs removed the loose ref");
+        let watched = git_watch(&repo, &env);
+        assert!(watched.iter().all(|p| p.exists()), "{watched:?}");
+        git(&repo, &["reset", "-q", "--soft", "HEAD~1"], &env).unwrap();
+        assert!(loose.is_file(), "the reset wrote a loose ref");
+        assert!(
+            watched.iter().any(|w| loose.starts_with(w)),
+            "{} is under no watched path: {watched:?}",
+            loose.display()
+        );
+        assert!(
+            !watched.contains(&repo.join(".git")),
+            "never the whole git dir: {watched:?}"
+        );
+    }
+
+    /// A rustflags variable or a rustc wrapper that is set makes the build unclean. Cargo
+    /// sets `CARGO_ENCODED_RUSTFLAGS` for every build script, empty when there are no flags.
+    #[test]
+    fn rustflags_and_wrappers_make_the_build_unclean() {
+        let none = os(&[("PATH", "/usr/bin"), ("CARGO_ENCODED_RUSTFLAGS", "")]);
+        assert_eq!(build_flags_unclean(none), None);
+        assert_eq!(build_flags_unclean(os(&[("RUSTFLAGS", "")])), None);
+        let flags = os(&[
+            ("RUSTFLAGS", "-C target-cpu=native"),
+            ("CARGO_ENCODED_RUSTFLAGS", "-C\u{1f}target-cpu=native"),
+        ]);
+        assert_eq!(
+            build_flags_unclean(flags).as_deref(),
+            Some("built with RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS set")
+        );
+        let config = os(&[("CARGO_ENCODED_RUSTFLAGS", "--cfg\u{1f}x")]);
+        assert_eq!(
+            build_flags_unclean(config).as_deref(),
+            Some("built with CARGO_ENCODED_RUSTFLAGS set")
+        );
+        let wrapper = os(&[
+            ("RUSTC_WRAPPER", "sccache"),
+            ("RUSTC_WORKSPACE_WRAPPER", "w"),
+        ]);
+        assert_eq!(
+            build_flags_unclean(wrapper).as_deref(),
+            Some("built with RUSTC_WRAPPER, RUSTC_WORKSPACE_WRAPPER set")
+        );
+        // Cargo gives the build script the linker of any cargo config (one outside the
+        // repository too) or of CARGO_TARGET_<triple>_LINKER as RUSTC_LINKER.
+        let linker = os(&[("RUSTC_LINKER", "/home/u/other-ld")]);
+        assert_eq!(
+            build_flags_unclean(linker).as_deref(),
+            Some("built with RUSTC_LINKER set")
+        );
+        let flags = || Some("built with RUSTFLAGS set".to_owned());
+        let compiler = || Some("compiler: rustc 1.98.0".to_owned());
+        assert_eq!(unclean_reason("", [None, None]), "");
+        assert_eq!(unclean_reason("tree", [None, None]), "tree");
+        assert_eq!(
+            unclean_reason("", [None, flags()]),
+            "built with RUSTFLAGS set"
+        );
+        assert_eq!(
+            unclean_reason("tree", [compiler(), flags()]),
+            "tree; compiler: rustc 1.98.0; built with RUSTFLAGS set"
+        );
+    }
+
+    const RUSTC_HASH: &str = "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4";
+
+    /// The variables of the C and proto builds (cc for ring and blst, prost for
+    /// ethswarm-proto) make the build unclean, in each form that cc reads: plain, with the
+    /// target in either spelling, and with TARGET_ or HOST_. Only the names are given.
+    #[test]
+    fn c_compiler_and_protoc_variables_make_the_build_unclean() {
+        let vars = os(&[
+            ("PROTOC", "/home/u/protoc"),
+            ("CC", "clang"),
+            ("CFLAGS", "-O0"),
+            ("CXX", "clang++"),
+            ("CXXFLAGS", "-O0"),
+            ("AR", "llvm-ar"),
+            ("CRATE_CC_NO_DEFAULTS", "1"),
+            ("CC_x86_64-unknown-linux-gnu", "gcc"),
+            ("CFLAGS_x86_64_unknown_linux_gnu", "-g"),
+            ("TARGET_CC", "gcc"),
+            ("HOST_CXXFLAGS", "-g"),
+            ("PATH", "/usr/bin"),
+            ("CCACHE_DIR", "/c"),
+            ("HOSTNAME", "h"),
+            ("TARGET", "x86_64-unknown-linux-gnu"),
+            ("ARCH", "x86_64"),
+        ]);
+        assert_eq!(
+            build_flags_unclean(vars).as_deref(),
+            Some(
+                "built with AR, CC, CC_x86_64-unknown-linux-gnu, CFLAGS, \
+                 CFLAGS_x86_64_unknown_linux_gnu, CRATE_CC_NO_DEFAULTS, CXX, CXXFLAGS, \
+                 HOST_CXXFLAGS, PROTOC, TARGET_CC set"
+            )
+        );
+        let both = os(&[("RUSTFLAGS", "-g"), ("CC", "clang")]);
+        assert_eq!(
+            build_flags_unclean(both).as_deref(),
+            Some("built with RUSTFLAGS, CC set")
+        );
+        assert_eq!(build_flags_unclean(os(&[("CC", "")])), None);
+        let watched = c_build_watch("x86_64-unknown-linux-gnu", "aarch64-apple-darwin");
+        for name in [
+            "CC",
+            "PROTOC",
+            "CRATE_CC_NO_DEFAULTS",
+            "TARGET_CC",
+            "HOST_CFLAGS",
+            "CC_x86_64-unknown-linux-gnu",
+            "CC_x86_64_unknown_linux_gnu",
+            "CXXFLAGS_aarch64_apple_darwin",
+            "AR_aarch64-apple-darwin",
+        ] {
+            assert!(watched.iter().any(|w| w == name), "{name}: {watched:?}");
+        }
+    }
+
+    /// The compiler must be the `rustc` of the pinned rustup toolchain, by its canonical path:
+    /// a `RUSTC` or `CARGO_BUILD_RUSTC` elsewhere (a wrapper that prints the real `-vV`, say)
+    /// makes the build unclean. A symlink to the toolchain's own rustc is that rustc.
+    #[test]
+    fn the_compiler_must_be_the_rustc_of_the_pinned_toolchain() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let home = root.join("rustup");
+        let file = |p: &Path| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "").unwrap();
+            p.to_path_buf()
+        };
+        let good = file(&home.join("toolchains/1.99.0-aarch64-apple-darwin/bin/rustc"));
+        let old = file(&home.join("toolchains/1.98.0-aarch64-apple-darwin/bin/rustc"));
+        let other = file(&root.join("wrapper/rustc"));
+        let pin = "[toolchain]\nchannel = \"1.99.0\"\n";
+        let path = |dirs: &[&Path]| std::env::join_paths(dirs).unwrap();
+        assert_eq!(rustc_location(good.as_os_str(), None, &home, pin), None);
+        let links = root.join("links");
+        std::fs::create_dir_all(&links).unwrap();
+        std::os::unix::fs::symlink(&good, links.join("rustc")).unwrap();
+        assert_eq!(
+            rustc_location(links.join("rustc").as_os_str(), None, &home, pin),
+            None,
+            "a symlink to the toolchain's rustc"
+        );
+        let bare = path(&[&root.join("empty"), &links]);
+        assert_eq!(
+            rustc_location("rustc".as_ref(), Some(&bare), &home, pin),
+            None,
+            "a bare name is found on PATH"
+        );
+        for bad in [&old, &other] {
+            let why = rustc_location(bad.as_os_str(), None, &home, pin).unwrap();
+            assert!(
+                why.starts_with(COMPILER_REASON)
+                    && why.contains("is not the rustc of the rustup toolchain 1.99.0-*"),
+                "{why}"
+            );
+        }
+        let wrappers = path(&[other.parent().unwrap()]);
+        assert!(rustc_location("rustc".as_ref(), Some(&wrappers), &home, pin).is_some());
+        let why = rustc_location(root.join("none/rustc").as_os_str(), None, &home, pin).unwrap();
+        assert!(why.starts_with("compiler: cannot find"), "{why}");
+        let why = rustc_location(good.as_os_str(), None, &home, "[toolchain]\n").unwrap();
+        assert_eq!(why, "compiler: rust-toolchain.toml pins no channel");
+    }
+
+    /// The official commit of the pinned release is in [`PINNED_RUSTC`], for the release that
+    /// rust-toolchain.toml pins: a bump of one without the other fails here.
+    #[test]
+    fn the_pinned_rustc_commit_is_for_the_toolchain_pin() {
+        let toolchain = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rust-toolchain.toml");
+        let channel = pinned_channel(&std::fs::read_to_string(toolchain).unwrap());
+        assert_eq!(channel.as_deref(), Some(PINNED_RUSTC.0));
+        assert_eq!(PINNED_RUSTC.1.len(), 40);
+    }
+
+    /// `rustc -vV` of a compiler of `release`.
+    fn rustc_vv(release: &str) -> Result<String, String> {
+        Ok(format!(
+            "rustc {release} (b940084d7 2026-09-28)\nbinary: rustc\n\
+             commit-hash: {RUSTC_HASH}\ncommit-date: 2026-09-28\n\
+             host: aarch64-apple-darwin\nrelease: {release}\nLLVM version: 23.1.1\n"
+        ))
+    }
+
+    /// The compiler is recorded by its commit hash, and the build is unclean unless its release
+    /// is the channel that rust-toolchain.toml pins: `RUSTC`, `RUSTUP_TOOLCHAIN`, a rustup
+    /// override or `cargo +<toolchain>` can replace the pin.
+    #[test]
+    fn the_compiler_must_be_the_pinned_release() {
+        // build.rs reruns when either variable that selects the compiler changes.
+        assert_eq!(
+            COMPILER_VARS,
+            [
+                "RUSTC",
+                "CARGO_BUILD_RUSTC",
+                "RUSTUP_TOOLCHAIN",
+                "RUSTUP_HOME"
+            ]
+        );
+        let pin =
+            || Ok("[toolchain]\nchannel = \"1.99.0\"\ncomponents = [\"rustfmt\"]\n".to_owned());
+        assert_eq!(pinned_channel(&pin().unwrap()).as_deref(), Some("1.99.0"));
+        assert_eq!(
+            pinned_channel("[toolchain]\nchannel = '1.99.0'\n").as_deref(),
+            Some("1.99.0")
+        );
+        assert_eq!(pinned_channel("[other]\nchannel = \"1.99.0\"\n"), None);
+        assert_eq!(pinned_channel("[toolchain]\nprofile = \"minimal\"\n"), None);
+
+        assert_eq!(
+            compiler_state(rustc_vv("1.99.0"), pin()),
+            (RUSTC_HASH.to_owned(), None)
+        );
+        for release in ["1.98.0", "1.99.0-nightly", "1.99.1"] {
+            assert_eq!(
+                compiler_state(rustc_vv(release), pin()),
+                (
+                    RUSTC_HASH.to_owned(),
+                    Some(format!(
+                        "compiler: rustc {release} is not the release 1.99.0 that \
+                         rust-toolchain.toml pins"
+                    ))
+                ),
+            );
+        }
+        assert_eq!(
+            compiler_state(Err("cannot run rustc -vV: not found".into()), pin()),
+            (
+                String::new(),
+                Some("compiler: cannot run rustc -vV: not found".to_owned())
+            )
+        );
+        assert_eq!(
+            compiler_state(Ok("rustc 1.99.0\n".into()), pin()),
+            (
+                String::new(),
+                Some("compiler: rustc -vV gave no commit-hash or no release".to_owned())
+            )
+        );
+        assert_eq!(
+            compiler_state(
+                rustc_vv("1.99.0"),
+                Err("rust-toolchain.toml: missing".into())
+            ),
+            (
+                RUSTC_HASH.to_owned(),
+                Some("compiler: rust-toolchain.toml: missing".to_owned())
+            )
+        );
+        // A compiler that says 1.99.0 with another commit is not the official 1.99.0, and a pin
+        // with no official commit in PINNED_RUSTC is refused.
+        let forged = Ok(rustc_vv("1.99.0")
+            .unwrap()
+            .replace(RUSTC_HASH, &"0".repeat(40)));
+        assert_eq!(
+            compiler_state(forged, pin()),
+            (
+                "0".repeat(40),
+                Some(format!(
+                    "compiler: rustc 1.99.0 has commit {}, not the official {RUSTC_HASH}",
+                    "0".repeat(40)
+                ))
+            )
+        );
+        let bumped = || Ok("[toolchain]\nchannel = \"1.100.0\"\n".to_owned());
+        assert_eq!(
+            compiler_state(rustc_vv("1.100.0"), bumped()).1.as_deref(),
+            Some("compiler: no official commit of rustc 1.100.0 is pinned (PINNED_RUSTC)")
+        );
+        assert_eq!(
+            compiler_state(rustc_vv("1.99.0"), Ok("[toolchain]\n".into())),
+            (
+                RUSTC_HASH.to_owned(),
+                Some("compiler: rust-toolchain.toml pins no channel".to_owned())
+            )
+        );
+    }
+
+    /// The tree check of [`build_state`] on a checkout with the real harness: an untracked
+    /// `.cargo` config and an ignored file in a build crate make it unclean, and a file in a
+    /// crate that the binaries do not compile does not.
+    #[test]
+    fn the_build_tree_check_sees_cargo_config_and_ignored_files() {
+        let env = real_env();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        init_repo(&repo);
+        let harness = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/m2a-common.sh");
+        std::fs::create_dir_all(repo.join("fuzz")).unwrap();
+        std::fs::copy(harness, repo.join(COMMON)).unwrap();
+        for (path, text) in [
+            ("Cargo.toml", "[workspace]\n"),
+            ("Cargo.lock", "version = 4\n"),
+            (".gitignore", "*.profraw\n"),
+            ("crates/cl-p2p/src.rs", "\n"),
+            ("crates/cl-chain/src.rs", "\n"),
+            ("proto/a.proto", "\n"),
+        ] {
+            std::fs::create_dir_all(repo.join(path).parent().unwrap()).unwrap();
+            std::fs::write(repo.join(path), text).unwrap();
+        }
+        commit_all(&repo, "tree");
+        let head = git(&repo, &["rev-parse", "HEAD"], &env).unwrap();
+        assert_eq!(
+            build_state(&repo, &env),
+            (head.trim().to_owned(), String::new())
+        );
+
+        std::fs::write(repo.join("crates/cl-chain/new.rs"), "\n").unwrap();
+        assert_eq!(
+            build_state(&repo, &env).1,
+            "",
+            "not a crate of the binaries"
+        );
+
+        std::fs::write(repo.join("crates/cl-p2p/default.profraw"), "x").unwrap();
+        let unclean = build_state(&repo, &env).1;
+        assert!(
+            unclean.starts_with("uncommitted changes in the build tree: ")
+                && unclean.contains("crates/cl-p2p/default.profraw"),
+            "an ignored file is dirty: {unclean}"
+        );
+        std::fs::remove_file(repo.join("crates/cl-p2p/default.profraw")).unwrap();
+
+        std::fs::create_dir_all(repo.join(".cargo")).unwrap();
+        std::fs::write(repo.join(".cargo/config.toml"), "[build]\n").unwrap();
+        let unclean = build_state(&repo, &env).1;
+        assert!(unclean.contains(".cargo"), "{unclean}");
+    }
+
+    /// What `build.rs` embedded for this build is the state of the tree now: the commit is
+    /// git's HEAD, and the reason for an unclean tree is the one [`build_state`] gives. A
+    /// rustflags reason can follow it ([`unclean_reason`]).
+    #[test]
+    fn the_embedded_build_state_is_the_trees() {
+        let commit = include_str!(concat!(env!("OUT_DIR"), "/m2a-build-commit.txt"));
+        let unclean = include_str!(concat!(env!("OUT_DIR"), "/m2a-build-unclean.txt"));
+        let env = real_env();
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (now_commit, now_tree) = match locate_repo(manifest, &env) {
+            Ok(repo) => build_state(&repo, &env),
+            Err(why) => (String::new(), why),
+        };
+        assert_eq!(commit, now_commit);
+        let (others, tree): (Vec<&str>, Vec<&str>) = unclean
+            .split("; ")
+            .filter(|part| !part.is_empty())
+            .partition(|part| part.starts_with(FLAGS_REASON) || part.starts_with(COMPILER_REASON));
+        assert_eq!(
+            tree.join("; "),
+            now_tree.replace(['\n', '\r'], " "),
+            "{unclean}"
+        );
+        // With no compiler reason, the embedded compiler is the pinned one that cargo runs
+        // here (the same RUSTC, the same rust-toolchain.toml).
+        let rustc = include_str!(concat!(env!("OUT_DIR"), "/m2a-build-rustc.txt"));
+        if !others.iter().any(|part| part.starts_with(COMPILER_REASON)) {
+            let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+            let now = compiler_state(
+                rustc_version(&compiler, manifest),
+                std::fs::read_to_string(manifest.join("../../rust-toolchain.toml"))
+                    .map_err(|e| e.to_string()),
+            );
+            assert_eq!((rustc.to_owned(), None), now, "{unclean}");
+        }
     }
 }

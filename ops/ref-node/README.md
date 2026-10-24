@@ -349,7 +349,21 @@ command (see above).
        build and install the binary. Keep the output:
        - `git rev-parse HEAD`.
        - `git status --porcelain --untracked-files=no`. The output must be empty.
+       - `git status --porcelain --ignored -- Cargo.toml Cargo.lock rust-toolchain.toml .cargo crates proto`.
+         The output must be empty. This check also shows the untracked and ignored files that
+         the build can read, for example a `.cargo/config.toml` or a `*.profraw` file.
+       - `rustc -vV`. Its `release` must be the `channel` of `rust-toolchain.toml`.
+       - `env | grep -E '^((CC|CXX|AR|ARFLAGS|CFLAGS|CXXFLAGS)(_[^=]*)?|(TARGET|HOST)_[^=]*|CRATE_CC_[^=]*|PROTOC[^=]*|RUSTC[^=]*|RUSTFLAGS|RUSTUP_TOOLCHAIN|CARGO_BUILD_[^=]*|CARGO_TARGET_[^=]*|CARGO_ENCODED_RUSTFLAGS)='`.
+         The output must be empty. These variables change the compiler, its flags, the linker,
+         or the C and proto builds.
+       - `d=$(pwd -P); while :; do ls -d "$d"/.cargo/config "$d"/.cargo/config.toml 2>/dev/null; [ "$d" = / ] && break; d=$(dirname "$d"); done; ls -d "${CARGO_HOME:-$HOME/.cargo}"/config "${CARGO_HOME:-$HOME/.cargo}"/config.toml 2>/dev/null`.
+         The output must be empty. A cargo config in `$CARGO_HOME` or in a parent `.cargo` can
+         change the build, and the build tree does not show it. Cargo looks in the parents of
+         the physical directory, so the search starts at `pwd -P`.
        - `cargo build --release --locked -p cl-p2p --bin m2a-session`.
+       - After the build, run the three `git` commands above again. The commit must be equal
+         to the commit before the build, and the two `git status` outputs must be empty. The
+         build reads the tree while it compiles, and a file can change before that time.
        - `sudo install -o root -g root -m 0755 /dev/stdin /usr/local/bin/m2a-session < target/release/m2a-session`.
        - `fuzz/check-gate1.sh fuzz/artifacts/gate1.json`. The check must pass.
     3. Install the m2a gate file from stdin, so that root does not follow a symlink in the
@@ -371,19 +385,31 @@ command (see above).
     6. **Warning:** Stop the tunnel at step 10.8, also if step 10.7 fails. While the tunnel is
        open, every local account on the test host can use the beacon API of the reference node.
 
-       In a second terminal, open the tunnel to the reference API with the line of the TOML
-       block: `ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:<BEACON_API_PORT>:127.0.0.1:<BEACON_API_PORT> <ref-host>`.
-       The forward listens on loopback only. If another process holds the port, `ssh` exits.
+       Open the tunnel to the reference API with the line of the TOML block:
+       `ssh -f -N -o ExitOnForwardFailure=yes -L 127.0.0.1:<BEACON_API_PORT>:127.0.0.1:<BEACON_API_PORT> <ref-host>`.
+       The forward listens on loopback only. `ssh -f` goes to the background only after the
+       forward listens, so a host-key or passphrase prompt does not leave the port free. If
+       another process holds the port, `ssh` exits with an error.
+       If `ssh -f` does not exit 0, do not do step 10.7. A local account that holds the port
+       can then give false reference values to the probe.
+
+       After `ssh -f` returns, record the PID of the tunnel. Keep the output:
+       `pgrep -u "$(id -u)" -f -- '-L 127.0.0.1:<BEACON_API_PORT>:'`. It must print one PID.
     7. Go to a directory outside the checkout (`cd ~`), so that the session file does not
        change the tree. Then run the Status probe, which gives the evidence:
        `sudo -u m2a-session m2a-session --gate-file /etc/ethswarm/m2a-gate.json > session-$(date -u +%Y%m%dT%H%M%SZ).jsonl`.
-       The probe refuses to dial if the gate file does not pass for the decoders of the binary.
+       The probe refuses to dial if the gate file does not pass for the decoders of the binary,
+       or if the build of the binary was not clean.
        It writes one JSON line for each step on stdout, and the `m2a-summary` line last. The
        exit code is 0 only if every check passed.
-    8. Stop the tunnel immediately after step 10.7: stop its `ssh` process (Ctrl-C in its
-       terminal).
+    8. Immediately after step 10.7, run the `pgrep` command of step 10.6 again. Keep the
+       output. It must print the same PID as in step 10.6. If it does not, the tunnel stopped
+       during step 10.7, and another local account can have answered the probe on the free
+       port. Then do not post the session file of step 10.7 as evidence.
+
+       Then stop the tunnel with the PID of step 10.6: `kill <PID>`.
 11. **Post the session evidence** on the issue:
-    - The m2a and gate-1 gate files, and the output of steps 10.2, 10.3 and 10.4.
+    - The m2a and gate-1 gate files, and the output of steps 10.2, 10.3, 10.4, 10.6 and 10.8.
     - The output of `ls -l session-*.jsonl` and `grep -H m2a-summary session-*.jsonl` in the
       directory of step 10.7. Post every session file and every summary line, not only one
       passing line.
@@ -394,6 +420,7 @@ command (see above).
       - `test_build: false`, and a pass for `production_build`.
       - A `build_commit` equal to the `git rev-parse HEAD` output of step 10.2,
         `build_dirty: false`, and a pass for `clean_build`.
+      - A `build_rustc_commit` equal to the `commit-hash` of the `rustc -vV` output of step 10.2.
       - A pass for `fuzz_gate`.
       - `os_user: "m2a-session"`, a non-zero `euid`, and a pass for `own_os_user`.
       - A `peer_id` equal to the peer ID of the pinned multiaddr. Also a pass for
@@ -434,12 +461,24 @@ spec-diff helper against both pinned configs, the API verdicts, the anchor compa
 `collect-run-log.sh` for both networks against stub commands, and `docker compose config`
 when docker is installed. It also lints the session run of steps 10 and 11, and fails closed
 on a change:
-- Each line there that names a command (`m2a-session`, `install`, `check-m2a-gate.sh`,
-  `check-gate1.sh`, `ssh`, `sha256sum`, `cargo`, `git` or `cd`) must equal the expected list in
-  the test, in the same sequence. If you change such a line, change the expected list too.
-- A fence, an HTML comment, a tab, an indented code line, or a code span that crosses the line
-  break of a command line fails.
-- The evidence must name each value of step 11.
+- Each line there, blank lines included, must equal the expected list in the test, in the same
+  sequence. Emphasis, a link or an invisible character can split a command word, so the lint
+  compares every line and not only the lines that name a command. If you change a line, change
+  the expected list too. This also applies to a new line wrap of prose. Each `got:` line of a
+  failure gives its line number in this README.
+- A fence, an HTML comment, a tab, an indented code line, a code span that crosses a line
+  break, a backslash, an HTML entity (`&#45;`, for example) or inline HTML outside a code span
+  fails. Each one can show a command that the text does not hold, for example `m2a\-session`.
+- The evidence must name each value of step 11. Step 10.6 must open the tunnel with `ssh -f`
+  and say that you do not do step 10.7 if `ssh -f` does not exit 0. Step 10.8 must stop the
+  tunnel with `kill <PID>` and say that you do not post the session file if the tunnel stopped.
+
+The suite also fails if a file of the repository gives an SSH port forward (`-L` in any
+option group, or `LocalForward` in any case) whose bind address is not `127.0.0.1`, an `ssh`
+forward whose first `ExitOnForwardFailure` value is not `yes`, or one that a trailing `&` puts
+in the background (use `ssh -f`). It finds `ssh` and `autossh` as a word, also next to
+punctuation, and reads all of argv after it, also after the host. It joins a line that ends with
+a backslash, or that leaves a code span open, with the next line.
 
 As root it needs `ETHSWARM_ROOT_TESTS=1` and belongs in a throwaway container only (it creates
 users): it then runs `setup.sh` and `preflight.sh` for real for both networks side by side,

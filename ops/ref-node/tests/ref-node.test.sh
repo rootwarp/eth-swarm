@@ -725,39 +725,112 @@ for spec in "sepolia 1" "hoodi 2"; do
 done
 
 # README.md's session run (steps 10 and 11, between the session-run markers) is the evidence
-# procedure, so the lint does not parse shell: it fails closed on any change. Every line of the
-# block that names a command of interest (m2a-session, install, check-m2a-gate.sh,
-# check-gate1.sh, ssh, sha256sum, cargo, git or cd), in a code span or not, must equal the
-# expected list below, in order, indentation included. Placeholders such as <ref-host> and
-# <BEACON_API_PORT> stay literal in both. A fence, an HTML comment, a tab, an indented code line
-# or a code span that crosses into such a line fails too. The evidence must name each value.
+# procedure, so the lint does not parse shell or Markdown: it fails closed on any change. Every
+# line of the block, blank lines included, must equal the expected list below, in order,
+# indentation included. Not only the lines that name a command: emphasis (s*s*h), a link
+# ([ss](#x)h) or a zero-width character can split a command word, and a new command need not
+# be one of a list. So a new line wrap fails too: change the list with it. Each `got:` line
+# names its README line. Placeholders such as <ref-host> and <BEACON_API_PORT> stay literal in
+# both. A fence, an HTML comment, a tab, an indented code line, a code span that crosses a line
+# break, a backslash (an escape such as m2a\-session), an HTML entity (&#45;) or inline HTML
+# outside a code span (s<b></b>sh) fails too, with its own message. The evidence must name each
+# value, step 10.6 must say what to do when ssh exits, and step 10.8 what to do when the tunnel
+# stopped during the probe.
 session_run_expected="$tmp/session-run.expected"
 cat > "$session_run_expected" <<'EXPECTED'
+10. **Run the session** on the test host (Sepolia):
     1. Replace `/etc/ethswarm/m2a-session.toml` of step 7 with the TOML block of the run log's
        "m2a-session config" section. Keep it owned by root with mode 0644. The probe needs the
+       `reference_api_url` of that block.
+    2. In the checkout at the commit of the fuzz gates, record the commit and the tree, then
        build and install the binary. Keep the output:
        - `git rev-parse HEAD`.
        - `git status --porcelain --untracked-files=no`. The output must be empty.
+       - `git status --porcelain --ignored -- Cargo.toml Cargo.lock rust-toolchain.toml .cargo crates proto`.
+         The output must be empty. This check also shows the untracked and ignored files that
+         the build can read, for example a `.cargo/config.toml` or a `*.profraw` file.
+       - `rustc -vV`. Its `release` must be the `channel` of `rust-toolchain.toml`.
+       - `env | grep -E '^((CC|CXX|AR|ARFLAGS|CFLAGS|CXXFLAGS)(_[^=]*)?|(TARGET|HOST)_[^=]*|CRATE_CC_[^=]*|PROTOC[^=]*|RUSTC[^=]*|RUSTFLAGS|RUSTUP_TOOLCHAIN|CARGO_BUILD_[^=]*|CARGO_TARGET_[^=]*|CARGO_ENCODED_RUSTFLAGS)='`.
+         The output must be empty. These variables change the compiler, its flags, the linker,
+         or the C and proto builds.
+       - `d=$(pwd -P); while :; do ls -d "$d"/.cargo/config "$d"/.cargo/config.toml 2>/dev/null; [ "$d" = / ] && break; d=$(dirname "$d"); done; ls -d "${CARGO_HOME:-$HOME/.cargo}"/config "${CARGO_HOME:-$HOME/.cargo}"/config.toml 2>/dev/null`.
+         The output must be empty. A cargo config in `$CARGO_HOME` or in a parent `.cargo` can
+         change the build, and the build tree does not show it. Cargo looks in the parents of
+         the physical directory, so the search starts at `pwd -P`.
        - `cargo build --release --locked -p cl-p2p --bin m2a-session`.
+       - After the build, run the three `git` commands above again. The commit must be equal
+         to the commit before the build, and the two `git status` outputs must be empty. The
+         build reads the tree while it compiles, and a file can change before that time.
        - `sudo install -o root -g root -m 0755 /dev/stdin /usr/local/bin/m2a-session < target/release/m2a-session`.
        - `fuzz/check-gate1.sh fuzz/artifacts/gate1.json`. The check must pass.
+    3. Install the m2a gate file from stdin, so that root does not follow a symlink in the
        checkout. Then, in the checkout, check the installed copy. Keep the output:
        - `sudo install -o root -g root -m 0644 /dev/stdin /etc/ethswarm/m2a-gate.json < fuzz/artifacts/m2a-gate.json`.
        - `fuzz/check-m2a-gate.sh /etc/ethswarm/m2a-gate.json`. The check must pass.
+
+       If a gate check of step 10.2 or 10.3 fails, run that gate again at the commit of the
+       checkout (`fuzz/run-gate1.sh` or `fuzz/run-m2a-gate.sh`).
+    4. In the checkout, record the binary and the gate files. Keep the output:
        - `sha256sum target/release/m2a-session /usr/local/bin/m2a-session fuzz/artifacts/m2a-gate.json /etc/ethswarm/m2a-gate.json fuzz/artifacts/gate1.json`.
+         The two hashes of the binary must be equal. The two hashes of the m2a gate file must
+         be equal.
        - `sudo stat /usr/local/bin/m2a-session /etc/ethswarm /etc/ethswarm/m2a-gate.json`.
     5. Do a connection pre-check: `sudo -u m2a-session m2a-session --dial-only`. This mode dials
-       block: `ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:<BEACON_API_PORT>:127.0.0.1:<BEACON_API_PORT> <ref-host>`.
-       The forward listens on loopback only. If another process holds the port, `ssh` exits.
+       the pinned peer, checks its peer ID and disconnects. It does not check the fuzz gate, and
+       it writes no `m2a-summary` line. Thus its output is not evidence. If it does not exit 0,
+       read the error on stderr and correct the cause before you continue.
+    6. **Warning:** Stop the tunnel at step 10.8, also if step 10.7 fails. While the tunnel is
+       open, every local account on the test host can use the beacon API of the reference node.
+
+       Open the tunnel to the reference API with the line of the TOML block:
+       `ssh -f -N -o ExitOnForwardFailure=yes -L 127.0.0.1:<BEACON_API_PORT>:127.0.0.1:<BEACON_API_PORT> <ref-host>`.
+       The forward listens on loopback only. `ssh -f` goes to the background only after the
+       forward listens, so a host-key or passphrase prompt does not leave the port free. If
+       another process holds the port, `ssh` exits with an error.
+       If `ssh -f` does not exit 0, do not do step 10.7. A local account that holds the port
+       can then give false reference values to the probe.
+
+       After `ssh -f` returns, record the PID of the tunnel. Keep the output:
+       `pgrep -u "$(id -u)" -f -- '-L 127.0.0.1:<BEACON_API_PORT>:'`. It must print one PID.
     7. Go to a directory outside the checkout (`cd ~`), so that the session file does not
+       change the tree. Then run the Status probe, which gives the evidence:
        `sudo -u m2a-session m2a-session --gate-file /etc/ethswarm/m2a-gate.json > session-$(date -u +%Y%m%dT%H%M%SZ).jsonl`.
-    8. Stop the tunnel immediately after step 10.7: stop its `ssh` process (Ctrl-C in its
+       The probe refuses to dial if the gate file does not pass for the decoders of the binary,
+       or if the build of the binary was not clean.
+       It writes one JSON line for each step on stdout, and the `m2a-summary` line last. The
+       exit code is 0 only if every check passed.
+    8. Immediately after step 10.7, run the `pgrep` command of step 10.6 again. Keep the
+       output. It must print the same PID as in step 10.6. If it does not, the tunnel stopped
+       during step 10.7, and another local account can have answered the probe on the free
+       port. Then do not post the session file of step 10.7 as evidence.
+
+       Then stop the tunnel with the PID of step 10.6: `kill <PID>`.
+11. **Post the session evidence** on the issue:
+    - The m2a and gate-1 gate files, and the output of steps 10.2, 10.3, 10.4, 10.6 and 10.8.
+    - The output of `ls -l session-*.jsonl` and `grep -H m2a-summary session-*.jsonl` in the
+      directory of step 10.7. Post every session file and every summary line, not only one
+      passing line.
+    - The `m2a-summary` line of the probe run of step 10.7. Below, `key: value` gives a JSON
+      field of the line, and a pass for a check means that `checks.<check>.pass` is `true`. The
+      line must show:
+      - `pass: true` and `exit_code: 0`.
+      - `test_build: false`, and a pass for `production_build`.
       - A `build_commit` equal to the `git rev-parse HEAD` output of step 10.2,
+        `build_dirty: false`, and a pass for `clean_build`.
+      - A `build_rustc_commit` equal to the `commit-hash` of the `rustc -vV` output of step 10.2.
+      - A pass for `fuzz_gate`.
       - `os_user: "m2a-session"`, a non-zero `euid`, and a pass for `own_os_user`.
+      - A `peer_id` equal to the peer ID of the pinned multiaddr. Also a pass for
+        `pinned_peer_only`, with the detail
+        `connected to 1 peer(s), 0 not pinned; 0 listen address(es)`.
+    - The output of `collect-run-log.sh`, that is the run log of step 8.
     - The output of `id m2a-session` on the test host.
     - The output of `sudo stat /var/lib/m2a-session/node.key /etc/ethswarm/m2a-session.toml` on
       the test host. The key must be owned by `m2a-session` with mode 0600. The config must be
+      owned by root with mode 0644.
 EXPECTED
+# The tunnel line of step 10.6.
+tunnel_span='`ssh -f -N -o ExitOnForwardFailure=yes -L 127.0.0.1:<BEACON_API_PORT>:127.0.0.1:<BEACON_API_PORT> <ref-host>`'
 # session_run_lint <README>: prints each problem, exit 1 if there is one.
 session_run_lint() {
   local readme=$1 n_begin n_end at_begin at_end text want rc=0
@@ -770,23 +843,26 @@ session_run_lint() {
   at_begin=$(grep -n -x -- '<!-- session-run:begin -->' "$readme" | cut -d: -f1)
   at_end=$(grep -n -x -- '<!-- session-run:end -->' "$readme" | cut -d: -f1)
   if ((at_end <= at_begin)); then echo "the session-run end marker is not after its begin marker"; return 1; fi
-  # The form of the block: no fence, HTML comment or tab; no line indented four or more past
-  # the content of its list item (an indented code block); no code span that runs from one
-  # line into a command line, or out of one.
+  # The form of the block: no fence, HTML comment, tab, backslash or HTML entity; no line
+  # indented four or more past the content of its list item (an indented code block); no code
+  # span that crosses a line break; no inline HTML outside a code span.
   awk -v b="$at_begin" -v e="$at_end" '
-    function cmd(s) {
-      return s ~ /m2a-session|install|check-m2a-gate\.sh|check-gate1\.sh|ssh|sha256sum|cargo/ ||
-        s ~ /(^|[^[:alnum:]_-])(git|cd)([^[:alnum:]_-]|$)/
-    }
     NR <= b || NR >= e { next }
     {
       line = $0
       if (line ~ /\t/) { print "line " NR ": a tab"; bad = 1 }
       if (line ~ /^[ ]*(```|~~~)/) { print "line " NR ": a fence"; bad = 1 }
       if (line ~ /<!--|-->/) { print "line " NR ": an HTML comment"; bad = 1 }
+      if (line ~ /\\/) { print "line " NR ": a backslash"; bad = 1 }
+      if (line ~ /&(#[0-9]+|#[xX][0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]*);/) { print "line " NR ": an HTML entity"; bad = 1 }
       ticks_before = ticks
       ticks += gsub(/`/, "`", line)
-      if (cmd($0) && (ticks_before % 2 || ticks % 2)) { print "line " NR ": a code span crosses the line break of a command line"; bad = 1 }
+      if (ticks_before % 2 || ticks % 2) { print "line " NR ": a code span crosses a line break"; bad = 1 }
+      else {
+        prose = $0
+        gsub(/`[^`]*`/, "", prose)
+        if (prose ~ /<[A-Za-z\/!?]/) { print "line " NR ": inline HTML"; bad = 1 }
+      }
       if (line ~ /^[ ]*$/) next
       match(line, /^ */); ind = RLENGTH
       if (ind >= content + 4) { print "line " NR ": an indented code line"; bad = 1 }
@@ -794,17 +870,27 @@ session_run_lint() {
     }
     END { if (ticks % 2) { print "an unclosed code span"; bad = 1 } exit bad }
   ' "$readme" || rc=1
-  awk -v b="$at_begin" -v e="$at_end" 'NR > b && NR < e && ($0 ~ /m2a-session|install|check-m2a-gate\.sh|check-gate1\.sh|ssh|sha256sum|cargo/ ||
-      $0 ~ /(^|[^[:alnum:]_-])(git|cd)([^[:alnum:]_-]|$)/) { print }' "$readme" > "$tmp/session-run.got"
+  # Each line of the block with its README line number, then the lines alone.
+  awk -v b="$at_begin" -v e="$at_end" 'NR > b && NR < e { print NR "\t" $0 }' "$readme" > "$tmp/session-run.numbered"
+  cut -f2- "$tmp/session-run.numbered" > "$tmp/session-run.got"
   if ! diff "$session_run_expected" "$tmp/session-run.got" > "$tmp/session-run.diff"; then
     echo "the session-run commands differ from the expected list:"
-    sed -n 's/^< /want: /p; s/^> /got:  /p' "$tmp/session-run.diff"
+    # A diff hunk header ("4a5,6", "7c7", "9d8") gives the first line of the got side.
+    # FILENAME, not NR == FNR: with an empty block the first file has no line.
+    awk 'FILENAME == ARGV[1] { n = $0; sub(/\t.*/, "", n); at_line[FNR] = n; next }
+      /^[0-9]/ { r = $0; sub(/^[0-9,]*[acd]/, "", r); split(r, a, ","); at = a[1] + 0; next }
+      /^< / { print "want: " substr($0, 3); next }
+      /^> / { print "got:  line " at_line[at] ": " substr($0, 3); at++ }' \
+      "$tmp/session-run.numbered" "$tmp/session-run.diff"
     rc=1
   fi
   text=$(awk -v b="$at_begin" -v e="$at_end" 'NR > b && NR < e { sub(/^[ ]+/, ""); printf "%s ", $0 }' "$readme")
   for want in 'writes no `m2a-summary` line' '`pass: true`' '`exit_code: 0`' '`test_build: false`' \
     '`production_build`' '`build_commit`' '`build_dirty: false`' '`clean_build`' '`fuzz_gate`' '`euid`' \
-    '`pinned_peer_only`' '`connected to 1 peer(s), 0 not pinned; 0 listen address(es)`' '`collect-run-log.sh`'; do
+    '`pinned_peer_only`' '`connected to 1 peer(s), 0 not pinned; 0 listen address(es)`' '`collect-run-log.sh`' \
+    '`build_rustc_commit`' 'If `ssh -f` does not exit 0, do not do step 10.7.' \
+    "$tunnel_span" '`kill <PID>`' \
+    'Then do not post the session file of step 10.7 as evidence.'; do
     if [[ $text != *"$want"* ]]; then echo "the evidence does not name $want"; rc=1; fi
   done
   return $rc
@@ -847,10 +933,10 @@ lint_readme "an m2a-session invocation by its path fails" '^got: .*`/usr/local/b
   's|read the error on stderr|run `/usr/local/bin/m2a-session --listen x` and read the error on stderr|'
 lint_readme "a command chained after m2a-session fails" '^got: .*--dial-only && --listen x`' \
   "s|m2a-session --dial-only\`|m2a-session --dial-only \\&\\& --listen x\`|"
-lint_readme "a command split over two lines fails" 'a code span crosses the line break of a command line$' \
+lint_readme "a command split over two lines fails" 'a code span crosses a line break$' \
   "s|m2a-session --dial-only\`|m2a-session${nl}       --dial-only --bogus\`|"
 # Commands that are not in an inline code span, or that run under another command.
-lint_readme "a command in plain text fails" '^got: +sudo -u m2a-session m2a-session --listen x$' \
+lint_readme "a command in plain text fails" '^got:  line [0-9]+: +sudo -u m2a-session m2a-session --listen x$' \
   "s|^\( *\)The forward listens on loopback only.*|&${nl}\1sudo -u m2a-session m2a-session --listen x|"
 lint_readme "a command under timeout fails" '^got: .*`timeout 60 sudo -u m2a-session m2a-session --dial-only`' \
   "s|$dial_span|\`timeout 60 sudo -u m2a-session m2a-session --dial-only\`|"
@@ -858,7 +944,7 @@ lint_readme "a command in a subshell fails" '^got: .*`\(sudo -u m2a-session m2a-
   "s|$dial_span|\`(sudo -u m2a-session m2a-session --dial-only)\`|"
 lint_readme "a command in a command substitution fails" '^got: .*`echo \$\(sudo -u m2a-session m2a-session --dial-only\)`' \
   "s|$dial_span|\`echo \$(sudo -u m2a-session m2a-session --dial-only)\`|"
-lint_readme "a code span from the line before into the probe fails" 'a code span crosses the line break of a command line$' \
+lint_readme "a code span from the line before into the probe fails" 'a code span crosses a line break$' \
   's|change the tree. Then run the Status probe, which gives the evidence:|change the tree. Then run `timeout 9|'
 lint_readme "a fence fails" ': a fence$' \
   "s|^\( *\)The forward listens on loopback only.*|&${nl}${nl}\1\`\`\`sh${nl}\1true${nl}\1\`\`\`|"
@@ -890,11 +976,61 @@ lint_readme "a quoted --gate-file path fails" '^got: .*--gate-file "/etc/ethswar
   "s|--gate-file $gate_path >|--gate-file \"$gate_path\" >|"
 lint_readme "a 2>> redirect on the probe fails" '^got: .*\.jsonl 2>> session\.log`' \
   's|%SZ).jsonl`|%SZ).jsonl 2>> session.log`|'
+# A new step that names no command of the old list, and text that shows a command it does not
+# hold: an escape, an HTML entity or inline HTML.
+lint_readme "a new sudo cp step in a code span fails" '^got:  line [0-9]+: +- `sudo cp target/release/m2a-session /usr/local/bin/`\.$' \
+  "s|^\( *\)- \`cargo build --release.*|&${nl}\1- \`sudo cp target/release/m2a-session /usr/local/bin/\`.|"
+lint_readme "a new sudo cp step in plain text fails" '^got:  line [0-9]+: +Then sudo cp a b\.$' \
+  "s|^\( *\)The forward listens on loopback only.*|&${nl}\1Then sudo cp a b.|"
+lint_readme "m2a-session written with escapes fails" ': a backslash$' \
+  "s|^\( *\)The forward listens on loopback only.*|&${nl}\1Run m2a\\\\-session --listen x.|"
+lint_readme "m2a-session written with an HTML entity fails" ': an HTML entity$' \
+  "s|^\( *\)The forward listens on loopback only.*|&${nl}\1Run m2a\&#45;session --listen x.|"
+lint_readme "inline HTML around ssh fails" ': inline HTML$' \
+  "s|^\( *\)The forward listens on loopback only.*|&${nl}\1Run s<b></b>sh -N -L 5052:127.0.0.1:5052 ref-host.|"
+lint_readme "inline HTML code around a command fails" ': inline HTML$' \
+  "s|^\( *\)The forward listens on loopback only.*|&${nl}\1Run <code>m2a-ses</code>sion.|"
+# Emphasis, a link or an invisible character inside a command word, and a command that the
+# old list did not name: each line is compared, so each is a change.
+lint_readme "emphasis inside ssh fails" '^got:  line [0-9]+: +Then run s\*s\*h -N -L 5052:127\.0\.0\.1:5052 ref-host\.$' \
+  "s|^\( *\)The forward listens on loopback only.*|&${nl}\1Then run s*s*h -N -L 5052:127.0.0.1:5052 ref-host.|"
+lint_readme "bold inside m2a-session fails" '^got:  line [0-9]+: +Run m2a-ses\*\*sion\*\* --listen x\.$' \
+  "s|^\( *\)The forward listens on loopback only.*|&${nl}\1Run m2a-ses**sion** --listen x.|"
+lint_readme "a link inside ssh fails" '^got:  line [0-9]+: +Run \[ss\]\(#x\)h -N -L 5052:127\.0\.0\.1:5052 ref-host\.$' \
+  "s|^\( *\)The forward listens on loopback only.*|&${nl}\1Run [ss](#x)h -N -L 5052:127.0.0.1:5052 ref-host.|"
+zero_width=$(printf '\342\200\213')   # U+200B, in UTF-8
+lint_readme "a zero-width character inside ssh fails" '^got:  line [0-9]+: +Run ss.+h -N -L 5052' \
+  "s|^\( *\)The forward listens on loopback only.*|&${nl}\1Run ss${zero_width}h -N -L 5052:127.0.0.1:5052 ref-host.|"
+lint_readme "a command that the old list did not name fails" '^got:  line [0-9]+: +Then run chmod 0777 /etc/ethswarm\.$' \
+  "s|^\( *\)The forward listens on loopback only.*|&${nl}\1Then run chmod 0777 /etc/ethswarm.|"
+lint_readme "an empty session run lists every wanted line" '^want: 10\. \*\*Run the session\*\* on the test host' \
+  '/<!-- session-run:begin -->/,/<!-- session-run:end -->/{/<!-- session-run:/!d;}'
+# Each got line names its line in the README.
+dial_at=$(grep -n -F -- "$dial_span" "$ref/README.md" | cut -d: -f1)
+lint_readme "a got line names its README line" "^got:  line $dial_at: .*--dial-only --dial-only\`" \
+  "s|m2a-session --dial-only\`|m2a-session --dial-only --dial-only\`|"
+lint_readme "a line wrap change of a compared line fails" '^got:  line [0-9]+: +`ssh -f` goes to the background only after the$' \
+  "s|^\\( *\\)\\(The forward listens on loopback only.\\) \\(.*\\)|\\1\\2${nl}\\1\\3|"
 # The tree check, the tunnel and the markers.
 lint_readme "a tree check that lists untracked files fails" '^got: .*`git status --porcelain`' \
   's|`git status --porcelain --untracked-files=no`|`git status --porcelain`|'
-lint_readme "a tunnel on every address fails" '^got: .*`ssh -N -L <BEACON_API_PORT>' \
-  's|`ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:<BEACON_API_PORT>|`ssh -N -L <BEACON_API_PORT>|'
+lint_readme "a tunnel on every address fails" '^got: .*`ssh -f -N -L <BEACON_API_PORT>' \
+  's|`ssh -f -N -o ExitOnForwardFailure=yes -L 127.0.0.1:<BEACON_API_PORT>|`ssh -f -N -L <BEACON_API_PORT>|'
+lint_readme "a tunnel step that does not stop on an ssh exit fails" 'does not name If `ssh -f` does not exit 0, do not do step 10\.7\.$' \
+  's|If `ssh -f` does not exit 0, do not do step 10.7.|If `ssh` exits, open it again.|'
+# The tunnel goes to the background only once the forward listens (ssh -f), and step 10.8 stops
+# that process by its PID: a foreground ssh at a host-key or passphrase prompt has a PID but
+# no forward yet, and Ctrl-C stops whatever runs in that terminal.
+lint_readme "a tunnel without ssh -f fails" "does not name $(sed 's/[][\.*^$()|+?{}]/\\&/g' <<< "$tunnel_span")\$" \
+  's|`ssh -f -N -o ExitOnForwardFailure=yes|`ssh -N -o ExitOnForwardFailure=yes|'
+lint_readme "a tunnel stopped with Ctrl-C fails" 'does not name `kill <PID>`$' \
+  's|`kill <PID>`|Ctrl-C|'
+lint_readme "a tree check without the build variables fails" '^want: .*`env \| grep -E ' \
+  '/`env | grep -E /d'
+lint_readme "a cargo config search from the logical cwd fails" '^got:  line [0-9]+: .*`d=\$PWD; while' \
+  's|`d=$(pwd -P); while|`d=$PWD; while|'
+lint_readme "a probe whose tunnel stopped can still give evidence fails" 'does not name Then do not post the session file of step 10\.7 as evidence\.$' \
+  's|Then do not post the session file of step 10.7 as evidence.|Then run it again.|'
 lint_readme "a tunnel on a fixed port fails" '^got: .*-L 127\.0\.0\.1:5052:127\.0\.0\.1:5052 <ref-host>' \
   's|<BEACON_API_PORT>:127.0.0.1:<BEACON_API_PORT>|5052:127.0.0.1:5052|'
 lint_readme "no end marker fails" '^want one session-run begin and one end marker \(got 1 and 0\)$' \
@@ -904,7 +1040,7 @@ lint_readme "no begin marker fails" '^want one session-run begin and one end mar
 lint_readme "the end marker before the begin marker fails" '^the session-run end marker is not after its begin marker$' \
   's|<!-- session-run:begin -->|<!-- session-run:END -->|; s|<!-- session-run:end -->|<!-- session-run:begin -->|; s|<!-- session-run:END -->|<!-- session-run:end -->|'
 # Each value that the evidence must name: drop it, and the lint names it.
-for want in '`pass: true`' '`exit_code: 0`' '`build_dirty: false`' '`clean_build`' \
+for want in '`pass: true`' '`exit_code: 0`' '`build_dirty: false`' '`clean_build`' '`build_rustc_commit`' \
   '`connected to 1 peer(s), 0 not pinned; 0 listen address(es)`'; do
   # The README wraps the detail of pinned_peer_only, so drop the line that holds it.
   if [[ $want == '`connected to 1 peer(s)'* ]]; then script='/`connected to 1 peer(s), 0 not pinned/d'; else
@@ -913,6 +1049,197 @@ for want in '`pass: true`' '`exit_code: 0`' '`build_dirty: false`' '`clean_build
 done
 lint_readme "evidence without os_user fails" '^want: .*`os_user: "m2a-session"`' \
   's|`os_user: "m2a-session"`|the user|'
+
+# tunnel_lint <root>: every SSH port forward that the files under <root> give (docs, code
+# comments, scripts, ssh configs) listens on loopback only: the bind address of each -L (also
+# in an option group such as -NL, and with the spec in the same word, -L5052:...) and of each
+# LocalForward (also through -o) is 127.0.0.1. Each ssh with a forward also has
+# -o ExitOnForwardFailure=yes, so that ssh exits if another process holds the port, and is not
+# put in the background with a trailing & (use ssh -f, which goes to the background only once
+# the forward listens). ssh is found as a word, also inside punctuation such as (ssh, **ssh or
+# h;ssh, and autossh counts. All of argv after ssh is read: OpenSSH also takes options after
+# the host. Option keys compare without case, the first ExitOnForwardFailure value counts, and
+# -o takes both the key=value and the "key value" form. Without these, a forward listens on every address, or a local account
+# that holds the port serves the reference values. A line that ends with a backslash, or that
+# leaves a code span open, is read with the next line (its comment marker removed). Prints each
+# problem as <file>:<line>: <problem>: <detail>. In a git checkout only tracked files count, so
+# a copy elsewhere in the tree (a worktree, a build dir) does not. This test file holds bad
+# forwards on purpose.
+tunnel_py='
+import os, re, shlex, sys
+root, mode = sys.argv[1], sys.argv[2]
+SELF = "ref-node.test.sh"
+if mode == "git":
+    paths = [p for p in sys.stdin.buffer.read().decode("utf-8", "surrogateescape").split("\0") if p]
+else:
+    paths = []
+    for d, dirs, files in os.walk(root):
+        dirs[:] = sorted(x for x in dirs if x not in ("target", ".git"))
+        paths += [os.path.relpath(os.path.join(d, f), root) for f in sorted(files) if f != SELF]
+# The ssh options that take an argument (ssh(1)).
+ARG = set("BbcDEeFIiJLlmOoPpRSWw")
+# ssh (or autossh) as a word: after a blank, a (, a ;, a * of emphasis or a /.
+SSH = re.compile(r"(?<![A-Za-z0-9_.-])(?:auto)?ssh(?![A-Za-z0-9_-])")
+# Where the command of an ssh ends.
+CUT = re.compile(r"&&|[|][|]|[;|)]")
+COMMENT = re.compile(r"^\s*(//[/!]?|#|\*|--)?\s*")
+forwards, problems = 0, []
+def bind(spec):
+    return spec.startswith("127.0.0.1:")
+def check(rel, at, text):
+    global forwards
+    for segment in text.split("`"):
+        toks = [t.strip("\"'"'"'") for t in segment.split()]
+        for k, t in enumerate(toks):
+            m = re.fullmatch(r"(?i)localforward(?:=(.*))?", t)
+            if not m or (k and toks[k - 1] == "-o"):
+                continue  # -o LocalForward is read with the ssh options below
+            spec = m.group(1) or (toks[k + 1] if k + 1 < len(toks) else "")
+            if not spec:
+                continue  # the name alone, in prose or a code span: no forward
+            forwards += 1
+            if not bind(spec):
+                problems.append((rel, at, "a forward without the bind address 127.0.0.1", spec))
+        for found in SSH.finditer(segment):
+            after = segment[found.end():]
+            cut = CUT.search(after)
+            words = after[:cut.start()] if cut else after
+            try:
+                argv = shlex.split(words)
+            except ValueError:
+                argv = words.split()
+            specs, exit_values, background, j = [], [], False, 0
+            # Every word after ssh: OpenSSH also reads the options after the host.
+            while j < len(argv):
+                x = argv[j]
+                if x == "&" or (x.endswith("&") and not x.endswith("&&")):
+                    background = True
+                if x.startswith("-") and len(x) > 1 and not x.startswith("--"):
+                    for n, c in enumerate(x[1:], 1):
+                        if c not in ARG:
+                            continue
+                        arg = x[n + 1:]
+                        if not arg and j + 1 < len(argv):
+                            j += 1
+                            arg = argv[j]
+                        if c == "L":
+                            specs.append(arg)
+                        elif c == "o":
+                            key, _, value = arg.strip().partition("=") if "=" in arg else arg.strip().partition(" ")
+                            key, value = key.strip().lower(), value.strip()
+                            if key == "exitonforwardfailure":
+                                exit_values.append(value.lower())
+                            elif key == "localforward":
+                                specs.append(value.split()[0] if value.split() else "")
+                        break
+                j += 1
+            if not specs:
+                continue
+            forwards += len(specs)
+            for spec in specs:
+                if not bind(spec):
+                    problems.append((rel, at, "a forward without the bind address 127.0.0.1", spec))
+            # ssh takes the first value of an option.
+            if not exit_values or exit_values[0] != "yes":
+                problems.append((rel, at, "an ssh forward without -o ExitOnForwardFailure=yes", segment.strip()))
+            if background:
+                problems.append((rel, at, "an ssh forward in the background with & (use ssh -f)", segment.strip()))
+for rel in paths:
+    try:
+        with open(os.path.join(root, rel), "rb") as f:
+            data = f.read()
+    except OSError:
+        continue
+    if b"\0" in data[:8192]:
+        continue
+    lines = data.decode("utf-8", "replace").split("\n")
+    i = 0
+    while i < len(lines):
+        at, text = i + 1, lines[i]
+        i += 1
+        while i < len(lines) and (text.endswith("\\") or text.count("`") % 2):
+            text = text[:-1] if text.endswith("\\") else text
+            text += " " + COMMENT.sub("", lines[i], count=1)
+            i += 1
+        check(rel, at, text)
+for rel, at, what, detail in problems:
+    print("%s:%d: %s: %s" % (rel, at, what, detail))
+if not forwards:
+    print("no SSH port forward found under " + root)
+sys.exit(1 if problems or not forwards else 0)
+'
+tunnel_lint() {
+  local root=$1
+  if git -C "$root" rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+    git -C "$root" ls-files -z -- . ':!ops/ref-node/tests/ref-node.test.sh' |
+      (cd "$root" && python3 -I -c "$tunnel_py" "$root" git)
+  else
+    python3 -I -c "$tunnel_py" "$root" walk < /dev/null
+  fi
+}
+check 0 "tunnel: every SSH port forward in the repository binds loopback and stops on a taken port" tunnel_lint "$repo"
+mkdir -p "$tmp/tunnel/docs" "$tmp/tunnel-git/docs"
+printf 'Tunnel: `ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:1:127.0.0.1:1 h`\n' > "$tmp/tunnel/docs/good.md"
+cp "$tmp/tunnel/docs/good.md" "$tmp/tunnel-git/docs/good.md"
+printf 'ssh -N -L 127.0.0.1:5053:127.0.0.1:5053 ref-host\n' > "$tmp/tunnel-git/docs/bad.md"
+git -C "$tmp/tunnel-git" init -q && git -C "$tmp/tunnel-git" add -A
+check_out 1 "tunnel: a forward without ExitOnForwardFailure fails (git checkout)" \
+  '^docs/bad\.md:1: an ssh forward without -o ExitOnForwardFailure=yes: ssh -N -L 127' tunnel_lint "$tmp/tunnel-git"
+check 0 "tunnel: a loopback forward with ExitOnForwardFailure passes" tunnel_lint "$tmp/tunnel"
+# tunnel_case <description> <pattern> <file content (printf format)>: one bad file next to the
+# good one fails with a line that matches the pattern.
+tunnel_case() {
+  # shellcheck disable=SC2059 # the format is the case's own text
+  printf "$3" > "$tmp/tunnel/docs/bad.txt"
+  check_out 1 "tunnel: $1" "$2" tunnel_lint "$tmp/tunnel"
+  rm "$tmp/tunnel/docs/bad.txt"
+}
+exit_on='-o ExitOnForwardFailure=yes'
+tunnel_case "a forward on every address fails" \
+  '^docs/bad\.txt:1: a forward without the bind address 127\.0\.0\.1: 5052:127\.0\.0\.1:5052$' \
+  "//! (\`ssh $exit_on -L 5052:127.0.0.1:5052 ref-host\`)\n"
+tunnel_case "-NL (L in an option group) fails" '^docs/bad\.txt:1: a forward without the bind address 127\.0\.0\.1: 5052:' \
+  "ssh $exit_on -NL 5052:127.0.0.1:5052 ref-host\n"
+tunnel_case "-L5052 (the spec in the same word) fails" '^docs/bad\.txt:1: a forward without the bind address 127\.0\.0\.1: 5052:' \
+  "ssh -N $exit_on -L5052:127.0.0.1:5052 ref-host\n"
+tunnel_case "-o LocalForward= fails" '^docs/bad\.txt:1: a forward without the bind address 127\.0\.0\.1: 5052$' \
+  "ssh -N $exit_on -o LocalForward=5052 127.0.0.1:5052 ref-host\n"
+tunnel_case "a LocalForward line of an ssh config fails" '^docs/bad\.txt:2: a forward without the bind address 127\.0\.0\.1: 5052$' \
+  "Host ref\n  LocalForward 5052 127.0.0.1:5052\n"
+tunnel_case "a forward split over two lines fails" '^docs/bad\.txt:1: an ssh forward without -o ExitOnForwardFailure=yes' \
+  "ssh -N \\\\\n  -L 127.0.0.1:5052:127.0.0.1:5052 ref-host\n"
+tunnel_case "a forward split inside a code span fails" '^docs/bad\.txt:1: a forward without the bind address 127\.0\.0\.1: 5052:' \
+  "//! (\`ssh -N $exit_on\n//! -L 5052:127.0.0.1:5052 ref-host\`)\n"
+tunnel_case "a second bad -L on a good line fails" '^docs/bad\.txt:1: a forward without the bind address 127\.0\.0\.1: 5053:' \
+  "ssh -N $exit_on -L 127.0.0.1:5052:127.0.0.1:5052 -L 5053:127.0.0.1:5053 ref-host\n"
+tunnel_case "a forward put in the background with & fails" '^docs/bad\.txt:1: an ssh forward in the background with &' \
+  "ssh -N $exit_on -L 127.0.0.1:5053:127.0.0.1:5053 ref-host &\ncollector sse\n"
+# Options after the host, a word boundary other than a blank, autossh, any case of the key,
+# the first ExitOnForwardFailure value, and the "key value" form of -o.
+tunnel_case "-L after the host fails" '^docs/bad\.txt:1: a forward without the bind address 127\.0\.0\.1: 5052:' \
+  "ssh -N $exit_on ref-host -L 5052:127.0.0.1:5052\n"
+tunnel_case "ssh in a subshell fails" '^docs/bad\.txt:1: a forward without the bind address 127\.0\.0\.1: 5052:' \
+  "(ssh -N $exit_on -L 5052:127.0.0.1:5052 ref-host)\n"
+tunnel_case "ssh in bold fails" '^docs/bad\.txt:1: a forward without the bind address 127\.0\.0\.1: 5052:' \
+  "**ssh -N $exit_on -L 5052:127.0.0.1:5052 ref-host**\n"
+tunnel_case "ssh after a ; fails" '^docs/bad\.txt:1: a forward without the bind address 127\.0\.0\.1: 5052:' \
+  "h;ssh -N $exit_on -L 5052:127.0.0.1:5052 ref-host\n"
+tunnel_case "autossh fails" '^docs/bad\.txt:1: a forward without the bind address 127\.0\.0\.1: 5052:' \
+  "autossh -M 0 -N $exit_on -L 5052:127.0.0.1:5052 ref-host\n"
+tunnel_case "a lower-case localforward fails" '^docs/bad\.txt:2: a forward without the bind address 127\.0\.0\.1: 5052$' \
+  "Host ref\n  localforward 5052 127.0.0.1:5052\n"
+tunnel_case "a first ExitOnForwardFailure=no fails" '^docs/bad\.txt:1: an ssh forward without -o ExitOnForwardFailure=yes' \
+  "ssh -N -o ExitOnForwardFailure=no $exit_on -L 127.0.0.1:5052:127.0.0.1:5052 ref-host\n"
+tunnel_case "a first \"ExitOnForwardFailure no\" fails" '^docs/bad\.txt:1: an ssh forward without -o ExitOnForwardFailure=yes' \
+  "ssh -N -o \"ExitOnForwardFailure no\" $exit_on -L 127.0.0.1:5052:127.0.0.1:5052 ref-host\n"
+tunnel_case "\"ExitOnForwardFailure no\" with a bad forward fails" '^docs/bad\.txt:1: a forward without the bind address 127\.0\.0\.1: 5052:' \
+  "ssh -N -o \"ExitOnForwardFailure no\" -L 5052:127.0.0.1:5052 ref-host\n"
+printf 'ssh -f -N -o "ExitOnForwardFailure yes" -L 127.0.0.1:5053:127.0.0.1:5053 ref-host &&\n  collector sse\n' > "$tmp/tunnel/docs/f.txt"
+check 0 "tunnel: the \"key value\" form of -o passes" tunnel_lint "$tmp/tunnel"
+printf 'ssh -f -N %s -L 127.0.0.1:5053:127.0.0.1:5053 ref-host &&\n  collector sse\n' "$exit_on" > "$tmp/tunnel/docs/f.txt"
+check 0 "tunnel: ssh -f before && passes" tunnel_lint "$tmp/tunnel"
+rm -r "$tmp/tunnel/docs"
+check_out 1 "tunnel: no forward at all fails" '^no SSH port forward found' tunnel_lint "$tmp/tunnel"
 
 check_out 0 "mode: 600 and the service user passes" '^/k: 600 reth: PASS$' check_mode_owner /k "600 reth" reth
 check_out 1 "mode: 644 fails" '^/k: 644 reth \(want 600 reth\): FAIL$' check_mode_owner /k "644 reth" reth
@@ -2069,7 +2396,7 @@ has "finalized slot 10128, oldest block slot 10000 (anchor.oldest_block_slot): 1
 has "custody_group_count: 4" "records custody_group_count"
 has "peer = \"/ip4/34.89.10.7/tcp/9000/p2p/$pid\"" "writes the m2a-session peer line"
 # The forward binds loopback only, and ssh exits if another local account holds the port.
-has '# Over the tunnel: ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:5052:127.0.0.1:5052 <ref-host>' "the tunnel binds loopback and fails if the port is taken"
+has '# Over the tunnel: ssh -f -N -o ExitOnForwardFailure=yes -L 127.0.0.1:5052:127.0.0.1:5052 <ref-host>' "the tunnel binds loopback, fails if the port is taken, and returns once it listens"
 has 'trusted_by_reference = true' "TRUSTED_PEERS set: the session config is trusted_by_reference"
 has 'sigp/lighthouse/releases/tag/v8.3.0-rc.0' "copies the release-note block from README.md"
 if grep -q KEY123secret "$log" || grep -qF "$(cat "$jwt_r")" "$log"; then
@@ -2464,7 +2791,7 @@ has "reth: no non-loopback TCP listener but p2p port 30304 (pids 812): PASS" "Ho
 has "$hroot/lighthouse/data/beacon/network/key: 600 $me_uid: PASS" "Hoodi: the node key under its own DATA_ROOT"
 has 'network = "hoodi"' "Hoodi: the session config names the network"
 has "peer = \"/ip4/34.89.10.7/tcp/9002/p2p/$pid\"" "Hoodi: the multiaddr carries the configured p2p port"
-has '# Over the tunnel: ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:5053:127.0.0.1:5053 <ref-host>' "Hoodi: the tunnel uses the configured Beacon API port, on loopback only"
+has '# Over the tunnel: ssh -f -N -o ExitOnForwardFailure=yes -L 127.0.0.1:5053:127.0.0.1:5053 <ref-host>' "Hoodi: the tunnel uses the configured Beacon API port, on loopback only"
 if grep -qx 'http://127.0.0.1:5053/eth/v1/node/syncing' "$tmp/curl.log" && ! grep -q ':5052/' "$tmp/curl.log"; then
   ok "run log: Hoodi: every Beacon API request goes to the configured port"
 else

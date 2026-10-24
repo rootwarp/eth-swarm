@@ -14,7 +14,8 @@
 //!   `m2a-session-test` fails it.
 //! - `clean_build`: the binary was built from a known commit with no uncommitted change in the
 //!   build tree. The top-level `build_commit` names the commit (or is `null`), and `build_dirty`
-//!   is `true` unless the check passed ([`BuildInfo`]).
+//!   is `true` unless the check passed ([`BuildInfo`]). The probe refuses to dial with a build
+//!   that was not clean, so this check is a second guard.
 //! - `fuzz_gate`, `own_os_user`, `key_handling`: what the pre-flight established before the
 //!   dial (a passing m2a fuzz gate, the effective UID of the session user `run_as`, never
 //!   root, with equal real and saved UIDs, a checked node key). `own_os_user` passes only when
@@ -123,9 +124,13 @@ fn production_build(test_build: bool) -> Verdict {
 /// build tree ([`BuildInfo`]), so `build_commit` names the sources that ran.
 fn clean_build(build: &BuildInfo) -> Verdict {
     match (&build.commit, &build.unclean) {
-        (Some(commit), None) => verdict(
+        (Some(commit), None) if build.is_clean() => verdict(
             true,
             format!("built from {commit} with no uncommitted change in the build tree"),
+        ),
+        (Some(commit), None) => verdict(
+            false,
+            format!("built from {commit}, but no valid compiler commit was embedded"),
         ),
         (Some(commit), Some(why)) => verdict(false, format!("built from {commit}, but {why}")),
         (None, why) => verdict(
@@ -329,6 +334,7 @@ impl Summary {
             "euid": self.facts.euid,
             "test_build": self.facts.test_build,
             "build_commit": self.facts.build.commit,
+            "build_rustc_commit": self.facts.build.rustc_commit,
             "build_dirty": !self.facts.build.is_clean(),
             "consensus_specs": SPEC_PIN.consensus_specs,
             "started_at_ms": ms(self.facts.started_at_ms),
@@ -342,7 +348,7 @@ impl Summary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build_info::FIXTURE_COMMIT;
+    use crate::build_info::{FIXTURE_COMMIT, FIXTURE_RUSTC};
 
     fn facts(user: &str, euid: u32) -> Facts {
         Facts {
@@ -476,6 +482,7 @@ mod tests {
             format!("built from {FIXTURE_COMMIT} with no uncommitted change in the build tree")
         );
         assert_eq!(line(&clean)["build_commit"], FIXTURE_COMMIT);
+        assert_eq!(line(&clean)["build_rustc_commit"], FIXTURE_RUSTC);
         assert_eq!(line(&clean)["build_dirty"], false);
         let dirty = summary_of(BuildInfo::from_build(
             FIXTURE_COMMIT,
@@ -498,7 +505,19 @@ mod tests {
         assert!(!failed.pass, "{failed:?}");
         assert_eq!(failed.detail, "no build commit: no git");
         assert_eq!(line(&unknown)["build_commit"], serde_json::Value::Null);
+        assert_eq!(
+            line(&unknown)["build_rustc_commit"],
+            serde_json::Value::Null
+        );
         assert_eq!(line(&unknown)["build_dirty"], true);
+        let no_rustc = summary_of(BuildInfo::from_build(FIXTURE_COMMIT, ""));
+        let failed = check(&no_rustc, "clean_build");
+        assert!(!failed.pass, "{failed:?}");
+        assert_eq!(
+            failed.detail,
+            format!("built from {FIXTURE_COMMIT}, but no valid compiler commit was embedded")
+        );
+        assert_eq!(line(&no_rustc)["build_dirty"], true);
     }
 
     /// A summary of the test binary fails its `production_build` check, so a gate that reads
