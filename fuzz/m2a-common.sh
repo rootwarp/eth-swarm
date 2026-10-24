@@ -36,42 +36,56 @@ M2A_BUILD_FLAGS=(-O -a)
 
 # The gate's decoder key: what the fuzzed decoder and its harness are built and run from. A
 # change to any of these makes a gate file stale. `git rev-parse HEAD:<path>` of each path, plus
-# the sha256 of both lockfiles. network-config is keyed: consensus-types' by-slot decoders map a
-# peer's slot through its ForkSchedule, and the caps come from its pinned configs. cl-p2p's
-# library is keyed from its crate root
-# (lib.rs, so a #[path] or mod edit there makes the gate stale) through every module a keyed
-# file imports, transitively: the rpc directory whole, transport (metrics imports its
-# Direction) and its child modules, behaviour and peer_caps (the swarm builder imports them),
-# gossip, and the modules lib.rs declares. Its binaries (main.rs, src/bin) are not keyed.
-# crates/ci-checks/tests/fuzz_keys.rs fails if a keyed file imports a module (crate::, super::,
-# self::, a child mod) that no key holds, if a keyed module's crate root is not keyed, or if
-# keyed code imports a workspace path crate that the gate neither keys nor allows for that
-# importing file with a reason (its ALLOWED list: ethswarm-proto, ipc, node-key and the crates
-# only other gates' targets import). The manifests are in it
-# because features (root [workspace.dependencies] included) change the build without changing
-# the lockfile; the harness, seeds and these scripts (limits, build flags) because a weaker run
-# must not keep an old gate. fuzz/Cargo.lock is what the targets link; the root Cargo.lock is
-# what the session binary links, so a root bump (snap, say) makes the gate stale before
-# fuzz/Cargo.lock follows it (scripts/check-fuzz-lock.sh keeps the two alike).
+# the sha256 of both lockfiles.
+#
+# The workspace crates in the key are the closure of the harness: every workspace crate that
+# fuzz/Cargo.toml depends on, transitively, through normal and build dependencies. Each crate is
+# keyed as its whole directory: its sources, build script, tests, binaries and docs. So no
+# import form can reach an unkeyed crate, a #[path] or include! whose target is in a crate
+# directory reads a keyed file, and a gate goes stale when any crate of the closure changes. The
+# closure is the same for every gate: the fuzz targets are the binaries of one package, so each
+# target links the harness library and every crate that it depends on, with the features that
+# the whole graph unifies.
+#   - Build dependencies are followed: a build script runs when its crate is built, and the code
+#     that it generates is compiled into the crate. proto/ethswarm is keyed with ethswarm-proto,
+#     whose build script compiles it (PROTOC and PROTOC_* are refused below).
+#   - Dev-dependencies are not followed: cargo builds them only for the tests, benches and
+#     examples of their own crate, which neither cargo-fuzz nor a dependent crate builds.
+# crates/ci-checks/tests/fuzz_keys.rs reads these keys from bash after gate_select, computes the
+# closure from `cargo metadata`, and fails if a key does not hold one of these:
+#   - a crate of the closure, whole;
+#   - the directory of the root file of each built target (a [lib] path, [[bin]] path or build
+#     can be outside the crate directory);
+#   - a file outside a crate that a build script reads, and each proto import;
+#   - root Cargo.toml, Cargo.lock and fuzz/Cargo.lock.
+# The harness itself (fuzz/, where the fuzz build writes target/ and artifacts/) is keyed by its
+# manifest and the directories of its library and its targets (a root file such as a build.rs as
+# its file). The test refuses a #[path] or include! in the harness, which could read an unkeyed
+# fuzz/tests or fuzz/examples. A symlink under a keyed path makes the tree dirty
+# (m2a_worktree_diff).
+# A #[path] or include! that leaves the crate directory of a crate of the closure is not found;
+# no crate has one outside its test code.
+#
+# The root manifest is in the key because features (root [workspace.dependencies] included)
+# change the build without changing the lockfile; the harness, seeds and these scripts (limits,
+# build flags) because a weaker run must not keep an old gate. fuzz/Cargo.lock is what the
+# targets link; the root Cargo.lock is what the session binary links, so a root bump (snap, say)
+# makes the gate stale before fuzz/Cargo.lock follows it (scripts/check-fuzz-lock.sh keeps the
+# two alike).
 M2A_KEY_PATHS=(
   Cargo.toml
-  crates/p2p-wire
+  crates/cl-chain
+  crates/cl-chain-columns
+  crates/cl-discv5
+  crates/cl-p2p
   crates/consensus-types
+  crates/ethswarm-proto
+  crates/ipc
   crates/network-config
-  crates/cl-p2p/Cargo.toml
-  crates/cl-p2p/src/lib.rs
-  crates/cl-p2p/src/rpc
-  crates/cl-p2p/src/transport.rs
-  crates/cl-p2p/src/transport
-  crates/cl-p2p/src/behaviour.rs
-  crates/cl-p2p/src/peer_caps.rs
-  crates/cl-p2p/src/gossip
-  crates/cl-p2p/src/custody.rs
-  crates/cl-p2p/src/identity.rs
-  crates/cl-p2p/src/m2a_session.rs
-  crates/cl-p2p/src/m2a_session
-  crates/cl-p2p/src/peers
-  crates/cl-p2p/src/testkit.rs
+  crates/node-key
+  crates/p2p-wire
+  crates/svc-runtime
+  proto/ethswarm
   fuzz/Cargo.toml
   fuzz/rust-toolchain.toml
   fuzz/src
@@ -84,59 +98,26 @@ M2A_KEY_PATHS=(
 )
 M2A_KEY_FILES=(Cargo.lock fuzz/Cargo.lock)
 
-# Gate 1's key: the m2a key (which holds cl-p2p's gossip module: the gossip transform and the
-# message-id hook), plus what its targets add: the record reader (cl-discv5's library, from its
-# crate root through the enr, metrics and service modules it declares, and its manifest; not
-# its main.rs) and fuzz/run-gate1.sh. network-config (the gossip caps and the ENR seeds come
-# from the pinned Sepolia schedules) is in the m2a key. Both lockfiles are keyed as for m2a.
+# Gate 1's key: the m2a key (the closure holds the record reader, cl-discv5, and cl-p2p's gossip
+# transform and message-id hook), plus fuzz/run-gate1.sh. Both lockfiles are keyed as for m2a.
 GATE1_KEY_PATHS=(
   "${M2A_KEY_PATHS[@]}"
-  crates/cl-discv5/Cargo.toml
-  crates/cl-discv5/src/lib.rs
-  crates/cl-discv5/src/enr.rs
-  crates/cl-discv5/src/metrics.rs
-  crates/cl-discv5/src/service.rs
   fuzz/run-gate1.sh
 )
 
-# Gate 2a's key: the m2a key (p2p-wire holds the column protocols, their request and sidecar
-# bounds and column_request_error, the check cl-p2p admits a column request with; cl-p2p's rpc
-# codec reads the column responses and requests, and its rpc directory holds the column answers,
-# rpc/columns.rs: what a request names, how an answer is cut; consensus-types holds
-# NUMBER_OF_COLUMNS), plus cl-chain's request bounds (reqresp.rs), which the request targets run
-# on every decoded request: cl-chain's source whole (its crate root declares every module) and
-# manifest, and the workspace crates it imports (cl-chain-columns, the chain.v1 messages in
-# ethswarm-proto and their sources in proto/ethswarm, the contract layer ipc); and
-# fuzz/run-gate2a.sh. network-config (the column caps and the fork schedule a sidecar's slot is
-# mapped through) is in the m2a key. Both lockfiles are keyed as for m2a.
+# Gate 2a's key: the m2a key (the closure holds the column protocols and bounds of p2p-wire, the
+# column codec and answers of cl-p2p, and the request bounds of cl-chain), plus
+# fuzz/run-gate2a.sh. Both lockfiles are keyed as for m2a.
 GATE2A_KEY_PATHS=(
   "${M2A_KEY_PATHS[@]}"
-  crates/cl-chain/Cargo.toml
-  crates/cl-chain/src
-  crates/cl-chain-columns
-  crates/ethswarm-proto
-  proto/ethswarm
-  crates/ipc
   fuzz/run-gate2a.sh
 )
 
-# Gate 2b's key: the m2a key (the gossip transform and the column request decoders are
-# p2p-wire's, the sidecar and block types consensus-types', the timed request codec cl-p2p's),
-# plus everything column_contract runs past them: cl-chain's source and manifest (the probe's
-# storage contract, reference view, root wait and column store, the custody record, the
-# verify.v1 client's trait and the column RPCs), the column env (cl-chain-columns, its MDBX
-# binding pinned in the lockfiles), the chain.v1 messages and their sources (ethswarm-proto,
-# proto/ethswarm), the contract layer the RPCs and the harness hold every stream to (ipc), and
-# fuzz/run-gate2b.sh. network-config (the Sepolia schedule and caps) is in the m2a key. Both
-# lockfiles are keyed as for m2a.
+# Gate 2b's key: the m2a key (the closure holds cl-chain's storage contract, column store and
+# column RPCs, the column env of cl-chain-columns, whose MDBX binding the lockfiles pin, the
+# chain.v1 messages and ipc), plus fuzz/run-gate2b.sh. Both lockfiles are keyed as for m2a.
 GATE2B_KEY_PATHS=(
   "${M2A_KEY_PATHS[@]}"
-  crates/cl-chain/Cargo.toml
-  crates/cl-chain/src
-  crates/cl-chain-columns
-  crates/ethswarm-proto
-  proto/ethswarm
-  crates/ipc
   fuzz/run-gate2b.sh
 )
 
@@ -296,6 +277,8 @@ m2a_require_python() {
 #     CRATE_CC_NO_DEFAULTS, CROSS_COMPILE, SDKROOT and MACOSX_DEPLOYMENT_TARGET (cc turns it
 #     into libFuzzer's -mmacosx-version-min). The <target> forms hold '-' and '.', so they are
 #     no shell identifiers and bash does not list them: the names come from python;
+#   - the proto build (ethswarm-proto's build script, through prost-build): PROTOC and every
+#     PROTOC_* (PROTOC_INCLUDE, say), which pick another protoc or other well-known types;
 #   - the lockfile pre-flight (m2a_lock_preflight): FUZZ_LOCK_CARGO, which replaces cargo in
 #     scripts/check-fuzz-lock.sh's resolution check (its tests' stub);
 #   - the run itself: RUST_LIBFUZZER_DEBUG_PATH (libfuzzer-sys then writes each input to that
@@ -333,7 +316,7 @@ m2a_require_clean_env() {
         HOST_CC* | HOST_CXX* | HOST_CFLAGS | HOST_AR* | HOST_RANLIB* | HOST_NVCC | \
         TARGET_CC* | TARGET_CXX* | TARGET_CFLAGS | TARGET_AR* | TARGET_RANLIB* | TARGET_NVCC | \
         CRATE_CC_NO_DEFAULTS | CROSS_COMPILE | SDKROOT | MACOSX_DEPLOYMENT_TARGET | \
-        FUZZ_LOCK_CARGO)
+        PROTOC | PROTOC_* | FUZZ_LOCK_CARGO)
         bad+=("$name")
         ;;
     esac
@@ -459,10 +442,12 @@ m2a_git() {
 
 # m2a_worktree_diff: prints how the keyed paths on disk differ from HEAD, byte for byte and
 # without git's view of the working tree: every file HEAD has under a keyed path is read from
-# $repo and its blob id computed over the raw bytes (what `git hash-object --no-filters` gives;
-# a symlink's id is over its target) and compared with HEAD's ("content differs from HEAD",
-# "missing", "type differs from HEAD"), and every file on disk under a keyed path that HEAD
-# lacks is listed ("not in HEAD"), whatever .gitignore or .git/info/exclude say. So none of
+# $repo and its blob id computed over the raw bytes (what `git hash-object --no-filters` gives)
+# and compared with HEAD's ("content differs from HEAD", "missing", "type differs from HEAD").
+# A symlink that HEAD has under a keyed path is listed ("symlink"): git keys it by its link
+# text, but rustc and include! read its target, which can be outside every key. Every file on
+# disk under a keyed path that HEAD lacks is listed ("not in HEAD"), whatever .gitignore or
+# .git/info/exclude say. So none of
 # what git still reads from the repository itself (.git/config filters, core.worktree,
 # .git/info/attributes, the index's stat data, assume-unchanged or skip-worktree) can make a
 # changed file look clean. Fails closed: a checkout whose bytes legitimately differ from the
@@ -498,6 +483,9 @@ for path, (mode, kind, oid) in sorted(head.items()):
     shown, full = os.fsdecode(path), os.path.join(repo, path)
     if kind != b"blob":
         out.append(f"not a file in HEAD: {shown}")
+        continue
+    if mode == b"120000":
+        out.append(f"symlink: {shown} (keyed by its link text, but the build reads its target)")
         continue
     try:
         st = os.lstat(full)

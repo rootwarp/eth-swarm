@@ -56,7 +56,7 @@ printf '[toolchain]\nchannel = "nightly-2026-10-17"\n' > "$fx/fuzz/rust-toolchai
 echo 'version = 4' > "$fx/fuzz/Cargo.lock"
 echo 'version = 4' > "$fx/Cargo.lock"
 printf 'target\nartifacts\n' > "$fx/fuzz/.gitignore"
-# The modules the keyed files import, which the keys hold too (fuzz/m2a-common.sh).
+# More files of the keyed crates (fuzz/m2a-common.sh keys each crate whole).
 for f in crates/cl-p2p/src/transport.rs crates/cl-p2p/src/transport/quota.rs \
   crates/cl-p2p/src/behaviour.rs crates/cl-p2p/src/peer_caps.rs crates/cl-p2p/src/gossip/mod.rs \
   crates/cl-chain/src/probe.rs crates/cl-chain/src/probe/ingest.rs crates/cl-chain/src/da/custody.rs \
@@ -69,6 +69,7 @@ for f in crates/cl-p2p/src/transport.rs crates/cl-p2p/src/transport/quota.rs \
   mkdir -p "$(dirname "$fx/$f")"
   [[ -e $fx/$f ]] || echo 'x' > "$fx/$f"
 done
+fixture_key_dirs "$fx"
 git init -q "$fx"
 g add -A
 g commit -q -m fixture
@@ -126,16 +127,16 @@ done
 [[ -z $others ]] && ok "no other gate's target is run" || bad "ran:$others"
 key=$(gate_run -- "$fx/fuzz/check-gate2b.sh" --print-key)
 missing=""
-for path in crates/cl-chain/Cargo.toml crates/cl-chain/src crates/cl-chain-columns crates/ethswarm-proto \
-  proto/ethswarm crates/ipc crates/network-config crates/p2p-wire crates/cl-p2p/src/rpc \
+for path in crates/cl-chain crates/cl-chain-columns crates/ethswarm-proto \
+  proto/ethswarm crates/ipc crates/network-config crates/p2p-wire crates/cl-p2p \
   fuzz/src fuzz/corpus fuzz/run-gate2b.sh fuzz/m2a-common.sh; do
   grep -q "\"$path\"" <<<"$key" || missing="$missing $path"
 done
 [[ -z $missing ]] && ok "gate 2b's key holds cl-chain, the column env, the chain.v1 contract and the shared fuzz sources" \
   || bad "key lacks$missing" "$key"
-! grep -q '"crates/cl-discv5/src/enr.rs"' <<<"$key" && ! grep -q '"fuzz/run-gate2a.sh"' <<<"$key" \
-  && ! grep -q '"crates/cl-chain/src/reqresp.rs"' <<<"$key" \
-  && ok "gate 2b's key leaves out the other gates' own paths" || bad "key" "$key"
+! grep -q '"fuzz/run-gate1.sh"' <<<"$key" && ! grep -q '"fuzz/run-gate2a.sh"' <<<"$key" \
+  && ! grep -q '"crates/cl-chain/src"' <<<"$key" \
+  && ok "gate 2b's key leaves out the other gates' own paths and keys crates whole" || bad "key" "$key"
 [[ $(field "$file" "json.dumps(gate['decoder_key'], sort_keys=True)") \
   == $(python3 -I -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1]), sort_keys=True))' "$key") ]] \
   && ok "the decoder key is check-gate2b.sh --print-key" || bad "decoder key"

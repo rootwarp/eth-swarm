@@ -53,7 +53,7 @@ printf '[toolchain]\nchannel = "nightly-2026-10-17"\n' > "$fx/fuzz/rust-toolchai
 echo 'version = 4' > "$fx/fuzz/Cargo.lock"
 echo 'version = 4' > "$fx/Cargo.lock"
 printf 'target\nartifacts\n' > "$fx/fuzz/.gitignore"
-# The modules the keyed files import, which the keys hold too (fuzz/m2a-common.sh).
+# More files of the keyed crates (fuzz/m2a-common.sh keys each crate whole).
 for f in crates/cl-p2p/src/transport.rs crates/cl-p2p/src/transport/quota.rs \
   crates/cl-p2p/src/behaviour.rs crates/cl-p2p/src/peer_caps.rs crates/cl-p2p/src/gossip/mod.rs \
   crates/cl-chain/src/probe.rs crates/cl-chain/src/probe/ingest.rs crates/cl-chain/src/da/custody.rs \
@@ -66,6 +66,7 @@ for f in crates/cl-p2p/src/transport.rs crates/cl-p2p/src/transport/quota.rs \
   mkdir -p "$(dirname "$fx/$f")"
   [[ -e $fx/$f ]] || echo 'x' > "$fx/$f"
 done
+fixture_key_dirs "$fx"
 git init -q "$fx"
 g add -A
 g commit -q -m fixture
@@ -126,13 +127,13 @@ for t in rpc_chunk gossip_transform message_id enr_fields status_v2 metadata_v3 
 done
 [[ -z $others ]] && ok "no other gate's target is run" || bad "ran:$others"
 key=$(gate_run -- "$fx/fuzz/check-gate2a.sh" --print-key)
-grep -q '"crates/cl-p2p/src/rpc"' <<<"$key" && grep -q '"crates/cl-chain/src"' <<<"$key" \
-  && grep -q '"crates/cl-chain/Cargo.toml"' <<<"$key" && grep -q '"crates/ethswarm-proto"' <<<"$key" \
-  && grep -q '"crates/cl-p2p/src/transport"' <<<"$key" && grep -q '"crates/p2p-wire"' <<<"$key" \
+grep -q '"crates/cl-p2p"' <<<"$key" && grep -q '"crates/cl-chain"' <<<"$key" \
+  && grep -q '"crates/ethswarm-proto"' <<<"$key" && grep -q '"proto/ethswarm"' <<<"$key" \
+  && grep -q '"crates/p2p-wire"' <<<"$key" \
   && grep -q '"fuzz/run-gate2a.sh"' <<<"$key" && grep -q '"crates/network-config"' <<<"$key" \
-  && ok "gate 2a's key holds the column codec, request and network-config paths" || bad "key" "$key"
-! grep -q '"crates/cl-discv5/src/enr.rs"' <<<"$key" && ! grep -q '"fuzz/run-gate1.sh"' <<<"$key" \
-  && ok "gate 2a's key leaves out gate 1's own paths" || bad "key" "$key"
+  && ok "gate 2a's key holds the column codec, request and network-config crates" || bad "key" "$key"
+! grep -q '"fuzz/run-gate1.sh"' <<<"$key" && ! grep -q '"crates/cl-chain/src"' <<<"$key" \
+  && ok "gate 2a's key leaves out gate 1's own path and keys crates whole" || bad "key" "$key"
 [[ $(field "$file" "json.dumps(gate['decoder_key'], sort_keys=True)") \
   == $(python3 -I -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1]), sort_keys=True))' "$key") ]] \
   && ok "the decoder key is check-gate2a.sh --print-key" || bad "decoder key"
@@ -185,15 +186,20 @@ g add -A && g commit -q -m "seed at max_len"
 rc=0 out=$(gate_run -- "$runner" --seconds 3 --out "$tmp/s.json" 2>&1) || rc=$?
 ((rc == 0)) && ok "a seed at its -max_len runs" || bad "seed at max_len (exit $rc)" "$out"
 g reset -q --hard HEAD~1
-# A path only gate 2a keys: dirty for gate 2a, not for gate 1.
-echo '// edit' >> "$fx/crates/cl-chain/src/reqresp.rs"
+# The path only gate 2a keys: dirty for gate 2a, not for gate 1.
+echo '# edit' >> "$fx/fuzz/run-gate2a.sh"
 rc=0 out=$(gate_run -- "$runner" --seconds 3 --out "$tmp/d.json" 2>&1) || rc=$?
-((rc == 2)) && grep -q 'crates/cl-chain/src/reqresp.rs' <<<"$out" && ok "an edit to a gate-2a keyed path stops the gate-2a run" || bad "dirty (exit $rc)" "$out"
+((rc == 2)) && grep -q 'fuzz/run-gate2a.sh' <<<"$out" && ok "an edit to a gate-2a keyed path stops the gate-2a run" || bad "dirty (exit $rc)" "$out"
 rc=0 out=$(gate_run -- "$runner" --seconds 3 --allow-dirty --out "$tmp/d.json" 2>&1) || rc=$?
 ((rc == 0)) && [[ $(field "$tmp/d.json" "gate['dirty']") == True ]] && ok "--allow-dirty runs it and records dirty" || bad "allow-dirty (exit $rc)" "$out"
 rc=0 out=$(gate_run -- "$fx/fuzz/run-gate1.sh" --seconds 3 --out "$tmp/m.json" 2>&1) || rc=$?
 ((rc == 0)) && [[ $(field "$tmp/m.json" "(gate['gate'], gate['dirty'], len(gate['targets']))") == "('gate1-fuzz', False, 7)" ]] \
   && ok "the same edit leaves gate 1 clean (outside its key)" || bad "gate-1 run with a gate-2a edit (exit $rc)" "$out"
+g checkout -q -- fuzz/run-gate2a.sh
+# A crate of the closure is in every key: an edit to cl-chain stops the gate-1 run too.
+echo '// edit' >> "$fx/crates/cl-chain/src/reqresp.rs"
+rc=0 out=$(gate_run -- "$fx/fuzz/run-gate1.sh" --seconds 3 --out "$tmp/m.json" 2>&1) || rc=$?
+((rc == 2)) && grep -q 'crates/cl-chain/src/reqresp.rs' <<<"$out" && ok "an edit to cl-chain stops the gate-1 run" || bad "gate-1 run with a cl-chain edit (exit $rc)" "$out"
 g checkout -q -- crates/cl-chain/src/reqresp.rs
 
 echo "# $passed passed, $failed failed"

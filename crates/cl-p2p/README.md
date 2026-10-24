@@ -514,10 +514,10 @@ Pre-flight first, before any dial:
   this binary was built from. `build.rs` embeds `check-m2a-gate.sh --print-expected` of the
   build tree, `heads` included: the file's `head` must be the build's commit or an ancestor of
   it with the same decoder key (the script checks the same with git), so the file names a
-  commit that was fuzzed. The cl-p2p library from its crate root `lib.rs`, every module that a
-  keyed file imports, and each workspace crate that keyed code imports (or a written reason why
-  not) are in the key (`crates/ci-checks/tests/fuzz_keys.rs` checks this), so a
-  gate file written before they were keyed is stale and the gate has to be run again. A dirty
+  commit that was fuzzed. The key holds, whole, each workspace crate that the fuzz harness
+  depends on, transitively (this crate too, its binaries included), from `cargo metadata`
+  (`crates/ci-checks/tests/fuzz_keys.rs` checks this). So a change to any of them, or a
+  gate file written before they were keyed, makes the gate stale, and it must run again. A dirty
   keyed path, or a tree without the fuzz harness, embeds no expectations, and every gate file is
   refused. So does a build outside its git checkout
   (`cargo package`, a tarball, or `GIT_DIR`/`GIT_WORK_TREE` pointing elsewhere: the build

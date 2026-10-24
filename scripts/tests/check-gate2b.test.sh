@@ -79,7 +79,7 @@ echo '[package]' > "$fx/fuzz/Cargo.toml"
 printf '[toolchain]\nchannel = "nightly-2026-10-17"\n' > "$fx/fuzz/rust-toolchain.toml"
 echo 'version = 4' > "$fx/fuzz/Cargo.lock"
 echo 'version = 4' > "$fx/Cargo.lock"
-# The modules the keyed files import, which the keys hold too (fuzz/m2a-common.sh).
+# More files of the keyed crates (fuzz/m2a-common.sh keys each crate whole).
 for f in crates/cl-p2p/src/transport.rs crates/cl-p2p/src/transport/quota.rs \
   crates/cl-p2p/src/behaviour.rs crates/cl-p2p/src/peer_caps.rs crates/cl-p2p/src/gossip/mod.rs \
   crates/cl-chain/src/probe.rs crates/cl-chain/src/probe/ingest.rs crates/cl-chain/src/da/custody.rs \
@@ -92,6 +92,7 @@ for f in crates/cl-p2p/src/transport.rs crates/cl-p2p/src/transport/quota.rs \
   mkdir -p "$(dirname "$fx/$f")"
   [[ -e $fx/$f ]] || echo 'x' > "$fx/$f"
 done
+fixture_key_dirs "$fx"
 git init -q "$fx"
 g add -A
 g commit -q -m fixture
@@ -228,8 +229,8 @@ check fail "a FIFO with no writer, refused without blocking" "not a regular file
 check fail "an unknown gate" "m2a, gate1, gate2a or gate2b" bash "$m2a_checker" --gate gate3 "$ok2b"
 
 # The path only gate 2b keys makes a gate-2b file stale and leaves the gate-2a, gate-1 and m2a
-# files valid; cl-chain, the column env, the chain.v1 contract and ipc are gate 2a's too, and
-# network-config is the m2a key's.
+# files valid; cl-chain, the column env, the chain.v1 contract, ipc, cl-discv5 and
+# network-config are in the closure of the harness, which every gate keys.
 gate2a_ok="$tmp/gate2a.json"
 gate1_ok="$tmp/gate1.json"
 m2a_ok="$tmp/m2a.json"
@@ -242,23 +243,16 @@ for path in fuzz/run-gate2b.sh; do
   check pass "the m2a gate holds after a commit to $path" "" bash "$m2a_checker" "$m2a_ok"
   g reset -q --hard HEAD~1
 done
-for path in crates/cl-chain/Cargo.toml crates/cl-chain/src/reqresp.rs crates/cl-chain/src/probe/ingest.rs \
-  crates/cl-chain/src/lib.rs crates/cl-chain-columns/src/lib.rs crates/ethswarm-proto/src/lib.rs \
-  proto/ethswarm/chain/v1/reqresp.proto crates/ipc/src/lib.rs; do
-  echo '# changed' >> "$fx/$path"
-  g commit -q -am "change $path"
-  check fail "gate 2b stale after a commit to $path" "stale" bash "$checker" "$ok2b"
-  check fail "gate 2a stale after a commit to $path" "stale" bash "$gate2a_checker" "$gate2a_ok"
-  check pass "the m2a gate holds after a commit to $path" "" bash "$m2a_checker" "$m2a_ok"
-  g reset -q --hard HEAD~1
-done
-for path in fuzz/run-gate2a.sh crates/cl-discv5/src/enr.rs fuzz/run-gate1.sh; do
+for path in fuzz/run-gate2a.sh fuzz/run-gate1.sh; do
   echo '# changed' >> "$fx/$path"
   g commit -q -am "change $path"
   check pass "gate 2b holds after a commit to $path (another gate's only)" "" bash "$checker" "$ok2b"
   g reset -q --hard HEAD~1
 done
-for path in crates/p2p-wire/src/lib.rs crates/network-config/src/lib.rs crates/cl-p2p/src/rpc/codec.rs crates/cl-p2p/src/rpc/columns.rs \
+for path in crates/cl-chain/Cargo.toml crates/cl-chain/src/reqresp.rs crates/cl-chain/src/probe/ingest.rs \
+  crates/cl-chain/src/lib.rs crates/cl-chain-columns/src/lib.rs crates/ethswarm-proto/src/lib.rs \
+  proto/ethswarm/chain/v1/reqresp.proto crates/ipc/src/lib.rs crates/cl-discv5/src/enr.rs \
+  crates/p2p-wire/src/lib.rs crates/network-config/src/lib.rs crates/cl-p2p/src/rpc/codec.rs crates/cl-p2p/src/rpc/columns.rs \
   crates/cl-p2p/src/gossip/mod.rs fuzz/m2a-common.sh fuzz/run-m2a-gate.sh \
   fuzz/src/lib.rs fuzz/fuzz_targets/column_contract.rs fuzz/corpus/column_contract/valid \
   fuzz/corpus/status_v2/valid Cargo.lock; do

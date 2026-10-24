@@ -50,7 +50,7 @@ printf '[toolchain]\nchannel = "nightly-2026-10-17"\n' > "$fx/fuzz/rust-toolchai
 echo 'version = 4' > "$fx/fuzz/Cargo.lock"
 echo 'version = 4' > "$fx/Cargo.lock"
 printf 'target\nartifacts\n' > "$fx/fuzz/.gitignore"
-# The modules the keyed files import, which the keys hold too (fuzz/m2a-common.sh).
+# More files of the keyed crates (fuzz/m2a-common.sh keys each crate whole).
 for f in crates/cl-p2p/src/transport.rs crates/cl-p2p/src/transport/quota.rs \
   crates/cl-p2p/src/behaviour.rs crates/cl-p2p/src/peer_caps.rs crates/cl-p2p/src/gossip/mod.rs \
   crates/cl-p2p/src/lib.rs crates/cl-p2p/src/custody.rs crates/cl-p2p/src/identity.rs \
@@ -61,6 +61,7 @@ for f in crates/cl-p2p/src/transport.rs crates/cl-p2p/src/transport/quota.rs \
   mkdir -p "$(dirname "$fx/$f")"
   [[ -e $fx/$f ]] || echo 'x' > "$fx/$f"
 done
+fixture_key_dirs "$fx"
 git init -q "$fx"
 g add -A
 g commit -q -m fixture
@@ -116,9 +117,9 @@ done
   || bad "fuzz run of$missing" "$(grep "fuzz run" "$CALLS")"
 ! grep -q "fuzz run -O -a blocks_by_range_resp" "$CALLS" && ok "the m2a-only target is not run" || bad "blocks_by_range_resp ran"
 key=$(gate_run -- "$fx/fuzz/check-gate1.sh" --print-key)
-grep -q '"crates/cl-discv5/src/enr.rs"' <<<"$key" && grep -q '"crates/cl-p2p/src/gossip"' <<<"$key" \
+grep -q '"crates/cl-discv5"' <<<"$key" && grep -q '"crates/cl-p2p"' <<<"$key" \
   && grep -q '"fuzz/run-gate1.sh"' <<<"$key" && grep -q '"crates/network-config"' <<<"$key" \
-  && ok "gate 1's key holds the gossip, ENR and network-config paths" || bad "key" "$key"
+  && ok "gate 1's key holds the gossip, ENR and network-config crates" || bad "key" "$key"
 [[ $(field "$file" "json.dumps(gate['decoder_key'], sort_keys=True)") \
   == $(python3 -I -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1]), sort_keys=True))' "$key") ]] \
   && ok "the decoder key is check-gate1.sh --print-key" || bad "decoder key"
@@ -161,13 +162,18 @@ g add -A && g commit -q -m "long seed"
 rc=0 out=$(gate_run -- "$runner" --seconds 3 --out "$tmp/s.json" 2>&1) || rc=$?
 ((rc == 2)) && grep -q 'enr_fields/too-long' <<<"$out" && ok "a seed over its -max_len stops the run" || bad "seed over max_len (exit $rc)" "$out"
 g reset -q --hard HEAD~1
-# A path only gate 1 keys: dirty for gate 1, not for the m2a gate.
-echo '// edit' >> "$fx/crates/cl-discv5/src/enr.rs"
+# The path only gate 1 keys: dirty for gate 1, not for the m2a gate.
+echo '# edit' >> "$fx/fuzz/run-gate1.sh"
 rc=0 out=$(gate_run -- "$runner" --seconds 3 --out "$tmp/d.json" 2>&1) || rc=$?
-((rc == 2)) && grep -q 'crates/cl-discv5/src/enr.rs' <<<"$out" && ok "an edit to a gate-1 keyed path stops the gate-1 run" || bad "dirty (exit $rc)" "$out"
+((rc == 2)) && grep -q 'fuzz/run-gate1.sh' <<<"$out" && ok "an edit to a gate-1 keyed path stops the gate-1 run" || bad "dirty (exit $rc)" "$out"
 rc=0 out=$(gate_run -- "$fx/fuzz/run-m2a-gate.sh" --seconds 3 --out "$tmp/m.json" 2>&1) || rc=$?
 ((rc == 0)) && [[ $(field "$tmp/m.json" "(gate['gate'], gate['dirty'], len(gate['targets']))") == "('m2a-fuzz', False, 4)" ]] \
   && ok "the same edit leaves the m2a gate clean (outside its key)" || bad "m2a run with a gate-1 edit (exit $rc)" "$out"
+g checkout -q -- fuzz/run-gate1.sh
+# A crate of the closure is in every key: an edit to the record reader stops the m2a run too.
+echo '// edit' >> "$fx/crates/cl-discv5/src/enr.rs"
+rc=0 out=$(gate_run -- "$fx/fuzz/run-m2a-gate.sh" --seconds 3 --out "$tmp/m.json" 2>&1) || rc=$?
+((rc == 2)) && grep -q 'crates/cl-discv5/src/enr.rs' <<<"$out" && ok "an edit to cl-discv5 stops the m2a run" || bad "m2a run with a cl-discv5 edit (exit $rc)" "$out"
 g checkout -q -- crates/cl-discv5/src/enr.rs
 
 echo "# $passed passed, $failed failed"

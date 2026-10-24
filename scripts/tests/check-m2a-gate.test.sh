@@ -69,6 +69,9 @@ echo 'pub struct GossipConfig;' > "$fx/crates/cl-p2p/src/gossip/config.rs"
 mkdir -p "$fx/crates/cl-p2p/src/m2a_session" "$fx/crates/cl-p2p/src/peers" "$fx/crates/network-config/src"
 echo 'pub struct ChainConfig;' > "$fx/crates/network-config/src/lib.rs"
 echo 'pub mod rpc;' > "$fx/crates/cl-p2p/src/lib.rs"
+echo 'fn main() {}' > "$fx/crates/cl-p2p/src/main.rs"
+mkdir -p "$fx/crates/cl-store/src"
+echo '// not in the closure' > "$fx/crates/cl-store/src/lib.rs"
 for f in custody.rs identity.rs m2a_session.rs m2a_session/config.rs peers/mod.rs testkit.rs; do
   echo "// $f" > "$fx/crates/cl-p2p/src/$f"
 done
@@ -78,6 +81,7 @@ echo 'pub fn run() {}' > "$fx/fuzz/src/lib.rs"
 echo '#![no_main]' > "$fx/fuzz/fuzz_targets/status_v2.rs"
 echo 'version = 4' > "$fx/fuzz/Cargo.lock"
 echo 'version = 4' > "$fx/Cargo.lock"
+fixture_key_dirs "$fx"
 git init -q "$fx"
 g add -A
 g commit -q -m fixture
@@ -158,6 +162,9 @@ check fail "a seconds value that is not a number" "seconds" bash "$checker" \
   "$(gate "$tmp/str.json" 'gate["targets"][0]["seconds"] = "3601"')"
 check fail "a key entry missing" "stale" bash "$checker" \
   "$(gate "$tmp/nokey.json" 'del gate["decoder_key"]["git"]["crates/consensus-types"]')"
+# A file of the old key layout (cl-p2p keyed by its library files, no svc-runtime) is stale.
+check fail "a key of the old layout" "decoder key stale: git crates/svc-runtime" bash "$checker" \
+  "$(gate "$tmp/oldkey.json" 'k = gate["decoder_key"]["git"]; k["crates/cl-p2p/src/lib.rs"] = k.pop("crates/cl-p2p"); del k["crates/svc-runtime"]')"
 # Every policy field: the limits, build flags, toolchain, cargo-fuzz and the seed corpus.
 for edit in \
   'gate["limits"]["malloc_limit_mb"] = 4096' \
@@ -305,7 +312,10 @@ for path in Cargo.toml Cargo.lock fuzz/Cargo.lock crates/p2p-wire/src/lib.rs cra
   crates/cl-p2p/src/transport/quota.rs crates/cl-p2p/src/behaviour.rs crates/cl-p2p/src/peer_caps.rs \
   crates/cl-p2p/src/gossip/mod.rs crates/cl-p2p/src/gossip/config.rs crates/cl-p2p/src/lib.rs \
   crates/cl-p2p/src/identity.rs crates/cl-p2p/src/m2a_session/config.rs crates/cl-p2p/src/peers/mod.rs \
-  crates/network-config/src/lib.rs fuzz/Cargo.toml fuzz/rust-toolchain.toml fuzz/src/lib.rs fuzz/fuzz_targets/status_v2.rs \
+  crates/network-config/src/lib.rs crates/cl-p2p/src/main.rs crates/cl-chain/placeholder.rs \
+  crates/cl-chain-columns/placeholder.rs crates/cl-discv5/placeholder.rs crates/ethswarm-proto/placeholder.rs \
+  crates/ipc/placeholder.rs crates/node-key/placeholder.rs crates/svc-runtime/placeholder.rs \
+  proto/ethswarm/placeholder.rs fuzz/Cargo.toml fuzz/rust-toolchain.toml fuzz/src/lib.rs fuzz/fuzz_targets/status_v2.rs \
   fuzz/corpus/status_v2/valid fuzz/corpus-slow/blocks_by_range_resp/slow-seed fuzz/m2a-common.sh fuzz/build-m2a.sh fuzz/run-m2a-gate.sh; do
   echo '# changed' >> "$fx/$path"
   g commit -q -am "change $path"
@@ -313,11 +323,23 @@ for path in Cargo.toml Cargo.lock fuzz/Cargo.lock crates/p2p-wire/src/lib.rs cra
   g reset -q --hard HEAD~1
 done
 check pass "valid again at the keyed commit" "" bash "$checker" "$ok"
-
-# A change outside the key does not.
-echo 'fn main() {}' > "$fx/crates/cl-p2p/src/main.rs"
+# A committed symlink under a keyed path: its key is the link text, but rustc reads the target.
+ln -s lib.rs "$fx/crates/p2p-wire/src/link.rs"
+mkdir -p "$fx/elsewhere" && echo '// not keyed' > "$fx/elsewhere/x.rs"
+ln -s ../../../elsewhere "$fx/crates/cl-p2p/src/linked"
 g add -A
-g commit -q -m "outside the key"
+g commit -q -m "symlinks"
+check fail "a committed symlink file under a keyed path" "symlink: crates/p2p-wire/src/link.rs" \
+  bash "$checker" "$ok"
+check fail "a committed symlink directory under a keyed path" "symlink: crates/cl-p2p/src/linked" \
+  bash "$checker" "$ok"
+g reset -q --hard HEAD~1
+rm -rf "$fx/elsewhere"
+check pass "valid again without the symlinks" "" bash "$checker" "$ok"
+
+# A change outside the key does not: a workspace crate outside the closure of the harness.
+echo '// changed' >> "$fx/crates/cl-store/src/lib.rs"
+g commit -q -am "outside the key"
 check pass "a commit outside the key keeps the gate" "" bash "$checker" "$ok"
 
 # Both lockfiles are keyed by their sha256 (committed: stale above) and dirty-checked: a root

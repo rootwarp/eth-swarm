@@ -18,8 +18,10 @@
 //! The Status probe refuses to dial with a build that was not clean. The `m2a-summary` line
 //! writes the values as `build_commit`, `build_rustc_commit` and `build_dirty`, and its
 //! `clean_build` check fails a build that was not clean. A gate file can name an ancestor of the
-//! build commit, and the decoder key does not hold `src/bin`. So only `build_commit` ties a
-//! posted summary to the commit of the binary that ran.
+//! build commit with the same decoder key. The key holds this crate whole, `src/bin` included,
+//! but not every build path: `rust-toolchain.toml`, `.cargo` and the files of `proto` outside
+//! `proto/ethswarm` can differ at that ancestor. So only `build_commit` ties a posted summary to
+//! the commit of the binary that ran.
 
 /// What `build.rs` recorded about the build tree.
 #[derive(Debug, Clone, PartialEq, Eq)]

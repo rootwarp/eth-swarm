@@ -339,8 +339,8 @@ fn run(
             return EXIT_REFUSED;
         }
     };
-    // Root, mixed UIDs, GID 0 and mixed GIDs first, before the config is read or the name
-    // service is asked.
+    // Root, mixed UIDs, GID 0 and mixed GIDs first, then the platform (Linux only, outside a
+    // test build), before the config is read or the name service is asked.
     if let Err(e) = process_checks(&process, env) {
         tracing::error!(error = %e, "pre-flight refused");
         return EXIT_REFUSED;
@@ -766,13 +766,42 @@ mod tests {
             ..macos()
         };
         assert_eq!(process_checks(&ids(1000), &test_build), Ok(()));
+        // A config path that does not exist: if `run` read the config before the platform
+        // check (or had no platform check), it would refuse the config, not the platform.
         let mut out = Vec::new();
         let missing = ["--config", "/nonexistent/m2a-session.toml", "--dial-only"];
-        assert_eq!(
-            run(argv(&missing), ids(1000), &mut out, &macos()),
-            EXIT_REFUSED
-        );
+        let (code, logs) = logs_of(|| run(argv(&missing), ids(1000), &mut out, &macos()));
+        assert_eq!(code, EXIT_REFUSED);
         assert!(out.is_empty());
+        assert!(
+            logs.contains("pre-flight refused") && logs.contains("refusing to run on macos"),
+            "{logs}"
+        );
+        assert!(!logs.contains("config refused"), "{logs}");
+    }
+
+    /// What `f` returns, and the log lines that it writes (the fmt layer, without colours).
+    fn logs_of<R>(f: impl FnOnce() -> R) -> (R, String) {
+        #[derive(Clone, Default)]
+        struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let lines = Lines::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8_lossy(&lines.0.lock().unwrap()).into_owned();
+        (result, text)
     }
 
     fn run_quiet(args: &[&str], euid: u32) -> (u8, String) {

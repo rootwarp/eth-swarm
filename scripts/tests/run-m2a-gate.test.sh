@@ -47,7 +47,7 @@ echo 'x' > "$fx/fuzz/fuzz_targets/status_v2.rs"
 echo 'version = 4' > "$fx/fuzz/Cargo.lock"
 echo 'version = 4' > "$fx/Cargo.lock"
 printf 'target\nartifacts\n' > "$fx/fuzz/.gitignore"
-# The modules the keyed files import, which the keys hold too (fuzz/m2a-common.sh).
+# More files of the keyed crates (fuzz/m2a-common.sh keys each crate whole).
 for f in crates/cl-p2p/src/transport.rs crates/cl-p2p/src/transport/quota.rs \
   crates/cl-p2p/src/behaviour.rs crates/cl-p2p/src/peer_caps.rs crates/cl-p2p/src/gossip/mod.rs \
   crates/cl-p2p/src/lib.rs crates/cl-p2p/src/custody.rs crates/cl-p2p/src/identity.rs \
@@ -59,6 +59,7 @@ for f in crates/cl-p2p/src/transport.rs crates/cl-p2p/src/transport/quota.rs \
   mkdir -p "$(dirname "$fx/$f")"
   [[ -e $fx/$f ]] || echo 'x' > "$fx/$f"
 done
+fixture_key_dirs "$fx"
 git init -q "$fx"
 g add -A
 g commit -q -m fixture
@@ -228,7 +229,9 @@ for var in \
   'CROSS_COMPILE=evil-' \
   'SDKROOT=/tmp/sdk' \
   'MACOSX_DEPLOYMENT_TARGET=10.9' \
-  'FUZZ_LOCK_CARGO=/usr/bin/true'; do
+  'FUZZ_LOCK_CARGO=/usr/bin/true' \
+  'PROTOC=/bin/echo' \
+  'PROTOC_INCLUDE=/tmp/include'; do
   # (DYLD_INSERT_LIBRARIES is refused too, but macOS strips it before a protected binary such
   # as /usr/bin/env passes it on, so it cannot be set up here.) The cc crate's target forms
   # (CC_<target>) are no shell identifiers, so bash's own variable list never shows them.
@@ -245,6 +248,7 @@ refused "build refuses CUSTOM_LIBFUZZER_PATH" "$builder" 'CUSTOM_LIBFUZZER_PATH=
 refused "build refuses CXX" "$builder" 'CXX=/bin/echo'
 refused "build refuses MACOSX_DEPLOYMENT_TARGET" "$builder" 'MACOSX_DEPLOYMENT_TARGET=10.9'
 refused "build refuses FUZZ_LOCK_CARGO" "$builder" 'FUZZ_LOCK_CARGO=/usr/bin/true'
+refused "build refuses PROTOC" "$builder" 'PROTOC=/bin/echo'
 
 # python3 < 3.11 has no tomllib: a clear error, not a traceback, and nothing built.
 pybin="$tmp/py39"

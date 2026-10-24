@@ -128,3 +128,21 @@ with open(os.path.join(out, "sparse.json"), "wb") as f:
     f.truncate(64 << 20)
 PY
 }
+
+# fixture_key_dirs <repo>: puts a placeholder file in each directory of the m2a decoder key under
+# crates/ and proto/ (M2A_KEY_PATHS of <repo>/fuzz/m2a-common.sh) that holds no file yet, so the
+# fixture's commit holds every keyed workspace crate. Gates 1, 2a and 2b key the same crates.
+fixture_key_dirs() {
+  local path list
+  list=$(bash -c '. "$1/fuzz/m2a-common.sh" && printf "%s\n" "${M2A_KEY_PATHS[@]}"' fixture "$1") || return 1
+  while IFS= read -r path; do
+    case $path in
+      crates/* | proto/*)
+        if [[ -z $(find "$1/$path" -type f 2>/dev/null | head -n 1) ]]; then
+          mkdir -p "$1/$path"
+          echo "// $path" > "$1/$path/placeholder.rs"
+        fi
+        ;;
+    esac
+  done <<<"$list"
+}
