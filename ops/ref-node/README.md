@@ -340,11 +340,71 @@ command (see above).
 9. **Post the run log** on the issue. It holds no secret: the JWT copies and the node key are
    only fstat'ed, through `lib/fsguard.py`, and the checkpoint URLs appear as scheme and host
    only.
-10. **Run the session** on the test host (Sepolia): open the tunnel
-    (`ssh -N -L 5052:127.0.0.1:5052 <ref-host>`), replace `/etc/ethswarm/m2a-session.toml` of
-    step 7 with the run log's last section, owned by root with mode 0644 as before, and run
-    `sudo -u m2a-session m2a-session --dial-only`. The `m2a-summary` line names the user
-    (`os_user`).
+<!-- session-run:begin -->
+10. **Run the session** on the test host (Sepolia):
+    1. Replace `/etc/ethswarm/m2a-session.toml` of step 7 with the TOML block of the run log's
+       "m2a-session config" section. Keep it owned by root with mode 0644. The probe needs the
+       `reference_api_url` of that block.
+    2. In the checkout at the commit of the fuzz gates, record the commit and the tree, then
+       build and install the binary. Keep the output:
+       - `git rev-parse HEAD`.
+       - `git status --porcelain --untracked-files=no`. The output must be empty.
+       - `cargo build --release --locked -p cl-p2p --bin m2a-session`.
+       - `sudo install -o root -g root -m 0755 /dev/stdin /usr/local/bin/m2a-session < target/release/m2a-session`.
+       - `fuzz/check-gate1.sh fuzz/artifacts/gate1.json`. The check must pass.
+    3. Install the m2a gate file from stdin, so that root does not follow a symlink in the
+       checkout. Then, in the checkout, check the installed copy. Keep the output:
+       - `sudo install -o root -g root -m 0644 /dev/stdin /etc/ethswarm/m2a-gate.json < fuzz/artifacts/m2a-gate.json`.
+       - `fuzz/check-m2a-gate.sh /etc/ethswarm/m2a-gate.json`. The check must pass.
+
+       If a gate check of step 10.2 or 10.3 fails, run that gate again at the commit of the
+       checkout (`fuzz/run-gate1.sh` or `fuzz/run-m2a-gate.sh`).
+    4. In the checkout, record the binary and the gate files. Keep the output:
+       - `sha256sum target/release/m2a-session /usr/local/bin/m2a-session fuzz/artifacts/m2a-gate.json /etc/ethswarm/m2a-gate.json fuzz/artifacts/gate1.json`.
+         The two hashes of the binary must be equal. The two hashes of the m2a gate file must
+         be equal.
+       - `sudo stat /usr/local/bin/m2a-session /etc/ethswarm /etc/ethswarm/m2a-gate.json`.
+    5. Do a connection pre-check: `sudo -u m2a-session m2a-session --dial-only`. This mode dials
+       the pinned peer, checks its peer ID and disconnects. It does not check the fuzz gate, and
+       it writes no `m2a-summary` line. Thus its output is not evidence. If it does not exit 0,
+       read the error on stderr and correct the cause before you continue.
+    6. **Warning:** Stop the tunnel at step 10.8, also if step 10.7 fails. While the tunnel is
+       open, every local account on the test host can use the beacon API of the reference node.
+
+       In a second terminal, open the tunnel to the reference API with the line of the TOML
+       block: `ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:<BEACON_API_PORT>:127.0.0.1:<BEACON_API_PORT> <ref-host>`.
+       The forward listens on loopback only. If another process holds the port, `ssh` exits.
+    7. Go to a directory outside the checkout (`cd ~`), so that the session file does not
+       change the tree. Then run the Status probe, which gives the evidence:
+       `sudo -u m2a-session m2a-session --gate-file /etc/ethswarm/m2a-gate.json > session-$(date -u +%Y%m%dT%H%M%SZ).jsonl`.
+       The probe refuses to dial if the gate file does not pass for the decoders of the binary.
+       It writes one JSON line for each step on stdout, and the `m2a-summary` line last. The
+       exit code is 0 only if every check passed.
+    8. Stop the tunnel immediately after step 10.7: stop its `ssh` process (Ctrl-C in its
+       terminal).
+11. **Post the session evidence** on the issue:
+    - The m2a and gate-1 gate files, and the output of steps 10.2, 10.3 and 10.4.
+    - The output of `ls -l session-*.jsonl` and `grep -H m2a-summary session-*.jsonl` in the
+      directory of step 10.7. Post every session file and every summary line, not only one
+      passing line.
+    - The `m2a-summary` line of the probe run of step 10.7. Below, `key: value` gives a JSON
+      field of the line, and a pass for a check means that `checks.<check>.pass` is `true`. The
+      line must show:
+      - `pass: true` and `exit_code: 0`.
+      - `test_build: false`, and a pass for `production_build`.
+      - A `build_commit` equal to the `git rev-parse HEAD` output of step 10.2,
+        `build_dirty: false`, and a pass for `clean_build`.
+      - A pass for `fuzz_gate`.
+      - `os_user: "m2a-session"`, a non-zero `euid`, and a pass for `own_os_user`.
+      - A `peer_id` equal to the peer ID of the pinned multiaddr. Also a pass for
+        `pinned_peer_only`, with the detail
+        `connected to 1 peer(s), 0 not pinned; 0 listen address(es)`.
+    - The output of `collect-run-log.sh`, that is the run log of step 8.
+    - The output of `id m2a-session` on the test host.
+    - The output of `sudo stat /var/lib/m2a-session/node.key /etc/ethswarm/m2a-session.toml` on
+      the test host. The key must be owned by `m2a-session` with mode 0600. The config must be
+      owned by root with mode 0644.
+<!-- session-run:end -->
 
 ## Keyed checkpoint providers
 
@@ -372,6 +432,15 @@ any credential in its URL, use the proxy, whatever `preflight.sh` says.
 spec-diff helper against both pinned configs, the API verdicts, the anchor comparison,
 `setup.sh --test-mode`, `preflight.sh --test-mode` (which ends "not a deployment gate") and
 `collect-run-log.sh` for both networks against stub commands, and `docker compose config`
-when docker is installed. As root it needs `ETHSWARM_ROOT_TESTS=1` and belongs in a throwaway
-container only (it creates users): it then runs `setup.sh` and `preflight.sh` for real for
-both networks side by side, every refusal as root, and the race regressions.
+when docker is installed. It also lints the session run of steps 10 and 11, and fails closed
+on a change:
+- Each line there that names a command (`m2a-session`, `install`, `check-m2a-gate.sh`,
+  `check-gate1.sh`, `ssh`, `sha256sum`, `cargo`, `git` or `cd`) must equal the expected list in
+  the test, in the same sequence. If you change such a line, change the expected list too.
+- A fence, an HTML comment, a tab, an indented code line, or a code span that crosses the line
+  break of a command line fails.
+- The evidence must name each value of step 11.
+
+As root it needs `ETHSWARM_ROOT_TESTS=1` and belongs in a throwaway container only (it creates
+users): it then runs `setup.sh` and `preflight.sh` for real for both networks side by side,
+every refusal as root, and the race regressions.

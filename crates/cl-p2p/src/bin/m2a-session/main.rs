@@ -36,6 +36,7 @@
 
 mod app;
 mod blocks;
+mod build_info;
 mod enr;
 mod gate;
 mod metadata;

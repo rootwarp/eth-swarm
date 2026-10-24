@@ -724,6 +724,196 @@ for spec in "sepolia 1" "hoodi 2"; do
   if [[ $got == "$want" ]]; then ok "required_providers: $net needs $want"; else bad "required_providers: $net (got '$got', want '$want')"; fi
 done
 
+# README.md's session run (steps 10 and 11, between the session-run markers) is the evidence
+# procedure, so the lint does not parse shell: it fails closed on any change. Every line of the
+# block that names a command of interest (m2a-session, install, check-m2a-gate.sh,
+# check-gate1.sh, ssh, sha256sum, cargo, git or cd), in a code span or not, must equal the
+# expected list below, in order, indentation included. Placeholders such as <ref-host> and
+# <BEACON_API_PORT> stay literal in both. A fence, an HTML comment, a tab, an indented code line
+# or a code span that crosses into such a line fails too. The evidence must name each value.
+session_run_expected="$tmp/session-run.expected"
+cat > "$session_run_expected" <<'EXPECTED'
+    1. Replace `/etc/ethswarm/m2a-session.toml` of step 7 with the TOML block of the run log's
+       "m2a-session config" section. Keep it owned by root with mode 0644. The probe needs the
+       build and install the binary. Keep the output:
+       - `git rev-parse HEAD`.
+       - `git status --porcelain --untracked-files=no`. The output must be empty.
+       - `cargo build --release --locked -p cl-p2p --bin m2a-session`.
+       - `sudo install -o root -g root -m 0755 /dev/stdin /usr/local/bin/m2a-session < target/release/m2a-session`.
+       - `fuzz/check-gate1.sh fuzz/artifacts/gate1.json`. The check must pass.
+       checkout. Then, in the checkout, check the installed copy. Keep the output:
+       - `sudo install -o root -g root -m 0644 /dev/stdin /etc/ethswarm/m2a-gate.json < fuzz/artifacts/m2a-gate.json`.
+       - `fuzz/check-m2a-gate.sh /etc/ethswarm/m2a-gate.json`. The check must pass.
+       - `sha256sum target/release/m2a-session /usr/local/bin/m2a-session fuzz/artifacts/m2a-gate.json /etc/ethswarm/m2a-gate.json fuzz/artifacts/gate1.json`.
+       - `sudo stat /usr/local/bin/m2a-session /etc/ethswarm /etc/ethswarm/m2a-gate.json`.
+    5. Do a connection pre-check: `sudo -u m2a-session m2a-session --dial-only`. This mode dials
+       block: `ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:<BEACON_API_PORT>:127.0.0.1:<BEACON_API_PORT> <ref-host>`.
+       The forward listens on loopback only. If another process holds the port, `ssh` exits.
+    7. Go to a directory outside the checkout (`cd ~`), so that the session file does not
+       `sudo -u m2a-session m2a-session --gate-file /etc/ethswarm/m2a-gate.json > session-$(date -u +%Y%m%dT%H%M%SZ).jsonl`.
+    8. Stop the tunnel immediately after step 10.7: stop its `ssh` process (Ctrl-C in its
+      - A `build_commit` equal to the `git rev-parse HEAD` output of step 10.2,
+      - `os_user: "m2a-session"`, a non-zero `euid`, and a pass for `own_os_user`.
+    - The output of `id m2a-session` on the test host.
+    - The output of `sudo stat /var/lib/m2a-session/node.key /etc/ethswarm/m2a-session.toml` on
+      the test host. The key must be owned by `m2a-session` with mode 0600. The config must be
+EXPECTED
+# session_run_lint <README>: prints each problem, exit 1 if there is one.
+session_run_lint() {
+  local readme=$1 n_begin n_end at_begin at_end text want rc=0
+  n_begin=$(grep -c -x -- '<!-- session-run:begin -->' "$readme" || true)
+  n_end=$(grep -c -x -- '<!-- session-run:end -->' "$readme" || true)
+  if [[ $n_begin != 1 || $n_end != 1 ]]; then
+    echo "want one session-run begin and one end marker (got $n_begin and $n_end)"
+    return 1
+  fi
+  at_begin=$(grep -n -x -- '<!-- session-run:begin -->' "$readme" | cut -d: -f1)
+  at_end=$(grep -n -x -- '<!-- session-run:end -->' "$readme" | cut -d: -f1)
+  if ((at_end <= at_begin)); then echo "the session-run end marker is not after its begin marker"; return 1; fi
+  # The form of the block: no fence, HTML comment or tab; no line indented four or more past
+  # the content of its list item (an indented code block); no code span that runs from one
+  # line into a command line, or out of one.
+  awk -v b="$at_begin" -v e="$at_end" '
+    function cmd(s) {
+      return s ~ /m2a-session|install|check-m2a-gate\.sh|check-gate1\.sh|ssh|sha256sum|cargo/ ||
+        s ~ /(^|[^[:alnum:]_-])(git|cd)([^[:alnum:]_-]|$)/
+    }
+    NR <= b || NR >= e { next }
+    {
+      line = $0
+      if (line ~ /\t/) { print "line " NR ": a tab"; bad = 1 }
+      if (line ~ /^[ ]*(```|~~~)/) { print "line " NR ": a fence"; bad = 1 }
+      if (line ~ /<!--|-->/) { print "line " NR ": an HTML comment"; bad = 1 }
+      ticks_before = ticks
+      ticks += gsub(/`/, "`", line)
+      if (cmd($0) && (ticks_before % 2 || ticks % 2)) { print "line " NR ": a code span crosses the line break of a command line"; bad = 1 }
+      if (line ~ /^[ ]*$/) next
+      match(line, /^ */); ind = RLENGTH
+      if (ind >= content + 4) { print "line " NR ": an indented code line"; bad = 1 }
+      if (match(line, /^ *([0-9]+\.|[-*+]) +/)) content = RLENGTH
+    }
+    END { if (ticks % 2) { print "an unclosed code span"; bad = 1 } exit bad }
+  ' "$readme" || rc=1
+  awk -v b="$at_begin" -v e="$at_end" 'NR > b && NR < e && ($0 ~ /m2a-session|install|check-m2a-gate\.sh|check-gate1\.sh|ssh|sha256sum|cargo/ ||
+      $0 ~ /(^|[^[:alnum:]_-])(git|cd)([^[:alnum:]_-]|$)/) { print }' "$readme" > "$tmp/session-run.got"
+  if ! diff "$session_run_expected" "$tmp/session-run.got" > "$tmp/session-run.diff"; then
+    echo "the session-run commands differ from the expected list:"
+    sed -n 's/^< /want: /p; s/^> /got:  /p' "$tmp/session-run.diff"
+    rc=1
+  fi
+  text=$(awk -v b="$at_begin" -v e="$at_end" 'NR > b && NR < e { sub(/^[ ]+/, ""); printf "%s ", $0 }' "$readme")
+  for want in 'writes no `m2a-summary` line' '`pass: true`' '`exit_code: 0`' '`test_build: false`' \
+    '`production_build`' '`build_commit`' '`build_dirty: false`' '`clean_build`' '`fuzz_gate`' '`euid`' \
+    '`pinned_peer_only`' '`connected to 1 peer(s), 0 not pinned; 0 listen address(es)`' '`collect-run-log.sh`'; do
+    if [[ $text != *"$want"* ]]; then echo "the evidence does not name $want"; rc=1; fi
+  done
+  return $rc
+}
+check 0 "session run: README.md holds exactly the expected session-run commands" session_run_lint "$ref/README.md"
+# lint_readme <description> <pattern> <sed script>: a copy of README.md edited by the script fails
+# the lint with a line that matches the pattern.
+lint_readme() {
+  sed "$3" "$ref/README.md" > "$tmp/session-readme.md"
+  check_out 1 "session run: $1" "$2" session_run_lint "$tmp/session-readme.md"
+}
+gate_path=/etc/ethswarm/m2a-gate.json
+dial_span='`sudo -u m2a-session m2a-session --dial-only`'
+probe_span='`sudo -u m2a-session m2a-session --gate-file '"$gate_path"' > session-$(date -u +%Y%m%dT%H%M%SZ).jsonl`'
+nl=$'\\\n'   # a line break in a sed replacement
+# The probe run and the pre-check.
+lint_readme "a probe run without --gate-file fails" '^got: .*m2a-session m2a-session > session-' \
+  "s|m2a-session --gate-file $gate_path >|m2a-session >|"
+lint_readme "--gate-file without a value fails" '^got: .*--gate-file > session-' \
+  "s|--gate-file $gate_path >|--gate-file >|"
+lint_readme "a flag the binary does not take fails" '^got: .*m2a-session --gate /etc' \
+  "s|--gate-file $gate_path|--gate $gate_path|"
+lint_readme "no probe run fails" '^want: .*--gate-file /etc/ethswarm/m2a-gate\.json > session-' \
+  '/m2a-session --gate-file/d'
+lint_readme "no --dial-only pre-check fails" '^got: .*m2a-session --print-peer-id`' \
+  "s|$dial_span|\`sudo -u m2a-session m2a-session --print-peer-id\`|"
+lint_readme "the modes of the pre-check and the probe swapped fail" '^got: .*m2a-session --dial-only > session-' \
+  "s|m2a-session --dial-only\`|m2a-session --gate-file $gate_path\`|; s|m2a-session --gate-file $gate_path >|m2a-session --dial-only >|"
+lint_readme "a probe run before the pre-check fails" '^got: .*pre-check: `sudo -u m2a-session m2a-session --gate-file' \
+  "s|$dial_span|DIAL|; s|$probe_span|$dial_span|; s|DIAL|$probe_span|"
+lint_readme "a --gate-file other than the installed copy fails" '^got: .*--gate-file /tmp/m2a-gate\.json' \
+  "s|--gate-file $gate_path|--gate-file /tmp/m2a-gate.json|"
+lint_readme "a repeated --dial-only fails" '^got: .*--dial-only --dial-only`' \
+  "s|m2a-session --dial-only\`|m2a-session --dial-only --dial-only\`|"
+lint_readme "--print-peer-id --dial-only fails" '^got: .*--print-peer-id --dial-only`' \
+  "s|m2a-session --dial-only\`|m2a-session --print-peer-id --dial-only\`|"
+lint_readme "a timeout that is not a number fails" '^got: .*--connect-timeout-secs x`' \
+  "s|m2a-session --dial-only\`|m2a-session --dial-only --connect-timeout-secs x\`|"
+lint_readme "an m2a-session invocation by its path fails" '^got: .*`/usr/local/bin/m2a-session --listen x`' \
+  's|read the error on stderr|run `/usr/local/bin/m2a-session --listen x` and read the error on stderr|'
+lint_readme "a command chained after m2a-session fails" '^got: .*--dial-only && --listen x`' \
+  "s|m2a-session --dial-only\`|m2a-session --dial-only \\&\\& --listen x\`|"
+lint_readme "a command split over two lines fails" 'a code span crosses the line break of a command line$' \
+  "s|m2a-session --dial-only\`|m2a-session${nl}       --dial-only --bogus\`|"
+# Commands that are not in an inline code span, or that run under another command.
+lint_readme "a command in plain text fails" '^got: +sudo -u m2a-session m2a-session --listen x$' \
+  "s|^\( *\)The forward listens on loopback only.*|&${nl}\1sudo -u m2a-session m2a-session --listen x|"
+lint_readme "a command under timeout fails" '^got: .*`timeout 60 sudo -u m2a-session m2a-session --dial-only`' \
+  "s|$dial_span|\`timeout 60 sudo -u m2a-session m2a-session --dial-only\`|"
+lint_readme "a command in a subshell fails" '^got: .*`\(sudo -u m2a-session m2a-session --dial-only\)`' \
+  "s|$dial_span|\`(sudo -u m2a-session m2a-session --dial-only)\`|"
+lint_readme "a command in a command substitution fails" '^got: .*`echo \$\(sudo -u m2a-session m2a-session --dial-only\)`' \
+  "s|$dial_span|\`echo \$(sudo -u m2a-session m2a-session --dial-only)\`|"
+lint_readme "a code span from the line before into the probe fails" 'a code span crosses the line break of a command line$' \
+  's|change the tree. Then run the Status probe, which gives the evidence:|change the tree. Then run `timeout 9|'
+lint_readme "a fence fails" ': a fence$' \
+  "s|^\( *\)The forward listens on loopback only.*|&${nl}${nl}\1\`\`\`sh${nl}\1true${nl}\1\`\`\`|"
+lint_readme "an HTML comment fails" ': an HTML comment$' \
+  "s|^\( *\)The forward listens on loopback only.*|&${nl}\1<!-- true -->|"
+lint_readme "an indented code line fails" ': an indented code line$' \
+  "s|^\( *\)The forward listens on loopback only.*|&${nl}${nl}\1    true|"
+lint_readme "a tab fails" ': a tab$' \
+  "s|^\( *\)The forward listens on loopback only.*|&${nl}\1	true|"
+# The install source, owner and mode, the order of the steps and the session user.
+lint_readme "a gate file copied by root through a path fails" '^got: .*-m 0644 fuzz/artifacts/m2a-gate\.json /etc/ethswarm/m2a-gate\.json`' \
+  "s|/dev/stdin $gate_path < fuzz/artifacts/m2a-gate.json|fuzz/artifacts/m2a-gate.json $gate_path|"
+lint_readme "a gate file owned by the session user fails" '^got: .*install -o m2a-session -g root -m 0644 /dev/stdin /etc' \
+  "s|install -o root -g root -m 0644|install -o m2a-session -g root -m 0644|"
+lint_readme "a gate file of mode 0666 fails" '^got: .*install -o root -g root -m 0666 /dev/stdin /etc' \
+  "s|-m 0644 /dev/stdin|-m 0666 /dev/stdin|"
+lint_readme "a binary installed through a path fails" '^got: .*-m 0755 target/release/m2a-session /usr/local/bin/m2a-session`' \
+  "s|/dev/stdin /usr/local/bin/m2a-session < target/release/m2a-session|target/release/m2a-session /usr/local/bin/m2a-session|"
+lint_readme "a check of the checkout copy only fails" '^got: .*`fuzz/check-m2a-gate\.sh fuzz/artifacts/m2a-gate\.json`' \
+  "s|\`fuzz/check-m2a-gate.sh $gate_path\`|\`fuzz/check-m2a-gate.sh fuzz/artifacts/m2a-gate.json\`|"
+lint_readme "the gate check before its install fails" '^(want|got): .*-m 0644 /dev/stdin /etc/ethswarm/m2a-gate\.json' \
+  "/m2a-gate.json < fuzz\/artifacts\/m2a-gate.json\`/{h;d;}; /\`fuzz\/check-m2a-gate.sh \/etc/G"
+lint_readme "the pre-check without the session user fails" '^got: .*`sudo m2a-session --dial-only`' \
+  "s|$dial_span|\`sudo m2a-session --dial-only\`|"
+lint_readme "the probe under another user fails" '^got: .*`sudo -u root m2a-session --gate-file' \
+  "s|\`sudo -u m2a-session m2a-session --gate-file|\`sudo -u root m2a-session --gate-file|"
+# Words that a shell parser could take for the same command are still a change.
+lint_readme "a quoted --gate-file path fails" '^got: .*--gate-file "/etc/ethswarm/m2a-gate\.json" >' \
+  "s|--gate-file $gate_path >|--gate-file \"$gate_path\" >|"
+lint_readme "a 2>> redirect on the probe fails" '^got: .*\.jsonl 2>> session\.log`' \
+  's|%SZ).jsonl`|%SZ).jsonl 2>> session.log`|'
+# The tree check, the tunnel and the markers.
+lint_readme "a tree check that lists untracked files fails" '^got: .*`git status --porcelain`' \
+  's|`git status --porcelain --untracked-files=no`|`git status --porcelain`|'
+lint_readme "a tunnel on every address fails" '^got: .*`ssh -N -L <BEACON_API_PORT>' \
+  's|`ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:<BEACON_API_PORT>|`ssh -N -L <BEACON_API_PORT>|'
+lint_readme "a tunnel on a fixed port fails" '^got: .*-L 127\.0\.0\.1:5052:127\.0\.0\.1:5052 <ref-host>' \
+  's|<BEACON_API_PORT>:127.0.0.1:<BEACON_API_PORT>|5052:127.0.0.1:5052|'
+lint_readme "no end marker fails" '^want one session-run begin and one end marker \(got 1 and 0\)$' \
+  '/<!-- session-run:end -->/d'
+lint_readme "no begin marker fails" '^want one session-run begin and one end marker \(got 0 and 1\)$' \
+  '/<!-- session-run:begin -->/d'
+lint_readme "the end marker before the begin marker fails" '^the session-run end marker is not after its begin marker$' \
+  's|<!-- session-run:begin -->|<!-- session-run:END -->|; s|<!-- session-run:end -->|<!-- session-run:begin -->|; s|<!-- session-run:END -->|<!-- session-run:end -->|'
+# Each value that the evidence must name: drop it, and the lint names it.
+for want in '`pass: true`' '`exit_code: 0`' '`build_dirty: false`' '`clean_build`' \
+  '`connected to 1 peer(s), 0 not pinned; 0 listen address(es)`'; do
+  # The README wraps the detail of pinned_peer_only, so drop the line that holds it.
+  if [[ $want == '`connected to 1 peer(s)'* ]]; then script='/`connected to 1 peer(s), 0 not pinned/d'; else
+    script="s|$(sed 's/[][\.*^$|]/\\&/g' <<< "$want")|DROPPED|g"; fi
+  lint_readme "evidence without $want fails" "does not name $(sed 's/[][\.*^$()|+?{}]/\\&/g' <<< "$want")\$" "$script"
+done
+lint_readme "evidence without os_user fails" '^want: .*`os_user: "m2a-session"`' \
+  's|`os_user: "m2a-session"`|the user|'
+
 check_out 0 "mode: 600 and the service user passes" '^/k: 600 reth: PASS$' check_mode_owner /k "600 reth" reth
 check_out 1 "mode: 644 fails" '^/k: 644 reth \(want 600 reth\): FAIL$' check_mode_owner /k "644 reth" reth
 check_out 1 "mode: another owner fails" '\(want 600 lighthouse\): FAIL$' check_mode_owner /k "600 reth" lighthouse
@@ -1878,6 +2068,8 @@ has "spec diff: empty (8 fork versions, 7 fork epochs, 2 blob schedule entries)"
 has "finalized slot 10128, oldest block slot 10000 (anchor.oldest_block_slot): 128 slots: PASS" "a 128-slot finalized range passes"
 has "custody_group_count: 4" "records custody_group_count"
 has "peer = \"/ip4/34.89.10.7/tcp/9000/p2p/$pid\"" "writes the m2a-session peer line"
+# The forward binds loopback only, and ssh exits if another local account holds the port.
+has '# Over the tunnel: ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:5052:127.0.0.1:5052 <ref-host>' "the tunnel binds loopback and fails if the port is taken"
 has 'trusted_by_reference = true' "TRUSTED_PEERS set: the session config is trusted_by_reference"
 has 'sigp/lighthouse/releases/tag/v8.3.0-rc.0' "copies the release-note block from README.md"
 if grep -q KEY123secret "$log" || grep -qF "$(cat "$jwt_r")" "$log"; then
@@ -2272,7 +2464,7 @@ has "reth: no non-loopback TCP listener but p2p port 30304 (pids 812): PASS" "Ho
 has "$hroot/lighthouse/data/beacon/network/key: 600 $me_uid: PASS" "Hoodi: the node key under its own DATA_ROOT"
 has 'network = "hoodi"' "Hoodi: the session config names the network"
 has "peer = \"/ip4/34.89.10.7/tcp/9002/p2p/$pid\"" "Hoodi: the multiaddr carries the configured p2p port"
-has '# Over the tunnel: ssh -N -L 5053:127.0.0.1:5053 <ref-host>' "Hoodi: the tunnel uses the configured Beacon API port"
+has '# Over the tunnel: ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:5053:127.0.0.1:5053 <ref-host>' "Hoodi: the tunnel uses the configured Beacon API port, on loopback only"
 if grep -qx 'http://127.0.0.1:5053/eth/v1/node/syncing' "$tmp/curl.log" && ! grep -q ':5052/' "$tmp/curl.log"; then
   ok "run log: Hoodi: every Beacon API request goes to the configured port"
 else

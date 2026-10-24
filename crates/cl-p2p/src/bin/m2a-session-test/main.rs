@@ -9,6 +9,8 @@
 mod app;
 #[path = "../m2a-session/blocks.rs"]
 mod blocks;
+#[path = "../m2a-session/build_info.rs"]
+mod build_info;
 #[path = "../m2a-session/enr.rs"]
 mod enr;
 #[path = "../m2a-session/gate.rs"]

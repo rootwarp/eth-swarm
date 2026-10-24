@@ -2,6 +2,7 @@
 //! [`main`] with `test_build = false`, the test binary `m2a-session-test` with `true` (see the
 //! crate docs of `main.rs`). Nothing else differs between them.
 
+use crate::build_info::BuildInfo;
 use crate::gate::Expected;
 use crate::probe::{Chain, Probe, Verdict};
 use crate::reference_api::ReferenceApi;
@@ -115,6 +116,8 @@ struct RunEnv {
     /// The owner the config's path may have besides root: 0 (root only) in `m2a-session`, the
     /// process's own UID in the test binary.
     config_owner: u32,
+    /// The build commit and state: [`BuildInfo::built`] in production.
+    build: BuildInfo,
 }
 
 /// A current-thread tokio runtime with I/O and timers.
@@ -144,6 +147,7 @@ impl RunEnv {
                 0
             },
             gate: Expected::built(),
+            build: BuildInfo::built(),
             now_ms: Box::new(system_ms),
             wall_ms: Box::new(system_ms),
             hold: probe::HOLD,
@@ -255,6 +259,7 @@ struct SummaryInputs {
     user: String,
     key_handling: Verdict,
     test_build: bool,
+    build: BuildInfo,
 }
 
 /// Writes the steps' lines and the summary to `out` and returns the exit code: 0 only if
@@ -286,6 +291,7 @@ fn finish<E: EthSpec>(
             user: inputs.user,
             key_handling: inputs.key_handling,
             test_build: inputs.test_build,
+            build: inputs.build,
         },
     );
     for line in report.json_lines().iter().chain([&summary.json_line()]) {
@@ -438,6 +444,7 @@ fn run(
         user: config.run_as.clone(),
         key_handling: key_check,
         test_build: env.test_build,
+        build: env.build.clone(),
     });
     let runtime = match (env.runtime)() {
         Ok(rt) => rt,
@@ -668,6 +675,7 @@ mod tests {
             test_build: false,
             os: "linux".into(),
             config_owner: euid(),
+            build: BuildInfo::fixture(),
         }
     }
 
@@ -2708,8 +2716,14 @@ mod tests {
         assert_eq!(line["euid"], 1000);
         assert_eq!(line["test_build"], false);
         assert!(detail("production_build").contains("m2a-session"));
+        assert_eq!(line["build_commit"], crate::build_info::FIXTURE_COMMIT);
+        assert_eq!(line["build_dirty"], false);
+        assert!(detail("clean_build").contains(crate::build_info::FIXTURE_COMMIT));
         assert!(detail("key_handling").contains("ephemeral"));
-        assert!(detail("pinned_peer_only").contains("0 not pinned"));
+        assert_eq!(
+            detail("pinned_peer_only"),
+            "connected to 1 peer(s), 0 not pinned; 0 listen address(es)"
+        );
         assert!(detail("fuzz_gate").contains("m2a-gate.json"));
         assert!(!line.to_string().contains('\n'));
         // Any failed step fails the summary and the exit code.

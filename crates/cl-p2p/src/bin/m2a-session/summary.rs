@@ -4,14 +4,17 @@
 //!
 //! - `status`, `metadata`, `ping`, `blocks_by_range`: the step passed (its own line has the
 //!   field verdicts); `status` covers the fork digest.
-//! - `pinned_peer_only`: at the end, the swarm is connected to no peer but the pinned one and
-//!   listens nowhere.
+//! - `pinned_peer_only`: at the end, the swarm is connected to the pinned peer and to no other
+//!   peer, and listens nowhere.
 //! - `decode_limits`: the BlocksByRange request asked for at most `MAX_REQUEST_BLOCKS_DENEB`
 //!   blocks and the response held at most `count` of them, read under the codec's byte budget.
 //! - `blocks_dropped`: the BlocksByRange response arrived and its blocks were hashed and
 //!   dropped (the step keeps roots only, and the binary links no store crate).
 //! - `production_build`: the deployed binary `m2a-session` ran; the test binary
 //!   `m2a-session-test` fails it.
+//! - `clean_build`: the binary was built from a known commit with no uncommitted change in the
+//!   build tree. The top-level `build_commit` names the commit (or is `null`), and `build_dirty`
+//!   is `true` unless the check passed ([`BuildInfo`]).
 //! - `fuzz_gate`, `own_os_user`, `key_handling`: what the pre-flight established before the
 //!   dial (a passing m2a fuzz gate, the effective UID of the session user `run_as`, never
 //!   root, with equal real and saved UIDs, a checked node key). `own_os_user` passes only when
@@ -19,6 +22,7 @@
 //!   user and its UID.
 
 use crate::blocks::BlocksReport;
+use crate::build_info::BuildInfo;
 use crate::probe::{verdicts_json, Report, Verdict};
 use cl_p2p::m2a_session::config::DEFAULT_RUN_AS;
 use cl_p2p::rpc::codec::MAX_RESPONSE_BYTES;
@@ -29,7 +33,7 @@ use p2p_wire::rpc::protocols::MAX_REQUEST_BLOCKS_DENEB;
 use serde_json::json;
 
 /// Every check of the summary, in order.
-pub const CHECKS: [&str; 11] = [
+pub const CHECKS: [&str; 12] = [
     "status",
     "metadata",
     "ping",
@@ -41,6 +45,7 @@ pub const CHECKS: [&str; 11] = [
     "own_os_user",
     "key_handling",
     "production_build",
+    "clean_build",
 ];
 
 /// What the run knows besides the steps' report.
@@ -66,6 +71,8 @@ pub struct Facts {
     pub key_handling: Verdict,
     /// Whether the test binary `m2a-session-test` ran: a summary from it is never evidence.
     pub test_build: bool,
+    /// The commit the binary was built from, and whether its build tree was clean.
+    pub build: BuildInfo,
 }
 
 /// The summary of one session.
@@ -109,6 +116,23 @@ fn production_build(test_build: bool) -> Verdict {
             true,
             "the deployed binary m2a-session ran (test_build = false)",
         )
+    }
+}
+
+/// `clean_build`: the binary was built from a known commit with no uncommitted change in the
+/// build tree ([`BuildInfo`]), so `build_commit` names the sources that ran.
+fn clean_build(build: &BuildInfo) -> Verdict {
+    match (&build.commit, &build.unclean) {
+        (Some(commit), None) => verdict(
+            true,
+            format!("built from {commit} with no uncommitted change in the build tree"),
+        ),
+        (Some(commit), Some(why)) => verdict(false, format!("built from {commit}, but {why}")),
+        (None, why) => verdict(
+            false,
+            why.clone()
+                .unwrap_or_else(|| "no build commit was embedded".to_owned()),
+        ),
     }
 }
 
@@ -205,10 +229,11 @@ impl Summary {
             .filter(|p| **p != pinned)
             .map(ToString::to_string)
             .collect();
+        let pinned_connected = facts.connected.contains(&pinned);
         let pinned_only = verdict(
-            others.is_empty() && facts.listeners == 0,
+            pinned_connected && others.is_empty() && facts.listeners == 0,
             format!(
-                "connected to {} peer(s), {} not pinned{}; {} listen address(es)",
+                "connected to {} peer(s), {} not pinned{}; {} listen address(es){}",
                 facts.connected.len(),
                 others.len(),
                 if others.is_empty() {
@@ -216,7 +241,12 @@ impl Summary {
                 } else {
                     format!(" ({})", others.join(", "))
                 },
-                facts.listeners
+                facts.listeners,
+                if pinned_connected {
+                    ""
+                } else {
+                    "; the pinned peer is not connected"
+                }
             ),
         );
         let checks = vec![
@@ -264,6 +294,7 @@ impl Summary {
             ("own_os_user", own_os_user(&facts)),
             ("key_handling", facts.key_handling.clone()),
             ("production_build", production_build(facts.test_build)),
+            ("clean_build", clean_build(&facts.build)),
         ];
         Self { facts, checks }
     }
@@ -297,6 +328,8 @@ impl Summary {
             "os_user": self.facts.user,
             "euid": self.facts.euid,
             "test_build": self.facts.test_build,
+            "build_commit": self.facts.build.commit,
+            "build_dirty": !self.facts.build.is_clean(),
             "consensus_specs": SPEC_PIN.consensus_specs,
             "started_at_ms": ms(self.facts.started_at_ms),
             "ended_at_ms": ms(self.facts.ended_at_ms),
@@ -309,6 +342,7 @@ impl Summary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build_info::FIXTURE_COMMIT;
 
     fn facts(user: &str, euid: u32) -> Facts {
         Facts {
@@ -322,6 +356,7 @@ mod tests {
             user: user.to_owned(),
             key_handling: verdict(true, "key"),
             test_build: false,
+            build: BuildInfo::fixture(),
         }
     }
 
@@ -358,6 +393,112 @@ mod tests {
         assert_eq!(line["os_user"], "alice");
         assert_eq!(line["euid"], 7);
         assert_eq!(line["test_build"], false);
+    }
+
+    fn check(summary: &Summary, name: &str) -> Verdict {
+        summary
+            .checks()
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("no {name} check"))
+    }
+
+    /// `pinned_peer_only` passes only while the pinned peer is connected, no other peer is and
+    /// nothing listens: a run that lost its peer, or never had one, is no proof.
+    #[test]
+    fn pinned_peer_only_needs_the_pinned_peer_and_nothing_else() {
+        let base = facts("m2a-session", 1000);
+        let pinned = base.peer_id;
+        let other = PeerId::random();
+        let pinned_only = |connected: Vec<PeerId>, listeners: usize| {
+            check(
+                &Summary::new(
+                    &Report::default(),
+                    Facts {
+                        connected,
+                        listeners,
+                        ..base.clone()
+                    },
+                ),
+                "pinned_peer_only",
+            )
+        };
+        let ok = pinned_only(vec![pinned], 0);
+        assert!(ok.pass, "{ok:?}");
+        assert_eq!(
+            ok.detail,
+            "connected to 1 peer(s), 0 not pinned; 0 listen address(es)"
+        );
+        let none = pinned_only(Vec::new(), 0);
+        assert!(!none.pass, "{none:?}");
+        assert_eq!(
+            none.detail,
+            "connected to 0 peer(s), 0 not pinned; 0 listen address(es); the pinned peer is \
+             not connected"
+        );
+        let both = pinned_only(vec![pinned, other], 0);
+        assert!(!both.pass, "{both:?}");
+        assert_eq!(
+            both.detail,
+            format!("connected to 2 peer(s), 1 not pinned ({other}); 0 listen address(es)")
+        );
+        assert!(!pinned_only(vec![other], 0).pass);
+        let listening = pinned_only(vec![pinned], 1);
+        assert!(!listening.pass, "{listening:?}");
+        assert_eq!(
+            listening.detail,
+            "connected to 1 peer(s), 0 not pinned; 1 listen address(es)"
+        );
+    }
+
+    /// A build from a tree that was not clean, or with no known commit, fails `clean_build`, and
+    /// the line records the commit and the state.
+    #[test]
+    fn a_build_that_was_not_clean_fails_the_clean_build_check() {
+        let summary_of = |build: BuildInfo| {
+            Summary::new(
+                &Report::default(),
+                Facts {
+                    build,
+                    ..facts("m2a-session", 1000)
+                },
+            )
+        };
+        let line = |summary: &Summary| -> serde_json::Value {
+            serde_json::from_str(&summary.json_line()).unwrap()
+        };
+        let clean = summary_of(BuildInfo::fixture());
+        let ok = check(&clean, "clean_build");
+        assert!(ok.pass, "{ok:?}");
+        assert_eq!(
+            ok.detail,
+            format!("built from {FIXTURE_COMMIT} with no uncommitted change in the build tree")
+        );
+        assert_eq!(line(&clean)["build_commit"], FIXTURE_COMMIT);
+        assert_eq!(line(&clean)["build_dirty"], false);
+        let dirty = summary_of(BuildInfo::from_build(
+            FIXTURE_COMMIT,
+            "uncommitted changes in the build tree: content differs from HEAD: crates/x",
+        ));
+        let failed = check(&dirty, "clean_build");
+        assert!(!failed.pass, "{failed:?}");
+        assert_eq!(
+            failed.detail,
+            format!(
+                "built from {FIXTURE_COMMIT}, but uncommitted changes in the build tree: \
+                 content differs from HEAD: crates/x"
+            )
+        );
+        assert!(!dirty.passed());
+        assert_eq!(line(&dirty)["build_commit"], FIXTURE_COMMIT);
+        assert_eq!(line(&dirty)["build_dirty"], true);
+        let unknown = summary_of(BuildInfo::from_build("", "no build commit: no git"));
+        let failed = check(&unknown, "clean_build");
+        assert!(!failed.pass, "{failed:?}");
+        assert_eq!(failed.detail, "no build commit: no git");
+        assert_eq!(line(&unknown)["build_commit"], serde_json::Value::Null);
+        assert_eq!(line(&unknown)["build_dirty"], true);
     }
 
     /// A summary of the test binary fails its `production_build` check, so a gate that reads

@@ -413,6 +413,13 @@ test user owns, and runs on any platform. Its first log line says `TEST BUILD`, 
 `"test_build": true`, and that summary fails its `production_build` check, so a gate that reads
 the summary fails a test-binary run. Never deploy it.
 
+`build.rs` also records the build commit (git's `HEAD`) and if the build tree was clean. The
+tree is clean only if `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `crates` and `proto`
+have no uncommitted change, no untracked file and no assume-unchanged or skip-worktree flag.
+The summary writes them as `build_commit` and `build_dirty`. Its `clean_build` check fails a
+binary that was built from a tree that was not clean, or with no git checkout. Build the
+deployed binary from a clean checkout: `build_commit` is then the commit that you post.
+
 ### Node key
 
 The reference node trusts one peer ID, so the session needs a stable key, not an ephemeral one.
@@ -434,7 +441,8 @@ network = "sepolia"
 # The reference node, its peer ID from its /eth/v1/node/identity.
 peer = "/ip4/192.0.2.10/tcp/9000/p2p/16Uiu2HAm…"
 # The reference node's beacon API: plain HTTP on loopback only (localhost, 127.0.0.0/8, [::1]).
-# For a remote node, tunnel it: ssh -N -L 5052:127.0.0.1:5052 ref-host
+# For a remote node, tunnel it on loopback only:
+# ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:5052:127.0.0.1:5052 ref-host
 reference_api_url = "http://127.0.0.1:5052"
 node_key = "/var/lib/m2a-session/node.key"
 # The reference node lists our peer ID as trusted; refused without node_key.
