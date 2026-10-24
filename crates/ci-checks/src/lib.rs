@@ -33,6 +33,7 @@ use yaml_rust2::{Yaml, YamlLoader};
 
 pub mod fuzz_keys;
 pub mod kurtosis;
+pub mod locked;
 
 /// One broken rule, reported as `ERROR <file>[:<line>]: <message>`.
 #[derive(Debug, Clone, PartialEq, Eq)]

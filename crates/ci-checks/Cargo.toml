@@ -5,15 +5,16 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "CI gates: GitHub Actions workflow hardening, Kurtosis devnet image pins, plus tests for the CI shell scripts."
+description = "CI gates: GitHub Actions workflow hardening, --locked cargo calls in workflows, Kurtosis devnet image pins, plus tests for the CI shell scripts."
 
 [dependencies]
 # default-features off drops encoding_rs; workflows are UTF-8.
 yaml-rust2 = { version = "0.13", default-features = false }
+# Reads the repository's .cargo/config.toml files (the check-locked alias rule).
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
-toml = "0.8"
 
 [[bin]]
 name = "check-workflows"
@@ -22,3 +23,7 @@ path = "src/main.rs"
 [[bin]]
 name = "check-kurtosis-pins"
 path = "src/kurtosis_main.rs"
+
+[[bin]]
+name = "check-locked"
+path = "src/locked_main.rs"
