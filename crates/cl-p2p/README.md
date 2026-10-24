@@ -461,7 +461,7 @@ network = "sepolia"
 peer = "/ip4/192.0.2.10/tcp/9000/p2p/16Uiu2HAm…"
 # The reference node's beacon API: plain HTTP on loopback only (localhost, 127.0.0.0/8, [::1]).
 # For a remote node, tunnel it on loopback only:
-# ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:5052:127.0.0.1:5052 ref-host
+# ssh -f -N -o ExitOnForwardFailure=yes -L 127.0.0.1:5052:127.0.0.1:5052 ref-host
 reference_api_url = "http://127.0.0.1:5052"
 node_key = "/var/lib/m2a-session/node.key"
 # The reference node lists our peer ID as trusted; refused without node_key.

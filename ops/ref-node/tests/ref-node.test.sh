@@ -750,9 +750,18 @@ cat > "$session_run_expected" <<'EXPECTED'
          The output must be empty. This check also shows the untracked and ignored files that
          the build can read, for example a `.cargo/config.toml` or a `*.profraw` file.
        - `rustc -vV`. Its `release` must be the `channel` of `rust-toolchain.toml`.
-       - `env | grep -E '^((CC|CXX|AR|ARFLAGS|CFLAGS|CXXFLAGS)(_[^=]*)?|(TARGET|HOST)_[^=]*|CRATE_CC_[^=]*|PROTOC[^=]*|RUSTC[^=]*|RUSTFLAGS|RUSTUP_TOOLCHAIN|CARGO_BUILD_[^=]*|CARGO_TARGET_[^=]*|CARGO_ENCODED_RUSTFLAGS)='`.
+       - `rustup which rustc`. The output must be the `bin/rustc` of the toolchain directory
+         `<channel>-<host>` in the rustup home, with the `host` of `rustc -vV`. A build with
+         another compiler is not clean.
+       - `env | grep -E '^(((CC|CXX|AR|ARFLAGS|CFLAGS|CXXFLAGS)(_[^=]*)?|(TARGET|HOST)_[^=]*|CRATE_CC_[^=]*|PROTOC[^=]*|RUSTC[^=]*|RUSTFLAGS|RUSTUP_TOOLCHAIN|CARGO_BUILD_[^=]*|CARGO_TARGET_[^=]*|CARGO_PROFILE_[^=]*|CARGO_UNSTABLE_[^=]*|CARGO_ENCODED_RUSTFLAGS)=|CARGO_INCREMENTAL=1$)'`.
          The output must be empty. These variables change the compiler, its flags, the linker,
-         or the C and proto builds.
+         the cargo profile, the unstable features of cargo, or the C and proto builds.
+         `RUSTC_BOOTSTRAP` turns on the unstable features of a stable toolchain.
+         `CARGO_INCREMENTAL=1` changes the code generation, but `CARGO_INCREMENTAL=0` does not.
+         The command also shows `CARGO_TARGET_DIR` and `CARGO_BUILD_JOBS`. `CARGO_TARGET_DIR`
+         puts the binary in another directory, but the install step reads `target/release`.
+         `CARGO_BUILD_JOBS` does not change the binary. If the output is not empty, unset each
+         variable that it shows. Then run the command again.
        - `d=$(pwd -P); while :; do ls -d "$d"/.cargo/config "$d"/.cargo/config.toml 2>/dev/null; [ "$d" = / ] && break; d=$(dirname "$d"); done; ls -d "${CARGO_HOME:-$HOME/.cargo}"/config "${CARGO_HOME:-$HOME/.cargo}"/config.toml 2>/dev/null`.
          The output must be empty. A cargo config in `$CARGO_HOME` or in a parent `.cargo` can
          change the build, and the build tree does not show it. Cargo looks in the parents of
@@ -791,7 +800,7 @@ cat > "$session_run_expected" <<'EXPECTED'
        can then give false reference values to the probe.
 
        After `ssh -f` returns, record the PID of the tunnel. Keep the output:
-       `pgrep -u "$(id -u)" -f -- '-L 127.0.0.1:<BEACON_API_PORT>:'`. It must print one PID.
+       `pgrep -u "$(id -u)" -f '^ssh .*-L 127[.]0[.]0[.]1:<BEACON_API_PORT>:'`. It must print one PID.
     7. Go to a directory outside the checkout (`cd ~`), so that the session file does not
        change the tree. Then run the Status probe, which gives the evidence:
        `sudo -u m2a-session m2a-session --gate-file /etc/ethswarm/m2a-gate.json > session-$(date -u +%Y%m%dT%H%M%SZ).jsonl`.
@@ -889,13 +898,49 @@ session_run_lint() {
     '`production_build`' '`build_commit`' '`build_dirty: false`' '`clean_build`' '`fuzz_gate`' '`euid`' \
     '`pinned_peer_only`' '`connected to 1 peer(s), 0 not pinned; 0 listen address(es)`' '`collect-run-log.sh`' \
     '`build_rustc_commit`' 'If `ssh -f` does not exit 0, do not do step 10.7.' \
-    "$tunnel_span" '`kill <PID>`' \
+    "$tunnel_span" '`kill <PID>`' '`rustup which rustc`' '`CARGO_TARGET_DIR`' '`CARGO_BUILD_JOBS`' \
     'Then do not post the session file of step 10.7 as evidence.'; do
     if [[ $text != *"$want"* ]]; then echo "the evidence does not name $want"; rc=1; fi
   done
   return $rc
 }
 check 0 "session run: README.md holds exactly the expected session-run commands" session_run_lint "$ref/README.md"
+# build_env_refused <README> <name>...: the `env | grep -E` of step 10.2 prints NAME=1 for each
+# name, or the line itself for a NAME=VALUE. Prints each one that it does not print, exit 1 if
+# there is one.
+build_env_refused() {
+  local readme=$1 line re name rc=0
+  shift
+  line=$(grep -F -- "- \`env | grep -E '" "$readme" || true)
+  re=${line#*"env | grep -E '"}
+  re=${re%%"'"*}
+  if [[ -z $line || -z $re ]]; then echo "no env | grep -E of step 10.2"; return 1; fi
+  for name in "$@"; do
+    [[ $name == *=* ]] || name+="=1"
+    if ! grep -E -- "$re" <<< "$name" > /dev/null; then echo "not refused: $name"; rc=1; fi
+  done
+  return $rc
+}
+# The variables that make the build unclean (crates/cl-p2p/build_support.rs): each one that the
+# build script reads, and the cargo profile and unstable variables. Also CARGO_TARGET_DIR (the
+# install step reads target/release) and CARGO_BUILD_JOBS, which step 10.2 names.
+build_vars=(RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTC_LINKER
+  RUSTC CARGO_BUILD_RUSTC RUSTUP_TOOLCHAIN CARGO_BUILD_RUSTC_WRAPPER
+  CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER
+  CARGO_PROFILE_RELEASE_OPT_LEVEL CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS CARGO_PROFILE_RELEASE_PANIC
+  CARGO_UNSTABLE_BUILD_STD CC CFLAGS_x86_64-unknown-linux-gnu TARGET_CC HOST_CXXFLAGS ARFLAGS
+  CRATE_CC_NO_DEFAULTS PROTOC CARGO_TARGET_DIR CARGO_BUILD_JOBS RUSTC_BOOTSTRAP CARGO_INCREMENTAL=1)
+check 0 "session run: step 10.2 refuses every variable that makes the build unclean" \
+  build_env_refused "$ref/README.md" "${build_vars[@]}"
+check_out 1 "session run: a harmless variable is not refused" '^not refused: CARGO_HOME=1$' \
+  build_env_refused "$ref/README.md" CARGO_HOME
+check_out 1 "session run: CARGO_INCREMENTAL=0 is not refused" '^not refused: CARGO_INCREMENTAL=0$' \
+  build_env_refused "$ref/README.md" CARGO_INCREMENTAL=0
+check_out 1 "session run: CARGO_INCREMENTAL=10 is not refused (cargo reads only 1 as on)" \
+  '^not refused: CARGO_INCREMENTAL=10$' build_env_refused "$ref/README.md" CARGO_INCREMENTAL=10
+sed 's/|CARGO_PROFILE_\[^=\]\*//' "$ref/README.md" > "$tmp/no-profile-readme.md"
+check_out 1 "session run: a step 10.2 without CARGO_PROFILE_ fails" '^not refused: CARGO_PROFILE_RELEASE_OPT_LEVEL=1$' \
+  build_env_refused "$tmp/no-profile-readme.md" "${build_vars[@]}"
 # lint_readme <description> <pattern> <sed script>: a copy of README.md edited by the script fails
 # the lint with a line that matches the pattern.
 lint_readme() {
@@ -1054,17 +1099,21 @@ lint_readme "evidence without os_user fails" '^want: .*`os_user: "m2a-session"`'
 # comments, scripts, ssh configs) listens on loopback only: the bind address of each -L (also
 # in an option group such as -NL, and with the spec in the same word, -L5052:...) and of each
 # LocalForward (also through -o) is 127.0.0.1. Each ssh with a forward also has
-# -o ExitOnForwardFailure=yes, so that ssh exits if another process holds the port, and is not
-# put in the background with a trailing & (use ssh -f, which goes to the background only once
-# the forward listens). ssh is found as a word, also inside punctuation such as (ssh, **ssh or
-# h;ssh, and autossh counts. All of argv after ssh is read: OpenSSH also takes options after
-# the host. Option keys compare without case, the first ExitOnForwardFailure value counts, and
-# -o takes both the key=value and the "key value" form. Without these, a forward listens on every address, or a local account
-# that holds the port serves the reference values. A line that ends with a backslash, or that
-# leaves a code span open, is read with the next line (its comment marker removed). Prints each
-# problem as <file>:<line>: <problem>: <detail>. In a git checkout only tracked files count, so
-# a copy elsewhere in the tree (a worktree, a build dir) does not. This test file holds bad
-# forwards on purpose.
+# -o ExitOnForwardFailure=yes, so that ssh exits if another process holds the port, and -f (also
+# in an option group such as -fN), so that it goes to the background only once the forward
+# listens. It is not put in the background with a trailing &. ssh is found as a word, also
+# inside punctuation such as (ssh, **ssh or h;ssh, and autossh counts. The argv after ssh is
+# read up to the remote command: OpenSSH also takes options after the host, but the words of the
+# command are not options of ssh. Option keys compare without case, the first
+# ExitOnForwardFailure value counts, and -o takes both the key=value and the "key value" form.
+# Without these, a forward listens on every address, or a local account that holds the port
+# serves the reference values. A line that ends with a backslash is read with the next line
+# (its comment marker removed), as one shell command. A line that leaves a code span open is
+# read with the next lines in two ways: the line break as a blank (Markdown) and as the end of
+# the command (a shell). A fence line is never joined, so a forward in a fence does not take
+# the options of a later line. Prints each problem as <file>:<line>: <problem>: <detail>. In a
+# git checkout only tracked files count, so a copy elsewhere in the tree (a worktree, a build
+# dir) does not. This test file holds bad forwards on purpose.
 tunnel_py='
 import os, re, shlex, sys
 root, mode = sys.argv[1], sys.argv[2]
@@ -1080,13 +1129,26 @@ else:
 ARG = set("BbcDEeFIiJLlmOoPpRSWw")
 # ssh (or autossh) as a word: after a blank, a (, a ;, a * of emphasis or a /.
 SSH = re.compile(r"(?<![A-Za-z0-9_.-])(?:auto)?ssh(?![A-Za-z0-9_-])")
-# Where the command of an ssh ends.
-CUT = re.compile(r"&&|[|][|]|[;|)]")
+# Where the command of an ssh ends: also a line break (below).
+CUT = re.compile(r"&&|[|][|]|[;|)\n]")
 COMMENT = re.compile(r"^\s*(//[/!]?|#|\*|--)?\s*")
+# A fence line (after its comment marker): its backticks open no code span.
+FENCE = re.compile(r"(```|~~~)")
 forwards, problems = 0, []
 def bind(spec):
     return spec.startswith("127.0.0.1:")
+def report(rel, at, what, detail):
+    problem = (rel, at, what, " ".join(detail.split()))
+    if problem not in problems:
+        problems.append(problem)
+def fence(line):
+    return FENCE.match(COMMENT.sub("", line, count=1)) is not None
 def check(rel, at, text):
+    # A code span that crosses a line break: Markdown shows the break as a blank, and a shell
+    # ends the command there. Read the text both ways, and report what either reading finds.
+    scan(rel, at, text.replace("\n", " "))
+    scan(rel, at, text)
+def scan(rel, at, text):
     global forwards
     for segment in text.split("`"):
         toks = [t.strip("\"'"'"'") for t in segment.split()]
@@ -1099,23 +1161,31 @@ def check(rel, at, text):
                 continue  # the name alone, in prose or a code span: no forward
             forwards += 1
             if not bind(spec):
-                problems.append((rel, at, "a forward without the bind address 127.0.0.1", spec))
+                report(rel, at, "a forward without the bind address 127.0.0.1", spec)
         for found in SSH.finditer(segment):
             after = segment[found.end():]
             cut = CUT.search(after)
             words = after[:cut.start()] if cut else after
+            command = found.group(0) + words
             try:
                 argv = shlex.split(words)
             except ValueError:
                 argv = words.split()
-            specs, exit_values, background, j = [], [], False, 0
-            # Every word after ssh: OpenSSH also reads the options after the host.
+            specs, exit_values, fork, host, ended, j = [], [], False, False, False, 0
+            background = any(x == "&" or (x.endswith("&") and not x.endswith("&&")) for x in argv)
+            # OpenSSH reads the options before and after the host, up to the remote command:
+            # the first word after the host that is not an option, or the word after the host
+            # once -- ended the options. The words of the command are not options of ssh.
             while j < len(argv):
                 x = argv[j]
-                if x == "&" or (x.endswith("&") and not x.endswith("&&")):
-                    background = True
-                if x.startswith("-") and len(x) > 1 and not x.startswith("--"):
+                if x == "--" and not ended:
+                    ended = True
+                elif not ended and x.startswith("-") and len(x) > 1:
+                    if x.startswith("--"):
+                        j += 1
+                        continue
                     for n, c in enumerate(x[1:], 1):
+                        fork = fork or c == "f"
                         if c not in ARG:
                             continue
                         arg = x[n + 1:]
@@ -1132,18 +1202,24 @@ def check(rel, at, text):
                             elif key == "localforward":
                                 specs.append(value.split()[0] if value.split() else "")
                         break
+                elif host:
+                    break  # the remote command
+                else:
+                    host = True
                 j += 1
             if not specs:
                 continue
             forwards += len(specs)
             for spec in specs:
                 if not bind(spec):
-                    problems.append((rel, at, "a forward without the bind address 127.0.0.1", spec))
+                    report(rel, at, "a forward without the bind address 127.0.0.1", spec)
             # ssh takes the first value of an option.
             if not exit_values or exit_values[0] != "yes":
-                problems.append((rel, at, "an ssh forward without -o ExitOnForwardFailure=yes", segment.strip()))
+                report(rel, at, "an ssh forward without -o ExitOnForwardFailure=yes", command)
+            if not fork:
+                report(rel, at, "an ssh forward without -f (it goes to the background once the forward listens)", command)
             if background:
-                problems.append((rel, at, "an ssh forward in the background with & (use ssh -f)", segment.strip()))
+                report(rel, at, "an ssh forward in the background with & (use ssh -f)", command)
 for rel in paths:
     try:
         with open(os.path.join(root, rel), "rb") as f:
@@ -1156,10 +1232,18 @@ for rel in paths:
     i = 0
     while i < len(lines):
         at, text = i + 1, lines[i]
+        opens_span = not fence(text)
         i += 1
-        while i < len(lines) and (text.endswith("\\") or text.count("`") % 2):
-            text = text[:-1] if text.endswith("\\") else text
-            text += " " + COMMENT.sub("", lines[i], count=1)
+        # A backslash continues the shell command (a blank), an open code span continues on
+        # the next line (a line break). A fence line is never joined.
+        while i < len(lines) and not fence(lines[i]):
+            if text.endswith("\\"):
+                text = text[:-1] + " "
+            elif opens_span and text.count("`") % 2:
+                text += "\n"
+            else:
+                break
+            text += COMMENT.sub("", lines[i], count=1)
             i += 1
         check(rel, at, text)
 for rel, at, what, detail in problems:
@@ -1179,13 +1263,13 @@ tunnel_lint() {
 }
 check 0 "tunnel: every SSH port forward in the repository binds loopback and stops on a taken port" tunnel_lint "$repo"
 mkdir -p "$tmp/tunnel/docs" "$tmp/tunnel-git/docs"
-printf 'Tunnel: `ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:1:127.0.0.1:1 h`\n' > "$tmp/tunnel/docs/good.md"
+printf 'Tunnel: `ssh -f -N -o ExitOnForwardFailure=yes -L 127.0.0.1:1:127.0.0.1:1 h`\n' > "$tmp/tunnel/docs/good.md"
 cp "$tmp/tunnel/docs/good.md" "$tmp/tunnel-git/docs/good.md"
 printf 'ssh -N -L 127.0.0.1:5053:127.0.0.1:5053 ref-host\n' > "$tmp/tunnel-git/docs/bad.md"
 git -C "$tmp/tunnel-git" init -q && git -C "$tmp/tunnel-git" add -A
 check_out 1 "tunnel: a forward without ExitOnForwardFailure fails (git checkout)" \
   '^docs/bad\.md:1: an ssh forward without -o ExitOnForwardFailure=yes: ssh -N -L 127' tunnel_lint "$tmp/tunnel-git"
-check 0 "tunnel: a loopback forward with ExitOnForwardFailure passes" tunnel_lint "$tmp/tunnel"
+check 0 "tunnel: a loopback forward with -f and ExitOnForwardFailure passes" tunnel_lint "$tmp/tunnel"
 # tunnel_case <description> <pattern> <file content (printf format)>: one bad file next to the
 # good one fails with a line that matches the pattern.
 tunnel_case() {
@@ -1234,6 +1318,34 @@ tunnel_case "a first \"ExitOnForwardFailure no\" fails" '^docs/bad\.txt:1: an ss
   "ssh -N -o \"ExitOnForwardFailure no\" $exit_on -L 127.0.0.1:5052:127.0.0.1:5052 ref-host\n"
 tunnel_case "\"ExitOnForwardFailure no\" with a bad forward fails" '^docs/bad\.txt:1: a forward without the bind address 127\.0\.0\.1: 5052:' \
   "ssh -N -o \"ExitOnForwardFailure no\" -L 5052:127.0.0.1:5052 ref-host\n"
+# A fence line is not joined with the lines after it, and a line break ends an ssh command
+# outside a code span: a forward does not take the ExitOnForwardFailure or the -f of a later
+# ssh line of the same fence, or of the lines after an odd backtick in a script.
+tunnel_case "a forward in a fence with a good ssh line after it fails" \
+  '^docs/bad\.txt:2: an ssh forward without -o ExitOnForwardFailure=yes: ssh -f -N -L 127\.0\.0\.1:5052:127\.0\.0\.1:5052 ref-host$' \
+  "\`\`\`sh\nssh -f -N -L 127.0.0.1:5052:127.0.0.1:5052 ref-host\nssh -f $exit_on other-host\n\`\`\`\n"
+tunnel_case "a forward in a commented fence with a good ssh line after it fails" \
+  '^docs/bad\.txt:2: an ssh forward without -o ExitOnForwardFailure=yes' \
+  "//! \`\`\`sh\n//! ssh -f -N -L 127.0.0.1:5052:127.0.0.1:5052 ref-host\n//! ssh -f $exit_on h\n//! \`\`\`\n"
+tunnel_case "a forward after an odd backtick with a good ssh line after it fails" \
+  '^docs/bad\.txt:1: an ssh forward without -o ExitOnForwardFailure=yes: ssh -f -N -L 127\.0\.0\.1:5052' \
+  "echo \"\\\`\" && ssh -f -N -L 127.0.0.1:5052:127.0.0.1:5052 ref-host\nssh -f $exit_on h\n"
+# The tunnel goes to the background with ssh -f, only once the forward listens: a foreground
+# ssh at a host-key or passphrase prompt has no forward yet, and the port stays free.
+tunnel_case "a forward without ssh -f fails" '^docs/bad\.txt:1: an ssh forward without -f' \
+  "ssh -N $exit_on -L 127.0.0.1:5052:127.0.0.1:5052 ref-host\n"
+tunnel_case "an -f after the forward's argument fails" '^docs/bad\.txt:1: an ssh forward without -f' \
+  "ssh -N $exit_on -L 127.0.0.1:5052:127.0.0.1:5052f ref-host\n"
+# ssh reads its options before and after the host, up to the remote command: an -f or an -L of
+# the command is not an option of ssh.
+tunnel_case "an -f of the remote command fails" '^docs/bad\.txt:1: an ssh forward without -f' \
+  "ssh $exit_on -L 127.0.0.1:5052:127.0.0.1:5052 ref-host journalctl -f\n"
+tunnel_case "an -f of the remote command after -- fails" '^docs/bad\.txt:1: an ssh forward without -f' \
+  "ssh $exit_on -L 127.0.0.1:5052:127.0.0.1:5052 -- ref-host -f\n"
+printf 'ssh -f -N %s -L 127.0.0.1:5053:127.0.0.1:5053 ref-host grep -L x y\n' "$exit_on" > "$tmp/tunnel/docs/f.txt"
+check 0 "tunnel: an -L of the remote command is not a forward" tunnel_lint "$tmp/tunnel"
+printf '```sh\nssh -fN %s -L 127.0.0.1:5053:127.0.0.1:5053 ref-host\n```\n' "$exit_on" > "$tmp/tunnel/docs/f.txt"
+check 0 "tunnel: -fN (f in an option group) in a fence passes" tunnel_lint "$tmp/tunnel"
 printf 'ssh -f -N -o "ExitOnForwardFailure yes" -L 127.0.0.1:5053:127.0.0.1:5053 ref-host &&\n  collector sse\n' > "$tmp/tunnel/docs/f.txt"
 check 0 "tunnel: the \"key value\" form of -o passes" tunnel_lint "$tmp/tunnel"
 printf 'ssh -f -N %s -L 127.0.0.1:5053:127.0.0.1:5053 ref-host &&\n  collector sse\n' "$exit_on" > "$tmp/tunnel/docs/f.txt"

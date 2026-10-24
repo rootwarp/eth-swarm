@@ -35,23 +35,29 @@
 //! It also records the build commit and why the build was not clean, for the `m2a-summary`
 //! line (`src/bin/m2a-session/build_info.rs`): `m2a-build-commit.txt` (git's `HEAD`, or empty),
 //! `m2a-build-rustc.txt` (the compiler's commit hash, or empty) and `m2a-build-unclean.txt`
-//! (empty for a clean build, else the reason). The build is clean only if four conditions are
+//! (empty for a clean build, else the reason). The build is clean only if five conditions are
 //! true:
 //!
 //! - `m2a_dirty_paths` finds nothing under [`BUILD_PATHS`] (the paths that can change what the
 //!   binaries compile; an ignored file there counts too).
-//! - No variable of [`BUILD_FLAG_VARS`] (rustflags, a rustc wrapper, a linker) is set.
+//! - No variable of [`BUILD_FLAG_VARS`] (rustflags, a rustc wrapper, a linker,
+//!   `RUSTC_BOOTSTRAP`) is set.
+//! - No cargo profile or unstable variable is set (`CARGO_PROFILE_*`, `CARGO_UNSTABLE_*`:
+//!   `build_support::is_cargo_flag_var`), and `CARGO_INCREMENTAL` is not `1`.
 //! - No C or proto build variable is set (`CC`, `CFLAGS`, `PROTOC` and the rest:
 //!   `build_support::is_c_build_var`).
 //! - The compiler's release is the `channel` of `rust-toolchain.toml`, with the official commit
 //!   of `build_support::PINNED_RUSTC` (`build_support::compiler_state`), and the compiler is the
-//!   `rustc` of that rustup toolchain by its canonical path (`build_support::rustc_location`).
+//!   `rustc` of the rustup toolchain `<channel>-<host>` by its canonical path
+//!   (`build_support::rustc_location`).
 //!
 //! A tree without git, or without the harness, is not clean.
 //!
 //! Cargo reruns this script when a build path, a keyed path or a harness script changes on disk
 //! (or, while one is missing, its nearest existing parent below the repository root), when a
-//! variable of [`BUILD_FLAG_VARS`], [`COMPILER_VARS`] or a C or proto build variable changes,
+//! variable of `build_support::env_watch` changes ([`BUILD_FLAG_VARS`], [`COMPILER_VARS`], the
+//! wrapper keys of `build_support::WRAPPER_CONFIG_VARS`, the release and dev profile settings,
+//! the C and proto build variables, and each cargo profile or unstable variable set now),
 //! when git's `HEAD`, the current branch ref or the index changes (a commit, checkout, reset or
 //! `git add`), or when the history depth may have (`build_support::history_watch`: a shallow
 //! clone deepened or unshallowed, or a full one made shallow). While `git pack-refs` holds the branch ref, the nearest existing
@@ -59,13 +65,22 @@
 //! not watched (the repository root would rerun every build): step 10.2 of the runbook
 //! (`ops/ref-node/README.md`) checks the tree again after the build. A new compiler rebuilds
 //! every crate, and so reruns this script.
+//!
+//! Some cases rely on step 10.2 only, and step 10.2 refuses each one before the build:
+//!
+//! - A profile or an unstable flag in a cargo config file. This script does not see it.
+//! - A wrapper or a linker that a cargo config file sets after a clean build. Cargo gives its
+//!   value to this script, but it does not rerun the script for a config change, so a stale
+//!   "clean" stays.
+//! - A `CARGO_PROFILE_*` or `CARGO_UNSTABLE_*` variable that is not in the fixed list of
+//!   `build_support::env_watch` and that was not set at the last run.
 
 mod build_support;
 
 use build_support::{
-    bash, build_flags_unclean, build_state, c_build_watch, child_env, command, compiler_state,
-    git_watch, is_c_build_var, locate_repo, run, rustc_location, rustc_version, unclean_reason,
-    watch_path, BUILD_FLAG_VARS, BUILD_PATHS, COMMON, COMPILER_VARS,
+    bash, build_flags_unclean, build_state, child_env, command, compiler_state, env_watch,
+    git_watch, locate_repo, run, rustc_location, rustc_version, unclean_reason, watch_path,
+    BUILD_PATHS, COMMON,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -77,15 +92,9 @@ type Env = [(OsString, OsString)];
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build_support.rs");
-    for name in BUILD_FLAG_VARS.iter().chain(&COMPILER_VARS) {
-        println!("cargo:rerun-if-env-changed={name}");
-    }
     let target = std::env::var("TARGET").unwrap_or_default();
     let host = std::env::var("HOST").unwrap_or_default();
-    let set_c_vars = std::env::vars_os()
-        .filter_map(|(k, _)| k.into_string().ok())
-        .filter(|k| is_c_build_var(k));
-    for name in c_build_watch(&target, &host).into_iter().chain(set_c_vars) {
+    for name in env_watch(&target, &host, std::env::vars_os()) {
         println!("cargo:rerun-if-env-changed={name}");
     }
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("set by cargo"));
@@ -128,10 +137,10 @@ fn main() {
         &tree,
         [
             compiler,
-            compiler_location(&rustc, toolchain.as_deref().ok()),
+            compiler_location(&rustc, &host, toolchain.as_deref().ok()),
             std::env::var_os("CARGO_BUILD_RUSTC")
                 .filter(|v| !v.is_empty())
-                .and_then(|other| compiler_location(&other, toolchain.as_deref().ok())),
+                .and_then(|other| compiler_location(&other, &host, toolchain.as_deref().ok())),
             build_flags_unclean(std::env::vars_os()),
         ],
     );
@@ -153,9 +162,14 @@ fn main() {
 }
 
 /// Why the compiler `rustc` is not the rustc of the pinned rustup toolchain, or `None`
-/// ([`rustc_location`]). `RUSTUP_HOME` is rustup's directory, by default `~/.rustup`. With no
-/// toolchain file, [`compiler_state`] already gives the reason.
-fn compiler_location(rustc: &std::ffi::OsStr, toolchain: Option<&str>) -> Option<String> {
+/// ([`rustc_location`]) for the build `host`. `RUSTUP_HOME` is rustup's directory, by default
+/// `~/.rustup`. The build trusts it: step 10.2 of the runbook records `rustup which rustc`.
+/// With no toolchain file, [`compiler_state`] already gives the reason.
+fn compiler_location(
+    rustc: &std::ffi::OsStr,
+    host: &str,
+    toolchain: Option<&str>,
+) -> Option<String> {
     let toolchain = toolchain?;
     let rustup_home = std::env::var_os("RUSTUP_HOME")
         .filter(|v| !v.is_empty())
@@ -168,6 +182,7 @@ fn compiler_location(rustc: &std::ffi::OsStr, toolchain: Option<&str>) -> Option
         rustc,
         std::env::var_os("PATH").as_deref(),
         &rustup_home,
+        host,
         toolchain,
     )
 }

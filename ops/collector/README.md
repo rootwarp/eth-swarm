@@ -362,8 +362,10 @@ otherwise give `--url-file` a 0600 file. To read a remote node, tunnel its API t
 first:
 
 ```bash
+unset tunnel pids
 ssh -f -N -o ExitOnForwardFailure=yes -L 127.0.0.1:5053:127.0.0.1:5053 ref-host &&
-  tunnel=$(pgrep -u "$(id -u)" -f -- '-L 127.0.0.1:5053:') && echo "tunnel PID: $tunnel" &&
+  pids=$(pgrep -u "$(id -u)" -f '^ssh .*-L 127\.0\.0\.1:5053:') && [[ $pids =~ ^[0-9]+$ ]] &&
+  tunnel=$pids && echo "tunnel PID: $tunnel" &&
   collector sse --network hoodi --url http://127.0.0.1:5053 --out ./captures --host "$(hostname)" --ntp none \
     --topics-file ops/collector/collector-hoodi.topics.toml.example
 # After the capture:
@@ -375,3 +377,8 @@ starts only after that. If `ssh` exits, stop: another process holds the port, an
 collector must not read from it. If the `ssh` process stops while the collector runs, stop the
 collector and do not use its capture. A local account can bind the free port and answer. After
 the capture, stop the tunnel with `kill "$tunnel"` (the PID that `pgrep` printed).
+
+The chain sets `$tunnel` only if `pgrep` prints exactly one PID of an `ssh` command line with
+the forward. Thus an old `$tunnel` of the shell, or a PID of another process, does not go to
+`kill`. If `pgrep` prints no PID or more than one, the chain stops before the collector starts.
+Then find the `ssh` processes of the port in `$pids`, and stop them yourself.

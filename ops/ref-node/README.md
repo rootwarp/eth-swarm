@@ -353,9 +353,18 @@ command (see above).
          The output must be empty. This check also shows the untracked and ignored files that
          the build can read, for example a `.cargo/config.toml` or a `*.profraw` file.
        - `rustc -vV`. Its `release` must be the `channel` of `rust-toolchain.toml`.
-       - `env | grep -E '^((CC|CXX|AR|ARFLAGS|CFLAGS|CXXFLAGS)(_[^=]*)?|(TARGET|HOST)_[^=]*|CRATE_CC_[^=]*|PROTOC[^=]*|RUSTC[^=]*|RUSTFLAGS|RUSTUP_TOOLCHAIN|CARGO_BUILD_[^=]*|CARGO_TARGET_[^=]*|CARGO_ENCODED_RUSTFLAGS)='`.
+       - `rustup which rustc`. The output must be the `bin/rustc` of the toolchain directory
+         `<channel>-<host>` in the rustup home, with the `host` of `rustc -vV`. A build with
+         another compiler is not clean.
+       - `env | grep -E '^(((CC|CXX|AR|ARFLAGS|CFLAGS|CXXFLAGS)(_[^=]*)?|(TARGET|HOST)_[^=]*|CRATE_CC_[^=]*|PROTOC[^=]*|RUSTC[^=]*|RUSTFLAGS|RUSTUP_TOOLCHAIN|CARGO_BUILD_[^=]*|CARGO_TARGET_[^=]*|CARGO_PROFILE_[^=]*|CARGO_UNSTABLE_[^=]*|CARGO_ENCODED_RUSTFLAGS)=|CARGO_INCREMENTAL=1$)'`.
          The output must be empty. These variables change the compiler, its flags, the linker,
-         or the C and proto builds.
+         the cargo profile, the unstable features of cargo, or the C and proto builds.
+         `RUSTC_BOOTSTRAP` turns on the unstable features of a stable toolchain.
+         `CARGO_INCREMENTAL=1` changes the code generation, but `CARGO_INCREMENTAL=0` does not.
+         The command also shows `CARGO_TARGET_DIR` and `CARGO_BUILD_JOBS`. `CARGO_TARGET_DIR`
+         puts the binary in another directory, but the install step reads `target/release`.
+         `CARGO_BUILD_JOBS` does not change the binary. If the output is not empty, unset each
+         variable that it shows. Then run the command again.
        - `d=$(pwd -P); while :; do ls -d "$d"/.cargo/config "$d"/.cargo/config.toml 2>/dev/null; [ "$d" = / ] && break; d=$(dirname "$d"); done; ls -d "${CARGO_HOME:-$HOME/.cargo}"/config "${CARGO_HOME:-$HOME/.cargo}"/config.toml 2>/dev/null`.
          The output must be empty. A cargo config in `$CARGO_HOME` or in a parent `.cargo` can
          change the build, and the build tree does not show it. Cargo looks in the parents of
@@ -394,7 +403,7 @@ command (see above).
        can then give false reference values to the probe.
 
        After `ssh -f` returns, record the PID of the tunnel. Keep the output:
-       `pgrep -u "$(id -u)" -f -- '-L 127.0.0.1:<BEACON_API_PORT>:'`. It must print one PID.
+       `pgrep -u "$(id -u)" -f '^ssh .*-L 127[.]0[.]0[.]1:<BEACON_API_PORT>:'`. It must print one PID.
     7. Go to a directory outside the checkout (`cd ~`), so that the session file does not
        change the tree. Then run the Status probe, which gives the evidence:
        `sudo -u m2a-session m2a-session --gate-file /etc/ethswarm/m2a-gate.json > session-$(date -u +%Y%m%dT%H%M%SZ).jsonl`.
@@ -474,11 +483,17 @@ on a change:
   tunnel with `kill <PID>` and say that you do not post the session file if the tunnel stopped.
 
 The suite also fails if a file of the repository gives an SSH port forward (`-L` in any
-option group, or `LocalForward` in any case) whose bind address is not `127.0.0.1`, an `ssh`
-forward whose first `ExitOnForwardFailure` value is not `yes`, or one that a trailing `&` puts
-in the background (use `ssh -f`). It finds `ssh` and `autossh` as a word, also next to
-punctuation, and reads all of argv after it, also after the host. It joins a line that ends with
-a backslash, or that leaves a code span open, with the next line.
+option group, or `LocalForward` in any case) whose bind address is not `127.0.0.1`. It also
+fails on an `ssh` forward whose first `ExitOnForwardFailure` value is not `yes`, one without
+`-f`, or one that a trailing `&` puts in the background. It finds `ssh` and `autossh` as a word,
+also next to punctuation. It reads the argv after it up to the remote command, also the
+options after the host. It joins a line that ends with a backslash with the next line. It also
+joins a line that leaves a code span open with the next lines, and reads that text two times:
+with each line break as a blank, and with each line break as the end of the command. It does
+not join a fence line.
+
+Write each `ssh` command that gives a forward on one line. A code span over two lines has two
+readings, and the lint cannot know which one a reader copies.
 
 As root it needs `ETHSWARM_ROOT_TESTS=1` and belongs in a throwaway container only (it creates
 users): it then runs `setup.sh` and `preflight.sh` for real for both networks side by side,

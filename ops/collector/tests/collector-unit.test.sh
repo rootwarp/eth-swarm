@@ -578,5 +578,53 @@ expect_fail "a README that starts the old unit is caught" check_readme "$tmp/old
 { cat "$readme"; echo 'sudo useradd --system ethswarm-collector'; } >"$tmp/shared-user.md"
 expect_fail "a README that creates the shared user is caught" check_readme "$tmp/shared-user.md"
 
+# --- the README's tunnel to a remote node ---------------------------------------------------------
+
+# tunnel_block FILE: the bash fence after "tunnel its API to a local port" in FILE.
+tunnel_block() {
+  awk '/tunnel its API to a local port/ { f = 1 } f && /^```bash$/ { g = 1; next } g && /^```$/ { exit } g' "$1"
+}
+# run_tunnel FILE PROCS SSH_RC: runs the tunnel block of FILE in this bash, with a stale
+# tunnel=999 in the environment, an ssh that exits SSH_RC, and PROCS (lines of
+# "PID<tab>command line") as the processes that pgrep sees. pgrep matches its last argument as an
+# extended regex against each command line. The collector and kill only print what they get.
+run_tunnel() {
+  local block
+  block=$(tunnel_block "$1")
+  if [[ -z $block ]]; then echo "no tunnel block"; return 0; fi
+  PROCS=$2 SSH_RC=$3 tunnel=999 "$BASH" -c '
+    ssh() { return "$SSH_RC"; }
+    pgrep() {
+      local pat found=1 pid cmd tab
+      for pat; do :; done
+      tab=$(printf "\t")
+      while IFS=$tab read -r pid cmd; do
+        if grep -E -- "$pat" <<< "$cmd" > /dev/null; then echo "$pid"; found=0; fi
+      done < "$PROCS"
+      return $found
+    }
+    collector() { echo collector; }
+    kill() { echo "kill $*"; }
+    '"$block" 2>&1 || true
+}
+# tunnel_case FILE DESC PROCS SSH_RC WANT: the output of run_tunnel is WANT.
+tunnel_case() {
+  local got
+  got=$(run_tunnel "$1" "$3" "$4")
+  if [[ $got == "$5" ]]; then ok "tunnel: $2"; else bad "tunnel: $2" "got: $got"$'\n'"want: $5"; fi
+}
+ssh_line='ssh -f -N -o ExitOnForwardFailure=yes -L 127.0.0.1:5053:127.0.0.1:5053 ref-host'
+printf '100\t%s\n200\tvim -L 127.0.0.1:5053: notes\n' "$ssh_line" > "$tmp/procs-one"
+printf '100\t%s\n101\t%s\n' "$ssh_line" "$ssh_line" > "$tmp/procs-two"
+: > "$tmp/procs-none"
+tunnel_case "$readme" "the PID of the ssh process only, not of another command line with the forward" \
+  "$tmp/procs-one" 0 $'tunnel PID: 100\ncollector\nkill 100'
+tunnel_case "$readme" "two ssh processes on the port stop the chain before the collector" \
+  "$tmp/procs-two" 0 'kill '
+tunnel_case "$readme" "a failed ssh leaves no old tunnel PID to kill" "$tmp/procs-none" 255 'kill '
+tunnel_case "$readme" "no ssh process stops the chain before the collector" "$tmp/procs-none" 0 'kill '
+replace "$readme" 'unset tunnel' ':' > "$tmp/no-unset.md"
+tunnel_case "$tmp/no-unset.md" "a README that keeps an old tunnel PID is caught" "$tmp/procs-none" 255 'kill 999'
+
 echo "collector unit tests: $passed passed, $failed failed"
 ((failed == 0))

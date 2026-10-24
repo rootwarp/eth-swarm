@@ -52,17 +52,62 @@ pub const BUILD_PATHS: [&str; 13] = [
 /// The variables of a build script that change how rustc compiles or links, whatever the tree
 /// holds: the rustflags (`CARGO_ENCODED_RUSTFLAGS` holds them from every source: `RUSTFLAGS`,
 /// `CARGO_BUILD_RUSTFLAGS` and any cargo config), the rustc wrappers and the linker
-/// (`RUSTC_LINKER`: from any cargo config or `CARGO_TARGET_<triple>_LINKER`). A cargo config
-/// outside the repository (in `$CARGO_HOME` or a parent `.cargo`) is not a build path, so
-/// these variables are what the build script sees of it, and step 10.2 of the runbook
+/// (`RUSTC_LINKER`: from any cargo config or `CARGO_TARGET_<triple>_LINKER`), and
+/// `RUSTC_BOOTSTRAP`, which turns on the unstable features of a stable toolchain (`-Z`,
+/// `CARGO_UNSTABLE_*`, and a cfg in the build script of `anyhow`). A cargo config outside the
+/// repository (in `$CARGO_HOME` or a parent `.cargo`) is not a build path, so these variables
+/// are what the build script sees of it, and step 10.2 of the runbook
 /// (`ops/ref-node/README.md`) requires that none exists. A build with any of them set and not
 /// empty is not clean.
-pub const BUILD_FLAG_VARS: [&str; 5] = [
+pub const BUILD_FLAG_VARS: [&str; 6] = [
     "RUSTFLAGS",
     "CARGO_ENCODED_RUSTFLAGS",
     "RUSTC_WRAPPER",
     "RUSTC_WORKSPACE_WRAPPER",
     "RUSTC_LINKER",
+    "RUSTC_BOOTSTRAP",
+];
+
+/// The variable that turns incremental compilation on (`1`) or off (`0`) for every profile.
+/// The release profile compiles without it, and incremental compilation changes the code
+/// generation, so only the value `1` (the only value that cargo reads as on) makes the build
+/// unclean. Its reason gives the value.
+pub const INCREMENTAL_VAR: &str = "CARGO_INCREMENTAL";
+
+/// The prefixes of cargo's own variables that change the release binary, whatever the tree
+/// holds: a profile setting (`CARGO_PROFILE_RELEASE_OPT_LEVEL`, `..._OVERFLOW_CHECKS`,
+/// `..._PANIC` and the rest) and an unstable flag (`CARGO_UNSTABLE_BUILD_STD`). A variable with
+/// one of them and a name after it, set and not empty, makes the build unclean.
+pub const CARGO_FLAG_PREFIXES: [&str; 2] = ["CARGO_PROFILE_", "CARGO_UNSTABLE_"];
+
+/// The profiles and the settings of [`CARGO_FLAG_PREFIXES`] that `build.rs` watches also when
+/// they are not set: `CARGO_PROFILE_<profile>_<setting>`. An unstable flag has no fixed list.
+pub const WATCHED_PROFILES: [&str; 2] = ["RELEASE", "DEV"];
+
+/// See [`WATCHED_PROFILES`].
+pub const PROFILE_SETTINGS: [&str; 11] = [
+    "OPT_LEVEL",
+    "DEBUG",
+    "SPLIT_DEBUGINFO",
+    "STRIP",
+    "DEBUG_ASSERTIONS",
+    "OVERFLOW_CHECKS",
+    "LTO",
+    "PANIC",
+    "INCREMENTAL",
+    "CODEGEN_UNITS",
+    "RPATH",
+];
+
+/// The cargo config keys of the rustc wrappers in the environment (`build.rustc-wrapper` and
+/// `build.rustc-workspace-wrapper`). Cargo gives their value to the build script as
+/// `RUSTC_WRAPPER` and `RUSTC_WORKSPACE_WRAPPER` ([`BUILD_FLAG_VARS`]), but it reruns the script
+/// only when a watched variable of its own environment changes. So `build.rs` watches these
+/// too. A wrapper that a cargo config file sets after a clean build does not rerun the script,
+/// and a stale "clean" stays: step 10.2 of the runbook refuses such a config before the build.
+pub const WRAPPER_CONFIG_VARS: [&str; 2] = [
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
 ];
 
 /// The variables that select the compiler: cargo's `RUSTC` (also set from a cargo config or by
@@ -101,6 +146,55 @@ pub fn is_c_build_var(name: &str) -> bool {
                     .iter()
                     .any(|prefix| name.strip_prefix(prefix) == Some(base))
         })
+}
+
+/// Whether `name` is a cargo profile or unstable variable ([`CARGO_FLAG_PREFIXES`]).
+pub fn is_cargo_flag_var(name: &str) -> bool {
+    CARGO_FLAG_PREFIXES.iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .is_some_and(|rest| !rest.is_empty())
+    })
+}
+
+/// Every variable that `build.rs` watches with `rerun-if-env-changed`, each name once:
+/// [`BUILD_FLAG_VARS`], [`COMPILER_VARS`], [`WRAPPER_CONFIG_VARS`], [`INCREMENTAL_VAR`], the
+/// profile settings of [`WATCHED_PROFILES`], the C and proto build variables of
+/// [`c_build_watch`] for `target` and `host`, and each cargo flag or C build variable of `vars`
+/// (the environment now) by name.
+/// Cargo cannot watch a prefix, so a prefixed variable that is set only after a clean build
+/// does not rerun the script: step 10.2 of the runbook refuses it before the build.
+pub fn env_watch(
+    target: &str,
+    host: &str,
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<String> {
+    let mut names: Vec<String> = BUILD_FLAG_VARS
+        .iter()
+        .chain(&COMPILER_VARS)
+        .chain(&WRAPPER_CONFIG_VARS)
+        .chain(&[INCREMENTAL_VAR])
+        .map(|v| (*v).to_owned())
+        .collect();
+    for profile in WATCHED_PROFILES {
+        for setting in PROFILE_SETTINGS {
+            names.push(format!("CARGO_PROFILE_{profile}_{setting}"));
+        }
+    }
+    names.extend(c_build_watch(target, host));
+    let mut set: Vec<String> = vars
+        .into_iter()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .filter(|k| is_cargo_flag_var(k) || is_c_build_var(k))
+        .collect();
+    set.sort_unstable();
+    names.extend(set);
+    let mut unique = Vec::new();
+    for name in names {
+        if !unique.contains(&name) {
+            unique.push(name);
+        }
+    }
+    unique
 }
 
 /// The C and proto build variables to watch with `rerun-if-env-changed` for `target` and
@@ -220,8 +314,10 @@ pub fn bash(repo: &Path, script: &str, env: &[(OsString, OsString)]) -> Result<S
     )
 }
 
-/// Why the build is not clean because of its variables ([`BUILD_FLAG_VARS`], then the C and
-/// proto build variables of [`is_c_build_var`] by name), or `None`. Only the names are given: a
+/// Why the build is not clean because of its variables ([`BUILD_FLAG_VARS`], then
+/// [`INCREMENTAL_VAR`] with the value `1`, then the cargo profile and unstable variables of
+/// [`is_cargo_flag_var`] and the C and proto build variables of [`is_c_build_var`], each group
+/// by name), or `None`. Only the names are given (and the value `1` of [`INCREMENTAL_VAR`]): a
 /// flag can hold a path or a secret.
 pub fn build_flags_unclean(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Option<String> {
     let vars: Vec<(OsString, OsString)> = vars.into_iter().collect();
@@ -230,15 +326,21 @@ pub fn build_flags_unclean(vars: impl IntoIterator<Item = (OsString, OsString)>)
         .copied()
         .filter(|name| vars.iter().any(|(k, v)| k == name && !v.is_empty()))
         .collect();
-    let mut c_build: Vec<&str> = vars
-        .iter()
-        .filter(|(_, v)| !v.is_empty())
-        .filter_map(|(k, _)| k.to_str())
-        .filter(|k| is_c_build_var(k))
-        .collect();
-    c_build.sort_unstable();
-    c_build.dedup();
-    set.extend(c_build);
+    let incremental = format!("{INCREMENTAL_VAR}=1");
+    if vars.iter().any(|(k, v)| k == INCREMENTAL_VAR && v == "1") {
+        set.push(&incremental);
+    }
+    for is_group in [is_cargo_flag_var, is_c_build_var] {
+        let mut group: Vec<&str> = vars
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .filter_map(|(k, _)| k.to_str())
+            .filter(|k| is_group(k))
+            .collect();
+        group.sort_unstable();
+        group.dedup();
+        set.extend(group);
+    }
     (!set.is_empty()).then(|| format!("{FLAGS_REASON}{} set", set.join(", ")))
 }
 
@@ -285,19 +387,25 @@ pub fn rustc_version(rustc: &std::ffi::OsStr, dir: &Path) -> Result<String, Stri
 }
 
 /// Why the compiler at `rustc` makes the build unclean, or `None`: it must be, by its canonical
-/// path, the `rustc` of the rustup toolchain of the pinned channel,
-/// `<rustup_home>/toolchains/<channel>-<host>/bin/rustc`. A bare name is looked up on `path`.
-/// Otherwise a wrapper that prints the real `-vV` would pass [`compiler_state`].
+/// path, the `rustc` of the rustup toolchain of the pinned channel for the build host,
+/// exactly `<rustup_home>/toolchains/<channel>-<host>/bin/rustc`. A bare name is looked up on
+/// `path`. Otherwise a wrapper that prints the real `-vV` would pass [`compiler_state`], and
+/// another directory that starts with the channel (`1.99.0-mine`) could hold any compiler.
 pub fn rustc_location(
     rustc: &std::ffi::OsStr,
     path: Option<&std::ffi::OsStr>,
     rustup_home: &Path,
+    host: &str,
     toolchain: &str,
 ) -> Option<String> {
     let reason = |why: String| Some(format!("{COMPILER_REASON}{why}"));
     let Some(channel) = pinned_channel(toolchain) else {
         return reason("rust-toolchain.toml pins no channel".to_owned());
     };
+    if host.is_empty() {
+        return reason("the host triple (HOST) is not set".to_owned());
+    }
+    let pinned_dir = format!("{channel}-{host}");
     let given = Path::new(rustc);
     let found = if given.components().count() > 1 {
         Some(given.to_path_buf())
@@ -316,16 +424,13 @@ pub fn rustc_location(
     let toolchain_dir = bin.and_then(Path::parent);
     let pinned = canonical.file_name() == Some("rustc".as_ref())
         && bin.and_then(Path::file_name) == Some("bin".as_ref())
-        && toolchain_dir
-            .and_then(Path::file_name)
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(&format!("{channel}-")))
+        && toolchain_dir.and_then(Path::file_name) == Some(pinned_dir.as_ref())
         && toolchain_dir.and_then(Path::parent) == toolchains.canonicalize().ok().as_deref();
     if pinned {
         None
     } else {
         reason(format!(
-            "{} is not the rustc of the rustup toolchain {channel}-* in {}",
+            "{} is not the rustc of the rustup toolchain {pinned_dir} in {}",
             canonical.display(),
             toolchains.display()
         ))
@@ -1028,9 +1133,124 @@ mod tests {
         }
     }
 
+    /// A profile setting or an unstable flag of cargo in the environment changes the release
+    /// binary (an opt-level, overflow checks, `panic = "abort"`), so it makes the build
+    /// unclean. Only the names are given, sorted, after the rustflags and before the C build.
+    #[test]
+    fn cargo_profile_and_unstable_variables_make_the_build_unclean() {
+        let opt = os(&[("CARGO_PROFILE_RELEASE_OPT_LEVEL", "0")]);
+        assert_eq!(
+            build_flags_unclean(opt).as_deref(),
+            Some("built with CARGO_PROFILE_RELEASE_OPT_LEVEL set")
+        );
+        let vars = os(&[
+            ("CC", "clang"),
+            ("CARGO_UNSTABLE_BUILD_STD", "std"),
+            ("CARGO_PROFILE_RELEASE_PANIC", "abort"),
+            ("CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS", "false"),
+            ("RUSTFLAGS", "-g"),
+            ("CARGO_PROFILE_DEV_DEBUG", ""),
+            ("CARGO_PROFILE_", "x"),
+            ("CARGO_PKG_NAME", "cl-p2p"),
+            ("CARGO_MANIFEST_DIR", "/r/crates/cl-p2p"),
+        ]);
+        assert_eq!(
+            build_flags_unclean(vars).as_deref(),
+            Some(
+                "built with RUSTFLAGS, CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS, \
+                 CARGO_PROFILE_RELEASE_PANIC, CARGO_UNSTABLE_BUILD_STD, CC set"
+            )
+        );
+        for name in ["CARGO_PROFILE_RELEASE_LTO", "CARGO_UNSTABLE_X"] {
+            assert!(is_cargo_flag_var(name), "{name}");
+        }
+        for name in [
+            "CARGO_PROFILE_",
+            "CARGO_UNSTABLE_",
+            "CARGO_PROFILE",
+            "CARGO_PKG_NAME",
+        ] {
+            assert!(!is_cargo_flag_var(name), "{name}");
+        }
+    }
+
+    /// `RUSTC_BOOTSTRAP` turns on the unstable features of a stable toolchain (`-Z`,
+    /// `CARGO_UNSTABLE_*`, and a cfg in the build script of `anyhow`), and `CARGO_INCREMENTAL=1`
+    /// changes the code generation of the release build. Each makes the build unclean.
+    /// `CARGO_INCREMENTAL=0` turns incremental compilation off, as the release profile does, so
+    /// it does not.
+    #[test]
+    fn rustc_bootstrap_and_incremental_compilation_make_the_build_unclean() {
+        let bootstrap = os(&[("RUSTC_BOOTSTRAP", "1")]);
+        assert_eq!(
+            build_flags_unclean(bootstrap).as_deref(),
+            Some("built with RUSTC_BOOTSTRAP set")
+        );
+        let incremental = os(&[("CARGO_INCREMENTAL", "1")]);
+        assert_eq!(
+            build_flags_unclean(incremental).as_deref(),
+            Some("built with CARGO_INCREMENTAL=1 set")
+        );
+        for value in ["0", ""] {
+            let off = os(&[("CARGO_INCREMENTAL", value), ("CARGO_BUILD_JOBS", "4")]);
+            assert_eq!(build_flags_unclean(off), None, "CARGO_INCREMENTAL={value}");
+        }
+        let all = os(&[
+            ("CARGO_UNSTABLE_BUILD_STD", "std"),
+            ("CARGO_INCREMENTAL", "1"),
+            ("RUSTC_BOOTSTRAP", "1"),
+            ("RUSTFLAGS", "-g"),
+        ]);
+        assert_eq!(
+            build_flags_unclean(all).as_deref(),
+            Some(
+                "built with RUSTFLAGS, RUSTC_BOOTSTRAP, CARGO_INCREMENTAL=1, \
+                 CARGO_UNSTABLE_BUILD_STD set"
+            )
+        );
+    }
+
+    /// `build.rs` reruns when a variable that makes the build unclean changes: each fixed name,
+    /// the profile settings of the release and dev profiles, the cargo config keys of the
+    /// rustc wrappers, and each prefixed variable that is set now. A prefixed variable that is
+    /// set only after a clean build is not watched: step 10.2 of the runbook refuses it before
+    /// the build.
+    #[test]
+    fn the_build_script_watches_every_variable_that_makes_the_build_unclean() {
+        let set = os(&[
+            ("CARGO_UNSTABLE_BUILD_STD", "std"),
+            ("CC_wasm32-unknown-unknown", "clang"),
+            ("CARGO_PKG_NAME", "cl-p2p"),
+        ]);
+        let watched = env_watch("x86_64-unknown-linux-gnu", "aarch64-apple-darwin", set);
+        for name in BUILD_FLAG_VARS.iter().chain(&COMPILER_VARS).chain(&[
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+            "RUSTC_BOOTSTRAP",
+            "CARGO_INCREMENTAL",
+            "CARGO_PROFILE_RELEASE_OPT_LEVEL",
+            "CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS",
+            "CARGO_PROFILE_RELEASE_PANIC",
+            "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS",
+            "CARGO_UNSTABLE_BUILD_STD",
+            "CC_x86_64_unknown_linux_gnu",
+            "CC_wasm32-unknown-unknown",
+            "PROTOC",
+        ]) {
+            assert!(watched.iter().any(|w| w == name), "{name}: {watched:?}");
+        }
+        assert!(!watched.iter().any(|w| w == "CARGO_PKG_NAME"));
+        let mut unique = watched.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), watched.len(), "each name once: {watched:?}");
+    }
+
     /// The compiler must be the `rustc` of the pinned rustup toolchain, by its canonical path:
     /// a `RUSTC` or `CARGO_BUILD_RUSTC` elsewhere (a wrapper that prints the real `-vV`, say)
-    /// makes the build unclean. A symlink to the toolchain's own rustc is that rustc.
+    /// makes the build unclean. A symlink to the toolchain's own rustc is that rustc. The
+    /// toolchain directory must be exactly `<channel>-<host>`: another directory that starts
+    /// with the channel (`1.99.0-x`, or the toolchain of another host) is not the pin.
     #[test]
     fn the_compiler_must_be_the_rustc_of_the_pinned_toolchain() {
         let dir = tempfile::tempdir().unwrap();
@@ -1041,40 +1261,52 @@ mod tests {
             std::fs::write(p, "").unwrap();
             p.to_path_buf()
         };
+        let host = "aarch64-apple-darwin";
         let good = file(&home.join("toolchains/1.99.0-aarch64-apple-darwin/bin/rustc"));
         let old = file(&home.join("toolchains/1.98.0-aarch64-apple-darwin/bin/rustc"));
+        let suffixed = file(&home.join("toolchains/1.99.0-aarch64-apple-darwin-x/bin/rustc"));
+        let custom = file(&home.join("toolchains/1.99.0-mine/bin/rustc"));
+        let other_host = file(&home.join("toolchains/1.99.0-x86_64-apple-darwin/bin/rustc"));
         let other = file(&root.join("wrapper/rustc"));
         let pin = "[toolchain]\nchannel = \"1.99.0\"\n";
         let path = |dirs: &[&Path]| std::env::join_paths(dirs).unwrap();
-        assert_eq!(rustc_location(good.as_os_str(), None, &home, pin), None);
+        assert_eq!(
+            rustc_location(good.as_os_str(), None, &home, host, pin),
+            None
+        );
         let links = root.join("links");
         std::fs::create_dir_all(&links).unwrap();
         std::os::unix::fs::symlink(&good, links.join("rustc")).unwrap();
         assert_eq!(
-            rustc_location(links.join("rustc").as_os_str(), None, &home, pin),
+            rustc_location(links.join("rustc").as_os_str(), None, &home, host, pin),
             None,
             "a symlink to the toolchain's rustc"
         );
         let bare = path(&[&root.join("empty"), &links]);
         assert_eq!(
-            rustc_location("rustc".as_ref(), Some(&bare), &home, pin),
+            rustc_location("rustc".as_ref(), Some(&bare), &home, host, pin),
             None,
             "a bare name is found on PATH"
         );
-        for bad in [&old, &other] {
-            let why = rustc_location(bad.as_os_str(), None, &home, pin).unwrap();
+        for bad in [&old, &suffixed, &custom, &other_host, &other] {
+            let why = rustc_location(bad.as_os_str(), None, &home, host, pin).unwrap();
             assert!(
                 why.starts_with(COMPILER_REASON)
-                    && why.contains("is not the rustc of the rustup toolchain 1.99.0-*"),
+                    && why.contains(
+                        "is not the rustc of the rustup toolchain 1.99.0-aarch64-apple-darwin"
+                    ),
                 "{why}"
             );
         }
         let wrappers = path(&[other.parent().unwrap()]);
-        assert!(rustc_location("rustc".as_ref(), Some(&wrappers), &home, pin).is_some());
-        let why = rustc_location(root.join("none/rustc").as_os_str(), None, &home, pin).unwrap();
+        assert!(rustc_location("rustc".as_ref(), Some(&wrappers), &home, host, pin).is_some());
+        let none = root.join("none/rustc");
+        let why = rustc_location(none.as_os_str(), None, &home, host, pin).unwrap();
         assert!(why.starts_with("compiler: cannot find"), "{why}");
-        let why = rustc_location(good.as_os_str(), None, &home, "[toolchain]\n").unwrap();
+        let why = rustc_location(good.as_os_str(), None, &home, host, "[toolchain]\n").unwrap();
         assert_eq!(why, "compiler: rust-toolchain.toml pins no channel");
+        let why = rustc_location(good.as_os_str(), None, &home, "", pin).unwrap();
+        assert_eq!(why, "compiler: the host triple (HOST) is not set");
     }
 
     /// The official commit of the pinned release is in [`PINNED_RUSTC`], for the release that

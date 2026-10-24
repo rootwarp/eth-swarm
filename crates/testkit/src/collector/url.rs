@@ -4,7 +4,7 @@
 //! collector has no TLS stack, and plaintext over any other path could be forged or read by
 //! anyone on it, so a remote node is reached through an SSH tunnel to a local port that listens
 //! on loopback only, and ssh exits if another process holds the port
-//! (`ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:5052:127.0.0.1:5052 ref-host`). No
+//! (`ssh -f -N -o ExitOnForwardFailure=yes -L 127.0.0.1:5052:127.0.0.1:5052 ref-host`). No
 //! credentials, query or fragment. The base path may carry a key, so errors never quote the
 //! URL and `Debug` shows `scheme://host:port` only.
 //! Hosts are never resolved: `localhost` is `127.0.0.1` then `::1`.

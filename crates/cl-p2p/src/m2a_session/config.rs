@@ -24,7 +24,7 @@
 //!   fragment. The API's answers decide the verdicts, and plaintext over any other path could be
 //!   forged by anyone on it, so a remote node is reached through an SSH tunnel to a local port
 //!   that listens on loopback only, and ssh exits if another process holds the port
-//!   (`ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:5052:127.0.0.1:5052 ref-host`). This is
+//!   (`ssh -f -N -o ExitOnForwardFailure=yes -L 127.0.0.1:5052:127.0.0.1:5052 ref-host`). This is
 //!   the only place the rule lives: a [`ReferenceApiUrl`] exists only once it passed. The URL
 //!   may still carry a key in its path, so errors never quote it and `Debug` shows
 //!   `scheme://host:port` only.

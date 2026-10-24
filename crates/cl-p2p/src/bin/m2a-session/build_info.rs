@@ -1,16 +1,20 @@
 //! The commit the binary was built from, and whether its build was clean.
 //!
 //! `build.rs` records both when it builds the crate, because a deployed binary has no checkout
-//! to look at. The commit is git's `HEAD`. The build is clean only if three conditions are true:
+//! to look at. The commit is git's `HEAD`. The build is clean only if four conditions are true:
 //!
 //! - No build path (`BUILD_PATHS` in `build_support.rs`: the workspace manifests, the toolchain
 //!   pin, `.cargo`, `proto` and the crates that the binaries compile) has an uncommitted change,
 //!   an untracked or ignored file, or git's assume-unchanged or skip-worktree flag. `build.rs`
 //!   reads the tree with `m2a_dirty_paths` of `fuzz/m2a-common.sh`, the same check that voids
 //!   the gate expectations for a dirty keyed path.
-//! - No rustflags variable, rustc wrapper or linker was set (`BUILD_FLAG_VARS`).
-//! - The compiler's release is the `channel` that `rust-toolchain.toml` pins. The compiler's
-//!   commit hash (`rustc -vV`) is recorded too.
+//! - No rustflags variable, rustc wrapper, linker or `RUSTC_BOOTSTRAP` was set
+//!   (`BUILD_FLAG_VARS`).
+//! - No cargo profile or unstable variable (`CARGO_PROFILE_*`, `CARGO_UNSTABLE_*`) and no C or
+//!   proto build variable was set, and `CARGO_INCREMENTAL` was not `1`.
+//! - The compiler's release is the `channel` that `rust-toolchain.toml` pins, with its
+//!   official commit, and the compiler is the `rustc` of the rustup toolchain
+//!   `<channel>-<host>`. The compiler's commit hash (`rustc -vV`) is recorded too.
 //!
 //! A test of the library (`build_support::tests::the_embedded_build_state_is_the_trees`) holds
 //! the embedded values to the state of the tree.
