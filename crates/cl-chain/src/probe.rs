@@ -1901,9 +1901,16 @@ mod tests {
         );
         assert_eq!(reader.contiguous_from().unwrap(), None);
         // A parent the reference does not know: a gap at once. Once the store is past 22 by
-        // the pending wait, 22 is settled as a gap too.
+        // the pending wait, 22 is settled as a gap too. The writer settles pending links after
+        // it writes the column, so wait for that settle as well.
         let lost = serve(30, &b.commitments, [0x5e; 32]);
         s.store(&column_at(lost, 30, CUSTODY_COLUMN)).await;
+        assert!(
+            tokio::time::timeout(SETTLE, s.ingest.settled())
+                .await
+                .expect("the writer settles within SETTLE"),
+            "the writer is gone"
+        );
         assert_eq!(reader.link_of(&lost).unwrap(), Some(BlockLink::Gap));
         assert_eq!(reader.link_of(&b22).unwrap(), Some(BlockLink::Gap));
         assert_eq!(reader.contiguous_from().unwrap(), Some(30));

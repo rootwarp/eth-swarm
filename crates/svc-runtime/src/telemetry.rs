@@ -1859,8 +1859,70 @@ mod tests {
         stop.send(()).unwrap();
         server.await.unwrap();
         assert!(
-            tokio::net::TcpStream::connect(addr).await.is_err(),
-            "closed"
+            refused_within(addr, Duration::from_secs(10)).await,
+            "closed: the listener still accepts after the shutdown"
         );
+    }
+
+    /// Connects to `addr` until a connect is refused, for at most `limit`; `false` if no
+    /// connect in that time was refused.
+    ///
+    /// One connect that succeeds does not show that our listener is still open. A port that is
+    /// free again can also accept a connect when the OS picks `addr` as the source port of the
+    /// connect (a connect to itself), or when a child process of another test got the
+    /// descriptor of the listener before it was close-on-exec. These cases end soon. A
+    /// listener that stays open refuses no connect in all of `limit`.
+    ///
+    /// Only `ConnectionRefused` counts. A listener that is open but does not accept resets a
+    /// connect when its accept queue is full (macOS), or drops its SYN (Linux). Each connect
+    /// has at most [`CONNECT_LIMIT`], so a dropped SYN does not hold the loop past `limit`.
+    async fn refused_within(addr: SocketAddr, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let connect = tokio::net::TcpStream::connect(addr);
+            if let Ok(Err(e)) = tokio::time::timeout(left.min(CONNECT_LIMIT), connect).await {
+                if e.kind() == io::ErrorKind::ConnectionRefused {
+                    return true;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The longest one connect of [`refused_within`] waits.
+    const CONNECT_LIMIT: Duration = Duration::from_secs(1);
+
+    /// A listener that stays open but does not accept is not refused, also after its accept
+    /// queue is full and the OS resets or drops each new connect.
+    #[tokio::test]
+    async fn a_listener_that_does_not_accept_is_not_refused() {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket
+            .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .unwrap();
+        let listener = socket.listen(1).unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Fill the accept queue: the connects past it are reset or time out.
+        let mut held = Vec::new();
+        let mut full = false;
+        for _ in 0..8 {
+            let connect = tokio::net::TcpStream::connect(addr);
+            match tokio::time::timeout(Duration::from_millis(200), connect).await {
+                Ok(Ok(stream)) => held.push(stream),
+                Ok(Err(e)) => {
+                    assert_ne!(e.kind(), io::ErrorKind::ConnectionRefused, "{e}");
+                    full = true;
+                }
+                Err(_) => full = true,
+            }
+        }
+        assert!(full, "the accept queue holds {} connects", held.len());
+        assert!(!refused_within(addr, Duration::from_millis(1500)).await);
+        drop(listener);
+        assert!(refused_within(addr, Duration::from_secs(10)).await);
     }
 }

@@ -525,13 +525,26 @@ mod tests {
             .all(|r| r.count <= 128 && r.step == 1 && r.start_slot >= 24));
     }
 
+    /// The remote of [`identify_listener`]: identify, and a gossipsub that subscribes to
+    /// nothing, as a CL speaks it.
+    #[derive(libp2p::swarm::NetworkBehaviour)]
+    struct IdentifyListener {
+        identify: libp2p::identify::Behaviour,
+        gossipsub: libp2p::gossipsub::Behaviour,
+    }
+
     /// A remote that hears identify from whoever dials it, at its address.
+    ///
+    /// It speaks gossipsub too. The gossipsub of the dialer opens its stream at once, and on a
+    /// remote without gossipsub that stream fails: the dialer then takes `/meshsub/1.*` off the
+    /// protocols of the connection. If that failure comes before the identify answer, the
+    /// answer lists no `/meshsub/1.*`, so the remote must accept the stream.
     async fn identify_listener() -> (
         PinnedPeer,
         futures::channel::oneshot::Receiver<libp2p::identify::Info>,
     ) {
         use libp2p::swarm::SwarmEvent;
-        use libp2p::{identify, noise, tcp, yamux, SwarmBuilder};
+        use libp2p::{gossipsub, identify, noise, tcp, yamux, SwarmBuilder};
         let key = libp2p::identity::Keypair::generate_secp256k1();
         let mut swarm = SwarmBuilder::with_existing_identity(key)
             .with_tokio()
@@ -542,10 +555,21 @@ mod tests {
             )
             .unwrap()
             .with_behaviour(|key| {
-                identify::Behaviour::new(identify::Config::new(
-                    cl_p2p::behaviour::IDENTIFY_PROTOCOL_VERSION.to_owned(),
-                    key.public(),
-                ))
+                let config = gossipsub::ConfigBuilder::default()
+                    .validation_mode(gossipsub::ValidationMode::Anonymous)
+                    .build()
+                    .unwrap();
+                IdentifyListener {
+                    identify: identify::Behaviour::new(identify::Config::new(
+                        cl_p2p::behaviour::IDENTIFY_PROTOCOL_VERSION.to_owned(),
+                        key.public(),
+                    )),
+                    gossipsub: gossipsub::Behaviour::new(
+                        gossipsub::MessageAuthenticity::Anonymous,
+                        config,
+                    )
+                    .unwrap(),
+                }
             })
             .unwrap()
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
@@ -563,8 +587,9 @@ mod tests {
         tokio::spawn(async move {
             let mut tx = Some(tx);
             loop {
-                if let SwarmEvent::Behaviour(identify::Event::Received { info, .. }) =
-                    swarm.select_next_some().await
+                if let SwarmEvent::Behaviour(IdentifyListenerEvent::Identify(
+                    identify::Event::Received { info, .. },
+                )) = swarm.select_next_some().await
                 {
                     if let Some(tx) = tx.take() {
                         let _ = tx.send(info);
