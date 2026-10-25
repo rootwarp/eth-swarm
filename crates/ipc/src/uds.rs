@@ -1098,6 +1098,64 @@ pub async fn connect_path(
         .await
 }
 
+/// The pause between two connection attempts of [`connect_path_waiting`].
+pub const CONNECT_RETRY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// [`connect_path`], tried again every [`CONNECT_RETRY`] while the socket is not there yet or
+/// nobody listens on it yet ([`is_not_ready`]), until `wait` is over. `waiting` is called once,
+/// at the first retry, so the caller can log the wait. Any other error (a server of another
+/// user included) is returned at once.
+///
+/// # Errors
+///
+/// The last connection error.
+pub async fn connect_path_waiting(
+    path: &Path,
+    expected_uid: u32,
+    wait: std::time::Duration,
+    waiting: impl FnOnce(),
+) -> Result<Channel, tonic::transport::Error> {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut waiting = Some(waiting);
+    loop {
+        match connect_path(path, expected_uid).await {
+            Ok(channel) => return Ok(channel),
+            Err(e)
+                if is_not_ready(&e) && tokio::time::Instant::now() + CONNECT_RETRY <= deadline =>
+            {
+                if let Some(tell) = waiting.take() {
+                    tell();
+                }
+                tokio::time::sleep(CONNECT_RETRY).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Whether `err` is a socket that is not there yet (`NotFound`) or that nobody listens on yet
+/// (`ConnectionRefused`), anywhere in its source chain. A peer check that failed
+/// ([`peer_refusal`]) is never "not ready", whatever I/O error it carries.
+#[must_use]
+pub fn is_not_ready(err: &(dyn std::error::Error + 'static)) -> bool {
+    if peer_refusal(err).is_some() {
+        return false;
+    }
+    let mut next = Some(err);
+    while let Some(e) = next {
+        if let Some(io) = e.downcast_ref::<io::Error>() {
+            if matches!(
+                io.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) {
+                return true;
+            }
+        }
+        next = e.source();
+    }
+    false
+}
+
 /// The peer check that refused a connection, anywhere in `err`'s source chain.
 #[must_use]
 pub fn peer_refusal<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a PeerCredError> {
@@ -1370,5 +1428,39 @@ mod tests {
         ));
         let plain = io::Error::from(io::ErrorKind::NotFound);
         assert!(peer_refusal(&plain).is_none());
+    }
+
+    /// The wait for a socket that is not there yet ends when it accepts; a socket that never
+    /// comes ends the wait at its bound with a "not ready" error, and the wait is told once.
+    #[tokio::test]
+    async fn a_socket_is_waited_for_within_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc.sock");
+        let uid = Ownership::current().uid;
+        let told = std::sync::atomic::AtomicUsize::new(0);
+        let err = connect_path_waiting(&path, uid, std::time::Duration::from_millis(500), || {
+            told.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await
+        .unwrap_err();
+        assert!(is_not_ready(&err), "{err:?}");
+        assert_eq!(told.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let later = path.clone();
+        let bind = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let listener = tokio::net::UnixListener::bind(&later).unwrap();
+            let routes = tonic::service::Routes::default();
+            tonic::transport::Server::builder()
+                .add_routes(routes)
+                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener))
+                .await
+        });
+        assert!(
+            connect_path_waiting(&path, uid, std::time::Duration::from_secs(10), || {})
+                .await
+                .is_ok()
+        );
+        bind.abort();
+        assert!(!is_not_ready(&std::io::Error::other("other")));
     }
 }

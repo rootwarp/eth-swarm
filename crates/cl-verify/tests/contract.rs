@@ -45,7 +45,7 @@ fn my_cred() -> UCred {
 /// nothing is restored or saved there.
 fn server_config(link: &Link, snapshot_dir: &tempfile::TempDir) -> ServerConfig {
     ServerConfig {
-        handshake: Handshake::new(link.local().clone(), link.floor()),
+        handshake: Handshake::new(link.local(), link.floor()),
         peer_uid: my_cred().uid(),
         // Not loaded: the server gets the backends below.
         trusted_setup: TrustedSetupConfig {

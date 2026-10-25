@@ -2,7 +2,7 @@
 //!
 //! Integers are plain `u64` so that containers encode and hash exactly like the spec's `Uint64`.
 
-pub use alloy_primitives::{Address, B256, U256};
+pub use alloy_primitives::{keccak256, Address, B256, U256};
 pub use network_config::{Epoch, ForkName, Version, FAR_FUTURE_EPOCH};
 
 /// `Slot`.

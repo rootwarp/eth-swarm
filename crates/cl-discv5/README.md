@@ -1,8 +1,10 @@
 # cl-discv5
 
 discv5 0.12.0 peer discovery with the `eth2`/`cgc`/`nfd` local record (`src/enr.rs`), and the
-`ethswarm.discv5.v1` service stub (contract layer only, every RPC answers `UNIMPLEMENTED`).
-`src/service.rs` is the discovery itself; its module docs are the detailed reference.
+`ethswarm.discv5.v1` service. `src/service.rs` is the discovery itself; its module docs are the
+detailed reference. `src/server.rs` serves `WatchPeers` and `GetLocalEnr` to cl-p2p (the other
+RPCs are still stubs), and `src/process.rs` is the `cl-discv5` process that
+`ops/probe/ethswarm-discv5.service` runs.
 
 ## Routing-table rules
 
@@ -53,9 +55,8 @@ before the count.
   that a concurrent call for the same node set.
 - **Metric.** `discv5_table_evictions_total{reason="ip_rule"|"fork_digest"}`, one per record
   removed, on the registry passed to `EvictionMetrics::register` (`Discovery::with_metrics`).
-  It is not exported yet. The binary (`src/main.rs`) is still a stub that exits before it
-  builds a `Discovery`, so nothing in production registers the counter. Whatever builds the
-  service must call `with_metrics` with its registry.
+  The binary registers it on the service's registry without a prefix, so `/metrics` shows it
+  under this name (`process::serve`).
 
 Devnet mode is unchanged: loopback and private records stay; only the fork rule and the
 never-contactable addresses evict.

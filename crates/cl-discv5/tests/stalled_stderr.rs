@@ -140,7 +140,11 @@ fn loads_its_node_key_and_exits_with_a_full_stderr() {
     std::fs::write(&path, [0x42; 32]).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
     let mut child = Stalled::spawn(cl_discv5(Some(dir.path())));
-    assert_eq!(child.exit_code(), Some(2), "loaded, not runnable yet");
+    assert_eq!(
+        child.exit_code(),
+        Some(2),
+        "loaded, then the config is refused"
+    );
 }
 
 #[test]

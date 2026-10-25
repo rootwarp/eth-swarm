@@ -17,9 +17,12 @@ use p2p_wire::gossip::{GossipKind, GossipTopic};
 use p2p_wire::rpc::messages::ForkDigest;
 use std::collections::BTreeSet;
 
-/// Fork digests one body may name: the current one and, ahead of a fork or BPO boundary, the
-/// next. The topic bound ([`crate::gossip::config::MAX_TOPICS`]) is two digests' worth.
-pub const MAX_FORK_DIGESTS: usize = 2;
+/// Fork digests one body may name: the current one and each digest whose change comes within
+/// cl-chain's lead (2 epochs), so two changes one epoch apart make three. The custody topics of
+/// three digests (and the whitelist of their 3 × 128 column subnets) stay within the topic
+/// bound ([`crate::gossip::config::MAX_TOPICS`]); the topic list goes under the first two only
+/// ([`crate::gossip::TopicList::topics`]).
+pub const MAX_FORK_DIGESTS: usize = 3;
 
 /// Why a `WatchSubscriptions` body was refused: it breaks the contract, nothing is subscribed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -93,6 +96,12 @@ impl CustodySubscriptions {
     /// The custody columns, in increasing order.
     pub fn columns(&self) -> impl Iterator<Item = u64> + '_ {
         self.columns.iter().copied()
+    }
+
+    /// The fork digests to join the subnets under: the current one, and the next one ahead of
+    /// its change.
+    pub fn fork_digests(&self) -> &[ForkDigest] {
+        &self.fork_digests
     }
 
     /// The column subnets of the custody columns.
@@ -271,6 +280,14 @@ mod tests {
         assert_eq!(subs.topics().len(), 4);
         let empty = CustodySubscriptions::from_chain(&body(vec![], vec![])).unwrap();
         assert!(empty.topics().is_empty());
+        // The current digest and two changes within cl-chain's lead: three digests.
+        let three = CustodySubscriptions::from_chain(&body(
+            vec![3],
+            vec![vec![1; 4], vec![2; 4], vec![3; 4]],
+        ))
+        .unwrap();
+        assert_eq!(three.fork_digests().len(), 3);
+        assert_eq!(three.topics().len(), 3);
     }
 
     #[test]
@@ -284,8 +301,11 @@ mod tests {
             (body(vec![128], d()), CustodyError::ColumnOutOfRange(128)),
             (body(vec![5, 5], d()), CustodyError::DuplicateColumn(5)),
             (
-                body(vec![1], vec![vec![1; 4], vec![2; 4], vec![3; 4]]),
-                CustodyError::TooManyForkDigests(3),
+                body(
+                    vec![1],
+                    vec![vec![1; 4], vec![2; 4], vec![3; 4], vec![4; 4]],
+                ),
+                CustodyError::TooManyForkDigests(4),
             ),
             (
                 body(vec![1], vec![vec![1; 5]]),
@@ -298,6 +318,37 @@ mod tests {
         ] {
             assert_eq!(CustodySubscriptions::from_chain(&b), Err(want));
         }
+    }
+
+    /// A retired fork digest leaves gossipsub, the subscribed set and the whitelist, its
+    /// whitelisted column subnets too; the other digests stay, and the freed room takes the
+    /// topics of a new digest.
+    #[test]
+    fn a_retired_digest_leaves_gossip() {
+        let mut gossip = gossip();
+        let next: ForkDigest = [0x11; 4];
+        let subs = CustodySubscriptions::from_chain(&body(
+            CUSTODY_COLUMNS.to_vec(),
+            vec![DIGEST.to_vec(), next.to_vec()],
+        ))
+        .unwrap();
+        assert_eq!(subscribe(&mut gossip, &subs).unwrap(), 8);
+        let whitelisted = gossip.whitelist_len();
+        // beacon_block and every column subnet of the start digest, then the next digest's four.
+        assert_eq!(whitelisted, 1 + 128 + 4);
+        assert_eq!(gossip.retire_digest(DIGEST), 1 + 4);
+        let want: BTreeSet<(ForkDigest, u64)> =
+            CUSTODY_COLUMNS.iter().map(|&c| (next, c)).collect();
+        assert_eq!(subscribed_column_subnets(&gossip), want);
+        assert_eq!(gossip.gossipsub().topics().count(), 4);
+        assert_eq!(gossip.whitelist_len(), 4);
+        assert_eq!(gossip.subscribed_len(), 4);
+        assert_eq!(gossip.retire_digest(DIGEST), 0, "retired already");
+        // The freed room: 414 topics of new digests fit again.
+        let many: Vec<GossipTopic> = (0..(crate::gossip::config::MAX_TOPICS - 4) as u32)
+            .map(|i| GossipTopic::new((i + 7).to_be_bytes(), GossipKind::BeaconBlock))
+            .collect();
+        assert_eq!(gossip.subscribe(&many).unwrap(), many.len());
     }
 
     /// Past the topic bound nothing is subscribed, and the set stays as it was. The bound is

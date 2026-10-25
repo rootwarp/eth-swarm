@@ -490,7 +490,7 @@ where
     ) -> BoxFuture<Result<GuardReport, ContractError>> {
         let rpc = self.rpc;
         Box::pin(within(rpc, async move {
-            let hello = vec![Req::hello(link.local().clone())];
+            let hello = vec![Req::hello(link.local())];
             let mut grpc = ready(transport)
                 .await
                 .map_err(|s| ContractError::from_status(&s))?;
@@ -567,7 +567,7 @@ where
         let rpc = self.rpc;
         Box::pin(within(rpc, async move {
             let mut request = Req::default();
-            request.set_hello_field(Some(link.local().clone()));
+            request.set_hello_field(Some(link.local()));
             let mut grpc = ready(transport)
                 .await
                 .map_err(|s| ContractError::from_status(&s))?;

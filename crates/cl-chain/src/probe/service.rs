@@ -46,7 +46,6 @@ use consensus_types::{forked, EthSpec};
 use ethswarm_proto::chain as pb;
 use ethswarm_proto::verify::verify_service_client::VerifyServiceClient;
 use ipc::acl::{AclTables, MethodAcl};
-use ipc::envelope::DigestTable;
 use ipc::frame::OutFrame;
 use ipc::hello::{stream_hello, NetworkHello, NetworkHelloError, Preset};
 use ipc::stub::StubStream;
@@ -57,7 +56,7 @@ use pb::gossip_service_server::{GossipService, GossipServiceServer};
 use prometheus_client::registry::Registry;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::Routes;
@@ -93,9 +92,6 @@ pub const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
 /// started a moment before loads its trusted setup before it binds.
 pub const VERIFY_SOCKET_WAIT: Duration = Duration::from_secs(30);
 
-/// The pause between two connection attempts to cl-verify's socket.
-const VERIFY_SOCKET_RETRY: Duration = Duration::from_millis(200);
-
 /// How long a reference sample is reused for our Status \[est\]: every Status that goes out
 /// reads the store again, the reference API at most every 2 s.
 pub const STATUS_SAMPLE_REUSE: Duration = Duration::from_secs(2);
@@ -109,12 +105,7 @@ pub const API_VERSION: u32 = 1;
 pub const SUBSCRIBE_AHEAD: Epoch = 2;
 
 /// Unix milliseconds of the system clock.
-#[must_use]
-pub fn system_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis())
-}
+pub use ipc::hello::system_ms;
 
 /// The network the probe runs on: its config, its genesis and its network hello, which gives
 /// its preset.
@@ -224,30 +215,37 @@ impl ProbeNetwork {
     }
 }
 
-/// The chain.v1 link that both ends of cl-chain's socket hold: the network hello at `now_ms`
-/// and every digest of the schedule.
+/// The chain.v1 link that both ends of cl-chain's socket hold: the network hello and every
+/// digest of the schedule. Its hello follows the system clock ([`Link::network`]): each stream
+/// carries the digest of the wall-clock epoch, so a caller that starts after a fork or BPO
+/// digest change is accepted by a cl-chain that started before it. `now_ms` is the start, which
+/// must have a digest.
 ///
 /// # Errors
 ///
-/// The clock is before genesis or Fulu, or the schedule has no digest.
+/// `now_ms` is before genesis or Fulu, or the schedule makes no digest table.
 pub fn chain_link<E: EthSpec>(net: &ProbeNetwork, now_ms: u128) -> Result<Link, String> {
-    let hello = net
-        .hello()
+    net.hello()
         .at(now_ms)
         .map_err(|e| format!("our fork digest: {e}"))?;
-    let digests = DigestTable::new(
-        digest_schedule(net.config(), &net.genesis().genesis_validators_root)
-            .iter()
-            .map(|e| (e.epoch, e.fork, e.fork_digest))
-            .collect(),
-    )
-    .map_err(|e| format!("the digest schedule: {e}"))?;
-    Ok(Link::new::<E>(
-        hello,
-        API_VERSION,
-        *net.config().fork_schedule(),
-        digests,
-    ))
+    chain_link_on::<E>(net, Arc::new(system_ms))
+}
+
+/// [`chain_link`] whose hello follows `clock` (Unix milliseconds), with no check of the start.
+///
+/// # Errors
+///
+/// `E` is not the network's preset, or the schedule makes no digest table.
+pub fn chain_link_on<E: EthSpec>(net: &ProbeNetwork, clock: WallMs) -> Result<Link, String> {
+    if E::slots_per_epoch() != net.slots_per_epoch() {
+        return Err(format!(
+            "the preset has {} slots per epoch, the network {}",
+            E::slots_per_epoch(),
+            net.slots_per_epoch()
+        ));
+    }
+    Link::network_on(Arc::clone(net.hello()), API_VERSION, clock)
+        .map_err(|e| format!("the digest schedule: {e}"))
 }
 
 /// cl-chain's side of the verify.v1 link on `channel`: a KZG client that opens each stream
@@ -288,28 +286,79 @@ pub fn chain_acl(caller_uid: u32) -> Result<MethodAcl, String> {
 ///
 /// The directory is not closed, cannot be opened, or `socket` names no file in it.
 pub fn check_verify_socket_dir(socket: &Path, uid: u32) -> Result<(), String> {
+    verify_dir_state(socket, uid).map_err(|e| e.to_string())
+}
+
+/// What [`verify_dir_state`] found wrong with the directory of cl-verify's socket.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum VerifyDirError {
+    /// The directory, or one above it, is not there (a typed `NotFound`): after a reboot, or
+    /// after systemd removed cl-verify's runtime directory at its stop. A wait can fix it.
+    #[error("{0}")]
+    Missing(String),
+    /// The directory is there and closed to others, but owned by neither cl-verify's user nor
+    /// root: systemd makes it, then gives it to its user, so a wait can fix it.
+    #[error("{0}")]
+    Owner(String),
+    /// The directory, or one above it, is open to other users, or cannot be read: no wait fixes
+    /// it.
+    #[error("{0}")]
+    Refused(String),
+}
+
+/// [`check_verify_socket_dir`], with what it found wrong told apart ([`VerifyDirError`]).
+///
+/// # Errors
+///
+/// [`VerifyDirError`].
+pub fn verify_dir_state(socket: &Path, uid: u32) -> Result<(), VerifyDirError> {
     use std::os::unix::fs::MetadataExt;
     let shown = socket.display();
     let path = std::env::current_dir()
-        .map_err(|e| format!("verify socket {shown}: the working directory: {e}"))?
+        .map_err(|e| {
+            VerifyDirError::Refused(format!("verify socket {shown}: the working directory: {e}"))
+        })?
         .join(socket);
     let (Some(dir), Some(_)) = (path.parent(), path.file_name()) else {
-        return Err(format!("verify socket {shown} names no file"));
+        return Err(VerifyDirError::Refused(format!(
+            "verify socket {shown} names no file"
+        )));
     };
-    let fd =
-        ipc::uds::open_closed_dir(dir, uid).map_err(|e| format!("verify socket directory {e}"))?;
+    let fd = match ipc::uds::open_closed_dir(dir, uid) {
+        Ok(fd) => fd,
+        Err(e) => {
+            let shown = format!("verify socket directory {e}");
+            return Err(match &e {
+                ipc::uds::BindError::Io { source, .. }
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    VerifyDirError::Missing(shown)
+                }
+                // The directory itself, closed to others, of another user than cl-verify's.
+                ipc::uds::BindError::Insecure { path, .. }
+                    if path.as_path() == dir
+                        && std::fs::symlink_metadata(dir).is_ok_and(|m| {
+                            m.is_dir() && m.uid() != uid && m.uid() != 0 && m.mode() & 0o022 == 0
+                        }) =>
+                {
+                    VerifyDirError::Owner(shown)
+                }
+                _ => VerifyDirError::Refused(shown),
+            });
+        }
+    };
     // The directory itself, as the socket root ([`ipc::uds::bind`]): writable only by its
     // owner, sticky or not. In a sticky directory that others can write (`/tmp`), another
     // user could create the socket name first.
-    let meta = std::fs::File::from(fd)
-        .metadata()
-        .map_err(|e| format!("verify socket directory {}: {e}", dir.display()))?;
+    let meta = std::fs::File::from(fd).metadata().map_err(|e| {
+        VerifyDirError::Refused(format!("verify socket directory {}: {e}", dir.display()))
+    })?;
     let mode = meta.mode() & 0o7777;
     if mode & 0o022 != 0 {
-        return Err(format!(
+        return Err(VerifyDirError::Refused(format!(
             "verify socket directory {} must be writable only by its owner (mode {mode:o})",
             dir.display()
-        ));
+        )));
     }
     Ok(())
 }
@@ -327,53 +376,18 @@ pub async fn connect_verify(
     uid: u32,
     wait: Duration,
 ) -> Result<tonic::transport::Channel, tonic::transport::Error> {
-    let deadline = tokio::time::Instant::now() + wait;
-    let mut logged = false;
-    loop {
-        match ipc::uds::connect_path(path, uid).await {
-            Ok(channel) => return Ok(channel),
-            Err(e)
-                if is_not_ready(&e)
-                    && tokio::time::Instant::now() + VERIFY_SOCKET_RETRY <= deadline =>
-            {
-                if !logged {
-                    tracing::info!(
-                        socket = %path.display(),
-                        wait_ms = wait.as_millis() as u64,
-                        retry_ms = VERIFY_SOCKET_RETRY.as_millis() as u64,
-                        "cl-verify is not accepting yet; trying again until the wait is over"
-                    );
-                    logged = true;
-                }
-                tokio::time::sleep(VERIFY_SOCKET_RETRY).await;
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    ipc::uds::connect_path_waiting(path, uid, wait, || {
+        tracing::info!(
+            socket = %path.display(),
+            wait_ms = wait.as_millis() as u64,
+            retry_ms = ipc::uds::CONNECT_RETRY.as_millis() as u64,
+            "cl-verify is not accepting yet; trying again until the wait is over"
+        );
+    })
+    .await
 }
 
-/// Whether `err` is a socket that is not there yet (`NotFound`) or that nobody listens on yet
-/// (`ConnectionRefused`), anywhere in its source chain. A peer check that failed
-/// ([`ipc::uds::peer_refusal`]) is never "not ready", whatever I/O error it carries.
-#[must_use]
-pub fn is_not_ready(err: &(dyn std::error::Error + 'static)) -> bool {
-    if ipc::uds::peer_refusal(err).is_some() {
-        return false;
-    }
-    let mut next = Some(err);
-    while let Some(e) = next {
-        if let Some(io) = e.downcast_ref::<std::io::Error>() {
-            if matches!(
-                io.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) {
-                return true;
-            }
-        }
-        next = e.source();
-    }
-    false
-}
+pub use ipc::uds::is_not_ready;
 
 /// `err` and each error in its source chain, joined by `": "`. A tonic transport error alone
 /// shows only "transport error".
@@ -481,6 +495,20 @@ pub enum OpenError {
         /// The node ID given now.
         configured: String,
     },
+    /// The store holds a custody record but no node-ID marker (a store of an older build): its
+    /// columns follow a node ID that nobody recorded.
+    #[error(
+        "the column store {} has a custody record but no {NODE_ID_FILE} (a store of an older \
+         build): its custody columns follow a node ID that nobody recorded, so clear the store \
+         (remove the directory) to start with node ID {configured}",
+        dir.display()
+    )]
+    NodeIdUnknown {
+        /// The store's directory.
+        dir: PathBuf,
+        /// The node ID given now.
+        configured: String,
+    },
     /// Any other failure.
     #[error("{0}")]
     Failed(String),
@@ -504,9 +532,11 @@ fn node_id_text(node_id: U256) -> String {
 }
 
 /// Holds the store in `dir` to `node_id`: the first open writes it to [`NODE_ID_FILE`] (a
-/// temporary file, synced, then renamed, mode 0600); every later open reads it back (a regular
-/// file, the one looked at and not a symlink, at most 128 bytes) and refuses another node ID.
-fn claim_node_id(dir: &Path, node_id: U256) -> Result<(), OpenError> {
+/// temporary file, synced, renamed, then the directory synced; mode 0600); every later open
+/// reads it back (a regular file, the one looked at and not a symlink, at most 128 bytes) and
+/// refuses another node ID. A store with a custody record (`has_custody`) but no marker is of an
+/// older build and is refused too: nothing says whose custody it holds.
+fn claim_node_id(dir: &Path, node_id: U256, has_custody: bool) -> Result<(), OpenError> {
     use std::io::{Read as _, Write as _};
     use std::os::unix::fs::OpenOptionsExt as _;
     let path = dir.join(NODE_ID_FILE);
@@ -543,6 +573,12 @@ fn claim_node_id(dir: &Path, node_id: U256) -> Result<(), OpenError> {
             }
             Ok(())
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && has_custody => {
+            Err(OpenError::NodeIdUnknown {
+                dir: dir.to_owned(),
+                configured: want,
+            })
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let tmp = dir.join(format!("{NODE_ID_FILE}.tmp"));
             let _ = std::fs::remove_file(&tmp);
@@ -552,9 +588,11 @@ fn claim_node_id(dir: &Path, node_id: U256) -> Result<(), OpenError> {
                 .mode(0o600)
                 .open(&tmp)
                 .map_err(|e| failed(e.to_string()))?;
+            // The rename is durable only once the directory is synced too.
             file.write_all(format!("{want}\n").as_bytes())
                 .and_then(|()| file.sync_all())
                 .and_then(|()| std::fs::rename(&tmp, &path))
+                .and_then(|()| std::fs::File::open(dir)?.sync_all())
                 .map_err(|e| failed(e.to_string()))?;
             tracing::info!(node_id = %want, store = %dir.display(), "the column store is this node ID's");
             Ok(())
@@ -597,7 +635,12 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ProbeService<E, V> {
                 .map_err(|e| format!("column store {}: {e}", plan.columns_dir.display()))?,
         );
         // Under the writer's lock: no other start compares or writes it meanwhile.
-        claim_node_id(&plan.columns_dir, plan.node_id)?;
+        let has_custody = writer
+            .reader()
+            .custody()
+            .map_err(|e| format!("custody: {e}"))?
+            .is_some();
+        claim_node_id(&plan.columns_dir, plan.node_id, has_custody)?;
         let custody = Custody::open(
             Arc::clone(&writer),
             NoEnr,
@@ -885,8 +928,8 @@ impl Subscriptions {
     }
 }
 
-/// Unix milliseconds now.
-pub type WallMs = Arc<dyn Fn() -> u128 + Send + Sync>;
+/// Unix milliseconds now ([`ipc::hello::Clock`]).
+pub type WallMs = ipc::hello::Clock;
 
 /// `ethswarm.chain.v1.GossipService` with `WatchSubscriptions` served from [`Subscriptions`];
 /// the rest are stubs (contract checks, then `UNIMPLEMENTED`).
@@ -971,7 +1014,7 @@ impl GossipService for GossipServer {
         self.link
             .accept_hello_field(request.get_ref().hello.as_ref())
             .map_err(|e| e.to_status())?;
-        let (_, ours) = stream_hello(self.link.local()).map_err(|e| e.to_status())?;
+        let (_, ours) = stream_hello(&self.link.local()).map_err(|e| e.to_status())?;
         // Held by the stream's task until the stream ends.
         let place = Arc::clone(&self.watchers)
             .try_acquire_owned()

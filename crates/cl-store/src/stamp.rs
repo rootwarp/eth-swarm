@@ -260,7 +260,7 @@ where
     }
 
     fn with_hello<R: HelloField>(&self, mut request: R) -> R {
-        request.set_hello_field(Some(self.link.local().clone()));
+        request.set_hello_field(Some(self.link.local()));
         request
     }
 

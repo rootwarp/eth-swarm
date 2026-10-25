@@ -12,7 +12,8 @@
 //! - `max_message_size()` as the RPC cap, and the phase0 mesh and cache parameters.
 //! - A subscription filter ([`ProbeSubscriptionFilter`]): gossipsub keeps, for each peer, only
 //!   the subscriptions to whitelisted topics, from RPCs of bounded size.
-//! - Two [`TopicSet`]s, which only grow, all or nothing and never past [`MAX_TOPICS`]:
+//! - Two [`TopicSet`]s, which grow all or nothing and never past [`MAX_TOPICS`], and shrink
+//!   only by a whole fork digest ([`TopicSet::remove_digest`], when the probe retires it):
 //!   - the subscribed set, behind the transform: [`GossipConfig::topics`] at start, and the
 //!     topics subscribed later ([`super::IgnoreAll::subscribe`], e.g. the custody column
 //!     subnets), so a topic is decodable from the moment we subscribe it;
@@ -124,7 +125,8 @@ pub const SUBSCRIBED_TOPICS_HEADROOM: usize = 4;
 pub const MAX_TOPICS: usize = MAX_SUBSCRIPTIONS_PER_REQUEST;
 
 /// A set of topics read by the subscription filter (the whitelist) or the transform (the
-/// subscribed set); see the module docs. Clones share one set. It never shrinks.
+/// subscribed set); see the module docs. Clones share one set. It shrinks only by a whole fork
+/// digest.
 #[derive(Clone, Debug, Default)]
 pub struct TopicSet(Arc<RwLock<HashSet<TopicHash>>>);
 
@@ -156,6 +158,14 @@ impl TopicSet {
     /// Whether the set is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Removes every topic under `digest`; returns how many there were.
+    pub fn remove_digest(&self, digest: ForkDigest) -> usize {
+        let mut set = self.0.write().unwrap_or_else(PoisonError::into_inner);
+        let before = set.len();
+        set.retain(|t| digest_of(t) != Some(digest));
+        before - set.len()
     }
 
     /// Adds `topics`, all of them or none; returns how many were new.
@@ -333,6 +343,13 @@ impl GossipConfig {
     pub fn transform(&self, topics: &TopicSet) -> WireTransform {
         WireTransform::shared(SnappyTransform::new(self.caps.clone()), topics.clone())
     }
+}
+
+/// The fork digest of the topic `hash`, if it is an Ethereum topic.
+pub fn digest_of(hash: &TopicHash) -> Option<ForkDigest> {
+    GossipTopic::parse(hash.as_str())
+        .ok()
+        .map(|t| t.fork_digest)
 }
 
 /// The `TopicHash` of `topic`.
@@ -688,6 +705,41 @@ mod tests {
                 .is_err());
         }
         assert_eq!(t.inbound_transform(raw(BLOCK, data)).unwrap().data, ssz);
+    }
+
+    /// The topics of a fork digest leave the set together, and only they: the room they free
+    /// takes new topics again.
+    #[test]
+    fn a_digest_leaves_the_topic_set() {
+        let set = TopicSet::default();
+        let fill: Vec<TopicHash> = (0..MAX_TOPICS as u64)
+            .map(|i| {
+                topic_hash(&GossipTopic::new(
+                    [(i % 4) as u8; 4],
+                    GossipKind::DataColumnSidecar {
+                        subnet_id: i / 4 % 128,
+                    },
+                ))
+            })
+            .collect();
+        let fill: Vec<TopicHash> = fill
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        set.extend(&fill).unwrap();
+        let before = set.len();
+        let removed = set.remove_digest([1; 4]);
+        assert!(removed > 0);
+        assert_eq!(set.len(), before - removed);
+        assert!(fill
+            .iter()
+            .all(|t| set.contains(t) != t.as_str().starts_with("/eth2/01010101/")));
+        assert_eq!(set.remove_digest([1; 4]), 0, "gone already");
+        let again: Vec<TopicHash> = (0..removed as u64)
+            .map(|i| TopicHash::from_raw(format!("/eth2/{:08x}/beacon_block/ssz_snappy", i + 9)))
+            .collect();
+        assert_eq!(set.extend(&again).unwrap(), removed);
     }
 
     /// The topic set grows all or nothing, never past [`MAX_TOPICS`], and duplicates are free.

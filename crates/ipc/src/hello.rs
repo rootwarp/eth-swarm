@@ -17,6 +17,8 @@
 //! every service of one node that reads the same network sends the same hello.
 
 use std::num::NonZeroU64;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use consensus_types::{EthSpec, Mainnet, Minimal};
 use ethswarm_proto::common::{
@@ -232,6 +234,18 @@ impl NetworkHello {
         self.preset
     }
 
+    /// The network's config.
+    #[must_use]
+    pub fn config(&self) -> &ChainConfig {
+        &self.config
+    }
+
+    /// The network's genesis.
+    #[must_use]
+    pub fn genesis(&self) -> Genesis {
+        self.genesis
+    }
+
     /// The hello without the clock: `current_fork_digest` is empty. The schedules in it give
     /// the network's limits (for example the largest blob count).
     #[must_use]
@@ -265,6 +279,17 @@ impl NetworkHello {
             ..self.schedule.clone()
         })
     }
+}
+
+/// Unix milliseconds now, from a clock a link follows ([`crate::Link::network_on`]).
+pub type Clock = Arc<dyn Fn() -> u128 + Send + Sync>;
+
+/// Unix milliseconds of the system clock.
+#[must_use]
+pub fn system_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
 }
 
 /// Checks the peer's hello against ours and returns the negotiated API version.

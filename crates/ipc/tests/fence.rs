@@ -140,7 +140,7 @@ impl VerifyService for FakeVerify {
         tokio::spawn(async move {
             let run = async {
                 let mut guarded = this.link.open(Inbound::new(request.into_inner())).await?;
-                let (generation, hello) = stream_hello(this.link.local())?;
+                let (generation, hello) = stream_hello(&this.link.local())?;
                 this.tape
                     .generations
                     .lock()
@@ -224,7 +224,7 @@ impl Client {
     async fn connect(conn: &Connection, metrics: &Arc<FenceMetrics>) -> Self {
         let link = fixture::v1_link();
         let (tx, rx) = mpsc::channel(16);
-        tx.send(VerifyBlsRequest::hello(link.local().clone()))
+        tx.send(VerifyBlsRequest::hello(link.local()))
             .await
             .unwrap();
         let response = VerifyServiceClient::new(conn.transport.clone())

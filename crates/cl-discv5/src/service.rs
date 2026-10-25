@@ -66,28 +66,17 @@ use crate::metrics::EvictionMetrics;
 use alloy_rlp::Bytes;
 use discv5::kbucket::{Entry, KBucketsTable, Key};
 use discv5::{ConfigBuilder, Discv5, Event, ListenConfig};
-use p2p_wire::enr::{encode_cgc, CGC_KEY};
+use p2p_wire::enr::{encode_cgc, ForkFields, CGC_KEY, ETH2_KEY, NFD_KEY};
 use p2p_wire::rpc::messages::ForkDigest;
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
-/// Which addresses the routing table accepts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NetworkMode {
-    /// A public network: every address a record advertises must be globally routable.
-    Public,
-    /// A local devnet: loopback and private addresses are accepted too.
-    Devnet,
-    /// Local addresses only ([`is_local_ip`]): loopback, private, link-local, CGNAT and IPv6
-    /// unique-local. For a probe on a devnet's own network (a Docker bridge), which must send
-    /// nothing to a public host whatever a peer hands it.
-    Local,
-}
+pub use p2p_wire::ip::{is_local_ip, NetworkMode};
 
 /// The `table_filter` for `mode`.
 pub fn table_filter(mode: NetworkMode) -> fn(&Enr) -> bool {
@@ -100,13 +89,13 @@ pub fn table_filter(mode: NetworkMode) -> fn(&Enr) -> bool {
 
 /// At least one address, and every address globally routable.
 fn public_ip_rules(enr: &Enr) -> bool {
-    every_address(enr, public_ip)
+    every_address(enr, ip_rule(NetworkMode::Public))
 }
 
 /// At least one address, and none that can never be contacted (unspecified, broadcast,
 /// multicast).
 fn devnet_ip_rules(enr: &Enr) -> bool {
-    every_address(enr, devnet_ip)
+    every_address(enr, ip_rule(NetworkMode::Devnet))
 }
 
 /// At least one address, and every address local ([`is_local_ip`]).
@@ -114,48 +103,10 @@ fn local_ip_rules(enr: &Enr) -> bool {
     every_address(enr, is_local_ip)
 }
 
-/// The per-address rule of `mode`, shared by the record rules and the session source check.
+/// The per-address rule of `mode`, shared by the record rules and the session source check
+/// ([`p2p_wire::ip::ip_rule`]).
 fn ip_rule(mode: NetworkMode) -> fn(IpAddr) -> bool {
-    match mode {
-        NetworkMode::Public => public_ip,
-        NetworkMode::Devnet => devnet_ip,
-        NetworkMode::Local => is_local_ip,
-    }
-}
-
-fn public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_global_v4(v4),
-        IpAddr::V6(v6) => is_global_v6(v6),
-    }
-}
-
-/// A local address: IPv4 loopback (127/8), private (10/8, 172.16/12, 192.168/16), link-local
-/// (169.254/16) or shared CGNAT space (100.64/10); IPv6 loopback, unique-local (fc00::/7) or
-/// link-local (fe80::/10). An IPv4-mapped address is judged as its IPv4 address.
-#[must_use]
-pub fn is_local_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
-            let cgnat = a == 100 && (b & 0xc0) == 64;
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || cgnat
-        }
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => is_local_ip(IpAddr::V4(v4)),
-            None => {
-                let first = v6.segments()[0];
-                v6.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
-            }
-        },
-    }
-}
-
-fn devnet_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_contactable_v4(v4),
-        IpAddr::V6(v6) => is_contactable_v6(v6),
-    }
+    p2p_wire::ip::ip_rule(mode)
 }
 
 fn every_address(enr: &Enr, rule: fn(IpAddr) -> bool) -> bool {
@@ -166,72 +117,18 @@ fn every_address(enr: &Enr, rule: fn(IpAddr) -> bool) -> bool {
     ip4.is_none_or(|ip| rule(ip.into())) && ip6.is_none_or(|ip| rule(ip.into()))
 }
 
-fn is_contactable_v4(ip: Ipv4Addr) -> bool {
-    // 0.0.0.0/8 is "this network", never a destination.
-    !(ip.octets()[0] == 0 || ip.is_broadcast() || ip.is_multicast())
-}
-
-/// An IPv4-mapped address is judged as the IPv4 address it maps.
-fn is_contactable_v6(ip: Ipv6Addr) -> bool {
-    ip.to_ipv4_mapped().map_or_else(
-        || !(ip.is_unspecified() || ip.is_multicast()),
-        is_contactable_v4,
-    )
-}
-
-/// Globally reachable IPv4: the exclusions of std's unstable `Ipv4Addr::is_global` (the IANA
-/// IPv4 special-purpose address registry), and never multicast.
-fn is_global_v4(ip: Ipv4Addr) -> bool {
-    let [a, b, c, d] = ip.octets();
-    // 100.64.0.0/10, shared address space (carrier-grade NAT).
-    let shared = a == 100 && (b & 0xc0) == 64;
-    // 192.0.0.0/24, IETF protocol assignments, except 192.0.0.9 and 192.0.0.10 (PCP and TURN
-    // anycast, globally reachable).
-    let protocol_assignments = a == 192 && b == 0 && c == 0 && d != 9 && d != 10;
-    // 198.18.0.0/15, benchmarking.
-    let benchmarking = a == 198 && (b & 0xfe) == 18;
-    // 240.0.0.0/4, reserved, and the broadcast address in it.
-    let reserved = a >= 240;
-    is_contactable_v4(ip)
-        && !(ip.is_private()
-            || ip.is_loopback()
-            || ip.is_link_local()
-            || ip.is_documentation()
-            || shared
-            || protocol_assignments
-            || benchmarking
-            || reserved)
-}
-
-/// Globally reachable IPv6: global unicast (2000::/3) minus the exclusions of std's unstable
-/// `Ipv6Addr::is_global` that fall in it, plus the documentation prefix 3fff::/20. Everything
-/// else std excludes (unspecified, loopback, IPv4-mapped, 64:ff9b:1::/48, 100::/64, unique
-/// local, link local, 5f00::/16, multicast) is outside 2000::/3.
-fn is_global_v6(ip: Ipv6Addr) -> bool {
-    let bits = u128::from(ip);
-    let [s0, s1, s2, ..] = ip.segments();
-    let global_unicast = (s0 & 0xe000) == 0x2000;
-    // 2001::/23, IETF protocol assignments (Teredo, benchmarking 2001:2::/48, ORCHID, ...),
-    // except the parts IANA lists as globally reachable.
-    let protocol_assignments = s0 == 0x2001
-        && s1 < 0x200
-        && !(bits == 0x2001_0001_0000_0000_0000_0000_0000_0001 // 2001:1::1, PCP anycast
-            || bits == 0x2001_0001_0000_0000_0000_0000_0000_0002 // 2001:1::2, TURN anycast
-            || s1 == 3 // 2001:3::/32, AMT
-            || (s1 == 4 && s2 == 0x112) // 2001:4:112::/48, AS112-v6
-            || (0x20..=0x3f).contains(&s1)); // 2001:20::/28 ORCHIDv2, 2001:30::/28 DETs
-                                             // 2002::/16, 6to4.
-    let six_to_four = s0 == 0x2002;
-    // 2001:db8::/32 and 3fff::/20, documentation.
-    let documentation = (s0 == 0x2001 && s1 == 0x0db8) || (s0 == 0x3fff && s1 < 0x1000);
-    global_unicast && !(protocol_assignments || six_to_four || documentation)
-}
-
 /// Which records this node reports: on our fork digest and within the IP rules.
+///
+/// A record is on our fork when its `eth2.fork_digest` is ours, when its `nfd` is ours (it moves
+/// to ours at the change, and peers update their records only when discv5 asks again), or,
+/// within the grace after our own digest change ([`Discovery::with_fork_grace`]), when its
+/// `eth2.fork_digest` is the one we had before. So a digest change does not empty the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerFilter {
     /// The local fork digest a record's `eth2.fork_digest` must equal.
     pub fork_digest: ForkDigest,
+    /// The local fork digest before the last change, while its grace lasts.
+    pub previous: Option<ForkDigest>,
     /// The IP rules every address of the record must pass, the same rules as `table_filter`.
     pub mode: NetworkMode,
 }
@@ -243,9 +140,15 @@ impl PeerFilter {
         table_filter(self.mode)(enr) && self.on_fork(enr)
     }
 
-    /// True for a record whose `eth2.fork_digest` is ours.
+    /// True for a record on our fork (see the type's docs).
     fn on_fork(&self, enr: &Enr) -> bool {
-        fork_id(enr).is_ok_and(|id| id.fork_digest == self.fork_digest)
+        let Ok(fields) = crate::enr::EnrFields::read(enr) else {
+            return false;
+        };
+        let digest = fields.eth2.fork_digest;
+        digest == self.fork_digest
+            || fields.nfd == Some(self.fork_digest)
+            || self.previous == Some(digest)
     }
 
     /// Why a routing-table record must leave the table, or `None` when it may stay. The IP
@@ -326,6 +229,10 @@ pub fn fork_predicate(filter: PeerFilter) -> Box<dyn Fn(&Enr) -> bool + Send> {
     Box::new(move |enr| filter.accepts(enr))
 }
 
+/// How long the table keeps the records of our digest before a change, by default
+/// ([`Discovery::with_fork_grace`]): a mainnet epoch. The process sets one epoch of its network.
+pub const FORK_GRACE: Duration = Duration::from_secs(384);
+
 /// How often [`Discovery`] sweeps its routing table by default: the longest a record that
 /// fails the rules and raised no event stays in the table.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
@@ -398,6 +305,10 @@ struct TableGuard {
     /// The fork digest of the local record when it was last read (big-endian), the fork rule
     /// for when the local record has none it can decode.
     fork_digest: Arc<AtomicU32>,
+    /// The digest before the last change, and when its grace ends.
+    previous: Arc<Mutex<Option<(ForkDigest, std::time::Instant)>>>,
+    /// How long a digest before a change is kept.
+    grace: Duration,
     /// Exempt from the fork rule, never from the IP rules. Only [`Discovery::add_enr`] grows it.
     added: Arc<Mutex<HashSet<NodeId>>>,
     metrics: EvictionMetrics,
@@ -408,6 +319,8 @@ impl TableGuard {
         Self {
             mode,
             fork_digest: Arc::new(AtomicU32::new(u32::from_be_bytes(fork_digest))),
+            previous: Arc::default(),
+            grace: FORK_GRACE,
             added: Arc::default(),
             metrics: EvictionMetrics::default(),
         }
@@ -423,8 +336,14 @@ impl TableGuard {
     fn filter(&self, discv5: &Discv5) -> PeerFilter {
         let fork_digest = match fork_id(&discv5.local_enr()) {
             Ok(id) => {
-                self.fork_digest
-                    .store(u32::from_be_bytes(id.fork_digest), Ordering::Relaxed);
+                let before = self
+                    .fork_digest
+                    .swap(u32::from_be_bytes(id.fork_digest), Ordering::Relaxed)
+                    .to_be_bytes();
+                if before != id.fork_digest {
+                    // Our digest changed: the old one is kept for the grace.
+                    *self.previous() = Some((before, std::time::Instant::now() + self.grace));
+                }
                 id.fork_digest
             }
             Err(error) => {
@@ -434,6 +353,7 @@ impl TableGuard {
         };
         PeerFilter {
             fork_digest,
+            previous: self.previous_in_grace(),
             mode: self.mode,
         }
     }
@@ -442,7 +362,25 @@ impl TableGuard {
     fn last_filter(&self) -> PeerFilter {
         PeerFilter {
             fork_digest: self.last_fork_digest(),
+            previous: self.previous_in_grace(),
             mode: self.mode,
+        }
+    }
+
+    fn previous(&self) -> MutexGuard<'_, Option<(ForkDigest, std::time::Instant)>> {
+        self.previous.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The digest before the last change, while its grace lasts.
+    fn previous_in_grace(&self) -> Option<ForkDigest> {
+        let mut previous = self.previous();
+        match *previous {
+            Some((digest, until)) if std::time::Instant::now() < until => Some(digest),
+            Some(_) => {
+                *previous = None;
+                None
+            }
+            None => None,
         }
     }
 
@@ -559,6 +497,14 @@ impl Discovery {
         })
     }
 
+    /// Keeps the records of our digest before a change for `grace` after it ([`PeerFilter`];
+    /// [`FORK_GRACE`] by default). Call it before [`Self::start`], which hands the guard on.
+    #[must_use]
+    pub fn with_fork_grace(mut self, grace: Duration) -> Self {
+        self.guard.grace = grace;
+        self
+    }
+
     /// Counts evictions on `metrics` (registered with [`EvictionMetrics::register`]) instead of
     /// the unregistered default. Call it before [`Self::start`], which hands the counter on.
     #[must_use]
@@ -635,6 +581,37 @@ impl Discovery {
             .enr_insert(CGC_KEY, &value)
             .map_err(|e| ServiceError::UpdateEnr(e.to_string()))?;
         Ok(true)
+    }
+
+    /// Sets the local record's `eth2` and `nfd` to `fork` (the fork fields of the wall-clock
+    /// epoch, at a fork or BPO digest change): each value that changes bumps `seq` once, and
+    /// the lookups and the event filter follow the new digest at once ([`Self::filter`]).
+    /// Returns whether the record changed.
+    pub fn set_fork_fields(&self, fork: &ForkFields) -> Result<bool, ServiceError> {
+        let eth2 = Bytes::from(fork.eth2.to_bytes().to_vec());
+        let nfd = Bytes::from(fork.nfd.to_vec());
+        let mut changed = false;
+        for (key, value) in [(ETH2_KEY, &eth2), (NFD_KEY, &nfd)] {
+            if value_eq(&self.discv5.local_enr(), key, value) {
+                continue;
+            }
+            self.discv5
+                .enr_insert(key, value)
+                .map_err(|e| ServiceError::UpdateEnr(e.to_string()))?;
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    /// The routing table's records that pass the filter now (our fork digest, the IP rules):
+    /// what a new watcher of the peers starts from.
+    pub fn table_records(&self) -> Vec<Enr> {
+        let filter = self.filter();
+        self.discv5
+            .table_entries_enr()
+            .into_iter()
+            .filter(|enr| filter.accepts(enr))
+            .collect()
     }
 
     /// Adds a known record (a boot node) to the routing table, subject to the IP rules. The
@@ -774,7 +751,7 @@ mod tests {
         ConnectionDirection, ConnectionState, InsertResult, NodeStatus, MAX_NODES_PER_BUCKET,
     };
     use network_config::{ChainConfig, Network};
-    use p2p_wire::enr::{ForkFields, ETH2_KEY};
+    use p2p_wire::enr::ETH2_KEY;
 
     use std::future::Future as _;
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -1559,19 +1536,31 @@ mod tests {
     }
 
     /// The fork rule reads the local record each time: once its `eth2` moves to the next
-    /// digest (a fork or BPO boundary), records on the new digest are kept, reported and
-    /// returned, and records on the old one evicted. A local `eth2` that no longer decodes
-    /// keeps the digest last read.
+    /// digest (a fork or BPO boundary) and the grace is over (none here), records on the new
+    /// digest are kept, reported and returned, records on the old one that name the new digest
+    /// as their `nfd` are kept too, and other records on the old one are evicted. A local
+    /// `eth2` that no longer decodes keeps the digest last read.
     #[tokio::test]
     async fn the_fork_rule_follows_the_local_record() {
         let ours = sepolia_fields(274_175);
         let next = sepolia_fields(274_176);
-        let node = idle_node(&ours, NetworkMode::Public);
+        let node = idle_node(&ours, NetworkMode::Public).with_fork_grace(Duration::ZERO);
         assert_eq!(node.fork_digest(), ours.eth2.fork_digest);
+        let mut stale = ours;
+        stale.nfd = [0xee; 4];
         let on_old = record_with(
             &CombinedKey::generate_secp256k1(),
-            &ours,
+            &stale,
             Ipv4Addr::new(8, 8, 8, 8),
+        );
+        let moving = record_with(
+            &CombinedKey::generate_secp256k1(),
+            &ours,
+            Ipv4Addr::new(8, 8, 2, 2),
+        );
+        assert_eq!(
+            ours.nfd, next.eth2.fork_digest,
+            "the record names the next digest"
         );
         let on_new = record_with(
             &CombinedKey::generate_secp256k1(),
@@ -1588,6 +1577,7 @@ mod tests {
             .unwrap();
         assert_eq!(node.fork_digest(), next.eth2.fork_digest);
         assert!(node.filter().accepts(&on_new));
+        assert!(node.filter().accepts(&moving));
         assert!(!node.filter().accepts(&on_old));
         let _ = insert_unchecked(&node, &on_old);
         let _ = insert_unchecked(&node, &on_new);
@@ -1764,6 +1754,115 @@ mod tests {
         assert_eq!(node.local_enr().seq(), seq + 1);
     }
 
+    /// At a fork or BPO digest change the running record takes the new `eth2` and `nfd`, and
+    /// lookups then filter on the new digest. The same fields again change nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_fork_fields_moves_the_record_to_the_new_digest() {
+        let before = sepolia_fields(274_175);
+        let (node, _events) = node(&before).await;
+        let seq = node.local_enr().seq();
+        assert_eq!(node.set_fork_fields(&before), Ok(false));
+        assert_eq!(node.local_enr().seq(), seq);
+        let mut after = before;
+        after.eth2.fork_digest = [9, 9, 9, 9];
+        after.nfd = [8, 8, 8, 8];
+        assert_eq!(node.set_fork_fields(&after), Ok(true));
+        let enr = node.local_enr();
+        assert!(enr.verify());
+        assert!(enr.seq() > seq);
+        let fields = crate::enr::EnrFields::read(&enr).unwrap();
+        assert_eq!(fields.eth2, after.eth2);
+        assert_eq!(fields.nfd, Some(after.nfd));
+        assert_eq!(node.fork_digest(), [9, 9, 9, 9]);
+        assert_eq!(node.set_fork_fields(&after), Ok(false));
+    }
+
+    /// Across a digest change the table keeps its peers: a record still on the old digest
+    /// stays for the grace after the change, and a record whose `nfd` is our new digest (it
+    /// moves to it at the change) stays after the grace too. A record of another digest goes.
+    #[test]
+    fn a_digest_change_keeps_the_table_for_its_grace() {
+        let old = sepolia_fields(274_175);
+        let new_digest = [9, 9, 9, 9];
+        let on_old = loopback_enr(&CombinedKey::generate_secp256k1(), &old, 9);
+        let mut announcing = old;
+        announcing.nfd = new_digest;
+        let moving = loopback_enr(&CombinedKey::generate_secp256k1(), &announcing, 10);
+        let mut elsewhere = old;
+        elsewhere.eth2.fork_digest = [7, 7, 7, 7];
+        let other = loopback_enr(&CombinedKey::generate_secp256k1(), &elsewhere, 11);
+        let during = PeerFilter {
+            fork_digest: new_digest,
+            previous: Some(old.eth2.fork_digest),
+            mode: NetworkMode::Devnet,
+        };
+        let table = [&on_old, &moving, &other];
+        let none = HashSet::new();
+        let evicted = |f: &PeerFilter| -> Vec<NodeId> {
+            table_evictions(f, table, &none)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        assert_eq!(evicted(&during), [other.node_id()]);
+        assert!(during.accepts(&on_old) && during.accepts(&moving));
+        let after = PeerFilter {
+            previous: None,
+            ..during
+        };
+        assert_eq!(evicted(&after), [on_old.node_id(), other.node_id()]);
+        assert!(after.accepts(&moving) && !after.accepts(&on_old));
+    }
+
+    /// The node's filter takes the digest before a change as its previous one for the grace
+    /// after the change ([`Discovery::with_fork_grace`]), then drops it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_filter_keeps_the_old_digest_for_the_grace() {
+        let old = sepolia_fields(274_175);
+        let (node, _events) = start_on_free_port(|port| async move {
+            let key = CombinedKey::generate_secp256k1();
+            let enr = loopback_enr(&key, &old, port);
+            let config = DiscoveryConfig {
+                listen_ip: Ipv4Addr::LOCALHOST.into(),
+                udp_port: port,
+                mode: NetworkMode::Devnet,
+                sweep_interval: SWEEP_INTERVAL,
+            };
+            let mut discovery = Discovery::new(enr, key, &config)
+                .unwrap()
+                .with_fork_grace(Duration::from_millis(300));
+            let events = discovery.start().await?;
+            Ok((discovery, events))
+        })
+        .await;
+        assert_eq!(node.filter().previous, None);
+        let mut new = old;
+        new.eth2.fork_digest = [9, 9, 9, 9];
+        node.set_fork_fields(&new).unwrap();
+        let filter = node.filter();
+        assert_eq!(filter.fork_digest, [9, 9, 9, 9]);
+        assert_eq!(filter.previous, Some(old.eth2.fork_digest));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(node.filter().previous, None);
+        assert_eq!(FORK_GRACE, Duration::from_secs(384));
+    }
+
+    /// The table's records that pass the filter: a record on our digest, never one on
+    /// another.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_table_records_pass_the_filter() {
+        let ours = sepolia_fields(274_175);
+        let (node, _events) = node(&ours).await;
+        let peer = loopback_enr(&CombinedKey::generate_secp256k1(), &ours, 9);
+        node.add_enr(peer.clone()).unwrap();
+        let mut other = ours;
+        other.eth2.fork_digest = [7, 7, 7, 7];
+        let foreign = loopback_enr(&CombinedKey::generate_secp256k1(), &other, 10);
+        node.add_enr(foreign).unwrap();
+        let ids: Vec<_> = node.table_records().iter().map(Enr::node_id).collect();
+        assert_eq!(ids, [peer.node_id()]);
+    }
+
     /// Local mode takes loopback, private (RFC 1918), link-local, CGNAT and IPv6 unique-local
     /// and link-local addresses, and nothing else: every address of a record must be one.
     #[test]
@@ -1817,6 +1916,7 @@ mod tests {
         assert!(!local(&mixed));
         assert!(table_filter(NetworkMode::Devnet)(&mixed));
         let filter = PeerFilter {
+            previous: None,
             fork_digest: [0; 4],
             mode: NetworkMode::Local,
         };
@@ -2025,11 +2125,13 @@ mod tests {
             build_local_enr(&key, &ours, 4, &LocalAddr::new(Ipv4Addr::LOCALHOST)).unwrap();
         let results = vec![public_off, loopback_on.clone(), public_on.clone()];
         let filter = PeerFilter {
+            previous: None,
             fork_digest: ours.eth2.fork_digest,
             mode: NetworkMode::Public,
         };
         assert_eq!(filter.retain(results.clone()), vec![public_on.clone()]);
         let devnet = PeerFilter {
+            previous: None,
             mode: NetworkMode::Devnet,
             ..filter
         };
@@ -2069,6 +2171,7 @@ mod tests {
         ];
         let added = HashSet::from([added_off.node_id(), added_private.node_id()]);
         let public = PeerFilter {
+            previous: None,
             fork_digest: ours.eth2.fork_digest,
             mode: NetworkMode::Public,
         };
@@ -2086,6 +2189,7 @@ mod tests {
 
         // Devnet mode keeps loopback and private records; the fork rule is the same.
         let devnet = PeerFilter {
+            previous: None,
             mode: NetworkMode::Devnet,
             ..public
         };
@@ -2121,10 +2225,12 @@ mod tests {
             .build(&key)
             .unwrap();
         let public = PeerFilter {
+            previous: None,
             fork_digest: ours.eth2.fork_digest,
             mode: NetworkMode::Public,
         };
         let devnet = PeerFilter {
+            previous: None,
             mode: NetworkMode::Devnet,
             ..public
         };
@@ -2177,6 +2283,7 @@ mod tests {
         let off = build_local_enr(&key, &other, 4, &addr).unwrap();
         let socket: SocketAddr = (Ipv4Addr::LOCALHOST, 9000).into();
         let filter = PeerFilter {
+            previous: None,
             fork_digest: ours.eth2.fork_digest,
             mode: NetworkMode::Devnet,
         };
@@ -2212,6 +2319,7 @@ mod tests {
         // Public mode: a loopback record on our digest is never surfaced, whichever event
         // carries it.
         let public = PeerFilter {
+            previous: None,
             mode: NetworkMode::Public,
             ..filter
         };

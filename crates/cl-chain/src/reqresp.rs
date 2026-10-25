@@ -1033,7 +1033,7 @@ impl ReqRespServer {
         self.link
             .accept_hello_field(hello)
             .map_err(|e| e.to_status())?;
-        let (_, ours) = stream_hello(self.link.local()).map_err(|e| e.to_status())?;
+        let (_, ours) = stream_hello(&self.link.local()).map_err(|e| e.to_status())?;
         let answer = match Arc::clone(&self.reads).try_acquire_owned() {
             Ok(permit) => {
                 let columns = Arc::clone(&self.columns);

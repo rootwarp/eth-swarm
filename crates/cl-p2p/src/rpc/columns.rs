@@ -145,7 +145,7 @@ impl ColumnSource for ChainColumns {
             start_slot: request.start_slot,
             count: request.count,
             columns: request.columns.to_vec(),
-            hello: Some(link.local().clone()),
+            hello: Some(link.local()),
         };
         Box::pin(async move {
             match client.data_columns_by_range(request).await {
@@ -167,7 +167,7 @@ impl ColumnSource for ChainColumns {
                     columns: id.columns.to_vec(),
                 })
                 .collect(),
-            hello: Some(link.local().clone()),
+            hello: Some(link.local()),
         };
         Box::pin(async move {
             match client.data_columns_by_root(request).await {
@@ -582,7 +582,7 @@ mod tests {
     fn server_hello(link: &Link) -> Hello {
         Hello {
             generation: 7,
-            ..link.local().clone()
+            ..link.local()
         }
     }
 

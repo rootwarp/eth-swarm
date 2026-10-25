@@ -1081,6 +1081,7 @@ name = "cl-discv5"
 version = "0.1.0"
 dependencies = [
  "alloy-rlp",
+ "cl-discv5",
  "data-encoding",
  "discv5",
  "enr",
@@ -1091,10 +1092,12 @@ dependencies = [
  "p2p-wire",
  "prometheus-client",
  "rustix",
+ "serde",
  "svc-runtime",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",

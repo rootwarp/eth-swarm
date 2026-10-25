@@ -18,6 +18,11 @@ testkit = ["p2p-wire/testkit"]
 # user. Only cl-p2p's own dev-dependency turns it on. The feature changes no code of the library
 # or of m2a-session, which always passes test_build = false, whatever is built with it.
 test-run-as = []
+# Builds the test binary cl-p2p-test (below): the same code as cl-p2p, but it reads its config
+# from $CL_P2P_TEST_CONFIG, accepts a config and a topic list that the test user owns and lets
+# the OS pick the /metrics port. Only cl-p2p's own dev-dependency turns it on; the cl-p2p
+# binary never reads the variable.
+test-config = []
 
 # The test binary of the session: the same code as m2a-session with test_build = true. Built
 # only with the test-run-as feature; its unit tests are m2a-session's, so it has none of its own.
@@ -25,6 +30,13 @@ test-run-as = []
 name = "m2a-session-test"
 path = "src/bin/m2a-session-test/main.rs"
 required-features = ["test-run-as"]
+test = false
+
+# The test binary of the service, built only with test-config. Its unit tests are cl-p2p's.
+[[bin]]
+name = "cl-p2p-test"
+path = "src/bin/cl-p2p-test.rs"
+required-features = ["test-config"]
 test = false
 
 [dependencies]
@@ -83,7 +95,9 @@ data-encoding = "2"
 
 [dev-dependencies]
 # test-run-as: the integration tests run the test binary m2a-session-test.
-cl-p2p = { path = ".", features = ["testkit", "test-run-as"] }
+cl-p2p = { path = ".", features = ["testkit", "test-run-as", "test-config"] }
+# owned::testkit: temp directories with no symlink on their path, for the owner walk.
+svc-runtime = { path = "../svc-runtime", features = ["testkit"] }
 ipc = { path = "../ipc", features = ["testkit"] }
 # The mock reference beacon API: plain HTTP/1.1 on 127.0.0.1.
 hyper = { version = "1", features = ["server", "http1"] }

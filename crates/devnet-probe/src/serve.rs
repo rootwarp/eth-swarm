@@ -1423,7 +1423,7 @@ mod tests {
         let devnet = devnet();
         let now = crate::fixtures::now_ms();
         let ours = network_hello(&devnet, now).unwrap();
-        assert_eq!(&ours, chain_link::<Minimal>(&devnet, now).unwrap().local());
+        assert_eq!(ours, chain_link::<Minimal>(&devnet, now).unwrap().local());
         let cl_verify =
             ipc::hello::NetworkHello::new("cl-verify/0", devnet.config(), devnet.genesis())
                 .unwrap()

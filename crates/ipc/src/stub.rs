@@ -54,7 +54,7 @@ where
 {
     link.accept_hello_field(request.hello_field())
         .map_err(|e| e.to_status())?;
-    let (_, hello) = stream_hello(link.local()).map_err(|e| e.to_status())?;
+    let (_, hello) = stream_hello(&link.local()).map_err(|e| e.to_status())?;
     let frames = vec![Ok(Resp::hello(hello)), Err(not_implemented(rpc))];
     Ok(Response::new(Box::pin(tokio_stream::iter(frames))))
 }
@@ -77,7 +77,7 @@ where
     crate::spawn_in_span(async move {
         let end = async {
             let mut guarded = link.open(Inbound::new(request.into_inner())).await?;
-            let (_, hello) = stream_hello(link.local())?;
+            let (_, hello) = stream_hello(&link.local())?;
             if tx.send(Ok(Resp::hello(hello))).await.is_err() {
                 return Ok(());
             }
@@ -209,7 +209,7 @@ mod tests {
             ErrorCode::ContractViolation
         );
         let mut ok = GetDataColumnsRequest::default();
-        ok.set_hello_field(Some(l.local().clone()));
+        ok.set_hello_field(Some(l.local()));
         let mut s = server_stream::<_, GetDataColumnsResponse>(&l, "S/M", &ok)
             .unwrap()
             .into_inner();

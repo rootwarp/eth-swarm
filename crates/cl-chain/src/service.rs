@@ -47,17 +47,17 @@
 //! | Code | Meaning | Restarted |
 //! |---|---|---|
 //! | 0 | stopped on SIGTERM or SIGINT, in-flight calls drained (also during the wait for cl-verify) | no (a stop) |
-//! | 1 ([`EXIT_FAILED`]) | a start that a restart cannot fix: the store, the socket's bind, an ACL of unserved methods, a cl-verify directory open to others, a cl-verify server of another user | no |
-//! | 2 ([`EXIT_CONFIG`]) | the config was refused, or the store holds the custody of another `node_id` | no |
+//! | 1 ([`EXIT_FAILED`]) | a start that a restart cannot fix: the store, the socket's bind, an ACL of unserved methods, a cl-verify directory open to others (or still of another user at the end of the wait), a cl-verify server of another user | no |
+//! | 2 ([`EXIT_CONFIG`]) | the config was refused, or the store holds the custody of another `node_id` (or of an unrecorded one) | no |
 //! | 64 ([`EXIT_USAGE`]) | a command-line argument: the unit passes none | no |
 //! | 69 ([`EXIT_UNAVAILABLE`]) | cl-verify's directory or socket is not there within `verify_wait_ms`, or the clock is before genesis | yes |
-//! | 70 ([`EXIT_SOFTWARE`]) | a fault of the run that a restart can fix: the server task, a drain past its deadline, `/metrics`, the service manager | yes |
+//! | 70 ([`EXIT_SOFTWARE`]) | a fault of the run that a restart can fix: the server task, a drain past its deadline, `/metrics`, the service manager, a store that does not close within 10 s | yes |
 //! | 71 | the log writer could not start (`svc_runtime::telemetry::EXIT_NO_LOG_WRITER`) | yes |
 
 use crate::probe::service::{
-    chain_acl, chain_link, check_verify_socket_dir, connect_verify, error_chain, open_store_dir,
-    system_ms, verify_client, ProbeNetwork, ProbePlan, ProbeService, CHAIN_METHODS, CHAIN_SERVICE,
-    DEFAULT_VERIFY_TIMEOUT, P2P_CALLER, VERIFY_SOCKET_WAIT,
+    chain_acl, chain_link, connect_verify, error_chain, open_store_dir, system_ms, verify_client,
+    verify_dir_state, ProbeNetwork, ProbePlan, ProbeService, VerifyDirError, CHAIN_METHODS,
+    CHAIN_SERVICE, DEFAULT_VERIFY_TIMEOUT, P2P_CALLER, VERIFY_SOCKET_WAIT,
 };
 use crate::probe::BeaconApi;
 use crate::verify::client::KzgVerifier;
@@ -288,6 +288,9 @@ pub enum ServeError {
     /// The start failed in a way that a restart cannot fix.
     #[error("{0}")]
     Failed(String),
+    /// A fault of the run that a restart can fix: the store did not close in time.
+    #[error("{0}")]
+    Software(String),
     /// The runtime stopped on an error.
     #[error("{0}")]
     Runtime(#[from] svc_runtime::RuntimeError),
@@ -302,6 +305,7 @@ impl ServeError {
             Self::Unavailable(_) => EXIT_UNAVAILABLE,
             Self::Config(_) => EXIT_CONFIG,
             Self::Failed(_) => EXIT_FAILED,
+            Self::Software(_) => EXIT_SOFTWARE,
             // The socket and the ACL do not fix themselves; every other fault of the run (the
             // server task, a drain past its deadline, /metrics, the manager) may.
             Self::Runtime(RuntimeError::Bind(_) | RuntimeError::UnservedMethods(_)) => EXIT_FAILED,
@@ -323,6 +327,32 @@ pub fn verify_unreachable(socket: &Path, err: &tonic::transport::Error) -> Serve
     }
 }
 
+/// Closes the store `value` (drops it on a blocking thread), waiting `limit` at most. `pending`
+/// is how many columns were still on their way into it.
+///
+/// # Errors
+///
+/// [`ServeError::Software`] (70) if it did not close in time: the columns still on their way
+/// are lost, and the drop goes on alone.
+pub async fn close_within<T: Send + 'static>(
+    value: T,
+    pending: usize,
+    limit: Duration,
+) -> Result<(), ServeError> {
+    if drop_within(value, limit).await {
+        return Ok(());
+    }
+    tracing::warn!(
+        limit_ms = limit.as_millis() as u64,
+        pending,
+        "the column store did not close in time; stopping without it"
+    );
+    Err(ServeError::Software(format!(
+        "the column store did not close within {limit:?}: {pending} columns were still on their \
+         way into it and are lost"
+    )))
+}
+
 /// Drops `value` on a blocking thread, waiting `limit` at most; whether it was dropped in time.
 /// A drop that takes longer goes on alone.
 pub async fn drop_within<T: Send + 'static>(value: T, limit: Duration) -> bool {
@@ -333,17 +363,13 @@ pub async fn drop_within<T: Send + 'static>(value: T, limit: Duration) -> bool {
 /// The pause between two looks for cl-verify's directory.
 const DIR_RETRY: Duration = Duration::from_millis(200);
 
-/// Whether the directory of `socket` (or one above it) is not there.
-fn verify_dir_missing(socket: &Path) -> bool {
-    socket.parent().is_some_and(|dir| {
-        std::fs::symlink_metadata(dir).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-    })
-}
-
 /// Waits until the directory of cl-verify's socket is there and closed to other users, until
-/// `deadline`. A directory that is not there yet (after a reboot, or after systemd removed
-/// cl-verify's runtime directory at its stop) is waited for, then [`ServeError::Unavailable`]; a
-/// directory that is there but open to other users is [`ServeError::Failed`].
+/// `deadline` ([`verify_dir_state`]). A directory that is not there yet (a typed `NotFound`: after
+/// a reboot, or after systemd removed cl-verify's runtime directory at its stop) is waited for,
+/// and at the end of the wait is [`ServeError::Unavailable`]. A directory that another user
+/// still owns (systemd makes it, then gives it to its user) is waited for too, and at the end of
+/// the wait is [`ServeError::Failed`]. A directory, or one above it, that others can write is
+/// [`ServeError::Failed`] at once.
 async fn wait_for_verify_dir(
     socket: &Path,
     uid: u32,
@@ -351,23 +377,26 @@ async fn wait_for_verify_dir(
 ) -> Result<(), ServeError> {
     let mut told = false;
     loop {
-        match check_verify_socket_dir(socket, uid) {
+        let wait = match verify_dir_state(socket, uid) {
             Ok(()) => return Ok(()),
-            Err(e) if verify_dir_missing(socket) => {
-                if tokio::time::Instant::now() + DIR_RETRY > deadline {
-                    return Err(ServeError::Unavailable(e));
-                }
-                if !told {
-                    tracing::info!(
-                        socket = %socket.display(),
-                        "cl-verify's directory is not there yet; waiting for it"
-                    );
-                    told = true;
-                }
-                tokio::time::sleep(DIR_RETRY).await;
-            }
-            Err(e) => return Err(ServeError::Failed(e)),
+            Err(VerifyDirError::Refused(e)) => return Err(ServeError::Failed(e)),
+            Err(wait) => wait,
+        };
+        if tokio::time::Instant::now() + DIR_RETRY > deadline {
+            return Err(match wait {
+                VerifyDirError::Missing(e) => ServeError::Unavailable(e),
+                VerifyDirError::Owner(e) | VerifyDirError::Refused(e) => ServeError::Failed(e),
+            });
         }
+        if !told {
+            tracing::info!(
+                socket = %socket.display(),
+                why = %wait,
+                "cl-verify's directory is not ready yet; waiting for it"
+            );
+            told = true;
+        }
+        tokio::time::sleep(DIR_RETRY).await;
     }
 }
 
@@ -403,7 +432,8 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
     };
     let service =
         ProbeService::<E, V>::open(net, plan, &mut hooks.unprefixed).map_err(|e| match e {
-            crate::probe::service::OpenError::NodeIdChanged { .. } => {
+            crate::probe::service::OpenError::NodeIdChanged { .. }
+            | crate::probe::service::OpenError::NodeIdUnknown { .. } => {
                 ServeError::Config(e.to_string())
             }
             crate::probe::service::OpenError::Failed(why) => ServeError::Failed(why),
@@ -431,14 +461,12 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
     });
     let result = svc_runtime::run_with(config, services, hooks).await;
     // The store's writer finishes what it was given, off the runtime's workers, within a
-    // limit: the stop must end within the unit's stop timeout.
-    if !drop_within(service, STORE_CLOSE).await {
-        tracing::warn!(
-            limit_ms = STORE_CLOSE.as_millis() as u64,
-            "the column store did not close in time; stopping without it"
-        );
-    }
-    result.map_err(ServeError::from)
+    // limit: the stop must end within the unit's stop timeout. A store that does not close in
+    // time is 70, unless the run itself failed.
+    let pending = service.pending();
+    let closed = close_within(service, pending, STORE_CLOSE).await;
+    result.map_err(ServeError::from)?;
+    closed
 }
 
 /// Connects to cl-verify (its socket directory checked, its server's UID checked) and runs
@@ -817,5 +845,66 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(400));
         assert!(drop_within(1u8, Duration::from_secs(5)).await);
         assert!(STORE_CLOSE < Duration::from_secs(30));
+    }
+
+    /// A store that does not close in time is a fault a restart can fix (70), and the error
+    /// names how many columns were still on their way.
+    #[tokio::test]
+    async fn a_store_that_does_not_close_in_time_is_70() {
+        struct Slow;
+        impl Drop for Slow {
+            fn drop(&mut self) {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+        let err = close_within(Slow, 3, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 70);
+        assert!(err.to_string().contains("3 columns"), "{err}");
+        assert!(close_within(1u8, 0, Duration::from_secs(5)).await.is_ok());
+    }
+
+    /// The wait for cl-verify's directory: one not there is 69 at the end of the wait, one of
+    /// another user is 1 at the end of the wait (it is retried until then), and one open to
+    /// others is 1 at once.
+    #[tokio::test]
+    async fn the_verify_dir_wait_ends_by_what_it_found() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = ipc::uds::Ownership::current().uid;
+        let root = tempfile::Builder::new()
+            .tempdir_in(svc_runtime::owned::testkit::config_root())
+            .unwrap();
+        let sock = |dir: &str| root.path().join(dir).join("cl-verify.sock");
+        let soon = || tokio::time::Instant::now() + Duration::from_millis(300);
+        let err = wait_for_verify_dir(&sock("absent"), uid, soon())
+            .await
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 69, "{err}");
+        let dir = root.path().join("verify");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let started = tokio::time::Instant::now();
+        let err = wait_for_verify_dir(&sock("verify"), uid + 1, soon())
+            .await
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 1, "{err}");
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "retried until the end"
+        );
+        let open = root.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let started = tokio::time::Instant::now();
+        let far = tokio::time::Instant::now() + Duration::from_secs(30);
+        let err = wait_for_verify_dir(&sock("open/absent"), uid, far)
+            .await
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 1, "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "refused at once"
+        );
     }
 }

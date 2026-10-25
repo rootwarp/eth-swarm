@@ -84,6 +84,11 @@ impl NodeKey {
     pub fn peer_id(&self) -> PeerId {
         self.0.public().to_peer_id()
     }
+
+    /// The libp2p key itself, for a swarm built with it (`cl_p2p::service`).
+    pub fn into_keypair(self) -> Keypair {
+        self.0
+    }
 }
 
 impl fmt::Debug for NodeKey {

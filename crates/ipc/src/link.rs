@@ -18,10 +18,12 @@ use network_config::ForkSchedule;
 use tokio_stream::Stream;
 use tonic::Status;
 
-use crate::envelope::{check_envelope_at, Checked, EnvelopeError, Envelopes, ForkDigests};
+use crate::envelope::{
+    check_envelope_at, Checked, DigestTable, EnvelopeError, Envelopes, ForkDigests,
+};
 use crate::error::ContractError;
 use crate::frame::{check_unary_seq, InFrame, Inbound, SeqChecker};
-use crate::hello::negotiate;
+use crate::hello::{negotiate, system_ms, Clock, NetworkHello};
 
 /// Time from stream open to the peer's hello unless configured otherwise.
 pub const DEFAULT_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -66,8 +68,34 @@ impl ContractMetrics {
     }
 }
 
+/// Where our hello comes from.
+enum HelloSource {
+    /// One hello for the life of the link.
+    Fixed(Hello),
+    /// The network's hello at the clock of each call ([`NetworkHello::at`]).
+    Clock {
+        network: Arc<NetworkHello>,
+        clock: Clock,
+    },
+}
+
+impl HelloSource {
+    fn hello(&self) -> Hello {
+        match self {
+            Self::Fixed(hello) => hello.clone(),
+            // Before genesis or Fulu there is no digest: the schedule alone. A peer with a
+            // digest does not match it; a peer of the same network before genesis has none
+            // either and does. That is safe: no envelope of any fork goes over a link before
+            // genesis (cl-chain refuses to start then), and cl-discv5 may serve its peers then.
+            Self::Clock { network, clock } => network
+                .at(clock())
+                .unwrap_or_else(|_| network.schedule().clone()),
+        }
+    }
+}
+
 struct Inner {
-    local: Hello,
+    local: HelloSource,
     floor: u32,
     schedule: ForkSchedule,
     digests: Box<dyn ForkDigests + Send + Sync>,
@@ -85,7 +113,7 @@ pub struct Link {
 impl std::fmt::Debug for Link {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Link")
-            .field("local", &self.inner.local)
+            .field("local", &self.local())
             .field("floor", &self.inner.floor)
             .field("hello_timeout", &self.hello_timeout)
             .finish_non_exhaustive()
@@ -101,13 +129,72 @@ impl Link {
         schedule: ForkSchedule,
         digests: impl ForkDigests + Send + Sync + 'static,
     ) -> Self {
+        Self::with_source(
+            HelloSource::Fixed(local),
+            floor,
+            schedule,
+            digests,
+            E::slots_per_epoch(),
+        )
+    }
+
+    /// The link of `network` (its fork schedule and every digest of it), whose hello follows
+    /// the system clock: at each stream it carries the fork digest of the wall-clock epoch, so
+    /// both ends of a link stay equal across a fork or BPO digest change, whichever started
+    /// first. Envelope epochs use the epoch length of the network's preset.
+    ///
+    /// # Errors
+    ///
+    /// The network's digest schedule does not make a table ([`DigestTable::new`]).
+    pub fn network(network: Arc<NetworkHello>, floor: u32) -> Result<Self, ContractError> {
+        Self::network_on(network, floor, Arc::new(system_ms))
+    }
+
+    /// [`Self::network`] on `clock` (Unix milliseconds).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::network`].
+    pub fn network_on(
+        network: Arc<NetworkHello>,
+        floor: u32,
+        clock: Clock,
+    ) -> Result<Self, ContractError> {
+        let config = network.config();
+        let digests = DigestTable::new(
+            network_config::digest::digest_schedule(
+                config,
+                &network.genesis().genesis_validators_root,
+            )
+            .iter()
+            .map(|e| (e.epoch, e.fork, e.fork_digest))
+            .collect(),
+        )?;
+        let schedule = *config.fork_schedule();
+        let slots_per_epoch = network.slots_per_epoch();
+        Ok(Self::with_source(
+            HelloSource::Clock { network, clock },
+            floor,
+            schedule,
+            digests,
+            slots_per_epoch,
+        ))
+    }
+
+    fn with_source(
+        local: HelloSource,
+        floor: u32,
+        schedule: ForkSchedule,
+        digests: impl ForkDigests + Send + Sync + 'static,
+        slots_per_epoch: u64,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 local,
                 floor,
                 schedule,
                 digests: Box::new(digests),
-                slots_per_epoch: E::slots_per_epoch(),
+                slots_per_epoch,
                 metrics: ContractMetrics::default(),
             }),
             hello_timeout: DEFAULT_HELLO_TIMEOUT,
@@ -127,9 +214,11 @@ impl Link {
         self
     }
 
+    /// The hello this side sends now: the fixed one ([`Self::new`]), or the network's hello
+    /// at the clock ([`Self::network`]). Every negotiation compares the peer's hello with it.
     #[must_use]
-    pub fn local(&self) -> &Hello {
-        &self.inner.local
+    pub fn local(&self) -> Hello {
+        self.inner.local.hello()
     }
 
     #[must_use]
@@ -181,7 +270,7 @@ impl Link {
 
     /// Negotiates with the peer's hello ([`negotiate`] against our hello and floor).
     pub fn negotiate(&self, remote: &Hello) -> Result<u32, ContractError> {
-        self.recorded(negotiate(&self.inner.local, remote, self.inner.floor))
+        self.recorded(negotiate(&self.local(), remote, self.inner.floor))
     }
 
     /// The in-line hello of a server-streaming request, which is required.
@@ -397,7 +486,7 @@ mod tests {
     }
 
     fn peer() -> Hello {
-        let mut h = link(1).local().clone();
+        let mut h = link(1).local();
         h.max_api_version = 1;
         h
     }
@@ -622,5 +711,59 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         l.record(&ContractError::new(ErrorCode::NotFound, "not counted"));
         assert_eq!(l.metrics().counts().contract_violations, 1);
+    }
+
+    /// A network link follows the clock: its hello carries the digest of the epoch of the
+    /// clock at each call, so a peer that starts after a fork or BPO digest change is
+    /// accepted, and a peer still on the old digest is refused.
+    #[test]
+    fn a_network_link_follows_the_clock_across_a_digest_change() {
+        use crate::testkit::devnet::{devnet_hello, devnet_ms};
+        use std::sync::atomic::AtomicU64;
+        let network = Arc::new(devnet_hello("ipc/test"));
+        let now = Arc::new(AtomicU64::new(devnet_ms(0)));
+        let clock: crate::hello::Clock = {
+            let now = Arc::clone(&now);
+            Arc::new(move || u128::from(now.load(Ordering::SeqCst)))
+        };
+        let ours = Link::network_on(Arc::clone(&network), 1, clock).unwrap();
+        let at = |slot: u64| network.at(u128::from(devnet_ms(slot))).unwrap();
+        // Epoch 0: our hello is the hello of epoch 0, and a peer of epoch 0 is accepted.
+        assert_eq!(ours.local(), at(0));
+        assert_eq!(ours.negotiate(&at(0)), Ok(1));
+        // The clock passes the digest change at epoch 1 (8 slots) and the one at epoch 2.
+        now.store(devnet_ms(17), Ordering::SeqCst);
+        assert_eq!(ours.local(), at(17));
+        assert_ne!(at(17).current_fork_digest, at(0).current_fork_digest);
+        // A peer that started after the change is accepted by the link built before it.
+        let later = Link::network(Arc::clone(&network), 1).unwrap();
+        let mut theirs = later.local();
+        theirs.current_fork_digest = at(17).current_fork_digest;
+        assert_eq!(ours.negotiate(&theirs), Ok(1));
+        // A peer still on the old digest is a version mismatch.
+        assert_eq!(
+            ours.negotiate(&at(0)).unwrap_err().code(),
+            ErrorCode::VersionMismatch
+        );
+        // The envelopes are checked against every digest of the schedule.
+        assert_eq!(ours.schedule(), network.config().fork_schedule());
+        // Before genesis there is no digest: the hello has none. A peer of the same network
+        // before genesis has none either, and is accepted; a peer with a digest is not.
+        now.store(0, Ordering::SeqCst);
+        assert!(ours.local().current_fork_digest.is_empty());
+        let mut before = at(0);
+        before.current_fork_digest.clear();
+        assert_eq!(ours.negotiate(&before), Ok(1));
+        assert_eq!(
+            ours.negotiate(&at(0)).unwrap_err().code(),
+            ErrorCode::VersionMismatch
+        );
+    }
+
+    #[test]
+    fn a_fixed_link_keeps_its_hello() {
+        let l = link(1);
+        assert_eq!(l.local().max_api_version, 2);
+        assert_eq!(l.local(), l.local());
     }
 }

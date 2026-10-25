@@ -139,7 +139,7 @@ fn flush_deadline() -> Instant {
     Instant::now() + LOG_FLUSH_DEADLINE + SLACK
 }
 
-// cl-p2p: a stub that loads its identity and exits.
+// cl-p2p: it loads its identity, then refuses the missing config, and exits.
 
 fn cl_p2p(credentials: Option<&Path>) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cl-p2p"));
@@ -165,7 +165,7 @@ async fn cl_p2p_loads_its_identity_and_exits_with_a_full_stderr() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
     let mut child = Stalled::spawn(cl_p2p(Some(dir.path())));
     let code = child.exit_code_by(flush_deadline(), "cl-p2p").await;
-    assert_eq!(code, Some(2), "loaded, not runnable yet");
+    assert_eq!(code, Some(2), "loaded, then the config is refused");
 }
 
 /// `command` exits [`EXIT_NO_LOG_WRITER`] at once, with stderr full and with stderr a file it

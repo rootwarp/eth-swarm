@@ -657,7 +657,7 @@ impl Node {
             start_slot,
             count,
             columns: columns.to_vec(),
-            hello: Some(self.link.local().clone()),
+            hello: Some(self.link.local()),
         };
         let stream = self
             .client
@@ -684,7 +684,7 @@ impl Node {
                     columns: columns.to_vec(),
                 })
                 .collect(),
-            hello: Some(self.link.local().clone()),
+            hello: Some(self.link.local()),
         };
         let stream = self
             .client

@@ -93,7 +93,7 @@ fn subscriptions_name_each_digest_ahead_of_its_change() {
 
 fn watch_request(link: &Link) -> Request<pb::WatchSubscriptionsRequest> {
     Request::new(pb::WatchSubscriptionsRequest {
-        hello: Some(link.local().clone()),
+        hello: Some(link.local()),
     })
 }
 
@@ -411,4 +411,98 @@ async fn a_store_keeps_the_node_id_of_its_first_open() {
     std::fs::remove_file(&marker).unwrap();
     std::os::unix::fs::symlink("/etc/hosts", &marker).unwrap();
     assert!(matches!(open(7), Err(OpenError::Failed(_))));
+}
+
+/// cl-chain's link follows the clock: a caller that starts after a fork or BPO digest change
+/// sends the new digest, and the server that started before the change accepts it. A caller
+/// still on the old digest is a version mismatch.
+#[tokio::test]
+async fn a_caller_that_starts_after_a_digest_change_is_accepted() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let net = devnet();
+    let now = Arc::new(AtomicU64::new(u64::try_from(epoch_ms(0)).unwrap()));
+    let clock: ipc::hello::Clock = {
+        let now = Arc::clone(&now);
+        Arc::new(move || u128::from(now.load(Ordering::SeqCst)))
+    };
+    let link = chain_link_on::<Minimal>(&net, Arc::clone(&clock)).unwrap();
+    let (_stop, stopped) = watch::channel(false);
+    let server = GossipServer::new(link, Subscriptions::new(&net, vec![3]), clock, stopped);
+    let hello_at = |ms: u128| net.hello().at(ms).unwrap();
+    let ask = |hello| {
+        server.watch_subscriptions(Request::new(pb::WatchSubscriptionsRequest {
+            hello: Some(hello),
+        }))
+    };
+    assert!(ask(hello_at(epoch_ms(0))).await.is_ok());
+    // The clock passes the changes at epochs 1 and 2; a caller starts now.
+    now.store(u64::try_from(epoch_ms(2)).unwrap() + 1, Ordering::SeqCst);
+    assert!(ask(hello_at(epoch_ms(2))).await.is_ok());
+    let stale = ask(hello_at(epoch_ms(0))).await.err().expect("refused");
+    assert_eq!(
+        ipc::ContractError::from_status(&stale).code(),
+        ErrorCode::VersionMismatch
+    );
+}
+
+/// A store of an older build has a custody record but no node-ID marker: its custody follows a
+/// node ID nobody recorded, so it is refused (with the message to clear the store), never
+/// taken as this node ID's.
+#[tokio::test]
+async fn a_store_without_its_node_id_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let net = devnet();
+    let open = || {
+        ProbeService::<Minimal, Valid>::open(&net, plan(dir.path(), 40), &mut Registry::default())
+    };
+    drop(open().unwrap());
+    std::fs::remove_file(dir.path().join(NODE_ID_FILE)).unwrap();
+    match open() {
+        Err(e @ OpenError::NodeIdUnknown { .. }) => {
+            assert!(e.to_string().contains("clear the store"), "{e}");
+        }
+        other => panic!("refused, got {:?}", other.err()),
+    }
+    assert!(!dir.path().join(NODE_ID_FILE).exists(), "nothing written");
+}
+
+/// The cl-verify directory's check tells apart what a wait can fix from what it cannot: a
+/// directory not there yet under closed directories, or one that another user still owns
+/// (systemd makes it, then gives it to its user), is retried; an ancestor that others can
+/// write is refused at once, whether or not the directory under it is there.
+#[test]
+fn the_verify_dir_check_tells_apart_what_a_wait_can_fix() {
+    use std::os::unix::fs::PermissionsExt;
+    let uid = ipc::uds::Ownership::current().uid;
+    let root = closed_tempdir();
+    let sock = |dir: &str| root.path().join(dir).join("cl-verify.sock");
+    // Not there yet, under closed directories.
+    assert!(matches!(
+        verify_dir_state(&sock("absent"), uid),
+        Err(VerifyDirError::Missing(_))
+    ));
+    // Not there, under a directory that others can write: refused.
+    let open = root.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(matches!(
+        verify_dir_state(&sock("open/absent"), uid),
+        Err(VerifyDirError::Refused(_))
+    ));
+    // There, closed, and ours.
+    let ours = root.path().join("verify");
+    std::fs::create_dir(&ours).unwrap();
+    std::fs::set_permissions(&ours, std::fs::Permissions::from_mode(0o750)).unwrap();
+    assert!(verify_dir_state(&sock("verify"), uid).is_ok());
+    // There and closed, but of another user than cl-verify's: retried.
+    assert!(matches!(
+        verify_dir_state(&sock("verify"), uid + 1),
+        Err(VerifyDirError::Owner(_))
+    ));
+    // There, but writable by the group: refused.
+    std::fs::set_permissions(&ours, std::fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(matches!(
+        verify_dir_state(&sock("verify"), uid),
+        Err(VerifyDirError::Refused(_))
+    ));
 }

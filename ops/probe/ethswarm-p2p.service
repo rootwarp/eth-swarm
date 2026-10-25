@@ -74,8 +74,11 @@ MemorySwapMax=0
 OOMPolicy=stop
 Restart=on-failure
 RestartSec=5min
-# No restart on a refusal that a restart cannot fix: 1 a refused credential, 2 the stub
-# (or a refused config), 64 a usage error. Exit codes of the main process only.
+# No restart on a refusal that a restart cannot fix: 1 a refused credential or a failed
+# start, 2 a refused config (/etc/ethswarm/cl-p2p.toml) or custody columns of another key,
+# 64 a usage error (any argument). Exit codes of the main process only. Not listed, so
+# restarted: 69, cl-chain did not accept within chain_wait_ms or the clock is before genesis,
+# and 70, a fault of the run that a restart can fix.
 # Not listed, so restarted: 71 EXIT_NO_LOG_WRITER (EX_OSERR), cl-p2p could not start its
 # log-writer thread and exited at once, leaving stderr empty on purpose:
 # no application stderr line, though systemd still logs the exit. A thread limit can lift;

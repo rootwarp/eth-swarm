@@ -28,6 +28,45 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// A record made by an independent encoder (Python, not [`crate::enr_text`]): eth2 with digest
+/// 0x669e6c11 (the pinned Sepolia Gloas digest), next version 0x90000076, next epoch
+/// FAR_FUTURE_EPOCH, plus attnets, id, ip, secp256k1, syncnets, tcp and udp.
+pub const ENR_GLOAS: &str = "enr:-Ly4QBEREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREFh2F0dG5ldHOI__________-EZXRoMpBmnmwRkAAAdv__________gmlkgnY0gmlwhH8AAAGJc2VjcDI1NmsxoQIBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fIIhzeW5jbmV0cw-DdGNwgiMog3VkcIIjKA";
+/// The same record with digest 0x74d01459 (the second Sepolia BPO digest).
+pub const ENR_BPO2: &str = "enr:-Ly4QBEREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREREFh2F0dG5ldHOI__________-EZXRoMpB00BRZkAAAdv__________gmlkgnY0gmlwhH8AAAGJc2VjcDI1NmsxoQIBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fIIhzeW5jbmV0cw-DdGNwgiMog3VkcIIjKA";
+
+/// The textual form (`enr:` and unpadded URL-safe base64) of a node record with `pairs`, which
+/// the caller gives in key order, after a dummy signature and seq 1: what [`crate::enr_text`]
+/// reads. The signature is not valid, so only a reader that does not verify it accepts it.
+#[must_use]
+pub fn record_text(pairs: &[(&[u8], &[u8])]) -> String {
+    fn header(short: u8, len: usize) -> Vec<u8> {
+        if len < 56 {
+            // A short item: one byte, as `len` < 56 fits.
+            vec![short + len as u8]
+        } else {
+            let be = len.to_be_bytes();
+            let first = be.iter().position(|&b| b != 0).unwrap_or(be.len() - 1);
+            let mut out = vec![short + 55 + (be.len() - first) as u8];
+            out.extend_from_slice(&be[first..]);
+            out
+        }
+    }
+    fn string(bytes: &[u8]) -> Vec<u8> {
+        match bytes {
+            [b] if *b < 0x80 => vec![*b],
+            _ => [header(0x80, bytes.len()), bytes.to_vec()].concat(),
+        }
+    }
+    let mut payload = [string(&[0x11; 64]), string(&[1])].concat();
+    for (key, value) in pairs {
+        payload.extend(string(key));
+        payload.extend(string(value));
+    }
+    let raw = [header(0xc0, payload.len()), payload].concat();
+    format!("enr:{}", data_encoding::BASE64URL_NOPAD.encode(&raw))
+}
+
 /// The custody group count [`control`] advertises.
 pub const FIXTURE_CGC: u64 = 4;
 

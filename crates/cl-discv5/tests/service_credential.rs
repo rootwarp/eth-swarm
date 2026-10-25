@@ -82,14 +82,14 @@ fn a_credential_others_can_read_is_refused() {
 }
 
 #[test]
-fn a_good_credential_loads_and_the_stub_stops_without_showing_the_key() {
+fn a_good_credential_loads_and_a_missing_config_stops_it_without_showing_the_key() {
     let dir = credentials(0o400);
     let o = cl_discv5(Some(dir.path()));
-    // The service itself is still a stub: node key loaded, then "not runnable yet".
+    // The node key loads, then the config is refused: /etc/ethswarm/cl-discv5.toml is not there.
     assert_eq!(o.status.code(), Some(2));
     let text = output(&o);
     assert!(text.contains("node key loaded"), "{text}");
-    assert!(text.contains("not runnable yet"), "{text}");
+    assert!(text.contains("config refused"), "{text}");
     assert_no_key(&text);
     assert_json_lines(&o);
 }

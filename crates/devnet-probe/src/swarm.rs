@@ -1,50 +1,26 @@
-//! The probe swarm on a devnet: cl-p2p's [`build_swarm`] (TCP, Noise XX, yamux then mplex,
-//! connection limits, identify) with its req/resp behaviour ([`Control`]) over the devnet's
-//! preset and fork digests, and, if asked for, its ignore-all gossipsub ([`IgnoreAll`],
-//! `build_swarm_with_gossip`) on `beacon_block`.
+//! The probe swarm on a devnet: cl-p2p's service swarm (`cl_p2p::service::swarm`: TCP, Noise
+//! XX, yamux then mplex, connection limits, identify, the req/resp behaviour) over the devnet's
+//! preset and fork digests, and, if asked for, its ignore-all gossipsub on `beacon_block`.
 
 use super::devnet::Devnet;
 use cl_p2p::behaviour::SpecBehaviour;
-use cl_p2p::gossip::{CaptureTap, GossipConfig, IgnoreAll};
-use cl_p2p::rpc::codec::Deadlines;
-use cl_p2p::rpc::columns::ColumnSource;
-use cl_p2p::rpc::inbound::{Control, ControlConfig, SharedMetaData, StatusSource};
-use cl_p2p::rpc::limits::RpcLimits;
-use cl_p2p::rpc::metrics::RpcMetrics;
-use cl_p2p::transport::{
-    build_swarm, build_swarm_with_gossip, MuxerBudget, MuxerObserver, SwarmConfig, TransportMetrics,
-};
-use consensus_types::caps::NetworkCaps;
+use cl_p2p::rpc::inbound::StatusSource;
 use consensus_types::das::CUSTODY_REQUIREMENT;
 use consensus_types::EthSpec;
 use libp2p::identity::Keypair;
-use libp2p::{Multiaddr, PeerId, Swarm};
+use libp2p::Swarm;
 use p2p_wire::gossip::{GossipKind, GossipTopic};
-use p2p_wire::rpc::messages::{ForkDigest, MetaDataV3};
 use prometheus_client::registry::Registry;
 use std::sync::Arc;
-use std::time::Duration;
 
-/// How the probe swarm is built.
-#[derive(Debug, Clone)]
-pub struct SwarmPlan {
-    /// Where it listens; none for a swarm that only dials.
-    pub listen: Vec<Multiaddr>,
-    /// How long a connection with no open stream stays up.
-    pub idle: Duration,
-    /// Peers exempt from the connection caps: the reference CLs.
-    pub bypass: Vec<PeerId>,
-    /// Told the muxer each connection negotiated.
-    pub muxer_observer: Option<MuxerObserver>,
-    /// How often the req/resp behaviour pings each connected peer: cl-p2p's Ping cadence
-    /// (`cl_p2p::rpc::inbound::PING_INTERVAL` in production).
-    pub ping_interval: Duration,
-    /// The ignore-all gossipsub, subscribed to `beacon_block` at this fork digest; none if
-    /// `None`. It reports IGNORE for every message, so it forwards nothing.
-    pub gossip: Option<ForkDigest>,
-    /// The req/resp limits: the quotas, and the column answer places and their address blocks.
-    pub limits: RpcLimits,
-}
+pub use cl_p2p::service::swarm::{Gossip, Sources, SwarmPlan};
+
+#[cfg(test)]
+use cl_p2p::rpc::limits::RpcLimits;
+#[cfg(test)]
+use p2p_wire::rpc::messages::ForkDigest;
+#[cfg(test)]
+use std::time::Duration;
 
 /// The probe swarm for `devnet` under the preset `E`, with an ephemeral secp256k1 node key, our
 /// Status from `status`, MetaData `seq_number` 0 and the custody group count
@@ -73,25 +49,6 @@ pub fn probe_swarm<E: EthSpec>(
     serving_swarm(devnet, Keypair::generate_secp256k1(), sources, plan, gossip)
 }
 
-/// Where the probe swarm's answers come from.
-pub struct Sources {
-    /// Our Status.
-    pub status: Arc<dyn StatusSource>,
-    /// The MetaData `custody_group_count` (`seq_number` 0, no attestation or sync subnets).
-    pub custody_group_count: u64,
-    /// The custody columns' source; `None` answers every column request
-    /// `3: ResourceUnavailable`.
-    pub columns: Option<Arc<dyn ColumnSource>>,
-}
-
-/// The ignore-all gossipsub's topics, and the tap each message also goes to.
-pub struct Gossip {
-    /// The topics it subscribes.
-    pub topics: Vec<GossipTopic>,
-    /// Every message, as gossipsub delivers it.
-    pub tap: Option<CaptureTap>,
-}
-
 /// The probe swarm for `devnet` under the preset `E`, with the node key `key`, answering from
 /// `sources`, with the ignore-all gossipsub on `gossip`'s topics if given (`plan.gossip` is not
 /// read). Every column answer is read and served under the devnet's caps
@@ -101,7 +58,7 @@ pub struct Gossip {
 ///
 /// # Errors
 ///
-/// The req/resp limits were refused for the devnet's blob schedule ([`RpcLimits::validate`]),
+/// The req/resp limits were refused for the devnet's blob schedule,
 /// or the swarm could not be built or could not listen.
 pub fn serving_swarm<E: EthSpec>(
     devnet: &Devnet,
@@ -110,49 +67,15 @@ pub fn serving_swarm<E: EthSpec>(
     plan: SwarmPlan,
     gossip: Option<Gossip>,
 ) -> Result<Swarm<SpecBehaviour<E>>, String> {
-    plan.limits
-        .validate::<E>(&NetworkCaps::from_config(devnet.config()))
-        .map_err(|e| format!("req/resp limits: {e}"))?;
-    let mut registry = Registry::default();
-    let transport = TransportMetrics::register(&mut registry);
-    let mut cfg = SwarmConfig::new(MuxerBudget::with_defaults(&transport));
-    cfg.listen_addrs = plan.listen;
-    cfg.idle_connection_timeout = plan.idle;
-    cfg.bypass = plan.bypass;
-    cfg.muxer_observer = plan.muxer_observer;
-    let control = Control::<E>::new(
-        ControlConfig {
-            status: sources.status,
-            metadata: Arc::new(SharedMetaData::new(MetaDataV3 {
-                seq_number: 0,
-                attnets: Default::default(),
-                syncnets: Default::default(),
-                custody_group_count: sources.custody_group_count,
-            })),
-            contexts: Arc::new(devnet.context_table()),
-            deadlines: Deadlines::default(),
-            limits: plan.limits,
-            ping_interval: plan.ping_interval,
-            columns: sources.columns,
-        },
-        RpcMetrics::register(&mut registry),
-    );
-    match gossip {
-        None => build_swarm(key, &cfg, control).map_err(|e| e.to_string()),
-        Some(gossip) => {
-            let gossip_cfg = GossipConfig::ethereum_profile::<E>(
-                devnet.config(),
-                gossip.topics,
-                devnet.topic_caps::<E>(),
-            );
-            let mut ignore_all = IgnoreAll::new(&gossip_cfg, &mut registry)
-                .map_err(|e| format!("gossipsub: {e}"))?;
-            if let Some(tap) = gossip.tap {
-                ignore_all = ignore_all.with_tap(tap);
-            }
-            build_swarm_with_gossip(key, &cfg, control, ignore_all).map_err(|e| e.to_string())
-        }
-    }
+    cl_p2p::service::swarm::serving_swarm::<E>(
+        devnet.config(),
+        &devnet.genesis(),
+        key,
+        sources,
+        plan,
+        gossip,
+        &mut Registry::default(),
+    )
 }
 
 /// `error` and every `source()` under it, `: `-separated.

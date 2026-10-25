@@ -30,11 +30,14 @@ install -d -m 0700 /etc/ethswarm/credentials
 # The 32-byte secp256k1 secret, root-owned.
 install -m 0600 node.key /etc/ethswarm/credentials/nodekey
 install -m 0600 anchor-check.env /etc/ethswarm/anchor-check.env
-# Each service's config: root-owned, readable, holds no secret (see "Services").
-install -m 0644 cl-chain.toml /etc/ethswarm/cl-chain.toml
-# cl-p2p calls cl-chain and cl-discv5 on their sockets (directories 0750, sockets 0660).
+# Each service's config and the topic list: root-owned, readable, no secret (see "Services").
+install -m 0644 cl-chain.toml cl-discv5.toml cl-p2p.toml /etc/ethswarm/
+install -m 0644 ops/probe/gossip-topics.toml /etc/ethswarm/gossip-topics.toml
+# cl-p2p calls cl-chain and cl-discv5 on their sockets (directories 0750, sockets 0660), and
+# cl-chain calls cl-verify on its socket (here cl-verify's group is ethswarm-verify).
 usermod -a -G ethswarm-chain ethswarm-p2p
 usermod -a -G ethswarm-discv5 ethswarm-p2p
+usermod -a -G ethswarm-verify ethswarm-chain
 # The three units by name, never a glob: only these three are linted.
 install -m 0644 ops/probe/ethswarm-p2p.service ops/probe/ethswarm-discv5.service ops/probe/ethswarm-chain.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now ethswarm-chain ethswarm-discv5 ethswarm-p2p
@@ -115,17 +118,23 @@ verify_uid = 993                              # the UID that cl-verify runs as
 | Exit | Meaning | Restarted |
 |---|---|---|
 | 0 | SIGTERM: the watch streams end, in-flight calls drain, the socket is removed; during the wait for cl-verify, at once | no |
-| 1 | a start that a restart cannot fix: the store, the socket's bind, an ACL of unserved methods, a cl-verify directory open to others, a cl-verify server of another user | no |
-| 2 | the config was refused, or the store holds the custody of another `node_id` | no |
+| 1 | a start that a restart cannot fix: the store, the socket's bind, an ACL of unserved methods, a cl-verify directory open to others (or still another user's at the end of the wait), a cl-verify server of another user | no |
+| 2 | the config was refused, or the store holds the custody of another `node_id` (or of an unrecorded one) | no |
 | 64 | an argument (the unit passes none) | no |
 | 69 | cl-verify's directory or socket was not there within `verify_wait_ms`, or the clock is before genesis | yes |
-| 70 | a fault of the run that a restart can fix: the server task, a drain past its deadline, `/metrics`, the service manager | yes |
+| 70 | a fault of the run that a restart can fix: the server task, a drain past its deadline, `/metrics`, the service manager, a store that did not close within 10 s | yes |
 | 71 | the log writer could not start | yes |
 
-The store keeps the node ID of its first start (`node-id` in `columns_dir`, mode 0600). A start
-with another `node_id` exits 2, because the custody columns follow the node ID: remove the
-store's directory to start with the new one. After the drain, the store gets 10 s to close, so
-the stop ends within the unit's stop timeout.
+The store keeps the node ID of its first start (`node-id` in `columns_dir`, mode 0600, the
+directory synced after it). A start with another `node_id` exits 2, because the custody columns
+follow the node ID: remove the store's directory to start with the new one. A store of an older
+build, with custody but no `node-id`, exits 2 too. After the drain, the store gets 10 s to
+close, so the stop ends within the unit's stop timeout; a store that does not close in time
+exits 70 and logs how many columns were still on their way.
+
+The wait for cl-verify (`verify_wait_ms`) covers its directory too. A directory that is not
+there yet, or that another user still owns (systemd makes it, then gives it to its user), is
+waited for. A directory, or one above it, that other users can write is refused at once.
 
 **The reference API.** `reference_api_url` is plain HTTP. On a private address of a shared
 network, anyone on that network can read and change what cl-chain gets, and the reference
@@ -134,12 +143,101 @@ decides which block roots cl-chain stores. Prefer an SSH tunnel to a loopback po
 Use a private address only on a network that only the probe and the reference share, such as
 the Kurtosis enclave network.
 
-Known limit: cl-chain's chain.v1 hello carries the fork digest of its start. After a fork or
-BPO digest change, a caller that started later sends another digest, and its streams get
-`VERSION_MISMATCH` (`GetStatus`, a unary call, still works). Restart cl-chain after such a
-change until its link follows the clock.
+### The hellos follow the clock
 
-cl-discv5 and cl-p2p are still stubs: they load the node key, then exit 2.
+Every chain.v1 and discv5.v1 stream carries the fork digest of the wall-clock epoch at its
+start (`ipc::Link::network`), on both ends. So a service that starts after a fork or BPO
+digest change is accepted by a service that started before it, and no restart is needed at a
+change. A peer that still sends the old digest is refused with `VERSION_MISMATCH`.
+
+### cl-discv5
+
+cl-discv5 runs discv5 with the node key (`cl_discv5::process`). Its record carries the fork
+fields of the wall clock and takes the new ones at each digest change. It logs its node ID and
+its record at start: both are public, and cl-chain's `node_id` is that node ID. It starts its
+routing table from `bootnodes` and does a lookup every `lookup_interval_ms`. At a digest change
+it keeps the records that announce the new digest as their next one (`nfd`), and keeps the
+records of the old digest for one epoch, while peers update their records. Only cl-p2p's UID
+can call its two methods: `WatchPeers` (the table's records, then each record found) and
+`GetLocalEnr`. Its `cgc` must be cl-chain's custody group count: cl-p2p refuses another.
+
+```toml
+# /etc/ethswarm/cl-discv5.toml
+network_dir = "/etc/ethswarm/network"   # or: network = "sepolia"
+metrics_port = 9103
+
+[socket]
+group = 992                             # the GID of ethswarm-discv5
+
+[callers]
+cl-p2p = 991                            # the UID of ethswarm-p2p
+
+[methods]                               # exactly these two, to cl-p2p only
+"/ethswarm.discv5.v1.DiscoveryService/WatchPeers" = ["cl-p2p"]
+"/ethswarm.discv5.v1.DiscoveryService/GetLocalEnr" = ["cl-p2p"]
+
+[discv5]
+mode = "public"                  # public, devnet or local: the routing table's IP rules
+bootnodes = ["enr:<record>"]
+# listen_ip = "0.0.0.0"  udp_port = 9000  tcp_port = 9000  (cl-p2p's port, in our record)
+# enr_ip = "<our IPv4 address>"  cgc = 4  lookup_interval_ms = 30000  lookup_peers = 16
+```
+
+### cl-p2p
+
+cl-p2p runs the swarm (`cl_p2p::service`). At start it waits for cl-chain (`chain_wait_ms`)
+and for its first custody subscriptions, and refuses to start (exit 2) if those columns are not
+the custody columns of its own node key: cl-chain's `node_id` is then another key's. It holds
+each later subscriptions body to the same key and group count (exit 2). It subscribes the
+ignore-all gossipsub to the topics of `gossip_topics` and to the custody column subnets, under
+every fork digest that cl-chain names, and to the topics of a new digest ahead of its change.
+The topics of a digest that cl-chain no longer names leave one epoch after the change, so the
+topic set stays within its bound (418 topics) at every fork and BPO change. Its Status, its
+column answers and its custody come from cl-chain. Before each `WatchPeers` stream it reads
+cl-discv5's record (`GetLocalEnr`) and stops (exit 2) if its `cgc` is not cl-chain's custody
+group count. It dials cl-discv5's candidates, their addresses held to the IP rule of `mode`
+(the value of cl-discv5's `mode`), up to `target_peers` of its own dials, the `static_peers`
+first and always, once it has a Status. Inbound peers do not count toward `target_peers`: they
+have their own 128 slots, and the 32 outbound slots stay ours. It feeds the Goodbye ledger and
+ticks it every 60 s; an event that does not fit the feed is dropped and counted on
+`p2p_ledger_feed_dropped_total`, but a disconnect is never dropped. On SIGTERM it sends Goodbye
+1 (client shutdown) to every peer and gives that 1 s before it exits.
+
+```toml
+# /etc/ethswarm/cl-p2p.toml
+network_dir = "/etc/ethswarm/network"   # or: network = "sepolia"
+metrics_port = 9101
+
+[socket]
+group = 991                             # the GID of ethswarm-p2p
+
+[callers]                               # the p2p.v1 stub's ACL: its future callers
+cl-sync = 994
+
+[methods]
+"/ethswarm.p2p.v1.NetworkService/ListPeers" = ["cl-sync"]
+
+[p2p]
+chain_uid = 990                         # the UID of ethswarm-chain
+discv5_uid = 992                        # the UID of ethswarm-discv5
+# listen = ["/ip4/0.0.0.0/tcp/9000"]
+# chain_socket = "/run/ethswarm/cl-chain/cl-chain.sock"
+# discv5_socket = "/run/ethswarm/cl-discv5/cl-discv5.sock"
+# gossip_topics = "/etc/ethswarm/gossip-topics.toml"   (read only if root owns it)
+# target_peers = 32  (1 to 32: our own dials)  static_peers = []
+# answer_prefix_v4 = 24  answer_prefix_v6 = 48  chain_wait_ms = 30000
+# mode = "public"                       # public, devnet or local: as cl-discv5's mode
+# [p2p.goodbye_ledger]  goodbye3_threshold_pct = 2.0
+```
+
+cl-discv5 and cl-p2p use the exit codes of cl-chain, with 1 also for a refused credential. The
+credential is checked before the config. cl-p2p exits 2 also for custody columns of another
+key or of another group count, at the start or later, and for a cl-discv5 record of another
+`cgc`; 69 when cl-chain (its directory included) did not accept or send its subscriptions within
+`chain_wait_ms`, and 1 when the server on cl-chain's socket runs as another user. Both exit 70
+for a fault of the run that a restart can fix. A server of another user on cl-discv5's socket
+does not stop cl-p2p: it is logged at ERROR at each try, and cl-p2p dials only its static
+peers.
 
 ## Node key
 
@@ -326,8 +424,10 @@ subscription whitelist that starts as these topics plus all 128
 within 418), every name a Gloas topic name so the
 control-message size (46,898 bytes, computed for the two-fork set of every topic) still fits
 without a recompute, and each topic's decompressed cap on Sepolia (largest message 10 MiB, one
-message of every topic 21,362,195 bytes). Set the attestation and column subnets to the ones
-the probe samples and custodies before a run.
+message of every topic 21,362,195 bytes). Set the attestation subnets to the ones the probe
+samples before a run. cl-p2p also subscribes the custody column subnets that cl-chain names
+(`WatchSubscriptions`), so the custody subnets need not be in the file: a column subnet of the
+file that is not a custody subnet is still subscribed, and cl-chain drops its columns.
 
 ## Not covered here
 

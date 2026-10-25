@@ -15,7 +15,7 @@
 //! Each message also goes to an optional [`CaptureTap`] with its receive time: a bounded queue
 //! that drops (and counts) when the reader is behind, so capture never slows the swarm.
 
-use super::config::topic_hash;
+use super::config::{digest_of, topic_hash};
 use super::{GossipConfig, GossipError, TopicSet};
 use libp2p::core::transport::PortUse;
 use libp2p::core::Endpoint;
@@ -29,6 +29,7 @@ use libp2p::swarm::{
 };
 use libp2p::{Multiaddr, PeerId};
 use p2p_wire::gossip::GossipTopic;
+use p2p_wire::rpc::messages::ForkDigest;
 use prometheus_client::registry::Registry;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -251,6 +252,32 @@ impl IgnoreAll<ProbeGossipsub> {
         }
         Ok(subscribed)
     }
+
+    /// Retires the fork digest `digest`: unsubscribes every topic under it, and removes them
+    /// from the subscribed set and from the whitelist (its whitelisted column subnets too), so
+    /// the room takes the topics of later digests. Returns how many topics were unsubscribed.
+    /// gossipsub tells our peers and leaves the meshes; the transform refuses the topics' late
+    /// messages before decompression, as for any topic we do not subscribe.
+    pub fn retire_digest(&mut self, digest: ForkDigest) -> usize {
+        let ours: Vec<TopicHash> = self
+            .inner
+            .topics()
+            .filter(|t| digest_of(t) == Some(digest))
+            .cloned()
+            .collect();
+        let mut unsubscribed = 0;
+        for topic in &ours {
+            if self
+                .inner
+                .unsubscribe(&gossipsub::IdentTopic::new(topic.as_str()))
+            {
+                unsubscribed += 1;
+            }
+        }
+        self.topics.remove_digest(digest);
+        self.whitelist.remove_digest(digest);
+        unsubscribed
+    }
 }
 
 impl<G> IgnoreAll<G> {
@@ -276,6 +303,16 @@ impl<G> IgnoreAll<G> {
     /// Messages reported IGNORE so far.
     pub fn ignored(&self) -> u64 {
         self.ignored
+    }
+
+    /// The topics in the whitelist: at most [`super::config::MAX_TOPICS`].
+    pub fn whitelist_len(&self) -> usize {
+        self.whitelist.len()
+    }
+
+    /// The topics in the subscribed set, which the transform decodes.
+    pub fn subscribed_len(&self) -> usize {
+        self.topics.len()
     }
 
     /// The gossipsub behaviour, read-only (mesh and peer state).

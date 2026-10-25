@@ -1,9 +1,12 @@
-//! `cl-p2p`: serves `ethswarm.p2p.v1`, outbound peer requests and peer scoring.
+//! `cl-p2p`: the probe's libp2p side, and `ethswarm.p2p.v1` (outbound peer requests and peer
+//! scoring).
 //!
-//! This is a stub. Every RPC runs the `ipc` contract layer first (hello negotiation, frame
-//! discipline, `seq`, envelope type and digest checks) and then answers `UNIMPLEMENTED`, so the
-//! service already holds its peers to the wire contract. `tests/contract.rs` runs the contract
-//! suite against it, in process and over a Unix socket.
+//! [`service`] is the `cl-p2p` process that `ops/probe/ethswarm-p2p.service` runs: the swarm,
+//! cl-chain's Status, columns and custody subscriptions over its socket, cl-discv5's peers, the
+//! Goodbye ledger's feed and `/metrics`. [`P2pStub`] serves `ethswarm.p2p.v1` on its socket,
+//! still a stub: every RPC runs the `ipc` contract layer first (hello negotiation, frame
+//! discipline, `seq`, envelope type and digest checks) and then answers `UNIMPLEMENTED`.
+//! `tests/contract.rs` runs the contract suite against it, in process and over a Unix socket.
 //!
 //! [`rpc`] is req/resp over libp2p `request_response`: the codec (both halves, deadlines
 //! inside) and the probe's control protocols ([`rpc::inbound::Control`]: Status, MetaData,
@@ -13,17 +16,20 @@
 //! [`behaviour`]), and [`identity`] the service's node key from its systemd credential.
 //! [`gossip`] is the probe's gossipsub, which reports IGNORE for every message and so forwards
 //! none; [`custody`] subscribes it to exactly the custody column subnets cl-chain names.
+//! [`enr_text`] reads one field of a textual node record.
 //! [`peers`] records what the probe learns of its peers: the Goodbye ledger
 //! ([`peers::manager::GoodbyeLedger`]), reason-3 Goodbyes from Status-valid peers per hour.
 
 pub mod behaviour;
 pub mod custody;
+pub mod enr_text;
 pub mod gossip;
 pub mod identity;
 pub mod m2a_session;
 pub mod peer_caps;
 pub mod peers;
 pub mod rpc;
+pub mod service;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod transport;

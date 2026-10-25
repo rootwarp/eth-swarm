@@ -278,7 +278,7 @@ mod tests {
             start_slot: 0,
             count: 1,
             columns: vec![1],
-            hello: Some(link().local().clone()),
+            hello: Some(link().local()),
         };
         let stream = client
             .data_columns_by_range(request)
@@ -308,7 +308,7 @@ mod tests {
             start_slot: 0,
             count: 1,
             columns: vec![1],
-            hello: Some(link().local().clone()),
+            hello: Some(link().local()),
         };
         let mut stream = ReqRespService::data_columns_by_range(&stub, tonic::Request::new(request))
             .await
