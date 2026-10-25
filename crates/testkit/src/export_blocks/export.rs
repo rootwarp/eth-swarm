@@ -9,8 +9,8 @@ use super::manifest::{
 use super::open::{open_export, Export};
 use super::ExportError;
 use crate::archive::{
-    create_dir_new_durable, open_verified, validate_network, write_durable, ArchiveError, Capture,
-    CaptureConfig, ChainParams, ForkDigest, Writer, MAX_MANIFEST_LEN,
+    create_dir_new_durable, digest_in_force, open_verified, validate_network, write_durable,
+    ArchiveError, Capture, CaptureConfig, ChainParams, ForkDigest, Writer, MAX_MANIFEST_LEN,
 };
 use crate::collector::{ApiError, ReferenceApiUrl};
 use consensus_types::caps::{NetworkCaps, MAX_PAYLOAD_SIZE};
@@ -332,19 +332,6 @@ async fn read_genesis<E: EthSpec>(
     })
 }
 
-/// The digest of `digests` (ascending by epoch) in force at `slot`.
-pub(super) fn digest_at<E: EthSpec>(
-    digests: &[(Epoch, ForkDigest)],
-    slot: Slot,
-) -> Option<ForkDigest> {
-    let epoch = E::epoch_at_slot(slot);
-    digests
-        .iter()
-        .rev()
-        .find(|(from, _)| *from <= epoch)
-        .map(|(_, d)| *d)
-}
-
 /// The block at `slot` continues the chain walked so far: the genesis block has a zero
 /// parent and the genesis state's root; every later one has the last block before it (`tip`,
 /// across any empty slots) as its parent.
@@ -462,7 +449,7 @@ impl Walk<'_> {
         slot: Slot,
         ssz: &[u8],
     ) -> Result<(), ExportError> {
-        let digest = digest_at::<E>(self.digests, slot).ok_or_else(|| {
+        let digest = digest_in_force(self.digests, E::epoch_at_slot(slot)).ok_or_else(|| {
             ExportError::Config(format!("the config has no fork digest at slot {slot}"))
         })?;
         let payload = snap::raw::Encoder::new()

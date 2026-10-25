@@ -19,8 +19,11 @@
 //! root: the pinned one, or `--genesis-validators-root` for a network without one (Hoodi). A
 //! refused payload is reported and skipped; an error that stops the capture, including an input
 //! file over the gossip size bound (never read past it), seals what was written, marked as
-//! stopped. `verify` runs [`testkit::archive::open_verified`] and prints the segment's slot
-//! range, file count and archive sha256.
+//! stopped. Each manifest records the digest schedule over its segment's slot range, so a
+//! segment that spans a fork or BPO boundary (a late payload joins the open segment) names
+//! both digests. `verify` runs [`testkit::archive::open_verified`] and prints the segment's
+//! slot range, file count and archive sha256. It refuses a file whose fork digest is not the
+//! one that the manifest's schedule gives for its slot.
 //!
 //! Exit codes: 0 done, 1 a payload refused, the capture stopped or the archive refused, 64
 //! usage.
@@ -69,7 +72,8 @@ A payload on a fork digest other than the network's for its slot is refused; an 
 over the gossip size bound stops the capture.
 
 verify checks a segment's manifest digest and every file's length and sha256, and refuses
-missing and extra files.
+missing and extra files. It also checks each file's fork digest against the digest schedule
+in the manifest (each digest with the epoch where it starts) for the file's slot.
 
 Exit codes: 0 done, 1 a payload refused, the capture stopped or the archive refused, 64 usage.";
 
@@ -424,7 +428,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::fs;
     use testkit::archive::{
-        fixtures, ArchiveError, ArchiveFile, ClosedBy, Fault, Manifest, ManifestError,
+        fixtures, ArchiveError, ArchiveFile, ClosedBy, DigestEntry, Fault, Manifest, ManifestError,
         MANIFEST_FILE, OPEN_PREFIX,
     };
 
@@ -915,6 +919,221 @@ mod tests {
                 source: ManifestError::DigestMismatch { .. },
                 ..
             }
+        ));
+    }
+
+    /// A genesis validators root for the Hoodi tests. Hoodi pins none, and any root gives a
+    /// consistent digest schedule.
+    const HOODI_TEST_ROOT: [u8; 32] = [0x21; 32];
+
+    fn hoodi() -> ChainConfig {
+        ChainConfig::load(Network::Hoodi).unwrap()
+    }
+
+    /// Hoodi's Gloas fork epoch and its first slot.
+    fn hoodi_gloas() -> (consensus_types::primitives::Epoch, Slot) {
+        let epoch = hoodi().fork_schedule().fork_epoch(ForkName::Gloas).unwrap();
+        (epoch, Mainnet::start_slot_at_epoch(epoch))
+    }
+
+    /// Hoodi's digest at an epoch, with [`HOODI_TEST_ROOT`].
+    fn hoodi_digest(epoch: consensus_types::primitives::Epoch) -> ForkDigest {
+        compute_fork_digest(&hoodi(), &HOODI_TEST_ROOT, epoch).unwrap()
+    }
+
+    /// Replaces the `fork_digest` of the file at `path` in the manifest text with `to`, and
+    /// rehashes the body: a forged manifest whose archive digest still holds.
+    fn forge_file_digest(manifest: &str, path: &str, to: ForkDigest) -> String {
+        let (_, body) = manifest.split_once('\n').unwrap();
+        let table = body.find(&format!("path = \"{path}\"")).unwrap();
+        let key = "fork_digest = \"0x";
+        let at = table + body[table..].find(key).unwrap() + key.len();
+        let mut body = body.to_owned();
+        body.replace_range(at..at + 8, &hex::encode(to));
+        let digest = hex::encode(sha256(body.as_bytes()));
+        format!("archive_sha256 = \"{digest}\"\n{body}")
+    }
+
+    /// A Hoodi segment across the Gloas fork (epoch 132352, slot 4235264): the Gloas block and
+    /// column, then the last Fulu block and column late, then the next Gloas block. The late
+    /// payloads join the open segment, so one manifest holds both digests. It round-trips, and
+    /// `open_verified` refuses a file whose fork digest is not the one of its slot.
+    #[test]
+    fn two_digest_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (gloas_epoch, gloas) = hoodi_gloas();
+        assert_eq!((gloas_epoch, gloas), (132352, 4_235_264));
+        let schedule = *hoodi().fork_schedule();
+        let (pre, post) = (hoodi_digest(gloas_epoch - 1), hoodi_digest(gloas_epoch));
+        assert_ne!(pre, post);
+        let late = gloas - 1;
+        let input = tmp.path().join("input");
+        fs::create_dir_all(&input).unwrap();
+        let payloads = [
+            (
+                "beacon_block",
+                gloas,
+                fixtures::block_on::<Mainnet>(&schedule, gloas, 1),
+            ),
+            (
+                COLUMN,
+                gloas,
+                fixtures::column_on::<Mainnet>(&schedule, gloas, 1, 5),
+            ),
+            (
+                "beacon_block",
+                late,
+                fixtures::block_on::<Mainnet>(&schedule, late, 2),
+            ),
+            (
+                COLUMN,
+                late,
+                fixtures::column_on::<Mainnet>(&schedule, late, 2, 5),
+            ),
+            (
+                "beacon_block",
+                gloas + 1,
+                fixtures::block_on::<Mainnet>(&schedule, gloas + 1, 3),
+            ),
+        ];
+        for (seq, (topic, slot, (payload, _))) in payloads.iter().enumerate() {
+            let digest = if *slot < gloas { pre } else { post };
+            let name = format!("{seq}_{}_{topic}{INPUT_SUFFIX}", hex::encode(digest));
+            fs::write(input.join(name), payload).unwrap();
+        }
+        let out = tmp.path().join("archive");
+        let mut a = capture_args(input.to_str().unwrap(), out.to_str().unwrap());
+        let gvr = format!("0x{}", hex::encode(HOODI_TEST_ROOT));
+        a[2] = "hoodi";
+        a.extend(["--genesis-validators-root", &gvr]);
+        let (code, stdout, stderr) = run_args(&a);
+        assert_eq!(code, 0, "{stderr}");
+        let segment = out.join(format!("hoodi/{late}-{}", gloas + 1));
+        assert_eq!(
+            stdout.lines().collect::<Vec<_>>(),
+            [segment.to_str().unwrap()]
+        );
+
+        // The manifest names both digests, the schedule over its slot range and, per file, the
+        // digest of its slot.
+        let archive = open_verified(&segment).unwrap();
+        let m = archive.manifest();
+        let bpo = hoodi()
+            .blob_schedule()
+            .iter()
+            .map(|b| b.epoch)
+            .filter(|e| *e < gloas_epoch)
+            .max()
+            .unwrap();
+        assert_eq!(hoodi_digest(bpo), pre, "the last BPO digest is in force");
+        assert_eq!(
+            m.digest_schedule,
+            [
+                DigestEntry {
+                    epoch: bpo,
+                    digest: pre
+                },
+                DigestEntry {
+                    epoch: gloas_epoch,
+                    digest: post
+                }
+            ]
+        );
+        let mut both = vec![pre, post];
+        both.sort();
+        assert_eq!(m.fork_digests, both);
+        assert_eq!(archive.files().len(), payloads.len());
+        for f in archive.files() {
+            let want = if f.slot < gloas { pre } else { post };
+            assert_eq!((f.fork_digest, m.digest_at(f.slot)), (want, Some(want)));
+        }
+        let text = fs::read_to_string(segment.join(MANIFEST_FILE)).unwrap();
+        for field in [
+            "format_version = 2".to_string(),
+            format!(
+                "[[digest_schedule]]\nepoch = {bpo}\ndigest = \"0x{}\"",
+                hex::encode(pre)
+            ),
+            format!(
+                "[[digest_schedule]]\nepoch = {gloas_epoch}\ndigest = \"0x{}\"",
+                hex::encode(post)
+            ),
+        ] {
+            assert!(text.contains(&field), "{field} missing from\n{text}");
+        }
+        let (bytes, digest) = m.render().unwrap();
+        assert_eq!(
+            (bytes, digest),
+            (text.clone().into_bytes(), archive.archive_sha256())
+        );
+        assert_eq!(
+            Manifest::parse(text.as_bytes()).unwrap(),
+            (m.clone(), digest)
+        );
+
+        // A file on the other digest than its slot's, in a rehashed manifest: refused, in both
+        // directions across the fork.
+        let manifest = segment.join(MANIFEST_FILE);
+        for (slot, wrong, right) in [(late, post, pre), (gloas, pre, post)] {
+            let file = archive
+                .files()
+                .iter()
+                .find(|f| f.slot == slot && f.topic == "beacon_block")
+                .unwrap();
+            fs::write(&manifest, forge_file_digest(&text, &file.path, wrong)).unwrap();
+            let e = open_verified(&segment).unwrap_err();
+            assert!(
+                matches!(
+                    &e,
+                    ArchiveError::Manifest {
+                        source: ManifestError::ForkDigest { path, slot: s, expected, got },
+                        ..
+                    } if *path == file.path && *s == slot && *expected == Some(right)
+                        && *got == wrong
+                ),
+                "{slot}: {e}"
+            );
+            let (code, _, stderr) = run_args(&["verify", segment.to_str().unwrap()]);
+            assert_eq!(code, EXIT_FAILED);
+            assert!(stderr.contains("fork digest"), "{stderr}");
+        }
+        fs::write(&manifest, &text).unwrap();
+        let (code, stdout, _) = run_args(&["verify", segment.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        assert!(stdout.contains("5 files"), "{stdout}");
+    }
+
+    /// A segment of the format before the digest schedule, rehashed so that its archive
+    /// digest holds: `verify` refuses it as a format version.
+    #[test]
+    fn verify_refuses_a_version_1_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (segments, _) = capture_into(tmp.path());
+        let manifest = segments[0].join(MANIFEST_FILE);
+        let text = fs::read_to_string(&manifest).unwrap();
+        let (_, body) = text.split_once('\n').unwrap();
+        let start = body.find("[[digest_schedule]]").unwrap();
+        let end = body.find("[[files]]").unwrap();
+        let v1 = format!("{}{}", &body[..start], &body[end..]).replacen(
+            "format_version = 2",
+            "format_version = 1",
+            1,
+        );
+        let digest = hex::encode(sha256(v1.as_bytes()));
+        fs::write(&manifest, format!("archive_sha256 = \"{digest}\"\n{v1}")).unwrap();
+        let (code, stdout, stderr) = run_args(&["verify", segments[0].to_str().unwrap()]);
+        assert_eq!(code, EXIT_FAILED);
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(
+            stderr.contains("refused") && stderr.contains("format_version 1, expected 2"),
+            "{stderr}"
+        );
+        assert!(matches!(
+            open_verified(&segments[0]),
+            Err(ArchiveError::Manifest {
+                source: ManifestError::Version(1),
+                ..
+            })
         ));
     }
 

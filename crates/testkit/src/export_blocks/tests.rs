@@ -1151,10 +1151,11 @@ async fn open_export_checks_the_fork_digests() {
     // A changed digest: the files arrived on another one.
     let out = tempfile::tempdir().unwrap();
     let export = exported(out.path().to_owned()).await;
+    // The segment's digest schedule tells it first.
     rewrite(&export, |m| m.fork_digests[0].digest = [9, 9, 9, 9]);
     let err = open_export(export.dir()).unwrap_err();
     assert!(
-        matches!(&err, ExportError::Mismatch(m) if m.contains("fork digest")),
+        matches!(&err, ExportError::Mismatch(m) if m.contains("digest_schedule")),
         "{err}"
     );
 
@@ -1164,7 +1165,7 @@ async fn open_export_checks_the_fork_digests() {
     rewrite(&export, |m| m.fork_digests.retain(|d| d.epoch != 1));
     let err = open_export(export.dir()).unwrap_err();
     assert!(
-        matches!(&err, ExportError::Mismatch(m) if m.contains("fork digest")),
+        matches!(&err, ExportError::Mismatch(m) if m.contains("digest_schedule")),
         "{err}"
     );
 
@@ -1290,4 +1291,63 @@ async fn the_pinned_export_sha256_opens_the_export() {
     std::fs::write(dir.join(GENESIS_STATE_FILE), b"x").unwrap();
     let err = open_export_pinned(&dir, [0; 32]).unwrap_err();
     assert!(matches!(err, ExportError::NotPinned { .. }), "{err}");
+}
+
+#[tokio::test]
+async fn open_export_checks_each_segments_digest_schedule() {
+    // The segment relabelled, consistently, to another digest: it holds together alone, but its
+    // schedule is not export.toml's fork digests over its slots.
+    let out = tempfile::tempdir().unwrap();
+    let (export, dir) = exported(out.path()).await;
+    let forged = [9, 9, 9, 9];
+    let archive_sha256 = rewrite_segment(&export, |m, _| {
+        for f in &mut m.files {
+            f.fork_digest = forged;
+        }
+        for d in &mut m.digest_schedule {
+            d.digest = forged;
+        }
+        m.fork_digests = vec![forged];
+    });
+    rewrite(&export, |m| m.segments[0].archive_sha256 = archive_sha256);
+    let err = open_export(&dir).unwrap_err();
+    assert!(
+        matches!(&err, ExportError::Mismatch(m)
+            if m.contains("digest_schedule") && m.contains("fork_digests")),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn open_export_refuses_a_version_1_segment() {
+    use crate::archive::{ArchiveError, ManifestError, MANIFEST_FILE};
+    use sha2::Digest;
+    // The segment format before the digest schedule, rehashed so that its archive digest holds.
+    let out = tempfile::tempdir().unwrap();
+    let (export, dir) = exported(out.path()).await;
+    let path = dir
+        .join(&export.manifest().segments[0].dir)
+        .join(MANIFEST_FILE);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let (_, body) = text.split_once('\n').unwrap();
+    let start = body.find("[[digest_schedule]]").unwrap();
+    let end = body.find("[[files]]").unwrap();
+    let v1 = format!("{}{}", &body[..start], &body[end..]).replacen(
+        "format_version = 2",
+        "format_version = 1",
+        1,
+    );
+    let digest = hex::encode(sha2::Sha256::digest(v1.as_bytes()));
+    std::fs::write(&path, format!("archive_sha256 = \"{digest}\"\n{v1}")).unwrap();
+    let err = open_export(&dir).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            ExportError::Archive(ArchiveError::Manifest {
+                source: ManifestError::Version(1),
+                ..
+            })
+        ),
+        "{err}"
+    );
 }

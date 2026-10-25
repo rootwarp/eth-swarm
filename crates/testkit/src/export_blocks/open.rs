@@ -1,15 +1,15 @@
 //! [`open_export`]: the only way replay opens an export; and [`diff_root_lists`], the
 //! consistency check between two exports of one devnet.
 
-use super::export::{block_fields, check_parent, digest_at, BLOCK_TOPIC, MAX_GENESIS_STATE_BYTES};
+use super::export::{block_fields, check_parent, BLOCK_TOPIC, MAX_GENESIS_STATE_BYTES};
 use super::manifest::{BlockEntry, ExportManifest, EXPORT_FILE, GENESIS_STATE_FILE};
 use super::ExportError;
 use crate::archive::{
-    open_verified, read_regular, Archive, ArchiveError, ArchiveFile, ForkDigest, Sha256Digest,
-    MAX_MANIFEST_LEN,
+    digest_in_force, open_verified, read_regular, schedule_over, Archive, ArchiveError,
+    ArchiveFile, Sha256Digest, MAX_MANIFEST_LEN,
 };
 use consensus_types::forked::{BeaconState, SignedBeaconBlock};
-use consensus_types::primitives::{Epoch, ForkName, Root, Slot};
+use consensus_types::primitives::{ForkName, Root, Slot};
 use consensus_types::{EthSpec, ForkSchedule, Mainnet, Minimal};
 use network_config::{ScheduledFork, FAR_FUTURE_EPOCH};
 use sha2::{Digest, Sha256};
@@ -206,6 +206,19 @@ fn open_segments(dir: &Path, manifest: &ExportManifest) -> Result<Vec<Archive>, 
                 entry.dir, m.network, m.preset, manifest.devnet, manifest.preset
             ));
         }
+        let (Some(start), Some(end)) = (m.epoch_at(m.slot_start), m.epoch_at(m.slot_end)) else {
+            return mismatch(format!(
+                "segment {}: unknown preset {:?}",
+                entry.dir, m.preset
+            ));
+        };
+        if m.digest_schedule != schedule_over(&manifest.fork_digests, start, end) {
+            return mismatch(format!(
+                "segment {}: its digest_schedule is not export.toml's fork_digests over its \
+                 epochs {start} to {end}",
+                entry.dir
+            ));
+        }
         if let Some(f) = archive.files().iter().find(|f| f.topic != BLOCK_TOPIC) {
             return mismatch(format!("segment {}: {} is not a block", entry.dir, f.path));
         }
@@ -270,11 +283,6 @@ fn verify_contents<E: EthSpec>(
 ) -> Result<(), ExportError> {
     let schedule = fork_schedule(manifest)?;
     verify_genesis_state::<E>(&read_state(dir, manifest)?, manifest, &schedule)?;
-    let digests: Vec<(Epoch, ForkDigest)> = manifest
-        .fork_digests
-        .iter()
-        .map(|d| (d.epoch, d.digest))
-        .collect();
     let files: BTreeMap<(Slot, Root), (&Archive, &ArchiveFile)> = segments
         .iter()
         .flat_map(|a| a.files().iter().map(move |f| ((f.slot, f.root), (a, f))))
@@ -286,7 +294,7 @@ fn verify_contents<E: EthSpec>(
         let Some(&(archive, file)) = files.get(&(slot, entry.root)) else {
             return mismatch("no segment holds the block".into());
         };
-        let expected = digest_at::<E>(&digests, slot);
+        let expected = digest_in_force(&manifest.fork_digests, E::epoch_at_slot(slot));
         if expected != Some(file.fork_digest) {
             return mismatch(format!(
                 "the block's fork digest 0x{} is not export.toml's for its epoch",

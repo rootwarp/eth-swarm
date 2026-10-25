@@ -21,7 +21,9 @@
 //! refuses; the next one then starts at the payload that rolled it, in the same window.
 //!
 //! Every payload must be on the network's fork digest for its slot's epoch
-//! ([`CaptureConfig::fork_digests`]). The payload bytes are kept under a disk budget
+//! ([`CaptureConfig::fork_digests`]). Each manifest records the part of that schedule over its
+//! slot range ([`Manifest::digest_schedule`]), so a reader checks each file's digest without
+//! the network's config. The payload bytes are kept under a disk budget
 //! (`max_bytes`), checked before a payload can roll the open segment; passing it, or any write
 //! error such as a full disk, stops the capture with an error. [`Writer::close`] then still
 //! seals what was written, marked [`ClosedBy::Error`] with the reason (cut to
@@ -30,8 +32,9 @@
 
 use super::error::ArchiveError;
 use super::manifest::{
-    base_len_bound as manifest_base_len_bound, file_len_bound as manifest_file_len_bound,
-    truncate_error, ArchiveFile, ClosedBy, ForkDigest, Manifest, MANIFEST_FILE, MAX_MANIFEST_LEN,
+    base_len_bound as manifest_base_len_bound, check_network_preset, digest_in_force,
+    file_len_bound as manifest_file_len_bound, schedule_over, truncate_error, ArchiveFile,
+    ClosedBy, ForkDigest, Manifest, MANIFEST_FILE, MAX_DIGEST_SCHEDULE, MAX_MANIFEST_LEN,
 };
 use super::names::{
     file_name, file_path, segment_name, validate_network, validate_topic, TopicKind,
@@ -72,7 +75,8 @@ pub struct CaptureConfig {
     pub max_bytes: u64,
     /// The network's fork digest from each epoch on, ascending by epoch: every entry of
     /// `network_config::digest::digest_schedule`, so blob-parameter changes are in it. A
-    /// payload whose topic digest is not the one of its slot's epoch is refused.
+    /// payload whose topic digest is not the one of its slot's epoch is refused. At most
+    /// [`MAX_DIGEST_SCHEDULE`] entries.
     pub fork_digests: Vec<(Epoch, ForkDigest)>,
 }
 
@@ -202,6 +206,7 @@ impl<E: EthSpec> Writer<E> {
         mut sync_fault: SyncFault,
     ) -> Result<Self, ArchiveError> {
         validate_network(&config.network)?;
+        check_network_preset(&config.network, E::NAME).map_err(ArchiveError::Config)?;
         config.topics.sort();
         config.topics.dedup();
         if config.topics.is_empty() {
@@ -228,11 +233,19 @@ impl<E: EthSpec> Writer<E> {
                 "fork_digests must be non-empty and strictly ascending by epoch".into(),
             ));
         }
+        if config.fork_digests.len() > MAX_DIGEST_SCHEDULE {
+            return Err(ArchiveError::Config(format!(
+                "fork_digests has {} entries, over the {MAX_DIGEST_SCHEDULE} entries a manifest \
+                 records",
+                config.fork_digests.len()
+            )));
+        }
         let manifest_base_len = manifest_base_len_bound(
             &config.network,
             &config.topics,
             &config.capture_host,
             &config.clock_source,
+            &config.fork_digests,
         );
         let longest_topic = config
             .topics
@@ -341,7 +354,7 @@ impl<E: EthSpec> Writer<E> {
             return Err(PayloadError::Unsubscribed(topic.to_owned()).into());
         }
         let decoded = decode_payload::<E>(TopicKind::of(topic)?, payload, &self.chain)?;
-        let expected = digest_at(&self.config.fork_digests, E::epoch_at_slot(decoded.slot));
+        let expected = digest_in_force(&self.config.fork_digests, E::epoch_at_slot(decoded.slot));
         if expected != Some(fork_digest) {
             return Err(PayloadError::ForkDigest {
                 slot: decoded.slot,
@@ -473,17 +486,23 @@ impl<E: EthSpec> Writer<E> {
             SegmentEnd::LastSlot => segment.last_slot,
         };
         let files: Vec<ArchiveFile> = segment.files.into_values().collect();
+        let digest_schedule = schedule_over(
+            &self.config.fork_digests,
+            E::epoch_at_slot(segment.covers_from),
+            E::epoch_at_slot(slot_end),
+        );
         let manifest = Manifest {
             network: self.config.network.clone(),
             preset: E::NAME.to_owned(),
             slot_start: segment.covers_from,
             slot_end,
-            fork_digests: files
+            fork_digests: digest_schedule
                 .iter()
-                .map(|f| f.fork_digest)
+                .map(|d| d.digest)
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect(),
+            digest_schedule,
             topics: self.config.topics.clone(),
             peer_count: self.peer_count,
             capture_host: self.config.capture_host.clone(),
@@ -593,15 +612,6 @@ fn own_entries(
         }
     }
     Ok(out)
-}
-
-/// The digest of `schedule` (ascending by epoch) in force at `epoch`, `None` before its first.
-fn digest_at(schedule: &[(Epoch, ForkDigest)], epoch: Epoch) -> Option<ForkDigest> {
-    schedule
-        .iter()
-        .rev()
-        .find(|(from, _)| *from <= epoch)
-        .map(|(_, digest)| *digest)
 }
 
 /// The first slot of the aligned window of `slots_per_segment` slots that holds `slot`.
@@ -773,7 +783,7 @@ fn write_all(file: &mut File, bytes: &[u8], _: WriteFault, _: &mut bool) -> io::
 mod tests {
     use super::*;
     use crate::archive::fixtures::{self, Spec};
-    use crate::archive::manifest::Sha256Digest;
+    use crate::archive::manifest::{DigestEntry, Sha256Digest};
 
     const COLUMN: &str = "data_column_sidecar_3";
 
@@ -866,6 +876,13 @@ mod tests {
         assert_eq!((m.slot_start, m.slot_end), (10, 10));
         assert_eq!(m.topics, ["beacon_block", COLUMN]);
         assert_eq!(m.fork_digests, [fixtures::BPO_DIGEST]);
+        assert_eq!(
+            m.digest_schedule,
+            [DigestEntry {
+                epoch: fixtures::BPO_EPOCH,
+                digest: fixtures::BPO_DIGEST
+            }]
+        );
         assert_eq!((m.peer_count, m.capture_host.as_str()), (31, "probe-1"));
         assert_eq!((m.closed_by, m.error), (ClosedBy::Close, None));
         assert_eq!(m.total_bytes, (block.len() + column.len()) as u64);
@@ -976,6 +993,23 @@ mod tests {
         assert_eq!(sealed, [out.path().join("devnet/2-9")]);
         let m = manifest(&sealed[0]);
         assert_eq!(m.files.iter().map(|f| f.slot).collect::<Vec<_>>(), [2, 9]);
+        // The late payload is before the blob-parameter change: the segment spans it.
+        assert_eq!(
+            m.digest_schedule,
+            [
+                DigestEntry {
+                    epoch: 0,
+                    digest: fixtures::FULU_DIGEST
+                },
+                DigestEntry {
+                    epoch: fixtures::BPO_EPOCH,
+                    digest: fixtures::BPO_DIGEST
+                }
+            ]
+        );
+        let mut both = vec![fixtures::FULU_DIGEST, fixtures::BPO_DIGEST];
+        both.sort();
+        assert_eq!(m.fork_digests, both);
     }
 
     #[test]
@@ -1066,7 +1100,14 @@ mod tests {
         let sealed = w.close().unwrap();
         let mut every = vec![FULU_DIGEST, BPO_DIGEST, GLOAS_DIGEST];
         every.sort();
-        assert_eq!(manifest(&sealed[0]).fork_digests, every);
+        let m = manifest(&sealed[0]);
+        assert_eq!(m.fork_digests, every);
+        let schedule: Vec<_> = m
+            .digest_schedule
+            .iter()
+            .map(|d| (d.epoch, d.digest))
+            .collect();
+        assert_eq!(schedule, fixtures::fork_digests());
 
         // A slot before the first digest has none.
         let mut w = writer(
@@ -1353,6 +1394,26 @@ mod tests {
         ] {
             assert!(matches!(refuse(bad), ArchiveError::Config(_)));
         }
+        // A schedule no manifest could record.
+        let too_long = |n: u64| CaptureConfig {
+            fork_digests: (0..n).map(|e| (e, [e as u8; 4])).collect(),
+            ..config(8)
+        };
+        // A network with an embedded config, at another preset than its config's.
+        let e = refuse(CaptureConfig {
+            network: "hoodi".into(),
+            ..config(8)
+        });
+        assert!(
+            matches!(&e, ArchiveError::Config(m) if m.contains("hoodi's preset is mainnet")),
+            "{e}"
+        );
+        let e = refuse(too_long(MAX_DIGEST_SCHEDULE as u64 + 1));
+        assert!(
+            matches!(&e, ArchiveError::Config(m) if m.contains("64 entries")),
+            "{e}"
+        );
+        writer(out.path(), too_long(MAX_DIGEST_SCHEDULE as u64));
         // Duplicate topics collapse; nothing is created for a refused config.
         let w = writer(
             out.path(),

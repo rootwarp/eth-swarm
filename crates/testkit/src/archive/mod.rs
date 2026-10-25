@@ -12,13 +12,18 @@
 //! block), computed at write time by decoding with the fork of the object's own slot. Each
 //! `<slot_start>-<slot_end>` directory is one segment; segments roll every `slots_per_segment`
 //! slots and at capture close, and only a sealed segment has a [`Manifest`]: network, preset,
-//! slot range, fork digests, subscribed topics (subnets are in the topic names), peer count,
-//! capture host, clock source, why it was sealed, and every file's length, slot, root, fork
-//! digest and sha256, all covered by the manifest's `archive_sha256`.
+//! slot range, fork digests, the digest schedule over the slot range (each digest with the
+//! epoch where it starts, BPO changes included), subscribed topics (subnets are in the topic
+//! names), peer count, capture host, clock source, why it was sealed, and every file's length,
+//! slot, root, fork digest and sha256, all covered by the manifest's `archive_sha256`.
 //!
 //! Replay opens a segment only through [`open_verified`], which recomputes every sha256 and
 //! refuses any mismatch, missing file or extra file, an unsealed `.open-*` directory, and a
-//! segment not at the `<network>/<slot_start>-<slot_end>` its manifest names.
+//! segment not at the `<network>/<slot_start>-<slot_end>` its manifest names. It also refuses
+//! a file whose fork digest is not the schedule's for its slot, a schedule that is empty, not
+//! ascending or does not cover the slot range, and `fork_digests` that are not the schedule's.
+//! A segment can span a fork or BPO boundary (a late payload joins the open segment), so one
+//! manifest can hold two digests.
 //!
 //! Segments of one capture can overlap: a late payload joins the open segment and lowers its
 //! `slot_start`, and a segment that rolls on its manifest's size limit shares its window with
@@ -39,10 +44,10 @@ mod verify;
 mod writer;
 
 pub use error::ArchiveError;
-pub(crate) use manifest::{canonical_hex, PRESETS};
+pub(crate) use manifest::{canonical_hex, digest_in_force, schedule_over, PRESETS};
 pub use manifest::{
-    ArchiveFile, ClosedBy, ForkDigest, Manifest, ManifestError, Sha256Digest, FORMAT_VERSION,
-    MANIFEST_FILE, MAX_ERROR_LEN, MAX_MANIFEST_LEN,
+    ArchiveFile, ClosedBy, DigestEntry, ForkDigest, Manifest, ManifestError, Sha256Digest,
+    FORMAT_VERSION, MANIFEST_FILE, MAX_DIGEST_SCHEDULE, MAX_ERROR_LEN, MAX_MANIFEST_LEN,
 };
 pub(crate) use names::{segment_name, validate_network};
 pub use names::{NameError, TopicKind};

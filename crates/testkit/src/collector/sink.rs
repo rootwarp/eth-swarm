@@ -786,8 +786,9 @@ mod tests {
     }
 
     fn archive(out: &Path) -> Writer<Spec> {
+        // Not "sepolia": the fixtures are of the minimal preset.
         let config = CaptureConfig {
-            network: "sepolia".into(),
+            network: "devnet".into(),
             topics: vec!["beacon_block".into(), "data_column_sidecar_4".into()],
             capture_host: "probe".into(),
             clock_source: "chrony".into(),

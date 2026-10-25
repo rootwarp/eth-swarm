@@ -5,7 +5,7 @@
 //!
 //! ```toml
 //! export_sha256 = "…"
-//! format_version = 1
+//! format_version = 2
 //! devnet = "ethswarm-gloas"
 //! source = "cl-1-lighthouse-geth"
 //! preset = "minimal"
@@ -48,9 +48,7 @@
 //! sha256) are in the body, so `export_sha256` pins the whole export.
 
 use super::export::MAX_GENESIS_STATE_BYTES;
-use crate::archive::{
-    canonical_hex, segment_name, validate_network, ForkDigest, Sha256Digest, PRESETS,
-};
+use crate::archive::{canonical_hex, segment_name, validate_network, Sha256Digest, PRESETS};
 use consensus_types::primitives::{Epoch, ForkName, Root, Slot, Version};
 use consensus_types::{EthSpec, Mainnet, Minimal};
 use serde::{Deserialize, Serialize};
@@ -61,7 +59,8 @@ pub const EXPORT_FILE: &str = "export.toml";
 /// The genesis state's file name, in `<out>/<devnet>/`: the SSZ as the beacon API served it.
 pub const GENESIS_STATE_FILE: &str = "genesis_state.ssz";
 /// The export format this crate writes and reads.
-pub const EXPORT_FORMAT_VERSION: u32 = 1;
+/// Version 2: the segments are of archive format 2, with a digest schedule.
+pub const EXPORT_FORMAT_VERSION: u32 = 2;
 /// The longest source label.
 pub const MAX_SOURCE_LEN: usize = 64;
 /// The longest image reference.
@@ -91,14 +90,8 @@ pub struct ForkEntry {
     pub epoch: Epoch,
 }
 
-/// A fork digest and the epoch it is in force from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DigestEntry {
-    /// The first epoch of the digest.
-    pub epoch: Epoch,
-    /// `compute_fork_digest(genesis_validators_root, epoch)`.
-    pub digest: ForkDigest,
-}
+/// A fork digest and the epoch it is in force from: the archive manifest's entry type.
+pub use crate::archive::DigestEntry;
 
 /// A sealed archive segment of the export.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -871,11 +864,15 @@ pub(crate) mod tests {
             ExportManifest::parse(&with_digest(&unknown)),
             Err(ExportManifestError::Toml(_))
         ));
-        let v2 = good.replace("format_version = 1", "format_version = 2");
-        assert_eq!(
-            ExportManifest::parse(&with_digest(&v2)),
-            Err(ExportManifestError::Version(2))
-        );
+        // Version 1 named segments of the archive format before the digest schedule.
+        for (version, to) in [(1, "format_version = 1"), (3, "format_version = 3")] {
+            let other = good.replace("format_version = 2", to);
+            assert_ne!(other, good);
+            assert_eq!(
+                ExportManifest::parse(&with_digest(&other)),
+                Err(ExportManifestError::Version(version))
+            );
+        }
         for (from, to) in [
             ("fork = \"gloas\"", "fork = \"heze\""),
             ("digest = \"0x01020304\"", "digest = \"0x010203\""),

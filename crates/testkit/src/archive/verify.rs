@@ -69,6 +69,12 @@ impl Archive {
 /// names `dir` resolves to), and every file's presence, length and sha256. It also refuses an
 /// unsealed `.open-*` directory, any file or directory the manifest does not list, and any
 /// symlink or other non-regular entry, anywhere in `dir`.
+///
+/// The fork digests are checked with the manifest's own digest schedule, with no outside
+/// config ([`Manifest::validate`]): a file whose fork digest is not the schedule's for its
+/// slot ([`ManifestError::ForkDigest`]), a schedule that is empty, not ascending or does not
+/// cover the slot range, and `fork_digests` that are not the schedule's are refused. A
+/// manifest of an older format is refused ([`ManifestError::Version`]).
 pub fn open_verified(dir: &Path) -> Result<Archive, ArchiveError> {
     let meta = fs::symlink_metadata(dir).map_err(ArchiveError::io(dir))?;
     if !meta.is_dir() {
@@ -418,6 +424,115 @@ mod tests {
             open_verified(&dir),
             Err(ArchiveError::Manifest { .. })
         ));
+
+        fs::write(&manifest, &good).unwrap();
+        open_verified(&dir).unwrap();
+    }
+
+    /// The manifest text with `edit` applied to its body, rehashed: a forged manifest whose
+    /// archive digest still holds.
+    fn rehashed(manifest: &[u8], edit: impl Fn(&str) -> String) -> Vec<u8> {
+        let text = std::str::from_utf8(manifest).unwrap();
+        let (_, body) = text.split_once('\n').unwrap();
+        let body = edit(body);
+        assert_ne!(
+            body,
+            text.split_once('\n').unwrap().1,
+            "the edit changes the body"
+        );
+        let digest = hex::encode(Sha256::digest(body.as_bytes()));
+        format!("archive_sha256 = \"{digest}\"\n{body}").into_bytes()
+    }
+
+    #[test]
+    fn a_digest_schedule_that_does_not_hold_or_an_old_format_is_refused() {
+        let out = tempfile::tempdir().unwrap();
+        let (dir, _) = segment(out.path());
+        let manifest = dir.join(MANIFEST_FILE);
+        let good = fs::read(&manifest).unwrap();
+        let archive = open_verified(&dir).unwrap();
+        assert_eq!(
+            archive.manifest().digest_schedule,
+            [crate::archive::DigestEntry {
+                epoch: 0,
+                digest: fixtures::FULU_DIGEST
+            }]
+        );
+        let fulu = format!("\"0x{}\"", hex::encode(fixtures::FULU_DIGEST));
+        let bpo = format!("\"0x{}\"", hex::encode(fixtures::BPO_DIGEST));
+        let schedule = format!("[[digest_schedule]]\nepoch = 0\ndigest = {fulu}\n");
+        let refusals = [
+            // Starts after the segment's first slot.
+            (
+                rehashed(&good, |b| b.replace("epoch = 0", "epoch = 1")),
+                "after slot_start's epoch",
+            ),
+            // Empty: no table, and an empty array before the first table.
+            (
+                rehashed(&good, |b| b.replace(&schedule, "")),
+                "missing field",
+            ),
+            (
+                rehashed(&good, |b| {
+                    b.replace(&schedule, "").replacen(
+                        "format_version = 2\n",
+                        "format_version = 2\ndigest_schedule = []\n",
+                        1,
+                    )
+                }),
+                "digest_schedule is empty",
+            ),
+            // fork_digests that are not the schedule's.
+            (
+                rehashed(&good, |b| {
+                    b.replace(
+                        &format!("fork_digests = [{fulu}]"),
+                        &format!("fork_digests = [{bpo}]"),
+                    )
+                }),
+                "sorted digests of digest_schedule",
+            ),
+            // A version 1 manifest.
+            (
+                rehashed(&good, |b| {
+                    b.replace("format_version = 2", "format_version = 1")
+                }),
+                "format_version 1",
+            ),
+        ];
+        for (forged, says) in refusals {
+            fs::write(&manifest, forged).unwrap();
+            let e = open_verified(&dir).unwrap_err();
+            assert!(
+                matches!(&e, ArchiveError::Manifest { .. }) && e.to_string().contains(says),
+                "{says}: {e}"
+            );
+        }
+        // The file digests alone changed: each file is on another digest than its slot's.
+        fs::write(
+            &manifest,
+            rehashed(&good, |b| {
+                b.replace(
+                    &format!("fork_digest = {fulu}"),
+                    &format!("fork_digest = {bpo}"),
+                )
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            open_verified(&dir),
+            Err(ArchiveError::Manifest {
+                source: ManifestError::ForkDigest { got, expected: Some(want), .. },
+                ..
+            }) if got == fixtures::BPO_DIGEST && want == fixtures::FULU_DIGEST
+        ));
+
+        // Every digest replaced by another one holds together: the values are not recomputed
+        // from the network's config. Only the pinned archive digest tells it apart.
+        fs::write(&manifest, rehashed(&good, |b| b.replace(&fulu, &bpo))).unwrap();
+        let forged = open_verified(&dir).unwrap();
+        assert_eq!(forged.manifest().fork_digests, [fixtures::BPO_DIGEST]);
+        assert_ne!(forged.archive_sha256(), archive.archive_sha256());
 
         fs::write(&manifest, &good).unwrap();
         open_verified(&dir).unwrap();
