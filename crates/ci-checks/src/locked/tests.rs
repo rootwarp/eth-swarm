@@ -542,13 +542,11 @@ fn invalid_yaml_fails() {
 
 #[test]
 fn run_passes_the_words_after_its_first_positional_argument_to_the_binary() {
-    assert_rejected("cargo run x --locked", "cargo run without --locked");
-    assert_rejected("cargo r --bin p y --locked", "cargo r without --locked");
-    assert_rejected("cargo run -q x --locked", "cargo run without --locked");
-    assert_rejected(
-        "cargo run --release x --locked",
-        "cargo run without --locked",
-    );
+    let after = |sub: &str| format!("cargo {sub} has --locked only after a positional argument");
+    assert_rejected("cargo run x --locked", &after("run"));
+    assert_rejected("cargo r --bin p y --locked", &after("r"));
+    assert_rejected("cargo run -q x --locked", &after("run"));
+    assert_rejected("cargo run --release x --locked", &after("run"));
     assert_passes("cargo run --locked x");
     assert_passes("cargo run --bin p --locked -- x");
     assert_passes("cargo r -p x --release --locked");
@@ -888,7 +886,7 @@ fn check_repo_reads_workflows_actions_and_cargo_configs() {
 
 #[cfg(unix)]
 #[test]
-fn check_repo_in_git_reads_only_tracked_configs_and_follows_cargo_links() {
+fn check_repo_in_git_reads_tracked_and_untracked_configs_and_follows_cargo_links() {
     let repo = tempfile::TempDir::new().expect("tempdir");
     let root = repo.path();
     git(root, &["init", "-q"]);
@@ -917,7 +915,31 @@ fn check_repo_in_git_reads_only_tracked_configs_and_follows_cargo_links() {
         found.iter().any(|f| f.contains("alias \"deny\"")),
         "{found:#?}"
     );
-    assert!(!found.iter().any(|f| f.contains("target/")), "{found:#?}");
+    // Cargo reads an untracked config too, also one that git ignores.
+    assert!(
+        found
+            .iter()
+            .any(|f| f.contains("target/.cargo/config.toml: alias \"fmt\"")),
+        "{found:#?}"
+    );
+    write(&root.join(".gitignore"), "target/\n");
+    write(&root.join("sub/.cargo/config"), "alias.test = \"b\"\n");
+    git(root, &["add", ".gitignore"]);
+    let scan = check_repo(root, &[]).expect("scan");
+    let found: Vec<String> = scan.violations.iter().map(|v| v.to_string()).collect();
+    assert_eq!(scan.config_files, 4, "{found:#?}");
+    assert!(
+        found
+            .iter()
+            .any(|f| f.contains("target/.cargo/config.toml")),
+        "{found:#?}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|f| f.contains("sub/.cargo/config: alias \"test\"")),
+        "{found:#?}"
+    );
 
     // A tracked .cargo link out of the repository fails.
     let outside = tempfile::TempDir::new().expect("tempdir");
@@ -932,6 +954,20 @@ fn check_repo_in_git_reads_only_tracked_configs_and_follows_cargo_links() {
     let found: Vec<String> = scan.violations.iter().map(|v| v.to_string()).collect();
     assert!(
         found.iter().any(|f| f.contains("outside the repository")),
+        "{found:#?}"
+    );
+
+    // An untracked .cargo link out of the repository fails too.
+    std::fs::remove_file(root.join(".cargo")).expect("rm");
+    git(root, &["rm", "-q", "--cached", ".cargo"]);
+    std::fs::create_dir_all(root.join("u")).expect("mkdir");
+    std::os::unix::fs::symlink(outside.path(), root.join("u/.cargo")).expect("symlink");
+    let scan = check_repo(root, &[]).expect("scan");
+    let found: Vec<String> = scan.violations.iter().map(|v| v.to_string()).collect();
+    assert!(
+        found
+            .iter()
+            .any(|f| f.contains("u/.cargo") && f.contains("outside the repository")),
         "{found:#?}"
     );
 }
@@ -1059,28 +1095,17 @@ fn check_paths_reports_an_unreadable_file() {
 
 #[test]
 fn llvm_cov_run_gives_the_words_after_its_first_positional_argument_to_the_binary() {
-    assert_rejected(
-        "cargo llvm-cov run x --locked",
-        "cargo llvm-cov without --locked",
-    );
-    assert_rejected(
-        "cargo llvm-cov x --locked",
-        "cargo llvm-cov without --locked",
-    );
-    assert_rejected(
-        "cargo nextest run x --locked",
-        "cargo nextest without --locked",
-    );
+    let after = |sub: &str| format!("cargo {sub} has --locked only after a positional argument");
+    assert_rejected("cargo llvm-cov run x --locked", &after("llvm-cov"));
+    assert_rejected("cargo llvm-cov x --locked", &after("llvm-cov"));
+    assert_rejected("cargo nextest run x --locked", &after("nextest"));
     assert_passes("cargo llvm-cov run --locked x");
     assert_passes("cargo llvm-cov --locked run x");
     assert_passes("cargo llvm-cov test --workspace --locked");
     assert_passes("cargo llvm-cov --workspace --summary-only --locked");
     assert_passes("cargo deny --locked check");
     assert_passes("cargo deny check --locked");
-    assert_rejected(
-        "cargo deny check bans --locked",
-        "cargo deny without --locked",
-    );
+    assert_rejected("cargo deny check bans --locked", &after("deny"));
 }
 
 #[test]
@@ -1166,4 +1191,314 @@ fn keys_that_differ_only_in_letter_case_fail() {
         &workflow("      - run: cargo build --locked\n        shell: bash\n        shell: pwsh\n"),
         "",
     );
+}
+
+// Deliberate bypasses after the fail-closed rewrite.
+
+#[test]
+fn a_redirect_before_the_command_word_keeps_the_next_word_a_command_word() {
+    for line in [
+        "x=car; y=go; >/dev/null $x$y build",
+        "> /dev/null $c build",
+        "2>/dev/null $c build",
+        "<in $c build",
+        "X=1 >o $c build",
+        "<<< x $c build",
+        ">>log 2>&1 $c build",
+    ] {
+        assert_rejected(line, "a redirect");
+    }
+    // A quote or a backslash before `<` or `>` makes it part of the command word.
+    assert_rejected("\"<\"/$c build", "a quote");
+    assert_rejected("\\>/$c build", "a backslash");
+    // A quoted name is not an assignment, so the word is the command word.
+    assert_rejected("\"x\"=/$c build", "a quote");
+    // A redirect after the command word is not checked.
+    assert_passes("echo x >/dev/null $y");
+}
+
+#[test]
+fn trap_coproc_find_parallel_script_and_ssh_run_their_arguments() {
+    assert_rejected("trap \"$x$y build\" EXIT", "a quote");
+    for line in [
+        "coproc $c build",
+        "find . -exec $c build",
+        "parallel $c ::: build",
+        "script -c $c",
+        "ssh host $c build",
+    ] {
+        assert_rejected(line, "a parameter expansion");
+    }
+}
+
+#[test]
+fn an_anchored_mapping_cannot_move_the_cargo_config() {
+    assert_workflow_rejected(
+        &workflow(
+            "      - uses: ./x\n        with: &w {HOME: /tmp/h}\n      - run: cargo fmt\n        env: *w\n",
+        ),
+        "HOME",
+    );
+    assert_workflow_rejected(
+        &workflow(
+            "      - uses: ./x\n        with: &w\n          cargo_home: /tmp/h\n      - run: cargo fmt\n        env:\n          <<: *w\n",
+        ),
+        "CARGO_HOME",
+    );
+    // Without an anchor, a `home` input of an action is not an environment variable.
+    assert_workflow_passes(&workflow("      - uses: ./x\n        with: {home: /x}\n"));
+}
+
+#[test]
+fn llvm_cov_options_take_the_next_word_as_their_value() {
+    assert_passes("cargo llvm-cov --lcov --output-path lcov.info --locked");
+    assert_passes("cargo llvm-cov report --lcov --output-path lcov.info --locked");
+    assert_passes("cargo llvm-cov --workspace --fail-under-lines 90 --locked");
+    assert_passes("cargo llvm-cov run --output-dir d --bin p --locked x");
+    // cargo-llvm-cov takes the next word as the value, also if it starts with `-`.
+    assert_rejected(
+        "cargo llvm-cov run --features --locked x",
+        "--locked only as the value of \"--features\"",
+    );
+    assert_rejected(
+        "cargo llvm-cov -p --locked test",
+        "--locked only as the value of \"-p\"",
+    );
+    assert_rejected("cargo llvm-cov run -vF --locked x", "short-option cluster");
+    assert_rejected("cargo llvm-cov -qp x --locked", "short-option cluster");
+    assert_passes("cargo llvm-cov -vq --locked");
+}
+
+#[test]
+fn locked_after_a_positional_argument_is_named_as_such() {
+    for (line, sub) in [
+        ("cargo deny check bans --locked", "deny"),
+        ("cargo run x --locked", "run"),
+        ("cargo llvm-cov run x --locked", "llvm-cov"),
+        ("cargo llvm-cov report x --locked", "llvm-cov"),
+        ("cargo nextest run x --locked", "nextest"),
+    ] {
+        assert_rejected(
+            line,
+            &format!("cargo {sub} has --locked only after a positional argument"),
+        );
+    }
+    assert_rejected("cargo run x", "cargo run without --locked");
+    assert_rejected("cargo run -- --locked", "cargo run without --locked");
+}
+
+#[cfg(unix)]
+#[test]
+fn check_repo_walks_a_root_that_git_ignores_or_does_not_track() {
+    let outer = tempfile::TempDir::new().expect("tempdir");
+    git(outer.path(), &["init", "-q"]);
+    write(&outer.path().join(".gitignore"), "ignored/\n");
+    git(outer.path(), &["add", ".gitignore"]);
+    for dir in ["ignored", "untracked"] {
+        let root = outer.path().join(dir);
+        write(
+            &root.join(".github/workflows/ci.yml"),
+            &workflow("      - run: cargo fmt\n"),
+        );
+        write(&root.join(".cargo/config.toml"), "alias.fmt = \"b\"\n");
+        write(&root.join("a/.cargo/config"), "alias.clippy = \"b\"\n");
+        let scan = check_repo(&root, &[]).expect("scan");
+        let found: Vec<String> = scan.violations.iter().map(|v| v.to_string()).collect();
+        assert_eq!(scan.config_files, 2, "{dir}: {found:#?}");
+        assert!(
+            found.iter().any(|f| f.contains("alias \"fmt\"")),
+            "{dir}: {found:#?}"
+        );
+        assert!(
+            found.iter().any(|f| f.contains("alias \"clippy\"")),
+            "{dir}: {found:#?}"
+        );
+    }
+}
+
+// Review cycle 1.
+
+#[test]
+fn an_escaped_redirect_character_does_not_join_the_next_operator() {
+    for line in [
+        "x=car; y=go; echo a\\>|$x$y build",
+        "x=car; y=go; echo a\\>&$x$y build",
+        "x=car; y=go; echo a\\<|$x$y build",
+        "echo \"a>\"|$c build",
+    ] {
+        assert_rejected(line, "");
+    }
+}
+
+#[test]
+fn find_xargs_and_parallel_run_their_arguments_up_to_the_unquoted_end_of_the_command() {
+    assert_rejected(
+        "x=car; y=go; find . -maxdepth 0 -exec true ';' -exec $x$y build ';'",
+        "a quote",
+    );
+    assert_rejected("find . -exec true \\; -exec $c build \\;", "a backslash");
+    assert_rejected(
+        "x=car; y=go; echo b | xargs -I {} -P 1 $x$y {}",
+        "the character '{'",
+    );
+    assert_rejected("parallel -q ';' x $c ::: build", "a quote");
+    assert_rejected(
+        "find . -exec $(echo; echo) $c build",
+        "a command substitution",
+    );
+    // An unquoted operator ends the command.
+    assert_passes("find . -name x -exec rm {} + && echo \"$x\"");
+    assert_passes("ls | xargs -n 1 echo; echo \"$x\"");
+}
+
+#[test]
+fn find_and_trap_count_only_the_words_that_they_can_run() {
+    assert_passes("find \"$DIR\" -name x -delete");
+    assert_passes("trap 'rm -rf \"$tmp\"' EXIT");
+    assert_passes("trap \"rm -f ${tmp}\" EXIT");
+    assert_passes("trap - EXIT");
+    // An expansion in the arguments of find can be `-exec`, and an unquoted one can also hold
+    // the command.
+    assert_rejected("find \"$d\" $c build", "a quote");
+    assert_rejected("find . $d build", "a parameter expansion");
+    assert_rejected("find . -execdir $c build", "a parameter expansion");
+    assert_rejected("find . -okdir $c build", "a parameter expansion");
+    // The action of trap is a command line.
+    assert_rejected("trap \"$x$y build\" EXIT", "a quote");
+    assert_rejected("trap -- \"$c build\" EXIT", "a quote");
+    assert_rejected("trap \"echo; $c build\" EXIT", "a quote");
+    assert_rejected("trap 'echo \"$(date)\"; $c build' EXIT", "a quote");
+    assert_rejected("trap $(echo x) EXIT", "a command substitution");
+    // An expansion in the arguments of ssh can be an option such as `-oProxyCommand=..`, so
+    // each one can run cargo (rule 3 of the module docs).
+    assert_rejected("ssh \"$HOST\" uptime", "a quote");
+    assert_passes("ssh host uptime");
+}
+
+#[test]
+fn llvm_cov_reads_m_cargo_profile_and_archive_file_with_a_value() {
+    assert_passes("cargo llvm-cov -m m/Cargo.toml --locked");
+    assert_passes("cargo llvm-cov nextest --cargo-profile ci --locked");
+    assert_passes("cargo llvm-cov nextest --archive-file a.tar.zst --locked");
+    assert_rejected(
+        "cargo llvm-cov -m --locked test",
+        "--locked only as the value of \"-m\"",
+    );
+    assert_rejected(
+        "cargo llvm-cov nextest --cargo-profile --locked",
+        "--locked only as the value of \"--cargo-profile\"",
+    );
+    assert_rejected("cargo llvm-cov -vm --locked", "short-option cluster");
+}
+
+#[test]
+fn a_parameter_expansion_with_a_command_substitution_can_run_cargo() {
+    assert_rejected(
+        "a=car; b=go; : ${x:-$($a$b build)}",
+        "a parameter expansion",
+    );
+    assert_rejected(">${x:-$($a$b build)}", "a redirect");
+    assert_rejected("echo ${x:-`$c build`}", "a parameter expansion");
+    assert_passes("echo ${x:-y}");
+}
+
+#[test]
+fn a_short_option_cluster_with_a_glued_value_is_one_option() {
+    assert_passes("cargo llvm-cov -j8 --locked");
+    assert_passes("cargo llvm-cov -pci-checks --locked");
+    assert_rejected("cargo llvm-cov -vj --locked", "short-option cluster");
+}
+
+#[test]
+fn llvm_cov_nextest_also_reads_the_cargo_options_with_a_value() {
+    assert_passes("cargo llvm-cov nextest --target-dir x --locked");
+    assert_passes("cargo llvm-cov nextest --message-format json --locked");
+    assert_rejected(
+        "cargo llvm-cov run --message-format json --locked x",
+        "after a positional argument",
+    );
+}
+
+#[test]
+fn more_wrappers_run_their_arguments() {
+    for wrapper in [
+        "taskset 1",
+        "unshare -r",
+        "systemd-run --user",
+        "chrt 1",
+        "nsenter -t 1",
+        "runuser -u u --",
+        "strace -f",
+        "fakeroot",
+        "unbuffer",
+        "busybox",
+    ] {
+        assert_rejected(&format!("{wrapper} $c build"), "a parameter expansion");
+    }
+}
+
+#[test]
+fn the_words_of_trap_and_the_quotes_after_find_are_read_as_bash_reads_them() {
+    for line in ["trap", "trap -p", "trap -p EXIT", "trap -- 'echo $x' EXIT"] {
+        assert_passes(line);
+    }
+    assert_rejected("trap \\$c EXIT", "a backslash");
+    assert_rejected("trap \"\\\"$c\\\" build\" EXIT", "a quote");
+    assert_rejected("trap ${c} EXIT", "a parameter expansion");
+    assert_rejected("trap \"${c:-\"x\"}\" EXIT", "a quote");
+    assert_rejected("trap >/dev/null $c EXIT", "a redirect");
+    assert_rejected("trap `$c` EXIT", "a command substitution");
+    assert_rejected("trap \"`$c`\" EXIT", "a quote");
+    // An escaped quote does not end a double-quoted string, so the `;` ends the command.
+    assert_passes("find . -exec rm \"a\\\"b\" ; echo $x");
+    assert_rejected("find . -exec rm \"a\\\"b ; echo $x", "a quote");
+}
+
+// Review cycle 2.
+
+#[test]
+fn a_substitution_in_double_quotes_does_not_hide_the_end_of_the_command() {
+    for line in [
+        "echo \"${X}\" | xargs echo; echo $Y",
+        "mkdir -p \"${OUT}\"; find . -name x -delete; ls $OUT",
+        "git diff --name-only \"$(git merge-base HEAD origin/main)\" | xargs -r shellcheck; echo $?",
+        "echo \"$(date)\" && find . -name x -delete && echo $HOME",
+        "echo \"`date`\" | xargs echo; echo $Y",
+        "echo \"${X:-\"a\"}\" | xargs echo; echo $Y",
+        "echo \"$(echo \")\")\" | xargs echo; echo $Y",
+    ] {
+        assert_passes(line);
+    }
+    // The separator in the substitution is quoted, so the wrapper stays open.
+    assert_rejected("xargs echo \"$(echo ;)\" $c build", "a quote");
+    assert_rejected(
+        "x=car; y=go; find . -exec echo \"$(true)\" ';' -exec $x$y build ';'",
+        "a quote",
+    );
+    assert_rejected("xargs echo \"`echo ;`\" $c build", "a quote");
+    assert_rejected("xargs echo \"${x:-;}\" $c build", "a quote");
+    // A substitution that the check cannot read to its end makes the rest of the line quoted.
+    assert_rejected("xargs echo \"$(echo ; $c build", "a quote");
+    assert_rejected(
+        "xargs echo \"$(case x in a) echo ;; esac)\" $c build",
+        "a quote",
+    );
+    assert_rejected("xargs echo \"${x:-'}\"; $c build'}\" $c build", "a quote");
+    assert_rejected(
+        "xargs -I{} sh -c \"$(x)\" ';' $c build",
+        "the character '{'",
+    );
+    assert_rejected("find . -exec sh -c \"${x}\" ';' $c build", "a quote");
+    assert_rejected("xargs echo \"$(cat <<x)\" $c build", "a quote");
+    assert_passes("echo \"$(echo `date` 'a)' \"b)\")\" | xargs echo; echo $Y");
+    assert_passes("echo \"$(echo ${x:-y} \\))\" | xargs echo; echo $Y");
+}
+
+#[test]
+fn an_argument_of_find_with_only_quoted_expansions_is_one_word() {
+    assert_passes("find \"$DIR\"/x -delete");
+    assert_passes("find \"$DIR\"/\"$SUB\" -name x");
+    assert_rejected("find \"$DIR\"$x -delete", "a quote");
+    assert_rejected("find x/$DIR -delete", "a parameter expansion");
+    assert_rejected("find \"$(echo x)\"/y $c build", "a quote");
 }

@@ -11,9 +11,16 @@
 # with real cargo) and finds no line that the check passes but that runs cargo unlocked. This
 # wrapper builds and runs that checker from the locked workspace.
 #
-# Usage: scripts/check-locked.sh [FILE|DIR...]   (default: this repository: .github/workflows,
-#        .github/actions and every .cargo/config(.toml); a directory contributes its *.yml and
-#        *.yaml files and each action.yml and action.yaml below it)
+# Usage: scripts/check-locked.sh [FILE|DIR...]
+#   With no argument, the check reads this repository: .github/workflows, .github/actions, and
+#   each local action or reusable workflow that a `uses: ./<path>` names (nested ones too). It
+#   also reads each .cargo/config and .cargo/config.toml. In a git work tree, these are the
+#   files that git tracks (in submodules too) and the untracked files that
+#   `git ls-files --others` lists (ignored ones too). That command does not go into an
+#   untracked nested repository or into a submodule. If git does not run, or tracks no file
+#   below the root, the check reads every directory but .git.
+#   A FILE or DIR argument does not follow `uses: ./` and reads no cargo config. A directory
+#   gives its *.yml and *.yaml files and each action.yml and action.yaml below it.
 # Exit: 0 clean, 1 a cargo command without --locked, 2 nothing to check, 3 the scan failed
 #       (the checker did not build or run, or a file could not be read).
 # Works on bash 3.2.

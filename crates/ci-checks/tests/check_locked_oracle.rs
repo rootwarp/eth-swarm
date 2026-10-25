@@ -16,7 +16,9 @@
 //! The stub reads the arguments as cargo 1.99 and clap do, independently of the check: an
 //! optional first `+toolchain`, the global options (with short-option clusters, `--frozen` and
 //! errors for unknown options), `CARGO_ALIAS_<NAME>` and `--config alias.<name>=..` for the
-//! names that are not built in, and the trailing arguments of `cargo run`.
+//! names that are not built in, and the trailing arguments of `cargo run`. It reads the
+//! arguments of `cargo llvm-cov` as cargo-llvm-cov 0.9 and lexopt do: an option that takes a
+//! value takes the next word, also one that starts with `-`.
 //!
 //! A second, small leg runs real cargo (offline, no dependencies, its own `CARGO_HOME`) on a
 //! scratch package with no lockfile, for a fixed sample of passed lines. A new `Cargo.lock`
@@ -62,6 +64,30 @@ const ISSUE_SHAPES: &[&str] = &[
     "xargs -a f -I fmt cargo fmt",
     "ln -sf ./bin/cargo fmt; ./fmt build",
     "CARGO_HOME=h cargo fmt --check",
+    // Deliberate bypasses after the fail-closed rewrite: a redirect before the command word,
+    // wrappers that run their arguments, and cargo-llvm-cov options that take the next word.
+    "x=car; y=go; >/dev/null $x$y build",
+    "x=car; y=go; trap \"$x$y build\" EXIT",
+    "x=car; y=go; find . -maxdepth 0 -exec $x$y build ';'",
+    "cargo llvm-cov run --features --locked x",
+    "cargo llvm-cov --lcov --output-path lcov.info --locked",
+    // Review cycle 1: an escaped `<` or `>` before `|` or `&`, a quoted `;` in find, the
+    // arguments of xargs after `{}`, and a command substitution in a `${..}`.
+    "x=car; y=go; echo a\\>|$x$y build",
+    "x=car; y=go; echo a\\>&$x$y build",
+    "x=car; y=go; echo a\\<|$x$y build",
+    "x=car; y=go; find . -maxdepth 0 -exec true ';' -exec $x$y build ';'",
+    "x=car; y=go; echo b | xargs -I {} -P 1 $x$y {}",
+    "a=car; b=go; : ${x:-$($a$b build)}",
+];
+
+/// Lines that the check must pass (a false refusal fails the test). They run with the other
+/// cases, so a line here that ran cargo unlocked is a false pass too.
+const POSITIVE_SHAPES: &[&str] = &[
+    "echo \"${X}\" | xargs echo; echo $Y",
+    "mkdir -p \"${OUT}\"; find . -name x -delete; ls $OUT",
+    "git diff --name-only \"$(git merge-base HEAD origin/main)\" | xargs -r shellcheck; echo $?",
+    "echo \"$(date)\" && find . -name x -delete && echo $HOME",
 ];
 
 /// The stub: `oracle_cargo ARGS` writes `<kind> <case> <subcommand>` to fd 3. The kind is `L`
@@ -173,6 +199,56 @@ oc_run_locked() {
   return 1
 }
 
+# oc_llvm_locked ARGS: the arguments after `cargo llvm-cov`, as cargo-llvm-cov 0.9 reads them
+# with lexopt: an option that takes a value takes the next word, also one that starts with `-`.
+# The first positional argument is a subcommand, and `run` gives each word after its own first
+# positional argument to the binary. Status 0 locked, 1 unlocked, 2 refused.
+oc_llvm_locked() {
+  oc_mode=
+  while [ $# -gt 0 ]; do
+    oc_a=$1
+    shift
+    case $oc_a in
+      --) return 1 ;;
+      --locked|--frozen) return 0 ;;
+      --output-path|--output-dir|--failure-mode|--ignore-filename-regex|--fail-under-*|\
+      --fail-uncovered-*|--dep-coverage|--nextest-archive-file|--archive-file|--cargo-profile|\
+      --bin|--example|--test|--bench|--package|--exclude|--exclude-from-test|\
+      --exclude-from-report|--jobs|--profile|--features|--target|--color|--manifest-path|\
+      -p|-j|-F|-Z|-m)
+        [ $# -gt 0 ] || return 2
+        shift ;;
+      --*) ;;
+      -*)
+        oc_s=${oc_a#-}
+        while [ -n "$oc_s" ]; do
+          oc_l=${oc_s%"${oc_s#?}"}
+          oc_s=${oc_s#?}
+          case $oc_l in
+            p|j|F|Z|m)
+              if [ -z "$oc_s" ]; then
+                [ $# -gt 0 ] || return 2
+                shift
+              fi
+              break ;;
+          esac
+        done ;;
+      *)
+        case $oc_mode in
+          run) return 1 ;;
+          sub) ;;
+          *)
+            case $oc_a in
+              run) oc_mode=run ;;
+              test|nextest|nextest-archive|report|clean|show-env) oc_mode=sub ;;
+              *) return 2 ;;
+            esac ;;
+        esac ;;
+    esac
+  done
+  return 1
+}
+
 oracle_kind() {
   for oc_n in $oc_cfg_names; do unset "oc_cfg_$oc_n"; done
   oc_cfg_names=
@@ -221,19 +297,9 @@ oracle_kind() {
       case $? in 0) oc_kind=L ;; 1) oc_kind=U ;; *) oc_kind=E ;; esac
       return ;;
     llvm-cov)
-      # `cargo llvm-cov run` gives each word after its first positional argument to the binary.
-      for oc_a in "$@"; do
-        case $oc_a in
-          --) break ;;
-          --locked|--frozen) oc_kind=L; return ;;
-          -*) shift ;;
-          run) shift
-            oc_run_locked "$@"
-            case $? in 0) oc_kind=L ;; 1) oc_kind=U ;; *) oc_kind=E ;; esac
-            return ;;
-          *) break ;;
-        esac
-      done ;;
+      oc_llvm_locked "$@"
+      case $? in 0) oc_kind=L ;; 1) oc_kind=U ;; *) oc_kind=E ;; esac
+      return ;;
   esac
   for oc_a in "$@"; do
     case $oc_a in
@@ -619,7 +685,11 @@ fn case(rng: &mut Rng) -> String {
 
 fn cases() -> Vec<String> {
     let mut rng = Rng(SEED);
-    let mut out: Vec<String> = ISSUE_SHAPES.iter().map(|s| s.to_string()).collect();
+    let mut out: Vec<String> = ISSUE_SHAPES
+        .iter()
+        .chain(POSITIVE_SHAPES)
+        .map(|s| s.to_string())
+        .collect();
     while out.len() < CASES {
         out.push(case(&mut rng));
     }
@@ -849,6 +919,12 @@ fn no_generated_run_value_passes_and_runs_cargo_unlocked() {
         .iter()
         .map(|c| ci_checks::locked::check_run(c, &[]).is_empty())
         .collect();
+    let refused: Vec<&str> = POSITIVE_SHAPES
+        .iter()
+        .copied()
+        .filter(|line| !ci_checks::locked::check_run(line, &[]).is_empty())
+        .collect();
+    assert!(refused.is_empty(), "false refusals: {refused:#?}");
     let calls = run_in_bash(&cases);
     let unlocked: HashSet<usize> = calls.iter().filter(|c| c.0 == 'U').map(|c| c.1).collect();
     let ran: HashSet<usize> = calls.iter().map(|c| c.1).collect();
@@ -945,7 +1021,7 @@ fn the_generator_is_deterministic_and_covers_the_issue_shapes() {
     let a = cases();
     assert_eq!(a.len(), CASES);
     assert_eq!(a, cases());
-    for shape in ISSUE_SHAPES {
+    for shape in ISSUE_SHAPES.iter().chain(POSITIVE_SHAPES) {
         assert!(a.iter().any(|c| c == shape), "{shape:?} is not generated");
     }
 }

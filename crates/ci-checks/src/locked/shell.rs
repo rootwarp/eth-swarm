@@ -38,6 +38,101 @@ const RUN_VALUED: &[&str] = &[
     "--artifact-dir",
 ];
 
+/// Options of cargo-llvm-cov 0.9 that take a value (from `cargo llvm-cov --help`, `run --help`
+/// and `report --help`). cargo-llvm-cov reads its arguments with lexopt, which takes the next
+/// word as the value, also a word that starts with `-`. Only options that take a value can be
+/// in the list.
+const LLVM_COV_VALUED: &[&str] = &[
+    "--output-path",
+    "--output-dir",
+    "--failure-mode",
+    "--ignore-filename-regex",
+    "--fail-under-functions",
+    "--fail-under-lines",
+    "--fail-under-file-lines",
+    "--fail-under-regions",
+    "--fail-uncovered-lines",
+    "--fail-uncovered-regions",
+    "--fail-uncovered-functions",
+    "--dep-coverage",
+    "--nextest-archive-file",
+    "--archive-file",
+    "--cargo-profile",
+    "--bin",
+    "--example",
+    "--test",
+    "--bench",
+    "-p",
+    "--package",
+    "--exclude",
+    "--exclude-from-test",
+    "--exclude-from-report",
+    "-j",
+    "--jobs",
+    "--profile",
+    "-F",
+    "--features",
+    "--target",
+    "--color",
+    "-m",
+    "--manifest-path",
+    "-Z",
+];
+
+/// How a subcommand reads the options that take a value from the next word.
+#[derive(Clone, Copy)]
+struct Options {
+    /// Options that take the next word as the value, also if it starts with `-` (lexopt).
+    lexopt: &'static [&'static str],
+    /// Options that take the next word as the value if it does not start with `-` (clap).
+    clap: &'static [&'static str],
+    /// The letters of the short options in `lexopt`. A short-option cluster whose first such
+    /// letter is its last character takes the next word as the value, and it fails.
+    valued_letters: &'static [char],
+    /// The options after a nested `nextest` or `nextest-archive` subcommand.
+    nextest: Option<&'static Options>,
+}
+
+/// `cargo run` and the other subcommands that clap reads.
+const CLAP: Options = Options {
+    lexopt: &[],
+    clap: RUN_VALUED,
+    valued_letters: &[],
+    nextest: None,
+};
+
+/// `cargo llvm-cov`.
+const LLVM_COV: Options = Options {
+    lexopt: LLVM_COV_VALUED,
+    clap: &[],
+    valued_letters: &['p', 'j', 'F', 'Z', 'm'],
+    nextest: Some(&LLVM_COV_NEXTEST),
+};
+
+/// `cargo llvm-cov nextest` and `nextest-archive`. cargo-llvm-cov gives the options that it
+/// does not know to cargo-nextest, which reads them with clap.
+const LLVM_COV_NEXTEST: Options = Options {
+    lexopt: LLVM_COV_VALUED,
+    clap: RUN_VALUED,
+    valued_letters: &['p', 'j', 'F', 'Z', 'm'],
+    nextest: None,
+};
+
+/// Where the check found `--locked` in the arguments after a subcommand.
+#[derive(Debug, PartialEq, Eq)]
+enum Lock {
+    /// Where the subcommand reads it.
+    Read,
+    /// Not before `--`.
+    Missing,
+    /// Only after the first positional argument.
+    AfterPositional,
+    /// Only as the value of this option.
+    Value(String),
+    /// After this short-option cluster, which can take the next word as its value.
+    Cluster(String),
+}
+
 /// Subcommands that give each word after their first positional argument to the program that
 /// they run (a clap trailing var-arg).
 const TRAILING_ARGS: &[&str] = &["run", "r"];
@@ -102,10 +197,13 @@ pub(super) fn can_run_cargo(text: &str) -> bool {
         return true;
     }
     let raw: Vec<char> = lower.chars().collect();
-    let in_command = command_words(&raw);
+    let scan = command_words(&raw);
+    if scan.actions.iter().any(|action| can_run_cargo(action)) {
+        return true;
+    }
     let (kept, flags): (Vec<char>, Vec<bool>) = raw
         .iter()
-        .zip(&in_command)
+        .zip(&scan.in_command)
         .filter(|(c, _)| !matches!(c, '"' | '\'' | '\\' | '\n' | '\r'))
         .map(|(c, f)| (*c, *f))
         .unzip();
@@ -116,32 +214,119 @@ pub(super) fn can_run_cargo(text: &str) -> bool {
 /// Words after which the next word is a command word.
 const KEYWORDS: &[&str] = &["if", "then", "else", "elif", "do", "while", "until", "!"];
 
-/// Commands that can run their arguments as a command.
+/// Commands that can run their arguments as a command: each later word of the command is a
+/// command word, up to the next separator.
 const WRAPPERS: &[&str] = &[
-    "env", "exec", "command", "builtin", "eval", "xargs", "nice", "sudo", "doas", "nohup",
-    "timeout", "time", "stdbuf", "setsid", "ionice", "flock", "bash", "sh", "dash", "zsh", "ksh",
-    "su", "watch", "chroot",
+    "env",
+    "exec",
+    "command",
+    "builtin",
+    "eval",
+    "nice",
+    "sudo",
+    "doas",
+    "nohup",
+    "timeout",
+    "time",
+    "stdbuf",
+    "setsid",
+    "ionice",
+    "flock",
+    "bash",
+    "sh",
+    "dash",
+    "zsh",
+    "ksh",
+    "su",
+    "watch",
+    "chroot",
+    "coproc",
+    "script",
+    // An expansion in the arguments of ssh can be an option such as `-oProxyCommand=..`.
+    "ssh",
+    "taskset",
+    "unshare",
+    "systemd-run",
+    "chrt",
+    "nsenter",
+    "runuser",
+    "strace",
+    "fakeroot",
+    "unbuffer",
+    "busybox",
 ];
+
+/// Commands whose arguments hold a command after a quoted `;` or a `{}`: each later word is a
+/// command word, up to the unquoted end of the command.
+const STICKY_WRAPPERS: &[&str] = &["xargs", "parallel"];
+
+/// The primaries of find after which find runs the next words as a command.
+const FIND_EXEC: &[&str] = &["-exec", "-execdir", "-ok", "-okdir"];
 
 /// A character that ends a word and starts a new command (or a substitution) after it.
 fn is_separator(c: char) -> bool {
     matches!(c, ';' | '&' | '|' | '(' | ')' | '{' | '}' | '`' | '\n')
 }
 
+/// What [`command_words`] found.
+struct Scan {
+    /// For each character, true if its word can be a command word.
+    in_command: Vec<bool>,
+    /// The action of each `trap`, as the command line that the shell runs later.
+    actions: Vec<String>,
+}
+
 /// For each character of `raw`, true if its word can be a command word. This over-estimates:
 /// the first word of a command, of a substitution or of a group; a word after an assignment, a
-/// keyword or a command word with a quote or a backslash (the real word ends are unknown); and
-/// each word after a wrapper such as `env` or `xargs`.
-fn command_words(raw: &[char]) -> Vec<bool> {
+/// redirect (and its target), a keyword or a command word with a quote or a backslash (the real
+/// word ends are unknown); each word after a wrapper such as `env`; and each word after
+/// `xargs`, `parallel` or a `find -exec` up to the unquoted end of the command. The action of
+/// a `trap` goes into [`Scan::actions`].
+fn command_words(raw: &[char]) -> Scan {
+    let quoted = quoted_chars(raw);
     let mut out = vec![false; raw.len()];
+    let mut actions = Vec::new();
     let mut next_is_command = true;
     let mut after_wrapper = false;
+    // The last word was a redirect operator without its target (`>`, `2>`, `<<<`).
+    let mut target_next = false;
+    // The nesting depth of substitutions and subshells, and the depth of the open find
+    // command and of the open sticky wrapper.
+    let mut depth = 0usize;
+    let mut in_backtick = false;
+    let mut find: Option<usize> = None;
+    let mut sticky: Option<usize> = None;
     let mut i = 0;
     while i < raw.len() {
         let c = raw[i];
         if is_separator(c) {
             next_is_command = true;
             after_wrapper = false;
+            target_next = false;
+            if !quoted[i] {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth = depth.saturating_sub(1),
+                    '`' if in_backtick => {
+                        in_backtick = false;
+                        depth = depth.saturating_sub(1);
+                    }
+                    '`' => {
+                        in_backtick = true;
+                        depth += 1;
+                    }
+                    _ => {}
+                }
+                let ends = |open: usize| {
+                    depth < open || (depth == open && matches!(c, ';' | '&' | '|' | '\n'))
+                };
+                if find.is_some_and(ends) {
+                    find = None;
+                }
+                if sticky.is_some_and(ends) {
+                    sticky = None;
+                }
+            }
             i += 1;
             continue;
         }
@@ -150,7 +335,10 @@ fn command_words(raw: &[char]) -> Vec<bool> {
             continue;
         }
         let start = i;
-        while i < raw.len() && !matches!(raw[i], ' ' | '\t') && !is_separator(raw[i]) {
+        while i < raw.len()
+            && !matches!(raw[i], ' ' | '\t')
+            && (!is_separator(raw[i]) || in_redirect_operator(raw, start, i))
+        {
             // `${..}` is part of the word, not a group.
             i = if raw[i] == '$' && raw.get(i + 1) == Some(&'{') {
                 after_group(raw, i + 1, '{', '}')
@@ -159,23 +347,293 @@ fn command_words(raw: &[char]) -> Vec<bool> {
             };
         }
         let word: String = raw[start..i].iter().collect();
-        let is_command = next_is_command || after_wrapper;
+        let is_command = next_is_command || after_wrapper || sticky.is_some();
         let bare: String = word
             .chars()
             .filter(|c| !matches!(c, '"' | '\'' | '\\'))
             .collect();
-        let assignment = is_command && is_assignment(&bare);
-        // The value of an assignment is not a command word.
-        if is_command && !assignment {
+        // Bash reads an assignment or a redirect only from unquoted text, so the raw word
+        // decides. A quoted name or operator is part of the command word.
+        let assignment = is_command && is_assignment(&word);
+        let target = is_command && std::mem::take(&mut target_next);
+        let operator = redirect_operator(&word);
+        let redirect = is_command && operator.is_some();
+        // In the arguments of find, an expansion can be `-exec`. An unquoted one can also hold
+        // the command.
+        let find_exec = find.is_some()
+            && sticky.is_none()
+            && (FIND_EXEC.contains(&bare.as_str()) || word.contains(['$', '`']));
+        let find_command =
+            find_exec && word.contains(['$', '`']) && !expansions_in_double_quotes(&word);
+        // The value of an assignment, a redirect and its target are not command words.
+        if (is_command && !assignment && !redirect && !target) || find_command {
             out[start..i].fill(true);
         }
+        target_next = redirect && operator == Some(true);
         let unclear = is_command && word.contains(['"', '\'', '\\']);
-        next_is_command = unclear || assignment || KEYWORDS.contains(&bare.as_str());
+        next_is_command =
+            unclear || assignment || redirect || target || KEYWORDS.contains(&bare.as_str());
         if is_command && WRAPPERS.contains(&bare.as_str()) {
             after_wrapper = true;
         }
+        if (is_command && STICKY_WRAPPERS.contains(&bare.as_str())) || find_exec {
+            sticky.get_or_insert(depth);
+        }
+        if is_command && bare == "find" {
+            find.get_or_insert(depth);
+        }
+        if is_command && bare == "trap" {
+            match trap_action(raw, i) {
+                Some(action) => actions.extend(action),
+                None => after_wrapper = true,
+            }
+        }
+    }
+    Scan {
+        in_command: out,
+        actions,
+    }
+}
+
+/// True if each `$` of `word` is inside double quotes and the word has no command
+/// substitution (`"$dir"/x`), so that bash gives it as one argument.
+fn expansions_in_double_quotes(word: &str) -> bool {
+    let c: Vec<char> = word.chars().collect();
+    let mut in_double = false;
+    let mut i = 0;
+    while i < c.len() {
+        match c[i] {
+            '\\' => i += 2,
+            '\'' if !in_double => match c[i + 1..].iter().position(|x| *x == '\'') {
+                Some(len) => i += len + 2,
+                None => return false,
+            },
+            '"' => {
+                in_double = !in_double;
+                i += 1;
+            }
+            '`' => return false,
+            '$' if c.get(i + 1) == Some(&'(') || !in_double => return false,
+            _ => i += 1,
+        }
+    }
+    !in_double
+}
+
+/// For each character of `raw`, true if bash can read it as quoted: in quotes, after a
+/// backslash, or a quote or a backslash itself. A double-quoted string includes each
+/// `${..}`, `$(..)` and backtick span in it. If the check cannot find the end of a quoted
+/// string, the rest of the text is quoted.
+fn quoted_chars(raw: &[char]) -> Vec<bool> {
+    let mut out = vec![false; raw.len()];
+    let mut i = 0;
+    while i < raw.len() {
+        let end = match raw[i] {
+            '\\' => (i + 2).min(raw.len()),
+            '\'' => raw[i + 1..]
+                .iter()
+                .position(|c| *c == '\'')
+                .map_or(raw.len(), |p| i + p + 2),
+            '"' => after_double_quotes(raw, i).unwrap_or(raw.len()),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        out[i..end].fill(true);
+        i = end;
     }
     out
+}
+
+/// True if a `$(..)`, a `${..}` or a backtick span starts at `raw[at]`.
+fn starts_span(raw: &[char], at: usize) -> bool {
+    raw[at] == '`' || (raw[at] == '$' && matches!(raw.get(at + 1), Some('(' | '{')))
+}
+
+/// The index after the double-quoted string whose `"` is at `raw[at]`, or `None` if the check
+/// cannot find its end.
+fn after_double_quotes(raw: &[char], at: usize) -> Option<usize> {
+    let mut j = at + 1;
+    loop {
+        match *raw.get(j)? {
+            '\\' => j += 2,
+            '"' => return Some(j + 1),
+            _ if starts_span(raw, j) => j = after_span(raw, j)?,
+            _ => j += 1,
+        }
+    }
+}
+
+/// The index after the `$(..)`, `${..}` or backtick span at `raw[at]`, with the quotes and the
+/// spans in it, or `None` if the check cannot find its end. The check does not read a
+/// here-document or a `case` in a `$(..)`, nor a single quote in a `${..}`, because bash can
+/// read a `)` or a `'` there in more than one way.
+fn after_span(raw: &[char], at: usize) -> Option<usize> {
+    if raw[at] == '`' {
+        let mut j = at + 1;
+        loop {
+            match *raw.get(j)? {
+                '\\' => j += 2,
+                '`' => return Some(j + 1),
+                _ => j += 1,
+            }
+        }
+    }
+    let (open, close) = if raw.get(at + 1) == Some(&'(') {
+        ('(', ')')
+    } else {
+        ('{', '}')
+    };
+    let mut depth = 0usize;
+    let mut j = at + 1;
+    loop {
+        let c = *raw.get(j)?;
+        match c {
+            '\\' => j += 2,
+            '\'' if open == '{' => return None,
+            '\'' => j += raw[j + 1..].iter().position(|c| *c == '\'')? + 2,
+            '"' => j = after_double_quotes(raw, j)?,
+            '<' if open == '(' && raw.get(j + 1) == Some(&'<') => return None,
+            _ if starts_span(raw, j) => j = after_span(raw, j)?,
+            _ if c == open => {
+                depth += 1;
+                j += 1;
+            }
+            _ if c == close => {
+                depth -= 1;
+                j += 1;
+                if depth == 0 {
+                    let body: String = raw[at..j].iter().collect();
+                    return (!body.contains("case")).then_some(j);
+                }
+            }
+            _ => j += 1,
+        }
+    }
+}
+
+/// The action of the `trap` command whose arguments start at `raw[at]`, as the text that the
+/// shell runs later: `Some(None)` if it has none, and `None` if the check cannot read its words.
+fn trap_action(raw: &[char], at: usize) -> Option<Option<String>> {
+    let mut i = at;
+    let mut options = true;
+    loop {
+        let Some((end, word)) = shell_word(raw, i)? else {
+            return Some(None);
+        };
+        i = end;
+        if options && word == "--" {
+            options = false;
+        } else if options && word.len() > 1 && word.starts_with('-') {
+            // `-p`, `-l` or `-P`: no action.
+        } else {
+            return Some(Some(word));
+        }
+    }
+}
+
+/// The next word of the command at `raw[at]`, after blanks, as `(end, the text after quote
+/// removal)`: `Some(None)` at the end of the command, and `None` if the check cannot read the
+/// word (a substitution, a redirect, a continuation, an open quote, or a `${..}` with a quote
+/// or a substitution in it).
+fn shell_word(raw: &[char], at: usize) -> Option<Option<(usize, String)>> {
+    let mut i = at;
+    while matches!(raw.get(i), Some(' ' | '\t')) {
+        i += 1;
+    }
+    let ends = |c: char| matches!(c, ' ' | '\t' | ';' | '&' | '|' | '(' | ')' | '\n');
+    if raw.get(i).is_none_or(|c| ends(*c)) {
+        return Some(None);
+    }
+    let mut word = String::new();
+    // Appends the `${..}` at `raw[j]` and returns the index after it.
+    let parameter = |j: usize, word: &mut String| -> Option<usize> {
+        let end = after_group(raw, j + 1, '{', '}');
+        let body = &raw[j..end];
+        if body.iter().any(|c| matches!(c, '"' | '\'' | '`' | '(')) || end > raw.len() {
+            return None;
+        }
+        word.extend(body);
+        Some(end)
+    };
+    while let Some(&c) = raw.get(i) {
+        match c {
+            _ if ends(c) => break,
+            '<' | '>' | '`' => return None,
+            '$' if raw.get(i + 1) == Some(&'(') => return None,
+            '$' if raw.get(i + 1) == Some(&'{') => i = parameter(i, &mut word)?,
+            '\\' => {
+                let next = *raw.get(i + 1)?;
+                if next == '\n' {
+                    return None;
+                }
+                word.push(next);
+                i += 2;
+            }
+            '\'' => {
+                let len = raw[i + 1..].iter().position(|c| *c == '\'')?;
+                word.extend(&raw[i + 1..i + 1 + len]);
+                i += len + 2;
+            }
+            '"' => {
+                i += 1;
+                loop {
+                    match *raw.get(i)? {
+                        '"' => {
+                            i += 1;
+                            break;
+                        }
+                        '`' => return None,
+                        '$' if raw.get(i + 1) == Some(&'(') => return None,
+                        '$' if raw.get(i + 1) == Some(&'{') => i = parameter(i, &mut word)?,
+                        '\\' => {
+                            let next = *raw.get(i + 1)?;
+                            if !matches!(next, '$' | '`' | '"' | '\\') {
+                                word.push('\\');
+                            }
+                            if next == '\n' {
+                                return None;
+                            }
+                            word.push(next);
+                            i += 2;
+                        }
+                        ch => {
+                            word.push(ch);
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            ch => {
+                word.push(ch);
+                i += 1;
+            }
+        }
+    }
+    Some(Some((i, word)))
+}
+
+/// True if the `&` or `|` at `raw[i]` is part of a redirect operator (`>&`, `<&`, `>|`) of the
+/// word that starts at `start`, and thus not a separator. A quote or a backslash in the word
+/// before it can make the `<` or `>` a plain character, so then it is a separator.
+fn in_redirect_operator(raw: &[char], start: usize, i: usize) -> bool {
+    i > start
+        && matches!(raw[i], '&' | '|')
+        && matches!(raw[i - 1], '<' | '>')
+        && !raw[start..i].iter().any(|c| matches!(c, '\\' | '"' | '\''))
+}
+
+/// The redirect operators of bash that a word can start with, the longest first.
+const REDIRECTS: &[&str] = &["<<<", "<<-", "<<", "<>", "<&", "<", ">>", ">|", ">&", ">"];
+
+/// `Some(alone)` if the raw `word` starts with an unquoted redirect operator, after optional
+/// file descriptor digits. `alone` is true if the word is only the operator (`>`, `2>`, `<<<`),
+/// so that the next word is its target.
+fn redirect_operator(word: &str) -> Option<bool> {
+    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    let operator = REDIRECTS.iter().find(|op| rest.starts_with(**op))?;
+    Some(rest.len() == operator.len())
 }
 
 /// `NAME=...` with a shell identifier as the name.
@@ -213,6 +671,11 @@ fn pattern(c: &[char], in_command: &[bool], keep_expansions: bool) -> Vec<Part> 
         }
         let keep = keep_expansions && !in_command[i];
         match c[i] {
+            '$' if c.get(i + 1) == Some(&'{') && substitutes(c, i + 1) => {
+                // A `${..}` that runs a command can give any text.
+                out.push(Part::Any);
+                i = after_group(c, i + 1, '{', '}');
+            }
             '$' if keep => {
                 out.push(Part::Char('$'));
                 i += 1;
@@ -283,6 +746,13 @@ fn pattern(c: &[char], in_command: &[bool], keep_expansions: bool) -> Vec<Part> 
         }
     }
     out
+}
+
+/// True if the `${..}` whose `{` is at `c[at]` holds a command substitution (`$(` or a
+/// backtick).
+fn substitutes(c: &[char], at: usize) -> bool {
+    let body = &c[at..after_group(c, at, '{', '}')];
+    body.contains(&'`') || body.windows(2).any(|w| w == ['$', '('])
 }
 
 /// True if some expansion of `parts` holds the text `cargo`.
@@ -640,60 +1110,90 @@ fn check_subcommand(sub: &str, locked: bool, rest: &[String]) -> Result<(), Stri
         .iter()
         .find(|(name, _)| *name == sub)
         .map(|(_, n)| *n);
-    let locked = locked
-        || if TRAILING_ARGS.contains(&sub) {
-            locked_before_positional(rest)
-        } else if let Some(nested) = nested {
-            locked_in_nested(nested, rest)
-        } else {
-            rest.iter()
-                .take_while(|a| a.as_str() != "--")
-                .any(|a| a == "--locked")
-        };
-    if locked {
-        Ok(())
+    let options = if sub == "llvm-cov" { LLVM_COV } else { CLAP };
+    let lock = if locked {
+        Lock::Read
+    } else if TRAILING_ARGS.contains(&sub) {
+        options_lock(rest, options, &[])
+    } else if let Some(nested) = nested {
+        options_lock(rest, options, nested)
+    } else if rest
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| a == "--locked")
+    {
+        Lock::Read
     } else {
-        Err(format!("cargo {sub} without --locked"))
+        Lock::Missing
+    };
+    match lock {
+        Lock::Read => Ok(()),
+        Lock::Missing => Err(format!("cargo {sub} without --locked")),
+        Lock::AfterPositional => Err(format!(
+            "cargo {sub} has --locked only after a positional argument, where the check does \
+             not read it (put --locked before the first positional argument)"
+        )),
+        Lock::Value(option) => Err(format!(
+            "cargo {sub} has --locked only as the value of {option:?}, which takes the next \
+             word"
+        )),
+        Lock::Cluster(cluster) => Err(format!(
+            "cargo {sub} has a short-option cluster that can take the next word as its value \
+             ({cluster:?}): write each option as its own word"
+        )),
     }
 }
 
-/// True if `--locked` comes before the nested subcommand, or after it and before `--` and the
-/// first positional argument. A first positional argument that is not in `nested` fails.
-fn locked_in_nested(nested: &[&str], rest: &[String]) -> bool {
+/// Where `--locked` is in `rest`, if the check reads it only before `--` and the first
+/// positional argument. If that argument is one of `nested` (a nested subcommand), the check
+/// reads the options after it in the same way, up to the next positional argument.
+fn options_lock(rest: &[String], options: Options, nested: &[&str]) -> Lock {
+    let mut value_of: Option<String> = None;
     let mut j = 0;
     while j < rest.len() {
         let arg = rest[j].as_str();
-        if arg == "--locked" {
-            return true;
-        }
         if arg == "--" {
-            return false;
+            break;
         }
         if !arg.starts_with('-') {
-            return nested.contains(&arg) && locked_before_positional(&rest[j + 1..]);
-        }
-        let takes_next =
-            RUN_VALUED.contains(&arg) && rest.get(j + 1).is_some_and(|next| !next.starts_with('-'));
-        j += if takes_next { 2 } else { 1 };
-    }
-    false
-}
-
-/// True if `--locked` comes before `--` and before the first positional argument, after which
-/// `cargo run` gives each word to the binary.
-fn locked_before_positional(rest: &[String]) -> bool {
-    let mut j = 0;
-    while j < rest.len() {
-        let arg = rest[j].as_str();
-        if arg == "--" || !arg.starts_with('-') {
-            return false;
+            if nested.contains(&arg) {
+                let inner = match options.nextest {
+                    Some(nextest) if arg.starts_with("nextest") => *nextest,
+                    _ => options,
+                };
+                return match options_lock(&rest[j + 1..], inner, &[]) {
+                    Lock::Missing => value_of.map_or(Lock::Missing, Lock::Value),
+                    lock => lock,
+                };
+            }
+            if rest[j..]
+                .iter()
+                .take_while(|a| a.as_str() != "--")
+                .any(|a| a == "--locked")
+            {
+                return Lock::AfterPositional;
+            }
+            break;
         }
         if arg == "--locked" {
-            return true;
+            return Lock::Read;
         }
-        let takes_next =
-            RUN_VALUED.contains(&arg) && rest.get(j + 1).is_some_and(|next| !next.starts_with('-'));
+        // In `-vF`, the value is the next word. In `-j8`, it is the rest of the cluster.
+        let cluster = !arg.starts_with("--") && arg.len() > 2;
+        let first_valued = arg[1..].find(options.valued_letters);
+        if cluster && first_valued == Some(arg.len() - 2) {
+            return Lock::Cluster(arg.to_owned());
+        }
+        // A `--` is never read as a value: then the check reads less.
+        let takes_next = rest.get(j + 1).is_some_and(|next| {
+            next != "--"
+                && (options.lexopt.contains(&arg)
+                    || (options.clap.contains(&arg) && !next.starts_with('-')))
+        });
+        if takes_next && rest[j + 1] == "--locked" {
+            value_of.get_or_insert_with(|| arg.to_owned());
+        }
         j += if takes_next { 2 } else { 1 };
     }
-    false
+    value_of.map_or(Lock::Missing, Lock::Value)
 }

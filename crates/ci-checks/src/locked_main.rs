@@ -2,7 +2,9 @@
 //! action or a repository cargo config can make cargo run without `--locked`.
 //!
 //! - `--repo DIR` (the default is `--repo .`) checks `DIR/.github/workflows`,
-//!   `DIR/.github/actions` and each `.cargo/config` and `.cargo/config.toml` below `DIR`.
+//!   `DIR/.github/actions`, each local action or reusable workflow that a `uses: ./<path>`
+//!   names, and each `.cargo/config` and `.cargo/config.toml` below `DIR` (rule 10 of the
+//!   module docs of `ci_checks::locked` tells which files count in a git work tree).
 //! - `FILE|DIR...` checks only those files. A directory gives its `*.yml` and `*.yaml` files and
 //!   each `action.yml` and `action.yaml` below it.
 //!

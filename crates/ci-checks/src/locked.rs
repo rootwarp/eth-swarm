@@ -17,10 +17,28 @@
 //!    some expansion of it can spell `cargo` (any letter case). For that, quotes and
 //!    backslashes are removed, `?` and `[..]` are any one character, and `*` and a brace
 //!    expansion (`{a,b}`, `{a..b}`) are any text. An expansion (`$name`, `${..}`, `$(..)`,
-//!    backticks) is any text in a word that can be a command word: the first word of a command,
-//!    of a substitution or of a group, a word after an assignment or a keyword, after a command
-//!    word with a quote, or after a wrapper such as `env` or `xargs`. Elsewhere it is once kept
-//!    and once removed. Other lines are not checked.
+//!    backticks) is any text in a word that can be a command word:
+//!    - the first word of a command, of a substitution or of a group;
+//!    - a word after an assignment, a redirect (and its target) or a keyword, or after a
+//!      command word with a quote;
+//!    - each word after a wrapper such as `env`, `sudo` or `ssh`, up to the next separator.
+//!      Thus `ssh "$HOST" uptime` fails: an expansion in the arguments of ssh can be an option
+//!      such as `-oProxyCommand=..`;
+//!    - each word after `xargs` or `parallel`, and after `-exec`, `-execdir`, `-ok`, `-okdir`
+//!      or an expansion in the arguments of `find`, up to the unquoted end of the command (a
+//!      quoted `;` and a `{}` do not end it). An expansion in the arguments of `find` that is
+//!      not inside double quotes is a command word itself, so `find "$DIR"/x -name x` passes
+//!      and `find $DIR -name x` fails. A double-quoted string includes its `${..}`, `$(..)`
+//!      and backtick spans. If the check cannot find the end of such a span, the rest of the
+//!      line is quoted.
+//!
+//!    Elsewhere an expansion is once kept and once removed, but a `${..}` that holds `$(` or a
+//!    backtick is any text. The action of a `trap` is read as one more line, so
+//!    `trap 'rm -rf "$tmp"' EXIT` passes. If the check cannot read the words of a `trap`, each
+//!    later word is a command word. The check reads a double-quoted action only after quote
+//!    removal. Thus it does not follow a variable value in that action, which the shell
+//!    expands when it sets the trap and reads again as shell text when the trap runs
+//!    (`trap "rm -f ${tmp}" EXIT` passes). Other lines are not checked.
 //! 4. A line that can run cargo may hold only letters, digits, blanks, `_ . / , : = + ~ @ -`,
 //!    the operators `; & && | ||`, `#` comments, and `2>&1` as the last word of a command.
 //!    Thus a quote, a backslash, a continuation, `$`, a backtick, a glob, a brace, `<(`, `>(`,
@@ -45,7 +63,9 @@
 //!      argument to the binary, so for them `--locked` must also come before that argument.
 //!      For `llvm-cov`, `nextest` and `deny`, `--locked` must come before the nested
 //!      subcommand, or after it and before its first positional argument (`llvm-cov run` gives
-//!      the words after that argument to the binary);
+//!      the words after that argument to the binary). cargo-llvm-cov takes the next word as
+//!      the value of an option, also a word that starts with `-`, so a short-option cluster
+//!      that can end in such an option (`-vF`) fails;
 //!    - [`NO_LOCK`] subcommands, and a call with only [`INFORMATIONAL`] flags, need no lock;
 //!    - any other subcommand fails until it is put in one of the lists.
 //! 7. A `shell` value is a command template, so it is checked as a line, with `{0}` read as a
@@ -58,13 +78,21 @@
 //!    `entrypoint`) fails, and so does a Docker action whose `entrypoint`, `pre-entrypoint`,
 //!    `post-entrypoint` or `args` can run cargo.
 //! 9. A mapping key `CARGO_ALIAS_<x>` (at any depth), or `CARGO_HOME` or `HOME` in an `env`
-//!    mapping (at any level), fails.
+//!    mapping (at any level) or in a mapping with an anchor (an alias can make it an `env`
+//!    mapping), fails. Thus `with: &w {home: /x}` fails, although `with: {home: /x}` passes.
 //! 10. In repository mode ([`check_repo`]), the check also reads each local action or
 //!     reusable workflow that a `uses: ./<path>` names, nested ones too, and fails if it is
 //!     missing or resolves outside the repository. Each `.cargo/config` and
-//!     `.cargo/config.toml` of the repository (the files that git tracks, in a git work tree)
-//!     is read as TOML: it must parse, must not `include` a file, and must not alias a name of
-//!     [`NO_LOCK`] or [`NEEDS_LOCK`]. A `.cargo` link must resolve inside the repository.
+//!     `.cargo/config.toml` of the repository is read as TOML: it must parse, must not
+//!     `include` a file, and must not alias a name of [`NO_LOCK`] or [`NEEDS_LOCK`]. In a git
+//!     work tree, the check reads:
+//!     - each config file and `.cargo` link that git tracks, in submodules too;
+//!     - each untracked config file and `.cargo` link that `git ls-files --others` lists,
+//!       ignored ones too. That command does not go into an untracked nested repository or
+//!       into a submodule, so the untracked files there are not read.
+//!
+//!     If git does not run, or tracks no file below the root, the check reads every directory
+//!     but `.git`. A `.cargo` link must resolve inside the repository.
 //!
 //! A reviewed [`ALLOW`] entry passes one exact line or `uses:` value of one file. The check does
 //! not follow a command name that comes from somewhere else: a variable value that is not in a
@@ -311,9 +339,9 @@ pub fn check_paths(paths: &[PathBuf], allow: &[Allow]) -> Result<Scan, PathError
 
 /// Checks a repository: `.github/workflows`, `.github/actions` (if it exists), each local
 /// action or workflow that a `uses: ./<path>` names (also from those files), and each
-/// `.cargo/config` and `.cargo/config.toml` of the repository. In a git work tree, only the
-/// files that git tracks count. A local action, or a `.cargo` link, that resolves outside the
-/// repository fails.
+/// `.cargo/config` and `.cargo/config.toml` of the repository. In a git work tree, the files
+/// that git tracks and the untracked config files count (rule 10 of the module docs). A local
+/// action, or a `.cargo` link, that resolves outside the repository fails.
 pub fn check_repo(root: &Path, allow: &[Allow]) -> Result<Scan, PathError> {
     let mut paths = vec![root.join(".github/workflows")];
     let actions = root.join(".github/actions");
@@ -448,12 +476,12 @@ fn action_files(dir: &Path) -> Result<Vec<PathBuf>, PathError> {
 }
 
 /// The cargo config files of the repository, and a problem for each `.cargo` link that
-/// resolves outside it. In a git work tree, the files that git tracks; else every directory but
-/// `.git`.
+/// resolves outside it. In a git work tree, the paths of [`git_listed`]; else, or if git
+/// tracks no file below `root`, every directory but `.git`.
 fn cargo_configs(root: &Path, top: &Path) -> Result<(Vec<PathBuf>, Vec<Violation>), PathError> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    match git_tracked(root) {
+    match git_listed(root) {
         Some(tracked) => {
             for rel in tracked {
                 let path = root.join(&rel);
@@ -500,13 +528,36 @@ fn cargo_configs(root: &Path, top: &Path) -> Result<(Vec<PathBuf>, Vec<Violation
     Ok((files, problems))
 }
 
-/// The paths that git tracks below `root` (submodules included), or `None` if `root` is not
-/// in a git work tree or git does not run.
-fn git_tracked(root: &Path) -> Option<Vec<PathBuf>> {
+/// The paths that git tracks below `root` (submodules included), and the untracked `.cargo`
+/// links and `.cargo/config` and `.cargo/config.toml` files (ignored ones too). `git ls-files
+/// --others` does not go into an untracked nested repository or into a submodule, so their
+/// untracked files are not in the list. `None` if `root` is not in a git work tree, git does
+/// not run, or git tracks no file below `root` (the root is ignored or untracked).
+fn git_listed(root: &Path) -> Option<Vec<PathBuf>> {
+    let mut paths = git_ls_files(root, &["--cached", "--recurse-submodules"])?;
+    if paths.is_empty() {
+        return None;
+    }
+    paths.extend(git_ls_files(
+        root,
+        &[
+            "--others",
+            "--",
+            ":(glob)**/.cargo",
+            ":(glob)**/.cargo/config",
+            ":(glob)**/.cargo/config.toml",
+        ],
+    )?);
+    Some(paths)
+}
+
+/// The paths of `git ls-files -z <args>` in `root`, or `None` if git fails.
+fn git_ls_files(root: &Path, args: &[&str]) -> Option<Vec<PathBuf>> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["ls-files", "-z", "--cached", "--recurse-submodules"])
+        .args(["ls-files", "-z"])
+        .args(args)
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
@@ -523,7 +574,9 @@ fn git_tracked(root: &Path) -> Option<Vec<PathBuf>> {
 }
 
 /// Each `.cargo` directory or link below `dir`, without `.git` directories. A link is not
-/// followed further.
+/// followed further. The walk does not skip a directory with a `CACHEDIR.TAG` or a `.git`
+/// file: this walk runs when git cannot list the files (for example, git refuses a checkout
+/// that another user owns), and then a committed `CACHEDIR.TAG` could hide a committed config.
 fn walk_cargo_dirs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), PathError> {
     for path in entries(dir)? {
         let name = path
@@ -571,7 +624,8 @@ enum Open {
         expect_key: bool,
         /// The keys so far, in lower case.
         keys: Vec<String>,
-        /// The mapping is the value of an `env` key.
+        /// The mapping is the value of an `env` key, or has an anchor (an alias can make it
+        /// the value of an `env` key).
         env: bool,
     },
     Seq,
@@ -579,7 +633,8 @@ enum Open {
 
 /// Records each scalar value of a `run` or `shell` key (any letter case), through aliases too,
 /// and each key problem: two keys of one mapping that differ only in letter case (or are the
-/// same), a `CARGO_ALIAS_` key anywhere, and a `CARGO_HOME` or `HOME` key of an `env` mapping.
+/// same), a `CARGO_ALIAS_` key anywhere, and a `CARGO_HOME` or `HOME` key of an `env` mapping
+/// or of a mapping with an anchor.
 #[derive(Default)]
 struct Values {
     open: Vec<Open>,
@@ -673,7 +728,9 @@ impl MarkedEventReceiver for Values {
                     self.anchors.insert(anchor, None);
                 }
                 let role = self.node(None, mark);
-                let env = role == Role::Value && self.last_key.as_deref() == Some("env");
+                // An alias can put an anchored mapping under an `env` key that is not above it.
+                let env =
+                    anchor != 0 || (role == Role::Value && self.last_key.as_deref() == Some("env"));
                 self.open.push(if matches!(ev, Event::MappingStart(..)) {
                     Open::Map {
                         expect_key: true,
