@@ -130,6 +130,20 @@ pub fn metrics_addr(ready: &str) -> SocketAddr {
 
 /// Starts `services` under `config` and waits for READY.
 pub async fn start(config: Config, services: Services) -> Running {
+    start_with(
+        config,
+        services,
+        prometheus_client::registry::Registry::default(),
+    )
+    .await
+}
+
+/// [`start`], with `unprefixed` as the service's registry of metrics without a prefix.
+pub async fn start_with(
+    config: Config,
+    services: Services,
+    unprefixed: prometheus_client::registry::Registry,
+) -> Running {
     let (tx, mut states) = mpsc::unbounded_channel();
     let (stop, stopped) = oneshot::channel::<()>();
     let socket = config.socket.clone();
@@ -139,6 +153,7 @@ pub async fn start(config: Config, services: Services) -> Running {
             let _ = stopped.await;
         }),
         registry: prometheus_client_registry(),
+        unprefixed,
     };
     let task = tokio::spawn(svc_runtime::run_with(config, services, hooks));
     let ready = tokio::time::timeout(Duration::from_secs(30), states.recv())

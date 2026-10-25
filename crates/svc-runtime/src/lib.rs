@@ -12,8 +12,9 @@
 //! svc_runtime::exit_code(&result)
 //! ```
 //!
-//! - [`config`]: `/etc/ethswarm/<svc>.toml`: the network (resolved through `network-config`),
-//!   the `/metrics` port, the drain deadline, the socket group and the method ACL.
+//! - [`config`]: `/etc/ethswarm/<svc>.toml`: the network (pinned, or a devnet's directory), the
+//!   `/metrics` port, the drain deadline, the socket group, the method ACL and the service's
+//!   own table.
 //! - [`telemetry`]: JSON `tracing` with a `trace_id` per call, and prometheus-client metrics at
 //!   `127.0.0.1:91NN/metrics`.
 //! - [`log_writer`]: the bounded queue and writer thread between `tracing` and stderr.
@@ -23,11 +24,13 @@
 //! - [`services`]: the gRPC services served and their method paths; an ACL entry nothing
 //!   serves fails startup.
 //! - [`notify`]: `sd_notify(3)` without libsystemd.
+//! - [`owned`]: a config file read only if the service user cannot change it or its path.
 
 pub mod config;
 pub mod lifecycle;
 pub mod log_writer;
 pub mod notify;
+pub mod owned;
 pub mod services;
 pub mod telemetry;
 

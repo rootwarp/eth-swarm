@@ -567,6 +567,39 @@ impl Notifier for ModesAtReady {
     }
 }
 
+/// The service's metrics on `Hooks::unprefixed` keep their names (the names a run report reads,
+/// such as `p2p_goodbye_received_total`), the runtime's own keep the `ethswarm_` prefix, and one
+/// `/metrics` serves both, with one `# EOF`.
+#[tokio::test(flavor = "multi_thread")]
+async fn unprefixed_metrics_keep_their_names() {
+    use prometheus_client::metrics::counter::Counter;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = runtime_root(tmp.path());
+    let config = engine_config(tmp.path(), &config_text(&root, 1000)).unwrap();
+    let mut unprefixed = prometheus_client::registry::Registry::default();
+    let goodbyes = Counter::<u64>::default();
+    unprefixed.register(
+        "p2p_goodbye_received",
+        "Goodbyes received",
+        goodbyes.clone(),
+    );
+    goodbyes.inc();
+    let mut svc = start_with(config, slow_routes(SLOW), unprefixed).await;
+    let text = scrape(svc.metrics).await;
+    assert!(
+        text.lines().any(|l| l == "p2p_goodbye_received_total 1"),
+        "{text}"
+    );
+    assert!(
+        text.lines().any(|l| l == "ethswarm_rpc_inflight 0"),
+        "{text}"
+    );
+    assert_eq!(text.matches("# EOF").count(), 1, "{text}");
+    assert!(text.trim_end().ends_with("# EOF"), "{text}");
+    svc.terminate();
+    svc.task.await.unwrap().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ready_only_once_the_socket_is_0660() {
     let tmp = tempfile::tempdir().unwrap();
@@ -583,6 +616,7 @@ async fn ready_only_once_the_socket_is_0660() {
             let _ = stopped.await;
         }),
         registry: prometheus_client::registry::Registry::default(),
+        unprefixed: prometheus_client::registry::Registry::default(),
     };
     let task = tokio::spawn(svc_runtime::run_with(config, slow_routes(SLOW), hooks));
     while seen.lock().unwrap().is_empty() {
@@ -614,6 +648,7 @@ async fn failed_startup_never_reports_ready() {
         }),
         shutdown: Box::pin(std::future::pending()),
         registry: prometheus_client::registry::Registry::default(),
+        unprefixed: prometheus_client::registry::Registry::default(),
     };
     let result = svc_runtime::run_with(config, slow_routes(SLOW), hooks).await;
     assert!(matches!(result, Err(RuntimeError::Bind(_))), "{result:?}");
@@ -639,6 +674,7 @@ async fn ready_that_cannot_be_sent_stops_the_service() {
         notifier: Arc::new(Unreachable),
         shutdown: Box::pin(std::future::pending()),
         registry: prometheus_client::registry::Registry::default(),
+        unprefixed: prometheus_client::registry::Registry::default(),
     };
     let result = svc_runtime::run_with(config, slow_routes(SLOW), hooks).await;
     assert!(matches!(result, Err(RuntimeError::Notify(_))), "{result:?}");
@@ -674,6 +710,7 @@ async fn drain_deadline_starts_before_stopping() {
             let _ = stopped.await;
         }),
         registry: prometheus_client::registry::Registry::default(),
+        unprefixed: prometheus_client::registry::Registry::default(),
     };
     let task = tokio::spawn(svc_runtime::run_with(
         config,

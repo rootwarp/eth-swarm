@@ -59,6 +59,9 @@ p2p-wire = { path = "../p2p-wire", features = ["testkit"] }
 testkit = { path = "../testkit", features = ["test-support"] }
 tree_hash.workspace = true
 tempfile = "3"
+# tests/chain_service.rs: temp directories with no symlink on their path (owned::testkit), for
+# the column store's parent check.
+svc-runtime = { path = "../svc-runtime", features = ["testkit"] }
 # The stalled-stderr test fills a pipe without blocking (`fcntl` O_NONBLOCK).
 rustix = { version = "1", features = ["fs"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "test-util"] }

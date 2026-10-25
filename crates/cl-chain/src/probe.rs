@@ -80,6 +80,7 @@ mod head;
 pub mod ingest;
 mod ref_view;
 mod root_wait;
+pub mod service;
 
 pub use beacon_api::BeaconApi;
 pub use beacon_api::BlockEvents;

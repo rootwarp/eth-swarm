@@ -30,6 +30,11 @@ install -d -m 0700 /etc/ethswarm/credentials
 # The 32-byte secp256k1 secret, root-owned.
 install -m 0600 node.key /etc/ethswarm/credentials/nodekey
 install -m 0600 anchor-check.env /etc/ethswarm/anchor-check.env
+# Each service's config: root-owned, readable, holds no secret (see "Services").
+install -m 0644 cl-chain.toml /etc/ethswarm/cl-chain.toml
+# cl-p2p calls cl-chain and cl-discv5 on their sockets (directories 0750, sockets 0660).
+usermod -a -G ethswarm-chain ethswarm-p2p
+usermod -a -G ethswarm-discv5 ethswarm-p2p
 # The three units by name, never a glob: only these three are linted.
 install -m 0644 ops/probe/ethswarm-p2p.service ops/probe/ethswarm-discv5.service ops/probe/ethswarm-chain.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now ethswarm-chain ethswarm-discv5 ethswarm-p2p
@@ -44,6 +49,97 @@ other line that names a path through a `systemd` directory and holds a `..` anyw
 alias (from systemd's user unit directory up and into its system one, or a `cd` into one and a
 relative path after) reaches a unit directory without spelling it, so such a line is refused,
 not resolved.
+
+## Services
+
+The units pass no argument to the binaries. Each binary reads one fixed config file,
+`/etc/ethswarm/<service>.toml`, and serves its gRPC package on its own Unix socket.
+
+- **The config file.** The binary reads the file only if root owns it and every directory on
+  its path, and the service user can write none of them. The path is walked from `/`, and a
+  symlink on it is refused (`svc_runtime::owned`, the same walk as `m2a-session`). The file holds
+  no secret, so mode 0644 is correct. The node key never goes in a config file.
+- **The keys that every service shares** (`svc_runtime::config`): `network` (a pinned network)
+  or `network_dir` (a devnet's `config.yaml` and `genesis.ssz`), `metrics_port` (`/metrics` on
+  `127.0.0.1`), `[socket] group`, `[callers]` and `[methods]` (the method ACL). Each service also
+  has its own table: `[chain]`, `[discv5]` or `[p2p]`. A table of another service is refused.
+- **The sockets.** A service binds `/run/ethswarm/<service>/<service>.sock` in its
+  `RuntimeDirectory=`, directory 0750 and socket 0660, owned by the service user and the
+  `[socket] group`. Set that group to the service's own group. A caller can connect only if it
+  is a member, so the install adds `ethswarm-p2p` to `ethswarm-chain` and `ethswarm-discv5`,
+  and cl-chain's user to the group of cl-verify's socket. The units do not change: systemd
+  gives a `User=` its groups from the user database, and the lint refuses
+  `SupplementaryGroups=`. The method ACL then checks the caller's UID on each call.
+- **`/metrics`.** The runtime's own metrics have the prefix `ethswarm_`. The service's metrics
+  keep their names without a prefix (`probe_column_dropped_total`, and from cl-p2p
+  `topic_msg_*`, `p2p_peers` and `p2p_goodbye_received_total`), because the run reports read
+  those names.
+
+### cl-chain
+
+cl-chain runs probe mode (`cl_chain::probe::service`, `cl_chain::service`). It stores the
+custody columns in `/var/lib/ethswarm-chain/columns` and opens the same store after a restart,
+so the custody group count and `cgc_set_slot` of the first start stay. It follows the
+reference node's events (the canonical chain, the finalize and retention prunes). It asks
+cl-verify for the KZG checks, and refuses a cl-verify server that runs as another UID. Only
+cl-p2p's UID can call its four methods: `ReqRespService/GetStatus`, `DataColumnsByRange`,
+`DataColumnsByRoot` and `GossipService/WatchSubscriptions`.
+
+```toml
+# /etc/ethswarm/cl-chain.toml
+network_dir = "/etc/ethswarm/network"   # or: network = "sepolia"
+metrics_port = 9102
+
+[socket]
+group = 990                             # the GID of ethswarm-chain
+
+[callers]
+cl-p2p = 991                            # the UID of ethswarm-p2p
+
+[methods]                               # exactly these four, to cl-p2p only
+"/ethswarm.chain.v1.ReqRespService/GetStatus" = ["cl-p2p"]
+"/ethswarm.chain.v1.ReqRespService/DataColumnsByRange" = ["cl-p2p"]
+"/ethswarm.chain.v1.ReqRespService/DataColumnsByRoot" = ["cl-p2p"]
+"/ethswarm.chain.v1.GossipService/WatchSubscriptions" = ["cl-p2p"]
+
+[chain]
+reference_api_url = "http://127.0.0.1:5052"   # localhost, loopback or a private address
+node_id = "0x<64 hex digits>"                 # the probe's discv5 node ID (public)
+verify_socket = "/run/ethswarm/cl-verify/cl-verify.sock"
+verify_uid = 993                              # the UID that cl-verify runs as
+# columns_dir = "/var/lib/ethswarm-chain/columns"
+# verify_timeout_ms = 5000
+# verify_wait_ms = 30000
+```
+
+| Exit | Meaning | Restarted |
+|---|---|---|
+| 0 | SIGTERM: the watch streams end, in-flight calls drain, the socket is removed; during the wait for cl-verify, at once | no |
+| 1 | a start that a restart cannot fix: the store, the socket's bind, an ACL of unserved methods, a cl-verify directory open to others, a cl-verify server of another user | no |
+| 2 | the config was refused, or the store holds the custody of another `node_id` | no |
+| 64 | an argument (the unit passes none) | no |
+| 69 | cl-verify's directory or socket was not there within `verify_wait_ms`, or the clock is before genesis | yes |
+| 70 | a fault of the run that a restart can fix: the server task, a drain past its deadline, `/metrics`, the service manager | yes |
+| 71 | the log writer could not start | yes |
+
+The store keeps the node ID of its first start (`node-id` in `columns_dir`, mode 0600). A start
+with another `node_id` exits 2, because the custody columns follow the node ID: remove the
+store's directory to start with the new one. After the drain, the store gets 10 s to close, so
+the stop ends within the unit's stop timeout.
+
+**The reference API.** `reference_api_url` is plain HTTP. On a private address of a shared
+network, anyone on that network can read and change what cl-chain gets, and the reference
+decides which block roots cl-chain stores. Prefer an SSH tunnel to a loopback port
+(`ssh -f -N -o ExitOnForwardFailure=yes -L 127.0.0.1:5052:127.0.0.1:5052 <reference host>`).
+Use a private address only on a network that only the probe and the reference share, such as
+the Kurtosis enclave network.
+
+Known limit: cl-chain's chain.v1 hello carries the fork digest of its start. After a fork or
+BPO digest change, a caller that started later sends another digest, and its streams get
+`VERSION_MISMATCH` (`GetStatus`, a unary call, still works). Restart cl-chain after such a
+change until its link follows the clock.
+
+cl-discv5 and cl-p2p are still stubs: they load the node key, then exit 2.
 
 ## Node key
 
@@ -98,7 +194,8 @@ no key.
 requests at 30 s, two bodies at 30 s + 1800 s: 3780 s). A failed start is retried after
 `RestartSec=5min`, at most `StartLimitBurst=3` times in `StartLimitIntervalSec=6h`, then the
 unit stays failed. `RestartPreventExitStatus=1 2 64` stops restarts of the service itself on a
-refused credential (1), the stub's exit (2) and a usage error (64); systemd applies it to the
+refused credential or a failed start (1), a refused config or the stub's exit (2) and a usage
+error (64); systemd applies it to the
 main process only, so a failing `ExecStartPre=` check is bounded by the start limit instead.
 
 Exit 71 (`EXIT_NO_LOG_WRITER`, `EX_OSERR`) is deliberately not in that list, so it is

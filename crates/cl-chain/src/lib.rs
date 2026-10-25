@@ -23,10 +23,15 @@
 //!
 //! [`da::custody`] owns the node's custody group count: never decreasing, stored in the column
 //! env, advertised through the MetaData and the ENR, and the column subnets cl-p2p subscribes.
+//!
+//! [`probe::service`] puts probe mode together as one service, and [`service`] is the `cl-chain`
+//! process that `ops/probe/ethswarm-chain.service` runs: `/etc/ethswarm/cl-chain.toml`, the
+//! socket and the method ACL through `svc-runtime`, and the SIGTERM drain.
 
 pub mod da;
 pub mod probe;
 pub mod reqresp;
+pub mod service;
 pub mod verify;
 
 #[cfg(test)]
@@ -42,11 +47,13 @@ use pb::req_resp_service_server::{ReqRespService, ReqRespServiceServer};
 use tonic::service::Routes;
 
 /// The `cl-chain` service: contract checks, then `UNIMPLEMENTED`, except `ReqRespService`
-/// once it is given the probe's column server ([`Self::serving`]).
+/// once it is given the probe's column server ([`Self::serving`]) and `GossipService` once it
+/// is given the probe's custody subscriptions ([`Self::serving_gossip`]).
 #[derive(Clone, Debug)]
 pub struct ChainStub {
     link: Link,
     req_resp: Option<reqresp::ReqRespServer>,
+    gossip: Option<probe::service::GossipServer>,
 }
 
 impl ChainStub {
@@ -55,6 +62,7 @@ impl ChainStub {
         Self {
             link,
             req_resp: None,
+            gossip: None,
         }
     }
 
@@ -63,6 +71,14 @@ impl ChainStub {
     #[must_use]
     pub fn serving(mut self, req_resp: reqresp::ReqRespServer) -> Self {
         self.req_resp = Some(req_resp);
+        self
+    }
+
+    /// The same service with `GossipService` served by `gossip` (`WatchSubscriptions` from the
+    /// probe's custody) instead of the stub.
+    #[must_use]
+    pub fn serving_gossip(mut self, gossip: probe::service::GossipServer) -> Self {
+        self.gossip = Some(gossip);
         self
     }
 
@@ -81,7 +97,10 @@ impl ChainStub {
     /// Every `ethswarm.chain.v1` service, ready to serve.
     #[must_use]
     pub fn routes(self) -> Routes {
-        let routes = Routes::new(GossipServiceServer::new(self.clone()));
+        let routes = match self.gossip.clone() {
+            Some(server) => Routes::new(server.into_service()),
+            None => Routes::new(GossipServiceServer::new(self.clone())),
+        };
         let routes = match self.req_resp.clone() {
             Some(server) => routes.add_service(server.into_service()),
             None => routes.add_service(ReqRespServiceServer::new(self.clone())),

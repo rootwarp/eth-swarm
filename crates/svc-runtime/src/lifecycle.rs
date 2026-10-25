@@ -4,7 +4,7 @@
 //! 0. every `[methods]` path of the ACL must be a method of a served service;
 //! 1. bind the service socket ([`ipc::uds::bind`]: directory `0750`, stale-socket cleanup,
 //!    instance lock, socket `0660` with its owner and group set explicitly);
-//! 2. listen for `/metrics` on `127.0.0.1`;
+//! 2. listen for `/metrics` on `127.0.0.1` ([`Hooks::registry`], then [`Hooks::unprefixed`]);
 //! 3. serve the routes behind the trace, metrics and method-ACL layers (outermost first);
 //! 4. `READY=1` to the service manager, with the socket and metrics address in `STATUS=`.
 //!
@@ -117,6 +117,11 @@ pub struct Hooks {
     /// Served at `/metrics`; the runtime adds its own metrics. Register service metrics here
     /// before calling [`run_with`].
     pub registry: Registry,
+    /// Served at `/metrics` after [`Self::registry`], without its prefix: the metrics whose
+    /// names readers outside the service fix (for example gossipsub's `topic_msg_*`, or
+    /// `p2p_goodbye_received_total`, which the run reports read). A name here must not also be
+    /// one in [`Self::registry`].
+    pub unprefixed: Registry,
 }
 
 impl Hooks {
@@ -126,6 +131,7 @@ impl Hooks {
             notifier: Arc::new(Systemd),
             shutdown: Box::pin(termination()?),
             registry: Registry::with_prefix("ethswarm"),
+            unprefixed: Registry::default(),
         })
     }
 }
@@ -176,6 +182,7 @@ pub async fn run_with(
         notifier,
         shutdown,
         mut registry,
+        unprefixed,
     } = hooks;
     let metrics = RuntimeMetrics::register(&mut registry);
 
@@ -191,7 +198,7 @@ pub async fn run_with(
     let (stop_metrics, metrics_stopped) = oneshot::channel::<()>();
     let metrics_task = tokio::spawn(telemetry::serve_metrics(
         metrics_listener,
-        Arc::new(registry),
+        Arc::from(vec![registry, unprefixed]),
         config.metrics_limits,
         async {
             let _ = metrics_stopped.await;
@@ -230,7 +237,7 @@ pub async fn run_with(
     metrics.ready.set(1);
     tracing::info!(
         service = %config.service,
-        network = config.network.name(),
+        network = %config.network.name(),
         socket = %socket_path.display(),
         metrics = %metrics_addr,
         "ready"

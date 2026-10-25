@@ -2,19 +2,16 @@
 //! `DataColumnSidecarsByRange` v1 and `DataColumnSidecarsByRoot` v1 (`fulu/p2p-interface.md`
 //! L605–790), the way the services split it, then checks its own answers against its store.
 //!
-//! - **cl-chain** ([`ChainSide`]): probe mode's column store ([`ColumnIngest`]: the reference
-//!   node vouches for each block root, cl-verify checks the cells by KZG, only custody columns
-//!   are kept, and the reference's `block` events announce its roots ahead of their columns,
-//!   [`ColumnIngest::follow_head`]), the column server over it ([`ColumnServer`], its range
-//!   answers on the reference's canonical chain from the same events, and the store pruned of
-//!   the blocks off its finalized chain and of the columns out of retention by the wall clock:
-//!   `cl_chain::probe::CanonicalChain`) and our Status
-//!   ([`StatusProvider`], its `earliest_available_slot` the column server's), all on
-//!   `ethswarm.chain.v1.ReqRespService` ([`ReqRespServer`] mounted by [`ChainStub::serving`]).
-//!   It is served on a Unix socket of its own, `<socket root>/cl-chain/cl-chain.sock`, bound by
-//!   [`ipc::uds::bind`] (directory 0750, socket 0660) behind the method ACL ([`chain_acl`]):
-//!   only the caller `cl-p2p` (our own UID) may call `GetStatus`, `DataColumnsByRange` and
-//!   `DataColumnsByRoot`, and nothing else.
+//! - **cl-chain** ([`ChainSide`]): cl-chain's probe mode as the `cl-chain` service runs it
+//!   ([`ProbeService`], `cl_chain::probe::service`): the column store (the reference node
+//!   vouches for each block root, cl-verify checks the cells by KZG, only custody columns are
+//!   kept), the reference follower (its canonical chain, which range answers follow, and the
+//!   prunes of the finalized chain and of retention), the column server, our Status and the
+//!   custody subscriptions, on `ethswarm.chain.v1`. Here it is served on a Unix socket of its
+//!   own, `<socket root>/cl-chain/cl-chain.sock`, bound by [`ipc::uds::bind`] (directory 0750,
+//!   socket 0660) behind the method ACL ([`chain_acl`]): only the caller `cl-p2p` (our own UID)
+//!   may call `GetStatus`, `DataColumnsByRange`, `DataColumnsByRoot` and `WatchSubscriptions`,
+//!   and nothing else. Unlike the service, every run creates a new store.
 //! - **cl-p2p** ([`p2p_swarm`]): the probe swarm, connected to that socket through the
 //!   peer-checked connector ([`ipc::uds::connect_path`]: the server must run as cl-chain's
 //!   UID): its column responders answer from [`ChainColumns`], every Status it sends or
@@ -23,8 +20,9 @@
 //!   subscribes to our custody column subnets (and `beacon_block`) with a capture tap.
 //! - **The gossip hand-off** ([`ChainSide::hand_over`]): each captured column sidecar whose
 //!   topic carries the fork digest of its slot's epoch is decoded by the fork of its slot and
-//!   given to cl-chain's [`ColumnIngest::on_column`] in process; another digest is dropped
-//!   undecoded. `ethswarm.chain.v1.GossipService/Validate`, its wire form, is still a stub.
+//!   given to cl-chain's store in process ([`ProbeService::accept_column`]); another digest is
+//!   dropped undecoded. `ethswarm.chain.v1.GossipService/Validate`, its wire form, is still a
+//!   stub.
 //!
 //! [`serve`] runs it all for a while on the devnet, dialling the reference CLs so their column
 //! gossip reaches us, never across a fork digest change ([`clip_until`]: the subscriptions are
@@ -38,15 +36,13 @@
 use super::devnet::Devnet;
 use super::report::Check;
 use super::swarm::{serving_swarm, Gossip, Sources, SwarmPlan};
-use cl_chain::da::custody::{Advertise, Custody, EnrCgc, EnrError};
-use cl_chain::probe::{
-    BeaconApi, ColumnContract, ColumnIngest, ColumnMetrics, GossipColumn, HeadFollow, IngestLimits,
-    QueueMetrics, RefLimits, RefView, StatusProvider, DEFAULT_API_TIMEOUT,
-};
-use cl_chain::reqresp::{ColumnServer, ColumnStore, ReqRespServer, ServeBudget, WallClock};
+#[cfg(test)]
+use cl_chain::probe::service::API_VERSION;
+use cl_chain::probe::service::{ProbePlan, ProbeService};
+use cl_chain::probe::BeaconApi;
+use cl_chain::reqresp::WallClock;
 use cl_chain::verify::client::{KzgClient, KzgVerifier};
-use cl_chain::ChainStub;
-use cl_chain_columns::{ColumnReader, ColumnWriter, RangeBudget};
+use cl_chain_columns::{ColumnReader, RangeBudget};
 use cl_p2p::behaviour::{SpecBehaviour, SpecBehaviourEvent};
 use cl_p2p::gossip::{CaptureReader, CaptureTap, Captured};
 use cl_p2p::m2a_session::PinnedPeer;
@@ -56,15 +52,15 @@ use cl_p2p::rpc::codec::{Deadlines, ReceivedChunk, RpcCodec, RpcRequest};
 use cl_p2p::rpc::columns::ChainColumns;
 use cl_p2p::rpc::inbound::StatusSource;
 use cl_p2p::rpc::limits::{RpcLimits, MAX_COLUMN_RESPONSE_BYTES};
-use consensus_types::caps::NetworkCaps;
 use consensus_types::das::NUMBER_OF_COLUMNS;
+#[cfg(test)]
+use consensus_types::forked;
 use consensus_types::primitives::U256;
-use consensus_types::{forked, EthSpec};
+use consensus_types::EthSpec;
+#[cfg(test)]
 use ethswarm_proto::common::Hello;
-use ethswarm_proto::verify::verify_service_client::VerifyServiceClient;
 use futures::StreamExt;
-use ipc::acl::{AclLayer, AclTables, MethodAcl};
-use ipc::envelope::DigestTable;
+use ipc::acl::AclLayer;
 use ipc::uds::{Ownership, SocketDir, SocketGuard};
 use ipc::Link;
 use libp2p::identity::Keypair;
@@ -90,31 +86,13 @@ use tokio::task::JoinHandle;
 /// The check's name, as the subcommand.
 pub const NAME: &str = "serve";
 
-/// The service that serves `ethswarm.chain.v1`, and its socket directory's name.
-pub const CHAIN_SERVICE: &str = "cl-chain";
-
-/// The one caller of cl-chain's socket: cl-p2p.
-pub const P2P_CALLER: &str = "cl-p2p";
-
-/// The `ethswarm.chain.v1` methods cl-p2p calls to serve columns, and only those.
-pub const CHAIN_METHODS: [&str; 3] = [
-    "/ethswarm.chain.v1.ReqRespService/GetStatus",
-    "/ethswarm.chain.v1.ReqRespService/DataColumnsByRange",
-    "/ethswarm.chain.v1.ReqRespService/DataColumnsByRoot",
-];
+pub use cl_chain::probe::service::{
+    chain_acl, check_verify_socket_dir, connect_verify, error_chain, is_not_ready, CHAIN_METHODS,
+    CHAIN_SERVICE, DEFAULT_VERIFY_TIMEOUT, P2P_CALLER, VERIFY_SOCKET_WAIT,
+};
 
 /// How long the probe serves by default before it checks its answers.
 pub const DEFAULT_SERVE: Duration = Duration::from_secs(300);
-
-/// How long cl-verify may take for one column's cells \[est\].
-pub const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long `serve` waits for cl-verify's socket to accept a connection \[est\]: a cl-verify
-/// started a moment before loads its trusted setup before it binds.
-pub const VERIFY_SOCKET_WAIT: Duration = Duration::from_secs(30);
-
-/// The pause between two connection attempts to cl-verify's socket.
-const VERIFY_SOCKET_RETRY: Duration = Duration::from_millis(200);
 
 /// How many captured gossip messages wait for the hand-off at most \[est\]: a few slots of
 /// the custody subnets' columns; past it the tap drops and counts them.
@@ -132,23 +110,17 @@ const SETTLE_WAIT: Duration = Duration::from_secs(10);
 /// ([`clip_until`]).
 pub const AFTER_SERVING: Duration = Duration::from_secs(30);
 
-/// How long a reference sample is reused for our Status \[est\]: every Status that goes out
-/// reads the store afresh, the reference API at most every 2 s.
-const STATUS_SAMPLE_REUSE: Duration = Duration::from_secs(2);
-
 /// How long one of our requests to the probe may take.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The roots a by-root check names at most.
 const BY_ROOT_BLOCKS: usize = 4;
 
-/// The `api_version` of the probe's chain.v1 and verify.v1 links.
-const API_VERSION: u32 = 1;
-
 /// The network hello of the devnet at `now_ms` ([`Devnet::network`]): its genesis validators
 /// root, the digest of the wall clock at `now_ms`, every fork and blob-schedule entry, our spec
 /// pin and API version. cl-verify builds its own hello from the same files
 /// (`cl-verify --network-dir`) in the same way, so the two differ only in `build`.
+#[cfg(test)]
 fn network_hello(devnet: &Devnet, now_ms: u128) -> Result<Hello, String> {
     devnet
         .network()
@@ -156,154 +128,21 @@ fn network_hello(devnet: &Devnet, now_ms: u128) -> Result<Hello, String> {
         .map_err(|e| format!("our fork digest: {e}"))
 }
 
-/// The chain.v1 link both ends of cl-chain's socket hold: our hello ([`network_hello`] at
-/// `now_ms`) and every digest of the schedule.
+/// The chain.v1 link both ends of cl-chain's socket hold
+/// ([`cl_chain::probe::service::chain_link`] of the devnet).
 ///
 /// # Errors
 ///
 /// The clock is before genesis or Fulu, or the schedule has no digest.
 pub fn chain_link<E: EthSpec>(devnet: &Devnet, now_ms: u128) -> Result<Link, String> {
-    let config = devnet.config();
-    let hello = network_hello(devnet, now_ms)?;
-    let digests = DigestTable::new(
-        digest_schedule(config, &devnet.genesis().genesis_validators_root)
-            .iter()
-            .map(|e| (e.epoch, e.fork, e.fork_digest))
-            .collect(),
-    )
-    .map_err(|e| format!("the digest schedule: {e}"))?;
-    Ok(Link::new::<E>(
-        hello,
-        API_VERSION,
-        *config.fork_schedule(),
-        digests,
-    ))
+    cl_chain::probe::service::chain_link::<E>(devnet.probe_network(), now_ms)
 }
 
-/// cl-chain's side of the verify.v1 link on `channel`: a KZG client that opens each stream
-/// with the devnet's network hello at the time of the stream open ([`KzgClient::network`]).
-/// That hello is equal to the one cl-verify sends for `--network-dir` of the same devnet apart
-/// from `build`, before and after each fork or BPO digest change.
+/// cl-chain's side of the verify.v1 link on `channel`
+/// ([`cl_chain::probe::service::verify_client`] of the devnet).
 #[must_use]
 pub fn verify_client(devnet: &Devnet, channel: tonic::transport::Channel) -> KzgClient {
-    KzgClient::network(
-        VerifyServiceClient::new(channel),
-        Arc::clone(devnet.network()),
-    )
-}
-
-/// Refuses a verify socket whose directory other users could change, or the way to it
-/// ([`ipc::uds::open_closed_dir`], as for the socket root and the store's parent): walked from `/`
-/// without following a symlink, it and every directory above it must be owned by `uid` (cl-verify's
-/// user) or root, and not group or world writable unless sticky. The directory itself must be
-/// writable only by its owner, also when it is sticky, as the socket root. Otherwise another user
-/// could put a socket of their own in its place. The connector refuses a server of another user
-/// anyway, so such a socket could only stop the run. A relative `socket` is taken from the working
-/// directory.
-///
-/// # Errors
-///
-/// The directory is not closed, cannot be opened, or `socket` names no file in it.
-pub fn check_verify_socket_dir(socket: &Path, uid: u32) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    let shown = socket.display();
-    let path = std::env::current_dir()
-        .map_err(|e| format!("verify socket {shown}: the working directory: {e}"))?
-        .join(socket);
-    let (Some(dir), Some(_)) = (path.parent(), path.file_name()) else {
-        return Err(format!("verify socket {shown} names no file"));
-    };
-    let fd =
-        ipc::uds::open_closed_dir(dir, uid).map_err(|e| format!("verify socket directory {e}"))?;
-    // The directory itself, as the socket root ([`ipc::uds::bind`]): writable only by its
-    // owner, sticky or not. In a sticky directory that others can write (`/tmp`), another
-    // user could create the socket name first.
-    let meta = std::fs::File::from(fd)
-        .metadata()
-        .map_err(|e| format!("verify socket directory {}: {e}", dir.display()))?;
-    let mode = meta.mode() & 0o7777;
-    if mode & 0o022 != 0 {
-        return Err(format!(
-            "verify socket directory {} must be writable only by its owner (mode {mode:o})",
-            dir.display()
-        ));
-    }
-    Ok(())
-}
-
-/// A channel to cl-verify at `path`, which must run as `uid` ([`ipc::uds::connect_path`]). While
-/// the socket is not there yet or refuses connections ([`is_not_ready`]), the connection is tried
-/// again every 200 ms until `wait` is over, and the wait is logged once. Any other error (a
-/// server of another user included) is returned at once.
-///
-/// # Errors
-///
-/// The last connection error. [`error_chain`] shows it with its causes.
-pub async fn connect_verify(
-    path: &Path,
-    uid: u32,
-    wait: Duration,
-) -> Result<tonic::transport::Channel, tonic::transport::Error> {
-    let deadline = tokio::time::Instant::now() + wait;
-    let mut logged = false;
-    loop {
-        match ipc::uds::connect_path(path, uid).await {
-            Ok(channel) => return Ok(channel),
-            Err(e)
-                if is_not_ready(&e)
-                    && tokio::time::Instant::now() + VERIFY_SOCKET_RETRY <= deadline =>
-            {
-                if !logged {
-                    tracing::info!(
-                        socket = %path.display(),
-                        wait_ms = wait.as_millis() as u64,
-                        retry_ms = VERIFY_SOCKET_RETRY.as_millis() as u64,
-                        "cl-verify is not accepting yet; trying again until the wait is over"
-                    );
-                    logged = true;
-                }
-                tokio::time::sleep(VERIFY_SOCKET_RETRY).await;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// Whether `err` is a socket that is not there yet (`NotFound`) or that nobody listens on yet
-/// (`ConnectionRefused`), anywhere in its source chain. A peer check that failed
-/// ([`ipc::uds::peer_refusal`]) is never "not ready", whatever I/O error it carries.
-#[must_use]
-pub fn is_not_ready(err: &(dyn std::error::Error + 'static)) -> bool {
-    if ipc::uds::peer_refusal(err).is_some() {
-        return false;
-    }
-    let mut next = Some(err);
-    while let Some(e) = next {
-        if let Some(io) = e.downcast_ref::<std::io::Error>() {
-            if matches!(
-                io.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) {
-                return true;
-            }
-        }
-        next = e.source();
-    }
-    false
-}
-
-/// `err` and each error in its source chain, joined by `": "`. A tonic transport error alone
-/// shows only "transport error".
-#[must_use]
-pub fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
-    let mut shown = err.to_string();
-    let mut next = err.source();
-    while let Some(e) = next {
-        shown.push_str(": ");
-        shown.push_str(&e.to_string());
-        next = e.source();
-    }
-    shown
+    cl_chain::probe::service::verify_client(devnet.probe_network(), channel)
 }
 
 /// The discv5 node ID of `key` as the spec's `uint256`: what the custody columns are drawn
@@ -328,37 +167,10 @@ pub fn node_id(key: &Keypair) -> Result<U256, String> {
     Ok(U256::from_be_bytes(record.node_id().raw()))
 }
 
-/// cl-chain's method ACL: [`CHAIN_METHODS`] to [`P2P_CALLER`] at `caller_uid`, nothing else.
-///
-/// # Errors
-///
-/// The ACL does not load (it always does).
-pub fn chain_acl(caller_uid: u32) -> Result<MethodAcl, String> {
-    let tables = AclTables {
-        callers: [(P2P_CALLER.to_owned(), caller_uid)].into(),
-        methods: CHAIN_METHODS
-            .iter()
-            .map(|m| ((*m).to_owned(), vec![P2P_CALLER.to_owned()]))
-            .collect(),
-    };
-    MethodAcl::from_tables(CHAIN_SERVICE, &tables).map_err(|e| e.to_string())
-}
-
 /// The slot of the wall clock at `now_ms`; `None` before genesis.
 #[must_use]
 pub fn slot_at(devnet: &Devnet, now_ms: u128) -> Option<u64> {
-    let since = now_ms.checked_sub(u128::from(devnet.genesis().genesis_time) * 1000)?;
-    let slot_ms = u128::from(devnet.config().slot_duration_ms().max(1));
-    u64::try_from(since / slot_ms).ok()
-}
-
-/// The probe publishes no ENR while it serves: peers reach it by its own dials.
-struct NoEnr;
-
-impl EnrCgc for NoEnr {
-    fn set_cgc(&mut self, _: u64) -> Result<(), EnrError> {
-        Ok(())
-    }
+    devnet.probe_network().slot_at(now_ms)
 }
 
 /// What [`ChainSide::start`] needs.
@@ -383,104 +195,49 @@ pub struct ChainPlan<V> {
     pub cgc_set_slot: u64,
 }
 
-/// The column store of cl-chain's probe mode.
-type Ingest<E, V> = ColumnIngest<BeaconApi, E, V, Arc<ColumnWriter>, NoEnr>;
-
-/// cl-chain in probe mode: the column store, its column server and our Status, served on its
-/// socket behind the ACL until dropped.
+/// cl-chain in probe mode ([`ProbeService`]: the column store, its column server, our Status
+/// and the custody subscriptions), served on its socket behind the ACL until dropped. It
+/// dereferences to the service.
 pub struct ChainSide<E: EthSpec, V> {
-    ingest: Ingest<E, V>,
-    writer: Arc<ColumnWriter>,
-    columns: Arc<ColumnServer>,
-    status: Arc<StatusProvider<BeaconApi>>,
-    custody: Vec<u64>,
-    cgc: u64,
+    service: ProbeService<E, V>,
     socket: PathBuf,
-    caps: NetworkCaps,
-    devnet: Devnet,
     server: JoinHandle<()>,
     _guard: SocketGuard,
 }
 
 impl<E: EthSpec, V: KzgVerifier + 'static> ChainSide<E, V> {
-    /// Opens the store, starts the ingest and serves chain.v1 on the socket.
+    /// Binds the socket, opens the store, starts the ingest and serves chain.v1 on the socket.
     ///
     /// # Errors
     ///
-    /// The store, the custody record, the ingest, the clock or the socket failed.
+    /// The clock, the socket, the store, the custody record or the ingest failed.
     pub fn start(
         devnet: &Devnet,
         plan: ChainPlan<V>,
         registry: &mut Registry,
     ) -> Result<Self, String> {
         // Everything that can be checked first is, so a refused start leaves no store behind.
-        let clock: Arc<dyn cl_chain::reqresp::ServeClock> =
-            Arc::new(WallClock::new(devnet.probe_chain())?);
+        WallClock::new(devnet.probe_chain())?;
         let acl = chain_acl(plan.caller_uid)?;
         let dir = SocketDir::under(&plan.socket_root, CHAIN_SERVICE).map_err(|e| e.to_string())?;
         let (listener, guard) = ipc::uds::bind(&dir, Ownership::current())
             .map_err(|e| format!("cl-chain socket: {e}"))?
             .into_tokio()
             .map_err(|e| format!("cl-chain socket: {e}"))?;
-        let writer = Arc::new(
-            ColumnWriter::open(&plan.columns_dir)
-                .map_err(|e| format!("column store {}: {e}", plan.columns_dir.display()))?,
-        );
-        let custody = Custody::open(
-            Arc::clone(&writer),
-            NoEnr,
-            plan.node_id,
-            Advertise::Custody,
-            plan.cgc_set_slot,
-        )
-        .map_err(|e| format!("custody: {e}"))?;
-        let columns_of = custody.custody_columns();
-        let cgc = custody.advertised_cgc();
-        let contract = ColumnContract {
-            kzg: plan.kzg,
-            verify_timeout: plan.verify_timeout,
-            metrics: ColumnMetrics::register(registry),
-        };
-        let refs = RefView::<_, E>::new(
-            plan.reference.clone(),
-            *devnet.config().fork_schedule(),
-            RefLimits::default(),
-        );
-        let ingest = ColumnIngest::start(
-            refs,
-            custody,
-            contract,
-            Arc::clone(&writer),
-            IngestLimits::default(),
-            QueueMetrics::register(registry),
-        )
-        .map_err(|e| format!("column ingest: {e}"))?;
-        // The reference's block events seed its view: a root it imports is looked up before its
-        // columns arrive, so a flood of made-up roots cannot delay them. Its head, re-org and
-        // finality events keep its chain, which range answers follow, and with the wall clock
-        // they prune the store of the blocks off the finalized chain and out of retention.
-        ingest.follow_head(
-            plan.reference.clone(),
-            HeadFollow::default(),
-            Arc::clone(&clock),
-        );
-        let columns = Arc::new(
-            ColumnServer::new(
-                Arc::clone(&writer) as Arc<dyn ColumnStore>,
-                plan.node_id,
-                clock,
-                ServeBudget::default(),
-            )
-            .following(ingest.canonical()),
-        );
-        let status = Arc::new(
-            StatusProvider::new(plan.reference, devnet.probe_chain(), DEFAULT_API_TIMEOUT)
-                .serving_columns(Arc::clone(&columns) as Arc<dyn cl_chain::probe::ServedColumns>)
-                .reusing_samples(STATUS_SAMPLE_REUSE),
-        );
-        let req_resp = ReqRespServer::new(plan.link.clone(), Arc::clone(&columns))
-            .serving_status(Arc::clone(&status) as Arc<dyn cl_chain::reqresp::ChainStatus>);
-        let routes = ChainStub::new(plan.link).serving(req_resp).routes();
+        let service = ProbeService::open(
+            devnet.probe_network(),
+            ProbePlan {
+                link: plan.link,
+                node_id: plan.node_id,
+                columns_dir: plan.columns_dir,
+                reference: plan.reference,
+                kzg: plan.kzg,
+                verify_timeout: plan.verify_timeout,
+                cgc_set_slot: plan.cgc_set_slot,
+            },
+            registry,
+        )?;
+        let routes = service.routes();
         let server = tokio::spawn(async move {
             let served = tonic::transport::Server::builder()
                 .layer(AclLayer::new(Arc::new(acl)))
@@ -492,91 +249,18 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ChainSide<E, V> {
             }
         });
         Ok(Self {
-            ingest,
-            writer,
-            columns,
-            status,
-            custody: columns_of,
-            cgc,
+            service,
             socket: dir.socket_path(),
-            caps: NetworkCaps::from_config(devnet.config()),
-            devnet: devnet.clone(),
             server,
             _guard: guard,
         })
     }
-}
 
-impl<E: EthSpec, V> ChainSide<E, V> {
-    /// cl-chain's socket.
-    #[must_use]
-    pub fn socket(&self) -> &Path {
-        &self.socket
-    }
-
-    /// Our custody columns, sorted.
-    #[must_use]
-    pub fn custody_columns(&self) -> &[u64] {
-        &self.custody
-    }
-
-    /// The custody group count we advertise.
-    #[must_use]
-    pub fn custody_group_count(&self) -> u64 {
-        self.cgc
-    }
-
-    /// The store, read only.
-    #[must_use]
-    pub fn reader(&self) -> &ColumnReader {
-        self.writer.reader()
-    }
-
-    /// The slot the columns are served from (the Status `earliest_available_slot`); `None`
-    /// while nothing is.
-    #[must_use]
-    pub fn earliest_available_slot(&self) -> Option<u64> {
-        self.columns.earliest_available_slot()
-    }
-
-    /// What our Status must advertise at least: the slot a range request is served from
-    /// ([`ColumnServer::status_floor`]).
-    ///
-    /// # Errors
-    ///
-    /// The store cannot be read.
-    pub fn status_floor(&self) -> Result<u64, String> {
-        self.columns.status_floor()
-    }
-
-    /// Columns on their way into the store.
-    #[must_use]
-    pub fn pending(&self) -> usize {
-        self.ingest.pending()
-    }
-
-    /// Waits until the store's writer has done everything handed to it so far, the settle of
-    /// pending links after it included ([`ColumnIngest::settled`]); `false` if it is gone.
-    pub async fn settled(&self) -> bool {
-        self.ingest.settled().await
-    }
-
-    /// Samples the reference API for our Status now, so the first `GetStatus` has one: a
-    /// Status never waits on the API, and before its first good sample is `UNAVAILABLE`.
-    ///
-    /// # Errors
-    ///
-    /// The sample failed or timed out; a later Status refreshes it in the background.
-    pub async fn sample_reference(&self) -> Result<(), String> {
-        self.status.refresh().await.map_err(|e| e.to_string())
-    }
-}
-
-impl<E: EthSpec, V: KzgVerifier + 'static> ChainSide<E, V> {
-    /// Hands one captured gossip message to the column store, if it is a Gloas column sidecar
-    /// on a column subnet whose topic carries the fork digest of the sidecar's slot's epoch:
-    /// decoded by the fork of its slot, as cl-p2p's gossip path does. A digest mismatch is
-    /// dropped without decoding (`proto/README.md`). Returns whether it was handed over.
+    /// Hands one captured gossip message to the column store, if it is a column sidecar on a
+    /// column subnet whose topic carries the fork digest of the sidecar's slot's epoch
+    /// ([`ProbeService::accept_column`]: decoded by the fork of its slot, as cl-p2p's gossip
+    /// path does; another digest is dropped without decoding). Returns whether it was handed
+    /// over.
     pub fn hand_over(&self, captured: &Captured) -> bool {
         let Some(topic) = GossipTopic::parse(&captured.topic).ok() else {
             return false;
@@ -584,41 +268,8 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ChainSide<E, V> {
         let GossipKind::DataColumnSidecar { subnet_id } = topic.kind else {
             return false;
         };
-        let Ok(slot) = forked::DataColumnSidecar::<E>::peek_slot(&captured.data) else {
-            tracing::debug!("a column sidecar without a slot: dropped");
-            return false;
-        };
-        let epoch = slot / self.devnet.slots_per_epoch().max(1);
-        if self.devnet.digest_at(epoch) != Some(topic.fork_digest) {
-            tracing::debug!(
-                slot,
-                "a column sidecar on another fork digest's topic: dropped"
-            );
-            return false;
-        }
-        let schedule = self.devnet.config().fork_schedule();
-        match forked::DataColumnSidecar::<E>::from_ssz_bytes_by_slot(
-            &captured.data,
-            schedule,
-            &self.caps,
-        ) {
-            Ok(forked::DataColumnSidecar::Gloas(sidecar)) => {
-                // Every column is reported IGNORE: none is forwarded.
-                let _ = self.ingest.on_column(GossipColumn { sidecar, subnet_id });
-                true
-            }
-            Ok(other) => {
-                tracing::debug!(
-                    slot = other.slot(),
-                    "a column sidecar before Gloas: not stored"
-                );
-                false
-            }
-            Err(e) => {
-                tracing::debug!(error = ?e, "a column sidecar that does not decode: dropped");
-                false
-            }
-        }
+        self.service
+            .accept_column(topic.fork_digest, subnet_id, &captured.data)
     }
 
     /// Hands over every message queued in `tap`; returns how many were column sidecars.
@@ -628,6 +279,22 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ChainSide<E, V> {
             handed += usize::from(self.hand_over(&captured));
         }
         handed
+    }
+}
+
+impl<E: EthSpec, V> ChainSide<E, V> {
+    /// cl-chain's socket.
+    #[must_use]
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+}
+
+impl<E: EthSpec, V> std::ops::Deref for ChainSide<E, V> {
+    type Target = ProbeService<E, V>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.service
     }
 }
 

@@ -8,12 +8,13 @@
 //! CL's beacon API (`/eth/v1/beacon/genesis`), and every fork digest from the two. The readers
 //! are `network_config::network_dir`'s, which cl-verify's `--network-dir` reads with too.
 
+use cl_chain::probe::service::ProbeNetwork;
 use cl_chain::probe::ProbeChain;
 use cl_p2p::m2a_session::PinnedPeer;
 use consensus_types::EthSpec;
 use ipc::hello::NetworkHello;
 use libp2p::multiaddr::Protocol;
-use network_config::digest::{compute_fork_digest, current_epoch, DigestError};
+use network_config::digest::{compute_fork_digest, DigestError};
 use network_config::network_dir;
 use network_config::{ChainConfig, Epoch, Genesis};
 use p2p_wire::enr::ForkFields;
@@ -32,12 +33,11 @@ pub use ipc::hello::Preset;
 /// The build string of the probe's hellos.
 const BUILD: &str = concat!("devnet-probe/", env!("CARGO_PKG_VERSION"));
 
-/// A devnet: its config, its genesis and its network hello, which gives its preset.
+/// A devnet: its config, its genesis and its network hello, which gives its preset (cl-chain's
+/// [`ProbeNetwork`]).
 #[derive(Debug, Clone)]
 pub struct Devnet {
-    config: ChainConfig,
-    genesis: Genesis,
-    network: Arc<NetworkHello>,
+    net: ProbeNetwork,
 }
 
 impl Devnet {
@@ -50,36 +50,38 @@ impl Devnet {
     /// schedules no Fulu.
     pub fn new(config_yaml: &[u8], genesis: Genesis) -> Result<Self, String> {
         let config = ChainConfig::from_devnet_yaml(config_yaml).map_err(|e| e.to_string())?;
-        let network = NetworkHello::new(BUILD, &config, genesis).map_err(|e| e.to_string())?;
-        Ok(Self {
-            config,
-            genesis,
-            network: Arc::new(network),
-        })
+        let net = ProbeNetwork::new(BUILD, config, genesis).map_err(|e| e.to_string())?;
+        Ok(Self { net })
+    }
+
+    /// The devnet as cl-chain's probe mode takes it.
+    #[must_use]
+    pub fn probe_network(&self) -> &ProbeNetwork {
+        &self.net
     }
 
     /// The config.
     #[must_use]
     pub fn config(&self) -> &ChainConfig {
-        &self.config
+        self.net.config()
     }
 
     /// The genesis time and validators root.
     #[must_use]
     pub fn genesis(&self) -> Genesis {
-        self.genesis
+        self.net.genesis()
     }
 
     /// The preset `PRESET_BASE` names.
     #[must_use]
     pub fn preset(&self) -> Preset {
-        self.network.preset()
+        self.net.preset()
     }
 
     /// `SLOTS_PER_EPOCH` of the preset.
     #[must_use]
     pub fn slots_per_epoch(&self) -> u64 {
-        self.network.slots_per_epoch()
+        self.net.slots_per_epoch()
     }
 
     /// The network hello of the devnet, sent with the probe's build: the hello of its chain.v1
@@ -87,7 +89,7 @@ impl Devnet {
     /// the two differ only in `build`.
     #[must_use]
     pub fn network(&self) -> &Arc<NetworkHello> {
-        &self.network
+        self.net.hello()
     }
 
     /// The wall-clock epoch at `now_ms` (Unix milliseconds).
@@ -96,12 +98,7 @@ impl Devnet {
     ///
     /// The clock is before genesis.
     pub fn epoch_at(&self, now_ms: u128) -> Result<Epoch, DigestError> {
-        current_epoch(
-            self.genesis.genesis_time,
-            self.config.slot_duration_ms(),
-            self.slots_per_epoch(),
-            now_ms,
-        )
+        self.net.epoch_at(now_ms)
     }
 
     /// `compute_fork_digest` of the wall-clock epoch at `now_ms`.
@@ -111,7 +108,11 @@ impl Devnet {
     /// The clock is before genesis, or the epoch before Fulu.
     pub fn fork_digest(&self, now_ms: u128) -> Result<ForkDigest, DigestError> {
         let epoch = self.epoch_at(now_ms)?;
-        compute_fork_digest(&self.config, &self.genesis.genesis_validators_root, epoch)
+        compute_fork_digest(
+            self.config(),
+            &self.genesis().genesis_validators_root,
+            epoch,
+        )
     }
 
     /// The ENR fork fields (`eth2`, `nfd`) of the wall-clock epoch at `now_ms`.
@@ -121,13 +122,17 @@ impl Devnet {
     /// As [`Self::fork_digest`].
     pub fn fork_fields(&self, now_ms: u128) -> Result<ForkFields, DigestError> {
         let epoch = self.epoch_at(now_ms)?;
-        ForkFields::from_schedule(&self.config, &self.genesis.genesis_validators_root, epoch)
+        ForkFields::from_schedule(
+            self.config(),
+            &self.genesis().genesis_validators_root,
+            epoch,
+        )
     }
 
     /// `compute_fork_digest(epoch)` on the BPO-aware schedule; `None` before Fulu.
     #[must_use]
     pub fn digest_at(&self, epoch: Epoch) -> Option<ForkDigest> {
-        compute_fork_digest(&self.config, &self.genesis.genesis_validators_root, epoch).ok()
+        self.net.digest_at(epoch)
     }
 
     /// Fork digest to fork, for every digest of the schedule (the context bytes the codec
@@ -135,7 +140,7 @@ impl Devnet {
     /// served under ([`cl_p2p::rpc::network_context_table`]).
     #[must_use]
     pub fn context_table(&self) -> ContextTable {
-        cl_p2p::rpc::network_context_table(&self.config, &self.genesis.genesis_validators_root)
+        cl_p2p::rpc::network_context_table(self.config(), &self.genesis().genesis_validators_root)
     }
 
     /// The gossip caps of preset `E` under each fork digest of the schedule, BPO digests
@@ -143,17 +148,13 @@ impl Devnet {
     /// fork and blob limit, and a digest off the schedule to none.
     #[must_use]
     pub fn topic_caps<E: EthSpec>(&self) -> TopicCaps {
-        TopicCaps::from_config::<E>(&self.config, &self.genesis.genesis_validators_root)
+        TopicCaps::from_config::<E>(self.config(), &self.genesis().genesis_validators_root)
     }
 
     /// The chain probe mode's Status provider builds our Status for.
     #[must_use]
     pub fn probe_chain(&self) -> ProbeChain {
-        ProbeChain {
-            config: self.config.clone(),
-            genesis: self.genesis,
-            slots_per_epoch: self.slots_per_epoch(),
-        }
+        self.net.probe_chain()
     }
 }
 

@@ -71,8 +71,12 @@ MemorySwapMax=0
 OOMPolicy=stop
 Restart=on-failure
 RestartSec=5min
-# No restart on a refusal that a restart cannot fix: 1 a refused credential, 2 the stub
-# (or a refused config), 64 a usage error. Exit codes of the main process only.
+# No restart on a refusal that a restart cannot fix: 1 a failed start (the store, the
+# socket), 2 a refused config (/etc/ethswarm/cl-chain.toml) or a store of another node_id, 64
+# a usage error (any argument).
+# Exit codes of the main process only. Not listed, so restarted: 69 (cl-verify's directory or
+# socket was not there within verify_wait_ms, or the clock is before genesis), 70 (a fault of
+# the run that a restart can fix) and 71 (no log writer).
 RestartPreventExitStatus=1 2 64
 
 [Install]

@@ -182,6 +182,7 @@ async fn acl_method_not_served_refused() {
         notifier: std::sync::Arc::new(Recorder::default()),
         shutdown: Box::pin(std::future::pending()),
         registry: prometheus_client::registry::Registry::default(),
+        unprefixed: prometheus_client::registry::Registry::default(),
     };
     let err = svc_runtime::run_with(config, engine_routes(), hooks)
         .await

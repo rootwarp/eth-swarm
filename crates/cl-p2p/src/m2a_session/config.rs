@@ -283,7 +283,8 @@ impl M2aConfig {
     }
 
     /// Loads the config from `path` for a session that runs as effective UID `euid`: as
-    /// [`M2aConfig::load`], but nothing on the path is one the session user could change.
+    /// [`M2aConfig::load`], but nothing on the path is one the session user could change. The
+    /// walk is the one every service uses ([`svc_runtime::owned::read_root_owned`]):
     ///
     /// - `path` must be absolute, without `..`. It is walked from `/` one directory at a time
     ///   (`openat` with `O_NOFOLLOW | O_DIRECTORY`, as `ipc::uds::open_closed_dir` walks a
@@ -297,35 +298,16 @@ impl M2aConfig {
     ///   with its own file.
     /// - The open file (`fstat`, so the file checked is the file read) must be a regular file
     ///   that `euid` cannot write by its mode bits: owner-writable when `euid` owns it, or
-    ///   group- or world-writable, is refused.
+    ///   group- or world-writable, is refused. It holds at most
+    ///   [`svc_runtime::owned::MAX_CONFIG_BYTES`] of UTF-8.
     ///
     /// Only the mode bits are read, never ACLs: an ACL that grants the session user write
     /// access is not seen. A file or a directory that `euid` owns but cannot write (mode 0444,
     /// 0555) passes: its owner could change the mode, so this check stops a mistake, not a
     /// determined login user. The pre-flight holds the user to [`DEFAULT_RUN_AS`] as well.
     pub fn load_for(path: &Path, euid: u32, accepted_owner: u32) -> Result<Self, ConfigError> {
-        use std::io::Read as _;
-        use std::os::unix::fs::MetadataExt as _;
-        let read_error = |source| ConfigError::Read {
-            path: path.to_owned(),
-            source,
-        };
-        let mut file = open_closed(path, euid, accepted_owner)?;
-        let meta = file.metadata().map_err(read_error)?;
-        if !meta.file_type().is_file() {
-            return Err(ConfigError::NotRegular);
-        }
-        let mode = meta.mode() & 0o7777;
-        let owner_writes = meta.uid() == euid && mode & 0o200 != 0;
-        if owner_writes || mode & 0o022 != 0 {
-            return Err(ConfigError::Writable {
-                euid,
-                owner: meta.uid(),
-                mode,
-            });
-        }
-        let mut text = String::new();
-        file.read_to_string(&mut text).map_err(read_error)?;
+        let text = svc_runtime::owned::read_root_owned(path, euid, accepted_owner)
+            .map_err(|e| ConfigError::from_owned(path, e))?;
         Self::from_toml(&text)
     }
 
@@ -367,105 +349,45 @@ impl M2aConfig {
     }
 }
 
-/// Opens the config at `path` by walking it from `/` (see [`M2aConfig::load_for`]).
-fn open_closed(path: &Path, euid: u32, accepted: u32) -> Result<std::fs::File, ConfigError> {
-    use rustix::fs::{openat, Mode, OFlags, CWD};
-    use std::path::Component;
-    let refused = |reason: String| ConfigError::Path {
-        path: path.to_owned(),
-        reason,
-    };
-    if !path.is_absolute() {
-        return Err(refused("must be an absolute path".into()));
-    }
-    let mut names = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::RootDir | Component::CurDir => {}
-            Component::Normal(name) => names.push(name),
-            Component::ParentDir | Component::Prefix(_) => {
-                return Err(refused("must not contain `..`".into()))
-            }
+impl ConfigError {
+    /// The error of the shared walk ([`svc_runtime::owned::read_root_owned`]) for the config at
+    /// `path`, in the session's words.
+    fn from_owned(path: &Path, e: svc_runtime::owned::OwnedFileError) -> Self {
+        use svc_runtime::owned::OwnedFileError as Owned;
+        match e {
+            Owned::Read { path, source } => Self::Read { path, source },
+            Owned::Path { path, reason } => Self::Path { path, reason },
+            Owned::OpenDirectory {
+                dir,
+                euid,
+                owner,
+                mode,
+            } => Self::OpenDirectory {
+                dir,
+                euid,
+                owner,
+                mode,
+            },
+            Owned::Owner {
+                path,
+                owner,
+                accepted,
+            } => Self::Owner {
+                path,
+                owner,
+                accepted,
+            },
+            Owned::NotRegular => Self::NotRegular,
+            Owned::Writable { euid, owner, mode } => Self::Writable { euid, owner, mode },
+            Owned::TooLarge { .. } => Self::Read {
+                path: path.to_owned(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("larger than {} bytes", svc_runtime::owned::MAX_CONFIG_BYTES),
+                ),
+            },
         }
     }
-    let Some((file, dirs)) = names.split_last() else {
-        return Err(refused("names no file".into()));
-    };
-    let open_error = |walked: &Path, e: rustix::io::Errno| match e {
-        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => refused(format!(
-            "{} is a symlink or not a directory",
-            walked.display()
-        )),
-        other => ConfigError::Read {
-            path: walked.to_owned(),
-            source: other.into(),
-        },
-    };
-    let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let mut walked = PathBuf::from("/");
-    let mut fd = openat(CWD, "/", dir_flags, Mode::empty()).map_err(|e| open_error(&walked, e))?;
-    check_directory(&fd, &walked, euid, accepted)?;
-    for name in dirs {
-        walked.push(name);
-        fd = openat(&fd, *name, dir_flags, Mode::empty()).map_err(|e| open_error(&walked, e))?;
-        check_directory(&fd, &walked, euid, accepted)?;
-    }
-    // O_NONBLOCK: a FIFO is refused by the caller instead of blocking the open.
-    let file_flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    let fd = openat(&fd, *file, file_flags, Mode::empty()).map_err(|e| match e {
-        rustix::io::Errno::LOOP => refused("the config is a symlink".into()),
-        other => ConfigError::Read {
-            path: path.to_owned(),
-            source: other.into(),
-        },
-    })?;
-    check_owner(&fd, path, accepted)?;
-    Ok(std::fs::File::from(fd))
-}
-
-/// Fails unless the open `fd` (named `path`) is owned by root or by `accepted` (0: root only),
-/// as `ipc::uds::check_closed` holds a socket's directories to root or the caller.
-fn check_owner(fd: &rustix::fd::OwnedFd, path: &Path, accepted: u32) -> Result<(), ConfigError> {
-    let stat = rustix::fs::fstat(fd).map_err(|e| ConfigError::Read {
-        path: path.to_owned(),
-        source: e.into(),
-    })?;
-    if stat.st_uid != 0 && stat.st_uid != accepted {
-        return Err(ConfigError::Owner {
-            path: path.to_owned(),
-            owner: stat.st_uid,
-            accepted,
-        });
-    }
-    Ok(())
-}
-
-/// Fails if the directory `fd` (named `dir`) is writable by `euid` as its owner, or by group or
-/// others without the sticky bit.
-fn check_directory(
-    fd: &rustix::fd::OwnedFd,
-    dir: &Path,
-    euid: u32,
-    accepted: u32,
-) -> Result<(), ConfigError> {
-    check_owner(fd, dir, accepted)?;
-    let stat = rustix::fs::fstat(fd).map_err(|e| ConfigError::Read {
-        path: dir.to_owned(),
-        source: e.into(),
-    })?;
-    let mode = u32::from(stat.st_mode) & 0o7777;
-    let owner = stat.st_uid;
-    let owner_writes = owner == euid && mode & 0o200 != 0;
-    let others_write = mode & 0o022 != 0 && mode & 0o1000 == 0;
-    if owner_writes || others_write {
-        return Err(ConfigError::OpenDirectory {
-            dir: dir.to_owned(),
-            euid,
-            owner,
-            mode,
-        });
-    }
-    Ok(())
 }
 
 /// The parser's message and line, without the snippet of input `toml` would quote.

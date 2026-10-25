@@ -4,6 +4,22 @@ The bootstrap every ETH Swarm service process runs: config and method ACL, the s
 JSON tracing through a bounded stderr writer, loopback `/metrics`, `sd_notify` and the SIGTERM
 drain. The crate docs (`src/lib.rs`) describe each module.
 
+## The config file
+
+A deployed binary reads `/etc/ethswarm/<service>.toml` through `Config::load_root_owned`. The
+file is read only if root owns it and every directory on its path, and the service user can
+write none of them (`owned::read_root_owned`, the walk that `m2a-session` also uses). The
+network is `network` (pinned) or `network_dir` (a devnet's directory). Each of cl-chain,
+cl-discv5 and cl-p2p reads its own table (`[chain]`, `[discv5]`, `[p2p]`) with
+`Config::section`, and a table of another service is refused.
+
+## Two registries on `/metrics`
+
+`Hooks::registry` has the prefix `ethswarm_` and holds the runtime's own metrics.
+`Hooks::unprefixed` holds the service's metrics whose names readers outside the service fix,
+such as `topic_msg_sent_counts` or `p2p_goodbye_received_total`. `/metrics` serves both, in
+that order, with one `# EOF`.
+
 ## Logging when the writer cannot start
 
 `telemetry::try_init_tracing_with` starts one `log-writer` thread that owns stderr. The first

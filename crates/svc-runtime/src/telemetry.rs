@@ -865,11 +865,12 @@ impl Default for MetricsLimits {
     }
 }
 
-/// Serves `registry` at `GET /metrics` until `shutdown` resolves, one request per connection
-/// (no keep-alive), at most `limits.max_connections` at a time.
+/// Serves `registries` at `GET /metrics`, in their order and with one `# EOF` at the end, until
+/// `shutdown` resolves, one request per connection (no keep-alive), at most
+/// `limits.max_connections` at a time.
 pub async fn serve_metrics(
     listener: TcpListener,
-    registry: Arc<Registry>,
+    registries: Arc<[Registry]>,
     limits: MetricsLimits,
     shutdown: impl Future<Output = ()>,
 ) {
@@ -893,11 +894,11 @@ pub async fn serve_metrics(
             drop(stream);
             continue;
         };
-        let registry = Arc::clone(&registry);
+        let registries = Arc::clone(&registries);
         tokio::spawn(async move {
             let _slot = slot;
             let service = hyper::service::service_fn(move |req| {
-                std::future::ready(Ok::<_, Infallible>(respond(&req, &registry)))
+                std::future::ready(Ok::<_, Infallible>(respond(&req, &registries)))
             });
             let connection = hyper::server::conn::http1::Builder::new()
                 .timer(TokioTimer::new())
@@ -913,7 +914,7 @@ pub async fn serve_metrics(
     }
 }
 
-fn respond<B>(request: &http::Request<B>, registry: &Registry) -> http::Response<Full<Bytes>> {
+fn respond<B>(request: &http::Request<B>, registries: &[Registry]) -> http::Response<Full<Bytes>> {
     let reply = |status: http::StatusCode, content_type: &str, body: String| {
         http::Response::builder()
             .status(status)
@@ -936,7 +937,11 @@ fn respond<B>(request: &http::Request<B>, registry: &Registry) -> http::Response
         );
     }
     let mut body = String::new();
-    match prometheus_client::encoding::text::encode(&mut body, registry) {
+    let encoded = registries
+        .iter()
+        .try_for_each(|r| prometheus_client::encoding::text::encode_registry(&mut body, r))
+        .and_then(|()| prometheus_client::encoding::text::encode_eof(&mut body));
+    match encoded {
         Ok(()) => reply(http::StatusCode::OK, METRICS_CONTENT_TYPE, body),
         Err(e) => reply(
             http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1733,7 +1738,7 @@ mod tests {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(serve_metrics(
             listener,
-            Arc::new(Registry::default()),
+            Arc::from(vec![Registry::default()]),
             limits,
             async {
                 let _ = stopped.await;
@@ -1781,7 +1786,7 @@ mod tests {
         };
         tokio::spawn(serve_metrics(
             listener,
-            Arc::new(Registry::default()),
+            Arc::from(vec![Registry::default()]),
             limits,
             std::future::pending(),
         ));
@@ -1819,7 +1824,7 @@ mod tests {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(serve_metrics(
             listener,
-            Arc::new(registry),
+            Arc::from(vec![registry]),
             MetricsLimits::default(),
             async {
                 let _ = stopped.await;

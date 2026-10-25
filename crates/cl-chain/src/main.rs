@@ -1,11 +1,9 @@
-//! `cl-chain` binary. The service is a stub (see the library), so there is nothing to run yet.
+//! `cl-chain` binary: probe mode as `ops/probe/ethswarm-chain.service` runs it. It takes no
+//! argument and reads `/etc/ethswarm/cl-chain.toml`; see [`cl_chain::service`] for the config
+//! and the exit codes.
 
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    eprintln!(
-        "cl-chain {}: stub service, every ethswarm.chain.v1 RPC answers UNIMPLEMENTED; not runnable yet",
-        env!("CARGO_PKG_VERSION")
-    );
-    ExitCode::from(2)
+    ExitCode::from(cl_chain::service::main(cl_chain::service::Build::Deployed))
 }

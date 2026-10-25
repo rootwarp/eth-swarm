@@ -7,6 +7,20 @@ rust-version.workspace = true
 publish = false
 description = "cl-chain: the ethswarm.chain.v1 service (stub: contract layer only, every RPC answers UNIMPLEMENTED)."
 
+[features]
+# Builds the test binary cl-chain-test (below): the same code as cl-chain, but it reads its
+# config from $CL_CHAIN_TEST_CONFIG, accepts a config that the test user owns and lets the OS
+# pick the /metrics port, so the integration tests can run it as the developer's user. Only
+# cl-chain's own dev-dependency turns it on; the cl-chain binary never reads the variable.
+test-config = []
+
+# The test binary of the service, built only with test-config. Its unit tests are cl-chain's.
+[[bin]]
+name = "cl-chain-test"
+path = "src/bin/cl-chain-test.rs"
+required-features = ["test-config"]
+test = false
+
 [dependencies]
 ethswarm-proto = { path = "../ethswarm-proto" }
 ipc = { path = "../ipc" }
@@ -40,9 +54,19 @@ serde_json = "1"
 hex = "0.4"
 # probe_column_dropped_total{reason}; the version cl-verify and cl-p2p use.
 prometheus-client = "0.25.1"
+# The binary: the config from /etc/ethswarm/cl-chain.toml (read only if root owns it and its
+# path), the socket, the method ACL, /metrics, JSON logs and the SIGTERM drain. A workspace
+# crate; it adds no crate to Cargo.lock.
+svc-runtime = { path = "../svc-runtime" }
 
 [dev-dependencies]
+# test-config: tests/service.rs runs the test binary cl-chain-test.
+cl-chain = { path = ".", features = ["test-config"] }
 ipc = { path = "../ipc", features = ["testkit"] }
+# owned::testkit: temp directories with no symlink on their path, for the owner walk.
+svc-runtime = { path = "../svc-runtime", features = ["testkit"] }
+# tests/service.rs sends SIGTERM to the child (the version svc-runtime and cl-p2p use).
+rustix = { version = "1", features = ["process"] }
 # tests/probe_restart.rs pauses a column write before its commit and kills the process there.
 cl-chain-columns = { path = "../cl-chain-columns", features = ["test-hooks"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }

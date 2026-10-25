@@ -1034,6 +1034,7 @@ name = "cl-chain"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "cl-chain",
  "cl-chain-columns",
  "cl-discv5",
  "cl-verify",
@@ -1050,8 +1051,10 @@ dependencies = [
  "network-config",
  "p2p-wire",
  "prometheus-client",
+ "rustix",
  "serde",
  "serde_json",
+ "svc-runtime",
  "tempfile",
  "testkit",
  "thiserror 2.0.21",

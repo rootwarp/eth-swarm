@@ -50,7 +50,8 @@ tokio = { version = "1", features = ["rt", "macros", "time", "net", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 # The binaries' logging: JSON lines through the bounded stderr writer (a stalled stderr drops
-# lines, never blocks the session) and the bounded flush before each exit.
+# lines, never blocks the session) and the bounded flush before each exit. Also the owner walk
+# that m2a-session reads its config through (svc_runtime::owned), which every service shares.
 svc-runtime = { path = "../svc-runtime" }
 rustix = { version = "1", features = ["fs", "process"] }
 # getpwnam_r for the m2a-session pre-flight (m2a_session::os_user): the UID of the run_as user,
