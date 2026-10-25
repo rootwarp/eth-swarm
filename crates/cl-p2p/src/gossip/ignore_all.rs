@@ -13,7 +13,11 @@
 //! [`IgnoreAllEvent::Ignored`] for each message, and every other gossipsub event as is.
 //!
 //! Each message also goes to an optional [`CaptureTap`] with its receive time: a bounded queue
-//! that drops (and counts) when the reader is behind, so capture never slows the swarm.
+//! that drops (and counts) when the reader is behind, so capture never slows the swarm. A tap
+//! can keep only some topics ([`CaptureTap::keeping`]): the others never enter its queue, so
+//! the queue holds at most its capacity of messages of those topics. A topic that is not in the
+//! subscribed set, as after its fork digest retired ([`IgnoreAll::retire_digest`]), never
+//! reaches the tap either.
 
 use super::config::{digest_of, topic_hash};
 use super::{GossipConfig, GossipError, TopicSet};
@@ -30,10 +34,9 @@ use libp2p::swarm::{
 use libp2p::{Multiaddr, PeerId};
 use p2p_wire::gossip::GossipTopic;
 use p2p_wire::rpc::messages::ForkDigest;
+use prometheus_client::metrics::counter::Counter;
 use prometheus_client::registry::Registry;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime};
 
@@ -90,36 +93,57 @@ pub struct Captured {
 #[derive(Clone, Debug)]
 pub struct CaptureTap {
     tx: SyncSender<Captured>,
-    dropped: Arc<AtomicU64>,
+    dropped: Counter,
+    /// The topics the tap keeps; `None` keeps every topic.
+    keep: Option<fn(&str) -> bool>,
 }
 
 /// The reading side of a capture queue.
 #[derive(Debug)]
 pub struct CaptureReader {
     rx: Receiver<Captured>,
-    dropped: Arc<AtomicU64>,
+    dropped: Counter,
 }
 
 /// A capture queue holding at most `capacity` messages (at least one).
 pub fn capture_tap(capacity: usize) -> (CaptureTap, CaptureReader) {
+    capture_tap_counted(capacity, Counter::default())
+}
+
+/// [`capture_tap`], its drops counted on `dropped` (a metric's counter, which it shares).
+pub fn capture_tap_counted(capacity: usize, dropped: Counter) -> (CaptureTap, CaptureReader) {
     let (tx, rx) = mpsc::sync_channel(capacity.max(1));
-    let dropped = Arc::new(AtomicU64::new(0));
     (
         CaptureTap {
             tx,
             dropped: dropped.clone(),
+            keep: None,
         },
         CaptureReader { rx, dropped },
     )
 }
 
 impl CaptureTap {
+    /// The same tap, keeping only the messages whose full topic string `keep` accepts. The
+    /// others never enter the queue, and they are no drop.
+    #[must_use]
+    pub fn keeping(mut self, keep: fn(&str) -> bool) -> Self {
+        self.keep = Some(keep);
+        self
+    }
+
+    /// Whether the tap keeps messages of `topic`.
+    #[must_use]
+    pub fn wants(&self, topic: &str) -> bool {
+        self.keep.is_none_or(|keep| keep(topic))
+    }
+
     /// Queues `captured`, or drops and counts it if the queue is full or its reader is gone.
     pub fn offer(&self, captured: Captured) -> bool {
         match self.tx.try_send(captured) {
             Ok(()) => true,
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
+                self.dropped.inc();
                 false
             }
         }
@@ -127,7 +151,7 @@ impl CaptureTap {
 
     /// Messages dropped so far.
     pub fn dropped(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
+        self.dropped.get()
     }
 }
 
@@ -137,9 +161,15 @@ impl CaptureReader {
         self.rx.try_recv().ok()
     }
 
+    /// The next message: waits for one, and blocks the thread while it waits. `None` once the
+    /// queue is empty and every [`CaptureTap`] of it is gone (the swarm was dropped).
+    pub fn recv(&self) -> Option<Captured> {
+        self.rx.recv().ok()
+    }
+
     /// Messages the tap dropped so far.
     pub fn dropped(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
+        self.dropped.get()
     }
 }
 
@@ -337,15 +367,23 @@ impl<G: ValidationSink> IgnoreAll<G> {
         if !in_cache {
             tracing::warn!(%message_id, peer = %source, "ignored message was not in the cache");
         }
-        if let Some(tap) = &self.tap {
-            tap.offer(Captured {
-                recv_mono,
-                recv_wall,
-                topic: message.topic.to_string(),
-                message_id: message_id.0.clone(),
-                source,
-                data: message.data,
-            });
+        // Only a topic still subscribed (its digest live, not retired) reaches the tap.
+        if let Some(tap) = self
+            .tap
+            .as_ref()
+            .filter(|_| self.topics.contains(&message.topic))
+        {
+            let topic = message.topic.to_string();
+            if tap.wants(&topic) {
+                tap.offer(Captured {
+                    recv_mono,
+                    recv_wall,
+                    topic,
+                    message_id: message_id.0.clone(),
+                    source,
+                    data: message.data,
+                });
+            }
         }
         IgnoreAllEvent::Ignored {
             source,
@@ -647,7 +685,7 @@ mod tests {
         }
         let (tap, reader) = capture_tap(2);
         let before = SystemTime::now();
-        let mut behaviour = IgnoreAll::with_inner(inner).with_tap(tap.clone());
+        let mut behaviour = live(IgnoreAll::with_inner(inner).with_tap(tap.clone()));
         assert_eq!(drain(&mut behaviour).len(), 4);
         let first = reader.try_next().unwrap();
         assert_eq!(first.topic, TOPIC);
@@ -664,6 +702,105 @@ mod tests {
         drop(reader);
         assert!(!tap.offer(first));
         assert_eq!(tap.dropped(), 3);
+    }
+
+    /// `behaviour` with [`TOPIC`] in its subscribed set, as `IgnoreAll::new` subscribes a topic.
+    fn live(behaviour: IgnoreAll<Scripted>) -> IgnoreAll<Scripted> {
+        behaviour
+            .topics
+            .extend(&[TopicHash::from_raw(TOPIC)])
+            .unwrap();
+        behaviour
+    }
+
+    /// The tap follows the live digests: a message of a topic that is not (or no longer) in the
+    /// subscribed set, as after its digest retired, is reported IGNORE and never tapped.
+    #[test]
+    fn the_tap_keeps_only_the_live_topics() {
+        let peer = PeerId::random();
+        let mut inner = Scripted {
+            cached: true,
+            ..Default::default()
+        };
+        inner.events.push_back(message(0, peer));
+        let (tap, reader) = capture_tap(4);
+        let mut behaviour = live(IgnoreAll::with_inner(inner).with_tap(tap));
+        drain(&mut behaviour);
+        assert_eq!(reader.try_next().unwrap().message_id, vec![0]);
+        // The digest of TOPIC retires; a late message of it is not tapped.
+        assert_eq!(behaviour.topics.remove_digest([0; 4]), 1);
+        let mut inner = Scripted {
+            cached: true,
+            ..Default::default()
+        };
+        inner.events.push_back(message(1, peer));
+        let mut late = IgnoreAll::with_inner(inner).with_tap(behaviour.tap.take().unwrap());
+        late.topics = behaviour.topics.clone();
+        assert_eq!(drain(&mut late).len(), 1, "still reported IGNORE");
+        assert_eq!(late.gossipsub().reports.len(), 1);
+        assert!(
+            reader.try_next().is_none(),
+            "a retired digest's message is not tapped"
+        );
+    }
+
+    /// A tap that keeps only some topics gets nothing of the others, and its drops count on
+    /// the counter it was given.
+    #[test]
+    fn a_filtered_tap_keeps_only_its_topics_and_counts_its_drops() {
+        let peer = PeerId::random();
+        let mut inner = Scripted {
+            cached: true,
+            ..Default::default()
+        };
+        for i in 0..3 {
+            inner.events.push_back(message(i, peer));
+        }
+        let none = |_: &str| false;
+        let (tap, reader) = capture_tap(4);
+        let mut behaviour = live(IgnoreAll::with_inner(inner).with_tap(tap.keeping(none)));
+        assert_eq!(
+            drain(&mut behaviour).len(),
+            3,
+            "every message is still reported"
+        );
+        assert!(reader.try_next().is_none(), "no topic kept");
+        assert_eq!(reader.dropped(), 0, "a topic not kept is no drop");
+        let counter = Counter::default();
+        let (tap, reader) = capture_tap_counted(1, counter.clone());
+        let kept = tap.keeping(|topic| topic == TOPIC);
+        assert!(kept.wants(TOPIC) && !kept.wants("/eth2/00000000/execution_payload/ssz_snappy"));
+        let mut inner = Scripted {
+            cached: true,
+            ..Default::default()
+        };
+        inner.events.push_back(message(0, peer));
+        inner.events.push_back(message(1, peer));
+        let mut behaviour = live(IgnoreAll::with_inner(inner).with_tap(kept));
+        drain(&mut behaviour);
+        assert_eq!(reader.try_next().unwrap().message_id, vec![0]);
+        assert_eq!((counter.get(), reader.dropped()), (1, 1));
+    }
+
+    /// `recv` waits for the next message, and ends once every tap is gone.
+    #[test]
+    fn recv_waits_for_a_message_and_ends_with_the_taps() {
+        let (tap, reader) = capture_tap(2);
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let captured = Captured {
+                recv_mono: Instant::now(),
+                recv_wall: SystemTime::now(),
+                topic: TOPIC.into(),
+                message_id: vec![7],
+                source: PeerId::random(),
+                data: vec![1],
+            };
+            assert!(tap.offer(captured));
+        });
+        assert_eq!(reader.recv().unwrap().message_id, vec![7]);
+        sender.join().unwrap();
+        assert!(reader.recv().is_none(), "the tap is gone");
     }
 
     #[test]

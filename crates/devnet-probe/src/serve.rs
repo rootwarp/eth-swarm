@@ -21,8 +21,8 @@
 //! - **The gossip hand-off** ([`ChainSide::hand_over`]): each captured column sidecar whose
 //!   topic carries the fork digest of its slot's epoch is decoded by the fork of its slot and
 //!   given to cl-chain's store in process ([`ProbeService::accept_column`]); another digest is
-//!   dropped undecoded. `ethswarm.chain.v1.GossipService/Validate`, its wire form, is still a
-//!   stub.
+//!   dropped undecoded. The `cl-p2p` service does the same over the wire, through
+//!   `ethswarm.chain.v1.GossipService/Validate`.
 //!
 //! [`serve`] runs it all for a while on the devnet, dialling the reference CLs so their column
 //! gossip reaches us, never across a fork digest change ([`clip_until`]: the subscriptions are
@@ -457,6 +457,30 @@ impl<E: EthSpec> ColumnRequester<E> {
             .map_err(|_| "dial: no connection in time".to_owned())?
     }
 
+    /// Connects to whichever peer listens at `addr` (its peer ID proved by Noise); returns it.
+    ///
+    /// # Errors
+    ///
+    /// The dial failed or took longer than the request deadline.
+    pub async fn connect_any(&mut self, addr: Multiaddr) -> Result<PeerId, String> {
+        let opts = DialOpts::unknown_peer_id().address(addr).build();
+        self.swarm.dial(opts).map_err(|e| format!("dial: {e}"))?;
+        let connected = async {
+            loop {
+                match self.swarm.select_next_some().await {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => return Ok(peer_id),
+                    SwarmEvent::OutgoingConnectionError { error, .. } => {
+                        return Err(format!("dial: {error}"));
+                    }
+                    _ => {}
+                }
+            }
+        };
+        tokio::time::timeout(REQUEST_DEADLINE, connected)
+            .await
+            .map_err(|_| "dial: no connection in time".to_owned())?
+    }
+
     /// `DataColumnSidecarsByRange` v1 of `count` slots from `start_slot` for `columns`.
     ///
     /// # Errors
@@ -656,16 +680,9 @@ pub fn stored_blocks(
 }
 
 /// Asks the probe `peer` at `addr` for its custody columns as a peer would, and judges every
-/// answer against `chain`'s store, into `check`:
-///
-/// - **by range**, from `earliest_available_slot` to `last_slot`, every custody column: a
-///   non-empty answer of stored sidecars only, each the stored bytes of its block and column,
-///   in `(slot, column_index)` order, with the context bytes of its slot's epoch;
-/// - **by root**, up to [`BY_ROOT_BLOCKS`] stored blocks' custody columns and a root nobody
-///   stored: exactly the stored sidecars of the stored blocks, in request order, the unknown
-///   root left out;
-/// - **a column we do not custody**, by range: `3: ResourceUnavailable`, never an empty answer;
-/// - **our Status**: its `earliest_available_slot` at or above the slot the store serves from.
+/// answer against `chain`'s store, into `check`: our Status first (its
+/// `earliest_available_slot` at or above the slot the store serves from), then the answers
+/// ([`judge_answers`]) from `earliest_available_slot` to `last_slot`.
 ///
 /// Nothing may enter the store while it runs (see [`drive`]'s `pumping`), so the answers are
 /// judged against the store they were read from.
@@ -708,7 +725,47 @@ pub async fn self_check<E: EthSpec, V: KzgVerifier + 'static>(
             "nothing to serve: no earliest_available_slot ({stored} columns stored)"
         ));
     };
-    let blocks = match stored_blocks(chain.reader(), (earliest, last_slot), &custody) {
+    let answers = Answers {
+        store: chain.reader(),
+        custody: &custody,
+        earliest,
+        last_slot,
+    };
+    judge_answers(check, &mut requester, devnet, peer, &answers).await;
+}
+
+/// What [`judge_answers`] asks for and judges against: the store, our custody columns, and the
+/// slots of the range, inclusive.
+pub struct Answers<'a> {
+    /// The store the answers must come from.
+    pub store: &'a ColumnReader,
+    /// Our custody columns, sorted.
+    pub custody: &'a [u64],
+    /// The first slot of the range: the slot the columns are served from.
+    pub earliest: u64,
+    /// The last slot of the range.
+    pub last_slot: u64,
+}
+
+/// Asks `peer` for `answers.custody` and judges each answer against `answers.store`, into
+/// `check`:
+///
+/// - **by range**, from `earliest` to `last_slot`, every custody column: a non-empty answer of
+///   stored sidecars only, each the stored bytes of its block and column, in `(slot,
+///   column_index)` order, with the context bytes of its slot's epoch;
+/// - **by root**, up to [`BY_ROOT_BLOCKS`] stored blocks' custody columns and a root nobody
+///   stored: exactly the stored sidecars of the stored blocks, in request order, the unknown
+///   root left out;
+/// - **a column we do not custody**, by range: `3: ResourceUnavailable`, never an empty answer.
+pub async fn judge_answers<E: EthSpec>(
+    check: &mut Check,
+    requester: &mut ColumnRequester<E>,
+    devnet: &Devnet,
+    peer: PeerId,
+    answers: &Answers<'_>,
+) {
+    let (custody, earliest, last_slot) = (answers.custody, answers.earliest, answers.last_slot);
+    let blocks = match stored_blocks(answers.store, (earliest, last_slot), custody) {
         Ok(blocks) => blocks,
         Err(e) => return check.fail(e),
     };
@@ -727,7 +784,7 @@ pub async fn self_check<E: EthSpec, V: KzgVerifier + 'static>(
         .saturating_sub(earliest)
         .saturating_add(1)
         .min(cl_chain::reqresp::MAX_REQUEST_DATA_COLUMN_SIDECARS / custody.len().max(1) as u64);
-    match requester.by_range(peer, earliest, count, &custody).await {
+    match requester.by_range(peer, earliest, count, custody).await {
         Ok(ColumnAnswer::Sidecars(got)) => {
             let judged = judge_range(&got, &order, custody.len(), epoch_digest);
             check.record(
@@ -754,9 +811,9 @@ pub async fn self_check<E: EthSpec, V: KzgVerifier + 'static>(
     // By root: exactly the stored sidecars, the unknown root left out.
     let named: Vec<_> = blocks.iter().rev().take(BY_ROOT_BLOCKS).rev().collect();
     let mut ids: Vec<([u8; 32], Vec<u64>)> =
-        named.iter().map(|b| (b.root, custody.clone())).collect();
+        named.iter().map(|b| (b.root, custody.to_vec())).collect();
     let unknown = [0x5a; 32];
-    ids.push((unknown, custody.clone()));
+    ids.push((unknown, custody.to_vec()));
     let want: Vec<(Option<ForkDigest>, Vec<u8>)> = named
         .iter()
         .flat_map(|b| {
@@ -1396,8 +1453,9 @@ mod tests {
             assert!(acl.allows(method, 990), "{method}");
             assert!(!acl.allows(method, 991), "{method}");
         }
+        assert!(acl.allows("/ethswarm.chain.v1.GossipService/Validate", 990));
         assert!(!acl.allows("/ethswarm.chain.v1.ReqRespService/GetMetadata", 990));
-        assert!(!acl.allows("/ethswarm.chain.v1.GossipService/Validate", 990));
+        assert!(!acl.allows("/ethswarm.chain.v1.GossipService/WatchPublish", 990));
     }
 
     #[test]

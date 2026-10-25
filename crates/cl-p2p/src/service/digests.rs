@@ -7,8 +7,9 @@
 //! subnets.
 //!
 //! - **Subscribe**: the topics of each named digest, in the body's order.
-//! - **Retire**: a digest that the body no longer names stays subscribed for the grace (one
-//!   epoch \[est\]), because messages of the old digest can arrive late. Then its topics leave
+//! - **Retire**: a digest that the body no longer names stays subscribed for the grace (two
+//!   epochs, [`crate::service::DIGEST_GRACE_EPOCHS`]: `altair/p2p-interface.md`, "Transitioning
+//!   the gossip"), because messages of the old digest can arrive late. Then its topics leave
 //!   gossipsub, the subscribed set and the whitelist ([`IgnoreAll::retire_digest`]), and the
 //!   room takes the topics of later digests.
 //! - **Make room**: when the topics of a named digest do not fit the bound, the retiring

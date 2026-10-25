@@ -48,7 +48,7 @@ use tonic::service::Routes;
 
 /// The `cl-chain` service: contract checks, then `UNIMPLEMENTED`, except `ReqRespService`
 /// once it is given the probe's column server ([`Self::serving`]) and `GossipService` once it
-/// is given the probe's custody subscriptions ([`Self::serving_gossip`]).
+/// is given the probe's custody subscriptions and column hand-off ([`Self::serving_gossip`]).
 #[derive(Clone, Debug)]
 pub struct ChainStub {
     link: Link,
@@ -75,7 +75,7 @@ impl ChainStub {
     }
 
     /// The same service with `GossipService` served by `gossip` (`WatchSubscriptions` from the
-    /// probe's custody) instead of the stub.
+    /// probe's custody, `Validate` into its column store) instead of the stub.
     #[must_use]
     pub fn serving_gossip(mut self, gossip: probe::service::GossipServer) -> Self {
         self.gossip = Some(gossip);

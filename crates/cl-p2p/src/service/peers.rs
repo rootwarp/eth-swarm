@@ -278,8 +278,11 @@ pub fn check_record_cgc(text: &str, ours: u64) -> Result<(), RecordCgc> {
 ///
 /// # Errors
 ///
-/// [`ServeError::Config`]: cl-discv5's record does not advertise our custody group count
-/// ([`check_record_cgc`]). Nothing more is read, and the process must stop.
+/// cl-discv5's record does not advertise our custody group count ([`check_record_cgc`]):
+/// nothing more is read, and the process must stop. At the first record that is
+/// [`ServeError::Config`] (exit 2, a refused start); after a record passed it is
+/// [`ServeError::Software`] (exit 70, logged at ERROR), so that systemd starts the unit again and
+/// a bad peer service cannot stop cl-p2p for good.
 pub async fn watch_peers(
     discv5: Discv5Peer,
     link: Link,
@@ -287,17 +290,25 @@ pub async fn watch_peers(
     mut stop: watch::Receiver<bool>,
 ) -> Result<(), ServeError> {
     let mut backoff = Backoff::default();
+    let mut passed = false;
     loop {
         if *stop.borrow_and_update() {
             return Ok(());
         }
-        let read = read_stream(&discv5, &link, &candidates);
+        let started = passed;
+        let read = read_stream(&discv5, &link, &candidates, &mut passed);
         let ended = tokio::select! {
             ended = read => ended,
             _ = stop.changed() => return Ok(()),
         };
         if let Err(Unread::Cgc(e)) = ended {
-            return Err(ServeError::Config(e.to_string()));
+            if !started {
+                return Err(ServeError::Config(e.to_string()));
+            }
+            tracing::error!(error = %e, "cl-discv5's record changed its custody group count");
+            return Err(ServeError::Software(format!(
+                "cl-discv5's record changed after the start: {e}"
+            )));
         }
         let refused = matches!(&ended, Err(Unread::Refused(_)));
         let delivered = match ended {
@@ -343,11 +354,13 @@ impl From<String> for Unread {
     }
 }
 
-/// One `WatchPeers` stream: how many candidates it gave before it ended.
+/// One `WatchPeers` stream: how many candidates it gave before it ended. `passed` turns true
+/// once cl-discv5's record passed the custody check.
 async fn read_stream(
     discv5: &Discv5Peer,
     link: &Link,
     candidates: &mpsc::Sender<Candidate>,
+    passed: &mut bool,
 ) -> Result<usize, Unread> {
     let channel = ipc::uds::connect_path(&discv5.socket, discv5.uid)
         .await
@@ -369,7 +382,7 @@ async fn read_stream(
         .map(|enr| enr.text)
         .unwrap_or_default();
     match check_record_cgc(&record, discv5.groups) {
-        Ok(()) => {}
+        Ok(()) => *passed = true,
         Err(e @ RecordCgc::Unreadable(_)) => return Err(Unread::Other(e.to_string())),
         Err(e) => return Err(Unread::Cgc(e)),
     }

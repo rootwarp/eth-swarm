@@ -322,17 +322,15 @@ pub async fn serve(
     let mut discovery_config = DiscoveryConfig::new(settings.listen_ip, settings.mode);
     discovery_config.udp_port = settings.udp_port;
     discovery_config.sweep_interval = SWEEP_INTERVAL;
-    // At a digest change, the records of the old digest stay one epoch: peers move to the new
+    // At a digest change, the records of the old digest stay two epochs: peers move to the new
     // one only when discv5 asks them again.
-    let epoch = Duration::from_millis(
-        network
-            .config()
-            .slot_duration_ms()
-            .saturating_mul(network.slots_per_epoch()),
+    let grace = fork_grace(
+        network.config().slot_duration_ms(),
+        network.slots_per_epoch(),
     );
     let mut discovery = Discovery::new(enr, key, &discovery_config)
         .map_err(|e| ServeError::Failed(e.to_string()))?
-        .with_fork_grace(epoch)
+        .with_fork_grace(grace)
         .with_metrics(EvictionMetrics::register(&mut hooks.unprefixed));
     let events = discovery
         .start()
@@ -557,6 +555,21 @@ fn run_runtime(config: Config, settings: Discv5Settings, key: CombinedKey) -> u8
     code
 }
 
+/// How many epochs the records of the old fork digest stay in the table after a change: as
+/// long as the old gossip topics (`altair/p2p-interface.md`, "Transitioning the gossip": the
+/// pre-fork topics SHOULD be unsubscribed two epochs after the fork).
+pub const FORK_GRACE_EPOCHS: u64 = 2;
+
+/// [`FORK_GRACE_EPOCHS`] epochs of `slots_per_epoch` slots of `slot_ms` milliseconds.
+#[must_use]
+pub fn fork_grace(slot_ms: u64, slots_per_epoch: u64) -> Duration {
+    Duration::from_millis(
+        slot_ms
+            .saturating_mul(slots_per_epoch)
+            .saturating_mul(FORK_GRACE_EPOCHS),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,6 +665,14 @@ mod tests {
 
     /// A restart can fix a fault of the run (70), not a failed start, the socket's bind or the
     /// ACL (1).
+    /// The records of the old digest stay two epochs after a change, as the old gossip topics
+    /// do (`altair/p2p-interface.md`, "Transitioning the gossip").
+    #[test]
+    fn the_fork_grace_is_two_epochs() {
+        assert_eq!(fork_grace(6_000, 8), Duration::from_secs(96));
+        assert_eq!(fork_grace(12_000, 32), Duration::from_secs(768));
+    }
+
     #[test]
     fn exit_codes_follow_the_unit() {
         use svc_runtime::RuntimeError;

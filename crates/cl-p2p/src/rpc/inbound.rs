@@ -2140,6 +2140,11 @@ impl<E: EthSpec> Control<E> {
             match done {
                 Ok(None) => {}
                 Ok(Some(done)) => {
+                    let sidecars = done
+                        .chunks
+                        .iter()
+                        .filter(|c| matches!(c.chunk, ResponseChunk::Success(_)))
+                        .count();
                     let answer = Answer {
                         chunks: done.chunks,
                         pacer: None,
@@ -2152,8 +2157,10 @@ impl<E: EthSpec> Control<E> {
                         .inner
                         .of(protocol)
                         .send_response(done.channel, answer)
-                        .is_err()
+                        .is_ok()
                     {
+                        self.metrics.column_sidecars_answered(protocol, sidecars);
+                    } else {
                         tracing::debug!(%protocol, "the stream closed before our column answer");
                     }
                 }

@@ -12,14 +12,18 @@
 //!   is then another key's. Each later body is held to the same key and group count.
 //! - **The swarm** ([`swarm::serving_swarm`]): the ignore-all gossipsub on the topic list
 //!   (`gossip_topics`) and the custody column subnets, under the fork digests that cl-chain's
-//!   subscriptions name ([`digests::DigestTopics`]): a superseded digest's topics leave one
-//!   epoch after its change, so the topic set stays within its bound across every change. And
-//!   the req/resp responders.
+//!   subscriptions name ([`digests::DigestTopics`]): a superseded digest's topics leave two
+//!   epochs after its change ([`DIGEST_GRACE_EPOCHS`]), so the topic set stays within its bound
+//!   across every change. And the req/resp responders.
 //! - **cl-discv5** ([`peers::watch_peers`]): its record's `cgc` (`GetLocalEnr`) must be our
 //!   custody group count. The candidates it finds, their addresses held to the `mode`'s IP
 //!   rule, are dialled by the [`peers::Dialer`] up to `target_peers` of our own dials (inbound
 //!   peers come in addition), with the static peers first and always. A dial waits for our
 //!   first Status: a reference CL drops a peer that sends none.
+//! - **The column hand-off** ([`validate`]): the gossipsub's capture tap gives a copy of each
+//!   `data_column_sidecar_*` message, and they go to cl-chain's `GossipService/Validate`, from
+//!   which cl-chain stores its custody columns. Every message is reported IGNORE before that,
+//!   so cl-chain's verdicts change nothing.
 //! - **The owner loop** ([`Owner`]): `p2p_peers{direction}` and `p2p_dial_failures_total`
 //!   ([`PeerMetrics`]), identify logs, and the Goodbye ledger's feed ([`feed::run_feed`]), whose
 //!   dropped events count on `p2p_ledger_feed_dropped_total` ([`feed::FeedSender`]).
@@ -45,6 +49,7 @@ pub mod digests;
 pub mod feed;
 pub mod peers;
 pub mod swarm;
+pub mod validate;
 
 use crate::behaviour::{log_identify, SpecBehaviour, SpecBehaviourEvent};
 use crate::custody::CustodySubscriptions;
@@ -115,6 +120,26 @@ pub const DIAL_EVERY: Duration = Duration::from_secs(2);
 /// How long a connection with no open stream stays up.
 pub const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Column sidecars the capture tap holds for the column hand-off at most \[est\]: a few slots
+/// of the column subnets. The tap keeps only those topics, so it holds at most this many
+/// sidecars, each within its topic's cap. Past it the tap drops and counts them.
+pub const TAP_CAPACITY: usize = 1024;
+
+/// How many epochs the topics of a superseded fork digest stay subscribed:
+/// `altair/p2p-interface.md`, "Transitioning the gossip" (which the Fulu and Gloas specs point
+/// to): the pre-fork topics SHOULD be unsubscribed two epochs after the fork.
+pub const DIGEST_GRACE_EPOCHS: u64 = 2;
+
+/// [`DIGEST_GRACE_EPOCHS`] epochs of `slots_per_epoch` slots of `slot_ms` milliseconds.
+#[must_use]
+pub fn digest_grace(slot_ms: u64, slots_per_epoch: u64) -> Duration {
+    Duration::from_millis(
+        slot_ms
+            .saturating_mul(slots_per_epoch)
+            .saturating_mul(DIGEST_GRACE_EPOCHS),
+    )
+}
+
 /// The discv5 node ID of `key`: keccak256 of its uncompressed secp256k1 public key, as the
 /// spec's `uint256` (what `get_custody_groups` takes). `None` for a key of another type.
 #[must_use]
@@ -184,7 +209,8 @@ pub enum ServeError {
     /// The start failed in a way that a restart cannot fix.
     #[error("{0}")]
     Failed(String),
-    /// A fault of the run that a restart can fix: the swarm's tasks did not end in time.
+    /// A fault of the run that a restart can fix: the swarm's tasks did not end in time, or a
+    /// thread of the service could not start.
     #[error("{0}")]
     Software(String),
     /// The runtime stopped on an error.
@@ -433,13 +459,7 @@ pub async fn serve<E: EthSpec>(
     };
     let status = ChainStatusSource::new(ChainStatus::new(chain.clone()));
     let refresh = status.keep_current(DEFAULT_STATUS_REFRESH);
-    // One epoch: how long the topics of a superseded digest stay.
-    let grace = Duration::from_millis(
-        network
-            .config()
-            .slot_duration_ms()
-            .saturating_mul(E::slots_per_epoch()),
-    );
+    let grace = digest_grace(network.config().slot_duration_ms(), E::slots_per_epoch());
     let mut digest_topics =
         digests::DigestTopics::new(settings.topics.clone(), grace, first.clone());
     let topics = digest_topics.start_topics();
@@ -453,7 +473,7 @@ pub async fn serve<E: EthSpec>(
         status: Arc::new(status.clone()) as Arc<dyn StatusSource>,
         custody_group_count: groups,
         columns: Some(Arc::new(ChainColumns::new(
-            chain,
+            chain.clone(),
             link.clone(),
             MAX_COLUMN_RESPONSE_BYTES,
         ))),
@@ -470,7 +490,13 @@ pub async fn serve<E: EthSpec>(
             ..RpcLimits::default()
         },
     };
-    let gossip = swarm::Gossip { topics, tap: None };
+    let handoff_metrics = validate::HandOffMetrics::register(&mut hooks.unprefixed);
+    let (tap, tap_reader) =
+        crate::gossip::capture_tap_counted(TAP_CAPACITY, handoff_metrics.tap_counter());
+    let gossip = swarm::Gossip {
+        topics,
+        tap: Some(tap.keeping(validate::is_column_topic)),
+    };
     let genesis = network.genesis();
     let swarm = swarm::serving_swarm::<E>(
         network.config(),
@@ -482,6 +508,18 @@ pub async fn serve<E: EthSpec>(
         &mut hooks.unprefixed,
     )
     .map_err(ServeError::Failed)?;
+    // The column hand-off: the bridge thread ends with the swarm's tap, the task at the stop.
+    let (columns_tx, columns_rx) = mpsc::channel(validate::COLUMN_QUEUE);
+    validate::bridge_tap::<E>(tap_reader, columns_tx, handoff_metrics.clone())
+        .map_err(|e| ServeError::Software(format!("the column hand-off thread: {e}")))?;
+    let handing_off = tokio::spawn(validate::hand_off_columns(
+        chain,
+        link.clone(),
+        columns_rx,
+        handoff_metrics,
+        validate::HandOffLimits::default(),
+        stop.clone(),
+    ));
     let peer_metrics = PeerMetrics::register(&mut hooks.unprefixed);
     let ledger = GoodbyeLedger::new(settings.goodbye_ledger)
         .map_err(|e| ServeError::Config(format!("goodbye_ledger: {e}")))?;
@@ -545,6 +583,7 @@ pub async fn serve<E: EthSpec>(
             let _ = feeding.await;
             let _ = watching_peers.await;
             let _ = watching_subs.await;
+            let _ = handing_off.await;
         },
         TASKS_END,
     )
@@ -701,9 +740,9 @@ impl<E: EthSpec> Owner<E> {
     ///
     /// # Errors
     ///
-    /// A subscriptions body that is not our custody (`Owner::check`, exit 2), or a topic set
-    /// that cannot follow the fork digests (exit 70): the owner says Goodbye and stops, and so
-    /// must the process.
+    /// A subscriptions body that is not our custody (`Owner::check`), or a topic set that cannot
+    /// follow the fork digests: exit 70 for both. The owner says Goodbye and stops, and so must
+    /// the process.
     pub async fn drive(
         mut self,
         mut candidates: mpsc::Receiver<peers::Candidate>,
@@ -748,12 +787,17 @@ impl<E: EthSpec> Owner<E> {
     ///
     /// # Errors
     ///
-    /// [`ServeError::Config`]: cl-chain's `node_id` or custody group count changed under us.
+    /// [`ServeError::Software`] (exit 70, logged at ERROR): cl-chain's `node_id` or custody
+    /// group count changed under us after the start. The start's own check of the first body is
+    /// exit 2; a later one restarts the unit, so a bad peer service cannot stop cl-p2p for good.
     fn check(&self, body: &CustodySubscriptions) -> Result<(), ServeError> {
-        let groups =
-            check_custody(self.node, body).map_err(|e| ServeError::Config(e.to_string()))?;
+        let later = |why: String| {
+            tracing::error!(error = %why, "cl-chain's subscriptions changed after the start");
+            ServeError::Software(why)
+        };
+        let groups = check_custody(self.node, body).map_err(|e| later(e.to_string()))?;
         if groups != self.groups {
-            return Err(ServeError::Config(format!(
+            return Err(later(format!(
                 "cl-chain changed its custody group count from {} to {groups}: our MetaData and \
                  record carry {}; restart cl-chain, cl-discv5 and cl-p2p on one cgc",
                 self.groups, self.groups

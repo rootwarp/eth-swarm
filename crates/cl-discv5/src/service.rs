@@ -230,7 +230,8 @@ pub fn fork_predicate(filter: PeerFilter) -> Box<dyn Fn(&Enr) -> bool + Send> {
 }
 
 /// How long the table keeps the records of our digest before a change, by default
-/// ([`Discovery::with_fork_grace`]): a mainnet epoch. The process sets one epoch of its network.
+/// ([`Discovery::with_fork_grace`]): a mainnet epoch. The process sets two epochs of its network
+/// (`crate::process::fork_grace`).
 pub const FORK_GRACE: Duration = Duration::from_secs(384);
 
 /// How often [`Discovery`] sweeps its routing table by default: the longest a record that
@@ -336,14 +337,19 @@ impl TableGuard {
     fn filter(&self, discv5: &Discv5) -> PeerFilter {
         let fork_digest = match fork_id(&discv5.local_enr()) {
             Ok(id) => {
+                // The swap and the record of the old digest are one step, under the lock of
+                // `previous`: a filter that runs at the same time sees both or neither, and two
+                // that see the change one after the other cannot record a digest out of turn.
+                let mut previous = self.previous();
                 let before = self
                     .fork_digest
                     .swap(u32::from_be_bytes(id.fork_digest), Ordering::Relaxed)
                     .to_be_bytes();
                 if before != id.fork_digest {
                     // Our digest changed: the old one is kept for the grace.
-                    *self.previous() = Some((before, std::time::Instant::now() + self.grace));
+                    *previous = Some((before, std::time::Instant::now() + self.grace));
                 }
+                drop(previous);
                 id.fork_digest
             }
             Err(error) => {

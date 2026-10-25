@@ -5,7 +5,8 @@
 //!   `/etc/ethswarm/cl-chain.toml` is refused (exit 2).
 //! - `cl-chain-test` (the same code, its config from `$CL_CHAIN_TEST_CONFIG`, owned by the
 //!   test user): it serves chain.v1 on its socket behind its ACL, keeps a `WatchSubscriptions`
-//!   stream open, and on SIGTERM ends that stream, drains, removes its socket and exits 0. A
+//!   and a `Validate` stream open (a column batch answered IGNORE through its fences), and on
+//!   SIGTERM ends those streams, drains, removes its socket and exits 0. A
 //!   second start on the same state directory opens the store again, with the same custody.
 //!
 //! The child gets a cl-verify socket (a tonic server of this test, as its own user) and a
@@ -234,8 +235,68 @@ async fn connect(socket: &Path, child: &Owned) -> tonic::transport::Channel {
     }
 }
 
-/// One run: serves, holds a `WatchSubscriptions` stream open, then stops on SIGTERM with exit
-/// 0 and no socket left. Returns the custody columns it named.
+/// Opens a `Validate` stream on `channel`, sends one column sidecar on a topic of another
+/// fork digest (dropped undecoded), and checks the IGNORE verdict through its fence. Returns
+/// the open stream.
+async fn validate_one(
+    channel: tonic::transport::Channel,
+    hello: ethswarm_proto::common::Hello,
+) -> (
+    tokio::sync::mpsc::Sender<pb::ValidateRequest>,
+    tonic::Streaming<pb::ValidateResponse>,
+) {
+    use ethswarm_proto::common::{Envelope, PayloadType, Verdict};
+    use ipc::fence::{FencedRequest, Outstanding};
+    use ipc::frame::OutFrame;
+    use ipc::hello::Generation;
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tx.send(pb::ValidateRequest::hello(hello)).await.unwrap();
+    let mut responses = GossipServiceClient::new(channel)
+        .validate(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+    let server = match responses.message().await.unwrap().and_then(|m| m.frame) {
+        Some(pb::validate_response::Frame::Hello(h)) => h,
+        other => panic!("a hello, got {other:?}"),
+    };
+    let mut out = Outstanding::new(Generation::from_hello(&server).unwrap(), 2);
+    let (_, batch) = out
+        .issue(|tag| {
+            let batch = pb::ValidateBatch {
+                messages: vec![pb::GossipMessage {
+                    message_id: vec![7; 20],
+                    topic: pb::Topic::DataColumnSidecar as i32,
+                    subnet_id: 3,
+                    payload: Some(Envelope {
+                        fork_digest: vec![0xde, 0xad, 0xbe, 0xef],
+                        slot: 1,
+                        ssz: vec![1, 2, 3],
+                        payload_type: PayloadType::DataColumnSidecar as i32,
+                        seq: 1,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                request_id: tag.request_id,
+                generation: tag.generation.get(),
+            };
+            let hashes = batch.item_hashes();
+            (batch, hashes)
+        })
+        .unwrap();
+    tx.send(pb::ValidateRequest::body(batch)).await.unwrap();
+    let verdicts = match responses.message().await.unwrap().and_then(|m| m.frame) {
+        Some(pb::validate_response::Frame::Verdicts(v)) => v,
+        other => panic!("verdicts, got {other:?}"),
+    };
+    assert_eq!(out.settle_body(&verdicts), Ok(1));
+    assert_eq!(verdicts.verdicts[0].verdict, Verdict::Ignore as i32);
+    (tx, responses)
+}
+
+/// One run: serves, holds a `WatchSubscriptions` and a `Validate` stream open, then stops on
+/// SIGTERM with exit 0 and no socket left. Returns the custody columns it named.
 async fn one_run(host: &Host) -> Vec<u64> {
     let mut child = host.start();
     let channel = connect(&host.socket, &child).await;
@@ -249,6 +310,7 @@ async fn one_run(host: &Host) -> Vec<u64> {
         .await
         .unwrap_err();
     assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    let (_validate_tx, mut validating) = validate_one(channel.clone(), hello.clone()).await;
     let mut stream = GossipServiceClient::new(channel)
         .watch_subscriptions(pb::WatchSubscriptionsRequest { hello: Some(hello) })
         .await
@@ -261,8 +323,10 @@ async fn one_run(host: &Host) -> Vec<u64> {
     };
     assert_eq!(columns.len(), 4);
     child.terminate();
-    // The open stream ends first, so it cannot hold the drain.
+    // The open streams end first, so they cannot hold the drain.
     let end = stream.message().await.unwrap_err();
+    assert_eq!(end.code(), tonic::Code::Unavailable, "{end:?}");
+    let end = validating.message().await.unwrap_err();
     assert_eq!(end.code(), tonic::Code::Unavailable, "{end:?}");
     let code = tokio::task::spawn_blocking(move || {
         let code = child.wait();

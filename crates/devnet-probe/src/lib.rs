@@ -34,6 +34,7 @@
 //! (cl-chain's tests use testkit; `scripts/check-dep-cycles.sh`), so the checks that need all
 //! three live in a crate of their own that nothing depends on.
 
+pub mod answers;
 pub mod api;
 pub mod connect;
 pub mod devnet;

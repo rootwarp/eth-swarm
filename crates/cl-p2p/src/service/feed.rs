@@ -7,7 +7,9 @@
 //! never a wait. A burst that does not fit in [`FEED_CAPACITY`] is dropped and counted on
 //! `p2p_ledger_feed_dropped_total`, except a disconnect: the ledger keeps a peer as Status-valid
 //! until its disconnect, so a lost one would count the peer in every later hour. A disconnect
-//! that does not fit is held, in order, and nothing goes ahead of it.
+//! that does not fit is held, in order, and nothing goes ahead of it. At most [`MAX_HELD`]
+//! disconnects are held: past them a disconnect is dropped and counted too, and only the first
+//! drop of a stall is logged, until the held ones drain.
 //!
 //! The ledger's own monotonic clock is tokio's ([`tokio::time::Instant`]), so a paused test
 //! clock drives both the ticks and the ledger's check for unobserved gaps.
@@ -59,6 +61,11 @@ pub struct FeedSender {
     /// Disconnects that did not fit, oldest first, each peer once.
     held: VecDeque<PeerId>,
     dropped: Counter,
+    /// Whether the warning of the current stall went out: only its first dropped disconnect is
+    /// logged, until the held disconnects drain.
+    stall_logged: bool,
+    /// Stall warnings logged so far.
+    stall_warnings: u64,
 }
 
 impl FeedSender {
@@ -74,6 +81,8 @@ impl FeedSender {
             tx,
             held: VecDeque::new(),
             dropped,
+            stall_logged: false,
+            stall_warnings: 0,
         }
     }
 
@@ -109,7 +118,16 @@ impl FeedSender {
             self.held.push_back(peer);
         } else {
             self.dropped.inc();
-            tracing::warn!("the Goodbye ledger's feed is stalled: a disconnect dropped");
+            // One line per stall: a stalled feed would log every disconnect.
+            if !self.stall_logged {
+                self.stall_logged = true;
+                self.stall_warnings += 1;
+                tracing::warn!(
+                    held = MAX_HELD,
+                    "the Goodbye ledger's feed is stalled: disconnects past the held ones are \
+                     dropped and counted (p2p_ledger_feed_dropped_total) until it drains"
+                );
+            }
         }
     }
 
@@ -125,6 +143,7 @@ impl FeedSender {
                 Err(TrySendError::Full(_)) => return false,
             }
         }
+        self.stall_logged = false;
         true
     }
 
@@ -394,6 +413,30 @@ mod tests {
         }
         assert_eq!(sender.held.len(), MAX_HELD);
         assert_eq!(dropped(&registry), "p2p_ledger_feed_dropped_total 1");
+    }
+
+    /// A stalled feed logs its first dropped disconnect only, and logs again only after it
+    /// drained and stalled anew; every drop is counted.
+    #[tokio::test]
+    async fn a_stall_is_logged_once() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut registry = Registry::default();
+        let mut sender = FeedSender::new(tx, &mut registry);
+        sender.identified(peer(), String::new());
+        for _ in 0..MAX_HELD + 3 {
+            sender.disconnected(peer());
+        }
+        assert_eq!(dropped(&registry), "p2p_ledger_feed_dropped_total 3");
+        assert_eq!(sender.stall_warnings, 1);
+        // Drained: every held disconnect goes, then a new stall logs again.
+        while !sender.flush() {
+            rx.recv().await.unwrap();
+        }
+        rx.recv().await.unwrap();
+        for _ in 0..=MAX_HELD + 1 {
+            sender.disconnected(peer());
+        }
+        assert_eq!(sender.stall_warnings, 2);
     }
 
     /// The feed ends when the stop turns true, with the events already queued counted, and when

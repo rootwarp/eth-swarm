@@ -15,11 +15,12 @@
 //! [callers]
 //! cl-p2p = 991                            # UID of ethswarm-p2p
 //!
-//! [methods]                               # exactly these four, to cl-p2p only
+//! [methods]                               # exactly these five, to cl-p2p only
 //! "/ethswarm.chain.v1.ReqRespService/GetStatus" = ["cl-p2p"]
 //! "/ethswarm.chain.v1.ReqRespService/DataColumnsByRange" = ["cl-p2p"]
 //! "/ethswarm.chain.v1.ReqRespService/DataColumnsByRoot" = ["cl-p2p"]
 //! "/ethswarm.chain.v1.GossipService/WatchSubscriptions" = ["cl-p2p"]
+//! "/ethswarm.chain.v1.GossipService/Validate" = ["cl-p2p"]
 //!
 //! [chain]
 //! reference_api_url = "http://127.0.0.1:5052"   # the reference node's beacon API
@@ -153,14 +154,14 @@ pub enum SettingsError {
     /// The network gives no network hello.
     #[error("the network: {0}")]
     Network(String),
-    /// The ACL is not exactly cl-p2p on the four methods.
+    /// The ACL is not exactly cl-p2p on the five methods.
     #[error(
         "the method ACL must give exactly {methods:?} to [callers] {P2P_CALLER} and to nobody \
          else: {why}"
     )]
     Acl {
         /// The methods.
-        methods: [&'static str; 4],
+        methods: [&'static str; 5],
         /// What is wrong.
         why: String,
     },
@@ -662,16 +663,16 @@ mod tests {
         );
     }
 
-    /// The ACL is exactly cl-p2p on the four methods: one fewer, one more, or another caller is
-    /// refused.
+    /// The ACL is exactly cl-p2p on the five methods: one fewer (the four before `Validate`),
+    /// one more, or another caller is refused.
     #[test]
-    fn the_acl_is_cl_p2p_on_four_methods_only() {
-        let three = &CHAIN_METHODS[..3];
-        let err = parse(&text(three, &chain_table(""))).unwrap_err();
+    fn the_acl_is_cl_p2p_on_five_methods_only() {
+        let four = &CHAIN_METHODS[..4];
+        let err = parse(&text(four, &chain_table(""))).unwrap_err();
         assert!(matches!(err, SettingsError::Acl { .. }), "{err}");
-        let mut five = CHAIN_METHODS.to_vec();
-        five.push("/ethswarm.chain.v1.ReqRespService/GetMetadata");
-        let err = parse(&text(&five, &chain_table(""))).unwrap_err();
+        let mut six = CHAIN_METHODS.to_vec();
+        six.push("/ethswarm.chain.v1.ReqRespService/GetMetadata");
+        let err = parse(&text(&six, &chain_table(""))).unwrap_err();
         assert!(matches!(err, SettingsError::Acl { .. }), "{err}");
         let api = text(&CHAIN_METHODS, &chain_table("")).replace(
             "GetStatus\" = [\"cl-p2p\"]",

@@ -8,7 +8,7 @@ use crate::checkpoint::testkit::{Reply, Server};
 use bytes::Bytes;
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
 use consensus_types::primitives::Root;
-use consensus_types::Mainnet;
+use consensus_types::{EthSpec, Mainnet, Minimal};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use ssz::Encode;
@@ -49,7 +49,7 @@ fn anchor0() -> Anchor0 {
     }
 }
 
-fn header_json(block: &SignedBeaconBlock<Mainnet>, root: Root, canonical: bool) -> Value {
+fn header_json<E: EthSpec>(block: &SignedBeaconBlock<E>, root: Root, canonical: bool) -> Value {
     let m = &block.message;
     serde_json::json!({
         "execution_optimistic": false,
@@ -1210,6 +1210,11 @@ impl CheckNet {
 /// Runs the CLI's check on `urls` with a fresh scratch parent; returns the exit code and what
 /// is left in the scratch parent.
 fn check_cli(urls: &str) -> (u8, Vec<String>) {
+    check_cli_with(urls, &[])
+}
+
+/// [`check_cli`] with the arguments `extra` too.
+fn check_cli_with(urls: &str, extra: &[&str]) -> (u8, Vec<String>) {
     let scratch = tempfile::tempdir().unwrap();
     let args: Vec<String> = [
         "--providers",
@@ -1221,6 +1226,7 @@ fn check_cli(urls: &str) -> (u8, Vec<String>) {
         "--quiet",
     ]
     .iter()
+    .chain(extra)
     .map(|a| (*a).to_owned())
     .collect();
     let code = crate::checkpoint::cli::main_with(&args, &apart());
@@ -1269,6 +1275,40 @@ fn mismatch_exit_code() {
         net.net.b.paths().contains(&state_path),
         "the state was fetched"
     );
+}
+
+/// A node finalized at `epoch` on a minimal-preset anchor, as the Kurtosis devnet serves one.
+fn honest_minimal(epoch: u64) -> Node {
+    let (block, state) = anchor::<Minimal>(SLOT);
+    let root = block.message.tree_hash_root();
+    Node {
+        finalized_epoch: epoch,
+        finalized_root: root,
+        headers: vec![(root, header_json(&block, root, true))],
+        block: Some((root, Bytes::from(block.as_ssz_bytes()))),
+        state: Some((
+            state.tree_hash_root(),
+            Reply::Ssz {
+                body: Bytes::from(state.as_ssz_bytes()),
+                version: Some("gloas"),
+            },
+        )),
+    }
+}
+
+/// A minimal-preset anchor (the devnet's) passes only with `--preset minimal`: by the mainnet
+/// preset its block does not decode, and the check fails.
+#[test]
+fn a_minimal_anchor_needs_the_minimal_preset() {
+    // Slot 100 is in minimal epoch 12: finalized at 13, the anchor is its epoch's last block.
+    let net = CheckNet::start(honest_minimal(13), honest_minimal(13));
+    let urls = net.net.provider_urls();
+    let (code, left) = check_cli_with(&urls, &["--preset", "minimal"]);
+    assert_eq!(code, 0);
+    assert!(left.is_empty(), "left in the scratch dir: {left:?}");
+    let (code, left) = check_cli(&urls);
+    assert_ne!(code, 0, "a minimal block by the mainnet preset");
+    assert!(left.is_empty(), "left in the scratch dir: {left:?}");
 }
 
 #[test]

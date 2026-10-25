@@ -302,6 +302,27 @@ fn fstat(fd: impl AsFd, path: &Path) -> Result<Meta, BindError> {
         .map_err(io_err("stat", path))
 }
 
+/// The owner change of a new inode, made only where its owner `m` is not `owner`: a new inode of
+/// a unit's process carries its `User=` and `Group=` already, and the units' seccomp filter
+/// (`SystemCallFilter=~@privileged`, which holds `@chown`) kills a process that calls `fchown`
+/// or `fchownat`. The caller checks the result afterwards either way. Returns `None` when nothing
+/// needs a change; else the uid to set (`None`: keep it) and the gid.
+fn owner_change(m: &Meta, owner: Ownership) -> Option<(Option<Uid>, Gid)> {
+    if m.uid == owner.uid && m.gid == owner.gid {
+        return None;
+    }
+    #[cfg(test)]
+    CHOWNS.with(|c| c.set(c.get() + 1));
+    let uid = (m.uid != owner.uid).then(|| Uid::from_raw(owner.uid));
+    Some((uid, Gid::from_raw(owner.gid)))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The owner changes this thread asked for.
+    static CHOWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// `lstat` of `name` in `dir`; `None` if nothing is there.
 fn lstat_at(dir: impl AsFd, name: &str, path: &Path) -> Result<Option<Meta>, BindError> {
     match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
@@ -509,10 +530,11 @@ fn open_service_dir(
     };
     let fd = open_dir(root, Path::new(dir.service()), &path)?;
     if created {
-        // Set explicitly: neither the umask nor a setgid parent decides the owner or mode.
-        let uid = (owner.uid != peercred::effective_uid()).then(|| Uid::from_raw(owner.uid));
-        rustix::fs::fchown(&fd, uid, Some(Gid::from_raw(owner.gid)))
-            .map_err(io_err("chown", &path))?;
+        // Set explicitly: neither the umask nor a setgid parent decides the owner or mode. The
+        // owner changes only where it differs (`owner_change`), and is checked below.
+        if let Some((uid, gid)) = owner_change(&fstat(&fd, &path)?, owner) {
+            rustix::fs::fchown(&fd, uid, Some(gid)).map_err(io_err("chown", &path))?;
+        }
         rustix::fs::fchmod(&fd, mode(DIR_MODE)).map_err(io_err("chmod", &path))?;
     }
     let m = fstat(&fd, &path)?;
@@ -700,9 +722,9 @@ fn create_lock(
     };
     let m = fstat(&fd, &tmp.path)?;
     // Set explicitly on the inode just created: neither the umask nor a setgid directory decides
-    // its owner or mode.
-    let uid = (m.uid != owner.uid).then(|| Uid::from_raw(owner.uid));
-    rustix::fs::fchown(&fd, uid, Some(Gid::from_raw(owner.gid)))
+    // its owner or mode. The owner changes only where it differs (`owner_change`).
+    owner_change(&m, owner)
+        .map_or(Ok(()), |(uid, gid)| rustix::fs::fchown(&fd, uid, Some(gid)))
         .and_then(|()| rustix::fs::fchmod(&fd, mode(LOCK_MODE)))
         .map_err(|e| BindError::Insecure {
             path: path.clone(),
@@ -961,15 +983,18 @@ fn same_dir(path: &Path, dir_fd: &OwnedFd) -> Result<(), BindError> {
 
 fn set_socket_owner_and_mode(guard: &SocketGuard, owner: Ownership) -> Result<(), BindError> {
     let path = &guard.path;
-    let uid = (owner.uid != peercred::effective_uid()).then(|| Uid::from_raw(owner.uid));
-    rustix::fs::chownat(
-        &guard.dir_fd,
-        guard.name.as_str(),
-        uid,
-        Some(Gid::from_raw(owner.gid)),
-        AtFlags::SYMLINK_NOFOLLOW,
-    )
-    .map_err(io_err("chown", path))?;
+    // The owner changes only where it differs (`owner_change`), and is checked below.
+    let bound = lstat_at(&guard.dir_fd, &guard.name, path)?;
+    if let Some((uid, gid)) = bound.as_ref().and_then(|m| owner_change(m, owner)) {
+        rustix::fs::chownat(
+            &guard.dir_fd,
+            guard.name.as_str(),
+            uid,
+            Some(gid),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(io_err("chown", path))?;
+    }
     // Linux has no fchmodat(AT_SYMLINK_NOFOLLOW) before 6.6; the directory is writable only by
     // the service user, so the name cannot have been replaced by a symlink since the bind.
     rustix::fs::chmodat(
@@ -1172,6 +1197,7 @@ pub fn peer_refusal<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn socket_dir_names_the_paths() {
@@ -1297,6 +1323,44 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// A bind as our own user and group changes no owner: the new directory, lock and socket
+    /// carry both already, as a unit's do under its `User=` and `Group=`. The units' seccomp
+    /// filter (`SystemCallFilter=~@privileged`, which holds `@chown`) kills a process that
+    /// calls `fchown`. Another group of ours is set, and checked, as before.
+    #[test]
+    fn a_bind_as_our_own_user_and_group_changes_no_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let me = Ownership::current();
+        let dir = SocketDir::under(&root, "svc").unwrap();
+        CHOWNS.with(|c| c.set(0));
+        let bound = bind(&dir, me).unwrap();
+        assert_eq!(
+            CHOWNS.with(Cell::get),
+            0,
+            "a chown for ids that already match"
+        );
+        drop(bound);
+        // A group of ours that is not our effective one needs the chown.
+        let other = rustix::process::getgroups()
+            .unwrap_or_default()
+            .into_iter()
+            .map(rustix::process::Gid::as_raw)
+            .find(|g| *g != me.gid);
+        if let Some(gid) = other {
+            let dir = SocketDir::under(&root, "other").unwrap();
+            let owner = Ownership { uid: me.uid, gid };
+            CHOWNS.with(|c| c.set(0));
+            let bound = bind(&dir, owner).unwrap();
+            assert!(
+                CHOWNS.with(Cell::get) > 0,
+                "the group of a new file is not set"
+            );
+            assert_eq!(std::fs::metadata(dir.socket_path()).unwrap().gid(), gid);
+            drop(bound);
+        }
     }
 
     /// A start that fails after creating its lock but before publishing it leaves nothing under

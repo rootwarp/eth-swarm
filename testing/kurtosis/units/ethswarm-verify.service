@@ -1,0 +1,51 @@
+# ETH Swarm devnet only: cl-verify for the probe units of testing/kurtosis/run-units.sh.
+# Not a probe unit: ops/probe has no cl-verify unit, and ops/probe/tests does not lint this
+# file. It runs cl-verify as the ethswarm-verify user and group, which the install's
+# `usermod -a -G ethswarm-verify ethswarm-chain` line names. cl-chain connects to its socket
+# and refuses a server of another UID (cl-chain.toml verify_uid).
+[Unit]
+Description=ETH Swarm devnet: cl-verify for the probe units (devnet only)
+Before=ethswarm-chain.service
+
+[Service]
+Type=simple
+User=ethswarm-verify
+Group=ethswarm-verify
+# The socket is srwxrwx---: cl-chain reaches it as a member of the group ethswarm-verify.
+UMask=0007
+# CHAIN_UID=<the UID of ethswarm-chain>, the only caller cl-verify serves (written by
+# run-units.sh, root 0600).
+EnvironmentFile=/etc/ethswarm/cl-verify.env
+ExecStart=/usr/local/bin/cl-verify --trusted-setup /usr/local/share/ethswarm/trusted_setup_4096.json --socket /run/ethswarm/cl-verify/cl-verify.sock --peer-uid ${CHAIN_UID} --pubkey-snapshot /var/lib/ethswarm-verify/pubkeys.bin --network-dir /etc/ethswarm/network
+StateDirectory=ethswarm-verify
+StateDirectoryMode=0700
+# cl-chain checks this directory: owned by cl-verify's user, writable only by it.
+RuntimeDirectory=ethswarm/cl-verify
+RuntimeDirectoryMode=0750
+ReadWritePaths=/var/lib/ethswarm-verify
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target

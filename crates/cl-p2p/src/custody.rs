@@ -36,6 +36,9 @@ pub enum CustodyError {
     /// A column listed twice.
     #[error("custody column {0} is listed twice")]
     DuplicateColumn(u64),
+    /// No fork digest: nothing to join the subnets under.
+    #[error("no fork digest")]
+    NoForkDigest,
     /// More fork digests than [`MAX_FORK_DIGESTS`].
     #[error("{0} fork digests, more than {MAX_FORK_DIGESTS}")]
     TooManyForkDigests(usize),
@@ -63,6 +66,9 @@ impl CustodySubscriptions {
     pub fn from_chain(body: &pb::WatchSubscriptionsResponseBody) -> Result<Self, CustodyError> {
         if body.custody_columns.len() > NUMBER_OF_COLUMNS as usize {
             return Err(CustodyError::TooManyColumns(body.custody_columns.len()));
+        }
+        if body.fork_digests.is_empty() {
+            return Err(CustodyError::NoForkDigest);
         }
         if body.fork_digests.len() > MAX_FORK_DIGESTS {
             return Err(CustodyError::TooManyForkDigests(body.fork_digests.len()));
@@ -278,8 +284,8 @@ mod tests {
         assert_eq!(subs.columns().collect::<Vec<_>>(), vec![0, 3]);
         assert_eq!(subs.subnets(), BTreeSet::from([0, 3]));
         assert_eq!(subs.topics().len(), 4);
-        let empty = CustodySubscriptions::from_chain(&body(vec![], vec![])).unwrap();
-        assert!(empty.topics().is_empty());
+        let no_columns = CustodySubscriptions::from_chain(&body(vec![], vec![vec![1; 4]])).unwrap();
+        assert!(no_columns.topics().is_empty());
         // The current digest and two changes within cl-chain's lead: three digests.
         let three = CustodySubscriptions::from_chain(&body(
             vec![3],
@@ -315,6 +321,7 @@ mod tests {
                 body(vec![1], vec![vec![1; 4], vec![1; 4]]),
                 CustodyError::DuplicateForkDigest,
             ),
+            (body(vec![1], Vec::new()), CustodyError::NoForkDigest),
         ] {
             assert_eq!(CustodySubscriptions::from_chain(&b), Err(want));
         }

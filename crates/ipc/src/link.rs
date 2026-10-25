@@ -568,6 +568,7 @@ mod tests {
             Ok(ValidateRequest::hello(peer())),
             Ok(ValidateRequest::body(ValidateBatch {
                 messages: vec![msg(Some(block(1))), msg(None)],
+                ..Default::default()
             })),
         ];
         let mut g = l

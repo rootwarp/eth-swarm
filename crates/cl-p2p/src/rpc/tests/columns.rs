@@ -194,6 +194,11 @@ async fn columns_are_served_by_range_and_root_with_the_digest_of_their_slot() {
     );
     assert_eq!(sidecars(raw.outcome(id).await.unwrap()), wire(&stored));
     assert_eq!(*source.asked.lock().unwrap(), ["range 9 2", "root 2"]);
+    // Each answer's sidecars are counted by protocol as it goes to its stream.
+    let answered = |p| ours.metrics.column_sidecars_answered_count(p);
+    let n = stored.len() as u64;
+    assert_eq!(answered(Protocol::DataColumnsByRangeV1), n);
+    assert_eq!(answered(Protocol::DataColumnsByRootV1), n);
 
     // A request that names no sidecar is an empty answer, without a lookup.
     let id = raw.send(ours.peer, by_range(9, 0, &CUSTODY));

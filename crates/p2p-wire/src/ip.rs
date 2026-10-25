@@ -19,7 +19,8 @@ pub enum NetworkMode {
 }
 
 /// The per-address rule of `mode`: every address a record advertises must pass it, and so must
-/// the source of a discv5 session and every address cl-p2p dials.
+/// the source of a discv5 session and every address cl-p2p dials. No mode passes a cloud
+/// metadata service ([`is_cloud_metadata`]).
 #[must_use]
 pub fn ip_rule(mode: NetworkMode) -> fn(IpAddr) -> bool {
     match mode {
@@ -29,7 +30,23 @@ pub fn ip_rule(mode: NetworkMode) -> fn(IpAddr) -> bool {
     }
 }
 
+/// The address of a cloud instance metadata service: 169.254.169.254 (AWS, GCP, Azure and most
+/// others), also IPv4-mapped, and AWS's IPv6 endpoint fd00:ec2::254. No mode contacts one, so a
+/// record cannot make a node on a cloud host send to the service that holds its credentials.
+#[must_use]
+pub fn is_cloud_metadata(ip: IpAddr) -> bool {
+    const V4: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
+    const V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254);
+    match ip {
+        IpAddr::V4(v4) => v4 == V4,
+        IpAddr::V6(v6) => v6 == V6 || v6.to_ipv4_mapped() == Some(V4),
+    }
+}
+
 fn public_ip(ip: IpAddr) -> bool {
+    if is_cloud_metadata(ip) {
+        return false;
+    }
     match ip {
         IpAddr::V4(v4) => is_global_v4(v4),
         IpAddr::V6(v6) => is_global_v6(v6),
@@ -38,9 +55,13 @@ fn public_ip(ip: IpAddr) -> bool {
 
 /// A local address: IPv4 loopback (127/8), private (10/8, 172.16/12, 192.168/16), link-local
 /// (169.254/16) or shared CGNAT space (100.64/10); IPv6 loopback, unique-local (fc00::/7) or
-/// link-local (fe80::/10). An IPv4-mapped address is judged as its IPv4 address.
+/// link-local (fe80::/10). An IPv4-mapped address is judged as its IPv4 address. A cloud
+/// metadata service ([`is_cloud_metadata`]) is not one.
 #[must_use]
 pub fn is_local_ip(ip: IpAddr) -> bool {
+    if is_cloud_metadata(ip) {
+        return false;
+    }
     match ip {
         IpAddr::V4(v4) => {
             let [a, b, ..] = v4.octets();
@@ -58,6 +79,9 @@ pub fn is_local_ip(ip: IpAddr) -> bool {
 }
 
 fn devnet_ip(ip: IpAddr) -> bool {
+    if is_cloud_metadata(ip) {
+        return false;
+    }
     match ip {
         IpAddr::V4(v4) => is_contactable_v4(v4),
         IpAddr::V6(v6) => is_contactable_v6(v6),
@@ -131,6 +155,26 @@ mod tests {
 
     /// Each mode's rule on one address of each kind. cl-discv5's routing-table tests hold every
     /// range boundary through the same rules.
+    /// The cloud metadata services are contacted in no mode, also as IPv4-mapped addresses; the
+    /// rest of link-local and unique-local space keeps the rule of its mode.
+    #[test]
+    fn no_mode_contacts_a_cloud_metadata_service() {
+        for text in ["169.254.169.254", "::ffff:169.254.169.254", "fd00:ec2::254"] {
+            let ip: IpAddr = text.parse().unwrap();
+            assert!(is_cloud_metadata(ip), "{text}");
+            assert!(!is_local_ip(ip), "{text}: local");
+            for mode in [NetworkMode::Public, NetworkMode::Devnet, NetworkMode::Local] {
+                assert!(!ip_rule(mode)(ip), "{text} in {mode:?}");
+            }
+        }
+        for text in ["169.254.169.253", "fd00:ec2::253"] {
+            let ip: IpAddr = text.parse().unwrap();
+            assert!(!is_cloud_metadata(ip), "{text}");
+            assert!(ip_rule(NetworkMode::Local)(ip), "{text} stays local");
+            assert!(ip_rule(NetworkMode::Devnet)(ip), "{text} stays contactable");
+        }
+    }
+
     #[test]
     fn each_mode_has_its_rule() {
         let cases: [(&str, bool, bool, bool); 12] = [

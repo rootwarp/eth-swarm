@@ -22,6 +22,9 @@
 //!   the end of the write) and the SSZ bytes they hold ([`crate::rpc::limits::ColumnPlaces`]).
 //! - `rpc_column_unrequested_total`: sidecars a column source handed over that the request did
 //!   not name (or named once and got twice), dropped, never sent.
+//! - `rpc_column_sidecars_answered_total{protocol}`: column sidecars of our answers to peers'
+//!   `DataColumnSidecarsByRange` and `DataColumnSidecarsByRoot` requests, counted as each answer
+//!   goes to its stream.
 //! - `queue_dropped_total{queue}`: items a bounded queue IGNOREd ([`QueueMetrics`]), shared with
 //!   the other queues of the service through [`RpcMetrics::queues`].
 //!
@@ -189,6 +192,7 @@ pub struct RpcMetrics {
     column_answers: Gauge,
     column_answer_bytes: Gauge,
     column_unrequested: Counter,
+    column_sidecars_answered: Family<ProtocolLabel, Counter>,
     queues: QueueMetrics,
 }
 
@@ -208,8 +212,19 @@ impl RpcMetrics {
             column_answers: Gauge::default(),
             column_answer_bytes: Gauge::default(),
             column_unrequested: Counter::default(),
+            column_sidecars_answered: Family::default(),
             queues: QueueMetrics::register(registry),
         };
+        for protocol in [
+            Protocol::DataColumnsByRangeV1,
+            Protocol::DataColumnsByRootV1,
+        ] {
+            drop(
+                metrics
+                    .column_sidecars_answered
+                    .get_or_create(&ProtocolLabel::of(protocol)),
+            );
+        }
         for protocol in Protocol::ALL {
             let label = ProtocolLabel::of(protocol);
             drop(metrics.outbound_inflight.get_or_create(&label));
@@ -294,6 +309,11 @@ impl RpcMetrics {
             metrics.column_answer_bytes.clone(),
         );
         registry.register(
+            "rpc_column_sidecars_answered",
+            "Column sidecars of our answers to peers' column requests, by protocol",
+            metrics.column_sidecars_answered.clone(),
+        );
+        registry.register(
             "rpc_column_unrequested",
             "Column sidecars a source handed over that the request did not name, dropped",
             metrics.column_unrequested.clone(),
@@ -324,6 +344,21 @@ impl RpcMetrics {
     #[must_use]
     pub fn column_answer_bytes_held(&self) -> u64 {
         u64::try_from(self.column_answer_bytes.get()).unwrap_or(0)
+    }
+
+    /// Counts `n` column sidecars of an answer to a `protocol` request.
+    pub(crate) fn column_sidecars_answered(&self, protocol: Protocol, n: usize) {
+        self.column_sidecars_answered
+            .get_or_create(&ProtocolLabel::of(protocol))
+            .inc_by(u64::try_from(n).unwrap_or(u64::MAX));
+    }
+
+    /// The current `rpc_column_sidecars_answered_total{protocol}`.
+    #[must_use]
+    pub fn column_sidecars_answered_count(&self, protocol: Protocol) -> u64 {
+        self.column_sidecars_answered
+            .get_or_create(&ProtocolLabel::of(protocol))
+            .get()
     }
 
     /// The current `rpc_column_unrequested_total`.

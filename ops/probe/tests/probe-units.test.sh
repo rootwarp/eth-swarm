@@ -177,6 +177,25 @@ d=$(variant deny-list)
 edit "$d" ethswarm-discv5.service '{ sub(/^RestrictAddressFamilies=.*/, "RestrictAddressFamilies=~AF_PACKET") } { print }'
 expect 1 "a deny-list RestrictAddressFamilies= fails" "ethswarm-discv5.service: RestrictAddressFamilies" "$d"
 
+# cl-p2p alone needs AF_NETLINK: libp2p-tcp's wildcard listen watches the interfaces (if-watch)
+# through a netlink route socket. Exactly that list for cl-p2p, and no netlink for the others.
+if grep -qx -- "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK" "$probe/ethswarm-p2p.service"; then
+  ok "cl-p2p's unit allows AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+else
+  bad "cl-p2p's unit allows AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+fi
+for unit in ethswarm-discv5 ethswarm-chain; do
+  d=$(variant "netlink-$unit")
+  edit "$d" "$unit.service" '{ sub(/^RestrictAddressFamilies=.*/, "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK") } { print }'
+  expect 1 "AF_NETLINK in $unit fails" "$unit.service: RestrictAddressFamilies" "$d"
+done
+d=$(variant p2p-no-netlink)
+edit "$d" ethswarm-p2p.service '{ sub(/^RestrictAddressFamilies=.*/, "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6") } { print }'
+expect 1 "cl-p2p without AF_NETLINK fails (its wildcard listen needs it)" "ethswarm-p2p.service: RestrictAddressFamilies" "$d"
+d=$(variant p2p-packet)
+edit "$d" ethswarm-p2p.service '{ sub(/^RestrictAddressFamilies=.*/, "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET") } { print }'
+expect 1 "AF_PACKET in cl-p2p fails" "ethswarm-p2p.service: RestrictAddressFamilies" "$d"
+
 d=$(variant writable-root); append "$d" ethswarm-chain.service "ReadWritePaths=/"
 expect 1 "another ReadWritePaths= fails" "ethswarm-chain.service: ReadWritePaths" "$d"
 

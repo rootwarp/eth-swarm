@@ -22,8 +22,8 @@ mod tests;
 
 pub use config::{GossipConfig, TopicSet, WireTransform};
 pub use ignore_all::{
-    capture_tap, CaptureReader, CaptureTap, Captured, IgnoreAll, IgnoreAllEvent, ProbeGossipsub,
-    ValidationSink,
+    capture_tap, capture_tap_counted, CaptureReader, CaptureTap, Captured, IgnoreAll,
+    IgnoreAllEvent, ProbeGossipsub, ValidationSink,
 };
 pub use topics::{ByteBudget, TopicList, TopicListError, MAX_FORK_DIGESTS};
 

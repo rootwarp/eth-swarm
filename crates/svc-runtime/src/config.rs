@@ -131,6 +131,18 @@ pub enum ConfigError {
     LogLevel(String),
     #[error("socket: {0}")]
     Socket(#[from] BindError),
+    /// `[socket] group` is not the process's primary group.
+    #[error(
+        "[socket] group {group} is not this service's primary group {primary} (the unit's \
+         Group=): a socket of another group needs a chown, which the units' seccomp filter \
+         (SystemCallFilter=~@privileged) kills; set group to the service's own group"
+    )]
+    SocketGroup {
+        /// The group the config names.
+        group: u32,
+        /// The process's effective (primary) group.
+        primary: u32,
+    },
     #[error("method ACL: {0}")]
     Acl(#[from] Box<AclError>),
 }
@@ -206,7 +218,8 @@ impl Config {
 
     /// Loads `service`'s config from `path`, for a service that runs as effective UID `euid`,
     /// only if root (or `accepted_owner`, 0 in a deployed binary) owns the file and every
-    /// directory on its path, and `euid` can write none of them ([`crate::owned`]).
+    /// directory on its path, and `euid` can write none of them ([`crate::owned`]). Its
+    /// `[socket] group` must be this process's primary group ([`ConfigError::SocketGroup`]).
     pub fn load_root_owned(
         service: &str,
         path: &Path,
@@ -214,7 +227,16 @@ impl Config {
         accepted_owner: u32,
     ) -> Result<Self, ConfigError> {
         let text = crate::owned::read_root_owned(path, euid, accepted_owner)?;
-        Self::from_toml(service, &text, path)
+        let config = Self::from_toml(service, &text, path)?;
+        // The socket's group must need no chown ([`ConfigError::SocketGroup`]).
+        let primary = ipc::peercred::effective_gid();
+        if config.ownership.gid != primary {
+            return Err(ConfigError::SocketGroup {
+                group: config.ownership.gid,
+                primary,
+            });
+        }
+        Ok(config)
     }
 
     /// The service's own table as `T` ([`section_name`]); with no table in the file, `T` of an
@@ -579,7 +601,11 @@ mod tests {
         let me = ipc::peercred::effective_uid();
         let dir = tempfile::Builder::new().tempdir_in(config_root()).unwrap();
         let path = dir.path().join("cl-chain.toml");
-        write_read_only(&path, &chain("network = \"sepolia\"", ""));
+        let ours = format!("group = {}", ipc::peercred::effective_gid());
+        write_read_only(
+            &path,
+            &chain("network = \"sepolia\"", "").replace("group = 991", &ours),
+        );
         let sealed = Sealed::new(dir.path());
         let c = Config::load_root_owned("cl-chain", &path, me + 1, me).unwrap();
         assert_eq!(c.metrics_port, 9102);
@@ -587,6 +613,30 @@ mod tests {
         drop(sealed);
         let err = Config::load_root_owned("cl-chain", &path, me, me).unwrap_err();
         assert!(matches!(err, ConfigError::Owned(_)), "{err}");
+    }
+
+    /// A deployed service's socket group must be its primary group (the unit's `Group=`): the
+    /// socket of another group needs a chown, and the units' seccomp filter
+    /// (`SystemCallFilter=~@privileged`, which holds `@chown`) would kill the process with SIGSYS
+    /// before it could log. The load refuses such a group, so the start exits 2 with the reason.
+    #[test]
+    fn load_root_owned_refuses_a_socket_group_that_is_not_ours() {
+        use crate::owned::testkit::{config_root, write_read_only, Sealed};
+        let me = ipc::peercred::effective_uid();
+        let other = ipc::peercred::effective_gid().wrapping_add(1);
+        let dir = tempfile::Builder::new().tempdir_in(config_root()).unwrap();
+        let path = dir.path().join("cl-chain.toml");
+        write_read_only(
+            &path,
+            &chain("network = \"sepolia\"", "").replace("group = 991", &format!("group = {other}")),
+        );
+        let _sealed = Sealed::new(dir.path());
+        let err = Config::load_root_owned("cl-chain", &path, me + 1, me).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::SocketGroup { group, .. } if group == other),
+            "{err}"
+        );
+        assert!(err.to_string().contains("Group="), "{err}");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! ```text
 //! anchor-fetch [--config anchor-fetch.toml] [--out DIR] [--quiet]
 //! anchor-fetch --check (--providers A,B [--allow-insecure-http] | --config FILE)
-//!              [--scratch DIR] [--quiet]
+//!              [--preset mainnet|minimal] [--scratch DIR] [--quiet]
 //! anchor-fetch check-log RUN_LOG
 //! anchor-fetch --help
 //! ```
@@ -25,6 +25,8 @@
 //! 143/130). It exits 0 only if both providers report the same finalized checkpoint, agree on
 //! its block root and header, the block from A hashes to that root, its `state_root` is the
 //! headers', and the state from B hashes to that state root; otherwise with the codes above.
+//! It decodes by the mainnet preset, or by the minimal one with `--preset minimal` (a local
+//! devnet: the Kurtosis devnet's probe units add it in a devnet-only drop-in).
 //! The providers come from `--providers A,B` (two URLs) or from `--config`; one host, one
 //! domain or one resolved address behind both exits 2. The run log goes to stderr only
 //! (unless `--quiet`), naming both providers by origin. A probe unit runs it as

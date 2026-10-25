@@ -235,3 +235,37 @@ fn a_later_named_digest_gives_way_to_an_earlier_one() {
     assert!(later.retired.is_empty(), "named again: no grace runs");
     assert_eq!(digests.subscribed().collect::<Vec<_>>(), [a, b]);
 }
+
+/// The topics of a superseded digest stay two epochs (`altair/p2p-interface.md`, "Transitioning
+/// the gossip": pre-fork topics SHOULD be unsubscribed two epochs after the fork), on a paused
+/// clock: still there one epoch after the change, gone two epochs after it.
+#[tokio::test(start_paused = true)]
+async fn a_superseded_digest_stays_two_epochs() {
+    let grace = crate::service::digest_grace(DEVNET_SLOT_MS, 8);
+    assert_eq!(grace, EPOCH * 2);
+    let net = network();
+    let columns = custody_columns(U256::from(7u64), CUSTODY_REQUIREMENT).unwrap();
+    let subs = Subscriptions::new(&net, columns);
+    let body_at = |epoch| body_of(&subs.body_at(net.epoch_start_ms(epoch) + 1).unwrap());
+    let mut digests = DigestTopics::new(TopicList::parse(SHIPPED).unwrap(), grace, body_at(0));
+    let cfg = GossipConfig::new(digests.start_topics(), caps(), Duration::from_secs(60));
+    let mut gossip = IgnoreAll::new(&cfg, &mut Registry::default()).unwrap();
+    let d0 = net.digest_at(0).unwrap();
+    // The change at epoch 1: d0 is no longer named.
+    tokio::time::advance(EPOCH).await;
+    digests.set_body(body_at(1));
+    let at_change = digests.follow(&mut gossip, Instant::now()).unwrap();
+    assert!(!at_change.retired.contains(&d0), "{at_change:?}");
+    // The fork + 1 epoch: still subscribed.
+    tokio::time::advance(EPOCH).await;
+    digests.set_body(body_at(2));
+    let one = digests.follow(&mut gossip, Instant::now()).unwrap();
+    assert!(!one.retired.contains(&d0), "{one:?}");
+    assert!(digests.subscribed().any(|d| d == d0));
+    // The fork + 2 epochs: gone.
+    tokio::time::advance(EPOCH).await;
+    digests.set_body(body_at(3));
+    let two = digests.follow(&mut gossip, Instant::now()).unwrap();
+    assert!(two.retired.contains(&d0), "{two:?}");
+    assert!(digests.subscribed().all(|d| d != d0));
+}

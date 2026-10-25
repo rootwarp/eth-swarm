@@ -798,6 +798,142 @@ deadline at most). The stored line names how many custody columns were stored an
 reason counted (`not_custody`, `unknown_root`, ...). The reference CLs reach the probe only
 through its own dials, since it publishes no record while it serves.
 
+## Probe units under systemd
+
+`run-units.sh` runs the probe as it runs on a host: the three units of `ops/probe`, installed
+unchanged, under systemd, against the reference CLs of one enclave. It is the devnet check of
+#252 (items 2 to 4): the units run for 10 minutes (or an hour), the journals hold no node key,
+and the exit run's counters are read. Run it against an enclave that has finalized, for example
+the first enclave that `run-pair.sh --keep-on-pass` leaves up:
+
+```bash
+bash testing/kurtosis/run-pair.sh --keep-on-pass; echo "run-pair exit $?"   # 0: the pair is up
+enclave=ethswarm-gloas-a-<T>-<pid>                                         # the name it printed
+```
+
+The units' anchor check needs more than the epoch 3 at which `run-pair.sh` hands the pair over.
+anchor-fetch reads the finalized state's own finalized checkpoint
+(`/eth/v1/beacon/states/finalized/finality_checkpoints`) and refuses the genesis zero root, which
+that state keeps until the chain finalizes epoch 4. So the script waits, up to 900 s, until every
+CL's answer names a root, before the units start.
+
+The script does these steps, and stops with exit 2 at the first one that fails:
+
+1. It reads the enclave: its CL services, each CL's beacon API on the host
+   (`kurtosis port print`), each CL's peer ID, ENR and address on the enclave network
+   (`/eth/v1/node/identity`), and the network files (`kurtosis files download`). It also checks
+   that the drop-in is each unit's own `ExecStartPre=` with only the two devnet flags added.
+2. It builds `cl-chain`, `cl-p2p`, `cl-discv5`, `anchor-fetch`, `cl-verify` and `devnet-probe`
+   for Linux in `rust:1.99-bookworm` (pinned by digest in the script), with the crates in the
+   Docker volume `ethswarm-cargo`. The build container sees the repository read-only and writes
+   only `target/linux`. It runs as root, so on a Linux host `target/linux` belongs to root.
+   `--skip-build` uses the binaries there.
+3. It starts a privileged systemd container, `debian:trixie` (pinned by digest), on the
+   enclave's network `kt-<enclave>`, as `ethswarm-units-<T>-<pid>`. Only `ops/`,
+   `target/linux/release`, the trusted setup, `testing/kurtosis/units/` and the run's stage are
+   mounted, all read-only: root in a privileged container could remount a mount writable, so
+   the rest of the repository is not there. Then it runs the `ops/probe/README.md` "Install"
+   block as it is, in two parts: the `useradd` loop, then the rest. Between the two parts it
+   writes the configs, because they name the IDs of the users that the first part made.
+4. It checks that each installed unit is its `ops/probe` file byte for byte, waits until the
+   three units are active (each one runs the anchor check first), and holds them for
+   `--minutes`. Every `--sample-secs` it keeps cl-p2p's and cl-chain's `/metrics` and the units'
+   states. Then it sends its own column requests to the probe unit (`devnet-probe answers`).
+5. It stops the units, keeps their journals and judges the run (below).
+6. It removes the container and the staged node key, and prints its exit code and its run
+   directory, `target/kurtosis/units-<T>-<pid>`. The directory and every file in it are
+   readable only by you (umask 077).
+
+It never starts, cleans or removes an enclave: it calls kurtosis only for `enclave inspect`,
+`port print` and `files download`. The cargo volume stays. Every long step is a bounded
+background job in its own process group (`lib/jobs.sh`, the machinery of `run-pair.sh`, which a
+test keeps equal to `run-pair.sh`'s own copy), and the exit trap removes the container on every
+exit. `--keep` leaves the container running and prints the command that removes it. After a
+SIGKILL of the script, remove what it left by hand:
+
+```bash
+docker ps -a --filter name=ethswarm-units     # the run's containers, by their -<T>-<pid> names
+docker rm -f ethswarm-units-<T>-<pid> ethswarm-units-build-<T>-<pid>
+cat target/kurtosis/units-<T>-<pid>/job-groups   # the process groups of the jobs that ran; kill -TERM -- -<group>
+```
+
+### Devnet deviations of the units
+
+These belong to the devnet only. They are not in `ops/probe`, and a probe host never has them:
+
+| Deviation | Why |
+|---|---|
+| A drop-in for each probe unit, `units/devnet-anchor-check.conf`: `anchor-fetch ... --allow-insecure-http --preset minimal --check` | the devnet's beacon APIs are plain `http://`, and the devnet runs the minimal preset; the check itself is the same two-provider check, with the two reference CLs as the providers |
+| The same drop-in sets `LogRateLimitIntervalSec=0` | journald must keep every line of the journals that the run greps; the run also fails on a journald "Suppressed" line |
+| A cl-verify unit, `units/ethswarm-verify.service`, run as the user and group `ethswarm-verify` | `ops/probe` has no cl-verify unit; the install's `usermod -a -G ethswarm-verify ethswarm-chain` line names this group, so the script creates the user before the install |
+| `mount --make-rshared /` in the container before systemd starts | in a container `/` and `/run` are private, so the tmpfs that systemd mounts for a unit's credential at `/run/credentials/<unit>` would not reach the unit, and node-key would find no `nodekey`; with it the credential is `0400` on a read-only `noswap` tmpfs with no ACL, which node-key accepts |
+| `answer_prefix_v4 = 32`, `answer_prefix_v6 = 128` in `cl-p2p.toml` | every CL sits in the enclave's one network (see "Serving check") |
+| `mode = "devnet"` in `cl-p2p.toml` and `cl-discv5.toml` | the CLs' addresses are private addresses of the enclave network |
+| `chain_wait_ms` and `verify_wait_ms` of 600000 | the units start at the same time, and each runs its anchor check first |
+| `[callers] cl-sync = 65534` in `cl-p2p.toml` | the devnet has no cl-sync; the p2p.v1 stub's ACL needs a caller |
+
+### Item 2: a 10-minute run
+
+```bash
+bash testing/kurtosis/run-units.sh "$enclave"; echo "run-units exit $?"
+```
+
+It prints one `PASS`, `FAIL` or `DIAGNOSTIC` line per criterion and `INFO` lines, then
+`verdict: PASS` (exit 0), `verdict: FAIL (...)` (exit 1) or `verdict: DIAGNOSTIC (...)` (exit 3,
+only when `check-devnet.sh` is DIAGNOSTIC):
+
+| Criterion | What passes |
+|---|---|
+| `units` | each installed unit equals its `ops/probe` file byte for byte (`systemctl-cat-<unit>.txt` shows the drop-in apart) |
+| `start`, `hold`, `restarts`, `stop` | the three units active within 20 minutes, active at every sample, `NRestarts` 0, and each main process exits 0 on `systemctl stop` |
+| `columns` | our own `DataColumnSidecarsByRange` and `DataColumnSidecarsByRoot` requests to the probe unit's libp2p port (`devnet-probe answers` in the container, `answers.log`): every answer is what the store holds, read-only, by range from the Status's `earliest_available_slot` to 2 epochs before the clock, and a column the probe does not custody is `3: ResourceUnavailable`. The column answers to the reference CLs' own requests (`rpc_column_sidecars_answered_total`) are an `INFO` line: a CL asks only for columns that it misses |
+| `keygrep` | no journal (`journal-<unit>.export`, `journal-all.export`) holds the node key (item 3) |
+| `ratelimit` | journald suppressed no line of a probe unit (no "Suppressed ... messages from ethswarm-..." line) |
+| `topic_msg` | `topic_msg_sent_counts`, `topic_msg_sent_bytes` and `topic_msg_published` sum to 0 in the last sample: the probe sent no data message |
+| `status` | `p2p_status_valid_peers` in the last sample is at least the number of CLs: cl-p2p holds a valid Status with each one |
+| `handoff` | cl-chain answered the column hand-off (`p2p_column_handoff_total{result="answered"}`) and stored columns (`probe_column_stored_total`) |
+| `check-devnet` | `check-devnet.sh --probe-log p2p.log` passes: cl-p2p's own journal lines of this run name each CL and hold no reason-3 Goodbye (`goodbye3`), with the genesis, fork and finality checks |
+
+### Item 3: the journal grep (#40)
+
+The `keygrep` criterion greps every journal of the run for the node key's hex (lower and upper
+case) and its base64, standard and URL-safe, each with and without padding
+(`lib/nodekey.py patterns`). It names a journal that holds one, and never prints the text. To
+grep again by hand, run with `--keep`, then grep in the container, where the key is the
+credential's source file:
+
+```bash
+bash testing/kurtosis/run-units.sh --keep "$enclave"; echo "run-units exit $?"
+ctr=ethswarm-units-<T>-<pid>                    # the name it printed
+docker exec -w / "$ctr" bash -c '
+  k=/etc/ethswarm/credentials/nodekey
+  hex=$(od -An -tx1 "$k" | tr -d " \n"); b64=$(base64 -w0 "$k"); url=$(printf %s "$b64" | tr "+/" "-_")
+  printf "%s\n" "$hex" "${hex^^}" "$b64" "${b64%%=*}" "$url" "${url%%=*}" | sort -u > /run/key-patterns
+  for u in ethswarm-p2p ethswarm-discv5 ethswarm-chain; do
+    printf "%s: " "$u"; journalctl -u "$u" -o export --no-pager | grep -a -c -F -f /run/key-patterns
+  done; rm -f /run/key-patterns'
+docker rm -f "$ctr"
+```
+
+Each unit must show `0`. `grep -c` exits 1 when it counts 0, so the exit status is not the
+verdict.
+
+### Item 4: a 1-hour dry run of the exit run's counters (#38)
+
+```bash
+bash testing/kurtosis/run-units.sh --minutes 60 --sample-secs 10 "$enclave"; echo "run-units exit $?"
+run=target/kurtosis/units-<T>-<pid>             # the directory it printed
+cat "$run/counters.txt"                         # the last sample: peers, mesh degree, Status-valid peers, Goodbyes, rpc, topic_msg_*
+grep -E '^topic_msg_(sent_counts|sent_bytes|published)' "$run/counters.txt"   # every value 0
+grep -c '^# sample' "$run/metrics-p2p.txt"      # about 360 samples, 10 s apart
+```
+
+`metrics-p2p.txt` and `metrics-chain.txt` hold every sample of the hour, each after a
+`# sample <n> at <unix s>` line: the time series that #38's run report needs (peers by
+direction, `mesh_peer_counts`, `p2p_status_valid_peers`, `p2p_goodbye_sent_total` and
+`p2p_goodbye_received_total` by reason and Status validity, `rpc_outbound_inflight`,
+`rpc_timeouts_total` and `topic_msg_*`). The `topic_msg` criterion holds `topic_msg_*` at 0.
+
 ## Changing a pin
 
 1. Pick the new tag and confirm its spec version at the source commit (Lighthouse

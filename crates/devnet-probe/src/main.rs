@@ -11,6 +11,8 @@
 //!              --peer MULTIADDR... --columns-dir DIR --socket-dir DIR --verify-socket PATH
 //!              [--verify-uid UID] [--listen MULTIADDR]... [--serve-secs N]
 //!              [--answer-prefix-v4 BITS] [--answer-prefix-v6 BITS]
+//! devnet-probe answers (--network-dir DIR | --config PATH [--genesis PATH])
+//!              --probe MULTIADDR --columns-dir DIR --node-id 0x<64 hex> [--behind-slots N]
 //! devnet-probe --help
 //! ```
 //!
@@ -18,7 +20,9 @@
 //! run ends with one `verdict:` line (`devnet_probe::report`). The checks are in
 //! `devnet_probe`: `discover`, `connect`, `status` and `fetch-epoch`; `all` runs the
 //! four in that order. `serve` (`devnet_probe::serve`) runs on its own: it stores our custody
-//! columns from gossip and serves them, then checks its answers against its store. A `setup` check runs first: the config parses, and the genesis (from the
+//! columns from gossip and serves them, then checks its answers against its store. `answers`
+//! (`devnet_probe::answers`) asks a probe that runs as its units for its custody columns, as
+//! a peer would, and judges the answers against the store it serves from. A `setup` check runs first: the config parses, and the genesis (from the
 //! genesis state and every `--api`) is one, and for the checks that dial, every `--api`'s node
 //! is one of the `--peer`s.
 //!
@@ -43,7 +47,9 @@ use cl_discv5::enr::{Enr, EnrFields};
 use cl_p2p::gossip::capture_tap;
 use cl_p2p::m2a_session::PinnedPeer;
 use cl_p2p::rpc::answer_bucket::AnswerPrefixes;
+use consensus_types::primitives::U256;
 use consensus_types::{EthSpec, Mainnet, Minimal};
+use devnet_probe::answers::{self, AnswersPlan};
 use devnet_probe::api::{ProbeApi, DEFAULT_API_TIMEOUT};
 use devnet_probe::connect::{self, ConnectPlan};
 use devnet_probe::devnet::{is_devnet_ip, parse_peer, read_config, read_genesis, Devnet, Preset};
@@ -77,6 +83,9 @@ usage: devnet-probe <discover|connect|status|fetch-epoch|all>
                     --peer MULTIADDR... --columns-dir DIR --socket-dir DIR
                     --verify-socket PATH [--verify-uid UID] [--listen MULTIADDR]...
                     [--serve-secs N] [--answer-prefix-v4 BITS] [--answer-prefix-v6 BITS]
+       devnet-probe answers (--network-dir DIR | --config PATH [--genesis PATH])
+                    --probe MULTIADDR --columns-dir DIR --node-id 0x<64 hex>
+                    [--behind-slots N]
        devnet-probe --help";
 const HELP: &str = "\
 Check our probe against the reference CLs of a local devnet. Every address must be local
@@ -99,6 +108,10 @@ only.
                 them by DataColumnSidecarsByRange/ByRoot for --serve-secs, cl-p2p asking
                 cl-chain over cl-chain's socket under --socket-dir; then ask ourselves for
                 them as a peer would: every answer must be what the store holds
+  answers       ask a probe that runs as its units (--probe) for its custody columns of
+                --node-id, as a peer would, by range from its Status's earliest_available_slot
+                to --behind-slots before the clock, and by root: every answer must be what its
+                store (--columns-dir, opened read-only) holds
 
   --network-dir DIR      the devnet's genesis data: DIR/config.yaml and DIR/genesis.ssz
   --config PATH          the devnet's config.yaml (PRESET_BASE picks the preset)
@@ -134,6 +147,10 @@ only.
   --answer-prefix-v4 BITS  serve: the IPv4 prefix whose peers share 2 column answer places,
                          1 to 32 (default 24; 32 on a devnet, whose CLs share one /24)
   --answer-prefix-v6 BITS  serve: the same for IPv6, 1 to 128 (default 48)
+  --probe MULTIADDR      answers: the probe's libp2p address, /ip4|ip6/<addr>/tcp/<port>,
+                         no peer ID (Noise proves it)
+  --node-id 0x<64 hex>   answers: the probe's node ID, whose custody columns it serves
+  --behind-slots N       answers: the range ends N slots before the clock (default 2 epochs)
 
 Every -secs flag takes 1 to 86400.
 
@@ -160,6 +177,7 @@ enum Command {
     FetchEpoch,
     All,
     Serve,
+    Answers,
 }
 
 impl Command {
@@ -171,12 +189,13 @@ impl Command {
             "fetch-epoch" => Self::FetchEpoch,
             "all" => Self::All,
             "serve" => Self::Serve,
+            "answers" => Self::Answers,
             _ => return None,
         })
     }
 
     fn runs(self, check: Self) -> bool {
-        self == check || (self == Self::All && check != Self::Serve)
+        self == check || (self == Self::All && ![Self::Serve, Self::Answers].contains(&check))
     }
 
     /// Whether it dials the `--peer`s.
@@ -212,10 +231,73 @@ struct Args {
     fetch: Duration,
     epoch: Option<Epoch>,
     serve: ServeArgs,
+    answers: AnswersArgs,
+}
+
+/// The flags of `answers` alone (it shares `--columns-dir` with `serve`).
+#[derive(Debug, Default, PartialEq)]
+struct AnswersArgs {
+    probe: Option<Multiaddr>,
+    node_id: Option<U256>,
+    behind_slots: Option<u64>,
+}
+
+impl Args {
+    /// The plan of `answers`, once its flags are all there.
+    fn answers_plan(&self) -> Option<AnswersPlan> {
+        Some(AnswersPlan {
+            probe: self.answers.probe.clone()?,
+            columns_dir: self.serve.columns_dir.clone()?,
+            node_id: self.answers.node_id?,
+            behind_slots: self.answers.behind_slots,
+        })
+    }
+}
+
+/// The probe address of `answers`: `/ip4|ip6/<a local addr>/tcp/<port>`, without a peer ID.
+fn parse_probe(text: &str) -> Result<Multiaddr, String> {
+    use libp2p::multiaddr::Protocol;
+    let addr: Multiaddr = text
+        .parse()
+        .map_err(|_| "--probe: not a multiaddr".to_owned())?;
+    let mut parts = addr.iter();
+    let ip = match parts.next() {
+        Some(Protocol::Ip4(ip)) => IpAddr::V4(ip),
+        Some(Protocol::Ip6(ip)) => IpAddr::V6(ip),
+        _ => return Err("--probe: want /ip4|ip6/<addr>/tcp/<port>".into()),
+    };
+    match (parts.next(), parts.next()) {
+        (Some(Protocol::Tcp(_)), None) => {}
+        (Some(Protocol::Tcp(_)), Some(Protocol::P2p(_))) => {
+            return Err("--probe: no peer ID: Noise proves whichever peer listens there".into())
+        }
+        _ => return Err("--probe: want /ip4|ip6/<addr>/tcp/<port>".into()),
+    }
+    if !is_devnet_ip(ip) {
+        return Err(format!(
+            "--probe: {addr} is not a local address (loopback, private, link-local, CGNAT, \
+             IPv6 unique-local): the probe talks to a local devnet only"
+        ));
+    }
+    Ok(addr)
+}
+
+/// A node ID: `0x` and 64 hex digits, big-endian.
+fn parse_node_id(text: &str) -> Result<U256, String> {
+    let bad = || "--node-id: want 0x and 64 hex digits".to_owned();
+    let hex = text.strip_prefix("0x").ok_or_else(bad)?;
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(bad());
+    }
+    let mut bytes = [0u8; 32];
+    for (n, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * n..2 * n + 2], 16).map_err(|_| bad())?;
+    }
+    Ok(U256::from_be_bytes(bytes))
 }
 
 /// The flags of `serve` alone.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ServeArgs {
     columns_dir: Option<PathBuf>,
     socket_dir: Option<PathBuf>,
@@ -300,7 +382,8 @@ fn parse(argv: &[String]) -> Result<Parsed, String> {
     let command = match argv.first() {
         None => return Err("no command".into()),
         Some(c) => Command::parse(c).ok_or_else(|| {
-            "unknown command (want discover, connect, status, fetch-epoch, all or serve)".to_owned()
+            "unknown command (want discover, connect, status, fetch-epoch, all, serve or answers)"
+                .to_owned()
         })?,
     };
     let (mut network_dir, mut config, mut genesis) = (None, None, None);
@@ -330,6 +413,7 @@ fn parse(argv: &[String]) -> Result<Parsed, String> {
             answer_prefixes: AnswerPrefixes::default(),
             verify_wait: serve::VERIFY_SOCKET_WAIT,
         },
+        answers: AnswersArgs::default(),
     };
     let mut it = argv[1..].iter();
     while let Some(flag) = it.next() {
@@ -388,6 +472,18 @@ fn parse(argv: &[String]) -> Result<Parsed, String> {
                     .parse()
                     .map_err(|_| "--listen: not a multiaddr".to_owned())?,
             ),
+            "--probe" => args.answers.probe = Some(parse_probe(value?)?),
+            "--node-id" => args.answers.node_id = Some(parse_node_id(value?)?),
+            "--behind-slots" => {
+                let v = value?;
+                let slots = v
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+                    .then(|| v.parse().ok())
+                    .flatten()
+                    .ok_or("--behind-slots: not a number")?;
+                args.answers.behind_slots = Some(slots);
+            }
             "--epoch" => {
                 let v = value?;
                 let epoch = v
@@ -431,6 +527,32 @@ fn parse(argv: &[String]) -> Result<Parsed, String> {
     }
     if (cmd.runs(Command::Status) || cmd.runs(Command::FetchEpoch)) && args.apis.is_empty() {
         return Err("status and fetch-epoch need the reference --api".into());
+    }
+    if cmd == Command::Answers {
+        let only_the_store = ServeArgs {
+            columns_dir: None,
+            ..args.serve.clone()
+        };
+        if only_the_store != ServeArgs::unset() {
+            return Err(
+                "--socket-dir, --verify-socket, --verify-uid, --listen, --serve-secs and \
+                 --answer-prefix-v4/v6 are serve's only"
+                    .into(),
+            );
+        }
+        for (missing, flag) in [
+            (args.answers.probe.is_none(), "--probe"),
+            (args.serve.columns_dir.is_none(), "--columns-dir"),
+            (args.answers.node_id.is_none(), "--node-id"),
+        ] {
+            if missing {
+                return Err(format!("answers needs {flag}"));
+            }
+        }
+        return Ok(Parsed::Run(Box::new(args)));
+    }
+    if args.answers != AnswersArgs::default() {
+        return Err("--probe, --node-id and --behind-slots are answers' only".into());
     }
     if cmd == Command::Serve {
         let s = &args.serve;
@@ -683,6 +805,16 @@ async fn checks<E: EthSpec>(args: &Args, devnet: &Devnet, out: &mut dyn Write) -
     }
     if args.command == Command::Serve {
         emit(serve_check::<E>(args, devnet).await, out);
+    }
+    if args.command == Command::Answers {
+        let check = match args.answers_plan() {
+            Some(plan) => answers::answers::<E>(devnet, &plan, system_ms()).await,
+            None => Check::failed(
+                answers::NAME,
+                "answers needs --probe, --columns-dir and --node-id",
+            ),
+        };
+        emit(check, out);
     }
     if args.command.runs(Command::FetchEpoch) {
         let plan = FetchPlan {
@@ -1192,6 +1324,81 @@ mod tests {
         assert!(parse(&args(&connect)).unwrap_err().contains("serve's only"));
         assert!(!Command::All.runs(Command::Serve));
         assert!(Command::All.runs(Command::FetchEpoch));
+    }
+
+    /// `answers` takes the probe's address, its store and its node ID, and nothing of serve's
+    /// own but the store.
+    #[test]
+    fn answers_arguments() {
+        let node_id = format!("0x{}07", "00".repeat(31));
+        let full = [
+            "answers",
+            "--network-dir",
+            "/net",
+            "--probe",
+            "/ip4/127.0.0.1/tcp/9000",
+            "--columns-dir",
+            "/var/lib/ethswarm-chain/columns",
+            "--node-id",
+            node_id.as_str(),
+            "--behind-slots",
+            "4",
+        ];
+        let Parsed::Run(a) = parse(&args(&full)).unwrap() else {
+            panic!()
+        };
+        assert_eq!(a.command, Command::Answers);
+        assert!(!a.command.dials(), "no reference CL is dialled");
+        assert!(!Command::All.runs(Command::Answers));
+        let plan = a.answers_plan().unwrap();
+        assert_eq!(plan.probe.to_string(), "/ip4/127.0.0.1/tcp/9000");
+        assert_eq!(
+            plan.columns_dir,
+            PathBuf::from("/var/lib/ethswarm-chain/columns")
+        );
+        assert_eq!(plan.node_id, consensus_types::primitives::U256::from(7u64));
+        assert_eq!(plan.behind_slots, Some(4));
+        let Parsed::Run(a) = parse(&args(&full[..9])).unwrap() else {
+            panic!()
+        };
+        assert_eq!(a.answers_plan().unwrap().behind_slots, None);
+        for (n, want) in [(3, "--probe"), (5, "--columns-dir"), (7, "--node-id")] {
+            let mut short = full[..9].to_vec();
+            short.drain(n..n + 2);
+            let err = parse(&args(&short)).unwrap_err();
+            assert!(err.contains(want), "{want}: {err}");
+        }
+        for (flag, value, want) in [
+            ("--probe", "/ip4/8.8.8.8/tcp/9000", "local"),
+            ("--probe", PEER, "peer ID"),
+            ("--probe", "nonsense", "--probe"),
+            ("--node-id", "0x07", "--node-id"),
+            ("--behind-slots", "x", "--behind-slots"),
+        ] {
+            let mut bad = full[..9].to_vec();
+            if let Some(at) = bad.iter().position(|a| *a == flag) {
+                bad.drain(at..at + 2);
+            }
+            bad.extend([flag, value]);
+            let err = parse(&args(&bad)).unwrap_err();
+            assert!(err.contains(want), "{flag} {value}: {err}");
+        }
+        // Serve's other flags, and answers' own elsewhere, are refused.
+        let mut socket = full.to_vec();
+        socket.extend(["--socket-dir", "/run/probe"]);
+        assert!(parse(&args(&socket)).unwrap_err().contains("serve's only"));
+        let connect = [
+            "connect",
+            "--network-dir",
+            "/net",
+            "--peer",
+            PEER,
+            "--probe",
+            "/ip4/127.0.0.1/tcp/9000",
+        ];
+        assert!(parse(&args(&connect))
+            .unwrap_err()
+            .contains("answers' only"));
     }
 
     /// `serve` refuses a reference with a base path, and a cl-verify it cannot reach, before

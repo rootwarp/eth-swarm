@@ -46,6 +46,17 @@ jobs:
       - name: Early-exit pipe guard the ops suites run on themselves (flagged and clean snippets)
         run: bash ops/tests/early-exit-guard.test.sh
 
+  kurtosis-units:
+    name: Kurtosis devnet probe units under systemd (offline)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The units runner (offline, stub kurtosis, docker, curl and clock)
+        run: bash testing/kurtosis/tests/run-units.test.sh
+
   proto:
     name: buf lint, build, breaking vs develop, baseline drift
     runs-on: ubuntu-24.04

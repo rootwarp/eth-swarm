@@ -32,15 +32,16 @@ impl KzgVerifier for Valid {
 }
 
 #[test]
-fn the_acl_admits_cl_p2p_to_its_four_methods_only() {
+fn the_acl_admits_cl_p2p_to_its_five_methods_only() {
     let acl = chain_acl(990).unwrap();
     assert_eq!(acl.methods().collect::<Vec<_>>().len(), CHAIN_METHODS.len());
     for method in CHAIN_METHODS {
         assert!(acl.allows(method, 990), "{method}");
         assert!(!acl.allows(method, 991), "{method}");
     }
+    assert!(acl.allows("/ethswarm.chain.v1.GossipService/Validate", 990));
     assert!(!acl.allows("/ethswarm.chain.v1.ReqRespService/GetMetadata", 990));
-    assert!(!acl.allows("/ethswarm.chain.v1.GossipService/Validate", 990));
+    assert!(!acl.allows("/ethswarm.chain.v1.GossipService/WatchPublish", 990));
 }
 
 #[test]
@@ -284,6 +285,42 @@ async fn a_column_needs_the_digest_of_its_slot() {
     let fulu = p2p_wire::testkit::fulu_sidecar::<Minimal>(1, 3).as_ssz_bytes();
     assert!(!service.accept_column(d(0), 3, &fulu));
     assert!(!service.accept_column(d(3), 3, &[1, 2, 3]));
+    // Through the hand-off of Validate: the envelope's slot must be the sidecar's own.
+    let hand_off = service.column_hand_off();
+    let column = |slot, fork_digest, ssz| GossipColumnBytes {
+        fork_digest,
+        slot,
+        subnet_id: 3,
+        ssz,
+    };
+    assert_eq!(
+        hand_off.hand_over(column(24, d(3), &gloas)),
+        HandOff::Stored
+    );
+    assert_eq!(
+        hand_off.hand_over(column(8, d(1), &gloas)),
+        HandOff::Dropped("probe: IGNORE: the sidecar's slot is not its envelope's")
+    );
+    assert!(matches!(
+        hand_off.hand_over(column(24, d(0), &gloas)),
+        HandOff::Dropped(_)
+    ));
+    assert!(matches!(
+        hand_off.hand_over(column(1, d(0), &fulu)),
+        HandOff::Dropped(_)
+    ));
+    // From the stop on, nothing more is handed over, so no hand-off holds the store open.
+    service.stream_stop().end_streams();
+    assert_eq!(
+        hand_off.hand_over(column(24, d(3), &gloas)),
+        HandOff::Dropped("probe: IGNORE: cl-chain is stopping")
+    );
+    // Once the service is gone, the hand-off holds no store: nothing more is handed over.
+    drop(service);
+    assert_eq!(
+        hand_off.hand_over(column(24, d(3), &gloas)),
+        HandOff::Dropped("probe: IGNORE: cl-chain is stopping")
+    );
 }
 
 /// The routes serve `WatchSubscriptions` from the custody, not the stub.
@@ -505,4 +542,29 @@ fn the_verify_dir_check_tells_apart_what_a_wait_can_fix() {
         verify_dir_state(&sock("verify"), uid),
         Err(VerifyDirError::Refused(_))
     ));
+}
+
+/// The service closes its store only once no hand-off holds it, so the store closes within the
+/// drop that `close_within` times.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_store_closes_only_once_no_hand_off_holds_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let net = devnet();
+    let service =
+        ProbeService::<Minimal, Valid>::open(&net, plan(dir.path(), 0), &mut Registry::default())
+            .unwrap();
+    // As a hand-off in the middle of a column holds it.
+    let held = Arc::clone(&service.ingest);
+    let (done, closed) = std::sync::mpsc::channel();
+    let dropper = std::thread::spawn(move || {
+        drop(service);
+        done.send(()).unwrap();
+    });
+    assert!(
+        closed.recv_timeout(Duration::from_millis(300)).is_err(),
+        "the service went while a hand-off held its store"
+    );
+    drop(held);
+    closed.recv_timeout(Duration::from_secs(30)).unwrap();
+    dropper.join().unwrap();
 }

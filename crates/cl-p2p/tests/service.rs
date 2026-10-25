@@ -79,7 +79,9 @@ fn our_node_id() -> U256 {
 /// stream that sends its hello and fails. The other RPCs are stubs.
 struct FakeDiscovery {
     link: ipc::Link,
-    record: String,
+    /// The record of each `GetLocalEnr`, in turn; the last one again past them.
+    records: Vec<String>,
+    asked: std::sync::atomic::AtomicUsize,
 }
 
 #[tonic::async_trait]
@@ -113,10 +115,10 @@ impl dpb::discovery_service_server::DiscoveryService for FakeDiscovery {
         &self,
         _: Request<dpb::GetLocalEnrRequest>,
     ) -> Result<Response<dpb::GetLocalEnrResponse>, Status> {
+        let n = self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let text = self.records[n.min(self.records.len() - 1)].clone();
         Ok(Response::new(dpb::GetLocalEnrResponse {
-            enr: Some(dpb::Enr {
-                text: self.record.clone(),
-            }),
+            enr: Some(dpb::Enr { text }),
         }))
     }
 }
@@ -296,12 +298,25 @@ impl Host {
 impl Host {
     /// A fake cl-discv5 whose record advertises `cgc`, served on its socket until dropped.
     fn discv5(&self, cgc: u64) -> tokio::task::JoinHandle<()> {
+        self.discv5_records(&[cgc])
+    }
+
+    /// A fake cl-discv5 whose record advertises `cgcs[n]` at its n-th `GetLocalEnr` (the last
+    /// one past them), served on its socket until dropped.
+    fn discv5_records(&self, cgcs: &[u64]) -> tokio::task::JoinHandle<()> {
         let config = ChainConfig::from_devnet_yaml(network_yaml().as_bytes()).unwrap();
         let net = ProbeNetwork::new("cl-discv5/test", config, DEVNET_GENESIS).unwrap();
-        let cgc = p2p_wire::enr::encode_cgc(cgc);
+        let records = cgcs
+            .iter()
+            .map(|&cgc| {
+                let cgc = p2p_wire::enr::encode_cgc(cgc);
+                cl_p2p::testkit::record_text(&[(b"cgc", &cgc), (b"eth2", &[0; 16])])
+            })
+            .collect();
         let fake = FakeDiscovery {
             link: chain_link::<Minimal>(&net, system_ms()).unwrap(),
-            record: cl_p2p::testkit::record_text(&[(b"cgc", &cgc), (b"eth2", &[0; 16])]),
+            records,
+            asked: std::sync::atomic::AtomicUsize::new(0),
         };
         let listener = tokio::net::UnixListener::bind(&self.discv5_socket).unwrap();
         let routes = tonic::service::Routes::new(
@@ -368,6 +383,9 @@ async fn the_service_runs_and_stops_cleanly_on_sigterm() {
         "# TYPE p2p_goodbye_received counter",
         "# TYPE mesh_peer_counts gauge",
         "ethswarm_rpc_inflight 0",
+        // The column hand-off to cl-chain's Validate, and the column answers to peers.
+        "p2p_column_handoff_total{result=\"unsent\"} 0",
+        "# TYPE rpc_column_sidecars_answered counter",
     ] {
         assert!(metrics.contains(name), "{name}:\n{metrics}");
     }
@@ -409,6 +427,28 @@ async fn a_record_of_another_cgc_is_refused() {
     );
     assert!(log.contains("Goodbye sent to every peer"), "{log}");
     assert!(!log.contains("watching cl-discv5's peers"), "{log}");
+    chain.abort();
+    discv5.abort();
+}
+
+/// cl-discv5's record changes its custody group count after the start: cl-p2p logs an ERROR
+/// and stops with 70, so systemd starts it again, and its start then refuses with exit 2. A
+/// bad peer service cannot stop cl-p2p for good this way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_whose_cgc_changes_after_the_start_restarts_the_unit() {
+    let host = Host::new();
+    let chain = host.chain(our_node_id());
+    let discv5 = host.discv5_records(&[CUSTODY_REQUIREMENT, CUSTODY_REQUIREMENT * 2]);
+    let mut child = host.start();
+    let (code, log) = tokio::task::spawn_blocking(move || (child.wait(), child.log()))
+        .await
+        .unwrap();
+    assert_eq!(code, Some(70), "{log}");
+    assert!(
+        log.contains("watching cl-discv5's peers"),
+        "the first record passed: {log}"
+    );
+    assert!(log.contains(r#""level":"ERROR""#), "{log}");
     chain.abort();
     discv5.abort();
 }

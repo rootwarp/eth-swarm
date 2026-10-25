@@ -3781,6 +3781,48 @@ async fn quic_listen_address_is_refused() {
     }
 }
 
+/// A listen error names its cause: libp2p's `TransportError::Other` prints nothing of its own,
+/// so the text carries the error it wraps (under the unit, the netlink socket that if-watch
+/// opens for a wildcard listen and that `RestrictAddressFamilies=` refused).
+#[test]
+fn a_listen_error_carries_its_source() {
+    let addr: Multiaddr = "/ip4/0.0.0.0/tcp/9000".parse().unwrap();
+    let refused = io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Address family not supported by protocol",
+    );
+    let err = BuildError::Listen {
+        addr: addr.clone(),
+        source: TransportError::Other(refused),
+    };
+    assert_eq!(
+        err.to_string(),
+        "cannot listen on /ip4/0.0.0.0/tcp/9000: Address family not supported by protocol"
+    );
+    let unsupported = BuildError::Listen {
+        addr: addr.clone(),
+        source: TransportError::MultiaddrNotSupported(addr),
+    };
+    assert!(
+        unsupported.to_string().contains("not supported"),
+        "{unsupported}"
+    );
+    // An error with no text at all shows as its Debug form, never as nothing.
+    #[derive(Debug)]
+    struct Silent;
+    impl std::fmt::Display for Silent {
+        fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            Ok(())
+        }
+    }
+    impl std::error::Error for Silent {}
+    let silent = BuildError::Listen {
+        addr: "/ip4/0.0.0.0/tcp/9000".parse().unwrap(),
+        source: TransportError::Other(io::Error::other(Silent)),
+    };
+    assert!(silent.to_string().contains("Silent"), "{silent}");
+}
+
 #[test]
 fn dial_failure_reasons() {
     let addr: Multiaddr = "/ip4/127.0.0.1/tcp/9000".parse().unwrap();

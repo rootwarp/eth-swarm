@@ -143,12 +143,32 @@ pub enum BuildError {
     /// The Noise config could not be built from the node key.
     #[error("noise: {0}")]
     Noise(#[from] noise::Error),
-    /// A listen address was refused.
-    #[error("cannot listen on {addr}: {source}")]
+    /// A listen address was refused. The text carries the whole chain of causes
+    /// ([`listen_cause`]): libp2p's `TransportError::Other` prints nothing of its own.
+    #[error("cannot listen on {addr}: {}", listen_cause(source))]
     Listen {
         addr: Multiaddr,
         source: TransportError<io::Error>,
     },
+}
+
+/// The causes of a listen error, outermost first, joined by `": "`; its Debug form if none of
+/// them has a text (an error with an empty message must still say something in the journal).
+fn listen_cause(err: &TransportError<io::Error>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = next {
+        let text = e.to_string();
+        if !text.is_empty() && !parts.contains(&text) {
+            parts.push(text);
+        }
+        next = e.source();
+    }
+    if parts.is_empty() {
+        format!("{err:?}")
+    } else {
+        parts.join(": ")
+    }
 }
 
 /// The probe swarm for the node key `keypair`: TCP (no Nagle), Noise XX, then yamux or mplex

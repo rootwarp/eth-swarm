@@ -46,6 +46,11 @@ message GossipVerdict {
   ethswarm.common.v1.Verdict verdict = 2;
   // Rule that fired, e.g. "gloas/execution_payload_bid: REJECT bad signature". Max 256 bytes (operational: the longest spec rule id plus a short reason fits). Receiver truncates, never changes the verdict because of it.
   string reason = 3;
+  // Required. request_id and generation of the batch, index of the message answered (equal to this
+  // verdict's position in verdicts), item_hash = SHA-256 of that GossipMessage's protobuf encoding. A
+  // missing or mismatched fence is ERROR_CODE_CONTRACT_VIOLATION; the whole batch is dropped, never
+  // ACCEPTed.
+  ethswarm.common.v1.Fence fence = 4;
 }
 
 message ValidateRequest {
@@ -57,7 +62,15 @@ message ValidateRequest {
 }
 
 message ValidateBatch {
+  // At least 1 and at most 256 messages. An empty batch, or a longer one, is
+  // ERROR_CODE_CONTRACT_VIOLATION.
   repeated GossipMessage messages = 1;
+  // Per-stream, strictly increasing from 1. Echoed in VerdictBatch.request_id and in every fence.
+  uint64 request_id = 2;
+  // The server generation of this stream (common.v1 Hello.generation of cl-chain's hello). Any other
+  // value is ERROR_CODE_CONTRACT_VIOLATION. Item i of the request is messages[i]; GossipVerdict.fence
+  // answers it.
+  uint64 generation = 3;
 }
 
 message ValidateResponse {
@@ -68,7 +81,10 @@ message ValidateResponse {
 }
 
 message VerdictBatch {
+  // One per request message, same order.
   repeated GossipVerdict verdicts = 1;
+  // The request_id of the ValidateBatch answered.
+  uint64 request_id = 2;
 }
 
 message WatchPublishRequest {
@@ -123,6 +139,11 @@ message GetForkScheduleResponse {
 
 service GossipService {
   // Bidi, ordered per topic. Missed deadline (default 500 ms) => p2p applies VERDICT_IGNORE.
+  // Fencing (proto/README.md, request fencing): cl-chain's hello carries a fresh non-zero generation
+  // for each stream, every ValidateBatch carries it back with its request_id, and every GossipVerdict
+  // carries a common.v1 Fence. cl-p2p sends no batch on a stream before it has read cl-chain's hello
+  // there. At a batch's deadline, or when cl-p2p replaces the stream, cl-p2p fails the batch locally as
+  // VERDICT_IGNORE; a verdict that arrives for it later is dropped and counted, never used.
   rpc Validate(stream ValidateRequest) returns (stream ValidateResponse);
   // Core-originated messages for p2p to publish.
   rpc WatchPublish(WatchPublishRequest) returns (stream WatchPublishResponse);

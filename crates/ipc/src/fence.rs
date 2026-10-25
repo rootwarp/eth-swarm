@@ -22,15 +22,15 @@
 //! [`Outstanding::close`]): it is dropped and counted, and is not a violation.
 //!
 //! Item bytes: an item is the request's i-th repeated element when the request has one result
-//! per element (`VerifyBlsRequestBody.sets`), else the whole request body (`VerifyKzgRequestBody`,
-//! index 0). Its bytes are its deterministic protobuf encoding, as prost encodes it (fields in
+//! per element (`VerifyBlsRequestBody.sets`, `ValidateBatch.messages`), else the whole request
+//! body (`VerifyKzgRequestBody`, index 0). Its bytes are its deterministic protobuf encoding, as prost encodes it (fields in
 //! field-number order, defaults omitted, no unknown fields), so both sides compute the same hash
 //! from the message they hold ([`FencedRequest`], [`FencedResult`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use ethswarm_proto::common::{ErrorCode, Fence as WireFence};
-use ethswarm_proto::verify;
+use ethswarm_proto::{chain, verify};
 use prost::Message;
 use sha2::{Digest, Sha256};
 
@@ -222,6 +222,15 @@ impl FencedRequest for verify::VerifyKzgRequestBody {
     }
 }
 
+impl FencedRequest for chain::ValidateBatch {
+    fn wire_tag(&self) -> (u64, u64) {
+        (self.request_id, self.generation)
+    }
+    fn item_hashes(&self) -> Vec<ItemHash> {
+        self.messages.iter().map(message_hash).collect()
+    }
+}
+
 /// Refuses fences that name another request than their body's `request_id`.
 fn named_by(request_id: u64, fences: Vec<Fence>) -> Result<Vec<Fence>, FenceError> {
     match fences.iter().find(|f| f.request_id != request_id) {
@@ -265,6 +274,25 @@ impl FencedResult for verify::VerifyKzgResponseBody {
     fn stamp(&mut self, fences: &[Fence]) {
         if let Some(fence) = fences.first() {
             self.fence = Some(fence.to_wire());
+        }
+    }
+}
+
+impl FencedResult for chain::VerdictBatch {
+    fn request_id(&self) -> u64 {
+        self.request_id
+    }
+    fn fences(&self) -> Result<Vec<Fence>, FenceError> {
+        let fences = self
+            .verdicts
+            .iter()
+            .map(|v| Fence::from_wire(v.fence.as_ref()))
+            .collect::<Result<_, _>>()?;
+        named_by(self.request_id, fences)
+    }
+    fn stamp(&mut self, fences: &[Fence]) {
+        for (verdict, fence) in self.verdicts.iter_mut().zip(fences) {
+            verdict.fence = Some(fence.to_wire());
         }
     }
 }
@@ -483,6 +511,7 @@ impl Outstanding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethswarm_proto::common::Verdict;
     use verify::{bls_result, BlsResult, BlsSet, VerifyBlsRequestBody, VerifyBlsResponseBody};
 
     fn generation(g: u64) -> Generation {
@@ -815,6 +844,62 @@ mod tests {
         reply.stamp(&kzg.result_fences());
         assert_eq!(reply.fences().unwrap()[0].index, 0);
         assert_eq!(out.settle(&reply.fences().unwrap()), Ok(2));
+    }
+
+    fn gossip_message(id: u8) -> chain::GossipMessage {
+        chain::GossipMessage {
+            message_id: vec![id; 20],
+            topic: chain::Topic::DataColumnSidecar as i32,
+            subnet_id: u32::from(id),
+            ..Default::default()
+        }
+    }
+
+    /// A Validate batch has one item per message; each verdict answers its message, by position.
+    #[test]
+    fn validate_batches_carry_fences_end_to_end() {
+        let mut out = Outstanding::new(generation(31), 4);
+        let (tag, batch) = out
+            .issue(|tag| {
+                let b = chain::ValidateBatch {
+                    messages: vec![gossip_message(1), gossip_message(2)],
+                    request_id: tag.request_id,
+                    generation: tag.generation.get(),
+                };
+                let h = b.item_hashes();
+                (b, h)
+            })
+            .unwrap();
+        assert_eq!(batch.wire_tag(), (1, 31));
+        assert_eq!(
+            batch.item_hashes(),
+            vec![
+                message_hash(&gossip_message(1)),
+                message_hash(&gossip_message(2))
+            ]
+        );
+        assert_eq!(check_request(&batch, tag.generation), Ok(()));
+        let verdict = |id: u8| chain::GossipVerdict {
+            message_id: vec![id; 20],
+            verdict: Verdict::Ignore as i32,
+            ..Default::default()
+        };
+        let mut verdicts = chain::VerdictBatch {
+            verdicts: vec![verdict(1), verdict(2)],
+            request_id: tag.request_id,
+        };
+        assert!(matches!(verdicts.fences(), Err(FenceError::Malformed(_))));
+        verdicts.stamp(&batch.result_fences());
+        assert_eq!(verdicts.request_id(), 1);
+        let fences = verdicts.fences().unwrap();
+        assert_eq!(fences[1].index, 1);
+        assert_eq!(out.settle_body(&verdicts), Ok(1));
+        // A verdict batch that names another request than its fences is substituted.
+        verdicts.request_id = 2;
+        assert!(matches!(
+            verdicts.fences(),
+            Err(FenceError::Substituted { .. })
+        ));
     }
 
     #[test]

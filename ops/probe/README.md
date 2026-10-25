@@ -68,7 +68,9 @@ The units pass no argument to the binaries. Each binary reads one fixed config f
   has its own table: `[chain]`, `[discv5]` or `[p2p]`. A table of another service is refused.
 - **The sockets.** A service binds `/run/ethswarm/<service>/<service>.sock` in its
   `RuntimeDirectory=`, directory 0750 and socket 0660, owned by the service user and the
-  `[socket] group`. Set that group to the service's own group. A caller can connect only if it
+  `[socket] group`. Set that group to the service's own group: another group would need a
+  chown of the socket, which the units' seccomp filter (`@chown` is in `@privileged`) kills, so
+  the binary refuses such a config (exit 2). A caller can connect only if it
   is a member, so the install adds `ethswarm-p2p` to `ethswarm-chain` and `ethswarm-discv5`,
   and cl-chain's user to the group of cl-verify's socket. The units do not change: systemd
   gives a `User=` its groups from the user database, and the lint refuses
@@ -85,8 +87,13 @@ custody columns in `/var/lib/ethswarm-chain/columns` and opens the same store af
 so the custody group count and `cgc_set_slot` of the first start stay. It follows the
 reference node's events (the canonical chain, the finalize and retention prunes). It asks
 cl-verify for the KZG checks, and refuses a cl-verify server that runs as another UID. Only
-cl-p2p's UID can call its four methods: `ReqRespService/GetStatus`, `DataColumnsByRange`,
-`DataColumnsByRoot` and `GossipService/WatchSubscriptions`.
+cl-p2p's UID can call its five methods: `ReqRespService/GetStatus`, `DataColumnsByRange`,
+`DataColumnsByRoot`, `GossipService/WatchSubscriptions` and `GossipService/Validate`. Validate
+is the column hand-off: cl-p2p sends the column sidecars that its gossipsub captured, and
+cl-chain stores its custody columns from them. It drops a sidecar whose fork digest is not the
+digest of its slot's epoch without decoding it, decodes the rest by the fork of their slot, and
+answers IGNORE for every message. cl-p2p reports every message IGNORE to gossipsub before that,
+so no verdict can make a message travel on.
 
 ```toml
 # /etc/ethswarm/cl-chain.toml
@@ -99,11 +106,12 @@ group = 990                             # the GID of ethswarm-chain
 [callers]
 cl-p2p = 991                            # the UID of ethswarm-p2p
 
-[methods]                               # exactly these four, to cl-p2p only
+[methods]                               # exactly these five, to cl-p2p only
 "/ethswarm.chain.v1.ReqRespService/GetStatus" = ["cl-p2p"]
 "/ethswarm.chain.v1.ReqRespService/DataColumnsByRange" = ["cl-p2p"]
 "/ethswarm.chain.v1.ReqRespService/DataColumnsByRoot" = ["cl-p2p"]
 "/ethswarm.chain.v1.GossipService/WatchSubscriptions" = ["cl-p2p"]
+"/ethswarm.chain.v1.GossipService/Validate" = ["cl-p2p"]
 
 [chain]
 reference_api_url = "http://127.0.0.1:5052"   # localhost, loopback or a private address
@@ -157,7 +165,8 @@ fields of the wall clock and takes the new ones at each digest change. It logs i
 its record at start: both are public, and cl-chain's `node_id` is that node ID. It starts its
 routing table from `bootnodes` and does a lookup every `lookup_interval_ms`. At a digest change
 it keeps the records that announce the new digest as their next one (`nfd`), and keeps the
-records of the old digest for one epoch, while peers update their records. Only cl-p2p's UID
+records of the old digest for two epochs, as long as the old gossip topics stay, while peers
+update their records. Only cl-p2p's UID
 can call its two methods: `WatchPeers` (the table's records, then each record found) and
 `GetLocalEnr`. Its `cgc` must be cl-chain's custody group count: cl-p2p refuses another.
 
@@ -188,19 +197,27 @@ bootnodes = ["enr:<record>"]
 cl-p2p runs the swarm (`cl_p2p::service`). At start it waits for cl-chain (`chain_wait_ms`)
 and for its first custody subscriptions, and refuses to start (exit 2) if those columns are not
 the custody columns of its own node key: cl-chain's `node_id` is then another key's. It holds
-each later subscriptions body to the same key and group count (exit 2). It subscribes the
+each later subscriptions body to the same key and group count: a later mismatch is logged at
+ERROR and ends cl-p2p with 70, so systemd starts it again and the start checks once more. A
+bad peer service cannot stop cl-p2p for good. It subscribes the
 ignore-all gossipsub to the topics of `gossip_topics` and to the custody column subnets, under
 every fork digest that cl-chain names, and to the topics of a new digest ahead of its change.
-The topics of a digest that cl-chain no longer names leave one epoch after the change, so the
-topic set stays within its bound (418 topics) at every fork and BPO change. Its Status, its
-column answers and its custody come from cl-chain. Before each `WatchPeers` stream it reads
-cl-discv5's record (`GetLocalEnr`) and stops (exit 2) if its `cgc` is not cl-chain's custody
-group count. It dials cl-discv5's candidates, their addresses held to the IP rule of `mode`
+The topics of a digest that cl-chain no longer names leave two epochs after the change
+(`altair/p2p-interface.md`, "Transitioning the gossip"), so the topic set stays within its
+bound (418 topics) at every fork and BPO change. Its Status, its
+column answers and its custody come from cl-chain. Its gossipsub's capture tap gives each
+`data_column_sidecar_*` message to cl-chain's `GossipService/Validate`
+(`p2p_column_handoff_total{result}`), after the message was reported IGNORE. Before each
+`WatchPeers` stream it reads cl-discv5's record (`GetLocalEnr`) and stops if its `cgc` is not
+cl-chain's custody group count: with exit 2 at the first record, and with 70 (logged at ERROR)
+once a record passed. It dials cl-discv5's candidates, their addresses held to the IP rule of `mode`
 (the value of cl-discv5's `mode`), up to `target_peers` of its own dials, the `static_peers`
 first and always, once it has a Status. Inbound peers do not count toward `target_peers`: they
 have their own 128 slots, and the 32 outbound slots stay ours. It feeds the Goodbye ledger and
 ticks it every 60 s; an event that does not fit the feed is dropped and counted on
-`p2p_ledger_feed_dropped_total`, but a disconnect is never dropped. On SIGTERM it sends Goodbye
+`p2p_ledger_feed_dropped_total`. A disconnect that does not fit is held instead, in order, up to
+4,096 held disconnects; past them it is dropped and counted too, and only the first drop of a
+stall is logged. On SIGTERM it sends Goodbye
 1 (client shutdown) to every peer and gives that 1 s before it exits.
 
 ```toml
@@ -354,6 +371,15 @@ warning, watch the unit's cgroup instead: `memory.current` against `MemoryMax=`,
   6.05 GiB. `MemoryMax=7G` sits about 0.95 GiB above that, so the transport's own budgets,
   which close a connection, act before the ceiling, which kills the process. The ceiling
   catches what those budgets do not bound.
+- **cl-p2p's column hand-off** to cl-chain adds about 0.13 GiB at most, also while cl-chain
+  restarts or stalls. The capture tap keeps only the column topics and holds at most 1,024
+  sidecars (`TAP_CAPACITY`), and the column queue behind it holds at most 1,024
+  (`COLUMN_QUEUE`). A sidecar is at most 45,380 bytes on Sepolia (`gossip-topics.toml`), so
+  each holds about 44 MiB. When either is full, it drops and counts the sidecar
+  (`p2p_column_handoff_total{result="tap_dropped"}` and `{result="queue_dropped"}`), and nothing
+  waits. A batch fills up to 2 MiB, and at most 17 request frames of up to 2 MiB wait for the
+  stream (34 MiB). With the hand-off the worst case is about 6.2 GiB, still about 0.8 GiB
+  under `MemoryMax=7G`.
 
 An OOM kill is a signal (SIGKILL), not an exit status. With `OOMPolicy=stop`, set in the unit
 rather than left to the host's `DefaultOOMPolicy=`, systemd stops the unit with result
@@ -366,10 +392,17 @@ stop. The same holds for an OOM kill of the anchor check during the start.
 
 Every unit sets `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`,
 `PrivateTmp=yes`, `PrivateDevices=yes`, an empty `CapabilityBoundingSet=`,
-`RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `SystemCallFilter=@system-service` and
+`RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` (cl-p2p also `AF_NETLINK`, see below),
+`SystemCallFilter=@system-service` and
 `~@privileged`, `SystemCallArchitectures=native`, `MemoryDenyWriteExecute=yes`, the
 `Protect*`/`Restrict*` set in the files, `UMask=0077`, and `ReadWritePaths=` its state dir only
 (plus the systemd-managed runtime dir for its socket).
+
+cl-p2p alone also gets `AF_NETLINK`. For its wildcard listen (`/ip4/0.0.0.0/tcp/9000`)
+libp2p-tcp watches the host's interfaces (if-watch) through a netlink route socket, and without
+the family the listen fails at start (`cannot listen on /ip4/0.0.0.0/tcp/9000: ...`, exit 1).
+cl-discv5 binds one UDP socket and cl-chain uses Unix and TCP sockets only, so neither gets it.
+The lint holds each unit to its own list exactly.
 
 **The lint pins the units exactly.** `ops/probe/tests/probe-units.test.sh` (CI, `workflows`
 job) accepts a unit only if every line systemd reads (not blank, not a comment) equals, in
@@ -415,7 +448,12 @@ adds.
 reads it as data (`cl_p2p::gossip::TopicList`): every name goes through p2p-wire's
 `GossipTopic::parse`, and a name it does not handle refuses the whole file. The probe
 subscribes each name under every fork digest it follows (two at most, around a fork) and
-reports IGNORE for every message, so it forwards none.
+reports IGNORE for every message, so it forwards none. A gossipsub WARN `[Penalty] Peer attempted
+graft within backoff time, penalizing` now and then is expected: a reference CL that left or
+pruned a topic (with a PRUNE that sets a backoff) grafts it again within that backoff. The
+probe has no peer scoring, so the penalty is only the log line, and gossipsub refuses that GRAFT
+with a PRUNE. The probe itself prunes a peer only when a mesh holds more than `mesh_n_high` (12)
+peers or when it leaves a topic.
 
 The file records its bounds and byte budget, and cl-p2p's tests check them against it: 11
 topics per digest (22 under two) within the 418 subscriptions one RPC may carry, a
@@ -431,8 +469,13 @@ file that is not a custody subnet is still subscribed, and cl-chain drops its co
 
 ## Not covered here
 
-- A journal grep of every probe unit after a 10-minute devnet run (neither the key hex nor its
-  base64 appears) needs the Kurtosis devnet and running probe services.
+- The 10-minute devnet run under systemd, its journal grep (neither the key hex nor its base64
+  appears) and the 1-hour dry run of the exit run's counters run on the Kurtosis devnet:
+  `testing/kurtosis/run-units.sh` (`testing/kurtosis/README.md`, "Probe units under systemd").
+  It installs the three units unchanged, with two devnet-only additions: a cl-verify unit, which
+  runs as the `ethswarm-verify` user and group that the install's `usermod` line names, and a
+  drop-in that runs the anchor check over plain HTTP with the minimal preset and turns
+  journald's rate limit off.
 - The host check for the Sepolia exit run: on the real host, `stat` and `getfacl` of
   `/run/credentials/ethswarm-p2p.service/nodekey` (and discv5's) show one of the two shapes
   above. On a current kernel that is root-owned 0440 with `user:ethswarm-p2p:r--` and

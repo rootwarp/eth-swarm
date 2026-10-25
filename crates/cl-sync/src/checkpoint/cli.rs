@@ -4,18 +4,20 @@
 //! ```text
 //! anchor-fetch [--config FILE] [--out DIR] [--quiet]
 //! anchor-fetch --check (--providers A,B [--allow-insecure-http] | --config FILE)
-//!              [--scratch DIR] [--quiet]
+//!              [--preset mainnet|minimal] [--scratch DIR] [--quiet]
 //! anchor-fetch check-log RUN_LOG
 //! anchor-fetch --help
 //! ```
 //!
 //! The first form is [`fetch::run`]; `--check` is [`fetch::check`], which writes nothing and
 //! is what a probe unit runs as `ExecStartPre=`. Both use the mainnet preset (Sepolia, Hoodi
-//! and mainnet all use it).
+//! and mainnet all use it). `--check --preset minimal` decodes with the minimal preset instead:
+//! the Kurtosis devnet's (`testing/kurtosis`), whose probe units add it in a devnet-only
+//! drop-in.
 
 use crate::checkpoint::config::Config;
 use crate::checkpoint::{fetch, runlog};
-use consensus_types::Mainnet;
+use consensus_types::{EthSpec, Mainnet, Minimal};
 use std::future::Future;
 use std::path::PathBuf;
 
@@ -24,7 +26,7 @@ pub const EXIT_USAGE: u8 = 64;
 
 const USAGE: &str = "\
 usage: anchor-fetch [--config FILE] [--out DIR] [--quiet]
-       anchor-fetch --check (--providers A,B [--allow-insecure-http] | --config FILE) [--scratch DIR] [--quiet]
+       anchor-fetch --check (--providers A,B [--allow-insecure-http] | --config FILE) [--preset mainnet|minimal] [--scratch DIR] [--quiet]
        anchor-fetch check-log RUN_LOG";
 
 const HELP: &str = "\
@@ -41,6 +43,8 @@ Options:
                          one domain (same last two DNS labels) or one resolved address
                          behind both is refused
   --allow-insecure-http  with --providers: accept http:// URLs (local fixtures only)
+  --preset P             with --check: decode by the preset P, mainnet (the default) or
+                         minimal (a local devnet)
   --scratch DIR          with --check: where the bodies are held while they are checked, in a
                          new private directory removed before exit (default: $TMPDIR or /tmp)
   -h, --help             print this help
@@ -75,6 +79,16 @@ enum Providers {
     Config(PathBuf),
 }
 
+/// The preset a check decodes the block and the state by.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Preset {
+    /// Sepolia, Hoodi and mainnet.
+    #[default]
+    Mainnet,
+    /// A local devnet (Kurtosis).
+    Minimal,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Help,
@@ -85,6 +99,7 @@ enum Command {
     },
     Check {
         providers: Providers,
+        preset: Preset,
         scratch: PathBuf,
         echo: bool,
     },
@@ -98,6 +113,7 @@ struct Flags {
     out: Option<PathBuf>,
     providers: Option<String>,
     scratch: Option<PathBuf>,
+    preset: Option<Preset>,
     allow_insecure_http: bool,
     check: bool,
     quiet: bool,
@@ -144,6 +160,13 @@ fn parse(args: &[String]) -> Result<Command, String> {
             "--out" => f.out = Some(value(&mut it, "--out needs a DIR")?.into()),
             "--providers" => f.providers = Some(value(&mut it, "--providers needs A,B")?.into()),
             "--scratch" => f.scratch = Some(value(&mut it, "--scratch needs a DIR")?.into()),
+            "--preset" => {
+                f.preset = Some(match value(&mut it, "--preset needs mainnet or minimal")? {
+                    "mainnet" => Preset::Mainnet,
+                    "minimal" => Preset::Minimal,
+                    other => return Err(format!("--preset {other:?}: want mainnet or minimal")),
+                });
+            }
             "--allow-insecure-http" => f.allow_insecure_http = true,
             "--check" => f.check = true,
             "--quiet" => f.quiet = true,
@@ -155,6 +178,7 @@ fn parse(args: &[String]) -> Result<Command, String> {
         for (given, flag) in [
             (f.providers.is_some(), "--providers"),
             (f.scratch.is_some(), "--scratch"),
+            (f.preset.is_some(), "--preset"),
             (f.allow_insecure_http, "--allow-insecure-http"),
         ] {
             if given {
@@ -185,6 +209,7 @@ fn parse(args: &[String]) -> Result<Command, String> {
     };
     Ok(Command::Check {
         providers,
+        preset: f.preset.unwrap_or_default(),
         scratch: f.scratch.unwrap_or_else(std::env::temp_dir),
         echo,
     })
@@ -241,6 +266,7 @@ pub(crate) fn main_with(args: &[String], resolver: &dyn fetch::Resolve) -> u8 {
         }
         Command::Check {
             providers,
+            preset,
             scratch,
             echo,
         } => {
@@ -255,39 +281,52 @@ pub(crate) fn main_with(args: &[String], resolver: &dyn fetch::Resolve) -> u8 {
                 Ok(c) => c,
                 Err(e) => return aborted(&e),
             };
-            let log = runlog::RunLog::in_memory(echo);
-            let check = fetch::check_logged::<Mainnet>(&config, &scratch, log, resolver);
-            match block_on(until_signalled(async { check.await.0 })) {
-                Err(code) => code,
-                Ok(Err(Interrupted::Signal(name, code))) => {
-                    eprintln!("anchor-fetch: interrupted by {name}; the check was cancelled and its scratch directory removed");
-                    code
-                }
-                Ok(Err(Interrupted::Setup(e))) => {
-                    eprintln!("anchor-fetch: signal handlers: {e}");
-                    4
-                }
-                Ok(Ok(result)) => match result {
-                    Ok(agreement) => {
-                        println!("{}", serde_json::to_string(&agreement).unwrap_or_default());
-                        let [a, b] = [&agreement.providers[0], &agreement.providers[1]];
-                        eprintln!(
-                        "anchor-fetch: check passed: {} ({}) and {} ({}) agree on block {} and \
-                         state root {} at slot {}",
-                        a.name,
-                        a.url,
-                        b.name,
-                        b.url,
-                        agreement.block_root,
-                        agreement.state_root,
-                        agreement.slot
-                    );
-                        0
-                    }
-                    Err(e) => aborted(&e),
-                },
+            match preset {
+                Preset::Mainnet => check::<Mainnet>(&config, &scratch, echo, resolver),
+                Preset::Minimal => check::<Minimal>(&config, &scratch, echo, resolver),
             }
         }
+    }
+}
+
+/// The `--check` of `config` by the preset `E`; the exit code.
+fn check<E: EthSpec>(
+    config: &Config,
+    scratch: &std::path::Path,
+    echo: bool,
+    resolver: &dyn fetch::Resolve,
+) -> u8 {
+    let log = runlog::RunLog::in_memory(echo);
+    let check = fetch::check_logged::<E>(config, scratch, log, resolver);
+    match block_on(until_signalled(async { check.await.0 })) {
+        Err(code) => code,
+        Ok(Err(Interrupted::Signal(name, code))) => {
+            eprintln!("anchor-fetch: interrupted by {name}; the check was cancelled and its scratch directory removed");
+            code
+        }
+        Ok(Err(Interrupted::Setup(e))) => {
+            eprintln!("anchor-fetch: signal handlers: {e}");
+            4
+        }
+        Ok(Ok(result)) => match result {
+            Ok(agreement) => {
+                println!("{}", serde_json::to_string(&agreement).unwrap_or_default());
+                let [a, b] = [&agreement.providers[0], &agreement.providers[1]];
+                eprintln!(
+                    "anchor-fetch: check passed: {} ({}) and {} ({}) agree on block {} and \
+                     state root {} at slot {}",
+                    a.name,
+                    a.url,
+                    b.name,
+                    b.url,
+                    agreement.block_root,
+                    agreement.state_root,
+                    agreement.slot
+                );
+                0
+            }
+            Err(e) => aborted(&e),
+        },
     }
 }
 
@@ -363,6 +402,7 @@ mod tests {
                     list: "https://a,https://b".into(),
                     allow_insecure_http: false
                 },
+                preset: Preset::Mainnet,
                 scratch: "/s".into(),
                 echo: false,
             }
@@ -372,10 +412,22 @@ mod tests {
             c,
             Command::Check {
                 providers: Providers::Config("f.toml".into()),
+                preset: Preset::Mainnet,
                 scratch: std::env::temp_dir(),
                 echo: true,
             }
         );
+        let c = parse(&args(&[
+            "--config", "f.toml", "--check", "--preset", "minimal",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            c,
+            Command::Check {
+                preset: Preset::Minimal,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -408,6 +460,10 @@ mod tests {
             &["--check", "--config", "f", "--allow-insecure-http"],
             &["--check", "--providers"],
             &["--check", "--scratch"],
+            &["--preset", "minimal"],
+            &["--check", "--config", "f", "--preset"],
+            &["--check", "--config", "f", "--preset", "--quiet"],
+            &["--check", "--config", "f", "--preset", "gnosis"],
             &["--out"],
         ] {
             assert!(parse(&args(list)).is_err(), "{list:?}");

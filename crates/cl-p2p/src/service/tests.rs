@@ -160,6 +160,8 @@ fn exit_codes_follow_the_unit() {
     assert_eq!(ServeError::Unavailable(String::new()).exit_code(), 69);
     assert_eq!(ServeError::Config(String::new()).exit_code(), 2);
     assert_eq!(ServeError::Failed(String::new()).exit_code(), 1);
+    // A thread that could not start may start after a restart.
+    assert_eq!(ServeError::Software(String::new()).exit_code(), 70);
     // A restart can fix a fault of the run (70), not the socket's bind or the ACL (1).
     let runtime = |e| ServeError::Runtime(e).exit_code();
     assert_eq!(
@@ -227,7 +229,7 @@ fn sepolia_owner(
         topics: digests::DigestTopics::new(
             crate::gossip::TopicList::parse("topics = [\"beacon_block\"]\n").unwrap(),
             Duration::from_secs(1),
-            CustodySubscriptions::from_chain(&body(Vec::new(), &[])).unwrap(),
+            CustodySubscriptions::from_chain(&body(Vec::new(), &[[1; 4]])).unwrap(),
         ),
         node,
         groups: CUSTODY_REQUIREMENT,
@@ -237,7 +239,8 @@ fn sepolia_owner(
 
 /// Every subscriptions body is held to our key, not only the first: a cl-chain that starts to
 /// name another key's columns, or another group count than our MetaData and record carry, stops
-/// the owner with a refused config (exit 2). A body equal to the first goes on.
+/// the owner with a fault that a restart can fix (exit 70, so systemd starts the unit again and
+/// its start checks the first body with exit 2). A body equal to the first goes on.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_later_body_of_another_key_stops_the_owner() {
     let id = node_id(&Keypair::generate_secp256k1()).unwrap();
@@ -265,7 +268,7 @@ async fn a_later_body_of_another_key_stops_the_owner() {
             .expect("the owner stopped")
             .unwrap()
             .unwrap_err();
-        assert_eq!(err.exit_code(), EXIT_CONFIG, "{err}");
+        assert_eq!(err.exit_code(), EXIT_SOFTWARE, "{err}");
         assert!(err.to_string().contains(why), "{err}");
         assert!(
             err.to_string().contains(&format!("{later:?}")) || why == "custody group count",

@@ -21,6 +21,7 @@ use cl_p2p::rpc::answer_bucket::AnswerPrefixes;
 use consensus_types::das::{compute_subnet_for_data_column_sidecar, custody_columns};
 use consensus_types::primitives::Root;
 use consensus_types::{gloas, Minimal};
+use devnet_probe::answers::{self, AnswersPlan};
 use devnet_probe::devnet::Devnet;
 use devnet_probe::fixtures::FixtureChain;
 use devnet_probe::serve::{
@@ -375,7 +376,7 @@ async fn custody_columns_from_gossip_are_served_byte_for_byte() {
         stopped,
     ));
     let mut requester = ColumnRequester::<E>::new(&devnet).unwrap();
-    requester.connect(peer, addr).await.unwrap();
+    requester.connect(peer, addr.clone()).await.unwrap();
     // Nothing stored yet: the slot it serves from at the earliest, cgc_set_slot, not the head.
     let empty = advertised(&mut requester, peer, digest, &probe).await;
     assert_eq!(
@@ -403,6 +404,23 @@ async fn custody_columns_from_gossip_are_served_byte_for_byte() {
             .earliest_available_slot,
         NOW_SLOT
     );
+    // The outside check of the systemd units: a peer of its own asks, and every answer is
+    // judged against the store, by range from the Status's earliest slot to the last block.
+    let outside = AnswersPlan {
+        probe: addr.clone(),
+        columns_dir: columns_dir.path().join("columns"),
+        node_id: id,
+        behind_slots: Some(0),
+    };
+    let at_the_last_block = now_ms() + 4 * 6_000;
+    let judged =
+        answers::answers_with::<E>(&devnet, &outside, probe.reader(), at_the_last_block).await;
+    assert!(judged.passed(), "{:?}", judged.render());
+    assert_eq!(judged.lines().len(), 4, "{:?}", judged.render());
+    // A range that ends before the slot it is served from has nothing to ask.
+    let early =
+        answers::answers_with::<E>(&devnet, &outside, probe.reader(), now_ms() - 6_000).await;
+    assert!(!early.passed(), "{:?}", early.render());
     // By range: every block of the range, every requested custody column, byte for byte, in
     // (slot, column_index) order, each with the digest of its slot's epoch.
     let got = requester

@@ -14,7 +14,10 @@
 //!   - the column server ([`ColumnServer`]) and our Status ([`StatusProvider`], its
 //!     `earliest_available_slot` the column server's), on `ReqRespService`
 //!     ([`ReqRespServer`]);
-//!   - the custody subscriptions on `GossipService/WatchSubscriptions` ([`GossipServer`]).
+//!   - the custody subscriptions on `GossipService/WatchSubscriptions` ([`GossipServer`]);
+//!   - the column hand-off on `GossipService/Validate` ([`validate`]): cl-p2p hands over the
+//!     column sidecars that its gossipsub captured, [`ColumnHandOff`] gives them to the store,
+//!     and every verdict is IGNORE.
 //!
 //!   The store is opened in its directory, and opened again after a restart: the custody
 //!   record in it keeps the custody group count and `cgc_set_slot` of the first start.
@@ -55,12 +58,16 @@ use network_config::{ChainConfig, Epoch, Genesis};
 use pb::gossip_service_server::{GossipService, GossipServiceServer};
 use prometheus_client::registry::Registry;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::Routes;
 use tonic::{Request, Response, Status, Streaming};
+
+pub mod validate;
+
+pub use validate::{ColumnHandOff, GossipColumnBytes, HandOff, MAX_BATCH_MESSAGES};
 
 /// The service that serves `ethswarm.chain.v1`, and its socket directory's name.
 pub const CHAIN_SERVICE: &str = "cl-chain";
@@ -69,12 +76,13 @@ pub const CHAIN_SERVICE: &str = "cl-chain";
 pub const P2P_CALLER: &str = "cl-p2p";
 
 /// The `ethswarm.chain.v1` methods that cl-p2p calls, and only those: our Status, the custody
-/// columns by range and by root, and the custody subscriptions.
-pub const CHAIN_METHODS: [&str; 4] = [
+/// columns by range and by root, the custody subscriptions, and the column hand-off.
+pub const CHAIN_METHODS: [&str; 5] = [
     "/ethswarm.chain.v1.ReqRespService/GetStatus",
     "/ethswarm.chain.v1.ReqRespService/DataColumnsByRange",
     "/ethswarm.chain.v1.ReqRespService/DataColumnsByRoot",
     "/ethswarm.chain.v1.GossipService/WatchSubscriptions",
+    "/ethswarm.chain.v1.GossipService/Validate",
 ];
 
 /// The file in the store's directory that holds the node ID the store's custody follows: written
@@ -84,6 +92,15 @@ pub const NODE_ID_FILE: &str = "node-id";
 /// The `WatchSubscriptions` streams open at once at most \[est\]: cl-p2p holds one, and a
 /// reconnect may briefly hold a second.
 pub const MAX_WATCHERS: usize = 4;
+
+/// The `Validate` streams open at once at most \[est\]: cl-p2p holds one, and a reconnect may
+/// briefly hold a second.
+pub const MAX_VALIDATE_STREAMS: usize = 4;
+
+/// The largest `Validate` request frame cl-chain decodes: one message of `MAX_PAYLOAD_SIZE`
+/// (10 MiB, the cap of `Envelope.ssz`) and its framing. cl-p2p sends smaller batches
+/// (a few MiB), and a larger sidecar alone.
+pub const MAX_GOSSIP_REQUEST_BYTES: usize = 12 * 1024 * 1024;
 
 /// How long cl-verify may take for one column's cells \[est\].
 pub const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -603,7 +620,10 @@ fn claim_node_id(dir: &Path, node_id: U256, has_custody: bool) -> Result<(), Ope
 
 /// cl-chain in probe mode (see the module docs).
 pub struct ProbeService<E: EthSpec, V> {
-    ingest: Ingest<E, V>,
+    /// The only lasting hold of the store: [`StoreHandOff`] holds it weakly, and strongly only
+    /// for one column. The service's drop waits until no hand-off holds it, so the store closes
+    /// (its writer thread joined) in that drop.
+    ingest: Arc<Ingest<E, V>>,
     writer: Arc<ColumnWriter>,
     columns: Arc<ColumnServer>,
     status: Arc<StatusProvider<BeaconApi>>,
@@ -695,7 +715,7 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ProbeService<E, V> {
         );
         let (stop, _) = watch::channel(false);
         Ok(Self {
-            ingest,
+            ingest: Arc::new(ingest),
             writer,
             columns,
             status,
@@ -712,45 +732,40 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ProbeService<E, V> {
     /// subnet `subnet_id`: decoded by the fork of its slot, and stored if the storage contract
     /// passes it. A `fork_digest` that is not the digest of its slot's epoch is dropped without
     /// decoding (`proto/README.md`). Returns whether it was handed to the store. Every column
-    /// is IGNOREd: none is forwarded.
+    /// is IGNOREd: none is forwarded. `GossipService/Validate` hands columns over the same way
+    /// ([`Self::column_hand_off`]), with the slot of their envelope.
     pub fn accept_column(&self, fork_digest: [u8; 4], subnet_id: u64, data: &[u8]) -> bool {
         let Ok(slot) = forked::DataColumnSidecar::<E>::peek_slot(data) else {
             tracing::debug!("a column sidecar without a slot: dropped");
             return false;
         };
-        let epoch = slot / self.net.slots_per_epoch().max(1);
-        if self.net.digest_at(epoch) != Some(fork_digest) {
-            tracing::debug!(
-                slot,
-                "a column sidecar on another fork digest's topic: dropped"
-            );
-            return false;
-        }
-        let schedule = self.net.config().fork_schedule();
-        match forked::DataColumnSidecar::<E>::from_ssz_bytes_by_slot(data, schedule, &self.caps) {
-            Ok(forked::DataColumnSidecar::Gloas(sidecar)) => {
-                let _ = self.ingest.on_column(GossipColumn { sidecar, subnet_id });
-                true
-            }
-            Ok(other) => {
-                tracing::debug!(
-                    slot = other.slot(),
-                    "a column sidecar before Gloas: not stored"
-                );
-                false
-            }
-            Err(e) => {
-                tracing::debug!(error = ?e, "a column sidecar that does not decode: dropped");
-                false
-            }
+        let column = GossipColumnBytes {
+            fork_digest,
+            slot,
+            subnet_id,
+            ssz: data,
+        };
+        self.store_hand_off().hand_over(column) == HandOff::Stored
+    }
+
+    /// The store as `GossipService/Validate` hands column sidecars to it ([`StoreHandOff`]).
+    #[must_use]
+    pub fn column_hand_off(&self) -> Arc<dyn ColumnHandOff> {
+        Arc::new(self.store_hand_off())
+    }
+
+    fn store_hand_off(&self) -> StoreHandOff<E, V> {
+        StoreHandOff {
+            ingest: Arc::downgrade(&self.ingest),
+            net: self.net.clone(),
+            caps: self.caps,
+            stop: self.stop.subscribe(),
         }
     }
-}
 
-impl<E: EthSpec, V> ProbeService<E, V> {
     /// Every `ethswarm.chain.v1` service: `ReqRespService` from the column server and our
-    /// Status, `GossipService/WatchSubscriptions` from the custody, the rest stubs. Serve them
-    /// behind [`chain_acl`].
+    /// Status, `GossipService` from the custody and the column store, the rest stubs. Serve
+    /// them behind [`chain_acl`].
     #[must_use]
     pub fn routes(&self) -> Routes {
         ChainStub::new(self.link.clone())
@@ -759,15 +774,8 @@ impl<E: EthSpec, V> ProbeService<E, V> {
             .routes()
     }
 
-    /// `ReqRespService`: the column server and our Status.
-    #[must_use]
-    pub fn req_resp_server(&self) -> ReqRespServer {
-        ReqRespServer::new(self.link.clone(), Arc::clone(&self.columns))
-            .serving_status(Arc::clone(&self.status) as Arc<dyn ChainStatus>)
-    }
-
-    /// `GossipService`: the custody subscriptions on the wall clock, its streams ended by
-    /// [`Self::stream_stop`].
+    /// `GossipService`: the custody subscriptions on the wall clock and the column hand-off
+    /// to the store, its streams ended by [`Self::stream_stop`].
     #[must_use]
     pub fn gossip_server(&self) -> GossipServer {
         GossipServer::new(
@@ -776,6 +784,85 @@ impl<E: EthSpec, V> ProbeService<E, V> {
             Arc::new(system_ms),
             self.stop.subscribe(),
         )
+        .validating(self.column_hand_off())
+    }
+}
+
+/// The column store of a [`ProbeService`] as [`ColumnHandOff`]: it holds the store weakly, so a
+/// `Validate` stream that outlives the service holds no store open, and from the stop on it
+/// hands nothing over.
+struct StoreHandOff<E: EthSpec, V> {
+    ingest: Weak<Ingest<E, V>>,
+    net: ProbeNetwork,
+    caps: NetworkCaps,
+    /// The service's stop ([`StreamStop::end_streams`]).
+    stop: watch::Receiver<bool>,
+}
+
+impl<E: EthSpec, V: KzgVerifier + 'static> ColumnHandOff for StoreHandOff<E, V> {
+    /// The sidecar's own slot must be its envelope's, and the fork digest the digest of that
+    /// slot's epoch; else it is dropped undecoded. Then it is decoded by the fork of its slot,
+    /// and a Gloas sidecar goes to the store ([`ColumnIngest::on_column`]).
+    fn hand_over(&self, column: GossipColumnBytes<'_>) -> HandOff {
+        let Ok(slot) = forked::DataColumnSidecar::<E>::peek_slot(column.ssz) else {
+            tracing::debug!("a column sidecar without a slot: dropped");
+            return HandOff::Dropped("probe: IGNORE: a column sidecar without a slot");
+        };
+        if slot != column.slot {
+            tracing::debug!(
+                slot,
+                envelope_slot = column.slot,
+                "a column sidecar whose slot is not its envelope's: dropped"
+            );
+            return HandOff::Dropped("probe: IGNORE: the sidecar's slot is not its envelope's");
+        }
+        let epoch = slot / self.net.slots_per_epoch().max(1);
+        if self.net.digest_at(epoch) != Some(column.fork_digest) {
+            tracing::debug!(
+                slot,
+                "a column sidecar on another fork digest's topic: dropped"
+            );
+            return HandOff::Dropped("probe: IGNORE: another fork digest's topic, not decoded");
+        }
+        let schedule = self.net.config().fork_schedule();
+        let sidecar = match forked::DataColumnSidecar::<E>::from_ssz_bytes_by_slot(
+            column.ssz, schedule, &self.caps,
+        ) {
+            Ok(forked::DataColumnSidecar::Gloas(sidecar)) => sidecar,
+            Ok(other) => {
+                tracing::debug!(
+                    slot = other.slot(),
+                    "a column sidecar before Gloas: not stored"
+                );
+                return HandOff::Dropped("probe: IGNORE: a column sidecar before Gloas");
+            }
+            Err(e) => {
+                tracing::debug!(error = ?e, "a column sidecar that does not decode: dropped");
+                return HandOff::Dropped("probe: IGNORE: a column sidecar that does not decode");
+            }
+        };
+        // Held for this column only; the service's drop waits for it.
+        let stopping = HandOff::Dropped("probe: IGNORE: cl-chain is stopping");
+        if *self.stop.borrow() {
+            return stopping;
+        }
+        let Some(ingest) = self.ingest.upgrade() else {
+            return stopping;
+        };
+        let _ = ingest.on_column(GossipColumn {
+            sidecar,
+            subnet_id: column.subnet_id,
+        });
+        HandOff::Stored
+    }
+}
+
+impl<E: EthSpec, V> ProbeService<E, V> {
+    /// `ReqRespService`: the column server and our Status.
+    #[must_use]
+    pub fn req_resp_server(&self) -> ReqRespServer {
+        ReqRespServer::new(self.link.clone(), Arc::clone(&self.columns))
+            .serving_status(Arc::clone(&self.status) as Arc<dyn ChainStatus>)
     }
 
     /// The handle that ends every `WatchSubscriptions` stream ([`StreamStop::end_streams`]), for
@@ -855,14 +942,25 @@ impl<E: EthSpec, V> ProbeService<E, V> {
     }
 }
 
+impl<E: EthSpec, V> Drop for ProbeService<E, V> {
+    /// Waits until no hand-off holds the store (one holds it for one column at most, and none
+    /// takes it from the stop on), so the store closes in this drop: the drop that the
+    /// service's stop times (`cl_chain::service::close_within`).
+    fn drop(&mut self) {
+        while Arc::strong_count(&self.ingest) > 1 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 /// Ends the `WatchSubscriptions` streams of a [`ProbeService`] ([`ProbeService::stream_stop`]).
 #[derive(Clone, Debug)]
 pub struct StreamStop(Arc<watch::Sender<bool>>);
 
 impl StreamStop {
     /// Ends every stream now, with `UNAVAILABLE`: a stream that stays open would hold the
-    /// shutdown's drain to its deadline. Streams opened after this end at once. Called at the
-    /// start of a shutdown.
+    /// shutdown's drain to its deadline. Streams opened after this end at once, and the column
+    /// hand-off takes no more columns. Called at the start of a shutdown.
     pub fn end_streams(&self) {
         self.0.send_replace(true);
     }
@@ -931,13 +1029,14 @@ impl Subscriptions {
 /// Unix milliseconds now ([`ipc::hello::Clock`]).
 pub type WallMs = ipc::hello::Clock;
 
-/// `ethswarm.chain.v1.GossipService` with `WatchSubscriptions` served from [`Subscriptions`];
+/// `ethswarm.chain.v1.GossipService` with `WatchSubscriptions` served from [`Subscriptions`]
+/// and, once it is given a column hand-off ([`Self::validating`]), `Validate` ([`validate`]);
 /// the rest are stubs (contract checks, then `UNIMPLEMENTED`).
 ///
 /// A `WatchSubscriptions` stream sends our hello, then the body, then a new body each time it
 /// changes (checked at each epoch start of the wall clock `clock`). It ends with `UNAVAILABLE`
 /// when `stop` turns true or its sender is dropped (the service stops), and ends when the
-/// client goes.
+/// client goes. A `Validate` stream ends the same way.
 #[derive(Clone)]
 pub struct GossipServer {
     link: Link,
@@ -946,6 +1045,9 @@ pub struct GossipServer {
     stop: watch::Receiver<bool>,
     /// A place per open `WatchSubscriptions` stream ([`MAX_WATCHERS`]).
     watchers: Arc<tokio::sync::Semaphore>,
+    /// A place per open `Validate` stream ([`MAX_VALIDATE_STREAMS`]).
+    validators: Arc<tokio::sync::Semaphore>,
+    columns: Option<Arc<dyn ColumnHandOff>>,
 }
 
 impl std::fmt::Debug for GossipServer {
@@ -953,6 +1055,7 @@ impl std::fmt::Debug for GossipServer {
         f.debug_struct("GossipServer")
             .field("link", &self.link)
             .field("subscriptions", &self.subscriptions)
+            .field("validating", &self.columns.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -972,13 +1075,23 @@ impl GossipServer {
             clock,
             stop,
             watchers: Arc::new(tokio::sync::Semaphore::new(MAX_WATCHERS)),
+            validators: Arc::new(tokio::sync::Semaphore::new(MAX_VALIDATE_STREAMS)),
+            columns: None,
         }
     }
 
-    /// The tonic service.
+    /// The same server with `Validate` served: every column sidecar goes to `columns`, and every
+    /// verdict is IGNORE ([`validate`]).
+    #[must_use]
+    pub fn validating(mut self, columns: Arc<dyn ColumnHandOff>) -> Self {
+        self.columns = Some(columns);
+        self
+    }
+
+    /// The tonic service. It decodes request frames of up to [`MAX_GOSSIP_REQUEST_BYTES`].
     #[must_use]
     pub fn into_service(self) -> GossipServiceServer<Self> {
-        GossipServiceServer::new(self)
+        GossipServiceServer::new(self).max_decoding_message_size(MAX_GOSSIP_REQUEST_BYTES)
     }
 }
 
@@ -1071,7 +1184,25 @@ impl GossipService for GossipServer {
         &self,
         request: Request<Streaming<pb::ValidateRequest>>,
     ) -> Result<Response<Self::ValidateStream>, Status> {
-        ipc::stub::bidi(&self.link, "validate", request)
+        let Some(columns) = self.columns.clone() else {
+            return ipc::stub::bidi(&self.link, "validate", request);
+        };
+        // Held by the stream's task until the stream ends.
+        let place = Arc::clone(&self.validators)
+            .try_acquire_owned()
+            .map_err(|_| {
+                Status::resource_exhausted(format!(
+                    "{MAX_VALIDATE_STREAMS} Validate streams are open already"
+                ))
+            })?;
+        let frames = validate::serve_stream(
+            self.link.clone(),
+            columns,
+            request.into_inner(),
+            self.stop.clone(),
+            place,
+        );
+        Ok(Response::new(Box::pin(ReceiverStream::new(frames))))
     }
 }
 

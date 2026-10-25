@@ -19,6 +19,11 @@ use p2p_wire::enr::{decode_cgc, EnrFieldError, CGC_KEY, ETH2_KEY};
 /// The largest record EIP-778 allows.
 pub const MAX_RECORD_LEN: usize = 300;
 
+/// The longest record text read: `enr:` and the base64 of [`MAX_RECORD_LEN`] bytes (404 bytes),
+/// with room. A longer text is refused before it is decoded, so a peer service cannot make the
+/// reader decode an unbounded text.
+pub const MAX_TEXT_LEN: usize = 512;
+
 /// `ENRForkID`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnrForkId {
@@ -36,6 +41,9 @@ pub enum EnrError {
     /// No `enr:` prefix, or not unpadded URL-safe base64.
     #[error("not an enr: text record")]
     Text,
+    /// A text of more than [`MAX_TEXT_LEN`] bytes, not decoded.
+    #[error("record text of {0} bytes, over {MAX_TEXT_LEN}")]
+    TextTooLong(usize),
     /// More than [`MAX_RECORD_LEN`] bytes.
     #[error("record of {0} bytes, over {MAX_RECORD_LEN}")]
     TooLong(usize),
@@ -124,6 +132,9 @@ fn item(buf: &[u8]) -> Result<(Item<'_>, &[u8]), EnrError> {
 ///
 /// The record is malformed, or the value of `key` is a list.
 pub fn field(text: &str, key: &[u8]) -> Result<Option<Vec<u8>>, EnrError> {
+    if text.len() > MAX_TEXT_LEN {
+        return Err(EnrError::TextTooLong(text.len()));
+    }
     let b64 = text.strip_prefix("enr:").ok_or(EnrError::Text)?;
     let raw = data_encoding::BASE64URL_NOPAD
         .decode(b64.as_bytes())
@@ -255,6 +266,11 @@ mod tests {
             ("enr:***".to_owned(), EnrError::Text),
             (format!("{ENR_GLOAS}="), EnrError::Text),
             (text(&[0xc0; 301]), EnrError::TooLong(301)),
+            // Refused by its length before any decode: 513 bytes of text.
+            (
+                format!("enr:{}", "A".repeat(509)),
+                EnrError::TextTooLong(513),
+            ),
             (record(&[(b"id", rlp_bytes(b"v4"))]), EnrError::NoEth2),
             (
                 record(&[(b"eth2", rlp_bytes(&[0; 15]))]),

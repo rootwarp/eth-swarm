@@ -745,6 +745,7 @@ mod tests {
                 },
                 chain::GossipMessage::default(),
             ],
+            ..Default::default()
         };
         assert_eq!(batch.envelopes().len(), 1);
         let chunk = p2p::RequestBlocksByRangeResponseBody {

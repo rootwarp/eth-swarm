@@ -31,9 +31,10 @@ messages. Each unit must, in its [Service] section unless noted:
     OOMPolicy=stop or kill (never continue, and never the host's DefaultOOMPolicy=), so an OOM
     kill fails the unit and Restart= applies;
   - carry the full hardening set of the committed units (HARDENING below, plus an empty
-    CapabilityBoundingSet= and no AmbientCapabilities=, an allow-list RestrictAddressFamilies=
-    within AF_UNIX AF_INET AF_INET6, StateDirectory= the user's name, and ReadWritePaths=
-    exactly its /var/lib/<StateDirectory>).
+    CapabilityBoundingSet= and no AmbientCapabilities=, RestrictAddressFamilies= exactly the
+    unit's "families" in UNITS (AF_UNIX AF_INET AF_INET6, and for cl-p2p AF_NETLINK too: libp2p-tcp's
+    wildcard listen watches the interfaces through a netlink route socket), StateDirectory= the
+    user's name, and ReadWritePaths= exactly its /var/lib/<StateDirectory>).
 Fail-closed reading: a unit file may hold only tab, newline and printable ASCII bytes, no
 backslash, and no line that is not blank, a comment, a [section] header or a key=value inside
 a section; anything else refuses the whole file, so there is no continuation, escape or exotic
@@ -55,10 +56,16 @@ import re
 import shlex
 import sys
 
+# The address families each unit may use, exactly. cl-p2p alone needs AF_NETLINK: for a wildcard
+# listen (/ip4/0.0.0.0/tcp/...) libp2p-tcp watches the host's interfaces (if-watch) through a
+# netlink route socket, and without it the listen fails at start. cl-discv5 binds one UDP socket
+# and cl-chain uses Unix and TCP sockets only, so neither gets netlink.
+INET = ["AF_UNIX", "AF_INET", "AF_INET6"]
 UNITS = {
-    "ethswarm-p2p.service": {"user": "ethswarm-p2p", "node_key": True},
-    "ethswarm-discv5.service": {"user": "ethswarm-discv5", "node_key": True},
-    "ethswarm-chain.service": {"user": "ethswarm-chain", "node_key": False},
+    "ethswarm-p2p.service": {"user": "ethswarm-p2p", "node_key": True,
+                             "families": INET + ["AF_NETLINK"]},
+    "ethswarm-discv5.service": {"user": "ethswarm-discv5", "node_key": True, "families": INET},
+    "ethswarm-chain.service": {"user": "ethswarm-chain", "node_key": False, "families": INET},
 }
 CREDENTIAL = "nodekey"
 # The shortest line refused. systemd 257 reads unit files with read_line(LONG_LINE_MAX = 1 MiB)
@@ -70,7 +77,6 @@ LINE_MAX = 2048
 # A unit file's size cap: the committed units are under 4 KiB.
 FILE_MAX = 64 * 1024
 TRUE = {"yes", "y", "true", "t", "on", "1"}
-FAMILIES = {"AF_UNIX", "AF_INET", "AF_INET6"}
 # Settings whose assignments accumulate, and which an empty assignment resets.
 EXEC_KEYS = ("ExecStart", "ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost",
              "ExecReload", "ExecCondition")
@@ -177,7 +183,7 @@ EXPECTED = {
         ('Service', 'PrivateDevices', 'yes'),
         ('Service', 'CapabilityBoundingSet', ''),
         ('Service', 'AmbientCapabilities', ''),
-        ('Service', 'RestrictAddressFamilies', 'AF_UNIX AF_INET AF_INET6'),
+        ('Service', 'RestrictAddressFamilies', 'AF_UNIX AF_INET AF_INET6 AF_NETLINK'),
         ('Service', 'RestrictNamespaces', 'yes'),
         ('Service', 'RestrictRealtime', 'yes'),
         ('Service', 'RestrictSUIDSGID', 'yes'),
@@ -671,7 +677,7 @@ def lint_memory(service):
     return found
 
 
-def lint_hardening(service, user):
+def lint_hardening(service, user, want_families):
     found = []
     for key, want in HARDENING.items():
         got = last(service, key)
@@ -694,9 +700,9 @@ def lint_hardening(service, user):
     families = effective(service, "RestrictAddressFamilies")
     if not families:
         found.append("missing RestrictAddressFamilies=")
-    elif families[0].startswith("~") or not set(families) <= FAMILIES:
-        found.append("RestrictAddressFamilies=%s, want an allow-list within %s"
-                     % (" ".join(families), " ".join(sorted(FAMILIES))))
+    elif families != want_families:
+        found.append("RestrictAddressFamilies=%s, want exactly the allow-list %s"
+                     % (" ".join(families), " ".join(want_families)))
     state = effective(service, "StateDirectory")
     if state != [user]:
         found.append("StateDirectory=%s, want StateDirectory=%s"
@@ -729,7 +735,7 @@ def lint(path, rules):
             + lint_anchor_check(service)
             + lint_start_and_restart(sections.get("Unit", {}), service)
             + lint_memory(service)
-            + lint_hardening(service, rules["user"]))
+            + lint_hardening(service, rules["user"], rules["families"]))
 
 
 def main(argv):
