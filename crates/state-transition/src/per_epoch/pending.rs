@@ -8,24 +8,29 @@
 //!
 //! # Verdicts to prefetch
 //!
-//! A caller that prefetches verdicts must fetch one for each pending deposit that the step
-//! can reach (the finalized deposits up to `MAX_PENDING_DEPOSITS_PER_EPOCH`) and whose key
-//! is not in the registry of the pre-state. An earlier deposit of the same epoch can add the
-//! key, and then a later deposit for it is a top-up that needs no verdict. A deposit for a
-//! key whose earlier deposit was invalid needs its own verdict.
+//! Use [`pending_deposit_signature_sets`] to get the sets to prefetch before a slot loop.
+//! Do not filter the queue by the finality of the pre-state:
+//! `process_justification_and_finalization` runs first in the same `process_epoch` and can
+//! move the finalized checkpoint forward. Also, one slot loop can cross more than one epoch
+//! boundary, and each boundary can apply up to `MAX_PENDING_DEPOSITS_PER_EPOCH` deposits.
+//!
+//! An earlier deposit can add a key, and then a later deposit for it is a top-up that needs
+//! no verdict. A deposit for a key whose earlier deposit was invalid needs its own verdict.
 
 use super::registry::get_max_effective_balance;
+use super::state_validator;
 use crate::accessors::{get_activation_churn_limit, get_current_epoch, TotalActiveBalanceCache};
 use crate::mutators::{decrease_balance, increase_balance};
 use crate::preset::{EFFECTIVE_BALANCE_INCREMENT, MAX_PENDING_DEPOSITS_PER_EPOCH};
-use crate::signatures::is_valid_deposit_signature;
-use crate::{Preset, SignatureBackend, StfError};
+use crate::signatures::{deposit_signature_set, is_valid_deposit_signature};
+use crate::{Preset, SignatureBackend, SignatureSet, StfError};
 use consensus_types::common::{PendingDeposit, Validator};
 use consensus_types::gloas::BeaconState;
 use consensus_types::primitives::{
-    BLSPubkey, Bytes32, Gwei, ValidatorIndex, Version, FAR_FUTURE_EPOCH,
+    BLSPubkey, Bytes32, Gwei, Slot, ValidatorIndex, Version, FAR_FUTURE_EPOCH,
 };
 use milhouse::{ProgressiveList, Value};
+use std::collections::{HashMap, HashSet};
 
 /// `validator_pubkeys.index(pubkey)`: the index of the first validator with `pubkey`. It
 /// reads the registry until the first match.
@@ -38,6 +43,94 @@ fn validator_index_of<E: Preset>(
         .iter()
         .position(|validator| validator.pubkey == *pubkey)
         .map(|index| index as ValidatorIndex)
+}
+
+/// `validator_pubkeys.index(pubkey)` for each key of `pubkeys`, in one pass over the
+/// registry: the index of the first validator with the key, or `None` for a key that no
+/// validator has. The pass stops when it found each key.
+fn validator_indices_of<'a, E: Preset>(
+    state: &BeaconState<E>,
+    pubkeys: impl IntoIterator<Item = &'a BLSPubkey>,
+) -> HashMap<BLSPubkey, Option<ValidatorIndex>> {
+    let mut indices: HashMap<BLSPubkey, Option<ValidatorIndex>> =
+        pubkeys.into_iter().map(|pubkey| (*pubkey, None)).collect();
+    let mut missing = indices.len();
+    if missing == 0 {
+        return indices;
+    }
+    for (i, validator) in state.validators.iter().enumerate() {
+        if let Some(index @ None) = indices.get_mut(&validator.pubkey) {
+            *index = Some(i as ValidatorIndex);
+            missing -= 1;
+            if missing == 0 {
+                break;
+            }
+        }
+    }
+    indices
+}
+
+/// The deposit signature sets that `process_slots(state, slot, bls)` can give to
+/// `bls.backend`: the verdicts to prefetch before the slot loop. A caller that holds a
+/// verdict for each of these sets gets no [`StfError::MissingVerdict`] from the slot loop.
+///
+/// The list can hold more sets than the loop asks for. For each epoch boundary that the
+/// loop crosses, it holds each deposit with a key that is not in the registry of `state`,
+/// in the first `MAX_PENDING_DEPOSITS_PER_EPOCH` entries of the queue at that boundary.
+/// It has no finality filter, and it lists each set one time, in the queue order.
+///
+/// The queue of each boundary comes from the queue of `state` only:
+///
+/// - Only blocks append deposits to the queue (deposit requests and the excess balance of
+///   a switch to compounding credentials), and a slot loop applies no block.
+/// - `process_pending_deposits` removes at most `MAX_PENDING_DEPOSITS_PER_EPOCH` deposits
+///   from the front, and it appends again only the postponed deposits of validators that
+///   exit. The key of such a deposit is in the registry, so it needs no verdict.
+/// - The registry only grows, so a key of `state` never needs a verdict.
+///
+/// Thus the `k`-th boundary reads only the first `k * MAX_PENDING_DEPOSITS_PER_EPOCH`
+/// deposits of `state`. Call this function again on the state after each block, because
+/// the block can add deposits. It reads the registry one time.
+pub fn pending_deposit_signature_sets<E: Preset>(
+    state: &BeaconState<E>,
+    slot: Slot,
+    genesis_fork_version: Version,
+) -> Vec<SignatureSet> {
+    // `process_slots` fails before the loop when `state.slot >= slot`.
+    if state.slot >= slot {
+        return Vec::new();
+    }
+    let slots_per_epoch = E::slots_per_epoch();
+    let boundaries = slot / slots_per_epoch - state.slot / slots_per_epoch;
+    let reach = boundaries.saturating_mul(MAX_PENDING_DEPOSITS_PER_EPOCH);
+    let window: Vec<&PendingDeposit> = state
+        .pending_deposits
+        .iter()
+        .take(usize::try_from(reach).unwrap_or(usize::MAX))
+        .collect();
+    let indices = validator_indices_of(state, window.iter().map(|deposit| &deposit.pubkey));
+    let mut listed = HashSet::new();
+    window
+        .into_iter()
+        .filter(|deposit| matches!(indices.get(&deposit.pubkey), Some(None)))
+        .filter(|deposit| {
+            listed.insert((
+                deposit.pubkey,
+                deposit.withdrawal_credentials,
+                deposit.amount,
+                deposit.signature,
+            ))
+        })
+        .map(|deposit| {
+            deposit_signature_set(
+                deposit.pubkey,
+                deposit.withdrawal_credentials,
+                deposit.amount,
+                deposit.signature,
+                genesis_fork_version,
+            )
+        })
+        .collect()
 }
 
 /// `get_validator_from_deposit` (E L1707-1727, Modified in Electra): a validator that is not
@@ -241,6 +334,15 @@ pub(crate) fn process_pending_deposits_with<E: Preset>(
         .take(MAX_PENDING_DEPOSITS_PER_EPOCH as usize)
         .cloned()
         .collect();
+    // The finalized slot does not change in the step, so the loop stops at the first deposit
+    // past it. One pass over the registry finds the index of each key before that deposit.
+    let mut indices = validator_indices_of(
+        state,
+        deposits
+            .iter()
+            .take_while(|deposit| deposit.slot <= finalized_slot)
+            .map(|deposit| &deposit.pubkey),
+    );
     for deposit in &deposits {
         // Check if deposit has been finalized, otherwise, stop processing.
         if deposit.slot > finalized_slot {
@@ -254,19 +356,26 @@ pub(crate) fn process_pending_deposits_with<E: Preset>(
         // Read validator state
         let mut is_validator_exited = false;
         let mut is_validator_withdrawn = false;
-        let index = validator_index_of(state, &deposit.pubkey);
+        let index = indices.get(&deposit.pubkey).copied().flatten();
         if let Some(index) = index {
-            let validator = state
-                .validators
-                .get(index as usize)
-                .ok_or(StfError::UnknownValidator(index))?;
+            let validator = state_validator(state, index)?;
             is_validator_exited = validator.exit_epoch < FAR_FUTURE_EPOCH;
             is_validator_withdrawn = validator.withdrawable_epoch < next_epoch;
         }
+        let mut apply = |state: &mut BeaconState<E>| {
+            apply_indexed_deposit(
+                state,
+                deposit,
+                index,
+                &mut indices,
+                genesis_fork_version,
+                backend,
+            )
+        };
         if is_validator_withdrawn {
             // Deposited balance will never become active. Increase balance but do not
             // consume churn
-            apply_pending_deposit_at(state, deposit, index, genesis_fork_version, backend)?;
+            apply(state)?;
         } else if is_validator_exited {
             // Validator is exiting, postpone the deposit until after withdrawable epoch
             deposits_to_postpone.push(deposit.clone());
@@ -282,7 +391,7 @@ pub(crate) fn process_pending_deposits_with<E: Preset>(
             }
             // Consume churn and apply deposit.
             processed_amount = amount;
-            apply_pending_deposit_at(state, deposit, index, genesis_fork_version, backend)?;
+            apply(state)?;
         }
         // Regardless of how the deposit was handled, we move on in the queue.
         next_deposit_index += 1;
@@ -306,7 +415,31 @@ pub(crate) fn process_pending_deposits_with<E: Preset>(
     Ok(())
 }
 
+/// [`apply_pending_deposit_at`], and then the index of a key that the deposit added to the
+/// registry goes into `indices`. Thus a later deposit for the key in the same step is a
+/// top-up, with no other pass over the registry.
+fn apply_indexed_deposit<E: Preset>(
+    state: &mut BeaconState<E>,
+    deposit: &PendingDeposit,
+    index: Option<ValidatorIndex>,
+    indices: &mut HashMap<BLSPubkey, Option<ValidatorIndex>>,
+    genesis_fork_version: Version,
+    backend: &dyn SignatureBackend,
+) -> Result<(), StfError> {
+    let new_index = state.validators.len() as ValidatorIndex;
+    apply_pending_deposit_at(state, deposit, index, genesis_fork_version, backend)?;
+    if index.is_none() && state.validators.len() as ValidatorIndex > new_index {
+        // `add_validator_to_registry` appends the key at the end of the registry.
+        indices.insert(deposit.pubkey, Some(new_index));
+    }
+    Ok(())
+}
+
 /// `process_pending_consolidations` (E L1208-1229, New in Electra; Gloas keeps it).
+///
+/// The source and the target indices come from our own queue, and the consolidation request
+/// checked both against the registry. Thus an index past the registry is a fault of our own
+/// state (`ListIndexOutOfRange`), not a proof.
 pub fn process_pending_consolidations<E: Preset>(
     state: &mut BeaconState<E>,
 ) -> Result<(), StfError> {
@@ -322,10 +455,7 @@ pub fn process_pending_consolidations<E: Preset>(
         .cloned()
     {
         let source_index = pending_consolidation.source_index;
-        let source_validator = state
-            .validators
-            .get(source_index as usize)
-            .ok_or(StfError::UnknownValidator(source_index))?;
+        let source_validator = state_validator(state, source_index)?;
         if source_validator.slashed {
             next_pending_consolidation += 1;
             continue;
@@ -345,11 +475,14 @@ pub fn process_pending_consolidations<E: Preset>(
         let source_effective_balance = balance.min(source_validator.effective_balance);
         // Move active balance to target. Excess balance is withdrawable.
         decrease_balance(state, source_index, source_effective_balance)?;
-        increase_balance(
-            state,
-            pending_consolidation.target_index,
-            source_effective_balance,
-        )?;
+        let target_index = pending_consolidation.target_index;
+        increase_balance(state, target_index, source_effective_balance).map_err(|e| match e {
+            StfError::UnknownValidator(index) => StfError::ListIndexOutOfRange {
+                list: "validators",
+                index,
+            },
+            e => e,
+        })?;
         next_pending_consolidation += 1;
     }
     state
@@ -469,6 +602,57 @@ mod tests {
             StfError::MissingVerdict(BackendError("not prefetched".into()))
         );
         assert!(!err.proves_invalid());
+    }
+
+    #[test]
+    fn prefetch_lists_each_new_key_that_the_crossed_boundaries_can_reach() {
+        // The state is at slot 39, the last slot of epoch 4, and finalized at slot 16.
+        let mut state = state();
+        let first = deposit([0xa1; 48], 32 * ETH, 0);
+        // Past the finalized slot: the justification of the same epoch can finalize it, so
+        // the list has no finality filter.
+        let unfinalized = deposit([0xa2; 48], ETH, 30);
+        let top_up = deposit(key_of(1), ETH, 0);
+        // Positions 0 to 15 are in the reach of the first boundary. A second copy of a set
+        // is listed one time, and a key of the registry needs no verdict.
+        let mut deposits = vec![first.clone(), unfinalized.clone(), first.clone()];
+        deposits.extend(std::iter::repeat_n(top_up, 13));
+        // Positions 16 and 17 are in the reach of the second boundary only. The second
+        // deposit for `[0xa1; 48]` is a top-up if the first one was valid, but it needs its
+        // own verdict if the first one was invalid.
+        let second = deposit([0xb1; 48], 32 * ETH, 0);
+        let again = deposit([0xa1; 48], ETH, 0);
+        deposits.extend([second.clone(), again.clone()]);
+        queue(&mut state, &deposits);
+        let sets = |slot| pending_deposit_signature_sets(&state, slot, GENESIS_FORK_VERSION);
+
+        // `process_slots` fails before the loop, so it asks for no verdict.
+        assert!(sets(39).is_empty() && sets(0).is_empty());
+        let one = vec![set_of(&first), set_of(&unfinalized)];
+        assert_eq!(sets(40), one);
+        assert_eq!(sets(47), one);
+        let two = vec![
+            set_of(&first),
+            set_of(&unfinalized),
+            set_of(&second),
+            set_of(&again),
+        ];
+        assert_eq!(sets(48), two);
+        // Each boundary moves the front of the queue by at most 16 deposits, and only the
+        // queue of the pre-state can reach a boundary of the slot loop.
+        assert_eq!(sets(u64::MAX), two);
+        // A slot loop inside one epoch crosses no boundary.
+        let mut inside = state.clone();
+        inside.slot = 33;
+        assert!(pending_deposit_signature_sets(&inside, 39, GENESIS_FORK_VERSION).is_empty());
+        assert_eq!(
+            pending_deposit_signature_sets(&inside, 40, GENESIS_FORK_VERSION),
+            one
+        );
+        // The domain comes from the genesis fork version.
+        let other = pending_deposit_signature_sets(&state, 40, [0x09; 4]);
+        assert_eq!(other.len(), 2);
+        assert_ne!(other, one);
     }
 
     #[test]
@@ -637,15 +821,24 @@ mod tests {
         assert_eq!(state.balances.get(2), Some(&(64 * ETH)));
         assert_eq!(state.balances.get(0), Some(&(32 * ETH)));
 
-        // A source past the registry is a spec error.
-        let mut state = self::state();
-        state
-            .pending_consolidations
-            .push(consolidation(8, 0))
-            .unwrap();
-        assert_eq!(
-            process_pending_consolidations(&mut state),
-            Err(StfError::UnknownValidator(8))
-        );
+        // The indices come from our own queue: a source or a target past the registry is
+        // a fault of our own state, not a proof.
+        for (source, target) in [(8, 0), (1, 8)] {
+            let mut state = self::state();
+            state.validators.get_mut(1).unwrap().withdrawable_epoch = 5;
+            state
+                .pending_consolidations
+                .push(consolidation(source, target))
+                .unwrap();
+            let err = process_pending_consolidations(&mut state).unwrap_err();
+            assert_eq!(
+                err,
+                StfError::ListIndexOutOfRange {
+                    list: "validators",
+                    index: 8
+                }
+            );
+            assert!(!err.proves_invalid());
+        }
     }
 }

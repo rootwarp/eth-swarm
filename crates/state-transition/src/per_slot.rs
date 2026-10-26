@@ -10,6 +10,12 @@ use tree_hash::TreeHash;
 /// up to `slot`, and `process_epoch` on the last slot of each epoch. `process_epoch` takes
 /// `bls` for its deposits and its sync committee.
 ///
+/// The deposit verdicts are always necessary, also for a block that we produce ourselves.
+/// At each epoch boundary, `bls.backend` must give a verdict for each pending deposit of a
+/// new key that the boundary applies. A missing verdict gives [`StfError::MissingVerdict`],
+/// which is not a proof. Before the call, prefetch a verdict for each set that
+/// [`per_epoch::pending_deposit_signature_sets`] lists for `state` and `slot`.
+///
 /// The work is linear in `slot - state.slot`, and, as in the spec, there is no upper bound.
 /// Bound `slot` against the wall clock before you call it with a slot from the network.
 pub fn process_slots<E: Preset>(

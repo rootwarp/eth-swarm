@@ -378,9 +378,9 @@ pub(crate) fn block_at_state_slot<E: Preset>(state: &BeaconState<E>) -> SignedBe
     block
 }
 
-/// A [`PubkeyAggregator`] without BLS: the byte-wise XOR of the keys. It is not the BLS sum,
-/// but it depends on each key and on the number of times a key occurs. An empty input fails,
-/// as in `eth_aggregate_pubkeys`.
+/// A [`PubkeyAggregator`] without BLS: the byte-wise XOR of the keys. It is not the BLS sum.
+/// It depends on each key, but only on the parity of the number of times a key occurs: two
+/// copies of a key cancel. An empty input fails, as in `eth_aggregate_pubkeys`.
 pub(crate) struct XorAggregator;
 
 impl PubkeyAggregator for XorAggregator {
@@ -420,4 +420,42 @@ impl SignatureBackend for NoVerdicts {
 /// [`bls_context`] with [`NoVerdicts`], for the tests that check no signature.
 pub(crate) fn no_bls() -> BlsContext<'static> {
     bls_context(&NoVerdicts)
+}
+
+/// A [`SignatureBackend`] that holds prefetched verdicts, one for each set, as the verdict
+/// cache of a caller does. A call with a set that it does not hold gives `Err`, as a cache
+/// without that verdict does. Else the call gives `Ok(true)` only if each set is valid. It
+/// records each set that it gets.
+pub(crate) struct PrefetchedBackend {
+    verdicts: Vec<(SignatureSet, bool)>,
+    seen: RefCell<Vec<SignatureSet>>,
+}
+
+impl PrefetchedBackend {
+    /// A backend that holds `verdicts`.
+    pub(crate) fn new(verdicts: impl IntoIterator<Item = (SignatureSet, bool)>) -> Self {
+        Self {
+            verdicts: verdicts.into_iter().collect(),
+            seen: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The sets of every call, in sequence.
+    pub(crate) fn seen(&self) -> Vec<SignatureSet> {
+        self.seen.borrow().clone()
+    }
+}
+
+impl SignatureBackend for PrefetchedBackend {
+    fn verify_signature_sets(&self, sets: &[SignatureSet]) -> Result<bool, BackendError> {
+        self.seen.borrow_mut().extend_from_slice(sets);
+        let mut valid = true;
+        for set in sets {
+            match self.verdicts.iter().find(|(held, _)| held == set) {
+                Some((_, verdict)) => valid &= verdict,
+                None => return Err(BackendError("not prefetched".into())),
+            }
+        }
+        Ok(valid)
+    }
 }

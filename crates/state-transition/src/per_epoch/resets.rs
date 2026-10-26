@@ -3,6 +3,7 @@
 //! summaries (C L379-387), the participation flags (A L826-830) and the sync committees
 //! (A L838-842, with `get_next_sync_committee`, A L356-363).
 
+use super::state_validator;
 use crate::accessors::{get_current_epoch, get_next_sync_committee_indices, get_randao_mix};
 use crate::preset::epochs_per_eth1_voting_period;
 use crate::{Preset, PubkeyAggregator, StfError};
@@ -99,15 +100,10 @@ pub fn get_next_sync_committee<E: Preset>(
     aggregator: &dyn PubkeyAggregator,
 ) -> Result<SyncCommittee<E>, StfError> {
     let indices = get_next_sync_committee_indices(state)?;
+    // The indices come from the registry, so an index past it is a fault of our own state.
     let pubkeys = indices
         .iter()
-        .map(|&index| {
-            state
-                .validators
-                .get(index as usize)
-                .map(|validator| validator.pubkey)
-                .ok_or(StfError::UnknownValidator(index))
-        })
+        .map(|&index| state_validator(state, index).map(|validator| validator.pubkey))
         .collect::<Result<Vec<BLSPubkey>, _>>()?;
     let aggregate_pubkey = aggregator.aggregate_pubkeys(&pubkeys)?;
     // `compute_balance_weighted_selection` gives exactly `SYNC_COMMITTEE_SIZE` indices.

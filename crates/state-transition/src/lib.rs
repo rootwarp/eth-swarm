@@ -202,9 +202,10 @@ pub enum StfError {
         len: u64,
     },
     /// The backend has no verdict for the signature of a deposit with an inline key (for
-    /// example a builder deposit). The caller fetches these verdicts before the transition
-    /// (ADR-011), so this error means that the fetch did not give one. This is never a
-    /// proof that the input is invalid: callers IGNORE, never REJECT, on it.
+    /// example a builder deposit, or a pending deposit of a new key at an epoch boundary).
+    /// The caller fetches these verdicts before the transition (ADR-011), so this error
+    /// means that the fetch did not give one. This is never a proof that the input is
+    /// invalid: callers IGNORE, never REJECT, on it.
     #[error("no prefetched deposit signature verdict: {0}")]
     MissingVerdict(BackendError),
     /// `process_block_header` asserts `block.slot == state.slot`.
@@ -442,11 +443,11 @@ pub enum StfError {
 impl StfError {
     /// Whether the error proves that the input is invalid by the spec (REJECT). It does not
     /// for a step that is not ported yet, a backend without a verdict, a missing deposit
-    /// verdict, a failed pubkey aggregation, a committee cache of another epoch or seed, a failure of the state trees, a
-    /// state list shorter than the registry, a `proposer_lookahead` entry past the registry
-    /// or a code index past a spec table (`ListIndexOutOfRange`), or a participation epoch
-    /// other than the previous and the current one (`ParticipationEpochOutOfRange`):
-    /// callers IGNORE those, never REJECT.
+    /// verdict, a failed pubkey aggregation, a committee cache of another epoch or seed, a
+    /// failure of the state trees, a state list shorter than the registry, a
+    /// `proposer_lookahead` entry past the registry or a code index past a spec table
+    /// (`ListIndexOutOfRange`), or a participation epoch other than the previous and the
+    /// current one (`ParticipationEpochOutOfRange`): callers IGNORE those, never REJECT.
     ///
     /// These variants are a proof only when the state is the object's own pre-state,
     /// advanced to the object's slot: [`StfError::EpochOutOfWindow`],
@@ -617,14 +618,20 @@ pub fn state_root<E: Preset>(state: &mut BeaconState<E>) -> Result<Root, StfErro
 /// ([`per_block::check_block_header`]) and then checks every signature set of the block
 /// ([`signatures::block_signature_sets`]) through `bls.backend` in one call. A block that
 /// fails the header checks costs no registry read and no backend call. On `Err`, `state` is
-/// partly updated: the caller drops it. The epoch processing of the slots also reads `bls`
-/// (see [`per_epoch::process_epoch`]).
+/// partly updated: the caller drops it.
 ///
-/// `validate_result` false skips every BLS check: the proposer signature, the RANDAO reveal
-/// and the sync aggregate signature. The spec skips only the proposer signature there.
-/// Use `validate_result` false only to compute the state root of a block that we produce
-/// ourselves, whose signatures we made. The checks that need no BLS (for example the
-/// infinity signature of an empty sync aggregate) run in both modes.
+/// `validate_result` controls only the signature sets of the block. With `validate_result`
+/// false, the call does not check the proposer signature, the RANDAO reveal, the sync
+/// aggregate signature and the payload attestation signatures. The spec skips only the
+/// proposer signature there. Use `validate_result` false only to compute the state root of
+/// a block that we produce ourselves, whose signatures we made. The checks that need no BLS
+/// (for example the infinity signature of an empty sync aggregate) run in both modes.
+///
+/// The slot loop always needs `bls`, in both modes. At each epoch boundary it asks
+/// `bls.backend` for the verdicts of the pending deposits of new keys, and it aggregates the
+/// keys of the next sync committee through `bls.aggregator` (see
+/// [`per_slot::process_slots`]). Prefetch the deposit verdicts with
+/// [`per_epoch::pending_deposit_signature_sets`] on the pre-state and `block.slot`.
 ///
 /// # Warning
 ///

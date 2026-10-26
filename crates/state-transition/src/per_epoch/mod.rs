@@ -30,14 +30,33 @@ pub use justification::{
     process_justification_and_finalization, weigh_justification_and_finalization,
 };
 pub use participation::get_unslashed_participating_indices;
+pub use pending::pending_deposit_signature_sets;
 pub use rewards::{
     get_flag_index_deltas, get_inactivity_penalty_deltas, process_rewards_and_penalties,
 };
 
 use crate::accessors::TotalActiveBalanceCache;
 use crate::{BlsContext, Preset, StfError};
+use consensus_types::common::Validator;
 use consensus_types::gloas::BeaconState;
+use consensus_types::primitives::ValidatorIndex;
 use participation::ParticipationCache;
+
+/// `state.validators[index]` for an index that a step read from the state, not from an
+/// object. A state that the spec makes holds each such index in its registry, so an index
+/// past it is a fault of our own state: `ListIndexOutOfRange`, not a proof.
+pub(crate) fn state_validator<E: Preset>(
+    state: &BeaconState<E>,
+    index: ValidatorIndex,
+) -> Result<&Validator, StfError> {
+    state
+        .validators
+        .get(index as usize)
+        .ok_or(StfError::ListIndexOutOfRange {
+            list: "validators",
+            index,
+        })
+}
 
 /// One step of `process_epoch` (G L1633-1653).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -206,7 +225,8 @@ impl<'s, 'b, E: Preset> EpochRun<'s, 'b, E> {
 /// with one participation cache and one total-balance cache for the steps that read them.
 ///
 /// `bls` gives the verdicts of the pending deposits, the aggregation of the next sync
-/// committee and the deposit domain. The call returns [`StfError::Unimplemented`] at
+/// committee and the deposit domain. [`pending_deposit_signature_sets`] lists the deposit
+/// verdicts to prefetch. The call returns [`StfError::Unimplemented`] at
 /// `process_builder_pending_payments`, which is not ported yet. On `Err`, `state` is partly
 /// updated: the caller drops it.
 pub fn process_epoch<E: Preset>(
@@ -236,11 +256,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{bls_context, genesis_state, ScriptedBackend};
-    use crate::{BackendError, BlsContext};
+    use crate::per_slot::{process_slot, process_slots};
+    use crate::signatures::deposit_signature_set;
+    use crate::testing::{
+        bls_context, genesis_state, PrefetchedBackend, ScriptedBackend, GENESIS_FORK_VERSION,
+    };
+    use crate::{BackendError, BlsContext, SignatureSet};
     use consensus_types::common::{PendingConsolidation, PendingDeposit};
     use consensus_types::gloas::Eth1Data;
-    use consensus_types::primitives::{Bytes32, Gwei, Root};
+    use consensus_types::primitives::{BLSPubkey, Bytes32, Gwei, Root, Slot};
     use consensus_types::{EthSpec, Minimal};
     use ssz_types::typenum::Unsigned;
 
@@ -456,5 +480,182 @@ mod tests {
                 "not prefetched".into()
             )))
         );
+    }
+
+    /// A deposit of `amount` for `pubkey` at `slot`, with 0x01 credentials.
+    fn deposit(pubkey: BLSPubkey, amount: Gwei, slot: Slot) -> PendingDeposit {
+        let mut withdrawal_credentials = Bytes32::ZERO;
+        withdrawal_credentials[0] = 0x01;
+        PendingDeposit {
+            pubkey,
+            withdrawal_credentials,
+            amount,
+            signature: [0x44; 96],
+            slot,
+        }
+    }
+
+    fn set_of(deposit: &PendingDeposit) -> SignatureSet {
+        deposit_signature_set(
+            deposit.pubkey,
+            deposit.withdrawal_credentials,
+            deposit.amount,
+            deposit.signature,
+            GENESIS_FORK_VERSION,
+        )
+    }
+
+    /// The deposits of [`finalizing_state`]: the new key `[0xa1; 48]` at slot 44, which
+    /// only the justification of epoch 7 finalizes, at the front, and the new keys
+    /// `[0xb1; 48]` and `[0xc1; 48]` after the reach of the first boundary.
+    struct Queue {
+        first: PendingDeposit,
+        second: PendingDeposit,
+        again: PendingDeposit,
+        invalid: PendingDeposit,
+    }
+
+    /// A minimal state of 64 validators at the last slot of epoch 7, with full
+    /// participation in epochs 6 and 7. It is finalized at epoch 5 (slot 40), and epochs 5
+    /// and 6 are justified. Thus its justification finalizes epoch 6 (slot 48).
+    ///
+    /// Its queue holds [`Queue::first`], 15 top-ups for validator 1, and then
+    /// [`Queue::second`], [`Queue::again`] (a top-up for `[0xa1; 48]`) and
+    /// [`Queue::invalid`] (the key `[0xc1; 48]`, with an invalid signature in the tests).
+    fn finalizing_state() -> (BeaconState<Minimal>, Queue) {
+        let mut state = genesis_state::<Minimal>(&[32 * ETH; 64]);
+        state.slot = Minimal::start_slot_at_epoch(8) - 1;
+        crate::testing::refresh_lookahead(&mut state);
+        state.finalized_checkpoint.epoch = 5;
+        state.previous_justified_checkpoint.epoch = 5;
+        state.current_justified_checkpoint.epoch = 6;
+        state.justification_bits.set(0, true).unwrap();
+        state.justification_bits.set(1, true).unwrap();
+        for i in 0..64 {
+            *state.previous_epoch_participation.get_mut(i).unwrap() = 0b111;
+            *state.current_epoch_participation.get_mut(i).unwrap() = 0b111;
+        }
+        let queue = Queue {
+            first: deposit([0xa1; 48], 32 * ETH, 44),
+            second: deposit([0xb1; 48], 32 * ETH, 45),
+            again: deposit([0xa1; 48], ETH, 46),
+            invalid: deposit([0xc1; 48], ETH, 47),
+        };
+        let mut validator_1 = [0u8; 48];
+        validator_1[0] = 1;
+        let mut deposits = vec![queue.first.clone()];
+        deposits.extend(std::iter::repeat_n(deposit(validator_1, ETH, 0), 15));
+        deposits.extend([
+            queue.second.clone(),
+            queue.again.clone(),
+            queue.invalid.clone(),
+        ]);
+        for d in deposits {
+            state.pending_deposits.push(d).unwrap();
+        }
+        (state, queue)
+    }
+
+    /// The verdicts of `sets`, with an invalid signature for `invalid` only.
+    fn verdicts(sets: &[SignatureSet], invalid: &PendingDeposit) -> PrefetchedBackend {
+        let invalid = set_of(invalid);
+        PrefetchedBackend::new(sets.iter().map(|set| (set.clone(), *set != invalid)))
+    }
+
+    /// `process_slots` with the builder payments step left out, as in [`traced`], so that
+    /// the loop can cross more than one epoch boundary.
+    fn slots_without_builder_payments(
+        state: &mut BeaconState<Minimal>,
+        slot: Slot,
+        bls: &BlsContext,
+    ) -> Result<(), StfError> {
+        while state.slot < slot {
+            process_slot(state)?;
+            let next_slot = state.slot + 1;
+            if next_slot.is_multiple_of(Minimal::slots_per_epoch()) {
+                traced(state, bls).1?;
+            }
+            state.slot = next_slot;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prefetch_covers_a_deposit_that_the_same_epoch_finalizes() {
+        let (pre, queue) = finalizing_state();
+        let sets = pending_deposit_signature_sets(&pre, 64, GENESIS_FORK_VERSION);
+        assert_eq!(sets, vec![set_of(&queue.first)]);
+        let backend = verdicts(&sets, &queue.invalid);
+        let mut state = pre.clone();
+        // The real slot loop gets to the builder payments step, after the deposits.
+        assert_eq!(
+            process_slots(&mut state, 64, &bls_context(&backend)),
+            Err(StfError::Unimplemented(
+                "process_builder_pending_payments (4.6b)"
+            ))
+        );
+        assert_eq!(state.finalized_checkpoint.epoch, 6);
+        assert_eq!(backend.seen(), sets);
+        assert_eq!(state.validators.get(64).unwrap().pubkey, [0xa1; 48]);
+        assert_eq!(state.pending_deposits.len(), 3);
+
+        // A prefetch with the finality of the pre-state (slot 40) has no verdict for it.
+        let filtered = verdicts(&[], &queue.invalid);
+        assert_eq!(
+            process_slots(&mut pre.clone(), 64, &bls_context(&filtered)),
+            Err(StfError::MissingVerdict(BackendError(
+                "not prefetched".into()
+            )))
+        );
+    }
+
+    #[test]
+    fn prefetch_covers_each_boundary_of_the_slot_loop() {
+        let (pre, queue) = finalizing_state();
+        let sets = pending_deposit_signature_sets(&pre, 72, GENESIS_FORK_VERSION);
+        assert_eq!(
+            sets,
+            [&queue.first, &queue.second, &queue.again, &queue.invalid].map(set_of)
+        );
+        let backend = verdicts(&sets, &queue.invalid);
+        let mut state = pre.clone();
+        assert_eq!(
+            slots_without_builder_payments(&mut state, 72, &bls_context(&backend)),
+            Ok(())
+        );
+        // The second deposit for `[0xa1; 48]` is a top-up, so the loop asked for the
+        // other three sets only.
+        assert_eq!(
+            backend.seen(),
+            [&queue.first, &queue.second, &queue.invalid].map(set_of)
+        );
+        assert!(state.pending_deposits.is_empty());
+        let keys: Vec<BLSPubkey> = state.validators.iter().skip(64).map(|v| v.pubkey).collect();
+        assert_eq!(keys, [[0xa1; 48], [0xb1; 48]]);
+
+        // The sets of the first boundary only do not cover the second one.
+        let first = pending_deposit_signature_sets(&pre, 64, GENESIS_FORK_VERSION);
+        let backend = verdicts(&first, &queue.invalid);
+        assert_eq!(
+            slots_without_builder_payments(&mut pre.clone(), 72, &bls_context(&backend)),
+            Err(StfError::MissingVerdict(BackendError(
+                "not prefetched".into()
+            )))
+        );
+    }
+
+    #[test]
+    fn indices_from_the_state_are_not_a_proof() {
+        let state = genesis_state::<Minimal>(&[32 * ETH; 8]);
+        assert_eq!(state_validator(&state, 7).map(|v| v.pubkey[0]), Ok(7));
+        let err = state_validator(&state, 8).unwrap_err();
+        assert_eq!(
+            err,
+            StfError::ListIndexOutOfRange {
+                list: "validators",
+                index: 8
+            }
+        );
+        assert!(!err.proves_invalid());
     }
 }

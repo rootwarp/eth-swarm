@@ -108,7 +108,8 @@ pub(crate) fn process_registry_updates_with<E: Preset>(
     Ok(())
 }
 
-/// `state.validators[index]`, for an index that the step read from the registry.
+/// `state.validators[index]`, for an index that the step read from the registry. An index
+/// past the registry is a fault of our own state (`ListIndexOutOfRange`), not a proof.
 fn validator_mut<E: Preset>(
     state: &mut BeaconState<E>,
     index: ValidatorIndex,
@@ -116,7 +117,10 @@ fn validator_mut<E: Preset>(
     state
         .validators
         .get_mut(index as usize)
-        .ok_or(StfError::UnknownValidator(index))
+        .ok_or(StfError::ListIndexOutOfRange {
+            list: "validators",
+            index,
+        })
 }
 
 /// `process_slashings` (E L1082-1102, Modified in Electra; Gloas keeps it).
@@ -215,6 +219,7 @@ pub fn process_effective_balance_updates<E: Preset>(
 mod tests {
     use super::*;
     use crate::accessors::{is_compounding_withdrawal_credential, TotalActiveBalanceCache};
+    use crate::per_epoch::participation::ParticipationCache;
     use crate::preset::{EFFECTIVE_BALANCE_INCREMENT, MAX_EFFECTIVE_BALANCE_ELECTRA};
     use crate::testing::registry_state;
     use crate::StfError;
@@ -275,11 +280,41 @@ mod tests {
         assert_eq!(v(5), pre.validators.get(5).unwrap().clone());
         assert_eq!(state.earliest_exit_epoch, 9);
 
-        // The cached variant gives the same state.
+        // The cached variant reads the exit churn from a total that the participation
+        // cache read from the same pre-state, and it gives the same state.
+        let filled = |state: &BeaconState<Minimal>| {
+            let mut totals = TotalActiveBalanceCache::default();
+            ParticipationCache::new(state, &mut totals);
+            assert!(totals.key().is_some());
+            totals
+        };
         let mut cached = pre.clone();
-        process_registry_updates_with(&mut cached, &mut TotalActiveBalanceCache::default())
-            .unwrap();
+        process_registry_updates_with(&mut cached, &mut filled(&pre)).unwrap();
         assert_eq!(cached, state);
+        // The variant reads the cache: a total of another registry with the same key gives
+        // another exit churn, so the assertion above can fail.
+        let mut larger = pre.clone();
+        for i in 0..6 {
+            larger.validators.get_mut(i).unwrap().effective_balance = 2_048 * ETH;
+        }
+        let mut stale = pre.clone();
+        process_registry_updates_with(&mut stale, &mut filled(&larger)).unwrap();
+        assert_ne!(stale.exit_balance_to_consume, state.exit_balance_to_consume);
+    }
+
+    #[test]
+    fn registry_indices_past_the_registry_are_not_a_proof() {
+        let mut state = state_at(&[32 * ETH; 6], 4);
+        assert!(validator_mut(&mut state, 5).is_ok());
+        let err = validator_mut(&mut state, 6).unwrap_err();
+        assert_eq!(
+            err,
+            StfError::ListIndexOutOfRange {
+                list: "validators",
+                index: 6
+            }
+        );
+        assert!(!err.proves_invalid());
     }
 
     #[test]
