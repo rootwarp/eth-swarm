@@ -5,7 +5,8 @@
 use crate::coverage::{self, CaseShape, Guard, Layout, Reads, Slot};
 use crate::plan::{plan, Case, CaseKey, Date, Disposition, Scope, SkipList, COMPTESTS_PRESETS};
 use crate::{
-    bls, epoch_processing, fixture, kzg, networking, sanity, shuffling, ssz_generic, ssz_static,
+    bls, epoch_processing, fixture, kzg, networking, operations, sanity, shuffling, ssz_generic,
+    ssz_static,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -432,8 +433,8 @@ fn incomplete(set: &VectorSet, dir: &Path, cases: &[Case]) -> Option<String> {
     })
 }
 
-/// Fails on a `bls`, `kzg` or Gloas `epoch_processing` handler directory the runners do not
-/// classify.
+/// Fails on a `bls`, `kzg`, Gloas `epoch_processing` or Gloas `operations` handler
+/// directory the runners do not classify.
 fn handler_check(k: &CaseKey) -> Result<(), String> {
     if k.handler.is_empty() {
         return Ok(());
@@ -447,6 +448,11 @@ fn handler_check(k: &CaseKey) -> Result<(), String> {
             .map(drop)
             .map_err(|e| e + &at()),
         "epoch_processing" => epoch_processing::check_handler(k),
+        "operations" if k.source == "consensus-specs" && k.fork == "gloas" => {
+            operations::handler_runs(&k.handler)
+                .map(drop)
+                .map_err(|e| e + &at())
+        }
         _ => Ok(()),
     }
 }
@@ -460,6 +466,7 @@ enum Kind {
     Bls,
     Kzg,
     Networking,
+    Operations,
     Sanity,
     Shuffling,
     EpochProcessing,
@@ -494,6 +501,11 @@ fn kind(case: &Case) -> Option<Kind> {
         }
         ("consensus-specs", "networking") if networking::supported(&k.fork, &k.handler) => {
             Some(Kind::Networking)
+        }
+        ("consensus-specs", "operations")
+            if operations::supported(&k.fork, &k.preset, &k.handler) =>
+        {
+            Some(Kind::Operations)
         }
         ("consensus-specs", "sanity") if sanity::supported(&k.fork, &k.preset, &k.handler) => {
             Some(Kind::Sanity)
@@ -534,6 +546,10 @@ impl Kind {
             Kind::Networking => {
                 consensus_manifest(reads, case)?;
                 networking::run(reads, handler, data(case, "meta.yaml")?)
+            }
+            Kind::Operations => {
+                consensus_manifest(reads, case)?;
+                operations::run(reads, case)
             }
             Kind::Sanity => {
                 consensus_manifest(reads, case)?;

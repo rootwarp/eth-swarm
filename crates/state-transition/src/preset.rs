@@ -52,6 +52,9 @@ pub const BUILDER_INDEX_FLAG: u64 = 1 << 40;
 pub const BUILDER_WITHDRAWAL_PREFIX: u8 = 0xb0;
 /// `PAYLOAD_BUILDER_VERSION` (G "Builder versions", a constant).
 pub const PAYLOAD_BUILDER_VERSION: u8 = 0;
+/// `BUILDER_INDEX_SELF_BUILD` (G L571, a constant): the builder index of a bid that the
+/// proposer builds itself.
+pub const BUILDER_INDEX_SELF_BUILD: u64 = u64::MAX;
 
 /// The preset values of the state transition, on top of the SSZ lengths of [`EthSpec`].
 ///
@@ -148,5 +151,6 @@ mod tests {
         assert_eq!(BUILDER_INDEX_FLAG, 1_099_511_627_776);
         assert_eq!(BUILDER_WITHDRAWAL_PREFIX, 0xb0);
         assert_eq!(PAYLOAD_BUILDER_VERSION, 0);
+        assert_eq!(BUILDER_INDEX_SELF_BUILD, u64::MAX);
     }
 }

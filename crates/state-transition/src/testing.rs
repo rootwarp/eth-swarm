@@ -1,9 +1,11 @@
 //! Test inputs: a Gloas genesis-like state with a given registry, empty blocks, builders
 //! and their requests, and a scripted signature backend.
 
+use crate::caches::get_beacon_proposer_index;
 use crate::caches::{initialize_proposer_lookahead, initialize_ptc_window};
 use crate::per_block::builder::{process_builder_deposit_request, process_builder_exit_request};
-use crate::preset::BUILDER_WITHDRAWAL_PREFIX;
+use crate::preset::{BUILDER_INDEX_SELF_BUILD, BUILDER_WITHDRAWAL_PREFIX};
+use crate::signatures::G2_POINT_AT_INFINITY;
 use crate::{BackendError, Preset, SignatureBackend, SignatureSet, SignerRef};
 use consensus_types::gloas::*;
 use consensus_types::primitives::{
@@ -14,6 +16,7 @@ use ssz::BitVector;
 use ssz_types::FixedVector;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use tree_hash::TreeHash;
 
 /// A Gloas state at slot 0 whose validators have `effective_balances` (each also its
 /// balance), all active from epoch 0. Every RANDAO mix is `mix`. The proposer lookahead and
@@ -165,8 +168,9 @@ fn empty_bid<E: Preset>(slot: u64) -> ExecutionPayloadBid<E> {
     }
 }
 
-/// A block at `slot` by `proposer_index` with an empty body, a zero `state_root` and the
-/// signature `[0x11; 96]`.
+/// A block at `slot` by `proposer_index` with an empty body (no sync committee bits, the
+/// infinity sync signature and a self-build bid), a zero `state_root` and the signature
+/// `[0x11; 96]`.
 pub(crate) fn signed_block<E: Preset>(slot: u64, proposer_index: u64) -> SignedBeaconBlock<E> {
     let body = BeaconBlockBody {
         randao_reveal: [0; 96],
@@ -183,12 +187,16 @@ pub(crate) fn signed_block<E: Preset>(slot: u64, proposer_index: u64) -> SignedB
         voluntary_exits: Default::default(),
         sync_aggregate: SyncAggregate {
             sync_committee_bits: BitVector::new(),
-            sync_committee_signature: [0; 96],
+            sync_committee_signature: G2_POINT_AT_INFINITY,
         },
         bls_to_execution_changes: Default::default(),
+        // A self-build bid (`BUILDER_INDEX_SELF_BUILD`) with the infinity signature.
         signed_execution_payload_bid: SignedExecutionPayloadBid {
-            message: empty_bid(slot),
-            signature: [0; 96],
+            message: ExecutionPayloadBid {
+                builder_index: BUILDER_INDEX_SELF_BUILD,
+                ..empty_bid(slot)
+            },
+            signature: G2_POINT_AT_INFINITY,
         },
         payload_attestations: Default::default(),
         parent_execution_requests: ExecutionRequests {
@@ -352,4 +360,13 @@ pub(crate) fn index_reuse_states<E: Preset>() -> (BeaconState<E>, BeaconState<E>
     let request = builder_deposit_request(REUSING_BUILDER_KEY, 7);
     process_builder_deposit_request(&mut state, &request, GENESIS_FORK_VERSION, &backend).unwrap();
     (exited, state)
+}
+
+/// [`signed_block`] at `state.slot` by the proposer of the slot, whose parent is the latest
+/// block header: a block that `process_block_header` accepts on `state`.
+pub(crate) fn block_at_state_slot<E: Preset>(state: &BeaconState<E>) -> SignedBeaconBlock<E> {
+    let proposer = get_beacon_proposer_index(state).unwrap();
+    let mut block = signed_block::<E>(state.slot, proposer);
+    block.message.parent_root = state.latest_block_header.tree_hash_root();
+    block
 }

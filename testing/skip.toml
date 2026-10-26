@@ -236,13 +236,151 @@ owner   = "ian"
 issue   = "4.7"
 expires = "2026-11-30"
 
+# Gloas operations handlers that are not ported yet. block_header, builder_deposit_request,
+# builder_exit_request and sync_aggregate run (crates/spec-tests/src/operations.rs). beta.4
+# has no operations/randao handler. The reason names the plan item that ports each handler;
+# `issue` is the milestone, because the plan IDs with a letter are not valid values of
+# `issue`.
+
 [[skip]]
 source  = "consensus-specs"
 fork    = "gloas"
 preset  = "*"
 runner  = "operations"
-handler = "*"
-reason  = "No operations runner yet: Gloas operations vectors land with the Gloas state transition"
+handler = "attestation"
+reason  = "process_attestation is not ported yet: the operations runner has a dispatch slot for it only (plan item 4.3b)"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "operations"
+handler = "attester_slashing"
+reason  = "process_attester_slashing is not ported yet: the operations runner has a dispatch slot for it only (plan item 4.3b)"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "operations"
+handler = "bls_to_execution_change"
+reason  = "process_bls_to_execution_change is not ported yet: the operations runner has a dispatch slot for it only (plan item 4.4b)"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "operations"
+handler = "consolidation_request"
+reason  = "process_consolidation_request is not ported yet (plan item 4.4b)"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "operations"
+handler = "deposit_request"
+reason  = "Deposit requests come from the parent payload, whose processing is not ported yet (plan item 4.6a)"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "operations"
+handler = "execution_payload_bid"
+reason  = "process_execution_payload_bid is not ported yet: process_block has a stub step for it only (plan item 4.5)"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "operations"
+handler = "parent_execution_payload"
+reason  = "process_parent_execution_payload is not ported yet: process_block has a stub step for it only (plan item 4.6a)"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "operations"
+handler = "payload_attestation"
+reason  = "process_payload_attestation is not ported yet: the operations runner has a dispatch slot for it only (plan item 4.11)"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "operations"
+handler = "proposer_slashing"
+reason  = "process_proposer_slashing is not ported yet: the operations runner has a dispatch slot for it only (plan item 4.3b)"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "operations"
+handler = "voluntary_exit"
+reason  = "process_voluntary_exit is not ported yet: the operations runner has a dispatch slot for it only (plan item 4.4b)"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "operations"
+handler = "voluntary_exit_churn"
+reason  = "process_voluntary_exit is not ported yet: the operations runner has a dispatch slot for it only (plan item 4.4b)"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "operations"
+handler = "withdrawal_request"
+reason  = "Withdrawal requests come from the parent payload, whose processing is not ported yet (plan item 4.6a)"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "operations"
+handler = "withdrawals"
+reason  = "The Gloas process_withdrawals(state) is not ported yet: process_block has a stub step for it only (plan item 4.4a)"
 owner   = "ian"
 issue   = "4.7"
 expires = "2026-11-30"

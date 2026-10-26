@@ -139,6 +139,23 @@ fn state_transition_skips_point_at_their_milestone() {
     }
 }
 
+/// The Gloas operations handlers that the runner executes are not skipped; every other
+/// Gloas operations handler of beta.4 waits for its port.
+#[test]
+fn gloas_operations_runnable_handlers_are_not_skipped() {
+    let skips = committed();
+    for preset in ["minimal", "mainnet"] {
+        for handler in spec_tests::operations::RUNNABLE {
+            let k = consensus("gloas", preset, "operations", handler);
+            assert!(skips.skipped_by(&k).is_none(), "{k} is skipped");
+        }
+        for handler in spec_tests::operations::NOT_RUN {
+            let k = consensus("gloas", preset, "operations", handler);
+            assert_eq!(issue_of(&skips, &k), "4.7", "{k}");
+        }
+    }
+}
+
 /// The data-column `ssz_static` types, by the forks that define them: consensus-types defines
 /// them all, so none may be skipped again.
 const COLUMN_TYPES: [(&str, &[&str]); 7] = [

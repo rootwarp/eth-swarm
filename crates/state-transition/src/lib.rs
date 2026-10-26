@@ -6,16 +6,19 @@
 //!
 //! - [`state_transition`]: the slot loop, the block signature, the block and the state root.
 //! - [`per_slot`]: `process_slots` and `process_slot`.
-//! - [`per_epoch`] and [`per_block`]: the epoch and block processing (partly ported).
+//! - [`per_epoch`]: the epoch processing (a stub for now).
+//! - [`per_block`]: the block processing: the step order, the header, RANDAO, eth1 data and
+//!   the sync aggregate (the other steps and operations are stubs for now).
 //! - [`accessors`]: the beacon-state accessors and the misc helpers.
 //! - [`caches`]: shuffling, beacon committees, proposer and PTC selection.
 //! - [`mutators`]: the balance helpers, the exit and consolidation churn, validator and
 //!   builder exits, builder-payment settlement and `slash_validator`.
-//! - [`signatures`]: the [`SignatureBackend`] seam and the block signature set.
+//! - [`signatures`]: the [`SignatureBackend`] seam and the signature sets of a block.
 //!
 //! Each ported function cites its spec file and line range at the pin. File prefixes: P0
-//! `phase0/beacon-chain.md`, A `altair/beacon-chain.md`, Bx `bellatrix/beacon-chain.md`, E
-//! `electra/beacon-chain.md`, Fu `fulu/beacon-chain.md`, G `gloas/beacon-chain.md`.
+//! `phase0/beacon-chain.md`, A `altair/beacon-chain.md`, Bx `bellatrix/beacon-chain.md`, C
+//! `capella/beacon-chain.md`, E `electra/beacon-chain.md`, Fu `fulu/beacon-chain.md`, G
+//! `gloas/beacon-chain.md`.
 //!
 //! milhouse trees panic in `tree_hash_root` while they hold pending updates, so every root
 //! of a state goes through [`state_root`], which flushes them first.
@@ -58,7 +61,8 @@ pub enum StfError {
         /// The requested slot.
         slot: Slot,
     },
-    /// The backend rejected the proposer signature of the block.
+    /// The backend rejected a signature set of the block: the proposer signature, or a set
+    /// of the same batch ([`signatures::block_signature_sets`]).
     #[error("invalid block signature")]
     InvalidBlockSignature,
     /// `block.state_root != hash_tree_root(state)` after the block.
@@ -194,6 +198,59 @@ pub enum StfError {
     /// proof that the input is invalid: callers IGNORE, never REJECT, on it.
     #[error("no prefetched deposit signature verdict: {0}")]
     MissingVerdict(BackendError),
+    /// `process_block_header` asserts `block.slot == state.slot`.
+    #[error("block slot {block} is not the state slot {state}")]
+    BlockSlotMismatch {
+        /// `block.slot`.
+        block: Slot,
+        /// `state.slot`.
+        state: Slot,
+    },
+    /// `process_block_header` asserts `block.slot > state.latest_block_header.slot`.
+    #[error("block slot {block} is not after the latest block header slot {latest}")]
+    BlockNotNewer {
+        /// `block.slot`.
+        block: Slot,
+        /// `state.latest_block_header.slot`.
+        latest: Slot,
+    },
+    /// `process_block_header` asserts `block.proposer_index == get_beacon_proposer_index(state)`.
+    #[error("block proposer {block} is not the proposer {expected} of the slot")]
+    WrongProposer {
+        /// `block.proposer_index`.
+        block: ValidatorIndex,
+        /// `get_beacon_proposer_index(state)`.
+        expected: ValidatorIndex,
+    },
+    /// `process_block_header` asserts that `block.parent_root` is the root of the latest
+    /// block header.
+    #[error("block parent root {block} is not the latest block header root {expected}")]
+    ParentRootMismatch {
+        /// `block.parent_root`.
+        block: Root,
+        /// `hash_tree_root(state.latest_block_header)`.
+        expected: Root,
+    },
+    /// `process_block_header` asserts that the proposer is not slashed.
+    #[error("proposer {0} is slashed")]
+    ProposerSlashed(ValidatorIndex),
+    /// The Gloas `process_operations` asserts `len(body.deposits) == 0`.
+    #[error("block has {0} deposits, Gloas allows none")]
+    BlockDeposits(usize),
+    /// A sync committee pubkey that no validator has (`all_pubkeys.index` raises in
+    /// `process_sync_aggregate`). The keys come from the state, and a state that the spec
+    /// makes has each of them in its registry, so this error shows a fault of our own state,
+    /// never a proof that the block is invalid.
+    #[error("sync committee member {position} is not in the validator registry")]
+    UnknownSyncCommitteeMember {
+        /// The position in `state.current_sync_committee.pubkeys`.
+        position: usize,
+    },
+    /// The sync aggregate signature is invalid: an empty aggregate whose signature is not
+    /// `G2_POINT_AT_INFINITY` (`eth_fast_aggregate_verify`), or a backend rejection in
+    /// [`signatures::verify_sync_aggregate_signature`].
+    #[error("invalid sync aggregate signature")]
+    InvalidSyncAggregateSignature,
 }
 
 impl StfError {
@@ -205,14 +262,13 @@ impl StfError {
     /// current one (`ParticipationEpochOutOfRange`):
     /// callers IGNORE those, never REJECT.
     ///
-    /// [`StfError::StateRootMismatch`] from [`state_transition`] is not a proof yet either.
-    /// Block processing is not ported, so a valid block with a body fails with that error.
-    /// Remove this paragraph when block processing lands.
-    ///
-    /// [`StfError::EpochOutOfWindow`] and [`StfError::BlockRootOutOfRange`] are a proof only
-    /// when the state is the object's own
-    /// pre-state, advanced to the object's slot. A caller that uses another state (for
-    /// example a head state behind the slot of a gossip message) must map it to IGNORE.
+    /// These variants are a proof only when the state is the object's own pre-state,
+    /// advanced to the object's slot: [`StfError::EpochOutOfWindow`],
+    /// [`StfError::BlockRootOutOfRange`], [`StfError::BlockSlotMismatch`],
+    /// [`StfError::BlockNotNewer`], [`StfError::WrongProposer`],
+    /// [`StfError::ParentRootMismatch`], [`StfError::ProposerSlashed`] and
+    /// [`StfError::InvalidSyncAggregateSignature`]. A caller that uses another state (for
+    /// example a head state behind the slot of a gossip message) must map them to IGNORE.
     ///
     /// [`StfError::UnknownValidator`] has the same rule. The result depends on the registry
     /// of the state that the caller uses. A head state older than the object can have a
@@ -234,7 +290,11 @@ impl StfError {
             // so another epoch is a caller error.
             | Self::ParticipationEpochOutOfRange { .. }
             // The verdict was not fetched, which says nothing about the deposit.
-            | Self::MissingVerdict(_) => false,
+            | Self::MissingVerdict(_)
+            // The committee keys come from the state, not from the block, and a state that
+            // the spec makes has each of them in its registry. So, as for
+            // `ListIndexOutOfRange`, our own state is wrong, and the block did not cause it.
+            | Self::UnknownSyncCommitteeMember { .. } => false,
             Self::SlotNotLater { .. }
             | Self::InvalidBlockSignature
             | Self::StateRootMismatch { .. }
@@ -253,7 +313,21 @@ impl StfError {
             | Self::UnknownBuilder(_)
             // The `assert` of `settle_builder_payment` on the length of
             // `state.builder_pending_payments`, a spec error.
-            | Self::PaymentIndexOutOfRange { .. } => true,
+            | Self::PaymentIndexOutOfRange { .. }
+            // The asserts of `process_block_header` on the block's own pre-state at its
+            // slot: the slot, a newer slot than the parent header, the proposer of the
+            // slot, the parent root, and a proposer that is not slashed.
+            | Self::BlockSlotMismatch { .. }
+            | Self::BlockNotNewer { .. }
+            | Self::WrongProposer { .. }
+            | Self::ParentRootMismatch { .. }
+            | Self::ProposerSlashed(_)
+            // `assert len(body.deposits) == 0` of the Gloas `process_operations`: a
+            // property of the block alone.
+            | Self::BlockDeposits(_)
+            // `eth_fast_aggregate_verify` is false: an empty aggregate without the infinity
+            // signature, or a verdict of the backend (as for `InvalidBlockSignature`).
+            | Self::InvalidSyncAggregateSignature => true,
         }
     }
 }
@@ -272,16 +346,26 @@ pub fn state_root<E: Preset>(state: &mut BeaconState<E>) -> Result<Root, StfErro
 
 /// `state_transition` (P0 L1822-1835).
 ///
-/// Processes the slots up to `block.slot`, checks the proposer signature through `backend`
-/// (when `validate_result`), applies the block, and checks `block.state_root` (when
-/// `validate_result`). On `Err`, `state` is partly updated: the caller drops it.
+/// Processes the slots up to `block.slot`, applies the block, and checks
+/// `block.state_root`. With `validate_result` true it first runs the cheap header checks
+/// ([`per_block::check_block_header`]) and then checks every signature set of the block
+/// ([`signatures::block_signature_sets`]) through `backend` in one call. A block that
+/// fails the header checks costs no registry read and no backend call. On `Err`, `state` is
+/// partly updated: the caller drops it.
+///
+/// `validate_result` false skips every BLS check: the proposer signature, the RANDAO reveal
+/// and the sync aggregate signature. The spec skips only the proposer signature there.
+/// Use `validate_result` false only to compute the state root of a block that we produce
+/// ourselves, whose signatures we made. The checks that need no BLS (for example the
+/// infinity signature of an empty sync aggregate) run in both modes.
 ///
 /// # Warning
 ///
-/// Do not use this function on real blocks yet. Block processing is not ported:
-/// [`per_block::process_block`] applies nothing. With `validate_result` false, the
-/// post-state is wrong. With `validate_result` true, a valid block fails with
-/// [`StfError::StateRootMismatch`], which looks like a proof of an invalid block.
+/// Do not use this function on real blocks yet. Block processing is ported only in part:
+/// [`per_block::process_block`] returns [`StfError::Unimplemented`] at its first step (the
+/// parent payload), so every block fails with an error that is not a proof of an invalid
+/// block. For the same reason, a block with an operation or a builder bid fails the
+/// signature sets with `Unimplemented`.
 ///
 /// Bound `block.slot` against the wall clock before the call. As in the spec, the slots
 /// are processed before the signature check, and `process_slots` has no upper bound: a
@@ -297,7 +381,7 @@ pub fn state_transition<E: Preset>(
         signed_block,
         validate_result,
         backend,
-        per_block::process_block,
+        per_block::process_block_with,
     )
 }
 
@@ -312,14 +396,22 @@ pub(crate) fn apply_block<E, F>(
 ) -> Result<(), StfError>
 where
     E: Preset,
-    F: FnOnce(&mut BeaconState<E>, &BeaconBlock<E>) -> Result<(), StfError>,
+    F: FnOnce(
+        &mut BeaconState<E>,
+        &BeaconBlock<E>,
+        &mut per_block::BlockContext,
+    ) -> Result<(), StfError>,
 {
     let block = &signed_block.message;
     per_slot::process_slots(state, block.slot)?;
+    // One context for the block: the signature sets and the steps share the sync committee
+    // indices.
+    let mut ctx = per_block::BlockContext::default();
     if validate_result {
-        signatures::verify_block_signature(state, signed_block, backend)?;
+        per_block::check_block_header(state, block)?;
+        signatures::verify_block_signatures_with(state, signed_block, backend, &mut ctx)?;
     }
-    block_fn(state, block)?;
+    block_fn(state, block, &mut ctx)?;
     if validate_result {
         let computed = state_root(state)?;
         if computed != block.state_root {
@@ -336,7 +428,7 @@ where
 mod tests {
     use super::*;
     use crate::accessors::get_domain;
-    use crate::testing::{genesis_state, signed_block};
+    use crate::testing::{block_at_state_slot, genesis_state};
     use consensus_types::signing::{compute_signing_root, DOMAIN_BEACON_PROPOSER};
     use consensus_types::Minimal;
     use std::cell::RefCell;
@@ -363,16 +455,21 @@ mod tests {
         }
     }
 
-    fn no_op(_: &mut BeaconState<Minimal>, _: &BeaconBlock<Minimal>) -> Result<(), StfError> {
+    fn no_op(
+        _: &mut BeaconState<Minimal>,
+        _: &BeaconBlock<Minimal>,
+        _: &mut per_block::BlockContext,
+    ) -> Result<(), StfError> {
         Ok(())
     }
 
-    /// The pre-state, and a block at slot 1 whose `state_root` is the post-state root.
+    /// The pre-state, and a block at slot 1 by the proposer of the slot, on the latest block
+    /// header, whose `state_root` is the post-state root of the slot loop.
     fn state_and_block() -> (BeaconState<Minimal>, SignedBeaconBlock<Minimal>) {
         let state = genesis_state::<Minimal>(&[32_000_000_000; 8]);
-        let mut block = signed_block::<Minimal>(1, 3);
         let mut post = state.clone();
         per_slot::process_slots(&mut post, 1).unwrap();
+        let mut block = block_at_state_slot(&post);
         block.message.state_root = state_root(&mut post).unwrap();
         (state, block)
     }
@@ -385,16 +482,18 @@ mod tests {
             apply_block(&mut state.clone(), &block, true, &rejecting, no_op),
             Err(StfError::InvalidBlockSignature)
         );
-        // The backend saw exactly the proposer set of the block.
+        // The backend saw the proposer set of the block first, in one batch with the
+        // RANDAO set (the sync aggregate is empty, with the infinity signature).
         let mut at_slot = state.clone();
         per_slot::process_slots(&mut at_slot, 1).unwrap();
         let domain = get_domain(&at_slot, DOMAIN_BEACON_PROPOSER, None);
         let want = SignatureSet::single(
-            SignerRef::Validator(3),
+            SignerRef::Validator(block.message.proposer_index),
             compute_signing_root(&block.message, domain),
             [0x11; 96],
         );
-        assert_eq!(*rejecting.seen.borrow(), vec![want]);
+        let randao = signatures::randao_signature_set(&at_slot, &block.message.body).unwrap();
+        assert_eq!(*rejecting.seen.borrow(), vec![want, randao]);
 
         // No verdict is not a proof of a bad signature.
         let unavailable = FixedBackend::new(Err(BackendError("timeout".into())));
@@ -409,7 +508,8 @@ mod tests {
             Ok(())
         );
         assert!(skipped.seen.borrow().is_empty());
-        // A proposer outside the registry has no key to check.
+        // A proposer outside the registry is not the proposer of the slot, and its set has
+        // no key to check.
         let mut stranger = block.clone();
         stranger.message.proposer_index = 8;
         assert_eq!(
@@ -420,8 +520,53 @@ mod tests {
                 &FixedBackend::new(Ok(true)),
                 no_op
             ),
+            Err(StfError::WrongProposer {
+                block: 8,
+                expected: block.message.proposer_index
+            })
+        );
+        assert_eq!(
+            signatures::block_proposer_signature_set(&at_slot, &stranger),
             Err(StfError::UnknownValidator(8))
         );
+    }
+
+    #[test]
+    fn header_checks_run_before_the_registry_scan() {
+        // 64 validators at slot 1, and a sync committee with a key outside the registry: a
+        // registry scan for the committee indices fails with `UnknownSyncCommitteeMember`.
+        let mut state = genesis_state::<Minimal>(&[32_000_000_000; 64]);
+        state.current_sync_committee.pubkeys[0] = [0xee; 48];
+        let mut at_slot = state.clone();
+        per_slot::process_slots(&mut at_slot, 1).unwrap();
+        let mut block = block_at_state_slot(&at_slot);
+        let aggregate = &mut block.message.body.sync_aggregate;
+        aggregate.sync_committee_bits.set(0, true).unwrap();
+        aggregate.sync_committee_signature = [0x22; 96];
+
+        // A block with a wrong parent fails at the header checks: no scan, no backend call.
+        let mut orphan = block.clone();
+        orphan.message.parent_root = Root::repeat_byte(9);
+        let backend = FixedBackend::new(Ok(true));
+        assert!(matches!(
+            apply_block(&mut state.clone(), &orphan, true, &backend, no_op),
+            Err(StfError::ParentRootMismatch { .. })
+        ));
+        // A block with a wrong slot for its proposer fails the same way.
+        let mut stranger = block.clone();
+        stranger.message.proposer_index = (block.message.proposer_index + 1) % 64;
+        assert!(matches!(
+            apply_block(&mut state.clone(), &stranger, true, &backend, no_op),
+            Err(StfError::WrongProposer { .. })
+        ));
+        assert!(backend.seen.borrow().is_empty());
+
+        // A block that passes the header checks reaches the scan before the backend.
+        assert_eq!(
+            apply_block(&mut state.clone(), &block, true, &backend, no_op),
+            Err(StfError::UnknownSyncCommitteeMember { position: 0 })
+        );
+        assert!(backend.seen.borrow().is_empty());
     }
 
     #[test]
@@ -448,17 +593,18 @@ mod tests {
             Ok(())
         );
         assert_eq!(post.slot, 1);
-        // The public entry point runs the same steps.
+        // The public entry point runs the same steps, then `process_block`, which stops at
+        // the parent-payload step until it is ported.
         let mut post = state;
         assert_eq!(
             state_transition(&mut post, &block, true, &accepting),
-            Ok(())
+            Err(StfError::Unimplemented("4.6a"))
         );
     }
 
     /// The number of [`StfError`] variants: one more than the largest [`variant_id`].
     /// Increase `VARIANTS` when you add an id.
-    const VARIANTS: usize = 21;
+    const VARIANTS: usize = 29;
 
     /// A distinct id for each variant. The match has no `_` arm, so a new variant does not
     /// compile until it gets an id here, and then the table test fails until it has an entry.
@@ -485,6 +631,14 @@ mod tests {
             StfError::BlockRootOutOfRange { .. } => 18,
             StfError::ParticipationEpochOutOfRange { .. } => 19,
             StfError::MissingVerdict(_) => 20,
+            StfError::BlockSlotMismatch { .. } => 21,
+            StfError::BlockNotNewer { .. } => 22,
+            StfError::WrongProposer { .. } => 23,
+            StfError::ParentRootMismatch { .. } => 24,
+            StfError::ProposerSlashed(_) => 25,
+            StfError::BlockDeposits(_) => 26,
+            StfError::UnknownSyncCommitteeMember { .. } => 27,
+            StfError::InvalidSyncAggregateSignature => 28,
         }
     }
 
@@ -577,6 +731,32 @@ mod tests {
                 StfError::MissingVerdict(BackendError("not prefetched".into())),
                 false,
             ),
+            (StfError::BlockSlotMismatch { block: 1, state: 2 }, true),
+            (
+                StfError::BlockNotNewer {
+                    block: 1,
+                    latest: 1,
+                },
+                true,
+            ),
+            (
+                StfError::WrongProposer {
+                    block: 1,
+                    expected: 2,
+                },
+                true,
+            ),
+            (
+                StfError::ParentRootMismatch {
+                    block: Root::repeat_byte(1),
+                    expected: Root::repeat_byte(2),
+                },
+                true,
+            ),
+            (StfError::ProposerSlashed(1), true),
+            (StfError::BlockDeposits(1), true),
+            (StfError::UnknownSyncCommitteeMember { position: 1 }, false),
+            (StfError::InvalidSyncAggregateSignature, true),
         ];
         let mut ids: Vec<usize> = cases.iter().map(|(e, _)| variant_id(e)).collect();
         ids.sort_unstable();
