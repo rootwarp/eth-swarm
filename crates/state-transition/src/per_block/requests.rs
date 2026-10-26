@@ -55,6 +55,16 @@ fn validator_index_of<E: Preset>(
         .map(|index| index as ValidatorIndex)
 }
 
+/// The error for an index past the registry that our own code computed (for example with
+/// [`validator_index_of`]). It is a fault of our own state, not a proof that the request is
+/// invalid.
+fn past_registry(index: ValidatorIndex) -> StfError {
+    StfError::ListIndexOutOfRange {
+        list: "validators",
+        index,
+    }
+}
+
 /// `state.validators[index]` for an index from [`validator_index_of`].
 fn validator<E: Preset>(
     state: &BeaconState<E>,
@@ -63,7 +73,7 @@ fn validator<E: Preset>(
     state
         .validators
         .get(index as usize)
-        .ok_or(StfError::UnknownValidator(index))
+        .ok_or_else(|| past_registry(index))
 }
 
 /// The source index of a valid switch to compounding credentials, with the checks of
@@ -111,6 +121,9 @@ pub fn is_valid_switch_to_compounding_request<E: Preset>(
 
 /// `switch_to_compounding_validator` (E L887-892, New in Electra): the validator gets the
 /// 0x02 prefix, and the balance above `MIN_ACTIVATION_BALANCE` goes to a pending deposit.
+///
+/// The caller computes `index` from the registry. Thus an index past the registry gives
+/// [`StfError::ListIndexOutOfRange`], which is not a proof of an invalid request.
 pub fn switch_to_compounding_validator<E: Preset>(
     state: &mut BeaconState<E>,
     index: ValidatorIndex,
@@ -118,7 +131,7 @@ pub fn switch_to_compounding_validator<E: Preset>(
     let validator = state
         .validators
         .get_mut(index as usize)
-        .ok_or(StfError::UnknownValidator(index))?;
+        .ok_or_else(|| past_registry(index))?;
     validator.withdrawal_credentials[0] = COMPOUNDING_WITHDRAWAL_PREFIX;
     queue_excess_active_balance(state, index)
 }
@@ -385,7 +398,7 @@ pub fn process_consolidation_request<E: Preset>(
     let source_validator = state
         .validators
         .get_mut(source_index as usize)
-        .ok_or(StfError::UnknownValidator(source_index))?;
+        .ok_or_else(|| past_registry(source_index))?;
     source_validator.exit_epoch = exit_epoch;
     source_validator.withdrawable_epoch = withdrawable_epoch;
     // `PendingConsolidations` is a `ProgressiveList` without a limit. milhouse fails only at
@@ -574,6 +587,27 @@ mod tests {
         let mut exiting = state.clone();
         exiting.validators.get_mut(1).unwrap().exit_epoch = 70;
         assert!(!is_valid_switch_to_compounding_request(&exiting, &switch));
+    }
+
+    /// An index past the registry that our own code computed is a fault of our state, not a
+    /// proof that the request is invalid.
+    #[test]
+    fn computed_index_past_the_registry() {
+        let mut state = state();
+        let past = StfError::ListIndexOutOfRange {
+            list: "validators",
+            index: 64,
+        };
+        assert_eq!(validator(&state, 64).err(), Some(past.clone()));
+        assert_eq!(
+            switch_to_compounding_validator(&mut state, 64),
+            Err(past.clone())
+        );
+        assert_eq!(
+            queue_excess_active_balance(&mut state, 64),
+            Err(past.clone())
+        );
+        assert!(!past.proves_invalid());
     }
 
     /// Changes the state or the request of a valid consolidation of validator 1 into

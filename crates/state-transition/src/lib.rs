@@ -814,11 +814,13 @@ pub fn state_root<E: Preset>(state: &mut BeaconState<E>) -> Result<Root, StfErro
 /// partly updated: the caller drops it.
 ///
 /// `validate_result` controls only the signature sets of the block. With `validate_result`
-/// false, the call does not check the proposer signature, the RANDAO reveal, the sync
-/// aggregate signature and the payload attestation signatures. The spec skips only the
-/// proposer signature there. Use `validate_result` false only to compute the state root of
-/// a block that we produce ourselves, whose signatures we made. The checks that need no BLS
-/// (for example the infinity signature of an empty sync aggregate) run in both modes.
+/// false, the call checks no block signature set of [`signatures::block_signature_sets`]:
+/// the proposer signature, the RANDAO reveal, the signed operations of the body (for example
+/// the slashings, the attestations, the voluntary exits and the BLS changes), the payload
+/// attestations and the sync aggregate signature. The spec skips only the proposer
+/// signature there. Use `validate_result` false only to compute the state root of a block
+/// that we produce ourselves, whose signatures we made. The checks that need no BLS (for
+/// example the infinity signature of an empty sync aggregate) run in both modes.
 ///
 /// The slot loop always needs `bls`, in both modes. At each epoch boundary it asks
 /// `bls.backend` for the verdicts of the pending deposits of new keys, and it aggregates the
