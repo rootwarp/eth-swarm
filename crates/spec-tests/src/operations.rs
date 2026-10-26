@@ -4,9 +4,12 @@
 //! Each case holds `pre.ssz_snappy`, the operation (`<operation>.ssz_snappy`), `post.ssz_snappy`
 //! when the operation is valid, `manifest.yaml`, and an optional `meta.yaml` with
 //! `bls_setting` (0 or absent: check the signatures, 1: they must be checked, 2: do not check
-//! them). The check is the handler on `pre`, then `hash_tree_root` against `post`. A case
-//! without `post.ssz_snappy` must fail with an error that proves the input invalid
-//! (`StfError::proves_invalid`).
+//! them) and, for the Gloas `attestation` handler, `parent_slot`. The check is the handler on
+//! `pre`, then `hash_tree_root` against `post`. A case without `post.ssz_snappy` must fail
+//! with an error that proves the input invalid (`StfError::proves_invalid`).
+//!
+//! The signature sets of an operation are checked before the handler, through the
+//! in-process backend, as the block checks them in one batch before its steps.
 //!
 //! Every Gloas operations handler directory must be in [`RUNNABLE`] or [`NOT_RUN`]
 //! ([`handler_runs`]); any other directory fails the run. The handlers of [`NOT_RUN`] need a
@@ -23,14 +26,20 @@ use crate::coverage::Reads;
 use crate::fixture;
 use crate::plan::Case;
 use consensus_types::common::{
-    ConsolidationRequest, SignedBLSToExecutionChange, SignedVoluntaryExit, SyncAggregate,
+    AttestationData, ConsolidationRequest, ProposerSlashing, SignedBLSToExecutionChange,
+    SignedVoluntaryExit, SyncAggregate,
 };
 use consensus_types::gloas::{
-    BeaconBlock, BeaconState, BuilderDepositRequest, BuilderExitRequest, PayloadAttestation,
+    Attestation, AttesterSlashing, BeaconBlock, BeaconState, BuilderDepositRequest,
+    BuilderExitRequest, PayloadAttestation,
 };
+use consensus_types::primitives::{BLSSignature, Slot, ValidatorIndex};
 use consensus_types::{Mainnet, Minimal};
 use ssz::Decode;
+use ssz_types::typenum::{Unsigned, U0};
+use ssz_types::ProgressiveVariableList;
 use state_transition::accessors::TotalActiveBalanceCache;
+use state_transition::per_block::attestation::process_attestation_with;
 use state_transition::per_block::builder::{
     process_builder_deposit_request, process_builder_exit_request,
 };
@@ -38,10 +47,13 @@ use state_transition::per_block::exits::{process_bls_to_execution_change, proces
 use state_transition::per_block::requests::process_consolidation_request;
 use state_transition::per_block::sync_aggregate::process_sync_aggregate_with;
 use state_transition::per_block::{
-    process_block_header, process_payload_attestation, BlockContext,
+    process_attester_slashing, process_block_header, process_payload_attestation,
+    process_proposer_slashing, BlockContext,
 };
 use state_transition::signatures::{
-    verify_bls_to_execution_change_signature, verify_payload_attestation_signature,
+    attestation_signature_set_with, attester_slashing_signature_sets,
+    proposer_slashing_signature_sets, verify_bls_to_execution_change_signature,
+    verify_operation_signatures, verify_payload_attestation_signature,
     verify_sync_aggregate_signature_with, verify_voluntary_exit_signature,
 };
 use state_transition::{state_root, Preset, StfError};
@@ -50,13 +62,16 @@ use tree_hash::TreeHash;
 use yaml_rust2::Yaml;
 
 /// Handlers this runner executes.
-pub const RUNNABLE: [&str; 9] = [
+pub const RUNNABLE: [&str; 12] = [
+    "attestation",
+    "attester_slashing",
     "block_header",
     "bls_to_execution_change",
     "builder_deposit_request",
     "builder_exit_request",
     "consolidation_request",
     "payload_attestation",
+    "proposer_slashing",
     "sync_aggregate",
     "voluntary_exit",
     "voluntary_exit_churn",
@@ -64,13 +79,10 @@ pub const RUNNABLE: [&str; 9] = [
 
 /// Gloas handlers at beta.4 that the state transition does not port yet. Each needs a
 /// `skip.toml` entry.
-pub const NOT_RUN: [&str; 8] = [
-    "attestation",
-    "attester_slashing",
+pub const NOT_RUN: [&str; 5] = [
     "deposit_request",
     "execution_payload_bid",
     "parent_execution_payload",
-    "proposer_slashing",
     "withdrawal_request",
     "withdrawals",
 ];
@@ -191,6 +203,35 @@ fn operation<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
             let mut cache = TotalActiveBalanceCache::default();
             process_consolidation_request(&mut state, &request, &mut cache)
         }
+        ("operations", "proposer_slashing") => {
+            let slashing =
+                decode::<ProposerSlashing>(reads, file("proposer_slashing.ssz_snappy")?)?;
+            let keys = StateKeys::new(&state);
+            proposer_slashing_signature_sets(&state, &slashing)
+                .and_then(|sets| verify_operation_signatures(&sets, backend_for(bls, &keys)))
+                .and_then(|()| process_proposer_slashing(&mut state, &slashing))
+        }
+        ("operations", "attester_slashing") => {
+            let slashing = attester_slashing::<E>(reads, file("attester_slashing.ssz_snappy")?)?;
+            let keys = StateKeys::new(&state);
+            slashing.and_then(|slashing| {
+                attester_slashing_signature_sets(&state, &slashing)
+                    .and_then(|sets| verify_operation_signatures(&sets, backend_for(bls, &keys)))
+                    .and_then(|()| process_attester_slashing(&mut state, &slashing))
+            })
+        }
+        ("operations", "attestation") => {
+            let attestation = decode::<Attestation<E>>(reads, file("attestation.ssz_snappy")?)?;
+            let parent_slot = parent_slot(reads, case)?.unwrap_or(state.latest_block_header.slot);
+            // One context: the signature set and the step share the committee cache.
+            let mut ctx = BlockContext::default();
+            let keys = StateKeys::new(&state);
+            attestation_signature_set_with(&state, &attestation, &mut ctx)
+                .and_then(|set| verify_operation_signatures(&[set], backend_for(bls, &keys)))
+                .and_then(|()| {
+                    process_attestation_with(&mut state, &attestation, parent_slot, &mut ctx)
+                })
+        }
         (runner, handler) => return Err(format!("no runner for {runner}/{handler}")),
     };
     expect(&mut state, outcome, post)
@@ -221,6 +262,68 @@ fn check_config(reads: &Reads, path: &Path, preset: &str) -> Result<(), String> 
         return Err(wrong("GENESIS_FORK_VERSION", version));
     }
     Ok(())
+}
+
+/// `parent_slot` of `meta.yaml`: the slot of the parent block, which the Gloas
+/// `process_attestation` takes. `None` if the case has no `meta.yaml` or no such key; the
+/// caller then uses the slot of the latest block header of `pre`, which `process_block`
+/// passes (`gloas/beacon-chain.md` L1756).
+fn parent_slot(reads: &Reads, case: &Case) -> Result<Option<Slot>, String> {
+    let Some(path) = case.file("meta.yaml") else {
+        return Ok(None);
+    };
+    match &fixture::load(reads, path)?["parent_slot"] {
+        Yaml::BadValue => Ok(None),
+        Yaml::Integer(slot) => Slot::try_from(*slot)
+            .map(Some)
+            .map_err(|_| format!("meta.yaml: parent_slot {slot} is not a slot")),
+        other => Err(format!(
+            "meta.yaml: parent_slot {other:?} is not an integer"
+        )),
+    }
+}
+
+/// `IndexedAttestation` with the unbounded `AttestingIndices` of the spec
+/// (`ProgressiveList[ValidatorIndex]`, `gloas/beacon-chain.md` L225).
+#[derive(ssz_derive::Decode)]
+struct SpecIndexedAttestation {
+    attesting_indices: ProgressiveVariableList<ValidatorIndex, U0>,
+    _data: AttestationData,
+    _signature: BLSSignature,
+}
+
+/// `AttesterSlashing` of two [`SpecIndexedAttestation`]s.
+#[derive(ssz_derive::Decode)]
+struct SpecAttesterSlashing {
+    attestation_1: SpecIndexedAttestation,
+    attestation_2: SpecIndexedAttestation,
+}
+
+/// The attester slashing of a case.
+///
+/// The `IndexedAttestation` of consensus-types holds at most `MAX_VALIDATORS_PER_COMMITTEE *
+/// MAX_COMMITTEES_PER_SLOT` indices, the bound that `is_valid_indexed_attestation`
+/// (`gloas/beacon-chain.md` L1022-1041) asserts. An object that does not decode for that reason only has the verdict
+/// of that assert: `Ok(Err(StfError::InvalidIndexedAttestation))`. Any other decode error is
+/// a failure of the case (`Err`).
+fn attester_slashing<E: Preset>(
+    reads: &Reads,
+    path: &Path,
+) -> Result<Result<AttesterSlashing<E>, StfError>, String> {
+    let bytes = fixture::ssz_snappy(reads, path)?;
+    let bounded_error = match AttesterSlashing::<E>::from_ssz_bytes(&bytes) {
+        Ok(slashing) => return Ok(Ok(slashing)),
+        Err(e) => format!("{}: {e:?}", path.display()),
+    };
+    let spec = SpecAttesterSlashing::from_ssz_bytes(&bytes).map_err(|_| bounded_error.clone())?;
+    let bound = E::MaxValidatorsPerSlot::to_usize();
+    if spec.attestation_1.attesting_indices.len() > bound
+        || spec.attestation_2.attesting_indices.len() > bound
+    {
+        Ok(Err(StfError::InvalidIndexedAttestation))
+    } else {
+        Err(bounded_error)
+    }
 }
 
 /// Compares the outcome of a handler with what the vector expects.
@@ -1045,5 +1148,212 @@ mod tests {
         assert!(expect(&mut s, Err(StfError::Unimplemented("x")), None)
             .unwrap_err()
             .contains("not a spec failure"));
+    }
+
+    /// The files of a case of one operation, with an optional post-state and `meta.yaml`.
+    fn op_files(
+        pre: &BeaconState<Minimal>,
+        name: &'static str,
+        op: Vec<u8>,
+        post: Option<&BeaconState<Minimal>>,
+        meta: Option<&str>,
+    ) -> Vec<(&'static str, Vec<u8>)> {
+        let mut files = vec![
+            ("pre.ssz_snappy", snappy(pre.as_ssz_bytes())),
+            (name, snappy(op)),
+        ];
+        if let Some(post) = post {
+            files.push(("post.ssz_snappy", snappy(post.as_ssz_bytes())));
+        }
+        if let Some(meta) = meta {
+            files.push(("meta.yaml", meta.as_bytes().to_vec()));
+        }
+        files
+    }
+
+    fn header(body: u8) -> consensus_types::common::SignedBeaconBlockHeader {
+        use consensus_types::common::{BeaconBlockHeader, SignedBeaconBlockHeader};
+        use consensus_types::primitives::Root;
+        SignedBeaconBlockHeader {
+            message: BeaconBlockHeader {
+                slot: 1,
+                proposer_index: 1,
+                parent_root: Root::ZERO,
+                state_root: Root::ZERO,
+                body_root: Root::repeat_byte(body),
+            },
+            signature: [body; 96],
+        }
+    }
+
+    #[test]
+    fn proposer_slashing_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        let pre = pre();
+        let slashing = ProposerSlashing {
+            signed_header_1: header(1),
+            signed_header_2: header(2),
+        };
+        let name = "proposer_slashing.ssz_snappy";
+        // bls_setting 2: the signatures are not checked, and validator 1 is slashed.
+        let mut post = pre.clone();
+        process_proposer_slashing(&mut post, &slashing).unwrap();
+        post.apply_updates().unwrap();
+        assert!(post.validators.get(1).unwrap().slashed);
+        let files = op_files(
+            &pre,
+            name,
+            slashing.as_ssz_bytes(),
+            Some(&post),
+            Some("{bls_setting: 2}\n"),
+        );
+        let c = case(dir.path(), "proposer_slashing", &files);
+        let reads = Reads::default();
+        assert_eq!(run(&reads, &c), Ok(()));
+        assert!(c.files.iter().all(|f| reads.contains(&f.path)));
+        // With the check, the key `[1; 48]` does not decode, so the signatures are invalid.
+        let files = op_files(&pre, name, slashing.as_ssz_bytes(), None, None);
+        let c = case(dir.path(), "proposer_slashing", &files);
+        assert_eq!(run(&Reads::default(), &c), Ok(()));
+        let files = op_files(&pre, name, slashing.as_ssz_bytes(), Some(&post), None);
+        let c = case(dir.path(), "proposer_slashing", &files);
+        assert!(run(&Reads::default(), &c)
+            .unwrap_err()
+            .contains("invalid operation signature"));
+    }
+
+    #[test]
+    fn attester_slashing_cases() {
+        use consensus_types::common::Checkpoint;
+        use consensus_types::gloas::IndexedAttestation;
+        use consensus_types::primitives::Root;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pre = pre();
+        let data = |root: u8| AttestationData {
+            slot: 0,
+            index: 0,
+            beacon_block_root: Root::repeat_byte(root),
+            source: Checkpoint {
+                epoch: 0,
+                root: Root::ZERO,
+            },
+            target: Checkpoint {
+                epoch: 0,
+                root: Root::ZERO,
+            },
+        };
+        let indexed = |indices: Vec<u64>, root: u8| IndexedAttestation::<Mainnet> {
+            attesting_indices: indices.try_into().unwrap(),
+            data: data(root),
+            signature: [root; 96],
+        };
+        let name = "attester_slashing.ssz_snappy";
+        // A double vote of validator 1, with bls_setting 2.
+        let slashing = AttesterSlashing::<Mainnet> {
+            attestation_1: indexed(vec![1], 1),
+            attestation_2: indexed(vec![1], 2),
+        };
+        let minimal =
+            AttesterSlashing::<Minimal>::from_ssz_bytes(&slashing.as_ssz_bytes()).unwrap();
+        let mut post = pre.clone();
+        process_attester_slashing(&mut post, &minimal).unwrap();
+        post.apply_updates().unwrap();
+        let files = op_files(
+            &pre,
+            name,
+            slashing.as_ssz_bytes(),
+            Some(&post),
+            Some("{bls_setting: 2}\n"),
+        );
+        let c = case(dir.path(), "attester_slashing", &files);
+        assert_eq!(run(&Reads::default(), &c), Ok(()));
+        // With the check, the key of validator 1 does not decode.
+        let files = op_files(&pre, name, slashing.as_ssz_bytes(), None, None);
+        assert_eq!(
+            run(
+                &Reads::default(),
+                &case(dir.path(), "attester_slashing", &files)
+            ),
+            Ok(())
+        );
+
+        // More indices than the minimal bound (8192): the verdict of the bound check of
+        // `is_valid_indexed_attestation`, which the vector expects to fail.
+        let too_many = AttesterSlashing::<Mainnet> {
+            attestation_1: indexed((0..8193).collect(), 1),
+            attestation_2: indexed(vec![1], 2),
+        };
+        let files = op_files(&pre, name, too_many.as_ssz_bytes(), None, None);
+        let c = case(dir.path(), "attester_slashing", &files);
+        assert_eq!(run(&Reads::default(), &c), Ok(()));
+        let path = &c.files[1].path;
+        assert_eq!(
+            attester_slashing::<Minimal>(&Reads::default(), path),
+            Ok(Err(StfError::InvalidIndexedAttestation))
+        );
+        // Bytes that are not an attester slashing at all are a failure of the case.
+        let files = op_files(&pre, name, vec![1, 2, 3], None, None);
+        let c = case(dir.path(), "attester_slashing", &files);
+        assert!(run(&Reads::default(), &c)
+            .unwrap_err()
+            .contains("attester_slashing.ssz_snappy"));
+        // An attestation in the bound that does not decode for another reason (an offset
+        // past the end) is also a failure.
+        let mut bytes = slashing.as_ssz_bytes();
+        bytes[0] = 0xff;
+        let files = op_files(&pre, name, bytes, None, None);
+        let c = case(dir.path(), "attester_slashing", &files);
+        assert!(run(&Reads::default(), &c).is_err());
+    }
+
+    #[test]
+    fn attestation_cases() {
+        use consensus_types::common::Checkpoint;
+        use consensus_types::primitives::Root;
+        use ssz::{BitVector, ProgressiveBitList};
+
+        let dir = tempfile::tempdir().unwrap();
+        let pre = pre();
+        let attestation = Attestation::<Minimal> {
+            aggregation_bits: ProgressiveBitList::with_capacity(1),
+            data: AttestationData {
+                slot: 0,
+                index: 2,
+                beacon_block_root: Root::ZERO,
+                source: Checkpoint {
+                    epoch: 0,
+                    root: Root::ZERO,
+                },
+                target: Checkpoint {
+                    epoch: 0,
+                    root: Root::ZERO,
+                },
+            },
+            signature: [0; 96],
+            committee_bits: BitVector::new(),
+        };
+        let name = "attestation.ssz_snappy";
+        // `data.index` 2 fails in both modes, with or without `parent_slot`.
+        for meta in [
+            None,
+            Some("{parent_slot: 1}\n"),
+            Some("{parent_slot: 1, bls_setting: 2}\n"),
+            Some("{bls_setting: 1}\n"),
+        ] {
+            let files = op_files(&pre, name, attestation.as_ssz_bytes(), None, meta);
+            let c = case(dir.path(), "attestation", &files);
+            let reads = Reads::default();
+            assert_eq!(run(&reads, &c), Ok(()), "{meta:?}");
+            assert!(c.files.iter().all(|f| reads.contains(&f.path)));
+        }
+        // A `parent_slot` that is not a slot.
+        for meta in ["{parent_slot: x}\n", "{parent_slot: -1}\n"] {
+            let files = op_files(&pre, name, attestation.as_ssz_bytes(), None, Some(meta));
+            let c = case(dir.path(), "attestation", &files);
+            assert!(run(&Reads::default(), &c)
+                .unwrap_err()
+                .contains("parent_slot"));
+        }
     }
 }

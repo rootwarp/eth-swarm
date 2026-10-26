@@ -13,7 +13,7 @@ use crate::accessors::{
     compute_activation_exit_epoch, get_consolidation_churn_limit, get_current_epoch,
     get_exit_churn_limit, TotalActiveBalanceCache,
 };
-use crate::caches::get_beacon_proposer_index;
+use crate::per_block::state_proposer_index;
 use crate::preset::{
     MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA, MIN_VALIDATOR_WITHDRAWABILITY_DELAY, PROPOSER_WEIGHT,
     WEIGHT_DENOMINATOR, WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA,
@@ -268,6 +268,10 @@ pub fn settle_builder_payment<E: Preset>(
 /// `slash_validator` (G L1549-1581, Modified in Gloas): the Electra penalty and rewards,
 /// and the pending builder payments of the blocks that the slashed validator proposed are
 /// emptied (consensus-specs PR 5719). `None` as `whistleblower_index` is the proposer.
+///
+/// The proposer comes from `state.proposer_lookahead`, not from the slashing, so an index
+/// there past the registry is a fault of our own state: `ListIndexOutOfRange`, not a proof
+/// that the slashing is invalid.
 pub fn slash_validator<E: Preset>(
     state: &mut BeaconState<E>,
     slashed_index: ValidatorIndex,
@@ -298,7 +302,7 @@ pub fn slash_validator<E: Preset>(
     decrease_balance(state, slashed_index, slashing_penalty)?;
 
     // Apply proposer and whistleblower rewards
-    let proposer_index = get_beacon_proposer_index(state)?;
+    let proposer_index = state_proposer_index(state)?;
     let whistleblower_index = whistleblower_index.unwrap_or(proposer_index);
     let whistleblower_reward = effective_balance / WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA;
     let proposer_reward = whistleblower_reward
@@ -833,5 +837,20 @@ mod tests {
         // The new errors prove an invalid input.
         assert!(StfError::UnknownBuilder(0).proves_invalid());
         assert!(StfError::PaymentIndexOutOfRange { index: 16, len: 16 }.proves_invalid());
+    }
+
+    #[test]
+    fn slash_with_a_lookahead_past_the_registry() {
+        // The proposer of the rewards comes from our own lookahead. An index there past the
+        // registry is a fault of our state, not a proof against the slashing.
+        let mut state = genesis_state::<Minimal>(&[32 * ETH; 8]);
+        *state.proposer_lookahead.get_mut(0).unwrap() = 8;
+        let result = slash_validator(&mut state, 1, None, &mut TotalActiveBalanceCache::default());
+        let fault = StfError::ListIndexOutOfRange {
+            list: "validators",
+            index: 8,
+        };
+        assert_eq!(result, Err(fault.clone()));
+        assert!(!fault.proves_invalid());
     }
 }

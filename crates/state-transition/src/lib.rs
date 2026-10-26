@@ -349,6 +349,94 @@ pub enum StfError {
     /// `process_bls_to_execution_change`).
     #[error("invalid BLS-to-execution change signature")]
     InvalidBlsToExecutionChangeSignature,
+    /// `process_attestation` asserts that `data.target.epoch` is the previous or the current
+    /// epoch of the state.
+    #[error("attestation target epoch {target} is not the previous or the current epoch of state epoch {state_epoch}")]
+    AttestationTargetEpoch {
+        /// `data.target.epoch`.
+        target: Epoch,
+        /// `get_current_epoch(state)`.
+        state_epoch: Epoch,
+    },
+    /// `process_attestation` asserts `data.target.epoch == compute_epoch_at_slot(data.slot)`.
+    #[error("attestation target epoch {target} is not the epoch of its slot {slot}")]
+    AttestationTargetSlot {
+        /// `data.target.epoch`.
+        target: Epoch,
+        /// `data.slot`.
+        slot: Slot,
+    },
+    /// `process_attestation` asserts `data.slot + MIN_ATTESTATION_INCLUSION_DELAY <= state.slot`.
+    #[error("attestation of slot {slot} is too early for state slot {state_slot}")]
+    AttestationTooEarly {
+        /// `data.slot`.
+        slot: Slot,
+        /// `state.slot`.
+        state_slot: Slot,
+    },
+    /// The Gloas `process_attestation` asserts `data.index < 2`: the index tells the payload
+    /// status, not a committee.
+    #[error("attestation data index {0} is not 0 or 1")]
+    AttestationDataIndex(u64),
+    /// The Gloas `get_attestation_participation_flag_indices` asserts `data.index == 0` for an
+    /// attestation of the block of its own slot (`is_attestation_same_slot`).
+    #[error("same-slot attestation has data index {0}, not 0")]
+    SameSlotAttestationIndex(u64),
+    /// `process_attestation` asserts that each committee of `committee_bits` has an attester.
+    #[error("committee {0} of the attestation has no attester")]
+    EmptyCommitteeAttesters(CommitteeIndex),
+    /// `process_attestation` asserts that `aggregation_bits` is as long as its committees.
+    #[error("aggregation bits have length {len}, the committees have {participants} members")]
+    AggregationBitsLength {
+        /// `len(attestation.aggregation_bits)`.
+        len: usize,
+        /// The sum of the committee sizes (`committee_offset`).
+        participants: usize,
+    },
+    /// `get_attestation_participation_flag_indices` asserts `is_matching_source`: the source
+    /// is not the justified checkpoint of the target epoch.
+    #[error("attestation source is not the justified checkpoint")]
+    AttestationSourceMismatch,
+    /// `is_valid_indexed_attestation` is false before its BLS check: the attesting indices are
+    /// empty, more than `MAX_VALIDATORS_PER_COMMITTEE * MAX_COMMITTEES_PER_SLOT`, or not
+    /// sorted and unique.
+    #[error("attesting indices are empty, too many, or not sorted and unique")]
+    InvalidIndexedAttestation,
+    /// `process_attester_slashing` asserts `is_slashable_attestation_data`: the two data are
+    /// not a double vote and not a surround vote.
+    #[error("attester slashing data are not slashable")]
+    NotSlashableAttestationData,
+    /// `process_attester_slashing` asserts `slashed_any`: no validator in both attestations
+    /// is slashable.
+    #[error("attester slashing slashes no validator")]
+    NoValidatorSlashed,
+    /// `process_proposer_slashing` asserts `header_1.slot == header_2.slot`.
+    #[error("proposer slashing headers have slots {slot_1} and {slot_2}")]
+    ProposerSlashingSlots {
+        /// `header_1.slot`.
+        slot_1: Slot,
+        /// `header_2.slot`.
+        slot_2: Slot,
+    },
+    /// `process_proposer_slashing` asserts `header_1.proposer_index == header_2.proposer_index`.
+    #[error("proposer slashing headers have proposers {proposer_1} and {proposer_2}")]
+    ProposerSlashingProposers {
+        /// `header_1.proposer_index`.
+        proposer_1: ValidatorIndex,
+        /// `header_2.proposer_index`.
+        proposer_2: ValidatorIndex,
+    },
+    /// `process_proposer_slashing` asserts `header_1 != header_2`.
+    #[error("proposer slashing headers are the same")]
+    ProposerSlashingSameHeaders,
+    /// `process_proposer_slashing` asserts `is_slashable_validator` for the proposer.
+    #[error("validator {0} is not slashable")]
+    ValidatorNotSlashable(ValidatorIndex),
+    /// The backend rejected a signature set of one operation (an attestation, an attester
+    /// slashing or a proposer slashing) that the caller checks alone, through
+    /// [`signatures::verify_operation_signatures`], not in the batch of the block.
+    #[error("invalid operation signature")]
+    InvalidOperationSignature,
 }
 
 impl StfError {
@@ -382,6 +470,13 @@ impl StfError {
     /// of the state that the caller uses. A head state older than the object can have a
     /// shorter registry, so the index of a valid object can be past it. Thus a caller that
     /// uses another state than the object's own pre-state must map it to IGNORE.
+    ///
+    /// The attestation and slashing variants that read the state have the same rule:
+    /// [`StfError::AttestationTargetEpoch`], [`StfError::AttestationTooEarly`],
+    /// [`StfError::SameSlotAttestationIndex`], [`StfError::EmptyCommitteeAttesters`],
+    /// [`StfError::AggregationBitsLength`], [`StfError::AttestationSourceMismatch`],
+    /// [`StfError::NoValidatorSlashed`], [`StfError::ValidatorNotSlashable`] and
+    /// [`StfError::InvalidOperationSignature`].
     ///
     /// The match has no `_` arm, so each new variant must select its class here.
     pub fn proves_invalid(&self) -> bool {
@@ -468,7 +563,37 @@ impl StfError {
             | Self::BlsChangeKeyMismatch(_)
             // `bls.Verify` is false for the inline key of the change, a verdict of the
             // backend (as for `InvalidBlockSignature`).
-            | Self::InvalidBlsToExecutionChangeSignature => true,
+            | Self::InvalidBlsToExecutionChangeSignature
+            // The asserts of `process_attestation` and of its flag indices on the state at
+            // the attestation's block slot: the target epoch, the inclusion delay, the index
+            // of a same-slot attestation, the attesters of each committee, the length of
+            // the bits and the source. A proof only on the object's own pre-state.
+            | Self::AttestationTargetEpoch { .. }
+            | Self::AttestationTooEarly { .. }
+            | Self::SameSlotAttestationIndex(_)
+            | Self::EmptyCommitteeAttesters(_)
+            | Self::AggregationBitsLength { .. }
+            | Self::AttestationSourceMismatch
+            // Properties of the attestation alone: the target epoch of its slot, and an
+            // index that is not a payload status.
+            | Self::AttestationTargetSlot { .. }
+            | Self::AttestationDataIndex(_)
+            // `is_valid_indexed_attestation` is false for the indices alone.
+            | Self::InvalidIndexedAttestation
+            // The asserts of `process_attester_slashing` and `process_proposer_slashing`
+            // on the slashing alone: two data that are not slashable, and two headers of
+            // other slots, of other proposers, or that are the same.
+            | Self::NotSlashableAttestationData
+            | Self::ProposerSlashingSlots { .. }
+            | Self::ProposerSlashingProposers { .. }
+            | Self::ProposerSlashingSameHeaders
+            // The slashable checks read the registry of the state: a proof only on the
+            // object's own pre-state.
+            | Self::NoValidatorSlashed
+            | Self::ValidatorNotSlashable(_)
+            // A verdict of the backend on the keys of the state, as for
+            // `InvalidBlockSignature`.
+            | Self::InvalidOperationSignature => true,
         }
     }
 }
@@ -506,8 +631,8 @@ pub fn state_root<E: Preset>(state: &mut BeaconState<E>) -> Result<Root, StfErro
 /// Do not use this function on real blocks yet. Block processing is ported only in part:
 /// [`per_block::process_block`] returns [`StfError::Unimplemented`] at its first step (the
 /// parent payload), so every block fails with an error that is not a proof of an invalid
-/// block. For the same reason, a block with a slashing, an attestation or a builder bid
-/// fails the signature sets with `Unimplemented`.
+/// block. For the same reason, a block with a builder bid fails the signature sets with
+/// `Unimplemented`.
 ///
 /// Bound `block.slot` against the wall clock before the call. As in the spec, the slots
 /// are processed before the signature check, and `process_slots` has no upper bound: a
@@ -846,7 +971,7 @@ mod tests {
 
     /// The number of [`StfError`] variants: one more than the largest [`variant_id`].
     /// Increase `VARIANTS` when you add an id.
-    const VARIANTS: usize = 44;
+    const VARIANTS: usize = 60;
 
     /// A distinct id for each variant. The match has no `_` arm, so a new variant does not
     /// compile until it gets an id here, and then the table test fails until it has an entry.
@@ -896,6 +1021,22 @@ mod tests {
             StfError::NotBlsWithdrawalCredentials(_) => 41,
             StfError::BlsChangeKeyMismatch(_) => 42,
             StfError::InvalidBlsToExecutionChangeSignature => 43,
+            StfError::AttestationTargetEpoch { .. } => 44,
+            StfError::AttestationTargetSlot { .. } => 45,
+            StfError::AttestationTooEarly { .. } => 46,
+            StfError::AttestationDataIndex(_) => 47,
+            StfError::SameSlotAttestationIndex(_) => 48,
+            StfError::EmptyCommitteeAttesters(_) => 49,
+            StfError::AggregationBitsLength { .. } => 50,
+            StfError::AttestationSourceMismatch => 51,
+            StfError::InvalidIndexedAttestation => 52,
+            StfError::NotSlashableAttestationData => 53,
+            StfError::NoValidatorSlashed => 54,
+            StfError::ProposerSlashingSlots { .. } => 55,
+            StfError::ProposerSlashingProposers { .. } => 56,
+            StfError::ProposerSlashingSameHeaders => 57,
+            StfError::ValidatorNotSlashable(_) => 58,
+            StfError::InvalidOperationSignature => 59,
         }
     }
 
@@ -1063,6 +1204,52 @@ mod tests {
             (StfError::NotBlsWithdrawalCredentials(1), true),
             (StfError::BlsChangeKeyMismatch(1), true),
             (StfError::InvalidBlsToExecutionChangeSignature, true),
+            (
+                StfError::AttestationTargetEpoch {
+                    target: 5,
+                    state_epoch: 2,
+                },
+                true,
+            ),
+            (StfError::AttestationTargetSlot { target: 1, slot: 0 }, true),
+            (
+                StfError::AttestationTooEarly {
+                    slot: 3,
+                    state_slot: 3,
+                },
+                true,
+            ),
+            (StfError::AttestationDataIndex(2), true),
+            (StfError::SameSlotAttestationIndex(1), true),
+            (StfError::EmptyCommitteeAttesters(0), true),
+            (
+                StfError::AggregationBitsLength {
+                    len: 5,
+                    participants: 4,
+                },
+                true,
+            ),
+            (StfError::AttestationSourceMismatch, true),
+            (StfError::InvalidIndexedAttestation, true),
+            (StfError::NotSlashableAttestationData, true),
+            (StfError::NoValidatorSlashed, true),
+            (
+                StfError::ProposerSlashingSlots {
+                    slot_1: 1,
+                    slot_2: 2,
+                },
+                true,
+            ),
+            (
+                StfError::ProposerSlashingProposers {
+                    proposer_1: 1,
+                    proposer_2: 2,
+                },
+                true,
+            ),
+            (StfError::ProposerSlashingSameHeaders, true),
+            (StfError::ValidatorNotSlashable(1), true),
+            (StfError::InvalidOperationSignature, true),
         ];
         let mut ids: Vec<usize> = cases.iter().map(|(e, _)| variant_id(e)).collect();
         ids.sort_unstable();

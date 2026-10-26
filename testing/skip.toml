@@ -236,34 +236,13 @@ owner   = "ian"
 issue   = "4.7"
 expires = "2026-11-30"
 
-# Gloas operations handlers that are not ported yet. block_header, bls_to_execution_change,
-# builder_deposit_request, builder_exit_request, consolidation_request, payload_attestation,
-# sync_aggregate, voluntary_exit and voluntary_exit_churn run
-# (crates/spec-tests/src/operations.rs). beta.4 has no operations/randao handler. The reason names the plan item that ports each handler;
+# Gloas operations handlers that are not ported yet. attestation, attester_slashing,
+# block_header, bls_to_execution_change, builder_deposit_request, builder_exit_request,
+# consolidation_request, payload_attestation, proposer_slashing, sync_aggregate,
+# voluntary_exit and voluntary_exit_churn run (crates/spec-tests/src/operations.rs). beta.4
+# has no operations/randao handler. The reason names the plan item that ports each handler;
 # `issue` is the milestone, because the plan IDs with a letter are not valid values of
 # `issue`.
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "*"
-runner  = "operations"
-handler = "attestation"
-reason  = "process_attestation is not ported yet: the operations runner has a dispatch slot for it only (plan item 4.3b)"
-owner   = "ian"
-issue   = "4.7"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "*"
-runner  = "operations"
-handler = "attester_slashing"
-reason  = "process_attester_slashing is not ported yet: the operations runner has a dispatch slot for it only (plan item 4.3b)"
-owner   = "ian"
-issue   = "4.7"
-expires = "2026-11-30"
 
 [[skip]]
 source  = "consensus-specs"
@@ -294,17 +273,6 @@ preset  = "*"
 runner  = "operations"
 handler = "parent_execution_payload"
 reason  = "process_parent_execution_payload is not ported yet: process_block has a stub step for it only (plan item 4.6a)"
-owner   = "ian"
-issue   = "4.7"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "*"
-runner  = "operations"
-handler = "proposer_slashing"
-reason  = "process_proposer_slashing is not ported yet: the operations runner has a dispatch slot for it only (plan item 4.3b)"
 owner   = "ian"
 issue   = "4.7"
 expires = "2026-11-30"

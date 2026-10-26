@@ -16,6 +16,7 @@
 pub use consensus_types::signing::{SignatureSet, SignerRef};
 
 use crate::accessors::{get_block_root_at_slot, get_current_epoch, get_domain};
+use crate::per_block::attestation::{check_attestation, check_indexed_attestation};
 use crate::per_block::payload_attestation::{
     check_indexed_payload_attestation, check_payload_attestation_target,
     get_indexed_payload_attestation,
@@ -25,16 +26,18 @@ use crate::per_block::BlockContext;
 use crate::preset::BUILDER_INDEX_SELF_BUILD;
 use crate::{Preset, StfError};
 use consensus_types::common::{
-    DepositMessage, SignedBLSToExecutionChange, SignedVoluntaryExit, SyncAggregate,
+    DepositMessage, ProposerSlashing, SignedBLSToExecutionChange, SignedBeaconBlockHeader,
+    SignedVoluntaryExit, SyncAggregate,
 };
 use consensus_types::gloas::{
-    BeaconBlockBody, BeaconState, IndexedPayloadAttestation, PayloadAttestation, SignedBeaconBlock,
+    Attestation, AttesterSlashing, BeaconBlockBody, BeaconState, IndexedAttestation,
+    IndexedPayloadAttestation, PayloadAttestation, SignedBeaconBlock,
 };
 use consensus_types::primitives::{BLSPubkey, BLSSignature, Bytes32, Gwei, Root, Version};
 use consensus_types::signing::{
-    compute_domain, compute_signing_root, DOMAIN_BEACON_PROPOSER, DOMAIN_BLS_TO_EXECUTION_CHANGE,
-    DOMAIN_DEPOSIT, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
-    DOMAIN_VOLUNTARY_EXIT,
+    compute_domain, compute_signing_root, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
+    DOMAIN_BLS_TO_EXECUTION_CHANGE, DOMAIN_DEPOSIT, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
+    DOMAIN_SYNC_COMMITTEE, DOMAIN_VOLUNTARY_EXIT,
 };
 
 /// `G2_POINT_AT_INFINITY` (`altair/bls.md` L25): the compressed G2 identity.
@@ -384,25 +387,131 @@ pub fn verify_bls_to_execution_change_signature<E: Preset>(
     }
 }
 
+/// The two sets of a proposer slashing: the `bls.Verify` of each header in
+/// `process_proposer_slashing` (P0 L2436-2441), by the proposer of `signed_header_1`, each
+/// over the `DOMAIN_BEACON_PROPOSER` of the epoch of its own header.
+///
+/// A proposer past the registry has no key: [`StfError::UnknownValidator`], as
+/// `state.validators[header_1.proposer_index]` raises in the spec.
+pub fn proposer_slashing_signature_sets<E: Preset>(
+    state: &BeaconState<E>,
+    proposer_slashing: &ProposerSlashing,
+) -> Result<[SignatureSet; 2], StfError> {
+    let proposer_index = proposer_slashing.signed_header_1.message.proposer_index;
+    if proposer_index >= state.validators.len() as u64 {
+        return Err(StfError::UnknownValidator(proposer_index));
+    }
+    let set = |signed_header: &SignedBeaconBlockHeader| {
+        let epoch = E::epoch_at_slot(signed_header.message.slot);
+        let domain = get_domain(state, DOMAIN_BEACON_PROPOSER, Some(epoch));
+        SignatureSet::single(
+            SignerRef::Validator(proposer_index),
+            compute_signing_root(&signed_header.message, domain),
+            signed_header.signature,
+        )
+    };
+    Ok([
+        set(&proposer_slashing.signed_header_1),
+        set(&proposer_slashing.signed_header_2),
+    ])
+}
+
+/// The set of `is_valid_indexed_attestation` (G L1022-1041): after the checks that need no
+/// BLS ([`check_indexed_attestation`]), the `bls.FastAggregateVerify` of the attesters over
+/// `data`, with the `DOMAIN_BEACON_ATTESTER` of the target epoch.
+pub fn indexed_attestation_signature_set<E: Preset>(
+    state: &BeaconState<E>,
+    indexed_attestation: &IndexedAttestation<E>,
+) -> Result<SignatureSet, StfError> {
+    check_indexed_attestation(state, indexed_attestation)?;
+    let data = &indexed_attestation.data;
+    let domain = get_domain(state, DOMAIN_BEACON_ATTESTER, Some(data.target.epoch));
+    let signers = indexed_attestation
+        .attesting_indices
+        .iter()
+        .map(|&index| SignerRef::Validator(index))
+        .collect();
+    // The checks above prove that the signers are not empty.
+    SignatureSet::aggregate(
+        signers,
+        compute_signing_root(data, domain),
+        indexed_attestation.signature,
+    )
+    .map_err(|_| StfError::InvalidIndexedAttestation)
+}
+
+/// The two sets of an attester slashing: the `is_valid_indexed_attestation` of each
+/// attestation in `process_attester_slashing` (P0 L2453-2454).
+pub fn attester_slashing_signature_sets<E: Preset>(
+    state: &BeaconState<E>,
+    attester_slashing: &AttesterSlashing<E>,
+) -> Result<[SignatureSet; 2], StfError> {
+    Ok([
+        indexed_attestation_signature_set(state, &attester_slashing.attestation_1)?,
+        indexed_attestation_signature_set(state, &attester_slashing.attestation_2)?,
+    ])
+}
+
+/// The set of an attestation: the `is_valid_indexed_attestation` of
+/// `get_indexed_attestation(state, attestation)` in `process_attestation` (G L2432).
+///
+/// The asserts of `process_attestation` before it (G L2403-2423) run first, so that the
+/// committees of an epoch other than the previous or the current one are never shuffled.
+pub fn attestation_signature_set<E: Preset>(
+    state: &BeaconState<E>,
+    attestation: &Attestation<E>,
+) -> Result<SignatureSet, StfError> {
+    attestation_signature_set_with(state, attestation, &mut BlockContext::default())
+}
+
+/// [`attestation_signature_set`] with the committee caches of `ctx`, which the other
+/// attestations of the block and [`crate::per_block::attestation::process_attestation_with`]
+/// read again.
+pub fn attestation_signature_set_with<E: Preset>(
+    state: &BeaconState<E>,
+    attestation: &Attestation<E>,
+    ctx: &mut BlockContext,
+) -> Result<SignatureSet, StfError> {
+    let indexed_attestation = check_attestation(state, attestation, ctx)?;
+    indexed_attestation_signature_set(state, &indexed_attestation)
+}
+
+/// Checks the sets of one operation through `backend` in one call, for a caller that
+/// processes the operation outside [`block_signature_sets`]. A set that the backend refuses
+/// is [`StfError::InvalidOperationSignature`].
+pub fn verify_operation_signatures(
+    sets: &[SignatureSet],
+    backend: &dyn SignatureBackend,
+) -> Result<(), StfError> {
+    if backend.verify_signature_sets(sets)? {
+        Ok(())
+    } else {
+        Err(StfError::InvalidOperationSignature)
+    }
+}
+
 /// Every signature set of a block, in the order of `process_block`: the proposer
-/// signature, the RANDAO reveal, the voluntary exits, the BLS-to-execution changes, one set
-/// for each payload attestation, and the sync aggregate (none for an empty aggregate with
-/// the infinity signature). The operation sets follow the order of `process_operations`
-/// (G L2228-2263). The domains of the exits and the changes take the fork versions of the
-/// network from `bls`.
+/// signature, the RANDAO reveal, two sets for each proposer slashing, two for each attester
+/// slashing, one for each attestation, the voluntary exits, the BLS-to-execution changes,
+/// one set for each payload attestation, and the sync aggregate (none for an empty
+/// aggregate with the infinity signature). The operation sets follow the order of
+/// `process_operations` (G L2228-2263). The domains of the exits and the changes take the
+/// fork versions of the network from `bls`.
 ///
 /// The function fails closed for the signed parts of the body that have no set builder
-/// yet: a builder bid (not a self-build), and each operation list that is not empty
-/// (proposer slashings, attester slashings, attestations) give [`StfError::Unimplemented`]
-/// with the work that ports them. A port must add its set builder here and remove its
-/// `Unimplemented`, so that no signature of the block is left out of the batch.
+/// yet: a builder bid (not a self-build) gives [`StfError::Unimplemented`] with the work
+/// that ports it. A port must add its set builder here and remove its `Unimplemented`, so
+/// that no signature of the block is left out of the batch.
 ///
 /// `state` is the state at the block's slot, after `process_slots` and before
 /// `process_block`. The steps before each check do not change what the set reads (the
 /// registry keys, the proposer lookahead, the PTC window, the fork, the genesis validators
 /// root and the block roots), so the sets are the ones that the spec checks during
 /// `process_block`. The payload attestation sets compare with `block.parent_root`, which is
-/// the parent root of the latest block header after the header step.
+/// the parent root of the latest block header after the header step. The attestation sets
+/// also read the beacon committees of the previous and the current epoch. No step of a
+/// block changes them: an exit or a slashing sets an exit epoch after `MAX_SEED_LOOKAHEAD`
+/// epochs, and the RANDAO mix of the current epoch is not in the seed of these two epochs.
 pub fn block_signature_sets<E: Preset>(
     state: &BeaconState<E>,
     signed_block: &SignedBeaconBlock<E>,
@@ -429,13 +538,14 @@ pub fn block_signature_sets_with<E: Preset>(
         // `verify_execution_payload_bid_signature` (G L2149-2156).
         return Err(StfError::Unimplemented("4.5"));
     }
-    let unported = [
-        (body.proposer_slashings.is_empty(), "4.3b"),
-        (body.attester_slashings.is_empty(), "4.3b"),
-        (body.attestations.is_empty(), "4.3b"),
-    ];
-    if let Some((_, id)) = unported.iter().find(|(empty, _)| !empty) {
-        return Err(StfError::Unimplemented(id));
+    for proposer_slashing in &body.proposer_slashings {
+        sets.extend(proposer_slashing_signature_sets(state, proposer_slashing)?);
+    }
+    for attester_slashing in &body.attester_slashings {
+        sets.extend(attester_slashing_signature_sets(state, attester_slashing)?);
+    }
+    for attestation in &body.attestations {
+        sets.push(attestation_signature_set_with(state, attestation, ctx)?);
     }
     for exit in &body.voluntary_exits {
         sets.push(voluntary_exit_signature_set(
@@ -548,6 +658,7 @@ pub fn is_valid_deposit_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::caches::CommitteeCache;
     use crate::per_slot::process_slots;
     use crate::testing::{
         block_at_state_slot, bls_context, genesis_state, no_bls, ScriptedBackend,
@@ -714,12 +825,7 @@ mod tests {
 
     #[test]
     fn operations_without_a_set_builder_fail_closed() {
-        use consensus_types::common::{
-            AttestationData, BeaconBlockHeader, Checkpoint, SignedBeaconBlockHeader,
-        };
-        use consensus_types::gloas::{
-            Attestation, AttesterSlashing, BeaconBlockBody, IndexedAttestation,
-        };
+        use consensus_types::common::{BeaconBlockHeader, SignedBeaconBlockHeader};
 
         let (state, block) = state_and_block(&[1]);
         let header = SignedBeaconBlockHeader {
@@ -732,75 +838,21 @@ mod tests {
             },
             signature: [0; 96],
         };
-        let checkpoint = Checkpoint {
-            epoch: 0,
-            root: Root::ZERO,
-        };
-        let data = AttestationData {
-            slot: 0,
-            index: 0,
-            beacon_block_root: Root::ZERO,
-            source: checkpoint.clone(),
-            target: checkpoint,
-        };
-        let indexed = IndexedAttestation::<Minimal> {
-            attesting_indices: Default::default(),
-            data: data.clone(),
-            signature: [0; 96],
-        };
-        /// Adds one signed part to a block body.
-        type AddPart = Box<dyn Fn(&mut BeaconBlockBody<Minimal>)>;
-        let cases: [(&str, AddPart); 4] = [
-            (
-                "4.3b",
-                Box::new(move |b| {
-                    b.proposer_slashings
-                        .push(consensus_types::common::ProposerSlashing {
-                            signed_header_1: header.clone(),
-                            signed_header_2: header.clone(),
-                        })
-                        .unwrap()
-                }),
-            ),
-            (
-                "4.3b",
-                Box::new(move |b| {
-                    b.attester_slashings
-                        .push(AttesterSlashing {
-                            attestation_1: indexed.clone(),
-                            attestation_2: indexed.clone(),
-                        })
-                        .unwrap()
-                }),
-            ),
-            (
-                "4.3b",
-                Box::new(move |b| {
-                    b.attestations
-                        .push(Attestation {
-                            aggregation_bits: ssz::ProgressiveBitList::with_capacity(1),
-                            data: data.clone(),
-                            signature: [0; 96],
-                            committee_bits: ssz::BitVector::new(),
-                        })
-                        .unwrap()
-                }),
-            ),
-            (
-                // A bid of a builder, not a self-build.
-                "4.5",
-                Box::new(|b| b.signed_execution_payload_bid.message.builder_index = 0),
-            ),
-        ];
-        for (id, add) in cases {
-            let mut with = block.clone();
-            add(&mut with.message.body);
-            assert_eq!(
-                block_signature_sets(&state, &with, &no_bls()),
-                Err(StfError::Unimplemented(id)),
-                "{id}"
-            );
-        }
+        // A bid of a builder, not a self-build, has no set builder yet. A proposer slashing
+        // has one, and it does not stop the check of the bid.
+        let mut with = block.clone();
+        let body = &mut with.message.body;
+        body.signed_execution_payload_bid.message.builder_index = 0;
+        body.proposer_slashings
+            .push(consensus_types::common::ProposerSlashing {
+                signed_header_1: header.clone(),
+                signed_header_2: header,
+            })
+            .unwrap();
+        assert_eq!(
+            block_signature_sets(&state, &with, &no_bls()),
+            Err(StfError::Unimplemented("4.5"))
+        );
         // A self-build bid with another signature than the infinity needs no BLS check, but
         // the bid step rejects it; the sets do not fail for it.
         let mut self_build = block.clone();
@@ -813,6 +865,227 @@ mod tests {
             block_signature_sets(&state, &self_build, &no_bls()).map(|s| s.len()),
             Ok(3)
         );
+    }
+
+    /// A proposer slashing of validator 3, two headers of slot 5.
+    fn proposer_slashing() -> ProposerSlashing {
+        use consensus_types::common::BeaconBlockHeader;
+        let header = |body: u8| SignedBeaconBlockHeader {
+            message: BeaconBlockHeader {
+                slot: 5,
+                proposer_index: 3,
+                parent_root: Root::ZERO,
+                state_root: Root::ZERO,
+                body_root: Root::repeat_byte(body),
+            },
+            signature: [body; 96],
+        };
+        ProposerSlashing {
+            signed_header_1: header(1),
+            signed_header_2: header(2),
+        }
+    }
+
+    /// A double vote in epoch 1 of validators `[2, 5]` and `[5, 7]`.
+    fn attester_slashing() -> AttesterSlashing<Minimal> {
+        use consensus_types::common::{AttestationData, Checkpoint};
+        let indexed = |indices: &[u64], root: u8| IndexedAttestation {
+            attesting_indices: indices.to_vec().try_into().unwrap(),
+            data: AttestationData {
+                slot: 8,
+                index: 0,
+                beacon_block_root: Root::repeat_byte(root),
+                source: Checkpoint {
+                    epoch: 0,
+                    root: Root::ZERO,
+                },
+                target: Checkpoint {
+                    epoch: 1,
+                    root: Root::ZERO,
+                },
+            },
+            signature: [root; 96],
+        };
+        AttesterSlashing {
+            attestation_1: indexed(&[2, 5], 1),
+            attestation_2: indexed(&[5, 7], 2),
+        }
+    }
+
+    #[test]
+    fn slashing_sets() {
+        use crate::per_block::attestation::tests::attestation;
+        let (state, block) = state_and_block(&[1]);
+        let base = block_signature_sets(&state, &block, &no_bls()).unwrap();
+        assert_eq!(base.len(), 3);
+        let with = |add: &dyn Fn(&mut BeaconBlockBody<Minimal>)| {
+            let mut block = block.clone();
+            add(&mut block.message.body);
+            let sets = block_signature_sets(&state, &block, &no_bls()).unwrap();
+            // The proposer and RANDAO sets first, the sync aggregate set last. The proposer
+            // signs the block, so only its signer is the same.
+            assert_eq!(sets[0].signers(), base[0].signers());
+            assert_eq!(sets[1], base[1]);
+            assert_eq!(sets.last(), base.last());
+            sets[2..sets.len() - 1].to_vec()
+        };
+
+        // An attestation (slot 5, previous epoch): one aggregate set of its attesters.
+        let attestation = attestation(&state, 5, &[0, 2]);
+        let sets = with(&|b| b.attestations.push(attestation.clone()).unwrap());
+        assert_eq!(sets.len(), 1);
+        let committee = CommitteeCache::new(&state, 0).unwrap();
+        let committee = committee.committee(5, 0).unwrap();
+        let mut attesters = vec![committee[0], committee[2]];
+        attesters.sort_unstable();
+        let domain = get_domain(&state, DOMAIN_BEACON_ATTESTER, Some(0));
+        assert_eq!(
+            sets[0],
+            SignatureSet::aggregate(
+                attesters.into_iter().map(SignerRef::Validator).collect(),
+                compute_signing_root(&attestation.data, domain),
+                attestation.signature,
+            )
+            .unwrap()
+        );
+
+        // An attester slashing: two aggregate sets, one for each attestation.
+        let slashing = attester_slashing();
+        let sets = with(&|b| b.attester_slashings.push(slashing.clone()).unwrap());
+        assert_eq!(sets.len(), 2);
+        let domain = get_domain(&state, DOMAIN_BEACON_ATTESTER, Some(1));
+        for (set, indexed) in sets
+            .iter()
+            .zip([&slashing.attestation_1, &slashing.attestation_2])
+        {
+            let signers: Vec<SignerRef> = indexed
+                .attesting_indices
+                .iter()
+                .map(|&i| SignerRef::Validator(i))
+                .collect();
+            assert_eq!(set.signers(), &signers[..]);
+            assert_eq!(
+                set.signing_root(),
+                compute_signing_root(&indexed.data, domain)
+            );
+            assert_eq!(set.signature(), &indexed.signature);
+        }
+
+        // A proposer slashing: two sets of the proposer, one for each header, with the
+        // domain of the header's epoch.
+        let slashing = proposer_slashing();
+        let sets = with(&|b| b.proposer_slashings.push(slashing.clone()).unwrap());
+        let domain = get_domain(&state, DOMAIN_BEACON_PROPOSER, Some(0));
+        let want: Vec<SignatureSet> = [&slashing.signed_header_1, &slashing.signed_header_2]
+            .iter()
+            .map(|h| {
+                SignatureSet::single(
+                    SignerRef::Validator(3),
+                    compute_signing_root(&h.message, domain),
+                    h.signature,
+                )
+            })
+            .collect();
+        assert_eq!(sets, want);
+
+        // All three, in the order of `process_operations`: 2 + 2 + 1.
+        let all = with(&|b| {
+            b.proposer_slashings.push(proposer_slashing()).unwrap();
+            b.attester_slashings.push(attester_slashing()).unwrap();
+            b.attestations.push(attestation.clone()).unwrap();
+        });
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[..2], want[..]);
+        let slashing = attester_slashing();
+        assert_eq!(
+            all[2..4],
+            attester_slashing_signature_sets(&state, &slashing).unwrap()[..]
+        );
+        assert_eq!(
+            all[4],
+            attestation_signature_set(&state, &attestation).unwrap()
+        );
+    }
+
+    #[test]
+    fn operation_set_errors() {
+        use crate::per_block::attestation::tests::attestation;
+        let (state, _) = state_and_block(&[1]);
+        // A proposer past the registry has no key.
+        let mut stranger = proposer_slashing();
+        stranger.signed_header_1.message.proposer_index = 64;
+        assert_eq!(
+            proposer_slashing_signature_sets(&state, &stranger),
+            Err(StfError::UnknownValidator(64))
+        );
+        // Indices past the registry, or not sorted.
+        let mut slashing = attester_slashing();
+        slashing.attestation_2.attesting_indices = vec![5, 64].try_into().unwrap();
+        assert_eq!(
+            attester_slashing_signature_sets(&state, &slashing),
+            Err(StfError::UnknownValidator(64))
+        );
+        slashing.attestation_1.attesting_indices = vec![5, 2].try_into().unwrap();
+        assert_eq!(
+            attester_slashing_signature_sets(&state, &slashing),
+            Err(StfError::InvalidIndexedAttestation)
+        );
+        // The asserts of `process_attestation` run before the committees are read.
+        let mut early = attestation(&state, 5, &[0]);
+        early.data.target.epoch = 3;
+        assert_eq!(
+            attestation_signature_set(&state, &early),
+            Err(StfError::AttestationTargetEpoch {
+                target: 3,
+                state_epoch: 1
+            })
+        );
+        // One operation alone: the backend verdict, and no verdict.
+        let sets = proposer_slashing_signature_sets(&state, &proposer_slashing()).unwrap();
+        let backend = |verdict: bool| Counting {
+            verdict,
+            calls: Cell::new(0),
+        };
+        let rejecting = backend(false);
+        assert_eq!(
+            verify_operation_signatures(&sets, &rejecting),
+            Err(StfError::InvalidOperationSignature)
+        );
+        assert_eq!(rejecting.calls.get(), 1);
+        assert_eq!(verify_operation_signatures(&sets, &backend(true)), Ok(()));
+    }
+
+    #[test]
+    fn one_shuffle_per_epoch() {
+        use crate::per_block::attestation::process_attestation_with;
+        use crate::per_block::attestation::tests::attestation;
+        // Two attestations of epoch 0 and the step of each share one shuffle.
+        let (mut state, mut block) = state_and_block(&[1]);
+        let first = attestation(&state, 5, &[0]);
+        let second = attestation(&state, 6, &[1]);
+        let body = &mut block.message.body;
+        body.attestations.push(first.clone()).unwrap();
+        body.attestations.push(second.clone()).unwrap();
+        let mut ctx = BlockContext::default();
+        assert_eq!(
+            block_signature_sets_with(&state, &block, &no_bls(), &mut ctx).map(|s| s.len()),
+            Ok(5)
+        );
+        assert_eq!(ctx.committee_shuffles(), 1);
+        for attestation in [&first, &second] {
+            assert_eq!(
+                process_attestation_with(&mut state, attestation, 8, &mut ctx),
+                Ok(())
+            );
+        }
+        assert_eq!(ctx.committee_shuffles(), 1);
+        // An attestation of the current epoch shuffles that epoch one time.
+        let mut third = attestation(&state, 5, &[0]);
+        third.data.slot = 8;
+        third.data.target.epoch = 1;
+        let _ = attestation_signature_set_with(&state, &third, &mut ctx);
+        let _ = attestation_signature_set_with(&state, &third, &mut ctx);
+        assert_eq!(ctx.committee_shuffles(), 2);
     }
 
     #[test]

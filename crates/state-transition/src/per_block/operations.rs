@@ -6,14 +6,16 @@
 //! one passes. The Gloas text calls no builder deposit or exit request handler here (the
 //! parent-payload step processes those), so no `4.6a` slot is in this function.
 //!
-//! The voluntary exits and the BLS-to-execution changes go to [`super::exits`].
+//! The slashings go to [`super::slashings`], the attestations to [`super::attestation`], and
+//! the voluntary exits and the BLS-to-execution changes to [`super::exits`].
 
-use crate::accessors::TotalActiveBalanceCache;
+use crate::per_block::attestation::process_attestation_with;
 use crate::per_block::exits::{process_bls_to_execution_change, process_voluntary_exit};
 use crate::per_block::payload_attestation::process_payload_attestation;
+use crate::per_block::slashings::{process_attester_slashing_with, process_proposer_slashing_with};
+use crate::per_block::BlockContext;
 use crate::{Preset, StfError};
-use consensus_types::common::ProposerSlashing;
-use consensus_types::gloas::{Attestation, AttesterSlashing, BeaconBlockBody, BeaconState};
+use consensus_types::gloas::{BeaconBlockBody, BeaconState};
 use consensus_types::primitives::Slot;
 
 /// `process_operations` (G L2228-2263, Modified in Gloas): `parent_slot` is the slot of the
@@ -26,23 +28,36 @@ pub fn process_operations<E: Preset>(
     body: &BeaconBlockBody<E>,
     parent_slot: Slot,
 ) -> Result<(), StfError> {
-    // One total active balance for the exit churn of the block: the operations do not
-    // change the effective balances or the active set of the current epoch.
-    let mut cache = TotalActiveBalanceCache::default();
+    let mut ctx = BlockContext {
+        parent_slot,
+        ..BlockContext::default()
+    };
+    process_operations_with(state, body, &mut ctx)
+}
+
+/// [`process_operations`] with the [`BlockContext`] of the block: its `parent_slot`, the
+/// committee caches that the attestation sets of the same block can compute first, and one
+/// total active balance for the slashings and the exit churn of the block. The operations
+/// do not change the effective balances or the active set of the current epoch.
+pub fn process_operations_with<E: Preset>(
+    state: &mut BeaconState<E>,
+    body: &BeaconBlockBody<E>,
+    ctx: &mut BlockContext,
+) -> Result<(), StfError> {
     if !body.deposits.is_empty() {
         return Err(StfError::BlockDeposits(body.deposits.len()));
     }
     for operation in &body.proposer_slashings {
-        process_proposer_slashing(state, operation)?;
+        process_proposer_slashing_with(state, operation, ctx)?;
     }
     for operation in &body.attester_slashings {
-        process_attester_slashing(state, operation)?;
+        process_attester_slashing_with(state, operation, ctx)?;
     }
     for operation in &body.attestations {
-        process_attestation(state, operation, parent_slot)?;
+        process_attestation_with(state, operation, ctx.parent_slot(), ctx)?;
     }
     for operation in &body.voluntary_exits {
-        process_voluntary_exit(state, operation, &mut cache)?;
+        process_voluntary_exit(state, operation, ctx.total_active_balance())?;
     }
     for operation in &body.bls_to_execution_changes {
         process_bls_to_execution_change(state, operation)?;
@@ -53,42 +68,20 @@ pub fn process_operations<E: Preset>(
     Ok(())
 }
 
-/// Dispatch slot of `process_proposer_slashing` (P0 L2422). Not ported yet.
-fn process_proposer_slashing<E: Preset>(
-    _: &mut BeaconState<E>,
-    _: &ProposerSlashing,
-) -> Result<(), StfError> {
-    Err(StfError::Unimplemented("4.3b"))
-}
-
-/// Dispatch slot of `process_attester_slashing` (P0 L2449). Not ported yet.
-fn process_attester_slashing<E: Preset>(
-    _: &mut BeaconState<E>,
-    _: &AttesterSlashing<E>,
-) -> Result<(), StfError> {
-    Err(StfError::Unimplemented("4.3b"))
-}
-
-/// Dispatch slot of the Gloas `process_attestation(state, attestation, parent_slot)`
-/// (G L2396-2480). Not ported yet.
-fn process_attestation<E: Preset>(
-    _: &mut BeaconState<E>,
-    _: &Attestation<E>,
-    _: Slot,
-) -> Result<(), StfError> {
-    Err(StfError::Unimplemented("4.3b"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::accessors::hash;
     use crate::testing::{genesis_state, signed_block};
+    use consensus_types::common::ProposerSlashing;
     use consensus_types::common::{
         AttestationData, BLSToExecutionChange, BeaconBlockHeader, Checkpoint, Deposit, DepositData,
         SignedBLSToExecutionChange, SignedBeaconBlockHeader, SignedVoluntaryExit, VoluntaryExit,
     };
-    use consensus_types::gloas::{IndexedAttestation, PayloadAttestation, PayloadAttestationData};
+    use consensus_types::gloas::{
+        Attestation, AttesterSlashing, IndexedAttestation, PayloadAttestation,
+        PayloadAttestationData,
+    };
     use consensus_types::primitives::{Address, Root};
     use consensus_types::{EthSpec, Minimal};
     use ssz::{BitVector, ProgressiveBitList};
@@ -159,16 +152,17 @@ mod tests {
     type AddOperation = dyn Fn(&mut BeaconBlockBody<Minimal>);
 
     #[test]
-    fn each_operation_goes_to_its_dispatch_slot() {
-        let state = genesis_state::<Minimal>(&[32_000_000_000; 8]);
+    fn each_operation_goes_to_its_handler() {
+        let mut state = genesis_state::<Minimal>(&[32_000_000_000; 8]);
+        state.slot = 1;
         let empty = signed_block::<Minimal>(1, 0).message.body;
         let with = |f: &AddOperation| {
             let mut body = empty.clone();
             f(&mut body);
             process_operations(&mut state.clone(), &body, 0)
         };
-        let cases: [(&str, &AddOperation); 3] = [
-            ("4.3b", &|b| {
+        let cases: [(StfError, &AddOperation); 3] = [
+            (StfError::ProposerSlashingSameHeaders, &|b| {
                 b.proposer_slashings
                     .push(ProposerSlashing {
                         signed_header_1: header(),
@@ -176,7 +170,7 @@ mod tests {
                     })
                     .unwrap()
             }),
-            ("4.3b", &|b| {
+            (StfError::NotSlashableAttestationData, &|b| {
                 b.attester_slashings
                     .push(AttesterSlashing {
                         attestation_1: indexed(),
@@ -184,22 +178,24 @@ mod tests {
                     })
                     .unwrap()
             }),
-            ("4.3b", &|b| {
+            (StfError::AttestationDataIndex(2), &|b| {
+                let mut data = data();
+                data.index = 2;
                 b.attestations
                     .push(Attestation {
                         aggregation_bits: ProgressiveBitList::with_capacity(1),
-                        data: data(),
+                        data,
                         signature: [0; 96],
                         committee_bits: BitVector::new(),
                     })
                     .unwrap()
             }),
         ];
-        for (id, add) in cases {
-            assert_eq!(with(add), Err(StfError::Unimplemented(id)), "{id}");
+        for (want, add) in cases {
+            assert_eq!(with(add), Err(want.clone()), "{want}");
         }
         // A payload attestation goes to `process_payload_attestation`, which refuses one
-        // for the slot of the state.
+        // that is not for the slot before the state slot.
         assert_eq!(
             with(&|b| {
                 b.payload_attestations
@@ -207,7 +203,7 @@ mod tests {
                         aggregation_bits: BitVector::new(),
                         data: PayloadAttestationData {
                             beacon_block_root: Root::ZERO,
-                            slot: 0,
+                            slot: 5,
                             payload_present: false,
                             blob_data_available: false,
                         },
@@ -216,8 +212,8 @@ mod tests {
                     .unwrap()
             }),
             Err(StfError::PayloadAttestationSlotMismatch {
-                attestation: 0,
-                state: 0
+                attestation: 5,
+                state: 1
             })
         );
     }

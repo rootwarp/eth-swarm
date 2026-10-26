@@ -10,6 +10,7 @@
 //! the steps run. The checks that need no BLS stay in the steps, for example the infinity
 //! signature of an empty sync aggregate and the structure of a payload attestation.
 //!
+//! - [`attestation`] has the Gloas `process_attestation` and its helpers.
 //! - [`builder`] has the builder deposit and exit requests.
 //! - [`exits`] has `process_voluntary_exit` and `process_bls_to_execution_change`.
 //! - [`header`] has `process_block_header`, `process_randao` and `process_eth1_data`.
@@ -17,25 +18,32 @@
 //! - [`payload_attestation`] has `process_payload_attestation` and the indexed form of a
 //!   payload attestation.
 //! - [`requests`] has `process_consolidation_request` and its helpers.
+//! - [`slashings`] has `process_proposer_slashing` and `process_attester_slashing`.
 //! - [`sync_aggregate`] has `process_sync_aggregate`.
 
+pub mod attestation;
 pub mod builder;
 pub mod exits;
 pub mod header;
 pub mod operations;
 pub mod payload_attestation;
 pub mod requests;
+pub mod slashings;
 pub mod sync_aggregate;
 
+pub use attestation::process_attestation;
 pub use header::{check_block_header, process_block_header, process_eth1_data, process_randao};
 pub use operations::process_operations;
 pub use payload_attestation::process_payload_attestation;
+pub use slashings::{process_attester_slashing, process_proposer_slashing};
 pub use sync_aggregate::process_sync_aggregate;
 
+use crate::accessors::TotalActiveBalanceCache;
 use crate::caches::get_beacon_proposer_index;
+use crate::caches::CommitteeCache;
 use crate::{Preset, StfError};
 use consensus_types::gloas::{BeaconBlock, BeaconState};
-use consensus_types::primitives::{BLSPubkey, Slot, ValidatorIndex};
+use consensus_types::primitives::{BLSPubkey, Epoch, Slot, ValidatorIndex};
 
 /// A step of `process_block`, in the order of G L1754-1771.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -70,13 +78,21 @@ pub enum BlockStep {
 ///   `current_sync_committee.aggregate_pubkey` that they are for. It computes them again
 ///   for a state with another slot or another committee, for example a state on another
 ///   fork after a sync committee period boundary.
+/// - The beacon committees of each attestation epoch, shuffled at most one time for each
+///   block: the attestation sets and `process_attestation` read them. The attestations of a
+///   block are of the previous or the current epoch, so the context keeps at most two.
+/// - The total active balance, which the attestation rewards and `slash_validator` read.
 ///
-/// Use one context for one block on one state, and a new context for the next block.
+/// Use one context for one block on one state, and a new context for the next block. A
+/// committee cache of another state with another seed is not used:
+/// [`crate::accessors::get_attesting_indices_with`] gives `CacheSeedMismatch` for it.
 #[derive(Debug, Default)]
 pub struct BlockContext {
     parent_slot: Slot,
     sync_committee_indices: Option<SyncCommitteeIndices>,
     sync_index_scans: usize,
+    committee_caches: Vec<CommitteeCache>,
+    total_active_balance: TotalActiveBalanceCache,
 }
 
 /// The sync committee indices of a state, with the key of the state that they are for.
@@ -134,6 +150,42 @@ impl BlockContext {
     #[cfg(test)]
     pub(crate) fn sync_index_scans(&self) -> usize {
         self.sync_index_scans
+    }
+
+    /// The beacon committees of `epoch` on `state`. The first call for an epoch shuffles it,
+    /// and the later calls give the same cache.
+    ///
+    /// Call it only for the previous or the current epoch of `state`: the cache of another
+    /// epoch costs a shuffle, and the spec reads no committee of it.
+    pub fn committee_cache<E: Preset>(
+        &mut self,
+        state: &BeaconState<E>,
+        epoch: Epoch,
+    ) -> Result<&CommitteeCache, StfError> {
+        let position = match self
+            .committee_caches
+            .iter()
+            .position(|cache| cache.key().0 == epoch)
+        {
+            Some(position) => position,
+            None => {
+                self.committee_caches
+                    .push(CommitteeCache::new(state, epoch)?);
+                self.committee_caches.len() - 1
+            }
+        };
+        Ok(&self.committee_caches[position])
+    }
+
+    /// The number of shuffles for the committee caches.
+    #[cfg(test)]
+    pub(crate) fn committee_shuffles(&self) -> usize {
+        self.committee_caches.len()
+    }
+
+    /// The total active balance cache of the block.
+    pub fn total_active_balance(&mut self) -> &mut TotalActiveBalanceCache {
+        &mut self.total_active_balance
     }
 }
 
@@ -310,7 +362,7 @@ fn operations_step<E: Preset>(
     block: &BeaconBlock<E>,
     ctx: &mut BlockContext,
 ) -> Result<(), StfError> {
-    process_operations(state, &block.body, ctx.parent_slot())
+    operations::process_operations_with(state, &block.body, ctx)
 }
 
 fn sync_aggregate_step<E: Preset>(
