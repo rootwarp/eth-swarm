@@ -32,9 +32,13 @@ pub(crate) fn process_justification_and_finalization_with<E: Preset>(
     if skips_ffg(state) {
         return Ok(());
     }
+    // The spec reads both participation lists, then the total active balance, then the two
+    // target sums. A short list is not a proof, so it must fail before a sum that overflows.
+    participation.previous_participation()?;
+    participation.current_participation()?;
+    let total_active_balance = participation.total_active_balance()?;
     let previous_target_balance = participation.previous_flag_balance(TIMELY_TARGET_FLAG_INDEX)?;
     let current_target_balance = participation.current_target_balance()?;
-    let total_active_balance = participation.total_active_balance()?;
     weigh_justification_and_finalization(
         state,
         total_active_balance,
@@ -238,6 +242,28 @@ mod tests {
             weigh_justification_and_finalization(&mut state, 3 * ETH, 0, 0),
             Err(StfError::ArithmeticOverflow)
         );
+    }
+
+    #[test]
+    fn reads_both_participation_lists_before_the_sums() {
+        // The previous target sum overflows, and `current_epoch_participation` is shorter
+        // than the registry. The spec reads both lists before it adds a balance, so the
+        // short list fails first, and that error is not a proof.
+        let mut state = state_at_epoch_6();
+        for i in 0..8 {
+            state.validators.get_mut(i).unwrap().effective_balance = u64::MAX;
+            *state.previous_epoch_participation.get_mut(i).unwrap() = 0b111;
+        }
+        state.current_epoch_participation = milhouse::ProgressiveList::default();
+        let want = Err(StfError::ListIndexOutOfRange {
+            list: "current_epoch_participation",
+            index: 0,
+        });
+        assert_eq!(
+            super::super::literal::process_justification_and_finalization(&mut state.clone()),
+            want
+        );
+        assert_eq!(process_justification_and_finalization(&mut state), want);
     }
 
     #[test]

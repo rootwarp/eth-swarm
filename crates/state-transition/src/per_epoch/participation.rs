@@ -145,6 +145,9 @@ pub(crate) struct ParticipationCache {
     pub(crate) validators: Vec<ValidatorParticipation>,
     /// The previous-epoch flags of [`Self::validators`] are valid only if this is `Ok`.
     previous_participation: Result<(), StfError>,
+    /// `Ok` if `current_epoch_participation` holds every validator that is active in the
+    /// current epoch.
+    current_participation: Result<(), StfError>,
     /// `get_total_balance` of the previous-epoch participants of each flag.
     previous_flag_balances: [Result<Gwei, StfError>; 3],
     /// `get_total_balance` of the current-epoch participants of the target flag.
@@ -223,8 +226,9 @@ impl ParticipationCache {
         Self {
             validators,
             previous_flag_balances,
-            current_target_balance: current_participation.and(total(current_target_sum)),
+            current_target_balance: current_participation.clone().and(total(current_target_sum)),
             previous_participation,
+            current_participation,
             total_active_balance: totals.get(state),
         }
     }
@@ -237,6 +241,12 @@ impl ParticipationCache {
     /// `Ok` if the previous-epoch flags of [`Self::validators`] are valid.
     pub(crate) fn previous_participation(&self) -> Result<(), StfError> {
         self.previous_participation.clone()
+    }
+
+    /// `Ok` if `get_unslashed_participating_indices(state, f, current_epoch)` can read
+    /// `current_epoch_participation` for each active validator.
+    pub(crate) fn current_participation(&self) -> Result<(), StfError> {
+        self.current_participation.clone()
     }
 
     /// `get_total_balance(state, get_unslashed_participating_indices(state, flag_index,

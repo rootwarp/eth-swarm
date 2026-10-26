@@ -76,7 +76,8 @@ pub enum StfError {
     /// A `Uint64` operation overflowed, underflowed or divided by zero.
     #[error("arithmetic overflow")]
     ArithmeticOverflow,
-    /// `state.validators[index]` is out of range.
+    /// `state.validators[index]` is out of range. A proof only on the object's own
+    /// pre-state: see [`StfError::proves_invalid`].
     #[error("validator index {0} is out of range")]
     UnknownValidator(ValidatorIndex),
     /// An index past the end of a state list or a spec table, for example `balances`,
@@ -213,6 +214,11 @@ impl StfError {
     /// pre-state, advanced to the object's slot. A caller that uses another state (for
     /// example a head state behind the slot of a gossip message) must map it to IGNORE.
     ///
+    /// [`StfError::UnknownValidator`] has the same rule. The result depends on the registry
+    /// of the state that the caller uses. A head state older than the object can have a
+    /// shorter registry, so the index of a valid object can be past it. Thus a caller that
+    /// uses another state than the object's own pre-state must map it to IGNORE.
+    ///
     /// The match has no `_` arm, so each new variant must select its class here.
     pub fn proves_invalid(&self) -> bool {
         match self {
@@ -233,6 +239,7 @@ impl StfError {
             | Self::InvalidBlockSignature
             | Self::StateRootMismatch { .. }
             | Self::ArithmeticOverflow
+            // A proof only on the object's own pre-state, as for `EpochOutOfWindow`.
             | Self::UnknownValidator(_)
             | Self::ShuffleIndexOutOfRange { .. }
             | Self::NoCandidates

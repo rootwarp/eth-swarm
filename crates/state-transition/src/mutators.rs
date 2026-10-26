@@ -49,23 +49,24 @@ pub fn decrease_balance<E: Preset>(
     Ok(())
 }
 
-/// `state.balances[index]`. An index past the registry is the error of the object that
-/// names it (`UnknownValidator`). An index inside the registry but past `balances` means
-/// that our own state is bad, so it is not a proof (`ListIndexOutOfRange`).
+/// `state.balances[index]`. The spec reads only `balances`, so an index inside `balances`
+/// succeeds, also when it is past the registry. An index past `balances` and past the
+/// registry is the error of the object that names it (`UnknownValidator`). An index inside
+/// the registry but past `balances` means that our own state is bad, so it is not a proof
+/// (`ListIndexOutOfRange`).
 fn balance_mut<E: Preset>(
     state: &mut BeaconState<E>,
     index: ValidatorIndex,
 ) -> Result<&mut Gwei, StfError> {
-    if index >= state.validators.len() as u64 {
-        return Err(StfError::UnknownValidator(index));
-    }
-    state
-        .balances
-        .get_mut(index as usize)
-        .ok_or(StfError::ListIndexOutOfRange {
+    let in_registry = index < state.validators.len() as u64;
+    match state.balances.get_mut(index as usize) {
+        Some(balance) => Ok(balance),
+        None if in_registry => Err(StfError::ListIndexOutOfRange {
             list: "balances",
             index,
-        })
+        }),
+        None => Err(StfError::UnknownValidator(index)),
+    }
 }
 
 /// The queue of exits or of consolidations: its earliest epoch, and the balance that is
@@ -819,6 +820,13 @@ mod tests {
             Err(past_balances.clone())
         );
         assert!(!past_balances.proves_invalid());
+        // The spec reads only `state.balances[index]`, so an index inside a `balances` list
+        // that is longer than the registry succeeds.
+        let mut long = state.clone();
+        long.balances.push(5).unwrap();
+        assert_eq!(increase_balance(&mut long, 8, 1), Ok(()));
+        assert_eq!(decrease_balance(&mut long, 8, 2), Ok(()));
+        assert_eq!(long.balances.get(8), Some(&4));
         // A full milhouse list is a limit of the implementation, not of the spec.
         let full = StfError::from(milhouse::Error::ListFull { len: usize::MAX });
         assert!(matches!(full, StfError::Tree(_)) && !full.proves_invalid());

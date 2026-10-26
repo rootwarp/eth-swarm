@@ -1,12 +1,22 @@
 //! The spec-literal epoch accounting: the test oracles of the cached steps. Each function
 //! is the spec text line by line, with a set of participants built for each query.
 //!
-//! The oracle shares no predicate or formula with the cached steps. It writes
-//! `weigh_justification_and_finalization`, the leak and eligibility predicates, the total
-//! active balance and the base reward again from the spec text, so `cached_vs_literal` can
-//! find a bug in any of them. It shares only the spec-literal accessors
-//! `get_unslashed_participating_indices` and `get_total_balance`, which the cached steps do
-//! not call.
+//! The oracle writes `weigh_justification_and_finalization`, the leak and eligibility
+//! predicates, the total active balance, the base reward and the balance helpers again from
+//! the spec text, so `cached_vs_literal` can find a bug in any of them.
+//!
+//! The oracle calls these functions of the crate, and does not write them again:
+//!
+//! - `get_unslashed_participating_indices` and `get_total_balance`, which the cached steps
+//!   do not call.
+//! - `get_active_validator_indices`, which the cached steps do not call, but which calls
+//!   `is_active_validator`.
+//! - `get_block_root` (and `get_block_root_at_slot` under it), `is_active_validator`,
+//!   `has_flag` (in `get_unslashed_participating_indices`), `get_current_epoch` and
+//!   `get_previous_epoch`, which the cached steps also call.
+//!
+//! Thus `cached_vs_literal` cannot find a bug in the functions of the last two items. Their
+//! own unit tests and the spec vectors test them.
 
 use super::participation::{get_total_balance, get_unslashed_participating_indices};
 use super::rewards::Deltas;
