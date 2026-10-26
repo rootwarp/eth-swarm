@@ -7,7 +7,7 @@
 //!
 //! - [`state_transition`]: the slot loop, the block signature, the block and the state root.
 //! - [`per_slot`]: `process_slots` and `process_slot`.
-//! - [`per_epoch`]: the epoch processing (every step but the builder payments).
+//! - [`per_epoch`]: the epoch processing.
 //! - [`per_block`]: the block processing: the step order, the header, the bid, RANDAO, eth1
 //!   data, the voluntary exits, the BLS-to-execution changes, the payload attestations and
 //!   the sync aggregate. The other steps and operations are stubs for now. It also has the
@@ -195,6 +195,11 @@ pub enum StfError {
     #[error("builder index {0} is out of range")]
     UnknownBuilder(BuilderIndex),
     /// `settle_builder_payment` asserts `payment_index < len(state.builder_pending_payments)`.
+    ///
+    /// Only a caller defect can cause this error. The vector has `2 * SLOTS_PER_EPOCH`
+    /// entries, and each spec caller (G L1799-1804) gives an index below that length. Each
+    /// caller puts a `debug_assert!` on the index, so that a defect shows in the tests and
+    /// does not REJECT a valid block.
     #[error("builder payment index {index} is out of range of {len}")]
     PaymentIndexOutOfRange {
         /// The payment index.

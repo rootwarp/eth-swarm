@@ -85,6 +85,7 @@ fn decode_state<E: Preset>(reads: &Reads, path: &Path) -> Result<BeaconState<E>,
 pub(crate) mod tests {
     use super::*;
     use crate::plan::{CaseFile, CaseKey};
+    use consensus_types::common::PendingConsolidation;
     use consensus_types::gloas::*;
     use consensus_types::primitives::{Address, Root};
     use milhouse::{List, ProgressiveList, Vector};
@@ -263,8 +264,8 @@ pub(crate) mod tests {
             ("1", Some(&pre), "root mismatch"),
             // No post-state: the vector expects process_slots to fail.
             ("1", None, "expects to fail"),
-            // Slot 8 starts epoch 1, so process_epoch runs, and it stops at the builder
-            // payments step, which is not ported yet.
+            // Slot 8 starts epoch 1, so process_epoch runs. A state without validators has
+            // no proposer for the lookahead.
             ("6", Some(&pre), "process_slots failed"),
             ("-1", Some(&pre), "unsigned integer"),
         ] {
@@ -272,9 +273,17 @@ pub(crate) mod tests {
             let err = run(&Reads::default(), &c).unwrap_err();
             assert!(err.contains(needle), "{slots}: {err}");
         }
-        // A vector without a post-state expects a spec failure, not a missing port: slot 8
-        // needs the whole process_epoch, which stops at the builder payments step.
-        let c = case(dir.path(), "minimal", Some(&pre), "6", None);
+        // A vector without a post-state expects a spec failure, not a fault of our own state:
+        // a pending consolidation of a validator outside the registry.
+        let mut fault = pre.clone();
+        fault
+            .pending_consolidations
+            .push(PendingConsolidation {
+                source_index: 0,
+                target_index: 1,
+            })
+            .unwrap();
+        let c = case(dir.path(), "minimal", Some(&fault), "6", None);
         let err = run(&Reads::default(), &c).unwrap_err();
         assert!(err.contains("not a spec failure"), "{err}");
         // Zero slots is rejected by process_slots, as the vector without a post-state expects.

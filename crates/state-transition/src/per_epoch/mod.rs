@@ -9,10 +9,8 @@
 //! - [`pending`] holds `process_pending_deposits` and `process_pending_consolidations`.
 //! - [`resets`] holds the eth1, slashings, RANDAO, historical summary, participation flag and
 //!   sync committee updates.
-//! - [`gloas`] holds `process_proposer_lookahead` and `process_ptc_window`.
-//!
-//! `process_builder_pending_payments` is not ported yet: [`process_epoch`] stops there with
-//! [`StfError::Unimplemented`].
+//! - [`gloas`] holds `process_builder_pending_payments`, `process_proposer_lookahead` and
+//!   `process_ptc_window`.
 
 pub mod gloas;
 pub mod inactivity;
@@ -77,7 +75,7 @@ pub enum EpochStep {
     PendingDeposits,
     /// `process_pending_consolidations`.
     PendingConsolidations,
-    /// `process_builder_pending_payments` (not ported yet).
+    /// `process_builder_pending_payments`.
     BuilderPendingPayments,
     /// `process_effective_balance_updates`.
     EffectiveBalanceUpdates,
@@ -198,9 +196,9 @@ impl<'s, 'b, E: Preset> EpochRun<'s, 'b, E> {
                 &mut self.totals,
             ),
             EpochStep::PendingConsolidations => pending::process_pending_consolidations(state),
-            EpochStep::BuilderPendingPayments => Err(StfError::Unimplemented(
-                "process_builder_pending_payments (4.6b)",
-            )),
+            EpochStep::BuilderPendingPayments => {
+                gloas::process_builder_pending_payments_with(state, &mut self.totals)
+            }
             EpochStep::EffectiveBalanceUpdates => {
                 registry::process_effective_balance_updates(state)
             }
@@ -226,9 +224,7 @@ impl<'s, 'b, E: Preset> EpochRun<'s, 'b, E> {
 ///
 /// `bls` gives the verdicts of the pending deposits, the aggregation of the next sync
 /// committee and the deposit domain. [`pending_deposit_signature_sets`] lists the deposit
-/// verdicts to prefetch. The call returns [`StfError::Unimplemented`] at
-/// `process_builder_pending_payments`, which is not ported yet. On `Err`, `state` is partly
-/// updated: the caller drops it.
+/// verdicts to prefetch. On `Err`, `state` is partly updated: the caller drops it.
 pub fn process_epoch<E: Preset>(
     state: &mut BeaconState<E>,
     bls: &BlsContext,
@@ -256,7 +252,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per_slot::{process_slot, process_slots};
+    use crate::per_slot::process_slots;
     use crate::signatures::deposit_signature_set;
     use crate::testing::{
         bls_context, genesis_state, PrefetchedBackend, ScriptedBackend, GENESIS_FORK_VERSION,
@@ -306,7 +302,7 @@ mod tests {
     /// changes something: the next epoch 8 starts an eth1 voting period, a sync committee
     /// period and a historical summary period. It has participation, a slashed validator at
     /// the half of the slashings vector, a validator to eject, a new deposit for the key
-    /// `[0xd1; 48]` and a consolidation.
+    /// `[0xd1; 48]`, a consolidation, and a builder payment of epoch 6 at the quorum.
     fn busy_state() -> BeaconState<Minimal> {
         let mut state = genesis_state::<Minimal>(&[32 * ETH; 64]);
         for i in 0..64 {
@@ -347,11 +343,14 @@ mod tests {
                 block_hash: Root::repeat_byte(2),
             })
             .unwrap();
+        let payment = state.builder_pending_payments.get_mut(1).unwrap();
+        payment.weight = 64 * 32 * ETH;
+        payment.withdrawal.amount = 5 * ETH;
         state
     }
 
     /// The steps of [`SPEC_ORDER`] one by one through their public functions, each with its
-    /// own caches. `process_builder_pending_payments` is not ported, so it is left out.
+    /// own caches.
     fn stepwise(state: &mut BeaconState<Minimal>, bls: &BlsContext) -> Result<(), StfError> {
         process_justification_and_finalization(state)?;
         process_inactivity_updates(state)?;
@@ -361,6 +360,7 @@ mod tests {
         resets::process_eth1_data_reset(state)?;
         pending::process_pending_deposits(state, bls.genesis_fork_version, bls.backend)?;
         pending::process_pending_consolidations(state)?;
+        gloas::process_builder_pending_payments(state)?;
         registry::process_effective_balance_updates(state)?;
         resets::process_slashings_reset(state)?;
         resets::process_randao_mixes_reset(state)?;
@@ -371,7 +371,7 @@ mod tests {
         gloas::process_ptc_window(state)
     }
 
-    /// `process_epoch` with a step trace, and with the builder payments step left out.
+    /// `process_epoch` with a step trace.
     fn traced(
         state: &mut BeaconState<Minimal>,
         bls: &BlsContext,
@@ -379,11 +379,7 @@ mod tests {
         let mut trace = Vec::new();
         let result = process_epoch_with(state, bls, |step, epoch| {
             trace.push(step);
-            if step == EpochStep::BuilderPendingPayments {
-                Ok(())
-            } else {
-                epoch.run(step)
-            }
+            epoch.run(step)
         });
         (trace, result)
     }
@@ -413,6 +409,8 @@ mod tests {
         assert!(state.pending_deposits.is_empty() && state.pending_consolidations.is_empty());
         assert_ne!(state.validators.get(6), pre.validators.get(6));
         assert!(state.eth1_data_votes.is_empty());
+        assert_eq!(state.builder_pending_withdrawals.len(), 1);
+        assert_ne!(state.builder_pending_payments, pre.builder_pending_payments);
         assert_eq!(state.slashings.get(8), Some(&0));
         assert_eq!(state.historical_summaries.len(), 1);
         assert_ne!(state.next_sync_committee, pre.next_sync_committee);
@@ -421,29 +419,24 @@ mod tests {
     }
 
     #[test]
-    fn process_epoch_stops_at_the_builder_payments() {
+    fn process_epoch_runs_every_step() {
+        // The public function is the traced run, with the builder payments step at its spec
+        // place: the payment of epoch 6 is paid with the total of the shared cache.
         let backend = ScriptedBackend::new([Ok(true)]);
         let mut state = busy_state();
-        let err = process_epoch(&mut state, &bls_context(&backend)).unwrap_err();
-        assert_eq!(
-            err,
-            StfError::Unimplemented("process_builder_pending_payments (4.6b)")
-        );
-        assert!(!err.proves_invalid());
-        // The steps before it ran in the spec order.
+        assert_eq!(process_epoch(&mut state, &bls_context(&backend)), Ok(()));
         let mut want = busy_state();
         let backend = ScriptedBackend::new([Ok(true)]);
-        let bls = bls_context(&backend);
-        process_justification_and_finalization(&mut want).unwrap();
-        process_inactivity_updates(&mut want).unwrap();
-        process_rewards_and_penalties(&mut want).unwrap();
-        registry::process_registry_updates(&mut want).unwrap();
-        registry::process_slashings(&mut want).unwrap();
-        resets::process_eth1_data_reset(&mut want).unwrap();
-        pending::process_pending_deposits(&mut want, bls.genesis_fork_version, bls.backend)
-            .unwrap();
-        pending::process_pending_consolidations(&mut want).unwrap();
+        assert_eq!(traced(&mut want, &bls_context(&backend)).1, Ok(()));
         assert_eq!(state, want);
+        assert_eq!(
+            state
+                .builder_pending_withdrawals
+                .iter()
+                .map(|w| w.amount)
+                .collect::<Vec<_>>(),
+            [5 * ETH]
+        );
     }
 
     #[test]
@@ -562,26 +555,6 @@ mod tests {
         PrefetchedBackend::new(sets.iter().map(|set| (set.clone(), *set != invalid)))
     }
 
-    /// `process_slots` with the builder payments step left out, as in [`traced`], so that
-    /// the loop can cross more than one epoch boundary.
-    // TODO(#72): when `process_builder_pending_payments` is ported, remove this copy of
-    // the slot loop and call `process_slots` in the two-boundary test.
-    fn slots_without_builder_payments(
-        state: &mut BeaconState<Minimal>,
-        slot: Slot,
-        bls: &BlsContext,
-    ) -> Result<(), StfError> {
-        while state.slot < slot {
-            process_slot(state)?;
-            let next_slot = state.slot + 1;
-            if next_slot.is_multiple_of(Minimal::slots_per_epoch()) {
-                traced(state, bls).1?;
-            }
-            state.slot = next_slot;
-        }
-        Ok(())
-    }
-
     #[test]
     fn prefetch_covers_a_deposit_that_the_same_epoch_finalizes() {
         let (pre, queue) = finalizing_state();
@@ -589,12 +562,9 @@ mod tests {
         assert_eq!(sets, vec![set_of(&queue.first)]);
         let backend = verdicts(&sets, &queue.invalid);
         let mut state = pre.clone();
-        // The real slot loop gets to the builder payments step, after the deposits.
         assert_eq!(
             process_slots(&mut state, 64, &bls_context(&backend)),
-            Err(StfError::Unimplemented(
-                "process_builder_pending_payments (4.6b)"
-            ))
+            Ok(())
         );
         assert_eq!(state.finalized_checkpoint.epoch, 6);
         assert_eq!(backend.seen(), sets);
@@ -622,7 +592,7 @@ mod tests {
         let backend = verdicts(&sets, &queue.invalid);
         let mut state = pre.clone();
         assert_eq!(
-            slots_without_builder_payments(&mut state, 72, &bls_context(&backend)),
+            process_slots(&mut state, 72, &bls_context(&backend)),
             Ok(())
         );
         // The second deposit for `[0xa1; 48]` is a top-up, so the loop asked for the
@@ -639,7 +609,7 @@ mod tests {
         let first = pending_deposit_signature_sets(&pre, 64, GENESIS_FORK_VERSION);
         let backend = verdicts(&first, &queue.invalid);
         assert_eq!(
-            slots_without_builder_payments(&mut pre.clone(), 72, &bls_context(&backend)),
+            process_slots(&mut pre.clone(), 72, &bls_context(&backend)),
             Err(StfError::MissingVerdict(BackendError(
                 "not prefetched".into()
             )))

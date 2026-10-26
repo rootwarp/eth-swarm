@@ -247,6 +247,13 @@ pub fn empty_payment() -> BuilderPendingPayment {
 ///
 /// The callers enforce the order of the settlement against the other steps of their
 /// function (consensus-specs PR 5695).
+///
+/// # Caller defect
+///
+/// [`StfError::PaymentIndexOutOfRange`] comes only from a caller defect: the spec callers
+/// (G L1799-1804) give an index below `2 * SLOTS_PER_EPOCH`, the length of the vector. Put a
+/// `debug_assert!(payment_index < 2 * SLOTS_PER_EPOCH)` at each call site, so that a defect
+/// fails the tests and does not REJECT a valid block.
 pub fn settle_builder_payment<E: Preset>(
     state: &mut BeaconState<E>,
     payment_index: u64,

@@ -103,24 +103,11 @@ fn state_transition_skips_point_at_their_milestone() {
             let k = consensus("fulu", preset, runner, handler);
             assert_eq!(issue_of(&skips, &k), "none", "{k}");
         }
-        for (runner, handler) in [
-            ("epoch_processing", "builder_pending_payments"),
-            ("fork", "fork"),
-            ("sanity", "blocks"),
-        ] {
+        for (runner, handler) in [("fork", "fork"), ("sanity", "blocks")] {
             let k = consensus("gloas", preset, runner, handler);
             assert_eq!(issue_of(&skips, &k), "4.7", "{k}");
         }
-        // The reason of the epoch step that is not ported names the item that ports it.
-        let k = consensus(
-            "gloas",
-            preset,
-            "epoch_processing",
-            "builder_pending_payments",
-        );
-        let reason = skips.skipped_by(&k).unwrap().reason;
-        assert!(reason.starts_with("Ported by 4.6b:"), "{k}: {reason}");
-        // Every other Gloas epoch step runs, also the three that the epoch README omits
+        // Every Gloas epoch step runs, also the three that the epoch README omits
         // (pending_deposits_churn, proposer_lookahead and ptc_window).
         for handler in [
             "justification_and_finalization",
@@ -140,6 +127,7 @@ fn state_transition_skips_point_at_their_milestone() {
             "sync_committee_updates",
             "proposer_lookahead",
             "ptc_window",
+            "builder_pending_payments",
         ] {
             let k = consensus("gloas", preset, "epoch_processing", handler);
             assert!(skips.skipped_by(&k).is_none(), "{k} is skipped");
@@ -164,33 +152,32 @@ fn gloas_operations_runnable_handlers_are_not_skipped() {
     }
 }
 
-/// One Gloas `epoch_processing` case entry is left, for the step that is not ported. The
-/// entry with a `file` field excuses only the whole-epoch files, and its cases run.
+/// No Gloas `epoch_processing` or `sanity/slots` entry is left: every epoch step is ported,
+/// the runner reads the whole-epoch files, and the slots that cross an epoch boundary run.
 #[test]
-fn only_the_builder_payments_step_is_skipped() {
+fn no_gloas_epoch_or_slots_entry_is_left() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testing/skip.toml");
     let doc: toml::Table = std::fs::read_to_string(path).unwrap().parse().unwrap();
     let field =
         |e: &toml::Value, name: &str| e.get(name).and_then(|v| v.as_str()).map(String::from);
-    let mut case_entries = Vec::new();
-    let mut file_entries = Vec::new();
+    let mut epoch_entries = Vec::new();
+    let mut slots_entries = Vec::new();
     for e in doc["skip"].as_array().unwrap() {
-        if field(e, "fork").as_deref() != Some("gloas")
-            || field(e, "runner").as_deref() != Some("epoch_processing")
+        let runner = field(e, "runner");
+        let handler = field(e, "handler");
+        if field(e, "source").as_deref() != Some("consensus-specs")
+            || !matches!(field(e, "fork").as_deref(), Some("gloas" | "*"))
         {
             continue;
         }
-        let handler = field(e, "handler").unwrap();
-        match field(e, "file") {
-            Some(file) => file_entries.push((handler, file)),
-            None => case_entries.push(handler),
+        match (runner.as_deref(), handler.as_deref()) {
+            (Some("epoch_processing"), _) => epoch_entries.push(e.clone()),
+            (Some("sanity"), Some("slots" | "*")) => slots_entries.push(e.clone()),
+            _ => {}
         }
     }
-    assert_eq!(case_entries, ["builder_pending_payments"]);
-    assert_eq!(
-        file_entries,
-        [("*".to_string(), "*_epoch.ssz_snappy".to_string())]
-    );
+    assert!(epoch_entries.is_empty(), "{epoch_entries:?}");
+    assert!(slots_entries.is_empty(), "{slots_entries:?}");
 }
 
 /// The data-column `ssz_static` types, by the forks that define them: consensus-types defines
@@ -287,11 +274,10 @@ fn kzg_bls_and_light_client_skips_point_at_their_milestone() {
     assert_eq!(issue_of(&skips, &k), "none");
 }
 
-/// Gloas `sanity/slots` runs inside one epoch; the cases that cross an epoch boundary wait
-/// for `process_epoch`. phase0 `shuffling/core` runs; every other phase0 runner is out of
-/// scope.
+/// Gloas `sanity/slots` runs, also the cases that cross an epoch boundary. phase0
+/// `shuffling/core` runs; every other phase0 runner is out of scope.
 #[test]
-fn slots_inside_one_epoch_and_shuffling_run() {
+fn slots_and_shuffling_run() {
     let skips = committed();
     let case = |fork: &str, preset: &str, runner: &str, handler: &str, case: &str| CaseKey {
         case: case.into(),
@@ -303,17 +289,7 @@ fn slots_inside_one_epoch_and_shuffling_run() {
             "slots_2",
             "execution_payload_availability_reset_from_set",
             "execution_payload_availability_reset_from_unset",
-        ] {
-            let k = case(
-                "gloas",
-                preset,
-                "sanity",
-                "slots",
-                &format!("pyspec_tests/{name}"),
-            );
-            assert!(skips.skipped_by(&k).is_none(), "{k} is skipped");
-        }
-        for name in [
+            // The cases that cross an epoch boundary run the whole process_epoch.
             "over_epoch_boundary",
             "empty_epoch",
             "historical_accumulator",
@@ -325,7 +301,7 @@ fn slots_inside_one_epoch_and_shuffling_run() {
                 "slots",
                 &format!("pyspec_tests/{name}"),
             );
-            assert_eq!(issue_of(&skips, &k), "4.7", "{k}");
+            assert!(skips.skipped_by(&k).is_none(), "{k} is skipped");
         }
         let k = case(
             "phase0",

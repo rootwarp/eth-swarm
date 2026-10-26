@@ -56,6 +56,10 @@ pub const PAYLOAD_BUILDER_VERSION: u8 = 0;
 /// `BUILDER_INDEX_SELF_BUILD` (G L571, a constant): the builder index of a bid that the
 /// proposer builds itself.
 pub const BUILDER_INDEX_SELF_BUILD: u64 = u64::MAX;
+/// `BUILDER_PAYMENT_THRESHOLD_NUMERATOR` (G L572, a constant).
+pub const BUILDER_PAYMENT_THRESHOLD_NUMERATOR: u64 = 6;
+/// `BUILDER_PAYMENT_THRESHOLD_DENOMINATOR` (G L573, a constant).
+pub const BUILDER_PAYMENT_THRESHOLD_DENOMINATOR: u64 = 10;
 /// `MIN_ACTIVATION_BALANCE` (`presets/*/electra.yaml`, 32 ETH in both presets).
 pub const MIN_ACTIVATION_BALANCE: Gwei = 32_000_000_000;
 /// `EJECTION_BALANCE` (`configs/{minimal,mainnet}.yaml`, 16 ETH in both). A config value,
@@ -219,6 +223,14 @@ mod tests {
         assert_eq!(BUILDER_WITHDRAWAL_PREFIX, 0xb0);
         assert_eq!(PAYLOAD_BUILDER_VERSION, 0);
         assert_eq!(BUILDER_INDEX_SELF_BUILD, u64::MAX);
+        // G "Misc": Uint64(6) and Uint64(10).
+        assert_eq!(
+            (
+                BUILDER_PAYMENT_THRESHOLD_NUMERATOR,
+                BUILDER_PAYMENT_THRESHOLD_DENOMINATOR
+            ),
+            (6, 10)
+        );
     }
 
     #[test]

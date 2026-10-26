@@ -23,11 +23,13 @@
 //!   values from the preset, so each value that it reads ([`config_values`]) must be the
 //!   value of the case. Another value fails the case.
 //!
-//! The `pre_epoch.ssz_snappy` and `post_epoch.ssz_snappy` files of the whole-epoch check are
-//! not read until `process_epoch` is complete (it stops at the builder payments step). A
-//! `skip.toml` entry excuses them from the coverage guard.
+//! Most cases also hold `pre_epoch.ssz_snappy` and `post_epoch.ssz_snappy`: the state before
+//! and after the whole `process_epoch`. The runner checks them as the step: `process_epoch` on
+//! the pre-epoch state, and then `hash_tree_root` against the post-epoch state. A case with a
+//! pre-epoch state but without a post-epoch state must fail with a proof. These files get a
+//! BLS context of their own, with the keys of the pre-epoch state.
 
-use crate::bls_backend::{backend_for, bls_context, bls_setting, StateKeys};
+use crate::bls_backend::{backend_for, bls_context, bls_setting, Bls, StateKeys};
 use crate::check::state_field_diff;
 use crate::coverage::Reads;
 use crate::fixture;
@@ -35,7 +37,9 @@ use crate::plan::{Case, CaseKey};
 use consensus_types::gloas::BeaconState;
 use consensus_types::{Mainnet, Minimal};
 use ssz::Decode;
-use state_transition::per_epoch::gloas::{process_proposer_lookahead, process_ptc_window};
+use state_transition::per_epoch::gloas::{
+    process_builder_pending_payments, process_proposer_lookahead, process_ptc_window,
+};
 use state_transition::per_epoch::pending::{
     process_pending_consolidations, process_pending_deposits,
 };
@@ -48,7 +52,7 @@ use state_transition::per_epoch::resets::{
     process_sync_committee_updates,
 };
 use state_transition::per_epoch::{
-    process_inactivity_updates, process_justification_and_finalization,
+    process_epoch, process_inactivity_updates, process_justification_and_finalization,
     process_rewards_and_penalties,
 };
 use state_transition::preset::{
@@ -78,6 +82,7 @@ pub fn step<E: Preset>(handler: &str) -> Result<Option<Step<E>>, String> {
             |s, bls| process_pending_deposits(s, bls.genesis_fork_version, bls.backend)
         }
         "pending_consolidations" => |s, _| process_pending_consolidations(s),
+        "builder_pending_payments" => |s, _| process_builder_pending_payments(s),
         "effective_balance_updates" => |s, _| process_effective_balance_updates(s),
         "slashings_reset" => |s, _| process_slashings_reset(s),
         "randao_mixes_reset" => |s, _| process_randao_mixes_reset(s),
@@ -86,7 +91,6 @@ pub fn step<E: Preset>(handler: &str) -> Result<Option<Step<E>>, String> {
         "sync_committee_updates" => |s, bls| process_sync_committee_updates(s, bls.aggregator),
         "proposer_lookahead" => |s, _| process_proposer_lookahead(s),
         "ptc_window" => |s, _| process_ptc_window(s),
-        "builder_pending_payments" => return Ok(None),
         other => {
             return Err(format!(
                 "unknown epoch_processing handler directory `{other}`: classify it in \
@@ -142,38 +146,69 @@ fn run_step<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
         .file("post.ssz_snappy")
         .map(|p| decode_state::<E>(reads, p))
         .transpose()?;
+    let setting = bls_setting(reads, case)?;
     let keys = StateKeys::new(&state);
-    let bls = bls_context(
-        &case.key.preset,
-        backend_for(bls_setting(reads, case)?, &keys),
-    )?;
+    let bls = bls_context(&case.key.preset, backend_for(setting, &keys))?;
     check_config::<E>(reads, case, &bls)?;
-    match (step(&mut state, &bls), post) {
+    let result = step(&mut state, &bls);
+    check_outcome(case, handler, result, &mut state, post)?;
+    whole_epoch::<E>(reads, case, setting)
+}
+
+/// The whole-epoch check of a case: `process_epoch` on `pre_epoch.ssz_snappy`, against
+/// `post_epoch.ssz_snappy`. A case without both files has no such check.
+fn whole_epoch<E: Preset>(reads: &Reads, case: &Case, setting: Bls) -> Result<(), String> {
+    let post = case
+        .file("post_epoch.ssz_snappy")
+        .map(|p| decode_state::<E>(reads, p))
+        .transpose()?;
+    let Some(pre) = case.file("pre_epoch.ssz_snappy") else {
+        return match post {
+            Some(_) => Err("case has post_epoch.ssz_snappy, but no pre_epoch.ssz_snappy".into()),
+            None => Ok(()),
+        };
+    };
+    let mut state = decode_state::<E>(reads, pre)?;
+    let keys = StateKeys::new(&state);
+    let bls = bls_context(&case.key.preset, backend_for(setting, &keys))?;
+    let result = process_epoch(&mut state, &bls);
+    check_outcome(case, "process_epoch", result, &mut state, post)
+        .map_err(|e| format!("process_epoch: {e}"))
+}
+
+/// Compares the result of `what` on `state` with the vector: the root of `post`, or a proof
+/// failure when the vector has no `post`.
+fn check_outcome<E: Preset>(
+    case: &Case,
+    what: &str,
+    result: Result<(), StfError>,
+    state: &mut BeaconState<E>,
+    post: Option<BeaconState<E>>,
+) -> Result<(), String> {
+    match (result, post) {
         (Ok(()), Some(post)) => {
-            let got = state_root(&mut state).map_err(|e| format!("post-state root: {e}"))?;
+            let got = state_root(state).map_err(|e| format!("post-state root: {e}"))?;
             let want = post.tree_hash_root();
             if got == want {
                 Ok(())
             } else {
                 Err(format!(
                     "post-state root mismatch: got {got:x}, want {want:x}; fields that differ: {}",
-                    state_field_diff(&state, &post).join(", ")
+                    state_field_diff(state, &post).join(", ")
                 ))
             }
         }
         (Err(e), None) if e.proves_invalid() => {
             // Any proof error passes such a case, so print it: a port defect that happens
             // to give a proof error shows in the trial output.
-            eprintln!("{}: expected failure: {handler} failed with {e}", case.key);
+            eprintln!("{}: expected failure: {what} failed with {e}", case.key);
             Ok(())
         }
         (Err(e), None) => Err(format!(
-            "{handler} failed with {e}, which is not a spec failure"
+            "{what} failed with {e}, which is not a spec failure"
         )),
-        (Ok(()), None) => Err(format!(
-            "{handler} passed, but the vector expects it to fail"
-        )),
-        (Err(e), Some(_)) => Err(format!("{handler} failed: {e}")),
+        (Ok(()), None) => Err(format!("{what} passed, but the vector expects it to fail")),
+        (Err(e), Some(_)) => Err(format!("{what} failed: {e}")),
     }
 }
 
@@ -317,14 +352,13 @@ mod tests {
             "sync_committee_updates",
             "proposer_lookahead",
             "ptc_window",
+            "builder_pending_payments",
         ] {
             assert!(supported("gloas", "minimal", handler), "{handler}");
             assert!(supported("gloas", "mainnet", handler), "{handler}");
             assert!(!supported("fulu", "minimal", handler));
             assert!(!supported("gloas", "general", handler));
         }
-        assert_eq!(handler_runs("builder_pending_payments"), Ok(false));
-        assert!(!supported("gloas", "minimal", "builder_pending_payments"));
         assert!(handler_runs("process_new_thing").is_err());
         // Other forks and runners are not checked here.
         let key = |fork: &str, runner: &str| CaseKey {
@@ -403,11 +437,6 @@ mod tests {
         let pre = state_at(2);
         for (preset, handler, needle) in [
             ("general", HANDLER, "no epoch_processing runner"),
-            (
-                "minimal",
-                "builder_pending_payments",
-                "needs a skip.toml entry",
-            ),
             (
                 "minimal",
                 "process_new_thing",
@@ -525,6 +554,108 @@ mod tests {
         assert!(run(&Reads::default(), &c)
             .unwrap_err()
             .contains("bls_setting"));
+    }
+
+    /// [`state_at`] 2 with 64 validators of 32 ETH, and the proposer lookahead and the PTC
+    /// window of epoch 2: the whole `process_epoch` runs on it.
+    fn epoch_state() -> BeaconState<Minimal> {
+        use consensus_types::common::Validator;
+        use consensus_types::primitives::FAR_FUTURE_EPOCH;
+        use state_transition::caches::{initialize_proposer_lookahead, initialize_ptc_window};
+        let mut state = state_at(2);
+        for i in 0..64u64 {
+            let mut pubkey = [0u8; 48];
+            pubkey[..8].copy_from_slice(&i.to_le_bytes());
+            state
+                .validators
+                .push(Validator {
+                    pubkey,
+                    withdrawal_credentials: Default::default(),
+                    effective_balance: 32_000_000_000,
+                    slashed: false,
+                    activation_eligibility_epoch: 0,
+                    activation_epoch: 0,
+                    exit_epoch: FAR_FUTURE_EPOCH,
+                    withdrawable_epoch: FAR_FUTURE_EPOCH,
+                })
+                .unwrap();
+            state.balances.push(32_000_000_000).unwrap();
+            state.previous_epoch_participation.push(0b111).unwrap();
+            state.current_epoch_participation.push(0b111).unwrap();
+            state.inactivity_scores.push(0).unwrap();
+        }
+        state.proposer_lookahead =
+            milhouse::Vector::new(initialize_proposer_lookahead(&state).unwrap()).unwrap();
+        state.ptc_window = milhouse::Vector::new(initialize_ptc_window(&state).unwrap()).unwrap();
+        state.apply_updates().unwrap();
+        state
+    }
+
+    /// `case` with one more state file `name` in `dir`.
+    fn with_state(mut case: Case, dir: &Path, name: &str, state: &BeaconState<Minimal>) -> Case {
+        let path = dir.join(name);
+        std::fs::write(&path, snappy(state)).unwrap();
+        case.files.push(CaseFile {
+            path,
+            name: name.into(),
+        });
+        case
+    }
+
+    #[test]
+    fn the_whole_epoch_check_runs_process_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let pre = epoch_state();
+        let mut post = pre.clone();
+        process_justification_and_finalization(&mut post).unwrap();
+        let step_case = || case(dir.path(), "minimal", HANDLER, &pre, Some(&post));
+        let mut post_epoch = pre.clone();
+        let keys = StateKeys::new(&pre);
+        process_epoch(&mut post_epoch, &bls_context("minimal", &keys).unwrap()).unwrap();
+        post_epoch.apply_updates().unwrap();
+        assert_ne!(post_epoch, pre);
+
+        // A matching post-epoch state passes, and the runner reads every file.
+        let c = with_state(step_case(), dir.path(), "pre_epoch.ssz_snappy", &pre);
+        let c = with_state(c, dir.path(), "post_epoch.ssz_snappy", &post_epoch);
+        let reads = Reads::default();
+        assert_eq!(run(&reads, &c), Ok(()));
+        assert!(c.files.iter().all(|f| reads.contains(&f.path)));
+
+        // Another post-epoch state fails, with the fields that differ.
+        let c = with_state(step_case(), dir.path(), "pre_epoch.ssz_snappy", &pre);
+        let c = with_state(c, dir.path(), "post_epoch.ssz_snappy", &pre);
+        let err = run(&Reads::default(), &c).unwrap_err();
+        assert!(
+            err.starts_with("process_epoch: post-state root mismatch"),
+            "{err}"
+        );
+        assert!(
+            err.contains("current_justified_checkpoint, proposer_lookahead"),
+            "{err}"
+        );
+
+        // No post-epoch state: process_epoch must fail with a proof.
+        let c = with_state(step_case(), dir.path(), "pre_epoch.ssz_snappy", &pre);
+        let err = run(&Reads::default(), &c).unwrap_err();
+        assert!(err.contains("process_epoch passed"), "{err}");
+        let mut invalid = pre.clone();
+        for i in 0..3 {
+            invalid.justification_bits.set(i, true).unwrap();
+        }
+        invalid.previous_justified_checkpoint.epoch = u64::MAX;
+        let c = with_state(step_case(), dir.path(), "pre_epoch.ssz_snappy", &invalid);
+        assert_eq!(run(&Reads::default(), &c), Ok(()));
+
+        // A post-epoch state needs a pre-epoch state.
+        let c = with_state(
+            step_case(),
+            dir.path(),
+            "post_epoch.ssz_snappy",
+            &post_epoch,
+        );
+        let err = run(&Reads::default(), &c).unwrap_err();
+        assert!(err.contains("no pre_epoch.ssz_snappy"), "{err}");
     }
 
     /// An unknown handler directory fails the setup of the run with its path in the message.

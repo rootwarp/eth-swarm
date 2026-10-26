@@ -126,18 +126,21 @@ mod tests {
     }
 
     #[test]
-    fn stops_at_the_builder_payments_until_they_land() {
+    fn runs_the_epoch_at_the_boundary() {
         let mut state = genesis_state::<Minimal>(&[32_000_000_000; 8]);
         let bls = no_bls();
         // Slot 7 is the last slot of epoch 0 in the minimal preset.
         assert_eq!(process_slots(&mut state, 7, &bls), Ok(()));
-        // `process_epoch` runs its steps up to `process_builder_pending_payments`.
-        assert_eq!(
-            process_slots(&mut state, 8, &bls),
-            Err(StfError::Unimplemented(
-                "process_builder_pending_payments (4.6b)"
-            ))
-        );
+        let payment = state.builder_pending_payments.get_mut(8).unwrap();
+        payment.withdrawal.amount = 1;
+        let moved = payment.clone();
+        let lookahead = state.proposer_lookahead.clone();
+        // `process_epoch` runs every step: the builder payments of epoch 0 move to the first
+        // half, and the proposer lookahead shifts.
+        assert_eq!(process_slots(&mut state, 8, &bls), Ok(()));
+        assert_eq!(state.slot, 8);
+        assert_eq!(state.builder_pending_payments.get(0), Some(&moved));
+        assert_ne!(state.proposer_lookahead, lookahead);
     }
 
     #[test]
