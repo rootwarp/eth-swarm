@@ -71,6 +71,8 @@ pub const HYSTERESIS_UPWARD_MULTIPLIER: u64 = 5;
 pub const PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX: u64 = 3;
 /// `MAX_PENDING_DEPOSITS_PER_EPOCH` (`presets/*/electra.yaml`, 16 in both presets).
 pub const MAX_PENDING_DEPOSITS_PER_EPOCH: u64 = 16;
+/// `MIN_DEPOSIT_AMOUNT` (`presets/*/phase0.yaml` L23, 1 ETH in both presets).
+pub const MIN_DEPOSIT_AMOUNT: Gwei = 1_000_000_000;
 /// `GENESIS_SLOT` (P0 "Misc").
 pub const GENESIS_SLOT: Slot = 0;
 /// `BLS_WITHDRAWAL_PREFIX` (P0 "Withdrawal prefixes", a constant).
@@ -235,6 +237,7 @@ mod tests {
         );
         assert_eq!(PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX, 3);
         assert_eq!(MAX_PENDING_DEPOSITS_PER_EPOCH, 16);
+        assert_eq!(MIN_DEPOSIT_AMOUNT, 1_000_000_000);
         assert_eq!(COMPOUNDING_WITHDRAWAL_PREFIX, 0x02);
         assert_eq!(Minimal::EPOCHS_PER_SYNC_COMMITTEE_PERIOD, 8);
         assert_eq!(Mainnet::EPOCHS_PER_SYNC_COMMITTEE_PERIOD, 256);

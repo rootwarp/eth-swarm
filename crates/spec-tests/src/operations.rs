@@ -23,6 +23,9 @@
 //! state only, so its cases have no operation file. A `withdrawals` case without
 //! `post.ssz_snappy` has a pre-state that the transition does not make, and it must fail with
 //! the index error of the list that its name gives ([`expect_state_only`]).
+//!
+//! The `execution_payload_bid` cases take the blob limit of the spec config of the preset
+//! ([`crate::bls_backend::blob_schedule`]) at the epoch of `pre`.
 
 use crate::bls_backend::{
     backend_for, bls_context, bls_setting, genesis_fork_version, Bls, StateKeys,
@@ -36,14 +39,14 @@ use consensus_types::common::{
 };
 use consensus_types::gloas::{
     Attestation, AttesterSlashing, BeaconBlock, BeaconState, BuilderDepositRequest,
-    BuilderExitRequest, PayloadAttestation,
+    BuilderExitRequest, PayloadAttestation, SignedExecutionPayloadBid,
 };
 use consensus_types::primitives::{BLSSignature, Slot, ValidatorIndex};
 use consensus_types::{Mainnet, Minimal};
 use ssz::Decode;
 use ssz_types::typenum::{Unsigned, U0};
 use ssz_types::ProgressiveVariableList;
-use state_transition::accessors::TotalActiveBalanceCache;
+use state_transition::accessors::{get_current_epoch, TotalActiveBalanceCache};
 use state_transition::per_block::attestation::process_attestation_with;
 use state_transition::per_block::builder::{
     process_builder_deposit_request, process_builder_exit_request,
@@ -52,14 +55,15 @@ use state_transition::per_block::exits::{process_bls_to_execution_change, proces
 use state_transition::per_block::requests::process_consolidation_request;
 use state_transition::per_block::sync_aggregate::process_sync_aggregate_with;
 use state_transition::per_block::{
-    process_attester_slashing, process_block_header, process_payload_attestation,
-    process_proposer_slashing, process_withdrawals, BlockContext,
+    process_attester_slashing, process_block_header, process_execution_payload_bid,
+    process_payload_attestation, process_proposer_slashing, process_withdrawals, BlockContext,
 };
 use state_transition::signatures::{
     attestation_signature_set_with, attester_slashing_signature_sets,
     proposer_slashing_signature_sets, verify_bls_to_execution_change_signature,
-    verify_operation_signatures, verify_payload_attestation_signature,
-    verify_sync_aggregate_signature_with, verify_voluntary_exit_signature,
+    verify_execution_payload_bid_signature, verify_operation_signatures,
+    verify_payload_attestation_signature, verify_sync_aggregate_signature_with,
+    verify_voluntary_exit_signature,
 };
 use state_transition::{state_root, Preset, StfError};
 use std::path::Path;
@@ -67,7 +71,7 @@ use tree_hash::TreeHash;
 use yaml_rust2::Yaml;
 
 /// Handlers this runner executes.
-pub const RUNNABLE: [&str; 13] = [
+pub const RUNNABLE: [&str; 14] = [
     "attestation",
     "attester_slashing",
     "block_header",
@@ -75,6 +79,7 @@ pub const RUNNABLE: [&str; 13] = [
     "builder_deposit_request",
     "builder_exit_request",
     "consolidation_request",
+    "execution_payload_bid",
     "payload_attestation",
     "proposer_slashing",
     "sync_aggregate",
@@ -85,9 +90,8 @@ pub const RUNNABLE: [&str; 13] = [
 
 /// Gloas handlers at beta.4 that the state transition does not port yet. Each needs a
 /// `skip.toml` entry.
-pub const NOT_RUN: [&str; 4] = [
+pub const NOT_RUN: [&str; 3] = [
     "deposit_request",
-    "execution_payload_bid",
     "parent_execution_payload",
     "withdrawal_request",
 ];
@@ -149,6 +153,27 @@ fn operation<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
                 ctx.genesis_fork_version,
                 ctx.backend,
             )
+        }
+        ("operations", "execution_payload_bid") => {
+            let signed_bid = decode::<SignedExecutionPayloadBid<E>>(
+                reads,
+                file("execution_payload_bid.ssz_snappy")?,
+            )?;
+            // The blob limit of the spec config of the preset, at the epoch of the state.
+            let keys = StateKeys::new(&state);
+            let ctx = bls_context(&case.key.preset, backend_for(bls, &keys))?;
+            let max_blobs_per_block = ctx
+                .blob_schedule
+                .max_blobs_per_block(get_current_epoch(&state));
+            verify_execution_payload_bid_signature(
+                &state,
+                &signed_bid,
+                max_blobs_per_block,
+                ctx.backend,
+            )
+            .and_then(|()| {
+                process_execution_payload_bid(&mut state, &signed_bid, max_blobs_per_block)
+            })
         }
         ("operations", "builder_exit_request") => {
             let request =
@@ -906,6 +931,92 @@ mod tests {
             run(&Reads::default(), &case(dir.path(), handler, &files)),
             Ok(())
         );
+    }
+
+    #[test]
+    fn execution_payload_bid_cases() {
+        use consensus_types::gloas::{Builder, ExecutionPayloadBid, SignedExecutionPayloadBid};
+        use consensus_types::signing::{DOMAIN_BEACON_BUILDER, DOMAIN_BEACON_PROPOSER};
+        use state_transition::accessors::{get_domain, get_randao_mix};
+        use state_transition::per_block::process_execution_payload_bid;
+
+        // Builder 0 has the key of the secret key 1, 5 ETH, and a finalized deposit.
+        let mut pre = signing_pre();
+        pre.finalized_checkpoint.epoch = 1;
+        pre.latest_block_hash = Root::repeat_byte(0x11);
+        *pre.block_roots.get_mut(511 % 64).unwrap() = Root::repeat_byte(0x08);
+        pre.builders
+            .push(Builder {
+                pubkey: pubkey_1(),
+                version: 0,
+                execution_address: Address::repeat_byte(0xb1),
+                balance: 5 * ETH,
+                deposit_epoch: 0,
+                withdrawable_epoch: FAR_FUTURE_EPOCH,
+            })
+            .unwrap();
+        pre.apply_updates().unwrap();
+        let bid = ExecutionPayloadBid {
+            parent_block_hash: Root::repeat_byte(0x11),
+            parent_block_root: Root::repeat_byte(0x08),
+            block_hash: Root::repeat_byte(0xbb),
+            prev_randao: get_randao_mix(&pre, 64),
+            fee_recipient: Address::repeat_byte(0xfe),
+            gas_limit: 0,
+            builder_index: 0,
+            slot: 64 * 8,
+            value: ETH,
+            execution_payment: 0,
+            blob_kzg_commitments: Default::default(),
+            execution_requests_root: Root::ZERO,
+        };
+        let signed_in = |domain_type, bid: &ExecutionPayloadBid<Minimal>| {
+            let domain = get_domain(&pre, domain_type, None);
+            SignedExecutionPayloadBid {
+                message: bid.clone(),
+                signature: sign_1(compute_signing_root(bid, domain)),
+            }
+        };
+        let valid = signed_in(DOMAIN_BEACON_BUILDER, &bid);
+        let wrong_domain = signed_in(DOMAIN_BEACON_PROPOSER, &bid);
+        let mut post = pre.clone();
+        process_execution_payload_bid(&mut post, &valid, 9).unwrap();
+        post.apply_updates().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let name = "execution_payload_bid.ssz_snappy";
+        let handler = "execution_payload_bid";
+        // The bid signed by the key of `state.builders[0]` records the payment of builder 0.
+        let files = signed_case_files(&pre, name, valid.as_ssz_bytes(), Some(&post));
+        let c = case(dir.path(), handler, &files);
+        let reads = Reads::default();
+        assert_eq!(run(&reads, &c), Ok(()));
+        assert!(c.files.iter().all(|f| reads.contains(&f.path)));
+        // A signature in another domain is invalid, and a proof.
+        let files = signed_case_files(&pre, name, wrong_domain.as_ssz_bytes(), Some(&post));
+        assert!(run(&Reads::default(), &case(dir.path(), handler, &files))
+            .unwrap_err()
+            .contains("invalid operation signature"));
+        let files = signed_case_files(&pre, name, wrong_domain.as_ssz_bytes(), None);
+        assert_eq!(
+            run(&Reads::default(), &case(dir.path(), handler, &files)),
+            Ok(())
+        );
+        // bls_setting 2: the signature is not checked.
+        let mut files = signed_case_files(&pre, name, wrong_domain.as_ssz_bytes(), Some(&post));
+        files[2].1 = b"{bls_setting: 2}\n".to_vec();
+        assert_eq!(
+            run(&Reads::default(), &case(dir.path(), handler, &files)),
+            Ok(())
+        );
+        // 10 blob commitments: one past MAX_BLOBS_PER_BLOCK_ELECTRA of configs/minimal.yaml.
+        let mut many = bid.clone();
+        many.blob_kzg_commitments = vec![[0xc0; 48]; 10].try_into().unwrap();
+        let many = signed_in(DOMAIN_BEACON_BUILDER, &many);
+        let files = signed_case_files(&pre, name, many.as_ssz_bytes(), Some(&post));
+        assert!(run(&Reads::default(), &case(dir.path(), handler, &files))
+            .unwrap_err()
+            .contains("10 blob commitments, the limit is 9"));
     }
 
     #[test]

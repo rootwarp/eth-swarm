@@ -82,13 +82,18 @@ pub fn compute_signing_root<T: TreeHash>(object: &T, domain: Domain) -> Root {
 pub enum SignerRef {
     /// A validator, by registry index.
     Validator(ValidatorIndex),
-    /// A Gloas builder, by builder-registry index and its `Builder.version`.
-    /// Not a safe cache key after an index reuse (see `state_transition::per_block::builder`).
+    /// A Gloas builder, by builder-registry index and the version of its key.
+    ///
+    /// A builder index is reusable: a new key can take the index of a builder that exited
+    /// (see `state_transition::per_block::builder`). The `version` changes when a new key
+    /// takes the index, so a cache of builder keys uses `(index, version)` as its key.
     Builder {
         /// Index into `state.builders`.
         index: BuilderIndex,
-        /// `Builder.version`.
-        version: u8,
+        /// `state_transition::accessors::builder_key_version` of the state: a 64-bit digest
+        /// of `state.builders[index].pubkey`. It is not `Builder.version`, which is the same
+        /// for each payload builder.
+        version: u64,
     },
     /// A key carried by the message itself (deposits, BLS-to-execution changes, new indices past
     /// the finalized registry).

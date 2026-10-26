@@ -10,13 +10,15 @@
 //!
 //! The epoch processing also needs `eth_aggregate_pubkeys` for the next sync committee. A
 //! [`PubkeyAggregator`] that the caller supplies does it, so the crate links no BLS library.
-//! A [`BlsContext`] holds the backend, the aggregator and the `GENESIS_FORK_VERSION` of the
-//! deposit domain.
+//! A [`BlsContext`] holds the backend, the aggregator, the `GENESIS_FORK_VERSION` of the
+//! deposit domain and the other values of the network config that the transition reads.
 
 pub use consensus_types::signing::{SignatureSet, SignerRef};
 
+use crate::accessors::builder_key_version;
 use crate::accessors::{get_block_root_at_slot, get_current_epoch, get_domain};
 use crate::per_block::attestation::{check_attestation, check_indexed_attestation};
+use crate::per_block::bid::{check_builder_bid_before_block, BlobSchedule};
 use crate::per_block::payload_attestation::{
     check_indexed_payload_attestation, check_payload_attestation_target,
     get_indexed_payload_attestation,
@@ -31,13 +33,13 @@ use consensus_types::common::{
 };
 use consensus_types::gloas::{
     Attestation, AttesterSlashing, BeaconBlockBody, BeaconState, IndexedAttestation,
-    IndexedPayloadAttestation, PayloadAttestation, SignedBeaconBlock,
+    IndexedPayloadAttestation, PayloadAttestation, SignedBeaconBlock, SignedExecutionPayloadBid,
 };
 use consensus_types::primitives::{BLSPubkey, BLSSignature, Bytes32, Gwei, Root, Version};
 use consensus_types::signing::{
-    compute_domain, compute_signing_root, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
-    DOMAIN_BLS_TO_EXECUTION_CHANGE, DOMAIN_DEPOSIT, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
-    DOMAIN_SYNC_COMMITTEE, DOMAIN_VOLUNTARY_EXIT,
+    compute_domain, compute_signing_root, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_BUILDER,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_BLS_TO_EXECUTION_CHANGE, DOMAIN_DEPOSIT, DOMAIN_PTC_ATTESTER,
+    DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE, DOMAIN_VOLUNTARY_EXIT,
 };
 
 /// `G2_POINT_AT_INFINITY` (`altair/bls.md` L25): the compressed G2 identity.
@@ -96,6 +98,10 @@ pub struct BlsContext<'a> {
     /// from Deneb (EIP-7044, E L1853-1855). It is a value of the network config, not of the
     /// preset. The network config of cl-chain does not give it yet.
     pub capella_fork_version: Version,
+    /// The blob schedule of the network (`BLOB_SCHEDULE` with its BPO forks), for the blob
+    /// limit of a bid (G L2183-2187). It is a value of the network config, not of the
+    /// preset. cl-chain gives `network_config::ChainConfig::get_blob_parameters`.
+    pub blob_schedule: &'a dyn BlobSchedule,
 }
 
 /// The proposer signature set of a block: `verify_block_signature` (P0 L1839-1844) without
@@ -476,6 +482,70 @@ pub fn attestation_signature_set_with<E: Preset>(
     indexed_attestation_signature_set(state, &indexed_attestation)
 }
 
+/// The signature set of `verify_execution_payload_bid_signature` (G L2149-2156) without the
+/// BLS call: the key of `state.builders[bid.builder_index]`, named by
+/// [`SignerRef::Builder`] with its [`builder_key_version`], over the bid in the
+/// `DOMAIN_BEACON_BUILDER` of the current epoch.
+///
+/// It checks only that the builder is in the registry ([`StfError::UnknownBuilder`]; a
+/// self-build bid also gives it). Run the cheap checks of the bid first: in a block,
+/// [`block_bid_signature_set`] runs them, and the gossip validation runs its own
+/// (`gloas/p2p-interface.md` L951-1091) before the signature.
+pub fn execution_payload_bid_signature_set<E: Preset>(
+    state: &BeaconState<E>,
+    signed_bid: &SignedExecutionPayloadBid<E>,
+) -> Result<SignatureSet, StfError> {
+    let index = signed_bid.message.builder_index;
+    let signer = SignerRef::Builder {
+        index,
+        version: builder_key_version(state, index)?,
+    };
+    let domain = get_domain(state, DOMAIN_BEACON_BUILDER, None);
+    Ok(SignatureSet::single(
+        signer,
+        compute_signing_root(&signed_bid.message, domain),
+        signed_bid.signature,
+    ))
+}
+
+/// The signature set of the bid of a block: `None` for a self-build bid, else
+/// [`execution_payload_bid_signature_set`].
+///
+/// A self-build bid has no BLS check: the bid step checks its value and its infinity
+/// signature. For a builder bid, the asserts that need no BLS and that the earlier steps of
+/// the block cannot change run first
+/// (`per_block::bid::check_builder_bid_before_block`). A bid that fails them gives
+/// its error and no set, so it costs no key lookup and no backend call.
+///
+/// `state` is the state at the block's slot, before `process_block`. `max_blobs_per_block`
+/// is the limit of the network at the epoch of the state ([`BlobSchedule`]).
+pub fn block_bid_signature_set<E: Preset>(
+    state: &BeaconState<E>,
+    signed_bid: &SignedExecutionPayloadBid<E>,
+    max_blobs_per_block: u64,
+) -> Result<Option<SignatureSet>, StfError> {
+    if signed_bid.message.builder_index == BUILDER_INDEX_SELF_BUILD {
+        return Ok(None);
+    }
+    check_builder_bid_before_block(state, &signed_bid.message, max_blobs_per_block)?;
+    execution_payload_bid_signature_set(state, signed_bid).map(Some)
+}
+
+/// [`block_bid_signature_set`] through `backend`, for a caller that processes a bid outside
+/// [`block_signature_sets`]. A self-build bid makes no backend call. A set that the backend
+/// refuses is [`StfError::InvalidOperationSignature`].
+pub fn verify_execution_payload_bid_signature<E: Preset>(
+    state: &BeaconState<E>,
+    signed_bid: &SignedExecutionPayloadBid<E>,
+    max_blobs_per_block: u64,
+    backend: &dyn SignatureBackend,
+) -> Result<(), StfError> {
+    match block_bid_signature_set(state, signed_bid, max_blobs_per_block)? {
+        None => Ok(()),
+        Some(set) => verify_operation_signatures(std::slice::from_ref(&set), backend),
+    }
+}
+
 /// Checks the sets of one operation through `backend` in one call, for a caller that
 /// processes the operation outside [`block_signature_sets`]. A set that the backend refuses
 /// is [`StfError::InvalidOperationSignature`].
@@ -491,17 +561,19 @@ pub fn verify_operation_signatures(
 }
 
 /// Every signature set of a block, in the order of `process_block`: the proposer
-/// signature, the RANDAO reveal, two sets for each proposer slashing, two for each attester
+/// signature, the RANDAO reveal, the bid of a builder (none for a self-build bid), two sets
+/// for each proposer slashing, two for each attester
 /// slashing, one for each attestation, the voluntary exits, the BLS-to-execution changes,
 /// one set for each payload attestation, and the sync aggregate (none for an empty
 /// aggregate with the infinity signature). The operation sets follow the order of
 /// `process_operations` (G L2228-2263). The domains of the exits and the changes take the
 /// fork versions of the network from `bls`.
 ///
-/// The function fails closed for the signed parts of the body that have no set builder
-/// yet: a builder bid (not a self-build) gives [`StfError::Unimplemented`] with the work
-/// that ports it. A port must add its set builder here and remove its `Unimplemented`, so
-/// that no signature of the block is left out of the batch.
+/// The bid comes before the RANDAO reveal in `process_block`. The order of the sets in one
+/// batch does not change the verdict. The bid set is built after the cheap checks of the
+/// bid ([`block_bid_signature_set`]), with the blob limit of `bls.blob_schedule` at the
+/// epoch of the state. Each signed part of the body has a set builder here, so that no
+/// signature of the block is left out of the batch.
 ///
 /// `state` is the state at the block's slot, after `process_slots` and before
 /// `process_block`. The steps before each check do not change what the set reads (the
@@ -534,10 +606,15 @@ pub fn block_signature_sets_with<E: Preset>(
         block_proposer_signature_set(state, signed_block)?,
         randao_signature_set(state, body)?,
     ];
-    if body.signed_execution_payload_bid.message.builder_index != BUILDER_INDEX_SELF_BUILD {
-        // `verify_execution_payload_bid_signature` (G L2149-2156).
-        return Err(StfError::Unimplemented("4.5"));
-    }
+    // `verify_execution_payload_bid_signature` (G L2149-2156).
+    let max_blobs_per_block = bls
+        .blob_schedule
+        .max_blobs_per_block(get_current_epoch(state));
+    sets.extend(block_bid_signature_set(
+        state,
+        &body.signed_execution_payload_bid,
+        max_blobs_per_block,
+    )?);
     for proposer_slashing in &body.proposer_slashings {
         sets.extend(proposer_slashing_signature_sets(state, proposer_slashing)?);
     }
@@ -824,35 +901,41 @@ mod tests {
     }
 
     #[test]
-    fn operations_without_a_set_builder_fail_closed() {
-        use consensus_types::common::{BeaconBlockHeader, SignedBeaconBlockHeader};
+    fn builder_bid_set_is_in_the_batch() {
+        use crate::testing::{bid_for_state, builder};
 
-        let (state, block) = state_and_block(&[1]);
-        let header = SignedBeaconBlockHeader {
-            message: BeaconBlockHeader {
-                slot: 0,
-                proposer_index: 0,
-                parent_root: Root::ZERO,
-                state_root: Root::ZERO,
-                body_root: Root::ZERO,
-            },
-            signature: [0; 96],
-        };
-        // A bid of a builder, not a self-build, has no set builder yet. A proposer slashing
-        // has one, and it does not stop the check of the bid.
-        let mut with = block.clone();
-        let body = &mut with.message.body;
-        body.signed_execution_payload_bid.message.builder_index = 0;
-        body.proposer_slashings
-            .push(consensus_types::common::ProposerSlashing {
-                signed_header_1: header.clone(),
-                signed_header_2: header,
-            })
+        let (mut state, block) = state_and_block(&[1]);
+        state.finalized_checkpoint.epoch = 1;
+        state
+            .builders
+            .push(builder(0xa1, 5_000_000_000, 0))
             .unwrap();
+        // A builder bid: its set comes after the proposer and RANDAO sets, and before the
+        // sync aggregate set.
+        let mut with = block.clone();
+        let bid = bid_for_state(&state, 0, 1);
+        with.message.body.signed_execution_payload_bid = bid.clone();
+        let sets = block_signature_sets(&state, &with, &no_bls()).unwrap();
+        assert_eq!(sets.len(), 4);
+        let max = crate::testing::MINIMAL_MAX_BLOBS_PER_BLOCK;
         assert_eq!(
-            block_signature_sets(&state, &with, &no_bls()),
-            Err(StfError::Unimplemented("4.5"))
+            block_bid_signature_set(&state, &bid, max),
+            Ok(Some(sets[2].clone()))
         );
+        // A forged bid of a builder that is not active fails the sets of the block, with no
+        // key lookup and no backend call.
+        let mut forged = with.clone();
+        state.builders.get_mut(0).unwrap().deposit_epoch = 1;
+        forged.message.body.signed_execution_payload_bid = bid_for_state(&state, 0, 1);
+        let backend = Counting {
+            verdict: true,
+            calls: Cell::new(0),
+        };
+        assert_eq!(
+            verify_block_signatures(&state, &forged, &bls_context(&backend)),
+            Err(StfError::BidBuilderNotActive(0))
+        );
+        assert_eq!(backend.calls.get(), 0);
         // A self-build bid with another signature than the infinity needs no BLS check, but
         // the bid step rejects it; the sets do not fail for it.
         let mut self_build = block.clone();

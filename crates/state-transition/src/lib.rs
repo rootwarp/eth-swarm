@@ -8,9 +8,9 @@
 //! - [`state_transition`]: the slot loop, the block signature, the block and the state root.
 //! - [`per_slot`]: `process_slots` and `process_slot`.
 //! - [`per_epoch`]: the epoch processing (every step but the builder payments).
-//! - [`per_block`]: the block processing: the step order, the header, RANDAO, eth1 data,
-//!   the voluntary exits, the BLS-to-execution changes, the payload attestations and the
-//!   sync aggregate. The other steps and operations are stubs for now. It also has the
+//! - [`per_block`]: the block processing: the step order, the header, the bid, RANDAO, eth1
+//!   data, the voluntary exits, the BLS-to-execution changes, the payload attestations and
+//!   the sync aggregate. The other steps and operations are stubs for now. It also has the
 //!   builder requests and the consolidation requests of the parent payload.
 //! - [`accessors`]: the beacon-state accessors and the misc helpers.
 //! - [`caches`]: shuffling, beacon committees, proposer and PTC selection.
@@ -39,6 +39,7 @@ pub mod signatures;
 #[cfg(test)]
 mod testing;
 
+pub use per_block::bid::BlobSchedule;
 pub use preset::Preset;
 pub use signatures::{
     AggregationError, BackendError, BlsContext, PubkeyAggregator, SignatureBackend, SignatureSet,
@@ -47,7 +48,7 @@ pub use signatures::{
 
 use consensus_types::gloas::{BeaconBlock, BeaconState, SignedBeaconBlock};
 use consensus_types::primitives::{
-    BuilderIndex, Bytes32, CommitteeIndex, Epoch, Gwei, Root, Slot, ValidatorIndex,
+    BuilderIndex, Bytes32, CommitteeIndex, Epoch, Gwei, Hash32, Root, Slot, ValidatorIndex,
 };
 use tree_hash::TreeHash;
 
@@ -460,6 +461,89 @@ pub enum StfError {
         /// The value that failed, for example `"withdrawal index"`.
         what: &'static str,
     },
+    /// `process_execution_payload_bid` asserts `amount == 0` for a self-build bid
+    /// (`BUILDER_INDEX_SELF_BUILD`).
+    #[error("self-build bid has the value {0}, not 0")]
+    SelfBuildBidValue(Gwei),
+    /// `process_execution_payload_bid` asserts that the signature of a self-build bid is
+    /// `G2_POINT_AT_INFINITY`.
+    #[error("self-build bid signature is not the infinity point")]
+    SelfBuildBidSignature,
+    /// `process_execution_payload_bid` asserts `is_active_builder` for the builder of the bid.
+    #[error("builder {0} is not active, so it cannot bid")]
+    BidBuilderNotActive(BuilderIndex),
+    /// `process_execution_payload_bid` asserts that the builder of the bid has
+    /// `PAYLOAD_BUILDER_VERSION`.
+    #[error("builder {index} has version {version}, not the payload builder version")]
+    BidBuilderVersion {
+        /// `bid.builder_index`.
+        index: BuilderIndex,
+        /// `state.builders[index].version`.
+        version: u8,
+    },
+    /// `process_execution_payload_bid` asserts `can_builder_cover_bid`.
+    #[error("builder {index} cannot cover a bid of {amount} Gwei")]
+    BidNotCovered {
+        /// `bid.builder_index`.
+        index: BuilderIndex,
+        /// `bid.value`.
+        amount: Gwei,
+    },
+    /// `process_execution_payload_bid` asserts that the bid has at most
+    /// `get_blob_parameters(get_current_epoch(state)).max_blobs_per_block` blob commitments.
+    #[error("bid has {count} blob commitments, the limit is {max}")]
+    BidBlobCommitments {
+        /// `len(bid.blob_kzg_commitments)`.
+        count: usize,
+        /// The limit of the network for the epoch.
+        max: u64,
+    },
+    /// `process_execution_payload_bid` asserts `bid.slot == state.slot`.
+    #[error("bid slot {bid} is not the state slot {state}")]
+    BidSlotMismatch {
+        /// `bid.slot`.
+        bid: Slot,
+        /// `state.slot`.
+        state: Slot,
+    },
+    /// `process_execution_payload_bid` asserts `state.slot > GENESIS_SLOT`.
+    #[error("a bid cannot be at the genesis slot")]
+    BidAtGenesisSlot,
+    /// `process_execution_payload_bid` asserts
+    /// `bid.parent_block_hash == state.latest_block_hash`.
+    #[error("bid parent block hash {bid} is not the latest block hash {expected}")]
+    BidParentBlockHash {
+        /// `bid.parent_block_hash`.
+        bid: Hash32,
+        /// `state.latest_block_hash`.
+        expected: Hash32,
+    },
+    /// `process_execution_payload_bid` asserts `bid.block_hash != bid.parent_block_hash`.
+    #[error("bid block hash is the same as its parent block hash")]
+    BidBlockHashIsParent,
+    /// `process_execution_payload_bid` asserts
+    /// `bid.parent_block_root == get_block_root_at_slot(state, state.slot - 1)`.
+    #[error("bid parent block root {bid} is not the block root {expected} of the previous slot")]
+    BidParentBlockRoot {
+        /// `bid.parent_block_root`.
+        bid: Root,
+        /// `get_block_root_at_slot(state, state.slot - 1)`.
+        expected: Root,
+    },
+    /// `process_execution_payload_bid` asserts
+    /// `bid.prev_randao == get_randao_mix(state, get_current_epoch(state))`.
+    #[error("bid prev_randao {bid} is not the RANDAO mix {expected} of the current epoch")]
+    BidPrevRandao {
+        /// `bid.prev_randao`.
+        bid: Bytes32,
+        /// `get_randao_mix(state, get_current_epoch(state))`.
+        expected: Bytes32,
+    },
+    /// The [`per_block::BlockContext`] has no blob limit of the network for the epoch of the
+    /// state. The caller did not give it ([`per_block::BlockContext::set_max_blobs_per_block`]).
+    /// This is a caller error, never a proof that the input is invalid.
+    #[error("no blob limit of the network for epoch {0}")]
+    UnknownBlobLimit(Epoch),
 }
 
 impl StfError {
@@ -504,6 +588,14 @@ impl StfError {
     /// [`StfError::NoValidatorSlashed`], [`StfError::ValidatorNotSlashable`] and
     /// [`StfError::InvalidOperationSignature`].
     ///
+    /// The bid variants that read the state have the same rule:
+    /// [`StfError::BidBuilderNotActive`], [`StfError::BidBuilderVersion`],
+    /// [`StfError::BidNotCovered`], [`StfError::BidSlotMismatch`],
+    /// [`StfError::BidAtGenesisSlot`], [`StfError::BidParentBlockHash`],
+    /// [`StfError::BidParentBlockRoot`] and [`StfError::BidPrevRandao`].
+    /// [`StfError::BidBlobCommitments`] is a proof only with the blob schedule of the
+    /// network of the bid. [`StfError::UnknownBlobLimit`] is a caller error: IGNORE.
+    ///
     /// The match has no `_` arm, so each new variant must select its class here.
     pub fn proves_invalid(&self) -> bool {
         match self {
@@ -533,7 +625,10 @@ impl StfError {
             | Self::PriorWithdrawalsPastLimit { .. }
             // The operands come from our own state, not from the block, so a failure is a
             // fault of our state.
-            | Self::StateArithmetic { .. } => false,
+            | Self::StateArithmetic { .. }
+            // The caller did not give the blob limit of the network, which says nothing
+            // about the bid.
+            | Self::UnknownBlobLimit(_) => false,
             Self::SlotNotLater { .. }
             | Self::InvalidBlockSignature
             | Self::StateRootMismatch { .. }
@@ -625,7 +720,26 @@ impl StfError {
             | Self::ValidatorNotSlashable(_)
             // A verdict of the backend on the keys of the state, as for
             // `InvalidBlockSignature`.
-            | Self::InvalidOperationSignature => true,
+            | Self::InvalidOperationSignature
+            // The asserts of a self-build bid and the block hash of a bid: properties of the
+            // bid alone.
+            | Self::SelfBuildBidValue(_)
+            | Self::SelfBuildBidSignature
+            | Self::BidBlockHashIsParent
+            // The asserts of `process_execution_payload_bid` that read the state: the
+            // builder, its funds, the slot, the latest block hash, the block root of the
+            // previous slot and the RANDAO mix. A proof only on the bid's own pre-state.
+            | Self::BidBuilderNotActive(_)
+            | Self::BidBuilderVersion { .. }
+            | Self::BidNotCovered { .. }
+            | Self::BidSlotMismatch { .. }
+            | Self::BidAtGenesisSlot
+            | Self::BidParentBlockHash { .. }
+            | Self::BidParentBlockRoot { .. }
+            | Self::BidPrevRandao { .. }
+            // The limit of the blob schedule of the network at the bid's epoch: a proof
+            // with the network config of the bid's chain.
+            | Self::BidBlobCommitments { .. } => true,
         }
     }
 }
@@ -669,8 +783,7 @@ pub fn state_root<E: Preset>(state: &mut BeaconState<E>) -> Result<Root, StfErro
 /// Do not use this function on real blocks yet. Block processing is ported only in part:
 /// [`per_block::process_block`] returns [`StfError::Unimplemented`] at its first step (the
 /// parent payload), so every block fails with an error that is not a proof of an invalid
-/// block. For the same reason, a block with a builder bid fails the signature sets with
-/// `Unimplemented`.
+/// block.
 ///
 /// Bound `block.slot` against the wall clock before the call. As in the spec, the slots
 /// are processed before the signature check, and `process_slots` has no upper bound: a
@@ -710,8 +823,10 @@ where
     let block = &signed_block.message;
     per_slot::process_slots(state, block.slot, bls)?;
     // One context for the block: the signature sets and the steps share the sync committee
-    // indices.
+    // indices. The bid step reads the blob limit of the network for the epoch of the block.
     let mut ctx = per_block::BlockContext::default();
+    let epoch = accessors::get_current_epoch(state);
+    ctx.set_max_blobs_per_block(epoch, bls.blob_schedule.max_blobs_per_block(epoch));
     if validate_result {
         per_block::check_block_header(state, block)?;
         signatures::verify_block_signatures_with(state, signed_block, bls, &mut ctx)?;
@@ -777,6 +892,27 @@ mod tests {
         let mut block = block_at_state_slot(&post);
         block.message.state_root = state_root(&mut post).unwrap();
         (state, block)
+    }
+
+    #[test]
+    fn block_context_has_the_blob_limit_of_the_network() {
+        // The context has the limit of the schedule for the epoch of the block (0), and no
+        // limit for another epoch.
+        let (mut state, block) = state_and_block();
+        let schedule = |epoch: Epoch| if epoch == 0 { 6 } else { 9 };
+        let bls = BlsContext {
+            blob_schedule: &schedule,
+            ..no_bls()
+        };
+        let mut seen = Vec::new();
+        let read = |_: &mut BeaconState<Minimal>,
+                    _: &BeaconBlock<Minimal>,
+                    ctx: &mut per_block::BlockContext| {
+            seen = vec![ctx.max_blobs_per_block(0), ctx.max_blobs_per_block(1)];
+            Ok(())
+        };
+        assert_eq!(apply_block(&mut state, &block, false, &bls, read), Ok(()));
+        assert_eq!(seen, vec![Ok(6), Err(StfError::UnknownBlobLimit(1))]);
     }
 
     #[test]
@@ -1009,7 +1145,7 @@ mod tests {
 
     /// The number of [`StfError`] variants: one more than the largest [`variant_id`].
     /// Increase `VARIANTS` when you add an id.
-    const VARIANTS: usize = 62;
+    const VARIANTS: usize = 75;
 
     /// A distinct id for each variant. The match has no `_` arm, so a new variant does not
     /// compile until it gets an id here, and then the table test fails until it has an entry.
@@ -1077,6 +1213,19 @@ mod tests {
             StfError::InvalidOperationSignature => 59,
             StfError::PriorWithdrawalsPastLimit { .. } => 60,
             StfError::StateArithmetic { .. } => 61,
+            StfError::SelfBuildBidValue(_) => 62,
+            StfError::SelfBuildBidSignature => 63,
+            StfError::BidBuilderNotActive(_) => 64,
+            StfError::BidBuilderVersion { .. } => 65,
+            StfError::BidNotCovered { .. } => 66,
+            StfError::BidBlobCommitments { .. } => 67,
+            StfError::BidSlotMismatch { .. } => 68,
+            StfError::BidAtGenesisSlot => 69,
+            StfError::BidParentBlockHash { .. } => 70,
+            StfError::BidBlockHashIsParent => 71,
+            StfError::BidParentBlockRoot { .. } => 72,
+            StfError::BidPrevRandao { .. } => 73,
+            StfError::UnknownBlobLimit(_) => 74,
         }
     }
 
@@ -1300,6 +1449,49 @@ mod tests {
                 },
                 false,
             ),
+            (StfError::SelfBuildBidValue(1), true),
+            (StfError::SelfBuildBidSignature, true),
+            (StfError::BidBuilderNotActive(1), true),
+            (
+                StfError::BidBuilderVersion {
+                    index: 1,
+                    version: 1,
+                },
+                true,
+            ),
+            (
+                StfError::BidNotCovered {
+                    index: 1,
+                    amount: 2,
+                },
+                true,
+            ),
+            (StfError::BidBlobCommitments { count: 10, max: 9 }, true),
+            (StfError::BidSlotMismatch { bid: 1, state: 2 }, true),
+            (StfError::BidAtGenesisSlot, true),
+            (
+                StfError::BidParentBlockHash {
+                    bid: Root::repeat_byte(1),
+                    expected: Root::repeat_byte(2),
+                },
+                true,
+            ),
+            (StfError::BidBlockHashIsParent, true),
+            (
+                StfError::BidParentBlockRoot {
+                    bid: Root::repeat_byte(1),
+                    expected: Root::repeat_byte(2),
+                },
+                true,
+            ),
+            (
+                StfError::BidPrevRandao {
+                    bid: Bytes32::repeat_byte(1),
+                    expected: Bytes32::repeat_byte(2),
+                },
+                true,
+            ),
+            (StfError::UnknownBlobLimit(1), false),
         ];
         let mut ids: Vec<usize> = cases.iter().map(|(e, _)| variant_id(e)).collect();
         ids.sort_unstable();

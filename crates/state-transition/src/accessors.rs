@@ -4,7 +4,7 @@ use crate::caches::committee::{compute_shuffled_index, CommitteeCache};
 use crate::preset::{
     BASE_REWARD_FACTOR, BUILDER_INDEX_FLAG, BUILDER_WITHDRAWAL_PREFIX,
     COMPOUNDING_WITHDRAWAL_PREFIX, EFFECTIVE_BALANCE_INCREMENT, ETH1_ADDRESS_WITHDRAWAL_PREFIX,
-    MAX_EFFECTIVE_BALANCE_ELECTRA, MAX_SEED_LOOKAHEAD, MIN_SEED_LOOKAHEAD,
+    MAX_EFFECTIVE_BALANCE_ELECTRA, MAX_SEED_LOOKAHEAD, MIN_DEPOSIT_AMOUNT, MIN_SEED_LOOKAHEAD,
 };
 use crate::{Preset, StfError};
 use consensus_types::common::Validator;
@@ -557,6 +557,63 @@ pub fn get_pending_balance_to_withdraw_for_builder<E: Preset>(
         .ok_or(StfError::ArithmeticOverflow)
 }
 
+/// `can_builder_cover_bid` (G L1184-1192, New in Gloas): the balance of the builder, less
+/// `MIN_DEPOSIT_AMOUNT` and its pending withdrawals and payments, is at least `bid_amount`.
+pub fn can_builder_cover_bid<E: Preset>(
+    state: &BeaconState<E>,
+    builder_index: BuilderIndex,
+    bid_amount: Gwei,
+) -> Result<bool, StfError> {
+    let builder_balance = state
+        .builders
+        .get(builder_index as usize)
+        .ok_or(StfError::UnknownBuilder(builder_index))?
+        .balance;
+    let pending_withdrawals_amount =
+        get_pending_balance_to_withdraw_for_builder(state, builder_index)?;
+    let min_balance = MIN_DEPOSIT_AMOUNT
+        .checked_add(pending_withdrawals_amount)
+        .ok_or(StfError::ArithmeticOverflow)?;
+    if builder_balance < min_balance {
+        return Ok(false);
+    }
+    Ok(builder_balance - min_balance >= bid_amount)
+}
+
+/// The key version of the builder at `builder_index`: the `version` of its
+/// [`SignerRef::Builder`](crate::SignerRef::Builder). It is the first 8 bytes of
+/// `sha256(state.builders[builder_index].pubkey)`, little-endian. Not in the spec.
+///
+/// The value comes from `state` only, so the pure transition needs no other input. A
+/// verifier that caches builder keys uses `(index, version)` as the cache key.
+///
+/// The beta.4 `Builder` container (G L660-666) has no field that tells two builders at a
+/// reused index apart on every branch:
+///
+/// - `Builder.version` is `PAYLOAD_BUILDER_VERSION` for each builder that
+///   `add_builder_to_registry` writes, so it does not change with an index reuse.
+/// - `deposit_epoch` changes with an index reuse, but two branches before finality can each
+///   reuse an index in the same epoch with different keys.
+///
+/// Thus the key version follows the key. It changes when a new key takes the index, on
+/// any branch, and it stays the same while the key stays the same. The other fields of the
+/// builder (balance, exit, `Builder.version`) do not change it. Two keys give the same
+/// version only for a 64-bit collision of sha256. A verifier that must exclude that case
+/// compares its cached key with `state.builders[index].pubkey`.
+pub fn builder_key_version<E: Preset>(
+    state: &BeaconState<E>,
+    builder_index: BuilderIndex,
+) -> Result<u64, StfError> {
+    let builder = state
+        .builders
+        .get(builder_index as usize)
+        .ok_or(StfError::UnknownBuilder(builder_index))?;
+    let digest = hash(&[&builder.pubkey]);
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&digest[..8]);
+    Ok(bytes_to_uint64(&prefix))
+}
+
 /// `has_eth1_withdrawal_credential` (C L313-317): the 0x01 prefix.
 pub fn has_eth1_withdrawal_credential(validator: &Validator) -> bool {
     validator.withdrawal_credentials[0] == ETH1_ADDRESS_WITHDRAWAL_PREFIX
@@ -958,6 +1015,71 @@ mod tests {
         assert_eq!(
             get_pending_balance_to_withdraw_for_builder(&state, 1),
             Err(StfError::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn builder_covers_a_bid_above_the_minimum_and_the_pending_amount() {
+        let mut state = registry_state::<Minimal>(&[32 * ETH; 4], Bytes32::ZERO);
+        state
+            .builders
+            .push(builder_at(0, FAR_FUTURE_EPOCH))
+            .unwrap();
+        // 5 ETH less MIN_DEPOSIT_AMOUNT (1 ETH) is 4 ETH free for a bid.
+        assert_eq!(can_builder_cover_bid(&state, 0, 4 * ETH), Ok(true));
+        assert_eq!(can_builder_cover_bid(&state, 0, 4 * ETH + 1), Ok(false));
+        // A pending withdrawal or payment of the builder makes the free amount smaller.
+        state
+            .builder_pending_withdrawals
+            .push(BuilderPendingWithdrawal {
+                fee_recipient: Address::repeat_byte(0xfe),
+                amount: ETH,
+                builder_index: 0,
+            })
+            .unwrap();
+        assert_eq!(can_builder_cover_bid(&state, 0, 3 * ETH), Ok(true));
+        assert_eq!(can_builder_cover_bid(&state, 0, 3 * ETH + 1), Ok(false));
+        // A balance under the minimum covers no bid, not even a bid of 0.
+        state.builders.get_mut(0).unwrap().balance = 2 * ETH - 1;
+        assert_eq!(can_builder_cover_bid(&state, 0, 0), Ok(false));
+        state.builders.get_mut(0).unwrap().balance = 2 * ETH;
+        assert_eq!(can_builder_cover_bid(&state, 0, 0), Ok(true));
+        assert_eq!(
+            can_builder_cover_bid(&state, 1, 0),
+            Err(StfError::UnknownBuilder(1))
+        );
+        // A minimum past `u64::MAX` is a `Uint64` overflow.
+        state.builder_pending_withdrawals.get_mut(0).unwrap().amount = u64::MAX;
+        assert_eq!(
+            can_builder_cover_bid(&state, 0, 0),
+            Err(StfError::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn builder_key_version_changes_with_the_key_only() {
+        let mut state = registry_state::<Minimal>(&[32 * ETH; 4], Bytes32::ZERO);
+        state
+            .builders
+            .push(builder_at(0, FAR_FUTURE_EPOCH))
+            .unwrap();
+        // The first 8 bytes of sha256([0xb0] * 48), little-endian, from Python's hashlib.
+        // The digest starts with 1a163e8f938e9314.
+        let version = builder_key_version(&state, 0).unwrap();
+        assert_eq!(version, 0x1493_8e93_8f3e_161a);
+        // The other fields of the builder do not change the version.
+        let builder = state.builders.get_mut(0).unwrap();
+        builder.balance = 0;
+        builder.deposit_epoch = 7;
+        builder.withdrawable_epoch = 9;
+        builder.version = 1;
+        assert_eq!(builder_key_version(&state, 0), Ok(version));
+        // Another key at the same index gives another version.
+        state.builders.get_mut(0).unwrap().pubkey = [0xb1; 48];
+        assert_ne!(builder_key_version(&state, 0), Ok(version));
+        assert_eq!(
+            builder_key_version(&state, 1),
+            Err(StfError::UnknownBuilder(1))
         );
     }
 

@@ -1,6 +1,7 @@
 //! Test inputs: a Gloas genesis-like state with a given registry, empty blocks, builders
 //! and their requests, a scripted signature backend and a pubkey aggregator without BLS.
 
+use crate::accessors::{get_block_root_at_slot, get_current_epoch, get_randao_mix};
 use crate::caches::get_beacon_proposer_index;
 use crate::caches::{initialize_proposer_lookahead, initialize_ptc_window};
 use crate::per_block::builder::{process_builder_deposit_request, process_builder_exit_request};
@@ -12,7 +13,7 @@ use crate::{
 };
 use consensus_types::gloas::*;
 use consensus_types::primitives::{
-    Address, BLSPubkey, Bytes32, Epoch, Gwei, Root, Version, FAR_FUTURE_EPOCH,
+    Address, BLSPubkey, BuilderIndex, Bytes32, Epoch, Gwei, Root, Version, FAR_FUTURE_EPOCH,
 };
 use milhouse::{List, ProgressiveList, Vector};
 use ssz::BitVector;
@@ -369,6 +370,37 @@ pub(crate) fn index_reuse_states<E: Preset>() -> (BeaconState<E>, BeaconState<E>
     (exited, state)
 }
 
+/// A bid of `value` by `builder_index` for `state.slot` that the asserts of
+/// `process_execution_payload_bid` on the bid fields accept on `state` (`state.slot > 0`):
+/// the latest block hash of the state as the parent block hash, the block hash
+/// `[0xbb; 32]`, the block root of the previous slot and the RANDAO mix of the current
+/// epoch, with no blob commitment. A self-build bid has the infinity signature, and any
+/// other bid the signature `[0x33; 96]`.
+pub(crate) fn bid_for_state<E: Preset>(
+    state: &BeaconState<E>,
+    builder_index: BuilderIndex,
+    value: Gwei,
+) -> SignedExecutionPayloadBid<E> {
+    let signature = if builder_index == BUILDER_INDEX_SELF_BUILD {
+        G2_POINT_AT_INFINITY
+    } else {
+        [0x33; 96]
+    };
+    SignedExecutionPayloadBid {
+        message: ExecutionPayloadBid {
+            parent_block_hash: state.latest_block_hash,
+            parent_block_root: get_block_root_at_slot(state, state.slot - 1).unwrap(),
+            block_hash: Root::repeat_byte(0xbb),
+            prev_randao: get_randao_mix(state, get_current_epoch(state)),
+            fee_recipient: Address::repeat_byte(0xfe),
+            builder_index,
+            value,
+            ..empty_bid(state.slot)
+        },
+        signature,
+    }
+}
+
 /// [`signed_block`] at `state.slot` by the proposer of the slot, whose parent is the latest
 /// block header: a block that `process_block_header` accepts on `state`.
 pub(crate) fn block_at_state_slot<E: Preset>(state: &BeaconState<E>) -> SignedBeaconBlock<E> {
@@ -398,6 +430,15 @@ impl PubkeyAggregator for XorAggregator {
     }
 }
 
+/// The blob limit of `configs/minimal.yaml` in each epoch: its `BLOB_SCHEDULE` is empty
+/// (L239), so `get_blob_parameters` gives `MAX_BLOBS_PER_BLOCK_ELECTRA` (L201).
+pub(crate) const MINIMAL_MAX_BLOBS_PER_BLOCK: u64 = 9;
+
+/// The blob schedule of `configs/minimal.yaml`: [`MINIMAL_MAX_BLOBS_PER_BLOCK`] in each epoch.
+fn minimal_blob_schedule(_: Epoch) -> u64 {
+    MINIMAL_MAX_BLOBS_PER_BLOCK
+}
+
 /// A [`BlsContext`] of the minimal config with `backend` and the [`XorAggregator`].
 pub(crate) fn bls_context(backend: &dyn SignatureBackend) -> BlsContext<'_> {
     BlsContext {
@@ -405,6 +446,7 @@ pub(crate) fn bls_context(backend: &dyn SignatureBackend) -> BlsContext<'_> {
         aggregator: &XorAggregator,
         genesis_fork_version: GENESIS_FORK_VERSION,
         capella_fork_version: CAPELLA_FORK_VERSION,
+        blob_schedule: &minimal_blob_schedule,
     }
 }
 

@@ -10,19 +10,19 @@
 //!   `False` for it.
 //! - [`BlsOff`] finds every set valid, as the spec does with BLS off (`bls_setting: 2`).
 //! - [`BlsAggregator`] is `eth_aggregate_pubkeys` for the next sync committee.
-//! - [`bls_context`] puts a backend, the aggregator and the `GENESIS_FORK_VERSION` of the
-//!   preset config in one [`BlsContext`].
+//! - [`bls_context`] puts a backend, the aggregator, and the `GENESIS_FORK_VERSION`, the
+//!   `CAPELLA_FORK_VERSION` and the blob schedule of the preset config in one [`BlsContext`].
 //! - [`bls_setting`] reads `bls_setting` from the `meta.yaml` of a case.
 
 use crate::coverage::Reads;
 use crate::fixture;
 use crate::plan::Case;
 use consensus_types::gloas::BeaconState;
-use consensus_types::primitives::{BLSPubkey, Version};
+use consensus_types::primitives::{BLSPubkey, Epoch, Version};
 use crypto_bls::{eth_aggregate_pubkeys, eth_fast_aggregate_verify, verify, PublicKey, Signature};
 use state_transition::{
-    AggregationError, BackendError, BlsContext, Preset, PubkeyAggregator, SignatureBackend,
-    SignatureSet, SignerRef,
+    AggregationError, BackendError, BlobSchedule, BlsContext, Preset, PubkeyAggregator,
+    SignatureBackend, SignatureSet, SignerRef,
 };
 use yaml_rust2::Yaml;
 
@@ -137,8 +137,39 @@ pub fn capella_fork_version(preset: &str) -> Result<Version, String> {
     }
 }
 
+/// `MAX_BLOBS_PER_BLOCK_ELECTRA` of `configs/minimal.yaml` (L201) and
+/// `configs/mainnet.yaml` (L204) at v1.7.0-beta.4: the limit before the first
+/// `BLOB_SCHEDULE` entry.
+const MAX_BLOBS_PER_BLOCK_ELECTRA: u64 = 9;
+
+/// `get_blob_parameters(epoch).max_blobs_per_block` (`fulu/beacon-chain.md` L293-300) of
+/// `configs/minimal.yaml`: its `BLOB_SCHEDULE` is empty (L239).
+fn minimal_max_blobs_per_block(_: Epoch) -> u64 {
+    MAX_BLOBS_PER_BLOCK_ELECTRA
+}
+
+/// `get_blob_parameters(epoch).max_blobs_per_block` of `configs/mainnet.yaml`: the
+/// `BLOB_SCHEDULE` (L242-246) has 15 blobs from epoch 412672 and 21 from epoch 419072.
+fn mainnet_max_blobs_per_block(epoch: Epoch) -> u64 {
+    match epoch {
+        419_072.. => 21,
+        412_672.. => 15,
+        _ => MAX_BLOBS_PER_BLOCK_ELECTRA,
+    }
+}
+
+/// The blob schedule of the spec config of `preset`, the config of the vectors.
+pub fn blob_schedule(preset: &str) -> Result<&'static dyn BlobSchedule, String> {
+    match preset {
+        "minimal" => Ok(&minimal_max_blobs_per_block),
+        "mainnet" => Ok(&mainnet_max_blobs_per_block),
+        other => Err(format!("no BLOB_SCHEDULE for preset {other}")),
+    }
+}
+
 /// The context of the vectors of `preset`: `backend`, [`BlsAggregator`], and the
-/// [`genesis_fork_version`] and the [`capella_fork_version`] of the preset.
+/// [`genesis_fork_version`], the [`capella_fork_version`] and the [`blob_schedule`] of the
+/// preset.
 pub fn bls_context<'a>(
     preset: &str,
     backend: &'a dyn SignatureBackend,
@@ -148,6 +179,7 @@ pub fn bls_context<'a>(
         aggregator: &BlsAggregator,
         genesis_fork_version: genesis_fork_version(preset)?,
         capella_fork_version: capella_fork_version(preset)?,
+        blob_schedule: blob_schedule(preset)?,
     })
 }
 
@@ -297,6 +329,21 @@ mod tests {
             ([0, 0, 0, 0], [3, 0, 0, 0])
         );
         assert!(bls_context("general", &keys).is_err());
+        // The blob schedules of configs/minimal.yaml and configs/mainnet.yaml.
+        let minimal = blob_schedule("minimal").unwrap();
+        assert_eq!(minimal.max_blobs_per_block(0), 9);
+        assert_eq!(minimal.max_blobs_per_block(u64::MAX), 9);
+        let mainnet = blob_schedule("mainnet").unwrap();
+        for (epoch, max) in [
+            (0, 9),
+            (412_671, 9),
+            (412_672, 15),
+            (419_071, 15),
+            (419_072, 21),
+        ] {
+            assert_eq!(mainnet.max_blobs_per_block(epoch), max, "{epoch}");
+        }
+        assert!(blob_schedule("general").is_err());
         // BLS off finds an invalid set valid, and `backend_for` selects it for setting 2.
         let garbage = SignatureSet::single(SignerRef::Inline([0x01; 48]), Root::ZERO, [0x01; 96]);
         let sets = std::slice::from_ref(&garbage);

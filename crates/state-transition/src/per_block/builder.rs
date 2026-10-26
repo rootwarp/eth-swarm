@@ -18,14 +18,15 @@
 //! new builder takes that index with a new key ([`get_index_for_new_builder`], G
 //! L2322-2331). A key that was in the registry can come back at another index.
 //!
-//! `SignerRef::Builder { index, version }` alone is not a safe key for a cache of builder
-//! keys after an index reuse. [`add_builder_to_registry`] writes `PAYLOAD_BUILDER_VERSION`
-//! as the `version` of each new builder, so the old and the new builder at a reused index
-//! have the same `SignerRef`. The `deposit_epoch` does not tell them apart either: before
-//! finality, two branches can each reuse an index in the same epoch with different keys.
-//! Thus a cache must compare its key with `state.builders[index].pubkey` of the state that
-//! it verifies against, or keep one entry for each branch. Entries for the finalized
-//! registry only are safe ([4.9], [4.10]).
+//! `Builder.version` and `deposit_epoch` do not tell the old and the new builder at a
+//! reused index apart on every branch. [`add_builder_to_registry`] writes
+//! `PAYLOAD_BUILDER_VERSION` as the `Builder.version` of each new builder. Before finality,
+//! two branches can each reuse an index in the same epoch with different keys. Thus the
+//! `version` of `SignerRef::Builder { index, version }` is
+//! [`crate::accessors::builder_key_version`], a digest of the key, which changes when a new
+//! key takes the index. A cache of builder keys uses `(index, version)` as its key, or
+//! compares its key with `state.builders[index].pubkey` of the state that it verifies
+//! against ([4.9], [4.10]).
 
 use crate::accessors::{
     get_current_epoch, get_pending_balance_to_withdraw_for_builder, is_active_builder,
@@ -235,6 +236,7 @@ pub fn process_builder_exit_request<E: Preset>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accessors::builder_key_version;
     use crate::preset::PAYLOAD_BUILDER_VERSION;
     use crate::testing::{
         builder, builder_deposit_request, builder_exit_request, index_reuse_states, registry_state,
@@ -293,13 +295,17 @@ mod tests {
                 exited.builders.get(1).unwrap().clone(),
             ]
         );
-        // No key version changes with the reuse: both builders have PAYLOAD_BUILDER_VERSION,
-        // so `SignerRef::Builder { index: 0, version }` is the same before and after it. Only
-        // the key and the deposit epoch differ.
+        // `Builder.version` does not change with the reuse: both builders have
+        // PAYLOAD_BUILDER_VERSION. Only the key and the deposit epoch differ, and the key
+        // version of `SignerRef::Builder` follows the key.
         let new = reused.builders.get(0).unwrap();
         assert_eq!(new.version, old.version);
         assert_ne!(new.pubkey, old.pubkey);
         assert_ne!(new.deposit_epoch, old.deposit_epoch);
+        assert_ne!(
+            builder_key_version(&reused, 0),
+            builder_key_version(&exited, 0)
+        );
 
         // The old key is not in the registry now: a deposit for it is a new registration,
         // which needs a valid signature and goes to the end of the registry.

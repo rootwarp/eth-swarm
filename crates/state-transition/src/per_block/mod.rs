@@ -2,15 +2,17 @@
 //!
 //! [`process_block`] runs the eight steps of [`block_steps`] in the order of the spec. The
 //! steps that are not ported yet return [`StfError::Unimplemented`] with the work that ports
-//! them: the parent payload (`4.6a`) and the bid (`4.5`).
+//! them: the parent payload (`4.6a`).
 //!
-//! The steps make no BLS check. The RANDAO reveal, the payload attestation signatures and
-//! the sync aggregate signature (and later the other operation signatures) go to the
-//! backend as sets, in the one batch of [`crate::signatures::block_signature_sets`], before
-//! the steps run. The checks that need no BLS stay in the steps, for example the infinity
-//! signature of an empty sync aggregate and the structure of a payload attestation.
+//! The steps make no BLS check. The RANDAO reveal, the bid signature of a builder, the
+//! operation signatures, the payload attestation signatures and the sync aggregate signature
+//! go to the backend as sets, in the one batch of
+//! [`crate::signatures::block_signature_sets`], before the steps run. The checks that need
+//! no BLS stay in the steps, for example the infinity signature of an empty sync aggregate,
+//! the self-build rules of a bid and the structure of a payload attestation.
 //!
 //! - [`attestation`] has the Gloas `process_attestation` and its helpers.
+//! - [`bid`] has `process_execution_payload_bid` and the [`bid::BlobSchedule`] seam.
 //! - [`builder`] has the builder deposit and exit requests.
 //! - [`exits`] has `process_voluntary_exit` and `process_bls_to_execution_change`.
 //! - [`header`] has `process_block_header`, `process_randao` and `process_eth1_data`.
@@ -23,6 +25,7 @@
 //! - [`withdrawals`] has the Gloas `process_withdrawals(state)` and the withdrawals sweep.
 
 pub mod attestation;
+pub mod bid;
 pub mod builder;
 pub mod exits;
 pub mod header;
@@ -34,6 +37,7 @@ pub mod sync_aggregate;
 pub mod withdrawals;
 
 pub use attestation::process_attestation;
+pub use bid::process_execution_payload_bid;
 pub use header::{check_block_header, process_block_header, process_eth1_data, process_randao};
 pub use operations::process_operations;
 pub use payload_attestation::process_payload_attestation;
@@ -41,7 +45,7 @@ pub use slashings::{process_attester_slashing, process_proposer_slashing};
 pub use sync_aggregate::process_sync_aggregate;
 pub use withdrawals::process_withdrawals;
 
-use crate::accessors::TotalActiveBalanceCache;
+use crate::accessors::{get_current_epoch, TotalActiveBalanceCache};
 use crate::caches::get_beacon_proposer_index;
 use crate::caches::CommitteeCache;
 use crate::{Preset, StfError};
@@ -85,6 +89,10 @@ pub enum BlockStep {
 ///   block: the attestation sets and `process_attestation` read them. The attestations of a
 ///   block are of the previous or the current epoch, so the context keeps at most two.
 /// - The total active balance, which the attestation rewards and `slash_validator` read.
+/// - The blob limit of the network for the epoch of the block, which the bid step reads
+///   ([`BlockContext::set_max_blobs_per_block`]). [`crate::state_transition`] sets it from
+///   [`crate::BlsContext::blob_schedule`]. A context without it fails the bid step with
+///   [`StfError::UnknownBlobLimit`], which is not a proof that the block is invalid.
 ///
 /// Use one context for one block on one state, and a new context for the next block. A
 /// committee cache of another state with another seed is not used:
@@ -96,6 +104,7 @@ pub struct BlockContext {
     sync_index_scans: usize,
     committee_caches: Vec<CommitteeCache>,
     total_active_balance: TotalActiveBalanceCache,
+    max_blobs_per_block: Option<(Epoch, u64)>,
 }
 
 /// The sync committee indices of a state, with the key of the state that they are for.
@@ -189,6 +198,21 @@ impl BlockContext {
     /// The total active balance cache of the block.
     pub fn total_active_balance(&mut self) -> &mut TotalActiveBalanceCache {
         &mut self.total_active_balance
+    }
+
+    /// Sets the blob limit of the network for `epoch`:
+    /// `get_blob_parameters(epoch).max_blobs_per_block` (Fu L293-300).
+    pub fn set_max_blobs_per_block(&mut self, epoch: Epoch, max_blobs_per_block: u64) {
+        self.max_blobs_per_block = Some((epoch, max_blobs_per_block));
+    }
+
+    /// The blob limit that [`Self::set_max_blobs_per_block`] set for `epoch`.
+    /// [`StfError::UnknownBlobLimit`] if it set none, or set it for another epoch.
+    pub fn max_blobs_per_block(&self, epoch: Epoch) -> Result<u64, StfError> {
+        match self.max_blobs_per_block {
+            Some((limit_epoch, max)) if limit_epoch == epoch => Ok(max),
+            _ => Err(StfError::UnknownBlobLimit(epoch)),
+        }
     }
 }
 
@@ -335,13 +359,19 @@ fn withdrawals_step<E: Preset>(
 }
 
 /// `process_execution_payload_bid(state, block.body.signed_execution_payload_bid)`
-/// (G L2162-2215, New in Gloas). Not ported yet.
+/// (G L2162-2215, New in Gloas), with the blob limit of `ctx` for the current epoch. The
+/// batch of the block checked the signature of a builder bid before the steps.
 fn execution_payload_bid_step<E: Preset>(
-    _: &mut BeaconState<E>,
-    _: &BeaconBlock<E>,
-    _: &mut BlockContext,
+    state: &mut BeaconState<E>,
+    block: &BeaconBlock<E>,
+    ctx: &mut BlockContext,
 ) -> Result<(), StfError> {
-    Err(StfError::Unimplemented("4.5"))
+    let max_blobs_per_block = ctx.max_blobs_per_block(get_current_epoch(state))?;
+    bid::process_execution_payload_bid(
+        state,
+        &block.body.signed_execution_payload_bid,
+        max_blobs_per_block,
+    )
 }
 
 fn randao_step<E: Preset>(
@@ -379,7 +409,7 @@ fn sync_aggregate_step<E: Preset>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{block_at_state_slot, genesis_state};
+    use crate::testing::{bid_for_state, block_at_state_slot, genesis_state};
     use crate::{per_slot, state_root};
     use consensus_types::Minimal;
 
@@ -484,24 +514,27 @@ mod tests {
     fn steps_call_their_spec_function() {
         let mut state = genesis_state::<Minimal>(&[32_000_000_000; 64]);
         per_slot::process_slots(&mut state, 1, &crate::testing::no_bls()).unwrap();
-        let block = block_at_state_slot(&state).message;
+        let mut block = block_at_state_slot(&state).message;
+        block.body.signed_execution_payload_bid =
+            bid_for_state(&state, crate::preset::BUILDER_INDEX_SELF_BUILD, 0);
         let steps = block_steps::<Minimal>();
         let step = |s: BlockStep| steps.iter().find(|(k, _)| *k == s).unwrap().1;
-        for (s, id) in [
-            (BlockStep::ParentExecutionPayload, "4.6a"),
-            (BlockStep::ExecutionPayloadBid, "4.5"),
-        ] {
-            assert_eq!(
-                step(s)(&mut state.clone(), &block, &mut BlockContext::default()),
-                Err(StfError::Unimplemented(id))
-            );
-        }
+        assert_eq!(
+            step(BlockStep::ParentExecutionPayload)(
+                &mut state.clone(),
+                &block,
+                &mut BlockContext::default()
+            ),
+            Err(StfError::Unimplemented("4.6a"))
+        );
         // The ported steps, in the spec order, apply the block to the state.
         let mut post = state.clone();
         let mut ctx = BlockContext::default();
+        ctx.set_max_blobs_per_block(0, crate::testing::MINIMAL_MAX_BLOBS_PER_BLOCK);
         for s in [
             BlockStep::BlockHeader,
             BlockStep::Withdrawals,
+            BlockStep::ExecutionPayloadBid,
             BlockStep::Randao,
             BlockStep::Eth1Data,
             BlockStep::Operations,
@@ -510,6 +543,10 @@ mod tests {
             assert_eq!(step(s)(&mut post, &block, &mut ctx), Ok(()), "{s:?}");
         }
         assert_eq!(post.latest_block_header.slot, 1);
+        assert_eq!(
+            post.latest_execution_payload_bid,
+            block.body.signed_execution_payload_bid.message
+        );
         assert_eq!(post.eth1_data_votes.len(), 1);
         assert_ne!(post.randao_mixes.get(0), state.randao_mixes.get(0));
         // The parent is FULL, and no validator can withdraw (0x00 credentials): the sweep
