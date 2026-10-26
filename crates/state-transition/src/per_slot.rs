@@ -115,7 +115,7 @@ mod tests {
         assert_eq!(process_slots(&mut state, 7), Ok(()));
         assert_eq!(
             process_slots(&mut state, 8),
-            Err(StfError::Unimplemented("4.2a/4.2b/4.6b"))
+            Err(StfError::Unimplemented("4.2b/4.6b"))
         );
     }
 

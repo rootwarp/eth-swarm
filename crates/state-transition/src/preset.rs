@@ -25,6 +25,26 @@ pub const MIN_VALIDATOR_WITHDRAWABILITY_DELAY: Epoch = 256;
 pub const PROPOSER_WEIGHT: u64 = 8;
 /// `WEIGHT_DENOMINATOR` (A "Incentivization weights", a constant).
 pub const WEIGHT_DENOMINATOR: u64 = 64;
+/// `BASE_REWARD_FACTOR` (`presets/*/phase0.yaml`, 64 in both presets).
+pub const BASE_REWARD_FACTOR: u64 = 64;
+/// `TIMELY_SOURCE_FLAG_INDEX` (A L131).
+pub const TIMELY_SOURCE_FLAG_INDEX: usize = 0;
+/// `TIMELY_TARGET_FLAG_INDEX` (A L132).
+pub const TIMELY_TARGET_FLAG_INDEX: usize = 1;
+/// `TIMELY_HEAD_FLAG_INDEX` (A L133).
+pub const TIMELY_HEAD_FLAG_INDEX: usize = 2;
+/// `PARTICIPATION_FLAG_WEIGHTS` (A L160): the source, target and head weights (A L139-141).
+pub const PARTICIPATION_FLAG_WEIGHTS: [u64; 3] = [14, 26, 14];
+/// `GENESIS_EPOCH` (P0 "Misc").
+pub const GENESIS_EPOCH: Epoch = 0;
+/// `MIN_EPOCHS_TO_INACTIVITY_PENALTY` (`presets/*/phase0.yaml`, 4 in both presets).
+pub const MIN_EPOCHS_TO_INACTIVITY_PENALTY: Epoch = 4;
+/// `INACTIVITY_PENALTY_QUOTIENT_BELLATRIX` (`presets/*/bellatrix.yaml`, 2**24 in both).
+pub const INACTIVITY_PENALTY_QUOTIENT_BELLATRIX: u64 = 1 << 24;
+/// `INACTIVITY_SCORE_BIAS` (`configs/{minimal,mainnet}.yaml`, 4 in both).
+pub const INACTIVITY_SCORE_BIAS: u64 = 4;
+/// `INACTIVITY_SCORE_RECOVERY_RATE` (`configs/{minimal,mainnet}.yaml`, 16 in both).
+pub const INACTIVITY_SCORE_RECOVERY_RATE: u64 = 16;
 
 /// The preset values of the state transition, on top of the SSZ lengths of [`EthSpec`].
 ///

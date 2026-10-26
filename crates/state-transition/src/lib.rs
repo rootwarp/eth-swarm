@@ -6,7 +6,7 @@
 //!
 //! - [`state_transition`]: the slot loop, the block signature, the block and the state root.
 //! - [`per_slot`]: `process_slots` and `process_slot`.
-//! - [`per_epoch`] and [`per_block`]: the epoch and block processing (stubs for now).
+//! - [`per_epoch`] and [`per_block`]: the epoch and block processing (partly ported).
 //! - [`accessors`]: the beacon-state accessors and the misc helpers.
 //! - [`caches`]: shuffling, beacon committees, proposer and PTC selection.
 //! - [`mutators`]: the balance helpers, the exit and consolidation churn, validator and
@@ -14,8 +14,8 @@
 //! - [`signatures`]: the [`SignatureBackend`] seam and the block signature set.
 //!
 //! Each ported function cites its spec file and line range at the pin. File prefixes: P0
-//! `phase0/beacon-chain.md`, A `altair/beacon-chain.md`, E `electra/beacon-chain.md`, Fu
-//! `fulu/beacon-chain.md`, G `gloas/beacon-chain.md`.
+//! `phase0/beacon-chain.md`, A `altair/beacon-chain.md`, Bx `bellatrix/beacon-chain.md`, E
+//! `electra/beacon-chain.md`, Fu `fulu/beacon-chain.md`, G `gloas/beacon-chain.md`.
 //!
 //! milhouse trees panic in `tree_hash_root` while they hold pending updates, so every root
 //! of a state goes through [`state_root`], which flushes them first.
@@ -79,6 +79,40 @@ pub enum StfError {
     /// `state.validators[index]` is out of range.
     #[error("validator index {0} is out of range")]
     UnknownValidator(ValidatorIndex),
+    /// An index past the end of a state list or a spec table, for example `balances`,
+    /// `inactivity_scores`, the participation flags or `PARTICIPATION_FLAG_WEIGHTS`.
+    ///
+    /// A state that the transition makes keeps these lists as long as the registry, and the
+    /// flag index comes from the code. Thus this error shows a bug in our state or in the
+    /// caller, never a proof that the input object is invalid.
+    #[error("index {index} is out of range of {list}")]
+    ListIndexOutOfRange {
+        /// The name of the list.
+        list: &'static str,
+        /// The index.
+        index: u64,
+    },
+    /// `get_block_root_at_slot` asserts `slot < state.slot <= slot + SLOTS_PER_HISTORICAL_ROOT`.
+    ///
+    /// As [`StfError::EpochOutOfWindow`], this proves that the input is invalid only when
+    /// the state is the object's own pre-state, advanced to the object's slot.
+    #[error("block root of slot {slot} is out of the history of state slot {state_slot}")]
+    BlockRootOutOfRange {
+        /// The requested slot.
+        slot: Slot,
+        /// `state.slot`.
+        state_slot: Slot,
+    },
+    /// `get_unslashed_participating_indices` asserts that `epoch` is the previous or the
+    /// current epoch of the state. The spec calls it only with those two epochs, so this is
+    /// a caller error, never a proof that the input is invalid.
+    #[error("participation of epoch {epoch} is not kept by a state of epoch {state_epoch}")]
+    ParticipationEpochOutOfRange {
+        /// The requested epoch.
+        epoch: Epoch,
+        /// `get_current_epoch(state)`.
+        state_epoch: Epoch,
+    },
     /// `compute_shuffled_index` asserts `index < index_count`.
     #[error("shuffle index {index} is out of range of {index_count}")]
     ShuffleIndexOutOfRange {
@@ -158,14 +192,17 @@ pub enum StfError {
 impl StfError {
     /// Whether the error proves that the input is invalid by the spec (REJECT). It does not
     /// for a step that is not ported yet, a backend without a verdict, a committee cache of
-    /// another epoch or seed, or a failure of the state trees: callers IGNORE those, never
-    /// REJECT.
+    /// another epoch or seed, a failure of the state trees, a state list shorter than the
+    /// registry or a code index past a spec table (`ListIndexOutOfRange`), or a participation
+    /// epoch other than the previous and the current one (`ParticipationEpochOutOfRange`):
+    /// callers IGNORE those, never REJECT.
     ///
     /// [`StfError::StateRootMismatch`] from [`state_transition`] is not a proof yet either.
     /// Block processing is not ported, so a valid block with a body fails with that error.
     /// Remove this paragraph when block processing lands.
     ///
-    /// [`StfError::EpochOutOfWindow`] is a proof only when the state is the object's own
+    /// [`StfError::EpochOutOfWindow`] and [`StfError::BlockRootOutOfRange`] are a proof only
+    /// when the state is the object's own
     /// pre-state, advanced to the object's slot. A caller that uses another state (for
     /// example a head state behind the slot of a gossip message) must map it to IGNORE.
     ///
@@ -176,7 +213,13 @@ impl StfError {
             | Self::SignatureBackend(_)
             | Self::CacheEpochMismatch { .. }
             | Self::CacheSeedMismatch { .. }
-            | Self::Tree(_) => false,
+            | Self::Tree(_)
+            // A state list shorter than the registry, or a flag index past the table: our
+            // own state or code is wrong, and the object did not cause it.
+            | Self::ListIndexOutOfRange { .. }
+            // The spec reads participation only for the previous and the current epoch,
+            // so another epoch is a caller error.
+            | Self::ParticipationEpochOutOfRange { .. } => false,
             Self::SlotNotLater { .. }
             | Self::InvalidBlockSignature
             | Self::StateRootMismatch { .. }
@@ -187,6 +230,9 @@ impl StfError {
             | Self::UnknownCommittee { .. }
             | Self::BitOutOfRange { .. }
             | Self::EpochOutOfWindow { .. }
+            // The `assert` of `get_block_root_at_slot`: a spec error on the object's own
+            // pre-state, as for `EpochOutOfWindow`.
+            | Self::BlockRootOutOfRange { .. }
             // An out-of-range access of `state.builders`, a spec error.
             | Self::UnknownBuilder(_)
             // The `assert` of `settle_builder_payment` on the length of
@@ -396,7 +442,7 @@ mod tests {
 
     /// The number of [`StfError`] variants: one more than the largest [`variant_id`].
     /// Increase `VARIANTS` when you add an id.
-    const VARIANTS: usize = 17;
+    const VARIANTS: usize = 20;
 
     /// A distinct id for each variant. The match has no `_` arm, so a new variant does not
     /// compile until it gets an id here, and then the table test fails until it has an entry.
@@ -419,6 +465,9 @@ mod tests {
             StfError::CacheSeedMismatch { .. } => 14,
             StfError::UnknownBuilder(_) => 15,
             StfError::PaymentIndexOutOfRange { .. } => 16,
+            StfError::ListIndexOutOfRange { .. } => 17,
+            StfError::BlockRootOutOfRange { .. } => 18,
+            StfError::ParticipationEpochOutOfRange { .. } => 19,
         }
     }
 
@@ -485,6 +534,27 @@ mod tests {
             (
                 StfError::PaymentIndexOutOfRange { index: 16, len: 16 },
                 true,
+            ),
+            (
+                StfError::ListIndexOutOfRange {
+                    list: "balances",
+                    index: 3,
+                },
+                false,
+            ),
+            (
+                StfError::BlockRootOutOfRange {
+                    slot: 9,
+                    state_slot: 9,
+                },
+                true,
+            ),
+            (
+                StfError::ParticipationEpochOutOfRange {
+                    epoch: 1,
+                    state_epoch: 3,
+                },
+                false,
             ),
         ];
         let mut ids: Vec<usize> = cases.iter().map(|(e, _)| variant_id(e)).collect();

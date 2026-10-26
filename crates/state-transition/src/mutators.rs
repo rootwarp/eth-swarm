@@ -31,10 +31,7 @@ pub fn increase_balance<E: Preset>(
     index: ValidatorIndex,
     delta: Gwei,
 ) -> Result<(), StfError> {
-    let balance = state
-        .balances
-        .get_mut(index as usize)
-        .ok_or(StfError::UnknownValidator(index))?;
+    let balance = balance_mut(state, index)?;
     *balance = balance
         .checked_add(delta)
         .ok_or(StfError::ArithmeticOverflow)?;
@@ -47,12 +44,28 @@ pub fn decrease_balance<E: Preset>(
     index: ValidatorIndex,
     delta: Gwei,
 ) -> Result<(), StfError> {
-    let balance = state
-        .balances
-        .get_mut(index as usize)
-        .ok_or(StfError::UnknownValidator(index))?;
+    let balance = balance_mut(state, index)?;
     *balance = balance.saturating_sub(delta);
     Ok(())
+}
+
+/// `state.balances[index]`. An index past the registry is the error of the object that
+/// names it (`UnknownValidator`). An index inside the registry but past `balances` means
+/// that our own state is bad, so it is not a proof (`ListIndexOutOfRange`).
+fn balance_mut<E: Preset>(
+    state: &mut BeaconState<E>,
+    index: ValidatorIndex,
+) -> Result<&mut Gwei, StfError> {
+    if index >= state.validators.len() as u64 {
+        return Err(StfError::UnknownValidator(index));
+    }
+    state
+        .balances
+        .get_mut(index as usize)
+        .ok_or(StfError::ListIndexOutOfRange {
+            list: "balances",
+            index,
+        })
 }
 
 /// The queue of exits or of consolidations: its earliest epoch, and the balance that is
@@ -781,7 +794,8 @@ mod tests {
             ),
             Err(StfError::ArithmeticOverflow)
         );
-        // The balance helpers check the index.
+        // The balance helpers check the index: past the registry it is the object's
+        // error, past a `balances` list that is shorter than the registry it is ours.
         assert_eq!(
             increase_balance(&mut state, 8, 1),
             Err(StfError::UnknownValidator(8))
@@ -790,6 +804,21 @@ mod tests {
             decrease_balance(&mut state, 8, 1),
             Err(StfError::UnknownValidator(8))
         );
+        let mut short = state.clone();
+        short.balances = milhouse::ProgressiveList::try_from_iter([32 * ETH; 7]).unwrap();
+        let past_balances = StfError::ListIndexOutOfRange {
+            list: "balances",
+            index: 7,
+        };
+        assert_eq!(
+            increase_balance(&mut short, 7, 1),
+            Err(past_balances.clone())
+        );
+        assert_eq!(
+            decrease_balance(&mut short, 7, 1),
+            Err(past_balances.clone())
+        );
+        assert!(!past_balances.proves_invalid());
         // A full milhouse list is a limit of the implementation, not of the spec.
         let full = StfError::from(milhouse::Error::ListFull { len: usize::MAX });
         assert!(matches!(full, StfError::Tree(_)) && !full.proves_invalid());

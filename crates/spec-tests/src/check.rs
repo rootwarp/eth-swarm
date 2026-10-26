@@ -1,5 +1,8 @@
-//! The SSZ round-trip check shared by both vector sets.
+//! The SSZ round-trip check shared by both vector sets, and the field diff of two Gloas
+//! beacon states for a post-state mismatch.
 
+use consensus_types::gloas::BeaconState;
+use consensus_types::EthSpec;
 use ssz::{Decode, Encode};
 use tree_hash::TreeHash;
 
@@ -45,6 +48,77 @@ pub fn round_trip<T: Encode + Decode + TreeHash>(
             Ok(())
         }
     }
+}
+
+/// The top-level fields of `got` whose `hash_tree_root` differs from the same field of
+/// `want`, in container order. Both states must hold no pending tree updates, because
+/// `tree_hash_root` panics on a milhouse tree with pending updates.
+pub fn state_field_diff<E: EthSpec>(
+    got: &BeaconState<E>,
+    want: &BeaconState<E>,
+) -> Vec<&'static str> {
+    macro_rules! diff {
+        ($($field:ident),* $(,)?) => {{
+            // The pattern names every field, so a new container field does not compile
+            // until it is listed here.
+            let BeaconState { $($field: _),* } = got;
+            let mut differ = Vec::new();
+            $(
+                if got.$field.tree_hash_root() != want.$field.tree_hash_root() {
+                    differ.push(stringify!($field));
+                }
+            )*
+            differ
+        }};
+    }
+    diff!(
+        genesis_time,
+        genesis_validators_root,
+        slot,
+        fork,
+        latest_block_header,
+        block_roots,
+        state_roots,
+        historical_roots,
+        eth1_data,
+        eth1_data_votes,
+        eth1_deposit_index,
+        validators,
+        balances,
+        randao_mixes,
+        slashings,
+        previous_epoch_participation,
+        current_epoch_participation,
+        justification_bits,
+        previous_justified_checkpoint,
+        current_justified_checkpoint,
+        finalized_checkpoint,
+        inactivity_scores,
+        current_sync_committee,
+        next_sync_committee,
+        latest_block_hash,
+        next_withdrawal_index,
+        next_withdrawal_validator_index,
+        historical_summaries,
+        deposit_requests_start_index,
+        deposit_balance_to_consume,
+        exit_balance_to_consume,
+        earliest_exit_epoch,
+        consolidation_balance_to_consume,
+        earliest_consolidation_epoch,
+        pending_deposits,
+        pending_partial_withdrawals,
+        pending_consolidations,
+        proposer_lookahead,
+        builders,
+        next_withdrawal_builder_index,
+        execution_payload_availability,
+        builder_pending_payments,
+        builder_pending_withdrawals,
+        latest_execution_payload_bid,
+        payload_expected_withdrawals,
+        ptc_window,
+    )
 }
 
 /// Parses a `0x`-prefixed hex string.

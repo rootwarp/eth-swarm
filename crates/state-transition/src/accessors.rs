@@ -2,14 +2,15 @@
 
 use crate::caches::committee::{compute_shuffled_index, CommitteeCache};
 use crate::preset::{
-    EFFECTIVE_BALANCE_INCREMENT, MAX_EFFECTIVE_BALANCE_ELECTRA, MAX_SEED_LOOKAHEAD,
-    MIN_SEED_LOOKAHEAD,
+    BASE_REWARD_FACTOR, EFFECTIVE_BALANCE_INCREMENT, MAX_EFFECTIVE_BALANCE_ELECTRA,
+    MAX_SEED_LOOKAHEAD, MIN_SEED_LOOKAHEAD,
 };
 use crate::{Preset, StfError};
 use consensus_types::common::Validator;
 use consensus_types::gloas::{Attestation, BeaconState};
 use consensus_types::primitives::{
-    Bytes32, CommitteeIndex, Domain, DomainType, Epoch, Gwei, Root, ValidatorIndex,
+    Bytes32, CommitteeIndex, Domain, DomainType, Epoch, Gwei, ParticipationFlags, Root, Slot,
+    ValidatorIndex,
 };
 use consensus_types::signing::{compute_domain, DOMAIN_BEACON_ATTESTER, DOMAIN_SYNC_COMMITTEE};
 use ethereum_hashing::{Context, Sha256Context};
@@ -391,6 +392,106 @@ pub fn get_consolidation_churn_limit<E: Preset>(
     Ok(consolidation_churn_limit::<E>(cache.get(state)?))
 }
 
+/// `integer_squareroot` (P0 L989-1000). `u64::isqrt(u64::MAX)` is `UINT64_MAX_SQRT`, as in
+/// the spec.
+pub fn integer_squareroot(n: u64) -> u64 {
+    n.isqrt()
+}
+
+/// `has_flag` (A L290-295). A `flag_index` of 8 or more fails, as the spec raises on
+/// `ParticipationFlags(2**flag_index)`. The flag index comes from the code, so that error
+/// is a caller error.
+pub fn has_flag(flags: ParticipationFlags, flag_index: usize) -> Result<bool, StfError> {
+    let flag = u32::try_from(flag_index)
+        .ok()
+        .and_then(|i| 1u8.checked_shl(i))
+        .ok_or(StfError::ListIndexOutOfRange {
+            list: "ParticipationFlags",
+            index: flag_index as u64,
+        })?;
+    Ok(flags & flag == flag)
+}
+
+/// `get_previous_epoch` (P0 L1428-1432).
+pub fn get_previous_epoch<E: Preset>(state: &BeaconState<E>) -> Epoch {
+    get_current_epoch(state).saturating_sub(1)
+}
+
+/// `get_block_root_at_slot` (P0 L1448-1453).
+pub fn get_block_root_at_slot<E: Preset>(
+    state: &BeaconState<E>,
+    slot: Slot,
+) -> Result<Root, StfError> {
+    let history = E::SlotsPerHistoricalRoot::to_u64();
+    let out_of_range = || StfError::BlockRootOutOfRange {
+        slot,
+        state_slot: state.slot,
+    };
+    // `assert slot < state.slot <= slot + SLOTS_PER_HISTORICAL_ROOT`. Python evaluates the
+    // sum only when `slot < state.slot`, and a `Uint64` sum past 2**64 - 1 raises.
+    if slot >= state.slot {
+        return Err(out_of_range());
+    }
+    let newest = slot
+        .checked_add(history)
+        .ok_or(StfError::ArithmeticOverflow)?;
+    if state.slot > newest {
+        return Err(out_of_range());
+    }
+    state
+        .block_roots
+        .get((slot % history) as usize)
+        .copied()
+        .ok_or_else(|| StfError::Tree("block_roots is shorter than its length".into()))
+}
+
+/// `get_block_root` (P0 L1438-1442).
+pub fn get_block_root<E: Preset>(state: &BeaconState<E>, epoch: Epoch) -> Result<Root, StfError> {
+    let slot = epoch
+        .checked_mul(E::slots_per_epoch())
+        .ok_or(StfError::ArithmeticOverflow)?;
+    get_block_root_at_slot(state, slot)
+}
+
+/// `get_base_reward_per_increment` (A L369-374) for a total active balance.
+pub fn base_reward_per_increment(total_active_balance: Gwei) -> Gwei {
+    // EFFECTIVE_BALANCE_INCREMENT * BASE_REWARD_FACTOR is 64 * 10**9, far below u64::MAX.
+    // The square root is 0 only for a total of 0, which `get_total_active_balance` never
+    // gives (its floor is one increment); `checked_div` keeps a 0 from a caller harmless.
+    (EFFECTIVE_BALANCE_INCREMENT * BASE_REWARD_FACTOR)
+        .checked_div(integer_squareroot(total_active_balance))
+        .unwrap_or(0)
+}
+
+/// `get_base_reward_per_increment` (A L369-374).
+pub fn get_base_reward_per_increment<E: Preset>(state: &BeaconState<E>) -> Result<Gwei, StfError> {
+    Ok(base_reward_per_increment(get_total_active_balance(state)?))
+}
+
+/// `get_base_reward` (A L386-391, Modified in Altair) for an effective balance and the base
+/// reward per increment: `increments * base_reward_per_increment`.
+pub fn base_reward(effective_balance: Gwei, per_increment: Gwei) -> Result<Gwei, StfError> {
+    (effective_balance / EFFECTIVE_BALANCE_INCREMENT)
+        .checked_mul(per_increment)
+        .ok_or(StfError::ArithmeticOverflow)
+}
+
+/// `get_base_reward` (A L386-391, Modified in Altair). It reads the whole registry for the
+/// total active balance; [`base_reward`] takes a total that the caller keeps.
+pub fn get_base_reward<E: Preset>(
+    state: &BeaconState<E>,
+    index: ValidatorIndex,
+) -> Result<Gwei, StfError> {
+    let validator = state
+        .validators
+        .get(index as usize)
+        .ok_or(StfError::UnknownValidator(index))?;
+    base_reward(
+        validator.effective_balance,
+        get_base_reward_per_increment(state)?,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,5 +747,91 @@ mod tests {
         assert_eq!(cache.get(&x), Ok(256 * ETH));
         assert_eq!(cache.key(), Some((0, x.genesis_validators_root)));
         assert_eq!(cache.get(&y), Ok(248 * ETH));
+    }
+
+    #[test]
+    fn flags_and_square_roots() {
+        use crate::preset::{PARTICIPATION_FLAG_WEIGHTS, TIMELY_TARGET_FLAG_INDEX};
+        assert_eq!(has_flag(0b010, TIMELY_TARGET_FLAG_INDEX), Ok(true));
+        assert_eq!(has_flag(0b101, TIMELY_TARGET_FLAG_INDEX), Ok(false));
+        assert_eq!(has_flag(0x80, 7), Ok(true));
+        // `ParticipationFlags(2**8)` raises in the spec.
+        let past = has_flag(0xff, 8).unwrap_err();
+        assert_eq!(
+            past,
+            StfError::ListIndexOutOfRange {
+                list: "ParticipationFlags",
+                index: 8
+            }
+        );
+        assert!(!past.proves_invalid());
+        assert_eq!(integer_squareroot(0), 0);
+        assert_eq!(integer_squareroot(15), 3);
+        assert_eq!(integer_squareroot(16), 4);
+        assert_eq!(integer_squareroot(u64::MAX), (1 << 32) - 1);
+        assert_eq!(PARTICIPATION_FLAG_WEIGHTS.iter().sum::<u64>(), 54);
+    }
+
+    #[test]
+    fn block_roots_inside_the_history_only() {
+        let mut state = genesis_state::<Minimal>(&[32 * ETH; 8]);
+        state.slot = Minimal::start_slot_at_epoch(10) - 1;
+        for i in 0..state.block_roots.len() {
+            *state.block_roots.get_mut(i).unwrap() = Root::repeat_byte(i as u8);
+        }
+        // Slot 79 of the minimal preset; the history holds slots 15 to 78.
+        assert_eq!(state.slot, 79);
+        assert_eq!(get_previous_epoch(&state), 8);
+        assert_eq!(
+            get_block_root_at_slot(&state, 78),
+            Ok(Root::repeat_byte(14))
+        );
+        assert_eq!(
+            get_block_root_at_slot(&state, 15),
+            Ok(Root::repeat_byte(15))
+        );
+        assert_eq!(get_block_root(&state, 9), Ok(Root::repeat_byte(72 % 64)));
+        for slot in [14, 79, 80] {
+            assert_eq!(
+                get_block_root_at_slot(&state, slot),
+                Err(StfError::BlockRootOutOfRange {
+                    slot,
+                    state_slot: 79
+                })
+            );
+        }
+        assert_eq!(
+            get_block_root(&state, u64::MAX),
+            Err(StfError::ArithmeticOverflow)
+        );
+        // The spec computes `slot + SLOTS_PER_HISTORICAL_ROOT` in uint64, which raises near
+        // the top of the range, also where `state.slot - slot` is small.
+        state.slot = u64::MAX;
+        assert_eq!(
+            get_block_root_at_slot(&state, u64::MAX - 1),
+            Err(StfError::ArithmeticOverflow)
+        );
+        assert_eq!(
+            get_block_root_at_slot(&state, u64::MAX - 64),
+            Ok(Root::repeat_byte(((u64::MAX - 64) % 64) as u8))
+        );
+    }
+
+    #[test]
+    fn base_reward_of_the_total_active_balance() {
+        let state = genesis_state::<Minimal>(&[32 * ETH; 8]);
+        // 64 * 10**9 // isqrt(256 * 10**9) = 64 * 10**9 // 505_964.
+        assert_eq!(get_base_reward_per_increment(&state), Ok(126_491));
+        assert_eq!(base_reward_per_increment(ETH), 64 * ETH / 31_622);
+        assert_eq!(base_reward_per_increment(0), 0);
+        assert_eq!(get_base_reward(&state, 3), Ok(32 * 126_491));
+        assert_eq!(
+            get_base_reward(&state, 8),
+            Err(StfError::UnknownValidator(8))
+        );
+        assert_eq!(
+            base_reward(2 * ETH, u64::MAX),
+            Err(StfError::ArithmeticOverflow)
+        );
     }
 }

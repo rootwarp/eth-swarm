@@ -77,7 +77,7 @@ fn decode_state<E: Preset>(reads: &Reads, path: &Path) -> Result<BeaconState<E>,
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::plan::{CaseFile, CaseKey};
     use consensus_types::gloas::*;
@@ -88,7 +88,7 @@ mod tests {
 
     /// A Gloas minimal state at `slot` with an empty registry: enough for `process_slots`
     /// inside one epoch.
-    fn state(slot: u64) -> BeaconState<Minimal> {
+    pub(crate) fn state(slot: u64) -> BeaconState<Minimal> {
         let checkpoint = Checkpoint {
             epoch: 0,
             root: Root::ZERO,

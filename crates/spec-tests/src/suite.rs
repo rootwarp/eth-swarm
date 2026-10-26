@@ -4,7 +4,9 @@
 
 use crate::coverage::{self, CaseShape, Guard, Layout, Reads, Slot};
 use crate::plan::{plan, Case, CaseKey, Date, Disposition, Scope, SkipList, COMPTESTS_PRESETS};
-use crate::{bls, fixture, kzg, networking, sanity, shuffling, ssz_generic, ssz_static};
+use crate::{
+    bls, epoch_processing, fixture, kzg, networking, sanity, shuffling, ssz_generic, ssz_static,
+};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -430,7 +432,8 @@ fn incomplete(set: &VectorSet, dir: &Path, cases: &[Case]) -> Option<String> {
     })
 }
 
-/// Fails on a `bls` or `kzg` handler directory the runners do not classify.
+/// Fails on a `bls`, `kzg` or Gloas `epoch_processing` handler directory the runners do not
+/// classify.
 fn handler_check(k: &CaseKey) -> Result<(), String> {
     if k.handler.is_empty() {
         return Ok(());
@@ -443,6 +446,7 @@ fn handler_check(k: &CaseKey) -> Result<(), String> {
         "kzg" => kzg::handler_runs(&k.handler)
             .map(drop)
             .map_err(|e| e + &at()),
+        "epoch_processing" => epoch_processing::check_handler(k),
         _ => Ok(()),
     }
 }
@@ -458,6 +462,7 @@ enum Kind {
     Networking,
     Sanity,
     Shuffling,
+    EpochProcessing,
 }
 
 /// The runner for a case, or `None` if nothing in this crate runs it.
@@ -498,6 +503,11 @@ fn kind(case: &Case) -> Option<Kind> {
         {
             Some(Kind::Shuffling)
         }
+        ("consensus-specs", "epoch_processing")
+            if epoch_processing::supported(&k.fork, &k.preset, &k.handler) =>
+        {
+            Some(Kind::EpochProcessing)
+        }
         _ => None,
     }
 }
@@ -532,6 +542,10 @@ impl Kind {
             Kind::Shuffling => {
                 consensus_manifest(reads, case)?;
                 shuffling::run(reads, &case.key.preset, data(case, "mapping.yaml")?)
+            }
+            Kind::EpochProcessing => {
+                consensus_manifest(reads, case)?;
+                epoch_processing::run(reads, case)
             }
         }
     }

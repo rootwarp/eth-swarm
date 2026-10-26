@@ -114,6 +114,28 @@ fn state_transition_skips_point_at_their_milestone() {
             let k = consensus("gloas", preset, runner, handler);
             assert_eq!(issue_of(&skips, &k), "4.7", "{k}");
         }
+        // The reason of each epoch step that is not ported names the item that ports it.
+        for (handler, item) in [
+            ("builder_pending_payments", "4.6b"),
+            ("ptc_window", "4.2b"),
+            ("registry_updates", "4.2b"),
+        ] {
+            let k = consensus("gloas", preset, "epoch_processing", handler);
+            let reason = skips.skipped_by(&k).unwrap().reason;
+            assert!(
+                reason.starts_with(&format!("Ported by {item}:")),
+                "{k}: {reason}"
+            );
+        }
+        // The ported epoch steps run.
+        for handler in [
+            "justification_and_finalization",
+            "inactivity_updates",
+            "rewards_and_penalties",
+        ] {
+            let k = consensus("gloas", preset, "epoch_processing", handler);
+            assert!(skips.skipped_by(&k).is_none(), "{k} is skipped");
+        }
     }
 }
 

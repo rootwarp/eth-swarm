@@ -11,12 +11,14 @@
 //!   of bls12-381-tests, cryptography-specs and consensus-spec-tests `general` through
 //!   `crypto-bls`), [`networking`] (the custody handlers of `<preset>/{fulu,gloas}/networking`
 //!   through `consensus_types::das`), [`sanity`] (`<preset>/gloas/sanity/slots` through
-//!   `state_transition::per_slot`) and [`shuffling`] (`<preset>/phase0/shuffling/core` through
-//!   `state_transition::caches`).
+//!   `state_transition::per_slot`), [`shuffling`] (`<preset>/phase0/shuffling/core` through
+//!   `state_transition::caches`) and [`epoch_processing`] (`<preset>/gloas/epoch_processing`
+//!   through `state_transition::per_epoch`).
 
 pub mod bls;
 pub mod check;
 pub mod coverage;
+pub mod epoch_processing;
 pub mod fixture;
 pub mod kzg;
 pub mod networking;
