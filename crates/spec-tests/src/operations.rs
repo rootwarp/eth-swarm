@@ -143,8 +143,9 @@ fn operation<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
         .map(|p| decode::<BeaconState<E>>(reads, p))
         .transpose()?;
     let bls = bls_setting(reads, case)?;
+    let mut fork_epoch_differs = false;
     if let Some(path) = case.file("config.yaml") {
-        check_config::<E>(reads, path, &case.key.preset)?;
+        fork_epoch_differs = check_config(reads, path, case, &state)?;
     }
     let outcome = match (case.key.runner.as_str(), case.key.handler.as_str()) {
         ("operations", "block_header") => {
@@ -303,7 +304,27 @@ fn operation<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
         }
         (runner, handler) => return Err(format!("no runner for {runner}/{handler}")),
     };
+    let outcome = if fork_epoch_differs {
+        cross_epoch_outcome(outcome)?
+    } else {
+        outcome
+    };
     expect(&mut state, outcome, post)
+}
+
+/// The one case whose pre-state has a `fork.epoch` other than its `GLOAS_FORK_EPOCH`.
+const CROSS_EPOCH_WRONG_DOMAIN: &str =
+    "pyspec_tests/process_payload_attestation_cross_epoch_wrong_domain";
+
+/// The outcome of [`CROSS_EPOCH_WRONG_DOMAIN`]: it must be the `EpochOutOfWindow` of
+/// `get_ptc`. Any other outcome fails the case.
+fn cross_epoch_outcome(outcome: Result<(), StfError>) -> Result<Result<(), StfError>, String> {
+    match outcome {
+        Err(StfError::EpochOutOfWindow { .. }) => Ok(outcome),
+        other => Err(format!(
+            "expected the EpochOutOfWindow of get_ptc before the fork epoch, got {other:?}"
+        )),
+    }
 }
 
 /// Checks the `config.yaml` of a case (the pyspec writes one for the tests that need the
@@ -314,16 +335,24 @@ fn operation<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
 /// - `CAPELLA_FORK_VERSION` is [`capella_fork_version`], the domain of the voluntary exits.
 /// - `SHARD_COMMITTEE_PERIOD` is `E::SHARD_COMMITTEE_PERIOD`, which the voluntary exits and
 ///   the consolidation requests read.
+/// - `GLOAS_FORK_EPOCH` is `state.fork.epoch` of the pre-state, which `get_ptc` reads as the
+///   Gloas fork epoch. Only [`CROSS_EPOCH_WRONG_DOMAIN`] has two epochs that differ, and then
+///   the result is `Ok(true)`.
 ///
 /// A case that overrides one of these values fails with a config message.
 ///
-/// `GLOAS_FORK_EPOCH` is not compared. `get_ptc` reads the Gloas fork epoch from
-/// `state.fork.epoch`, which is `GLOAS_FORK_EPOCH` in each state that the transition makes.
-/// The case `process_payload_attestation_cross_epoch_wrong_domain` sets `state.fork.epoch` to
-/// 1 under a `GLOAS_FORK_EPOCH` of 0, to give its two epochs different fork versions. Thus
-/// `get_ptc` refuses the slot of epoch 0 (`EpochOutOfWindow`) before the domain check that
-/// the case tests. The case expects an invalid attestation, and it gets one.
-fn check_config<E: Preset>(reads: &Reads, path: &Path, preset: &str) -> Result<(), String> {
+/// [`CROSS_EPOCH_WRONG_DOMAIN`] sets `state.fork.epoch` to 1 under a `GLOAS_FORK_EPOCH` of
+/// 0, to give its two epochs different fork versions. Thus `get_ptc` refuses the slot of
+/// epoch 0 before the domain check that the case tests, and [`cross_epoch_outcome`] requires
+/// that refusal. A state that the transition makes has `fork.epoch == GLOAS_FORK_EPOCH`, so
+/// the case is a property of the vector, not of a live network.
+fn check_config<E: Preset>(
+    reads: &Reads,
+    path: &Path,
+    case: &Case,
+    state: &BeaconState<E>,
+) -> Result<bool, String> {
+    let preset = case.key.preset.as_str();
     let config = fixture::load(reads, path)?;
     let wrong = |key: &str, value: &Yaml| format!("config.yaml: {key} is {value:?}");
     let base = fixture::field(&config, "PRESET_BASE")?;
@@ -345,7 +374,25 @@ fn check_config<E: Preset>(reads: &Reads, path: &Path, preset: &str) -> Result<(
     if period.as_i64().and_then(|v| u64::try_from(v).ok()) != Some(E::SHARD_COMMITTEE_PERIOD) {
         return Err(wrong("SHARD_COMMITTEE_PERIOD", period));
     }
-    Ok(())
+    let value = fixture::field(&config, "GLOAS_FORK_EPOCH")?;
+    let epoch = value
+        .as_i64()
+        .and_then(|v| u64::try_from(v).ok())
+        .ok_or_else(|| wrong("GLOAS_FORK_EPOCH", value))?;
+    match (
+        epoch != state.fork.epoch,
+        case.key.case == CROSS_EPOCH_WRONG_DOMAIN,
+    ) {
+        (false, false) => Ok(false),
+        (true, true) => Ok(true),
+        (true, false) => Err(format!(
+            "config.yaml: GLOAS_FORK_EPOCH is {epoch}, but the pre-state has fork.epoch {}",
+            state.fork.epoch
+        )),
+        (false, true) => Err(format!(
+            "the pre-state fork.epoch must differ from GLOAS_FORK_EPOCH {epoch} in this case"
+        )),
+    }
 }
 
 /// `parent_slot` of `meta.yaml`: the slot of the parent block, which the Gloas
@@ -1582,7 +1629,7 @@ mod tests {
                 Err(StfError::StateArithmetic {
                     what: "withdrawal index",
                 }),
-                Err(StfError::Unimplemented("x")),
+                Err(StfError::Tree("x".into())),
             ] {
                 let err = check(name, wrong).unwrap_err();
                 assert!(err.contains("`validators`"), "{err}");
@@ -1703,11 +1750,13 @@ mod tests {
     fn config_compares_capella_and_shard_committee_period() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
+        let c = case(dir.path(), "payload_attestation", &[]);
+        let pre = pre();
         let check = |text: &str| {
             std::fs::write(&path, text).unwrap();
-            check_config::<Minimal>(&Reads::default(), &path, "minimal")
+            check_config(&Reads::default(), &path, &c, &pre)
         };
-        assert_eq!(check(&config("minimal", "0x00000001")), Ok(()));
+        assert_eq!(check(&config("minimal", "0x00000001")), Ok(false));
         let base = "PRESET_BASE: 'minimal'\nGENESIS_FORK_VERSION: 0x00000001\n";
         for (text, want) in [
             (
@@ -1733,6 +1782,76 @@ mod tests {
         ] {
             let err = check(&text).unwrap_err();
             assert!(err.contains(want), "{want}: {err}");
+        }
+    }
+
+    #[test]
+    fn gloas_fork_epoch_of_the_config() {
+        use consensus_types::gloas::{PayloadAttestation, PayloadAttestationData};
+        use consensus_types::primitives::Root;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut attestation = PayloadAttestation::<Minimal> {
+            aggregation_bits: Default::default(),
+            data: PayloadAttestationData {
+                beacon_block_root: Root::ZERO,
+                slot: 1,
+                payload_present: true,
+                blob_data_available: true,
+            },
+            signature: [0x22; 96],
+        };
+        attestation.aggregation_bits.set(0, true).unwrap();
+        let config = |epoch: &str| {
+            format!(
+                "PRESET_BASE: 'minimal'\nGENESIS_FORK_VERSION: 0x00000001\n\
+                 CAPELLA_FORK_VERSION: 0x03000001\nSHARD_COMMITTEE_PERIOD: 64\n\
+                 GLOAS_FORK_EPOCH: {epoch}\n"
+            )
+        };
+        let run_case = |name: &str, fork_epoch: u64, config: String| {
+            let mut pre = pre();
+            pre.fork.epoch = fork_epoch;
+            let mut c = case(
+                dir.path(),
+                "payload_attestation",
+                &[
+                    ("pre.ssz_snappy", snappy(pre.as_ssz_bytes())),
+                    (
+                        "payload_attestation.ssz_snappy",
+                        snappy(attestation.as_ssz_bytes()),
+                    ),
+                    ("meta.yaml", b"{bls_setting: 2}\n".to_vec()),
+                    ("config.yaml", config.into_bytes()),
+                ],
+            );
+            c.key.case = name.into();
+            run(&Reads::default(), &c)
+        };
+        // The named case sets `fork.epoch` past `GLOAS_FORK_EPOCH`, and `get_ptc` refuses
+        // the slot of epoch 0.
+        assert_eq!(run_case(CROSS_EPOCH_WRONG_DOMAIN, 1, config("0")), Ok(()));
+        // Another case must have `GLOAS_FORK_EPOCH == state.fork.epoch`.
+        for (fork_epoch, epoch) in [(1, "0"), (0, "1")] {
+            let err = run_case("pyspec_tests/other", fork_epoch, config(epoch)).unwrap_err();
+            assert!(err.contains("GLOAS_FORK_EPOCH"), "{err}");
+        }
+        // The named case must have the two epochs that differ.
+        let err = run_case(CROSS_EPOCH_WRONG_DOMAIN, 0, config("0")).unwrap_err();
+        assert!(err.contains("differ"), "{err}");
+        for bad in ["-1", "x"] {
+            let err = run_case("pyspec_tests/other", 0, config(bad)).unwrap_err();
+            assert!(err.contains("GLOAS_FORK_EPOCH"), "{err}");
+        }
+        // The named case passes only on `EpochOutOfWindow`.
+        let window = StfError::EpochOutOfWindow {
+            epoch: 0,
+            state_epoch: 0,
+        };
+        assert_eq!(cross_epoch_outcome(Err(window.clone())), Ok(Err(window)));
+        for other in [Ok(()), Err(StfError::InvalidPayloadAttestationSignature)] {
+            let err = cross_epoch_outcome(other).unwrap_err();
+            assert!(err.contains("EpochOutOfWindow"), "{err}");
         }
     }
 
@@ -1794,7 +1913,7 @@ mod tests {
             .contains("no pre.ssz_snappy"));
         // A post-state of an error that is not a spec failure.
         let mut s = pre.clone();
-        assert!(expect(&mut s, Err(StfError::Unimplemented("x")), None)
+        assert!(expect(&mut s, Err(StfError::Tree("x".into())), None)
             .unwrap_err()
             .contains("not a spec failure"));
     }

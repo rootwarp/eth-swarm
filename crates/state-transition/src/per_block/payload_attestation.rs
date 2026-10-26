@@ -161,9 +161,7 @@ mod tests {
     /// of the epoch, so its PTC is in the current-epoch third of the window.
     fn state_at_slot_9() -> BeaconState<Minimal> {
         let mut state = genesis_state::<Minimal>(&[32_000_000_000; 64]);
-        process_slots(&mut state, 7, &no_bls()).unwrap();
-        // Skip the epoch transition (not ported yet): slots 8 and 9 by hand.
-        state.slot = 9;
+        process_slots(&mut state, 9, &no_bls()).unwrap();
         state.latest_block_header.parent_root = PARENT;
         state
     }

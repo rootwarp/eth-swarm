@@ -308,10 +308,16 @@ pub fn slash_validator<E: Preset>(
     let epoch = get_current_epoch(state);
     initiate_validator_exit(state, slashed_index, cache)?;
     let slashings_vector = E::EpochsPerSlashingsVector::to_u64();
-    let validator = state
-        .validators
-        .get_mut(slashed_index as usize)
-        .ok_or(StfError::UnknownValidator(slashed_index))?;
+    // `initiate_validator_exit` found the same index first, so a miss here is a fault of
+    // our own state, not a proof that the slashing is invalid.
+    let validator =
+        state
+            .validators
+            .get_mut(slashed_index as usize)
+            .ok_or(StfError::ListIndexOutOfRange {
+                list: "validators",
+                index: slashed_index,
+            })?;
     validator.slashed = true;
     validator.withdrawable_epoch = validator
         .withdrawable_epoch

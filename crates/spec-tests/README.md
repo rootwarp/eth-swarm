@@ -20,8 +20,11 @@ SPEC_SETS="ssz-specs minimal" cargo test -p spec-tests --release --test vectors
   `hash_tree_root`), `kzg` (cell handlers through `crypto-kzg` with `TrustedSetup::load_pinned`)
   `bls` (every handler through `crypto-bls`, `sign`/`aggregate`/`aggregate_verify` via its
   `test-vectors` feature), `networking` (the custody handlers through `consensus_types::das`),
-  `sanity` (Gloas `sanity/slots` through `state_transition::per_slot::process_slots`, post-state
-  `hash_tree_root`) and `shuffling` (phase0 `shuffling/core`: the whole-list shuffle and the
+  `sanity` (Gloas `sanity/slots` through `state_transition::per_slot::process_slots`, and
+  `sanity/blocks` through `state_transition::state_transition` with the in-process BLS backend,
+  post-state `hash_tree_root`; each block also checks that the batch verdict of its signature
+  sets is the per-set verdict), `finality` (Gloas `finality` with the blocks runner of
+  `sanity`), `operations`, `epoch_processing` and `shuffling` (phase0 `shuffling/core`: the whole-list shuffle and the
   per-index `compute_shuffled_index` must both equal `mapping`). consensus-spec-tests cases also have their `manifest.yaml` checked
   against the directory.
 - **Handler directories:** `kzg.rs` and `bls.rs` list every handler they run and every one they

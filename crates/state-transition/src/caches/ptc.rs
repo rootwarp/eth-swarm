@@ -44,7 +44,9 @@ pub fn compute_ptc_with<E: Preset>(
 /// `slot` must be in the previous epoch, the current epoch or the next `MIN_SEED_LOOKAHEAD`
 /// epochs, and not before the Gloas fork. A Gloas state's `fork.epoch` is
 /// `GLOAS_FORK_EPOCH` (`upgrade_to_gloas` sets it, and genesis at Gloas has epoch 0), so the
-/// fork check reads it from the state instead of from a network config.
+/// fork check reads it from the state instead of from a network config. A fork after Gloas
+/// sets `fork.epoch` to its own epoch, so its port must pass `GLOAS_FORK_EPOCH` from the
+/// network config.
 pub fn get_ptc<E: Preset>(
     state: &BeaconState<E>,
     slot: Slot,

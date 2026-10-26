@@ -5,8 +5,8 @@
 use crate::coverage::{self, CaseShape, Guard, Layout, Reads, Slot};
 use crate::plan::{plan, Case, CaseKey, Date, Disposition, Scope, SkipList, COMPTESTS_PRESETS};
 use crate::{
-    bls, epoch_processing, fixture, kzg, networking, operations, sanity, shuffling, ssz_generic,
-    ssz_static,
+    bls, epoch_processing, finality, fixture, kzg, networking, operations, sanity, shuffling,
+    ssz_generic, ssz_static,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -470,6 +470,7 @@ enum Kind {
     Sanity,
     Shuffling,
     EpochProcessing,
+    Finality,
 }
 
 /// The runner for a case, or `None` if nothing in this crate runs it.
@@ -520,6 +521,9 @@ fn kind(case: &Case) -> Option<Kind> {
         {
             Some(Kind::EpochProcessing)
         }
+        ("consensus-specs", "finality") if finality::supported(&k.fork, &k.preset, &k.handler) => {
+            Some(Kind::Finality)
+        }
         _ => None,
     }
 }
@@ -562,6 +566,10 @@ impl Kind {
             Kind::EpochProcessing => {
                 consensus_manifest(reads, case)?;
                 epoch_processing::run(reads, case)
+            }
+            Kind::Finality => {
+                consensus_manifest(reads, case)?;
+                finality::run(reads, case)
             }
         }
     }

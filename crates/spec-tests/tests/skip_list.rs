@@ -103,9 +103,14 @@ fn state_transition_skips_point_at_their_milestone() {
             let k = consensus("fulu", preset, runner, handler);
             assert_eq!(issue_of(&skips, &k), "none", "{k}");
         }
-        for (runner, handler) in [("fork", "fork"), ("sanity", "blocks")] {
+        for (runner, handler) in [("fork", "fork"), ("transition", "core")] {
             let k = consensus("gloas", preset, runner, handler);
             assert_eq!(issue_of(&skips, &k), "4.7", "{k}");
+        }
+        // The whole-block runners run.
+        for (runner, handler) in [("sanity", "blocks"), ("finality", "finality")] {
+            let k = consensus("gloas", preset, runner, handler);
+            assert!(skips.skipped_by(&k).is_none(), "{k} is skipped");
         }
         // Every Gloas epoch step runs, also the three that the epoch README omits
         // (pending_deposits_churn, proposer_lookahead and ptc_window).
@@ -152,8 +157,9 @@ fn gloas_operations_runnable_handlers_are_not_skipped() {
     }
 }
 
-/// No Gloas `epoch_processing` or `sanity/slots` entry is left: every epoch step is ported,
-/// the runner reads the whole-epoch files, and the slots that cross an epoch boundary run.
+/// No Gloas `epoch_processing`, `sanity` or `finality` entry is left: every epoch step is
+/// ported, the runner reads the whole-epoch files, the slots that cross an epoch boundary
+/// run, and the blocks of `sanity/blocks` and `finality` run.
 #[test]
 fn no_gloas_epoch_or_slots_entry_is_left() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testing/skip.toml");
@@ -172,7 +178,7 @@ fn no_gloas_epoch_or_slots_entry_is_left() {
         }
         match (runner.as_deref(), handler.as_deref()) {
             (Some("epoch_processing"), _) => epoch_entries.push(e.clone()),
-            (Some("sanity"), Some("slots" | "*")) => slots_entries.push(e.clone()),
+            (Some("sanity" | "finality"), _) => slots_entries.push(e.clone()),
             _ => {}
         }
     }

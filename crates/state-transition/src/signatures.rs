@@ -646,7 +646,7 @@ pub fn block_signature_sets_with<E: Preset>(
             signed_block.message.parent_root,
         )?);
     }
-    // Last, as it is the only set that can read the registry.
+    // Last, as in `process_block`.
     sets.extend(sync_aggregate_signature_set_with(
         state,
         &body.sync_aggregate,
@@ -769,7 +769,8 @@ mod tests {
     ) -> (BeaconState<Minimal>, SignedBeaconBlock<Minimal>) {
         let mut state = genesis_state::<Minimal>(&[32_000_000_000; 64]);
         process_slots(&mut state, 7, &no_bls()).unwrap();
-        // Skip the epoch transition (not ported yet): slots 8 and 9 by hand.
+        // Slots 8 and 9 by hand, without the epoch transition: the sets read the slot, the
+        // registry and the block root of slot 8, and the test gives that root a known value.
         state.slot = 9;
         *state.block_roots.get_mut(8).unwrap() = Root::repeat_byte(8);
         for i in 0..32 {

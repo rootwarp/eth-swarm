@@ -57,9 +57,6 @@ use tree_hash::TreeHash;
 /// each variant.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StfError {
-    /// The step is not ported yet; the text names the work that ports it.
-    #[error("not implemented yet ({0})")]
-    Unimplemented(&'static str),
     /// `process_slots` asserts `state.slot < slot`.
     #[error("target slot {slot} is not after the state slot {state_slot}")]
     SlotNotLater {
@@ -585,8 +582,8 @@ pub enum StfError {
 
 impl StfError {
     /// Whether the error proves that the input is invalid by the spec (REJECT). It does not
-    /// for a step that is not ported yet, a backend without a verdict, a missing deposit
-    /// verdict, a failed pubkey aggregation, a committee cache of another epoch or seed, a
+    /// for a backend without a verdict, a missing deposit verdict, a failed pubkey
+    /// aggregation, a committee cache of another epoch or seed, a
     /// failure of the state trees, a state list shorter than the registry, a
     /// `proposer_lookahead` entry past the registry or a code index past a spec table
     /// (`ListIndexOutOfRange`), a participation epoch other than the previous and the
@@ -639,8 +636,7 @@ impl StfError {
     /// The match has no `_` arm, so each new variant must select its class here.
     pub fn proves_invalid(&self) -> bool {
         match self {
-            Self::Unimplemented(_)
-            | Self::SignatureBackend(_)
+            Self::SignatureBackend(_)
             | Self::CacheEpochMismatch { .. }
             | Self::CacheSeedMismatch { .. }
             | Self::Tree(_)
@@ -815,8 +811,9 @@ pub fn state_root<E: Preset>(state: &mut BeaconState<E>) -> Result<Root, StfErro
 ///
 /// `validate_result` controls only the signature sets of the block. With `validate_result`
 /// false, the call checks no block signature set of [`signatures::block_signature_sets`]:
-/// the proposer signature, the RANDAO reveal, the signed operations of the body (for example
-/// the slashings, the attestations, the voluntary exits and the BLS changes), the payload
+/// the proposer signature, the RANDAO reveal, the signature of the execution payload bid (a
+/// self-build bid has no set), the signed operations of the body (the proposer and attester
+/// slashings, the attestations, the voluntary exits and the BLS changes), the payload
 /// attestations and the sync aggregate signature. The spec skips only the proposer
 /// signature there. Use `validate_result` false only to compute the state root of a block
 /// that we produce ourselves, whose signatures we made. The checks that need no BLS (for
@@ -839,7 +836,8 @@ pub fn state_root<E: Preset>(state: &mut BeaconState<E>) -> Result<Root, StfErro
 /// block with a far-future slot costs one `process_slot` for each slot.
 /// Bound `block.slot` also before the prefetch of the deposit verdicts: with a far-future
 /// slot, the prefetch lists each pending deposit of a new key, and each set costs one BLS
-/// check.
+/// check. The prefetch covers a slot loop from a Gloas pre-state only (see the `# Warning`
+/// of [`per_slot::process_slots`]).
 pub fn state_transition<E: Preset>(
     state: &mut BeaconState<E>,
     signed_block: &SignedBeaconBlock<E>,
@@ -1228,90 +1226,89 @@ mod tests {
 
     /// The number of [`StfError`] variants: one more than the largest [`variant_id`].
     /// Increase `VARIANTS` when you add an id.
-    const VARIANTS: usize = 78;
+    const VARIANTS: usize = 77;
 
     /// A distinct id for each variant. The match has no `_` arm, so a new variant does not
     /// compile until it gets an id here, and then the table test fails until it has an entry.
     fn variant_id(e: &StfError) -> usize {
         match e {
-            StfError::Unimplemented(_) => 0,
-            StfError::SlotNotLater { .. } => 1,
-            StfError::InvalidBlockSignature => 2,
-            StfError::StateRootMismatch { .. } => 3,
-            StfError::SignatureBackend(_) => 4,
-            StfError::ArithmeticOverflow => 5,
-            StfError::UnknownValidator(_) => 6,
-            StfError::ShuffleIndexOutOfRange { .. } => 7,
-            StfError::NoCandidates => 8,
-            StfError::UnknownCommittee { .. } => 9,
-            StfError::BitOutOfRange { .. } => 10,
-            StfError::EpochOutOfWindow { .. } => 11,
-            StfError::CacheEpochMismatch { .. } => 12,
-            StfError::Tree(_) => 13,
-            StfError::CacheSeedMismatch { .. } => 14,
-            StfError::UnknownBuilder(_) => 15,
-            StfError::PaymentIndexOutOfRange { .. } => 16,
-            StfError::ListIndexOutOfRange { .. } => 17,
-            StfError::BlockRootOutOfRange { .. } => 18,
-            StfError::ParticipationEpochOutOfRange { .. } => 19,
-            StfError::MissingVerdict(_) => 20,
-            StfError::BlockSlotMismatch { .. } => 21,
-            StfError::BlockNotNewer { .. } => 22,
-            StfError::WrongProposer { .. } => 23,
-            StfError::ParentRootMismatch { .. } => 24,
-            StfError::ProposerSlashed(_) => 25,
-            StfError::BlockDeposits(_) => 26,
-            StfError::UnknownSyncCommitteeMember { .. } => 27,
-            StfError::InvalidSyncAggregateSignature => 28,
-            StfError::PubkeyAggregation(_) => 29,
-            StfError::PayloadAttestationRootMismatch { .. } => 30,
-            StfError::PayloadAttestationSlotMismatch { .. } => 31,
-            StfError::PayloadAttestationNoAttesters => 32,
-            StfError::PayloadAttestationUnsorted => 33,
-            StfError::InvalidPayloadAttestationSignature => 34,
-            StfError::ExitNotActive(_) => 35,
-            StfError::ExitAlreadyInitiated(_) => 36,
-            StfError::ExitEpochInFuture { .. } => 37,
-            StfError::ExitTooEarly { .. } => 38,
-            StfError::ExitPendingWithdrawals { .. } => 39,
-            StfError::InvalidVoluntaryExitSignature => 40,
-            StfError::NotBlsWithdrawalCredentials(_) => 41,
-            StfError::BlsChangeKeyMismatch(_) => 42,
-            StfError::InvalidBlsToExecutionChangeSignature => 43,
-            StfError::AttestationTargetEpoch { .. } => 44,
-            StfError::AttestationTargetSlot { .. } => 45,
-            StfError::AttestationTooEarly { .. } => 46,
-            StfError::AttestationDataIndex(_) => 47,
-            StfError::SameSlotAttestationIndex(_) => 48,
-            StfError::EmptyCommitteeAttesters(_) => 49,
-            StfError::AggregationBitsLength { .. } => 50,
-            StfError::AttestationSourceMismatch => 51,
-            StfError::InvalidIndexedAttestation => 52,
-            StfError::NotSlashableAttestationData => 53,
-            StfError::NoValidatorSlashed => 54,
-            StfError::ProposerSlashingSlots { .. } => 55,
-            StfError::ProposerSlashingProposers { .. } => 56,
-            StfError::ProposerSlashingSameHeaders => 57,
-            StfError::ValidatorNotSlashable(_) => 58,
-            StfError::InvalidOperationSignature => 59,
-            StfError::PriorWithdrawalsPastLimit { .. } => 60,
-            StfError::StateArithmetic { .. } => 61,
-            StfError::SelfBuildBidValue(_) => 62,
-            StfError::SelfBuildBidSignature => 63,
-            StfError::BidBuilderNotActive(_) => 64,
-            StfError::BidBuilderVersion { .. } => 65,
-            StfError::BidNotCovered { .. } => 66,
-            StfError::BidBlobCommitments { .. } => 67,
-            StfError::BidSlotMismatch { .. } => 68,
-            StfError::BidAtGenesisSlot => 69,
-            StfError::BidParentBlockHash { .. } => 70,
-            StfError::BidBlockHashIsParent => 71,
-            StfError::BidParentBlockRoot { .. } => 72,
-            StfError::BidPrevRandao { .. } => 73,
-            StfError::UnknownBlobLimit(_) => 74,
-            StfError::ParentRequestsNotEmpty => 75,
-            StfError::ParentRequestsRootMismatch { .. } => 76,
-            StfError::ParentRequestsPastLimit { .. } => 77,
+            StfError::SlotNotLater { .. } => 0,
+            StfError::InvalidBlockSignature => 1,
+            StfError::StateRootMismatch { .. } => 2,
+            StfError::SignatureBackend(_) => 3,
+            StfError::ArithmeticOverflow => 4,
+            StfError::UnknownValidator(_) => 5,
+            StfError::ShuffleIndexOutOfRange { .. } => 6,
+            StfError::NoCandidates => 7,
+            StfError::UnknownCommittee { .. } => 8,
+            StfError::BitOutOfRange { .. } => 9,
+            StfError::EpochOutOfWindow { .. } => 10,
+            StfError::CacheEpochMismatch { .. } => 11,
+            StfError::Tree(_) => 12,
+            StfError::CacheSeedMismatch { .. } => 13,
+            StfError::UnknownBuilder(_) => 14,
+            StfError::PaymentIndexOutOfRange { .. } => 15,
+            StfError::ListIndexOutOfRange { .. } => 16,
+            StfError::BlockRootOutOfRange { .. } => 17,
+            StfError::ParticipationEpochOutOfRange { .. } => 18,
+            StfError::MissingVerdict(_) => 19,
+            StfError::BlockSlotMismatch { .. } => 20,
+            StfError::BlockNotNewer { .. } => 21,
+            StfError::WrongProposer { .. } => 22,
+            StfError::ParentRootMismatch { .. } => 23,
+            StfError::ProposerSlashed(_) => 24,
+            StfError::BlockDeposits(_) => 25,
+            StfError::UnknownSyncCommitteeMember { .. } => 26,
+            StfError::InvalidSyncAggregateSignature => 27,
+            StfError::PubkeyAggregation(_) => 28,
+            StfError::PayloadAttestationRootMismatch { .. } => 29,
+            StfError::PayloadAttestationSlotMismatch { .. } => 30,
+            StfError::PayloadAttestationNoAttesters => 31,
+            StfError::PayloadAttestationUnsorted => 32,
+            StfError::InvalidPayloadAttestationSignature => 33,
+            StfError::ExitNotActive(_) => 34,
+            StfError::ExitAlreadyInitiated(_) => 35,
+            StfError::ExitEpochInFuture { .. } => 36,
+            StfError::ExitTooEarly { .. } => 37,
+            StfError::ExitPendingWithdrawals { .. } => 38,
+            StfError::InvalidVoluntaryExitSignature => 39,
+            StfError::NotBlsWithdrawalCredentials(_) => 40,
+            StfError::BlsChangeKeyMismatch(_) => 41,
+            StfError::InvalidBlsToExecutionChangeSignature => 42,
+            StfError::AttestationTargetEpoch { .. } => 43,
+            StfError::AttestationTargetSlot { .. } => 44,
+            StfError::AttestationTooEarly { .. } => 45,
+            StfError::AttestationDataIndex(_) => 46,
+            StfError::SameSlotAttestationIndex(_) => 47,
+            StfError::EmptyCommitteeAttesters(_) => 48,
+            StfError::AggregationBitsLength { .. } => 49,
+            StfError::AttestationSourceMismatch => 50,
+            StfError::InvalidIndexedAttestation => 51,
+            StfError::NotSlashableAttestationData => 52,
+            StfError::NoValidatorSlashed => 53,
+            StfError::ProposerSlashingSlots { .. } => 54,
+            StfError::ProposerSlashingProposers { .. } => 55,
+            StfError::ProposerSlashingSameHeaders => 56,
+            StfError::ValidatorNotSlashable(_) => 57,
+            StfError::InvalidOperationSignature => 58,
+            StfError::PriorWithdrawalsPastLimit { .. } => 59,
+            StfError::StateArithmetic { .. } => 60,
+            StfError::SelfBuildBidValue(_) => 61,
+            StfError::SelfBuildBidSignature => 62,
+            StfError::BidBuilderNotActive(_) => 63,
+            StfError::BidBuilderVersion { .. } => 64,
+            StfError::BidNotCovered { .. } => 65,
+            StfError::BidBlobCommitments { .. } => 66,
+            StfError::BidSlotMismatch { .. } => 67,
+            StfError::BidAtGenesisSlot => 68,
+            StfError::BidParentBlockHash { .. } => 69,
+            StfError::BidBlockHashIsParent => 70,
+            StfError::BidParentBlockRoot { .. } => 71,
+            StfError::BidPrevRandao { .. } => 72,
+            StfError::UnknownBlobLimit(_) => 73,
+            StfError::ParentRequestsNotEmpty => 74,
+            StfError::ParentRequestsRootMismatch { .. } => 75,
+            StfError::ParentRequestsPastLimit { .. } => 76,
         }
     }
 
@@ -1319,7 +1316,6 @@ mod tests {
     fn only_spec_failures_prove_invalid() {
         // One entry for each variant, checked against `variant_id` below.
         let cases = [
-            (StfError::Unimplemented("x"), false),
             (
                 StfError::SlotNotLater {
                     state_slot: 1,

@@ -237,29 +237,8 @@ issue   = "4.7"
 expires = "2026-11-30"
 
 # Every Gloas operations handler of beta.4 runs (crates/spec-tests/src/operations.rs), so no
-# operations entry is left. beta.4 has no operations/randao handler.
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "*"
-runner  = "sanity"
-handler = "blocks"
-reason  = "No sanity/blocks runner yet: Gloas block vectors need block processing, which lands with the Gloas state transition"
-owner   = "ian"
-issue   = "4.7"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "*"
-runner  = "finality"
-handler = "*"
-reason  = "No finality runner yet: Gloas finality vectors land with the Gloas state transition"
-owner   = "ian"
-issue   = "4.7"
-expires = "2026-11-30"
+# operations entry is left. beta.4 has no operations/randao handler. Gloas sanity/slots,
+# sanity/blocks and finality run (crates/spec-tests/src/{sanity,finality}.rs).
 
 [[skip]]
 source  = "consensus-specs"
