@@ -157,7 +157,7 @@ mod tests {
     /// A minimal state at slot 3 after a block at slot 2, and a valid block for slot 3.
     fn state_and_block() -> (BeaconState<Minimal>, BeaconBlock<Minimal>) {
         let mut state = genesis_state::<Minimal>(&[32 * ETH; 64]);
-        per_slot::process_slots(&mut state, 3).unwrap();
+        per_slot::process_slots(&mut state, 3, &crate::testing::no_bls()).unwrap();
         state.latest_block_header.slot = 2;
         let block = block_at_state_slot(&state).message;
         (state, block)

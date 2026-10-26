@@ -16,6 +16,8 @@
 //!   [`shuffling`] (`<preset>/phase0/shuffling/core` through `state_transition::caches`) and
 //!   [`epoch_processing`] (`<preset>/gloas/epoch_processing` through
 //!   `state_transition::per_epoch`).
+//! - [`bls_backend`]: the one in-process BLS context (signature verdicts, pubkey aggregation
+//!   and the genesis fork version) of the operations, epoch processing and sanity runners.
 
 pub mod bls;
 pub mod bls_backend;

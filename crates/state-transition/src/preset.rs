@@ -1,11 +1,12 @@
 //! Preset values the state transition reads that are not SSZ lengths
-//! (`presets/{minimal,mainnet}/{phase0,electra}.yaml`).
+//! (`presets/{minimal,mainnet}/{phase0,altair,bellatrix,electra}.yaml`).
 //!
 //! The SSZ lengths stay on [`EthSpec`]; this trait adds the plain numbers, so every function
 //! takes one type parameter for both.
 
 use consensus_types::primitives::{Epoch, Gwei};
 use consensus_types::{EthSpec, Mainnet, Minimal};
+use ssz_types::typenum::Unsigned;
 
 /// `MIN_SEED_LOOKAHEAD` (`presets/*/phase0.yaml`, 1 in both presets).
 pub const MIN_SEED_LOOKAHEAD: Epoch = 1;
@@ -55,6 +56,29 @@ pub const PAYLOAD_BUILDER_VERSION: u8 = 0;
 /// `BUILDER_INDEX_SELF_BUILD` (G L571, a constant): the builder index of a bid that the
 /// proposer builds itself.
 pub const BUILDER_INDEX_SELF_BUILD: u64 = u64::MAX;
+/// `MIN_ACTIVATION_BALANCE` (`presets/*/electra.yaml`, 32 ETH in both presets).
+pub const MIN_ACTIVATION_BALANCE: Gwei = 32_000_000_000;
+/// `EJECTION_BALANCE` (`configs/{minimal,mainnet}.yaml`, 16 ETH in both). A config value,
+/// but Sepolia and Hoodi have the same value as mainnet.
+pub const EJECTION_BALANCE: Gwei = 16_000_000_000;
+/// `HYSTERESIS_QUOTIENT` (`presets/*/phase0.yaml`, 4 in both presets).
+pub const HYSTERESIS_QUOTIENT: u64 = 4;
+/// `HYSTERESIS_DOWNWARD_MULTIPLIER` (`presets/*/phase0.yaml`, 1 in both presets).
+pub const HYSTERESIS_DOWNWARD_MULTIPLIER: u64 = 1;
+/// `HYSTERESIS_UPWARD_MULTIPLIER` (`presets/*/phase0.yaml`, 5 in both presets).
+pub const HYSTERESIS_UPWARD_MULTIPLIER: u64 = 5;
+/// `PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX` (`presets/*/bellatrix.yaml`, 3 in both).
+pub const PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX: u64 = 3;
+/// `MAX_PENDING_DEPOSITS_PER_EPOCH` (`presets/*/electra.yaml`, 16 in both presets).
+pub const MAX_PENDING_DEPOSITS_PER_EPOCH: u64 = 16;
+/// `COMPOUNDING_WITHDRAWAL_PREFIX` (E "Withdrawal prefixes", a constant).
+pub const COMPOUNDING_WITHDRAWAL_PREFIX: u8 = 0x02;
+
+/// `EPOCHS_PER_ETH1_VOTING_PERIOD` (`presets/*/phase0.yaml`): the SSZ length
+/// `SlotsPerEth1VotingPeriod` divided by `SLOTS_PER_EPOCH`.
+pub fn epochs_per_eth1_voting_period<E: EthSpec>() -> Epoch {
+    E::SlotsPerEth1VotingPeriod::to_u64() / E::slots_per_epoch()
+}
 
 /// The preset values of the state transition, on top of the SSZ lengths of [`EthSpec`].
 ///
@@ -75,6 +99,8 @@ pub trait Preset: EthSpec {
     const MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS: Gwei;
     /// `MIN_BUILDER_WITHDRAWABILITY_DELAY` (`configs/{minimal,mainnet}.yaml`).
     const MIN_BUILDER_WITHDRAWABILITY_DELAY: Epoch;
+    /// `EPOCHS_PER_SYNC_COMMITTEE_PERIOD` (`presets/{minimal,mainnet}/altair.yaml`).
+    const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: Epoch;
 }
 
 impl Preset for Minimal {
@@ -85,6 +111,7 @@ impl Preset for Minimal {
     const CONSOLIDATION_CHURN_LIMIT_QUOTIENT: u64 = 32;
     const MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS: Gwei = 128_000_000_000;
     const MIN_BUILDER_WITHDRAWABILITY_DELAY: Epoch = 2;
+    const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: Epoch = 8;
 }
 
 impl Preset for Mainnet {
@@ -95,6 +122,7 @@ impl Preset for Mainnet {
     const CONSOLIDATION_CHURN_LIMIT_QUOTIENT: u64 = 65_536;
     const MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS: Gwei = 256_000_000_000;
     const MIN_BUILDER_WITHDRAWABILITY_DELAY: Epoch = 64;
+    const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: Epoch = 256;
 }
 
 #[cfg(test)]
@@ -152,5 +180,28 @@ mod tests {
         assert_eq!(BUILDER_WITHDRAWAL_PREFIX, 0xb0);
         assert_eq!(PAYLOAD_BUILDER_VERSION, 0);
         assert_eq!(BUILDER_INDEX_SELF_BUILD, u64::MAX);
+    }
+
+    #[test]
+    fn epoch_values_match_the_pinned_presets() {
+        // presets/{minimal,mainnet}/{phase0,altair,bellatrix,electra}.yaml and
+        // configs/{minimal,mainnet}.yaml at consensus-specs v1.7.0-beta.4.
+        assert_eq!(MIN_ACTIVATION_BALANCE, 32 * 1_000_000_000);
+        assert_eq!(EJECTION_BALANCE, 16 * 1_000_000_000);
+        assert_eq!(
+            (
+                HYSTERESIS_QUOTIENT,
+                HYSTERESIS_DOWNWARD_MULTIPLIER,
+                HYSTERESIS_UPWARD_MULTIPLIER
+            ),
+            (4, 1, 5)
+        );
+        assert_eq!(PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX, 3);
+        assert_eq!(MAX_PENDING_DEPOSITS_PER_EPOCH, 16);
+        assert_eq!(COMPOUNDING_WITHDRAWAL_PREFIX, 0x02);
+        assert_eq!(Minimal::EPOCHS_PER_SYNC_COMMITTEE_PERIOD, 8);
+        assert_eq!(Mainnet::EPOCHS_PER_SYNC_COMMITTEE_PERIOD, 256);
+        assert_eq!(epochs_per_eth1_voting_period::<Minimal>(), 4);
+        assert_eq!(epochs_per_eth1_voting_period::<Mainnet>(), 64);
     }
 }

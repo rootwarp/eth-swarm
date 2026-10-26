@@ -1,17 +1,22 @@
 //! Slot processing: `process_slots` (P0 L1848-1855) and the Gloas `process_slot`.
 
-use crate::{per_epoch, state_root, Preset, StfError};
+use crate::{per_epoch, state_root, BlsContext, Preset, StfError};
 use consensus_types::gloas::BeaconState;
 use consensus_types::primitives::{Root, Slot};
 use ssz_types::typenum::Unsigned;
 use tree_hash::TreeHash;
 
 /// `process_slots` (P0 L1848-1855): runs [`process_slot`] for every slot from `state.slot`
-/// up to `slot`, and `process_epoch` on the last slot of each epoch.
+/// up to `slot`, and `process_epoch` on the last slot of each epoch. `process_epoch` takes
+/// `bls` for its deposits and its sync committee.
 ///
 /// The work is linear in `slot - state.slot`, and, as in the spec, there is no upper bound.
 /// Bound `slot` against the wall clock before you call it with a slot from the network.
-pub fn process_slots<E: Preset>(state: &mut BeaconState<E>, slot: Slot) -> Result<(), StfError> {
+pub fn process_slots<E: Preset>(
+    state: &mut BeaconState<E>,
+    slot: Slot,
+    bls: &BlsContext,
+) -> Result<(), StfError> {
     if state.slot >= slot {
         return Err(StfError::SlotNotLater {
             state_slot: state.slot,
@@ -23,7 +28,7 @@ pub fn process_slots<E: Preset>(state: &mut BeaconState<E>, slot: Slot) -> Resul
         // `state.slot < slot`, so `state.slot + 1` cannot overflow.
         let next_slot = state.slot + 1;
         if next_slot.is_multiple_of(E::slots_per_epoch()) {
-            per_epoch::process_epoch(state)?;
+            per_epoch::process_epoch(state, bls)?;
         }
         state.slot = next_slot;
     }
@@ -67,7 +72,7 @@ pub fn process_slot<E: Preset>(state: &mut BeaconState<E>) -> Result<(), StfErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::genesis_state;
+    use crate::testing::{genesis_state, no_bls};
     use consensus_types::Minimal;
 
     type Spe = <Minimal as consensus_types::EthSpec>::SlotsPerHistoricalRoot;
@@ -96,7 +101,7 @@ mod tests {
     fn caches_the_roots_of_each_slot() {
         let mut state = genesis_state::<Minimal>(&[32_000_000_000; 8]);
         let pre_root = state_root(&mut state).unwrap();
-        process_slots(&mut state, 2).unwrap();
+        process_slots(&mut state, 2, &no_bls()).unwrap();
         assert_eq!(state.slot, 2);
         assert_eq!(state.state_roots.get(0), Some(&pre_root));
         // The empty header state root is filled with the root of slot 0.
@@ -109,13 +114,17 @@ mod tests {
     }
 
     #[test]
-    fn stops_at_the_epoch_boundary_until_process_epoch_lands() {
+    fn stops_at_the_builder_payments_until_they_land() {
         let mut state = genesis_state::<Minimal>(&[32_000_000_000; 8]);
+        let bls = no_bls();
         // Slot 7 is the last slot of epoch 0 in the minimal preset.
-        assert_eq!(process_slots(&mut state, 7), Ok(()));
+        assert_eq!(process_slots(&mut state, 7, &bls), Ok(()));
+        // `process_epoch` runs its steps up to `process_builder_pending_payments`.
         assert_eq!(
-            process_slots(&mut state, 8),
-            Err(StfError::Unimplemented("4.2b/4.6b"))
+            process_slots(&mut state, 8, &bls),
+            Err(StfError::Unimplemented(
+                "process_builder_pending_payments (4.6b)"
+            ))
         );
     }
 
@@ -125,7 +134,7 @@ mod tests {
         state.slot = 3;
         for slot in [0, 3] {
             assert_eq!(
-                process_slots(&mut state, slot),
+                process_slots(&mut state, slot, &no_bls()),
                 Err(StfError::SlotNotLater {
                     state_slot: 3,
                     slot

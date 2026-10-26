@@ -7,6 +7,11 @@
 //!
 //! [`block_signature_sets`] gives every set of a block for one backend call. The block
 //! processing steps check no signature themselves.
+//!
+//! The epoch processing also needs `eth_aggregate_pubkeys` for the next sync committee. A
+//! [`PubkeyAggregator`] that the caller supplies does it, so the crate links no BLS library.
+//! A [`BlsContext`] holds the backend, the aggregator and the `GENESIS_FORK_VERSION` of the
+//! deposit domain.
 
 pub use consensus_types::signing::{SignatureSet, SignerRef};
 
@@ -15,11 +20,12 @@ use crate::per_block::state_proposer_index;
 use crate::per_block::BlockContext;
 use crate::preset::BUILDER_INDEX_SELF_BUILD;
 use crate::{Preset, StfError};
-use consensus_types::common::SyncAggregate;
+use consensus_types::common::{DepositMessage, SyncAggregate};
 use consensus_types::gloas::{BeaconBlockBody, BeaconState, SignedBeaconBlock};
-use consensus_types::primitives::BLSSignature;
+use consensus_types::primitives::{BLSPubkey, BLSSignature, Bytes32, Gwei, Root, Version};
 use consensus_types::signing::{
-    compute_signing_root, DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
+    compute_domain, compute_signing_root, DOMAIN_BEACON_PROPOSER, DOMAIN_DEPOSIT, DOMAIN_RANDAO,
+    DOMAIN_SYNC_COMMITTEE,
 };
 
 /// `G2_POINT_AT_INFINITY` (`altair/bls.md` L25): the compressed G2 identity.
@@ -45,6 +51,35 @@ pub trait SignatureBackend {
     /// deposit is ignored. `Err` is only for a backend that is not available or that fails
     /// (for example a timeout, an overload or a verdict that was not fetched).
     fn verify_signature_sets(&self, sets: &[SignatureSet]) -> Result<bool, BackendError>;
+}
+
+/// The aggregator failed (for example on a key that fails `KeyValidate`, or on an empty
+/// input). The keys come from the validator registry, whose deposits passed a proof of
+/// possession, so this is never a proof that an input is invalid.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("pubkey aggregation failed: {0}")]
+pub struct AggregationError(pub String);
+
+/// `eth_aggregate_pubkeys` (`altair/bls.md` L36-52) for the state transition. cl-chain
+/// implements it on `crypto-bls` (feature `aggregate`). Calls are synchronous.
+pub trait PubkeyAggregator {
+    /// The compressed sum of `pubkeys`, with each duplicate counted. `Err` for an empty input
+    /// or for a key that does not decode or fails `KeyValidate`.
+    fn aggregate_pubkeys(&self, pubkeys: &[BLSPubkey]) -> Result<BLSPubkey, AggregationError>;
+}
+
+/// The BLS inputs of the transition that the state does not hold.
+#[derive(Clone, Copy)]
+pub struct BlsContext<'a> {
+    /// The verdicts of the block signatures and of the deposit signatures.
+    pub backend: &'a dyn SignatureBackend,
+    /// `eth_aggregate_pubkeys` for `get_next_sync_committee`.
+    pub aggregator: &'a dyn PubkeyAggregator,
+    /// The `GENESIS_FORK_VERSION` of the network, for the domain of the deposit signatures.
+    /// It is a value of the network config, not of the preset: Sepolia and Hoodi use the
+    /// mainnet preset with other versions. cl-chain reads it from
+    /// `network_config::ChainConfig::genesis_fork_version()`.
+    pub genesis_fork_version: Version,
 }
 
 /// The proposer signature set of a block: `verify_block_signature` (P0 L1839-1844) without
@@ -235,36 +270,91 @@ pub fn block_signature_sets_with<E: Preset>(
     Ok(sets)
 }
 
-/// Checks [`block_signature_sets`] through `backend` in one call.
+/// Checks [`block_signature_sets`] through `bls.backend` in one call.
 pub fn verify_block_signatures<E: Preset>(
     state: &BeaconState<E>,
     signed_block: &SignedBeaconBlock<E>,
-    backend: &dyn SignatureBackend,
+    bls: &BlsContext,
 ) -> Result<(), StfError> {
-    verify_block_signatures_with(state, signed_block, backend, &mut BlockContext::default())
+    verify_block_signatures_with(state, signed_block, bls, &mut BlockContext::default())
 }
 
 /// [`verify_block_signatures`] with a [`BlockContext`] for the same block.
 pub fn verify_block_signatures_with<E: Preset>(
     state: &BeaconState<E>,
     signed_block: &SignedBeaconBlock<E>,
-    backend: &dyn SignatureBackend,
+    bls: &BlsContext,
     ctx: &mut BlockContext,
 ) -> Result<(), StfError> {
     let sets = block_signature_sets_with(state, signed_block, ctx)?;
-    if backend.verify_signature_sets(&sets)? {
+    if bls.backend.verify_signature_sets(&sets)? {
         Ok(())
     } else {
         Err(StfError::InvalidBlockSignature)
     }
 }
 
+/// The signature set of `is_valid_deposit_signature` (E L1786-1797) without the BLS call:
+/// the inline key over its `DepositMessage`, in the domain `compute_domain(DOMAIN_DEPOSIT)`.
+/// That domain takes `genesis_fork_version` (see [`BlsContext::genesis_fork_version`]) and a
+/// zero genesis validators root, so a deposit is valid across forks.
+///
+/// The caller uses the set to fetch the verdict before the transition (ADR-011).
+pub fn deposit_signature_set(
+    pubkey: BLSPubkey,
+    withdrawal_credentials: Bytes32,
+    amount: Gwei,
+    signature: BLSSignature,
+    genesis_fork_version: Version,
+) -> SignatureSet {
+    let deposit_message = DepositMessage {
+        pubkey,
+        withdrawal_credentials,
+        amount,
+    };
+    // Fork-agnostic domain since deposits are valid across forks
+    let domain = compute_domain(DOMAIN_DEPOSIT, genesis_fork_version, Root::ZERO);
+    SignatureSet::single(
+        SignerRef::Inline(pubkey),
+        compute_signing_root(&deposit_message, domain),
+        signature,
+    )
+}
+
+/// `is_valid_deposit_signature` (E L1786-1797, New in Electra; Gloas keeps it), through
+/// `backend`, with the set of [`deposit_signature_set`].
+///
+/// `Ok(false)` for an invalid signature. By the contract of [`SignatureBackend`], that
+/// includes a key or a signature that does not decode or fails `KeyValidate`. A backend
+/// without a verdict gives [`StfError::MissingVerdict`], never `Ok(false)`.
+pub fn is_valid_deposit_signature(
+    pubkey: BLSPubkey,
+    withdrawal_credentials: Bytes32,
+    amount: Gwei,
+    signature: BLSSignature,
+    genesis_fork_version: Version,
+    backend: &dyn SignatureBackend,
+) -> Result<bool, StfError> {
+    let set = deposit_signature_set(
+        pubkey,
+        withdrawal_credentials,
+        amount,
+        signature,
+        genesis_fork_version,
+    );
+    backend
+        .verify_signature_sets(std::slice::from_ref(&set))
+        .map_err(StfError::MissingVerdict)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::per_slot::process_slots;
-    use crate::testing::{block_at_state_slot, genesis_state};
-    use consensus_types::primitives::Root;
+    use crate::testing::{
+        block_at_state_slot, bls_context, genesis_state, no_bls, ScriptedBackend,
+        GENESIS_FORK_VERSION,
+    };
     use consensus_types::Minimal;
     use std::cell::Cell;
 
@@ -287,7 +377,7 @@ mod tests {
         participants: &[usize],
     ) -> (BeaconState<Minimal>, SignedBeaconBlock<Minimal>) {
         let mut state = genesis_state::<Minimal>(&[32_000_000_000; 64]);
-        process_slots(&mut state, 7).unwrap();
+        process_slots(&mut state, 7, &no_bls()).unwrap();
         // Skip the epoch transition (not ported yet): slots 8 and 9 by hand.
         state.slot = 9;
         *state.block_roots.get_mut(8).unwrap() = Root::repeat_byte(8);
@@ -344,7 +434,7 @@ mod tests {
             calls: Cell::new(0),
         };
         assert_eq!(
-            verify_block_signatures(&state, &block, &rejecting),
+            verify_block_signatures(&state, &block, &bls_context(&rejecting)),
             Err(StfError::InvalidBlockSignature)
         );
         assert_eq!(rejecting.calls.get(), 1);
@@ -352,7 +442,10 @@ mod tests {
             verdict: true,
             calls: Cell::new(0),
         };
-        assert_eq!(verify_block_signatures(&state, &block, &accepting), Ok(()));
+        assert_eq!(
+            verify_block_signatures(&state, &block, &bls_context(&accepting)),
+            Ok(())
+        );
 
         // An empty sync aggregate: no sync set with the infinity signature, and an error
         // (with no backend call) without it.
@@ -595,5 +688,64 @@ mod tests {
                 index: 64
             })
         );
+    }
+
+    #[test]
+    fn deposit_set_signs_the_deposit_message_in_the_genesis_domain() {
+        let mut credentials = Bytes32::ZERO;
+        credentials[0] = 0x01;
+        let set =
+            deposit_signature_set([0xaa; 48], credentials, 7, [0x33; 96], GENESIS_FORK_VERSION);
+        let message = DepositMessage {
+            pubkey: [0xaa; 48],
+            withdrawal_credentials: credentials,
+            amount: 7,
+        };
+        // `compute_domain(DOMAIN_DEPOSIT)`: the genesis fork version and a zero root, so the
+        // domain does not change with the fork of the state.
+        let domain = compute_domain(DOMAIN_DEPOSIT, GENESIS_FORK_VERSION, Root::ZERO);
+        let want = SignatureSet::single(
+            SignerRef::Inline([0xaa; 48]),
+            compute_signing_root(&message, domain),
+            [0x33; 96],
+        );
+        assert_eq!(set, want);
+        let other = deposit_signature_set([0xaa; 48], credentials, 7, [0x33; 96], [0; 4]);
+        assert_ne!(other.signing_root(), want.signing_root());
+    }
+
+    #[test]
+    fn deposit_verdicts_come_from_the_backend() {
+        let backend = ScriptedBackend::new([
+            Ok(true),
+            Ok(false),
+            Err(BackendError("not prefetched".into())),
+        ]);
+        let check = || {
+            is_valid_deposit_signature(
+                [0xaa; 48],
+                Bytes32::ZERO,
+                7,
+                [0x33; 96],
+                GENESIS_FORK_VERSION,
+                &backend,
+            )
+        };
+        assert_eq!(check(), Ok(true));
+        assert_eq!(check(), Ok(false));
+        let missing = check().unwrap_err();
+        assert_eq!(
+            missing,
+            StfError::MissingVerdict(BackendError("not prefetched".into()))
+        );
+        assert!(!missing.proves_invalid());
+        let set = deposit_signature_set(
+            [0xaa; 48],
+            Bytes32::ZERO,
+            7,
+            [0x33; 96],
+            GENESIS_FORK_VERSION,
+        );
+        assert_eq!(backend.seen(), vec![set; 3]);
     }
 }

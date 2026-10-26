@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn gloas_order() {
         let mut state = genesis_state::<Minimal>(&[32_000_000_000; 64]);
-        per_slot::process_slots(&mut state, 3).unwrap();
+        per_slot::process_slots(&mut state, 3, &crate::testing::no_bls()).unwrap();
         state.latest_block_header.slot = 2;
         let block = block_at_state_slot(&state).message;
         let before = state_root(&mut state).unwrap();
@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn steps_call_their_spec_function() {
         let mut state = genesis_state::<Minimal>(&[32_000_000_000; 64]);
-        per_slot::process_slots(&mut state, 1).unwrap();
+        per_slot::process_slots(&mut state, 1, &crate::testing::no_bls()).unwrap();
         let block = block_at_state_slot(&state).message;
         let steps = block_steps::<Minimal>();
         let step = |s: BlockStep| steps.iter().find(|(k, _)| *k == s).unwrap().1;

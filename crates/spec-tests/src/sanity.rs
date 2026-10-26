@@ -7,6 +7,7 @@
 //! fail with an error that proves the input invalid (`StfError::proves_invalid`). Only
 //! `slots` runs: the `blocks` handler needs block processing.
 
+use crate::bls_backend::{bls_context, StateKeys};
 use crate::coverage::Reads;
 use crate::fixture;
 use crate::plan::Case;
@@ -48,7 +49,11 @@ fn slots<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
         .slot
         .checked_add(slots)
         .ok_or("pre.slot + slots overflows")?;
-    match (process_slots(&mut state, target), post) {
+    // The slots check no block signature: only the deposit verdicts of the epoch steps,
+    // whose keys are inline.
+    let keys = StateKeys::new(&state);
+    let bls = bls_context(&case.key.preset, &keys)?;
+    match (process_slots(&mut state, target, &bls), post) {
         (Ok(()), Some(post)) => {
             let got = state_root(&mut state).map_err(|e| format!("post-state root: {e}"))?;
             let want = post.tree_hash_root();
@@ -240,7 +245,8 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pre = state(2);
         let mut post = pre.clone();
-        process_slots(&mut post, 4).unwrap();
+        let keys = StateKeys::new(&post);
+        process_slots(&mut post, 4, &bls_context("minimal", &keys).unwrap()).unwrap();
         post.apply_updates().unwrap();
         let c = case(dir.path(), "minimal", Some(&pre), "2\n...\n", Some(&post));
         let reads = Reads::default();
@@ -257,7 +263,8 @@ pub(crate) mod tests {
             ("1", Some(&pre), "root mismatch"),
             // No post-state: the vector expects process_slots to fail.
             ("1", None, "expects to fail"),
-            // Slot 8 starts epoch 1, so process_epoch runs and is still a stub.
+            // Slot 8 starts epoch 1, so process_epoch runs, and it stops at the builder
+            // payments step, which is not ported yet.
             ("6", Some(&pre), "process_slots failed"),
             ("-1", Some(&pre), "unsigned integer"),
         ] {
@@ -266,7 +273,7 @@ pub(crate) mod tests {
             assert!(err.contains(needle), "{slots}: {err}");
         }
         // A vector without a post-state expects a spec failure, not a missing port: slot 8
-        // needs process_epoch, which is still a stub.
+        // needs the whole process_epoch, which stops at the builder payments step.
         let c = case(dir.path(), "minimal", Some(&pre), "6", None);
         let err = run(&Reads::default(), &c).unwrap_err();
         assert!(err.contains("not a spec failure"), "{err}");

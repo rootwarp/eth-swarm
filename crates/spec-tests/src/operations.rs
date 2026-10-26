@@ -13,13 +13,12 @@
 //! `skip.toml` entry. beta.4 has no `operations/randao` handler: `sanity/blocks` proves
 //! `process_randao`.
 
-use crate::bls_backend::StateKeys;
+use crate::bls_backend::{backend_for, bls_context, bls_setting, Bls, StateKeys};
 use crate::coverage::Reads;
 use crate::fixture;
 use crate::plan::Case;
 use consensus_types::common::SyncAggregate;
 use consensus_types::gloas::{BeaconBlock, BeaconState, BuilderDepositRequest, BuilderExitRequest};
-use consensus_types::primitives::Version;
 use consensus_types::{Mainnet, Minimal};
 use ssz::Decode;
 use state_transition::per_block::builder::{
@@ -28,12 +27,9 @@ use state_transition::per_block::builder::{
 use state_transition::per_block::sync_aggregate::process_sync_aggregate_with;
 use state_transition::per_block::{process_block_header, BlockContext};
 use state_transition::signatures::verify_sync_aggregate_signature_with;
-use state_transition::{
-    state_root, BackendError, Preset, SignatureBackend, SignatureSet, StfError,
-};
+use state_transition::{state_root, Preset, StfError};
 use std::path::Path;
 use tree_hash::TreeHash;
-use yaml_rust2::Yaml;
 
 /// Handlers this runner executes.
 pub const RUNNABLE: [&str; 4] = [
@@ -89,30 +85,6 @@ pub fn run(reads: &Reads, case: &Case) -> Result<(), String> {
     }
 }
 
-/// What `meta.yaml` says about the signatures (`bls_setting`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Bls {
-    /// 0 (or no `meta.yaml`): optional, and checked here. 1: required.
-    Check,
-    /// 2: the vector has no valid signatures. The BLS checks do not run (every signature is
-    /// valid, as in the spec with BLS off), but the checks that need no BLS (the infinity
-    /// signature of an empty sync aggregate) still run.
-    Ignore,
-}
-
-fn bls_setting(reads: &Reads, case: &Case) -> Result<Bls, String> {
-    let Some(path) = case.file("meta.yaml") else {
-        return Ok(Bls::Check);
-    };
-    let meta = fixture::load(reads, path)?;
-    match &meta["bls_setting"] {
-        Yaml::BadValue => Ok(Bls::Check),
-        Yaml::Integer(0 | 1) => Ok(Bls::Check),
-        Yaml::Integer(2) => Ok(Bls::Ignore),
-        other => Err(format!("meta.yaml: unknown bls_setting {other:?}")),
-    }
-}
-
 fn operation<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
     let file = |name: &str| case.file(name).ok_or_else(|| format!("case has no {name}"));
     let mut state = decode::<BeaconState<E>>(reads, file("pre.ssz_snappy")?)?;
@@ -131,16 +103,14 @@ fn operation<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
                 reads,
                 file("builder_deposit_request.ssz_snappy")?,
             )?;
-            let version = genesis_fork_version(&case.key.preset)?;
-            match bls {
-                Bls::Check => {
-                    let keys = StateKeys::new(&state);
-                    process_builder_deposit_request(&mut state, &request, version, &keys)
-                }
-                Bls::Ignore => {
-                    process_builder_deposit_request(&mut state, &request, version, &NoBls)
-                }
-            }
+            let keys = StateKeys::new(&state);
+            let ctx = bls_context(&case.key.preset, backend_for(bls, &keys))?;
+            process_builder_deposit_request(
+                &mut state,
+                &request,
+                ctx.genesis_fork_version,
+                ctx.backend,
+            )
         }
         ("operations", "builder_exit_request") => {
             let request =
@@ -165,26 +135,6 @@ fn operation<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
         (runner, handler) => return Err(format!("no runner for {runner}/{handler}")),
     };
     expect(&mut state, outcome, post)
-}
-
-/// `GENESIS_FORK_VERSION` of the spec config of `preset`: `configs/minimal.yaml` L27 and
-/// `configs/mainnet.yaml` L30 at v1.7.0-beta.4. The operations cases carry no
-/// `config.yaml`, so the runner keeps the two values here.
-fn genesis_fork_version(preset: &str) -> Result<Version, String> {
-    match preset {
-        "minimal" => Ok([0x00, 0x00, 0x00, 0x01]),
-        "mainnet" => Ok([0x00, 0x00, 0x00, 0x00]),
-        other => Err(format!("no GENESIS_FORK_VERSION for preset {other}")),
-    }
-}
-
-/// The backend of `bls_setting` 2: as the spec with BLS off, every signature is valid.
-struct NoBls;
-
-impl SignatureBackend for NoBls {
-    fn verify_signature_sets(&self, _: &[SignatureSet]) -> Result<bool, BackendError> {
-        Ok(true)
-    }
 }
 
 /// Compares the outcome of a handler with what the vector expects.
@@ -508,14 +458,6 @@ mod tests {
         assert!(run(&Reads::default(), &c)
             .unwrap_err()
             .contains("bls_setting"));
-    }
-
-    #[test]
-    fn genesis_fork_version_of_each_spec_config() {
-        // GENESIS_FORK_VERSION of configs/minimal.yaml (L27) and configs/mainnet.yaml (L30).
-        assert_eq!(genesis_fork_version("minimal"), Ok([0, 0, 0, 1]));
-        assert_eq!(genesis_fork_version("mainnet"), Ok([0, 0, 0, 0]));
-        assert!(genesis_fork_version("general").is_err());
     }
 
     #[test]

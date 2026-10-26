@@ -376,8 +376,9 @@ mod tests {
     }
 
     /// `process_slots` to the last slot of the state's epoch, then the epoch boundary.
-    /// `process_epoch` is a stub, so the boundary is done here by hand with its only effect
-    /// on the seeds: `process_randao_mixes_reset` copies the mix into the next epoch.
+    /// `process_epoch` does not complete yet, so the boundary is done here by hand with its
+    /// only effect on the seeds: `process_randao_mixes_reset` copies the mix into the next
+    /// epoch.
     fn cross_epoch(state: &mut consensus_types::gloas::BeaconState<consensus_types::Minimal>) {
         use consensus_types::{EthSpec, Minimal};
         use ssz_types::typenum::Unsigned;
@@ -385,7 +386,7 @@ mod tests {
         let epoch = crate::accessors::get_current_epoch(state);
         let last = (epoch + 1) * spe - 1;
         if state.slot < last {
-            crate::per_slot::process_slots(state, last).unwrap();
+            crate::per_slot::process_slots(state, last, &crate::testing::no_bls()).unwrap();
         }
         crate::per_slot::process_slot(state).unwrap();
         let n = <Minimal as EthSpec>::EpochsPerHistoricalVector::to_u64();
@@ -421,8 +422,12 @@ mod tests {
         // The seed of C + 2 uses the mix of C, which the blocks of epoch C still change.
         let cache = CommitteeCache::new(&state, c + 2).unwrap();
         let slot = Minimal::start_slot_at_epoch(c + 2);
-        crate::per_slot::process_slots(&mut state, Minimal::start_slot_at_epoch(c + 1) - 1)
-            .unwrap();
+        crate::per_slot::process_slots(
+            &mut state,
+            Minimal::start_slot_at_epoch(c + 1) - 1,
+            &crate::testing::no_bls(),
+        )
+        .unwrap();
         reveal(&mut state, 0x41);
         cross_epoch(&mut state);
         let state_seed = attester_seed(&state, c + 2).unwrap();

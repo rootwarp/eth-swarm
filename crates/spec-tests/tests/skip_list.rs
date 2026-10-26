@@ -107,31 +107,41 @@ fn state_transition_skips_point_at_their_milestone() {
             ("operations", "payload_attestation"),
             ("operations", "execution_payload_bid"),
             ("epoch_processing", "builder_pending_payments"),
-            ("epoch_processing", "ptc_window"),
             ("fork", "fork"),
             ("sanity", "blocks"),
         ] {
             let k = consensus("gloas", preset, runner, handler);
             assert_eq!(issue_of(&skips, &k), "4.7", "{k}");
         }
-        // The reason of each epoch step that is not ported names the item that ports it.
-        for (handler, item) in [
-            ("builder_pending_payments", "4.6b"),
-            ("ptc_window", "4.2b"),
-            ("registry_updates", "4.2b"),
-        ] {
-            let k = consensus("gloas", preset, "epoch_processing", handler);
-            let reason = skips.skipped_by(&k).unwrap().reason;
-            assert!(
-                reason.starts_with(&format!("Ported by {item}:")),
-                "{k}: {reason}"
-            );
-        }
-        // The ported epoch steps run.
+        // The reason of the epoch step that is not ported names the item that ports it.
+        let k = consensus(
+            "gloas",
+            preset,
+            "epoch_processing",
+            "builder_pending_payments",
+        );
+        let reason = skips.skipped_by(&k).unwrap().reason;
+        assert!(reason.starts_with("Ported by 4.6b:"), "{k}: {reason}");
+        // Every other Gloas epoch step runs, also the three that the epoch README omits
+        // (pending_deposits_churn, proposer_lookahead and ptc_window).
         for handler in [
             "justification_and_finalization",
             "inactivity_updates",
             "rewards_and_penalties",
+            "registry_updates",
+            "slashings",
+            "eth1_data_reset",
+            "pending_deposits",
+            "pending_deposits_churn",
+            "pending_consolidations",
+            "effective_balance_updates",
+            "slashings_reset",
+            "randao_mixes_reset",
+            "historical_summaries_update",
+            "participation_flag_updates",
+            "sync_committee_updates",
+            "proposer_lookahead",
+            "ptc_window",
         ] {
             let k = consensus("gloas", preset, "epoch_processing", handler);
             assert!(skips.skipped_by(&k).is_none(), "{k} is skipped");
@@ -154,6 +164,35 @@ fn gloas_operations_runnable_handlers_are_not_skipped() {
             assert_eq!(issue_of(&skips, &k), "4.7", "{k}");
         }
     }
+}
+
+/// One Gloas `epoch_processing` case entry is left, for the step that is not ported. The
+/// entry with a `file` field excuses only the whole-epoch files, and its cases run.
+#[test]
+fn only_the_builder_payments_step_is_skipped() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testing/skip.toml");
+    let doc: toml::Table = std::fs::read_to_string(path).unwrap().parse().unwrap();
+    let field =
+        |e: &toml::Value, name: &str| e.get(name).and_then(|v| v.as_str()).map(String::from);
+    let mut case_entries = Vec::new();
+    let mut file_entries = Vec::new();
+    for e in doc["skip"].as_array().unwrap() {
+        if field(e, "fork").as_deref() != Some("gloas")
+            || field(e, "runner").as_deref() != Some("epoch_processing")
+        {
+            continue;
+        }
+        let handler = field(e, "handler").unwrap();
+        match field(e, "file") {
+            Some(file) => file_entries.push((handler, file)),
+            None => case_entries.push(handler),
+        }
+    }
+    assert_eq!(case_entries, ["builder_pending_payments"]);
+    assert_eq!(
+        file_entries,
+        [("*".to_string(), "*_epoch.ssz_snappy".to_string())]
+    );
 }
 
 /// The data-column `ssz_static` types, by the forks that define them: consensus-types defines

@@ -1,12 +1,15 @@
 //! Test inputs: a Gloas genesis-like state with a given registry, empty blocks, builders
-//! and their requests, and a scripted signature backend.
+//! and their requests, a scripted signature backend and a pubkey aggregator without BLS.
 
 use crate::caches::get_beacon_proposer_index;
 use crate::caches::{initialize_proposer_lookahead, initialize_ptc_window};
 use crate::per_block::builder::{process_builder_deposit_request, process_builder_exit_request};
 use crate::preset::{BUILDER_INDEX_SELF_BUILD, BUILDER_WITHDRAWAL_PREFIX};
 use crate::signatures::G2_POINT_AT_INFINITY;
-use crate::{BackendError, Preset, SignatureBackend, SignatureSet, SignerRef};
+use crate::{
+    AggregationError, BackendError, BlsContext, Preset, PubkeyAggregator, SignatureBackend,
+    SignatureSet, SignerRef,
+};
 use consensus_types::gloas::*;
 use consensus_types::primitives::{
     Address, BLSPubkey, Bytes32, Epoch, Gwei, Root, Version, FAR_FUTURE_EPOCH,
@@ -369,4 +372,47 @@ pub(crate) fn block_at_state_slot<E: Preset>(state: &BeaconState<E>) -> SignedBe
     let mut block = signed_block::<E>(state.slot, proposer);
     block.message.parent_root = state.latest_block_header.tree_hash_root();
     block
+}
+
+/// A [`PubkeyAggregator`] without BLS: the byte-wise XOR of the keys. It is not the BLS sum,
+/// but it depends on each key and on the number of times a key occurs. An empty input fails,
+/// as in `eth_aggregate_pubkeys`.
+pub(crate) struct XorAggregator;
+
+impl PubkeyAggregator for XorAggregator {
+    fn aggregate_pubkeys(&self, pubkeys: &[BLSPubkey]) -> Result<BLSPubkey, AggregationError> {
+        if pubkeys.is_empty() {
+            return Err(AggregationError("no keys".into()));
+        }
+        let mut sum = [0u8; 48];
+        for key in pubkeys {
+            for (s, k) in sum.iter_mut().zip(key) {
+                *s ^= k;
+            }
+        }
+        Ok(sum)
+    }
+}
+
+/// A [`BlsContext`] of the minimal config with `backend` and the [`XorAggregator`].
+pub(crate) fn bls_context(backend: &dyn SignatureBackend) -> BlsContext<'_> {
+    BlsContext {
+        backend,
+        aggregator: &XorAggregator,
+        genesis_fork_version: GENESIS_FORK_VERSION,
+    }
+}
+
+/// A [`SignatureBackend`] for the tests that need no verdict: each call gives `Err`.
+pub(crate) struct NoVerdicts;
+
+impl SignatureBackend for NoVerdicts {
+    fn verify_signature_sets(&self, _: &[SignatureSet]) -> Result<bool, BackendError> {
+        Err(BackendError("no verdicts in this test".into()))
+    }
+}
+
+/// [`bls_context`] with [`NoVerdicts`], for the tests that check no signature.
+pub(crate) fn no_bls() -> BlsContext<'static> {
+    bls_context(&NoVerdicts)
 }

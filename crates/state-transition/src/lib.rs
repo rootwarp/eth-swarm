@@ -2,18 +2,20 @@
 //! v1.7.0-beta.4, and the earlier forks it inherits from).
 //!
 //! The crate does no I/O and links no BLS library: signature checks go through a
-//! [`SignatureBackend`] that the caller supplies.
+//! [`SignatureBackend`] that the caller supplies, and pubkey aggregation goes through a
+//! [`PubkeyAggregator`].
 //!
 //! - [`state_transition`]: the slot loop, the block signature, the block and the state root.
 //! - [`per_slot`]: `process_slots` and `process_slot`.
-//! - [`per_epoch`]: the epoch processing (a stub for now).
+//! - [`per_epoch`]: the epoch processing (every step but the builder payments).
 //! - [`per_block`]: the block processing: the step order, the header, RANDAO, eth1 data and
 //!   the sync aggregate (the other steps and operations are stubs for now).
 //! - [`accessors`]: the beacon-state accessors and the misc helpers.
 //! - [`caches`]: shuffling, beacon committees, proposer and PTC selection.
 //! - [`mutators`]: the balance helpers, the exit and consolidation churn, validator and
 //!   builder exits, builder-payment settlement and `slash_validator`.
-//! - [`signatures`]: the [`SignatureBackend`] seam and the signature sets of a block.
+//! - [`signatures`]: the [`SignatureBackend`] and [`PubkeyAggregator`] seams in a
+//!   [`BlsContext`], the signature sets of a block and the deposit signature set.
 //!
 //! Each ported function cites its spec file and line range at the pin. File prefixes: P0
 //! `phase0/beacon-chain.md`, A `altair/beacon-chain.md`, Bx `bellatrix/beacon-chain.md`, C
@@ -36,7 +38,10 @@ pub mod signatures;
 mod testing;
 
 pub use preset::Preset;
-pub use signatures::{BackendError, SignatureBackend, SignatureSet, SignerRef};
+pub use signatures::{
+    AggregationError, BackendError, BlsContext, PubkeyAggregator, SignatureBackend, SignatureSet,
+    SignerRef,
+};
 
 use consensus_types::gloas::{BeaconBlock, BeaconState, SignedBeaconBlock};
 use consensus_types::primitives::{
@@ -251,12 +256,17 @@ pub enum StfError {
     /// [`signatures::verify_sync_aggregate_signature`].
     #[error("invalid sync aggregate signature")]
     InvalidSyncAggregateSignature,
+    /// The [`PubkeyAggregator`] failed on the keys of the next sync committee. The keys come
+    /// from the registry, so this is a failure of the aggregator or of our state, never a
+    /// proof that the input is invalid.
+    #[error(transparent)]
+    PubkeyAggregation(#[from] AggregationError),
 }
 
 impl StfError {
     /// Whether the error proves that the input is invalid by the spec (REJECT). It does not
     /// for a step that is not ported yet, a backend without a verdict, a missing deposit
-    /// verdict, a committee cache of another epoch or seed, a failure of the state trees, a
+    /// verdict, a failed pubkey aggregation, a committee cache of another epoch or seed, a failure of the state trees, a
     /// state list shorter than the registry or a code index past a spec table
     /// (`ListIndexOutOfRange`), or a participation epoch other than the previous and the
     /// current one (`ParticipationEpochOutOfRange`):
@@ -294,7 +304,10 @@ impl StfError {
             // The committee keys come from the state, not from the block, and a state that
             // the spec makes has each of them in its registry. So, as for
             // `ListIndexOutOfRange`, our own state is wrong, and the block did not cause it.
-            | Self::UnknownSyncCommitteeMember { .. } => false,
+            | Self::UnknownSyncCommitteeMember { .. }
+            // Registry keys passed a proof of possession, so the aggregator or our state
+            // failed, not the object.
+            | Self::PubkeyAggregation(_) => false,
             Self::SlotNotLater { .. }
             | Self::InvalidBlockSignature
             | Self::StateRootMismatch { .. }
@@ -349,9 +362,10 @@ pub fn state_root<E: Preset>(state: &mut BeaconState<E>) -> Result<Root, StfErro
 /// Processes the slots up to `block.slot`, applies the block, and checks
 /// `block.state_root`. With `validate_result` true it first runs the cheap header checks
 /// ([`per_block::check_block_header`]) and then checks every signature set of the block
-/// ([`signatures::block_signature_sets`]) through `backend` in one call. A block that
+/// ([`signatures::block_signature_sets`]) through `bls.backend` in one call. A block that
 /// fails the header checks costs no registry read and no backend call. On `Err`, `state` is
-/// partly updated: the caller drops it.
+/// partly updated: the caller drops it. The epoch processing of the slots also reads `bls`
+/// (see [`per_epoch::process_epoch`]).
 ///
 /// `validate_result` false skips every BLS check: the proposer signature, the RANDAO reveal
 /// and the sync aggregate signature. The spec skips only the proposer signature there.
@@ -374,13 +388,13 @@ pub fn state_transition<E: Preset>(
     state: &mut BeaconState<E>,
     signed_block: &SignedBeaconBlock<E>,
     validate_result: bool,
-    backend: &dyn SignatureBackend,
+    bls: &BlsContext,
 ) -> Result<(), StfError> {
     apply_block(
         state,
         signed_block,
         validate_result,
-        backend,
+        bls,
         per_block::process_block_with,
     )
 }
@@ -391,7 +405,7 @@ pub(crate) fn apply_block<E, F>(
     state: &mut BeaconState<E>,
     signed_block: &SignedBeaconBlock<E>,
     validate_result: bool,
-    backend: &dyn SignatureBackend,
+    bls: &BlsContext,
     block_fn: F,
 ) -> Result<(), StfError>
 where
@@ -403,13 +417,13 @@ where
     ) -> Result<(), StfError>,
 {
     let block = &signed_block.message;
-    per_slot::process_slots(state, block.slot)?;
+    per_slot::process_slots(state, block.slot, bls)?;
     // One context for the block: the signature sets and the steps share the sync committee
     // indices.
     let mut ctx = per_block::BlockContext::default();
     if validate_result {
         per_block::check_block_header(state, block)?;
-        signatures::verify_block_signatures_with(state, signed_block, backend, &mut ctx)?;
+        signatures::verify_block_signatures_with(state, signed_block, bls, &mut ctx)?;
     }
     block_fn(state, block, &mut ctx)?;
     if validate_result {
@@ -428,7 +442,7 @@ where
 mod tests {
     use super::*;
     use crate::accessors::get_domain;
-    use crate::testing::{block_at_state_slot, genesis_state};
+    use crate::testing::{block_at_state_slot, bls_context, genesis_state, no_bls};
     use consensus_types::signing::{compute_signing_root, DOMAIN_BEACON_PROPOSER};
     use consensus_types::Minimal;
     use std::cell::RefCell;
@@ -468,7 +482,7 @@ mod tests {
     fn state_and_block() -> (BeaconState<Minimal>, SignedBeaconBlock<Minimal>) {
         let state = genesis_state::<Minimal>(&[32_000_000_000; 8]);
         let mut post = state.clone();
-        per_slot::process_slots(&mut post, 1).unwrap();
+        per_slot::process_slots(&mut post, 1, &no_bls()).unwrap();
         let mut block = block_at_state_slot(&post);
         block.message.state_root = state_root(&mut post).unwrap();
         (state, block)
@@ -479,13 +493,19 @@ mod tests {
         let (state, block) = state_and_block();
         let rejecting = FixedBackend::new(Ok(false));
         assert_eq!(
-            apply_block(&mut state.clone(), &block, true, &rejecting, no_op),
+            apply_block(
+                &mut state.clone(),
+                &block,
+                true,
+                &bls_context(&rejecting),
+                no_op
+            ),
             Err(StfError::InvalidBlockSignature)
         );
         // The backend saw the proposer set of the block first, in one batch with the
         // RANDAO set (the sync aggregate is empty, with the infinity signature).
         let mut at_slot = state.clone();
-        per_slot::process_slots(&mut at_slot, 1).unwrap();
+        per_slot::process_slots(&mut at_slot, 1, &no_bls()).unwrap();
         let domain = get_domain(&at_slot, DOMAIN_BEACON_PROPOSER, None);
         let want = SignatureSet::single(
             SignerRef::Validator(block.message.proposer_index),
@@ -498,13 +518,25 @@ mod tests {
         // No verdict is not a proof of a bad signature.
         let unavailable = FixedBackend::new(Err(BackendError("timeout".into())));
         assert_eq!(
-            apply_block(&mut state.clone(), &block, true, &unavailable, no_op),
+            apply_block(
+                &mut state.clone(),
+                &block,
+                true,
+                &bls_context(&unavailable),
+                no_op
+            ),
             Err(StfError::SignatureBackend(BackendError("timeout".into())))
         );
         // Without `validate_result` the backend is not asked.
         let skipped = FixedBackend::new(Ok(false));
         assert_eq!(
-            apply_block(&mut state.clone(), &block, false, &skipped, no_op),
+            apply_block(
+                &mut state.clone(),
+                &block,
+                false,
+                &bls_context(&skipped),
+                no_op
+            ),
             Ok(())
         );
         assert!(skipped.seen.borrow().is_empty());
@@ -517,7 +549,7 @@ mod tests {
                 &mut state.clone(),
                 &stranger,
                 true,
-                &FixedBackend::new(Ok(true)),
+                &bls_context(&FixedBackend::new(Ok(true))),
                 no_op
             ),
             Err(StfError::WrongProposer {
@@ -538,7 +570,7 @@ mod tests {
         let mut state = genesis_state::<Minimal>(&[32_000_000_000; 64]);
         state.current_sync_committee.pubkeys[0] = [0xee; 48];
         let mut at_slot = state.clone();
-        per_slot::process_slots(&mut at_slot, 1).unwrap();
+        per_slot::process_slots(&mut at_slot, 1, &no_bls()).unwrap();
         let mut block = block_at_state_slot(&at_slot);
         let aggregate = &mut block.message.body.sync_aggregate;
         aggregate.sync_committee_bits.set(0, true).unwrap();
@@ -549,21 +581,39 @@ mod tests {
         orphan.message.parent_root = Root::repeat_byte(9);
         let backend = FixedBackend::new(Ok(true));
         assert!(matches!(
-            apply_block(&mut state.clone(), &orphan, true, &backend, no_op),
+            apply_block(
+                &mut state.clone(),
+                &orphan,
+                true,
+                &bls_context(&backend),
+                no_op
+            ),
             Err(StfError::ParentRootMismatch { .. })
         ));
         // A block with a wrong slot for its proposer fails the same way.
         let mut stranger = block.clone();
         stranger.message.proposer_index = (block.message.proposer_index + 1) % 64;
         assert!(matches!(
-            apply_block(&mut state.clone(), &stranger, true, &backend, no_op),
+            apply_block(
+                &mut state.clone(),
+                &stranger,
+                true,
+                &bls_context(&backend),
+                no_op
+            ),
             Err(StfError::WrongProposer { .. })
         ));
         assert!(backend.seen.borrow().is_empty());
 
         // A block that passes the header checks reaches the scan before the backend.
         assert_eq!(
-            apply_block(&mut state.clone(), &block, true, &backend, no_op),
+            apply_block(
+                &mut state.clone(),
+                &block,
+                true,
+                &bls_context(&backend),
+                no_op
+            ),
             Err(StfError::UnknownSyncCommitteeMember { position: 0 })
         );
         assert!(backend.seen.borrow().is_empty());
@@ -576,7 +626,13 @@ mod tests {
         let mut wrong = block.clone();
         wrong.message.state_root = Root::repeat_byte(0xee);
         assert_eq!(
-            apply_block(&mut state.clone(), &wrong, true, &accepting, no_op),
+            apply_block(
+                &mut state.clone(),
+                &wrong,
+                true,
+                &bls_context(&accepting),
+                no_op
+            ),
             Err(StfError::StateRootMismatch {
                 block: Root::repeat_byte(0xee),
                 computed: block.message.state_root,
@@ -584,12 +640,18 @@ mod tests {
         );
         // Without `validate_result` the root is not checked.
         assert_eq!(
-            apply_block(&mut state.clone(), &wrong, false, &accepting, no_op),
+            apply_block(
+                &mut state.clone(),
+                &wrong,
+                false,
+                &bls_context(&accepting),
+                no_op
+            ),
             Ok(())
         );
         let mut post = state.clone();
         assert_eq!(
-            apply_block(&mut post, &block, true, &accepting, no_op),
+            apply_block(&mut post, &block, true, &bls_context(&accepting), no_op),
             Ok(())
         );
         assert_eq!(post.slot, 1);
@@ -597,14 +659,14 @@ mod tests {
         // the parent-payload step until it is ported.
         let mut post = state;
         assert_eq!(
-            state_transition(&mut post, &block, true, &accepting),
+            state_transition(&mut post, &block, true, &bls_context(&accepting)),
             Err(StfError::Unimplemented("4.6a"))
         );
     }
 
     /// The number of [`StfError`] variants: one more than the largest [`variant_id`].
     /// Increase `VARIANTS` when you add an id.
-    const VARIANTS: usize = 29;
+    const VARIANTS: usize = 30;
 
     /// A distinct id for each variant. The match has no `_` arm, so a new variant does not
     /// compile until it gets an id here, and then the table test fails until it has an entry.
@@ -639,6 +701,7 @@ mod tests {
             StfError::BlockDeposits(_) => 26,
             StfError::UnknownSyncCommitteeMember { .. } => 27,
             StfError::InvalidSyncAggregateSignature => 28,
+            StfError::PubkeyAggregation(_) => 29,
         }
     }
 
@@ -757,6 +820,10 @@ mod tests {
             (StfError::BlockDeposits(1), true),
             (StfError::UnknownSyncCommitteeMember { position: 1 }, false),
             (StfError::InvalidSyncAggregateSignature, true),
+            (
+                StfError::PubkeyAggregation(AggregationError("bad key".into())),
+                false,
+            ),
         ];
         let mut ids: Vec<usize> = cases.iter().map(|(e, _)| variant_id(e)).collect();
         ids.sort_unstable();
