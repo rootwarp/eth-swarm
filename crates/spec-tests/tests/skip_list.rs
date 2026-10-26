@@ -210,3 +210,58 @@ fn kzg_bls_and_light_client_skips_point_at_their_milestone() {
     let k = key("bls12-381-tests", "none", "none", "bls", "hash_to_G2");
     assert_eq!(issue_of(&skips, &k), "none");
 }
+
+/// Gloas `sanity/slots` runs inside one epoch; the cases that cross an epoch boundary wait
+/// for `process_epoch`. phase0 `shuffling/core` runs; every other phase0 runner is out of
+/// scope.
+#[test]
+fn slots_inside_one_epoch_and_shuffling_run() {
+    let skips = committed();
+    let case = |fork: &str, preset: &str, runner: &str, handler: &str, case: &str| CaseKey {
+        case: case.into(),
+        ..consensus(fork, preset, runner, handler)
+    };
+    for preset in ["minimal", "mainnet"] {
+        for name in [
+            "slots_1",
+            "slots_2",
+            "execution_payload_availability_reset_from_set",
+            "execution_payload_availability_reset_from_unset",
+        ] {
+            let k = case(
+                "gloas",
+                preset,
+                "sanity",
+                "slots",
+                &format!("pyspec_tests/{name}"),
+            );
+            assert!(skips.skipped_by(&k).is_none(), "{k} is skipped");
+        }
+        for name in [
+            "over_epoch_boundary",
+            "empty_epoch",
+            "historical_accumulator",
+        ] {
+            let k = case(
+                "gloas",
+                preset,
+                "sanity",
+                "slots",
+                &format!("pyspec_tests/{name}"),
+            );
+            assert_eq!(issue_of(&skips, &k), "4.7", "{k}");
+        }
+        let k = case(
+            "phase0",
+            preset,
+            "shuffling",
+            "core",
+            "shuffle/shuffle_0x00_0",
+        );
+        assert!(skips.skipped_by(&k).is_none(), "{k} is skipped");
+        for runner in ["epoch_processing", "operations", "sanity", "ssz_static"] {
+            let k = consensus("phase0", preset, runner, "any");
+            assert_eq!(issue_of(&skips, &k), "none", "{k}");
+        }
+    }
+}

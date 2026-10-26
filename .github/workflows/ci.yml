@@ -137,6 +137,8 @@ jobs:
         run: bash scripts/tests/check-dep-cycles.test.sh && bash scripts/check-dep-cycles.sh
       - name: m2a-session links no discv5 and no store crate (one pinned peer, blocks dropped)
         run: bash scripts/tests/check-m2a-deps.test.sh && bash scripts/check-m2a-deps.sh
+      - name: state-transition links no blst (pure core; signatures go through a backend)
+        run: bash scripts/tests/check-state-transition-deps.test.sh && bash scripts/check-state-transition-deps.sh
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Fetch and verify spec vectors (uncached)
         run: PRESETS="general minimal" bash testing/fetch-vectors.sh

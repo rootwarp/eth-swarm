@@ -23,6 +23,16 @@ pub fn parse(text: &str) -> Result<Yaml, String> {
     }
 }
 
+/// Reads (recording the path) and snappy-decodes (block format) a `.ssz_snappy` file.
+pub fn ssz_snappy(reads: &Reads, path: &Path) -> Result<Vec<u8>, String> {
+    let compressed = reads
+        .read(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    snap::raw::Decoder::new()
+        .decompress_vec(&compressed)
+        .map_err(|e| format!("{}: snappy: {e}", path.display()))
+}
+
 /// `map[key]`, or an error naming the missing key.
 pub fn field<'y>(map: &'y Yaml, key: &str) -> Result<&'y Yaml, String> {
     match &map[key] {

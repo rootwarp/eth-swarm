@@ -18,8 +18,11 @@ SPEC_SETS="ssz-specs minimal" cargo test -p spec-tests --release --test vectors
 - **Runners:** `ssz_generic` (ssz-specs fixtures, sample types transcribed from the fillers),
   `ssz_static` (Fulu and Gloas, types from `consensus-types`; decode, re-encode,
   `hash_tree_root`), `kzg` (cell handlers through `crypto-kzg` with `TrustedSetup::load_pinned`)
-  and `bls` (every handler through `crypto-bls`, `sign`/`aggregate`/`aggregate_verify` via its
-  `test-vectors` feature). consensus-spec-tests cases also have their `manifest.yaml` checked
+  `bls` (every handler through `crypto-bls`, `sign`/`aggregate`/`aggregate_verify` via its
+  `test-vectors` feature), `networking` (the custody handlers through `consensus_types::das`),
+  `sanity` (Gloas `sanity/slots` through `state_transition::per_slot::process_slots`, post-state
+  `hash_tree_root`) and `shuffling` (phase0 `shuffling/core`: the whole-list shuffle and the
+  per-index `compute_shuffled_index` must both equal `mapping`). consensus-spec-tests cases also have their `manifest.yaml` checked
   against the directory.
 - **Handler directories:** `kzg.rs` and `bls.rs` list every handler they run and every one they
   know but do not run. Any other directory under `bls/` or `kzg/` fails the run, skip entry or
@@ -34,7 +37,8 @@ SPEC_SETS="ssz-specs minimal" cargo test -p spec-tests --release --test vectors
   was not there when the cases were planned fails the run too. Filtered runs (`-- <name>`,
   `--skip`, `--ignored`) turn the guard off.
 - **Setup:** every scanned set must hold files, including its runnable subtrees (e.g.
-  `tests/minimal/{fulu,gloas}/ssz_static`, cryptography-specs `tests/{bls,kzg}`). Setup and
+  `tests/minimal/{fulu,gloas}/ssz_static`, `tests/<preset>/phase0/shuffling`,
+  cryptography-specs `tests/{bls,kzg}`). Setup and
   skip-list errors exit 101 before any trial runs, whatever the name filter.
 - **`deserialization_G1` and KeyValidate:** the suite expects the compressed identity to
   decode; `PublicKey::from_validated_bytes` rejects it as a key (`PublicKeyIsInfinity`, reported

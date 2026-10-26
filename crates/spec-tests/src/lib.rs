@@ -7,10 +7,12 @@
 //!   anything else is reported as unaccounted so the run fails.
 //! - Runners: [`ssz_generic`] (ethereum/ssz-specs JSON fixtures), [`ssz_static`]
 //!   (consensus-spec-tests `<preset>/{fulu,gloas}/ssz_static` against `consensus-types`),
-//!   [`kzg`] (cryptography-specs cell handlers through `crypto-kzg`) and [`bls`] (BLS handlers
+//!   [`kzg`] (cryptography-specs cell handlers through `crypto-kzg`), [`bls`] (BLS handlers
 //!   of bls12-381-tests, cryptography-specs and consensus-spec-tests `general` through
-//!   `crypto-bls`) and [`networking`] (the custody handlers of `<preset>/{fulu,gloas}/networking`
-//!   through `consensus_types::das`).
+//!   `crypto-bls`), [`networking`] (the custody handlers of `<preset>/{fulu,gloas}/networking`
+//!   through `consensus_types::das`), [`sanity`] (`<preset>/gloas/sanity/slots` through
+//!   `state_transition::per_slot`) and [`shuffling`] (`<preset>/phase0/shuffling/core` through
+//!   `state_transition::caches`).
 
 pub mod bls;
 pub mod check;
@@ -19,6 +21,8 @@ pub mod fixture;
 pub mod kzg;
 pub mod networking;
 pub mod plan;
+pub mod sanity;
+pub mod shuffling;
 pub mod ssz_generic;
 pub mod ssz_static;
 pub mod suite;

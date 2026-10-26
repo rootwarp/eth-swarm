@@ -4,7 +4,7 @@
 
 use crate::coverage::{self, CaseShape, Guard, Layout, Reads, Slot};
 use crate::plan::{plan, Case, CaseKey, Date, Disposition, Scope, SkipList, COMPTESTS_PRESETS};
-use crate::{bls, fixture, kzg, networking, ssz_generic, ssz_static};
+use crate::{bls, fixture, kzg, networking, sanity, shuffling, ssz_generic, ssz_static};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -133,6 +133,7 @@ pub const SETS: [VectorSet; 7] = [
         &[
             "tests/minimal/fulu/ssz_static",
             "tests/minimal/gloas/ssz_static",
+            "tests/minimal/phase0/shuffling",
         ],
     ),
     consensus(
@@ -142,6 +143,7 @@ pub const SETS: [VectorSet; 7] = [
         &[
             "tests/mainnet/fulu/ssz_static",
             "tests/mainnet/gloas/ssz_static",
+            "tests/mainnet/phase0/shuffling",
         ],
     ),
     VectorSet {
@@ -454,6 +456,8 @@ enum Kind {
     Bls,
     Kzg,
     Networking,
+    Sanity,
+    Shuffling,
 }
 
 /// The runner for a case, or `None` if nothing in this crate runs it.
@@ -486,6 +490,14 @@ fn kind(case: &Case) -> Option<Kind> {
         ("consensus-specs", "networking") if networking::supported(&k.fork, &k.handler) => {
             Some(Kind::Networking)
         }
+        ("consensus-specs", "sanity") if sanity::supported(&k.fork, &k.preset, &k.handler) => {
+            Some(Kind::Sanity)
+        }
+        ("consensus-specs", "shuffling")
+            if shuffling::supported(&k.fork, &k.preset, &k.handler) =>
+        {
+            Some(Kind::Shuffling)
+        }
         _ => None,
     }
 }
@@ -512,6 +524,14 @@ impl Kind {
             Kind::Networking => {
                 consensus_manifest(reads, case)?;
                 networking::run(reads, handler, data(case, "meta.yaml")?)
+            }
+            Kind::Sanity => {
+                consensus_manifest(reads, case)?;
+                sanity::run(reads, case)
+            }
+            Kind::Shuffling => {
+                consensus_manifest(reads, case)?;
+                shuffling::run(reads, &case.key.preset, data(case, "mapping.yaml")?)
             }
         }
     }

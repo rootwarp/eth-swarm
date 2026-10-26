@@ -258,13 +258,172 @@ owner   = "ian"
 issue   = "4.7"
 expires = "2026-11-30"
 
+# Gloas sanity/slots cases that cross an epoch boundary: process_slots calls process_epoch,
+# which is a stub until the Gloas epoch processing lands. The cases inside one epoch run.
+
 [[skip]]
 source  = "consensus-specs"
 fork    = "gloas"
 preset  = "*"
 runner  = "sanity"
-handler = "*"
-reason  = "No sanity runner yet: Gloas sanity vectors land with the Gloas state transition"
+handler = "slots"
+case    = "pyspec_tests/balance_change_affects_proposer"
+reason  = "Crosses an epoch boundary, so it needs process_epoch, which is a stub until the Gloas epoch processing lands"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "sanity"
+handler = "slots"
+case    = "pyspec_tests/double_empty_epoch"
+reason  = "Crosses an epoch boundary, so it needs process_epoch, which is a stub until the Gloas epoch processing lands"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "sanity"
+handler = "slots"
+case    = "pyspec_tests/effective_decrease_balance_updates_lookahead"
+reason  = "Crosses an epoch boundary, so it needs process_epoch, which is a stub until the Gloas epoch processing lands"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "sanity"
+handler = "slots"
+case    = "pyspec_tests/empty_epoch"
+reason  = "Crosses an epoch boundary, so it needs process_epoch, which is a stub until the Gloas epoch processing lands"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "sanity"
+handler = "slots"
+case    = "pyspec_tests/historical_accumulator"
+reason  = "Crosses an epoch boundary, so it needs process_epoch, which is a stub until the Gloas epoch processing lands"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "sanity"
+handler = "slots"
+case    = "pyspec_tests/multiple_pending_deposits_same_pubkey"
+reason  = "Crosses an epoch boundary, so it needs process_epoch, which is a stub until the Gloas epoch processing lands"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "sanity"
+handler = "slots"
+case    = "pyspec_tests/multiple_pending_deposits_same_pubkey_above_upward_threshold"
+reason  = "Crosses an epoch boundary, so it needs process_epoch, which is a stub until the Gloas epoch processing lands"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "sanity"
+handler = "slots"
+case    = "pyspec_tests/multiple_pending_deposits_same_pubkey_below_upward_threshold"
+reason  = "Crosses an epoch boundary, so it needs process_epoch, which is a stub until the Gloas epoch processing lands"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "sanity"
+handler = "slots"
+case    = "pyspec_tests/multiple_pending_deposits_same_pubkey_compounding"
+reason  = "Crosses an epoch boundary, so it needs process_epoch, which is a stub until the Gloas epoch processing lands"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "sanity"
+handler = "slots"
+case    = "pyspec_tests/multiple_pending_deposits_same_pubkey_different_signature"
+reason  = "Crosses an epoch boundary, so it needs process_epoch, which is a stub until the Gloas epoch processing lands"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "sanity"
+handler = "slots"
+case    = "pyspec_tests/over_epoch_boundary"
+reason  = "Crosses an epoch boundary, so it needs process_epoch, which is a stub until the Gloas epoch processing lands"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "sanity"
+handler = "slots"
+case    = "pyspec_tests/pending_consolidation"
+reason  = "Crosses an epoch boundary, so it needs process_epoch, which is a stub until the Gloas epoch processing lands"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "sanity"
+handler = "slots"
+case    = "pyspec_tests/pending_deposit_extra_gwei"
+reason  = "Crosses an epoch boundary, so it needs process_epoch, which is a stub until the Gloas epoch processing lands"
+owner   = "ian"
+issue   = "4.7"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "sanity"
+handler = "blocks"
+reason  = "No sanity/blocks runner yet: Gloas block vectors need block processing, which lands with the Gloas state transition"
 owner   = "ian"
 issue   = "4.7"
 expires = "2026-11-30"
@@ -342,13 +501,93 @@ expires = "2026-11-30"
 
 # ---------------------------------------------------------------------------------------
 # Out-of-scope forks (Fulu and Gloas only). general/altair/bls is not skipped: the bls runner
-# runs it, so altair is skipped per preset.
+# runs it, so altair is skipped per preset. phase0 is skipped per runner: the shuffling runner
+# runs its shuffling/core vectors (Gloas shuffles the same way, and only phase0 has them).
+# phase0 genesis (minimal only) is skipped by the genesis runner entry above, and its own
+# entry here would be stale in a mainnet-only run.
 
 [[skip]]
 source  = "consensus-specs"
 fork    = "phase0"
 preset  = "*"
-runner  = "*"
+runner  = "epoch_processing"
+handler = "*"
+reason  = "Pre-Fulu fork phase0: out of scope (Fulu and Gloas only)"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "phase0"
+preset  = "*"
+runner  = "finality"
+handler = "*"
+reason  = "Pre-Fulu fork phase0: out of scope (Fulu and Gloas only)"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "phase0"
+preset  = "*"
+runner  = "networking"
+handler = "*"
+reason  = "Pre-Fulu fork phase0: out of scope (Fulu and Gloas only)"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "phase0"
+preset  = "*"
+runner  = "operations"
+handler = "*"
+reason  = "Pre-Fulu fork phase0: out of scope (Fulu and Gloas only)"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "phase0"
+preset  = "*"
+runner  = "random"
+handler = "*"
+reason  = "Pre-Fulu fork phase0: out of scope (Fulu and Gloas only)"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "phase0"
+preset  = "*"
+runner  = "rewards"
+handler = "*"
+reason  = "Pre-Fulu fork phase0: out of scope (Fulu and Gloas only)"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "phase0"
+preset  = "*"
+runner  = "sanity"
+handler = "*"
+reason  = "Pre-Fulu fork phase0: out of scope (Fulu and Gloas only)"
+owner   = "ian"
+issue   = "none"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "phase0"
+preset  = "*"
+runner  = "ssz_static"
 handler = "*"
 reason  = "Pre-Fulu fork phase0: out of scope (Fulu and Gloas only)"
 owner   = "ian"

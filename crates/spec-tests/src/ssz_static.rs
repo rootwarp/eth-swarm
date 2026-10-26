@@ -7,6 +7,7 @@
 
 use crate::check::{parse_hex, round_trip, Expect};
 use crate::coverage::Reads;
+use crate::fixture;
 use crate::plan::Case;
 use consensus_types::{fulu, gloas, EthSpec, Mainnet, Minimal};
 
@@ -30,12 +31,7 @@ pub fn supported(fork: &str, preset: &str, handler: &str) -> bool {
 /// Runs one case from its `serialized.ssz_snappy` and `roots.yaml`. `Err` describes a failure.
 pub fn run(reads: &Reads, case: &Case) -> Result<(), String> {
     let file = |name: &str| case.file(name).ok_or_else(|| format!("case has no {name}"));
-    let compressed = reads
-        .read(file("serialized.ssz_snappy")?)
-        .map_err(|e| format!("serialized.ssz_snappy: {e}"))?;
-    let bytes = snap::raw::Decoder::new()
-        .decompress_vec(&compressed)
-        .map_err(|e| format!("snappy: {e}"))?;
+    let bytes = fixture::ssz_snappy(reads, file("serialized.ssz_snappy")?)?;
     let yaml = reads
         .read_to_string(file("roots.yaml")?)
         .map_err(|e| format!("roots.yaml: {e}"))?;

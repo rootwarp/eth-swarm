@@ -1,0 +1,22 @@
+[package]
+name = "state-transition"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "The pure Gloas state transition: slot processing, shuffling and the committee, proposer, PTC and sync-committee selection. No I/O and no blst."
+
+[dependencies]
+consensus-types = { path = "../consensus-types" }
+# sha256 of the spec (`hash`): the version tree_hash already pulls in, so Cargo.lock keeps one.
+ethereum_hashing = "0.8.0"
+# The trait (`TreeHash`), tree and bitfield types of the consensus-types containers.
+ethereum_ssz.workspace = true
+ssz_types.workspace = true
+tree_hash.workspace = true
+milhouse.workspace = true
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"

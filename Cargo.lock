@@ -5583,11 +5583,13 @@ dependencies = [
  "ethereum_ssz_derive",
  "hex",
  "libtest-mimic",
+ "milhouse",
  "network-config",
  "serde",
  "serde_json",
  "snap",
  "ssz_types",
+ "state-transition",
  "tempfile",
  "thiserror 2.0.21",
  "toml 0.8.23",
@@ -5654,6 +5656,20 @@ dependencies = [
  "libc",
  "psm",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "state-transition"
+version = "0.1.0"
+dependencies = [
+ "consensus-types",
+ "ethereum_hashing",
+ "ethereum_ssz",
+ "milhouse",
+ "proptest",
+ "ssz_types",
+ "thiserror 2.0.21",
+ "tree_hash",
 ]
 
 [[package]]

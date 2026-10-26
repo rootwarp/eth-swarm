@@ -91,11 +91,29 @@ fn checkpoint_case(root: &Path, fork: &str) {
     );
 }
 
-/// A minimal tree with one Fulu and one Gloas `Checkpoint` case: the runnable subtrees.
+/// One phase0 `shuffling/core` case: one index maps to itself.
+fn shuffling_case(root: &Path) {
+    let dir = format!("{MINIMAL}/phase0/shuffling/core/shuffle/shuffle_0x01_1");
+    write(
+        root,
+        &format!("{dir}/mapping.yaml"),
+        format!("seed: '0x{}'\ncount: 1\nmapping: [0]\n", "01".repeat(32)).as_bytes(),
+    );
+    write(
+        root,
+        &format!("{dir}/manifest.yaml"),
+        b"preset: minimal\nfork: phase0\nrunner: shuffling\nhandler: core\n\
+          suite: shuffle\ncase: shuffle_0x01_1\n",
+    );
+}
+
+/// A minimal tree with one Fulu and one Gloas `Checkpoint` case and one shuffling case: the
+/// runnable subtrees.
 fn minimal_tree() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     checkpoint_case(dir.path(), "fulu");
     checkpoint_case(dir.path(), "gloas");
+    shuffling_case(dir.path());
     dir
 }
 
@@ -156,11 +174,12 @@ fn coverage_passes_on_a_fully_read_tree() {
         run_all(&suite),
         [
             "fulu_ssz_static_minimal::Checkpoint::ssz_one::case_0",
-            "gloas_ssz_static_minimal::Checkpoint::ssz_one::case_0"
+            "gloas_ssz_static_minimal::Checkpoint::ssz_one::case_0",
+            "phase0_shuffling_minimal::core::shuffle::shuffle_0x01_1"
         ]
     );
     let covered = suite.guard.check(&suite.reads).unwrap();
-    assert_eq!((covered.read, covered.total), (6, 8));
+    assert_eq!((covered.read, covered.total), (8, 10));
 }
 
 #[test]
@@ -494,9 +513,20 @@ fn required_set_without_files_fails() {
 fn missing_fork_subtree_fails() {
     let tree = tempfile::tempdir().unwrap();
     checkpoint_case(tree.path(), "gloas");
+    shuffling_case(tree.path());
     match build(tree.path(), &value_yaml_excused(), "minimal") {
         Err(SuiteError::Setup(msg)) => {
             assert!(msg.contains("tests/minimal/fulu/ssz_static"), "{msg}")
+        }
+        other => panic!("{:?}", other.err()),
+    }
+    // The shuffling runner's tree is required too.
+    let tree = tempfile::tempdir().unwrap();
+    checkpoint_case(tree.path(), "fulu");
+    checkpoint_case(tree.path(), "gloas");
+    match build(tree.path(), &value_yaml_excused(), "minimal") {
+        Err(SuiteError::Setup(msg)) => {
+            assert!(msg.contains("tests/minimal/phase0/shuffling"), "{msg}")
         }
         other => panic!("{:?}", other.err()),
     }
