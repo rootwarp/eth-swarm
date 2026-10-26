@@ -127,6 +127,8 @@ pub struct CommitteeCache {
     seed: Bytes32,
     slots_per_epoch: u64,
     committees_per_slot: u64,
+    /// `len(state.validators)` of the state that the cache was shuffled from.
+    registry_len: u64,
     /// `indices[compute_shuffled_index(k)]` for each position `k` of the active set.
     shuffling: Vec<ValidatorIndex>,
 }
@@ -147,6 +149,7 @@ impl CommitteeCache {
             seed,
             slots_per_epoch: E::slots_per_epoch(),
             committees_per_slot: committee_count_per_slot::<E>(len),
+            registry_len: state.validators.len() as u64,
             shuffling,
         })
     }
@@ -171,10 +174,18 @@ impl CommitteeCache {
         }
     }
 
-    /// `Err(CacheEpochMismatch)` unless `slot` is in the epoch of the cache, and
+    /// The length of the registry that the cache was shuffled from.
+    pub fn registry_len(&self) -> u64 {
+        self.registry_len
+    }
+
+    /// `Err(CacheEpochMismatch)` unless `slot` is in the epoch of the cache,
     /// `Err(CacheSeedMismatch)` unless the cache's seed is the attester seed of `state` for
-    /// that epoch. A cache of the same epoch from another branch can have another seed, and
-    /// then its committees are wrong for `state`.
+    /// that epoch, and `Err(CacheRegistryMismatch)` unless the cache was shuffled from a
+    /// registry of the length of `state.validators`. A cache of the same epoch from another
+    /// branch can have another seed, and then its committees are wrong for `state`. The seed
+    /// alone does not fix the active set: a cache of a longer registry can hold indices past
+    /// the registry of `state`. All three errors are caller errors, never a proof.
     pub fn check_state<E: Preset>(
         &self,
         state: &BeaconState<E>,
@@ -182,15 +193,22 @@ impl CommitteeCache {
     ) -> Result<(), StfError> {
         self.check_slot(slot)?;
         let state_seed = attester_seed(state, self.epoch)?;
-        if state_seed == self.seed {
-            Ok(())
-        } else {
-            Err(StfError::CacheSeedMismatch {
+        if state_seed != self.seed {
+            return Err(StfError::CacheSeedMismatch {
                 epoch: self.epoch,
                 cache_seed: self.seed,
                 state_seed,
-            })
+            });
         }
+        let state_len = state.validators.len() as u64;
+        if state_len != self.registry_len {
+            return Err(StfError::CacheRegistryMismatch {
+                epoch: self.epoch,
+                cache_len: self.registry_len,
+                state_len,
+            });
+        }
+        Ok(())
     }
 
     /// `get_committee_count_per_slot` of the epoch.
@@ -221,9 +239,10 @@ impl CommitteeCache {
     }
 }
 
-/// `get_beacon_committee` (P0 L1527-1540). It shuffles the whole epoch on each call, so it
-/// is for single reads only: to read several committees of one epoch, build one
-/// [`CommitteeCache`] and call [`CommitteeCache::committee`], which this function delegates to.
+/// `get_beacon_committee` (P0 L1527-1540). It shuffles the whole epoch on each call, so only
+/// the tests have it: to read a committee, build one [`CommitteeCache`] and call
+/// [`CommitteeCache::committee`], which this function delegates to.
+#[cfg(test)]
 pub fn get_beacon_committee<E: Preset>(
     state: &BeaconState<E>,
     slot: Slot,
@@ -444,6 +463,44 @@ mod tests {
         // After the last slot of C the seed of C + 2 is fixed, so a new cache passes.
         let fresh = CommitteeCache::new(&state, c + 2).unwrap();
         assert_eq!(fresh.check_state(&state, slot), Ok(()));
+    }
+
+    #[test]
+    fn cache_of_another_registry_length_is_refused() {
+        use crate::accessors::get_attesting_indices_with;
+        use crate::caches::compute_ptc_with;
+        use crate::per_block::attestation::get_indexed_attestation_with;
+        use crate::per_block::attestation::tests::{attestation, attestation_state};
+        use crate::testing::genesis_state;
+        use consensus_types::Minimal;
+
+        // The same attester seed of epoch 0, with 64 and with 32 validators.
+        let long = attestation_state(4);
+        let mut short = genesis_state::<Minimal>(&[32_000_000_000; 32]);
+        short.slot = long.slot;
+        short.block_roots = long.block_roots.clone();
+        let cache = CommitteeCache::new(&long, 0).unwrap();
+        assert_eq!(cache.key(), CommitteeCache::new(&short, 0).unwrap().key());
+        let want = StfError::CacheRegistryMismatch {
+            epoch: 0,
+            cache_len: 64,
+            state_len: 32,
+        };
+        assert!(!want.proves_invalid());
+        assert_eq!(cache.check_state(&short, 3), Err(want.clone()));
+        // The three readers of a cache refuse it, and do not give a proof.
+        let on_short = attestation(&short, 3, &[0]);
+        assert_eq!(
+            get_attesting_indices_with(&short, &cache, &on_short),
+            Err(want.clone())
+        );
+        assert_eq!(
+            get_indexed_attestation_with(&short, &cache, &on_short),
+            Err(want.clone())
+        );
+        assert_eq!(compute_ptc_with(&short, &cache, 3), Err(want));
+        // The cache of the same registry passes.
+        assert_eq!(cache.check_state(&long, 3), Ok(()));
     }
 
     /// Every range `committee_range` gives slices a list of `len` safely. Mainnet has 32

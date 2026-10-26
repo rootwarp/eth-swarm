@@ -23,6 +23,7 @@ use crate::per_block::payload_attestation::{
     check_indexed_payload_attestation, check_payload_attestation_target,
     get_indexed_payload_attestation,
 };
+use crate::per_block::slashings::{check_attester_slashing, check_proposer_slashing};
 use crate::per_block::state_proposer_index;
 use crate::per_block::BlockContext;
 use crate::preset::BUILDER_INDEX_SELF_BUILD;
@@ -397,16 +398,16 @@ pub fn verify_bls_to_execution_change_signature<E: Preset>(
 /// `process_proposer_slashing` (P0 L2436-2441), by the proposer of `signed_header_1`, each
 /// over the `DOMAIN_BEACON_PROPOSER` of the epoch of its own header.
 ///
-/// A proposer past the registry has no key: [`StfError::UnknownValidator`], as
-/// `state.validators[header_1.proposer_index]` raises in the spec.
+/// The asserts of the handler before its BLS checks ([`check_proposer_slashing`]) run first:
+/// the two headers, the proposer in the registry, and a slashable proposer. If one fails, the
+/// function gives the error of the handler and no set. A proposer past the registry has no
+/// key: [`StfError::UnknownValidator`], as `state.validators[header_1.proposer_index]` raises
+/// in the spec.
 pub fn proposer_slashing_signature_sets<E: Preset>(
     state: &BeaconState<E>,
     proposer_slashing: &ProposerSlashing,
 ) -> Result<[SignatureSet; 2], StfError> {
-    let proposer_index = proposer_slashing.signed_header_1.message.proposer_index;
-    if proposer_index >= state.validators.len() as u64 {
-        return Err(StfError::UnknownValidator(proposer_index));
-    }
+    let proposer_index = check_proposer_slashing(state, proposer_slashing)?;
     let set = |signed_header: &SignedBeaconBlockHeader| {
         let epoch = E::epoch_at_slot(signed_header.message.slot);
         let domain = get_domain(state, DOMAIN_BEACON_PROPOSER, Some(epoch));
@@ -430,6 +431,15 @@ pub fn indexed_attestation_signature_set<E: Preset>(
     indexed_attestation: &IndexedAttestation<E>,
 ) -> Result<SignatureSet, StfError> {
     check_indexed_attestation(state, indexed_attestation)?;
+    indexed_attestation_set(state, indexed_attestation)
+}
+
+/// The `bls.FastAggregateVerify` set of an indexed attestation that passed
+/// [`check_indexed_attestation`].
+fn indexed_attestation_set<E: Preset>(
+    state: &BeaconState<E>,
+    indexed_attestation: &IndexedAttestation<E>,
+) -> Result<SignatureSet, StfError> {
     let data = &indexed_attestation.data;
     let domain = get_domain(state, DOMAIN_BEACON_ATTESTER, Some(data.target.epoch));
     let signers = indexed_attestation
@@ -448,21 +458,24 @@ pub fn indexed_attestation_signature_set<E: Preset>(
 
 /// The two sets of an attester slashing: the `is_valid_indexed_attestation` of each
 /// attestation in `process_attester_slashing` (P0 L2453-2454).
+///
+/// The asserts of the handler before its BLS checks ([`check_attester_slashing`]) run first,
+/// for both attestations. If one fails, the function gives the error of the handler and no
+/// set, so a forged slashing costs no key resolution and no backend call.
 pub fn attester_slashing_signature_sets<E: Preset>(
     state: &BeaconState<E>,
     attester_slashing: &AttesterSlashing<E>,
 ) -> Result<[SignatureSet; 2], StfError> {
+    check_attester_slashing(state, attester_slashing)?;
     Ok([
-        indexed_attestation_signature_set(state, &attester_slashing.attestation_1)?,
-        indexed_attestation_signature_set(state, &attester_slashing.attestation_2)?,
+        indexed_attestation_set(state, &attester_slashing.attestation_1)?,
+        indexed_attestation_set(state, &attester_slashing.attestation_2)?,
     ])
 }
 
-/// The set of an attestation: the `is_valid_indexed_attestation` of
-/// `get_indexed_attestation(state, attestation)` in `process_attestation` (G L2432).
-///
-/// The asserts of `process_attestation` before it (G L2403-2423) run first, so that the
-/// committees of an epoch other than the previous or the current one are never shuffled.
+/// [`attestation_signature_set_with`] with a new context, which shuffles the epoch on each
+/// call. Only the tests use it.
+#[cfg(test)]
 pub fn attestation_signature_set<E: Preset>(
     state: &BeaconState<E>,
     attestation: &Attestation<E>,
@@ -470,9 +483,13 @@ pub fn attestation_signature_set<E: Preset>(
     attestation_signature_set_with(state, attestation, &mut BlockContext::default())
 }
 
-/// [`attestation_signature_set`] with the committee caches of `ctx`, which the other
-/// attestations of the block and [`crate::per_block::attestation::process_attestation_with`]
-/// read again.
+/// The set of an attestation: the `is_valid_indexed_attestation` of
+/// `get_indexed_attestation(state, attestation)` in `process_attestation` (G L2432).
+///
+/// The asserts of `process_attestation` before it (G L2403-2423) run first, so that the
+/// committees of an epoch other than the previous or the current one are never shuffled.
+/// The committee caches come from `ctx`, which the other attestations of the block and
+/// [`crate::per_block::attestation::process_attestation_with`] read again.
 pub fn attestation_signature_set_with<E: Preset>(
     state: &BeaconState<E>,
     attestation: &Attestation<E>,
@@ -549,10 +566,18 @@ pub fn verify_execution_payload_bid_signature<E: Preset>(
 /// Checks the sets of one operation through `backend` in one call, for a caller that
 /// processes the operation outside [`block_signature_sets`]. A set that the backend refuses
 /// is [`StfError::InvalidOperationSignature`].
+///
+/// An empty `sets` has no verdict: [`StfError::SignatureBackend`] (not a proof), with no
+/// backend call. Each operation has at least one set, so an empty `sets` is a caller error.
 pub fn verify_operation_signatures(
     sets: &[SignatureSet],
     backend: &dyn SignatureBackend,
 ) -> Result<(), StfError> {
+    if sets.is_empty() {
+        return Err(StfError::SignatureBackend(BackendError(
+            "no signature set to verify".into(),
+        )));
+    }
     if backend.verify_signature_sets(sets)? {
         Ok(())
     } else {
@@ -1098,6 +1123,7 @@ mod tests {
         // A proposer past the registry has no key.
         let mut stranger = proposer_slashing();
         stranger.signed_header_1.message.proposer_index = 64;
+        stranger.signed_header_2.message.proposer_index = 64;
         assert_eq!(
             proposer_slashing_signature_sets(&state, &stranger),
             Err(StfError::UnknownValidator(64))
@@ -1137,6 +1163,151 @@ mod tests {
         );
         assert_eq!(rejecting.calls.get(), 1);
         assert_eq!(verify_operation_signatures(&sets, &backend(true)), Ok(()));
+        // No set is no verdict: an error that is not a proof, with no backend call.
+        let accepting = backend(true);
+        let err = verify_operation_signatures(&[], &accepting).unwrap_err();
+        assert!(matches!(err, StfError::SignatureBackend(_)), "{err}");
+        assert!(!err.proves_invalid());
+        assert_eq!(accepting.calls.get(), 0);
+    }
+
+    #[test]
+    fn slashing_of_a_proposer_that_is_not_slashable_has_no_set() {
+        use crate::per_block::slashings::process_proposer_slashing;
+        use consensus_types::common::Validator;
+        let (state, block) = state_and_block(&[1]);
+        // Slashed, not active yet, and withdrawable at the current epoch 1.
+        let edits: [&dyn Fn(&mut Validator); 3] =
+            [&|v| v.slashed = true, &|v| v.activation_epoch = 2, &|v| {
+                v.withdrawable_epoch = 1
+            }];
+        for edit in edits {
+            let mut state = state.clone();
+            edit(state.validators.get_mut(3).unwrap());
+            let slashing = proposer_slashing();
+            let want = Err(StfError::ValidatorNotSlashable(3));
+            assert_eq!(
+                proposer_slashing_signature_sets(&state, &slashing).map(|_| ()),
+                want
+            );
+            assert_eq!(
+                process_proposer_slashing(&mut state.clone(), &slashing),
+                want
+            );
+            let mut forged = block.clone();
+            forged
+                .message
+                .body
+                .proposer_slashings
+                .push(slashing)
+                .unwrap();
+            let backend = Counting {
+                verdict: true,
+                calls: Cell::new(0),
+            };
+            assert_eq!(
+                verify_block_signatures(&state, &forged, &bls_context(&backend)),
+                Err(StfError::ValidatorNotSlashable(3))
+            );
+            assert_eq!(backend.calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn forged_slashings_fail_before_their_sets() {
+        use crate::per_block::slashings::{process_attester_slashing, process_proposer_slashing};
+        let (state, block) = state_and_block(&[1]);
+        // The set builder gives the error of the handler, on the same state.
+        let attester = |slashing: &AttesterSlashing<Minimal>| {
+            let handler = process_attester_slashing(&mut state.clone(), slashing);
+            let sets = attester_slashing_signature_sets(&state, slashing).map(|_| ());
+            assert_eq!(sets, handler);
+            sets
+        };
+        let proposer = |slashing: &ProposerSlashing| {
+            let handler = process_proposer_slashing(&mut state.clone(), slashing);
+            let sets = proposer_slashing_signature_sets(&state, slashing).map(|_| ());
+            assert_eq!(sets, handler);
+            sets
+        };
+
+        // Two equal attestations are not slashable. An index past the registry, or indices
+        // that are not sorted, in the second one do not change the error: the data check
+        // comes first, as in `process_attester_slashing`.
+        let mut same = attester_slashing();
+        same.attestation_2 = same.attestation_1.clone();
+        assert_eq!(attester(&same), Err(StfError::NotSlashableAttestationData));
+        same.attestation_2.attesting_indices = vec![5, 64].try_into().unwrap();
+        assert_eq!(attester(&same), Err(StfError::NotSlashableAttestationData));
+        same.attestation_2.attesting_indices = vec![5, 2].try_into().unwrap();
+        assert_eq!(attester(&same), Err(StfError::NotSlashableAttestationData));
+        // A slashable pair with a bad second attestation: its structure check comes before
+        // any set of the first attestation.
+        let mut unsorted = attester_slashing();
+        unsorted.attestation_2.attesting_indices = vec![7, 5].try_into().unwrap();
+        assert_eq!(
+            attester(&unsorted),
+            Err(StfError::InvalidIndexedAttestation)
+        );
+
+        // Two equal headers, headers of two slots, and headers of two proposers. A proposer
+        // past the registry does not change the error.
+        let mut equal = proposer_slashing();
+        equal.signed_header_2.message = equal.signed_header_1.message.clone();
+        assert_eq!(proposer(&equal), Err(StfError::ProposerSlashingSameHeaders));
+        equal.signed_header_1.message.proposer_index = 64;
+        equal.signed_header_2.message.proposer_index = 64;
+        assert_eq!(proposer(&equal), Err(StfError::ProposerSlashingSameHeaders));
+        let mut slots = proposer_slashing();
+        slots.signed_header_2.message.slot = 6;
+        assert_eq!(
+            proposer(&slots),
+            Err(StfError::ProposerSlashingSlots {
+                slot_1: 5,
+                slot_2: 6
+            })
+        );
+        let mut proposers = proposer_slashing();
+        proposers.signed_header_2.message.proposer_index = 64;
+        assert_eq!(
+            proposer(&proposers),
+            Err(StfError::ProposerSlashingProposers {
+                proposer_1: 3,
+                proposer_2: 64
+            })
+        );
+
+        // In a block, a forged slashing stops the batch before the backend call.
+        let mut same = attester_slashing();
+        same.attestation_2 = same.attestation_1.clone();
+        let mut equal = proposer_slashing();
+        equal.signed_header_2.message = equal.signed_header_1.message.clone();
+        for (add, want) in [
+            (
+                &(|b: &mut BeaconBlockBody<Minimal>| {
+                    b.attester_slashings.push(same.clone()).unwrap()
+                }) as &dyn Fn(&mut BeaconBlockBody<Minimal>),
+                StfError::NotSlashableAttestationData,
+            ),
+            (
+                &|b: &mut BeaconBlockBody<Minimal>| {
+                    b.proposer_slashings.push(equal.clone()).unwrap()
+                },
+                StfError::ProposerSlashingSameHeaders,
+            ),
+        ] {
+            let mut forged = block.clone();
+            add(&mut forged.message.body);
+            let backend = Counting {
+                verdict: true,
+                calls: Cell::new(0),
+            };
+            assert_eq!(
+                verify_block_signatures(&state, &forged, &bls_context(&backend)),
+                Err(want)
+            );
+            assert_eq!(backend.calls.get(), 0);
+        }
     }
 
     #[test]

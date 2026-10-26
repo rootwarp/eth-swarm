@@ -8,15 +8,18 @@ pub mod committee;
 pub mod proposer;
 pub mod ptc;
 
+#[cfg(test)]
+pub use committee::get_beacon_committee;
 pub use committee::{
-    compute_committee, compute_shuffled_index, compute_shuffled_permutation, get_beacon_committee,
-    CommitteeCache,
+    compute_committee, compute_shuffled_index, compute_shuffled_permutation, CommitteeCache,
 };
 pub use proposer::{
     compute_proposer_indices, get_beacon_proposer_index, get_beacon_proposer_indices,
     initialize_proposer_lookahead,
 };
-pub use ptc::{compute_ptc, compute_ptc_with, get_ptc, initialize_ptc_window};
+#[cfg(test)]
+pub use ptc::compute_ptc;
+pub use ptc::{compute_ptc_with, get_ptc, initialize_ptc_window};
 
 #[cfg(test)]
 mod tests {

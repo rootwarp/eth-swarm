@@ -135,7 +135,9 @@ pub enum StfError {
     /// A selection had no candidates (`assert total > 0`).
     #[error("no candidate validators to select from")]
     NoCandidates,
-    /// A beacon committee that does not exist at `slot`.
+    /// A beacon committee that does not exist at `slot`. The committee count comes from the
+    /// active set of the state, so this is a proof only on the object's own pre-state: see
+    /// [`StfError::proves_invalid`].
     #[error("committee {index} does not exist at slot {slot}")]
     UnknownCommittee {
         /// The slot.
@@ -143,7 +145,9 @@ pub enum StfError {
         /// The committee index.
         index: CommitteeIndex,
     },
-    /// A bitfield is shorter than the committees it covers.
+    /// A bitfield is shorter than the committees it covers. The committee sizes come from
+    /// the active set of the state, so this is a proof only on the object's own pre-state:
+    /// see [`StfError::proves_invalid`].
     #[error("bit {index} is out of range of a bitfield of length {len}")]
     BitOutOfRange {
         /// The bit index.
@@ -578,13 +582,29 @@ pub enum StfError {
         /// `MAX_*_REQUESTS_PER_PAYLOAD` of the list.
         limit: usize,
     },
+    /// A [`caches::CommitteeCache`] of the slot's epoch and seed, but shuffled from a
+    /// registry of another length than the state's. Its committees can hold indices past the
+    /// registry of the state. This is a caller error, never a proof that the input is
+    /// invalid.
+    #[error(
+        "committee cache of epoch {epoch} is for {cache_len} validators, the state has {state_len}"
+    )]
+    CacheRegistryMismatch {
+        /// The epoch of the cache.
+        epoch: Epoch,
+        /// The length of the registry that the cache was shuffled from.
+        cache_len: u64,
+        /// `len(state.validators)`.
+        state_len: u64,
+    },
 }
 
 impl StfError {
     /// Whether the error proves that the input is invalid by the spec (REJECT). It does not
     /// for a backend without a verdict, a missing deposit verdict, a failed pubkey
-    /// aggregation, a committee cache of another epoch or seed, a
-    /// failure of the state trees, a state list shorter than the registry, a
+    /// aggregation, a committee cache of another epoch, seed or registry length
+    /// (`CacheRegistryMismatch`), a failure of the state trees, a state list shorter than
+    /// the registry, a
     /// `proposer_lookahead` entry past the registry or a code index past a spec table
     /// (`ListIndexOutOfRange`), a participation epoch other than the previous and the
     /// current one (`ParticipationEpochOutOfRange`), prior withdrawals past the limit of a
@@ -618,6 +638,7 @@ impl StfError {
     /// The attestation and slashing variants that read the state have the same rule:
     /// [`StfError::AttestationTargetEpoch`], [`StfError::AttestationTooEarly`],
     /// [`StfError::SameSlotAttestationIndex`], [`StfError::EmptyCommitteeAttesters`],
+    /// [`StfError::UnknownCommittee`], [`StfError::BitOutOfRange`],
     /// [`StfError::AggregationBitsLength`], [`StfError::AttestationSourceMismatch`],
     /// [`StfError::NoValidatorSlashed`], [`StfError::ValidatorNotSlashable`] and
     /// [`StfError::InvalidOperationSignature`].
@@ -664,7 +685,9 @@ impl StfError {
             | Self::StateArithmetic { .. }
             // The caller did not give the blob limit of the network, which says nothing
             // about the bid.
-            | Self::UnknownBlobLimit(_) => false,
+            | Self::UnknownBlobLimit(_)
+            // A cache of another registry is a fault of the caller, not of the object.
+            | Self::CacheRegistryMismatch { .. } => false,
             Self::SlotNotLater { .. }
             | Self::InvalidBlockSignature
             | Self::StateRootMismatch { .. }
@@ -1226,7 +1249,7 @@ mod tests {
 
     /// The number of [`StfError`] variants: one more than the largest [`variant_id`].
     /// Increase `VARIANTS` when you add an id.
-    const VARIANTS: usize = 77;
+    const VARIANTS: usize = 78;
 
     /// A distinct id for each variant. The match has no `_` arm, so a new variant does not
     /// compile until it gets an id here, and then the table test fails until it has an entry.
@@ -1309,6 +1332,7 @@ mod tests {
             StfError::ParentRequestsNotEmpty => 74,
             StfError::ParentRequestsRootMismatch { .. } => 75,
             StfError::ParentRequestsPastLimit { .. } => 76,
+            StfError::CacheRegistryMismatch { .. } => 77,
         }
     }
 
@@ -1589,6 +1613,14 @@ mod tests {
                     limit: 16,
                 },
                 true,
+            ),
+            (
+                StfError::CacheRegistryMismatch {
+                    epoch: 0,
+                    cache_len: 64,
+                    state_len: 32,
+                },
+                false,
             ),
         ];
         let mut ids: Vec<usize> = cases.iter().map(|(e, _)| variant_id(e)).collect();

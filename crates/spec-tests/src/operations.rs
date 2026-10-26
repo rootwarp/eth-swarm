@@ -4,9 +4,10 @@
 //! Each case holds `pre.ssz_snappy`, the operation (`<operation>.ssz_snappy`), `post.ssz_snappy`
 //! when the operation is valid, `manifest.yaml`, and an optional `meta.yaml` with
 //! `bls_setting` (0 or absent: check the signatures, 1: they must be checked, 2: do not check
-//! them) and, for the Gloas `attestation` handler, `parent_slot`. The check is the handler on
-//! `pre`, then `hash_tree_root` against `post`. A case without `post.ssz_snappy` must fail
-//! with an error that proves the input invalid (`StfError::proves_invalid`).
+//! them) and, for the Gloas `attestation` handler, `parent_slot`, which that handler needs. The
+//! check is the handler on `pre`, then `hash_tree_root` against `post`. A case without
+//! `post.ssz_snappy` must fail with an error that proves the input invalid
+//! (`StfError::proves_invalid`).
 //!
 //! The signature sets of an operation are checked before the handler, through the
 //! in-process backend, as the block checks them in one batch before its steps.
@@ -288,7 +289,7 @@ fn operation<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
         }
         ("operations", "attestation") => {
             let attestation = decode::<Attestation<E>>(reads, file("attestation.ssz_snappy")?)?;
-            let parent_slot = parent_slot(reads, case)?.unwrap_or(state.latest_block_header.slot);
+            let parent_slot = parent_slot(reads, case)?;
             // One context: the signature set and the step share the committee cache.
             let mut ctx = BlockContext::default();
             let keys = StateKeys::new(&state);
@@ -396,17 +397,14 @@ fn check_config<E: Preset>(
 }
 
 /// `parent_slot` of `meta.yaml`: the slot of the parent block, which the Gloas
-/// `process_attestation` takes. `None` if the case has no `meta.yaml` or no such key; the
-/// caller then uses the slot of the latest block header of `pre`, which `process_block`
-/// passes (`gloas/beacon-chain.md` L1756).
-fn parent_slot(reads: &Reads, case: &Case) -> Result<Option<Slot>, String> {
-    let Some(path) = case.file("meta.yaml") else {
-        return Ok(None);
-    };
+/// `process_attestation` takes. Every Gloas `attestation` case has the key, so a case
+/// without `meta.yaml` or without the key fails. A default value could hide a bad vector.
+fn parent_slot(reads: &Reads, case: &Case) -> Result<Slot, String> {
+    let missing = || "meta.yaml: no parent_slot for the attestation case".to_string();
+    let path = case.file("meta.yaml").ok_or_else(missing)?;
     match &fixture::load(reads, path)?["parent_slot"] {
-        Yaml::BadValue => Ok(None),
+        Yaml::BadValue => Err(missing()),
         Yaml::Integer(slot) => Slot::try_from(*slot)
-            .map(Some)
             .map_err(|_| format!("meta.yaml: parent_slot {slot} is not a slot")),
         other => Err(format!(
             "meta.yaml: parent_slot {other:?} is not an integer"
@@ -2102,26 +2100,30 @@ mod tests {
             committee_bits: BitVector::new(),
         };
         let name = "attestation.ssz_snappy";
-        // `data.index` 2 fails in both modes, with or without `parent_slot`.
+        // `data.index` 2 fails in both modes.
         for meta in [
-            None,
-            Some("{parent_slot: 1}\n"),
-            Some("{parent_slot: 1, bls_setting: 2}\n"),
-            Some("{bls_setting: 1}\n"),
+            "{parent_slot: 1}\n",
+            "{parent_slot: 1, bls_setting: 2}\n",
+            "{parent_slot: 1, bls_setting: 1}\n",
         ] {
-            let files = op_files(&pre, name, attestation.as_ssz_bytes(), None, meta);
+            let files = op_files(&pre, name, attestation.as_ssz_bytes(), None, Some(meta));
             let c = case(dir.path(), "attestation", &files);
             let reads = Reads::default();
             assert_eq!(run(&reads, &c), Ok(()), "{meta:?}");
             assert!(c.files.iter().all(|f| reads.contains(&f.path)));
         }
-        // A `parent_slot` that is not a slot.
-        for meta in ["{parent_slot: x}\n", "{parent_slot: -1}\n"] {
-            let files = op_files(&pre, name, attestation.as_ssz_bytes(), None, Some(meta));
+        // A case without `parent_slot` fails, and so does a `parent_slot` that is not a
+        // slot.
+        for meta in [
+            None,
+            Some("{bls_setting: 1}\n"),
+            Some("{parent_slot: x}\n"),
+            Some("{parent_slot: -1}\n"),
+        ] {
+            let files = op_files(&pre, name, attestation.as_ssz_bytes(), None, meta);
             let c = case(dir.path(), "attestation", &files);
-            assert!(run(&Reads::default(), &c)
-                .unwrap_err()
-                .contains("parent_slot"));
+            let err = run(&Reads::default(), &c).unwrap_err();
+            assert!(err.contains("parent_slot"), "{meta:?}: {err}");
         }
     }
 }

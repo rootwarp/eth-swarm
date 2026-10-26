@@ -132,7 +132,9 @@ pub fn get_committee_indices<N: Unsigned + Clone>(
 }
 
 /// `get_attesting_indices` (E L801-819, Modified in Electra; Gloas keeps it). It shuffles
-/// the attestation's epoch on each call; [`get_attesting_indices_with`] reuses a cache.
+/// the attestation's epoch on each call, so only the tests have it.
+/// [`get_attesting_indices_with`] reuses a cache.
+#[cfg(test)]
 pub fn get_attesting_indices<E: Preset>(
     state: &BeaconState<E>,
     attestation: &Attestation<E>,
@@ -141,9 +143,10 @@ pub fn get_attesting_indices<E: Preset>(
     get_attesting_indices_with(state, &cache, attestation)
 }
 
-/// [`get_attesting_indices`] over the committees of `cache`, which must be the cache of the
+/// `get_attesting_indices` over the committees of `cache`, which must be the cache of the
 /// attestation slot's epoch (else `Err(CacheEpochMismatch)`) with the attester seed of
-/// `state` for that epoch (else `Err(CacheSeedMismatch)`).
+/// `state` for that epoch (else `Err(CacheSeedMismatch)`), shuffled from a registry of the
+/// length of `state.validators` (else `Err(CacheRegistryMismatch)`).
 pub fn get_attesting_indices_with<E: Preset>(
     state: &BeaconState<E>,
     cache: &CommitteeCache,

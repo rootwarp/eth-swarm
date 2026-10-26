@@ -46,8 +46,8 @@ use state_transition::caches::{
 use state_transition::mutators::empty_payment;
 use state_transition::per_block::withdrawals::{get_builder_withdrawals, process_withdrawals};
 use state_transition::per_block::{
-    process_attestation, process_block_header, process_execution_payload_bid,
-    process_proposer_slashing,
+    process_attestation_with, process_block_header, process_execution_payload_bid,
+    process_proposer_slashing, BlockContext,
 };
 use state_transition::per_epoch::gloas::get_builder_payment_quorum_threshold;
 use state_transition::per_slot::process_slots;
@@ -362,8 +362,10 @@ fn bid_and_attest(attesters: usize) -> (BeaconState<Minimal>, u64) {
     assert_eq!(payment(&state, index), bid_payment(block.proposer_index, 0));
 
     process_slots(&mut state, BID_SLOT + 1, &bls()).unwrap();
+    // One context for the block: the attestations share one shuffle of the epoch.
+    let mut ctx = BlockContext::default();
     for attestation in attestations(&state, attesters) {
-        process_attestation(&mut state, &attestation, BID_SLOT).unwrap();
+        process_attestation_with(&mut state, &attestation, BID_SLOT, &mut ctx).unwrap();
     }
     let weight = attesters as Gwei * 32 * ETH;
     assert_eq!(

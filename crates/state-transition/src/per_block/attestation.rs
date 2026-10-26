@@ -4,13 +4,14 @@
 //! (P0 L1603-1613) and `add_flag` (A L279-284).
 //!
 //! As for the other operations, the BLS check of the attestation signature is not in
-//! [`process_attestation`]: the caller gives
-//! [`crate::signatures::attestation_signature_set`] to the backend, in the one batch of
+//! [`process_attestation_with`]: the caller gives
+//! [`crate::signatures::attestation_signature_set_with`] to the backend, in the one batch of
 //! [`crate::signatures::block_signature_sets`]. The checks of `is_valid_indexed_attestation`
 //! that need no BLS ([`check_indexed_attestation`]) run in every mode.
 //!
 //! The committees come from the [`CommitteeCache`] of the [`BlockContext`], one shuffle for
-//! each epoch and block, never one for each attestation.
+//! each epoch and block, never one for each attestation. The forms without a cache shuffle
+//! on each call, so only the tests have them.
 
 use crate::accessors::{
     base_reward, base_reward_per_increment, get_attesting_indices_with, get_block_root,
@@ -36,14 +37,9 @@ use ssz_types::ProgressiveVariableList;
 /// presets.
 pub const MIN_ATTESTATION_INCLUSION_DELAY: u64 = 1;
 
-/// `process_attestation` (G L2396-2480, Modified in Gloas): sets the participation flags of
-/// the attesters, rewards the proposer, and adds the effective balance of each new same-slot
-/// attester to the weight of the builder payment of the attested slot.
-///
-/// `parent_slot` is the slot of the parent block of the block that holds the attestation:
-/// the slot of `state.latest_block_header` before the block (G L1756). The BLS check of the
-/// signature is not here: see the module documentation. On `Err`, `state` is partly updated:
-/// the caller drops it.
+/// [`process_attestation_with`] with a new context, which shuffles the epoch on each call.
+/// Only the tests use it.
+#[cfg(test)]
 pub fn process_attestation<E: Preset>(
     state: &mut BeaconState<E>,
     attestation: &Attestation<E>,
@@ -57,8 +53,17 @@ pub fn process_attestation<E: Preset>(
     )
 }
 
-/// [`process_attestation`] with the committee caches and the total active balance of `ctx`,
-/// which the other attestations and the signature sets of the same block read again.
+/// `process_attestation` (G L2396-2480, Modified in Gloas): sets the participation flags of
+/// the attesters, rewards the proposer, and adds the effective balance of each new same-slot
+/// attester to the weight of the builder payment of the attested slot.
+///
+/// `parent_slot` is the slot of the parent block of the block that holds the attestation:
+/// the slot of `state.latest_block_header` before the block (G L1756). The BLS check of the
+/// signature is not here: see the module documentation. On `Err`, `state` is partly updated:
+/// the caller drops it.
+///
+/// The committee caches and the total active balance come from `ctx`, which the other
+/// attestations and the signature sets of the same block read again.
 pub fn process_attestation_with<E: Preset>(
     state: &mut BeaconState<E>,
     attestation: &Attestation<E>,
@@ -353,7 +358,8 @@ pub fn get_indexed_attestation_with<E: Preset>(
 }
 
 /// `get_indexed_attestation` (P0 L1603-1613). It shuffles the attestation's epoch on each
-/// call; [`get_indexed_attestation_with`] reuses a cache.
+/// call, so only the tests have it. [`get_indexed_attestation_with`] reuses a cache.
+#[cfg(test)]
 pub fn get_indexed_attestation<E: Preset>(
     state: &BeaconState<E>,
     attestation: &Attestation<E>,

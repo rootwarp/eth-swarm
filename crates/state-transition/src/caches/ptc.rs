@@ -11,7 +11,9 @@ use ssz_types::typenum::Unsigned;
 
 /// `compute_ptc` (G L1266-1282, New in Gloas): `PTC_SIZE` members, with possible
 /// duplicates, drawn by balance from the beacon committees of `slot` in order. It shuffles
-/// the slot's epoch on each call; [`compute_ptc_with`] reuses a cache.
+/// the slot's epoch on each call, so only the tests have it. [`compute_ptc_with`] reuses a
+/// cache.
+#[cfg(test)]
 pub fn compute_ptc<E: Preset>(
     state: &BeaconState<E>,
     slot: Slot,
@@ -20,9 +22,10 @@ pub fn compute_ptc<E: Preset>(
     compute_ptc_with(state, &cache, slot)
 }
 
-/// [`compute_ptc`] over the committees of `cache`, which must be the cache of `slot`'s epoch
+/// `compute_ptc` over the committees of `cache`, which must be the cache of `slot`'s epoch
 /// (else `Err(CacheEpochMismatch)`) with the attester seed of `state` for that epoch (else
-/// `Err(CacheSeedMismatch)`).
+/// `Err(CacheSeedMismatch)`), shuffled from a registry of the length of `state.validators`
+/// (else `Err(CacheRegistryMismatch)`).
 pub fn compute_ptc_with<E: Preset>(
     state: &BeaconState<E>,
     cache: &CommitteeCache,

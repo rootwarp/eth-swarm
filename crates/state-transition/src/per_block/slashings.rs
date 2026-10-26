@@ -17,7 +17,7 @@ use crate::per_block::BlockContext;
 use crate::{Preset, StfError};
 use consensus_types::common::{AttestationData, ProposerSlashing, Validator};
 use consensus_types::gloas::{AttesterSlashing, BeaconState};
-use consensus_types::primitives::Epoch;
+use consensus_types::primitives::{Epoch, ValidatorIndex};
 
 /// `is_slashable_validator` (P0 L1129-1135).
 pub fn is_slashable_validator(validator: &Validator, epoch: Epoch) -> bool {
@@ -51,6 +51,26 @@ pub fn process_proposer_slashing_with<E: Preset>(
     proposer_slashing: &ProposerSlashing,
     ctx: &mut BlockContext,
 ) -> Result<(), StfError> {
+    let index = check_proposer_slashing(state, proposer_slashing)?;
+    // Verify signatures: in the batch of the block.
+
+    slash_validator(state, index, None, ctx.total_active_balance())
+}
+
+/// The asserts of `process_proposer_slashing` (P0 L2426-2434) before its BLS checks, in the
+/// order of the spec: the two headers have the same slot and the same proposer, they are
+/// different, the proposer is in the registry, and it is slashable. It gives the index of
+/// the proposer. The handler and [`crate::signatures::proposer_slashing_signature_sets`] run
+/// them first, so a forged slashing gets its proof error before any signature set.
+///
+/// The builder of the sets runs on the state before the block, and the handler on the state
+/// after the earlier operations. A proposer that is not slashable before the block is not
+/// slashable after them: no step of a block clears `slashed` or changes `activation_epoch`,
+/// and a `withdrawable_epoch` at or before the current epoch does not move.
+pub fn check_proposer_slashing<E: Preset>(
+    state: &BeaconState<E>,
+    proposer_slashing: &ProposerSlashing,
+) -> Result<ValidatorIndex, StfError> {
     let header_1 = &proposer_slashing.signed_header_1.message;
     let header_2 = &proposer_slashing.signed_header_2.message;
 
@@ -81,9 +101,7 @@ pub fn process_proposer_slashing_with<E: Preset>(
     if !is_slashable_validator(proposer, get_current_epoch(state)) {
         return Err(StfError::ValidatorNotSlashable(index));
     }
-    // Verify signatures: in the batch of the block.
-
-    slash_validator(state, index, None, ctx.total_active_balance())
+    Ok(index)
 }
 
 /// `process_attester_slashing` (P0 L2449-2462): slashes each slashable validator that is in
@@ -103,13 +121,9 @@ pub fn process_attester_slashing_with<E: Preset>(
     attester_slashing: &AttesterSlashing<E>,
     ctx: &mut BlockContext,
 ) -> Result<(), StfError> {
+    check_attester_slashing(state, attester_slashing)?;
     let attestation_1 = &attester_slashing.attestation_1;
     let attestation_2 = &attester_slashing.attestation_2;
-    if !is_slashable_attestation_data(&attestation_1.data, &attestation_2.data) {
-        return Err(StfError::NotSlashableAttestationData);
-    }
-    check_indexed_attestation(state, attestation_1)?;
-    check_indexed_attestation(state, attestation_2)?;
 
     // The checks prove that both index lists are sorted and unique, so the indices of the
     // first list that are also in the second are `sorted(indices)`.
@@ -132,6 +146,24 @@ pub fn process_attester_slashing_with<E: Preset>(
         return Err(StfError::NoValidatorSlashed);
     }
     Ok(())
+}
+
+/// The asserts of `process_attester_slashing` (P0 L2452-2454) before its BLS checks, in the
+/// order of the spec: `is_slashable_attestation_data`, then the checks of
+/// `is_valid_indexed_attestation` that need no BLS ([`check_indexed_attestation`]) for each
+/// attestation. The handler and [`crate::signatures::attester_slashing_signature_sets`] run
+/// them first, so a forged slashing gets its proof error before any signature set.
+pub fn check_attester_slashing<E: Preset>(
+    state: &BeaconState<E>,
+    attester_slashing: &AttesterSlashing<E>,
+) -> Result<(), StfError> {
+    let attestation_1 = &attester_slashing.attestation_1;
+    let attestation_2 = &attester_slashing.attestation_2;
+    if !is_slashable_attestation_data(&attestation_1.data, &attestation_2.data) {
+        return Err(StfError::NotSlashableAttestationData);
+    }
+    check_indexed_attestation(state, attestation_1)?;
+    check_indexed_attestation(state, attestation_2)
 }
 
 #[cfg(test)]

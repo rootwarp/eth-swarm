@@ -39,7 +39,7 @@ pub mod slashings;
 pub mod sync_aggregate;
 pub mod withdrawals;
 
-pub use attestation::process_attestation;
+pub use attestation::process_attestation_with;
 pub use bid::process_execution_payload_bid;
 pub use header::{check_block_header, process_block_header, process_eth1_data, process_randao};
 pub use operations::process_operations;
@@ -106,7 +106,8 @@ pub enum BlockStep {
 ///
 /// Use one context for one block on one state, and a new context for the next block. A
 /// committee cache of another state with another seed is not used:
-/// [`crate::accessors::get_attesting_indices_with`] gives `CacheSeedMismatch` for it.
+/// [`crate::accessors::get_attesting_indices_with`] gives `CacheSeedMismatch` for it. A state
+/// with the same seed and another registry length gets its own shuffle.
 #[derive(Debug, Default)]
 pub struct BlockContext<'a> {
     parent_slot: Slot,
@@ -212,8 +213,15 @@ impl BlockContext<'_> {
         self.sync_index_scans
     }
 
-    /// The beacon committees of `epoch` on `state`. The first call for an epoch shuffles it,
-    /// and the later calls give the same cache.
+    /// The beacon committees of `epoch` on `state`. The first call for an epoch and a
+    /// registry length shuffles the epoch, and the later calls give the same cache.
+    ///
+    /// The key holds the registry length, because the attester seed alone does not identify
+    /// the active set. A state with the same seed and another registry gets a new shuffle.
+    /// Thus the committees of a longer registry never give an index past the registry of
+    /// `state`, which would be [`StfError::UnknownValidator`], a proof, for a fault of our
+    /// own state. [`CommitteeCache::check_state`] refuses a cache with another seed or
+    /// another registry length.
     ///
     /// Call it only for the previous or the current epoch of `state`: the cache of another
     /// epoch costs a shuffle, and the spec reads no committee of it.
@@ -222,10 +230,11 @@ impl BlockContext<'_> {
         state: &BeaconState<E>,
         epoch: Epoch,
     ) -> Result<&CommitteeCache, StfError> {
+        let registry_len = state.validators.len() as u64;
         let position = match self
             .committee_caches
             .iter()
-            .position(|cache| cache.key().0 == epoch)
+            .position(|cache| cache.key().0 == epoch && cache.registry_len() == registry_len)
         {
             Some(position) => position,
             None => {
@@ -556,6 +565,44 @@ mod tests {
             &want_second[..]
         );
         assert_eq!(ctx.sync_index_scans(), 2);
+    }
+
+    #[test]
+    fn context_shuffles_again_for_a_shorter_registry() {
+        use crate::per_block::attestation::tests::{attestation, attestation_state};
+        use crate::signatures::attestation_signature_set_with;
+
+        // Two states with the same attester seed of epoch 0: 64 validators, and the first
+        // 32 of them. The committees of the first state hold indices past the second
+        // registry. One context for both must not give them for the second state.
+        let long = attestation_state(4);
+        let mut short = genesis_state::<Minimal>(&[32_000_000_000; 32]);
+        short.slot = long.slot;
+        short.block_roots = long.block_roots.clone();
+        let seed = |state: &BeaconState<Minimal>| CommitteeCache::new(state, 0).unwrap().key();
+        assert_eq!(seed(&long), seed(&short));
+
+        let mut ctx = BlockContext::default();
+        let on_long = attestation(&long, 3, &[0, 1, 2, 3]);
+        assert!(attestation_signature_set_with(&long, &on_long, &mut ctx).is_ok());
+        let on_short = attestation(&short, 3, &[0, 1, 2, 3]);
+        let want = attestation_signature_set_with(&short, &on_short, &mut BlockContext::default());
+        assert!(want.is_ok());
+        assert_eq!(
+            attestation_signature_set_with(&short, &on_short, &mut ctx),
+            want
+        );
+        assert_eq!(
+            ctx.committee_cache(&short, 0).unwrap(),
+            &CommitteeCache::new(&short, 0).unwrap()
+        );
+        assert_eq!(ctx.committee_shuffles(), 2);
+        // The first state still reads its own committees, with no new shuffle.
+        assert_eq!(
+            ctx.committee_cache(&long, 0).unwrap(),
+            &CommitteeCache::new(&long, 0).unwrap()
+        );
+        assert_eq!(ctx.committee_shuffles(), 2);
     }
 
     #[test]
