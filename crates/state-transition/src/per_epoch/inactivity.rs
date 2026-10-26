@@ -2,11 +2,16 @@
 
 use super::participation::{is_in_inactivity_leak, ParticipationCache};
 use crate::accessors::{get_current_epoch, has_flag};
+use crate::mutators::state_sum;
 use crate::preset::{
     GENESIS_EPOCH, INACTIVITY_SCORE_BIAS, INACTIVITY_SCORE_RECOVERY_RATE, TIMELY_TARGET_FLAG_INDEX,
 };
 use crate::{Preset, StfError};
 use consensus_types::gloas::BeaconState;
+
+/// The `what` of `inactivity_score + INACTIVITY_SCORE_BIAS`. The score comes from our own
+/// state, so a failed sum is `StateArithmetic`, not a proof.
+pub(crate) const INACTIVITY_SCORE: &str = "inactivity score";
 
 /// `process_inactivity_updates` (A L754-771, New in Altair; Gloas keeps it).
 pub fn process_inactivity_updates<E: Preset>(state: &mut BeaconState<E>) -> Result<(), StfError> {
@@ -51,9 +56,7 @@ pub(crate) fn process_inactivity_updates_with<E: Preset>(
         if has_flag(v.previous_flags, TIMELY_TARGET_FLAG_INDEX)? {
             *score = score.saturating_sub(1);
         } else {
-            *score = score
-                .checked_add(INACTIVITY_SCORE_BIAS)
-                .ok_or(StfError::ArithmeticOverflow)?;
+            *score = state_sum(*score, INACTIVITY_SCORE_BIAS, INACTIVITY_SCORE)?;
         }
         // Decrease the inactivity score of all eligible validators during a leak-free epoch
         if !leaking.clone()? {
@@ -108,10 +111,15 @@ mod tests {
     fn invalid_states_fail() {
         let mut overflow = state(9, 0);
         *overflow.inactivity_scores.get_mut(3).unwrap() = u64::MAX;
+        // The score comes from our own state, so its overflow is not a proof.
+        let err = process_inactivity_updates(&mut overflow).unwrap_err();
         assert_eq!(
-            process_inactivity_updates(&mut overflow),
-            Err(StfError::ArithmeticOverflow)
+            err,
+            StfError::StateArithmetic {
+                what: "inactivity score"
+            }
         );
+        assert!(!err.proves_invalid());
         let mut short = state(9, 0);
         short.inactivity_scores = milhouse::ProgressiveList::default();
         assert_eq!(
@@ -132,11 +140,13 @@ mod tests {
                 index: 0
             })
         );
-        // The finalized epoch is after the previous epoch.
+        // The finalized epoch is after the previous epoch: a fault of our own state.
         let mut future = state(9, 9);
         assert_eq!(
             process_inactivity_updates(&mut future),
-            Err(StfError::ArithmeticOverflow)
+            Err(StfError::StateArithmetic {
+                what: "finality delay"
+            })
         );
         // Without an eligible validator the loop body, and thus the leak check, never runs.
         for i in 0..4 {

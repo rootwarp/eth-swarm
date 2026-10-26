@@ -8,6 +8,7 @@ use crate::accessors::{
     get_active_validator_indices, get_current_epoch, get_previous_epoch, has_flag,
     is_active_validator, TotalActiveBalanceCache,
 };
+use crate::mutators::state_sum;
 use crate::preset::{
     EFFECTIVE_BALANCE_INCREMENT, MIN_EPOCHS_TO_INACTIVITY_PENALTY, TIMELY_TARGET_FLAG_INDEX,
 };
@@ -16,9 +17,13 @@ use consensus_types::gloas::BeaconState;
 use consensus_types::primitives::{Epoch, Gwei, ParticipationFlags, ValidatorIndex};
 use std::collections::BTreeSet;
 
+/// The `what` of a failed `get_total_balance` sum.
+const TOTAL_BALANCE: &str = "total balance";
+
 /// `get_total_balance` (P0 L1559-1570). The spec gives it only indices from the registry
 /// of `state`, so an index past the registry is a fault of our own state
-/// (`ListIndexOutOfRange`), not a proof.
+/// (`ListIndexOutOfRange`), not a proof. The effective balances also come from our own
+/// state, so a failed sum is [`StfError::StateArithmetic`], not a proof.
 pub fn get_total_balance<E: Preset>(
     state: &BeaconState<E>,
     indices: &BTreeSet<ValidatorIndex>,
@@ -26,9 +31,7 @@ pub fn get_total_balance<E: Preset>(
     let mut sum: Gwei = 0;
     for &index in indices {
         let validator = super::state_validator(state, index)?;
-        sum = sum
-            .checked_add(validator.effective_balance)
-            .ok_or(StfError::ArithmeticOverflow)?;
+        sum = state_sum(sum, validator.effective_balance, TOTAL_BALANCE)?;
     }
     Ok(sum.max(EFFECTIVE_BALANCE_INCREMENT))
 }
@@ -104,11 +107,14 @@ pub fn get_eligible_validator_indices<E: Preset>(state: &BeaconState<E>) -> Vec<
         .collect()
 }
 
-/// `get_finality_delay` (P0 L2027-2028).
+/// `get_finality_delay` (P0 L2027-2028). Both epochs come from our own state, so a
+/// finalized epoch past the previous epoch is [`StfError::StateArithmetic`], not a proof.
 pub fn get_finality_delay<E: Preset>(state: &BeaconState<E>) -> Result<Epoch, StfError> {
     get_previous_epoch(state)
         .checked_sub(state.finalized_checkpoint.epoch)
-        .ok_or(StfError::ArithmeticOverflow)
+        .ok_or(StfError::StateArithmetic {
+            what: "finality delay",
+        })
 }
 
 /// `is_in_inactivity_leak` (P0 L2032-2033).
@@ -216,9 +222,12 @@ impl ParticipationCache {
                 previous_flags,
             });
         }
+        // The same sum as `get_total_balance`, so the same class.
         let total = |sum: Option<Gwei>| {
             sum.map(|s| s.max(EFFECTIVE_BALANCE_INCREMENT))
-                .ok_or(StfError::ArithmeticOverflow)
+                .ok_or(StfError::StateArithmetic {
+                    what: TOTAL_BALANCE,
+                })
         };
         let previous_flag_balances =
             previous_sums.map(|sum| previous_participation.clone().and(total(sum)));
@@ -427,10 +436,41 @@ mod tests {
         assert_eq!(is_in_inactivity_leak(&state), Ok(false));
         state.finalized_checkpoint.epoch = 4;
         assert_eq!(is_in_inactivity_leak(&state), Ok(true));
+        // A finalized epoch past the previous epoch is a fault of our own state.
         state.finalized_checkpoint.epoch = 10;
+        let err = is_in_inactivity_leak(&state).unwrap_err();
         assert_eq!(
-            is_in_inactivity_leak(&state),
-            Err(StfError::ArithmeticOverflow)
+            err,
+            StfError::StateArithmetic {
+                what: "finality delay"
+            }
         );
+        assert!(!err.proves_invalid());
+    }
+
+    #[test]
+    fn total_balance_sums_are_not_a_proof() {
+        // The effective balances come from our own state, so a sum past `u64::MAX` is not
+        // a proof.
+        let mut state = state_at(3);
+        for i in 0..8 {
+            *state.previous_epoch_participation.get_mut(i).unwrap() = 0b111;
+            *state.current_epoch_participation.get_mut(i).unwrap() = 0b111;
+        }
+        state.validators.get_mut(0).unwrap().effective_balance = u64::MAX;
+        let total_balance = StfError::StateArithmetic {
+            what: "total balance",
+        };
+        let err = get_total_balance(&state, &BTreeSet::from([0, 1])).unwrap_err();
+        assert_eq!(err, total_balance);
+        assert!(!err.proves_invalid());
+        let cache = cache_of(&state);
+        for flag in 0..3 {
+            assert_eq!(
+                cache.previous_flag_balance(flag),
+                Err(total_balance.clone())
+            );
+        }
+        assert_eq!(cache.current_target_balance(), Err(total_balance));
     }
 }

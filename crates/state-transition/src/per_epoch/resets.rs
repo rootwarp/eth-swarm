@@ -15,7 +15,8 @@ use ssz_types::typenum::Unsigned;
 use ssz_types::FixedVector;
 use tree_hash::TreeHash;
 
-/// `get_current_epoch(state) + 1`.
+/// `get_current_epoch(state) + 1`. Kept a proof: unreachable, an epoch is at most
+/// `u64::MAX / SLOTS_PER_EPOCH`.
 fn next_epoch<E: Preset>(state: &BeaconState<E>) -> Result<Epoch, StfError> {
     get_current_epoch(state)
         .checked_add(1)

@@ -70,6 +70,7 @@ pub fn process_slot<E: Preset>(state: &mut BeaconState<E>) -> Result<(), StfErro
         .get_mut(slot_index)
         .ok_or_else(out_of_range)? = previous_block_root;
     // [New in Gloas:EIP7732] Unset the next payload availability
+    // Kept a proof: unreachable, the loop of `process_slots` keeps `state.slot < target`.
     let next_slot = state
         .slot
         .checked_add(1)

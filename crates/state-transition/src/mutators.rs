@@ -29,8 +29,8 @@ use ssz_types::typenum::Unsigned;
 
 /// `increase_balance` (P0 L1653-1657). The sum is checked.
 ///
-/// A failed sum stays [`StfError::ArithmeticOverflow`] (a proof), because some callers add
-/// a value of the object. A caller that adds a value of our own state only uses
+/// A failed sum is [`StfError::ArithmeticOverflow`] (a proof), for a caller that adds a
+/// value of the object. The transition itself adds only values of our own state, so it uses
 /// [`increase_balance_from_state`].
 pub fn increase_balance<E: Preset>(
     state: &mut BeaconState<E>,

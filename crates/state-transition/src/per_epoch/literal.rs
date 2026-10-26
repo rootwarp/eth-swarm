@@ -18,8 +18,12 @@
 //! Thus `cached_vs_literal` cannot find a bug in the functions of the last two items. Their
 //! own unit tests and the spec vectors test them.
 
+use super::inactivity::INACTIVITY_SCORE;
+use super::justification::{JUSTIFICATION_TARGET_BALANCE, JUSTIFICATION_TOTAL_BALANCE};
 use super::participation::{get_total_balance, get_unslashed_participating_indices};
-use super::rewards::Deltas;
+use super::rewards::{
+    Deltas, FLAG_PENALTY, FLAG_REWARD_NUMERATOR, INACTIVITY_PENALTY_NUMERATOR, REWARD_BALANCE,
+};
 use crate::accessors::{
     get_active_validator_indices, get_block_root, get_current_epoch, get_previous_epoch,
     is_active_validator,
@@ -37,6 +41,11 @@ use consensus_types::primitives::{Epoch, Gwei, ValidatorIndex};
 use std::collections::BTreeSet;
 
 const OVERFLOW: StfError = StfError::ArithmeticOverflow;
+
+/// The error of a failed sum of values of our own state: the cached steps give the same.
+fn state_arithmetic(what: &'static str) -> StfError {
+    StfError::StateArithmetic { what }
+}
 
 /// `process_justification_and_finalization` (A L730-746).
 pub(crate) fn process_justification_and_finalization<E: Preset>(
@@ -93,7 +102,9 @@ pub(crate) fn process_inactivity_updates<E: Preset>(
             *score = score.saturating_sub(1);
         } else {
             let score = state.inactivity_scores.get_mut(i).ok_or(range.clone())?;
-            *score = score.checked_add(INACTIVITY_SCORE_BIAS).ok_or(OVERFLOW)?;
+            *score = score
+                .checked_add(INACTIVITY_SCORE_BIAS)
+                .ok_or(state_arithmetic(INACTIVITY_SCORE))?;
         }
         if !is_in_inactivity_leak(state)? {
             let score = state.inactivity_scores.get_mut(i).ok_or(range)?;
@@ -134,7 +145,7 @@ pub(crate) fn get_flag_index_deltas<E: Preset>(
                 let reward_numerator = base_reward
                     .checked_mul(weight)
                     .and_then(|r| r.checked_mul(unslashed_participating_increments))
-                    .ok_or(OVERFLOW)?;
+                    .ok_or(state_arithmetic(FLAG_REWARD_NUMERATOR))?;
                 let denominator = active_increments
                     .checked_mul(WEIGHT_DENOMINATOR)
                     .ok_or(OVERFLOW)?;
@@ -143,7 +154,10 @@ pub(crate) fn get_flag_index_deltas<E: Preset>(
                     .ok_or(OVERFLOW)?;
             }
         } else if flag_index != TIMELY_HEAD_FLAG_INDEX {
-            let penalty = base_reward.checked_mul(weight).ok_or(OVERFLOW)? / WEIGHT_DENOMINATOR;
+            let penalty = base_reward
+                .checked_mul(weight)
+                .ok_or(state_arithmetic(FLAG_PENALTY))?
+                / WEIGHT_DENOMINATOR;
             penalties[i] = penalties[i].checked_add(penalty).ok_or(OVERFLOW)?;
         }
     }
@@ -175,7 +189,9 @@ pub(crate) fn get_inactivity_penalty_deltas<E: Preset>(
                     list: "inactivity_scores",
                     index,
                 })?;
-            let penalty_numerator = effective_balance.checked_mul(score).ok_or(OVERFLOW)?;
+            let penalty_numerator = effective_balance
+                .checked_mul(score)
+                .ok_or(state_arithmetic(INACTIVITY_PENALTY_NUMERATOR))?;
             let penalty_denominator = INACTIVITY_SCORE_BIAS * INACTIVITY_PENALTY_QUOTIENT_BELLATRIX;
             penalties[i] = penalties[i]
                 .checked_add(penalty_numerator / penalty_denominator)
@@ -213,7 +229,9 @@ fn increase_balance<E: Preset>(
     delta: Gwei,
 ) -> Result<(), StfError> {
     let balance = balance_mut(state, index)?;
-    *balance = balance.checked_add(delta).ok_or(OVERFLOW)?;
+    *balance = balance
+        .checked_add(delta)
+        .ok_or(state_arithmetic(REWARD_BALANCE))?;
     Ok(())
 }
 
@@ -262,15 +280,17 @@ fn weigh_justification_and_finalization<E: Preset>(
         state.justification_bits.set(i + 1, b).unwrap();
     }
     state.justification_bits.set(0, false).unwrap();
-    let times = |a: Gwei, k: u64| a.checked_mul(k).ok_or(OVERFLOW);
-    if times(previous_epoch_target_balance, 3)? >= times(total_active_balance, 2)? {
+    let times = |a: Gwei, k: u64, what| a.checked_mul(k).ok_or(state_arithmetic(what));
+    let target = |balance| times(balance, 3, JUSTIFICATION_TARGET_BALANCE);
+    let total = || times(total_active_balance, 2, JUSTIFICATION_TOTAL_BALANCE);
+    if target(previous_epoch_target_balance)? >= total()? {
         state.current_justified_checkpoint = Checkpoint {
             epoch: previous_epoch,
             root: get_block_root(state, previous_epoch)?,
         };
         state.justification_bits.set(1, true).unwrap();
     }
-    if times(current_epoch_target_balance, 3)? >= times(total_active_balance, 2)? {
+    if target(current_epoch_target_balance)? >= total()? {
         state.current_justified_checkpoint = Checkpoint {
             epoch: current_epoch,
             root: get_block_root(state, current_epoch)?,
@@ -349,7 +369,7 @@ fn get_base_reward<E: Preset>(
 fn get_finality_delay<E: Preset>(state: &BeaconState<E>) -> Result<Epoch, StfError> {
     get_previous_epoch(state)
         .checked_sub(state.finalized_checkpoint.epoch)
-        .ok_or(OVERFLOW)
+        .ok_or(state_arithmetic("finality delay"))
 }
 
 /// `is_in_inactivity_leak` (P0 L2032-2033).

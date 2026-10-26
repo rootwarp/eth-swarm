@@ -8,6 +8,12 @@ use consensus_types::common::Checkpoint;
 use consensus_types::gloas::BeaconState;
 use consensus_types::primitives::{Epoch, Gwei};
 
+/// The `what` of `target_balance * 3`. The target balance is a sum of our own state, so a
+/// failed product is `StateArithmetic`, not a proof.
+pub(crate) const JUSTIFICATION_TARGET_BALANCE: &str = "justification target balance";
+/// The `what` of `total_active_balance * 2`, also a value of our own state.
+pub(crate) const JUSTIFICATION_TOTAL_BALANCE: &str = "justification total balance";
+
 /// `process_justification_and_finalization` (A L730-746, Modified in Altair; Gloas keeps
 /// it).
 pub fn process_justification_and_finalization<E: Preset>(
@@ -71,10 +77,14 @@ pub fn weigh_justification_and_finalization<E: Preset>(
         *bit = justification_bit(state, i - 1)?;
     }
     let two_thirds = |balance: Gwei| -> Result<bool, StfError> {
-        let lhs = balance.checked_mul(3).ok_or(StfError::ArithmeticOverflow)?;
+        let lhs = balance.checked_mul(3).ok_or(StfError::StateArithmetic {
+            what: JUSTIFICATION_TARGET_BALANCE,
+        })?;
         let rhs = total_active_balance
             .checked_mul(2)
-            .ok_or(StfError::ArithmeticOverflow)?;
+            .ok_or(StfError::StateArithmetic {
+                what: JUSTIFICATION_TOTAL_BALANCE,
+            })?;
         Ok(lhs >= rhs)
     };
     if two_thirds(previous_epoch_target_balance)? {
@@ -101,6 +111,7 @@ pub fn weigh_justification_and_finalization<E: Preset>(
     // Process finalizations
     // The spec evaluates `checkpoint.epoch + k` only when the bits hold, and a `Uint64`
     // overflow raises.
+    // Kept a proof: the epoch_processing runner accepts this crafted pre-state only as a proof.
     let source_is = |checkpoint: &Checkpoint, k: Epoch| -> Result<bool, StfError> {
         Ok(checkpoint
             .epoch
@@ -227,13 +238,36 @@ mod tests {
     #[test]
     fn overflows_raise() {
         let mut state = state_at_epoch_6();
+        // The balances come from our own state, so their products are not a proof.
+        let err =
+            weigh_justification_and_finalization(&mut state.clone(), u64::MAX, 0, 0).unwrap_err();
         assert_eq!(
-            weigh_justification_and_finalization(&mut state.clone(), u64::MAX, 0, 0),
-            Err(StfError::ArithmeticOverflow)
+            err,
+            StfError::StateArithmetic {
+                what: JUSTIFICATION_TOTAL_BALANCE
+            }
+        );
+        assert!(!err.proves_invalid());
+        let err =
+            weigh_justification_and_finalization(&mut state.clone(), ETH, u64::MAX, 0).unwrap_err();
+        assert_eq!(
+            err,
+            StfError::StateArithmetic {
+                what: JUSTIFICATION_TARGET_BALANCE
+            }
+        );
+        assert!(!err.proves_invalid());
+        let err =
+            weigh_justification_and_finalization(&mut state.clone(), ETH, 0, u64::MAX).unwrap_err();
+        assert_eq!(
+            err,
+            StfError::StateArithmetic {
+                what: JUSTIFICATION_TARGET_BALANCE
+            }
         );
         assert_eq!(
-            weigh_justification_and_finalization(&mut state.clone(), ETH, u64::MAX, 0),
-            Err(StfError::ArithmeticOverflow)
+            err.to_string(),
+            "state arithmetic failed: justification target balance"
         );
         // `epoch + 3` is evaluated once the bits hold.
         set_bits(&mut state, [true, true, true, false]);

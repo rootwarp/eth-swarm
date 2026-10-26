@@ -20,7 +20,7 @@
 use super::registry::get_max_effective_balance;
 use super::state_validator;
 use crate::accessors::{get_activation_churn_limit, get_current_epoch, TotalActiveBalanceCache};
-use crate::mutators::{decrease_balance, increase_balance};
+use crate::mutators::{decrease_balance, increase_balance_from_state, state_sum};
 use crate::preset::{EFFECTIVE_BALANCE_INCREMENT, MAX_PENDING_DEPOSITS_PER_EPOCH};
 use crate::signatures::{deposit_signature_set, is_valid_deposit_signature};
 use crate::{Preset, SignatureBackend, SignatureSet, StfError};
@@ -262,7 +262,8 @@ fn apply_pending_deposit_at<E: Preset>(
             }
             Ok(())
         }
-        Some(index) => increase_balance(state, index, deposit.amount),
+        // The deposit comes from our own queue, so a failed sum is not a proof.
+        Some(index) => increase_balance_from_state(state, index, deposit.amount, "deposit balance"),
     }
 }
 
@@ -318,15 +319,19 @@ pub(crate) fn process_pending_deposits_with<E: Preset>(
     backend: &dyn SignatureBackend,
     totals: &mut TotalActiveBalanceCache,
 ) -> Result<(), StfError> {
-    let overflow = || StfError::ArithmeticOverflow;
+    // Kept a proof: unreachable, an epoch is at most `u64::MAX / SLOTS_PER_EPOCH`.
     let next_epoch = get_current_epoch(state)
         .checked_add(1)
-        .ok_or_else(overflow)?;
+        .ok_or(StfError::ArithmeticOverflow)?;
+    // The sums and the product below read only our own state (the carried churn, the churn
+    // limit, the finalized epoch and the queued amounts), so a failed one is
+    // `StateArithmetic`, not a proof.
     // Deposits still consume the activation-only churn budget in Gloas.
-    let available_for_processing = state
-        .deposit_balance_to_consume
-        .checked_add(get_activation_churn_limit(state, totals)?)
-        .ok_or_else(overflow)?;
+    let available_for_processing = state_sum(
+        state.deposit_balance_to_consume,
+        get_activation_churn_limit(state, totals)?,
+        "deposit churn budget",
+    )?;
     let mut processed_amount: Gwei = 0;
     let mut next_deposit_index: u64 = 0;
     let mut deposits_to_postpone = Vec::new();
@@ -335,7 +340,9 @@ pub(crate) fn process_pending_deposits_with<E: Preset>(
         .finalized_checkpoint
         .epoch
         .checked_mul(E::slots_per_epoch())
-        .ok_or_else(overflow)?;
+        .ok_or(StfError::StateArithmetic {
+            what: "finalized slot",
+        })?;
 
     // The loop applies at most `MAX_PENDING_DEPOSITS_PER_EPOCH` deposits and does not change
     // the queue, so a copy of them lets it change the state. A deposit past them only stops
@@ -394,9 +401,7 @@ pub(crate) fn process_pending_deposits_with<E: Preset>(
         } else {
             // Check if deposit fits in the churn, otherwise, do no more deposit processing in
             // this epoch.
-            let amount = processed_amount
-                .checked_add(deposit.amount)
-                .ok_or_else(overflow)?;
+            let amount = state_sum(processed_amount, deposit.amount, "processed deposit amount")?;
             is_churn_limit_reached = amount > available_for_processing;
             if is_churn_limit_reached {
                 break;
@@ -455,6 +460,7 @@ fn apply_indexed_deposit<E: Preset>(
 pub fn process_pending_consolidations<E: Preset>(
     state: &mut BeaconState<E>,
 ) -> Result<(), StfError> {
+    // Kept a proof: unreachable, an epoch is at most `u64::MAX / SLOTS_PER_EPOCH`.
     let next_epoch = get_current_epoch(state)
         .checked_add(1)
         .ok_or(StfError::ArithmeticOverflow)?;
@@ -488,7 +494,14 @@ pub fn process_pending_consolidations<E: Preset>(
         // Move active balance to target. Excess balance is withdrawable.
         decrease_balance(state, source_index, source_effective_balance)?;
         let target_index = pending_consolidation.target_index;
-        increase_balance(state, target_index, source_effective_balance).map_err(|e| match e {
+        // Both balances come from our own state, so a failed sum is not a proof.
+        increase_balance_from_state(
+            state,
+            target_index,
+            source_effective_balance,
+            "consolidated balance",
+        )
+        .map_err(|e| match e {
             StfError::UnknownValidator(index) => StfError::ListIndexOutOfRange {
                 list: "validators",
                 index,
@@ -703,14 +716,29 @@ mod tests {
         assert_eq!(state.balances.get(2), Some(&(48 * ETH)));
         assert_eq!(state.deposit_balance_to_consume, 0);
 
+        // Each operand of these sums comes from our own state, so no overflow is a proof.
+        let state_arithmetic = |what| StfError::StateArithmetic { what };
         // The sum of the carried churn and the churn limit overflows.
         let mut state = self::state();
         state.deposit_balance_to_consume = u64::MAX;
-        assert_eq!(run(&mut state, &none()), Err(StfError::ArithmeticOverflow));
+        let err = run(&mut state, &none()).unwrap_err();
+        assert_eq!(err, state_arithmetic("deposit churn budget"));
+        assert!(!err.proves_invalid());
         // So does the start slot of a finalized epoch past 2**64 / SLOTS_PER_EPOCH.
         let mut state = self::state();
         state.finalized_checkpoint.epoch = u64::MAX / 4;
-        assert_eq!(run(&mut state, &none()), Err(StfError::ArithmeticOverflow));
+        let err = run(&mut state, &none()).unwrap_err();
+        assert_eq!(err, state_arithmetic("finalized slot"));
+        assert!(!err.proves_invalid());
+        // So does the processed amount: a queued amount past the rest of `u64`.
+        let mut state = self::state();
+        queue(
+            &mut state,
+            &[deposit(key_of(2), ETH, 0), deposit(key_of(3), u64::MAX, 0)],
+        );
+        let err = run(&mut state, &none()).unwrap_err();
+        assert_eq!(err, state_arithmetic("processed deposit amount"));
+        assert!(!err.proves_invalid());
     }
 
     #[test]
@@ -852,5 +880,38 @@ mod tests {
             );
             assert!(!err.proves_invalid());
         }
+
+        // The moved balance and the balance of the target come from our own state.
+        let mut state = self::state();
+        state.validators.get_mut(1).unwrap().withdrawable_epoch = 5;
+        *state.balances.get_mut(2).unwrap() = u64::MAX;
+        state
+            .pending_consolidations
+            .push(consolidation(1, 2))
+            .unwrap();
+        let err = process_pending_consolidations(&mut state).unwrap_err();
+        assert_eq!(
+            err,
+            StfError::StateArithmetic {
+                what: "consolidated balance"
+            }
+        );
+        assert!(!err.proves_invalid());
+    }
+
+    #[test]
+    fn top_up_past_u64_is_not_a_proof() {
+        // The queued amount and the balance come from our own state.
+        let mut state = state();
+        *state.balances.get_mut(2).unwrap() = u64::MAX;
+        queue(&mut state, &[deposit(key_of(2), ETH, 0)]);
+        let err = run(&mut state, &ScriptedBackend::new([])).unwrap_err();
+        assert_eq!(
+            err,
+            StfError::StateArithmetic {
+                what: "deposit balance"
+            }
+        );
+        assert!(!err.proves_invalid());
     }
 }

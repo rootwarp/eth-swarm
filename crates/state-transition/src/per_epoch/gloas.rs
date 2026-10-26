@@ -71,6 +71,7 @@ pub(crate) fn process_builder_pending_payments_with<E: Preset>(
 /// `get_current_epoch(state) + MIN_SEED_LOOKAHEAD + 1`: the epoch that the step adds to its
 /// window.
 fn last_window_epoch<E: Preset>(state: &BeaconState<E>) -> Result<Epoch, StfError> {
+    // Kept a proof: unreachable, an epoch is at most `u64::MAX / SLOTS_PER_EPOCH`.
     get_current_epoch(state)
         .checked_add(MIN_SEED_LOOKAHEAD + 1)
         .ok_or(StfError::ArithmeticOverflow)
@@ -85,8 +86,18 @@ fn shift_window<T>(old: Vec<T>, spe: usize, last_epoch: Vec<T>) -> Vec<T> {
 /// proposers of the first epoch and appends the proposers of the next epoch past the window.
 pub fn process_proposer_lookahead<E: Preset>(state: &mut BeaconState<E>) -> Result<(), StfError> {
     let spe = E::slots_per_epoch() as usize;
+    let last_epoch = last_window_epoch(state)?;
+    // `compute_proposer_indices` reads the slots of `last_epoch`. The epoch comes from the
+    // slot of our own state, so a slot past `u64::MAX` is `StateArithmetic`, not a proof.
+    // The check runs here, so a caller with the epoch of an object still gets a proof.
+    last_epoch
+        .checked_mul(E::slots_per_epoch())
+        .and_then(|start| start.checked_add(E::slots_per_epoch() - 1))
+        .ok_or(StfError::StateArithmetic {
+            what: "proposer lookahead slot",
+        })?;
     // Fill in the last epoch with new proposer indices
-    let last_epoch_proposers = get_beacon_proposer_indices(state, last_window_epoch(state)?)?;
+    let last_epoch_proposers = get_beacon_proposer_indices(state, last_epoch)?;
     // Shift out proposers in the first epoch
     let lookahead = shift_window(state.proposer_lookahead.to_vec(), spe, last_epoch_proposers);
     state.proposer_lookahead = Vector::new(lookahead)?;
@@ -101,12 +112,13 @@ pub fn process_ptc_window<E: Preset>(state: &mut BeaconState<E>) -> Result<(), S
     // Fill in the last epoch
     let next_epoch = last_window_epoch(state)?;
     let cache = CommitteeCache::new(state, next_epoch)?;
-    let start_slot = next_epoch
-        .checked_mul(spe)
-        .ok_or(StfError::ArithmeticOverflow)?;
-    let end_slot = start_slot
-        .checked_add(spe)
-        .ok_or(StfError::ArithmeticOverflow)?;
+    // The epoch comes from the slot of our own state, so a slot past `u64::MAX` is
+    // `StateArithmetic`, not a proof.
+    let window_slot = || StfError::StateArithmetic {
+        what: "PTC window slot",
+    };
+    let start_slot = next_epoch.checked_mul(spe).ok_or_else(window_slot)?;
+    let end_slot = start_slot.checked_add(spe).ok_or_else(window_slot)?;
     let last_epoch = (start_slot..end_slot)
         .map(|slot| {
             PayloadTimelinessCommittee::<E>::new(compute_ptc_with(state, &cache, slot)?)
@@ -155,6 +167,39 @@ mod tests {
         // The current epoch is 3, so the new last epoch is 3 + MIN_SEED_LOOKAHEAD + 1.
         assert_eq!(post[spe..], get_beacon_proposer_indices(&state, 5).unwrap());
         assert_ne!(post[spe..], pre[spe..]);
+    }
+
+    #[test]
+    fn proposer_lookahead_slots_past_u64_are_not_a_proof() {
+        // The slot of our own state puts the start slot of the new lookahead epoch past
+        // `u64::MAX`.
+        let mut state = state();
+        state.slot = u64::MAX;
+        let err = process_proposer_lookahead(&mut state).unwrap_err();
+        assert_eq!(
+            err,
+            StfError::StateArithmetic {
+                what: "proposer lookahead slot"
+            }
+        );
+        assert!(!err.proves_invalid());
+    }
+
+    #[test]
+    fn ptc_window_slots_past_u64_are_not_a_proof() {
+        // The slot of our own state puts the start slot of the new window epoch past
+        // `u64::MAX`, or its end slot one epoch further.
+        let spe = Minimal::slots_per_epoch();
+        let window_slot = StfError::StateArithmetic {
+            what: "PTC window slot",
+        };
+        for slot in [u64::MAX, (u64::MAX / spe - 2) * spe] {
+            let mut state = state();
+            state.slot = slot;
+            let err = process_ptc_window(&mut state).unwrap_err();
+            assert_eq!(err, window_slot, "{slot}");
+            assert!(!err.proves_invalid());
+        }
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::accessors::{
     compute_activation_exit_epoch, get_current_epoch, has_compounding_withdrawal_credential,
     is_active_validator, TotalActiveBalanceCache,
 };
-use crate::mutators::{decrease_balance, initiate_validator_exit};
+use crate::mutators::{decrease_balance, initiate_validator_exit, state_sum};
 use crate::preset::{
     EFFECTIVE_BALANCE_INCREMENT, EJECTION_BALANCE, HYSTERESIS_DOWNWARD_MULTIPLIER,
     HYSTERESIS_QUOTIENT, HYSTERESIS_UPWARD_MULTIPLIER, MAX_EFFECTIVE_BALANCE_ELECTRA,
@@ -94,6 +94,7 @@ pub(crate) fn process_registry_updates_with<E: Preset>(
     for update in updates {
         match update {
             RegistryUpdate::Queue(index) => {
+                // Kept a proof: unreachable, an epoch is at most `u64::MAX / SLOTS_PER_EPOCH`.
                 let epoch = current_epoch
                     .checked_add(1)
                     .ok_or(StfError::ArithmeticOverflow)?;
@@ -145,15 +146,18 @@ pub(crate) fn process_slashings_with<E: Preset>(
     state: &mut BeaconState<E>,
     totals: &mut TotalActiveBalanceCache,
 ) -> Result<(), StfError> {
-    let overflow = || StfError::ArithmeticOverflow;
     let epoch = get_current_epoch(state);
     let total_balance = totals.get(state)?;
+    // The slashings vector and the effective balances are our own state, so a failed sum or
+    // product is `StateArithmetic`, not a proof.
     let adjusted_total_slashing_balance = state
         .slashings
         .iter()
         .try_fold(0u64, |sum, s| sum.checked_add(*s))
         .and_then(|sum| sum.checked_mul(PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX))
-        .ok_or_else(overflow)?
+        .ok_or(StfError::StateArithmetic {
+            what: "adjusted total slashing balance",
+        })?
         .min(total_balance);
     // Factored out from total balance to avoid Uint64 overflow
     let increment = EFFECTIVE_BALANCE_INCREMENT;
@@ -169,13 +173,16 @@ pub(crate) fn process_slashings_with<E: Preset>(
         if !validator.slashed {
             continue;
         }
-        if withdrawable_epoch.ok_or_else(overflow)? != validator.withdrawable_epoch {
+        // Kept a proof: unreachable, an epoch is at most `u64::MAX / SLOTS_PER_EPOCH`.
+        if withdrawable_epoch.ok_or(StfError::ArithmeticOverflow)? != validator.withdrawable_epoch {
             continue;
         }
         let effective_balance_increments = validator.effective_balance / increment;
         let penalty = penalty_per_effective_balance_increment
             .checked_mul(effective_balance_increments)
-            .ok_or_else(overflow)?;
+            .ok_or(StfError::StateArithmetic {
+                what: "slashing penalty",
+            })?;
         penalties.push((i as ValidatorIndex, penalty));
     }
     for (index, penalty) in penalties {
@@ -191,7 +198,9 @@ pub(crate) fn process_slashings_with<E: Preset>(
 pub fn process_effective_balance_updates<E: Preset>(
     state: &mut BeaconState<E>,
 ) -> Result<(), StfError> {
-    let overflow = || StfError::ArithmeticOverflow;
+    // The balances and the effective balances are our own state, so a failed sum is
+    // `StateArithmetic`, not a proof.
+    let threshold = |balance: Gwei, delta: Gwei| state_sum(balance, delta, "hysteresis threshold");
     let hysteresis_increment = EFFECTIVE_BALANCE_INCREMENT / HYSTERESIS_QUOTIENT;
     let downward_threshold = hysteresis_increment * HYSTERESIS_DOWNWARD_MULTIPLIER;
     let upward_threshold = hysteresis_increment * HYSTERESIS_UPWARD_MULTIPLIER;
@@ -207,16 +216,8 @@ pub fn process_effective_balance_updates<E: Preset>(
             })?;
         let max_effective_balance = get_max_effective_balance(validator);
         let effective_balance = validator.effective_balance;
-        let below = balance
-            .checked_add(downward_threshold)
-            .ok_or_else(overflow)?
-            < effective_balance;
-        if below
-            || effective_balance
-                .checked_add(upward_threshold)
-                .ok_or_else(overflow)?
-                < balance
-        {
+        let below = threshold(balance, downward_threshold)? < effective_balance;
+        if below || threshold(effective_balance, upward_threshold)? < balance {
             let new = (balance - balance % EFFECTIVE_BALANCE_INCREMENT).min(max_effective_balance);
             updates.push((index, new));
         }
@@ -403,12 +404,34 @@ mod tests {
         process_slashings_with(&mut state, &mut TotalActiveBalanceCache::default()).unwrap();
         assert_eq!(state.balances.get(0), Some(&0));
 
-        // The sum of the vector overflows.
+        // The sum of the vector overflows. The vector is our own state, so it is not a proof.
         *state.slashings.get_mut(4).unwrap() = u64::MAX;
+        let err = process_slashings(&mut state).unwrap_err();
         assert_eq!(
-            process_slashings(&mut state),
-            Err(StfError::ArithmeticOverflow)
+            err,
+            StfError::StateArithmetic {
+                what: "adjusted total slashing balance"
+            }
         );
+        assert!(!err.proves_invalid());
+
+        // A total of 1.9 ETH has one increment, so the penalty for each increment is
+        // 1.9 ETH. A slashed, exited validator with the largest effective balance takes a
+        // penalty past `u64::MAX`.
+        let mut state = state_at(&[19 * ETH / 10, u64::MAX], 10);
+        let v = state.validators.get_mut(1).unwrap();
+        v.slashed = true;
+        v.exit_epoch = 5;
+        v.withdrawable_epoch = 10 + n / 2;
+        *state.slashings.get_mut(3).unwrap() = 10 * ETH;
+        let err = process_slashings(&mut state).unwrap_err();
+        assert_eq!(
+            err,
+            StfError::StateArithmetic {
+                what: "slashing penalty"
+            }
+        );
+        assert!(!err.proves_invalid());
     }
 
     #[test]
@@ -456,12 +479,24 @@ mod tests {
                 index: 1
             }
         );
-        // `balance + DOWNWARD_THRESHOLD` overflows.
+        // `balance + DOWNWARD_THRESHOLD` overflows. Both are values of our own state, so it
+        // is not a proof.
+        let hysteresis = StfError::StateArithmetic {
+            what: "hysteresis threshold",
+        };
         let mut state = state_at(&[32 * ETH], 4);
         *state.balances.get_mut(0).unwrap() = u64::MAX;
-        assert_eq!(
-            process_effective_balance_updates(&mut state),
-            Err(StfError::ArithmeticOverflow)
-        );
+        let err = process_effective_balance_updates(&mut state).unwrap_err();
+        assert_eq!(err, hysteresis);
+        assert!(!err.proves_invalid());
+        // So does `effective_balance + UPWARD_THRESHOLD`. The balance is just low enough that
+        // the downward sum fits, so the upward sum is the one that fails.
+        let downward_threshold =
+            EFFECTIVE_BALANCE_INCREMENT / HYSTERESIS_QUOTIENT * HYSTERESIS_DOWNWARD_MULTIPLIER;
+        let mut state = state_at(&[u64::MAX], 4);
+        *state.balances.get_mut(0).unwrap() = u64::MAX - downward_threshold;
+        let err = process_effective_balance_updates(&mut state).unwrap_err();
+        assert_eq!(err, hysteresis);
+        assert!(!err.proves_invalid());
     }
 }

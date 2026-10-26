@@ -19,7 +19,7 @@ use crate::accessors::{
     integer_squareroot,
 };
 use crate::caches::CommitteeCache;
-use crate::mutators::increase_balance;
+use crate::mutators::{increase_balance_from_state, state_sum};
 use crate::per_block::{state_proposer_index, BlockContext};
 use crate::preset::{
     PARTICIPATION_FLAG_WEIGHTS, PROPOSER_WEIGHT, TIMELY_HEAD_FLAG_INDEX, TIMELY_SOURCE_FLAG_INDEX,
@@ -97,9 +97,12 @@ pub fn process_attestation_with<E: Preset>(
         })?;
     let same_slot = is_attestation_same_slot(state, data)?;
     let per_increment = base_reward_per_increment(ctx.total_active_balance().get(state)?);
-    // Kept a proof for now, outside the slashing and exit paths: the reward and weight sums
-    // read only state values, so their class is a follow-up.
-    let overflow = || StfError::ArithmeticOverflow;
+    // The reward and the weight sums read only values of our own state (the effective
+    // balances, the total active balance and the payment weight), so a failed sum is
+    // `StateArithmetic`, not a proof. The attestation selects the indices only.
+    let reward_overflow = || StfError::StateArithmetic {
+        what: "proposer reward numerator",
+    };
 
     let mut proposer_reward_numerator: u64 = 0;
     for &index in indexed.attesting_indices.iter() {
@@ -132,19 +135,17 @@ pub fn process_attestation_with<E: Preset>(
                 *flags = add_flag(*flags, flag_index)?;
                 let reward = base_reward(effective_balance, per_increment)?
                     .checked_mul(*weight)
-                    .ok_or_else(overflow)?;
+                    .ok_or_else(reward_overflow)?;
                 proposer_reward_numerator = proposer_reward_numerator
                     .checked_add(reward)
-                    .ok_or_else(overflow)?;
+                    .ok_or_else(reward_overflow)?;
                 will_set_new_flag = true;
             }
         }
 
         if will_set_new_flag && had_no_participation && same_slot && payment.withdrawal.amount > 0 {
-            payment.weight = payment
-                .weight
-                .checked_add(effective_balance)
-                .ok_or_else(overflow)?;
+            payment.weight =
+                state_sum(payment.weight, effective_balance, "builder payment weight")?;
         }
     }
 
@@ -152,7 +153,12 @@ pub fn process_attestation_with<E: Preset>(
     let proposer_reward_denominator =
         (WEIGHT_DENOMINATOR - PROPOSER_WEIGHT) * WEIGHT_DENOMINATOR / PROPOSER_WEIGHT;
     let proposer_reward = proposer_reward_numerator / proposer_reward_denominator;
-    increase_balance(state, state_proposer_index(state)?, proposer_reward)?;
+    increase_balance_from_state(
+        state,
+        state_proposer_index(state)?,
+        proposer_reward,
+        "proposer reward",
+    )?;
 
     // Update builder payment weight
     *state
@@ -778,6 +784,80 @@ pub(crate) mod tests {
         );
         assert_eq!(weight(&state, 3), 32 * ETH);
         assert_eq!(weight(&state, (SPE + 3) as usize), 0);
+    }
+
+    #[test]
+    fn state_sums_of_an_attestation_are_not_a_proof() {
+        // The weight of a pending payment comes from our own state. A weight that cannot
+        // take one more effective balance is a fault of the state, not of the attestation.
+        let mut state = attestation_state(4);
+        let payment = (SPE + 3) as usize;
+        set_payment(&mut state, payment, 5 * ETH);
+        state
+            .builder_pending_payments
+            .get_mut(payment)
+            .unwrap()
+            .weight = u64::MAX;
+        let first = attestation(&state, 3, &[0]);
+        let err = process_attestation(&mut state, &first, 3).unwrap_err();
+        assert_eq!(
+            err,
+            StfError::StateArithmetic {
+                what: "builder payment weight"
+            }
+        );
+        assert!(!err.proves_invalid());
+
+        // The base rewards come from our own state too. 16 attesters of epoch 0 with the
+        // largest effective balance exit at epoch 1, so the total active balance of epoch 1
+        // is the floor of one increment: the sum of their rewards is past `u64::MAX`.
+        let mut state = genesis_state::<Minimal>(&[0; 128]);
+        state.slot = 8;
+        for s in 0..8 {
+            *state.block_roots.get_mut(s as usize).unwrap() = Root::repeat_byte(s as u8 + 1);
+        }
+        state.previous_justified_checkpoint = state.current_justified_checkpoint.clone();
+        // 128 validators give 4 committees of 4 at each slot: all of them attest.
+        let mut all = attestation(&state, 7, &[]);
+        for committee in 1..4 {
+            all.committee_bits.set(committee, true).unwrap();
+        }
+        let mut bits = ProgressiveBitList::with_capacity(16);
+        for p in 0..16 {
+            bits.set(p, true).unwrap();
+        }
+        all.aggregation_bits = bits;
+        for index in get_indexed_attestation(&state, &all)
+            .unwrap()
+            .attesting_indices
+            .iter()
+        {
+            let validator = state.validators.get_mut(*index as usize).unwrap();
+            validator.effective_balance = u64::MAX;
+            validator.exit_epoch = 1;
+        }
+        let err = process_attestation(&mut state, &all, 7).unwrap_err();
+        assert_eq!(
+            err,
+            StfError::StateArithmetic {
+                what: "proposer reward numerator"
+            }
+        );
+        assert!(!err.proves_invalid());
+
+        // The reward and the balance of the proposer come from our own state too.
+        let mut state = attestation_state(4);
+        let proposer = state_proposer_index(&state).unwrap();
+        *state.balances.get_mut(proposer as usize).unwrap() = u64::MAX;
+        let first = attestation(&state, 3, &[0]);
+        let err = process_attestation(&mut state, &first, 3).unwrap_err();
+        assert_eq!(
+            err,
+            StfError::StateArithmetic {
+                what: "proposer reward"
+            }
+        );
+        assert!(!err.proves_invalid());
     }
 
     #[test]

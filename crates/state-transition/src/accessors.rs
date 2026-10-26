@@ -1,6 +1,7 @@
 //! Beacon-state accessors and the misc helpers they share.
 
 use crate::caches::committee::{compute_shuffled_index, CommitteeCache};
+use crate::mutators::state_sum;
 use crate::preset::{
     BASE_REWARD_FACTOR, BUILDER_INDEX_FLAG, BUILDER_WITHDRAWAL_PREFIX,
     COMPOUNDING_WITHDRAWAL_PREFIX, EFFECTIVE_BALANCE_INCREMENT, ETH1_ADDRESS_WITHDRAWAL_PREFIX,
@@ -487,6 +488,8 @@ pub fn get_base_reward_per_increment<E: Preset>(state: &BeaconState<E>) -> Resul
 /// `get_base_reward` (A L386-391, Modified in Altair) for an effective balance and the base
 /// reward per increment: `increments * base_reward_per_increment`.
 pub fn base_reward(effective_balance: Gwei, per_increment: Gwei) -> Result<Gwei, StfError> {
+    // Kept a proof: unreachable from a state, because the floor of the total balance keeps
+    // `per_increment` at or below about 2,023,907, so the product stays below about 3.74e16.
     (effective_balance / EFFECTIVE_BALANCE_INCREMENT)
         .checked_mul(per_increment)
         .ok_or(StfError::ArithmeticOverflow)
@@ -578,6 +581,9 @@ pub fn get_pending_balance_to_withdraw_for_builder<E: Preset>(
 
 /// `can_builder_cover_bid` (G L1184-1192, New in Gloas): the balance of the builder, less
 /// `MIN_DEPOSIT_AMOUNT` and its pending withdrawals and payments, is at least `bid_amount`.
+///
+/// The minimum balance reads only `MIN_DEPOSIT_AMOUNT` and our own state, not the bid, so a
+/// failed sum is [`StfError::StateArithmetic`], not a proof.
 pub fn can_builder_cover_bid<E: Preset>(
     state: &BeaconState<E>,
     builder_index: BuilderIndex,
@@ -590,9 +596,11 @@ pub fn can_builder_cover_bid<E: Preset>(
         .balance;
     let pending_withdrawals_amount =
         get_pending_balance_to_withdraw_for_builder(state, builder_index)?;
-    let min_balance = MIN_DEPOSIT_AMOUNT
-        .checked_add(pending_withdrawals_amount)
-        .ok_or(StfError::ArithmeticOverflow)?;
+    let min_balance = state_sum(
+        MIN_DEPOSIT_AMOUNT,
+        pending_withdrawals_amount,
+        "builder minimum balance",
+    )?;
     if builder_balance < min_balance {
         return Ok(false);
     }
@@ -1095,12 +1103,17 @@ mod tests {
             can_builder_cover_bid(&state, 1, 0),
             Err(StfError::UnknownBuilder(1))
         );
-        // A minimum past `u64::MAX` is a `Uint64` overflow.
+        // A minimum past `u64::MAX` is a `Uint64` overflow. Its operands come from our own
+        // state, not from the bid, so it is not a proof.
         state.builder_pending_withdrawals.get_mut(0).unwrap().amount = u64::MAX;
+        let err = can_builder_cover_bid(&state, 0, 0).unwrap_err();
         assert_eq!(
-            can_builder_cover_bid(&state, 0, 0),
-            Err(StfError::ArithmeticOverflow)
+            err,
+            StfError::StateArithmetic {
+                what: "builder minimum balance"
+            }
         );
+        assert!(!err.proves_invalid());
     }
 
     #[test]

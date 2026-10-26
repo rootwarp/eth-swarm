@@ -7,6 +7,7 @@
 
 use super::participation::{is_in_inactivity_leak, ParticipationCache};
 use crate::accessors::{base_reward, base_reward_per_increment, get_current_epoch, has_flag};
+use crate::mutators::state_sum;
 use crate::preset::{
     EFFECTIVE_BALANCE_INCREMENT, GENESIS_EPOCH, INACTIVITY_PENALTY_QUOTIENT_BELLATRIX,
     INACTIVITY_SCORE_BIAS, PARTICIPATION_FLAG_WEIGHTS, TIMELY_HEAD_FLAG_INDEX,
@@ -18,6 +19,20 @@ use consensus_types::primitives::Gwei;
 
 /// The rewards and the penalties of one delta function, one entry for each validator.
 pub type Deltas = (Vec<Gwei>, Vec<Gwei>);
+
+// Each operand of the reward and penalty sums comes from our own state (the effective
+// balances, the participation, the inactivity scores and the balances). Thus a failed sum is
+// `StateArithmetic` with one of these names, not a proof. `per_epoch::literal` uses the same
+// names, so that the oracle and the cached path give the same error.
+
+/// The `what` of `base_reward * weight * unslashed_participating_increments`.
+pub(crate) const FLAG_REWARD_NUMERATOR: &str = "flag reward numerator";
+/// The `what` of `base_reward * weight` of a flag penalty.
+pub(crate) const FLAG_PENALTY: &str = "flag penalty";
+/// The `what` of `effective_balance * inactivity_score`.
+pub(crate) const INACTIVITY_PENALTY_NUMERATOR: &str = "inactivity penalty numerator";
+/// The `what` of `balance + reward` in `process_rewards_and_penalties`.
+pub(crate) const REWARD_BALANCE: &str = "reward balance";
 
 /// `get_flag_index_deltas` (A L459-485).
 pub fn get_flag_index_deltas<E: Preset>(
@@ -64,14 +79,18 @@ pub(crate) fn flag_index_deltas<E: Preset>(
                 let reward_numerator = base_reward
                     .checked_mul(weight)
                     .and_then(|r| r.checked_mul(unslashed_participating_increments))
-                    .ok_or(StfError::ArithmeticOverflow)?;
+                    .ok_or(StfError::StateArithmetic {
+                        what: FLAG_REWARD_NUMERATOR,
+                    })?;
                 // `active_increments` is at least 1, and at most u64::MAX / 10**9.
                 rewards[index] = reward_numerator / (active_increments * WEIGHT_DENOMINATOR);
             }
         } else if flag_index != TIMELY_HEAD_FLAG_INDEX {
+            // A base reward is at most about 3.74 * 10**16 (see `base_reward`), so this
+            // product stays below `u64::MAX`. It is a state value all the same.
             penalties[index] = base_reward
                 .checked_mul(weight)
-                .ok_or(StfError::ArithmeticOverflow)?
+                .ok_or(StfError::StateArithmetic { what: FLAG_PENALTY })?
                 / WEIGHT_DENOMINATOR;
         }
     }
@@ -98,10 +117,12 @@ pub(crate) fn inactivity_penalty_deltas<E: Preset>(
                 list: "inactivity_scores",
                 index: index as u64,
             })?;
-        let penalty_numerator = v
-            .effective_balance
-            .checked_mul(*score)
-            .ok_or(StfError::ArithmeticOverflow)?;
+        let penalty_numerator =
+            v.effective_balance
+                .checked_mul(*score)
+                .ok_or(StfError::StateArithmetic {
+                    what: INACTIVITY_PENALTY_NUMERATOR,
+                })?;
         // [Modified in Bellatrix]
         let penalty_denominator = INACTIVITY_SCORE_BIAS * INACTIVITY_PENALTY_QUOTIENT_BELLATRIX;
         penalties[index] = penalty_numerator / penalty_denominator;
@@ -153,9 +174,7 @@ fn apply_deltas<E: Preset>(state: &mut BeaconState<E>, deltas: &[Deltas]) -> Res
     let before = balances.clone();
     for (rewards, penalties) in deltas {
         for (index, balance) in balances.iter_mut().enumerate().take(n) {
-            *balance = balance
-                .checked_add(rewards[index])
-                .ok_or(StfError::ArithmeticOverflow)?;
+            *balance = state_sum(*balance, rewards[index], REWARD_BALANCE)?;
             *balance = balance.saturating_sub(penalties[index]);
         }
     }
@@ -250,16 +269,31 @@ mod tests {
         state.slot = Minimal::start_slot_at_epoch(2) - 1;
         *state.balances.get_mut(0).unwrap() = u64::MAX;
         *state.previous_epoch_participation.get_mut(0).unwrap() = 0b111;
+        // Each operand of these sums comes from our own state, so no overflow is a proof.
+        let state_arithmetic = |what| StfError::StateArithmetic { what };
+        let err = process_rewards_and_penalties(&mut state.clone()).unwrap_err();
+        assert_eq!(err, state_arithmetic("reward balance"));
+        assert!(!err.proves_invalid());
         assert_eq!(
-            process_rewards_and_penalties(&mut state.clone()),
-            Err(StfError::ArithmeticOverflow)
+            literal::process_rewards_and_penalties(&mut state.clone()),
+            Err(err)
         );
         // An inactivity score that overflows the penalty numerator.
         *state.inactivity_scores.get_mut(1).unwrap() = u64::MAX;
-        assert_eq!(
-            get_inactivity_penalty_deltas(&state),
-            Err(StfError::ArithmeticOverflow)
-        );
+        let err = get_inactivity_penalty_deltas(&state).unwrap_err();
+        assert_eq!(err, state_arithmetic("inactivity penalty numerator"));
+        assert!(!err.proves_invalid());
+        assert_eq!(literal::get_inactivity_penalty_deltas(&state), Err(err));
+        // A participating balance that overflows the reward numerator of a flag.
+        // The total active balance is u64::MAX itself, so it does not overflow first.
+        let mut large = registry_state::<Minimal>(&[u64::MAX, 0, 0, 0], Root::ZERO);
+        large.slot = Minimal::start_slot_at_epoch(2) - 1;
+        *large.previous_epoch_participation.get_mut(0).unwrap() = 0b111;
+        let err = get_flag_index_deltas(&large, 0).unwrap_err();
+        assert_eq!(err, state_arithmetic("flag reward numerator"));
+        assert!(!err.proves_invalid());
+        assert_eq!(literal::get_flag_index_deltas(&large, 0), Err(err));
+
         state.inactivity_scores = milhouse::ProgressiveList::default();
         assert!(matches!(
             get_inactivity_penalty_deltas(&state),
