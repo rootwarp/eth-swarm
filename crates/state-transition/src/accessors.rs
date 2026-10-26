@@ -594,8 +594,21 @@ pub fn can_builder_cover_bid<E: Preset>(
 /// [`SignerRef::Builder`](crate::SignerRef::Builder). It is the first 8 bytes of
 /// `sha256(state.builders[builder_index].pubkey)`, little-endian. Not in the spec.
 ///
-/// The value comes from `state` only, so the pure transition needs no other input. A
-/// verifier that caches builder keys uses `(index, version)` as the cache key.
+/// The value comes from `state` only, so the pure transition needs no other input.
+///
+/// The key version is a lookup hint only, never a cache key. A builder key cache must
+/// compare the cached full key with `state.builders[index].pubkey` of the state that the
+/// signature is verified against on every hit, or the signer must carry its key inline.
+/// `(index, version)` alone is not safe:
+///
+/// - The version is a 64-bit digest. It is not collision-resistant against a party that
+///   controls both keys: with about 2^32 key generations (the birthday bound) it can find
+///   two keys A and B with the same version, register A, exit, wait for the sweep, and then
+///   put B on the same index.
+/// - The builder registry is not append-only, so a finalized entry is not safe either: a
+///   finalized builder can exit and be swept to 0, and a branch that is not finalized can
+///   give its index to a new key. A finalized entry is right only for a state whose
+///   `state.builders[index].pubkey` is the same key.
 ///
 /// The beta.4 `Builder` container (G L660-666) has no field that tells two builders at a
 /// reused index apart on every branch:
@@ -606,10 +619,9 @@ pub fn can_builder_cover_bid<E: Preset>(
 ///   reuse an index in the same epoch with different keys.
 ///
 /// Thus the key version follows the key. It changes when a new key takes the index, on
-/// any branch, and it stays the same while the key stays the same. The other fields of the
-/// builder (balance, exit, `Builder.version`) do not change it. Two keys give the same
-/// version only for a 64-bit collision of sha256. A verifier that must exclude that case
-/// compares its cached key with `state.builders[index].pubkey`.
+/// any branch (except for a collision), and it stays the same while the key stays the same.
+/// The other fields of the builder (balance, exit, `Builder.version`) do not change it.
+/// `cl-verify` uses it only to reject a cached entry early (`cl_verify_cache::builders`).
 pub fn builder_key_version<E: Preset>(
     state: &BeaconState<E>,
     builder_index: BuilderIndex,

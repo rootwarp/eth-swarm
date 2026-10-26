@@ -292,6 +292,8 @@ no_envelopes!(
     ethswarm_proto::verify::VerifyKzgResponseBody,
     ethswarm_proto::verify::PubkeyFeedRequestBody,
     ethswarm_proto::verify::PubkeyFeedResponseBody,
+    ethswarm_proto::verify::BuilderKeyFeedRequestBody,
+    ethswarm_proto::verify::BuilderKeyFeedResponseBody,
 );
 
 impl Envelopes for chain::ImportBatchRequestBody {

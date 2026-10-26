@@ -11,7 +11,9 @@ use std::collections::HashSet;
 pub use cl_verify_cache::MAX_INLINE_KEYS_PER_BATCH;
 
 use crate::proto::common::{Error, ErrorCode, Hello};
-use crate::proto::verify::{VerifyBlsRequestBody, VerifyKzgRequestBody, VerifyOrigin};
+use crate::proto::verify::{
+    KeyNamespace, Signer, VerifyBlsRequestBody, VerifyKzgRequestBody, VerifyOrigin,
+};
 use crate::wire::wire_error;
 
 /// Max BLS sets in one `VerifyBlsRequestBody` (verify.proto: "At most 256 sets").
@@ -52,6 +54,12 @@ pub enum CapError {
     TooManySigners { got: usize, max: usize },
     #[error("VERIFY_ORIGIN_UNSPECIFIED")]
     UnspecifiedOrigin,
+    #[error("set {set} has a signer with KEY_NAMESPACE_UNSPECIFIED")]
+    UnspecifiedNamespace { set: usize },
+    /// A validator signer with a `builder`, or a builder signer without one or with a
+    /// `validator_index` or an `inline_pubkey`.
+    #[error("set {set} has a signer whose fields do not fit its KeyNamespace")]
+    SignerShape { set: usize },
     #[error("{got} inline pubkeys across the sets of one import request exceed the cap of {max}")]
     TooManyInlineKeys { got: usize, max: usize },
     /// The spec's empty batch is vacuously true; an empty request would read as ACCEPT with no
@@ -73,11 +81,13 @@ impl CapError {
 }
 
 /// Request-shape checks for VerifyBls: set count, at least one and at most
-/// [`MAX_SIGNERS_PER_SET`] signers per set, [`MAX_SIGNERS_PER_REQUEST`] in all, a zero origin, any
-/// inline key on gossip, and the import inline packing cap (which a request of exactly one set may
-/// exceed). Each fails the stream with `ERROR_CODE_CONTRACT_VIOLATION`, and the server runs these
-/// before the deadline check, so a malformed request is reported even when its deadline is 0 or
-/// past. An unknown non-zero origin passes here; it is IGNOREd without BLS work by the verifier.
+/// [`MAX_SIGNERS_PER_SET`] signers per set, [`MAX_SIGNERS_PER_REQUEST`] in all, a zero origin, a
+/// zero signer namespace, signer fields that do not fit their namespace, any inline key (validator
+/// or builder) on gossip, and the import inline packing cap over both namespaces (which a request
+/// of exactly one set may exceed). Each fails the stream with `ERROR_CODE_CONTRACT_VIOLATION`, and
+/// the server runs these before the deadline check, so a malformed request is reported even when
+/// its deadline is 0 or past. An unknown non-zero origin or signer namespace passes here; the
+/// verifier IGNOREs it without BLS work.
 pub fn check_bls(body: &VerifyBlsRequestBody) -> Result<(), CapError> {
     let got = body.sets.len();
     if got > MAX_BLS_SETS {
@@ -93,7 +103,10 @@ pub fn check_bls(body: &VerifyBlsRequestBody) -> Result<(), CapError> {
         if got == 0 {
             return Err(CapError::NoSigners { set });
         }
-        if gossip && s.signers.iter().any(|g| !g.inline_pubkey.is_empty()) {
+        for signer in &s.signers {
+            check_signer(signer, set)?;
+        }
+        if gossip && s.signers.iter().any(is_inline) {
             return Err(CapError::InlineOnGossip { set });
         }
         if got > MAX_SIGNERS_PER_SET {
@@ -119,7 +132,7 @@ pub fn check_bls(body: &VerifyBlsRequestBody) -> Result<(), CapError> {
             .sets
             .iter()
             .flat_map(|s| &s.signers)
-            .filter(|s| !s.inline_pubkey.is_empty())
+            .filter(|s| is_inline(s))
             .count();
         if inline > MAX_INLINE_KEYS_PER_BATCH {
             return Err(CapError::TooManyInlineKeys {
@@ -129,6 +142,37 @@ pub fn check_bls(body: &VerifyBlsRequestBody) -> Result<(), CapError> {
         }
     }
     Ok(())
+}
+
+/// The namespace rules of one signer: not `UNSPECIFIED`, and the fields of its namespace only. An
+/// unknown non-zero namespace passes (it is IGNOREd per set).
+fn check_signer(signer: &Signer, set: usize) -> Result<(), CapError> {
+    let fits = match KeyNamespace::try_from(signer.namespace) {
+        Ok(KeyNamespace::Unspecified) => return Err(CapError::UnspecifiedNamespace { set }),
+        Ok(KeyNamespace::Validator) => signer.builder.is_none(),
+        Ok(KeyNamespace::Builder) => {
+            signer.builder.is_some()
+                && signer.validator_index == 0
+                && signer.inline_pubkey.is_empty()
+        }
+        Err(_) => true,
+    };
+    if fits {
+        Ok(())
+    } else {
+        Err(CapError::SignerShape { set })
+    }
+}
+
+/// Whether a signer carries an inline key: a validator `inline_pubkey`, or a builder marked
+/// `inline`. A signer of an unknown namespace never does: its set is IGNOREd without decoding,
+/// so its fields neither fail a gossip request nor count against the inline cap.
+fn is_inline(signer: &Signer) -> bool {
+    match KeyNamespace::try_from(signer.namespace) {
+        Ok(KeyNamespace::Validator) => !signer.inline_pubkey.is_empty(),
+        Ok(KeyNamespace::Builder) => signer.builder.as_ref().is_some_and(|b| b.inline),
+        Ok(KeyNamespace::Unspecified) | Err(_) => false,
+    }
 }
 
 /// Most cells one KZG request may carry: every column of one block at the largest blob count in
@@ -177,7 +221,7 @@ pub fn check_kzg(body: &VerifyKzgRequestBody, max_cells: usize) -> Result<(), Ca
 mod tests {
     use super::*;
     use crate::proto::common::{BlobScheduleEntry, ForkScheduleEntry};
-    use crate::proto::verify::{BlsSet, KzgCellProof, Signer, VerifyOrigin};
+    use crate::proto::verify::{BlsSet, BuilderSigner, KzgCellProof, Signer, VerifyOrigin};
 
     fn bls(n: usize) -> VerifyBlsRequestBody {
         VerifyBlsRequestBody {
@@ -210,6 +254,8 @@ mod tests {
                 .map(|i| Signer {
                     validator_index: i,
                     inline_pubkey: if inline { vec![1; 48] } else { vec![] },
+                    namespace: KeyNamespace::Validator as i32,
+                    builder: None,
                 })
                 .collect(),
             ..BlsSet::default()
@@ -330,6 +376,114 @@ mod tests {
         assert_eq!(check_bls(&one), Err(CapError::InlineOnGossip { set: 1 }));
         let none = with_sets(vec![signers(3, false)], VerifyOrigin::Gossip);
         assert_eq!(check_bls(&none), Ok(()));
+    }
+
+    fn builder(inline: bool) -> Signer {
+        Signer {
+            namespace: KeyNamespace::Builder as i32,
+            builder: Some(BuilderSigner {
+                builder_index: 5,
+                key_version: 9,
+                pubkey: vec![2; 48],
+                inline,
+            }),
+            ..Signer::default()
+        }
+    }
+
+    fn set_of(signers: Vec<Signer>) -> BlsSet {
+        BlsSet {
+            signers,
+            ..BlsSet::default()
+        }
+    }
+
+    #[test]
+    fn a_zero_signer_namespace_is_refused_and_an_unknown_one_passes() {
+        let mut zero = signers(2, false);
+        zero.signers[1].namespace = KeyNamespace::Unspecified as i32;
+        let b = with_sets(vec![signers(1, false), zero], VerifyOrigin::Import);
+        assert_eq!(
+            check_bls(&b),
+            Err(CapError::UnspecifiedNamespace { set: 1 })
+        );
+        assert!(CapError::UnspecifiedNamespace { set: 1 }
+            .to_wire()
+            .detail
+            .contains("KEY_NAMESPACE_UNSPECIFIED"));
+        let mut unknown = signers(1, false);
+        unknown.signers[0].namespace = 99;
+        let b = with_sets(vec![unknown], VerifyOrigin::Gossip);
+        assert_eq!(check_bls(&b), Ok(()), "IGNOREd per set, not refused");
+    }
+
+    #[test]
+    fn signer_fields_must_fit_their_namespace() {
+        let mut validator_with_builder = signers(1, false);
+        validator_with_builder.signers[0].builder = builder(false).builder;
+        let mut builder_without = builder(false);
+        builder_without.builder = None;
+        let mut builder_with_index = builder(false);
+        builder_with_index.validator_index = 5;
+        let mut builder_with_inline_pubkey = builder(false);
+        builder_with_inline_pubkey.inline_pubkey = vec![2; 48];
+        for bad in [
+            validator_with_builder,
+            set_of(vec![builder_without]),
+            set_of(vec![builder_with_index]),
+            set_of(vec![builder_with_inline_pubkey]),
+        ] {
+            let b = with_sets(vec![signers(1, false), bad], VerifyOrigin::Import);
+            assert_eq!(check_bls(&b), Err(CapError::SignerShape { set: 1 }));
+        }
+        let fine = with_sets(vec![set_of(vec![builder(false)])], VerifyOrigin::Gossip);
+        assert_eq!(check_bls(&fine), Ok(()));
+    }
+
+    #[test]
+    fn an_inline_builder_key_is_refused_on_gossip_and_counts_against_the_import_cap() {
+        let gossip = with_sets(vec![set_of(vec![builder(true)])], VerifyOrigin::Gossip);
+        assert_eq!(check_bls(&gossip), Err(CapError::InlineOnGossip { set: 0 }));
+        let cap = MAX_INLINE_KEYS_PER_BATCH;
+        let at = with_sets(
+            vec![signers(cap - 1, true), set_of(vec![builder(true)])],
+            VerifyOrigin::Import,
+        );
+        assert_eq!(check_bls(&at), Ok(()));
+        let over = with_sets(
+            vec![
+                signers(cap, true),
+                set_of(vec![builder(true), builder(false)]),
+            ],
+            VerifyOrigin::Import,
+        );
+        assert_eq!(
+            check_bls(&over),
+            Err(CapError::TooManyInlineKeys {
+                got: cap + 1,
+                max: cap
+            })
+        );
+    }
+
+    #[test]
+    fn inline_rules_skip_a_signer_of_an_unknown_namespace() {
+        // Inline fields on a signer of a namespace this build does not know: the set is IGNOREd
+        // later (VERSION_MISMATCH), so they neither fail gossip nor count against the cap.
+        let mut unknown = builder(true);
+        unknown.namespace = 99;
+        unknown.inline_pubkey = vec![2; 48];
+        let gossip = with_sets(
+            vec![signers(1, false), set_of(vec![unknown.clone()])],
+            VerifyOrigin::Gossip,
+        );
+        assert_eq!(check_bls(&gossip), Ok(()));
+        let cap = MAX_INLINE_KEYS_PER_BATCH;
+        let import = with_sets(
+            vec![signers(cap, true), set_of(vec![unknown])],
+            VerifyOrigin::Import,
+        );
+        assert_eq!(check_bls(&import), Ok(()));
     }
 
     #[test]

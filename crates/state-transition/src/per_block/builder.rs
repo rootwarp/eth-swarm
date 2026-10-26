@@ -23,10 +23,15 @@
 //! `PAYLOAD_BUILDER_VERSION` as the `Builder.version` of each new builder. Before finality,
 //! two branches can each reuse an index in the same epoch with different keys. Thus the
 //! `version` of `SignerRef::Builder { index, version }` is
-//! [`crate::accessors::builder_key_version`], a digest of the key, which changes when a new
-//! key takes the index. A cache of builder keys uses `(index, version)` as its key, or
-//! compares its key with `state.builders[index].pubkey` of the state that it verifies
-//! against ([4.9], [4.10]).
+//! [`crate::accessors::builder_key_version`], a 64-bit digest of the key, which changes when
+//! a new key takes the index.
+//!
+//! The `version` is a lookup hint only. A party that controls two keys can find a 64-bit
+//! collision, and a finalized builder can exit and its index can go to a new key on a branch
+//! that is not finalized. Thus a cache of builder keys compares the cached full key with
+//! `state.builders[index].pubkey` of the state that the signature is verified against on
+//! every hit, or the signer carries its key inline. `(index, version)` alone, and a cache of
+//! finalized entries alone, are not safe keys (`cl_verify_cache::builders`).
 
 use crate::accessors::{
     get_current_epoch, get_pending_balance_to_withdraw_for_builder, is_active_builder,

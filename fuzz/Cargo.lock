@@ -912,6 +912,7 @@ dependencies = [
  "prometheus-client",
  "serde",
  "serde_json",
+ "state-transition",
  "svc-runtime",
  "thiserror 2.0.21",
  "tokio",
@@ -5234,6 +5235,19 @@ dependencies = [
  "libc",
  "psm",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "state-transition"
+version = "0.1.0"
+dependencies = [
+ "consensus-types",
+ "ethereum_hashing",
+ "ethereum_ssz",
+ "milhouse",
+ "ssz_types",
+ "thiserror 2.0.21",
+ "tree_hash",
 ]
 
 [[package]]

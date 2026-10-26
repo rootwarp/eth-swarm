@@ -27,9 +27,9 @@ use ethswarm_proto::common::{
 use ethswarm_proto::verify::verify_service_client::VerifyServiceClient;
 use ethswarm_proto::verify::verify_service_server::{VerifyService, VerifyServiceServer};
 use ethswarm_proto::verify::{
-    verify_kzg_request, verify_kzg_response, PubkeyFeedRequest, PubkeyFeedResponse,
-    VerifyBlsRequest, VerifyBlsResponse, VerifyKzgRequest, VerifyKzgResponse,
-    VerifyKzgResponseBody, VerifyStatus,
+    verify_kzg_request, verify_kzg_response, BuilderKeyFeedRequest, BuilderKeyFeedResponse,
+    PubkeyFeedRequest, PubkeyFeedResponse, VerifyBlsRequest, VerifyBlsResponse, VerifyKzgRequest,
+    VerifyKzgResponse, VerifyKzgResponseBody, VerifyStatus,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -319,6 +319,7 @@ impl VerifyService for StubVerify {
     type VerifyBlsStream = Frames<VerifyBlsResponse>;
     type VerifyKzgStream = ReceiverStream<Result<VerifyKzgResponse, Status>>;
     type PubkeyFeedStream = Frames<PubkeyFeedResponse>;
+    type BuilderKeyFeedStream = Frames<BuilderKeyFeedResponse>;
 
     async fn verify_bls(
         &self,
@@ -421,6 +422,13 @@ impl VerifyService for StubVerify {
         &self,
         _: Request<Streaming<PubkeyFeedRequest>>,
     ) -> Result<Response<Self::PubkeyFeedStream>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
+
+    async fn builder_key_feed(
+        &self,
+        _: Request<Streaming<BuilderKeyFeedRequest>>,
+    ) -> Result<Response<Self::BuilderKeyFeedStream>, Status> {
         Err(Status::unimplemented("stub"))
     }
 }

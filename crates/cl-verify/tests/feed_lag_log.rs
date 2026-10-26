@@ -47,7 +47,8 @@ impl Subscriber for Capture {
 #[test]
 fn alert_clears() {
     let capture = Capture::default();
-    let metrics = FeedLagMetrics::register(&mut Registry::default());
+    let all = FeedLagMetrics::register(&mut Registry::default());
+    let metrics = all.validator();
     tracing::subscriber::with_default(capture.clone(), || {
         // Lag 4 (at the bound), 5 twice, a frame without epochs (refused, so it logs nothing),
         // 5 again at a later finality, then 4, 3 and 4.

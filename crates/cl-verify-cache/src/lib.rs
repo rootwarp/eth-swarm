@@ -10,6 +10,10 @@
 //! Signers are checked with [`PubkeyCache::resolve_signer`] before any BLS work; the gossip and
 //! import rules, and how large import batches are split, are in [`eligibility`].
 //!
+//! Gloas builder keys are in a separate namespace, [`builders`]: the builder registry is not
+//! append-only (an index can go to a new key), so that cache compares the full key on every hit.
+//! The invariant above is for validators only.
+//!
 //! # Feed lag
 //!
 //! cl-chain feeds the finalized registry over `PubkeyFeed`, and the cache can trail it (a slow or
@@ -65,10 +69,14 @@
 //! `MAX_SEED_LOOKAHEAD` (4) epochs, re-evaluated on every feed frame it applies; the bound is in
 //! [`lag`].
 
+pub mod builders;
 pub mod eligibility;
 pub mod lag;
 pub mod persist;
 
+pub use builders::{
+    BuilderEntry, BuilderKeyCache, BuilderSigner, CompressedPubkey, BUILDER_PUBKEY_BYTES,
+};
 pub use eligibility::{
     split_import_batch, IgnoreReason, KeySource, Origin, Resolution, ResolvedKey, Signer,
     Violation, MAX_INLINE_KEYS_PER_BATCH, MAX_SETS_PER_BATCH,

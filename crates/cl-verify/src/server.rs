@@ -29,6 +29,13 @@
 //! at [`ServerConfig::pubkey_snapshot`] or by a rebuild over that stream ([`crate::feed`]); errors
 //! during the restore fail the stream. VerifyBls reads the empty cache (`UNKNOWN_INDEX`) until then.
 //!
+//! The builder key cache ([`crate::builder_feed`]) is in memory only and starts empty. Each
+//! BuilderKeyFeed stream gets the builder high-water mark right after the hello, then one reply per
+//! frame; there is no restore. Only the newest BuilderKeyFeed stream writes: a stream that opens
+//! fences every older one, whose next frame fails it with `RESOURCE_UNAVAILABLE`, and each frame's
+//! epoch check, apply and lag update run as one step under the writer lock. VerifyBls reads both
+//! caches, validators first.
+//!
 //! The frame that completes the restore, and every PubkeyFeed frame applied after it, re-evaluate
 //! the feed-lag gauges from the finalized epochs they carry ([`crate::metrics`]); a frame whose
 //! epochs break the epoch rules is refused before it is applied. The metrics live on the registry
@@ -54,7 +61,8 @@ use tokio_stream::Stream;
 use tonic::transport::server::UdsConnectInfo;
 use tonic::{Code, Request, Response, Status, Streaming};
 
-use crate::bls::{self, BlsBackend, BlstBackend};
+use crate::bls::{self, BlsBackend, BlstBackend, KeyCaches};
+use crate::builder_feed::{self, SharedBuilderCache};
 use crate::caps::{self, CapError, MAX_MESSAGE_BYTES};
 use crate::feed::{self, FrameEpochs, Restored, SharedCache, SnapshotWriter};
 use crate::frame::{InFrame, Inbound, OutFrame};
@@ -64,10 +72,11 @@ use crate::metrics::FeedLagMetrics;
 use crate::proto::common::{Error, ErrorCode};
 use crate::proto::verify::verify_service_server::{VerifyService, VerifyServiceServer};
 use crate::proto::verify::{
-    bls_result, verify_bls_response, verify_kzg_response, PubkeyFeedRequest, PubkeyFeedRequestBody,
-    PubkeyFeedResponse, PubkeyFeedResponseBody, VerifyBlsRequest, VerifyBlsRequestBody,
-    VerifyBlsResponse, VerifyBlsResponseBody, VerifyKzgRequest, VerifyKzgRequestBody,
-    VerifyKzgResponse, VerifyKzgResponseBody, VerifyStatus,
+    bls_result, verify_bls_response, verify_kzg_response, BuilderKeyFeedRequest,
+    BuilderKeyFeedRequestBody, BuilderKeyFeedResponse, BuilderKeyFeedResponseBody,
+    PubkeyFeedRequest, PubkeyFeedRequestBody, PubkeyFeedResponse, PubkeyFeedResponseBody,
+    VerifyBlsRequest, VerifyBlsRequestBody, VerifyBlsResponse, VerifyBlsResponseBody,
+    VerifyKzgRequest, VerifyKzgRequestBody, VerifyKzgResponse, VerifyKzgResponseBody, VerifyStatus,
 };
 use crate::wire::{by_deadline, to_status, wire_error, Deadline, SystemClock, WallClock};
 use ipc::fence::{check_request, FencedRequest, FencedResult};
@@ -156,6 +165,11 @@ struct Inner {
     limits: Limits,
     max_kzg_cells: usize,
     cache: SharedCache,
+    /// The builder key cache: memory only, empty at start, filled by BuilderKeyFeed.
+    builders: SharedBuilderCache,
+    /// The id of the newest BuilderKeyFeed stream, the only one that may write. Held for each
+    /// frame from its epoch check to its lag update, so frames apply one at a time.
+    builder_writer: Mutex<u64>,
     /// Whether `cache` has been restored (see [`crate::feed`]). Held across a restore, so a
     /// second feed stream waits for it instead of restoring again.
     restored: Mutex<bool>,
@@ -169,9 +183,10 @@ struct Inner {
     /// Set once by [`VerifyServer::close`]: every open stream then fails with
     /// `RESOURCE_UNAVAILABLE` and stops its work.
     closing: watch::Sender<bool>,
-    /// Whether feed frames may still be applied. Read-held for each apply (until the frame is in
-    /// the cache and the snapshot marked dirty); [`VerifyServer::close`] takes it for writing and
-    /// clears it, so no frame is applied after the final flush copies the cache.
+    /// Whether feed frames (of both key feeds) may still be applied. Read-held for each apply
+    /// (until the frame is in the cache and the snapshot marked dirty); [`VerifyServer::close`]
+    /// takes it for writing and clears it, so no frame is applied after the final flush copies
+    /// the cache.
     feed_open: Arc<RwLock<bool>>,
     /// Holds every metric below; served by the service runtime.
     metrics: MetricsRegistry,
@@ -249,6 +264,8 @@ impl VerifyServer {
                 limits: config.limits,
                 max_kzg_cells,
                 cache,
+                builders: SharedBuilderCache::default(),
+                builder_writer: Mutex::new(0),
                 restored: Mutex::new(restored),
                 snapshot: Arc::new(SnapshotWriter::new(
                     config.pubkey_snapshot,
@@ -724,10 +741,39 @@ impl Inner {
         } = epochs;
         if let Err(e) = self
             .feed_lag
+            .validator()
             .update(feed_finalized_epoch, chain_finalized_epoch)
         {
             tracing::debug!(error = %e, "feed-lag update overtaken; not published");
         }
+    }
+
+    /// Applies one builder feed frame on a blocking thread, holding a verifier slot and the feed
+    /// gate until it is in the cache. Refused with `RESOURCE_UNAVAILABLE` once the server is
+    /// closing.
+    async fn apply_builder_frame(
+        &self,
+        body: BuilderKeyFeedRequestBody,
+    ) -> Result<BuilderKeyFeedResponseBody, Error> {
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| wire_error(ErrorCode::ResourceUnavailable, "verify server closed"))?;
+        let gate = Arc::clone(&self.feed_open).read_owned().await;
+        if !*gate {
+            return Err(shutting_down());
+        }
+        let cache = Arc::clone(&self.builders);
+        let job = spawn_blocking(move || {
+            let _held = (permit, gate);
+            builder_feed::apply(&cache, &body)
+        });
+        job.await.map_err(|join| {
+            wire_error(
+                ErrorCode::ResourceUnavailable,
+                format!("builder key feed failed: {join}"),
+            )
+        })
     }
 
     /// A verifier slot for a request with `deadline_unix_ms`, or the status to answer instead.
@@ -765,7 +811,7 @@ impl Inner {
                         &deadline,
                         &closed,
                         inner.clock.as_ref(),
-                        &inner.cache,
+                        KeyCaches::new(&inner.cache, &inner.builders),
                         inner.bls.as_ref(),
                     )
                 });
@@ -1048,6 +1094,7 @@ async fn run_feed<S: FeedInbound>(
         let epochs = FrameEpochs::of(&body);
         let reply = match inner
             .feed_lag
+            .validator()
             .check(epochs.feed_finalized_epoch, epochs.chain_finalized_epoch)
         {
             // Refused before it is applied: the gauges keep their values.
@@ -1076,11 +1123,102 @@ async fn run_feed<S: FeedInbound>(
     }
 }
 
+/// One BuilderKeyFeed stream: hello, the builder high-water mark, then one reply per frame.
+///
+/// The stream takes the next writer id when it opens, which fences every older stream: a frame
+/// that finds another id current fails its stream with `RESOURCE_UNAVAILABLE` and applies
+/// nothing. A frame holds the writer lock from its checks to its lag update, so a frame of an
+/// older stream can never pass its checks before a newer stream writes and land after it.
+/// A frame is checked in this order, and the first failure is its in-band reply (nothing
+/// applied): the namespace, the finalized epochs against the builder lag series, then the frame
+/// itself.
+async fn run_builder_feed<S>(
+    inner: Arc<Inner>,
+    mut inbound: Inbound<S>,
+    tx: Tx<BuilderKeyFeedResponse>,
+) where
+    S: Stream<Item = Result<BuilderKeyFeedRequest, Status>> + Unpin,
+{
+    if inner.open(&mut inbound, &tx).await.is_none() {
+        return;
+    }
+    let me = {
+        let mut writer = inner.builder_writer.lock().await;
+        *writer += 1;
+        *writer
+    };
+    let first = BuilderKeyFeedResponse::body(builder_feed::status(&inner.builders));
+    if tx.send(Ok(first)).await.is_err() {
+        return;
+    }
+    let lag = inner.feed_lag.builder();
+    loop {
+        let body = match inbound.body().await {
+            Ok(Some(body)) => body,
+            Ok(None) => return,
+            Err(e) => return inner.fail(&tx, e).await,
+        };
+        let writer = inner.builder_writer.lock().await;
+        if *writer != me {
+            drop(writer);
+            let err = wire_error(
+                ErrorCode::ResourceUnavailable,
+                "a newer BuilderKeyFeed stream replaced this one",
+            );
+            return inner.fail(&tx, err).await;
+        }
+        let epochs = builder_feed::epochs(&body);
+        let refused = builder_feed::check_namespace(&body).err().or_else(|| {
+            lag.check(epochs.feed_finalized_epoch, epochs.chain_finalized_epoch)
+                .err()
+                .map(|e| wire_error(ErrorCode::ContractViolation, e.to_string()))
+        });
+        let reply = match refused {
+            Some(err) => BuilderKeyFeedResponseBody {
+                err: Some(err),
+                ..builder_feed::status(&inner.builders)
+            },
+            None => match inner.apply_builder_frame(body).await {
+                Ok(reply) => reply,
+                Err(err) => return inner.fail(&tx, err).await,
+            },
+        };
+        match &reply.err {
+            None => {
+                if let Err(e) =
+                    lag.update(epochs.feed_finalized_epoch, epochs.chain_finalized_epoch)
+                {
+                    tracing::debug!(error = %e, "builder feed-lag update overtaken; not published");
+                }
+            }
+            Some(err) => {
+                if err.code() == ErrorCode::ContractViolation {
+                    inner.contract_violations.fetch_add(1, Ordering::Relaxed);
+                }
+                tracing::warn!(
+                    code = ?err.code(),
+                    detail = %err.detail,
+                    "builder key feed frame refused"
+                );
+            }
+        }
+        drop(writer);
+        if tx
+            .send(Ok(BuilderKeyFeedResponse::body(reply)))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl VerifyService for VerifyServer {
     type VerifyBlsStream = ResponseStream<VerifyBlsResponse>;
     type VerifyKzgStream = ResponseStream<VerifyKzgResponse>;
     type PubkeyFeedStream = ReceiverStream<Result<PubkeyFeedResponse, Status>>;
+    type BuilderKeyFeedStream = ReceiverStream<Result<BuilderKeyFeedResponse, Status>>;
 
     async fn verify_bls(
         &self,
@@ -1131,6 +1269,28 @@ impl VerifyService for VerifyServer {
                     inner.fail_within(&tx, shutting_down(), CLOSE_SEND).await;
                 }
                 () = run_feed(Arc::clone(&inner), inbound, tx.clone()) => {}
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn builder_key_feed(
+        &self,
+        request: Request<Streaming<BuilderKeyFeedRequest>>,
+    ) -> Result<Response<Self::BuilderKeyFeedStream>, Status> {
+        let slot = self.inner.admit_stream(&request)?;
+        let inner = Arc::clone(&self.inner);
+        let (tx, rx) = mpsc::channel(RESPONSE_BUFFER);
+        let inbound = Inbound::new(request.into_inner());
+        tokio::spawn(async move {
+            let _stream_slot = slot;
+            let closing = inner.closing.subscribe();
+            tokio::select! {
+                biased;
+                () = closed_down(closing) => {
+                    inner.fail_within(&tx, shutting_down(), CLOSE_SEND).await;
+                }
+                () = run_builder_feed(Arc::clone(&inner), inbound, tx.clone()) => {}
             }
         });
         Ok(Response::new(ReceiverStream::new(rx)))

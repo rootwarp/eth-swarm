@@ -184,6 +184,7 @@ impl VerifyService for RewritingProxy {
     type VerifyBlsStream = ReceiverStream<Result<VerifyBlsResponse, Status>>;
     type VerifyKzgStream = Streaming<VerifyKzgResponse>;
     type PubkeyFeedStream = Streaming<PubkeyFeedResponse>;
+    type BuilderKeyFeedStream = Streaming<BuilderKeyFeedResponse>;
 
     async fn verify_bls(
         &self,
@@ -248,6 +249,16 @@ impl VerifyService for RewritingProxy {
         let requests = request.into_inner().filter_map(Result::ok);
         VerifyServiceClient::new(self.upstream.clone())
             .pubkey_feed(requests)
+            .await
+    }
+
+    async fn builder_key_feed(
+        &self,
+        request: Request<Streaming<BuilderKeyFeedRequest>>,
+    ) -> Result<Response<Self::BuilderKeyFeedStream>, Status> {
+        let requests = request.into_inner().filter_map(Result::ok);
+        VerifyServiceClient::new(self.upstream.clone())
+            .builder_key_feed(requests)
             .await
     }
 }

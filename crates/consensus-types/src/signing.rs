@@ -85,14 +85,17 @@ pub enum SignerRef {
     /// A Gloas builder, by builder-registry index and the version of its key.
     ///
     /// A builder index is reusable: a new key can take the index of a builder that exited
-    /// (see `state_transition::per_block::builder`). The `version` changes when a new key
-    /// takes the index, so a cache of builder keys uses `(index, version)` as its key.
+    /// (see `state_transition::per_block::builder`), also on a branch that is not finalized.
+    /// Thus `(index, version)` is not a safe cache key. The `version` is a lookup hint only:
+    /// a cache of builder keys compares the cached full key with `state.builders[index].pubkey`
+    /// of the state that the signature is verified against on every hit, or the signer
+    /// carries its key inline (`verify.v1` `BuilderSigner`).
     Builder {
         /// Index into `state.builders`.
         index: BuilderIndex,
         /// `state_transition::accessors::builder_key_version` of the state: a 64-bit digest
-        /// of `state.builders[index].pubkey`. It is not `Builder.version`, which is the same
-        /// for each payload builder.
+        /// of `state.builders[index].pubkey`, so two keys can have the same value. It is not
+        /// `Builder.version`, which is the same for each payload builder.
         version: u64,
     },
     /// A key carried by the message itself (deposits, BLS-to-execution changes, new indices past

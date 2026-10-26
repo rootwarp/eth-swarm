@@ -39,6 +39,9 @@ tracing = "0.1"
 cl-chain-columns = { path = "../cl-chain-columns" }
 # da::custody: get_custody_groups and the custody constants.
 consensus-types = { path = "../consensus-types" }
+# verify::pubkey_feed: builder_key_version, the version of each builder key it feeds to cl-verify.
+# The pure state transition: it links no BLS library (scripts/check-state-transition-deps.sh).
+state-transition = { path = "../state-transition" }
 # probe::storage_contract: block roots of the reference node's blocks, the stored sidecar's SSZ.
 tree_hash.workspace = true
 ethereum_ssz.workspace = true
@@ -83,3 +86,7 @@ crypto-kzg = { path = "../crypto-kzg" }
 # The reference-API fixture server (testkit::collector::testing::FixtureServer).
 testkit = { path = "../testkit", features = ["test-support"] }
 tokio-stream = { version = "0.1", features = ["net"] }
+# verify::pubkey_feed tests and tests/builders.rs build Gloas states with builders; the versions
+# consensus-types links.
+milhouse.workspace = true
+ssz_types.workspace = true

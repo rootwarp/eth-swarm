@@ -84,6 +84,7 @@ M2A_KEY_PATHS=(
   crates/network-config
   crates/node-key
   crates/p2p-wire
+  crates/state-transition
   crates/svc-runtime
   proto/ethswarm
   fuzz/Cargo.toml

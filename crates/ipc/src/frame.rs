@@ -105,8 +105,8 @@ use store::{
     get_blocks_by_range_response, get_data_columns_by_range_response, get_data_columns_response,
 };
 use verify::{
-    pubkey_feed_request, pubkey_feed_response, verify_bls_request, verify_bls_response,
-    verify_kzg_request, verify_kzg_response,
+    builder_key_feed_request, builder_key_feed_response, pubkey_feed_request, pubkey_feed_response,
+    verify_bls_request, verify_bls_response, verify_kzg_request, verify_kzg_response,
 };
 
 framed!(
@@ -158,6 +158,8 @@ framed!(verify:
     VerifyKzgResponse / verify_kzg_response / VerifyKzgResponseBody,
     PubkeyFeedRequest / pubkey_feed_request / PubkeyFeedRequestBody,
     PubkeyFeedResponse / pubkey_feed_response / PubkeyFeedResponseBody,
+    BuilderKeyFeedRequest / builder_key_feed_request / BuilderKeyFeedRequestBody,
+    BuilderKeyFeedResponse / builder_key_feed_response / BuilderKeyFeedResponseBody,
 );
 
 hello_field!(chain:

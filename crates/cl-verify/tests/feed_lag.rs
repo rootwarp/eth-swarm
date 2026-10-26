@@ -20,14 +20,16 @@ fn at(
     frame
 }
 
-/// `(verify_pubkey_feed_lag_epochs, verify_pubkey_feed_lag_alert)` as scraped from the server.
+/// `(verify_pubkey_feed_lag_epochs, verify_pubkey_feed_lag_alert)` of the validator feed
+/// (`namespace="validator"`) as scraped from the server.
 fn scraped(h: &Harness) -> (u64, u64) {
     let mut text = String::new();
     encode(&mut text, h.server.metrics_registry()).unwrap();
     let gauge = |name: &str| {
+        let series = format!("{name}{{namespace=\"validator\"}} ");
         text.lines()
-            .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
-            .unwrap_or_else(|| panic!("{name} missing from\n{text}"))
+            .find_map(|l| l.strip_prefix(&series)?.parse().ok())
+            .unwrap_or_else(|| panic!("{series} missing from\n{text}"))
     };
     (
         gauge("verify_pubkey_feed_lag_epochs"),

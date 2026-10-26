@@ -619,13 +619,15 @@ pub fn cached(i: u64) -> Signer {
     Signer {
         validator_index: i,
         inline_pubkey: vec![],
+        namespace: KeyNamespace::Validator as i32,
+        builder: None,
     }
 }
 
 pub fn inline(i: u64, key: Vec<u8>) -> Signer {
     Signer {
-        validator_index: i,
         inline_pubkey: key,
+        ..cached(i)
     }
 }
 
@@ -786,4 +788,153 @@ pub fn snapshot_holds(path: &Path, n: u64) -> bool {
         load_with(&cl_verify::feed::BlstCodec, path, &registry),
         Startup::Use(c) if c.high_water() == n
     )
+}
+
+// ---- builder keys and the builder key feed ----
+
+pub type BuilderStream = Bidi<BuilderKeyFeedRequest, BuilderKeyFeedResponse>;
+
+impl Stamp for BuilderKeyFeedRequest {
+    fn stamp(&mut self, _: u64) {}
+}
+
+/// Builder key `i`: never the key of validator `i`.
+pub fn builder_sk(i: u64) -> SecretKey {
+    let mut ikm = [0xb7u8; 32];
+    ikm[..8].copy_from_slice(&i.to_le_bytes());
+    SecretKey::key_gen(&ikm, &[]).unwrap()
+}
+
+pub fn builder_pk_bytes(i: u64) -> Vec<u8> {
+    builder_sk(i).sk_to_pk().compress().to_vec()
+}
+
+/// The key version cl-chain sends for builder key `i` (any value works: it is a hint).
+pub fn builder_version(i: u64) -> u64 {
+    0xb0_0000 + i
+}
+
+/// A builder signer for `state.builders[index]` holding builder key `key`.
+pub fn builder_signer(index: u64, key: u64, inline: bool) -> Signer {
+    Signer {
+        validator_index: 0,
+        inline_pubkey: vec![],
+        namespace: KeyNamespace::Builder as i32,
+        builder: Some(BuilderSigner {
+            builder_index: index,
+            key_version: builder_version(key),
+            pubkey: builder_pk_bytes(key),
+            inline,
+        }),
+    }
+}
+
+/// A set over `[root; 32]` signed by builder key `key`, naming `signer`.
+pub fn builder_set(signer: Signer, key: u64, root: u8) -> BlsSet {
+    let msg = [root; 32];
+    BlsSet {
+        signers: vec![signer],
+        signing_root: msg.to_vec(),
+        signature: builder_sk(key).sign(&msg, DST, &[]).compress().to_vec(),
+    }
+}
+
+/// A builder feed frame at `start` carrying builder keys `keys`, each at its own version.
+pub fn builder_frame(start: u64, keys: impl IntoIterator<Item = u64>) -> BuilderKeyFeedRequestBody {
+    let entries: Vec<BuilderKeyEntry> = keys
+        .into_iter()
+        .map(|k| BuilderKeyEntry {
+            key_version: builder_version(k),
+            pubkey: builder_pk_bytes(k),
+        })
+        .collect();
+    BuilderKeyFeedRequestBody {
+        namespace: KeyNamespace::Builder as i32,
+        start_index: start,
+        count: entries.len() as u64,
+        entries,
+        feed_finalized_epoch: 0,
+        chain_finalized_epoch: 0,
+    }
+}
+
+pub fn builder_hello(h: Hello) -> BuilderKeyFeedRequest {
+    BuilderKeyFeedRequest {
+        frame: Some(builder_key_feed_request::Frame::Hello(h)),
+    }
+}
+
+pub fn builder_body(b: BuilderKeyFeedRequestBody) -> BuilderKeyFeedRequest {
+    BuilderKeyFeedRequest {
+        frame: Some(builder_key_feed_request::Frame::Body(b)),
+    }
+}
+
+/// Opens a builder key feed stream, completes the hello exchange and returns the first
+/// high-water report.
+pub async fn builder_open(h: &mut Harness) -> (BuilderStream, u64) {
+    let (tx, rx) = mpsc::channel(8);
+    let rx = h
+        .client
+        .builder_key_feed(ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut s = Bidi {
+        tx,
+        rx,
+        generation: 0,
+    };
+    s.send(builder_hello(hello())).await;
+    match s.next().await.unwrap().unwrap().frame {
+        Some(builder_key_feed_response::Frame::Hello(server)) => {
+            s.generation = server_generation(server)
+        }
+        other => panic!("first server frame is not hello: {other:?}"),
+    }
+    let first = builder_reply(&mut s).await;
+    assert_eq!(first.err, None);
+    (s, first.high_water)
+}
+
+/// The next builder feed reply, which must be a body of the builder namespace.
+pub async fn builder_reply(s: &mut BuilderStream) -> BuilderKeyFeedResponseBody {
+    match s.next().await.unwrap().unwrap().frame {
+        Some(builder_key_feed_response::Frame::Body(b)) => {
+            assert_eq!(b.namespace, KeyNamespace::Builder as i32);
+            b
+        }
+        other => panic!("expected a body frame: {other:?}"),
+    }
+}
+
+/// Sends `frame` and returns the reply's high-water mark and error code.
+pub async fn builder_apply(
+    s: &mut BuilderStream,
+    frame: BuilderKeyFeedRequestBody,
+) -> (u64, Option<ErrorCode>) {
+    s.send(builder_body(frame)).await;
+    let r = builder_reply(s).await;
+    (r.high_water, r.err.map(|e| e.code()))
+}
+
+/// Feeds builder keys `0..n` (key `i` at index `i`) to the server, in one stream.
+pub async fn feed_builders(h: &mut Harness, n: u64) -> BuilderStream {
+    let (mut s, _) = builder_open(h).await;
+    assert_eq!(
+        builder_apply(&mut s, builder_frame(0, 0..n)).await,
+        (n, None)
+    );
+    s
+}
+
+/// The outcome of each set, sent on a fresh VerifyBls stream from `origin`.
+pub async fn bls_outcomes(
+    h: &mut Harness,
+    sets: Vec<BlsSet>,
+    origin: VerifyOrigin,
+) -> Vec<Result<VerifyStatus, ErrorCode>> {
+    let mut b = bls_open(h).await;
+    b.send(bls_body(bls_request_from(1, sets, origin))).await;
+    outcomes(&bls_reply(&mut b).await)
 }

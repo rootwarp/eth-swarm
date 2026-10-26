@@ -1,13 +1,19 @@
 //! BLS signature-set verification (blst, `min_pk`, Ethereum POP ciphersuite).
 //!
-//! Each set's signers go through [`PubkeyCache::resolve_signer`] with the request's origin; only a
-//! [`ResolvedKey`] reaches BLS, and a [`PreparedSet`] can only be built from resolved keys plus a
-//! [`ValidatedSignature`]. The whole batch is then checked with one random-linear-combination
-//! multi-pairing using non-zero 64-bit scalars. If the batch fails, each set is re-checked on its
-//! own so one bad set never changes the verdict of another.
+//! Each set's signers go through the cache of their namespace with the request's origin
+//! ([`PubkeyCache::resolve_signer`] for validators, [`BuilderKeyCache::resolve_signer`] for Gloas
+//! builders); only a [`ResolvedKey`] reaches BLS, and a [`PreparedSet`] can only be built from
+//! resolved keys plus a [`ValidatedSignature`]. A builder signer resolves from the cache only if
+//! the cached entry has the signer's key version AND its full 48-byte key; the key never comes
+//! from the validator cache, and a validator never from the builder cache. The whole batch is
+//! then checked with one random-linear-combination multi-pairing using non-zero 64-bit scalars.
+//! If the batch fails, each set is re-checked on its own so one bad set never changes the verdict
+//! of another.
 //!
-//! Per-item outcomes before BLS: an unknown index is `UNKNOWN_INDEX` (IGNORE); an inline key for a
-//! cached index, or one that is not a valid 48-byte compressed key, is an `err` with
+//! Per-item outcomes before BLS: an unknown index (or a builder with no matching cached entry and
+//! no inline key) is `UNKNOWN_INDEX` (IGNORE); a signer of an unknown namespace is an `err` with
+//! `ERROR_CODE_VERSION_MISMATCH` (IGNORE, nothing in the set decoded); an inline key for a cached
+//! validator index, or a key that is not a valid 48-byte compressed key, is an `err` with
 //! `ERROR_CODE_CONTRACT_VIOLATION` (IGNORE); a signing root that is not 32 bytes or a signature
 //! that is not a 96-byte compressed, subgroup-checked G2 point is `DECODE_ERROR`. Request-shape
 //! violations (a set without signers, an inline key on gossip, the caps) fail the stream in
@@ -19,13 +25,16 @@ use std::sync::RwLock;
 
 use blst::min_pk::{AggregatePublicKey, PublicKey, Signature};
 use blst::{blst_scalar, BLST_ERROR};
-use cl_verify_cache::{IgnoreReason, Origin, PubkeyCache, Resolution, ResolvedKey, Signer};
+use cl_verify_cache::{
+    BuilderKeyCache, BuilderSigner, CompressedPubkey, IgnoreReason, Origin, PubkeyCache,
+    Resolution, ResolvedKey, Signer,
+};
 use rand::RngCore;
 
 use crate::proto::common::ErrorCode;
 use crate::proto::verify::{
-    bls_result, BlsResult, BlsSet, Signer as WireSigner, VerifyBlsRequestBody, VerifyOrigin,
-    VerifyStatus,
+    bls_result, BlsResult, BlsSet, BuilderSigner as WireBuilderSigner, KeyNamespace,
+    Signer as WireSigner, VerifyBlsRequestBody, VerifyOrigin, VerifyStatus,
 };
 use crate::wire::{wire_error, Deadline, SystemClock, WallClock};
 
@@ -191,6 +200,33 @@ pub fn deadline_open(deadline_unix_ms: u64, now_unix_ms: u64) -> bool {
     deadline_unix_ms != 0 && now_unix_ms <= deadline_unix_ms
 }
 
+/// The key caches a VerifyBls request reads, one per [`KeyNamespace`]. They are separate, so an
+/// index of one namespace never resolves to a key of the other.
+#[derive(Clone, Copy, Debug)]
+pub struct KeyCaches<'a> {
+    validators: &'a RwLock<PubkeyCache<PublicKey>>,
+    builders: &'a RwLock<BuilderKeyCache<PublicKey>>,
+}
+
+impl<'a> KeyCaches<'a> {
+    #[must_use]
+    pub fn new(
+        validators: &'a RwLock<PubkeyCache<PublicKey>>,
+        builders: &'a RwLock<BuilderKeyCache<PublicKey>>,
+    ) -> Self {
+        Self {
+            validators,
+            builders,
+        }
+    }
+}
+
+/// Read snapshots of both caches, taken together.
+struct Snapshot<'a> {
+    validators: &'a PubkeyCache<PublicKey>,
+    builders: &'a BuilderKeyCache<PublicKey>,
+}
+
 /// What stops signer resolution for a request.
 enum Stop {
     /// Answer every set `DEADLINE_EXCEEDED`.
@@ -224,7 +260,7 @@ impl ResolveGate<'_> {
 /// system clock.
 pub fn verify_request(
     body: &VerifyBlsRequestBody,
-    cache: &RwLock<PubkeyCache<PublicKey>>,
+    caches: KeyCaches<'_>,
     backend: &dyn BlsBackend,
 ) -> Vec<BlsResult> {
     let gate = ResolveGate {
@@ -232,7 +268,7 @@ pub fn verify_request(
         closed: &AtomicBool::new(false),
         clock: &SystemClock,
     };
-    verify_request_by(body, &gate, cache, backend).unwrap_or_default()
+    verify_request_by(body, &gate, caches, backend).unwrap_or_default()
 }
 
 /// Verifies one request admitted with `deadline`: one result per set, in order, or `None` if
@@ -250,7 +286,7 @@ pub fn verify_request_gated(
     deadline: &Deadline,
     closed: &AtomicBool,
     clock: &dyn WallClock,
-    cache: &RwLock<PubkeyCache<PublicKey>>,
+    caches: KeyCaches<'_>,
     backend: &dyn BlsBackend,
 ) -> Option<Vec<BlsResult>> {
     let gate = ResolveGate {
@@ -258,17 +294,17 @@ pub fn verify_request_gated(
         closed,
         clock,
     };
-    verify_request_by(body, &gate, cache, backend)
+    verify_request_by(body, &gate, caches, backend)
 }
 
 fn verify_request_by(
     body: &VerifyBlsRequestBody,
     gate: &ResolveGate<'_>,
-    cache: &RwLock<PubkeyCache<PublicKey>>,
+    caches: KeyCaches<'_>,
     backend: &dyn BlsBackend,
 ) -> Option<Vec<BlsResult>> {
     match origin(body.origin) {
-        Some(origin) => verify_gated(&body.sets, origin, gate, cache, backend, &decode_set),
+        Some(origin) => verify_gated(&body.sets, origin, gate, caches, backend, &decode_set),
         None if body.origin == VerifyOrigin::Unspecified as i32 => Some(
             body.sets
                 .iter()
@@ -299,7 +335,7 @@ pub fn verify_sets(
     sets: &[BlsSet],
     origin: Origin,
     deadline_unix_ms: u64,
-    cache: &RwLock<PubkeyCache<PublicKey>>,
+    caches: KeyCaches<'_>,
     backend: &dyn BlsBackend,
 ) -> Vec<BlsResult> {
     let closed = AtomicBool::new(false);
@@ -308,7 +344,7 @@ pub fn verify_sets(
         closed: &closed,
         clock: &SystemClock,
     };
-    verify_gated(sets, origin, &gate, cache, backend, &decode_set).unwrap_or_default()
+    verify_gated(sets, origin, &gate, caches, backend, &decode_set).unwrap_or_default()
 }
 
 /// `decode` is [`decode_set`] outside the tests, which count the sets it decodes.
@@ -316,7 +352,7 @@ fn verify_gated(
     sets: &[BlsSet],
     origin: Origin,
     gate: &ResolveGate<'_>,
-    cache: &RwLock<PubkeyCache<PublicKey>>,
+    caches: KeyCaches<'_>,
     backend: &dyn BlsBackend,
     decode: &dyn Fn(&BlsSet) -> Result<DecodedSet, BlsResult>,
 ) -> Option<Vec<BlsResult>> {
@@ -334,18 +370,30 @@ fn verify_gated(
     if let Err(stop) = gate.check() {
         return stopped(stop);
     }
-    // Then the snapshot, and the gate again immediately before each cache-dependent check.
-    let prepared: Result<Vec<Result<PreparedSet, BlsResult>>, Stop> = match cache.read() {
-        Ok(snapshot) => decoded
-            .iter()
-            .map(|d| {
-                gate.check().map(|()| match d {
-                    Ok(d) => resolve_set(d, origin, &snapshot),
-                    Err(early) => Err(early.clone()),
+    // Then the snapshot of both caches (validators first, the one lock order of every reader),
+    // and the gate again immediately before each cache-dependent check.
+    let locked = caches
+        .validators
+        .read()
+        .ok()
+        .and_then(|v| caches.builders.read().ok().map(|b| (v, b)));
+    let prepared: Result<Vec<Result<PreparedSet, BlsResult>>, Stop> = match &locked {
+        Some((validators, builders)) => {
+            let snapshot = Snapshot {
+                validators,
+                builders,
+            };
+            decoded
+                .iter()
+                .map(|d| {
+                    gate.check().map(|()| match d {
+                        Ok(d) => resolve_set(d, origin, &snapshot),
+                        Err(early) => Err(early.clone()),
+                    })
                 })
-            })
-            .collect(),
-        Err(_) => {
+                .collect()
+        }
+        None => {
             if let Err(stop) = gate.check() {
                 return stopped(stop);
             }
@@ -356,6 +404,7 @@ fn verify_gated(
             );
         }
     };
+    drop(locked);
     let prepared = match prepared {
         Ok(p) => p,
         Err(stop) => return stopped(stop),
@@ -395,18 +444,29 @@ fn verify_gated(
 /// A set whose signature and inline keys have been decoded and validated; nothing in it depends
 /// on the cache yet.
 struct DecodedSet {
-    signers: Vec<Signer<PublicKey>>,
+    signers: Vec<DecodedSigner>,
     signing_root: [u8; 32],
     signature: ValidatedSignature,
+}
+
+/// One decoded signer, in its namespace.
+enum DecodedSigner {
+    Validator(Signer<PublicKey>),
+    Builder(BuilderSigner<PublicKey>),
 }
 
 /// Decodes and resolves one set. The `Err` side is the set's final result (never VALID).
 pub fn prepare_set(
     set: &BlsSet,
     origin: Origin,
-    cache: &PubkeyCache<PublicKey>,
+    validators: &PubkeyCache<PublicKey>,
+    builders: &BuilderKeyCache<PublicKey>,
 ) -> Result<PreparedSet, BlsResult> {
-    resolve_set(&decode_set(set)?, origin, cache)
+    let snapshot = Snapshot {
+        validators,
+        builders,
+    };
+    resolve_set(&decode_set(set)?, origin, &snapshot)
 }
 
 /// The cache-independent part of [`prepare_set`].
@@ -415,6 +475,17 @@ fn decode_set(set: &BlsSet) -> Result<DecodedSet, BlsResult> {
         return Err(error(
             ErrorCode::ContractViolation,
             "BLS set has no signers",
+        ));
+    }
+    // A signer of a namespace this build does not know is IGNOREd before anything is decoded.
+    if let Some(unknown) = set
+        .signers
+        .iter()
+        .find(|s| KeyNamespace::try_from(s.namespace).is_err())
+    {
+        return Err(error(
+            ErrorCode::VersionMismatch,
+            &format!("unknown KeyNamespace {}", unknown.namespace),
         ));
     }
     let signing_root: [u8; 32] = set
@@ -440,20 +511,38 @@ fn decode_set(set: &BlsSet) -> Result<DecodedSet, BlsResult> {
 fn resolve_set(
     set: &DecodedSet,
     origin: Origin,
-    cache: &PubkeyCache<PublicKey>,
+    snapshot: &Snapshot<'_>,
 ) -> Result<PreparedSet, BlsResult> {
     let keys = set
         .signers
         .iter()
-        .map(|s| resolve_signer(s, origin, cache))
+        .map(|s| resolve_signer(s, origin, snapshot))
         .collect::<Result<Vec<_>, _>>()?;
     PreparedSet::new(&keys, set.signing_root, set.signature)
         .ok_or_else(|| status(VerifyStatus::DecodeError))
 }
 
-/// The wire signer as the cache's [`Signer`]. An inline key comes from cl-chain, not from a peer,
-/// so one that is not a valid 48-byte compressed key is a contract violation.
-fn decode_signer(s: &WireSigner) -> Result<Signer<PublicKey>, BlsResult> {
+/// The wire signer in its namespace. A key comes from cl-chain, not from a peer, so one that is
+/// not a valid 48-byte compressed key is a contract violation, and so is a signer whose fields do
+/// not fit its namespace (the request-shape check in [`crate::caps`] refuses those first).
+fn decode_signer(s: &WireSigner) -> Result<DecodedSigner, BlsResult> {
+    match (KeyNamespace::try_from(s.namespace), &s.builder) {
+        (Ok(KeyNamespace::Validator), None) => decode_validator(s).map(DecodedSigner::Validator),
+        (Ok(KeyNamespace::Builder), Some(b))
+            if s.validator_index == 0 && s.inline_pubkey.is_empty() =>
+        {
+            decode_builder(b).map(DecodedSigner::Builder)
+        }
+        (Ok(KeyNamespace::Unspecified), _) => Err(violation("KEY_NAMESPACE_UNSPECIFIED")),
+        (Ok(_), _) => Err(violation("signer fields do not fit its KeyNamespace")),
+        (Err(_), _) => Err(error(
+            ErrorCode::VersionMismatch,
+            &format!("unknown KeyNamespace {}", s.namespace),
+        )),
+    }
+}
+
+fn decode_validator(s: &WireSigner) -> Result<Signer<PublicKey>, BlsResult> {
     if s.inline_pubkey.is_empty() {
         return Ok(Signer::Validator(s.validator_index));
     }
@@ -462,29 +551,53 @@ fn decode_signer(s: &WireSigner) -> Result<Signer<PublicKey>, BlsResult> {
             index: s.validator_index,
             key,
         })
-        .ok_or_else(|| {
-            error(
-                ErrorCode::ContractViolation,
-                "inline pubkey is not a valid 48-byte compressed key",
-            )
+        .ok_or_else(|| violation("inline pubkey is not a valid 48-byte compressed key"))
+}
+
+/// A builder signer: its 48-byte key is only compared with the cache, unless it is inline, when it
+/// is decoded and validated.
+fn decode_builder(b: &WireBuilderSigner) -> Result<BuilderSigner<PublicKey>, BlsResult> {
+    let pubkey: CompressedPubkey = b
+        .pubkey
+        .as_slice()
+        .try_into()
+        .map_err(|_| violation("builder pubkey is not 48 bytes"))?;
+    if !b.inline {
+        return Ok(BuilderSigner::Cached {
+            index: b.builder_index,
+            version: b.key_version,
+            pubkey,
+        });
+    }
+    decode_pubkey(&pubkey)
+        .map(|key| BuilderSigner::Inline {
+            index: b.builder_index,
+            key,
         })
+        .ok_or_else(|| violation("inline builder pubkey is not a valid compressed key"))
 }
 
 /// The eligibility decision for one signer; the only place a signer becomes a key.
 fn resolve_signer<'a>(
-    signer: &'a Signer<PublicKey>,
+    signer: &'a DecodedSigner,
     origin: Origin,
-    cache: &'a PubkeyCache<PublicKey>,
+    snapshot: &Snapshot<'a>,
 ) -> Result<ResolvedKey<'a, PublicKey>, BlsResult> {
-    match cache.resolve_signer(signer, origin) {
+    let resolution = match signer {
+        DecodedSigner::Validator(s) => snapshot.validators.resolve_signer(s, origin),
+        DecodedSigner::Builder(b) => snapshot.builders.resolve_signer(b, origin),
+    };
+    match resolution {
         Resolution::Resolved(key) => Ok(key),
-        Resolution::Ignore(IgnoreReason::UnknownIndex { .. }) => {
-            Err(status(VerifyStatus::UnknownIndex))
-        }
-        Resolution::ContractViolation(v) => {
-            Err(error(ErrorCode::ContractViolation, &v.to_string()))
-        }
+        Resolution::Ignore(
+            IgnoreReason::UnknownIndex { .. } | IgnoreReason::UnknownBuilder { .. },
+        ) => Err(status(VerifyStatus::UnknownIndex)),
+        Resolution::ContractViolation(v) => Err(violation(&v.to_string())),
     }
+}
+
+fn violation(detail: &str) -> BlsResult {
+    error(ErrorCode::ContractViolation, detail)
 }
 
 fn status(s: VerifyStatus) -> BlsResult {
@@ -522,24 +635,41 @@ mod tests {
         SecretKey::key_gen(&ikm, &[]).unwrap()
     }
 
-    fn cache(n: u64) -> RwLock<PubkeyCache<PublicKey>> {
+    /// Both key caches: validators `0..n`, and no builder.
+    struct Caches {
+        validators: RwLock<PubkeyCache<PublicKey>>,
+        builders: RwLock<BuilderKeyCache<PublicKey>>,
+    }
+
+    impl Caches {
+        fn keys(&self) -> KeyCaches<'_> {
+            KeyCaches::new(&self.validators, &self.builders)
+        }
+    }
+
+    fn cache(n: u64) -> Caches {
         let mut c = PubkeyCache::new();
         c.append_range(0, (0..n).map(|i| sk(i).sk_to_pk()).collect())
             .unwrap();
-        RwLock::new(c)
+        Caches {
+            validators: RwLock::new(c),
+            builders: RwLock::new(BuilderKeyCache::new()),
+        }
     }
 
     fn signer(i: u64) -> WireSigner {
         WireSigner {
             validator_index: i,
             inline_pubkey: vec![],
+            namespace: KeyNamespace::Validator as i32,
+            builder: None,
         }
     }
 
     fn inline(i: u64) -> WireSigner {
         WireSigner {
-            validator_index: i,
             inline_pubkey: sk(i).sk_to_pk().compress().to_vec(),
+            ..signer(i)
         }
     }
 
@@ -574,15 +704,12 @@ mod tests {
     fn run_from(
         sets: &[BlsSet],
         origin: Origin,
-        c: &RwLock<PubkeyCache<PublicKey>>,
+        c: &Caches,
     ) -> Vec<Result<VerifyStatus, ErrorCode>> {
-        statuses(&verify_sets(sets, origin, u64::MAX, c, &BlstBackend))
+        statuses(&verify_sets(sets, origin, u64::MAX, c.keys(), &BlstBackend))
     }
 
-    fn run(
-        sets: &[BlsSet],
-        c: &RwLock<PubkeyCache<PublicKey>>,
-    ) -> Vec<Result<VerifyStatus, ErrorCode>> {
+    fn run(sets: &[BlsSet], c: &Caches) -> Vec<Result<VerifyStatus, ErrorCode>> {
         run_from(sets, Origin::Import, c)
     }
 
@@ -695,7 +822,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            c.read().unwrap().high_water(),
+            c.validators.read().unwrap().high_water(),
             2,
             "inline keys never enter the cache"
         );
@@ -738,7 +865,7 @@ mod tests {
             generation: 0,
         };
         assert_eq!(
-            statuses(&verify_request(&body, &c, &counting)),
+            statuses(&verify_request(&body, c.keys(), &counting)),
             vec![Err(ErrorCode::VersionMismatch); 2]
         );
         assert_eq!(counting.0.load(Ordering::SeqCst), 0);
@@ -747,7 +874,7 @@ mod tests {
             ..body.clone()
         };
         assert_eq!(
-            statuses(&verify_request(&unspecified, &c, &counting)),
+            statuses(&verify_request(&unspecified, c.keys(), &counting)),
             vec![Err(ErrorCode::ContractViolation); 2]
         );
         let gossip = VerifyBlsRequestBody {
@@ -755,7 +882,7 @@ mod tests {
             ..body
         };
         assert_eq!(
-            statuses(&verify_request(&gossip, &c, &counting)),
+            statuses(&verify_request(&gossip, c.keys(), &counting)),
             vec![Ok(VerifyStatus::Valid); 2]
         );
         assert_eq!(counting.0.load(Ordering::SeqCst), 1);
@@ -775,7 +902,7 @@ mod tests {
             generation: 0,
         };
         assert_eq!(
-            statuses(&verify_request(&body, &c, &counting)),
+            statuses(&verify_request(&body, c.keys(), &counting)),
             vec![Ok(VerifyStatus::DeadlineExceeded); 2]
         );
         assert_eq!(counting.0.load(Ordering::SeqCst), 0);
@@ -788,7 +915,7 @@ mod tests {
         // waiting for the lock would resolve the inline signer against the new entry (a contract
         // violation); checking it after taking the snapshot gives DEADLINE_EXCEEDED.
         let c = Arc::new(cache(5));
-        let mut writer = c.write().unwrap();
+        let mut writer = c.validators.write().unwrap();
         let body = VerifyBlsRequestBody {
             request_id: 1,
             sets: vec![signed(vec![inline(5)], &[5], 1)],
@@ -798,7 +925,7 @@ mod tests {
         };
         let reader = {
             let c = Arc::clone(&c);
-            std::thread::spawn(move || statuses(&verify_request(&body, &c, &BlstBackend)))
+            std::thread::spawn(move || statuses(&verify_request(&body, c.keys(), &BlstBackend)))
         };
         std::thread::sleep(std::time::Duration::from_millis(250));
         writer.append(5, sk(5).sk_to_pk()).unwrap();
@@ -842,8 +969,8 @@ mod tests {
             sets: vec![BlsSet {
                 signers: (0..n)
                     .map(|i| WireSigner {
-                        validator_index: 1_000 + i,
                         inline_pubkey: key.clone(),
+                        ..signer(1_000 + i)
                     })
                     .collect(),
                 signing_root: msg.to_vec(),
@@ -867,7 +994,7 @@ mod tests {
             &deadline,
             &AtomicBool::new(false),
             &clock,
-            &c,
+            c.keys(),
             &counting,
         );
         assert_eq!(
@@ -912,7 +1039,7 @@ mod tests {
             &deadline,
             &AtomicBool::new(false),
             &clock,
-            &c,
+            c.keys(),
             &counting,
         );
         assert_eq!(
@@ -944,7 +1071,7 @@ mod tests {
             &body.sets,
             Origin::Import,
             &gate,
-            &c,
+            c.keys(),
             &BlstBackend,
             &counting_decode,
         );
@@ -992,7 +1119,7 @@ mod tests {
         let closed = AtomicBool::new(true);
         let deadline = Deadline::new(body.deadline_unix_ms, &SystemClock).unwrap();
         let run = |closed: &AtomicBool| {
-            verify_request_gated(&body, &deadline, closed, &SystemClock, &c, &counting)
+            verify_request_gated(&body, &deadline, closed, &SystemClock, c.keys(), &counting)
         };
         assert!(run(&closed).is_none());
         assert_eq!(counting.0.load(Ordering::SeqCst), 0);
@@ -1008,7 +1135,7 @@ mod tests {
         let c = Arc::new(cache(2));
         let c2 = Arc::clone(&c);
         let _ = std::thread::spawn(move || {
-            let _g = c2.write().unwrap();
+            let _g = c2.validators.write().unwrap();
             panic!("poison");
         })
         .join();
@@ -1017,7 +1144,7 @@ mod tests {
                 &[set(&[0], 1)],
                 Origin::Import,
                 0,
-                &c,
+                c.keys(),
                 &BlstBackend
             )),
             vec![Ok(VerifyStatus::DeadlineExceeded)]
@@ -1037,9 +1164,13 @@ mod tests {
         let sig = ValidatedSignature::from_compressed(&set(&[0], 1).signature).unwrap();
         assert!(PreparedSet::new(&[], [1; 32], sig).is_none());
         let c = cache(1);
-        let guard = c.read().unwrap();
-        let signer = Signer::Validator(0);
-        let key = resolve_signer(&signer, Origin::Gossip, &guard).unwrap();
+        let (validators, builders) = (c.validators.read().unwrap(), c.builders.read().unwrap());
+        let snapshot = Snapshot {
+            validators: &validators,
+            builders: &builders,
+        };
+        let signer = DecodedSigner::Validator(Signer::Validator(0));
+        let key = resolve_signer(&signer, Origin::Gossip, &snapshot).unwrap();
         let p = PreparedSet::new(&[key], [1; 32], sig).unwrap();
         assert_eq!(p.pubkey(), &sk(0).sk_to_pk());
         assert_eq!(p.signing_root(), &[1; 32]);
@@ -1049,7 +1180,9 @@ mod tests {
 
     #[test]
     fn empty_request_yields_no_results() {
-        assert!(verify_sets(&[], Origin::Gossip, u64::MAX, &cache(1), &BlstBackend).is_empty());
+        assert!(
+            verify_sets(&[], Origin::Gossip, u64::MAX, cache(1).keys(), &BlstBackend).is_empty()
+        );
     }
 
     #[test]
@@ -1066,7 +1199,7 @@ mod tests {
                 &[set(&[0], 1), set(&[1], 2)],
                 Origin::Import,
                 u64::MAX,
-                &c,
+                c.keys(),
                 &Short
             )),
             vec![Err(ErrorCode::ResourceUnavailable); 2]
@@ -1078,7 +1211,7 @@ mod tests {
         let c = Arc::new(cache(2));
         let c2 = Arc::clone(&c);
         let _ = std::thread::spawn(move || {
-            let _g = c2.write().unwrap();
+            let _g = c2.validators.write().unwrap();
             panic!("poison");
         })
         .join();
@@ -1086,6 +1219,179 @@ mod tests {
             run(&[set(&[0], 1), set(&[1], 2)], &c),
             vec![Err(ErrorCode::ResourceUnavailable); 2]
         );
+    }
+
+    // Builder signers.
+
+    /// Builder `i`'s key: another secret than validator `i`'s.
+    fn builder_sk(i: u64) -> SecretKey {
+        sk(1_000_000 + i)
+    }
+
+    fn builder_signer(i: u64, version: u64, key: &SecretKey, inline: bool) -> WireSigner {
+        WireSigner {
+            validator_index: 0,
+            inline_pubkey: vec![],
+            namespace: KeyNamespace::Builder as i32,
+            builder: Some(WireBuilderSigner {
+                builder_index: i,
+                key_version: version,
+                pubkey: key.sk_to_pk().compress().to_vec(),
+                inline,
+            }),
+        }
+    }
+
+    /// A set over `[root; 32]` signed by `key`, naming `signer`.
+    fn signed_by(signer: WireSigner, key: &SecretKey, root: u8) -> BlsSet {
+        let msg = [root; 32];
+        BlsSet {
+            signers: vec![signer],
+            signing_root: msg.to_vec(),
+            signature: key.sign(&msg, DST, &[]).compress().to_vec(),
+        }
+    }
+
+    /// Validators `0..n`, and builders `0..n` with version `100 + i`.
+    fn with_builders(n: u64) -> Caches {
+        let c = cache(n);
+        let entries = (0..n)
+            .map(|i| {
+                let key = builder_sk(i).sk_to_pk();
+                cl_verify_cache::BuilderEntry::new(100 + i, key.compress(), key)
+            })
+            .collect();
+        c.builders
+            .write()
+            .unwrap()
+            .append_range(0, entries)
+            .unwrap();
+        c
+    }
+
+    #[test]
+    fn a_builder_resolves_only_from_the_builder_cache_and_only_with_its_full_key() {
+        let c = with_builders(3);
+        let b1 = builder_sk(1);
+        let other = builder_sk(9);
+        let sets = [
+            // The cached builder key, named with its version and its full key.
+            signed_by(builder_signer(1, 101, &b1, false), &b1, 1),
+            // The right version with another key (a version collision): never the cached key.
+            signed_by(builder_signer(1, 101, &other, false), &other, 2),
+            // The right key with another version.
+            signed_by(builder_signer(1, 102, &b1, false), &b1, 3),
+            // Past the builder high-water mark.
+            signed_by(
+                builder_signer(3, 103, &builder_sk(3), false),
+                &builder_sk(3),
+                4,
+            ),
+            // Builder 1's signature named as validator 1: the validator key does not verify it.
+            signed_by(signer(1), &b1, 5),
+        ];
+        for origin in [Origin::Gossip, Origin::Import] {
+            assert_eq!(
+                run_from(&sets, origin, &c),
+                vec![
+                    Ok(VerifyStatus::Valid),
+                    Ok(VerifyStatus::UnknownIndex),
+                    Ok(VerifyStatus::UnknownIndex),
+                    Ok(VerifyStatus::UnknownIndex),
+                    Ok(VerifyStatus::Invalid),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn an_inline_builder_key_resolves_on_import_only() {
+        let c = with_builders(2);
+        let fresh = builder_sk(7);
+        let inline = signed_by(builder_signer(5, 7, &fresh, true), &fresh, 1);
+        // An inline key for a cached index is used too: the key, not the mark, decides.
+        let reused = signed_by(builder_signer(1, 7, &fresh, true), &fresh, 2);
+        assert_eq!(
+            run(&[inline.clone(), reused], &c),
+            vec![Ok(VerifyStatus::Valid), Ok(VerifyStatus::Valid)]
+        );
+        assert_eq!(
+            run_from(&[inline], Origin::Gossip, &c),
+            vec![Err(ErrorCode::ContractViolation)]
+        );
+        assert_eq!(c.builders.read().unwrap().high_water(), 2, "never cached");
+    }
+
+    #[test]
+    fn a_malformed_builder_signer_is_a_per_item_violation() {
+        let c = with_builders(2);
+        let b0 = builder_sk(0);
+        let mut short = signed_by(builder_signer(0, 100, &b0, false), &b0, 1);
+        short.signers[0].builder.as_mut().unwrap().pubkey.pop();
+        let mut bad_inline = signed_by(builder_signer(0, 100, &b0, true), &b0, 2);
+        bad_inline.signers[0].builder.as_mut().unwrap().pubkey = vec![0xaa; 48];
+        let mut no_builder = signed_by(builder_signer(0, 100, &b0, false), &b0, 3);
+        no_builder.signers[0].builder = None;
+        let mut validator_with_builder = set(&[0], 4);
+        validator_with_builder.signers[0].builder = builder_signer(0, 100, &b0, false).builder;
+        let mut unspecified = set(&[0], 5);
+        unspecified.signers[0].namespace = KeyNamespace::Unspecified as i32;
+        assert_eq!(
+            run(
+                &[
+                    short,
+                    bad_inline,
+                    no_builder,
+                    validator_with_builder,
+                    unspecified
+                ],
+                &c
+            ),
+            vec![Err(ErrorCode::ContractViolation); 5]
+        );
+    }
+
+    #[test]
+    fn a_signer_of_an_unknown_namespace_is_ignored_before_anything_is_decoded() {
+        let c = with_builders(2);
+        let counting = Arc::new(Counting::default());
+        let mut unknown = set(&[0], 1);
+        unknown.signers[0].namespace = 99;
+        // A signature that would be a DECODE_ERROR if it were decoded.
+        unknown.signature = vec![0xff; 96];
+        let body = import_body(vec![unknown, set(&[1], 2)], u64::MAX);
+        assert_eq!(
+            statuses(&verify_request(&body, c.keys(), &counting)),
+            vec![Err(ErrorCode::VersionMismatch), Ok(VerifyStatus::Valid)]
+        );
+        assert_eq!(counting.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_poisoned_builder_cache_is_an_error_for_every_set() {
+        let c = Arc::new(with_builders(1));
+        let c2 = Arc::clone(&c);
+        let _ = std::thread::spawn(move || {
+            let _g = c2.builders.write().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert_eq!(
+            run(&[set(&[0], 1)], &c),
+            vec![Err(ErrorCode::ResourceUnavailable)]
+        );
+    }
+
+    #[test]
+    fn prepare_set_resolves_a_builder_from_the_given_caches() {
+        let c = with_builders(1);
+        let b0 = builder_sk(0);
+        let (validators, builders) = (c.validators.read().unwrap(), c.builders.read().unwrap());
+        let ok = signed_by(builder_signer(0, 100, &b0, false), &b0, 1);
+        let p = prepare_set(&ok, Origin::Gossip, &validators, &builders).unwrap();
+        assert_eq!(p.pubkey(), &b0.sk_to_pk());
+        let miss = signed_by(builder_signer(0, 100, &builder_sk(5), false), &b0, 1);
+        assert!(prepare_set(&miss, Origin::Gossip, &validators, &builders).is_err());
     }
 
     #[test]

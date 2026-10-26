@@ -10,9 +10,10 @@ use ethswarm_proto::common::{ErrorCode, Verdict};
 use ethswarm_proto::verify::verify_service_client::VerifyServiceClient;
 use ethswarm_proto::verify::verify_service_server::{VerifyService, VerifyServiceServer};
 use ethswarm_proto::verify::{
-    bls_result, BlsResult, BlsSet, PubkeyFeedRequest, PubkeyFeedResponse, VerifyBlsRequest,
-    VerifyBlsRequestBody, VerifyBlsResponse, VerifyBlsResponseBody, VerifyKzgRequest,
-    VerifyKzgResponse, VerifyOrigin, VerifyStatus,
+    bls_result, BlsResult, BlsSet, BuilderKeyFeedRequest, BuilderKeyFeedResponse,
+    PubkeyFeedRequest, PubkeyFeedResponse, VerifyBlsRequest, VerifyBlsRequestBody,
+    VerifyBlsResponse, VerifyBlsResponseBody, VerifyKzgRequest, VerifyKzgResponse, VerifyOrigin,
+    VerifyStatus,
 };
 use ipc::deadline::{Calls, Delivery, FenceMetrics, Ignored, Pending};
 use ipc::fence::{check_request, message_hash, FencedRequest, FencedResult, RequestTag};
@@ -130,6 +131,7 @@ impl VerifyService for FakeVerify {
     type VerifyBlsStream = ReceiverStream<Result<VerifyBlsResponse, Status>>;
     type VerifyKzgStream = ReceiverStream<Result<VerifyKzgResponse, Status>>;
     type PubkeyFeedStream = ReceiverStream<Result<PubkeyFeedResponse, Status>>;
+    type BuilderKeyFeedStream = ReceiverStream<Result<BuilderKeyFeedResponse, Status>>;
 
     async fn verify_bls(
         &self,
@@ -177,6 +179,13 @@ impl VerifyService for FakeVerify {
         &self,
         _: Request<Streaming<PubkeyFeedRequest>>,
     ) -> Result<Response<Self::PubkeyFeedStream>, Status> {
+        Err(Status::unimplemented("fake serves VerifyBls only"))
+    }
+
+    async fn builder_key_feed(
+        &self,
+        _: Request<Streaming<BuilderKeyFeedRequest>>,
+    ) -> Result<Response<Self::BuilderKeyFeedStream>, Status> {
         Err(Status::unimplemented("fake serves VerifyBls only"))
     }
 }

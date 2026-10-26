@@ -13,7 +13,8 @@
 //! (`SignerRef::Builder`, an index into the separate `state.builders` registry) and a key carried
 //! by the message itself with no validator index (`SignerRef::Inline`: deposits,
 //! BLS-to-execution-change withdrawal keys) must not be resolved through it. A builder index
-//! passed as `Validator(i)` would resolve to an unrelated validator's key.
+//! passed as `Validator(i)` would resolve to an unrelated validator's key. Builder signers go
+//! through [`crate::builders`], a separate cache with its own rules.
 //!
 //! # Why gossip needs no inline keys
 //!
@@ -135,6 +136,9 @@ pub enum IgnoreReason {
     /// Index at or past the cache high-water mark with no usable inline key
     /// (`VERIFY_STATUS_UNKNOWN_INDEX`).
     UnknownIndex { index: u64 },
+    /// A builder with no cached entry of the same version and the same full key, and no inline
+    /// key (`VERIFY_STATUS_UNKNOWN_INDEX`; see [`crate::builders`]).
+    UnknownBuilder { index: u64 },
 }
 
 /// A signer the caller must never have sent.
@@ -144,6 +148,8 @@ pub enum Violation {
     InlineOnGossip { index: u64 },
     #[error("validator {index} carries an inline pubkey but is already cached")]
     InlineForCachedIndex { index: u64 },
+    #[error("builder {index} carries an inline pubkey on gossip")]
+    BuilderInlineOnGossip { index: u64 },
 }
 
 /// Splits import items (signature sets) into batches of at most [`MAX_SETS_PER_BATCH`] items and

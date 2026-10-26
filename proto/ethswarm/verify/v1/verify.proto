@@ -7,8 +7,10 @@ import "ethswarm/common/v1/error.proto";
 
 // Served by cl-verify (service 8); called ONLY by cl-chain (UID-checked, like cl-engine).
 //
-// cl-verify is stateless apart from an append-only pubkey cache fed by cl-chain over PubkeyFeed.
-// It runs BLS (blst) and KZG cell-proof checks and returns per-item verdicts. See arch/verify-ipc.md.
+// cl-verify is stateless apart from an append-only validator pubkey cache fed by cl-chain over
+// PubkeyFeed and a builder key cache fed over BuilderKeyFeed (see there). The two are separate
+// namespaces (KeyNamespace). It runs BLS (blst) and KZG cell-proof checks and returns per-item verdicts.
+// See arch/verify-ipc.md.
 //
 // Cache-safety invariant: once FINALIZED, a validator index never changes pubkey (the registry is
 // append-only, electra beacon-chain.md add_validator_to_registry). Before finality, competing branches can
@@ -106,7 +108,9 @@ enum VerifyStatus {
   VERIFY_STATUS_UNSPECIFIED = 0;
   VERIFY_STATUS_VALID = 1;
   VERIFY_STATUS_INVALID = 2;
-  // Index at or past the cache high-water mark with no inline pubkey. IGNORE (or retry), never ACCEPT.
+  // Index at or past the cache high-water mark with no inline pubkey. For a builder signer: no cached
+  // entry with the same key_version and the same full key, and no inline key (see BuilderSigner).
+  // IGNORE (or retry), never ACCEPT.
   VERIFY_STATUS_UNKNOWN_INDEX = 3;
   VERIFY_STATUS_DEADLINE_EXCEEDED = 4;
   VERIFY_STATUS_OVERLOADED = 5;
@@ -124,13 +128,30 @@ enum VerifyOrigin {
   VERIFY_ORIGIN_IMPORT = 2;
 }
 
-// A validator-registry signer. Validator signing keys only: a Gloas builder (index into the separate
-// state.builders registry) and a key carried by the message itself with no validator index (deposits,
-// BLS-to-execution-change withdrawal keys) must not be sent as a Signer; a builder index here would
-// resolve to an unrelated validator's key.
+// The key registry that a signer or a key feed frame belongs to. Each namespace has its own cache in
+// cl-verify, so an index of one namespace never resolves to a key of the other.
+enum KeyNamespace {
+  // Contract violation if sent.
+  KEY_NAMESPACE_UNSPECIFIED = 0;
+  // state.validators: the append-only registry that PubkeyFeed feeds.
+  KEY_NAMESPACE_VALIDATOR = 1;
+  // state.builders (Gloas): the builder registry that BuilderKeyFeed feeds. It is not append-only.
+  KEY_NAMESPACE_BUILDER = 2;
+}
+
+// One signer of a BlsSet, in the registry that namespace names.
+// namespace is required: KEY_NAMESPACE_UNSPECIFIED (0) fails the call or stream with
+// ERROR_CODE_CONTRACT_VIOLATION (a request-shape rule). A signer with an unknown non-zero namespace is
+// IGNOREd: its set gets an err with ERROR_CODE_VERSION_MISMATCH, nothing in it is decoded and it is
+// never VALID.
+// KEY_NAMESPACE_VALIDATOR: validator_index and inline_pubkey as below; builder must be unset.
+// KEY_NAMESPACE_BUILDER: builder is required, validator_index must be 0 and inline_pubkey empty.
+// Anything else is ERROR_CODE_CONTRACT_VIOLATION (a request-shape rule).
+// A key carried by the message itself with no registry index (deposits, BLS-to-execution-change
+// withdrawal keys) must not be sent as a Signer of either namespace.
 message Signer {
   uint64 validator_index = 1;
-  // 48 bytes compressed G1.
+  // 48 bytes compressed G1. KEY_NAMESPACE_VALIDATOR only.
   // The rules depend on the request's VerifyBlsRequestBody.origin.
   // Gossip: always empty; a non-empty inline_pubkey is ERROR_CODE_CONTRACT_VIOLATION.
   // Import: required iff validator_index >= the cache high-water mark (unfinalized); empty otherwise.
@@ -138,6 +159,41 @@ message Signer {
   //   index is ERROR_CODE_CONTRACT_VIOLATION, even when it equals the cached key. See the inline bound
   //   and the feed hold-back above.
   bytes inline_pubkey = 2;
+  KeyNamespace namespace = 3;
+  // Required for KEY_NAMESPACE_BUILDER, unset otherwise.
+  BuilderSigner builder = 4;
+}
+
+// A Gloas builder signer: state.builders[builder_index] of the state that the signature is verified
+// against (the bid or envelope signer, gloas/beacon-chain.md verify_execution_payload_bid_signature and
+// verify_execution_payload_envelope_signature).
+// Builder indices are reusable (gloas/beacon-chain.md process_builder_deposit_request): a builder that
+// exited and was swept to 0 frees its index, and a new key can take it, also on a branch that is not
+// finalized. Thus (builder_index, key_version) is not a safe cache key, and cl-verify uses a cached key
+// only if it is byte for byte equal to pubkey:
+// - inline false: cl-verify uses its cached builder key at builder_index only if the cached key_version
+//   equals key_version AND the cached 48-byte key equals pubkey. Any other case (no entry, another
+//   version, another key) yields VERIFY_STATUS_UNKNOWN_INDEX -> IGNORE, with no BLS work. pubkey is
+//   compared, never decoded.
+// - inline true: cl-verify decodes pubkey (KeyValidate) and uses it for this call only. It never enters
+//   the cache. A pubkey that is not a valid 48-byte compressed key is ERROR_CODE_CONTRACT_VIOLATION for
+//   the set. Gossip: inline true is ERROR_CODE_CONTRACT_VIOLATION (a request-shape rule; an active
+//   builder has a finalized placement, gloas/beacon-chain.md is_active_builder). Import: cl-chain sends
+//   inline true when state.builders[builder_index] of the branch state is not a builder entry that
+//   cl-verify acknowledged on BuilderKeyFeed. An inline builder key counts against the 1,024 inline
+//   packing cap. An inline key for a cached builder index is allowed: the key comparison, not the cache
+//   high-water mark, decides, so no BuilderKeyFeed hold-back applies.
+message BuilderSigner {
+  uint64 builder_index = 1;
+  // The builder key version of the state (cl-chain's state_transition::accessors::builder_key_version: the
+  // first 8 bytes of SHA-256(pubkey), little-endian). A lookup hint only: two keys can have the same
+  // version (a 64-bit digest), so a version match alone never selects a cached key.
+  uint64 key_version = 2;
+  // 48 bytes compressed G1: state.builders[builder_index].pubkey of the state that the signature is
+  // verified against. Always required; any other length is ERROR_CODE_CONTRACT_VIOLATION for the set.
+  bytes pubkey = 3;
+  // Use pubkey as an inline key (import only, see above).
+  bool inline = 4;
 }
 
 message BlsSet {
@@ -378,8 +434,93 @@ message PubkeyFeedResponse {
   }
 }
 
+// BuilderKeyFeed: cl-chain feeds the builder registry of its finalized state (state.builders of the
+// finalized checkpoint state) to cl-verify's builder key cache, a cache separate from the validator one.
+// Only finalized entries are fed. A builder that is not finalized travels inline on import (see
+// BuilderSigner), so nothing above finality is cached and a reorg has nothing to roll back.
+//
+// The builder registry is not append-only: a finalized builder can exit, be swept to 0 and its index can
+// go to a new key. Thus a frame can overwrite entries: a frame covers the indices start_index ..
+// start_index + count, start_index must be at most cl-verify's high-water mark (a gap is
+// ERROR_CODE_CONTRACT_VIOLATION), an entry below the mark replaces the cached entry of its index, and the
+// other entries extend the cache. A cached entry is never a safe key on its own: every lookup compares
+// it with the key that the signer carries (see BuilderSigner), so a stale or replaced entry can only
+// miss (VERIFY_STATUS_UNKNOWN_INDEX -> IGNORE), never give a wrong key.
+//
+// Restart: the builder cache is in memory only; the PubkeyFeed snapshot never holds builder keys. After
+// hello, cl-verify sends one BuilderKeyFeedResponseBody with its builder high-water mark (0 after a
+// start). cl-chain waits for it before its first body frame: a stream without that first response is
+// ERROR_CODE_CONTRACT_VIOLATION on cl-chain's side. Until the feed delivers, every builder signer
+// without an inline key is VERIFY_STATUS_UNKNOWN_INDEX.
+// Updates: on every finality update cl-chain sends the entries from the lowest index whose entry in the
+// new finalized state differs from the entry cl-verify acknowledged (or from the high-water mark), to
+// the end of the registry, in frames of at most 4,096 entries. With no change it sends one frame with
+// count = 0 at the high-water mark, which reports the lag.
+// Frame errors are answered in-band (BuilderKeyFeedResponseBody.err, high_water unchanged, nothing of
+// the frame applied) and the stream stays open.
+// One writer: only the newest BuilderKeyFeed stream writes. A stream that completes its hello fences
+// every older one: the next frame of an older stream fails that stream with
+// ERROR_CODE_RESOURCE_UNAVAILABLE and applies nothing, so a late frame of an old stream (a reconnect)
+// never overwrites what a newer stream fed. cl-verify runs each frame's epoch check, apply and lag
+// update as one step, one frame at a time.
+// Lag: as PubkeyFeed (see Lag and the epoch rules at PubkeyFeedRequestBody), but in the separate series
+// verify_pubkey_feed_lag_epochs{namespace="builder"} and verify_pubkey_feed_lag_alert{namespace="builder"};
+// the validator feed reports namespace="validator". Every applied frame is evaluated.
+
+// One builder registry entry: state.builders[i] for i = start_index + its position in the frame.
+message BuilderKeyEntry {
+  // builder_key_version of the finalized state for this index (see BuilderSigner.key_version).
+  uint64 key_version = 1;
+  // 48 bytes compressed G1: state.builders[i].pubkey of the finalized state. cl-verify decompresses and
+  // key_validates it once on apply; an invalid key fails the whole frame (ERROR_CODE_CONTRACT_VIOLATION).
+  bytes pubkey = 2;
+}
+
+message BuilderKeyFeedRequestBody {
+  // Must be KEY_NAMESPACE_BUILDER. KEY_NAMESPACE_UNSPECIFIED (0) and KEY_NAMESPACE_VALIDATOR are
+  // ERROR_CODE_CONTRACT_VIOLATION. An unknown non-zero value is IGNOREd: the frame is not decoded or
+  // applied, and the reply carries ERROR_CODE_VERSION_MISMATCH.
+  KeyNamespace namespace = 1;
+  // At most cl-verify's high-water mark; a gap is ERROR_CODE_CONTRACT_VIOLATION.
+  uint64 start_index = 2;
+  // Must equal len(entries); a mismatch is ERROR_CODE_CONTRACT_VIOLATION.
+  uint64 count = 3;
+  // At most 4,096 per frame (about 220 KiB); more is ERROR_CODE_CONTRACT_VIOLATION.
+  repeated BuilderKeyEntry entries = 4;
+  // The finalized checkpoint epoch whose whole builder registry cl-verify holds once this frame is
+  // applied. Same rules as PubkeyFeedRequestBody.feed_finalized_epoch.
+  uint64 feed_finalized_epoch = 5;
+  // cl-chain's finalized checkpoint epoch when it sends this frame. Same rules as
+  // PubkeyFeedRequestBody.chain_finalized_epoch, checked against this stream kind's own history.
+  uint64 chain_finalized_epoch = 6;
+}
+
+message BuilderKeyFeedResponseBody {
+  // Always KEY_NAMESPACE_BUILDER. Any other value is ERROR_CODE_CONTRACT_VIOLATION on cl-chain's side.
+  KeyNamespace namespace = 1;
+  // Builder entries cl-verify holds: the most start_index can be. Sent once right after hello, then after
+  // every frame.
+  uint64 high_water = 2;
+  ethswarm.common.v1.Error err = 3;
+}
+
+message BuilderKeyFeedRequest {
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    BuilderKeyFeedRequestBody body = 2;
+  }
+}
+
+message BuilderKeyFeedResponse {
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    BuilderKeyFeedResponseBody body = 2;
+  }
+}
+
 service VerifyService {
   rpc VerifyBls(stream VerifyBlsRequest) returns (stream VerifyBlsResponse);
   rpc VerifyKzg(stream VerifyKzgRequest) returns (stream VerifyKzgResponse);
   rpc PubkeyFeed(stream PubkeyFeedRequest) returns (stream PubkeyFeedResponse);
+  rpc BuilderKeyFeed(stream BuilderKeyFeedRequest) returns (stream BuilderKeyFeedResponse);
 }
