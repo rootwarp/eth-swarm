@@ -212,7 +212,10 @@ issue   = "none"
 expires = "2026-11-30"
 
 # ---------------------------------------------------------------------------------------
-# Gloas state transition: moved to the state-transition milestone.
+# Gloas runners outside the exit of the state-transition milestone. Every Gloas case of
+# sanity, epoch_processing, operations, finality, rewards and random runs, and so does every
+# phase0 shuffling case (crates/spec-tests/tests/skip_list.rs, skip_toml_has_no_m3_entries),
+# so no entry of those runners is left. beta.4 has no operations/randao handler.
 
 [[skip]]
 source  = "consensus-specs"
@@ -220,9 +223,9 @@ fork    = "gloas"
 preset  = "*"
 runner  = "fork"
 handler = "*"
-reason  = "No fork runner yet: upgrade_to_gloas lands with the Gloas state transition"
+reason  = "No fork runner: upgrade_to_gloas (gloas/fork.md) is not ported, because the state-transition milestone runs Gloas blocks and epochs only; no plan item names the Fulu-to-Gloas upgrade yet (tracked in GitHub issue 269)"
 owner   = "ian"
-issue   = "4.7"
+issue   = "none"
 expires = "2026-11-30"
 
 [[skip]]
@@ -231,35 +234,9 @@ fork    = "gloas"
 preset  = "*"
 runner  = "transition"
 handler = "*"
-reason  = "No transition runner yet: Fulu-to-Gloas transition vectors need the Gloas state transition (and Fulu slot processing before the fork epoch)"
+reason  = "No transition runner: each Fulu-to-Gloas transition vector starts from a Fulu state before the fork epoch and needs Fulu slot and epoch processing (some also Fulu blocks); there is no Fulu state transition (Fulu and Gloas only); tracked in GitHub issue 269"
 owner   = "ian"
-issue   = "4.7"
-expires = "2026-11-30"
-
-# Every Gloas operations handler of beta.4 runs (crates/spec-tests/src/operations.rs), so no
-# operations entry is left. beta.4 has no operations/randao handler. Gloas sanity/slots,
-# sanity/blocks and finality run (crates/spec-tests/src/{sanity,finality}.rs).
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "*"
-runner  = "random"
-handler = "*"
-reason  = "No random runner yet: Gloas random vectors land with the Gloas state transition"
-owner   = "ian"
-issue   = "4.7"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "*"
-runner  = "rewards"
-handler = "*"
-reason  = "No rewards runner yet: Gloas rewards vectors land with the Gloas state transition"
-owner   = "ian"
-issue   = "4.7"
+issue   = "none"
 expires = "2026-11-30"
 
 # ---------------------------------------------------------------------------------------

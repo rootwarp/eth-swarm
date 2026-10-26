@@ -402,6 +402,22 @@ impl SkipList {
             .map(EntryInfo::from)
     }
 
+    /// Every entry, with a `file` or without, that can match a case of `source`, `fork` and
+    /// `runner`, whatever its preset, handler and case globs: its index and its summary, in
+    /// file order.
+    pub fn reaching(&self, source: &str, fork: &str, runner: &str) -> Vec<(usize, String)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                glob(&e.raw.source, source)
+                    && glob(&e.raw.fork, fork)
+                    && glob(&e.raw.runner, runner)
+            })
+            .map(|(index, e)| (index, e.summary()))
+            .collect()
+    }
+
     /// Every entry whose `expires` date is before `today`. An entry is valid through its
     /// expiry day: it expires on the day after.
     pub fn expired(&self, today: Date) -> Vec<PlanError> {
@@ -584,6 +600,44 @@ mod tests {
         let mut other_fork = key("DataColumnSidecar", "x");
         other_fork.fork = "fulu".into();
         assert_eq!(skips.skips_some_case_of(&other_fork), None);
+    }
+
+    #[test]
+    fn entries_reaching_a_runner() {
+        let text = format!(
+            "{}{}",
+            entry("Foo", Some("ssz_random/*"), "2026-12-31"),
+            "[[skip]]\nsource = \"consensus-specs\"\nfork = \"*\"\npreset = \"minimal\"\n\
+             runner = \"ssz_*\"\nhandler = \"*\"\nfile = \"value.yaml\"\n\
+             reason = \"f\"\nowner = \"ian\"\nissue = \"none\"\nexpires = \"2026-12-31\"\n"
+        );
+        let skips = SkipList::parse(&text).unwrap();
+        assert_eq!(
+            skips.reaching("consensus-specs", "gloas", "ssz_static"),
+            [
+                (
+                    0,
+                    "consensus-specs/gloas/*/ssz_static/Foo/ssz_random/*".to_owned()
+                ),
+                (
+                    1,
+                    "consensus-specs/*/minimal/ssz_*/*/* file value.yaml".to_owned()
+                ),
+            ]
+        );
+        assert_eq!(
+            skips.reaching("consensus-specs", "fulu", "ssz_static"),
+            [(
+                1,
+                "consensus-specs/*/minimal/ssz_*/*/* file value.yaml".to_owned()
+            )]
+        );
+        assert!(skips
+            .reaching("consensus-specs", "gloas", "sanity")
+            .is_empty());
+        assert!(skips
+            .reaching("comptests", "gloas", "ssz_static")
+            .is_empty());
     }
 
     #[test]

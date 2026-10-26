@@ -107,13 +107,37 @@ fn shuffling_case(root: &Path) {
     );
 }
 
-/// A minimal tree with one Fulu and one Gloas `Checkpoint` case and one shuffling case: the
-/// runnable subtrees.
+/// The Gloas trees of the state-transition runners that a minimal or mainnet set must hold,
+/// each with a handler that its runner knows.
+const M3_TREES: [(&str, &str); 6] = [
+    ("sanity", "blocks"),
+    ("epoch_processing", "justification_and_finalization"),
+    ("operations", "attestation"),
+    ("finality", "finality"),
+    ("rewards", "basic"),
+    ("random", "random"),
+];
+
+/// The case name of the placeholder cases of [`M3_TREES`].
+const PLACEHOLDER: &str = "pyspec_tests/placeholder";
+
+/// One file in each tree of [`M3_TREES`], in a case [`PLACEHOLDER`] that [`build`] skips: a
+/// real case needs a whole `BeaconState`.
+fn m3_placeholders(root: &Path) {
+    for (runner, handler) in M3_TREES {
+        let dir = format!("{MINIMAL}/gloas/{runner}/{handler}/{PLACEHOLDER}");
+        write(root, &format!("{dir}/pre.ssz_snappy"), b"placeholder\n");
+    }
+}
+
+/// A minimal tree with one Fulu and one Gloas `Checkpoint` case, one shuffling case and the
+/// placeholders of the Gloas state-transition trees: the runnable subtrees.
 fn minimal_tree() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     checkpoint_case(dir.path(), "fulu");
     checkpoint_case(dir.path(), "gloas");
     shuffling_case(dir.path());
+    m3_placeholders(dir.path());
     dir
 }
 
@@ -144,11 +168,21 @@ fn crypto_trees(root: &Path) {
     }
 }
 
+/// `suite::build` with `skip` and one more entry that skips the [`PLACEHOLDER`] cases of a
+/// minimal set.
 fn build(root: &Path, skip: &str, sets: &str) -> Result<Suite, SuiteError> {
+    let placeholders = entry(
+        "consensus-specs",
+        "gloas",
+        "minimal",
+        "*",
+        "*",
+        &format!("case = \"{PLACEHOLDER}\"\n"),
+    );
     suite::build(&Config {
         root,
         manifest: MANIFEST,
-        skip,
+        skip: &format!("{skip}\n{placeholders}"),
         selection: Some(sets),
         today: Date::parse("2026-10-17").unwrap(),
     })
@@ -170,16 +204,21 @@ fn run_all(suite: &Suite) -> Vec<String> {
 fn coverage_passes_on_a_fully_read_tree() {
     let tree = minimal_tree();
     let suite = build(tree.path(), &value_yaml_excused(), "minimal").unwrap();
+    let names = run_all(&suite);
+    let (placeholders, run): (Vec<_>, Vec<_>) = names
+        .iter()
+        .partition(|n| n.ends_with("::pyspec_tests::placeholder"));
     assert_eq!(
-        run_all(&suite),
+        run,
         [
             "fulu_ssz_static_minimal::Checkpoint::ssz_one::case_0",
             "gloas_ssz_static_minimal::Checkpoint::ssz_one::case_0",
             "phase0_shuffling_minimal::core::shuffle::shuffle_0x01_1"
         ]
     );
+    assert_eq!(placeholders.len(), M3_TREES.len());
     let covered = suite.guard.check(&suite.reads).unwrap();
-    assert_eq!((covered.read, covered.total), (8, 10));
+    assert_eq!((covered.read, covered.total), (8, 16));
 }
 
 #[test]
@@ -529,6 +568,21 @@ fn missing_fork_subtree_fails() {
             assert!(msg.contains("tests/minimal/phase0/shuffling"), "{msg}")
         }
         other => panic!("{:?}", other.err()),
+    }
+    // Each Gloas tree of the state-transition runners is required too: without its skip
+    // entries, nothing else finds a tree that is missing.
+    for (runner, _) in M3_TREES {
+        let tree = minimal_tree();
+        std::fs::remove_dir_all(tree.path().join(format!("{MINIMAL}/gloas/{runner}"))).unwrap();
+        match build(tree.path(), &value_yaml_excused(), "minimal") {
+            Err(SuiteError::Setup(msg)) => {
+                assert!(
+                    msg.contains(&format!("tests/minimal/gloas/{runner}")),
+                    "{msg}"
+                )
+            }
+            other => panic!("{runner}: {:?}", other.err()),
+        }
     }
     let crypto = tempfile::tempdir().unwrap();
     crypto_trees(crypto.path());

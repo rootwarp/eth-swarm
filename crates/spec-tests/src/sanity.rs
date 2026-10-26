@@ -12,22 +12,21 @@
 //! `post.ssz_snappy` if the blocks are valid. [`run_blocks`] applies each block in sequence
 //! with `state_transition(state, block, validate_result = true)` and the in-process BLS
 //! backend, and then compares `hash_tree_root` with the post-state. On a mismatch, the error
-//! names the top-level fields that differ. A case without a post-state must apply each block
-//! but the last, and the last block must fail: it does not decode, or its transition fails
-//! with a proof error. Some cases also hold `config.yaml`, which [`check_config`] compares
-//! with the config values of the transition.
+//! names the top-level fields that differ. It does so also when the last block fails with
+//! `StateRootMismatch` in a case with a post-state. A case without a post-state must apply
+//! each block but the last, and the last block must fail: it does not decode, or its
+//! transition fails with a proof error. Some cases also hold `config.yaml`, which
+//! [`check_same_config`] compares with the config values of the transition.
 //!
 //! For each block of a `blocks` case, the runner also checks the signature sets of the block
 //! in one batch and each set alone ([`batch_matches_single`]). The two verdicts must agree.
 //! cl-verify gets the same batch shape. The `finality` runner ([`crate::finality`]) applies
 //! its blocks with [`run_blocks`] too.
 
-use crate::bls_backend::{
-    backend_for, bls_context, bls_setting, BatchKeys, Bls, BlsOff, StateKeys,
-};
+use crate::bls_backend::{backend_for, bls_context, bls_setting, BatchKeys, Bls, StateKeys};
 use crate::check::state_field_diff;
+use crate::config::check_same_config;
 use crate::coverage::Reads;
-use crate::epoch_processing::config_values;
 use crate::fixture;
 use crate::plan::Case;
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
@@ -153,7 +152,7 @@ fn blocks<E: Preset>(reads: &Reads, case: &Case, check: BatchCheck) -> Result<()
         .file("post.ssz_snappy")
         .map(|p| decode_state::<E>(reads, p))
         .transpose()?;
-    check_config(reads, case, &state)?;
+    check_same_config::<E>(reads, case, state.fork.epoch)?;
     // Read every block first: a block that does not decode is a verdict, not a runner error.
     let mut blocks = Vec::with_capacity(count);
     for i in 0..count {
@@ -278,6 +277,19 @@ fn expect_blocks<E: Preset>(
         (None, None) => Err(format!(
             "applied all {count} blocks, but the vector expects the last one to fail"
         )),
+        // The transition of the last block made a post-state with another root than the
+        // block's. `state` holds that post-state, so name its fields that differ from the
+        // post-state of the vector.
+        (
+            Some((i, failure @ BlockFailure::Transition(StfError::StateRootMismatch { .. }))),
+            Some(post),
+        ) if i + 1 == count => {
+            state_root(state).map_err(|e| format!("post-state root: {e}"))?;
+            Err(format!(
+                "block {i} {failure}; fields that differ: {}",
+                state_field_diff(state, &post).join(", ")
+            ))
+        }
         (Some((i, failure @ BlockFailure::Runner(_))), _) | (Some((i, failure)), Some(_)) => {
             Err(format!("block {i} {failure}"))
         }
@@ -297,43 +309,6 @@ fn expect_blocks<E: Preset>(
     }
 }
 
-/// Checks the `config.yaml` of a case of blocks, if it has one, against the config values
-/// that the transition reads: [`config_values`] of the epoch steps, `PRESET_BASE`,
-/// `CAPELLA_FORK_VERSION`, `SHARD_COMMITTEE_PERIOD`, and `GLOAS_FORK_EPOCH`, which `get_ptc`
-/// reads as `state.fork.epoch` of the pre-state. Another value fails the case. The fork
-/// versions are hex integers in YAML (`0x00000001`).
-fn check_config<E: Preset>(reads: &Reads, case: &Case, pre: &BeaconState<E>) -> Result<(), String> {
-    let Some(path) = case.file("config.yaml") else {
-        return Ok(());
-    };
-    let config = fixture::load(reads, path)?;
-    let preset = &case.key.preset;
-    let base = fixture::field(&config, "PRESET_BASE").map_err(|e| format!("config.yaml: {e}"))?;
-    if base.as_str() != Some(preset) {
-        return Err(format!(
-            "config.yaml sets PRESET_BASE to {base:?}, but the case is {preset}"
-        ));
-    }
-    let bls = bls_context(preset, &BlsOff)?;
-    let block_values = [
-        (
-            "CAPELLA_FORK_VERSION",
-            u64::from(u32::from_be_bytes(bls.capella_fork_version)),
-        ),
-        ("SHARD_COMMITTEE_PERIOD", E::SHARD_COMMITTEE_PERIOD),
-        ("GLOAS_FORK_EPOCH", pre.fork.epoch),
-    ];
-    for (name, want) in config_values::<E>(&bls).into_iter().chain(block_values) {
-        let got = fixture::field(&config, name).map_err(|e| format!("config.yaml: {e}"))?;
-        if got.as_i64().and_then(|v| u64::try_from(v).ok()) != Some(want) {
-            return Err(format!(
-                "config.yaml sets {name} to {got:?}, but the runner uses {want}"
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// A `BeaconState` from a `.ssz_snappy` file.
 fn decode_state<E: Preset>(reads: &Reads, path: &Path) -> Result<BeaconState<E>, String> {
     let bytes = fixture::ssz_snappy(reads, path)?;
@@ -343,6 +318,7 @@ fn decode_state<E: Preset>(reads: &Reads, path: &Path) -> Result<BeaconState<E>,
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::config::tests::config_yaml;
     use crate::plan::{CaseFile, CaseKey};
     use consensus_types::common::PendingConsolidation;
     use consensus_types::gloas::*;
@@ -694,25 +670,11 @@ pub(crate) mod tests {
         (c, result)
     }
 
-    /// A `config.yaml` with every value that [`check_config`] compares, as the minimal
-    /// config has them, and `GLOAS_FORK_EPOCH: 0`. `replace` changes one line.
+    /// A minimal `config.yaml` with one line changed by `replace`.
     fn config(replace: Option<(&str, &str)>) -> Vec<u8> {
-        let bls = bls_context("minimal", &BlsOff).unwrap();
-        let mut lines = vec!["PRESET_BASE: 'minimal'".to_owned()];
-        for (name, value) in config_values::<Minimal>(&bls) {
-            lines.push(format!("{name}: {value}"));
-        }
-        lines.push("CAPELLA_FORK_VERSION: 0x03000001".into());
-        lines.push("SHARD_COMMITTEE_PERIOD: 64".into());
-        lines.push("GLOAS_FORK_EPOCH: 0".into());
-        if let Some((name, value)) = replace {
-            let line = lines
-                .iter_mut()
-                .find(|l| l.starts_with(&format!("{name}:")))
-                .unwrap();
-            *line = format!("{name}: {value}");
-        }
-        (lines.join("\n") + "\n").into_bytes()
+        let replace: Vec<(&str, Option<&str>)> =
+            replace.into_iter().map(|(n, v)| (n, Some(v))).collect();
+        config_yaml::<Minimal>("minimal", &replace).into_bytes()
     }
 
     #[test]
@@ -806,6 +768,26 @@ pub(crate) mod tests {
         let failure = Some((0, BlockFailure::Runner("verdicts differ".into())));
         let err = expect_blocks(&c, 1, failure, &mut pre.clone(), None).unwrap_err();
         assert!(err.contains("verdicts differ"), "{err}");
+    }
+
+    /// One block whose state root does not agree with the post-state that the transition
+    /// makes: the error names the fields that differ from the post-state of the vector.
+    #[test]
+    fn a_state_root_mismatch_names_the_fields_that_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = blocks_case(dir.path(), "sanity", "blocks", &[]);
+        let mismatch = StfError::StateRootMismatch {
+            block: Root::ZERO,
+            computed: Root::repeat_byte(1),
+        };
+        let failure = Some((0, BlockFailure::Transition(mismatch.clone())));
+        let err = expect_blocks(&c, 1, failure, &mut state(2), Some(state(3))).unwrap_err();
+        assert!(err.contains("block 0 state_transition failed"), "{err}");
+        assert!(err.ends_with("fields that differ: slot"), "{err}");
+        // A mismatch of a block before the last one is not compared with the post-state.
+        let failure = Some((0, BlockFailure::Transition(mismatch)));
+        let err = expect_blocks(&c, 2, failure, &mut state(2), Some(state(3))).unwrap_err();
+        assert!(!err.contains("fields that differ"), "{err}");
     }
 
     #[test]

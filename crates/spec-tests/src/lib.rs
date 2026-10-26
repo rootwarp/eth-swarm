@@ -15,15 +15,19 @@
 //!   `state_transition::state_transition`), [`finality`] (`<preset>/gloas/finality` with the
 //!   blocks runner of [`sanity`]), [`operations`] (`<preset>/gloas/operations` through
 //!   `state_transition::per_block`, with the in-process BLS backend of [`bls_backend`]),
-//!   [`shuffling`] (`<preset>/phase0/shuffling/core` through `state_transition::caches`) and
+//!   [`shuffling`] (`<preset>/phase0/shuffling/core` through `state_transition::caches`),
 //!   [`epoch_processing`] (`<preset>/gloas/epoch_processing` through
-//!   `state_transition::per_epoch`).
+//!   `state_transition::per_epoch`), [`rewards`] (`<preset>/gloas/rewards` through the delta
+//!   functions of `state_transition::per_epoch`) and [`random`] (`<preset>/gloas/random` with
+//!   the blocks runner of [`sanity`]).
+//! - [`config`]: the one check of the `config.yaml` of a state-transition case.
 //! - [`bls_backend`]: the one in-process BLS context (signature verdicts, pubkey aggregation
 //!   and the genesis fork version) of the operations, epoch processing and sanity runners.
 
 pub mod bls;
 pub mod bls_backend;
 pub mod check;
+pub mod config;
 pub mod coverage;
 pub mod epoch_processing;
 pub mod finality;
@@ -32,6 +36,8 @@ pub mod kzg;
 pub mod networking;
 pub mod operations;
 pub mod plan;
+pub mod random;
+pub mod rewards;
 pub mod sanity;
 pub mod shuffling;
 pub mod ssz_generic;

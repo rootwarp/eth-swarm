@@ -20,8 +20,8 @@
 //! - `meta.yaml` with `bls_setting`: 0, 1 or no value checks the deposit signatures, and 2
 //!   turns BLS off ([`crate::bls_backend::BlsOff`]).
 //! - `config.yaml`, which replaces the config of the preset. The transition takes its config
-//!   values from the preset, so each value that it reads ([`config_values`]) must be the
-//!   value of the case. Another value fails the case.
+//!   values from the preset, so [`check_same_config`] requires each value that it reads to
+//!   be the value of the case. Another value fails the case.
 //!
 //! Most cases also hold `pre_epoch.ssz_snappy` and `post_epoch.ssz_snappy`: the state before
 //! and after the whole `process_epoch`. The runner checks them as the step: `process_epoch` on
@@ -31,6 +31,7 @@
 
 use crate::bls_backend::{backend_for, bls_context, bls_setting, Bls, StateKeys};
 use crate::check::state_field_diff;
+use crate::config::check_same_config;
 use crate::coverage::Reads;
 use crate::fixture;
 use crate::plan::{Case, CaseKey};
@@ -54,10 +55,6 @@ use state_transition::per_epoch::resets::{
 use state_transition::per_epoch::{
     process_epoch, process_inactivity_updates, process_justification_and_finalization,
     process_rewards_and_penalties,
-};
-use state_transition::preset::{
-    EJECTION_BALANCE, INACTIVITY_SCORE_BIAS, INACTIVITY_SCORE_RECOVERY_RATE,
-    MIN_VALIDATOR_WITHDRAWABILITY_DELAY,
 };
 use state_transition::{state_root, BlsContext, Preset, StfError};
 use std::path::Path;
@@ -149,7 +146,7 @@ fn run_step<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
     let setting = bls_setting(reads, case)?;
     let keys = StateKeys::new(&state);
     let bls = bls_context(&case.key.preset, backend_for(setting, &keys))?;
-    check_config::<E>(reads, case, &bls)?;
+    check_same_config::<E>(reads, case, state.fork.epoch)?;
     let result = step(&mut state, &bls);
     check_outcome(case, handler, result, &mut state, post)?;
     whole_epoch::<E>(reads, case, setting)
@@ -212,62 +209,6 @@ fn check_outcome<E: Preset>(
     }
 }
 
-/// The config values that the transition reads, with the values of the config of preset
-/// `E`, which is also the config of the vectors: `configs/{minimal,mainnet}.yaml`.
-pub fn config_values<E: Preset>(bls: &BlsContext) -> [(&'static str, u64); 10] {
-    [
-        (
-            "GENESIS_FORK_VERSION",
-            u64::from(u32::from_be_bytes(bls.genesis_fork_version)),
-        ),
-        ("EJECTION_BALANCE", EJECTION_BALANCE),
-        (
-            "MIN_VALIDATOR_WITHDRAWABILITY_DELAY",
-            MIN_VALIDATOR_WITHDRAWABILITY_DELAY,
-        ),
-        ("INACTIVITY_SCORE_BIAS", INACTIVITY_SCORE_BIAS),
-        (
-            "INACTIVITY_SCORE_RECOVERY_RATE",
-            INACTIVITY_SCORE_RECOVERY_RATE,
-        ),
-        (
-            "MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA",
-            E::MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA,
-        ),
-        ("CHURN_LIMIT_QUOTIENT_GLOAS", E::CHURN_LIMIT_QUOTIENT_GLOAS),
-        (
-            "CONSOLIDATION_CHURN_LIMIT_QUOTIENT",
-            E::CONSOLIDATION_CHURN_LIMIT_QUOTIENT,
-        ),
-        (
-            "MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS",
-            E::MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS,
-        ),
-        (
-            "MIN_BUILDER_WITHDRAWABILITY_DELAY",
-            E::MIN_BUILDER_WITHDRAWABILITY_DELAY,
-        ),
-    ]
-}
-
-/// `Err` unless the `config.yaml` of the case (if any) has the [`config_values`] of `E`.
-/// The fork versions are hex integers in YAML (`0x00000001`).
-fn check_config<E: Preset>(reads: &Reads, case: &Case, bls: &BlsContext) -> Result<(), String> {
-    let Some(path) = case.file("config.yaml") else {
-        return Ok(());
-    };
-    let config = fixture::load(reads, path)?;
-    for (name, want) in config_values::<E>(bls) {
-        let got = fixture::field(&config, name).map_err(|e| format!("config.yaml: {e}"))?;
-        if got.as_i64().and_then(|v| u64::try_from(v).ok()) != Some(want) {
-            return Err(format!(
-                "config.yaml sets {name} to {got:?}, but the runner uses {want}"
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// A `BeaconState` from a `.ssz_snappy` file.
 fn decode_state<E: Preset>(reads: &Reads, path: &Path) -> Result<BeaconState<E>, String> {
     let bytes = fixture::ssz_snappy(reads, path)?;
@@ -278,6 +219,7 @@ fn decode_state<E: Preset>(reads: &Reads, path: &Path) -> Result<BeaconState<E>,
 mod tests {
     use super::*;
     use crate::bls_backend::BlsOff;
+    use crate::config::tests::config_yaml;
     use crate::plan::{CaseFile, Date};
     use crate::sanity::tests::state;
     use crate::suite::{self, Config, SuiteError};
@@ -467,44 +409,33 @@ mod tests {
         case
     }
 
-    /// The config values that the transition reads, as `configs/minimal.yaml` writes them.
-    const MINIMAL_CONFIG: &str = "GENESIS_FORK_VERSION: 0x00000001\n\
-        GLOAS_FORK_EPOCH: 0\n\
-        EJECTION_BALANCE: 16000000000\n\
-        MIN_VALIDATOR_WITHDRAWABILITY_DELAY: 256\n\
-        INACTIVITY_SCORE_BIAS: 4\n\
-        INACTIVITY_SCORE_RECOVERY_RATE: 16\n\
-        MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA: 64000000000\n\
-        CHURN_LIMIT_QUOTIENT_GLOAS: 16\n\
-        CONSOLIDATION_CHURN_LIMIT_QUOTIENT: 32\n\
-        MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS: 128000000000\n\
-        MIN_BUILDER_WITHDRAWABILITY_DELAY: 2\n";
-
     #[test]
     fn a_case_config_must_match_the_config_of_the_preset() {
         let dir = tempfile::tempdir().unwrap();
         let pre = state_at(2);
         let mut post = pre.clone();
         process_justification_and_finalization(&mut post).unwrap();
-        let c = case(dir.path(), "minimal", HANDLER, &pre, Some(&post));
-        let c = with_file(c, dir.path(), "config.yaml", MINIMAL_CONFIG);
+        let with_config = |text: &str| {
+            let c = case(dir.path(), "minimal", HANDLER, &pre, Some(&post));
+            with_file(c, dir.path(), "config.yaml", text)
+        };
+        let c = with_config(&config_yaml::<Minimal>("minimal", &[]));
         let reads = Reads::default();
         assert_eq!(run(&reads, &c), Ok(()));
         assert!(c.files.iter().all(|f| reads.contains(&f.path)));
-        // Another value of a config field that the transition reads fails the case.
-        let other = MINIMAL_CONFIG.replace("EJECTION_BALANCE: 16000000000", "EJECTION_BALANCE: 1");
-        let c = case(dir.path(), "minimal", HANDLER, &pre, Some(&post));
-        let c = with_file(c, dir.path(), "config.yaml", &other);
-        let err = run(&Reads::default(), &c).unwrap_err();
-        assert!(err.contains("EJECTION_BALANCE"), "{err}");
-        let other = MINIMAL_CONFIG.replace("0x00000001", "0x00000002");
-        let c = case(dir.path(), "minimal", HANDLER, &pre, Some(&post));
-        let c = with_file(c, dir.path(), "config.yaml", &other);
-        let err = run(&Reads::default(), &c).unwrap_err();
-        assert!(err.contains("GENESIS_FORK_VERSION"), "{err}");
+        // Another value of a config field that the transition reads fails the case, and so
+        // does a GLOAS_FORK_EPOCH that is not the fork epoch of the pre-state.
+        for (name, value) in [
+            ("EJECTION_BALANCE", "1"),
+            ("GENESIS_FORK_VERSION", "0x00000002"),
+            ("GLOAS_FORK_EPOCH", "1"),
+        ] {
+            let c = with_config(&config_yaml::<Minimal>("minimal", &[(name, Some(value))]));
+            let err = run(&Reads::default(), &c).unwrap_err();
+            assert!(err.contains(name), "{err}");
+        }
         // A config without one of the fields fails too.
-        let c = case(dir.path(), "minimal", HANDLER, &pre, Some(&post));
-        let c = with_file(c, dir.path(), "config.yaml", "PRESET_BASE: 'minimal'\n");
+        let c = with_config("PRESET_BASE: 'minimal'\n");
         assert!(run(&Reads::default(), &c).unwrap_err().contains("missing"));
     }
 

@@ -5,8 +5,8 @@
 use crate::coverage::{self, CaseShape, Guard, Layout, Reads, Slot};
 use crate::plan::{plan, Case, CaseKey, Date, Disposition, Scope, SkipList, COMPTESTS_PRESETS};
 use crate::{
-    bls, epoch_processing, finality, fixture, kzg, networking, operations, sanity, shuffling,
-    ssz_generic, ssz_static,
+    bls, epoch_processing, finality, fixture, kzg, networking, operations, random, rewards, sanity,
+    shuffling, ssz_generic, ssz_static,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -88,6 +88,10 @@ const fn consensus(
 /// Every set the runner knows. Without `SPEC_SETS`, ssz-specs and minimal are required and
 /// the rest are scanned when extracted.
 ///
+/// `minimal` and `mainnet` must hold the trees of each runner that no skip entry may reach:
+/// `ssz_static`, `phase0/shuffling` and the Gloas state-transition runners. Without these
+/// subtrees, a missing tree would pass setup and run no trial.
+///
 /// `general` at v1.7.0-beta.4 holds only `altair/bls`, which is its scope.
 ///
 /// `comptests` is consensus-specs `comptests.tar.gz`: the `fork_choice_compliance` vectors
@@ -137,6 +141,12 @@ pub const SETS: [VectorSet; 7] = [
             "tests/minimal/fulu/ssz_static",
             "tests/minimal/gloas/ssz_static",
             "tests/minimal/phase0/shuffling",
+            "tests/minimal/gloas/sanity",
+            "tests/minimal/gloas/epoch_processing",
+            "tests/minimal/gloas/operations",
+            "tests/minimal/gloas/finality",
+            "tests/minimal/gloas/rewards",
+            "tests/minimal/gloas/random",
         ],
     ),
     consensus(
@@ -147,6 +157,12 @@ pub const SETS: [VectorSet; 7] = [
             "tests/mainnet/fulu/ssz_static",
             "tests/mainnet/gloas/ssz_static",
             "tests/mainnet/phase0/shuffling",
+            "tests/mainnet/gloas/sanity",
+            "tests/mainnet/gloas/epoch_processing",
+            "tests/mainnet/gloas/operations",
+            "tests/mainnet/gloas/finality",
+            "tests/mainnet/gloas/rewards",
+            "tests/mainnet/gloas/random",
         ],
     ),
     VectorSet {
@@ -471,6 +487,8 @@ enum Kind {
     Shuffling,
     EpochProcessing,
     Finality,
+    Rewards,
+    Random,
 }
 
 /// The runner for a case, or `None` if nothing in this crate runs it.
@@ -524,6 +542,12 @@ fn kind(case: &Case) -> Option<Kind> {
         ("consensus-specs", "finality") if finality::supported(&k.fork, &k.preset, &k.handler) => {
             Some(Kind::Finality)
         }
+        ("consensus-specs", "rewards") if rewards::supported(&k.fork, &k.preset, &k.handler) => {
+            Some(Kind::Rewards)
+        }
+        ("consensus-specs", "random") if random::supported(&k.fork, &k.preset, &k.handler) => {
+            Some(Kind::Random)
+        }
         _ => None,
     }
 }
@@ -570,6 +594,14 @@ impl Kind {
             Kind::Finality => {
                 consensus_manifest(reads, case)?;
                 finality::run(reads, case)
+            }
+            Kind::Rewards => {
+                consensus_manifest(reads, case)?;
+                rewards::run(reads, case)
+            }
+            Kind::Random => {
+                consensus_manifest(reads, case)?;
+                random::run(reads, case)
             }
         }
     }

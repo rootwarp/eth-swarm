@@ -4,12 +4,14 @@
 //! - [`StateKeys`] is the one in-process [`SignatureBackend`]. It takes the validator and
 //!   builder keys of one state, and resolves each [`SignerRef`] of a set to its key there.
 //!   An inline key (a deposit) is in the set itself. The builder key `version` is not
-//!   checked: all keys come from the same state. A set with a signer outside the state has
-//!   no verdict (`BackendError`). A key or a signature that does not decode makes the set
-//!   invalid (`Ok(false)`), as the spec's `bls.Verify` and `bls.FastAggregateVerify` return
-//!   `False` for it.
+//!   checked: all keys come from the same state. A key or a signature that does not decode
+//!   makes the set invalid (`Ok(false)`), as the spec's `bls.Verify` and
+//!   `bls.FastAggregateVerify` return `False` for it. Else, a set with a signer outside the
+//!   state has no verdict (`BackendError`).
 //! - [`BatchKeys`] checks all the sets of one call in one `crypto_bls::verify_batch`, and
-//!   [`StateKeys::verify_each`] checks each set alone. Both give the same verdict.
+//!   [`StateKeys::verify_each`] checks each set alone. Both give the same verdict, with the
+//!   same precedence across the sets: a set that does not decode gives `Ok(false)`, else a
+//!   signer outside the state gives `BackendError`.
 //! - [`BlsOff`] finds every set valid, as the spec does with BLS off (`bls_setting: 2`).
 //! - [`BlsAggregator`] is `eth_aggregate_pubkeys` for the next sync committee.
 //! - [`bls_context`] puts a backend, the aggregator, and the `GENESIS_FORK_VERSION`, the
@@ -61,56 +63,92 @@ impl StateKeys {
             .ok_or_else(|| BackendError(format!("unknown signer {signer:?}")))
     }
 
-    /// The decoded keys and signature of `set`. `Err` if a signer is not in the state, and
-    /// `Ok(None)` if a key or the signature does not decode (an invalid set). The lookup of
-    /// every signer comes first, so an unknown signer always gives `Err`.
-    fn decode(&self, set: &SignatureSet) -> Result<Option<Decoded>, BackendError> {
-        let raw = set
-            .signers()
-            .iter()
-            .map(|signer| self.key(signer))
-            .collect::<Result<Vec<_>, _>>()?;
-        let Ok(keys) = raw
-            .iter()
-            .map(PublicKey::from_validated_bytes)
-            .collect::<Result<Vec<_>, _>>()
-        else {
-            return Ok(None);
-        };
+    /// The decoded keys and signature of `set`.
+    ///
+    /// A key or a signature that does not decode makes the set invalid, whatever its other
+    /// signers are, as the spec's `bls.Verify` and `bls.FastAggregateVerify` return `False`
+    /// for it. Thus the lookup error of a signer outside the state counts only when the
+    /// available keys and the signature decode.
+    fn decode(&self, set: &SignatureSet) -> Decode {
+        let mut unknown = None;
+        let mut keys = Vec::with_capacity(set.signers().len());
+        for signer in set.signers() {
+            match self.key(signer) {
+                Ok(raw) => match PublicKey::from_validated_bytes(&raw) {
+                    Ok(key) => keys.push(key),
+                    Err(_) => return Decode::Invalid,
+                },
+                Err(e) => {
+                    unknown.get_or_insert(e);
+                }
+            }
+        }
         let Ok(signature) = Signature::from_validated_bytes(set.signature()) else {
-            return Ok(None);
+            return Decode::Invalid;
         };
-        Ok(Some(Decoded {
-            keys,
-            message: set.signing_root(),
-            signature,
-        }))
+        match unknown {
+            Some(e) => Decode::Unknown(e),
+            None => Decode::Ok(Box::new(Decoded {
+                keys,
+                message: set.signing_root(),
+                signature,
+            })),
+        }
+    }
+
+    /// The decoded sets of `sets`. `Ok(None)` if a set does not decode, and then the other
+    /// sets do not matter. Else `Err` if a set has a signer outside the state.
+    fn decode_all(&self, sets: &[SignatureSet]) -> Result<Option<Vec<Decoded>>, BackendError> {
+        let mut decoded = Vec::with_capacity(sets.len());
+        let mut unknown = None;
+        for set in sets {
+            match self.decode(set) {
+                Decode::Ok(set) => decoded.push(*set),
+                Decode::Invalid => return Ok(None),
+                Decode::Unknown(e) => {
+                    unknown.get_or_insert(e);
+                }
+            }
+        }
+        match unknown {
+            Some(e) => Err(e),
+            None => Ok(Some(decoded)),
+        }
     }
 
     fn verify_set(&self, set: &SignatureSet) -> Result<bool, BackendError> {
-        let Some(set) = self.decode(set)? else {
-            return Ok(false);
-        };
-        let message = set.message.as_slice();
-        Ok(match set.keys.as_slice() {
-            [key] => verify(key, message, &set.signature),
-            many => {
-                let refs: Vec<&PublicKey> = many.iter().collect();
-                eth_fast_aggregate_verify(&refs, message, &set.signature)
-            }
-        })
+        match self.decode(set) {
+            Decode::Ok(set) => Ok(set.verify()),
+            Decode::Invalid => Ok(false),
+            Decode::Unknown(e) => Err(e),
+        }
     }
 
-    /// The verdict of each set alone: `Err` if a set has no verdict, else `Ok(true)` only if
-    /// every set is valid. Each set gets its own check, so the order of the sets does not
-    /// change the verdict. [`BatchKeys`] gives the same verdict in one batch.
+    /// The verdict of each set alone: `Ok(false)` if a set does not decode, else `Err` if a
+    /// set has a signer outside the state, else `Ok(true)` only if every set is valid. Each
+    /// set gets its own check, so the order of the sets does not change the verdict.
+    /// [`BatchKeys`] gives the same verdict in one batch.
     pub fn verify_each(&self, sets: &[SignatureSet]) -> Result<bool, BackendError> {
+        let Some(decoded) = self.decode_all(sets)? else {
+            return Ok(false);
+        };
         let mut valid = true;
-        for set in sets {
-            valid &= self.verify_set(set)?;
+        for set in &decoded {
+            valid &= set.verify();
         }
         Ok(valid)
     }
+}
+
+/// The result of the decode of one set.
+enum Decode {
+    /// The keys and the signature decode, and every signer is in the state.
+    Ok(Box<Decoded>),
+    /// A key or the signature does not decode: the set is invalid.
+    Invalid,
+    /// The keys and the signature that are available decode, but a signer is not in the
+    /// state: the set has no verdict.
+    Unknown(BackendError),
 }
 
 /// The keys, the message and the signature of one set, decoded.
@@ -120,26 +158,32 @@ struct Decoded {
     signature: Signature,
 }
 
+impl Decoded {
+    /// `bls.Verify` for one key, else `eth_fast_aggregate_verify`.
+    fn verify(&self) -> bool {
+        let message = self.message.as_slice();
+        match self.keys.as_slice() {
+            [key] => verify(key, message, &self.signature),
+            many => {
+                let refs: Vec<&PublicKey> = many.iter().collect();
+                eth_fast_aggregate_verify(&refs, message, &self.signature)
+            }
+        }
+    }
+}
+
 /// The keys of one state, checked in one `crypto_bls::verify_batch` call: a random linear
 /// combination of all the sets with 64-bit non-zero randomizers, as cl-verify checks the
-/// sets of a block. A signer outside the state gives `BackendError`, as for
-/// [`StateKeys`]. A key or a signature that does not decode makes the batch invalid
-/// (`Ok(false)`). No sets is valid, as for [`StateKeys`].
+/// sets of a block. A key or a signature that does not decode makes the batch invalid
+/// (`Ok(false)`). Else, a signer outside the state gives `BackendError`, as for
+/// [`StateKeys::verify_each`]. No sets is valid, as for [`StateKeys`].
 pub struct BatchKeys<'a>(pub &'a StateKeys);
 
 impl SignatureBackend for BatchKeys<'_> {
     fn verify_signature_sets(&self, sets: &[SignatureSet]) -> Result<bool, BackendError> {
-        let mut decoded = Vec::with_capacity(sets.len());
-        let mut decodes = true;
-        for set in sets {
-            match self.0.decode(set)? {
-                Some(set) => decoded.push(set),
-                None => decodes = false,
-            }
-        }
-        if !decodes {
+        let Some(decoded) = self.0.decode_all(sets)? else {
             return Ok(false);
-        }
+        };
         if decoded.is_empty() {
             return Ok(true);
         }
@@ -417,6 +461,9 @@ pub(crate) mod tests {
         assert_eq!(batch.verify_signature_sets(&[]), Ok(true));
         assert_eq!(keys.verify_each(&[]), Ok(true));
         assert_eq!(batch.verify_signature_sets(&valid), Ok(true));
+        // The sets that do not decode: an undecodable signature and an undecodable key. The
+        // wrong signer and the infinity signature decode.
+        let undecodable = [&invalid[1], &invalid[3]];
         for bad in &invalid {
             // The invalid set at each position of the batch.
             for at in 0..=valid.len() {
@@ -425,15 +472,48 @@ pub(crate) mod tests {
                 assert_eq!(batch.verify_signature_sets(&sets), Ok(false), "{bad:?}");
                 assert_eq!(keys.verify_each(&sets), Ok(false), "{bad:?}");
             }
-            // An unknown signer gives no verdict, before or after an invalid set.
+            // With an unknown signer in another set, a set that does not decode is invalid
+            // whatever the unknown key is. A set that decodes gives no verdict.
             for sets in [
                 [bad.clone(), unknown.clone()],
                 [unknown.clone(), bad.clone()],
             ] {
-                assert!(batch.verify_signature_sets(&sets).is_err());
-                assert!(keys.verify_each(&sets).is_err());
+                if undecodable.contains(&bad) {
+                    assert_eq!(batch.verify_signature_sets(&sets), Ok(false), "{bad:?}");
+                    assert_eq!(keys.verify_each(&sets), Ok(false), "{bad:?}");
+                } else {
+                    assert!(batch.verify_signature_sets(&sets).is_err());
+                    assert!(keys.verify_each(&sets).is_err());
+                }
             }
         }
+        // A key that does not decode and an unknown signer in one set, in both orders: the
+        // set is invalid, not without a verdict.
+        for signers in [
+            vec![SignerRef::Inline([0x01; 48]), SignerRef::Validator(1)],
+            vec![SignerRef::Validator(1), SignerRef::Inline([0x01; 48])],
+        ] {
+            let set = SignatureSet::aggregate(signers, root, sig(1).to_bytes()).unwrap();
+            let sets = std::slice::from_ref(&set);
+            assert_eq!(batch.verify_signature_sets(sets), Ok(false), "{set:?}");
+            assert_eq!(keys.verify_each(sets), Ok(false), "{set:?}");
+            assert_eq!(keys.verify_signature_sets(sets), Ok(false), "{set:?}");
+        }
+        // A signature that does not decode and an unknown signer: also invalid.
+        let set = SignatureSet::single(SignerRef::Validator(1), root, [0x01; 96]);
+        let sets = std::slice::from_ref(&set);
+        assert_eq!(batch.verify_signature_sets(sets), Ok(false));
+        assert_eq!(keys.verify_each(sets), Ok(false));
+        // An unknown signer with a key and a signature that decode gives no verdict.
+        let set = SignatureSet::aggregate(
+            vec![SignerRef::Validator(0), SignerRef::Validator(1)],
+            root,
+            sig(1).to_bytes(),
+        )
+        .unwrap();
+        let sets = std::slice::from_ref(&set);
+        assert!(batch.verify_signature_sets(sets).is_err());
+        assert!(keys.verify_each(sets).is_err());
         assert_eq!(keys.verify_each(&valid), Ok(true));
     }
 

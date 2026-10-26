@@ -18,7 +18,7 @@
 //! `process_randao`.
 //!
 //! The `payload_attestation` cases also carry `config.yaml`, which [`check_config`] compares
-//! with the values that the runner and the transition use.
+//! with the values that the runner and the transition use ([`crate::config`]).
 //!
 //! The `withdrawals` handler calls the Gloas `process_withdrawals(state)`, which takes the
 //! state only, so its cases have no operation file. A `withdrawals` case without
@@ -35,10 +35,8 @@
 //! `MAX_*_REQUESTS_PER_PAYLOAD` does not decode; [`parent_payload_block`] gives the verdict
 //! of the count assert for it.
 
-use crate::bls_backend::{
-    backend_for, bls_context, bls_setting, capella_fork_version, genesis_fork_version, Bls,
-    StateKeys,
-};
+use crate::bls_backend::{backend_for, bls_context, bls_setting, Bls, StateKeys};
+use crate::config::{self, ForkEpoch};
 use crate::coverage::Reads;
 use crate::fixture;
 use crate::plan::Case;
@@ -144,10 +142,7 @@ fn operation<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
         .map(|p| decode::<BeaconState<E>>(reads, p))
         .transpose()?;
     let bls = bls_setting(reads, case)?;
-    let mut fork_epoch_differs = false;
-    if let Some(path) = case.file("config.yaml") {
-        fork_epoch_differs = check_config(reads, path, case, &state)?;
-    }
+    let fork_epoch_differs = check_config::<E>(reads, case, &state)?;
     let outcome = match (case.key.runner.as_str(), case.key.handler.as_str()) {
         ("operations", "block_header") => {
             let block = decode::<BeaconBlock<E>>(reads, file("block.ssz_snappy")?)?;
@@ -328,19 +323,10 @@ fn cross_epoch_outcome(outcome: Result<(), StfError>) -> Result<Result<(), StfEr
     }
 }
 
-/// Checks the `config.yaml` of a case (the pyspec writes one for the tests that need the
-/// config of the preset) against the values that the runner and the transition keep:
-///
-/// - `PRESET_BASE` is the preset of the case.
-/// - `GENESIS_FORK_VERSION` is [`genesis_fork_version`].
-/// - `CAPELLA_FORK_VERSION` is [`capella_fork_version`], the domain of the voluntary exits.
-/// - `SHARD_COMMITTEE_PERIOD` is `E::SHARD_COMMITTEE_PERIOD`, which the voluntary exits and
-///   the consolidation requests read.
-/// - `GLOAS_FORK_EPOCH` is `state.fork.epoch` of the pre-state, which `get_ptc` reads as the
-///   Gloas fork epoch. Only [`CROSS_EPOCH_WRONG_DOMAIN`] has two epochs that differ, and then
-///   the result is `Ok(true)`.
-///
-/// A case that overrides one of these values fails with a config message.
+/// Checks the `config.yaml` of a case, if it has one, with [`config::check_config`]. The
+/// result is `Ok(true)` only for [`CROSS_EPOCH_WRONG_DOMAIN`], the one case whose
+/// `GLOAS_FORK_EPOCH` differs from `state.fork.epoch` of the pre-state. Another case with
+/// two epochs that differ fails, and so does that case with two epochs that agree.
 ///
 /// [`CROSS_EPOCH_WRONG_DOMAIN`] sets `state.fork.epoch` to 1 under a `GLOAS_FORK_EPOCH` of
 /// 0, to give its two epochs different fork versions. Thus `get_ptc` refuses the slot of
@@ -349,49 +335,19 @@ fn cross_epoch_outcome(outcome: Result<(), StfError>) -> Result<Result<(), StfEr
 /// the case is a property of the vector, not of a live network.
 fn check_config<E: Preset>(
     reads: &Reads,
-    path: &Path,
     case: &Case,
     state: &BeaconState<E>,
 ) -> Result<bool, String> {
-    let preset = case.key.preset.as_str();
-    let config = fixture::load(reads, path)?;
-    let wrong = |key: &str, value: &Yaml| format!("config.yaml: {key} is {value:?}");
-    let base = fixture::field(&config, "PRESET_BASE")?;
-    if base.as_str() != Some(preset) {
-        return Err(wrong("PRESET_BASE", base));
-    }
-    for (key, want) in [
-        ("GENESIS_FORK_VERSION", genesis_fork_version(preset)?),
-        ("CAPELLA_FORK_VERSION", capella_fork_version(preset)?),
-    ] {
-        // YAML reads the unquoted `0x` value as an integer.
-        let version = fixture::field(&config, key)?;
-        let parsed = version.as_i64().and_then(|v| u32::try_from(v).ok());
-        if parsed.map(u32::to_be_bytes) != Some(want) {
-            return Err(wrong(key, version));
-        }
-    }
-    let period = fixture::field(&config, "SHARD_COMMITTEE_PERIOD")?;
-    if period.as_i64().and_then(|v| u64::try_from(v).ok()) != Some(E::SHARD_COMMITTEE_PERIOD) {
-        return Err(wrong("SHARD_COMMITTEE_PERIOD", period));
-    }
-    let value = fixture::field(&config, "GLOAS_FORK_EPOCH")?;
-    let epoch = value
-        .as_i64()
-        .and_then(|v| u64::try_from(v).ok())
-        .ok_or_else(|| wrong("GLOAS_FORK_EPOCH", value))?;
+    let fork_epoch = state.fork.epoch;
     match (
-        epoch != state.fork.epoch,
+        config::check_config::<E>(reads, case, fork_epoch)?,
         case.key.case == CROSS_EPOCH_WRONG_DOMAIN,
     ) {
-        (false, false) => Ok(false),
-        (true, true) => Ok(true),
-        (true, false) => Err(format!(
-            "config.yaml: GLOAS_FORK_EPOCH is {epoch}, but the pre-state has fork.epoch {}",
-            state.fork.epoch
-        )),
-        (false, true) => Err(format!(
-            "the pre-state fork.epoch must differ from GLOAS_FORK_EPOCH {epoch} in this case"
+        (ForkEpoch::Same, false) => Ok(false),
+        (ForkEpoch::Differs(_), true) => Ok(true),
+        (ForkEpoch::Differs(epoch), false) => Err(config::fork_epoch_differs(epoch, fork_epoch)),
+        (ForkEpoch::Same, true) => Err(format!(
+            "the pre-state fork.epoch must differ from GLOAS_FORK_EPOCH {fork_epoch} in this case"
         )),
     }
 }
@@ -647,6 +603,7 @@ fn decode<T: Decode>(reads: &Reads, path: &Path) -> Result<T, String> {
 mod tests {
     use super::*;
     use crate::bls_backend::{capella_fork_version, genesis_fork_version};
+    use crate::config::tests::config_yaml;
     use crate::plan::{CaseFile, CaseKey, Date};
     use crate::sanity::tests::state;
     use crate::suite::{self, Config, SuiteError};
@@ -1637,12 +1594,16 @@ mod tests {
         }
     }
 
-    /// A `config.yaml` as the pyspec writes it: the keys that the runner checks, and keys
-    /// that it does not compare.
+    /// A minimal `config.yaml` with `PRESET_BASE` of `preset` and `GENESIS_FORK_VERSION`
+    /// `version`.
     fn config(preset: &str, version: &str) -> String {
-        format!(
-            "PRESET_BASE: '{preset}'\nGENESIS_FORK_VERSION: {version}\n\
-             CAPELLA_FORK_VERSION: 0x03000001\nGLOAS_FORK_EPOCH: 0\nSHARD_COMMITTEE_PERIOD: 64\n"
+        let base = format!("'{preset}'");
+        config_yaml::<Minimal>(
+            "minimal",
+            &[
+                ("PRESET_BASE", Some(&base)),
+                ("GENESIS_FORK_VERSION", Some(version)),
+            ],
         )
     }
 
@@ -1742,47 +1703,6 @@ mod tests {
         }
     }
 
-    /// A `config.yaml` that overrides `CAPELLA_FORK_VERSION` or `SHARD_COMMITTEE_PERIOD`
-    /// fails with a config message.
-    #[test]
-    fn config_compares_capella_and_shard_committee_period() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        let c = case(dir.path(), "payload_attestation", &[]);
-        let pre = pre();
-        let check = |text: &str| {
-            std::fs::write(&path, text).unwrap();
-            check_config(&Reads::default(), &path, &c, &pre)
-        };
-        assert_eq!(check(&config("minimal", "0x00000001")), Ok(false));
-        let base = "PRESET_BASE: 'minimal'\nGENESIS_FORK_VERSION: 0x00000001\n";
-        for (text, want) in [
-            (
-                format!("{base}CAPELLA_FORK_VERSION: 0x03000000\nSHARD_COMMITTEE_PERIOD: 64\n"),
-                "CAPELLA_FORK_VERSION",
-            ),
-            (
-                format!("{base}SHARD_COMMITTEE_PERIOD: 64\n"),
-                "CAPELLA_FORK_VERSION",
-            ),
-            (
-                format!("{base}CAPELLA_FORK_VERSION: 0x03000001\nSHARD_COMMITTEE_PERIOD: 256\n"),
-                "SHARD_COMMITTEE_PERIOD",
-            ),
-            (
-                format!("{base}CAPELLA_FORK_VERSION: 0x03000001\nSHARD_COMMITTEE_PERIOD: -1\n"),
-                "SHARD_COMMITTEE_PERIOD",
-            ),
-            (
-                format!("{base}CAPELLA_FORK_VERSION: 0x03000001\n"),
-                "SHARD_COMMITTEE_PERIOD",
-            ),
-        ] {
-            let err = check(&text).unwrap_err();
-            assert!(err.contains(want), "{want}: {err}");
-        }
-    }
-
     #[test]
     fn gloas_fork_epoch_of_the_config() {
         use consensus_types::gloas::{PayloadAttestation, PayloadAttestationData};
@@ -1800,13 +1720,8 @@ mod tests {
             signature: [0x22; 96],
         };
         attestation.aggregation_bits.set(0, true).unwrap();
-        let config = |epoch: &str| {
-            format!(
-                "PRESET_BASE: 'minimal'\nGENESIS_FORK_VERSION: 0x00000001\n\
-                 CAPELLA_FORK_VERSION: 0x03000001\nSHARD_COMMITTEE_PERIOD: 64\n\
-                 GLOAS_FORK_EPOCH: {epoch}\n"
-            )
-        };
+        let config =
+            |epoch: &str| config_yaml::<Minimal>("minimal", &[("GLOAS_FORK_EPOCH", Some(epoch))]);
         let run_case = |name: &str, fork_epoch: u64, config: String| {
             let mut pre = pre();
             pre.fork.epoch = fork_epoch;

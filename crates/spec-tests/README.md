@@ -24,8 +24,12 @@ SPEC_SETS="ssz-specs minimal" cargo test -p spec-tests --release --test vectors
   `sanity/blocks` through `state_transition::state_transition` with the in-process BLS backend,
   post-state `hash_tree_root`; each block also checks that the batch verdict of its signature
   sets is the per-set verdict), `finality` (Gloas `finality` with the blocks runner of
-  `sanity`), `operations`, `epoch_processing` and `shuffling` (phase0 `shuffling/core`: the whole-list shuffle and the
-  per-index `compute_shuffled_index` must both equal `mapping`). consensus-spec-tests cases also have their `manifest.yaml` checked
+  `sanity`), `random` (Gloas `random` with the blocks runner of `sanity`, batch check on),
+  `rewards` (Gloas `rewards`: `get_flag_index_deltas` for the source, target and head flags
+  and `get_inactivity_penalty_deltas`, against each `*_deltas.ssz_snappy`), `operations`,
+  `epoch_processing` and `shuffling` (phase0 `shuffling/core`: the whole-list shuffle and the
+  per-index `compute_shuffled_index` must both equal `mapping`). The state-transition
+  runners check a `config.yaml` with one helper (`src/config.rs`). consensus-spec-tests cases also have their `manifest.yaml` checked
   against the directory.
 - **Handler directories:** `kzg.rs` and `bls.rs` list every handler they run and every one they
   know but do not run. Any other directory under `bls/` or `kzg/` fails the run, skip entry or

@@ -103,12 +103,22 @@ fn state_transition_skips_point_at_their_milestone() {
             let k = consensus("fulu", preset, runner, handler);
             assert_eq!(issue_of(&skips, &k), "none", "{k}");
         }
+        // upgrade_to_gloas is not ported, and the Fulu-to-Gloas transition needs Fulu
+        // processing: neither is work of the state-transition milestone.
         for (runner, handler) in [("fork", "fork"), ("transition", "core")] {
             let k = consensus("gloas", preset, runner, handler);
-            assert_eq!(issue_of(&skips, &k), "4.7", "{k}");
+            assert_eq!(issue_of(&skips, &k), "none", "{k}");
         }
-        // The whole-block runners run.
-        for (runner, handler) in [("sanity", "blocks"), ("finality", "finality")] {
+        // The whole-block runners and the rewards run.
+        for (runner, handler) in [
+            ("sanity", "blocks"),
+            ("finality", "finality"),
+            ("random", "random"),
+            ("rewards", "basic"),
+            ("rewards", "leak"),
+            ("rewards", "random"),
+            ("rewards", "inactivity_scores"),
+        ] {
             let k = consensus("gloas", preset, runner, handler);
             assert!(skips.skipped_by(&k).is_none(), "{k} is skipped");
         }
@@ -140,8 +150,8 @@ fn state_transition_skips_point_at_their_milestone() {
     }
 }
 
-/// The Gloas operations handlers that the runner executes are not skipped; every other
-/// Gloas operations handler of beta.4 waits for its port.
+/// The Gloas operations handlers that the runner executes are not skipped, and no handler of
+/// beta.4 waits for its port: a skip entry for one would fail `skip_toml_has_no_m3_entries`.
 #[test]
 fn gloas_operations_runnable_handlers_are_not_skipped() {
     let skips = committed();
@@ -150,11 +160,13 @@ fn gloas_operations_runnable_handlers_are_not_skipped() {
             let k = consensus("gloas", preset, "operations", handler);
             assert!(skips.skipped_by(&k).is_none(), "{k} is skipped");
         }
-        for handler in spec_tests::operations::NOT_RUN {
-            let k = consensus("gloas", preset, "operations", handler);
-            assert_eq!(issue_of(&skips, &k), "4.7", "{k}");
-        }
     }
+    assert_eq!(
+        spec_tests::operations::NOT_RUN.len(),
+        0,
+        "every Gloas operations handler must run: {:?}",
+        spec_tests::operations::NOT_RUN
+    );
 }
 
 /// No Gloas `epoch_processing`, `sanity` or `finality` entry is left: every epoch step is
@@ -322,4 +334,154 @@ fn slots_and_shuffling_run() {
             assert_eq!(issue_of(&skips, &k), "none", "{k}");
         }
     }
+}
+
+/// The runners of the exit of the state-transition milestone (M3), each with the fork of its
+/// vectors: every case of them runs, so no skip entry may reach one. The shuffling vectors
+/// exist only under phase0, and Gloas shuffles the same way.
+const M3_RUNNERS: [(&str, &str); 8] = [
+    ("gloas", "sanity"),
+    ("gloas", "epoch_processing"),
+    ("gloas", "operations"),
+    ("gloas", "finality"),
+    ("gloas", "rewards"),
+    ("gloas", "random"),
+    ("gloas", "shuffling"),
+    ("phase0", "shuffling"),
+];
+
+/// The entries of `skips` that the state-transition milestone must remove:
+///
+/// - an entry, with a `file` or without, that can match a case of [`M3_RUNNERS`] (its fork
+///   and runner), whatever its preset, handler and case globs;
+/// - an entry whose `issue` is a plan item of that milestone (`4.x`).
+///
+/// The out-of-scope runners (`light_client`, `fork`, `transition` and others) keep their
+/// entries, with an `issue` of another milestone or `none`.
+fn m3_entries(skips: &SkipList) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for (fork, runner) in M3_RUNNERS {
+        for (index, summary) in skips.reaching("consensus-specs", fork, runner) {
+            found.push(format!(
+                "#{index} {summary}: reaches the {fork} {runner} cases"
+            ));
+        }
+    }
+    found.extend(
+        skips
+            .entries()
+            .enumerate()
+            .filter(|(_, e)| e.issue.starts_with("4."))
+            .map(|(index, e)| format!("#{index} issue {}: {}", e.issue, e.reason)),
+    );
+    found
+}
+
+/// The `skip_toml_has_no_m3_entries` check on the skip file at `path`.
+fn m3_entries_of(path: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(path).unwrap();
+    let skips = SkipList::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    m3_entries(&skips)
+}
+
+fn committed_path() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testing/skip.toml")
+}
+
+/// Exit 1 of the state-transition milestone: no skip entry is left for its work.
+#[test]
+fn skip_toml_has_no_m3_entries() {
+    let found = m3_entries_of(&committed_path());
+    assert!(
+        found.is_empty(),
+        "testing/skip.toml has entries of the state-transition milestone: {found:#?}"
+    );
+}
+
+/// The check of [`skip_toml_has_no_m3_entries`] turns red on a temp copy of `skip.toml` with
+/// one M3 entry more: a Gloas entry of an M3 runner, also through a fork or runner glob or as
+/// a `file` excuse, and an entry of another runner that names a `4.x` plan item.
+#[test]
+fn skip_toml_has_no_m3_entries_fails_on_an_m3_entry() {
+    let committed = std::fs::read_to_string(committed_path()).unwrap();
+    let entry = |fork: &str, runner: &str, handler: &str, extra: &str, issue: &str| {
+        format!(
+            "\n[[skip]]\nsource  = \"consensus-specs\"\nfork    = \"{fork}\"\npreset  = \"*\"\n\
+             runner  = \"{runner}\"\nhandler = \"{handler}\"\n{extra}\
+             reason  = \"an M3 entry\"\nowner   = \"ian\"\nissue   = \"{issue}\"\n\
+             expires = \"2026-11-30\"\n"
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let copy = dir.path().join("skip.toml");
+    for (added, needle) in [
+        (
+            entry("gloas", "rewards", "basic", "", "none"),
+            "/rewards/basic/",
+        ),
+        (entry("gloas", "random", "*", "", "none"), "/random/"),
+        (
+            entry(
+                "gloas",
+                "sanity",
+                "blocks",
+                "case    = \"pyspec_tests/x\"\n",
+                "none",
+            ),
+            "/sanity/blocks/pyspec_tests/x",
+        ),
+        (
+            entry("*", "epoch_processing", "*", "", "none"),
+            "/epoch_processing/",
+        ),
+        (
+            entry("gloas", "*", "*", "", "none"),
+            "consensus-specs/gloas/*/*/*",
+        ),
+        (
+            entry(
+                "gloas",
+                "operations",
+                "*",
+                "file    = \"post.ssz_snappy\"\n",
+                "none",
+            ),
+            "file post.ssz_snappy",
+        ),
+        (entry("gloas", "finality", "*", "", "none"), "/finality/"),
+        (entry("gloas", "shuffling", "*", "", "none"), "/shuffling/"),
+        // The shuffling vectors exist only under phase0.
+        (
+            entry(
+                "phase0",
+                "shuffling",
+                "core",
+                "case    = \"shuffle/*\"\n",
+                "none",
+            ),
+            "consensus-specs/phase0/*/shuffling/core/shuffle/*",
+        ),
+        (
+            entry("*", "shuffling", "*", "", "none"),
+            "consensus-specs/*/*/shuffling/",
+        ),
+        (entry("gloas", "light_client", "*", "", "4.7"), "issue 4.7"),
+    ] {
+        std::fs::write(&copy, format!("{committed}{added}")).unwrap();
+        let found = m3_entries_of(&copy);
+        assert!(
+            found.iter().any(|f| f.contains(needle)),
+            "{needle}: {found:#?}"
+        );
+    }
+    // An out-of-scope entry with no plan item of the milestone stays green.
+    std::fs::write(
+        &copy,
+        format!(
+            "{committed}{}",
+            entry("fulu", "rewards", "basic", "", "none")
+        ),
+    )
+    .unwrap();
+    assert_eq!(m3_entries_of(&copy), Vec::<String>::new());
 }
