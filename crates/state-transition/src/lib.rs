@@ -8,8 +8,9 @@
 //! - [`state_transition`]: the slot loop, the block signature, the block and the state root.
 //! - [`per_slot`]: `process_slots` and `process_slot`.
 //! - [`per_epoch`]: the epoch processing (every step but the builder payments).
-//! - [`per_block`]: the block processing: the step order, the header, RANDAO, eth1 data and
-//!   the sync aggregate (the other steps and operations are stubs for now).
+//! - [`per_block`]: the block processing: the step order, the header, RANDAO, eth1 data,
+//!   the sync aggregate and the payload attestations (the other steps and operations are
+//!   stubs for now).
 //! - [`accessors`]: the beacon-state accessors and the misc helpers.
 //! - [`caches`]: shuffling, beacon committees, proposer and PTC selection.
 //! - [`mutators`]: the balance helpers, the exit and consolidation churn, validator and
@@ -261,6 +262,36 @@ pub enum StfError {
     /// proof that the input is invalid.
     #[error(transparent)]
     PubkeyAggregation(#[from] AggregationError),
+    /// `process_payload_attestation` asserts
+    /// `data.beacon_block_root == state.latest_block_header.parent_root`.
+    #[error("payload attestation root {attestation} is not the parent block root {expected}")]
+    PayloadAttestationRootMismatch {
+        /// `data.beacon_block_root`.
+        attestation: Root,
+        /// `state.latest_block_header.parent_root`.
+        expected: Root,
+    },
+    /// `process_payload_attestation` asserts `data.slot + 1 == state.slot`.
+    #[error("payload attestation slot {attestation} is not the slot before {state}")]
+    PayloadAttestationSlotMismatch {
+        /// `data.slot`.
+        attestation: Slot,
+        /// `state.slot`.
+        state: Slot,
+    },
+    /// `is_valid_indexed_payload_attestation` is false: the attestation has no attesting
+    /// index (no aggregation bit is set).
+    #[error("payload attestation has no attester")]
+    PayloadAttestationNoAttesters,
+    /// `is_valid_indexed_payload_attestation` is false: the attesting indices are not
+    /// sorted.
+    #[error("payload attestation indices are not sorted")]
+    PayloadAttestationUnsorted,
+    /// `is_valid_indexed_payload_attestation` is false: the backend rejected the aggregate
+    /// signature ([`signatures::verify_payload_attestation_signature`] or
+    /// [`per_block::payload_attestation::is_valid_indexed_payload_attestation`]).
+    #[error("invalid payload attestation signature")]
+    InvalidPayloadAttestationSignature,
 }
 
 impl StfError {
@@ -276,8 +307,11 @@ impl StfError {
     /// advanced to the object's slot: [`StfError::EpochOutOfWindow`],
     /// [`StfError::BlockRootOutOfRange`], [`StfError::BlockSlotMismatch`],
     /// [`StfError::BlockNotNewer`], [`StfError::WrongProposer`],
-    /// [`StfError::ParentRootMismatch`], [`StfError::ProposerSlashed`] and
-    /// [`StfError::InvalidSyncAggregateSignature`]. A caller that uses another state (for
+    /// [`StfError::ParentRootMismatch`], [`StfError::ProposerSlashed`],
+    /// [`StfError::InvalidSyncAggregateSignature`],
+    /// [`StfError::PayloadAttestationRootMismatch`],
+    /// [`StfError::PayloadAttestationSlotMismatch`] and
+    /// [`StfError::InvalidPayloadAttestationSignature`]. A caller that uses another state (for
     /// example a head state behind the slot of a gossip message) must map them to IGNORE.
     ///
     /// [`StfError::UnknownValidator`] has the same rule. The result depends on the registry
@@ -340,7 +374,18 @@ impl StfError {
             | Self::BlockDeposits(_)
             // `eth_fast_aggregate_verify` is false: an empty aggregate without the infinity
             // signature, or a verdict of the backend (as for `InvalidBlockSignature`).
-            | Self::InvalidSyncAggregateSignature => true,
+            | Self::InvalidSyncAggregateSignature
+            // The asserts of `process_payload_attestation` on the block's own pre-state at
+            // its slot: the parent block root and the previous slot.
+            | Self::PayloadAttestationRootMismatch { .. }
+            | Self::PayloadAttestationSlotMismatch { .. }
+            // The structural checks of `is_valid_indexed_payload_attestation`: properties of
+            // the attestation alone. No set bit gives no index, on any state.
+            | Self::PayloadAttestationNoAttesters
+            | Self::PayloadAttestationUnsorted
+            // `bls.FastAggregateVerify` is false: a verdict of the backend on the
+            // attestation's own pre-state, as for `InvalidSyncAggregateSignature`.
+            | Self::InvalidPayloadAttestationSignature => true,
         }
     }
 }
@@ -378,8 +423,8 @@ pub fn state_root<E: Preset>(state: &mut BeaconState<E>) -> Result<Root, StfErro
 /// Do not use this function on real blocks yet. Block processing is ported only in part:
 /// [`per_block::process_block`] returns [`StfError::Unimplemented`] at its first step (the
 /// parent payload), so every block fails with an error that is not a proof of an invalid
-/// block. For the same reason, a block with an operation or a builder bid fails the
-/// signature sets with `Unimplemented`.
+/// block. For the same reason, a block with an operation other than a payload attestation,
+/// or with a builder bid, fails the signature sets with `Unimplemented`.
 ///
 /// Bound `block.slot` against the wall clock before the call. As in the spec, the slots
 /// are processed before the signature check, and `process_slots` has no upper bound: a
@@ -666,7 +711,7 @@ mod tests {
 
     /// The number of [`StfError`] variants: one more than the largest [`variant_id`].
     /// Increase `VARIANTS` when you add an id.
-    const VARIANTS: usize = 30;
+    const VARIANTS: usize = 35;
 
     /// A distinct id for each variant. The match has no `_` arm, so a new variant does not
     /// compile until it gets an id here, and then the table test fails until it has an entry.
@@ -702,6 +747,11 @@ mod tests {
             StfError::UnknownSyncCommitteeMember { .. } => 27,
             StfError::InvalidSyncAggregateSignature => 28,
             StfError::PubkeyAggregation(_) => 29,
+            StfError::PayloadAttestationRootMismatch { .. } => 30,
+            StfError::PayloadAttestationSlotMismatch { .. } => 31,
+            StfError::PayloadAttestationNoAttesters => 32,
+            StfError::PayloadAttestationUnsorted => 33,
+            StfError::InvalidPayloadAttestationSignature => 34,
         }
     }
 
@@ -824,6 +874,23 @@ mod tests {
                 StfError::PubkeyAggregation(AggregationError("bad key".into())),
                 false,
             ),
+            (
+                StfError::PayloadAttestationRootMismatch {
+                    attestation: Root::repeat_byte(1),
+                    expected: Root::repeat_byte(2),
+                },
+                true,
+            ),
+            (
+                StfError::PayloadAttestationSlotMismatch {
+                    attestation: 1,
+                    state: 1,
+                },
+                true,
+            ),
+            (StfError::PayloadAttestationNoAttesters, true),
+            (StfError::PayloadAttestationUnsorted, true),
+            (StfError::InvalidPayloadAttestationSignature, true),
         ];
         let mut ids: Vec<usize> = cases.iter().map(|(e, _)| variant_id(e)).collect();
         ids.sort_unstable();

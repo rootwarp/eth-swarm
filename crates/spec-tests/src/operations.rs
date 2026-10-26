@@ -12,36 +12,49 @@
 //! ([`handler_runs`]); any other directory fails the run. The handlers of [`NOT_RUN`] need a
 //! `skip.toml` entry. beta.4 has no `operations/randao` handler: `sanity/blocks` proves
 //! `process_randao`.
+//!
+//! The `payload_attestation` cases also carry `config.yaml`, which [`check_config`] compares
+//! with the values that the runner and the transition use.
 
-use crate::bls_backend::{backend_for, bls_context, bls_setting, Bls, StateKeys};
+use crate::bls_backend::{
+    backend_for, bls_context, bls_setting, genesis_fork_version, Bls, StateKeys,
+};
 use crate::coverage::Reads;
 use crate::fixture;
 use crate::plan::Case;
 use consensus_types::common::SyncAggregate;
-use consensus_types::gloas::{BeaconBlock, BeaconState, BuilderDepositRequest, BuilderExitRequest};
+use consensus_types::gloas::{
+    BeaconBlock, BeaconState, BuilderDepositRequest, BuilderExitRequest, PayloadAttestation,
+};
 use consensus_types::{Mainnet, Minimal};
 use ssz::Decode;
 use state_transition::per_block::builder::{
     process_builder_deposit_request, process_builder_exit_request,
 };
 use state_transition::per_block::sync_aggregate::process_sync_aggregate_with;
-use state_transition::per_block::{process_block_header, BlockContext};
-use state_transition::signatures::verify_sync_aggregate_signature_with;
+use state_transition::per_block::{
+    process_block_header, process_payload_attestation, BlockContext,
+};
+use state_transition::signatures::{
+    verify_payload_attestation_signature, verify_sync_aggregate_signature_with,
+};
 use state_transition::{state_root, Preset, StfError};
 use std::path::Path;
 use tree_hash::TreeHash;
+use yaml_rust2::Yaml;
 
 /// Handlers this runner executes.
-pub const RUNNABLE: [&str; 4] = [
+pub const RUNNABLE: [&str; 5] = [
     "block_header",
     "builder_deposit_request",
     "builder_exit_request",
+    "payload_attestation",
     "sync_aggregate",
 ];
 
 /// Gloas handlers at beta.4 that the state transition does not port yet. Each needs a
 /// `skip.toml` entry.
-pub const NOT_RUN: [&str; 13] = [
+pub const NOT_RUN: [&str; 12] = [
     "attestation",
     "attester_slashing",
     "bls_to_execution_change",
@@ -49,7 +62,6 @@ pub const NOT_RUN: [&str; 13] = [
     "deposit_request",
     "execution_payload_bid",
     "parent_execution_payload",
-    "payload_attestation",
     "proposer_slashing",
     "voluntary_exit",
     "voluntary_exit_churn",
@@ -93,6 +105,9 @@ fn operation<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
         .map(|p| decode::<BeaconState<E>>(reads, p))
         .transpose()?;
     let bls = bls_setting(reads, case)?;
+    if let Some(path) = case.file("config.yaml") {
+        check_config(reads, path, &case.key.preset)?;
+    }
     let outcome = match (case.key.runner.as_str(), case.key.handler.as_str()) {
         ("operations", "block_header") => {
             let block = decode::<BeaconBlock<E>>(reads, file("block.ssz_snappy")?)?;
@@ -117,6 +132,13 @@ fn operation<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
                 decode::<BuilderExitRequest>(reads, file("builder_exit_request.ssz_snappy")?)?;
             process_builder_exit_request(&mut state, &request)
         }
+        ("operations", "payload_attestation") => {
+            let attestation =
+                decode::<PayloadAttestation<E>>(reads, file("payload_attestation.ssz_snappy")?)?;
+            let keys = StateKeys::new(&state);
+            verify_payload_attestation_signature(&state, &attestation, backend_for(bls, &keys))
+                .and_then(|()| process_payload_attestation(&state, &attestation))
+        }
         ("operations", "sync_aggregate") => {
             let aggregate = decode::<SyncAggregate<E>>(reads, file("sync_aggregate.ssz_snappy")?)?;
             // One context: the signature check and the rewards share the committee indices.
@@ -135,6 +157,33 @@ fn operation<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
         (runner, handler) => return Err(format!("no runner for {runner}/{handler}")),
     };
     expect(&mut state, outcome, post)
+}
+
+/// Checks the `config.yaml` of a case (the pyspec writes one for the tests that need the
+/// config of the preset) against the values that the runner keeps: `PRESET_BASE` is the
+/// preset of the case, and `GENESIS_FORK_VERSION` is [`genesis_fork_version`]. The
+/// transition reads no config value in the runnable handlers.
+///
+/// `GLOAS_FORK_EPOCH` is not compared. `get_ptc` reads the Gloas fork epoch from
+/// `state.fork.epoch`, which is `GLOAS_FORK_EPOCH` in each state that the transition makes.
+/// The case `process_payload_attestation_cross_epoch_wrong_domain` sets `state.fork.epoch` to
+/// 1 under a `GLOAS_FORK_EPOCH` of 0, to give its two epochs different fork versions. Thus
+/// `get_ptc` refuses the slot of epoch 0 (`EpochOutOfWindow`) before the domain check that
+/// the case tests. The case expects an invalid attestation, and it gets one.
+fn check_config(reads: &Reads, path: &Path, preset: &str) -> Result<(), String> {
+    let config = fixture::load(reads, path)?;
+    let wrong = |key: &str, value: &Yaml| format!("config.yaml: {key} is {value:?}");
+    let base = fixture::field(&config, "PRESET_BASE")?;
+    if base.as_str() != Some(preset) {
+        return Err(wrong("PRESET_BASE", base));
+    }
+    // YAML reads the unquoted `0x` value as an integer.
+    let version = fixture::field(&config, "GENESIS_FORK_VERSION")?;
+    let parsed = version.as_i64().and_then(|v| u32::try_from(v).ok());
+    if parsed.map(u32::to_be_bytes) != Some(genesis_fork_version(preset)?) {
+        return Err(wrong("GENESIS_FORK_VERSION", version));
+    }
+    Ok(())
 }
 
 /// Compares the outcome of a handler with what the vector expects.
@@ -545,6 +594,111 @@ mod tests {
         assert!(run(&Reads::default(), &c)
             .unwrap_err()
             .contains("pre.ssz_snappy"));
+    }
+
+    /// A `config.yaml` as the pyspec writes it: the keys that the runner checks, and keys
+    /// that it does not compare.
+    fn config(preset: &str, version: &str) -> String {
+        format!(
+            "PRESET_BASE: '{preset}'\nGENESIS_FORK_VERSION: {version}\n\
+             GLOAS_FORK_EPOCH: 0\nSHARD_COMMITTEE_PERIOD: 64\n"
+        )
+    }
+
+    #[test]
+    fn payload_attestation_cases() {
+        use consensus_types::gloas::{PayloadAttestation, PayloadAttestationData};
+        use consensus_types::primitives::Root;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pre = pre();
+        // The previous slot and the parent root of `pre`, with the first PTC position: the
+        // PTC window of `pre` is zero, so the attester is validator 0.
+        let mut attestation = PayloadAttestation::<Minimal> {
+            aggregation_bits: Default::default(),
+            data: PayloadAttestationData {
+                beacon_block_root: Root::ZERO,
+                slot: 1,
+                payload_present: true,
+                blob_data_available: true,
+            },
+            signature: [0x22; 96],
+        };
+        attestation.aggregation_bits.set(0, true).unwrap();
+        let files = |attestation: &PayloadAttestation<Minimal>,
+                     post: Option<&BeaconState<Minimal>>,
+                     meta: Option<&str>,
+                     config: Option<String>| {
+            let mut files = vec![
+                ("pre.ssz_snappy", snappy(pre.as_ssz_bytes())),
+                (
+                    "payload_attestation.ssz_snappy",
+                    snappy(attestation.as_ssz_bytes()),
+                ),
+            ];
+            if let Some(post) = post {
+                files.push(("post.ssz_snappy", snappy(post.as_ssz_bytes())));
+            }
+            if let Some(meta) = meta {
+                files.push(("meta.yaml", meta.as_bytes().to_vec()));
+            }
+            if let Some(config) = config {
+                files.push(("config.yaml", config.into_bytes()));
+            }
+            files
+        };
+        let minimal = || Some(config("minimal", "0x00000001"));
+
+        // The key of validator 0 does not decode, so the signature is invalid.
+        let c = case(
+            dir.path(),
+            "payload_attestation",
+            &files(&attestation, None, Some("{bls_setting: 1}\n"), minimal()),
+        );
+        let reads = Reads::default();
+        assert_eq!(run(&reads, &c), Ok(()));
+        assert!(c.files.iter().all(|f| reads.contains(&f.path)));
+        let c = case(
+            dir.path(),
+            "payload_attestation",
+            &files(&attestation, Some(&pre), None, minimal()),
+        );
+        assert!(run(&Reads::default(), &c)
+            .unwrap_err()
+            .contains("invalid payload attestation signature"));
+        // bls_setting 2: the signature is not checked, and the state does not change.
+        let c = case(
+            dir.path(),
+            "payload_attestation",
+            &files(&attestation, Some(&pre), Some("{bls_setting: 2}\n"), None),
+        );
+        assert_eq!(run(&Reads::default(), &c), Ok(()));
+        // The asserts that need no BLS run with bls_setting 2 too.
+        let mut late = attestation.clone();
+        late.data.slot = 2;
+        let c = case(
+            dir.path(),
+            "payload_attestation",
+            &files(&late, None, Some("{bls_setting: 2}\n"), None),
+        );
+        assert_eq!(run(&Reads::default(), &c), Ok(()));
+
+        // A config that the runner does not agree with fails the case.
+        for (config, want) in [
+            (config("mainnet", "0x00000001"), "PRESET_BASE"),
+            (config("minimal", "0x00000000"), "GENESIS_FORK_VERSION"),
+            (config("minimal", "0x100000001"), "GENESIS_FORK_VERSION"),
+            ("PRESET_BASE: 'minimal'\n".into(), "GENESIS_FORK_VERSION"),
+            (": :\n- [".into(), "config.yaml"),
+        ] {
+            let c = case(
+                dir.path(),
+                "payload_attestation",
+                &files(&attestation, None, Some("{bls_setting: 2}\n"), Some(config)),
+            );
+            let err = run(&Reads::default(), &c).unwrap_err();
+            assert!(err.contains(want), "{want}: {err}");
+        }
     }
 
     #[test]

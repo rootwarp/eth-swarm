@@ -104,7 +104,6 @@ fn state_transition_skips_point_at_their_milestone() {
             assert_eq!(issue_of(&skips, &k), "none", "{k}");
         }
         for (runner, handler) in [
-            ("operations", "payload_attestation"),
             ("operations", "execution_payload_bid"),
             ("epoch_processing", "builder_pending_payments"),
             ("fork", "fork"),

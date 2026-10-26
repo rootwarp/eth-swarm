@@ -16,16 +16,22 @@
 pub use consensus_types::signing::{SignatureSet, SignerRef};
 
 use crate::accessors::{get_block_root_at_slot, get_current_epoch, get_domain};
+use crate::per_block::payload_attestation::{
+    check_indexed_payload_attestation, check_payload_attestation_target,
+    get_indexed_payload_attestation,
+};
 use crate::per_block::state_proposer_index;
 use crate::per_block::BlockContext;
 use crate::preset::BUILDER_INDEX_SELF_BUILD;
 use crate::{Preset, StfError};
 use consensus_types::common::{DepositMessage, SyncAggregate};
-use consensus_types::gloas::{BeaconBlockBody, BeaconState, SignedBeaconBlock};
+use consensus_types::gloas::{
+    BeaconBlockBody, BeaconState, IndexedPayloadAttestation, PayloadAttestation, SignedBeaconBlock,
+};
 use consensus_types::primitives::{BLSPubkey, BLSSignature, Bytes32, Gwei, Root, Version};
 use consensus_types::signing::{
-    compute_domain, compute_signing_root, DOMAIN_BEACON_PROPOSER, DOMAIN_DEPOSIT, DOMAIN_RANDAO,
-    DOMAIN_SYNC_COMMITTEE,
+    compute_domain, compute_signing_root, DOMAIN_BEACON_PROPOSER, DOMAIN_DEPOSIT,
+    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
 };
 
 /// `G2_POINT_AT_INFINITY` (`altair/bls.md` L25): the compressed G2 identity.
@@ -212,21 +218,86 @@ pub fn verify_sync_aggregate_signature_with<E: Preset>(
     }
 }
 
+/// The aggregate signature set of an indexed payload attestation: the
+/// `bls.FastAggregateVerify` of `is_valid_indexed_payload_attestation` (G L1094-1110), with
+/// the PTC domain of the epoch of `data.slot`.
+///
+/// The structural checks ([`check_indexed_payload_attestation`]) run first. If one fails,
+/// the function gives that error and no set. The signers are the attesting indices in order,
+/// a duplicate included, as each PTC position signs.
+pub fn indexed_payload_attestation_signature_set<E: Preset>(
+    state: &BeaconState<E>,
+    indexed: &IndexedPayloadAttestation<E>,
+) -> Result<SignatureSet, StfError> {
+    check_indexed_payload_attestation(state, indexed)?;
+    let epoch = E::epoch_at_slot(indexed.data.slot);
+    let domain = get_domain(state, DOMAIN_PTC_ATTESTER, Some(epoch));
+    let signers = indexed
+        .attesting_indices
+        .iter()
+        .map(|&index| SignerRef::Validator(index))
+        .collect();
+    // The structural checks refuse an empty list, so the signers are not empty.
+    SignatureSet::aggregate(
+        signers,
+        compute_signing_root(&indexed.data, domain),
+        indexed.signature,
+    )
+    .map_err(|_| StfError::PayloadAttestationNoAttesters)
+}
+
+/// The signature set of a payload attestation in a block: the asserts of
+/// `process_payload_attestation` (G L2494-2496) on `parent_root` and `state.slot`, then
+/// [`get_indexed_payload_attestation`] and [`indexed_payload_attestation_signature_set`].
+///
+/// `parent_root` is the parent root of the block. The header step makes it
+/// `state.latest_block_header.parent_root` (P0 L2350-2370), which the spec compares. The
+/// cheap asserts run before the PTC read, so a wrong target costs no backend call.
+pub fn payload_attestation_signature_set<E: Preset>(
+    state: &BeaconState<E>,
+    payload_attestation: &PayloadAttestation<E>,
+    parent_root: Root,
+) -> Result<SignatureSet, StfError> {
+    check_payload_attestation_target(&payload_attestation.data, parent_root, state.slot)?;
+    let indexed = get_indexed_payload_attestation(state, payload_attestation)?;
+    indexed_payload_attestation_signature_set(state, &indexed)
+}
+
+/// The checks of `process_payload_attestation` with the signature through `backend`, for a
+/// caller that processes a payload attestation outside [`block_signature_sets`]. `state` is
+/// the state after the header step of the block, so the parent root is
+/// `state.latest_block_header.parent_root`.
+pub fn verify_payload_attestation_signature<E: Preset>(
+    state: &BeaconState<E>,
+    payload_attestation: &PayloadAttestation<E>,
+    backend: &dyn SignatureBackend,
+) -> Result<(), StfError> {
+    let parent_root = state.latest_block_header.parent_root;
+    let set = payload_attestation_signature_set(state, payload_attestation, parent_root)?;
+    if backend.verify_signature_sets(std::slice::from_ref(&set))? {
+        Ok(())
+    } else {
+        Err(StfError::InvalidPayloadAttestationSignature)
+    }
+}
+
 /// Every signature set of a block, in the order of `process_block`: the proposer
-/// signature, the RANDAO reveal and the sync aggregate (none for an empty aggregate with the
-/// infinity signature).
+/// signature, the RANDAO reveal, one set for each payload attestation, and the sync
+/// aggregate (none for an empty aggregate with the infinity signature).
 ///
 /// The function fails closed for the signed parts of the body that have no set builder
 /// yet: a builder bid (not a self-build), and each operation list that is not empty
 /// (proposer slashings, attester slashings, attestations, voluntary exits, BLS-to-execution
-/// changes, payload attestations) give [`StfError::Unimplemented`] with the work that ports
-/// them. A port must add its set builder here and remove its `Unimplemented`, so that no
-/// signature of the block is left out of the batch.
+/// changes) give [`StfError::Unimplemented`] with the work that ports them. A port must add
+/// its set builder here and remove its `Unimplemented`, so that no signature of the block
+/// is left out of the batch.
 ///
 /// `state` is the state at the block's slot, after `process_slots` and before
 /// `process_block`. The steps before each check do not change what the set reads (the
-/// registry keys, the proposer lookahead, the fork and the block roots), so the sets are
-/// the ones that the spec checks during `process_block`.
+/// registry keys, the proposer lookahead, the PTC window, the fork and the block roots), so
+/// the sets are the ones that the spec checks during `process_block`. The payload
+/// attestation sets compare with `block.parent_root`, which is the parent root of the
+/// latest block header after the header step.
 pub fn block_signature_sets<E: Preset>(
     state: &BeaconState<E>,
     signed_block: &SignedBeaconBlock<E>,
@@ -256,10 +327,17 @@ pub fn block_signature_sets_with<E: Preset>(
         (body.attestations.is_empty(), "4.3b"),
         (body.voluntary_exits.is_empty(), "4.4b"),
         (body.bls_to_execution_changes.is_empty(), "4.4b"),
-        (body.payload_attestations.is_empty(), "4.11"),
     ];
     if let Some((_, id)) = unported.iter().find(|(empty, _)| !empty) {
         return Err(StfError::Unimplemented(id));
+    }
+    // `process_payload_attestation` (G L2488-2499), the last operation list.
+    for payload_attestation in &body.payload_attestations {
+        sets.push(payload_attestation_signature_set(
+            state,
+            payload_attestation,
+            signed_block.message.parent_root,
+        )?);
     }
     // Last, as it is the only set that can read the registry.
     sets.extend(sync_aggregate_signature_set_with(
@@ -515,7 +593,7 @@ mod tests {
             BLSToExecutionChange, BeaconBlockHeader, SignedBLSToExecutionChange,
             SignedBeaconBlockHeader, SignedVoluntaryExit, VoluntaryExit,
         };
-        use consensus_types::gloas::{BeaconBlockBody, PayloadAttestation, PayloadAttestationData};
+        use consensus_types::gloas::BeaconBlockBody;
         use consensus_types::primitives::Address;
 
         let (state, block) = state_and_block(&[1]);
@@ -531,7 +609,7 @@ mod tests {
         };
         /// Adds one signed part to a block body.
         type AddPart = Box<dyn Fn(&mut BeaconBlockBody<Minimal>)>;
-        let cases: [(&str, AddPart); 5] = [
+        let cases: [(&str, AddPart); 4] = [
             (
                 "4.3b",
                 Box::new(move |b| {
@@ -566,23 +644,6 @@ mod tests {
                                 validator_index: 0,
                                 from_bls_pubkey: [0; 48],
                                 to_execution_address: Address::ZERO,
-                            },
-                            signature: [0; 96],
-                        })
-                        .unwrap()
-                }),
-            ),
-            (
-                "4.11",
-                Box::new(|b| {
-                    b.payload_attestations
-                        .push(PayloadAttestation {
-                            aggregation_bits: Default::default(),
-                            data: PayloadAttestationData {
-                                beacon_block_root: Root::ZERO,
-                                slot: 0,
-                                payload_present: false,
-                                blob_data_available: false,
                             },
                             signature: [0; 96],
                         })

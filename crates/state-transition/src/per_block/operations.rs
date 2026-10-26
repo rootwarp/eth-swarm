@@ -6,11 +6,10 @@
 //! one passes. The Gloas text calls no builder deposit or exit request handler here (the
 //! parent-payload step processes those), so no `4.6a` slot is in this function.
 
+use crate::per_block::payload_attestation::process_payload_attestation;
 use crate::{Preset, StfError};
 use consensus_types::common::{ProposerSlashing, SignedBLSToExecutionChange, SignedVoluntaryExit};
-use consensus_types::gloas::{
-    Attestation, AttesterSlashing, BeaconBlockBody, BeaconState, PayloadAttestation,
-};
+use consensus_types::gloas::{Attestation, AttesterSlashing, BeaconBlockBody, BeaconState};
 use consensus_types::primitives::Slot;
 
 /// `process_operations` (G L2228-2263, Modified in Gloas): `parent_slot` is the slot of the
@@ -89,14 +88,6 @@ fn process_bls_to_execution_change<E: Preset>(
     Err(StfError::Unimplemented("4.4b"))
 }
 
-/// Dispatch slot of `process_payload_attestation` (G L2488-2499). Not ported yet.
-fn process_payload_attestation<E: Preset>(
-    _: &mut BeaconState<E>,
-    _: &PayloadAttestation<E>,
-) -> Result<(), StfError> {
-    Err(StfError::Unimplemented("4.11"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,7 +96,7 @@ mod tests {
         AttestationData, BLSToExecutionChange, BeaconBlockHeader, Checkpoint, Deposit, DepositData,
         SignedBeaconBlockHeader, VoluntaryExit,
     };
-    use consensus_types::gloas::{IndexedAttestation, PayloadAttestationData};
+    use consensus_types::gloas::{IndexedAttestation, PayloadAttestation, PayloadAttestationData};
     use consensus_types::primitives::{Address, Root};
     use consensus_types::Minimal;
     use ssz::{BitVector, ProgressiveBitList};
@@ -184,7 +175,7 @@ mod tests {
             f(&mut body);
             process_operations(&mut state.clone(), &body, 0)
         };
-        let cases: [(&str, &AddOperation); 6] = [
+        let cases: [(&str, &AddOperation); 5] = [
             ("4.3b", &|b| {
                 b.proposer_slashings
                     .push(ProposerSlashing {
@@ -234,7 +225,14 @@ mod tests {
                     })
                     .unwrap()
             }),
-            ("4.11", &|b| {
+        ];
+        for (id, add) in cases {
+            assert_eq!(with(add), Err(StfError::Unimplemented(id)), "{id}");
+        }
+        // A payload attestation goes to `process_payload_attestation`, which refuses one
+        // for the slot of the state.
+        assert_eq!(
+            with(&|b| {
                 b.payload_attestations
                     .push(PayloadAttestation {
                         aggregation_bits: BitVector::new(),
@@ -248,9 +246,10 @@ mod tests {
                     })
                     .unwrap()
             }),
-        ];
-        for (id, add) in cases {
-            assert_eq!(with(add), Err(StfError::Unimplemented(id)), "{id}");
-        }
+            Err(StfError::PayloadAttestationSlotMismatch {
+                attestation: 0,
+                state: 0
+            })
+        );
     }
 }

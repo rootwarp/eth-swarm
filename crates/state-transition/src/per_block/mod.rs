@@ -4,23 +4,28 @@
 //! steps that are not ported yet return [`StfError::Unimplemented`] with the work that ports
 //! them: the parent payload (`4.6a`), the withdrawals (`4.4a`) and the bid (`4.5`).
 //!
-//! The steps make no BLS check. The RANDAO reveal and the sync aggregate signature (and
-//! later the operation signatures) go to the backend as sets, in the one batch of
-//! [`crate::signatures::block_signature_sets`], before the steps run. The checks that need
-//! no BLS stay in the steps, for example the infinity signature of an empty sync aggregate.
+//! The steps make no BLS check. The RANDAO reveal, the payload attestation signatures and
+//! the sync aggregate signature (and later the other operation signatures) go to the
+//! backend as sets, in the one batch of [`crate::signatures::block_signature_sets`], before
+//! the steps run. The checks that need no BLS stay in the steps, for example the infinity
+//! signature of an empty sync aggregate and the structure of a payload attestation.
 //!
 //! - [`builder`] has the builder deposit and exit requests.
 //! - [`header`] has `process_block_header`, `process_randao` and `process_eth1_data`.
 //! - [`operations`] has the Gloas `process_operations`.
+//! - [`payload_attestation`] has `process_payload_attestation` and the indexed form of a
+//!   payload attestation.
 //! - [`sync_aggregate`] has `process_sync_aggregate`.
 
 pub mod builder;
 pub mod header;
 pub mod operations;
+pub mod payload_attestation;
 pub mod sync_aggregate;
 
 pub use header::{check_block_header, process_block_header, process_eth1_data, process_randao};
 pub use operations::process_operations;
+pub use payload_attestation::process_payload_attestation;
 pub use sync_aggregate::process_sync_aggregate;
 
 use crate::caches::get_beacon_proposer_index;
