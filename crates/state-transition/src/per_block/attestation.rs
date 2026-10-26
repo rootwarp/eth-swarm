@@ -97,6 +97,8 @@ pub fn process_attestation_with<E: Preset>(
         })?;
     let same_slot = is_attestation_same_slot(state, data)?;
     let per_increment = base_reward_per_increment(ctx.total_active_balance().get(state)?);
+    // Kept a proof for now, outside the slashing and exit paths: the reward and weight sums
+    // read only state values, so their class is a follow-up.
     let overflow = || StfError::ArithmeticOverflow;
 
     let mut proposer_reward_numerator: u64 = 0;
@@ -188,6 +190,7 @@ pub(crate) fn check_attestation<E: Preset>(
             slot: data.slot,
         });
     }
+    // Kept a proof: `data.slot` comes from the attestation, not from our own state.
     let earliest = data
         .slot
         .checked_add(MIN_ATTESTATION_INCLUSION_DELAY)

@@ -319,7 +319,9 @@ mod tests {
         state.validators.get_mut(0).unwrap().effective_balance = u64::MAX;
         assert_eq!(
             cache_of(&state).total_active_balance(),
-            Err(StfError::ArithmeticOverflow)
+            Err(StfError::StateArithmetic {
+                what: "total active balance"
+            })
         );
     }
 

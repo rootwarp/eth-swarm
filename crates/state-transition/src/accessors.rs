@@ -272,6 +272,9 @@ pub fn compute_activation_exit_epoch(epoch: Epoch) -> Result<Epoch, StfError> {
 ///
 /// It reads the whole registry. Callers that read the total more than one time in an epoch
 /// use a [`TotalActiveBalanceCache`].
+///
+/// The effective balances come from our own state only, so a failed sum is
+/// [`StfError::StateArithmetic`], not a proof.
 pub fn get_total_active_balance<E: Preset>(state: &BeaconState<E>) -> Result<Gwei, StfError> {
     let epoch = get_current_epoch(state);
     let total = state
@@ -279,7 +282,9 @@ pub fn get_total_active_balance<E: Preset>(state: &BeaconState<E>) -> Result<Gwe
         .iter()
         .filter(|v| is_active_validator(v, epoch))
         .try_fold(0u64, |sum, v| sum.checked_add(v.effective_balance))
-        .ok_or(StfError::ArithmeticOverflow)?;
+        .ok_or(StfError::StateArithmetic {
+            what: "total active balance",
+        })?;
     Ok(total.max(EFFECTIVE_BALANCE_INCREMENT))
 }
 
@@ -543,7 +548,9 @@ pub fn is_active_builder<E: Preset>(
 }
 
 /// `get_pending_balance_to_withdraw_for_builder` (G L1168-1178, New in Gloas): the sum of the
-/// pending withdrawals and the pending payments of the builder. The sum is checked.
+/// pending withdrawals and the pending payments of the builder. The sum is checked. Its
+/// amounts come from our own state only, so a failed sum is [`StfError::StateArithmetic`],
+/// not a proof.
 ///
 /// It reads both queues. `builder_pending_payments` has `2 * SLOTS_PER_EPOCH` entries, and
 /// `builder_pending_withdrawals` holds only the withdrawals that the sweep did not pay yet.
@@ -564,7 +571,9 @@ pub fn get_pending_balance_to_withdraw_for_builder<E: Preset>(
     withdrawals
         .chain(payments)
         .try_fold(0u64, |balance, amount| balance.checked_add(amount))
-        .ok_or(StfError::ArithmeticOverflow)
+        .ok_or(StfError::StateArithmetic {
+            what: "builder pending balance to withdraw",
+        })
 }
 
 /// `can_builder_cover_bid` (G L1184-1192, New in Gloas): the balance of the builder, less
@@ -886,14 +895,16 @@ mod tests {
         assert_eq!(get_total_active_balance(&empty), Ok(ETH));
         let mut huge = registry_state::<Minimal>(&[32 * ETH; 2], Bytes32::ZERO);
         huge.validators.get_mut(0).unwrap().effective_balance = u64::MAX;
-        assert_eq!(
-            get_total_active_balance(&huge),
-            Err(StfError::ArithmeticOverflow)
-        );
+        // The effective balances come from our own state, so the overflow is not a proof.
+        let fault = StfError::StateArithmetic {
+            what: "total active balance",
+        };
+        assert_eq!(get_total_active_balance(&huge), Err(fault.clone()));
         assert_eq!(
             TotalActiveBalanceCache::default().get(&huge),
-            Err(StfError::ArithmeticOverflow)
+            Err(fault.clone())
         );
+        assert!(!fault.proves_invalid());
     }
 
     #[test]
@@ -1039,15 +1050,19 @@ mod tests {
             get_pending_balance_to_withdraw_for_builder(&state, 2),
             Ok(0)
         );
-        // A sum past `u64::MAX` is a `Uint64` overflow.
+        // A sum past `u64::MAX` is a fault of our own state, not a proof.
         state
             .builder_pending_withdrawals
             .push(withdrawal(u64::MAX, 1))
             .unwrap();
+        let err = get_pending_balance_to_withdraw_for_builder(&state, 1).unwrap_err();
         assert_eq!(
-            get_pending_balance_to_withdraw_for_builder(&state, 1),
-            Err(StfError::ArithmeticOverflow)
+            err,
+            StfError::StateArithmetic {
+                what: "builder pending balance to withdraw"
+            }
         );
+        assert!(!err.proves_invalid());
     }
 
     #[test]

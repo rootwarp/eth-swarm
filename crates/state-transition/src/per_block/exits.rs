@@ -20,7 +20,7 @@ use crate::accessors::{
     get_current_epoch, get_pending_balance_to_withdraw, hash, is_active_validator,
     TotalActiveBalanceCache,
 };
-use crate::mutators::initiate_validator_exit;
+use crate::mutators::{initiate_validator_exit, state_sum};
 use crate::preset::{BLS_WITHDRAWAL_PREFIX, ETH1_ADDRESS_WITHDRAWAL_PREFIX};
 use crate::{Preset, StfError};
 use consensus_types::common::{SignedBLSToExecutionChange, SignedVoluntaryExit};
@@ -61,10 +61,13 @@ pub fn process_voluntary_exit<E: Preset>(
         });
     }
     // Verify the validator has been active long enough
-    let earliest_epoch = validator
-        .activation_epoch
-        .checked_add(E::SHARD_COMMITTEE_PERIOD)
-        .ok_or(StfError::ArithmeticOverflow)?;
+    // The activation epoch comes from our own state, not from the exit. An active
+    // validator has it at most the current epoch, so the sum does not fail.
+    let earliest_epoch = state_sum(
+        validator.activation_epoch,
+        E::SHARD_COMMITTEE_PERIOD,
+        "exit eligibility epoch",
+    )?;
     if current_epoch < earliest_epoch {
         return Err(StfError::ExitTooEarly {
             index,

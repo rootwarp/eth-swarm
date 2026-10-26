@@ -37,7 +37,7 @@ use crate::accessors::{
     get_current_epoch, get_pending_balance_to_withdraw_for_builder, is_active_builder,
     is_builder_withdrawal_credential,
 };
-use crate::mutators::initiate_builder_exit;
+use crate::mutators::{initiate_builder_exit, state_sum};
 use crate::preset::PAYLOAD_BUILDER_VERSION;
 use crate::{Preset, SignatureBackend, SignatureSet, SignerRef, StfError};
 use consensus_types::common::DepositMessage;
@@ -198,11 +198,15 @@ pub fn process_builder_deposit_request<E: Preset>(
         .ok_or(StfError::UnknownBuilder(builder_index))?;
     // If exited and swept, reset the withdrawable epoch
     if builder.withdrawable_epoch != FAR_FUTURE_EPOCH && builder.balance == 0 {
-        builder.withdrawable_epoch = epoch
-            .checked_add(E::MIN_BUILDER_WITHDRAWABILITY_DELAY)
-            .ok_or(StfError::ArithmeticOverflow)?;
+        // The epoch comes from our own state: not a proof, as in `initiate_builder_exit`.
+        builder.withdrawable_epoch = state_sum(
+            epoch,
+            E::MIN_BUILDER_WITHDRAWABILITY_DELAY,
+            "builder withdrawable epoch",
+        )?;
     }
     // Increase balance by deposit amount
+    // Kept a proof: the amount comes from the request, not from our own state.
     builder.balance = builder
         .balance
         .checked_add(request.amount)

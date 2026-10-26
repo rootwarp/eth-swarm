@@ -8,8 +8,8 @@
 //!
 //! The arithmetic is as in the spec: `decrease_balance` saturates at 0, and every other
 //! `Uint64` operation is checked. A failed operation is [`StfError::ArithmeticOverflow`],
-//! but [`StfError::StateArithmetic`] (not a proof) for the churn queue, whose operands come
-//! from our own state only.
+//! but [`StfError::StateArithmetic`] (not a proof) when its operands come from our own state
+//! only: the churn queue, the sums of `slash_validator` and the builder withdrawable epoch.
 
 use crate::accessors::{
     compute_activation_exit_epoch, get_consolidation_churn_limit, get_current_epoch,
@@ -28,16 +28,46 @@ use consensus_types::primitives::{
 use ssz_types::typenum::Unsigned;
 
 /// `increase_balance` (P0 L1653-1657). The sum is checked.
+///
+/// A failed sum stays [`StfError::ArithmeticOverflow`] (a proof), because some callers add
+/// a value of the object. A caller that adds a value of our own state only uses
+/// [`increase_balance_from_state`].
 pub fn increase_balance<E: Preset>(
     state: &mut BeaconState<E>,
     index: ValidatorIndex,
     delta: Gwei,
 ) -> Result<(), StfError> {
+    add_to_balance(state, index, delta, StfError::ArithmeticOverflow)
+}
+
+/// [`increase_balance`] with a `delta` that comes from our own state only: a failed sum is
+/// [`StfError::StateArithmetic`] (`what` names the value), not a proof.
+pub(crate) fn increase_balance_from_state<E: Preset>(
+    state: &mut BeaconState<E>,
+    index: ValidatorIndex,
+    delta: Gwei,
+    what: &'static str,
+) -> Result<(), StfError> {
+    add_to_balance(state, index, delta, StfError::StateArithmetic { what })
+}
+
+/// `state.balances[index] += delta`, or `overflow` if the sum does not fit in a `Uint64`.
+fn add_to_balance<E: Preset>(
+    state: &mut BeaconState<E>,
+    index: ValidatorIndex,
+    delta: Gwei,
+    overflow: StfError,
+) -> Result<(), StfError> {
     let balance = balance_mut(state, index)?;
-    *balance = balance
-        .checked_add(delta)
-        .ok_or(StfError::ArithmeticOverflow)?;
+    *balance = balance.checked_add(delta).ok_or(overflow)?;
     Ok(())
+}
+
+/// A `Uint64` sum of two values that come from our own state only, not from the object.
+/// A state that the transition makes keeps the sum in range, so a failed sum is
+/// [`StfError::StateArithmetic`] (`what` names the value), not a proof.
+pub(crate) fn state_sum(a: u64, b: u64, what: &'static str) -> Result<u64, StfError> {
+    a.checked_add(b).ok_or(StfError::StateArithmetic { what })
 }
 
 /// `decrease_balance` (P0 L1663-1667). The difference saturates at 0, as in the spec.
@@ -201,6 +231,7 @@ pub fn initiate_validator_exit<E: Preset>(
     let effective_balance = validator.effective_balance;
     // Compute exit queue epoch
     let exit_queue_epoch = compute_exit_epoch_and_update_churn(state, effective_balance, cache)?;
+    // Kept a proof: `registry_updates/invalid_large_withdrawable_epoch` expects this failure.
     let withdrawable_epoch = exit_queue_epoch
         .checked_add(MIN_VALIDATOR_WITHDRAWABILITY_DELAY)
         .ok_or(StfError::ArithmeticOverflow)?;
@@ -222,13 +253,19 @@ pub fn initiate_validator_exit<E: Preset>(
 /// `initiate_builder_exit` (G L1526-1532, New in Gloas): the builder can withdraw
 /// `MIN_BUILDER_WITHDRAWABILITY_DELAY` epochs after the current epoch. As in the spec text,
 /// it does not check an earlier exit: its callers do.
+///
+/// The sum reads only the slot of our own state, so a failed sum is
+/// [`StfError::StateArithmetic`], not a proof. An epoch is at most
+/// `u64::MAX / SLOTS_PER_EPOCH`, so the sum does not fail on a state of the spec.
 pub fn initiate_builder_exit<E: Preset>(
     state: &mut BeaconState<E>,
     builder_index: BuilderIndex,
 ) -> Result<(), StfError> {
-    let withdrawable_epoch = get_current_epoch(state)
-        .checked_add(E::MIN_BUILDER_WITHDRAWABILITY_DELAY)
-        .ok_or(StfError::ArithmeticOverflow)?;
+    let withdrawable_epoch = state_sum(
+        get_current_epoch(state),
+        E::MIN_BUILDER_WITHDRAWABILITY_DELAY,
+        "builder withdrawable epoch",
+    )?;
     let builder = state
         .builders
         .get_mut(builder_index as usize)
@@ -298,13 +335,17 @@ pub fn settle_builder_payment<E: Preset>(
 /// The proposer comes from `state.proposer_lookahead`, not from the slashing, so an index
 /// there past the registry is a fault of our own state: `ListIndexOutOfRange`, not a proof
 /// that the slashing is invalid.
+///
+/// The sums of the function read only values of our own state: the epoch, the slashings
+/// accumulator, the effective balance of the slashed validator, and the balances of the
+/// proposer and the whistleblower. Thus a failed sum is [`StfError::StateArithmetic`], not
+/// a proof. The sum of [`initiate_validator_exit`] stays a proof (see there).
 pub fn slash_validator<E: Preset>(
     state: &mut BeaconState<E>,
     slashed_index: ValidatorIndex,
     whistleblower_index: Option<ValidatorIndex>,
     cache: &mut TotalActiveBalanceCache,
 ) -> Result<(), StfError> {
-    let overflow = || StfError::ArithmeticOverflow;
     let epoch = get_current_epoch(state);
     initiate_validator_exit(state, slashed_index, cache)?;
     let slashings_vector = E::EpochsPerSlashingsVector::to_u64();
@@ -319,17 +360,17 @@ pub fn slash_validator<E: Preset>(
                 index: slashed_index,
             })?;
     validator.slashed = true;
-    validator.withdrawable_epoch = validator
-        .withdrawable_epoch
-        .max(epoch.checked_add(slashings_vector).ok_or_else(overflow)?);
+    validator.withdrawable_epoch = validator.withdrawable_epoch.max(state_sum(
+        epoch,
+        slashings_vector,
+        "slashed withdrawable epoch",
+    )?);
     let effective_balance = validator.effective_balance;
     let slashing = state
         .slashings
         .get_mut((epoch % slashings_vector) as usize)
         .ok_or_else(|| StfError::Tree("slashings is shorter than its length".into()))?;
-    *slashing = slashing
-        .checked_add(effective_balance)
-        .ok_or_else(overflow)?;
+    *slashing = state_sum(*slashing, effective_balance, "slashing accumulator")?;
     let slashing_penalty = effective_balance / MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA;
     decrease_balance(state, slashed_index, slashing_penalty)?;
 
@@ -337,15 +378,15 @@ pub fn slash_validator<E: Preset>(
     let proposer_index = state_proposer_index(state)?;
     let whistleblower_index = whistleblower_index.unwrap_or(proposer_index);
     let whistleblower_reward = effective_balance / WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA;
-    let proposer_reward = whistleblower_reward
-        .checked_mul(PROPOSER_WEIGHT)
-        .ok_or_else(overflow)?
-        / WEIGHT_DENOMINATOR;
-    increase_balance(state, proposer_index, proposer_reward)?;
-    increase_balance(
+    // `effective_balance / WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA * PROPOSER_WEIGHT` is less
+    // than `u64::MAX`, so the product does not overflow.
+    let proposer_reward = whistleblower_reward * PROPOSER_WEIGHT / WEIGHT_DENOMINATOR;
+    increase_balance_from_state(state, proposer_index, proposer_reward, "proposer reward")?;
+    increase_balance_from_state(
         state,
         whistleblower_index,
         whistleblower_reward - proposer_reward,
+        "whistleblower reward",
     )?;
 
     // Remove pending builder payments for blocks proposed by the slashed validator
@@ -672,6 +713,27 @@ mod tests {
     }
 
     #[test]
+    fn state_sums_are_not_a_proof() {
+        // An epoch is at most `u64::MAX / SLOTS_PER_EPOCH`, so the epoch sums of the
+        // slashing and the exit paths cannot overflow on a state. Their class comes from
+        // `state_sum`: a sum of values of our own state is never a proof.
+        assert_eq!(state_sum(3, 2, "builder withdrawable epoch"), Ok(5));
+        let err = state_sum(u64::MAX, 1, "builder withdrawable epoch").unwrap_err();
+        assert_eq!(
+            err,
+            StfError::StateArithmetic {
+                what: "builder withdrawable epoch"
+            }
+        );
+        assert!(!err.proves_invalid());
+        // The message names the value, not only the withdrawals sweep.
+        assert_eq!(
+            err.to_string(),
+            "state arithmetic failed: builder withdrawable epoch"
+        );
+    }
+
+    #[test]
     fn builder_payment_settlement() {
         // G L1538-1543: a payment with an amount becomes a pending withdrawal, and its slot
         // is reset to BuilderPendingPayment.empty().
@@ -816,24 +878,60 @@ mod tests {
             ),
             Err(StfError::UnknownValidator(8))
         );
-        // A slashings sum that does not fit in a Uint64.
+        // A slashings sum that does not fit in a Uint64. Both operands come from our own
+        // state, so the error is not a proof against the slashing.
         let mut state = genesis_state::<Minimal>(&[32 * ETH; 8]);
         *state.slashings.get_mut(0).unwrap() = u64::MAX;
+        let err = slash_validator(&mut state, 1, None, &mut TotalActiveBalanceCache::default())
+            .unwrap_err();
         assert_eq!(
-            slash_validator(&mut state, 1, None, &mut TotalActiveBalanceCache::default()),
-            Err(StfError::ArithmeticOverflow)
+            err,
+            StfError::StateArithmetic {
+                what: "slashing accumulator"
+            }
         );
-        // A reward that does not fit.
+        assert!(!err.proves_invalid());
+        // A proposer reward that does not fit: the balance and the reward come from our
+        // own state.
         let mut state = genesis_state::<Minimal>(&[32 * ETH; 8]);
         let proposer = get_beacon_proposer_index(&state).unwrap();
         *state.balances.get_mut(proposer as usize).unwrap() = u64::MAX;
+        let err = slash_validator(
+            &mut state,
+            (proposer + 1) % 8,
+            None,
+            &mut TotalActiveBalanceCache::default(),
+        )
+        .unwrap_err();
         assert_eq!(
-            slash_validator(
-                &mut state,
-                (proposer + 1) % 8,
-                None,
-                &mut TotalActiveBalanceCache::default()
-            ),
+            err,
+            StfError::StateArithmetic {
+                what: "proposer reward"
+            }
+        );
+        assert!(!err.proves_invalid());
+        // A whistleblower reward that does not fit.
+        let mut state = genesis_state::<Minimal>(&[32 * ETH; 8]);
+        let proposer = get_beacon_proposer_index(&state).unwrap();
+        let whistleblower = (proposer + 2) % 8;
+        *state.balances.get_mut(whistleblower as usize).unwrap() = u64::MAX;
+        let err = slash_validator(
+            &mut state,
+            (proposer + 1) % 8,
+            Some(whistleblower),
+            &mut TotalActiveBalanceCache::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            StfError::StateArithmetic {
+                what: "whistleblower reward"
+            }
+        );
+        assert!(!err.proves_invalid());
+        // The generic balance helper stays a proof: some callers add a value of the object.
+        assert_eq!(
+            increase_balance(&mut state, 0, u64::MAX),
             Err(StfError::ArithmeticOverflow)
         );
         // The balance helpers check the index: past the registry it is the object's

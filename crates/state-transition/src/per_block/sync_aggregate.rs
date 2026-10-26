@@ -5,7 +5,7 @@
 //! [`process_sync_aggregate`] applies the rewards only.
 
 use crate::accessors::{base_reward_per_increment, get_total_active_balance};
-use crate::mutators::{decrease_balance, increase_balance};
+use crate::mutators::{decrease_balance, increase_balance_from_state};
 use crate::per_block::{state_proposer_index, BlockContext};
 use crate::preset::{EFFECTIVE_BALANCE_INCREMENT, PROPOSER_WEIGHT, WEIGHT_DENOMINATOR};
 use crate::signatures::G2_POINT_AT_INFINITY;
@@ -51,6 +51,8 @@ pub fn process_sync_aggregate_with<E: Preset>(
     // Compute participant and proposer rewards
     let total_active_balance = get_total_active_balance(state)?;
     let total_active_increments = total_active_balance / EFFECTIVE_BALANCE_INCREMENT;
+    // Kept a proof, but the three products cannot fail: `total_base_rewards` is at most
+    // `64 * sqrt(total_active_balance)`, far below `u64::MAX`.
     let total_base_rewards = base_reward_per_increment(total_active_balance)
         .checked_mul(total_active_increments)
         .ok_or(StfError::ArithmeticOverflow)?;
@@ -73,8 +75,18 @@ pub fn process_sync_aggregate_with<E: Preset>(
         .zip(sync_aggregate.sync_committee_bits.iter())
     {
         if participation_bit {
-            increase_balance(state, participant_index, participant_reward)?;
-            increase_balance(state, proposer_index, proposer_reward)?;
+            increase_balance_from_state(
+                state,
+                participant_index,
+                participant_reward,
+                "sync committee reward",
+            )?;
+            increase_balance_from_state(
+                state,
+                proposer_index,
+                proposer_reward,
+                "sync proposer reward",
+            )?;
         } else {
             decrease_balance(state, participant_index, participant_reward)?;
         }
@@ -246,19 +258,41 @@ mod tests {
 
     #[test]
     fn balance_errors_stop_the_rewards() {
+        // Each operand comes from our own state, so no error here is a proof.
         // A total active balance that overflows.
         let mut huge = state();
         huge.validators.get_mut(0).unwrap().effective_balance = u64::MAX;
+        let err = process_sync_aggregate(&mut huge, &aggregate(&[])).unwrap_err();
         assert_eq!(
-            process_sync_aggregate(&mut huge, &aggregate(&[])),
-            Err(StfError::ArithmeticOverflow)
+            err,
+            StfError::StateArithmetic {
+                what: "total active balance"
+            }
         );
+        assert!(!err.proves_invalid());
         // A participant whose balance overflows.
         let mut full = state();
         *full.balances.get_mut(0).unwrap() = u64::MAX;
+        let err = process_sync_aggregate(&mut full, &aggregate(&[0])).unwrap_err();
         assert_eq!(
-            process_sync_aggregate(&mut full, &aggregate(&[0])),
-            Err(StfError::ArithmeticOverflow)
+            err,
+            StfError::StateArithmetic {
+                what: "sync committee reward"
+            }
         );
+        assert!(!err.proves_invalid());
+        // A proposer whose balance overflows.
+        let mut full = state();
+        let proposer = state_proposer_index(&full).unwrap();
+        *full.balances.get_mut(proposer as usize).unwrap() = u64::MAX;
+        let participant = if proposer == 0 { 1 } else { 0 };
+        let err = process_sync_aggregate(&mut full, &aggregate(&[participant])).unwrap_err();
+        assert_eq!(
+            err,
+            StfError::StateArithmetic {
+                what: "sync proposer reward"
+            }
+        );
+        assert!(!err.proves_invalid());
     }
 }

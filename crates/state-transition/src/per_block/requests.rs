@@ -22,7 +22,7 @@ use crate::accessors::{
 };
 use crate::mutators::{
     compute_consolidation_epoch_and_update_churn, compute_exit_epoch_and_update_churn,
-    initiate_validator_exit,
+    initiate_validator_exit, state_sum,
 };
 use crate::preset::{
     COMPOUNDING_WITHDRAWAL_PREFIX, GENESIS_SLOT, MIN_ACTIVATION_BALANCE,
@@ -246,12 +246,11 @@ pub fn process_withdrawal_request<E: Preset>(
     }
     // Verify the validator has been active long enough. An active validator has an
     // activation epoch at or before the current epoch, so the sum does not overflow.
-    let earliest_epoch = validator
-        .activation_epoch
-        .checked_add(E::SHARD_COMMITTEE_PERIOD)
-        .ok_or(StfError::StateArithmetic {
-            what: "activation epoch",
-        })?;
+    let earliest_epoch = state_sum(
+        validator.activation_epoch,
+        E::SHARD_COMMITTEE_PERIOD,
+        "exit eligibility epoch",
+    )?;
     if current_epoch < earliest_epoch {
         return Ok(());
     }
@@ -373,12 +372,11 @@ pub fn process_consolidation_request<E: Preset>(
     }
     // Verify the source has been active long enough. An active source has an activation
     // epoch at or before the current epoch, so the sum does not overflow on our own state.
-    let earliest_epoch = source_validator
-        .activation_epoch
-        .checked_add(E::SHARD_COMMITTEE_PERIOD)
-        .ok_or(StfError::StateArithmetic {
-            what: "activation epoch",
-        })?;
+    let earliest_epoch = state_sum(
+        source_validator.activation_epoch,
+        E::SHARD_COMMITTEE_PERIOD,
+        "exit eligibility epoch",
+    )?;
     if current_epoch < earliest_epoch {
         return Ok(());
     }

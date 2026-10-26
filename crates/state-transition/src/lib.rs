@@ -465,8 +465,12 @@ pub enum StfError {
     /// Other sums that read the state only give it for the same reason: the pending balance
     /// to withdraw of a validator, the exit and consolidation churn queues, and the
     /// activation and withdrawable epochs of the withdrawal and consolidation requests of
-    /// the parent payload.
-    #[error("withdrawals sweep arithmetic failed on the state: {what}")]
+    /// the parent payload. The slashing and exit paths also give it: the slashings
+    /// accumulator, the proposer and whistleblower rewards and the withdrawable epoch of
+    /// `slash_validator`, the builder withdrawable epoch, the builder pending balance to
+    /// withdraw, and the exit eligibility epoch of a voluntary exit or a request. The total
+    /// active balance and the sync committee rewards also give it.
+    #[error("state arithmetic failed: {what}")]
     StateArithmetic {
         /// The value that failed, for example `"withdrawal index"`.
         what: &'static str,
@@ -608,8 +612,9 @@ impl StfError {
     /// `proposer_lookahead` entry past the registry or a code index past a spec table
     /// (`ListIndexOutOfRange`), a participation epoch other than the previous and the
     /// current one (`ParticipationEpochOutOfRange`), prior withdrawals past the limit of a
-    /// sweep part (`PriorWithdrawalsPastLimit`), or a failed `Uint64` operation of the
-    /// withdrawals sweep or of a request on values of our own state (`StateArithmetic`):
+    /// sweep part (`PriorWithdrawalsPastLimit`), or a failed `Uint64` operation on values of
+    /// our own state, for example in the withdrawals sweep, a request or a slashing
+    /// (`StateArithmetic`):
     /// callers IGNORE those, never REJECT.
     ///
     /// These variants are a proof only when the state is the object's own pre-state,
