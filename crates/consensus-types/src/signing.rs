@@ -43,6 +43,10 @@ pub const DOMAIN_BUILDER_DEPOSIT: DomainType = [0x0e, 0, 0, 0];
 /// `DOMAIN_APPLICATION_MASK`.
 pub const DOMAIN_APPLICATION_MASK: DomainType = [0x00, 0, 0, 0x01];
 
+/// `BUILDER_INDEX_SELF_BUILD` (`gloas/beacon-chain.md` L571): the builder index of a bid and an
+/// envelope that the proposer builds itself.
+pub const BUILDER_INDEX_SELF_BUILD: BuilderIndex = u64::MAX;
+
 /// `compute_fork_data_root`: `hash_tree_root(ForkData(current_version, genesis_validators_root))`.
 pub fn compute_fork_data_root(current_version: Version, genesis_validators_root: Root) -> Root {
     ForkData {
@@ -105,6 +109,35 @@ pub enum SignerRef {
     /// that does not decode or fails `KeyValidate`, and also for a signature that does not
     /// decode. An error is only for a verifier that is not available or that fails.
     Inline(BLSPubkey),
+}
+
+/// The signer of an execution payload envelope by `builder_index`, as
+/// `verify_execution_payload_envelope_signature` selects it (`gloas/beacon-chain.md`
+/// L2104-2115).
+///
+/// - A self-build envelope ([`BUILDER_INDEX_SELF_BUILD`]) is signed by the proposer with its
+///   validator key: [`SignerRef::Validator`] of `proposer_index`
+///   (`state.latest_block_header.proposer_index`). A builder key never signs it, and the
+///   verifier makes no builder-key lookup for it. `version` is not used.
+/// - Any other envelope is signed by `state.builders[builder_index].pubkey`:
+///   [`SignerRef::Builder`] with `version`, the `builder_key_version` of that state. The
+///   version is a lookup hint only (see [`SignerRef::Builder`]).
+///
+/// The function selects the signer only. The signing root (`DOMAIN_BEACON_BUILDER`) and the
+/// signature check are the caller's.
+pub fn envelope_signer(
+    builder_index: BuilderIndex,
+    proposer_index: ValidatorIndex,
+    version: u64,
+) -> SignerRef {
+    if builder_index == BUILDER_INDEX_SELF_BUILD {
+        SignerRef::Validator(proposer_index)
+    } else {
+        SignerRef::Builder {
+            index: builder_index,
+            version,
+        }
+    }
 }
 
 /// A signature set with no signers cannot be verified.

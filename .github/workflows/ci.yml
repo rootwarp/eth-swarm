@@ -127,6 +127,8 @@ jobs:
         run: bash scripts/tests/check-setup-pin.test.sh && bash scripts/check-setup-pin.sh
       - name: Only cl-verify's own tests enable cl-verify/test-backends
         run: bash scripts/tests/check-test-backends.test.sh && bash scripts/check-test-backends.sh
+      - name: Only dev-dependencies enable state-transition/testing (backends without BLS)
+        run: bash scripts/tests/check-stf-testing.test.sh && bash scripts/check-stf-testing.sh
       - name: Only spec-tests may enable crypto-bls/test-vectors
         run: bash scripts/check-bls-features.sh
       - name: cl-chain links only crypto-bls/aggregate, never crypto-bls/verify
@@ -139,12 +141,16 @@ jobs:
         run: bash scripts/tests/check-m2a-deps.test.sh && bash scripts/check-m2a-deps.sh
       - name: state-transition links no blst (pure core; signatures go through a backend)
         run: bash scripts/tests/check-state-transition-deps.test.sh && bash scripts/check-state-transition-deps.sh
+      - name: cl-verify-cache stays a leaf (state-transition, crypto-bls and blst are dev-only)
+        run: bash scripts/tests/check-verify-cache-deps.test.sh && bash scripts/check-verify-cache-deps.sh
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Fetch and verify spec vectors (uncached)
         run: PRESETS="general minimal" bash testing/fetch-vectors.sh
       - run: cargo test --workspace --locked
       - name: Bad column sidecars from gossip are never stored or served (KZG through cl-verify)
         run: cargo test -p cl-chain --test v2_serving --locked
+      - name: Builder keys under index reuse, re-registration, reorg and self-build (M3 exit 2b)
+        run: cargo test -p cl-verify-cache --test v3_builder_keys --locked
       - name: Every service runs the contract suite, in process and over UDS
         run: bash scripts/tests/check-contract-tests.test.sh && bash scripts/check-contract-tests.sh
       - name: crypto-bls API tests with every feature (verify, aggregate, test-vectors)

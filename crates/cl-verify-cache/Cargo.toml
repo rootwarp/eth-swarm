@@ -13,6 +13,15 @@ sha2 = "0.10"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+# The builder-key tests (`tests/v3_builder_keys.rs`, `builders::model`) drive the real Gloas state
+# transition and check real BLS signatures. Dev-only: the normal dependencies stay a leaf
+# (scripts/check-verify-cache-deps.sh).
+consensus-types = { path = "../consensus-types" }
+state-transition = { path = "../state-transition", features = ["testing"] }
+crypto-bls = { path = "../crypto-bls", features = ["verify"] }
+# Test key pairs and signatures: crypto-bls has no secret keys outside its `test-vectors` feature,
+# which only spec-tests may enable (scripts/check-bls-features.sh).
+blst.workspace = true
 
 [[bench]]
 name = "persist"

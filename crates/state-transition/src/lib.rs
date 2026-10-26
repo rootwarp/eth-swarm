@@ -35,8 +35,8 @@ pub mod per_slot;
 pub mod preset;
 pub mod signatures;
 
-#[cfg(test)]
-mod testing;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use per_block::bid::BlobSchedule;
 pub use preset::Preset;

@@ -1232,8 +1232,12 @@ dependencies = [
 name = "cl-verify-cache"
 version = "0.1.0"
 dependencies = [
+ "blst",
+ "consensus-types",
+ "crypto-bls",
  "proptest",
  "sha2 0.10.9",
+ "state-transition",
  "tempfile",
  "thiserror 2.0.21",
 ]

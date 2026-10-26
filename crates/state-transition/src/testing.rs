@@ -1,5 +1,8 @@
 //! Test inputs: a Gloas genesis-like state with a given registry, empty blocks, builders
 //! and their requests, a scripted signature backend and a pubkey aggregator without BLS.
+//!
+//! The crate's own tests use the module. The tests of other crates get it with the feature
+//! `testing`, as a dev-dependency only.
 
 use crate::accessors::{get_block_root_at_slot, get_current_epoch, get_randao_mix};
 use crate::caches::get_beacon_proposer_index;
@@ -25,7 +28,7 @@ use tree_hash::TreeHash;
 /// A Gloas state at slot 0 whose validators have `effective_balances` (each also its
 /// balance), all active from epoch 0. Every RANDAO mix is `mix`. The proposer lookahead and
 /// the PTC window are initialized as at genesis.
-pub(crate) fn genesis_state_with_mix<E: Preset>(
+pub fn genesis_state_with_mix<E: Preset>(
     effective_balances: &[Gwei],
     mix: Bytes32,
 ) -> BeaconState<E> {
@@ -36,10 +39,7 @@ pub(crate) fn genesis_state_with_mix<E: Preset>(
 
 /// [`genesis_state_with_mix`] with a zero proposer lookahead and PTC window, for registries
 /// too small to give every slot a non-empty committee (the PTC of such a slot does not exist).
-pub(crate) fn registry_state<E: Preset>(
-    effective_balances: &[Gwei],
-    mix: Bytes32,
-) -> BeaconState<E> {
+pub fn registry_state<E: Preset>(effective_balances: &[Gwei], mix: Bytes32) -> BeaconState<E> {
     let validators = effective_balances.iter().enumerate().map(|(i, &b)| {
         let mut pubkey = [0u8; 48];
         pubkey[..8].copy_from_slice(&(i as u64).to_le_bytes());
@@ -149,18 +149,18 @@ pub(crate) fn registry_state<E: Preset>(
 }
 
 /// [`genesis_state_with_mix`] with a fixed mix.
-pub(crate) fn genesis_state<E: Preset>(effective_balances: &[Gwei]) -> BeaconState<E> {
+pub fn genesis_state<E: Preset>(effective_balances: &[Gwei]) -> BeaconState<E> {
     genesis_state_with_mix(effective_balances, Bytes32::repeat_byte(0x5a))
 }
 
 /// Sets `proposer_lookahead` and `ptc_window` as the fork upgrade does at the state's epoch.
-pub(crate) fn refresh_lookahead<E: Preset>(state: &mut BeaconState<E>) {
+pub fn refresh_lookahead<E: Preset>(state: &mut BeaconState<E>) {
     state.proposer_lookahead = Vector::new(initialize_proposer_lookahead(state).unwrap()).unwrap();
     state.ptc_window = Vector::new(initialize_ptc_window(state).unwrap()).unwrap();
 }
 
 /// `ExecutionRequests.empty()`: no request of any kind.
-pub(crate) fn empty_requests<E: Preset>() -> ExecutionRequests<E> {
+pub fn empty_requests<E: Preset>() -> ExecutionRequests<E> {
     ExecutionRequests {
         deposits: Default::default(),
         withdrawals: Default::default(),
@@ -191,7 +191,7 @@ fn empty_bid<E: Preset>(slot: u64) -> ExecutionPayloadBid<E> {
 /// A block at `slot` by `proposer_index` with an empty body (no sync committee bits, the
 /// infinity sync signature and a self-build bid), a zero `state_root` and the signature
 /// `[0x11; 96]`.
-pub(crate) fn signed_block<E: Preset>(slot: u64, proposer_index: u64) -> SignedBeaconBlock<E> {
+pub fn signed_block<E: Preset>(slot: u64, proposer_index: u64) -> SignedBeaconBlock<E> {
     let body = BeaconBlockBody {
         randao_reveal: [0; 96],
         eth1_data: Eth1Data {
@@ -235,11 +235,11 @@ pub(crate) fn signed_block<E: Preset>(slot: u64, proposer_index: u64) -> SignedB
 
 /// The `GENESIS_FORK_VERSION` of `configs/minimal.yaml` (L27), for the builder deposits of
 /// the tests.
-pub(crate) const GENESIS_FORK_VERSION: Version = [0x00, 0x00, 0x00, 0x01];
+pub const GENESIS_FORK_VERSION: Version = [0x00, 0x00, 0x00, 0x01];
 
 /// The `CAPELLA_FORK_VERSION` of `configs/minimal.yaml` (L43), for the voluntary exits of
 /// the tests.
-pub(crate) const CAPELLA_FORK_VERSION: Version = [0x03, 0x00, 0x00, 0x01];
+pub const CAPELLA_FORK_VERSION: Version = [0x03, 0x00, 0x00, 0x01];
 
 /// A [`SignatureBackend`] that gives the scripted verdicts in sequence and records each set
 /// that it gets. A call after the last verdict panics, so a test also proves that no other
@@ -248,14 +248,14 @@ pub(crate) const CAPELLA_FORK_VERSION: Version = [0x03, 0x00, 0x00, 0x01];
 /// A script follows the contract of [`SignatureBackend`]: `Err` stands for a backend
 /// without a verdict, and `Ok(false)` for any invalid set, which includes a key that fails
 /// `KeyValidate`.
-pub(crate) struct ScriptedBackend {
+pub struct ScriptedBackend {
     verdicts: RefCell<VecDeque<Result<bool, BackendError>>>,
     seen: RefCell<Vec<SignatureSet>>,
 }
 
 impl ScriptedBackend {
     /// A backend that gives `verdicts`, one for each call.
-    pub(crate) fn new(verdicts: impl IntoIterator<Item = Result<bool, BackendError>>) -> Self {
+    pub fn new(verdicts: impl IntoIterator<Item = Result<bool, BackendError>>) -> Self {
         Self {
             verdicts: RefCell::new(verdicts.into_iter().collect()),
             seen: RefCell::new(Vec::new()),
@@ -263,7 +263,7 @@ impl ScriptedBackend {
     }
 
     /// The sets of every call, in sequence.
-    pub(crate) fn seen(&self) -> Vec<SignatureSet> {
+    pub fn seen(&self) -> Vec<SignatureSet> {
         self.seen.borrow().clone()
     }
 }
@@ -282,14 +282,14 @@ impl SignatureBackend for ScriptedBackend {
 /// with a signer in `invalid_keys` gives `Ok(false)`, as a key that fails `KeyValidate`
 /// must, and every other set is valid. It never gives `Err`. It records each set that it
 /// gets.
-pub(crate) struct ContractBackend {
+pub struct ContractBackend {
     invalid_keys: Vec<BLSPubkey>,
     seen: RefCell<Vec<SignatureSet>>,
 }
 
 impl ContractBackend {
     /// A backend for which the keys `invalid_keys` fail `KeyValidate`.
-    pub(crate) fn new(invalid_keys: impl IntoIterator<Item = BLSPubkey>) -> Self {
+    pub fn new(invalid_keys: impl IntoIterator<Item = BLSPubkey>) -> Self {
         Self {
             invalid_keys: invalid_keys.into_iter().collect(),
             seen: RefCell::new(Vec::new()),
@@ -297,7 +297,7 @@ impl ContractBackend {
     }
 
     /// The sets of every call, in sequence.
-    pub(crate) fn seen(&self) -> Vec<SignatureSet> {
+    pub fn seen(&self) -> Vec<SignatureSet> {
         self.seen.borrow().clone()
     }
 }
@@ -315,7 +315,7 @@ impl SignatureBackend for ContractBackend {
 
 /// A builder with the key `[key; 48]` and the execution address `[key; 20]`, with
 /// `balance`, deposited in `deposit_epoch` and not exiting.
-pub(crate) fn builder(key: u8, balance: Gwei, deposit_epoch: Epoch) -> Builder {
+pub fn builder(key: u8, balance: Gwei, deposit_epoch: Epoch) -> Builder {
     Builder {
         pubkey: [key; 48],
         version: 0,
@@ -328,7 +328,7 @@ pub(crate) fn builder(key: u8, balance: Gwei, deposit_epoch: Epoch) -> Builder {
 
 /// A builder deposit request of `amount` for the key `[key; 48]`, with the builder
 /// withdrawal credentials of the address `[key; 20]` and the signature `[0x22; 96]`.
-pub(crate) fn builder_deposit_request(key: u8, amount: Gwei) -> BuilderDepositRequest {
+pub fn builder_deposit_request(key: u8, amount: Gwei) -> BuilderDepositRequest {
     let mut withdrawal_credentials = Bytes32::ZERO;
     withdrawal_credentials[0] = BUILDER_WITHDRAWAL_PREFIX;
     withdrawal_credentials[12..].fill(key);
@@ -341,7 +341,7 @@ pub(crate) fn builder_deposit_request(key: u8, amount: Gwei) -> BuilderDepositRe
 }
 
 /// A builder exit request for the key `[key; 48]` from the address `[key; 20]`.
-pub(crate) fn builder_exit_request(key: u8) -> BuilderExitRequest {
+pub fn builder_exit_request(key: u8) -> BuilderExitRequest {
     BuilderExitRequest {
         source_address: Address::repeat_byte(key),
         pubkey: [key; 48],
@@ -349,9 +349,9 @@ pub(crate) fn builder_exit_request(key: u8) -> BuilderExitRequest {
 }
 
 /// The key of the builder that exits in [`index_reuse_states`].
-pub(crate) const EXITED_BUILDER_KEY: u8 = 0xa1;
+pub const EXITED_BUILDER_KEY: u8 = 0xa1;
 /// The key of the new builder that takes its index in [`index_reuse_states`].
-pub(crate) const REUSING_BUILDER_KEY: u8 = 0xb1;
+pub const REUSING_BUILDER_KEY: u8 = 0xb1;
 
 /// The index reuse of G L2322-2331, through the real requests. The registry starts with the
 /// builders `[0xa1; 48]` (index 0) and `[0xa2; 48]` (index 1), both deposited in epoch 0
@@ -360,7 +360,7 @@ pub(crate) const REUSING_BUILDER_KEY: u8 = 0xb1;
 ///
 /// Returns that state, and the state after a deposit of 7 Gwei for the key `[0xb1; 48]`
 /// with a valid signature, which takes index 0.
-pub(crate) fn index_reuse_states<E: Preset>() -> (BeaconState<E>, BeaconState<E>) {
+pub fn index_reuse_states<E: Preset>() -> (BeaconState<E>, BeaconState<E>) {
     let mut state = registry_state::<E>(&[32_000_000_000; 8], Bytes32::ZERO);
     state.slot = E::start_slot_at_epoch(3) + 1;
     state.finalized_checkpoint.epoch = 3;
@@ -386,7 +386,7 @@ pub(crate) fn index_reuse_states<E: Preset>() -> (BeaconState<E>, BeaconState<E>
 /// `[0xbb; 32]`, the block root of the previous slot and the RANDAO mix of the current
 /// epoch, with no blob commitment. A self-build bid has the infinity signature, and any
 /// other bid the signature `[0x33; 96]`.
-pub(crate) fn bid_for_state<E: Preset>(
+pub fn bid_for_state<E: Preset>(
     state: &BeaconState<E>,
     builder_index: BuilderIndex,
     value: Gwei,
@@ -413,7 +413,7 @@ pub(crate) fn bid_for_state<E: Preset>(
 
 /// [`signed_block`] at `state.slot` by the proposer of the slot, whose parent is the latest
 /// block header: a block that `process_block_header` accepts on `state`.
-pub(crate) fn block_at_state_slot<E: Preset>(state: &BeaconState<E>) -> SignedBeaconBlock<E> {
+pub fn block_at_state_slot<E: Preset>(state: &BeaconState<E>) -> SignedBeaconBlock<E> {
     let proposer = get_beacon_proposer_index(state).unwrap();
     let mut block = signed_block::<E>(state.slot, proposer);
     block.message.parent_root = state.latest_block_header.tree_hash_root();
@@ -423,7 +423,7 @@ pub(crate) fn block_at_state_slot<E: Preset>(state: &BeaconState<E>) -> SignedBe
 /// A [`PubkeyAggregator`] without BLS: the byte-wise XOR of the keys. It is not the BLS sum.
 /// It depends on each key, but only on the parity of the number of times a key occurs: two
 /// copies of a key cancel. An empty input fails, as in `eth_aggregate_pubkeys`.
-pub(crate) struct XorAggregator;
+pub struct XorAggregator;
 
 impl PubkeyAggregator for XorAggregator {
     fn aggregate_pubkeys(&self, pubkeys: &[BLSPubkey]) -> Result<BLSPubkey, AggregationError> {
@@ -442,7 +442,7 @@ impl PubkeyAggregator for XorAggregator {
 
 /// The blob limit of `configs/minimal.yaml` in each epoch: its `BLOB_SCHEDULE` is empty
 /// (L239), so `get_blob_parameters` gives `MAX_BLOBS_PER_BLOCK_ELECTRA` (L201).
-pub(crate) const MINIMAL_MAX_BLOBS_PER_BLOCK: u64 = 9;
+pub const MINIMAL_MAX_BLOBS_PER_BLOCK: u64 = 9;
 
 /// The blob schedule of `configs/minimal.yaml`: [`MINIMAL_MAX_BLOBS_PER_BLOCK`] in each epoch.
 fn minimal_blob_schedule(_: Epoch) -> u64 {
@@ -450,7 +450,7 @@ fn minimal_blob_schedule(_: Epoch) -> u64 {
 }
 
 /// A [`BlsContext`] of the minimal config with `backend` and the [`XorAggregator`].
-pub(crate) fn bls_context(backend: &dyn SignatureBackend) -> BlsContext<'_> {
+pub fn bls_context(backend: &dyn SignatureBackend) -> BlsContext<'_> {
     BlsContext {
         backend,
         aggregator: &XorAggregator,
@@ -461,7 +461,7 @@ pub(crate) fn bls_context(backend: &dyn SignatureBackend) -> BlsContext<'_> {
 }
 
 /// A [`SignatureBackend`] for the tests that need no verdict: each call gives `Err`.
-pub(crate) struct NoVerdicts;
+pub struct NoVerdicts;
 
 impl SignatureBackend for NoVerdicts {
     fn verify_signature_sets(&self, _: &[SignatureSet]) -> Result<bool, BackendError> {
@@ -470,7 +470,7 @@ impl SignatureBackend for NoVerdicts {
 }
 
 /// [`bls_context`] with [`NoVerdicts`], for the tests that check no signature.
-pub(crate) fn no_bls() -> BlsContext<'static> {
+pub fn no_bls() -> BlsContext<'static> {
     bls_context(&NoVerdicts)
 }
 
@@ -478,14 +478,14 @@ pub(crate) fn no_bls() -> BlsContext<'static> {
 /// cache of a caller does. A call with a set that it does not hold gives `Err`, as a cache
 /// without that verdict does. Else the call gives `Ok(true)` only if each set is valid. It
 /// records each set that it gets.
-pub(crate) struct PrefetchedBackend {
+pub struct PrefetchedBackend {
     verdicts: Vec<(SignatureSet, bool)>,
     seen: RefCell<Vec<SignatureSet>>,
 }
 
 impl PrefetchedBackend {
     /// A backend that holds `verdicts`.
-    pub(crate) fn new(verdicts: impl IntoIterator<Item = (SignatureSet, bool)>) -> Self {
+    pub fn new(verdicts: impl IntoIterator<Item = (SignatureSet, bool)>) -> Self {
         Self {
             verdicts: verdicts.into_iter().collect(),
             seen: RefCell::new(Vec::new()),
@@ -493,7 +493,7 @@ impl PrefetchedBackend {
     }
 
     /// The sets of every call, in sequence.
-    pub(crate) fn seen(&self) -> Vec<SignatureSet> {
+    pub fn seen(&self) -> Vec<SignatureSet> {
         self.seen.borrow().clone()
     }
 }

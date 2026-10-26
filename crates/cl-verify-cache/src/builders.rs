@@ -41,6 +41,13 @@
 //! comparison, not the high-water mark, decides what a cached entry is good for, so cl-chain
 //! needs no hold-back between the builder feed and VerifyBls.
 //!
+//! # Self-build
+//!
+//! A self-build bid has no signature set: its signature is `G2_POINT_AT_INFINITY` (G
+//! L2170-2172). A self-build envelope is signed by the proposer with its validator key
+//! (`consensus_types::signing::envelope_signer`, G L2104-2115). Neither makes a lookup in this
+//! cache.
+//!
 //! The cache is in memory only. [`crate::persist`] writes the validator registry only; after a
 //! restart the builder cache is empty until the feed refills it.
 //!
@@ -211,6 +218,9 @@ impl<K> BuilderKeyCache<K> {
         self.entries.len() as u64
     }
 }
+
+#[cfg(test)]
+mod model;
 
 #[cfg(test)]
 mod tests {

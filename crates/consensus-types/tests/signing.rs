@@ -5,9 +5,9 @@ mod common;
 use consensus_types::common::{ForkData, SigningData, VoluntaryExit};
 use consensus_types::primitives::*;
 use consensus_types::signing::{
-    compute_domain, compute_fork_data_root, compute_signing_root, SignatureSet, SignatureSetError,
-    SignerRef, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_BUILDER, DOMAIN_BEACON_PROPOSER,
-    DOMAIN_VOLUNTARY_EXIT,
+    compute_domain, compute_fork_data_root, compute_signing_root, envelope_signer, SignatureSet,
+    SignatureSetError, SignerRef, BUILDER_INDEX_SELF_BUILD, DOMAIN_BEACON_ATTESTER,
+    DOMAIN_BEACON_BUILDER, DOMAIN_BEACON_PROPOSER, DOMAIN_VOLUNTARY_EXIT,
 };
 use consensus_types::Minimal;
 use proptest::prelude::*;
@@ -103,4 +103,34 @@ fn signature_sets_name_their_signers() {
         SignatureSet::aggregate(vec![], root, common::SIG),
         Err(SignatureSetError::NoSigners)
     );
+}
+
+#[test]
+fn self_build_index_matches_spec() {
+    // `BUILDER_INDEX_SELF_BUILD` (`gloas/beacon-chain.md` L571): `BuilderIndex(UINT64_MAX)`.
+    assert_eq!(BUILDER_INDEX_SELF_BUILD, u64::MAX);
+}
+
+#[test]
+fn a_self_build_envelope_is_signed_by_the_proposer() {
+    // `verify_execution_payload_envelope_signature` (G L2104-2115): the proposer's validator key.
+    assert_eq!(
+        envelope_signer(BUILDER_INDEX_SELF_BUILD, 5, 0xdead),
+        SignerRef::Validator(5)
+    );
+}
+
+proptest! {
+    /// Any other builder index names the builder and the key version, never the proposer.
+    #[test]
+    fn a_builder_envelope_is_signed_by_its_builder(
+        index in 0..BUILDER_INDEX_SELF_BUILD,
+        proposer in any::<u64>(),
+        version in any::<u64>(),
+    ) {
+        prop_assert_eq!(
+            envelope_signer(index, proposer, version),
+            SignerRef::Builder { index, version }
+        );
+    }
 }

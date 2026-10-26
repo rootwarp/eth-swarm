@@ -54,8 +54,8 @@ pub const BUILDER_WITHDRAWAL_PREFIX: u8 = 0xb0;
 /// `PAYLOAD_BUILDER_VERSION` (G "Builder versions", a constant).
 pub const PAYLOAD_BUILDER_VERSION: u8 = 0;
 /// `BUILDER_INDEX_SELF_BUILD` (G L571, a constant): the builder index of a bid that the
-/// proposer builds itself.
-pub const BUILDER_INDEX_SELF_BUILD: u64 = u64::MAX;
+/// proposer builds itself. consensus-types holds the value, for `envelope_signer`.
+pub use consensus_types::signing::BUILDER_INDEX_SELF_BUILD;
 /// `BUILDER_PAYMENT_THRESHOLD_NUMERATOR` (G L572, a constant).
 pub const BUILDER_PAYMENT_THRESHOLD_NUMERATOR: u64 = 6;
 /// `BUILDER_PAYMENT_THRESHOLD_DENOMINATOR` (G L573, a constant).

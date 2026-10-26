@@ -7,6 +7,12 @@ rust-version.workspace = true
 publish = false
 description = "The pure Gloas state transition: slot processing, shuffling and the committee, proposer, PTC and sync-committee selection. No I/O and no blst."
 
+[features]
+# Dev-only: the test inputs of `testing` (states, requests, bids, signature backends without BLS)
+# for the tests of other crates. `ContractBackend` accepts each set without a BLS check, so only a
+# dev-dependency may enable it (scripts/check-stf-testing.sh).
+testing = []
+
 [dependencies]
 consensus-types = { path = "../consensus-types" }
 # sha256 of the spec (`hash`): the version tree_hash already pulls in, so Cargo.lock keeps one.
