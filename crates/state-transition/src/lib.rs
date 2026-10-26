@@ -187,14 +187,21 @@ pub enum StfError {
         /// `len(state.builder_pending_payments)`.
         len: u64,
     },
+    /// The backend has no verdict for the signature of a deposit with an inline key (for
+    /// example a builder deposit). The caller fetches these verdicts before the transition
+    /// (ADR-011), so this error means that the fetch did not give one. This is never a
+    /// proof that the input is invalid: callers IGNORE, never REJECT, on it.
+    #[error("no prefetched deposit signature verdict: {0}")]
+    MissingVerdict(BackendError),
 }
 
 impl StfError {
     /// Whether the error proves that the input is invalid by the spec (REJECT). It does not
-    /// for a step that is not ported yet, a backend without a verdict, a committee cache of
-    /// another epoch or seed, a failure of the state trees, a state list shorter than the
-    /// registry or a code index past a spec table (`ListIndexOutOfRange`), or a participation
-    /// epoch other than the previous and the current one (`ParticipationEpochOutOfRange`):
+    /// for a step that is not ported yet, a backend without a verdict, a missing deposit
+    /// verdict, a committee cache of another epoch or seed, a failure of the state trees, a
+    /// state list shorter than the registry or a code index past a spec table
+    /// (`ListIndexOutOfRange`), or a participation epoch other than the previous and the
+    /// current one (`ParticipationEpochOutOfRange`):
     /// callers IGNORE those, never REJECT.
     ///
     /// [`StfError::StateRootMismatch`] from [`state_transition`] is not a proof yet either.
@@ -219,7 +226,9 @@ impl StfError {
             | Self::ListIndexOutOfRange { .. }
             // The spec reads participation only for the previous and the current epoch,
             // so another epoch is a caller error.
-            | Self::ParticipationEpochOutOfRange { .. } => false,
+            | Self::ParticipationEpochOutOfRange { .. }
+            // The verdict was not fetched, which says nothing about the deposit.
+            | Self::MissingVerdict(_) => false,
             Self::SlotNotLater { .. }
             | Self::InvalidBlockSignature
             | Self::StateRootMismatch { .. }
@@ -442,7 +451,7 @@ mod tests {
 
     /// The number of [`StfError`] variants: one more than the largest [`variant_id`].
     /// Increase `VARIANTS` when you add an id.
-    const VARIANTS: usize = 20;
+    const VARIANTS: usize = 21;
 
     /// A distinct id for each variant. The match has no `_` arm, so a new variant does not
     /// compile until it gets an id here, and then the table test fails until it has an entry.
@@ -468,6 +477,7 @@ mod tests {
             StfError::ListIndexOutOfRange { .. } => 17,
             StfError::BlockRootOutOfRange { .. } => 18,
             StfError::ParticipationEpochOutOfRange { .. } => 19,
+            StfError::MissingVerdict(_) => 20,
         }
     }
 
@@ -554,6 +564,10 @@ mod tests {
                     epoch: 1,
                     state_epoch: 3,
                 },
+                false,
+            ),
+            (
+                StfError::MissingVerdict(BackendError("not prefetched".into())),
                 false,
             ),
         ];

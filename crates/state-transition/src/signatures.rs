@@ -21,6 +21,12 @@ pub struct BackendError(pub String);
 /// Checks signature sets for the state transition. Calls are synchronous.
 pub trait SignatureBackend {
     /// `Ok(true)` if every set in `sets` is valid, `Ok(false)` if at least one is not.
+    ///
+    /// A key or a signature that does not decode, or a key that fails `KeyValidate`, makes
+    /// its set invalid: `Ok(false)`, never `Err`. The spec needs this for the inline keys of
+    /// deposits ([`SignerRef::Inline`]): `bls.Verify` returns `False` for such a key, and the
+    /// deposit is ignored. `Err` is only for a backend that is not available or that fails
+    /// (for example a timeout, an overload or a verdict that was not fetched).
     fn verify_signature_sets(&self, sets: &[SignatureSet]) -> Result<bool, BackendError>;
 }
 

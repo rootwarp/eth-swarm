@@ -1,5 +1,7 @@
 //! Block processing (`process_block`, G L1754-1771). Not ported yet.
 
+pub mod builder;
+
 use crate::{Preset, StfError};
 use consensus_types::gloas::{BeaconBlock, BeaconState};
 

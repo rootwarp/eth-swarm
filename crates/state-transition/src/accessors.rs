@@ -2,15 +2,15 @@
 
 use crate::caches::committee::{compute_shuffled_index, CommitteeCache};
 use crate::preset::{
-    BASE_REWARD_FACTOR, EFFECTIVE_BALANCE_INCREMENT, MAX_EFFECTIVE_BALANCE_ELECTRA,
-    MAX_SEED_LOOKAHEAD, MIN_SEED_LOOKAHEAD,
+    BASE_REWARD_FACTOR, BUILDER_INDEX_FLAG, BUILDER_WITHDRAWAL_PREFIX, EFFECTIVE_BALANCE_INCREMENT,
+    MAX_EFFECTIVE_BALANCE_ELECTRA, MAX_SEED_LOOKAHEAD, MIN_SEED_LOOKAHEAD,
 };
 use crate::{Preset, StfError};
 use consensus_types::common::Validator;
 use consensus_types::gloas::{Attestation, BeaconState};
 use consensus_types::primitives::{
-    Bytes32, CommitteeIndex, Domain, DomainType, Epoch, Gwei, ParticipationFlags, Root, Slot,
-    ValidatorIndex,
+    BuilderIndex, Bytes32, CommitteeIndex, Domain, DomainType, Epoch, Gwei, ParticipationFlags,
+    Root, Slot, ValidatorIndex, FAR_FUTURE_EPOCH,
 };
 use consensus_types::signing::{compute_domain, DOMAIN_BEACON_ATTESTER, DOMAIN_SYNC_COMMITTEE};
 use ethereum_hashing::{Context, Sha256Context};
@@ -492,13 +492,80 @@ pub fn get_base_reward<E: Preset>(
     )
 }
 
+/// `is_builder_index` (G L1047-1048, New in Gloas): whether `validator_index` carries
+/// `BUILDER_INDEX_FLAG`, so that it names a builder.
+pub fn is_builder_index(validator_index: ValidatorIndex) -> bool {
+    validator_index & BUILDER_INDEX_FLAG != 0
+}
+
+/// `convert_builder_index_to_validator_index` (G L1141-1142, New in Gloas).
+pub fn convert_builder_index_to_validator_index(builder_index: BuilderIndex) -> ValidatorIndex {
+    builder_index | BUILDER_INDEX_FLAG
+}
+
+/// `convert_validator_index_to_builder_index` (G L1148-1149, New in Gloas).
+pub fn convert_validator_index_to_builder_index(validator_index: ValidatorIndex) -> BuilderIndex {
+    validator_index & !BUILDER_INDEX_FLAG
+}
+
+/// `is_builder_withdrawal_credential` (G L1070-1071, New in Gloas).
+pub fn is_builder_withdrawal_credential(withdrawal_credentials: &Bytes32) -> bool {
+    withdrawal_credentials[0] == BUILDER_WITHDRAWAL_PREFIX
+}
+
+/// `is_active_builder` (G L1054-1064, New in Gloas): the deposit epoch of the builder is
+/// before the finalized epoch, and the builder did not initiate an exit.
+pub fn is_active_builder<E: Preset>(
+    state: &BeaconState<E>,
+    builder_index: BuilderIndex,
+) -> Result<bool, StfError> {
+    let builder = state
+        .builders
+        .get(builder_index as usize)
+        .ok_or(StfError::UnknownBuilder(builder_index))?;
+    Ok(
+        // Placement in builder list is finalized
+        builder.deposit_epoch < state.finalized_checkpoint.epoch
+            // Has not initiated exit
+            && builder.withdrawable_epoch == FAR_FUTURE_EPOCH,
+    )
+}
+
+/// `get_pending_balance_to_withdraw_for_builder` (G L1168-1178, New in Gloas): the sum of the
+/// pending withdrawals and the pending payments of the builder. The sum is checked.
+///
+/// It reads both queues. `builder_pending_payments` has `2 * SLOTS_PER_EPOCH` entries, and
+/// `builder_pending_withdrawals` holds only the withdrawals that the sweep did not pay yet.
+pub fn get_pending_balance_to_withdraw_for_builder<E: Preset>(
+    state: &BeaconState<E>,
+    builder_index: BuilderIndex,
+) -> Result<Gwei, StfError> {
+    let withdrawals = state
+        .builder_pending_withdrawals
+        .iter()
+        .filter(|withdrawal| withdrawal.builder_index == builder_index)
+        .map(|withdrawal| withdrawal.amount);
+    let payments = state
+        .builder_pending_payments
+        .iter()
+        .filter(|payment| payment.withdrawal.builder_index == builder_index)
+        .map(|payment| payment.withdrawal.amount);
+    withdrawals
+        .chain(payments)
+        .try_fold(0u64, |balance, amount| balance.checked_add(amount))
+        .ok_or(StfError::ArithmeticOverflow)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::{genesis_state, registry_state};
     use consensus_types::common::{AttestationData, Checkpoint};
+    use consensus_types::gloas::{Builder, BuilderPendingWithdrawal};
+    use consensus_types::primitives::{Address, FAR_FUTURE_EPOCH};
     use consensus_types::signing::DOMAIN_BEACON_PROPOSER;
     use consensus_types::{EthSpec, Mainnet, Minimal};
+    use proptest::prelude::*;
     use ssz::ProgressiveBitList;
 
     const ETH: u64 = 1_000_000_000;
@@ -718,6 +785,140 @@ mod tests {
         // A new seed with the same decision root is the same key.
         state.randao_mixes = milhouse::Vector::from_elem(Bytes32::repeat_byte(9)).unwrap();
         assert_eq!(cache.get(&state), Ok(224 * ETH));
+    }
+
+    proptest! {
+        #[test]
+        fn builder_index_roundtrip(builder_index in 0..BUILDER_INDEX_FLAG, validator_index: u64) {
+            // A builder index below the flag goes to a flagged validator index and back.
+            let flagged = convert_builder_index_to_validator_index(builder_index);
+            prop_assert!(is_builder_index(flagged));
+            prop_assert_eq!(flagged, builder_index + BUILDER_INDEX_FLAG);
+            prop_assert_eq!(convert_validator_index_to_builder_index(flagged), builder_index);
+            // `is_builder_index` holds exactly for the indices that a conversion gives.
+            let round = convert_builder_index_to_validator_index(
+                convert_validator_index_to_builder_index(validator_index),
+            );
+            prop_assert_eq!(is_builder_index(validator_index), round == validator_index);
+            prop_assert_eq!(
+                is_builder_index(validator_index),
+                validator_index & BUILDER_INDEX_FLAG != 0
+            );
+        }
+    }
+
+    #[test]
+    fn builder_index_edges() {
+        assert!(!is_builder_index(0));
+        assert!(!is_builder_index(BUILDER_INDEX_FLAG - 1));
+        assert!(is_builder_index(BUILDER_INDEX_FLAG));
+        assert_eq!(
+            convert_validator_index_to_builder_index(BUILDER_INDEX_FLAG),
+            0
+        );
+        // The other bits stay: a validator index with the flag and higher bits keeps them.
+        let high = (1 << 41) | BUILDER_INDEX_FLAG | 5;
+        assert_eq!(
+            convert_validator_index_to_builder_index(high),
+            (1 << 41) | 5
+        );
+        // BUILDER_INDEX_SELF_BUILD (UINT64_MAX) has the flag bit, so it does not round-trip.
+        assert_eq!(convert_builder_index_to_validator_index(u64::MAX), u64::MAX);
+        assert_ne!(convert_validator_index_to_builder_index(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn builder_withdrawal_credential_is_the_0xb0_prefix() {
+        let mut credentials = Bytes32::repeat_byte(0x11);
+        assert!(!is_builder_withdrawal_credential(&credentials));
+        credentials.0[0] = 0xb0;
+        assert!(is_builder_withdrawal_credential(&credentials));
+        for prefix in [0x00, 0x01, 0x02, 0xb1, 0x0b] {
+            credentials.0[0] = prefix;
+            assert!(!is_builder_withdrawal_credential(&credentials), "{prefix}");
+        }
+    }
+
+    fn builder_at(deposit_epoch: Epoch, withdrawable_epoch: Epoch) -> Builder {
+        Builder {
+            pubkey: [0xb0; 48],
+            version: 0,
+            execution_address: Address::repeat_byte(0xb1),
+            balance: 5 * ETH,
+            deposit_epoch,
+            withdrawable_epoch,
+        }
+    }
+
+    #[test]
+    fn active_builder_needs_a_finalized_deposit_and_no_exit() {
+        let mut state = registry_state::<Minimal>(&[32 * ETH; 4], Bytes32::ZERO);
+        state.finalized_checkpoint.epoch = 3;
+        for builder in [
+            builder_at(2, FAR_FUTURE_EPOCH),
+            builder_at(3, FAR_FUTURE_EPOCH),
+            builder_at(0, 9),
+        ] {
+            state.builders.push(builder).unwrap();
+        }
+        assert_eq!(is_active_builder(&state, 0), Ok(true));
+        // The deposit epoch must be before the finalized epoch.
+        assert_eq!(is_active_builder(&state, 1), Ok(false));
+        // An exit sets the withdrawable epoch.
+        assert_eq!(is_active_builder(&state, 2), Ok(false));
+        assert_eq!(
+            is_active_builder(&state, 3),
+            Err(StfError::UnknownBuilder(3))
+        );
+    }
+
+    #[test]
+    fn pending_balance_to_withdraw_for_builder_sums_both_queues() {
+        let mut state = registry_state::<Minimal>(&[32 * ETH; 4], Bytes32::ZERO);
+        let withdrawal = |amount, builder_index| BuilderPendingWithdrawal {
+            fee_recipient: Address::repeat_byte(0xfe),
+            amount,
+            builder_index,
+        };
+        assert_eq!(
+            get_pending_balance_to_withdraw_for_builder(&state, 1),
+            Ok(0)
+        );
+        for w in [withdrawal(3, 1), withdrawal(4, 0), withdrawal(5, 1)] {
+            state.builder_pending_withdrawals.push(w).unwrap();
+        }
+        state
+            .builder_pending_payments
+            .get_mut(2)
+            .unwrap()
+            .withdrawal = withdrawal(7, 1);
+        state
+            .builder_pending_payments
+            .get_mut(5)
+            .unwrap()
+            .withdrawal = withdrawal(11, 0);
+        assert_eq!(
+            get_pending_balance_to_withdraw_for_builder(&state, 1),
+            Ok(15)
+        );
+        // The empty payments name builder 0 with an amount of 0.
+        assert_eq!(
+            get_pending_balance_to_withdraw_for_builder(&state, 0),
+            Ok(15)
+        );
+        assert_eq!(
+            get_pending_balance_to_withdraw_for_builder(&state, 2),
+            Ok(0)
+        );
+        // A sum past `u64::MAX` is a `Uint64` overflow.
+        state
+            .builder_pending_withdrawals
+            .push(withdrawal(u64::MAX, 1))
+            .unwrap();
+        assert_eq!(
+            get_pending_balance_to_withdraw_for_builder(&state, 1),
+            Err(StfError::ArithmeticOverflow)
+        );
     }
 
     #[test]

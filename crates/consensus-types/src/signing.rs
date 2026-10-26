@@ -83,6 +83,7 @@ pub enum SignerRef {
     /// A validator, by registry index.
     Validator(ValidatorIndex),
     /// A Gloas builder, by builder-registry index and its `Builder.version`.
+    /// Not a safe cache key after an index reuse (see `state_transition::per_block::builder`).
     Builder {
         /// Index into `state.builders`.
         index: BuilderIndex,
@@ -91,6 +92,10 @@ pub enum SignerRef {
     },
     /// A key carried by the message itself (deposits, BLS-to-execution changes, new indices past
     /// the finalized registry).
+    ///
+    /// The key is not checked. A verifier gives an invalid verdict (not an error) for a key
+    /// that does not decode or fails `KeyValidate`, and also for a signature that does not
+    /// decode. An error is only for a verifier that is not available or that fails.
     Inline(BLSPubkey),
 }
 

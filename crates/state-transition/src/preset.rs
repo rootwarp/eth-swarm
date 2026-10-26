@@ -45,6 +45,13 @@ pub const INACTIVITY_PENALTY_QUOTIENT_BELLATRIX: u64 = 1 << 24;
 pub const INACTIVITY_SCORE_BIAS: u64 = 4;
 /// `INACTIVITY_SCORE_RECOVERY_RATE` (`configs/{minimal,mainnet}.yaml`, 16 in both).
 pub const INACTIVITY_SCORE_RECOVERY_RATE: u64 = 16;
+/// `BUILDER_INDEX_FLAG` (G "Index flags", a constant): the bit of a `ValidatorIndex` that
+/// marks a `BuilderIndex`.
+pub const BUILDER_INDEX_FLAG: u64 = 1 << 40;
+/// `BUILDER_WITHDRAWAL_PREFIX` (G "Withdrawal prefixes", a constant).
+pub const BUILDER_WITHDRAWAL_PREFIX: u8 = 0xb0;
+/// `PAYLOAD_BUILDER_VERSION` (G "Builder versions", a constant).
+pub const PAYLOAD_BUILDER_VERSION: u8 = 0;
 
 /// The preset values of the state transition, on top of the SSZ lengths of [`EthSpec`].
 ///
@@ -133,5 +140,13 @@ mod tests {
         assert_eq!(MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA, 4096);
         assert_eq!(WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA, 4096);
         assert_eq!((PROPOSER_WEIGHT, WEIGHT_DENOMINATOR), (8, 64));
+    }
+
+    #[test]
+    fn builder_values_match_the_pinned_specs() {
+        // G "Constants": 2**40, 0xB0 and Uint8(0).
+        assert_eq!(BUILDER_INDEX_FLAG, 1_099_511_627_776);
+        assert_eq!(BUILDER_WITHDRAWAL_PREFIX, 0xb0);
+        assert_eq!(PAYLOAD_BUILDER_VERSION, 0);
     }
 }

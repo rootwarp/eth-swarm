@@ -1,12 +1,19 @@
-//! Test inputs: a Gloas genesis-like state with a given registry, and empty blocks.
+//! Test inputs: a Gloas genesis-like state with a given registry, empty blocks, builders
+//! and their requests, and a scripted signature backend.
 
 use crate::caches::{initialize_proposer_lookahead, initialize_ptc_window};
-use crate::Preset;
+use crate::per_block::builder::{process_builder_deposit_request, process_builder_exit_request};
+use crate::preset::BUILDER_WITHDRAWAL_PREFIX;
+use crate::{BackendError, Preset, SignatureBackend, SignatureSet, SignerRef};
 use consensus_types::gloas::*;
-use consensus_types::primitives::{Address, Bytes32, Gwei, Root, FAR_FUTURE_EPOCH};
+use consensus_types::primitives::{
+    Address, BLSPubkey, Bytes32, Epoch, Gwei, Root, Version, FAR_FUTURE_EPOCH,
+};
 use milhouse::{List, ProgressiveList, Vector};
 use ssz::BitVector;
 use ssz_types::FixedVector;
+use std::cell::RefCell;
+use std::collections::VecDeque;
 
 /// A Gloas state at slot 0 whose validators have `effective_balances` (each also its
 /// balance), all active from epoch 0. Every RANDAO mix is `mix`. The proposer lookahead and
@@ -202,4 +209,147 @@ pub(crate) fn signed_block<E: Preset>(slot: u64, proposer_index: u64) -> SignedB
         },
         signature: [0x11; 96],
     }
+}
+
+/// The `GENESIS_FORK_VERSION` of `configs/minimal.yaml` (L27), for the builder deposits of
+/// the tests.
+pub(crate) const GENESIS_FORK_VERSION: Version = [0x00, 0x00, 0x00, 0x01];
+
+/// A [`SignatureBackend`] that gives the scripted verdicts in sequence and records each set
+/// that it gets. A call after the last verdict panics, so a test also proves that no other
+/// call occurs.
+///
+/// A script follows the contract of [`SignatureBackend`]: `Err` stands for a backend
+/// without a verdict, and `Ok(false)` for any invalid set, which includes a key that fails
+/// `KeyValidate`.
+pub(crate) struct ScriptedBackend {
+    verdicts: RefCell<VecDeque<Result<bool, BackendError>>>,
+    seen: RefCell<Vec<SignatureSet>>,
+}
+
+impl ScriptedBackend {
+    /// A backend that gives `verdicts`, one for each call.
+    pub(crate) fn new(verdicts: impl IntoIterator<Item = Result<bool, BackendError>>) -> Self {
+        Self {
+            verdicts: RefCell::new(verdicts.into_iter().collect()),
+            seen: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The sets of every call, in sequence.
+    pub(crate) fn seen(&self) -> Vec<SignatureSet> {
+        self.seen.borrow().clone()
+    }
+}
+
+impl SignatureBackend for ScriptedBackend {
+    fn verify_signature_sets(&self, sets: &[SignatureSet]) -> Result<bool, BackendError> {
+        self.seen.borrow_mut().extend_from_slice(sets);
+        self.verdicts
+            .borrow_mut()
+            .pop_front()
+            .expect("a backend call that the test did not script")
+    }
+}
+
+/// A [`SignatureBackend`] that follows its contract for inline keys without BLS: a set
+/// with a signer in `invalid_keys` gives `Ok(false)`, as a key that fails `KeyValidate`
+/// must, and every other set is valid. It never gives `Err`. It records each set that it
+/// gets.
+pub(crate) struct ContractBackend {
+    invalid_keys: Vec<BLSPubkey>,
+    seen: RefCell<Vec<SignatureSet>>,
+}
+
+impl ContractBackend {
+    /// A backend for which the keys `invalid_keys` fail `KeyValidate`.
+    pub(crate) fn new(invalid_keys: impl IntoIterator<Item = BLSPubkey>) -> Self {
+        Self {
+            invalid_keys: invalid_keys.into_iter().collect(),
+            seen: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The sets of every call, in sequence.
+    pub(crate) fn seen(&self) -> Vec<SignatureSet> {
+        self.seen.borrow().clone()
+    }
+}
+
+impl SignatureBackend for ContractBackend {
+    fn verify_signature_sets(&self, sets: &[SignatureSet]) -> Result<bool, BackendError> {
+        self.seen.borrow_mut().extend_from_slice(sets);
+        let decodes = |signer: &SignerRef| match signer {
+            SignerRef::Inline(key) => !self.invalid_keys.contains(key),
+            SignerRef::Validator(_) | SignerRef::Builder { .. } => true,
+        };
+        Ok(sets.iter().all(|set| set.signers().iter().all(decodes)))
+    }
+}
+
+/// A builder with the key `[key; 48]` and the execution address `[key; 20]`, with
+/// `balance`, deposited in `deposit_epoch` and not exiting.
+pub(crate) fn builder(key: u8, balance: Gwei, deposit_epoch: Epoch) -> Builder {
+    Builder {
+        pubkey: [key; 48],
+        version: 0,
+        execution_address: Address::repeat_byte(key),
+        balance,
+        deposit_epoch,
+        withdrawable_epoch: FAR_FUTURE_EPOCH,
+    }
+}
+
+/// A builder deposit request of `amount` for the key `[key; 48]`, with the builder
+/// withdrawal credentials of the address `[key; 20]` and the signature `[0x22; 96]`.
+pub(crate) fn builder_deposit_request(key: u8, amount: Gwei) -> BuilderDepositRequest {
+    let mut withdrawal_credentials = Bytes32::ZERO;
+    withdrawal_credentials[0] = BUILDER_WITHDRAWAL_PREFIX;
+    withdrawal_credentials[12..].fill(key);
+    BuilderDepositRequest {
+        pubkey: [key; 48],
+        withdrawal_credentials,
+        amount,
+        signature: [0x22; 96],
+    }
+}
+
+/// A builder exit request for the key `[key; 48]` from the address `[key; 20]`.
+pub(crate) fn builder_exit_request(key: u8) -> BuilderExitRequest {
+    BuilderExitRequest {
+        source_address: Address::repeat_byte(key),
+        pubkey: [key; 48],
+    }
+}
+
+/// The key of the builder that exits in [`index_reuse_states`].
+pub(crate) const EXITED_BUILDER_KEY: u8 = 0xa1;
+/// The key of the new builder that takes its index in [`index_reuse_states`].
+pub(crate) const REUSING_BUILDER_KEY: u8 = 0xb1;
+
+/// The index reuse of G L2322-2331, through the real requests. The registry starts with the
+/// builders `[0xa1; 48]` (index 0) and `[0xa2; 48]` (index 1), both deposited in epoch 0
+/// and finalized at epoch 3. Builder 0 exits in epoch 3, and the state goes to its
+/// withdrawable epoch with its balance swept to 0.
+///
+/// Returns that state, and the state after a deposit of 7 Gwei for the key `[0xb1; 48]`
+/// with a valid signature, which takes index 0.
+pub(crate) fn index_reuse_states<E: Preset>() -> (BeaconState<E>, BeaconState<E>) {
+    let mut state = registry_state::<E>(&[32_000_000_000; 8], Bytes32::ZERO);
+    state.slot = E::start_slot_at_epoch(3) + 1;
+    state.finalized_checkpoint.epoch = 3;
+    for key in [EXITED_BUILDER_KEY, 0xa2] {
+        state.builders.push(builder(key, 5_000_000_000, 0)).unwrap();
+    }
+    process_builder_exit_request(&mut state, &builder_exit_request(EXITED_BUILDER_KEY)).unwrap();
+    let withdrawable_epoch = state.builders.get(0).unwrap().withdrawable_epoch;
+    assert_eq!(withdrawable_epoch, 3 + E::MIN_BUILDER_WITHDRAWABILITY_DELAY);
+    // The builders sweep of `process_withdrawals` pays the balance out.
+    state.builders.get_mut(0).unwrap().balance = 0;
+    state.slot = E::start_slot_at_epoch(withdrawable_epoch);
+    let exited = state.clone();
+    let backend = ScriptedBackend::new([Ok(true)]);
+    let request = builder_deposit_request(REUSING_BUILDER_KEY, 7);
+    process_builder_deposit_request(&mut state, &request, GENESIS_FORK_VERSION, &backend).unwrap();
+    (exited, state)
 }
