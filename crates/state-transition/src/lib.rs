@@ -788,6 +788,9 @@ pub fn state_root<E: Preset>(state: &mut BeaconState<E>) -> Result<Root, StfErro
 /// Bound `block.slot` against the wall clock before the call. As in the spec, the slots
 /// are processed before the signature check, and `process_slots` has no upper bound: a
 /// block with a far-future slot costs one `process_slot` for each slot.
+/// Bound `block.slot` also before the prefetch of the deposit verdicts: with a far-future
+/// slot, the prefetch lists each pending deposit of a new key, and each set costs one BLS
+/// check.
 pub fn state_transition<E: Preset>(
     state: &mut BeaconState<E>,
     signed_block: &SignedBeaconBlock<E>,

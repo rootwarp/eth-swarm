@@ -99,13 +99,25 @@ pub(crate) fn process_registry_updates_with<E: Preset>(
                     .ok_or(StfError::ArithmeticOverflow)?;
                 validator_mut(state, index)?.activation_eligibility_epoch = epoch;
             }
-            RegistryUpdate::Eject(index) => initiate_validator_exit(state, index, totals)?,
+            RegistryUpdate::Eject(index) => eject(state, index, totals)?,
             RegistryUpdate::Activate(index) => {
                 validator_mut(state, index)?.activation_epoch = activation_epoch;
             }
         }
     }
     Ok(())
+}
+
+/// `initiate_validator_exit` for an ejection. The index comes from the registry, so an
+/// index past it is a fault of our own state (`ListIndexOutOfRange`), not a proof.
+/// `initiate_validator_exit` keeps `UnknownValidator` for the index of a voluntary exit.
+fn eject<E: Preset>(
+    state: &mut BeaconState<E>,
+    index: ValidatorIndex,
+    totals: &mut TotalActiveBalanceCache,
+) -> Result<(), StfError> {
+    validator_mut(state, index)?;
+    initiate_validator_exit(state, index, totals)
 }
 
 /// `state.validators[index]`, for an index that the step read from the registry. An index
@@ -315,6 +327,22 @@ mod tests {
             }
         );
         assert!(!err.proves_invalid());
+        // An ejection reads its index from the registry too.
+        let mut totals = TotalActiveBalanceCache::default();
+        let err = eject(&mut state, 6, &mut totals).unwrap_err();
+        assert_eq!(
+            err,
+            StfError::ListIndexOutOfRange {
+                list: "validators",
+                index: 6
+            }
+        );
+        assert!(!err.proves_invalid());
+        assert_eq!(eject(&mut state, 5, &mut totals), Ok(()));
+        assert_ne!(
+            state.validators.get(5).unwrap().exit_epoch,
+            FAR_FUTURE_EPOCH
+        );
     }
 
     #[test]

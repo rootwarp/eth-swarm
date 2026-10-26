@@ -16,17 +16,16 @@ use consensus_types::gloas::BeaconState;
 use consensus_types::primitives::{Epoch, Gwei, ParticipationFlags, ValidatorIndex};
 use std::collections::BTreeSet;
 
-/// `get_total_balance` (P0 L1559-1570).
+/// `get_total_balance` (P0 L1559-1570). The spec gives it only indices from the registry
+/// of `state`, so an index past the registry is a fault of our own state
+/// (`ListIndexOutOfRange`), not a proof.
 pub fn get_total_balance<E: Preset>(
     state: &BeaconState<E>,
     indices: &BTreeSet<ValidatorIndex>,
 ) -> Result<Gwei, StfError> {
     let mut sum: Gwei = 0;
     for &index in indices {
-        let validator = state
-            .validators
-            .get(index as usize)
-            .ok_or(StfError::UnknownValidator(index))?;
+        let validator = super::state_validator(state, index)?;
         sum = sum
             .checked_add(validator.effective_balance)
             .ok_or(StfError::ArithmeticOverflow)?;
@@ -306,10 +305,16 @@ mod tests {
             get_total_balance(&state, &BTreeSet::from([0, 7])),
             Ok(64 * ETH)
         );
+        // The indices come from our own registry, so an index past it is not a proof.
+        let err = get_total_balance(&state, &BTreeSet::from([8])).unwrap_err();
         assert_eq!(
-            get_total_balance(&state, &BTreeSet::from([8])),
-            Err(StfError::UnknownValidator(8))
+            err,
+            StfError::ListIndexOutOfRange {
+                list: "validators",
+                index: 8
+            }
         );
+        assert!(!err.proves_invalid());
         assert_eq!(cache_of(&state).total_active_balance(), Ok(256 * ETH));
         state.validators.get_mut(0).unwrap().effective_balance = u64::MAX;
         assert_eq!(

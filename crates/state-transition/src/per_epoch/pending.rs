@@ -91,6 +91,18 @@ fn validator_indices_of<'a, E: Preset>(
 /// Thus the `k`-th boundary reads only the first `k * MAX_PENDING_DEPOSITS_PER_EPOCH`
 /// deposits of `state`. Call this function again on the state after each block, because
 /// the block can add deposits. It reads the registry one time.
+///
+/// The guarantee holds only for a Gloas pre-state. `upgrade_to_gloas` calls
+/// `onboard_builders_from_pending_deposits` (`gloas/fork.md` L70-119), which reads the full queue
+/// and can ask for a verdict at any position. When the slot loop gets the fork upgrade,
+/// the upgrade needs its own helper that lists the sets of the full queue.
+///
+/// # Warning
+///
+/// Bound `slot` against the wall clock before you call this function with a slot from the
+/// network. The list has no upper bound: each epoch boundary adds up to
+/// `MAX_PENDING_DEPOSITS_PER_EPOCH` deposits. With a far-future slot, the list holds each
+/// deposit of a new key in the queue, and the caller does one BLS check for each set.
 pub fn pending_deposit_signature_sets<E: Preset>(
     state: &BeaconState<E>,
     slot: Slot,

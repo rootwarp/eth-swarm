@@ -17,7 +17,13 @@ use tree_hash::TreeHash;
 /// [`per_epoch::pending_deposit_signature_sets`] lists for `state` and `slot`.
 ///
 /// The work is linear in `slot - state.slot`, and, as in the spec, there is no upper bound.
-/// Bound `slot` against the wall clock before you call it with a slot from the network.
+///
+/// # Warning
+///
+/// Bound `slot` against the wall clock before you call this function or the prefetch with a
+/// slot from the network. The prefetch also has no upper bound: with a far-future slot, it
+/// lists each pending deposit of a new key, and each set costs one BLS check. The prefetch
+/// covers a slot loop from a Gloas pre-state only.
 pub fn process_slots<E: Preset>(
     state: &mut BeaconState<E>,
     slot: Slot,

@@ -176,6 +176,10 @@ pub fn get_attesting_indices_with<E: Preset>(
 /// Returns `size` indices of `indices`, sampled by effective balance, with possible
 /// duplicates. With `shuffle_indices` the candidates are drawn through
 /// `compute_shuffled_index`, else `indices` is walked in order.
+///
+/// The spec gives it only active indices of `state` (the sync committee, the proposer
+/// lookahead and the PTC). Thus an index past the registry is a fault of our own state
+/// (`ListIndexOutOfRange`), not a proof.
 pub fn compute_balance_weighted_selection<E: Preset>(
     state: &BeaconState<E>,
     indices: &[ValidatorIndex],
@@ -195,7 +199,10 @@ pub fn compute_balance_weighted_selection<E: Preset>(
                 .validators
                 .get(index as usize)
                 .map(|v| v.effective_balance)
-                .ok_or(StfError::UnknownValidator(index))
+                .ok_or(StfError::ListIndexOutOfRange {
+                    list: "validators",
+                    index,
+                })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let seed: &[u8; 32] = seed.as_ref();
@@ -726,10 +733,16 @@ mod tests {
             compute_balance_weighted_selection(&state, &[], &seed, 1, true),
             Err(StfError::NoCandidates)
         );
+        // The candidates come from our own registry, so an index past it is not a proof.
+        let err = compute_balance_weighted_selection(&state, &[0, 8], &seed, 1, false).unwrap_err();
         assert_eq!(
-            compute_balance_weighted_selection(&state, &[0, 8], &seed, 1, false),
-            Err(StfError::UnknownValidator(8))
+            err,
+            StfError::ListIndexOutOfRange {
+                list: "validators",
+                index: 8
+            }
         );
+        assert!(!err.proves_invalid());
         // At the maximum effective balance every draw is taken, so the walk is in order.
         assert_eq!(
             compute_balance_weighted_selection(&state, &[2, 0, 1], &seed, 5, false),

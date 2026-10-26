@@ -171,6 +171,10 @@ pub fn compute_consolidation_epoch_and_update_churn<E: Preset>(
 
 /// `initiate_validator_exit` (E L867-881, Modified in Electra; Gloas keeps it). It does
 /// nothing for a validator that already initiated its exit.
+///
+/// An index past the registry gives `UnknownValidator`, because a voluntary exit names the
+/// index. A caller that reads the index from the registry checks it first (the ejection of
+/// `process_registry_updates`), so that a fault of our own state is not a proof.
 pub fn initiate_validator_exit<E: Preset>(
     state: &mut BeaconState<E>,
     index: ValidatorIndex,
@@ -191,10 +195,15 @@ pub fn initiate_validator_exit<E: Preset>(
         .checked_add(MIN_VALIDATOR_WITHDRAWABILITY_DELAY)
         .ok_or(StfError::ArithmeticOverflow)?;
     // Set validator exit epoch and withdrawable epoch
-    let validator = state
-        .validators
-        .get_mut(index as usize)
-        .ok_or(StfError::UnknownValidator(index))?;
+    // The first read found `index` in the registry, so a miss here is our own fault.
+    let validator =
+        state
+            .validators
+            .get_mut(index as usize)
+            .ok_or(StfError::ListIndexOutOfRange {
+                list: "validators",
+                index,
+            })?;
     validator.exit_epoch = exit_queue_epoch;
     validator.withdrawable_epoch = withdrawable_epoch;
     Ok(())

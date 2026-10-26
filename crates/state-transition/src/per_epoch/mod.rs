@@ -564,6 +564,8 @@ mod tests {
 
     /// `process_slots` with the builder payments step left out, as in [`traced`], so that
     /// the loop can cross more than one epoch boundary.
+    // TODO(#72): when `process_builder_pending_payments` is ported, remove this copy of
+    // the slot loop and call `process_slots` in the two-boundary test.
     fn slots_without_builder_payments(
         state: &mut BeaconState<Minimal>,
         slot: Slot,
