@@ -7,19 +7,19 @@
 //! fields that the step does not write, so the result is the result of the spec loop.
 
 use crate::accessors::{
-    compute_activation_exit_epoch, get_current_epoch, is_active_validator, TotalActiveBalanceCache,
+    compute_activation_exit_epoch, get_current_epoch, has_compounding_withdrawal_credential,
+    is_active_validator, TotalActiveBalanceCache,
 };
 use crate::mutators::{decrease_balance, initiate_validator_exit};
 use crate::preset::{
-    COMPOUNDING_WITHDRAWAL_PREFIX, EFFECTIVE_BALANCE_INCREMENT, EJECTION_BALANCE,
-    HYSTERESIS_DOWNWARD_MULTIPLIER, HYSTERESIS_QUOTIENT, HYSTERESIS_UPWARD_MULTIPLIER,
-    MAX_EFFECTIVE_BALANCE_ELECTRA, MIN_ACTIVATION_BALANCE,
-    PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX,
+    EFFECTIVE_BALANCE_INCREMENT, EJECTION_BALANCE, HYSTERESIS_DOWNWARD_MULTIPLIER,
+    HYSTERESIS_QUOTIENT, HYSTERESIS_UPWARD_MULTIPLIER, MAX_EFFECTIVE_BALANCE_ELECTRA,
+    MIN_ACTIVATION_BALANCE, PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX,
 };
 use crate::{Preset, StfError};
 use consensus_types::common::Validator;
 use consensus_types::gloas::BeaconState;
-use consensus_types::primitives::{Bytes32, Gwei, ValidatorIndex, FAR_FUTURE_EPOCH};
+use consensus_types::primitives::{Gwei, ValidatorIndex, FAR_FUTURE_EPOCH};
 use ssz_types::typenum::Unsigned;
 
 /// `is_eligible_for_activation_queue` (E L630-638, Modified in Electra).
@@ -37,16 +37,6 @@ pub fn is_eligible_for_activation<E: Preset>(
     validator.activation_eligibility_epoch <= state.finalized_checkpoint.epoch
         // Has not yet been activated
         && validator.activation_epoch == FAR_FUTURE_EPOCH
-}
-
-/// `is_compounding_withdrawal_credential` (E L644-645, New in Electra).
-pub fn is_compounding_withdrawal_credential(withdrawal_credentials: &Bytes32) -> bool {
-    withdrawal_credentials[0] == COMPOUNDING_WITHDRAWAL_PREFIX
-}
-
-/// `has_compounding_withdrawal_credential` (E L651-655, New in Electra).
-pub fn has_compounding_withdrawal_credential(validator: &Validator) -> bool {
-    is_compounding_withdrawal_credential(&validator.withdrawal_credentials)
 }
 
 /// `get_max_effective_balance` (E L743-750, New in Electra).
@@ -224,7 +214,7 @@ pub fn process_effective_balance_updates<E: Preset>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accessors::TotalActiveBalanceCache;
+    use crate::accessors::{is_compounding_withdrawal_credential, TotalActiveBalanceCache};
     use crate::preset::{EFFECTIVE_BALANCE_INCREMENT, MAX_EFFECTIVE_BALANCE_ELECTRA};
     use crate::testing::registry_state;
     use crate::StfError;

@@ -300,7 +300,7 @@ mod tests {
             .payload_attestations
             .push(payload_attestation.clone())
             .unwrap();
-        let sets = block_signature_sets(&state, &block).unwrap();
+        let sets = block_signature_sets(&state, &block, &no_bls()).unwrap();
         assert_eq!(sets.len(), 3);
         assert_eq!(
             sets[1],
@@ -382,7 +382,7 @@ mod tests {
         block.message.parent_root = PARENT;
         block.message.body.payload_attestations.push(empty).unwrap();
         assert_eq!(
-            block_signature_sets(&state, &block),
+            block_signature_sets(&state, &block, &no_bls()),
             Err(StfError::PayloadAttestationNoAttesters)
         );
 

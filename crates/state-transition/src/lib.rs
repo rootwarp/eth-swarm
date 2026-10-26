@@ -9,8 +9,9 @@
 //! - [`per_slot`]: `process_slots` and `process_slot`.
 //! - [`per_epoch`]: the epoch processing (every step but the builder payments).
 //! - [`per_block`]: the block processing: the step order, the header, RANDAO, eth1 data,
-//!   the sync aggregate and the payload attestations (the other steps and operations are
-//!   stubs for now).
+//!   the voluntary exits, the BLS-to-execution changes, the payload attestations and the
+//!   sync aggregate. The other steps and operations are stubs for now. It also has the
+//!   builder requests and the consolidation requests of the parent payload.
 //! - [`accessors`]: the beacon-state accessors and the misc helpers.
 //! - [`caches`]: shuffling, beacon committees, proposer and PTC selection.
 //! - [`mutators`]: the balance helpers, the exit and consolidation churn, validator and
@@ -46,7 +47,7 @@ pub use signatures::{
 
 use consensus_types::gloas::{BeaconBlock, BeaconState, SignedBeaconBlock};
 use consensus_types::primitives::{
-    BuilderIndex, Bytes32, CommitteeIndex, Epoch, Root, Slot, ValidatorIndex,
+    BuilderIndex, Bytes32, CommitteeIndex, Epoch, Gwei, Root, Slot, ValidatorIndex,
 };
 use tree_hash::TreeHash;
 
@@ -294,6 +295,60 @@ pub enum StfError {
     /// [`per_block::payload_attestation::is_valid_indexed_payload_attestation`]).
     #[error("invalid payload attestation signature")]
     InvalidPayloadAttestationSignature,
+    /// `process_voluntary_exit` asserts that the validator is active in the current epoch.
+    #[error("validator {0} is not active, so it cannot exit")]
+    ExitNotActive(ValidatorIndex),
+    /// `process_voluntary_exit` asserts `validator.exit_epoch == FAR_FUTURE_EPOCH`.
+    #[error("validator {0} already initiated its exit")]
+    ExitAlreadyInitiated(ValidatorIndex),
+    /// `process_voluntary_exit` asserts `get_current_epoch(state) >= voluntary_exit.epoch`.
+    #[error("exit epoch {exit_epoch} is after the current epoch {current_epoch}")]
+    ExitEpochInFuture {
+        /// `voluntary_exit.epoch`.
+        exit_epoch: Epoch,
+        /// `get_current_epoch(state)`.
+        current_epoch: Epoch,
+    },
+    /// `process_voluntary_exit` asserts
+    /// `get_current_epoch(state) >= validator.activation_epoch + SHARD_COMMITTEE_PERIOD`.
+    #[error(
+        "validator {index} can exit from epoch {earliest_epoch}, not in epoch {current_epoch}"
+    )]
+    ExitTooEarly {
+        /// `voluntary_exit.validator_index`.
+        index: ValidatorIndex,
+        /// `validator.activation_epoch + SHARD_COMMITTEE_PERIOD`.
+        earliest_epoch: Epoch,
+        /// `get_current_epoch(state)`.
+        current_epoch: Epoch,
+    },
+    /// `process_voluntary_exit` asserts
+    /// `get_pending_balance_to_withdraw(state, voluntary_exit.validator_index) == 0`.
+    #[error("validator {index} has {pending} Gwei of pending withdrawals, so it cannot exit")]
+    ExitPendingWithdrawals {
+        /// `voluntary_exit.validator_index`.
+        index: ValidatorIndex,
+        /// `get_pending_balance_to_withdraw(state, index)`.
+        pending: Gwei,
+    },
+    /// The backend rejected the signature of a voluntary exit in
+    /// [`signatures::verify_voluntary_exit_signature`] (the `bls.Verify` of
+    /// `process_voluntary_exit`).
+    #[error("invalid voluntary exit signature")]
+    InvalidVoluntaryExitSignature,
+    /// `process_bls_to_execution_change` asserts
+    /// `validator.withdrawal_credentials[:1] == BLS_WITHDRAWAL_PREFIX`.
+    #[error("validator {0} does not have BLS withdrawal credentials")]
+    NotBlsWithdrawalCredentials(ValidatorIndex),
+    /// `process_bls_to_execution_change` asserts
+    /// `validator.withdrawal_credentials[1:] == sha256(address_change.from_bls_pubkey)[1:]`.
+    #[error("from_bls_pubkey is not the key of the withdrawal credentials of validator {0}")]
+    BlsChangeKeyMismatch(ValidatorIndex),
+    /// The backend rejected the signature of a BLS-to-execution change in
+    /// [`signatures::verify_bls_to_execution_change_signature`] (the `bls.Verify` of
+    /// `process_bls_to_execution_change`).
+    #[error("invalid BLS-to-execution change signature")]
+    InvalidBlsToExecutionChangeSignature,
 }
 
 impl StfError {
@@ -315,6 +370,13 @@ impl StfError {
     /// [`StfError::PayloadAttestationSlotMismatch`] and
     /// [`StfError::InvalidPayloadAttestationSignature`]. A caller that uses another state (for
     /// example a head state behind the slot of a gossip message) must map them to IGNORE.
+    ///
+    /// The asserts of a voluntary exit and of a BLS-to-execution change read the validator
+    /// in the state, and they have the same rule: [`StfError::ExitNotActive`],
+    /// [`StfError::ExitAlreadyInitiated`], [`StfError::ExitEpochInFuture`],
+    /// [`StfError::ExitTooEarly`], [`StfError::ExitPendingWithdrawals`],
+    /// [`StfError::InvalidVoluntaryExitSignature`], [`StfError::NotBlsWithdrawalCredentials`]
+    /// and [`StfError::BlsChangeKeyMismatch`].
     ///
     /// [`StfError::UnknownValidator`] has the same rule. The result depends on the registry
     /// of the state that the caller uses. A head state older than the object can have a
@@ -388,7 +450,25 @@ impl StfError {
             | Self::PayloadAttestationUnsorted
             // `bls.FastAggregateVerify` is false: a verdict of the backend on the
             // attestation's own pre-state, as for `InvalidSyncAggregateSignature`.
-            | Self::InvalidPayloadAttestationSignature => true,
+            | Self::InvalidPayloadAttestationSignature
+            // The asserts of `process_voluntary_exit` on the exit and on the validator in the
+            // exit's own pre-state at its slot: active, no exit yet, an epoch that is not in
+            // the future, active for `SHARD_COMMITTEE_PERIOD`, and no pending withdrawal.
+            | Self::ExitNotActive(_)
+            | Self::ExitAlreadyInitiated(_)
+            | Self::ExitEpochInFuture { .. }
+            | Self::ExitTooEarly { .. }
+            | Self::ExitPendingWithdrawals { .. }
+            // `bls.Verify` is false for the key of the validator in the registry, a verdict
+            // of the backend (as for `InvalidBlockSignature`).
+            | Self::InvalidVoluntaryExitSignature
+            // The asserts of `process_bls_to_execution_change` on the change and on the
+            // withdrawal credentials of the validator in the change's own pre-state.
+            | Self::NotBlsWithdrawalCredentials(_)
+            | Self::BlsChangeKeyMismatch(_)
+            // `bls.Verify` is false for the inline key of the change, a verdict of the
+            // backend (as for `InvalidBlockSignature`).
+            | Self::InvalidBlsToExecutionChangeSignature => true,
         }
     }
 }
@@ -426,8 +506,8 @@ pub fn state_root<E: Preset>(state: &mut BeaconState<E>) -> Result<Root, StfErro
 /// Do not use this function on real blocks yet. Block processing is ported only in part:
 /// [`per_block::process_block`] returns [`StfError::Unimplemented`] at its first step (the
 /// parent payload), so every block fails with an error that is not a proof of an invalid
-/// block. For the same reason, a block with an operation other than a payload attestation,
-/// or with a builder bid, fails the signature sets with `Unimplemented`.
+/// block. For the same reason, a block with a slashing, an attestation or a builder bid
+/// fails the signature sets with `Unimplemented`.
 ///
 /// Bound `block.slot` against the wall clock before the call. As in the spec, the slots
 /// are processed before the signature check, and `process_slots` has no upper bound: a
@@ -766,7 +846,7 @@ mod tests {
 
     /// The number of [`StfError`] variants: one more than the largest [`variant_id`].
     /// Increase `VARIANTS` when you add an id.
-    const VARIANTS: usize = 35;
+    const VARIANTS: usize = 44;
 
     /// A distinct id for each variant. The match has no `_` arm, so a new variant does not
     /// compile until it gets an id here, and then the table test fails until it has an entry.
@@ -807,6 +887,15 @@ mod tests {
             StfError::PayloadAttestationNoAttesters => 32,
             StfError::PayloadAttestationUnsorted => 33,
             StfError::InvalidPayloadAttestationSignature => 34,
+            StfError::ExitNotActive(_) => 35,
+            StfError::ExitAlreadyInitiated(_) => 36,
+            StfError::ExitEpochInFuture { .. } => 37,
+            StfError::ExitTooEarly { .. } => 38,
+            StfError::ExitPendingWithdrawals { .. } => 39,
+            StfError::InvalidVoluntaryExitSignature => 40,
+            StfError::NotBlsWithdrawalCredentials(_) => 41,
+            StfError::BlsChangeKeyMismatch(_) => 42,
+            StfError::InvalidBlsToExecutionChangeSignature => 43,
         }
     }
 
@@ -946,6 +1035,34 @@ mod tests {
             (StfError::PayloadAttestationNoAttesters, true),
             (StfError::PayloadAttestationUnsorted, true),
             (StfError::InvalidPayloadAttestationSignature, true),
+            (StfError::ExitNotActive(1), true),
+            (StfError::ExitAlreadyInitiated(1), true),
+            (
+                StfError::ExitEpochInFuture {
+                    exit_epoch: 2,
+                    current_epoch: 1,
+                },
+                true,
+            ),
+            (
+                StfError::ExitTooEarly {
+                    index: 1,
+                    earliest_epoch: 64,
+                    current_epoch: 1,
+                },
+                true,
+            ),
+            (
+                StfError::ExitPendingWithdrawals {
+                    index: 1,
+                    pending: 1,
+                },
+                true,
+            ),
+            (StfError::InvalidVoluntaryExitSignature, true),
+            (StfError::NotBlsWithdrawalCredentials(1), true),
+            (StfError::BlsChangeKeyMismatch(1), true),
+            (StfError::InvalidBlsToExecutionChangeSignature, true),
         ];
         let mut ids: Vec<usize> = cases.iter().map(|(e, _)| variant_id(e)).collect();
         ids.sort_unstable();

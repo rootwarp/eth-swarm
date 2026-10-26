@@ -126,8 +126,19 @@ pub fn genesis_fork_version(preset: &str) -> Result<Version, String> {
     }
 }
 
-/// The context of the vectors of `preset`: `backend`, [`BlsAggregator`] and the
-/// [`genesis_fork_version`] of the preset.
+/// `CAPELLA_FORK_VERSION` of the spec config of `preset`: `configs/minimal.yaml` L43 and
+/// `configs/mainnet.yaml` L47 at v1.7.0-beta.4. It is the domain of the voluntary exits
+/// (EIP-7044).
+pub fn capella_fork_version(preset: &str) -> Result<Version, String> {
+    match preset {
+        "minimal" => Ok([0x03, 0x00, 0x00, 0x01]),
+        "mainnet" => Ok([0x03, 0x00, 0x00, 0x00]),
+        other => Err(format!("no CAPELLA_FORK_VERSION for preset {other}")),
+    }
+}
+
+/// The context of the vectors of `preset`: `backend`, [`BlsAggregator`], and the
+/// [`genesis_fork_version`] and the [`capella_fork_version`] of the preset.
 pub fn bls_context<'a>(
     preset: &str,
     backend: &'a dyn SignatureBackend,
@@ -136,6 +147,7 @@ pub fn bls_context<'a>(
         backend,
         aggregator: &BlsAggregator,
         genesis_fork_version: genesis_fork_version(preset)?,
+        capella_fork_version: capella_fork_version(preset)?,
     })
 }
 
@@ -271,9 +283,19 @@ mod tests {
         assert_eq!(genesis_fork_version("minimal"), Ok([0, 0, 0, 1]));
         assert_eq!(genesis_fork_version("mainnet"), Ok([0, 0, 0, 0]));
         assert!(genesis_fork_version("general").is_err());
+        // CAPELLA_FORK_VERSION of configs/minimal.yaml (L43) and configs/mainnet.yaml (L47).
+        assert_eq!(capella_fork_version("minimal"), Ok([3, 0, 0, 1]));
+        assert_eq!(capella_fork_version("mainnet"), Ok([3, 0, 0, 0]));
+        assert!(capella_fork_version("general").is_err());
         let keys = keys();
         let bls = bls_context("minimal", &keys).unwrap();
         assert_eq!(bls.genesis_fork_version, [0, 0, 0, 1]);
+        assert_eq!(bls.capella_fork_version, [3, 0, 0, 1]);
+        let bls = bls_context("mainnet", &keys).unwrap();
+        assert_eq!(
+            (bls.genesis_fork_version, bls.capella_fork_version),
+            ([0, 0, 0, 0], [3, 0, 0, 0])
+        );
         assert!(bls_context("general", &keys).is_err());
         // BLS off finds an invalid set valid, and `backend_for` selects it for setting 2.
         let garbage = SignatureSet::single(SignerRef::Inline([0x01; 48]), Root::ZERO, [0x01; 96]);

@@ -4,7 +4,7 @@
 //! The SSZ lengths stay on [`EthSpec`]; this trait adds the plain numbers, so every function
 //! takes one type parameter for both.
 
-use consensus_types::primitives::{Epoch, Gwei};
+use consensus_types::primitives::{Epoch, Gwei, Slot};
 use consensus_types::{EthSpec, Mainnet, Minimal};
 use ssz_types::typenum::Unsigned;
 
@@ -71,6 +71,12 @@ pub const HYSTERESIS_UPWARD_MULTIPLIER: u64 = 5;
 pub const PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX: u64 = 3;
 /// `MAX_PENDING_DEPOSITS_PER_EPOCH` (`presets/*/electra.yaml`, 16 in both presets).
 pub const MAX_PENDING_DEPOSITS_PER_EPOCH: u64 = 16;
+/// `GENESIS_SLOT` (P0 "Misc").
+pub const GENESIS_SLOT: Slot = 0;
+/// `BLS_WITHDRAWAL_PREFIX` (P0 "Withdrawal prefixes", a constant).
+pub const BLS_WITHDRAWAL_PREFIX: u8 = 0x00;
+/// `ETH1_ADDRESS_WITHDRAWAL_PREFIX` (P0 "Withdrawal prefixes", a constant).
+pub const ETH1_ADDRESS_WITHDRAWAL_PREFIX: u8 = 0x01;
 /// `COMPOUNDING_WITHDRAWAL_PREFIX` (E "Withdrawal prefixes", a constant).
 pub const COMPOUNDING_WITHDRAWAL_PREFIX: u8 = 0x02;
 
@@ -101,6 +107,9 @@ pub trait Preset: EthSpec {
     const MIN_BUILDER_WITHDRAWABILITY_DELAY: Epoch;
     /// `EPOCHS_PER_SYNC_COMMITTEE_PERIOD` (`presets/{minimal,mainnet}/altair.yaml`).
     const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: Epoch;
+    /// `SHARD_COMMITTEE_PERIOD` (`configs/{minimal,mainnet}.yaml`). Sepolia and Hoodi have
+    /// the value of mainnet (256).
+    const SHARD_COMMITTEE_PERIOD: Epoch;
 }
 
 impl Preset for Minimal {
@@ -112,6 +121,7 @@ impl Preset for Minimal {
     const MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS: Gwei = 128_000_000_000;
     const MIN_BUILDER_WITHDRAWABILITY_DELAY: Epoch = 2;
     const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: Epoch = 8;
+    const SHARD_COMMITTEE_PERIOD: Epoch = 64;
 }
 
 impl Preset for Mainnet {
@@ -123,6 +133,7 @@ impl Preset for Mainnet {
     const MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS: Gwei = 256_000_000_000;
     const MIN_BUILDER_WITHDRAWABILITY_DELAY: Epoch = 64;
     const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: Epoch = 256;
+    const SHARD_COMMITTEE_PERIOD: Epoch = 256;
 }
 
 #[cfg(test)]
@@ -203,5 +214,23 @@ mod tests {
         assert_eq!(Mainnet::EPOCHS_PER_SYNC_COMMITTEE_PERIOD, 256);
         assert_eq!(epochs_per_eth1_voting_period::<Minimal>(), 4);
         assert_eq!(epochs_per_eth1_voting_period::<Mainnet>(), 64);
+    }
+
+    #[test]
+    fn exit_and_credential_values_match_the_pinned_specs() {
+        // configs/minimal.yaml L76 and configs/mainnet.yaml L80; the network configs of
+        // Sepolia and Hoodi (L62) have 256 too.
+        assert_eq!(Minimal::SHARD_COMMITTEE_PERIOD, 64);
+        assert_eq!(Mainnet::SHARD_COMMITTEE_PERIOD, 256);
+        // P0 "Withdrawal prefixes" and "Misc", and E "Withdrawal prefixes".
+        assert_eq!(GENESIS_SLOT, 0);
+        assert_eq!(
+            (
+                BLS_WITHDRAWAL_PREFIX,
+                ETH1_ADDRESS_WITHDRAWAL_PREFIX,
+                COMPOUNDING_WITHDRAWAL_PREFIX
+            ),
+            (0x00, 0x01, 0x02)
+        );
     }
 }

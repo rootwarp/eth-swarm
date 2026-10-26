@@ -2,7 +2,8 @@
 
 use crate::caches::committee::{compute_shuffled_index, CommitteeCache};
 use crate::preset::{
-    BASE_REWARD_FACTOR, BUILDER_INDEX_FLAG, BUILDER_WITHDRAWAL_PREFIX, EFFECTIVE_BALANCE_INCREMENT,
+    BASE_REWARD_FACTOR, BUILDER_INDEX_FLAG, BUILDER_WITHDRAWAL_PREFIX,
+    COMPOUNDING_WITHDRAWAL_PREFIX, EFFECTIVE_BALANCE_INCREMENT, ETH1_ADDRESS_WITHDRAWAL_PREFIX,
     MAX_EFFECTIVE_BALANCE_ELECTRA, MAX_SEED_LOOKAHEAD, MIN_SEED_LOOKAHEAD,
 };
 use crate::{Preset, StfError};
@@ -556,11 +557,50 @@ pub fn get_pending_balance_to_withdraw_for_builder<E: Preset>(
         .ok_or(StfError::ArithmeticOverflow)
 }
 
+/// `has_eth1_withdrawal_credential` (C L313-317): the 0x01 prefix.
+pub fn has_eth1_withdrawal_credential(validator: &Validator) -> bool {
+    validator.withdrawal_credentials[0] == ETH1_ADDRESS_WITHDRAWAL_PREFIX
+}
+
+/// `is_compounding_withdrawal_credential` (E L644-645, New in Electra): the 0x02 prefix.
+pub fn is_compounding_withdrawal_credential(withdrawal_credentials: &Bytes32) -> bool {
+    withdrawal_credentials[0] == COMPOUNDING_WITHDRAWAL_PREFIX
+}
+
+/// `has_compounding_withdrawal_credential` (E L651-655, New in Electra).
+pub fn has_compounding_withdrawal_credential(validator: &Validator) -> bool {
+    is_compounding_withdrawal_credential(&validator.withdrawal_credentials)
+}
+
+/// `has_execution_withdrawal_credential` (E L661-668, New in Electra): the 0x01 or the 0x02
+/// prefix.
+pub fn has_execution_withdrawal_credential(validator: &Validator) -> bool {
+    has_eth1_withdrawal_credential(validator) || has_compounding_withdrawal_credential(validator)
+}
+
+/// `get_pending_balance_to_withdraw` (E L788-793, New in Electra): the sum of the pending
+/// partial withdrawals of the validator. The sum is checked.
+///
+/// It reads the whole queue, which holds only the withdrawals that the sweep did not pay yet.
+pub fn get_pending_balance_to_withdraw<E: Preset>(
+    state: &BeaconState<E>,
+    validator_index: ValidatorIndex,
+) -> Result<Gwei, StfError> {
+    state
+        .pending_partial_withdrawals
+        .iter()
+        .filter(|withdrawal| withdrawal.validator_index == validator_index)
+        .try_fold(0u64, |balance, withdrawal| {
+            balance.checked_add(withdrawal.amount)
+        })
+        .ok_or(StfError::ArithmeticOverflow)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::{genesis_state, registry_state};
-    use consensus_types::common::{AttestationData, Checkpoint};
+    use consensus_types::common::{AttestationData, Checkpoint, PendingPartialWithdrawal};
     use consensus_types::gloas::{Builder, BuilderPendingWithdrawal};
     use consensus_types::primitives::{Address, FAR_FUTURE_EPOCH};
     use consensus_types::signing::DOMAIN_BEACON_PROPOSER;
@@ -1032,6 +1072,64 @@ mod tests {
         );
         assert_eq!(
             base_reward(2 * ETH, u64::MAX),
+            Err(StfError::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn withdrawal_credential_predicates() {
+        let mut state = genesis_state::<Minimal>(&[32 * ETH; 8]);
+        let with_prefix = |prefix: u8| {
+            let mut validator = state.validators.get(0).unwrap().clone();
+            validator.withdrawal_credentials[0] = prefix;
+            validator
+        };
+        // (prefix, eth1, compounding, execution)
+        for (prefix, eth1, compounding, execution) in [
+            (0x00, false, false, false),
+            (0x01, true, false, true),
+            (0x02, false, true, true),
+            (0x03, false, false, false),
+            (0xb0, false, false, false),
+        ] {
+            let validator = with_prefix(prefix);
+            assert_eq!(has_eth1_withdrawal_credential(&validator), eth1, "{prefix}");
+            assert_eq!(
+                has_compounding_withdrawal_credential(&validator),
+                compounding,
+                "{prefix}"
+            );
+            assert_eq!(
+                has_execution_withdrawal_credential(&validator),
+                execution,
+                "{prefix}"
+            );
+        }
+
+        // The pending partial withdrawals of validator 1 only, summed and checked.
+        assert_eq!(get_pending_balance_to_withdraw(&state, 1), Ok(0));
+        for (validator_index, amount) in [(1, 3), (2, 100), (1, 4)] {
+            state
+                .pending_partial_withdrawals
+                .push(PendingPartialWithdrawal {
+                    validator_index,
+                    amount,
+                    withdrawable_epoch: 0,
+                })
+                .unwrap();
+        }
+        assert_eq!(get_pending_balance_to_withdraw(&state, 1), Ok(7));
+        assert_eq!(get_pending_balance_to_withdraw(&state, 3), Ok(0));
+        state
+            .pending_partial_withdrawals
+            .push(PendingPartialWithdrawal {
+                validator_index: 1,
+                amount: u64::MAX,
+                withdrawable_epoch: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            get_pending_balance_to_withdraw(&state, 1),
             Err(StfError::ArithmeticOverflow)
         );
     }

@@ -24,14 +24,17 @@ use crate::per_block::state_proposer_index;
 use crate::per_block::BlockContext;
 use crate::preset::BUILDER_INDEX_SELF_BUILD;
 use crate::{Preset, StfError};
-use consensus_types::common::{DepositMessage, SyncAggregate};
+use consensus_types::common::{
+    DepositMessage, SignedBLSToExecutionChange, SignedVoluntaryExit, SyncAggregate,
+};
 use consensus_types::gloas::{
     BeaconBlockBody, BeaconState, IndexedPayloadAttestation, PayloadAttestation, SignedBeaconBlock,
 };
 use consensus_types::primitives::{BLSPubkey, BLSSignature, Bytes32, Gwei, Root, Version};
 use consensus_types::signing::{
-    compute_domain, compute_signing_root, DOMAIN_BEACON_PROPOSER, DOMAIN_DEPOSIT,
-    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
+    compute_domain, compute_signing_root, DOMAIN_BEACON_PROPOSER, DOMAIN_BLS_TO_EXECUTION_CHANGE,
+    DOMAIN_DEPOSIT, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_VOLUNTARY_EXIT,
 };
 
 /// `G2_POINT_AT_INFINITY` (`altair/bls.md` L25): the compressed G2 identity.
@@ -81,11 +84,15 @@ pub struct BlsContext<'a> {
     pub backend: &'a dyn SignatureBackend,
     /// `eth_aggregate_pubkeys` for `get_next_sync_committee`.
     pub aggregator: &'a dyn PubkeyAggregator,
-    /// The `GENESIS_FORK_VERSION` of the network, for the domain of the deposit signatures.
-    /// It is a value of the network config, not of the preset: Sepolia and Hoodi use the
-    /// mainnet preset with other versions. cl-chain reads it from
-    /// `network_config::ChainConfig::genesis_fork_version()`.
+    /// The `GENESIS_FORK_VERSION` of the network, for the domain of the deposit signatures
+    /// and of the BLS-to-execution changes (C L632-634). It is a value of the network
+    /// config, not of the preset: Sepolia and Hoodi use the mainnet preset with other
+    /// versions. cl-chain reads it from `network_config::ChainConfig::genesis_fork_version()`.
     pub genesis_fork_version: Version,
+    /// The `CAPELLA_FORK_VERSION` of the network, for the domain of the voluntary exits
+    /// from Deneb (EIP-7044, E L1853-1855). It is a value of the network config, not of the
+    /// preset. The network config of cl-chain does not give it yet.
+    pub capella_fork_version: Version,
 }
 
 /// The proposer signature set of a block: `verify_block_signature` (P0 L1839-1844) without
@@ -288,28 +295,120 @@ pub fn verify_payload_attestation_signature<E: Preset>(
     }
 }
 
+/// The signature set of a voluntary exit: the `bls.Verify` of `process_voluntary_exit`
+/// (E L1853-1857), by the key of the validator in the registry, in the domain
+/// `compute_domain(DOMAIN_VOLUNTARY_EXIT, CAPELLA_FORK_VERSION, genesis_validators_root)`.
+/// That domain does not change with the fork of the state (EIP-7044).
+///
+/// `capella_fork_version` is the `CAPELLA_FORK_VERSION` of the network. A validator outside
+/// the registry has no key: [`StfError::UnknownValidator`], as `state.validators[index]`
+/// fails in the spec.
+pub fn voluntary_exit_signature_set<E: Preset>(
+    state: &BeaconState<E>,
+    signed_voluntary_exit: &SignedVoluntaryExit,
+    capella_fork_version: Version,
+) -> Result<SignatureSet, StfError> {
+    let voluntary_exit = &signed_voluntary_exit.message;
+    let index = voluntary_exit.validator_index;
+    if index >= state.validators.len() as u64 {
+        return Err(StfError::UnknownValidator(index));
+    }
+    let domain = compute_domain(
+        DOMAIN_VOLUNTARY_EXIT,
+        capella_fork_version,
+        state.genesis_validators_root,
+    );
+    Ok(SignatureSet::single(
+        SignerRef::Validator(index),
+        compute_signing_root(voluntary_exit, domain),
+        signed_voluntary_exit.signature,
+    ))
+}
+
+/// [`voluntary_exit_signature_set`] through `backend`, for a caller that processes a
+/// voluntary exit outside [`block_signature_sets`].
+pub fn verify_voluntary_exit_signature<E: Preset>(
+    state: &BeaconState<E>,
+    signed_voluntary_exit: &SignedVoluntaryExit,
+    capella_fork_version: Version,
+    backend: &dyn SignatureBackend,
+) -> Result<(), StfError> {
+    let set = voluntary_exit_signature_set(state, signed_voluntary_exit, capella_fork_version)?;
+    if backend.verify_signature_sets(std::slice::from_ref(&set))? {
+        Ok(())
+    } else {
+        Err(StfError::InvalidVoluntaryExitSignature)
+    }
+}
+
+/// The signature set of a BLS-to-execution change: the `bls.Verify` of
+/// `process_bls_to_execution_change` (C L632-636), by the inline key `from_bls_pubkey`
+/// ([`SignerRef::Inline`]), in the fork-agnostic domain
+/// `compute_domain(DOMAIN_BLS_TO_EXECUTION_CHANGE, GENESIS_FORK_VERSION,
+/// genesis_validators_root)`.
+///
+/// `genesis_fork_version` is the `GENESIS_FORK_VERSION` of the network. A key that does
+/// not decode makes the set invalid (`Ok(false)` from the backend).
+pub fn bls_to_execution_change_signature_set<E: Preset>(
+    state: &BeaconState<E>,
+    signed_address_change: &SignedBLSToExecutionChange,
+    genesis_fork_version: Version,
+) -> SignatureSet {
+    let address_change = &signed_address_change.message;
+    let domain = compute_domain(
+        DOMAIN_BLS_TO_EXECUTION_CHANGE,
+        genesis_fork_version,
+        state.genesis_validators_root,
+    );
+    SignatureSet::single(
+        SignerRef::Inline(address_change.from_bls_pubkey),
+        compute_signing_root(address_change, domain),
+        signed_address_change.signature,
+    )
+}
+
+/// [`bls_to_execution_change_signature_set`] through `backend`, for a caller that processes
+/// a BLS-to-execution change outside [`block_signature_sets`].
+pub fn verify_bls_to_execution_change_signature<E: Preset>(
+    state: &BeaconState<E>,
+    signed_address_change: &SignedBLSToExecutionChange,
+    genesis_fork_version: Version,
+    backend: &dyn SignatureBackend,
+) -> Result<(), StfError> {
+    let set =
+        bls_to_execution_change_signature_set(state, signed_address_change, genesis_fork_version);
+    if backend.verify_signature_sets(std::slice::from_ref(&set))? {
+        Ok(())
+    } else {
+        Err(StfError::InvalidBlsToExecutionChangeSignature)
+    }
+}
+
 /// Every signature set of a block, in the order of `process_block`: the proposer
-/// signature, the RANDAO reveal, one set for each payload attestation, and the sync
-/// aggregate (none for an empty aggregate with the infinity signature).
+/// signature, the RANDAO reveal, the voluntary exits, the BLS-to-execution changes, one set
+/// for each payload attestation, and the sync aggregate (none for an empty aggregate with
+/// the infinity signature). The operation sets follow the order of `process_operations`
+/// (G L2228-2263). The domains of the exits and the changes take the fork versions of the
+/// network from `bls`.
 ///
 /// The function fails closed for the signed parts of the body that have no set builder
 /// yet: a builder bid (not a self-build), and each operation list that is not empty
-/// (proposer slashings, attester slashings, attestations, voluntary exits, BLS-to-execution
-/// changes) give [`StfError::Unimplemented`] with the work that ports them. A port must add
-/// its set builder here and remove its `Unimplemented`, so that no signature of the block
-/// is left out of the batch.
+/// (proposer slashings, attester slashings, attestations) give [`StfError::Unimplemented`]
+/// with the work that ports them. A port must add its set builder here and remove its
+/// `Unimplemented`, so that no signature of the block is left out of the batch.
 ///
 /// `state` is the state at the block's slot, after `process_slots` and before
 /// `process_block`. The steps before each check do not change what the set reads (the
-/// registry keys, the proposer lookahead, the PTC window, the fork and the block roots), so
-/// the sets are the ones that the spec checks during `process_block`. The payload
-/// attestation sets compare with `block.parent_root`, which is the parent root of the
-/// latest block header after the header step.
+/// registry keys, the proposer lookahead, the PTC window, the fork, the genesis validators
+/// root and the block roots), so the sets are the ones that the spec checks during
+/// `process_block`. The payload attestation sets compare with `block.parent_root`, which is
+/// the parent root of the latest block header after the header step.
 pub fn block_signature_sets<E: Preset>(
     state: &BeaconState<E>,
     signed_block: &SignedBeaconBlock<E>,
+    bls: &BlsContext,
 ) -> Result<Vec<SignatureSet>, StfError> {
-    block_signature_sets_with(state, signed_block, &mut BlockContext::default())
+    block_signature_sets_with(state, signed_block, bls, &mut BlockContext::default())
 }
 
 /// [`block_signature_sets`] with a [`BlockContext`] that
@@ -317,6 +416,7 @@ pub fn block_signature_sets<E: Preset>(
 pub fn block_signature_sets_with<E: Preset>(
     state: &BeaconState<E>,
     signed_block: &SignedBeaconBlock<E>,
+    bls: &BlsContext,
     ctx: &mut BlockContext,
 ) -> Result<Vec<SignatureSet>, StfError> {
     let body = &signed_block.message.body;
@@ -333,11 +433,23 @@ pub fn block_signature_sets_with<E: Preset>(
         (body.proposer_slashings.is_empty(), "4.3b"),
         (body.attester_slashings.is_empty(), "4.3b"),
         (body.attestations.is_empty(), "4.3b"),
-        (body.voluntary_exits.is_empty(), "4.4b"),
-        (body.bls_to_execution_changes.is_empty(), "4.4b"),
     ];
     if let Some((_, id)) = unported.iter().find(|(empty, _)| !empty) {
         return Err(StfError::Unimplemented(id));
+    }
+    for exit in &body.voluntary_exits {
+        sets.push(voluntary_exit_signature_set(
+            state,
+            exit,
+            bls.capella_fork_version,
+        )?);
+    }
+    for change in &body.bls_to_execution_changes {
+        sets.push(bls_to_execution_change_signature_set(
+            state,
+            change,
+            bls.genesis_fork_version,
+        ));
     }
     // `process_payload_attestation` (G L2488-2499), the last operation list.
     for payload_attestation in &body.payload_attestations {
@@ -372,7 +484,7 @@ pub fn verify_block_signatures_with<E: Preset>(
     bls: &BlsContext,
     ctx: &mut BlockContext,
 ) -> Result<(), StfError> {
-    let sets = block_signature_sets_with(state, signed_block, ctx)?;
+    let sets = block_signature_sets_with(state, signed_block, bls, ctx)?;
     if bls.backend.verify_signature_sets(&sets)? {
         Ok(())
     } else {
@@ -439,8 +551,13 @@ mod tests {
     use crate::per_slot::process_slots;
     use crate::testing::{
         block_at_state_slot, bls_context, genesis_state, no_bls, ScriptedBackend,
-        GENESIS_FORK_VERSION,
+        CAPELLA_FORK_VERSION, GENESIS_FORK_VERSION,
     };
+    use consensus_types::common::{
+        BLSToExecutionChange, SignedBLSToExecutionChange, SignedVoluntaryExit, VoluntaryExit,
+    };
+    use consensus_types::gloas::PayloadAttestationData;
+    use consensus_types::primitives::Address;
     use consensus_types::Minimal;
     use std::cell::Cell;
 
@@ -484,7 +601,7 @@ mod tests {
     fn block_sets() {
         // A full block: the proposer, RANDAO and sync aggregate sets, in that order.
         let (state, block) = state_and_block(&[1, 4, 4 + 16]);
-        let sets = block_signature_sets(&state, &block).unwrap();
+        let sets = block_signature_sets(&state, &block, &no_bls()).unwrap();
         let proposer = block.message.proposer_index;
         let randao_domain = get_domain(&state, DOMAIN_RANDAO, None);
         let sync_domain = get_domain(&state, DOMAIN_SYNC_COMMITTEE, Some(1));
@@ -537,7 +654,7 @@ mod tests {
         // (with no backend call) without it.
         let (state, mut block) = state_and_block(&[]);
         assert_eq!(
-            block_signature_sets(&state, &block),
+            block_signature_sets(&state, &block, &no_bls()),
             Err(StfError::InvalidSyncAggregateSignature)
         );
         let none = Counting {
@@ -550,7 +667,7 @@ mod tests {
         );
         assert_eq!(none.calls.get(), 0);
         block.message.body.sync_aggregate.sync_committee_signature = G2_POINT_AT_INFINITY;
-        let sets = block_signature_sets(&state, &block).unwrap();
+        let sets = block_signature_sets(&state, &block, &no_bls()).unwrap();
         let mut want = want;
         want[0] = block_proposer_signature_set(&state, &block).unwrap();
         assert_eq!(sets[..], want[..2]);
@@ -597,15 +714,12 @@ mod tests {
 
     #[test]
     fn operations_without_a_set_builder_fail_closed() {
-        use consensus_types::common::{AttestationData, Checkpoint};
         use consensus_types::common::{
-            BLSToExecutionChange, BeaconBlockHeader, SignedBLSToExecutionChange,
-            SignedBeaconBlockHeader, SignedVoluntaryExit, VoluntaryExit,
+            AttestationData, BeaconBlockHeader, Checkpoint, SignedBeaconBlockHeader,
         };
         use consensus_types::gloas::{
             Attestation, AttesterSlashing, BeaconBlockBody, IndexedAttestation,
         };
-        use consensus_types::primitives::Address;
 
         let (state, block) = state_and_block(&[1]);
         let header = SignedBeaconBlockHeader {
@@ -636,7 +750,7 @@ mod tests {
         };
         /// Adds one signed part to a block body.
         type AddPart = Box<dyn Fn(&mut BeaconBlockBody<Minimal>)>;
-        let cases: [(&str, AddPart); 6] = [
+        let cases: [(&str, AddPart); 4] = [
             (
                 "4.3b",
                 Box::new(move |b| {
@@ -673,35 +787,6 @@ mod tests {
                 }),
             ),
             (
-                "4.4b",
-                Box::new(|b| {
-                    b.voluntary_exits
-                        .push(SignedVoluntaryExit {
-                            message: VoluntaryExit {
-                                epoch: 0,
-                                validator_index: 0,
-                            },
-                            signature: [0; 96],
-                        })
-                        .unwrap()
-                }),
-            ),
-            (
-                "4.4b",
-                Box::new(|b| {
-                    b.bls_to_execution_changes
-                        .push(SignedBLSToExecutionChange {
-                            message: BLSToExecutionChange {
-                                validator_index: 0,
-                                from_bls_pubkey: [0; 48],
-                                to_execution_address: Address::ZERO,
-                            },
-                            signature: [0; 96],
-                        })
-                        .unwrap()
-                }),
-            ),
-            (
                 // A bid of a builder, not a self-build.
                 "4.5",
                 Box::new(|b| b.signed_execution_payload_bid.message.builder_index = 0),
@@ -711,7 +796,7 @@ mod tests {
             let mut with = block.clone();
             add(&mut with.message.body);
             assert_eq!(
-                block_signature_sets(&state, &with),
+                block_signature_sets(&state, &with, &no_bls()),
                 Err(StfError::Unimplemented(id)),
                 "{id}"
             );
@@ -725,7 +810,7 @@ mod tests {
             .signed_execution_payload_bid
             .signature = [0x55; 96];
         assert_eq!(
-            block_signature_sets(&state, &self_build).map(|s| s.len()),
+            block_signature_sets(&state, &self_build, &no_bls()).map(|s| s.len()),
             Ok(3)
         );
     }
@@ -738,7 +823,7 @@ mod tests {
         // The set and the rewards share one computation of the committee indices.
         let (mut state, block) = state_and_block(&[1, 4]);
         let mut ctx = BlockContext::default();
-        let sets = block_signature_sets_with(&state, &block, &mut ctx).unwrap();
+        let sets = block_signature_sets_with(&state, &block, &no_bls(), &mut ctx).unwrap();
         assert_eq!(sets.len(), 3);
         assert_eq!(ctx.sync_index_scans(), 1);
         let aggregate = &block.message.body.sync_aggregate;
@@ -753,7 +838,7 @@ mod tests {
         block.message.body.sync_aggregate.sync_committee_signature = G2_POINT_AT_INFINITY;
         let mut ctx = BlockContext::default();
         assert_eq!(
-            block_signature_sets_with(&state, &block, &mut ctx).map(|s| s.len()),
+            block_signature_sets_with(&state, &block, &no_bls(), &mut ctx).map(|s| s.len()),
             Ok(2)
         );
         assert_eq!(ctx.sync_index_scans(), 0);
@@ -780,7 +865,10 @@ mod tests {
                 block_proposer_signature_set(&state, &block),
                 Err(outside.clone())
             );
-            assert_eq!(block_signature_sets(&state, &block), Err(outside.clone()));
+            assert_eq!(
+                block_signature_sets(&state, &block, &no_bls()),
+                Err(outside.clone())
+            );
             let backend = Counting {
                 verdict: true,
                 calls: Cell::new(0),
@@ -896,5 +984,159 @@ mod tests {
             GENESIS_FORK_VERSION,
         );
         assert_eq!(backend.seen(), vec![set; 3]);
+    }
+
+    /// A voluntary exit of `validator_index` in epoch 1 with the signature `[0x33; 96]`.
+    fn exit(validator_index: u64) -> SignedVoluntaryExit {
+        SignedVoluntaryExit {
+            message: VoluntaryExit {
+                epoch: 1,
+                validator_index,
+            },
+            signature: [0x33; 96],
+        }
+    }
+
+    /// A BLS-to-execution change of validator 7 from the key `[0x77; 48]`.
+    fn change() -> SignedBLSToExecutionChange {
+        SignedBLSToExecutionChange {
+            message: BLSToExecutionChange {
+                validator_index: 7,
+                from_bls_pubkey: [0x77; 48],
+                to_execution_address: Address::repeat_byte(0xee),
+            },
+            signature: [0x44; 96],
+        }
+    }
+
+    #[test]
+    fn exit_and_bls_change_sets() {
+        let (state, mut block) = state_and_block(&[1]);
+        let body = &mut block.message.body;
+        for index in [5, 6] {
+            body.voluntary_exits.push(exit(index)).unwrap();
+        }
+        body.bls_to_execution_changes.push(change()).unwrap();
+        // A payload attestation of one PTC member for slot 8 and the parent of the block.
+        let mut payload_attestation = PayloadAttestation {
+            aggregation_bits: Default::default(),
+            data: PayloadAttestationData {
+                beacon_block_root: block.message.parent_root,
+                slot: 8,
+                payload_present: true,
+                blob_data_available: false,
+            },
+            signature: [0x55; 96],
+        };
+        payload_attestation.aggregation_bits.set(0, true).unwrap();
+        let body = &mut block.message.body;
+        body.payload_attestations
+            .push(payload_attestation.clone())
+            .unwrap();
+        let sets = block_signature_sets(&state, &block, &no_bls()).unwrap();
+
+        // The exits sign over the fixed CAPELLA_FORK_VERSION domain (EIP-7044), and the BLS
+        // change over the GENESIS_FORK_VERSION domain, both with the genesis validators
+        // root of the state. Neither is the domain of the current fork.
+        let gvr = state.genesis_validators_root;
+        let exit_domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, [0x03, 0, 0, 0x01], gvr);
+        let change_domain = compute_domain(DOMAIN_BLS_TO_EXECUTION_CHANGE, [0, 0, 0, 0x01], gvr);
+        assert_ne!(exit_domain, get_domain(&state, DOMAIN_VOLUNTARY_EXIT, None));
+        assert_ne!(
+            change_domain,
+            get_domain(&state, DOMAIN_BLS_TO_EXECUTION_CHANGE, None)
+        );
+        let exit_set = |index| {
+            SignatureSet::single(
+                SignerRef::Validator(index),
+                compute_signing_root(&exit(index).message, exit_domain),
+                [0x33; 96],
+            )
+        };
+        let change_set = SignatureSet::single(
+            SignerRef::Inline([0x77; 48]),
+            compute_signing_root(&change().message, change_domain),
+            [0x44; 96],
+        );
+        // In the order of `process_operations`: the exits, the change and then the payload
+        // attestation. The sync aggregate comes last.
+        assert_eq!(sets.len(), 7);
+        assert_eq!(sets[2..5], [exit_set(5), exit_set(6), change_set.clone()]);
+        assert_eq!(
+            sets[5],
+            payload_attestation_signature_set(
+                &state,
+                &payload_attestation,
+                block.message.parent_root
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            sets[6],
+            sync_aggregate_signature_set(&state, &block.message.body.sync_aggregate)
+                .unwrap()
+                .unwrap()
+        );
+        assert_eq!(
+            voluntary_exit_signature_set(&state, &exit(5), CAPELLA_FORK_VERSION),
+            Ok(exit_set(5))
+        );
+        assert_eq!(
+            bls_to_execution_change_signature_set(&state, &change(), GENESIS_FORK_VERSION),
+            change_set
+        );
+
+        // An exit of a validator outside the registry has no key: the block is invalid.
+        block.message.body.voluntary_exits.push(exit(64)).unwrap();
+        assert_eq!(
+            block_signature_sets(&state, &block, &no_bls()),
+            Err(StfError::UnknownValidator(64))
+        );
+    }
+
+    #[test]
+    fn verify_exit_and_bls_change() {
+        let (state, _) = state_and_block(&[]);
+        let backend = |verdict| Counting {
+            verdict,
+            calls: Cell::new(0),
+        };
+        let capella = CAPELLA_FORK_VERSION;
+        let genesis = GENESIS_FORK_VERSION;
+        assert_eq!(
+            verify_voluntary_exit_signature(&state, &exit(5), capella, &backend(true)),
+            Ok(())
+        );
+        assert_eq!(
+            verify_voluntary_exit_signature(&state, &exit(5), capella, &backend(false)),
+            Err(StfError::InvalidVoluntaryExitSignature)
+        );
+        let none = backend(true);
+        assert_eq!(
+            verify_voluntary_exit_signature(&state, &exit(64), capella, &none),
+            Err(StfError::UnknownValidator(64))
+        );
+        assert_eq!(none.calls.get(), 0);
+        assert_eq!(
+            verify_bls_to_execution_change_signature(&state, &change(), genesis, &backend(true)),
+            Ok(())
+        );
+        assert_eq!(
+            verify_bls_to_execution_change_signature(&state, &change(), genesis, &backend(false)),
+            Err(StfError::InvalidBlsToExecutionChangeSignature)
+        );
+        // A backend without a verdict is not a proof of a bad signature.
+        let unavailable = crate::testing::ScriptedBackend::new([
+            Err(BackendError("timeout".into())),
+            Err(BackendError("timeout".into())),
+        ]);
+        assert_eq!(
+            verify_voluntary_exit_signature(&state, &exit(5), capella, &unavailable),
+            Err(StfError::SignatureBackend(BackendError("timeout".into())))
+        );
+        assert_eq!(
+            verify_bls_to_execution_change_signature(&state, &change(), genesis, &unavailable),
+            Err(StfError::SignatureBackend(BackendError("timeout".into())))
+        );
     }
 }

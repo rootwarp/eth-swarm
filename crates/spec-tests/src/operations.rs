@@ -22,21 +22,27 @@ use crate::bls_backend::{
 use crate::coverage::Reads;
 use crate::fixture;
 use crate::plan::Case;
-use consensus_types::common::SyncAggregate;
+use consensus_types::common::{
+    ConsolidationRequest, SignedBLSToExecutionChange, SignedVoluntaryExit, SyncAggregate,
+};
 use consensus_types::gloas::{
     BeaconBlock, BeaconState, BuilderDepositRequest, BuilderExitRequest, PayloadAttestation,
 };
 use consensus_types::{Mainnet, Minimal};
 use ssz::Decode;
+use state_transition::accessors::TotalActiveBalanceCache;
 use state_transition::per_block::builder::{
     process_builder_deposit_request, process_builder_exit_request,
 };
+use state_transition::per_block::exits::{process_bls_to_execution_change, process_voluntary_exit};
+use state_transition::per_block::requests::process_consolidation_request;
 use state_transition::per_block::sync_aggregate::process_sync_aggregate_with;
 use state_transition::per_block::{
     process_block_header, process_payload_attestation, BlockContext,
 };
 use state_transition::signatures::{
-    verify_payload_attestation_signature, verify_sync_aggregate_signature_with,
+    verify_bls_to_execution_change_signature, verify_payload_attestation_signature,
+    verify_sync_aggregate_signature_with, verify_voluntary_exit_signature,
 };
 use state_transition::{state_root, Preset, StfError};
 use std::path::Path;
@@ -44,27 +50,27 @@ use tree_hash::TreeHash;
 use yaml_rust2::Yaml;
 
 /// Handlers this runner executes.
-pub const RUNNABLE: [&str; 5] = [
+pub const RUNNABLE: [&str; 9] = [
     "block_header",
+    "bls_to_execution_change",
     "builder_deposit_request",
     "builder_exit_request",
+    "consolidation_request",
     "payload_attestation",
     "sync_aggregate",
+    "voluntary_exit",
+    "voluntary_exit_churn",
 ];
 
 /// Gloas handlers at beta.4 that the state transition does not port yet. Each needs a
 /// `skip.toml` entry.
-pub const NOT_RUN: [&str; 12] = [
+pub const NOT_RUN: [&str; 8] = [
     "attestation",
     "attester_slashing",
-    "bls_to_execution_change",
-    "consolidation_request",
     "deposit_request",
     "execution_payload_bid",
     "parent_execution_payload",
     "proposer_slashing",
-    "voluntary_exit",
-    "voluntary_exit_churn",
     "withdrawal_request",
     "withdrawals",
 ];
@@ -157,6 +163,34 @@ fn operation<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
             };
             checked.and_then(|()| process_sync_aggregate_with(&mut state, &aggregate, &mut ctx))
         }
+        // `voluntary_exit_churn` has the cases of the exit churn: the same operation.
+        ("operations", "voluntary_exit" | "voluntary_exit_churn") => {
+            let exit = decode::<SignedVoluntaryExit>(reads, file("voluntary_exit.ssz_snappy")?)?;
+            let keys = StateKeys::new(&state);
+            let ctx = bls_context(&case.key.preset, backend_for(bls, &keys))?;
+            let mut cache = TotalActiveBalanceCache::default();
+            verify_voluntary_exit_signature(&state, &exit, ctx.capella_fork_version, ctx.backend)
+                .and_then(|()| process_voluntary_exit(&mut state, &exit, &mut cache))
+        }
+        ("operations", "bls_to_execution_change") => {
+            let change =
+                decode::<SignedBLSToExecutionChange>(reads, file("address_change.ssz_snappy")?)?;
+            let keys = StateKeys::new(&state);
+            let ctx = bls_context(&case.key.preset, backend_for(bls, &keys))?;
+            verify_bls_to_execution_change_signature(
+                &state,
+                &change,
+                ctx.genesis_fork_version,
+                ctx.backend,
+            )
+            .and_then(|()| process_bls_to_execution_change(&mut state, &change))
+        }
+        ("operations", "consolidation_request") => {
+            let request =
+                decode::<ConsolidationRequest>(reads, file("consolidation_request.ssz_snappy")?)?;
+            let mut cache = TotalActiveBalanceCache::default();
+            process_consolidation_request(&mut state, &request, &mut cache)
+        }
         (runner, handler) => return Err(format!("no runner for {runner}/{handler}")),
     };
     expect(&mut state, outcome, post)
@@ -223,11 +257,15 @@ fn decode<T: Decode>(reads: &Reads, path: &Path) -> Result<T, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bls_backend::{capella_fork_version, genesis_fork_version};
     use crate::plan::{CaseFile, CaseKey, Date};
     use crate::sanity::tests::state;
     use crate::suite::{self, Config, SuiteError};
-    use consensus_types::common::Validator;
-    use consensus_types::primitives::{Bytes32, FAR_FUTURE_EPOCH};
+    use consensus_types::common::{BLSToExecutionChange, Validator, VoluntaryExit};
+    use consensus_types::primitives::{Address, Bytes32, Root, Version, FAR_FUTURE_EPOCH};
+    use consensus_types::signing::{
+        compute_domain, compute_signing_root, DOMAIN_BLS_TO_EXECUTION_CHANGE, DOMAIN_VOLUNTARY_EXIT,
+    };
     use ssz::Encode;
     use state_transition::per_block::process_sync_aggregate;
     use state_transition::signatures::G2_POINT_AT_INFINITY;
@@ -308,6 +346,15 @@ mod tests {
         assert_eq!(handler_runs("withdrawals"), Ok(false));
         assert_eq!(handler_runs("builder_deposit_request"), Ok(true));
         assert_eq!(handler_runs("builder_exit_request"), Ok(true));
+        for handler in [
+            "bls_to_execution_change",
+            "consolidation_request",
+            "voluntary_exit",
+            "voluntary_exit_churn",
+        ] {
+            assert_eq!(handler_runs(handler), Ok(true), "{handler}");
+            assert!(supported("gloas", "mainnet", handler), "{handler}");
+        }
         let err = handler_runs("randao").unwrap_err();
         assert!(
             err.contains("unknown operations handler directory `randao`"),
@@ -510,6 +557,239 @@ mod tests {
         assert!(run(&Reads::default(), &c)
             .unwrap_err()
             .contains("bls_setting"));
+    }
+
+    /// The compressed G1 generator: the public key of the secret key 1.
+    const PUBKEY_1: &str = "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
+    /// sha256 of the 48 bytes of [`PUBKEY_1`], from Python's hashlib.
+    const PUBKEY_1_SHA256: &str =
+        "7ccf478a431837728dcec3461f4f53b8749cdc4e03496dcaed459dea82b82eb8";
+
+    fn pubkey_1() -> [u8; 48] {
+        hex::decode(PUBKEY_1).unwrap().try_into().unwrap()
+    }
+
+    /// The signature of the secret key 1 over `root`.
+    fn sign_1(root: Root) -> [u8; 96] {
+        let mut secret = [0u8; 32];
+        secret[31] = 1;
+        crypto_bls::sign(&secret, root.as_slice())
+            .unwrap()
+            .to_bytes()
+    }
+
+    /// The minimal Gloas fork version (`configs/minimal.yaml` `GLOAS_FORK_VERSION`).
+    const GLOAS_FORK_VERSION: Version = [0x07, 0x00, 0x00, 0x01];
+
+    /// [`pre`] in epoch 64 (`SHARD_COMMITTEE_PERIOD` of the minimal preset) at the Gloas
+    /// fork, with a genesis validators root of `0x42` bytes. Validator 0 has the key
+    /// [`PUBKEY_1`] and the BLS withdrawal credentials of that key, so it can exit and change
+    /// its credentials.
+    fn signing_pre() -> BeaconState<Minimal> {
+        let mut pre = pre();
+        pre.slot = 64 * 8;
+        pre.fork.previous_version = GLOAS_FORK_VERSION;
+        pre.fork.current_version = GLOAS_FORK_VERSION;
+        pre.genesis_validators_root = Root::repeat_byte(0x42);
+        let validator = pre.validators.get_mut(0).unwrap();
+        validator.pubkey = pubkey_1();
+        validator.withdrawal_credentials =
+            Bytes32::from_slice(&hex::decode(PUBKEY_1_SHA256).unwrap());
+        validator.withdrawal_credentials[0] = 0x00;
+        pre.apply_updates().unwrap();
+        pre
+    }
+
+    /// The files of a case: `pre`, the operation as `name`, and `post` if the case is valid,
+    /// with `meta.yaml` `bls_setting: 1`.
+    fn signed_case_files(
+        pre: &BeaconState<Minimal>,
+        name: &'static str,
+        operation: Vec<u8>,
+        post: Option<&BeaconState<Minimal>>,
+    ) -> Vec<(&'static str, Vec<u8>)> {
+        let mut files = vec![
+            ("pre.ssz_snappy", snappy(pre.as_ssz_bytes())),
+            (name, snappy(operation)),
+            ("meta.yaml", b"{bls_setting: 1}\n".to_vec()),
+        ];
+        if let Some(post) = post {
+            files.push(("post.ssz_snappy", snappy(post.as_ssz_bytes())));
+        }
+        files
+    }
+
+    #[test]
+    fn exit_domain() {
+        let pre = signing_pre();
+        let exit = VoluntaryExit {
+            epoch: 64,
+            validator_index: 0,
+        };
+        let signed_over = |version: Version| SignedVoluntaryExit {
+            message: exit.clone(),
+            signature: sign_1(compute_signing_root(
+                &exit,
+                compute_domain(DOMAIN_VOLUNTARY_EXIT, version, pre.genesis_validators_root),
+            )),
+        };
+        let capella = capella_fork_version("minimal").unwrap();
+        let keys = StateKeys::new(&pre);
+        // EIP-7044: the domain of an exit has CAPELLA_FORK_VERSION at every later fork.
+        let current = signed_over(pre.fork.current_version);
+        assert_eq!(
+            verify_voluntary_exit_signature(&pre, &current, capella, &keys),
+            Err(StfError::InvalidVoluntaryExitSignature)
+        );
+        let fixed = signed_over(capella);
+        assert_eq!(
+            verify_voluntary_exit_signature(&pre, &fixed, capella, &keys),
+            Ok(())
+        );
+
+        // Through the runner: the exit over the current fork domain fails, and the exit over
+        // the Capella domain starts the exit of validator 0.
+        let dir = tempfile::tempdir().unwrap();
+        let name = "voluntary_exit.ssz_snappy";
+        let mut post = pre.clone();
+        process_voluntary_exit(&mut post, &fixed, &mut TotalActiveBalanceCache::default()).unwrap();
+        post.apply_updates().unwrap();
+        assert_ne!(post.validators.get(0).unwrap().exit_epoch, FAR_FUTURE_EPOCH);
+        for handler in ["voluntary_exit", "voluntary_exit_churn"] {
+            let files = signed_case_files(&pre, name, current.as_ssz_bytes(), Some(&post));
+            assert!(run(&Reads::default(), &case(dir.path(), handler, &files))
+                .unwrap_err()
+                .contains("invalid voluntary exit signature"));
+            let files = signed_case_files(&pre, name, current.as_ssz_bytes(), None);
+            assert_eq!(
+                run(&Reads::default(), &case(dir.path(), handler, &files)),
+                Ok(())
+            );
+            let files = signed_case_files(&pre, name, fixed.as_ssz_bytes(), Some(&post));
+            let c = case(dir.path(), handler, &files);
+            let reads = Reads::default();
+            assert_eq!(run(&reads, &c), Ok(()));
+            assert!(c.files.iter().all(|f| reads.contains(&f.path)));
+        }
+    }
+
+    #[test]
+    fn bls_change_domain() {
+        let pre = signing_pre();
+        let change = BLSToExecutionChange {
+            validator_index: 0,
+            from_bls_pubkey: pubkey_1(),
+            to_execution_address: Address::repeat_byte(0xee),
+        };
+        let signed_over = |version: Version| SignedBLSToExecutionChange {
+            message: change.clone(),
+            signature: sign_1(compute_signing_root(
+                &change,
+                compute_domain(
+                    DOMAIN_BLS_TO_EXECUTION_CHANGE,
+                    version,
+                    pre.genesis_validators_root,
+                ),
+            )),
+        };
+        let genesis = genesis_fork_version("minimal").unwrap();
+        let keys = StateKeys::new(&pre);
+        // The domain of a change has GENESIS_FORK_VERSION at every fork.
+        let current = signed_over(pre.fork.current_version);
+        assert_eq!(
+            verify_bls_to_execution_change_signature(&pre, &current, genesis, &keys),
+            Err(StfError::InvalidBlsToExecutionChangeSignature)
+        );
+        let fixed = signed_over(genesis);
+        assert_eq!(
+            verify_bls_to_execution_change_signature(&pre, &fixed, genesis, &keys),
+            Ok(())
+        );
+
+        // Through the runner, with the vector name of the operation file.
+        let dir = tempfile::tempdir().unwrap();
+        let name = "address_change.ssz_snappy";
+        let handler = "bls_to_execution_change";
+        let mut post = pre.clone();
+        process_bls_to_execution_change(&mut post, &fixed).unwrap();
+        post.apply_updates().unwrap();
+        let files = signed_case_files(&pre, name, current.as_ssz_bytes(), Some(&post));
+        assert!(run(&Reads::default(), &case(dir.path(), handler, &files))
+            .unwrap_err()
+            .contains("invalid BLS-to-execution change signature"));
+        let files = signed_case_files(&pre, name, current.as_ssz_bytes(), None);
+        assert_eq!(
+            run(&Reads::default(), &case(dir.path(), handler, &files)),
+            Ok(())
+        );
+        let files = signed_case_files(&pre, name, fixed.as_ssz_bytes(), Some(&post));
+        let c = case(dir.path(), handler, &files);
+        let reads = Reads::default();
+        assert_eq!(run(&reads, &c), Ok(()));
+        assert!(c.files.iter().all(|f| reads.contains(&f.path)));
+        // bls_setting 2: the signature over the current fork domain is not checked.
+        let mut files = signed_case_files(&pre, name, current.as_ssz_bytes(), Some(&post));
+        files[2].1 = b"{bls_setting: 2}\n".to_vec();
+        assert_eq!(
+            run(&Reads::default(), &case(dir.path(), handler, &files)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn exit_without_bls_and_consolidation_cases() {
+        let pre = signing_pre();
+        let dir = tempfile::tempdir().unwrap();
+        // bls_setting 2: an exit with a zero signature is valid.
+        let exit = SignedVoluntaryExit {
+            message: VoluntaryExit {
+                epoch: 0,
+                validator_index: 1,
+            },
+            signature: [0; 96],
+        };
+        let mut post = pre.clone();
+        process_voluntary_exit(&mut post, &exit, &mut TotalActiveBalanceCache::default()).unwrap();
+        post.apply_updates().unwrap();
+        let mut files = signed_case_files(
+            &pre,
+            "voluntary_exit.ssz_snappy",
+            exit.as_ssz_bytes(),
+            Some(&post),
+        );
+        files[2].1 = b"{bls_setting: 2}\n".to_vec();
+        assert_eq!(
+            run(
+                &Reads::default(),
+                &case(dir.path(), "voluntary_exit", &files)
+            ),
+            Ok(())
+        );
+
+        // A consolidation request for a key that no validator has does nothing.
+        let request = ConsolidationRequest {
+            source_address: Address::ZERO,
+            source_pubkey: [0xff; 48],
+            target_pubkey: [1; 48],
+        };
+        let files = [
+            ("pre.ssz_snappy", snappy(pre.as_ssz_bytes())),
+            (
+                "consolidation_request.ssz_snappy",
+                snappy(request.as_ssz_bytes()),
+            ),
+            ("post.ssz_snappy", snappy(pre.as_ssz_bytes())),
+        ];
+        let c = case(dir.path(), "consolidation_request", &files);
+        let reads = Reads::default();
+        assert_eq!(run(&reads, &c), Ok(()));
+        assert!(c.files.iter().all(|f| reads.contains(&f.path)));
+        // A valid request without a post-state: the vector expects it to fail, but a
+        // request never fails.
+        let c = case(dir.path(), "consolidation_request", &files[..2]);
+        assert!(run(&Reads::default(), &c)
+            .unwrap_err()
+            .contains("expects to fail"));
     }
 
     #[test]

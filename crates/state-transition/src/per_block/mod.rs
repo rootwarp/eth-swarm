@@ -11,16 +11,20 @@
 //! signature of an empty sync aggregate and the structure of a payload attestation.
 //!
 //! - [`builder`] has the builder deposit and exit requests.
+//! - [`exits`] has `process_voluntary_exit` and `process_bls_to_execution_change`.
 //! - [`header`] has `process_block_header`, `process_randao` and `process_eth1_data`.
 //! - [`operations`] has the Gloas `process_operations`.
 //! - [`payload_attestation`] has `process_payload_attestation` and the indexed form of a
 //!   payload attestation.
+//! - [`requests`] has `process_consolidation_request` and its helpers.
 //! - [`sync_aggregate`] has `process_sync_aggregate`.
 
 pub mod builder;
+pub mod exits;
 pub mod header;
 pub mod operations;
 pub mod payload_attestation;
+pub mod requests;
 pub mod sync_aggregate;
 
 pub use header::{check_block_header, process_block_header, process_eth1_data, process_randao};

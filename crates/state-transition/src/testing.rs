@@ -226,6 +226,10 @@ pub(crate) fn signed_block<E: Preset>(slot: u64, proposer_index: u64) -> SignedB
 /// the tests.
 pub(crate) const GENESIS_FORK_VERSION: Version = [0x00, 0x00, 0x00, 0x01];
 
+/// The `CAPELLA_FORK_VERSION` of `configs/minimal.yaml` (L43), for the voluntary exits of
+/// the tests.
+pub(crate) const CAPELLA_FORK_VERSION: Version = [0x03, 0x00, 0x00, 0x01];
+
 /// A [`SignatureBackend`] that gives the scripted verdicts in sequence and records each set
 /// that it gets. A call after the last verdict panics, so a test also proves that no other
 /// call occurs.
@@ -400,6 +404,7 @@ pub(crate) fn bls_context(backend: &dyn SignatureBackend) -> BlsContext<'_> {
         backend,
         aggregator: &XorAggregator,
         genesis_fork_version: GENESIS_FORK_VERSION,
+        capella_fork_version: CAPELLA_FORK_VERSION,
     }
 }
 
