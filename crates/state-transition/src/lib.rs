@@ -91,11 +91,13 @@ pub enum StfError {
     #[error("validator index {0} is out of range")]
     UnknownValidator(ValidatorIndex),
     /// An index past the end of a state list or a spec table, for example `balances`,
-    /// `inactivity_scores`, the participation flags or `PARTICIPATION_FLAG_WEIGHTS`.
+    /// `inactivity_scores`, the participation flags or `PARTICIPATION_FLAG_WEIGHTS`. It is
+    /// also a `state.proposer_lookahead` entry past the end of `validators`.
     ///
-    /// A state that the transition makes keeps these lists as long as the registry, and the
-    /// flag index comes from the code. Thus this error shows a bug in our state or in the
-    /// caller, never a proof that the input object is invalid.
+    /// A state that the transition makes keeps these lists as long as the registry, keeps
+    /// each lookahead entry in the registry, and the flag index comes from the code. Thus
+    /// this error shows a bug in our state or in the caller, never a proof that the input
+    /// object is invalid.
     #[error("index {index} is out of range of {list}")]
     ListIndexOutOfRange {
         /// The name of the list.
@@ -298,9 +300,9 @@ impl StfError {
     /// Whether the error proves that the input is invalid by the spec (REJECT). It does not
     /// for a step that is not ported yet, a backend without a verdict, a missing deposit
     /// verdict, a failed pubkey aggregation, a committee cache of another epoch or seed, a failure of the state trees, a
-    /// state list shorter than the registry or a code index past a spec table
-    /// (`ListIndexOutOfRange`), or a participation epoch other than the previous and the
-    /// current one (`ParticipationEpochOutOfRange`):
+    /// state list shorter than the registry, a `proposer_lookahead` entry past the registry
+    /// or a code index past a spec table (`ListIndexOutOfRange`), or a participation epoch
+    /// other than the previous and the current one (`ParticipationEpochOutOfRange`):
     /// callers IGNORE those, never REJECT.
     ///
     /// These variants are a proof only when the state is the object's own pre-state,
@@ -327,8 +329,9 @@ impl StfError {
             | Self::CacheEpochMismatch { .. }
             | Self::CacheSeedMismatch { .. }
             | Self::Tree(_)
-            // A state list shorter than the registry, or a flag index past the table: our
-            // own state or code is wrong, and the object did not cause it.
+            // A state list shorter than the registry, a lookahead entry past the registry,
+            // or a flag index past the table: our own state or code is wrong, and the
+            // object did not cause it.
             | Self::ListIndexOutOfRange { .. }
             // The spec reads participation only for the previous and the current epoch,
             // so another epoch is a caller error.
@@ -661,6 +664,58 @@ mod tests {
             ),
             Err(StfError::UnknownSyncCommitteeMember { position: 0 })
         );
+        assert!(backend.seen.borrow().is_empty());
+    }
+
+    #[test]
+    fn lookahead_outside_the_registry_is_not_a_proof() {
+        // 64 validators, and a lookahead entry of 64 for slot 1: the index comes from our
+        // own state, so a block that carries it gets an error that is not a proof.
+        let mut state = genesis_state::<Minimal>(&[32_000_000_000; 64]);
+        *state.proposer_lookahead.get_mut(1).unwrap() = 64;
+        let mut at_slot = state.clone();
+        per_slot::process_slots(&mut at_slot, 1, &no_bls()).unwrap();
+        let block = block_at_state_slot(&at_slot);
+        assert_eq!(block.message.proposer_index, 64);
+        let backend = FixedBackend::new(Ok(true));
+        let err = apply_block(
+            &mut state.clone(),
+            &block,
+            true,
+            &bls_context(&backend),
+            no_op,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            StfError::ListIndexOutOfRange {
+                list: "validators",
+                index: 64
+            }
+        );
+        assert!(!err.proves_invalid());
+        assert!(backend.seen.borrow().is_empty());
+
+        // A block with another proposer index (0, in the registry) gets the same error,
+        // not `WrongProposer`: the lookahead entry is the fault.
+        let mut other = block.clone();
+        other.message.proposer_index = 0;
+        let err = apply_block(
+            &mut state.clone(),
+            &other,
+            true,
+            &bls_context(&backend),
+            no_op,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            StfError::ListIndexOutOfRange {
+                list: "validators",
+                index: 64
+            }
+        );
+        assert!(!err.proves_invalid());
         assert!(backend.seen.borrow().is_empty());
     }
 

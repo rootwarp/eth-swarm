@@ -2,7 +2,6 @@
 //! keeps).
 
 use crate::accessors::{get_current_epoch, get_randao_mix, hash};
-use crate::caches::get_beacon_proposer_index;
 use crate::per_block::state_proposer_index;
 use crate::{Preset, StfError};
 use consensus_types::common::BeaconBlockHeader;
@@ -46,7 +45,7 @@ pub fn process_block_header<E: Preset>(
 
 /// The four asserts of `process_block_header` (P0 L2352-2358) before it writes the header:
 /// the slot, a newer slot than the latest block header, the proposer of the slot, and the
-/// parent root. They read no registry list and change nothing.
+/// parent root. They read only the length of the registry, and they change nothing.
 ///
 /// [`crate::state_transition`] runs them before it builds the signature sets, so a block
 /// that fails them costs no registry read and no backend call. The verdict is the one of
@@ -70,8 +69,10 @@ pub fn check_block_header<E: Preset>(
             latest: state.latest_block_header.slot,
         });
     }
-    // Verify that proposer index is the correct index
-    let expected = get_beacon_proposer_index(state)?;
+    // Verify that proposer index is the correct index. The index of the lookahead must be
+    // in the registry: if it is not, our own state is wrong (`ListIndexOutOfRange`, not a
+    // proof), and the proposer set of the block must not read it.
+    let expected = state_proposer_index(state)?;
     if block.proposer_index != expected {
         return Err(StfError::WrongProposer {
             block: block.proposer_index,

@@ -90,10 +90,17 @@ pub struct BlsContext<'a> {
 
 /// The proposer signature set of a block: `verify_block_signature` (P0 L1839-1844) without
 /// the BLS call.
+///
+/// `state` is the state at the block's slot. The function first checks that the proposer
+/// of `state.proposer_lookahead` for the slot is in the registry. If it is not, our own
+/// state is wrong, and the error is [`StfError::ListIndexOutOfRange`] (not a proof) for any
+/// block. [`StfError::UnknownValidator`] is only for a block index past the registry when
+/// the lookahead is valid.
 pub fn block_proposer_signature_set<E: Preset>(
     state: &BeaconState<E>,
     signed_block: &SignedBeaconBlock<E>,
 ) -> Result<SignatureSet, StfError> {
+    state_proposer_index(state)?;
     let block = &signed_block.message;
     if block.proposer_index >= state.validators.len() as u64 {
         return Err(StfError::UnknownValidator(block.proposer_index));
@@ -313,6 +320,7 @@ pub fn block_signature_sets_with<E: Preset>(
     ctx: &mut BlockContext,
 ) -> Result<Vec<SignatureSet>, StfError> {
     let body = &signed_block.message.body;
+    // The proposer set comes first, so its lookahead check runs before any other read.
     let mut sets = vec![
         block_proposer_signature_set(state, signed_block)?,
         randao_signature_set(state, body)?,
@@ -589,11 +597,14 @@ mod tests {
 
     #[test]
     fn operations_without_a_set_builder_fail_closed() {
+        use consensus_types::common::{AttestationData, Checkpoint};
         use consensus_types::common::{
             BLSToExecutionChange, BeaconBlockHeader, SignedBLSToExecutionChange,
             SignedBeaconBlockHeader, SignedVoluntaryExit, VoluntaryExit,
         };
-        use consensus_types::gloas::BeaconBlockBody;
+        use consensus_types::gloas::{
+            Attestation, AttesterSlashing, BeaconBlockBody, IndexedAttestation,
+        };
         use consensus_types::primitives::Address;
 
         let (state, block) = state_and_block(&[1]);
@@ -607,9 +618,25 @@ mod tests {
             },
             signature: [0; 96],
         };
+        let checkpoint = Checkpoint {
+            epoch: 0,
+            root: Root::ZERO,
+        };
+        let data = AttestationData {
+            slot: 0,
+            index: 0,
+            beacon_block_root: Root::ZERO,
+            source: checkpoint.clone(),
+            target: checkpoint,
+        };
+        let indexed = IndexedAttestation::<Minimal> {
+            attesting_indices: Default::default(),
+            data: data.clone(),
+            signature: [0; 96],
+        };
         /// Adds one signed part to a block body.
         type AddPart = Box<dyn Fn(&mut BeaconBlockBody<Minimal>)>;
-        let cases: [(&str, AddPart); 4] = [
+        let cases: [(&str, AddPart); 6] = [
             (
                 "4.3b",
                 Box::new(move |b| {
@@ -617,6 +644,30 @@ mod tests {
                         .push(consensus_types::common::ProposerSlashing {
                             signed_header_1: header.clone(),
                             signed_header_2: header.clone(),
+                        })
+                        .unwrap()
+                }),
+            ),
+            (
+                "4.3b",
+                Box::new(move |b| {
+                    b.attester_slashings
+                        .push(AttesterSlashing {
+                            attestation_1: indexed.clone(),
+                            attestation_2: indexed.clone(),
+                        })
+                        .unwrap()
+                }),
+            ),
+            (
+                "4.3b",
+                Box::new(move |b| {
+                    b.attestations
+                        .push(Attestation {
+                            aggregation_bits: ssz::ProgressiveBitList::with_capacity(1),
+                            data: data.clone(),
+                            signature: [0; 96],
+                            committee_bits: ssz::BitVector::new(),
                         })
                         .unwrap()
                 }),
@@ -709,6 +760,43 @@ mod tests {
         let aggregate = &block.message.body.sync_aggregate;
         process_sync_aggregate_with(&mut state, aggregate, &mut ctx).unwrap();
         assert_eq!(ctx.sync_index_scans(), 1);
+    }
+
+    #[test]
+    fn lookahead_outside_the_registry_is_not_a_proof() {
+        // The lookahead entry of slot 9 is past the 64 validators. The public set builders
+        // give `ListIndexOutOfRange` (a fault of our own state), not `UnknownValidator`,
+        // for the index of the lookahead and for any other index of the block.
+        let (mut state, block) = state_and_block(&[1]);
+        *state.proposer_lookahead.get_mut(9 % 8).unwrap() = 64;
+        let outside = StfError::ListIndexOutOfRange {
+            list: "validators",
+            index: 64,
+        };
+        for proposer_index in [64, 0] {
+            let mut block = block.clone();
+            block.message.proposer_index = proposer_index;
+            assert_eq!(
+                block_proposer_signature_set(&state, &block),
+                Err(outside.clone())
+            );
+            assert_eq!(block_signature_sets(&state, &block), Err(outside.clone()));
+            let backend = Counting {
+                verdict: true,
+                calls: Cell::new(0),
+            };
+            let err = verify_block_signatures(&state, &block, &bls_context(&backend)).unwrap_err();
+            assert_eq!(err, outside);
+            assert!(!err.proves_invalid());
+            assert_eq!(backend.calls.get(), 0);
+        }
+        // With a valid lookahead, a block index past the registry stays `UnknownValidator`.
+        let (state, mut block) = state_and_block(&[1]);
+        block.message.proposer_index = 64;
+        assert_eq!(
+            block_proposer_signature_set(&state, &block),
+            Err(StfError::UnknownValidator(64))
+        );
     }
 
     #[test]

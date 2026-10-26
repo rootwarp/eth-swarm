@@ -142,6 +142,9 @@ fn operation<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
         ("operations", "sync_aggregate") => {
             let aggregate = decode::<SyncAggregate<E>>(reads, file("sync_aggregate.ssz_snappy")?)?;
             // One context: the signature check and the rewards share the committee indices.
+            // Under `Bls::Ignore`, `process_sync_aggregate_with` still rejects an empty
+            // aggregate without the infinity signature, which the spec with BLS off accepts
+            // (see `Bls::Ignore`).
             let mut ctx = BlockContext::default();
             let checked = match bls {
                 Bls::Check => verify_sync_aggregate_signature_with(

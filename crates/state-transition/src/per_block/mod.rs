@@ -31,7 +31,7 @@ pub use sync_aggregate::process_sync_aggregate;
 use crate::caches::get_beacon_proposer_index;
 use crate::{Preset, StfError};
 use consensus_types::gloas::{BeaconBlock, BeaconState};
-use consensus_types::primitives::{Slot, ValidatorIndex};
+use consensus_types::primitives::{BLSPubkey, Slot, ValidatorIndex};
 
 /// A step of `process_block`, in the order of G L1754-1771.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -62,13 +62,33 @@ pub enum BlockStep {
 ///   time for each block. The signature set and the rewards of the sync aggregate both read
 ///   them. No step of a Gloas block changes the registry keys or the sync committee, so the
 ///   indices of the pre-state are the indices that `process_sync_aggregate` computes.
+///   The context keeps the indices with the `state.slot` and the
+///   `current_sync_committee.aggregate_pubkey` that they are for. It computes them again
+///   for a state with another slot or another committee, for example a state on another
+///   fork after a sync committee period boundary.
 ///
 /// Use one context for one block on one state, and a new context for the next block.
 #[derive(Debug, Default)]
 pub struct BlockContext {
     parent_slot: Slot,
-    sync_committee_indices: Option<Vec<ValidatorIndex>>,
+    sync_committee_indices: Option<SyncCommitteeIndices>,
     sync_index_scans: usize,
+}
+
+/// The sync committee indices of a state, with the key of the state that they are for.
+#[derive(Debug)]
+struct SyncCommitteeIndices {
+    slot: Slot,
+    aggregate_pubkey: BLSPubkey,
+    indices: Vec<ValidatorIndex>,
+}
+
+impl SyncCommitteeIndices {
+    /// Whether the indices are for the slot and the current sync committee of `state`.
+    fn is_for<E: Preset>(&self, state: &BeaconState<E>) -> bool {
+        self.slot == state.slot
+            && self.aggregate_pubkey == state.current_sync_committee.aggregate_pubkey
+    }
 }
 
 impl BlockContext {
@@ -78,17 +98,32 @@ impl BlockContext {
     }
 
     /// The validator index of each member of `state.current_sync_committee`
-    /// ([`sync_aggregate::sync_committee_indices`]). The first call reads the registry, and
-    /// the later calls give the same indices.
+    /// ([`sync_aggregate::sync_committee_indices`]). The first call for a `state.slot` and a
+    /// `current_sync_committee.aggregate_pubkey` reads the registry. The later calls for the
+    /// same slot and the same committee give the same indices.
     pub fn sync_committee_indices<E: Preset>(
         &mut self,
         state: &BeaconState<E>,
     ) -> Result<&[ValidatorIndex], StfError> {
-        if self.sync_committee_indices.is_none() {
+        let fresh = self
+            .sync_committee_indices
+            .as_ref()
+            .is_some_and(|cached| cached.is_for(state));
+        if !fresh {
+            self.sync_committee_indices = None;
             self.sync_index_scans += 1;
-            self.sync_committee_indices = Some(sync_aggregate::sync_committee_indices(state)?);
+            let indices = sync_aggregate::sync_committee_indices(state)?;
+            self.sync_committee_indices = Some(SyncCommitteeIndices {
+                slot: state.slot,
+                aggregate_pubkey: state.current_sync_committee.aggregate_pubkey,
+                indices,
+            });
         }
-        Ok(self.sync_committee_indices.as_deref().unwrap_or_default())
+        Ok(self
+            .sync_committee_indices
+            .as_ref()
+            .map(|cached| cached.indices.as_slice())
+            .unwrap_or_default())
     }
 
     /// The number of registry reads for the sync committee indices.
@@ -327,6 +362,63 @@ mod tests {
             Err(StfError::Unimplemented("4.6a"))
         );
         assert_eq!(state_root(&mut state).unwrap(), before);
+    }
+
+    #[test]
+    fn context_computes_the_indices_again_for_another_slot() {
+        // Two states at different slots, with other sync committees. One context for both
+        // must not give the indices of the first state for the second.
+        let mut first = genesis_state::<Minimal>(&[32_000_000_000; 64]);
+        per_slot::process_slots(&mut first, 1, &crate::testing::no_bls()).unwrap();
+        let mut second = first.clone();
+        second.slot = 2;
+        second.current_sync_committee.pubkeys[0] = second.validators.get(63).unwrap().pubkey;
+        let want_first = sync_aggregate::sync_committee_indices(&first).unwrap();
+        let want_second = sync_aggregate::sync_committee_indices(&second).unwrap();
+        assert_ne!(want_first, want_second);
+
+        let mut ctx = BlockContext::default();
+        assert_eq!(ctx.sync_committee_indices(&first).unwrap(), &want_first[..]);
+        assert_eq!(ctx.sync_committee_indices(&first).unwrap(), &want_first[..]);
+        assert_eq!(ctx.sync_index_scans(), 1);
+        assert_eq!(
+            ctx.sync_committee_indices(&second).unwrap(),
+            &want_second[..]
+        );
+        assert_eq!(ctx.sync_index_scans(), 2);
+    }
+
+    #[test]
+    fn context_computes_the_indices_again_for_another_committee() {
+        // Two fork states at the same slot after a sync committee period boundary: each has
+        // its own committee, with its own aggregate key. One context for both must not give
+        // the indices of the first state for the second.
+        let mut first = genesis_state::<Minimal>(&[32_000_000_000; 64]);
+        per_slot::process_slots(&mut first, 1, &crate::testing::no_bls()).unwrap();
+        let mut second = first.clone();
+        second.current_sync_committee.pubkeys[0] = second.validators.get(63).unwrap().pubkey;
+        second.current_sync_committee.aggregate_pubkey = [0x77; 48];
+        assert_ne!(
+            first.current_sync_committee.aggregate_pubkey,
+            second.current_sync_committee.aggregate_pubkey
+        );
+        let want_first = sync_aggregate::sync_committee_indices(&first).unwrap();
+        let want_second = sync_aggregate::sync_committee_indices(&second).unwrap();
+        assert_ne!(want_first, want_second);
+
+        let mut ctx = BlockContext::default();
+        assert_eq!(ctx.sync_committee_indices(&first).unwrap(), &want_first[..]);
+        assert_eq!(
+            ctx.sync_committee_indices(&second).unwrap(),
+            &want_second[..]
+        );
+        assert_eq!(ctx.sync_index_scans(), 2);
+        // The same committee at the same slot needs no new registry read.
+        assert_eq!(
+            ctx.sync_committee_indices(&second).unwrap(),
+            &want_second[..]
+        );
+        assert_eq!(ctx.sync_index_scans(), 2);
     }
 
     #[test]

@@ -144,9 +144,12 @@ pub fn bls_context<'a>(
 pub enum Bls {
     /// 0 (or no `meta.yaml`): optional, and checked here. 1: required.
     Check,
-    /// 2: the vector has no valid signatures. The BLS checks do not run (every signature is
-    /// valid, as in the spec with BLS off), but the checks that need no BLS (the infinity
-    /// signature of an empty sync aggregate) still run.
+    /// 2: the vector has no valid signatures. The BLS checks do not run, as in the spec with
+    /// BLS off. The checks that need no BLS still run, and one of them is stricter than the
+    /// spec: an empty sync aggregate must have the infinity signature. With BLS off,
+    /// `eth_fast_aggregate_verify` (`altair/bls.md` L58-66) calls `bls.FastAggregateVerify`,
+    /// which returns True, so the spec accepts an empty aggregate with any signature. This
+    /// runner rejects it. No vector at v1.7.0-beta.4 has this case.
     Ignore,
 }
 
