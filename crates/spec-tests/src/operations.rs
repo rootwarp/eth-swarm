@@ -18,6 +18,11 @@
 //!
 //! The `payload_attestation` cases also carry `config.yaml`, which [`check_config`] compares
 //! with the values that the runner and the transition use.
+//!
+//! The `withdrawals` handler calls the Gloas `process_withdrawals(state)`, which takes the
+//! state only, so its cases have no operation file. A `withdrawals` case without
+//! `post.ssz_snappy` has a pre-state that the transition does not make, and it must fail with
+//! the index error of the list that its name gives ([`expect_state_only`]).
 
 use crate::bls_backend::{
     backend_for, bls_context, bls_setting, genesis_fork_version, Bls, StateKeys,
@@ -48,7 +53,7 @@ use state_transition::per_block::requests::process_consolidation_request;
 use state_transition::per_block::sync_aggregate::process_sync_aggregate_with;
 use state_transition::per_block::{
     process_attester_slashing, process_block_header, process_payload_attestation,
-    process_proposer_slashing, BlockContext,
+    process_proposer_slashing, process_withdrawals, BlockContext,
 };
 use state_transition::signatures::{
     attestation_signature_set_with, attester_slashing_signature_sets,
@@ -62,7 +67,7 @@ use tree_hash::TreeHash;
 use yaml_rust2::Yaml;
 
 /// Handlers this runner executes.
-pub const RUNNABLE: [&str; 12] = [
+pub const RUNNABLE: [&str; 13] = [
     "attestation",
     "attester_slashing",
     "block_header",
@@ -75,16 +80,16 @@ pub const RUNNABLE: [&str; 12] = [
     "sync_aggregate",
     "voluntary_exit",
     "voluntary_exit_churn",
+    "withdrawals",
 ];
 
 /// Gloas handlers at beta.4 that the state transition does not port yet. Each needs a
 /// `skip.toml` entry.
-pub const NOT_RUN: [&str; 5] = [
+pub const NOT_RUN: [&str; 4] = [
     "deposit_request",
     "execution_payload_bid",
     "parent_execution_payload",
     "withdrawal_request",
-    "withdrawals",
 ];
 
 /// `Ok(true)` for a handler this runner executes, `Ok(false)` for a known handler that it
@@ -232,6 +237,10 @@ fn operation<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
                     process_attestation_with(&mut state, &attestation, parent_slot, &mut ctx)
                 })
         }
+        ("operations", "withdrawals") => {
+            let outcome = process_withdrawals(&mut state);
+            return expect_state_only(case, &mut state, outcome, post);
+        }
         (runner, handler) => return Err(format!("no runner for {runner}/{handler}")),
     };
     expect(&mut state, outcome, post)
@@ -351,6 +360,65 @@ fn expect<E: Preset>(
     }
 }
 
+/// [`expect`] for a handler that takes the state only (`withdrawals`). Such a handler has no
+/// operation that an error can prove invalid. Thus a case without `post.ssz_snappy` tests a
+/// pre-state that the transition does not make: an index in the state past the end of its
+/// list, which the pyspec raises as `IndexError`. That error is
+/// [`StfError::ListIndexOutOfRange`], which is not a proof (a fault of our own state).
+///
+/// A case without a post-state passes only on the `ListIndexOutOfRange` of the list that its
+/// name gives ([`expected_index_list`]). Any other error fails it, a proof error too: a port
+/// defect that fails earlier must not pass the case. [`expect`] checks the cases with a
+/// post-state.
+fn expect_state_only<E: Preset>(
+    case: &Case,
+    state: &mut BeaconState<E>,
+    outcome: Result<(), StfError>,
+    post: Option<BeaconState<E>>,
+) -> Result<(), String> {
+    let e = match (outcome, post) {
+        (Err(e), None) => e,
+        (outcome, post) => return expect(state, outcome, post),
+    };
+    let Some(want) = expected_index_list(&case.key.case) else {
+        return Err(format!(
+            "failed with {e}, but the case name gives no expected index error"
+        ));
+    };
+    match &e {
+        StfError::ListIndexOutOfRange { list, .. } if *list == want => {
+            // Print the error: a port defect that happens to give this error shows in the
+            // trial output.
+            eprintln!("{}: expected failure: {e}", case.key);
+            Ok(())
+        }
+        _ => Err(format!(
+            "failed with {e}, not the index error of `{want}` that the case expects"
+        )),
+    }
+}
+
+/// The list whose index error a `withdrawals` case without a post-state expects, from the
+/// name of the case:
+///
+/// - `invalid_builder_index_pending` and `invalid_builder_index_sweep`: `builders`. The first
+///   read of the bad index is `state.builders[builder_index]` in `apply_withdrawals`
+///   (G L2002) and in `get_builders_sweep_withdrawals` (G L1931).
+/// - `invalid_validator_index_pending_partial` and `invalid_validator_index_sweep`:
+///   `validators`. The first read of the bad index is `state.validators[validator_index]` in
+///   `get_pending_partial_withdrawals` (E L1378) and `get_validators_sweep_withdrawals`
+///   (E L1423), before `state.balances`.
+fn expected_index_list(case: &str) -> Option<&'static str> {
+    let name = case.rsplit('/').next().unwrap_or(case);
+    if name.starts_with("invalid_builder_index_") {
+        Some("builders")
+    } else if name.starts_with("invalid_validator_index_") {
+        Some("validators")
+    } else {
+        None
+    }
+}
+
 /// An SSZ object from a `.ssz_snappy` file.
 fn decode<T: Decode>(reads: &Reads, path: &Path) -> Result<T, String> {
     let bytes = fixture::ssz_snappy(reads, path)?;
@@ -446,7 +514,8 @@ mod tests {
     #[test]
     fn unknown_handler_fails() {
         assert_eq!(handler_runs("block_header"), Ok(true));
-        assert_eq!(handler_runs("withdrawals"), Ok(false));
+        assert_eq!(handler_runs("withdrawals"), Ok(true));
+        assert_eq!(handler_runs("parent_execution_payload"), Ok(false));
         assert_eq!(handler_runs("builder_deposit_request"), Ok(true));
         assert_eq!(handler_runs("builder_exit_request"), Ok(true));
         for handler in [
@@ -982,6 +1051,101 @@ mod tests {
             .contains("pre.ssz_snappy"));
     }
 
+    #[test]
+    fn withdrawals_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        // Validator 1 of `pre` can withdraw its full balance, and the parent of `pre` is FULL.
+        let mut pre = pre();
+        let validator = pre.validators.get_mut(1).unwrap();
+        validator.withdrawal_credentials[0] = 0x01;
+        validator.withdrawable_epoch = 0;
+        pre.apply_updates().unwrap();
+        let mut post = pre.clone();
+        process_withdrawals(&mut post).unwrap();
+        post.apply_updates().unwrap();
+        assert_eq!(*post.balances.get(1).unwrap(), 0);
+        // The cases have no operation file.
+        let files = |pre: &BeaconState<Minimal>, post: Option<&BeaconState<Minimal>>| {
+            let mut files = vec![("pre.ssz_snappy", snappy(pre.as_ssz_bytes()))];
+            if let Some(post) = post {
+                files.push(("post.ssz_snappy", snappy(post.as_ssz_bytes())));
+            }
+            files
+        };
+        let c = case(dir.path(), "withdrawals", &files(&pre, Some(&post)));
+        let reads = Reads::default();
+        assert_eq!(run(&reads, &c), Ok(()));
+        assert!(c.files.iter().all(|f| reads.contains(&f.path)));
+
+        // The pre-state is not the post-state.
+        let c = case(dir.path(), "withdrawals", &files(&pre, Some(&pre)));
+        assert!(run(&Reads::default(), &c)
+            .unwrap_err()
+            .contains("root mismatch"));
+        // A valid pre-state that the vector expects to fail.
+        let c = case(dir.path(), "withdrawals", &files(&pre, None));
+        assert!(run(&Reads::default(), &c)
+            .unwrap_err()
+            .contains("expects to fail"));
+        // A sweep cursor past the registry: the case expects the `IndexError` of the pyspec
+        // on `state.validators`.
+        let mut bad = pre.clone();
+        bad.next_withdrawal_validator_index = 2;
+        let named = |files: &[(&str, Vec<u8>)], name: &str| {
+            let mut c = case(dir.path(), "withdrawals", files);
+            c.key.case = format!("pyspec_tests/{name}");
+            c
+        };
+        let c = named(&files(&bad, None), "invalid_validator_index_sweep");
+        assert_eq!(run(&Reads::default(), &c), Ok(()));
+        let c = named(&files(&bad, Some(&post)), "invalid_validator_index_sweep");
+        assert!(run(&Reads::default(), &c)
+            .unwrap_err()
+            .contains("operation failed"));
+        // The same error under a case name that gives no expected list fails.
+        let c = case(dir.path(), "withdrawals", &files(&bad, None));
+        assert!(run(&Reads::default(), &c)
+            .unwrap_err()
+            .contains("gives no expected index error"));
+
+        // Only the index error of the list that the case name gives passes a case without a
+        // post-state. A proof error does not, and neither does another fault of our state.
+        let index = |list: &'static str| StfError::ListIndexOutOfRange { list, index: 8 };
+        let check = |name: &str, outcome: Result<(), StfError>| {
+            let mut c = case(dir.path(), "withdrawals", &[]);
+            c.key.case = format!("pyspec_tests/{name}");
+            expect_state_only(&c, &mut pre.clone(), outcome, None)
+        };
+        for name in [
+            "invalid_builder_index_pending",
+            "invalid_builder_index_sweep",
+        ] {
+            assert_eq!(check(name, Err(index("builders"))), Ok(()), "{name}");
+            let err = check(name, Err(index("validators"))).unwrap_err();
+            assert!(err.contains("`builders`"), "{err}");
+        }
+        for name in [
+            "invalid_validator_index_pending_partial",
+            "invalid_validator_index_sweep",
+        ] {
+            assert_eq!(check(name, Err(index("validators"))), Ok(()), "{name}");
+            for wrong in [
+                Err(index("builders")),
+                Err(index("balances")),
+                Err(StfError::ArithmeticOverflow),
+                Err(StfError::StateArithmetic {
+                    what: "withdrawal index",
+                }),
+                Err(StfError::Unimplemented("x")),
+            ] {
+                let err = check(name, wrong).unwrap_err();
+                assert!(err.contains("`validators`"), "{err}");
+            }
+            // A pre-state that passes is still an error.
+            assert!(check(name, Ok(())).unwrap_err().contains("expects to fail"));
+        }
+    }
+
     /// A `config.yaml` as the pyspec writes it: the keys that the runner checks, and keys
     /// that it does not compare.
     fn config(preset: &str, version: &str) -> String {
@@ -1101,12 +1265,12 @@ mod tests {
             .contains("no block.ssz_snappy"));
         let c = case(
             dir.path(),
-            "withdrawals",
+            "parent_execution_payload",
             &[("pre.ssz_snappy", snappy(pre.as_ssz_bytes()))],
         );
         assert!(run(&Reads::default(), &c)
             .unwrap_err()
-            .contains("no runner for operations/withdrawals"));
+            .contains("no runner for operations/parent_execution_payload"));
         let c = case(
             dir.path(),
             "builder_exit_request",

@@ -2,7 +2,7 @@
 //!
 //! [`process_block`] runs the eight steps of [`block_steps`] in the order of the spec. The
 //! steps that are not ported yet return [`StfError::Unimplemented`] with the work that ports
-//! them: the parent payload (`4.6a`), the withdrawals (`4.4a`) and the bid (`4.5`).
+//! them: the parent payload (`4.6a`) and the bid (`4.5`).
 //!
 //! The steps make no BLS check. The RANDAO reveal, the payload attestation signatures and
 //! the sync aggregate signature (and later the other operation signatures) go to the
@@ -20,6 +20,7 @@
 //! - [`requests`] has `process_consolidation_request` and its helpers.
 //! - [`slashings`] has `process_proposer_slashing` and `process_attester_slashing`.
 //! - [`sync_aggregate`] has `process_sync_aggregate`.
+//! - [`withdrawals`] has the Gloas `process_withdrawals(state)` and the withdrawals sweep.
 
 pub mod attestation;
 pub mod builder;
@@ -30,6 +31,7 @@ pub mod payload_attestation;
 pub mod requests;
 pub mod slashings;
 pub mod sync_aggregate;
+pub mod withdrawals;
 
 pub use attestation::process_attestation;
 pub use header::{check_block_header, process_block_header, process_eth1_data, process_randao};
@@ -37,6 +39,7 @@ pub use operations::process_operations;
 pub use payload_attestation::process_payload_attestation;
 pub use slashings::{process_attester_slashing, process_proposer_slashing};
 pub use sync_aggregate::process_sync_aggregate;
+pub use withdrawals::process_withdrawals;
 
 use crate::accessors::TotalActiveBalanceCache;
 use crate::caches::get_beacon_proposer_index;
@@ -52,7 +55,7 @@ pub enum BlockStep {
     ParentExecutionPayload,
     /// `process_block_header` (P0 L2350-2370).
     BlockHeader,
-    /// `process_withdrawals(state)` (Modified in Gloas).
+    /// `process_withdrawals(state)` (G L2067-2092, Modified in Gloas).
     Withdrawals,
     /// `process_execution_payload_bid` (G L2162-2215, New in Gloas).
     ExecutionPayloadBid,
@@ -322,13 +325,13 @@ fn block_header_step<E: Preset>(
     process_block_header(state, block)
 }
 
-/// `process_withdrawals(state)` (Modified in Gloas: it takes the state only). Not ported yet.
+/// `process_withdrawals(state)` (G L2067-2092, Modified in Gloas: it takes the state only).
 fn withdrawals_step<E: Preset>(
-    _: &mut BeaconState<E>,
+    state: &mut BeaconState<E>,
     _: &BeaconBlock<E>,
     _: &mut BlockContext,
 ) -> Result<(), StfError> {
-    Err(StfError::Unimplemented("4.4a"))
+    process_withdrawals(state)
 }
 
 /// `process_execution_payload_bid(state, block.body.signed_execution_payload_bid)`
@@ -486,7 +489,6 @@ mod tests {
         let step = |s: BlockStep| steps.iter().find(|(k, _)| *k == s).unwrap().1;
         for (s, id) in [
             (BlockStep::ParentExecutionPayload, "4.6a"),
-            (BlockStep::Withdrawals, "4.4a"),
             (BlockStep::ExecutionPayloadBid, "4.5"),
         ] {
             assert_eq!(
@@ -499,6 +501,7 @@ mod tests {
         let mut ctx = BlockContext::default();
         for s in [
             BlockStep::BlockHeader,
+            BlockStep::Withdrawals,
             BlockStep::Randao,
             BlockStep::Eth1Data,
             BlockStep::Operations,
@@ -509,6 +512,9 @@ mod tests {
         assert_eq!(post.latest_block_header.slot, 1);
         assert_eq!(post.eth1_data_votes.len(), 1);
         assert_ne!(post.randao_mixes.get(0), state.randao_mixes.get(0));
+        // The parent is FULL, and no validator can withdraw (0x00 credentials): the sweep
+        // moves its cursor by `MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP` (16 of 64).
+        assert_eq!(post.next_withdrawal_validator_index, 16);
         // A second header for the same slot is refused.
         assert_eq!(
             step(BlockStep::BlockHeader)(&mut post, &block, &mut ctx),

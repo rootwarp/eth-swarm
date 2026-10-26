@@ -1,5 +1,5 @@
 //! Preset values the state transition reads that are not SSZ lengths
-//! (`presets/{minimal,mainnet}/{phase0,altair,bellatrix,electra}.yaml`).
+//! (`presets/{minimal,mainnet}/{phase0,altair,bellatrix,capella,electra,gloas}.yaml`).
 //!
 //! The SSZ lengths stay on [`EthSpec`]; this trait adds the plain numbers, so every function
 //! takes one type parameter for both.
@@ -95,6 +95,12 @@ pub trait Preset: EthSpec {
     const SHUFFLE_ROUND_COUNT: u8;
     /// `TARGET_COMMITTEE_SIZE`.
     const TARGET_COMMITTEE_SIZE: u64;
+    /// `MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP` (`presets/{minimal,mainnet}/capella.yaml`).
+    const MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP: u64;
+    /// `MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP` (`presets/{minimal,mainnet}/electra.yaml`).
+    const MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP: u64;
+    /// `MAX_BUILDERS_PER_WITHDRAWALS_SWEEP` (`presets/{minimal,mainnet}/gloas.yaml`).
+    const MAX_BUILDERS_PER_WITHDRAWALS_SWEEP: u64;
     /// `MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA` (`configs/{minimal,mainnet}.yaml`).
     const MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA: Gwei;
     /// `CHURN_LIMIT_QUOTIENT_GLOAS` (`configs/{minimal,mainnet}.yaml`).
@@ -115,6 +121,9 @@ pub trait Preset: EthSpec {
 impl Preset for Minimal {
     const SHUFFLE_ROUND_COUNT: u8 = 10;
     const TARGET_COMMITTEE_SIZE: u64 = 4;
+    const MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP: u64 = 16;
+    const MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP: u64 = 2;
+    const MAX_BUILDERS_PER_WITHDRAWALS_SWEEP: u64 = 16;
     const MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA: Gwei = 64_000_000_000;
     const CHURN_LIMIT_QUOTIENT_GLOAS: u64 = 16;
     const CONSOLIDATION_CHURN_LIMIT_QUOTIENT: u64 = 32;
@@ -127,6 +136,9 @@ impl Preset for Minimal {
 impl Preset for Mainnet {
     const SHUFFLE_ROUND_COUNT: u8 = 90;
     const TARGET_COMMITTEE_SIZE: u64 = 128;
+    const MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP: u64 = 16_384;
+    const MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP: u64 = 8;
+    const MAX_BUILDERS_PER_WITHDRAWALS_SWEEP: u64 = 16_384;
     const MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA: Gwei = 128_000_000_000;
     const CHURN_LIMIT_QUOTIENT_GLOAS: u64 = 32_768;
     const CONSOLIDATION_CHURN_LIMIT_QUOTIENT: u64 = 65_536;
@@ -149,6 +161,20 @@ mod tests {
         assert_eq!(Mainnet::TARGET_COMMITTEE_SIZE, 128);
         assert_eq!(MIN_SEED_LOOKAHEAD, 1);
         assert_eq!(MAX_EFFECTIVE_BALANCE_ELECTRA, 2048 * 1_000_000_000);
+    }
+
+    #[test]
+    fn withdrawal_sweep_values_match_the_pinned_presets() {
+        // presets/{minimal,mainnet}/capella.yaml L11 and L16, electra.yaml L45 and
+        // gloas.yaml L23 at consensus-specs v1.7.0-beta.4.
+        assert_eq!(<Minimal as EthSpec>::MaxWithdrawalsPerPayload::to_u64(), 4);
+        assert_eq!(<Mainnet as EthSpec>::MaxWithdrawalsPerPayload::to_u64(), 16);
+        assert_eq!(Minimal::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP, 16);
+        assert_eq!(Mainnet::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP, 1 << 14);
+        assert_eq!(Minimal::MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP, 2);
+        assert_eq!(Mainnet::MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP, 8);
+        assert_eq!(Minimal::MAX_BUILDERS_PER_WITHDRAWALS_SWEEP, 16);
+        assert_eq!(Mainnet::MAX_BUILDERS_PER_WITHDRAWALS_SWEEP, 1 << 14);
     }
 
     #[test]

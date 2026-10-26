@@ -438,6 +438,28 @@ pub enum StfError {
     /// [`signatures::verify_operation_signatures`], not in the batch of the block.
     #[error("invalid operation signature")]
     InvalidOperationSignature,
+    /// A part of the withdrawals sweep got more prior withdrawals than its limit (the
+    /// `assert len(prior_withdrawals) <= withdrawals_limit` of G L1867 and L1920, E L1366, and
+    /// the `<` of E L1412). The prior withdrawals come from `get_expected_withdrawals`, which
+    /// keeps each part inside its limit, so this error shows a bug in our code or in the
+    /// caller, never a proof that the input is invalid.
+    #[error("{prior} prior withdrawals are past the limit {limit}")]
+    PriorWithdrawalsPastLimit {
+        /// `len(prior_withdrawals)`.
+        prior: u64,
+        /// The largest number of prior withdrawals that the part accepts.
+        limit: u64,
+    },
+    /// A `Uint64` operation of the withdrawals sweep overflowed, underflowed or divided by
+    /// zero. Each operand comes from the state only: the withdrawal index, the balances, the
+    /// sweep cursors and the length of the registry. A state that the transition makes keeps
+    /// them in range, so this error shows a fault of our own state, never a proof that a block
+    /// is invalid.
+    #[error("withdrawals sweep arithmetic failed on the state: {what}")]
+    StateArithmetic {
+        /// The value that failed, for example `"withdrawal index"`.
+        what: &'static str,
+    },
 }
 
 impl StfError {
@@ -446,8 +468,11 @@ impl StfError {
     /// verdict, a failed pubkey aggregation, a committee cache of another epoch or seed, a
     /// failure of the state trees, a state list shorter than the registry, a
     /// `proposer_lookahead` entry past the registry or a code index past a spec table
-    /// (`ListIndexOutOfRange`), or a participation epoch other than the previous and the
-    /// current one (`ParticipationEpochOutOfRange`): callers IGNORE those, never REJECT.
+    /// (`ListIndexOutOfRange`), a participation epoch other than the previous and the
+    /// current one (`ParticipationEpochOutOfRange`), prior withdrawals past the limit of a
+    /// sweep part (`PriorWithdrawalsPastLimit`), or a failed `Uint64` operation of the
+    /// withdrawals sweep on values of our own state (`StateArithmetic`): callers IGNORE
+    /// those, never REJECT.
     ///
     /// These variants are a proof only when the state is the object's own pre-state,
     /// advanced to the object's slot: [`StfError::EpochOutOfWindow`],
@@ -502,7 +527,13 @@ impl StfError {
             | Self::UnknownSyncCommitteeMember { .. }
             // Registry keys passed a proof of possession, so the aggregator or our state
             // failed, not the object.
-            | Self::PubkeyAggregation(_) => false,
+            | Self::PubkeyAggregation(_)
+            // The prior withdrawals come from our own `get_expected_withdrawals`, not from
+            // the object, so an excess is a fault of our code.
+            | Self::PriorWithdrawalsPastLimit { .. }
+            // The operands come from our own state, not from the block, so a failure is a
+            // fault of our state.
+            | Self::StateArithmetic { .. } => false,
             Self::SlotNotLater { .. }
             | Self::InvalidBlockSignature
             | Self::StateRootMismatch { .. }
@@ -978,7 +1009,7 @@ mod tests {
 
     /// The number of [`StfError`] variants: one more than the largest [`variant_id`].
     /// Increase `VARIANTS` when you add an id.
-    const VARIANTS: usize = 60;
+    const VARIANTS: usize = 62;
 
     /// A distinct id for each variant. The match has no `_` arm, so a new variant does not
     /// compile until it gets an id here, and then the table test fails until it has an entry.
@@ -1044,6 +1075,8 @@ mod tests {
             StfError::ProposerSlashingSameHeaders => 57,
             StfError::ValidatorNotSlashable(_) => 58,
             StfError::InvalidOperationSignature => 59,
+            StfError::PriorWithdrawalsPastLimit { .. } => 60,
+            StfError::StateArithmetic { .. } => 61,
         }
     }
 
@@ -1257,6 +1290,16 @@ mod tests {
             (StfError::ProposerSlashingSameHeaders, true),
             (StfError::ValidatorNotSlashable(1), true),
             (StfError::InvalidOperationSignature, true),
+            (
+                StfError::PriorWithdrawalsPastLimit { prior: 4, limit: 3 },
+                false,
+            ),
+            (
+                StfError::StateArithmetic {
+                    what: "withdrawal index",
+                },
+                false,
+            ),
         ];
         let mut ids: Vec<usize> = cases.iter().map(|(e, _)| variant_id(e)).collect();
         ids.sort_unstable();
