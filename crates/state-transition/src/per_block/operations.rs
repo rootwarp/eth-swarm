@@ -1,10 +1,9 @@
 //! The Gloas `process_operations` (G L2228-2263, Modified in Gloas).
 //!
-//! Each operation list goes to its handler in the order of the spec. The handlers that are
-//! not ported yet are dispatch slots that return [`StfError::Unimplemented`] with the work
-//! that ports them, so a block with an operation of such a kind fails and a block without
-//! one passes. The Gloas text calls no builder deposit or exit request handler here (the
-//! parent-payload step processes those), so no `4.6a` slot is in this function.
+//! Each operation list goes to its handler in the order of the spec. The Gloas text calls
+//! no request handler here: the parent payload step
+//! ([`super::parent_payload`]) processes the execution requests, the builder deposits and
+//! the builder exits.
 //!
 //! The slashings go to [`super::slashings`], the attestations to [`super::attestation`], and
 //! the voluntary exits and the BLS-to-execution changes to [`super::exits`].

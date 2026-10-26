@@ -8,10 +8,9 @@
 //! - [`state_transition`]: the slot loop, the block signature, the block and the state root.
 //! - [`per_slot`]: `process_slots` and `process_slot`.
 //! - [`per_epoch`]: the epoch processing.
-//! - [`per_block`]: the block processing: the step order, the header, the bid, RANDAO, eth1
-//!   data, the voluntary exits, the BLS-to-execution changes, the payload attestations and
-//!   the sync aggregate. The other steps and operations are stubs for now. It also has the
-//!   builder requests and the consolidation requests of the parent payload.
+//! - [`per_block`]: the block processing: the step order, the parent payload with its
+//!   execution requests, the header, the withdrawals, the bid, RANDAO, eth1 data, the
+//!   operations and the sync aggregate.
 //! - [`accessors`]: the beacon-state accessors and the misc helpers.
 //! - [`caches`]: shuffling, beacon committees, proposer and PTC selection.
 //! - [`mutators`]: the balance helpers, the exit and consolidation churn, validator and
@@ -461,6 +460,11 @@ pub enum StfError {
     /// sweep cursors and the length of the registry. A state that the transition makes keeps
     /// them in range, so this error shows a fault of our own state, never a proof that a block
     /// is invalid.
+    ///
+    /// Other sums that read the state only give it for the same reason: the pending balance
+    /// to withdraw of a validator, the exit and consolidation churn queues, and the
+    /// activation and withdrawable epochs of the withdrawal and consolidation requests of
+    /// the parent payload.
     #[error("withdrawals sweep arithmetic failed on the state: {what}")]
     StateArithmetic {
         /// The value that failed, for example `"withdrawal index"`.
@@ -549,6 +553,34 @@ pub enum StfError {
     /// This is a caller error, never a proof that the input is invalid.
     #[error("no blob limit of the network for epoch {0}")]
     UnknownBlobLimit(Epoch),
+    /// `process_parent_execution_payload` asserts `requests == ExecutionRequests.empty()`
+    /// when the parent is EMPTY: the bid of the block does not build on the block hash of
+    /// `state.latest_execution_payload_bid`, but the block carries parent execution requests.
+    #[error("the parent payload is empty, but the block carries parent execution requests")]
+    ParentRequestsNotEmpty,
+    /// `process_parent_execution_payload` asserts that a FULL parent has
+    /// `hash_tree_root(requests) == state.latest_execution_payload_bid.execution_requests_root`.
+    #[error("parent execution requests root {block} is not the root {expected} of the parent bid")]
+    ParentRequestsRootMismatch {
+        /// `hash_tree_root(block.body.parent_execution_requests)`.
+        block: Root,
+        /// `state.latest_execution_payload_bid.execution_requests_root`.
+        expected: Root,
+    },
+    /// `apply_parent_execution_payload` asserts that each request list of the parent payload
+    /// has at most its `MAX_*_REQUESTS_PER_PAYLOAD` entries (G L1792-1795). The list types
+    /// of `ExecutionRequests` bound each count at decode, so a decoded block always passes
+    /// these asserts. A decoder that refuses a block only for such a count gives this
+    /// verdict.
+    #[error("{count} parent {list} requests are more than the limit {limit}")]
+    ParentRequestsPastLimit {
+        /// The name of the request list, for example `"withdrawal"`.
+        list: &'static str,
+        /// The number of requests.
+        count: usize,
+        /// `MAX_*_REQUESTS_PER_PAYLOAD` of the list.
+        limit: usize,
+    },
 }
 
 impl StfError {
@@ -560,8 +592,8 @@ impl StfError {
     /// (`ListIndexOutOfRange`), a participation epoch other than the previous and the
     /// current one (`ParticipationEpochOutOfRange`), prior withdrawals past the limit of a
     /// sweep part (`PriorWithdrawalsPastLimit`), or a failed `Uint64` operation of the
-    /// withdrawals sweep on values of our own state (`StateArithmetic`): callers IGNORE
-    /// those, never REJECT.
+    /// withdrawals sweep or of a request on values of our own state (`StateArithmetic`):
+    /// callers IGNORE those, never REJECT.
     ///
     /// These variants are a proof only when the state is the object's own pre-state,
     /// advanced to the object's slot: [`StfError::EpochOutOfWindow`],
@@ -600,6 +632,9 @@ impl StfError {
     /// [`StfError::BidParentBlockRoot`] and [`StfError::BidPrevRandao`].
     /// [`StfError::BidBlobCommitments`] is a proof only with the blob schedule of the
     /// network of the bid. [`StfError::UnknownBlobLimit`] is a caller error: IGNORE.
+    ///
+    /// The parent payload variants that read the parent bid of the state have the same rule:
+    /// [`StfError::ParentRequestsNotEmpty`] and [`StfError::ParentRequestsRootMismatch`].
     ///
     /// The match has no `_` arm, so each new variant must select its class here.
     pub fn proves_invalid(&self) -> bool {
@@ -744,7 +779,15 @@ impl StfError {
             | Self::BidPrevRandao { .. }
             // The limit of the blob schedule of the network at the bid's epoch: a proof
             // with the network config of the bid's chain.
-            | Self::BidBlobCommitments { .. } => true,
+            | Self::BidBlobCommitments { .. }
+            // The asserts of `process_parent_execution_payload` on the parent bid of the
+            // block's own pre-state: no requests for an EMPTY parent, and the committed
+            // requests root for a FULL parent.
+            | Self::ParentRequestsNotEmpty
+            | Self::ParentRequestsRootMismatch { .. }
+            // The count asserts of `apply_parent_execution_payload`: a property of the
+            // block alone.
+            | Self::ParentRequestsPastLimit { .. } => true,
         }
     }
 }
@@ -783,12 +826,11 @@ pub fn state_root<E: Preset>(state: &mut BeaconState<E>) -> Result<Root, StfErro
 /// [`per_slot::process_slots`]). Prefetch the deposit verdicts with
 /// [`per_epoch::pending_deposit_signature_sets`] on the pre-state and `block.slot`.
 ///
-/// # Warning
-///
-/// Do not use this function on real blocks yet. Block processing is ported only in part:
-/// [`per_block::process_block`] returns [`StfError::Unimplemented`] at its first step (the
-/// parent payload), so every block fails with an error that is not a proof of an invalid
-/// block.
+/// The block also needs `bls` in both modes. Its parent payload step asks `bls.backend` for
+/// the verdicts of the builder deposits of new keys in
+/// `block.body.parent_execution_requests`. Prefetch a verdict for
+/// [`per_block::builder::builder_deposit_signature_set`] of each builder deposit request
+/// with the builder withdrawal prefix (see [`per_block::parent_payload`]).
 ///
 /// Bound `block.slot` against the wall clock before the call. As in the spec, the slots
 /// are processed before the signature check, and `process_slots` has no upper bound: a
@@ -835,6 +877,8 @@ where
     let mut ctx = per_block::BlockContext::default();
     let epoch = accessors::get_current_epoch(state);
     ctx.set_max_blobs_per_block(epoch, bls.blob_schedule.max_blobs_per_block(epoch));
+    // The parent payload step asks the backend for the builder deposits of new keys.
+    ctx.set_deposit_verdicts(bls.backend, bls.genesis_fork_version);
     if validate_result {
         per_block::check_block_header(state, block)?;
         signatures::verify_block_signatures_with(state, signed_block, bls, &mut ctx)?;
@@ -921,6 +965,35 @@ mod tests {
         };
         assert_eq!(apply_block(&mut state, &block, false, &bls, read), Ok(()));
         assert_eq!(seen, vec![Ok(6), Err(StfError::UnknownBlobLimit(1))]);
+    }
+
+    #[test]
+    fn block_context_has_the_deposit_verdicts_of_bls() {
+        // The parent payload step of the block asks `bls.backend` for the builder deposit
+        // verdicts, with the `GENESIS_FORK_VERSION` of `bls`, in both modes.
+        let (state, block) = state_and_block();
+        let backend = FixedBackend::new(Ok(true));
+        let bls = BlsContext {
+            genesis_fork_version: [9, 9, 9, 9],
+            ..bls_context(&backend)
+        };
+        for validate_result in [false, true] {
+            let mut seen = None;
+            let read = |_: &mut BeaconState<Minimal>,
+                        _: &BeaconBlock<Minimal>,
+                        ctx: &mut per_block::BlockContext| {
+                let verdicts = ctx.deposit_verdicts().expect("deposit verdicts");
+                let set = SignatureSet::single(SignerRef::Inline([1; 48]), Root::ZERO, [2; 96]);
+                seen = Some((
+                    verdicts.genesis_fork_version,
+                    verdicts.backend.verify_signature_sets(&[set]),
+                ));
+                Ok(())
+            };
+            let mut post = state.clone();
+            let _ = apply_block(&mut post, &block, validate_result, &bls, read);
+            assert_eq!(seen, Some(([9, 9, 9, 9], Ok(true))), "{validate_result}");
+        }
     }
 
     #[test]
@@ -1142,18 +1215,18 @@ mod tests {
             Ok(())
         );
         assert_eq!(post.slot, 1);
-        // The public entry point runs the same steps, then `process_block`, which stops at
-        // the parent-payload step until it is ported.
+        // The public entry point runs the same steps, then `process_block`. The bid of the
+        // test block has its parent block hash as its block hash, so the bid step refuses it.
         let mut post = state;
         assert_eq!(
             state_transition(&mut post, &block, true, &bls_context(&accepting)),
-            Err(StfError::Unimplemented("4.6a"))
+            Err(StfError::BidBlockHashIsParent)
         );
     }
 
     /// The number of [`StfError`] variants: one more than the largest [`variant_id`].
     /// Increase `VARIANTS` when you add an id.
-    const VARIANTS: usize = 75;
+    const VARIANTS: usize = 78;
 
     /// A distinct id for each variant. The match has no `_` arm, so a new variant does not
     /// compile until it gets an id here, and then the table test fails until it has an entry.
@@ -1234,6 +1307,9 @@ mod tests {
             StfError::BidParentBlockRoot { .. } => 72,
             StfError::BidPrevRandao { .. } => 73,
             StfError::UnknownBlobLimit(_) => 74,
+            StfError::ParentRequestsNotEmpty => 75,
+            StfError::ParentRequestsRootMismatch { .. } => 76,
+            StfError::ParentRequestsPastLimit { .. } => 77,
         }
     }
 
@@ -1500,6 +1576,22 @@ mod tests {
                 true,
             ),
             (StfError::UnknownBlobLimit(1), false),
+            (StfError::ParentRequestsNotEmpty, true),
+            (
+                StfError::ParentRequestsRootMismatch {
+                    block: Root::repeat_byte(1),
+                    expected: Root::repeat_byte(2),
+                },
+                true,
+            ),
+            (
+                StfError::ParentRequestsPastLimit {
+                    list: "withdrawal",
+                    count: 17,
+                    limit: 16,
+                },
+                true,
+            ),
         ];
         let mut ids: Vec<usize> = cases.iter().map(|(e, _)| variant_id(e)).collect();
         ids.sort_unstable();

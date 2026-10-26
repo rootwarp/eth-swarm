@@ -26,6 +26,13 @@
 //!
 //! The `execution_payload_bid` cases take the blob limit of the spec config of the preset
 //! ([`crate::bls_backend::blob_schedule`]) at the epoch of `pre`.
+//!
+//! The `parent_execution_payload` cases hold a `block.ssz_snappy` and call
+//! `process_parent_execution_payload(state, block)`, with the in-process backend for the
+//! proofs of possession of new builders. The `deposit_request` and `withdrawal_request`
+//! cases call their request handler alone. A block whose request list is longer than its
+//! `MAX_*_REQUESTS_PER_PAYLOAD` does not decode; [`parent_payload_block`] gives the verdict
+//! of the count assert for it.
 
 use crate::bls_backend::{
     backend_for, bls_context, bls_setting, genesis_fork_version, Bls, StateKeys,
@@ -34,14 +41,15 @@ use crate::coverage::Reads;
 use crate::fixture;
 use crate::plan::Case;
 use consensus_types::common::{
-    AttestationData, ConsolidationRequest, ProposerSlashing, SignedBLSToExecutionChange,
-    SignedVoluntaryExit, SyncAggregate,
+    AttestationData, ConsolidationRequest, Deposit, DepositRequest, Eth1Data, ProposerSlashing,
+    SignedBLSToExecutionChange, SignedVoluntaryExit, SyncAggregate, WithdrawalRequest,
 };
 use consensus_types::gloas::{
     Attestation, AttesterSlashing, BeaconBlock, BeaconState, BuilderDepositRequest,
     BuilderExitRequest, PayloadAttestation, SignedExecutionPayloadBid,
 };
-use consensus_types::primitives::{BLSSignature, Slot, ValidatorIndex};
+use consensus_types::primitives::{BLSSignature, Bytes32, Root, Slot, ValidatorIndex};
+use consensus_types::EthSpec;
 use consensus_types::{Mainnet, Minimal};
 use ssz::Decode;
 use ssz_types::typenum::{Unsigned, U0};
@@ -52,11 +60,14 @@ use state_transition::per_block::builder::{
     process_builder_deposit_request, process_builder_exit_request,
 };
 use state_transition::per_block::exits::{process_bls_to_execution_change, process_voluntary_exit};
-use state_transition::per_block::requests::process_consolidation_request;
+use state_transition::per_block::requests::{
+    process_consolidation_request, process_deposit_request, process_withdrawal_request,
+};
 use state_transition::per_block::sync_aggregate::process_sync_aggregate_with;
 use state_transition::per_block::{
     process_attester_slashing, process_block_header, process_execution_payload_bid,
-    process_payload_attestation, process_proposer_slashing, process_withdrawals, BlockContext,
+    process_parent_execution_payload, process_payload_attestation, process_proposer_slashing,
+    process_withdrawals, BlockContext,
 };
 use state_transition::signatures::{
     attestation_signature_set_with, attester_slashing_signature_sets,
@@ -71,7 +82,7 @@ use tree_hash::TreeHash;
 use yaml_rust2::Yaml;
 
 /// Handlers this runner executes.
-pub const RUNNABLE: [&str; 14] = [
+pub const RUNNABLE: [&str; 17] = [
     "attestation",
     "attester_slashing",
     "block_header",
@@ -79,22 +90,21 @@ pub const RUNNABLE: [&str; 14] = [
     "builder_deposit_request",
     "builder_exit_request",
     "consolidation_request",
+    "deposit_request",
     "execution_payload_bid",
+    "parent_execution_payload",
     "payload_attestation",
     "proposer_slashing",
     "sync_aggregate",
     "voluntary_exit",
     "voluntary_exit_churn",
+    "withdrawal_request",
     "withdrawals",
 ];
 
 /// Gloas handlers at beta.4 that the state transition does not port yet. Each needs a
-/// `skip.toml` entry.
-pub const NOT_RUN: [&str; 3] = [
-    "deposit_request",
-    "parent_execution_payload",
-    "withdrawal_request",
-];
+/// `skip.toml` entry. Every Gloas handler of beta.4 runs now.
+pub const NOT_RUN: [&str; 0] = [];
 
 /// `Ok(true)` for a handler this runner executes, `Ok(false)` for a known handler that it
 /// does not, and `Err` for a handler directory that it does not know.
@@ -226,6 +236,30 @@ fn operation<E: Preset>(reads: &Reads, case: &Case) -> Result<(), String> {
                 ctx.backend,
             )
             .and_then(|()| process_bls_to_execution_change(&mut state, &change))
+        }
+        ("operations", "deposit_request") => {
+            let request = decode::<DepositRequest>(reads, file("deposit_request.ssz_snappy")?)?;
+            process_deposit_request(&mut state, &request)
+        }
+        ("operations", "withdrawal_request") => {
+            let request =
+                decode::<WithdrawalRequest>(reads, file("withdrawal_request.ssz_snappy")?)?;
+            let mut cache = TotalActiveBalanceCache::default();
+            process_withdrawal_request(&mut state, &request, &mut cache)
+        }
+        ("operations", "parent_execution_payload") => {
+            let block = parent_payload_block::<E>(reads, file("block.ssz_snappy")?)?;
+            // The builder deposits of new keys carry their key inline.
+            let keys = StateKeys::new(&state);
+            let ctx = bls_context(&case.key.preset, backend_for(bls, &keys))?;
+            block.and_then(|block| {
+                process_parent_execution_payload(
+                    &mut state,
+                    &block,
+                    ctx.genesis_fork_version,
+                    ctx.backend,
+                )
+            })
         }
         ("operations", "consolidation_request") => {
             let request =
@@ -360,6 +394,104 @@ fn attester_slashing<E: Preset>(
     }
 }
 
+/// `ExecutionRequests` with the unbounded lists of the spec (`gloas/beacon-chain.md`
+/// L972-981): each `ProgressiveList` has no type-level limit. Its SSZ encoding is the
+/// encoding of the bounded type of consensus-types.
+#[derive(ssz_derive::Decode)]
+#[cfg_attr(test, derive(ssz_derive::Encode))]
+struct SpecExecutionRequests {
+    _deposits: ProgressiveVariableList<DepositRequest, U0>,
+    withdrawals: ProgressiveVariableList<WithdrawalRequest, U0>,
+    consolidations: ProgressiveVariableList<ConsolidationRequest, U0>,
+    builder_deposits: ProgressiveVariableList<BuilderDepositRequest, U0>,
+    builder_exits: ProgressiveVariableList<BuilderExitRequest, U0>,
+}
+
+/// The Gloas `BeaconBlockBody` (`gloas/beacon-chain.md` L840-860) with
+/// [`SpecExecutionRequests`]. The other fields have the types of consensus-types.
+#[derive(ssz_derive::Decode)]
+struct SpecBeaconBlockBody<E: EthSpec> {
+    _randao_reveal: BLSSignature,
+    _eth1_data: Eth1Data,
+    _graffiti: Bytes32,
+    _proposer_slashings: ProgressiveVariableList<ProposerSlashing, E::MaxProposerSlashings>,
+    _attester_slashings: ProgressiveVariableList<AttesterSlashing<E>, E::MaxAttesterSlashings>,
+    _attestations: ProgressiveVariableList<Attestation<E>, E::MaxAttestations>,
+    _deposits: ProgressiveVariableList<Deposit, E::MaxDeposits>,
+    _voluntary_exits: ProgressiveVariableList<SignedVoluntaryExit, E::MaxVoluntaryExits>,
+    _sync_aggregate: SyncAggregate<E>,
+    _bls_to_execution_changes:
+        ProgressiveVariableList<SignedBLSToExecutionChange, E::MaxBlsToExecutionChanges>,
+    _signed_execution_payload_bid: SignedExecutionPayloadBid<E>,
+    _payload_attestations:
+        ProgressiveVariableList<PayloadAttestation<E>, E::MaxPayloadAttestations>,
+    parent_execution_requests: SpecExecutionRequests,
+}
+
+/// The Gloas `BeaconBlock` with [`SpecBeaconBlockBody`].
+#[derive(ssz_derive::Decode)]
+struct SpecBeaconBlock<E: EthSpec> {
+    _slot: Slot,
+    _proposer_index: ValidatorIndex,
+    _parent_root: Root,
+    _state_root: Root,
+    body: SpecBeaconBlockBody<E>,
+}
+
+/// The block of a `parent_execution_payload` case.
+///
+/// The `ExecutionRequests` of consensus-types bounds each request list except the deposits
+/// to its `MAX_*_REQUESTS_PER_PAYLOAD`, the bound that `apply_parent_execution_payload`
+/// (`gloas/beacon-chain.md` L1792-1795) asserts. A block that does not decode for that
+/// reason only has the verdict of that assert:
+/// `Ok(Err(StfError::ParentRequestsPastLimit { .. }))`. Any other decode error is a failure
+/// of the case (`Err`).
+fn parent_payload_block<E: Preset>(
+    reads: &Reads,
+    path: &Path,
+) -> Result<Result<BeaconBlock<E>, StfError>, String> {
+    let bytes = fixture::ssz_snappy(reads, path)?;
+    let bounded_error = match BeaconBlock::<E>::from_ssz_bytes(&bytes) {
+        Ok(block) => return Ok(Ok(block)),
+        Err(e) => format!("{}: {e:?}", path.display()),
+    };
+    let spec = SpecBeaconBlock::<E>::from_ssz_bytes(&bytes).map_err(|_| bounded_error.clone())?;
+    let requests = &spec.body.parent_execution_requests;
+    let counts = [
+        (
+            "withdrawal",
+            requests.withdrawals.len(),
+            E::MaxWithdrawalRequestsPerPayload::to_usize(),
+        ),
+        (
+            "consolidation",
+            requests.consolidations.len(),
+            E::MaxConsolidationRequestsPerPayload::to_usize(),
+        ),
+        (
+            "builder deposit",
+            requests.builder_deposits.len(),
+            E::MaxBuilderDepositRequestsPerPayload::to_usize(),
+        ),
+        (
+            "builder exit",
+            requests.builder_exits.len(),
+            E::MaxBuilderExitRequestsPerPayload::to_usize(),
+        ),
+    ];
+    counts
+        .into_iter()
+        .find(|&(_, count, limit)| count > limit)
+        .map(|(list, count, limit)| {
+            Ok(Err(StfError::ParentRequestsPastLimit {
+                list,
+                count,
+                limit,
+            }))
+        })
+        .unwrap_or(Err(bounded_error))
+}
+
 /// Compares the outcome of a handler with what the vector expects.
 fn expect<E: Preset>(
     state: &mut BeaconState<E>,
@@ -457,7 +589,10 @@ mod tests {
     use crate::plan::{CaseFile, CaseKey, Date};
     use crate::sanity::tests::state;
     use crate::suite::{self, Config, SuiteError};
-    use consensus_types::common::{BLSToExecutionChange, Validator, VoluntaryExit};
+    use consensus_types::common::{
+        BLSToExecutionChange, Validator, VoluntaryExit, WithdrawalRequest,
+    };
+    use consensus_types::gloas::ExecutionRequests;
     use consensus_types::primitives::{Address, Bytes32, Root, Version, FAR_FUTURE_EPOCH};
     use consensus_types::signing::{
         compute_domain, compute_signing_root, DOMAIN_BLS_TO_EXECUTION_CHANGE, DOMAIN_VOLUNTARY_EXIT,
@@ -540,7 +675,9 @@ mod tests {
     fn unknown_handler_fails() {
         assert_eq!(handler_runs("block_header"), Ok(true));
         assert_eq!(handler_runs("withdrawals"), Ok(true));
-        assert_eq!(handler_runs("parent_execution_payload"), Ok(false));
+        assert_eq!(handler_runs("parent_execution_payload"), Ok(true));
+        assert_eq!(handler_runs("deposit_request"), Ok(true));
+        assert_eq!(handler_runs("withdrawal_request"), Ok(true));
         assert_eq!(handler_runs("builder_deposit_request"), Ok(true));
         assert_eq!(handler_runs("builder_exit_request"), Ok(true));
         for handler in [
@@ -678,14 +815,19 @@ mod tests {
                     signature: [0; 96],
                 },
                 payload_attestations: Default::default(),
-                parent_execution_requests: ExecutionRequests {
-                    deposits: Default::default(),
-                    withdrawals: Default::default(),
-                    consolidations: Default::default(),
-                    builder_deposits: Default::default(),
-                    builder_exits: Default::default(),
-                },
+                parent_execution_requests: empty_requests(),
             },
+        }
+    }
+
+    /// `ExecutionRequests.empty()`.
+    fn empty_requests() -> consensus_types::gloas::ExecutionRequests<Minimal> {
+        consensus_types::gloas::ExecutionRequests {
+            deposits: Default::default(),
+            withdrawals: Default::default(),
+            consolidations: Default::default(),
+            builder_deposits: Default::default(),
+            builder_exits: Default::default(),
         }
     }
 
@@ -1163,6 +1305,183 @@ mod tests {
     }
 
     #[test]
+    fn deposit_and_withdrawal_request_cases() {
+        use consensus_types::common::{DepositRequest, WithdrawalRequest};
+        use state_transition::per_block::requests::{
+            process_deposit_request, process_withdrawal_request,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let pre = pre();
+        // A deposit request is queued, with `bls_setting: 1` in `meta.yaml`.
+        let deposit = DepositRequest {
+            pubkey: [7; 48],
+            withdrawal_credentials: Bytes32::ZERO,
+            amount: ETH,
+            signature: [0x22; 96],
+            index: 3,
+        };
+        let mut post = pre.clone();
+        process_deposit_request(&mut post, &deposit).unwrap();
+        post.apply_updates().unwrap();
+        let name = "deposit_request.ssz_snappy";
+        let files = op_files(
+            &pre,
+            name,
+            deposit.as_ssz_bytes(),
+            Some(&post),
+            Some("{bls_setting: 1}\n"),
+        );
+        let c = case(dir.path(), "deposit_request", &files);
+        let reads = Reads::default();
+        assert_eq!(run(&reads, &c), Ok(()));
+        assert!(c.files.iter().all(|f| reads.contains(&f.path)));
+        let files = op_files(&pre, name, deposit.as_ssz_bytes(), Some(&pre), None);
+        let c = case(dir.path(), "deposit_request", &files);
+        assert!(run(&Reads::default(), &c)
+            .unwrap_err()
+            .contains("root mismatch"));
+
+        // A withdrawal request for a key that no validator has does nothing.
+        let request = WithdrawalRequest {
+            source_address: Address::ZERO,
+            validator_pubkey: [0xff; 48],
+            amount: 0,
+        };
+        let mut post = pre.clone();
+        process_withdrawal_request(&mut post, &request, &mut TotalActiveBalanceCache::default())
+            .unwrap();
+        let name = "withdrawal_request.ssz_snappy";
+        let files = op_files(&pre, name, request.as_ssz_bytes(), Some(&post), None);
+        let c = case(dir.path(), "withdrawal_request", &files);
+        let reads = Reads::default();
+        assert_eq!(run(&reads, &c), Ok(()));
+        assert!(c.files.iter().all(|f| reads.contains(&f.path)));
+        // A request never fails, so a case without a post-state fails.
+        let files = op_files(&pre, name, request.as_ssz_bytes(), None, None);
+        let c = case(dir.path(), "withdrawal_request", &files);
+        assert!(run(&Reads::default(), &c)
+            .unwrap_err()
+            .contains("expects to fail"));
+    }
+
+    /// [`pre`] whose parent bid has the block hash `[0xaa; 32]` and commits to `requests`.
+    fn parent_pre(requests: &ExecutionRequests<Minimal>) -> BeaconState<Minimal> {
+        let mut pre = pre();
+        let bid = &mut pre.latest_execution_payload_bid;
+        bid.block_hash = Root::repeat_byte(0xaa);
+        bid.execution_requests_root = requests.tree_hash_root();
+        pre
+    }
+
+    /// [`empty_block`] at slot 2 whose bid builds on `parent_block_hash`, with `requests`.
+    fn parent_block(
+        parent_block_hash: Root,
+        requests: ExecutionRequests<Minimal>,
+    ) -> BeaconBlock<Minimal> {
+        let mut block = empty_block();
+        block.slot = 2;
+        block
+            .body
+            .signed_execution_payload_bid
+            .message
+            .parent_block_hash = parent_block_hash;
+        block.body.parent_execution_requests = requests;
+        block
+    }
+
+    fn withdrawal_request(n: u8) -> WithdrawalRequest {
+        WithdrawalRequest {
+            source_address: Address::repeat_byte(n),
+            validator_pubkey: [n; 48],
+            amount: 0,
+        }
+    }
+
+    #[test]
+    fn parent_execution_payload_cases() {
+        use state_transition::per_block::process_parent_execution_payload;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut requests = parent_block(Root::ZERO, empty_requests())
+            .body
+            .parent_execution_requests;
+        requests.withdrawals.push(withdrawal_request(1)).unwrap();
+        let pre = parent_pre(&requests);
+        let full = parent_block(Root::repeat_byte(0xaa), requests.clone());
+        let mut post = pre.clone();
+        let keys = StateKeys::new(&pre);
+        process_parent_execution_payload(&mut post, &full, [0, 0, 0, 1], &keys).unwrap();
+        post.apply_updates().unwrap();
+        assert!(post.execution_payload_availability.get(1).unwrap());
+        let name = "block.ssz_snappy";
+        let handler = "parent_execution_payload";
+
+        // A FULL parent: the payload is applied.
+        let files = op_files(&pre, name, full.as_ssz_bytes(), Some(&post), None);
+        let c = case(dir.path(), handler, &files);
+        let reads = Reads::default();
+        assert_eq!(run(&reads, &c), Ok(()));
+        assert!(c.files.iter().all(|f| reads.contains(&f.path)));
+        // An EMPTY parent with requests is invalid.
+        let empty = parent_block(Root::repeat_byte(0xbb), requests.clone());
+        let files = op_files(&pre, name, empty.as_ssz_bytes(), None, None);
+        assert_eq!(
+            run(&Reads::default(), &case(dir.path(), handler, &files)),
+            Ok(())
+        );
+        let files = op_files(&pre, name, empty.as_ssz_bytes(), Some(&pre), None);
+        assert!(run(&Reads::default(), &case(dir.path(), handler, &files))
+            .unwrap_err()
+            .contains("parent payload is empty"));
+
+        // 17 withdrawal requests: one past MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD. The block
+        // does not decode with the bounded lists, and the verdict is the count assert.
+        let block = parent_block(Root::repeat_byte(0xaa), requests.clone());
+        let too_many = too_many_withdrawals(&block, 17);
+        assert!(BeaconBlock::<Minimal>::from_ssz_bytes(&too_many).is_err());
+        let files = op_files(&pre, name, too_many.clone(), None, None);
+        let c = case(dir.path(), handler, &files);
+        assert_eq!(run(&Reads::default(), &c), Ok(()));
+        assert_eq!(
+            parent_payload_block::<Minimal>(&Reads::default(), &c.files[1].path),
+            Ok(Err(StfError::ParentRequestsPastLimit {
+                list: "withdrawal",
+                count: 17,
+                limit: 16,
+            }))
+        );
+        // The bound itself decodes.
+        let at_bound = BeaconBlock::<Minimal>::from_ssz_bytes(&too_many_withdrawals(&block, 16));
+        let withdrawals = at_bound.unwrap().body.parent_execution_requests.withdrawals;
+        assert_eq!(withdrawals.to_vec(), vec![withdrawal_request(3); 16]);
+        // Bytes that are not a block at all are a failure of the case.
+        let files = op_files(&pre, name, vec![1, 2, 3], None, None);
+        let c = case(dir.path(), handler, &files);
+        assert!(run(&Reads::default(), &c)
+            .unwrap_err()
+            .contains("block.ssz_snappy"));
+    }
+
+    /// The bytes of `block` with `count` withdrawal requests in place of its own. The parent
+    /// execution requests are the last field of the body, and the body the last field of the
+    /// block, so their bytes are the end of the block bytes.
+    fn too_many_withdrawals(block: &BeaconBlock<Minimal>, count: usize) -> Vec<u8> {
+        let requests = &block.body.parent_execution_requests;
+        let mut bytes = block.as_ssz_bytes();
+        bytes.truncate(bytes.len() - requests.as_ssz_bytes().len());
+        let unbounded = SpecExecutionRequests {
+            _deposits: requests.deposits.to_vec().try_into().unwrap(),
+            withdrawals: vec![withdrawal_request(3); count].try_into().unwrap(),
+            consolidations: requests.consolidations.to_vec().try_into().unwrap(),
+            builder_deposits: requests.builder_deposits.to_vec().try_into().unwrap(),
+            builder_exits: requests.builder_exits.to_vec().try_into().unwrap(),
+        };
+        bytes.extend(unbounded.as_ssz_bytes());
+        bytes
+    }
+
+    #[test]
     fn withdrawals_cases() {
         let dir = tempfile::tempdir().unwrap();
         // Validator 1 of `pre` can withdraw its full balance, and the parent of `pre` is FULL.
@@ -1381,7 +1700,7 @@ mod tests {
         );
         assert!(run(&Reads::default(), &c)
             .unwrap_err()
-            .contains("no runner for operations/parent_execution_payload"));
+            .contains("no block.ssz_snappy"));
         let c = case(
             dir.path(),
             "builder_exit_request",

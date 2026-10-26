@@ -137,7 +137,12 @@ pub(crate) fn registry_state<E: Preset>(
         execution_payload_availability: BitVector::new(),
         builder_pending_payments: Vector::from_elem(payment).unwrap(),
         builder_pending_withdrawals: ProgressiveList::default(),
-        latest_execution_payload_bid: empty_bid(0),
+        // The fork upgrade commits the bid to the empty requests (`gloas/fork.md` L218), so
+        // that the first Gloas block finds a FULL parent with no requests.
+        latest_execution_payload_bid: ExecutionPayloadBid {
+            execution_requests_root: empty_requests::<E>().tree_hash_root(),
+            ..empty_bid(0)
+        },
         payload_expected_withdrawals: ProgressiveList::default(),
         ptc_window: Vector::default(),
     }
@@ -152,6 +157,17 @@ pub(crate) fn genesis_state<E: Preset>(effective_balances: &[Gwei]) -> BeaconSta
 pub(crate) fn refresh_lookahead<E: Preset>(state: &mut BeaconState<E>) {
     state.proposer_lookahead = Vector::new(initialize_proposer_lookahead(state).unwrap()).unwrap();
     state.ptc_window = Vector::new(initialize_ptc_window(state).unwrap()).unwrap();
+}
+
+/// `ExecutionRequests.empty()`: no request of any kind.
+pub(crate) fn empty_requests<E: Preset>() -> ExecutionRequests<E> {
+    ExecutionRequests {
+        deposits: Default::default(),
+        withdrawals: Default::default(),
+        consolidations: Default::default(),
+        builder_deposits: Default::default(),
+        builder_exits: Default::default(),
+    }
 }
 
 /// An empty Gloas bid for `slot`.
@@ -203,13 +219,7 @@ pub(crate) fn signed_block<E: Preset>(slot: u64, proposer_index: u64) -> SignedB
             signature: G2_POINT_AT_INFINITY,
         },
         payload_attestations: Default::default(),
-        parent_execution_requests: ExecutionRequests {
-            deposits: Default::default(),
-            withdrawals: Default::default(),
-            consolidations: Default::default(),
-            builder_deposits: Default::default(),
-            builder_exits: Default::default(),
-        },
+        parent_execution_requests: empty_requests(),
     };
     SignedBeaconBlock {
         message: BeaconBlock {

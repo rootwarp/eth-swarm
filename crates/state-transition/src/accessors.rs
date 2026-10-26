@@ -646,6 +646,8 @@ pub fn has_execution_withdrawal_credential(validator: &Validator) -> bool {
 /// partial withdrawals of the validator. The sum is checked.
 ///
 /// It reads the whole queue, which holds only the withdrawals that the sweep did not pay yet.
+/// Each amount comes from our own state, and a state that the transition makes keeps the
+/// sum in range. Thus an overflow is [`StfError::StateArithmetic`], not a proof.
 pub fn get_pending_balance_to_withdraw<E: Preset>(
     state: &BeaconState<E>,
     validator_index: ValidatorIndex,
@@ -657,7 +659,9 @@ pub fn get_pending_balance_to_withdraw<E: Preset>(
         .try_fold(0u64, |balance, withdrawal| {
             balance.checked_add(withdrawal.amount)
         })
-        .ok_or(StfError::ArithmeticOverflow)
+        .ok_or(StfError::StateArithmetic {
+            what: "pending balance to withdraw",
+        })
 }
 
 #[cfg(test)]
@@ -1265,7 +1269,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             get_pending_balance_to_withdraw(&state, 1),
-            Err(StfError::ArithmeticOverflow)
+            Err(StfError::StateArithmetic {
+                what: "pending balance to withdraw"
+            })
         );
     }
 }

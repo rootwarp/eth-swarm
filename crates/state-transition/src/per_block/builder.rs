@@ -161,8 +161,8 @@ fn builder_index_of<E: Preset>(state: &BeaconState<E>, pubkey: &BLSPubkey) -> Op
 /// `network_config::ChainConfig::genesis_fork_version()` (see
 /// [`builder_deposit_signature_set`]).
 ///
-/// [4.6a] calls it from `apply_parent_execution_payload` (G L1825). On `Err`, `state` is
-/// partly updated: the caller drops it.
+/// [`super::parent_payload::apply_parent_execution_payload`] calls it (G L1825). On `Err`,
+/// `state` is partly updated: the caller drops it.
 pub fn process_builder_deposit_request<E: Preset>(
     state: &mut BeaconState<E>,
     request: &BuilderDepositRequest,
@@ -209,7 +209,7 @@ pub fn process_builder_deposit_request<E: Preset>(
 /// builder, requested from its execution address, when it has no pending withdrawal or
 /// payment. Any other request is ignored.
 ///
-/// [4.6a] calls it from `apply_parent_execution_payload` (G L1826).
+/// [`super::parent_payload::apply_parent_execution_payload`] calls it (G L1826).
 pub fn process_builder_exit_request<E: Preset>(
     state: &mut BeaconState<E>,
     request: &BuilderExitRequest,

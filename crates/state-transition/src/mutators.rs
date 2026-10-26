@@ -7,7 +7,9 @@
 //! the caller drops it.
 //!
 //! The arithmetic is as in the spec: `decrease_balance` saturates at 0, and every other
-//! `Uint64` operation is checked and fails with [`StfError::ArithmeticOverflow`].
+//! `Uint64` operation is checked. A failed operation is [`StfError::ArithmeticOverflow`],
+//! but [`StfError::StateArithmetic`] (not a proof) for the churn queue, whose operands come
+//! from our own state only.
 
 use crate::accessors::{
     compute_activation_exit_epoch, get_consolidation_churn_limit, get_current_epoch,
@@ -79,16 +81,24 @@ struct ChurnQueue {
 /// The common body of `compute_exit_epoch_and_update_churn` (G L1495-1518) and
 /// `compute_consolidation_epoch_and_update_churn` (E L948-974): the new queue after
 /// `balance` is added to `queue` in `current_epoch`, with `per_epoch_churn` per epoch.
+///
+/// Each operand comes from our own state: the queue, the epoch, the churn of the total
+/// active balance, and a balance that each caller reads from the state (an effective
+/// balance, or the excess balance of a withdrawal request). A state that the transition
+/// makes keeps them in range, so a failed operation is [`StfError::StateArithmetic`], not
+/// a proof.
 fn update_churn(
     queue: ChurnQueue,
     current_epoch: Epoch,
     per_epoch_churn: Gwei,
     balance: Gwei,
 ) -> Result<ChurnQueue, StfError> {
-    let overflow = || StfError::ArithmeticOverflow;
+    let overflow = || StfError::StateArithmetic {
+        what: "churn queue",
+    };
     let mut earliest_epoch = queue
         .earliest_epoch
-        .max(compute_activation_exit_epoch(current_epoch)?);
+        .max(compute_activation_exit_epoch(current_epoch).map_err(|_| overflow())?);
     // New epoch for the queue.
     let mut balance_to_consume = if queue.earliest_epoch < earliest_epoch {
         per_epoch_churn
@@ -510,14 +520,17 @@ mod tests {
         end.earliest_exit_epoch = u64::MAX;
         end.exit_balance_to_consume = 0;
         let mut cache = TotalActiveBalanceCache::default();
+        let churn = StfError::StateArithmetic {
+            what: "churn queue",
+        };
         assert_eq!(
             compute_exit_epoch_and_update_churn(&mut end, ETH, &mut cache),
-            Err(StfError::ArithmeticOverflow)
+            Err(churn.clone())
         );
         end.earliest_exit_epoch = 5;
         assert_eq!(
             compute_exit_epoch_and_update_churn(&mut end, u64::MAX, &mut cache),
-            Err(StfError::ArithmeticOverflow)
+            Err(churn)
         );
     }
 
@@ -588,7 +601,9 @@ mod tests {
         );
         assert_eq!(
             compute_consolidation_epoch_and_update_churn(&mut small, ETH, &mut cache),
-            Err(StfError::ArithmeticOverflow)
+            Err(StfError::StateArithmetic {
+                what: "churn queue"
+            })
         );
     }
 

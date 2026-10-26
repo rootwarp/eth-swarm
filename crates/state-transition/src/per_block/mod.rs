@@ -1,8 +1,6 @@
 //! Block processing: `process_block` (G L1754-1771, Modified in Gloas) and its steps.
 //!
-//! [`process_block`] runs the eight steps of [`block_steps`] in the order of the spec. The
-//! steps that are not ported yet return [`StfError::Unimplemented`] with the work that ports
-//! them: the parent payload (`4.6a`).
+//! [`process_block`] runs the eight steps of [`block_steps`] in the order of the spec.
 //!
 //! The steps make no BLS check. The RANDAO reveal, the bid signature of a builder, the
 //! operation signatures, the payload attestation signatures and the sync aggregate signature
@@ -17,9 +15,13 @@
 //! - [`exits`] has `process_voluntary_exit` and `process_bls_to_execution_change`.
 //! - [`header`] has `process_block_header`, `process_randao` and `process_eth1_data`.
 //! - [`operations`] has the Gloas `process_operations`.
+//! - [`parent_payload`] has `process_parent_execution_payload` and
+//!   `apply_parent_execution_payload`: the builder payment and the execution requests of
+//!   the parent payload.
 //! - [`payload_attestation`] has `process_payload_attestation` and the indexed form of a
 //!   payload attestation.
-//! - [`requests`] has `process_consolidation_request` and its helpers.
+//! - [`requests`] has `process_deposit_request`, `process_withdrawal_request` and
+//!   `process_consolidation_request`, with their helpers.
 //! - [`slashings`] has `process_proposer_slashing` and `process_attester_slashing`.
 //! - [`sync_aggregate`] has `process_sync_aggregate`.
 //! - [`withdrawals`] has the Gloas `process_withdrawals(state)` and the withdrawals sweep.
@@ -30,6 +32,7 @@ pub mod builder;
 pub mod exits;
 pub mod header;
 pub mod operations;
+pub mod parent_payload;
 pub mod payload_attestation;
 pub mod requests;
 pub mod slashings;
@@ -40,6 +43,7 @@ pub use attestation::process_attestation;
 pub use bid::process_execution_payload_bid;
 pub use header::{check_block_header, process_block_header, process_eth1_data, process_randao};
 pub use operations::process_operations;
+pub use parent_payload::process_parent_execution_payload;
 pub use payload_attestation::process_payload_attestation;
 pub use slashings::{process_attester_slashing, process_proposer_slashing};
 pub use sync_aggregate::process_sync_aggregate;
@@ -48,9 +52,10 @@ pub use withdrawals::process_withdrawals;
 use crate::accessors::{get_current_epoch, TotalActiveBalanceCache};
 use crate::caches::get_beacon_proposer_index;
 use crate::caches::CommitteeCache;
-use crate::{Preset, StfError};
+use crate::{Preset, SignatureBackend, StfError};
 use consensus_types::gloas::{BeaconBlock, BeaconState};
-use consensus_types::primitives::{BLSPubkey, Epoch, Slot, ValidatorIndex};
+use consensus_types::primitives::{BLSPubkey, Epoch, Slot, ValidatorIndex, Version};
+use std::fmt;
 
 /// A step of `process_block`, in the order of G L1754-1771.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -93,18 +98,40 @@ pub enum BlockStep {
 ///   ([`BlockContext::set_max_blobs_per_block`]). [`crate::state_transition`] sets it from
 ///   [`crate::BlsContext::blob_schedule`]. A context without it fails the bid step with
 ///   [`StfError::UnknownBlobLimit`], which is not a proof that the block is invalid.
+/// - The verdicts of the builder deposit signatures of the parent payload, which the parent
+///   payload step reads ([`BlockContext::set_deposit_verdicts`]). [`crate::state_transition`]
+///   sets them from [`crate::BlsContext::backend`] and
+///   [`crate::BlsContext::genesis_fork_version`]. With a context without them, a builder
+///   deposit that needs a verdict gives [`StfError::MissingVerdict`], which is not a proof.
 ///
 /// Use one context for one block on one state, and a new context for the next block. A
 /// committee cache of another state with another seed is not used:
 /// [`crate::accessors::get_attesting_indices_with`] gives `CacheSeedMismatch` for it.
 #[derive(Debug, Default)]
-pub struct BlockContext {
+pub struct BlockContext<'a> {
     parent_slot: Slot,
     sync_committee_indices: Option<SyncCommitteeIndices>,
     sync_index_scans: usize,
     committee_caches: Vec<CommitteeCache>,
     total_active_balance: TotalActiveBalanceCache,
     max_blobs_per_block: Option<(Epoch, u64)>,
+    deposit_verdicts: Option<DepositVerdicts<'a>>,
+}
+
+/// The source of the verdicts of the builder deposit signatures: the backend, and the
+/// `GENESIS_FORK_VERSION` of the network for the deposit domain.
+#[derive(Clone, Copy)]
+pub(crate) struct DepositVerdicts<'a> {
+    pub(crate) backend: &'a dyn SignatureBackend,
+    pub(crate) genesis_fork_version: Version,
+}
+
+impl fmt::Debug for DepositVerdicts<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DepositVerdicts")
+            .field("genesis_fork_version", &self.genesis_fork_version)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The sync committee indices of a state, with the key of the state that they are for.
@@ -123,7 +150,28 @@ impl SyncCommitteeIndices {
     }
 }
 
-impl BlockContext {
+impl<'a> BlockContext<'a> {
+    /// Sets the source of the verdicts of the builder deposit signatures of the parent
+    /// payload: `backend`, and `genesis_fork_version`, the `GENESIS_FORK_VERSION` of the
+    /// network (see [`builder::builder_deposit_signature_set`]).
+    pub fn set_deposit_verdicts(
+        &mut self,
+        backend: &'a dyn SignatureBackend,
+        genesis_fork_version: Version,
+    ) {
+        self.deposit_verdicts = Some(DepositVerdicts {
+            backend,
+            genesis_fork_version,
+        });
+    }
+
+    /// The source that [`Self::set_deposit_verdicts`] set, if any.
+    pub(crate) fn deposit_verdicts(&self) -> Option<DepositVerdicts<'a>> {
+        self.deposit_verdicts
+    }
+}
+
+impl BlockContext<'_> {
     /// The slot of the latest block header before the block.
     pub fn parent_slot(&self) -> Slot {
         self.parent_slot
@@ -249,11 +297,9 @@ pub const fn block_steps<E: Preset>() -> [(BlockStep, StepFn<E>); 8] {
 ///
 /// No BLS check is made here: see the module documentation.
 ///
-/// # Warning
-///
-/// Do not use this function on real blocks yet. The parent-payload step, the first step,
-/// is not ported, so every call returns [`StfError::Unimplemented`], which is not a proof
-/// that the block is invalid.
+/// The context of this function has no blob limit and no deposit verdicts, so the bid step
+/// gives [`StfError::UnknownBlobLimit`], and a builder deposit of a new key gives
+/// [`StfError::MissingVerdict`]. Use [`process_block_with`] with a context that has them.
 pub fn process_block<E: Preset>(
     state: &mut BeaconState<E>,
     block: &BeaconBlock<E>,
@@ -332,13 +378,14 @@ pub(crate) fn state_proposer_index<E: Preset>(
     Ok(index)
 }
 
-/// `process_parent_execution_payload` (G L1841, New in Gloas). Not ported yet.
+/// `process_parent_execution_payload(state, block)` (G L1841-1853, New in Gloas), with the
+/// total active balance and the deposit verdicts of `ctx`.
 fn parent_execution_payload_step<E: Preset>(
-    _: &mut BeaconState<E>,
-    _: &BeaconBlock<E>,
-    _: &mut BlockContext,
+    state: &mut BeaconState<E>,
+    block: &BeaconBlock<E>,
+    ctx: &mut BlockContext,
 ) -> Result<(), StfError> {
-    Err(StfError::Unimplemented("4.6a"))
+    parent_payload::process_parent_execution_payload_with(state, block, ctx)
 }
 
 fn block_header_step<E: Preset>(
@@ -433,7 +480,7 @@ mod tests {
         let block = block_at_state_slot(&state).message;
         let before = state_root(&mut state).unwrap();
 
-        // The trace has all 8 steps in the spec order, stubs included. Each step gets the
+        // The trace has all 8 steps in the spec order. Each step gets the
         // header slot of the pre-state as `parent_slot`.
         let (result, trace) = process_block_traced(&mut state, &block);
         assert_eq!(result, Ok(()));
@@ -445,12 +492,13 @@ mod tests {
         let table: Vec<BlockStep> = block_steps::<Minimal>().iter().map(|(s, _)| *s).collect();
         assert_eq!(table, GLOAS_ORDER);
 
-        // The real run stops at the first stub, before any change to the state.
+        // The real run has no stub. A context without the blob limit of the network stops
+        // it at the bid step, after the parent payload and the header.
         assert_eq!(
             process_block(&mut state, &block),
-            Err(StfError::Unimplemented("4.6a"))
+            Err(StfError::UnknownBlobLimit(0))
         );
-        assert_eq!(state_root(&mut state).unwrap(), before);
+        assert_eq!(state.latest_block_header.slot, 3);
     }
 
     #[test]
@@ -519,19 +567,12 @@ mod tests {
             bid_for_state(&state, crate::preset::BUILDER_INDEX_SELF_BUILD, 0);
         let steps = block_steps::<Minimal>();
         let step = |s: BlockStep| steps.iter().find(|(k, _)| *k == s).unwrap().1;
-        assert_eq!(
-            step(BlockStep::ParentExecutionPayload)(
-                &mut state.clone(),
-                &block,
-                &mut BlockContext::default()
-            ),
-            Err(StfError::Unimplemented("4.6a"))
-        );
-        // The ported steps, in the spec order, apply the block to the state.
+        // The steps, in the spec order, apply the block to the state.
         let mut post = state.clone();
         let mut ctx = BlockContext::default();
         ctx.set_max_blobs_per_block(0, crate::testing::MINIMAL_MAX_BLOBS_PER_BLOCK);
         for s in [
+            BlockStep::ParentExecutionPayload,
             BlockStep::BlockHeader,
             BlockStep::Withdrawals,
             BlockStep::ExecutionPayloadBid,
@@ -543,6 +584,8 @@ mod tests {
             assert_eq!(step(s)(&mut post, &block, &mut ctx), Ok(()), "{s:?}");
         }
         assert_eq!(post.latest_block_header.slot, 1);
+        // The parent (the genesis block) is FULL with no requests: its payload is available.
+        assert!(post.execution_payload_availability.get(0).unwrap());
         assert_eq!(
             post.latest_execution_payload_bid,
             block.body.signed_execution_payload_bid.message
@@ -559,6 +602,72 @@ mod tests {
                 block: 1,
                 latest: 1
             })
+        );
+    }
+
+    #[test]
+    fn builder_requests_wired() {
+        use crate::per_block::builder::{
+            process_builder_deposit_request, process_builder_exit_request,
+        };
+        use crate::testing::{
+            builder, builder_deposit_request, builder_exit_request, empty_requests,
+            ScriptedBackend, GENESIS_FORK_VERSION, MINIMAL_MAX_BLOBS_PER_BLOCK,
+        };
+        use crate::Preset;
+        use tree_hash::TreeHash;
+
+        // Slot 1 of a state finalized at epoch 1, with the builders `[0xa1; 48]` and
+        // `[0xa2; 48]`, both active. The genesis parent is FULL, and its bid committed one
+        // builder deposit of a new key and one builder exit of builder 0.
+        let mut pre = genesis_state::<Minimal>(&[32_000_000_000; 64]);
+        per_slot::process_slots(&mut pre, 1, &crate::testing::no_bls()).unwrap();
+        pre.finalized_checkpoint.epoch = 1;
+        for key in [0xa1, 0xa2] {
+            pre.builders.push(builder(key, 5_000_000_000, 0)).unwrap();
+        }
+        let deposit = builder_deposit_request(0xc1, 2_000_000_000);
+        let exit = builder_exit_request(0xa1);
+        let mut requests = empty_requests::<Minimal>();
+        requests.builder_deposits.push(deposit.clone()).unwrap();
+        requests.builder_exits.push(exit.clone()).unwrap();
+        pre.latest_execution_payload_bid.execution_requests_root = requests.tree_hash_root();
+        let mut block = block_at_state_slot(&pre).message;
+        block.body.signed_execution_payload_bid =
+            bid_for_state(&pre, crate::preset::BUILDER_INDEX_SELF_BUILD, 0);
+        block.body.parent_execution_requests = requests;
+
+        // The whole block, with the verdict of the new builder from the context.
+        let mut post = pre.clone();
+        let backend = ScriptedBackend::new([Ok(true)]);
+        let mut ctx = BlockContext::default();
+        ctx.set_max_blobs_per_block(0, MINIMAL_MAX_BLOBS_PER_BLOCK);
+        ctx.set_deposit_verdicts(&backend, GENESIS_FORK_VERSION);
+        assert_eq!(process_block_with(&mut post, &block, &mut ctx), Ok(()));
+
+        // The builder functions called directly on the pre-state, in the spec order.
+        let mut direct = pre.clone();
+        let direct_backend = ScriptedBackend::new([Ok(true)]);
+        process_builder_deposit_request(
+            &mut direct,
+            &deposit,
+            GENESIS_FORK_VERSION,
+            &direct_backend,
+        )
+        .unwrap();
+        process_builder_exit_request(&mut direct, &exit).unwrap();
+
+        let builders =
+            |state: &BeaconState<Minimal>| state.builders.iter().cloned().collect::<Vec<_>>();
+        assert_eq!(builders(&post), builders(&direct));
+        assert_eq!(backend.seen(), direct_backend.seen());
+        // Both requests changed the registry: a new builder at index 2, and the exit of
+        // builder 0.
+        assert_eq!(post.builders.len(), 3);
+        assert_eq!(post.builders.get(2).unwrap().pubkey, [0xc1; 48]);
+        assert_eq!(
+            post.builders.get(0).unwrap().withdrawable_epoch,
+            Minimal::MIN_BUILDER_WITHDRAWABILITY_DELAY
         );
     }
 }
