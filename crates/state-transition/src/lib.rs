@@ -9,6 +9,8 @@
 //! - [`per_epoch`] and [`per_block`]: the epoch and block processing (stubs for now).
 //! - [`accessors`]: the beacon-state accessors and the misc helpers.
 //! - [`caches`]: shuffling, beacon committees, proposer and PTC selection.
+//! - [`mutators`]: the balance helpers, the exit and consolidation churn, validator and
+//!   builder exits, builder-payment settlement and `slash_validator`.
 //! - [`signatures`]: the [`SignatureBackend`] seam and the block signature set.
 //!
 //! Each ported function cites its spec file and line range at the pin. File prefixes: P0
@@ -20,6 +22,7 @@
 
 pub mod accessors;
 pub mod caches;
+pub mod mutators;
 pub mod per_block;
 pub mod per_epoch;
 pub mod per_slot;
@@ -33,7 +36,9 @@ pub use preset::Preset;
 pub use signatures::{BackendError, SignatureBackend, SignatureSet, SignerRef};
 
 use consensus_types::gloas::{BeaconBlock, BeaconState, SignedBeaconBlock};
-use consensus_types::primitives::{Bytes32, CommitteeIndex, Epoch, Root, Slot, ValidatorIndex};
+use consensus_types::primitives::{
+    BuilderIndex, Bytes32, CommitteeIndex, Epoch, Root, Slot, ValidatorIndex,
+};
 use tree_hash::TreeHash;
 
 /// Why a state transition step failed. Most variants mean that the input is invalid by the
@@ -68,7 +73,7 @@ pub enum StfError {
     /// invalid: callers IGNORE, never REJECT, on it.
     #[error(transparent)]
     SignatureBackend(#[from] BackendError),
-    /// A `Uint64` operation overflowed or underflowed.
+    /// A `Uint64` operation overflowed, underflowed or divided by zero.
     #[error("arithmetic overflow")]
     ArithmeticOverflow,
     /// `state.validators[index]` is out of range.
@@ -137,6 +142,17 @@ pub enum StfError {
         /// `get_seed(state, epoch, DOMAIN_BEACON_ATTESTER)`.
         state_seed: Bytes32,
     },
+    /// `state.builders[index]` is out of range.
+    #[error("builder index {0} is out of range")]
+    UnknownBuilder(BuilderIndex),
+    /// `settle_builder_payment` asserts `payment_index < len(state.builder_pending_payments)`.
+    #[error("builder payment index {index} is out of range of {len}")]
+    PaymentIndexOutOfRange {
+        /// The payment index.
+        index: u64,
+        /// `len(state.builder_pending_payments)`.
+        len: u64,
+    },
 }
 
 impl StfError {
@@ -170,7 +186,12 @@ impl StfError {
             | Self::NoCandidates
             | Self::UnknownCommittee { .. }
             | Self::BitOutOfRange { .. }
-            | Self::EpochOutOfWindow { .. } => true,
+            | Self::EpochOutOfWindow { .. }
+            // An out-of-range access of `state.builders`, a spec error.
+            | Self::UnknownBuilder(_)
+            // The `assert` of `settle_builder_payment` on the length of
+            // `state.builder_pending_payments`, a spec error.
+            | Self::PaymentIndexOutOfRange { .. } => true,
         }
     }
 }
@@ -374,7 +395,8 @@ mod tests {
     }
 
     /// The number of [`StfError`] variants: one more than the largest [`variant_id`].
-    const VARIANTS: usize = 15;
+    /// Increase `VARIANTS` when you add an id.
+    const VARIANTS: usize = 17;
 
     /// A distinct id for each variant. The match has no `_` arm, so a new variant does not
     /// compile until it gets an id here, and then the table test fails until it has an entry.
@@ -395,6 +417,8 @@ mod tests {
             StfError::CacheEpochMismatch { .. } => 12,
             StfError::Tree(_) => 13,
             StfError::CacheSeedMismatch { .. } => 14,
+            StfError::UnknownBuilder(_) => 15,
+            StfError::PaymentIndexOutOfRange { .. } => 16,
         }
     }
 
@@ -456,6 +480,11 @@ mod tests {
                     state_seed: Bytes32::repeat_byte(2),
                 },
                 false,
+            ),
+            (StfError::UnknownBuilder(2), true),
+            (
+                StfError::PaymentIndexOutOfRange { index: 16, len: 16 },
+                true,
             ),
         ];
         let mut ids: Vec<usize> = cases.iter().map(|(e, _)| variant_id(e)).collect();

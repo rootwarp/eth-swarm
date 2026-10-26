@@ -1,12 +1,15 @@
 //! Beacon-state accessors and the misc helpers they share.
 
 use crate::caches::committee::{compute_shuffled_index, CommitteeCache};
-use crate::preset::{MAX_EFFECTIVE_BALANCE_ELECTRA, MIN_SEED_LOOKAHEAD};
+use crate::preset::{
+    EFFECTIVE_BALANCE_INCREMENT, MAX_EFFECTIVE_BALANCE_ELECTRA, MAX_SEED_LOOKAHEAD,
+    MIN_SEED_LOOKAHEAD,
+};
 use crate::{Preset, StfError};
 use consensus_types::common::Validator;
 use consensus_types::gloas::{Attestation, BeaconState};
 use consensus_types::primitives::{
-    Bytes32, CommitteeIndex, Domain, DomainType, Epoch, ValidatorIndex,
+    Bytes32, CommitteeIndex, Domain, DomainType, Epoch, Gwei, Root, ValidatorIndex,
 };
 use consensus_types::signing::{compute_domain, DOMAIN_BEACON_ATTESTER, DOMAIN_SYNC_COMMITTEE};
 use ethereum_hashing::{Context, Sha256Context};
@@ -243,12 +246,156 @@ pub(crate) fn attester_seed<E: Preset>(
     get_seed(state, epoch, DOMAIN_BEACON_ATTESTER)
 }
 
+/// `compute_activation_exit_epoch` (P0 L1356-1360): `epoch + 1 + MAX_SEED_LOOKAHEAD`.
+pub fn compute_activation_exit_epoch(epoch: Epoch) -> Result<Epoch, StfError> {
+    epoch
+        .checked_add(1)
+        .and_then(|e| e.checked_add(MAX_SEED_LOOKAHEAD))
+        .ok_or(StfError::ArithmeticOverflow)
+}
+
+/// `get_total_active_balance` (P0 L1576-1583), with `get_total_balance` (P0 L1559-1570)
+/// inlined: the sum of the effective balances of the validators that are active in the
+/// current epoch, and at least `EFFECTIVE_BALANCE_INCREMENT`.
+///
+/// It reads the whole registry. Callers that read the total more than one time in an epoch
+/// use a [`TotalActiveBalanceCache`].
+pub fn get_total_active_balance<E: Preset>(state: &BeaconState<E>) -> Result<Gwei, StfError> {
+    let epoch = get_current_epoch(state);
+    let total = state
+        .validators
+        .iter()
+        .filter(|v| is_active_validator(v, epoch))
+        .try_fold(0u64, |sum, v| sum.checked_add(v.effective_balance))
+        .ok_or(StfError::ArithmeticOverflow)?;
+    Ok(total.max(EFFECTIVE_BALANCE_INCREMENT))
+}
+
+/// The root that fixes the effective balances and the active set of `epoch`: the block
+/// root at the last slot of the previous epoch, `get_block_root_at_slot(state,
+/// compute_start_slot_at_epoch(epoch) - 1)` (P0 L1448-1453), read from a state of `epoch`.
+///
+/// The spec has no block before slot 0. The validators of epoch 0 are the genesis registry,
+/// so its root `genesis_validators_root` takes that place.
+fn balance_decision_root<E: Preset>(
+    state: &BeaconState<E>,
+    epoch: Epoch,
+) -> Result<Root, StfError> {
+    let Some(decision_slot) = E::start_slot_at_epoch(epoch).checked_sub(1) else {
+        return Ok(state.genesis_validators_root);
+    };
+    // `decision_slot < state.slot <= decision_slot + SLOTS_PER_EPOCH`, so the assert of
+    // `get_block_root_at_slot` holds and the root is in the vector.
+    let index = decision_slot % E::SlotsPerHistoricalRoot::to_u64();
+    state
+        .block_roots
+        .get(index as usize)
+        .copied()
+        .ok_or_else(|| StfError::Tree("block_roots is shorter than its length".into()))
+}
+
+/// The total active balance of the current epoch, read one time per `(epoch, decision
+/// root)`. The decision root is the block root at the last slot of the previous epoch (the
+/// genesis validators root in epoch 0).
+///
+/// The effective balances and the active set of an epoch are fixed by the chain up to the
+/// decision root:
+///
+/// - Only `process_epoch` changes the effective balances, and the epoch processing at the
+///   end of the previous epoch runs on the state of the decision root.
+/// - The registry updates set activation and exit epochs in the future, so the active set
+///   of the current epoch stays the same.
+/// - `process_effective_balance_updates` runs at the end of the epoch, and no later step of
+///   the same `process_epoch` reads the total. Then the state goes to the next epoch, which
+///   has a new key.
+///
+/// Thus two states with the same key have the same total, also on two branches, and one
+/// cache can follow a state through its blocks and epochs. A key that is not the cached key
+/// reads the registry again. After a direct edit of the registry (for example in a test),
+/// use a new cache.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TotalActiveBalanceCache {
+    entry: Option<((Epoch, Root), Gwei)>,
+}
+
+impl TotalActiveBalanceCache {
+    /// `get_total_active_balance(state)`. It reads the registry only when the key of `state`
+    /// is not the key of the cached total.
+    pub fn get<E: Preset>(&mut self, state: &BeaconState<E>) -> Result<Gwei, StfError> {
+        let epoch = get_current_epoch(state);
+        let key = (epoch, balance_decision_root(state, epoch)?);
+        if let Some((cached, total)) = self.entry {
+            if cached == key {
+                return Ok(total);
+            }
+        }
+        let total = get_total_active_balance(state)?;
+        self.entry = Some((key, total));
+        Ok(total)
+    }
+
+    /// The `(epoch, decision root)` of the cached total, `None` before the first read.
+    pub fn key(&self) -> Option<(Epoch, Root)> {
+        self.entry.map(|(key, _)| key)
+    }
+}
+
+/// `churn - churn % EFFECTIVE_BALANCE_INCREMENT`.
+fn round_to_increment(churn: Gwei) -> Gwei {
+    churn - churn % EFFECTIVE_BALANCE_INCREMENT
+}
+
+/// `get_exit_churn_limit` (G L1461-1470, New in Gloas) for a total active balance of
+/// `total_active_balance`.
+pub fn exit_churn_limit<E: Preset>(total_active_balance: Gwei) -> Gwei {
+    let churn = E::MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA
+        .max(total_active_balance / E::CHURN_LIMIT_QUOTIENT_GLOAS);
+    round_to_increment(churn)
+}
+
+/// `get_activation_churn_limit` (G L1445-1455, New in Gloas) for a total active balance of
+/// `total_active_balance`: the exit churn, capped at
+/// `MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS`.
+pub fn activation_churn_limit<E: Preset>(total_active_balance: Gwei) -> Gwei {
+    E::MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS.min(exit_churn_limit::<E>(total_active_balance))
+}
+
+/// `get_consolidation_churn_limit` (G L1479-1486, Modified in Gloas) for a total active
+/// balance of `total_active_balance`.
+pub fn consolidation_churn_limit<E: Preset>(total_active_balance: Gwei) -> Gwei {
+    round_to_increment(total_active_balance / E::CONSOLIDATION_CHURN_LIMIT_QUOTIENT)
+}
+
+/// `get_activation_churn_limit` (G L1445-1455, New in Gloas), with the total from `cache`.
+pub fn get_activation_churn_limit<E: Preset>(
+    state: &BeaconState<E>,
+    cache: &mut TotalActiveBalanceCache,
+) -> Result<Gwei, StfError> {
+    Ok(activation_churn_limit::<E>(cache.get(state)?))
+}
+
+/// `get_exit_churn_limit` (G L1461-1470, New in Gloas), with the total from `cache`.
+pub fn get_exit_churn_limit<E: Preset>(
+    state: &BeaconState<E>,
+    cache: &mut TotalActiveBalanceCache,
+) -> Result<Gwei, StfError> {
+    Ok(exit_churn_limit::<E>(cache.get(state)?))
+}
+
+/// `get_consolidation_churn_limit` (G L1479-1486, Modified in Gloas), with the total from
+/// `cache`.
+pub fn get_consolidation_churn_limit<E: Preset>(
+    state: &BeaconState<E>,
+    cache: &mut TotalActiveBalanceCache,
+) -> Result<Gwei, StfError> {
+    Ok(consolidation_churn_limit::<E>(cache.get(state)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::genesis_state;
+    use crate::testing::{genesis_state, registry_state};
     use consensus_types::common::{AttestationData, Checkpoint};
-    use consensus_types::primitives::Root;
     use consensus_types::signing::DOMAIN_BEACON_PROPOSER;
     use consensus_types::{EthSpec, Mainnet, Minimal};
     use ssz::ProgressiveBitList;
@@ -415,5 +562,89 @@ mod tests {
             get_attesting_indices(&state, &attestation),
             Err(StfError::BitOutOfRange { .. })
         ));
+    }
+
+    #[test]
+    fn activation_exit_epoch_is_checked() {
+        assert_eq!(compute_activation_exit_epoch(3), Ok(8));
+        assert_eq!(compute_activation_exit_epoch(u64::MAX - 5), Ok(u64::MAX));
+        assert_eq!(
+            compute_activation_exit_epoch(u64::MAX - 4),
+            Err(StfError::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn total_active_balance_counts_active_validators_only() {
+        let balances = [32 * ETH, 31 * ETH, 2048 * ETH, 1];
+        let mut state = registry_state::<Minimal>(&balances, Bytes32::ZERO);
+        assert_eq!(get_total_active_balance(&state), Ok(2111 * ETH + 1));
+        // Exited and not yet active validators do not count. Slashed active validators count.
+        state.validators.get_mut(2).unwrap().exit_epoch = 0;
+        state.validators.get_mut(3).unwrap().activation_epoch = 1;
+        state.validators.get_mut(1).unwrap().slashed = true;
+        assert_eq!(get_total_active_balance(&state), Ok(63 * ETH));
+        // The total is at least EFFECTIVE_BALANCE_INCREMENT.
+        let empty = registry_state::<Minimal>(&[], Bytes32::ZERO);
+        assert_eq!(get_total_active_balance(&empty), Ok(ETH));
+        let mut huge = registry_state::<Minimal>(&[32 * ETH; 2], Bytes32::ZERO);
+        huge.validators.get_mut(0).unwrap().effective_balance = u64::MAX;
+        assert_eq!(
+            get_total_active_balance(&huge),
+            Err(StfError::ArithmeticOverflow)
+        );
+        assert_eq!(
+            TotalActiveBalanceCache::default().get(&huge),
+            Err(StfError::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn total_active_balance_is_read_once_per_key() {
+        let mut state = genesis_state::<Minimal>(&[32 * ETH; 8]);
+        let mut cache = TotalActiveBalanceCache::default();
+        assert_eq!(cache.key(), None);
+        assert_eq!(cache.get(&state), Ok(256 * ETH));
+        assert_eq!(cache.key(), Some((0, state.genesis_validators_root)));
+        // A second read with the same key does not read the registry again.
+        state.validators.get_mut(0).unwrap().effective_balance = 0;
+        assert_eq!(cache.get(&state), Ok(256 * ETH));
+        // A new epoch is a new key: the block root of slot 7.
+        state.slot = Minimal::start_slot_at_epoch(1);
+        *state.block_roots.get_mut(7).unwrap() = Root::repeat_byte(7);
+        assert_eq!(cache.get(&state), Ok(224 * ETH));
+        assert_eq!(cache.key(), Some((1, Root::repeat_byte(7))));
+        // A new seed with the same decision root is the same key.
+        state.randao_mixes = milhouse::Vector::from_elem(Bytes32::repeat_byte(9)).unwrap();
+        assert_eq!(cache.get(&state), Ok(224 * ETH));
+    }
+
+    #[test]
+    fn total_active_balance_cache_tells_branches_apart() {
+        // Two branches that fork in epoch 1: in epoch 2 they have the same epoch and the same
+        // attester seed (from the mix of epoch 0), but the effective balances of the end of
+        // epoch 1 differ, and so does the last block root of epoch 1.
+        let mut a = genesis_state::<Minimal>(&[32 * ETH; 8]);
+        a.slot = Minimal::start_slot_at_epoch(2) + 3;
+        *a.block_roots.get_mut(15).unwrap() = Root::repeat_byte(0xa1);
+        let mut b = a.clone();
+        b.validators.get_mut(0).unwrap().effective_balance = 31 * ETH;
+        *b.block_roots.get_mut(15).unwrap() = Root::repeat_byte(0xb1);
+        assert_eq!(attester_seed(&a, 2), attester_seed(&b, 2));
+        let mut cache = TotalActiveBalanceCache::default();
+        assert_eq!(cache.get(&a), Ok(256 * ETH));
+        assert_eq!(cache.key(), Some((2, Root::repeat_byte(0xa1))));
+        assert_eq!(cache.get(&b), Ok(255 * ETH));
+        assert_eq!(cache.key(), Some((2, Root::repeat_byte(0xb1))));
+        assert_eq!(cache.get(&a), Ok(256 * ETH));
+
+        // In epoch 0 the key is the genesis validators root, the root of the genesis
+        // registry: two genesis registries are two keys.
+        let x = genesis_state::<Minimal>(&[32 * ETH; 8]);
+        let mut y = genesis_state::<Minimal>(&[31 * ETH; 8]);
+        y.genesis_validators_root = Root::repeat_byte(0x43);
+        assert_eq!(cache.get(&x), Ok(256 * ETH));
+        assert_eq!(cache.key(), Some((0, x.genesis_validators_root)));
+        assert_eq!(cache.get(&y), Ok(248 * ETH));
     }
 }
