@@ -97,7 +97,7 @@ pub struct BlsContext<'a> {
     pub genesis_fork_version: Version,
     /// The `CAPELLA_FORK_VERSION` of the network, for the domain of the voluntary exits
     /// from Deneb (EIP-7044, E L1853-1855). It is a value of the network config, not of the
-    /// preset. The network config of cl-chain does not give it yet.
+    /// preset. cl-chain reads it from `network_config::ChainConfig::capella_fork_version()`.
     pub capella_fork_version: Version,
     /// The blob schedule of the network (`BLOB_SCHEDULE` with its BPO forks), for the blob
     /// limit of a bid (G L2183-2187). It is a value of the network config, not of the

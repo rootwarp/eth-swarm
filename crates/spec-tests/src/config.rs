@@ -7,10 +7,11 @@
 //! case:
 //!
 //! - `PRESET_BASE` is the preset of the case.
-//! - [`config_values`]: the values of the epoch steps, and `GENESIS_FORK_VERSION`.
-//! - `CAPELLA_FORK_VERSION` is the domain of the voluntary exits (EIP-7044).
-//! - `SHARD_COMMITTEE_PERIOD` is `E::SHARD_COMMITTEE_PERIOD`, which the voluntary exits and
-//!   the consolidation requests read.
+//! - `GENESIS_FORK_VERSION`, the domain of the deposits and of the BLS-to-execution changes.
+//! - `CAPELLA_FORK_VERSION`, the domain of the voluntary exits (EIP-7044).
+//! - [`config_values`]: each config value that the transition compiles in, for example the
+//!   churn values of the epoch steps and `SHARD_COMMITTEE_PERIOD`, which the voluntary exits
+//!   and the consolidation requests read.
 //!
 //! It also gives how `GLOAS_FORK_EPOCH` compares with `fork.epoch` of the pre-state
 //! ([`ForkEpoch`]): `get_ptc` reads `state.fork.epoch` as the Gloas fork epoch. A state that
@@ -23,60 +24,25 @@ use crate::coverage::Reads;
 use crate::fixture;
 use crate::plan::Case;
 use consensus_types::primitives::Epoch;
-use state_transition::preset::{
-    EJECTION_BALANCE, INACTIVITY_SCORE_BIAS, INACTIVITY_SCORE_RECOVERY_RATE,
-    MIN_VALIDATOR_WITHDRAWABILITY_DELAY,
-};
+use state_transition::preset::config_values;
 use state_transition::{BlsContext, Preset};
 
-/// The config values that the epoch steps read, and `GENESIS_FORK_VERSION`, with the values
-/// of the config of preset `E`, which is also the config of the vectors:
-/// `configs/{minimal,mainnet}.yaml`.
-pub fn config_values<E: Preset>(bls: &BlsContext) -> [(&'static str, u64); 10] {
-    [
+/// Every numeric value that [`check_config`] compares: `GENESIS_FORK_VERSION` and
+/// `CAPELLA_FORK_VERSION` of `bls`, and the config values that the transition compiles in
+/// ([`config_values`]), with the values of the config of preset `E`, which is also the config
+/// of the vectors: `configs/{minimal,mainnet}.yaml`.
+pub fn compared_values<E: Preset>(bls: &BlsContext) -> Vec<(&'static str, u64)> {
+    let mut values = vec![
         (
             "GENESIS_FORK_VERSION",
             u64::from(u32::from_be_bytes(bls.genesis_fork_version)),
         ),
-        ("EJECTION_BALANCE", EJECTION_BALANCE),
         (
-            "MIN_VALIDATOR_WITHDRAWABILITY_DELAY",
-            MIN_VALIDATOR_WITHDRAWABILITY_DELAY,
+            "CAPELLA_FORK_VERSION",
+            u64::from(u32::from_be_bytes(bls.capella_fork_version)),
         ),
-        ("INACTIVITY_SCORE_BIAS", INACTIVITY_SCORE_BIAS),
-        (
-            "INACTIVITY_SCORE_RECOVERY_RATE",
-            INACTIVITY_SCORE_RECOVERY_RATE,
-        ),
-        (
-            "MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA",
-            E::MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA,
-        ),
-        ("CHURN_LIMIT_QUOTIENT_GLOAS", E::CHURN_LIMIT_QUOTIENT_GLOAS),
-        (
-            "CONSOLIDATION_CHURN_LIMIT_QUOTIENT",
-            E::CONSOLIDATION_CHURN_LIMIT_QUOTIENT,
-        ),
-        (
-            "MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS",
-            E::MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS,
-        ),
-        (
-            "MIN_BUILDER_WITHDRAWABILITY_DELAY",
-            E::MIN_BUILDER_WITHDRAWABILITY_DELAY,
-        ),
-    ]
-}
-
-/// Every numeric value that [`check_config`] compares: [`config_values`],
-/// `CAPELLA_FORK_VERSION` and `SHARD_COMMITTEE_PERIOD`.
-pub fn compared_values<E: Preset>(bls: &BlsContext) -> Vec<(&'static str, u64)> {
-    let mut values = config_values::<E>(bls).to_vec();
-    values.push((
-        "CAPELLA_FORK_VERSION",
-        u64::from(u32::from_be_bytes(bls.capella_fork_version)),
-    ));
-    values.push(("SHARD_COMMITTEE_PERIOD", E::SHARD_COMMITTEE_PERIOD));
+    ];
+    values.extend(config_values::<E>());
     values
 }
 

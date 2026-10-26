@@ -92,6 +92,50 @@ pub fn epochs_per_eth1_voting_period<E: EthSpec>() -> Epoch {
     E::SlotsPerEth1VotingPeriod::to_u64() / E::slots_per_epoch()
 }
 
+/// Each config value (`configs/*.yaml`) that the state transition of preset `P` compiles in
+/// as a constant, by its config key. This list is the one list of these values.
+///
+/// A service compares the list with the network config at startup
+/// (`network_config::ChainConfig::check_compiled_values`). A network with another value
+/// gives other exit and withdrawability epochs, and thus another state root.
+///
+/// The list holds only the values that are equal on mainnet, Sepolia and Hoodi. A value
+/// that is different on each network is an argument of the transition and is not in the
+/// list: `GENESIS_FORK_VERSION`, `CAPELLA_FORK_VERSION` and `BLOB_SCHEDULE` go through
+/// [`crate::BlsContext`].
+pub fn config_values<P: Preset>() -> [(&'static str, u64); 10] {
+    [
+        ("EJECTION_BALANCE", EJECTION_BALANCE),
+        (
+            "MIN_VALIDATOR_WITHDRAWABILITY_DELAY",
+            MIN_VALIDATOR_WITHDRAWABILITY_DELAY,
+        ),
+        ("INACTIVITY_SCORE_BIAS", INACTIVITY_SCORE_BIAS),
+        (
+            "INACTIVITY_SCORE_RECOVERY_RATE",
+            INACTIVITY_SCORE_RECOVERY_RATE,
+        ),
+        (
+            "MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA",
+            P::MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA,
+        ),
+        ("CHURN_LIMIT_QUOTIENT_GLOAS", P::CHURN_LIMIT_QUOTIENT_GLOAS),
+        (
+            "CONSOLIDATION_CHURN_LIMIT_QUOTIENT",
+            P::CONSOLIDATION_CHURN_LIMIT_QUOTIENT,
+        ),
+        (
+            "MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS",
+            P::MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS,
+        ),
+        (
+            "MIN_BUILDER_WITHDRAWABILITY_DELAY",
+            P::MIN_BUILDER_WITHDRAWABILITY_DELAY,
+        ),
+        ("SHARD_COMMITTEE_PERIOD", P::SHARD_COMMITTEE_PERIOD),
+    ]
+}
+
 /// The preset values of the state transition, on top of the SSZ lengths of [`EthSpec`].
 ///
 /// The churn and builder constants are config values. Each preset takes the value of the
@@ -255,6 +299,39 @@ mod tests {
         assert_eq!(Mainnet::EPOCHS_PER_SYNC_COMMITTEE_PERIOD, 256);
         assert_eq!(epochs_per_eth1_voting_period::<Minimal>(), 4);
         assert_eq!(epochs_per_eth1_voting_period::<Mainnet>(), 64);
+    }
+
+    #[test]
+    fn config_values_name_each_config_key_once() {
+        // configs/minimal.yaml and configs/mainnet.yaml at consensus-specs v1.7.0-beta.4.
+        let minimal = config_values::<Minimal>();
+        let mainnet = config_values::<Mainnet>();
+        let keys =
+            |values: &[(&'static str, u64)]| values.iter().map(|(k, _)| *k).collect::<Vec<_>>();
+        assert_eq!(keys(&minimal), keys(&mainnet));
+        let mut unique = keys(&minimal);
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), minimal.len());
+        let value = |values: &[(&'static str, u64)], key: &str| {
+            values.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+        };
+        assert_eq!(value(&minimal, "SHARD_COMMITTEE_PERIOD"), Some(64));
+        assert_eq!(value(&mainnet, "SHARD_COMMITTEE_PERIOD"), Some(256));
+        assert_eq!(
+            value(&minimal, "MIN_BUILDER_WITHDRAWABILITY_DELAY"),
+            Some(2)
+        );
+        assert_eq!(value(&mainnet, "CHURN_LIMIT_QUOTIENT_GLOAS"), Some(32_768));
+        assert_eq!(value(&mainnet, "EJECTION_BALANCE"), Some(16_000_000_000));
+        // The values of each network are arguments of the transition, not constants.
+        for key in [
+            "GENESIS_FORK_VERSION",
+            "CAPELLA_FORK_VERSION",
+            "BLOB_SCHEDULE",
+        ] {
+            assert_eq!(value(&mainnet, key), None, "{key}");
+        }
     }
 
     #[test]

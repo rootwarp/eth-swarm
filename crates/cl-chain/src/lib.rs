@@ -24,10 +24,14 @@
 //! [`da::custody`] owns the node's custody group count: never decreasing, stored in the column
 //! env, advertised through the MetaData and the ENR, and the column subnets cl-p2p subscribes.
 //!
+//! [`compiled_config`] is the startup check of the config values that the state transition
+//! compiles in: a network config with another value stops the start.
+//!
 //! [`probe::service`] puts probe mode together as one service, and [`service`] is the `cl-chain`
 //! process that `ops/probe/ethswarm-chain.service` runs: `/etc/ethswarm/cl-chain.toml`, the
 //! socket and the method ACL through `svc-runtime`, and the SIGTERM drain.
 
+pub mod compiled_config;
 pub mod da;
 pub mod probe;
 pub mod reqresp;

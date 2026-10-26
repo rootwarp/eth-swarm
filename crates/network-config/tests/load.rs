@@ -303,3 +303,49 @@ fn large_blob_schedule_loads() {
         29_999 % 4096
     );
 }
+
+#[test]
+fn capella_fork_version_matches_the_pinned_configs() {
+    let version = |network| {
+        ChainConfig::load(network)
+            .unwrap()
+            .capella_fork_version()
+            .unwrap()
+    };
+    assert_eq!(version(Network::Sepolia), [0x90, 0, 0, 0x72]);
+    assert_eq!(version(Network::Hoodi), [0x40, 0, 0x09, 0x10]);
+    let devnet = parse(&format!(
+        "{MINIMAL_CONFIG}CAPELLA_FORK_VERSION: 0x03000001\n"
+    ))
+    .unwrap();
+    assert_eq!(devnet.capella_fork_version(), Ok([0x03, 0, 0, 0x01]));
+}
+
+#[test]
+fn a_missing_capella_fork_version_is_an_error_of_the_accessor() {
+    // A config without the key loads: the fixture devnets of the other crates do not have it.
+    // The caller that builds the BLS context gets the error that names the key.
+    let config = parse(MINIMAL_CONFIG).unwrap();
+    assert_eq!(
+        config.capella_fork_version(),
+        Err(ConfigError::Missing("CAPELLA_FORK_VERSION"))
+    );
+}
+
+#[test]
+fn a_malformed_capella_fork_version_fails_the_load() {
+    for value in ["0x0300", "03000001", "0x0300000g"] {
+        let yaml = format!("{MINIMAL_CONFIG}CAPELLA_FORK_VERSION: {value}\n");
+        let err = parse(&yaml).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::Invalid {
+                    key: "CAPELLA_FORK_VERSION",
+                    ..
+                }
+            ),
+            "{value}: {err:?}"
+        );
+    }
+}

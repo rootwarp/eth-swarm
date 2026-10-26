@@ -182,6 +182,17 @@ pub enum ConfigError {
         /// What is wrong.
         reason: String,
     },
+    /// A config value that the node compiles in has another value in the config
+    /// ([`ChainConfig::check_compiled_values`]).
+    #[error("config {key} = {config}, but the node is compiled with {key} = {compiled}")]
+    CompiledMismatch {
+        /// The key.
+        key: &'static str,
+        /// The value of the config.
+        config: u64,
+        /// The compiled value.
+        compiled: u64,
+    },
 }
 
 /// `BlobParameters` (`fulu/beacon-chain.md`).
@@ -199,6 +210,8 @@ pub struct ChainConfig {
     preset_base: String,
     config_name: String,
     genesis_fork_version: Version,
+    /// `None` if the config does not have the key.
+    capella_fork_version: Option<Version>,
     slot_duration_ms: u64,
     max_payload_size: u64,
     electra_fork_epoch: Epoch,
@@ -263,6 +276,7 @@ impl ChainConfig {
             preset_base: r.scalar("PRESET_BASE")?.to_owned(),
             config_name: r.scalar("CONFIG_NAME")?.to_owned(),
             genesis_fork_version: r.version("GENESIS_FORK_VERSION")?,
+            capella_fork_version: r.optional_version("CAPELLA_FORK_VERSION")?,
             slot_duration_ms: r.uint("SLOT_DURATION_MS")?,
             max_payload_size: r.uint("MAX_PAYLOAD_SIZE")?,
             electra_fork_epoch: r.uint("ELECTRA_FORK_EPOCH")?,
@@ -286,6 +300,17 @@ impl ChainConfig {
     /// `GENESIS_FORK_VERSION`.
     pub fn genesis_fork_version(&self) -> Version {
         self.genesis_fork_version
+    }
+
+    /// `CAPELLA_FORK_VERSION`: the domain of the voluntary exits from Deneb (EIP-7044).
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Missing`] if the config does not have the key. A config without the key
+    /// loads, but the state transition cannot check a voluntary exit without the value.
+    pub fn capella_fork_version(&self) -> Result<Version, ConfigError> {
+        self.capella_fork_version
+            .ok_or(ConfigError::Missing("CAPELLA_FORK_VERSION"))
     }
 
     /// `SLOT_DURATION_MS`.
@@ -317,6 +342,38 @@ impl ChainConfig {
     /// Any scalar value as written, for keys without a typed accessor.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.scalars.get(key).map(String::as_str)
+    }
+
+    /// Compares each `(key, value)` of `compiled` with the uint64 value of `key` in the config.
+    ///
+    /// `compiled` holds the config values that the node compiles in as constants (for example
+    /// `state_transition::preset::config_values`). A service calls this at startup, after it
+    /// loads the config. Then a network with other values stops the node before the state
+    /// transition can compute other exit epochs or another state root.
+    ///
+    /// # Errors
+    ///
+    /// The first key of `compiled` that the config does not have ([`ConfigError::Missing`]),
+    /// that is not a uint64 ([`ConfigError::Invalid`]), or that has another value
+    /// ([`ConfigError::CompiledMismatch`]).
+    pub fn check_compiled_values(
+        &self,
+        compiled: &[(&'static str, u64)],
+    ) -> Result<(), ConfigError> {
+        for &(key, compiled) in compiled {
+            let text = self.get(key).ok_or(ConfigError::Missing(key))?;
+            let config: u64 = text
+                .parse()
+                .map_err(|_| invalid(key, text, "expected a uint64"))?;
+            if config != compiled {
+                return Err(ConfigError::CompiledMismatch {
+                    key,
+                    config,
+                    compiled,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// `get_blob_parameters` (`fulu/beacon-chain.md`): the latest schedule entry at or before
@@ -354,6 +411,14 @@ impl Reader<'_> {
     fn version(&self, key: &'static str) -> Result<Version, ConfigError> {
         let s = self.scalar(key)?;
         parse_version(s).ok_or_else(|| invalid(key, s, "expected 0x and 8 hex digits"))
+    }
+
+    /// `None` if the key is absent.
+    fn optional_version(&self, key: &'static str) -> Result<Option<Version>, ConfigError> {
+        match self.0.get(key) {
+            None => Ok(None),
+            Some(_) => self.version(key).map(Some),
+        }
     }
 
     /// An absent list is empty: `fulu/beacon-chain.md` allows an empty blob schedule.
