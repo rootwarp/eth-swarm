@@ -21,13 +21,14 @@ pub fn compute_ptc<E: Preset>(
 }
 
 /// [`compute_ptc`] over the committees of `cache`, which must be the cache of `slot`'s epoch
-/// (else `Err(CacheEpochMismatch)`).
+/// (else `Err(CacheEpochMismatch)`) with the attester seed of `state` for that epoch (else
+/// `Err(CacheSeedMismatch)`).
 pub fn compute_ptc_with<E: Preset>(
     state: &BeaconState<E>,
     cache: &CommitteeCache,
     slot: Slot,
 ) -> Result<Vec<ValidatorIndex>, StfError> {
-    cache.check_slot(slot)?;
+    cache.check_state(state, slot)?;
     let epoch = E::epoch_at_slot(slot);
     let seed = get_seed(state, epoch, DOMAIN_PTC_ATTESTER)?;
     let seed = Bytes32::from(hash(&[seed.as_slice(), &slot.to_le_bytes()]));
@@ -137,6 +138,20 @@ mod tests {
                 epoch: 1
             })
         );
+        // A cache of the right epoch with another seed (for example from another branch)
+        // is a caller error, not an invalid input.
+        let mut other = state.clone();
+        other.randao_mixes = milhouse::Vector::from_elem(Bytes32::repeat_byte(0xa5)).unwrap();
+        let wrong = compute_ptc_with(&other, &cache, 1).unwrap_err();
+        assert_eq!(
+            wrong,
+            StfError::CacheSeedMismatch {
+                epoch: 0,
+                cache_seed: cache.key().1,
+                state_seed: crate::accessors::attester_seed(&other, 0).unwrap(),
+            }
+        );
+        assert!(!wrong.proves_invalid());
         let out = |epoch, state_epoch| Err(StfError::EpochOutOfWindow { epoch, state_epoch });
         assert_eq!(get_ptc(&state, 2 * spe), out(2, 0));
 

@@ -33,12 +33,13 @@ pub use preset::Preset;
 pub use signatures::{BackendError, SignatureBackend, SignatureSet, SignerRef};
 
 use consensus_types::gloas::{BeaconBlock, BeaconState, SignedBeaconBlock};
-use consensus_types::primitives::{CommitteeIndex, Epoch, Root, Slot, ValidatorIndex};
+use consensus_types::primitives::{Bytes32, CommitteeIndex, Epoch, Root, Slot, ValidatorIndex};
 use tree_hash::TreeHash;
 
-/// Why a state transition step failed. Every variant except
-/// [`StfError::SignatureBackend`] and [`StfError::Unimplemented`] means that the input is
-/// invalid by the spec (a failed `assert`, an out-of-range access or a `Uint64` overflow).
+/// Why a state transition step failed. Most variants mean that the input is invalid by the
+/// spec (a failed `assert`, an out-of-range access or a `Uint64` overflow). Some variants
+/// are not a proof of an invalid input: [`StfError::proves_invalid`] gives the class of
+/// each variant.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StfError {
     /// The step is not ported yet; the text names the work that ports it.
@@ -101,6 +102,10 @@ pub enum StfError {
         len: usize,
     },
     /// An epoch that the state's PTC window or proposer lookahead does not cover.
+    ///
+    /// This proves that the input is invalid only when the state is the object's own
+    /// pre-state, advanced to the object's slot. A caller that uses another state (for
+    /// example a head state behind the slot of a gossip message) must map it to IGNORE.
     #[error("epoch {epoch} is out of the window of state epoch {state_epoch}")]
     EpochOutOfWindow {
         /// The requested epoch.
@@ -120,20 +125,53 @@ pub enum StfError {
     /// A milhouse tree failed an update or a flush.
     #[error("state tree: {0}")]
     Tree(String),
+    /// A [`caches::CommitteeCache`] of the slot's epoch, but with another attester seed than
+    /// the state (for example a cache from another branch). This is a caller error, never a
+    /// proof that the input is invalid.
+    #[error("committee cache seed {cache_seed} differs from the state seed {state_seed} of epoch {epoch}")]
+    CacheSeedMismatch {
+        /// The epoch of the slot.
+        epoch: Epoch,
+        /// The seed of the cache.
+        cache_seed: Bytes32,
+        /// `get_seed(state, epoch, DOMAIN_BEACON_ATTESTER)`.
+        state_seed: Bytes32,
+    },
 }
 
 impl StfError {
     /// Whether the error proves that the input is invalid by the spec (REJECT). It does not
-    /// for a step that is not ported yet, a backend without a verdict, or a failure of the
-    /// state trees: callers IGNORE those, never REJECT.
+    /// for a step that is not ported yet, a backend without a verdict, a committee cache of
+    /// another epoch or seed, or a failure of the state trees: callers IGNORE those, never
+    /// REJECT.
+    ///
+    /// [`StfError::StateRootMismatch`] from [`state_transition`] is not a proof yet either.
+    /// Block processing is not ported, so a valid block with a body fails with that error.
+    /// Remove this paragraph when block processing lands.
+    ///
+    /// [`StfError::EpochOutOfWindow`] is a proof only when the state is the object's own
+    /// pre-state, advanced to the object's slot. A caller that uses another state (for
+    /// example a head state behind the slot of a gossip message) must map it to IGNORE.
+    ///
+    /// The match has no `_` arm, so each new variant must select its class here.
     pub fn proves_invalid(&self) -> bool {
-        !matches!(
-            self,
+        match self {
             Self::Unimplemented(_)
-                | Self::SignatureBackend(_)
-                | Self::CacheEpochMismatch { .. }
-                | Self::Tree(_)
-        )
+            | Self::SignatureBackend(_)
+            | Self::CacheEpochMismatch { .. }
+            | Self::CacheSeedMismatch { .. }
+            | Self::Tree(_) => false,
+            Self::SlotNotLater { .. }
+            | Self::InvalidBlockSignature
+            | Self::StateRootMismatch { .. }
+            | Self::ArithmeticOverflow
+            | Self::UnknownValidator(_)
+            | Self::ShuffleIndexOutOfRange { .. }
+            | Self::NoCandidates
+            | Self::UnknownCommittee { .. }
+            | Self::BitOutOfRange { .. }
+            | Self::EpochOutOfWindow { .. } => true,
+        }
     }
 }
 
@@ -335,30 +373,100 @@ mod tests {
         );
     }
 
+    /// The number of [`StfError`] variants: one more than the largest [`variant_id`].
+    const VARIANTS: usize = 15;
+
+    /// A distinct id for each variant. The match has no `_` arm, so a new variant does not
+    /// compile until it gets an id here, and then the table test fails until it has an entry.
+    fn variant_id(e: &StfError) -> usize {
+        match e {
+            StfError::Unimplemented(_) => 0,
+            StfError::SlotNotLater { .. } => 1,
+            StfError::InvalidBlockSignature => 2,
+            StfError::StateRootMismatch { .. } => 3,
+            StfError::SignatureBackend(_) => 4,
+            StfError::ArithmeticOverflow => 5,
+            StfError::UnknownValidator(_) => 6,
+            StfError::ShuffleIndexOutOfRange { .. } => 7,
+            StfError::NoCandidates => 8,
+            StfError::UnknownCommittee { .. } => 9,
+            StfError::BitOutOfRange { .. } => 10,
+            StfError::EpochOutOfWindow { .. } => 11,
+            StfError::CacheEpochMismatch { .. } => 12,
+            StfError::Tree(_) => 13,
+            StfError::CacheSeedMismatch { .. } => 14,
+        }
+    }
+
     #[test]
     fn only_spec_failures_prove_invalid() {
-        for e in [
-            StfError::SlotNotLater {
-                state_slot: 1,
-                slot: 1,
-            },
-            StfError::InvalidBlockSignature,
-            StfError::ArithmeticOverflow,
-            StfError::UnknownValidator(1),
-            StfError::NoCandidates,
-        ] {
-            assert!(e.proves_invalid(), "{e}");
-        }
-        for e in [
-            StfError::Unimplemented("x"),
-            StfError::SignatureBackend(BackendError("timeout".into())),
-            StfError::Tree("flush".into()),
-            StfError::CacheEpochMismatch {
-                cache_epoch: 0,
-                epoch: 1,
-            },
-        ] {
-            assert!(!e.proves_invalid(), "{e}");
+        // One entry for each variant, checked against `variant_id` below.
+        let cases = [
+            (StfError::Unimplemented("x"), false),
+            (
+                StfError::SlotNotLater {
+                    state_slot: 1,
+                    slot: 1,
+                },
+                true,
+            ),
+            (StfError::InvalidBlockSignature, true),
+            (
+                StfError::StateRootMismatch {
+                    block: Root::repeat_byte(1),
+                    computed: Root::repeat_byte(2),
+                },
+                true,
+            ),
+            (
+                StfError::SignatureBackend(BackendError("timeout".into())),
+                false,
+            ),
+            (StfError::ArithmeticOverflow, true),
+            (StfError::UnknownValidator(1), true),
+            (
+                StfError::ShuffleIndexOutOfRange {
+                    index: 1,
+                    index_count: 1,
+                },
+                true,
+            ),
+            (StfError::NoCandidates, true),
+            (StfError::UnknownCommittee { slot: 1, index: 2 }, true),
+            (StfError::BitOutOfRange { index: 3, len: 3 }, true),
+            (
+                StfError::EpochOutOfWindow {
+                    epoch: 5,
+                    state_epoch: 1,
+                },
+                true,
+            ),
+            (
+                StfError::CacheEpochMismatch {
+                    cache_epoch: 0,
+                    epoch: 1,
+                },
+                false,
+            ),
+            (StfError::Tree("flush".into()), false),
+            (
+                StfError::CacheSeedMismatch {
+                    epoch: 0,
+                    cache_seed: Bytes32::repeat_byte(1),
+                    state_seed: Bytes32::repeat_byte(2),
+                },
+                false,
+            ),
+        ];
+        let mut ids: Vec<usize> = cases.iter().map(|(e, _)| variant_id(e)).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            (0..VARIANTS).collect::<Vec<_>>(),
+            "one entry per variant"
+        );
+        for (e, proves) in cases {
+            assert_eq!(e.proves_invalid(), proves, "{e}");
         }
     }
 }

@@ -133,17 +133,19 @@ pub fn get_attesting_indices<E: Preset>(
     attestation: &Attestation<E>,
 ) -> Result<BTreeSet<ValidatorIndex>, StfError> {
     let cache = CommitteeCache::new(state, E::epoch_at_slot(attestation.data.slot))?;
-    get_attesting_indices_with(&cache, attestation)
+    get_attesting_indices_with(state, &cache, attestation)
 }
 
 /// [`get_attesting_indices`] over the committees of `cache`, which must be the cache of the
-/// attestation slot's epoch (else `Err(CacheEpochMismatch)`).
+/// attestation slot's epoch (else `Err(CacheEpochMismatch)`) with the attester seed of
+/// `state` for that epoch (else `Err(CacheSeedMismatch)`).
 pub fn get_attesting_indices_with<E: Preset>(
+    state: &BeaconState<E>,
     cache: &CommitteeCache,
     attestation: &Attestation<E>,
 ) -> Result<BTreeSet<ValidatorIndex>, StfError> {
     let slot = attestation.data.slot;
-    cache.check_slot(slot)?;
+    cache.check_state(state, slot)?;
     let bits = &attestation.aggregation_bits;
     let mut output = BTreeSet::new();
     let mut committee_offset = 0usize;
@@ -380,15 +382,32 @@ mod tests {
         let got = get_attesting_indices(&state, &attestation).unwrap();
         assert_eq!(got, BTreeSet::from([c0[1], c1[0]]));
         // The cached variant gives the same set, and refuses a cache of another epoch.
-        assert_eq!(get_attesting_indices_with(&cache, &attestation), Ok(got));
+        assert_eq!(
+            get_attesting_indices_with(&state, &cache, &attestation),
+            Ok(got)
+        );
         let next = CommitteeCache::new(&state, 1).unwrap();
         assert_eq!(
-            get_attesting_indices_with(&next, &attestation),
+            get_attesting_indices_with(&state, &next, &attestation),
             Err(StfError::CacheEpochMismatch {
                 cache_epoch: 1,
                 epoch: 0
             })
         );
+
+        // A cache of the right epoch with another seed is a caller error, not a proof.
+        let mut other = state.clone();
+        other.randao_mixes = milhouse::Vector::from_elem(Root::repeat_byte(0xa5)).unwrap();
+        let wrong = get_attesting_indices_with(&other, &cache, &attestation).unwrap_err();
+        assert_eq!(
+            wrong,
+            StfError::CacheSeedMismatch {
+                epoch: 0,
+                cache_seed: cache.key().1,
+                state_seed: attester_seed(&other, 0).unwrap(),
+            }
+        );
+        assert!(!wrong.proves_invalid());
 
         // Bits shorter than the committees they cover are out of range.
         attestation.aggregation_bits = ProgressiveBitList::with_capacity(c0.len());

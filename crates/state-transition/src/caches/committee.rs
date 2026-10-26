@@ -92,7 +92,12 @@ fn committee_range(len: u64, index: u64, count: u64) -> Option<(usize, usize)> {
 }
 
 /// `compute_committee` (P0 L1273-1284), per index through `compute_shuffled_index`: the
-/// reference oracle of [`CommitteeCache::committee`].
+/// reference oracle of [`CommitteeCache::committee`]. With `count == 0` no committee
+/// exists, and the result is `Err(UnknownCommittee)`, as the spec also raises an error.
+///
+/// Only the spec oracle (the tests) calls this function, and it has no slot. Thus the
+/// `slot` field of each `UnknownCommittee` from this function is 0, which is not the slot of
+/// the committee.
 pub fn compute_committee(
     indices: &[ValidatorIndex],
     seed: &[u8; 32],
@@ -100,9 +105,12 @@ pub fn compute_committee(
     count: u64,
     rounds: u8,
 ) -> Result<Vec<ValidatorIndex>, StfError> {
+    let unknown = StfError::UnknownCommittee { slot: 0, index };
+    if count == 0 {
+        return Err(unknown);
+    }
     let len = indices.len() as u64;
-    let (start, end) =
-        committee_range(len, index, count).ok_or(StfError::UnknownCommittee { slot: 0, index })?;
+    let (start, end) = committee_range(len, index, count).ok_or(unknown)?;
     (start as u64..end as u64)
         .map(|i| Ok(indices[compute_shuffled_index(i, len, seed, rounds)? as usize]))
         .collect()
@@ -149,6 +157,8 @@ impl CommitteeCache {
     }
 
     /// `Err(CacheEpochMismatch)` unless `slot` is in the epoch of the cache.
+    ///
+    /// Call [`CommitteeCache::check_state`] first; this function checks only the epoch.
     pub fn check_slot(&self, slot: Slot) -> Result<(), StfError> {
         let epoch = slot / self.slots_per_epoch;
         if epoch == self.epoch {
@@ -161,6 +171,28 @@ impl CommitteeCache {
         }
     }
 
+    /// `Err(CacheEpochMismatch)` unless `slot` is in the epoch of the cache, and
+    /// `Err(CacheSeedMismatch)` unless the cache's seed is the attester seed of `state` for
+    /// that epoch. A cache of the same epoch from another branch can have another seed, and
+    /// then its committees are wrong for `state`.
+    pub fn check_state<E: Preset>(
+        &self,
+        state: &BeaconState<E>,
+        slot: Slot,
+    ) -> Result<(), StfError> {
+        self.check_slot(slot)?;
+        let state_seed = attester_seed(state, self.epoch)?;
+        if state_seed == self.seed {
+            Ok(())
+        } else {
+            Err(StfError::CacheSeedMismatch {
+                epoch: self.epoch,
+                cache_seed: self.seed,
+                state_seed,
+            })
+        }
+    }
+
     /// `get_committee_count_per_slot` of the epoch.
     pub fn committees_per_slot(&self) -> u64 {
         self.committees_per_slot
@@ -169,6 +201,8 @@ impl CommitteeCache {
     /// `get_beacon_committee(state, slot, index)` (P0 L1527-1540) for a slot of this epoch,
     /// without a new shuffle. The cache must come from the same state, or from one with the
     /// same active set and seed for this epoch.
+    ///
+    /// Call [`CommitteeCache::check_state`] first; this function checks only the epoch.
     pub fn committee(
         &self,
         slot: Slot,
@@ -312,6 +346,99 @@ mod tests {
             cache.committee(7, 4),
             Err(StfError::UnknownCommittee { slot: 7, index: 4 })
         );
+    }
+
+    #[test]
+    fn zero_committees_is_an_error() {
+        for (indices, index) in [(&[1u64, 2, 3][..], 0u64), (&[][..], 0), (&[1][..], 5)] {
+            assert_eq!(
+                compute_committee(indices, &SEED, index, 0, 10),
+                Err(StfError::UnknownCommittee { slot: 0, index })
+            );
+        }
+    }
+
+    /// A state at slot `start_slot_at_epoch(epoch)` with 64 validators.
+    fn state_at_epoch(epoch: u64) -> consensus_types::gloas::BeaconState<consensus_types::Minimal> {
+        use consensus_types::{EthSpec, Minimal};
+        let mut state = crate::testing::genesis_state::<Minimal>(&[32_000_000_000; 64]);
+        state.slot = Minimal::start_slot_at_epoch(epoch);
+        state
+    }
+
+    /// `process_randao` of a block at the state's slot: a new mix of the current epoch.
+    fn reveal(state: &mut consensus_types::gloas::BeaconState<consensus_types::Minimal>, byte: u8) {
+        use consensus_types::{EthSpec, Minimal};
+        use ssz_types::typenum::Unsigned;
+        let n = <Minimal as EthSpec>::EpochsPerHistoricalVector::to_u64();
+        let epoch = crate::accessors::get_current_epoch(state);
+        *state.randao_mixes.get_mut((epoch % n) as usize).unwrap() = Bytes32::repeat_byte(byte);
+    }
+
+    /// `process_slots` to the last slot of the state's epoch, then the epoch boundary.
+    /// `process_epoch` is a stub, so the boundary is done here by hand with its only effect
+    /// on the seeds: `process_randao_mixes_reset` copies the mix into the next epoch.
+    fn cross_epoch(state: &mut consensus_types::gloas::BeaconState<consensus_types::Minimal>) {
+        use consensus_types::{EthSpec, Minimal};
+        use ssz_types::typenum::Unsigned;
+        let spe = Minimal::slots_per_epoch();
+        let epoch = crate::accessors::get_current_epoch(state);
+        let last = (epoch + 1) * spe - 1;
+        if state.slot < last {
+            crate::per_slot::process_slots(state, last).unwrap();
+        }
+        crate::per_slot::process_slot(state).unwrap();
+        let n = <Minimal as EthSpec>::EpochsPerHistoricalVector::to_u64();
+        let mix = crate::accessors::get_randao_mix(state, epoch);
+        *state
+            .randao_mixes
+            .get_mut(((epoch + 1) % n) as usize)
+            .unwrap() = mix;
+        state.slot = (epoch + 1) * spe;
+    }
+
+    #[test]
+    fn cache_of_the_next_epoch_stays_valid_after_the_boundary() {
+        use consensus_types::{EthSpec, Minimal};
+        let c = 2u64;
+        let mut state = state_at_epoch(c);
+        // The seed of C + 1 uses the mix of C - 1, which is fixed in epoch C.
+        let cache = CommitteeCache::new(&state, c + 1).unwrap();
+        let slot = Minimal::start_slot_at_epoch(c + 1);
+        reveal(&mut state, 0x31);
+        cross_epoch(&mut state);
+        reveal(&mut state, 0x32);
+        assert_eq!(crate::accessors::get_current_epoch(&state), c + 1);
+        assert_eq!(cache.check_state(&state, slot), Ok(()));
+        assert_eq!(cache, CommitteeCache::new(&state, c + 1).unwrap());
+    }
+
+    #[test]
+    fn cache_two_epochs_ahead_fails_because_its_seed_is_not_fixed() {
+        use consensus_types::{EthSpec, Minimal};
+        let c = 2u64;
+        let mut state = state_at_epoch(c);
+        // The seed of C + 2 uses the mix of C, which the blocks of epoch C still change.
+        let cache = CommitteeCache::new(&state, c + 2).unwrap();
+        let slot = Minimal::start_slot_at_epoch(c + 2);
+        crate::per_slot::process_slots(&mut state, Minimal::start_slot_at_epoch(c + 1) - 1)
+            .unwrap();
+        reveal(&mut state, 0x41);
+        cross_epoch(&mut state);
+        let state_seed = attester_seed(&state, c + 2).unwrap();
+        let wrong = cache.check_state(&state, slot).unwrap_err();
+        assert_eq!(
+            wrong,
+            StfError::CacheSeedMismatch {
+                epoch: c + 2,
+                cache_seed: cache.key().1,
+                state_seed,
+            }
+        );
+        assert!(!wrong.proves_invalid());
+        // After the last slot of C the seed of C + 2 is fixed, so a new cache passes.
+        let fresh = CommitteeCache::new(&state, c + 2).unwrap();
+        assert_eq!(fresh.check_state(&state, slot), Ok(()));
     }
 
     /// Every range `committee_range` gives slices a list of `len` safely. Mainnet has 32
