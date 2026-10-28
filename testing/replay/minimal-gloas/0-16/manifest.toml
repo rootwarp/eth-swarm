@@ -1,0 +1,161 @@
+archive_sha256 = "46e21ca9c802c99aebf39194d39312028e4d9e8cbf29fba8e31ac06d55c081db"
+format_version = 2
+network = "minimal-gloas"
+preset = "minimal"
+slot_start = 0
+slot_end = 16
+fork_digests = ["0xab889b2b"]
+topics = ["beacon_block"]
+peer_count = 0
+capture_host = "replay-fixture"
+clock_source = "beacon-api"
+closed_by = "close"
+total_bytes = 6195
+
+[[digest_schedule]]
+epoch = 0
+digest = "0xab889b2b"
+
+[[files]]
+path = "beacon_block/0_0x127fa66689c5e1e3948953911d6c7d8d8246d9df82cb0c1a74271c3704dd850e.ssz_snappy"
+topic = "beacon_block"
+slot = 0
+root = "0x127fa66689c5e1e3948953911d6c7d8d8246d9df82cb0c1a74271c3704dd850e"
+fork_digest = "0xab889b2b"
+len = 125
+sha256 = "af69190a20135ac72a38e88c5894289b004eb96ae99e25f056a70f12ca64def7"
+
+[[files]]
+path = "beacon_block/10_0x48f20a58e6554273742fa3b313ab06d7486622395e84fa24e94feebaaf404d03.ssz_snappy"
+topic = "beacon_block"
+slot = 10
+root = "0x48f20a58e6554273742fa3b313ab06d7486622395e84fa24e94feebaaf404d03"
+fork_digest = "0xab889b2b"
+len = 408
+sha256 = "6e94f34edf597d0e70cad29a8e5bad726c211834d531b90d4c5160213ec0e056"
+
+[[files]]
+path = "beacon_block/11_0xccb7658a3d0f604bb69a805435cdcc01ca710a4bcffb42eddc01fd3ea12732d3.ssz_snappy"
+topic = "beacon_block"
+slot = 11
+root = "0xccb7658a3d0f604bb69a805435cdcc01ca710a4bcffb42eddc01fd3ea12732d3"
+fork_digest = "0xab889b2b"
+len = 408
+sha256 = "8717eabe58bbe9a90ccb1f94f6d5e468b37f1ad267f4b498f26f430e7b26f014"
+
+[[files]]
+path = "beacon_block/12_0x7ac3cb1d2b2021b2ac8b228617dade751d0a5cf61b98e8b668711cd55578804d.ssz_snappy"
+topic = "beacon_block"
+slot = 12
+root = "0x7ac3cb1d2b2021b2ac8b228617dade751d0a5cf61b98e8b668711cd55578804d"
+fork_digest = "0xab889b2b"
+len = 406
+sha256 = "60cd8b5fd94a52e4b2231a7fec27478a2be6b5ff350770baf2798b04319b5c47"
+
+[[files]]
+path = "beacon_block/13_0xaae39ebb428eab316206a3b46a866f79baac7b3728f5b129cb743ed44ae77679.ssz_snappy"
+topic = "beacon_block"
+slot = 13
+root = "0xaae39ebb428eab316206a3b46a866f79baac7b3728f5b129cb743ed44ae77679"
+fork_digest = "0xab889b2b"
+len = 406
+sha256 = "853ac74e386cae134d7c4e9342d08eb83a5a6eca94746cd178dfe853068ddaa0"
+
+[[files]]
+path = "beacon_block/14_0x97b22fb4047d7ebe9b557e8a38435807515ef755acb889b959d4675418cf1c81.ssz_snappy"
+topic = "beacon_block"
+slot = 14
+root = "0x97b22fb4047d7ebe9b557e8a38435807515ef755acb889b959d4675418cf1c81"
+fork_digest = "0xab889b2b"
+len = 406
+sha256 = "de32a599f46c080c65fe9b8cb77fa02296e58eeffe26902cb55573c773203078"
+
+[[files]]
+path = "beacon_block/15_0xc5107e6fd6bba60642ccfebacc46efa419a5ed406a0ea995ce35ad29fe78697c.ssz_snappy"
+topic = "beacon_block"
+slot = 15
+root = "0xc5107e6fd6bba60642ccfebacc46efa419a5ed406a0ea995ce35ad29fe78697c"
+fork_digest = "0xab889b2b"
+len = 406
+sha256 = "4ac64f2d82b996977ed1ca6bc1b62c69086a4b932cf3894d7b8f0ba63b33581a"
+
+[[files]]
+path = "beacon_block/16_0x80dc3339cb8f475babdf421524ee0233a13f03ff873d225664fce11cb8d08c3a.ssz_snappy"
+topic = "beacon_block"
+slot = 16
+root = "0x80dc3339cb8f475babdf421524ee0233a13f03ff873d225664fce11cb8d08c3a"
+fork_digest = "0xab889b2b"
+len = 406
+sha256 = "50678f459072ae56630157b5a680b5e54494603bd917b45f69bfdd973fe6fc9f"
+
+[[files]]
+path = "beacon_block/1_0xde3b3cab23f655878f5f1a272e386f632fdc6ce876ffc8a8c60e5d9827c6e4b2.ssz_snappy"
+topic = "beacon_block"
+slot = 1
+root = "0xde3b3cab23f655878f5f1a272e386f632fdc6ce876ffc8a8c60e5d9827c6e4b2"
+fork_digest = "0xab889b2b"
+len = 381
+sha256 = "d6688ef98f508e98bc359570de474839a567607d98aac57f8503bf2036fa64a7"
+
+[[files]]
+path = "beacon_block/2_0xd89a872ae030c9f289b5078edca27a082dc387d33ed1578f4df0fa2926987ba1.ssz_snappy"
+topic = "beacon_block"
+slot = 2
+root = "0xd89a872ae030c9f289b5078edca27a082dc387d33ed1578f4df0fa2926987ba1"
+fork_digest = "0xab889b2b"
+len = 406
+sha256 = "5865d8a0fdda765b4fd5674ad63b81597c50d7aaf470c38dacfdb46807c6b7a9"
+
+[[files]]
+path = "beacon_block/4_0xfeba547420b20194c0f2109f2b8f33d4f4639045f2d553276cd9e7616dfb9273.ssz_snappy"
+topic = "beacon_block"
+slot = 4
+root = "0xfeba547420b20194c0f2109f2b8f33d4f4639045f2d553276cd9e7616dfb9273"
+fork_digest = "0xab889b2b"
+len = 406
+sha256 = "7f8091b1d859a3ed8d7536a5c3f6359fe1afd114875f04613d7621d1941a96a8"
+
+[[files]]
+path = "beacon_block/5_0x9f7f6985be6d8c084fd2cd75087fb3064c9560b540b3736362fbdcdf482d8ffd.ssz_snappy"
+topic = "beacon_block"
+slot = 5
+root = "0x9f7f6985be6d8c084fd2cd75087fb3064c9560b540b3736362fbdcdf482d8ffd"
+fork_digest = "0xab889b2b"
+len = 406
+sha256 = "62c43f63804b0aa9ed05e6bebc841ca1fd0395b1970700d991ca80b7d465ea0c"
+
+[[files]]
+path = "beacon_block/6_0x495340ff176cd4ad988b66919cb609ab9e9458fa107e790aa9178526ea902332.ssz_snappy"
+topic = "beacon_block"
+slot = 6
+root = "0x495340ff176cd4ad988b66919cb609ab9e9458fa107e790aa9178526ea902332"
+fork_digest = "0xab889b2b"
+len = 406
+sha256 = "7cca68c7e65605e1c324f05bfc0982113954c6c09be9b84036cb3beb45e8b55c"
+
+[[files]]
+path = "beacon_block/7_0xa57a1381b375d90382abb960d79d50b1863e9cb9b54503201c1ca0665485483b.ssz_snappy"
+topic = "beacon_block"
+slot = 7
+root = "0xa57a1381b375d90382abb960d79d50b1863e9cb9b54503201c1ca0665485483b"
+fork_digest = "0xab889b2b"
+len = 406
+sha256 = "38ac51fbc0e74ae6aa08b790a1e9b900f1b6553e0db9065ed05a48fc08db2fca"
+
+[[files]]
+path = "beacon_block/8_0xd7b6f60e48475861f8bce83851387e4a34f1c6e5c20cdaa978f6305dcc917fe3.ssz_snappy"
+topic = "beacon_block"
+slot = 8
+root = "0xd7b6f60e48475861f8bce83851387e4a34f1c6e5c20cdaa978f6305dcc917fe3"
+fork_digest = "0xab889b2b"
+len = 405
+sha256 = "36f375da3a509fbe190452073384fc42084a5767aead7caf4f44fc0c557f9654"
+
+[[files]]
+path = "beacon_block/9_0x0891514da46ffab6b7ba19fb5c0f91cf054fbf3e52df0c941dc6716ab67894c6.ssz_snappy"
+topic = "beacon_block"
+slot = 9
+root = "0x0891514da46ffab6b7ba19fb5c0f91cf054fbf3e52df0c941dc6716ab67894c6"
+fork_digest = "0xab889b2b"
+len = 408
+sha256 = "c52ca148579bc63d6640b7aad5987df89f3f3c11cfe5f6bf58e823f139804199"

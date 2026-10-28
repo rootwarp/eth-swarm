@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "Capture and replay tooling for live-network runs: the gossip/SSE arrival collector and the block/column archiver with a verified sha256 manifest, and the devnet block and root export. Never links cl-sync."
+description = "Capture and replay tooling for live-network runs: the gossip/SSE arrival collector, the block/column archiver with a verified sha256 manifest, the devnet block and root export, and genesis replay of that export. Never links cl-sync."
 
 [[bin]]
 name = "archiver"
@@ -19,16 +19,29 @@ path = "src/bin/collector.rs"
 name = "export-blocks"
 path = "src/bin/export-blocks.rs"
 
+[[bin]]
+name = "replay"
+path = "src/bin/replay.rs"
+required-features = ["replay"]
+
 [features]
 # For this crate's tests and its users' tests: write-fault injection (`archive::Fault`: an
 # interrupted write, a full disk), payload fixtures (`archive::fixtures`), and the collector's
 # scripted clock and fixture beacon node (`collector::testing`, a hyper server on 127.0.0.1), and
 # the export's fixture devnet (`export_blocks::fixtures`).
-test-support = ["p2p-wire/testkit", "dep:ethereum_ssz", "dep:ssz_types", "hyper/server"]
+test-support = ["p2p-wire/testkit", "dep:ssz_types", "hyper/server"]
+# Genesis replay. Not a default: cl-chain's dev-dependency on this crate must not pull
+# `crypto-bls/verify` (scripts/check-cl-chain-features.sh). `cargo run --bin replay` turns it on.
+replay = ["dep:crypto-bls", "dep:state-transition"]
 
 [dependencies]
 consensus-types = { path = "../consensus-types" }
 network-config = { path = "../network-config" }
+# In-process BLS for genesis replay (`crypto-bls` verify + aggregate), feature `replay` only.
+# Sign stays off this crate: scripts/check-bls-features.sh allows `test-vectors` on spec-tests only.
+crypto-bls = { path = "../crypto-bls", optional = true, features = ["verify", "aggregate"] }
+# The pure Gloas transition, feature `replay` only. `testing` is a dev-dependency only.
+state-transition = { path = "../state-transition", optional = true }
 # `max_compressed_len`, the gossip snappy bound.
 p2p-wire = { path = "../p2p-wire" }
 tree_hash.workspace = true
@@ -53,10 +66,22 @@ bytes = "1"
 rustix = { version = "1", features = ["fs", "process"] }
 # Arrival records, gaps and NTP samples are JSON lines; beacon API and SSE event bodies are JSON.
 serde_json = "1"
-# Fixture encoding (feature `test-support`).
-ethereum_ssz = { workspace = true, optional = true }
+# SSZ of the genesis state and of blocks. Also used by the `test-support` fixtures.
+ethereum_ssz.workspace = true
 ssz_types = { workspace = true, optional = true }
 
 [dev-dependencies]
-testkit = { path = ".", features = ["test-support"] }
+testkit = { path = ".", features = ["test-support", "replay"] }
 tempfile = "3"
+# The replay fixture chain (tests/support/chain.rs): real validator keys and the test inputs
+# (`genesis_state`, `bid_for_state`). `testing` is dev-only (scripts/check-stf-testing.sh).
+state-transition = { path = "../state-transition", features = ["testing"] }
+# `SecretKey::key_gen` and `sign` for that fixture. blst is already the workspace BLS library
+# (crypto-bls); this dev-dependency does not enable crypto-bls `test-vectors`.
+blst.workspace = true
+crypto-bls = { path = "../crypto-bls", features = ["verify", "aggregate"] }
+consensus-types = { path = "../consensus-types" }
+network-config = { path = "../network-config" }
+ethereum_ssz.workspace = true
+tree_hash.workspace = true
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync"] }

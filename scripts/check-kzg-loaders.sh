@@ -49,7 +49,9 @@ rc=0
 tree=$("$cargo" tree -e features -i blst --target all --all-features --locked 2>&1) || rc=$?
 if ((rc != 0)) || [[ $tree != *blst* ]]; then
   echo "ERROR: cargo tree -e features -i blst failed (exit $rc):"; printf '%s\n' "$tree"; fail=1
-elif grep -qw portable <<<"$tree"; then
+# Match the feature edge, not the word. `grep -w portable` also matches cargo's
+# download progress for `portable-atomic`, which is not blst's `portable` feature.
+elif grep -F 'feature "portable"' <<<"$tree"; then
   echo "ERROR: blst is built with portable:"; printf '%s\n' "$tree"; fail=1
 fi
 

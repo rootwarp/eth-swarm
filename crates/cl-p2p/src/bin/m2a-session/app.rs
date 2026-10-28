@@ -711,11 +711,19 @@ mod tests {
 
     /// The IDs of a process running as `uid`, all equal: GID 1000 for the test's `m2a-session`
     /// (and 1001, a login user in its group), 0 for root, else the test's own effective GID.
+    ///
+    /// GitHub-hosted runners are uid 1001. `ids(euid())` is that process, not the synthetic
+    /// login user, so it keeps the real gid. Otherwise `run_as = "test-user"` fails the
+    /// group check before a dial.
     fn ids(uid: u32) -> ProcessIds {
-        let gid = match uid {
-            0 => 0,
-            1000 | 1001 => 1000,
-            _ => egid(),
+        let gid = if uid == euid() && uid != 1000 {
+            egid()
+        } else {
+            match uid {
+                0 => 0,
+                1000 | 1001 => 1000,
+                _ => egid(),
+            }
         };
         ProcessIds {
             uids: ProcessUids::same(uid),

@@ -3000,9 +3000,15 @@ compose_env() { # compose_env <file> <trusted peers> [example]: an .env example 
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
   echo "# skip - compose.yaml checks: docker compose is not installed"
 else
+  # Compose stops at the first missing variable. In compose.yaml that is RETH_UID
+  # (the service user), so the example file's error is the ids one, checked next.
+  # With the ids filled in, the empty CHECKPOINT_SYNC_URL is what remains.
+  cp "$ref/.env.example" "$tmp/compose-no-checkpoint.env"
+  for key in RETH_UID RETH_GID; do set_env "$tmp/compose-no-checkpoint.env" "$key" 990; done
+  for key in LIGHTHOUSE_UID LIGHTHOUSE_GID; do set_env "$tmp/compose-no-checkpoint.env" "$key" 991; done
   check_out 1 "compose: .env.example alone is refused until CHECKPOINT_SYNC_URL is set" \
     'CHECKPOINT_SYNC_URL is missing a value' \
-    docker compose --env-file "$ref/.env.example" -f "$ref/compose.yaml" config --quiet
+    docker compose --env-file "$tmp/compose-no-checkpoint.env" -f "$ref/compose.yaml" config --quiet
   check_out 1 "compose: .env.example alone is refused until setup.sh wrote the ids" \
     'RETH_UID is missing a value: run setup.sh' \
     docker compose --env-file "$ref/.env.example" -f "$ref/compose.yaml" config --quiet
@@ -3030,7 +3036,7 @@ sys.exit(0 if eval(sys.argv[2]) else 1)' "$tmp/compose.json" "$2"
   compose_rule "reth gets at least 5 minutes to stop" 's["reth"]["stop_grace_period"].startswith("5m")'
   compose_rule "pinned images from .env" 'all("@sha256:" in v["image"] for v in s.values())'
   compose_rule "each JWT copy mounted read-only from its own directory, no host path created" \
-    'all(any(m["target"] == "/secrets/jwt.hex" and m.get("read_only") and m["source"].endswith(n + "/jwt.hex") for m in s[n]["volumes"]) and all(m["bind"]["create_host_path"] is False for m in s[n]["volumes"]) for n in s)'
+    'all(any(m["target"] == "/secrets/jwt.hex" and m.get("read_only") and m["source"].endswith(n + "/jwt.hex") for m in s[n]["volumes"]) and all((m.get("bind") or {}).get("create_host_path", False) is False for m in s[n]["volumes"]) for n in s)'
   compose_rule "reth: Engine API on 127.0.0.1:8551 with the JWT, --full, Sepolia" \
     'all(a in s["reth"]["command"] for a in ["--authrpc.addr=127.0.0.1", "--authrpc.port=8551", "--authrpc.jwtsecret=/secrets/jwt.hex", "--full", "--chain=sepolia", "--ipcdisable"])'
   compose_rule "reth: p2p and discovery on RETH_P2P_PORT" \
