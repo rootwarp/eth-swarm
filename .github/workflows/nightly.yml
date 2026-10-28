@@ -99,7 +99,7 @@ jobs:
       - name: fuzz/Cargo.lock resolves every shared crate exactly as Cargo.lock does
         run: bash scripts/check-fuzz-lock.sh
       - name: Run gate 1 (3600 s per target)
-        run: bash fuzz/run-gate1.sh
+        run: unset PROTOC && bash fuzz/run-gate1.sh
       - name: The gate file passes the checker
         run: bash fuzz/check-gate1.sh fuzz/artifacts/gate1.json
       - name: Gate file and log
@@ -146,7 +146,7 @@ jobs:
       - name: fuzz/Cargo.lock resolves every shared crate exactly as Cargo.lock does
         run: bash scripts/check-fuzz-lock.sh
       - name: Run gate 2a (3600 s per target)
-        run: bash fuzz/run-gate2a.sh
+        run: unset PROTOC && bash fuzz/run-gate2a.sh
       - name: The gate file passes the checker
         run: bash fuzz/check-gate2a.sh fuzz/artifacts/gate2a.json
       - name: Gate file and log
@@ -194,7 +194,7 @@ jobs:
       - name: fuzz/Cargo.lock resolves every shared crate exactly as Cargo.lock does
         run: bash scripts/check-fuzz-lock.sh
       - name: Run gate 2b (3600 s)
-        run: bash fuzz/run-gate2b.sh
+        run: unset PROTOC && bash fuzz/run-gate2b.sh
       - name: The gate file passes the checker
         run: bash fuzz/check-gate2b.sh fuzz/artifacts/gate2b.json
       - name: Gate file and log

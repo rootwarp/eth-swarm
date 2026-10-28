@@ -1,0 +1,118 @@
+export_sha256 = "81ff2ef9ace143308f6d35badecba9aa027b6f523c18a4cd36092a79c58a01d8"
+format_version = 2
+devnet = "minimal-gloas"
+source = "replay-fixture"
+preset = "minimal"
+slot_start = 0
+slot_end = 16
+finalized_slot = 16
+config_sha256 = "02f9587a796a87911c016af4c5ed8ac93c6976239d38c12392d090db1bf23c67"
+genesis_time = 1700000000
+genesis_validators_root = "0x4242424242424242424242424242424242424242424242424242424242424242"
+genesis_block_root = "0x127fa66689c5e1e3948953911d6c7d8d8246d9df82cb0c1a74271c3704dd850e"
+genesis_state_root = "0xf3cfe9a6b27cb30a731e24c96664871edea754887599a3951772fb6b5d33f656"
+images = ["ethswarm/replay-fixture:4.8a@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
+empty_slots = [3]
+
+[genesis_state]
+path = "genesis_state.ssz"
+len = 23525
+sha256 = "259de968c2083d6dffb2aa269ec9db77c5c06230ebb7e11aaa6205cc732d40d0"
+
+[[fork_schedule]]
+fork = "fulu"
+version = "0x06000001"
+epoch = 0
+
+[[fork_schedule]]
+fork = "gloas"
+version = "0x07000001"
+epoch = 0
+
+[[fork_digests]]
+epoch = 0
+digest = "0xab889b2b"
+
+[[segments]]
+dir = "0-16"
+archive_sha256 = "46e21ca9c802c99aebf39194d39312028e4d9e8cbf29fba8e31ac06d55c081db"
+
+[[blocks]]
+slot = 0
+root = "0x127fa66689c5e1e3948953911d6c7d8d8246d9df82cb0c1a74271c3704dd850e"
+parent_root = "0x0000000000000000000000000000000000000000000000000000000000000000"
+
+[[blocks]]
+slot = 1
+root = "0xde3b3cab23f655878f5f1a272e386f632fdc6ce876ffc8a8c60e5d9827c6e4b2"
+parent_root = "0x127fa66689c5e1e3948953911d6c7d8d8246d9df82cb0c1a74271c3704dd850e"
+
+[[blocks]]
+slot = 2
+root = "0xd89a872ae030c9f289b5078edca27a082dc387d33ed1578f4df0fa2926987ba1"
+parent_root = "0xde3b3cab23f655878f5f1a272e386f632fdc6ce876ffc8a8c60e5d9827c6e4b2"
+
+[[blocks]]
+slot = 4
+root = "0xfeba547420b20194c0f2109f2b8f33d4f4639045f2d553276cd9e7616dfb9273"
+parent_root = "0xd89a872ae030c9f289b5078edca27a082dc387d33ed1578f4df0fa2926987ba1"
+
+[[blocks]]
+slot = 5
+root = "0x9f7f6985be6d8c084fd2cd75087fb3064c9560b540b3736362fbdcdf482d8ffd"
+parent_root = "0xfeba547420b20194c0f2109f2b8f33d4f4639045f2d553276cd9e7616dfb9273"
+
+[[blocks]]
+slot = 6
+root = "0x495340ff176cd4ad988b66919cb609ab9e9458fa107e790aa9178526ea902332"
+parent_root = "0x9f7f6985be6d8c084fd2cd75087fb3064c9560b540b3736362fbdcdf482d8ffd"
+
+[[blocks]]
+slot = 7
+root = "0xa57a1381b375d90382abb960d79d50b1863e9cb9b54503201c1ca0665485483b"
+parent_root = "0x495340ff176cd4ad988b66919cb609ab9e9458fa107e790aa9178526ea902332"
+
+[[blocks]]
+slot = 8
+root = "0xd7b6f60e48475861f8bce83851387e4a34f1c6e5c20cdaa978f6305dcc917fe3"
+parent_root = "0xa57a1381b375d90382abb960d79d50b1863e9cb9b54503201c1ca0665485483b"
+
+[[blocks]]
+slot = 9
+root = "0x0891514da46ffab6b7ba19fb5c0f91cf054fbf3e52df0c941dc6716ab67894c6"
+parent_root = "0xd7b6f60e48475861f8bce83851387e4a34f1c6e5c20cdaa978f6305dcc917fe3"
+
+[[blocks]]
+slot = 10
+root = "0x48f20a58e6554273742fa3b313ab06d7486622395e84fa24e94feebaaf404d03"
+parent_root = "0x0891514da46ffab6b7ba19fb5c0f91cf054fbf3e52df0c941dc6716ab67894c6"
+
+[[blocks]]
+slot = 11
+root = "0xccb7658a3d0f604bb69a805435cdcc01ca710a4bcffb42eddc01fd3ea12732d3"
+parent_root = "0x48f20a58e6554273742fa3b313ab06d7486622395e84fa24e94feebaaf404d03"
+
+[[blocks]]
+slot = 12
+root = "0x7ac3cb1d2b2021b2ac8b228617dade751d0a5cf61b98e8b668711cd55578804d"
+parent_root = "0xccb7658a3d0f604bb69a805435cdcc01ca710a4bcffb42eddc01fd3ea12732d3"
+
+[[blocks]]
+slot = 13
+root = "0xaae39ebb428eab316206a3b46a866f79baac7b3728f5b129cb743ed44ae77679"
+parent_root = "0x7ac3cb1d2b2021b2ac8b228617dade751d0a5cf61b98e8b668711cd55578804d"
+
+[[blocks]]
+slot = 14
+root = "0x97b22fb4047d7ebe9b557e8a38435807515ef755acb889b959d4675418cf1c81"
+parent_root = "0xaae39ebb428eab316206a3b46a866f79baac7b3728f5b129cb743ed44ae77679"
+
+[[blocks]]
+slot = 15
+root = "0xc5107e6fd6bba60642ccfebacc46efa419a5ed406a0ea995ce35ad29fe78697c"
+parent_root = "0x97b22fb4047d7ebe9b557e8a38435807515ef755acb889b959d4675418cf1c81"
+
+[[blocks]]
+slot = 16
+root = "0x80dc3339cb8f475babdf421524ee0233a13f03ff873d225664fce11cb8d08c3a"
+parent_root = "0xc5107e6fd6bba60642ccfebacc46efa419a5ed406a0ea995ce35ad29fe78697c"

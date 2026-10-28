@@ -1,0 +1,40 @@
+# Nightly replay of the export pinned in testing/replay.manifest.toml.
+#
+# `schedule` and `workflow_dispatch` run only from the default branch (`main`). A pin change
+# on a pull request does not start this workflow. The first green run is the one on `main`
+# after the pin is merged. Until then, the same command locally is the check:
+#
+#   cargo run --locked --release -p testkit --bin replay -- \
+#     --manifest testing/replay.manifest.toml --out target/replay-out
+#
+# A change to testing/replay.manifest.toml is the only way the input changes.
+name: replay-nightly
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: replay-nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  replay:
+    name: replay the pinned export
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - name: Replay testing/replay.manifest.toml
+        run: cargo run --locked --release -p testkit --bin replay -- --manifest testing/replay.manifest.toml --out target/replay-out

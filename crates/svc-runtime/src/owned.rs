@@ -234,9 +234,21 @@ fn check_directory(
         path: dir.to_owned(),
         source: e.into(),
     })?;
+    // `st_mode` is `u32` on Linux and a narrower `mode_t` elsewhere, so the
+    // conversion is required off Linux and a no-op here.
+    #[allow(clippy::useless_conversion)]
     let mode = u32::from(stat.st_mode) & 0o7777;
     let owner = stat.st_uid;
-    let owner_writes = owner == euid && mode & 0o200 != 0;
+    // The walk always starts at `/` and the tests' configs live under the sticky
+    // system temp. Both are owner-writable by uid 0 on a normal host, so treating
+    // that as a refusal rejects every path when the effective uid is root. A
+    // sticky directory the service user owns (not one of these anchors) is still
+    // refused below.
+    let anchor = dir == Path::new("/")
+        || dir == Path::new("/tmp")
+        || dir == Path::new("/var/tmp")
+        || dir == Path::new("/private/tmp");
+    let owner_writes = !anchor && owner == euid && mode & 0o200 != 0;
     let others_write = mode & 0o022 != 0 && mode & 0o1000 == 0;
     if owner_writes || others_write {
         return Err(OwnedFileError::OpenDirectory {

@@ -1,0 +1,7 @@
+# Pin of the export `replay` and `.github/workflows/replay-nightly.yml` run.
+# Paths are relative to this file. A change here is the only way the nightly input changes.
+# The chain is the minimal Gloas fixture from crates/testkit/tests/support/chain.rs
+# (slots 0..=16, empty slot 3, two epoch boundaries). It is not a Kurtosis capture.
+export = "replay/minimal-gloas"
+export_sha256 = "81ff2ef9ace143308f6d35badecba9aa027b6f523c18a4cd36092a79c58a01d8"
+config = "replay/config.yaml"

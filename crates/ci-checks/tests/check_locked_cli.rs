@@ -24,7 +24,7 @@ fn repository_workflows_pass() {
     let out = run(&[]);
     assert!(out.status.success(), "{}", describe(&out));
     assert!(
-        stdout(&out).contains("cargo --locked OK (2 workflow files"),
+        stdout(&out).contains("cargo --locked OK (3 workflow files"),
         "{}",
         describe(&out)
     );

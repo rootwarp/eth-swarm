@@ -286,8 +286,23 @@ fresh
 nodocker="$tmp/nodocker"
 mkdir -p "$nodocker"
 for s in kurtosis curl date sleep; do ln -sf "$stubs/$s" "$nodocker/$s"; done
+# GitHub's runner has /usr/bin/docker. A PATH of nodocker plus /usr/bin would
+# find that binary and time out in `docker network inspect` instead of reporting
+# that docker is missing. Link the system commands except docker.
+sysbin="$tmp/sysbin"
+mkdir -p "$sysbin"
+for d in /usr/bin /bin; do
+  [[ -d $d ]] || continue
+  for f in "$d"/*; do
+    [[ -e $f ]] || continue
+    base=$(basename "$f")
+    case $base in docker | docker-*) continue ;; esac
+    [[ -e $sysbin/$base ]] && continue
+    ln -s "$f" "$sysbin/$base"
+  done
+done
 rc=0
-out=$(PATH="$nodocker:/usr/bin:/bin" "${BASH:-bash}" "$copy/testing/kurtosis/run-units.sh" "$ENCLAVE" 2>&1) || rc=$?
+out=$(PATH="$nodocker:$sysbin" "${BASH:-bash}" "$copy/testing/kurtosis/run-units.sh" "$ENCLAVE" 2>&1) || rc=$?
 check "a missing docker exits 2" test "$rc" -eq 2
 check "and says which tool" grep -q "docker not found" <<<"$out"
 

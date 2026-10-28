@@ -208,10 +208,12 @@ deny_case dotted "a dotted bans.skip key" 'bans.skip = [{ crate = "libp2p-swarm@
 deny_case array-table "an [[bans.skip]] array of tables" '[[bans.skip-tree]]
 crate = "libp2p"
 reason = "x"'
+# A newline inside `{ ... }` is not TOML 1.0, which tomllib (Python 3.11/3.12) rejects.
+# The entry is still split across lines, with `crate` not the first key.
 deny_case multiline "an entry split over lines" '[bans]
 skip = [
-  { crate = "syn@2.0.119", reason = "x" }, { reason = "y",
-    crate = "libp2p-swarm@0.47.1" },
+  { crate = "syn@2.0.119", reason = "x" },
+  { reason = "y", crate = "libp2p-swarm@0.47.1" },
 ]'
 deny_case quoted-key "a quoted \"crate\" key" '[bans]
 skip = [{ "crate" = "libp2p-swarm@0.47.1", reason = "x" }]'

@@ -21,7 +21,9 @@ jobs:
   workflows:
     name: workflow hardening
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # The offline script steps (ref-node, the pair runner) take most of five minutes
+    # before the probe units start. Ten leaves room for that step and the pipe guard.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -185,13 +187,17 @@ jobs:
         run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: fuzz/Cargo.lock resolves every shared crate exactly as Cargo.lock does
         run: bash scripts/tests/check-fuzz-lock.test.sh && bash scripts/check-fuzz-lock.sh
+      # install-action exports PROTOC. fuzz/m2a-common.sh refuses that variable: it
+      # would select a protoc other than the one on PATH. The pinned protoc stays
+      # on PATH, so prost-build still finds it after the variable is unset.
       - name: Build every target as the gates run them
-        run: bash fuzz/build-m2a.sh
+        run: unset PROTOC && bash fuzz/build-m2a.sh
       - name: Seed corpus is what fuzz/gen-seeds.sh builds and runs clean under every target
         working-directory: fuzz
         run: cargo test --locked
       - name: Gate runners and gate file checkers (m2a, gate 1, gate 2a and gate 2b)
         run: |
+          unset PROTOC
           bash scripts/tests/run-m2a-gate.test.sh && bash scripts/tests/check-m2a-gate.test.sh
           bash scripts/tests/run-gate1.test.sh && bash scripts/tests/check-gate1.test.sh
           bash scripts/tests/run-gate2a.test.sh && bash scripts/tests/check-gate2a.test.sh
