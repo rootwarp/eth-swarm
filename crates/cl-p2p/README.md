@@ -470,9 +470,9 @@ trusted_by_reference = true
 run_as = "m2a-session"
 
 [deadlines]           # optional; milliseconds, the defaults shown
-ttfb_ms = 5000
-total_ms = 10000      # at most 10000
-per_chunk_ms = 5000
+ttfb_ms = 5000        # at most 5000 (TTFB_TIMEOUT)
+total_ms = 10000      # at most 10000 (RESP_TIMEOUT)
+per_chunk_ms = 5000   # at most 5000
 ```
 
 Exactly one peer: `peer = "<multiaddr>"` or a `[peer]` table with one `multiaddr` key. A list,

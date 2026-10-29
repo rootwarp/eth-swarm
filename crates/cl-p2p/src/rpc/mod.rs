@@ -53,6 +53,20 @@ pub const MAX_CONCURRENT_REQUESTS: usize = 2;
 /// so the first-byte and per-chunk deadlines live in the codec.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// `TTFB_TIMEOUT` (`phase0/p2p-interface.md`): time to the first response byte.
+/// Consensus-specs v1.7.0-beta.4 defines no `TTFB_TIMEOUT`; 5 s is the fixed local \[est\]
+/// ceiling.
+pub const TTFB_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `RESP_TIMEOUT` (`phase0/p2p-interface.md`): the whole response.
+/// Consensus-specs v1.7.0-beta.4 defines no `RESP_TIMEOUT`; 10 s, the same span as
+/// [`REQUEST_TIMEOUT`].
+pub const RESP_TIMEOUT: Duration = REQUEST_TIMEOUT;
+
+/// Per-chunk ceiling. The spec names no separate timeout; the local \[est\] bound is the same
+/// 5 s as [`TTFB_TIMEOUT`] (`phase0/p2p-interface.md`).
+pub const PER_CHUNK_TIMEOUT: Duration = TTFB_TIMEOUT;
+
 /// The context table a swarm of `config`'s network reads and answers with: every fork digest of
 /// its schedule from Fulu on (BPO digests included) to its fork, and the network's caps
 /// ([`NetworkCaps::from_config`]), without which every column sidecar chunk is refused and

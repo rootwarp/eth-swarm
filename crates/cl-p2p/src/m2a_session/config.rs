@@ -28,9 +28,12 @@
 //!   the only place the rule lives: a [`ReferenceApiUrl`] exists only once it passed. The URL
 //!   may still carry a key in its path, so errors never quote it and `Debug` shows
 //!   `scheme://host:port` only.
-//! - **`deadlines`**: milliseconds, each positive; `ttfb_ms` and `per_chunk_ms` at most
-//!   `total_ms`, and `total_ms` at most [`MAX_DEADLINE`], the `request_response` backstop
-//!   ([`crate::rpc::REQUEST_TIMEOUT`]), so the configured total is the one that applies.
+//! - **`deadlines`**: milliseconds, each positive. `ttfb_ms` at most
+//!   [`crate::rpc::TTFB_TIMEOUT`] (5 s), `per_chunk_ms` at most
+//!   [`crate::rpc::PER_CHUNK_TIMEOUT`] (5 s), `total_ms` at most [`MAX_DEADLINE`]
+//!   ([`crate::rpc::RESP_TIMEOUT`], the `request_response` backstop
+//!   [`crate::rpc::REQUEST_TIMEOUT`]), and `ttfb_ms` and `per_chunk_ms` at most `total_ms`,
+//!   so the configured total is the one that applies.
 //! - **`node_key`**: an absolute path to the 32-byte secp256k1 secret; the pre-flight
 //!   ([`super::preflight`]) requires a regular file of mode 0600 owned by the effective UID.
 //! - **`trusted_by_reference = true`** says the reference node lists our peer ID as a trusted
@@ -54,6 +57,7 @@
 
 use super::{KeySource, PinnedPeer, PinnedPeerError};
 use crate::rpc::codec::Deadlines;
+use crate::rpc::{PER_CHUNK_TIMEOUT, RESP_TIMEOUT, TTFB_TIMEOUT};
 use serde::Deserialize;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -65,9 +69,11 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/ethswarm/m2a-session.toml";
 /// The default `run_as`: the session's own OS user.
 pub const DEFAULT_RUN_AS: &str = "m2a-session";
 
-/// The longest deadline a config may set: `request_response`'s own per-exchange timeout, which
-/// would cut a longer one short.
-pub const MAX_DEADLINE: Duration = crate::rpc::REQUEST_TIMEOUT;
+/// The longest `total_ms` a config may set: [`RESP_TIMEOUT`] (`phase0/p2p-interface.md`), which
+/// is also `request_response`'s per-exchange timeout ([`crate::rpc::REQUEST_TIMEOUT`]). A longer
+/// total would be cut short by that backstop. `ttfb_ms` and `per_chunk_ms` are tighter
+/// ([`TTFB_TIMEOUT`], [`PER_CHUNK_TIMEOUT`]).
+pub const MAX_DEADLINE: Duration = RESP_TIMEOUT;
 
 /// The network the session runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -477,24 +483,49 @@ fn is_loopback_host(host: &str) -> bool {
         .is_ok_and(|ip| ip.is_loopback())
 }
 
-fn deadlines(raw: &RawDeadlines) -> Result<Deadlines, ConfigError> {
-    let default = Deadlines::default();
-    let read = |name, ms: Option<u64>, default| match ms.map(Duration::from_millis) {
+/// One configured deadline. Absent keeps `default`. Zero is refused. Above `ceiling` is `why`.
+fn read_deadline(
+    name: &'static str,
+    ms: Option<u64>,
+    default: Duration,
+    ceiling: Duration,
+    why: &'static str,
+) -> Result<Duration, ConfigError> {
+    match ms.map(Duration::from_millis) {
         None => Ok(default),
         Some(Duration::ZERO) => Err(ConfigError::Deadline {
             name,
             why: "must be positive",
         }),
-        Some(d) if d > MAX_DEADLINE => Err(ConfigError::Deadline {
-            name,
-            why: "exceeds the 10 s request_response backstop",
-        }),
+        Some(d) if d > ceiling => Err(ConfigError::Deadline { name, why }),
         Some(d) => Ok(d),
-    };
+    }
+}
+
+fn deadlines(raw: &RawDeadlines) -> Result<Deadlines, ConfigError> {
+    let default = Deadlines::default();
     let deadlines = Deadlines {
-        ttfb: read("ttfb_ms", raw.ttfb_ms, default.ttfb)?,
-        total: read("total_ms", raw.total_ms, default.total)?,
-        per_chunk: read("per_chunk_ms", raw.per_chunk_ms, default.per_chunk)?,
+        ttfb: read_deadline(
+            "ttfb_ms",
+            raw.ttfb_ms,
+            default.ttfb,
+            TTFB_TIMEOUT,
+            "exceeds the 5 s TTFB_TIMEOUT ceiling",
+        )?,
+        total: read_deadline(
+            "total_ms",
+            raw.total_ms,
+            default.total,
+            MAX_DEADLINE,
+            "exceeds the 10 s request_response backstop",
+        )?,
+        per_chunk: read_deadline(
+            "per_chunk_ms",
+            raw.per_chunk_ms,
+            default.per_chunk,
+            PER_CHUNK_TIMEOUT,
+            "exceeds the 5 s per-chunk ceiling",
+        )?,
     };
     let within_total = |name, d: Duration| {
         if d > deadlines.total {
@@ -908,6 +939,93 @@ mod tests {
                 "{table}"
             );
         }
+        // Still inside each field's ceiling, so only the relative bound refuses these.
+        for (table, name) in [
+            (
+                "ttfb_ms = 4000\nper_chunk_ms = 2000\ntotal_ms = 3000",
+                "ttfb_ms",
+            ),
+            (
+                "per_chunk_ms = 4000\nttfb_ms = 2000\ntotal_ms = 3000",
+                "per_chunk_ms",
+            ),
+        ] {
+            let err = parse(&with_deadlines(table)).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Deadline {
+                        name: n,
+                        why: "must not exceed total_ms",
+                    } if n == name
+                ),
+                "{table}: {err}"
+            );
+        }
+    }
+
+    /// `TTFB_TIMEOUT` is 5 s: 5000 ms is the ceiling, 5001 ms is refused.
+    #[test]
+    fn ttfb_ms_is_capped_at_five_seconds() {
+        let ok = parse(&with_deadlines("ttfb_ms = 5000")).unwrap();
+        assert_eq!(
+            ok.deadlines,
+            Deadlines {
+                ttfb: Duration::from_secs(5),
+                ..Deadlines::default()
+            }
+        );
+        let err = parse(&with_deadlines("ttfb_ms = 5001")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "deadlines.ttfb_ms: exceeds the 5 s TTFB_TIMEOUT ceiling"
+        );
+    }
+
+    /// The per-chunk ceiling is 5 s, the same span as `TTFB_TIMEOUT`.
+    #[test]
+    fn per_chunk_ms_is_capped_at_five_seconds() {
+        let ok = parse(&with_deadlines("per_chunk_ms = 5000")).unwrap();
+        assert_eq!(
+            ok.deadlines,
+            Deadlines {
+                per_chunk: Duration::from_secs(5),
+                ..Deadlines::default()
+            }
+        );
+        let err = parse(&with_deadlines("per_chunk_ms = 5001")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "deadlines.per_chunk_ms: exceeds the 5 s per-chunk ceiling"
+        );
+    }
+
+    /// `RESP_TIMEOUT` / the `request_response` backstop is 10 s.
+    #[test]
+    fn total_ms_is_capped_at_ten_seconds() {
+        let ok = parse(&with_deadlines("total_ms = 10000")).unwrap();
+        assert_eq!(
+            ok.deadlines,
+            Deadlines {
+                total: Duration::from_secs(10),
+                ..Deadlines::default()
+            }
+        );
+        let err = parse(&with_deadlines("total_ms = 10001")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "deadlines.total_ms: exceeds the 10 s request_response backstop"
+        );
+    }
+
+    /// Above 5 s and still ≤ `total_ms` and the 10 s backstop: the old cap accepted this.
+    #[test]
+    fn ttfb_above_five_seconds_is_rejected_under_the_total() {
+        let err = parse(&with_deadlines("ttfb_ms = 6000\ntotal_ms = 10000")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "deadlines.ttfb_ms: exceeds the 5 s TTFB_TIMEOUT ceiling"
+        );
     }
 
     /// `run_as` must be a portable user name; the error does not quote it.
