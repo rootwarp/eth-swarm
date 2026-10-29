@@ -150,9 +150,11 @@ protocols offered: any other fails multistream-select negotiation, among them th
   protocols. A Status we cannot
   answer (no Status of ours yet) gets `2: ServerError`. Error chunks carry no context bytes.
 - **Deadlines** (in the codec, `tokio::time::timeout`, both directions): 5 s to the first
-  byte, 5 s per chunk, 10 s in total \[est\]; `request_response`'s own 10 s request timeout is
-  only the backstop. A silent inbound stream is dropped at 5 s and holds one of the 2 stream
-  slots until then.
+  byte, 5 s per chunk, 10 s in total. Those are this client's own policy \[est\], taken from
+  the historical phase0 values; v1.7.0-beta.4 does not define them. Phase0 (<= v1.4) allowed
+  10 s per subsequent response chunk; 10 s here is the total-response ceiling.
+  `request_response`'s own 10 s request timeout is only the backstop. A silent inbound stream
+  is dropped at 5 s and holds one of the 2 stream slots until then.
 - **Rate limits** (`rpc::limits::RateLimiter`, `ControlConfig::limits`): a token bucket per
   peer and protocol, counted in response chunks \[est\]: Status 5 at once then one per 2 s,
   MetaData and Ping 2 then one per 2 s, BeaconBlocksByRange 128 then one per 20 ms, each
@@ -470,9 +472,9 @@ trusted_by_reference = true
 run_as = "m2a-session"
 
 [deadlines]           # optional; milliseconds, the defaults shown
-ttfb_ms = 5000        # at most 5000 (TTFB_TIMEOUT)
-total_ms = 10000      # at most 10000 (RESP_TIMEOUT)
-per_chunk_ms = 5000   # at most 5000
+ttfb_ms = 5000        # at most 5000 (client policy ceiling)
+total_ms = 10000      # at most 10000 (client policy ceiling for the whole response)
+per_chunk_ms = 5000   # at most 5000 (client policy ceiling)
 ```
 
 Exactly one peer: `peer = "<multiaddr>"` or a `[peer]` table with one `multiaddr` key. A list,
