@@ -512,7 +512,7 @@ fn deadlines(raw: &RawDeadlines) -> Result<Deadlines, ConfigError> {
             raw.ttfb_ms,
             default.ttfb,
             TTFB_TIMEOUT,
-            "exceeds the 5 s client policy ceiling",
+            "exceeds the 5 s first-byte ceiling",
         )?,
         total: read_deadline(
             "total_ms",
@@ -980,7 +980,7 @@ mod tests {
         let err = parse(&with_deadlines("ttfb_ms = 5001")).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "deadlines.ttfb_ms: exceeds the 5 s client policy ceiling"
+            "deadlines.ttfb_ms: exceeds the 5 s first-byte ceiling"
         );
     }
 
@@ -1026,7 +1026,7 @@ mod tests {
         let err = parse(&with_deadlines("ttfb_ms = 6000\ntotal_ms = 10000")).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "deadlines.ttfb_ms: exceeds the 5 s client policy ceiling"
+            "deadlines.ttfb_ms: exceeds the 5 s first-byte ceiling"
         );
     }
 
