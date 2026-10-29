@@ -2,13 +2,17 @@
 # every tag -> commit pin and sha256, run the full vector suite, re-run the dependency policy
 # against today's advisory database, and run fuzz gate 1 (seven decoder targets, an hour each),
 # fuzz gate 2a (the three column decoder targets, an hour each) and fuzz gate 2b (the column
-# handler target, an hour). Also runnable by hand via workflow_dispatch.
+# handler target, an hour). Also runnable by hand via workflow_dispatch. A push to
+# fuzz-gate/** runs the same jobs: this file is not on the default branch, so
+# workflow_dispatch returns 404, and a push reads the workflow from the pushed branch.
 name: nightly
 
 on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
+  push:
+    branches: ['fuzz-gate/**']
 
 permissions:
   contents: read

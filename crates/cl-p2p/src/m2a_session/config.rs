@@ -69,10 +69,12 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/ethswarm/m2a-session.toml";
 /// The default `run_as`: the session's own OS user.
 pub const DEFAULT_RUN_AS: &str = "m2a-session";
 
-/// The longest `total_ms` a config may set: [`RESP_TIMEOUT`] (`phase0/p2p-interface.md`), which
-/// is also `request_response`'s per-exchange timeout ([`crate::rpc::REQUEST_TIMEOUT`]). A longer
-/// total would be cut short by that backstop. `ttfb_ms` and `per_chunk_ms` are tighter
-/// ([`TTFB_TIMEOUT`], [`PER_CHUNK_TIMEOUT`]).
+/// The longest `total_ms` a config may set: the client policy ceiling [`RESP_TIMEOUT`] (10 s),
+/// which is also `request_response`'s per-exchange timeout ([`crate::rpc::REQUEST_TIMEOUT`]).
+/// A longer total would be cut short by that backstop. `ttfb_ms` and `per_chunk_ms` use the
+/// tighter client policy ceilings [`TTFB_TIMEOUT`] and [`PER_CHUNK_TIMEOUT`] (5 s). The pinned
+/// spec does not define these timeouts; the numbers are this client's own policy, taken from
+/// the historical phase0 values.
 pub const MAX_DEADLINE: Duration = RESP_TIMEOUT;
 
 /// The network the session runs on.
@@ -510,7 +512,7 @@ fn deadlines(raw: &RawDeadlines) -> Result<Deadlines, ConfigError> {
             raw.ttfb_ms,
             default.ttfb,
             TTFB_TIMEOUT,
-            "exceeds the 5 s TTFB_TIMEOUT ceiling",
+            "exceeds the 5 s client policy ceiling",
         )?,
         total: read_deadline(
             "total_ms",
@@ -978,7 +980,7 @@ mod tests {
         let err = parse(&with_deadlines("ttfb_ms = 5001")).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "deadlines.ttfb_ms: exceeds the 5 s TTFB_TIMEOUT ceiling"
+            "deadlines.ttfb_ms: exceeds the 5 s client policy ceiling"
         );
     }
 
@@ -1024,7 +1026,7 @@ mod tests {
         let err = parse(&with_deadlines("ttfb_ms = 6000\ntotal_ms = 10000")).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "deadlines.ttfb_ms: exceeds the 5 s TTFB_TIMEOUT ceiling"
+            "deadlines.ttfb_ms: exceeds the 5 s client policy ceiling"
         );
     }
 
