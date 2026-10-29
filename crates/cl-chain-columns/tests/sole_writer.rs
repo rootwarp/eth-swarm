@@ -6,10 +6,11 @@
 //! Every test here runs under [`serial`]. MDBX locks its files with open-file-description
 //! (OFD) locks, and a child spawned by one test briefly holds a copy of every fd of this
 //! process (from the fork until exec closes the `O_CLOEXEC` ones), the open file descriptions
-//! and their locks included. A test that closes an env and reopens it while another test spawns
-//! a child can then find its own released lock still held, and fail with
-//! `WriterAlreadyOpen` (seen under full-workspace load). Spawning and reopening never overlap
-//! once the tests are serialized.
+//! and their locks included. [`ColumnWriter::open`] retries `EAGAIN`/`EWOULDBLOCK` for about a
+//! second ([`cl_chain_columns::WRITER_LOCK_ATTEMPTS`] attempts,
+//! [`cl_chain_columns::WRITER_LOCK_RETRY_INTERVAL`] apart) and only then returns
+//! `WriterAlreadyOpen`. A live second writer is still refused, after that budget. Spawning and
+//! reopening never overlap once the tests are serialized.
 
 use std::{
     io::{BufRead, BufReader, Read, Write},
@@ -20,7 +21,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cl_chain_columns::{BlockLink, Column, ColumnReader, ColumnWriter, Error, WriterOptions};
+use cl_chain_columns::{
+    BlockLink, Column, ColumnReader, ColumnWriter, Error, WriterOptions, WRITER_LOCK_ATTEMPTS,
+    WRITER_LOCK_RETRY_INTERVAL,
+};
 
 const CHILD_MODE: &str = "CL_CHAIN_COLUMNS_CHILD_MODE";
 const CHILD_PATH: &str = "CL_CHAIN_COLUMNS_CHILD_PATH";
@@ -181,6 +185,28 @@ fn second_writer_in_the_same_process_is_refused() {
 
     drop(writer);
     ColumnWriter::open(dir.path()).expect("the guard is released when the writer drops");
+}
+
+/// A real writer keeps the env open for the whole second open. The retry budget runs out
+/// before that holder leaves, so the second open is [`Error::WriterAlreadyOpen`] and never
+/// takes the lock.
+#[test]
+fn a_live_writer_is_refused_only_after_the_retry_budget() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let writer = ColumnWriter::open(dir.path()).unwrap();
+    let started = Instant::now();
+    let err = ColumnWriter::open(dir.path()).unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(matches!(err, Error::WriterAlreadyOpen { .. }), "{err:?}");
+    let budget = WRITER_LOCK_RETRY_INTERVAL * (WRITER_LOCK_ATTEMPTS - 1);
+    assert!(
+        elapsed >= budget,
+        "second open returned in {elapsed:?}, before the {budget:?} retry budget"
+    );
+    writer
+        .set_cgc(4)
+        .expect("the first writer still holds the env; the second open did not take it");
 }
 
 #[test]
