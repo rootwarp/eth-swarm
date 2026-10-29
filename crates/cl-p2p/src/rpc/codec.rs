@@ -16,11 +16,11 @@
 //! defines no `TTFB_TIMEOUT` or `RESP_TIMEOUT`; [`Deadlines`] holds them and [`read_response`]
 //! and [`read_request`] run them with `tokio::time::timeout`:
 //!
-//! - `ttfb` (5 s): from the start of the read to the first byte (for an empty MetaData
-//!   request, to the end of the stream);
-//! - `per_chunk` (5 s): for each chunk, from its first read to its last byte, and for the end
-//!   of the stream after the last chunk;
-//! - `total` (10 s): for the whole response or request.
+//! - `ttfb` ([`super::TTFB_TIMEOUT`], 5 s): from the start of the read to the first byte (for an
+//!   empty MetaData request, to the end of the stream);
+//! - `per_chunk` ([`super::PER_CHUNK_TIMEOUT`], 5 s): for each chunk, from its first read to its
+//!   last byte, and for the end of the stream after the last chunk;
+//! - `total` ([`super::RESP_TIMEOUT`], 10 s): for the whole response or request.
 //!
 //! An inbound stream that stays silent therefore fails at 5 s and is dropped; until then it
 //! holds one of the behaviour's `max_concurrent_streams` slots.
@@ -95,12 +95,12 @@ pub struct Deadlines {
 }
 
 impl Default for Deadlines {
-    /// 5 s first byte, 10 s total, 5 s per chunk \[est\].
+    /// [`super::TTFB_TIMEOUT`], [`super::RESP_TIMEOUT`] and [`super::PER_CHUNK_TIMEOUT`] \[est\].
     fn default() -> Self {
         Self {
-            ttfb: Duration::from_secs(5),
-            total: Duration::from_secs(10),
-            per_chunk: Duration::from_secs(5),
+            ttfb: super::TTFB_TIMEOUT,
+            total: super::RESP_TIMEOUT,
+            per_chunk: super::PER_CHUNK_TIMEOUT,
         }
     }
 }
