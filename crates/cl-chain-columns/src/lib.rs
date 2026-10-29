@@ -37,7 +37,10 @@
 //!   never decreases ([`Error::CgcDecrease`]), the slot it was set at, the MetaData
 //!   `seq_number` and the count advertised to peers, written in one transaction.
 //! - **Single writer.** [`ColumnWriter::open`] holds an OS-level writer guard, so there is at
-//!   most one writer per env across all processes. [`ColumnReader`] opens the env read-only and
+//!   most one writer per env across all processes. `EAGAIN`/`EWOULDBLOCK` from that lock is
+//!   retried for about a second ([`WRITER_LOCK_ATTEMPTS`], [`WRITER_LOCK_RETRY_INTERVAL`]); a
+//!   holder that outlasts the budget fails with [`Error::WriterAlreadyOpen`]. `MDBX_BUSY` is
+//!   [`Error::EnvBusy`] and is not retried. [`ColumnReader`] opens the env read-only and
 //!   has no write methods:
 //!
 //! ```compile_fail
@@ -57,7 +60,10 @@ mod reader;
 mod sched;
 mod writer;
 
-pub use env::{WriterOptions, DEFAULT_MAX_SIZE, MAX_SIZE_ALIGN, MIN_MAX_SIZE};
+pub use env::{
+    WriterOptions, DEFAULT_MAX_SIZE, MAX_SIZE_ALIGN, MIN_MAX_SIZE, WRITER_LOCK_ATTEMPTS,
+    WRITER_LOCK_RETRY_INTERVAL,
+};
 pub use error::{Error, Result};
 pub use keys::{BlockLink, BlockRoot};
 pub use reader::{

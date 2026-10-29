@@ -3,6 +3,7 @@
 //! another opens it `Durable`, so the sync mode is fixed here and not configurable.
 
 use std::path::Path;
+use std::time::Duration;
 
 use libmdbx::{
     Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, SyncMode, TableFlags, WriteFlags,
@@ -141,36 +142,198 @@ pub(crate) fn open_ro(path: &Path) -> Result<Env> {
     Ok(Env::open_with_options(path, options(Mode::ReadOnly))?)
 }
 
-/// Takes the writer guard: a tiny env next to the data opened `MDBX_EXCLUSIVE`. While any process
-/// (this one included) has it open, MDBX refuses another open with `MDBX_BUSY` or the file-lock
-/// errno (`EWOULDBLOCK`). The lock is an OS file lock, released when the holder exits, so a
-/// crashed writer never leaves a stale lock behind.
+/// How many times [`lock_writer`] tries the exclusive guard before
+/// [`Error::WriterAlreadyOpen`].
+pub const WRITER_LOCK_ATTEMPTS: u32 = 50;
+
+/// Pause between those attempts. Fifty tries at this interval is about one second.
+pub const WRITER_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
+/// How [`lock_writer`] waits. Tests pass [`Duration::ZERO`] so a full budget does not sleep.
+pub(crate) struct WriterLockPace {
+    /// Tries, including the first. At least 1.
+    pub attempts: u32,
+    /// Sleep after an `EAGAIN` that will be tried again. Zero skips the sleep.
+    pub interval: Duration,
+}
+
+impl WriterLockPace {
+    pub(crate) const fn production() -> Self {
+        Self {
+            attempts: WRITER_LOCK_ATTEMPTS,
+            interval: WRITER_LOCK_RETRY_INTERVAL,
+        }
+    }
+}
+
+/// Takes the writer guard: a tiny env next to the data opened `MDBX_EXCLUSIVE`.
+///
+/// A live holder makes that open return `EAGAIN`/`EWOULDBLOCK` (`libmdbx::Error::Other(11)`
+/// on Linux): the OFD lock. The same errno comes back for a moment after the holder is reaped.
+/// A `/proc` reader (`maps`, `smaps`, `environ`) can keep the dead child's address space alive,
+/// and its mmaps pin the open-file description, so the lock lingers with no fd holder. Only
+/// that errno is retried, [`WRITER_LOCK_ATTEMPTS`] times, [`WRITER_LOCK_RETRY_INTERVAL`] apart.
+/// `MDBX_BUSY` is [`Error::EnvBusy`] on that attempt. Any other error is returned as-is, also
+/// without a retry.
 pub(crate) fn lock_writer(path: &Path) -> Result<Env> {
     std::fs::create_dir_all(path)?;
+    let guard = path.join(WRITER_GUARD);
+    retry_writer_lock(path, WriterLockPace::production(), || {
+        open_exclusive(&guard)
+    })
+}
+
+fn open_exclusive(guard: &Path) -> std::result::Result<Env, libmdbx::Error> {
     Env::open_with_options(
-        path.join(WRITER_GUARD),
+        guard,
         DatabaseOptions {
             no_sub_dir: true,
             exclusive: true,
             ..DatabaseOptions::default()
         },
     )
-    .map_err(|e| busy_means_writer_open(e, path))
 }
 
-fn busy_means_writer_open(e: libmdbx::Error, path: &Path) -> Error {
-    let held = match e {
-        libmdbx::Error::Busy => true,
+/// Runs `attempt` until the exclusive lock is held, the `EAGAIN` budget is spent, or some
+/// other error comes back. `path` is the column env directory, named in the error.
+pub(crate) fn retry_writer_lock<T, F>(
+    path: &Path,
+    pace: WriterLockPace,
+    mut attempt: F,
+) -> Result<T>
+where
+    F: FnMut() -> std::result::Result<T, libmdbx::Error>,
+{
+    let mut n = 0u32;
+    loop {
+        n += 1;
+        match attempt() {
+            Ok(guard) => return Ok(guard),
+            Err(err) if is_eagain(&err) && n < pace.attempts => {
+                tracing::warn!(
+                    attempt = n,
+                    attempts = pace.attempts,
+                    path = %path.display(),
+                    "exclusive writer lock returned EAGAIN; retrying"
+                );
+                if !pace.interval.is_zero() {
+                    std::thread::sleep(pace.interval);
+                }
+            }
+            Err(err) if is_eagain(&err) => {
+                return Err(Error::WriterAlreadyOpen {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(libmdbx::Error::Busy) => {
+                return Err(Error::EnvBusy {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+/// `EAGAIN` and `EWOULDBLOCK`. On Linux they are the same errno (`11`); both are
+/// [`std::io::ErrorKind::WouldBlock`].
+fn is_eagain(err: &libmdbx::Error) -> bool {
+    match err {
         libmdbx::Error::Other(code) => {
-            std::io::Error::from_raw_os_error(code).kind() == std::io::ErrorKind::WouldBlock
+            std::io::Error::from_raw_os_error(*code).kind() == std::io::ErrorKind::WouldBlock
         }
         _ => false,
-    };
-    if held {
-        Error::WriterAlreadyOpen {
-            path: path.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `EAGAIN` on Linux. `EWOULDBLOCK` is the same value, so one errno covers both names.
+    const EAGAIN: i32 = 11;
+
+    fn pace() -> WriterLockPace {
+        WriterLockPace {
+            attempts: WRITER_LOCK_ATTEMPTS,
+            interval: Duration::ZERO,
         }
-    } else {
-        Error::Mdbx(e)
+    }
+
+    #[test]
+    fn eagain_then_success_counts_every_attempt() {
+        let mut calls = 0;
+        let got = retry_writer_lock(Path::new("/env"), pace(), || {
+            calls += 1;
+            if calls <= 3 {
+                Err(libmdbx::Error::Other(EAGAIN))
+            } else {
+                Ok(calls)
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 4);
+        assert_eq!(got, 4);
+    }
+
+    #[test]
+    fn eagain_until_the_cap_is_writer_already_open_after_exactly_50() {
+        let mut calls = 0;
+        let err = retry_writer_lock(Path::new("/env"), pace(), || {
+            calls += 1;
+            Err::<(), _>(libmdbx::Error::Other(EAGAIN))
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::WriterAlreadyOpen { ref path } if path == Path::new("/env")),
+            "{err}"
+        );
+        assert_eq!(calls, WRITER_LOCK_ATTEMPTS);
+    }
+
+    #[test]
+    fn mdbx_busy_is_env_busy_on_the_first_attempt() {
+        let mut calls = 0;
+        let err = retry_writer_lock(Path::new("/env"), pace(), || {
+            calls += 1;
+            Err::<(), _>(libmdbx::Error::Busy)
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::EnvBusy { ref path } if path == Path::new("/env")),
+            "{err}"
+        );
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn eagain_then_busy_stops_without_finishing_the_budget() {
+        let mut calls = 0;
+        let err = retry_writer_lock(Path::new("/env"), pace(), || {
+            calls += 1;
+            if calls <= 2 {
+                Err(libmdbx::Error::Other(EAGAIN))
+            } else {
+                Err::<(), _>(libmdbx::Error::Busy)
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::EnvBusy { .. }), "{err}");
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn any_other_lock_error_fails_on_the_first_attempt() {
+        let mut calls = 0;
+        let err = retry_writer_lock(Path::new("/env"), pace(), || {
+            calls += 1;
+            Err::<(), _>(libmdbx::Error::Other(1))
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::Mdbx(libmdbx::Error::Other(1))),
+            "{err:?}"
+        );
+        assert_eq!(calls, 1);
     }
 }

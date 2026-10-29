@@ -189,8 +189,11 @@ impl Hooks {
 
 /// The only handle that writes the column env. cl-chain owns it.
 ///
-/// [`ColumnWriter::open`] takes the writer guard first, so a second writer for the same path, in
-/// this process or any other, fails with [`Error::WriterAlreadyOpen`]. The type is neither
+/// [`ColumnWriter::open`] takes the writer guard first. `EAGAIN`/`EWOULDBLOCK` from that lock
+/// is retried for about a second ([`crate::WRITER_LOCK_ATTEMPTS`] attempts,
+/// [`crate::WRITER_LOCK_RETRY_INTERVAL`] apart). A lock still held after that budget, including
+/// a live writer in this process or another, fails with [`Error::WriterAlreadyOpen`].
+/// `MDBX_BUSY` is [`Error::EnvBusy`] at once and is not retried. The type is neither
 /// `Clone` nor constructible any other way, and readers ([`ColumnReader`]) have no write
 /// methods. Methods take `&self`, so cl-chain shares one writer (e.g. in an `Arc`) between block
 /// import and the low-priority column task.

@@ -13,9 +13,19 @@ pub enum Error {
     MapFull,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    /// Another [`ColumnWriter`](crate::ColumnWriter), in this process or another, holds the env.
+    /// The exclusive writer lock stayed `EAGAIN`/`EWOULDBLOCK` through the retry budget.
+    ///
+    /// A live [`ColumnWriter`](crate::ColumnWriter) holds the lock that way for as long as it
+    /// is open. The same errno also shows up for a moment after a writer is reaped: a `/proc`
+    /// reader can keep the dead child's address space alive, and its mmaps pin the open-file
+    /// description, so the OFD lock lingers with no fd holder. That case is retried; this
+    /// error is what remains when the budget runs out.
     #[error("another column writer already holds {}", path.display())]
     WriterAlreadyOpen { path: PathBuf },
+    /// `MDBX_BUSY` from the exclusive writer lock. Not the transient `EAGAIN` left after a
+    /// writer is reaped, so it is not retried.
+    #[error("column writer lock at {} returned MDBX_BUSY", path.display())]
+    EnvBusy { path: PathBuf },
     /// [`WriterOptions::max_size`](crate::WriterOptions) is below
     /// [`MIN_MAX_SIZE`](crate::MIN_MAX_SIZE), not a multiple of
     /// [`MAX_SIZE_ALIGN`](crate::MAX_SIZE_ALIGN), or over `isize::MAX`.
