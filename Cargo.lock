@@ -1111,9 +1111,26 @@ dependencies = [
 name = "cl-engine"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "data-encoding",
  "ethswarm-proto",
+ "hmac 0.13.0",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "ipc",
+ "rustix",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-stream",
  "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

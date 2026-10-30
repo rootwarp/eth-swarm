@@ -3000,8 +3000,8 @@ compose_env() { # compose_env <file> <trusted peers> [example]: an .env example 
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
   echo "# skip - compose.yaml checks: docker compose is not installed"
 else
-  # Compose stops at the first missing variable. In compose.yaml that is RETH_UID
-  # (the service user), so the example file's error is the ids one, checked next.
+  # Compose stops at the first missing variable it interpolates. That is one of the
+  # service users (RETH_UID or LIGHTHOUSE_UID); which one depends on the compose version.
   # With the ids filled in, the empty CHECKPOINT_SYNC_URL is what remains.
   cp "$ref/.env.example" "$tmp/compose-no-checkpoint.env"
   for key in RETH_UID RETH_GID; do set_env "$tmp/compose-no-checkpoint.env" "$key" 990; done
@@ -3010,7 +3010,7 @@ else
     'CHECKPOINT_SYNC_URL is missing a value' \
     docker compose --env-file "$tmp/compose-no-checkpoint.env" -f "$ref/compose.yaml" config --quiet
   check_out 1 "compose: .env.example alone is refused until setup.sh wrote the ids" \
-    'RETH_UID is missing a value: run setup.sh' \
+    '(RETH_UID|LIGHTHOUSE_UID) is missing a value: run setup.sh' \
     docker compose --env-file "$ref/.env.example" -f "$ref/compose.yaml" config --quiet
   compose_env "$tmp/compose.env" ""
   check 0 "compose: config validates with the required values set" \
