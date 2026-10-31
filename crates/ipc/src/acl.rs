@@ -250,6 +250,12 @@ impl MethodAcl {
         self.methods.keys().map(String::as_str)
     }
 
+    /// Every UID that may call at least one method.
+    #[must_use]
+    pub fn callers(&self) -> BTreeSet<u32> {
+        self.methods.values().flatten().copied().collect()
+    }
+
     /// Whether `uid` may call `method`.
     #[must_use]
     pub fn allows(&self, method: &str, uid: u32) -> bool {
@@ -449,6 +455,15 @@ mod tests {
             .to_status()
             .message()
             .contains("no peer credentials"));
+    }
+
+    #[test]
+    fn callers_are_every_listed_uid() {
+        let text = format!(
+            "[callers]\ncl-chain = 990\ncl-api = 993\ncl-unused = 994\n[methods]\n\"{NEW_PAYLOAD}\" = [\"cl-chain\"]"
+        );
+        let acl = parse("cl-engine", &text).unwrap();
+        assert_eq!(acl.callers(), BTreeSet::from([990]));
     }
 
     #[test]
