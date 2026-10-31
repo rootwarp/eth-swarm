@@ -28,7 +28,10 @@ shape as the node key. The secret is zeroized on drop. `Debug` and `Display` pri
 `src/capabilities.rs`. Before the first call, and again after every reconnect,
 `engine_exchangeCapabilities` must list `engine_newPayloadV5` and
 `engine_forkchoiceUpdatedV4`. An older method is not a substitute. The spec makes the call
-optional; this crate does not.
+optional; this crate does not. The exchange offers every method the server routes (Fulu and
+Gloas versions of newPayload, forkchoiceUpdated, getPayload and getBlobs), and every other
+call is checked against the list the EL returned: a method it did not list is refused
+(`MissingCaps`) before anything is sent.
 
 ## Client
 
@@ -42,9 +45,11 @@ bounded by 1 s. Each call has a timeout:
 
 | method | wait |
 | --- | --- |
-| `engine_newPayload` | 8 s (`paris.md`; the proto comment says 6 s) |
+| `engine_newPayloadV5` | 6 s (`amsterdam.md`) |
+| `engine_newPayloadV4` | 8 s (`prague.md`) |
 | `engine_forkchoiceUpdated` | 8 s |
-| `engine_getPayload`, `engine_getBlobs`, `engine_exchangeCapabilities` | 1 s |
+| `engine_getBlobs`, `engine_exchangeCapabilities` | 1 s |
+| `engine_getPayload` | 1 s (ours: no spec timeout since execution-apis #958) |
 
 A timeout is an error the caller sees, never `VALID`. JSON-RPC `id`s must match.
 
@@ -60,8 +65,14 @@ what to resubmit. The connection is dropped; the next call reconnects (generatio
 the capability check) inside its own deadline, so one failure does not hold the queue.
 
 The queue is bounded: a caller waits for room among 256 queued calls (backpressure), and at
-most 256 calls may wait for an earlier `seq` before new ones fail with `Overloaded`. No lock
-is held across an `.await`.
+most 256 calls may wait for an earlier `seq` before new ones fail with `Overloaded`. A buffer
+full of released `seq`s behind a gap skips the gap (nothing else would). No lock is held
+across an `.await`.
+
+A job is claimed right before it goes on the wire, once the connection can take it: a job
+whose deadline passed or whose caller went away meanwhile is never sent. One call can take up
+to twice its timeout: queued (and waiting for the connection) up to the timeout, then the
+EL's full response timeout from the send.
 
 Reconnect dials immediately, then with exponential backoff from 200 ms capped at 5 s (the
 spec does not set this), up to 5 attempts. A missing capability does not install the new
@@ -81,13 +92,22 @@ bound by `ipc::uds::bind`. It is a trust boundary:
 - `Limits`: a request message over 32 MiB + 64 KiB is refused from its gRPC length prefix
   (`OUT_OF_RANGE`) before a buffer is allocated; responses are capped at 48 MiB + 64 KiB. Each
   request has a 10 s deadline (body read included), a connection silent for 30 s is closed,
-  at most 4 connections and 16 in-flight requests per connection.
-- A caller's `timeout_ms` may shorten the spec wait, never lengthen it. An EL error, timeout or
-  a `forkchoiceUpdated` result without `payloadStatus` is an `EngineError`, never `VALID`.
+  one whose first request has not arrived 10 s after the accept is closed however steadily it
+  sends, at most 4 connections and 16 in-flight requests per connection.
+- Requests the EL could not take as specified are refused (`INVALID_ARGUMENT`) before the
+  queue, and their `seq` is released: a `payload_id` that is not 8 bytes, a versioned hash that
+  is not 32 bytes, more than 128 of them, an `indices_bitarray` that is not 16 bytes for
+  getBlobsV4 (or set at all for V2/V3), a `custody_columns` that is not 16 bytes or empty for
+  forkchoiceUpdatedV4 (or set at all for V3).
+- A caller's `timeout_ms` may raise the spec wait (up to the 10 s request deadline), never
+  shorten it (`common.md`: the CL MUST wait the method's timeout). An EL error, timeout, a
+  `forkchoiceUpdated` result without `payloadStatus`, or a `latestValidHash`/`payloadId` that is
+  not `null` or exactly 32/8 bytes is an `EngineError`, never `VALID`.
 - Errors and logs carry codes, UIDs and fixed text, never the secret or a payload.
 
 `tests/server.rs` serves the mock EL over a socket: a wrong-UID peer, unknown and near-miss
-methods, an oversize frame, stalled writers and the connection cap.
+methods, an oversize frame, an oversize length prefix alone, a body that never finishes,
+stalled and trickling writers, malformed getBlobs/getPayload requests and the connection cap.
 
 Tests use the hyper mock in `tests/common`, bound to `127.0.0.1:0`. Nothing is dialed that the
 test did not start.

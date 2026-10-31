@@ -47,9 +47,14 @@
 //!    owned by the service user that refuses a `connect()` probe is stale and unlinked. A live
 //!    socket fails with `AddrInUse`; a symlink, file, directory, or a socket of another user is
 //!    left in place and fails startup.
-//! 6. The socket is bound, then its group and mode (`0660`) are set explicitly and checked
-//!    before the caller is told the service is ready. The directory is writable only by the
-//!    service user, so nobody else can swap the socket afterwards.
+//! 6. The socket is bound in a fresh private directory inside the service directory
+//!    (`.<svc>.bind.<random>`, mode `0700`, this process's user), where nobody else can
+//!    connect to it. Its owner, group and mode (`0660`) are set explicitly and checked there,
+//!    whatever the umask gave it, and only then is it linked to `<svc>.sock` (`linkat`, which
+//!    never replaces a name) and the private directory removed. So the advertised path never
+//!    names a socket that is not finished. A private directory a killed start left behind is
+//!    never looked at. The service directory is writable only by the service user, so nobody
+//!    else can swap the socket afterwards.
 //!
 //! The returned [`SocketGuard`] unlinks the socket when dropped, but only while the path still
 //! names the socket this process bound (same device and inode).
@@ -321,7 +326,13 @@ fn owner_change(m: &Meta, owner: Ownership) -> Option<(Option<Uid>, Gid)> {
 thread_local! {
     /// The owner changes this thread asked for.
     static CHOWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Called with the path `bind(2)` used, right after it returned.
+    static AFTER_BIND: std::cell::RefCell<Option<AfterBind>> =
+        const { std::cell::RefCell::new(None) };
 }
+
+#[cfg(test)]
+type AfterBind = Box<dyn FnMut(&Path)>;
 
 /// `lstat` of `name` in `dir`; `None` if nothing is there.
 fn lstat_at(dir: impl AsFd, name: &str, path: &Path) -> Result<Option<Meta>, BindError> {
@@ -910,8 +921,8 @@ impl BoundSocket {
 }
 
 /// Creates or verifies `dir`'s directory, takes the instance lock, removes a stale socket of
-/// the service user, binds the socket and sets its owner, group and mode (`0660`). See the
-/// module docs for what makes it fail.
+/// the service user, binds the socket in a private directory, sets its owner, group and mode
+/// (`0660`) there and links it into place. See the module docs for what makes it fail.
 pub fn bind(dir: &SocketDir, owner: Ownership) -> Result<BoundSocket, BindError> {
     for id in [owner.uid, owner.gid] {
         if id == u32::MAX {
@@ -926,19 +937,44 @@ pub fn bind(dir: &SocketDir, owner: Ownership) -> Result<BoundSocket, BindError>
     clear_stale(&dir_fd, dir, owner)?;
 
     let (name, path) = (dir.socket_name(), dir.socket_path());
-    let listener =
-        StdUnixListener::bind(through_dir(&dir_fd, &name, &path)?).map_err(|source| {
-            BindError::Io {
-                op: "bind",
-                path: path.clone(),
-                source,
-            }
-        })?;
-    let bound = lstat_at(&dir_fd, &name, &path)?.ok_or_else(|| BindError::Insecure {
-        path: path.clone(),
-        reason: "socket vanished right after bind".into(),
+    // Bound where only we can reach it, finished there, then published.
+    let private = PrivateDir::create(&dir_fd, dir)?;
+    let in_private = private.path.join(BOUND_NAME);
+    let bind_path = through_dir(&private.fd, BOUND_NAME, &in_private)?;
+    let listener = StdUnixListener::bind(&bind_path).map_err(|source| BindError::Io {
+        op: "bind",
+        path: in_private.clone(),
+        source,
     })?;
-    // From here on the guard removes the socket on every error path.
+    #[cfg(test)]
+    AFTER_BIND.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(&bind_path);
+        }
+    });
+    let bound =
+        lstat_at(&private.fd, BOUND_NAME, &in_private)?.ok_or_else(|| BindError::Insecure {
+            path: in_private.clone(),
+            reason: "socket vanished right after bind".into(),
+        })?;
+    set_socket_owner_and_mode(&private.fd, BOUND_NAME, &in_private, &bound, owner)?;
+    // `linkat` never replaces a name: the stale socket is gone and the lock is ours, so the
+    // advertised name is free unless something is wrong.
+    rustix::fs::linkat(
+        &private.fd,
+        BOUND_NAME,
+        &dir_fd,
+        name.as_str(),
+        AtFlags::empty(),
+    )
+    .map_err(|e| match e {
+        Errno::EXIST => BindError::InUse {
+            path: path.clone(),
+            reason: "the socket path was taken while the socket was set up",
+        },
+        e => io_err("link", &path)(e),
+    })?;
+    // From here on the guard removes the published socket on every error path.
     let guard = SocketGuard {
         dir_fd,
         name,
@@ -947,8 +983,81 @@ pub fn bind(dir: &SocketDir, owner: Ownership) -> Result<BoundSocket, BindError>
         unlinked: false,
         _lock: lock_fd,
     };
-    set_socket_owner_and_mode(&guard, owner)?;
+    check_socket(&guard.dir_fd, &guard.name, &guard.path, &guard.bound, owner)?;
+    drop(private);
     Ok(BoundSocket { listener, guard })
+}
+
+/// The socket's name inside its [`PrivateDir`]. Short: off Linux, `bind(2)` takes the whole
+/// path, which has to fit a `sun_path`.
+const BOUND_NAME: &str = "s";
+
+/// A directory only this process's user can enter (`0700`), made in the service directory
+/// for one bind and removed, with the socket's name in it, when dropped. A socket bound there
+/// can be connected to by nobody else until it is linked to the advertised path, so it never
+/// sits at that path with the mode the umask gave it. A directory a killed start left behind is
+/// never looked at, so it blocks nothing.
+struct PrivateDir {
+    parent: OwnedFd,
+    name: String,
+    path: PathBuf,
+    fd: OwnedFd,
+}
+
+const PRIVATE_DIR_MODE: u32 = 0o700;
+
+impl PrivateDir {
+    fn create(parent: &OwnedFd, dir: &SocketDir) -> Result<Self, BindError> {
+        const ATTEMPTS: usize = 8;
+        let parent = parent.try_clone().map_err(|source| BindError::Io {
+            op: "dup",
+            path: dir.dir(),
+            source,
+        })?;
+        for _ in 0..ATTEMPTS {
+            let name = format!(".{}.bind.{:016x}", dir.service(), random_suffix());
+            let path = dir.dir().join(&name);
+            match rustix::fs::mkdirat(&parent, name.as_str(), mode(PRIVATE_DIR_MODE)) {
+                Ok(()) => {}
+                Err(Errno::EXIST) => continue,
+                Err(e) => return Err(io_err("mkdir", &path)(e)),
+            }
+            let fd = match open_dir(&parent, Path::new(&name), &path) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    let _ = rustix::fs::unlinkat(&parent, name.as_str(), AtFlags::REMOVEDIR);
+                    return Err(e);
+                }
+            };
+            let private = Self {
+                parent,
+                name,
+                path,
+                fd,
+            };
+            // `0700` exactly, whatever the umask: it only ever narrows what `mkdirat` asks for.
+            rustix::fs::fchmod(&private.fd, mode(PRIVATE_DIR_MODE))
+                .map_err(io_err("chmod", &private.path))?;
+            let m = fstat(&private.fd, &private.path)?;
+            if m.uid != peercred::effective_uid() || m.mode != mode(PRIVATE_DIR_MODE) {
+                return Err(BindError::Insecure {
+                    path: private.path.clone(),
+                    reason: format!("private bind directory is {}", describe(&m)),
+                });
+            }
+            return Ok(private);
+        }
+        Err(io_err("mkdir", &dir.dir())(Errno::EXIST))
+    }
+}
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        let _ = rustix::fs::unlinkat(&self.fd, BOUND_NAME, AtFlags::empty());
+        if let Err(e) = rustix::fs::unlinkat(&self.parent, self.name.as_str(), AtFlags::REMOVEDIR) {
+            tracing::warn!(dir = %self.path.display(), error = %e, "cannot remove the private bind directory");
+        }
+    }
 }
 
 /// Clients connect to the advertised path, not the `/proc` one `bind(2)` goes through, so the
@@ -981,42 +1090,46 @@ fn same_dir(path: &Path, dir_fd: &OwnedFd) -> Result<(), BindError> {
     }
 }
 
-fn set_socket_owner_and_mode(guard: &SocketGuard, owner: Ownership) -> Result<(), BindError> {
-    let path = &guard.path;
+/// Gives the socket `name` in `dir_fd` (the [`PrivateDir`]) its owner, group and mode
+/// (`0660`), and checks them.
+fn set_socket_owner_and_mode(
+    dir_fd: &OwnedFd,
+    name: &str,
+    path: &Path,
+    bound: &Meta,
+    owner: Ownership,
+) -> Result<(), BindError> {
     // The owner changes only where it differs (`owner_change`), and is checked below.
-    let bound = lstat_at(&guard.dir_fd, &guard.name, path)?;
-    if let Some((uid, gid)) = bound.as_ref().and_then(|m| owner_change(m, owner)) {
-        rustix::fs::chownat(
-            &guard.dir_fd,
-            guard.name.as_str(),
-            uid,
-            Some(gid),
-            AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .map_err(io_err("chown", path))?;
+    if let Some((uid, gid)) = owner_change(bound, owner) {
+        rustix::fs::chownat(dir_fd, name, uid, Some(gid), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(io_err("chown", path))?;
     }
-    // Linux has no fchmodat(AT_SYMLINK_NOFOLLOW) before 6.6; the directory is writable only by
-    // the service user, so the name cannot have been replaced by a symlink since the bind.
-    rustix::fs::chmodat(
-        &guard.dir_fd,
-        guard.name.as_str(),
-        mode(SOCKET_MODE),
-        AtFlags::empty(),
-    )
-    .map_err(io_err("chmod", path))?;
-    let m = lstat_at(&guard.dir_fd, &guard.name, path)?;
+    // Linux has no fchmodat(AT_SYMLINK_NOFOLLOW) before 6.6; the directory is ours alone
+    // (`0700`), so the name cannot have been replaced by a symlink since the bind.
+    rustix::fs::chmodat(dir_fd, name, mode(SOCKET_MODE), AtFlags::empty())
+        .map_err(io_err("chmod", path))?;
+    check_socket(dir_fd, name, path, bound, owner)
+}
+
+/// Fails unless `name` in `dir_fd` is the socket `bound`, with `owner`'s uid and gid and mode
+/// `0660`.
+fn check_socket(
+    dir_fd: &OwnedFd,
+    name: &str,
+    path: &Path,
+    bound: &Meta,
+    owner: Ownership,
+) -> Result<(), BindError> {
+    let m = lstat_at(dir_fd, name, path)?;
     let want = mode(SOCKET_MODE);
     match m {
         Some(m)
-            if m.same_file(&guard.bound)
-                && m.uid == owner.uid
-                && m.gid == owner.gid
-                && m.mode == want =>
+            if m.same_file(bound) && m.uid == owner.uid && m.gid == owner.gid && m.mode == want =>
         {
             Ok(())
         }
         other => Err(BindError::Insecure {
-            path: path.clone(),
+            path: path.to_owned(),
             reason: format!(
                 "socket must be uid {} gid {} mode {:o}, found {:?}",
                 owner.uid,
@@ -1198,6 +1311,7 @@ pub fn peer_refusal<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::os::unix::net::UnixStream as StdUnixStream;
 
     #[test]
     fn socket_dir_names_the_paths() {
@@ -1323,6 +1437,46 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// Nobody can reach the socket before its owner, group and mode are final: `bind(2)`
+    /// creates it in a private `0700` directory, and only the finished socket is linked to the
+    /// advertised path. A chmod after a bind at the advertised path would leave it there for a
+    /// moment with whatever mode the umask gave it.
+    #[test]
+    fn the_socket_is_published_only_once_its_mode_is_final() {
+        use std::os::unix::fs::FileTypeExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let dir = SocketDir::under(&root, "svc").unwrap();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (advertised, record) = (dir.socket_path(), std::rc::Rc::clone(&seen));
+        AFTER_BIND.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |bound_at: &Path| {
+                let reachable = std::fs::symlink_metadata(&advertised).is_ok();
+                let private = std::fs::metadata(bound_at.parent().unwrap())
+                    .map(|m| m.mode() & 0o7777)
+                    .ok();
+                *record.borrow_mut() = Some((reachable, private));
+            }));
+        });
+        let bound = bind(&dir, Ownership::current());
+        AFTER_BIND.with(|hook| hook.borrow_mut().take());
+        let bound = bound.unwrap();
+        let (reachable, private) = seen.borrow_mut().take().expect("bind(2) ran");
+        assert!(
+            !reachable,
+            "the socket was reachable at its advertised path before its mode was set"
+        );
+        assert_eq!(private, Some(0o700), "bound outside a private directory");
+        let m = std::fs::symlink_metadata(dir.socket_path()).unwrap();
+        assert!(m.file_type().is_socket());
+        assert_eq!(m.mode() & 0o7777, SOCKET_MODE);
+        // Nothing is left behind next to the lock and the socket, and the socket answers at
+        // the advertised path.
+        assert_eq!(entries(&dir), ["svc.lock", "svc.sock"]);
+        drop(StdUnixStream::connect(dir.socket_path()).unwrap());
+        drop(bound);
     }
 
     /// A bind as our own user and group changes no owner: the new directory, lock and socket

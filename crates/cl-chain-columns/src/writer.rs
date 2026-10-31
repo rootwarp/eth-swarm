@@ -221,11 +221,17 @@ pub struct ColumnWriter {
 impl ColumnWriter {
     /// Opens or creates the column env at `path` with default [`WriterOptions`] and creates
     /// every table on first open.
+    ///
+    /// Blocking: an `EAGAIN` on the writer guard or the data env is retried for about a second
+    /// ([`WRITER_LOCK_ATTEMPTS`](crate::WRITER_LOCK_ATTEMPTS) tries,
+    /// [`WRITER_LOCK_RETRY_INTERVAL`](crate::WRITER_LOCK_RETRY_INTERVAL) apart), sleeping the
+    /// calling thread. Call it at startup, or from async code through
+    /// `tokio::task::spawn_blocking`, never directly on a runtime worker.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with(path, WriterOptions::default())
     }
 
-    /// [`ColumnWriter::open`] with explicit options.
+    /// [`ColumnWriter::open`] with explicit options. Blocks the same way.
     pub fn open_with(path: impl AsRef<Path>, options: WriterOptions) -> Result<Self> {
         let path = path.as_ref();
         let guard = env::lock_writer(path)?;

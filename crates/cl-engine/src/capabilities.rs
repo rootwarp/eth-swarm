@@ -3,6 +3,11 @@
 //! `engine_exchangeCapabilities` is optional in the spec. This crate calls it anyway, at start
 //! and after every reconnect, and refuses to send engine calls until the EL lists
 //! [`NEW_PAYLOAD_V5`] and [`FORKCHOICE_UPDATED_V4`]. An older method is not a substitute.
+//!
+//! Every other method is checked per call: the caller picks the method version for the fork
+//! of its payload, and a method the EL did not list in the last exchange is refused before it
+//! is sent ([`crate::client::Session::call`]), so the gate follows the fork and the methods
+//! actually called rather than a fixed list.
 
 /// `engine_newPayloadV5` (Gloas / Amsterdam).
 pub const NEW_PAYLOAD_V5: &str = "engine_newPayloadV5";
@@ -12,8 +17,19 @@ pub const FORKCHOICE_UPDATED_V4: &str = "engine_forkchoiceUpdatedV4";
 /// The methods this client requires. Order is the order a refusal reports.
 pub const REQUIRED: [&str; 2] = [NEW_PAYLOAD_V5, FORKCHOICE_UPDATED_V4];
 
-/// What we tell the EL we can call when the caller does not supply a list.
-pub const ADVERTISED: [&str; 2] = REQUIRED;
+/// What we tell the EL we can call when the caller does not supply a list: every method the
+/// engine server routes, Fulu (Osaka) and Gloas (Amsterdam).
+pub const ADVERTISED: [&str; 9] = [
+    "engine_newPayloadV4",
+    NEW_PAYLOAD_V5,
+    "engine_forkchoiceUpdatedV3",
+    FORKCHOICE_UPDATED_V4,
+    "engine_getPayloadV5",
+    "engine_getPayloadV6",
+    "engine_getBlobsV2",
+    "engine_getBlobsV3",
+    "engine_getBlobsV4",
+];
 
 /// The EL's `engine_exchangeCapabilities` result omitted a required method.
 #[derive(Debug, Clone, PartialEq, Eq)]

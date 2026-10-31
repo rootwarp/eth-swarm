@@ -286,3 +286,58 @@ fn hex(bytes: &[u8]) -> String {
     }
     out
 }
+
+/// The start gate requires the Gloas pair only; every other routed method (getPayload,
+/// getBlobs, the Fulu versions) is checked per call against what the EL listed in its last
+/// capability exchange. A method it did not list is refused before anything is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_method_the_el_did_not_list_is_refused_before_it_is_sent() {
+    let secret = test_secret(SECRET);
+    let mut listed = required_methods();
+    listed.push("engine_getBlobsV4".into());
+    let mock = MockEl::start(secret.expose_secret(), listed).await;
+    let session = Session::connect(config(&mock.url(), secret)).await.unwrap();
+    let err = session
+        .call(
+            "engine_getPayloadV6",
+            &json!(["0x0102030405060708"]),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, CallError::MissingCaps(missing) if missing.contains("engine_getPayloadV6")),
+        "{err:?}"
+    );
+    session
+        .call(
+            "engine_getBlobsV4",
+            &json!([[], "0x00"]),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    let sent: Vec<String> = mock
+        .seen()
+        .into_iter()
+        .filter(|seen| seen.method != "engine_exchangeCapabilities")
+        .map(|seen| seen.method)
+        .collect();
+    assert_eq!(sent, ["engine_getBlobsV4"]);
+    // The refusal did not cost the connection.
+    assert!(session.is_connected());
+    // The exchange itself is never listed (common.md: the response MUST NOT contain
+    // `engine_exchangeCapabilities`), and is not gated.
+    let methods = session
+        .call(
+            "engine_exchangeCapabilities",
+            &json!([[NEW_PAYLOAD_V5, FORKCHOICE_UPDATED_V4]]),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    assert!(
+        methods.as_array().is_some_and(|m| !m.is_empty()),
+        "{methods}"
+    );
+}

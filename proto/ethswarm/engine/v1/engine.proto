@@ -86,7 +86,8 @@ message NewPayloadRequest {
   uint64 seq = 1;
   // [executionPayload, expectedBlobVersionedHashes, parentBeaconBlockRoot, executionRequests] per version.
   VersionedData params = 2;
-  // Overrides the spec default (6s for newPayload) if non-zero.
+  // Raises the spec wait if non-zero; never shortens it (common.md: the CL MUST wait the method's timeout). Spec wait: 6 s for
+  // newPayloadV5 (amsterdam.md), 8 s for newPayloadV4 (prague.md).
   uint32 timeout_ms = 3;
 }
 
@@ -106,7 +107,12 @@ message ForkchoiceUpdatedRequest {
   bytes finalized_block_hash = 4;
   // PayloadAttributes per version (V3 for Fulu, V4 for Gloas); empty = no build. Max 64 KiB (65536 bytes). PayloadAttributesV3/V4 are fixed fields plus withdrawals (MAX_WITHDRAWALS_PER_PAYLOAD = 16, capella/beacon-chain.md), well under 4 KiB in JSON; 64 KiB is headroom for later versions.
   VersionedData payload_attributes = 5;
+  // Raises the spec wait (8 s for forkchoiceUpdated) if non-zero; never shortens it (common.md: the CL MUST wait the method's timeout).
   uint32 timeout_ms = 6;
+  // forkchoiceUpdatedV4 (Gloas) only: the third param `custodyColumns` (amsterdam.md, `DATA|null`), the SSZ-serialized
+  // CustodyColumnBits = Bitvector[NUMBER_OF_COLUMNS] (gloas/fork-choice.md, EIP-8070), sent to the EL as is. Exactly 16 bytes,
+  // or empty for `null` (the CL provides no custody). Must be empty for forkchoiceUpdatedV3.
+  bytes custody_columns = 7;
 }
 
 message ForkchoiceUpdatedResponse {
@@ -122,6 +128,7 @@ message GetPayloadRequest {
   EngineMethodVersion version = 2;
   // 8 bytes.
   bytes payload_id = 3;
+  // Raises cl-engine's 1 s wait if non-zero; never shortens it (getPayload has no spec timeout since execution-apis #958).
   uint32 timeout_ms = 4;
 }
 
@@ -141,6 +148,7 @@ message GetBlobsRequest {
   repeated bytes versioned_hashes = 4;
   // getBlobsV4 only: 16 bytes, bitarray of cell indices to retrieve.
   bytes indices_bitarray = 5;
+  // Raises the spec wait (1 s for getBlobs) if non-zero; never shortens it.
   uint32 timeout_ms = 6;
 }
 

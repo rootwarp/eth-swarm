@@ -27,15 +27,19 @@ pub const DEFAULT_PORT: u16 = 8551;
 ///
 /// `engine.proto` caps ordinary JSON at 32 MiB and `GetBlobs` at 48 MiB. One cap covers both.
 pub const MAX_RESPONSE_BYTES: usize = 48 * 1024 * 1024;
-/// `engine_newPayload` (`paris.md`, inherited by later versions). The proto comment says 6s;
-/// execution-apis says 8s, and that is what we wait.
+/// `engine_newPayloadV4` (`prague.md`; 8 s since `paris.md`).
 pub const NEW_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(8);
+/// `engine_newPayloadV5` (`amsterdam.md`, execution-apis #849): 6 s.
+pub const NEW_PAYLOAD_V5_TIMEOUT: Duration = Duration::from_secs(6);
 /// `engine_forkchoiceUpdated` (`paris.md`, inherited).
 pub const FORKCHOICE_UPDATED_TIMEOUT: Duration = Duration::from_secs(8);
-/// `engine_getPayload` (1s in every version that states a timeout).
+/// `engine_getPayload`. execution-apis #958 dropped its 1 s timeout: the EL must answer at
+/// once, and the CL may abort at its own discretion. 1 s is that discretion.
 pub const GET_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(1);
 /// `engine_getBlobs` (1s where the spec states it; methods that state none use the same bound).
 pub const GET_BLOBS_TIMEOUT: Duration = Duration::from_secs(1);
+/// `engine_exchangeCapabilities` (`common.md`).
+pub const EXCHANGE_CAPABILITIES: &str = "engine_exchangeCapabilities";
 /// `engine_exchangeCapabilities` (`common.md`).
 pub const EXCHANGE_CAPABILITIES_TIMEOUT: Duration = Duration::from_secs(1);
 /// TCP connect plus the HTTP/1.1 handshake of one dial. The spec sets no number; without a
@@ -391,8 +395,12 @@ struct Inner {
     rpc_id: AtomicU64,
     late_dropped: AtomicU64,
     slot: Mutex<Option<Slot>>,
+    /// The methods the EL listed in the capability exchange of the installed connection.
+    listed: Mutex<Arc<[String]>>,
     #[cfg(test)]
     install_gate: Mutex<Option<tests::InstallGate>>,
+    #[cfg(test)]
+    ready_gate: Mutex<Option<tests::ReadyGate>>,
 }
 
 /// One EL connection. Cloning shares it.
@@ -429,19 +437,20 @@ impl Session {
                 rpc_id: AtomicU64::new(1),
                 late_dropped: AtomicU64::new(0),
                 slot: Mutex::new(None),
+                listed: Mutex::new(Arc::from([])),
                 #[cfg(test)]
                 install_gate: Mutex::new(None),
+                #[cfg(test)]
+                ready_gate: Mutex::new(None),
             }),
         };
-        let sender = session.dial_and_check().await?;
-        *lock(&session.inner.slot) = Some(Slot {
-            generation: 1,
-            sender,
-        });
+        let (sender, listed) = session.dial_and_check().await?;
+        session.install(1, sender, listed);
         Ok(session)
     }
 
-    /// JSON-RPC `method` with `params`, bounded by `timeout`.
+    /// JSON-RPC `method` with `params`. Waiting for the connection to take the request is
+    /// bounded by `timeout`, and so is the response, counted from the send.
     ///
     /// A fresh JWT is minted from the clock for this call. When the connection generation
     /// changes before the body is returned, the body is discarded.
@@ -451,10 +460,54 @@ impl Session {
         params: &Value,
         timeout: Duration,
     ) -> Result<Value, CallError> {
+        let send_by = tokio::time::Instant::now() + timeout;
+        self.call_claimed(method, params, send_by, timeout, || true)
+            .await
+    }
+
+    /// [`Session::call`] for the queue: the request goes on the wire only if `claim` returns
+    /// true, asked once the connection is ready to take it, so nothing is sent after `send_by`
+    /// or for a caller that has gone, however long the wait for the connection was. That wait
+    /// is bounded by `send_by`; the response by `timeout` from the send.
+    pub(crate) async fn call_claimed(
+        &self,
+        method: &str,
+        params: &Value,
+        send_by: tokio::time::Instant,
+        timeout: Duration,
+        claim: impl FnOnce() -> bool,
+    ) -> Result<Value, CallError> {
+        // The EL never lists the exchange itself (`common.md`), so it is not gated.
+        if method != EXCHANGE_CAPABILITIES
+            && !lock(&self.inner.listed)
+                .iter()
+                .any(|listed| listed == method)
+        {
+            return Err(CallError::MissingCaps(format!("missing {method}")));
+        }
         // `SendRequest` is not `Clone`. Take it for this call so a reconnect can install a
         // new one without sharing the old connection. The old sender stays alive until the
         // body has been read, which is what lets a late reply be discarded instead of applied.
         let (generation, mut sender) = self.take_sender()?;
+        let ready = tokio::time::timeout_at(send_by, async {
+            #[cfg(test)]
+            self.ready_gate().await;
+            sender.ready().await
+        })
+        .await;
+        if !matches!(ready, Ok(Ok(()))) {
+            // Nothing was sent. A connection that cannot take a request in time is not reused.
+            drop(sender);
+            self.drop_if(generation);
+            return Err(match ready {
+                Err(_) => CallError::Timeout,
+                Ok(_) => CallError::Transport,
+            });
+        }
+        if !claim() {
+            self.restore(generation, sender);
+            return Err(CallError::Timeout);
+        }
         let result =
             tokio::time::timeout(timeout, self.round_trip(&mut sender, method, params)).await;
         if self.generation() != generation {
@@ -507,17 +560,10 @@ impl Session {
             }
             attempt += 1;
             match self.dial_and_check().await {
-                Ok(sender) => {
+                Ok((sender, listed)) => {
                     #[cfg(test)]
                     self.install_gate(new_gen).await;
-                    // Compare and install under one lock: a newer reconnect cannot slip in
-                    // between, and the connection of a reconnect it overtook is dropped.
-                    let mut slot = lock(&self.inner.slot);
-                    if self.generation() == new_gen {
-                        *slot = Some(Slot {
-                            generation: new_gen,
-                            sender,
-                        });
+                    if self.install(new_gen, sender, listed) {
                         tracing::info!(generation = new_gen, "engine reconnected");
                     }
                     return Ok(());
@@ -555,6 +601,24 @@ impl Session {
             .is_some_and(|slot| slot.generation == self.generation())
     }
 
+    /// Installs a checked connection and the methods its EL listed, unless a newer reconnect
+    /// has started. Compare and install under one lock: a newer reconnect cannot slip in
+    /// between, and the connection of a reconnect it overtook is dropped.
+    fn install(
+        &self,
+        generation: u64,
+        sender: SendRequest<Full<Bytes>>,
+        listed: Arc<[String]>,
+    ) -> bool {
+        let mut slot = lock(&self.inner.slot);
+        if self.generation() != generation {
+            return false;
+        }
+        *lock(&self.inner.listed) = listed;
+        *slot = Some(Slot { generation, sender });
+        true
+    }
+
     fn take_sender(&self) -> Result<(u64, SendRequest<Full<Bytes>>), CallError> {
         let mut guard = lock(&self.inner.slot);
         let Some(slot) = guard.take() else {
@@ -586,7 +650,9 @@ impl Session {
         }
     }
 
-    async fn dial_and_check(&self) -> Result<SendRequest<Full<Bytes>>, StartError> {
+    async fn dial_and_check(
+        &self,
+    ) -> Result<(SendRequest<Full<Bytes>>, Arc<[String]>), StartError> {
         let addr = self
             .inner
             .endpoint
@@ -612,7 +678,7 @@ impl Session {
         let params = serde_json::json!([ADVERTISED]);
         let result = tokio::time::timeout(
             EXCHANGE_CAPABILITIES_TIMEOUT,
-            self.round_trip(&mut sender, "engine_exchangeCapabilities", &params),
+            self.round_trip(&mut sender, EXCHANGE_CAPABILITIES, &params),
         )
         .await
         .map_err(|_| StartError::Transport)?
@@ -626,10 +692,14 @@ impl Session {
             .as_array()
             .ok_or(StartError::BadResponse)?
             .iter()
-            .map(|item| item.as_str().ok_or(StartError::BadResponse))
-            .collect::<Result<Vec<_>, _>>()?;
-        capabilities::check(methods).map_err(StartError::MissingCaps)?;
-        Ok(sender)
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_owned)
+                    .ok_or(StartError::BadResponse)
+            })
+            .collect::<Result<Arc<[String]>, _>>()?;
+        capabilities::check(methods.iter().map(String::as_str)).map_err(StartError::MissingCaps)?;
+        Ok((sender, methods))
     }
 
     async fn round_trip(
@@ -736,6 +806,24 @@ impl Session {
             gate.go.notified().await;
         }
     }
+
+    /// Test seam: the next call stops where it waits for the connection to be ready to send, as
+    /// a `ready()` that stalls would, until the test notifies the second `Notify`. The first is
+    /// notified when the call gets there.
+    pub(crate) fn hold_before_ready(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let gate = tests::ReadyGate::default();
+        let pair = (Arc::clone(&gate.reached), Arc::clone(&gate.go));
+        *lock(&self.inner.ready_gate) = Some(gate);
+        pair
+    }
+
+    async fn ready_gate(&self) {
+        let gate = lock(&self.inner.ready_gate).take();
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.go.notified().await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -743,6 +831,12 @@ mod tests {
     use super::*;
     use crate::test_mock::{required_methods, test_secret, MockEl};
     use tokio::sync::Notify;
+
+    #[derive(Default)]
+    pub(super) struct ReadyGate {
+        pub(super) reached: Arc<Notify>,
+        pub(super) go: Arc<Notify>,
+    }
 
     pub(super) struct InstallGate {
         pub(super) generation: u64,
