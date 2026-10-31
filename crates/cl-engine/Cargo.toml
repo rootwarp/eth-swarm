@@ -5,12 +5,34 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "cl-engine: the ethswarm.engine.v1 service (stub: contract layer only, every RPC answers UNIMPLEMENTED)."
+description = "cl-engine: ordered Engine API transport (JWT, capability gate, per-EL queue) for ethswarm.engine.v1."
 
 [dependencies]
 ethswarm-proto = { path = "../ethswarm-proto" }
 ipc = { path = "../ipc" }
 tonic.workspace = true
+# HS256 (authentication.md). hmac 0.13 and sha2 0.11 are the digest 0.11 pair already in the
+# graph (libp2p); hmac 0.12 would be a second hmac next to 0.13.
+hmac = "0.13"
+sha2 = "0.11"
+serde_json = "1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time", "io-util"] }
+thiserror = "2"
+tracing = "0.1"
+zeroize = "1"
+# O_NOFOLLOW open and fstat of the JWT credential; the features node-key uses.
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 ipc = { path = "../ipc", features = ["testkit"] }
+hyper = { version = "1", features = ["server", "http1"] }
+tempfile = "3"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+data-encoding = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time", "io-util"] }
+tokio-stream = "0.1"

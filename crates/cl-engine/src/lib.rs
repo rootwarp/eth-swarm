@@ -1,9 +1,26 @@
-//! `cl-engine`: serves `ethswarm.engine.v1`, the ordered, stateless Engine API adapter (the only holder of the JWT secret).
+//! `cl-engine`: the ordered, stateless Engine API adapter between cl-chain and one execution
+//! client (execution-apis `authentication.md` and `common.md`).
 //!
-//! This is a stub. Every RPC runs the `ipc` contract layer first (hello negotiation, frame
-//! discipline, `seq`, envelope type and digest checks) and then answers `UNIMPLEMENTED`, so the
-//! service already holds its peers to the wire contract. `tests/contract.rs` runs the contract
-//! suite against it, in process and over a Unix socket.
+//! It is the only holder of the JWT secret. It never decodes consensus types (ADR-007): JSON
+//! params are forwarded as JSON-RPC params. Calls run in `seq` order, one at a time, on one
+//! queue per execution client ([`queue`]), over a JWT-authenticated client ([`client`],
+//! [`jwt`]) that only sends once the capability gate ([`capabilities`]) has passed.
+//!
+//! [`EngineStub`] still answers every `ethswarm.engine.v1` RPC with `UNIMPLEMENTED` after the
+//! `ipc` contract checks, which is what `tests/contract.rs` drives. The Unix-socket server in
+//! front of the queue is a separate change.
+
+pub mod capabilities;
+pub mod client;
+pub mod jwt;
+pub mod queue;
+
+// Unit tests drive the same in-crate mock EL as the integration tests.
+#[cfg(test)]
+extern crate self as cl_engine;
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+pub(crate) mod test_mock;
 
 use ethswarm_proto::engine as pb;
 use ipc::Link;

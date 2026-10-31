@@ -1,10 +1,14 @@
-//! `cl-engine` binary. The service is a stub (see the library), so there is nothing to run yet.
+//! `cl-engine` binary.
+//!
+//! The transport lives in the library ([`cl_engine::queue::Queue`]). This process entry
+//! does not serve: wiring it to the systemd unit is a later change, and a binary that dialed an
+//! execution client on startup would need a live host.
 
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     eprintln!(
-        "cl-engine {}: stub service, every ethswarm.engine.v1 RPC answers UNIMPLEMENTED; not runnable yet",
+        "cl-engine {}: engine transport is in the library; this binary does not serve yet",
         env!("CARGO_PKG_VERSION")
     );
     ExitCode::from(2)
