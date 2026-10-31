@@ -11,6 +11,8 @@ description = "cl-engine: ordered Engine API transport (JWT, capability gate, pe
 ethswarm-proto = { path = "../ethswarm-proto" }
 ipc = { path = "../ipc" }
 tonic.workspace = true
+prost.workspace = true
+tokio-stream = "0.1"
 # HS256 (authentication.md). hmac 0.13 and sha2 0.11 are the digest 0.11 pair already in the
 # graph (libp2p); hmac 0.12 would be a second hmac next to 0.13.
 hmac = "0.13"
@@ -36,3 +38,5 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 data-encoding = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time", "io-util"] }
 tokio-stream = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tonic-prost.workspace = true

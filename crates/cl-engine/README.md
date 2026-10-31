@@ -5,8 +5,8 @@ holder of the JWT secret. It does not decode consensus types (ADR-007): a call's
 are forwarded as the JSON-RPC `params`, and a result is copied back into the proto message.
 
 `EngineStub` (`src/lib.rs`) is what `tests/contract.rs` drives (contract checks, then
-`UNIMPLEMENTED`). The `engine.v1` Unix-socket server in front of the queue is a separate
-change. The binary does not serve yet.
+`UNIMPLEMENTED`). `src/server.rs` is the `engine.v1` Unix-socket server in front of the
+queue (below). The binary does not serve yet.
 
 ## JWT
 
@@ -66,6 +66,28 @@ is held across an `.await`.
 Reconnect dials immediately, then with exponential backoff from 200 ms capped at 5 s (the
 spec does not set this), up to 5 attempts. A missing capability does not install the new
 connection.
+
+## engine.v1 server
+
+`EngineServer` maps each `engine.v1` RPC onto one queue call; `serve` runs it on a Unix socket
+bound by `ipc::uds::bind`. It is a trust boundary:
+
+- Every accepted connection has its `SO_PEERCRED` read before anything is read from it. An
+  unreadable credential, or a UID that is not a caller in the method ACL from config
+  (`/etc/ethswarm/cl-engine.toml`; only cl-chain may be listed), closes it. Each handler checks
+  the UID again from the connection info.
+- `ipc::acl::AclLayer` runs before the service: exact method paths, deny by default, so an
+  unknown or unlisted method is `PERMISSION_DENIED` before the body is decoded.
+- `Limits`: a request message over 32 MiB + 64 KiB is refused from its gRPC length prefix
+  (`OUT_OF_RANGE`) before a buffer is allocated; responses are capped at 48 MiB + 64 KiB. Each
+  request has a 10 s deadline (body read included), a connection silent for 30 s is closed,
+  at most 4 connections and 16 in-flight requests per connection.
+- A caller's `timeout_ms` may shorten the spec wait, never lengthen it. An EL error, timeout or
+  a `forkchoiceUpdated` result without `payloadStatus` is an `EngineError`, never `VALID`.
+- Errors and logs carry codes, UIDs and fixed text, never the secret or a payload.
+
+`tests/server.rs` serves the mock EL over a socket: a wrong-UID peer, unknown and near-miss
+methods, an oversize frame, stalled writers and the connection cap.
 
 Tests use the hyper mock in `tests/common`, bound to `127.0.0.1:0`. Nothing is dialed that the
 test did not start.
