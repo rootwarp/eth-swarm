@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cl_node::units::{generate, Config};
+use cl_node::units::{generate, Config, LOOPBACK_ADDRESS_FAMILIES};
 
 /// The services in start order (issue #205): the oracle for names and order.
 const SERVICES: [&str; 8] = [
@@ -74,19 +74,30 @@ const HARDENING: [(&str, &str); 25] = [
     ("NotifyAccess", "main"),
 ];
 
-/// RestrictAddressFamilies= per service: AF_UNIX for all, IP only where the service talks to the
-/// network, AF_NETLINK for cl-p2p's interface watch. cl-sync stays AF_UNIX (Vera's list) until it
-/// gains its checkpoint fetch.
+/// RestrictAddressFamilies= per service: AF_UNIX for the sockets, IP for the [`NETWORK`]
+/// services (AF_NETLINK too for cl-p2p's interface watch). The others are loopback only: the
+/// ruling's [`LOOPBACK_ADDRESS_FAMILIES`], for the /metrics svc-runtime binds on 127.0.0.1.
 const ADDRESS_FAMILIES: [(&str, &str); 8] = [
-    ("verify", "AF_UNIX"),
+    ("verify", LOOPBACK_ADDRESS_FAMILIES),
     ("engine", "AF_UNIX AF_INET AF_INET6"),
-    ("chain", "AF_UNIX"),
-    ("store", "AF_UNIX"),
+    ("chain", LOOPBACK_ADDRESS_FAMILIES),
+    ("store", LOOPBACK_ADDRESS_FAMILIES),
     ("discv5", "AF_UNIX AF_INET AF_INET6"),
     ("p2p", "AF_UNIX AF_INET AF_INET6 AF_NETLINK"),
-    ("sync", "AF_UNIX"),
+    ("sync", LOOPBACK_ADDRESS_FAMILIES),
     ("api", "AF_UNIX AF_INET AF_INET6"),
 ];
+
+/// What [`LOOPBACK_ADDRESS_FAMILIES`] may be: AF_INET is required (/metrics on 127.0.0.1),
+/// AF_INET6 is a ruling that may still change. Today's ruling is the first.
+const LOOPBACK_RULINGS: [&str; 2] = ["AF_UNIX AF_INET", "AF_UNIX AF_INET AF_INET6"];
+
+/// The services that talk to the network (the EL, discovery, peers, the REST API). Every other
+/// unit is loopback only: exactly `IPAddressAllow=localhost` and `IPAddressDeny=any`.
+const NETWORK: [&str; 4] = ["engine", "discv5", "p2p", "api"];
+
+/// The loopback pair of a unit that is not in [`NETWORK`].
+const LOOPBACK: [&str; 2] = ["IPAddressAllow=localhost", "IPAddressDeny=any"];
 
 /// ADR-009: the only credentials, by service.
 const CREDENTIALS: [(&str, &str); 3] = [
@@ -412,6 +423,10 @@ fn hardening_findings(name: &str, text: &str) -> Vec<String> {
     out
 }
 
+/// RestrictAddressFamilies= as in [`ADDRESS_FAMILIES`], and IP reach over every service unit
+/// present (not only the eight): a [`NETWORK`] unit carries no IPAddressAllow=/IPAddressDeny=;
+/// any other has AF_INET (for its /metrics bind), no family outside [`LOOPBACK_ADDRESS_FAMILIES`]
+/// (so no AF_INET6 while the ruling has none) and exactly the [`LOOPBACK`] pair.
 fn address_family_findings(units: &Units) -> Vec<String> {
     let mut out = Vec::new();
     for (svc, want) in ADDRESS_FAMILIES {
@@ -423,6 +438,46 @@ fn address_family_findings(units: &Units) -> Vec<String> {
             Ok(v) if v == want => {}
             Ok(v) => out.push(format!("{svc}: RestrictAddressFamilies={v}, want {want}")),
             Err(e) => out.push(format!("{svc}: {e}")),
+        }
+    }
+    for (name, text) in units.iter().filter(|(n, _)| n.ends_with(".service")) {
+        let svc = &name["ethswarm-".len()..name.len() - ".service".len()];
+        let allow = values(text, "Service", "IPAddressAllow");
+        let deny = values(text, "Service", "IPAddressDeny");
+        if NETWORK.contains(&svc) {
+            if !allow.is_empty() || !deny.is_empty() {
+                out.push(format!(
+                    "{name}: network unit with IPAddressAllow={allow:?} IPAddressDeny={deny:?}"
+                ));
+            }
+            continue;
+        }
+        // The lines add up (systemd), so every family of every line counts.
+        let lines = values(text, "Service", "RestrictAddressFamilies");
+        let families: Vec<&str> = lines.iter().flat_map(|l| l.split_whitespace()).collect();
+        // svc-runtime binds /metrics on 127.0.0.1 before READY=1 (crates/svc-runtime/src/
+        // lifecycle.rs:192): without AF_INET socket() fails and the unit never gets ready.
+        if !families.contains(&"AF_INET") {
+            out.push(format!(
+                "{name}: no AF_INET for /metrics on 127.0.0.1 ({lines:?})"
+            ));
+        }
+        for family in families {
+            if !LOOPBACK_ADDRESS_FAMILIES
+                .split_whitespace()
+                .any(|f| f == family)
+            {
+                out.push(format!(
+                    "{name}: {family} on a loopback-only unit (the ruling: \
+                     {LOOPBACK_ADDRESS_FAMILIES})"
+                ));
+            }
+        }
+        if allow != ["localhost"] || deny != ["any"] {
+            out.push(format!(
+                "{name}: IP without the loopback pair: IPAddressAllow={allow:?} \
+                 IPAddressDeny={deny:?}, want exactly {LOOPBACK:?}"
+            ));
         }
     }
     out
@@ -682,68 +737,114 @@ fn credentials_only_where_allowed() {
     assert_caught("ExecStart with the JWT path", credential_findings(&mutated));
 }
 
+/// Both profiles: `--supernode` rewrites cl-p2p's unit, so each gate runs on its units too.
+fn profiles() -> [(&'static str, Units); 2] {
+    [
+        ("default", default_units()),
+        ("supernode", supernode_units()),
+    ]
+}
+
+/// `findings`, each prefixed with the profile it came from.
+fn tagged(profile: &str, findings: Vec<String>) -> Vec<String> {
+    findings
+        .into_iter()
+        .map(|f| format!("{profile}: {f}"))
+        .collect()
+}
+
 #[test]
 fn own_user_and_group_per_service() {
-    let units = default_units();
-    assert_clean(user_findings(&units));
-    for svc in SERVICES {
-        for key in ["User", "Group"] {
-            let line = format!("{key}=ethswarm-{svc}");
-            assert_caught(
-                &line,
-                user_findings(&mutate(&units, svc, |t| without(t, &line))),
-            );
+    for (profile, units) in profiles() {
+        assert_clean(tagged(profile, user_findings(&units)));
+        for svc in SERVICES {
+            for key in ["User", "Group"] {
+                let line = format!("{key}=ethswarm-{svc}");
+                assert_caught(
+                    &format!("{profile}: {line}"),
+                    user_findings(&mutate(&units, svc, |t| without(t, &line))),
+                );
+            }
         }
+        let shared = mutate(&units, "store", |t| {
+            t.replace("User=ethswarm-store", "User=ethswarm-chain")
+        });
+        assert_caught(&format!("{profile}: a shared user"), user_findings(&shared));
+        let root = mutate(&units, "api", |t| with(t, "Service", "User=root"));
+        assert_caught(
+            &format!("{profile}: User=root appended"),
+            user_findings(&root),
+        );
+        let p2p_root = mutate(&units, "p2p", |t| {
+            t.replace("User=ethswarm-p2p\n", "User=root\n")
+        });
+        assert_caught(
+            &format!("{profile}: cl-p2p as root"),
+            user_findings(&p2p_root),
+        );
+        let dynamic = mutate(&units, "sync", |t| with(t, "Service", "DynamicUser=yes"));
+        assert_caught(
+            &format!("{profile}: DynamicUser=yes"),
+            user_findings(&dynamic),
+        );
     }
-    let shared = mutate(&units, "store", |t| {
-        t.replace("User=ethswarm-store", "User=ethswarm-chain")
-    });
-    assert_caught("a shared user", user_findings(&shared));
-    let root = mutate(&units, "api", |t| with(t, "Service", "User=root"));
-    assert_caught("User=root appended", user_findings(&root));
-    let dynamic = mutate(&units, "sync", |t| with(t, "Service", "DynamicUser=yes"));
-    assert_caught("DynamicUser=yes", user_findings(&dynamic));
 }
 
 #[test]
 fn caller_groups_match_arch_table() {
-    let units = default_units();
-    assert_clean(caller_group_findings(&units));
-    // Each caller's membership in each callee's group is load-bearing.
-    for (callee, callers) in CALLERS {
-        for caller in callers {
-            let mutated = mutate(&units, caller, |t| {
-                let line = t
-                    .lines()
-                    .find(|l| l.starts_with("SupplementaryGroups="))
-                    .unwrap()
-                    .to_owned();
-                let groups: Vec<&str> = line["SupplementaryGroups=".len()..]
-                    .split(' ')
-                    .filter(|g| *g != format!("ethswarm-{callee}"))
-                    .collect();
-                t.replace(&line, &format!("SupplementaryGroups={}", groups.join(" ")))
-            });
-            assert_caught(
-                &format!("{caller} not in ethswarm-{callee}"),
-                caller_group_findings(&mutated),
-            );
+    for (profile, units) in profiles() {
+        assert_clean(tagged(profile, caller_group_findings(&units)));
+        // Each caller's membership in each callee's group is load-bearing.
+        for (callee, callers) in CALLERS {
+            for caller in callers {
+                let mutated = mutate(&units, caller, |t| {
+                    let line = t
+                        .lines()
+                        .find(|l| l.starts_with("SupplementaryGroups="))
+                        .unwrap()
+                        .to_owned();
+                    let groups: Vec<&str> = line["SupplementaryGroups=".len()..]
+                        .split(' ')
+                        .filter(|g| *g != format!("ethswarm-{callee}"))
+                        .collect();
+                    t.replace(&line, &format!("SupplementaryGroups={}", groups.join(" ")))
+                });
+                assert_caught(
+                    &format!("{profile}: {caller} not in ethswarm-{callee}"),
+                    caller_group_findings(&mutated),
+                );
+            }
         }
+        let extra = mutate(&units, "verify", |t| {
+            with(t, "Service", "SupplementaryGroups=ethswarm-engine")
+        });
+        assert_caught(
+            &format!("{profile}: cl-verify in ethswarm-engine"),
+            caller_group_findings(&extra),
+        );
+        // In place, sorted: cl-p2p in cl-engine's group (only cl-chain may call the EL side).
+        let p2p_engine = mutate(&units, "p2p", |t| {
+            t.replace(
+                "SupplementaryGroups=ethswarm-chain ethswarm-discv5 ethswarm-store\n",
+                "SupplementaryGroups=ethswarm-chain ethswarm-discv5 ethswarm-engine \
+                 ethswarm-store\n",
+            )
+        });
+        assert_caught(
+            &format!("{profile}: cl-p2p in ethswarm-engine"),
+            caller_group_findings(&p2p_engine),
+        );
+        let foreign = mutate(&units, "api", |t| {
+            t.replace(
+                "SupplementaryGroups=ethswarm-chain",
+                "SupplementaryGroups=adm ethswarm-chain",
+            )
+        });
+        assert_caught(
+            &format!("{profile}: a group outside the node"),
+            caller_group_findings(&foreign),
+        );
     }
-    let extra = mutate(&units, "verify", |t| {
-        with(t, "Service", "SupplementaryGroups=ethswarm-engine")
-    });
-    assert_caught(
-        "cl-verify in ethswarm-engine",
-        caller_group_findings(&extra),
-    );
-    let foreign = mutate(&units, "api", |t| {
-        t.replace(
-            "SupplementaryGroups=ethswarm-chain",
-            "SupplementaryGroups=adm ethswarm-chain",
-        )
-    });
-    assert_caught("a group outside the node", caller_group_findings(&foreign));
 }
 
 #[test]
@@ -766,31 +867,148 @@ fn hardening_on_every_unit() {
     }
 }
 
+/// Whether `families` (one RestrictAddressFamilies= value) has `family`.
+fn has(families: &str, family: &str) -> bool {
+    families.split_whitespace().any(|f| f == family)
+}
+
 #[test]
 fn address_families() {
-    let units = default_units();
-    assert_clean(address_family_findings(&units));
-    assert_clean(address_family_findings(&supernode_units()));
-    for (svc, families) in ADDRESS_FAMILIES {
-        let line = format!("RestrictAddressFamilies={families}");
-        let removed = mutate(&units, svc, |t| without(t, &line));
-        assert_caught(&line, address_family_findings(&removed));
-        let widened = mutate(&units, svc, |t| {
-            t.replace(&line, &format!("{line} AF_PACKET"))
-        });
-        assert_caught(
-            &format!("{line} AF_PACKET"),
-            address_family_findings(&widened),
-        );
+    assert!(
+        LOOPBACK_RULINGS.contains(&LOOPBACK_ADDRESS_FAMILIES),
+        "LOOPBACK_ADDRESS_FAMILIES={LOOPBACK_ADDRESS_FAMILIES:?}, want one of {LOOPBACK_RULINGS:?}"
+    );
+    for units in [default_units(), supernode_units()] {
+        assert_clean(address_family_findings(&units));
+        for (svc, families) in ADDRESS_FAMILIES {
+            let line = format!("RestrictAddressFamilies={families}");
+            let removed = mutate(&units, svc, |t| without(t, &line));
+            assert_caught(&line, address_family_findings(&removed));
+            let widened = mutate(&units, svc, |t| {
+                t.replace(&line, &format!("{line} AF_PACKET"))
+            });
+            assert_caught(
+                &format!("{line} AF_PACKET"),
+                address_family_findings(&widened),
+            );
+        }
     }
-    // cl-sync gets no IP until its checkpoint fetch lands (README, judgement calls).
-    let sync = mutate(&units, "sync", |t| {
-        t.replace(
-            "RestrictAddressFamilies=AF_UNIX",
-            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
-        )
-    });
-    assert_caught("cl-sync with IP", address_family_findings(&sync));
+}
+
+#[test]
+fn loopback_only_ip_outside_the_network_services() {
+    let loopback = format!("RestrictAddressFamilies={LOOPBACK_ADDRESS_FAMILIES}");
+    for units in [default_units(), supernode_units()] {
+        for svc in SERVICES.into_iter().filter(|s| !NETWORK.contains(s)) {
+            for line in LOOPBACK {
+                let removed = mutate(&units, svc, |t| without(t, line));
+                assert_caught(
+                    &format!("{svc} without {line}"),
+                    address_family_findings(&removed),
+                );
+                let twice = mutate(&units, svc, |t| with(t, "Service", line));
+                assert_caught(
+                    &format!("{svc} with {line} twice"),
+                    address_family_findings(&twice),
+                );
+            }
+            // AF_INET with neither line: IP to anywhere.
+            let open = mutate(&units, svc, |t| {
+                without(&without(t, LOOPBACK[0]), LOOPBACK[1])
+            });
+            assert_caught(
+                &format!("{svc}: AF_INET without the pair"),
+                address_family_findings(&open),
+            );
+            // Widened: an address beyond loopback, or the deny list reset.
+            for extra in [
+                "IPAddressAllow=any",
+                "IPAddressAllow=192.0.2.0/24",
+                "IPAddressDeny=",
+            ] {
+                let widened = mutate(&units, svc, |t| with(t, "Service", extra));
+                assert_caught(
+                    &format!("{svc} with {extra}"),
+                    address_family_findings(&widened),
+                );
+            }
+            // AF_INET6, in the line or in a second one, unless the ruling grants it.
+            if !has(LOOPBACK_ADDRESS_FAMILIES, "AF_INET6") {
+                for v6 in [
+                    mutate(&units, svc, |t| {
+                        t.replace(&format!("{loopback}\n"), &format!("{loopback} AF_INET6\n"))
+                    }),
+                    mutate(&units, svc, |t| {
+                        with(t, "Service", "RestrictAddressFamilies=AF_INET6")
+                    }),
+                ] {
+                    assert_caught(
+                        &format!("{svc} with AF_INET6"),
+                        address_family_findings(&v6),
+                    );
+                }
+            }
+            // No AF_INET (AF_UNIX only, or AF_INET6 in its place): the /metrics bind fails.
+            for narrowed in ["AF_UNIX", "AF_UNIX AF_INET6"] {
+                let narrowed = mutate(&units, svc, |t| {
+                    t.replace(
+                        &format!("{loopback}\n"),
+                        &format!("RestrictAddressFamilies={narrowed}\n"),
+                    )
+                });
+                assert_caught(
+                    &format!("{svc}: no AF_INET"),
+                    address_family_findings(&narrowed),
+                );
+            }
+        }
+        for svc in NETWORK {
+            for line in LOOPBACK {
+                let confined = mutate(&units, svc, |t| with(t, "Service", line));
+                assert_caught(
+                    &format!("{svc} with {line}"),
+                    address_family_findings(&confined),
+                );
+            }
+        }
+        // Any unit, not only the eight: a ninth loopback-only one with IP to anywhere, or with
+        // AF_INET6 the ruling does not grant, is caught.
+        let chain = &units[&unit_name("chain")];
+        let mut ninth = units.clone();
+        let open = without(&without(chain, LOOPBACK[0]), LOOPBACK[1]);
+        ninth.insert(unit_name("extra"), open);
+        assert_caught(
+            "a ninth unit with IP to anywhere",
+            address_family_findings(&ninth),
+        );
+        if !has(LOOPBACK_ADDRESS_FAMILIES, "AF_INET6") {
+            let mut ninth = units.clone();
+            let v6 = chain.replace(&format!("{loopback}\n"), &format!("{loopback} AF_INET6\n"));
+            ninth.insert(unit_name("extra"), v6);
+            assert_caught(
+                "a ninth unit with AF_INET6",
+                address_family_findings(&ninth),
+            );
+        }
+    }
+}
+
+/// cl-chain runs through `svc_runtime::run_with`, which binds TCP `/metrics` on 127.0.0.1 before
+/// READY=1 (crates/svc-runtime/src/lifecycle.rs:192, `telemetry::bind_metrics`). Under
+/// `RestrictAddressFamilies=AF_UNIX` that socket(AF_INET) fails, loopback included, and the unit
+/// loops on `Restart=`. units-verify.test.sh runs a real bind under these lines (systemd-run).
+#[test]
+fn chain_unit_permits_loopback_metrics_bind() {
+    let units = default_units();
+    let chain = service_unit(&units, "chain");
+    let families = one(chain, "Service", "RestrictAddressFamilies").unwrap();
+    assert!(
+        has(&families, "AF_INET"),
+        "cl-chain: RestrictAddressFamilies={families}: no AF_INET for /metrics on 127.0.0.1"
+    );
+    assert_eq!(families, LOOPBACK_ADDRESS_FAMILIES);
+    assert_eq!(values(chain, "Service", "IPAddressAllow"), ["localhost"]);
+    assert_eq!(values(chain, "Service", "IPAddressDeny"), ["any"]);
 }
 
 #[test]
@@ -813,25 +1031,42 @@ fn notify_timeouts_restart() {
 
 #[test]
 fn runtime_and_state_directories() {
-    let units = default_units();
-    assert_clean(directory_findings(&units));
-    let removed = mutate(&units, "chain", |t| {
-        without(t, "StateDirectory=ethswarm-chain")
-    });
-    assert_caught("cl-chain without state", directory_findings(&removed));
-    let loose = mutate(&units, "verify", |t| {
-        t.replace("StateDirectoryMode=0700", "StateDirectoryMode=0750")
-    });
-    assert_caught(
-        "a group-readable state directory",
-        directory_findings(&loose),
-    );
-    let extra = mutate(&units, "api", |t| {
-        with(t, "Service", "StateDirectory=ethswarm-api")
-    });
-    assert_caught("state for cl-api", directory_findings(&extra));
-    let runtime = mutate(&units, "store", |t| without(t, "RuntimeDirectoryMode=0750"));
-    assert_caught("no RuntimeDirectoryMode", directory_findings(&runtime));
+    for (profile, units) in profiles() {
+        assert_clean(tagged(profile, directory_findings(&units)));
+        let removed = mutate(&units, "chain", |t| {
+            without(t, "StateDirectory=ethswarm-chain")
+        });
+        assert_caught(
+            &format!("{profile}: cl-chain without state"),
+            directory_findings(&removed),
+        );
+        let loose = mutate(&units, "verify", |t| {
+            t.replace("StateDirectoryMode=0700", "StateDirectoryMode=0750")
+        });
+        assert_caught(
+            &format!("{profile}: a group-readable state directory"),
+            directory_findings(&loose),
+        );
+        let extra = mutate(&units, "api", |t| {
+            with(t, "Service", "StateDirectory=ethswarm-api")
+        });
+        assert_caught(
+            &format!("{profile}: state for cl-api"),
+            directory_findings(&extra),
+        );
+        let runtime = mutate(&units, "store", |t| without(t, "RuntimeDirectoryMode=0750"));
+        assert_caught(
+            &format!("{profile}: no RuntimeDirectoryMode"),
+            directory_findings(&runtime),
+        );
+        let p2p_open = mutate(&units, "p2p", |t| {
+            t.replace("RuntimeDirectoryMode=0750\n", "RuntimeDirectoryMode=0755\n")
+        });
+        assert_caught(
+            &format!("{profile}: a world-readable cl-p2p socket directory"),
+            directory_findings(&p2p_open),
+        );
+    }
 }
 
 #[test]

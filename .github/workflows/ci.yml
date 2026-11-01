@@ -253,9 +253,9 @@ jobs:
         run: cargo test -p ipc --test peercred --locked
       - name: Method ACL against cl-engine and the SIGTERM drain
         run: cargo test -p svc-runtime --locked
-      # Only the root case: the other launch tests run in the rust job, as a non-root user.
-      - name: cl-node launch as root refuses without the eight unit users (none runs as root)
-        run: cargo test -p cl-node --test launch --locked -- root_
+      # Only the root cases: the other launch tests run in the rust job, as a non-root user.
+      - name: cl-node as root (launch refuses without the unit users; staging never follows a symlink)
+        run: cargo test -p cl-node --lib --test launch --locked -- root_
 
   credential-root-tests:
     # The node-key credential shapes as systemd leaves them: a tmpfs at /run/credentials/<unit>,

@@ -19,7 +19,10 @@ SupplementaryGroups=ethswarm-chain
 RuntimeDirectory=ethswarm/cl-store
 RuntimeDirectoryMode=0750
 MemoryMax=512M
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_INET
+# IP only for /metrics on 127.0.0.1 (crates/cl-node/README.md).
+IPAddressAllow=localhost
+IPAddressDeny=any
 UMask=0077
 NoNewPrivileges=yes
 ProtectSystem=strict

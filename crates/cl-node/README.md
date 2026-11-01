@@ -29,15 +29,16 @@ wiring (cl-verify's command-line flags included) comes with the service mains.
 
 | Service | User = Group | `SupplementaryGroups=` (the sockets it calls, ARCH V-9) | `MemoryMax=` (ARCH §9) | `RestrictAddressFamilies=` | `LoadCredential=` | `StateDirectory=` |
 |---|---|---|---|---|---|---|
-| cl-verify | ethswarm-verify | – | 512M | AF_UNIX | – | ethswarm-verify |
+| cl-verify | ethswarm-verify | – | 512M | AF_UNIX AF_INET, loopback | – | ethswarm-verify |
 | cl-engine | ethswarm-engine | – | 256M | AF_UNIX AF_INET AF_INET6 | jwt | – |
-| cl-chain | ethswarm-chain | engine p2p verify | 3G, `MemoryHigh=2G`, `MemorySwapMax=0` | AF_UNIX | – | ethswarm-chain |
-| cl-store | ethswarm-store | chain | 512M | AF_UNIX | – | – |
+| cl-chain | ethswarm-chain | engine p2p verify | 3G, `MemoryHigh=2G`, `MemorySwapMax=0` | AF_UNIX AF_INET, loopback | – | ethswarm-chain |
+| cl-store | ethswarm-store | chain | 512M | AF_UNIX AF_INET, loopback | – | – |
 | cl-discv5 | ethswarm-discv5 | – | 128M | AF_UNIX AF_INET AF_INET6 | nodekey | ethswarm-discv5 |
 | cl-p2p | ethswarm-p2p | chain discv5 store | 768M (supernode: 1536M, `MemoryHigh=1G`) | AF_UNIX AF_INET AF_INET6 AF_NETLINK | nodekey | ethswarm-p2p |
-| cl-sync | ethswarm-sync | chain p2p store | 1G | AF_UNIX | – | ethswarm-sync |
+| cl-sync | ethswarm-sync | chain p2p store | 1G | AF_UNIX AF_INET, loopback | – | ethswarm-sync |
 | cl-api | ethswarm-api | chain discv5 p2p store sync | 1G | AF_UNIX AF_INET AF_INET6 | – | – |
 
+"loopback": also `IPAddressAllow=localhost` and `IPAddressDeny=any`.
 MemoryMax adds up to 7,296 MiB (8,064 MiB with `--supernode`). Groups are `ethswarm-<svc>`,
 sorted. Nothing is in group `ethswarm-api`: its caller is the operator, who adds an account by
 hand.
@@ -59,10 +60,15 @@ one `Wants=` per service, in start order, and `WantedBy=multi-user.target`.
 - **Socket groups.** svc-runtime refuses a socket group that is not the process's primary group
   (a chown would be killed by `~@privileged`). So each service's own group is its socket's
   group, and a caller holds the callee's group as a supplementary group. No UID or GID is shared.
-- **cl-sync gets AF_UNIX only.** ARCH lists "cl-sync → providers HTTPS" (the checkpoint fetch),
-  but Vera's M4 list gives it no IP, and today's cl-sync service makes no network call. The
-  stricter profile wins; `SYNC_ADDRESS_FAMILIES` in `src/units.rs` carries a TODO to add
-  `AF_INET AF_INET6` when cl-sync gains its checkpoint fetch.
+- **IP on loopback only for cl-verify, cl-chain, cl-store and cl-sync.** svc-runtime binds each
+  service's `/metrics` on 127.0.0.1 before READY=1 (ARCH: every service serves its registry
+  there), and `RestrictAddressFamilies=AF_UNIX` refuses that socket, loopback included: the unit
+  would never get ready. So they get AF_INET (no AF_INET6: `LOOPBACK_ADDRESS_FAMILIES` in
+  `src/units.rs`, the one place to change if that ruling does) with `IPAddressAllow=localhost`
+  and `IPAddressDeny=any`; the four network services get no such pair. ARCH lists "cl-sync →
+  providers HTTPS" (the checkpoint fetch), but today's cl-sync service makes no network call: it
+  stays loopback only until the [5.1] (#79) fetch runs inside it (outbound HTTPS, #283; the TODO
+  on `SYNC_LOOPBACK_ONLY` in `src/units.rs`).
 - **AF_NETLINK for cl-p2p** only: libp2p-tcp watches the interfaces (if-watch) through a netlink
   route socket for its wildcard listen (as in ops/probe).
 - **Timeouts.** 90 s to start covers cl-chain's 30 s wait for cl-verify and opening its store;
@@ -80,9 +86,11 @@ one `Wants=` per service, in start order, and `WantedBy=multi-user.target`.
 - **ProcSubset=pid** is not in Vera's list but is in the ops/probe block the issue asked for.
 
 `crates/cl-node/tests/units-verify.test.sh` runs `systemd-analyze verify` on both profiles and
-fails on any diagnostic (verify exits 0 on lines it ignores). CI runs it in the kurtosis-units
-job with `ETHSWARM_REQUIRE_SYSTEMD_ANALYZE=1`; elsewhere it uses a user namespace for a private
-`/run`, or skips with a notice.
+fails on any diagnostic (verify exits 0 on lines it ignores). Under systemd as PID 1 it also runs
+a TCP bind probe under cl-chain's IP lines (`systemd-run`, root through sudo): 127.0.0.1 must
+work, a non-loopback address and an AF_INET6 socket must not. CI runs it in the kurtosis-units
+job with `ETHSWARM_REQUIRE_SYSTEMD_ANALYZE=1`, where neither may skip; elsewhere verify uses a
+user namespace for a private `/run` or skips with a notice, and the probe skips with a notice.
 
 ## `launch --foreground`: the services as children (containers)
 
@@ -112,7 +120,10 @@ For a container without systemd. Each child gets what its unit asks of systemd:
   otherwise.
 - **No state.** The sockets and credential copies live in `<runtime-dir>/.cl-node` and go with
   cl-node (one launcher per runtime directory; a directory a killed launcher left is replaced).
-  The services' runtime directories stay, as their owners left them.
+  The services' runtime directories stay, as their owners left them (a symlink there refuses the
+  launch). Each child's directory there stays root's until it holds its socket and copies, and
+  is handed over last, through descriptors: nothing of the service's can make root chmod or
+  chown through a symlink.
 
 ## Deferred
 
@@ -125,4 +136,4 @@ For a container without systemd. Each child gets what its unit asks of systemd:
   `STATE_DIRECTORY` in launch mode.
 - cl-store reads cl-chain's MDBX, but `StateDirectory=ethswarm-chain` is 0700: the read path
   for cl-store needs a decision (a group-readable store directory and `ReadOnlyPaths=`).
-- cl-sync's address families once it fetches its checkpoint (above).
+- cl-sync's outbound HTTPS once it fetches its checkpoint (#283, above).

@@ -21,12 +21,19 @@ pub const DEFAULT_NETWORK: &str = "mainnet";
 /// Where `LoadCredential=` reads the secrets from (root-owned, ADR-009).
 pub const CREDENTIALS_DIR: &str = "/etc/ethswarm/credentials";
 
-/// cl-sync's address families. ARCH lists "cl-sync → providers HTTPS" (the checkpoint fetch),
-/// but Vera's M4 list gives it none, and today's cl-sync service makes no network call: the
-/// stricter profile wins until it does.
-// TODO(cl-sync checkpoint fetch): add "AF_INET AF_INET6" here when cl-sync gains its checkpoint
-// fetch (and a test that the fetch runs under the unit).
-pub const SYNC_ADDRESS_FAMILIES: &str = "AF_UNIX";
+/// Whether cl-sync is loopback only. ARCH lists "cl-sync → providers HTTPS" (the checkpoint
+/// fetch), but today's cl-sync service makes no network call: its IP is its /metrics on
+/// 127.0.0.1, and the stricter profile wins until it does.
+// TODO(cl-sync checkpoint fetch): set this to false (outbound HTTPS, #283) when the [5.1] (#79)
+// checkpoint fetch runs inside the cl-sync service, with a test that the fetch runs under the
+// unit.
+pub const SYNC_LOOPBACK_ONLY: bool = true;
+
+/// `RestrictAddressFamilies=` of the loopback-only units (cl-verify, cl-chain, cl-store and, for
+/// now, cl-sync): AF_UNIX for the sockets, AF_INET for the /metrics svc-runtime binds on
+/// 127.0.0.1 before READY=1. With `IPAddressAllow=localhost` and `IPAddressDeny=any`. No
+/// AF_INET6: nothing of theirs uses it (the ruling may change: then add it here, nowhere else).
+pub const LOOPBACK_ADDRESS_FAMILIES: &str = "AF_UNIX AF_INET";
 
 /// The eight services.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -116,16 +123,27 @@ impl Service {
         matches!(self, Chain | Verify | P2p | Discv5 | Sync)
     }
 
-    /// `RestrictAddressFamilies=`: AF_UNIX for the sockets, IP only for the services that talk
-    /// to the network (the EL, peers, discovery, the REST API).
+    /// `RestrictAddressFamilies=`: AF_UNIX for the sockets, IP for the services that talk to
+    /// the network (the EL, peers, discovery, the REST API), [`LOOPBACK_ADDRESS_FAMILIES`] for
+    /// the others.
     const fn address_families(self) -> &'static str {
         match self {
             // libp2p-tcp watches the interfaces (if-watch) through a netlink route socket for
             // its wildcard listen; without AF_NETLINK the listen fails at start.
             P2p => "AF_UNIX AF_INET AF_INET6 AF_NETLINK",
-            Engine | Discv5 | Api => "AF_UNIX AF_INET AF_INET6",
-            Sync => SYNC_ADDRESS_FAMILIES,
-            Verify | Chain | Store => "AF_UNIX",
+            _ if self.loopback_only() => LOOPBACK_ADDRESS_FAMILIES,
+            _ => "AF_UNIX AF_INET AF_INET6",
+        }
+    }
+
+    /// IP on loopback only (`IPAddressAllow=localhost`, `IPAddressDeny=any`): a service that
+    /// talks to none of the EL, peers, discovery or REST clients still needs IP for its /metrics
+    /// on 127.0.0.1, which svc-runtime binds before READY=1.
+    const fn loopback_only(self) -> bool {
+        match self {
+            Verify | Chain | Store => true,
+            Sync => SYNC_LOOPBACK_ONLY,
+            Engine | Discv5 | P2p | Api => false,
         }
     }
 
@@ -344,10 +362,11 @@ fn service_unit(svc: Service, config: &Config) -> Unit {
     if no_swap {
         t.push_str("MemorySwapMax=0\n");
     }
-    if svc == Sync {
-        t.push_str("# No IP until cl-sync fetches its checkpoint (crates/cl-node/README.md).\n");
-    }
     let _ = writeln!(t, "RestrictAddressFamilies={}", svc.address_families());
+    if svc.loopback_only() {
+        t.push_str("# IP only for /metrics on 127.0.0.1 (crates/cl-node/README.md).\n");
+        t.push_str("IPAddressAllow=localhost\nIPAddressDeny=any\n");
+    }
     let _ = write!(t, "{HARDENING}\n[Install]\nWantedBy={TARGET}\n");
     Unit {
         name: svc.unit_name(),

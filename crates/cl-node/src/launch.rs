@@ -28,14 +28,15 @@ use std::ffi::{c_char, c_int, CString};
 use std::fs;
 use std::io::{self, IoSliceMut, Write as _};
 use std::mem::MaybeUninit;
-use std::os::unix::fs::{chown, OpenOptionsExt, PermissionsExt};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixDatagram;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
 
-use rustix::fs::Mode;
+use rustix::fs::{AtFlags, Mode, OFlags};
+use rustix::io::Errno;
 use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
 use rustix::process::{kill_process_group, waitid, Gid, Pid, Signal, Uid, WaitId, WaitIdOptions};
 use tokio::io::Interest;
@@ -148,25 +149,40 @@ impl Drop for PrivateDir {
     }
 }
 
-fn io_err(what: impl std::fmt::Display) -> impl FnOnce(io::Error) -> String {
+fn io_err<E: std::fmt::Display>(what: impl std::fmt::Display) -> impl FnOnce(E) -> String {
     move |e| format!("{what}: {e}")
 }
 
-/// Creates `path` with `mode` exactly (not through the umask), owned by `owner` if given.
-fn make_dir(path: &Path, mode: u32, owner: Option<&Identity>) -> Result<(), String> {
-    fs::create_dir(path).map_err(io_err(path.display()))?;
-    give(path, mode, owner)
+/// Opens the directory `name` in `dir`; a symlink there is refused (ELOOP), never followed.
+fn open_dir(dir: impl AsFd, name: &str) -> rustix::io::Result<OwnedFd> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    rustix::fs::openat(dir, name, flags, Mode::empty())
 }
 
-fn give(path: &Path, mode: u32, owner: Option<&Identity>) -> Result<(), String> {
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(io_err(path.display()))?;
-    match owner {
-        Some(id) => chown(path, Some(id.uid), Some(id.gid)).map_err(io_err(path.display())),
-        None => Ok(()),
+/// Makes the directory `name` in `dir` with `mode` exactly (not through the umask), still
+/// cl-node's: [`give`] hands it over.
+fn make_dir(dir: impl AsFd, name: &str, mode: u32) -> rustix::io::Result<OwnedFd> {
+    rustix::fs::mkdirat(&dir, name, Mode::RWXU)?;
+    let made = open_dir(&dir, name)?;
+    rustix::fs::fchmod(&made, Mode::from_raw_mode(mode))?;
+    Ok(made)
+}
+
+/// Hands what `fd` holds (with a `name`: that entry of directory `fd`, not through a symlink) to
+/// `owner`; with none (cl-node is not root), cl-node keeps it. Never by path.
+fn give(fd: impl AsFd, name: Option<&str>, owner: Option<&Identity>) -> rustix::io::Result<()> {
+    let Some(id) = owner else { return Ok(()) };
+    let (uid, gid) = (Some(Uid::from_raw(id.uid)), Some(Gid::from_raw(id.gid)));
+    match name {
+        Some(name) => rustix::fs::chownat(fd, name, uid, gid, AtFlags::SYMLINK_NOFOLLOW),
+        None => rustix::fs::fchown(fd, uid, gid),
     }
 }
 
 /// Reads the credentials, makes the runtime directories and each child's private directory.
+/// A private directory is cl-node's while it is filled and goes to its service only once
+/// complete, innermost first, through held descriptors: no process of the service can swap in a
+/// link for cl-node (root) to chmod or chown through.
 fn prepare(
     launch: &Launch,
     private: &Path,
@@ -182,49 +198,70 @@ fn prepare(
             secrets.push((svc, *name, bytes));
         }
     }
-    if !launch.runtime_dir.exists() {
-        fs::create_dir_all(&launch.runtime_dir).map_err(io_err(launch.runtime_dir.display()))?;
-        give(&launch.runtime_dir, 0o755, None)?;
+    let runtime_dir = &launch.runtime_dir;
+    let made = !runtime_dir.exists();
+    if made {
+        fs::create_dir_all(runtime_dir).map_err(io_err(runtime_dir.display()))?;
+    }
+    // The operator's directory, followed as any path it gives; 0755 if cl-node made it.
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let runtime_fd = rustix::fs::open(runtime_dir, flags, Mode::empty())
+        .map_err(io_err(runtime_dir.display()))?;
+    if made {
+        rustix::fs::fchmod(&runtime_fd, Mode::from_raw_mode(0o755))
+            .map_err(io_err(runtime_dir.display()))?;
     }
     // A directory a killed launch left behind holds only what this one replaces.
     if private.exists() {
         fs::remove_dir_all(private).map_err(io_err(private.display()))?;
     }
-    make_dir(private, 0o711, None)?;
+    let private_fd = make_dir(&runtime_fd, PRIVATE, 0o711).map_err(io_err(private.display()))?;
     let mut out = Vec::new();
     for (i, svc) in Service::START_ORDER.into_iter().enumerate() {
         let identity = ids.as_ref().map(|ids| ids[i].clone());
-        let runtime = launch.runtime_dir.join(svc.binary());
-        if !runtime.exists() {
-            make_dir(&runtime, 0o750, identity.as_ref())?;
+        let owner = identity.as_ref();
+        // Made and handed over if missing, else kept as it is, but never a symlink.
+        let runtime = runtime_dir.join(svc.binary());
+        match make_dir(&runtime_fd, &svc.binary(), 0o750) {
+            Ok(dir) => give(&dir, None, owner),
+            Err(Errno::EXIST) => open_dir(&runtime_fd, &svc.binary()).map(drop),
+            Err(e) => Err(e),
         }
-        let own = private.join(svc.short());
-        make_dir(&own, 0o700, identity.as_ref())?;
-        let notify_path = own.join("notify");
+        .map_err(io_err(runtime.display()))?;
+        let own_path = private.join(svc.short());
+        let own = make_dir(&private_fd, svc.short(), 0o700).map_err(io_err(own_path.display()))?;
+        let notify_path = own_path.join("notify");
         let notify = UnixDatagram::bind(&notify_path).map_err(io_err(notify_path.display()))?;
-        give(&notify_path, 0o600, identity.as_ref())?;
+        // `own` is still cl-node's alone (0700): nothing else can have put a link at `notify`.
+        rustix::fs::chmodat(&own, "notify", Mode::from_raw_mode(0o600), AtFlags::empty())
+            .and_then(|()| give(&own, Some("notify"), owner))
+            .map_err(io_err(notify_path.display()))?;
         rustix::net::sockopt::set_socket_passcred(&notify, true)
             .map_err(|e| format!("SO_PASSCRED: {e}"))?;
         notify
             .set_nonblocking(true)
             .map_err(io_err("notify socket"))?;
         let mut credentials = None;
-        for (_, name, bytes) in secrets.iter().filter(|(s, _, _)| *s == svc) {
-            let dir = own.join("credentials");
-            if credentials.is_none() {
-                make_dir(&dir, 0o700, identity.as_ref())?;
+        let mut mine = secrets.iter().filter(|(s, _, _)| *s == svc).peekable();
+        if mine.peek().is_some() {
+            let path = own_path.join("credentials");
+            let dir = make_dir(&own, "credentials", 0o700).map_err(io_err(path.display()))?;
+            let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW;
+            for (_, name, bytes) in mine {
+                let copy = path.join(name);
+                let file = rustix::fs::openat(&dir, *name, flags | OFlags::CLOEXEC, Mode::RUSR)
+                    .map_err(io_err(copy.display()))?;
+                let mut file = fs::File::from(file);
+                file.write_all(bytes).map_err(io_err(copy.display()))?;
+                rustix::fs::fchmod(&file, Mode::RUSR)
+                    .and_then(|()| give(&file, None, owner))
+                    .map_err(io_err(copy.display()))?;
             }
-            let path = dir.join(name);
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o400)
-                .open(&path)
-                .map_err(io_err(path.display()))?;
-            file.write_all(bytes).map_err(io_err(path.display()))?;
-            give(&path, 0o400, identity.as_ref())?;
-            credentials = Some(dir);
+            give(&dir, None, owner).map_err(io_err(path.display()))?;
+            credentials = Some(path);
         }
+        // Last: the service gets its directory only now that it holds everything.
+        give(&own, None, owner).map_err(io_err(own_path.display()))?;
         out.push(Prepared {
             svc,
             identity,
@@ -518,6 +555,10 @@ pub fn run(launch: &Launch) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::units::Config;
+    use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     fn lookup<'a>(table: &'a [(&'a str, u32)]) -> impl Fn(&str) -> Option<u32> + 'a {
         |name| table.iter().find(|(n, _)| *n == name).map(|(_, id)| *id)
@@ -583,5 +624,208 @@ mod tests {
             let err = identities(lookup(&users), lookup(&groups)).unwrap_err();
             assert!(err.contains(&format!("{who} is root")), "{err}");
         }
+    }
+
+    /// A launch to stage in a temp dir a service's user can traverse, a victim file there (what
+    /// cl-node must never chmod or chown for a service) and `decoy/jwt`, a symlink to it. The
+    /// jwt is 32 MiB, so writing cl-engine's copy holds open the window between creating the
+    /// copy and handing it over.
+    fn staging() -> (tempfile::TempDir, Launch, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::set_permissions(root, fs::Permissions::from_mode(0o755)).unwrap();
+        let creds = root.join("creds");
+        fs::create_dir(&creds).unwrap();
+        fs::write(creds.join("jwt"), vec![b'j'; 32 << 20]).unwrap();
+        fs::write(creds.join("nodekey"), "test-nodekey").unwrap();
+        let victim = root.join("victim");
+        fs::write(&victim, "victim").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::create_dir(root.join("decoy")).unwrap();
+        symlink(&victim, root.join("decoy/jwt")).unwrap();
+        let launch = Launch {
+            config: Config::default(),
+            credentials_dir: creds,
+            runtime_dir: root.join("run"),
+            ready_timeout: Duration::from_secs(1),
+            stop_grace: Duration::from_secs(1),
+        };
+        (dir, launch, victim)
+    }
+
+    /// `0644 uid:gid`.
+    fn owned(mode: u32, uid: u32, gid: u32) -> String {
+        format!("{mode:04o} {uid}:{gid}")
+    }
+
+    /// Mode, owner and group of `path` itself, as [`owned`].
+    fn stat(path: &Path) -> String {
+        let m = fs::symlink_metadata(path).unwrap();
+        owned(m.mode() & 0o7777, m.uid(), m.gid())
+    }
+
+    /// Stages `launch` while a thread running as `attacker` (uid and gid; `None`: as the test
+    /// runs) swaps cl-engine's credentials directory for a symlink to `decoy` (next to
+    /// `victim`) once the copy is in it, as any process of cl-engine's user could in a
+    /// directory it owns. (A rename over the copy itself would wait for root's write, which
+    /// holds the copy's inode lock.) Whether the swap landed.
+    fn stage_under_attack(
+        launch: &Launch,
+        ids: Option<Vec<Identity>>,
+        victim: &Path,
+        attacker: Option<(u32, u32)>,
+    ) -> bool {
+        let stop = Arc::new(AtomicBool::new(false));
+        let own = launch.runtime_dir.join(PRIVATE).join("engine");
+        let (stopped, decoy) = (stop.clone(), victim.with_file_name("decoy"));
+        let racer = std::thread::spawn(move || {
+            if let Some((uid, gid)) = attacker {
+                // This thread only (the raw syscalls, not libc's process-wide setresuid).
+                let gid = Gid::from_raw(gid);
+                rustix::thread::set_thread_groups(&[]).unwrap();
+                rustix::thread::set_thread_res_gid(gid, gid, gid).unwrap();
+                let uid = Uid::from_raw(uid);
+                rustix::thread::set_thread_res_uid(uid, uid, uid).unwrap();
+            }
+            let (creds, moved) = (own.join("credentials"), own.join("moved"));
+            while !stopped.load(Ordering::Relaxed) {
+                if fs::symlink_metadata(creds.join("jwt")).is_ok_and(|m| m.is_file())
+                    && fs::rename(&creds, &moved).is_ok()
+                {
+                    return symlink(&decoy, &creds).is_ok();
+                }
+            }
+            false
+        });
+        let private = PrivateDir(launch.runtime_dir.join(PRIVATE));
+        let staged = prepare(launch, &private.0, ids).map(|p| p.len());
+        stop.store(true, Ordering::Relaxed);
+        let swapped = racer.join().unwrap();
+        assert_eq!(staged, Ok(8));
+        swapped
+    }
+
+    #[test]
+    fn staging_never_chmods_through_a_swapped_symlink() {
+        // Not root: everything is the test user's, so the swap lands (the copy's directory is
+        // the user's own); cl-node's chmod must still reach only the copy it made.
+        for attempt in 1..=5 {
+            let (_dir, launch, victim) = staging();
+            let before = stat(&victim);
+            let swapped = stage_under_attack(&launch, None, &victim, None);
+            assert_eq!(
+                stat(&victim),
+                before,
+                "attempt {attempt}: the victim changed"
+            );
+            assert_eq!(fs::read_to_string(&victim).unwrap(), "victim");
+            if swapped {
+                return;
+            }
+        }
+        panic!("the swap never landed in 5 attempts: nothing was tested");
+    }
+
+    /// Whether a root test can run: as root, or (ETHSWARM_ROOT_TESTS=1, CI) a failure.
+    fn as_root(test: &str) -> bool {
+        let required = std::env::var("ETHSWARM_ROOT_TESTS").is_ok_and(|v| v == "1");
+        let root = rustix::process::geteuid().is_root();
+        assert!(
+            root || !required,
+            "{test}: needs root with ETHSWARM_ROOT_TESTS=1"
+        );
+        if !root {
+            eprintln!("{test}: skipped (not root)");
+        }
+        root
+    }
+
+    /// Throwaway ids, one per service in start order (none needs to exist to own a file).
+    fn throwaway_ids() -> Vec<Identity> {
+        (0..8)
+            .map(|i| Identity {
+                uid: 61_000 + i,
+                gid: 61_000 + i,
+                groups: vec![],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn root_staging_hands_over_each_private_directory() {
+        if !as_root("root_staging_hands_over_each_private_directory") {
+            return;
+        }
+        let ids = throwaway_ids();
+        let (_dir, launch, _) = staging();
+        let private = PrivateDir(launch.runtime_dir.join(PRIVATE));
+        let prepared = prepare(&launch, &private.0, Some(ids.clone())).unwrap();
+        assert_eq!(stat(&launch.runtime_dir), owned(0o755, 0, 0));
+        assert_eq!(stat(&private.0), owned(0o711, 0, 0));
+        for (p, id) in prepared.iter().zip(&ids) {
+            let (svc, own) = (p.svc, private.0.join(p.svc.short()));
+            assert_eq!(stat(&p.runtime), owned(0o750, id.uid, id.gid), "{svc:?}");
+            assert_eq!(stat(&own), owned(0o700, id.uid, id.gid), "{svc:?}");
+            assert_eq!(
+                stat(&p.notify_path),
+                owned(0o600, id.uid, id.gid),
+                "{svc:?}"
+            );
+            let socket = fs::symlink_metadata(&p.notify_path).unwrap();
+            assert!(socket.file_type().is_socket(), "{svc:?}");
+            let names = svc.credentials();
+            assert_eq!(p.credentials.is_some(), !names.is_empty(), "{svc:?}");
+            let Some(dir) = &p.credentials else { continue };
+            assert_eq!(stat(dir), owned(0o700, id.uid, id.gid), "{svc:?}");
+            for name in names {
+                let copy = dir.join(name);
+                assert_eq!(stat(&copy), owned(0o400, id.uid, id.gid), "{svc:?} {name}");
+                let want = fs::read(launch.credentials_dir.join(name)).unwrap();
+                assert!(fs::read(&copy).unwrap() == want, "{svc:?} {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn root_staging_never_follows_a_service_symlink() {
+        if !as_root("root_staging_never_follows_a_service_symlink") {
+            return;
+        }
+        let ids = throwaway_ids();
+        assert_eq!(Service::START_ORDER[1], Service::Engine);
+        let engine = (ids[1].uid, ids[1].gid);
+        // cl-engine's user, racing: with its private directory its own while root fills it,
+        // root's chmod and chown of the copy follow the swapped-in link to the victim.
+        for attempt in 1..=3 {
+            let (_dir, launch, victim) = staging();
+            let before = stat(&victim);
+            assert_eq!(before, owned(0o644, 0, 0));
+            stage_under_attack(&launch, Some(ids.clone()), &victim, Some(engine));
+            assert_eq!(
+                stat(&victim),
+                before,
+                "attempt {attempt}: root chmodded or chowned the victim through cl-engine's link"
+            );
+            assert_eq!(fs::read_to_string(&victim).unwrap(), "victim");
+        }
+    }
+
+    #[test]
+    fn staging_refuses_a_symlinked_runtime_directory() {
+        // A link where a service's runtime directory goes (a directory a service could have
+        // left there, say): refused, and the directory it names is left as it was.
+        let (dir, launch, _) = staging();
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir(&launch.runtime_dir).unwrap();
+        symlink(&elsewhere, launch.runtime_dir.join("cl-chain")).unwrap();
+        let before = stat(&elsewhere);
+        let private = PrivateDir(launch.runtime_dir.join(PRIVATE));
+        let err = prepare(&launch, &private.0, None)
+            .map(|p| p.len())
+            .unwrap_err();
+        assert!(err.contains("cl-chain"), "{err}");
+        assert_eq!(stat(&elsewhere), before);
     }
 }

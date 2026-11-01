@@ -23,7 +23,10 @@ StateDirectoryMode=0700
 MemoryHigh=2G
 MemoryMax=3G
 MemorySwapMax=0
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_INET
+# IP only for /metrics on 127.0.0.1 (crates/cl-node/README.md).
+IPAddressAllow=localhost
+IPAddressDeny=any
 UMask=0077
 NoNewPrivileges=yes
 ProtectSystem=strict
