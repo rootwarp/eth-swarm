@@ -25,7 +25,7 @@
 //! - `rpc_column_sidecars_answered_total{protocol}`: column sidecars of our answers to peers'
 //!   `DataColumnSidecarsByRange` and `DataColumnSidecarsByRoot` requests, counted as each answer
 //!   goes to its stream.
-//! - `rpc_inbound_streams_refused_total`: inbound streams dropped without a chunk because
+//! - `rpc_inbound_streams_refused_total`: inbound streams answered `2: ServerError` because
 //!   `max_inbound_streams` streamed answers were open ([`crate::rpc::limits::RpcLimits`]).
 //! - `queue_dropped_total{queue}`: items a bounded queue IGNOREd ([`QueueMetrics`]), shared with
 //!   the other queues of the service through [`RpcMetrics::queues`].
@@ -324,7 +324,7 @@ impl RpcMetrics {
         );
         registry.register(
             "rpc_inbound_streams_refused",
-            "Inbound streams dropped without a chunk because the streamed answers were at their cap",
+            "Inbound streams answered 2: ServerError because the streamed answers were at their cap",
             metrics.inbound_streams_refused.clone(),
         );
         metrics

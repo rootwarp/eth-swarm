@@ -56,8 +56,9 @@ pub type Serving = Pin<Box<dyn Future<Output = ()> + Send>>;
 ///
 /// [`super::inbound::Control`] checks a request before it reaches the responder (a count over
 /// its cap is `1: InvalidRequest`, never clamped), books [`Self::cost`] tokens of the peer's
-/// quota for it, and runs [`Self::serve`]'s future on its own task until it returns or the
-/// stream ends (written, reset, timed out), whichever is first.
+/// quota for it, and once the first of them is due calls [`Self::serve`] on the answer's own
+/// task, running its future until it returns or the stream ends (written, reset, timed out),
+/// whichever is first.
 pub trait Responder<E: EthSpec>: Send + Sync + 'static {
     /// The tokens of the peer's (peer, protocol) quota `request` is charged when it is
     /// admitted: by default the items it asks for (BlocksByRange `count`; a column range
@@ -68,9 +69,10 @@ pub trait Responder<E: EthSpec>: Send + Sync + 'static {
         request.max_response_chunks()
     }
 
-    /// Answers `peer`'s `request` through `sink`. Called on the swarm's task: the work belongs
-    /// in the returned future, which stops when a [`ChunkSink`] call fails or is dropped when
-    /// the stream ends. Returning ends the answer; a panic ends it as a failure.
+    /// Answers `peer`'s `request` through `sink`. Called on the answer's task once the peer's
+    /// first token is due, so a peer over its quota costs no lookup; never for a request
+    /// naming no item. The returned future stops when a [`ChunkSink`] call fails or is dropped
+    /// when the stream ends. Returning ends the answer; a panic ends it as a failure.
     fn serve(&self, peer: PeerId, request: Request, sink: ChunkSink<E>) -> Serving;
 }
 
@@ -284,21 +286,24 @@ impl<E: EthSpec> ChunkSink<E> {
 pub struct StreamedAnswer {
     queue: mpsc::Receiver<Queued>,
     started: Instant,
+    ready: Instant,
     task: AbortHandle,
     _slot: OwnedSemaphorePermit,
 }
 
 impl StreamedAnswer {
-    /// Runs `responder` on `peer`'s `request` on its own task, its chunks' context bytes from
-    /// `contexts`, each holding its bytes of `budget` while queued, the answer holding `slot`;
-    /// `None` outside a tokio runtime.
+    /// Runs `responder` on `peer`'s `request` on its own task from `ready` (the peer's first
+    /// token), its chunks' context bytes from `contexts`, each holding its bytes of `budget`
+    /// while queued, the answer holding `slot`; `None` outside a tokio runtime. A request
+    /// naming no item is not served: its empty answer ends at `ready`.
     pub(crate) fn start<E: EthSpec>(
-        responder: &dyn Responder<E>,
+        responder: Arc<dyn Responder<E>>,
         peer: PeerId,
         request: Request,
         contexts: Arc<ContextTable>,
         budget: PeerBytes,
         slot: OwnedSemaphorePermit,
+        ready: Instant,
     ) -> Option<Self> {
         let runtime = tokio::runtime::Handle::try_current().ok()?;
         let (done, queue) = mpsc::channel(STREAM_QUEUE_LEN);
@@ -310,24 +315,34 @@ impl StreamedAnswer {
             done.clone(),
             budget,
         );
-        let serving = responder.serve(peer, request, sink);
         let task = runtime.spawn(async move {
-            serving.await;
+            tokio::time::sleep_until(ready).await;
+            if max_chunks > 0 {
+                responder.serve(peer, request, sink).await;
+            }
             // Only a responder that returned says so: one that panicked or was aborted drops
             // its sink, which ends the answer as a failure.
             let _ = done.send(Queued::Done).await;
         });
+        let started = Instant::now();
         Some(Self {
             queue,
-            started: Instant::now(),
+            started,
+            ready: ready.max(started),
             task: task.abort_handle(),
             _slot: slot,
         })
     }
 
-    /// When the answer started: its deadlines run from here.
+    /// When the answer started: its total deadline runs from here.
     pub(crate) fn started(&self) -> Instant {
         self.started
+    }
+
+    /// When its responder starts (the peer's first token): its first-byte deadline runs from
+    /// here.
+    pub(crate) fn ready(&self) -> Instant {
+        self.ready
     }
 
     /// The next item; `None` once the responder's task is gone without saying it was done.
@@ -408,7 +423,7 @@ pub(crate) mod testing {
     /// [`serving_table`], holding the one slot of a fresh global cap and a fresh budget of
     /// `budget` bytes: the answer, the cap and the budget.
     pub(crate) fn start<E: EthSpec>(
-        responder: &dyn Responder<E>,
+        responder: &Arc<dyn Responder<E>>,
         request: Request,
         budget: usize,
     ) -> (StreamedAnswer, Arc<Semaphore>, PeerBytes) {
@@ -416,9 +431,17 @@ pub(crate) mod testing {
         let bytes = PeerBytes::new(budget);
         let slot = Arc::clone(&slots).try_acquire_owned().expect("a free slot");
         let contexts = serving_table(NetworkCaps::PRESET_BOUND);
-        let peer = PeerId::random();
-        let answer = StreamedAnswer::start(responder, peer, request, contexts, bytes.clone(), slot)
-            .expect("a runtime");
+        let (peer, budget, now) = (PeerId::random(), bytes.clone(), Instant::now());
+        let answer = StreamedAnswer::start(
+            Arc::clone(responder),
+            peer,
+            request,
+            contexts,
+            budget,
+            slot,
+            now,
+        )
+        .expect("a runtime");
         (answer, slots, bytes)
     }
 

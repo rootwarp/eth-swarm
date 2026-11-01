@@ -53,12 +53,17 @@
 //!   (`phase0` L1286–1288, L1514; `deneb` L876); the connection stays.
 //!   With a [`Responder`] the answer is streamed ([`super::responder`]): the request is checked
 //!   first, as above, before the responder runs or anything is read or booked (never clamped);
-//!   one asking for no block is an empty answer; else the responder produces its chunks on its
-//!   own task as the stream's writer sends them. The writer sends `2: ServerError` if no chunk
-//!   was produced by the first-byte deadline less [`STATUS_ANSWER_SLACK`] (4.5 s), and ends the
-//!   answer cleanly at its last whole chunk at the total deadline less the same slack (9.5 s),
+//!   then the responder produces its chunks on its own task, started once the peer's first
+//!   booked token is due, as the stream's writer sends them (one asking for no block is not
+//!   served: its empty answer goes out at that token). The writer sends `2: ServerError` if no
+//!   chunk was produced by the first-byte deadline less [`STATUS_ANSWER_SLACK`] (4.5 s after
+//!   the responder started), and ends the answer cleanly at its last whole chunk at the total
+//!   deadline less the same slack (9.5 s from when the answer was made),
 //!   ahead of the requester's deadlines and of `request_response`'s own [`REQUEST_TIMEOUT`],
-//!   which started before the request was read. A responder that returns ends the answer (with
+//!   which started before the request was read. A chunk whose token is due past that keeps the
+//!   stream open until then, never an early close (`phase0` L1269–1271). Past the global
+//!   stream cap the request is answered `2: ServerError` (see Limits). A responder that
+//!   returns ends the answer (with
 //!   no chunk: `2: ServerError` on a single-response protocol); one that panics, or whose chunk
 //!   the sink refused, ends it with `2: ServerError` if nothing went out, else at the last
 //!   whole chunk. The column protocols keep their own path below (#148 moves them onto a
@@ -116,10 +121,14 @@
 //!   its stream, so a peer over its quota cannot open more. A column stream holds its slot
 //!   while its lookup runs, too.
 //! - **Streamed answers**: at most [`RpcLimits::max_inbound_streams`] (256) at once over all
-//!   peers; one past them is dropped without a chunk (a reset, as the per-connection cap does)
-//!   and counted in `rpc_inbound_streams_refused_total`. A request books its
+//!   peers; one past them is answered one `2: ServerError` chunk ("too many streams"), then
+//!   closed: an error answer the requester reads as a failure, not a reset and not an empty
+//!   answer (#287). It is counted in `rpc_inbound_streams_refused_total`, paced like every
+//!   answer, and holds no slot: it starts no responder, reads nothing and books nothing. A
+//!   request books its
 //!   [`Responder::cost`] (by default the items it asks for) on its peer's bucket when it is
-//!   admitted, so a peer over its quota is held back from its first request on: its chunks go
+//!   admitted, so a peer over its quota is held back from its first request on: its lookup
+//!   starts once the first token is due (an empty answer goes out no sooner), and its chunks go
 //!   out at those tokens (then the pacer's), withheld whole, never an error or a close. What
 //!   the answer did not use goes back once it ended, past one token for its read; a reset
 //!   gives nothing back. Its chunks wait in a queue of [`super::responder::STREAM_QUEUE_LEN`]
@@ -1694,16 +1703,18 @@ impl<E: EthSpec> Control<E> {
     }
 
     /// Our answer to `peer`'s `request` from `responder` (see the module docs): checked first,
-    /// so one out of bounds is `1: InvalidRequest` before anything is read or booked, and one
-    /// naming nothing an empty answer; else the responder's streamed answer, its
-    /// [`Responder::cost`] booked. `None` drops the stream without a chunk: past the global
-    /// stream cap (counted), or for a peer no longer connected.
+    /// so one out of bounds is `1: InvalidRequest` before anything is read or booked; else the
+    /// responder's streamed answer, its [`Responder::cost`] booked and its lookup started once
+    /// the first token is due (one naming nothing is not served: an empty answer then). Past
+    /// the global stream cap it is one `2: ServerError` chunk (counted), paced like every
+    /// answer but holding no slot, starting no responder and booking nothing. `None` drops the
+    /// stream without a chunk, for a peer no longer connected.
     fn answer_streamed(
         &mut self,
         peer: PeerId,
         protocol: Protocol,
         request: Request,
-        responder: &dyn Responder<E>,
+        responder: &Arc<dyn Responder<E>>,
     ) -> Option<Answer<E>> {
         let invalid = match &request {
             Request::BlocksByRange(range) => out_of_bounds(range),
@@ -1714,14 +1725,12 @@ impl<E: EthSpec> Control<E> {
             let chunks = error_chunk(ResultCode::InvalidRequest, &why);
             return Some(self.paced(peer, protocol, chunks));
         }
-        if request.max_response_chunks() == 0 {
-            return Some(self.paced(peer, protocol, Vec::new()));
-        }
         let budget = self.peers.get(&peer)?.queued_bytes.clone();
         let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
             self.metrics.inbound_stream_refused();
-            tracing::debug!(%peer, %protocol, "inbound stream cap reached: stream dropped");
-            return None;
+            tracing::debug!(%peer, %protocol, "inbound stream cap reached: 2: ServerError");
+            let chunks = error_chunk(ResultCode::ServerError, "too many streams");
+            return Some(self.paced(peer, protocol, chunks));
         };
         let booked = BookedChunks::book(
             &self.limiter,
@@ -1732,8 +1741,10 @@ impl<E: EthSpec> Control<E> {
             self.cfg.limits.column_deadlines(),
         )
         .with_lookup_cost(1);
-        let contexts = Arc::clone(&self.cfg.contexts);
-        let Some(stream) = StreamedAnswer::start(responder, peer, request, contexts, budget, slot)
+        let (contexts, ready) = (Arc::clone(&self.cfg.contexts), booked.ready_at());
+        let responder = Arc::clone(responder);
+        let Some(stream) =
+            StreamedAnswer::start(responder, peer, request, contexts, budget, slot, ready)
         else {
             let chunks = error_chunk(ResultCode::ServerError, "no runtime");
             return Some(self.paced(peer, protocol, chunks));
@@ -1837,7 +1848,7 @@ impl<E: EthSpec> Control<E> {
                 let responder = self.blocks_responder.clone();
                 let request = Request::BlocksByRange(range);
                 let answer =
-                    responder.and_then(|r| self.answer_streamed(peer, protocol, request, &*r));
+                    responder.and_then(|r| self.answer_streamed(peer, protocol, request, &r));
                 if let Some(answer) = answer {
                     self.send_answer(protocol, channel, answer);
                 }
@@ -4230,7 +4241,7 @@ mod tests {
                 }
             })
         };
-        let answer = control.answer_streamed(peer, BLOCKS, blocks(128), &*all);
+        let answer = control.answer_streamed(peer, BLOCKS, blocks(128), &all);
         let mut reader = reader;
         let start = Instant::now();
         writer(&control)
@@ -4259,7 +4270,7 @@ mod tests {
         let lives = Lives::default();
         for (before, after, read) in [(0, 4_500, 0), (1, 9_500, 1)] {
             let answer =
-                control.answer_streamed(peer, BLOCKS, blocks(2), &*stalls_after(before, &lives));
+                control.answer_streamed(peer, BLOCKS, blocks(2), &stalls_after(before, &lives));
             let mut reader = Reader::new(Duration::ZERO);
             let start = Instant::now();
             writer(&control)
@@ -4291,15 +4302,18 @@ mod tests {
         let (reads, lives) = (Arc::new(AtomicUsize::new(0)), Lives::default());
         let endless = reading(u64::MAX, &reads, &lives);
         let start = Instant::now();
-        let answer = control.answer_streamed(peer, BLOCKS, blocks(128), &*endless);
+        let answer = control.answer_streamed(peer, BLOCKS, blocks(128), &endless);
         assert_eq!(
             control.streams.available_permits(),
             0,
             "the one slot is held"
         );
-        assert!(control
-            .answer_streamed(peer, BLOCKS, blocks(1), &*endless)
-            .is_none());
+        assert!(
+            control
+                .answer_streamed(peer, BLOCKS, blocks(1), &endless)
+                .is_some_and(|a| a.stream.is_none() && a.booked.is_none()),
+            "over the cap: an error answer, no stream"
+        );
         let mut reader = Reader::new(Duration::from_millis(10)).stopping_after(3, true);
         let err = writer(&control)
             .write_response(&BLOCKS, &mut reader, answer.unwrap())
@@ -4315,7 +4329,7 @@ mod tests {
             Duration::from_millis(1_280),
             "the 128 tokens stay spent"
         );
-        let next = control.answer_streamed(peer, BLOCKS, blocks(1), &*endless);
+        let next = control.answer_streamed(peer, BLOCKS, blocks(1), &endless);
         assert!(
             next.is_some_and(|a| a.stream.is_some()),
             "the slot serves again"
@@ -4344,9 +4358,10 @@ mod tests {
             (blocks(0), None),
         ] {
             let due = next_due(&control, peer);
-            let answer = control.answer_streamed(peer, BLOCKS, request, &*counting);
+            let answer = control.answer_streamed(peer, BLOCKS, request, &counting);
             let answer = answer.unwrap();
-            assert!(answer.stream.is_none(), "not served");
+            // `count` 0 waits for its token as a streamed answer, unserved (see below).
+            assert_eq!(answer.stream.is_some(), code.is_none(), "not served");
             assert_eq!(next_due(&control, peer), due, "nothing booked");
             let mut reader = Reader::new(Duration::ZERO);
             writer(&control)
@@ -4360,25 +4375,182 @@ mod tests {
         assert_eq!(control.streams.available_permits(), 256, "no slot taken");
     }
 
-    /// #18 (Vera 2): at most `max_inbound_streams` (256 by default) streamed answers at once
-    /// across all peers: the next stream is dropped without a chunk (reset, like
-    /// `request_response`'s own per-connection cap) and counted; a slot frees when an
-    /// answer's writer is gone.
+    /// When a responder's `serve` was called, and when it read its store.
+    #[derive(Clone, Default)]
+    struct Calls {
+        serve: Arc<std::sync::Mutex<Vec<Instant>>>,
+        read: Arc<std::sync::Mutex<Vec<Instant>>>,
+    }
+
+    impl Calls {
+        fn serve(&self) -> Vec<Instant> {
+            self.serve.lock().unwrap().clone()
+        }
+
+        fn read(&self) -> Vec<Instant> {
+            self.read.lock().unwrap().clone()
+        }
+    }
+
+    /// A store of the blocks of slots 1..=4: sends those in the range asked for, logging in
+    /// `calls` when `serve` was called and when it read.
+    fn store_of_four(calls: &Calls) -> Arc<dyn Responder<Spec>> {
+        let calls = calls.clone();
+        testing::script(move |request, mut sink| {
+            calls.serve.lock().unwrap().push(Instant::now());
+            let calls = calls.clone();
+            async move {
+                calls.read.lock().unwrap().push(Instant::now());
+                let Request::BlocksByRange(range) = request else {
+                    return;
+                };
+                let end = range.start_slot.saturating_add(range.count);
+                for slot in (range.start_slot..end).filter(|s| (1..=4).contains(s)) {
+                    if sink.send(testing::block(slot)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Puts `peer` `tokens` BlocksByRange tokens (more) in debt: when its next token is due.
+    fn in_debt(control: &Control<Spec>, peer: PeerId, tokens: u64) -> Instant {
+        let now = Instant::now();
+        let _ = control
+            .limiter
+            .lock()
+            .unwrap()
+            .charge_block(peer, BLOCKS, tokens, now);
+        next_due(control, peer)
+    }
+
+    /// Writes `answer` on its own task to a requester that takes every write at once: when
+    /// the writer returned, and the bytes written.
+    fn write_on_task(
+        control: &Control<Spec>,
+        answer: Answer<Spec>,
+    ) -> tokio::task::JoinHandle<(Instant, Vec<u8>)> {
+        let mut codec = writer(control);
+        tokio::spawn(async move {
+            let mut reader = Reader::new(Duration::ZERO);
+            codec
+                .write_response(&BLOCKS, &mut reader, answer)
+                .await
+                .unwrap();
+            (Instant::now(), reader.bytes)
+        })
+    }
+
+    /// Vera B1, Cole B1: a peer in debt gets no store lookup until its token is due, and no
+    /// empty answer before then either, so looping requests that find nothing (or ask for
+    /// nothing) runs at its quota, not at network speed. `count` 0 is never served.
+    #[tokio::test(start_paused = true)]
+    async fn empty_answers_wait_for_the_peers_token() {
+        let (mut control, _, peers) = serving(1, |l| {
+            l.rate.blocks_by_range = Quota::new(1, Duration::from_secs(1));
+        });
+        let peer = peers[0];
+        let past_the_store = Request::BlocksByRange(BlocksByRangeV2Request {
+            start_slot: 100,
+            count: 4,
+            step: 1,
+        });
+        for (case, request, served) in [
+            ("count 0", blocks(0), false),
+            ("an empty range", past_the_store, true),
+        ] {
+            let calls = Calls::default();
+            let store = store_of_four(&calls);
+            let ready = in_debt(&control, peer, 3);
+            let answer = control.answer_streamed(peer, BLOCKS, request, &store);
+            let write = write_on_task(&control, answer.unwrap());
+            tokio::time::sleep_until(ready - Duration::from_millis(1)).await;
+            assert_eq!(calls.serve(), [], "{case}: serve before the token");
+            assert_eq!(calls.read(), [], "{case}: a store read before the token");
+            assert!(!write.is_finished(), "{case}: answered before the token");
+            let (done, wire) = write.await.unwrap();
+            assert_eq!(done, ready, "{case}: answered at the token");
+            assert!(wire.is_empty(), "{case}: an empty answer, no error chunk");
+            let at = if served { vec![ready] } else { vec![] };
+            assert_eq!(calls.serve(), at, "{case}: served at the token");
+            assert_eq!(calls.read(), at, "{case}: read at the token");
+        }
+    }
+
+    /// Vera B1, Cole B1: a peer's lookup starts when its first token is due, not when the
+    /// request came, and its chunks go out at their tokens. A token due past the first-byte
+    /// deadline is rate limiting, never `2: ServerError` (`phase0` L1269–1274): the
+    /// first-byte deadline runs from the token.
+    #[tokio::test(start_paused = true)]
+    async fn lookup_waits_for_the_peers_token() {
+        let (mut control, _, peers) = serving(1, |l| {
+            l.rate.blocks_by_range = Quota::new(1, Duration::from_secs(1));
+        });
+        let peer = peers[0];
+        let calls = Calls::default();
+        let store = store_of_four(&calls);
+        let ready = in_debt(&control, peer, 6);
+        let answer = control.answer_streamed(peer, BLOCKS, blocks(4), &store);
+        let write = write_on_task(&control, answer.unwrap());
+        tokio::time::sleep_until(ready - Duration::from_millis(1)).await;
+        assert_eq!(calls.serve(), [], "serve before the token");
+        assert_eq!(calls.read(), [], "a store read before the token");
+        let (done, wire) = write.await.unwrap();
+        assert_eq!(calls.serve(), [ready], "served at the token");
+        assert_eq!(calls.read(), [ready], "read at the token");
+        let read = read_back(&wire).await;
+        let slots: Vec<u64> = read
+            .iter()
+            .map(|c| match c {
+                ResponseChunk::Success(Response::Block(b)) => b.slot(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(slots, [1, 2, 3, 4]);
+        assert_eq!(done - ready, Duration::from_secs(3), "one token a second");
+    }
+
+    /// #18 (Vera 2, Ezra's ruling on B): at most `max_inbound_streams` (256 by default)
+    /// streamed answers at once across all peers: the next stream is answered one
+    /// `2: ServerError` chunk, then closed, and counted. The refusal starts no responder,
+    /// reads nothing, books nothing and holds no slot; a slot frees when an answer's writer is
+    /// gone.
     #[tokio::test(start_paused = true)]
     async fn global_inbound_stream_cap() {
         assert_eq!(RpcLimits::default().max_inbound_streams, 256);
-        let (mut control, metrics, peers) = serving(3, |l| l.max_inbound_streams = 2);
+        let (mut control, metrics, peers) = serving(3, |l| {
+            l.max_inbound_streams = 2;
+            l.rate.blocks_by_range = Quota::new(1, Duration::from_secs(1));
+        });
         let held = stalls_after(0, &Lives::default());
-        let first = control.answer_streamed(peers[0], BLOCKS, blocks(1), &*held);
-        let second = control.answer_streamed(peers[1], BLOCKS, blocks(1), &*held);
+        let first = control.answer_streamed(peers[0], BLOCKS, blocks(1), &held);
+        let second = control.answer_streamed(peers[1], BLOCKS, blocks(1), &held);
         assert!(first.is_some() && second.is_some());
-        assert!(control
-            .answer_streamed(peers[2], BLOCKS, blocks(1), &*held)
-            .is_none());
+        let calls = Calls::default();
+        let store = store_of_four(&calls);
+        let due = next_due(&control, peers[2]);
+        let Some(refused) = control.answer_streamed(peers[2], BLOCKS, blocks(1), &store) else {
+            panic!("#18: dropped without an answer");
+        };
+        assert!(refused.stream.is_none(), "no responder task");
+        assert!(refused.booked.is_none() && refused.permit.is_none());
+        assert_eq!(next_due(&control, peers[2]), due, "nothing booked");
+        assert_eq!(control.streams.available_permits(), 0, "no slot taken");
         assert_eq!(metrics.inbound_streams_refused(), 1);
+        let (_, wire) = write_on_task(&control, refused).await.unwrap();
+        let read = read_back(&wire).await;
+        let [ResponseChunk::Error { code, message }] = &read[..] else {
+            panic!("#18: one error chunk, not {read:?}");
+        };
+        assert_eq!(*code, ResultCode::ServerError);
+        assert_eq!(&message[..], b"too many streams");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(calls.serve(), [], "no responder");
+        assert_eq!(calls.read(), [], "no store read");
         drop(first);
         assert!(control
-            .answer_streamed(peers[2], BLOCKS, blocks(1), &*held)
+            .answer_streamed(peers[2], BLOCKS, blocks(1), &held)
             .is_some());
         assert_eq!(metrics.inbound_streams_refused(), 1);
     }
@@ -4394,7 +4566,7 @@ mod tests {
         let budget = control.cfg.limits.max_queued_bytes_per_peer;
         let (reads, lives) = (Arc::new(AtomicUsize::new(0)), Lives::default());
         let responder = reading(128, &reads, &lives);
-        let answer = control.answer_streamed(peer, BLOCKS, blocks(128), &*responder);
+        let answer = control.answer_streamed(peer, BLOCKS, blocks(128), &responder);
         tokio::time::sleep(Duration::from_secs(3)).await;
         // The queue's chunks and the one waiting for room.
         assert_eq!(reads.load(Ordering::SeqCst), STREAM_QUEUE_LEN + 1);
@@ -4429,7 +4601,7 @@ mod tests {
             assert_eq!(free_bytes(control, peer), budget);
         };
         // The writer dropped mid-answer.
-        let answer = control.answer_streamed(peer, BLOCKS, blocks(128), &*endless);
+        let answer = control.answer_streamed(peer, BLOCKS, blocks(128), &endless);
         let mut reader = Reader::new(Duration::from_millis(100));
         let mut codec = writer(&control);
         let write = codec.write_response(&BLOCKS, &mut reader, answer.unwrap());
@@ -4439,13 +4611,13 @@ mod tests {
         lives.gone().await;
         freed(&control);
         // Dropped before its writer started (the stream closed first).
-        let answer = control.answer_streamed(peer, BLOCKS, blocks(128), &*endless);
+        let answer = control.answer_streamed(peer, BLOCKS, blocks(128), &endless);
         tokio::task::yield_now().await;
         drop(answer);
         lives.gone().await;
         freed(&control);
         // A deadline: nothing produced in time.
-        let answer = control.answer_streamed(peer, BLOCKS, blocks(1), &*stalls_after(0, &lives));
+        let answer = control.answer_streamed(peer, BLOCKS, blocks(1), &stalls_after(0, &lives));
         let mut reader = Reader::new(Duration::ZERO);
         writer(&control)
             .write_response(&BLOCKS, &mut reader, answer.unwrap())
@@ -4470,7 +4642,7 @@ mod tests {
                 }
                 panic!("a responder bug");
             });
-            let answer = control.answer_streamed(peer, BLOCKS, blocks(4), &*buggy);
+            let answer = control.answer_streamed(peer, BLOCKS, blocks(4), &buggy);
             let mut reader = Reader::new(Duration::ZERO);
             writer(&control)
                 .write_response(&BLOCKS, &mut reader, answer.unwrap())
@@ -4506,7 +4678,7 @@ mod tests {
                 sink.send(testing::block(slot)).await.unwrap();
             }
         });
-        let answer = control.answer_streamed(peer, BLOCKS, blocks(10), &*two);
+        let answer = control.answer_streamed(peer, BLOCKS, blocks(10), &two);
         assert_eq!(
             next_due(&control, peer) - start,
             Duration::from_secs(10),
@@ -4529,7 +4701,7 @@ mod tests {
             "8 went back"
         );
         let nothing = testing::script(|_, _| async {});
-        let answer = control.answer_streamed(peer, BLOCKS, blocks(10), &*nothing);
+        let answer = control.answer_streamed(peer, BLOCKS, blocks(10), &nothing);
         let mut reader = Reader::new(Duration::ZERO);
         writer(&control)
             .write_response(&BLOCKS, &mut reader, answer.unwrap())
@@ -4554,7 +4726,8 @@ mod tests {
                 self.0.serve(peer, request, sink)
             }
         }
-        let flat = Flat(testing::script(|_, _| futures::future::pending()));
+        let flat: Arc<dyn Responder<Spec>> =
+            Arc::new(Flat(testing::script(|_, _| futures::future::pending())));
         let _held = control.answer_streamed(peer, BLOCKS, blocks(128), &flat);
         assert_eq!(
             next_due(&control, peer) - start,
@@ -4737,8 +4910,9 @@ mod tests {
     /// declared length; #11: bytes after the one request chunk) or a count over the cap (#17)
     /// is `1: InvalidRequest` and never reaches it (#12); column requests over their caps never
     /// reach the store (#17). A peer's third concurrent stream is reset (#14); a stream past
-    /// the global cap is dropped without a chunk (#18); a peer that goes away mid-answer frees
-    /// its task and its slot (#2, #20).
+    /// the global cap is answered `2: ServerError`, which the requester reads as a failure, not
+    /// an empty answer (#18); a peer that goes away mid-answer frees its task and its slot
+    /// (#2, #20).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn streamed_blocks_over_a_swarm() {
         let (lives, calls, lookups) = (
@@ -4865,15 +5039,29 @@ mod tests {
             refused.as_ref().map_or(true, Vec::is_empty),
             "#14: {refused:?}"
         );
-        // Both global slots are held: another peer's stream is dropped without a chunk.
+        // Both global slots are held: another peer's stream is answered `2: ServerError`, a
+        // failure, never an empty answer.
         lives_at(&lives, 2).await;
         let mut b = raw_peer(BLOCKS, &addr).await;
         let id = b
             .behaviour_mut()
             .send_request(&ours, encode_request(&blocks(2)).unwrap());
-        let mut dropped = Outcomes::new();
-        run_until(&mut b, &mut dropped, 1).await;
-        assert!(dropped[&id].as_ref().map_or(true, Vec::is_empty), "#18");
+        let mut over_cap = Outcomes::new();
+        run_until(&mut b, &mut over_cap, 1).await;
+        let read = match &over_cap[&id] {
+            Ok(wire) => read_wire(BLOCKS, wire).await,
+            Err(e) => panic!("#18: {e}"),
+        };
+        assert!(
+            matches!(
+                read[..],
+                [ResponseChunk::Error {
+                    code: ResultCode::ServerError,
+                    ..
+                }]
+            ),
+            "#18: a `2: ServerError` answer, never an empty one: {read:?}"
+        );
         assert_eq!(metrics.inbound_streams_refused(), 1);
         gate.add_permits(1);
         run_until(&mut a, &mut done, 3).await;

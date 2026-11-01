@@ -244,9 +244,11 @@ pub const DEFAULT_COLUMN_QUEUE_LEN: usize = 64;
 
 /// Inbound streams answered by a [`super::responder::Responder`] at once, over every peer
 /// \[est\]: 256, two (`MAX_CONCURRENT_REQUESTS`) for each of 128 inbound connections. One past
-/// it is dropped without a chunk (a reset, as `request_response`'s own per-connection cap does)
-/// and counted in `rpc_inbound_streams_refused_total`. The control protocols and the column
-/// answers have their own bounds (their quotas; [`ColumnPlaces`] and the column queue).
+/// it is answered one `2: ServerError` chunk, then closed (an error answer, not a reset and
+/// not an empty one; it holds no slot, see [`super::inbound`]), and counted in
+/// `rpc_inbound_streams_refused_total`. The control protocols and the column answers have
+/// their own bounds (their quotas;
+/// [`ColumnPlaces`] and the column queue).
 pub const DEFAULT_MAX_INBOUND_STREAMS: usize = 256;
 
 /// Encoded response bytes one peer's streamed answers hold queued at once \[est\]: 4 MiB, a
