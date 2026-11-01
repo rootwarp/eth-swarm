@@ -315,7 +315,7 @@ for path in Cargo.toml Cargo.lock fuzz/Cargo.lock crates/p2p-wire/src/lib.rs cra
   crates/network-config/src/lib.rs crates/cl-p2p/src/main.rs crates/cl-chain/placeholder.rs \
   crates/cl-chain-columns/placeholder.rs crates/cl-discv5/placeholder.rs crates/ethswarm-proto/placeholder.rs \
   crates/ipc/placeholder.rs crates/node-key/placeholder.rs crates/state-transition/placeholder.rs \
-  crates/svc-runtime/placeholder.rs \
+  crates/store-schema/placeholder.rs crates/svc-runtime/placeholder.rs \
   proto/ethswarm/placeholder.rs fuzz/Cargo.toml fuzz/rust-toolchain.toml fuzz/src/lib.rs fuzz/fuzz_targets/status_v2.rs \
   fuzz/corpus/status_v2/valid fuzz/corpus-slow/blocks_by_range_resp/slow-seed fuzz/m2a-common.sh fuzz/build-m2a.sh fuzz/run-m2a-gate.sh; do
   echo '# changed' >> "$fx/$path"

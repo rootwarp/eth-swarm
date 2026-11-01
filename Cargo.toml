@@ -4,6 +4,7 @@ members = [
     "crates/spec-tests",
     "crates/cl-verify-cache",
     "crates/cl-chain-columns",
+    "crates/store-schema",
     "crates/ci-checks",
     "crates/network-config",
     "crates/consensus-types",

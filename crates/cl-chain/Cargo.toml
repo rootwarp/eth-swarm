@@ -13,6 +13,10 @@ description = "cl-chain: the ethswarm.chain.v1 service (stub: contract layer onl
 # pick the /metrics port, so the integration tests can run it as the developer's user. Only
 # cl-chain's own dev-dependency turns it on; the cl-chain binary never reads the variable.
 test-config = []
+# The crash-injection seam of persist::durable (`FileSet::open_crashing`, `Step`,
+# `Error::Crashed`): at a named step of a durable write an injected crash returns early and
+# leaves the disk as it is. Only cl-chain's own dev-dependency turns it on.
+test-hooks = []
 
 # The test binary of the service, built only with test-config. Its unit tests are cl-chain's.
 [[bin]]
@@ -64,7 +68,11 @@ svc-runtime = { path = "../svc-runtime" }
 
 [dev-dependencies]
 # test-config: tests/service.rs runs the test binary cl-chain-test.
-cl-chain = { path = ".", features = ["test-config"] }
+# test-hooks: tests/durable.rs injects crashes into the durable file set.
+cl-chain = { path = ".", features = ["test-config", "test-hooks"] }
+# tests/durable.rs: the MDBX env beside the durable file set (blocks, schema version).
+store-schema = { path = "../store-schema" }
+libmdbx = "=0.5.6"
 ipc = { path = "../ipc", features = ["testkit"] }
 # owned::testkit: temp directories with no symlink on their path, for the owner walk.
 svc-runtime = { path = "../svc-runtime", features = ["testkit"] }

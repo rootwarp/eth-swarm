@@ -1,5 +1,7 @@
 //! On-disk layout of the column store. Readers in other processes (cl-store) decode the same
-//! bytes, so changing anything here is a schema change.
+//! bytes, so changing anything here is a schema change. The env, its table names and the
+//! `slot ‖ root` key shape are [`store_schema`]'s; the env also holds store-schema's other
+//! tables (`blocks`, `states`) and `meta` rows (`schema_version`, the reserved `stamp`).
 //!
 //! | table              | key                                                   | value                       |
 //! |--------------------|-------------------------------------------------------|-----------------------------|
@@ -17,17 +19,18 @@
 pub type BlockRoot = [u8; 32];
 
 /// Column sidecars: [`column_key`] → opaque SSZ bytes.
-pub const COLUMNS_TABLE: &str = "columns";
+pub const COLUMNS_TABLE: &str = store_schema::tables::COLUMNS;
 /// Index from block root to the slot that prefixes its column keys.
-pub const ROOTS_TABLE: &str = "column_roots";
+pub const ROOTS_TABLE: &str = store_schema::tables::COLUMN_ROOTS;
 /// Index from block root to the block's [`BlockLink`]: how it ties to the stored block before
 /// it on its chain.
-pub const LINKS_TABLE: &str = "column_links";
+pub const LINKS_TABLE: &str = store_schema::tables::COLUMN_LINKS;
 /// Small scalar values for this env: the custody record ([`CGC_KEY`], [`CGC_SET_SLOT_KEY`],
 /// [`METADATA_SEQ_KEY`], [`ADVERTISED_CGC_KEY`]), [`FINALIZED_SLOT_KEY`],
 /// [`RETAINED_FROM_KEY`], [`FIRST_STORED_SLOT_KEY`] and [`CONTIGUOUS_FROM_KEY`].
-pub const META_TABLE: &str = "meta";
-/// Every table this env holds, in creation order.
+pub const META_TABLE: &str = store_schema::tables::META;
+/// The column store's tables, in creation order. The env holds store-schema's other tables too
+/// ([`store_schema::tables::TABLES`]).
 pub const TABLES: [&str; 4] = [COLUMNS_TABLE, ROOTS_TABLE, META_TABLE, LINKS_TABLE];
 
 /// [`META_TABLE`] key of the node's custody group count. It never decreases
@@ -150,7 +153,7 @@ impl BlockLink {
 /// Length of a [`column_key`].
 pub const COLUMN_KEY_LEN: usize = BLOCK_PREFIX_LEN + 8;
 /// Length of a [`block_prefix`].
-pub const BLOCK_PREFIX_LEN: usize = 8 + 32;
+pub const BLOCK_PREFIX_LEN: usize = store_schema::keys::SLOT_ROOT_KEY_LEN;
 
 /// Key of one column: `slot BE ‖ block_root ‖ column_index BE`.
 #[must_use]
@@ -161,13 +164,11 @@ pub fn column_key(slot: u64, block_root: &BlockRoot, column_index: u64) -> [u8; 
     key
 }
 
-/// Prefix shared by every column key of one block: `slot BE ‖ block_root`.
+/// Prefix shared by every column key of one block: `slot BE ‖ block_root`, the
+/// [`store_schema::keys::slot_root_key`] of the block.
 #[must_use]
 pub fn block_prefix(slot: u64, block_root: &BlockRoot) -> [u8; BLOCK_PREFIX_LEN] {
-    let mut prefix = [0u8; BLOCK_PREFIX_LEN];
-    prefix[..8].copy_from_slice(&slot.to_be_bytes());
-    prefix[8..].copy_from_slice(block_root);
-    prefix
+    store_schema::keys::slot_root_key(slot, block_root)
 }
 
 /// Splits a [`column_key`] into `(slot, block_root, column_index)`; `None` if the length is wrong.

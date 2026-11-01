@@ -1,0 +1,21 @@
+[package]
+name = "store-schema"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "The MDBX env cl-chain writes: options, tables, keys and the schema version (ADR-008)."
+
+# Normal dependencies are libmdbx and thiserror only (consensus-types is also allowed):
+# scripts/check-store-schema-deps.sh fails on anything else.
+[dependencies]
+# MPL-2.0, unmodified. Builds the native mdbx-sys 12.13.2. Exact pin: bumps need a dependency review.
+libmdbx = "=0.5.6"
+thiserror = "2"
+
+[dev-dependencies]
+# Same crate libmdbx links; tests read env flags and options straight from the C API.
+mdbx-sys = "=12.13.2"
+proptest = "1"
+tempfile = "3"

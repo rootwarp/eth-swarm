@@ -85,6 +85,7 @@ M2A_KEY_PATHS=(
   crates/node-key
   crates/p2p-wire
   crates/state-transition
+  crates/store-schema
   crates/svc-runtime
   proto/ethswarm
   fuzz/Cargo.toml
@@ -115,8 +116,9 @@ GATE2A_KEY_PATHS=(
 )
 
 # Gate 2b's key: the m2a key (the closure holds cl-chain's storage contract, column store and
-# column RPCs, the column env of cl-chain-columns, whose MDBX binding the lockfiles pin, the
-# chain.v1 messages and ipc), plus fuzz/run-gate2b.sh. Both lockfiles are keyed as for m2a.
+# column RPCs, the column env of cl-chain-columns on store-schema's env (options, geometry,
+# tables, schema version), whose MDBX binding the lockfiles pin, the chain.v1 messages and ipc),
+# plus fuzz/run-gate2b.sh. Both lockfiles are keyed as for m2a.
 GATE2B_KEY_PATHS=(
   "${M2A_KEY_PATHS[@]}"
   fuzz/run-gate2b.sh
@@ -178,7 +180,8 @@ M2A_REQUIRED_SECONDS=3600
 # length), its requests those requests, and a sidecar it builds holds at most four cells; its
 # column env is a memory map, not an allocation. -rss_limit_mb=2048 bounds the whole process,
 # column_contract's column env included: one env at a time (one per input, removed after it),
-# its map at most cl-chain-columns' MIN_MAX_SIZE (256 MiB) even with every page resident.
+# its map at most MIN_MAX_SIZE (256 MiB; store-schema's, which cl-chain-columns re-exports) even
+# with every page resident.
 # -timeout=10 s per input; column_contract's wait for its writer thread (WRITER_WAIT in
 # fuzz/src/contract.rs, 8 s) stays 2 s under it, which fuzz/tests/writer_wait.rs checks.
 #
