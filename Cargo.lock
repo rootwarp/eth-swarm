@@ -1137,6 +1137,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cl-node"
+version = "0.1.0"
+dependencies = [
+ "cl-node",
+ "libc",
+ "rustix",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "cl-p2p"
 version = "0.1.0"
 dependencies = [

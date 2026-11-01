@@ -1,0 +1,36 @@
+[package]
+name = "cl-node"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "cl-node: generates the eight services' systemd units (and ethswarm.target) and launches them in the foreground for containers. A launcher only: it holds no state and links no service crate."
+
+[features]
+# Builds cl-node-fake-service (below), the stand-in service binary of tests/launch.rs. Only
+# cl-node's own dev-dependency turns it on.
+test-fake-service = []
+
+# A test-only stand-in for cl-<svc>, scripted per service by the test. Never deploy it.
+[[bin]]
+name = "cl-node-fake-service"
+path = "src/bin/fake-service.rs"
+required-features = ["test-fake-service"]
+test = false
+
+[dependencies]
+# launch: one current-thread task waits on SIGTERM/SIGINT/SIGCHLD, the readiness sockets and
+# the deadlines. The features svc-runtime already uses.
+tokio = { version = "1", features = ["rt", "macros", "net", "signal", "time"] }
+# launch: waitid(WNOWAIT), process-group signals, SCM_CREDENTIALS on the readiness socket and
+# the child's setgroups/setresgid/setresuid. The version ipc already uses.
+rustix = { version = "1", features = ["fs", "process", "net", "thread"] }
+# launch: getpwnam_r/getgrnam_r for the units' users and groups (NSS, as systemd resolves them).
+# The version cl-p2p already uses.
+libc = "0.2.190"
+
+[dev-dependencies]
+# test-fake-service: tests/launch.rs runs cl-node-fake-service.
+cl-node = { path = ".", features = ["test-fake-service"] }
+tempfile = "3"
