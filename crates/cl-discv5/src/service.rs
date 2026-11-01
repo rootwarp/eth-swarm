@@ -7,15 +7,17 @@
 //! - **Fork filter** ([`PeerFilter`]): our fork digest and the IP rules together. The digest is
 //!   read from the local record each time ([`Discovery::filter`]), so it follows a local-record
 //!   update at a fork or BPO boundary. It is the
-//!   `find_node_predicate` closure ([`fork_predicate`]), so a lookup returns only records whose
-//!   `eth2.fork_digest` is ours and that pass the IP rules, and it filters the event stream.
+//!   `find_node_predicate` closure ([`lookup_predicate`], with what the lookup wants), so a
+//!   lookup returns only records whose `eth2.fork_digest` is ours and that pass the IP rules,
+//!   and it filters the event stream.
 //!   The `next_fork_*` fields and `nfd` are not compared: a peer that plans another next fork
 //!   is still on our fork until the boundary, and `fulu/p2p-interface.md` forbids dropping it
 //!   before then.
 //! - **Service** ([`Discovery`]): `Discv5::new` with the local record and node key, the IP
 //!   rules as `table_filter`, then `start` and the event stream ([`Events`]). Lookups go
-//!   through [`Discovery::find_peers`], which runs the [`PeerFilter`] as the predicate and then
-//!   checks every returned record against it again ([`PeerFilter::retain`]). Events go through
+//!   through [`Discovery::find_peers_matching`] ([`Discovery::find_peers`] wants any peer),
+//!   which runs the [`PeerFilter`] and the lookup's own predicate and then checks every
+//!   returned record against both again ([`PeerFilter::retain`]). Events go through
 //!   [`Events::next`], which applies the [`PeerFilter`] to every record and, for a session,
 //!   the IP rules to its source address too.
 //! - **Table eviction** ([`EvictionReason`]): discv5 0.12 does not run `table_filter` on every
@@ -224,9 +226,12 @@ pub fn table_evictions<'a>(
         .collect()
 }
 
-/// The `find_node_predicate` closure: [`PeerFilter::accepts`].
-pub fn fork_predicate(filter: PeerFilter) -> Box<dyn Fn(&Enr) -> bool + Send> {
-    Box::new(move |enr| filter.accepts(enr))
+/// The `find_node_predicate` closure: [`PeerFilter::accepts`] and `wanted`.
+pub fn lookup_predicate(
+    filter: PeerFilter,
+    wanted: impl Fn(&Enr) -> bool + Send + 'static,
+) -> Box<dyn Fn(&Enr) -> bool + Send> {
+    Box::new(move |enr| filter.accepts(enr) && wanted(enr))
 }
 
 /// How long the table keeps the records of our digest before a change, by default
@@ -638,20 +643,44 @@ impl Discovery {
     }
 
     /// An iterative lookup towards `target` that returns at most `max_peers` peers, every one
-    /// on our fork digest and within the IP rules: the lookup runs [`fork_predicate`], and every
-    /// record it returns is checked again ([`PeerFilter::retain`]), because discv5 can return
-    /// an older copy of a record than the one the predicate passed.
+    /// on our fork digest and within the IP rules ([`Self::find_peers_matching`] with no
+    /// predicate of its own).
     pub async fn find_peers(
         &self,
         target: NodeId,
         max_peers: usize,
     ) -> Result<Vec<Enr>, ServiceError> {
-        let filter = self.filter();
-        self.discv5
-            .find_node_predicate(target, fork_predicate(filter), max_peers)
+        self.find_peers_matching(target, |_: &Enr| true, max_peers)
             .await
-            .map(|enrs| filter.retain(enrs))
-            .map_err(|e| ServiceError::Query(e.to_string()))
+    }
+
+    /// An iterative lookup towards `target` that returns at most `max_peers` peers, every one
+    /// on our fork digest, within the IP rules and passed by `predicate`: the lookup runs
+    /// [`lookup_predicate`], and every record it returns is checked against both again
+    /// ([`PeerFilter::retain`], then `predicate`), because discv5 can return an older copy of a
+    /// record than the one the predicate passed.
+    pub async fn find_peers_matching<P>(
+        &self,
+        target: NodeId,
+        predicate: P,
+        max_peers: usize,
+    ) -> Result<Vec<Enr>, ServiceError>
+    where
+        P: Fn(&Enr) -> bool + Clone + Send + 'static,
+    {
+        let filter = self.filter();
+        let found = self
+            .discv5
+            .find_node_predicate(
+                target,
+                lookup_predicate(filter, predicate.clone()),
+                max_peers,
+            )
+            .await
+            .map_err(|e| ServiceError::Query(e.to_string()))?;
+        let mut found = filter.retain(found);
+        found.retain(|enr| predicate(enr));
+        Ok(found)
     }
 }
 
@@ -2116,6 +2145,95 @@ mod tests {
             assert!(filter.accepts(enr), "{enr}");
         }
         drop(b);
+    }
+
+    /// As above, for a lookup with a predicate of its own: the stale copy is on our fork but
+    /// lacks what the predicate wants (attestation subnet 0), so only the check of every
+    /// result against the predicate again keeps it out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn find_peers_matching_checks_every_result_against_the_predicate_again() {
+        let ours = sepolia_fields(274_175);
+        let (a, _a_events) = node(&ours).await;
+        let (x, _x_events) = node(&ours).await;
+        let (b, _b_events, stale, fresh) = start_on_free_port(|port| {
+            let ours = &ours;
+            async move {
+                let b_key = CombinedKey::generate_secp256k1();
+                let stale = loopback_enr(&b_key, ours, port);
+                let mut fresh = stale.clone();
+                fresh
+                    .insert(
+                        "attnets",
+                        &alloy_rlp::Bytes::from(vec![1, 0, 0, 0, 0, 0, 0, 0]),
+                        &b_key,
+                    )
+                    .unwrap();
+                assert!(fresh.seq() > stale.seq());
+                let b_config = DiscoveryConfig {
+                    udp_port: port,
+                    ..DiscoveryConfig::new(Ipv4Addr::LOCALHOST.into(), NetworkMode::Devnet)
+                };
+                let mut b = Discovery::new(fresh.clone(), b_key, &b_config).unwrap();
+                let b_events = b.start().await?;
+                Ok((b, b_events, stale, fresh))
+            }
+        })
+        .await;
+        let wants_subnet_0 =
+            |enr: &Enr| crate::enr::EnrFields::read(enr).is_ok_and(|f| f.attnets & 1 != 0);
+        assert!(wants_subnet_0(&fresh) && !wants_subnet_0(&stale));
+
+        let (x_raw, b_raw) = (x.local_enr().node_id().raw(), fresh.node_id().raw());
+        let xor: [u8; 32] = std::array::from_fn(|i| x_raw[i] ^ b_raw[i]);
+        let first = xor.iter().position(|&byte| byte != 0).unwrap();
+        let k = 256 - (first * 8 + xor[first].leading_zeros() as usize);
+        assert!(k >= 2, "log2 distance {k}");
+        let bit = k - 2;
+        let mut target = x_raw;
+        target[31 - bit / 8] ^= 1 << (bit % 8);
+        let target = NodeId::new(&target);
+
+        a.add_enr(x.local_enr()).unwrap();
+        a.add_enr(stale.clone()).unwrap();
+        x.add_enr(fresh.clone()).unwrap();
+        let found = a
+            .find_peers_matching(target, wants_subnet_0, 1)
+            .await
+            .unwrap();
+        let filter = a.filter();
+        for enr in &found {
+            assert!(filter.accepts(enr) && wants_subnet_0(enr), "{enr}");
+        }
+        drop(b);
+    }
+
+    /// The lookup predicate passes a record only when the filter (fork digest, IP rules) and
+    /// the wanted match both pass it.
+    #[test]
+    fn the_lookup_predicate_needs_the_filter_and_the_wanted_match() {
+        let ours = sepolia_fields(274_175);
+        let other = sepolia_fields(274_176);
+        let key = CombinedKey::generate_secp256k1();
+        let at = |fork: &ForkFields, ip: Ipv4Addr| {
+            build_local_enr(&key, fork, 4, &LocalAddr::new(ip)).unwrap()
+        };
+        let filter = PeerFilter {
+            previous: None,
+            fork_digest: ours.eth2.fork_digest,
+            mode: NetworkMode::Public,
+        };
+        let on = at(&ours, Ipv4Addr::new(8, 8, 8, 8));
+        let off = at(&other, Ipv4Addr::new(8, 8, 8, 8));
+        let loopback = at(&ours, Ipv4Addr::LOCALHOST);
+        let anything = lookup_predicate(filter, |_: &Enr| true);
+        assert!(anything(&on));
+        assert!(!anything(&off));
+        assert!(!anything(&loopback));
+        let nothing = lookup_predicate(filter, |_: &Enr| false);
+        assert!(!nothing(&on));
+        let only_on = on.node_id();
+        let just_on = lookup_predicate(filter, move |enr: &Enr| enr.node_id() == only_on);
+        assert!(just_on(&on));
     }
 
     #[test]

@@ -226,6 +226,9 @@ fn expected(spec: &RecordSpec<'_>) -> Option<Result<EnrFields, FieldError>> {
             eth2: decode_eth2(eth2.ok_or(FieldError::NoEth2)?)?,
             cgc: cgc.map(decode_cgc).transpose()?,
             nfd: nfd.map(decode_nfd).transpose()?,
+            // A structured record has no `attnets` or `syncnets`: absent is all zero.
+            attnets: 0,
+            syncnets: 0,
         })
     })())
 }

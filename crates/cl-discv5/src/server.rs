@@ -6,25 +6,36 @@
 //!   reports from then on ([`PeerFeed`]). A watcher that falls behind the feed loses the oldest
 //!   candidates (and the next lookup finds them again), so no watcher can hold discv5 back. The
 //!   stream ends with `UNAVAILABLE` when cl-discv5 stops, so it does not hold the drain.
+//! - **`FindPeers`**: our hello, then one `PeerCandidate` per peer that serves a wanted
+//!   attestation subnet, sync-committee subnet or custody column ([`crate::subnet_query`]), at
+//!   most the request's `target`, then the end of the stream. A malformed request is refused
+//!   before any frame (`INVALID_ARGUMENT`; another fork digest `FAILED_PRECONDITION`); a failed
+//!   lookup ends the stream with `UNAVAILABLE`.
 //! - **`GetLocalEnr`**: the local record as it is now, in its `enr:` text form.
-//! - `FindPeers` and `UpdateEnr` are still stubs (contract checks, then `UNIMPLEMENTED`).
+//! - `UpdateEnr` is still a stub (contract checks, then `UNIMPLEMENTED`).
 //!
 //! A candidate ([`candidate`]) carries the record, its libp2p peer ID ([`peer_id_text`]: the
 //! identity multihash of the protobuf-encoded secp256k1 key, base58btc, as libp2p prints it),
 //! its `/ip4|ip6/<addr>/tcp/<port>` addresses, its `cgc` and its `nfd`. A record without a TCP
 //! address cannot be dialled and is not sent.
 
-use crate::enr::{CombinedPublicKey, Enr, EnrFields};
-use crate::service::Discovery;
+use crate::enr::{CombinedPublicKey, Enr, EnrFields, NodeId};
+use crate::service::{Discovery, ServiceError};
+use crate::subnet_query::{Finder, SlotClock, SubnetQuery, MAX_TARGET};
 use ethswarm_proto::discv5 as pb;
 use ipc::frame::OutFrame;
 use ipc::hello::stream_hello;
 use ipc::stub::StubStream;
 use ipc::Link;
+use p2p_wire::rpc::messages::ForkDigest;
 use pb::discovery_service_server::{DiscoveryService, DiscoveryServiceServer};
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch};
+use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 
 /// The candidates the feed holds for a slow watcher at most \[est\]: a few lookups' worth.
@@ -36,6 +47,14 @@ pub trait PeerSource: Send + Sync + 'static {
     fn local_enr(&self) -> Enr;
     /// The routing table's records that pass the filter now.
     fn table_records(&self) -> Vec<Enr>;
+    /// Our fork digest now.
+    fn fork_digest(&self) -> ForkDigest;
+    /// A lookup for at most `max` records that pass the filter and that `query` matches.
+    fn find_matching(
+        &self,
+        query: SubnetQuery,
+        max: usize,
+    ) -> impl Future<Output = Result<Vec<Enr>, ServiceError>> + Send;
 }
 
 impl PeerSource for Discovery {
@@ -45,6 +64,21 @@ impl PeerSource for Discovery {
 
     fn table_records(&self) -> Vec<Enr> {
         Discovery::table_records(self)
+    }
+
+    fn fork_digest(&self) -> ForkDigest {
+        Discovery::fork_digest(self)
+    }
+
+    /// Towards a random node ID, as the periodic lookups.
+    async fn find_matching(
+        &self,
+        query: SubnetQuery,
+        max: usize,
+    ) -> Result<Vec<Enr>, ServiceError> {
+        let wanted = move |enr: &Enr| query.matches(enr);
+        self.find_peers_matching(NodeId::random(), wanted, max)
+            .await
     }
 }
 
@@ -154,6 +188,7 @@ pub struct DiscoveryServer<S> {
     source: Arc<S>,
     feed: PeerFeed,
     stop: watch::Receiver<bool>,
+    finder: Arc<Finder>,
 }
 
 impl<S> Clone for DiscoveryServer<S> {
@@ -163,20 +198,28 @@ impl<S> Clone for DiscoveryServer<S> {
             source: Arc::clone(&self.source),
             feed: self.feed.clone(),
             stop: self.stop.clone(),
+            finder: Arc::clone(&self.finder),
         }
     }
 }
 
 impl<S: PeerSource> DiscoveryServer<S> {
     /// A server of `source` and `feed`, holding every stream to `link`; its streams end when
-    /// `stop` turns true or its sender goes.
+    /// `stop` turns true or its sender goes. `FindPeers` caches by the slot `slots` reads.
     #[must_use]
-    pub fn new(link: Link, source: Arc<S>, feed: PeerFeed, stop: watch::Receiver<bool>) -> Self {
+    pub fn new(
+        link: Link,
+        source: Arc<S>,
+        feed: PeerFeed,
+        stop: watch::Receiver<bool>,
+        slots: SlotClock,
+    ) -> Self {
         Self {
             link,
             source,
             feed,
             stop,
+            finder: Arc::new(Finder::new(slots)),
         }
     }
 
@@ -187,9 +230,36 @@ impl<S: PeerSource> DiscoveryServer<S> {
     }
 }
 
-/// The status a `WatchPeers` stream ends with when cl-discv5 stops.
+/// The status a `WatchPeers` or `FindPeers` stream ends with when cl-discv5 stops.
 fn stopping() -> Status {
     Status::unavailable("cl-discv5 is stopping")
+}
+
+/// The deadline of a call: its `grpc-timeout` (gRPC over HTTP/2: 1 to 8 digits, then `H`, `M`,
+/// `S`, `m`, `u` or `n`) from now; none without one or for one that does not parse, as tonic's
+/// server reads it.
+fn deadline(metadata: &MetadataMap) -> Option<Instant> {
+    let text = metadata.get("grpc-timeout")?.to_str().ok()?;
+    let (digits, unit) = text.split_at(text.len().checked_sub(1)?);
+    if !(1..=8).contains(&digits.len()) || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u64 = digits.parse().ok()?;
+    let timeout = match unit {
+        "H" => Duration::from_secs(n * 3600),
+        "M" => Duration::from_secs(n * 60),
+        "S" => Duration::from_secs(n),
+        "m" => Duration::from_millis(n),
+        "u" => Duration::from_micros(n),
+        "n" => Duration::from_nanos(n),
+        _ => return None,
+    };
+    Instant::now().checked_add(timeout)
+}
+
+/// Until `stop` turns true or its sender goes.
+async fn stopped(mut stop: watch::Receiver<bool>) {
+    let _ = stop.wait_for(|stopped| *stopped).await;
 }
 
 #[tonic::async_trait]
@@ -263,7 +333,53 @@ impl<S: PeerSource> DiscoveryService for DiscoveryServer<S> {
         &self,
         request: Request<pb::FindPeersRequest>,
     ) -> Result<Response<Self::FindPeersStream>, Status> {
-        ipc::stub::server_stream(&self.link, "find_peers", request.get_ref())
+        let deadline = deadline(request.metadata());
+        let request = request.into_inner();
+        self.link
+            .accept_hello_field(request.hello.as_ref())
+            .map_err(|e| e.to_status())?;
+        let digest = self.source.fork_digest();
+        let (query, target) = SubnetQuery::parse(&request, digest)?;
+        let (_, ours) = stream_hello(&self.link.local()).map_err(|e| e.to_status())?;
+        let (source, finder) = (Arc::clone(&self.source), Arc::clone(&self.finder));
+        let stop = self.stop.clone();
+        let (tx, rx) = mpsc::channel(16);
+        // The wait for a lookup runs after our hello, in the stream: tonic's own `grpc-timeout`
+        // covers the handler only, and would end the call `CANCELLED`.
+        ipc::spawn_in_span(async move {
+            if tx
+                .send(Ok(pb::FindPeersResponse::hello(ours)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let lookup = || source.find_matching(query, MAX_TARGET);
+            let found = tokio::select! {
+                biased;
+                () = stopped(stop) => Err(stopping()),
+                found = finder.find(query, digest, deadline, lookup) => found.map_err(Status::from),
+                () = tx.closed() => return,
+            };
+            match found {
+                Ok(found) => {
+                    for c in found.iter().filter_map(candidate).take(target) {
+                        let body = pb::FindPeersResponseBody { candidate: Some(c) };
+                        if tx
+                            .send(Ok(pb::FindPeersResponse::body(body)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                Err(status) => {
+                    let _ = tx.send(Err(status)).await;
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
     async fn update_enr(

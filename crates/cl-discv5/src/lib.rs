@@ -5,8 +5,10 @@
 //! - [`service`]: discv5 with the routing-table IP rules and lookups filtered by fork digest;
 //!   table records that fail either are evicted on their event and by a periodic sweep.
 //! - [`metrics`], the routing-table eviction counter `discv5_table_evictions_total{reason}`.
-//! - [`server`]: `ethswarm.discv5.v1` `WatchPeers` and `GetLocalEnr` from the running discv5,
-//!   for cl-p2p.
+//! - [`server`]: `ethswarm.discv5.v1` `WatchPeers`, `GetLocalEnr` and `FindPeers` from the
+//!   running discv5, for cl-p2p.
+//! - [`subnet_query`]: `FindPeers`' query (attestation and sync-committee subnets, custody
+//!   columns), its ranking, the bound on its lookups and its per-slot cache.
 //! - [`process`]: the `cl-discv5` process that `ops/probe/ethswarm-discv5.service` runs.
 //!
 //! [`Discv5Stub`] is the stub of the whole package: every RPC runs the `ipc` contract layer
@@ -19,6 +21,7 @@ pub mod metrics;
 pub mod process;
 pub mod server;
 pub mod service;
+pub mod subnet_query;
 
 use ethswarm_proto::discv5 as pb;
 use ipc::Link;

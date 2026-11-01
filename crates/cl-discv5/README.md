@@ -2,9 +2,29 @@
 
 discv5 0.12.0 peer discovery with the `eth2`/`cgc`/`nfd` local record (`src/enr.rs`), and the
 `ethswarm.discv5.v1` service. `src/service.rs` is the discovery itself; its module docs are the
-detailed reference. `src/server.rs` serves `WatchPeers` and `GetLocalEnr` to cl-p2p (the other
-RPCs are still stubs), and `src/process.rs` is the `cl-discv5` process that
+detailed reference. `src/server.rs` serves `WatchPeers`, `GetLocalEnr` and `FindPeers` to
+cl-p2p (`UpdateEnr` is still a stub), and `src/process.rs` is the `cl-discv5` process that
 `ops/probe/ethswarm-discv5.service` runs.
+
+## FindPeers
+
+`FindPeers` (`src/subnet_query.rs`, served by `src/server.rs`) runs a lookup for the peers that
+serve at least one wanted attestation subnet (`attnets`), sync-committee subnet (`syncnets`) or
+custody column. A peer's custody columns are `das::custody_columns` of its node ID and `cgc`; a
+record without `cgc` counts as `CUSTODY_REQUIREMENT` (4), an empty one as 0 (no column), and one
+above 128 or not in its canonical form matches nothing. The predicate is ANDed with the fork and
+IP filter inside the lookup, and every result is checked against both again.
+
+- **Request.** Every index below its count (64, 4, 128), at least one wanted, `target` at least
+  1 (capped at 16); otherwise `INVALID_ARGUMENT`, before any frame. `fork_digest` empty means
+  ours; another 4-byte digest is `FAILED_PRECONDITION`, another length `INVALID_ARGUMENT`.
+- **Answer.** Our hello, then the dialable candidates ranked by coverage (how many wanted
+  subnets and columns each serves, ties in node ID order), at most `target`, then the end.
+- **Bounds.** At most two lookups run at once (the periodic lookups are not counted); a request
+  waits for one until its `grpc-timeout` passes (`DEADLINE_EXCEEDED`), or without one until the
+  client goes. The ranked peers of up to 64 queries are cached for the rest of the slot (from
+  the network config's genesis time and slot duration) and our fork digest; a full cache drops
+  its oldest query.
 
 ## Routing-table rules
 
@@ -16,8 +36,9 @@ unique-local and link-local), so a node on a devnet's own network (the devnet pr
 queries or pings a public host, whatever record a peer hands it. The
 rules are discv5's `table_filter`, a bare `fn` pointer, so it cannot hold the fork digest.
 
-- **Lookups** (`Discovery::find_peers`) run `find_node_predicate` with the fork digest and the
-  IP rules, and check every returned record again.
+- **Lookups** (`Discovery::find_peers_matching`, `Discovery::find_peers` for any peer) run
+  `find_node_predicate` with the fork digest, the IP rules and the lookup's own predicate, and
+  check every returned record against them again.
 - **Events** (`Events::next`) surface `Discovered` and `SessionEstablished` only for records
   on our fork digest within the IP rules, and a session only from a source address within the
   IP rules.

@@ -3,9 +3,11 @@
 //!
 //! - `cl-discv5` itself: an argument is a usage error (exit 64).
 //! - `cl-discv5-test` (the same code, its config from `$CL_DISCV5_TEST_CONFIG`, owned by the
-//!   test user): discv5 on a loopback UDP port in local mode, `WatchPeers` and `GetLocalEnr` on
-//!   its socket behind its ACL. On SIGTERM the open `WatchPeers` stream ends, the socket drains
-//!   and is removed, and the process exits 0. Its log names its node ID and never the key.
+//!   test user): discv5 on a loopback UDP port in local mode, `WatchPeers`, `GetLocalEnr` and
+//!   `FindPeers` on its socket behind its ACL (a `FindPeers` with no peer to find: our hello,
+//!   then the end of the stream). On SIGTERM the open `WatchPeers` stream ends, the socket
+//!   drains and is removed, and the process exits 0. Its log names its node ID and never the
+//!   key.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -141,7 +143,8 @@ impl Host {
             "network_dir = \"{}\"\nmetrics_port = 9103\ndrain_timeout_ms = 5000\n\n\
              [socket]\nroot = \"{}\"\ngroup = {gid}\n\n[callers]\ncl-p2p = {uid}\n\n[methods]\n\
              \"/ethswarm.discv5.v1.DiscoveryService/WatchPeers\" = [\"cl-p2p\"]\n\
-             \"/ethswarm.discv5.v1.DiscoveryService/GetLocalEnr\" = [\"cl-p2p\"]\n\n\
+             \"/ethswarm.discv5.v1.DiscoveryService/GetLocalEnr\" = [\"cl-p2p\"]\n\
+             \"/ethswarm.discv5.v1.DiscoveryService/FindPeers\" = [\"cl-p2p\"]\n\n\
              [discv5]\nmode = \"local\"\nlisten_ip = \"127.0.0.1\"\nudp_port = {}\n\
              enr_ip = \"127.0.0.1\"\ntcp_port = 9000\nlookup_interval_ms = 200\n",
             net.display(),
@@ -201,6 +204,26 @@ async fn the_service_serves_and_stops_cleanly_on_sigterm() {
     assert!(enr.starts_with("enr:"), "{enr}");
     let network = Arc::new(ipc::testkit::devnet::kurtosis_hello("test"));
     let link = ipc::Link::network(network, 1).unwrap();
+    let mut found = client
+        .find_peers(pb::FindPeersRequest {
+            attnets: vec![0],
+            target: 1,
+            hello: Some(link.local()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let hello = tokio::time::timeout(WAIT, found.message()).await.unwrap();
+    assert!(
+        matches!(
+            hello.unwrap().and_then(|f| f.frame),
+            Some(pb::find_peers_response::Frame::Hello(_))
+        ),
+        "the hello"
+    );
+    let end = tokio::time::timeout(WAIT, found.message()).await.unwrap();
+    assert!(end.unwrap().is_none(), "no peer to find");
     let mut stream = client
         .watch_peers(pb::WatchPeersRequest {
             hello: Some(link.local()),

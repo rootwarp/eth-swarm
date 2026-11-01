@@ -13,13 +13,18 @@
 //!   `uint64` with no leading zero bytes, 0 as the empty string.
 //! - [`decode_nfd`]: the next fork digest under `nfd`, a 4-byte `ForkDigest`, all zero
 //!   ([`NO_NEXT_FORK_DIGEST`]) when no fork is scheduled.
+//! - [`decode_attnets`] / [`decode_syncnets`]: the subnet bitfields under `attnets` (SSZ
+//!   `Bitvector[ATTESTATION_SUBNET_COUNT]`, 8 bytes) and `syncnets` (SSZ
+//!   `Bitvector[SYNC_COMMITTEE_SUBNET_COUNT]`, 1 byte), `phase0/p2p-interface.md` and
+//!   `altair/p2p-interface.md`, as integers whose bit `i` is subnet `i`.
 //! - [`ForkFields::from_schedule`]: the local `eth2` and `nfd` values at a wall-clock epoch.
 
-use crate::rpc::messages::ForkDigest;
+use crate::rpc::messages::{AttestationSubnetCount, ForkDigest, SyncCommitteeSubnetCount};
 use network_config::digest::{digest_schedule, DigestError, Root};
 use network_config::{ChainConfig, Epoch, Version, FAR_FUTURE_EPOCH};
 use ssz::{Decode, Encode};
 use ssz_derive::{Decode, Encode};
+use typenum::Unsigned;
 
 /// The record key of the `ENRForkID`.
 pub const ETH2_KEY: &str = "eth2";
@@ -27,6 +32,15 @@ pub const ETH2_KEY: &str = "eth2";
 pub const CGC_KEY: &str = "cgc";
 /// The record key of the next fork digest.
 pub const NFD_KEY: &str = "nfd";
+/// The record key of the attestation subnet bitfield.
+pub const ATTNETS_KEY: &str = "attnets";
+/// The record key of the sync-committee subnet bitfield.
+pub const SYNCNETS_KEY: &str = "syncnets";
+/// `SYNC_COMMITTEE_SUBNET_COUNT` (`altair/validator.md`), 4 on every network: the bits of
+/// `syncnets`.
+pub const SYNC_COMMITTEE_SUBNET_COUNT: u64 = SyncCommitteeSubnetCount::U64;
+/// The SSZ length of `attnets`: `ATTESTATION_SUBNET_COUNT` bits.
+const ATTNETS_LEN: usize = AttestationSubnetCount::USIZE / 8;
 /// The SSZ length of `ENRForkID`: `ForkDigest` (4), `Version` (4), `Epoch` (8).
 pub const ENR_FORK_ID_LEN: usize = 16;
 /// The longest `cgc` value: a `uint64`.
@@ -70,6 +84,15 @@ pub enum EnrFieldError {
     /// The `nfd` value is not 4 bytes.
     #[error("nfd value of {0} bytes, want 4")]
     NfdLen(usize),
+    /// The `attnets` value is not 8 bytes.
+    #[error("attnets value of {0} bytes, want {ATTNETS_LEN}")]
+    AttnetsLen(usize),
+    /// The `syncnets` value is not 1 byte.
+    #[error("syncnets value of {0} bytes, want 1")]
+    SyncnetsLen(usize),
+    /// The `syncnets` byte sets a bit past the last sync-committee subnet, which SSZ refuses.
+    #[error("syncnets value {0:#04x} sets a bit past subnet {last}", last = SYNC_COMMITTEE_SUBNET_COUNT - 1)]
+    SyncnetsHighBits(u8),
 }
 
 /// Decodes an `eth2` value.
@@ -103,6 +126,23 @@ pub fn decode_cgc(bytes: &[u8]) -> Result<u64, EnrFieldError> {
 /// Decodes an `nfd` value.
 pub fn decode_nfd(bytes: &[u8]) -> Result<ForkDigest, EnrFieldError> {
     ForkDigest::try_from(bytes).map_err(|_| EnrFieldError::NfdLen(bytes.len()))
+}
+
+/// Decodes an `attnets` value: bit `i` of the result is attestation subnet `i` (SSZ puts bit `i`
+/// of a bitvector in byte `i / 8`, at bit `i % 8`, so the bytes read little-endian).
+pub fn decode_attnets(bytes: &[u8]) -> Result<u64, EnrFieldError> {
+    <[u8; ATTNETS_LEN]>::try_from(bytes)
+        .map(u64::from_le_bytes)
+        .map_err(|_| EnrFieldError::AttnetsLen(bytes.len()))
+}
+
+/// Decodes a `syncnets` value: bit `i` of the result is sync-committee subnet `i`.
+pub fn decode_syncnets(bytes: &[u8]) -> Result<u8, EnrFieldError> {
+    match *bytes {
+        [byte] if byte >> SYNC_COMMITTEE_SUBNET_COUNT == 0 => Ok(byte),
+        [byte] => Err(EnrFieldError::SyncnetsHighBits(byte)),
+        _ => Err(EnrFieldError::SyncnetsLen(bytes.len())),
+    }
 }
 
 /// The local node's `eth2` and `nfd` values at one wall-clock epoch.
@@ -203,6 +243,54 @@ mod tests {
         assert_eq!(decode_eth2(&bytes), Ok(id));
         assert_eq!(decode_eth2(&bytes[..15]), Err(EnrFieldError::Eth2Len(15)));
         assert_eq!(decode_eth2(&[0; 17]), Err(EnrFieldError::Eth2Len(17)));
+    }
+
+    /// `attnets` is the SSZ `Bitvector[64]`: bit `i` of the decoded value is subnet `i`, as the
+    /// SSZ encoder lays it out; any other length is refused.
+    #[test]
+    fn attnets_is_the_ssz_bitvector_of_64() {
+        use crate::rpc::messages::AttestationSubnetCount;
+        for subnet in [0, 1, 7, 8, 33, 63] {
+            let mut bits = ssz::BitVector::<AttestationSubnetCount>::new();
+            bits.set(subnet, true).unwrap();
+            assert_eq!(
+                decode_attnets(&bits.as_ssz_bytes()),
+                Ok(1 << subnet),
+                "{subnet}"
+            );
+        }
+        assert_eq!(decode_attnets(&[0; 8]), Ok(0));
+        assert_eq!(decode_attnets(&[0xff; 8]), Ok(u64::MAX));
+        assert_eq!(decode_attnets(&[]), Err(EnrFieldError::AttnetsLen(0)));
+        assert_eq!(decode_attnets(&[0; 7]), Err(EnrFieldError::AttnetsLen(7)));
+        assert_eq!(decode_attnets(&[0; 9]), Err(EnrFieldError::AttnetsLen(9)));
+    }
+
+    /// `syncnets` is the SSZ `Bitvector[4]`: one byte whose four high bits are zero.
+    #[test]
+    fn syncnets_is_the_ssz_bitvector_of_4() {
+        use crate::rpc::messages::SyncCommitteeSubnetCount;
+        for subnet in 0..4 {
+            let mut bits = ssz::BitVector::<SyncCommitteeSubnetCount>::new();
+            bits.set(subnet, true).unwrap();
+            assert_eq!(
+                decode_syncnets(&bits.as_ssz_bytes()),
+                Ok(1 << subnet),
+                "{subnet}"
+            );
+        }
+        assert_eq!(decode_syncnets(&[0x0f]), Ok(0x0f));
+        assert_eq!(
+            decode_syncnets(&[0x10]),
+            Err(EnrFieldError::SyncnetsHighBits(0x10))
+        );
+        assert_eq!(
+            decode_syncnets(&[0x80]),
+            Err(EnrFieldError::SyncnetsHighBits(0x80))
+        );
+        assert_eq!(decode_syncnets(&[]), Err(EnrFieldError::SyncnetsLen(0)));
+        assert_eq!(decode_syncnets(&[1, 0]), Err(EnrFieldError::SyncnetsLen(2)));
+        assert_eq!(SYNC_COMMITTEE_SUBNET_COUNT, 4);
     }
 
     #[test]

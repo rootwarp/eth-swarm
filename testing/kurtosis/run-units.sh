@@ -499,6 +499,7 @@ cl-p2p = $uid_p2p
 [methods]
 "/ethswarm.discv5.v1.DiscoveryService/WatchPeers" = ["cl-p2p"]
 "/ethswarm.discv5.v1.DiscoveryService/GetLocalEnr" = ["cl-p2p"]
+"/ethswarm.discv5.v1.DiscoveryService/FindPeers" = ["cl-p2p"]
 
 [discv5]
 mode = "devnet"
