@@ -25,6 +25,7 @@ members = [
     "crates/devnet-probe",
     "crates/node-key",
     "crates/state-transition",
+    "crates/cl-node",
 ]
 
 [workspace.package]

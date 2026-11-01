@@ -49,6 +49,8 @@ jobs:
         run: bash ops/tests/early-exit-guard.test.sh
 
   kurtosis-units:
+    # Also verifies cl-node's generated units with the runner's own systemd-analyze (the host
+    # boots systemd, so verify runs as is; required here, skipped with a notice elsewhere).
     name: Kurtosis devnet probe units under systemd (offline)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -58,6 +60,12 @@ jobs:
           persist-credentials: false
       - name: The units runner (offline, stub kurtosis, docker, curl and clock)
         run: bash testing/kurtosis/tests/run-units.test.sh
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - name: cl-node's generated units pass systemd-analyze verify (default and supernode)
+        env:
+          ETHSWARM_REQUIRE_SYSTEMD_ANALYZE: "1"
+        run: bash crates/cl-node/tests/units-verify.test.sh
 
   proto:
     name: buf lint, build, breaking vs develop, baseline drift
@@ -245,6 +253,9 @@ jobs:
         run: cargo test -p ipc --test peercred --locked
       - name: Method ACL against cl-engine and the SIGTERM drain
         run: cargo test -p svc-runtime --locked
+      # Only the root case: the other launch tests run in the rust job, as a non-root user.
+      - name: cl-node launch as root refuses without the eight unit users (none runs as root)
+        run: cargo test -p cl-node --test launch --locked -- root_
 
   credential-root-tests:
     # The node-key credential shapes as systemd leaves them: a tmpfs at /run/credentials/<unit>,
