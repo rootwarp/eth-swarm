@@ -141,6 +141,23 @@ protocols offered: any other fails multistream-select negotiation, among them th
     `rpc::network_context_table` and carries the network's caps
     (`NetworkCaps::from_config`): without them every column answer would be
     `2: ServerError`.
+- **Streamed answers** (`rpc::responder`, #234): a `Responder` given with
+  `Control::with_blocks_responder` serves `BeaconBlocksByRange`; without one it stays
+  `3: ResourceUnavailable`. The request is checked first (a `count` above 128 or `step` 0 is
+  `1: InvalidRequest`, never clamped, before any read), then its cost (by default the blocks it
+  asks for) is booked on the peer's bucket, and the responder runs on its own task, handing
+  decoded objects to a `ChunkSink`. The sink makes each chunk itself: the context bytes of the
+  object's own epoch, the type's SSZ bound (capped at `MAX_PAYLOAD_SIZE`), at most the request's
+  count, error codes the protocol allows and messages cut at 256 bytes. Chunks wait in a queue
+  of 4 per stream and within the peer's byte budget (`RpcLimits::max_queued_bytes_per_peer`,
+  4 MiB \[est\]), so a slow reader slows the responder and its reads. The stream's writer sends
+  each chunk whole at its token, `2: ServerError` if nothing was produced 4.5 s in, and ends
+  cleanly at the last whole chunk 9.5 s in (the 5 s and 10 s deadlines less 500 ms, ahead of
+  the requester's and of `request_response`'s backstop). At most 256 such streams are open over
+  all peers (`RpcLimits::max_inbound_streams` \[est\]); one past them is dropped without a chunk
+  and counted in `rpc_inbound_streams_refused_total`. A reset, a dropped writer or a panicking
+  responder frees the slot, the bytes and the task; a reset gives no tokens back. The column
+  protocols keep their own path until #148 moves them onto it.
 - **Rejects**: a request that breaks the wire format gets `1: InvalidRequest` (a Goodbye's
   too), and so does a
   `BeaconBlocksByRange` request with `step` 0 or a `count` above `MAX_REQUEST_BLOCKS_DENEB` (128;

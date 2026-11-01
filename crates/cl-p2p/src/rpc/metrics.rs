@@ -25,6 +25,8 @@
 //! - `rpc_column_sidecars_answered_total{protocol}`: column sidecars of our answers to peers'
 //!   `DataColumnSidecarsByRange` and `DataColumnSidecarsByRoot` requests, counted as each answer
 //!   goes to its stream.
+//! - `rpc_inbound_streams_refused_total`: inbound streams dropped without a chunk because
+//!   `max_inbound_streams` streamed answers were open ([`crate::rpc::limits::RpcLimits`]).
 //! - `queue_dropped_total{queue}`: items a bounded queue IGNOREd ([`QueueMetrics`]), shared with
 //!   the other queues of the service through [`RpcMetrics::queues`].
 //!
@@ -193,6 +195,7 @@ pub struct RpcMetrics {
     column_answer_bytes: Gauge,
     column_unrequested: Counter,
     column_sidecars_answered: Family<ProtocolLabel, Counter>,
+    inbound_streams_refused: Counter,
     queues: QueueMetrics,
 }
 
@@ -213,6 +216,7 @@ impl RpcMetrics {
             column_answer_bytes: Gauge::default(),
             column_unrequested: Counter::default(),
             column_sidecars_answered: Family::default(),
+            inbound_streams_refused: Counter::default(),
             queues: QueueMetrics::register(registry),
         };
         for protocol in [
@@ -318,7 +322,23 @@ impl RpcMetrics {
             "Column sidecars a source handed over that the request did not name, dropped",
             metrics.column_unrequested.clone(),
         );
+        registry.register(
+            "rpc_inbound_streams_refused",
+            "Inbound streams dropped without a chunk because the streamed answers were at their cap",
+            metrics.inbound_streams_refused.clone(),
+        );
         metrics
+    }
+
+    /// Counts an inbound stream refused at the global cap.
+    pub(crate) fn inbound_stream_refused(&self) {
+        self.inbound_streams_refused.inc();
+    }
+
+    /// The current `rpc_inbound_streams_refused_total`.
+    #[must_use]
+    pub fn inbound_streams_refused(&self) -> u64 {
+        self.inbound_streams_refused.get()
     }
 
     /// Sets `rpc_column_answers` and `rpc_column_answer_bytes`.

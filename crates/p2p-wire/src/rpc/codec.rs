@@ -196,11 +196,16 @@ impl ResultCode {
 ///
 /// Injected by the caller, so that decoding peer bytes runs no network-config code. From Fulu
 /// on, a blob-parameter-only fork changes the digest without changing the fork, so several
-/// digests can name one fork.
+/// digests can name one fork. A serving table also knows from which epoch each digest applies
+/// ([`ContextTable::insert_from`]): a responder's context bytes are the digest of the epoch of
+/// the object's own slot ([`ContextTable::at_epoch`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextTable {
     entries: Vec<(ForkDigest, ForkName)>,
     network: Option<NetworkCaps>,
+    /// `(epoch, digest, fork)`, ascending by epoch: each digest applies from its epoch until
+    /// the next entry's.
+    epochs: Vec<(u64, ForkDigest, ForkName)>,
 }
 
 impl ContextTable {
@@ -239,6 +244,25 @@ impl ContextTable {
             .iter()
             .find(|(d, _)| d == digest)
             .map(|(_, f)| *f)
+    }
+
+    /// Maps `digest` to `fork` ([`Self::insert`]) and makes it the digest of every epoch from
+    /// `epoch` until the next entry's; an epoch entered again takes the later digest.
+    pub fn insert_from(&mut self, epoch: u64, digest: ForkDigest, fork: ForkName) {
+        let at = self.epochs.partition_point(|e| e.0 < epoch);
+        match self.epochs.get_mut(at) {
+            Some(entry) if entry.0 == epoch => *entry = (epoch, digest, fork),
+            _ => self.epochs.insert(at, (epoch, digest, fork)),
+        }
+        self.insert(digest, fork);
+    }
+
+    /// The digest of `epoch` and the fork it names: the entry of the latest epoch at or before
+    /// it; `None` before the first, or in a table without epochs.
+    pub fn at_epoch(&self, epoch: u64) -> Option<(ForkDigest, ForkName)> {
+        let at = self.epochs.partition_point(|e| e.0 <= epoch);
+        let &(_, digest, fork) = self.epochs.get(at.checked_sub(1)?)?;
+        Some((digest, fork))
     }
 }
 
@@ -1600,6 +1624,40 @@ mod tests {
             testkit::context_table().fork(&testkit::GLOAS_DIGEST),
             Some(ForkName::Gloas)
         );
+    }
+
+    /// #234: a responder's context bytes are the digest of the epoch of the object's own slot,
+    /// so the table knows from which epoch each digest applies (a BPO epoch changes the
+    /// digest, not the fork).
+    #[test]
+    fn context_table_digest_of_an_epoch() {
+        let mut table = ContextTable::new();
+        table.insert_from(4, testkit::GLOAS_DIGEST, ForkName::Gloas);
+        table.insert_from(1, testkit::FULU_DIGEST, ForkName::Fulu);
+        table.insert_from(2, testkit::FULU_BPO_DIGEST, ForkName::Fulu);
+        assert_eq!(table.at_epoch(0), None, "before the first entry");
+        assert_eq!(
+            table.at_epoch(1),
+            Some((testkit::FULU_DIGEST, ForkName::Fulu))
+        );
+        assert_eq!(
+            table.at_epoch(3),
+            Some((testkit::FULU_BPO_DIGEST, ForkName::Fulu))
+        );
+        assert_eq!(
+            table.at_epoch(u64::MAX),
+            Some((testkit::GLOAS_DIGEST, ForkName::Gloas))
+        );
+        // Each digest still names its fork for a reader.
+        assert_eq!(table.fork(&testkit::FULU_BPO_DIGEST), Some(ForkName::Fulu));
+        // An epoch entered again takes the later digest.
+        table.insert_from(4, testkit::UNKNOWN_DIGEST, ForkName::Gloas);
+        assert_eq!(
+            table.at_epoch(4),
+            Some((testkit::UNKNOWN_DIGEST, ForkName::Gloas))
+        );
+        // A table without epochs (a reader's) gives none.
+        assert_eq!(testkit::context_table().at_epoch(5), None);
     }
 
     // --- scan work and frame bounds ---

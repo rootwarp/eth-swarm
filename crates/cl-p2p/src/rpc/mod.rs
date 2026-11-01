@@ -16,10 +16,22 @@
 //!   `ReqRespService` ([`columns::ChainColumns`]).
 //! - [`outbound`]: one exchange on a swarm, for the m2a session.
 //! - [`inbound`]: the probe swarm's behaviour, answering and initiating Status, MetaData, Ping
-//!   and Goodbye, and serving the custody columns ([`inbound::Control`]).
-//! - [`limits`]: the per-peer rate limit, the outbound semaphore and the bounded IGNORE queues.
+//!   and Goodbye, serving the custody columns, and BlocksByRange through a responder
+//!   ([`inbound::Control`]).
+//! - [`limits`]: the per-peer rate limit, the outbound semaphore, the bounded IGNORE queues and
+//!   the streamed answers' global cap and per-peer byte budget.
 //! - [`metrics`]: `rpc_timeouts_total`, the Goodbye counters, `p2p_status_valid_peers` and the
 //!   limit counters.
+//! - [`responder`]: streamed answers: a [`responder::Responder`] produces one request's chunks
+//!   on its own task through a [`responder::ChunkSink`], which makes each wire chunk itself
+//!   and holds the producer back to the reader's pace.
+//!
+//! The streamed answers go through one `request_response` `ResponseChannel` per request
+//! (architecture OQ 4): [`codec::Answer`] carries the responder's bounded queue, and the codec
+//! writes its chunks as they come. Not `libp2p-stream`: an alpha that drops streams when the
+//! application falls behind, and would need the per-connection stream cap, the exchange
+//! backstop and the reset handling `request_response` already has, plus another crate in the
+//! pinned rust-libp2p set.
 //! - [`unsupported`]: the MUST-support protocols the probe leaves unregistered (written
 //!   deviations), and the count of peers' proposals of them.
 
@@ -31,6 +43,7 @@ pub mod inbound;
 pub mod limits;
 pub mod metrics;
 pub mod outbound;
+pub mod responder;
 #[cfg(test)]
 mod tests;
 pub mod unsupported;
@@ -73,7 +86,8 @@ pub const RESP_TIMEOUT: Duration = REQUEST_TIMEOUT;
 pub const PER_CHUNK_TIMEOUT: Duration = TTFB_TIMEOUT;
 
 /// The context table a swarm of `config`'s network reads and answers with: every fork digest of
-/// its schedule from Fulu on (BPO digests included) to its fork, and the network's caps
+/// its schedule from Fulu on (BPO digests included) to its fork, from the epoch it applies at
+/// (the context bytes a [`responder::ChunkSink`] gives an object), and the network's caps
 /// ([`NetworkCaps::from_config`]), without which every column sidecar chunk is refused and
 /// every column answer is `2: ServerError`. Every table built for serving comes from here.
 #[must_use]
@@ -83,7 +97,7 @@ pub fn network_context_table(
 ) -> ContextTable {
     let mut table = ContextTable::new().with_network_caps(NetworkCaps::from_config(config));
     for entry in digest_schedule(config, genesis_validators_root) {
-        table.insert(entry.fork_digest, entry.fork);
+        table.insert_from(entry.epoch, entry.fork_digest, entry.fork);
     }
     table
 }
@@ -121,6 +135,13 @@ mod context_table_tests {
         assert!(!schedule.is_empty());
         for entry in schedule {
             assert_eq!(table.fork(&entry.fork_digest), Some(entry.fork));
+            // #234: a responder's context bytes are the digest of the object's own epoch.
+            assert_eq!(
+                table.at_epoch(entry.epoch),
+                Some((entry.fork_digest, entry.fork)),
+                "epoch {}",
+                entry.epoch
+            );
         }
     }
 }
