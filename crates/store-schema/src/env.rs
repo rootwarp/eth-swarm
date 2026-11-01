@@ -12,7 +12,9 @@ use libmdbx::{
 };
 
 use crate::{
-    tables::{MAX_TABLES, TABLES},
+    blocks,
+    tables::{self, BLOCK_INDEX, MAX_TABLES, TABLES},
+    txn::{self, Update},
     version, Error, Result,
 };
 
@@ -113,10 +115,13 @@ pub fn open_writer(path: &Path, opts: WriterOptions) -> Result<WriterEnv> {
 /// Opens (creating if needed) the env at `path` as its one writer.
 ///
 /// Takes the writer guard, opens the env read-write and checks that the requested map size is
-/// in effect. Then, in one write transaction: checks the schema version ([`version`]), creates
-/// every missing table, runs `upgrade` with the names of the tables this open created, writes
-/// the version row if there was none, and commits. An error anywhere aborts the transaction,
-/// so a refused or failed open writes nothing.
+/// in effect. Then, in one write transaction: checks the schema version ([`version`]) and that
+/// every named table is one of [`TABLES`], creates every missing table, fills `block_index`
+/// from `blocks` if this open created it, runs `upgrade` with the names of the tables this
+/// open created, writes the version row if the env was not at
+/// [`SCHEMA_VERSION`](version::SCHEMA_VERSION), and commits with the stamp carried
+/// ([`Update::Carry`]). An error anywhere aborts the transaction, so a refused or failed open
+/// writes nothing.
 ///
 /// `upgrade` is where a crate that owns some tables migrates their data in the same transaction
 /// that creates the tables (cl-chain-columns' links migration).
@@ -139,7 +144,8 @@ where
     };
     let env = open_rw(path, opts)?;
     let txn = env.begin_rw_txn().map_err(Error::from)?;
-    let stored = version::check(&txn)?;
+    let upgrade_version = version::check_writer(&txn)?;
+    tables::check_known(&txn)?;
     let mut created = Vec::new();
     for table in TABLES {
         match txn.open_table(Some(table)) {
@@ -152,19 +158,27 @@ where
             Err(e) => return Err(Error::from(e).into()),
         }
     }
+    if created.contains(&BLOCK_INDEX) {
+        blocks::fill_index(&txn)?;
+    }
     upgrade(&txn, &created)?;
-    if stored.is_none() {
+    if upgrade_version {
         version::write(&txn)?;
     }
-    txn.commit().map_err(Error::from)?;
+    txn::commit(txn, Update::Carry)?;
     Ok(WriterEnv { env, guard })
 }
 
 /// Opens an existing env with `MDBX_RDONLY` (no write txn at all) and the writer's options,
-/// and checks its schema version. Never opens the writer guard.
+/// and checks its schema version and that every named table is one of [`TABLES`]. Never opens
+/// the writer guard.
 pub fn open_reader(path: &Path) -> Result<Env> {
     let env = Env::open_with_options(path, options(Mode::ReadOnly))?;
-    version::check(&env.begin_ro_txn()?)?;
+    {
+        let txn = env.begin_ro_txn()?;
+        version::check_reader(&txn)?;
+        tables::check_known(&txn)?;
+    }
     Ok(env)
 }
 

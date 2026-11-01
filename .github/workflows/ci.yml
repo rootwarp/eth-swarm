@@ -155,6 +155,10 @@ jobs:
         run: bash scripts/tests/check-verify-cache-deps.test.sh && bash scripts/check-verify-cache-deps.sh
       - name: store-schema depends only on consensus-types, libmdbx and thiserror
         run: bash scripts/tests/check-store-schema-deps.test.sh && bash scripts/check-store-schema-deps.sh
+      - name: Every write txn of the store env commits through store_schema::txn::commit (the stamp row)
+        run: bash scripts/tests/check-stamped-commits.test.sh && bash scripts/check-stamped-commits.sh
+      - name: cl-store never opens the store env for write (no Mode::ReadWrite, begin_rw_txn, writer)
+        run: bash scripts/tests/check-store-readonly.test.sh && bash scripts/check-store-readonly.sh
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Fetch and verify spec vectors (uncached)
         run: PRESETS="general minimal" bash testing/fetch-vectors.sh
@@ -169,6 +173,30 @@ jobs:
         run: cargo test -p crypto-bls --all-features --locked
       - name: crypto-bls feature gate (aggregate only, trybuild)
         run: cargo test -p crypto-bls --no-default-features --features aggregate --test compile_fail --locked
+
+  mdbx-chk:
+    # mdbx_chk, built from the libmdbx sources mdbx-sys =12.13.2 vendors (ADR-0009, not a distro
+    # binary), checks an env the production writer paths filled with real blocks, stamps and
+    # column sidecars (crates/store-schema/examples/fill_env.rs); any error fails the job. The
+    # build step prints the source directory and VERSION.txt and fails unless they are the
+    # pinned ones. #290 reuses this job.
+    name: mdbx_chk on written store envs (pinned libmdbx sources)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - name: Build mdbx_chk from mdbx-sys 12.13.2's libmdbx (prints the source and VERSION.txt)
+        run: bash scripts/build-mdbx-chk.sh
+      - name: The scripts fail on a corrupted env (b-tree pages, meta pages) and pass a clean one
+        run: bash scripts/tests/mdbx-chk-envs.test.sh
+      - name: mdbx_chk -v on an env filled with blocks, stamps and columns
+        env:
+          MDBX_CHK: target/mdbx-chk/mdbx_chk
+        run: bash scripts/mdbx-chk-envs.sh
 
   fuzz-build:
     # The decoder fuzz targets (fuzz/, its own workspace and Cargo.lock) build as the gates run

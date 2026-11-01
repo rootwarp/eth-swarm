@@ -61,6 +61,20 @@ fn forked_block_encodes_and_hashes_like_its_variant() {
     assert_eq!(fulu.slot(), 9);
 }
 
+/// A block's root is `hash_tree_root(block.message)`, not the root of the signed container.
+#[test]
+fn message_root_is_the_root_of_the_message() {
+    let fulu = fulu_block::<Minimal>(9);
+    let forked = SignedBeaconBlock::Fulu(fulu.clone());
+    assert_eq!(forked.message_root(), fulu.message.tree_hash_root());
+    assert_ne!(forked.message_root(), forked.tree_hash_root());
+    let gloas = gloas_block::<Minimal>(9);
+    assert_eq!(
+        SignedBeaconBlock::Gloas(gloas.clone()).message_root(),
+        gloas.message.tree_hash_root()
+    );
+}
+
 #[test]
 fn pre_fulu_slots_are_refused() {
     let schedule = sepolia();

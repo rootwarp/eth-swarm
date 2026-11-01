@@ -15,9 +15,10 @@
 use crate::caps::{NetworkCaps, ObjectKind};
 use crate::codec::{decode_checked, DecodeError};
 use crate::preset::EthSpec;
-use crate::primitives::{ForkName, Slot};
+use crate::primitives::{ForkName, Root, Slot};
 use crate::{fulu, gloas};
 use network_config::ForkSchedule;
+use tree_hash::TreeHash;
 
 macro_rules! forked {
     ($(#[$doc:meta])* $name:ident, $kind:expr) => {
@@ -162,6 +163,14 @@ impl<E: EthSpec> SignedBeaconBlock<E> {
         match self {
             Self::Fulu(b) => b.message.slot,
             Self::Gloas(b) => b.message.slot,
+        }
+    }
+
+    /// The block root: `hash_tree_root(message)`, not the root of the signed container.
+    pub fn message_root(&self) -> Root {
+        match self {
+            Self::Fulu(b) => b.message.tree_hash_root(),
+            Self::Gloas(b) => b.message.tree_hash_root(),
         }
     }
 

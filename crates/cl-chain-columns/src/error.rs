@@ -72,9 +72,11 @@ pub enum Error {
     /// A stored row does not match the layout in [`keys`](crate::keys).
     #[error("corrupt row in table {table}")]
     Corrupt { table: &'static str },
-    /// The env's schema refused the open: a schema version this build does not read
-    /// ([`store_schema::Error::SchemaVersion`], [`store_schema::Error::MalformedSchemaVersion`]).
-    /// Nothing was written.
+    /// The env's schema refused the open or the write: a schema version this build does not
+    /// read ([`store_schema::Error::SchemaVersion`], [`store_schema::Error::NeedsUpgrade`]), an
+    /// unknown table ([`store_schema::Error::UnknownTable`]), or a stamp row that does not check
+    /// out ([`store_schema::Error::MalformedStamp`], [`store_schema::Error::StampBlockMissing`],
+    /// ...). Nothing of the open or the write transaction was written.
     #[error("store schema: {0}")]
     Schema(store_schema::Error),
 }

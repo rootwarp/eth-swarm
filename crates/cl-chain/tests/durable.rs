@@ -517,7 +517,7 @@ fn file_set_versioned_not_mdbx() {
     }
     let err = open_writer(&env_dir, WriterOptions::default()).unwrap_err();
     assert!(
-        matches!(err, store_schema::Error::SchemaVersion { found: 2, .. }),
+        matches!(err, store_schema::Error::SchemaVersion { found, .. } if found == SCHEMA_VERSION + 1),
         "{err:?}"
     );
 }

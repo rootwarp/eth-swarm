@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::keys::Root;
+
 /// Errors from opening the env.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -63,6 +65,55 @@ pub enum Error {
         /// Its length.
         len: usize,
     },
+    /// A reader met a schema version only the writer's open upgrades (#291's version 1). The
+    /// reader opens once cl-chain has opened the env.
+    #[error("env schema version {found} needs a writer upgrade")]
+    NeedsUpgrade {
+        /// The stored version.
+        found: u64,
+    },
+    /// The env holds a named table that is not in [`TABLES`](crate::tables::TABLES): a newer
+    /// or foreign layout. Nothing was written.
+    #[error("env holds table {name:?}, which this schema does not know")]
+    UnknownTable {
+        /// The table's name (lossy UTF-8).
+        name: String,
+    },
+    /// The stamp row is not [`STAMP_LEN`](crate::stamp::STAMP_LEN) bytes.
+    #[error("stamp row is {len} bytes, not 88")]
+    MalformedStamp {
+        /// Its length.
+        len: usize,
+    },
+    /// The stamp's finalized slot is above its head slot.
+    #[error("stamp finalized slot {finalized_slot} is above its head slot {head_slot}")]
+    StampFinalizedAfterHead {
+        /// The stamp's finalized slot.
+        finalized_slot: u64,
+        /// The stamp's head slot.
+        head_slot: u64,
+    },
+    /// The stamp names a head or finalized block that has no `blocks` row.
+    #[error("stamp names a block not stored: slot {slot}, root 0x{}", hex(.root))]
+    StampBlockMissing {
+        /// The block's slot in the stamp.
+        slot: u64,
+        /// The block's root in the stamp.
+        root: Root,
+    },
+    /// Block bytes that do not decode as a block of their slot's fork. Nothing was written.
+    #[error("block: {0}")]
+    Block(consensus_types::codec::DecodeError),
+    /// A row whose key does not have its table's layout ([`crate::keys`]).
+    #[error("corrupt row in table {table}")]
+    Corrupt {
+        /// The table.
+        table: &'static str,
+    },
+}
+
+fn hex(root: &Root) -> String {
+    root.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// `Result` with [`Error`].

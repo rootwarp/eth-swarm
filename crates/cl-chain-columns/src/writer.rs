@@ -9,7 +9,7 @@ use std::{
 };
 
 use libmdbx::{NoWriteMap, Transaction, WriteFlags, RW};
-use store_schema::env::WriterGuard;
+use store_schema::{env::WriterGuard, txn::Update};
 
 use crate::{
     env::{self, WriterOptions},
@@ -215,6 +215,7 @@ pub struct ColumnWriter {
     column_ops: Mutex<Orphans>,
     sched: TxnScheduler,
     rw_txns: AtomicU64,
+    stamped_txns: AtomicU64,
     hooks: Hooks,
     _guard: WriterGuard,
 }
@@ -248,6 +249,7 @@ impl ColumnWriter {
             }),
             sched: TxnScheduler::default(),
             rw_txns: AtomicU64::new(0),
+            stamped_txns: AtomicU64::new(0),
             hooks: Hooks::default(),
             _guard: guard,
         })
@@ -277,7 +279,7 @@ impl ColumnWriter {
         let mut value = vec![3];
         value.extend_from_slice(target);
         txn.put(&links, child, value, WriteFlags::UPSERT)?;
-        txn.commit()?;
+        store_schema::txn::commit(txn, Update::Carry)?;
         Ok(())
     }
 
@@ -285,6 +287,13 @@ impl ColumnWriter {
     #[must_use]
     pub fn rw_txns_committed(&self) -> u64 {
         self.rw_txns.load(Ordering::Relaxed)
+    }
+
+    /// Of [`Self::rw_txns_committed`], those that committed a stamp row: every one once the env
+    /// has a stamp ([`store_schema::stamp`]), none before.
+    #[must_use]
+    pub fn stamped_txns_committed(&self) -> u64 {
+        self.stamped_txns.load(Ordering::Relaxed)
     }
 
     /// Stores verified, unfinalized columns of one block, at most [`MAX_COLUMNS_PER_TXN`] per
@@ -659,7 +668,9 @@ impl ColumnWriter {
         })
     }
 
-    /// Runs `body` in one write txn under a scheduler permit and commits if it asks to.
+    /// Runs `body` in one write txn under a scheduler permit and commits if it asks to, with
+    /// the env's stamp carried ([`store_schema::txn::commit`]): a stamp that no longer checks
+    /// out fails the commit, and nothing of the txn is written.
     fn write_txn<T>(
         &self,
         priority: Priority,
@@ -669,8 +680,11 @@ impl ColumnWriter {
         let txn = self.reader.db.begin_rw_txn()?;
         match body(&txn)? {
             Commit::Yes(value) => {
-                txn.commit()?;
+                let stamp = store_schema::txn::commit(txn, Update::Carry)?;
                 self.rw_txns.fetch_add(1, Ordering::Relaxed);
+                if stamp.is_some() {
+                    self.stamped_txns.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(value)
             }
             Commit::No(value) => Ok(value),
@@ -1037,7 +1051,7 @@ pub(crate) fn make_legacy_for_test(writer: &ColumnWriter) {
     unsafe { txn.drop_table(links).unwrap() };
     let meta = txn.open_table(Some(META_TABLE)).unwrap();
     let _ = txn.del(&meta, CONTIGUOUS_FROM_KEY, None);
-    txn.commit().unwrap();
+    store_schema::txn::commit(txn, Update::Carry).unwrap();
 }
 
 /// Removes `block_root`'s link, if it has one.
@@ -1104,6 +1118,7 @@ mod tests {
     use crate::sched::Priority;
     use crate::{keys::TABLES, Error, NUMBER_OF_COLUMNS, NUMBER_OF_CUSTODY_GROUPS};
     use std::collections::HashSet;
+    use store_schema::{stamp::Stamp, txn::Update};
 
     #[test]
     fn env_opens_with_max_tables() {
@@ -1598,15 +1613,143 @@ mod tests {
         assert_eq!(writer.reader().slot_of(&ROOT_A).unwrap(), None);
     }
 
+    /// Stores a block row at `slot` (opaque: the stamp checks only that it exists) and a
+    /// stamp with that block as head and finalized, as cl-chain's import commits them.
+    fn stamp_block(writer: &ColumnWriter, slot: u64, root: &BlockRoot) -> Stamp {
+        let txn = writer.reader.db.begin_rw_txn().unwrap();
+        let blocks = txn.open_table(Some(store_schema::tables::BLOCKS)).unwrap();
+        let key = store_schema::keys::slot_root_key(slot, root);
+        txn.put(&blocks, key, b"block", WriteFlags::UPSERT).unwrap();
+        let stamp = Stamp {
+            head_seq: slot,
+            head_root: *root,
+            head_slot: slot,
+            finalized_root: *root,
+            finalized_slot: slot,
+        };
+        assert_eq!(
+            store_schema::txn::commit(txn, Update::New(stamp)).unwrap(),
+            Some(stamp)
+        );
+        stamp
+    }
+
+    /// The stamp row as stored.
+    fn stamp_row(writer: &ColumnWriter) -> Option<Vec<u8>> {
+        let txn = writer.reader.db.begin_ro_txn().unwrap();
+        let meta = txn.open_table(Some(META_TABLE)).unwrap();
+        txn.get::<Vec<u8>>(&meta, store_schema::keys::STAMP_KEY)
+            .unwrap()
+    }
+
+    /// C2: every column write txn commits through `store_schema::txn::commit` with
+    /// `Update::Carry`: one stamp row, unchanged, in each chunk txn and each other write txn,
+    /// none before the first stamp, and a stamp that does not validate fails the commit.
+    #[test]
+    fn every_chunk_txn_carries_the_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let all: Vec<u64> = (0..NUMBER_OF_COLUMNS).collect();
+        let root_c: BlockRoot = [0xcc; 32];
+
+        // Before any block: nothing to carry (open question 1). The chunks commit alone.
+        write_block(&writer, 3, &ROOT_A, &all);
+        assert_eq!(writer.rw_txns_committed(), 8);
+        assert_eq!(writer.stamped_txns_committed(), 0);
+        assert_eq!(stamp_row(&writer), None);
+
+        let stamp = stamp_block(&writer, 6, &[0xee; 32]);
+        let row = stamp_row(&writer).unwrap();
+        assert_eq!(row, stamp.encode());
+        let (txns, stamped) = (writer.rw_txns_committed(), writer.stamped_txns_committed());
+        write_block(&writer, 7, &ROOT_B, &all);
+        assert_eq!(writer.rw_txns_committed() - txns, 8);
+        assert_eq!(
+            writer.stamped_txns_committed() - stamped,
+            8,
+            "one stamp row in each chunk txn"
+        );
+        assert_eq!(stamp_row(&writer).unwrap(), row);
+
+        // Every other write txn carries it too.
+        writer.set_cgc(4).unwrap();
+        writer.prune_orphaned(&[ROOT_A]).unwrap();
+        writer.prune_finalized(5).unwrap();
+        writer.finalize(6, &HashSet::new(), 0).unwrap();
+        let committed = writer.rw_txns_committed() - txns;
+        assert!(committed > 8);
+        assert_eq!(writer.stamped_txns_committed() - stamped, committed);
+        assert_eq!(stamp_row(&writer).unwrap(), row);
+
+        // The stamp's head block gone: the stamp no longer validates, so the chunk txn fails
+        // and stores nothing.
+        {
+            let txn = writer.reader.db.begin_rw_txn().unwrap();
+            let blocks = txn.open_table(Some(store_schema::tables::BLOCKS)).unwrap();
+            let key = store_schema::keys::slot_root_key(6, &[0xee; 32]);
+            txn.del(&blocks, key, None).unwrap();
+            txn.commit().unwrap();
+        }
+        let txns = writer.rw_txns_committed();
+        let columns: Vec<Column<'_>> = (0..16).map(|index| Column { index, ssz: b"x" }).collect();
+        let err = writer.write_columns(8, &root_c, &columns).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Schema(store_schema::Error::StampBlockMissing { slot: 6, .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(writer.rw_txns_committed(), txns);
+        assert_eq!(writer.reader().columns_for_root(&root_c).unwrap(), vec![]);
+        assert_eq!(writer.reader().slot_of(&root_c).unwrap(), None);
+    }
+
+    /// V3: `column_index < NUMBER_OF_COLUMNS` is checked before any write: a batch holding one
+    /// index out of range commits no txn, no column, no block and no stamp.
+    #[test]
+    fn column_index_out_of_range_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        stamp_block(&writer, 6, &[0xee; 32]);
+        let row = stamp_row(&writer);
+        for bad in [NUMBER_OF_COLUMNS, NUMBER_OF_COLUMNS + 1, u64::MAX] {
+            let mut columns: Vec<Column<'_>> =
+                (0..20).map(|index| Column { index, ssz: b"x" }).collect();
+            columns.push(Column {
+                index: bad,
+                ssz: b"x",
+            });
+            let err = writer.write_columns(7, &ROOT_A, &columns).unwrap_err();
+            assert!(
+                matches!(err, Error::ColumnIndexOutOfRange { index } if index == bad),
+                "{err:?}"
+            );
+        }
+        assert_eq!(writer.rw_txns_committed(), 0);
+        assert_eq!(writer.stamped_txns_committed(), 0);
+        assert_eq!(writer.reader().column_count().unwrap(), 0);
+        assert_eq!(writer.reader().block_count().unwrap(), 0);
+        assert_eq!(writer.reader().first_stored_slot().unwrap(), None);
+        assert_eq!(stamp_row(&writer), row);
+    }
+
     #[test]
     fn chunks_le_16() {
         let dir = tempfile::tempdir().unwrap();
         let writer = ColumnWriter::open(dir.path()).unwrap();
         let all: Vec<u64> = (0..NUMBER_OF_COLUMNS).collect();
+        stamp_block(&writer, 6, &[0xee; 32]);
 
         let before = writer.rw_txns_committed();
+        let stamped = writer.stamped_txns_committed();
         let report = write_block(&writer, 7, &ROOT_A, &all);
         assert_eq!(writer.rw_txns_committed() - before, 8);
+        assert_eq!(
+            writer.stamped_txns_committed() - stamped,
+            8,
+            "each of the 8 txns carries one stamp row"
+        );
         assert_eq!(report.transactions, 8);
         assert_eq!(report.columns, 128);
         assert!(report.max_columns_per_txn <= MAX_COLUMNS_PER_TXN);
