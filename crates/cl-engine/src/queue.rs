@@ -300,8 +300,14 @@ async fn run(
                     break;
                 };
                 // A released seq has no deadline: a buffer full of them behind a gap would never
-                // skip it, and every later message would be refused. Skip the gap now.
-                if buffered.len() >= QUEUE_DEPTH
+                // skip it, and every later message would be refused. Skip the gap now, unless
+                // this message fills it: then it runs and the released seqs behind it drain.
+                let seq = match &msg {
+                    Msg::Release(seq) => *seq,
+                    Msg::Job(job) => job.seq,
+                };
+                if seq != next
+                    && buffered.len() >= QUEUE_DEPTH
                     && buffered.values().all(|entry| matches!(entry, Entry::Released))
                 {
                     skip_gap(&mut buffered, &mut next);

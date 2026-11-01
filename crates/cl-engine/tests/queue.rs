@@ -665,6 +665,42 @@ async fn a_buffer_full_of_released_seqs_skips_the_gap() {
     assert_eq!(payload_seqs(&mock), [next]);
 }
 
+/// The buffer is full of released seqs behind a gap, and then the seq filling the gap arrives:
+/// it runs instead of being skipped over and refused, and the released seqs behind it drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seq_filling_the_gap_runs_when_the_buffer_is_full_of_released_seqs() {
+    let secret = test_secret(SECRET);
+    let mock = MockEl::start(secret.expose_secret(), required_methods()).await;
+    let queue = Queue::connect(config(&mock.url(), secret), 1)
+        .await
+        .unwrap();
+    let depth = u64::try_from(QUEUE_DEPTH).unwrap();
+    for seq in 2..=depth + 1 {
+        queue.release(seq).await.unwrap();
+    }
+    let value = bounded(
+        Duration::from_secs(3),
+        queue.call(1, "engine_newPayloadV5", json!([1]), Duration::from_secs(2)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(value["status"], "VALID");
+    let next = depth + 2;
+    let value = bounded(
+        Duration::from_secs(3),
+        queue.call(
+            next,
+            "engine_newPayloadV5",
+            json!([next]),
+            Duration::from_secs(2),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(value["status"], "VALID");
+    assert_eq!(payload_seqs(&mock), [1, next]);
+}
+
 /// `newPayload` and `forkchoiceUpdated` calls interleaved and submitted out of order, with
 /// `newPayload` answered late: a quick `forkchoiceUpdated` never overtakes an earlier
 /// `newPayload`, and the EL sees every call in `seq` order with the method it was given.
