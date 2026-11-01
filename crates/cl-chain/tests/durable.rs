@@ -15,8 +15,8 @@ use std::{
 };
 
 use cl_chain::persist::durable::{
-    BaseFiles, BaseKind, Checkpoint, ElStatus, Error, FileSet, ImportRecord, Loaded, PayloadStatus,
-    Step,
+    AppendFault, BaseFiles, BaseKind, Checkpoint, ElStatus, Error, FileSet, ImportRecord, Loaded,
+    PayloadStatus, Step,
 };
 use libmdbx::WriteFlags;
 use store_schema::{
@@ -123,6 +123,41 @@ fn assert_base(loaded: &Loaded, kind: BaseKind, root: [u8; 32], tag: &'static st
     assert_eq!(base.envelope.as_deref(), Some(envelope.as_slice()));
 }
 
+/// `anchor-<A>/` holds exactly what `install_anchor(ANCHOR, files("A"))` wrote, byte for byte:
+/// a finality advance keeps the operator's anchor dir.
+fn assert_anchor_dir(datadir: &Path, what: &str) {
+    let dir = durable(datadir).join(format!("anchor-{}", hex(&ROOT_A)));
+    let (block, state, envelope) = files("A");
+    let mut anchor = ROOT_A.to_vec();
+    anchor.extend_from_slice(&ANCHOR.epoch.to_be_bytes());
+    let want = [
+        ("anchor", anchor),
+        ("block.ssz", block),
+        ("envelope.ssz", envelope),
+        ("state.ssz", state),
+    ];
+    let mut names: Vec<String> = fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    assert_eq!(
+        names,
+        want.each_ref().map(|(name, _)| *name),
+        "{what}: anchor-<A>/"
+    );
+    for (name, bytes) in want {
+        assert_eq!(
+            fs::read(dir.join(name)).unwrap(),
+            bytes,
+            "{what}: anchor-<A>/{name}"
+        );
+    }
+}
+
 #[test]
 fn import_log_atomic_with_block() {
     let datadir = tempfile::tempdir().unwrap();
@@ -210,7 +245,7 @@ fn import_log_atomic_with_block() {
 
 /// A crash at every step of a finality advance leaves exactly one complete base: the old one
 /// until `CURRENT` names the new one, the new one from then on, never a mix. The next open
-/// cleans up whatever the crash left.
+/// cleans up whatever the crash left, and `anchor-<A>/` survives every crash point whole.
 #[test]
 fn finality_swap_atomic() {
     let template = tempfile::tempdir().unwrap();
@@ -224,7 +259,7 @@ fn finality_swap_atomic() {
     });
     let finalized = format!("finalized-{}", hex(&ROOT_F));
     // Every file of the new dir written and fsync'd, the dir fsync'd and renamed, CURRENT
-    // swapped atomically, then the old dir deleted.
+    // swapped atomically. The old base is the anchor: it is kept.
     let want: Vec<(Step, String)> = [
         (Step::Written, "block.ssz"),
         (Step::Synced, "block.ssz"),
@@ -258,21 +293,160 @@ fn finality_swap_atomic() {
 
         let (_, loaded) = open(datadir.path());
         let swapped = nth >= steps.len() - 2; // CURRENT renamed into place
+        let anchor = format!("anchor-{}", hex(&ROOT_A));
         if swapped {
             assert_base(&loaded, BaseKind::Finalized, ROOT_F, "F");
             assert_eq!(
                 entries(datadir.path()),
-                ["CURRENT", "VERSION", finalized.as_str()]
+                ["CURRENT", "VERSION", anchor.as_str(), finalized.as_str()]
             );
         } else {
             assert_base(&loaded, BaseKind::Anchor, ROOT_A, "A");
-            let anchor = format!("anchor-{}", hex(&ROOT_A));
             assert_eq!(
                 entries(datadir.path()),
                 ["CURRENT", "VERSION", anchor.as_str()]
             );
         }
+        assert_anchor_dir(datadir.path(), &format!("crash at {step:?} {name}"));
     }
+}
+
+/// A crash at every step of an advance from a finalized base (F to G): the old `finalized-F/`
+/// or the new `finalized-G/` is the base, the other is gone after the next open, and
+/// `anchor-<A>/` survives every crash point whole.
+#[test]
+fn every_finality_crash_point_keeps_the_anchor_dir() {
+    let (a, f, g) = (files("A"), files("F"), files("G"));
+    let setup = |datadir: &Path| {
+        let (mut set, _) = open(datadir);
+        set.install_anchor(ANCHOR, &base_files(&a)).unwrap();
+        set.advance_finality(ROOT_F, &base_files(&f)).unwrap();
+    };
+    let template = tempfile::tempdir().unwrap();
+    setup(template.path());
+    let steps = steps_of(template.path(), |set| {
+        set.advance_finality(ROOT_G, &base_files(&g)).unwrap();
+    });
+    assert_eq!(steps.len(), 14);
+    let anchor = format!("anchor-{}", hex(&ROOT_A));
+    for (nth, (step, name)) in steps.iter().enumerate() {
+        let datadir = tempfile::tempdir().unwrap();
+        setup(datadir.path());
+        let (mut set, _) = FileSet::open_crashing(datadir.path(), crash_at(nth)).unwrap();
+        assert_crashed(set.advance_finality(ROOT_G, &base_files(&g)), *step, name);
+        drop(set);
+
+        let (_, loaded) = open(datadir.path());
+        let (root, tag) = if nth >= steps.len() - 2 {
+            (ROOT_G, "G")
+        } else {
+            (ROOT_F, "F")
+        };
+        assert_base(&loaded, BaseKind::Finalized, root, tag);
+        let finalized = format!("finalized-{}", hex(&root));
+        assert_eq!(
+            entries(datadir.path()),
+            ["CURRENT", "VERSION", anchor.as_str(), finalized.as_str()],
+            "crash at {step:?} {name}"
+        );
+        assert_anchor_dir(datadir.path(), &format!("crash at {step:?} {name}"));
+    }
+}
+
+/// Install anchor A, advance to F, then to G, reopening after each: `anchor-<A>/` and its
+/// block, state and envelope survive byte-identical, and only `finalized-F/` goes when G
+/// becomes the base. A new anchor is a new trust root: installing B removes `anchor-<A>/` and
+/// every `finalized-*` dir.
+#[test]
+fn the_anchor_dir_survives_finality_advances() {
+    let datadir = tempfile::tempdir().unwrap();
+    let (a, b, f, g) = (files("A"), files("B"), files("F"), files("G"));
+    let anchor = format!("anchor-{}", hex(&ROOT_A));
+    let (fin_f, fin_g) = (
+        format!("finalized-{}", hex(&ROOT_F)),
+        format!("finalized-{}", hex(&ROOT_G)),
+    );
+
+    let (mut set, _) = open(datadir.path());
+    set.install_anchor(ANCHOR, &base_files(&a)).unwrap();
+    drop(set);
+    let (mut set, loaded) = open(datadir.path());
+    assert_base(&loaded, BaseKind::Anchor, ROOT_A, "A");
+    assert_anchor_dir(datadir.path(), "installed");
+
+    set.advance_finality(ROOT_F, &base_files(&f)).unwrap();
+    assert_anchor_dir(datadir.path(), "advanced to F");
+    drop(set);
+    let (mut set, loaded) = open(datadir.path());
+    assert_base(&loaded, BaseKind::Finalized, ROOT_F, "F");
+    assert_eq!(
+        entries(datadir.path()),
+        ["CURRENT", "VERSION", anchor.as_str(), fin_f.as_str()]
+    );
+    assert_anchor_dir(datadir.path(), "reopened at F");
+
+    set.advance_finality(ROOT_G, &base_files(&g)).unwrap();
+    assert_eq!(
+        entries(datadir.path()),
+        ["CURRENT", "VERSION", anchor.as_str(), fin_g.as_str()],
+        "only finalized-F is deleted"
+    );
+    drop(set);
+    let (mut set, loaded) = open(datadir.path());
+    assert_base(&loaded, BaseKind::Finalized, ROOT_G, "G");
+    assert_eq!(
+        entries(datadir.path()),
+        ["CURRENT", "VERSION", anchor.as_str(), fin_g.as_str()]
+    );
+    assert_anchor_dir(datadir.path(), "reopened at G");
+
+    // A new anchor replaces the old anchor and every finalized dir.
+    let other = Checkpoint {
+        root: ROOT_B,
+        epoch: 9,
+    };
+    set.install_anchor(other, &base_files(&b)).unwrap();
+    drop(set);
+    let (_, loaded) = open(datadir.path());
+    let base = loaded.base.unwrap();
+    assert_eq!(
+        (base.kind, base.root, base.anchor),
+        (BaseKind::Anchor, ROOT_B, other)
+    );
+    let anchor_b = format!("anchor-{}", hex(&ROOT_B));
+    assert_eq!(
+        entries(datadir.path()),
+        ["CURRENT", "VERSION", anchor_b.as_str()]
+    );
+}
+
+/// On open, the base CURRENT names and the anchor dir it carries are kept; any other anchor
+/// dir and any stale finalized dir are crash leftovers and removed.
+#[test]
+fn open_keeps_the_current_anchor_and_removes_other_bases() {
+    let datadir = tempfile::tempdir().unwrap();
+    let (a, f) = (files("A"), files("F"));
+    {
+        let (mut set, _) = open(datadir.path());
+        set.install_anchor(ANCHOR, &base_files(&a)).unwrap();
+        set.advance_finality(ROOT_F, &base_files(&f)).unwrap();
+    }
+    let dir = durable(datadir.path());
+    let other_anchor = format!("anchor-{}", hex(&ROOT_B));
+    let stale = format!("finalized-{}", hex(&ROOT_G));
+    for name in [&other_anchor, &stale] {
+        fs::create_dir(dir.join(name)).unwrap();
+        fs::write(dir.join(name).join("block.ssz"), b"x").unwrap();
+    }
+    let (_, loaded) = open(datadir.path());
+    assert_base(&loaded, BaseKind::Finalized, ROOT_F, "F");
+    let anchor = format!("anchor-{}", hex(&ROOT_A));
+    let finalized = format!("finalized-{}", hex(&ROOT_F));
+    assert_eq!(
+        entries(datadir.path()),
+        ["CURRENT", "VERSION", anchor.as_str(), finalized.as_str()]
+    );
+    assert_anchor_dir(datadir.path(), "reopened");
 }
 
 #[test]
@@ -296,9 +470,16 @@ fn file_set_versioned_not_mdbx() {
     }
     // Plain files under durable/, beside the env, not in it.
     let finalized = format!("finalized-{}", hex(&ROOT_F));
+    let anchor = format!("anchor-{}", hex(&ROOT_A));
     assert_eq!(
         entries(datadir.path()),
-        ["CURRENT", "VERSION", finalized.as_str(), "import.log"]
+        [
+            "CURRENT",
+            "VERSION",
+            anchor.as_str(),
+            finalized.as_str(),
+            "import.log"
+        ]
     );
     assert_eq!(
         fs::read(durable(datadir.path()).join("VERSION")).unwrap(),
@@ -384,7 +565,11 @@ fn the_anchor_dir_name_is_pinned() {
     );
     assert_eq!(fs::read(dir.join(&finalized).join("anchor")).unwrap(), want);
     assert!(!dir.join(&finalized).join("envelope.ssz").exists());
-    assert!(!dir.join(name).exists(), "the old base is deleted");
+    assert!(dir.join(name).is_dir(), "the anchor dir is kept");
+    assert_eq!(fs::read(dir.join(name).join("anchor")).unwrap(), want);
+    assert_eq!(fs::read(dir.join(name).join("block.ssz")).unwrap(), a.0);
+    assert_eq!(fs::read(dir.join(name).join("state.ssz")).unwrap(), a.1);
+    assert_eq!(fs::read(dir.join(name).join("envelope.ssz")).unwrap(), a.2);
     drop(set);
     let (_, loaded) = open(datadir.path());
     let base = loaded.base.unwrap();
@@ -409,9 +594,10 @@ fn finality_carries_the_anchor_forward() {
     let (_, loaded) = open(datadir.path());
     assert_base(&loaded, BaseKind::Finalized, ROOT_G, "G");
     let finalized = format!("finalized-{}", hex(&ROOT_G));
+    let anchor = format!("anchor-{}", hex(&ROOT_A));
     assert_eq!(
         entries(datadir.path()),
-        ["CURRENT", "VERSION", finalized.as_str()]
+        ["CURRENT", "VERSION", anchor.as_str(), finalized.as_str()]
     );
 }
 
@@ -775,6 +961,199 @@ fn a_bad_record_mid_file_refuses_to_start() {
         );
         assert_eq!(log_bytes(datadir.path()), log, "nothing truncated");
     }
+}
+
+/// A failed append (a short write of any prefix of the frame, a failed fsync) is rolled back
+/// to the length before it: the next good append follows the last good frame, and the reopen
+/// loads every acknowledged record, never `CorruptImportLog`. Also when the failed append was
+/// the one that created `import.log`.
+#[test]
+fn a_failed_append_is_rolled_back() {
+    let faults = [
+        AppendFault {
+            short_write: Some(0),
+            ..AppendFault::default()
+        },
+        AppendFault {
+            short_write: Some(7),
+            ..AppendFault::default()
+        },
+        AppendFault {
+            short_write: Some(49),
+            ..AppendFault::default()
+        },
+        AppendFault {
+            sync: true,
+            ..AppendFault::default()
+        },
+    ];
+    for fault in faults {
+        for before in [vec![], vec![record(ROOT_A, 1)]] {
+            let what = format!("{fault:?} after {} records", before.len());
+            let datadir = tempfile::tempdir().unwrap();
+            let (mut set, _) = open(datadir.path());
+            for r in &before {
+                set.record_import(r).unwrap();
+            }
+            set.fail_next_append(fault);
+            let err = set.record_import(&record(ROOT_F, 2)).unwrap_err();
+            assert!(matches!(err, Error::Io(_)), "{what}: {err:?}");
+            assert_eq!(
+                log_bytes(datadir.path()).len(),
+                50 * before.len(),
+                "{what}: rolled back"
+            );
+            set.record_import(&record(ROOT_B, 3)).unwrap();
+            drop(set);
+
+            let (_, loaded) =
+                FileSet::open(datadir.path()).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            let mut want = before.clone();
+            want.push(record(ROOT_B, 3));
+            assert_eq!(loaded.imports, want, "{what}");
+        }
+    }
+}
+
+/// When rolling a failed append back fails too, the log may end in a torn frame: every later
+/// write (`record_import`, `advance_finality`, `install_anchor`) is `Error::Poisoned` and
+/// changes nothing, until the reopen cuts the torn tail; then the set works again.
+#[test]
+fn a_failed_rollback_poisons_the_set_until_reopen() {
+    let datadir = tempfile::tempdir().unwrap();
+    let (a, b, f) = (files("A"), files("B"), files("F"));
+    let (mut set, _) = open(datadir.path());
+    set.install_anchor(ANCHOR, &base_files(&a)).unwrap();
+    set.record_import(&record(ROOT_A, 1)).unwrap();
+    set.fail_next_append(AppendFault {
+        short_write: Some(7),
+        rollback: true,
+        ..AppendFault::default()
+    });
+    let err = set.record_import(&record(ROOT_F, 2)).unwrap_err();
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    assert_eq!(log_bytes(datadir.path()).len(), 57, "the torn frame stays");
+
+    let other = Checkpoint {
+        root: ROOT_B,
+        epoch: 9,
+    };
+    let refused = [
+        ("record_import", set.record_import(&record(ROOT_B, 3))),
+        (
+            "advance_finality",
+            set.advance_finality(ROOT_F, &base_files(&f)),
+        ),
+        ("install_anchor", set.install_anchor(other, &base_files(&b))),
+        ("record_import again", set.record_import(&record(ROOT_B, 3))),
+    ];
+    for (what, result) in refused {
+        assert!(matches!(result, Err(Error::Poisoned)), "{what}: {result:?}");
+    }
+    assert_eq!(log_bytes(datadir.path()).len(), 57, "nothing appended");
+    let anchor = format!("anchor-{}", hex(&ROOT_A));
+    assert_eq!(
+        entries(datadir.path()),
+        ["CURRENT", "VERSION", anchor.as_str(), "import.log"],
+        "no base written"
+    );
+    drop(set);
+
+    // The reopen cuts the torn tail, and writes work again.
+    let (mut set, loaded) = open(datadir.path());
+    assert_eq!(loaded.imports, vec![record(ROOT_A, 1)]);
+    assert_eq!(log_bytes(datadir.path()).len(), 50, "the torn tail is cut");
+    set.record_import(&record(ROOT_B, 3)).unwrap();
+    set.advance_finality(ROOT_F, &base_files(&f)).unwrap();
+    drop(set);
+    let (_, loaded) = open(datadir.path());
+    assert_eq!(loaded.imports, vec![record(ROOT_A, 1), record(ROOT_B, 3)]);
+    assert_base(&loaded, BaseKind::Finalized, ROOT_F, "F");
+}
+
+/// The `(step, name)`s a hook saw.
+type Seen = Arc<Mutex<Vec<(Step, String)>>>;
+
+/// A set whose hook records every `(step, name)` from its open on and never crashes, except
+/// at `crash` if given.
+fn open_recording(datadir: &Path, crash: Option<(Step, &'static str)>) -> (FileSet, Loaded, Seen) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    let (set, loaded) = FileSet::open_crashing(datadir, move |step, name| {
+        log.lock().unwrap().push((step, name.to_owned()));
+        crash == Some((step, name))
+    })
+    .unwrap();
+    (set, loaded, seen)
+}
+
+/// Takes the steps recorded so far.
+fn take_steps(seen: &Mutex<Vec<(Step, String)>>) -> Vec<(Step, String)> {
+    std::mem::take(&mut *seen.lock().unwrap())
+}
+
+fn steps(want: &[(Step, &str)]) -> Vec<(Step, String)> {
+    want.iter().map(|(s, n)| (*s, (*n).to_owned())).collect()
+}
+
+/// `import.log`'s entry in `durable/` is durable before an append is acknowledged, on every
+/// path. A crash after the first append created the file and before `durable/` was fsync'd
+/// is repaired by the next open: an open that finds `import.log` fsyncs `durable/` before it
+/// takes an append. Without one, the first append after each open fsyncs `durable/`, also when
+/// the append that created the file failed.
+#[test]
+fn the_import_log_dir_entry_is_synced_before_an_append_is_acked() {
+    let written = (Step::Written, "import.log");
+    let dir_synced = (Step::DirSynced, "durable");
+
+    // The very first append dies after its frame is written: no fsync of the file or of
+    // durable/ yet.
+    let datadir = tempfile::tempdir().unwrap();
+    let (mut set, _, seen) = open_recording(datadir.path(), Some(written));
+    take_steps(&seen);
+    assert_crashed(set.record_import(&record(ROOT_A, 1)), written.0, written.1);
+    assert_eq!(take_steps(&seen), steps(&[written]));
+    drop(set);
+
+    // The restart fsyncs durable/ during the open, before the next append is acknowledged.
+    let (mut set, loaded, seen) = open_recording(datadir.path(), None);
+    assert_eq!(loaded.imports, vec![record(ROOT_A, 1)]);
+    assert_eq!(
+        take_steps(&seen),
+        steps(&[dir_synced]),
+        "the open syncs durable/"
+    );
+    set.record_import(&record(ROOT_B, 2)).unwrap();
+    set.record_import(&record(ROOT_F, 3)).unwrap();
+    assert_eq!(take_steps(&seen), steps(&[written, written]));
+    drop(set);
+
+    // No import.log at open: the first append fsyncs durable/, later ones do not.
+    let datadir = tempfile::tempdir().unwrap();
+    let (mut set, _, seen) = open_recording(datadir.path(), None);
+    take_steps(&seen);
+    set.record_import(&record(ROOT_A, 1)).unwrap();
+    set.record_import(&record(ROOT_B, 2)).unwrap();
+    assert_eq!(take_steps(&seen), steps(&[written, dir_synced, written]));
+    drop(set);
+
+    // The append that created import.log failed and was rolled back: the file is there but its
+    // entry was never fsync'd, so the next append fsyncs durable/.
+    let datadir = tempfile::tempdir().unwrap();
+    let (mut set, _, seen) = open_recording(datadir.path(), None);
+    take_steps(&seen);
+    set.fail_next_append(AppendFault {
+        short_write: Some(7),
+        ..AppendFault::default()
+    });
+    assert!(matches!(
+        set.record_import(&record(ROOT_A, 1)),
+        Err(Error::Io(_))
+    ));
+    assert_eq!(take_steps(&seen), steps(&[]), "the write failed first");
+    assert!(durable(datadir.path()).join("import.log").exists());
+    set.record_import(&record(ROOT_B, 2)).unwrap();
+    assert_eq!(take_steps(&seen), steps(&[written, dir_synced]));
 }
 
 /// CRC32C (Castagnoli), as RFC 3720 defines it, to build frames by hand.

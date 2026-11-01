@@ -8,7 +8,8 @@
 //! <datadir>/durable/
 //!   VERSION              "1\n"
 //!   CURRENT              "anchor-<root>\n" or "finalized-<root>\n": the restart base
-//!   anchor-<root>/       the operator's anchor (install_anchor); <root> is the anchor's root
+//!   anchor-<root>/       the operator's anchor (install_anchor); <root> is the anchor's root.
+//!                        Kept beside finalized-* until a new anchor replaces it
 //!   finalized-<root>/    the latest finalized block and its state (advance_finality)
 //!     block.ssz          the block, SSZ (opaque here, never decoded)
 //!     state.ssz          its post-state, SSZ
@@ -29,9 +30,18 @@
 //! - A base dir: built as `.tmp-<name>/` (each file written and fsync'd, the dir fsync'd),
 //!   renamed into place, `durable/` fsync'd.
 //! - A base change ([`FileSet::install_anchor`], [`FileSet::advance_finality`]): the new dir,
-//!   then CURRENT swapped, then the old base deleted. A crash at any step leaves CURRENT naming
-//!   one complete base: the old one until CURRENT is renamed, the new one from then on.
-//! - [`FileSet::record_import`]: one frame appended and fsync'd.
+//!   then CURRENT swapped, then every base dir the new base does not keep deleted. A base keeps
+//!   itself and `anchor-<root>/` of the anchor it carries. So a finality advance deletes only the
+//!   previous `finalized-*` dir, never the anchor dir: the anchor's block, state and envelope
+//!   stay for the ancestry check (#192). A new anchor is a new trust root: installing it deletes
+//!   the previous anchor dir and every `finalized-*` dir. A crash at any step leaves CURRENT
+//!   naming one complete base: the old one until CURRENT is renamed, the new one from then on.
+//! - [`FileSet::record_import`]: one frame appended and fsync'd. Until `durable/` has been
+//!   fsync'd with `import.log` in it since the open, the append fsyncs `durable/` too, so the
+//!   log's entry is durable before the import is acknowledged. A failed append is cut back
+//!   off (truncate, fsync) before the error returns, so the next append follows the last good
+//!   frame. If that cut fails too, the set takes no more writes ([`Error::Poisoned`]) until it
+//!   is reopened, and the reopen cuts the torn tail.
 //!
 //! # Open
 //!
@@ -41,22 +51,24 @@
 //! CURRENT: the text must parse as a base name whose re-formatted bytes are equal to it (so no
 //! `..`, `/`, NUL, uppercase, wrong length or extra bytes), naming a real directory (not a
 //! symlink) in `durable/`; else [`Error::BadCurrent`] or [`Error::BaseNotDir`], with nothing
-//! deleted. Only then are a crash's leftovers removed: `*.tmp`, `.tmp-*` and base dirs CURRENT
-//! does not name; nothing else is touched. Last, the base is read and `import.log` loaded, a
-//! torn tail cut.
+//! deleted. The base is read next ([`Error::BadBase`], nothing deleted). Only then are a crash's
+//! leftovers removed: `*.tmp`, `.tmp-*` and base dirs the base does not keep (any other anchor
+//! dir, any stale `finalized-*` dir); nothing else is touched. Last, `import.log` is loaded, a
+//! torn tail cut, and if it exists `durable/` is fsync'd before any append: a crash between the
+//! log's creation and the fsync of its entry is repaired here.
 
 use std::{
     fmt,
-    fs::{self, OpenOptions},
-    io::{self, Read, Write},
+    fs::{self, File, OpenOptions},
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
-#[cfg(feature = "test-hooks")]
-pub use super::atomic::Step;
-#[cfg(not(feature = "test-hooks"))]
-use super::atomic::Step;
 use super::atomic::{is_leftover, sync_dir, AtomicDir, Hooks};
+#[cfg(feature = "test-hooks")]
+pub use super::atomic::{AppendFault, Step};
+#[cfg(not(feature = "test-hooks"))]
+use super::atomic::{AppendFault, Step};
 use super::base::BaseName;
 pub use super::base::{Base, BaseFiles, BaseKind, Checkpoint};
 use super::import_log;
@@ -133,6 +145,10 @@ pub enum Error {
         /// Where the bad frame starts.
         offset: u64,
     },
+    /// An `import.log` append failed and rolling it back failed too, so the log may end in a
+    /// torn frame: the set takes no more writes until it is reopened, which cuts that tail.
+    #[error("an import.log append could not be rolled back; reopen the durable file set")]
+    Poisoned,
     /// A crash injected by [`FileSet::open_crashing`]: the operation stopped there and left the
     /// disk as it was.
     #[cfg(feature = "test-hooks")]
@@ -170,6 +186,13 @@ impl Loaded {
 /// The durable file set of one datadir. Its writes take `&mut self`: one writer.
 pub struct FileSet {
     dir: AtomicDir,
+    /// What the next [`Self::record_import`] injects (`test-hooks`); nothing without the
+    /// feature.
+    fault: AppendFault,
+    /// A failed append could not be rolled back: no more writes until a reopen.
+    poisoned: bool,
+    /// `durable/` was fsync'd with `import.log` in it since the open.
+    log_synced: bool,
 }
 
 impl fmt::Debug for FileSet {
@@ -198,20 +221,28 @@ impl FileSet {
     }
 
     fn open_with(datadir: &Path, hooks: Hooks) -> Result<(Self, Loaded)> {
-        let set = Self {
+        let mut set = Self {
             dir: AtomicDir::new(datadir.join(DIR), hooks),
+            fault: AppendFault::default(),
+            poisoned: false,
+            log_synced: false,
         };
         set.check_version(datadir)?;
-        let current = set.current()?;
-        set.clean(current)?;
-        let base = current.map(|name| set.read_base(name)).transpose()?;
+        let base = set.current()?.map(|name| set.read_base(name)).transpose()?;
+        let keep: Vec<BaseName> = base
+            .iter()
+            .flat_map(|base| kept(BaseName::of(base), base.anchor))
+            .collect();
+        set.clean(&keep)?;
         let imports = set.load_log()?;
         Ok((set, Loaded { base, imports }))
     }
 
     /// Makes `anchor` the restart base: writes `anchor-<root>/` with `files`, swaps CURRENT to
-    /// it, then deletes the previous base.
+    /// it, then deletes the previous base. A new anchor is a new trust root, so the previous
+    /// anchor dir and every `finalized-*` dir go.
     pub fn install_anchor(&mut self, anchor: Checkpoint, files: &BaseFiles<'_>) -> Result<()> {
+        self.writable()?;
         let old = self.current()?;
         let new = BaseName {
             kind: BaseKind::Anchor,
@@ -221,8 +252,10 @@ impl FileSet {
     }
 
     /// Makes the finalized block `root` the restart base: writes `finalized-<root>/` with
-    /// `files` and the current base's anchor, swaps CURRENT to it, then deletes the old base.
+    /// `files` and the current base's anchor, swaps CURRENT to it, then deletes the previous
+    /// `finalized-*` dir. `anchor-<root>/` of the carried anchor is kept.
     pub fn advance_finality(&mut self, root: [u8; 32], files: &BaseFiles<'_>) -> Result<()> {
+        self.writable()?;
         let old = self.current()?.ok_or(Error::NoBase)?;
         let anchor = self.read_anchor(old)?;
         let new = BaseName {
@@ -237,15 +270,56 @@ impl FileSet {
     /// Contract: call it after the block's `blocks` transaction has committed and before the
     /// import is acknowledged. A crash before it leaves a block with no record, which loading
     /// ignores ([`Loaded::is_imported`]); once it returns, both are durable.
+    ///
+    /// On an I/O error the import is not acknowledged and the frame is cut back off: the file
+    /// is truncated to its length before the append and fsync'd, so a partial frame never sits
+    /// before a later good one. If that fails too, the set is poisoned: this and every later
+    /// write is [`Error::Poisoned`] until [`Self::open`], whose load cuts the torn tail.
     pub fn record_import(&mut self, record: &ImportRecord) -> Result<()> {
+        self.writable()?;
+        let fault = std::mem::take(&mut self.fault);
         let path = self.dir.join(IMPORT_LOG);
-        let created = !path.exists();
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        file.write_all(&import_log::frame(record))?;
+        let len = file.metadata()?.len();
+        let appended = self.append(&mut file, record, fault);
+        // Only an I/O error: an injected crash is the process dying, and nothing runs after it.
+        if let Err(Error::Io(_)) = appended {
+            if fault.truncate(&file, len).is_err() {
+                self.poisoned = true;
+            }
+        }
+        appended
+    }
+
+    /// Makes the next [`Self::record_import`] fail as `fault` says, once.
+    #[cfg(feature = "test-hooks")]
+    pub fn fail_next_append(&mut self, fault: AppendFault) {
+        self.fault = fault;
+    }
+
+    /// Writes `record`'s frame at the end of `file` and fsyncs it, and `durable/` too if it
+    /// was not fsync'd with the log in it since the open.
+    fn append(&mut self, file: &mut File, record: &ImportRecord, fault: AppendFault) -> Result<()> {
+        fault.write(file, &import_log::frame(record))?;
         self.dir.at(Step::Written, IMPORT_LOG)?;
-        file.sync_data()?;
-        if created {
-            sync_dir(self.dir.path())?;
+        fault.sync(file)?;
+        if !self.log_synced {
+            self.sync_log_entry()?;
+        }
+        Ok(())
+    }
+
+    /// fsyncs `durable/`, so `import.log`'s entry in it is durable.
+    fn sync_log_entry(&mut self) -> Result<()> {
+        sync_dir(self.dir.path())?;
+        self.log_synced = true;
+        self.dir.at(Step::DirSynced, DIR)
+    }
+
+    /// [`Error::Poisoned`] once a failed append could not be rolled back.
+    fn writable(&self) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
         }
         Ok(())
     }
@@ -299,8 +373,9 @@ impl FileSet {
         Ok(Some(name))
     }
 
-    /// Removes a crash's leftovers: temp files and dirs, and base dirs other than `keep`.
-    fn clean(&self, keep: Option<BaseName>) -> Result<()> {
+    /// Removes temp files and dirs, and base dirs not in `keep`: a crash's leftovers, or the
+    /// bases a base change replaced.
+    fn clean(&self, keep: &[BaseName]) -> Result<()> {
         let mut removed = false;
         for entry in fs::read_dir(self.dir.path())? {
             let entry = entry?;
@@ -308,7 +383,7 @@ impl FileSet {
             let stale = name
                 .to_str()
                 .and_then(BaseName::parse)
-                .is_some_and(|base| Some(base) != keep);
+                .is_some_and(|base| !keep.contains(&base));
             if !stale && !is_leftover(&name) {
                 continue;
             }
@@ -346,7 +421,7 @@ impl FileSet {
         })
     }
 
-    fn load_log(&self) -> Result<Vec<ImportRecord>> {
+    fn load_log(&mut self) -> Result<Vec<ImportRecord>> {
         let path = self.dir.join(IMPORT_LOG);
         let mut file = match OpenOptions::new().read(true).write(true).open(path) {
             Ok(file) => file,
@@ -361,6 +436,7 @@ impl FileSet {
             file.set_len(good as u64)?;
             file.sync_all()?;
         }
+        self.sync_log_entry()?;
         Ok(records)
     }
 
@@ -375,19 +451,15 @@ impl FileSet {
         if old == Some(new) {
             return Err(Error::BaseIsCurrent { name });
         }
-        let anchor = anchor.encode();
+        let encoded = anchor.encode();
         let mut contents = vec![(BLOCK, files.block), (STATE, files.state)];
         contents.extend(files.envelope.map(|envelope| (ENVELOPE, envelope)));
-        contents.push((ANCHOR, &anchor));
+        contents.push((ANCHOR, &encoded));
         self.dir.write_dir(&name, &contents)?;
         self.dir
             .write_file(CURRENT, format!("{name}\n").as_bytes())?;
         self.dir.at(Step::Swapped, &name)?;
-        if let Some(old) = old {
-            fs::remove_dir_all(self.dir.join(&old.to_string()))?;
-            sync_dir(self.dir.path())?;
-        }
-        Ok(())
+        self.clean(&kept(new, anchor))
     }
 }
 
@@ -403,6 +475,16 @@ fn parse_version(bytes: &[u8]) -> Result<()> {
             found: bytes.escape_ascii().to_string(),
         }),
     }
+}
+
+/// The base dirs `base` keeps: itself and `anchor-<root>/` of the operator anchor it carries
+/// (for an anchor base, the same dir twice).
+fn kept(base: BaseName, anchor: Checkpoint) -> [BaseName; 2] {
+    let anchor = BaseName {
+        kind: BaseKind::Anchor,
+        root: anchor.root,
+    };
+    [base, anchor]
 }
 
 fn bad_base(name: BaseName, file: &'static str) -> Error {

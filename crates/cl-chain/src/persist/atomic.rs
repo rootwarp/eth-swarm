@@ -6,7 +6,8 @@
 //!   fsync'd), renamed onto `<name>/`, the directory fsync'd.
 //!
 //! Each step reports to the [`Hooks`]; with the `test-hooks` feature a hook can stop the write
-//! there ([`super::durable::Error::Crashed`]), leaving the disk as it is.
+//! there ([`super::durable::Error::Crashed`]), leaving the disk as it is. An [`AppendFault`]
+//! makes an `import.log` append fail with an I/O error instead, and the process goes on.
 
 use std::{
     ffi::OsStr,
@@ -34,6 +35,8 @@ pub enum Step {
     Renamed,
     /// CURRENT names the new base (named here), durably; the old base is not deleted.
     Swapped,
+    /// `durable/` (named here) fsync'd for `import.log`: the log's entry in it is durable.
+    DirSynced,
 }
 
 #[cfg(feature = "test-hooks")]
@@ -140,6 +143,61 @@ pub(super) fn is_leftover(name: &OsStr) -> bool {
 pub(super) fn sync_dir(dir: &Path) -> Result<()> {
     File::open(dir)?.sync_all()?;
     Ok(())
+}
+
+/// I/O failures a test injects into one `import.log` append
+/// ([`FileSet::fail_next_append`](super::durable::FileSet::fail_next_append), feature
+/// `test-hooks`). Unlike a crash, the append returns [`super::durable::Error::Io`], as a full
+/// disk or a failing device would, and the process goes on. Without the feature it has no
+/// fields and injects nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AppendFault {
+    /// The frame's write puts only its first `n` bytes in the file, then fails. `None`: the
+    /// whole frame is written.
+    #[cfg(feature = "test-hooks")]
+    pub short_write: Option<usize>,
+    /// The frame's fsync fails.
+    #[cfg(feature = "test-hooks")]
+    pub sync: bool,
+    /// Rolling the failed append back (truncate and fsync) fails.
+    #[cfg(feature = "test-hooks")]
+    pub rollback: bool,
+}
+
+impl AppendFault {
+    /// Writes `frame` to `file`; with a short write, only its first bytes and then an error.
+    pub(super) fn write(&self, file: &mut File, frame: &[u8]) -> io::Result<()> {
+        #[cfg(feature = "test-hooks")]
+        if let Some(n) = self.short_write {
+            file.write_all(frame.get(..n).unwrap_or(frame))?;
+            return Err(injected("write"));
+        }
+        file.write_all(frame)
+    }
+
+    /// fsyncs the data appended to `file`.
+    pub(super) fn sync(&self, file: &File) -> io::Result<()> {
+        #[cfg(feature = "test-hooks")]
+        if self.sync {
+            return Err(injected("fsync"));
+        }
+        file.sync_data()
+    }
+
+    /// Cuts `file` back to `len` bytes and fsyncs it.
+    pub(super) fn truncate(&self, file: &File, len: u64) -> io::Result<()> {
+        #[cfg(feature = "test-hooks")]
+        if self.rollback {
+            return Err(injected("truncate"));
+        }
+        file.set_len(len)?;
+        file.sync_all()
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+fn injected(call: &str) -> io::Error {
+    io::Error::other(format!("injected {call} failure"))
 }
 
 fn remove_dir_if_any(path: &Path) -> Result<()> {

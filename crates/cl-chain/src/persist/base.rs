@@ -90,6 +90,14 @@ pub(super) struct BaseName {
 }
 
 impl BaseName {
+    /// The name of `base`'s dir.
+    pub(super) fn of(base: &Base) -> Self {
+        Self {
+            kind: base.kind,
+            root: base.root,
+        }
+    }
+
     /// The name `text` is, if formatting it back gives exactly `text`.
     pub(super) fn parse(text: &str) -> Option<Self> {
         let (kind, hex) = text.split_once('-')?;
