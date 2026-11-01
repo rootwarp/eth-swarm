@@ -1,7 +1,7 @@
 //! `FindPeers` by subnet and custody column, through the public API: the predicate a lookup runs
 //! (`SubnetQuery::matches`, ANDed with the fork and IP filter by `service::lookup_predicate`),
-//! and the RPC over a fake discv5 ([`Lookups`]: a gate the test opens, counted lookups) on a
-//! paused tokio clock and a fake slot clock.
+//! and the RPC over a fake discv5 ([`Lookups`]: lookups that outlive their caller, a gate the
+//! test opens, counted lookups) on a paused tokio clock and a fake slot clock.
 //!
 //! The vectors of the custody tests come from `das::custody_columns` of each record's node ID,
 //! so every record (a fresh random key) is checked against its own custody.
@@ -19,12 +19,13 @@ use ipc::Link;
 use p2p_wire::enr::ForkFields;
 use p2p_wire::rpc::messages::ForkDigest;
 use pb::discovery_service_server::DiscoveryService;
+use std::future::Future;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::watch;
-use tokio::time::Instant;
+use tokio::sync::{oneshot, watch};
+use tokio::time::{timeout, Instant};
 use tokio_stream::StreamExt;
 use tonic::{Code, Request, Status};
 
@@ -233,29 +234,103 @@ fn fork_digest_filtered() {
     );
 }
 
-/// discv5 as the server reads it: a lookup finds every record of `records` that the query
-/// matches (all of them, whatever `max` it is asked for), once `open` is true. It counts the
-/// lookups, the most that ran at once and the `max` each was asked for.
+/// A filter within the grace after our digest changed, and three records that serve attestation
+/// subnet 0, named by [`NAMES`]: on another digest with an `nfd` of ours, on our digest before
+/// the change, and on ours.
+fn in_grace() -> (PeerFilter, [Enr; 3]) {
+    let digest = fork().eth2.fork_digest;
+    let previous = [0xa1, 0xa2, 0xa3, 0xa4];
+    let on = |fork_digest| {
+        let mut fields = fork();
+        fields.eth2.fork_digest = fork_digest;
+        fields
+    };
+    let filter = PeerFilter {
+        fork_digest: digest,
+        previous: Some(previous),
+        mode: NetworkMode::Devnet,
+    };
+    let attnet_0: &[u8] = &[1, 0, 0, 0, 0, 0, 0, 0];
+    let records = [
+        record(
+            Some(&on([0xde, 0xad, 0xbe, 0xef])),
+            &[("nfd", &digest[..]), ("attnets", attnet_0)],
+        ),
+        record(Some(&on(previous)), &[("attnets", attnet_0)]),
+        record(Some(&on(digest)), &[("attnets", attnet_0)]),
+    ];
+    (filter, records)
+}
+
+const NAMES: [&str; 3] = ["nfd ours", "previous", "exact"];
+
+/// The names of `found`, records of `records` ([`in_grace`]).
+fn names(found: &[Enr], records: &[Enr; 3]) -> Vec<&'static str> {
+    (found.iter())
+        .map(|enr| NAMES[records.iter().position(|r| r == enr).unwrap()])
+        .collect()
+}
+
+/// `FindPeers` wants peers whose `eth2.fork_digest` is exactly ours (the status handshake drops
+/// the others): its lookup's predicate refuses a record on another digest whose `nfd` is ours,
+/// and one on our digest before the change while its grace lasts, though the table's filter
+/// (`PeerFilter::accepts`, for the table, `WatchPeers` and the events) keeps both.
+#[test]
+fn find_peers_needs_our_exact_eth2_digest() {
+    let (filter, records) = in_grace();
+    let wanted = query(&[0], &[], &[]);
+    let predicate = lookup_predicate(filter, move |enr: &Enr| wanted.matches(enr));
+    let passed: Vec<Enr> = records
+        .iter()
+        .filter(|enr| predicate(enr))
+        .cloned()
+        .collect();
+    assert_eq!(names(&passed, &records), ["exact"]);
+    let kept: Vec<Enr> = (records.iter())
+        .filter(|enr| filter.accepts(enr) && wanted.matches(enr))
+        .cloned()
+        .collect();
+    assert_eq!(names(&kept, &records), NAMES);
+}
+
+/// What a `FindPeers` lookup returns is checked again, because discv5 can return an older copy
+/// of a record than the one the predicate passed: the check (`PeerFilter::retain_exact`)
+/// refuses the same records; the table's (`PeerFilter::retain`) keeps them.
+#[test]
+fn find_peers_rechecks_our_exact_eth2_digest() {
+    let (filter, records) = in_grace();
+    let rechecked = filter.retain_exact(records.to_vec());
+    assert_eq!(names(&rechecked, &records), ["exact"]);
+    assert_eq!(names(&filter.retain(records.to_vec()), &records), NAMES);
+}
+
+/// discv5 as the server reads it. A lookup runs as discv5 runs a `find_node_predicate` query: in
+/// the service, apart from the future that waits for it, so dropping that future does not end
+/// the lookup (discv5 cannot cancel a query; it ends at its `query_timeout`). Lookups are
+/// numbered from 0 as they are asked for, and lookup `n` ends once `open` is above `n`; it then
+/// finds every record of `records` that the query matches (all of them, whatever `max` it is
+/// asked for). It counts the lookups asked for, those running, the most that ran at once and
+/// the `max` each was asked for.
 struct Lookups {
     local: Enr,
     records: Vec<Enr>,
     digest: Mutex<ForkDigest>,
-    open: watch::Receiver<bool>,
+    open: watch::Receiver<usize>,
     started: AtomicUsize,
-    running: AtomicUsize,
+    running: Arc<AtomicUsize>,
     most: AtomicUsize,
     asked: Mutex<Vec<usize>>,
 }
 
 impl Lookups {
-    fn new(records: Vec<Enr>, open: watch::Receiver<bool>) -> Arc<Self> {
+    fn new(records: Vec<Enr>, open: watch::Receiver<usize>) -> Arc<Self> {
         Arc::new(Self {
             local: record(Some(&fork()), &[]),
             records,
             digest: Mutex::new(fork().eth2.fork_digest),
             open,
             started: AtomicUsize::new(0),
-            running: AtomicUsize::new(0),
+            running: Arc::new(AtomicUsize::new(0)),
             most: AtomicUsize::new(0),
             asked: Mutex::new(Vec::new()),
         })
@@ -263,6 +338,10 @@ impl Lookups {
 
     fn started(&self) -> usize {
         self.started.load(SeqCst)
+    }
+
+    fn running(&self) -> usize {
+        self.running.load(SeqCst)
     }
 }
 
@@ -279,24 +358,34 @@ impl PeerSource for Lookups {
         *self.digest.lock().unwrap()
     }
 
-    async fn find_matching(
+    /// Started when asked for, in a task of its own (discv5's service); the future only waits
+    /// for its answer.
+    fn find_matching(
         &self,
         query: SubnetQuery,
         max: usize,
-    ) -> Result<Vec<Enr>, ServiceError> {
-        self.started.fetch_add(1, SeqCst);
-        let running = self.running.fetch_add(1, SeqCst) + 1;
-        self.most.fetch_max(running, SeqCst);
+    ) -> impl Future<Output = Result<Vec<Enr>, ServiceError>> + Send {
+        let n = self.started.fetch_add(1, SeqCst);
+        let running = Arc::clone(&self.running);
+        self.most
+            .fetch_max(running.fetch_add(1, SeqCst) + 1, SeqCst);
         self.asked.lock().unwrap().push(max);
-        let mut open = self.open.clone();
-        let _ = open.wait_for(|open| *open).await;
-        self.running.fetch_sub(1, SeqCst);
-        Ok(self
-            .records
-            .iter()
+        let found: Vec<Enr> = (self.records.iter())
             .filter(|enr| query.matches(enr))
             .cloned()
-            .collect())
+            .collect();
+        let mut open = self.open.clone();
+        let (answer, answered) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = open.wait_for(|open| *open > n).await;
+            running.fetch_sub(1, SeqCst);
+            let _ = answer.send(found);
+        });
+        async move {
+            answered
+                .await
+                .map_err(|_| ServiceError::Query("discv5 stopped".into()))
+        }
     }
 }
 
@@ -378,7 +467,7 @@ fn everywhere() -> Enr {
 /// cache holds at most 64 queries a slot, dropping the oldest first.
 #[tokio::test(start_paused = true)]
 async fn query_bounded() {
-    let (open, gate) = watch::channel(false);
+    let (open, gate) = watch::channel(0);
     let lookups = Lookups::new((0..20).map(|_| everywhere()).collect(), gate);
     let slot = Arc::new(AtomicU64::new(7));
     let (server, link, _stop) = serve(&lookups, &slot);
@@ -401,7 +490,7 @@ async fn query_bounded() {
     let mut fourth = opened(&server, find(&[4], &[], 1, &link)).await;
     assert_eq!(lookups.started(), 2);
 
-    open.send_replace(true);
+    open.send_replace(usize::MAX);
     assert_eq!(candidates(&mut first).await.len(), MAX_TARGET);
     assert_eq!(candidates(&mut second).await.len(), 1);
     assert_eq!(candidates(&mut fourth).await.len(), 1);
@@ -451,6 +540,49 @@ async fn query_bounded() {
     assert_eq!(lookups.started(), before + 66, "the oldest was dropped");
 }
 
+/// A lookup keeps its slot until it ends, whatever becomes of its request: discv5 cannot cancel
+/// a lookup it started, so a request that its deadline or its client's going away cancels
+/// frees no slot. With two such lookups running, a third request waits (no lookup, no frame)
+/// until one of them ends, and then runs its own; never more than two run at once.
+#[tokio::test(start_paused = true)]
+async fn cancelled_callers_keep_their_lookup_slots() {
+    let (open, gate) = watch::channel(0);
+    let lookups = Lookups::new(vec![everywhere()], gate);
+    let slot = Arc::new(AtomicU64::new(1));
+    let (server, link, _stop) = serve(&lookups, &slot);
+
+    let mut by_deadline = find(&[1], &[], 1, &link);
+    by_deadline.set_timeout(Duration::from_secs(2));
+    let mut by_deadline = opened(&server, by_deadline).await;
+    let gone = opened(&server, find(&[2], &[], 1, &link)).await;
+    assert_eq!(lookups.started(), 2);
+    // One client goes away; the other request's deadline passes (on the paused clock, once
+    // every task has run).
+    drop(gone);
+    let refused = by_deadline.next().await.unwrap().unwrap_err();
+    assert_eq!(refused.code(), Code::DeadlineExceeded, "{refused:?}");
+    assert!(by_deadline.next().await.is_none());
+
+    let mut third = opened(&server, find(&[3], &[], 1, &link)).await;
+    let wait = Duration::from_secs(30);
+    assert!(timeout(wait, third.next()).await.is_err(), "no frame yet");
+    assert_eq!(
+        lookups.started(),
+        2,
+        "a cancelled request freed its lookup's slot"
+    );
+    assert_eq!(lookups.running(), 2);
+
+    // The first lookup ends, though nobody waits for it: the third request's starts.
+    open.send_replace(1);
+    assert!(timeout(wait, third.next()).await.is_err(), "no frame yet");
+    assert_eq!(lookups.started(), 3);
+    assert_eq!(lookups.running(), 2);
+    open.send_replace(usize::MAX);
+    assert_eq!(candidates(&mut third).await.len(), 1);
+    assert_eq!(lookups.most.load(SeqCst), MAX_CONCURRENT_LOOKUPS);
+}
+
 /// Peers come most-covering first: the number of wanted subnets and columns each serves, kinds
 /// mixed; ties in node ID order. The target takes the first ones.
 #[tokio::test(start_paused = true)]
@@ -477,7 +609,7 @@ async fn results_ranked_by_coverage() {
     want.extend(by_id(&one_a, &one_b));
     let want: Vec<String> = want.iter().map(Enr::to_base64).collect();
 
-    let (_open, gate) = watch::channel(true);
+    let (_open, gate) = watch::channel(usize::MAX);
     let lookups = Lookups::new(vec![one_a, unwanted, two, three_b, one_b, three_a], gate);
     let slot = Arc::new(AtomicU64::new(1));
     let (server, link, _stop) = serve(&lookups, &slot);

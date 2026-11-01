@@ -12,8 +12,10 @@ cl-p2p (`UpdateEnr` is still a stub), and `src/process.rs` is the `cl-discv5` pr
 serve at least one wanted attestation subnet (`attnets`), sync-committee subnet (`syncnets`) or
 custody column. A peer's custody columns are `das::custody_columns` of its node ID and `cgc`; a
 record without `cgc` counts as `CUSTODY_REQUIREMENT` (4), an empty one as 0 (no column), and one
-above 128 or not in its canonical form matches nothing. The predicate is ANDed with the fork and
-IP filter inside the lookup, and every result is checked against both again.
+above 128 or not in its canonical form matches nothing. The predicate is ANDed with the IP rules
+and our exact `eth2.fork_digest` inside the lookup, and every result is checked against both
+again. Unlike the routing table, `FindPeers` takes no peer on another digest whose `nfd` is ours,
+nor one on our digest before a change while its grace lasts: the status handshake would drop it.
 
 - **Request.** Every index below its count (64, 4, 128), at least one wanted, `target` at least
   1 (capped at 16); otherwise `INVALID_ARGUMENT`, before any frame. `fork_digest` empty means
@@ -22,7 +24,8 @@ IP filter inside the lookup, and every result is checked against both again.
   subnets and columns each serves, ties in node ID order), at most `target`, then the end.
 - **Bounds.** At most two lookups run at once (the periodic lookups are not counted); a request
   waits for one until its `grpc-timeout` passes (`DEADLINE_EXCEEDED`), or without one until the
-  client goes. The ranked peers of up to 64 queries are cached for the rest of the slot (from
+  client goes. A lookup holds its slot until it ends (discv5 cannot cancel it), even when its
+  request's deadline passes or its client goes first. The ranked peers of up to 64 queries are cached for the rest of the slot (from
   the network config's genesis time and slot duration) and our fork digest; a full cache drops
   its oldest query.
 
@@ -38,7 +41,7 @@ rules are discv5's `table_filter`, a bare `fn` pointer, so it cannot hold the fo
 
 - **Lookups** (`Discovery::find_peers_matching`, `Discovery::find_peers` for any peer) run
   `find_node_predicate` with the fork digest, the IP rules and the lookup's own predicate, and
-  check every returned record against them again.
+  check every returned record against them again (`FindPeers` wants our exact digest).
 - **Events** (`Events::next`) surface `Discovered` and `SessionEstablished` only for records
   on our fork digest within the IP rules, and a session only from a source address within the
   IP rules.

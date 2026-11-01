@@ -49,7 +49,8 @@ pub trait PeerSource: Send + Sync + 'static {
     fn table_records(&self) -> Vec<Enr>;
     /// Our fork digest now.
     fn fork_digest(&self) -> ForkDigest;
-    /// A lookup for at most `max` records that pass the filter and that `query` matches.
+    /// A lookup for at most `max` records that pass the IP rules, have our exact `eth2` fork
+    /// digest and that `query` matches.
     fn find_matching(
         &self,
         query: SubnetQuery,
@@ -354,7 +355,7 @@ impl<S: PeerSource> DiscoveryService for DiscoveryServer<S> {
             {
                 return;
             }
-            let lookup = || source.find_matching(query, MAX_TARGET);
+            let lookup = || async move { source.find_matching(query, MAX_TARGET).await };
             let found = tokio::select! {
                 biased;
                 () = stopped(stop) => Err(stopping()),

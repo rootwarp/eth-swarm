@@ -10,15 +10,20 @@
 //!   `attnets` and `syncnets` bits (`phase0/p2p-interface.md`, `altair/p2p-interface.md`) and
 //!   its custody columns, `get_custody_groups` of its node ID and `cgc` (`fulu/das-core.md`). A
 //!   peer matches when it serves any one ([`SubnetQuery::matches`], the lookup's predicate, which
-//!   [`crate::service::Discovery::find_peers_matching`] ANDs with the fork and IP filter); the
-//!   peers found are ranked by coverage, most first, ties in node ID order.
+//!   [`crate::service::Discovery::find_peers_matching`] ANDs with the IP rules and our exact
+//!   `eth2` fork digest); the peers found are ranked by coverage, most first, ties in node ID
+//!   order.
 //! - The finder (crate-internal, one per server): at most [`MAX_CONCURRENT_LOOKUPS`] lookups at
-//!   once, and a request waits for one until its deadline, which bounds its lookup too. Each
-//!   lookup asks for [`MAX_TARGET`] peers whatever the request's `target`, and its ranked peers
-//!   are cached by query for the rest of the slot ([`SlotClock`]) at our fork digest: a hit runs
-//!   no lookup. A new slot or fork digest empties the cache; it holds at most
-//!   [`MAX_CACHE_ENTRIES`] queries and drops the oldest first (a hit does not refresh one). A
-//!   failed lookup, or one that ends in a later slot, is not cached.
+//!   once. A request waits for a slot until its deadline; once it holds one, its lookup runs in a
+//!   task of its own that holds the slot until the lookup ends, whatever becomes of the request
+//!   (discv5 cannot cancel a lookup it started; it ends at its query timeout). So the deadline
+//!   bounds the request, not its lookup, and a request cancelled while it waits leaves the
+//!   queue without starting one. Each lookup asks for [`MAX_TARGET`] peers whatever the
+//!   request's `target`, and its ranked peers are cached by query for the rest of the slot
+//!   ([`SlotClock`]) at our fork digest: a hit runs no lookup. A new slot or fork digest empties
+//!   the cache; it holds at most [`MAX_CACHE_ENTRIES`] queries and drops the oldest first (a hit
+//!   does not refresh one). A failed lookup, one that ends in a later slot, or one whose request
+//!   is gone (its peers are dropped) is not cached.
 
 use crate::enr::{Enr, EnrFields};
 use crate::service::ServiceError;
@@ -77,7 +82,7 @@ pub enum QueryError {
     /// A `fork_digest` that is not our current one.
     #[error("fork_digest is not our current fork digest")]
     OtherFork,
-    /// The request's deadline passed before a lookup could run and end.
+    /// The request's deadline passed before a lookup could run and end (the lookup runs on).
     #[error("the deadline passed before the lookup ended")]
     Deadline,
     /// The lookup failed.
@@ -200,7 +205,7 @@ impl SubnetQuery {
 /// The lookups of `FindPeers`: at most [`MAX_CONCURRENT_LOOKUPS`] at once, their results cached
 /// for the rest of the slot (see the module docs).
 pub(crate) struct Finder {
-    permits: Semaphore,
+    permits: Arc<Semaphore>,
     cache: Mutex<Cache>,
     slots: SlotClock,
 }
@@ -229,7 +234,7 @@ impl Finder {
     #[must_use]
     pub(crate) fn new(slots: SlotClock) -> Self {
         Self {
-            permits: Semaphore::new(MAX_CONCURRENT_LOOKUPS),
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_LOOKUPS)),
             cache: Mutex::new(Cache::default()),
             slots,
         }
@@ -237,12 +242,13 @@ impl Finder {
 
     /// The peers for `query` while our fork digest is `ours`: those cached at this slot and
     /// digest, else those `lookup` finds once a permit is free, then cached. `deadline` bounds
-    /// the wait for the permit and the lookup together.
+    /// the wait for the permit and the lookup together; the lookup itself, once started, runs
+    /// to its end in a task that holds the permit, even if this future is dropped first.
     ///
     /// # Errors
     ///
     /// [`QueryError::Deadline`] once `deadline` passes, [`QueryError::Lookup`] if the lookup
-    /// fails; neither is cached.
+    /// fails (or its task panics); neither is cached.
     pub(crate) async fn find<F, Fut>(
         &self,
         query: SubnetQuery,
@@ -252,7 +258,7 @@ impl Finder {
     ) -> Result<Arc<[Enr]>, QueryError>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<Vec<Enr>, ServiceError>>,
+        Fut: Future<Output = Result<Vec<Enr>, ServiceError>> + Send + 'static,
     {
         let at = ((self.slots)(), ours);
         let hit = (self.cache().at(at).iter())
@@ -262,16 +268,25 @@ impl Finder {
             return Ok(found);
         }
         let run = async {
-            // `acquire` fails only once the semaphore is closed, and this one never is.
-            let _permit = self.permits.acquire().await.ok();
-            lookup().await
+            // The wait is ours: dropped while it waits, a request starts no lookup. `acquire`
+            // fails only once the semaphore is closed, and this one never is.
+            let permit = Arc::clone(&self.permits).acquire_owned().await.ok();
+            let lookup = lookup();
+            // The task, not this future, holds the permit until the lookup ends: dropping this
+            // future (the deadline, the client gone) detaches the task and frees no slot.
+            ipc::spawn_in_span(async move {
+                let _permit = permit;
+                lookup.await
+            })
+            .await
         };
         let found = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, run)
                 .await
-                .map_err(|_| QueryError::Deadline)??,
-            None => run.await?,
+                .map_err(|_| QueryError::Deadline)?,
+            None => run.await,
         };
+        let found = found.map_err(|e| ServiceError::Query(e.to_string()))??;
         let found: Arc<[Enr]> = query.rank(found).into();
         // Cached only at the slot it was looked up in.
         if (self.slots)() == at.0 {

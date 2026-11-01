@@ -6,18 +6,19 @@
 //!   routing table.
 //! - **Fork filter** ([`PeerFilter`]): our fork digest and the IP rules together. The digest is
 //!   read from the local record each time ([`Discovery::filter`]), so it follows a local-record
-//!   update at a fork or BPO boundary. It is the
-//!   `find_node_predicate` closure ([`lookup_predicate`], with what the lookup wants), so a
-//!   lookup returns only records whose `eth2.fork_digest` is ours and that pass the IP rules,
-//!   and it filters the event stream.
+//!   update at a fork or BPO boundary. It is the `find_node_predicate` closure of
+//!   [`Discovery::find_peers`], so a lookup returns only records on our fork that pass the IP
+//!   rules, and it filters the event stream. A `FindPeers` lookup ([`lookup_predicate`], with
+//!   what the lookup wants) is stricter: `eth2.fork_digest` exactly ours
+//!   ([`PeerFilter::accepts_exact`]).
 //!   The `next_fork_*` fields and `nfd` are not compared: a peer that plans another next fork
 //!   is still on our fork until the boundary, and `fulu/p2p-interface.md` forbids dropping it
 //!   before then.
 //! - **Service** ([`Discovery`]): `Discv5::new` with the local record and node key, the IP
-//!   rules as `table_filter`, then `start` and the event stream ([`Events`]). Lookups go
-//!   through [`Discovery::find_peers_matching`] ([`Discovery::find_peers`] wants any peer),
-//!   which runs the [`PeerFilter`] and the lookup's own predicate and then checks every
-//!   returned record against both again ([`PeerFilter::retain`]). Events go through
+//!   rules as `table_filter`, then `start` and the event stream ([`Events`]). A lookup
+//!   ([`Discovery::find_peers`], or [`Discovery::find_peers_matching`] with its own predicate)
+//!   runs its filter and then checks every returned record against it again
+//!   ([`PeerFilter::retain`], [`PeerFilter::retain_exact`]). Events go through
 //!   [`Events::next`], which applies the [`PeerFilter`] to every record and, for a session,
 //!   the IP rules to its source address too.
 //! - **Table eviction** ([`EvictionReason`]): discv5 0.12 does not run `table_filter` on every
@@ -125,6 +126,7 @@ fn every_address(enr: &Enr, rule: fn(IpAddr) -> bool) -> bool {
 /// to ours at the change, and peers update their records only when discv5 asks again), or,
 /// within the grace after our own digest change ([`Discovery::with_fork_grace`]), when its
 /// `eth2.fork_digest` is the one we had before. So a digest change does not empty the table.
+/// `FindPeers` takes neither exception ([`Self::accepts_exact`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerFilter {
     /// The local fork digest a record's `eth2.fork_digest` must equal.
@@ -140,6 +142,15 @@ impl PeerFilter {
     /// without a decodable `eth2` is on no fork.
     pub fn accepts(&self, enr: &Enr) -> bool {
         table_filter(self.mode)(enr) && self.on_fork(enr)
+    }
+
+    /// True for a record whose addresses pass the IP rules and whose `eth2.fork_digest` is
+    /// exactly ours: no `nfd` or grace exception. What `FindPeers` returns, as the status
+    /// handshake would drop the others.
+    pub fn accepts_exact(&self, enr: &Enr) -> bool {
+        table_filter(self.mode)(enr)
+            && crate::enr::EnrFields::read(enr)
+                .is_ok_and(|fields| fields.eth2.fork_digest == self.fork_digest)
     }
 
     /// True for a record on our fork (see the type's docs).
@@ -170,6 +181,12 @@ impl PeerFilter {
     /// The records of `enrs` that [`Self::accepts`], in order.
     pub fn retain(&self, mut enrs: Vec<Enr>) -> Vec<Enr> {
         enrs.retain(|enr| self.accepts(enr));
+        enrs
+    }
+
+    /// The records of `enrs` that [`Self::accepts_exact`], in order.
+    pub fn retain_exact(&self, mut enrs: Vec<Enr>) -> Vec<Enr> {
+        enrs.retain(|enr| self.accepts_exact(enr));
         enrs
     }
 
@@ -226,12 +243,13 @@ pub fn table_evictions<'a>(
         .collect()
 }
 
-/// The `find_node_predicate` closure: [`PeerFilter::accepts`] and `wanted`.
+/// The `find_node_predicate` closure of a `FindPeers` lookup ([`Discovery::find_peers_matching`]):
+/// [`PeerFilter::accepts_exact`] and `wanted`.
 pub fn lookup_predicate(
     filter: PeerFilter,
     wanted: impl Fn(&Enr) -> bool + Send + 'static,
 ) -> Box<dyn Fn(&Enr) -> bool + Send> {
-    Box::new(move |enr| filter.accepts(enr) && wanted(enr))
+    Box::new(move |enr| filter.accepts_exact(enr) && wanted(enr))
 }
 
 /// How long the table keeps the records of our digest before a change, by default
@@ -643,22 +661,24 @@ impl Discovery {
     }
 
     /// An iterative lookup towards `target` that returns at most `max_peers` peers, every one
-    /// on our fork digest and within the IP rules ([`Self::find_peers_matching`] with no
-    /// predicate of its own).
+    /// that [`PeerFilter::accepts`] (on our fork, within the IP rules): the lookup runs the
+    /// filter, and every record it returns is checked against it again ([`PeerFilter::retain`]),
+    /// because discv5 can return an older copy of a record than the one the filter passed.
     pub async fn find_peers(
         &self,
         target: NodeId,
         max_peers: usize,
     ) -> Result<Vec<Enr>, ServiceError> {
-        self.find_peers_matching(target, |_: &Enr| true, max_peers)
-            .await
+        let filter = self.filter();
+        let accepted = Box::new(move |enr: &Enr| filter.accepts(enr));
+        let found = self.lookup(target, accepted, max_peers).await?;
+        Ok(filter.retain(found))
     }
 
-    /// An iterative lookup towards `target` that returns at most `max_peers` peers, every one
-    /// on our fork digest, within the IP rules and passed by `predicate`: the lookup runs
-    /// [`lookup_predicate`], and every record it returns is checked against both again
-    /// ([`PeerFilter::retain`], then `predicate`), because discv5 can return an older copy of a
-    /// record than the one the predicate passed.
+    /// As [`Self::find_peers`], for `FindPeers`: every peer has our exact `eth2.fork_digest`
+    /// and passes `predicate` ([`lookup_predicate`]). Every record the lookup returns is checked
+    /// again ([`PeerFilter::retain_exact`], then `predicate`), on the filter as it is when the
+    /// lookup ends.
     pub async fn find_peers_matching<P>(
         &self,
         target: NodeId,
@@ -668,19 +688,24 @@ impl Discovery {
     where
         P: Fn(&Enr) -> bool + Clone + Send + 'static,
     {
-        let filter = self.filter();
-        let found = self
-            .discv5
-            .find_node_predicate(
-                target,
-                lookup_predicate(filter, predicate.clone()),
-                max_peers,
-            )
-            .await
-            .map_err(|e| ServiceError::Query(e.to_string()))?;
-        let mut found = filter.retain(found);
+        let wanted = lookup_predicate(self.filter(), predicate.clone());
+        let found = self.lookup(target, wanted, max_peers).await?;
+        let mut found = self.filter().retain_exact(found);
         found.retain(|enr| predicate(enr));
         Ok(found)
+    }
+
+    /// A `find_node_predicate` lookup.
+    async fn lookup(
+        &self,
+        target: NodeId,
+        predicate: Box<dyn Fn(&Enr) -> bool + Send>,
+        max_peers: usize,
+    ) -> Result<Vec<Enr>, ServiceError> {
+        self.discv5
+            .find_node_predicate(target, predicate, max_peers)
+            .await
+            .map_err(|e| ServiceError::Query(e.to_string()))
     }
 }
 
