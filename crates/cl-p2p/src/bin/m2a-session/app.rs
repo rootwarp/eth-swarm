@@ -1613,7 +1613,7 @@ mod tests {
         assert_eq!(out.peer.metadata_requests(), 1);
         assert_eq!(out.peer.pings(), vec![ping::OUR_SEQ_NUMBER]);
         assert_eq!(ping::OUR_SEQ_NUMBER, 0);
-        assert_eq!(out.peer.connections(), 1);
+        assert_eq!(out.peer.wait_connections(1).await, 1);
         assert_eq!(out.api.hits(FINALITY_PATH), 2, "sampled before and after");
         assert_eq!(out.lines.len(), 5, "one line per step and the summary");
         let events: Vec<&Value> = out.lines.iter().map(|l| &l["event"]).collect();
@@ -1869,7 +1869,7 @@ mod tests {
         // The connection check still ran, on the same connection.
         assert_eq!(out.line()["pass"], true);
         assert!(out.verdict("connection"));
-        assert_eq!(out.peer.connections(), 1);
+        assert_eq!(out.peer.wait_connections(1).await, 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1968,7 +1968,7 @@ mod tests {
         assert_eq!(out.peer.pings(), vec![0], "one Ping");
         // The ENR read, the step's two samples, the re-sample.
         assert_eq!(out.api.hits(IDENTITY_PATH), 4);
-        assert_eq!(out.peer.connections(), 1);
+        assert_eq!(out.peer.wait_connections(1).await, 1);
 
         // The re-fetched MetaData is at 9, not the Ping's 8: fail, and no second re-fetch.
         let mut s = Scenario::new(peer_status(F1, 0, 0));
@@ -2068,7 +2068,7 @@ mod tests {
             "{error}"
         );
         assert!(out.verdict("connection"));
-        assert_eq!(out.peer.connections(), 1);
+        assert_eq!(out.peer.wait_connections(1).await, 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2295,7 +2295,7 @@ mod tests {
         let (_dir, path) = config_without_api(&format!("{}/p2p/{}", peer.addr, peer.id));
         let (code, _) = run_off_runtime(path, vec!["--dial-only".into()], test_env()).await;
         assert_eq!(code, EXIT_CONNECTED);
-        assert_eq!(peer.connections(), 1);
+        assert_eq!(peer.wait_connections(1).await, 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2371,7 +2371,7 @@ mod tests {
         };
         let (code, _) = run_off_runtime(path, vec!["--dial-only".into()], env).await;
         assert_eq!(code, EXIT_CONNECTED);
-        assert_eq!(peer.connections(), 1);
+        assert_eq!(peer.wait_connections(1).await, 1);
     }
 
     async fn missing_gate_refused(s: Scenario) {
@@ -2656,7 +2656,7 @@ mod tests {
         assert_eq!(out.code, EXIT_CONNECTED, "{}", out.summary());
         assert!(out.verdict("connection"), "{}", out.line());
         assert!(out.blocks_verdict("roots"), "{}", out.blocks_line());
-        assert_eq!(out.peer.connections(), 1);
+        assert_eq!(out.peer.wait_connections(1).await, 1);
         assert_eq!(
             out.peer.requests().len(),
             2,
