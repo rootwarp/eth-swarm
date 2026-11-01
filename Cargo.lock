@@ -5724,11 +5724,17 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 name = "store-schema"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
+ "consensus-types",
+ "ethereum_ssz",
  "libmdbx",
  "mdbx-sys",
+ "network-config",
  "proptest",
+ "ssz_types",
  "tempfile",
  "thiserror 2.0.21",
+ "tree_hash",
 ]
 
 [[package]]

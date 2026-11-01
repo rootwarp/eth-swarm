@@ -53,7 +53,8 @@
 //! `SafeNoSync`/`UtterlyNoSync` on one env is `MDBX_INCOMPATIBLE`), with the same `max_tables`
 //! for every opener, and a schema version this build does not read refuses the writer and
 //! readers ([`Error::Schema`]). The first writer open of an env written before store-schema
-//! adds its tables and version row in place.
+//! adds its tables and version row in place. Every write transaction commits through
+//! `store_schema::txn::commit` with the env's head stamp carried unchanged.
 
 mod env;
 mod error;

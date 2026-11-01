@@ -1,7 +1,8 @@
 //! On-disk layout of the column store. Readers in other processes (cl-store) decode the same
 //! bytes, so changing anything here is a schema change. The env, its table names and the
 //! `slot ‖ root` key shape are [`store_schema`]'s; the env also holds store-schema's other
-//! tables (`blocks`, `states`) and `meta` rows (`schema_version`, the reserved `stamp`).
+//! tables (`blocks`, `block_index`, `states`, ...) and `meta` rows (`schema_version`, the
+//! `stamp` every write transaction carries).
 //!
 //! | table              | key                                                   | value                       |
 //! |--------------------|-------------------------------------------------------|-----------------------------|
@@ -196,13 +197,19 @@ mod tests {
     const ROOT_A: BlockRoot = [0xaa; 32];
     const ROOT_B: BlockRoot = [0xbb; 32];
 
+    /// C3: `slot BE ‖ block_root ‖ column_index BE`, so byte order is `(slot, root, index)`
+    /// order.
     #[test]
-    fn column_key_is_slot_root_index_big_endian() {
-        let key = column_key(0x0102, &ROOT_A, 7);
+    fn column_key_is_big_endian() {
+        let key = column_key(0x0102_0304_0506_0708, &ROOT_A, 0x0a0b);
         assert_eq!(key.len(), COLUMN_KEY_LEN);
-        assert_eq!(&key[..8], &0x0102u64.to_be_bytes());
+        assert_eq!(COLUMN_KEY_LEN, 48);
+        assert_eq!(&key[..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(&key[8..40], &ROOT_A);
-        assert_eq!(&key[40..], &7u64.to_be_bytes());
+        assert_eq!(&key[40..], &[0, 0, 0, 0, 0, 0, 0x0a, 0x0b]);
+        assert!(column_key(255, &ROOT_B, 0) < column_key(256, &ROOT_A, 0));
+        assert!(column_key(1, &ROOT_A, 255) < column_key(1, &ROOT_A, 256));
+        assert!(column_key(1, &ROOT_A, u64::MAX) < column_key(1, &ROOT_B, 0));
     }
 
     #[test]

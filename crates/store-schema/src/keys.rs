@@ -31,8 +31,8 @@ pub fn decode_slot_root_key(key: &[u8]) -> Option<(u64, Root)> {
 /// `meta` row of the schema version, `u64 BE` ([`crate::version`]).
 pub const SCHEMA_VERSION_KEY: &[u8] = b"schema_version";
 
-/// `meta` row reserved for #130's head/finalized stamp, written in every commit. Any length;
-/// nothing in this version reads it.
+/// `meta` row of the head/finalized [`crate::stamp::Stamp`], written by every commit
+/// ([`crate::txn::commit`]): exactly [`crate::stamp::STAMP_LEN`] bytes, checked on every read.
 pub const STAMP_KEY: &[u8] = b"stamp";
 
 #[cfg(test)]

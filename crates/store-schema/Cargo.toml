@@ -10,6 +10,8 @@ description = "The MDBX env cl-chain writes: options, tables, keys and the schem
 # Normal dependencies are libmdbx and thiserror only (consensus-types is also allowed):
 # scripts/check-store-schema-deps.sh fails on anything else.
 [dependencies]
+# Decodes a block by its slot's fork and computes its root (`blocks::put`).
+consensus-types = { path = "../consensus-types" }
 # MPL-2.0, unmodified. Builds the native mdbx-sys 12.13.2. Exact pin: bumps need a dependency review.
 libmdbx = "=0.5.6"
 thiserror = "2"
@@ -19,3 +21,9 @@ thiserror = "2"
 mdbx-sys = "=12.13.2"
 proptest = "1"
 tempfile = "3"
+# Test blocks (tests/common), built and encoded in code: no spec vectors.
+alloy-primitives.workspace = true
+ethereum_ssz.workspace = true
+network-config = { path = "../network-config" }
+ssz_types.workspace = true
+tree_hash.workspace = true
