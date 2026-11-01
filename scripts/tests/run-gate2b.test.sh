@@ -127,7 +127,7 @@ done
 [[ -z $others ]] && ok "no other gate's target is run" || bad "ran:$others"
 key=$(gate_run -- "$fx/fuzz/check-gate2b.sh" --print-key)
 missing=""
-for path in crates/cl-chain crates/cl-chain-columns crates/ethswarm-proto \
+for path in crates/cl-chain crates/cl-chain-columns crates/store-schema crates/ethswarm-proto \
   proto/ethswarm crates/ipc crates/network-config crates/p2p-wire crates/cl-p2p \
   fuzz/src fuzz/corpus fuzz/run-gate2b.sh fuzz/m2a-common.sh; do
   grep -q "\"$path\"" <<<"$key" || missing="$missing $path"
