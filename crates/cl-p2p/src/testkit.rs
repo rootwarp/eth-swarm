@@ -594,7 +594,32 @@ impl StatusPeer {
     pub fn connections(&self) -> u32 {
         self.connections.load(Ordering::SeqCst)
     }
+
+    /// [`Self::connections`] once it reaches `want`, or the last count read after
+    /// [`CONNECTION_WAIT`], for the caller to assert on.
+    ///
+    /// The peer counts a connection on its own task, when its swarm reports it established. The
+    /// dialler can see the connection, finish and return before that, so a single read right
+    /// after the dial can still miss it. The count only grows: one past `want` returns at once.
+    /// A zero is not proven by waiting, so a test that expects none reads
+    /// [`Self::connections`] once.
+    pub async fn wait_connections(&self, want: u32) -> u32 {
+        let deadline = std::time::Instant::now() + CONNECTION_WAIT;
+        loop {
+            let n = self.connections();
+            if n >= want || std::time::Instant::now() >= deadline {
+                return n;
+            }
+            tokio::time::sleep(CONNECTION_POLL).await;
+        }
+    }
 }
+
+/// How long [`StatusPeer::wait_connections`] waits for the peer to count a connection.
+const CONNECTION_WAIT: Duration = Duration::from_secs(5);
+
+/// How often [`StatusPeer::wait_connections`] reads the count.
+const CONNECTION_POLL: Duration = Duration::from_millis(10);
 
 /// The TCP port of [`refused_tcp_addr`]: tcpmux, which nothing serves.
 pub const REFUSED_PORT: u16 = 1;

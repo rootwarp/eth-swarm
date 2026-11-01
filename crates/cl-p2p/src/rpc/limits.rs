@@ -23,7 +23,10 @@
 //!   cannot reset its way out of the bill: once the answer's first chunk was written whole the
 //!   tokens it does not use, past its lookup's cost, are given back
 //!   ([`BookedChunks::settle_answer`]), once and never more, and a reset before that (or a close
-//!   during the lookup) refunds nothing.
+//!   during the lookup) refunds nothing. A streamed answer books its responder's cost the same
+//!   way ([`super::responder::Responder::cost`]), past which its chunks take the pacer's
+//!   tokens; what it did not use, past one token for its read, goes back once it ended, and
+//!   a reset refunds nothing.
 //! - [`ColumnPlaces`]: the column answers held at once, from the lookup until the stream's
 //!   writer returns, at most one per peer ([`AnswerPermit`]), each written to its booked
 //!   schedule and held no longer than the answer window and the write deadline
@@ -34,7 +37,9 @@
 //!
 //! The inbound concurrent-stream cap is `request_response`'s own: each protocol's inbound
 //! behaviour serves at most [`MAX_CONCURRENT_REQUESTS`] streams per connection and resets the
-//! next one ([`super::inbound::Duplex`]), and a peer holds one connection.
+//! next one ([`super::inbound::Duplex`]), and a peer holds one connection. Streamed answers
+//! also share a global cap ([`RpcLimits::max_inbound_streams`]), and a peer's queued response
+//! bytes a budget ([`RpcLimits::max_queued_bytes_per_peer`]).
 
 use super::answer_bucket::{AnswerBucket, AnswerPrefixes};
 use super::metrics::RpcMetrics;
@@ -237,6 +242,21 @@ impl Default for ColumnDeadlines {
 /// by-root request (136 KiB) held. Past it a request gets `2: ServerError`.
 pub const DEFAULT_COLUMN_QUEUE_LEN: usize = 64;
 
+/// Inbound streams answered by a [`super::responder::Responder`] at once, over every peer
+/// \[est\]: 256, two (`MAX_CONCURRENT_REQUESTS`) for each of 128 inbound connections. One past
+/// it is answered one `2: ServerError` chunk, then closed (an error answer, not a reset and
+/// not an empty one; it holds no slot, see [`super::inbound`]), and counted in
+/// `rpc_inbound_streams_refused_total`. The control protocols and the column answers have
+/// their own bounds (their quotas;
+/// [`ColumnPlaces`] and the column queue).
+pub const DEFAULT_MAX_INBOUND_STREAMS: usize = 256;
+
+/// Encoded response bytes one peer's streamed answers hold queued at once \[est\]: 4 MiB, a
+/// few dozen typical blocks. A slow reader holds its responders back past it
+/// ([`super::responder`]), so at most this much per peer waits for the wire, and one chunk
+/// larger than it is queued alone.
+pub const DEFAULT_MAX_QUEUED_BYTES_PER_PEER: usize = 4 << 20;
+
 /// How long an admitted column request waits for a place once its tokens are due \[est\]: 2 s,
 /// so that with a 2 s lookup its first byte goes out before the requester's 5 s deadline. Past
 /// it the request gets `2: ServerError`, counted.
@@ -269,6 +289,11 @@ pub struct RpcLimits {
     /// How far a column chunk may fall behind its answer's schedule before its stream is reset
     /// and its place given back ([`COLUMN_WRITE_DEADLINE`]).
     pub column_write_deadline: Duration,
+    /// Streamed answers at once, over every peer ([`DEFAULT_MAX_INBOUND_STREAMS`]).
+    pub max_inbound_streams: usize,
+    /// Encoded bytes one peer's streamed answers hold queued
+    /// ([`DEFAULT_MAX_QUEUED_BYTES_PER_PEER`]).
+    pub max_queued_bytes_per_peer: usize,
 }
 
 impl Default for RpcLimits {
@@ -284,6 +309,8 @@ impl Default for RpcLimits {
             max_column_answers_per_ip: DEFAULT_MAX_COLUMN_ANSWERS_PER_IP,
             column_answer_prefixes: AnswerPrefixes::default(),
             column_write_deadline: COLUMN_WRITE_DEADLINE,
+            max_inbound_streams: DEFAULT_MAX_INBOUND_STREAMS,
+            max_queued_bytes_per_peer: DEFAULT_MAX_QUEUED_BYTES_PER_PEER,
         }
     }
 }
@@ -965,8 +992,8 @@ impl Drop for Reservation {
     }
 }
 
-/// One column answer's tokens, booked when its request was admitted (see the module docs).
-/// Dropping it unsettled refunds nothing.
+/// One answer's tokens, booked when its request was admitted: a column answer's, or a streamed
+/// answer's (see the module docs). Dropping it unsettled refunds nothing.
 pub struct BookedChunks {
     limiter: SharedLimiter,
     peer: PeerId,

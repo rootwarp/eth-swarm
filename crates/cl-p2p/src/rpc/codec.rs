@@ -60,10 +60,30 @@
 //! that goes away before a chunk was written whole refunds what is still ahead of that chunk's
 //! token. A column answer goes out at the tokens booked for it instead ([`BookedChunks`]): cut
 //! again when writing starts, and settled once, when its first chunk was written whole.
+//!
+//! A streamed answer (`Answer::streamed`) is written as its responder produces it
+//! ([`super::responder`]): each chunk comes encoded and checked from the responder's queue and
+//! goes out whole at its token (those booked for the answer, then the pacer's), and gives its
+//! bytes of the peer's budget back once written. Its deadlines, each less
+//! [`super::inbound::STATUS_ANSWER_SLACK`], run from when its responder started (the peer's
+//! first token) for `ttfb` and from when the answer was made for `total`: no chunk produced by
+//! `ttfb` is `2: ServerError`, and past `total` the answer ends at its last whole chunk,
+//! checked before each chunk (one already queued is not sent). A chunk whose token comes at
+//! or past `total` is waited for until `total`, the stream kept open, and is not sent: rate
+//! limiting never closes the stream early (`phase0/p2p-interface.md` L1269–1271).
+//! The first chunk waits for its token whatever the deadline: rate limiting never answers an
+//! error (`phase0/p2p-interface.md` L1269–1274), and `request_response`'s own exchange
+//! timeout bounds that wait. When the responder returns, the writer returns and
+//! `request_response` closes the write side; an empty answer is valid on a list protocol and
+//! `2: ServerError` on a single-response one, and a responder that failed (panicked, or had a
+//! chunk refused) gets `2: ServerError` if nothing went out, else a clean end. The unused
+//! booked tokens go back when the writer returns `Ok`; a failed write refunds nothing.
 
-use super::columns::{block_lengths, error_answer};
+use super::columns::{block_lengths, error_answer, fixed_message};
+use super::inbound::STATUS_ANSWER_SLACK;
 use super::limits::{AnswerPermit, BookedChunks, ChunkPacer, Reservation};
 use super::metrics::RpcMetrics;
+use super::responder::{Queued, StreamedAnswer};
 use consensus_types::EthSpec;
 use consensus_types::{caps, forked};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -679,6 +699,9 @@ pub struct Answer<E: EthSpec> {
     pub booked: Option<Box<BookedChunks>>,
     /// The column answer's place, given back when the writer returns or is dropped.
     pub permit: Option<Box<AnswerPermit>>,
+    /// A streamed answer: its chunks come from its responder's task instead of `chunks`
+    /// (`Answer::streamed`).
+    pub stream: Option<Box<StreamedAnswer>>,
 }
 
 impl<E: EthSpec> From<Vec<ReceivedChunk<E>>> for Answer<E> {
@@ -690,6 +713,27 @@ impl<E: EthSpec> From<Vec<ReceivedChunk<E>>> for Answer<E> {
             token: None,
             booked: None,
             permit: None,
+            stream: None,
+        }
+    }
+}
+
+impl<E: EthSpec> Answer<E> {
+    /// The answer `stream`'s responder produces, its chunks going out at the tokens `booked`
+    /// for it, then at `pacer`'s.
+    #[must_use]
+    pub(crate) fn streamed(
+        stream: StreamedAnswer,
+        pacer: Option<ChunkPacer>,
+        booked: Option<BookedChunks>,
+    ) -> Self {
+        Self {
+            chunks: Vec::new(),
+            pacer,
+            token: None,
+            booked: booked.map(Box::new),
+            permit: None,
+            stream: Some(Box::new(stream)),
         }
     }
 }
@@ -713,6 +757,101 @@ impl<E: EthSpec> InboundCodec<E> {
     /// Requests read by `inner`.
     pub fn new(inner: RpcCodec<E>) -> Self {
         Self { inner }
+    }
+
+    /// Writes `stream`'s chunks as its responder produces them (see the module docs), each at
+    /// its token: one of `booked`, then of `pacer`.
+    async fn write_streamed<T: AsyncWrite + Unpin>(
+        &self,
+        protocol: Protocol,
+        io: &mut T,
+        mut stream: Box<StreamedAnswer>,
+        pacer: Option<ChunkPacer>,
+        mut booked: Option<Box<BookedChunks>>,
+    ) -> io::Result<()> {
+        let deadlines = self.inner.deadlines;
+        // 9.5 s: ahead of `request_response`'s own 10 s timeout (`REQUEST_TIMEOUT`), which runs
+        // from the stream's negotiation, before the request was read (`super::inbound` module
+        // docs, "BeaconBlocksByRange"), so this clean end is what the requester gets.
+        let end_by = stream.started() + deadlines.total.saturating_sub(STATUS_ANSWER_SLACK);
+        // From the peer's first token: waiting for it is rate limiting, never an error
+        // (`phase0` L1269–1274); one due past `end_by` is bounded by `request_response`'s own.
+        let ready = stream.ready();
+        let first_by = ready + deadlines.ttfb.saturating_sub(STATUS_ANSWER_SLACK);
+        let first_by = if ready < end_by {
+            first_by.min(end_by)
+        } else {
+            first_by
+        };
+        let mut sent = 0u64;
+        let mut produced = false;
+        let failed = loop {
+            let by = if produced { end_by } else { first_by };
+            // `timeout_at` polls the queue before its deadline, so a chunk already queued would
+            // still go out past it: past `end_by`, the answer ends at this chunk boundary.
+            let next = if sent > 0 && tokio::time::Instant::now() >= end_by {
+                None
+            } else {
+                tokio::time::timeout_at(by, stream.next()).await.ok()
+            };
+            let Some(next) = next else {
+                let deadline = if produced {
+                    Deadline::Total
+                } else {
+                    Deadline::Ttfb
+                };
+                if let Some(metrics) = &self.inner.metrics {
+                    metrics.timed_out(deadline);
+                }
+                // Nothing produced in time is our failure; a short answer is a valid one.
+                break sent == 0;
+            };
+            produced = true;
+            let (bytes, held, last) = match next {
+                Some(Queued::Chunk { bytes, held, last }) => (bytes, held, last),
+                Some(Queued::Done) => break sent == 0 && protocol.single_response(),
+                Some(Queued::Failed) | None => break sent == 0,
+            };
+            let (due, reservation) = match booked.as_deref() {
+                Some(booked) if sent < booked.tokens() => (Some(booked.due(sent)), None),
+                _ => {
+                    let reservation = pacer.as_ref().map(ChunkPacer::reserve);
+                    (reservation.as_ref().map(Reservation::due), reservation)
+                }
+            };
+            if let Some(due) = due {
+                if due >= end_by && sent > 0 {
+                    // Its token comes past the end: the stream stays open, waiting on the
+                    // limiter until `end_by` (no close when rate limiting, `phase0`
+                    // L1269–1271), then ends at the last whole chunk (above), the token given
+                    // back.
+                    tokio::time::sleep_until(end_by).await;
+                    continue;
+                }
+                tokio::time::sleep_until(due).await;
+            }
+            io.write_all(&bytes).await?;
+            if let Some(reservation) = reservation {
+                reservation.sent();
+            }
+            sent += 1;
+            drop(held);
+            io.flush().await?;
+            if last {
+                break false;
+            }
+        };
+        if failed {
+            let message = fixed_message(ResultCode::ServerError).as_bytes();
+            let bytes = encode_error_chunk(ResultCode::ServerError, message)
+                .map_err(|e| invalid_response(e.to_string()))?;
+            io.write_all(&bytes).await?;
+            io.flush().await?;
+        }
+        if let Some(booked) = booked.as_mut() {
+            booked.settle_answer(sent);
+        }
+        Ok(())
     }
 }
 
@@ -765,7 +904,8 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
     /// request-response handler waits on the answer, not the stream) gets nothing back. A
     /// booked chunk not written by its place in the answer's schedule
     /// ([`super::limits::WriteSchedule`]) ends the write with `TimedOut`. The answer's place
-    /// goes back when this returns or is dropped.
+    /// goes back when this returns or is dropped. A streamed answer (`Answer::streamed`) is
+    /// written as its responder produces it instead (see the module docs).
     async fn write_response<T>(
         &mut self,
         protocol: &Protocol,
@@ -775,6 +915,11 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
     where
         T: AsyncWrite + Unpin + Send,
     {
+        if let Some(stream) = answer.stream {
+            return self
+                .write_streamed(*protocol, io, stream, answer.pacer, answer.booked)
+                .await;
+        }
         check_response(*protocol, &answer.chunks)?;
         let Answer {
             mut chunks,
@@ -782,6 +927,7 @@ impl<E: EthSpec> request_response::Codec for InboundCodec<E> {
             mut token,
             mut booked,
             mut permit,
+            stream: _,
         } = answer;
         let now = tokio::time::Instant::now();
         let schedule = booked.as_deref().map(|booked| {
@@ -2011,6 +2157,7 @@ mod tests {
             token: None,
             booked: None,
             permit: None,
+            stream: None,
         };
         let mut io = Timed::default();
         inbound_codec()
@@ -2056,6 +2203,7 @@ mod tests {
             token: None,
             booked: Some(Box::new(booked)),
             permit: places.try_take(peer, None).map(Box::new),
+            stream: None,
         };
         assert_eq!(places.held(), 1);
         let mut io = Timed::default();
@@ -2079,6 +2227,7 @@ mod tests {
             token: None,
             booked: Some(Box::new(booked)),
             permit: places.try_take(peer, None).map(Box::new),
+            stream: None,
         };
         let mut io = Timed::default();
         let mut codec = inbound_codec();
@@ -2151,6 +2300,7 @@ mod tests {
                 },
             ))),
             permit: places.try_take(peer, None).map(Box::new),
+            stream: None,
         };
         let start = Instant::now();
         let mut registry = prometheus_client::registry::Registry::default();
@@ -2266,6 +2416,7 @@ mod tests {
             permit: places
                 .try_take(peer, Some(AnswerBucket::V4(Ipv4Addr::new(10, 0, ip, 0))))
                 .map(Box::new),
+            stream: None,
         };
         let start = Instant::now();
         let slow: Vec<_> = (0..8)
@@ -2342,6 +2493,7 @@ mod tests {
                 &limiter, peer, BLOCKS, 40, None, deadlines,
             ))),
             permit: places.try_take(peer, None).map(Box::new),
+            stream: None,
         };
         // The lookup took 3 s; then a requester reading a chunk every 100 ms needs 4 s more.
         tokio::time::advance(Duration::from_secs(3)).await;
@@ -2431,6 +2583,7 @@ mod tests {
                 ColumnDeadlines::default(),
             ))),
             permit: places.try_take(peer, None).map(Box::new),
+            stream: None,
         }
     }
 
@@ -2536,6 +2689,7 @@ mod tests {
                 token: None,
                 booked: Some(Box::new(booked)),
                 permit: Some(Box::new(permit)),
+                stream: None,
             };
             let mut io = SlowReader::new(Duration::from_millis(10), pace, pace);
             inbound_codec()
@@ -2729,6 +2883,7 @@ mod tests {
             token: None,
             booked: Some(Box::new(booked)),
             permit: Some(Box::new(permit)),
+            stream: None,
         };
         let mut io = SteadyReader::new(at_the_answer_pace(), Duration::from_millis(10));
         inbound_codec()
@@ -2810,6 +2965,7 @@ mod tests {
             token: None,
             booked: Some(Box::new(booked)),
             permit: Some(Box::new(permit)),
+            stream: None,
         };
         inbound_codec()
             .write_response(&COLUMNS, &mut io, answer)
@@ -2970,6 +3126,7 @@ mod tests {
             token: None,
             booked: Some(Box::new(booked)),
             permit: Some(Box::new(permit)),
+            stream: None,
         };
         inbound_codec()
             .write_response(&ROOTS, &mut io, answer)
@@ -3261,6 +3418,7 @@ mod tests {
                 ColumnDeadlines::default(),
             ))),
             permit: places.try_take(peer, None).map(Box::new),
+            stream: None,
         };
         let start = Instant::now();
         // Written: the two chunks stay charged, the eight past them go back.
@@ -3371,6 +3529,7 @@ mod tests {
             token: None,
             booked: Some(Box::new(booked)),
             permit: Some(Box::new(permit)),
+            stream: None,
         };
         inbound_codec()
             .write_response(&ROOTS, &mut io, answer)
@@ -3455,6 +3614,7 @@ mod tests {
             token: None,
             booked: Some(Box::new(booked)),
             permit: None,
+            stream: None,
         };
         inbound_codec()
             .write_response(&protocol, &mut Timed::default(), answer)
@@ -3570,6 +3730,7 @@ mod tests {
             token: None,
             booked: None,
             permit: None,
+            stream: None,
         };
         let mut io = Timed::default();
         let mut codec = inbound_codec();
@@ -3624,6 +3785,7 @@ mod tests {
             token: None,
             booked: None,
             permit: None,
+            stream: None,
         };
         let mut io = FlushFails::default();
         let err = inbound_codec()
@@ -3656,5 +3818,486 @@ mod tests {
             .read_response(&Protocol::PingV1, &mut Cursor::new(Vec::new()))
             .await
             .is_err());
+    }
+
+    // --- streamed answers (#234) ---
+
+    use crate::rpc::responder::testing::{self, Lives};
+    use crate::rpc::responder::{ChunkSink, PeerBytes, Responder};
+    use p2p_wire::rpc::protocols::MAX_REQUEST_BLOCKS_DENEB;
+
+    /// Takes every write whole, at once, recording when and what.
+    #[derive(Default)]
+    struct Wire {
+        writes: Vec<(Instant, Vec<u8>)>,
+    }
+
+    impl Wire {
+        fn bytes(&self) -> Vec<u8> {
+            self.writes.iter().flat_map(|(_, w)| w.clone()).collect()
+        }
+
+        fn at_ms(&self, start: Instant) -> Vec<u128> {
+            self.writes
+                .iter()
+                .map(|(t, _)| (*t - start).as_millis())
+                .collect()
+        }
+    }
+
+    impl AsyncWrite for Wire {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes.push((Instant::now(), buf.to_vec()));
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The unpaced streamed answer of `responder` to `request` (a 1 MiB peer budget), with the
+    /// global stream slots and the byte budget it holds.
+    fn streamed(
+        responder: &Arc<dyn Responder<E>>,
+        request: Request,
+    ) -> (Answer<E>, Arc<tokio::sync::Semaphore>, PeerBytes) {
+        let (stream, slots, bytes) = testing::start(responder, request, 1 << 20);
+        (Answer::streamed(stream, None, None), slots, bytes)
+    }
+
+    /// What a requester reads from `wire`, to its end.
+    async fn read_back(protocol: Protocol, wire: &[u8]) -> Vec<ResponseChunk<E>> {
+        let contexts = testkit::context_table();
+        read_response_chunks::<E, _>(
+            &mut &wire[..],
+            protocol,
+            MAX_REQUEST_BLOCKS_DENEB,
+            &contexts,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn is_server_error(read: &[ResponseChunk<E>]) -> bool {
+        matches!(
+            read,
+            [ResponseChunk::Error {
+                code: ResultCode::ServerError,
+                ..
+            }]
+        )
+    }
+
+    /// Sends the blocks of slots `1..=n`.
+    fn sends(n: u64) -> Arc<dyn Responder<E>> {
+        testing::script(move |_, mut sink| async move {
+            for slot in 1..=n {
+                sink.send(testing::fulu_block(slot)).await.unwrap();
+            }
+        })
+    }
+
+    /// #9: a responder that sends nothing: an empty answer on a list protocol, at once (zero
+    /// chunks are a valid response, `phase0/p2p-interface.md` L1203).
+    #[tokio::test(start_paused = true)]
+    async fn streamed_zero_chunks_closes_cleanly() {
+        let (answer, slots, _) = streamed(&sends(0), range(4));
+        let mut wire = Wire::default();
+        let start = Instant::now();
+        inbound_codec()
+            .write_response(&BLOCKS, &mut wire, answer)
+            .await
+            .unwrap();
+        assert!(wire.writes.is_empty());
+        assert_eq!(Instant::now(), start, "ended at once");
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    /// #9: on a single-response protocol no chunk is `2: ServerError`.
+    #[tokio::test(start_paused = true)]
+    async fn streamed_zero_chunks_single_response_is_server_error() {
+        let (answer, ..) = streamed(&sends(0), Request::Ping(Ping(1)));
+        let mut wire = Wire::default();
+        inbound_codec()
+            .write_response(&Protocol::PingV1, &mut wire, answer)
+            .await
+            .unwrap();
+        assert!(is_server_error(
+            &read_back(Protocol::PingV1, &wire.bytes()).await
+        ));
+    }
+
+    /// #10: the writer returns as soon as the responder's last chunk is written, not at a
+    /// deadline, and `request_response` then closes the write side (`phase0` L1262–1263): the
+    /// requester reads every chunk to the end. The task, its slot and its bytes are gone.
+    #[tokio::test(start_paused = true)]
+    async fn write_side_closed_after_last_chunk() {
+        let lives = Lives::default();
+        let three = {
+            let lives = lives.clone();
+            testing::script(move |_, mut sink| {
+                let live = lives.enter();
+                async move {
+                    let _live = live;
+                    for slot in 1..=3 {
+                        sink.send(testing::fulu_block(slot)).await.unwrap();
+                    }
+                }
+            })
+        };
+        let (answer, slots, bytes) = streamed(&three, range(3));
+        let mut wire = Wire::default();
+        let start = Instant::now();
+        inbound_codec()
+            .write_response(&BLOCKS, &mut wire, answer)
+            .await
+            .unwrap();
+        assert_eq!(Instant::now(), start, "ended at the last chunk");
+        wire.close().await.unwrap();
+        assert_eq!(read_back(BLOCKS, &wire.bytes()).await.len(), 3);
+        lives.gone().await;
+        assert_eq!(slots.available_permits(), 1);
+        assert_eq!(bytes.available(), 1 << 20);
+    }
+
+    /// #13: no chunk by the first-byte deadline less the slack (4.5 s): `2: ServerError` at
+    /// that instant, and the responder's task is aborted.
+    #[tokio::test(start_paused = true)]
+    async fn ttfb_fires_paused() {
+        let lives = Lives::default();
+        let slow = {
+            let lives = lives.clone();
+            testing::script(move |_, mut sink| {
+                let live = lives.enter();
+                async move {
+                    let _live = live;
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    let _ = sink.send(testing::fulu_block(1)).await;
+                }
+            })
+        };
+        let (answer, slots, _) = streamed(&slow, range(1));
+        let mut wire = Wire::default();
+        let start = Instant::now();
+        inbound_codec()
+            .write_response(&BLOCKS, &mut wire, answer)
+            .await
+            .unwrap();
+        assert_eq!(Instant::now() - start, Duration::from_millis(4_500));
+        assert!(is_server_error(&read_back(BLOCKS, &wire.bytes()).await));
+        lives.gone().await;
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    /// #13: past the total less the slack (9.5 s) after a chunk went out: the answer ends
+    /// there, at a whole chunk, with no error chunk.
+    #[tokio::test(start_paused = true)]
+    async fn total_fires_paused() {
+        let lives = Lives::default();
+        let stalls = {
+            let lives = lives.clone();
+            testing::script(move |_, mut sink| {
+                let live = lives.enter();
+                async move {
+                    let _live = live;
+                    sink.send(testing::fulu_block(1)).await.unwrap();
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    let _ = sink.send(testing::fulu_block(2)).await;
+                }
+            })
+        };
+        let (answer, ..) = streamed(&stalls, range(2));
+        let mut wire = Wire::default();
+        let start = Instant::now();
+        inbound_codec()
+            .write_response(&BLOCKS, &mut wire, answer)
+            .await
+            .unwrap();
+        assert_eq!(Instant::now() - start, Duration::from_millis(9_500));
+        let read = read_back(BLOCKS, &wire.bytes()).await;
+        assert!(matches!(read[..], [ResponseChunk::Success(_)]), "{read:?}");
+        lives.gone().await;
+    }
+
+    /// Takes each write whole `per_write` after it was offered (a reader slower than the
+    /// producer), recording when, as [`Wire`] does.
+    struct SlowWire {
+        per_write: Duration,
+        wait: Option<Pin<Box<Sleep>>>,
+        wire: Wire,
+    }
+
+    impl AsyncWrite for SlowWire {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let per_write = self.per_write;
+            let wait = self
+                .wait
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(per_write)));
+            std::task::ready!(wait.as_mut().poll(cx));
+            self.wait = None;
+            Pin::new(&mut self.wire).poll_write(cx, buf)
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Cole B2: with the next chunk always queued, a reader slower than the producer still
+    /// gets the clean end at the total deadline less the slack (9.5 s), at the first chunk
+    /// boundary past it (`timeout_at` polls the queue before its deadline, so a queued chunk
+    /// would win): whole chunks only, no error chunk, ahead of `request_response`'s 10 s.
+    #[tokio::test(start_paused = true)]
+    async fn total_ends_a_slow_read_at_a_whole_chunk() {
+        let ahead = testing::script(|_, mut sink: ChunkSink<E>| async move {
+            for slot in 1..=128 {
+                if sink.send(testing::block(slot)).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let (answer, ..) = streamed(&ahead, range(128));
+        let mut slow = SlowWire {
+            per_write: Duration::from_millis(750),
+            wait: None,
+            wire: Wire::default(),
+        };
+        let start = Instant::now();
+        inbound_codec()
+            .write_response(&BLOCKS, &mut slow, answer)
+            .await
+            .unwrap();
+        let ended = Instant::now() - start;
+        assert!(
+            ended >= Duration::from_millis(9_500) && ended < Duration::from_secs(10),
+            "ended at {ended:?}"
+        );
+        // 750 ms a chunk: the 13th is written at 9.75 s, the first boundary past 9.5 s.
+        let at = slow.wire.at_ms(start);
+        assert_eq!(at.len(), 13, "{at:?}");
+        assert_eq!(at.last(), Some(&9_750));
+        let read = read_back(BLOCKS, &slow.wire.bytes()).await;
+        assert_eq!(read.len(), 13);
+        assert!(
+            read.iter().all(|c| matches!(c, ResponseChunk::Success(_))),
+            "no error chunk"
+        );
+    }
+
+    /// A Fulu block of exactly `MAX_PAYLOAD_SIZE` SSZ bytes, nearly all of it one transaction
+    /// of pseudo-random bytes, which snappy cannot shrink.
+    fn incompressible_block() -> Response<E> {
+        use consensus_types::caps::MAX_PAYLOAD_SIZE;
+        let mut block = testkit::fulu_block::<E>(1);
+        let fork = |b| Response::Block(Box::new(forked::SignedBeaconBlock::Fulu(b)));
+        // The transaction and its 4-byte offset.
+        let len = MAX_PAYLOAD_SIZE - fork(block.clone()).ssz_bytes_len() - 4;
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let tx: Vec<u8> = (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x.to_le_bytes()[0]
+            })
+            .collect();
+        let txs = &mut block.message.body.execution_payload.transactions;
+        txs.push(tx.try_into().unwrap()).unwrap();
+        let big = fork(block);
+        assert_eq!(big.ssz_bytes_len(), MAX_PAYLOAD_SIZE);
+        big
+    }
+
+    /// Ezra ruling 3 at real scale (Cole NIT 5): on an empty queue one chunk larger than the
+    /// peer's whole default budget (a `MAX_PAYLOAD_SIZE` block, over 10 MiB encoded, against
+    /// 4 MiB) is taken at once, holding the whole budget, never stalling: `send` completes on
+    /// its first poll, the writer writes it whole with the clock unmoved, and the whole budget
+    /// is back after.
+    #[tokio::test(start_paused = true)]
+    async fn an_oversized_chunk_on_an_empty_queue_goes_at_once() {
+        use crate::rpc::limits::DEFAULT_MAX_QUEUED_BYTES_PER_PEER as BUDGET;
+        use futures::FutureExt as _;
+        let big = incompressible_block();
+        let at_once = Arc::new(std::sync::Mutex::new(None));
+        let one = {
+            let (big, at_once) = (big.clone(), Arc::clone(&at_once));
+            testing::script(move |_, mut sink: ChunkSink<E>| {
+                let (big, at_once) = (big.clone(), Arc::clone(&at_once));
+                async move {
+                    let sent = sink.send(big).now_or_never();
+                    *at_once.lock().unwrap() = Some(sent);
+                }
+            })
+        };
+        let (stream, slots, bytes) = testing::start(&one, range(1), BUDGET);
+        let answer = Answer::streamed(stream, None, None);
+        let mut wire = Wire::default();
+        let start = Instant::now();
+        inbound_codec()
+            .write_response(&BLOCKS, &mut wire, answer)
+            .await
+            .unwrap();
+        assert_eq!(
+            *at_once.lock().unwrap(),
+            Some(Some(Ok(()))),
+            "send completed on its first poll"
+        );
+        assert_eq!(Instant::now(), start, "no stall");
+        assert!(wire.bytes().len() > BUDGET, "{} bytes", wire.bytes().len());
+        let read = read_back(BLOCKS, &wire.bytes()).await;
+        assert_eq!(read, [ResponseChunk::Success(big)]);
+        assert_eq!(bytes.available(), BUDGET, "the whole budget back");
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    /// #16 (Cole): a chunk over the quota is withheld until its token (the tokens booked at
+    /// admission, then the pacer's) and then sent whole: never split, never an error chunk,
+    /// never an early end (`phase0` L1269–1274).
+    #[tokio::test(start_paused = true)]
+    async fn withheld_chunks_are_whole() {
+        use crate::rpc::limits::BookedChunks;
+        let limiter = shared_limiter(RateLimits {
+            blocks_by_range: Quota::new(1, Duration::from_secs(1)),
+            ..RateLimits::default()
+        });
+        let peer = libp2p::PeerId::random();
+        let start = Instant::now();
+        let booked = BookedChunks::book(&limiter, peer, BLOCKS, 3, None, LONG);
+        let pacer = ChunkPacer::new(Arc::clone(&limiter), peer, BLOCKS, None);
+        let (stream, ..) = testing::start(&sends(4), range(4), 1 << 20);
+        let answer = Answer::streamed(stream, Some(pacer), Some(booked));
+        let mut wire = Wire::default();
+        inbound_codec()
+            .write_response(&BLOCKS, &mut wire, answer)
+            .await
+            .unwrap();
+        assert_eq!(wire.at_ms(start), [0, 1000, 2000, 3000]);
+        for (_, write) in &wire.writes {
+            let one = read_back(BLOCKS, write).await;
+            assert!(
+                matches!(one[..], [ResponseChunk::Success(_)]),
+                "a whole chunk"
+            );
+        }
+    }
+
+    /// F (`phase0` L1269–1271: no error and no closed stream when rate limiting): a chunk
+    /// whose token comes past the total deadline less the slack (9.5 s) keeps the stream open,
+    /// waiting on the limiter until then. Six blocks at one token per 2 s: the five whose
+    /// tokens fall before 9.5 s go out whole at them, and the answer ends cleanly at exactly
+    /// 9.5 s, not at 8 s when the sixth token (10 s) was seen, with no error chunk.
+    #[tokio::test(start_paused = true)]
+    async fn a_token_past_the_end_keeps_the_stream_open_until_it() {
+        use crate::rpc::limits::BookedChunks;
+        let limiter = shared_limiter(RateLimits {
+            blocks_by_range: Quota::new(1, Duration::from_secs(2)),
+            ..RateLimits::default()
+        });
+        let peer = libp2p::PeerId::random();
+        let start = Instant::now();
+        let booked = BookedChunks::book(&limiter, peer, BLOCKS, 6, None, LONG);
+        let pacer = ChunkPacer::new(Arc::clone(&limiter), peer, BLOCKS, None);
+        let (stream, ..) = testing::start(&sends(6), range(6), 1 << 20);
+        let answer = Answer::streamed(stream, Some(pacer), Some(booked));
+        let write = tokio::spawn(async move {
+            let mut wire = Wire::default();
+            inbound_codec()
+                .write_response(&BLOCKS, &mut wire, answer)
+                .await
+                .map(|()| (Instant::now(), wire))
+        });
+        tokio::time::sleep_until(start + Duration::from_millis(8_100)).await;
+        assert!(
+            !write.is_finished(),
+            "the stream closed at 8 s, waiting on the limiter"
+        );
+        let (ended, wire) = write.await.unwrap().unwrap();
+        assert_eq!(
+            ended - start,
+            Duration::from_millis(9_500),
+            "ended at 9.5 s"
+        );
+        assert_eq!(wire.at_ms(start), [0, 2_000, 4_000, 6_000, 8_000]);
+        for (_, write) in &wire.writes {
+            let one = read_back(BLOCKS, write).await;
+            assert!(
+                matches!(one[..], [ResponseChunk::Success(_)]),
+                "a whole chunk"
+            );
+        }
+        let read = read_back(BLOCKS, &wire.bytes()).await;
+        assert_eq!(read.len(), 5);
+        assert!(
+            read.iter().all(|c| matches!(c, ResponseChunk::Success(_))),
+            "no error chunk"
+        );
+    }
+
+    /// #7 (Cole): an object the sink refuses ends the answer: `2: ServerError` if nothing went
+    /// out, else the chunks before it and a clean end.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_chunk_ends_the_answer() {
+        for before in [0u64, 2] {
+            let bad = testing::script(move |_, mut sink| async move {
+                for slot in 1..=before {
+                    sink.send(testing::fulu_block(slot)).await.unwrap();
+                }
+                let _ = sink.send(Response::Ping(Ping(1))).await;
+            });
+            let (answer, ..) = streamed(&bad, range(3));
+            let mut wire = Wire::default();
+            inbound_codec()
+                .write_response(&BLOCKS, &mut wire, answer)
+                .await
+                .unwrap();
+            let read = read_back(BLOCKS, &wire.bytes()).await;
+            match before {
+                0 => assert!(is_server_error(&read), "{read:?}"),
+                _ => assert!(matches!(
+                    read[..],
+                    [ResponseChunk::Success(_), ResponseChunk::Success(_)]
+                )),
+            }
+        }
+    }
+
+    /// #21: a responder that panics ends its answer: `2: ServerError` before any chunk, else a
+    /// clean end after the chunks it sent; its slot and bytes come back either way.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_responder_ends_the_answer() {
+        for before in [0u64, 1] {
+            let buggy = testing::script(move |_, mut sink| async move {
+                for slot in 1..=before {
+                    sink.send(testing::fulu_block(slot)).await.unwrap();
+                }
+                panic!("a responder bug");
+            });
+            let (answer, slots, bytes) = streamed(&buggy, range(2));
+            let mut wire = Wire::default();
+            inbound_codec()
+                .write_response(&BLOCKS, &mut wire, answer)
+                .await
+                .unwrap();
+            let read = read_back(BLOCKS, &wire.bytes()).await;
+            match before {
+                0 => assert!(is_server_error(&read), "{read:?}"),
+                _ => assert!(matches!(read[..], [ResponseChunk::Success(_)])),
+            }
+            assert_eq!(slots.available_permits(), 1);
+            assert_eq!(bytes.available(), 1 << 20);
+        }
     }
 }
