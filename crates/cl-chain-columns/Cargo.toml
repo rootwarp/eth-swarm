@@ -19,7 +19,8 @@ test-hooks = []
 # MPL-2.0, unmodified. Builds the native mdbx-sys 12.13.2. Exact pin: bumps need a dependency review.
 libmdbx = "=0.5.6"
 thiserror = "2"
-tracing = "0.1"
+# The env, its options, tables and schema version (the column tables are store-schema's).
+store-schema = { path = "../store-schema" }
 
 [dev-dependencies]
 # Same crate libmdbx links; tests read env flags and options straight from the C API.

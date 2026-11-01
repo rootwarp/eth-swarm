@@ -50,7 +50,7 @@ crate "$ws" discv5
 check pass "a dev-dependency is not linked into the binary" "$script" "$(workspace dev cl-p2p discv5)"
 
 # The store crates: m2a-session drops every block it fetches and must be unable to store one.
-for store in cl-chain cl-chain-columns cl-store libmdbx mdbx-sys; do
+for store in cl-chain cl-chain-columns cl-store store-schema libmdbx mdbx-sys; do
   ws="$tmp/direct-$store"
   cl_p2p "$ws" '[dependencies]' "$store = { path = \"../$store\" }"
   crate "$ws" "$store"

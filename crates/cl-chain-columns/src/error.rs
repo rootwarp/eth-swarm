@@ -72,6 +72,11 @@ pub enum Error {
     /// A stored row does not match the layout in [`keys`](crate::keys).
     #[error("corrupt row in table {table}")]
     Corrupt { table: &'static str },
+    /// The env's schema refused the open: a schema version this build does not read
+    /// ([`store_schema::Error::SchemaVersion`], [`store_schema::Error::MalformedSchemaVersion`]).
+    /// Nothing was written.
+    #[error("store schema: {0}")]
+    Schema(store_schema::Error),
 }
 
 impl From<libmdbx::Error> for Error {
@@ -79,6 +84,28 @@ impl From<libmdbx::Error> for Error {
         match e {
             libmdbx::Error::MapFull => Error::MapFull,
             other => Error::Mdbx(other),
+        }
+    }
+}
+
+/// The env's errors in this crate's terms; a schema refusal is [`Error::Schema`].
+impl From<store_schema::Error> for Error {
+    fn from(e: store_schema::Error) -> Self {
+        use store_schema::Error as S;
+        match e {
+            S::Mdbx(e) => e.into(),
+            S::Io(e) => Error::Io(e),
+            S::WriterHeld { path } => Error::WriterAlreadyOpen { path },
+            S::EnvBusy { path } => Error::EnvBusy { path },
+            S::InvalidMaxSize { max_size } => Error::InvalidMaxSize { max_size },
+            S::GeometryMismatch {
+                requested,
+                effective,
+            } => Error::GeometryMismatch {
+                requested,
+                effective,
+            },
+            other => Error::Schema(other),
         }
     }
 }

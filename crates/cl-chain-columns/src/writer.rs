@@ -9,6 +9,7 @@ use std::{
 };
 
 use libmdbx::{NoWriteMap, Transaction, WriteFlags, RW};
+use store_schema::env::WriterGuard;
 
 use crate::{
     env::{self, WriterOptions},
@@ -215,7 +216,7 @@ pub struct ColumnWriter {
     sched: TxnScheduler,
     rw_txns: AtomicU64,
     hooks: Hooks,
-    _guard: env::Env,
+    _guard: WriterGuard,
 }
 
 impl ColumnWriter {
@@ -234,8 +235,7 @@ impl ColumnWriter {
     /// [`ColumnWriter::open`] with explicit options. Blocks the same way.
     pub fn open_with(path: impl AsRef<Path>, options: WriterOptions) -> Result<Self> {
         let path = path.as_ref();
-        let guard = env::lock_writer(path)?;
-        let db = env::open_rw(path, options)?;
+        let (db, guard) = env::open_rw(path, options)?;
         let pending = {
             let txn = db.begin_ro_txn()?;
             pending_links(&txn)?
@@ -1123,13 +1123,51 @@ mod tests {
             mdbx_sys::mdbx_env_get_option(env, mdbx_sys::MDBX_opt_max_db, &mut max_tables)
         };
         assert_eq!(rc, 0);
-        assert_eq!(max_tables, crate::env::MAX_TABLES);
+        assert_eq!(max_tables, store_schema::tables::MAX_TABLES);
 
         let txn = writer.reader.db.begin_ro_txn().unwrap();
         for table in TABLES {
             txn.open_table(Some(table))
                 .unwrap_or_else(|e| panic!("table {table} missing on first open: {e}"));
         }
+    }
+
+    /// The column env is store-schema's env: every store-schema table and the version row are
+    /// there after the first open, and a newer schema version refuses the writer and readers.
+    #[test]
+    fn the_column_env_is_the_store_schema_env() {
+        use store_schema::{keys::SCHEMA_VERSION_KEY, version::SCHEMA_VERSION};
+        let dir = tempfile::tempdir().unwrap();
+        let writer = ColumnWriter::open(dir.path()).unwrap();
+        {
+            let txn = writer.reader.db.begin_rw_txn().unwrap();
+            for table in store_schema::tables::TABLES {
+                txn.open_table(Some(table))
+                    .unwrap_or_else(|e| panic!("table {table} missing: {e}"));
+            }
+            let meta = txn.open_table(Some(META_TABLE)).unwrap();
+            assert_eq!(
+                txn.get::<Vec<u8>>(&meta, SCHEMA_VERSION_KEY).unwrap(),
+                Some(SCHEMA_VERSION.to_be_bytes().to_vec())
+            );
+            txn.put(
+                &meta,
+                SCHEMA_VERSION_KEY,
+                (SCHEMA_VERSION + 1).to_be_bytes(),
+                WriteFlags::UPSERT,
+            )
+            .unwrap();
+            txn.commit().unwrap();
+        }
+        drop(writer);
+        let newer = |err: &Error| {
+            matches!(err, Error::Schema(store_schema::Error::SchemaVersion { found, supported })
+                if *found == SCHEMA_VERSION + 1 && *supported == SCHEMA_VERSION)
+        };
+        let err = ColumnWriter::open(dir.path()).unwrap_err();
+        assert!(newer(&err), "{err:?}");
+        let err = ColumnReader::open(dir.path()).unwrap_err();
+        assert!(newer(&err), "{err:?}");
     }
 
     const ROOT_A: BlockRoot = [0xaa; 32];

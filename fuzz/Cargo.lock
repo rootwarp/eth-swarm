@@ -927,8 +927,8 @@ name = "cl-chain-columns"
 version = "0.1.0"
 dependencies = [
  "libmdbx",
+ "store-schema",
  "thiserror 2.0.21",
- "tracing",
 ]
 
 [[package]]
@@ -5257,6 +5257,14 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "store-schema"
+version = "0.1.0"
+dependencies = [
+ "libmdbx",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "strsim"

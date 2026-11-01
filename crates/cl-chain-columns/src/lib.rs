@@ -49,9 +49,11 @@
 //! # }
 //! ```
 //!
-//! The env is always opened `SyncMode::Durable`; mixing it with `SafeNoSync`/`UtterlyNoSync` on
-//! one env is `MDBX_INCOMPATIBLE`. These tables move into the shared store schema later without
-//! an API change.
+//! The env is [`store_schema`]'s: always opened `SyncMode::Durable` (mixing it with
+//! `SafeNoSync`/`UtterlyNoSync` on one env is `MDBX_INCOMPATIBLE`), with the same `max_tables`
+//! for every opener, and a schema version this build does not read refuses the writer and
+//! readers ([`Error::Schema`]). The first writer open of an env written before store-schema
+//! adds its tables and version row in place.
 
 mod env;
 mod error;

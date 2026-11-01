@@ -153,6 +153,8 @@ jobs:
         run: bash scripts/tests/check-state-transition-deps.test.sh && bash scripts/check-state-transition-deps.sh
       - name: cl-verify-cache stays a leaf (state-transition, crypto-bls and blst are dev-only)
         run: bash scripts/tests/check-verify-cache-deps.test.sh && bash scripts/check-verify-cache-deps.sh
+      - name: store-schema depends only on consensus-types, libmdbx and thiserror
+        run: bash scripts/tests/check-store-schema-deps.test.sh && bash scripts/check-store-schema-deps.sh
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Fetch and verify spec vectors (uncached)
         run: PRESETS="general minimal" bash testing/fetch-vectors.sh

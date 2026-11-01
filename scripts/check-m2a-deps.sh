@@ -5,8 +5,8 @@
 # m2a-session dials one pinned peer and must have no discovery at all, so no discv5 (and no
 # crate that pulls it in) may be a normal dependency of cl-p2p, on any target platform. It also
 # hashes and drops every block it fetches, so it must be unable to store one: no cl-chain,
-# cl-chain-columns, cl-store, libmdbx or mdbx-sys (the workspace has no `store-schema` crate;
-# these are its storage crates and the MDBX binding they use).
+# cl-chain-columns, cl-store, store-schema, libmdbx or mdbx-sys (the workspace's storage crates
+# and the MDBX binding they use).
 # `cargo tree` has no --bin filter, but a binary links exactly its package's normal
 # dependencies, so the graph of `cargo tree -p cl-p2p -e normal --target all` is the binary's.
 # The check also fails if cl-p2p has no m2a-session binary, so it can never pass vacuously.
@@ -61,7 +61,7 @@ banned() {
 }
 banned "discv5 is a dependency of cl-p2p (m2a-session must have no discovery)" discv5
 banned "a store crate is a dependency of cl-p2p (m2a-session must store no block)" \
-  cl-chain cl-chain-columns cl-store libmdbx mdbx-sys
+  cl-chain cl-chain-columns cl-store store-schema libmdbx mdbx-sys
 if ((status != 0)); then
   exit 1
 fi
