@@ -640,6 +640,11 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ProbeService<E, V> {
     /// Opens the store (again, after a restart), starts the ingest and the reference follower.
     /// Must be called within a tokio runtime. The store's metrics go to `registry`.
     ///
+    /// Blocking: [`ColumnWriter::open`] can sleep the calling thread for about a second while
+    /// a lingering writer lock clears. Call it once at startup (as `devnet-probe` does), or
+    /// from async code through `tokio::task::spawn_blocking` (whose thread is inside the
+    /// runtime, so the tasks this starts are spawned there), never directly on a runtime worker.
+    ///
     /// # Errors
     ///
     /// [`OpenError::NodeIdChanged`] for a store of another node ID ([`NODE_ID_FILE`]);

@@ -4,13 +4,15 @@
 //! Cross-process cases re-run this test binary as a child, selected by `CHILD_MODE`.
 //!
 //! Every test here runs under [`serial`]. MDBX locks its files with open-file-description
-//! (OFD) locks, and a child spawned by one test briefly holds a copy of every fd of this
-//! process (from the fork until exec closes the `O_CLOEXEC` ones), the open file descriptions
-//! and their locks included. [`ColumnWriter::open`] retries `EAGAIN`/`EWOULDBLOCK` for about a
-//! second ([`cl_chain_columns::WRITER_LOCK_ATTEMPTS`] attempts,
-//! [`cl_chain_columns::WRITER_LOCK_RETRY_INTERVAL`] apart) and only then returns
-//! `WriterAlreadyOpen`. A live second writer is still refused, after that budget. Spawning and
-//! reopening never overlap once the tests are serialized.
+//! (OFD) locks, and a writer lock can outlive the child writer that held it: after the child
+//! is reaped, a `/proc` reader (`maps`, `smaps`, `environ`) can keep its address space alive
+//! for a moment, and those mmaps pin the open file description, so reopening gets `EAGAIN`
+//! with no process holding an fd (#275). [`ColumnWriter::open`] therefore retries
+//! `EAGAIN`/`EWOULDBLOCK` for about a second ([`cl_chain_columns::WRITER_LOCK_ATTEMPTS`]
+//! attempts, [`cl_chain_columns::WRITER_LOCK_RETRY_INTERVAL`] apart) and only then returns
+//! `WriterAlreadyOpen`; a live second writer is still refused, after that budget. Serializing
+//! also keeps a child spawned by one test from inheriting another test's lock fds between fork
+//! and exec (before exec closes the `O_CLOEXEC` ones).
 
 use std::{
     io::{BufRead, BufReader, Read, Write},

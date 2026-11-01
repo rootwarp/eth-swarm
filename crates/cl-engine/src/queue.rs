@@ -20,7 +20,15 @@
 //! later jobs do not wait for it. Once a job is sent, the EL gets its full response timeout,
 //! counted from the send: time spent queued never shortens it (execution-apis `common.md`).
 //! Whether the caller gives up first or the worker sends first is settled by one
-//! compare-and-swap on the job's [`Claim`], so a job is either answered unsent or sent.
+//! compare-and-swap on the job's [`Claim`], so a job is either answered unsent or sent. The
+//! worker claims a job only once the connection is ready to take the request, right before the
+//! send; a caller that stops waiting (dropped future) abandons its job, so it is never sent
+//! afterwards.
+//!
+//! Time bounds. One call can take up to twice its `timeout`: up to `timeout` waiting in the
+//! queue (and for the connection) before it is sent, then up to `timeout` for the EL's
+//! response. A caller that needs an end-to-end bound (for example the gRPC request deadline in
+//! [`crate::server`]) must allow for both, or treat a cut-off call as possibly applied.
 //!
 //! Gaps. A `seq` that will never be called (its request was rejected before reaching the
 //! queue) should be given back with [`Queue::release`]; later jobs then run without waiting.
@@ -34,8 +42,9 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
 /// Jobs waiting to be taken by the worker, and separately jobs waiting for an earlier `seq`.
 /// Large enough for the ordering test's 100 calls with room to spare.
@@ -154,7 +163,7 @@ impl Queue {
             claim: claim.clone(),
             reply,
         };
-        match tokio::time::timeout_at(deadline.into(), self.tx.send(Msg::Job(job))).await {
+        match tokio::time::timeout_at(deadline, self.tx.send(Msg::Job(job))).await {
             // The job never reached the worker, so it cannot be sent.
             Err(_) => return Err(CallError::Timeout),
             Ok(Err(_)) => return Err(CallError::Stopped),
@@ -193,7 +202,7 @@ impl Queue {
             claim: claim.clone(),
             reply,
         };
-        match tokio::time::timeout_at(deadline.into(), self.immediate.send(job)).await {
+        match tokio::time::timeout_at(deadline, self.immediate.send(job)).await {
             Err(_) => return Err(CallError::Timeout),
             Ok(Err(_)) => return Err(CallError::Stopped),
             Ok(Ok(())) => {}
@@ -201,9 +210,13 @@ impl Queue {
         await_reply(rx, deadline, &claim).await
     }
 
-    /// Bumps the connection generation and re-checks capabilities before returning. Safe to
-    /// call while the worker runs and concurrently with other reconnects
-    /// ([`Session::reconnect`]).
+    /// Bumps the connection generation and re-checks capabilities before returning.
+    ///
+    /// Safe to call while the worker runs and concurrently with other reconnects
+    /// ([`Session::reconnect`]). A call already sent on the old connection resolves as
+    /// [`CallError::StaleConnection`] and is not sent again; queued calls are not lost and go
+    /// out, in `seq` order, on the new connection (or reconnect themselves first if this
+    /// reconnect fails).
     pub async fn reconnect(&self) -> Result<(), StartError> {
         self.session.reconnect().await
     }
@@ -229,20 +242,31 @@ impl Queue {
 
 /// Waits for the worker's answer. At `deadline`, a job that has not been sent is abandoned
 /// (the worker will not send it); one already sent keeps waiting for its response, which the
-/// worker bounds by the job's response timeout.
+/// worker bounds by the job's response timeout. Dropping the future abandons the job too.
 async fn await_reply(
     mut rx: oneshot::Receiver<Result<Value, CallError>>,
     deadline: Instant,
     claim: &Claim,
 ) -> Result<Value, CallError> {
+    let _abandon_on_drop = AbandonOnDrop(claim);
     tokio::select! {
         result = &mut rx => return result.map_err(|_| CallError::Stopped)?,
-        () = tokio::time::sleep_until(deadline.into()) => {}
+        () = tokio::time::sleep_until(deadline) => {}
     }
     if claim.abandon() {
         return Err(CallError::Timeout);
     }
     rx.await.map_err(|_| CallError::Stopped)?
+}
+
+/// Abandons the job when its caller stops waiting, however that happens: the worker's claim
+/// right before the send then fails. A no-op once the job is claimed.
+struct AbandonOnDrop<'a>(&'a Claim);
+
+impl Drop for AbandonOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.abandon();
+    }
 }
 
 async fn run(
@@ -275,6 +299,19 @@ async fn run(
                 let Some(msg) = msg else {
                     break;
                 };
+                // A released seq has no deadline: a buffer full of them behind a gap would never
+                // skip it, and every later message would be refused. Skip the gap now, unless
+                // this message fills it: then it runs and the released seqs behind it drain.
+                let seq = match &msg {
+                    Msg::Release(seq) => *seq,
+                    Msg::Job(job) => job.seq,
+                };
+                if seq != next
+                    && buffered.len() >= QUEUE_DEPTH
+                    && buffered.values().all(|entry| matches!(entry, Entry::Released))
+                {
+                    skip_gap(&mut buffered, &mut next);
+                }
                 match msg {
                     Msg::Release(seq) => {
                         if seq == next {
@@ -332,18 +369,29 @@ async fn run(
                         }
                     }
                 }
-                if let Some(&lowest) = buffered.keys().next() {
-                    tracing::warn!(from = next, to = lowest, "engine queue skipped a seq gap");
-                    next = lowest;
-                }
+                skip_gap(&mut buffered, &mut next);
             }
         }
     }
 }
 
+/// Gives up the missing `seq` at `next`: continues from the lowest `seq` held, and drops the
+/// released seqs at the head, so the next job held (if any) is what runs next.
+fn skip_gap(buffered: &mut BTreeMap<u64, Entry>, next: &mut u64) {
+    let Some(&lowest) = buffered.keys().next() else {
+        return;
+    };
+    tracing::warn!(from = *next, to = lowest, "engine queue skipped a seq gap");
+    *next = lowest;
+    while let Some(Entry::Released) = buffered.get(next) {
+        buffered.remove(next);
+        *next = next.saturating_add(1);
+    }
+}
+
 async fn sleep_until(deadline: Option<Instant>) {
     if let Some(deadline) = deadline {
-        tokio::time::sleep_until(deadline.into()).await;
+        tokio::time::sleep_until(deadline).await;
     }
 }
 
@@ -380,18 +428,144 @@ async fn dispatch_at(
     // Nothing has been sent for this call yet, so reconnecting first is safe. The reconnect
     // (generation bump, then the capability check) is bounded by this call's deadline.
     if !session.is_connected() {
-        match tokio::time::timeout_at(deadline.into(), session.reconnect()).await {
+        match tokio::time::timeout_at(deadline, session.reconnect()).await {
             Err(_) => return Err(CallError::Timeout),
             Ok(Err(err)) => return Err(err.into()),
             Ok(Ok(())) => {}
         }
     }
-    // The reconnect may have taken a while: check again right before sending, and claim the
-    // job so its caller can no longer abandon it.
-    if cancelled() || Instant::now() >= deadline || !claim.send() {
-        return Err(CallError::Timeout);
+    // Claimed once the connection is ready to take the request, right before the send: a
+    // caller that has gone or a deadline that passed while the connection was made ready
+    // (reconnect included) sends nothing. After the claim the caller can no longer abandon
+    // the job; the response gets the full timeout from the send, and a failure after this
+    // point is the caller's result.
+    session
+        .call_claimed(method, params, deadline, timeout, || {
+            !cancelled() && Instant::now() < deadline && claim.send()
+        })
+        .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::EngineEndpoint;
+    use crate::test_mock::{required_methods, test_secret, MockEl};
+    use serde_json::json;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    async fn queue_on(mock: &MockEl, secret: crate::jwt::JwtSecret) -> Queue {
+        let config = Config::new(EngineEndpoint::parse(&mock.url(), false).unwrap(), secret);
+        Queue::connect(config, 1).await.unwrap()
     }
-    // Sent at most once, with the full response timeout from now: a failure after this point
-    // is the caller's result.
-    session.call(method, params, timeout).await
+
+    fn payload_seqs(mock: &MockEl) -> Vec<u64> {
+        mock.seen()
+            .into_iter()
+            .filter(|seen| seen.method == "engine_newPayloadV5")
+            .filter_map(|seen| seen.seq)
+            .collect()
+    }
+
+    /// Seq 2 waited 600 ms behind seq 1, so it is claimed well after it was queued. It then
+    /// stalls where the connection is made ready to send. Its caller must be answered at its
+    /// deadline, and the request must never go out after it.
+    #[tokio::test]
+    async fn a_call_that_stalls_before_the_wire_is_answered_at_its_deadline_and_never_sent() {
+        let secret = test_secret([0x51; 32]);
+        let mock = MockEl::start(secret.expose_secret(), required_methods()).await;
+        let queue = queue_on(&mock, secret).await;
+        let (reached, go) = queue.session().hold_before_ready();
+        tokio::time::pause();
+        // Polled once: seq 2 is queued now, with its deadline 1 s from now.
+        let call = queue.call(2, "engine_newPayloadV5", json!([2]), Duration::from_secs(1));
+        tokio::pin!(call);
+        assert!(poll_once(call.as_mut()).await.is_pending());
+        tokio::time::advance(Duration::from_millis(600)).await;
+        queue.release(1).await.unwrap();
+        reached.notified().await;
+        // Past seq 2's deadline (1 s after it was queued), not yet 1 s after it was claimed.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let answered = tokio::time::timeout(Duration::from_millis(300), call)
+            .await
+            .expect("the caller was not answered at its deadline");
+        assert!(matches!(answered, Err(CallError::Timeout)), "{answered:?}");
+        tokio::time::resume();
+        go.notify_one();
+        let value = queue
+            .call(3, "engine_newPayloadV5", json!([3]), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(value["status"], "VALID");
+        assert_eq!(
+            payload_seqs(&mock),
+            [3],
+            "seq 2 went out after its deadline"
+        );
+    }
+
+    /// The caller goes away while its call stalls before the wire. Nothing may be sent for it.
+    #[tokio::test]
+    async fn a_call_whose_caller_left_while_it_stalled_before_the_wire_is_never_sent() {
+        let secret = test_secret([0x52; 32]);
+        let mock = MockEl::start(secret.expose_secret(), required_methods()).await;
+        let queue = queue_on(&mock, secret).await;
+        let (reached, go) = queue.session().hold_before_ready();
+        let caller = {
+            let queue = queue.clone();
+            tokio::spawn(async move {
+                queue
+                    .call(
+                        1,
+                        "engine_newPayloadV5",
+                        json!([1]),
+                        Duration::from_secs(60),
+                    )
+                    .await
+            })
+        };
+        reached.notified().await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        go.notify_one();
+        let value = queue
+            .call(
+                2,
+                "engine_newPayloadV5",
+                json!([2]),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        assert_eq!(value["status"], "VALID");
+        assert_eq!(
+            payload_seqs(&mock),
+            [2],
+            "a call whose caller left was sent"
+        );
+    }
+
+    /// Polls `fut` once.
+    async fn poll_once<F: Future>(mut fut: Pin<&mut F>) -> Poll<F::Output> {
+        std::future::poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await
+    }
+
+    /// A caller dropped while it waits for its reply leaves the job's claim abandoned, so the
+    /// worker's claim right before the send fails however the two interleave.
+    #[tokio::test]
+    async fn dropping_the_caller_abandons_its_claim() {
+        let (_reply, rx) = oneshot::channel::<Result<Value, CallError>>();
+        let claim = Claim::default();
+        {
+            let wait = await_reply(rx, Instant::now() + Duration::from_secs(60), &claim);
+            tokio::pin!(wait);
+            assert!(poll_once(wait.as_mut()).await.is_pending());
+        }
+        assert!(
+            !claim.send(),
+            "the worker could still claim the job of a caller that is gone"
+        );
+    }
 }

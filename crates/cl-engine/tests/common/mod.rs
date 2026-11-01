@@ -37,6 +37,7 @@ struct State {
     hold_remaining: AtomicU32,
     hold: watch::Receiver<bool>,
     delay: Mutex<Duration>,
+    method_delays: Mutex<Vec<(String, Duration)>>,
     chunked: AtomicU32,
     capability_calls: AtomicU64,
 }
@@ -66,6 +67,7 @@ impl MockEl {
             hold_remaining: AtomicU32::new(0),
             hold,
             delay: Mutex::new(Duration::ZERO),
+            method_delays: Mutex::new(Vec::new()),
             chunked: AtomicU32::new(0),
             capability_calls: AtomicU64::new(0),
         });
@@ -126,6 +128,15 @@ impl MockEl {
 
     pub fn set_delay(&self, delay: Duration) {
         *self.state.delay.lock().unwrap() = delay;
+    }
+
+    /// Every `method` call is answered `delay` late, on top of [`MockEl::set_delay`].
+    pub fn set_method_delay(&self, method: &str, delay: Duration) {
+        self.state
+            .method_delays
+            .lock()
+            .unwrap()
+            .push((method.to_owned(), delay));
     }
 
     /// The next engine call (not the capability exchange) answers with `bytes` of chunked body
@@ -224,7 +235,15 @@ async fn handle(
     if chunked > 0 {
         return Ok(chunked_response(chunked));
     }
-    let delay = *state.delay.lock().unwrap();
+    let extra: Duration = state
+        .method_delays
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(name, _)| *name == method)
+        .map(|(_, delay)| *delay)
+        .sum();
+    let delay = *state.delay.lock().unwrap() + extra;
     if !delay.is_zero() {
         tokio::time::sleep(delay).await;
     }

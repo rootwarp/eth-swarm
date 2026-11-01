@@ -75,13 +75,27 @@ fn options(mode: Mode) -> DatabaseOptions {
 }
 
 /// Opens (creating if needed) the column env read-write, checks that the requested map size is
-/// in effect, and creates every table in one txn.
+/// in effect, and creates every table in one txn. An `EAGAIN` from the open is retried like the
+/// writer guard's ([`retry_writer_lock`], [`WRITER_LOCK_ATTEMPTS`] tries), so the open can block
+/// for about a second.
 ///
 /// Why an error and not a resize after open: libmdbx 0.5.6 has no API to change the geometry
 /// of an open env, and calling `mdbx_env_set_geometry` through the C API would run MDBX's own
 /// write txn outside the writer's txn scheduler and libmdbx's txn manager thread. Restarting
 /// with cl-store detached (or keeping the stored size) is the safe way to resize.
 pub(crate) fn open_rw(path: &Path, opts: WriterOptions) -> Result<Env> {
+    open_rw_with(path, opts, WriterLockPace::production(), |path, options| {
+        Env::open_with_options(path, options)
+    })
+}
+
+/// [`open_rw`] with the pace of the `EAGAIN` retries and the env opener given (tests).
+fn open_rw_with(
+    path: &Path,
+    opts: WriterOptions,
+    pace: WriterLockPace,
+    mut open: impl FnMut(&Path, DatabaseOptions) -> std::result::Result<Env, libmdbx::Error>,
+) -> Result<Env> {
     let requested = opts.max_size;
     let max_size = isize::try_from(requested)
         .ok()
@@ -91,15 +105,19 @@ pub(crate) fn open_rw(path: &Path, opts: WriterOptions) -> Result<Env> {
         })?;
     let growth_step = GROWTH_STEP as isize;
     std::fs::create_dir_all(path)?;
-    let env = Env::open_with_options(
-        path,
-        options(Mode::ReadWrite(ReadWriteOptions {
-            sync_mode: SyncMode::Durable,
-            max_size: Some(max_size),
-            growth_step: Some(growth_step),
-            ..ReadWriteOptions::default()
-        })),
-    )?;
+    // The same lingering lock the guard can meet after a writer is reaped ([`lock_writer`]):
+    // retried on the same budget.
+    let env = retry_writer_lock(path, pace, || {
+        open(
+            path,
+            options(Mode::ReadWrite(ReadWriteOptions {
+                sync_mode: SyncMode::Durable,
+                max_size: Some(max_size),
+                growth_step: Some(growth_step),
+                ..ReadWriteOptions::default()
+            })),
+        )
+    })?;
     let effective = env.info()?.map_size();
     if effective != requested {
         return Err(Error::GeometryMismatch {
@@ -320,6 +338,38 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::EnvBusy { .. }), "{err}");
         assert_eq!(calls, 3);
+    }
+
+    /// The data env open meets the same lingering lock as the guard after a writer is reaped
+    /// (see [`lock_writer`]): its `EAGAIN` is retried on the same budget.
+    #[test]
+    fn the_data_env_open_retries_eagain_on_the_writer_lock_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut calls = 0;
+        let env = open_rw_with(
+            dir.path(),
+            WriterOptions::default(),
+            pace(),
+            |path, options| {
+                calls += 1;
+                if calls <= 3 {
+                    Err(libmdbx::Error::Other(EAGAIN))
+                } else {
+                    Env::open_with_options(path, options)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 4);
+        drop(env);
+        let mut calls = 0;
+        let err = open_rw_with(dir.path(), WriterOptions::default(), pace(), |_, _| {
+            calls += 1;
+            Err(libmdbx::Error::Other(EAGAIN))
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::WriterAlreadyOpen { .. }), "{err}");
+        assert_eq!(calls, WRITER_LOCK_ATTEMPTS);
     }
 
     #[test]

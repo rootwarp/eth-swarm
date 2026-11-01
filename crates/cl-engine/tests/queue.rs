@@ -3,7 +3,7 @@
 mod common;
 
 use cl_engine::client::{Backoff, CallError, Config, EngineEndpoint, StartError};
-use cl_engine::queue::Queue;
+use cl_engine::queue::{Queue, QUEUE_DEPTH};
 use common::{required_methods, test_secret, MockEl};
 use serde_json::json;
 use std::time::Duration;
@@ -627,4 +627,129 @@ async fn call_expiring_while_queued_behind_a_running_call_is_not_sent() {
         .await
         .unwrap();
     assert_eq!(payload_seqs(&mock), [1, 3], "the expired call was sent");
+}
+
+/// Seq 1 never comes, and the buffer fills with released seqs behind it. A released seq has no
+/// deadline, so nothing would ever skip the gap: once the buffer is full of them, the gap is
+/// skipped when the next message arrives, and later calls run instead of being refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_buffer_full_of_released_seqs_skips_the_gap() {
+    let secret = test_secret(SECRET);
+    let mock = MockEl::start(secret.expose_secret(), required_methods()).await;
+    let queue = Queue::connect(config(&mock.url(), secret), 1)
+        .await
+        .unwrap();
+    let depth = u64::try_from(QUEUE_DEPTH).unwrap();
+    for seq in 2..=depth + 1 {
+        queue.release(seq).await.unwrap();
+    }
+    let next = depth + 2;
+    let value = bounded(
+        Duration::from_secs(3),
+        queue.call(
+            next,
+            "engine_newPayloadV5",
+            json!([next]),
+            Duration::from_secs(2),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(value["status"], "VALID");
+    // The skipped seq turns up late: refused, never sent.
+    let err = queue
+        .call(1, "engine_newPayloadV5", json!([1]), Duration::from_secs(2))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CallError::Sequence), "{err:?}");
+    assert_eq!(payload_seqs(&mock), [next]);
+}
+
+/// The buffer is full of released seqs behind a gap, and then the seq filling the gap arrives:
+/// it runs instead of being skipped over and refused, and the released seqs behind it drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seq_filling_the_gap_runs_when_the_buffer_is_full_of_released_seqs() {
+    let secret = test_secret(SECRET);
+    let mock = MockEl::start(secret.expose_secret(), required_methods()).await;
+    let queue = Queue::connect(config(&mock.url(), secret), 1)
+        .await
+        .unwrap();
+    let depth = u64::try_from(QUEUE_DEPTH).unwrap();
+    for seq in 2..=depth + 1 {
+        queue.release(seq).await.unwrap();
+    }
+    let value = bounded(
+        Duration::from_secs(3),
+        queue.call(1, "engine_newPayloadV5", json!([1]), Duration::from_secs(2)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(value["status"], "VALID");
+    let next = depth + 2;
+    let value = bounded(
+        Duration::from_secs(3),
+        queue.call(
+            next,
+            "engine_newPayloadV5",
+            json!([next]),
+            Duration::from_secs(2),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(value["status"], "VALID");
+    assert_eq!(payload_seqs(&mock), [1, next]);
+}
+
+/// `newPayload` and `forkchoiceUpdated` calls interleaved and submitted out of order, with
+/// `newPayload` answered late: a quick `forkchoiceUpdated` never overtakes an earlier
+/// `newPayload`, and the EL sees every call in `seq` order with the method it was given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_new_payload_and_forkchoice_calls_keep_seq_order_with_delayed_replies() {
+    const NEW_PAYLOAD: &str = "engine_newPayloadV5";
+    const FORKCHOICE: &str = "engine_forkchoiceUpdatedV4";
+    let secret = test_secret(SECRET);
+    let mock = MockEl::start(secret.expose_secret(), required_methods()).await;
+    mock.set_method_delay(NEW_PAYLOAD, Duration::from_millis(3));
+    let queue = Queue::connect(config(&mock.url(), secret), 1)
+        .await
+        .unwrap();
+    // A block, then one or two forkchoice updates for it.
+    let method_of = |seq: u64| {
+        if seq % 3 == 1 {
+            NEW_PAYLOAD
+        } else {
+            FORKCHOICE
+        }
+    };
+    let mut seqs: Vec<u64> = (1..=60).collect();
+    let mut state = 0x5eed_u64;
+    for i in (1..seqs.len()).rev() {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let j = (state as usize) % (i + 1);
+        seqs.swap(i, j);
+    }
+    let mut tasks = Vec::with_capacity(seqs.len());
+    for seq in seqs {
+        let queue = queue.clone();
+        tasks.push(tokio::spawn(async move {
+            queue
+                .call(seq, method_of(seq), json!([seq]), Duration::from_secs(5))
+                .await
+                .unwrap()
+        }));
+    }
+    for task in tasks {
+        assert_eq!(task.await.unwrap()["status"], "VALID");
+    }
+    let got: Vec<(String, Option<u64>)> = mock
+        .seen()
+        .into_iter()
+        .filter(|seen| seen.method != "engine_exchangeCapabilities")
+        .map(|seen| (seen.method, seen.seq))
+        .collect();
+    let want: Vec<(String, Option<u64>)> = (1..=60)
+        .map(|seq| (method_of(seq).to_owned(), Some(seq)))
+        .collect();
+    assert_eq!(got, want);
 }
