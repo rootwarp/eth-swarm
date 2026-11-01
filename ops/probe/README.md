@@ -167,8 +167,11 @@ routing table from `bootnodes` and does a lookup every `lookup_interval_ms`. At 
 it keeps the records that announce the new digest as their next one (`nfd`), and keeps the
 records of the old digest for two epochs, as long as the old gossip topics stay, while peers
 update their records. Only cl-p2p's UID
-can call its two methods: `WatchPeers` (the table's records, then each record found) and
-`GetLocalEnr`. Its `cgc` must be cl-chain's custody group count: cl-p2p refuses another.
+can call its three methods: `WatchPeers` (the table's records, then each record found),
+`GetLocalEnr` and `FindPeers` (a lookup for the peers that serve the wanted attestation or
+sync-committee subnets or custody columns, best coverage first, at most 16, cached for the
+slot; at most two such lookups run at once). Its `cgc` must be cl-chain's custody group count:
+cl-p2p refuses another.
 
 ```toml
 # /etc/ethswarm/cl-discv5.toml
@@ -181,9 +184,10 @@ group = 992                             # the GID of ethswarm-discv5
 [callers]
 cl-p2p = 991                            # the UID of ethswarm-p2p
 
-[methods]                               # exactly these two, to cl-p2p only
+[methods]                               # exactly these three, to cl-p2p only
 "/ethswarm.discv5.v1.DiscoveryService/WatchPeers" = ["cl-p2p"]
 "/ethswarm.discv5.v1.DiscoveryService/GetLocalEnr" = ["cl-p2p"]
+"/ethswarm.discv5.v1.DiscoveryService/FindPeers" = ["cl-p2p"]
 
 [discv5]
 mode = "public"                  # public, devnet or local: the routing table's IP rules

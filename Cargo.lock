@@ -1086,6 +1086,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-rlp",
  "cl-discv5",
+ "consensus-types",
  "data-encoding",
  "discv5",
  "enr",

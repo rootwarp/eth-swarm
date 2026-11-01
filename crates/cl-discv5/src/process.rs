@@ -15,9 +15,10 @@
 //! [callers]
 //! cl-p2p = 991                            # the UID of ethswarm-p2p
 //!
-//! [methods]                               # exactly these two, to cl-p2p only
+//! [methods]                               # exactly these three, to cl-p2p only
 //! "/ethswarm.discv5.v1.DiscoveryService/WatchPeers" = ["cl-p2p"]
 //! "/ethswarm.discv5.v1.DiscoveryService/GetLocalEnr" = ["cl-p2p"]
+//! "/ethswarm.discv5.v1.DiscoveryService/FindPeers" = ["cl-p2p"]
 //!
 //! [discv5]
 //! mode = "public"                  # public, devnet or local: the routing table's IP rules
@@ -35,7 +36,9 @@
 //!   each fork or BPO digest change ([`Discovery::set_fork_fields`], checked every
 //!   [`FORK_CHECK`]). It logs its node ID and record at start: both are public.
 //! - **Lookups** run every `lookup_interval_ms` towards a random node ID. Every record found,
-//!   and every record discv5 reports, goes to the watchers ([`PeerFeed`]).
+//!   and every record discv5 reports, goes to the watchers ([`PeerFeed`]). `FindPeers` runs
+//!   lookups of its own ([`crate::subnet_query`]), cached by the wall-clock slot (`genesis_time`
+//!   and the slot duration of the network config; slot 0 before genesis).
 //! - **The ACL** must be exactly [`discv5_acl`] of the `cl-p2p` caller.
 //!
 //! Exit codes, which `RestartPreventExitStatus=1 2 64` reads: 0 a clean stop; 1 a refused
@@ -82,9 +85,10 @@ pub const BUILD: &str = concat!("cl-discv5/", env!("CARGO_PKG_VERSION"));
 pub const P2P_CALLER: &str = "cl-p2p";
 
 /// The methods cl-p2p calls, and only those.
-pub const DISCV5_METHODS: [&str; 2] = [
+pub const DISCV5_METHODS: [&str; 3] = [
     "/ethswarm.discv5.v1.DiscoveryService/WatchPeers",
     "/ethswarm.discv5.v1.DiscoveryService/GetLocalEnr",
+    "/ethswarm.discv5.v1.DiscoveryService/FindPeers",
 ];
 
 /// A refused credential, or a start or run that a restart cannot fix.
@@ -266,6 +270,12 @@ fn fork_fields_at(
         .map_err(|e| format!("our record's fork fields: {e}"))
 }
 
+/// The wall-clock slot at `now_ms`, 0 before genesis: what `FindPeers` caches by.
+fn slot_at(genesis_time: u64, slot_ms: u64, now_ms: u128) -> u64 {
+    // An epoch of one slot is a slot.
+    current_epoch(genesis_time, slot_ms, 1, now_ms).unwrap_or(0)
+}
+
 /// Why [`serve`] stopped other than cleanly.
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
@@ -367,8 +377,11 @@ pub async fn serve(
     ];
     let link = Link::network(Arc::clone(&settings.network), 1)
         .map_err(|e| ServeError::Failed(format!("the digest schedule: {e}")))?;
-    let services = Services::new()
-        .add_service(DiscoveryServer::new(link, Arc::clone(&discovery), feed, stop).into_service());
+    let genesis_time = network.genesis().genesis_time;
+    let slot_ms = network.config().slot_duration_ms();
+    let slots = Arc::new(move || slot_at(genesis_time, slot_ms, ipc::hello::system_ms()));
+    let server = DiscoveryServer::new(link, Arc::clone(&discovery), feed, stop, slots);
+    let services = Services::new().add_service(server.into_service());
     let shutdown = std::mem::replace(&mut hooks.shutdown, Box::pin(std::future::pending()));
     hooks.shutdown = Box::pin(async move {
         shutdown.await;
@@ -695,6 +708,39 @@ mod tests {
             71
         );
         assert!(![1, 2, 64].contains(&EXIT_SOFTWARE));
+    }
+
+    /// cl-p2p may call `FindPeers`, and nobody else may; a config whose ACL leaves it out is
+    /// refused.
+    #[test]
+    fn find_peers_is_in_the_acl() {
+        let find = "/ethswarm.discv5.v1.DiscoveryService/FindPeers";
+        let acl = discv5_acl(991).unwrap();
+        assert!(acl.allows(find, 991));
+        assert!(!acl.allows(find, 995));
+        assert!(acl.methods().any(|m| m == find));
+        let without: Vec<&str> = DISCV5_METHODS
+            .iter()
+            .copied()
+            .filter(|m| *m != find)
+            .collect();
+        assert!(parse(&text(&without, ""))
+            .unwrap_err()
+            .contains("method ACL"));
+        assert!(parse(&text(&DISCV5_METHODS, "")).is_ok());
+    }
+
+    /// The slot `FindPeers` caches by: the wall-clock slot, 0 before genesis.
+    #[test]
+    fn the_slot_of_the_clock() {
+        use ipc::testkit::devnet::{devnet_ms, DEVNET_GENESIS, DEVNET_SLOT_MS};
+        let at = |ms: u64| slot_at(DEVNET_GENESIS.genesis_time, DEVNET_SLOT_MS, u128::from(ms));
+        assert_eq!(at(0), 0);
+        assert_eq!(at(devnet_ms(0) - 1), 0);
+        assert_eq!(at(devnet_ms(0)), 0);
+        assert_eq!(at(devnet_ms(1) - 1), 0);
+        assert_eq!(at(devnet_ms(1)), 1);
+        assert_eq!(at(devnet_ms(1234) + 5_999), 1234);
     }
 
     /// The record's fork fields follow the clock; before genesis, epoch 0's.

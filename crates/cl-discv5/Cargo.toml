@@ -26,6 +26,9 @@ ipc = { path = "../ipc" }
 tonic.workspace = true
 # The ENR values (eth2, cgc, nfd) as bytes and the BPO-aware local fork fields.
 p2p-wire = { path = "../p2p-wire" }
+# FindPeers: a peer's custody columns from its node ID and `cgc` (das::custody_columns); already
+# in the tree through p2p-wire.
+consensus-types = { path = "../consensus-types" }
 # No `libp2p` feature: every libp2p* crate comes from the one pinned rust-libp2p commit, and
 # discv5's would be the crates.io one (scripts/check-libp2p-revs.sh).
 discv5.workspace = true
@@ -59,7 +62,8 @@ cl-discv5 = { path = ".", features = ["test-config"] }
 ipc = { path = "../ipc", features = ["testkit"] }
 # owned::testkit: temp directories with no symlink on their path, for the owner walk.
 svc-runtime = { path = "../svc-runtime", features = ["testkit"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# test-util: FindPeers' deadline and lookup-bound tests run on a paused clock.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 tempfile = "3"
 # The node key's encodings the binary test greps its output for; already in the tree.
 data-encoding = "2"

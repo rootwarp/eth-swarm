@@ -936,6 +936,7 @@ name = "cl-discv5"
 version = "0.1.0"
 dependencies = [
  "alloy-rlp",
+ "consensus-types",
  "discv5",
  "enr",
  "ethswarm-proto",

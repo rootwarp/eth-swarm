@@ -656,7 +656,9 @@ fn enr_seeds() {
             EnrFields {
                 eth2: want.eth2,
                 cgc: Some(4),
-                nfd: Some(want.nfd)
+                nfd: Some(want.nfd),
+                attnets: 0,
+                syncnets: 0,
             },
             "{label}"
         );

@@ -2,7 +2,8 @@
 //!
 //! Spec: consensus-specs v1.7.0-beta.4, `phase0/p2p-interface.md` "ENR structure" and
 //! `fulu/p2p-interface.md` "The discovery domain: discv5". The record carries `eth2` (the SSZ
-//! `ENRForkID`), `cgc` (the custody group count) and `nfd` (the next fork digest); their byte
+//! `ENRForkID`), `cgc` (the custody group count) and `nfd` (the next fork digest), and a remote
+//! one may carry `attnets` and `syncnets` (its subnet bitfields); their byte
 //! encodings live in [`p2p_wire::enr`], which has no `enr` dependency, so this module only
 //! moves them in and out of the record's RLP string values.
 //!
@@ -14,8 +15,8 @@
 
 use alloy_rlp::{Bytes, Decodable};
 use p2p_wire::enr::{
-    decode_cgc, decode_eth2, decode_nfd, encode_cgc, EnrFieldError, EnrForkId, ForkFields, CGC_KEY,
-    ETH2_KEY, NFD_KEY,
+    decode_attnets, decode_cgc, decode_eth2, decode_nfd, decode_syncnets, encode_cgc,
+    EnrFieldError, EnrForkId, ForkFields, ATTNETS_KEY, CGC_KEY, ETH2_KEY, NFD_KEY, SYNCNETS_KEY,
 };
 use p2p_wire::rpc::messages::ForkDigest;
 use std::net::Ipv4Addr;
@@ -168,11 +169,16 @@ pub struct EnrFields {
     pub cgc: Option<u64>,
     /// `nfd`, absent on a record from before Fulu was scheduled.
     pub nfd: Option<ForkDigest>,
+    /// `attnets`: bit `i` is attestation subnet `i`; 0 when absent (an all-zero `attnets` may be
+    /// left out).
+    pub attnets: u64,
+    /// `syncnets`: bit `i` is sync-committee subnet `i`; 0 when absent.
+    pub syncnets: u8,
 }
 
 impl EnrFields {
-    /// Reads `eth2`, `cgc` and `nfd`. A present field that does not decode is an error, never
-    /// a default.
+    /// Reads `eth2`, `cgc`, `nfd`, `attnets` and `syncnets`. A present field that does not
+    /// decode is an error, never a default.
     pub fn read(enr: &Enr) -> Result<Self, FieldError> {
         if !matches!(enr.public_key(), CombinedPublicKey::Secp256k1(_)) {
             return Err(FieldError::NotSecp256k1);
@@ -180,7 +186,15 @@ impl EnrFields {
         let eth2 = fork_id(enr)?;
         let cgc = value(enr, CGC_KEY)?.map(|b| decode_cgc(&b)).transpose()?;
         let nfd = value(enr, NFD_KEY)?.map(|b| decode_nfd(&b)).transpose()?;
-        Ok(Self { eth2, cgc, nfd })
+        let attnets = value(enr, ATTNETS_KEY)?.map(|b| decode_attnets(&b));
+        let syncnets = value(enr, SYNCNETS_KEY)?.map(|b| decode_syncnets(&b));
+        Ok(Self {
+            eth2,
+            cgc,
+            nfd,
+            attnets: attnets.transpose()?.unwrap_or(0),
+            syncnets: syncnets.transpose()?.unwrap_or(0),
+        })
     }
 }
 
@@ -279,6 +293,8 @@ mod tests {
             eth2: fields.eth2,
             cgc: Some(4),
             nfd: Some(fields.nfd),
+            attnets: 0,
+            syncnets: 0,
         };
         assert_eq!(EnrFields::read(&enr), Ok(want));
         // Text form and RLP form decode to the same record and fields.
@@ -355,6 +371,37 @@ mod tests {
             .build(&ed)
             .unwrap();
         assert_eq!(read(&ed), Err(FieldError::NotSecp256k1));
+    }
+
+    /// `attnets` and `syncnets` read as integers whose bit `i` is subnet `i`; absent is all zero
+    /// (`phase0/p2p-interface.md` lets an all-zero `attnets` be left out); a present value of the
+    /// wrong length, or a `syncnets` with a bit past subnet 3, refuses the record.
+    #[test]
+    fn subnet_bitfields() {
+        let eth2 = sepolia_fields(300_000).eth2.to_bytes();
+        let read = |extra: &[(&str, &[u8])]| EnrFields::read(&record(Some(&eth2), extra));
+        let fields = read(&[]).unwrap();
+        assert_eq!((fields.attnets, fields.syncnets), (0, 0));
+        let attnets = [0b0000_0010, 0, 0, 0, 0, 0, 0, 0b1000_0000];
+        let fields = read(&[("attnets", &attnets), ("syncnets", &[0b0000_1001])]).unwrap();
+        assert_eq!(fields.attnets, 1 << 1 | 1 << 63);
+        assert_eq!(fields.syncnets, 0b1001);
+        assert_eq!(
+            read(&[("attnets", &[0xff; 7])]),
+            Err(FieldError::Value(EnrFieldError::AttnetsLen(7)))
+        );
+        assert_eq!(
+            read(&[("attnets", &[])]),
+            Err(FieldError::Value(EnrFieldError::AttnetsLen(0)))
+        );
+        assert_eq!(
+            read(&[("syncnets", &[0x10])]),
+            Err(FieldError::Value(EnrFieldError::SyncnetsHighBits(0x10)))
+        );
+        assert_eq!(
+            read(&[("syncnets", &[1, 0])]),
+            Err(FieldError::Value(EnrFieldError::SyncnetsLen(2)))
+        );
     }
 
     #[test]

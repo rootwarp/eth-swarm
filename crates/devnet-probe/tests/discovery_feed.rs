@@ -6,14 +6,17 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use cl_discv5::enr::{build_local_enr, CombinedKey, Enr, LocalAddr};
+use cl_discv5::enr::{build_local_enr, fork_id, CombinedKey, Enr, LocalAddr};
 use cl_discv5::server::{peer_id_text, DiscoveryServer, PeerFeed, PeerSource};
+use cl_discv5::service::ServiceError;
+use cl_discv5::subnet_query::SubnetQuery;
 use cl_p2p::service::peers::{watch_peers, Candidate, Discv5Peer};
 use ipc::testkit::devnet::{devnet_config, devnet_hello, DEVNET_GENESIS};
 use ipc::Link;
 use libp2p::identity::Keypair;
 use p2p_wire::enr::ForkFields;
 use p2p_wire::ip::NetworkMode;
+use p2p_wire::rpc::messages::ForkDigest;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,6 +68,24 @@ impl PeerSource for Table {
     fn table_records(&self) -> Vec<Enr> {
         self.0.clone()
     }
+
+    fn fork_digest(&self) -> ForkDigest {
+        fork_id(&self.0[0]).unwrap().fork_digest
+    }
+
+    async fn find_matching(
+        &self,
+        query: SubnetQuery,
+        max: usize,
+    ) -> Result<Vec<Enr>, ServiceError> {
+        Ok(self
+            .0
+            .iter()
+            .filter(|enr| query.matches(enr))
+            .take(max)
+            .cloned()
+            .collect())
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -78,6 +99,7 @@ async fn cl_p2p_gets_cl_discv5s_peers_over_the_socket() {
         Arc::new(Table(vec![known])),
         feed.clone(),
         stopped.clone(),
+        Arc::new(|| 0),
     );
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("cl-discv5.sock");
