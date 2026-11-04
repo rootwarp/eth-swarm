@@ -115,6 +115,13 @@ impl StoreServer {
         }
     }
 
+    /// The `StoreService` over the env `store` holds, reopened when it fails.
+    #[must_use]
+    pub fn recovering(link: Link, store: Arc<crate::recover::Recovering>) -> Self {
+        let _ = (link, store);
+        todo!()
+    }
+
     /// The same server with another per-call deadline.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {

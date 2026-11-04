@@ -1226,6 +1226,7 @@ name = "cl-store"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "cl-chain",
  "consensus-types",
  "ethereum_ssz",
  "ethswarm-proto",
@@ -1233,14 +1234,18 @@ dependencies = [
  "libmdbx",
  "mdbx-sys",
  "network-config",
+ "prometheus-client",
  "prost",
+ "serde",
  "ssz_types",
  "store-schema",
+ "svc-runtime",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
  "tonic",
+ "tracing",
  "tree_hash",
 ]
 

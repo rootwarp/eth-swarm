@@ -152,6 +152,10 @@ impl Reader {
         (*self.env).borrow()
     }
 
+    /// Marks the reader as if a read transaction had failed with `MDBX_WANNA_RECOVERY`.
+    #[cfg(test)]
+    pub(crate) fn poison(&self) {}
+
     /// The block `at` names, with the stamp of the transaction it was read in.
     ///
     /// # Errors
@@ -478,6 +482,8 @@ mod tests {
     use crate::testkit::{self, block, common, deadline, stamp, Store};
     use std::{
         collections::BTreeSet,
+        io::{BufRead, Read, Write},
+        path::PathBuf,
         sync::atomic::{AtomicBool, Ordering},
         thread,
     };
@@ -538,26 +544,35 @@ mod tests {
         assert_eq!(ReadError::from(malformed), ReadError::Internal);
     }
 
+    /// The env of the two-user run (`scripts/store-two-users.sh`): another OS user (cl-chain's)
+    /// wrote it, and this test binary runs as the reader's user. Unset in an ordinary run.
+    const TWO_USER_ENV: &str = "CL_STORE_TWO_USER_ENV";
+
+    fn two_user_env() -> Option<PathBuf> {
+        std::env::var_os(TWO_USER_ENV).map(PathBuf::from)
+    }
+
     /// cl-store opens the env read-only: a write transaction, and a put, a delete, a table
     /// create and a table drop in a read transaction of the reader's env, each straight
     /// through the C API, all fail with `EACCES`, and the env reads back unchanged, through
-    /// the reader too.
+    /// the reader too. In the two-user run the env is the one cl-chain's user wrote
+    /// ([`TWO_USER_ENV`]), checked as the reader's user; otherwise this test writes its own.
     #[test]
     fn cannot_write() {
-        let dir = tempfile::tempdir().unwrap();
-        let (ssz, root) = block(9, [0; 32], 1);
-        {
-            let writer = env::test_writer(dir.path()).unwrap();
+        let _serial = testkit::serial();
+        let own = tempfile::tempdir().unwrap();
+        let path = two_user_env().unwrap_or_else(|| {
+            let (ssz, root) = block(9, [0; 32], 1);
+            let writer = env::test_writer(own.path()).unwrap();
             testkit::import(&writer, &[&ssz], stamp(1, (9, root), (9, root)));
-        }
-        let reader = Reader::open(dir.path()).expect("the env opens read-only");
+            own.path().to_path_buf()
+        });
+        let reader = Reader::open(&path).expect("the env opens read-only");
         let before = env_rows(&reader);
-        let served = reader.block(BlockRef::Root(root), &deadline());
-        assert_eq!(
-            served.as_ref().map(|b| b.value.ssz == ssz),
-            Ok(true),
-            "the reader serves the stored block"
-        );
+        let served = reader
+            .block(BlockRef::Head, &deadline())
+            .expect("the reader serves the stored head");
+        let (slot, root) = (served.value.slot, served.value.root);
 
         let env = reader.env().ptr().0;
         let mut txn = std::ptr::null_mut();
@@ -580,7 +595,7 @@ mod tests {
         let ro = reader.env().begin_ro_txn().unwrap();
         let blocks = ro.open_table(Some(BLOCKS)).unwrap();
         let (raw, dbi) = (ro.txn().0, blocks.dbi());
-        let key = slot_root_key(9, &root);
+        let key = slot_root_key(slot, &root);
         let value = b"overwritten".to_vec();
         let mut created = 0;
         // SAFETY: `raw` is the live read txn `ro`, `dbi` its handle of `blocks`; the values
@@ -618,7 +633,396 @@ mod tests {
         }
         drop(ro);
         assert_eq!(env_rows(&reader), before, "a write changed the env");
-        assert_eq!(reader.block(BlockRef::Root(root), &deadline()), served);
+        assert_eq!(reader.block(BlockRef::Head, &deadline()), Ok(served));
+        if let Some(path) = two_user_env() {
+            let uid = ipc::peercred::effective_uid();
+            println!(
+                "two-user: cannot_write ok on {} as uid {uid}",
+                path.display()
+            );
+        }
+    }
+
+    /// The two-user run only ([`TWO_USER_ENV`]; skipped otherwise): the env is laid out as
+    /// [5.43] has it, and this user, the reader's, cannot write it. The directory is 0750, the
+    /// data file 0640 and the lock file 0660, each owned by another user (the writer's) and in
+    /// this user's group (the store group). The data file does not open for writing and no
+    /// file can be created in the directory, yet the env opens read-only and serves its head.
+    #[test]
+    fn env_permissions() {
+        use std::os::unix::fs::MetadataExt;
+        let Some(path) = two_user_env() else {
+            eprintln!("{TWO_USER_ENV} is not set: skipped (scripts/store-two-users.sh sets it)");
+            return;
+        };
+        let _serial = testkit::serial();
+        let (uid, gid) = (
+            ipc::peercred::effective_uid(),
+            ipc::peercred::effective_gid(),
+        );
+        assert_ne!(uid, 0, "run as the reader's user, not as root");
+        for (name, mode) in [(".", 0o750), ("mdbx.dat", 0o640), ("mdbx.lck", 0o660)] {
+            let meta = std::fs::metadata(path.join(name)).unwrap();
+            assert_eq!(meta.mode() & 0o7777, mode, "{name}: mode {:o}", meta.mode());
+            assert_ne!(meta.uid(), uid, "{name} is the writer's, not this user's");
+            assert_eq!(meta.gid(), gid, "{name} is in the store group");
+        }
+        let write = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path.join("mdbx.dat"));
+        assert_eq!(
+            write.map(drop).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::PermissionDenied),
+            "the data file opens for writing"
+        );
+        let create = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path.join("intruder"));
+        assert_eq!(
+            create.map(drop).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::PermissionDenied),
+            "a file is created in the env directory"
+        );
+        let reader = Reader::open(&path).expect("the env opens read-only");
+        reader.head(&deadline()).expect("and serves its stamp");
+        println!(
+            "two-user: env_permissions ok on {} as uid {uid}",
+            path.display()
+        );
+    }
+
+    /// The reader table of an env as `mdbx_stat -r` prints it: `(pid, txnid)` per row, the
+    /// txnid `-` for a slot without a live read transaction.
+    fn reader_rows(table: &str) -> Vec<(u32, String)> {
+        table
+            .lines()
+            .filter_map(|line| {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                match words.as_slice() {
+                    [row, slot, pid, _thread, txnid, ..]
+                        if row.ends_with(')') && slot.starts_with('[') =>
+                    {
+                        Some((pid.parse().ok()?, (*txnid).to_owned()))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// While cl-store holds a read transaction (a read in progress), the env's reader table
+    /// lists its pid with that transaction, and `mdbx_chk` checks the env clean all the same.
+    /// Both tools are the pinned libmdbx 0.12.13 build of `scripts/build-mdbx-chk.sh`:
+    /// `MDBX_CHK`, and `mdbx_stat` beside it (that `mdbx_chk` has no reader listing;
+    /// `mdbx_stat -r` prints the table). Skipped unless `MDBX_CHK` is set: the mdbx-chk CI job
+    /// sets it.
+    #[test]
+    fn registered_in_reader_list() {
+        let Some(chk) = std::env::var_os("MDBX_CHK").map(PathBuf::from) else {
+            eprintln!("MDBX_CHK is not set: skipped (the mdbx-chk CI job runs it)");
+            return;
+        };
+        let stat = chk.with_file_name("mdbx_stat");
+        assert!(
+            stat.is_file(),
+            "MDBX_CHK is {}, but {} (built beside it) is missing",
+            chk.display(),
+            stat.display()
+        );
+        let _serial = testkit::serial();
+        let dir = tempfile::tempdir().unwrap();
+        let (ssz, root) = block(9, [0; 32], 1);
+        {
+            let writer = env::test_writer(dir.path()).unwrap();
+            testkit::import(&writer, &[&ssz], stamp(1, (9, root), (9, root)));
+        }
+        let reader = Reader::open(dir.path()).expect("the env opens read-only");
+        let pid = std::process::id();
+        let (table, row) = reader
+            .read(&deadline(), |_, _| {
+                let out = std::process::Command::new(&stat)
+                    .arg("-r")
+                    .arg(dir.path())
+                    .output()
+                    .unwrap();
+                let table = String::from_utf8_lossy(&out.stdout).into_owned();
+                assert!(out.status.success(), "mdbx_stat -r: {out:?}");
+                let row = reader_rows(&table).into_iter().find(|(p, _)| *p == pid);
+                let chk = std::process::Command::new(&chk)
+                    .arg("-v")
+                    .arg("-c")
+                    .arg(dir.path())
+                    .output()
+                    .unwrap();
+                let text = String::from_utf8_lossy(&chk.stdout);
+                assert!(chk.status.success(), "mdbx_chk -v -c: {chk:?}");
+                assert!(!text.lines().any(|l| l.starts_with(" ~ ")), "{text}");
+                Ok((table, row))
+            })
+            .unwrap()
+            .value;
+        let (_, txnid) = row.unwrap_or_else(|| panic!("pid {pid} is not in the table:\n{table}"));
+        assert_ne!(txnid, "-", "pid {pid} has no live read txn:\n{table}");
+        println!("the reader table lists cl-store's pid {pid} with read txn {txnid}");
+    }
+
+    /// cl-chain's side of [`writer_crash_recovery`]: run as a child of this test binary (with
+    /// [`CHILD_ENV`]), it opens the env as its writer and commits block after block from the
+    /// stored stamp on (block `n` at slot `n`, [`crash_stamp`]), printing `committed <n>` after
+    /// each. With [`CHILD_HOLD`] = `k` it then commits `k` blocks only, writes block `k + 1` in
+    /// a write txn and prints `holding <n>` without committing it. It runs until it is
+    /// killed. A normal run passes straight through.
+    #[test]
+    fn child_writer() {
+        let Some(path) = std::env::var_os(CHILD_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let hold: Option<u64> = std::env::var(CHILD_HOLD).ok().map(|k| k.parse().unwrap());
+        let writer = env::test_writer(&path).unwrap();
+        let from = {
+            let txn = writer.begin_ro_txn().unwrap();
+            store_schema::stamp::read(&txn)
+                .unwrap()
+                .map_or(0, |s| s.head_seq)
+        };
+        let mut chain = crash_chain(from);
+        let mut out = std::io::stdout();
+        for n in from + 1.. {
+            let parent = chain.last().map_or([0; 32], |b| b.1);
+            chain.push(block(n, parent, n));
+            let ssz = &chain[usize::try_from(n - 1).unwrap()].0;
+            if hold.is_some_and(|k| n == from + k + 1) {
+                let txn = store_schema::txn::begin(&writer).unwrap();
+                store_schema::blocks::put::<common::E>(&txn, &common::schedule(), ssz).unwrap();
+                writeln!(out, "holding {n}").unwrap();
+                out.flush().unwrap();
+                std::io::stdin().read_to_end(&mut Vec::new()).unwrap();
+                drop(txn);
+                return;
+            }
+            testkit::import(&writer, &[ssz], crash_stamp(&chain, n));
+            writeln!(out, "committed {n}").unwrap();
+            out.flush().unwrap();
+        }
+    }
+
+    const CHILD_ENV: &str = "CL_STORE_CHILD_WRITER";
+    const CHILD_HOLD: &str = "CL_STORE_CHILD_HOLD";
+
+    /// The finalized block of [`crash_stamp`] trails its head by this many blocks.
+    const CRASH_LAG: u64 = 4;
+
+    /// Blocks `1..=upto` of the crash test's chain: `(ssz, root)`, block `n` at slot `n` on
+    /// block `n - 1`.
+    fn crash_chain(upto: u64) -> Vec<(Vec<u8>, Root)> {
+        let mut chain: Vec<(Vec<u8>, Root)> = Vec::new();
+        for n in 1..=upto {
+            let parent = chain.last().map_or([0; 32], |b| b.1);
+            chain.push(block(n, parent, n));
+        }
+        chain
+    }
+
+    /// The stamp of block `n`'s commit: head `n`, seq `n`, finalized [`CRASH_LAG`] behind.
+    fn crash_stamp(chain: &[(Vec<u8>, Root)], n: u64) -> Stamp {
+        let at = |n: u64| chain[usize::try_from(n - 1).unwrap()].1;
+        let fin = n.saturating_sub(CRASH_LAG).max(1);
+        stamp(n, (n, at(n)), (fin, at(fin)))
+    }
+
+    /// A child writer ([`child_writer`]) and what it printed.
+    struct ChildWriter {
+        child: std::process::Child,
+        lines: std::sync::mpsc::Receiver<String>,
+        last: Option<u64>,
+    }
+
+    impl ChildWriter {
+        fn start(path: &Path, hold: Option<u64>) -> Self {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", "reader::tests::child_writer", "--nocapture"])
+                .args(["--test-threads=1"])
+                .env(CHILD_ENV, path)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped());
+            if let Some(k) = hold {
+                command.env(CHILD_HOLD, k.to_string());
+            }
+            let mut child = command.spawn().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let (tx, lines) = std::sync::mpsc::channel();
+            thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            Self {
+                child,
+                lines,
+                last: None,
+            }
+        }
+
+        /// Waits (at most a minute) for a line `<what> <n>`, `n` at least `at_least`.
+        fn wait(&mut self, what: &str, at_least: u64) -> u64 {
+            let end = Instant::now() + Duration::from_secs(60);
+            loop {
+                let left = end.saturating_duration_since(Instant::now());
+                let line = self
+                    .lines
+                    .recv_timeout(left)
+                    .unwrap_or_else(|_| panic!("no `{what} {at_least}` from the child writer"));
+                let Some((word, n)) = line.split_once(' ') else {
+                    continue;
+                };
+                let Ok(n) = n.parse::<u64>() else { continue };
+                if word == "committed" {
+                    self.last = Some(n);
+                }
+                if word == what && n >= at_least {
+                    return n;
+                }
+            }
+        }
+
+        /// `kill -9`, then everything it printed: the last block it committed.
+        fn kill9(mut self) -> Option<u64> {
+            self.child.kill().unwrap();
+            self.child.wait().unwrap();
+            while let Ok(line) = self.lines.recv_timeout(Duration::from_secs(10)) {
+                if let Some(n) = line.strip_prefix("committed ") {
+                    self.last = n.parse().ok();
+                }
+            }
+            self.last
+        }
+    }
+
+    impl Drop for ChildWriter {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// cl-chain is killed (`SIGKILL`) while it commits, and later restarts. cl-store, reading
+    /// throughout through its [`Recovering`](crate::recover::Recovering) env:
+    ///
+    /// - starts before cl-chain: no env yet, so `Unavailable`, and the next open waits out the
+    ///   reopen backoff on the injected clock (no attempt before it is up, one after);
+    /// - serves cl-chain's commits once it has opened the env;
+    /// - after a kill in the middle of the commit loop, answers `Unavailable` or the last
+    ///   committed stamp (with its block), never an MDBX error, and the same after a kill
+    ///   with a write txn open: the block of that txn is never served;
+    /// - serves the new stamps once cl-chain has restarted and commits again.
+    ///
+    /// cl-store never recovers the env itself: it never opens it but read-only.
+    #[test]
+    fn writer_crash_recovery() {
+        use crate::recover::{
+            tests::{wait, Manual},
+            Recovering, REOPEN_BASE,
+        };
+        let _serial = testkit::serial();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env");
+        let clock = Manual::new();
+        let opener_path = path.clone();
+        let store =
+            Recovering::with_opener(Box::new(move || Reader::open(&opener_path)), clock.clock());
+        let head = |store: &Recovering| store.read(|r| r.block(BlockRef::Head, &deadline()));
+        // A served head: a stamp the writer committed and its own block, or `Unavailable`.
+        let check = |read: &Result<Stamped<Block>, ReadError>| match read {
+            Ok(read) => {
+                let n = read.stamp.head_seq;
+                let chain = crash_chain(n);
+                assert_eq!(read.stamp, crash_stamp(&chain, n));
+                let (ssz, root) = &chain[usize::try_from(n - 1).unwrap()];
+                assert_eq!((&read.value.ssz, read.value.root), (ssz, *root));
+            }
+            Err(err) => assert_eq!(*err, ReadError::Unavailable, "never an MDBX error"),
+        };
+        // Reads until one serves, moving the clock past each reopen delay.
+        let serve = |store: &Recovering| {
+            for _ in 0..100 {
+                let read = head(store);
+                check(&read);
+                if let Ok(read) = read {
+                    return read;
+                }
+                if let Some(at) = store.next_attempt() {
+                    clock.advance(at.saturating_duration_since(clock.now()));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the store never served again");
+        };
+
+        // cl-store starts first: no env.
+        assert_eq!(head(&store), Err(ReadError::Unavailable));
+        assert_eq!(store.reopen_attempts(), 1);
+        let first = wait(&store, &clock);
+        assert!(
+            (REOPEN_BASE / 2..=REOPEN_BASE).contains(&first),
+            "{first:?}"
+        );
+
+        // cl-chain starts and commits; the reopen still waits for its delay.
+        let mut writer = ChildWriter::start(&path, None);
+        writer.wait("committed", 1);
+        assert_eq!(head(&store), Err(ReadError::Unavailable));
+        assert_eq!(store.reopen_attempts(), 1, "no attempt before the delay");
+        clock.advance(first);
+        let read = head(&store);
+        check(&read);
+        assert!(read.is_ok(), "{read:?}");
+        assert_eq!(store.reopen_attempts(), 2);
+
+        // kill -9 in the middle of the commit loop.
+        writer.wait("committed", 20);
+        let last = writer.kill9().unwrap();
+        let after = serve(&store);
+        let seq = after.stamp.head_seq;
+        assert!(
+            seq == last || seq == last + 1,
+            "serves {seq}, the writer's last commit was {last} (or one it did not print)"
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                head(&store),
+                Ok(after.clone()),
+                "nothing moves without a writer"
+            );
+        }
+
+        // cl-chain restarts, commits three blocks, and is killed with a write txn open.
+        let mut writer = ChildWriter::start(&path, Some(3));
+        let held = writer.wait("holding", seq + 4);
+        assert_eq!(held, seq + 4);
+        writer.kill9();
+        let read = serve(&store);
+        assert_eq!(read.stamp.head_seq, seq + 3, "the last committed stamp");
+        let (_, uncommitted) = block(held, read.value.root, held);
+        assert_eq!(
+            store.read(|r| r.block(BlockRef::Root(uncommitted), &deadline())),
+            Err(ReadError::NotFound),
+            "the killed txn's block"
+        );
+
+        // cl-chain restarts and commits: cl-store serves the new stamps.
+        let mut writer = ChildWriter::start(&path, None);
+        let target = writer.wait("committed", seq + 10);
+        let end = Instant::now() + Duration::from_secs(30);
+        while serve(&store).stamp.head_seq < target {
+            assert!(Instant::now() < end, "the new stamps were never served");
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(writer);
     }
 
     /// cl-chain commits 1,000 blocks, each with its stamp, while cl-store reads. Every read's

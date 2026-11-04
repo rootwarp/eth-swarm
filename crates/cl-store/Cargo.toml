@@ -12,16 +12,28 @@ ethswarm-proto = { path = "../ethswarm-proto" }
 ipc = { path = "../ipc" }
 # MPL-2.0, unmodified; the version store-schema pins. Read transactions and their errors.
 libmdbx = "=0.5.6"
+# The follower's gauges and the reopen counter, as svc-runtime's /metrics serves them. The
+# version svc-runtime and cl-verify use; already in Cargo.lock.
+prometheus-client = "0.25.1"
+# The `[store]` table (`settings`). Already in Cargo.lock.
+serde = { version = "1", features = ["derive"] }
 # The env's options, tables, keys and stamp; opened only through `env::open_reader`.
 store-schema = { path = "../store-schema" }
+# The `[store]` table through the service config (`Config::section`).
+svc-runtime = { path = "../svc-runtime" }
 thiserror = "2"
-# `spawn_blocking` for every MDBX read, and the channel of a streamed walk.
-tokio = { version = "1", features = ["rt", "sync"] }
+# `spawn_blocking` for every MDBX read, the channel of a streamed walk, and the follower's
+# task: its backoff sleeps and its select on the stop.
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tokio-stream = "0.1"
 tonic.workspace = true
 prost.workspace = true
+tracing = "0.1"
 
 [dev-dependencies]
+# The follower's tests subscribe to cl-chain's own EventsService (its `events` source) over a
+# Unix socket. A workspace crate: it adds no crate to Cargo.lock.
+cl-chain = { path = "../cl-chain" }
 ipc = { path = "../ipc", features = ["testkit"] }
 network-config = { path = "../network-config" }
 # test-hooks: tests stand in for cl-chain (`env::test_writer`, `txn::seed_unstamped`) and read
@@ -30,7 +42,9 @@ store-schema = { path = "../store-schema", features = ["test-hooks"] }
 # Same crate libmdbx links; `cannot_write` tries writes straight through the C API.
 mdbx-sys = "=12.13.2"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+# cl-chain's EventsService served on a Unix socket (tonic's incoming stream).
+tokio-stream = { version = "0.1", features = ["net"] }
 # Real blocks from store-schema's tests/common, built and encoded in code (no spec vectors).
 alloy-primitives.workspace = true
 consensus-types = { path = "../consensus-types" }

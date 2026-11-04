@@ -4,7 +4,11 @@
 #[path = "../../store-schema/tests/common/mod.rs"]
 pub(crate) mod common;
 
-use std::{borrow::Borrow, sync::Arc, time::Duration};
+use std::{
+    borrow::Borrow,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::Duration,
+};
 
 use store_schema::{
     env::{self, Env, WriterEnv},
@@ -82,4 +86,14 @@ pub(crate) fn stamp(seq: u64, head: (u64, Root), finalized: (u64, Root)) -> Stam
 /// A deadline no test read comes near.
 pub(crate) fn deadline() -> Deadline {
     Deadline::after(system_clock(), Duration::from_secs(600))
+}
+
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// Held by the tests that spawn a child writer or reopen an env another open of this process
+/// just closed: MDBX locks with open-file-description locks, and a child spawned by one test
+/// must not inherit another test's lock fds between fork and exec (cl-chain-columns'
+/// `tests/sole_writer.rs`).
+pub(crate) fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
 }

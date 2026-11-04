@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tests for scripts/mdbx-chk-envs.sh and scripts/build-mdbx-chk.sh.
+# Tests for scripts/mdbx-chk-envs.sh and scripts/build-mdbx-chk.sh (mdbx_chk and mdbx_stat).
 # Run: bash scripts/tests/mdbx-chk-envs.test.sh
 # Builds mdbx_chk once from the pinned sources and fills one env with cl-chain-columns'
 # fill_env example (blocks and stamps through store-schema, columns through ColumnWriter;
@@ -43,6 +43,10 @@ chk="$tmp/bin/mdbx_chk"
 check pass "the build names the pinned source and its VERSION.txt" "mdbx-sys-12.13.2/libmdbx" \
   cat "$tmp/build.log"
 check pass "the binary is that libmdbx" "mdbx_chk version 0.12.13.5" "$chk" -V
+check pass "mdbx_stat is built beside it, from the same libmdbx" "mdbx_stat version 0.12.13.5" \
+  "$tmp/bin/mdbx_stat" -V
+check pass "the build prints mdbx_chk's path last (what mdbx-chk-envs.sh runs)" "$chk" \
+  tail -n 1 "$tmp/build.log"
 
 cargo run --quiet --locked --manifest-path "$repo/Cargo.toml" -p cl-chain-columns \
   --example fill_env -- "$tmp/clean" > /dev/null
@@ -129,6 +133,7 @@ check fail "build: a VERSION.txt other than 0.12.13.5" "not 0.12.13.5" \
   env CARGO="$tmp/stub/cargo" bash "$build" "$tmp/out3"
 check fail "build: a failing compiler" "" env CC=false bash "$build" "$tmp/out4"
 check pass "build: a failed build leaves no binary" "" test ! -e "$tmp/out4/mdbx_chk"
+check pass "build: ... and no mdbx_stat" "" test ! -e "$tmp/out4/mdbx_stat"
 
 echo "passed $passed, failed $failed"
 ((failed == 0))
