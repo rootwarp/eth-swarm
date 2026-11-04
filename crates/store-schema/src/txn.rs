@@ -4,7 +4,7 @@
 //! fails CI on one outside this file. The writer's open commits through `commit_open`, called
 //! only from [`crate::env::open_writer_with`] (the same script enforces that).
 //!
-//! A write transaction begins with `begin` and commits with [`commit`]:
+//! A write transaction begins with [`begin`] and commits with [`commit`]:
 //!
 //! ```no_run
 //! use libmdbx::WriteFlags;
@@ -51,15 +51,156 @@
 //! }
 //! ```
 
-use libmdbx::WriteFlags;
+use libmdbx::{Cursor, Decodable, NoWriteMap, Table, Transaction, TransactionKind, WriteFlags, RW};
 
 use crate::{
-    env::RwTxn,
+    env::WriterEnv,
     keys::STAMP_KEY,
     stamp::{self, Stamp},
     tables::{BLOCKS, BLOCK_INDEX, META},
     Error, Result,
 };
+
+/// A write transaction of the env ([`begin`], and [`open_writer_with`]'s upgrade hook). It has
+/// no commit of its own and, but for the `test-hooks` seam (a shared reference), no way to the
+/// libmdbx transaction inside it: it commits only through [`commit`]; dropped, it aborts and
+/// writes nothing.
+///
+/// [`open_writer_with`]: crate::env::open_writer_with
+#[derive(Debug)]
+pub struct RwTxn<'env>(Transaction<'env, RW, NoWriteMap>);
+
+impl<'env> RwTxn<'env> {
+    pub(crate) fn new(txn: Transaction<'env, RW, NoWriteMap>) -> Self {
+        Self(txn)
+    }
+
+    /// The libmdbx transaction, for this crate's own reads and table creation.
+    pub(crate) fn raw(&self) -> &Transaction<'env, RW, NoWriteMap> {
+        &self.0
+    }
+
+    /// The libmdbx transaction back, for this crate's tests that commit rows raw, as no writer
+    /// path may (blocks with no stamp).
+    #[cfg(test)]
+    pub(crate) fn into_raw(self) -> Transaction<'env, RW, NoWriteMap> {
+        self.0
+    }
+
+    /// The libmdbx transaction, for tests that change a store as no writer path may (drop a
+    /// table). Only with the `test-hooks` feature; a shared reference, so it cannot commit.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn raw_txn(&self) -> &Transaction<'env, RW, NoWriteMap> {
+        self.raw()
+    }
+
+    /// libmdbx's `Transaction::open_table`.
+    pub fn open_table(&self, name: Option<&str>) -> libmdbx::Result<Table<'_>> {
+        self.0.open_table(name)
+    }
+
+    /// libmdbx's `Transaction::get`.
+    pub fn get<'txn, V: Decodable<'txn>>(
+        &'txn self,
+        table: &Table<'txn>,
+        key: &[u8],
+    ) -> libmdbx::Result<Option<V>> {
+        self.0.get(table, key)
+    }
+
+    /// libmdbx's `Transaction::cursor`.
+    pub fn cursor<'txn>(&'txn self, table: &Table<'txn>) -> libmdbx::Result<Cursor<'txn, RW>> {
+        self.0.cursor(table)
+    }
+
+    /// libmdbx's `Transaction::put`.
+    pub fn put<'txn>(
+        &'txn self,
+        table: &Table<'txn>,
+        key: impl AsRef<[u8]>,
+        data: impl AsRef<[u8]>,
+        flags: WriteFlags,
+    ) -> libmdbx::Result<()> {
+        self.0.put(table, key, data, flags)
+    }
+
+    /// libmdbx's `Transaction::del`: whether a row was deleted.
+    pub fn del<'txn>(
+        &'txn self,
+        table: &Table<'txn>,
+        key: impl AsRef<[u8]>,
+        data: Option<&[u8]>,
+    ) -> libmdbx::Result<bool> {
+        self.0.del(table, key, data)
+    }
+}
+
+/// The reads of a transaction of the env, a write one ([`RwTxn`]) or a libmdbx read one: what a
+/// read helper that runs in both takes, as `&impl ReadTxn`.
+pub trait ReadTxn {
+    /// The kind of the transaction's cursors.
+    type Kind: TransactionKind;
+
+    /// libmdbx's `Transaction::open_table`.
+    fn open_table(&self, name: Option<&str>) -> libmdbx::Result<Table<'_>>;
+
+    /// libmdbx's `Transaction::get`.
+    fn get<'txn, V: Decodable<'txn>>(
+        &'txn self,
+        table: &Table<'txn>,
+        key: &[u8],
+    ) -> libmdbx::Result<Option<V>>;
+
+    /// libmdbx's `Transaction::cursor`.
+    fn cursor<'txn>(&'txn self, table: &Table<'txn>) -> libmdbx::Result<Cursor<'txn, Self::Kind>>;
+}
+
+impl ReadTxn for RwTxn<'_> {
+    type Kind = RW;
+
+    fn open_table(&self, name: Option<&str>) -> libmdbx::Result<Table<'_>> {
+        RwTxn::open_table(self, name)
+    }
+
+    fn get<'txn, V: Decodable<'txn>>(
+        &'txn self,
+        table: &Table<'txn>,
+        key: &[u8],
+    ) -> libmdbx::Result<Option<V>> {
+        RwTxn::get(self, table, key)
+    }
+
+    fn cursor<'txn>(&'txn self, table: &Table<'txn>) -> libmdbx::Result<Cursor<'txn, RW>> {
+        RwTxn::cursor(self, table)
+    }
+}
+
+impl<K: TransactionKind> ReadTxn for Transaction<'_, K, NoWriteMap> {
+    type Kind = K;
+
+    fn open_table(&self, name: Option<&str>) -> libmdbx::Result<Table<'_>> {
+        Transaction::open_table(self, name)
+    }
+
+    fn get<'txn, V: Decodable<'txn>>(
+        &'txn self,
+        table: &Table<'txn>,
+        key: &[u8],
+    ) -> libmdbx::Result<Option<V>> {
+        Transaction::get(self, table, key)
+    }
+
+    fn cursor<'txn>(&'txn self, table: &Table<'txn>) -> libmdbx::Result<Cursor<'txn, K>> {
+        Transaction::cursor(self, table)
+    }
+}
+
+/// A write transaction of `writer`'s env. It commits only through [`commit`].
+pub fn begin(writer: &WriterEnv) -> Result<RwTxn<'_>> {
+    writer.begin_rw_txn()
+}
 
 /// The stamp row a commit writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,7 +294,7 @@ fn write(txn: RwTxn<'_>, stamp: Option<Stamp>) -> Result<Option<Stamp>> {
         let meta = txn.open_table(Some(META))?;
         txn.put(&meta, STAMP_KEY, stamp.encode(), WriteFlags::UPSERT)?;
     }
-    txn.commit().map_err(Error::from)?;
+    txn.0.commit().map_err(Error::from)?;
     Ok(stamp)
 }
 
@@ -265,7 +406,7 @@ mod tests {
     /// `table`, and the env exactly as before: every table's rows, and still no stamp row.
     fn carry_refused(writer: &WriterEnv, table: &str) {
         let before = snapshot(writer);
-        let txn = writer.env().begin_rw_txn().unwrap();
+        let txn = begin(writer).unwrap();
         put_state(&txn, b"one");
         put_column(&txn, &column_key(5, &A, 0));
         let err = commit(txn, Update::Carry).unwrap_err();
@@ -288,14 +429,14 @@ mod tests {
     #[test]
     fn carry_before_the_first_stamp_writes_no_stamp() {
         let (_empty, writer) = fresh();
-        let txn = writer.env().begin_rw_txn().unwrap();
+        let txn = begin(&writer).unwrap();
         put_state(&txn, b"one");
         assert_eq!(commit(txn, Update::Carry).unwrap(), None);
         assert!(has_state(&writer, b"one"));
         assert_eq!(stamp_row(&writer), None);
 
         let (_dir, writer) = env_with_blocks();
-        let txn = writer.env().begin_rw_txn().unwrap();
+        let txn = begin(&writer).unwrap();
         put_state(&txn, b"one");
         let err = commit(txn, Update::Carry).unwrap_err();
         assert!(
@@ -331,7 +472,7 @@ mod tests {
         let (_dir, writer) = fresh();
         let before = snapshot(&writer);
         let (ssz, root) = fulu_block_ssz(5, [0; 32], 1);
-        let txn = writer.env().begin_rw_txn().unwrap();
+        let txn = begin(&writer).unwrap();
         assert_eq!(
             blocks::put::<E>(&txn, &schedule(), &ssz).unwrap(),
             (5, root)
@@ -344,7 +485,7 @@ mod tests {
         );
         assert_eq!(snapshot(&writer), before);
 
-        let txn = writer.env().begin_rw_txn().unwrap();
+        let txn = begin(&writer).unwrap();
         let index = txn.open_table(Some(BLOCK_INDEX)).unwrap();
         txn.put(&index, root, 5u64.to_be_bytes(), WriteFlags::UPSERT)
             .unwrap();
@@ -368,7 +509,7 @@ mod tests {
     fn carry_of_columns_before_any_block_commits_without_a_stamp() {
         let (_dir, writer) = fresh();
         let key = column_key(5, &A, 3);
-        let txn = writer.env().begin_rw_txn().unwrap();
+        let txn = begin(&writer).unwrap();
         put_column(&txn, &key);
         let meta = txn.open_table(Some(META)).unwrap();
         txn.put(&meta, b"cgc", 8u64.to_be_bytes(), WriteFlags::UPSERT)
@@ -386,7 +527,7 @@ mod tests {
         let schedule = schedule();
         let (ssz_a, a) = fulu_block_ssz(5, [0; 32], 1);
         let (ssz_b, b) = fulu_block_ssz(9, a, 2);
-        let txn = writer.env().begin_rw_txn().unwrap();
+        let txn = begin(&writer).unwrap();
         blocks::put::<E>(&txn, &schedule, &ssz_a).unwrap();
         blocks::put::<E>(&txn, &schedule, &ssz_b).unwrap();
         let stamp = Stamp {
@@ -401,7 +542,7 @@ mod tests {
         assert_eq!(row, stamp.encode());
 
         let key = column_key(9, &b, 0);
-        let txn = writer.env().begin_rw_txn().unwrap();
+        let txn = begin(&writer).unwrap();
         put_state(&txn, b"two");
         put_column(&txn, &key);
         assert_eq!(commit(txn, Update::Carry).unwrap(), Some(stamp));
@@ -414,12 +555,12 @@ mod tests {
     #[test]
     fn carry_keeps_the_stamp_unchanged() {
         let (_dir, writer) = env_with_blocks();
-        let txn = writer.env().begin_rw_txn().unwrap();
+        let txn = begin(&writer).unwrap();
         put_state(&txn, b"one");
         assert_eq!(commit(txn, Update::New(valid())).unwrap(), Some(valid()));
         let row = stamp_row(&writer).unwrap();
         assert_eq!(row, valid().encode());
-        let txn = writer.env().begin_rw_txn().unwrap();
+        let txn = begin(&writer).unwrap();
         put_state(&txn, b"two");
         assert_eq!(commit(txn, Update::Carry).unwrap(), Some(valid()));
         assert!(has_state(&writer, b"two"));
@@ -438,7 +579,7 @@ mod tests {
                 .unwrap();
             txn.commit().unwrap();
         }
-        let txn = writer.env().begin_rw_txn().unwrap();
+        let txn = begin(&writer).unwrap();
         put_state(&txn, b"one");
         let err = commit(txn, Update::Carry).unwrap_err();
         assert!(matches!(err, Error::MalformedStamp { len: 87 }), "{err:?}");
@@ -450,7 +591,7 @@ mod tests {
     fn stamped() -> (tempfile::TempDir, WriterEnv) {
         let (dir, writer) = env_with_blocks();
         seed_blocks(&writer, &[(3, C), (12, D)]);
-        let txn = writer.env().begin_rw_txn().unwrap();
+        let txn = begin(&writer).unwrap();
         assert_eq!(commit(txn, Update::New(valid())).unwrap(), Some(valid()));
         (dir, writer)
     }
@@ -460,7 +601,7 @@ mod tests {
     fn new_refused(writer: &WriterEnv, new: Stamp) -> Error {
         let before = snapshot(writer);
         let row = stamp_row(writer).expect("a stored stamp");
-        let txn = writer.env().begin_rw_txn().unwrap();
+        let txn = begin(writer).unwrap();
         put_state(&txn, b"refused");
         let err = commit(txn, Update::New(new)).unwrap_err();
         assert_eq!(stamp_row(writer).unwrap(), row, "{new:?} rewrote the stamp");
@@ -470,7 +611,7 @@ mod tests {
 
     /// Commits `new` with the state row `state`; expects it committed, the stamp row `new`.
     fn new_accepted(writer: &WriterEnv, new: Stamp, state: &[u8]) {
-        let txn = writer.env().begin_rw_txn().unwrap();
+        let txn = begin(writer).unwrap();
         put_state(&txn, state);
         assert_eq!(commit(txn, Update::New(new)).unwrap(), Some(new), "{new:?}");
         assert_eq!(stamp_row(writer).unwrap(), new.encode(), "{new:?}");
@@ -643,7 +784,10 @@ mod tests {
         let NoRawCommit = (&mut txn).commit();
         let NoRawCommit = (&txn).commit();
         let NoRawCommit = txn.commit();
-        assert!(!has_state(&writer, b"dropped"), "a dropped RwTxn wrote its rows");
+        assert!(
+            !has_state(&writer, b"dropped"),
+            "a dropped RwTxn wrote its rows"
+        );
 
         let txn = begin(&writer).unwrap();
         put_state(&txn, b"committed");
