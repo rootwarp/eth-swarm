@@ -7,25 +7,52 @@ use std::path::Path;
 use std::time::Duration;
 
 use libmdbx::{
-    Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, SyncMode, TableFlags,
-    Transaction, RO, RW,
+    Cursor, Database, DatabaseOptions, Decodable, Mode, NoWriteMap, ReadWriteOptions, Stat,
+    SyncMode, Table, TableFlags, Transaction, RO,
 };
 
 use crate::{
     blocks,
     tables::{self, BLOCK_INDEX, MAX_TABLES, TABLES},
-    txn, version, Error, Result,
+    txn::{self, RwTxn},
+    version, Error, Result,
 };
 
 /// The env handle.
 pub type Env = Database<NoWriteMap>;
 
-/// A write transaction of the env, as [`open_writer_with`]'s upgrade hook and
-/// [`WriterEnv::begin_rw_txn`] give it. It commits through [`txn::commit`] only.
-pub type RwTxn<'env> = Transaction<'env, RW, NoWriteMap>;
+/// A read transaction of the env ([`WriterEnv::begin_ro_txn`], or [`begin_reader_txn`] for an
+/// env [`open_reader`] opened). It only reads: it has no way to the libmdbx transaction inside
+/// it, whose `db()` would hand out the env and with it a raw write transaction, committed past
+/// [`txn::commit`].
+#[derive(Debug)]
+pub struct RoTxn<'env>(Transaction<'env, RO, NoWriteMap>);
 
-/// A read transaction of the env ([`WriterEnv::begin_ro_txn`]).
-pub type RoTxn<'env> = Transaction<'env, RO, NoWriteMap>;
+impl RoTxn<'_> {
+    /// libmdbx's `Transaction::open_table`.
+    pub fn open_table(&self, name: Option<&str>) -> libmdbx::Result<Table<'_>> {
+        self.0.open_table(name)
+    }
+
+    /// libmdbx's `Transaction::get`.
+    pub fn get<'txn, V: Decodable<'txn>>(
+        &'txn self,
+        table: &Table<'txn>,
+        key: &[u8],
+    ) -> libmdbx::Result<Option<V>> {
+        self.0.get(table, key)
+    }
+
+    /// libmdbx's `Transaction::cursor`.
+    pub fn cursor<'txn>(&'txn self, table: &Table<'txn>) -> libmdbx::Result<Cursor<'txn, RO>> {
+        self.0.cursor(table)
+    }
+
+    /// libmdbx's `Transaction::table_stat`.
+    pub fn table_stat<'txn>(&'txn self, table: &Table<'txn>) -> libmdbx::Result<Stat> {
+        self.0.table_stat(table)
+    }
+}
 
 /// Default upper bound of the memory map, 256 GiB. Only address space is reserved up front; the
 /// file grows in 256 MiB steps.
@@ -86,7 +113,7 @@ fn options(mode: Mode) -> DatabaseOptions {
 pub struct WriterEnv {
     // Field order is drop order: close the data env before releasing the guard.
     env: Env,
-    guard: WriterGuard,
+    _guard: WriterGuard,
 }
 
 /// The held writer guard; dropping it lets the next writer in.
@@ -97,7 +124,7 @@ pub struct WriterGuard {
 
 impl WriterEnv {
     /// The env itself, inside this crate. Outside it, a write transaction comes from
-    /// [`Self::begin_rw_txn`], whose only commit is [`txn::commit`].
+    /// [`txn::begin`], an [`RwTxn`] whose only commit is [`txn::commit`].
     #[must_use]
     pub(crate) fn env(&self) -> &Env {
         &self.env
@@ -114,23 +141,22 @@ impl WriterEnv {
 
     /// A read transaction of the env.
     pub fn begin_ro_txn(&self) -> Result<RoTxn<'_>> {
-        Ok(self.env().begin_ro_txn()?)
+        Ok(RoTxn(self.env().begin_ro_txn()?))
     }
 
-    /// A write transaction of the env. Commit it through [`txn::commit`], which writes the
-    /// stamp row: a raw `commit()` in the crates that write the env fails
-    /// `scripts/check-stamped-commits.sh`.
-    pub fn begin_rw_txn(&self) -> Result<RwTxn<'_>> {
-        Ok(self.env().begin_rw_txn()?)
+    /// A write transaction of the env, inside this crate; outside it, [`txn::begin`]. It
+    /// commits only through [`txn::commit`].
+    pub(crate) fn begin_rw_txn(&self) -> Result<RwTxn<'_>> {
+        Ok(RwTxn::new(self.env().begin_rw_txn()?))
     }
 
-    /// The env and the guard apart, for a caller that keeps the env elsewhere
-    /// (cl-chain-columns). Drop the env before the guard. Every write transaction of that env
-    /// still commits through [`txn::commit`]; `scripts/check-stamped-commits.sh` enforces it in
-    /// the crates that write the env.
+    /// The env and the guard apart, for tests only (the `test-hooks` feature): the env itself
+    /// begins raw write transactions. Drop the env before the guard.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
     #[must_use]
     pub fn into_parts(self) -> (Env, WriterGuard) {
-        (self.env, self.guard)
+        (self.env, self._guard)
     }
 }
 
@@ -173,15 +199,16 @@ where
         _env: lock_writer(path)?,
     };
     let env = open_rw(path, opts)?;
-    let txn = env.begin_rw_txn().map_err(Error::from)?;
-    let upgrade_version = version::check_writer(&txn)?;
-    tables::check_known(&txn)?;
+    let txn = RwTxn::new(env.begin_rw_txn().map_err(Error::from)?);
+    let upgrade_version = version::check_writer(txn.raw())?;
+    tables::check_known(txn.raw())?;
     let mut created = Vec::new();
     for table in TABLES {
         match txn.open_table(Some(table)) {
             Ok(_) => {}
             Err(libmdbx::Error::NotFound) => {
-                txn.create_table(Some(table), TableFlags::empty())
+                txn.raw()
+                    .create_table(Some(table), TableFlags::empty())
                     .map_err(Error::from)?;
                 created.push(table);
             }
@@ -193,10 +220,10 @@ where
     }
     upgrade(&txn, &created)?;
     if upgrade_version {
-        version::write(&txn)?;
+        version::write(txn.raw())?;
     }
     txn::commit_open(txn)?;
-    Ok(WriterEnv { env, guard })
+    Ok(WriterEnv { env, _guard: guard })
 }
 
 /// Opens an existing env with `MDBX_RDONLY` (no write txn at all) and the writer's options,
@@ -210,6 +237,12 @@ pub fn open_reader(path: &Path) -> Result<Env> {
         tables::check_known(&txn)?;
     }
     Ok(env)
+}
+
+/// A read transaction of an env [`open_reader`] opened. The caller holds the env already; the
+/// [`RoTxn`] adds no way back to it.
+pub fn begin_reader_txn(env: &Env) -> Result<RoTxn<'_>> {
+    Ok(RoTxn(env.begin_ro_txn()?))
 }
 
 /// [`open_rw_with`] with the production pace and opener.

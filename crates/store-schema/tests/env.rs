@@ -713,7 +713,7 @@ fn meta_row_in_commit() {
         for i in 0..1000u64 {
             // A column chunk of the block before: carries that block's stamp, or none yet.
             if let Some(&(slot, root)) = chain.last() {
-                let txn = writer.begin_rw_txn().unwrap();
+                let txn = txn::begin(&writer).unwrap();
                 let before = stamp::read(&txn).unwrap();
                 let columns = txn.open_table(Some(COLUMNS)).unwrap();
                 for index in (i % 8) * 16..(i % 8 + 1) * 16 {
@@ -724,7 +724,7 @@ fn meta_row_in_commit() {
                 assert_eq!(txn::commit(txn, Update::Carry).unwrap(), before);
             }
             let (ssz, _) = common::fulu_block_ssz(i + 1, parent, i);
-            let txn = writer.begin_rw_txn().unwrap();
+            let txn = txn::begin(&writer).unwrap();
             let (slot, root) = blocks::put::<common::E>(&txn, &schedule, &ssz).unwrap();
             chain.push((slot, root));
             let (finalized_slot, finalized_root) = chain[chain.len().saturating_sub(65)];

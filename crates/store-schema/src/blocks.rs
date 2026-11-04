@@ -5,9 +5,9 @@ use consensus_types::{forked::SignedBeaconBlock, EthSpec, ForkSchedule};
 use libmdbx::WriteFlags;
 
 use crate::{
-    env::RwTxn,
     keys::{decode_slot_root_key, slot_root_key, Root},
     tables::{BLOCKS, BLOCK_INDEX},
+    txn::RwTxn,
     Error, Result,
 };
 
@@ -115,11 +115,11 @@ mod tests {
             let schedule = schedule();
             let mut want = BTreeMap::new();
             let mut parent = [0; 32];
-            let mut txn = Some(writer.env().begin_rw_txn().unwrap());
+            let mut txn = Some(writer.begin_rw_txn().unwrap());
             let mut pending = BTreeMap::new();
             for (i, (slot, salt, aborted)) in puts.iter().enumerate() {
                 let (ssz, root) = fulu_block_ssz(*slot, parent, *salt);
-                let open = txn.get_or_insert_with(|| writer.env().begin_rw_txn().unwrap());
+                let open = txn.get_or_insert_with(|| writer.begin_rw_txn().unwrap());
                 prop_assert_eq!(put::<E>(open, &schedule, &ssz).unwrap(), (*slot, root));
                 // The same block again is the same two rows.
                 prop_assert_eq!(put::<E>(open, &schedule, &ssz).unwrap(), (*slot, root));
@@ -132,7 +132,7 @@ mod tests {
                     } else {
                         // Raw: blocks with no stamp, which `txn::commit` refuses
                         // (`Error::StampMissing`). Only the two tables are under test.
-                        open.commit().unwrap();
+                        open.into_raw().commit().unwrap();
                         want.append(&mut pending);
                     }
                     pending.clear();
@@ -161,7 +161,7 @@ mod tests {
             "not the signed container's root"
         );
 
-        let txn = writer.env().begin_rw_txn().unwrap();
+        let txn = writer.begin_rw_txn().unwrap();
         assert_eq!(put::<E>(&txn, &schedule(), &ssz).unwrap(), (12, root));
         // The same message at another slot is another block, under its own root.
         let mut moved = block.clone();
@@ -193,7 +193,7 @@ mod tests {
             assert!(matches!(err, Error::Block(_)), "{err:?}");
         }
         // Raw: blocks with no stamp, which `txn::commit` refuses (`Error::StampMissing`).
-        txn.commit().unwrap();
+        txn.into_raw().commit().unwrap();
 
         let (blocks, index) = tables(&writer);
         assert_eq!(

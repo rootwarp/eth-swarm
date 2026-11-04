@@ -23,6 +23,9 @@ thiserror = "2"
 store-schema = { path = "../store-schema" }
 
 [dev-dependencies]
+# test-hooks: tests reach the env itself (`WriterEnv::raw_env`) and a write txn's libmdbx txn
+# (`RwTxn::raw_txn`) to write rows no writer path may, committed raw.
+store-schema = { path = "../store-schema", features = ["test-hooks"] }
 # Same crate libmdbx links; tests read env flags and options straight from the C API.
 mdbx-sys = "=12.13.2"
 proptest = "1"

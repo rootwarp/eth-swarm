@@ -8,8 +8,8 @@ use std::{
     thread,
 };
 
-use libmdbx::{NoWriteMap, Transaction, WriteFlags, RW};
-use store_schema::{env::WriterGuard, txn::Update};
+use libmdbx::WriteFlags;
+use store_schema::txn::{ReadTxn, RwTxn, Update};
 
 use crate::{
     env::{self, WriterOptions},
@@ -104,8 +104,6 @@ enum Commit<T> {
     /// Nothing changed: drop (abort) the txn and don't count it.
     No(T),
 }
-
-type RwTxn<'db> = Transaction<'db, RW, NoWriteMap>;
 
 /// Orphan tombstones: roots pruned by [`ColumnWriter::prune_orphaned`], with their slot if any
 /// column of them was stored, so no later write brings them back (see
@@ -207,7 +205,8 @@ impl Hooks {
 /// chunk in flight, and admits one background txn after a bounded run of imports.
 #[derive(Debug)]
 pub struct ColumnWriter {
-    // Field order is drop order: close the data env before releasing the guard.
+    /// Reads through the writer's env, which holds the writer guard
+    /// ([`store_schema::env::WriterEnv`]).
     reader: ColumnReader,
     /// Serialises column writes and prunes, so a prune never lands between two chunks of one
     /// block's write and leaves the later chunks behind as orphans. Holds the orphan
@@ -217,7 +216,6 @@ pub struct ColumnWriter {
     rw_txns: AtomicU64,
     stamped_txns: AtomicU64,
     hooks: Hooks,
-    _guard: WriterGuard,
 }
 
 impl ColumnWriter {
@@ -236,13 +234,13 @@ impl ColumnWriter {
     /// [`ColumnWriter::open`] with explicit options. Blocks the same way.
     pub fn open_with(path: impl AsRef<Path>, options: WriterOptions) -> Result<Self> {
         let path = path.as_ref();
-        let (db, guard) = env::open_rw(path, options)?;
+        let db = env::open_rw(path, options)?;
         let pending = {
             let txn = db.begin_ro_txn()?;
             pending_links(&txn)?
         };
         Ok(Self {
-            reader: ColumnReader::from_env(db),
+            reader: ColumnReader::from_writer(db),
             column_ops: Mutex::new(Orphans {
                 pending,
                 ..Orphans::default()
@@ -251,7 +249,6 @@ impl ColumnWriter {
             rw_txns: AtomicU64::new(0),
             stamped_txns: AtomicU64::new(0),
             hooks: Hooks::default(),
-            _guard: guard,
         })
     }
 
@@ -984,9 +981,7 @@ pub(crate) fn raise_contiguous(txn: &RwTxn<'_>, slot: u64) -> Result<()> {
 }
 
 /// Every stored block's pending link, by the root it waits for.
-fn pending_links<K: libmdbx::TransactionKind>(
-    txn: &Transaction<'_, K, NoWriteMap>,
-) -> Result<HashMap<BlockRoot, Vec<(BlockRoot, u64)>>> {
+fn pending_links(txn: &impl ReadTxn) -> Result<HashMap<BlockRoot, Vec<(BlockRoot, u64)>>> {
     let links = txn.open_table(Some(LINKS_TABLE))?;
     let mut cursor = txn.cursor(&links)?;
     let mut out: HashMap<BlockRoot, Vec<(BlockRoot, u64)>> = HashMap::new();
@@ -1048,7 +1043,7 @@ pub(crate) fn make_legacy_for_test(writer: &ColumnWriter) {
     let txn = writer.reader.db.begin_rw_txn().unwrap();
     let links = txn.open_table(Some(LINKS_TABLE)).unwrap();
     // SAFETY: no other handle of the table is open in this test.
-    unsafe { txn.drop_table(links).unwrap() };
+    unsafe { txn.raw_txn().drop_table(links).unwrap() };
     let meta = txn.open_table(Some(META_TABLE)).unwrap();
     let _ = txn.del(&meta, CONTIGUOUS_FROM_KEY, None);
     store_schema::txn::commit(txn, Update::Carry).unwrap();
@@ -1124,7 +1119,7 @@ mod tests {
     fn env_opens_with_max_tables() {
         let dir = tempfile::tempdir().unwrap();
         let writer = ColumnWriter::open(dir.path()).unwrap();
-        let env = writer.reader.db.ptr().0;
+        let env = writer.reader.db.raw().ptr().0;
 
         let mut flags = 0;
         assert_eq!(unsafe { mdbx_sys::mdbx_env_get_flags(env, &mut flags) }, 0);
@@ -1155,7 +1150,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let writer = ColumnWriter::open(dir.path()).unwrap();
         {
-            let txn = writer.reader.db.begin_rw_txn().unwrap();
+            let txn = writer.reader.db.raw().begin_rw_txn().unwrap();
             for table in store_schema::tables::TABLES {
                 txn.open_table(Some(table))
                     .unwrap_or_else(|e| panic!("table {table} missing: {e}"));
@@ -1383,7 +1378,7 @@ mod tests {
 
     /// Stores `link` for `root` as it is, bypassing every rule: rows of an older schema.
     fn put_raw_link(writer: &ColumnWriter, root: &BlockRoot, value: &[u8]) {
-        let txn = writer.reader.db.begin_rw_txn().unwrap();
+        let txn = writer.reader.db.raw().begin_rw_txn().unwrap();
         let links = txn.open_table(Some(LINKS_TABLE)).unwrap();
         txn.put(&links, root, value, WriteFlags::UPSERT).unwrap();
         txn.commit().unwrap();
@@ -1684,7 +1679,7 @@ mod tests {
         // The stamp's head block gone: the stamp no longer validates, so the chunk txn fails
         // and stores nothing.
         {
-            let txn = writer.reader.db.begin_rw_txn().unwrap();
+            let txn = writer.reader.db.raw().begin_rw_txn().unwrap();
             let blocks = txn.open_table(Some(store_schema::tables::BLOCKS)).unwrap();
             let key = store_schema::keys::slot_root_key(6, &[0xee; 32]);
             txn.del(&blocks, key, None).unwrap();
@@ -2051,7 +2046,7 @@ mod tests {
         {
             let txn = writer.reader.db.begin_rw_txn().unwrap();
             raise_watermark(&txn, 10).unwrap();
-            txn.commit().unwrap();
+            store_schema::txn::commit(txn, Update::Carry).unwrap();
         }
         assert_eq!(reader.retained_from().unwrap(), Some(11));
         writer.finalize(12, &HashSet::new(), 13).unwrap();
@@ -2258,7 +2253,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(writer.reader().db.info().unwrap().map_size(), MIN_MAX_SIZE);
+        assert_eq!(
+            writer.reader().db.raw().info().unwrap().map_size(),
+            MIN_MAX_SIZE
+        );
     }
 
     #[test]
@@ -2273,7 +2271,7 @@ mod tests {
         drop(ColumnWriter::open_with(dir.path(), small).unwrap());
         let writer = ColumnWriter::open_with(dir.path(), large).unwrap();
         assert_eq!(
-            writer.reader().db.info().unwrap().map_size(),
+            writer.reader().db.raw().info().unwrap().map_size(),
             2 * MIN_MAX_SIZE
         );
     }

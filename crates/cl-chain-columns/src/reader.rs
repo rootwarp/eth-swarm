@@ -1,6 +1,10 @@
 use std::{borrow::Cow, path::Path};
 
-use libmdbx::{Decodable, NoWriteMap, Table, Transaction, TransactionKind, RO};
+use libmdbx::{Decodable, Table};
+use store_schema::{
+    env::{RoTxn, WriterEnv},
+    txn::{self, ReadTxn, RwTxn},
+};
 
 use crate::{
     env,
@@ -111,13 +115,47 @@ const DEADLINE_EVERY: usize = 64;
 /// written yet.
 #[derive(Debug)]
 pub struct ColumnReader {
-    pub(crate) db: env::Env,
+    pub(crate) db: Db,
+}
+
+/// The env a [`ColumnReader`] reads: opened read-only, or the writer's own (with its guard).
+#[derive(Debug)]
+pub(crate) enum Db {
+    ReadOnly(env::Env),
+    Writer(WriterEnv),
+}
+
+impl Db {
+    pub(crate) fn begin_ro_txn(&self) -> Result<RoTxn<'_>> {
+        Ok(match self {
+            Self::ReadOnly(env) => store_schema::env::begin_reader_txn(env)?,
+            Self::Writer(env) => env.begin_ro_txn()?,
+        })
+    }
+
+    /// A write transaction, of the writer's env ([`txn::begin`]); an env opened read-only has
+    /// none, and is refused as MDBX refuses it (`EACCES`).
+    pub(crate) fn begin_rw_txn(&self) -> Result<RwTxn<'_>> {
+        match self {
+            Self::ReadOnly(_) => Err(libmdbx::Error::Access.into()),
+            Self::Writer(env) => Ok(txn::begin(env)?),
+        }
+    }
+
+    /// The env itself, for tests (store-schema's `test-hooks`).
+    #[cfg(test)]
+    pub(crate) fn raw(&self) -> &env::Env {
+        match self {
+            Self::ReadOnly(env) => env,
+            Self::Writer(env) => env.raw_env(),
+        }
+    }
 }
 
 /// One read transaction over the store: every value read through it is of the same state
 /// ([`ColumnReader::snapshot`]).
 pub struct Snapshot<'r> {
-    txn: Transaction<'r, RO, NoWriteMap>,
+    txn: RoTxn<'r>,
     legacy: bool,
 }
 
@@ -133,12 +171,14 @@ impl ColumnReader {
     /// Opens an env the writer has already created.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
-            db: env::open_ro(path.as_ref())?,
+            db: Db::ReadOnly(env::open_ro(path.as_ref())?),
         })
     }
 
-    pub(crate) fn from_env(db: env::Env) -> Self {
-        Self { db }
+    pub(crate) fn from_writer(env: WriterEnv) -> Self {
+        Self {
+            db: Db::Writer(env),
+        }
     }
 
     /// One read transaction to read several values of one state through; whether the env has
@@ -469,9 +509,7 @@ impl Snapshot<'_> {
 }
 
 /// The slot after the highest stored column's, `None` with no column.
-pub(crate) fn after_highest_block<K: TransactionKind>(
-    txn: &Transaction<'_, K, NoWriteMap>,
-) -> Result<Option<u64>> {
+pub(crate) fn after_highest_block(txn: &impl ReadTxn) -> Result<Option<u64>> {
     let columns = txn.open_table(Some(COLUMNS_TABLE))?;
     let Some((key, ())) = txn.cursor(&columns)?.last::<Vec<u8>, ()>()? else {
         return Ok(None);
@@ -483,18 +521,12 @@ pub(crate) fn after_highest_block<K: TransactionKind>(
 }
 
 /// Slot recorded for `block_root` in [`ROOTS_TABLE`].
-pub(crate) fn stored_slot<K: TransactionKind>(
-    txn: &Transaction<'_, K, NoWriteMap>,
-    block_root: &BlockRoot,
-) -> Result<Option<u64>> {
+pub(crate) fn stored_slot(txn: &impl ReadTxn, block_root: &BlockRoot) -> Result<Option<u64>> {
     get_u64(txn, ROOTS_TABLE, block_root)
 }
 
 /// The link stored for `block_root`, `None` without one; other bytes are [`Error::Corrupt`].
-pub(crate) fn stored_link<K: TransactionKind>(
-    txn: &Transaction<'_, K, NoWriteMap>,
-    block_root: &BlockRoot,
-) -> Result<Option<BlockLink>> {
+pub(crate) fn stored_link(txn: &impl ReadTxn, block_root: &BlockRoot) -> Result<Option<BlockLink>> {
     let links = txn.open_table(Some(LINKS_TABLE))?;
     match txn.get::<Vec<u8>>(&links, block_root)? {
         None => Ok(None),
@@ -509,9 +541,7 @@ pub(crate) fn stored_link<K: TransactionKind>(
 }
 
 /// [`RETAINED_FROM_KEY`], or for an env written before it, the slot after the watermark.
-pub(crate) fn retained_from<K: TransactionKind>(
-    txn: &Transaction<'_, K, NoWriteMap>,
-) -> Result<Option<u64>> {
+pub(crate) fn retained_from(txn: &impl ReadTxn) -> Result<Option<u64>> {
     match meta_u64(txn, RETAINED_FROM_KEY)? {
         Some(slot) => Ok(Some(slot)),
         None => Ok(meta_u64(txn, FINALIZED_SLOT_KEY)?.map(|f| f.saturating_add(1))),
@@ -519,19 +549,12 @@ pub(crate) fn retained_from<K: TransactionKind>(
 }
 
 /// A `u64 BE` value from [`META_TABLE`].
-pub(crate) fn meta_u64<K: TransactionKind>(
-    txn: &Transaction<'_, K, NoWriteMap>,
-    key: &[u8],
-) -> Result<Option<u64>> {
+pub(crate) fn meta_u64(txn: &impl ReadTxn, key: &[u8]) -> Result<Option<u64>> {
     get_u64(txn, META_TABLE, key)
 }
 
 /// Reads an 8-byte big-endian value; any other length is [`Error::Corrupt`] and is never copied.
-fn get_u64<K: TransactionKind>(
-    txn: &Transaction<'_, K, NoWriteMap>,
-    table: &'static str,
-    key: &[u8],
-) -> Result<Option<u64>> {
+fn get_u64(txn: &impl ReadTxn, table: &'static str, key: &[u8]) -> Result<Option<u64>> {
     let handle = txn.open_table(Some(table))?;
     match txn.get::<[u8; 8]>(&handle, key) {
         Ok(value) => Ok(value.map(u64::from_be_bytes)),
@@ -543,13 +566,13 @@ fn get_u64<K: TransactionKind>(
 /// All `(key, value)` rows of [`COLUMNS_TABLE`] under one block prefix, in key order. Keys are
 /// checked against the prefix before the value is decoded, so the first row past the block is
 /// never copied.
-pub(crate) fn scan_block<'txn, K, V>(
-    txn: &'txn Transaction<'_, K, NoWriteMap>,
+pub(crate) fn scan_block<'txn, T, V>(
+    txn: &'txn T,
     columns: &Table<'txn>,
     prefix: &[u8; BLOCK_PREFIX_LEN],
 ) -> Result<Vec<(Vec<u8>, V)>>
 where
-    K: TransactionKind,
+    T: ReadTxn,
     V: Decodable<'txn> + 'txn,
 {
     let mut cursor = txn.cursor(columns)?;
@@ -835,13 +858,17 @@ mod tests {
         let reader = ColumnReader::open(dir.path()).unwrap();
         let mut flags = 0;
         assert_eq!(
-            unsafe { mdbx_sys::mdbx_env_get_flags(reader.db.ptr().0, &mut flags) },
+            unsafe { mdbx_sys::mdbx_env_get_flags(reader.db.raw().ptr().0, &mut flags) },
             0
         );
         assert_ne!(flags & mdbx_sys::MDBX_RDONLY, 0);
         assert!(matches!(
-            reader.db.begin_rw_txn(),
+            reader.db.raw().begin_rw_txn(),
             Err(libmdbx::Error::Access)
+        ));
+        assert!(matches!(
+            reader.db.begin_rw_txn(),
+            Err(Error::Mdbx(libmdbx::Error::Access))
         ));
         assert_eq!(reader.get(&[1; 32], 0).unwrap(), Some(b"x".to_vec()));
     }

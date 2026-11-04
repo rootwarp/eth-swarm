@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         for i in 0..BLOCKS {
             let block = common::fulu_block(i + 1, parent, i);
             let (ssz, _) = common::fulu_block_ssz(i + 1, parent, i);
-            let txn = writer.begin_rw_txn()?;
+            let txn = txn::begin(&writer)?;
             let (slot, root) = blocks::put::<common::E>(&txn, &schedule, &ssz)?;
             chain.push((slot, root));
             let (finalized_slot, finalized_root) = chain[chain.len().saturating_sub(65)];

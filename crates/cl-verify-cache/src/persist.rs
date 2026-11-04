@@ -255,7 +255,7 @@ pub fn save_with<C: KeyCodec>(
     cache: &PubkeyCache<C::Key>,
     path: &Path,
 ) -> io::Result<()> {
-    stage_with(codec, cache, path)?.commit()
+    stage_with(codec, cache, path)?.commit() // stamped-commits: not an env txn (StagedSnapshot)
 }
 
 /// A complete, fsynced snapshot in its own temp file `<path>.tmp.<pid>.<n>` that has not

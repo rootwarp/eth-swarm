@@ -8,11 +8,10 @@
 //! `blocks` rows at `(head_slot, head_root)` and `(finalized_slot, finalized_root)` exist;
 //! [`read`] checks that, and the writer checks it before it commits a new stamp.
 
-use libmdbx::{NoWriteMap, Transaction, TransactionKind};
-
 use crate::{
     keys::{slot_root_key, Root, STAMP_KEY},
     tables::{BLOCKS, META},
+    txn::ReadTxn,
     Error, Result,
 };
 
@@ -74,10 +73,7 @@ impl Stamp {
 
     /// Checks the stamp against the env as `txn` sees it: finalized at or below the head, and
     /// both blocks stored at their slots.
-    pub(crate) fn check<K: TransactionKind>(
-        &self,
-        txn: &Transaction<'_, K, NoWriteMap>,
-    ) -> Result<()> {
+    pub(crate) fn check(&self, txn: &impl ReadTxn) -> Result<()> {
         if self.finalized_slot > self.head_slot {
             return Err(Error::StampFinalizedAfterHead {
                 finalized_slot: self.finalized_slot,
@@ -102,7 +98,7 @@ impl Stamp {
 
 /// The stamp `txn` sees, checked; `None` before the first one. A row that is not a valid stamp
 /// is an error, never a default.
-pub fn read<K: TransactionKind>(txn: &Transaction<'_, K, NoWriteMap>) -> Result<Option<Stamp>> {
+pub fn read(txn: &impl ReadTxn) -> Result<Option<Stamp>> {
     let meta = txn.open_table(Some(META))?;
     let Some(row) = txn.get::<Vec<u8>>(&meta, STAMP_KEY)? else {
         return Ok(None);
@@ -287,7 +283,7 @@ pub(crate) mod tests {
         };
         let err = read_row(&writer, &bad.encode()).unwrap_err();
         assert!(refused(&err), "{err:?}");
-        let txn = writer.env().begin_rw_txn().unwrap();
+        let txn = txn::begin(&writer).unwrap();
         let err = txn::commit(txn, Update::New(bad)).unwrap_err();
         assert!(refused(&err), "{err:?}");
         assert_eq!(
@@ -301,7 +297,7 @@ pub(crate) mod tests {
             finalized_slot: 9,
             ..valid()
         };
-        let txn = writer.env().begin_rw_txn().unwrap();
+        let txn = txn::begin(&writer).unwrap();
         assert_eq!(
             txn::commit(txn, Update::New(at_head)).unwrap(),
             Some(at_head)
@@ -343,12 +339,12 @@ pub(crate) mod tests {
             let missing = |err: &Error| matches!(err, Error::StampBlockMissing { slot: s, root: r } if *s == slot && *r == root);
             let err = read_row(&writer, &stamp.encode()).unwrap_err();
             assert!(missing(&err), "{err:?}");
-            let txn = writer.env().begin_rw_txn().unwrap();
+            let txn = txn::begin(&writer).unwrap();
             let err = txn::commit(txn, Update::New(stamp)).unwrap_err();
             assert!(missing(&err), "{err:?}");
             assert_eq!(stored_stamp(&writer), None);
         }
-        let txn = writer.env().begin_rw_txn().unwrap();
+        let txn = txn::begin(&writer).unwrap();
         assert_eq!(
             txn::commit(txn, Update::New(valid())).unwrap(),
             Some(valid())

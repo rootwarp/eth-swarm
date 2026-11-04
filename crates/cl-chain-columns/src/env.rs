@@ -5,11 +5,11 @@
 use std::path::Path;
 
 use libmdbx::WriteFlags;
-use store_schema::env::{RwTxn, WriterGuard};
 pub use store_schema::env::{
     WriterOptions, DEFAULT_MAX_SIZE, MAX_SIZE_ALIGN, MIN_MAX_SIZE, WRITER_LOCK_ATTEMPTS,
     WRITER_LOCK_RETRY_INTERVAL,
 };
+use store_schema::{env::WriterEnv, txn::RwTxn};
 
 use crate::{
     error::Result,
@@ -21,8 +21,8 @@ pub(crate) type Env = store_schema::env::Env;
 
 /// Opens the env as its one writer ([`store_schema::env::open_writer_with`]: guard, geometry,
 /// schema version, every table) and migrates the column tables in the same transaction.
-pub(crate) fn open_rw(path: &Path, opts: WriterOptions) -> Result<(Env, WriterGuard)> {
-    Ok(store_schema::env::open_writer_with(path, opts, migrate)?.into_parts())
+pub(crate) fn open_rw(path: &Path, opts: WriterOptions) -> Result<WriterEnv> {
+    store_schema::env::open_writer_with(path, opts, migrate)
 }
 
 /// The column tables' migration. `created` names the tables this open created.
