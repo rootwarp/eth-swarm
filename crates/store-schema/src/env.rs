@@ -8,21 +8,24 @@ use std::time::Duration;
 
 use libmdbx::{
     Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, SyncMode, TableFlags,
-    Transaction, RW,
+    Transaction, RO, RW,
 };
 
 use crate::{
     blocks,
     tables::{self, BLOCK_INDEX, MAX_TABLES, TABLES},
-    txn::{self, Update},
-    version, Error, Result,
+    txn, version, Error, Result,
 };
 
 /// The env handle.
 pub type Env = Database<NoWriteMap>;
 
-/// A write transaction of the env, as [`open_writer_with`]'s upgrade hook gets it.
+/// A write transaction of the env, as [`open_writer_with`]'s upgrade hook and
+/// [`WriterEnv::begin_rw_txn`] give it. It commits through [`txn::commit`] only.
 pub type RwTxn<'env> = Transaction<'env, RW, NoWriteMap>;
+
+/// A read transaction of the env ([`WriterEnv::begin_ro_txn`]).
+pub type RoTxn<'env> = Transaction<'env, RO, NoWriteMap>;
 
 /// Default upper bound of the memory map, 256 GiB. Only address space is reserved up front; the
 /// file grows in 256 MiB steps.
@@ -93,14 +96,38 @@ pub struct WriterGuard {
 }
 
 impl WriterEnv {
-    /// The env, for read and write transactions.
+    /// The env itself, inside this crate. Outside it, a write transaction comes from
+    /// [`Self::begin_rw_txn`], whose only commit is [`txn::commit`].
     #[must_use]
-    pub fn env(&self) -> &Env {
+    pub(crate) fn env(&self) -> &Env {
         &self.env
     }
 
-    /// The env and the guard apart, for a caller that keeps the env elsewhere. Drop the env
-    /// before the guard.
+    /// The env itself, for tests that write a store no writer path may (rows committed raw,
+    /// with no stamp). Only with the `test-hooks` feature, which only dev-dependencies enable.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn raw_env(&self) -> &Env {
+        self.env()
+    }
+
+    /// A read transaction of the env.
+    pub fn begin_ro_txn(&self) -> Result<RoTxn<'_>> {
+        Ok(self.env().begin_ro_txn()?)
+    }
+
+    /// A write transaction of the env. Commit it through [`txn::commit`], which writes the
+    /// stamp row: a raw `commit()` in the crates that write the env fails
+    /// `scripts/check-stamped-commits.sh`.
+    pub fn begin_rw_txn(&self) -> Result<RwTxn<'_>> {
+        Ok(self.env().begin_rw_txn()?)
+    }
+
+    /// The env and the guard apart, for a caller that keeps the env elsewhere
+    /// (cl-chain-columns). Drop the env before the guard. Every write transaction of that env
+    /// still commits through [`txn::commit`]; `scripts/check-stamped-commits.sh` enforces it in
+    /// the crates that write the env.
     #[must_use]
     pub fn into_parts(self) -> (Env, WriterGuard) {
         (self.env, self.guard)
@@ -119,9 +146,12 @@ pub fn open_writer(path: &Path, opts: WriterOptions) -> Result<WriterEnv> {
 /// every named table is one of [`TABLES`], creates every missing table, fills `block_index`
 /// from `blocks` if this open created it, runs `upgrade` with the names of the tables this
 /// open created, writes the version row if the env was not at
-/// [`SCHEMA_VERSION`](version::SCHEMA_VERSION), and commits with the stamp carried
-/// ([`Update::Carry`]). An error anywhere aborts the transaction, so a refused or failed open
-/// writes nothing.
+/// [`SCHEMA_VERSION`](version::SCHEMA_VERSION), and commits through `txn::commit_open` (this
+/// is its one caller). A stored stamp is carried, as [`Update::Carry`](txn::Update::Carry)
+/// carries it. With no stamp yet no stamp row is written, and the open is refused
+/// ([`Error::StampMissing`]) if `blocks` or `block_index` holds a row: a store written raw, or
+/// a v1 store with blocks and no stamp. An error anywhere aborts the transaction, so a refused
+/// or failed open writes nothing.
 ///
 /// `upgrade` is where a crate that owns some tables migrates their data in the same transaction
 /// that creates the tables (cl-chain-columns' links migration).
@@ -165,7 +195,7 @@ where
     if upgrade_version {
         version::write(&txn)?;
     }
-    txn::commit(txn, Update::Carry)?;
+    txn::commit_open(txn)?;
     Ok(WriterEnv { env, guard })
 }
 

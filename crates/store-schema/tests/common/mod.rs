@@ -1,8 +1,8 @@
-//! Real blocks for the store-schema tests and the `fill_env` example: small Fulu
+//! Real blocks for the store-schema tests and cl-chain-columns' `fill_env` example: small Fulu
 //! `SignedBeaconBlock`s (Minimal preset) built and SSZ-encoded in code, no spec vectors.
 //!
-//! Included with `#[path]` by `src/` unit tests, `tests/env.rs` and `examples/fill_env.rs`, so
-//! each user leaves some helpers unused.
+//! Included with `#[path]` by `src/` unit tests, `tests/env.rs` and cl-chain-columns'
+//! `examples/fill_env.rs`, so each user leaves some helpers unused.
 #![allow(dead_code)]
 
 use alloy_primitives::{Address, B256, U256};

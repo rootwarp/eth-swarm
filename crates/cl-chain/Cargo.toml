@@ -70,8 +70,9 @@ svc-runtime = { path = "../svc-runtime" }
 # test-config: tests/service.rs runs the test binary cl-chain-test.
 # test-hooks: tests/durable.rs injects crashes into the durable file set.
 cl-chain = { path = ".", features = ["test-config", "test-hooks"] }
-# tests/durable.rs: the MDBX env beside the durable file set (blocks, schema version).
-store-schema = { path = "../store-schema" }
+# tests/durable.rs: the MDBX env beside the durable file set (blocks, schema version), written
+# raw through test-hooks (`WriterEnv::raw_env`).
+store-schema = { path = "../store-schema", features = ["test-hooks"] }
 libmdbx = "=0.5.6"
 ipc = { path = "../ipc", features = ["testkit"] }
 # owned::testkit: temp directories with no symlink on their path, for the owner walk.

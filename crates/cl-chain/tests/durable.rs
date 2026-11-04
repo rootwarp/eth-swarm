@@ -162,8 +162,9 @@ fn assert_anchor_dir(datadir: &Path, what: &str) {
 fn import_log_atomic_with_block() {
     let datadir = tempfile::tempdir().unwrap();
     let env = open_writer(&datadir.path().join("chain"), WriterOptions::default()).unwrap();
+    // Raw, with no stamp (`raw_env`, store-schema's test-hooks): only the block row matters.
     let commit_block = |slot: u64, root: &[u8; 32]| {
-        let txn = env.env().begin_rw_txn().unwrap();
+        let txn = env.raw_env().begin_rw_txn().unwrap();
         let blocks = txn.open_table(Some(BLOCKS)).unwrap();
         txn.put(
             &blocks,
@@ -175,7 +176,7 @@ fn import_log_atomic_with_block() {
         txn.commit().unwrap();
     };
     let stored_blocks = || {
-        let txn = env.env().begin_ro_txn().unwrap();
+        let txn = env.begin_ro_txn().unwrap();
         let blocks = txn.open_table(Some(BLOCKS)).unwrap();
         txn.table_stat(&blocks).unwrap().entries()
     };
@@ -461,7 +462,7 @@ fn file_set_versioned_not_mdbx() {
         set.advance_finality(ROOT_F, &base_files(&f)).unwrap();
         set.record_import(&record(ROOT_G, 99)).unwrap();
         // No MDBX table holds any of it: the only rows are the env's own version row.
-        let txn = env.env().begin_ro_txn().unwrap();
+        let txn = env.begin_ro_txn().unwrap();
         for table in TABLES {
             let handle = txn.open_table(Some(table)).unwrap();
             let rows = txn.table_stat(&handle).unwrap().entries();
@@ -504,7 +505,7 @@ fn file_set_versioned_not_mdbx() {
     assert!(matches!(err, Error::NewerVersion { found: 2 }), "{err:?}");
     {
         let env = open_writer(&env_dir, WriterOptions::default()).unwrap();
-        let txn = env.env().begin_rw_txn().unwrap();
+        let txn = env.raw_env().begin_rw_txn().unwrap();
         let meta = txn.open_table(Some(META)).unwrap();
         txn.put(
             &meta,

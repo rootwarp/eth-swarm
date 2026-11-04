@@ -12,11 +12,12 @@ trap 'rm -rf "$tmp"' EXIT
 
 passed=0 failed=0
 
-# fixture <name>: a tree with clean store-schema and cl-chain-columns sources. txn.rs commits
-# raw (the one allowed place) and every test module commits raw too.
+# fixture <name>: a tree with clean store-schema, cl-chain-columns and cl-chain sources. txn.rs
+# commits raw (the one allowed place) and every test module commits raw too.
 fixture() {
   local root="$tmp/$1"
-  mkdir -p "$root/crates/store-schema/src" "$root/crates/cl-chain-columns/src"
+  mkdir -p "$root/crates/store-schema/src" "$root/crates/cl-chain-columns/src" \
+    "$root/crates/cl-chain/src"
   cat > "$root/crates/store-schema/src/txn.rs" <<'RS'
 pub fn commit(txn: RwTxn<'_>, update: Update) -> Result<()> {
     txn.commit()?;
@@ -55,6 +56,20 @@ fn write_txn() -> Result<()> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    fn raw() {
+        txn.commit().unwrap();
+    }
+}
+RS
+  cat > "$root/crates/cl-chain/src/import.rs" <<'RS'
+/// A block's rows and its new stamp in one txn.
+fn import(txn: RwTxn<'_>, stamp: Stamp) -> Result<()> {
+    store_schema::txn::commit(txn, Update::New(stamp))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
     fn raw() {
         txn.commit().unwrap();
     }
@@ -112,6 +127,97 @@ check fail "a file in a subdirectory" "$root" "src/sub/deep.rs:2:"
 root=$(fixture missing)
 rm -rf "$root/crates/cl-chain-columns"
 check fail "a missing crate directory (never vacuous)" "$root" "not found"
+
+# Other spellings of a raw commit (#295).
+root=$(fixture rwtxn)
+printf 'fn upgrade() {\n    RwTxn::commit(txn)?;\n}\n' > "$root/crates/store-schema/src/version.rs"
+check fail "RwTxn::commit(txn) through the alias" "$root" "crates/store-schema/src/version.rs:2:"
+
+root=$(fixture turbofish)
+printf 'fn f() {\n    Transaction::<RW, NoWriteMap>::commit(txn)?;\n}\n' \
+  > "$root/crates/store-schema/src/stamp.rs"
+check fail "Transaction::<RW, NoWriteMap>::commit(txn)" "$root" "crates/store-schema/src/stamp.rs:2:"
+
+root=$(fixture rebind)
+printf 'fn f() {\n    let (_, dbs) = txn.commit_and_rebind_open_dbs()?;\n}\n' \
+  > "$root/crates/store-schema/src/blocks.rs"
+check fail "txn.commit_and_rebind_open_dbs()" "$root" "crates/store-schema/src/blocks.rs:2:"
+
+# cl-chain writes the env too (block import): its sources are scanned (#295).
+root=$(fixture chain)
+printf 'fn persist() {\n    txn.commit()?;\n}\n' > "$root/crates/cl-chain/src/persist.rs"
+check fail "a raw commit in cl-chain" "$root" "crates/cl-chain/src/persist.rs:2:"
+
+root=$(fixture chain_missing)
+rm -rf "$root/crates/cl-chain"
+check fail "a missing crates/cl-chain directory (never vacuous)" "$root" "not found"
+
+# txn::commit_open, the writer open's commit without a stamp row of its own, is called only
+# from crates/store-schema/src/env.rs (#295).
+root=$(fixture open_env)
+cat > "$root/crates/store-schema/src/env.rs" <<'RS'
+/// The open's txn commits through `txn::commit_open`: no stamp row of its own.
+pub fn open_writer_with() -> Result<()> {
+    let txn = env.begin_rw_txn()?;
+    txn::commit_open(txn)?;
+    crate::txn::commit_open (txn)?;
+    Ok(())
+}
+RS
+check pass "txn::commit_open from store-schema's env.rs" "$root" "stamped commits OK"
+
+root=$(fixture open_blocks)
+printf 'fn put() -> Result<()> {\n    txn::commit_open(txn)?;\n    Ok(())\n}\n' \
+  > "$root/crates/store-schema/src/blocks.rs"
+check fail "txn::commit_open in store-schema's blocks.rs" "$root" \
+  "crates/store-schema/src/blocks.rs:2:"
+
+root=$(fixture open_columns)
+printf 'fn open() {\n    store_schema::txn::commit_open (txn)?;\n}\n' \
+  >> "$root/crates/cl-chain-columns/src/writer.rs"
+check fail "txn::commit_open in cl-chain-columns" "$root" \
+  "crates/cl-chain-columns/src/writer.rs:14:"
+
+root=$(fixture open_chain_env)
+printf 'fn open() {\n    store_schema::txn::commit_open(txn)?;\n}\n' \
+  > "$root/crates/cl-chain/src/env.rs"
+check fail "txn::commit_open in an env.rs that is not store-schema's" "$root" \
+  "crates/cl-chain/src/env.rs:2:"
+
+root=$(fixture open_use)
+printf 'use crate::txn::commit_open;\n\nfn upgrade() {\n    commit_open(txn)?;\n}\n' \
+  > "$root/crates/store-schema/src/version.rs"
+check fail "commit_open imported, then called bare" "$root" "crates/store-schema/src/version.rs:4:"
+
+# Test modules and comments stay exempt from every spelling above.
+root=$(fixture test_modules)
+cat > "$root/crates/store-schema/src/blocks.rs" <<'RS'
+// Not txn::commit_open(txn) nor RwTxn::commit(txn): blocks commit with their stamp.
+pub fn put() {}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    fn raw() {
+        RwTxn::commit(txn).unwrap();
+        Transaction::<RW, NoWriteMap>::commit(txn).unwrap();
+        txn.commit_and_rebind_open_dbs().unwrap();
+        crate::txn::commit_open(txn).unwrap();
+    }
+}
+RS
+cat > "$root/crates/cl-chain/src/persist.rs" <<'RS'
+pub fn persist() {}
+
+#[cfg(test)]
+mod tests {
+    fn raw() {
+        txn.commit().unwrap();
+        RwTxn::commit(txn).unwrap();
+        store_schema::txn::commit_open(txn).unwrap();
+    }
+}
+RS
+check pass "every spelling inside test modules and comments" "$root" "stamped commits OK"
 
 check pass "the real repo" "$repo" "stamped commits OK"
 

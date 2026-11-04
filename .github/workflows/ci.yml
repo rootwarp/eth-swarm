@@ -176,10 +176,12 @@ jobs:
 
   mdbx-chk:
     # mdbx_chk, built from the libmdbx sources mdbx-sys =12.13.2 vendors (ADR-0009, not a distro
-    # binary), checks an env the production writer paths filled with real blocks, stamps and
-    # column sidecars (crates/store-schema/examples/fill_env.rs); any error fails the job. The
-    # build step prints the source directory and VERSION.txt and fails unless they are the
-    # pinned ones. #290 reuses this job.
+    # binary), checks an env the production writer paths filled
+    # (crates/cl-chain-columns/examples/fill_env.rs): real blocks, each committed with a new
+    # stamp through store-schema, then column sidecars written and pruned through
+    # cl-chain-columns' ColumnWriter, every column txn carrying the stamp. Any error or warning
+    # fails the job. The build step prints the source directory and VERSION.txt and fails
+    # unless they are the pinned ones. #290 reuses this job.
     name: mdbx_chk on written store envs (pinned libmdbx sources)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -191,9 +193,9 @@ jobs:
         run: rustup toolchain install && rustc --version
       - name: Build mdbx_chk from mdbx-sys 12.13.2's libmdbx (prints the source and VERSION.txt)
         run: bash scripts/build-mdbx-chk.sh
-      - name: The scripts fail on a corrupted env (b-tree pages, meta pages) and pass a clean one
+      - name: The scripts fail on a corrupted env (b-tree pages, meta pages) or a warning, and pass a clean one
         run: bash scripts/tests/mdbx-chk-envs.test.sh
-      - name: mdbx_chk -v on an env filled with blocks, stamps and columns
+      - name: mdbx_chk -v on an env of blocks and stamps (store-schema) and columns written through ColumnWriter
         env:
           MDBX_CHK: target/mdbx-chk/mdbx_chk
         run: bash scripts/mdbx-chk-envs.sh

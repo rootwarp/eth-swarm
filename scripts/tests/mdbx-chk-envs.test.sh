@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Tests for scripts/mdbx-chk-envs.sh and scripts/build-mdbx-chk.sh.
 # Run: bash scripts/tests/mdbx-chk-envs.test.sh
-# Builds mdbx_chk once from the pinned sources and fills one env with the fill_env example
-# (needs cargo, a C compiler and the crates of Cargo.lock), then checks copies of that env:
-# clean, and corrupted two ways, each of which must fail the run. The build script's pins
-# are tested with a stub cargo and a failing compiler.
+# Builds mdbx_chk once from the pinned sources and fills one env with cl-chain-columns'
+# fill_env example (blocks and stamps through store-schema, columns through ColumnWriter;
+# needs cargo, a C compiler and the crates of Cargo.lock), then checks copies of that env:
+# clean, and corrupted two ways, each of which must fail the run. Stub mdbx_chk binaries
+# check that a warning line fails the run even with exit 0. The build script's pins are
+# tested with a stub cargo and a failing compiler.
 # Works on bash 3.2.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -42,9 +44,9 @@ check pass "the build names the pinned source and its VERSION.txt" "mdbx-sys-12.
   cat "$tmp/build.log"
 check pass "the binary is that libmdbx" "mdbx_chk version 0.12.13.5" "$chk" -V
 
-cargo run --quiet --locked --manifest-path "$repo/Cargo.toml" -p store-schema \
+cargo run --quiet --locked --manifest-path "$repo/Cargo.toml" -p cl-chain-columns \
   --example fill_env -- "$tmp/clean" > /dev/null
-check pass "a filled env (blocks, stamps, columns) is clean" "mdbx_chk OK: $tmp/clean" \
+check pass "a filled env (blocks, stamps, ColumnWriter columns) is clean" "mdbx_chk OK: $tmp/clean" \
   env MDBX_CHK="$chk" bash "$script" "$tmp/clean"
 
 cp -R "$tmp/clean" "$tmp/btree"
@@ -62,6 +64,48 @@ check fail "one clean env does not hide a corrupt one" "mdbx_chk OK: $tmp/clean"
 
 check fail "an MDBX_CHK that is not an executable" "is not an executable" \
   env MDBX_CHK="$tmp/absent" bash "$script" "$tmp/clean"
+
+# Warnings exit 0 too (#295). mdbx_chk 0.12.13 prints libmdbx's log through its own logger
+# (va_log in mdbx_chk.c): errors as " ! <msg>" on stderr, counted, so the exit is nonzero;
+# warnings as " ~ <msg>" on stdout (prefixes[MDBX_LOG_WARN]), not counted, so the exit stays 0.
+# The script must fail on a line that starts with " ~ ". Its progress lines start with " - "
+# or a word ("Processing", "Traversal", "No error is detected"), and the summary's
+# "0 problems" is no warning.
+mkdir -p "$tmp/stub-chk"
+cat > "$tmp/stub-chk/progress.txt" <<'OUT'
+mdbx_chk v0.12.13-5-gf5279769 (2025-05-27T14:44:11+03:00, T-5b9aa49dc6073cc2fe08d05e5780fab3f5cbf4cb)
+Running for /env in 'read-only' mode...
+ - monopolistic mode
+ - pagesize 4096 (4096 system), max keysize 1980..2022, max readers 114
+ - mapsize 268435456 (256.00 Mb)
+ - dynamic datafile: 268435456 (256.00 Mb) .. 274877906944 (256.00 Gb), +268435456 (256.00 Mb), -536870912 (512.00 Mb)
+ - current datafile: 268435456 (256.00 Mb), 65536 pages
+ - transactions: recent 112, latter reader 112, lag 0
+ - meta-0: steady txn#111, tail
+ - meta-1: steady txn#112, head
+ - meta-2: steady txn#110, tail
+Traversal b-tree by txn#112...
+ - found 'blocks' area
+ - pages: walked 4381, left/unused 61155
+ - summary: average fill 87.3%, 0 problems
+Processing '@MAIN'...
+ - summary: 9 records, 0 dups, 99 key's bytes, 432 data's bytes, 0 problems
+Processing 'blocks'...
+ - summary: 64 records, 0 dups, 2560 key's bytes, 98432 data's bytes, 0 problems
+No error is detected, elapsed 0.012 seconds
+OUT
+# The same run with one warning libmdbx logs while it opens the env (meta validation,
+# mdbx.c), right after "Running for".
+awk '{ print } /^Running for / { print " ~ meta[2] has invalid steady-checksum (0x62e3b1a46f7c1d50 != 0x0), skip it" }' \
+  "$tmp/stub-chk/progress.txt" > "$tmp/stub-chk/warning.txt"
+for name in progress warning; do
+  printf '#!/usr/bin/env bash\ncat "%s"\n' "$tmp/stub-chk/$name.txt" > "$tmp/stub-chk/$name"
+  chmod +x "$tmp/stub-chk/$name"
+done
+check pass "a stub mdbx_chk with progress lines only, exit 0" "mdbx_chk OK: $tmp/clean" \
+  env MDBX_CHK="$tmp/stub-chk/progress" bash "$script" "$tmp/clean"
+check fail "a stub mdbx_chk that prints a warning and exits 0" "mdbx_chk reported warnings" \
+  env MDBX_CHK="$tmp/stub-chk/warning" bash "$script" "$tmp/clean"
 
 check pass "no ENV_DIR: fills its own env and checks it" "No error is detected" \
   env MDBX_CHK="$chk" bash "$script"

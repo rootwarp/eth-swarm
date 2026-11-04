@@ -27,3 +27,11 @@ store-schema = { path = "../store-schema" }
 mdbx-sys = "=12.13.2"
 proptest = "1"
 tempfile = "3"
+# examples/fill_env.rs: real blocks and sidecars from store-schema's tests/common, built and
+# encoded in code (no spec vectors), for the env scripts/mdbx-chk-envs.sh checks.
+alloy-primitives.workspace = true
+consensus-types = { path = "../consensus-types" }
+ethereum_ssz.workspace = true
+network-config = { path = "../network-config" }
+ssz_types.workspace = true
+tree_hash.workspace = true
