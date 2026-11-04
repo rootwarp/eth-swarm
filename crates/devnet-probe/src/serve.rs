@@ -234,6 +234,7 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ChainSide<E, V> {
                 kzg: plan.kzg,
                 verify_timeout: plan.verify_timeout,
                 cgc_set_slot: plan.cgc_set_slot,
+                anchor: None,
             },
             registry,
         )?;

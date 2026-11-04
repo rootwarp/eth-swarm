@@ -430,6 +430,7 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
         kzg,
         verify_timeout: settings.verify_timeout,
         cgc_set_slot,
+        anchor: None,
     };
     let service =
         ProbeService::<E, V>::open(net, plan, &mut hooks.unprefixed).map_err(|e| match e {

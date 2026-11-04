@@ -364,7 +364,10 @@ mod tests {
         env::{self, WriterEnv, WriterOptions, MIN_MAX_SIZE},
         keys::{slot_root_key, Root, STAMP_KEY},
         stamp::tests::{env_with_blocks, valid, A, B},
-        tables::{BLOCKS, BLOCK_INDEX, COLUMNS, META, STATES, TABLES},
+        tables::{
+            BLOCKS, BLOCK_INDEX, COLUMNS, COLUMN_LINKS, COLUMN_ROOTS, ENVELOPES, FC_SNAPSHOT, META,
+            STATES, TABLES,
+        },
         testkit::{fulu_block_ssz, schedule, E},
     };
     use libmdbx::WriteFlags;
@@ -852,6 +855,101 @@ mod tests {
         assert_eq!(commit(txn, Update::Carry).unwrap(), None);
         assert!(has_state(&writer, b"committed"));
         assert_eq!(stamp_row(&writer), None);
+    }
+
+    /// The full rule: before the first stamp there is nothing to carry, so a `Carry` commit is
+    /// refused ([`Error::CarryBeforeFirstStamp`]) whatever it writes: a row of any one table
+    /// (every table of [`TABLES`], and custody's `meta` row), all of them at once, or nothing.
+    /// So is one on a store that already holds a row of any table (committed raw, as no writer
+    /// path may) and no stamp. Nothing of a refused commit is written: every table as before,
+    /// and still no stamp row. The writer's open keeps its own path (`commit_open`): an
+    /// unstamped store with no block opens again and still has no stamp. Once a `New` has
+    /// stamped the store, a `Carry` of each row commits.
+    #[test]
+    fn no_carry_before_first_stamp() {
+        let column = column_key(5, &A, 0);
+        let block = slot_root_key(5, &A);
+        let slot = 5u64.to_be_bytes();
+        let cgc = 8u64.to_be_bytes();
+        // One row of each table: `(table, key, value)`.
+        let rows: [(&str, &[u8], &[u8]); 10] = [
+            (COLUMNS, &column, b"column"),
+            (COLUMN_ROOTS, &A, &slot),
+            (META, b"cgc", &cgc),
+            (META, b"finalized_slot", &slot),
+            (COLUMN_LINKS, &A, b"link"),
+            (BLOCKS, &block, b"block"),
+            (STATES, &block, b"state"),
+            (BLOCK_INDEX, &A, &slot),
+            (ENVELOPES, &block, b"envelope"),
+            (FC_SNAPSHOT, b"fc", b"snapshot"),
+        ];
+        for table in TABLES {
+            assert!(rows.iter().any(|(t, ..)| *t == table), "no row of {table}");
+        }
+        let put = |txn: &RwTxn<'_>, rows: &[(&str, &[u8], &[u8])]| {
+            for &(table, key, value) in rows {
+                let handle = txn.open_table(Some(table)).unwrap();
+                txn.put(&handle, key, value, WriteFlags::UPSERT).unwrap();
+            }
+        };
+        let refused = |writer: &WriterEnv, rows: &[(&str, &[u8], &[u8])]| {
+            let before = snapshot(writer);
+            let txn = begin(writer).unwrap();
+            put(&txn, rows);
+            let err = commit(txn, Update::Carry).unwrap_err();
+            assert!(
+                matches!(err, Error::CarryBeforeFirstStamp),
+                "{rows:?}: {err:?}"
+            );
+            assert_eq!(
+                snapshot(writer),
+                before,
+                "{rows:?}: the refused commit wrote"
+            );
+            assert_eq!(stamp_row(writer), None, "{rows:?}");
+        };
+
+        let (dir, writer) = fresh();
+        refused(&writer, &[]);
+        for row in &rows {
+            refused(&writer, std::slice::from_ref(row));
+        }
+        refused(&writer, &rows);
+        // The open's own path is unchanged: the store opens again, with no stamp row.
+        drop(writer);
+        let opts = WriterOptions {
+            max_size: MIN_MAX_SIZE,
+        };
+        let writer = env::open_writer(dir.path(), opts).unwrap();
+        assert_eq!(stamp_row(&writer), None);
+        drop(writer);
+
+        for &(table, key, value) in &rows {
+            let (_dir, writer) = fresh();
+            seed(&writer, table, &[(key, value)]);
+            refused(&writer, &[]);
+            refused(&writer, &[(table, key, value)]);
+            refused(&writer, &rows);
+        }
+
+        let (_dir, writer) = env_with_blocks();
+        let txn = begin(&writer).unwrap();
+        assert_eq!(commit(txn, Update::New(valid())).unwrap(), Some(valid()));
+        for row @ &(table, key, value) in &rows {
+            let txn = begin(&writer).unwrap();
+            put(&txn, std::slice::from_ref(row));
+            assert_eq!(
+                commit(txn, Update::Carry).unwrap(),
+                Some(valid()),
+                "{table}"
+            );
+            let txn = writer.env().begin_ro_txn().unwrap();
+            let handle = txn.open_table(Some(table)).unwrap();
+            let stored = txn.get::<Vec<u8>>(&handle, key).unwrap();
+            assert_eq!(stored.as_deref(), Some(value), "{table}");
+        }
+        assert_eq!(stamp_row(&writer).unwrap(), valid().encode());
     }
 
     /// S2: the first `New` on an unstamped store has nothing to compare with, `head_seq` 0

@@ -238,6 +238,7 @@ fn plan(dir: &Path, cgc_set_slot: u64) -> ProbePlan<Valid> {
         kzg: Valid,
         verify_timeout: DEFAULT_VERIFY_TIMEOUT,
         cgc_set_slot,
+        anchor: None,
     }
 }
 
@@ -267,6 +268,80 @@ async fn a_service_opened_again_keeps_its_custody() {
     let second =
         ProbeService::<Minimal, Valid>::open(&net, plan(dir.path(), 900), &mut Registry::default());
     assert!(second.is_err());
+}
+
+/// The reference's finalized block in these tests: a Fulu block at slot 8 of the devnet.
+fn anchor() -> Anchor {
+    use tree_hash::TreeHash;
+    let block = p2p_wire::testkit::fulu_block::<Minimal>(8);
+    Anchor {
+        root: block.message.tree_hash_root().0,
+        ssz: block.as_ssz_bytes(),
+    }
+}
+
+/// The env's stamp and the `blocks` row at `(slot, root)`, read once the service is gone.
+fn stored(
+    dir: &Path,
+    slot: u64,
+    root: &crate::probe::Root,
+) -> (Option<store_schema::stamp::Stamp>, Option<Vec<u8>>) {
+    let env = store_schema::env::open_reader(dir).unwrap();
+    let txn = env.begin_ro_txn().unwrap();
+    let stamp = store_schema::stamp::read(&txn).unwrap();
+    let blocks = txn.open_table(Some(store_schema::tables::BLOCKS)).unwrap();
+    let key = store_schema::keys::slot_root_key(slot, root);
+    (stamp, txn.get::<Vec<u8>>(&blocks, &key).unwrap())
+}
+
+/// Probe mode has no chain head: a new store is stamped with `Update::New` from its anchor,
+/// the reference's finalized block (the head and the finalized block of the stamp, at event
+/// 1), stored with it, before its first custody or column write. Every write txn of the store
+/// carries that stamp. Opened again, the store keeps it and needs no anchor.
+#[tokio::test]
+async fn a_new_store_is_stamped_from_its_anchor_before_its_first_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let net = devnet();
+    let anchor = anchor();
+    let first = ProbeService::<Minimal, Valid>::open(
+        &net,
+        ProbePlan {
+            anchor: Some(anchor.clone()),
+            ..plan(dir.path(), 40)
+        },
+        &mut Registry::default(),
+    )
+    .unwrap();
+    let committed = first.writer.rw_txns_committed();
+    assert!(committed >= 2, "the stamp, then the custody: {committed}");
+    assert_eq!(
+        first.writer.stamped_txns_committed(),
+        committed,
+        "a write txn before the stamp"
+    );
+    drop(first);
+    let want = store_schema::stamp::Stamp {
+        head_seq: 1,
+        head_root: anchor.root,
+        head_slot: 8,
+        finalized_root: anchor.root,
+        finalized_slot: 8,
+    };
+    assert_eq!(
+        stored(dir.path(), 8, &anchor.root),
+        (Some(want), Some(anchor.ssz.clone()))
+    );
+
+    let again =
+        ProbeService::<Minimal, Valid>::open(&net, plan(dir.path(), 900), &mut Registry::default())
+            .unwrap();
+    assert_eq!(again.cgc_set_slot(), 40);
+    assert_eq!(
+        again.writer.stamped_txns_committed(),
+        again.writer.rw_txns_committed()
+    );
+    drop(again);
+    assert_eq!(stored(dir.path(), 8, &anchor.root).0, Some(want));
 }
 
 /// A column sidecar is handed to the store only on the topic of its slot's digest, and only

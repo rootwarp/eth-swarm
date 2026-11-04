@@ -279,6 +279,7 @@ impl Host {
             kzg: Valid,
             verify_timeout: Duration::from_secs(5),
             cgc_set_slot: 0,
+            anchor: None,
         };
         let service = ProbeService::<Minimal, Valid>::open(
             &net,

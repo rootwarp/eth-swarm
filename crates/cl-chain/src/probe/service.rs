@@ -489,6 +489,17 @@ pub struct ProbePlan<V> {
     /// The slot custody is set at on a new store: columns are stored from there on. A store
     /// opened again keeps the slot of its first start.
     pub cgc_set_slot: u64,
+    /// The block a new store is stamped with. A store stamped before needs none.
+    pub anchor: Option<Anchor>,
+}
+
+/// The block probe mode stamps a new store with: the reference's finalized block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Anchor {
+    /// The finalized checkpoint's root.
+    pub root: crate::probe::Root,
+    /// The SSZ of its signed block, as the reference serves it.
+    pub ssz: Vec<u8>,
 }
 
 /// The column store of cl-chain's probe mode.

@@ -109,6 +109,11 @@ pub enum Error {
         /// The first of `blocks`, `block_index` that holds a row, as the txn sees it.
         table: &'static str,
     },
+    /// A [`Update::Carry`](crate::txn::Update::Carry) commit before the first stamp: there is
+    /// no stamp to carry, whatever the txn wrote (a row of any table, custody's `meta` rows
+    /// included, or none). Nothing was written; the first stamp is an `Update::New`.
+    #[error("a Carry commit before the first stamp: the env has no stamp to carry")]
+    CarryBeforeFirstStamp,
     /// `Update::New` would lower `head_seq` below the stored stamp's. Nothing was written.
     #[error("stamp head_seq {new} is below the stored {stored}")]
     StampSeqDecrease {
