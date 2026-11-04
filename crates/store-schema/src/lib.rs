@@ -23,9 +23,10 @@
 //!
 //! A block's root is `hash_tree_root(block.message)` and its slot the block's own, both from its
 //! SSZ ([`blocks::put`]), and its `block_index` row is written in the same transaction. Every
-//! write transaction commits through [`txn::commit`], which writes the stamp (the writer's open
-//! through its own path, under the same rule): a reader's snapshot never holds a block newer
-//! than its stamp's head, nor a stamp whose blocks are missing, nor blocks with no stamp.
+//! write transaction commits through [`txn::commit`], which writes the stamp; before the first
+//! stamp only the writer's open commits, through its own path, refused if a block is stored: a
+//! reader's snapshot never holds a block newer than its stamp's head, nor a stamp whose blocks
+//! are missing, nor blocks with no stamp.
 //!
 //! The column tables keep the names cl-chain-columns gave them (logically
 //! `columns_unfinalized`): renaming them would rewrite every existing env. The C4 restart file

@@ -129,7 +129,7 @@ pub(crate) mod tests {
 
     /// A writer env holding block rows A at slot 5 and B at slot 9 and no stamp. Raw rows: the
     /// stamp checks only that its blocks are stored. Committed raw, as no writer path may: a
-    /// `Carry` with `blocks` rows and no stamp is refused ([`Error::StampMissing`]).
+    /// `Carry` with no stamp is refused ([`Error::CarryBeforeFirstStamp`]).
     pub(crate) fn env_with_blocks() -> (tempfile::TempDir, WriterEnv) {
         let dir = tempfile::tempdir().unwrap();
         let writer = env::open_writer(

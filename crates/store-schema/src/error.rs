@@ -101,9 +101,8 @@ pub enum Error {
         /// The block's root in the stamp.
         root: Root,
     },
-    /// A [`Update::Carry`](crate::txn::Update::Carry) (or the writer's open txn) would commit
-    /// while `blocks` or `block_index` holds rows and the env has no stamp yet: blocks with no
-    /// head would be readable. Nothing was written.
+    /// The writer's open txn would commit while `blocks` or `block_index` holds rows and the
+    /// env has no stamp yet: blocks with no head would be readable. Nothing was written.
     #[error("table {table} holds rows but the env has no stamp yet")]
     StampMissing {
         /// The first of `blocks`, `block_index` that holds a row, as the txn sees it.

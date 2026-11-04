@@ -273,18 +273,16 @@ pub enum Update {
     /// The stored stamp, unchanged: a transaction that moves neither (columns, custody). It is
     /// checked again, so a transaction that removed the stamp's block fails.
     ///
-    /// Before the first stamp there is nothing to carry. The transaction commits with no stamp
-    /// row only while `blocks` and `block_index` are empty as it sees them, its own puts
-    /// included: a row in either would be a block with no head, so the commit is refused
-    /// ([`Error::StampMissing`], `blocks` checked first) and writes nothing. Columns and custody
-    /// before any block commit unstamped. The full rule, no `Carry` before the first stamp for
-    /// any table, is turned on later, once a production stamp writer exists (#208a).
+    /// Before the first stamp there is nothing to carry: the commit is refused
+    /// ([`Error::CarryBeforeFirstStamp`]) whatever the transaction wrote, a row of any table or
+    /// none, and writes nothing. A store's first commit with data is a `New` (probe mode's from
+    /// its anchor); only the writer's open commits before it, through its own path.
     Carry,
 }
 
-/// Writes `update`'s stamp row into `txn`, then commits it. Returns the stamp committed, `None`
-/// for a [`Update::Carry`] before the first stamp (with `blocks` and `block_index` empty). On
-/// an error ([`Update`] names the rules) `txn` is dropped, so nothing of it is written.
+/// Writes `update`'s stamp row into `txn`, then commits it. Returns the stamp committed (always
+/// `Some`; `None` is only the writer's open's, before the first stamp). On an error
+/// ([`Update`] names the rules) `txn` is dropped, so nothing of it is written.
 pub fn commit(txn: RwTxn<'_>, update: Update) -> Result<Option<Stamp>> {
     let stamp = match update {
         Update::New(new) => {
@@ -296,7 +294,7 @@ pub fn commit(txn: RwTxn<'_>, update: Update) -> Result<Option<Stamp>> {
             }
             Some(new)
         }
-        Update::Carry => carried(&txn)?,
+        Update::Carry => Some(stamp::read(&txn)?.ok_or(Error::CarryBeforeFirstStamp)?),
     };
     write(txn, stamp)
 }
@@ -304,8 +302,8 @@ pub fn commit(txn: RwTxn<'_>, update: Update) -> Result<Option<Stamp>> {
 /// The commit of the writer's open ([`crate::env::open_writer_with`], its only caller). With a
 /// stamp stored it is [`commit`] with [`Update::Carry`]. With none it commits no stamp row, and
 /// is refused ([`Error::StampMissing`]) if `blocks` or `block_index` holds a row: a store
-/// written raw, or a v1 store with blocks and no stamp. Apart from [`Update::Carry`] so the open
-/// of a fresh store keeps committing once a `Carry` with no stamp is refused outright (#208a).
+/// written raw, or a v1 store with blocks and no stamp. Apart from [`Update::Carry`], which
+/// refuses every commit before the first stamp, so the open of a fresh store still commits.
 pub(crate) fn commit_open(txn: RwTxn<'_>) -> Result<Option<Stamp>> {
     let stamp = carried(&txn)?;
     write(txn, stamp)
@@ -463,71 +461,8 @@ mod tests {
         txn.get::<Vec<u8>>(&columns, key).unwrap()
     }
 
-    /// Commits a state and a column row with `Carry`; expects [`Error::StampMissing`] naming
-    /// `table`, and the env exactly as before: every table's rows, and still no stamp row.
-    fn carry_refused(writer: &WriterEnv, table: &str) {
-        let before = snapshot(writer);
-        let txn = begin(writer).unwrap();
-        put_state(&txn, b"one");
-        put_column(&txn, &column_key(5, &A, 0));
-        let err = commit(txn, Update::Carry).unwrap_err();
-        assert!(
-            matches!(err, Error::StampMissing { table: t } if t == table),
-            "{err:?}"
-        );
-        assert_eq!(
-            snapshot(writer),
-            before,
-            "the refused commit changed the env"
-        );
-        assert_eq!(stamp_row(writer), None);
-    }
-
-    /// Before the first stamp there is nothing to carry: with `blocks` and `block_index` empty a
-    /// `Carry` commit writes its data and no stamp row. With `blocks` rows it is refused
-    /// ([`Error::StampMissing`]), and its data is not committed: those blocks would have no
-    /// head.
-    #[test]
-    fn carry_before_the_first_stamp_writes_no_stamp() {
-        let (_empty, writer) = fresh();
-        let txn = begin(&writer).unwrap();
-        put_state(&txn, b"one");
-        assert_eq!(commit(txn, Update::Carry).unwrap(), None);
-        assert!(has_state(&writer, b"one"));
-        assert_eq!(stamp_row(&writer), None);
-
-        let (_dir, writer) = env_with_blocks();
-        let txn = begin(&writer).unwrap();
-        put_state(&txn, b"one");
-        let err = commit(txn, Update::Carry).unwrap_err();
-        assert!(
-            matches!(err, Error::StampMissing { table: "blocks" }),
-            "{err:?}"
-        );
-        assert!(!has_state(&writer, b"one"));
-        assert_eq!(stamp_row(&writer), None);
-    }
-
-    /// S1: `blocks` rows and no stamp (a store written raw): a `Carry` of a state and a column
-    /// row is refused and commits nothing.
-    #[test]
-    fn carry_with_blocks_and_no_stamp_is_refused() {
-        let (_dir, writer) = env_with_blocks();
-        assert_eq!(snapshot(&writer)[4].1.len(), 2, "A and B are seeded");
-        carry_refused(&writer, "blocks");
-    }
-
-    /// S1: a `block_index` row alone is enough, and the error names that table.
-    #[test]
-    fn carry_with_block_index_and_no_stamp_is_refused() {
-        let (_dir, writer) = fresh();
-        seed(&writer, BLOCK_INDEX, &[(&B, &9u64.to_be_bytes())]);
-        carry_refused(&writer, "block_index");
-    }
-
-    /// S1 counts the rows the txn itself writes: a `Carry` that puts the first block (both its
-    /// rows, through [`blocks::put`]) or only a `block_index` row on a fresh, unstamped store
-    /// is refused and commits nothing.
+    /// A `Carry` that puts the first block (both its rows, through [`blocks::put`]) or only a
+    /// `block_index` row on a fresh, unstamped store is refused and commits nothing.
     #[test]
     fn carry_that_writes_the_first_block_is_refused() {
         let (_dir, writer) = fresh();
@@ -540,10 +475,7 @@ mod tests {
         );
         put_state(&txn, &slot_root_key(5, &root));
         let err = commit(txn, Update::Carry).unwrap_err();
-        assert!(
-            matches!(err, Error::StampMissing { table: "blocks" }),
-            "{err:?}"
-        );
+        assert!(matches!(err, Error::CarryBeforeFirstStamp), "{err:?}");
         assert_eq!(snapshot(&writer), before);
 
         let txn = begin(&writer).unwrap();
@@ -551,32 +483,8 @@ mod tests {
         txn.put(&index, root, 5u64.to_be_bytes(), WriteFlags::UPSERT)
             .unwrap();
         let err = commit(txn, Update::Carry).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                Error::StampMissing {
-                    table: "block_index"
-                }
-            ),
-            "{err:?}"
-        );
+        assert!(matches!(err, Error::CarryBeforeFirstStamp), "{err:?}");
         assert_eq!(snapshot(&writer), before);
-        assert_eq!(stamp_row(&writer), None);
-    }
-
-    /// S1's other side: with `blocks` and `block_index` empty, column and custody writes before
-    /// any block commit with `Carry` and no stamp row.
-    #[test]
-    fn carry_of_columns_before_any_block_commits_without_a_stamp() {
-        let (_dir, writer) = fresh();
-        let key = column_key(5, &A, 3);
-        let txn = begin(&writer).unwrap();
-        put_column(&txn, &key);
-        let meta = txn.open_table(Some(META)).unwrap();
-        txn.put(&meta, b"cgc", 8u64.to_be_bytes(), WriteFlags::UPSERT)
-            .unwrap();
-        assert_eq!(commit(txn, Update::Carry).unwrap(), None);
-        assert_eq!(column(&writer, &key), Some(b"column".to_vec()));
         assert_eq!(stamp_row(&writer), None);
     }
 
@@ -839,7 +747,7 @@ mod tests {
     #[test]
     fn rwtxn_no_raw_commit() {
         let _: fn() = <RwTxn<'_> as AmbiguousIfDeref<_>>::item;
-        let (_dir, writer) = fresh();
+        let (_dir, writer) = env_with_blocks();
         let mut txn = begin(&writer).unwrap();
         put_state(&txn, b"dropped");
         let NoRawCommit = (&mut txn).commit();
@@ -852,9 +760,9 @@ mod tests {
 
         let txn = begin(&writer).unwrap();
         put_state(&txn, b"committed");
-        assert_eq!(commit(txn, Update::Carry).unwrap(), None);
+        assert_eq!(commit(txn, Update::New(valid())).unwrap(), Some(valid()));
         assert!(has_state(&writer, b"committed"));
-        assert_eq!(stamp_row(&writer), None);
+        assert_eq!(stamp_row(&writer).unwrap(), valid().encode());
     }
 
     /// The full rule: before the first stamp there is nothing to carry, so a `Carry` commit is

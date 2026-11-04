@@ -328,8 +328,8 @@ impl ColumnWriter {
         self.rw_txns.load(Ordering::Relaxed)
     }
 
-    /// Of [`Self::rw_txns_committed`], those that committed a stamp row: every one once the env
-    /// has a stamp ([`store_schema::stamp`]), none before.
+    /// Of [`Self::rw_txns_committed`], those that committed a stamp row ([`store_schema::stamp`]):
+    /// every one, since none commits before the env's first stamp.
     #[must_use]
     pub fn stamped_txns_committed(&self) -> u64 {
         self.stamped_txns.load(Ordering::Relaxed)
@@ -1701,8 +1701,9 @@ mod tests {
     }
 
     /// C2: every column write txn commits through `store_schema::txn::commit` with
-    /// `Update::Carry`: one stamp row, unchanged, in each chunk txn and each other write txn,
-    /// none before the first stamp, and a stamp that does not validate fails the commit.
+    /// `Update::Carry`: one stamp row, unchanged, in each chunk txn and each other write txn;
+    /// before the first stamp none commits (nothing to carry), and a stamp that does not
+    /// validate fails the commit.
     #[test]
     fn every_chunk_txn_carries_the_stamp() {
         let dir = tempfile::tempdir().unwrap();
@@ -1710,15 +1711,33 @@ mod tests {
         let all: Vec<u64> = (0..NUMBER_OF_COLUMNS).collect();
         let root_c: BlockRoot = [0xcc; 32];
 
-        // Before any block: nothing to carry (open question 1). The chunks commit alone.
-        write_block(&writer, 3, &ROOT_A, &all);
-        assert_eq!(writer.rw_txns_committed(), 8);
-        assert_eq!(writer.stamped_txns_committed(), 0);
+        // Before the first stamp: the first chunk txn is refused, and so is any other write
+        // txn. Nothing is stored.
+        let unstamped: Vec<Column<'_>> = all
+            .iter()
+            .map(|&index| Column { index, ssz: b"x" })
+            .collect();
+        for err in [
+            writer.write_columns(3, &ROOT_A, &unstamped).unwrap_err(),
+            writer.set_cgc(4).unwrap_err(),
+        ] {
+            assert!(
+                matches!(
+                    err,
+                    Error::Schema(store_schema::Error::CarryBeforeFirstStamp)
+                ),
+                "{err:?}"
+            );
+        }
+        assert_eq!(writer.rw_txns_committed(), 0);
+        assert_eq!(writer.reader().columns_for_root(&ROOT_A).unwrap(), vec![]);
+        assert_eq!(writer.reader().cgc().unwrap(), None);
         assert_eq!(stamp_row(&writer), None);
 
         let stamp = stamp_block(&writer, 6, &[0xee; 32]);
         let row = stamp_row(&writer).unwrap();
         assert_eq!(row, stamp.encode());
+        write_block(&writer, 3, &ROOT_A, &all);
         let (txns, stamped) = (writer.rw_txns_committed(), writer.stamped_txns_committed());
         write_block(&writer, 7, &ROOT_B, &all);
         assert_eq!(writer.rw_txns_committed() - txns, 8);
