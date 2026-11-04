@@ -1,20 +1,62 @@
 //! `GET /eth/v1/events`: the beacon-APIs event stream (`apis/eventstream/index.yaml` at
-//! `01e99a6`), fed by cl-chain's chain.v1 `EventsService`. (Stub: the tests come first.)
+//! `01e99a6`), fed by cl-chain's chain.v1 `EventsService`.
+//!
+//! - **Topics** ([`Topics::parse`]). `topics` is repeated (`topics=head&topics=block`) or
+//!   comma-separated (`topics=head,block`); a topic named twice counts once. The topics served
+//!   are [`Topic::ALL`]. Any other name, a beacon-APIs topic not served yet
+//!   (`execution_payload`, `payload_attestation_message`, ...), an empty name or no topic at all
+//!   answers 400 with the beacon-APIs error body, before anything else is looked at.
+//! - **Events** ([`render`]). cl-chain writes each event's beacon-API JSON into the frame's
+//!   `data_json` (`cl_chain::events`). It is parsed and written again, so what goes out has
+//!   exactly the fields of the topic's schema, integers as quoted decimals and roots and hashes
+//!   as `0x` and 64 lowercase hex digits, on one `data` line. A frame whose data does not parse
+//!   is dropped and logged. One HEAD frame is two events, `head` then `head_v2`:
+//!   - `head` is the 01e99a6 schema, without `payload_status`.
+//!   - `head_v2` is `{"version": <fork of the head's slot>, "data": {...}}` with
+//!     `payload_status`. The dependent roots take their v2 names: `current_epoch_dependent_root`
+//!     is the frame's `previous_duty_dependent_root` and `next_epoch_dependent_root` its
+//!     `current_duty_dependent_root`. A head before Fulu has no fork to name, so it has no
+//!     `head_v2`.
+//!
+//!   `block` carries the Gloas `builder_index` and `block_hash` when cl-chain names them.
+//! - **Fan-out** ([`EventHub`]). One chain.v1 `Subscribe`, on every v1 kind, serves every
+//!   connection. [`EventHub::follow`] renders each frame once and broadcasts it. A connection may
+//!   fall [`CLIENT_QUEUE_EVENTS`] events behind. Past that, its stream ends, and the other
+//!   connections and the subscription go on. The policy is to close the slow connection: the hub
+//!   never waits for one, and a stream never skips events silently. A client that has stopped
+//!   reading altogether is closed by the server's write timeout.
+//! - **No gaps.** cl-chain replays nothing, so a stream lives within one subscription. Until the
+//!   subscription is open (cl-chain's hello read), a request answers 503. When it ends, every
+//!   open stream ends with it, and the hub subscribes again after [`UPSTREAM_RETRY`]. It ends
+//!   when cl-chain stops or ends it (a stream that lags its bus), or breaks the contract: a `seq`
+//!   that does not rise, or `EVENT_KIND_UNSPECIFIED`. A client that reconnects reconciles over
+//!   the REST routes.
+//! - **Shutdown.** [`EventHub::follow`] stops with the server, and every open stream ends with
+//!   it, so the server's drain does not wait on them.
+//!
+//! The route is mounted without the request timeout (`server::router`).
 
+use std::convert::Infallible;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use ethswarm_proto::chain as pb;
-use http::Uri;
-use ipc::Link;
-use network_config::ForkSchedule;
+use http::header::{CACHE_CONTROL, CONTENT_TYPE};
+use http::{HeaderValue, StatusCode, Uri};
+use ipc::frame::Inbound;
+use ipc::{ContractError, Link};
+use network_config::{ForkName, ForkSchedule};
 use pb::events_service_client::EventsServiceClient;
+use pb::EventKind;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize, Serializer};
+use tokio::sync::broadcast::{self, error::RecvError};
 use tonic::transport::Channel;
 
 use crate::server::{ApiError, ApiState};
@@ -22,11 +64,44 @@ use crate::server::{ApiError, ApiState};
 /// The route.
 pub const EVENTS_PATH: &str = "/eth/v1/events";
 
-/// Events one connection may fall behind the subscription before its stream ends.
+/// Events one connection may fall behind the subscription before its stream ends: the
+/// per-connection queue. Its policy is to close that connection, never to wait for it or to skip
+/// events. [6.26] tunes the cap.
 pub const CLIENT_QUEUE_EVENTS: usize = 256;
 
 /// The pause before the hub subscribes again after its subscription ended or failed.
 pub const UPSTREAM_RETRY: Duration = Duration::from_secs(1);
+
+/// The chain.v1 kinds the hub subscribes to: every v1 kind.
+const KINDS: [EventKind; 4] = [
+    EventKind::Head,
+    EventKind::Block,
+    EventKind::FinalizedCheckpoint,
+    EventKind::ChainReorg,
+];
+
+/// The other topics of the beacon APIs at `01e99a6`, which are not served yet.
+const NOT_SERVED: [&str; 19] = [
+    "block_gossip",
+    "attestation",
+    "single_attestation",
+    "voluntary_exit",
+    "bls_to_execution_change",
+    "proposer_slashing",
+    "attester_slashing",
+    "contribution_and_proof",
+    "light_client_finality_update",
+    "light_client_optimistic_update",
+    "payload_attributes",
+    "data_column_sidecar",
+    "execution_payload",
+    "execution_payload_gossip",
+    "execution_payload_available",
+    "execution_payload_bid",
+    "payload_attestation_message",
+    "fast_confirmation",
+    "proposer_preferences",
+];
 
 /// A topic this server streams.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +134,20 @@ impl Topic {
             Self::ChainReorg => "chain_reorg",
         }
     }
+
+    fn named(name: &str) -> Result<Self, ApiError> {
+        if let Some(topic) = Self::ALL.into_iter().find(|t| t.name() == name) {
+            return Ok(topic);
+        }
+        let message = if name.is_empty() {
+            "Invalid topic: an empty name".to_owned()
+        } else if NOT_SERVED.contains(&name) {
+            format!("Topic not served yet: {name}")
+        } else {
+            format!("Invalid topic: {name}")
+        };
+        Err(ApiError::bad_request(message))
+    }
 }
 
 /// The topics one connection asked for.
@@ -66,24 +155,32 @@ impl Topic {
 pub struct Topics(u8);
 
 impl Topics {
-    /// The `topics` of a query string.
+    /// The `topics` of a query string; other parameters are ignored.
     ///
     /// # Errors
     ///
-    /// 400.
+    /// 400 for a name that is not a served topic (an empty one included), or no topic.
     pub fn parse(query: Option<&str>) -> Result<Self, ApiError> {
-        let _ = query;
-        todo!("[6.12] topics")
+        let mut topics = Self::default();
+        let pairs = form_urlencoded::parse(query.unwrap_or_default().as_bytes());
+        for (_, value) in pairs.filter(|(key, _)| key == "topics") {
+            for name in value.split(',') {
+                topics.0 |= 1 << Topic::named(name)? as u8;
+            }
+        }
+        if topics.0 == 0 {
+            return Err(ApiError::bad_request("No topic given in topics"));
+        }
+        Ok(topics)
     }
 
     #[must_use]
     pub fn contains(self, topic: Topic) -> bool {
-        let _ = topic;
-        todo!("[6.12] topics")
+        self.0 & (1 << topic as u8) != 0
     }
 }
 
-/// What `head_v2` needs to name the fork of a head.
+/// What `head_v2` needs to name the fork of a head: the fork schedule and the epoch length.
 #[derive(Clone, Copy, Debug)]
 pub struct Forks {
     pub schedule: ForkSchedule,
@@ -91,6 +188,7 @@ pub struct Forks {
 }
 
 impl Forks {
+    /// The network's, from its link.
     #[must_use]
     pub fn of(link: &Link) -> Self {
         Self {
@@ -98,9 +196,14 @@ impl Forks {
             slots_per_epoch: link.slots_per_epoch(),
         }
     }
+
+    fn at_slot(&self, slot: u64) -> Option<ForkName> {
+        self.schedule.fork_at(slot / self.slots_per_epoch.max(1))
+    }
 }
 
-/// One frame, rendered once for every connection.
+/// One frame, rendered once for every connection: its events in order, each as
+/// `text/event-stream` text.
 #[derive(Debug)]
 pub struct Rendered {
     events: Vec<(Topic, Bytes)>,
@@ -110,25 +213,242 @@ impl Rendered {
     /// What a connection on `topics` sends of it; `None` if nothing.
     #[must_use]
     pub fn chunk(&self, topics: Topics) -> Option<Bytes> {
-        let _ = (topics, &self.events);
-        todo!("[6.12] render")
+        let mut texts = self
+            .events
+            .iter()
+            .filter(|(topic, _)| topics.contains(*topic))
+            .map(|(_, text)| text);
+        let first = texts.next()?;
+        let Some(second) = texts.next() else {
+            return Some(first.clone());
+        };
+        let mut joined = first.to_vec();
+        for text in std::iter::once(second).chain(texts) {
+            joined.extend_from_slice(text);
+        }
+        Some(joined.into())
     }
 }
 
-/// The events of one chain.v1 frame body.
+/// The events of one chain.v1 frame body; `Ok(None)` for a kind this server does not stream.
 ///
 /// # Errors
 ///
-/// The frame's data does not parse.
+/// The frame's `data_json` does not parse as its kind's event.
 pub fn render(body: &pb::SubscribeResponseBody, forks: &Forks) -> Result<Option<Rendered>, String> {
-    let _ = (body, forks);
-    todo!("[6.12] render")
+    let data = &body.data_json;
+    let events = match EventKind::try_from(body.kind) {
+        Ok(EventKind::Head) => heads(data, forks)?,
+        Ok(EventKind::Block) => vec![again::<BlockData>(Topic::Block, data)?],
+        Ok(EventKind::FinalizedCheckpoint) => {
+            vec![again::<FinalizedData>(Topic::FinalizedCheckpoint, data)?]
+        }
+        Ok(EventKind::ChainReorg) => vec![again::<ReorgData>(Topic::ChainReorg, data)?],
+        _ => return Ok(None),
+    };
+    Ok(Some(Rendered { events }))
 }
 
-/// The fan-out: one chain.v1 `Subscribe` shared by every connection.
+fn parse<T: DeserializeOwned>(topic: Topic, data: &[u8]) -> Result<T, String> {
+    serde_json::from_slice(data).map_err(|e| format!("{} data: {e}", topic.name()))
+}
+
+/// `data` parsed as `T` and written again as `topic`'s event.
+fn again<T: DeserializeOwned + Serialize>(
+    topic: Topic,
+    data: &[u8],
+) -> Result<(Topic, Bytes), String> {
+    Ok((topic, sse(topic, &parse::<T>(topic, data)?)))
+}
+
+/// One event: its `event` line and one `data` line (compact JSON has no line break).
+fn sse(topic: Topic, data: &impl Serialize) -> Bytes {
+    // Strings, numbers and booleans only: serializing cannot fail.
+    let json = serde_json::to_string(data).unwrap_or_default();
+    Bytes::from(format!("event: {}\ndata: {json}\n\n", topic.name()))
+}
+
+/// `head`, then `head_v2` if the head's slot has a fork.
+fn heads(data: &[u8], forks: &Forks) -> Result<Vec<(Topic, Bytes)>, String> {
+    let h: HeadData = parse(Topic::Head, data)?;
+    let v1 = HeadV1 {
+        slot: h.slot,
+        block: &h.block,
+        state: &h.state,
+        epoch_transition: h.epoch_transition,
+        previous_duty_dependent_root: &h.previous_duty_dependent_root,
+        current_duty_dependent_root: &h.current_duty_dependent_root,
+        execution_optimistic: h.execution_optimistic,
+    };
+    let mut events = vec![(Topic::Head, sse(Topic::Head, &v1))];
+    let Some(fork) = forks.at_slot(h.slot.0) else {
+        tracing::debug!(slot = h.slot.0, "a head before Fulu: no head_v2");
+        return Ok(events);
+    };
+    let v2 = HeadV2 {
+        version: fork.as_str(),
+        data: HeadV2Data {
+            slot: h.slot,
+            block: &h.block,
+            state: &h.state,
+            payload_status: h.payload_status,
+            epoch_transition: h.epoch_transition,
+            current_epoch_dependent_root: &h.previous_duty_dependent_root,
+            next_epoch_dependent_root: &h.current_duty_dependent_root,
+            execution_optimistic: h.execution_optimistic,
+        },
+    };
+    events.push((Topic::HeadV2, sse(Topic::HeadV2, &v2)));
+    Ok(events)
+}
+
+/// A `uint64` as the beacon APIs write it: a quoted decimal.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(try_from = "String")]
+struct Quoted(u64);
+
+impl TryFrom<String> for Quoted {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, String> {
+        // Digits only: `u64::from_str` would also take a leading `+`.
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!("{s:?} is not a quoted decimal"));
+        }
+        s.parse().map(Self).map_err(|e| format!("{s:?}: {e}"))
+    }
+}
+
+impl Serialize for Quoted {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&self.0)
+    }
+}
+
+/// A root or a hash: `0x` and 64 hex digits, kept in lowercase.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(try_from = "String")]
+struct Hex32(String);
+
+impl TryFrom<String> for Hex32 {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, String> {
+        match s.strip_prefix("0x") {
+            Some(hex) if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                Ok(Self(s.to_ascii_lowercase()))
+            }
+            _ => Err(format!("{s:?} is not 0x and 32 bytes of hex")),
+        }
+    }
+}
+
+impl Serialize for Hex32 {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+/// The fork-choice head node's payload status (`head_v2`).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PayloadStatus {
+    Empty,
+    Full,
+    Pending,
+}
+
+/// HEAD's `data_json`: the `head` fields and the head node's `payload_status`.
+#[derive(Deserialize)]
+struct HeadData {
+    slot: Quoted,
+    block: Hex32,
+    state: Hex32,
+    epoch_transition: bool,
+    previous_duty_dependent_root: Hex32,
+    current_duty_dependent_root: Hex32,
+    execution_optimistic: bool,
+    payload_status: PayloadStatus,
+}
+
+/// `head`.
+#[derive(Serialize)]
+struct HeadV1<'a> {
+    slot: Quoted,
+    block: &'a Hex32,
+    state: &'a Hex32,
+    epoch_transition: bool,
+    previous_duty_dependent_root: &'a Hex32,
+    current_duty_dependent_root: &'a Hex32,
+    execution_optimistic: bool,
+}
+
+/// `head_v2`.
+#[derive(Serialize)]
+struct HeadV2<'a> {
+    version: &'static str,
+    data: HeadV2Data<'a>,
+}
+
+#[derive(Serialize)]
+struct HeadV2Data<'a> {
+    slot: Quoted,
+    block: &'a Hex32,
+    state: &'a Hex32,
+    payload_status: PayloadStatus,
+    epoch_transition: bool,
+    current_epoch_dependent_root: &'a Hex32,
+    next_epoch_dependent_root: &'a Hex32,
+    execution_optimistic: bool,
+}
+
+/// `block`; the bid's fields from Gloas.
+#[derive(Serialize, Deserialize)]
+struct BlockData {
+    slot: Quoted,
+    block: Hex32,
+    execution_optimistic: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    builder_index: Option<Quoted>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    block_hash: Option<Hex32>,
+}
+
+/// `finalized_checkpoint`.
+#[derive(Serialize, Deserialize)]
+struct FinalizedData {
+    block: Hex32,
+    state: Hex32,
+    epoch: Quoted,
+    execution_optimistic: bool,
+}
+
+/// `chain_reorg`.
+#[derive(Serialize, Deserialize)]
+struct ReorgData {
+    slot: Quoted,
+    depth: Quoted,
+    old_head_block: Hex32,
+    new_head_block: Hex32,
+    old_head_state: Hex32,
+    new_head_state: Hex32,
+    epoch: Quoted,
+    execution_optimistic: bool,
+}
+
+/// The fan-out: one chain.v1 `Subscribe` shared by every connection (see the module docs).
+/// Clones share it.
 #[derive(Clone, Debug)]
 pub struct EventHub {
-    inner: Arc<usize>,
+    inner: Arc<Hub>,
+}
+
+#[derive(Debug)]
+struct Hub {
+    /// The open subscription's events, `None` while there is none.
+    live: Mutex<Option<broadcast::Sender<Arc<Rendered>>>>,
+    /// [`CLIENT_QUEUE_EVENTS`], or a test's.
+    queue: usize,
 }
 
 impl Default for EventHub {
@@ -138,33 +458,123 @@ impl Default for EventHub {
 }
 
 impl EventHub {
+    /// A hub whose connections may fall [`CLIENT_QUEUE_EVENTS`] events behind.
     #[must_use]
     pub fn new() -> Self {
         Self::with_queue(CLIENT_QUEUE_EVENTS)
     }
 
+    /// A hub whose connections may fall `events` (at least one) behind. The broadcast
+    /// channel rounds this up to a power of two, as [`CLIENT_QUEUE_EVENTS`] already is.
     #[must_use]
     pub fn with_queue(events: usize) -> Self {
         Self {
-            inner: Arc::new(events),
+            inner: Arc::new(Hub {
+                live: Mutex::new(None),
+                queue: events.max(1),
+            }),
         }
     }
 
-    /// Whether a subscription is open.
-    #[must_use]
-    pub fn is_live(&self) -> bool {
-        todo!("[6.12] hub")
+    fn live(&self) -> MutexGuard<'_, Option<broadcast::Sender<Arc<Rendered>>>> {
+        self.inner
+            .live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Follows cl-chain's events until `stop`.
+    /// Whether a subscription is open, so a new connection is served.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        self.live().is_some()
+    }
+
+    /// The open subscription's next events, if one is open.
+    fn attach(&self) -> Option<broadcast::Receiver<Arc<Rendered>>> {
+        self.live().as_ref().map(broadcast::Sender::subscribe)
+    }
+
+    /// Subscribes to cl-chain's events through `client` with `link`'s hello, and again after
+    /// [`UPSTREAM_RETRY`] each time the subscription fails or ends, until `stop`. Then every
+    /// open stream ends.
     pub async fn follow(
         self,
-        client: EventsServiceClient<Channel>,
+        mut client: EventsServiceClient<Channel>,
         link: Link,
         stop: impl Future<Output = ()>,
     ) {
-        let _ = (client, link, stop, self.inner);
-        todo!("[6.12] hub")
+        let subscriptions = async {
+            loop {
+                match self.subscription(&mut client, &link).await {
+                    Ok(end) => tracing::warn!(
+                        %end,
+                        "cl-chain's event stream ended, and every /eth/v1/events stream with it"
+                    ),
+                    Err(e) => tracing::debug!(error = %e, "cannot subscribe to cl-chain's events"),
+                }
+                tokio::time::sleep(UPSTREAM_RETRY).await;
+            }
+        };
+        tokio::select! {
+            () = stop => {}
+            () = subscriptions => {}
+        }
+        self.live().take();
+    }
+
+    /// One subscription, served to new connections while it is open: why it ended, or `Err`
+    /// if it did not open.
+    async fn subscription(
+        &self,
+        client: &mut EventsServiceClient<Channel>,
+        link: &Link,
+    ) -> Result<String, String> {
+        let request = pb::SubscribeRequest {
+            kinds: KINDS.map(|kind| kind as i32).to_vec(),
+            resume_from_seq: 0,
+            hello: Some(link.local()),
+        };
+        let stream = client
+            .subscribe(request)
+            .await
+            .map_err(|e| format!("Subscribe: {e}"))?
+            .into_inner();
+        let mut frames = link
+            .open(Inbound::from_server(stream))
+            .await
+            .map_err(|e| format!("Subscribe: {e}"))?;
+        let (sender, _) = broadcast::channel(self.inner.queue);
+        *self.live() = Some(sender.clone());
+        tracing::info!("subscribed to cl-chain's events: /eth/v1/events is served");
+        let forks = Forks::of(link);
+        let mut last = 0;
+        let end = loop {
+            let body = match frames.body().await {
+                Ok(Some(accepted)) => accepted.body,
+                Ok(None) => break "cl-chain closed it".to_owned(),
+                Err(e) => break e.to_string(),
+            };
+            if body.seq <= last || body.kind == EventKind::Unspecified as i32 {
+                let detail = format!(
+                    "event seq {} of kind {} after seq {last}",
+                    body.seq, body.kind
+                );
+                let e = ContractError::violation(detail);
+                link.record(&e);
+                break e.to_string();
+            }
+            last = body.seq;
+            match render(&body, &forks) {
+                Ok(Some(event)) => {
+                    // No connection is attached: nothing to send it to.
+                    let _ = sender.send(Arc::new(event));
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(seq = body.seq, error = %e, "cl-chain event dropped"),
+            }
+        };
+        self.live().take();
+        Ok(end)
     }
 }
 
@@ -173,9 +583,37 @@ pub fn routes() -> Router<ApiState> {
     Router::new().route(EVENTS_PATH, get(events))
 }
 
+/// 400 for bad topics, 503 without a subscription, else the stream.
 async fn events(State(state): State<ApiState>, uri: Uri) -> Response {
-    let _ = (state, uri);
-    todo!("[6.12] route")
+    let topics = match Topics::parse(uri.query()) {
+        Ok(topics) => topics,
+        Err(e) => return e.into_response(),
+    };
+    let Some(receiver) = state.events.attach() else {
+        let message = "Not subscribed to cl-chain's events yet; try again";
+        return ApiError::new(StatusCode::SERVICE_UNAVAILABLE, message).into_response();
+    };
+    let stream = futures_util::stream::unfold(receiver, move |mut receiver| async move {
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    if let Some(chunk) = event.chunk(topics) {
+                        return Some((Ok::<_, Infallible>(chunk), receiver));
+                    }
+                }
+                Err(RecvError::Lagged(missed)) => {
+                    tracing::info!(missed, "an /eth/v1/events client fell behind: closed");
+                    return None;
+                }
+                Err(RecvError::Closed) => return None,
+            }
+        }
+    });
+    let headers = [
+        (CONTENT_TYPE, HeaderValue::from_static("text/event-stream")),
+        (CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+    ];
+    (headers, Body::from_stream(stream)).into_response()
 }
 
 #[cfg(test)]

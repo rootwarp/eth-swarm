@@ -40,9 +40,12 @@
 //! - **cl-chain** is reached on `chain_socket` only if its server runs as `chain_uid`
 //!   (`ipc::uds::PeerCheckedConnector`). The channel connects lazily, so cl-api starts, and
 //!   answers 503 from `node/health`, while cl-chain is still down. cl-chain's ACL must give
-//!   `/ethswarm.chain.v1.ImportService/GetChainStatus` to cl-api.
+//!   cl-api [`CHAIN_METHODS`]: `ImportService/GetChainStatus` (the poller) and
+//!   `EventsService/Subscribe` (`/eth/v1/events`, one subscription for every client:
+//!   [`crate::sse`]). Without the subscription, `/eth/v1/events` answers 503.
 //! - **Shutdown.** At SIGTERM, the gRPC socket drains (svc-runtime), and the HTTP server stops
-//!   accepting and lets its open requests finish.
+//!   accepting and lets its open requests finish. Every `/eth/v1/events` stream ends then, so
+//!   none holds up the drain.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -51,9 +54,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ethswarm_proto::api::api_service_server::ApiServiceServer;
+use ethswarm_proto::chain::events_service_client::EventsServiceClient;
 use ethswarm_proto::chain::import_service_client::ImportServiceClient;
 use ipc::hello::{NetworkHello, API_VERSION_V1};
 use ipc::uds::PeerCheckedConnector;
+use ipc::Link;
 use network_config::{ChainConfig, Genesis};
 use serde::Deserialize;
 use svc_runtime::{Config, Hooks, Services};
@@ -64,6 +69,7 @@ use tonic::transport::Endpoint;
 use crate::node_state::{poll_chain, NodeState, SlotClock};
 use crate::routes::config::{ConfigData, ConfigDataError};
 use crate::server::{is_bare_host, router, ApiState, BindError, HttpBind, HttpLimits};
+use crate::sse::EventHub;
 use crate::ApiStub;
 
 /// The exit code of a config that does not load.
@@ -79,7 +85,10 @@ pub const SERVICE: &str = "cl-api";
 pub const DEFAULT_CHAIN_SOCKET: &str = "/run/ethswarm/cl-chain/cl-chain.sock";
 
 /// The chain.v1 methods cl-api calls. cl-chain's method ACL must give each of them to cl-api.
-pub const CHAIN_METHODS: [&str; 1] = ["/ethswarm.chain.v1.ImportService/GetChainStatus"];
+pub const CHAIN_METHODS: [&str; 2] = [
+    "/ethswarm.chain.v1.ImportService/GetChainStatus",
+    "/ethswarm.chain.v1.EventsService/Subscribe",
+];
 
 /// How often cl-chain is polled unless `poll_interval_ms` says otherwise.
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
@@ -248,16 +257,27 @@ impl ApiSettings {
     }
 }
 
-/// The Beacon API side, started: the server and the poller.
+/// The Beacon API side, started: the server, the poller and the events subscription.
 pub struct Http {
     /// The address the server listens on.
     pub addr: SocketAddr,
     pub server: JoinHandle<()>,
     pub poller: JoinHandle<()>,
+    /// [`EventHub::follow`].
+    pub events: JoinHandle<()>,
 }
 
-/// Binds the Beacon API, then starts the poller and the server. Both stop once `stop` turns
-/// `true` or its sender is gone.
+/// cl-api's link: the network's hello, on its gRPC service and on every chain.v1 stream.
+fn link(chain: &ChainConfig, genesis: Genesis) -> Result<Link, ServiceError> {
+    let build = format!("cl-api/{}", env!("CARGO_PKG_VERSION"));
+    NetworkHello::new(&build, chain, genesis)
+        .map_err(|e| e.to_string())
+        .and_then(|hello| Link::network(Arc::new(hello), API_VERSION_V1).map_err(|e| e.to_string()))
+        .map_err(|e| ServiceError::Config(format!("the ethswarm.api.v1 link: {e}")))
+}
+
+/// Binds the Beacon API, then starts the poller, the events subscription and the server. All
+/// three stop once `stop` turns `true` or its sender is gone.
 ///
 /// # Errors
 ///
@@ -269,6 +289,7 @@ pub async fn start_http(
     stop: watch::Receiver<bool>,
 ) -> Result<Http, ServiceError> {
     let config = Arc::new(ConfigData::new(chain)?);
+    let link = link(chain, genesis)?;
     let listener = settings.bind().bind().await?;
     let addr = listener.local_addr().map_err(|source| BindError::Io {
         addr: settings.http_listen,
@@ -285,13 +306,18 @@ pub async fn start_http(
     // The authority routes nothing: the connector picks the socket.
     let channel = Endpoint::from_static("http://localhost").connect_with_connector_lazy(connector);
     let poller = tokio::spawn(poll_chain(
-        ImportServiceClient::new(channel),
+        ImportServiceClient::new(channel.clone()),
         node.clone(),
         settings.poll_interval(),
         stopped(stop.clone()),
     ));
+    let events = EventHub::new();
+    let follower = tokio::spawn(events.clone().follow(
+        EventsServiceClient::new(channel),
+        link,
+        stopped(stop.clone()),
+    ));
     let limits = settings.limits();
-    let events = crate::sse::EventHub::new();
     let app = router(
         ApiState {
             node,
@@ -305,6 +331,7 @@ pub async fn start_http(
         addr,
         server,
         poller,
+        events: follower,
     })
 }
 
@@ -326,13 +353,7 @@ pub async fn serve(
     mut hooks: Hooks,
 ) -> Result<(), ServiceError> {
     let genesis = config.genesis.ok_or(ServiceError::NoGenesis)?;
-    let build = format!("cl-api/{}", env!("CARGO_PKG_VERSION"));
-    let link = NetworkHello::new(&build, &config.chain, genesis)
-        .map_err(|e| e.to_string())
-        .and_then(|hello| {
-            ipc::Link::network(Arc::new(hello), API_VERSION_V1).map_err(|e| e.to_string())
-        })
-        .map_err(|e| ServiceError::Config(format!("the ethswarm.api.v1 link: {e}")))?;
+    let link = link(&config.chain, genesis)?;
     let (stop, stop_rx) = watch::channel(false);
     let http = start_http(&settings, &config.chain, genesis, stop_rx).await?;
     tracing::info!(
@@ -358,6 +379,7 @@ pub async fn serve(
         ),
     }
     http.poller.abort();
+    http.events.abort();
     result.map_err(ServiceError::from)
 }
 
