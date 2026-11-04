@@ -74,8 +74,9 @@ pub const FIRST_STORED_SLOT_KEY: &[u8] = b"first_stored_slot";
 /// of a block written with [`BlockLink::Gap`] (a blob-carrying block before it on its chain is
 /// not held), or the slot after the highest block of an env written before [`LINKS_TABLE`]
 /// existed (its blocks have no links). It only rises. Status `earliest_available_slot` is never
-/// below it.
-pub const CONTIGUOUS_FROM_KEY: &[u8] = b"contiguous_from";
+/// below it. Store-schema's own name for it: the one row this crate's migration may add in the
+/// writer's open before the first stamp ([`store_schema::keys::CONTIGUOUS_FROM_KEY`]).
+pub const CONTIGUOUS_FROM_KEY: &[u8] = store_schema::keys::CONTIGUOUS_FROM_KEY;
 
 /// How a stored block ties to the stored block before it on its chain, as cl-chain learned when
 /// it stored the block (the parent roots come from the blocks the reference vouched for, through

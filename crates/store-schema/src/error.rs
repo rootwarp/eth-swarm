@@ -101,11 +101,14 @@ pub enum Error {
         /// The block's root in the stamp.
         root: Root,
     },
-    /// The writer's open txn would commit while `blocks` or `block_index` holds rows and the
-    /// env has no stamp yet: blocks with no head would be readable. Nothing was written.
-    #[error("table {table} holds rows but the env has no stamp yet")]
+    /// The writer's open txn would commit while the env has no stamp yet and `blocks` or
+    /// `block_index` holds rows (blocks with no head would be readable), or after it added a
+    /// row to a table (its `upgrade` hook's included): rows that came with no stamp. Nothing
+    /// was written.
+    #[error("table {table} holds rows the env has no stamp for yet")]
     StampMissing {
-        /// The first of `blocks`, `block_index` that holds a row, as the txn sees it.
+        /// The first of `blocks`, `block_index` that holds a row, as the txn sees it; else the
+        /// first table, in [`TABLES`](crate::tables::TABLES) order, the open added a row to.
         table: &'static str,
     },
     /// A [`Update::Carry`](crate::txn::Update::Carry) commit before the first stamp: there is

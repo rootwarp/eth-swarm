@@ -30,7 +30,10 @@ use libmdbx::{
 use store_schema::{
     blocks,
     env::{self, WriterOptions, DEFAULT_MAX_SIZE},
-    keys::{decode_slot_root_key, slot_root_key, Root, SCHEMA_VERSION_KEY, STAMP_KEY},
+    keys::{
+        decode_slot_root_key, slot_root_key, Root, CONTIGUOUS_FROM_KEY, SCHEMA_VERSION_KEY,
+        STAMP_KEY,
+    },
     stamp::{self, Stamp},
     tables::{
         BLOCKS, BLOCK_INDEX, COLUMNS, COLUMN_LINKS, COLUMN_ROOTS, ENVELOPES, FC_SNAPSHOT,
@@ -1052,6 +1055,176 @@ fn an_unstamped_store_with_a_block_index_row_is_refused() {
         before,
         "the refused open changed the env"
     );
+}
+
+/// Puts each `(table, key, value)` of `rows` in `txn`.
+fn put_rows(txn: &txn::RwTxn<'_>, rows: &[(&str, &[u8], &[u8])]) {
+    for &(table, key, value) in rows {
+        let handle = txn.open_table(Some(table)).unwrap();
+        txn.put(&handle, key, value, WriteFlags::UPSERT).unwrap();
+    }
+}
+
+/// `key`'s row of `table`, read raw.
+fn row(db: &Database<NoWriteMap>, table: &str, key: &[u8]) -> Option<Vec<u8>> {
+    let txn = db.begin_ro_txn().unwrap();
+    let handle = txn.open_table(Some(table)).unwrap();
+    txn.get::<Vec<u8>>(&handle, key).unwrap()
+}
+
+/// Before the first stamp the writer's open adds no row, from its `upgrade` hook either. On a
+/// fresh store a hook that puts one row of any table (every table of [`TABLES`], and custody's
+/// `meta` row) is refused, [`Error::StampMissing`] naming that table, and the refused open
+/// writes nothing: no table, no row, and the next open has none of it. Nor does the open mint
+/// the first stamp: a hook that stores a block and a stamp row naming it is refused. On an
+/// unstamped store that holds rows already (a probe store's columns and custody, no block) a
+/// hook that adds a column or a custody `meta` row is refused the same way, and every row stays
+/// as it was.
+#[test]
+fn an_unstamped_open_adds_no_row_from_its_upgrade() {
+    let _serial = serial();
+    let root = [0xaa; 32];
+    let column = column_key(5, &root, 0);
+    let block = slot_root_key(5, &root);
+    let slot = 5u64.to_be_bytes();
+    let cgc = 8u64.to_be_bytes();
+    // One row of each table: `(table, key, value)`.
+    let rows: [(&str, &[u8], &[u8]); 10] = [
+        (COLUMNS, &column, b"column"),
+        (COLUMN_ROOTS, &root, &slot),
+        (META, b"cgc", &cgc),
+        (META, b"retained_from", &slot),
+        (COLUMN_LINKS, &root, b"link"),
+        (BLOCKS, &block, b"block"),
+        (STATES, &block, b"state"),
+        (BLOCK_INDEX, &root, &slot),
+        (ENVELOPES, &block, b"envelope"),
+        (FC_SNAPSHOT, b"fc", b"snapshot"),
+    ];
+    for table in TABLES {
+        assert!(rows.iter().any(|(t, ..)| *t == table), "no row of {table}");
+    }
+    for row_put @ &(table, key, _) in &rows {
+        let dir = tempfile::tempdir().unwrap();
+        let err = env::open_writer_with(dir.path(), opts(), |txn, _| {
+            put_rows(txn, std::slice::from_ref(row_put));
+            Ok::<_, Error>(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::StampMissing { table: t } if t == table),
+            "{table}: {err:?}"
+        );
+        assert_eq!(
+            env_rows(dir.path()),
+            vec![],
+            "{table}: the refused open wrote"
+        );
+        let writer = env::open_writer(dir.path(), opts()).unwrap();
+        assert_eq!(row(writer.raw_env(), table, key), None, "{table}");
+        assert_eq!(meta_row(writer.raw_env(), STAMP_KEY), None, "{table}");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let err = env::open_writer_with(dir.path(), opts(), |txn, _| {
+        let (ssz, root) = common::fulu_block_ssz(5, [0; 32], 1);
+        blocks::put::<common::E>(txn, &common::schedule(), &ssz).unwrap();
+        let stamp = Stamp {
+            head_seq: 1,
+            head_root: root,
+            head_slot: 5,
+            finalized_root: root,
+            finalized_slot: 5,
+        };
+        put_rows(txn, &[(META, STAMP_KEY, &stamp.encode()[..])]);
+        Ok::<_, Error>(())
+    })
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::StampMissing { table } if table == BLOCKS),
+        "a minted stamp: {err:?}"
+    );
+    assert_eq!(env_rows(dir.path()), vec![], "a minted stamp was written");
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let writer = env::open_writer(dir.path(), opts()).unwrap();
+        txn::seed_unstamped(&writer, COLUMNS, &[(&column[..], &b"column"[..])]).unwrap();
+        txn::seed_unstamped(&writer, COLUMN_ROOTS, &[(&root[..], &slot[..])]).unwrap();
+        txn::seed_unstamped(&writer, META, &[(&b"cgc"[..], &cgc[..])]).unwrap();
+    }
+    let before = env_rows(dir.path());
+    let other = column_key(5, &root, 1);
+    for (table, key) in [(COLUMNS, &other[..]), (META, &b"retained_from"[..])] {
+        let err = env::open_writer_with(dir.path(), opts(), |txn, _| {
+            put_rows(txn, &[(table, key, &slot)]);
+            Ok::<_, Error>(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::StampMissing { table: t } if t == table),
+            "{table}: {err:?}"
+        );
+        assert_eq!(
+            env_rows(dir.path()),
+            before,
+            "{table}: the refused open wrote"
+        );
+    }
+}
+
+/// The rule is that the open adds no row, not that the store holds none: an unstamped store
+/// with rows and no block (a probe store's columns, custody and a link) opens when its
+/// `upgrade` hook only rewrites rows it holds, deletes one, and adds the one `meta` row a
+/// migration may, [`CONTIGUOUS_FROM_KEY`] (cl-chain-columns' links migration). What the hook
+/// wrote is committed, with still no stamp row, and the store opens again.
+#[test]
+fn an_unstamped_store_opens_when_its_upgrade_only_rewrites_rows() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = ([0xaa; 32], [0xbb; 32]);
+    let column = column_key(5, &a, 0);
+    let slot = 5u64.to_be_bytes();
+    {
+        let writer = env::open_writer(dir.path(), opts()).unwrap();
+        txn::seed_unstamped(&writer, COLUMNS, &[(&column[..], &b"old column"[..])]).unwrap();
+        txn::seed_unstamped(
+            &writer,
+            COLUMN_ROOTS,
+            &[(&a[..], &slot[..]), (&b[..], &slot[..])],
+        )
+        .unwrap();
+        txn::seed_unstamped(&writer, COLUMN_LINKS, &[(&a[..], &b"old link"[..])]).unwrap();
+        txn::seed_unstamped(&writer, META, &[(&b"cgc"[..], &4u64.to_be_bytes()[..])]).unwrap();
+    }
+    let writer = env::open_writer_with(dir.path(), opts(), |txn, created: &[&'static str]| {
+        assert_eq!(created, Vec::<&str>::new());
+        put_rows(
+            txn,
+            &[
+                (COLUMNS, &column[..], &b"new column"[..]),
+                (COLUMN_LINKS, &a[..], &b"new link"[..]),
+                (META, &b"cgc"[..], &8u64.to_be_bytes()[..]),
+                (META, CONTIGUOUS_FROM_KEY, &6u64.to_be_bytes()[..]),
+            ],
+        );
+        let roots = txn.open_table(Some(COLUMN_ROOTS)).unwrap();
+        assert!(txn.del(&roots, b, None).unwrap());
+        Ok::<_, Error>(())
+    })
+    .expect("rewrites, a delete and the migration's meta row add no row");
+    let db = writer.raw_env();
+    assert_eq!(row(db, COLUMNS, &column), Some(b"new column".to_vec()));
+    assert_eq!(row(db, COLUMN_LINKS, &a), Some(b"new link".to_vec()));
+    assert_eq!(rows(db, COLUMN_ROOTS), vec![(a.to_vec(), slot.to_vec())]);
+    assert_eq!(meta_row(db, b"cgc"), Some(8u64.to_be_bytes().to_vec()));
+    assert_eq!(
+        meta_row(db, CONTIGUOUS_FROM_KEY),
+        Some(6u64.to_be_bytes().to_vec())
+    );
+    assert_eq!(meta_row(db, STAMP_KEY), None);
+    drop(writer);
+    drop(env::open_writer(dir.path(), opts()).expect("opens again"));
 }
 
 /// V1: a newer schema version refuses the writer and the reader, and the refused writer

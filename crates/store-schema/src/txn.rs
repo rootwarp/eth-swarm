@@ -72,15 +72,17 @@
 //! }
 //! ```
 
+use std::collections::BTreeSet;
+
 use libmdbx::{
     Cursor, Decodable, NoWriteMap, Table, Transaction, TransactionKind, WriteFlags, RO, RW,
 };
 
 use crate::{
     env::{RoTxn, WriterEnv},
-    keys::STAMP_KEY,
+    keys::{CONTIGUOUS_FROM_KEY, SCHEMA_VERSION_KEY, STAMP_KEY},
     stamp::{self, Stamp},
-    tables::{BLOCKS, BLOCK_INDEX, META},
+    tables::{BLOCKS, BLOCK_INDEX, META, TABLES},
     Error, Result,
 };
 
@@ -299,29 +301,91 @@ pub fn commit(txn: RwTxn<'_>, update: Update) -> Result<Option<Stamp>> {
     write(txn, stamp)
 }
 
-/// The commit of the writer's open ([`crate::env::open_writer_with`], its only caller). With a
-/// stamp stored it is [`commit`] with [`Update::Carry`]. With none it commits no stamp row, and
-/// is refused ([`Error::StampMissing`]) if `blocks` or `block_index` holds a row: a store
-/// written raw, or a v1 store with blocks and no stamp. Apart from [`Update::Carry`], which
-/// refuses every commit before the first stamp, so the open of a fresh store still commits.
-pub(crate) fn commit_open(txn: RwTxn<'_>) -> Result<Option<Stamp>> {
-    let stamp = carried(&txn)?;
+/// The `meta` rows the writer's open may add before the first stamp: the schema version's
+/// ([`crate::version`]) and the one row of cl-chain-columns' migration
+/// ([`CONTIGUOUS_FROM_KEY`]).
+const OPEN_META_KEYS: [&[u8]; 2] = [SCHEMA_VERSION_KEY, CONTIGUOUS_FROM_KEY];
+
+/// What the writer's open transaction held before its `upgrade` hook ran ([`open_rows`]), for
+/// [`commit_open`] to tell which rows the open added.
+#[derive(Debug)]
+pub(crate) struct OpenRows {
+    /// The row count of each table of [`TABLES`], in that order.
+    entries: [usize; TABLES.len()],
+    /// The keys of `meta`'s rows.
+    meta: BTreeSet<Vec<u8>>,
+}
+
+/// The rows of every table of [`TABLES`] as `txn` sees them: each one's row count, and the keys
+/// of `meta` (a few small rows). Every table must exist.
+pub(crate) fn open_rows(txn: &RwTxn<'_>) -> Result<OpenRows> {
+    let mut entries = [0; TABLES.len()];
+    for (count, table) in entries.iter_mut().zip(TABLES) {
+        *count = txn.0.table_stat(&txn.open_table(Some(table))?)?.entries();
+    }
+    Ok(OpenRows {
+        entries,
+        meta: meta_keys(txn)?,
+    })
+}
+
+/// The keys of `meta`'s rows as `txn` sees them.
+fn meta_keys(txn: &RwTxn<'_>) -> Result<BTreeSet<Vec<u8>>> {
+    let meta = txn.open_table(Some(META))?;
+    let mut keys = BTreeSet::new();
+    for row in txn.cursor(&meta)?.iter::<Vec<u8>, ()>() {
+        keys.insert(row?.0);
+    }
+    Ok(keys)
+}
+
+/// The commit of the writer's open ([`crate::env::open_writer_with`], its only caller), `before`
+/// what its transaction held before the `upgrade` hook ran ([`open_rows`]). With a stamp
+/// stored, before the hook and at this commit, it is [`commit`] with [`Update::Carry`].
+/// Otherwise, before the first stamp, it commits no stamp row, and is refused
+/// ([`Error::StampMissing`]) if `blocks` or `block_index` holds a row (a store written raw, or
+/// a v1 store with blocks and no stamp), or if the open added a row to any table: more rows in
+/// a table than `before` counted, or a `meta` key it does not have, but for the schema version's
+/// and the column migration's ([`OPEN_META_KEYS`]). The rule is that the open adds no row, not
+/// that the store holds none: an unstamped store with rows and no block (a probe store's
+/// columns and custody) opens, and a migration may rewrite or delete its rows. The rows are
+/// counted, so a hook that deletes a row and adds another to the same table, other than `meta`,
+/// is not told apart from one that rewrites a row. Apart from [`Update::Carry`], which refuses
+/// every commit before the first stamp, so the open of a fresh store still commits.
+pub(crate) fn commit_open(txn: RwTxn<'_>, before: &OpenRows) -> Result<Option<Stamp>> {
+    let stamp = stamp::read(&txn)?;
+    if stamp.is_none() || !before.meta.contains(STAMP_KEY) {
+        unstamped(&txn, before)?;
+    }
     write(txn, stamp)
 }
 
-/// The stored stamp, checked; `None` before the first one, if `blocks` and `block_index` are
-/// empty as `txn` sees them, else [`Error::StampMissing`] naming the first that is not.
-fn carried(txn: &RwTxn<'_>) -> Result<Option<Stamp>> {
-    let stamp = stamp::read(txn)?;
-    if stamp.is_none() {
-        for table in [BLOCKS, BLOCK_INDEX] {
-            let handle = txn.open_table(Some(table))?;
-            if txn.cursor(&handle)?.first::<(), ()>()?.is_some() {
-                return Err(Error::StampMissing { table });
-            }
+/// The open's rules before the first stamp: `blocks` and `block_index` are empty as `txn` sees
+/// them, else [`Error::StampMissing`] naming the first that is not; then no table has a row
+/// `before` does not have ([`commit_open`]), else [`Error::StampMissing`] naming the first, in
+/// [`TABLES`] order, that has.
+fn unstamped(txn: &RwTxn<'_>, before: &OpenRows) -> Result<()> {
+    for table in [BLOCKS, BLOCK_INDEX] {
+        let handle = txn.open_table(Some(table))?;
+        if txn.cursor(&handle)?.first::<(), ()>()?.is_some() {
+            return Err(Error::StampMissing { table });
         }
     }
-    Ok(stamp)
+    let after = open_rows(txn)?;
+    for ((table, was), now) in TABLES.into_iter().zip(before.entries).zip(after.entries) {
+        let added = if table == META {
+            after
+                .meta
+                .iter()
+                .any(|key| !before.meta.contains(key) && !OPEN_META_KEYS.contains(&&key[..]))
+        } else {
+            now > was
+        };
+        if added {
+            return Err(Error::StampMissing { table });
+        }
+    }
+    Ok(())
 }
 
 /// [`Update::New`]'s rules for `new` over the `stored` stamp.
