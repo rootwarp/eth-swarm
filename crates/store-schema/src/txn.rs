@@ -1,7 +1,8 @@
 //! The one way a write transaction of the env commits: with its stamp row ([`crate::stamp`]).
 //!
 //! No writer path calls `commit()` on a write transaction itself; `scripts/check-stamped-commits.sh`
-//! fails CI on one outside this file.
+//! fails CI on one outside this file. The writer's open commits through `commit_open`, called
+//! only from [`crate::env::open_writer_with`] (the same script enforces that).
 
 use libmdbx::WriteFlags;
 
@@ -9,7 +10,7 @@ use crate::{
     env::RwTxn,
     keys::STAMP_KEY,
     stamp::{self, Stamp},
-    tables::META,
+    tables::{BLOCKS, BLOCK_INDEX, META},
     Error, Result,
 };
 
@@ -17,26 +18,90 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Update {
     /// A new head or finalized checkpoint (block import), checked as [`stamp::read`] checks a
-    /// stored one before it is written.
+    /// stored one before it is written, and against the stamp stored before it, if any:
+    /// `head_seq` never goes down ([`Error::StampSeqDecrease`]), one `head_seq` names one head
+    /// root ([`Error::StampSeqReused`]), and the finalized slot never goes down
+    /// ([`Error::StampFinalizedDecrease`]). The same stamp again, and any forward move (a reorg
+    /// to a lower head slot included), passes.
     New(Stamp),
-    /// The stored stamp, unchanged: a transaction that moves neither (columns, custody, the
-    /// writer's open). It is checked again, so a transaction that removed the stamp's block
-    /// fails. Before the first stamp there is nothing to carry and no row is written: the env
-    /// has no head yet and no `blocks` row, so data and stamp still agree.
+    /// The stored stamp, unchanged: a transaction that moves neither (columns, custody). It is
+    /// checked again, so a transaction that removed the stamp's block fails.
+    ///
+    /// Before the first stamp there is nothing to carry. The transaction commits with no stamp
+    /// row only while `blocks` and `block_index` are empty as it sees them, its own puts
+    /// included: a row in either would be a block with no head, so the commit is refused
+    /// ([`Error::StampMissing`], `blocks` checked first) and writes nothing. Columns and custody
+    /// before any block commit unstamped. The full rule, no `Carry` before the first stamp for
+    /// any table, is turned on later, once a production stamp writer exists (#208a).
     Carry,
 }
 
 /// Writes `update`'s stamp row into `txn`, then commits it. Returns the stamp committed, `None`
-/// for a [`Update::Carry`] before the first stamp. On an error `txn` is dropped, so nothing of
-/// it is written.
+/// for a [`Update::Carry`] before the first stamp (with `blocks` and `block_index` empty). On
+/// an error ([`Update`] names the rules) `txn` is dropped, so nothing of it is written.
 pub fn commit(txn: RwTxn<'_>, update: Update) -> Result<Option<Stamp>> {
     let stamp = match update {
-        Update::New(stamp) => {
-            stamp.check(&txn)?;
-            Some(stamp)
+        Update::New(new) => {
+            new.check(&txn)?;
+            let meta = txn.open_table(Some(META))?;
+            if let Some(row) = txn.get::<Vec<u8>>(&meta, STAMP_KEY)? {
+                // Decoded only: the txn may have pruned the stored stamp's blocks.
+                moves_forward(&Stamp::decode(&row)?, &new)?;
+            }
+            Some(new)
         }
-        Update::Carry => stamp::read(&txn)?,
+        Update::Carry => carried(&txn)?,
     };
+    write(txn, stamp)
+}
+
+/// The commit of the writer's open ([`crate::env::open_writer_with`], its only caller). With a
+/// stamp stored it is [`commit`] with [`Update::Carry`]. With none it commits no stamp row, and
+/// is refused ([`Error::StampMissing`]) if `blocks` or `block_index` holds a row: a store
+/// written raw, or a v1 store with blocks and no stamp. Apart from [`Update::Carry`] so the open
+/// of a fresh store keeps committing once a `Carry` with no stamp is refused outright (#208a).
+pub(crate) fn commit_open(txn: RwTxn<'_>) -> Result<Option<Stamp>> {
+    let stamp = carried(&txn)?;
+    write(txn, stamp)
+}
+
+/// The stored stamp, checked; `None` before the first one, if `blocks` and `block_index` are
+/// empty as `txn` sees them, else [`Error::StampMissing`] naming the first that is not.
+fn carried(txn: &RwTxn<'_>) -> Result<Option<Stamp>> {
+    let stamp = stamp::read(txn)?;
+    if stamp.is_none() {
+        for table in [BLOCKS, BLOCK_INDEX] {
+            let handle = txn.open_table(Some(table))?;
+            if txn.cursor(&handle)?.first::<(), ()>()?.is_some() {
+                return Err(Error::StampMissing { table });
+            }
+        }
+    }
+    Ok(stamp)
+}
+
+/// [`Update::New`]'s rules for `new` over the `stored` stamp.
+fn moves_forward(stored: &Stamp, new: &Stamp) -> Result<()> {
+    if new.head_seq < stored.head_seq {
+        return Err(Error::StampSeqDecrease {
+            stored: stored.head_seq,
+            new: new.head_seq,
+        });
+    }
+    if new.head_seq == stored.head_seq && new.head_root != stored.head_root {
+        return Err(Error::StampSeqReused { seq: new.head_seq });
+    }
+    if new.finalized_slot < stored.finalized_slot {
+        return Err(Error::StampFinalizedDecrease {
+            stored: stored.finalized_slot,
+            new: new.finalized_slot,
+        });
+    }
+    Ok(())
+}
+
+/// Writes `stamp`'s row, if any, into `txn` and commits it.
+fn write(txn: RwTxn<'_>, stamp: Option<Stamp>) -> Result<Option<Stamp>> {
     if let Some(stamp) = &stamp {
         let meta = txn.open_table(Some(META))?;
         txn.put(&meta, STAMP_KEY, stamp.encode(), WriteFlags::UPSERT)?;

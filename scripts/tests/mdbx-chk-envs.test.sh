@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Tests for scripts/mdbx-chk-envs.sh and scripts/build-mdbx-chk.sh.
 # Run: bash scripts/tests/mdbx-chk-envs.test.sh
-# Builds mdbx_chk once from the pinned sources and fills one env with the fill_env example
-# (needs cargo, a C compiler and the crates of Cargo.lock), then checks copies of that env:
-# clean, and corrupted two ways, each of which must fail the run. The build script's pins
-# are tested with a stub cargo and a failing compiler.
+# Builds mdbx_chk once from the pinned sources and fills one env with cl-chain-columns'
+# fill_env example (blocks and stamps through store-schema, columns through ColumnWriter;
+# needs cargo, a C compiler and the crates of Cargo.lock), then checks copies of that env:
+# clean, and corrupted two ways, each of which must fail the run. Stub mdbx_chk binaries
+# check that a warning line fails the run even with exit 0. The build script's pins are
+# tested with a stub cargo and a failing compiler.
 # Works on bash 3.2.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -42,9 +44,9 @@ check pass "the build names the pinned source and its VERSION.txt" "mdbx-sys-12.
   cat "$tmp/build.log"
 check pass "the binary is that libmdbx" "mdbx_chk version 0.12.13.5" "$chk" -V
 
-cargo run --quiet --locked --manifest-path "$repo/Cargo.toml" -p store-schema \
+cargo run --quiet --locked --manifest-path "$repo/Cargo.toml" -p cl-chain-columns \
   --example fill_env -- "$tmp/clean" > /dev/null
-check pass "a filled env (blocks, stamps, columns) is clean" "mdbx_chk OK: $tmp/clean" \
+check pass "a filled env (blocks, stamps, ColumnWriter columns) is clean" "mdbx_chk OK: $tmp/clean" \
   env MDBX_CHK="$chk" bash "$script" "$tmp/clean"
 
 cp -R "$tmp/clean" "$tmp/btree"

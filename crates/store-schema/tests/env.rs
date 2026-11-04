@@ -4,6 +4,9 @@
 //! runs under [`serial`]: MDBX locks with open-file-description locks, and a child spawned by
 //! one test must not inherit another test's lock fds between fork and exec (see
 //! cl-chain-columns' `tests/sole_writer.rs`).
+//!
+//! Rows no writer path may commit (a raw store, an older layout) go through
+//! `WriterEnv::raw_env`, the `test-hooks` seam this crate's own dev-dependency turns on.
 
 mod common;
 
@@ -357,7 +360,7 @@ fn max_tables_before_create() {
 
     let dir = tempfile::tempdir().unwrap();
     let writer = env::open_writer(dir.path(), opts()).unwrap();
-    let (max_tables, flags) = env_settings(writer.env());
+    let (max_tables, flags) = env_settings(writer.raw_env());
     assert_eq!(max_tables, MAX_TABLES);
     let no_sync =
         mdbx_sys::MDBX_NOMETASYNC | mdbx_sys::MDBX_SAFE_NOSYNC | mdbx_sys::MDBX_UTTERLY_NOSYNC;
@@ -368,14 +371,14 @@ fn max_tables_before_create() {
     );
     assert_eq!(flags & mdbx_sys::MDBX_RDONLY, 0);
     {
-        let txn = writer.env().begin_ro_txn().unwrap();
+        let txn = writer.begin_ro_txn().unwrap();
         for table in TABLES {
             txn.open_table(Some(table))
                 .unwrap_or_else(|e| panic!("table {table} missing after the first open: {e}"));
         }
     }
     assert_eq!(
-        meta_row(writer.env(), SCHEMA_VERSION_KEY),
+        meta_row(writer.raw_env(), SCHEMA_VERSION_KEY),
         Some(SCHEMA_VERSION.to_be_bytes().to_vec())
     );
     drop(writer);
@@ -419,7 +422,7 @@ fn version_mismatch_refuses() {
         let dir = tempfile::tempdir().unwrap();
         {
             let writer = env::open_writer(dir.path(), opts()).unwrap();
-            put_meta(writer.env(), SCHEMA_VERSION_KEY, &stored.to_be_bytes());
+            put_meta(writer.raw_env(), SCHEMA_VERSION_KEY, &stored.to_be_bytes());
         }
         let err = env::open_writer(dir.path(), opts()).unwrap_err();
         assert!(
@@ -452,7 +455,7 @@ fn version_mismatch_refuses() {
     let dir = tempfile::tempdir().unwrap();
     {
         let writer = env::open_writer(dir.path(), opts()).unwrap();
-        put_meta(writer.env(), SCHEMA_VERSION_KEY, b"\x01");
+        put_meta(writer.raw_env(), SCHEMA_VERSION_KEY, b"\x01");
     }
     let err = env::open_writer(dir.path(), opts()).unwrap_err();
     assert!(
@@ -556,15 +559,15 @@ fn a_legacy_column_env_is_upgraded_in_place() {
         [BLOCKS, STATES, BLOCK_INDEX, ENVELOPES, FC_SNAPSHOT]
     );
     assert_eq!(
-        meta_row(writer.env(), SCHEMA_VERSION_KEY),
+        meta_row(writer.raw_env(), SCHEMA_VERSION_KEY),
         Some(SCHEMA_VERSION.to_be_bytes().to_vec())
     );
     assert_eq!(
-        meta_row(writer.env(), b"cgc"),
+        meta_row(writer.raw_env(), b"cgc"),
         Some(8u64.to_be_bytes().to_vec())
     );
     {
-        let txn = writer.env().begin_ro_txn().unwrap();
+        let txn = writer.begin_ro_txn().unwrap();
         let columns = txn.open_table(Some(COLUMNS)).unwrap();
         assert_eq!(
             txn.get::<Vec<u8>>(&columns, &[7u8; 48]).unwrap(),
@@ -632,11 +635,11 @@ fn the_meta_table_has_room_for_the_stamp_row() {
     let dir = tempfile::tempdir().unwrap();
     {
         let writer = env::open_writer(dir.path(), opts()).unwrap();
-        put_meta(writer.env(), b"a_row_of_some_later_version", b"?");
+        put_meta(writer.raw_env(), b"a_row_of_some_later_version", b"?");
     }
     let writer = env::open_writer(dir.path(), opts()).expect("other meta rows are no version");
-    assert_eq!(meta_row(writer.env(), STAMP_KEY), None);
-    put_meta(writer.env(), STAMP_KEY, &[0xab; 80]);
+    assert_eq!(meta_row(writer.raw_env(), STAMP_KEY), None);
+    put_meta(writer.raw_env(), STAMP_KEY, &[0xab; 80]);
     drop(writer);
     let err = env::open_writer(dir.path(), opts()).unwrap_err();
     assert!(matches!(err, Error::MalformedStamp { len: 80 }), "{err:?}");
@@ -665,7 +668,7 @@ fn all_tables_created() {
     ]
     .map(String::from)
     .into();
-    assert_eq!(table_names(writer.env()), want);
+    assert_eq!(table_names(writer.raw_env()), want);
     assert_eq!(
         TABLES
             .map(String::from)
@@ -691,7 +694,7 @@ fn meta_row_in_commit() {
     let dir = tempfile::tempdir().unwrap();
     let writer = env::open_writer(dir.path(), opts()).unwrap();
     let other_process = Holder::start("stamp-reader", dir.path());
-    let db = writer.env();
+    let db = writer.raw_env();
     let done = AtomicBool::new(false);
     let seen = AtomicU64::new(0);
     thread::scope(|scope| {
@@ -710,7 +713,7 @@ fn meta_row_in_commit() {
         for i in 0..1000u64 {
             // A column chunk of the block before: carries that block's stamp, or none yet.
             if let Some(&(slot, root)) = chain.last() {
-                let txn = db.begin_rw_txn().unwrap();
+                let txn = writer.begin_rw_txn().unwrap();
                 let before = stamp::read(&txn).unwrap();
                 let columns = txn.open_table(Some(COLUMNS)).unwrap();
                 for index in (i % 8) * 16..(i % 8 + 1) * 16 {
@@ -721,7 +724,7 @@ fn meta_row_in_commit() {
                 assert_eq!(txn::commit(txn, Update::Carry).unwrap(), before);
             }
             let (ssz, _) = common::fulu_block_ssz(i + 1, parent, i);
-            let txn = db.begin_rw_txn().unwrap();
+            let txn = writer.begin_rw_txn().unwrap();
             let (slot, root) = blocks::put::<common::E>(&txn, &schedule, &ssz).unwrap();
             chain.push((slot, root));
             let (finalized_slot, finalized_root) = chain[chain.len().saturating_sub(65)];
@@ -842,7 +845,7 @@ fn a_v1_env_is_upgraded_in_place_rows_identical() {
     })
     .unwrap();
     assert_eq!(created, [BLOCK_INDEX, ENVELOPES, FC_SNAPSHOT]);
-    let db = writer.env();
+    let db = writer.raw_env();
     assert_eq!(
         meta_row(db, SCHEMA_VERSION_KEY),
         Some(SCHEMA_VERSION.to_be_bytes().to_vec())
@@ -884,7 +887,7 @@ fn a_v1_env_is_upgraded_in_place_rows_identical() {
         Vec::<&str>::new(),
         "the second open creates nothing"
     );
-    assert_eq!(rows(writer.env(), BLOCK_INDEX), index);
+    assert_eq!(rows(writer.raw_env(), BLOCK_INDEX), index);
 }
 
 /// A `blocks` key that is not `slot ‖ root` cannot be indexed: the upgrade refuses it and
@@ -937,7 +940,7 @@ fn a_fresh_store_opens_with_no_stamp() {
     let dir = tempfile::tempdir().unwrap();
     for _ in 0..2 {
         let writer = env::open_writer(dir.path(), opts()).unwrap();
-        let db = writer.env();
+        let db = writer.raw_env();
         assert_eq!(meta_row(db, STAMP_KEY), None);
         for table in [BLOCKS, BLOCK_INDEX, COLUMNS] {
             assert_eq!(rows(db, table), vec![], "table {table}");
@@ -959,7 +962,7 @@ fn an_empty_unstamped_v1_store_upgrades() {
     })
     .unwrap();
     assert_eq!(created, [BLOCK_INDEX, ENVELOPES, FC_SNAPSHOT]);
-    let db = writer.env();
+    let db = writer.raw_env();
     assert_eq!(
         meta_row(db, SCHEMA_VERSION_KEY),
         Some(SCHEMA_VERSION.to_be_bytes().to_vec())
