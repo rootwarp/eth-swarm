@@ -21,18 +21,26 @@
 //! - **Limits** ([`HttpLimits`], [`serve`]). A connection over the cap is closed at accept. The
 //!   header-read timeout closes a client that is slow to send its request headers, and a
 //!   keep-alive connection left idle that long. The request timeout answers 503 for a
-//!   non-streaming handler that is too slow.
-//! - **Streaming (SSE).** Neither timeout can end a stream that is still being sent. hyper only
-//!   runs the header-read timer while it waits for a request head: from accept, and again once a
-//!   response is fully written and the connection is idle. It never runs while a response body
-//!   is being written. The request timeout is a route layer, put only on the non-streaming
-//!   routes ([`router`]). Streaming routes (`/eth/v1/events`) are merged after it. Even on a
-//!   timed route it would only bound the wait for the response head, not the body.
+//!   non-streaming handler that is too slow. The write timeout closes a connection whose writes
+//!   have made no progress for that long: a client that stopped reading would otherwise hold its
+//!   slot forever, and shutdown would wait on it, since neither of the other timers runs while a
+//!   response write is blocked.
+//! - **Streaming (SSE).** Neither the header-read nor the request timeout can end a stream that
+//!   is still being sent. hyper only runs the header-read timer while it waits for a request
+//!   head: from accept, and again once a response is fully written and the connection is idle.
+//!   It never runs while a response body is being written. The request timeout is a route layer,
+//!   put only on the non-streaming routes ([`router`]). Streaming routes (`/eth/v1/events`) are
+//!   merged after it. Even on a timed route it would only bound the wait for the response head,
+//!   not the body. The write timeout ends a stream only once its client has stopped reading: its
+//!   clock runs only while a write is blocked, and starts over at every write that completes.
 
 use std::borrow::Cow;
 use std::future::Future;
+use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -47,8 +55,10 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
 use network_config::ForkName;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::{watch, Semaphore};
+use tokio::time::{Instant, Sleep};
 
 use crate::node_state::NodeState;
 use crate::routes::config::ConfigData;
@@ -286,6 +296,8 @@ pub struct ApiState {
 pub const DEFAULT_HEADER_READ_TIMEOUT_MS: u64 = 5_000;
 /// Default [`HttpLimits::request_timeout`], in milliseconds.
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+/// Default [`HttpLimits::write_timeout`], in milliseconds.
+pub const DEFAULT_WRITE_TIMEOUT_MS: u64 = 30_000;
 /// Default [`HttpLimits::max_connections`].
 pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
 /// Default [`HttpLimits::allowed_hosts`]: the loopback names a local client uses.
@@ -299,6 +311,10 @@ pub struct HttpLimits {
     pub header_read_timeout: Duration,
     /// How long a non-streaming handler may take to return its response (then 503). Not zero.
     pub request_timeout: Duration,
+    /// How long a write to a client may stay blocked without progress before the connection is
+    /// closed: a client that stopped reading. The clock starts over at every write that makes
+    /// progress, so a long response that keeps moving is never cut. Not zero.
+    pub write_timeout: Duration,
     /// Connections served at once, in `1..=Semaphore::MAX_PERMITS` (above that, the semaphore
     /// panics). One more is closed at accept.
     pub max_connections: usize,
@@ -312,6 +328,7 @@ impl Default for HttpLimits {
         Self {
             header_read_timeout: Duration::from_millis(DEFAULT_HEADER_READ_TIMEOUT_MS),
             request_timeout: Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS),
+            write_timeout: Duration::from_millis(DEFAULT_WRITE_TIMEOUT_MS),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             allowed_hosts: DEFAULT_ALLOWED_HOSTS.map(String::from).to_vec(),
         }
@@ -397,13 +414,103 @@ fn host_and_port(value: &HeaderValue) -> Option<Authority> {
     digits.then_some(authority)
 }
 
+/// A connection's stream whose writes fail with `TimedOut` once one has been blocked, with no
+/// progress, for `timeout`. The clock starts when a write, flush or shutdown is pending and stops
+/// when one completes (a write of at least one byte, a flush, or an error), so a response that
+/// keeps moving is never cut, however long. hyper retries a blocked write each time the task
+/// wakes, and the timer wakes it, so the error ends the connection and frees its slot. Reads pass
+/// through: the header-read timeout covers them.
+struct WriteTimeout<S> {
+    inner: S,
+    timeout: Duration,
+    /// The deadline of the blocked write, while `blocked`.
+    deadline: Pin<Box<Sleep>>,
+    blocked: bool,
+}
+
+impl<S> WriteTimeout<S> {
+    fn new(inner: S, timeout: Duration) -> Self {
+        Self {
+            inner,
+            timeout,
+            deadline: Box::pin(tokio::time::sleep(timeout)),
+            blocked: false,
+        }
+    }
+
+    /// `poll`, the inner stream's answer, unless the write has been blocked for `timeout`.
+    fn check<T>(&mut self, cx: &mut Context<'_>, poll: Poll<io::Result<T>>) -> Poll<io::Result<T>> {
+        if poll.is_ready() {
+            self.blocked = false;
+            return poll;
+        }
+        if !self.blocked {
+            self.blocked = true;
+            let deadline = Instant::now() + self.timeout;
+            self.deadline.as_mut().reset(deadline);
+        }
+        ready!(self.deadline.as_mut().poll(cx));
+        let message = "no write progress within the write timeout";
+        Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, message)))
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for WriteTimeout<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for WriteTimeout<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
+        this.check(cx, poll)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        this.check(cx, poll)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_flush(cx);
+        this.check(cx, poll)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_shutdown(cx);
+        this.check(cx, poll)
+    }
+}
+
 /// Serves `router` on `listener` under `limits` until `shutdown`. Then it stops accepting, lets
 /// the open requests finish, and returns once every connection is closed.
 ///
 /// Connections use hyper-util's `auto::Builder` with `TokioTimer` and the header-read timeout,
 /// like svc-runtime's `/metrics` server, and are HTTP/1.1 only. HTTP/2 is compiled in through
 /// tonic, and if it were enabled here the builder would first wait for an HTTP/2 preface with no
-/// timeout. An HTTP/2 request also carries `:authority`, not the `Host` that is checked.
+/// timeout. An HTTP/2 request also carries `:authority`, not the `Host` that is checked. Each
+/// connection's stream is under the write timeout (`WriteTimeout`).
 pub async fn serve(
     listener: TcpListener,
     router: Router,
@@ -418,6 +525,7 @@ pub async fn serve(
         .http1()
         .timer(TokioTimer::new())
         .header_read_timeout(limits.header_read_timeout);
+    let write_timeout = limits.write_timeout;
     let slots = Arc::new(Semaphore::new(limits.max_connections));
     // Each connection holds a receiver. A send starts their graceful shutdown, and `closed`
     // resolves once the last one has dropped its receiver.
@@ -444,7 +552,8 @@ pub async fn serve(
         let mut draining = drain.subscribe();
         tokio::spawn(async move {
             let _slot = slot;
-            let connection = builder.serve_connection(TokioIo::new(stream), service);
+            let io = TokioIo::new(WriteTimeout::new(stream, write_timeout));
+            let connection = builder.serve_connection(io, service);
             tokio::pin!(connection);
             let ended = tokio::select! {
                 ended = connection.as_mut() => ended,
@@ -653,12 +762,13 @@ mod tests {
         assert_eq!(twice.headers().get_all(CONSENSUS_VERSION).iter().count(), 1);
     }
 
-    /// The TCP tests' limits: `header_read_ms` and `request_ms` in milliseconds, the default
-    /// hosts.
+    /// The TCP tests' limits: `header_read_ms` and `request_ms` in milliseconds, a 5 s write
+    /// timeout, the default hosts.
     fn limits(header_read_ms: u64, request_ms: u64, max_connections: usize) -> HttpLimits {
         HttpLimits {
             header_read_timeout: Duration::from_millis(header_read_ms),
             request_timeout: Duration::from_millis(request_ms),
+            write_timeout: Duration::from_secs(5),
             max_connections,
             allowed_hosts: ["localhost", "127.0.0.1", "[::1]"]
                 .map(String::from)
@@ -675,12 +785,26 @@ mod tests {
         limits: HttpLimits,
     ) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (addr, stop, _) = spawn_on(listener, app, limits);
+        (addr, stop)
+    }
+
+    /// `app` served on `listener` under `limits` until the sender is dropped; the server task.
+    fn spawn_on(
+        listener: TcpListener,
+        app: Router,
+        limits: HttpLimits,
+    ) -> (
+        SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let addr = listener.local_addr().unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(serve(listener, app, limits, async {
+        let server = tokio::spawn(serve(listener, app, limits, async {
             let _ = stopped.await;
         }));
-        (addr, stop)
+        (addr, stop, server)
     }
 
     /// The response at the start of `raw`, once it is whole: its status, headers and body. The
@@ -942,5 +1066,151 @@ mod tests {
         for i in 0..8 {
             assert!(body.contains(&format!("tick {i}\n")), "{body}");
         }
+    }
+
+    /// The write timeout of the stalled-client tests.
+    const WRITE_TIMEOUT: Duration = Duration::from_millis(300);
+
+    /// A loopback listener whose connections inherit a small send buffer that the kernel does
+    /// not grow, so the server's writes block soon after a client stops reading.
+    fn tight_listener() -> TcpListener {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_send_buffer_size(16 << 10).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        socket.listen(64).unwrap()
+    }
+
+    /// A client on a small receive buffer that pipelines requests for 1 MiB of
+    /// `/eth/v1/config/spec` responses and never reads them.
+    async fn stalled_client(addr: SocketAddr) -> TcpStream {
+        const SPEC: &str = "/eth/v1/config/spec";
+        let (_, _, spec) = get(&app(), SPEC).await;
+        let request = format!("GET {SPEC} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let requests = request.repeat((1 << 20) / spec.len() + 1);
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4 << 10).unwrap();
+        let mut stream = socket.connect(addr).await.unwrap();
+        let send = stream.write_all(requests.as_bytes());
+        tokio::time::timeout(WITHIN, send)
+            .await
+            .expect("the requests are sent")
+            .unwrap();
+        stream
+    }
+
+    /// A client that pipelines requests and never reads holds its connection, and its slot,
+    /// only until its writes have made no progress for the write timeout. Neither the
+    /// header-read nor the request timeout runs while a response write is blocked.
+    #[tokio::test]
+    async fn stalled_writes_closed() {
+        let limits = HttpLimits {
+            write_timeout: WRITE_TIMEOUT,
+            ..limits(300, 300, 1)
+        };
+        let (addr, _stop, _) = spawn_on(tight_listener(), app(), limits);
+        let start = Instant::now();
+        let mut stalled = stalled_client(addr).await;
+        // While the stalled connection holds the only slot, a new one is closed unanswered.
+        let request =
+            "GET /eth/v1/node/version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        let mut refused = 0;
+        let status = loop {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let _ = stream.write_all(request.as_bytes()).await;
+            if let Some((status, _, _)) = whole(&read_until_closed(&mut stream).await) {
+                break status;
+            }
+            refused += 1;
+            assert!(
+                start.elapsed() < WITHIN,
+                "the stalled connection kept its slot"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let took = start.elapsed();
+        assert_eq!(status, StatusCode::OK);
+        assert!(refused > 0, "the stalled connection never held the slot");
+        assert!(took >= WRITE_TIMEOUT, "served after {took:?}");
+        // The stalled connection is closed: reading, it gets what its buffer held, then the end
+        // (or a reset).
+        read_until_closed(&mut stalled).await;
+    }
+
+    /// Shutdown does not wait on a client that stopped reading for longer than the write
+    /// timeout (`serve` returns, so cl-api does not sit out its drain timeout).
+    #[tokio::test]
+    async fn shutdown_with_stalled_writes() {
+        let limits = HttpLimits {
+            write_timeout: WRITE_TIMEOUT,
+            ..limits(300, 300, 8)
+        };
+        let (addr, stop, server) = spawn_on(tight_listener(), app(), limits);
+        let mut stalled = stalled_client(addr).await;
+        // The server's writes to it block well within this.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let start = Instant::now();
+        drop(stop);
+        tokio::time::timeout(WITHIN, server)
+            .await
+            .expect("serve returns despite the stalled client")
+            .unwrap();
+        let took = start.elapsed();
+        assert!(
+            took < WRITE_TIMEOUT + Duration::from_secs(1),
+            "returned after {took:?}"
+        );
+        read_until_closed(&mut stalled).await;
+    }
+
+    /// A long streaming response to a client that reads slowly: the server's writes block again
+    /// and again, for longer than the write timeout in all, but each makes progress within it,
+    /// so the response is not cut.
+    #[tokio::test]
+    async fn slow_reader_not_cut() {
+        use axum::routing::get;
+        const CHUNK: usize = 64 << 10;
+        const CHUNKS: usize = 32;
+        let big = || async {
+            let chunks = (0..CHUNKS)
+                .map(|_| Ok::<_, std::convert::Infallible>(Bytes::from(vec![b'x'; CHUNK])));
+            axum::body::Body::from_stream(futures_util::stream::iter(chunks))
+        };
+        let streaming = Router::new().route("/stream", get(big));
+        let state = testing::api_state(NodeState::new(testing::clock()));
+        let routes = super::app(
+            crate::routes::node::routes(),
+            streaming,
+            Duration::from_millis(300),
+        )
+        .with_state(state);
+        let limits = HttpLimits {
+            write_timeout: WRITE_TIMEOUT,
+            ..limits(300, 300, 8)
+        };
+        let (addr, _stop, _) = spawn_on(tight_listener(), routes, limits);
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(CHUNK as u32).unwrap();
+        let mut stream = socket.connect(addr).await.unwrap();
+        let start = Instant::now();
+        stream
+            .write_all(b"GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        // At most one chunk per read and a pause after each: at least CHUNKS - 1 pauses.
+        let deadline = tokio::time::Instant::now() + 2 * WITHIN;
+        let (mut raw, mut buf) = (Vec::new(), vec![0; CHUNK]);
+        while !raw.ends_with(b"\r\n0\r\n\r\n") {
+            let read = tokio::time::timeout_at(deadline, stream.read(&mut buf));
+            let n = read.await.expect("the whole response in time").unwrap();
+            assert!(n > 0, "cut after {} bytes", raw.len());
+            raw.extend_from_slice(&buf[..n]);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let took = start.elapsed();
+        let (status, _, body) = whole(&raw).unwrap();
+        assert_eq!(status, StatusCode::OK);
+        let payload = body.iter().filter(|&&b| b == b'x').count();
+        assert_eq!(payload, CHUNK * CHUNKS);
+        assert!(took > 2 * WRITE_TIMEOUT, "took {took:?}");
     }
 }

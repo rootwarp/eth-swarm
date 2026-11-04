@@ -23,6 +23,7 @@
 //! poll_interval_ms = 1000                                # optional, this default
 //! http_header_read_timeout_ms = 5000                     # optional, this default
 //! http_request_timeout_ms = 30000                        # optional, this default
+//! http_write_timeout_ms = 30000                          # optional, this default
 //! http_max_connections = 64                              # optional, this default
 //! http_allowed_hosts = ["localhost", "127.0.0.1", "[::1]"]  # optional, this default
 //! ```
@@ -31,7 +32,9 @@
 //!   ([`HttpBind`]). A refused address stops the process before anything listens.
 //! - **HTTP limits** ([`HttpLimits`]). `http_header_read_timeout_ms` bounds a request head and
 //!   an idle keep-alive connection. `http_request_timeout_ms` bounds a non-streaming handler
-//!   (503). `http_max_connections` caps open connections. A request whose `Host` is not one of
+//!   (503). `http_write_timeout_ms` closes a connection whose writes have made no progress for
+//!   that long (a client that stopped reading), so it frees its slot and does not hold up
+//!   shutdown. `http_max_connections` caps open connections. A request whose `Host` is not one of
 //!   `http_allowed_hosts` (any port) answers 421. A non-loopback `http_listen` needs the names
 //!   its clients use added here.
 //! - **cl-chain** is reached on `chain_socket` only if its server runs as `chain_uid`
@@ -99,6 +102,9 @@ pub struct ApiSettings {
     /// [`HttpLimits::request_timeout`].
     #[serde(default = "default_http_request_timeout_ms")]
     pub http_request_timeout_ms: u64,
+    /// [`HttpLimits::write_timeout`].
+    #[serde(default = "default_http_write_timeout_ms")]
+    pub http_write_timeout_ms: u64,
     /// [`HttpLimits::max_connections`].
     #[serde(default = "default_http_max_connections")]
     pub http_max_connections: usize,
@@ -125,6 +131,10 @@ fn default_http_header_read_timeout_ms() -> u64 {
 
 fn default_http_request_timeout_ms() -> u64 {
     crate::server::DEFAULT_REQUEST_TIMEOUT_MS
+}
+
+fn default_http_write_timeout_ms() -> u64 {
+    crate::server::DEFAULT_WRITE_TIMEOUT_MS
 }
 
 fn default_http_max_connections() -> usize {
@@ -179,6 +189,7 @@ impl ApiSettings {
                 settings.http_header_read_timeout_ms,
             ),
             ("http_request_timeout_ms", settings.http_request_timeout_ms),
+            ("http_write_timeout_ms", settings.http_write_timeout_ms),
         ] {
             if ms == 0 {
                 return Err(ServiceError::Config(format!("[api] {key} is 0")));
@@ -227,6 +238,7 @@ impl ApiSettings {
         HttpLimits {
             header_read_timeout: Duration::from_millis(self.http_header_read_timeout_ms),
             request_timeout: Duration::from_millis(self.http_request_timeout_ms),
+            write_timeout: Duration::from_millis(self.http_write_timeout_ms),
             max_connections: self.http_max_connections,
             allowed_hosts: self.http_allowed_hosts.clone(),
         }
@@ -456,6 +468,7 @@ mod tests {
                 poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
                 http_header_read_timeout_ms: 5000,
                 http_request_timeout_ms: 30000,
+                http_write_timeout_ms: 30000,
                 http_max_connections: 64,
                 http_allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "[::1]".into()],
             }
@@ -468,6 +481,7 @@ mod tests {
             HttpLimits {
                 header_read_timeout: Duration::from_secs(5),
                 request_timeout: Duration::from_secs(30),
+                write_timeout: Duration::from_secs(30),
                 max_connections: 64,
                 allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "[::1]".into()],
             }
@@ -475,7 +489,7 @@ mod tests {
         let full = "[api]\nhttp_listen = \"0.0.0.0:5052\"\nhttp_allow_non_loopback = true\n\
                     chain_socket = \"/run/x/chain.sock\"\nchain_uid = 7\npoll_interval_ms = 250\n\
                     http_header_read_timeout_ms = 100\nhttp_request_timeout_ms = 200\n\
-                    http_max_connections = 3\n\
+                    http_write_timeout_ms = 300\nhttp_max_connections = 3\n\
                     http_allowed_hosts = [\"beacon.internal\", \"10.0.0.1\", \"[fd00::1]\"]\n";
         let settings = ApiSettings::load(&config(root, full)).unwrap();
         assert_eq!(
@@ -492,6 +506,7 @@ mod tests {
             HttpLimits {
                 header_read_timeout: Duration::from_millis(100),
                 request_timeout: Duration::from_millis(200),
+                write_timeout: Duration::from_millis(300),
                 max_connections: 3,
                 allowed_hosts: vec![
                     "beacon.internal".into(),
@@ -515,6 +530,7 @@ mod tests {
             "[api]\nchain_uid = 1\nhttp_listen = \"localhost:5052\"\n",
             "[api]\nchain_uid = 1\nhttp_header_read_timeout_ms = 0\n",
             "[api]\nchain_uid = 1\nhttp_request_timeout_ms = 0\n",
+            "[api]\nchain_uid = 1\nhttp_write_timeout_ms = 0\n",
             "[api]\nchain_uid = 1\nhttp_max_connections = 0\n",
             &too_many,
             "[api]\nchain_uid = 1\nhttp_allowed_hosts = []\n",
