@@ -220,6 +220,8 @@ pub struct ChainConfig {
     blob_schedule: Vec<BlobParameters>,
     fork_schedule: ForkSchedule,
     scalars: BTreeMap<String, String>,
+    /// Every list as written (`BLOB_SCHEDULE` included).
+    lists: BTreeMap<String, Vec<Record>>,
 }
 
 impl ChainConfig {
@@ -272,6 +274,13 @@ impl ChainConfig {
                 Value::Records(_) => None,
             })
             .collect();
+        let lists = doc
+            .iter()
+            .filter_map(|(k, v)| match v {
+                Value::Records(records) => Some((k.clone(), records.clone())),
+                Value::Scalar(_) => None,
+            })
+            .collect();
         Ok(Self {
             preset_base: r.scalar("PRESET_BASE")?.to_owned(),
             config_name: r.scalar("CONFIG_NAME")?.to_owned(),
@@ -284,6 +293,7 @@ impl ChainConfig {
             blob_schedule,
             fork_schedule,
             scalars,
+            lists,
         })
     }
 
@@ -346,13 +356,13 @@ impl ChainConfig {
 
     /// Every scalar key and its value as written (without quotes), sorted by key.
     pub fn scalars(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
-        std::iter::empty()
+        self.scalars.iter().map(|(k, v)| (k.as_str(), v.as_str()))
     }
 
     /// Every list key (`BLOB_SCHEDULE`, ...) and its records as written, sorted by key. Each
     /// record is its `(field, value)` pairs in file order.
     pub fn lists(&self) -> impl Iterator<Item = (&str, &[Vec<(String, String)>])> + '_ {
-        std::iter::empty()
+        self.lists.iter().map(|(k, v)| (k.as_str(), v.as_slice()))
     }
 
     /// Compares each `(key, value)` of `compiled` with the uint64 value of `key` in the config.

@@ -378,7 +378,8 @@ fn scalars_and_lists_as_written() {
             .map(|(f, v)| ((*f).to_owned(), (*v).to_owned()))
             .collect()
     };
-    let lists: Vec<(&str, &[Vec<(String, String)>])> = config.lists().collect();
+    type Record = Vec<(String, String)>;
+    let lists: Vec<(&str, &[Record])> = config.lists().collect();
     assert_eq!(
         lists,
         [
