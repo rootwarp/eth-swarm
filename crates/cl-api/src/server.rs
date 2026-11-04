@@ -62,6 +62,7 @@ use tokio::time::{Instant, Sleep};
 
 use crate::node_state::NodeState;
 use crate::routes::config::ConfigData;
+use crate::sse::EventHub;
 
 /// `127.0.0.1:5052`: the Beacon API's default address.
 pub const DEFAULT_HTTP_ADDR: SocketAddr =
@@ -290,6 +291,8 @@ pub fn with_consensus_version(mut response: Response, fork: ForkName) -> Respons
 pub struct ApiState {
     pub node: NodeState,
     pub config: Arc<ConfigData>,
+    /// `/eth/v1/events`' fan-out of cl-chain's events.
+    pub events: EventHub,
 }
 
 /// Default [`HttpLimits::header_read_timeout`], in milliseconds.
@@ -344,12 +347,13 @@ pub fn is_bare_host(entry: &str) -> bool {
 }
 
 /// Every route, each non-streaming one under `request_timeout`, with the 404 and 405 fallbacks.
+/// `/eth/v1/events` streams, so it is mounted without the timeout.
 pub fn router(state: ApiState, request_timeout: Duration) -> Router {
     app(
         Router::new()
             .merge(crate::routes::node::routes())
             .merge(crate::routes::config::routes()),
-        Router::new(),
+        crate::sse::routes(),
         request_timeout,
     )
     .with_state(state)

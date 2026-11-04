@@ -40,9 +40,12 @@
 //! - **cl-chain** is reached on `chain_socket` only if its server runs as `chain_uid`
 //!   (`ipc::uds::PeerCheckedConnector`). The channel connects lazily, so cl-api starts, and
 //!   answers 503 from `node/health`, while cl-chain is still down. cl-chain's ACL must give
-//!   `/ethswarm.chain.v1.ImportService/GetChainStatus` to cl-api.
+//!   cl-api [`CHAIN_METHODS`]: `ImportService/GetChainStatus` (the poller) and
+//!   `EventsService/Subscribe` (`/eth/v1/events`, one subscription for every client:
+//!   [`crate::sse`]). Without the subscription, `/eth/v1/events` answers 503.
 //! - **Shutdown.** At SIGTERM, the gRPC socket drains (svc-runtime), and the HTTP server stops
-//!   accepting and lets its open requests finish.
+//!   accepting and lets its open requests finish. Every `/eth/v1/events` stream ends then, so
+//!   none holds up the drain.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -51,9 +54,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ethswarm_proto::api::api_service_server::ApiServiceServer;
+use ethswarm_proto::chain::events_service_client::EventsServiceClient;
 use ethswarm_proto::chain::import_service_client::ImportServiceClient;
 use ipc::hello::{NetworkHello, API_VERSION_V1};
 use ipc::uds::PeerCheckedConnector;
+use ipc::Link;
 use network_config::{ChainConfig, Genesis};
 use serde::Deserialize;
 use svc_runtime::{Config, Hooks, Services};
@@ -64,6 +69,7 @@ use tonic::transport::Endpoint;
 use crate::node_state::{poll_chain, NodeState, SlotClock};
 use crate::routes::config::{ConfigData, ConfigDataError};
 use crate::server::{is_bare_host, router, ApiState, BindError, HttpBind, HttpLimits};
+use crate::sse::EventHub;
 use crate::ApiStub;
 
 /// The exit code of a config that does not load.
@@ -77,6 +83,12 @@ pub const SERVICE: &str = "cl-api";
 
 /// cl-chain's socket unless `chain_socket` says otherwise.
 pub const DEFAULT_CHAIN_SOCKET: &str = "/run/ethswarm/cl-chain/cl-chain.sock";
+
+/// The chain.v1 methods cl-api calls. cl-chain's method ACL must give each of them to cl-api.
+pub const CHAIN_METHODS: [&str; 2] = [
+    "/ethswarm.chain.v1.ImportService/GetChainStatus",
+    "/ethswarm.chain.v1.EventsService/Subscribe",
+];
 
 /// How often cl-chain is polled unless `poll_interval_ms` says otherwise.
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
@@ -245,16 +257,27 @@ impl ApiSettings {
     }
 }
 
-/// The Beacon API side, started: the server and the poller.
+/// The Beacon API side, started: the server, the poller and the events subscription.
 pub struct Http {
     /// The address the server listens on.
     pub addr: SocketAddr,
     pub server: JoinHandle<()>,
     pub poller: JoinHandle<()>,
+    /// [`EventHub::follow`].
+    pub events: JoinHandle<()>,
 }
 
-/// Binds the Beacon API, then starts the poller and the server. Both stop once `stop` turns
-/// `true` or its sender is gone.
+/// cl-api's link: the network's hello, on its gRPC service and on every chain.v1 stream.
+fn link(chain: &ChainConfig, genesis: Genesis) -> Result<Link, ServiceError> {
+    let build = format!("cl-api/{}", env!("CARGO_PKG_VERSION"));
+    NetworkHello::new(&build, chain, genesis)
+        .map_err(|e| e.to_string())
+        .and_then(|hello| Link::network(Arc::new(hello), API_VERSION_V1).map_err(|e| e.to_string()))
+        .map_err(|e| ServiceError::Config(format!("the ethswarm.api.v1 link: {e}")))
+}
+
+/// Binds the Beacon API, then starts the poller, the events subscription and the server. All
+/// three stop once `stop` turns `true` or its sender is gone.
 ///
 /// # Errors
 ///
@@ -266,6 +289,7 @@ pub async fn start_http(
     stop: watch::Receiver<bool>,
 ) -> Result<Http, ServiceError> {
     let config = Arc::new(ConfigData::new(chain)?);
+    let link = link(chain, genesis)?;
     let listener = settings.bind().bind().await?;
     let addr = listener.local_addr().map_err(|source| BindError::Io {
         addr: settings.http_listen,
@@ -282,18 +306,32 @@ pub async fn start_http(
     // The authority routes nothing: the connector picks the socket.
     let channel = Endpoint::from_static("http://localhost").connect_with_connector_lazy(connector);
     let poller = tokio::spawn(poll_chain(
-        ImportServiceClient::new(channel),
+        ImportServiceClient::new(channel.clone()),
         node.clone(),
         settings.poll_interval(),
         stopped(stop.clone()),
     ));
+    let events = EventHub::new();
+    let follower = tokio::spawn(events.clone().follow(
+        EventsServiceClient::new(channel),
+        link,
+        stopped(stop.clone()),
+    ));
     let limits = settings.limits();
-    let app = router(ApiState { node, config }, limits.request_timeout);
+    let app = router(
+        ApiState {
+            node,
+            config,
+            events,
+        },
+        limits.request_timeout,
+    );
     let server = tokio::spawn(crate::server::serve(listener, app, limits, stopped(stop)));
     Ok(Http {
         addr,
         server,
         poller,
+        events: follower,
     })
 }
 
@@ -315,13 +353,7 @@ pub async fn serve(
     mut hooks: Hooks,
 ) -> Result<(), ServiceError> {
     let genesis = config.genesis.ok_or(ServiceError::NoGenesis)?;
-    let build = format!("cl-api/{}", env!("CARGO_PKG_VERSION"));
-    let link = NetworkHello::new(&build, &config.chain, genesis)
-        .map_err(|e| e.to_string())
-        .and_then(|hello| {
-            ipc::Link::network(Arc::new(hello), API_VERSION_V1).map_err(|e| e.to_string())
-        })
-        .map_err(|e| ServiceError::Config(format!("the ethswarm.api.v1 link: {e}")))?;
+    let link = link(&config.chain, genesis)?;
     let (stop, stop_rx) = watch::channel(false);
     let http = start_http(&settings, &config.chain, genesis, stop_rx).await?;
     tracing::info!(
@@ -347,6 +379,7 @@ pub async fn serve(
         ),
     }
     http.poller.abort();
+    http.events.abort();
     result.map_err(ServiceError::from)
 }
 
@@ -432,7 +465,7 @@ mod tests {
 
     use super::*;
     use crate::server::DEFAULT_HTTP_ADDR;
-    use crate::testing::{sync_status, FakeChain};
+    use crate::testing::{self, sync_status, FakeChain, SseClient, WITHIN};
 
     const HEALTH: &str = "/ethswarm.api.v1.ApiService/GetHealth";
 
@@ -708,5 +741,259 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ServiceError::NoGenesis), "{err}");
+    }
+
+    const SUBSCRIBE: &str = "/ethswarm.chain.v1.EventsService/Subscribe";
+    const CHAIN_STATUS: &str = "/ethswarm.chain.v1.ImportService/GetChainStatus";
+
+    /// cl-chain's `routes` on `path`, behind a cl-chain method ACL that gives `methods` to cl-api
+    /// (this process's UID); the count of calls it denied, and the server's stop.
+    fn serve_chain(
+        path: &Path,
+        routes: tonic::service::Routes,
+        methods: &[&str],
+    ) -> (
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let uid = ipc::peercred::effective_uid();
+        let mut acl = format!("[callers]\ncl-api = {uid}\n\n[methods]\n");
+        for method in methods {
+            acl.push_str(&format!("\"{method}\" = [\"cl-api\"]\n"));
+        }
+        let acl =
+            ipc::acl::MethodAcl::from_toml(&acl, Path::new("cl-chain.toml"), "cl-chain").unwrap();
+        let denied = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&denied);
+        let layer = ipc::acl::AclLayer::new(Arc::new(acl)).on_denied(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .layer(layer)
+                .add_routes(routes)
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::UnixListenerStream::new(listener),
+                    async {
+                        let _ = stopped.await;
+                    },
+                ),
+        );
+        (denied, stop)
+    }
+
+    /// The Beacon API on a free loopback port, reaching cl-chain on `chain_socket`.
+    async fn api_for(chain_socket: &Path, stop: watch::Receiver<bool>) -> Http {
+        let api = format!(
+            "[api]\nhttp_listen = \"127.0.0.1:0\"\nchain_socket = \"{}\"\nchain_uid = {}\n",
+            chain_socket.display(),
+            ipc::peercred::effective_uid()
+        );
+        let config = config(Path::new("/run/ethswarm"), &api);
+        let settings = ApiSettings::load(&config).unwrap();
+        start_http(&settings, &config.chain, testing::genesis(), stop)
+            .await
+            .unwrap()
+    }
+
+    /// A stream on `query`'s topics, once cl-api has subscribed to cl-chain (503 until then).
+    async fn live_client(addr: SocketAddr, query: &str) -> SseClient {
+        let start = Instant::now();
+        loop {
+            let client = SseClient::connect(addr, &format!("/eth/v1/events?{query}")).await;
+            if client.status == 200 {
+                return client;
+            }
+            assert_eq!(client.status, 503);
+            assert!(start.elapsed() < WITHIN, "/eth/v1/events was never served");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    type Root = consensus_types::primitives::Root;
+    type Slot = consensus_types::primitives::Slot;
+
+    /// A block tree of `(block, slot, parent)`.
+    struct Tree(Vec<(u8, Slot, u8)>);
+
+    fn root(n: u8) -> Root {
+        Root::repeat_byte(n)
+    }
+
+    fn hex(n: u8) -> String {
+        format!("0x{}", format!("{n:02x}").repeat(32))
+    }
+
+    impl cl_chain::events::BlockTree for Tree {
+        fn parent(&self, block: &Root) -> Option<(Root, Slot)> {
+            let (_, _, parent) = self.0.iter().find(|(n, _, _)| root(*n) == *block)?;
+            let (_, slot, _) = self.0.iter().find(|(n, _, _)| n == parent)?;
+            Some((root(*parent), *slot))
+        }
+    }
+
+    /// End to end over the Unix socket: cl-chain's own `EventsService` (its routes, behind a
+    /// method ACL that gives cl-api [`CHAIN_METHODS`]) publishes a head, a Gloas block, the head
+    /// turning full, a finalized checkpoint and a re-org; one `/eth/v1/events` client on every
+    /// topic gets them as the beacon APIs write them. Shutdown ends the stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chain_events_reach_sse_over_uds() {
+        use cl_chain::events::{Bid, Finalized, Head, ImportedBlock};
+        use cl_chain::persist::durable::PayloadStatus;
+        let tmp = tempfile::tempdir().unwrap();
+        let chain_socket = tmp.path().join("cl-chain.sock");
+        let chain = cl_chain::ChainStub::new(testing::link());
+        let events = chain.events().clone();
+        let (denied, _chain) = serve_chain(&chain_socket, chain.routes(), &CHAIN_METHODS);
+        let (stop, stopped) = watch::channel(false);
+        let http = api_for(&chain_socket, stopped).await;
+        let all = "topics=head,head_v2,block,finalized_checkpoint,chain_reorg";
+        let mut client = live_client(http.addr, all).await;
+
+        // Sepolia's Gloas epoch; blocks 1 (slot s) and 2 (slot s + 1) both build on block 9.
+        let epoch = 353_024;
+        let s = epoch * 32 + 5;
+        let tree = Tree(vec![(9, s - 1, 0), (1, s, 9), (2, s + 1, 9)]);
+        let head = |n: u8, slot, payload_status| Head {
+            slot,
+            block: root(n),
+            state: root(n | 0x80),
+            payload_status,
+            previous_duty_dependent_root: root(0x71),
+            current_duty_dependent_root: root(0x72),
+            execution_optimistic: false,
+        };
+        events.head(head(1, s, PayloadStatus::Empty), &tree);
+        events.block(&ImportedBlock {
+            slot: s,
+            block: root(1),
+            execution_optimistic: false,
+            bid: Some(Bid {
+                builder_index: 42,
+                block_hash: root(0xab),
+            }),
+        });
+        events.head(head(1, s, PayloadStatus::Full), &tree);
+        events.finalized(&Finalized {
+            epoch,
+            block: root(9),
+            state: root(0x89),
+            execution_optimistic: false,
+        });
+        events.head(head(2, s + 1, PayloadStatus::Empty), &tree);
+
+        let got = client.take(9).await;
+        let names: Vec<&str> = got.iter().map(|e| e.event.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "head",
+                "head_v2",
+                "block",
+                "head",
+                "head_v2",
+                "finalized_checkpoint",
+                "chain_reorg",
+                "head",
+                "head_v2"
+            ]
+        );
+        assert_eq!(
+            got[0].json(),
+            serde_json::json!({
+                "slot": s.to_string(),
+                "block": hex(1),
+                "state": hex(0x81),
+                "epoch_transition": false,
+                "previous_duty_dependent_root": hex(0x71),
+                "current_duty_dependent_root": hex(0x72),
+                "execution_optimistic": false,
+            })
+        );
+        assert_eq!(
+            got[1].json(),
+            serde_json::json!({
+                "version": "gloas",
+                "data": {
+                    "slot": s.to_string(),
+                    "block": hex(1),
+                    "state": hex(0x81),
+                    "payload_status": "empty",
+                    "epoch_transition": false,
+                    "current_epoch_dependent_root": hex(0x71),
+                    "next_epoch_dependent_root": hex(0x72),
+                    "execution_optimistic": false,
+                },
+            })
+        );
+        assert_eq!(
+            got[2].json(),
+            serde_json::json!({
+                "slot": s.to_string(),
+                "block": hex(1),
+                "execution_optimistic": false,
+                "builder_index": "42",
+                "block_hash": hex(0xab),
+            })
+        );
+        assert_eq!(got[3].json()["block"], hex(1));
+        assert_eq!(got[4].json()["data"]["payload_status"], "full");
+        assert_eq!(
+            got[5].json(),
+            serde_json::json!({
+                "block": hex(9),
+                "state": hex(0x89),
+                "epoch": epoch.to_string(),
+                "execution_optimistic": false,
+            })
+        );
+        assert_eq!(
+            got[6].json(),
+            serde_json::json!({
+                "slot": (s + 1).to_string(),
+                "depth": "1",
+                "old_head_block": hex(1),
+                "new_head_block": hex(2),
+                "old_head_state": hex(0x81),
+                "new_head_state": hex(0x82),
+                "epoch": epoch.to_string(),
+                "execution_optimistic": false,
+            })
+        );
+        assert_eq!(got[7].json()["block"], hex(2));
+        assert_eq!(got[8].json()["data"]["block"], hex(2));
+        assert_eq!(denied.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Shutdown: the stream ends and the server returns.
+        stop.send_replace(true);
+        assert_eq!(client.next().await, None);
+        tokio::time::timeout(WITHIN, http.server)
+            .await
+            .expect("the server returns")
+            .unwrap();
+    }
+
+    /// cl-chain's ACL must give `EventsService/Subscribe` to cl-api ([`CHAIN_METHODS`]):
+    /// without it, the subscription is refused and `/eth/v1/events` answers 503.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn events_need_the_subscribe_acl_entry() {
+        assert!(CHAIN_METHODS.contains(&SUBSCRIBE), "{CHAIN_METHODS:?}");
+        assert!(CHAIN_METHODS.contains(&CHAIN_STATUS), "{CHAIN_METHODS:?}");
+        let tmp = tempfile::tempdir().unwrap();
+        let chain_socket = tmp.path().join("cl-chain.sock");
+        let chain = cl_chain::ChainStub::new(testing::link());
+        let (denied, _chain) = serve_chain(&chain_socket, chain.routes(), &[CHAIN_STATUS]);
+        let (_stop, stopped) = watch::channel(false);
+        let http = api_for(&chain_socket, stopped).await;
+        let start = Instant::now();
+        while denied.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(start.elapsed() < WITHIN, "Subscribe was never refused");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let client = SseClient::connect(http.addr, "/eth/v1/events?topics=head").await;
+        assert_eq!(client.status, 503);
     }
 }

@@ -191,6 +191,7 @@ mod tests {
         let state = ApiState {
             node: NodeState::new(testing::clock()),
             config: std::sync::Arc::new(ConfigData::new(chain).unwrap()),
+            events: crate::sse::EventHub::new(),
         };
         let (status, headers, body) = get(&router(state), uri).await;
         assert_eq!(status, StatusCode::OK, "{uri}");

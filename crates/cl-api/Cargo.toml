@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "cl-api: the Beacon API on HTTP (node and config routes) and the ethswarm.api.v1 service (contract layer only, every RPC answers UNIMPLEMENTED)."
+description = "cl-api: the Beacon API on HTTP (node, config and event-stream routes) and the ethswarm.api.v1 service (contract layer only, every RPC answers UNIMPLEMENTED)."
 
 [dependencies]
 # The Beacon API server: axum 0.8 on hyper 1, already in the tree through tonic (svc-runtime
@@ -14,8 +14,11 @@ description = "cl-api: the Beacon API on HTTP (node and config routes) and the e
 # review of the new direct deps before first use.
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 ethswarm-proto = { path = "../ethswarm-proto" }
-# The `syncing_status` query parameter; already in Cargo.lock (through url).
+# The `syncing_status` and `topics` query parameters; already in Cargo.lock (through url).
 form_urlencoded = "1"
+# `stream::unfold`: the body of an /eth/v1/events stream. Already in Cargo.lock (through axum),
+# and a dev-dependency before.
+futures-util = { version = "0.3", default-features = false }
 http = "1"
 # The server's connections: auto::Builder, TokioTimer and TowerToHyperService, as
 # svc-runtime's /metrics server. Already in Cargo.lock (through axum and tonic).
@@ -31,9 +34,17 @@ tonic.workspace = true
 tracing = "0.1"
 
 [dev-dependencies]
-# A streaming body for the server tests; already in Cargo.lock (through axum).
-futures-util = { version = "0.3", default-features = false }
+# The end-to-end test of /eth/v1/events: cl-chain's own EventsService and its event types.
+# Workspace crates; they add no crate to Cargo.lock.
+cl-chain = { path = "../cl-chain" }
+consensus-types = { path = "../consensus-types" }
+# The test SSE client: hyper's HTTP/1 client, as cl-chain's reference API client uses it.
+# Already in Cargo.lock.
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
 ipc = { path = "../ipc", features = ["testkit"] }
 tempfile = "3"
 tokio = { version = "1", features = ["io-util"] }
+# A Unix socket served behind a method ACL (tonic's incoming stream); already in Cargo.lock.
+tokio-stream = { version = "0.1", features = ["net"] }
 tower = { version = "0.5", features = ["util"] }

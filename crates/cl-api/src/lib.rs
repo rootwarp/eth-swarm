@@ -6,8 +6,10 @@
 //! - [`node_state`]: what `node/health` and `node/syncing` report. That is cl-chain's chain
 //!   status, polled over chain.v1 `ImportService.GetChainStatus`, set against the wall clock.
 //! - [`routes`]: `node/{health,syncing,version}` and `config/{spec,fork_schedule,deposit_contract}`.
+//! - [`sse`]: `/eth/v1/events`, cl-chain's chain.v1 events as the beacon-APIs event stream, one
+//!   subscription shared by every client.
 //! - [`service`]: the process. It reads the config's `[api]` table, serves the gRPC service on
-//!   its socket and the Beacon API on HTTP, and runs the poller.
+//!   its socket and the Beacon API on HTTP, and runs the poller and the events subscription.
 //!
 //! The gRPC `ApiService` is still a stub. Every RPC runs the `ipc` contract layer first (hello
 //! negotiation, frame discipline, `seq`, envelope type and digest checks) and then answers
@@ -23,6 +25,7 @@ pub mod node_state;
 pub mod routes;
 pub mod server;
 pub mod service;
+pub mod sse;
 
 #[cfg(test)]
 mod openapi;
