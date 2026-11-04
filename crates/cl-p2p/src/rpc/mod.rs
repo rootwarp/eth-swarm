@@ -9,6 +9,10 @@
 //!
 //! - [`answer_bucket`]: the address block (IPv4 /24, IPv6 /48) a peer's column answer places
 //!   are counted against.
+//! - [`blocks`]: BeaconBlocksByRange v2 answers ([`blocks::ByRangeResponder`]) over a
+//!   [`blocks::BlockSource`]: cl-store's finalized blocks, then cl-chain's.
+//! - [`blocks_ipc`]: that source in the service ([`blocks_ipc::IpcBlocks`]): store.v1 and
+//!   chain.v1 clients held to the contract.
 //! - [`chain_status`]: our Status from cl-chain's `ReqRespService/GetStatus`
 //!   ([`chain_status::ChainStatus`]).
 //! - [`codec`]: both halves of the `ssz_snappy` codec, with the deadlines inside it.

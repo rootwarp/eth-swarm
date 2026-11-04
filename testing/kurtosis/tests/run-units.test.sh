@@ -338,7 +338,8 @@ check "the devnet's cl-verify user comes before the README's usermod line" grep 
 check "each probe unit gets the anchor-check drop-in" grep -qF 'devnet-anchor-check.conf "/etc/systemd/system/$u.service.d/"' "$STUB_DIR/ran.devnet-units.sh"
 order=$(grep -oE 'bash -euo pipefail /work/[a-z-]+\.sh' "$STUB_DIR/docker.log" | sed 's|.*/||' | tr '\n' ' ')
 check "the install order: devnet user, README users, devnet units, README rest" test "$order" == "devnet-user.sh install-users.sh devnet-units.sh install-rest.sh "
-check "cl-chain.toml gives the five methods to cl-p2p" test "$(grep -c '= \["cl-p2p"\]$' "$d/cl-chain.toml")" -eq 5
+check "cl-chain.toml gives the six methods to cl-p2p" test "$(grep -c '= \["cl-p2p"\]$' "$d/cl-chain.toml")" -eq 6
+check "cl-chain.toml names BlocksByRange" grep -qF '"/ethswarm.chain.v1.ReqRespService/BlocksByRange" = ["cl-p2p"]' "$d/cl-chain.toml"
 check "cl-chain.toml names Validate" grep -qF '"/ethswarm.chain.v1.GossipService/Validate" = ["cl-p2p"]' "$d/cl-chain.toml"
 check "cl-chain.toml: the IDs the install made" bash -c "grep -qx 'group = 986' '$d/cl-chain.toml' && grep -qx 'cl-p2p = 988' '$d/cl-chain.toml' && grep -qx 'verify_uid = 989' '$d/cl-chain.toml'"
 check "cl-chain.toml: a node ID and the first CL as the reference" bash -c "grep -qE '^node_id = \"0x[0-9a-f]{64}\"$' '$d/cl-chain.toml' && grep -qx 'reference_api_url = \"http://172.16.0.11:4000\"' '$d/cl-chain.toml'"

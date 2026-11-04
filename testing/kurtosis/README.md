@@ -732,7 +732,7 @@ it), with the same inputs as the checks above:
   `--api` vouches for each block root, cl-verify checks the cells by KZG, and only custody
   columns are kept. cl-chain serves `ethswarm.chain.v1.ReqRespService` on
   `<--socket-dir>/cl-chain/cl-chain.sock` behind its method ACL: only `cl-p2p` (our own UID)
-  may call `GetStatus`, `DataColumnsByRange` and `DataColumnsByRoot`.
+  may call `GetStatus`, `BlocksByRange`, `DataColumnsByRange` and `DataColumnsByRoot`.
 - cl-p2p's probe swarm listens on `--listen` (default `/ip4/0.0.0.0/tcp/9000`), subscribes
   to our custody column subnets, and answers column requests and Status through that socket.
 - After `--serve-secs` (default 300) it asks itself for the columns over libp2p, as a peer

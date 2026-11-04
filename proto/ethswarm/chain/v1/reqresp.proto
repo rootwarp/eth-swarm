@@ -6,7 +6,8 @@ import "ethswarm/common/v1/envelope.proto";
 import "ethswarm/common/v1/error.proto";
 
 // Served by cl-chain, called by cl-p2p to answer inbound peer requests.
-// cl-p2p may serve finalized ranges directly from its read-only MDBX handle.
+// cl-p2p opens no database: it reads finalized block ranges from cl-store
+// (ethswarm.store.v1 GetBlocksByRange) and everything above the store's finalized slot here.
 
 message ResponseChunk {
   oneof result {
@@ -40,7 +41,10 @@ message GetMetadataResponse {
   uint64 custody_group_count = 4;
 }
 
-// BeaconBlocksByRange v2. count <= MAX_REQUEST_BLOCKS_DENEB = 128.
+// BeaconBlocksByRange v2. count <= MAX_REQUEST_BLOCKS_DENEB = 128; a larger count is
+// ERROR_CODE_INVALID. The answer is the canonical blocks of [start_slot, start_slot + count) on
+// the chain of cl-chain's head, ascending, skipped slots skipped, one PAYLOAD_TYPE_SIGNED_BEACON_BLOCK
+// envelope per block (root: the block root; fork_digest: that of its slot's epoch).
 message BlocksByRangeRequest {
   uint64 start_slot = 1;
   uint64 count = 2;

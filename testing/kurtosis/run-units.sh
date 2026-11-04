@@ -474,6 +474,7 @@ cl-p2p = $uid_p2p
 
 [methods]
 "/ethswarm.chain.v1.ReqRespService/GetStatus" = ["cl-p2p"]
+"/ethswarm.chain.v1.ReqRespService/BlocksByRange" = ["cl-p2p"]
 "/ethswarm.chain.v1.ReqRespService/DataColumnsByRange" = ["cl-p2p"]
 "/ethswarm.chain.v1.ReqRespService/DataColumnsByRoot" = ["cl-p2p"]
 "/ethswarm.chain.v1.GossipService/WatchSubscriptions" = ["cl-p2p"]

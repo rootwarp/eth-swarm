@@ -15,8 +15,10 @@
 //! - `GetBlocksByHead` is a [`ParentWalk`]: `count` capped at [`MAX_BLOCKS`], stamped by its
 //!   first read (before the stream opens), then one block per read as the client reads, at
 //!   most one body ahead.
-//! - `GetChainHead` carries the stamp's head; the stamp holds no checkpoint epoch, justified
-//!   checkpoint, head state root or earliest slot, so those fields stay empty.
+//! - `GetChainHead` carries the stamp's head and its finalized block's slot (`finalized_slot`,
+//!   where cl-p2p splits a BeaconBlocksByRange answer between cl-store and cl-chain); the stamp
+//!   holds no checkpoint epoch, justified checkpoint, head state root or earliest slot, so those
+//!   fields stay empty.
 //! - `GetState`, `GetPayloadEnvelope`, `GetDataColumns` and `GetDataColumnsByRange` run the
 //!   contract checks and answer `UNIMPLEMENTED`; so does `include_envelopes`.
 //! - The method ACL is [`store_acl`]: the server's owner puts it in front as an
@@ -348,6 +350,7 @@ impl StoreService for StoreServer {
             head_slot: stamp.head_slot,
             head_root: stamp.head_root.to_vec(),
             meta: Some(read_meta(&stamp, stamp.head_slot <= stamp.finalized_slot)),
+            finalized_slot: stamp.finalized_slot,
             ..Default::default()
         }))
     }
@@ -583,19 +586,6 @@ mod tests {
         client(server(store)).await
     }
 
-    /// The field of `GetChainHeadResponse` #146 adds, read off the wire: `finalized_slot` (8).
-    #[derive(Clone, PartialEq, prost::Message)]
-    struct FinalizedSlot {
-        #[prost(uint64, tag = "8")]
-        finalized_slot: u64,
-    }
-
-    fn finalized_slot(head: &pb::GetChainHeadResponse) -> u64 {
-        FinalizedSlot::decode(head.encode_to_vec().as_slice())
-            .unwrap()
-            .finalized_slot
-    }
-
     /// #146: `GetChainHead` carries the stamp's finalized slot (`finalized_slot`, 8), the split
     /// point cl-p2p serves a BlocksByRange answer around, from the same read as the head; in
     /// process and over a Unix socket.
@@ -611,7 +601,7 @@ mod tests {
             let mut reader = StoreReader::new(conn.transport.clone(), fixture::v1_link());
             let head = reader.get_chain_head().await.unwrap();
             assert_eq!(head.head_slot, blocks[7].slot, "{}", mode.name());
-            assert_eq!(finalized_slot(&head), blocks[4].slot, "{}", mode.name());
+            assert_eq!(head.finalized_slot, blocks[4].slot, "{}", mode.name());
         }
     }
 

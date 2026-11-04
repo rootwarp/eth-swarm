@@ -163,13 +163,28 @@ protocols offered: any other fails multistream-select negotiation, among them th
   books nothing) and counted in `rpc_inbound_streams_refused_total`. A reset, a dropped
   writer or a panicking responder frees the slot, the bytes and the task; a reset gives no
   tokens back. The column protocols keep their own path until #148 moves them onto it.
+- **BeaconBlocksByRange v2 from the stores** (`rpc::blocks`, `rpc::blocks_ipc`, #146): with
+  `store_socket` and `store_uid` in `[p2p]`, the service gives `Control` the production
+  responder, `ByRangeResponder` over `IpcBlocks`. A start below our Status's
+  `earliest_available_slot` is `3` before any IPC call. Otherwise the answer is split at
+  cl-store's finalized slot (`GetChainHead.finalized_slot`, read first): the finalized blocks
+  from cl-store's `GetBlocksByRange`, then the rest from cl-chain's `ReqRespService/
+  BlocksByRange` (its stamp's head chain), contiguous and ascending, each block's
+  `parent_root` checked against the block before (a break ends the answer cleanly, counted in
+  `rpc_block_lookup_failures_total{half, kind}`). Blocks go out as stored, decoded by their
+  slot's fork, with their own epoch's digest (Fulu, BPO, Gloas). Each IPC step runs under
+  2 s, at most 16 answers hold IPC calls (`RpcLimits::max_block_lookups` \[est\], one past them
+  waits 2 s, then `2`), and cl-store's `UNAVAILABLE` and cl-chain's `RESOURCE_UNAVAILABLE`
+  are `3`, any other failure `2` (before the first chunk; after it the answer ends cleanly).
+  `step` above 1 is at most the block at `start_slot`. Without the store socket it stays `3`;
+  the probe units leave it out (probe mode stores only its anchor).
 - **Rejects**: a request that breaks the wire format gets `1: InvalidRequest` (a Goodbye's
   too), and so does a
   `BeaconBlocksByRange` request with `step` 0 or a `count` above `MAX_REQUEST_BLOCKS_DENEB` (128;
   semantically invalid, `phase0` L1286, L1514, `deneb` L876; the connection stays). `3:
   ResourceUnavailable` goes out only where the protocol specifies it: `BeaconBlocksByRange`,
-  answered so on every other request because the probe stores no blocks, and the two column
-  protocols. A Status we cannot
+  answered so on every other request when no store socket is configured (the probe stores no
+  blocks), and the two column protocols. A Status we cannot
   answer (no Status of ours yet) gets `2: ServerError`. Error chunks carry no context bytes.
 - **Deadlines** (in the codec, `tokio::time::timeout`, both directions): 5 s to the first
   byte, 5 s per chunk, 10 s in total. Those are this client's own policy \[est\], taken from

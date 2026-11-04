@@ -8,6 +8,8 @@
 //!   epoch.
 //! - [`Network::genesis`]: the pinned genesis time and validators root.
 //! - [`network_dir`]: a devnet's `config.yaml` and `genesis.ssz`, read from one directory.
+//! - [`window`]: the block serve window, `compute_min_epochs_for_block_requests` before and from
+//!   Gloas.
 //! - [`MAX_SEED_LOOKAHEAD`]: the preset activation lookahead.
 //! - [`SPEC_PIN`]: the spec releases every type and vector in the workspace follows.
 

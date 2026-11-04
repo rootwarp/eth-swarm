@@ -1,25 +1,51 @@
-//! The production [`BlockSource`] (#146): cl-store's `GetChainHead` and `GetBlocksByRange`,
-//! cl-chain's `ReqRespService/BlocksByRange`.
+//! The production [`BlockSource`] (#146): [`IpcBlocks`], cl-store's `GetChainHead` (the split
+//! point, `finalized_slot`) and `GetBlocksByRange` (the finalized half), and cl-chain's
+//! `ReqRespService/BlocksByRange` (the rest).
+//!
+//! - **Contract.** Every stream is read through the `ipc` contract layer ([`Link::open`] on
+//!   [`Inbound::from_server`]): the server's hello first, `seq` strictly from 1, and each
+//!   envelope's fork digest checked against its slot's fork ([`Link::check_envelope`]), the
+//!   fork the block is then decoded with. An envelope dropped by those checks, of another type
+//!   than `PAYLOAD_TYPE_SIGNED_BEACON_BLOCK`, or without a 32-byte root breaks the contract:
+//!   `2: ServerError`, never decoded.
+//! - **The read stamp.** cl-p2p links no cl-store (`scripts/check-m2a-deps.sh`), so it checks
+//!   cl-store's `ReadMeta` itself, as `cl_store::stamp::check_read_meta` does: a store answer or
+//!   body without its full stamp breaks the contract.
+//! - **Codes.** A store call cl-store failed `UNAVAILABLE` (nothing stamped to serve) is
+//!   `3: ResourceUnavailable`, any other failed call `2` ([`super::store_status`]). cl-chain's
+//!   error chunk `ERROR_CODE_RESOURCE_UNAVAILABLE` is `3`, any other `2`, `ERROR_CODE_INVALID`
+//!   included: cl-p2p built the request, so an invalid one is ours, not the peer's (unlike a
+//!   column request's).
+//! - **Bounds.** Each step (the call, the server's hello, each body) runs under
+//!   [`BLOCK_LOOKUP_TIMEOUT`]; past it the half fails `2` and its stream is dropped, which
+//!   cancels the call. Bodies are read one at a time as the answer goes out. Messages are
+//!   capped at `MAX_PAYLOAD_SIZE` plus 64 KiB.
 
-use super::blocks::{BlockSource, Blocks, Failed, Half, Lookup};
+use super::blocks::{BlockSource, Blocks, Failed, Half, Lookup, ServedBlock, BLOCK_LOOKUP_TIMEOUT};
+use super::store_status::store_result_code;
+use consensus_types::caps::MAX_PAYLOAD_SIZE;
 use ethswarm_proto::chain;
+use ethswarm_proto::common::{Envelope, ErrorCode, PayloadType};
 use ethswarm_proto::store;
 use futures::Stream;
 use ipc::envelope::Envelopes;
-use ipc::frame::InFrame;
+use ipc::frame::{InFrame, Inbound};
+use ipc::link::{Accepted, Guarded};
 use ipc::Link;
+use p2p_wire::rpc::protocols::ResultCode;
+use std::future::Future;
 use std::time::Duration;
 use tonic::transport::Channel;
 use tonic::Status;
 
-/// The blocks of an answer from cl-store and cl-chain.
+/// The largest message either client decodes: one block of `MAX_PAYLOAD_SIZE` and its framing.
+const MAX_MESSAGE_BYTES: usize = MAX_PAYLOAD_SIZE + 64 * 1024;
+
+/// The blocks of an answer from cl-store and cl-chain (see the module docs).
 #[derive(Clone, Debug)]
 pub struct IpcBlocks {
-    #[allow(dead_code)]
     store: store::store_service_client::StoreServiceClient<Channel>,
-    #[allow(dead_code)]
     chain: chain::req_resp_service_client::ReqRespServiceClient<Channel>,
-    #[allow(dead_code)]
     link: Link,
 }
 
@@ -28,8 +54,10 @@ impl IpcBlocks {
     #[must_use]
     pub fn new(store: Channel, chain: Channel, link: Link) -> Self {
         Self {
-            store: store::store_service_client::StoreServiceClient::new(store),
-            chain: chain::req_resp_service_client::ReqRespServiceClient::new(chain),
+            store: store::store_service_client::StoreServiceClient::new(store)
+                .max_decoding_message_size(MAX_MESSAGE_BYTES),
+            chain: chain::req_resp_service_client::ReqRespServiceClient::new(chain)
+                .max_decoding_message_size(MAX_MESSAGE_BYTES),
             link,
         }
     }
@@ -37,39 +65,209 @@ impl IpcBlocks {
 
 impl BlockSource for IpcBlocks {
     fn finalized_slot(&self) -> Lookup<u64> {
-        Box::pin(async { todo!("#146 step 5") })
+        let mut store = self.store.clone();
+        Box::pin(async move {
+            let head = within(
+                BLOCK_LOOKUP_TIMEOUT,
+                store.get_chain_head(store::GetChainHeadRequest {}),
+            )
+            .await?
+            .map_err(|status| call_failed(Half::Store, &status))?;
+            finalized_slot(head.get_ref())
+        })
     }
 
-    fn blocks(&self, _: Half, _: u64, _: u64) -> Lookup<Blocks> {
-        Box::pin(async { todo!("#146 step 5") })
+    fn blocks(&self, half: Half, start_slot: u64, count: u64) -> Lookup<Blocks> {
+        let (link, hello) = (self.link.clone(), Some(self.link.local()));
+        let step = BLOCK_LOOKUP_TIMEOUT;
+        let failed = move |status: Status| call_failed(half, &status);
+        match half {
+            Half::Store => {
+                let mut store = self.store.clone();
+                let request = store::GetBlocksByRangeRequest {
+                    start_slot,
+                    count,
+                    include_envelopes: false,
+                    hello,
+                };
+                Box::pin(async move {
+                    let call = within(step, store.get_blocks_by_range(request)).await?;
+                    Ok(read_blocks(
+                        link,
+                        call.map_err(failed)?.into_inner(),
+                        half,
+                        step,
+                    ))
+                })
+            }
+            Half::Chain => {
+                let mut chain = self.chain.clone();
+                let request = chain::BlocksByRangeRequest {
+                    start_slot,
+                    count,
+                    hello,
+                };
+                Box::pin(async move {
+                    let call = within(step, chain.blocks_by_range(request)).await?;
+                    Ok(read_blocks(
+                        link,
+                        call.map_err(failed)?.into_inner(),
+                        half,
+                        step,
+                    ))
+                })
+            }
+        }
     }
 }
 
-/// The body of one block of a range answer.
-pub(crate) trait BlockBody {}
-
-impl BlockBody for store::GetBlocksByRangeResponseBody {}
-
-impl BlockBody for chain::BlocksByRangeResponseBody {}
-
-/// The store's finalized slot from its `GetChainHead` answer.
-pub(crate) fn finalized_slot(_head: &store::GetChainHeadResponse) -> Result<u64, Failed> {
-    todo!("#146 step 5")
+/// `step` around one IPC step; past it the step fails `2` (`timeout`).
+async fn within<T>(step: Duration, future: impl Future<Output = T>) -> Result<T, Failed> {
+    tokio::time::timeout(step, future)
+        .await
+        .map_err(|_| Failed::server_error("timeout", format!("no answer within {step:?}")))
 }
 
-/// What a call of `half` that failed with `status` ends the answer with.
-pub(crate) fn call_failed(_half: Half, _status: &Status) -> Failed {
-    todo!("#146 step 5")
+fn contract(why: impl Into<String>) -> Failed {
+    Failed::server_error("contract", why)
 }
 
-/// The blocks of `half`'s response `stream`, each step within `step`.
-pub(crate) fn read_blocks<S, T>(_link: Link, _stream: S, _half: Half, _step: Duration) -> Blocks
+/// cl-store's read stamp, as `cl_store::stamp::check_read_meta` holds it: `as_of_seq`, a
+/// 32-byte `as_of_root` and `as_of_slot`, none of them zero.
+fn check_read_meta(meta: Option<&store::ReadMeta>) -> Result<(), Failed> {
+    match meta {
+        Some(m) if m.as_of_seq > 0 && m.as_of_root.len() == 32 && m.as_of_slot > 0 => Ok(()),
+        _ => Err(contract("a store answer without its full ReadMeta")),
+    }
+}
+
+/// The body of one block of a range answer: its envelope, or why there is none.
+pub(crate) trait BlockBody {
+    fn envelope(self) -> Result<Envelope, Failed>;
+}
+
+/// An error a server sent in the stream: `ERROR_CODE_RESOURCE_UNAVAILABLE` is `3`, any other
+/// `2`.
+fn refused(code: i32, detail: &str) -> Failed {
+    let code = match ErrorCode::try_from(code) {
+        Ok(ErrorCode::ResourceUnavailable) => ResultCode::ResourceUnavailable,
+        _ => ResultCode::ServerError,
+    };
+    Failed {
+        code,
+        kind: "refused",
+        why: format!("refused: {detail}"),
+    }
+}
+
+impl BlockBody for store::GetBlocksByRangeResponseBody {
+    fn envelope(self) -> Result<Envelope, Failed> {
+        check_read_meta(self.meta.as_ref())?;
+        if let Some(e) = self.error {
+            return Err(refused(e.code, &e.detail));
+        }
+        self.item
+            .ok_or_else(|| contract("a store body without its block"))
+    }
+}
+
+impl BlockBody for chain::BlocksByRangeResponseBody {
+    fn envelope(self) -> Result<Envelope, Failed> {
+        match self.item.and_then(|item| item.result) {
+            Some(chain::response_chunk::Result::Chunk(envelope)) => Ok(envelope),
+            Some(chain::response_chunk::Result::Error(e)) => Err(refused(e.code, &e.detail)),
+            // `Envelopes::check_shape` refuses a chunk with neither.
+            None => Err(contract("an empty chunk")),
+        }
+    }
+}
+
+/// The store's finalized slot from its `GetChainHead` answer, which must carry its stamp.
+pub(crate) fn finalized_slot(head: &store::GetChainHeadResponse) -> Result<u64, Failed> {
+    check_read_meta(head.meta.as_ref())?;
+    Ok(head.finalized_slot)
+}
+
+/// What a call of `half` that failed with `status` ends the answer with: cl-store's own
+/// `UNAVAILABLE` is `3`, any other failure `2`.
+pub(crate) fn call_failed(half: Half, status: &Status) -> Failed {
+    let code = match half {
+        Half::Store => store_result_code(status),
+        Half::Chain => ResultCode::ServerError,
+    };
+    Failed {
+        code,
+        kind: "status",
+        why: format!("{:?}: {}", status.code(), status.message()),
+    }
+}
+
+/// One accepted body as a block.
+fn served<B: BlockBody>(link: &Link, accepted: Accepted<B>) -> Result<ServedBlock, Failed> {
+    if let Some((_, reason)) = accepted.dropped.first() {
+        return Err(contract(format!("an envelope dropped: {reason}")));
+    }
+    let envelope = accepted.body.envelope()?;
+    if envelope.payload_type != PayloadType::SignedBeaconBlock as i32 {
+        let why = format!("payload_type {} in a block answer", envelope.payload_type);
+        return Err(contract(why));
+    }
+    let fork = link
+        .check_envelope(&envelope)
+        .map_err(|e| contract(format!("a block envelope: {e}")))?
+        .fork;
+    let root = <[u8; 32]>::try_from(envelope.root.as_slice())
+        .map_err(|_| contract("a block envelope without a 32-byte root"))?;
+    Ok(ServedBlock {
+        slot: envelope.slot,
+        root,
+        fork,
+        ssz: envelope.ssz,
+    })
+}
+
+/// Where a half's stream is.
+enum Reading<S> {
+    Opening(Inbound<S>),
+    Open(Box<Guarded<S>>),
+    Done,
+}
+
+/// The blocks of `half`'s response `stream` (see the module docs), each step within `step`.
+/// The first failure ends them, and drops the stream.
+pub(crate) fn read_blocks<S, T>(link: Link, stream: S, half: Half, step: Duration) -> Blocks
 where
     S: Stream<Item = Result<T, Status>> + Unpin + Send + 'static,
     T: InFrame + Send + 'static,
     T::Body: Envelopes + BlockBody + Send,
 {
-    Box::pin(futures::stream::once(async { todo!("#146 step 5") }))
+    let broken = move |e: ipc::ContractError| contract(format!("{}: {}", half.label(), e.detail()));
+    let start = (Reading::Opening(Inbound::from_server(stream)), link);
+    Box::pin(futures::stream::unfold(
+        start,
+        move |(state, link)| async move {
+            let mut guarded = match state {
+                Reading::Opening(inbound) => match within(step, link.open(inbound)).await {
+                    Ok(Ok(guarded)) => Box::new(guarded),
+                    Ok(Err(e)) => return Some((Err(broken(e)), (Reading::Done, link))),
+                    Err(timeout) => return Some((Err(timeout), (Reading::Done, link))),
+                },
+                Reading::Open(guarded) => guarded,
+                Reading::Done => return None,
+            };
+            let next = match within(step, guarded.body()).await {
+                Ok(Ok(Some(accepted))) => served(&link, accepted),
+                Ok(Ok(None)) => return None,
+                Ok(Err(e)) => Err(broken(e)),
+                Err(timeout) => Err(timeout),
+            };
+            let state = match next {
+                Ok(_) => Reading::Open(guarded),
+                Err(_) => Reading::Done,
+            };
+            Some((next, (state, link)))
+        },
+    ))
 }
 
 #[cfg(test)]

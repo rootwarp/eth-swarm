@@ -148,6 +148,10 @@ message GetChainHeadResponse {
   // Earliest slot with blocks available (checkpoint anchor or backfill progress).
   uint64 earliest_available_slot = 6;
   ReadMeta meta = 7;
+  // The slot of the stamp's finalized block, from the same read transaction as the head (0 is
+  // the genesis slot). cl-p2p splits a BeaconBlocksByRange answer at it: the blocks at or below
+  // it from GetBlocksByRange, the rest from ethswarm.chain.v1 ReqRespService/BlocksByRange.
+  uint64 finalized_slot = 8;
 }
 
 // A block and its ancestors, newest first: the block at `root`, then its parent, and so on, one

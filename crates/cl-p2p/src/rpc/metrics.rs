@@ -27,6 +27,12 @@
 //!   goes to its stream.
 //! - `rpc_inbound_streams_refused_total`: inbound streams answered `2: ServerError` because
 //!   `max_inbound_streams` streamed answers were open ([`crate::rpc::limits::RpcLimits`]).
+//! - `rpc_block_lookup_failures_total{half, kind}`: BeaconBlocksByRange lookups that ended an
+//!   answer ([`crate::rpc::blocks`]), by half (`store`, `chain`) and kind (`status`, `refused`,
+//!   `contract`, `timeout`, and the chain breaks `order`, `link`, `decode`).
+//! - `rpc_block_window_gap_slots`: slots from the start of the block serve window to our
+//!   `earliest_available_slot`, set at each BeaconBlocksByRange answer; above 0 the node does
+//!   not serve the whole window yet (`phase0/p2p-interface.md` L1527–1541, backfill).
 //! - `queue_dropped_total{queue}`: items a bounded queue IGNOREd ([`QueueMetrics`]), shared with
 //!   the other queues of the service through [`RpcMetrics::queues`].
 //!
@@ -175,6 +181,12 @@ impl ProtocolLabel {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct BlockLookupLabels {
+    half: &'static str,
+    kind: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct GoodbyeLabels {
     reason: ReasonLabel,
     status_valid: StatusValidity,
@@ -196,6 +208,8 @@ pub struct RpcMetrics {
     column_unrequested: Counter,
     column_sidecars_answered: Family<ProtocolLabel, Counter>,
     inbound_streams_refused: Counter,
+    block_lookup_failures: Family<BlockLookupLabels, Counter>,
+    block_window_gap: Gauge,
     queues: QueueMetrics,
 }
 
@@ -217,6 +231,8 @@ impl RpcMetrics {
             column_unrequested: Counter::default(),
             column_sidecars_answered: Family::default(),
             inbound_streams_refused: Counter::default(),
+            block_lookup_failures: Family::default(),
+            block_window_gap: Gauge::default(),
             queues: QueueMetrics::register(registry),
         };
         for protocol in [
@@ -323,6 +339,16 @@ impl RpcMetrics {
             metrics.column_unrequested.clone(),
         );
         registry.register(
+            "rpc_block_lookup_failures",
+            "BeaconBlocksByRange lookups that ended an answer, by half and kind",
+            metrics.block_lookup_failures.clone(),
+        );
+        registry.register(
+            "rpc_block_window_gap_slots",
+            "Slots from the start of the block serve window to our earliest_available_slot",
+            metrics.block_window_gap.clone(),
+        );
+        registry.register(
             "rpc_inbound_streams_refused",
             "Inbound streams answered 2: ServerError because the streamed answers were at their cap",
             metrics.inbound_streams_refused.clone(),
@@ -341,10 +367,25 @@ impl RpcMetrics {
         self.inbound_streams_refused.get()
     }
 
+    /// Counts a BeaconBlocksByRange lookup of `half` that failed with `kind`.
+    pub(crate) fn block_lookup_failed(&self, half: &'static str, kind: &'static str) {
+        self.block_lookup_failures
+            .get_or_create(&BlockLookupLabels { half, kind })
+            .inc();
+    }
+
     /// The current `rpc_block_lookup_failures_total{half, kind}`.
     #[must_use]
-    pub fn block_lookup_failures(&self, _half: &str, _kind: &str) -> u64 {
-        0
+    pub fn block_lookup_failures(&self, half: &'static str, kind: &'static str) -> u64 {
+        self.block_lookup_failures
+            .get_or_create(&BlockLookupLabels { half, kind })
+            .get()
+    }
+
+    /// Sets `rpc_block_window_gap_slots`.
+    pub(crate) fn set_block_window_gap(&self, slots: u64) {
+        self.block_window_gap
+            .set(i64::try_from(slots).unwrap_or(i64::MAX));
     }
 
     /// Sets `rpc_column_answers` and `rpc_column_answer_bytes`.

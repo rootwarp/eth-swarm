@@ -1,30 +1,67 @@
-//! The block serve window: `compute_min_epochs_for_block_requests` (`phase0/p2p-interface.md`
-//! L427–431; modified in Gloas, `gloas/p2p-interface.md` L246–262) from a network's config.
+//! The block serve window: the epochs a node MUST serve `BeaconBlocksByRange` from
+//! (`phase0/p2p-interface.md` L1527–1530), `[max(GENESIS_EPOCH, current_epoch -
+//! compute_min_epochs_for_block_requests()), current_epoch]`.
+//!
+//! `compute_min_epochs_for_block_requests` is `MIN_VALIDATOR_WITHDRAWABILITY_DELAY +
+//! CHURN_LIMIT_QUOTIENT // 2` (`phase0` L427–431; 33,024 epochs on mainnet values, 272 on
+//! minimal) and, from Gloas (EIP-8061, `gloas/p2p-interface.md` L246–262), the arithmetic of
+//! `compute_weak_subjectivity_period` (14,299 on mainnet values, 262 on minimal). Its inputs are
+//! config values, read from the network's config ([`ChainConfig::get`]).
 
-use crate::{ChainConfig, ConfigError, Epoch};
+use crate::{ChainConfig, ConfigError, Epoch, ForkName};
 
-/// `compute_min_epochs_for_block_requests()` for a block at `epoch`.
+/// The uint64 config value of `key`.
+fn uint(config: &ChainConfig, key: &'static str) -> Result<u64, ConfigError> {
+    let text = config.get(key).ok_or(ConfigError::Missing(key))?;
+    text.parse().map_err(|_| ConfigError::Invalid {
+        key,
+        value: text.to_owned(),
+        reason: "expected a uint64".into(),
+    })
+}
+
+/// `compute_min_epochs_for_block_requests()` of the fork of `epoch`: the phase0 formula before
+/// `GLOAS_FORK_EPOCH`, the Gloas one from it.
 ///
 /// # Errors
 ///
-/// A key it reads is missing or not a uint64.
+/// A key it reads is missing or not a uint64, or the Gloas denominator is 0.
 pub fn min_epochs_for_block_requests(
-    _config: &ChainConfig,
-    _epoch: Epoch,
+    config: &ChainConfig,
+    epoch: Epoch,
 ) -> Result<Epoch, ConfigError> {
-    todo!("#146 step 1")
+    let delay = uint(config, "MIN_VALIDATOR_WITHDRAWABILITY_DELAY")?;
+    let gloas = config.fork_schedule().fork_epoch(ForkName::Gloas);
+    if gloas.is_none_or(|gloas| epoch < gloas) {
+        return Ok(delay.saturating_add(uint(config, "CHURN_LIMIT_QUOTIENT")? / 2));
+    }
+    // [Modified in Gloas:EIP8061]
+    let exit = u128::from(uint(config, "CHURN_LIMIT_QUOTIENT_GLOAS")?);
+    let consolidation = u128::from(uint(config, "CONSOLIDATION_CHURN_LIMIT_QUOTIENT")?);
+    let numerator = (3 * exit).saturating_mul(consolidation);
+    let denominator = 2 * consolidation + 3 * exit;
+    if denominator == 0 {
+        return Err(ConfigError::Invalid {
+            key: "CONSOLIDATION_CHURN_LIMIT_QUOTIENT",
+            value: "0".into(),
+            reason: "with CHURN_LIMIT_QUOTIENT_GLOAS 0 the window divides by zero".into(),
+        });
+    }
+    let churn = u64::try_from(numerator / denominator / 2).unwrap_or(u64::MAX);
+    Ok(delay.saturating_add(churn))
 }
 
-/// The first epoch of the range a node MUST serve blocks of at `current_epoch`.
+/// The first epoch of the window at `current_epoch` (the wall clock's): `current_epoch` less
+/// [`min_epochs_for_block_requests`], at genesis at the earliest.
 ///
 /// # Errors
 ///
 /// As [`min_epochs_for_block_requests`].
 pub fn block_serve_window(
-    _config: &ChainConfig,
-    _current_epoch: Epoch,
+    config: &ChainConfig,
+    current_epoch: Epoch,
 ) -> Result<Epoch, ConfigError> {
-    todo!("#146 step 1")
+    Ok(current_epoch.saturating_sub(min_epochs_for_block_requests(config, current_epoch)?))
 }
 
 #[cfg(test)]

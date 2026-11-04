@@ -154,14 +154,14 @@ pub enum SettingsError {
     /// The network gives no network hello.
     #[error("the network: {0}")]
     Network(String),
-    /// The ACL is not exactly cl-p2p on the five methods.
+    /// The ACL is not exactly cl-p2p on the six methods.
     #[error(
         "the method ACL must give exactly {methods:?} to [callers] {P2P_CALLER} and to nobody \
          else: {why}"
     )]
     Acl {
         /// The methods.
-        methods: [&'static str; 5],
+        methods: [&'static str; 6],
         /// What is wrong.
         why: String,
     },

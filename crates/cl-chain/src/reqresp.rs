@@ -5,8 +5,11 @@
 //! the `cl-chain-columns` store the probe fills from gossip ([`crate::probe::ColumnIngest`]).
 //! Given a [`ChainStatus`] ([`ReqRespServer::serving_status`]: in probe mode the
 //! [`StatusProvider`], whose `earliest_available_slot` is [`ColumnServer`]'s), it also serves
-//! `GetStatus`, a unary call with no hello, `UNAVAILABLE` while there is no Status yet. The other
-//! RPCs of the service are still stubs. [`crate::ChainStub::serving`] mounts it.
+//! `GetStatus`, a unary call with no hello, `UNAVAILABLE` while there is no Status yet. Given a
+//! [`BlockStore`] ([`ReqRespServer::serving_blocks`]: the probe's own env), it serves
+//! `BlocksByRange`: the canonical blocks of a range above cl-store's finalized slot, which
+//! cl-p2p serves a peer's BeaconBlocksByRange v2 request from (`blocks`, [`canonical_blocks`]).
+//! The other RPCs of the service are still stubs. [`crate::ChainStub::serving`] mounts it.
 //!
 //! # What is served
 //!
@@ -965,8 +968,9 @@ fn refusal_chunk(refusal: &Refusal) -> Result<pb::ResponseChunk, Status> {
 }
 
 /// `ethswarm.chain.v1.ReqRespService` with the column RPCs served from a [`ColumnServer`],
-/// `GetStatus` from a [`ChainStatus`] once it is given one ([`Self::serving_status`]), and the
-/// rest still stubs (contract checks, then `UNIMPLEMENTED`).
+/// `GetStatus` from a [`ChainStatus`] once it is given one ([`Self::serving_status`]),
+/// `BlocksByRange` from a [`BlockStore`] once it is given one ([`Self::serving_blocks`]), and
+/// the rest still stubs (contract checks, then `UNIMPLEMENTED`).
 #[derive(Clone)]
 pub struct ReqRespServer {
     link: Link,
@@ -1013,7 +1017,8 @@ impl ReqRespServer {
         self
     }
 
-    /// The same server, answering `BlocksByRange` from `store`'s canonical blocks.
+    /// The same server, answering `BlocksByRange` from `store`'s canonical blocks (see
+    /// `blocks`), under the same read places and deadline as the column reads.
     #[must_use]
     pub fn serving_blocks(mut self, store: Arc<dyn BlockStore>) -> Self {
         self.blocks = Some(store);
@@ -1027,12 +1032,12 @@ impl ReqRespServer {
     }
 
     /// Checks the in-line hello, reads the answer off the async runtime under a read place and
-    /// [`READ_DEADLINE`], and streams our hello, then one chunk per sidecar, then the refusal
-    /// if there is one.
+    /// [`READ_DEADLINE`], and streams our hello, then one chunk per envelope (sidecar or block),
+    /// then the refusal if there is one.
     async fn stream<R, B>(
         &self,
         hello: Option<&common::Hello>,
-        read: impl FnOnce(&ColumnServer, Instant) -> Result<Vec<Served>, Refusal> + Send + 'static,
+        read: impl FnOnce(Instant) -> Result<Vec<Envelope>, Refusal> + Send + 'static,
         body: fn(pb::ResponseChunk) -> B,
     ) -> Result<Response<StubStream<R>>, Status>
     where
@@ -1045,15 +1050,14 @@ impl ReqRespServer {
         let (_, ours) = stream_hello(&self.link.local()).map_err(|e| e.to_status())?;
         let answer = match Arc::clone(&self.reads).try_acquire_owned() {
             Ok(permit) => {
-                let columns = Arc::clone(&self.columns);
                 let deadline = Instant::now() + READ_DEADLINE;
                 tokio::task::spawn_blocking(move || {
                     // Held until the read ends, even if the caller is gone.
                     let _permit = permit;
-                    read(&columns, deadline).and_then(|served| columns.envelopes(served))
+                    read(deadline)
                 })
                 .await
-                .unwrap_or_else(|e| Err(Refusal::Store(format!("column read: {e}"))))
+                .unwrap_or_else(|e| Err(Refusal::Store(format!("store read: {e}"))))
             }
             Err(_) => Err(Refusal::Overloaded),
         };
@@ -1068,7 +1072,7 @@ impl ReqRespServer {
             })))
         }));
         if let Some(refusal) = refusal {
-            tracing::debug!(%refusal, "column request refused");
+            tracing::debug!(%refusal, "request refused");
             frames.push(refusal_chunk(&refusal).map(|chunk| R::body(body(chunk))));
         }
         Ok(Response::new(Box::pin(tokio_stream::iter(frames))))
@@ -1120,7 +1124,20 @@ impl ReqRespService for ReqRespServer {
         &self,
         request: Request<pb::BlocksByRangeRequest>,
     ) -> Result<Response<Self::BlocksByRangeStream>, Status> {
-        ipc::stub::server_stream(&self.link, "blocks_by_range", request.get_ref())
+        let Some(store) = self.blocks.clone() else {
+            return ipc::stub::server_stream(&self.link, "blocks_by_range", request.get_ref());
+        };
+        let request = request.into_inner();
+        let (start, count, link) = (request.start_slot, request.count, self.link.clone());
+        self.stream(
+            request.hello.as_ref(),
+            move |deadline| {
+                let blocks = canonical_blocks(store.as_ref(), start, count, deadline)?;
+                blocks::envelopes(&link, blocks)
+            },
+            |item| pb::BlocksByRangeResponseBody { item: Some(item) },
+        )
+        .await
     }
 
     type BlocksByRootStream = StubStream<pb::BlocksByRootResponse>;
@@ -1157,10 +1174,14 @@ impl ReqRespService for ReqRespServer {
         request: Request<pb::DataColumnsByRangeRequest>,
     ) -> Result<Response<Self::DataColumnsByRangeStream>, Status> {
         let request = request.into_inner();
-        let (start, count, columns) = (request.start_slot, request.count, request.columns);
+        let (start, count, wanted) = (request.start_slot, request.count, request.columns);
+        let columns = Arc::clone(&self.columns);
         self.stream(
             request.hello.as_ref(),
-            move |server, deadline| server.by_range(start, count, &columns, Some(deadline)),
+            move |deadline| {
+                let served = columns.by_range(start, count, &wanted, Some(deadline))?;
+                columns.envelopes(served)
+            },
             |item| pb::DataColumnsByRangeResponseBody { item: Some(item) },
         )
         .await
@@ -1174,9 +1195,10 @@ impl ReqRespService for ReqRespServer {
     ) -> Result<Response<Self::DataColumnsByRootStream>, Status> {
         let request = request.into_inner();
         let ids = identifiers(&request);
+        let columns = Arc::clone(&self.columns);
         self.stream(
             request.hello.as_ref(),
-            move |server, deadline| server.by_root(&ids?, Some(deadline)),
+            move |deadline| columns.envelopes(columns.by_root(&ids?, Some(deadline))?),
             |item| pb::DataColumnsByRootResponseBody { item: Some(item) },
         )
         .await

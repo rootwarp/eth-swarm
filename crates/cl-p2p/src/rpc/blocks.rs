@@ -1,29 +1,85 @@
-//! `BeaconBlocksByRange` v2 answers (#146): [`ByRangeResponder`] over a [`BlockSource`].
+//! `BeaconBlocksByRange` v2 answers (#146; `phase0/p2p-interface.md` L1485–1575,
+//! `gloas/p2p-interface.md` L1356–1374): [`ByRangeResponder`], the production [`Responder`],
+//! over a [`BlockSource`] ([`super::blocks_ipc::IpcBlocks`] in the service). cl-p2p opens no
+//! database: the finalized blocks come from cl-store (store.v1), the rest from cl-chain
+//! (chain.v1, ADR-006).
+//!
+//! # An answer
+//!
+//! [`super::inbound::Control`] has checked the request already: `step` 0 or `count` over 128
+//! is `1: InvalidRequest`, never clamped, and `count` 0 is never served. Then, on the answer's
+//! own task:
+//!
+//! 1. **The floor**: a `start_slot` below our Status's `earliest_available_slot` (the cached
+//!    Status peers pick us by) is `3: ResourceUnavailable` before any IPC call (L1538–1541);
+//!    with no Status of ours it is `2: ServerError`. When the floor is above the start of the
+//!    block serve window (`network_config::window`, L1527–1530: the node is not compliant
+//!    until it backfilled), that is logged once and shown in `rpc_block_window_gap_slots`.
+//! 2. **A lookup slot**: at most [`super::limits::RpcLimits::max_block_lookups`] answers hold
+//!    IPC calls at once; one past them waits for a slot up to [`BLOCK_LOOKUP_TIMEOUT`], then
+//!    is `2`.
+//! 3. **The split**: the store's finalized slot `F0`, read first ([`BlockSource::finalized_slot`],
+//!    cl-store's `GetChainHead.finalized_slot`). The blocks of `[start, min(end, F0 + 1))` come
+//!    from cl-store, then those of `[max(start, F0 + 1), end)` from cl-chain, each half asked
+//!    for only if it is not empty. Finality only advances and cl-store is never ahead of
+//!    cl-chain, so a later store read still holds every finalized block up to `F0`, and
+//!    cl-chain's head descends from `F0`'s block: no gap and no duplicate, whatever finality
+//!    does meanwhile.
+//! 4. **One chain**: blocks go out in ascending slot order inside the range, each block's
+//!    `parent_root` the root of the block before it (L1558–1572). A block that breaks that ends
+//!    the answer at the last whole chunk (L1574–1575: the view changed), counted, never an
+//!    error chunk mid-stream; before the first chunk such a block breaks the contract: `2`.
+//! 5. **Bytes as stored**: each block is decoded by the fork of its slot (the envelope's, checked
+//!    by the source) and handed to the sink, which re-encodes it and picks its context bytes,
+//!    the digest of its own epoch ([`super::responder`]): codec only, no state transition.
+//!
+//! `step` above 1 is answered with at most the block at `start_slot` (L1514–1515), and costs
+//! one token. A failed lookup ([`Failed`]: cl-store's `UNAVAILABLE` and cl-chain's
+//! `RESOURCE_UNAVAILABLE` are `3`, any other failure, a contract break or a step past its
+//! timeout `2`) ends the answer with its code before the first chunk, and cleanly at the last
+//! whole chunk after it; each is counted in `rpc_block_lookup_failures_total{half, kind}`.
 
+use super::columns::fixed_message;
 use super::inbound::StatusSource;
 use super::metrics::RpcMetrics;
 use super::responder::{ChunkSink, Responder, Serving};
-use consensus_types::EthSpec;
-use futures::Stream;
+use consensus_types::{forked, EthSpec};
+use futures::{Stream, StreamExt as _};
 use libp2p::PeerId;
 use network_config::ForkName;
-use p2p_wire::rpc::protocols::{Request, ResultCode};
+use p2p_wire::rpc::messages::BlocksByRangeV2Request;
+use p2p_wire::rpc::protocols::{Request, Response, ResultCode};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
-/// How long one IPC step of a block answer may take \[est\].
+/// How long one IPC step of a block answer may take \[est\]: 2 s, as a column lookup
+/// ([`super::inbound::COLUMN_LOOKUP_TIMEOUT`]) and cl-chain's read deadline. Each step (the
+/// head read, opening a half's stream, each block of it) has its own; the stream's writer cuts
+/// the whole answer at the first-byte and total deadlines.
 pub const BLOCK_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Which half of an answer a block comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Half {
-    /// The finalized blocks: cl-store.
+    /// The finalized blocks, and the split point: cl-store.
     Store,
     /// The blocks above the store's finalized slot: cl-chain.
     Chain,
+}
+
+impl Half {
+    /// The metric's `half` label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Store => "store",
+            Self::Chain => "chain",
+        }
+    }
 }
 
 /// Why a block lookup failed.
@@ -31,10 +87,23 @@ pub enum Half {
 pub struct Failed {
     /// The result code the answer ends with if nothing went out yet.
     pub code: ResultCode,
-    /// The metric's `kind` label.
+    /// The metric's `kind` label: `status` (the call failed), `refused` (an error chunk),
+    /// `contract`, `timeout`, `order`, `link` or `decode`.
     pub kind: &'static str,
     /// What happened, for the log.
     pub why: String,
+}
+
+impl Failed {
+    /// `2: ServerError` of `kind`.
+    #[must_use]
+    pub fn server_error(kind: &'static str, why: impl Into<String>) -> Self {
+        Self {
+            code: ResultCode::ServerError,
+            kind,
+            why: why.into(),
+        }
+    }
 }
 
 /// One stored block as a source hands it over.
@@ -44,7 +113,7 @@ pub struct ServedBlock {
     pub slot: u64,
     /// `hash_tree_root(block.message)`.
     pub root: [u8; 32],
-    /// The fork of its slot.
+    /// The fork of its slot: the shape it is decoded with.
     pub fork: ForkName,
     /// Its SSZ, as stored.
     pub ssz: Vec<u8>,
@@ -53,12 +122,13 @@ pub struct ServedBlock {
 /// One IPC step in flight.
 pub type Lookup<T> = Pin<Box<dyn Future<Output = Result<T, Failed>> + Send>>;
 
-/// The blocks of one half, read one at a time.
+/// The blocks of one half, read one at a time as the answer goes out (never collected), so a
+/// slow reader holds the IPC stream back through the sink. Dropping it cancels the call.
 pub type Blocks = Pin<Box<dyn Stream<Item = Result<ServedBlock, Failed>> + Send>>;
 
-/// Where the blocks of an answer come from.
+/// Where the blocks of an answer come from (see the module docs).
 pub trait BlockSource: Send + Sync + 'static {
-    /// The store's finalized slot.
+    /// The store's finalized slot `F0`.
     fn finalized_slot(&self) -> Lookup<u64>;
 
     /// The canonical blocks of `[start, start + count)` from `half`, ascending.
@@ -68,22 +138,21 @@ pub trait BlockSource: Send + Sync + 'static {
 /// The start slot of the block serve window now, if known.
 pub type WindowStart = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 
-/// Serves BeaconBlocksByRange v2 from a [`BlockSource`].
+/// Serves BeaconBlocksByRange v2 from a [`BlockSource`] (see the module docs).
 #[derive(Clone)]
 pub struct ByRangeResponder {
-    #[allow(dead_code)]
     source: Arc<dyn BlockSource>,
-    #[allow(dead_code)]
     status: Arc<dyn StatusSource>,
     lookups: Arc<Semaphore>,
-    #[allow(dead_code)]
     metrics: Option<RpcMetrics>,
-    #[allow(dead_code)]
     window: Option<WindowStart>,
+    /// Whether the floor above the window's start was logged.
+    warned: Arc<AtomicBool>,
 }
 
 impl ByRangeResponder {
-    /// Answers from `source`, its floor from `status`, at most `max_lookups` at once.
+    /// Answers from `source`, its floor our Status's from `status`, at most `max_lookups`
+    /// answers holding IPC calls at once, its failures counted in `metrics`.
     #[must_use]
     pub fn new(
         source: Arc<dyn BlockSource>,
@@ -94,13 +163,14 @@ impl ByRangeResponder {
         Self {
             source,
             status,
-            lookups: Arc::new(Semaphore::new(max_lookups)),
+            lookups: Arc::new(Semaphore::new(max_lookups.min(Semaphore::MAX_PERMITS))),
             metrics,
             window: None,
+            warned: Arc::default(),
         }
     }
 
-    /// The same responder, warning when `earliest_available_slot` is above `window`'s start.
+    /// The same responder, comparing its floor with `window`'s start (see the module docs).
     #[must_use]
     pub fn with_window(mut self, window: WindowStart) -> Self {
         self.window = Some(window);
@@ -112,11 +182,179 @@ impl ByRangeResponder {
     pub fn free_lookups(&self) -> usize {
         self.lookups.available_permits()
     }
+
+    /// Counts and logs `failed` of `half`, and hands it back.
+    fn failed(&self, half: Half, failed: Failed) -> Failed {
+        tracing::debug!(half = half.label(), kind = failed.kind, why = %failed.why,
+            "block lookup failed");
+        if let Some(metrics) = &self.metrics {
+            metrics.block_lookup_failed(half.label(), failed.kind);
+        }
+        failed
+    }
+
+    /// Compares the floor `eas` with the serve window's start.
+    fn check_window(&self, eas: u64) {
+        let Some(start) = self.window.as_ref().and_then(|window| window()) else {
+            return;
+        };
+        if let Some(metrics) = &self.metrics {
+            metrics.set_block_window_gap(eas.saturating_sub(start));
+        }
+        if eas > start && !self.warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                earliest_available_slot = eas,
+                window_start = start,
+                "blocks are served from above the start of the block serve window: ranges \
+                 below earliest_available_slot get 3: ResourceUnavailable until backfill"
+            );
+        }
+    }
+
+    /// The answer to `range` into `out` (see the module docs).
+    async fn answer<E: EthSpec>(
+        &self,
+        range: BlocksByRangeV2Request,
+        out: &mut Out<E>,
+    ) -> Result<(), Failed> {
+        let eas = self
+            .status
+            .status()
+            .ok_or_else(|| Failed::server_error("status", "no Status of ours"))?
+            .earliest_available_slot;
+        if range.start_slot < eas {
+            return Err(Failed {
+                code: ResultCode::ResourceUnavailable,
+                kind: "floor",
+                why: format!(
+                    "start_slot {} below earliest_available_slot {eas}",
+                    range.start_slot
+                ),
+            });
+        }
+        self.check_window(eas);
+        let count = if range.step > 1 {
+            range.count.min(1)
+        } else {
+            range.count
+        };
+        let (start, end) = (range.start_slot, range.start_slot.saturating_add(count));
+        let slot = Arc::clone(&self.lookups).acquire_owned();
+        let Ok(Ok(_slot)) = tokio::time::timeout(BLOCK_LOOKUP_TIMEOUT, slot).await else {
+            return Err(Failed::server_error("busy", "no lookup slot in time"));
+        };
+        let finalized = self.source.finalized_slot().await;
+        let split = finalized
+            .map_err(|f| self.failed(Half::Store, f))?
+            .saturating_add(1);
+        if start < split {
+            self.half(out, Half::Store, start, end.min(split)).await?;
+        }
+        if end > split {
+            self.half(out, Half::Chain, start.max(split), end).await?;
+        }
+        Ok(())
+    }
+
+    /// The blocks of `[start, end)` from `half`, sent as they come.
+    async fn half<E: EthSpec>(
+        &self,
+        out: &mut Out<E>,
+        half: Half,
+        start: u64,
+        end: u64,
+    ) -> Result<(), Failed> {
+        let opened = self.source.blocks(half, start, end - start).await;
+        let mut blocks = opened.map_err(|f| self.failed(half, f))?;
+        while let Some(next) = blocks.next().await {
+            let block = next.and_then(|b| out.check(b, start, end));
+            let response = block.map_err(|f| self.failed(half, f))?;
+            if out.sink.send(response).await.is_err() {
+                return Err(Failed::server_error("closed", "the answer has ended"));
+            }
+            out.sent += 1;
+        }
+        Ok(())
+    }
+}
+
+/// One answer on its way out.
+struct Out<E: EthSpec> {
+    sink: ChunkSink<E>,
+    /// Chunks sent.
+    sent: usize,
+    /// The slot and root of the block sent last.
+    last: Option<(u64, [u8; 32])>,
+}
+
+impl<E: EthSpec> Out<E> {
+    /// `block` as the next chunk of `[start, end)`, if it is: after the last block, inside the
+    /// range, on the last block, decoded in its fork.
+    fn check(&mut self, block: ServedBlock, start: u64, end: u64) -> Result<Response<E>, Failed> {
+        let after = self.last.is_none_or(|(slot, _)| block.slot > slot);
+        if !after || !(start..end).contains(&block.slot) {
+            let why = format!(
+                "slot {} out of order or outside [{start}, {end})",
+                block.slot
+            );
+            return Err(Failed::server_error("order", why));
+        }
+        let decoded =
+            forked::SignedBeaconBlock::<E>::from_ssz_bytes_for_fork(&block.ssz, block.fork)
+                .map_err(|e| {
+                    Failed::server_error("decode", format!("slot {}: {e:?}", block.slot))
+                })?;
+        let parent = match &decoded {
+            forked::SignedBeaconBlock::Fulu(b) => b.message.parent_root.0,
+            forked::SignedBeaconBlock::Gloas(b) => b.message.parent_root.0,
+        };
+        if decoded.slot() != block.slot {
+            return Err(Failed::server_error("decode", "a block of another slot"));
+        }
+        if self.last.is_some_and(|(_, root)| root != parent) {
+            let why = format!("slot {}: parent_root is not the block before", block.slot);
+            return Err(Failed::server_error("link", why));
+        }
+        self.last = Some((block.slot, block.root));
+        Ok(Response::Block(Box::new(decoded)))
+    }
+
+    /// Ends the answer on `failed`: its error chunk if nothing went out, else at the last whole
+    /// chunk.
+    async fn end(&mut self, failed: Failed) {
+        if self.sent == 0 {
+            let _ = self
+                .sink
+                .error(failed.code, fixed_message(failed.code).as_bytes())
+                .await;
+        }
+    }
 }
 
 impl<E: EthSpec> Responder<E> for ByRangeResponder {
-    fn serve(&self, _: PeerId, _: Request, _: ChunkSink<E>) -> Serving {
-        Box::pin(async { todo!("#146 step 6") })
+    /// `count`, or one token for `step` above 1 (one block at most).
+    fn cost(&self, request: &Request) -> u64 {
+        match request {
+            Request::BlocksByRange(range) if range.step > 1 => range.count.min(1),
+            other => other.max_response_chunks(),
+        }
+    }
+
+    fn serve(&self, _: PeerId, request: Request, sink: ChunkSink<E>) -> Serving {
+        let this = self.clone();
+        Box::pin(async move {
+            let Request::BlocksByRange(range) = request else {
+                return;
+            };
+            let mut out = Out {
+                sink,
+                sent: 0,
+                last: None,
+            };
+            if let Err(failed) = this.answer(range, &mut out).await {
+                out.end(failed).await;
+            }
+        })
     }
 }
 

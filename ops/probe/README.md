@@ -87,8 +87,11 @@ custody columns in `/var/lib/ethswarm-chain/columns` and opens the same store af
 so the custody group count and `cgc_set_slot` of the first start stay. It follows the
 reference node's events (the canonical chain, the finalize and retention prunes). It asks
 cl-verify for the KZG checks, and refuses a cl-verify server that runs as another UID. Only
-cl-p2p's UID can call its five methods: `ReqRespService/GetStatus`, `DataColumnsByRange`,
-`DataColumnsByRoot`, `GossipService/WatchSubscriptions` and `GossipService/Validate`. Validate
+cl-p2p's UID can call its six methods: `ReqRespService/GetStatus`, `BlocksByRange`,
+`DataColumnsByRange`, `DataColumnsByRoot`, `GossipService/WatchSubscriptions` and
+`GossipService/Validate`. `BlocksByRange` serves the blocks of its own env above cl-store's
+finalized slot; probe mode stores only its anchor block, and the probe's cl-p2p sets no
+`store_socket`, so it answers BeaconBlocksByRange `3: ResourceUnavailable`. Validate
 is the column hand-off: cl-p2p sends the column sidecars that its gossipsub captured, and
 cl-chain stores its custody columns from them. It drops a sidecar whose fork digest is not the
 digest of its slot's epoch without decoding it, decodes the rest by the fork of their slot, and
@@ -106,8 +109,9 @@ group = 990                             # the GID of ethswarm-chain
 [callers]
 cl-p2p = 991                            # the UID of ethswarm-p2p
 
-[methods]                               # exactly these five, to cl-p2p only
+[methods]                               # exactly these six, to cl-p2p only
 "/ethswarm.chain.v1.ReqRespService/GetStatus" = ["cl-p2p"]
+"/ethswarm.chain.v1.ReqRespService/BlocksByRange" = ["cl-p2p"]
 "/ethswarm.chain.v1.ReqRespService/DataColumnsByRange" = ["cl-p2p"]
 "/ethswarm.chain.v1.ReqRespService/DataColumnsByRoot" = ["cl-p2p"]
 "/ethswarm.chain.v1.GossipService/WatchSubscriptions" = ["cl-p2p"]

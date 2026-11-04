@@ -47,10 +47,13 @@
 //!   first, and is dropped if that close has not finished [`CLOSE_DEADLINE`] later. Counted
 //!   and logged as one `goodbye_received` event. Our own Goodbye accepts an answer of one chunk
 //!   or none (Lighthouse sends none).
-//! - **BeaconBlocksByRange**: `3: ResourceUnavailable`, which that protocol specifies for blocks
-//!   the responder does not have (`phase0` L1540). A request with `step` 0 or a `count` above
-//!   `MAX_REQUEST_BLOCKS_DENEB` (128) is semantically invalid and gets `1: InvalidRequest`
-//!   (`phase0` L1286–1288, L1514; `deneb` L876); the connection stays.
+//! - **BeaconBlocksByRange**: `3: ResourceUnavailable` without a responder, which that protocol
+//!   specifies for blocks the responder does not have (`phase0` L1540). A request with `step`
+//!   0 or a `count` above `MAX_REQUEST_BLOCKS_DENEB` (128) is semantically invalid and gets
+//!   `1: InvalidRequest` (`phase0` L1286–1288, L1514; `deneb` L876); the connection stays.
+//!   The service's responder is [`super::blocks::ByRangeResponder`] (#146): cl-store's
+//!   finalized blocks, then cl-chain's above them, one chain, each block with its own epoch's
+//!   digest (see [`super::blocks`]).
 //!   With a [`Responder`] the answer is streamed ([`super::responder`]): the request is checked
 //!   first, as above, before the responder runs or anything is read or booked (never clamped);
 //!   then the responder produces its chunks on its own task, started once the peer's first

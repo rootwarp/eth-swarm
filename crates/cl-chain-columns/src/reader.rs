@@ -193,6 +193,12 @@ impl ColumnReader {
         Ok(Snapshot { txn, legacy })
     }
 
+    /// One read transaction of the env, for what is read through `store_schema` rather than
+    /// this crate: cl-chain's req/resp reads its blocks (`store_schema::blocks::walk`) from it.
+    pub fn read_txn(&self) -> Result<RoTxn<'_>> {
+        self.db.begin_ro_txn()
+    }
+
     /// Slot of a stored block, `None` if no column of it is stored.
     pub fn slot_of(&self, block_root: &BlockRoot) -> Result<Option<u64>> {
         self.snapshot()?.slot_of(block_root)

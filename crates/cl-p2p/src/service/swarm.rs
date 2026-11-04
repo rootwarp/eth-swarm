@@ -7,7 +7,7 @@
 
 use crate::behaviour::SpecBehaviour;
 use crate::gossip::{CaptureTap, GossipConfig, IgnoreAll};
-use crate::rpc::blocks::BlockSource;
+use crate::rpc::blocks::{BlockSource, ByRangeResponder, WindowStart};
 use crate::rpc::codec::Deadlines;
 use crate::rpc::columns::ColumnSource;
 use crate::rpc::inbound::{Control, ControlConfig, SharedMetaData, StatusSource};
@@ -20,6 +20,8 @@ use consensus_types::caps::NetworkCaps;
 use consensus_types::EthSpec;
 use libp2p::identity::Keypair;
 use libp2p::{Multiaddr, PeerId, Swarm};
+use network_config::digest::current_epoch;
+use network_config::window::block_serve_window;
 use network_config::{ChainConfig, Genesis};
 use p2p_wire::gossip::{GossipTopic, TopicCaps};
 use p2p_wire::rpc::messages::{ForkDigest, MetaDataV3};
@@ -58,8 +60,9 @@ pub struct Sources {
     /// The custody columns' source; `None` answers every column request
     /// `3: ResourceUnavailable`.
     pub columns: Option<Arc<dyn ColumnSource>>,
-    /// The blocks' source; `None` answers every BlocksByRange request
-    /// `3: ResourceUnavailable`.
+    /// The blocks' source (cl-store and cl-chain, [`crate::rpc::blocks_ipc::IpcBlocks`]),
+    /// served by a [`ByRangeResponder`] whose floor is [`Self::status`]'s; `None` answers every
+    /// BlocksByRange request `3: ResourceUnavailable`.
     pub blocks: Option<Arc<dyn BlockSource>>,
 }
 
@@ -71,8 +74,23 @@ pub struct Gossip {
     pub tap: Option<CaptureTap>,
 }
 
+/// The start slot of the block serve window by the wall clock (`network_config::window`), for
+/// the responder's floor check; `None` before genesis or for a config without the window's
+/// values.
+fn window_start<E: EthSpec>(config: &ChainConfig, genesis: &Genesis) -> WindowStart {
+    let (config, genesis_time) = (config.clone(), genesis.genesis_time);
+    Arc::new(move || {
+        let (slot_ms, per_epoch) = (config.slot_duration_ms(), E::slots_per_epoch());
+        let now = ipc::hello::system_ms();
+        let epoch = current_epoch(genesis_time, slot_ms, per_epoch, now).ok()?;
+        let start = block_serve_window(&config, epoch).ok()?;
+        Some(start.saturating_mul(per_epoch))
+    })
+}
+
 /// The probe swarm of the network of `config` and `genesis` under the preset `E`, with the
-/// node key `key`, answering from `sources`, with the ignore-all gossipsub on `gossip`'s topics
+/// node key `key`, answering from `sources` (BeaconBlocksByRange through a [`ByRangeResponder`]
+/// over `sources.blocks`, at most `plan.limits.max_block_lookups` answers holding IPC calls), with the ignore-all gossipsub on `gossip`'s topics
 /// if given (`plan.gossip` is not read). Every column answer is read and served under the
 /// network's caps ([`crate::rpc::network_context_table`]). Its metrics (`p2p_peers` excepted,
 /// which the owner of the swarm keeps: [`crate::transport::PeerMetrics`]) go to `registry`:
@@ -103,9 +121,11 @@ pub fn serving_swarm<E: EthSpec>(
     cfg.idle_connection_timeout = plan.idle;
     cfg.bypass = plan.bypass;
     cfg.muxer_observer = plan.muxer_observer;
-    let control = Control::<E>::new(
+    let metrics = RpcMetrics::register(registry);
+    let max_lookups = plan.limits.max_block_lookups;
+    let mut control = Control::<E>::new(
         ControlConfig {
-            status: sources.status,
+            status: Arc::clone(&sources.status),
             metadata: Arc::new(SharedMetaData::new(MetaDataV3 {
                 seq_number: 0,
                 attnets: Default::default(),
@@ -118,8 +138,13 @@ pub fn serving_swarm<E: EthSpec>(
             ping_interval: plan.ping_interval,
             columns: sources.columns,
         },
-        RpcMetrics::register(registry),
+        metrics.clone(),
     );
+    if let Some(source) = sources.blocks {
+        let responder = ByRangeResponder::new(source, sources.status, max_lookups, Some(metrics))
+            .with_window(window_start::<E>(config, genesis));
+        control = control.with_blocks_responder(Arc::new(responder));
+    }
     match gossip {
         None => build_swarm(key, &cfg, control).map_err(|e| e.to_string()),
         Some(gossip) => {
