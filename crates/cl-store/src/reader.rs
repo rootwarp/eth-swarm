@@ -178,7 +178,7 @@ impl Reader {
         f: impl FnOnce(&Snapshot<'_>) -> Result<T, ReadError>,
     ) -> Result<T, ReadError> {
         let snap = Snapshot {
-            txn: self.env().begin_ro_txn()?,
+            txn: env::begin_reader_txn(self.env())?,
             deadline,
             walked: Cell::new(0),
         };
@@ -491,7 +491,7 @@ mod tests {
 
     /// The table names, then every table's rows, as `reader`'s env holds them: the whole env.
     fn env_rows(reader: &Reader) -> Vec<(Option<&'static str>, Rows)> {
-        let txn = reader.env().begin_ro_txn().unwrap();
+        let txn = env::begin_reader_txn(reader.env()).unwrap();
         std::iter::once(None)
             .chain(TABLES.map(Some))
             .map(|table| {
