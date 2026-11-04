@@ -952,7 +952,7 @@ mod tests {
         let head = (before - 2) * 32;
         api.finalize(before - 2, [0xaa; 32], head);
         let dir = tempfile::tempdir().unwrap();
-        let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+        let writer = Arc::new(ColumnWriter::open_seeded(dir.path()).unwrap());
         let cgc_set_slot = head + 40;
         let custody = Custody::open(
             Arc::clone(&writer),
@@ -1041,7 +1041,7 @@ mod tests {
         api.finalize(before - 2, [0xaa; 32], (before - 2) * 32);
         let now = at_epoch(&chain, before);
         let dir = tempfile::tempdir().unwrap();
-        let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+        let writer = Arc::new(ColumnWriter::open_seeded(dir.path()).unwrap());
         let server = Arc::new(ColumnServer::new(
             Arc::clone(&writer) as Arc<dyn ColumnStore>,
             U256::MAX,
@@ -1188,7 +1188,7 @@ mod tests {
         server.serve(one_blob_root, SLOT, one_ssz);
         let api = server.api();
         let dir = tempfile::tempdir().unwrap();
-        let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+        let writer = Arc::new(ColumnWriter::open_seeded(dir.path()).unwrap());
         let custody = Custody::open(
             Arc::clone(&writer),
             NoEnr,
@@ -1451,7 +1451,7 @@ mod tests {
             })
             .collect();
         let dir = tempfile::tempdir().unwrap();
-        let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+        let writer = Arc::new(ColumnWriter::open_seeded(dir.path()).unwrap());
         let custody = Custody::open(
             Arc::clone(&writer),
             NoEnr,
@@ -1618,7 +1618,7 @@ mod tests {
         let (_, ssz, root) = gloas_block(SLOT, &blobs().commitments);
         reference.serve(root, SLOT, ssz);
         let dir = tempfile::tempdir().unwrap();
-        let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+        let writer = Arc::new(ColumnWriter::open_seeded(dir.path()).unwrap());
         let custody = Custody::open(
             Arc::clone(&writer),
             NoEnr,
@@ -1685,7 +1685,7 @@ mod tests {
             ..IngestLimits::default()
         };
         let dir = tempfile::tempdir().unwrap();
-        let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+        let writer = Arc::new(ColumnWriter::open_seeded(dir.path()).unwrap());
         let custody = Custody::open(
             Arc::clone(&writer),
             NoEnr,
@@ -2196,7 +2196,7 @@ mod tests {
             asked: Mutex::default(),
         });
         let dir = tempfile::tempdir().unwrap();
-        let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+        let writer = Arc::new(ColumnWriter::open_seeded(dir.path()).unwrap());
         let custody = Custody::open(
             Arc::clone(&writer),
             NoEnr,
@@ -2408,7 +2408,7 @@ mod tests {
         for (limits, ref_limits) in refused {
             let reference = Reference::start().await;
             let dir = tempfile::tempdir().unwrap();
-            let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+            let writer = Arc::new(ColumnWriter::open_seeded(dir.path()).unwrap());
             let custody = Custody::open(
                 Arc::clone(&writer),
                 NoEnr,

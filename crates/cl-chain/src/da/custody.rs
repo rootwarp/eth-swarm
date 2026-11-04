@@ -343,7 +343,7 @@ mod tests {
     const NODE: U256 = U256::MAX;
 
     fn open(dir: &tempfile::TempDir, advertise: Advertise) -> Custody<ColumnWriter, LocalEnr> {
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         Custody::open(writer, LocalEnr::new(), NODE, advertise, 100).unwrap()
     }
 
@@ -465,7 +465,10 @@ mod tests {
     #[test]
     fn a_stored_count_below_the_requirement_is_raised() {
         let dir = tempfile::tempdir().unwrap();
-        ColumnWriter::open(dir.path()).unwrap().set_cgc(0).unwrap();
+        ColumnWriter::open_seeded(dir.path())
+            .unwrap()
+            .set_cgc(0)
+            .unwrap();
         let custody = open(&dir, Advertise::Custody);
         assert_eq!((custody.cgc(), custody.cgc_set_slot()), (4, 100));
         assert_eq!(custody.store.load().unwrap().unwrap().cgc, 4);
@@ -587,7 +590,7 @@ mod tests {
     #[test]
     fn the_writer_is_shared_through_an_arc() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+        let writer = Arc::new(ColumnWriter::open_seeded(dir.path()).unwrap());
         let custody = Custody::open(
             writer.clone(),
             FlakyEnr::default(),

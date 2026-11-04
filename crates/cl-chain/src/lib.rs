@@ -260,7 +260,7 @@ mod tests {
     #[tokio::test]
     async fn the_routes_mount_the_column_server() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = Arc::new(ColumnWriter::open(dir.path().join("columns")).unwrap());
+        let writer = Arc::new(ColumnWriter::open_seeded(dir.path().join("columns")).unwrap());
         let columns = Arc::new(ColumnServer::new(
             writer as Arc<dyn ColumnStore>,
             U256::MAX,

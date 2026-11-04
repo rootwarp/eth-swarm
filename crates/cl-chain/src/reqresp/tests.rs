@@ -8,7 +8,7 @@ const CUSTODY: [u64; 4] = [1, 47, 87, 102];
 
 fn store() -> (tempfile::TempDir, ColumnWriter) {
     let dir = tempfile::tempdir().unwrap();
-    let writer = ColumnWriter::open(dir.path()).unwrap();
+    let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
     (dir, writer)
 }
 
@@ -498,7 +498,7 @@ fn a_pending_ancestors_slot_is_never_answered_as_empty() {
 fn an_unmigrated_pending_link_is_never_answered_as_empty() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         writer
             .set_custody(&cl_chain_columns::CustodyRecord {
                 cgc: 4,

@@ -261,7 +261,8 @@ mod tests {
         answers: Vec<Option<Result<pb::GetStatusResponse, ProbeError>>>,
     ) -> (Channel, tempfile::TempDir, tokio::sync::oneshot::Sender<()>) {
         let dir = tempfile::tempdir().unwrap();
-        let writer = std::sync::Arc::new(ColumnWriter::open(dir.path().join("columns")).unwrap());
+        let writer =
+            std::sync::Arc::new(ColumnWriter::open_seeded(dir.path().join("columns")).unwrap());
         let columns = std::sync::Arc::new(ColumnServer::new(
             writer as std::sync::Arc<dyn ColumnStore>,
             U256::MAX,

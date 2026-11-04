@@ -9,8 +9,10 @@ publish = false
 [features]
 # Seams for tests only: `ColumnWriter::set_before_commit`, a hook that runs in every column
 # write transaction after its puts and before its commit, so a test can kill the writer
-# mid-write; and `ColumnWriter::put_legacy_pending_link`, a link row in the layout stores wrote
-# before, for a reader of an env not migrated yet. Only cl-chain's dev-dependencies enable it,
+# mid-write; `ColumnWriter::put_legacy_pending_link`, a link row in the layout stores wrote
+# before, for a reader of an env not migrated yet; and `ColumnWriter::open_seeded` /
+# `seed_stamp`, a store's first stamp, since no column or custody write commits before one.
+# Only dev-dependencies enable it (this crate's own, cl-chain's and cl-p2p's),
 # so a normal build of a service leaves it off; `--all-features` (or a dependent's tests in the
 # same build) turns it on, so release artifacts come from per-service builds without it.
 test-hooks = []
@@ -23,6 +25,8 @@ thiserror = "2"
 store-schema = { path = "../store-schema" }
 
 [dev-dependencies]
+# test-hooks: the integration tests open their stores stamped (`ColumnWriter::open_seeded`).
+cl-chain-columns = { path = ".", features = ["test-hooks"] }
 # test-hooks: tests reach the env itself (`WriterEnv::raw_env`) and a write txn's libmdbx txn
 # (`RwTxn::raw_txn`) to write rows no writer path may, committed raw.
 store-schema = { path = "../store-schema", features = ["test-hooks"] }

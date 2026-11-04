@@ -96,6 +96,7 @@ use crate::columns::request_verdicts;
 use crate::{column_network, column_schedule, column_topic, column_transform, E};
 use cl_chain::da::custody::{Advertise, Custody, EnrCgc, EnrError};
 use cl_chain::probe::ingest::{MAX_LINK_WALK, PENDING_LINK_SLOTS};
+use cl_chain::probe::service::{stamp_from_anchor, Anchor};
 use cl_chain::probe::{
     ApiError, BlockApi, CanonicalChain, ChainView, Checkpoint, ColumnContract, ColumnIngest,
     ColumnMetrics, Drop, GossipColumn, Header, IngestLimits, QueueMetrics, RefLimits, RefView,
@@ -1671,6 +1672,13 @@ pub fn column_contract_events(data: &[u8]) -> Vec<Event> {
         )
         .expect("the column env"),
     );
+    // As probe mode, the new store is stamped from its anchor, the first known block.
+    let anchor = &known_blocks()[0];
+    let anchor = Anchor {
+        root: anchor.root,
+        ssz: anchor.ssz.clone(),
+    };
+    stamp_from_anchor::<E>(&writer, column_schedule(), Some(&anchor)).expect("the first stamp");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .start_paused(true)

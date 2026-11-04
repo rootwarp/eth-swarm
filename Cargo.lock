@@ -1075,6 +1075,7 @@ name = "cl-chain-columns"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "cl-chain-columns",
  "consensus-types",
  "ethereum_ssz",
  "libmdbx",

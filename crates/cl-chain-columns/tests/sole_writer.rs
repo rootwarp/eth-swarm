@@ -137,7 +137,7 @@ fn child_entry() {
     };
     match mode.as_str() {
         "second-writer" => {
-            let err = ColumnWriter::open(&path).unwrap_err();
+            let err = ColumnWriter::open_seeded(&path).unwrap_err();
             assert!(matches!(err, Error::WriterAlreadyOpen { .. }), "{err:?}");
         }
         "reader" => {
@@ -156,7 +156,7 @@ fn child_entry() {
             std::thread::park();
         },
         "migrate-and-link" => {
-            let writer = ColumnWriter::open(&path).unwrap();
+            let writer = ColumnWriter::open_seeded(&path).unwrap();
             writer
                 .write_block_columns(
                     11,
@@ -170,7 +170,7 @@ fn child_entry() {
                 .unwrap();
         }
         "writer-then-crash" => {
-            let _writer = ColumnWriter::open(&path).unwrap();
+            let _writer = ColumnWriter::open_seeded(&path).unwrap();
             std::process::abort();
         }
         other => panic!("unknown child mode {other}"),
@@ -181,12 +181,12 @@ fn child_entry() {
 fn second_writer_in_the_same_process_is_refused() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let writer = ColumnWriter::open(dir.path()).unwrap();
-    let err = ColumnWriter::open(dir.path()).unwrap_err();
+    let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
+    let err = ColumnWriter::open_seeded(dir.path()).unwrap_err();
     assert!(matches!(err, Error::WriterAlreadyOpen { .. }), "{err:?}");
 
     drop(writer);
-    ColumnWriter::open(dir.path()).expect("the guard is released when the writer drops");
+    ColumnWriter::open_seeded(dir.path()).expect("the guard is released when the writer drops");
 }
 
 /// A real writer keeps the env open for the whole second open. The retry budget runs out
@@ -196,9 +196,9 @@ fn second_writer_in_the_same_process_is_refused() {
 fn a_live_writer_is_refused_only_after_the_retry_budget() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let writer = ColumnWriter::open(dir.path()).unwrap();
+    let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
     let started = Instant::now();
-    let err = ColumnWriter::open(dir.path()).unwrap_err();
+    let err = ColumnWriter::open_seeded(dir.path()).unwrap_err();
     let elapsed = started.elapsed();
     assert!(matches!(err, Error::WriterAlreadyOpen { .. }), "{err:?}");
     let budget = WRITER_LOCK_RETRY_INTERVAL * (WRITER_LOCK_ATTEMPTS - 1);
@@ -215,15 +215,15 @@ fn a_live_writer_is_refused_only_after_the_retry_budget() {
 fn writers_of_different_envs_do_not_conflict() {
     let _serial = serial();
     let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let _wa = ColumnWriter::open(a.path()).unwrap();
-    let _wb = ColumnWriter::open(b.path()).unwrap();
+    let _wa = ColumnWriter::open_seeded(a.path()).unwrap();
+    let _wb = ColumnWriter::open_seeded(b.path()).unwrap();
 }
 
 #[test]
 fn second_writer_in_another_process_is_refused_while_readers_read() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let writer = ColumnWriter::open(dir.path()).unwrap();
+    let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
     writer
         .write_columns(
             9,
@@ -245,7 +245,7 @@ fn a_crashed_writer_leaves_no_stale_lock() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     assert!(!run_child("writer-then-crash", dir.path()).success());
-    ColumnWriter::open(dir.path()).expect("the OS released the dead writer's guard");
+    ColumnWriter::open_seeded(dir.path()).expect("the OS released the dead writer's guard");
 }
 
 #[test]
@@ -341,7 +341,7 @@ fn a_reader_opened_before_the_migration_reads_links_after_it() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     {
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         writer
             .write_block_columns(
                 9,

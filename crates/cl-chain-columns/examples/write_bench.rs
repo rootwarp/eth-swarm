@@ -254,7 +254,9 @@ fn main() {
     println!("              | blk  |          |         | txns   |         |         |");
 
     let chunked_dir = tempfile::tempdir().unwrap();
-    let chunked = Arc::new(Chunked(ColumnWriter::open(chunked_dir.path()).unwrap()));
+    let chunked = Arc::new(Chunked(
+        ColumnWriter::open_seeded(chunked_dir.path()).unwrap(),
+    ));
     let chunk_txns = NUMBER_OF_COLUMNS.div_ceil(MAX_COLUMNS_PER_TXN as u64);
     report(
         "chunked",

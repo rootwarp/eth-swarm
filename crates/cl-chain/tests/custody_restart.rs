@@ -40,7 +40,7 @@ impl EnrCgc for RecordedEnr {
 }
 
 fn open(path: &Path, slot: u64) -> Custody<ColumnWriter, RecordedEnr> {
-    let writer = ColumnWriter::open(path).unwrap();
+    let writer = ColumnWriter::open_seeded(path).unwrap();
     Custody::open(
         writer,
         RecordedEnr::default(),
