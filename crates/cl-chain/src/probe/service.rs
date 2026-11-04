@@ -35,6 +35,7 @@
 //! own), behind [`chain_acl`].
 
 use crate::da::custody::{Advertise, Custody, EnrCgc, EnrError};
+use crate::events::{ChainEvents, EventsServer};
 use crate::probe::{
     ApiError, BeaconApi, BlockApi, ColumnContract, ColumnIngest, ColumnMetrics, GossipColumn,
     HeadFollow, IngestLimits, ProbeChain, QueueMetrics, RefLimits, RefView, ReferenceApi, Root,
@@ -854,14 +855,23 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ProbeService<E, V> {
     }
 
     /// Every `ethswarm.chain.v1` service: `ReqRespService` from the column server and our
-    /// Status, `GossipService` from the custody and the column store, the rest stubs. Serve
-    /// them behind [`chain_acl`].
+    /// Status, `GossipService` from the custody and the column store, `EventsService` from
+    /// [`Self::events_server`], the rest stubs. Serve them behind [`chain_acl`].
     #[must_use]
     pub fn routes(&self) -> Routes {
         ChainStub::new(self.link.clone())
             .serving(self.req_resp_server())
             .serving_gossip(self.gossip_server())
+            .serving_events(self.events_server())
             .routes()
+    }
+
+    /// `EventsService`. The probe runs no fork choice, so nothing publishes to its bus: a
+    /// stream carries our hello until [`Self::stream_stop`] ends it.
+    #[must_use]
+    pub fn events_server(&self) -> EventsServer {
+        let bus = ChainEvents::new(self.link.slots_per_epoch());
+        EventsServer::new(self.link.clone(), bus).stopping(self.stop.subscribe())
     }
 
     /// `GossipService`: the custody subscriptions on the wall clock and the column hand-off
@@ -955,8 +965,8 @@ impl<E: EthSpec, V> ProbeService<E, V> {
             .serving_status(Arc::clone(&self.status) as Arc<dyn ChainStatus>)
     }
 
-    /// The handle that ends every `WatchSubscriptions` stream ([`StreamStop::end_streams`]), for
-    /// a shutdown future that does not hold the service.
+    /// The handle that ends every `WatchSubscriptions` and `Subscribe` stream
+    /// ([`StreamStop::end_streams`]), for a shutdown future that does not hold the service.
     #[must_use]
     pub fn stream_stop(&self) -> StreamStop {
         StreamStop(Arc::clone(&self.stop))
@@ -1043,7 +1053,8 @@ impl<E: EthSpec, V> Drop for ProbeService<E, V> {
     }
 }
 
-/// Ends the `WatchSubscriptions` streams of a [`ProbeService`] ([`ProbeService::stream_stop`]).
+/// Ends the `WatchSubscriptions` and `Subscribe` streams of a [`ProbeService`]
+/// ([`ProbeService::stream_stop`]).
 #[derive(Clone, Debug)]
 pub struct StreamStop(Arc<watch::Sender<bool>>);
 

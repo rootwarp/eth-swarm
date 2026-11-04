@@ -9,6 +9,11 @@
 //! and `GetStatus` ([`probe::StatusProvider`], with the column server's
 //! `earliest_available_slot`).
 //!
+//! `EventsService` is served for real, by [`events::EventsServer`] from the service's event bus,
+//! [`ChainStub::events`]: cl-chain's fork choice, block import and finality publish their HEAD,
+//! CHAIN_REORG, BLOCK and FINALIZED_CHECKPOINT events to it. Probe mode runs none of them, so
+//! its streams carry only our hello until its stream stop ends them.
+//!
 //! [`probe`] is probe mode: its Status (`ReqRespService/GetStatus`: the wall-clock fork digest
 //! and the reference Beacon API's finalized checkpoint, with the last good value kept through an
 //! outage), the storage contract for gossip column sidecars (reference root, KZG through
@@ -33,6 +38,7 @@
 
 pub mod compiled_config;
 pub mod da;
+pub mod events;
 pub mod persist;
 pub mod probe;
 pub mod reqresp;
@@ -44,7 +50,6 @@ mod testing;
 
 use ethswarm_proto::chain as pb;
 use ipc::Link;
-use pb::events_service_server::{EventsService, EventsServiceServer};
 use pb::gossip_service_server::{GossipService, GossipServiceServer};
 use pb::import_service_server::{ImportService, ImportServiceServer};
 use pb::query_service_server::{QueryService, QueryServiceServer};
@@ -52,19 +57,25 @@ use pb::req_resp_service_server::{ReqRespService, ReqRespServiceServer};
 use tonic::service::Routes;
 
 /// The `cl-chain` service: contract checks, then `UNIMPLEMENTED`, except `ReqRespService`
-/// once it is given the probe's column server ([`Self::serving`]) and `GossipService` once it
-/// is given the probe's custody subscriptions and column hand-off ([`Self::serving_gossip`]).
+/// once it is given the probe's column server ([`Self::serving`]), `GossipService` once it
+/// is given the probe's custody subscriptions and column hand-off ([`Self::serving_gossip`]),
+/// and `EventsService`, always served from its event bus ([`Self::events`]).
 #[derive(Clone, Debug)]
 pub struct ChainStub {
     link: Link,
     req_resp: Option<reqresp::ReqRespServer>,
     gossip: Option<probe::service::GossipServer>,
+    events: events::EventsServer,
 }
 
 impl ChainStub {
+    /// The service on `link`, `EventsService` served from a new bus with the link's slots per
+    /// epoch.
     #[must_use]
     pub fn new(link: Link) -> Self {
+        let bus = events::ChainEvents::new(link.slots_per_epoch());
         Self {
+            events: events::EventsServer::new(link.clone(), bus),
             link,
             req_resp: None,
             gossip: None,
@@ -87,10 +98,23 @@ impl ChainStub {
         self
     }
 
+    /// The same service with `EventsService` served by `events` (its bus and its stop).
+    #[must_use]
+    pub fn serving_events(mut self, events: events::EventsServer) -> Self {
+        self.events = events;
+        self
+    }
+
     /// Whether `ReqRespService` is served by the column server.
     #[must_use]
     pub fn serves_columns(&self) -> bool {
         self.req_resp.is_some()
+    }
+
+    /// The bus `EventsService` serves: what fork choice, block import and finality publish to.
+    #[must_use]
+    pub fn events(&self) -> &events::ChainEvents {
+        self.events.events()
     }
 
     /// The contract configuration every RPC is checked against.
@@ -113,7 +137,7 @@ impl ChainStub {
         routes
             .add_service(ImportServiceServer::new(self.clone()))
             .add_service(QueryServiceServer::new(self.clone()))
-            .add_service(EventsServiceServer::new(self.clone()))
+            .add_service(self.events.into_service())
     }
 }
 
@@ -179,18 +203,6 @@ ipc::stub_service!(ChainStub => QueryService {
         submit(pb::SubmitRequest) -> pb::SubmitResponse => |r| r.items.iter().collect(),
     ],
     server_stream: [
-    ],
-    bidi: [
-    ],
-});
-
-ipc::stub_service!(ChainStub => EventsService {
-    unary: [
-    ],
-    unary_envelopes: [
-    ],
-    server_stream: [
-        subscribe(pb::SubscribeRequest) -> pb::SubscribeResponse as SubscribeStream,
     ],
     bidi: [
     ],
@@ -300,6 +312,51 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unimplemented);
+        let _ = stop.send(());
+    }
+
+    /// The routes serve `EventsService` from the service's bus: an event published to
+    /// [`ChainStub::events`] reaches a subscriber over the socket, its epoch's start slot at the
+    /// link's slots per epoch.
+    #[tokio::test]
+    async fn the_routes_serve_the_events_bus() {
+        use consensus_types::primitives::B256;
+        use pb::events_service_client::EventsServiceClient;
+        use pb::subscribe_response::Frame;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = ChainStub::new(link());
+        let events = stub.events().clone();
+        let socket = dir.path().join("chain.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(ipc::stub::serve_uds(listener, stub.routes(), async {
+            let _ = stopped.await;
+        }));
+        let uid = ipc::uds::Ownership::current().uid;
+        let channel = ipc::uds::connect_path(&socket, uid).await.unwrap();
+        let request = pb::SubscribeRequest {
+            kinds: vec![pb::EventKind::FinalizedCheckpoint as i32],
+            resume_from_seq: 0,
+            hello: Some(link().local()),
+        };
+        let mut stream = EventsServiceClient::new(channel)
+            .subscribe(request)
+            .await
+            .unwrap()
+            .into_inner();
+        let first = stream.message().await.unwrap().and_then(|m| m.frame);
+        assert!(matches!(first, Some(Frame::Hello(_))), "{first:?}");
+        events.finalized(&events::Finalized {
+            epoch: 2,
+            block: B256::repeat_byte(1),
+            state: B256::repeat_byte(2),
+            execution_optimistic: false,
+        });
+        match stream.message().await.unwrap().and_then(|m| m.frame) {
+            // Mainnet: 32 slots per epoch.
+            Some(Frame::Body(body)) => assert_eq!((body.seq, body.slot), (1, 64)),
+            other => panic!("a body, got {other:?}"),
+        }
         let _ = stop.send(());
     }
 

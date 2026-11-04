@@ -439,6 +439,48 @@ async fn the_routes_serve_the_custody_subscriptions() {
     server.await.unwrap().unwrap();
 }
 
+/// The routes serve `EventsService/Subscribe`, not the stub: the probe runs no fork choice, so a
+/// stream gets our hello and then nothing until the stream stop ends it with `UNAVAILABLE`, which
+/// lets the drain finish.
+#[tokio::test]
+async fn the_routes_end_event_streams_at_the_stream_stop() {
+    use pb::events_service_client::EventsServiceClient;
+    let dir = tempfile::tempdir().unwrap();
+    let service = ProbeService::<Minimal, Valid>::open(
+        &devnet(),
+        plan(dir.path(), 0),
+        &mut Registry::default(),
+    )
+    .unwrap();
+    let socket = dir.path().join("chain.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let stop = service.stream_stop();
+    let (done, finished) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(ipc::stub::serve_uds(listener, service.routes(), async {
+        let _ = finished.await;
+    }));
+    let channel = ipc::uds::connect_path(&socket, ipc::uds::Ownership::current().uid)
+        .await
+        .unwrap();
+    let mut stream = EventsServiceClient::new(channel)
+        .subscribe(pb::SubscribeRequest {
+            kinds: vec![pb::EventKind::Head as i32],
+            resume_from_seq: 0,
+            hello: Some(service.link().local()),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(stream.message().await.unwrap().is_some(), "our hello");
+    stop.end_streams();
+    assert_eq!(
+        stream.message().await.unwrap_err().code(),
+        tonic::Code::Unavailable
+    );
+    let _ = done.send(());
+    server.await.unwrap().unwrap();
+}
+
 /// At most [`MAX_WATCHERS`] `WatchSubscriptions` streams are open at once; one more is
 /// `RESOURCE_EXHAUSTED`, and a place comes back when a stream ends.
 #[tokio::test]
