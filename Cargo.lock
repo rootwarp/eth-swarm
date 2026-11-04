@@ -617,6 +617,8 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "itoa",
  "matchit",
  "memchr",
@@ -625,6 +627,7 @@ dependencies = [
  "pin-project-lite",
  "serde_core",
  "sync_wrapper",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",
@@ -1024,9 +1027,21 @@ dependencies = [
 name = "cl-api"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "ethswarm-proto",
+ "form_urlencoded",
+ "http",
  "ipc",
+ "network-config",
+ "serde",
+ "serde_json",
+ "svc-runtime",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
  "tonic",
+ "tower",
+ "tracing",
 ]
 
 [[package]]

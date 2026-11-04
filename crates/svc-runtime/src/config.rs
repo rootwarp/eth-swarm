@@ -19,15 +19,15 @@
 //! [methods]
 //! "/ethswarm.engine.v1.EngineService/NewPayload" = ["cl-chain"]
 //!
-//! [chain]                      # the service's own table: [chain], [discv5] or [p2p]
+//! [chain]                      # the service's own table: [chain], [discv5], [p2p] or [api]
 //! ```
 //!
 //! - **The network.** Exactly one of `network` (a pinned network, with its pinned genesis where
 //!   there is one) and `network_dir` (an absolute path to a devnet's `config.yaml` and
 //!   `genesis.ssz`, read by `network_config::network_dir`).
-//! - **The service's table.** cl-chain reads `[chain]`, cl-discv5 `[discv5]` and cl-p2p `[p2p]`
-//!   ([`Config::section`]); the table of another service is refused, so a config cannot be put
-//!   at the wrong path by mistake. The service's own type refuses the keys it does not know.
+//! - **The service's table.** cl-chain reads `[chain]`, cl-discv5 `[discv5]`, cl-p2p `[p2p]` and
+//!   cl-api `[api]` ([`Config::section`]); the table of another service is refused, so a config
+//!   cannot be put at the wrong path by mistake. The service's own type refuses the keys it does not know.
 //!
 //! Unknown keys are refused, so a typo fails startup instead of silently falling back to a
 //! default. The socket's owner is the user the service runs as. A deployed binary reads the
@@ -78,6 +78,7 @@ struct File {
     chain: Option<toml::Table>,
     discv5: Option<toml::Table>,
     p2p: Option<toml::Table>,
+    api: Option<toml::Table>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,13 +169,14 @@ impl NetworkSource {
 }
 
 /// The table of `service` in its config file: `chain` for `cl-chain`, `discv5` for
-/// `cl-discv5`, `p2p` for `cl-p2p`; `None` for a service without one.
+/// `cl-discv5`, `p2p` for `cl-p2p`, `api` for `cl-api`; `None` for a service without one.
 #[must_use]
 pub fn section_name(service: &str) -> Option<&'static str> {
     match service {
         "cl-chain" => Some("chain"),
         "cl-discv5" => Some("discv5"),
         "cl-p2p" => Some("p2p"),
+        "cl-api" => Some("api"),
         _ => None,
     }
 }
@@ -284,6 +286,7 @@ impl Config {
             ("chain", file.chain),
             ("discv5", file.discv5),
             ("p2p", file.p2p),
+            ("api", file.api),
         ] {
             match table {
                 Some(table) if own == Some(name) => section = Some(table),
@@ -582,6 +585,32 @@ mod tests {
         let err = c.section::<ChainTable>().unwrap_err();
         assert!(
             matches!(&err, ConfigError::Section { table, .. } if table == "chain"),
+            "{err}"
+        );
+    }
+
+    /// cl-api reads `[api]`; no other service may have it.
+    #[test]
+    fn cl_api_reads_the_api_table() {
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ApiTable {
+            chain_uid: u32,
+        }
+        let api = "network = \"sepolia\"\nmetrics_port = 9105\n[socket]\ngroup = 994\n\
+                   [callers]\nsupervisor = 996\n\
+                   [methods]\n\"/ethswarm.api.v1.ApiService/GetHealth\" = [\"supervisor\"]\n\
+                   [api]\nchain_uid = 990\n";
+        let c = Config::from_toml("cl-api", api, Path::new("cl-api.toml")).unwrap();
+        assert_eq!(section_name("cl-api"), Some("api"));
+        assert_eq!(
+            c.section::<ApiTable>().unwrap(),
+            ApiTable { chain_uid: 990 }
+        );
+        let err = parse(&format!("{}[api]\nchain_uid = 990\n", engine(""))).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::ForeignTable { table, service }
+                if table == "api" && service == "cl-engine"),
             "{err}"
         );
     }

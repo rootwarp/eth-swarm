@@ -1,14 +1,33 @@
-//! `cl-api`: serves `ethswarm.api.v1`, the Beacon API front end (health over gRPC; the Beacon API itself is HTTP).
+//! `cl-api`: the Beacon API front end. It serves the beacon-APIs HTTP routes (beacon-APIs
+//! `01e99a6`) and `ethswarm.api.v1` (health over gRPC).
 //!
-//! This is a stub. Every RPC runs the `ipc` contract layer first (hello negotiation, frame
-//! discipline, `seq`, envelope type and digest checks) and then answers `UNIMPLEMENTED`, so the
-//! service already holds its peers to the wire contract. `tests/contract.rs` runs the contract
-//! suite against it, in process and over a Unix socket.
+//! - [`server`]: the HTTP core. It holds the loopback-only bind, the beacon-APIs error body,
+//!   content negotiation, `Eth-Consensus-Version` and the router.
+//! - [`node_state`]: what `node/health` and `node/syncing` report. That is cl-chain's chain
+//!   status, polled over chain.v1 `ImportService.GetChainStatus`, set against the wall clock.
+//! - [`routes`]: `node/{health,syncing,version}` and `config/{spec,fork_schedule,deposit_contract}`.
+//! - [`service`]: the process. It reads the config's `[api]` table, serves the gRPC service on
+//!   its socket and the Beacon API on HTTP, and runs the poller.
+//!
+//! The gRPC `ApiService` is still a stub. Every RPC runs the `ipc` contract layer first (hello
+//! negotiation, frame discipline, `seq`, envelope type and digest checks) and then answers
+//! `UNIMPLEMENTED`, so the service already holds its peers to the wire contract.
+//! `tests/contract.rs` runs the contract suite against it, in process and over a Unix socket.
 
 use ethswarm_proto::api as pb;
 use ipc::Link;
 use pb::api_service_server::{ApiService, ApiServiceServer};
 use tonic::service::Routes;
+
+pub mod node_state;
+pub mod routes;
+pub mod server;
+pub mod service;
+
+#[cfg(test)]
+mod openapi;
+#[cfg(test)]
+mod testing;
 
 /// The `cl-api` service: contract checks, then `UNIMPLEMENTED`.
 #[derive(Clone, Debug)]

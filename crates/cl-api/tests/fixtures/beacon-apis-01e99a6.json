@@ -1,0 +1,247 @@
+{
+  "source": {
+    "repository": "https://github.com/ethereum/beacon-APIs",
+    "commit": "01e99a6530b22941f619bde525cbf8bb61991d42",
+    "files": [
+      "beacon-node-oapi.yaml",
+      "apis/node/health.yaml",
+      "apis/node/syncing.yaml",
+      "apis/node/version.yaml",
+      "apis/config/spec.yaml",
+      "apis/config/fork_schedule.yaml",
+      "apis/config/deposit_contract.yaml",
+      "types/http.yaml",
+      "types/misc.yaml",
+      "types/primitive.yaml"
+    ],
+    "note": "Only the response schemas of the cl-api part 1 routes, converted by hand from YAML to JSON. Each $ref into beacon-node-oapi.yaml or types/*.yaml points at a copy under components, named as beacon-node-oapi.yaml names it. Descriptions, summaries, tags and examples are dropped. Every validation keyword is kept as written."
+  },
+  "components": {
+    "schemas": {
+      "Uint64": {
+        "type": "string"
+      },
+      "Version": {
+        "type": "string"
+      },
+      "ForkVersion": {
+        "type": "string",
+        "format": "hex",
+        "pattern": "^0x[a-fA-F0-9]{8}$"
+      },
+      "ExecutionAddress": {
+        "type": "string",
+        "format": "hex",
+        "pattern": "^0x[a-fA-F0-9]{40}$"
+      },
+      "Fork": {
+        "type": "object",
+        "required": ["previous_version", "current_version", "epoch"],
+        "properties": {
+          "previous_version": { "$ref": "#/components/schemas/ForkVersion" },
+          "current_version": { "$ref": "#/components/schemas/ForkVersion" },
+          "epoch": { "$ref": "#/components/schemas/Uint64" }
+        }
+      },
+      "ErrorMessage": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "type": "number" },
+          "message": { "type": "string" },
+          "stacktraces": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "responses": {
+      "InternalError": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": ["code", "message"],
+              "properties": {
+                "code": { "type": "number" },
+                "message": { "type": "string" },
+                "stacktraces": { "type": "array", "items": { "type": "string" } }
+              }
+            }
+          }
+        }
+      },
+      "NotAcceptable": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": ["code", "message"],
+              "properties": {
+                "code": { "type": "number" },
+                "message": { "type": "string" },
+                "stacktraces": { "type": "array", "items": { "type": "string" } }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/eth/v1/node/health": {
+      "get": {
+        "operationId": "getHealth",
+        "parameters": [
+          {
+            "name": "syncing_status",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 100, "maximum": 599 }
+          }
+        ],
+        "responses": {
+          "200": {},
+          "206": {},
+          "400": {},
+          "503": {}
+        }
+      }
+    },
+    "/eth/v1/node/syncing": {
+      "get": {
+        "operationId": "getSyncingStatus",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "GetSyncingStatusResponse",
+                  "type": "object",
+                  "required": ["data"],
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "required": ["head_slot", "sync_distance", "is_syncing", "is_optimistic", "el_offline"],
+                      "properties": {
+                        "head_slot": { "$ref": "#/components/schemas/Uint64" },
+                        "sync_distance": { "$ref": "#/components/schemas/Uint64" },
+                        "is_syncing": { "type": "boolean" },
+                        "is_optimistic": { "type": "boolean" },
+                        "el_offline": { "type": "boolean" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/eth/v1/node/version": {
+      "get": {
+        "operationId": "getNodeVersion",
+        "deprecated": true,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "GetVersionResponse",
+                  "type": "object",
+                  "required": ["data"],
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "required": ["version"],
+                      "properties": {
+                        "version": { "$ref": "#/components/schemas/Version" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/eth/v1/config/spec": {
+      "get": {
+        "operationId": "getSpec",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "GetSpecResponse",
+                  "type": "object",
+                  "required": ["data"],
+                  "properties": {
+                    "data": { "type": "object" }
+                  }
+                }
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/eth/v1/config/fork_schedule": {
+      "get": {
+        "operationId": "getForkSchedule",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "GetForkScheduleResponse",
+                  "type": "object",
+                  "required": ["data"],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/Fork" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/eth/v1/config/deposit_contract": {
+      "get": {
+        "operationId": "getDepositContract",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "GetDepositContractResponse",
+                  "type": "object",
+                  "required": ["data"],
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "required": ["chain_id", "address"],
+                      "properties": {
+                        "chain_id": { "$ref": "#/components/schemas/Uint64" },
+                        "address": { "$ref": "#/components/schemas/ExecutionAddress" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    }
+  }
+}
