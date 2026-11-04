@@ -33,6 +33,7 @@
 
 pub mod compiled_config;
 pub mod da;
+pub mod events;
 pub mod persist;
 pub mod probe;
 pub mod reqresp;
