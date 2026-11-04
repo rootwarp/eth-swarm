@@ -219,6 +219,108 @@ mod tests {
 RS
 check pass "every spelling inside test modules and comments" "$root" "stamped commits OK"
 
+# A call split across lines is one call: the file is matched as a whole, the line reported is
+# the one `commit` is on.
+root=$(fixture split_paren)
+printf 'fn f() {\n    txn.commit\n        ()?;\n}\n' > "$root/crates/cl-chain/src/split.rs"
+check fail "txn.commit, then ( on the next line" "$root" "crates/cl-chain/src/split.rs:2:"
+
+root=$(fixture split_dot)
+printf 'fn f() {\n    txn.\n        commit()?;\n}\n' > "$root/crates/cl-chain/src/split.rs"
+check fail "txn., then commit() on the next line" "$root" "crates/cl-chain/src/split.rs:3:"
+
+root=$(fixture split_args)
+printf 'fn f() {\n    let ok = txn.commit(\n    )?;\n}\n' > "$root/crates/cl-chain/src/split.rs"
+check fail "txn.commit(, then ) on the next line" "$root" "crates/cl-chain/src/split.rs:2:"
+
+root=$(fixture split_path)
+printf 'fn f() {\n    Transaction::\n        commit(txn)?;\n}\n' > "$root/crates/cl-chain/src/split.rs"
+check fail "Transaction::, then commit(txn) on the next line" "$root" \
+  "crates/cl-chain/src/split.rs:3:"
+
+root=$(fixture split_comment)
+printf 'fn f() {\n    txn\n        // the stamp is written elsewhere\n        .commit()?;\n}\n' \
+  > "$root/crates/cl-chain/src/split.rs"
+check fail "a comment line inside the split call" "$root" "crates/cl-chain/src/split.rs:4:"
+
+root=$(fixture split_open)
+printf 'fn f() {\n    store_schema::txn::\n        commit_open(txn)?;\n}\n' \
+  > "$root/crates/cl-chain/src/split.rs"
+check fail "txn::, then commit_open on the next line" "$root" "crates/cl-chain/src/split.rs:3:"
+
+root=$(fixture split_stamped)
+cat > "$root/crates/cl-chain/src/split.rs" <<'RS'
+fn f() {
+    store_schema::txn
+        ::commit(txn, Update::Carry)?;
+    crate::txn::
+        commit(txn, Update::Carry)?;
+}
+RS
+check pass "txn::commit split across lines is still the stamped commit" "$root" \
+  "stamped commits OK"
+
+# A commit under another name: renamed on import, or a `txn` that is not store-schema's, whose
+# `txn::commit` would read as the stamped one.
+root=$(fixture alias_use)
+printf 'use store_schema::txn::commit as c;\n\nfn f() {\n    c(raw)?;\n}\n' \
+  > "$root/crates/cl-chain/src/alias.rs"
+check fail "use ...::txn::commit as c, then c(raw)" "$root" "crates/cl-chain/src/alias.rs:1:"
+
+root=$(fixture alias_group)
+printf 'use store_schema::txn::{\n    commit as stamped,\n    Update,\n};\n' \
+  > "$root/crates/cl-chain/src/alias.rs"
+check fail "commit renamed inside a use group" "$root" "crates/cl-chain/src/alias.rs:2:"
+
+root=$(fixture alias_to_commit)
+printf 'use crate::raw::finish as commit;\n' > "$root/crates/cl-chain-columns/src/alias.rs"
+check fail "something else renamed to commit" "$root" \
+  "crates/cl-chain-columns/src/alias.rs:1:"
+
+root=$(fixture alias_txn)
+printf 'use libmdbx::Transaction as txn;\n\nfn f(raw: Raw) {\n    txn::commit(raw)?;\n}\n' \
+  > "$root/crates/cl-chain/src/alias.rs"
+check fail "txn::commit(raw) with txn a libmdbx alias" "$root" "crates/cl-chain/src/alias.rs:1:"
+
+root=$(fixture alias_type)
+printf "type txn<'e> = Transaction<'e, RW, NoWriteMap>;\n\nfn f(raw: Raw) {\n    txn::commit(raw)?;\n}\n" \
+  > "$root/crates/store-schema/src/stamp.rs"
+check fail "txn::commit(raw) with txn a type alias" "$root" "crates/store-schema/src/stamp.rs:1:"
+
+# Every crate under crates/ is scanned, not only the ones that write the env today.
+root=$(fixture other_crate)
+mkdir -p "$root/crates/devnet-probe/src"
+printf 'fn serve() {\n    txn.commit()?;\n}\n' > "$root/crates/devnet-probe/src/serve.rs"
+check fail "a raw commit in a crate outside the env writers" "$root" \
+  "crates/devnet-probe/src/serve.rs:2:"
+
+root=$(fixture new_crate)
+mkdir -p "$root/crates/brand-new/src/deep"
+printf 'fn f() {\n    libmdbx::Transaction::commit(txn)?;\n}\n' \
+  > "$root/crates/brand-new/src/deep/mod.rs"
+check fail "a raw commit in a crate added later" "$root" "crates/brand-new/src/deep/mod.rs:2:"
+
+# A commit that is not of an env txn (another type's method) says so on its line.
+root=$(fixture not_env)
+mkdir -p "$root/crates/cl-verify-cache/src"
+printf 'pub fn save() -> io::Result<()> {\n    stage()?.commit() // stamped-commits: not an env txn (StagedSnapshot)\n}\n' \
+  > "$root/crates/cl-verify-cache/src/persist.rs"
+check pass "a commit marked as not an env txn, with its type" "$root" "stamped commits OK"
+
+root=$(fixture not_env_bare)
+mkdir -p "$root/crates/cl-verify-cache/src"
+printf 'pub fn save() -> io::Result<()> {\n    stage()?.commit() // stamped-commits: not an env txn\n}\n' \
+  > "$root/crates/cl-verify-cache/src/persist.rs"
+check fail "the marker without the type it names" "$root" \
+  "crates/cl-verify-cache/src/persist.rs:2:"
+
+root=$(fixture not_env_above)
+mkdir -p "$root/crates/cl-verify-cache/src"
+printf 'pub fn save() -> io::Result<()> {\n    // stamped-commits: not an env txn (StagedSnapshot)\n    stage()?.commit()\n}\n' \
+  > "$root/crates/cl-verify-cache/src/persist.rs"
+check fail "the marker on the line above does not count" "$root" \
+  "crates/cl-verify-cache/src/persist.rs:3:"
+
 check pass "the real repo" "$repo" "stamped commits OK"
 
 echo "passed $passed, failed $failed"

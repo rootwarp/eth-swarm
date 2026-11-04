@@ -3,6 +3,53 @@
 //! No writer path calls `commit()` on a write transaction itself; `scripts/check-stamped-commits.sh`
 //! fails CI on one outside this file. The writer's open commits through `commit_open`, called
 //! only from [`crate::env::open_writer_with`] (the same script enforces that).
+//!
+//! A write transaction begins with `begin` and commits with [`commit`]:
+//!
+//! ```no_run
+//! use libmdbx::WriteFlags;
+//! use store_schema::{env::WriterEnv, tables::STATES, txn::{self, Update}};
+//!
+//! fn put_state(writer: &WriterEnv) -> store_schema::Result<()> {
+//!     let txn = txn::begin(writer)?;
+//!     let states = txn.open_table(Some(STATES))?;
+//!     txn.put(&states, b"key", b"state", WriteFlags::UPSERT)?;
+//!     txn::commit(txn, Update::Carry)?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! The transaction has no commit of its own:
+//!
+//! ```compile_fail,E0599
+//! # use store_schema::{env::WriterEnv, txn};
+//! fn raw(writer: &WriterEnv) -> store_schema::Result<()> {
+//!     let txn = txn::begin(writer)?;
+//!     txn.commit()?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! nor a way to the libmdbx transaction inside it:
+//!
+//! ```compile_fail,E0616
+//! # use store_schema::{env::WriterEnv, txn};
+//! fn raw(writer: &WriterEnv) -> store_schema::Result<()> {
+//!     let txn = txn::begin(writer)?;
+//!     txn.0.commit()?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! and outside this crate the env begins no raw write transaction:
+//!
+//! ```compile_fail,E0624
+//! # use store_schema::env::WriterEnv;
+//! fn raw(writer: &WriterEnv) -> store_schema::Result<()> {
+//!     writer.begin_rw_txn()?.commit()?;
+//!     Ok(())
+//! }
+//! ```
 
 use libmdbx::WriteFlags;
 
@@ -563,6 +610,46 @@ mod tests {
         };
         new_accepted(&writer, finalized, b"higher finalized");
         new_accepted(&writer, finalized, b"same seq, same root, again");
+    }
+
+    /// A `commit` for every type: `x.commit()` resolves to it only if `x`'s type has no
+    /// `commit` method of its own for that receiver (an inherent method wins over a trait's).
+    trait CommitFallback: Sized {
+        fn commit(self) -> NoRawCommit {
+            NoRawCommit
+        }
+    }
+    impl<T> CommitFallback for T {}
+    struct NoRawCommit;
+
+    /// One item for every type, and a second for a `Deref` type: naming the item of a `Deref`
+    /// type is ambiguous, so it does not compile.
+    trait AmbiguousIfDeref<A> {
+        fn item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfDeref<()> for T {}
+    impl<T: ?Sized + std::ops::Deref> AmbiguousIfDeref<u8> for T {}
+
+    /// An [`RwTxn`] has no raw commit: no `commit` taking it by value, `&` or `&mut` (each call
+    /// below resolves to the fallback, so it compiles), and no `Deref` to the libmdbx
+    /// transaction, whose `commit` would be one `*` away. Dropped, it writes nothing; it commits
+    /// only through [`commit`], under the stamp rules.
+    #[test]
+    fn rwtxn_no_raw_commit() {
+        let _: fn() = <RwTxn<'_> as AmbiguousIfDeref<_>>::item;
+        let (_dir, writer) = fresh();
+        let mut txn = begin(&writer).unwrap();
+        put_state(&txn, b"dropped");
+        let NoRawCommit = (&mut txn).commit();
+        let NoRawCommit = (&txn).commit();
+        let NoRawCommit = txn.commit();
+        assert!(!has_state(&writer, b"dropped"), "a dropped RwTxn wrote its rows");
+
+        let txn = begin(&writer).unwrap();
+        put_state(&txn, b"committed");
+        assert_eq!(commit(txn, Update::Carry).unwrap(), None);
+        assert!(has_state(&writer, b"committed"));
+        assert_eq!(stamp_row(&writer), None);
     }
 
     /// S2: the first `New` on an unstamped store has nothing to compare with, `head_seq` 0
