@@ -231,6 +231,12 @@ impl Link {
         &self.inner.schedule
     }
 
+    /// The slots per epoch the link's envelope epochs are counted in.
+    #[must_use]
+    pub fn slots_per_epoch(&self) -> u64 {
+        self.inner.slots_per_epoch
+    }
+
     #[must_use]
     pub fn metrics(&self) -> &ContractMetrics {
         &self.inner.metrics

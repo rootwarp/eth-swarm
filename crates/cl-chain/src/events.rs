@@ -1,24 +1,94 @@
-//! `chain.v1` `EventsService`: cl-chain's sequenced events (skeleton).
+//! `chain.v1` `EventsService`: cl-chain's sequenced events, the source of cl-api's
+//! `/eth/v1/events` and of the head and finality cl-store follows.
+//!
+//! [`ChainEvents`] is the publisher. cl-chain is the single writer, and each of its event
+//! sources calls one method of it:
+//!
+//! - fork choice, at every new head: [`ChainEvents::head`] with the head node and the block tree
+//!   it holds ([`BlockTree`]). A head node that changed is a HEAD event, after a CHAIN_REORG if
+//!   the old head block is not an ancestor of the new one. The same node again is nothing.
+//! - block import, after `on_block`: [`ChainEvents::block`], a BLOCK event.
+//! - finality, at a new finalized checkpoint: [`ChainEvents::finalized`], a FINALIZED_CHECKPOINT
+//!   event.
+//!
+//! [`EventsServer`] serves `EventsService/Subscribe` from it: each event goes to every stream
+//! whose request named its kind, through a `tokio::sync::broadcast`, so a publisher never waits
+//! on a subscriber. A stream that falls behind ends, and nothing is replayed (its docs have the
+//! request checks and every way a stream ends).
+//!
+//! # Frames
+//!
+//! Every event is one `SubscribeResponseBody`. `seq` is cl-chain's, not the stream's: it starts
+//! at 1 and goes up by one per event of any kind, so a stream sees a strictly increasing
+//! subsequence of it (`proto/ethswarm/chain/v1/events.proto`). `slot`, `root` and `optimistic`
+//! are those of the event's block (FINALIZED_CHECKPOINT: the start slot of the checkpoint's
+//! epoch and its root; CHAIN_REORG: the new head). `data_json` is the event as the beacon APIs
+//! write it (`apis/eventstream/index.yaml` at `01e99a6`): integers as quoted decimals, roots and
+//! hashes as `0x` hex.
+//!
+//! - HEAD: `head`'s `slot`, `block`, `state`, `epoch_transition`,
+//!   `previous_duty_dependent_root`, `current_duty_dependent_root` and `execution_optimistic`,
+//!   and the head node's `payload_status` (`"empty"`, `"full"`; `"pending"` never heads a Gloas
+//!   fork choice; a Fulu head is `"full"`). `head` and `head_v2` share this kind: `head` is the
+//!   frame without `payload_status`, `head_v2` names the two dependent roots
+//!   `current_epoch_dependent_root` and `next_epoch_dependent_root` (the same roots). Gloas
+//!   asks for a second head event when the head block's payload turns from empty to full; the
+//!   payload status is part of the node, so that change is a HEAD here.
+//! - BLOCK: `slot`, `block`, `execution_optimistic` and, from Gloas, the `builder_index` and
+//!   `block_hash` of the block's `signed_execution_payload_bid.message` ([`Bid`]).
+//! - FINALIZED_CHECKPOINT: `block`, `state`, `epoch`, `execution_optimistic`.
+//! - CHAIN_REORG: `slot` (the new head's), `depth`, `old_head_block`, `new_head_block`,
+//!   `old_head_state`, `new_head_state`, `epoch` (the new head's), `execution_optimistic` (the
+//!   new head's). `depth` is the old head's slot less the slot of the common ancestor.
+//!
+//! Every `data_json` is a fixed set of short fields, well under 1 KiB, so none can reach the
+//! proto's 64 KiB cap.
 
 use crate::persist::durable::PayloadStatus;
 use consensus_types::gloas;
 use consensus_types::primitives::{BuilderIndex, Epoch, Hash32, Root, Slot};
 use consensus_types::EthSpec;
 use ethswarm_proto::chain as pb;
+use ipc::frame::OutFrame;
+use ipc::hello::stream_hello;
 use ipc::stub::StubStream;
-use ipc::Link;
-use pb::events_service_server::EventsService;
+use ipc::{ContractError, Link};
+use pb::events_service_server::{EventsService, EventsServiceServer};
+use pb::EventKind;
+use serde::Serialize;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{broadcast, mpsc, watch};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-/// The fork-choice head: the node `get_head` returned and what its state says.
+/// Events the bus keeps for its slowest subscriber. A subscriber further behind than this has
+/// lost events.
+pub const EVENT_CAPACITY: usize = 1024;
+
+/// Frames one stream holds ahead of its client.
+const STREAM_BUFFER: usize = 16;
+
+/// The fork-choice head: the node `get_head` returned (its block and, from Gloas, its payload
+/// status) and what the head state says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Head {
+    /// The head block's slot.
     pub slot: Slot,
+    /// The head block's root.
     pub block: Root,
+    /// The head block's state root.
     pub state: Root,
+    /// The head node's payload status (Gloas `ForkChoiceNode.payload_status`); a Fulu head is
+    /// [`PayloadStatus::Full`].
     pub payload_status: PayloadStatus,
+    /// `get_block_root_at_slot(state, compute_start_slot_at_epoch(epoch - 1) - 1)` of the head
+    /// state at the head's epoch, the genesis block root on underflow.
     pub previous_duty_dependent_root: Root,
+    /// `get_block_root_at_slot(state, compute_start_slot_at_epoch(epoch) - 1)`, the genesis
+    /// block root on underflow.
     pub current_duty_dependent_root: Root,
+    /// The head is optimistic: its execution payload is not known to be valid yet.
     pub execution_optimistic: bool,
 }
 
@@ -28,23 +98,29 @@ pub struct ImportedBlock {
     pub slot: Slot,
     pub block: Root,
     pub execution_optimistic: bool,
+    /// Gloas: the block's bid. `None` for a Fulu block, whose event names no bid.
     pub bid: Option<Bid>,
 }
 
 /// What a Gloas block's event names of its `signed_execution_payload_bid.message`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bid {
+    /// `BUILDER_INDEX_SELF_BUILD` for a block its proposer built.
     pub builder_index: BuilderIndex,
+    /// The committed execution block hash.
     pub block_hash: Hash32,
 }
 
 impl<E: EthSpec> From<&gloas::ExecutionPayloadBid<E>> for Bid {
-    fn from(_bid: &gloas::ExecutionPayloadBid<E>) -> Self {
-        todo!()
+    fn from(bid: &gloas::ExecutionPayloadBid<E>) -> Self {
+        Self {
+            builder_index: bid.builder_index,
+            block_hash: bid.block_hash,
+        }
     }
 }
 
-/// A new finalized checkpoint.
+/// A new finalized checkpoint, with the state of its block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Finalized {
     pub epoch: Epoch,
@@ -53,43 +129,343 @@ pub struct Finalized {
     pub execution_optimistic: bool,
 }
 
-/// The block tree fork choice holds.
+/// The block tree fork choice holds, which [`ChainEvents::head`] walks back to the common
+/// ancestor of the old and the new head.
 pub trait BlockTree {
-    /// The root and slot of the parent of `root`.
+    /// The root and slot of the parent of block `root`; `None` if the tree does not hold
+    /// `root` or its parent.
     fn parent(&self, root: &Root) -> Option<(Root, Slot)>;
 }
 
-/// The publisher of cl-chain's events.
+/// The publisher of cl-chain's events (see the module docs). Clones publish to the same bus.
 #[derive(Clone, Debug)]
-pub struct ChainEvents;
+pub struct ChainEvents {
+    bus: Arc<Bus>,
+}
+
+#[derive(Debug)]
+struct Bus {
+    slots_per_epoch: u64,
+    sender: broadcast::Sender<pb::SubscribeResponseBody>,
+    /// Held while an event is numbered and sent, so the bus sends in `seq` order.
+    state: Mutex<State>,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    /// The `seq` of the last event; 0 before the first.
+    seq: u64,
+    /// The last head published.
+    head: Option<Head>,
+}
 
 impl ChainEvents {
+    /// A bus keeping [`EVENT_CAPACITY`] events, its epochs `slots_per_epoch` slots long.
     #[must_use]
-    pub fn new(_slots_per_epoch: u64) -> Self {
-        todo!()
+    pub fn new(slots_per_epoch: u64) -> Self {
+        Self::with_capacity(slots_per_epoch, EVENT_CAPACITY)
     }
 
-    pub fn head(&self, _head: Head, _tree: &dyn BlockTree) {
-        todo!()
+    /// A bus keeping `capacity` events (at least one) for its slowest subscriber.
+    #[must_use]
+    pub fn with_capacity(slots_per_epoch: u64, capacity: usize) -> Self {
+        let (sender, _) = broadcast::channel(capacity.max(1));
+        Self {
+            bus: Arc::new(Bus {
+                slots_per_epoch: slots_per_epoch.max(1),
+                sender,
+                state: Mutex::default(),
+            }),
+        }
     }
 
-    pub fn block(&self, _block: &ImportedBlock) {
-        todo!()
+    /// Fork choice has a new head. A head node other than the last one is a HEAD event, after
+    /// a CHAIN_REORG if the old head block is not an ancestor of `head`'s. `tree` must still
+    /// hold both heads: call this before pruning it at a new finality. If it cannot tell
+    /// where the two heads meet, no CHAIN_REORG is sent.
+    pub fn head(&self, head: Head, tree: &dyn BlockTree) {
+        let bus = &*self.bus;
+        let mut state = bus.lock();
+        let epoch_transition = match state.head.replace(head) {
+            None => false,
+            Some(old) if old.block == head.block && old.payload_status == head.payload_status => {
+                return;
+            }
+            Some(old) => {
+                match common_ancestor(tree, (old.block, old.slot), (head.block, head.slot)) {
+                    Some((root, _)) if root == old.block => {}
+                    Some((_, slot)) => bus.reorg(&mut state, &old, &head, old.slot - slot),
+                    None => tracing::warn!(
+                        old_slot = old.slot,
+                        new_slot = head.slot,
+                        "the block tree has no common ancestor of the old and new head: no CHAIN_REORG"
+                    ),
+                }
+                bus.epoch(old.slot) < bus.epoch(head.slot)
+            }
+        };
+        let data = HeadData {
+            slot: head.slot.to_string(),
+            block: hex0x(head.block),
+            state: hex0x(head.state),
+            epoch_transition,
+            previous_duty_dependent_root: hex0x(head.previous_duty_dependent_root),
+            current_duty_dependent_root: hex0x(head.current_duty_dependent_root),
+            execution_optimistic: head.execution_optimistic,
+            payload_status: payload_status_name(head.payload_status),
+        };
+        let at = (head.slot, head.block, head.execution_optimistic);
+        bus.send(&mut state, EventKind::Head, at, &data);
     }
 
-    pub fn finalized(&self, _checkpoint: &Finalized) {
-        todo!()
+    /// Block import: `on_block` imported `block`. A BLOCK event.
+    pub fn block(&self, block: &ImportedBlock) {
+        let data = BlockData {
+            slot: block.slot.to_string(),
+            block: hex0x(block.block),
+            execution_optimistic: block.execution_optimistic,
+            builder_index: block.bid.map(|b| b.builder_index.to_string()),
+            block_hash: block.bid.map(|b| hex0x(b.block_hash)),
+        };
+        let at = (block.slot, block.block, block.execution_optimistic);
+        let bus = &*self.bus;
+        bus.send(&mut bus.lock(), EventKind::Block, at, &data);
+    }
+
+    /// Finality: `checkpoint` is the new finalized checkpoint. A FINALIZED_CHECKPOINT event, at
+    /// the start slot of its epoch.
+    pub fn finalized(&self, checkpoint: &Finalized) {
+        let data = FinalizedData {
+            block: hex0x(checkpoint.block),
+            state: hex0x(checkpoint.state),
+            epoch: checkpoint.epoch.to_string(),
+            execution_optimistic: checkpoint.execution_optimistic,
+        };
+        let bus = &*self.bus;
+        let slot = checkpoint.epoch.saturating_mul(bus.slots_per_epoch);
+        let at = (slot, checkpoint.block, checkpoint.execution_optimistic);
+        bus.send(&mut bus.lock(), EventKind::FinalizedCheckpoint, at, &data);
     }
 }
 
-/// `EventsService` over a [`ChainEvents`] bus.
+/// Where an event is: its slot, root and execution optimism.
+type At = (Slot, Root, bool);
+
+impl Bus {
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn epoch(&self, slot: Slot) -> Epoch {
+        slot / self.slots_per_epoch
+    }
+
+    fn reorg(&self, state: &mut State, old: &Head, new: &Head, depth: u64) {
+        let data = ReorgData {
+            slot: new.slot.to_string(),
+            depth: depth.to_string(),
+            old_head_block: hex0x(old.block),
+            new_head_block: hex0x(new.block),
+            old_head_state: hex0x(old.state),
+            new_head_state: hex0x(new.state),
+            epoch: self.epoch(new.slot).to_string(),
+            execution_optimistic: new.execution_optimistic,
+        };
+        let at = (new.slot, new.block, new.execution_optimistic);
+        self.send(state, EventKind::ChainReorg, at, &data);
+    }
+
+    /// Numbers the event and sends it to every subscriber. With none, it is gone, its `seq`
+    /// spent all the same.
+    fn send(&self, state: &mut State, kind: EventKind, at: At, data: &impl Serialize) {
+        let (slot, root, optimistic) = at;
+        state.seq += 1;
+        let body = pb::SubscribeResponseBody {
+            seq: state.seq,
+            kind: kind as i32,
+            slot,
+            root: root.to_vec(),
+            // Strings and booleans only: serializing cannot fail.
+            data_json: serde_json::to_vec(data).unwrap_or_default(),
+            optimistic,
+        };
+        let _ = self.sender.send(body);
+    }
+}
+
+/// The block where the chains of `a` and `b` (root, slot) meet: the later of the two steps back
+/// to its parent until both are one block. `None` if the tree misses a block on the way, or
+/// names a parent that is not earlier than its child.
+fn common_ancestor(
+    tree: &dyn BlockTree,
+    mut a: (Root, Slot),
+    mut b: (Root, Slot),
+) -> Option<(Root, Slot)> {
+    while a.0 != b.0 {
+        let later = if a.1 >= b.1 { &mut a } else { &mut b };
+        *later = tree.parent(&later.0).filter(|parent| parent.1 < later.1)?;
+    }
+    Some(a)
+}
+
+fn hex0x(bytes: impl AsRef<[u8]>) -> String {
+    format!("0x{}", hex::encode(bytes))
+}
+
+/// The beacon API's name of a payload status (`head_v2`).
+fn payload_status_name(status: PayloadStatus) -> &'static str {
+    match status {
+        PayloadStatus::Empty => "empty",
+        PayloadStatus::Full => "full",
+        PayloadStatus::Pending => "pending",
+    }
+}
+
+#[derive(Serialize)]
+struct HeadData {
+    slot: String,
+    block: String,
+    state: String,
+    epoch_transition: bool,
+    previous_duty_dependent_root: String,
+    current_duty_dependent_root: String,
+    execution_optimistic: bool,
+    payload_status: &'static str,
+}
+
+#[derive(Serialize)]
+struct BlockData {
+    slot: String,
+    block: String,
+    execution_optimistic: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    builder_index: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_hash: Option<String>,
+}
+
+#[derive(Serialize)]
+struct FinalizedData {
+    block: String,
+    state: String,
+    epoch: String,
+    execution_optimistic: bool,
+}
+
+#[derive(Serialize)]
+struct ReorgData {
+    slot: String,
+    depth: String,
+    old_head_block: String,
+    new_head_block: String,
+    old_head_state: String,
+    new_head_state: String,
+    epoch: String,
+    execution_optimistic: bool,
+}
+
+/// The v1 kinds one stream subscribes, as bits `1 << kind`.
+#[derive(Clone, Copy, Debug)]
+struct Kinds(u8);
+
+impl Kinds {
+    /// The kinds `SubscribeRequest.kinds` names. `EVENT_KIND_UNSPECIFIED` is a contract
+    /// violation, a kind that v1 does not serve (5–8) or a request without a v1 kind
+    /// `INVALID_ARGUMENT`; an unknown non-zero kind is ignored (`proto/README.md` rule 3).
+    fn of(link: &Link, kinds: &[i32]) -> Result<Self, Status> {
+        let mut bits = 0;
+        for &kind in kinds {
+            match EventKind::try_from(kind) {
+                Ok(EventKind::Unspecified) => {
+                    return Err(link.fail(&ContractError::violation(
+                        "SubscribeRequest.kinds holds EVENT_KIND_UNSPECIFIED",
+                    )));
+                }
+                Ok(
+                    v1 @ (EventKind::Head
+                    | EventKind::Block
+                    | EventKind::FinalizedCheckpoint
+                    | EventKind::ChainReorg),
+                ) => bits |= Self::bit(v1),
+                Ok(later) => {
+                    return Err(Status::invalid_argument(format!(
+                        "{} is not a chain.v1 event yet",
+                        later.as_str_name()
+                    )));
+                }
+                Err(_) => {}
+            }
+        }
+        if bits == 0 {
+            return Err(Status::invalid_argument(
+                "SubscribeRequest.kinds names no chain.v1 event kind",
+            ));
+        }
+        Ok(Self(bits))
+    }
+
+    fn bit(kind: EventKind) -> u8 {
+        1 << (kind as u8)
+    }
+
+    /// Whether the stream asked for `kind`, one the bus sends (1–4).
+    fn has(self, kind: i32) -> bool {
+        (1..=4).contains(&kind) && self.0 & (1 << kind) != 0
+    }
+}
+
+/// `EventsService` over a [`ChainEvents`] bus, every stream held to `link`.
+///
+/// `Subscribe` checks the request's hello (none is a contract violation), then its kinds
+/// (`EVENT_KIND_UNSPECIFIED` is a contract violation; a kind v1 does not serve, 5–8, or no v1
+/// kind at all is `INVALID_ARGUMENT`; an unknown non-zero kind is ignored). The stream then
+/// sends our hello and every later event of its kinds, in `seq` order.
+///
+/// Nothing is replayed: cl-chain keeps no past events, so `resume_from_seq` is ignored and a
+/// stream starts at the bus's next event. A client that resumes compares the first `seq` it
+/// gets with `resume_from_seq + 1` and, on a gap, resyncs through `QueryService` or `store.v1`
+/// (`events.proto`). A stream ends:
+///
+/// - when its client goes, without waiting for an event;
+/// - with `RESOURCE_EXHAUSTED` once it is more than the bus's capacity behind: the bus never
+///   waits on a slow stream, and the stream sends nothing past the gap;
+/// - with `UNAVAILABLE` when the stop ([`Self::stopping`]) turns true or its sender goes, or
+///   when the bus closes (every [`ChainEvents`] dropped).
 #[derive(Clone, Debug)]
-pub struct EventsServer;
+pub struct EventsServer {
+    link: Link,
+    events: ChainEvents,
+    stop: Option<watch::Receiver<bool>>,
+}
 
 impl EventsServer {
     #[must_use]
-    pub fn new(_link: Link, _events: ChainEvents) -> Self {
-        todo!()
+    pub fn new(link: Link, events: ChainEvents) -> Self {
+        Self {
+            link,
+            events,
+            stop: None,
+        }
+    }
+
+    /// The same server, every stream ended with `UNAVAILABLE` when `stop` turns true or its
+    /// sender goes. Open streams would otherwise hold a drain to its deadline.
+    #[must_use]
+    pub fn stopping(mut self, stop: watch::Receiver<bool>) -> Self {
+        self.stop = Some(stop);
+        self
+    }
+
+    /// The bus the streams are served from.
+    #[must_use]
+    pub fn events(&self) -> &ChainEvents {
+        &self.events
+    }
+
+    /// The tonic service.
+    #[must_use]
+    pub fn into_service(self) -> EventsServiceServer<Self> {
+        EventsServiceServer::new(self)
     }
 }
 
@@ -99,9 +475,67 @@ impl EventsService for EventsServer {
 
     async fn subscribe(
         &self,
-        _request: Request<pb::SubscribeRequest>,
+        request: Request<pb::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        todo!()
+        let request = request.into_inner();
+        self.link
+            .accept_hello_field(request.hello.as_ref())
+            .map_err(|e| e.to_status())?;
+        let kinds = Kinds::of(&self.link, &request.kinds)?;
+        let (_, ours) = stream_hello(&self.link.local()).map_err(|e| e.to_status())?;
+        let mut events = self.events.bus.sender.subscribe();
+        let mut stop = self.stop.clone();
+        let (tx, rx) = mpsc::channel(STREAM_BUFFER);
+        ipc::spawn_in_span(async move {
+            if tx
+                .send(Ok(pb::SubscribeResponse::hello(ours)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let end = loop {
+                let body = tokio::select! {
+                    received = events.recv() => match received {
+                        Ok(body) => body,
+                        Err(RecvError::Lagged(missed)) => break lagged(missed),
+                        Err(RecvError::Closed) => {
+                            break Status::unavailable("cl-chain's event bus is closed");
+                        }
+                    },
+                    () = stopped(stop.as_mut()) => break Status::unavailable("cl-chain is stopping"),
+                    () = tx.closed() => return,
+                };
+                if kinds.has(body.kind)
+                    && tx
+                        .send(Ok(pb::SubscribeResponse::body(body)))
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
+            };
+            let _ = tx.send(Err(end)).await;
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+}
+
+/// The end of a stream `missed` events behind the bus.
+fn lagged(missed: u64) -> Status {
+    tracing::warn!(missed, "an EventsService stream fell behind the bus: ended");
+    Status::resource_exhausted(format!(
+        "the stream fell {missed} events behind; nothing is replayed: subscribe again and resync"
+    ))
+}
+
+/// Resolves once `stop` is true or its sender is gone; never without a stop.
+async fn stopped(stop: Option<&mut watch::Receiver<bool>>) {
+    match stop {
+        Some(stop) => {
+            let _ = stop.wait_for(|stop| *stop).await;
+        }
+        None => std::future::pending().await,
     }
 }
 
@@ -634,5 +1068,92 @@ mod tests {
             ErrorCode::ContractViolation
         );
         assert_eq!(link.metrics().counts().contract_violations, 1);
+    }
+
+    /// The request is the client's only frame, so it carries its hello: one without is a
+    /// contract violation, before the kinds are looked at.
+    #[tokio::test]
+    async fn missing_hello_is_a_contract_violation() {
+        let link = link();
+        let server = EventsServer::new(link.clone(), ChainEvents::new(SLOTS));
+        let request = pb::SubscribeRequest {
+            hello: None,
+            ..request(raw(&ALL))
+        };
+        let refused = call(&server, request).await.err().expect("refused");
+        assert_eq!(
+            ContractError::from_status(&refused).code(),
+            ErrorCode::ContractViolation
+        );
+        assert_eq!(link.metrics().counts().contract_violations, 1);
+    }
+
+    /// A stream that fell further behind than the bus keeps ends with RESOURCE_EXHAUSTED: no
+    /// replay, and no later event after the gap.
+    #[tokio::test]
+    async fn a_lagged_stream_ends() {
+        let events = ChainEvents::with_capacity(SLOTS, 2);
+        let server = EventsServer::new(link(), events.clone());
+        let mut frames = open(&server, &[EventKind::Block]).await;
+        for n in 0..5 {
+            events.block(&fulu_block(n, u64::from(n)));
+        }
+        let end = next(&mut frames).await.expect("an end").unwrap_err();
+        assert_eq!(end.code(), tonic::Code::ResourceExhausted, "{end:?}");
+        assert!(next(&mut frames).await.is_none());
+    }
+
+    /// A stream whose client is gone lets go of the bus without waiting for an event.
+    #[tokio::test]
+    async fn a_gone_client_frees_its_stream() {
+        let (events, server) = bus();
+        let frames = open(&server, &ALL).await;
+        assert_eq!(events.bus.sender.receiver_count(), 1);
+        drop(frames);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while events.bus.sender.receiver_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stream let go of the bus");
+    }
+
+    /// A stopping server ends every stream with UNAVAILABLE, when the stop turns true or its
+    /// sender goes.
+    #[tokio::test]
+    async fn stopping_ends_the_streams() {
+        for drop_sender in [false, true] {
+            let (stop, stopped) = tokio::sync::watch::channel(false);
+            let server = EventsServer::new(link(), ChainEvents::new(SLOTS)).stopping(stopped);
+            let mut frames = open(&server, &ALL).await;
+            if drop_sender {
+                drop(stop);
+            } else {
+                stop.send_replace(true);
+            }
+            let end = next(&mut frames).await.expect("an end").unwrap_err();
+            assert_eq!(end.code(), tonic::Code::Unavailable, "{end:?}");
+        }
+    }
+
+    /// `resume_from_seq` replays nothing: the stream starts at the bus's next event, and the
+    /// client tells the gap from its `seq`.
+    #[tokio::test]
+    async fn resume_from_seq_is_not_replayed() {
+        let (events, server) = bus();
+        events.block(&fulu_block(1, 1));
+        events.block(&fulu_block(2, 2));
+        let resume = pb::SubscribeRequest {
+            resume_from_seq: 1,
+            ..request(raw(&[EventKind::Block]))
+        };
+        let mut frames = call(&server, resume).await.expect("subscribed");
+        assert!(matches!(
+            next(&mut frames).await.unwrap().unwrap().frame,
+            Some(Frame::Hello(_))
+        ));
+        events.block(&fulu_block(3, 3));
+        assert_eq!(body(&mut frames).await.seq, 3);
     }
 }
