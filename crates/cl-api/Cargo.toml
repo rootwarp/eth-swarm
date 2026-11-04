@@ -17,6 +17,9 @@ ethswarm-proto = { path = "../ethswarm-proto" }
 # The `syncing_status` query parameter; already in Cargo.lock (through url).
 form_urlencoded = "1"
 http = "1"
+# The server's connections: auto::Builder, TokioTimer and TowerToHyperService, as
+# svc-runtime's /metrics server. Already in Cargo.lock (through axum and tonic).
+hyper-util = { version = "0.1", features = ["http1", "server", "service", "tokio"] }
 ipc = { path = "../ipc" }
 network-config = { path = "../network-config" }
 serde = { version = "1", features = ["derive"] }
@@ -28,6 +31,8 @@ tonic.workspace = true
 tracing = "0.1"
 
 [dev-dependencies]
+# A streaming body for the server tests; already in Cargo.lock (through axum).
+futures-util = { version = "0.3", default-features = false }
 ipc = { path = "../ipc", features = ["testkit"] }
 tempfile = "3"
 tokio = { version = "1", features = ["io-util"] }

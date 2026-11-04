@@ -185,8 +185,7 @@ mod tests {
 
     use super::*;
     use crate::node_state::NodeState;
-    use crate::server::router;
-    use crate::testing::{self, get, json};
+    use crate::testing::{self, get, json, router};
 
     async fn data(chain: &ChainConfig, uri: &str) -> Value {
         let state = ApiState {
