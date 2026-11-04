@@ -598,7 +598,7 @@ mod tests {
     #[test]
     fn a_range_reads_the_wanted_columns_in_key_order_within_its_budget() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let col = |index| Column { index, ssz: b"xyz" };
         // Two blocks at slot 9 (two roots), one at 10, one at 11 without a wanted column, one
         // at 12; written out of order.
@@ -698,7 +698,7 @@ mod tests {
     fn an_env_without_links_reads_as_contiguous_only_past_its_blocks() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let writer = ColumnWriter::open(dir.path()).unwrap();
+            let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
             writer
                 .write_block_columns(
                     7,
@@ -731,7 +731,7 @@ mod tests {
             .unwrap();
         assert!(read.blocks.iter().all(|b| b.link == BlockLink::Gap));
         drop(reader);
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         assert_eq!(writer.reader().contiguous_from().unwrap(), Some(10));
         assert_eq!(
             writer.reader().link_of(&[2; 32]).unwrap(),
@@ -756,9 +756,9 @@ mod tests {
         assert_eq!(writer.reader().contiguous_from().unwrap(), Some(10));
         // An empty old env claims nothing.
         let empty = tempfile::tempdir().unwrap();
-        crate::writer::make_legacy_for_test(&ColumnWriter::open(empty.path()).unwrap());
+        crate::writer::make_legacy_for_test(&ColumnWriter::open_seeded(empty.path()).unwrap());
         assert_eq!(
-            ColumnWriter::open(empty.path())
+            ColumnWriter::open_seeded(empty.path())
                 .unwrap()
                 .reader()
                 .contiguous_from()
@@ -772,7 +772,7 @@ mod tests {
     #[test]
     fn the_first_pending_target_of_a_range_is_found() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let write = |slot, root: [u8; 32], link| {
             writer
                 .write_block_columns(
@@ -817,7 +817,7 @@ mod tests {
     #[test]
     fn each_snapshot_looks_for_the_links_table() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         writer
             .write_block_columns(
                 7,
@@ -843,7 +843,7 @@ mod tests {
     #[test]
     fn reader_env_is_read_only() {
         let dir = tempfile::tempdir().unwrap();
-        ColumnWriter::open(dir.path())
+        ColumnWriter::open_seeded(dir.path())
             .unwrap()
             .write_columns(
                 1,

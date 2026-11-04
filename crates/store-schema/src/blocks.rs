@@ -131,7 +131,7 @@ mod tests {
                         drop(open);
                     } else {
                         // Raw: blocks with no stamp, which `txn::commit` refuses
-                        // (`Error::StampMissing`). Only the two tables are under test.
+                        // (`Error::CarryBeforeFirstStamp`). Only the two tables are under test.
                         open.into_raw().commit().unwrap();
                         want.append(&mut pending);
                     }
@@ -192,7 +192,7 @@ mod tests {
             let err = put::<E>(&txn, &schedule, bytes).unwrap_err();
             assert!(matches!(err, Error::Block(_)), "{err:?}");
         }
-        // Raw: blocks with no stamp, which `txn::commit` refuses (`Error::StampMissing`).
+        // Raw: blocks with no stamp, which `txn::commit` refuses (`Error::CarryBeforeFirstStamp`).
         txn.into_raw().commit().unwrap();
 
         let (blocks, index) = tables(&writer);

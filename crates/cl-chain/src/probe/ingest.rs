@@ -1394,7 +1394,7 @@ mod tests {
     #[test]
     fn a_block_is_written_in_chunks_of_at_most_sixteen() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let queue = queue(IngestLimits::default());
         let (dropped, metrics) = metrics();
         let mut batch: Vec<_> = (0..20).map(|i| write(&queue, 9, [1; 32], i)).collect();
@@ -1506,7 +1506,7 @@ mod tests {
     #[test]
     fn the_barrier_is_confirmed_after_the_settle_of_the_batch_before_it() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let queue = queue(IngestLimits::default());
         let (dropped, metrics) = metrics();
         let (began, settling) = std::sync::mpsc::channel();
@@ -1545,7 +1545,7 @@ mod tests {
     fn a_prune_lands_after_the_writes_before_it() {
         use super::super::canon::Finality;
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let queue = queue(IngestLimits::default());
         let (dropped, metrics) = metrics();
         let (jobs, received) = mpsc::channel(8);
@@ -1651,7 +1651,7 @@ mod tests {
     #[test]
     fn a_prune_between_writes_leaves_no_partial_root() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let queue = queue(IngestLimits::default());
         let (dropped, metrics) = metrics();
         let sink = PrunesBetweenCalls {
@@ -1671,7 +1671,7 @@ mod tests {
     #[test]
     fn a_refused_write_is_counted_and_gives_its_places_back() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         writer.prune_finalized(20).unwrap();
         let queue = queue(IngestLimits::default());
         let (dropped, metrics) = metrics();
@@ -1727,7 +1727,7 @@ mod tests {
     #[test]
     fn a_write_that_fails_partway_counts_what_it_committed_as_stored() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let queue = queue(IngestLimits::default());
         let (dropped, metrics) = metrics();
         let batch: Vec<_> = (0..20).map(|i| write(&queue, 9, [1; 32], i)).collect();
@@ -1742,7 +1742,7 @@ mod tests {
     #[test]
     fn a_later_batch_cannot_bring_back_a_pruned_root() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let queue = queue(IngestLimits::default());
         let (dropped, metrics) = metrics();
         let first: Vec<_> = (0..4).map(|i| write(&queue, 9, [1; 32], i)).collect();
@@ -2295,7 +2295,7 @@ mod tests {
             use crate::da::custody::{Advertise, Custody};
             use crate::reqresp::{ColumnServer, ColumnStore, ServeBudget};
             use consensus_types::primitives::U256;
-            let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+            let writer = Arc::new(ColumnWriter::open_seeded(dir.path()).unwrap());
             let custody = Custody::open(
                 Arc::clone(&writer),
                 NoEnr,

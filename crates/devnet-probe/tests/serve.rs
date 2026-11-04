@@ -14,6 +14,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use cl_chain::probe::service::fetch_anchor;
 use cl_chain::probe::{BeaconApi, DEFAULT_API_TIMEOUT};
 use cl_chain::verify::client::{KzgOutcome, KzgVerifier};
 use cl_p2p::gossip::{capture_tap, CaptureTap, Captured};
@@ -110,6 +111,14 @@ fn block(slot: u64, parent: [u8; 32]) -> ([u8; 32], Vec<u8>) {
         .message
         .blob_kzg_commitments = vec![[0xc0; 48]].try_into().unwrap();
     (block.message.tree_hash_root().0, block.as_ssz_bytes())
+}
+
+/// Finalizes `epoch` at a block at `slot`, which the reference serves (header and SSZ): the
+/// anchor a new store is stamped with.
+fn finalize_at(reference: &FixtureChain, epoch: u64, slot: u64) {
+    let (root, ssz) = block(slot, [0x55; 32]);
+    reference.with(|s| s.blocks.insert(Root::from(root), ssz));
+    reference.finalize(epoch, Root::from(root), slot);
 }
 
 /// The test chain: an anchor before [`SLOTS`] (its parent unknown) and a block at each of
@@ -300,6 +309,7 @@ async fn custody_columns_from_gossip_are_served_byte_for_byte() {
             kzg: Valid,
             verify_timeout: Duration::from_secs(5),
             cgc_set_slot: NOW_SLOT,
+            anchor: Some(fetch_anchor(&reference_api(&server)).await.unwrap()),
         },
         &mut Registry::default(),
     )
@@ -624,7 +634,7 @@ async fn serve_stores_and_answers_on_a_devnet_of_one() {
 async fn serve_with_nothing_stored_fails() {
     let devnet = devnet();
     let reference = FixtureChain::default();
-    reference.finalize(11, Root::from([7; 32]), 88);
+    finalize_at(&reference, 11, 88);
     let server = reference.serve().await;
     let (_columns_dir, columns_dir) = socket_root();
     let (_root_dir, root) = socket_root();
@@ -669,6 +679,7 @@ async fn serve_with_nothing_stored_fails() {
 async fn serve_needs_a_new_store_it_can_open() {
     let devnet = devnet();
     let reference = FixtureChain::default();
+    finalize_at(&reference, 11, 88);
     let server = reference.serve().await;
     let (_root_dir, root) = socket_root();
     let file = tempfile::NamedTempFile::new_in(&root).unwrap();
@@ -761,7 +772,7 @@ async fn a_clip_that_fails_after_the_start_removes_the_new_store() {
     assert_eq!(epoch, 14);
     let started = change - (serve::AFTER_SERVING + Duration::from_secs(6)).as_millis();
     let reference = FixtureChain::default();
-    reference.finalize(12, Root::from([7; 32]), 96);
+    finalize_at(&reference, 12, 96);
     let server = reference.serve().await;
     let (_dir, dir) = socket_root();
     let (_root_dir, root) = socket_root();

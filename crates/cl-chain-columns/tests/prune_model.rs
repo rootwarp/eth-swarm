@@ -148,7 +148,7 @@ proptest! {
     #[test]
     fn store_matches_model_after_every_step(ops in prop::collection::vec(op(), 1..25)) {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let mut model = Model::default();
         for (step, op) in ops.iter().enumerate() {
             apply(&writer, &mut model, step, op);

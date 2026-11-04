@@ -20,6 +20,7 @@ use p2p_wire::rpc::messages::{
     DataColumnsByRangeV1Request, DataColumnsByRootIdentifier, DataColumnsByRootV1Request,
 };
 use p2p_wire::rpc::protocols::ResultCode;
+use ssz::Encode as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use std::time::Duration;
 use svc_runtime::notify::Notifier;
 use svc_runtime::{Config, Hooks};
 use tokio::sync::{mpsc, oneshot};
+use tree_hash::TreeHash as _;
 
 /// Passes every cell.
 struct Valid;
@@ -79,9 +81,12 @@ fn config_text(root: &Path, reference: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cl_p2p_reads_status_and_columns_from_the_chain_service() {
-    // The reference: finalized at epoch 10, block slot 80.
+    // The reference: finalized at epoch 10, block slot 80, the anchor of the new store.
     let reference = FixtureChain::default();
-    reference.finalize(10, [0x11; 32].into(), 80);
+    let anchor = p2p_wire::testkit::gloas_block::<Minimal>(80);
+    let anchor_root = anchor.message.tree_hash_root();
+    reference.with(|s| s.blocks.insert(anchor_root, anchor.as_ssz_bytes()));
+    reference.finalize(10, anchor_root, 80);
     let api = reference.serve().await;
 
     let dir = tempfile::Builder::new()
@@ -129,7 +134,7 @@ async fn cl_p2p_reads_status_and_columns_from_the_chain_service() {
     // the slot the store serves from: the slot custody was set at, nothing being stored yet.
     let status = ChainStatus::new(channel.clone()).status().await.unwrap();
     assert_eq!(status.finalized_epoch, 10);
-    assert_eq!(status.finalized_root.0, [0x11; 32]);
+    assert_eq!(status.finalized_root, anchor_root);
     assert_eq!(status.head_slot, 80);
     let epoch = net.epoch_at(system_ms()).unwrap();
     assert_eq!(status.fork_digest, net.digest_at(epoch).unwrap());

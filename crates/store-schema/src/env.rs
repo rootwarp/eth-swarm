@@ -185,18 +185,25 @@ pub fn open_writer(path: &Path, opts: WriterOptions) -> Result<WriterEnv> {
 ///
 /// Takes the writer guard, opens the env read-write and checks that the requested map size is
 /// in effect. Then, in one write transaction: checks the schema version ([`version`]) and that
-/// every named table is one of [`TABLES`], creates every missing table, fills `block_index`
-/// from `blocks` if this open created it, runs `upgrade` with the names of the tables this
-/// open created, writes the version row if the env was not at
+/// every named table is one of [`TABLES`], creates every missing table, counts every table's
+/// rows, fills `block_index` from `blocks` if this open created it, runs `upgrade` with the
+/// names of the tables this open created, writes the version row if the env was not at
 /// [`SCHEMA_VERSION`](version::SCHEMA_VERSION), and commits through `txn::commit_open` (this
 /// is its one caller). A stored stamp is carried, as [`Update::Carry`](txn::Update::Carry)
-/// carries it. With no stamp yet no stamp row is written, and the open is refused
-/// ([`Error::StampMissing`]) if `blocks` or `block_index` holds a row: a store written raw, or
-/// a v1 store with blocks and no stamp. An error anywhere aborts the transaction, so a refused
-/// or failed open writes nothing.
+/// carries it. With no stamp yet (none stored when the transaction began, or none at its
+/// commit) no stamp row is written, and the open is refused ([`Error::StampMissing`]) if
+/// `blocks` or `block_index` holds a row (a store written raw, or a v1 store with blocks and
+/// no stamp), or if the open added a row to any table, `upgrade` included: a table with more
+/// rows than when they were counted, or a `meta` key that was not there then, but for the
+/// version row and cl-chain-columns' [`CONTIGUOUS_FROM_KEY`](crate::keys::CONTIGUOUS_FROM_KEY).
+/// An unstamped store with rows and no block still opens, and `upgrade` may rewrite or delete
+/// its rows. An error anywhere aborts the transaction, so a refused or failed open writes
+/// nothing.
 ///
 /// `upgrade` is where a crate that owns some tables migrates their data in the same transaction
-/// that creates the tables (cl-chain-columns' links migration).
+/// that creates the tables (cl-chain-columns' links migration). Before the first stamp it
+/// adds no row: the store's first rows come with its first stamp
+/// ([`Update::New`](txn::Update::New)).
 ///
 /// Blocking: an `EAGAIN` on the guard or the env is retried for about a second
 /// ([`WRITER_LOCK_ATTEMPTS`] tries, [`WRITER_LOCK_RETRY_INTERVAL`] apart), sleeping the calling
@@ -231,6 +238,7 @@ where
             Err(e) => return Err(Error::from(e).into()),
         }
     }
+    let before = txn::open_rows(&txn)?;
     if created.contains(&BLOCK_INDEX) {
         blocks::fill_index(&txn)?;
     }
@@ -238,7 +246,7 @@ where
     if upgrade_version {
         version::write(txn.raw())?;
     }
-    txn::commit_open(txn)?;
+    txn::commit_open(txn, &before)?;
     Ok(WriterEnv { env, _guard: guard })
 }
 

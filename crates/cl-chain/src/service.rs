@@ -51,14 +51,14 @@
 //! | 1 ([`EXIT_FAILED`]) | a start that a restart cannot fix: the store, the socket's bind, an ACL of unserved methods, a cl-verify directory open to others (or still of another user at the end of the wait), a cl-verify server of another user | no |
 //! | 2 ([`EXIT_CONFIG`]) | the config was refused, or the store holds the custody of another `node_id` (or of an unrecorded one) | no |
 //! | 64 ([`EXIT_USAGE`]) | a command-line argument: the unit passes none | no |
-//! | 69 ([`EXIT_UNAVAILABLE`]) | cl-verify's directory or socket is not there within `verify_wait_ms`, or the clock is before genesis | yes |
+//! | 69 ([`EXIT_UNAVAILABLE`]) | cl-verify's directory or socket is not there within `verify_wait_ms`, the clock is before genesis, or a new store and no anchor from the reference to stamp it with | yes |
 //! | 70 ([`EXIT_SOFTWARE`]) | a fault of the run that a restart can fix: the server task, a drain past its deadline, `/metrics`, the service manager, a store that does not close within 10 s | yes |
 //! | 71 | the log writer could not start (`svc_runtime::telemetry::EXIT_NO_LOG_WRITER`) | yes |
 
 use crate::probe::service::{
-    chain_acl, chain_link, connect_verify, error_chain, open_store_dir, system_ms, verify_client,
-    verify_dir_state, ProbeNetwork, ProbePlan, ProbeService, VerifyDirError, CHAIN_METHODS,
-    CHAIN_SERVICE, DEFAULT_VERIFY_TIMEOUT, P2P_CALLER, VERIFY_SOCKET_WAIT,
+    chain_acl, chain_link, connect_verify, error_chain, fetch_anchor, open_store_dir, system_ms,
+    verify_client, verify_dir_state, ProbeNetwork, ProbePlan, ProbeService, VerifyDirError,
+    CHAIN_METHODS, CHAIN_SERVICE, DEFAULT_VERIFY_TIMEOUT, P2P_CALLER, VERIFY_SOCKET_WAIT,
 };
 use crate::probe::BeaconApi;
 use crate::verify::client::KzgVerifier;
@@ -280,7 +280,8 @@ fn node_id(text: &str) -> Result<U256, &'static str> {
 /// Why [`serve`] stopped other than cleanly.
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
-    /// cl-verify did not accept, or the clock is before genesis: a restart can fix it.
+    /// cl-verify did not accept, the clock is before genesis, or a new store has no anchor:
+    /// a restart can fix it.
     #[error("{0}")]
     Unavailable(String),
     /// The config does not fit the host: the store is another node ID's.
@@ -407,8 +408,8 @@ async fn wait_for_verify_dir(
 ///
 /// # Errors
 ///
-/// The clock is before genesis ([`ServeError::Unavailable`]), the store does not open, or the
-/// runtime stopped on an error.
+/// The clock is before genesis or a new store has no anchor ([`ServeError::Unavailable`]), the
+/// store does not open, or the runtime stopped on an error.
 pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
     config: Config,
     settings: &ChainSettings,
@@ -422,6 +423,15 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
         .slot_at(now)
         .ok_or_else(|| ServeError::Unavailable("the clock is before genesis".into()))?;
     open_store_dir(&settings.columns_dir, config.ownership.uid).map_err(ServeError::Failed)?;
+    // A new store is stamped from the reference's finalized block. A store stamped before
+    // needs none, so a reference that does not answer now fails only a first start.
+    let anchor = match fetch_anchor(&settings.reference).await {
+        Ok(anchor) => Some(anchor),
+        Err(e) => {
+            tracing::warn!(error = %e, "no anchor from the reference");
+            None
+        }
+    };
     let plan = ProbePlan {
         link,
         node_id: settings.node_id,
@@ -430,6 +440,7 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
         kzg,
         verify_timeout: settings.verify_timeout,
         cgc_set_slot,
+        anchor,
     };
     let service =
         ProbeService::<E, V>::open(net, plan, &mut hooks.unprefixed).map_err(|e| match e {
@@ -437,6 +448,7 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
             | crate::probe::service::OpenError::NodeIdUnknown { .. } => {
                 ServeError::Config(e.to_string())
             }
+            crate::probe::service::OpenError::NoAnchor => ServeError::Unavailable(e.to_string()),
             crate::probe::service::OpenError::Failed(why) => ServeError::Failed(why),
         })?;
     tracing::info!(

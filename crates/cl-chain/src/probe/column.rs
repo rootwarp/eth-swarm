@@ -405,7 +405,7 @@ mod tests {
         let (block, _, root) = gloas_block(9, &[]);
         refs.seed(&block);
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let custody = Custody::open(writer, NoEnr, U256::MAX, Advertise::Withheld, 0).unwrap();
         assert!(custody.custody_columns().contains(&CUSTODY_COLUMN));
         let contract = ColumnContract {

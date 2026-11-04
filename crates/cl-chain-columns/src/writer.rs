@@ -9,7 +9,10 @@ use std::{
 };
 
 use libmdbx::WriteFlags;
-use store_schema::txn::{ReadTxn, RwTxn, Update};
+use store_schema::{
+    stamp::Stamp,
+    txn::{ReadTxn, RwTxn, Update},
+};
 
 use crate::{
     env::{self, WriterOptions},
@@ -280,17 +283,77 @@ impl ColumnWriter {
         Ok(())
     }
 
+    /// [`Self::open`], then [`Self::seed_stamp`]: a store as cl-chain leaves it once it has
+    /// stamped it, for tests that write columns or custody. Test seam only (`test-hooks`).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn open_seeded(path: impl AsRef<Path>) -> Result<Self> {
+        let writer = Self::open(path)?;
+        writer.seed_stamp()?;
+        Ok(writer)
+    }
+
+    /// The env's first stamp, for a test, if it has none: a `blocks` row of opaque bytes (the
+    /// stamp checks only that it is stored) and its `block_index` row at slot 0, named head and
+    /// finalized at event 1, committed with `Update::New`, as cl-chain stamps a new store
+    /// before its first write. Not counted in [`Self::rw_txns_committed`] and takes no
+    /// scheduler permit: call it before any other write. Test seam only (`test-hooks`).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn seed_stamp(&self) -> Result<()> {
+        const ROOT: BlockRoot = [0x5e; 32];
+        let txn = self.reader.db.begin_rw_txn()?;
+        if store_schema::stamp::read(&txn)?.is_some() {
+            return Ok(());
+        }
+        let blocks = txn.open_table(Some(store_schema::tables::BLOCKS))?;
+        let key = store_schema::keys::slot_root_key(0, &ROOT);
+        txn.put(&blocks, key, b"seed block", WriteFlags::UPSERT)?;
+        let index = txn.open_table(Some(store_schema::tables::BLOCK_INDEX))?;
+        txn.put(&index, ROOT, 0u64.to_be_bytes(), WriteFlags::UPSERT)?;
+        let stamp = Stamp {
+            head_seq: 1,
+            head_root: ROOT,
+            head_slot: 0,
+            finalized_root: ROOT,
+            finalized_slot: 0,
+        };
+        store_schema::txn::commit(txn, Update::New(stamp))?;
+        Ok(())
+    }
+
     /// Write transactions this handle has committed since [`ColumnWriter::open`] returned.
     #[must_use]
     pub fn rw_txns_committed(&self) -> u64 {
         self.rw_txns.load(Ordering::Relaxed)
     }
 
-    /// Of [`Self::rw_txns_committed`], those that committed a stamp row: every one once the env
-    /// has a stamp ([`store_schema::stamp`]), none before.
+    /// Of [`Self::rw_txns_committed`], those that committed a stamp row ([`store_schema::stamp`]):
+    /// every one, since none commits before the env's first stamp.
     #[must_use]
     pub fn stamped_txns_committed(&self) -> u64 {
         self.stamped_txns.load(Ordering::Relaxed)
+    }
+
+    /// The env's stamp: the one stored, or else its first, written in one import-priority write
+    /// transaction. `body` puts the blocks the stamp names and returns it; it commits with
+    /// `Update::New`. Before the first stamp no other write commits (no `Carry` with nothing to
+    /// carry), so a new store is stamped this way first. With a stamp stored, `body` is not run
+    /// and nothing is written. An error from `body` or the commit writes nothing.
+    pub fn stamp_first<E: From<Error>>(
+        &self,
+        body: impl FnOnce(&RwTxn<'_>) -> std::result::Result<Stamp, E>,
+    ) -> std::result::Result<Stamp, E> {
+        let _permit = self.sched.acquire(Priority::Import);
+        let txn = self.reader.db.begin_rw_txn()?;
+        if let Some(stamp) = store_schema::stamp::read(&txn).map_err(Error::from)? {
+            return Ok(stamp);
+        }
+        let stamp = body(&txn)?;
+        store_schema::txn::commit(txn, Update::New(stamp)).map_err(Error::from)?;
+        self.rw_txns.fetch_add(1, Ordering::Relaxed);
+        self.stamped_txns.fetch_add(1, Ordering::Relaxed);
+        Ok(stamp)
     }
 
     /// Stores verified, unfinalized columns of one block, at most [`MAX_COLUMNS_PER_TXN`] per
@@ -1118,7 +1181,7 @@ mod tests {
     #[test]
     fn env_opens_with_max_tables() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let env = writer.reader.db.raw().ptr().0;
 
         let mut flags = 0;
@@ -1148,7 +1211,7 @@ mod tests {
     fn the_column_env_is_the_store_schema_env() {
         use store_schema::{keys::SCHEMA_VERSION_KEY, version::SCHEMA_VERSION};
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         {
             let txn = writer.reader.db.raw().begin_rw_txn().unwrap();
             for table in store_schema::tables::TABLES {
@@ -1174,7 +1237,7 @@ mod tests {
             matches!(err, Error::Schema(store_schema::Error::SchemaVersion { found, supported })
                 if *found == SCHEMA_VERSION + 1 && *supported == SCHEMA_VERSION)
         };
-        let err = ColumnWriter::open(dir.path()).unwrap_err();
+        let err = ColumnWriter::open_seeded(dir.path()).unwrap_err();
         assert!(newer(&err), "{err:?}");
         let err = ColumnReader::open(dir.path()).unwrap_err();
         assert!(newer(&err), "{err:?}");
@@ -1233,7 +1296,7 @@ mod tests {
     #[test]
     fn a_block_keeps_its_link_and_a_gap_raises_the_contiguous_slot() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let reader = writer.reader();
         assert_eq!(reader.contiguous_from().unwrap(), None);
         write_linked(&writer, 10, &ROOT_A, BlockLink::Start);
@@ -1273,7 +1336,7 @@ mod tests {
     #[test]
     fn a_pending_link_resolves_when_its_target_is_written_or_settles_as_a_gap() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let reader = writer.reader();
         write_linked(&writer, 12, &ROOT_B, BlockLink::Pending(ROOT_A, 10));
         assert_eq!(
@@ -1298,7 +1361,7 @@ mod tests {
         assert_eq!(reader.contiguous_from().unwrap(), None);
         // The pending index survives a reopen.
         drop(writer);
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         assert_eq!(writer.settle_pending(21).unwrap(), 1);
         assert_eq!(
             writer.reader().link_of(&[0xdd; 32]).unwrap(),
@@ -1318,7 +1381,7 @@ mod tests {
     #[test]
     fn a_pending_target_finality_covers_is_a_start_not_a_gap() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let reader = writer.reader();
         // The target was stored when the link was found, and pruned before the write.
         writer.prune_finalized(10).unwrap();
@@ -1341,7 +1404,7 @@ mod tests {
     #[test]
     fn a_gap_never_replaces_a_pending_link() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let reader = writer.reader();
         write_linked(&writer, 12, &ROOT_B, BlockLink::Pending(ROOT_A, 11));
         write_linked(&writer, 12, &ROOT_B, BlockLink::Gap);
@@ -1363,7 +1426,7 @@ mod tests {
     #[test]
     fn relinking_a_pending_block_forgets_its_old_target() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         write_linked(&writer, 12, &ROOT_B, BlockLink::Pending(ROOT_A, 11));
         write_linked(&writer, 12, &ROOT_B, BlockLink::Pending([0x77; 32], 10));
         {
@@ -1397,7 +1460,7 @@ mod tests {
             value
         };
         {
-            let writer = ColumnWriter::open(dir.path()).unwrap();
+            let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
             write_linked(&writer, 10, &ROOT_A, BlockLink::Start);
             write_linked(&writer, 12, &ROOT_B, BlockLink::Start);
             write_linked(&writer, 14, &[0xcc; 32], BlockLink::Start);
@@ -1409,7 +1472,7 @@ mod tests {
             assert_eq!(reader.link_of(&[0xcc; 32]).unwrap(), Some(BlockLink::Gap));
             assert_eq!(reader.contiguous_from().unwrap(), None, "not migrated yet");
         }
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let reader = writer.reader();
         assert_eq!(
             reader.link_of(&ROOT_B).unwrap(),
@@ -1423,7 +1486,7 @@ mod tests {
             assert_eq!(migrate_legacy_pending(&txn).unwrap(), 0, "nothing left");
         }
         drop(writer);
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         assert_eq!(
             writer.reader().link_of(&ROOT_B).unwrap(),
             Some(BlockLink::Parent(ROOT_A))
@@ -1432,7 +1495,7 @@ mod tests {
         // A link of today's schema is never taken for an old one.
         write_linked(&writer, 16, &[0xdd; 32], BlockLink::Pending([0x98; 32], 15));
         drop(writer);
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         assert_eq!(
             writer.reader().link_of(&[0xdd; 32]).unwrap(),
             Some(BlockLink::Pending([0x98; 32], 15))
@@ -1443,7 +1506,7 @@ mod tests {
     #[test]
     fn pruning_removes_the_links_of_the_blocks_it_removes() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         write_linked(&writer, 10, &ROOT_A, BlockLink::Start);
         write_linked(&writer, 12, &ROOT_B, BlockLink::Parent(ROOT_A));
         writer.prune_orphaned(&[ROOT_B]).unwrap();
@@ -1455,7 +1518,7 @@ mod tests {
     #[test]
     fn written_columns_read_back_by_root() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         write_block(&writer, 5, &ROOT_A, &[9, 0, 127]);
 
         let reader = writer.reader();
@@ -1479,7 +1542,7 @@ mod tests {
     #[test]
     fn rewriting_a_column_replaces_it() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         write_block(&writer, 5, &ROOT_A, &[3]);
         writer
             .write_columns(
@@ -1501,7 +1564,7 @@ mod tests {
     #[test]
     fn invalid_columns_are_rejected_before_any_write() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let mut columns: Vec<Column<'_>> =
             (0..20).map(|index| Column { index, ssz: b"x" }).collect();
         columns.push(Column {
@@ -1526,7 +1589,7 @@ mod tests {
     #[test]
     fn a_block_root_cannot_move_to_another_slot() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         write_block(&writer, 5, &ROOT_A, &[0]);
         assert!(matches!(
             writer.write_columns(
@@ -1582,7 +1645,7 @@ mod tests {
     #[test]
     fn a_write_refused_before_its_first_chunk_reports_nothing_committed() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         writer.prune_finalized(20).unwrap();
         let ssz = sidecar(9, 1);
         let column = Column {
@@ -1601,7 +1664,7 @@ mod tests {
     #[test]
     fn empty_write_opens_no_transaction() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let report = writer.write_columns(1, &ROOT_A, &[]).unwrap();
         assert_eq!(report, WriteReport::default());
         assert_eq!(writer.rw_txns_committed(), 0);
@@ -1638,8 +1701,9 @@ mod tests {
     }
 
     /// C2: every column write txn commits through `store_schema::txn::commit` with
-    /// `Update::Carry`: one stamp row, unchanged, in each chunk txn and each other write txn,
-    /// none before the first stamp, and a stamp that does not validate fails the commit.
+    /// `Update::Carry`: one stamp row, unchanged, in each chunk txn and each other write txn;
+    /// before the first stamp none commits (nothing to carry), and a stamp that does not
+    /// validate fails the commit.
     #[test]
     fn every_chunk_txn_carries_the_stamp() {
         let dir = tempfile::tempdir().unwrap();
@@ -1647,15 +1711,33 @@ mod tests {
         let all: Vec<u64> = (0..NUMBER_OF_COLUMNS).collect();
         let root_c: BlockRoot = [0xcc; 32];
 
-        // Before any block: nothing to carry (open question 1). The chunks commit alone.
-        write_block(&writer, 3, &ROOT_A, &all);
-        assert_eq!(writer.rw_txns_committed(), 8);
-        assert_eq!(writer.stamped_txns_committed(), 0);
+        // Before the first stamp: the first chunk txn is refused, and so is any other write
+        // txn. Nothing is stored.
+        let unstamped: Vec<Column<'_>> = all
+            .iter()
+            .map(|&index| Column { index, ssz: b"x" })
+            .collect();
+        for err in [
+            writer.write_columns(3, &ROOT_A, &unstamped).unwrap_err(),
+            writer.set_cgc(4).unwrap_err(),
+        ] {
+            assert!(
+                matches!(
+                    err,
+                    Error::Schema(store_schema::Error::CarryBeforeFirstStamp)
+                ),
+                "{err:?}"
+            );
+        }
+        assert_eq!(writer.rw_txns_committed(), 0);
+        assert_eq!(writer.reader().columns_for_root(&ROOT_A).unwrap(), vec![]);
+        assert_eq!(writer.reader().cgc().unwrap(), None);
         assert_eq!(stamp_row(&writer), None);
 
         let stamp = stamp_block(&writer, 6, &[0xee; 32]);
         let row = stamp_row(&writer).unwrap();
         assert_eq!(row, stamp.encode());
+        write_block(&writer, 3, &ROOT_A, &all);
         let (txns, stamped) = (writer.rw_txns_committed(), writer.stamped_txns_committed());
         write_block(&writer, 7, &ROOT_B, &all);
         assert_eq!(writer.rw_txns_committed() - txns, 8);
@@ -1705,7 +1787,7 @@ mod tests {
     #[test]
     fn column_index_out_of_range_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         stamp_block(&writer, 6, &[0xee; 32]);
         let row = stamp_row(&writer);
         for bad in [NUMBER_OF_COLUMNS, NUMBER_OF_COLUMNS + 1, u64::MAX] {
@@ -1732,7 +1814,7 @@ mod tests {
     #[test]
     fn chunks_le_16() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let all: Vec<u64> = (0..NUMBER_OF_COLUMNS).collect();
         stamp_block(&writer, 6, &[0xee; 32]);
 
@@ -1774,7 +1856,7 @@ mod tests {
     #[test]
     fn finality_prunes_every_column_at_or_below_the_finalized_slot() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let root_c: BlockRoot = [0xcc; 32];
         let root_d: BlockRoot = [0xdd; 32];
         write_block(&writer, 3, &ROOT_A, &[0, 1]);
@@ -1808,7 +1890,7 @@ mod tests {
     #[test]
     fn finalize_removes_only_the_blocks_off_the_finalized_chain() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let reader = writer.reader();
         let (root_c, root_d) = ([0xcc; 32], [0xdd; 32]);
         write_start(&writer, 3, &ROOT_A, &[0, 1]);
@@ -1857,7 +1939,7 @@ mod tests {
     #[test]
     fn finalize_keeps_the_stored_chain_below_the_blocks_it_was_given() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let reader = writer.reader();
         let root = |n: u8| [n; 32];
         write_linked(&writer, 3, &root(3), BlockLink::Start);
@@ -1902,7 +1984,7 @@ mod tests {
     #[test]
     fn finalize_places_every_block_from_the_callers_first_slot() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let reader = writer.reader();
         let root = |n: u8| [n; 32];
         write_linked(&writer, 3, &root(3), BlockLink::Start);
@@ -1943,7 +2025,7 @@ mod tests {
         let root = |n: u8| [n; 32];
         let open = || {
             let dir = tempfile::tempdir().unwrap();
-            let writer = ColumnWriter::open(dir.path()).unwrap();
+            let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
             (dir, writer)
         };
         // Pending: below the waiting block nothing is placed; the orphan stays, unclaimed.
@@ -1987,7 +2069,7 @@ mod tests {
     #[test]
     fn prune_before_removes_the_slots_out_of_retention() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let reader = writer.reader();
         write_block(&writer, 3, &ROOT_A, &[0, 1]);
         write_block(&writer, 4, &ROOT_B, &[5]);
@@ -2023,7 +2105,7 @@ mod tests {
     #[test]
     fn a_pending_target_kept_by_finality_but_never_stored_is_a_gap() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let reader = writer.reader();
         writer.finalize(10, &HashSet::new(), 11).unwrap();
         write_linked(&writer, 12, &ROOT_B, BlockLink::Pending(ROOT_A, 10));
@@ -2041,7 +2123,7 @@ mod tests {
     #[test]
     fn an_env_finalized_before_retention_was_recorded_keeps_from_the_slot_after() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let reader = writer.reader();
         {
             let txn = writer.reader.db.begin_rw_txn().unwrap();
@@ -2058,7 +2140,7 @@ mod tests {
     fn the_first_stored_slot_is_the_lowest_slot_ever_written() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let writer = ColumnWriter::open(dir.path()).unwrap();
+            let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
             assert_eq!(writer.reader().first_stored_slot().unwrap(), None);
             // An empty write stores nothing, so it sets nothing.
             writer.write_columns(30, &ROOT_A, &[]).unwrap();
@@ -2089,14 +2171,14 @@ mod tests {
             assert_eq!(writer.reader().column_count().unwrap(), 0);
             assert_eq!(writer.reader().first_stored_slot().unwrap(), Some(18));
         }
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         assert_eq!(writer.reader().first_stored_slot().unwrap(), Some(18));
     }
 
     #[test]
     fn finality_prune_with_nothing_to_remove_only_advances_the_watermark() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         write_block(&writer, 10, &ROOT_A, &[0]);
 
         let before = writer.rw_txns_committed();
@@ -2116,7 +2198,7 @@ mod tests {
     fn a_late_write_cannot_undo_a_finality_prune() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let writer = ColumnWriter::open(dir.path()).unwrap();
+            let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
             assert_eq!(writer.reader().finalized_slot().unwrap(), None);
             write_block(&writer, 5, &ROOT_A, &[0]);
             writer.prune_finalized(5).unwrap();
@@ -2134,7 +2216,7 @@ mod tests {
             assert_eq!(writer.rw_txns_committed(), before);
             assert_eq!(writer.reader().column_count().unwrap(), 0);
         }
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         assert_eq!(writer.reader().finalized_slot().unwrap(), Some(5));
         assert!(writer
             .write_columns(
@@ -2153,7 +2235,7 @@ mod tests {
     #[test]
     fn batches_with_too_many_or_duplicate_columns_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let mut columns: Vec<Column<'_>> = (0..NUMBER_OF_COLUMNS)
             .map(|index| Column { index, ssz: b"x" })
             .collect();
@@ -2186,7 +2268,7 @@ mod tests {
         assert!(gloas(4190) > MAX_SIDECAR_BYTES);
 
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let largest = vec![1u8; MAX_SIDECAR_BYTES];
         let too_large = vec![1u8; MAX_SIDECAR_BYTES + 1];
         assert!(matches!(
@@ -2216,6 +2298,7 @@ mod tests {
             max_size: MIN_MAX_SIZE,
         };
         let writer = ColumnWriter::open_with(dir.path(), options).unwrap();
+        writer.seed_stamp().unwrap();
         // Two 16-column chunks of the largest sidecar need ~281 MB; the map holds 256 MiB.
         let ssz = vec![9u8; MAX_SIDECAR_BYTES];
         let columns: Vec<Column<'_>> = (0..32).map(|index| Column { index, ssz: &ssz }).collect();
@@ -2279,7 +2362,7 @@ mod tests {
     #[test]
     fn a_corrupt_cgc_value_is_reported_not_decoded() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         writer
             .write_txn(Priority::Import, |txn| {
                 let meta = txn.open_table(Some(META_TABLE))?;
@@ -2296,7 +2379,7 @@ mod tests {
     #[test]
     fn finality_prune_deletes_whole_blocks_in_bounded_transactions() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         let all: Vec<u64> = (0..NUMBER_OF_COLUMNS).collect();
         for slot in 1..=3u64 {
             write_block(&writer, slot, &[slot as u8; 32], &all);
@@ -2323,7 +2406,7 @@ mod tests {
     #[test]
     fn a_write_cannot_bring_back_an_orphaned_root() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         write_block(&writer, 5, &ROOT_A, &[0, 1]);
         writer.prune_orphaned(&[ROOT_A]).unwrap();
         // Columns of the orphan that were still in flight when it was pruned.
@@ -2353,7 +2436,7 @@ mod tests {
     #[test]
     fn a_slotless_tombstone_whose_late_write_is_finalized_is_forgotten() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         writer.prune_orphaned(&[ROOT_B]).unwrap();
         writer.prune_finalized(10).unwrap();
         assert!(lock(&writer.column_ops).contains(&ROOT_B), "no slot: kept");
@@ -2374,7 +2457,7 @@ mod tests {
     #[test]
     fn a_tombstone_learns_its_slot_from_a_refused_write() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         // Pruned before any column of it was stored: no slot yet.
         writer.prune_orphaned(&[ROOT_B]).unwrap();
         assert_eq!(lock(&writer.column_ops).slots.get(&ROOT_B), Some(&None));
@@ -2429,7 +2512,7 @@ mod tests {
     #[test]
     fn prune_orphaned_skips_unknown_roots() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         write_block(&writer, 1, &ROOT_A, &[0]);
         let before = writer.rw_txns_committed();
         assert_eq!(
@@ -2444,7 +2527,7 @@ mod tests {
     fn cgc_round_trips_and_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let writer = ColumnWriter::open(dir.path()).unwrap();
+            let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
             assert_eq!(writer.reader().cgc().unwrap(), None);
             writer.set_cgc(4).unwrap();
             writer.set_cgc(NUMBER_OF_CUSTODY_GROUPS).unwrap();
@@ -2454,7 +2537,7 @@ mod tests {
             ));
             write_block(&writer, 1, &ROOT_A, &[2]);
         }
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         assert_eq!(
             writer.reader().cgc().unwrap(),
             Some(NUMBER_OF_CUSTODY_GROUPS)
@@ -2478,7 +2561,7 @@ mod tests {
     fn the_custody_record_round_trips_and_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let writer = ColumnWriter::open(dir.path()).unwrap();
+            let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
             assert_eq!(writer.reader().custody().unwrap(), None);
             let before = writer.rw_txns_committed();
             writer.set_custody(&custody(4, 10, 1)).unwrap();
@@ -2487,7 +2570,7 @@ mod tests {
             assert_eq!(writer.rw_txns_committed() - before, 2);
             assert_eq!(writer.reader().custody().unwrap(), Some(custody(8, 20, 2)));
         }
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         assert_eq!(writer.reader().custody().unwrap(), Some(custody(8, 20, 2)));
         assert_eq!(writer.reader().cgc().unwrap(), Some(8));
     }
@@ -2495,7 +2578,7 @@ mod tests {
     #[test]
     fn a_lower_cgc_is_refused_and_the_stored_record_stays() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         writer.set_custody(&custody(4, 10, 1)).unwrap();
         let before = writer.rw_txns_committed();
         assert!(matches!(
@@ -2522,7 +2605,7 @@ mod tests {
     #[test]
     fn custody_counts_past_the_group_count_are_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         assert!(matches!(
             writer.set_custody(&custody(NUMBER_OF_CUSTODY_GROUPS + 1, 0, 0)),
             Err(Error::CgcOutOfRange(129))
@@ -2540,7 +2623,7 @@ mod tests {
     #[test]
     fn a_cgc_without_the_rest_of_the_record_reads_as_zeros() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ColumnWriter::open(dir.path()).unwrap();
+        let writer = ColumnWriter::open_seeded(dir.path()).unwrap();
         writer.set_cgc(4).unwrap();
         assert_eq!(
             writer.reader().custody().unwrap(),
@@ -2556,7 +2639,7 @@ mod tests {
     #[test]
     fn import_goes_ahead_of_a_queued_column_chunk() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = std::sync::Arc::new(ColumnWriter::open(dir.path()).unwrap());
+        let writer = std::sync::Arc::new(ColumnWriter::open_seeded(dir.path()).unwrap());
         let held = writer.sched.acquire(Priority::Background);
 
         let columns = {
@@ -2599,7 +2682,7 @@ mod tests {
     #[ignore = "wall-clock; run with --ignored"]
     fn priority_write_never_waits_out_a_busy_retry() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = std::sync::Arc::new(ColumnWriter::open(dir.path()).unwrap());
+        let writer = std::sync::Arc::new(ColumnWriter::open_seeded(dir.path()).unwrap());
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let background = {
             let (writer, done) = (writer.clone(), done.clone());

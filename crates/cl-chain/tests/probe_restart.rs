@@ -167,7 +167,7 @@ mod probe {
         /// The column store on the env at `path`, its custody opened at `slot` (kept from the
         /// env if it has one), and a reference that knows the blocks at `slots`.
         fn open(path: &Path, slot: u64, slots: &[u64]) -> (Ingest, Arc<ColumnWriter>) {
-            let writer = Arc::new(ColumnWriter::open(path).unwrap());
+            let writer = Arc::new(ColumnWriter::open_seeded(path).unwrap());
             let custody =
                 Custody::open(Arc::clone(&writer), NoEnr, NODE, Advertise::Withheld, slot).unwrap();
             let mut registry = Registry::default();

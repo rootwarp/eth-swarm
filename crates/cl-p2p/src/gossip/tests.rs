@@ -1745,7 +1745,7 @@ mod custody_columns {
                 .collect(),
         );
         let dir = tempfile::tempdir().unwrap();
-        let writer = Arc::new(ColumnWriter::open(dir.path()).unwrap());
+        let writer = Arc::new(ColumnWriter::open_seeded(dir.path()).unwrap());
         let custody = Custody::open(
             Arc::clone(&writer),
             NoEnr,
