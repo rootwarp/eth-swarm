@@ -116,7 +116,7 @@ check pass "no ENV_DIR: fills its own env and checks it" "No error is detected" 
 
 # build-mdbx-chk.sh's pins, with a stub cargo printing canned metadata.
 mkdir -p "$tmp/stub" "$tmp/fake/libmdbx"
-for f in mdbx_chk.c mdbx.c mdbx.h; do : > "$tmp/fake/libmdbx/$f"; done
+for f in mdbx_chk.c mdbx_stat.c mdbx.c mdbx.h; do : > "$tmp/fake/libmdbx/$f"; done
 echo 0.12.14.0 > "$tmp/fake/libmdbx/VERSION.txt"
 stub() {
   printf '#!/bin/sh\necho %s\n' "'$1'" > "$tmp/stub/cargo"

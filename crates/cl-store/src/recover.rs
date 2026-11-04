@@ -1,70 +1,194 @@
 //! Crash-recovery reopen: the store env as cl-store holds it, reopened read-only when it cannot
 //! be read.
+//!
+//! [`Recovering`] holds the open [`Reader`], if there is one. A read takes it
+//! ([`Recovering::reader`]) under a lock held only to copy or swap that handle, never across an
+//! open or a read, so no read waits on a reopen, on another read, or on the follower (which
+//! only sets a flag, [`Recovering::hint`]).
+//!
+//! - **Down.** The env is down when it did not open (missing, a layout this build does not
+//!   read, any MDBX error, `MDBX_WANNA_RECOVERY` included), or once a read transaction of the
+//!   open env failed with `MDBX_WANNA_RECOVERY` or `MDBX_PANIC` (that handle is of no further
+//!   use). While it is down every read is [`ReadError::Unavailable`], and the caller IGNOREs.
+//!   The reason is logged here; no MDBX text reaches a caller, whose error carries only
+//!   `ReadError`'s fixed message.
+//! - **Reopen.** The first read after the backoff's delay ([`REOPEN_BASE`] doubling to
+//!   [`REOPEN_CAP`], jittered: [`Backoff`]) tries one read-only open ([`Reader::open`]) on its
+//!   own (blocking) thread. Reads that come meanwhile do not wait for it: they are
+//!   `Unavailable`. Every attempt is counted ([`Recovering::reopen_attempts`], the
+//!   `store_reopen_attempts` counter). An open resets the backoff. A hint (the follower's: a
+//!   subscription to cl-chain opened, so cl-chain is up, maybe after a restart) makes the next
+//!   read try at once.
+//! - **Never recovery, never write.** cl-store opens the env with `MDBX_RDONLY` only, so it
+//!   never recovers it: an env that wants recovery stays down until cl-chain, its one writer,
+//!   has opened it. MDBX refuses a second open of one env in one process, so a reopen while a
+//!   read still holds the old handle fails, and is tried again on the backoff.
 
 use std::{
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, PoisonError, RwLock, RwLockWriteGuard,
+    },
     time::{Duration, Instant},
 };
 
-use prometheus_client::registry::Registry;
+use prometheus_client::{metrics::counter::Counter, registry::Registry};
 
-use crate::reader::{Clock, ReadError, Reader};
+use crate::{
+    backoff::Backoff,
+    reader::{system_clock, Clock, ReadError, Reader},
+};
 
 /// The first reopen delay.
 pub const REOPEN_BASE: Duration = Duration::from_millis(250);
 
-/// The longest reopen delay.
+/// The longest reopen delay: [`REOPEN_BASE`] doubled five times.
 pub const REOPEN_CAP: Duration = Duration::from_secs(8);
 
 /// How [`Recovering`] opens the env: [`Reader::open`] of its path, or a test's.
 pub type Opener = Box<dyn Fn() -> store_schema::Result<Reader> + Send + Sync>;
 
-/// The store env as cl-store holds it.
+/// The store env as cl-store holds it (see the module docs).
 pub struct Recovering {
-    _open: Option<Opener>,
-    _clock: Option<Clock>,
-    _fixed: Option<Arc<Reader>>,
+    /// `None`: a reader this process opened already, never reopened.
+    open: Option<Opener>,
+    clock: Clock,
+    state: RwLock<State>,
+    attempts: Counter,
+    hinted: AtomicBool,
+}
+
+struct State {
+    live: Option<Arc<Reader>>,
+    backoff: Backoff,
+    /// When the next reopen is due; `None`: at once.
+    at: Option<Instant>,
+    /// A reopen is under way on some read's thread.
+    opening: bool,
 }
 
 impl Recovering {
     /// The env at `path`, opened read-only by the first read.
     #[must_use]
     pub fn open(path: impl Into<PathBuf>) -> Self {
-        let _ = path.into();
-        todo!()
+        let path = path.into();
+        Self::with_opener(Box::new(move || Reader::open(&path)), system_clock())
     }
 
-    /// The env `open` opens, its backoff timed on `clock`.
+    /// The env `open` opens, its backoff timed on `clock` (tests inject both).
     #[must_use]
     pub fn with_opener(open: Opener, clock: Clock) -> Self {
-        Self {
-            _open: Some(open),
-            _clock: Some(clock),
-            _fixed: None,
-        }
+        Self::new(Some(open), None, clock)
     }
 
     /// A reader this process opened already, never reopened.
     #[must_use]
     pub fn fixed(reader: Arc<Reader>) -> Self {
+        Self::new(None, Some(reader), system_clock())
+    }
+
+    fn new(open: Option<Opener>, live: Option<Arc<Reader>>, clock: Clock) -> Self {
         Self {
-            _open: None,
-            _clock: None,
-            _fixed: Some(reader),
+            open,
+            clock,
+            state: RwLock::new(State {
+                live,
+                backoff: Backoff::new(REOPEN_BASE, REOPEN_CAP),
+                at: None,
+                opening: false,
+            }),
+            attempts: Counter::default(),
+            hinted: AtomicBool::new(false),
         }
     }
 
-    /// The open reader.
+    fn write(&self) -> RwLockWriteGuard<'_, State> {
+        self.state.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn live(&self) -> Option<Arc<Reader>> {
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
+        state.live.clone()
+    }
+
+    /// The open reader; while the env is down, a reopen if one is due.
     ///
     /// # Errors
     ///
     /// [`ReadError::Unavailable`] while the env is down.
     pub fn reader(&self) -> Result<Arc<Reader>, ReadError> {
-        todo!()
+        let live = self.live();
+        let Some(open) = &self.open else {
+            return live.ok_or(ReadError::Unavailable);
+        };
+        if let Some(reader) = live.filter(|reader| !reader.is_broken()) {
+            return Ok(reader);
+        }
+        let now = (self.clock)();
+        // A broken reader taken out is dropped (its env closed, if this held it last) after the
+        // lock is released (`state` is declared later, so it drops first) and before a reopen:
+        // MDBX refuses a second open of one env in one process.
+        let mut broken = None;
+        {
+            let mut state = self.write();
+            if let Some(reader) = state.live.take() {
+                if !reader.is_broken() {
+                    // Another read reopened it meanwhile.
+                    state.live = Some(Arc::clone(&reader));
+                    return Ok(reader);
+                }
+                broken = Some(reader);
+                state.at = Some(now + state.backoff.next_delay());
+                tracing::warn!(
+                    "a read txn of the store env failed (wants recovery or panicked): \
+                     reads answer UNAVAILABLE until it reopens read-only"
+                );
+            }
+            let hinted = self.hinted.swap(false, Ordering::SeqCst);
+            if state.opening || (!hinted && state.at.is_some_and(|at| now < at)) {
+                return Err(ReadError::Unavailable);
+            }
+            state.opening = true;
+        }
+        drop(broken);
+        self.reopen(open)
     }
 
-    /// `f` on the open reader.
+    /// One reopen attempt, with `opening` set.
+    fn reopen(&self, open: &Opener) -> Result<Arc<Reader>, ReadError> {
+        self.attempts.inc();
+        let opened = open();
+        let mut state = self.write();
+        state.opening = false;
+        match opened {
+            Ok(reader) => {
+                let reader = Arc::new(reader);
+                state.live = Some(Arc::clone(&reader));
+                state.at = None;
+                state.backoff.reset();
+                self.hinted.store(false, Ordering::SeqCst);
+                tracing::info!(
+                    attempts = self.attempts.get(),
+                    "the store env is open (read-only)"
+                );
+                Ok(reader)
+            }
+            Err(err) => {
+                let delay = state.backoff.next_delay();
+                state.at = Some((self.clock)() + delay);
+                tracing::warn!(
+                    error = %err,
+                    attempts = self.attempts.get(),
+                    retry_in = ?delay,
+                    "the store env did not open read-only: reads answer UNAVAILABLE"
+                );
+                Err(ReadError::Unavailable)
+            }
+        }
+    }
+
+    /// `f` on the open reader, on the caller's thread (a blocking one: it may reopen the env).
     ///
     /// # Errors
     ///
@@ -73,30 +197,40 @@ impl Recovering {
         f(&*self.reader()?)
     }
 
-    /// cl-chain is up again: the next read of an env that is down tries a reopen at once.
-    pub fn hint(&self) {}
+    /// cl-chain is up, maybe after a restart: if the env is down, its next read tries a reopen
+    /// at once. Never blocks; does nothing while the env is open.
+    pub fn hint(&self) {
+        if !self.is_open() {
+            self.hinted.store(true, Ordering::SeqCst);
+        }
+    }
 
-    /// Reopen attempts so far.
+    /// Reopen attempts so far (the first open included).
     #[must_use]
     pub fn reopen_attempts(&self) -> u64 {
-        0
+        self.attempts.get()
     }
 
-    /// Whether the env is open and was not found broken.
+    /// Whether the env is open and not found broken.
     #[must_use]
     pub fn is_open(&self) -> bool {
-        false
+        self.live().is_some_and(|reader| !reader.is_broken())
     }
 
-    /// Registers the reopen counter.
+    /// Registers `store_reopen_attempts` (a counter: `_total`).
     pub fn register(&self, registry: &mut Registry) {
-        let _ = registry;
+        registry.register(
+            "store_reopen_attempts",
+            "Read-only opens of the store env tried, the first included",
+            self.attempts.clone(),
+        );
     }
 
     /// When the next reopen is due, if the env is down.
     #[cfg(test)]
     pub(crate) fn next_attempt(&self) -> Option<Instant> {
-        None
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
+        state.live.is_none().then_some(state.at).flatten()
     }
 }
 
@@ -164,11 +298,11 @@ pub(crate) mod tests {
 
     /// An env that wants recovery (`MDBX_WANNA_RECOVERY` on open) is `Unavailable` with a fixed
     /// message, never the MDBX text. It is reopened read-only on a bounded backoff timed on the
-    /// injected clock: no attempt before the delay is up, one once it is, each delay at least
-    /// the one before and at most [`REOPEN_CAP`], every attempt counted. A hint (cl-chain is
-    /// back) makes the next read try at once. Once the env opens it serves; a reader whose read
-    /// transaction then fails with `MDBX_WANNA_RECOVERY` is taken out, and the env reopened
-    /// after the first delay again.
+    /// injected clock: no attempt before the delay is up, one once it is, the delays growing
+    /// until [`REOPEN_CAP`] and then staying in `[cap/2, cap]`, every attempt counted. A hint
+    /// (cl-chain is back) makes the next read try at once. Once the env opens it serves; a
+    /// reader whose read transaction then fails with `MDBX_WANNA_RECOVERY` is taken out, and the
+    /// env reopened after the first delay again.
     #[test]
     fn reopen_bounded_backoff() {
         let store = Arc::new(Store::new());
@@ -246,20 +380,26 @@ pub(crate) mod tests {
         assert_eq!(env.reopen_attempts(), 14);
     }
 
-    /// Delays of a bounded backoff from `base` to `cap`: the `n`th at most `base * 2^n` and at
-    /// least half that, never above `cap`, each at least the one before.
+    /// Delays of a bounded backoff from `base` to `cap`: the `n`th at most `base * 2^n` (never
+    /// above `cap`) and at least half that. They grow, each at least the one before, until
+    /// they reach the cap; then they stay in `[cap/2, cap]`.
     pub(crate) fn check_delays(delays: &[Duration], base: Duration, cap: Duration) {
+        let ceiling = |n: usize| base.checked_mul(1 << n.min(30)).map_or(cap, |c| c.min(cap));
         for (n, delay) in delays.iter().enumerate() {
-            let ceiling = base.checked_mul(1 << n.min(30)).map_or(cap, |c| c.min(cap));
+            let top = ceiling(n);
             assert!(
-                (ceiling / 2..=ceiling).contains(delay),
-                "delay {n} {delay:?} outside {:?}..={ceiling:?}: {delays:?}",
-                ceiling / 2
+                (top / 2..=top).contains(delay),
+                "delay {n} {delay:?} outside {:?}..={top:?}: {delays:?}",
+                top / 2
             );
+            if n > 0 && ceiling(n - 1) < cap {
+                assert!(delays[n - 1] <= *delay, "delay {n} shrinks: {delays:?}");
+            }
         }
-        assert!(
-            delays.windows(2).all(|w| w[0] <= w[1]),
-            "the delays shrink: {delays:?}"
+        assert_eq!(
+            ceiling(delays.len() - 1),
+            cap,
+            "the delays never reach the cap: {delays:?}"
         );
     }
 

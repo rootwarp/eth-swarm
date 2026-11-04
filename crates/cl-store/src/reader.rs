@@ -17,13 +17,20 @@
 //! it walks and once more before its data is returned, with the transaction open, so a slow read
 //! cannot pin MVCC pages past it. [`ParentWalk`] (`GetBlocksByHead`) is stamped once, by its
 //! first transaction, then reads each further block in a short transaction of its own.
+//!
+//! A read transaction that fails to begin with `MDBX_WANNA_RECOVERY` or `MDBX_PANIC` is
+//! `Unavailable`, like any env that cannot be read now, and marks the reader broken: the env
+//! handle is of no further use, and [`crate::recover`] reopens the env read-only.
 
 use std::{
     borrow::{Borrow, Cow},
     cell::Cell,
     ops::ControlFlow,
     path::Path,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -76,7 +83,8 @@ impl Deadline {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ReadError {
     /// The snapshot has no stamp row (nothing is stamped yet, so nothing is served), or the
-    /// env cannot be read now (out of reader slots, busy, wants recovery).
+    /// env cannot be read now (out of reader slots, busy, wants recovery, or down until it
+    /// reopens: [`crate::recover`]).
     #[error("store unavailable")]
     Unavailable,
     /// No such block in the snapshot, or none on the stamp's chain at that slot.
@@ -126,6 +134,9 @@ pub struct Stamped<T> {
 /// transaction.
 pub struct Reader {
     env: Box<dyn Borrow<Env> + Send + Sync>,
+    /// A read transaction failed to begin with `MDBX_WANNA_RECOVERY` or `MDBX_PANIC`: this
+    /// env handle is of no further use ([`crate::recover`] reopens the env).
+    broken: AtomicBool,
 }
 
 impl Reader {
@@ -138,6 +149,7 @@ impl Reader {
     pub fn open(path: &Path) -> store_schema::Result<Self> {
         Ok(Self {
             env: Box::new(env::open_reader(path)?),
+            broken: AtomicBool::new(false),
         })
     }
 
@@ -145,16 +157,27 @@ impl Reader {
     /// refuses a second open of one env in one process.
     #[cfg(test)]
     pub(crate) fn over(env: impl Borrow<Env> + Send + Sync + 'static) -> Self {
-        Self { env: Box::new(env) }
+        Self {
+            env: Box::new(env),
+            broken: AtomicBool::new(false),
+        }
     }
 
     pub(crate) fn env(&self) -> &Env {
         (*self.env).borrow()
     }
 
+    /// Whether a read transaction of this env failed to begin with `MDBX_WANNA_RECOVERY` or
+    /// `MDBX_PANIC`.
+    pub(crate) fn is_broken(&self) -> bool {
+        self.broken.load(Ordering::Relaxed)
+    }
+
     /// Marks the reader as if a read transaction had failed with `MDBX_WANNA_RECOVERY`.
     #[cfg(test)]
-    pub(crate) fn poison(&self) {}
+    pub(crate) fn poison(&self) {
+        self.broken.store(true, Ordering::Relaxed);
+    }
 
     /// The block `at` names, with the stamp of the transaction it was read in.
     ///
@@ -181,8 +204,16 @@ impl Reader {
         deadline: &Deadline,
         f: impl FnOnce(&Snapshot<'_>) -> Result<T, ReadError>,
     ) -> Result<T, ReadError> {
+        let txn = env::begin_reader_txn(self.env()).inspect_err(|err| {
+            if matches!(
+                err,
+                store_schema::Error::Mdbx(libmdbx::Error::WannaRecovery | libmdbx::Error::Panic)
+            ) {
+                self.broken.store(true, Ordering::Relaxed);
+            }
+        })?;
         let snap = Snapshot {
-            txn: env::begin_reader_txn(self.env())?,
+            txn,
             deadline,
             walked: Cell::new(0),
         };
@@ -484,7 +515,6 @@ mod tests {
         collections::BTreeSet,
         io::{BufRead, Read, Write},
         path::PathBuf,
-        sync::atomic::{AtomicBool, Ordering},
         thread,
     };
     use store_schema::{

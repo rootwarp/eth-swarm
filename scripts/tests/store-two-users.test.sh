@@ -67,8 +67,8 @@ touch "$1/mdbx.dat" "$1/mdbx.lck"
 SH
 cat > "$tmp/cl_store-0123" <<'SH'
 #!/usr/bin/env bash
-# The fake cl-store test binary: STUB_TESTS_MODE ok (both lines), skip (cannot_write's only),
-# silent (none), fail (exit 101).
+# The fake cl-store test binary: STUB_TESTS_MODE ok (both lines, laid out as libtest prints
+# them), skip (cannot_write's only), silent (none), fail (exit 101).
 env=${CL_STORE_TWO_USER_ENV:-}
 modes=""
 [[ -z $env ]] || modes=$(stat -c %a "$env" "$env/mdbx.dat" "$env/mdbx.lck" | tr '\n' ' ')
@@ -76,8 +76,11 @@ echo "tests as ${STUB_AS:-nobody} env=$env modes=$modes args=$*" >> "$STUB_LOG"
 [[ -n $env ]] || exit 0
 case ${STUB_TESTS_MODE:-ok} in
   ok)
-    echo "two-user: cannot_write ok on $env as uid 200"
-    echo "two-user: env_permissions ok on $env as uid 200" ;;
+    # As libtest prints them with --nocapture: each after its `test <name> ... `.
+    echo "test reader::tests::cannot_write ... two-user: cannot_write ok on $env as uid 200"
+    echo "ok"
+    echo "test reader::tests::env_permissions ... two-user: env_permissions ok on $env as uid 200"
+    echo "ok" ;;
   skip) echo "two-user: cannot_write ok on $env as uid 200" ;;
   silent) echo "running 0 tests" ;;
   fail) echo "test reader::tests::cannot_write ... FAILED"; exit 101 ;;

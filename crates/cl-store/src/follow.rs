@@ -1,13 +1,61 @@
-//! The chain.v1 events follower: cl-store's subscription to cl-chain's `EventsService`.
+//! The chain.v1 events follower: cl-store's subscription to cl-chain's `EventsService`, on HEAD
+//! and FINALIZED_CHECKPOINT, for liveness, `follower_lag` and the reopen hint.
+//!
+//! It is not the stamp's source. Every read is stamped from the stamp row of its own read
+//! transaction ([`crate::reader`]). The follower never produces or caches a stamp, and no read
+//! waits on it: it runs in a task of its own, holds no lock a read takes, and tells the reader
+//! only through [`Recovering::hint`], which sets a flag.
+//!
+//! - **What it tracks** ([`Followed`], and the gauges [`Followed::register`] adds): whether a
+//!   subscription is open, the last `seq`, the last head's slot, the last finalized
+//!   checkpoint's start slot, and `follower_lag`. That is how many slots its last head trails
+//!   the head of the store's stamp (cl-chain commits a head before it publishes it). It is
+//!   read from the store after each head and after each failed or ended subscription, so it
+//!   grows while the follower is down and cl-chain commits.
+//! - **The client-side contract.** The stream must open with cl-chain's hello (negotiated by
+//!   the link, within its hello timeout), and `seq` must rise. A `seq` that does not, or
+//!   `EVENT_KIND_UNSPECIFIED`, ends the subscription as a contract violation. An unknown
+//!   non-zero kind is ignored.
+//! - **Reconnect.** A subscription that is refused or fails, or whose stream ends (cl-chain
+//!   stops, the stream lags cl-chain's bus and is ended `RESOURCE_EXHAUSTED`, the connection
+//!   breaks, a contract violation), is followed by a new one after a bounded, jittered,
+//!   exponential backoff ([`RESUBSCRIBE_BASE`] doubling to [`RESUBSCRIBE_CAP`]). A subscription
+//!   that opens resets it. Nothing is replayed: cl-chain keeps no past events, so each
+//!   subscription starts at its next event.
+//! - **Reopen hint.** A subscription that opens means cl-chain is up, maybe after a restart, so
+//!   an env that wanted recovery may read again: the follower hints the reader
+//!   ([`Recovering::hint`]), and the next read of an env that is down tries a reopen at once.
+//!   Hello generations are per stream, so a restart looks like any new subscription; a hint to
+//!   an open env does nothing.
+//! - **ACL.** cl-chain's method ACL must give cl-store [`CHAIN_METHODS`]
+//!   (`EventsService/Subscribe`). Without it every subscription is refused
+//!   (`PERMISSION_DENIED`) and the follower keeps backing off; reads are not affected. The
+//!   probe's cl-chain gives its methods to cl-p2p only, so under the probe the follower is
+//!   refused.
+//! - **Readiness.** A follower that is down does not make cl-store unready: reads stay correct
+//!   from their own stamp.
 
-use std::{future::Future, path::Path, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    path::Path,
+    pin::Pin,
+    sync::{atomic::AtomicU64, Arc},
+    time::Duration,
+};
 
-use ethswarm_proto::chain::events_service_client::EventsServiceClient;
-use ipc::Link;
-use prometheus_client::registry::Registry;
-use tonic::transport::Channel;
+use ethswarm_proto::chain::{self as pb, events_service_client::EventsServiceClient, EventKind};
+use ipc::{frame::Inbound, uds::PeerCheckedConnector, ContractError, Link};
+use prometheus_client::{
+    metrics::{counter::Counter, gauge::Gauge},
+    registry::Registry,
+};
+use tonic::transport::{Channel, Endpoint};
 
-use crate::recover::Recovering;
+use crate::{
+    backoff::Backoff,
+    reader::{system_clock, Deadline},
+    recover::Recovering,
+};
 
 /// The chain.v1 methods cl-store calls. cl-chain's method ACL must give each of them to
 /// cl-store.
@@ -16,70 +64,128 @@ pub const CHAIN_METHODS: [&str; 1] = ["/ethswarm.chain.v1.EventsService/Subscrib
 /// The first delay before subscribing again.
 pub const RESUBSCRIBE_BASE: Duration = Duration::from_millis(250);
 
-/// The longest delay before subscribing again.
+/// The longest delay before subscribing again: [`RESUBSCRIBE_BASE`] doubled seven times.
 pub const RESUBSCRIBE_CAP: Duration = Duration::from_secs(32);
+
+/// The event kinds the follower subscribes to.
+const KINDS: [EventKind; 2] = [EventKind::Head, EventKind::FinalizedCheckpoint];
+
+/// The deadline of the store read behind `follower_lag`.
+const LAG_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How the follower waits between subscriptions: `tokio::time::sleep`, or a test's.
 pub type Sleep = Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
-/// What the follower has seen.
+type U64Gauge = Gauge<u64, AtomicU64>;
+
+/// What the follower has seen. Clones share it; it is lock-free.
 #[derive(Clone, Debug, Default)]
-pub struct Followed {}
+pub struct Followed {
+    connected: U64Gauge,
+    seq: U64Gauge,
+    head_slot: U64Gauge,
+    finalized_slot: U64Gauge,
+    lag: U64Gauge,
+    subscriptions: Counter,
+}
 
 impl Followed {
     /// Whether a subscription is open.
     #[must_use]
     pub fn connected(&self) -> bool {
-        false
+        self.connected.get() == 1
     }
 
-    /// The `seq` of the last event taken.
+    /// The `seq` of the last event taken (0 before the first).
     #[must_use]
     pub fn seq(&self) -> u64 {
-        0
+        self.seq.get()
     }
 
     /// The slot of the last head.
     #[must_use]
     pub fn head_slot(&self) -> u64 {
-        0
+        self.head_slot.get()
     }
 
     /// The start slot of the last finalized checkpoint.
     #[must_use]
     pub fn finalized_slot(&self) -> u64 {
-        0
+        self.finalized_slot.get()
     }
 
-    /// `follower_lag`.
+    /// `follower_lag`: the slots the last head trails the head of the store's stamp, as of the
+    /// last time it was read.
     #[must_use]
     pub fn lag(&self) -> u64 {
-        0
+        self.lag.get()
     }
 
     /// Subscriptions opened so far.
     #[must_use]
     pub fn subscriptions(&self) -> u64 {
-        0
+        self.subscriptions.get()
     }
 
-    /// Registers the gauges.
+    /// Registers `store_follower_{connected,seq,head_slot,finalized_slot,lag_slots}` and
+    /// `store_follower_subscriptions` (a counter: `_total`).
     pub fn register(&self, registry: &mut Registry) {
-        let _ = registry;
+        for (name, help, gauge) in [
+            (
+                "connected",
+                "1 while a subscription to cl-chain's events is open",
+                &self.connected,
+            ),
+            (
+                "seq",
+                "The seq of the last event of cl-chain the follower took",
+                &self.seq,
+            ),
+            (
+                "head_slot",
+                "The slot of the last head cl-chain published",
+                &self.head_slot,
+            ),
+            (
+                "finalized_slot",
+                "The start slot of the last finalized checkpoint",
+                &self.finalized_slot,
+            ),
+            (
+                "lag_slots",
+                "Slots the follower's last head trails the store stamp's head",
+                &self.lag,
+            ),
+        ] {
+            registry.register(format!("store_follower_{name}"), help, gauge.clone());
+        }
+        registry.register(
+            "store_follower_subscriptions",
+            "Subscriptions to cl-chain's events opened",
+            self.subscriptions.clone(),
+        );
     }
 }
 
-/// The follower.
+/// The follower (see the module docs).
 pub struct Follower {
+    link: Link,
+    store: Arc<Recovering>,
     seen: Followed,
+    backoff: Backoff,
+    sleep: Sleep,
 }
 
 impl Follower {
+    /// A follower with `link`'s hello, hinting `store`.
     #[must_use]
     pub fn new(link: Link, store: Arc<Recovering>) -> Self {
-        let _ = (link, store);
         Self {
+            link,
+            store,
             seen: Followed::default(),
+            backoff: Backoff::new(RESUBSCRIBE_BASE, RESUBSCRIBE_CAP),
+            sleep: Arc::new(|delay| Box::pin(tokio::time::sleep(delay))),
         }
     }
 
@@ -89,24 +195,118 @@ impl Follower {
         &self.seen
     }
 
-    /// The same follower, waiting between subscriptions with `sleep`.
+    /// The same follower, waiting between subscriptions with `sleep` (tests: no real sleep).
     #[must_use]
-    pub fn with_sleep(self, sleep: Sleep) -> Self {
-        let _ = sleep;
+    pub fn with_sleep(mut self, sleep: Sleep) -> Self {
+        self.sleep = sleep;
         self
     }
 
-    /// A client of cl-chain's `EventsService` on `socket`.
+    /// A client of cl-chain's `EventsService` on `socket`, whose server must run as
+    /// `chain_uid` (`ipc::uds::PeerCheckedConnector`). It connects lazily, at each
+    /// subscription, so cl-store starts while cl-chain is down.
     #[must_use]
     pub fn client(socket: &Path, chain_uid: u32) -> EventsServiceClient<Channel> {
-        let _ = (socket, chain_uid);
-        todo!()
+        let connector = PeerCheckedConnector::new(socket, chain_uid);
+        // The authority routes nothing: the connector picks the socket.
+        let channel =
+            Endpoint::from_static("http://localhost").connect_with_connector_lazy(connector);
+        EventsServiceClient::new(channel)
     }
 
-    /// Follows until `stop`.
-    pub async fn run(self, client: EventsServiceClient<Channel>, stop: impl Future<Output = ()>) {
-        let _ = (client, stop);
-        todo!()
+    /// Subscribes through `client`, and again after each end, until `stop`.
+    pub async fn run(
+        mut self,
+        mut client: EventsServiceClient<Channel>,
+        stop: impl Future<Output = ()>,
+    ) {
+        let seen = self.seen.clone();
+        let follow = async {
+            loop {
+                match self.subscription(&mut client).await {
+                    Ok(end) => {
+                        tracing::warn!(%end, "cl-chain's event stream ended: subscribing again")
+                    }
+                    Err(e) => tracing::debug!(error = %e, "cannot subscribe to cl-chain's events"),
+                }
+                self.seen.connected.set(0);
+                self.update_lag().await;
+                let delay = self.backoff.next_delay();
+                (self.sleep)(delay).await;
+            }
+        };
+        tokio::select! {
+            () = stop => {}
+            () = follow => {}
+        }
+        seen.connected.set(0);
+    }
+
+    /// One subscription: why it ended, or `Err` if it did not open.
+    async fn subscription(
+        &mut self,
+        client: &mut EventsServiceClient<Channel>,
+    ) -> Result<String, String> {
+        let request = pb::SubscribeRequest {
+            kinds: KINDS.map(|kind| kind as i32).to_vec(),
+            resume_from_seq: 0,
+            hello: Some(self.link.local()),
+        };
+        let stream = client
+            .subscribe(request)
+            .await
+            .map_err(|e| format!("Subscribe: {e}"))?
+            .into_inner();
+        let mut frames = self
+            .link
+            .open(Inbound::from_server(stream))
+            .await
+            .map_err(|e| format!("Subscribe: {e}"))?;
+        self.backoff.reset();
+        self.seen.connected.set(1);
+        self.seen.subscriptions.inc();
+        self.store.hint();
+        tracing::info!("following cl-chain's events");
+        let mut last = 0;
+        loop {
+            let body = match frames.body().await {
+                Ok(Some(accepted)) => accepted.body,
+                Ok(None) => return Ok("cl-chain closed it".to_owned()),
+                Err(e) => return Ok(e.to_string()),
+            };
+            if body.seq <= last || body.kind == EventKind::Unspecified as i32 {
+                let e = ContractError::violation(format!(
+                    "event seq {} of kind {} after seq {last}",
+                    body.seq, body.kind
+                ));
+                self.link.record(&e);
+                return Ok(e.to_string());
+            }
+            last = body.seq;
+            self.seen.seq.set(body.seq);
+            match EventKind::try_from(body.kind) {
+                Ok(EventKind::Head) => {
+                    self.seen.head_slot.set(body.slot);
+                    self.update_lag().await;
+                }
+                Ok(EventKind::FinalizedCheckpoint) => {
+                    self.seen.finalized_slot.set(body.slot);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `follower_lag` from the store's stamp, read on `spawn_blocking` under its own deadline;
+    /// left as it was if the store cannot be read.
+    async fn update_lag(&self) {
+        let store = Arc::clone(&self.store);
+        let deadline = Deadline::after(system_clock(), LAG_READ_TIMEOUT);
+        let read = tokio::task::spawn_blocking(move || store.read(|r| r.head(&deadline))).await;
+        if let Ok(Ok(stamp)) = read {
+            let lag = stamp.head_slot.saturating_sub(self.seen.head_slot());
+            self.seen.lag.set(lag);
+        }
     }
 }
 
@@ -444,6 +644,16 @@ mod tests {
         chain.stop().await;
     }
 
+    /// Stops the flood once dropped, a failed assertion's unwind included: the runtime waits
+    /// for its blocking threads.
+    struct Flooding(Arc<AtomicBool>);
+
+    impl Drop for Flooding {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+
     /// An upstream that sends its hello, then nothing, ever.
     struct Stalled;
 
@@ -471,10 +681,15 @@ mod tests {
     async fn lagging_never_blocks_reads() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new();
-        let (a, ra) = block(10, [0; 32], 1);
-        let (b, rb) = block(11, ra, 2);
-        let (c, rc) = block(12, rb, 3);
-        let stamped = stamp(9, (12, rc), (10, ra));
+        // Blocks at the first Fulu slots of the fixture link's schedule: each has a digest.
+        let fulu = fixture::sepolia_schedule()
+            .fork_epoch(network_config::ForkName::Fulu)
+            .unwrap()
+            * fixture::SLOTS_PER_EPOCH;
+        let (a, ra) = block(fulu, [0; 32], 1);
+        let (b, rb) = block(fulu + 1, ra, 2);
+        let (c, rc) = block(fulu + 2, rb, 3);
+        let stamped = stamp(9, (fulu + 2, rc), (fulu, ra));
         store.import(&[&a, &b, &c], stamped);
         let env = Arc::new(Recovering::fixed(Arc::new(store.reader())));
 
@@ -522,8 +737,8 @@ mod tests {
         let _three = spawn(three, &flood);
         until("subscribed to the flooded bus", || lagging.connected()).await;
         let events = chain.events.clone();
-        let flooding = Arc::new(AtomicBool::new(true));
-        let more = Arc::clone(&flooding);
+        let flooding = Flooding(Arc::new(AtomicBool::new(true)));
+        let more = Arc::clone(&flooding.0);
         let flooder = tokio::task::spawn_blocking(move || {
             let mut n = 0u8;
             while more.load(Ordering::SeqCst) {
@@ -553,7 +768,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 (got.head_slot, got.meta.unwrap().as_of_seq),
-                (12, stamped.head_seq)
+                (fulu + 2, stamped.head_seq)
             );
             let req = store_pb::GetBlocksByHeadRequest {
                 root: rc.to_vec(),
@@ -567,7 +782,7 @@ mod tests {
             assert_eq!(got.len(), 3);
         }
         assert!(stalled_seen.connected(), "the stalled subscription is open");
-        flooding.store(false, Ordering::SeqCst);
+        drop(flooding);
         flooder.await.unwrap();
         chain.stop().await;
     }
