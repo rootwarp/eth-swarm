@@ -8,8 +8,8 @@ use std::{
     thread,
 };
 
-use libmdbx::{NoWriteMap, Transaction, WriteFlags};
-use store_schema::txn::{RwTxn, Update};
+use libmdbx::WriteFlags;
+use store_schema::txn::{ReadTxn, RwTxn, Update};
 
 use crate::{
     env::{self, WriterOptions},
@@ -981,9 +981,7 @@ pub(crate) fn raise_contiguous(txn: &RwTxn<'_>, slot: u64) -> Result<()> {
 }
 
 /// Every stored block's pending link, by the root it waits for.
-fn pending_links<K: libmdbx::TransactionKind>(
-    txn: &Transaction<'_, K, NoWriteMap>,
-) -> Result<HashMap<BlockRoot, Vec<(BlockRoot, u64)>>> {
+fn pending_links(txn: &impl ReadTxn) -> Result<HashMap<BlockRoot, Vec<(BlockRoot, u64)>>> {
     let links = txn.open_table(Some(LINKS_TABLE))?;
     let mut cursor = txn.cursor(&links)?;
     let mut out: HashMap<BlockRoot, Vec<(BlockRoot, u64)>> = HashMap::new();

@@ -50,11 +50,34 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! A read transaction is no way around it: it has no `db()` to the env, which would begin a
+//! raw write transaction,
+//!
+//! ```compile_fail,E0599
+//! # use store_schema::env::WriterEnv;
+//! fn raw(writer: &WriterEnv) -> store_schema::Result<()> {
+//!     writer.begin_ro_txn()?.db().begin_rw_txn()?.commit()?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! nor a way to the libmdbx transaction inside it:
+//!
+//! ```compile_fail,E0616
+//! # use store_schema::env::WriterEnv;
+//! fn raw(writer: &WriterEnv) -> store_schema::Result<()> {
+//!     writer.begin_ro_txn()?.0.db().begin_rw_txn()?.commit()?;
+//!     Ok(())
+//! }
+//! ```
 
-use libmdbx::{Cursor, Decodable, NoWriteMap, Table, Transaction, TransactionKind, WriteFlags, RW};
+use libmdbx::{
+    Cursor, Decodable, NoWriteMap, Table, Transaction, TransactionKind, WriteFlags, RO, RW,
+};
 
 use crate::{
-    env::WriterEnv,
+    env::{RoTxn, WriterEnv},
     keys::STAMP_KEY,
     stamp::{self, Stamp},
     tables::{BLOCKS, BLOCK_INDEX, META},
@@ -137,8 +160,8 @@ impl<'env> RwTxn<'env> {
     }
 }
 
-/// The reads of a transaction of the env, a write one ([`RwTxn`]) or a libmdbx read one: what a
-/// read helper that runs in both takes, as `&impl ReadTxn`.
+/// The reads of a transaction of the env, a write one ([`RwTxn`]), a read one ([`RoTxn`]) or a
+/// libmdbx one: what a read helper that runs in all of them takes, as `&impl ReadTxn`.
 pub trait ReadTxn {
     /// The kind of the transaction's cursors.
     type Kind: TransactionKind;
@@ -174,6 +197,26 @@ impl ReadTxn for RwTxn<'_> {
 
     fn cursor<'txn>(&'txn self, table: &Table<'txn>) -> libmdbx::Result<Cursor<'txn, RW>> {
         RwTxn::cursor(self, table)
+    }
+}
+
+impl ReadTxn for RoTxn<'_> {
+    type Kind = RO;
+
+    fn open_table(&self, name: Option<&str>) -> libmdbx::Result<Table<'_>> {
+        RoTxn::open_table(self, name)
+    }
+
+    fn get<'txn, V: Decodable<'txn>>(
+        &'txn self,
+        table: &Table<'txn>,
+        key: &[u8],
+    ) -> libmdbx::Result<Option<V>> {
+        RoTxn::get(self, table, key)
+    }
+
+    fn cursor<'txn>(&'txn self, table: &Table<'txn>) -> libmdbx::Result<Cursor<'txn, RO>> {
+        RoTxn::cursor(self, table)
     }
 }
 

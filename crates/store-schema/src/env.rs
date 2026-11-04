@@ -7,8 +7,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use libmdbx::{
-    Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, SyncMode, TableFlags,
-    Transaction, RO,
+    Cursor, Database, DatabaseOptions, Decodable, Mode, NoWriteMap, ReadWriteOptions, Stat,
+    SyncMode, Table, TableFlags, Transaction, RO,
 };
 
 use crate::{
@@ -21,8 +21,38 @@ use crate::{
 /// The env handle.
 pub type Env = Database<NoWriteMap>;
 
-/// A read transaction of the env ([`WriterEnv::begin_ro_txn`]).
-pub type RoTxn<'env> = Transaction<'env, RO, NoWriteMap>;
+/// A read transaction of the env ([`WriterEnv::begin_ro_txn`], or [`begin_reader_txn`] for an
+/// env [`open_reader`] opened). It only reads: it has no way to the libmdbx transaction inside
+/// it, whose `db()` would hand out the env and with it a raw write transaction, committed past
+/// [`txn::commit`].
+#[derive(Debug)]
+pub struct RoTxn<'env>(Transaction<'env, RO, NoWriteMap>);
+
+impl RoTxn<'_> {
+    /// libmdbx's `Transaction::open_table`.
+    pub fn open_table(&self, name: Option<&str>) -> libmdbx::Result<Table<'_>> {
+        self.0.open_table(name)
+    }
+
+    /// libmdbx's `Transaction::get`.
+    pub fn get<'txn, V: Decodable<'txn>>(
+        &'txn self,
+        table: &Table<'txn>,
+        key: &[u8],
+    ) -> libmdbx::Result<Option<V>> {
+        self.0.get(table, key)
+    }
+
+    /// libmdbx's `Transaction::cursor`.
+    pub fn cursor<'txn>(&'txn self, table: &Table<'txn>) -> libmdbx::Result<Cursor<'txn, RO>> {
+        self.0.cursor(table)
+    }
+
+    /// libmdbx's `Transaction::table_stat`.
+    pub fn table_stat<'txn>(&'txn self, table: &Table<'txn>) -> libmdbx::Result<Stat> {
+        self.0.table_stat(table)
+    }
+}
 
 /// Default upper bound of the memory map, 256 GiB. Only address space is reserved up front; the
 /// file grows in 256 MiB steps.
@@ -111,7 +141,7 @@ impl WriterEnv {
 
     /// A read transaction of the env.
     pub fn begin_ro_txn(&self) -> Result<RoTxn<'_>> {
-        Ok(self.env().begin_ro_txn()?)
+        Ok(RoTxn(self.env().begin_ro_txn()?))
     }
 
     /// A write transaction of the env, inside this crate; outside it, [`txn::begin`]. It
@@ -207,6 +237,12 @@ pub fn open_reader(path: &Path) -> Result<Env> {
         tables::check_known(&txn)?;
     }
     Ok(env)
+}
+
+/// A read transaction of an env [`open_reader`] opened. The caller holds the env already; the
+/// [`RoTxn`] adds no way back to it.
+pub fn begin_reader_txn(env: &Env) -> Result<RoTxn<'_>> {
+    Ok(RoTxn(env.begin_ro_txn()?))
 }
 
 /// [`open_rw_with`] with the production pace and opener.

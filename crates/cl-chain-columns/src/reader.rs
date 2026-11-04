@@ -1,6 +1,6 @@
 use std::{borrow::Cow, path::Path};
 
-use libmdbx::{Decodable, NoWriteMap, Table, Transaction, RO};
+use libmdbx::{Decodable, Table};
 use store_schema::{
     env::{RoTxn, WriterEnv},
     txn::{self, ReadTxn, RwTxn},
@@ -128,7 +128,7 @@ pub(crate) enum Db {
 impl Db {
     pub(crate) fn begin_ro_txn(&self) -> Result<RoTxn<'_>> {
         Ok(match self {
-            Self::ReadOnly(env) => env.begin_ro_txn()?,
+            Self::ReadOnly(env) => store_schema::env::begin_reader_txn(env)?,
             Self::Writer(env) => env.begin_ro_txn()?,
         })
     }
@@ -155,7 +155,7 @@ impl Db {
 /// One read transaction over the store: every value read through it is of the same state
 /// ([`ColumnReader::snapshot`]).
 pub struct Snapshot<'r> {
-    txn: Transaction<'r, RO, NoWriteMap>,
+    txn: RoTxn<'r>,
     legacy: bool,
 }
 
