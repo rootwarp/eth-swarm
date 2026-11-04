@@ -586,6 +586,32 @@ mod tests {
         );
     }
 
+    /// cl-api reads `[api]`; no other service may have it.
+    #[test]
+    fn cl_api_reads_the_api_table() {
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ApiTable {
+            chain_uid: u32,
+        }
+        let api = "network = \"sepolia\"\nmetrics_port = 9105\n[socket]\ngroup = 994\n\
+                   [callers]\nsupervisor = 996\n\
+                   [methods]\n\"/ethswarm.api.v1.ApiService/GetHealth\" = [\"supervisor\"]\n\
+                   [api]\nchain_uid = 990\n";
+        let c = Config::from_toml("cl-api", api, Path::new("cl-api.toml")).unwrap();
+        assert_eq!(section_name("cl-api"), Some("api"));
+        assert_eq!(
+            c.section::<ApiTable>().unwrap(),
+            ApiTable { chain_uid: 990 }
+        );
+        let err = parse(&format!("{}[api]\nchain_uid = 990\n", engine(""))).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::ForeignTable { table, service }
+                if table == "api" && service == "cl-engine"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn the_callers_are_kept() {
         let c = parse_chain(&chain("network = \"sepolia\"", "")).unwrap();

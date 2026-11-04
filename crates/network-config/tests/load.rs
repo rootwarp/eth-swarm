@@ -349,3 +349,55 @@ fn a_malformed_capella_fork_version_fails_the_load() {
         );
     }
 }
+
+/// The Beacon API's `config/spec` serves every value as written: the scalars and the lists.
+#[test]
+fn scalars_and_lists_as_written() {
+    let config = ChainConfig::load(Network::Sepolia).unwrap();
+    let scalars: Vec<(&str, &str)> = config.scalars().collect();
+    let keys: Vec<&str> = scalars.iter().map(|(k, _)| *k).collect();
+    let mut sorted = keys.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(keys, sorted, "sorted by key, each once");
+    for (key, value) in &scalars {
+        assert_eq!(config.get(key), Some(*value), "{key}");
+    }
+    let find = |key: &str| scalars.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+    assert_eq!(find("PRESET_BASE"), Some("mainnet"));
+    assert_eq!(find("CONFIG_NAME"), Some("sepolia"));
+    assert_eq!(find("SECONDS_PER_SLOT"), Some("12"));
+    assert_eq!(
+        find("DEPOSIT_CONTRACT_ADDRESS"),
+        Some("0x7f02C3E3c98b133055B8B348B2Ac625669Ed295D")
+    );
+    assert_eq!(find("BLOB_SCHEDULE"), None);
+    let record = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(f, v)| ((*f).to_owned(), (*v).to_owned()))
+            .collect()
+    };
+    let lists: Vec<(&str, &[Vec<(String, String)>])> = config.lists().collect();
+    assert_eq!(
+        lists,
+        [
+            (
+                "BLOB_SCHEDULE",
+                &[
+                    record(&[("EPOCH", "274176"), ("MAX_BLOBS_PER_BLOCK", "15")]),
+                    record(&[("EPOCH", "275712"), ("MAX_BLOBS_PER_BLOCK", "21")]),
+                ][..]
+            ),
+            (
+                "GAS_LIMIT_SCHEDULE",
+                &[record(&[("EPOCH", "353024"), ("GAS_LIMIT", "200000000")])][..]
+            ),
+        ]
+    );
+    // An empty list is kept, empty.
+    let empty = parse(&format!("{MINIMAL_CONFIG}GAS_LIMIT_SCHEDULE: []\n")).unwrap();
+    assert!(empty
+        .lists()
+        .any(|(key, records)| key == "GAS_LIMIT_SCHEDULE" && records.is_empty()));
+}

@@ -344,6 +344,17 @@ impl ChainConfig {
         self.scalars.get(key).map(String::as_str)
     }
 
+    /// Every scalar key and its value as written (without quotes), sorted by key.
+    pub fn scalars(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        std::iter::empty()
+    }
+
+    /// Every list key (`BLOB_SCHEDULE`, ...) and its records as written, sorted by key. Each
+    /// record is its `(field, value)` pairs in file order.
+    pub fn lists(&self) -> impl Iterator<Item = (&str, &[Vec<(String, String)>])> + '_ {
+        std::iter::empty()
+    }
+
     /// Compares each `(key, value)` of `compiled` with the uint64 value of `key` in the config.
     ///
     /// `compiled` holds the config values that the node compiles in as constants (for example

@@ -1,0 +1,410 @@
+//! The `cl-api` process. It reads `/etc/ethswarm/cl-api.toml` through the owner walk
+//! (`svc_runtime::Config::load_root_owned`). It serves `ethswarm.api.v1` on its socket through
+//! svc-runtime and the Beacon API on HTTP, and polls cl-chain for the node state, until SIGTERM.
+//!
+//! ```toml
+//! network = "sepolia"
+//! metrics_port = 9105
+//!
+//! [socket]
+//! group = 994
+//!
+//! [callers]
+//! supervisor = 996
+//!
+//! [methods]
+//! "/ethswarm.api.v1.ApiService/GetHealth" = ["supervisor"]
+//!
+//! [api]
+//! http_listen = "127.0.0.1:5052"                         # optional, this default
+//! http_allow_non_loopback = false                        # the operator flag (ARCH §2b)
+//! chain_socket = "/run/ethswarm/cl-chain/cl-chain.sock"  # optional, this default
+//! chain_uid = 990                                        # the UID cl-chain runs as
+//! poll_interval_ms = 1000                                # optional, this default
+//! ```
+//!
+//! - **`http_listen`** must be a loopback address unless `http_allow_non_loopback = true`
+//!   ([`HttpBind`]). A refused address stops the process before anything listens.
+//! - **cl-chain** is reached on `chain_socket` only if its server runs as `chain_uid`
+//!   (`ipc::uds::PeerCheckedConnector`). The channel connects lazily, so cl-api starts, and
+//!   answers 503 from `node/health`, while cl-chain is still down. cl-chain's ACL must give
+//!   `/ethswarm.chain.v1.ImportService/GetChainStatus` to cl-api.
+//! - **Shutdown.** At SIGTERM, the gRPC socket drains (svc-runtime), and the HTTP server stops
+//!   accepting and lets its open requests finish.
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::time::Duration;
+
+use network_config::{ChainConfig, Genesis};
+use serde::Deserialize;
+use svc_runtime::{Config, Hooks};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+
+use crate::routes::config::ConfigDataError;
+use crate::server::{BindError, HttpBind};
+
+/// The service name: its config file, socket and ACL.
+pub const SERVICE: &str = "cl-api";
+
+/// cl-chain's socket unless `chain_socket` says otherwise.
+pub const DEFAULT_CHAIN_SOCKET: &str = "/run/ethswarm/cl-chain/cl-chain.sock";
+
+/// How often cl-chain is polled unless `poll_interval_ms` says otherwise.
+pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
+
+/// The `[api]` table.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiSettings {
+    #[serde(default = "default_http_listen")]
+    pub http_listen: SocketAddr,
+    /// The operator flag that allows a non-loopback `http_listen`.
+    #[serde(default)]
+    pub http_allow_non_loopback: bool,
+    #[serde(default = "default_chain_socket")]
+    pub chain_socket: PathBuf,
+    /// The UID cl-chain's server must run as.
+    pub chain_uid: u32,
+    #[serde(default = "default_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+}
+
+fn default_http_listen() -> SocketAddr {
+    crate::server::DEFAULT_HTTP_ADDR
+}
+
+fn default_chain_socket() -> PathBuf {
+    PathBuf::from(DEFAULT_CHAIN_SOCKET)
+}
+
+fn default_poll_interval_ms() -> u64 {
+    DEFAULT_POLL_INTERVAL_MS
+}
+
+/// Why cl-api stopped or did not start.
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceError {
+    #[error("config: {0}")]
+    Config(String),
+    #[error(transparent)]
+    Bind(#[from] BindError),
+    #[error(transparent)]
+    ConfigData(#[from] ConfigDataError),
+    #[error("the network has no genesis time, which the wall-clock slot needs")]
+    NoGenesis,
+    #[error(transparent)]
+    Runtime(#[from] svc_runtime::RuntimeError),
+}
+
+impl ApiSettings {
+    /// The `[api]` table of `config`.
+    ///
+    /// # Errors
+    ///
+    /// The table does not parse, has no `chain_uid`, or has a zero poll interval or a relative
+    /// `chain_socket`.
+    pub fn load(config: &Config) -> Result<Self, ServiceError> {
+        let _ = config;
+        todo!()
+    }
+
+    /// Where the Beacon API listens.
+    #[must_use]
+    pub fn bind(&self) -> HttpBind {
+        todo!()
+    }
+
+    #[must_use]
+    pub fn poll_interval(&self) -> Duration {
+        Duration::from_millis(self.poll_interval_ms)
+    }
+}
+
+/// The Beacon API side, started: the server and the poller.
+pub struct Http {
+    /// The address the server listens on.
+    pub addr: SocketAddr,
+    pub server: JoinHandle<std::io::Result<()>>,
+    pub poller: JoinHandle<()>,
+}
+
+/// Binds the Beacon API, then starts the poller and the server. Both stop once `stop` turns
+/// `true` or its sender is gone.
+///
+/// # Errors
+///
+/// The address is refused or does not bind, or the config cannot be served.
+pub async fn start_http(
+    settings: &ApiSettings,
+    chain: &ChainConfig,
+    genesis: Genesis,
+    stop: watch::Receiver<bool>,
+) -> Result<Http, ServiceError> {
+    let _ = (settings, chain, genesis, stop);
+    todo!()
+}
+
+/// Serves `config` and `settings` until `hooks.shutdown`: the Beacon API first, then the gRPC
+/// service through svc-runtime. Once svc-runtime has drained, the HTTP server gets at most the
+/// config's drain timeout to finish.
+///
+/// # Errors
+///
+/// Anything [`start_http`] or `svc_runtime::run_with` refuses.
+pub async fn serve(
+    config: Config,
+    settings: ApiSettings,
+    hooks: Hooks,
+) -> Result<(), ServiceError> {
+    let _ = (config, settings, hooks);
+    todo!()
+}
+
+/// The process: no argument, the deployed config, the logs, the runtime; the exit code.
+#[must_use]
+pub fn main() -> ExitCode {
+    todo!()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    use ethswarm_proto::api::api_service_client::ApiServiceClient;
+    use ethswarm_proto::api::GetHealthRequest;
+    use serde_json::Value;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+    use crate::server::DEFAULT_HTTP_ADDR;
+    use crate::testing::{sync_status, FakeChain};
+
+    const HEALTH: &str = "/ethswarm.api.v1.ApiService/GetHealth";
+
+    fn toml(root: &Path, api: &str) -> String {
+        format!(
+            "network = \"sepolia\"\nmetrics_port = 9105\ndrain_timeout_ms = 2000\n\
+             [socket]\nroot = \"{}\"\ngroup = {}\n\
+             [callers]\nsupervisor = {}\n\
+             [methods]\n\"{HEALTH}\" = [\"supervisor\"]\n{api}",
+            root.display(),
+            ipc::peercred::effective_gid(),
+            ipc::peercred::effective_uid(),
+        )
+    }
+
+    fn config(root: &Path, api: &str) -> Config {
+        Config::from_toml(SERVICE, &toml(root, api), Path::new("cl-api.toml"))
+            .unwrap()
+            .with_ephemeral_metrics_port()
+    }
+
+    #[test]
+    fn settings_from_the_api_table() {
+        let root = Path::new("/run/ethswarm");
+        let settings = ApiSettings::load(&config(root, "[api]\nchain_uid = 990\n")).unwrap();
+        assert_eq!(
+            settings,
+            ApiSettings {
+                http_listen: DEFAULT_HTTP_ADDR,
+                http_allow_non_loopback: false,
+                chain_socket: DEFAULT_CHAIN_SOCKET.into(),
+                chain_uid: 990,
+                poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
+            }
+        );
+        assert_eq!(settings.bind(), HttpBind::default());
+        assert_eq!(settings.poll_interval(), Duration::from_secs(1));
+        let full = "[api]\nhttp_listen = \"0.0.0.0:5052\"\nhttp_allow_non_loopback = true\n\
+                    chain_socket = \"/run/x/chain.sock\"\nchain_uid = 7\npoll_interval_ms = 250\n";
+        let settings = ApiSettings::load(&config(root, full)).unwrap();
+        assert_eq!(
+            settings.bind(),
+            HttpBind {
+                addr: "0.0.0.0:5052".parse().unwrap(),
+                allow_non_loopback: true,
+            }
+        );
+        assert_eq!(settings.chain_socket, Path::new("/run/x/chain.sock"));
+        assert_eq!(settings.poll_interval(), Duration::from_millis(250));
+        // Refused: no table or no chain_uid, an unknown key, a zero interval, a relative socket.
+        for bad in [
+            "",
+            "[api]\n",
+            "[api]\nchain_uid = 1\nhttp_listn = \"127.0.0.1:1\"\n",
+            "[api]\nchain_uid = 1\npoll_interval_ms = 0\n",
+            "[api]\nchain_uid = 1\nchain_socket = \"run/chain.sock\"\n",
+            "[api]\nchain_uid = 1\nhttp_listen = \"localhost:5052\"\n",
+        ] {
+            let err = ApiSettings::load(&config(root, bad)).unwrap_err();
+            assert!(matches!(err, ServiceError::Config(_)), "{bad:?}: {err}");
+        }
+    }
+
+    /// `GET path` over TCP: the status and the body.
+    async fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<u8>) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8_lossy(&response).into_owned();
+        let code = text.split(' ').nth(1).unwrap().parse().unwrap();
+        let body = text.split_once("\r\n\r\n").unwrap().1.as_bytes().to_vec();
+        (code, body)
+    }
+
+    async fn wait_for_health(addr: SocketAddr, code: u16, within: Duration) -> Duration {
+        let start = Instant::now();
+        loop {
+            if http_get(addr, "/eth/v1/node/health").await.0 == code {
+                return start.elapsed();
+            }
+            assert!(start.elapsed() < within, "health never answered {code}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    struct Recorded(Mutex<Vec<String>>);
+
+    impl svc_runtime::notify::Notifier for Recorded {
+        fn notify(&self, state: &str) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(state.to_owned());
+            Ok(())
+        }
+    }
+
+    /// A free loopback port (bound, then released).
+    fn free_port() -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serves_http_and_grpc_and_polls_chain() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_path = std::fs::canonicalize(tmp.path()).unwrap();
+        let root = tmp_path.join("run");
+        std::fs::create_dir(&root).unwrap();
+        for dir in [&tmp_path, &root] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // The fake cl-chain, at the wall-clock slot of a network that started 1000 slots ago.
+        let chain_socket = tmp_path.join("cl-chain.sock");
+        let fake = FakeChain::new(sync_status(1000, false, false));
+        let running = fake.serve_uds(&chain_socket);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let http_addr = free_port();
+        let api = format!(
+            "[api]\nhttp_listen = \"{http_addr}\"\nchain_socket = \"{}\"\nchain_uid = {}\n\
+             poll_interval_ms = 50\n",
+            chain_socket.display(),
+            ipc::peercred::effective_uid()
+        );
+        let mut config = config(&root, &api);
+        config.genesis = Some(Genesis {
+            genesis_time: now - 1000 * 12,
+            genesis_validators_root: [0; 32],
+        });
+        let settings = ApiSettings::load(&config).unwrap();
+        let socket = config.socket.socket_path();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let notes = Arc::new(Recorded(Mutex::new(Vec::new())));
+        let mut hooks = Hooks::systemd().unwrap();
+        hooks.notifier = notes.clone();
+        hooks.shutdown = Box::pin(async {
+            let _ = stopped.await;
+        });
+        let service = tokio::spawn(serve(config, settings, hooks));
+
+        // HTTP: the poller reaches cl-chain, so health turns 200.
+        wait_for_health(http_addr, 200, Duration::from_secs(10)).await;
+        let (code, body) = http_get(http_addr, "/eth/v1/node/syncing").await;
+        assert_eq!(code, 200);
+        let data = serde_json::from_slice::<Value>(&body).unwrap()["data"].clone();
+        assert_eq!(data["head_slot"], "1000");
+        assert_eq!(data["is_syncing"], false);
+        let (code, body) = http_get(http_addr, "/eth/v1/config/deposit_contract").await;
+        assert_eq!(code, 200);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["data"]["chain_id"],
+            "11155111"
+        );
+
+        // gRPC: the service socket answers, behind the ACL (GetHealth is still a stub).
+        let channel = ipc::uds::connect_path(&socket, ipc::peercred::effective_uid())
+            .await
+            .unwrap();
+        let err = ApiServiceClient::new(channel)
+            .get_health(GetHealthRequest {})
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented, "{err}");
+        assert!(notes
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|n| n.starts_with("READY=1")));
+
+        // cl-chain stops: health turns 206 within about one poll interval.
+        running.stop().await;
+        let took = wait_for_health(http_addr, 206, Duration::from_secs(10)).await;
+        assert!(took < Duration::from_secs(2), "took {took:?}");
+        let (_, body) = http_get(http_addr, "/eth/v1/node/syncing").await;
+        let data = serde_json::from_slice::<Value>(&body).unwrap()["data"].clone();
+        assert_eq!(data["is_syncing"], true);
+        assert_eq!(data["head_slot"], "1000");
+
+        // SIGTERM: both sides stop.
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), service)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(tokio::net::TcpStream::connect(http_addr).await.is_err());
+        assert!(!socket.exists());
+    }
+
+    #[tokio::test]
+    async fn a_refused_bind_starts_nothing() {
+        let root = Path::new("/run/ethswarm");
+        let config = config(root, "[api]\nchain_uid = 1\nhttp_listen = \"0.0.0.0:0\"\n");
+        let settings = ApiSettings::load(&config).unwrap();
+        let genesis = Genesis {
+            genesis_time: 0,
+            genesis_validators_root: [0; 32],
+        };
+        let (_stop, stopped) = watch::channel(false);
+        let err = start_http(&settings, &config.chain, genesis, stopped)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, ServiceError::Bind(BindError::NotLoopback(_))),
+            "{err}"
+        );
+        // No genesis: the wall-clock slot is unknown, so nothing starts either.
+        let mut config = config;
+        config.genesis = None;
+        let settings = ApiSettings {
+            http_listen: "127.0.0.1:0".parse().unwrap(),
+            ..settings
+        };
+        let err = serve(config, settings, Hooks::systemd().unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::NoGenesis), "{err}");
+    }
+}

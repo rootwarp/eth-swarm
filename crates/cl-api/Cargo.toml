@@ -5,12 +5,30 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "cl-api: the ethswarm.api.v1 service (stub: contract layer only, every RPC answers UNIMPLEMENTED)."
+description = "cl-api: the Beacon API on HTTP (node and config routes) and the ethswarm.api.v1 service (contract layer only, every RPC answers UNIMPLEMENTED)."
 
 [dependencies]
+# The Beacon API server: axum 0.8 on hyper 1, already in the tree through tonic (svc-runtime
+# names it too). `tokio` and `http1` give `axum::serve`; `json`, `query` and `form` stay off,
+# since they would add serde_path_to_error and serde_urlencoded to Cargo.lock. Pending Vera's
+# review of the new direct deps before first use.
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 ethswarm-proto = { path = "../ethswarm-proto" }
+# The `syncing_status` query parameter; already in Cargo.lock (through url).
+form_urlencoded = "1"
+http = "1"
 ipc = { path = "../ipc" }
+network-config = { path = "../network-config" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+svc-runtime = { path = "../svc-runtime" }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 tonic.workspace = true
+tracing = "0.1"
 
 [dev-dependencies]
 ipc = { path = "../ipc", features = ["testkit"] }
+tempfile = "3"
+tokio = { version = "1", features = ["io-util"] }
+tower = { version = "0.5", features = ["util"] }
