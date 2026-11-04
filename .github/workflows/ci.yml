@@ -181,17 +181,24 @@ jobs:
     # stamp through store-schema, then column sidecars written and pruned through
     # cl-chain-columns' ColumnWriter, every column txn carrying the stamp. Any error or warning
     # fails the job. The build step prints the source directory and VERSION.txt and fails
-    # unless they are the pinned ones. #290 reuses this job.
+    # unless they are the pinned ones. It builds mdbx_stat beside mdbx_chk from the same
+    # sources: cl-store's reader::tests::registered_in_reader_list reads the reader table with
+    # `mdbx_stat -r` (that mdbx_chk has no reader listing) and runs here, where MDBX_CHK is set.
     name: mdbx_chk on written store envs (pinned libmdbx sources)
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustc --version
-      - name: Build mdbx_chk from mdbx-sys 12.13.2's libmdbx (prints the source and VERSION.txt)
+      - name: Install protoc (ethswarm-proto build.rs runs tonic-prost-build)
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc@3.36.2
+          fallback: none
+      - name: Build mdbx_chk and mdbx_stat from mdbx-sys 12.13.2's libmdbx (prints the source and VERSION.txt)
         run: bash scripts/build-mdbx-chk.sh
       - name: The scripts fail on a corrupted env (b-tree pages, meta pages) or a warning, and pass a clean one
         run: bash scripts/tests/mdbx-chk-envs.test.sh
@@ -199,6 +206,14 @@ jobs:
         env:
           MDBX_CHK: target/mdbx-chk/mdbx_chk
         run: bash scripts/mdbx-chk-envs.sh
+      # The test skips without MDBX_CHK, so the step also fails unless its own line is there.
+      - name: While cl-store holds a read txn, mdbx_stat -r lists its pid and mdbx_chk passes
+        shell: bash
+        env:
+          MDBX_CHK: ${{ github.workspace }}/target/mdbx-chk/mdbx_chk
+        run: |
+          cargo test -p cl-store --lib --locked -- --exact reader::tests::registered_in_reader_list --nocapture 2>&1 | tee target/reader-list.log
+          grep -F "the reader table lists cl-store's pid" target/reader-list.log
 
   fuzz-build:
     # The decoder fuzz targets (fuzz/, its own workspace and Cargo.lock) build as the gates run
@@ -246,13 +261,15 @@ jobs:
   root-tests:
     # Tests that need more than one UID: file owner checks, and the Unix-socket peer checks
     # (counterfeit server, wrong-UID caller, foreign stale socket, socket directory owner and
-    # group). The container runs as root and three throwaway users supply the other UIDs: chain
-    # (the allowed caller), api (in the socket group, not allowed on every method) and other
-    # (outside the group). ETHSWARM_ROOT_TESTS=1 makes those cases fail instead of skip if
-    # root or a user is missing.
+    # group). The container runs as root and four throwaway users supply the other UIDs: chain
+    # (the allowed caller), api (in the socket group, not allowed on every method), other
+    # (outside the group) and store (cl-store's reader, in the store group).
+    # ETHSWARM_ROOT_TESTS=1 makes those cases fail instead of skip if root or a user is missing.
+    # cl-store's cannot_write and env_permissions run as store against an env chain wrote
+    # (scripts/store-two-users.sh, through sudo -u).
     name: multi-UID tests as root
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     container:
       image: rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 # 1.99.0-bookworm
       options: --user 0
@@ -264,9 +281,9 @@ jobs:
           persist-credentials: false
       - name: Running as root
         run: test "$(id -u)" -eq 0
-      - name: Create three throwaway users
+      - name: Create four throwaway users
         run: |
-          for user in other chain api; do
+          for user in other chain api store; do
             useradd --no-create-home --user-group --shell /usr/sbin/nologin "ethswarm-$user"
             upper=$(echo "$user" | tr '[:lower:]' '[:upper:]')
             echo "ETHSWARM_${upper}_UID=$(id -u "ethswarm-$user")" >> "$GITHUB_ENV"
@@ -288,6 +305,12 @@ jobs:
       # Only the root cases: the other launch tests run in the rust job, as a non-root user.
       - name: cl-node as root (launch refuses without the unit users; staging never follows a symlink)
         run: cargo test -p cl-node --lib --test launch --locked -- root_
+      # sudo switches users for the two-user store run; libclang-dev is for mdbx-sys's bindgen,
+      # since cl-store's tests are the first in this container to build libmdbx.
+      - name: Install sudo and libclang (the two-user store run builds mdbx-sys and uses sudo -u)
+        run: apt-get update && apt-get install -y --no-install-recommends sudo libclang-dev
+      - name: cl-store's read-only tests as ethswarm-store against an env ethswarm-chain wrote (sudo -u)
+        run: bash scripts/tests/store-two-users.test.sh && bash scripts/store-two-users.sh ethswarm-chain ethswarm-store
 
   credential-root-tests:
     # The node-key credential shapes as systemd leaves them: a tmpfs at /run/credentials/<unit>,

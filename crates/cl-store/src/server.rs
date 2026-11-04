@@ -1,6 +1,9 @@
 //! `ethswarm.store.v1` `StoreService` over a [`Reader`].
 //!
-//! - Every read runs on `spawn_blocking` under the call's [`Deadline`] ([`DEFAULT_TIMEOUT`]).
+//! - Every read runs on `spawn_blocking` under the call's [`Deadline`] ([`DEFAULT_TIMEOUT`]),
+//!   on the env a [`Recovering`] holds: while the env is down (it wants recovery, or did not
+//!   open) every read is `UNAVAILABLE`, and it is reopened read-only on a backoff
+//!   ([`crate::recover`]).
 //! - A failed read fails the call with a fixed message and the `common.v1.Error` in the status
 //!   details: `UNAVAILABLE` (`ERROR_CODE_RESOURCE_UNAVAILABLE`: nothing stamped to serve, or
 //!   the env cannot be read now), `NOT_FOUND`, `DEADLINE_EXCEEDED`; a malformed request is
@@ -40,9 +43,12 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{service::Routes, Code, Request, Response, Status};
 
-use crate::reader::{
-    system_clock, Block, BlockRef, Clock, Deadline, ParentWalk, ReadError, Reader, Root, Stamp,
-    Stamped,
+use crate::{
+    reader::{
+        system_clock, Block, BlockRef, Clock, Deadline, ParentWalk, ReadError, Reader, Root, Stamp,
+        Stamped,
+    },
+    recover::Recovering,
 };
 
 /// The callers of every `StoreService` method.
@@ -99,17 +105,24 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Clone)]
 pub struct StoreServer {
     link: Link,
-    reader: Arc<Reader>,
+    store: Arc<Recovering>,
     timeout: Duration,
     clock: Clock,
 }
 
 impl StoreServer {
+    /// The `StoreService` over `reader`, an env this process opened already and never reopens.
     #[must_use]
     pub fn new(link: Link, reader: Arc<Reader>) -> Self {
+        Self::recovering(link, Arc::new(Recovering::fixed(reader)))
+    }
+
+    /// The `StoreService` over the env `store` holds, reopened when it fails.
+    #[must_use]
+    pub fn recovering(link: Link, store: Arc<Recovering>) -> Self {
         Self {
             link,
-            reader,
+            store,
             timeout: DEFAULT_TIMEOUT,
             clock: system_clock(),
         }
@@ -144,9 +157,9 @@ impl StoreServer {
         &self,
         read: impl FnOnce(&Reader, &Deadline) -> Result<T, ReadError> + Send + 'static,
     ) -> Result<T, Status> {
-        let reader = Arc::clone(&self.reader);
+        let store = Arc::clone(&self.store);
         let deadline = self.deadline();
-        tokio::task::spawn_blocking(move || read(&reader, &deadline))
+        tokio::task::spawn_blocking(move || store.read(|reader| read(reader, &deadline)))
             .await
             .map_err(|_| status(ReadError::Internal))?
             .map_err(status)
@@ -349,7 +362,15 @@ impl StoreService for StoreServer {
             .map_err(|e| e.to_status())?;
         let root = root_of(&req.root)?;
         let count = req.count.min(MAX_BLOCKS);
-        let walk = ParentWalk::new(Arc::clone(&self.reader), root, count, self.deadline());
+        let (store, deadline) = (Arc::clone(&self.store), self.deadline());
+        let walk = tokio::task::spawn_blocking(move || {
+            store
+                .reader()
+                .map(|reader| ParentWalk::new(reader, root, count, deadline))
+        })
+        .await
+        .map_err(|_| status(ReadError::Internal))?
+        .map_err(status)?;
         // The stamped first read, before the stream opens: with no stamp the call fails.
         let (mut walk, mut next) = step(walk).await?;
         let hello = pb::GetBlocksByHeadResponse::hello(self.hello()?);
