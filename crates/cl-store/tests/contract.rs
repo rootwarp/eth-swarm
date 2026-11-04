@@ -40,14 +40,13 @@ fn target(link: Link) -> Target {
 }
 
 /// The env every target serves: blocks written and stamped by store-schema's writer (cl-chain's
-/// side), which then closes, and the env opened read-only.
+/// side), which then closes, and the env opened read-only. Its temp dir is removed once the env
+/// is open: the open env reads on from the unlinked files, and nothing is left behind.
 struct Seeded {
     reader: Arc<Reader>,
     /// `(slot, root, ssz)` of every block, oldest first; one chain.
     blocks: Vec<(u64, [u8; 32], Vec<u8>)>,
     stamp: store_schema::stamp::Stamp,
-    /// Kept for the process: the env lives under the target dir, not removed.
-    _dir: tempfile::TempDir,
 }
 
 /// The first Fulu slot of the fixture link's schedule: the blocks get Fulu's digest.
@@ -61,10 +60,7 @@ fn fulu_start() -> u64 {
 fn seeded() -> &'static Seeded {
     static SEEDED: OnceLock<Seeded> = OnceLock::new();
     SEEDED.get_or_init(|| {
-        let dir = tempfile::Builder::new()
-            .prefix("contract-env-")
-            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-            .expect("a temp dir");
+        let dir = tempfile::tempdir().expect("a temp dir");
         let mut blocks = Vec::new();
         let mut parent = [0; 32];
         for i in 0..8 {
@@ -91,11 +87,11 @@ fn seeded() -> &'static Seeded {
                 .expect("the stamped commit");
         }
         let reader = Arc::new(Reader::open(dir.path()).expect("the env opens read-only"));
+        dir.close().expect("the temp dir is removed");
         Seeded {
             reader,
             blocks,
             stamp,
-            _dir: dir,
         }
     })
 }

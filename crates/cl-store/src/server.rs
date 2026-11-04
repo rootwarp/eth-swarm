@@ -1,22 +1,55 @@
 //! `ethswarm.store.v1` `StoreService` over a [`Reader`].
+//!
+//! - Every read runs on `spawn_blocking` under the call's [`Deadline`] ([`DEFAULT_TIMEOUT`]).
+//! - A failed read fails the call with a fixed message and the `common.v1.Error` in the status
+//!   details: `UNAVAILABLE` (`ERROR_CODE_RESOURCE_UNAVAILABLE`: nothing stamped to serve, or
+//!   the env cannot be read now), `NOT_FOUND`, `DEADLINE_EXCEEDED`; a malformed request is
+//!   `INVALID_ARGUMENT` (`ERROR_CODE_INVALID`); anything else is `INTERNAL`.
+//! - `GetBlock` (a root, a slot, `head` or `finalized`) and `GetChainHead` answer from one read
+//!   transaction and its stamp. `GetBlocksByRange` serves finalized blocks only, at most
+//!   [`MAX_BLOCKS`], read in one transaction before its stream opens. Envelope `root`s are
+//!   block roots.
+//! - `GetBlocksByHead` is a [`ParentWalk`]: `count` capped at [`MAX_BLOCKS`], stamped by its
+//!   first read (before the stream opens), then one block per read as the client reads, at
+//!   most one body ahead.
+//! - `GetChainHead` carries the stamp's head; the stamp holds no checkpoint epoch, justified
+//!   checkpoint, head state root or earliest slot, so those fields stay empty.
+//! - `GetState`, `GetPayloadEnvelope`, `GetDataColumns` and `GetDataColumnsByRange` run the
+//!   contract checks and answer `UNIMPLEMENTED`; so does `include_envelopes`.
+//! - The method ACL is [`store_acl`]: the server's owner puts it in front as an
+//!   [`ipc::acl::AclLayer`].
 
 use std::{sync::Arc, time::Duration};
 
+use ethswarm_proto::common::{Envelope, ErrorCode, Hello, PayloadType};
 use ethswarm_proto::store as pb;
 use ipc::{
-    acl::{AclError, MethodAcl},
+    acl::{AclError, AclTables, MethodAcl},
+    error::wire_error,
+    frame::OutFrame,
+    hello::stream_hello,
+    stub::{self, StubStream},
     Link,
 };
-use pb::store_service_server::{StoreService, StoreServiceServer};
-use tonic::service::Routes;
+use pb::{
+    block_id::Id,
+    store_service_server::{StoreService, StoreServiceServer},
+};
+use prost::Message;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{service::Routes, Code, Request, Response, Status};
 
-use crate::reader::{system_clock, Clock, Reader};
+use crate::reader::{
+    system_clock, Block, BlockRef, Clock, Deadline, ParentWalk, ReadError, Reader, Root, Stamp,
+    Stamped,
+};
 
 /// The callers of every `StoreService` method.
-pub const CALLERS: [&str; 3] = ["cl-api", "cl-sync", "cl-p2p"];
+const CALLERS: [&str; 3] = ["cl-api", "cl-sync", "cl-p2p"];
 
 /// Every `StoreService` method.
-pub const METHODS: [&str; 8] = [
+const METHODS: [&str; 8] = [
     "/ethswarm.store.v1.StoreService/GetBlock",
     "/ethswarm.store.v1.StoreService/GetState",
     "/ethswarm.store.v1.StoreService/GetDataColumns",
@@ -27,7 +60,10 @@ pub const METHODS: [&str; 8] = [
     "/ethswarm.store.v1.StoreService/GetBlocksByHead",
 ];
 
-/// The UIDs of the [`CALLERS`].
+/// `MAX_REQUEST_BLOCKS_DENEB`: the most blocks one range or parent walk serves.
+pub const MAX_BLOCKS: u64 = 128;
+
+/// The UIDs of cl-store's callers: cl-api, cl-sync and cl-p2p.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Callers {
     pub api: u32,
@@ -41,10 +77,19 @@ pub struct Callers {
 ///
 /// The ACL does not load.
 pub fn store_acl(callers: Callers) -> Result<MethodAcl, AclError> {
-    let _ = callers;
-    Err(AclError::Empty {
-        service: "cl-store".into(),
-    })
+    let uids = [callers.api, callers.sync, callers.p2p];
+    let tables = AclTables {
+        callers: CALLERS
+            .iter()
+            .zip(uids)
+            .map(|(name, uid)| ((*name).to_owned(), uid))
+            .collect(),
+        methods: METHODS
+            .iter()
+            .map(|method| ((*method).to_owned(), CALLERS.map(str::to_owned).to_vec()))
+            .collect(),
+    };
+    MethodAcl::from_tables("cl-store", &tables)
 }
 
 /// How long one call's reads may take, unless [`StoreServer::with_timeout`] says otherwise.
@@ -83,37 +128,262 @@ impl StoreServer {
         self
     }
 
-    /// The contract configuration every RPC is checked against.
-    #[must_use]
-    pub fn link(&self) -> &Link {
-        &self.link
-    }
-
     /// Every `ethswarm.store.v1` service, ready to serve.
     #[must_use]
     pub fn routes(self) -> Routes {
         Routes::new(StoreServiceServer::new(self))
     }
+
+    /// The deadline of a call starting now.
+    fn deadline(&self) -> Deadline {
+        Deadline::after(Arc::clone(&self.clock), self.timeout)
+    }
+
+    /// `read` on `spawn_blocking`, under the deadline of a call starting now.
+    async fn blocking<T: Send + 'static>(
+        &self,
+        read: impl FnOnce(&Reader, &Deadline) -> Result<T, ReadError> + Send + 'static,
+    ) -> Result<T, Status> {
+        let reader = Arc::clone(&self.reader);
+        let deadline = self.deadline();
+        tokio::task::spawn_blocking(move || read(&reader, &deadline))
+            .await
+            .map_err(|_| status(ReadError::Internal))?
+            .map_err(status)
+    }
+
+    /// `block` as an envelope at `seq` (0 in a unary response), with its slot's fork digest.
+    fn envelope(&self, block: Block, seq: u64) -> Result<Envelope, Status> {
+        let digest = self
+            .link
+            .fork_digest_at_slot(block.slot)
+            .ok_or_else(|| status(ReadError::Internal))?;
+        Ok(Envelope {
+            fork_digest: digest.to_vec(),
+            slot: block.slot,
+            root: block.root.to_vec(),
+            ssz: block.ssz,
+            payload_type: PayloadType::SignedBeaconBlock as i32,
+            trace_id: Vec::new(),
+            seq,
+        })
+    }
+
+    /// The hello a stream opens with (a fresh server generation).
+    fn hello(&self) -> Result<Hello, Status> {
+        stream_hello(&self.link.local())
+            .map(|(_, hello)| hello)
+            .map_err(|e| e.to_status())
+    }
+
+    fn head_body(
+        &self,
+        read: Stamped<Block>,
+        seq: u64,
+    ) -> Result<pb::GetBlocksByHeadResponseBody, Status> {
+        let meta = read_meta(&read.stamp, read.value.finalized);
+        Ok(pb::GetBlocksByHeadResponseBody {
+            block: Some(self.envelope(read.value, seq)?),
+            meta: Some(meta),
+            error: None,
+        })
+    }
 }
 
-ipc::stub_service!(StoreServer => StoreService {
-    unary: [
-        get_block(pb::GetBlockRequest) -> pb::GetBlockResponse,
-        get_state(pb::GetStateRequest) -> pb::GetStateResponse,
-        get_payload_envelope(pb::GetPayloadEnvelopeRequest) -> pb::GetPayloadEnvelopeResponse,
-        get_chain_head(pb::GetChainHeadRequest) -> pb::GetChainHeadResponse,
-    ],
-    unary_envelopes: [
-    ],
-    server_stream: [
-        get_data_columns(pb::GetDataColumnsRequest) -> pb::GetDataColumnsResponse as GetDataColumnsStream,
-        get_blocks_by_range(pb::GetBlocksByRangeRequest) -> pb::GetBlocksByRangeResponse as GetBlocksByRangeStream,
-        get_data_columns_by_range(pb::GetDataColumnsByRangeRequest) -> pb::GetDataColumnsByRangeResponse as GetDataColumnsByRangeStream,
-        get_blocks_by_head(pb::GetBlocksByHeadRequest) -> pb::GetBlocksByHeadResponse as GetBlocksByHeadStream,
-    ],
-    bidi: [
-    ],
-});
+/// The status a failed read fails its call with.
+fn status(err: ReadError) -> Status {
+    let (code, error) = match err {
+        ReadError::Unavailable => (Code::Unavailable, ErrorCode::ResourceUnavailable),
+        ReadError::NotFound => (Code::NotFound, ErrorCode::NotFound),
+        ReadError::DeadlineExceeded => (Code::DeadlineExceeded, ErrorCode::DeadlineExceeded),
+        ReadError::Internal => return Status::internal(err.to_string()),
+    };
+    failed(code, error, &err.to_string())
+}
+
+/// `code`, with `error` and `detail` as the `common.v1.Error` in the details.
+fn failed(code: Code, error: ErrorCode, detail: &str) -> Status {
+    let details = wire_error(error, detail).encode_to_vec();
+    Status::with_details(code, detail, details.into())
+}
+
+fn invalid(detail: &str) -> Status {
+    failed(Code::InvalidArgument, ErrorCode::Invalid, detail)
+}
+
+fn root_of(bytes: &[u8]) -> Result<Root, Status> {
+    bytes
+        .try_into()
+        .map_err(|_| invalid("a block root is 32 bytes"))
+}
+
+fn read_meta(stamp: &Stamp, finalized: bool) -> pb::ReadMeta {
+    pb::ReadMeta {
+        as_of_seq: stamp.head_seq,
+        as_of_root: stamp.head_root.to_vec(),
+        as_of_slot: stamp.head_slot,
+        execution_optimistic: false,
+        finalized,
+    }
+}
+
+/// The walk's next block, read on `spawn_blocking`.
+async fn step(mut walk: ParentWalk) -> Result<(ParentWalk, Option<Stamped<Block>>), Status> {
+    let (walk, next) = tokio::task::spawn_blocking(move || {
+        let next = walk.next();
+        (walk, next)
+    })
+    .await
+    .map_err(|_| status(ReadError::Internal))?;
+    Ok((walk, next.transpose().map_err(status)?))
+}
+
+#[tonic::async_trait]
+impl StoreService for StoreServer {
+    type GetDataColumnsStream = StubStream<pb::GetDataColumnsResponse>;
+    type GetBlocksByRangeStream = StubStream<pb::GetBlocksByRangeResponse>;
+    type GetDataColumnsByRangeStream = StubStream<pb::GetDataColumnsByRangeResponse>;
+    type GetBlocksByHeadStream = StubStream<pb::GetBlocksByHeadResponse>;
+
+    async fn get_block(
+        &self,
+        request: Request<pb::GetBlockRequest>,
+    ) -> Result<Response<pb::GetBlockResponse>, Status> {
+        let at = match request.into_inner().id.and_then(|id| id.id) {
+            Some(Id::Root(root)) => BlockRef::Root(root_of(&root)?),
+            Some(Id::Slot(slot)) => BlockRef::Slot(slot),
+            Some(Id::Named(name)) if name == "head" => BlockRef::Head,
+            Some(Id::Named(name)) if name == "finalized" => BlockRef::Finalized,
+            _ => return Err(invalid("block id: a root, a slot, head or finalized")),
+        };
+        let read = self.blocking(move |r, d| r.block(at, d)).await?;
+        let meta = read_meta(&read.stamp, read.value.finalized);
+        Ok(Response::new(pb::GetBlockResponse {
+            block: Some(self.envelope(read.value, 0)?),
+            meta: Some(meta),
+            error: None,
+        }))
+    }
+
+    async fn get_state(
+        &self,
+        _: Request<pb::GetStateRequest>,
+    ) -> Result<Response<pb::GetStateResponse>, Status> {
+        stub::unary(&self.link, "get_state", &[])
+    }
+
+    async fn get_data_columns(
+        &self,
+        request: Request<pb::GetDataColumnsRequest>,
+    ) -> Result<Response<Self::GetDataColumnsStream>, Status> {
+        stub::server_stream(&self.link, "get_data_columns", request.get_ref())
+    }
+
+    async fn get_payload_envelope(
+        &self,
+        _: Request<pb::GetPayloadEnvelopeRequest>,
+    ) -> Result<Response<pb::GetPayloadEnvelopeResponse>, Status> {
+        stub::unary(&self.link, "get_payload_envelope", &[])
+    }
+
+    async fn get_blocks_by_range(
+        &self,
+        request: Request<pb::GetBlocksByRangeRequest>,
+    ) -> Result<Response<Self::GetBlocksByRangeStream>, Status> {
+        let req = request.into_inner();
+        self.link
+            .accept_hello_field(req.hello.as_ref())
+            .map_err(|e| e.to_status())?;
+        if req.count > MAX_BLOCKS {
+            return Err(invalid("count is at most 128"));
+        }
+        if req.include_envelopes {
+            return Err(Status::unimplemented(
+                "payload envelopes are not stored yet",
+            ));
+        }
+        let (start, count) = (req.start_slot, req.count);
+        let read = self
+            .blocking(move |r, d| r.finalized_blocks(start, count, d))
+            .await?;
+        let meta = read_meta(&read.stamp, true);
+        let mut frames = vec![Ok(pb::GetBlocksByRangeResponse::hello(self.hello()?))];
+        for (seq, block) in (1..).zip(read.value) {
+            let body = pb::GetBlocksByRangeResponseBody {
+                item: Some(self.envelope(block, seq)?),
+                meta: Some(meta.clone()),
+                error: None,
+            };
+            frames.push(Ok(pb::GetBlocksByRangeResponse::body(body)));
+        }
+        Ok(Response::new(Box::pin(tokio_stream::iter(frames))))
+    }
+
+    async fn get_data_columns_by_range(
+        &self,
+        request: Request<pb::GetDataColumnsByRangeRequest>,
+    ) -> Result<Response<Self::GetDataColumnsByRangeStream>, Status> {
+        stub::server_stream(&self.link, "get_data_columns_by_range", request.get_ref())
+    }
+
+    async fn get_chain_head(
+        &self,
+        _: Request<pb::GetChainHeadRequest>,
+    ) -> Result<Response<pb::GetChainHeadResponse>, Status> {
+        let stamp = self.blocking(|r, d| r.head(d)).await?;
+        Ok(Response::new(pb::GetChainHeadResponse {
+            head_slot: stamp.head_slot,
+            head_root: stamp.head_root.to_vec(),
+            meta: Some(read_meta(&stamp, stamp.head_slot <= stamp.finalized_slot)),
+            ..Default::default()
+        }))
+    }
+
+    async fn get_blocks_by_head(
+        &self,
+        request: Request<pb::GetBlocksByHeadRequest>,
+    ) -> Result<Response<Self::GetBlocksByHeadStream>, Status> {
+        let req = request.into_inner();
+        self.link
+            .accept_hello_field(req.hello.as_ref())
+            .map_err(|e| e.to_status())?;
+        let root = root_of(&req.root)?;
+        let count = req.count.min(MAX_BLOCKS);
+        let walk = ParentWalk::new(Arc::clone(&self.reader), root, count, self.deadline());
+        // The stamped first read, before the stream opens: with no stamp the call fails.
+        let (mut walk, mut next) = step(walk).await?;
+        let hello = pb::GetBlocksByHeadResponse::hello(self.hello()?);
+        let (tx, rx) = mpsc::channel(1);
+        let server = self.clone();
+        ipc::spawn_in_span(async move {
+            if tx.send(Ok(hello)).await.is_err() {
+                return;
+            }
+            let mut seq = 0;
+            while let Some(read) = next {
+                seq += 1;
+                let body = server.head_body(read, seq);
+                let failed = body.is_err();
+                if tx
+                    .send(body.map(pb::GetBlocksByHeadResponse::body))
+                    .await
+                    .is_err()
+                    || failed
+                {
+                    return;
+                }
+                match step(walk).await {
+                    Ok((rest, after)) => (walk, next) = (rest, after),
+                    Err(status) => {
+                        let _ = tx.send(Err(status)).await;
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -13,19 +13,26 @@
 //! the stamp's head (from its finalized block, for a slot at or below it); a skipped slot, or a
 //! slot whose only blocks are off that chain, is [`ReadError::NotFound`].
 //!
-//! Every transaction runs under its call's [`Deadline`], checked when it opens, every
-//! [`DEADLINE_EVERY`] blocks it walks and once more before its data is returned, so a slow read
+//! Every transaction runs under its call's [`Deadline`], checked when it opens, every 64 blocks
+//! it walks and once more before its data is returned, with the transaction open, so a slow read
 //! cannot pin MVCC pages past it. [`ParentWalk`] (`GetBlocksByHead`) is stamped once, by its
 //! first transaction, then reads each further block in a short transaction of its own.
 
 use std::{
-    borrow::Borrow,
+    borrow::{Borrow, Cow},
+    cell::Cell,
+    ops::ControlFlow,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use store_schema::env::{self, Env, RoTxn};
+use store_schema::{
+    env::{self, Env, RoTxn},
+    keys::slot_root_key,
+    stamp,
+    tables::{BLOCKS, BLOCK_INDEX},
+};
 pub use store_schema::{keys::Root, stamp::Stamp};
 
 /// A monotonic clock. The server's is [`system_clock`]; tests inject their own.
@@ -38,7 +45,7 @@ pub fn system_clock() -> Clock {
 }
 
 /// How many blocks a walk reads between two looks at its deadline.
-pub const DEADLINE_EVERY: usize = 64;
+const DEADLINE_EVERY: usize = 64;
 
 /// The point past which a call's read transactions stop with [`ReadError::DeadlineExceeded`].
 #[derive(Clone)]
@@ -151,8 +158,7 @@ impl Reader {
     ///
     /// [`ReadError`].
     pub fn block(&self, at: BlockRef, deadline: &Deadline) -> Result<Stamped<Block>, ReadError> {
-        let _ = (at, deadline);
-        Err(ReadError::Internal)
+        self.read(deadline, |snap, stamp| snap.block(stamp, at))
     }
 
     /// The stamp alone: the head and finalized block the env was last committed with.
@@ -161,24 +167,214 @@ impl Reader {
     ///
     /// [`ReadError`].
     pub fn head(&self, deadline: &Deadline) -> Result<Stamp, ReadError> {
-        let _ = deadline;
-        Err(ReadError::Internal)
+        self.read(deadline, |_, _| Ok(())).map(|read| read.stamp)
     }
 
-    /// One stamped read: `f` runs in a read transaction with the stamp row read in it.
+    /// One read transaction: `f` runs in it, and the deadline is checked when it opens and
+    /// again, with the transaction still open, before `f`'s value is returned.
+    fn view<T>(
+        &self,
+        deadline: &Deadline,
+        f: impl FnOnce(&Snapshot<'_>) -> Result<T, ReadError>,
+    ) -> Result<T, ReadError> {
+        let snap = Snapshot {
+            txn: self.env().begin_ro_txn()?,
+            deadline,
+            walked: Cell::new(0),
+        };
+        deadline.check()?;
+        let value = f(&snap)?;
+        deadline.check()?;
+        Ok(value)
+    }
+
+    /// One stamped read: [`Self::view`] with the stamp row read first, in the same transaction.
     pub(crate) fn read<T>(
         &self,
         deadline: &Deadline,
         f: impl FnOnce(&Snapshot<'_>, &Stamp) -> Result<T, ReadError>,
     ) -> Result<Stamped<T>, ReadError> {
-        let _ = (deadline, f);
-        Err(ReadError::Internal)
+        self.view(deadline, |snap| {
+            let stamp = snap.stamp()?;
+            let value = f(snap, &stamp)?;
+            Ok(Stamped { stamp, value })
+        })
     }
+}
+
+impl From<libmdbx::Error> for ReadError {
+    fn from(err: libmdbx::Error) -> Self {
+        match err {
+            libmdbx::Error::ReadersFull | libmdbx::Error::Busy | libmdbx::Error::WannaRecovery => {
+                Self::Unavailable
+            }
+            _ => Self::Internal,
+        }
+    }
+}
+
+impl From<store_schema::Error> for ReadError {
+    fn from(err: store_schema::Error) -> Self {
+        match err {
+            store_schema::Error::Mdbx(err) => err.into(),
+            _ => Self::Internal,
+        }
+    }
+}
+
+/// `SignedBeaconBlock` SSZ in every fork: the 4-byte offset of `message`, always 100 (the
+/// 96-byte signature is its only other field), then the message's `slot` (`u64` LE),
+/// `proposer_index` (8) and `parent_root` (32).
+const MESSAGE_OFFSET: u32 = 100;
+const SLOT_AT: usize = MESSAGE_OFFSET as usize;
+const PARENT_ROOT_AT: usize = SLOT_AT + 16;
+
+/// The slot and parent root of a block's SSZ; [`ReadError::Internal`] for bytes without that
+/// layout.
+fn slot_and_parent(ssz: &[u8]) -> Result<(u64, Root), ReadError> {
+    let offset = ssz.get(..4).and_then(|b| b.try_into().ok());
+    let slot = ssz
+        .get(SLOT_AT..SLOT_AT + 8)
+        .and_then(|b| b.try_into().ok());
+    let parent = ssz.get(PARENT_ROOT_AT..PARENT_ROOT_AT + 32);
+    match (
+        offset.map(u32::from_le_bytes),
+        slot,
+        parent.map(Root::try_from),
+    ) {
+        (Some(MESSAGE_OFFSET), Some(slot), Some(Ok(parent))) => {
+            Ok((u64::from_le_bytes(slot), parent))
+        }
+        _ => Err(ReadError::Internal),
+    }
+}
+
+/// A block as a read transaction holds it.
+struct Stored<'t> {
+    slot: u64,
+    parent: Root,
+    ssz: Cow<'t, [u8]>,
 }
 
 /// One read transaction under its call's deadline.
 pub(crate) struct Snapshot<'r> {
     txn: RoTxn<'r>,
+    deadline: &'r Deadline,
+    /// Blocks walked so far, for the deadline's look every [`DEADLINE_EVERY`].
+    walked: Cell<usize>,
+}
+
+impl Snapshot<'_> {
+    /// The stamp row; with none there is nothing to serve. Nor with a head `seq` or slot of 0,
+    /// which a `ReadMeta` cannot carry (they read as missing).
+    fn stamp(&self) -> Result<Stamp, ReadError> {
+        match stamp::read(&self.txn)? {
+            Some(stamp) if stamp.head_seq > 0 && stamp.head_slot > 0 => Ok(stamp),
+            _ => Err(ReadError::Unavailable),
+        }
+    }
+
+    /// The block at `root`: its slot (`block_index`), SSZ (`blocks`) and parent root; `None`
+    /// if it has no index row. An index row without its block, or a block whose SSZ is not of
+    /// that slot, is corruption.
+    fn stored(&self, root: &Root) -> Result<Option<Stored<'_>>, ReadError> {
+        let index = self.txn.open_table(Some(BLOCK_INDEX))?;
+        let Some(slot) = self.txn.get::<[u8; 8]>(&index, root)? else {
+            return Ok(None);
+        };
+        let slot = u64::from_be_bytes(slot);
+        let blocks = self.txn.open_table(Some(BLOCKS))?;
+        let ssz = self
+            .txn
+            .get::<Cow<'_, [u8]>>(&blocks, &slot_root_key(slot, root))?
+            .ok_or(ReadError::Internal)?;
+        match slot_and_parent(&ssz)? {
+            (own, parent) if own == slot => Ok(Some(Stored { slot, parent, ssz })),
+            _ => Err(ReadError::Internal),
+        }
+    }
+
+    /// Walks the parents down from `from`, newest first: `visit` sees each stored block
+    /// `(slot, root, ssz)` until it breaks, a block is below `low`, or a parent is not stored.
+    /// Each parent's slot must be below its child's.
+    pub(crate) fn walk(
+        &self,
+        from: Root,
+        low: u64,
+        mut visit: impl FnMut(u64, Root, &[u8]) -> ControlFlow<()>,
+    ) -> Result<(), ReadError> {
+        let mut next = Some(from);
+        let mut above = None;
+        while let Some(root) = next.take() {
+            let Some(block) = self.stored(&root)? else {
+                break;
+            };
+            let walked = self.walked.get() + 1;
+            self.walked.set(walked);
+            if walked.is_multiple_of(DEADLINE_EVERY) {
+                self.deadline.check()?;
+            }
+            if above.is_some_and(|above| block.slot >= above) {
+                return Err(ReadError::Internal);
+            }
+            if block.slot < low || visit(block.slot, root, &block.ssz).is_break() {
+                break;
+            }
+            above = Some(block.slot);
+            next = (block.slot > 0).then_some(block.parent);
+        }
+        Ok(())
+    }
+
+    /// The stamp's canonical block at `slot`: the one on the walk down from its head (from its
+    /// finalized block, for a slot at or below that). `None` for a skipped slot, a slot above
+    /// the head and one below what is stored.
+    fn canonical_at(&self, stamp: &Stamp, slot: u64) -> Result<Option<Root>, ReadError> {
+        if slot > stamp.head_slot {
+            return Ok(None);
+        }
+        let from = if slot <= stamp.finalized_slot {
+            stamp.finalized_root
+        } else {
+            stamp.head_root
+        };
+        let mut found = None;
+        self.walk(from, slot, |at, root, _| {
+            if at == slot {
+                found = Some(root);
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        })?;
+        Ok(found)
+    }
+
+    /// Whether the block `(slot, root)` is finalized by `stamp`: at or below its finalized
+    /// slot and on its chain.
+    fn finalized(&self, stamp: &Stamp, slot: u64, root: Root) -> Result<bool, ReadError> {
+        Ok(slot <= stamp.finalized_slot && self.canonical_at(stamp, slot)? == Some(root))
+    }
+
+    fn block(&self, stamp: &Stamp, at: BlockRef) -> Result<Block, ReadError> {
+        let root = match at {
+            BlockRef::Root(root) => root,
+            BlockRef::Slot(slot) => self.canonical_at(stamp, slot)?.ok_or(ReadError::NotFound)?,
+            BlockRef::Head => stamp.head_root,
+            BlockRef::Finalized => stamp.finalized_root,
+        };
+        let Stored { slot, ssz, .. } = self.stored(&root)?.ok_or(ReadError::NotFound)?;
+        let finalized = match at {
+            // By root, the block may be off the stamp's chain.
+            BlockRef::Root(_) => self.finalized(stamp, slot, root)?,
+            _ => slot <= stamp.finalized_slot,
+        };
+        Ok(Block {
+            slot,
+            root,
+            ssz: ssz.into_owned(),
+            finalized,
+        })
+    }
 }
 
 /// `GetBlocksByHead`: the block at a root, then its parent, and so on, newest first. The first
@@ -186,11 +382,21 @@ pub(crate) struct Snapshot<'r> {
 /// step reads one block in a short transaction of its own, under the same deadline, whatever
 /// the stamp is by then. The walk ends after `count` blocks, at a parent that is not stored, or
 /// at once for an unknown root; it fuses after an error.
+///
+/// A block's `finalized` is decided once, at the first block at or below the stamp's finalized
+/// slot (whether it is on the stamp's chain, read in that block's transaction), and holds for
+/// every block below it: a walk that reaches that slot on a fork reads its blocks below as not
+/// finalized, never the other way.
 pub struct ParentWalk {
     reader: Arc<Reader>,
     deadline: Deadline,
     next: Option<Root>,
     left: u64,
+    /// The first step's stamp.
+    stamp: Option<Stamp>,
+    /// The last block's slot: each parent's is lower.
+    above: Option<u64>,
+    finalized: Option<bool>,
 }
 
 impl ParentWalk {
@@ -201,7 +407,56 @@ impl ParentWalk {
             deadline,
             next: Some(root),
             left: count,
+            stamp: None,
+            above: None,
+            finalized: None,
         }
+    }
+
+    /// The block at `root`, if stored, and where the walk goes on.
+    fn step(&mut self, root: Root) -> Result<Option<Stamped<Block>>, ReadError> {
+        let decided = self.finalized.is_some();
+        let read = |snap: &Snapshot<'_>, stamp: &Stamp| {
+            let Some(Stored { slot, parent, ssz }) = snap.stored(&root)? else {
+                return Ok(None);
+            };
+            let finalized = if decided || slot > stamp.finalized_slot {
+                None
+            } else {
+                Some(snap.finalized(stamp, slot, root)?)
+            };
+            Ok(Some((slot, parent, ssz.into_owned(), finalized)))
+        };
+        let Stamped { stamp, value } = match self.stamp {
+            None => self.reader.read(&self.deadline, read)?,
+            Some(stamp) => Stamped {
+                stamp,
+                value: self
+                    .reader
+                    .view(&self.deadline, |snap| read(snap, &stamp))?,
+            },
+        };
+        self.stamp = Some(stamp);
+        let Some((slot, parent, ssz, finalized)) = value else {
+            return Ok(None);
+        };
+        if self.above.is_some_and(|above| slot >= above) {
+            return Err(ReadError::Internal);
+        }
+        self.finalized = self.finalized.or(finalized);
+        self.above = Some(slot);
+        self.left -= 1;
+        self.next = (slot > 0).then_some(parent);
+        let finalized = self.finalized == Some(true);
+        Ok(Some(Stamped {
+            stamp,
+            value: Block {
+                slot,
+                root,
+                ssz,
+                finalized,
+            },
+        }))
     }
 }
 
@@ -209,8 +464,11 @@ impl Iterator for ParentWalk {
     type Item = Result<Stamped<Block>, ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let _ = (&self.reader, &self.deadline, self.left);
-        self.next.take().map(|_| Err(ReadError::Internal))
+        let root = self.next.take()?;
+        if self.left == 0 {
+            return None;
+        }
+        self.step(root).transpose()
     }
 }
 
@@ -254,6 +512,30 @@ mod tests {
             iov_base: bytes.as_ptr().cast_mut().cast(),
             iov_len: bytes.len(),
         }
+    }
+
+    /// An MDBX error leaves only a fixed kind: `Unavailable` for the env being out of reach
+    /// for now (reader slots full, busy, wants recovery), `Internal` for any other; never its
+    /// own text.
+    #[test]
+    fn mdbx_errors_map_to_fixed_kinds() {
+        use libmdbx::Error as E;
+        for (err, want) in [
+            (E::ReadersFull, ReadError::Unavailable),
+            (E::Busy, ReadError::Unavailable),
+            (E::WannaRecovery, ReadError::Unavailable),
+            (E::Corrupted, ReadError::Internal),
+            (E::Panic, ReadError::Internal),
+            (E::Access, ReadError::Internal),
+            (E::Other(5), ReadError::Internal),
+        ] {
+            let text = err.to_string();
+            let got = ReadError::from(store_schema::Error::Mdbx(err));
+            assert_eq!(got, want, "{text}");
+            assert!(!got.to_string().contains(&text), "{text}");
+        }
+        let malformed = store_schema::Error::MalformedStamp { len: 3 };
+        assert_eq!(ReadError::from(malformed), ReadError::Internal);
     }
 
     /// cl-store opens the env read-only: a write transaction, and a put, a delete, a table
@@ -334,7 +616,6 @@ mod tests {
         for (what, code) in codes {
             assert_eq!(code, mdbx_sys::MDBX_EACCESS, "{what}");
         }
-        drop(blocks);
         drop(ro);
         assert_eq!(env_rows(&reader), before, "a write changed the env");
         assert_eq!(reader.block(BlockRef::Root(root), &deadline()), served);

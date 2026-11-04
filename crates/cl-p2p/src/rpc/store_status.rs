@@ -6,14 +6,27 @@
 //! in the status details, when it has nothing stamped to serve from: the responder does not
 //! have the data, `3: ResourceUnavailable`, never `2: ServerError`.
 
+use ethswarm_proto::common::ErrorCode;
+use ipc::error::error_from_status;
 use p2p_wire::rpc::protocols::ResultCode;
-use tonic::Status;
+use tonic::{Code, Status};
 
-/// The result code for a store call that failed with `status`.
+/// The result code for a store call that failed with `status`: cl-store's own `UNAVAILABLE`
+/// is `3: ResourceUnavailable`. Anything else, and a call that failed without cl-store's
+/// error in the details (the transport's `UNAVAILABLE`, a store that cannot be reached), is
+/// `2: ServerError`.
 #[must_use]
 pub fn store_result_code(status: &Status) -> ResultCode {
-    let _ = status;
-    ResultCode::ServerError
+    let from_store = !status.details().is_empty();
+    let error = error_from_status(status).code;
+    if from_store
+        && status.code() == Code::Unavailable
+        && error == ErrorCode::ResourceUnavailable as i32
+    {
+        ResultCode::ResourceUnavailable
+    } else {
+        ResultCode::ServerError
+    }
 }
 
 #[cfg(test)]
