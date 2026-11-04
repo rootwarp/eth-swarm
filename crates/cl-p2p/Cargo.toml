@@ -114,3 +114,11 @@ proptest = "1"
 cl-chain = { path = "../cl-chain" }
 # test-hooks: the tests' column stores open stamped (`ColumnWriter::open_seeded`).
 cl-chain-columns = { path = "../cl-chain-columns", features = ["test-hooks"] }
+# tests/byrange_serve.rs: the real cl-store and cl-chain servers over one env (#146).
+# test-hooks: cl-store reads through the writer's env (`Reader::over`), and the env is written
+# with blocks and a stamp (`env::test_writer`, `WriterEnv::raw_env`). Workspace crates, test-only
+# (scripts/check-m2a-deps.sh reads the normal dependencies).
+cl-store = { path = "../cl-store", features = ["test-hooks"] }
+store-schema = { path = "../store-schema", features = ["test-hooks"] }
+# blocks_ipc::tests write a store answer's field by its tag; the version the workspace pins.
+prost.workspace = true

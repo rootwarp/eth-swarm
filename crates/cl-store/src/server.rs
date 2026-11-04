@@ -583,6 +583,38 @@ mod tests {
         client(server(store)).await
     }
 
+    /// The field of `GetChainHeadResponse` #146 adds, read off the wire: `finalized_slot` (8).
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct FinalizedSlot {
+        #[prost(uint64, tag = "8")]
+        finalized_slot: u64,
+    }
+
+    fn finalized_slot(head: &pb::GetChainHeadResponse) -> u64 {
+        FinalizedSlot::decode(head.encode_to_vec().as_slice())
+            .unwrap()
+            .finalized_slot
+    }
+
+    /// #146: `GetChainHead` carries the stamp's finalized slot (`finalized_slot`, 8), the split
+    /// point cl-p2p serves a BlocksByRange answer around, from the same read as the head; in
+    /// process and over a Unix socket.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chain_head_carries_finalized_slot() {
+        let store = Store::new();
+        let blocks = chain(8);
+        let all: Vec<&[u8]> = blocks.iter().map(|b| b.ssz.as_slice()).collect();
+        store.import(&all, stamp_of(1, &blocks[7], &blocks[4]));
+        let dir = ipc::testkit::tempdir();
+        for mode in [Mode::InProcess, Mode::over_uds(dir.path())] {
+            let conn = mode.connect(Server::new(server(&store).routes())).await;
+            let mut reader = StoreReader::new(conn.transport.clone(), fixture::v1_link());
+            let head = reader.get_chain_head().await.unwrap();
+            assert_eq!(head.head_slot, blocks[7].slot, "{}", mode.name());
+            assert_eq!(finalized_slot(&head), blocks[4].slot, "{}", mode.name());
+        }
+    }
+
     /// A commit that lands while a `GetBlocksByHead` stream is being read (a new head, a new
     /// stamp) leaves the stream gap-free and without a duplicate: every parent of the root,
     /// once each, all under the first read's stamp. The stream produces at most a body ahead

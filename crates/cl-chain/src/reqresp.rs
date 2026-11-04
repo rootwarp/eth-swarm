@@ -973,6 +973,7 @@ pub struct ReqRespServer {
     columns: Arc<ColumnServer>,
     reads: Arc<Semaphore>,
     status: Option<Arc<dyn ChainStatus>>,
+    blocks: Option<Arc<dyn BlockStore>>,
 }
 
 impl std::fmt::Debug for ReqRespServer {
@@ -1001,6 +1002,7 @@ impl ReqRespServer {
             columns,
             reads: Arc::new(Semaphore::new(max_reads)),
             status: None,
+            blocks: None,
         }
     }
 
@@ -1008,6 +1010,13 @@ impl ReqRespServer {
     #[must_use]
     pub fn serving_status(mut self, status: Arc<dyn ChainStatus>) -> Self {
         self.status = Some(status);
+        self
+    }
+
+    /// The same server, answering `BlocksByRange` from `store`'s canonical blocks.
+    #[must_use]
+    pub fn serving_blocks(mut self, store: Arc<dyn BlockStore>) -> Self {
+        self.blocks = Some(store);
         self
     }
 
@@ -1173,6 +1182,10 @@ impl ReqRespService for ReqRespServer {
         .await
     }
 }
+
+mod blocks;
+
+pub use blocks::{canonical_blocks, BlockStore, StoredBlock};
 
 #[cfg(test)]
 mod tests;

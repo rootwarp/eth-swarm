@@ -7,6 +7,12 @@ rust-version.workspace = true
 publish = false
 description = "cl-store: the ethswarm.store.v1 service, the read side of the store env (MDBX opened read-only)."
 
+[features]
+# Seam for other crates' tests only: `Reader::over`, a reader of an env this process already
+# has open (cl-p2p's tests/byrange_serve.rs serves cl-store and cl-chain over one env). Only
+# dev-dependencies enable it, so a normal build of the service leaves it off.
+test-hooks = []
+
 [dependencies]
 ethswarm-proto = { path = "../ethswarm-proto" }
 ipc = { path = "../ipc" }

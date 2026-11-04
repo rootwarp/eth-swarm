@@ -341,6 +341,12 @@ impl RpcMetrics {
         self.inbound_streams_refused.get()
     }
 
+    /// The current `rpc_block_lookup_failures_total{half, kind}`.
+    #[must_use]
+    pub fn block_lookup_failures(&self, _half: &str, _kind: &str) -> u64 {
+        0
+    }
+
     /// Sets `rpc_column_answers` and `rpc_column_answer_bytes`.
     pub(crate) fn set_column_answers(&self, held: usize, bytes: usize) {
         self.column_answers

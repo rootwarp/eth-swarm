@@ -17,6 +17,7 @@ mod flat_yaml;
 mod fork_schedule;
 pub mod network_dir;
 mod preset;
+pub mod window;
 
 pub use chain_config::{
     BlobParameters, ChainConfig, ConfigError, Genesis, Network, PinnedSource,

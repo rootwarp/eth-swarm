@@ -1413,3 +1413,296 @@ async fn get_status_serves_the_status_source() {
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unavailable);
 }
+
+// --- BeaconBlocksByRange v2 (#146) ---
+
+mod by_range {
+    use super::*;
+    use consensus_types::{forked, Minimal};
+    use ipc::envelope::DigestTable;
+    use network_config::{ForkSchedule, ScheduledFork};
+    use p2p_wire::testkit::{fulu_block, gloas_block, FULU_BPO_DIGEST, FULU_DIGEST, GLOAS_DIGEST};
+    use ssz::Encode;
+    use store_schema::env::{test_writer, WriterEnv};
+    use store_schema::stamp::Stamp;
+    use store_schema::txn::{self, Update};
+    use tokio_stream::StreamExt;
+
+    /// The fixture's skipped slots, and its fork block's slot (off the head's chain).
+    const SKIPPED: [u64; 4] = [5, 17, 33, 36];
+    const HEAD: u64 = 40;
+    const FINALIZED: u64 = 20;
+
+    /// Fulu from epoch 0, Gloas from epoch 4 (minimal preset: 8 slots an epoch).
+    fn schedule() -> ForkSchedule {
+        let at = |version, epoch| ScheduledFork { version, epoch };
+        ForkSchedule::new(at([6, 0, 0, 1], 0), at([7, 0, 0, 1], 4)).unwrap()
+    }
+
+    /// The fixture link: Fulu at epoch 0, its BPO digest at 2, Gloas at 4 (the digests of
+    /// cl-p2p's `responder::testing::serving_table`).
+    fn link() -> Link {
+        let hello = common::Hello {
+            api_version: 1,
+            min_api_version: 1,
+            max_api_version: 1,
+            ..Default::default()
+        };
+        let digests = DigestTable::new(vec![
+            (0, ForkName::Fulu, FULU_DIGEST),
+            (2, ForkName::Fulu, FULU_BPO_DIGEST),
+            (4, ForkName::Gloas, GLOAS_DIGEST),
+        ])
+        .unwrap();
+        Link::new::<Minimal>(hello, 1, schedule(), digests)
+    }
+
+    /// The digest of `slot`'s epoch.
+    fn digest(slot: u64) -> [u8; 4] {
+        match slot / 8 {
+            0..=1 => FULU_DIGEST,
+            2..=3 => FULU_BPO_DIGEST,
+            _ => GLOAS_DIGEST,
+        }
+    }
+
+    /// A block at `slot` on `parent`: Fulu before epoch 4, Gloas from it; `salt` makes
+    /// siblings differ. Its root and SSZ.
+    fn block(slot: u64, parent: Root, salt: u64) -> (Root, Vec<u8>) {
+        let block = if slot < 32 {
+            let mut b = fulu_block::<Minimal>(slot);
+            b.message.parent_root = parent.into();
+            b.message.proposer_index = salt;
+            forked::SignedBeaconBlock::Fulu(b)
+        } else {
+            let mut b = gloas_block::<Minimal>(slot);
+            b.message.parent_root = parent.into();
+            b.message.proposer_index = salt;
+            forked::SignedBeaconBlock::Gloas(b)
+        };
+        (block.message_root().0, block.as_ssz_bytes())
+    }
+
+    /// One stored block: slot, root, SSZ.
+    type Stored = (u64, Root, Vec<u8>);
+
+    /// The canonical chain of slots 1 to [`HEAD`] but [`SKIPPED`], each on the one before, and
+    /// a fork block at 36 on the block at 35 (the head's chain goes 35, 37).
+    fn fixture() -> (Vec<Stored>, Stored) {
+        let mut chain: Vec<Stored> = Vec::new();
+        for slot in (1..=HEAD).filter(|s| !SKIPPED.contains(s)) {
+            let parent = chain.last().map_or([0; 32], |b| b.1);
+            let (root, ssz) = block(slot, parent, 0);
+            chain.push((slot, root, ssz));
+        }
+        let at_35 = chain.iter().find(|b| b.0 == 35).unwrap().1;
+        let (root, ssz) = block(36, at_35, 9);
+        (chain, (36, root, ssz))
+    }
+
+    /// cl-chain's env, as its req/resp server reads it.
+    struct Env(WriterEnv);
+
+    impl BlockStore for Env {
+        fn read_txn(&self) -> Result<store_schema::env::RoTxn<'_>, String> {
+            self.0.begin_ro_txn().map_err(|e| e.to_string())
+        }
+    }
+
+    /// An env holding `blocks`, stamped with `stamp` if given.
+    fn env(blocks: &[&Stored], stamp: Option<Stamp>) -> (tempfile::TempDir, Arc<Env>) {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = test_writer(dir.path()).unwrap();
+        if let Some(stamp) = stamp {
+            let txn = txn::begin(&writer).unwrap();
+            for (_, _, ssz) in blocks {
+                store_schema::blocks::put::<Minimal>(&txn, &schedule(), ssz).unwrap();
+            }
+            txn::commit(txn, Update::New(stamp)).unwrap();
+        }
+        (dir, Arc::new(Env(writer)))
+    }
+
+    /// The fixture env: head at [`HEAD`], finalized at [`FINALIZED`], the fork block stored.
+    fn seeded() -> (tempfile::TempDir, Arc<Env>, Vec<Stored>, Stored) {
+        let (chain, fork) = fixture();
+        let at = |slot: u64| chain.iter().find(|b| b.0 == slot).unwrap().1;
+        let stamp = Stamp {
+            head_seq: 3,
+            head_root: at(HEAD),
+            head_slot: HEAD,
+            finalized_root: at(FINALIZED),
+            finalized_slot: FINALIZED,
+        };
+        let all: Vec<&Stored> = chain.iter().chain([&fork]).collect();
+        let (dir, env) = env(&all, Some(stamp));
+        (dir, env, chain, fork)
+    }
+
+    fn server(blocks: Option<Arc<Env>>, max_reads: usize) -> (tempfile::TempDir, ReqRespServer) {
+        let (dir, writer) = store();
+        let columns = Arc::new(ColumnServer::new(
+            Arc::new(writer) as Arc<dyn ColumnStore>,
+            U256::MAX,
+            Arc::new(Fixed),
+            ServeBudget::default(),
+        ));
+        let server = ReqRespServer::with_max_reads(link(), columns, max_reads);
+        let server = match blocks {
+            Some(env) => server.serving_blocks(env as Arc<dyn BlockStore>),
+            None => server,
+        };
+        (dir, server)
+    }
+
+    fn request(start_slot: u64, count: u64) -> pb::BlocksByRangeRequest {
+        pb::BlocksByRangeRequest {
+            start_slot,
+            count,
+            hello: Some(link().local()),
+        }
+    }
+
+    /// What the server streams for `request`: the envelopes, then the error code if the
+    /// answer ends with one.
+    async fn answer(
+        server: &ReqRespServer,
+        request: pb::BlocksByRangeRequest,
+    ) -> Result<(Vec<Envelope>, Option<i32>), Status> {
+        let mut stream = server
+            .blocks_by_range(Request::new(request))
+            .await?
+            .into_inner();
+        let (mut envelopes, mut code) = (Vec::new(), None);
+        match stream.next().await {
+            Some(Ok(pb::BlocksByRangeResponse {
+                frame: Some(pb::blocks_by_range_response::Frame::Hello(_)),
+            })) => {}
+            other => panic!("not our hello first: {other:?}"),
+        }
+        while let Some(frame) = stream.next().await {
+            let Some(pb::blocks_by_range_response::Frame::Body(body)) = frame?.frame else {
+                panic!("a second hello");
+            };
+            assert!(code.is_none(), "a body after the error chunk");
+            match body.item.and_then(|i| i.result) {
+                Some(pb::response_chunk::Result::Chunk(e)) => envelopes.push(e),
+                Some(pb::response_chunk::Result::Error(e)) => code = Some(e.code),
+                None => panic!("an empty chunk"),
+            }
+        }
+        Ok((envelopes, code))
+    }
+
+    /// The slots of the canonical blocks of `[start, end)`.
+    fn canonical(start: u64, end: u64) -> Vec<u64> {
+        (start..end.min(HEAD + 1))
+            .filter(|s| *s > 0 && !SKIPPED.contains(s))
+            .collect()
+    }
+
+    /// #146: `BlocksByRange` serves the canonical blocks of the range, those of the stamp's
+    /// head's chain, ascending, skipped slots skipped, one envelope per block: the block root,
+    /// `PAYLOAD_TYPE_SIGNED_BEACON_BLOCK`, the stored SSZ, `seq` from 1 and the fork digest of
+    /// its slot's epoch (Fulu, its BPO digest, Gloas), each block's `parent_root` the root
+    /// of the one before. The fork block is never served, whether finalized or not; a range
+    /// above the head, or asking for nothing, has no block.
+    #[tokio::test]
+    async fn blocks_by_range_head_chain() {
+        let (_env_dir, fixture_env, chain, fork) = seeded();
+        let (_dir, served) = server(Some(fixture_env), DEFAULT_MAX_READS);
+        for (start, count) in [(10, 20), (0, 128), (30, 20), (FINALIZED, 1), (36, 1)] {
+            let (envelopes, code) = answer(&served, request(start, count)).await.unwrap();
+            assert_eq!(code, None, "[{start}, +{count})");
+            let slots: Vec<u64> = envelopes.iter().map(|e| e.slot).collect();
+            assert_eq!(
+                slots,
+                canonical(start, start + count),
+                "[{start}, +{count})"
+            );
+            for (seq, e) in (1..).zip(&envelopes) {
+                let stored = chain.iter().find(|b| b.0 == e.slot).unwrap();
+                assert_eq!(e.seq, seq);
+                assert_eq!(e.root, stored.1.to_vec());
+                assert_eq!(e.ssz, stored.2);
+                assert_eq!(e.fork_digest, digest(e.slot).to_vec(), "slot {}", e.slot);
+                assert_eq!(e.payload_type, PayloadType::SignedBeaconBlock as i32);
+                assert_ne!(e.root, fork.1.to_vec(), "the fork block");
+            }
+            for pair in envelopes.windows(2) {
+                assert_eq!(pair[1].ssz[116..148], pair[0].root[..], "parent_root links");
+            }
+        }
+        for (start, count) in [(HEAD + 1, 10), (u64::MAX - 1, 128), (10, 0)] {
+            let (envelopes, code) = answer(&served, request(start, count)).await.unwrap();
+            assert_eq!((envelopes.len(), code), (0, None), "[{start}, +{count})");
+        }
+        // The read itself, in one transaction.
+        let (_dir2, fixture_env, ..) = seeded();
+        let read =
+            canonical_blocks(fixture_env.as_ref(), 30, 20, Instant::now() + READ_DEADLINE).unwrap();
+        let slots: Vec<u64> = read.iter().map(|b| b.slot).collect();
+        assert_eq!(slots, canonical(30, 50));
+    }
+
+    /// #146: `count` over `MAX_REQUEST_BLOCKS_DENEB` (128) is `ERROR_CODE_INVALID` before
+    /// anything is read; a request without its hello is a contract violation; an env with no
+    /// stamp serves nothing (`ERROR_CODE_RESOURCE_UNAVAILABLE`); a server with no blocks
+    /// mounted keeps the stub's `UNIMPLEMENTED`.
+    #[tokio::test]
+    async fn blocks_by_range_bounds() {
+        let (_env_dir, fixture_env, ..) = seeded();
+        let (_dir, served) = server(Some(fixture_env), DEFAULT_MAX_READS);
+        let (envelopes, code) = answer(&served, request(1, 129)).await.unwrap();
+        assert_eq!(
+            (envelopes.len(), code),
+            (0, Some(ErrorCode::Invalid as i32))
+        );
+        let (envelopes, code) = answer(&served, request(1, 128)).await.unwrap();
+        assert_eq!((envelopes.len(), code), (canonical(1, 129).len(), None));
+        let no_hello = pb::BlocksByRangeRequest {
+            hello: None,
+            ..request(1, 4)
+        };
+        let status = answer(&served, no_hello).await.unwrap_err();
+        assert_eq!(
+            ipc::error::error_from_status(&status).code,
+            ErrorCode::ContractViolation as i32,
+            "{status:?}"
+        );
+        let (_empty_dir, empty) = env(&[], None);
+        let (_dir, unstamped) = server(Some(empty), DEFAULT_MAX_READS);
+        let (envelopes, code) = answer(&unstamped, request(1, 4)).await.unwrap();
+        assert_eq!(
+            (envelopes.len(), code),
+            (0, Some(ErrorCode::ResourceUnavailable as i32))
+        );
+        let (_dir, stub) = server(None, DEFAULT_MAX_READS);
+        let status = answer(&stub, request(1, 4)).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+    }
+
+    /// #146: block reads share the column reads' places (`DEFAULT_MAX_READS`): past them a
+    /// request is `ERROR_CODE_OVERLOADED` at once, and a place is given back when its read
+    /// ends; a read stops at its deadline (`READ_DEADLINE`) and the stream fails, which cl-p2p
+    /// answers `2: ServerError`.
+    #[tokio::test]
+    async fn blocks_by_range_overloaded_and_deadline() {
+        let (_env_dir, fixture_env, ..) = seeded();
+        let (_dir, full) = server(Some(Arc::clone(&fixture_env)), 0);
+        let (envelopes, code) = answer(&full, request(1, 8)).await.unwrap();
+        assert_eq!(
+            (envelopes.len(), code),
+            (0, Some(ErrorCode::Overloaded as i32))
+        );
+        let (_dir, one) = server(Some(Arc::clone(&fixture_env)), 1);
+        let (envelopes, code) = answer(&one, request(1, 8)).await.unwrap();
+        assert_eq!((envelopes.len(), code), (canonical(1, 9).len(), None));
+        assert_eq!(one.reads.available_permits(), 1, "given back");
+        let past = Instant::now() - Duration::from_millis(1);
+        assert!(matches!(
+            canonical_blocks(fixture_env.as_ref(), 1, 128, past),
+            Err(Refusal::Store(_))
+        ));
+    }
+}

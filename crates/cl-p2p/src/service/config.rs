@@ -113,6 +113,8 @@ pub struct P2pSettings {
     pub goodbye_ledger: GoodbyeLedgerConfig,
     /// The IP rule of the candidates' addresses.
     pub mode: NetworkMode,
+    /// cl-store's socket and the UID its server must run as; `None` serves no blocks.
+    pub store: Option<(PathBuf, u32)>,
 }
 
 /// Why the `[p2p]` table was refused. No variant quotes a value.
@@ -240,6 +242,7 @@ impl P2pSettings {
             chain_wait,
             goodbye_ledger: raw.goodbye_ledger,
             mode,
+            store: None,
         })
     }
 }
@@ -416,6 +419,41 @@ mod tests {
         assert_eq!(err, P2pConfigError::Missing("chain_uid"));
         let err = P2pSettings::from_table(table("chain_uid = 1"), me() + 1, me()).unwrap_err();
         assert_eq!(err, P2pConfigError::Missing("discv5_uid"));
+    }
+
+    /// #146: `store_socket` and `store_uid` come together or not at all: with neither cl-p2p
+    /// serves no blocks (BlocksByRange is `3`); one alone, or a relative socket path, is
+    /// refused.
+    #[test]
+    fn the_store_socket_comes_with_its_uid() {
+        let t = topics(TOPICS);
+        assert_eq!(settings("", &t).unwrap().store, None);
+        let s = settings(
+            "store_socket = \"/run/ethswarm/cl-store/cl-store.sock\"\nstore_uid = 994\n",
+            &t,
+        )
+        .unwrap();
+        assert_eq!(
+            s.store,
+            Some((PathBuf::from("/run/ethswarm/cl-store/cl-store.sock"), 994))
+        );
+        for (text, want) in [
+            (
+                "store_socket = \"/run/ethswarm/cl-store/cl-store.sock\"",
+                "store_uid",
+            ),
+            ("store_uid = 994", "store_socket"),
+            (
+                "store_socket = \"cl-store.sock\"\nstore_uid = 994",
+                "store_socket",
+            ),
+        ] {
+            let err = settings(text, &t).unwrap_err();
+            assert!(
+                matches!(&err, P2pConfigError::Key { key, .. } if *key == want),
+                "{text}: {err}"
+            );
+        }
     }
 
     /// The topic list is read only through the owner walk, and must load.

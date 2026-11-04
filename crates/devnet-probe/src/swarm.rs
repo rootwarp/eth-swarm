@@ -45,6 +45,7 @@ pub fn probe_swarm<E: EthSpec>(
         custody_group_count: CUSTODY_REQUIREMENT,
         // The devnet probe's checks store no columns.
         columns: None,
+        blocks: None,
     };
     serving_swarm(devnet, Keypair::generate_secp256k1(), sources, plan, gossip)
 }

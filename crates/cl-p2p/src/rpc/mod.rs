@@ -38,6 +38,8 @@
 //!   deviations), and the count of peers' proposals of them.
 
 pub mod answer_bucket;
+pub mod blocks;
+pub mod blocks_ipc;
 pub mod chain_status;
 pub mod codec;
 pub mod columns;

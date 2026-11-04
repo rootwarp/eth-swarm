@@ -5102,4 +5102,565 @@ mod tests {
         }
         assert_eq!(metrics.inbound_streams_refused(), 1);
     }
+
+    // --- BeaconBlocksByRange from cl-store and cl-chain (#146) ---
+
+    use super::super::blocks::testing::{self as fixture, failed, Act, Call, Fake, Step};
+    use super::super::blocks::{ByRangeResponder, Half, BLOCK_LOOKUP_TIMEOUT};
+    use consensus_types::{forked, ForkName};
+    use p2p_wire::testkit::{FULU_BPO_DIGEST, FULU_DIGEST, GLOAS_DIGEST};
+    use ssz::Encode as _;
+
+    fn range(start_slot: u64, count: u64) -> Request {
+        Request::BlocksByRange(BlocksByRangeV2Request {
+            start_slot,
+            count,
+            step: 1,
+        })
+    }
+
+    /// The production responder over `fake`, our Status's `earliest_available_slot` `eas` (no
+    /// Status if `None`), at most `lookups` answers holding IPC calls at once.
+    fn by_range(
+        fake: &Fake,
+        eas: Option<u64>,
+        lookups: usize,
+        metrics: &RpcMetrics,
+    ) -> (Arc<dyn Responder<Spec>>, ByRangeResponder) {
+        let status = eas.map(|eas| StatusV2 {
+            earliest_available_slot: eas,
+            ..testkit::status()
+        });
+        let responder = ByRangeResponder::new(
+            Arc::new(fake.clone()),
+            Arc::new(SharedStatus::new(status)),
+            lookups,
+            Some(metrics.clone()),
+        );
+        (Arc::new(responder.clone()), responder)
+    }
+
+    /// The chunks a requester of `request` reads from `wire`, context bytes included.
+    async fn received(wire: &[u8], request: &Request) -> Vec<ReceivedChunk<Spec>> {
+        let contexts = Arc::new(testkit::context_table());
+        let mut codec = RpcCodec::<Spec>::new(contexts, Deadlines::default());
+        let valid = RpcRequest::Valid(request.clone());
+        let mut sent = futures::io::sink();
+        codec
+            .write_request(&BLOCKS, &mut sent, valid)
+            .await
+            .unwrap();
+        codec.read_response(&BLOCKS, &mut &wire[..]).await.unwrap()
+    }
+
+    /// Serves `request` with `responder` to a requester that takes every write at once: what
+    /// it reads, and how long the answer took.
+    async fn serve_blocks(
+        control: &mut Control<Spec>,
+        peer: PeerId,
+        request: Request,
+        responder: &Arc<dyn Responder<Spec>>,
+    ) -> (Vec<ReceivedChunk<Spec>>, Duration) {
+        let start = Instant::now();
+        let answer = control.answer_streamed(peer, BLOCKS, request.clone(), responder);
+        let mut reader = Reader::new(Duration::ZERO);
+        writer(control)
+            .write_response(&BLOCKS, &mut reader, answer.unwrap())
+            .await
+            .unwrap();
+        (
+            received(&reader.bytes, &request).await,
+            Instant::now() - start,
+        )
+    }
+
+    /// The blocks of `chunks`, which must all be blocks.
+    fn blocks_of(chunks: &[ReceivedChunk<Spec>]) -> Vec<&forked::SignedBeaconBlock<Spec>> {
+        chunks
+            .iter()
+            .map(|c| match &c.chunk {
+                ResponseChunk::Success(Response::Block(b)) => &**b,
+                other => panic!("not a block: {other:?}"),
+            })
+            .collect()
+    }
+
+    fn block_slots(chunks: &[ReceivedChunk<Spec>]) -> Vec<u64> {
+        blocks_of(chunks).iter().map(|b| b.slot()).collect()
+    }
+
+    /// The code of the one error chunk `chunks` are, if they are.
+    fn only_error(chunks: &[ReceivedChunk<Spec>]) -> Option<ResultCode> {
+        match chunks {
+            [ReceivedChunk {
+                context: None,
+                chunk: ResponseChunk::Error { code, .. },
+            }] => Some(*code),
+            _ => None,
+        }
+    }
+
+    /// Every block's `parent_root` is the root of the block before it (`phase0` L1569–1572).
+    fn assert_linked(chunks: &[ReceivedChunk<Spec>]) {
+        let blocks = blocks_of(chunks);
+        for pair in blocks.windows(2) {
+            let parent = match pair[1] {
+                forked::SignedBeaconBlock::Fulu(b) => b.message.parent_root,
+                forked::SignedBeaconBlock::Gloas(b) => b.message.parent_root,
+            };
+            assert_eq!(parent, pair[0].message_root(), "slot {}", pair[1].slot());
+        }
+    }
+
+    /// Waits (yielding, never sleeping) until nothing of `fake` is alive: an aborted answer
+    /// drops its lookup when the runtime next runs its task.
+    async fn closed(fake: &Fake) {
+        for _ in 0..64 {
+            if fake.open() == 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("{} lookups or streams still open", fake.open());
+    }
+
+    /// #146 AC `byrange_across_finality`: a range that straddles the store's finalized slot
+    /// `F0` is the store's blocks up to `F0`, then cl-chain's from `F0 + 1`: contiguous,
+    /// ascending, skipped slots skipped, each block's `parent_root` the root of the one before.
+    /// `F0` is read once, first: finality moving on between that read and the chain read leaves
+    /// no gap and no duplicate. A range at or below `F0` never asks cl-chain; one above it
+    /// never reads a store range.
+    #[tokio::test(start_paused = true)]
+    async fn byrange_across_finality() {
+        let (mut control, metrics, peers) = serving(1, |_| {});
+        let peer = peers[0];
+        let fake = Fake::new();
+        let (responder, _) = by_range(&fake, Some(0), 16, &metrics);
+        let (chunks, _) = serve_blocks(&mut control, peer, range(10, 20), &responder).await;
+        assert_eq!(block_slots(&chunks), fixture::canonical(10, 30));
+        assert_linked(&chunks);
+        assert_eq!(
+            fake.calls(),
+            [
+                Call::Head,
+                Call::Range(Half::Store, 10, 11),
+                Call::Range(Half::Chain, 21, 9)
+            ]
+        );
+        let moving = Fake::new();
+        moving.advance_after_head(28);
+        let (responder_moving, _) = by_range(&moving, Some(0), 16, &metrics);
+        let (chunks, _) = serve_blocks(&mut control, peer, range(10, 20), &responder_moving).await;
+        assert_eq!(
+            block_slots(&chunks),
+            fixture::canonical(10, 30),
+            "no gap, no duplicate"
+        );
+        assert_linked(&chunks);
+        assert_eq!(
+            moving.ranges(),
+            [(Half::Store, 10, 11), (Half::Chain, 21, 9)]
+        );
+        for (request, want, ranges) in [
+            (range(1, 20), (1, 21), vec![(Half::Store, 1, 20)]),
+            (range(21, 19), (21, 40), vec![(Half::Chain, 21, 19)]),
+            (
+                range(20, 2),
+                (20, 22),
+                vec![(Half::Store, 20, 1), (Half::Chain, 21, 1)],
+            ),
+        ] {
+            let (chunks, _) = serve_blocks(&mut control, peer, request.clone(), &responder).await;
+            assert_eq!(block_slots(&chunks), fixture::canonical(want.0, want.1));
+            assert_linked(&chunks);
+            assert_eq!(fake.ranges(), ranges, "{request:?}");
+        }
+    }
+
+    /// #146 AC `byrange_fork_context`, on the linked Fulu→Gloas fixture: a range across the
+    /// epoch-2 BPO digest, the epoch-4 Gloas switch and finality. Each chunk's context bytes are
+    /// the digest of its own block's epoch (`FULU`, `FULU_BPO`, `GLOAS`), it decodes in that
+    /// fork, and its SSZ on the wire is the bytes as stored (codec only, no state transition).
+    #[tokio::test(start_paused = true)]
+    async fn byrange_fork_context() {
+        let (mut control, metrics, peers) = serving(1, |_| {});
+        let fake = Fake::new();
+        let (responder, _) = by_range(&fake, Some(0), 16, &metrics);
+        let (chunks, _) = serve_blocks(&mut control, peers[0], range(10, 30), &responder).await;
+        assert_eq!(block_slots(&chunks), fixture::canonical(10, 40));
+        assert_eq!(
+            fake.ranges(),
+            [(Half::Store, 10, 11), (Half::Chain, 21, 19)]
+        );
+        let stored = fixture::chain();
+        let mut seen = HashSet::new();
+        for (chunk, block) in chunks.iter().zip(blocks_of(&chunks)) {
+            let slot = block.slot();
+            let (digest, fork) = match slot / 8 {
+                0..=1 => (FULU_DIGEST, ForkName::Fulu),
+                2..=3 => (FULU_BPO_DIGEST, ForkName::Fulu),
+                _ => (GLOAS_DIGEST, ForkName::Gloas),
+            };
+            assert_eq!(chunk.context, Some(digest), "slot {slot}");
+            assert_eq!(block.fork_name(), fork, "slot {slot}");
+            let want = stored.iter().find(|b| b.slot == slot).unwrap();
+            assert_eq!(
+                block.as_ssz_bytes(),
+                want.ssz,
+                "slot {slot}: the stored bytes"
+            );
+            seen.insert(digest);
+        }
+        assert_eq!(seen.len(), 3, "every digest of the fixture");
+        assert_linked(&chunks);
+    }
+
+    /// #146 AC: a range starting below our Status's `earliest_available_slot` is one
+    /// `3: ResourceUnavailable` chunk before any IPC call (`phase0` L1538–1541); one starting
+    /// there is served. With no Status of ours there is no floor to serve from: `2`.
+    #[tokio::test(start_paused = true)]
+    async fn byrange_below_earliest_available_slot() {
+        let (mut control, metrics, peers) = serving(1, |_| {});
+        let peer = peers[0];
+        let fake = Fake::new();
+        let (responder, held) = by_range(&fake, Some(12), 16, &metrics);
+        let (chunks, _) = serve_blocks(&mut control, peer, range(11, 4), &responder).await;
+        assert_eq!(only_error(&chunks), Some(ResultCode::ResourceUnavailable));
+        assert_eq!(fake.calls(), [], "no IPC call, nothing read");
+        assert_eq!(held.free_lookups(), 16);
+        let (chunks, _) = serve_blocks(&mut control, peer, range(12, 4), &responder).await;
+        assert_eq!(block_slots(&chunks), fixture::canonical(12, 16));
+        fake.calls();
+        let (no_status, _) = by_range(&fake, None, 16, &metrics);
+        let (chunks, _) = serve_blocks(&mut control, peer, range(12, 4), &no_status).await;
+        assert_eq!(only_error(&chunks), Some(ResultCode::ServerError));
+        assert_eq!(fake.calls(), [], "no IPC call");
+    }
+
+    /// #146 AC: `count` over `MAX_REQUEST_BLOCKS_DENEB` (129, `u64::MAX`) and `step` 0 are
+    /// `1: InvalidRequest` on the production responder too, never clamped: no IPC call, nothing
+    /// booked, no stream or lookup slot taken.
+    #[tokio::test(start_paused = true)]
+    async fn byrange_count_over_128_invalid() {
+        let (mut control, metrics, peers) = serving(1, |_| {});
+        let peer = peers[0];
+        let fake = Fake::new();
+        let (responder, held) = by_range(&fake, Some(0), 16, &metrics);
+        let step_0 = Request::BlocksByRange(BlocksByRangeV2Request {
+            start_slot: 1,
+            count: 2,
+            step: 0,
+        });
+        for request in [range(1, 129), range(1, u64::MAX), step_0] {
+            let due = next_due(&control, peer);
+            let answer = control.answer_streamed(peer, BLOCKS, request.clone(), &responder);
+            assert_eq!(next_due(&control, peer), due, "nothing booked");
+            let mut reader = Reader::new(Duration::ZERO);
+            writer(&control)
+                .write_response(&BLOCKS, &mut reader, answer.unwrap())
+                .await
+                .unwrap();
+            let chunks = received(&reader.bytes, &request).await;
+            assert_eq!(only_error(&chunks), Some(ResultCode::InvalidRequest));
+        }
+        assert_eq!(fake.calls(), [], "no IPC call");
+        assert_eq!(held.free_lookups(), 16, "no lookup slot taken");
+        assert_eq!(
+            control.streams.available_permits(),
+            256,
+            "no stream slot taken"
+        );
+    }
+
+    /// #146 AC 1, Vera's limits on the production responder (paused time): a stall in the
+    /// head read is `2` at the first-byte deadline less the slack (4.5 s); a stall mid
+    /// chain-stream ends the answer cleanly at 9.5 s, every block before it whole; a step that
+    /// timed out ends the answer and gives back its IPC call and lookup slot; a peer over its
+    /// quota gets its chunks whole at its tokens, never an error or a close; past
+    /// `max_block_lookups` a request waits one IPC step for a slot, then gets `2`; a reset
+    /// mid-answer drops the IPC streams it held.
+    #[tokio::test(start_paused = true)]
+    async fn byrange_limits_and_timeouts() {
+        let (mut control, metrics, peers) = serving(2, |_| {});
+        let peer = peers[0];
+        let stalled = Fake::new();
+        stalled.script(Step::Head, Act::Stall);
+        let (responder, held) = by_range(&stalled, Some(0), 16, &metrics);
+        let (chunks, took) = serve_blocks(&mut control, peer, range(1, 8), &responder).await;
+        assert_eq!(only_error(&chunks), Some(ResultCode::ServerError));
+        assert_eq!(took, Duration::from_millis(4_500));
+        closed(&stalled).await;
+        assert_eq!(held.free_lookups(), 16);
+
+        let mid = Fake::new();
+        mid.script(Step::Item(Half::Chain, 2), Act::Stall);
+        let (responder, held) = by_range(&mid, Some(0), 16, &metrics);
+        let (chunks, took) = serve_blocks(&mut control, peer, range(18, 10), &responder).await;
+        assert_eq!(block_slots(&chunks), [18, 19, 20, 21, 22], "a clean end");
+        assert_eq!(took, Duration::from_millis(9_500));
+        closed(&mid).await;
+        assert_eq!(held.free_lookups(), 16);
+
+        let timing_out = Fake::new();
+        let timeout = failed(ResultCode::ServerError, "timeout");
+        timing_out.script(Step::Item(Half::Chain, 1), Act::Fail(timeout));
+        let (responder, held) = by_range(&timing_out, Some(0), 16, &metrics);
+        let (chunks, _) = serve_blocks(&mut control, peer, range(18, 10), &responder).await;
+        assert_eq!(block_slots(&chunks), [18, 19, 20, 21], "a clean end");
+        assert_eq!(metrics.block_lookup_failures("chain", "timeout"), 1);
+        closed(&timing_out).await;
+        assert_eq!(held.free_lookups(), 16);
+
+        let (mut slow, slow_metrics, slow_peers) = serving(1, |l| {
+            l.rate.blocks_by_range = Quota::new(1, Duration::from_secs(1));
+        });
+        let fake = Fake::new();
+        let (responder, _) = by_range(&fake, Some(0), 16, &slow_metrics);
+        let (chunks, took) = serve_blocks(&mut slow, slow_peers[0], range(10, 4), &responder).await;
+        assert_eq!(block_slots(&chunks), [10, 11, 12, 13], "whole, no error");
+        assert_eq!(took, Duration::from_secs(3), "one token a second");
+
+        let holding = Fake::new();
+        holding.script(Step::Head, Act::Stall);
+        let (responder, held) = by_range(&holding, Some(0), 1, &metrics);
+        let first = control.answer_streamed(peers[1], BLOCKS, range(1, 4), &responder);
+        let first = write_on_task(&control, first.unwrap());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(held.free_lookups(), 0, "the one slot is held");
+        let (chunks, took) = serve_blocks(&mut control, peer, range(1, 4), &responder).await;
+        assert_eq!(only_error(&chunks), Some(ResultCode::ServerError));
+        assert_eq!(took, BLOCK_LOOKUP_TIMEOUT, "waited one IPC step for a slot");
+        assert_eq!(
+            holding.calls(),
+            [Call::Head],
+            "the second never reached the stores"
+        );
+        let (_, wire) = first.await.unwrap();
+        let chunks = received(&wire, &range(1, 4)).await;
+        assert_eq!(only_error(&chunks), Some(ResultCode::ServerError));
+        closed(&holding).await;
+        assert_eq!(held.free_lookups(), 1);
+
+        let fake = Fake::new();
+        let (responder, held) = by_range(&fake, Some(0), 16, &metrics);
+        let answer = control.answer_streamed(peer, BLOCKS, range(10, 30), &responder);
+        let mut reader = Reader::new(Duration::from_millis(10)).stopping_after(12, true);
+        let err = writer(&control)
+            .write_response(&BLOCKS, &mut reader, answer.unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+        closed(&fake).await;
+        assert_eq!(held.free_lookups(), 16);
+        assert_eq!(control.streams.available_permits(), 256);
+    }
+
+    /// #146: `step` above 1 is answered with at most the first block of the range (`phase0`
+    /// L1514–1515), and books one token, not `count`.
+    #[tokio::test(start_paused = true)]
+    async fn byrange_step_over_one_single_block() {
+        let (mut control, metrics, peers) = serving(1, |l| {
+            l.rate.blocks_by_range = Quota::new(1, Duration::from_secs(1));
+        });
+        let peer = peers[0];
+        let fake = Fake::new();
+        let (responder, _) = by_range(&fake, Some(0), 16, &metrics);
+        let stepped = |start_slot| {
+            Request::BlocksByRange(BlocksByRangeV2Request {
+                start_slot,
+                count: 10,
+                step: 3,
+            })
+        };
+        let start = Instant::now();
+        let answer = control.answer_streamed(peer, BLOCKS, stepped(10), &responder);
+        assert_eq!(
+            next_due(&control, peer) - start,
+            Duration::from_secs(1),
+            "one token booked"
+        );
+        let mut reader = Reader::new(Duration::ZERO);
+        writer(&control)
+            .write_response(&BLOCKS, &mut reader, answer.unwrap())
+            .await
+            .unwrap();
+        let chunks = received(&reader.bytes, &stepped(10)).await;
+        assert_eq!(block_slots(&chunks), [10]);
+        assert_eq!(fake.ranges(), [(Half::Store, 10, 1)]);
+        let (chunks, _) = serve_blocks(&mut control, peer, stepped(17), &responder).await;
+        assert_eq!(
+            block_slots(&chunks),
+            Vec::<u64>::new(),
+            "a skipped first slot"
+        );
+    }
+
+    /// #146: a failed store or chain call before the first chunk ends the answer with its code
+    /// (cl-store's `UNAVAILABLE` and cl-chain's `RESOURCE_UNAVAILABLE` are `3`, anything else
+    /// `2`); after the first chunk the answer ends cleanly at its last whole chunk, never with
+    /// an error chunk mid-stream. Each failure is counted by half and kind.
+    #[tokio::test(start_paused = true)]
+    async fn byrange_store_and_chain_errors() {
+        let (mut control, metrics, peers) = serving(1, |_| {});
+        let peer = peers[0];
+        for (step, code, request) in [
+            (Step::Head, ResultCode::ResourceUnavailable, range(10, 4)),
+            (Step::Head, ResultCode::ServerError, range(10, 4)),
+            (
+                Step::Open(Half::Store),
+                ResultCode::ResourceUnavailable,
+                range(10, 4),
+            ),
+            (
+                Step::Item(Half::Store, 0),
+                ResultCode::ServerError,
+                range(10, 4),
+            ),
+            (
+                Step::Open(Half::Chain),
+                ResultCode::ResourceUnavailable,
+                range(25, 4),
+            ),
+            (
+                Step::Open(Half::Chain),
+                ResultCode::ServerError,
+                range(25, 4),
+            ),
+        ] {
+            let fake = Fake::new();
+            fake.script(step, Act::Fail(failed(code, "status")));
+            let (responder, held) = by_range(&fake, Some(0), 16, &metrics);
+            let (chunks, _) = serve_blocks(&mut control, peer, request, &responder).await;
+            assert_eq!(only_error(&chunks), Some(code), "{step:?}");
+            closed(&fake).await;
+            assert_eq!(held.free_lookups(), 16);
+        }
+        assert_eq!(metrics.block_lookup_failures("store", "status"), 4);
+        assert_eq!(metrics.block_lookup_failures("chain", "status"), 2);
+        for (step, request, want) in [
+            (Step::Item(Half::Store, 2), range(10, 4), vec![10, 11]),
+            (Step::Open(Half::Chain), range(18, 6), vec![18, 19, 20]),
+            (
+                Step::Item(Half::Chain, 1),
+                range(18, 6),
+                vec![18, 19, 20, 21],
+            ),
+        ] {
+            let fake = Fake::new();
+            let unavailable = failed(ResultCode::ResourceUnavailable, "status");
+            fake.script(step, Act::Fail(unavailable));
+            let (responder, _) = by_range(&fake, Some(0), 16, &metrics);
+            let (chunks, _) = serve_blocks(&mut control, peer, request, &responder).await;
+            assert_eq!(block_slots(&chunks), want, "{step:?}: a clean end");
+        }
+    }
+
+    /// #146: one chain (`phase0` L1564–1572). A block whose `parent_root` is not the root of
+    /// the block served before it ends the answer at the last whole chunk ("MAY stop", L1574–
+    /// 1575), counted; so does a block out of order. A block outside the range before anything
+    /// went out breaks the contract: `2`.
+    #[tokio::test(start_paused = true)]
+    async fn byrange_seam_break_ends_cleanly() {
+        let (mut control, metrics, peers) = serving(1, |_| {});
+        let peer = peers[0];
+        let seam = Fake::new();
+        seam.replace(21, fixture::block(21, [0xee; 32], 7));
+        let (responder, _) = by_range(&seam, Some(0), 16, &metrics);
+        let (chunks, _) = serve_blocks(&mut control, peer, range(18, 6), &responder).await;
+        assert_eq!(block_slots(&chunks), [18, 19, 20], "ends at the seam");
+        assert_eq!(metrics.block_lookup_failures("chain", "link"), 1);
+        let chain = fixture::chain();
+        let at = |slot: u64| chain.iter().find(|b| b.slot == slot).unwrap().clone();
+        let back = Fake::new();
+        back.replace(23, fixture::block(21, at(22).root, 7));
+        let (responder, _) = by_range(&back, Some(0), 16, &metrics);
+        let (chunks, _) = serve_blocks(&mut control, peer, range(21, 4), &responder).await;
+        assert_eq!(
+            block_slots(&chunks),
+            [21, 22],
+            "ends before a block out of order"
+        );
+        let outside = Fake::new();
+        outside.replace(25, at(30));
+        let (responder, _) = by_range(&outside, Some(0), 16, &metrics);
+        let (chunks, _) = serve_blocks(&mut control, peer, range(25, 2), &responder).await;
+        assert_eq!(only_error(&chunks), Some(ResultCode::ServerError));
+    }
+
+    /// #146: ranges with nothing to serve are empty answers, never errors: above the head, a
+    /// start near `u64::MAX` (no overflow), only skipped slots; `count` 0 makes no IPC call.
+    #[tokio::test(start_paused = true)]
+    async fn byrange_empty_ranges() {
+        let (mut control, metrics, peers) = serving(1, |_| {});
+        let peer = peers[0];
+        let fake = Fake::new();
+        let (responder, _) = by_range(&fake, Some(0), 16, &metrics);
+        for request in [range(41, 10), range(u64::MAX - 1, 128), range(17, 1)] {
+            let (chunks, _) = serve_blocks(&mut control, peer, request.clone(), &responder).await;
+            assert!(chunks.is_empty(), "{request:?}: {chunks:?}");
+        }
+        fake.calls();
+        let (chunks, _) = serve_blocks(&mut control, peer, range(10, 0), &responder).await;
+        assert!(chunks.is_empty());
+        assert_eq!(fake.calls(), [], "count 0: no IPC call");
+    }
+
+    /// #146 AC 1 through the whole stack (TCP, noise, yamux; real time): the production
+    /// responder's answer is read back whole, each block with its epoch's digest; a peer's
+    /// third concurrent stream is reset while two wait on cl-chain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn byrange_over_a_swarm() {
+        let fake = Fake::new();
+        fake.script(Step::Open(Half::Chain), Act::Stall);
+        let mut cfg = crate::testkit::control_config(Some(testkit::status()));
+        cfg.contexts = testing::serving_table(NetworkCaps::PRESET_BOUND);
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = RpcMetrics::register(&mut registry);
+        let (responder, _) = by_range(&fake, Some(0), 16, &metrics);
+        let control = Control::<Spec>::new(cfg, metrics).with_blocks_responder(responder);
+        let transport = crate::transport::TransportMetrics::register(&mut registry);
+        let budget = crate::transport::MuxerBudget::with_defaults(&transport);
+        let mut swarm_cfg = crate::transport::SwarmConfig::new(budget);
+        swarm_cfg.listen_addrs = vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()];
+        let key = libp2p::identity::Keypair::generate_secp256k1();
+        let mut node = crate::transport::build_swarm(key, &swarm_cfg, control).unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = node.select_next_some().await {
+                break address;
+            }
+        };
+        let ours = *node.local_peer_id();
+        tokio::spawn(async move {
+            loop {
+                node.select_next_some().await;
+            }
+        });
+        let mut a = raw_peer(BLOCKS, &addr).await;
+        let wire = exchange(&mut a, ours, encode_request(&range(0, 21)).unwrap()).await;
+        let chunks = received(&wire, &range(0, 21)).await;
+        assert_eq!(block_slots(&chunks), fixture::canonical(0, 21));
+        assert_linked(&chunks);
+        let held: Vec<OutboundRequestId> = (0..3)
+            .map(|_| {
+                a.behaviour_mut()
+                    .send_request(&ours, encode_request(&range(25, 2)).unwrap())
+            })
+            .collect();
+        let mut done = Outcomes::new();
+        run_until(&mut a, &mut done, 1).await;
+        let refused = done.values().next().unwrap();
+        assert!(
+            refused.as_ref().map_or(true, Vec::is_empty),
+            "the third stream is reset: {refused:?}"
+        );
+        run_until(&mut a, &mut done, 3).await;
+        for id in &held {
+            if let Ok(wire) = &done[id] {
+                if !wire.is_empty() {
+                    let chunks = received(wire, &range(25, 2)).await;
+                    assert_eq!(only_error(&chunks), Some(ResultCode::ServerError));
+                }
+            }
+        }
+    }
 }

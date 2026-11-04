@@ -675,16 +675,21 @@ mod tests {
         );
     }
 
-    /// The ACL is exactly cl-p2p on the five methods: one fewer (the four before `Validate`),
-    /// one more, or another caller is refused.
+    /// The ACL is exactly cl-p2p on the six methods, `BlocksByRange` among them (#146): one
+    /// fewer (each left out in turn), one more, or another caller is refused.
     #[test]
-    fn the_acl_is_cl_p2p_on_five_methods_only() {
-        let four = &CHAIN_METHODS[..4];
-        let err = parse(&text(four, &chain_table(""))).unwrap_err();
-        assert!(matches!(err, SettingsError::Acl { .. }), "{err}");
-        let mut six = CHAIN_METHODS.to_vec();
-        six.push("/ethswarm.chain.v1.ReqRespService/GetMetadata");
-        let err = parse(&text(&six, &chain_table(""))).unwrap_err();
+    fn the_acl_is_cl_p2p_on_six_methods_only() {
+        assert_eq!(CHAIN_METHODS.len(), 6);
+        assert!(CHAIN_METHODS.contains(&"/ethswarm.chain.v1.ReqRespService/BlocksByRange"));
+        for left_out in 0..CHAIN_METHODS.len() {
+            let mut five = CHAIN_METHODS.to_vec();
+            five.remove(left_out);
+            let err = parse(&text(&five, &chain_table(""))).unwrap_err();
+            assert!(matches!(err, SettingsError::Acl { .. }), "{err}");
+        }
+        let mut seven = CHAIN_METHODS.to_vec();
+        seven.push("/ethswarm.chain.v1.ReqRespService/GetMetadata");
+        let err = parse(&text(&seven, &chain_table(""))).unwrap_err();
         assert!(matches!(err, SettingsError::Acl { .. }), "{err}");
         let api = text(&CHAIN_METHODS, &chain_table("")).replace(
             "GetStatus\" = [\"cl-p2p\"]",

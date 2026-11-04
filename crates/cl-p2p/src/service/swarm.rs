@@ -7,6 +7,7 @@
 
 use crate::behaviour::SpecBehaviour;
 use crate::gossip::{CaptureTap, GossipConfig, IgnoreAll};
+use crate::rpc::blocks::BlockSource;
 use crate::rpc::codec::Deadlines;
 use crate::rpc::columns::ColumnSource;
 use crate::rpc::inbound::{Control, ControlConfig, SharedMetaData, StatusSource};
@@ -57,6 +58,9 @@ pub struct Sources {
     /// The custody columns' source; `None` answers every column request
     /// `3: ResourceUnavailable`.
     pub columns: Option<Arc<dyn ColumnSource>>,
+    /// The blocks' source; `None` answers every BlocksByRange request
+    /// `3: ResourceUnavailable`.
+    pub blocks: Option<Arc<dyn BlockSource>>,
 }
 
 /// The ignore-all gossipsub's topics, and the tap each message also goes to.

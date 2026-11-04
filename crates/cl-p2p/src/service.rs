@@ -477,6 +477,7 @@ pub async fn serve<E: EthSpec>(
             link.clone(),
             MAX_COLUMN_RESPONSE_BYTES,
         ))),
+        blocks: None,
     };
     let plan = swarm::SwarmPlan {
         listen: settings.listen.clone(),

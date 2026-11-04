@@ -154,9 +154,11 @@ impl Reader {
     }
 
     /// A reader of an env this process already has open (the writer's own, in tests): MDBX
-    /// refuses a second open of one env in one process.
-    #[cfg(test)]
-    pub(crate) fn over(env: impl Borrow<Env> + Send + Sync + 'static) -> Self {
+    /// refuses a second open of one env in one process. Test seam only (`test-hooks`: another
+    /// crate's tests serve cl-store over cl-chain's env, #146).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn over(env: impl Borrow<Env> + Send + Sync + 'static) -> Self {
         Self {
             env: Box::new(env),
             broken: AtomicBool::new(false),

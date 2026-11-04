@@ -361,6 +361,7 @@ pub async fn p2p_swarm<E: EthSpec>(
             link,
             MAX_COLUMN_RESPONSE_BYTES,
         ))),
+        blocks: None,
     };
     let mut topics = vec![GossipTopic::new(digest, GossipKind::BeaconBlock)];
     topics.extend(custody.iter().map(|&column| {
