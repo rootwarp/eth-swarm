@@ -2997,20 +2997,43 @@ compose_env() { # compose_env <file> <trusted peers> [example]: an .env example 
   for key in RETH_UID RETH_GID; do set_env "$1" "$key" 990; done
   for key in LIGHTHOUSE_UID LIGHTHOUSE_GID; do set_env "$1" "$key" 991; done
 }
+# compose's refusal of .env.example alone: a required variable the example leaves empty, in
+# compose's message shape, each with its own hint from compose.yaml (the ids setup.sh writes, or
+# CHECKPOINT_SYNC_URL). Compose stops at the first missing variable it interpolates, and which
+# one that is depends on the compose version (the ubuntu-24.04 runner's names
+# CHECKPOINT_SYNC_URL, others a service user's id), so the pattern takes any of them.
+compose_ids="RETH_UID RETH_GID LIGHTHOUSE_UID LIGHTHOUSE_GID"
+compose_unset_pattern="required variable (${compose_ids// /|}) is missing a value: run setup\.sh"
+compose_unset_pattern+="|required variable CHECKPOINT_SYNC_URL is missing a value: set CHECKPOINT_SYNC_URL in \.env"
+# compose_unset <line>: whether the compose error line <line> matches compose_unset_pattern.
+compose_unset() { printf '%s\n' "$1" | grep -Eq -- "$compose_unset_pattern"; }
+check 0 "compose pattern: matches compose's RETH_UID message" \
+  compose_unset 'error while interpolating services.reth.user: required variable RETH_UID is missing a value: run setup.sh'
+check 0 "compose pattern: matches compose's LIGHTHOUSE_UID message" \
+  compose_unset 'error while interpolating services.lighthouse.user: required variable LIGHTHOUSE_UID is missing a value: run setup.sh'
+check 0 "compose pattern: matches the CHECKPOINT_SYNC_URL message the ubuntu-24.04 runner printed" \
+  compose_unset 'error while interpolating services.lighthouse.environment.CHECKPOINT_SYNC_URL: required variable CHECKPOINT_SYNC_URL is missing a value: set CHECKPOINT_SYNC_URL in .env'
+check 1 "compose pattern: a variable .env.example sets (NETWORK) does not match" \
+  compose_unset 'required variable NETWORK is missing a value: set NETWORK in .env'
+check 1 "compose pattern: an id with CHECKPOINT_SYNC_URL's hint does not match" \
+  compose_unset 'required variable RETH_UID is missing a value: set CHECKPOINT_SYNC_URL in .env'
+# Every variable the pattern names is in .env.example and empty there, so the two cannot drift.
+for key in $compose_ids CHECKPOINT_SYNC_URL; do
+  check 0 "compose pattern: .env.example leaves $key empty" grep -qxF -- "$key=" "$ref/.env.example"
+done
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
   echo "# skip - compose.yaml checks: docker compose is not installed"
 else
-  # Compose stops at the first missing variable it interpolates. That is one of the
-  # service users (RETH_UID or LIGHTHOUSE_UID); which one depends on the compose version.
-  # With the ids filled in, the empty CHECKPOINT_SYNC_URL is what remains.
+  # With the ids filled in, the empty CHECKPOINT_SYNC_URL is the only required variable left,
+  # so compose names it whatever order it interpolates in.
   cp "$ref/.env.example" "$tmp/compose-no-checkpoint.env"
   for key in RETH_UID RETH_GID; do set_env "$tmp/compose-no-checkpoint.env" "$key" 990; done
   for key in LIGHTHOUSE_UID LIGHTHOUSE_GID; do set_env "$tmp/compose-no-checkpoint.env" "$key" 991; done
   check_out 1 "compose: .env.example alone is refused until CHECKPOINT_SYNC_URL is set" \
     'CHECKPOINT_SYNC_URL is missing a value' \
     docker compose --env-file "$tmp/compose-no-checkpoint.env" -f "$ref/compose.yaml" config --quiet
-  check_out 1 "compose: .env.example alone is refused until setup.sh wrote the ids" \
-    '(RETH_UID|LIGHTHOUSE_UID) is missing a value: run setup.sh' \
+  check_out 1 "compose: .env.example alone is refused, naming a variable it leaves unset (an id setup.sh writes, or CHECKPOINT_SYNC_URL)" \
+    "$compose_unset_pattern" \
     docker compose --env-file "$ref/.env.example" -f "$ref/compose.yaml" config --quiet
   compose_env "$tmp/compose.env" ""
   check 0 "compose: config validates with the required values set" \
