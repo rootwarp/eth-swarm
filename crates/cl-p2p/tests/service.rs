@@ -4,7 +4,7 @@
 //!
 //! cl-chain is the real probe service (`cl_chain::probe::service::ProbeService`) in this test
 //! process, as the test user, its reference API refusing every connection (so our Status has
-//! no sample and nothing is dialled). cl-discv5 is a fake ([`FakeDiscovery`]): `GetLocalEnr`
+//! no sample and nothing is dialled); its new store is stamped from a fixture anchor block. cl-discv5 is a fake ([`FakeDiscovery`]): `GetLocalEnr`
 //! answers a record with a chosen `cgc`, and `WatchPeers` sends its hello and fails, so cl-p2p
 //! tries again. Without it cl-p2p runs on and keeps trying.
 //!
@@ -18,7 +18,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use cl_chain::probe::service::{chain_link, system_ms, ProbeNetwork, ProbePlan, ProbeService};
+use cl_chain::probe::service::{
+    chain_link, system_ms, Anchor, ProbeNetwork, ProbePlan, ProbeService,
+};
 use cl_chain::probe::BeaconApi;
 use cl_chain::verify::client::{KzgOutcome, KzgVerifier};
 use consensus_types::das::CUSTODY_REQUIREMENT;
@@ -65,6 +67,17 @@ fn mkdir(path: &Path, mode: u32) {
 
 fn network_yaml() -> String {
     format!("{KURTOSIS_CONFIG}MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS: 4096\n")
+}
+
+/// The reference's finalized block that a new store is stamped with: a Gloas block at slot 8.
+fn anchor() -> Anchor {
+    use ssz::Encode as _;
+    use tree_hash::TreeHash as _;
+    let block = p2p_wire::testkit::gloas_block::<Minimal>(8);
+    Anchor {
+        root: block.message.tree_hash_root().0,
+        ssz: block.as_ssz_bytes(),
+    }
 }
 
 /// The node ID of [`SECRET`], as cl-p2p computes it.
@@ -279,7 +292,7 @@ impl Host {
             kzg: Valid,
             verify_timeout: Duration::from_secs(5),
             cgc_set_slot: 0,
-            anchor: None,
+            anchor: Some(anchor()),
         };
         let service = ProbeService::<Minimal, Valid>::open(
             &net,

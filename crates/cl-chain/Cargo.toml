@@ -41,6 +41,8 @@ thiserror = "2"
 tracing = "0.1"
 # da::custody: the custody record lives in the column env until it moves into the store schema.
 cl-chain-columns = { path = "../cl-chain-columns" }
+# probe::service: a new store's first stamp, from the anchor block it stores (blocks::put).
+store-schema = { path = "../store-schema" }
 # da::custody: get_custody_groups and the custody constants.
 consensus-types = { path = "../consensus-types" }
 # verify::pubkey_feed: builder_key_version, the version of each builder key it feeds to cl-verify.

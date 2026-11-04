@@ -21,6 +21,9 @@
 //!
 //!   The store is opened in its directory, and opened again after a restart: the custody
 //!   record in it keeps the custody group count and `cgc_set_slot` of the first start.
+//! - **The stamp** ([`Anchor`], [`fetch_anchor`]): probe mode has no chain head, so a new store
+//!   is stamped with `Update::New` from its anchor, the reference's finalized block, stored
+//!   with it, before its first custody or column write; every write after carries that stamp.
 //! - **The method ACL** ([`chain_acl`]): only the caller `cl-p2p`, by its UID, may call
 //!   [`CHAIN_METHODS`], and nothing else.
 //! - **The KZG link** ([`connect_verify`], [`verify_client`]): cl-verify's socket, whose
@@ -33,9 +36,9 @@
 
 use crate::da::custody::{Advertise, Custody, EnrCgc, EnrError};
 use crate::probe::{
-    BeaconApi, ColumnContract, ColumnIngest, ColumnMetrics, GossipColumn, HeadFollow, IngestLimits,
-    ProbeChain, QueueMetrics, RefLimits, RefView, ServedColumns, StatusProvider,
-    DEFAULT_API_TIMEOUT,
+    ApiError, BeaconApi, BlockApi, ColumnContract, ColumnIngest, ColumnMetrics, GossipColumn,
+    HeadFollow, IngestLimits, ProbeChain, QueueMetrics, RefLimits, RefView, ReferenceApi, Root,
+    ServedColumns, StatusProvider, DEFAULT_API_TIMEOUT,
 };
 use crate::reqresp::{
     ChainStatus, ColumnServer, ColumnStore, ReqRespServer, ServeBudget, ServeClock, WallClock,
@@ -45,7 +48,7 @@ use crate::ChainStub;
 use cl_chain_columns::{ColumnReader, ColumnWriter};
 use consensus_types::caps::NetworkCaps;
 use consensus_types::primitives::U256;
-use consensus_types::{forked, EthSpec};
+use consensus_types::{forked, EthSpec, ForkSchedule};
 use ethswarm_proto::chain as pb;
 use ethswarm_proto::verify::verify_service_client::VerifyServiceClient;
 use ipc::acl::{AclTables, MethodAcl};
@@ -60,6 +63,7 @@ use prometheus_client::registry::Registry;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
+use store_schema::{blocks, stamp::Stamp, txn::RwTxn};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::Routes;
@@ -489,7 +493,8 @@ pub struct ProbePlan<V> {
     /// The slot custody is set at on a new store: columns are stored from there on. A store
     /// opened again keeps the slot of its first start.
     pub cgc_set_slot: u64,
-    /// The block a new store is stamped with. A store stamped before needs none.
+    /// The block a new store is stamped with ([`fetch_anchor`]). A store stamped before needs
+    /// none.
     pub anchor: Option<Anchor>,
 }
 
@@ -497,9 +502,64 @@ pub struct ProbePlan<V> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Anchor {
     /// The finalized checkpoint's root.
-    pub root: crate::probe::Root,
+    pub root: Root,
     /// The SSZ of its signed block, as the reference serves it.
     pub ssz: Vec<u8>,
+}
+
+/// The reference's finalized block as an [`Anchor`]: its finalized checkpoint, then that
+/// block's SSZ, each request under the API's timeout.
+///
+/// # Errors
+///
+/// [`ApiError`] if either request fails.
+pub async fn fetch_anchor<A: ReferenceApi + BlockApi>(api: &A) -> Result<Anchor, ApiError> {
+    let root = api.finalized_checkpoint().await?.root;
+    let ssz = api.block(root).await?;
+    Ok(Anchor { root, ssz })
+}
+
+/// The store's stamp ([`ColumnWriter::stamp_first`]): the one stored, or else the first, from
+/// `anchor`, as [`ProbeService::open`] stamps a new store before its first write. The anchor's
+/// block is stored, decoded by the fork of its slot under `schedule` (its root must be the
+/// anchor's), and named the stamp's head and finalized block: probe mode's head is its
+/// finalized block (its Status, [`crate::probe`]), at event 1 (it sends no head events).
+///
+/// # Errors
+///
+/// [`OpenError::NoAnchor`] for a new store and no anchor; [`OpenError::Failed`] if the
+/// anchor's block or the store failed. Nothing is written then.
+pub fn stamp_from_anchor<E: EthSpec>(
+    writer: &ColumnWriter,
+    schedule: &ForkSchedule,
+    anchor: Option<&Anchor>,
+) -> Result<Stamp, OpenError> {
+    writer.stamp_first(|txn| anchor_stamp::<E>(txn, schedule, anchor))
+}
+
+fn anchor_stamp<E: EthSpec>(
+    txn: &RwTxn<'_>,
+    schedule: &ForkSchedule,
+    anchor: Option<&Anchor>,
+) -> Result<Stamp, OpenError> {
+    let anchor = anchor.ok_or(OpenError::NoAnchor)?;
+    let (slot, root) = blocks::put::<E>(txn, schedule, &anchor.ssz)
+        .map_err(|e| format!("the anchor block: {e}"))?;
+    if root != anchor.root {
+        return Err(format!(
+            "the anchor block's root is 0x{}, not the finalized root 0x{}",
+            hex::encode(root),
+            hex::encode(anchor.root)
+        )
+        .into());
+    }
+    Ok(Stamp {
+        head_seq: 1,
+        head_root: root,
+        head_slot: slot,
+        finalized_root: root,
+        finalized_slot: slot,
+    })
 }
 
 /// The column store of cl-chain's probe mode.
@@ -537,6 +597,10 @@ pub enum OpenError {
         /// The node ID given now.
         configured: String,
     },
+    /// The store is new, and there is no anchor to stamp it with ([`ProbePlan::anchor`]): the
+    /// reference did not give its finalized block. A restart may get it.
+    #[error("the column store is new and has no anchor to stamp it with: the reference's finalized block")]
+    NoAnchor,
     /// Any other failure.
     #[error("{0}")]
     Failed(String),
@@ -545,6 +609,12 @@ pub enum OpenError {
 impl From<String> for OpenError {
     fn from(why: String) -> Self {
         Self::Failed(why)
+    }
+}
+
+impl From<cl_chain_columns::Error> for OpenError {
+    fn from(e: cl_chain_columns::Error) -> Self {
+        Self::Failed(format!("column store: {e}"))
     }
 }
 
@@ -648,8 +718,9 @@ pub struct ProbeService<E: EthSpec, V> {
 }
 
 impl<E: EthSpec, V: KzgVerifier + 'static> ProbeService<E, V> {
-    /// Opens the store (again, after a restart), starts the ingest and the reference follower.
-    /// Must be called within a tokio runtime. The store's metrics go to `registry`.
+    /// Opens the store (again, after a restart), stamps a new one from `plan.anchor` before
+    /// its first write ([`stamp_from_anchor`]), starts the ingest and the reference
+    /// follower. Must be called within a tokio runtime. The store's metrics go to `registry`.
     ///
     /// Blocking: [`ColumnWriter::open`] can sleep the calling thread for about a second while
     /// a lingering writer lock clears. Call it once at startup (as `devnet-probe` does), or
@@ -659,7 +730,8 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ProbeService<E, V> {
     /// # Errors
     ///
     /// [`OpenError::NodeIdChanged`] for a store of another node ID ([`NODE_ID_FILE`]);
-    /// [`OpenError::Failed`] if the clock, the store, the custody record or the ingest failed.
+    /// [`OpenError::NoAnchor`] for a new store and no anchor; [`OpenError::Failed`] if the
+    /// clock, the store, the anchor's block, the custody record or the ingest failed.
     pub fn open(
         net: &ProbeNetwork,
         plan: ProbePlan<V>,
@@ -677,6 +749,8 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ProbeService<E, V> {
             .map_err(|e| format!("custody: {e}"))?
             .is_some();
         claim_node_id(&plan.columns_dir, plan.node_id, has_custody)?;
+        // No write commits before the first stamp: a new store is stamped from its anchor first.
+        stamp_from_anchor::<E>(&writer, net.config().fork_schedule(), plan.anchor.as_ref())?;
         let custody = Custody::open(
             Arc::clone(&writer),
             NoEnr,

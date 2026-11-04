@@ -10,8 +10,10 @@
 //!   second start on the same state directory opens the store again, with the same custody.
 //!
 //! The child gets a cl-verify socket (a tonic server of this test, as its own user) and a
-//! reference API that refuses every connection: its Status then has no sample, which is
-//! `UNAVAILABLE`, never a guess.
+//! reference API that refuses every connection, or, for a start that opens its store, one that
+//! serves only its finalized checkpoint and that block, the anchor the new store is stamped
+//! with. Either way its Status has no sample (no header), which is `UNAVAILABLE`, never a
+//! guess.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -32,6 +34,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use svc_runtime::owned::testkit::{config_root, write_read_only, Sealed};
+use testkit::collector::testing::{FixtureServer, Reply};
 
 /// How long a child may take to serve, or to exit once signalled.
 const WAIT: Duration = Duration::from_secs(60);
@@ -170,6 +173,11 @@ impl Host {
     /// A host whose cl-verify socket is in `<root>/<verify_dir>`, which is made only if it is
     /// `verify`.
     fn with_verify_dir(verify_dir: &str, extra: &str) -> Self {
+        Self::with_reference(verify_dir, "127.0.0.1:1", extra)
+    }
+
+    /// [`Self::with_verify_dir`], the reference API at `reference`.
+    fn with_reference(verify_dir: &str, reference: &str, extra: &str) -> Self {
         let dir = tempfile::Builder::new().tempdir_in(config_root()).unwrap();
         let root = dir.path();
         let (uid, gid) = me();
@@ -191,7 +199,7 @@ impl Host {
             text.push_str(&format!("\"{m}\" = [\"cl-p2p\"]\n"));
         }
         text.push_str(&format!(
-            "\n[chain]\nreference_api_url = \"http://127.0.0.1:1\"\n\
+            "\n[chain]\nreference_api_url = \"http://{reference}\"\n\
              node_id = \"0x{}07\"\nverify_socket = \"{}\"\nverify_uid = {uid}\n\
              columns_dir = \"{}\"\n",
             "00".repeat(31),
@@ -345,9 +353,30 @@ async fn one_run(host: &Host) -> Vec<u64> {
     columns
 }
 
+/// A reference API that serves its finalized checkpoint and that block's SSZ, the anchor a new
+/// store is stamped with, and nothing else: no header, so our Status has no sample.
+async fn anchor_reference() -> FixtureServer {
+    use ssz::Encode as _;
+    use tree_hash::TreeHash as _;
+    let block = p2p_wire::testkit::gloas_block::<Minimal>(8);
+    let root = format!("0x{}", hex::encode(block.message.tree_hash_root().0));
+    let finality = format!(
+        r#"{{"execution_optimistic":false,"finalized":true,"data":{{"previous_justified":{{"epoch":"0","root":"{root}"}},"current_justified":{{"epoch":"1","root":"{root}"}},"finalized":{{"epoch":"1","root":"{root}"}}}}}}"#
+    );
+    let block_path = format!("/eth/v2/beacon/blocks/{root}");
+    let ssz = block.as_ssz_bytes();
+    FixtureServer::start(move |_, path| match path {
+        "/eth/v1/beacon/states/head/finality_checkpoints" => Reply::json(&finality),
+        path if path == block_path => Reply::ssz(ssz.clone()),
+        _ => Reply::status(404),
+    })
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_service_serves_and_stops_cleanly_on_sigterm() {
-    let host = Host::new("");
+    let reference = anchor_reference().await;
+    let host = Host::with_reference("verify", &reference.addr.to_string(), "");
     // cl-verify's socket: any chain.v1 server of our own user accepts the connection.
     let listener = tokio::net::UnixListener::bind(&host.verify).unwrap();
     let link = chain_link::<Minimal>(&network(), cl_chain::probe::service::system_ms()).unwrap();

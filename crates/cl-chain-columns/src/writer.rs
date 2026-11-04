@@ -9,7 +9,10 @@ use std::{
 };
 
 use libmdbx::WriteFlags;
-use store_schema::txn::{ReadTxn, RwTxn, Update};
+use store_schema::{
+    stamp::Stamp,
+    txn::{ReadTxn, RwTxn, Update},
+};
 
 use crate::{
     env::{self, WriterOptions},
@@ -291,6 +294,27 @@ impl ColumnWriter {
     #[must_use]
     pub fn stamped_txns_committed(&self) -> u64 {
         self.stamped_txns.load(Ordering::Relaxed)
+    }
+
+    /// The env's stamp: the one stored, or else its first, written in one import-priority write
+    /// transaction. `body` puts the blocks the stamp names and returns it; it commits with
+    /// `Update::New`. Before the first stamp no other write commits (no `Carry` with nothing to
+    /// carry), so a new store is stamped this way first. With a stamp stored, `body` is not run
+    /// and nothing is written. An error from `body` or the commit writes nothing.
+    pub fn stamp_first<E: From<Error>>(
+        &self,
+        body: impl FnOnce(&RwTxn<'_>) -> std::result::Result<Stamp, E>,
+    ) -> std::result::Result<Stamp, E> {
+        let _permit = self.sched.acquire(Priority::Import);
+        let txn = self.reader.db.begin_rw_txn()?;
+        if let Some(stamp) = store_schema::stamp::read(&txn).map_err(Error::from)? {
+            return Ok(stamp);
+        }
+        let stamp = body(&txn)?;
+        store_schema::txn::commit(txn, Update::New(stamp)).map_err(Error::from)?;
+        self.rw_txns.fetch_add(1, Ordering::Relaxed);
+        self.stamped_txns.fetch_add(1, Ordering::Relaxed);
+        Ok(stamp)
     }
 
     /// Stores verified, unfinalized columns of one block, at most [`MAX_COLUMNS_PER_TXN`] per

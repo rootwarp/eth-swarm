@@ -913,6 +913,7 @@ dependencies = [
  "serde",
  "serde_json",
  "state-transition",
+ "store-schema",
  "svc-runtime",
  "thiserror 2.0.21",
  "tokio",

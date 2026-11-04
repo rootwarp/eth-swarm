@@ -238,7 +238,7 @@ fn plan(dir: &Path, cgc_set_slot: u64) -> ProbePlan<Valid> {
         kzg: Valid,
         verify_timeout: DEFAULT_VERIFY_TIMEOUT,
         cgc_set_slot,
-        anchor: None,
+        anchor: Some(anchor()),
     }
 }
 

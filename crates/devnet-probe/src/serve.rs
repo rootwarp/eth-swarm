@@ -38,7 +38,7 @@ use super::report::Check;
 use super::swarm::{serving_swarm, Gossip, Sources, SwarmPlan};
 #[cfg(test)]
 use cl_chain::probe::service::API_VERSION;
-use cl_chain::probe::service::{ProbePlan, ProbeService};
+use cl_chain::probe::service::{fetch_anchor, Anchor, ProbePlan, ProbeService};
 use cl_chain::probe::BeaconApi;
 use cl_chain::reqresp::WallClock;
 use cl_chain::verify::client::{KzgClient, KzgVerifier};
@@ -193,6 +193,8 @@ pub struct ChainPlan<V> {
     pub verify_timeout: Duration,
     /// The slot custody is set at on a new store: columns are stored from there on.
     pub cgc_set_slot: u64,
+    /// The block a new store is stamped with ([`ProbePlan::anchor`]).
+    pub anchor: Option<Anchor>,
 }
 
 /// cl-chain in probe mode ([`ProbeService`]: the column store, its column server, our Status
@@ -234,7 +236,7 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ChainSide<E, V> {
                 kzg: plan.kzg,
                 verify_timeout: plan.verify_timeout,
                 cgc_set_slot: plan.cgc_set_slot,
-                anchor: None,
+                anchor: plan.anchor,
             },
             registry,
         )?;
@@ -1239,6 +1241,12 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
             .map_err(|e| format!("our fork digest: {e}"))?;
         let cgc_set_slot = slot_at(devnet, now_ms).ok_or("the clock is before genesis")?;
         let uid = Ownership::current().uid;
+        // The new store is stamped from the reference's finalized block before its first write,
+        // asked for once the clock is checked: a start refused for it asks the reference nothing.
+        WallClock::new(devnet.probe_chain())?;
+        let anchor = fetch_anchor(&reference)
+            .await
+            .map_err(|e| format!("the anchor of the column store: {e}"))?;
         let chain = ChainSide::<E, V>::start(
             devnet,
             ChainPlan {
@@ -1251,6 +1259,7 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
                 kzg,
                 verify_timeout: plan.verify_timeout,
                 cgc_set_slot,
+                anchor: Some(anchor),
             },
             &mut registry,
         )?;
