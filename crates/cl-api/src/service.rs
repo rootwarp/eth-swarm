@@ -35,16 +35,30 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
+use ethswarm_proto::api::api_service_server::ApiServiceServer;
+use ethswarm_proto::chain::import_service_client::ImportServiceClient;
+use ipc::hello::{NetworkHello, API_VERSION_V1};
+use ipc::uds::PeerCheckedConnector;
 use network_config::{ChainConfig, Genesis};
 use serde::Deserialize;
-use svc_runtime::{Config, Hooks};
+use svc_runtime::{Config, Hooks, Services};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tonic::transport::Endpoint;
 
-use crate::routes::config::ConfigDataError;
-use crate::server::{BindError, HttpBind};
+use crate::node_state::{poll_chain, NodeState, SlotClock};
+use crate::routes::config::{ConfigData, ConfigDataError};
+use crate::server::{router, ApiState, BindError, HttpBind};
+use crate::ApiStub;
+
+/// The exit code of a config that does not load.
+pub const EXIT_CONFIG: u8 = 2;
+
+/// The exit code of a command line with arguments.
+pub const EXIT_USAGE: u8 = 64;
 
 /// The service name: its config file, socket and ACL.
 pub const SERVICE: &str = "cl-api";
@@ -107,14 +121,28 @@ impl ApiSettings {
     /// The table does not parse, has no `chain_uid`, or has a zero poll interval or a relative
     /// `chain_socket`.
     pub fn load(config: &Config) -> Result<Self, ServiceError> {
-        let _ = config;
-        todo!()
+        let settings: Self = config
+            .section()
+            .map_err(|e| ServiceError::Config(e.to_string()))?;
+        if settings.poll_interval_ms == 0 {
+            return Err(ServiceError::Config("[api] poll_interval_ms is 0".into()));
+        }
+        if !settings.chain_socket.is_absolute() {
+            let socket = settings.chain_socket.display();
+            return Err(ServiceError::Config(format!(
+                "[api] chain_socket {socket} is not an absolute path"
+            )));
+        }
+        Ok(settings)
     }
 
     /// Where the Beacon API listens.
     #[must_use]
     pub fn bind(&self) -> HttpBind {
-        todo!()
+        HttpBind {
+            addr: self.http_listen,
+            allow_non_loopback: self.http_allow_non_loopback,
+        }
     }
 
     #[must_use]
@@ -143,8 +171,40 @@ pub async fn start_http(
     genesis: Genesis,
     stop: watch::Receiver<bool>,
 ) -> Result<Http, ServiceError> {
-    let _ = (settings, chain, genesis, stop);
-    todo!()
+    let config = Arc::new(ConfigData::new(chain)?);
+    let listener = settings.bind().bind().await?;
+    let addr = listener.local_addr().map_err(|source| BindError::Io {
+        addr: settings.http_listen,
+        source,
+    })?;
+    if !addr.ip().is_loopback() {
+        tracing::warn!(%addr, "the Beacon API listens beyond loopback (http_allow_non_loopback)");
+    }
+    let node = NodeState::new(SlotClock::new(
+        genesis.genesis_time,
+        chain.slot_duration_ms(),
+    ));
+    let connector = PeerCheckedConnector::new(&settings.chain_socket, settings.chain_uid);
+    // The authority routes nothing: the connector picks the socket.
+    let channel = Endpoint::from_static("http://localhost").connect_with_connector_lazy(connector);
+    let poller = tokio::spawn(poll_chain(
+        ImportServiceClient::new(channel),
+        node.clone(),
+        settings.poll_interval(),
+        stopped(stop.clone()),
+    ));
+    let app = router(ApiState { node, config });
+    let server = tokio::spawn(crate::server::serve(listener, app, stopped(stop)));
+    Ok(Http {
+        addr,
+        server,
+        poller,
+    })
+}
+
+/// Resolves once `stop` turns `true` or its sender is gone.
+async fn stopped(mut stop: watch::Receiver<bool>) {
+    let _ = stop.wait_for(|stop| *stop).await;
 }
 
 /// Serves `config` and `settings` until `hooks.shutdown`: the Beacon API first, then the gRPC
@@ -157,16 +217,112 @@ pub async fn start_http(
 pub async fn serve(
     config: Config,
     settings: ApiSettings,
-    hooks: Hooks,
+    mut hooks: Hooks,
 ) -> Result<(), ServiceError> {
-    let _ = (config, settings, hooks);
-    todo!()
+    let genesis = config.genesis.ok_or(ServiceError::NoGenesis)?;
+    let build = format!("cl-api/{}", env!("CARGO_PKG_VERSION"));
+    let link = NetworkHello::new(&build, &config.chain, genesis)
+        .map_err(|e| e.to_string())
+        .and_then(|hello| {
+            ipc::Link::network(Arc::new(hello), API_VERSION_V1).map_err(|e| e.to_string())
+        })
+        .map_err(|e| ServiceError::Config(format!("the ethswarm.api.v1 link: {e}")))?;
+    let (stop, stop_rx) = watch::channel(false);
+    let http = start_http(&settings, &config.chain, genesis, stop_rx).await?;
+    tracing::info!(
+        addr = %http.addr,
+        chain_socket = %settings.chain_socket.display(),
+        "the Beacon API is listening"
+    );
+    // SIGTERM stops HTTP too. If svc-runtime returns early, it drops this future and `stop`.
+    let termination = std::mem::replace(&mut hooks.shutdown, Box::pin(std::future::pending()));
+    hooks.shutdown = Box::pin(async move {
+        termination.await;
+        let _ = stop.send(true);
+    });
+    let drain = config.drain_timeout;
+    let services = Services::new().add_service(ApiServiceServer::new(ApiStub::new(link)));
+    let result = svc_runtime::run_with(config, services, hooks).await;
+    match tokio::time::timeout(drain, http.server).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => tracing::warn!(error = %e, "the Beacon API stopped on an error"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "the Beacon API task failed"),
+        Err(_) => tracing::warn!(
+            ?drain,
+            "the Beacon API did not finish within the drain timeout"
+        ),
+    }
+    http.poller.abort();
+    result.map_err(ServiceError::from)
 }
 
 /// The process: no argument, the deployed config, the logs, the runtime; the exit code.
 #[must_use]
 pub fn main() -> ExitCode {
-    todo!()
+    use svc_runtime::lifecycle::LOG_FLUSH_DEADLINE;
+    use svc_runtime::telemetry::{flush_logs, init_binary_tracing};
+    let arguments = std::env::args_os().len().saturating_sub(1);
+    let path = svc_runtime::config::config_path(SERVICE);
+    let loaded = (arguments == 0).then(|| {
+        let euid = ipc::peercred::effective_uid();
+        let config = Config::load_root_owned(SERVICE, &path, euid, 0).map_err(|e| e.to_string())?;
+        let settings = ApiSettings::load(&config).map_err(|e| e.to_string())?;
+        Ok::<_, String>((config, settings))
+    });
+    let level = match &loaded {
+        Some(Ok((config, _))) => config.log_level,
+        _ => tracing::level_filters::LevelFilter::INFO,
+    };
+    if let Err(code) = init_binary_tracing(level) {
+        return code;
+    }
+    let code = match loaded {
+        None => {
+            let config = path.display();
+            tracing::error!(arguments, %config, "cl-api takes no argument: it reads its config only");
+            ExitCode::from(EXIT_USAGE)
+        }
+        Some(Err(e)) => {
+            tracing::error!(error = %e, "config refused");
+            ExitCode::from(EXIT_CONFIG)
+        }
+        Some(Ok((config, settings))) => run(config, settings),
+    };
+    flush_logs(LOG_FLUSH_DEADLINE);
+    code
+}
+
+/// [`serve`] on a new multi-threaded runtime with systemd's hooks; the exit code.
+fn run(config: Config, settings: ApiSettings) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot start the async runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = runtime.block_on(async {
+        let hooks = Hooks::systemd().map_err(|e| ServiceError::Config(format!("signals: {e}")))?;
+        serve(config, settings, hooks).await
+    });
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!(error = %e, "cl-api stopped");
+            match e {
+                ServiceError::Runtime(e) => svc_runtime::exit_code(&Err(e)),
+                ServiceError::Config(_)
+                | ServiceError::ConfigData(_)
+                | ServiceError::NoGenesis
+                | ServiceError::Bind(BindError::NotLoopback(_)) => ExitCode::from(EXIT_CONFIG),
+                ServiceError::Bind(BindError::Io { .. }) => ExitCode::FAILURE,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -246,9 +402,9 @@ mod tests {
         }
     }
 
-    /// `GET path` over TCP: the status and the body.
-    async fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<u8>) {
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    /// `GET path` over TCP: the status and the body; `None` if nothing listens yet.
+    async fn try_get(addr: SocketAddr, path: &str) -> Option<(u16, Vec<u8>)> {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.ok()?;
         let request =
             format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
         stream.write_all(request.as_bytes()).await.unwrap();
@@ -257,13 +413,17 @@ mod tests {
         let text = String::from_utf8_lossy(&response).into_owned();
         let code = text.split(' ').nth(1).unwrap().parse().unwrap();
         let body = text.split_once("\r\n\r\n").unwrap().1.as_bytes().to_vec();
-        (code, body)
+        Some((code, body))
+    }
+
+    async fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<u8>) {
+        try_get(addr, path).await.expect("the Beacon API listens")
     }
 
     async fn wait_for_health(addr: SocketAddr, code: u16, within: Duration) -> Duration {
         let start = Instant::now();
         loop {
-            if http_get(addr, "/eth/v1/node/health").await.0 == code {
+            if try_get(addr, "/eth/v1/node/health").await.map(|r| r.0) == Some(code) {
                 return start.elapsed();
             }
             assert!(start.elapsed() < within, "health never answered {code}");

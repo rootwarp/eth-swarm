@@ -20,7 +20,8 @@ use axum::body::Bytes;
 use axum::extract::FromRequestParts;
 use axum::response::{IntoResponse, Response};
 use axum::Router;
-use http::{HeaderMap, HeaderName, StatusCode};
+use http::header::{ACCEPT, CONTENT_TYPE};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use network_config::ForkName;
 use tokio::net::TcpListener;
 
@@ -34,6 +35,9 @@ pub const DEFAULT_HTTP_ADDR: SocketAddr =
 /// `Eth-Consensus-Version`: the fork of the data in a fork-versioned response.
 pub const CONSENSUS_VERSION: HeaderName = HeaderName::from_static("eth-consensus-version");
 
+const JSON: &str = "application/json";
+const SSZ: &str = "application/octet-stream";
+
 /// Where the Beacon API listens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HttpBind {
@@ -44,7 +48,10 @@ pub struct HttpBind {
 
 impl Default for HttpBind {
     fn default() -> Self {
-        todo!()
+        Self {
+            addr: DEFAULT_HTTP_ADDR,
+            allow_non_loopback: false,
+        }
     }
 }
 
@@ -62,13 +69,18 @@ pub enum BindError {
 }
 
 impl HttpBind {
-    /// The address to listen on, if the policy allows it.
+    /// The address to listen on, if the policy allows it. An IPv4-mapped IPv6 address
+    /// (`::ffff:127.0.0.1`) is not loopback here.
     ///
     /// # Errors
     ///
     /// [`BindError::NotLoopback`] for a non-loopback address without the operator flag.
     pub fn check(&self) -> Result<SocketAddr, BindError> {
-        todo!()
+        if self.addr.ip().is_loopback() || self.allow_non_loopback {
+            Ok(self.addr)
+        } else {
+            Err(BindError::NotLoopback(self.addr))
+        }
     }
 
     /// Listens on [`Self::check`]'s address. A refused address opens no socket.
@@ -77,7 +89,10 @@ impl HttpBind {
     ///
     /// The address is refused, or the bind fails.
     pub async fn bind(&self) -> Result<TcpListener, BindError> {
-        todo!()
+        let addr = self.check()?;
+        TcpListener::bind(addr)
+            .await
+            .map_err(|source| BindError::Io { addr, source })
     }
 }
 
@@ -106,22 +121,26 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        todo!()
+        let body = serde_json::json!({ "code": self.status.as_u16(), "message": self.message });
+        json_response(self.status, &body)
     }
 }
 
 /// A JSON response with `body`.
 #[must_use]
 pub fn json_response(status: StatusCode, body: &serde_json::Value) -> Response {
-    let _ = (status, body);
-    todo!()
+    json_bytes(status, Bytes::from(body.to_string()))
 }
 
 /// A JSON response with a body that is already encoded.
 #[must_use]
 pub fn json_bytes(status: StatusCode, body: Bytes) -> Response {
-    let _ = (status, body);
-    todo!()
+    (
+        status,
+        [(CONTENT_TYPE, HeaderValue::from_static(JSON))],
+        body,
+    )
+        .into_response()
 }
 
 /// A response encoding.
@@ -134,14 +153,77 @@ pub enum Encoding {
 }
 
 /// The encoding to answer with, for the request's `Accept` headers and whether the route can
-/// produce SSZ.
+/// produce SSZ. Each type gets the q of the most specific range that matches it (RFC 9110
+/// §12.5.1). The higher q wins, then the type the client named over a wildcard, then JSON. A
+/// range that does not parse is ignored, and no usable range at all means JSON.
 ///
 /// # Errors
 ///
 /// 406 when the route can produce none of the accepted types.
 pub fn negotiate(headers: &HeaderMap, ssz: bool) -> Result<Encoding, ApiError> {
-    let _ = (headers, ssz);
-    todo!()
+    let ranges: Vec<(String, u16)> = headers
+        .get_all(ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(media_range)
+        .collect();
+    if ranges.is_empty() {
+        return Ok(Encoding::Json);
+    }
+    let json = preference(&ranges, JSON);
+    let ssz = if ssz {
+        preference(&ranges, SSZ)
+    } else {
+        (0, 0)
+    };
+    match (json, ssz) {
+        (json, ssz) if ssz.0 > 0 && ssz > json => Ok(Encoding::Ssz),
+        ((q, _), _) if q > 0 => Ok(Encoding::Json),
+        _ => Err(ApiError::new(
+            StatusCode::NOT_ACCEPTABLE,
+            "Accepted media type not supported",
+        )),
+    }
+}
+
+/// One `type/subtype; q=...` range: the lowercase type and q in thousandths.
+fn media_range(range: &str) -> Option<(String, u16)> {
+    let mut parts = range.split(';');
+    let media = parts.next()?.trim().to_ascii_lowercase();
+    if !media.contains('/') {
+        return None;
+    }
+    let mut q = 1000;
+    for param in parts {
+        if let Some((name, value)) = param.split_once('=') {
+            if name.trim().eq_ignore_ascii_case("q") {
+                let value: f32 = value.trim().parse().ok()?;
+                if !(0.0..=1.0).contains(&value) {
+                    return None;
+                }
+                q = (value * 1000.0).round() as u16;
+            }
+        }
+    }
+    Some((media, q))
+}
+
+/// `(q, specificity)` of `media` under `ranges`: specificity 2 for the exact type, 1 for
+/// `type/*`, 0 for `*/*`; `(0, 0)` when nothing matches.
+fn preference(ranges: &[(String, u16)], media: &str) -> (u16, u8) {
+    let wildcard = format!("{}/*", media.split('/').next().unwrap_or_default());
+    let specificity = |range: &str| match range {
+        r if r == media => Some(2),
+        r if r == wildcard => Some(1),
+        "*/*" => Some(0),
+        _ => None,
+    };
+    ranges
+        .iter()
+        .filter_map(|(range, q)| specificity(range).map(|s| (s, *q)))
+        .max()
+        .map_or((0, 0), |(s, q)| (q, s))
 }
 
 /// The extractor of a JSON-only route: it rejects a request that does not accept JSON with 406.
@@ -159,11 +241,13 @@ impl<S: Send + Sync> FromRequestParts<S> for JsonOnly {
     }
 }
 
-/// `response` with `Eth-Consensus-Version: <fork>`.
+/// `response` with `Eth-Consensus-Version: <fork>`, replacing any earlier value.
 #[must_use]
-pub fn with_consensus_version(response: Response, fork: ForkName) -> Response {
-    let _ = (response, fork);
-    todo!()
+pub fn with_consensus_version(mut response: Response, fork: ForkName) -> Response {
+    response
+        .headers_mut()
+        .insert(CONSENSUS_VERSION, HeaderValue::from_static(fork.as_str()));
+    response
 }
 
 /// What the handlers read.
@@ -175,8 +259,15 @@ pub struct ApiState {
 
 /// Every route, with the 404 and 405 fallbacks.
 pub fn router(state: ApiState) -> Router {
-    let _ = state;
-    todo!()
+    Router::new()
+        .merge(crate::routes::node::routes())
+        .merge(crate::routes::config::routes())
+        .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "Route not found") })
+        // After every route: it applies to the routes added before it.
+        .method_not_allowed_fallback(|| async {
+            ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed")
+        })
+        .with_state(state)
 }
 
 /// Serves `router` on `listener` until `shutdown`, then lets the open requests finish.
@@ -189,8 +280,9 @@ pub async fn serve(
     router: Router,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    let _ = (listener, router, shutdown);
-    todo!()
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown)
+        .await
 }
 
 #[cfg(test)]

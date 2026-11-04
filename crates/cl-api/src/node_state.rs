@@ -14,7 +14,7 @@
 //!   cl-chain unreachable at once. `syncing` then reports `is_syncing=true` from the last cached
 //!   head, and health is 206, never 200. The next good status clears it.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ethswarm_proto::chain as pb;
@@ -63,14 +63,18 @@ impl SlotClock {
         slot_duration_ms: u64,
         now: impl Fn() -> Duration + Send + Sync + 'static,
     ) -> Self {
-        let _ = (genesis_time, slot_duration_ms, now);
-        todo!()
+        Self {
+            genesis_time,
+            slot_duration_ms: slot_duration_ms.max(1),
+            now: Arc::new(now),
+        }
     }
 
     /// The current slot: 0 before genesis.
     #[must_use]
     pub fn current_slot(&self) -> u64 {
-        todo!()
+        let now_ms = u64::try_from((self.now)().as_millis()).unwrap_or(u64::MAX);
+        now_ms.saturating_sub(self.genesis_time.saturating_mul(1000)) / self.slot_duration_ms
     }
 }
 
@@ -86,8 +90,11 @@ pub struct ChainHead {
 
 impl From<&pb::SyncStatus> for ChainHead {
     fn from(status: &pb::SyncStatus) -> Self {
-        let _ = status;
-        todo!()
+        Self {
+            head_slot: status.head_slot,
+            optimistic: status.optimistic,
+            el_offline: status.el_offline,
+        }
     }
 }
 
@@ -117,7 +124,6 @@ pub enum Health {
 #[derive(Clone, Debug)]
 pub struct NodeState {
     clock: SlotClock,
-    sync_tolerance: u64,
     last: Arc<Mutex<Last>>,
 }
 
@@ -131,40 +137,83 @@ struct Last {
 }
 
 impl NodeState {
-    /// No status yet, a tolerance of [`SYNC_TOLERANCE_SLOTS`].
+    /// No status yet.
     #[must_use]
     pub fn new(clock: SlotClock) -> Self {
-        let _ = clock;
-        todo!()
+        Self {
+            clock,
+            last: Arc::default(),
+        }
     }
 
-    /// Records a status cl-chain sent.
-    pub fn record_head(&self, head: ChainHead) {
-        let _ = head;
-        todo!()
+    fn last(&self) -> Last {
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Records a poll that got no status. The last head stays cached.
-    pub fn record_unreachable(&self) {
-        todo!()
+    /// Records a status cl-chain sent; returns whether the poll before got one too.
+    pub fn record_head(&self, head: ChainHead) -> bool {
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        let was = last.reachable;
+        *last = Last {
+            head: Some(head),
+            reachable: true,
+        };
+        was
+    }
+
+    /// Records a poll that got no status, keeping the last head; returns whether the poll
+    /// before got one.
+    pub fn record_unreachable(&self) -> bool {
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        std::mem::replace(&mut last.reachable, false)
     }
 
     /// Whether the last poll got a status.
     #[must_use]
     pub fn chain_reachable(&self) -> bool {
-        todo!()
+        self.last().reachable
     }
 
     /// `node/syncing`'s data now.
     #[must_use]
     pub fn syncing(&self) -> Syncing {
-        todo!()
+        self.view(self.last())
     }
 
     /// `node/health`'s answer now.
     #[must_use]
     pub fn health(&self) -> Health {
-        todo!()
+        let last = self.last();
+        if last.head.is_none() {
+            return Health::NotInitialised;
+        }
+        let s = self.view(last);
+        if s.is_syncing || s.is_optimistic || s.el_offline {
+            Health::Degraded
+        } else {
+            Health::Ready
+        }
+    }
+
+    fn view(&self, last: Last) -> Syncing {
+        let wall = self.clock.current_slot();
+        let Some(head) = last.head else {
+            return Syncing {
+                head_slot: 0,
+                sync_distance: wall,
+                is_syncing: true,
+                is_optimistic: false,
+                el_offline: false,
+            };
+        };
+        let sync_distance = wall.saturating_sub(head.head_slot);
+        Syncing {
+            head_slot: head.head_slot,
+            sync_distance,
+            is_syncing: !last.reachable || sync_distance > SYNC_TOLERANCE_SLOTS,
+            is_optimistic: head.optimistic,
+            el_offline: head.el_offline,
+        }
     }
 }
 
@@ -176,8 +225,25 @@ where
     T::ResponseBody: Body<Data = Bytes> + Send + 'static,
     <T::ResponseBody as Body>::Error: Into<StdError> + Send,
 {
-    let _ = (client, state, timeout);
-    todo!()
+    let call = client.get_chain_status(pb::GetChainStatusRequest {});
+    let failure = match tokio::time::timeout(timeout, call).await {
+        Ok(Ok(response)) => match response.into_inner().status {
+            Some(status) => {
+                if !state.record_head(ChainHead::from(&status)) {
+                    tracing::info!(head_slot = status.head_slot, "cl-chain reachable");
+                }
+                return;
+            }
+            None => "GetChainStatus answered without a status".to_owned(),
+        },
+        Ok(Err(status)) => format!("GetChainStatus failed: {status}"),
+        Err(_) => format!("GetChainStatus took longer than {timeout:?}"),
+    };
+    if state.record_unreachable() {
+        tracing::warn!(error = %failure, "cl-chain unreachable: node/syncing reports syncing");
+    } else {
+        tracing::debug!(error = %failure, "cl-chain still unreachable");
+    }
 }
 
 /// Polls every `interval` until `shutdown`. Each call gets `interval` at most.
@@ -187,6 +253,18 @@ pub async fn poll_chain(
     interval: Duration,
     shutdown: impl std::future::Future<Output = ()>,
 ) {
-    let _ = (client, state, interval, shutdown);
-    todo!()
+    let mut client = client;
+    let mut ticks = tokio::time::interval(interval);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tokio::pin!(shutdown);
+    loop {
+        let poll = async {
+            ticks.tick().await;
+            poll_once(&mut client, &state, interval).await;
+        };
+        tokio::select! {
+            () = &mut shutdown => return,
+            () = poll => {}
+        }
+    }
 }

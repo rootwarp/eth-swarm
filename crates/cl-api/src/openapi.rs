@@ -230,11 +230,10 @@ mod tests {
         );
         let schema = match response.and_then(|r| spec.json_schema(r)) {
             Some(schema) => schema,
-            None if status.is_success() => {
-                assert!(body.is_empty(), "{uri}: {status} has no content");
-                return status;
-            }
-            // Every error carries the beacon-APIs error body.
+            // A documented response without content has no body (`node/health`).
+            None if response.is_some() && body.is_empty() => return status,
+            None if status.is_success() => panic!("{uri}: {status} has no content: {body:?}"),
+            // Any other error carries the beacon-APIs error body.
             None => spec.schema("ErrorMessage"),
         };
         assert_eq!(headers[CONTENT_TYPE], "application/json", "{uri}");
@@ -304,8 +303,15 @@ mod tests {
                 .errors(&parameter["schema"], &serde_json::json!(value))
                 .is_empty();
             let uri = format!("{health}?syncing_status={value}");
-            let status = check(&spec, &app, health, get(&uri), &mut seen).await;
-            assert_eq!(status == StatusCode::BAD_REQUEST, !valid, "{uri}: {status}");
+            if valid {
+                // The client's own code, listed in the schema or not, and no body.
+                let (status, _, body) = request(&app, get(&uri)).await;
+                assert_eq!(status.as_u16(), value, "{uri}");
+                assert!(body.is_empty(), "{uri}");
+            } else {
+                let status = check(&spec, &app, health, get(&uri), &mut seen).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            }
         }
 
         check(

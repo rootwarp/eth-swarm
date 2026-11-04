@@ -12,10 +12,17 @@
 //!   without them, or with values that do not parse, stops cl-api at startup.
 
 use axum::body::Bytes;
+use axum::extract::State;
+use axum::routing::get;
 use axum::Router;
-use network_config::ChainConfig;
+use http::StatusCode;
+use network_config::{ChainConfig, ForkName, Version, FAR_FUTURE_EPOCH};
+use serde_json::{json, Map, Value};
 
-use crate::server::ApiState;
+use crate::server::{json_bytes, ApiState, JsonOnly};
+
+/// The forks before Fulu that a config may schedule, oldest first.
+const EARLIER_FORKS: [&str; 5] = ["ALTAIR", "BELLATRIX", "CAPELLA", "DENEB", "ELECTRA"];
 
 /// The encoded config responses.
 #[derive(Clone, Debug)]
@@ -45,14 +52,129 @@ impl ConfigData {
     ///
     /// The deposit contract keys are missing or malformed, or a fork key does not parse.
     pub fn new(chain: &ChainConfig) -> Result<Self, ConfigDataError> {
-        let _ = chain;
-        todo!()
+        let encode = |data: Value| Bytes::from(json!({ "data": data }).to_string());
+        Ok(Self {
+            spec: encode(spec(chain)),
+            fork_schedule: encode(fork_schedule(chain)?),
+            deposit_contract: encode(deposit_contract(chain)?),
+        })
     }
 }
 
 /// The config routes.
 pub fn routes() -> Router<ApiState> {
-    todo!()
+    let serve = |body: fn(&ConfigData) -> &Bytes| {
+        get(
+            move |_: JsonOnly, State(state): State<ApiState>| async move {
+                json_bytes(StatusCode::OK, body(&state.config).clone())
+            },
+        )
+    };
+    Router::new()
+        .route("/eth/v1/config/spec", serve(|c| &c.spec))
+        .route("/eth/v1/config/fork_schedule", serve(|c| &c.fork_schedule))
+        .route(
+            "/eth/v1/config/deposit_contract",
+            serve(|c| &c.deposit_contract),
+        )
+}
+
+fn invalid(key: &str, value: &str, expected: &'static str) -> ConfigDataError {
+    ConfigDataError::Invalid {
+        key: key.to_owned(),
+        value: value.to_owned(),
+        expected,
+    }
+}
+
+/// Every scalar as a string, every list as an array of objects of strings.
+fn spec(chain: &ChainConfig) -> Value {
+    let mut data: Map<String, Value> = chain
+        .scalars()
+        .map(|(key, value)| (key.to_owned(), Value::from(value)))
+        .collect();
+    for (key, records) in chain.lists() {
+        let records = records
+            .iter()
+            .map(|record| {
+                let fields = record
+                    .iter()
+                    .map(|(f, v)| (f.clone(), Value::from(v.as_str())));
+                Value::Object(fields.collect())
+            })
+            .collect();
+        data.insert(key.to_owned(), Value::Array(records));
+    }
+    Value::Object(data)
+}
+
+/// `0x` and 8 hex digits.
+fn parse_version(s: &str) -> Option<Version> {
+    let digits = s
+        .strip_prefix("0x")
+        .filter(|d| d.len() == 8 && d.bytes().all(|b| b.is_ascii_hexdigit()))?;
+    u32::from_str_radix(digits, 16).ok().map(u32::to_be_bytes)
+}
+
+fn hex(version: Version) -> String {
+    format!("0x{:08x}", u32::from_be_bytes(version))
+}
+
+/// Phase0, the earlier forks the config schedules, then Fulu and Gloas.
+fn fork_schedule(chain: &ChainConfig) -> Result<Value, ConfigDataError> {
+    let mut forks = vec![(chain.genesis_fork_version(), 0, String::new())];
+    for name in EARLIER_FORKS {
+        let (version_key, epoch_key) =
+            (format!("{name}_FORK_VERSION"), format!("{name}_FORK_EPOCH"));
+        let (Some(version), Some(epoch)) = (chain.get(&version_key), chain.get(&epoch_key)) else {
+            continue;
+        };
+        let epoch: u64 = epoch
+            .parse()
+            .map_err(|_| invalid(&epoch_key, epoch, "a uint64"))?;
+        let version = parse_version(version)
+            .ok_or_else(|| invalid(&version_key, version, "0x and 8 hex digits"))?;
+        if epoch != FAR_FUTURE_EPOCH {
+            forks.push((version, epoch, epoch_key));
+        }
+    }
+    let schedule = chain.fork_schedule();
+    for fork in ForkName::ALL {
+        if let Some(epoch) = schedule.fork_epoch(fork) {
+            let key = format!("{}_FORK_EPOCH", fork.as_str().to_ascii_uppercase());
+            forks.push((schedule.fork_version(fork), epoch, key));
+        }
+    }
+    let (mut previous, mut previous_epoch) = (chain.genesis_fork_version(), 0);
+    let mut data = Vec::with_capacity(forks.len());
+    for (version, epoch, key) in forks {
+        if epoch < previous_epoch {
+            let expected = "at or after the epoch of the fork before it";
+            return Err(invalid(&key, &epoch.to_string(), expected));
+        }
+        data.push(json!({
+            "previous_version": hex(previous),
+            "current_version": hex(version),
+            "epoch": epoch.to_string(),
+        }));
+        (previous, previous_epoch) = (version, epoch);
+    }
+    Ok(Value::Array(data))
+}
+
+fn deposit_contract(chain: &ChainConfig) -> Result<Value, ConfigDataError> {
+    let get = |key: &'static str| chain.get(key).ok_or(ConfigDataError::Missing(key));
+    let chain_id = get("DEPOSIT_CHAIN_ID")?;
+    let chain_id: u64 = chain_id
+        .parse()
+        .map_err(|_| invalid("DEPOSIT_CHAIN_ID", chain_id, "a uint64"))?;
+    let address = get("DEPOSIT_CONTRACT_ADDRESS")?;
+    let digits = address.strip_prefix("0x").unwrap_or_default();
+    if digits.len() != 40 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let expected = "0x and 40 hex digits";
+        return Err(invalid("DEPOSIT_CONTRACT_ADDRESS", address, expected));
+    }
+    Ok(json!({ "chain_id": chain_id.to_string(), "address": address }))
 }
 
 #[cfg(test)]

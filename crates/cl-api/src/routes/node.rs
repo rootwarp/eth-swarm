@@ -8,19 +8,87 @@
 //!   slots as decimal strings.
 //! - `version` reads `ethswarm/<semver>/<arch>-<os>` ([`version_string`]).
 
+use axum::extract::{RawQuery, State};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
 use axum::Router;
+use http::StatusCode;
+use serde_json::json;
 
-use crate::server::ApiState;
+use crate::node_state::Health;
+use crate::server::{json_response, ApiError, ApiState, JsonOnly};
 
 /// The node routes.
 pub fn routes() -> Router<ApiState> {
-    todo!()
+    Router::new()
+        .route("/eth/v1/node/health", get(health))
+        .route("/eth/v1/node/syncing", get(syncing))
+        .route("/eth/v1/node/version", get(version))
 }
 
 /// `ethswarm/<crate version>/<arch>-<os>`, e.g. `ethswarm/0.1.0/x86_64-linux`.
 #[must_use]
 pub fn version_string() -> String {
-    todo!()
+    format!(
+        "ethswarm/{}/{}-{}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::ARCH,
+        std::env::consts::OS
+    )
+}
+
+async fn health(State(state): State<ApiState>, RawQuery(query): RawQuery) -> Response {
+    let syncing_status = match syncing_status(query.as_deref()) {
+        Ok(code) => code,
+        Err(e) => return e.into_response(),
+    };
+    match state.node.health() {
+        Health::Ready => StatusCode::OK,
+        Health::Degraded => syncing_status.unwrap_or(StatusCode::PARTIAL_CONTENT),
+        Health::NotInitialised => StatusCode::SERVICE_UNAVAILABLE,
+    }
+    .into_response()
+}
+
+/// The `syncing_status` parameter: an integer in 100..=599, given at most once.
+fn syncing_status(query: Option<&str>) -> Result<Option<StatusCode>, ApiError> {
+    let mut found = None;
+    let pairs = form_urlencoded::parse(query.unwrap_or_default().as_bytes());
+    for (_, value) in pairs.filter(|(key, _)| key == "syncing_status") {
+        let code = value
+            .parse::<u16>()
+            .ok()
+            .filter(|code| (100..=599).contains(code))
+            .and_then(|code| StatusCode::from_u16(code).ok())
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "Invalid syncing_status {value:?}: expected an integer from 100 to 599"
+                ))
+            })?;
+        if found.replace(code).is_some() {
+            return Err(ApiError::bad_request("syncing_status is given twice"));
+        }
+    }
+    Ok(found)
+}
+
+async fn syncing(_: JsonOnly, State(state): State<ApiState>) -> Response {
+    let s = state.node.syncing();
+    let data = json!({
+        "head_slot": s.head_slot.to_string(),
+        "sync_distance": s.sync_distance.to_string(),
+        "is_syncing": s.is_syncing,
+        "is_optimistic": s.is_optimistic,
+        "el_offline": s.el_offline,
+    });
+    json_response(StatusCode::OK, &json!({ "data": data }))
+}
+
+async fn version(_: JsonOnly) -> Response {
+    json_response(
+        StatusCode::OK,
+        &json!({ "data": { "version": version_string() } }),
+    )
 }
 
 #[cfg(test)]
