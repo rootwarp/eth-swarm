@@ -305,8 +305,10 @@ jobs:
       # Only the root cases: the other launch tests run in the rust job, as a non-root user.
       - name: cl-node as root (launch refuses without the unit users; staging never follows a symlink)
         run: cargo test -p cl-node --lib --test launch --locked -- root_
-      - name: Install sudo (the two-user store run switches users with sudo -u)
-        run: apt-get update && apt-get install -y --no-install-recommends sudo
+      # sudo switches users for the two-user store run; libclang-dev is for mdbx-sys's bindgen,
+      # since cl-store's tests are the first in this container to build libmdbx.
+      - name: Install sudo and libclang (the two-user store run builds mdbx-sys and uses sudo -u)
+        run: apt-get update && apt-get install -y --no-install-recommends sudo libclang-dev
       - name: cl-store's read-only tests as ethswarm-store against an env ethswarm-chain wrote (sudo -u)
         run: bash scripts/tests/store-two-users.test.sh && bash scripts/store-two-users.sh ethswarm-chain ethswarm-store
 
