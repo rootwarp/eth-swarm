@@ -328,6 +328,7 @@ mod tests {
             let state = ApiState {
                 node: node.clone(),
                 config: Arc::new(ConfigData::new(&ChainConfig::load(network).unwrap()).unwrap()),
+                events: crate::sse::EventHub::new(),
             };
             let app = router(state);
             for path in [

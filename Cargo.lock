@@ -1028,10 +1028,14 @@ name = "cl-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "cl-chain",
+ "consensus-types",
  "ethswarm-proto",
  "form_urlencoded",
  "futures-util",
  "http",
+ "http-body-util",
+ "hyper",
  "hyper-util",
  "ipc",
  "network-config",
@@ -1041,6 +1045,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tower",
  "tracing",

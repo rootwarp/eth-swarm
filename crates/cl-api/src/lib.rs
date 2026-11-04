@@ -23,6 +23,7 @@ pub mod node_state;
 pub mod routes;
 pub mod server;
 pub mod service;
+pub mod sse;
 
 #[cfg(test)]
 mod openapi;

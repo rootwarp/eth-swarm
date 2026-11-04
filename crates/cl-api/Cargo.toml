@@ -31,9 +31,19 @@ tonic.workspace = true
 tracing = "0.1"
 
 [dev-dependencies]
+# The end-to-end test of /eth/v1/events: cl-chain's own EventsService and its event types.
+# Workspace crates; they add no crate to Cargo.lock.
+cl-chain = { path = "../cl-chain" }
+consensus-types = { path = "../consensus-types" }
 # A streaming body for the server tests; already in Cargo.lock (through axum).
 futures-util = { version = "0.3", default-features = false }
+# The test SSE client: hyper's HTTP/1 client, as cl-chain's reference API client uses it.
+# Already in Cargo.lock.
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
 ipc = { path = "../ipc", features = ["testkit"] }
 tempfile = "3"
 tokio = { version = "1", features = ["io-util"] }
+# A Unix socket served behind a method ACL (tonic's incoming stream); already in Cargo.lock.
+tokio-stream = { version = "0.1", features = ["net"] }
 tower = { version = "0.5", features = ["util"] }
