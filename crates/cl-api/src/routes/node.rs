@@ -100,8 +100,7 @@ mod tests {
     use ipc::testkit::{Mode, Server};
 
     use crate::node_state::{poll_once, ChainHead, Health, NodeState};
-    use crate::server::router;
-    use crate::testing::{self, get, json, sync_status, FakeChain, WALL_SLOT};
+    use crate::testing::{self, get, json, router, sync_status, FakeChain, WALL_SLOT};
 
     const HEALTH: &str = "/eth/v1/node/health";
     const SYNCING: &str = "/eth/v1/node/syncing";

@@ -28,6 +28,8 @@ tonic.workspace = true
 tracing = "0.1"
 
 [dev-dependencies]
+# A streaming body for the server tests; already in Cargo.lock (through axum).
+futures-util = { version = "0.3", default-features = false }
 ipc = { path = "../ipc", features = ["testkit"] }
 tempfile = "3"
 tokio = { version = "1", features = ["io-util"] }

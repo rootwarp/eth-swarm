@@ -46,6 +46,11 @@ pub fn api_state(node: NodeState) -> ApiState {
     }
 }
 
+/// [`crate::server::router`] over `state`, with the default request timeout.
+pub fn router(state: ApiState) -> Router {
+    crate::server::router(state, crate::server::HttpLimits::default().request_timeout)
+}
+
 /// `request` through `app`: its status, headers and body.
 pub async fn request(app: &Router, request: Request<Body>) -> (StatusCode, HeaderMap, Vec<u8>) {
     let response = app.clone().oneshot(request).await.unwrap();

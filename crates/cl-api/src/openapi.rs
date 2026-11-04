@@ -209,8 +209,8 @@ mod tests {
     use super::*;
     use crate::node_state::{ChainHead, NodeState};
     use crate::routes::config::ConfigData;
-    use crate::server::{router, ApiState};
-    use crate::testing::{self, json, request, WALL_SLOT};
+    use crate::server::ApiState;
+    use crate::testing::{self, json, request, router, WALL_SLOT};
 
     /// Checks one response against the fixture; returns its status.
     async fn check(

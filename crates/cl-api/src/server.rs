@@ -15,6 +15,7 @@ use std::borrow::Cow;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::FromRequestParts;
@@ -257,41 +258,70 @@ pub struct ApiState {
     pub config: Arc<ConfigData>,
 }
 
+/// The Beacon API's connection and request limits.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HttpLimits {
+    pub header_read_timeout: Duration,
+    pub request_timeout: Duration,
+    pub max_connections: usize,
+    pub allowed_hosts: Vec<String>,
+}
+
 /// Every route, with the 404 and 405 fallbacks.
-pub fn router(state: ApiState) -> Router {
-    Router::new()
-        .merge(crate::routes::node::routes())
-        .merge(crate::routes::config::routes())
+pub fn router(state: ApiState, request_timeout: Duration) -> Router {
+    app(
+        Router::new()
+            .merge(crate::routes::node::routes())
+            .merge(crate::routes::config::routes()),
+        Router::new(),
+        request_timeout,
+    )
+    .with_state(state)
+}
+
+/// `timed` and `streaming`, then the 404 and 405 fallbacks.
+fn app(
+    timed: Router<ApiState>,
+    streaming: Router<ApiState>,
+    request_timeout: Duration,
+) -> Router<ApiState> {
+    let _ = request_timeout;
+    timed
+        .merge(streaming)
         .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "Route not found") })
         // After every route: it applies to the routes added before it.
         .method_not_allowed_fallback(|| async {
             ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed")
         })
-        .with_state(state)
 }
 
 /// Serves `router` on `listener` until `shutdown`, then lets the open requests finish.
-///
-/// # Errors
-///
-/// The server stopped on an I/O error.
 pub async fn serve(
     listener: TcpListener,
     router: Router,
+    limits: HttpLimits,
     shutdown: impl Future<Output = ()> + Send + 'static,
-) -> std::io::Result<()> {
-    axum::serve(listener, router)
+) {
+    let _ = limits;
+    if let Err(e) = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown)
         .await
+    {
+        tracing::warn!(error = %e, "the Beacon API stopped on an error");
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::node_state::NodeState;
     use crate::testing::{self, get, json, request};
     use http::header::{ACCEPT, ALLOW, CONTENT_TYPE};
     use http::{HeaderValue, Method, Request};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
 
     fn bind(addr: &str, allow_non_loopback: bool) -> HttpBind {
         HttpBind {
@@ -301,7 +331,7 @@ mod tests {
     }
 
     fn app() -> Router {
-        router(testing::api_state(NodeState::new(testing::clock())))
+        testing::router(testing::api_state(NodeState::new(testing::clock())))
     }
 
     /// The error body: JSON `{"code": <status>, "message": <text>}` and nothing else.
@@ -469,5 +499,294 @@ mod tests {
         );
         assert_eq!(twice.headers()[CONSENSUS_VERSION], "gloas");
         assert_eq!(twice.headers().get_all(CONSENSUS_VERSION).iter().count(), 1);
+    }
+
+    /// The TCP tests' limits: `header_read_ms` and `request_ms` in milliseconds, the default
+    /// hosts.
+    fn limits(header_read_ms: u64, request_ms: u64, max_connections: usize) -> HttpLimits {
+        HttpLimits {
+            header_read_timeout: Duration::from_millis(header_read_ms),
+            request_timeout: Duration::from_millis(request_ms),
+            max_connections,
+            allowed_hosts: ["localhost", "127.0.0.1", "[::1]"]
+                .map(String::from)
+                .to_vec(),
+        }
+    }
+
+    /// How long a TCP test waits for anything before it fails.
+    const WITHIN: Duration = Duration::from_secs(5);
+
+    /// `app` served under `limits` on a free loopback port, until the sender is dropped.
+    async fn spawn(
+        app: Router,
+        limits: HttpLimits,
+    ) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(serve(listener, app, limits, async {
+            let _ = stopped.await;
+        }));
+        (addr, stop)
+    }
+
+    /// The response at the start of `raw`, once it is whole: its status, headers and body. The
+    /// body is framed by `Content-Length`, or else is chunked and kept with its chunk framing.
+    fn whole(raw: &[u8]) -> Option<(StatusCode, HeaderMap, Vec<u8>)> {
+        let text = std::str::from_utf8(raw).ok()?;
+        let (head, body) = text.split_once("\r\n\r\n")?;
+        let mut lines = head.split("\r\n");
+        let status = lines.next()?.split(' ').nth(1)?.parse::<u16>().ok()?;
+        let mut headers = HeaderMap::new();
+        for line in lines {
+            let (name, value) = line.split_once(':')?;
+            headers.append(
+                HeaderName::from_bytes(name.as_bytes()).ok()?,
+                HeaderValue::from_str(value.trim()).ok()?,
+            );
+        }
+        let body = match headers.get(http::header::CONTENT_LENGTH) {
+            Some(len) => body.as_bytes().get(..len.to_str().ok()?.parse().ok()?)?,
+            None => body.ends_with("\r\n0\r\n\r\n").then_some(body.as_bytes())?,
+        };
+        Some((StatusCode::from_u16(status).ok()?, headers, body.to_vec()))
+    }
+
+    /// One response on a connection that stays open.
+    async fn read_response(stream: &mut TcpStream) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let deadline = tokio::time::Instant::now() + WITHIN;
+        let (mut raw, mut buf) = (Vec::new(), [0; 4096]);
+        loop {
+            if let Some(response) = whole(&raw) {
+                return response;
+            }
+            let read = tokio::time::timeout_at(deadline, stream.read(&mut buf));
+            let n = read.await.expect("a whole response in time").unwrap();
+            assert!(
+                n > 0,
+                "closed mid-response: {}",
+                String::from_utf8_lossy(&raw)
+            );
+            raw.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    /// Everything the server sends until it closes the connection (a reset counts as a close).
+    async fn read_until_closed(stream: &mut TcpStream) -> Vec<u8> {
+        let deadline = tokio::time::Instant::now() + WITHIN;
+        let (mut raw, mut buf) = (Vec::new(), [0; 4096]);
+        loop {
+            let read = tokio::time::timeout_at(deadline, stream.read(&mut buf));
+            match read
+                .await
+                .expect("the server closes the connection in time")
+            {
+                Ok(0) | Err(_) => return raw,
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+
+    /// `GET target` on a new connection with `headers` (each line ends in CRLF) and
+    /// `Connection: close`; the response.
+    async fn once(
+        addr: SocketAddr,
+        target: &str,
+        headers: &str,
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let request = format!("GET {target} HTTP/1.1\r\n{headers}Connection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let raw = read_until_closed(&mut stream).await;
+        whole(&raw)
+            .unwrap_or_else(|| panic!("no whole response: {}", String::from_utf8_lossy(&raw)))
+    }
+
+    const VERSION: &str = "/eth/v1/node/version";
+    const KEEP_ALIVE: &[u8] = b"GET /eth/v1/node/version HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    /// DNS rebinding: a page on evil.example that resolves to 127.0.0.1 reaches the port, but
+    /// its requests still name evil.example in Host.
+    #[tokio::test]
+    async fn host_allow_list() {
+        let (addr, _stop) = spawn(app(), limits(5_000, 5_000, 8)).await;
+        let own_port = format!("127.0.0.1:{}", addr.port());
+        // An allowed host, with any port or none, in any case: 200.
+        for host in [
+            "localhost:5052",
+            "127.0.0.1",
+            &own_port,
+            "[::1]:5052",
+            "LocalHost",
+        ] {
+            let (status, _, body) = once(addr, VERSION, &format!("Host: {host}\r\n")).await;
+            assert_eq!(status, StatusCode::OK, "{host}");
+            assert!(json(&body)["data"]["version"].is_string(), "{host}");
+        }
+        // Another host, in Host or in an absolute-form target, on any route: 421.
+        for (target, host) in [
+            (VERSION, "evil.example"),
+            (VERSION, "evil.example:5052"),
+            (VERSION, "localhost.evil.example"),
+            ("/eth/v1/node/nope", "evil.example"),
+            ("http://evil.example/eth/v1/node/version", "localhost"),
+        ] {
+            let (status, headers, body) = once(addr, target, &format!("Host: {host}\r\n")).await;
+            assert_error(status, &headers, &body, 421);
+        }
+        // No Host, two, or one that is not a host and port: 400.
+        for headers in [
+            "",
+            "Host: localhost\r\nHost: localhost\r\n",
+            "Host: localhost\r\nHost: evil.example\r\n",
+            "Host: user@localhost\r\n",
+            "Host: localhost:port\r\n",
+        ] {
+            let (status, response_headers, body) = once(addr, VERSION, headers).await;
+            assert_error(status, &response_headers, &body, 400);
+        }
+    }
+
+    /// Slowloris: a client that stops partway through its headers holds the connection only
+    /// until the header-read timeout.
+    #[tokio::test]
+    async fn slow_headers_closed() {
+        let timeout = Duration::from_millis(300);
+        let (addr, _stop) = spawn(app(), limits(300, 5_000, 8)).await;
+        let start = Instant::now();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /eth/v1/node/version HTTP/1.1\r\nHost: local")
+            .await
+            .unwrap();
+        let raw = read_until_closed(&mut stream).await;
+        let took = start.elapsed();
+        assert!(raw.is_empty(), "{}", String::from_utf8_lossy(&raw));
+        assert!(took >= timeout, "closed after {took:?}");
+        assert!(
+            took < timeout + Duration::from_secs(2),
+            "closed after {took:?}"
+        );
+    }
+
+    /// A keep-alive connection serves several requests, then is closed once it has been idle
+    /// for the header-read timeout.
+    #[tokio::test]
+    async fn idle_keepalive_closed() {
+        let timeout = Duration::from_millis(300);
+        let (addr, _stop) = spawn(app(), limits(300, 5_000, 8)).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        for _ in 0..2 {
+            stream.write_all(KEEP_ALIVE).await.unwrap();
+            assert_eq!(read_response(&mut stream).await.0, StatusCode::OK);
+        }
+        let idle = Instant::now();
+        let raw = read_until_closed(&mut stream).await;
+        let took = idle.elapsed();
+        assert!(raw.is_empty(), "{}", String::from_utf8_lossy(&raw));
+        // The server's idle timer starts once it has written the response, a little before
+        // the client has read it.
+        assert!(took >= timeout / 2, "closed after {took:?}");
+        assert!(
+            took < timeout + Duration::from_secs(2),
+            "closed after {took:?}"
+        );
+    }
+
+    /// With the cap's connections open, one more is closed unanswered; once one of them
+    /// closes, a new connection is served again.
+    #[tokio::test]
+    async fn connection_cap() {
+        let (addr, _stop) = spawn(app(), limits(10_000, 5_000, 2)).await;
+        let mut open = Vec::new();
+        for _ in 0..2 {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(KEEP_ALIVE).await.unwrap();
+            assert_eq!(read_response(&mut stream).await.0, StatusCode::OK);
+            open.push(stream);
+        }
+        let mut over = TcpStream::connect(addr).await.unwrap();
+        let _ = over.write_all(KEEP_ALIVE).await;
+        let raw = read_until_closed(&mut over).await;
+        assert!(raw.is_empty(), "{}", String::from_utf8_lossy(&raw));
+        // The open ones are still served.
+        for stream in &mut open {
+            stream.write_all(KEEP_ALIVE).await.unwrap();
+            assert_eq!(read_response(stream).await.0, StatusCode::OK);
+        }
+        // One closes: its slot frees as soon as the server sees the close.
+        drop(open.remove(0));
+        let start = Instant::now();
+        let request =
+            "GET /eth/v1/node/version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        loop {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let _ = stream.write_all(request.as_bytes()).await;
+            if let Some((status, _, _)) = whole(&read_until_closed(&mut stream).await) {
+                assert_eq!(status, StatusCode::OK);
+                break;
+            }
+            assert!(start.elapsed() < WITHIN, "no slot freed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A handler slower than the request timeout answers 503. A streaming route, which leaves
+    /// the timeout out, keeps going past both the request and the header-read timeout on a
+    /// keep-alive connection.
+    #[tokio::test]
+    async fn request_timeout_non_streaming() {
+        use axum::routing::get;
+        let slow = || async {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            "late"
+        };
+        let ticks = || async {
+            let ticks = futures_util::stream::unfold(0, |i| async move {
+                (i < 8).then_some(())?;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Some((
+                    Ok::<_, std::convert::Infallible>(format!("tick {i}\n")),
+                    i + 1,
+                ))
+            });
+            axum::body::Body::from_stream(ticks)
+        };
+        let timed = Router::new()
+            .route("/slow", get(slow))
+            .merge(crate::routes::node::routes());
+        let streaming = Router::new().route("/stream", get(ticks));
+        let state = testing::api_state(NodeState::new(testing::clock()));
+        let routes = super::app(timed, streaming, Duration::from_millis(300)).with_state(state);
+        let (addr, _stop) = spawn(routes, limits(200, 300, 8)).await;
+
+        let start = Instant::now();
+        let (status, headers, body) = once(addr, "/slow", "Host: localhost\r\n").await;
+        let took = start.elapsed();
+        assert_error(status, &headers, &body, 503);
+        assert!(
+            took >= Duration::from_millis(300),
+            "answered after {took:?}"
+        );
+        assert!(took < Duration::from_secs(2), "answered after {took:?}");
+        // A fast route under the same timeout.
+        let (status, _, _) = once(addr, VERSION, "Host: localhost\r\n").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let start = Instant::now();
+        stream
+            .write_all(b"GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let (status, _, body) = read_response(&mut stream).await;
+        let took = start.elapsed();
+        assert_eq!(status, StatusCode::OK);
+        assert!(took >= Duration::from_millis(800), "ended after {took:?}");
+        let body = String::from_utf8(body).unwrap();
+        for i in 0..8 {
+            assert!(body.contains(&format!("tick {i}\n")), "{body}");
+        }
     }
 }

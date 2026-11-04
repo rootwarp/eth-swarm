@@ -1030,6 +1030,7 @@ dependencies = [
  "axum",
  "ethswarm-proto",
  "form_urlencoded",
+ "futures-util",
  "http",
  "ipc",
  "network-config",
