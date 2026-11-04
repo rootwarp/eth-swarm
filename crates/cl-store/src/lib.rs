@@ -1,59 +1,22 @@
-//! `cl-store`: serves `ethswarm.store.v1`, the read side: blocks, states, columns and envelopes from a read-only MDBX.
+//! `cl-store`: serves `ethswarm.store.v1`, the read side of the store env cl-chain writes.
 //!
-//! This is a stub. Every RPC runs the `ipc` contract layer first (hello negotiation, frame
-//! discipline, `seq`, envelope type and digest checks) and then answers `UNIMPLEMENTED`, so the
-//! service already holds its peers to the wire contract. `tests/contract.rs` runs the contract
-//! suite against it, in process and over a Unix socket.
-//!
-//! [`stamp`] is the client side every caller of cl-store uses: a response without its full
-//! `ReadMeta` stamp is refused.
+//! - [`reader`]: the env opened read-only (`MDBX_RDONLY`). Every read is one read transaction
+//!   that reads the stamp row with its data, under a per-call deadline; no stamp, no data.
+//! - `ranges`: finalized block ranges ([`Reader::finalized_blocks`]), under the same rules.
+//! - [`server`]: the `StoreService`: `GetBlock`, `GetBlocksByRange`, `GetChainHead` and the
+//!   streamed parent walk `GetBlocksByHead`, behind the `ipc` contract layer and the method
+//!   ACL ([`server::store_acl`]: cl-api, cl-sync, cl-p2p). The other RPCs run the contract
+//!   checks and answer `UNIMPLEMENTED`. `tests/contract.rs` runs the contract suite against it,
+//!   in process and over a Unix socket.
+//! - [`stamp`]: the client side every caller of cl-store uses: a response without its full
+//!   `ReadMeta` stamp is refused.
 
+mod ranges;
+pub mod reader;
+pub mod server;
 pub mod stamp;
+#[cfg(test)]
+mod testkit;
 
-use ethswarm_proto::store as pb;
-use ipc::Link;
-use pb::store_service_server::{StoreService, StoreServiceServer};
-use tonic::service::Routes;
-
-/// The `cl-store` service: contract checks, then `UNIMPLEMENTED`.
-#[derive(Clone, Debug)]
-pub struct StoreStub {
-    link: Link,
-}
-
-impl StoreStub {
-    #[must_use]
-    pub fn new(link: Link) -> Self {
-        Self { link }
-    }
-
-    /// The contract configuration every RPC is checked against.
-    #[must_use]
-    pub fn link(&self) -> &Link {
-        &self.link
-    }
-
-    /// Every `ethswarm.store.v1` service, ready to serve.
-    #[must_use]
-    pub fn routes(self) -> Routes {
-        Routes::new(StoreServiceServer::new(self.clone()))
-    }
-}
-
-ipc::stub_service!(StoreStub => StoreService {
-    unary: [
-        get_block(pb::GetBlockRequest) -> pb::GetBlockResponse,
-        get_state(pb::GetStateRequest) -> pb::GetStateResponse,
-        get_payload_envelope(pb::GetPayloadEnvelopeRequest) -> pb::GetPayloadEnvelopeResponse,
-        get_chain_head(pb::GetChainHeadRequest) -> pb::GetChainHeadResponse,
-    ],
-    unary_envelopes: [
-    ],
-    server_stream: [
-        get_data_columns(pb::GetDataColumnsRequest) -> pb::GetDataColumnsResponse as GetDataColumnsStream,
-        get_blocks_by_range(pb::GetBlocksByRangeRequest) -> pb::GetBlocksByRangeResponse as GetBlocksByRangeStream,
-        get_data_columns_by_range(pb::GetDataColumnsByRangeRequest) -> pb::GetDataColumnsByRangeResponse as GetDataColumnsByRangeStream,
-    ],
-    bidi: [
-    ],
-});
+pub use reader::{BlockRef, Deadline, ReadError, Reader};
+pub use server::{store_acl, Callers, StoreServer};

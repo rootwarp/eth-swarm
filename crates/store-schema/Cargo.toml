@@ -9,8 +9,9 @@ description = "The MDBX env cl-chain writes: options, tables, keys and the schem
 
 [features]
 # Seam for tests only: `WriterEnv::raw_env`, the env itself, so a test can write a store no
-# writer path may (rows committed raw, with no stamp). Only dev-dependencies enable it (this
-# crate's own, below, and cl-chain's), so a normal build of a service leaves it off.
+# writer path may (rows committed raw, with no stamp), plus `txn::seed_unstamped` and
+# `env::test_writer` for a reader crate's tests. Only dev-dependencies enable it (this crate's
+# own, below, cl-chain's and cl-store's), so a normal build of a service leaves it off.
 test-hooks = []
 
 # Normal dependencies are libmdbx and thiserror only (consensus-types is also allowed):

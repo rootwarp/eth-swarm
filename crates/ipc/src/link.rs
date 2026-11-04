@@ -19,7 +19,7 @@ use tokio_stream::Stream;
 use tonic::Status;
 
 use crate::envelope::{
-    check_envelope_at, Checked, DigestTable, EnvelopeError, Envelopes, ForkDigests,
+    check_envelope_at, Checked, DigestTable, EnvelopeError, Envelopes, ForkDigest, ForkDigests,
 };
 use crate::error::ContractError;
 use crate::frame::{check_unary_seq, InFrame, Inbound, SeqChecker};
@@ -293,6 +293,15 @@ impl Link {
         )
     }
 
+    /// The fork digest an envelope at `slot` carries: that of the fork of its epoch, as
+    /// [`Self::check_envelope`] expects it. `None` if the schedule has none there.
+    #[must_use]
+    pub fn fork_digest_at_slot(&self, slot: u64) -> Option<ForkDigest> {
+        let epoch = slot / self.inner.slots_per_epoch.max(1);
+        let fork = self.inner.schedule.fork_at(epoch)?;
+        self.inner.digests.fork_digest(fork, epoch)
+    }
+
     /// Checks one envelope at its place in a stream or call: a zero type fails it, anything
     /// else that does not pass is counted and returned as the reason it is dropped.
     fn admit_envelope(&self, envelope: &Envelope) -> Result<Option<EnvelopeError>, ContractError> {
@@ -476,6 +485,21 @@ mod tests {
 
     fn block(seq: u64) -> Envelope {
         env(seq, PayloadType::SignedBeaconBlock as i32, DIGEST)
+    }
+
+    /// A sender stamps an envelope with the digest the receiver checks it against: the fork
+    /// of its slot's epoch (32 slots), each side of the Gloas boundary.
+    #[test]
+    fn fork_digest_at_slot_is_what_check_envelope_expects() {
+        let l = link(1);
+        for (slot, digest) in [(0, DIGEST), (3199, DIGEST), (3200, [9; 4])] {
+            assert_eq!(l.fork_digest_at_slot(slot), Some(digest), "slot {slot}");
+            let e = Envelope {
+                slot,
+                ..env(1, PayloadType::SignedBeaconBlock as i32, digest)
+            };
+            assert!(l.check_envelope(&e).is_ok(), "slot {slot}");
+        }
     }
 
     fn batch(blocks: Vec<Envelope>) -> ImportBatchRequest {

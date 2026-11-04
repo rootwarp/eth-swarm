@@ -5,15 +5,35 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "cl-store: the ethswarm.store.v1 service (stub: contract layer only, every RPC answers UNIMPLEMENTED)."
+description = "cl-store: the ethswarm.store.v1 service, the read side of the store env (MDBX opened read-only)."
 
 [dependencies]
 ethswarm-proto = { path = "../ethswarm-proto" }
 ipc = { path = "../ipc" }
+# MPL-2.0, unmodified; the version store-schema pins. Read transactions and their errors.
+libmdbx = "=0.5.6"
+# The env's options, tables, keys and stamp; opened only through `env::open_reader`.
+store-schema = { path = "../store-schema" }
+thiserror = "2"
+# `spawn_blocking` for every MDBX read, and the channel of a streamed walk.
+tokio = { version = "1", features = ["rt", "sync"] }
+tokio-stream = "0.1"
 tonic.workspace = true
 prost.workspace = true
 
 [dev-dependencies]
 ipc = { path = "../ipc", features = ["testkit"] }
 network-config = { path = "../network-config" }
-tokio-stream = "0.1"
+# test-hooks: tests stand in for cl-chain (`env::test_writer`, `txn::seed_unstamped`) and read
+# through the writer's own env (`WriterEnv::raw_env`): one process cannot open an env twice.
+store-schema = { path = "../store-schema", features = ["test-hooks"] }
+# Same crate libmdbx links; `cannot_write` tries writes straight through the C API.
+mdbx-sys = "=12.13.2"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Real blocks from store-schema's tests/common, built and encoded in code (no spec vectors).
+alloy-primitives.workspace = true
+consensus-types = { path = "../consensus-types" }
+ethereum_ssz.workspace = true
+ssz_types.workspace = true
+tree_hash.workspace = true

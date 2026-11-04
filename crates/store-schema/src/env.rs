@@ -160,6 +160,22 @@ impl WriterEnv {
     }
 }
 
+/// The writer's open for the tests of a reader crate, which stand in for cl-chain:
+/// [`open_writer`] at [`MIN_MAX_SIZE`]. A reader crate's sources never name the writer's open
+/// (`scripts/check-store-readonly.sh` scans cl-store's tests too), so its tests reach a writer
+/// only through this seam. Only with the `test-hooks` feature, which only dev-dependencies
+/// enable.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn test_writer(path: &Path) -> Result<WriterEnv> {
+    open_writer(
+        path,
+        WriterOptions {
+            max_size: MIN_MAX_SIZE,
+        },
+    )
+}
+
 /// [`open_writer_with`] with no upgrade of its own.
 pub fn open_writer(path: &Path, opts: WriterOptions) -> Result<WriterEnv> {
     open_writer_with(path, opts, |_, _| Ok(()))
