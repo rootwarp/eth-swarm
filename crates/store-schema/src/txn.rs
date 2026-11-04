@@ -49,13 +49,73 @@ pub fn commit(txn: RwTxn<'_>, update: Update) -> Result<Option<Stamp>> {
 mod tests {
     use super::*;
     use crate::{
-        keys::STAMP_KEY,
-        stamp::tests::{env_with_blocks, valid},
-        tables::{META, STATES},
+        blocks,
+        env::{self, WriterEnv, WriterOptions, MIN_MAX_SIZE},
+        keys::{slot_root_key, Root, STAMP_KEY},
+        stamp::tests::{env_with_blocks, valid, A, B},
+        tables::{BLOCKS, BLOCK_INDEX, COLUMNS, META, STATES, TABLES},
+        testkit::{fulu_block_ssz, schedule, E},
     };
     use libmdbx::WriteFlags;
 
-    fn stamp_row(writer: &crate::env::WriterEnv) -> Option<Vec<u8>> {
+    const C: Root = [0xcc; 32];
+    const D: Root = [0xdd; 32];
+
+    /// Every table's rows, in [`TABLES`] order, each in key order: the whole env.
+    type Snapshot = Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)>;
+
+    /// A writer env as the first open leaves it: every table, no row but the version.
+    fn fresh() -> (tempfile::TempDir, WriterEnv) {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = env::open_writer(
+            dir.path(),
+            WriterOptions {
+                max_size: MIN_MAX_SIZE,
+            },
+        )
+        .unwrap();
+        (dir, writer)
+    }
+
+    fn snapshot(writer: &WriterEnv) -> Snapshot {
+        let txn = writer.env().begin_ro_txn().unwrap();
+        TABLES
+            .iter()
+            .map(|&table| {
+                let handle = txn.open_table(Some(table)).unwrap();
+                let rows = txn
+                    .cursor(&handle)
+                    .unwrap()
+                    .iter::<Vec<u8>, Vec<u8>>()
+                    .map(Result::unwrap)
+                    .collect();
+                (table, rows)
+            })
+            .collect()
+    }
+
+    /// Puts `rows` into `table` and commits raw, past every rule of [`commit`]: a store left by
+    /// a writer of before the rule.
+    fn seed(writer: &WriterEnv, table: &str, rows: &[(&[u8], &[u8])]) {
+        let txn = writer.env().begin_rw_txn().unwrap();
+        let handle = txn.open_table(Some(table)).unwrap();
+        for (key, value) in rows {
+            txn.put(&handle, *key, *value, WriteFlags::UPSERT).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    /// Raw `blocks` rows (the stamp checks only that its blocks are stored), committed raw.
+    fn seed_blocks(writer: &WriterEnv, blocks: &[(u64, Root)]) {
+        let keys: Vec<_> = blocks
+            .iter()
+            .map(|(slot, root)| slot_root_key(*slot, root))
+            .collect();
+        let rows: Vec<(&[u8], &[u8])> = keys.iter().map(|k| (&k[..], &b"block"[..])).collect();
+        seed(writer, BLOCKS, &rows);
+    }
+
+    fn stamp_row(writer: &WriterEnv) -> Option<Vec<u8>> {
         let txn = writer.env().begin_ro_txn().unwrap();
         let meta = txn.open_table(Some(META)).unwrap();
         txn.get::<Vec<u8>>(&meta, STAMP_KEY).unwrap()
@@ -66,22 +126,176 @@ mod tests {
         txn.put(&states, key, b"state", WriteFlags::UPSERT).unwrap();
     }
 
-    fn has_state(writer: &crate::env::WriterEnv, key: &[u8]) -> bool {
+    fn has_state(writer: &WriterEnv, key: &[u8]) -> bool {
         let txn = writer.env().begin_ro_txn().unwrap();
         let states = txn.open_table(Some(STATES)).unwrap();
         txn.get::<Vec<u8>>(&states, key).unwrap().is_some()
     }
 
-    /// Open question 1's default: before the first stamp there is nothing to carry, so a
-    /// `Carry` commit writes its data and no stamp row.
+    /// A `columns` key: `slot BE ‖ root ‖ index BE`.
+    fn column_key(slot: u64, root: &Root, index: u64) -> Vec<u8> {
+        [&slot_root_key(slot, root)[..], &index.to_be_bytes()].concat()
+    }
+
+    fn put_column(txn: &RwTxn<'_>, key: &[u8]) {
+        let columns = txn.open_table(Some(COLUMNS)).unwrap();
+        txn.put(&columns, key, b"column", WriteFlags::UPSERT)
+            .unwrap();
+    }
+
+    fn column(writer: &WriterEnv, key: &[u8]) -> Option<Vec<u8>> {
+        let txn = writer.env().begin_ro_txn().unwrap();
+        let columns = txn.open_table(Some(COLUMNS)).unwrap();
+        txn.get::<Vec<u8>>(&columns, key).unwrap()
+    }
+
+    /// Commits a state and a column row with `Carry`; expects [`Error::StampMissing`] naming
+    /// `table`, and the env exactly as before: every table's rows, and still no stamp row.
+    fn carry_refused(writer: &WriterEnv, table: &str) {
+        let before = snapshot(writer);
+        let txn = writer.env().begin_rw_txn().unwrap();
+        put_state(&txn, b"one");
+        put_column(&txn, &column_key(5, &A, 0));
+        let err = commit(txn, Update::Carry).unwrap_err();
+        assert!(
+            matches!(err, Error::StampMissing { table: t } if t == table),
+            "{err:?}"
+        );
+        assert_eq!(
+            snapshot(writer),
+            before,
+            "the refused commit changed the env"
+        );
+        assert_eq!(stamp_row(writer), None);
+    }
+
+    /// Before the first stamp there is nothing to carry: with `blocks` and `block_index` empty a
+    /// `Carry` commit writes its data and no stamp row. With `blocks` rows it is refused
+    /// ([`Error::StampMissing`]), and its data is not committed: those blocks would have no
+    /// head.
     #[test]
     fn carry_before_the_first_stamp_writes_no_stamp() {
-        let (_dir, writer) = env_with_blocks();
+        let (_empty, writer) = fresh();
         let txn = writer.env().begin_rw_txn().unwrap();
         put_state(&txn, b"one");
         assert_eq!(commit(txn, Update::Carry).unwrap(), None);
         assert!(has_state(&writer, b"one"));
         assert_eq!(stamp_row(&writer), None);
+
+        let (_dir, writer) = env_with_blocks();
+        let txn = writer.env().begin_rw_txn().unwrap();
+        put_state(&txn, b"one");
+        let err = commit(txn, Update::Carry).unwrap_err();
+        assert!(
+            matches!(err, Error::StampMissing { table: "blocks" }),
+            "{err:?}"
+        );
+        assert!(!has_state(&writer, b"one"));
+        assert_eq!(stamp_row(&writer), None);
+    }
+
+    /// S1: `blocks` rows and no stamp (a store written raw): a `Carry` of a state and a column
+    /// row is refused and commits nothing.
+    #[test]
+    fn carry_with_blocks_and_no_stamp_is_refused() {
+        let (_dir, writer) = env_with_blocks();
+        assert_eq!(snapshot(&writer)[4].1.len(), 2, "A and B are seeded");
+        carry_refused(&writer, "blocks");
+    }
+
+    /// S1: a `block_index` row alone is enough, and the error names that table.
+    #[test]
+    fn carry_with_block_index_and_no_stamp_is_refused() {
+        let (_dir, writer) = fresh();
+        seed(&writer, BLOCK_INDEX, &[(&B, &9u64.to_be_bytes())]);
+        carry_refused(&writer, "block_index");
+    }
+
+    /// S1 counts the rows the txn itself writes: a `Carry` that puts the first block (both its
+    /// rows, through [`blocks::put`]) or only a `block_index` row on a fresh, unstamped store
+    /// is refused and commits nothing.
+    #[test]
+    fn carry_that_writes_the_first_block_is_refused() {
+        let (_dir, writer) = fresh();
+        let before = snapshot(&writer);
+        let (ssz, root) = fulu_block_ssz(5, [0; 32], 1);
+        let txn = writer.env().begin_rw_txn().unwrap();
+        assert_eq!(
+            blocks::put::<E>(&txn, &schedule(), &ssz).unwrap(),
+            (5, root)
+        );
+        put_state(&txn, &slot_root_key(5, &root));
+        let err = commit(txn, Update::Carry).unwrap_err();
+        assert!(
+            matches!(err, Error::StampMissing { table: "blocks" }),
+            "{err:?}"
+        );
+        assert_eq!(snapshot(&writer), before);
+
+        let txn = writer.env().begin_rw_txn().unwrap();
+        let index = txn.open_table(Some(BLOCK_INDEX)).unwrap();
+        txn.put(&index, root, 5u64.to_be_bytes(), WriteFlags::UPSERT)
+            .unwrap();
+        let err = commit(txn, Update::Carry).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::StampMissing {
+                    table: "block_index"
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(snapshot(&writer), before);
+        assert_eq!(stamp_row(&writer), None);
+    }
+
+    /// S1's other side: with `blocks` and `block_index` empty, column and custody writes before
+    /// any block commit with `Carry` and no stamp row.
+    #[test]
+    fn carry_of_columns_before_any_block_commits_without_a_stamp() {
+        let (_dir, writer) = fresh();
+        let key = column_key(5, &A, 3);
+        let txn = writer.env().begin_rw_txn().unwrap();
+        put_column(&txn, &key);
+        let meta = txn.open_table(Some(META)).unwrap();
+        txn.put(&meta, b"cgc", 8u64.to_be_bytes(), WriteFlags::UPSERT)
+            .unwrap();
+        assert_eq!(commit(txn, Update::Carry).unwrap(), None);
+        assert_eq!(column(&writer, &key), Some(b"column".to_vec()));
+        assert_eq!(stamp_row(&writer), None);
+    }
+
+    /// The import path on a fresh store: blocks and their first stamp in one `New` commit, then
+    /// a `Carry` that commits the same stamp row, byte for byte.
+    #[test]
+    fn new_with_its_blocks_then_carry_on_a_fresh_store() {
+        let (_dir, writer) = fresh();
+        let schedule = schedule();
+        let (ssz_a, a) = fulu_block_ssz(5, [0; 32], 1);
+        let (ssz_b, b) = fulu_block_ssz(9, a, 2);
+        let txn = writer.env().begin_rw_txn().unwrap();
+        blocks::put::<E>(&txn, &schedule, &ssz_a).unwrap();
+        blocks::put::<E>(&txn, &schedule, &ssz_b).unwrap();
+        let stamp = Stamp {
+            head_seq: 1,
+            head_root: b,
+            head_slot: 9,
+            finalized_root: a,
+            finalized_slot: 5,
+        };
+        assert_eq!(commit(txn, Update::New(stamp)).unwrap(), Some(stamp));
+        let row = stamp_row(&writer).unwrap();
+        assert_eq!(row, stamp.encode());
+
+        let key = column_key(9, &b, 0);
+        let txn = writer.env().begin_rw_txn().unwrap();
+        put_state(&txn, b"two");
+        put_column(&txn, &key);
+        assert_eq!(commit(txn, Update::Carry).unwrap(), Some(stamp));
+        assert!(has_state(&writer, b"two"));
+        assert_eq!(column(&writer, &key), Some(b"column".to_vec()));
+        assert_eq!(stamp_row(&writer).unwrap(), row);
     }
 
     /// `New` writes the stamp with the data; `Carry` commits the same stamp, byte for byte.
@@ -117,5 +331,188 @@ mod tests {
         let err = commit(txn, Update::Carry).unwrap_err();
         assert!(matches!(err, Error::MalformedStamp { len: 87 }), "{err:?}");
         assert!(!has_state(&writer, b"one"));
+    }
+
+    /// [`env_with_blocks`] (A at 5, B at 9) plus C at 3 and D at 12, with [`valid`] stored:
+    /// head B@9 at `head_seq` 7, finalized A@5.
+    fn stamped() -> (tempfile::TempDir, WriterEnv) {
+        let (dir, writer) = env_with_blocks();
+        seed_blocks(&writer, &[(3, C), (12, D)]);
+        let txn = writer.env().begin_rw_txn().unwrap();
+        assert_eq!(commit(txn, Update::New(valid())).unwrap(), Some(valid()));
+        (dir, writer)
+    }
+
+    /// Commits `new` over the stored stamp with a state row; expects a refusal that leaves the
+    /// stamp row byte for byte and every table as it was.
+    fn new_refused(writer: &WriterEnv, new: Stamp) -> Error {
+        let before = snapshot(writer);
+        let row = stamp_row(writer).expect("a stored stamp");
+        let txn = writer.env().begin_rw_txn().unwrap();
+        put_state(&txn, b"refused");
+        let err = commit(txn, Update::New(new)).unwrap_err();
+        assert_eq!(stamp_row(writer).unwrap(), row, "{new:?} rewrote the stamp");
+        assert_eq!(snapshot(writer), before, "{new:?} committed data");
+        err
+    }
+
+    /// Commits `new` with the state row `state`; expects it committed, the stamp row `new`.
+    fn new_accepted(writer: &WriterEnv, new: Stamp, state: &[u8]) {
+        let txn = writer.env().begin_rw_txn().unwrap();
+        put_state(&txn, state);
+        assert_eq!(commit(txn, Update::New(new)).unwrap(), Some(new), "{new:?}");
+        assert_eq!(stamp_row(writer).unwrap(), new.encode(), "{new:?}");
+        assert!(has_state(writer, state), "{new:?}");
+    }
+
+    /// S2: a `head_seq` below the stored one is refused: one below, 0, and with another valid
+    /// head (a stale head event). The stored stamp still moves forward afterwards.
+    #[test]
+    fn new_with_a_lower_head_seq_is_refused() {
+        let (_dir, writer) = stamped();
+        for new in [
+            Stamp {
+                head_seq: 6,
+                ..valid()
+            },
+            Stamp {
+                head_seq: 0,
+                ..valid()
+            },
+            Stamp {
+                head_seq: 6,
+                head_root: D,
+                head_slot: 12,
+                ..valid()
+            },
+        ] {
+            let err = new_refused(&writer, new);
+            assert!(
+                matches!(err, Error::StampSeqDecrease { stored: 7, new: n } if n == new.head_seq),
+                "{err:?}"
+            );
+        }
+        new_accepted(
+            &writer,
+            Stamp {
+                head_seq: 8,
+                ..valid()
+            },
+            b"after",
+        );
+    }
+
+    /// S2: the stored `head_seq` again with another head root is refused, at a lower and at a
+    /// higher head slot: one sequence number never names two heads.
+    #[test]
+    fn new_reusing_the_head_seq_with_another_root_is_refused() {
+        let (_dir, writer) = stamped();
+        for (head_root, head_slot) in [(A, 5), (D, 12)] {
+            let err = new_refused(
+                &writer,
+                Stamp {
+                    head_root,
+                    head_slot,
+                    ..valid()
+                },
+            );
+            assert!(matches!(err, Error::StampSeqReused { seq: 7 }), "{err:?}");
+        }
+        new_accepted(
+            &writer,
+            Stamp {
+                head_seq: 8,
+                head_root: D,
+                head_slot: 12,
+                ..valid()
+            },
+            b"after",
+        );
+    }
+
+    /// S2: a finalized slot below the stored one is refused, even with a higher `head_seq`.
+    #[test]
+    fn new_with_a_lower_finalized_slot_is_refused() {
+        let (_dir, writer) = stamped();
+        let err = new_refused(
+            &writer,
+            Stamp {
+                head_seq: 8,
+                finalized_root: C,
+                finalized_slot: 3,
+                ..valid()
+            },
+        );
+        assert!(
+            matches!(err, Error::StampFinalizedDecrease { stored: 5, new: 3 }),
+            "{err:?}"
+        );
+        new_accepted(
+            &writer,
+            Stamp {
+                head_seq: 8,
+                ..valid()
+            },
+            b"after",
+        );
+    }
+
+    /// S2's allowed moves over a stored stamp: the same stamp again (same `head_seq`, same head
+    /// root), a higher `head_seq` with the same head, a new head, a reorg back to a lower head
+    /// slot, the finalized slot equal or higher.
+    #[test]
+    fn new_moving_forward_or_repeating_is_allowed() {
+        let (_dir, writer) = stamped();
+        new_accepted(&writer, valid(), b"same stamp");
+        new_accepted(
+            &writer,
+            Stamp {
+                head_seq: 8,
+                ..valid()
+            },
+            b"higher seq, same head, same finalized",
+        );
+        new_accepted(
+            &writer,
+            Stamp {
+                head_seq: 9,
+                head_root: D,
+                head_slot: 12,
+                ..valid()
+            },
+            b"new head",
+        );
+        new_accepted(
+            &writer,
+            Stamp {
+                head_seq: 10,
+                ..valid()
+            },
+            b"reorg to a lower head slot",
+        );
+        let finalized = Stamp {
+            head_seq: 11,
+            finalized_root: B,
+            finalized_slot: 9,
+            ..valid()
+        };
+        new_accepted(&writer, finalized, b"higher finalized");
+        new_accepted(&writer, finalized, b"same seq, same root, again");
+    }
+
+    /// S2: the first `New` on an unstamped store has nothing to compare with, `head_seq` 0
+    /// included.
+    #[test]
+    fn the_first_new_is_allowed_at_any_seq() {
+        let (_dir, writer) = env_with_blocks();
+        assert_eq!(stamp_row(&writer), None);
+        new_accepted(
+            &writer,
+            Stamp {
+                head_seq: 0,
+                ..valid()
+            },
+            b"first",
+        );
     }
 }

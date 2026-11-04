@@ -52,7 +52,6 @@ mod tests {
         env::{self, WriterEnv, WriterOptions, MIN_MAX_SIZE},
         keys::decode_slot_root_key,
         testkit::{fulu_block, fulu_block_ssz, message_root, schedule, E},
-        txn::{self, Update},
     };
     use consensus_types::ForkSchedule;
     use network_config::ScheduledFork;
@@ -131,7 +130,9 @@ mod tests {
                     if *aborted {
                         drop(open);
                     } else {
-                        txn::commit(open, Update::Carry).unwrap();
+                        // Raw: blocks with no stamp, which `txn::commit` refuses
+                        // (`Error::StampMissing`). Only the two tables are under test.
+                        open.commit().unwrap();
                         want.append(&mut pending);
                     }
                     pending.clear();
@@ -191,7 +192,8 @@ mod tests {
             let err = put::<E>(&txn, &schedule, bytes).unwrap_err();
             assert!(matches!(err, Error::Block(_)), "{err:?}");
         }
-        txn::commit(txn, Update::Carry).unwrap();
+        // Raw: blocks with no stamp, which `txn::commit` refuses (`Error::StampMissing`).
+        txn.commit().unwrap();
 
         let (blocks, index) = tables(&writer);
         assert_eq!(

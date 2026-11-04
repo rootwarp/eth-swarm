@@ -914,6 +914,143 @@ fn a_v1_env_with_a_malformed_block_key_is_not_upgraded() {
     );
 }
 
+/// One table's rows, in key order.
+type Rows = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Every named table of the env at `path` with its rows, read raw.
+fn env_rows(path: &Path) -> Vec<(String, Rows)> {
+    let db = raw_reader(path);
+    table_names(&db)
+        .into_iter()
+        .map(|table| {
+            let rows = rows(&db, &table);
+            (table, rows)
+        })
+        .collect()
+}
+
+/// The writer's open commits through its own path, which writes no stamp row: a fresh store
+/// opens, twice, and holds no stamp and no block, index or column row.
+#[test]
+fn a_fresh_store_opens_with_no_stamp() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    for _ in 0..2 {
+        let writer = env::open_writer(dir.path(), opts()).unwrap();
+        let db = writer.env();
+        assert_eq!(meta_row(db, STAMP_KEY), None);
+        for table in [BLOCKS, BLOCK_INDEX, COLUMNS] {
+            assert_eq!(rows(db, table), vec![], "table {table}");
+        }
+    }
+}
+
+/// An unstamped v1 store with no block upgrades: with `blocks` and `block_index` empty the
+/// open needs no stamp. The new tables and the version row are written, no stamp row.
+#[test]
+fn an_empty_unstamped_v1_store_upgrades() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    drop(v1_env(dir.path(), &[]));
+    let mut created = Vec::new();
+    let writer = env::open_writer_with(dir.path(), opts(), |_, new: &[&'static str]| {
+        created = new.to_vec();
+        Ok::<_, Error>(())
+    })
+    .unwrap();
+    assert_eq!(created, [BLOCK_INDEX, ENVELOPES, FC_SNAPSHOT]);
+    let db = writer.env();
+    assert_eq!(
+        meta_row(db, SCHEMA_VERSION_KEY),
+        Some(SCHEMA_VERSION.to_be_bytes().to_vec())
+    );
+    assert_eq!(
+        table_names(db),
+        TABLES
+            .map(String::from)
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+    );
+    for table in [BLOCKS, BLOCK_INDEX, ENVELOPES, FC_SNAPSHOT] {
+        assert_eq!(rows(db, table), vec![], "table {table}");
+    }
+    assert_eq!(meta_row(db, STAMP_KEY), None);
+}
+
+/// An unstamped v1 store that holds blocks (written raw: no writer path commits a block
+/// without its stamp) is refused by the writer's open, [`Error::StampMissing`], and the refused
+/// open writes nothing: no table created, every row as it was, the version row still 1.
+#[test]
+fn an_unstamped_v1_store_with_blocks_is_refused() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = v1_env(dir.path(), &[]);
+        let txn = db.begin_rw_txn().unwrap();
+        let blocks_t = txn.open_table(Some(BLOCKS)).unwrap();
+        let mut parent = [0; 32];
+        for slot in [3u64, 4] {
+            let (ssz, root) = common::fulu_block_ssz(slot, parent, slot);
+            txn.put(
+                &blocks_t,
+                slot_root_key(slot, &root),
+                &ssz,
+                WriteFlags::UPSERT,
+            )
+            .unwrap();
+            parent = root;
+        }
+        txn.commit().unwrap();
+    }
+    let before = env_rows(dir.path());
+    assert!(!before.iter().any(|(t, _)| t == BLOCK_INDEX));
+
+    let err = env::open_writer(dir.path(), opts()).unwrap_err();
+    assert!(
+        matches!(err, Error::StampMissing { table } if table == BLOCKS),
+        "{err:?}"
+    );
+    assert_eq!(
+        env_rows(dir.path()),
+        before,
+        "the refused open changed the env"
+    );
+    let db = raw_reader(dir.path());
+    assert_eq!(
+        meta_row(&db, SCHEMA_VERSION_KEY),
+        Some(1u64.to_be_bytes().to_vec())
+    );
+    assert_eq!(meta_row(&db, STAMP_KEY), None);
+}
+
+/// The same refusal on a v2 store whose only block row is a `block_index` row (written raw):
+/// the open's error names that table, and nothing changes.
+#[test]
+fn an_unstamped_store_with_a_block_index_row_is_refused() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    drop(env::open_writer(dir.path(), opts()).unwrap());
+    {
+        let db = raw_open(dir.path(), SyncMode::Durable).unwrap();
+        let txn = db.begin_rw_txn().unwrap();
+        let index = txn.open_table(Some(BLOCK_INDEX)).unwrap();
+        txn.put(&index, [0xbb; 32], 9u64.to_be_bytes(), WriteFlags::UPSERT)
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    let before = env_rows(dir.path());
+    let err = env::open_writer(dir.path(), opts()).unwrap_err();
+    assert!(
+        matches!(err, Error::StampMissing { table } if table == BLOCK_INDEX),
+        "{err:?}"
+    );
+    assert_eq!(
+        env_rows(dir.path()),
+        before,
+        "the refused open changed the env"
+    );
+}
+
 /// V1: a newer schema version refuses the writer and the reader, and the refused writer
 /// neither upgrades nor downgrades anything: no table is created, the version row stays.
 #[test]
