@@ -32,6 +32,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use svc_runtime::owned::testkit::{config_root, write_read_only, Sealed};
 use testkit::collector::testing::{FixtureServer, Reply};
@@ -64,6 +65,7 @@ fn mkdir(path: &Path, mode: u32) {
 struct Owned {
     child: Child,
     stderr: Arc<Mutex<Vec<u8>>>,
+    reader: JoinHandle<()>,
 }
 
 impl Owned {
@@ -77,7 +79,7 @@ impl Owned {
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let mut pipe = child.stderr.take().unwrap();
         let sink = Arc::clone(&stderr);
-        std::thread::spawn(move || {
+        let reader = std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             while let Ok(n) = pipe.read(&mut buf) {
                 if n == 0 {
@@ -86,18 +88,32 @@ impl Owned {
                 sink.lock().unwrap().extend_from_slice(&buf[..n]);
             }
         });
-        Self { child, stderr }
+        Self {
+            child,
+            stderr,
+            reader,
+        }
     }
 
     fn log(&self) -> String {
         String::from_utf8_lossy(&self.stderr.lock().unwrap()).into_owned()
     }
 
-    /// The exit code within [`WAIT`].
+    /// The exit code within [`WAIT`], once the reader has read the child's stderr to its end:
+    /// the child can exit before the reader has its last lines, and [`Self::log`] then misses
+    /// them.
     fn wait(&mut self) -> Option<i32> {
         let by = Instant::now() + WAIT;
         while Instant::now() < by {
             if let Some(status) = self.child.try_wait().unwrap() {
+                while !self.reader.is_finished() {
+                    assert!(
+                        Instant::now() < by,
+                        "the child's stderr did not close in time:\n{}",
+                        self.log()
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
                 return status.code();
             }
             std::thread::sleep(Duration::from_millis(20));
