@@ -5458,6 +5458,63 @@ mod tests {
         assert_eq!(control.streams.available_permits(), 256);
     }
 
+    /// Cole B1, Vera N1: an answer costs `count` tokens, but cl-store reads its finalized half
+    /// by walking down from `F0`, a step per slot whatever `count` is (the fake's store half:
+    /// 250 ms a slot walked). A one-token request that starts more than the depth cap (8 here)
+    /// below `F0` is `3: ResourceUnavailable` at once, after the head read, with no store range
+    /// asked for, and gives its one lookup slot back then: an honest request waiting for that
+    /// slot is served after its own short walk, never `2` for want of a slot. A start at the cap
+    /// is served; one past it is `3` even when its end reaches into what is served.
+    #[tokio::test(start_paused = true)]
+    async fn byrange_deep_request_bounded() {
+        let (mut control, metrics, peers) = serving(2, |_| {});
+        let fake = Fake::new();
+        fake.walk_cost(Duration::from_millis(250));
+        let (_, held) = by_range(&fake, Some(0), 1, &metrics);
+        let held = held.with_max_depth(8);
+        let responder: Arc<dyn Responder<Spec>> = Arc::new(held.clone());
+        let started = Instant::now();
+        let deep = control.answer_streamed(peers[1], BLOCKS, range(1, 1), &responder);
+        let deep = write_on_task(&control, deep.unwrap());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let (chunks, took) = serve_blocks(&mut control, peers[0], range(18, 4), &responder).await;
+        assert_eq!(block_slots(&chunks), fixture::canonical(18, 22), "served");
+        assert_linked(&chunks);
+        assert_eq!(
+            took,
+            Duration::from_millis(500),
+            "its own walk of 2 slots, no wait"
+        );
+        let (ended, wire) = deep.await.unwrap();
+        let deep_chunks = received(&wire, &range(1, 1)).await;
+        assert_eq!(
+            only_error(&deep_chunks),
+            Some(ResultCode::ResourceUnavailable)
+        );
+        assert_eq!(
+            ended - started,
+            Duration::ZERO,
+            "the deep request ends at once"
+        );
+        assert_eq!(
+            fake.ranges(),
+            [(Half::Store, 18, 3), (Half::Chain, 21, 1)],
+            "the deep request never asked cl-store for a range"
+        );
+        assert_eq!(metrics.block_lookup_failures("store", "depth"), 1);
+        closed(&fake).await;
+        assert_eq!(held.free_lookups(), 1);
+
+        let (chunks, _) = serve_blocks(&mut control, peers[0], range(12, 2), &responder).await;
+        assert_eq!(block_slots(&chunks), [12, 13], "a start at the cap");
+        for request in [range(11, 1), range(11, 10)] {
+            let (chunks, _) = serve_blocks(&mut control, peers[0], request, &responder).await;
+            assert_eq!(only_error(&chunks), Some(ResultCode::ResourceUnavailable));
+        }
+        assert_eq!(fake.ranges(), [(Half::Store, 12, 2)]);
+        assert_eq!(metrics.block_lookup_failures("store", "depth"), 3);
+    }
+
     /// #146: `step` above 1 is answered with at most the first block of the range (`phase0`
     /// L1514–1515), and books one token, not `count`.
     #[tokio::test(start_paused = true)]

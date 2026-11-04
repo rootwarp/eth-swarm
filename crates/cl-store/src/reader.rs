@@ -83,7 +83,8 @@ impl Deadline {
 pub enum ReadError {
     /// The snapshot has no stamp row (nothing is stamped yet, so nothing is served), or the
     /// env cannot be read now (out of reader slots, busy, wants recovery, or down until it
-    /// reopens: [`crate::recover`]).
+    /// reopens: [`crate::recover`]), or a range starts deeper below the finalized slot than
+    /// is served ([`crate::MAX_FINALIZED_DEPTH`]).
     #[error("store unavailable")]
     Unavailable,
     /// No such block in the snapshot, or none on the stamp's chain at that slot.

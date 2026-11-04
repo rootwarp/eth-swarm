@@ -30,6 +30,7 @@ mod testkit;
 
 pub use backoff::Backoff;
 pub use follow::{Followed, Follower, CHAIN_METHODS};
+pub use ranges::MAX_FINALIZED_DEPTH;
 pub use reader::{BlockRef, Deadline, ReadError, Reader};
 pub use recover::Recovering;
 pub use server::{store_acl, Callers, StoreServer};

@@ -29,7 +29,8 @@
 //!   `max_inbound_streams` streamed answers were open ([`crate::rpc::limits::RpcLimits`]).
 //! - `rpc_block_lookup_failures_total{half, kind}`: BeaconBlocksByRange lookups that ended an
 //!   answer ([`crate::rpc::blocks`]), by half (`store`, `chain`) and kind (`status`, `refused`,
-//!   `contract`, `timeout`, and the chain breaks `order`, `link`, `decode`).
+//!   `contract`, `timeout`, the chain breaks `order`, `link`, `decode`, and `depth`: a start
+//!   too far below the store's finalized slot).
 //! - `rpc_block_window_gap_slots`: slots from the start of the block serve window to our
 //!   `earliest_available_slot`, set at each BeaconBlocksByRange answer; above 0 the node does
 //!   not serve the whole window yet (`phase0/p2p-interface.md` L1527–1541, backfill).

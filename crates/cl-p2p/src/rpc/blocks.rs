@@ -24,7 +24,9 @@
 //!    for only if it is not empty. Finality only advances and cl-store is never ahead of
 //!    cl-chain, so a later store read still holds every finalized block up to `F0`, and
 //!    cl-chain's head descends from `F0`'s block: no gap and no duplicate, whatever finality
-//!    does meanwhile.
+//!    does meanwhile. A start more than [`MAX_FINALIZED_DEPTH`] below `F0` is
+//!    `3: ResourceUnavailable` before cl-store is asked (counted as `{store, depth}`): its walk
+//!    down from `F0` costs a block per slot whatever `count` is.
 //! 4. **One chain**: blocks go out in ascending slot order inside the range, each block's
 //!    `parent_root` the root of the block before it (L1558–1572). A block that breaks that ends
 //!    the answer at the last whole chunk (L1574–1575: the view changed), counted, never an
@@ -62,6 +64,17 @@ use tokio::sync::Semaphore;
 /// the whole answer at the first-byte and total deadlines.
 pub const BLOCK_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How far below the store's finalized slot `F0` a range may start \[est\]: 2,048 slots (64
+/// epochs of 32 slots, about 6.8 hours). An answer costs `count` tokens, but cl-store reads the
+/// finalized half by walking the parents down from its finalized block, one stored block per
+/// slot between `F0` and `start_slot` whatever `count` is, so uncapped a one-token request
+/// deep in history walks all of it. A start below `F0 - MAX_FINALIZED_DEPTH` is
+/// `3: ResourceUnavailable` before cl-store is asked: bounded work per request until a
+/// finalized slot index (slot to root) lands, which reaches any depth in one lookup. cl-store
+/// refuses the same depth itself (`cl_store::MAX_FINALIZED_DEPTH`; `tests/byrange_serve.rs`
+/// pins the two together).
+pub const MAX_FINALIZED_DEPTH: u64 = 2_048;
+
 /// Which half of an answer a block comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Half {
@@ -88,7 +101,7 @@ pub struct Failed {
     /// The result code the answer ends with if nothing went out yet.
     pub code: ResultCode,
     /// The metric's `kind` label: `status` (the call failed), `refused` (an error chunk),
-    /// `contract`, `timeout`, `order`, `link` or `decode`.
+    /// `contract`, `timeout`, `order`, `link`, `decode` or `depth` (a start too far below `F0`).
     pub kind: &'static str,
     /// What happened, for the log.
     pub why: String,
@@ -148,6 +161,8 @@ pub struct ByRangeResponder {
     window: Option<WindowStart>,
     /// Whether the floor above the window's start was logged.
     warned: Arc<AtomicBool>,
+    /// The deepest start below `F0` served ([`MAX_FINALIZED_DEPTH`]).
+    max_depth: u64,
 }
 
 impl ByRangeResponder {
@@ -167,7 +182,16 @@ impl ByRangeResponder {
             metrics,
             window: None,
             warned: Arc::default(),
+            max_depth: MAX_FINALIZED_DEPTH,
         }
+    }
+
+    /// The same responder, serving starts at most `depth` slots below `F0`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_max_depth(mut self, depth: u64) -> Self {
+        self.max_depth = depth;
+        self
     }
 
     /// The same responder, comparing its floor with `window`'s start (see the module docs).
@@ -244,9 +268,20 @@ impl ByRangeResponder {
             return Err(Failed::server_error("busy", "no lookup slot in time"));
         };
         let finalized = self.source.finalized_slot().await;
-        let split = finalized
-            .map_err(|f| self.failed(Half::Store, f))?
-            .saturating_add(1);
+        let finalized = finalized.map_err(|f| self.failed(Half::Store, f))?;
+        if start < finalized.saturating_sub(self.max_depth) {
+            let why = format!(
+                "start_slot {start} more than {} slots below F0 {finalized}",
+                self.max_depth
+            );
+            let deep = Failed {
+                code: ResultCode::ResourceUnavailable,
+                kind: "depth",
+                why,
+            };
+            return Err(self.failed(Half::Store, deep));
+        }
+        let split = finalized.saturating_add(1);
         if start < split {
             self.half(out, Half::Store, start, end.min(split)).await?;
         }
@@ -456,6 +491,8 @@ pub(crate) mod testing {
         script: Mutex<HashMap<Step, Act>>,
         /// Blocks the chain half serves in place of the canonical one at a slot.
         replaced: Mutex<Vec<(u64, ServedBlock)>>,
+        /// What the store half takes per slot walked before it opens.
+        walk_cost: Mutex<Option<Duration>>,
     }
 
     /// A [`BlockSource`] over [`chain`]: the store half holds the blocks at or below its
@@ -493,6 +530,12 @@ pub(crate) mod testing {
         /// The chain half serves `block` in place of the canonical block at slot `at`.
         pub(crate) fn replace(&self, at: u64, block: ServedBlock) {
             self.0.replaced.lock().unwrap().push((at, block));
+        }
+
+        /// From now on the store half takes `per_slot` for each slot from its finalized slot
+        /// down to the range's start before it opens, as cl-store's parent walk does.
+        pub(crate) fn walk_cost(&self, per_slot: Duration) {
+            *self.0.walk_cost.lock().unwrap() = Some(per_slot);
         }
 
         /// The calls so far, and forgets them.
@@ -565,6 +608,12 @@ pub(crate) mod testing {
                 }
                 let end = start.saturating_add(count);
                 let finalized = fake.0.finalized.load(Ordering::SeqCst);
+                let cost = *fake.0.walk_cost.lock().unwrap();
+                if let Some(per_slot) = cost.filter(|_| half == Half::Store) {
+                    let walked = finalized.saturating_sub(start);
+                    let walked = u32::try_from(walked).unwrap_or(u32::MAX);
+                    tokio::time::sleep(per_slot.saturating_mul(walked)).await;
+                }
                 let replaced = fake.0.replaced.lock().unwrap().clone();
                 let blocks: Vec<ServedBlock> = chain()
                     .into_iter()

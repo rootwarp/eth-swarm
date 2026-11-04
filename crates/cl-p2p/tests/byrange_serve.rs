@@ -309,3 +309,14 @@ async fn range_sync_across_finality_and_the_gloas_fork() {
         assert!(blocks.iter().all(|b| b.slot() != 36), "the fork block");
     }
 }
+
+/// Cole B1, Vera N1: cl-p2p refuses a range that starts deeper below the store's finalized slot
+/// than it lets cl-store walk before it asks cl-store, and cl-store refuses the same depth
+/// itself: one value on both sides.
+#[test]
+fn finalized_depth_matches_the_store() {
+    assert_eq!(
+        cl_p2p::rpc::blocks::MAX_FINALIZED_DEPTH,
+        cl_store::MAX_FINALIZED_DEPTH
+    );
+}

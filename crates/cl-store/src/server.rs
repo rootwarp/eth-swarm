@@ -10,8 +10,9 @@
 //!   `INVALID_ARGUMENT` (`ERROR_CODE_INVALID`); anything else is `INTERNAL`.
 //! - `GetBlock` (a root, a slot, `head` or `finalized`) and `GetChainHead` answer from one read
 //!   transaction and its stamp. `GetBlocksByRange` serves finalized blocks only, at most
-//!   [`MAX_BLOCKS`], read in one transaction before its stream opens. Envelope `root`s are
-//!   block roots.
+//!   [`MAX_BLOCKS`], read in one transaction before its stream opens; a range that starts more
+//!   than [`crate::MAX_FINALIZED_DEPTH`] below the finalized slot is `UNAVAILABLE`
+//!   (`ERROR_CODE_RESOURCE_UNAVAILABLE`), unread. Envelope `root`s are block roots.
 //! - `GetBlocksByHead` is a [`ParentWalk`]: `count` capped at [`MAX_BLOCKS`], stamped by its
 //!   first read (before the stream opens), then one block per read as the client reads, at
 //!   most one body ahead.
