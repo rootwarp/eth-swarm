@@ -150,6 +150,39 @@ message GetChainHeadResponse {
   ReadMeta meta = 7;
 }
 
+// A block and its ancestors, newest first: the block at `root`, then its parent, and so on, one
+// block per body (BeaconBlocksByHead). The stream is stamped once, from the read transaction that
+// finds `root`; each further block is read in its own short read transaction under the call's
+// deadline, and the walk does not stop when the stamp changes. It ends with OK after `count`
+// blocks, at a parent that is not stored, or with no body at all for an unknown `root`.
+message GetBlocksByHeadRequest {
+  // 32 bytes. Block root (hash_tree_root of the BeaconBlock).
+  bytes root = 1;
+  // At most 128 blocks; a larger count is served as 128.
+  uint64 count = 2;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 3;
+}
+
+message GetBlocksByHeadResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    GetBlocksByHeadResponseBody body = 2;
+  }
+}
+
+message GetBlocksByHeadResponseBody {
+  // PAYLOAD_TYPE_SIGNED_BEACON_BLOCK, one per message; `root` is the block root. SSZ max
+  // MAX_PAYLOAD_SIZE = 10485760 bytes.
+  ethswarm.common.v1.Envelope block = 1;
+  // The same stamp on every body of the stream: that of its first read transaction.
+  ReadMeta meta = 2;
+  ethswarm.common.v1.Error error = 3;
+}
+
 // Data columns for a slot range. count * len(columns) <= MAX_REQUEST_DATA_COLUMN_SIDECARS = 16384
 // (specs/fulu/p2p-interface.md); larger requests fail with ERROR_CODE_INVALID.
 message GetDataColumnsByRangeRequest {
@@ -186,4 +219,5 @@ service StoreService {
   rpc GetBlocksByRange(GetBlocksByRangeRequest) returns (stream GetBlocksByRangeResponse);
   rpc GetDataColumnsByRange(GetDataColumnsByRangeRequest) returns (stream GetDataColumnsByRangeResponse);
   rpc GetChainHead(GetChainHeadRequest) returns (GetChainHeadResponse);
+  rpc GetBlocksByHead(GetBlocksByHeadRequest) returns (stream GetBlocksByHeadResponse);
 }

@@ -32,6 +32,8 @@
 //! application falls behind, and would need the per-connection stream cap, the exchange
 //! backstop and the reset handling `request_response` already has, plus another crate in the
 //! pinned rust-libp2p set.
+//! - [`store_status`]: the result code of an answer that a failed cl-store call ends
+//!   (`UNAVAILABLE` is `3: ResourceUnavailable`).
 //! - [`unsupported`]: the MUST-support protocols the probe leaves unregistered (written
 //!   deviations), and the count of peers' proposals of them.
 
@@ -44,6 +46,7 @@ pub mod limits;
 pub mod metrics;
 pub mod outbound;
 pub mod responder;
+pub mod store_status;
 #[cfg(test)]
 mod tests;
 pub mod unsupported;

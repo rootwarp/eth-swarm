@@ -245,6 +245,21 @@ pub fn begin(writer: &WriterEnv) -> Result<RwTxn<'_>> {
     writer.begin_rw_txn()
 }
 
+/// Puts `rows` into `table` and commits raw, with no stamp row and none of [`commit`]'s rules: a
+/// store no writer path may leave (rows and no stamp), for the tests of its readers. Only with
+/// the `test-hooks` feature, which only dev-dependencies enable.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn seed_unstamped(writer: &WriterEnv, table: &str, rows: &[(&[u8], &[u8])]) -> Result<()> {
+    let txn = begin(writer)?;
+    let handle = txn.open_table(Some(table))?;
+    for (key, value) in rows {
+        txn.put(&handle, key, value, WriteFlags::UPSERT)?;
+    }
+    txn.0.commit()?;
+    Ok(())
+}
+
 /// The stamp row a commit writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Update {

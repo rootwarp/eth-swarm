@@ -8,8 +8,20 @@
 //!   a response over its configured message limit;
 //! - `store_stream_limits`: a streaming read refuses a stream over its configured total body
 //!   count or total bytes.
+//! - `store_stamp_real_server`: the stamp rule (ARCH §10 M1) against the real server over a
+//!   stamped env: every served response and streamed body passes `check_read_meta` with the
+//!   env's stamp; an unknown block fails NOT_FOUND, with no body.
+//!
+//! The target is the real server ([`StoreServer`]) over one env, seeded once per process and
+//! then opened read-only: MDBX refuses a second open of one env in one process.
 
-use cl_store::stamp::{StoreReader, StreamLimits, MAX_SSZ_BYTES};
+#[path = "../../store-schema/tests/common/mod.rs"]
+mod common;
+
+use std::sync::{Arc, OnceLock};
+
+use cl_store::stamp::{check_read_meta, StoreReader, StreamLimits, MAX_SSZ_BYTES};
+use cl_store::{Reader, StoreServer};
 use ethswarm_proto::common::{Envelope, ErrorCode, Hello, PayloadType};
 use ethswarm_proto::store::store_service_server::{StoreService, StoreServiceServer};
 use ethswarm_proto::store::{self as pb, ReadMeta};
@@ -22,9 +34,70 @@ use tonic::service::Routes;
 use tonic::{Request, Response, Status};
 
 fn target(link: Link) -> Target {
-    let routes = cl_store::StoreStub::new(link.clone()).routes();
+    let routes = StoreServer::new(link.clone(), Arc::clone(&seeded().reader)).routes();
     Target::new("ethswarm.store.v1", Server::new(routes), link)
         .with_probe(probe::store_get_data_columns())
+}
+
+/// The env every target serves: blocks written and stamped by store-schema's writer (cl-chain's
+/// side), which then closes, and the env opened read-only.
+struct Seeded {
+    reader: Arc<Reader>,
+    /// `(slot, root, ssz)` of every block, oldest first; one chain.
+    blocks: Vec<(u64, [u8; 32], Vec<u8>)>,
+    stamp: store_schema::stamp::Stamp,
+    /// Kept for the process: the env lives under the target dir, not removed.
+    _dir: tempfile::TempDir,
+}
+
+/// The first Fulu slot of the fixture link's schedule: the blocks get Fulu's digest.
+fn fulu_start() -> u64 {
+    fixture::sepolia_schedule()
+        .fork_epoch(ForkName::Fulu)
+        .expect("Sepolia schedules Fulu")
+        * fixture::SLOTS_PER_EPOCH
+}
+
+fn seeded() -> &'static Seeded {
+    static SEEDED: OnceLock<Seeded> = OnceLock::new();
+    SEEDED.get_or_init(|| {
+        let dir = tempfile::Builder::new()
+            .prefix("contract-env-")
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("a temp dir");
+        let mut blocks = Vec::new();
+        let mut parent = [0; 32];
+        for i in 0..8 {
+            let slot = fulu_start() + i;
+            let (ssz, root) = common::fulu_block_ssz(slot, parent, i);
+            blocks.push((slot, root, ssz));
+            parent = root;
+        }
+        let stamp = store_schema::stamp::Stamp {
+            head_seq: 3,
+            head_root: blocks[7].1,
+            head_slot: blocks[7].0,
+            finalized_root: blocks[5].1,
+            finalized_slot: blocks[5].0,
+        };
+        {
+            let writer = store_schema::env::test_writer(dir.path()).expect("the writer opens");
+            let txn = store_schema::txn::begin(&writer).expect("a write txn");
+            for (_, _, ssz) in &blocks {
+                store_schema::blocks::put::<common::E>(&txn, &common::schedule(), ssz)
+                    .expect("a block");
+            }
+            store_schema::txn::commit(txn, store_schema::txn::Update::New(stamp))
+                .expect("the stamped commit");
+        }
+        let reader = Arc::new(Reader::open(dir.path()).expect("the env opens read-only"));
+        Seeded {
+            reader,
+            blocks,
+            stamp,
+            _dir: dir,
+        }
+    })
 }
 
 /// A store peer that answers every read with `meta` as the stamp and `envelope` as the object.
@@ -73,6 +146,7 @@ impl StoreService for FakeStore {
     type GetDataColumnsStream = StubStream<pb::GetDataColumnsResponse>;
     type GetBlocksByRangeStream = StubStream<pb::GetBlocksByRangeResponse>;
     type GetDataColumnsByRangeStream = StubStream<pb::GetDataColumnsByRangeResponse>;
+    type GetBlocksByHeadStream = StubStream<pb::GetBlocksByHeadResponse>;
 
     async fn get_block(
         &self,
@@ -139,6 +213,16 @@ impl StoreService for FakeStore {
     ) -> Result<Response<Self::GetDataColumnsByRangeStream>, Status> {
         Ok(self.stream(|column| pb::GetDataColumnsByRangeResponseBody {
             column,
+            meta: self.meta.clone(),
+            error: None,
+        }))
+    }
+    async fn get_blocks_by_head(
+        &self,
+        _: Request<pb::GetBlocksByHeadRequest>,
+    ) -> Result<Response<Self::GetBlocksByHeadStream>, Status> {
+        Ok(self.stream(|block| pb::GetBlocksByHeadResponseBody {
+            block,
             meta: self.meta.clone(),
             error: None,
         }))
@@ -414,4 +498,80 @@ async fn store_stream_limits(mode: Mode) {
     }
 }
 
-ipc::contract_suite!(target, extra: [store_as_of_stamp, store_response_envelopes, store_message_limit, store_stream_limits]);
+/// The stamp rule against the real server (see the module docs).
+async fn store_stamp_real_server(mode: Mode) {
+    let seeded = seeded();
+    let link = fixture::v1_link();
+    let routes = StoreServer::new(link.clone(), Arc::clone(&seeded.reader)).routes();
+    let conn = mode.connect(Server::new(routes)).await;
+    let mut r = StoreReader::new(conn.transport.clone(), link);
+    let stamp = seeded.stamp;
+    let full = |meta: &ReadMeta, finalized: bool| {
+        assert_eq!(meta.as_of_seq, stamp.head_seq, "{}", mode.name());
+        assert_eq!(meta.as_of_root, stamp.head_root, "{}", mode.name());
+        assert_eq!(meta.as_of_slot, stamp.head_slot, "{}", mode.name());
+        assert_eq!(meta.finalized, finalized, "{}", mode.name());
+    };
+    let block_id = |id| pb::GetBlockRequest {
+        id: Some(pb::BlockId { id: Some(id) }),
+    };
+    let (head_slot, head_root, head_ssz) = seeded.blocks[7].clone();
+    for (what, id, finalized) in [
+        ("root", pb::block_id::Id::Root(head_root.to_vec()), false),
+        ("slot", pb::block_id::Id::Slot(head_slot), false),
+        ("head", pb::block_id::Id::Named("head".into()), false),
+        (
+            "finalized",
+            pb::block_id::Id::Named("finalized".into()),
+            true,
+        ),
+    ] {
+        let got = r.get_block(block_id(id)).await.expect(what);
+        full(check_read_meta(&got).expect(what), finalized);
+        let block = got.block.expect(what);
+        if what != "finalized" {
+            assert_eq!((block.slot, &block.ssz), (head_slot, &head_ssz), "{what}");
+        }
+    }
+    let head = r.get_chain_head().await.expect("GetChainHead");
+    full(check_read_meta(&head).expect("GetChainHead"), false);
+    assert_eq!(
+        (head.head_slot, head.head_root.as_slice()),
+        (head_slot, &head_root[..])
+    );
+
+    let range = r
+        .get_blocks_by_range(pb::GetBlocksByRangeRequest {
+            start_slot: seeded.blocks[0].0,
+            count: 128,
+            ..Default::default()
+        })
+        .await
+        .expect("GetBlocksByRange");
+    assert_eq!(range.len(), 6, "the finalized blocks");
+    for body in &range {
+        full(check_read_meta(body).expect("range body"), true);
+    }
+    let walk = r
+        .get_blocks_by_head(pb::GetBlocksByHeadRequest {
+            root: head_root.to_vec(),
+            count: 128,
+            hello: None,
+        })
+        .await
+        .expect("GetBlocksByHead");
+    assert_eq!(walk.len(), 8, "the head and every parent");
+    for (body, (slot, ..)) in walk.iter().zip(seeded.blocks.iter().rev()) {
+        full(
+            check_read_meta(body).expect("walk body"),
+            *slot <= stamp.finalized_slot,
+        );
+    }
+
+    let unknown = r
+        .get_block(block_id(pb::block_id::Id::Root(vec![0xee; 32])))
+        .await;
+    assert_eq!(unknown.unwrap_err().code(), ErrorCode::NotFound);
+}
+
+ipc::contract_suite!(target, extra: [store_as_of_stamp, store_response_envelopes, store_message_limit, store_stream_limits, store_stamp_real_server]);
