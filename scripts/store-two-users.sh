@@ -45,6 +45,7 @@ fi
 group=$(id -g "$reader")
 cd "$root"
 
+# --color never: the path is parsed from this output, and CI sets CARGO_TERM_COLOR=always.
 rc=0
 out=$("$cargo" test --locked --manifest-path "$root/Cargo.toml" -p cl-store --lib --no-run 2>&1) || rc=$?
 printf '%s\n' "$out"
