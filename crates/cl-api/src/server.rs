@@ -10,6 +10,24 @@
 //!   takes [`JsonOnly`].
 //! - **`Eth-Consensus-Version`** ([`with_consensus_version`]): set on fork-versioned responses.
 //!   No part 1 route is fork-versioned.
+//! - **Host** ([`serve`]). DNS rebinding is the threat: a page on `evil.example` that re-resolves
+//!   to 127.0.0.1 reaches the port, but its requests still say `Host: evil.example`. So a request
+//!   whose `Host` (or absolute-form target) names a host outside [`HttpLimits::allowed_hosts`]
+//!   (any port) answers **421 Misdirected Request** (RFC 9110 §15.5.20). The request itself is
+//!   well formed, so it is not a 400. It is not an access decision either, so it is not a 403.
+//!   421 says this server does not serve that origin. A request with no `Host`, more than one, or
+//!   one that is not `host[:port]`, is malformed, and RFC 9112 §3.2 requires **400** for it. Both
+//!   use the error body above, and the check runs before routing, so a 404 is never seen first.
+//! - **Limits** ([`HttpLimits`], [`serve`]). A connection over the cap is closed at accept. The
+//!   header-read timeout closes a client that is slow to send its request headers, and a
+//!   keep-alive connection left idle that long. The request timeout answers 503 for a
+//!   non-streaming handler that is too slow.
+//! - **Streaming (SSE).** Neither timeout can end a stream that is still being sent. hyper only
+//!   runs the header-read timer while it waits for a request head: from accept, and again once a
+//!   response is fully written and the connection is idle. It never runs while a response body
+//!   is being written. The request timeout is a route layer, put only on the non-streaming
+//!   routes ([`router`]). Streaming routes (`/eth/v1/events`) are merged after it. Even on a
+//!   timed route it would only bound the wait for the response head, not the body.
 
 use std::borrow::Cow;
 use std::future::Future;
@@ -18,13 +36,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRequestParts, Request, State};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
-use http::header::{ACCEPT, CONTENT_TYPE};
+use http::header::{ACCEPT, CONTENT_TYPE, HOST};
+use http::uri::Authority;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto;
+use hyper_util::service::TowerToHyperService;
 use network_config::ForkName;
 use tokio::net::TcpListener;
+use tokio::sync::{watch, Semaphore};
 
 use crate::node_state::NodeState;
 use crate::routes::config::ConfigData;
@@ -258,16 +282,51 @@ pub struct ApiState {
     pub config: Arc<ConfigData>,
 }
 
-/// The Beacon API's connection and request limits.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Default [`HttpLimits::header_read_timeout`], in milliseconds.
+pub const DEFAULT_HEADER_READ_TIMEOUT_MS: u64 = 5_000;
+/// Default [`HttpLimits::request_timeout`], in milliseconds.
+pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+/// Default [`HttpLimits::max_connections`].
+pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
+/// Default [`HttpLimits::allowed_hosts`]: the loopback names a local client uses.
+pub const DEFAULT_ALLOWED_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
+
+/// The Beacon API's connection and request limits (the `[api]` `http_*` keys).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HttpLimits {
+    /// How long a client may take to send a request head. The same timer closes a keep-alive
+    /// connection that has been idle this long. Not zero.
     pub header_read_timeout: Duration,
+    /// How long a non-streaming handler may take to return its response (then 503). Not zero.
     pub request_timeout: Duration,
+    /// Connections served at once, in `1..=Semaphore::MAX_PERMITS` (above that, the semaphore
+    /// panics). One more is closed at accept.
     pub max_connections: usize,
+    /// The hosts a request's `Host` may name, compared without case and with any port. Each is
+    /// a bare host ([`is_bare_host`]).
     pub allowed_hosts: Vec<String>,
 }
 
-/// Every route, with the 404 and 405 fallbacks.
+impl Default for HttpLimits {
+    fn default() -> Self {
+        Self {
+            header_read_timeout: Duration::from_millis(DEFAULT_HEADER_READ_TIMEOUT_MS),
+            request_timeout: Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            allowed_hosts: DEFAULT_ALLOWED_HOSTS.map(String::from).to_vec(),
+        }
+    }
+}
+
+/// Whether `entry` is a host with no port and no userinfo: `localhost`, `10.0.0.1`, `[::1]`.
+#[must_use]
+pub fn is_bare_host(entry: &str) -> bool {
+    entry
+        .parse::<Authority>()
+        .is_ok_and(|a| !a.host().is_empty() && a.as_str() == a.host())
+}
+
+/// Every route, each non-streaming one under `request_timeout`, with the 404 and 405 fallbacks.
 pub fn router(state: ApiState, request_timeout: Duration) -> Router {
     app(
         Router::new()
@@ -279,14 +338,15 @@ pub fn router(state: ApiState, request_timeout: Duration) -> Router {
     .with_state(state)
 }
 
-/// `timed` and `streaming`, then the 404 and 405 fallbacks.
+/// `timed`, each route under `request_timeout`, then `streaming` without it, then the 404 and
+/// 405 fallbacks. `timed` must have a route (axum panics on a route layer without one).
 fn app(
     timed: Router<ApiState>,
     streaming: Router<ApiState>,
     request_timeout: Duration,
 ) -> Router<ApiState> {
-    let _ = request_timeout;
     timed
+        .route_layer(middleware::from_fn_with_state(request_timeout, time_limit))
         .merge(streaming)
         .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "Route not found") })
         // After every route: it applies to the routes added before it.
@@ -295,20 +355,112 @@ fn app(
         })
 }
 
-/// Serves `router` on `listener` until `shutdown`, then lets the open requests finish.
+/// A timed route's limit: 503 if the handler has not returned its response by then. 408 would
+/// blame the client for being slow to send the request. Here the server is the slow one, and
+/// beacon-APIs already uses 503 for a node that cannot answer now.
+async fn time_limit(State(limit): State<Duration>, request: Request, next: Next) -> Response {
+    tokio::time::timeout(limit, next.run(request))
+        .await
+        .unwrap_or_else(|_| {
+            ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "Request timed out").into_response()
+        })
+}
+
+/// The Host check (see the module docs): 400 without exactly one valid `Host`, and 421 if it,
+/// or an absolute-form target, names a host that is not allowed.
+async fn check_host(
+    State(allowed): State<Arc<[String]>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let mut hosts = request.headers().get_all(HOST).iter();
+    let (Some(host), None) = (hosts.next(), hosts.next()) else {
+        return ApiError::bad_request("Exactly one Host header is required").into_response();
+    };
+    let Some(host) = host_and_port(host) else {
+        return ApiError::bad_request("Invalid Host header").into_response();
+    };
+    let is_allowed = |a: &Authority| allowed.iter().any(|h| h.eq_ignore_ascii_case(a.host()));
+    if !is_allowed(&host) || !request.uri().authority().is_none_or(is_allowed) {
+        let message = "This server does not serve the requested host";
+        return ApiError::new(StatusCode::MISDIRECTED_REQUEST, message).into_response();
+    }
+    next.run(request).await
+}
+
+/// A `Host` value as `uri-host [":" port]` (RFC 9110 §7.2): no userinfo, and a port of digits
+/// only (`Authority` alone accepts `localhost:port`).
+fn host_and_port(value: &HeaderValue) -> Option<Authority> {
+    let authority: Authority = value.to_str().ok()?.parse().ok()?;
+    let port = authority.as_str().strip_prefix(authority.host())?;
+    let digits = port.is_empty() || port.strip_prefix(':')?.bytes().all(|b| b.is_ascii_digit());
+    digits.then_some(authority)
+}
+
+/// Serves `router` on `listener` under `limits` until `shutdown`. Then it stops accepting, lets
+/// the open requests finish, and returns once every connection is closed.
+///
+/// Connections use hyper-util's `auto::Builder` with `TokioTimer` and the header-read timeout,
+/// like svc-runtime's `/metrics` server, and are HTTP/1.1 only. HTTP/2 is compiled in through
+/// tonic, and if it were enabled here the builder would first wait for an HTTP/2 preface with no
+/// timeout. An HTTP/2 request also carries `:authority`, not the `Host` that is checked.
 pub async fn serve(
     listener: TcpListener,
     router: Router,
     limits: HttpLimits,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) {
-    let _ = limits;
-    if let Err(e) = axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
-        .await
-    {
-        tracing::warn!(error = %e, "the Beacon API stopped on an error");
+    let hosts: Arc<[String]> = limits.allowed_hosts.into();
+    let app = router.layer(middleware::from_fn_with_state(hosts, check_host));
+    let service = TowerToHyperService::new(app);
+    let mut builder = auto::Builder::new(TokioExecutor::new()).http1_only();
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits.header_read_timeout);
+    let slots = Arc::new(Semaphore::new(limits.max_connections));
+    // Each connection holds a receiver. A send starts their graceful shutdown, and `closed`
+    // resolves once the last one has dropped its receiver.
+    let (drain, _) = watch::channel(());
+    tokio::pin!(shutdown);
+    loop {
+        let (stream, peer) = tokio::select! {
+            () = &mut shutdown => break,
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Beacon API accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+        };
+        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+            let max_connections = limits.max_connections;
+            tracing::warn!(%peer, max_connections, "Beacon API at its connection cap: closed");
+            continue; // `stream` drops here.
+        };
+        let (builder, service) = (builder.clone(), service.clone());
+        let mut draining = drain.subscribe();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let connection = builder.serve_connection(TokioIo::new(stream), service);
+            tokio::pin!(connection);
+            let ended = tokio::select! {
+                ended = connection.as_mut() => ended,
+                _ = draining.changed() => {
+                    connection.as_mut().graceful_shutdown();
+                    connection.await
+                }
+            };
+            if let Err(e) = ended {
+                tracing::debug!(error = %e, "Beacon API connection ended");
+            }
+        });
     }
+    drop(listener);
+    drain.send_replace(());
+    drain.closed().await;
 }
 
 #[cfg(test)]
@@ -633,6 +785,7 @@ mod tests {
             ("http://evil.example/eth/v1/node/version", "localhost"),
         ] {
             let (status, headers, body) = once(addr, target, &format!("Host: {host}\r\n")).await;
+            assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{target} {host}");
             assert_error(status, &headers, &body, 421);
         }
         // No Host, two, or one that is not a host and port: 400.
@@ -644,6 +797,7 @@ mod tests {
             "Host: localhost:port\r\n",
         ] {
             let (status, response_headers, body) = once(addr, VERSION, headers).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{headers:?}");
             assert_error(status, &response_headers, &body, 400);
         }
     }

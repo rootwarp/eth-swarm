@@ -21,10 +21,19 @@
 //! chain_socket = "/run/ethswarm/cl-chain/cl-chain.sock"  # optional, this default
 //! chain_uid = 990                                        # the UID cl-chain runs as
 //! poll_interval_ms = 1000                                # optional, this default
+//! http_header_read_timeout_ms = 5000                     # optional, this default
+//! http_request_timeout_ms = 30000                        # optional, this default
+//! http_max_connections = 64                              # optional, this default
+//! http_allowed_hosts = ["localhost", "127.0.0.1", "[::1]"]  # optional, this default
 //! ```
 //!
 //! - **`http_listen`** must be a loopback address unless `http_allow_non_loopback = true`
 //!   ([`HttpBind`]). A refused address stops the process before anything listens.
+//! - **HTTP limits** ([`HttpLimits`]). `http_header_read_timeout_ms` bounds a request head and
+//!   an idle keep-alive connection. `http_request_timeout_ms` bounds a non-streaming handler
+//!   (503). `http_max_connections` caps open connections. A request whose `Host` is not one of
+//!   `http_allowed_hosts` (any port) answers 421. A non-loopback `http_listen` needs the names
+//!   its clients use added here.
 //! - **cl-chain** is reached on `chain_socket` only if its server runs as `chain_uid`
 //!   (`ipc::uds::PeerCheckedConnector`). The channel connects lazily, so cl-api starts, and
 //!   answers 503 from `node/health`, while cl-chain is still down. cl-chain's ACL must give
@@ -45,13 +54,13 @@ use ipc::uds::PeerCheckedConnector;
 use network_config::{ChainConfig, Genesis};
 use serde::Deserialize;
 use svc_runtime::{Config, Hooks, Services};
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 use tonic::transport::Endpoint;
 
 use crate::node_state::{poll_chain, NodeState, SlotClock};
 use crate::routes::config::{ConfigData, ConfigDataError};
-use crate::server::{router, ApiState, BindError, HttpBind, HttpLimits};
+use crate::server::{is_bare_host, router, ApiState, BindError, HttpBind, HttpLimits};
 use crate::ApiStub;
 
 /// The exit code of a config that does not load.
@@ -84,13 +93,17 @@ pub struct ApiSettings {
     pub chain_uid: u32,
     #[serde(default = "default_poll_interval_ms")]
     pub poll_interval_ms: u64,
-    #[serde(default)]
+    /// [`HttpLimits::header_read_timeout`].
+    #[serde(default = "default_http_header_read_timeout_ms")]
     pub http_header_read_timeout_ms: u64,
-    #[serde(default)]
+    /// [`HttpLimits::request_timeout`].
+    #[serde(default = "default_http_request_timeout_ms")]
     pub http_request_timeout_ms: u64,
-    #[serde(default)]
+    /// [`HttpLimits::max_connections`].
+    #[serde(default = "default_http_max_connections")]
     pub http_max_connections: usize,
-    #[serde(default)]
+    /// [`HttpLimits::allowed_hosts`].
+    #[serde(default = "default_http_allowed_hosts")]
     pub http_allowed_hosts: Vec<String>,
 }
 
@@ -104,6 +117,24 @@ fn default_chain_socket() -> PathBuf {
 
 fn default_poll_interval_ms() -> u64 {
     DEFAULT_POLL_INTERVAL_MS
+}
+
+fn default_http_header_read_timeout_ms() -> u64 {
+    crate::server::DEFAULT_HEADER_READ_TIMEOUT_MS
+}
+
+fn default_http_request_timeout_ms() -> u64 {
+    crate::server::DEFAULT_REQUEST_TIMEOUT_MS
+}
+
+fn default_http_max_connections() -> usize {
+    crate::server::DEFAULT_MAX_CONNECTIONS
+}
+
+fn default_http_allowed_hosts() -> Vec<String> {
+    crate::server::DEFAULT_ALLOWED_HOSTS
+        .map(String::from)
+        .to_vec()
 }
 
 /// Why cl-api stopped or did not start.
@@ -127,7 +158,8 @@ impl ApiSettings {
     /// # Errors
     ///
     /// The table does not parse, has no `chain_uid`, or has a zero poll interval or a relative
-    /// `chain_socket`.
+    /// `chain_socket`. Or an HTTP limit is out of range: a zero timeout, a connection cap outside
+    /// `1..=Semaphore::MAX_PERMITS`, no allowed host, or an allowed host that is not a bare host.
     pub fn load(config: &Config) -> Result<Self, ServiceError> {
         let settings: Self = config
             .section()
@@ -139,6 +171,37 @@ impl ApiSettings {
             let socket = settings.chain_socket.display();
             return Err(ServiceError::Config(format!(
                 "[api] chain_socket {socket} is not an absolute path"
+            )));
+        }
+        for (key, ms) in [
+            (
+                "http_header_read_timeout_ms",
+                settings.http_header_read_timeout_ms,
+            ),
+            ("http_request_timeout_ms", settings.http_request_timeout_ms),
+        ] {
+            if ms == 0 {
+                return Err(ServiceError::Config(format!("[api] {key} is 0")));
+            }
+        }
+        let (max, cap) = (Semaphore::MAX_PERMITS, settings.http_max_connections);
+        if !(1..=max).contains(&cap) {
+            return Err(ServiceError::Config(format!(
+                "[api] http_max_connections {cap} is outside 1..={max}"
+            )));
+        }
+        if settings.http_allowed_hosts.is_empty() {
+            return Err(ServiceError::Config(
+                "[api] http_allowed_hosts is empty, so every request would answer 421".into(),
+            ));
+        }
+        if let Some(bad) = settings
+            .http_allowed_hosts
+            .iter()
+            .find(|h| !is_bare_host(h))
+        {
+            return Err(ServiceError::Config(format!(
+                "[api] http_allowed_hosts entry {bad:?} is not a host without a port"
             )));
         }
         Ok(settings)
@@ -161,7 +224,12 @@ impl ApiSettings {
     /// The Beacon API's limits.
     #[must_use]
     pub fn limits(&self) -> HttpLimits {
-        HttpLimits::default()
+        HttpLimits {
+            header_read_timeout: Duration::from_millis(self.http_header_read_timeout_ms),
+            request_timeout: Duration::from_millis(self.http_request_timeout_ms),
+            max_connections: self.http_max_connections,
+            allowed_hosts: self.http_allowed_hosts.clone(),
+        }
     }
 }
 

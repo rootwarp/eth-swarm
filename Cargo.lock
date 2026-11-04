@@ -1032,6 +1032,7 @@ dependencies = [
  "form_urlencoded",
  "futures-util",
  "http",
+ "hyper-util",
  "ipc",
  "network-config",
  "serde",
