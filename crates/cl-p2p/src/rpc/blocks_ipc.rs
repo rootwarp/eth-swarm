@@ -33,7 +33,7 @@ use consensus_types::caps::MAX_PAYLOAD_SIZE;
 use ethswarm_proto::chain;
 use ethswarm_proto::common::{Envelope, ErrorCode, PayloadType};
 use ethswarm_proto::store;
-use futures::Stream;
+use futures::{Stream, StreamExt as _};
 use ipc::envelope::Envelopes;
 use ipc::frame::{InFrame, Inbound};
 use ipc::link::{Accepted, Guarded};
@@ -143,20 +143,51 @@ impl BlockSource for IpcBlocks {
     }
 
     fn by_root(&self, half: Half, roots: Vec<[u8; 32]>) -> Lookup<ByRoot> {
-        let _ = (half, roots);
-        Box::pin(async { Err(Failed::server_error("todo", "by root")) })
+        let (link, hello) = (self.link.clone(), Some(self.link.local()));
+        let roots = roots.iter().map(|root| root.to_vec()).collect();
+        let step = BLOCK_LOOKUP_TIMEOUT;
+        let failed = move |status: Status| call_failed(half, &status);
+        let (mut chain, mut store) = (self.chain.clone(), self.store.clone());
+        Box::pin(async move {
+            if half == Half::Store {
+                let request = store::GetBlocksByRootRequest { roots, hello };
+                let call = within(step, store.get_blocks_by_root(request)).await?;
+                return read_by_root(link, call.map_err(failed)?.into_inner(), step).await;
+            }
+            let request = chain::BlocksByRootRequest { roots, hello };
+            let call = within(step, chain.blocks_by_root(request)).await?;
+            let blocks = read_blocks(link, call.map_err(failed)?.into_inner(), half, step);
+            let blocks: Vec<_> = blocks.collect().await;
+            Ok(ByRoot {
+                blocks: blocks.into_iter().collect::<Result<_, _>>()?,
+                unfinalized: Vec::new(),
+            })
+        })
     }
 }
 
 /// cl-store's `GetBlocksByRoot` answer `stream`, read to its end, each step within `step`: a
 /// body without its block or an error names a root cl-store holds unfinalized.
-#[allow(dead_code)] // Not read yet: by-root lookups are not served.
 async fn read_by_root<S>(link: Link, stream: S, step: Duration) -> Result<ByRoot, Failed>
 where
     S: Stream<Item = Result<store::GetBlocksByRootResponse, Status>> + Unpin + Send + 'static,
 {
-    let _ = (link, stream, step);
-    Err(Failed::server_error("todo", "by root"))
+    let broken = |e: ipc::ContractError| contract(format!("store: {}", e.detail()));
+    let opened = within(step, link.open(Inbound::from_server(stream))).await?;
+    let mut guarded = opened.map_err(broken)?;
+    let mut answer = ByRoot::default();
+    while let Some(accepted) = within(step, guarded.body()).await?.map_err(broken)? {
+        let body = &accepted.body;
+        if body.block.is_some() || body.error.is_some() {
+            answer.blocks.push(served(&link, accepted)?);
+            continue;
+        }
+        check_read_meta(body.meta.as_ref())?;
+        let root = <[u8; 32]>::try_from(body.unfinalized_root.as_slice())
+            .map_err(|_| contract("a store body with neither a block nor a 32-byte root"))?;
+        answer.unfinalized.push(root);
+    }
+    Ok(answer)
 }
 
 /// `step` around one IPC step; past it the step fails `2` (`timeout`).
@@ -348,7 +379,6 @@ mod tests {
     use crate::rpc::blocks::ServedBlock;
     use consensus_types::Minimal;
     use ethswarm_proto::common::{Envelope, Error, ErrorCode, Hello, PayloadType};
-    use futures::StreamExt as _;
     use ipc::envelope::DigestTable;
     use ipc::error::{to_status, wire_error};
     use ipc::frame::OutFrame;

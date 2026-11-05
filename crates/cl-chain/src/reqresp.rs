@@ -1149,7 +1149,28 @@ impl ReqRespService for ReqRespServer {
         &self,
         request: Request<pb::BlocksByRootRequest>,
     ) -> Result<Response<Self::BlocksByRootStream>, Status> {
-        ipc::stub::server_stream(&self.link, "blocks_by_root", request.get_ref())
+        let Some(store) = self.blocks.clone() else {
+            return ipc::stub::server_stream(&self.link, "blocks_by_root", request.get_ref());
+        };
+        let request = request.into_inner();
+        let roots: Result<Vec<Root>, Refusal> = request
+            .roots
+            .iter()
+            .map(|root| {
+                Root::try_from(root.as_slice())
+                    .map_err(|_| Refusal::Invalid(format!("a block root of {} bytes", root.len())))
+            })
+            .collect();
+        let link = self.link.clone();
+        self.stream(
+            request.hello.as_ref(),
+            move |deadline| {
+                let blocks = unfinalized_blocks(store.as_ref(), &roots?, deadline)?;
+                blocks::envelopes(&link, blocks)
+            },
+            |item| pb::BlocksByRootResponseBody { item: Some(item) },
+        )
+        .await
     }
 
     type PayloadEnvelopesByRangeStream = StubStream<pb::PayloadEnvelopesByRangeResponse>;

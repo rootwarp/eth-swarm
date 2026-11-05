@@ -72,8 +72,29 @@ impl Reader {
         roots: &[Root],
         deadline: &Deadline,
     ) -> Result<Stamped<Vec<AtRoot>>, ReadError> {
-        let _ = (roots, deadline);
-        Err(ReadError::Unavailable)
+        self.read(deadline, |snap, stamp| {
+            roots
+                .iter()
+                .map(|root| {
+                    snap.step()?;
+                    let Some(stored) = snap.stored(root)? else {
+                        return Ok(AtRoot::Missing);
+                    };
+                    if stored.slot > stamp.finalized_slot {
+                        return Ok(AtRoot::Unfinalized);
+                    }
+                    if !snap.finalized(stamp, stored.slot, *root)? {
+                        return Ok(AtRoot::Missing);
+                    }
+                    Ok(AtRoot::Finalized(Block {
+                        slot: stored.slot,
+                        root: *root,
+                        ssz: stored.ssz.into_owned(),
+                        finalized: true,
+                    }))
+                })
+                .collect()
+        })
     }
 }
 

@@ -132,8 +132,32 @@ pub fn unfinalized_blocks(
     roots: &[Root],
     deadline: Instant,
 ) -> Result<Vec<StoredBlock>, Refusal> {
-    let _ = (store, roots, deadline);
-    Ok(Vec::new())
+    if roots.len() > MAX_REQUEST_BLOCKS_DENEB {
+        return Err(Refusal::Invalid(format!("{} roots, over 128", roots.len())));
+    }
+    let txn = store.read_txn().map_err(Refusal::Store)?;
+    let stamp = store_schema::stamp::read(&txn)?
+        .ok_or_else(|| Refusal::Unavailable("nothing is stamped yet".into()))?;
+    let mut blocks: Vec<StoredBlock> = Vec::new();
+    for root in roots {
+        if blocks.iter().any(|b| b.root == *root) {
+            continue;
+        }
+        if let Some(b) = store_schema::blocks::stored(&txn, root)? {
+            if b.slot > stamp.finalized_slot {
+                let ssz = b.ssz.into_owned();
+                blocks.push(StoredBlock {
+                    slot: b.slot,
+                    root: *root,
+                    ssz,
+                });
+            }
+        }
+    }
+    if Instant::now() >= deadline {
+        return Err(Refusal::Store("the block read passed its deadline".into()));
+    }
+    Ok(blocks)
 }
 
 /// `blocks` as the envelopes of a chain.v1 response, `seq` from 1, each with the digest of its

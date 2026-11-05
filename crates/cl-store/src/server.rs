@@ -60,6 +60,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{service::Routes, Code, Request, Response, Status};
 
 use crate::{
+    ranges::AtRoot,
     reader::{
         system_clock, Block, BlockRef, Clock, Deadline, ParentWalk, ReadError, Reader, Root, Stamp,
         Stamped,
@@ -531,7 +532,43 @@ impl StoreService for StoreServer {
         &self,
         request: Request<pb::GetBlocksByRootRequest>,
     ) -> Result<Response<Self::GetBlocksByRootStream>, Status> {
-        stub::server_stream(&self.link, "get_blocks_by_root", request.get_ref())
+        let req = request.into_inner();
+        self.link
+            .accept_hello_field(req.hello.as_ref())
+            .map_err(|e| e.to_status())?;
+        if req.roots.len() as u64 > MAX_BLOCKS {
+            return Err(invalid("at most 128 roots"));
+        }
+        let roots = req
+            .roots
+            .iter()
+            .map(|root| root_of(root))
+            .collect::<Result<Vec<_>, _>>()?;
+        let read = {
+            let roots = roots.clone();
+            self.blocking(move |r, d| r.blocks_by_root(&roots, d))
+                .await?
+        };
+        let mut frames = vec![Ok(pb::GetBlocksByRootResponse::hello(self.hello()?))];
+        let mut seq = 0;
+        for (root, at) in roots.into_iter().zip(read.value) {
+            let (block, unfinalized_root) = match at {
+                AtRoot::Finalized(block) => {
+                    seq += 1;
+                    (Some(self.envelope(block, seq)?), Vec::new())
+                }
+                AtRoot::Unfinalized => (None, root.to_vec()),
+                AtRoot::Missing => continue,
+            };
+            let body = pb::GetBlocksByRootResponseBody {
+                meta: Some(read_meta(&read.stamp, block.is_some())),
+                block,
+                error: None,
+                unfinalized_root,
+            };
+            frames.push(Ok(pb::GetBlocksByRootResponse::body(body)));
+        }
+        Ok(Response::new(Box::pin(tokio_stream::iter(frames))))
     }
 }
 
