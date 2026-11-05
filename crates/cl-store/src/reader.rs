@@ -25,7 +25,9 @@
 //!
 //! A read transaction that fails to begin with `MDBX_WANNA_RECOVERY` or `MDBX_PANIC` is
 //! `Unavailable`, like any env that cannot be read now, and marks the reader broken: the env
-//! handle is of no further use, and [`crate::recover`] reopens the env read-only.
+//! handle is of no further use, and [`crate::recover`] reopens the env read-only. Whoever holds
+//! the reader across an await can wait for that ([`Reader::broken`]) and let go of it: a
+//! `GetBlocksByHead` stream does.
 
 use std::{
     borrow::Borrow,
@@ -156,6 +158,8 @@ pub struct Reader {
     /// A read transaction failed to begin with `MDBX_WANNA_RECOVERY` or `MDBX_PANIC`: this
     /// env handle is of no further use ([`crate::recover`] reopens the env).
     broken: AtomicBool,
+    /// Wakes every [`Reader::broken`] waiting once `broken` is set.
+    on_broken: tokio::sync::Notify,
     /// The blocks and index rows its reads touched, for the tests that count a read's work.
     #[cfg(test)]
     pub(crate) touched: std::sync::atomic::AtomicUsize,
@@ -172,6 +176,7 @@ impl Reader {
         Ok(Self {
             env: Box::new(env::open_reader(path)?),
             broken: AtomicBool::new(false),
+            on_broken: tokio::sync::Notify::new(),
             #[cfg(test)]
             touched: Default::default(),
         })
@@ -186,6 +191,7 @@ impl Reader {
         Self {
             env: Box::new(env),
             broken: AtomicBool::new(false),
+            on_broken: tokio::sync::Notify::new(),
             #[cfg(test)]
             touched: Default::default(),
         }
@@ -201,10 +207,26 @@ impl Reader {
         self.broken.load(Ordering::Relaxed)
     }
 
+    /// Resolves once this reader is broken ([`Self::is_broken`]), at once if it is already.
+    pub(crate) async fn broken(&self) {
+        // Made before the flag is read: a `notify_waiters` from then on wakes it.
+        let notified = self.on_broken.notified();
+        if self.is_broken() {
+            return;
+        }
+        notified.await;
+    }
+
+    /// Marks the reader broken and wakes whoever waits for that.
+    fn mark_broken(&self) {
+        self.broken.store(true, Ordering::Relaxed);
+        self.on_broken.notify_waiters();
+    }
+
     /// Marks the reader as if a read transaction had failed with `MDBX_WANNA_RECOVERY`.
     #[cfg(test)]
     pub(crate) fn poison(&self) {
-        self.broken.store(true, Ordering::Relaxed);
+        self.mark_broken();
     }
 
     /// The block `at` names, with the stamp of the transaction it was read in.
@@ -237,7 +259,7 @@ impl Reader {
                 err,
                 store_schema::Error::Mdbx(libmdbx::Error::WannaRecovery | libmdbx::Error::Panic)
             ) {
-                self.broken.store(true, Ordering::Relaxed);
+                self.mark_broken();
             }
         })?;
         let snap = Snapshot {
@@ -476,6 +498,11 @@ impl ParentWalk {
         self
     }
 
+    /// The reader the walk reads through.
+    pub(crate) fn reader(&self) -> &Reader {
+        &self.reader
+    }
+
     /// The block at `root`, if stored, and where the walk goes on.
     fn step(&mut self, root: Root) -> Result<Option<Stamped<Block>>, ReadError> {
         let decided = self.finalized.is_some();
@@ -706,10 +733,12 @@ mod tests {
     }
 
     /// The two-user run only ([`TWO_USER_ENV`]; skipped otherwise): the env is laid out as
-    /// [5.43] has it, and this user, the reader's, cannot write it. The directory is 0750, the
-    /// data file 0640 and the lock file 0660, each owned by another user (the writer's) and in
-    /// this user's group (the store group). The data file does not open for writing and no
-    /// file can be created in the directory, yet the env opens read-only and serves its head.
+    /// [5.43] has it, by the writer itself under umask 0077, and this user, the reader's,
+    /// cannot write it. The directory is 0750 and setgid (2750, cl-node's provisioning keeps
+    /// the files in its group), the data file 0640 and the lock file 0660, each owned by
+    /// another user (the writer's) and in this user's group (the store group). The data file
+    /// does not open for writing and no file can be created in the directory, yet the env
+    /// opens read-only and serves its head.
     #[test]
     fn env_permissions() {
         use std::os::unix::fs::MetadataExt;
@@ -723,7 +752,7 @@ mod tests {
             ipc::peercred::effective_gid(),
         );
         assert_ne!(uid, 0, "run as the reader's user, not as root");
-        for (name, mode) in [(".", 0o750), ("mdbx.dat", 0o640), ("mdbx.lck", 0o660)] {
+        for (name, mode) in [(".", 0o2750), ("mdbx.dat", 0o640), ("mdbx.lck", 0o660)] {
             let meta = std::fs::metadata(path.join(name)).unwrap();
             assert_eq!(meta.mode() & 0o7777, mode, "{name}: mode {:o}", meta.mode());
             assert_ne!(meta.uid(), uid, "{name} is the writer's, not this user's");

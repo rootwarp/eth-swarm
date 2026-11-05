@@ -3,7 +3,8 @@
 # Run: bash scripts/tests/store-two-users.test.sh
 # Offline and without root: stub `id`, `chown` and `chgrp` on PATH, a stub sudo (SUDO) that
 # logs the user and runs the command as the current one, and a stub cargo (CARGO) whose
-# "builds" are a fake fill_env (creates mdbx.dat and mdbx.lck) and a fake cl-store test binary
+# "builds" are a fake fill_env (logs its umask, creates mdbx.dat and mdbx.lck through it, as
+# the real writer's files would be before it sets their modes) and a fake cl-store test binary
 # (prints the two-user lines, or not). Every call goes to one log the cases read.
 # Works on bash 3.2.
 set -euo pipefail
@@ -61,7 +62,7 @@ SH
 cat > "$tmp/fill_env" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-echo "fill_env as ${STUB_AS:-nobody} $*" >> "$STUB_LOG"
+echo "fill_env as ${STUB_AS:-nobody} umask $(umask) $*" >> "$STUB_LOG"
 [[ ${STUB_FILL_FAIL:-} != 1 ]] || exit 1
 touch "$1/mdbx.dat" "$1/mdbx.lck"
 SH
@@ -118,12 +119,22 @@ logged() {
   fi
 }
 
+# unlogged <description> <text the log must not contain>
+unlogged() {
+  if grep -qF -- "$2" "$log"; then
+    failed=$((failed + 1)); echo "FAIL - $1: \"$2\" in the log"; sed 's/^/       /' "$log"
+  else
+    passed=$((passed + 1)); echo "ok   - $1"
+  fi
+}
+
 check pass "the writer fills the env, the reader runs both tests" "store two-user OK" -- writer reader
-logged "fill_env runs as the writer" "fill_env as writer "
+logged "fill_env runs as the writer, under the units' umask" "fill_env as writer umask 0077 "
 logged "the env directory is the writer's, in the reader's group" "chown writer:200 "
-logged "the env files are in the reader's group" "chgrp 200 "
+unlogged "  ... and nothing else: the writer's files keep their group" "chgrp "
 logged "the tests run as the reader, on the env it filled" "tests as reader env=/"
-logged "  ... laid out as [5.43] has it: 0750, 0640, 0660" "/env modes=750 640 660 "
+logged "  ... the directory provisioned setgid 2750, the files as the writer left them" \
+  "/env modes=2750 600 600 "
 logged "  ... both of them, exactly, with their output" \
   "args=--exact reader::tests::cannot_write reader::tests::env_permissions --nocapture --test-threads=1"
 logged "cargo builds the tests --locked" "cargo test --locked"

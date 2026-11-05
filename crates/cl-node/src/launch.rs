@@ -10,7 +10,8 @@
 //!   `RUNTIME_DIRECTORY` (`<runtime-dir>/cl-<svc>`, 0750) and, only for a credential owner
 //!   ([`Service::credentials`]), `CREDENTIALS_DIRECTORY`: a 0700 directory holding copies (0400)
 //!   of its own credentials only, removed when cl-node exits. Its working directory is `/`, its
-//!   umask 0077 (the units' `UMask=`).
+//!   umask 0077 (the units' `UMask=`): what a child shares sets its modes itself, as the store
+//!   env's writer does (store-schema's env layout: 0750, 0640, 0660).
 //! - **Users.** As root, each child drops to its unit's user, group and caller groups (looked up
 //!   by name) before exec; a missing name, or one that is root, refuses the launch before
 //!   anything starts. Never as root: a failed drop fails the spawn. As any other user, the
@@ -537,7 +538,8 @@ pub fn run(launch: &Launch) -> Result<(), String> {
         None
     };
     unblock_signals();
-    // The units' UMask=: the children inherit it; cl-node sets its own modes explicitly.
+    // The units' UMask=: the children inherit it; cl-node sets its own modes explicitly, and so
+    // does the store env's writer (cl-chain, through store-schema) for that env.
     rustix::process::umask(Mode::from_raw_mode(0o077));
     eprintln!(
         "cl-node: launching the eight services (network {})",

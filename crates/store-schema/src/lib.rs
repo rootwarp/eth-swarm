@@ -43,7 +43,9 @@
 //!   created, checks the requested geometry, then in one write transaction checks the schema
 //!   version and the table names, creates every missing table (upgrading a version-1 or -2 env
 //!   in place) and writes the version row. The finalized slot index of an upgraded env is
-//!   backfilled after the open ([`finalized::backfill`]).
+//!   backfilled after the open ([`finalized::backfill`]). It owns the env's layout on disk:
+//!   the directory 0750 (a setgid bit kept), `mdbx.dat` 0640, `mdbx.lck` 0660, whatever the
+//!   umask, on every open; the files take the directory's group (the store group).
 //! - [`env::open_reader`]: `MDBX_RDONLY` with the same options; it never opens or creates the
 //!   writer guard, and refuses a version or a table name it does not know, as the writer does,
 //!   and a version-1 or -2 env the writer has not upgraded yet.
