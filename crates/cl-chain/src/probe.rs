@@ -1248,7 +1248,7 @@ mod tests {
         async fn ingest(&self, column: &GossipColumn<Spec>) -> Result<(), Drop> {
             let verified =
                 storage_contract(column, &self.refs, &self.custody, &self.contract).await?;
-            store_verified(&verified, &self.writer).unwrap();
+            store_verified(&verified, &CanonicalChain::default(), &self.writer).unwrap();
             Ok(())
         }
 

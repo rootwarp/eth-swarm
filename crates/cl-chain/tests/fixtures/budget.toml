@@ -1,0 +1,19 @@
+# The non-finality disk budget as cl-chain reads it: the `[chain.disk_budget]` table of
+# /etc/ethswarm/cl-chain.toml. Every value is the proposed one of crates/cl-chain/README.md,
+# section "Non-finality disk budget (proposed values)", pending Vera's review, and equals the
+# compiled-in default (`DiskBudget::default()`). tests/budget.rs checks both.
+[chain.disk_budget]
+aggregate_mib = 49152               # 48 GiB of unfinalized data, all kinds together
+columns_mib = 32768                 # 32 GiB
+states_mib = 8192                   # 8 GiB
+fc_snapshots_mib = 512              # 512 MiB
+envelopes_mib = 4096                # 4 GiB
+pending_mib = 1024                  # 1 GiB
+pending_items = 4096
+fc_snapshots_kept = 2
+states_kept_per_epoch = 2           # per branch head, plus the finalized state
+canonical_headroom_percent = 10     # canonical writes go on up to 110% of the aggregate
+floor_min_mib = 10240               # reserved free floor: the larger of 10 GiB
+floor_percent = 5                   #   and 5% of the volume
+floor_hysteresis_mib = 1024         # import resumes 1 GiB above the floor
+sync_check_over_mib = 16            # statvfs before a write over 16 MiB, else once per slot

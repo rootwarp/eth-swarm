@@ -20,7 +20,8 @@
 //! `meta` rows: [`keys::SCHEMA_VERSION_KEY`] (`u64 BE`, [`version`]); [`keys::STAMP_KEY`], the
 //! head/finalized [`stamp`], 88 bytes, that every write transaction commits ([`txn::commit`]);
 //! [`keys::FINALIZED_INDEX_FROM_KEY`], the lowest slot `finalized_slots` covers (`u64 BE`);
-//! cl-chain-columns' custody and watermark rows (`cgc`, `finalized_slot`, ...). The version
+//! cl-chain-columns' custody and watermark rows (`cgc`, `finalized_slot`, ...); the
+//! non-finality disk budget's counters ([`budget`]: `budget_<kind>`, 16 bytes). The version
 //! check reads only its own row, so a new row never needs a migration.
 //!
 //! A block's root is `hash_tree_root(block.message)` and its slot the block's own, both from its
@@ -51,6 +52,7 @@
 //!   and a version-1 or -2 env the writer has not upgraded yet.
 
 pub mod blocks;
+pub mod budget;
 pub mod env;
 mod error;
 pub mod finalized;

@@ -293,6 +293,7 @@ impl Host {
             verify_timeout: Duration::from_secs(5),
             cgc_set_slot: 0,
             anchor: Some(anchor()),
+            disk_budget: Default::default(),
         };
         let service = ProbeService::<Minimal, Valid>::open(
             &net,

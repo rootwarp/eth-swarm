@@ -910,6 +910,7 @@ dependencies = [
  "ipc",
  "network-config",
  "prometheus-client",
+ "rustix",
  "serde",
  "serde_json",
  "state-transition",

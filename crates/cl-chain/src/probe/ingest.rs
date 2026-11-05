@@ -67,15 +67,20 @@
 //!    before a gap. Until then a range answer never passes the ancestor's slot
 //!    ([`crate::reqresp`]).
 //! 7. **The write**, on the [`WRITER_THREAD`] thread: the columns of one block that the writer
-//!    takes off its queue together, in one [`ColumnWriter::write_columns`] call, which commits
-//!    them in transactions of at most
+//!    takes off its queue together, in one [`ColumnWriter::write_block_columns_on`] call,
+//!    which commits them in transactions of at most
 //!    [`MAX_COLUMNS_PER_TXN`](cl_chain_columns::MAX_COLUMNS_PER_TXN) (16) at the column env's
 //!    background priority, so block import goes first, while it holds off reorg pruning. A root
-//!    pruned as an orphan is refused from then on, so a later batch cannot bring it back. A
-//!    refused write is dropped as `store_failed`. A column gives its queue place back once
-//!    written, and the writer settles the pending links after each batch, so
-//!    [`ColumnIngest::settled`] is what shows the store stopped changing: a barrier on the
-//!    writer's queue, confirmed once everything before it is written and settled.
+//!    pruned as an orphan is refused from then on, so a later batch cannot bring it back. The
+//!    columns are charged to the non-finality disk budget on their block's branch by the
+//!    reference's chain as the writer finds it ([`ColumnIngest::canonical`],
+//!    [`super::column::branch_of`]): canonical for a block on it; side for a block off it, one
+//!    it does not place, and every block while it is unknown, so only the canonical chain's
+//!    columns spend the canonical headroom. A refused write is dropped as `store_failed`. A
+//!    column gives its queue place back once written, and the writer settles the pending links
+//!    after each batch, so [`ColumnIngest::settled`] is what shows the store stopped changing:
+//!    a barrier on the writer's queue, confirmed once everything before it is written and
+//!    settled.
 //!
 //! `probe_column_buffer_bytes` is what the queued columns hold now, their SSZ and their copies
 //! together, and `probe_column_buffer_alert` is 1 while that is at or above
@@ -105,11 +110,14 @@
 //! may claim to serve from.
 
 use super::canon::{CanonicalChain, Prune, PruneSink, Pruned};
-use super::column::{local_check, vouched_contract, ColumnContract, ColumnMetrics, Drop};
+use super::column::{
+    branch_of, local_check, vouched_contract, ColumnContract, ColumnMetrics, Drop,
+};
 use super::head::{follow_head, HeadFollow, HeadSource};
 use super::root_wait::{Answer, RootWaits};
 use super::{BlockApi, GossipColumn, RefBlock, RefError, RefLimits, RefView, ReferenceApi, Root};
 use crate::da::custody::Custody;
+use crate::persist::budget::Branch;
 use crate::reqresp::ServeClock;
 use crate::verify::client::{Held, KzgVerifier};
 use cl_chain_columns::{
@@ -708,7 +716,8 @@ pub struct ColumnIngest<A, E, V, S, C> {
     barrier: Arc<tokio::sync::Mutex<()>>,
     /// Held by the one prune on the writer's queue, for the same reason.
     prune_turn: Arc<tokio::sync::Mutex<()>>,
-    /// The reference's chain, as [`Self::follow_head`] keeps it: unknown until then.
+    /// The reference's chain, as [`Self::follow_head`] keeps it: unknown until then. The writer
+    /// thread charges each block's columns to the disk budget by it.
     chain: Arc<CanonicalChain>,
     writer_thread: Option<JoinHandle<()>>,
     writer: Arc<ColumnWriter>,
@@ -743,13 +752,15 @@ where
         // Every write holds a queue place, one barrier at most is queued ([`Self::settled`]) and
         // one prune at most, so the channel never holds more than `max_items` writes and those.
         let (writes, jobs) = mpsc::channel(limits.max_items.max(1) + 2);
+        let chain = Arc::<CanonicalChain>::default();
         let writer_thread = std::thread::Builder::new()
             .name(WRITER_THREAD.into())
             .spawn({
                 let writer = Arc::clone(&writer);
+                let chain = Arc::clone(&chain);
                 let dropped = contract.metrics.clone();
                 let metrics = metrics.clone();
-                move || run_writer(writer.as_ref(), jobs, &dropped, &metrics)
+                move || run_writer(writer.as_ref(), &chain, jobs, &dropped, &metrics)
             })?;
         Ok(Self {
             shared: Arc::new(Shared {
@@ -768,7 +779,7 @@ where
             writes: Some(writes),
             barrier: Arc::default(),
             prune_turn: Arc::default(),
-            chain: Arc::default(),
+            chain,
             writer_thread: Some(writer_thread),
             writer,
         })
@@ -1096,12 +1107,14 @@ where
 
 /// Where the writer thread stores columns: the column env.
 trait ColumnSink {
-    /// [`ColumnWriter::write_block_columns_partial`]: on a failure, what was committed first.
+    /// [`ColumnWriter::write_block_columns_on`], charged to the disk budget on `branch`: on a
+    /// failure, what was committed first.
     fn write_block_columns(
         &self,
         slot: Slot,
         root: &Root,
         link: BlockLink,
+        branch: Branch,
         columns: &[Column<'_>],
     ) -> Result<WriteReport, WriteFailed>;
 
@@ -1126,9 +1139,10 @@ impl ColumnSink for ColumnWriter {
         slot: Slot,
         root: &Root,
         link: BlockLink,
+        branch: Branch,
         columns: &[Column<'_>],
     ) -> Result<WriteReport, WriteFailed> {
-        ColumnWriter::write_block_columns_partial(self, slot, root, link, columns)
+        ColumnWriter::write_block_columns_on(self, slot, root, link, branch, columns)
     }
 
     fn settle_pending(&self, before_slot: Slot) -> cl_chain_columns::Result<usize> {
@@ -1238,10 +1252,11 @@ async fn barrier(writes: &mpsc::Sender<Job>, one: &Arc<tokio::sync::Mutex<()>>) 
 }
 
 /// The writer thread: takes what is queued, up to [`MAX_BATCH`] columns, a barrier or a prune,
-/// writes it, settles the pending links, and then prunes or confirms the barrier, until every
-/// sender is gone.
+/// writes it on the branches of `chain` ([`write_batch`]), settles the pending links, and then
+/// prunes or confirms the barrier, until every sender is gone.
 fn run_writer(
     writer: &impl ColumnSink,
+    chain: &CanonicalChain,
     mut jobs: mpsc::Receiver<Job>,
     dropped: &ColumnMetrics,
     metrics: &QueueMetrics,
@@ -1272,7 +1287,7 @@ fn run_writer(
                 next = jobs.try_recv().ok();
             }
         }
-        let highest = write_batch(writer, batch, dropped, metrics);
+        let highest = write_batch(writer, chain, batch, dropped, metrics);
         // Blocks still waiting for an ancestor that never came, once the store is past them.
         if let Some(highest) = highest {
             if let Err(e) = writer.settle_pending(highest.saturating_sub(PENDING_LINK_SLOTS)) {
@@ -1293,7 +1308,7 @@ fn run_writer(
 }
 
 /// Writes `batch` block by block, in slot order, each block of the batch in one
-/// [`ColumnWriter::write_columns`] call. That call commits in transactions of at most
+/// [`ColumnWriter::write_block_columns_on`] call. That call commits in transactions of at most
 /// [`MAX_COLUMNS_PER_TXN`](cl_chain_columns::MAX_COLUMNS_PER_TXN) columns while it holds off
 /// pruning, so a reorg prune lands before or after the batch's columns of a block, never
 /// between two of its transactions. Columns of a block that verify later come in a later batch;
@@ -1303,8 +1318,16 @@ fn run_writer(
 /// before the failed one committed: those columns count as stored, the rest as `store_failed`.
 /// A column that arrived twice is written once. Each column gives its queue place back once
 /// written or dropped.
+///
+/// Each block's columns are charged to the disk budget on its branch by the reference's chain
+/// `chain` as it stands when the block is written ([`branch_of`]): [`Branch::Canonical`] for a
+/// block on it, [`Branch::Side`] for a block off it, one it does not place, and every block
+/// while the chain is unknown. So only the canonical chain's columns spend the canonical
+/// headroom; a block the chain has not reached yet is written on the side branch, not held
+/// back for a head.
 fn write_batch(
     writer: &impl ColumnSink,
+    chain: &CanonicalChain,
     batch: Vec<Write>,
     dropped: &ColumnMetrics,
     metrics: &QueueMetrics,
@@ -1333,7 +1356,8 @@ fn write_batch(
             .find(|link| *link != BlockLink::Gap)
             .unwrap_or(BlockLink::Gap);
         highest = highest.max(Some(slot));
-        match writer.write_block_columns(slot, &root, link, &ssz) {
+        let branch = branch_of(chain.view().as_deref(), slot, &root);
+        match writer.write_block_columns(slot, &root, link, branch, &ssz) {
             Ok(report) => {
                 metrics.stored.inc_by(report.columns as u64);
             }
@@ -1402,7 +1426,13 @@ mod tests {
         batch.push(write(&queue, 9, [1; 32], 3));
         batch.push(write(&queue, 10, [2; 32], 0));
         let before = writer.rw_txns_committed();
-        write_batch(&writer, batch, &dropped, &metrics);
+        write_batch(
+            &writer,
+            &CanonicalChain::default(),
+            batch,
+            &dropped,
+            &metrics,
+        );
         assert_eq!(writer.rw_txns_committed(), before + 3, "16 + 4, then 1");
         assert_eq!(
             writer.reader().columns_for_root(&[1; 32]).unwrap().len(),
@@ -1426,11 +1456,12 @@ mod tests {
             slot: Slot,
             root: &Root,
             link: BlockLink,
+            branch: Branch,
             columns: &[Column<'_>],
         ) -> Result<WriteReport, WriteFailed> {
             let written = self
                 .writer
-                .write_block_columns_partial(slot, root, link, columns);
+                .write_block_columns_on(slot, root, link, branch, columns);
             self.calls.set(self.calls.get() + 1);
             self.writer.prune_orphaned(&[self.orphan]).unwrap();
             written
@@ -1475,10 +1506,11 @@ mod tests {
             slot: Slot,
             root: &Root,
             link: BlockLink,
+            branch: Branch,
             columns: &[Column<'_>],
         ) -> Result<WriteReport, WriteFailed> {
             self.writer
-                .write_block_columns_partial(slot, root, link, columns)
+                .write_block_columns_on(slot, root, link, branch, columns)
         }
 
         fn settle_pending(&self, before_slot: Slot) -> cl_chain_columns::Result<usize> {
@@ -1518,7 +1550,15 @@ mod tests {
         };
         let (jobs, received) = mpsc::channel(8);
         std::thread::scope(|scope| {
-            scope.spawn(|| run_writer(&sink, received, &dropped, &metrics));
+            scope.spawn(|| {
+                run_writer(
+                    &sink,
+                    &CanonicalChain::default(),
+                    received,
+                    &dropped,
+                    &metrics,
+                )
+            });
             jobs.blocking_send(Job::Write(write(&queue, 9, [1; 32], 0)))
                 .unwrap();
             settling.recv().unwrap();
@@ -1555,7 +1595,15 @@ mod tests {
                 .unwrap()
         };
         std::thread::scope(|scope| {
-            scope.spawn(|| run_writer(&writer, received, &dropped, &metrics));
+            scope.spawn(|| {
+                run_writer(
+                    &writer,
+                    &CanonicalChain::default(),
+                    received,
+                    &dropped,
+                    &metrics,
+                )
+            });
             for (slot, root) in [(9, [1; 32]), (10, [2; 32]), (10, [3; 32]), (11, [4; 32])] {
                 jobs.blocking_send(Job::Write(write(&queue, slot, root, 0)))
                     .unwrap();
@@ -1661,7 +1709,7 @@ mod tests {
         };
         // More columns than one transaction carries, of a block a reorg orphans meanwhile.
         let batch: Vec<_> = (0..20).map(|i| write(&queue, 9, [1; 32], i)).collect();
-        write_batch(&sink, batch, &dropped, &metrics);
+        write_batch(&sink, &CanonicalChain::default(), batch, &dropped, &metrics);
         assert_eq!(sink.calls.get(), 1, "the whole block in one call");
         let stored = writer.reader().columns_for_root(&[1; 32]).unwrap();
         assert!(stored.is_empty(), "{} columns of the orphan", stored.len());
@@ -1676,10 +1724,81 @@ mod tests {
         let queue = queue(IngestLimits::default());
         let (dropped, metrics) = metrics();
         let batch = vec![write(&queue, 9, [1; 32], 0), write(&queue, 9, [1; 32], 1)];
-        write_batch(&writer, batch, &dropped, &metrics);
+        write_batch(
+            &writer,
+            &CanonicalChain::default(),
+            batch,
+            &dropped,
+            &metrics,
+        );
         assert_eq!(dropped.dropped(Drop::StoreFailed), 2);
         assert_eq!(metrics.stored(), 0);
         assert_eq!(queue.lock().items, 0);
+    }
+
+    /// While the reference's chain is unknown, probe ingest's columns are charged on the side
+    /// branch: at the columns cap they are refused, not admitted on the canonical headroom.
+    /// So are the columns of the writer's plain write methods, which name no branch.
+    #[test]
+    fn a_probe_write_at_the_columns_cap_is_a_side_branch_write() {
+        use crate::persist::budget::{Budget, Caps, Kind};
+        use cl_chain_columns::{WriterOptions, MIN_MAX_SIZE};
+        let dir = tempfile::tempdir().unwrap();
+        let mut caps = Caps {
+            aggregate: 1000,
+            headroom_percent: 10,
+            ..Caps::unlimited()
+        };
+        caps.bytes[Kind::Columns as usize] = Some(600);
+        let opts = WriterOptions {
+            max_size: MIN_MAX_SIZE,
+        };
+        let writer =
+            ColumnWriter::open_with_budget(dir.path(), opts, Arc::new(Budget::new(caps))).unwrap();
+        writer.seed_stamp().unwrap();
+        // The canonical chain fills the columns cap.
+        let full = vec![1; 600];
+        let canonical = [Column {
+            index: 0,
+            ssz: &full,
+        }];
+        writer
+            .write_block_columns_on(1, &[1; 32], BlockLink::Gap, Branch::Canonical, &canonical)
+            .unwrap();
+        let queue = queue(IngestLimits::default());
+        let (dropped, metrics) = metrics();
+        write_batch(
+            &writer,
+            &CanonicalChain::default(),
+            vec![write(&queue, 2, [2; 32], 0)],
+            &dropped,
+            &metrics,
+        );
+        assert_eq!(writer.reader().columns_for_root(&[2; 32]).unwrap(), vec![]);
+        assert_eq!(dropped.dropped(Drop::StoreFailed), 1);
+        assert_eq!(metrics.stored(), 0);
+        assert_eq!(queue.lock().items, 0);
+        assert_eq!(writer.budget().refusals(Kind::Columns, Branch::Side), 1);
+        assert_eq!(
+            writer.budget().refusals(Kind::Columns, Branch::Canonical),
+            0
+        );
+        let column = [Column {
+            index: 0,
+            ssz: b"gossip",
+        }];
+        let err = writer.write_columns(3, &[3; 32], &column).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                cl_chain_columns::Error::OverBudget {
+                    branch: Branch::Side
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(writer.budget().refusals(Kind::Columns, Branch::Side), 2);
+        assert_eq!(writer.budget().used(Kind::Columns).bytes, 600);
     }
 
     /// A column env that commits the first transaction of a block's columns, then fails.
@@ -1691,12 +1810,13 @@ mod tests {
             slot: Slot,
             root: &Root,
             link: BlockLink,
+            branch: Branch,
             columns: &[Column<'_>],
         ) -> Result<WriteReport, WriteFailed> {
             let first = &columns[..columns.len().min(MAX_COLUMNS_PER_TXN)];
             let committed = self
                 .0
-                .write_block_columns_partial(slot, root, link, first)?;
+                .write_block_columns_on(slot, root, link, branch, first)?;
             if committed.columns == columns.len() {
                 return Ok(committed);
             }
@@ -1731,7 +1851,13 @@ mod tests {
         let queue = queue(IngestLimits::default());
         let (dropped, metrics) = metrics();
         let batch: Vec<_> = (0..20).map(|i| write(&queue, 9, [1; 32], i)).collect();
-        write_batch(&FailsAfterOneTxn(&writer), batch, &dropped, &metrics);
+        write_batch(
+            &FailsAfterOneTxn(&writer),
+            &CanonicalChain::default(),
+            batch,
+            &dropped,
+            &metrics,
+        );
         let stored = writer.reader().columns_for_root(&[1; 32]).unwrap().len();
         assert_eq!(stored, MAX_COLUMNS_PER_TXN);
         assert_eq!(metrics.stored(), 16, "the first transaction's columns");
@@ -1746,11 +1872,23 @@ mod tests {
         let queue = queue(IngestLimits::default());
         let (dropped, metrics) = metrics();
         let first: Vec<_> = (0..4).map(|i| write(&queue, 9, [1; 32], i)).collect();
-        write_batch(&writer, first, &dropped, &metrics);
+        write_batch(
+            &writer,
+            &CanonicalChain::default(),
+            first,
+            &dropped,
+            &metrics,
+        );
         // A reorg orphans the block between two batches of its columns.
         writer.prune_orphaned(&[[1; 32]]).unwrap();
         let second: Vec<_> = (4..8).map(|i| write(&queue, 9, [1; 32], i)).collect();
-        write_batch(&writer, second, &dropped, &metrics);
+        write_batch(
+            &writer,
+            &CanonicalChain::default(),
+            second,
+            &dropped,
+            &metrics,
+        );
         assert_eq!(writer.reader().slot_of(&[1; 32]).unwrap(), None);
         assert_eq!(writer.reader().column_count().unwrap(), 0);
         assert_eq!(metrics.stored(), 4);
@@ -2292,10 +2430,35 @@ mod tests {
             dir: tempfile::TempDir,
             clock: Arc<super::super::fake::Clock>,
         ) -> Self {
+            let writer = Arc::new(ColumnWriter::open_seeded(dir.path()).unwrap());
+            Self::open_on(reference, dir, writer, clock)
+        }
+
+        /// A new store as [`Self::start`], its column writes admitted by a disk budget of
+        /// `caps`.
+        fn budgeted(reference: &Arc<Silent>, caps: crate::persist::budget::Caps) -> Self {
+            use crate::persist::budget::Budget;
+            use cl_chain_columns::WriterOptions;
+            let dir = tempfile::tempdir().unwrap();
+            let budget = Arc::new(Budget::new(caps));
+            let writer =
+                ColumnWriter::open_with_budget(dir.path(), WriterOptions::default(), budget)
+                    .unwrap();
+            writer.seed_stamp().unwrap();
+            let clock = Arc::new(super::super::fake::Clock::at(0, 80));
+            Self::open_on(reference, dir, Arc::new(writer), clock)
+        }
+
+        /// The store of `writer` in `dir`.
+        fn open_on(
+            reference: &Arc<Silent>,
+            dir: tempfile::TempDir,
+            writer: Arc<ColumnWriter>,
+            clock: Arc<super::super::fake::Clock>,
+        ) -> Self {
             use crate::da::custody::{Advertise, Custody};
             use crate::reqresp::{ColumnServer, ColumnStore, ServeBudget};
             use consensus_types::primitives::U256;
-            let writer = Arc::new(ColumnWriter::open_seeded(dir.path()).unwrap());
             let custody = Custody::open(
                 Arc::clone(&writer),
                 NoEnr,
@@ -2727,6 +2890,159 @@ mod tests {
             f.writer.reader().finalized_slot().unwrap() == Some(16)
         })
         .await;
+    }
+
+    /// Custody column `index` of the block `root` at `slot`: one cell for its one blob, on the
+    /// column's own subnet.
+    fn gossip_column(slot: Slot, root: Root, index: u64) -> GossipColumn<crate::testing::Spec> {
+        GossipColumn {
+            sidecar: gloas::DataColumnSidecar {
+                index,
+                column: vec![Default::default()].try_into().unwrap(),
+                kzg_proofs: vec![[0; 48]].try_into().unwrap(),
+                slot,
+                beacon_block_root: root.into(),
+            },
+            subnet_id: consensus_types::das::compute_subnet_for_data_column_sidecar(index),
+        }
+    }
+
+    /// The SSZ bytes of one [`gossip_column`].
+    fn column_bytes() -> u64 {
+        gossip_column(0, [0; 32], CUSTODY[0])
+            .sidecar
+            .ssz_bytes_len() as u64
+    }
+
+    /// A store following the reference, whose columns cap is already full of the custody
+    /// columns of `b16`, a canonical block: past the cap a column is admitted on the canonical
+    /// headroom only, and refused on a side branch.
+    fn at_the_columns_cap(reference: &Arc<Silent>, b16: Root) -> Following {
+        use crate::persist::budget::{Caps, Kind};
+        let one = column_bytes();
+        let mut caps = Caps {
+            aggregate: 16 * one,
+            headroom_percent: 10,
+            ..Caps::unlimited()
+        };
+        caps.bytes[Kind::Columns as usize] = Some(4 * one);
+        let f = Following::budgeted(reference, caps);
+        let ssz: Vec<Vec<u8>> = CUSTODY
+            .iter()
+            .map(|&index| gossip_column(16, b16, index).sidecar.as_ssz_bytes())
+            .collect();
+        let columns: Vec<_> = CUSTODY
+            .iter()
+            .zip(&ssz)
+            .map(|(&index, ssz)| Column { index, ssz })
+            .collect();
+        f.writer
+            .write_block_columns_on(16, &b16, BlockLink::Start, Branch::Canonical, &columns)
+            .unwrap();
+        assert_eq!(f.writer.budget().used(Kind::Columns).bytes, 4 * one);
+        f
+    }
+
+    /// Hands `column` to the store as cl-p2p does, and waits until it is stored or dropped.
+    async fn ingest_one(f: &Following, column: GossipColumn<crate::testing::Spec>) {
+        assert_eq!(f.ingest.on_column(column), Verdict::Ignore);
+        until("the column to be stored or dropped", || {
+            f.ingest.pending() == 0
+        })
+        .await;
+        assert!(f.ingest.settled().await);
+    }
+
+    /// Waits until the reference's chain, as the store follows it, has `root` at `slot`.
+    async fn on_the_chain(f: &Following, slot: Slot, root: Root) {
+        let chain = f.ingest.canonical();
+        until("the head to be walked", || {
+            chain
+                .view()
+                .is_some_and(|view| view.status(slot, &root) == super::super::Canonical::Yes)
+        })
+        .await;
+    }
+
+    /// A gossip column of a block on the reference's canonical chain is charged to the disk
+    /// budget as canonical: at the columns cap it is admitted on the canonical headroom.
+    #[tokio::test]
+    async fn a_column_of_a_block_on_the_canonical_chain_is_charged_as_canonical() {
+        use crate::persist::budget::Kind;
+        let reference = Arc::new(Silent::default());
+        let b16 = reference.serve(16);
+        let b17 = reference.serve_on(17, b16);
+        let f = at_the_columns_cap(&reference, b16);
+        f.send(RefEvent::Head(b17));
+        on_the_chain(&f, 17, b17).await;
+        let column = gossip_column(17, b17, CUSTODY[0]);
+        let ssz = column.sidecar.as_ssz_bytes();
+        ingest_one(&f, column).await;
+        let budget = f.writer.budget();
+        assert_eq!(budget.refusals(Kind::Columns, Branch::Side), 0);
+        assert_eq!(budget.refusals(Kind::Columns, Branch::Canonical), 0);
+        assert_eq!(budget.used(Kind::Columns).bytes, 5 * column_bytes());
+        assert_eq!(f.ingest.contract().metrics.dropped(Drop::StoreFailed), 0);
+        let stored = f.writer.reader().get(&b17, CUSTODY[0]).unwrap();
+        assert!(stored == Some(ssz), "the canonical column is stored");
+    }
+
+    /// A gossip column of another block at a slot of the canonical chain, a fork the chain
+    /// leaves out, is charged on the side branch: at the columns cap it is refused, while the
+    /// canonical block's column at that slot is admitted.
+    #[tokio::test]
+    async fn a_fork_column_at_a_canonical_slot_is_charged_as_side() {
+        use crate::persist::budget::Kind;
+        let reference = Arc::new(Silent::default());
+        let b16 = reference.serve(16);
+        let b17 = reference.serve_on(17, b16);
+        let o17 = reference.serve_fork(17, b16);
+        let f = at_the_columns_cap(&reference, b16);
+        f.send(RefEvent::Head(b17));
+        on_the_chain(&f, 17, b17).await;
+        let view = f.ingest.canonical().view().unwrap();
+        assert_eq!(view.status(17, &o17), super::super::Canonical::No);
+        ingest_one(&f, gossip_column(17, o17, CUSTODY[0])).await;
+        assert_eq!(f.writer.reader().get(&o17, CUSTODY[0]).unwrap(), None);
+        let budget = f.writer.budget();
+        assert_eq!(budget.refusals(Kind::Columns, Branch::Side), 1);
+        assert_eq!(budget.refusals(Kind::Columns, Branch::Canonical), 0);
+        assert_eq!(f.ingest.contract().metrics.dropped(Drop::StoreFailed), 1);
+        // The canonical block's column at the same slot and index.
+        ingest_one(&f, gossip_column(17, b17, CUSTODY[0])).await;
+        assert_eq!(budget.refusals(Kind::Columns, Branch::Side), 1);
+        assert_eq!(budget.refusals(Kind::Columns, Branch::Canonical), 0);
+        assert_eq!(budget.used(Kind::Columns).bytes, 5 * column_bytes());
+        assert!(f.writer.reader().get(&b17, CUSTODY[0]).unwrap().is_some());
+    }
+
+    /// A gossip column of a block the reference's chain does not place is charged on the side
+    /// branch: before the chain is known, and above its head. At the columns cap it is refused.
+    #[tokio::test]
+    async fn a_column_of_a_block_the_chain_does_not_place_is_charged_as_side() {
+        use crate::persist::budget::Kind;
+        let reference = Arc::new(Silent::default());
+        let b16 = reference.serve(16);
+        let b17 = reference.serve_on(17, b16);
+        let u18 = reference.serve_on(18, b17);
+        let f = at_the_columns_cap(&reference, b16);
+        // No head yet: the chain is unknown.
+        assert!(f.ingest.canonical().view().is_none());
+        ingest_one(&f, gossip_column(17, b17, CUSTODY[0])).await;
+        assert_eq!(f.writer.reader().get(&b17, CUSTODY[0]).unwrap(), None);
+        let budget = f.writer.budget();
+        assert_eq!(budget.refusals(Kind::Columns, Branch::Side), 1);
+        // Above the head: unknown too.
+        f.send(RefEvent::Head(b17));
+        on_the_chain(&f, 17, b17).await;
+        let view = f.ingest.canonical().view().unwrap();
+        assert_eq!(view.status(18, &u18), super::super::Canonical::Unknown);
+        ingest_one(&f, gossip_column(18, u18, CUSTODY[0])).await;
+        assert_eq!(f.writer.reader().get(&u18, CUSTODY[0]).unwrap(), None);
+        assert_eq!(budget.refusals(Kind::Columns, Branch::Side), 2);
+        assert_eq!(budget.refusals(Kind::Columns, Branch::Canonical), 0);
+        assert_eq!(f.ingest.contract().metrics.dropped(Drop::StoreFailed), 2);
+        assert_eq!(budget.used(Kind::Columns).bytes, 4 * column_bytes());
     }
 
     #[test]

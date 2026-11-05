@@ -3,13 +3,14 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex, MutexGuard, PoisonError,
+        Arc, Mutex, MutexGuard, PoisonError,
     },
     thread,
 };
 
-use libmdbx::WriteFlags;
+use libmdbx::{ObjectLength, WriteFlags};
 use store_schema::{
+    budget::{self, Branch, Budget, Caps, Kind, Usage},
     stamp::Stamp,
     txn::{ReadTxn, RwTxn, Update},
 };
@@ -219,6 +220,8 @@ pub struct ColumnWriter {
     rw_txns: AtomicU64,
     stamped_txns: AtomicU64,
     hooks: Hooks,
+    /// Admits and charges the unfinalized column writes ([`Self::open_with_budget`]).
+    budget: Arc<Budget>,
 }
 
 impl ColumnWriter {
@@ -236,13 +239,28 @@ impl ColumnWriter {
 
     /// [`ColumnWriter::open`] with explicit options. Blocks the same way.
     pub fn open_with(path: impl AsRef<Path>, options: WriterOptions) -> Result<Self> {
+        Self::open_with_budget(path, options, Arc::new(Budget::new(Caps::unlimited())))
+    }
+
+    /// [`Self::open_with`], the unfinalized column writes admitted and charged by `budget`
+    /// ([`store_schema::budget`]), its counters loaded from the env. [`Self::open`] and
+    /// [`Self::open_with`] count with no cap ([`Caps::unlimited`]). Blocks the same way.
+    ///
+    /// The columns counter is the bytes and rows of the columns above the finalized-slot
+    /// watermark. An env written before the budget has no counter row: it is counted from those
+    /// rows here, and the row is stored by the first write transaction.
+    pub fn open_with_budget(
+        path: impl AsRef<Path>,
+        options: WriterOptions,
+        budget: Arc<Budget>,
+    ) -> Result<Self> {
         let path = path.as_ref();
         let db = env::open_rw(path, options)?;
         let pending = {
             let txn = db.begin_ro_txn()?;
             pending_links(&txn)?
         };
-        Ok(Self {
+        Self {
             reader: ColumnReader::from_writer(db),
             column_ops: Mutex::new(Orphans {
                 pending,
@@ -252,7 +270,29 @@ impl ColumnWriter {
             rw_txns: AtomicU64::new(0),
             stamped_txns: AtomicU64::new(0),
             hooks: Hooks::default(),
-        })
+            budget,
+        }
+        .reload_budget()
+    }
+
+    /// The budget the writer's column writes are admitted by.
+    #[must_use]
+    pub fn budget(&self) -> &Arc<Budget> {
+        &self.budget
+    }
+
+    /// Mirrors the env's counters into the budget: at open, and after a write transaction that
+    /// did not commit.
+    fn reload_budget(self) -> Result<Self> {
+        self.load_budget()?;
+        Ok(self)
+    }
+
+    fn load_budget(&self) -> Result<()> {
+        let txn = self.reader.db.begin_ro_txn()?;
+        self.budget.load(&txn)?;
+        self.budget.set(Kind::Columns, column_usage(&txn)?.0);
+        Ok(())
     }
 
     /// Read access through the writer's own env.
@@ -369,7 +409,8 @@ impl ColumnWriter {
     /// ([`ColumnReader::first_stored_slot`]) also lowers it to `slot`.
     ///
     /// The block is stored with [`BlockLink::Gap`]: nothing is known of its chain
-    /// ([`Self::write_block_columns`]).
+    /// ([`Self::write_block_columns`]). Its columns are charged on [`Branch::Side`]
+    /// ([`Self::write_block_columns_partial`]).
     pub fn write_columns(
         &self,
         slot: u64,
@@ -405,11 +446,32 @@ impl ColumnWriter {
     /// [`Self::write_block_columns`], and on a failure what was committed before it: the
     /// transactions before the one that failed stay committed, so their columns are stored.
     /// A batch refused before its first transaction committed nothing.
+    ///
+    /// The columns are charged on [`Branch::Side`]: nothing here says the block is canonical,
+    /// so they never spend the canonical headroom ([`Self::write_block_columns_on`]).
     pub fn write_block_columns_partial(
         &self,
         slot: u64,
         block_root: &BlockRoot,
         link: BlockLink,
+        columns: &[Column<'_>],
+    ) -> std::result::Result<WriteReport, WriteFailed> {
+        self.write_block_columns_on(slot, block_root, link, Branch::Side, columns)
+    }
+
+    /// [`Self::write_block_columns_partial`] on `branch`: each transaction's columns, net of
+    /// the rows they replace, are admitted by the budget ([`Self::budget`]) and charged in it.
+    /// [`Branch::Finalized`] is charged and never refused. A transaction the budget ignores is
+    /// [`Error::OverBudget`] and writes nothing. Only a caller that has established the block
+    /// is on the canonical chain passes [`Branch::Canonical`]; columns of a block not known to
+    /// be canonical, such as probe ingest's and peer-fed ones, go on [`Branch::Side`], which
+    /// the other write methods use.
+    pub fn write_block_columns_on(
+        &self,
+        slot: u64,
+        block_root: &BlockRoot,
+        link: BlockLink,
+        branch: Branch,
         columns: &[Column<'_>],
     ) -> std::result::Result<WriteReport, WriteFailed> {
         let refused = |error| WriteFailed {
@@ -444,6 +506,7 @@ impl ColumnWriter {
         }
         commit_chunks(columns, |i, chunk| {
             let written = self.write_txn(Priority::Background, |txn| {
+                charge_chunk(txn, &self.budget, branch, slot, block_root, chunk)?;
                 write_chunk(txn, slot, block_root, chunk)?;
                 if i == 0 {
                     write_link(txn, slot, block_root, link, &mut orphans.pending)?;
@@ -479,7 +542,7 @@ impl ColumnWriter {
             }
             orphans.insert(*block_root, None);
             let removed = self.write_txn(Priority::Background, |txn| {
-                Ok(match prune_block(txn, block_root)? {
+                Ok(match prune_block(txn, &self.budget, block_root)? {
                     Some(removed) => Commit::Yes(Some(removed)),
                     None => Commit::No(None),
                 })
@@ -506,8 +569,8 @@ impl ColumnWriter {
         loop {
             let (batch, more) = self.write_txn(Priority::Background, |txn| {
                 let kept = raise_retained(txn, finalized_slot.saturating_add(1))?;
-                let advanced = raise_watermark(txn, finalized_slot)? || kept;
-                let (batch, more) = prune_finalized_batch(txn, finalized_slot)?;
+                let advanced = raise_watermark(txn, &self.budget, finalized_slot)? || kept;
+                let (batch, more) = prune_finalized_batch(txn, &self.budget, finalized_slot)?;
                 Ok(if advanced || batch.blocks > 0 {
                     Commit::Yes((batch, more))
                 } else {
@@ -593,7 +656,7 @@ impl ColumnWriter {
                 thread::yield_now();
             }
             let removed = self.write_txn(Priority::Background, |txn| {
-                Ok(match prune_block(txn, &block.block_root)? {
+                Ok(match prune_block(txn, &self.budget, &block.block_root)? {
                     Some(removed) => Commit::Yes(Some(removed)),
                     None => Commit::No(None),
                 })
@@ -609,7 +672,7 @@ impl ColumnWriter {
             if unplaced {
                 raise_contiguous(txn, placed_from)?;
             }
-            raise_watermark(txn, finalized_slot)?;
+            raise_watermark(txn, &self.budget, finalized_slot)?;
             Ok(Commit::Yes(()))
         })?;
         orphans.forget_finalized(finalized_slot);
@@ -630,7 +693,7 @@ impl ColumnWriter {
         loop {
             let (batch, more) = self.write_txn(Priority::Background, |txn| {
                 let advanced = raise_retained(txn, slot)?;
-                let (batch, more) = prune_finalized_batch(txn, last)?;
+                let (batch, more) = prune_finalized_batch(txn, &self.budget, last)?;
                 Ok(if advanced || batch.blocks > 0 {
                     Commit::Yes((batch, more))
                 } else {
@@ -744,25 +807,37 @@ impl ColumnWriter {
 
     /// Runs `body` in one write txn under a scheduler permit and commits if it asks to, with
     /// the env's stamp carried ([`store_schema::txn::commit`]): a stamp that no longer checks
-    /// out fails the commit, and nothing of the txn is written.
+    /// out fails the commit, and nothing of the txn is written. The txn first stores the
+    /// columns counter of an env written before the budget; one that fails reloads the
+    /// budget's mirror of the counters.
     fn write_txn<T>(
         &self,
         priority: Priority,
         body: impl FnOnce(&RwTxn<'_>) -> Result<Commit<T>>,
     ) -> Result<T> {
         let _permit = self.sched.acquire(priority);
-        let txn = self.reader.db.begin_rw_txn()?;
-        match body(&txn)? {
-            Commit::Yes(value) => {
-                let stamp = store_schema::txn::commit(txn, Update::Carry)?;
-                self.rw_txns.fetch_add(1, Ordering::Relaxed);
-                if stamp.is_some() {
-                    self.stamped_txns.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(value)
+        let written = (|| {
+            let txn = self.reader.db.begin_rw_txn()?;
+            if let (usage, false) = column_usage(&txn)? {
+                self.budget
+                    .charge(&txn, Kind::Columns, usage.bytes, usage.items)?;
             }
-            Commit::No(value) => Ok(value),
+            match body(&txn)? {
+                Commit::Yes(value) => {
+                    let stamp = store_schema::txn::commit(txn, Update::Carry)?;
+                    self.rw_txns.fetch_add(1, Ordering::Relaxed);
+                    if stamp.is_some() {
+                        self.stamped_txns.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(value)
+                }
+                Commit::No(value) => Ok(value),
+            }
+        })();
+        if written.is_err() {
+            let _ = self.load_budget();
         }
+        written
     }
 }
 
@@ -922,11 +997,15 @@ fn raise_retained(txn: &RwTxn<'_>, slot: u64) -> Result<bool> {
     Ok(true)
 }
 
-/// Raises the finalized-slot watermark to `finalized_slot`; returns whether it moved.
-fn raise_watermark(txn: &RwTxn<'_>, finalized_slot: u64) -> Result<bool> {
-    if meta_u64(txn, FINALIZED_SLOT_KEY)?.is_some_and(|current| current >= finalized_slot) {
+/// Raises the finalized-slot watermark to `finalized_slot`, releasing the columns it passes
+/// from the budget (they are finalized now); returns whether it moved.
+fn raise_watermark(txn: &RwTxn<'_>, budget: &Budget, finalized_slot: u64) -> Result<bool> {
+    let current = meta_u64(txn, FINALIZED_SLOT_KEY)?;
+    if current.is_some_and(|current| current >= finalized_slot) {
         return Ok(false);
     }
+    let passed = rows_in(txn, current.map_or(0, |c| c + 1), finalized_slot)?;
+    budget.release(txn, Kind::Columns, passed.bytes, passed.items)?;
     let meta = txn.open_table(Some(META_TABLE))?;
     txn.put(
         &meta,
@@ -1135,15 +1214,21 @@ fn del_link(txn: &RwTxn<'_>, block_root: &BlockRoot) -> Result<()> {
     }
 }
 
-/// Removes one block's columns and its root entry; returns its slot and the number of columns
-/// removed, `None` if the block is not stored.
-fn prune_block(txn: &RwTxn<'_>, block_root: &BlockRoot) -> Result<Option<(u64, u64)>> {
+/// Removes one block's columns and its root entry, released from the budget if above the
+/// watermark; returns its slot and the number of columns removed, `None` if the block is not
+/// stored.
+fn prune_block(
+    txn: &RwTxn<'_>,
+    budget: &Budget,
+    block_root: &BlockRoot,
+) -> Result<Option<(u64, u64)>> {
     let Some(slot) = stored_slot(txn, block_root)? else {
         return Ok(None);
     };
     let columns = txn.open_table(Some(COLUMNS_TABLE))?;
-    let rows = scan_block::<_, ()>(txn, &columns, &block_prefix(slot, block_root))?;
-    for (key, ()) in &rows {
+    let rows = scan_block::<_, ObjectLength>(txn, &columns, &block_prefix(slot, block_root))?;
+    release_rows(txn, budget, slot, &rows)?;
+    for (key, _) in &rows {
         txn.del(&columns, key, None)?;
     }
     let roots = txn.open_table(Some(ROOTS_TABLE))?;
@@ -1153,8 +1238,13 @@ fn prune_block(txn: &RwTxn<'_>, block_root: &BlockRoot) -> Result<Option<(u64, u
 }
 
 /// One finality-prune transaction. Rows are deleted from the start of the key space, so the
-/// table's first row is always the next candidate. Returns whether finalized rows remain.
-fn prune_finalized_batch(txn: &RwTxn<'_>, finalized_slot: u64) -> Result<(PruneReport, bool)> {
+/// table's first row is always the next candidate; those above the watermark are released from
+/// the budget. Returns whether finalized rows remain.
+fn prune_finalized_batch(
+    txn: &RwTxn<'_>,
+    budget: &Budget,
+    finalized_slot: u64,
+) -> Result<(PruneReport, bool)> {
     let columns = txn.open_table(Some(COLUMNS_TABLE))?;
     let roots = txn.open_table(Some(ROOTS_TABLE))?;
     let mut report = PruneReport::default();
@@ -1168,12 +1258,13 @@ fn prune_finalized_batch(txn: &RwTxn<'_>, finalized_slot: u64) -> Result<(PruneR
         if slot > finalized_slot {
             return Ok((report, false));
         }
-        let rows = scan_block::<_, ()>(txn, &columns, &block_prefix(slot, &block_root))?;
+        let rows = scan_block::<_, ObjectLength>(txn, &columns, &block_prefix(slot, &block_root))?;
         let rows_len = rows.len() as u64;
         if report.columns > 0 && report.columns + rows_len > MAX_ROWS_PER_PRUNE_TXN {
             return Ok((report, true));
         }
-        for (key, ()) in &rows {
+        release_rows(txn, budget, slot, &rows)?;
+        for (key, _) in &rows {
             txn.del(&columns, key, None)?;
         }
         txn.del(&roots, block_root, None)?;
@@ -1181,6 +1272,83 @@ fn prune_finalized_batch(txn: &RwTxn<'_>, finalized_slot: u64) -> Result<(PruneR
         report.columns += rows_len;
         report.blocks += 1;
     }
+}
+
+/// The columns counter `txn` holds, and `true`; for an env written before the budget, which
+/// holds none, the bytes and rows above the finalized-slot watermark, and `false`.
+fn column_usage(txn: &impl ReadTxn) -> Result<(Usage, bool)> {
+    if let Some(usage) = budget::stored(txn, Kind::Columns)? {
+        return Ok((usage, true));
+    }
+    let from = meta_u64(txn, FINALIZED_SLOT_KEY)?.map_or(0, |w| w.saturating_add(1));
+    Ok((rows_in(txn, from, u64::MAX)?, false))
+}
+
+/// The bytes and rows of the columns stored from slot `from` through `to`.
+fn rows_in(txn: &impl ReadTxn, from: u64, to: u64) -> Result<Usage> {
+    let columns = txn.open_table(Some(COLUMNS_TABLE))?;
+    let mut cursor = txn.cursor(&columns)?;
+    let mut usage = Usage::default();
+    let mut row = cursor.set_range::<Vec<u8>, ObjectLength>(&from.to_be_bytes())?;
+    while let Some((key, len)) = row {
+        let (slot, ..) = decode_column_key(&key).ok_or(Error::Corrupt {
+            table: COLUMNS_TABLE,
+        })?;
+        if slot > to {
+            break;
+        }
+        usage.bytes = usage.bytes.saturating_add(*len as u64);
+        usage.items += 1;
+        row = cursor.next::<Vec<u8>, ObjectLength>()?;
+    }
+    Ok(usage)
+}
+
+/// Releases a block's `rows` at `slot` from the budget, if the slot is above the watermark:
+/// below it they were released when it passed them.
+fn release_rows(
+    txn: &RwTxn<'_>,
+    budget: &Budget,
+    slot: u64,
+    rows: &[(Vec<u8>, ObjectLength)],
+) -> Result<()> {
+    if meta_u64(txn, FINALIZED_SLOT_KEY)?.is_none_or(|watermark| slot > watermark) {
+        let bytes = rows.iter().map(|(_, len)| **len as u64).sum();
+        budget.release(txn, Kind::Columns, bytes, rows.len() as u64)?;
+    }
+    Ok(())
+}
+
+/// Charges `chunk`, net of the stored rows it replaces, to the budget on `branch`
+/// ([`ColumnWriter::write_block_columns_on`]): [`Error::OverBudget`] if the budget ignores it.
+fn charge_chunk(
+    txn: &RwTxn<'_>,
+    budget: &Budget,
+    branch: Branch,
+    slot: u64,
+    block_root: &BlockRoot,
+    chunk: &[Column<'_>],
+) -> Result<()> {
+    let columns = txn.open_table(Some(COLUMNS_TABLE))?;
+    let (mut new, mut old, mut items) = (0u64, 0u64, 0u64);
+    for column in chunk {
+        new += column.ssz.len() as u64;
+        let key = column_key(slot, block_root, column.index);
+        match txn.get::<ObjectLength>(&columns, &key)? {
+            Some(len) => old += *len as u64,
+            None => items += 1,
+        }
+    }
+    if new > old && branch != Branch::Finalized {
+        let decision = budget.admit(txn, Kind::Columns, branch, new - old, items)?;
+        if !decision.admitted() {
+            return Err(Error::OverBudget { branch });
+        }
+    } else {
+        budget.release(txn, Kind::Columns, old.saturating_sub(new), 0)?;
+        budget.charge(txn, Kind::Columns, new.saturating_sub(old), items)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2141,7 +2309,7 @@ mod tests {
         let reader = writer.reader();
         {
             let txn = writer.reader.db.begin_rw_txn().unwrap();
-            raise_watermark(&txn, 10).unwrap();
+            raise_watermark(&txn, &writer.budget, 10).unwrap();
             store_schema::txn::commit(txn, Update::Carry).unwrap();
         }
         assert_eq!(reader.retained_from().unwrap(), Some(11));
