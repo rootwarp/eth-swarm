@@ -15,17 +15,22 @@
 //!    Status peers pick us by) is `3: ResourceUnavailable` before any IPC call (L1538–1541);
 //!    with no Status of ours it is `2: ServerError`. When the floor is above the start of the
 //!    block serve window (`network_config::window`, L1527–1530: the node is not compliant
-//!    until it backfilled), that is logged once and shown in `rpc_block_window_gap_slots`. A
-//!    start below the window's start is `3` too (counted as `{store, window}`): cl-store finds
-//!    any range inside it in its finalized slot index in one seek, so the window is the only
-//!    floor below `F0`, and a range deeper in history is never asked for.
+//!    until it backfilled), that is logged once and shown in `rpc_block_window_gap_slots`.
+//!    A start below the window's start and at or below the highest `F0` read so far (finality
+//!    only advances, so that is still finalized) is `3` too, at once (counted as
+//!    `{store, window}`): expired finalized history.
 //! 2. **A lookup slot**: at most [`super::limits::RpcLimits::max_block_lookups`] answers hold
 //!    IPC calls at once; one past them waits for a slot up to [`BLOCK_LOOKUP_TIMEOUT`], then
 //!    is `2`.
 //! 3. **The split**: the store's finalized slot `F0`, read first ([`BlockSource::finalized_slot`],
-//!    cl-store's `GetChainHead.finalized_slot`). The blocks of `[start, min(end, F0 + 1))` come
-//!    from cl-store, then those of `[max(start, F0 + 1), end)` from cl-chain, each half asked
-//!    for only if it is not empty. Finality only advances and cl-store is never ahead of
+//!    cl-store's `GetChainHead.finalized_slot`). A start below the window's start and at or
+//!    below `F0` is `3` (`{store, window}`), the whole request, whatever of it reaches into the
+//!    window: cl-store finds any range inside the window in its finalized slot index in one
+//!    seek, so the window is the only floor below `F0`, and finalized history deeper than it is
+//!    never asked for. The window does not account for finality (L1532–1536): a start above
+//!    `F0` is served even below the window's start. The blocks of `[start, min(end, F0 + 1))`
+//!    come from cl-store, then those of `[max(start, F0 + 1), end)` from cl-chain, each half
+//!    asked for only if it is not empty. Finality only advances and cl-store is never ahead of
 //!    cl-chain, so a later store read still holds every finalized block up to `F0`, and
 //!    cl-chain's head descends from `F0`'s block: no gap and no duplicate, whatever finality
 //!    does meanwhile. A start inside the window that cl-store has not indexed yet (its backfill
@@ -59,7 +64,7 @@ use p2p_wire::rpc::messages::BlocksByRangeV2Request;
 use p2p_wire::rpc::protocols::{Request, Response, ResultCode};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -96,8 +101,8 @@ pub struct Failed {
     /// The result code the answer ends with if nothing went out yet.
     pub code: ResultCode,
     /// The metric's `kind` label: `status` (the call failed), `refused` (an error chunk),
-    /// `contract`, `timeout`, `order`, `link`, `decode` or `window` (a start below the serve
-    /// window).
+    /// `contract`, `timeout`, `order`, `link`, `decode` or `window` (a start in finalized
+    /// history below the serve window).
     pub kind: &'static str,
     /// What happened, for the log.
     pub why: String,
@@ -177,6 +182,9 @@ pub struct ByRangeResponder {
     lookups: Arc<Semaphore>,
     metrics: Option<RpcMetrics>,
     window: Option<WindowStart>,
+    /// The highest `F0` read so far: never above the store's finalized slot now, finality only
+    /// advancing (0 before the first read: slot 0 is final whatever `F0` is).
+    finalized: Arc<AtomicU64>,
     /// Whether the floor above the window's start was logged.
     warned: Arc<AtomicBool>,
     /// The store streams of the ByHead answers it builds ([`Self::head_responder`]).
@@ -199,6 +207,7 @@ impl ByRangeResponder {
             lookups: Arc::new(Semaphore::new(max_lookups.min(Semaphore::MAX_PERMITS))),
             metrics,
             window: None,
+            finalized: Arc::default(),
             warned: Arc::default(),
             head_streams: StoreStreams::new(
                 MAX_BYHEAD_STORE_STREAMS,
@@ -207,8 +216,8 @@ impl ByRangeResponder {
         }
     }
 
-    /// The same responder, refusing starts below `window`'s start and comparing its floor with
-    /// it (see the module docs).
+    /// The same responder, refusing starts in finalized history below `window`'s start and
+    /// comparing its floor with it (see the module docs).
     #[must_use]
     pub fn with_window(mut self, window: WindowStart) -> Self {
         self.window = Some(window);
@@ -269,6 +278,21 @@ impl ByRangeResponder {
         }
     }
 
+    /// `3` for `start`, below the serve window's start `window` and at or below the finalized
+    /// slot `finalized`: expired finalized history, counted as `{store, window}`.
+    fn expired(&self, start: u64, window: u64, finalized: u64) -> Failed {
+        let why = format!(
+            "start_slot {start} below the serve window's start {window}, at or below F0 \
+             {finalized}"
+        );
+        let expired = Failed {
+            code: ResultCode::ResourceUnavailable,
+            kind: "window",
+            why,
+        };
+        self.failed(Half::Store, expired)
+    }
+
     /// The answer to `range` into `out` (see the module docs).
     async fn answer<E: EthSpec>(
         &self,
@@ -292,17 +316,12 @@ impl ByRangeResponder {
         }
         let window = self.window.as_ref().and_then(|window| window());
         self.check_window(eas, window);
-        if let Some(start) = window.filter(|start| range.start_slot < *start) {
-            let why = format!(
-                "start_slot {} below the serve window's start {start}",
-                range.start_slot
-            );
-            let below = Failed {
-                code: ResultCode::ResourceUnavailable,
-                kind: "window",
-                why,
-            };
-            return Err(self.failed(Half::Store, below));
+        // Below the window only finalized history is refused: at once when an `F0` read before
+        // proves the start finalized, else once `F0` is read.
+        let below = window.filter(|start| range.start_slot < *start);
+        let known = self.finalized.load(Ordering::Relaxed);
+        if let Some(window) = below.filter(|_| range.start_slot <= known) {
+            return Err(self.expired(range.start_slot, window, known));
         }
         let count = if range.step > 1 {
             range.count.min(1)
@@ -316,6 +335,10 @@ impl ByRangeResponder {
         };
         let finalized = self.source.finalized_slot().await;
         let finalized = finalized.map_err(|f| self.failed(Half::Store, f))?;
+        self.finalized.fetch_max(finalized, Ordering::Relaxed);
+        if let Some(window) = below.filter(|_| start <= finalized) {
+            return Err(self.expired(start, window, finalized));
+        }
         let split = finalized.saturating_add(1);
         if start < split {
             self.half(out, Half::Store, start, end.min(split)).await?;
