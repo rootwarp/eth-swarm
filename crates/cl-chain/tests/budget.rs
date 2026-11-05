@@ -447,21 +447,19 @@ fn checkpoint_never_deleted() {
     // Finalized columns are never refused (and are counted while above finality).
     write(&writer, 12, 14, Branch::Finalized, 1).unwrap();
     assert_eq!(columns_used(&writer).bytes, 1200);
+    // Read through the writer's own env: a second open of it in this process would fail.
     let checkpoint = || {
-        let env = store_schema::env::open_reader(dir.path()).unwrap();
-        let t = store_schema::env::begin_reader_txn(&env).unwrap();
+        let t = writer.reader().read_txn().unwrap();
         let stamp = store_schema::stamp::read(&t).unwrap().expect("stamped");
         let blocks = t.open_table(Some(store_schema::tables::BLOCKS)).unwrap();
         let key = store_schema::keys::slot_root_key(stamp.finalized_slot, &stamp.finalized_root);
         t.get::<Vec<u8>>(&blocks, &key).unwrap().is_some()
     };
     assert!(checkpoint(), "the checkpoint block is stored");
-    // The direct API admits finalized data without charging it, at the limit.
+    // The counter as stored, reloaded by a budget of its own; the checkpoint never charged.
     let budget = Budget::new(small_caps());
-    let reader = ColumnReader::open(dir.path()).unwrap();
-    budget.load(&reader.read_txn().unwrap()).unwrap();
+    budget.load(&writer.reader().read_txn().unwrap()).unwrap();
     assert_eq!(budget.used(Kind::Columns).bytes, 1200);
-    drop(reader);
     for kind in [Kind::Blocks, Kind::States] {
         assert_eq!(
             writer.budget().used(kind),
@@ -807,6 +805,7 @@ fn the_metrics_follow_the_budget_and_the_floor() {
         "chain_disk_budget_refusals_total{kind=\"columns\",branch=\"side\"} 1",
         "chain_disk_budget_refusals_total{kind=\"columns\",branch=\"canonical\"} 0",
         "chain_disk_budget_reached 1",
+        "chain_disk_budget_refusals_total{kind=\"pending\",branch=\"side\"} 0",
         "chain_disk_free_bytes 21474836480",
         "chain_disk_floor_reached 0",
     ] {

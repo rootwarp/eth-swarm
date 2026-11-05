@@ -37,6 +37,7 @@
 
 use crate::da::custody::{Advertise, Custody, EnrCgc, EnrError};
 use crate::events::{ChainEvents, EventsServer};
+use crate::persist::budget::{Budget, BudgetMetrics, DiskBudget};
 use crate::probe::{
     ApiError, BeaconApi, BlockApi, ColumnContract, ColumnIngest, ColumnMetrics, GossipColumn,
     HeadFollow, IngestLimits, ProbeChain, QueueMetrics, RefLimits, RefView, ReferenceApi, Root,
@@ -48,7 +49,7 @@ use crate::reqresp::{
 };
 use crate::verify::client::{KzgClient, KzgVerifier};
 use crate::{finalized_index, ChainStub};
-use cl_chain_columns::{ColumnReader, ColumnWriter};
+use cl_chain_columns::{ColumnReader, ColumnWriter, WriterOptions};
 use consensus_types::caps::NetworkCaps;
 use consensus_types::primitives::U256;
 use consensus_types::{forked, EthSpec, ForkSchedule};
@@ -501,6 +502,9 @@ pub struct ProbePlan<V> {
     /// The block a new store is stamped with ([`fetch_anchor`]). A store stamped before needs
     /// none.
     pub anchor: Option<Anchor>,
+    /// The non-finality disk budget the column store's writes are admitted by; its metrics go
+    /// to the service's registry.
+    pub disk_budget: DiskBudget,
 }
 
 /// The block probe mode stamps a new store with: the reference's finalized block.
@@ -743,10 +747,16 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ProbeService<E, V> {
         registry: &mut Registry,
     ) -> Result<Self, OpenError> {
         let clock: Arc<dyn ServeClock> = Arc::new(WallClock::new(net.probe_chain())?);
+        let budget = Arc::new(Budget::new(plan.disk_budget.caps()));
         let writer = Arc::new(
-            ColumnWriter::open(&plan.columns_dir)
-                .map_err(|e| format!("column store {}: {e}", plan.columns_dir.display()))?,
+            ColumnWriter::open_with_budget(
+                &plan.columns_dir,
+                WriterOptions::default(),
+                Arc::clone(&budget),
+            )
+            .map_err(|e| format!("column store {}: {e}", plan.columns_dir.display()))?,
         );
+        BudgetMetrics::register(registry, budget, None);
         // Under the writer's lock: no other start compares or writes it meanwhile.
         let has_custody = writer
             .reader()

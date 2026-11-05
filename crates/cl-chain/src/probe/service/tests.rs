@@ -239,6 +239,7 @@ fn plan(dir: &Path, cgc_set_slot: u64) -> ProbePlan<Valid> {
         verify_timeout: DEFAULT_VERIFY_TIMEOUT,
         cgc_set_slot,
         anchor: Some(anchor()),
+        disk_budget: Default::default(),
     }
 }
 

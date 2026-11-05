@@ -28,6 +28,12 @@
 //!   from the slot after its highest block; so are pending links stored without their target's
 //!   slot (a parent link if the target is stored, else a gap), in the same transaction. Until
 //!   then a reader serves nothing below the block of such a link.
+//! - **Disk budget.** Every column write above the finalized-slot watermark is admitted by the
+//!   non-finality disk budget ([`store_schema::budget`], [`ColumnWriter::open_with_budget`]) on
+//!   the branch the caller names ([`ColumnWriter::write_block_columns_on`]; the other write
+//!   methods write on the canonical branch), and charged in its own write transaction: a
+//!   refusal is [`Error::OverBudget`] and writes nothing. Every prune releases the columns it
+//!   removes above the watermark, and raising the watermark releases those it passes.
 //! - **Snapshots.** [`ColumnReader::snapshot`] reads several values of one state.
 //! - **First stored slot.** [`ColumnReader::first_stored_slot`] is the lowest slot any column
 //!   was ever stored at, written in the same transaction as that column; pruning leaves it. It

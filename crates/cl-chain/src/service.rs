@@ -30,6 +30,9 @@
 //! columns_dir = "/var/lib/ethswarm-chain/columns"   # optional, this default
 //! verify_timeout_ms = 5000                      # optional, this default
 //! verify_wait_ms = 30000                        # optional, this default: cl-verify's start
+//!
+//! [chain.disk_budget]                           # optional, every key: the proposed values
+//! aggregate_mib = 49152                         # (crate::persist::budget::DiskBudget)
 //! ```
 //!
 //! - **The ACL** must be exactly [`chain_acl`] of the `cl-p2p` caller: a config that gives a
@@ -40,6 +43,9 @@
 //!   shared network has no integrity: anyone on it can change what cl-chain gets. So the
 //!   preferred setup is an SSH tunnel to a loopback port; a private address is for a network
 //!   that only the probe and the reference share (the Kurtosis enclave network).
+//! - **`[chain.disk_budget]`** is the non-finality disk budget ([`crate::persist::budget`]): a
+//!   missing key is its default, an unknown key or a per-type cap above the aggregate is
+//!   refused.
 //! - **`node_id`** is public (the discv5 node ID of the probe's key, which cl-discv5 logs).
 //!   cl-chain never gets the key itself. The custody columns follow it.
 //!
@@ -55,6 +61,7 @@
 //! | 70 ([`EXIT_SOFTWARE`]) | a fault of the run that a restart can fix: the server task, a drain past its deadline, `/metrics`, the service manager, a store that does not close within 10 s | yes |
 //! | 71 | the log writer could not start (`svc_runtime::telemetry::EXIT_NO_LOG_WRITER`) | yes |
 
+use crate::persist::budget::DiskBudget;
 use crate::probe::service::{
     chain_acl, chain_link, connect_verify, error_chain, fetch_anchor, open_store_dir, system_ms,
     verify_client, verify_dir_state, ProbeNetwork, ProbePlan, ProbeService, VerifyDirError,
@@ -117,6 +124,8 @@ struct ChainTable {
     columns_dir: Option<PathBuf>,
     verify_timeout_ms: Option<u64>,
     verify_wait_ms: Option<u64>,
+    #[serde(default)]
+    disk_budget: DiskBudget,
 }
 
 /// What cl-chain runs with, read from its config and checked.
@@ -141,7 +150,7 @@ pub struct ChainSettings {
     /// cl-p2p's UID, the one caller.
     pub caller_uid: u32,
     /// The non-finality disk budget (`[chain.disk_budget]`).
-    pub disk_budget: crate::persist::budget::DiskBudget,
+    pub disk_budget: DiskBudget,
 }
 
 /// Why the config was refused.
@@ -220,6 +229,10 @@ pub fn settings(config: &Config) -> Result<ChainSettings, SettingsError> {
         }
         Some(_) => return Err(key("verify_wait_ms", "want 1 to 600000")),
     };
+    table
+        .disk_budget
+        .check()
+        .map_err(|why| key("disk_budget", &why))?;
     Ok(ChainSettings {
         network,
         reference,
@@ -230,7 +243,7 @@ pub fn settings(config: &Config) -> Result<ChainSettings, SettingsError> {
         verify_timeout,
         verify_wait,
         caller_uid,
-        disk_budget: crate::persist::budget::DiskBudget::default(),
+        disk_budget: table.disk_budget,
     })
 }
 
@@ -444,6 +457,7 @@ pub async fn serve<E: EthSpec, V: KzgVerifier + 'static>(
         verify_timeout: settings.verify_timeout,
         cgc_set_slot,
         anchor,
+        disk_budget: settings.disk_budget,
     };
     let service =
         ProbeService::<E, V>::open(net, plan, &mut hooks.unprefixed).map_err(|e| match e {

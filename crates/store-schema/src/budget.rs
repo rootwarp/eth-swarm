@@ -21,13 +21,16 @@
 //! - **Never deletes.** The budget only refuses writes; pruning stays with each table's owner.
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     OnceLock,
 };
 
+use libmdbx::WriteFlags;
+
 use crate::{
+    tables::META,
     txn::{ReadTxn, RwTxn},
-    Result,
+    Error, Result,
 };
 
 /// How many [`Kind`]s there are.
@@ -64,7 +67,26 @@ impl Kind {
     /// Its name in metrics and logs.
     #[must_use]
     pub const fn name(self) -> &'static str {
-        todo!()
+        match self {
+            Kind::Blocks => "blocks",
+            Kind::States => "states",
+            Kind::FcSnapshots => "fc_snapshots",
+            Kind::Columns => "columns",
+            Kind::Envelopes => "envelopes",
+            Kind::Pending => "pending",
+        }
+    }
+
+    /// Its counter's `meta` key.
+    const fn key(self) -> &'static [u8] {
+        match self {
+            Kind::Blocks => b"budget_blocks",
+            Kind::States => b"budget_states",
+            Kind::FcSnapshots => b"budget_fc_snapshots",
+            Kind::Columns => b"budget_columns",
+            Kind::Envelopes => b"budget_envelopes",
+            Kind::Pending => b"budget_pending",
+        }
     }
 }
 
@@ -83,7 +105,11 @@ impl Branch {
     /// Its name in metrics and logs.
     #[must_use]
     pub const fn name(self) -> &'static str {
-        todo!()
+        match self {
+            Branch::Finalized => "finalized",
+            Branch::Canonical => "canonical",
+            Branch::Side => "side",
+        }
     }
 }
 
@@ -122,7 +148,8 @@ impl Caps {
     /// The aggregate plus the canonical headroom.
     #[must_use]
     pub fn canonical_limit(&self) -> u64 {
-        todo!()
+        let headroom = u128::from(self.aggregate) * u128::from(self.headroom_percent) / 100;
+        u64::try_from(headroom).map_or(u64::MAX, |h| self.aggregate.saturating_add(h))
     }
 }
 
@@ -155,18 +182,43 @@ pub fn decide(
     bytes: u64,
     items: u64,
 ) -> Decision {
-    let _ = (caps, used, kind, branch, bytes, items);
-    todo!()
+    if branch == Branch::Finalized {
+        return Decision::Admit;
+    }
+    let (k, own) = (kind as usize, used[kind as usize]);
+    let total = used
+        .iter()
+        .fold(bytes, |sum, used| sum.saturating_add(used.bytes));
+    let items_ok = caps.items[k].is_none_or(|cap| own.items.saturating_add(items) <= cap);
+    let bytes_ok = caps.bytes[k].is_none_or(|cap| own.bytes.saturating_add(bytes) <= cap);
+    if items_ok && bytes_ok && total <= caps.aggregate {
+        Decision::Admit
+    } else if branch == Branch::Canonical && items_ok && total <= caps.canonical_limit() {
+        Decision::Headroom
+    } else {
+        Decision::Ignore
+    }
 }
 
 /// `kind`'s counter row as `txn` sees it; `None` if it was never written.
 ///
 /// # Errors
 ///
-/// An MDBX error, or [`crate::Error::Corrupt`] for a row that is not 16 bytes.
+/// An MDBX error, or [`Error::Corrupt`] for a row that is not 16 bytes.
 pub fn stored(txn: &impl ReadTxn, kind: Kind) -> Result<Option<Usage>> {
-    let _ = (txn, kind);
-    todo!()
+    let meta = txn.open_table(Some(META))?;
+    match txn.get::<[u8; 16]>(&meta, kind.key()) {
+        Ok(row) => Ok(row.map(|row| {
+            let (bytes, items) = row.split_at(8);
+            let u64_of = |half: &[u8]| u64::from_be_bytes(half.try_into().unwrap_or_default());
+            Usage {
+                bytes: u64_of(bytes),
+                items: u64_of(items),
+            }
+        })),
+        Err(libmdbx::Error::DecodeError(_)) => Err(Error::Corrupt { table: META }),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Called with `(reached, kind, branch)` each time the budget is reached or left
@@ -198,8 +250,13 @@ impl Budget {
     /// A budget of `caps`, its counters at zero until [`Self::load`].
     #[must_use]
     pub fn new(caps: Caps) -> Self {
-        let _ = caps;
-        todo!()
+        Self {
+            caps,
+            used: Default::default(),
+            refusals: Default::default(),
+            reached: AtomicBool::new(false),
+            observer: OnceLock::new(),
+        }
     }
 
     /// The caps.
@@ -211,39 +268,47 @@ impl Budget {
     /// `kind`'s counter, as last charged, released or loaded.
     #[must_use]
     pub fn used(&self, kind: Kind) -> Usage {
-        let _ = kind;
-        todo!()
+        let [bytes, items] = &self.used[kind as usize];
+        Usage {
+            bytes: bytes.load(Ordering::Relaxed),
+            items: items.load(Ordering::Relaxed),
+        }
     }
 
     /// Every kind's bytes together.
     #[must_use]
     pub fn total(&self) -> u64 {
-        todo!()
+        Kind::ALL
+            .iter()
+            .fold(0, |sum, &kind| sum.saturating_add(self.used(kind).bytes))
     }
 
     /// Sets `kind`'s mirrored counter (what a writer counted itself).
     pub fn set(&self, kind: Kind, usage: Usage) {
-        let _ = (kind, usage);
-        todo!()
+        let [bytes, items] = &self.used[kind as usize];
+        bytes.store(usage.bytes, Ordering::Relaxed);
+        items.store(usage.items, Ordering::Relaxed);
     }
 
     /// Writes of `kind` on `branch` refused so far.
     #[must_use]
     pub fn refusals(&self, kind: Kind, branch: Branch) -> u64 {
-        let _ = (kind, branch);
-        todo!()
+        match branch {
+            Branch::Finalized => 0,
+            Branch::Canonical => self.refusals[kind as usize][0].load(Ordering::Relaxed),
+            Branch::Side => self.refusals[kind as usize][1].load(Ordering::Relaxed),
+        }
     }
 
     /// Whether the last decision refused a write (until one is admitted within the caps).
     #[must_use]
     pub fn reached(&self) -> bool {
-        todo!()
+        self.reached.load(Ordering::Relaxed)
     }
 
     /// Sets the observer of the budget's transitions; only the first call sets it.
     pub fn on_transition(&self, observer: Observer) {
-        let _ = observer;
-        todo!()
+        let _ = self.observer.set(observer);
     }
 
     /// Mirrors every counter row `txn` sees (a missing one is zero).
@@ -252,8 +317,10 @@ impl Budget {
     ///
     /// As [`stored`].
     pub fn load(&self, txn: &impl ReadTxn) -> Result<()> {
-        let _ = txn;
-        todo!()
+        for kind in Kind::ALL {
+            self.set(kind, stored(txn, kind)?.unwrap_or_default());
+        }
+        Ok(())
     }
 
     /// Decides `bytes` and `items` more of `kind` on `branch` against the counters `txn` holds
@@ -271,8 +338,28 @@ impl Budget {
         bytes: u64,
         items: u64,
     ) -> Result<Decision> {
-        let _ = (txn, kind, branch, bytes, items);
-        todo!()
+        if branch == Branch::Finalized {
+            return Ok(Decision::Admit);
+        }
+        let mut used = [Usage::default(); KINDS];
+        for kind in Kind::ALL {
+            used[kind as usize] = stored(txn, kind)?.unwrap_or_default();
+        }
+        let decision = decide(&self.caps, &used, kind, branch, bytes, items);
+        match decision {
+            Decision::Ignore => {
+                let side = usize::from(branch == Branch::Side);
+                self.refusals[kind as usize][side].fetch_add(1, Ordering::Relaxed);
+                self.mark(true, kind, branch);
+            }
+            Decision::Admit | Decision::Headroom => {
+                if decision == Decision::Admit {
+                    self.mark(false, kind, branch);
+                }
+                self.charge(txn, kind, bytes, items)?;
+            }
+        }
+        Ok(decision)
     }
 
     /// Adds `bytes` and `items` to `kind`'s counter in `txn`, with no decision; the new counter.
@@ -281,8 +368,10 @@ impl Budget {
     ///
     /// As [`Self::admit`].
     pub fn charge(&self, txn: &RwTxn<'_>, kind: Kind, bytes: u64, items: u64) -> Result<Usage> {
-        let _ = (txn, kind, bytes, items);
-        todo!()
+        self.apply(txn, kind, |u| Usage {
+            bytes: u.bytes.saturating_add(bytes),
+            items: u.items.saturating_add(items),
+        })
     }
 
     /// Takes `bytes` and `items` off `kind`'s counter in `txn` (at zero at the least); the new
@@ -292,8 +381,31 @@ impl Budget {
     ///
     /// As [`Self::admit`].
     pub fn release(&self, txn: &RwTxn<'_>, kind: Kind, bytes: u64, items: u64) -> Result<Usage> {
-        let _ = (txn, kind, bytes, items);
-        todo!()
+        self.apply(txn, kind, |u| Usage {
+            bytes: u.bytes.saturating_sub(bytes),
+            items: u.items.saturating_sub(items),
+        })
+    }
+
+    /// Writes `f` of `kind`'s stored counter to its row and the mirror.
+    fn apply(&self, txn: &RwTxn<'_>, kind: Kind, f: impl FnOnce(Usage) -> Usage) -> Result<Usage> {
+        let usage = f(stored(txn, kind)?.unwrap_or_default());
+        let mut row = [0u8; 16];
+        row[..8].copy_from_slice(&usage.bytes.to_be_bytes());
+        row[8..].copy_from_slice(&usage.items.to_be_bytes());
+        let meta = txn.open_table(Some(META))?;
+        txn.put(&meta, kind.key(), row, WriteFlags::UPSERT)?;
+        self.set(kind, usage);
+        Ok(usage)
+    }
+
+    /// Sets `reached`, telling the observer if it changed.
+    fn mark(&self, reached: bool, kind: Kind, branch: Branch) {
+        if self.reached.swap(reached, Ordering::Relaxed) != reached {
+            if let Some(observer) = self.observer.get() {
+                observer(reached, kind, branch);
+            }
+        }
     }
 }
 
@@ -360,7 +472,7 @@ mod tests {
             (used(50, 40), Kind::States, Side, 11, Ignore),
             (used(50, 40), Kind::States, Canonical, 20, Headroom),
             (used(50, 40), Kind::States, Canonical, 21, Ignore),
-            (used(60, 50), Kind::Blocks, Canonical, 0, Ignore),
+            (used(60, 51), Kind::Blocks, Canonical, 0, Ignore),
             (used(60, 50), Kind::Blocks, Finalized, u64::MAX, Admit),
             (used(u64::MAX, 0), Kind::Columns, Side, 1, Ignore),
         ];

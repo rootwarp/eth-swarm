@@ -237,6 +237,8 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ChainSide<E, V> {
                 verify_timeout: plan.verify_timeout,
                 cgc_set_slot: plan.cgc_set_slot,
                 anchor: plan.anchor,
+                // The proposed values: the devnet probe has no budget table of its own.
+                disk_budget: Default::default(),
             },
             registry,
         )?;
