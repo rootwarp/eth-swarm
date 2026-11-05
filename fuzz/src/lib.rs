@@ -399,7 +399,7 @@ pub(crate) fn check_chunk_in(
                 (Protocol::MetaDataV3, Response::MetaData(metadata)) => metadata.as_ssz_bytes(),
                 (Protocol::PingV1, Response::Ping(ping)) => ping.as_ssz_bytes(),
                 (Protocol::GoodbyeV1, Response::Goodbye(goodbye)) => goodbye.as_ssz_bytes(),
-                (Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1, Response::Block(block)) => {
+                (p, Response::Block(block)) if p.is_blocks() => {
                     assert_eq!(
                         Some(block.fork_name()),
                         contexts.fork(&digest(chunk)),

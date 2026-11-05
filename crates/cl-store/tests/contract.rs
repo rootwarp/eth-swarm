@@ -143,6 +143,7 @@ impl StoreService for FakeStore {
     type GetBlocksByRangeStream = StubStream<pb::GetBlocksByRangeResponse>;
     type GetDataColumnsByRangeStream = StubStream<pb::GetDataColumnsByRangeResponse>;
     type GetBlocksByHeadStream = StubStream<pb::GetBlocksByHeadResponse>;
+    type GetBlocksByRootStream = StubStream<pb::GetBlocksByRootResponse>;
 
     async fn get_block(
         &self,
@@ -221,6 +222,16 @@ impl StoreService for FakeStore {
             block,
             meta: self.meta.clone(),
             error: None,
+        }))
+    }
+    async fn get_blocks_by_root(
+        &self,
+        _: Request<pb::GetBlocksByRootRequest>,
+    ) -> Result<Response<Self::GetBlocksByRootStream>, Status> {
+        Ok(self.stream(|block| pb::GetBlocksByRootResponseBody {
+            block,
+            meta: self.meta.clone(),
+            ..Default::default()
         }))
     }
 }
@@ -563,6 +574,27 @@ async fn store_stamp_real_server(mode: Mode) {
             *slot <= stamp.finalized_slot,
         );
     }
+
+    // By root: a body per root held, stamped; the finalized ones with their block, the
+    // unfinalized head by its root alone, none for an unknown root.
+    let (first_slot, first_root, first_ssz) = seeded.blocks[0].clone();
+    let roots = vec![first_root.to_vec(), vec![0xee; 32], head_root.to_vec()];
+    let by_root = r
+        .get_blocks_by_root(pb::GetBlocksByRootRequest { roots, hello: None })
+        .await
+        .expect("GetBlocksByRoot");
+    assert_eq!(by_root.len(), 2, "{}", mode.name());
+    full(check_read_meta(&by_root[0]).expect("root body"), true);
+    let block = by_root[0].block.as_ref().expect("the finalized block");
+    assert_eq!((block.slot, &block.ssz), (first_slot, &first_ssz));
+    full(check_read_meta(&by_root[1]).expect("root body"), false);
+    assert_eq!(
+        (
+            by_root[1].block.as_ref(),
+            by_root[1].unfinalized_root.as_slice()
+        ),
+        (None, &head_root[..])
+    );
 
     let unknown = r
         .get_block(block_id(pb::block_id::Id::Root(vec![0xee; 32])))

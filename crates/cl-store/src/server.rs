@@ -13,7 +13,9 @@
 //!   [`MAX_BLOCKS`], read in one transaction before its stream opens, from the finalized slot
 //!   index at any depth; a range that starts below the index's floor (what cl-chain has not
 //!   indexed yet) is `UNAVAILABLE` (`ERROR_CODE_RESOURCE_UNAVAILABLE`), unread. Envelope
-//!   `root`s are block roots.
+//!   `root`s are block roots. `GetBlocksByRoot` is read the same way, at most [`MAX_BLOCKS`]
+//!   roots: a body per requested root it holds, its block if the stamp finalizes it
+//!   ([`AtRoot`]).
 //! - `GetBlocksByHead` is a [`ParentWalk`]: `count` capped at [`MAX_BLOCKS`], stamped by its
 //!   first read (before the stream opens), then one block per read as the client reads, at
 //!   most one body ahead. cl-p2p reads it at its peer's pace for BeaconBlocksByHead (#230), so
@@ -69,7 +71,7 @@ use crate::{
 const CALLERS: [&str; 3] = ["cl-api", "cl-sync", "cl-p2p"];
 
 /// Every `StoreService` method.
-const METHODS: [&str; 8] = [
+const METHODS: [&str; 9] = [
     "/ethswarm.store.v1.StoreService/GetBlock",
     "/ethswarm.store.v1.StoreService/GetState",
     "/ethswarm.store.v1.StoreService/GetDataColumns",
@@ -78,9 +80,11 @@ const METHODS: [&str; 8] = [
     "/ethswarm.store.v1.StoreService/GetDataColumnsByRange",
     "/ethswarm.store.v1.StoreService/GetChainHead",
     "/ethswarm.store.v1.StoreService/GetBlocksByHead",
+    "/ethswarm.store.v1.StoreService/GetBlocksByRoot",
 ];
 
-/// `MAX_REQUEST_BLOCKS_DENEB`: the most blocks one range or parent walk serves.
+/// `MAX_REQUEST_BLOCKS_DENEB`: the most blocks one range or parent walk serves, and the most
+/// roots one by-root call names.
 pub const MAX_BLOCKS: u64 = 128;
 
 /// The UIDs of cl-store's callers: cl-api, cl-sync and cl-p2p.
@@ -378,6 +382,7 @@ impl StoreService for StoreServer {
     type GetBlocksByRangeStream = StubStream<pb::GetBlocksByRangeResponse>;
     type GetDataColumnsByRangeStream = StubStream<pb::GetDataColumnsByRangeResponse>;
     type GetBlocksByHeadStream = StubStream<pb::GetBlocksByHeadResponse>;
+    type GetBlocksByRootStream = StubStream<pb::GetBlocksByRootResponse>;
 
     async fn get_block(
         &self,
@@ -521,6 +526,13 @@ impl StoreService for StoreServer {
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
+
+    async fn get_blocks_by_root(
+        &self,
+        request: Request<pb::GetBlocksByRootRequest>,
+    ) -> Result<Response<Self::GetBlocksByRootStream>, Status> {
+        stub::server_stream(&self.link, "get_blocks_by_root", request.get_ref())
+    }
 }
 
 #[cfg(test)]
@@ -630,6 +642,67 @@ mod tests {
             .iter()
             .map(|b| (b.slot, b.root.to_vec(), b.ssz.clone()))
             .collect()
+    }
+
+    /// `GetBlocksByRoot` (the store half of BeaconBlocksByRoot): one stamped body per root
+    /// held, in request order: a finalized block as an envelope (`seq` from 1, its slot's
+    /// digest), a root above the finalized slot by `unfinalized_root` alone; no body for an
+    /// unknown root. More than 128 roots, or a root that is not 32 bytes, is INVALID_ARGUMENT;
+    /// no hello is a contract violation; with no stamp the call is UNAVAILABLE.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocks_by_root_stream() {
+        let store = Store::new();
+        let blocks = chain(10);
+        let all: Vec<&[u8]> = blocks.iter().map(|b| b.ssz.as_slice()).collect();
+        let stamped = stamp_of(2, &blocks[9], &blocks[6]);
+        store.import(&all, stamped);
+        let mut reader = client(server(&store)).await;
+        let by_root = |roots: Vec<Vec<u8>>| pb::GetBlocksByRootRequest { roots, hello: None };
+        let roots = vec![
+            blocks[8].root.to_vec(),
+            blocks[2].root.to_vec(),
+            vec![0xee; 32],
+            blocks[6].root.to_vec(),
+        ];
+        let bodies = reader.get_blocks_by_root(by_root(roots)).await.unwrap();
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(
+            (bodies[0].block.as_ref(), &bodies[0].unfinalized_root),
+            (None, &blocks[8].root.to_vec())
+        );
+        assert_eq!(bodies[0].meta, meta(&stamped, false));
+        for (body, (b, seq)) in bodies[1..].iter().zip([(&blocks[2], 1), (&blocks[6], 2)]) {
+            let envelope = body.block.as_ref().expect("a finalized block");
+            assert_eq!(
+                (envelope.slot, &envelope.root, &envelope.ssz, envelope.seq),
+                (b.slot, &b.root.to_vec(), &b.ssz, seq)
+            );
+            assert!(body.unfinalized_root.is_empty());
+            assert_eq!(body.meta, meta(&stamped, true));
+        }
+
+        let over = by_root(vec![vec![1; 32]; 129]);
+        let err = reader.get_blocks_by_root(over).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Invalid);
+        let short = by_root(vec![vec![1; 31]]);
+        let err = reader.get_blocks_by_root(short).await.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Invalid);
+        let no_hello = server(&store)
+            .get_blocks_by_root(Request::new(by_root(vec![blocks[2].root.to_vec()])))
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(
+            ipc::error::error_from_status(&no_hello).code,
+            ErrorCode::ContractViolation as i32
+        );
+        let empty = Store::new();
+        let mut unstamped = client(server(&empty)).await;
+        let err = unstamped
+            .get_blocks_by_root(by_root(vec![blocks[2].root.to_vec()]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ResourceUnavailable);
     }
 
     /// `GetBlocksByHead`: newest first along the parents, every body stamped with the stamp of

@@ -188,3 +188,55 @@ fn blocks_by_head_deep_canonical_and_sibling() {
         "decided once, at 3"
     );
 }
+
+/// `GetBlocksByRoot`'s read: in one transaction under one stamp (head 14, finalized 11), a
+/// point lookup per root, in request order. A finalized root is served as stored, the
+/// finalized slot's own included; a root not stored is missing; a block above the finalized
+/// slot is held but not served, the head's and a fork's alike; a fork block at or below the
+/// finalized slot is missing, never served, and so is a finalized block below the index's
+/// floor (not proven). A read past its deadline serves nothing.
+#[test]
+fn blocks_by_root_finalized_only() {
+    use crate::ranges::AtRoot;
+    let store = Store::new();
+    let main = chain([0; 32], &[10, 11, 12, 14], 0);
+    let fork = chain(main[0].1, &[11, 13], 9);
+    let mut all = main.clone();
+    all.extend(fork.iter().cloned());
+    let ssz: Vec<&[u8]> = all.iter().map(|b| b.2.as_slice()).collect();
+    let head = (main[3].0, main[3].1);
+    store.import(&ssz, stamp(4, head, (main[1].0, main[1].1)));
+    let reader = store.reader();
+    let roots = [
+        main[1].1, [0xee; 32], main[3].1, fork[0].1, fork[1].1, main[0].1,
+    ];
+    let read = reader.blocks_by_root(&roots, &deadline()).unwrap();
+    assert_eq!(read.stamp, stamp(4, head, (11, main[1].1)));
+    let served = |b: &(u64, Root, Vec<u8>)| {
+        AtRoot::Finalized(crate::reader::Block {
+            slot: b.0,
+            root: b.1,
+            ssz: b.2.clone(),
+            finalized: true,
+        })
+    };
+    assert_eq!(
+        read.value,
+        [
+            served(&main[1]),
+            AtRoot::Missing,
+            AtRoot::Unfinalized,
+            AtRoot::Missing,
+            AtRoot::Unfinalized,
+            served(&main[0]),
+        ]
+    );
+    index_from(&store, 11);
+    let read = reader.blocks_by_root(&[main[0].1, main[1].1], &deadline());
+    assert_eq!(read.unwrap().value, [AtRoot::Missing, served(&main[1])]);
+    let gone = Deadline::after(Arc::new(Instant::now), Duration::ZERO);
+    assert_eq!(
+        reader.blocks_by_root(&roots, &gone).map(|r| r.value.len()),
+        Err(ReadError::DeadlineExceeded)
+    );
+}

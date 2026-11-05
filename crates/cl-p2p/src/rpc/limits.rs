@@ -125,6 +125,8 @@ pub struct RateLimits {
     pub data_columns_by_root: Quota,
     /// `BeaconBlocksByHead`, in blocks: as by range, in a bucket of its own (#230).
     pub blocks_by_head: Quota,
+    /// `BeaconBlocksByRoot`, in roots named: as by range, in a bucket of its own.
+    pub blocks_by_root: Quota,
 }
 
 impl Default for RateLimits {
@@ -137,6 +139,7 @@ impl Default for RateLimits {
             data_columns_by_range: Quota::new(512, Duration::from_millis(5)),
             data_columns_by_root: Quota::new(512, Duration::from_millis(5)),
             blocks_by_head: Quota::new(128, Duration::from_millis(20)),
+            blocks_by_root: Quota::new(128, Duration::from_millis(20)),
         }
     }
 }
@@ -154,6 +157,7 @@ impl RateLimits {
             Protocol::DataColumnsByRangeV1 => Some(self.data_columns_by_range),
             Protocol::DataColumnsByRootV1 => Some(self.data_columns_by_root),
             Protocol::BlocksByHeadV1 => Some(self.blocks_by_head),
+            Protocol::BlocksByRootV2 => Some(self.blocks_by_root),
         }
     }
 }
@@ -379,28 +383,32 @@ impl RpcLimits {
     /// the latest each token can come: a booking's first token is due before its answer takes a
     /// place, and the rest follow at most one per period after it. So with these limits a full
     /// first block is refused `3: ResourceUnavailable` at its hold only when its lookup or its
-    /// writer took time, never for an instant lookup. The BlocksByHead quota delivers an
-    /// answer's first token before the answer ends ([`BLOCK_ANSWER_END`]), behind the
+    /// writer took time, never for an instant lookup. The BlocksByHead and BlocksByRoot quotas
+    /// deliver an answer's first token before the answer ends ([`BLOCK_ANSWER_END`]), behind the
     /// [`MAX_CONCURRENT_REQUESTS`] answers of 128 blocks a peer may have booked, so rate limiting
     /// never ends a held root's answer with no block (#230).
     ///
     /// # Errors
     ///
-    /// [`RpcLimitsError::BlocksQuotaTooSlow`] for a BlocksByHead quota too slow for that, else
-    /// [`RpcLimitsError::ColumnHoldTooLong`] if the answer window and the write deadline are too
+    /// [`RpcLimitsError::BlocksQuotaTooSlow`] for a BlocksByHead or BlocksByRoot quota too slow
+    /// for that, else [`RpcLimitsError::ColumnHoldTooLong`] if the answer window and the write deadline are too
     /// long to schedule, else [`RpcLimitsError::ColumnQuotaTooSlow`] for the first column quota
     /// that does not deliver that block in time.
     pub fn validate<E: EthSpec>(&self, network: &NetworkCaps) -> Result<(), RpcLimitsError> {
-        let quota = self.rate.blocks_by_head;
         let booked = MAX_CONCURRENT_REQUESTS as u32 * MAX_REQUEST_BLOCKS_DENEB as u32;
-        let first_token = quota.period.saturating_mul(booked);
-        if first_token >= BLOCK_ANSWER_END {
-            return Err(RpcLimitsError::BlocksQuotaTooSlow {
-                field: "rate.blocks_by_head",
-                period: quota.period,
-                first_token,
-                end: BLOCK_ANSWER_END,
-            });
+        for (field, quota) in [
+            ("rate.blocks_by_head", self.rate.blocks_by_head),
+            ("rate.blocks_by_root", self.rate.blocks_by_root),
+        ] {
+            let first_token = quota.period.saturating_mul(booked);
+            if first_token >= BLOCK_ANSWER_END {
+                return Err(RpcLimitsError::BlocksQuotaTooSlow {
+                    field,
+                    period: quota.period,
+                    first_token,
+                    end: BLOCK_ANSWER_END,
+                });
+            }
         }
         let deadlines = self.column_deadlines();
         let hold = deadlines.answer_window.saturating_add(deadlines.write);
@@ -1686,6 +1694,7 @@ pub fn outbound_queue_name(protocol: Protocol) -> &'static str {
         Protocol::DataColumnsByRangeV1 => "rpc_outbound_data_columns_by_range",
         Protocol::DataColumnsByRootV1 => "rpc_outbound_data_columns_by_root",
         Protocol::BlocksByHeadV1 => "rpc_outbound_blocks_by_head",
+        Protocol::BlocksByRootV2 => "rpc_outbound_blocks_by_root",
     }
 }
 

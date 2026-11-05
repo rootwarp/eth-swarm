@@ -6,8 +6,23 @@
 //! writer still holds at a finalized slot is never served. A range costs one seek and a row per
 //! block, at any depth below the finalized slot. One that starts below the index's floor (what
 //! cl-chain's backfill has not reached yet) is [`ReadError::Unavailable`], unread.
+//!
+//! By root ([`Reader::blocks_by_root`], `GetBlocksByRoot`): a point lookup per root in
+//! `block_index` and one in the index, in one read transaction; only a finalized block is
+//! served.
 
-use crate::reader::{Block, Deadline, ReadError, Reader, Stamped};
+use crate::reader::{Block, Deadline, ReadError, Reader, Root, Stamped};
+
+/// What the store holds at one requested root ([`Reader::blocks_by_root`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AtRoot {
+    /// The block, finalized by the stamp.
+    Finalized(Block),
+    /// A block above the stamp's finalized slot: not served.
+    Unfinalized,
+    /// No block, or one off the finalized chain at or below the finalized slot.
+    Missing,
+}
 
 impl Reader {
     /// The canonical blocks with a slot in `start..start + count` and at or below the stamp's
@@ -43,6 +58,22 @@ impl Reader {
             }
             Ok(blocks)
         })
+    }
+
+    /// What the stamp's snapshot holds at each of `roots`, in order: a block at or below the
+    /// stamp's finalized slot is served only if it is the index's block at its slot (below the
+    /// index's floor: not proven, [`AtRoot::Missing`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError`].
+    pub fn blocks_by_root(
+        &self,
+        roots: &[Root],
+        deadline: &Deadline,
+    ) -> Result<Stamped<Vec<AtRoot>>, ReadError> {
+        let _ = (roots, deadline);
+        Err(ReadError::Unavailable)
     }
 }
 

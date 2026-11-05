@@ -405,6 +405,12 @@ impl Envelopes for store::GetBlocksByHeadResponseBody {
     }
 }
 
+impl Envelopes for store::GetBlocksByRootResponseBody {
+    fn envelopes(&self) -> Vec<&Envelope> {
+        self.block.iter().collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

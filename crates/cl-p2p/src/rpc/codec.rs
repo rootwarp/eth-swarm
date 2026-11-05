@@ -556,7 +556,9 @@ pub fn encode_response_chunks<E: EthSpec>(
 /// `InvalidInput` for anything the protocol does not allow.
 fn check_response<E: EthSpec>(protocol: Protocol, chunks: &[ReceivedChunk<E>]) -> io::Result<()> {
     let max = match protocol {
-        Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 => usize::MAX,
+        Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 | Protocol::BlocksByRootV2 => {
+            usize::MAX
+        }
         // No more than `compute_max_request_data_column_sidecars()` (`fulu/p2p-interface.md`
         // L667–670, L746–747).
         Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1 => {

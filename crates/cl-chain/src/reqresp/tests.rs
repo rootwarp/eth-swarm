@@ -1705,4 +1705,141 @@ mod by_range {
             Err(Refusal::Store(_))
         ));
     }
+
+    fn roots_request(roots: &[Root]) -> pb::BlocksByRootRequest {
+        pb::BlocksByRootRequest {
+            roots: roots.iter().map(|r| r.to_vec()).collect(),
+            hello: Some(link().local()),
+        }
+    }
+
+    /// What the server streams for a by-root `request`: the envelopes, then the error code.
+    async fn root_answer(
+        server: &ReqRespServer,
+        request: pb::BlocksByRootRequest,
+    ) -> Result<(Vec<Envelope>, Option<i32>), Status> {
+        let mut stream = server
+            .blocks_by_root(Request::new(request))
+            .await?
+            .into_inner();
+        match stream.next().await {
+            Some(Ok(pb::BlocksByRootResponse {
+                frame: Some(pb::blocks_by_root_response::Frame::Hello(_)),
+            })) => {}
+            other => panic!("not our hello first: {other:?}"),
+        }
+        let (mut envelopes, mut code) = (Vec::new(), None);
+        while let Some(frame) = stream.next().await {
+            let Some(pb::blocks_by_root_response::Frame::Body(body)) = frame?.frame else {
+                panic!("a second hello");
+            };
+            match body.item.and_then(|i| i.result) {
+                Some(pb::response_chunk::Result::Chunk(e)) => envelopes.push(e),
+                Some(pb::response_chunk::Result::Error(e)) => code = Some(e.code),
+                None => panic!("an empty chunk"),
+            }
+        }
+        Ok((envelopes, code))
+    }
+
+    /// `BlocksByRoot` (BeaconBlocksByRoot's first half): every requested block stored above
+    /// the stamp's finalized slot, canonical or not (the fork block at 36), in request order,
+    /// each once, one envelope per block as for a range (root, SSZ, `seq` from 1, its epoch's
+    /// digest). A finalized block (the finalized slot's own included) and an unknown root get
+    /// nothing: cl-store serves the finalized chain.
+    #[tokio::test]
+    async fn blocks_by_root_unfinalized_any_branch() {
+        let (_env_dir, fixture_env, chain, fork) = seeded();
+        let (_dir, served) = server(Some(Arc::clone(&fixture_env)), DEFAULT_MAX_READS);
+        let at = |slot: u64| chain.iter().find(|b| b.0 == slot).unwrap().clone();
+        let asked = [
+            at(40).1,
+            at(10).1,
+            fork.1,
+            [0xee; 32],
+            at(21).1,
+            at(40).1,
+            at(FINALIZED).1,
+        ];
+        let (envelopes, code) = root_answer(&served, roots_request(&asked)).await.unwrap();
+        assert_eq!(code, None);
+        let want = [at(40), fork.clone(), at(21)];
+        assert_eq!(envelopes.len(), want.len());
+        for ((e, b), seq) in envelopes.iter().zip(&want).zip(1..) {
+            assert_eq!(
+                (e.slot, &e.root[..], &e.ssz, e.seq),
+                (b.0, &b.1[..], &b.2, seq)
+            );
+            assert_eq!(e.fork_digest, digest(e.slot).to_vec(), "slot {}", e.slot);
+            assert_eq!(e.payload_type, PayloadType::SignedBeaconBlock as i32);
+        }
+        let read = unfinalized_blocks(
+            fixture_env.as_ref(),
+            &[fork.1, at(30).1, fork.1],
+            Instant::now() + READ_DEADLINE,
+        )
+        .unwrap();
+        let slots: Vec<u64> = read.iter().map(|b| b.slot).collect();
+        assert_eq!(slots, [36, 30]);
+    }
+
+    /// More than 128 roots, or a root that is not 32 bytes, is `ERROR_CODE_INVALID` unread; no
+    /// hello is a contract violation; an env with no stamp is `ERROR_CODE_RESOURCE_UNAVAILABLE`;
+    /// past the read places `ERROR_CODE_OVERLOADED`; a read past its deadline fails the
+    /// stream; with no blocks mounted the stub's `UNIMPLEMENTED` stays.
+    #[tokio::test]
+    async fn blocks_by_root_bounds() {
+        let (_env_dir, fixture_env, chain, _) = seeded();
+        let (_dir, served) = server(Some(Arc::clone(&fixture_env)), DEFAULT_MAX_READS);
+        let head = chain.last().unwrap().1;
+        let (envelopes, code) = root_answer(&served, roots_request(&[head; 129]))
+            .await
+            .unwrap();
+        assert_eq!(
+            (envelopes.len(), code),
+            (0, Some(ErrorCode::Invalid as i32))
+        );
+        let (envelopes, code) = root_answer(&served, roots_request(&[head; 128]))
+            .await
+            .unwrap();
+        assert_eq!(
+            (envelopes.len(), code),
+            (1, None),
+            "128 roots, one block once"
+        );
+        let short = pb::BlocksByRootRequest {
+            roots: vec![vec![1; 31]],
+            ..roots_request(&[])
+        };
+        let (_, code) = root_answer(&served, short).await.unwrap();
+        assert_eq!(code, Some(ErrorCode::Invalid as i32));
+        let no_hello = pb::BlocksByRootRequest {
+            hello: None,
+            ..roots_request(&[head])
+        };
+        let status = root_answer(&served, no_hello).await.unwrap_err();
+        assert_eq!(
+            ipc::error::error_from_status(&status).code,
+            ErrorCode::ContractViolation as i32
+        );
+        let (_empty_dir, empty) = env(&[], None);
+        let (_dir, unstamped) = server(Some(empty), DEFAULT_MAX_READS);
+        let (_, code) = root_answer(&unstamped, roots_request(&[head]))
+            .await
+            .unwrap();
+        assert_eq!(code, Some(ErrorCode::ResourceUnavailable as i32));
+        let (_dir, full) = server(Some(Arc::clone(&fixture_env)), 0);
+        let (_, code) = root_answer(&full, roots_request(&[head])).await.unwrap();
+        assert_eq!(code, Some(ErrorCode::Overloaded as i32));
+        let past = Instant::now() - Duration::from_millis(1);
+        assert!(matches!(
+            unfinalized_blocks(fixture_env.as_ref(), &[head], past),
+            Err(Refusal::Store(_))
+        ));
+        let (_dir, stub) = server(None, DEFAULT_MAX_READS);
+        let status = root_answer(&stub, roots_request(&[head]))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+    }
 }

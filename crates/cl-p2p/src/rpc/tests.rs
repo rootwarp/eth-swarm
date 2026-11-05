@@ -504,7 +504,8 @@ impl RawPeer {
             | ProtocolsEvent::BlocksByRange(e)
             | ProtocolsEvent::DataColumnsByRange(e)
             | ProtocolsEvent::DataColumnsByRoot(e)
-            | ProtocolsEvent::BlocksByHead(e) => e,
+            | ProtocolsEvent::BlocksByHead(e)
+            | ProtocolsEvent::BlocksByRoot(e) => e,
         };
         match event {
             DuplexEvent::Inbound(Event::Message {
@@ -1650,7 +1651,8 @@ async fn unadvertised_protocols_fail_negotiation() {
     for protocol in [
         "/eth2/beacon_chain/req/status/1/ssz_snappy",
         "/eth2/beacon_chain/req/metadata/2/ssz_snappy",
-        "/eth2/beacon_chain/req/beacon_blocks_by_root/2/ssz_snappy",
+        // The deprecated v1: v2 is served.
+        "/eth2/beacon_chain/req/beacon_blocks_by_root/1/ssz_snappy",
         "/eth2/beacon_chain/req/data_column_sidecars_by_range/2/ssz_snappy",
         "/eth2/beacon_chain/req/execution_payload_envelopes_by_range/1/ssz_snappy",
     ] {
@@ -1966,7 +1968,7 @@ async fn unsupported_counted() {
     // `tracing` caches a callsite's interest process-wide, and another test may register the
     // listener's callsite while this one sets its subscriber. A refused proposal the count
     // ignores registers it first, then the cache is rebuilt with this subscriber in it.
-    let mut warm_up = bytes_peer("/eth2/beacon_chain/req/beacon_blocks_by_root/2/ssz_snappy");
+    let mut warm_up = bytes_peer("/eth2/beacon_chain/req/beacon_blocks_by_root/1/ssz_snappy");
     bytes_connect(&mut warm_up, ours.addr.clone()).await;
     let id = warm_up
         .behaviour_mut()

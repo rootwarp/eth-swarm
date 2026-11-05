@@ -102,8 +102,8 @@ use p2p::{
     request_payload_envelopes_by_range_response, request_payload_envelopes_by_root_response,
 };
 use store::{
-    get_blocks_by_head_response, get_blocks_by_range_response, get_data_columns_by_range_response,
-    get_data_columns_response,
+    get_blocks_by_head_response, get_blocks_by_range_response, get_blocks_by_root_response,
+    get_data_columns_by_range_response, get_data_columns_response,
 };
 use verify::{
     builder_key_feed_request, builder_key_feed_response, pubkey_feed_request, pubkey_feed_response,
@@ -140,6 +140,7 @@ framed!(store:
     GetBlocksByRangeResponse / get_blocks_by_range_response / GetBlocksByRangeResponseBody,
     GetDataColumnsByRangeResponse / get_data_columns_by_range_response / GetDataColumnsByRangeResponseBody,
     GetBlocksByHeadResponse / get_blocks_by_head_response / GetBlocksByHeadResponseBody,
+    GetBlocksByRootResponse / get_blocks_by_root_response / GetBlocksByRootResponseBody,
 );
 framed!(p2p:
     RequestBlocksByRangeResponse / request_blocks_by_range_response / RequestBlocksByRangeResponseBody,
@@ -180,6 +181,7 @@ hello_field!(store:
     GetBlocksByRangeRequest,
     GetDataColumnsByRangeRequest,
     GetBlocksByHeadRequest,
+    GetBlocksByRootRequest,
 );
 hello_field!(p2p:
     RequestBlocksByRangeRequest,

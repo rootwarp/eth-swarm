@@ -13,6 +13,8 @@
 //!   [`blocks::BlockSource`]: cl-store's finalized blocks, then cl-chain's.
 //! - [`blocks_head`]: BeaconBlocksByHead v1 answers ([`blocks_head::ByHeadResponder`]) over the
 //!   same source: cl-store's parent walk.
+//! - [`blocks_root`]: BeaconBlocksByRoot v2 answers ([`blocks_root::ByRootResponder`]) over the
+//!   same source: cl-chain's unfinalized blocks, then cl-store's finalized ones.
 //! - [`blocks_ipc`]: that source in the service ([`blocks_ipc::IpcBlocks`]): store.v1 and
 //!   chain.v1 clients held to the contract.
 //! - [`chain_status`]: our Status from cl-chain's `ReqRespService/GetStatus`
@@ -22,8 +24,8 @@
 //!   `ReqRespService` ([`columns::ChainColumns`]).
 //! - [`outbound`]: one exchange on a swarm, for the m2a session.
 //! - [`inbound`]: the probe swarm's behaviour, answering and initiating Status, MetaData, Ping
-//!   and Goodbye, serving the custody columns, and BlocksByRange and BlocksByHead through
-//!   responders ([`inbound::Control`]).
+//!   and Goodbye, serving the custody columns, and BlocksByRange, BlocksByHead and BlocksByRoot
+//!   through responders ([`inbound::Control`]).
 //! - [`limits`]: the per-peer rate limit, the outbound semaphore, the bounded IGNORE queues and
 //!   the streamed answers' global cap and per-peer byte budget.
 //! - [`metrics`]: `rpc_timeouts_total`, the Goodbye counters, `p2p_status_valid_peers` and the
@@ -47,6 +49,7 @@ pub mod answer_bucket;
 pub mod blocks;
 pub mod blocks_head;
 pub mod blocks_ipc;
+pub mod blocks_root;
 pub mod chain_status;
 pub mod codec;
 pub mod columns;

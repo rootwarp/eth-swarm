@@ -43,9 +43,9 @@
 //! under a counting allocator.
 
 use crate::rpc::messages::{
-    BlocksByHeadV1Request, BlocksByRangeV2Request, DataColumnsByRangeV1Request,
-    DataColumnsByRootV1Request, ErrorMessage, ForkDigest, Goodbye, MetaDataV3, Ping, StatusV2,
-    MAX_ERROR_MESSAGE_LEN,
+    BlocksByHeadV1Request, BlocksByRangeV2Request, BlocksByRootV2Request,
+    DataColumnsByRangeV1Request, DataColumnsByRootV1Request, ErrorMessage, ForkDigest, Goodbye,
+    MetaDataV3, Ping, StatusV2, MAX_ERROR_MESSAGE_LEN,
 };
 use crate::rpc::protocols::{Protocol, Request, Response, ResponseChunk, ResultCode, SszBounds};
 use consensus_types::caps::{NetworkCaps, ObjectKind, MAX_PAYLOAD_SIZE};
@@ -657,6 +657,9 @@ pub fn decode_request(protocol: Protocol, buf: &[u8]) -> Result<Request, CodecEr
         Protocol::BlocksByHeadV1 => {
             Request::BlocksByHead(BlocksByHeadV1Request::from_ssz_bytes(&ssz)?)
         }
+        Protocol::BlocksByRootV2 => {
+            Request::BlocksByRoot(BlocksByRootV2Request::from_ssz_bytes(&ssz)?)
+        }
     })
 }
 
@@ -842,7 +845,7 @@ pub fn decode_response_chunk<E: EthSpec>(
         Protocol::StatusV2 => Response::Status(StatusV2::from_ssz_bytes(&ssz)?),
         Protocol::MetaDataV3 => Response::MetaData(MetaDataV3::from_ssz_bytes(&ssz)?),
         Protocol::PingV1 => Response::Ping(Ping::from_ssz_bytes(&ssz)?),
-        Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 => {
+        Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 | Protocol::BlocksByRootV2 => {
             let fork = head.fork.ok_or(CodecError::MissingContext(protocol))?;
             Response::Block(Box::new(
                 forked::SignedBeaconBlock::from_ssz_bytes_for_fork(&ssz, fork)?,

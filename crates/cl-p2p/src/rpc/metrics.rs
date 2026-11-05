@@ -162,6 +162,7 @@ pub fn protocol_label(protocol: Protocol) -> &'static str {
         Protocol::DataColumnsByRangeV1 => "data_column_sidecars_by_range",
         Protocol::DataColumnsByRootV1 => "data_column_sidecars_by_root",
         Protocol::BlocksByHeadV1 => "beacon_blocks_by_head",
+        Protocol::BlocksByRootV2 => "beacon_blocks_by_root",
     }
 }
 
