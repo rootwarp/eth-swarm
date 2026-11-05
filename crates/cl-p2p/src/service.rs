@@ -14,8 +14,10 @@
 //! - **cl-store**, if `store_socket` is set (its server's UID checked, under the same wait):
 //!   the finalized blocks from `GetBlocksByRange` and the split point from `GetChainHead`.
 //!   With cl-chain's `BlocksByRange` it is the source of our BeaconBlocksByRange v2 answers
-//!   ([`IpcBlocks`], [`crate::rpc::blocks`]); without it every such request is
-//!   `3: ResourceUnavailable`.
+//!   ([`IpcBlocks`], [`crate::rpc::blocks`]), and alone, through `GetBlocksByHead`, of our
+//!   BeaconBlocksByHead v1 answers ([`crate::rpc::blocks_head`]); without it every
+//!   BlocksByRange request is `3: ResourceUnavailable` and every BlocksByHead one an empty
+//!   success.
 //! - **The swarm** ([`swarm::serving_swarm`]): the ignore-all gossipsub on the topic list
 //!   (`gossip_topics`) and the custody column subnets, under the fork digests that cl-chain's
 //!   subscriptions name ([`digests::DigestTopics`]): a superseded digest's topics leave two

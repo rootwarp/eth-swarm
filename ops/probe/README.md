@@ -91,7 +91,8 @@ cl-p2p's UID can call its six methods: `ReqRespService/GetStatus`, `BlocksByRang
 `DataColumnsByRange`, `DataColumnsByRoot`, `GossipService/WatchSubscriptions` and
 `GossipService/Validate`. `BlocksByRange` serves the blocks of its own env above cl-store's
 finalized slot; probe mode stores only its anchor block, and the probe's cl-p2p sets no
-`store_socket`, so it answers BeaconBlocksByRange `3: ResourceUnavailable`. Validate
+`store_socket`, so it answers BeaconBlocksByRange `3: ResourceUnavailable` and
+BeaconBlocksByHead with an empty success. Validate
 is the column hand-off: cl-p2p sends the column sidecars that its gossipsub captured, and
 cl-chain stores its custody columns from them. It drops a sidecar whose fork digest is not the
 digest of its slot's epoch without decoding it, decodes the rest by the fork of their slot, and

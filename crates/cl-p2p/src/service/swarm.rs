@@ -61,8 +61,9 @@ pub struct Sources {
     /// `3: ResourceUnavailable`.
     pub columns: Option<Arc<dyn ColumnSource>>,
     /// The blocks' source (cl-store and cl-chain, [`crate::rpc::blocks_ipc::IpcBlocks`]),
-    /// served by a [`ByRangeResponder`] whose floor is [`Self::status`]'s; `None` answers every
-    /// BlocksByRange request `3: ResourceUnavailable`.
+    /// served by a [`ByRangeResponder`] whose floor is [`Self::status`]'s and by its
+    /// [`ByRangeResponder::head_responder`]; `None` answers every BlocksByRange request
+    /// `3: ResourceUnavailable` and every BlocksByHead request an empty success.
     pub blocks: Option<Arc<dyn BlockSource>>,
 }
 
@@ -74,33 +75,32 @@ pub struct Gossip {
     pub tap: Option<CaptureTap>,
 }
 
-/// Stub ([6.42] B2).
+/// The start slot of the block serve window (`network_config::window`, the Gloas formula from
+/// `GLOAS_FORK_EPOCH` on) at `now_ms` on the network of `config` and `genesis_time`; `None`
+/// before genesis or for a config without the window's values.
 pub(crate) fn window_start_at<E: EthSpec>(
-    _config: &ChainConfig,
-    _genesis_time: u64,
-    _now_ms: u128,
+    config: &ChainConfig,
+    genesis_time: u64,
+    now_ms: u128,
 ) -> Option<u64> {
-    None
+    let (slot_ms, per_epoch) = (config.slot_duration_ms(), E::slots_per_epoch());
+    let epoch = current_epoch(genesis_time, slot_ms, per_epoch, now_ms).ok()?;
+    let start = block_serve_window(config, epoch).ok()?;
+    Some(start.saturating_mul(per_epoch))
 }
 
-/// The start slot of the block serve window by the wall clock (`network_config::window`), for
-/// the responder's floor check; `None` before genesis or for a config without the window's
-/// values.
+/// [`window_start_at`] by the wall clock, for both block responders: the range responder's
+/// floor check and the head responder's refusal and stop (#230).
 fn window_start<E: EthSpec>(config: &ChainConfig, genesis: &Genesis) -> WindowStart {
     let (config, genesis_time) = (config.clone(), genesis.genesis_time);
-    Arc::new(move || {
-        let (slot_ms, per_epoch) = (config.slot_duration_ms(), E::slots_per_epoch());
-        let now = ipc::hello::system_ms();
-        let epoch = current_epoch(genesis_time, slot_ms, per_epoch, now).ok()?;
-        let start = block_serve_window(&config, epoch).ok()?;
-        Some(start.saturating_mul(per_epoch))
-    })
+    Arc::new(move || window_start_at::<E>(&config, genesis_time, ipc::hello::system_ms()))
 }
 
 /// The probe swarm of the network of `config` and `genesis` under the preset `E`, with the
 /// node key `key`, answering from `sources` (BeaconBlocksByRange through a [`ByRangeResponder`]
-/// over `sources.blocks`, at most `plan.limits.max_block_lookups` answers holding IPC calls), with the ignore-all gossipsub on `gossip`'s topics
-/// if given (`plan.gossip` is not read). Every column answer is read and served under the
+/// over `sources.blocks`, BeaconBlocksByHead through its head responder, at most
+/// `plan.limits.max_block_lookups` answers of either holding IPC calls), with the ignore-all
+/// gossipsub on `gossip`'s topics if given (`plan.gossip` is not read). Every column answer is read and served under the
 /// network's caps ([`crate::rpc::network_context_table`]). Its metrics (`p2p_peers` excepted,
 /// which the owner of the swarm keeps: [`crate::transport::PeerMetrics`]) go to `registry`:
 /// the transport's, req/resp's (`p2p_goodbye_*`) and gossipsub's own (`topic_msg_*`).
@@ -152,7 +152,9 @@ pub fn serving_swarm<E: EthSpec>(
     if let Some(source) = sources.blocks {
         let responder = ByRangeResponder::new(source, sources.status, max_lookups, Some(metrics))
             .with_window(window_start::<E>(config, genesis));
-        control = control.with_blocks_responder(Arc::new(responder));
+        control = control
+            .with_head_responder(Arc::new(responder.head_responder()))
+            .with_blocks_responder(Arc::new(responder));
     }
     match gossip {
         None => build_swarm(key, &cfg, control).map_err(|e| e.to_string()),

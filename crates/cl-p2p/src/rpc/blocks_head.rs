@@ -1,10 +1,10 @@
 //! `BeaconBlocksByHead` v1 answers (#230; `fulu/p2p-interface.md` L796–863):
 //! [`ByHeadResponder`], built from the range responder
-//! ([`super::blocks::ByRangeResponder::head_responder`]) over the same [`BlockSource`].
+//! ([`super::blocks::ByRangeResponder::head_responder`]) over the same [`BlockSource`], and
+//! [`NoBlocks`] for a node with no block source.
 //!
-//! Nothing dispatches it yet: [`super::inbound::Control`] does not register BeaconBlocksByHead,
-//! so a peer's request still fails negotiation ([`super::unsupported`]). It is a [`Responder`]
-//! for a streamed answer ([`super::responder`]), which books
+//! [`super::inbound::Control`] dispatches it ([`super::inbound::Control::with_head_responder`]).
+//! It is a [`Responder`] for a streamed answer ([`super::responder`]), which books
 //! `min(count, MAX_REQUEST_BLOCKS_DENEB)` tokens ([`Request::max_response_chunks`]: a larger
 //! `count` is served as 128, never `1`, L820–821; Ezra's ruling of 2026-11-01), runs it from the
 //! peer's first token, and never runs it for `count` 0, an empty success.
@@ -17,9 +17,11 @@
 //!    `network_config::window`, the Gloas formula from `GLOAS_FORK_EPOCH` on). When it is
 //!    unknown (before genesis, or a config without its values) no window applies: every block
 //!    held is served, and that is logged once.
-//! 2. **A lookup slot** from the range responder's pool: at most
+//! 2. **A lookup slot** from the range responder's pool, for each store read: at most
 //!    [`super::limits::RpcLimits::max_block_lookups`] answers of either protocol hold IPC calls
-//!    at once; one past them waits up to [`BLOCK_LOOKUP_TIMEOUT`], then is `2` (`busy`).
+//!    at once; one past them waits up to [`BLOCK_LOOKUP_TIMEOUT`], then is `2` (`busy`) before
+//!    the first chunk and a clean end after it. The slot goes back while the sink waits on the
+//!    peer, so a slow reader holds none (only its store stream, which cl-store bounds).
 //! 3. **One store walk** ([`BlockSource::by_head`], cl-store's `GetBlocksByHead`) for finalized
 //!    and unfinalized blocks alike: a walk addressed by a root asks no fork choice question, so
 //!    it is never split at the finalized slot. A root the store does not hold is a success of
@@ -28,11 +30,12 @@
 //!    parent of the block before, at a lower slot (L819–820), each decoded by the fork of its
 //!    slot to a block of that slot. A break is `2` before the first chunk, a clean end after it.
 //! 5. **The window again**: the block at `beacon_root` below the window's start is
-//!    `3: ResourceUnavailable` (L836–838; ruling), and a later ancestor below it ends the answer
-//!    with success before it.
+//!    `3: ResourceUnavailable` (L836–838; ruling; counted as a failure of kind `window`), and a
+//!    later ancestor below it ends the answer with success before it.
 //! 6. **The count**: the walk stops at `min(count, 128)` blocks whatever the store sends and
-//!    drops the store's stream, which cancels the call. Blocks go out one at a time as the sink
-//!    takes them, never collected: a slow reader holds the store back.
+//!    drops the store's stream, which cancels the call, before its last block goes out. Blocks
+//!    go out one at a time as the sink takes them, never collected: a slow reader holds the
+//!    store back.
 //!
 //! A failed lookup ends the answer with its code before the first chunk (cl-store's
 //! `UNAVAILABLE` is `3`, any other failure `2`), else cleanly at the last whole chunk, counted in
@@ -48,7 +51,7 @@ use p2p_wire::rpc::messages::BlocksByHeadV1Request;
 use p2p_wire::rpc::protocols::{Request, Response, ResultCode, MAX_REQUEST_BLOCKS_DENEB};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Serves BeaconBlocksByHead v1 from a [`BlockSource`] (see the module docs).
 #[derive(Clone)]
@@ -99,6 +102,15 @@ impl ByHeadResponder {
         failed
     }
 
+    /// One of the shared lookup slots, waited for up to [`BLOCK_LOOKUP_TIMEOUT`].
+    async fn lookup(&self) -> Result<OwnedSemaphorePermit, Failed> {
+        let slot = Arc::clone(&self.lookups).acquire_owned();
+        match tokio::time::timeout(BLOCK_LOOKUP_TIMEOUT, slot).await {
+            Ok(Ok(slot)) => Ok(slot),
+            _ => Err(Failed::server_error("busy", "no lookup slot in time")),
+        }
+    }
+
     /// The answer to `head` into `out` (see the module docs).
     async fn answer<E: EthSpec>(
         &self,
@@ -107,18 +119,24 @@ impl ByHeadResponder {
     ) -> Result<(), Failed> {
         let count = head.count.min(MAX_REQUEST_BLOCKS_DENEB);
         let floor = self.window_start();
-        let slot = Arc::clone(&self.lookups).acquire_owned();
-        let Ok(Ok(_slot)) = tokio::time::timeout(BLOCK_LOOKUP_TIMEOUT, slot).await else {
-            return Err(Failed::server_error("busy", "no lookup slot in time"));
-        };
+        let mut slot = Some(self.lookup().await?);
         let opened = self.source.by_head(head.beacon_root.0, count).await;
-        let mut blocks = opened.map_err(|f| self.failed(f))?;
+        let mut walk = Some(opened.map_err(|f| self.failed(f))?);
         // The root the next block must have, and the slot it must be below.
         let (mut want, mut above) = (head.beacon_root.0, None);
         while (out.sent as u64) < count {
+            let Some(blocks) = walk.as_mut() else {
+                break;
+            };
+            // A slot for each read, none while the sink below waits on the peer.
+            let held = match slot.take() {
+                Some(held) => held,
+                None => self.lookup().await?,
+            };
             let Some(next) = blocks.next().await else {
                 break;
             };
+            drop(held);
             let block = next.map_err(|f| self.failed(f))?;
             if block.root != want || above.is_some_and(|slot| block.slot >= slot) {
                 let why = format!("slot {}: not the block the walk asked for", block.slot);
@@ -128,13 +146,17 @@ impl ByHeadResponder {
                 if out.sent > 0 {
                     return Ok(());
                 }
-                return Err(Failed {
+                return Err(self.failed(Failed {
                     code: ResultCode::ResourceUnavailable,
                     kind: "window",
                     why: format!("slot {} below the serve window", block.slot),
-                });
+                }));
             }
             let (decoded, parent) = decode::<E>(&block).map_err(|f| self.failed(f))?;
+            if out.sent as u64 + 1 == count {
+                // The walk is read: its stream goes before the last block waits on the sink.
+                walk = None;
+            }
             if out
                 .sink
                 .send(Response::Block(Box::new(decoded)))
@@ -147,6 +169,16 @@ impl ByHeadResponder {
             (want, above) = (parent, Some(block.slot));
         }
         Ok(())
+    }
+}
+
+/// The BeaconBlocksByHead responder of a node with no block source: every request is an empty
+/// success at the peer's token, since we hold nothing we can reach.
+pub(crate) struct NoBlocks;
+
+impl<E: EthSpec> Responder<E> for NoBlocks {
+    fn serve(&self, _: PeerId, _: Request, _: ChunkSink<E>) -> Serving {
+        Box::pin(async {})
     }
 }
 
@@ -427,9 +459,15 @@ mod tests {
         closed(&fake).await;
         assert_eq!(range.free_lookups(), LOOKUPS);
 
-        let (windowed, _) = responders(&fake, Some(24), &metrics());
+        let metrics = metrics();
+        let (windowed, _) = responders(&fake, Some(24), &metrics);
         let (chunks, _) = serve(&windowed, head(fixture::at(23).root, 4)).await;
         assert_eq!(only_error(&chunks), Some(ResultCode::ResourceUnavailable));
+        assert_eq!(
+            metrics.block_lookup_failures("store", "window"),
+            1,
+            "counted"
+        );
         let (chunks, _) = serve(&windowed, head(fixture::at(24).root, 4)).await;
         assert_eq!(
             walked(&chunks),

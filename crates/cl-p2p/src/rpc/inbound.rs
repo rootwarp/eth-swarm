@@ -1,12 +1,13 @@
 //! The control protocols, both ways: Status v2, MetaData v3, Ping v1 and Goodbye v1, plus
 //! `BeaconBlocksByRange` v2, served by a [`Responder`] if one is given
 //! ([`Control::with_blocks_responder`]) and else answered `3: ResourceUnavailable` (the probe
-//! stores no blocks), and the custody columns served by `DataColumnSidecarsByRange` v1 and
-//! `DataColumnSidecarsByRoot` v1.
+//! stores no blocks), `BeaconBlocksByHead` v1, served by a [`Responder`] if one is given
+//! ([`Control::with_head_responder`]) and else answered an empty success, and the custody
+//! columns served by `DataColumnSidecarsByRange` v1 and `DataColumnSidecarsByRoot` v1.
 //!
 //! [`Control`] is the probe swarm's req/resp behaviour. It holds one [`Duplex`] per protocol
 //! ([`Protocols`], see [`crate::rpc`] for why one each): an inbound-only and an outbound-only
-//! `request_response` behaviour, so these seven are what multistream-select offers and any other
+//! `request_response` behaviour, so these eight are what multistream-select offers and any other
 //! protocol fails negotiation (`phase0/p2p-interface.md` L187–190), among them the MUST-support
 //! ones the probe leaves out ([`super::unsupported`]). It answers every inbound
 //! request itself and reports what it learned as [`ControlEvent`]s.
@@ -54,8 +55,17 @@
 //!   The service's responder is [`super::blocks::ByRangeResponder`] (#146): cl-store's
 //!   finalized blocks, then cl-chain's above them, one chain, each block with its own epoch's
 //!   digest (see [`super::blocks`]).
+//! - **BeaconBlocksByHead** (`fulu/p2p-interface.md` L796–863, #230): never invalid: a `count`
+//!   above `MAX_REQUEST_BLOCKS_DENEB` is served as 128 and books 128 tokens of its own bucket
+//!   (L820–821; Ezra's ruling of 2026-11-01). The service's responder is
+//!   [`super::blocks_head::ByHeadResponder`]: the ancestry of `beacon_root`, newest first, from
+//!   one cl-store walk (see [`super::blocks_head`]). With none (no block source) it is
+//!   [`NoBlocks`]: an empty success at the peer's token, since we hold nothing we can reach.
+//!   Either way the answer is streamed, as below.
+//!
 //!   With a [`Responder`] the answer is streamed ([`super::responder`]): the request is checked
-//!   first, as above, before the responder runs or anything is read or booked (never clamped);
+//!   first, as above, before the responder runs or anything is read or booked (a BlocksByRange
+//!   `count` is never clamped);
 //!   then the responder produces its chunks on its own task, started once the peer's first
 //!   booked token is due, as the stream's writer sends them (one asking for no block is not
 //!   served: its empty answer goes out at that token). The writer sends `2: ServerError` if no
@@ -247,6 +257,7 @@
 //! until then it holds one of the protocol's [`MAX_CONCURRENT_REQUESTS`] stream slots on its
 //! connection. Every passed deadline counts in `rpc_timeouts_total{kind}`.
 
+use super::blocks_head::NoBlocks;
 use super::codec::{
     Answer, Deadline, Deadlines, InboundCodec, ReadError, ReceivedChunk, RpcCodec, RpcRequest,
 };
@@ -742,6 +753,7 @@ pub struct Protocols<E: EthSpec> {
     pub blocks_by_range: Duplex<E>,
     pub data_columns_by_range: Duplex<E>,
     pub data_columns_by_root: Duplex<E>,
+    pub blocks_by_head: Duplex<E>,
 }
 
 impl<E: EthSpec> Protocols<E> {
@@ -766,15 +778,11 @@ impl<E: EthSpec> Protocols<E> {
             blocks_by_range: Duplex::new(Protocol::BlocksByRangeV2, &codec),
             data_columns_by_range: Duplex::new(Protocol::DataColumnsByRangeV1, &codec),
             data_columns_by_root: Duplex::new(Protocol::DataColumnsByRootV1, &codec),
+            blocks_by_head: Duplex::new(Protocol::BlocksByHeadV1, &codec),
         }
     }
 
     /// The behaviour of `protocol`.
-    ///
-    /// # Panics
-    ///
-    /// On `BeaconBlocksByHead`, which has no behaviour until it is served ([6.42]): [`Control`]
-    /// sends no request of it, and a peer's fails negotiation ([`super::unsupported`]).
     pub fn of(&mut self, protocol: Protocol) -> &mut Duplex<E> {
         match protocol {
             Protocol::StatusV2 => &mut self.status,
@@ -784,7 +792,7 @@ impl<E: EthSpec> Protocols<E> {
             Protocol::BlocksByRangeV2 => &mut self.blocks_by_range,
             Protocol::DataColumnsByRangeV1 => &mut self.data_columns_by_range,
             Protocol::DataColumnsByRootV1 => &mut self.data_columns_by_root,
-            Protocol::BlocksByHeadV1 => unreachable!("BeaconBlocksByHead is not registered"),
+            Protocol::BlocksByHeadV1 => &mut self.blocks_by_head,
         }
     }
 }
@@ -1029,6 +1037,9 @@ pub struct Control<E: EthSpec> {
     queue_timer: Option<Pin<Box<Sleep>>>,
     /// Serves BlocksByRange with streamed answers; `None` answers `3: ResourceUnavailable`.
     blocks_responder: Option<Arc<dyn Responder<E>>>,
+    /// Serves BlocksByHead with streamed answers: [`NoBlocks`]' empty success unless
+    /// [`Self::with_head_responder`] gave one.
+    head_responder: Arc<dyn Responder<E>>,
     /// The streamed answers' slots ([`RpcLimits::max_inbound_streams`]), over every peer.
     streams: Arc<Semaphore>,
 }
@@ -1137,6 +1148,7 @@ impl<E: EthSpec> Control<E> {
             column_queue: VecDeque::new(),
             queue_timer: None,
             blocks_responder: None,
+            head_responder: Arc::new(NoBlocks),
             streams,
         }
     }
@@ -1149,20 +1161,24 @@ impl<E: EthSpec> Control<E> {
         self
     }
 
-    /// Stub ([6.42] B2): not served yet.
+    /// The same behaviour, serving BlocksByHead with `responder`'s streamed answers (see the
+    /// module docs) instead of an empty success.
     #[must_use]
-    pub fn with_head_responder(self, _responder: Arc<dyn Responder<E>>) -> Self {
+    pub fn with_head_responder(mut self, responder: Arc<dyn Responder<E>>) -> Self {
+        self.head_responder = responder;
         self
     }
 
-    /// Stub ([6.42] B2): not served yet.
+    /// Our answer to `peer`'s BlocksByHead `request` (see the module docs): the head
+    /// responder's streamed answer, or [`NoBlocks`]' empty one at the peer's token.
     pub(super) fn head_answer(
         &mut self,
-        _peer: PeerId,
-        _protocol: Protocol,
-        _request: Request,
+        peer: PeerId,
+        protocol: Protocol,
+        request: Request,
     ) -> Option<Answer<E>> {
-        None
+        let responder = Arc::clone(&self.head_responder);
+        self.answer_streamed(peer, protocol, request, &responder)
     }
 
     /// What our Status answers hold now ([`StatusBacklog`]).
@@ -1743,6 +1759,8 @@ impl<E: EthSpec> Control<E> {
     ) -> Option<Answer<E>> {
         let invalid = match &request {
             Request::BlocksByRange(range) => out_of_bounds(range),
+            // Clamped, never invalid (`fulu/p2p-interface.md` L820–821; Ezra, 2026-11-01).
+            Request::BlocksByHead(_) => None,
             other => column_request_error(other),
         };
         if let Some(why) = invalid {
@@ -1891,9 +1909,10 @@ impl<E: EthSpec> Control<E> {
             request @ (Request::DataColumnsByRange(_) | Request::DataColumnsByRoot(_)) => {
                 self.serve_columns(peer, protocol, channel, request);
             }
-            // Unregistered until it is served ([6.42]), so never read: dropped unanswered.
-            Request::BlocksByHead(_) => {
-                tracing::debug!(%peer, "a BlocksByHead request: not served");
+            request @ Request::BlocksByHead(_) => {
+                if let Some(answer) = self.head_answer(peer, protocol, request) {
+                    self.send_answer(protocol, channel, answer);
+                }
             }
         }
     }
@@ -2499,6 +2518,7 @@ impl<E: EthSpec> Control<E> {
             ProtocolsEvent::BlocksByRange(e) => (Protocol::BlocksByRangeV2, e),
             ProtocolsEvent::DataColumnsByRange(e) => (Protocol::DataColumnsByRangeV1, e),
             ProtocolsEvent::DataColumnsByRoot(e) => (Protocol::DataColumnsByRootV1, e),
+            ProtocolsEvent::BlocksByHead(e) => (Protocol::BlocksByHeadV1, e),
         };
         match event {
             DuplexEvent::Inbound(Event::Message {

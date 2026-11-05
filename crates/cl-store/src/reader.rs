@@ -17,8 +17,9 @@
 //! it walks and once more before its data is returned, with the transaction open, so a slow read
 //! cannot pin MVCC pages past it. [`ParentWalk`] (`GetBlocksByHead`) is stamped once, by its
 //! first transaction, then reads each further block in a short transaction of its own: the
-//! walk's deadline bounds when a step may start, and each step's transaction ends within its
-//! step timeout of the step's start ([`ParentWalk::with_step_timeout`]).
+//! walk's deadline bounds when a step may start, and each step's transaction is checked against
+//! its step timeout from the step's start ([`ParentWalk::with_step_timeout`]), the first step's
+//! against the call's deadline if given ([`ParentWalk::with_first_deadline`]).
 //!
 //! A read transaction that fails to begin with `MDBX_WANNA_RECOVERY` or `MDBX_PANIC` is
 //! `Unavailable`, like any env that cannot be read now, and marks the reader broken: the env
@@ -384,8 +385,11 @@ impl Snapshot<'_> {
 pub struct ParentWalk {
     reader: Arc<Reader>,
     deadline: Deadline,
-    /// Each step's read transaction ends this long after the step started, if set.
+    /// Each step's read transaction is checked against this long after the step started, if
+    /// set.
     step: Option<Duration>,
+    /// The first step's deadline instead, if set: the call's.
+    first: Option<Deadline>,
     next: Option<Root>,
     left: u64,
     /// The first step's stamp.
@@ -402,6 +406,7 @@ impl ParentWalk {
             reader,
             deadline,
             step: None,
+            first: None,
             next: Some(root),
             left: count,
             stamp: None,
@@ -410,17 +415,20 @@ impl ParentWalk {
         }
     }
 
-    /// The same walk, each step's read transaction ended within `timeout` of the step's start,
-    /// however far off the walk's deadline is.
+    /// The same walk, each step's read transaction checked against `timeout` from the step's
+    /// start, however far off the walk's deadline is.
     #[must_use]
     pub fn with_step_timeout(mut self, timeout: Duration) -> Self {
         self.step = Some(timeout);
         self
     }
 
-    /// Stub ([6.42] B2).
+    /// The same walk, its first step's read transaction checked against `first` (the call's
+    /// deadline, taken when the call came in) instead of a step timeout from the step's start:
+    /// time queued before the first step counts.
     #[must_use]
-    pub fn with_first_deadline(self, _first: Deadline) -> Self {
+    pub fn with_first_deadline(mut self, first: Deadline) -> Self {
+        self.first = Some(first);
         self
     }
 
@@ -440,9 +448,10 @@ impl ParentWalk {
             };
             Ok(Some((slot, parent, ssz.into_owned(), finalized)))
         };
-        let deadline = match self.step {
-            Some(timeout) => self.deadline.within(timeout),
-            None => self.deadline.clone(),
+        let deadline = match (self.first.take(), self.step) {
+            (Some(first), _) => first,
+            (None, Some(timeout)) => self.deadline.within(timeout),
+            (None, None) => self.deadline.clone(),
         };
         let Stamped { stamp, value } = match self.stamp {
             None => self.reader.read(&deadline, read)?,
