@@ -618,7 +618,13 @@ mod tests {
         for _ in 0..3 {
             assert!(matches!(stream.next().await, Some(Queued::Chunk { .. })));
         }
-        assert_eq!(range.free_lookups(), LOOKUPS - 1, "a lookup slot held");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            range.free_lookups(),
+            LOOKUPS,
+            "none held while the sink waits (#326)"
+        );
+        assert_eq!(fake.open(), 1, "the store stream open");
         drop(stream);
         closed(&fake).await;
         let read = fake.walk_reads();
@@ -628,6 +634,52 @@ mod tests {
         assert_eq!(range.free_lookups(), LOOKUPS);
         assert_eq!(slots.available_permits(), 1, "the stream slot is back");
         assert_eq!(bytes.available(), ROOMY, "the peer's bytes are back");
+    }
+
+    /// #230 (Cole NIT 1, Vera N2 of part B1): an answer holds its lookup slot while it reads the
+    /// store, never while its sink waits on the peer. More stalled ByHead requesters than there
+    /// are slots (their answers read until the stream's queue is full, then wait) hold none, so
+    /// a range answer gets one at once and is served whole, never `2` (busy) after a slot wait;
+    /// their store streams stay open until their answers go.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_stalled_readers_free_lookup_slots() {
+        let fake = Fake::new();
+        let (responder, range) = responders(&fake, None, &metrics());
+        let stalled: Vec<_> = (0..LOOKUPS + 4)
+            .map(|_| testing::start(&responder, head(fixture::at(40).root, 128), ROOMY))
+            .collect();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let read = fake.walk_reads();
+        assert!(
+            read >= stalled.len() * STREAM_QUEUE_LEN,
+            "each queue full: {read}"
+        );
+        assert_eq!(
+            range.free_lookups(),
+            LOOKUPS,
+            "no slot held by a stalled answer"
+        );
+        assert_eq!(fake.open(), stalled.len(), "every store stream open");
+
+        let ranges: Arc<dyn Responder<E>> = Arc::new(range.clone());
+        let start = Instant::now();
+        let (mut answer, _, _) = testing::start(&ranges, by_range(1, 4), ROOMY);
+        let mut sent = 0;
+        loop {
+            match answer.next().await {
+                Some(Queued::Chunk { last: false, .. }) => sent += 1,
+                Some(Queued::Done) => break,
+                other => panic!("not a block: {other:?}"),
+            }
+        }
+        assert_eq!(sent, fixture::canonical(1, 5).len(), "served whole");
+        assert!(
+            Instant::now() - start < BLOCK_LOOKUP_TIMEOUT,
+            "no wait for a slot"
+        );
+        drop(stalled);
+        closed(&fake).await;
+        assert_eq!(range.free_lookups(), LOOKUPS);
     }
 
     /// #230 D5: ByHead answers take their lookup slot from the range responder's pool: with

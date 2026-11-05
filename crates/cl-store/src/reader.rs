@@ -418,6 +418,12 @@ impl ParentWalk {
         self
     }
 
+    /// Stub ([6.42] B2).
+    #[must_use]
+    pub fn with_first_deadline(self, _first: Deadline) -> Self {
+        self
+    }
+
     /// The block at `root`, if stored, and where the walk goes on.
     fn step(&mut self, root: Root) -> Result<Option<Stamped<Block>>, ReadError> {
         let decided = self.finalized.is_some();
@@ -1249,6 +1255,53 @@ mod tests {
         };
         assert_eq!(walk(2), [Err(ReadError::DeadlineExceeded)]);
         assert_eq!(walk(3), [Ok(4), Ok(3), Ok(2), Ok(1)]);
+    }
+
+    /// #230 (Cole NIT 3 of part A): the first step's read transaction is checked against the
+    /// call's deadline, taken when the call came in, not the step timeout from the step's
+    /// start: time the call spent queued before its first step counts. A walk whose call came
+    /// in 2.5 s before its first step, under a 2 s call timeout, fails that step
+    /// `DeadlineExceeded`; without the call's deadline the step has its own 2 s and reads. The
+    /// steps after the first still get the step timeout from their own start.
+    #[test]
+    fn parent_walk_first_step_from_the_call() {
+        let store = Store::new();
+        let roots = linear(&store, 4);
+        let reader = Arc::new(store.reader());
+        let (t0, ms) = (Instant::now(), Arc::new(AtomicU64::new(0)));
+        let clock: Clock = {
+            let ms = Arc::clone(&ms);
+            Arc::new(move || t0 + Duration::from_millis(ms.load(Ordering::SeqCst)))
+        };
+        let walk = |from_the_call: bool| {
+            ms.store(0, Ordering::SeqCst);
+            let call = Deadline::after(Arc::clone(&clock), Duration::from_secs(2));
+            let deadline = Deadline::after(Arc::clone(&clock), Duration::from_secs(600));
+            let walk = ParentWalk::new(Arc::clone(&reader), roots[3], 4, deadline)
+                .with_step_timeout(Duration::from_secs(2));
+            let mut walk = if from_the_call {
+                walk.with_first_deadline(call)
+            } else {
+                walk
+            };
+            // Queued 2.5 s before the first step.
+            ms.store(2_500, Ordering::SeqCst);
+            let first = walk.next().map(|b| b.map(|b| b.value.slot));
+            // 3 s on: past the call's deadline, but each further step has its own 2 s.
+            ms.store(5_500, Ordering::SeqCst);
+            let rest: Vec<_> = walk.map(|b| b.map(|b| b.value.slot)).collect();
+            (first, rest)
+        };
+        assert_eq!(
+            walk(true),
+            (Some(Err(ReadError::DeadlineExceeded)), Vec::new()),
+            "the call's 2 s"
+        );
+        assert_eq!(
+            walk(false),
+            (Some(Ok(4)), vec![Ok(3), Ok(2), Ok(1)]),
+            "the step's own 2 s"
+        );
     }
 
     /// A block by slot is the canonical one of the snapshot's own stamp: the block on the

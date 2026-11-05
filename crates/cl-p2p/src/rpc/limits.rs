@@ -119,6 +119,8 @@ pub struct RateLimits {
     pub data_columns_by_range: Quota,
     /// `DataColumnSidecarsByRoot`, in sidecars: as by range.
     pub data_columns_by_root: Quota,
+    /// Stub ([6.42] B2).
+    pub blocks_by_head: Quota,
 }
 
 impl Default for RateLimits {
@@ -130,6 +132,7 @@ impl Default for RateLimits {
             blocks_by_range: Quota::new(128, Duration::from_millis(20)),
             data_columns_by_range: Quota::new(512, Duration::from_millis(5)),
             data_columns_by_root: Quota::new(512, Duration::from_millis(5)),
+            blocks_by_head: Quota::new(128, Duration::from_millis(20)),
         }
     }
 }
@@ -1807,6 +1810,56 @@ mod tests {
 
     fn validate(limits: &RpcLimits) -> Result<(), RpcLimitsError> {
         limits.validate::<consensus_types::Minimal>(&network())
+    }
+
+    /// #230 D6: BeaconBlocksByHead has its own bucket, `rate.blocks_by_head`, with
+    /// BlocksByRange's values (128 at once, then one per 20 ms) and its own outbound queue.
+    /// With at most `MAX_CONCURRENT_REQUESTS` answers open per peer, each booking at most 128
+    /// tokens, an answer's first token is due within that many full answers' periods:
+    /// 2 × 128 × 20 ms ≈ 5.1 s, inside the 9.5 s an answer runs, so rate limiting never ends
+    /// the answer of a held root with no block (Ezra, 2026-11-01). A quota too slow for that is
+    /// refused when the limits are loaded.
+    #[test]
+    fn blocks_by_head_quota_first_token_in_time() {
+        let limits = RpcLimits::default();
+        assert_eq!(limits.rate.blocks_by_head, limits.rate.blocks_by_range);
+        assert_eq!(
+            limits.rate.quota(Protocol::BlocksByHeadV1),
+            Some(Quota::new(128, Duration::from_millis(20)))
+        );
+        let own = Quota::new(3, Duration::from_millis(7));
+        let rate = RateLimits {
+            blocks_by_head: own,
+            ..RateLimits::default()
+        };
+        assert_eq!(
+            rate.quota(Protocol::BlocksByHeadV1),
+            Some(own),
+            "its own field"
+        );
+        assert_eq!(
+            rate.quota(Protocol::BlocksByRangeV2),
+            Some(rate.blocks_by_range)
+        );
+        assert_eq!(
+            outbound_queue_name(Protocol::BlocksByHeadV1),
+            "rpc_outbound_blocks_by_head"
+        );
+        let end = crate::rpc::REQUEST_TIMEOUT - crate::rpc::inbound::STATUS_ANSWER_SLACK;
+        let answers = MAX_CONCURRENT_REQUESTS as u32
+            * p2p_wire::rpc::protocols::MAX_REQUEST_BLOCKS_DENEB as u32;
+        let worst = limits.rate.blocks_by_head.period * answers;
+        assert!(worst < end, "{worst:?}");
+        assert_eq!(validate(&limits), Ok(()));
+        let slow = RpcLimits {
+            rate: RateLimits {
+                blocks_by_head: Quota::new(128, Duration::from_millis(40)),
+                ..RateLimits::default()
+            },
+            ..RpcLimits::default()
+        };
+        let err = validate(&slow).unwrap_err();
+        assert!(err.to_string().contains("rate.blocks_by_head"), "{err}");
     }
 
     /// The default limits with `quota` on both column protocols.

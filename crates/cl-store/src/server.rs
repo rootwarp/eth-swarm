@@ -154,6 +154,18 @@ impl StoreServer {
         self
     }
 
+    /// Stub ([6.42] B2).
+    #[cfg(test)]
+    fn with_walk_timeout(self, _walk: Duration) -> Self {
+        self
+    }
+
+    /// Stub ([6.42] B2).
+    #[cfg(test)]
+    fn with_head_streams(self, _streams: usize) -> Self {
+        self
+    }
+
     /// Every `ethswarm.store.v1` service, ready to serve.
     #[must_use]
     pub fn routes(self) -> Routes {
@@ -770,15 +782,114 @@ mod tests {
     /// the call's read txn is open (its first two reads are the call's start and the txn's
     /// open).
     fn late_after(reads: usize) -> Clock {
+        late_by(reads, Duration::from_secs(3600))
+    }
+
+    /// A clock that reads `t0` its first `reads` times, then `by` later.
+    fn late_by(reads: usize, by: Duration) -> Clock {
         let t0 = Instant::now();
         let calls = AtomicUsize::new(0);
         Arc::new(move || {
             if calls.fetch_add(1, Ordering::SeqCst) < reads {
                 t0
             } else {
-                t0 + Duration::from_secs(3600)
+                t0 + by
             }
         })
+    }
+
+    /// #230 (Cole NIT 3 of part A): a `GetBlocksByHead` call's first read is checked against
+    /// the call's deadline from when the call came in, not from when its first step started.
+    /// On a clock that reads `t0` once (the call's start) and later from then on (time queued
+    /// in the blocking hops), a 1 s call 1.5 s late fails `DEADLINE_EXCEEDED` before its
+    /// stream opens; 0.5 s late it walks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocks_by_head_first_read_from_the_call() {
+        async fn walk(server: StoreServer, root: &[u8]) -> Result<usize, ErrorCode> {
+            let bodies = client(server)
+                .await
+                .get_blocks_by_head(by_head(root, 4))
+                .await;
+            bodies.map(|b| b.len()).map_err(|e| e.code())
+        }
+        let store = Store::new();
+        let blocks = chain(4);
+        let all: Vec<&[u8]> = blocks.iter().map(|b| b.ssz.as_slice()).collect();
+        store.import(&all, stamp_of(1, &blocks[3], &blocks[2]));
+        let late = |ms| {
+            server(&store)
+                .with_timeout(Duration::from_secs(1))
+                .with_clock(late_by(1, Duration::from_millis(ms)))
+        };
+        let head = blocks[3].root;
+        assert_eq!(
+            walk(late(1_500), &head).await,
+            Err(ErrorCode::DeadlineExceeded),
+            "queued past the call's 1 s"
+        );
+        assert_eq!(walk(late(500), &head).await, Ok(4), "within it");
+    }
+
+    /// #230 (Vera N2, Cole NIT 2 of part A): a client that stops reading a `GetBlocksByHead`
+    /// stream holds it no longer than the stream lives: each frame waits for the client until
+    /// then at most, and the stream ends there, after what was queued, freeing its walk, its
+    /// block and its place. The server holds a place per open stream, at most
+    /// `with_head_streams` (here 1): a call past them is `UNAVAILABLE` before any read; once the
+    /// stalled stream ended a call is served again, and a stream read to its end gives its
+    /// place back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocks_by_head_stalled_reader_released() {
+        use tokio_stream::StreamExt as _;
+        let store = Store::new();
+        let blocks = chain(8);
+        let all: Vec<&[u8]> = blocks.iter().map(|b| b.ssz.as_slice()).collect();
+        store.import(&all, stamp_of(1, &blocks[7], &blocks[0]));
+        let lives = Duration::from_millis(300);
+        let server = server(&store).with_walk_timeout(lives).with_head_streams(1);
+        let request = || {
+            Request::new(pb::GetBlocksByHeadRequest {
+                root: blocks[7].root.to_vec(),
+                count: 8,
+                hello: Some(fixture::v1_link().local()),
+            })
+        };
+        // A place: retried until the one place is free again, for at most 5 s.
+        let (server, request) = (&server, &request);
+        let placed = move || async move {
+            let start = Instant::now();
+            loop {
+                match server.get_blocks_by_head(request()).await {
+                    Ok(stream) => return stream.into_inner(),
+                    Err(status) => assert_eq!(status.code(), Code::Unavailable, "{status:?}"),
+                }
+                assert!(start.elapsed() < Duration::from_secs(5), "no place in 5 s");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+
+        let called = Instant::now();
+        // Never read: its one-frame queue holds the hello, and its first body waits.
+        let stalled = placed().await;
+        let refused = server.get_blocks_by_head(request()).await.err();
+        let refused = refused.expect("a call past the cap");
+        assert_eq!(refused.code(), Code::Unavailable, "{refused:?}");
+        let served = placed().await;
+        assert!(
+            called.elapsed() >= lives,
+            "the stalled stream lived out its time"
+        );
+        let frames: Vec<_> = stalled.collect().await;
+        assert_eq!(
+            frames.len(),
+            1,
+            "the hello it never read, then the end: {frames:?}"
+        );
+        assert!(frames[0].is_ok());
+
+        let frames: Vec<_> = served.collect().await;
+        assert_eq!(frames.len(), 9, "the hello and 8 bodies");
+        assert!(frames.iter().all(Result::is_ok));
+        drop(placed().await);
     }
 
     /// A read txn held past the call's deadline fails the call `DEADLINE_EXCEEDED`, on every

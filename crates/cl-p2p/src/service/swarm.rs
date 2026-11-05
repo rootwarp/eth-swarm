@@ -74,6 +74,15 @@ pub struct Gossip {
     pub tap: Option<CaptureTap>,
 }
 
+/// Stub ([6.42] B2).
+pub(crate) fn window_start_at<E: EthSpec>(
+    _config: &ChainConfig,
+    _genesis_time: u64,
+    _now_ms: u128,
+) -> Option<u64> {
+    None
+}
+
 /// The start slot of the block serve window by the wall clock (`network_config::window`), for
 /// the responder's floor check; `None` before genesis or for a config without the window's
 /// values.
@@ -160,5 +169,31 @@ pub fn serving_swarm<E: EthSpec>(
             }
             build_swarm_with_gossip(key, &cfg, control, ignore_all).map_err(|e| e.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use network_config::{ForkName, Network};
+
+    /// #230 D7: the start of the block serve window by the clock, which both block responders
+    /// read: none before genesis; `current_epoch - 33,024` epochs before `GLOAS_FORK_EPOCH`
+    /// (the phase0 formula) and `current_epoch - 14,299` from it (EIP-8061) on mainnet values
+    /// (Sepolia), in slots, at genesis at the earliest.
+    #[test]
+    fn window_start_at_switches_at_gloas() {
+        type E = consensus_types::Mainnet;
+        let config = ChainConfig::load(Network::Sepolia).unwrap();
+        let genesis = Network::Sepolia.genesis().unwrap().genesis_time;
+        let gloas = config.fork_schedule().fork_epoch(ForkName::Gloas).unwrap();
+        let epoch_ms = u128::from(config.slot_duration_ms()) * 32;
+        let at = |epoch: u64| u128::from(genesis) * 1000 + u128::from(epoch) * epoch_ms;
+        let start = |now_ms| window_start_at::<E>(&config, genesis, now_ms);
+        assert_eq!(start(at(0) - 1), None, "before genesis");
+        assert_eq!(start(at(100)), Some(0), "at genesis at the earliest");
+        assert_eq!(start(at(gloas - 1)), Some((gloas - 1 - 33_024) * 32));
+        assert_eq!(start(at(gloas)), Some((gloas - 14_299) * 32));
+        assert_eq!(start(at(gloas + 10) + 5), Some((gloas + 10 - 14_299) * 32));
     }
 }

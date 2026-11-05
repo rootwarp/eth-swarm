@@ -9,7 +9,7 @@
 mod columns;
 mod limits;
 
-use super::codec::{Answer, Deadline, Deadlines, ReceivedChunk, RpcRequest};
+use super::codec::{Answer, Deadline, Deadlines, ReceivedChunk, RpcCodec, RpcRequest};
 use super::inbound::{
     ControlConfig, ControlEvent, DuplexEvent, Protocols, ProtocolsEvent, Relevance, SharedStatus,
     StatusBacklog, StatusVia,
@@ -35,7 +35,7 @@ use libp2p::{
 use p2p_wire::enr::{decode_cgc, encode_cgc};
 use p2p_wire::rpc::codec::{decode_response_chunk, encode_chunk, encode_request};
 use p2p_wire::rpc::messages::{
-    BlocksByRangeV2Request, ForkDigest, Goodbye, MetaDataV3, Ping, StatusV2,
+    BlocksByHeadV1Request, BlocksByRangeV2Request, ForkDigest, Goodbye, MetaDataV3, Ping, StatusV2,
 };
 use p2p_wire::rpc::protocols::{Protocol, Request, Response, ResponseChunk, ResultCode};
 use prometheus_client::registry::Registry;
@@ -1669,26 +1669,25 @@ async fn unadvertised_protocols_fail_negotiation() {
 // Unsupported protocols: written probe deviations
 
 /// The guard: the protocols the spec makes MUST-support that the probe leaves unregistered.
-/// Registering one (closing [6.42] or [6.19b]) means taking it off this list, off
-/// [`Unsupported`] and out of the README's §Deviations, together.
+/// Registering one (closing [6.19b]) means taking it off this list, off [`Unsupported`] and
+/// out of the README's §Deviations, together. [6.42] registered BeaconBlocksByHead v1 (#230):
+/// it is off all three.
 #[test]
 fn unsupported_ids_stay_unregistered() {
     assert_eq!(
-        Unsupported::ALL.map(Unsupported::id),
+        Unsupported::ALL.map(Unsupported::id).to_vec(),
         [
-            "/eth2/beacon_chain/req/beacon_blocks_by_head/1/ssz_snappy",
             "/eth2/beacon_chain/req/execution_payload_envelopes_by_range/1/ssz_snappy",
             "/eth2/beacon_chain/req/execution_payload_envelopes_by_root/1/ssz_snappy",
         ]
     );
-    // p2p-wire knows BeaconBlocksByHead; the probe registers it once it serves it ([6.42]).
+    let by_head = "/eth2/beacon_chain/req/beacon_blocks_by_head/1/ssz_snappy";
+    assert!(
+        Protocol::ALL.iter().any(|p| p.id() == by_head),
+        "a protocol"
+    );
     for protocol in Protocol::ALL {
-        let unsupported = Unsupported::from_id(protocol.id());
-        if protocol == Protocol::BlocksByHeadV1 {
-            assert_eq!(unsupported, Some(Unsupported::BlocksByHeadV1));
-        } else {
-            assert_eq!(unsupported, None, "{protocol}");
-        }
+        assert_eq!(Unsupported::from_id(protocol.id()), None, "{protocol}");
     }
     let readme = include_str!("../../README.md");
     let deviations = readme
@@ -1706,12 +1705,14 @@ fn unsupported_ids_stay_unregistered() {
         );
         assert_eq!(Unsupported::from_id(unsupported.id()), Some(unsupported));
     }
-    for closing in ["[6.42]", "[6.19b]"] {
-        assert!(
-            deviations.contains(closing),
-            "README §Deviations: {closing}"
-        );
-    }
+    assert!(
+        deviations.contains("[6.19b]"),
+        "README §Deviations: [6.19b]"
+    );
+    assert!(
+        !deviations.contains(by_head),
+        "README §Deviations: BeaconBlocksByHead is served, its deviation closed"
+    );
 }
 
 /// A peer requesting the [`Unsupported`] protocols, one behaviour each (a behaviour offers all
@@ -1884,6 +1885,75 @@ async fn assert_refused_cleanly(protocols: &[Unsupported]) {
 #[tokio::test]
 async fn blocks_by_head_rejected() {
     assert_refused_cleanly(&[Unsupported::BlocksByHeadV1]).await;
+}
+
+/// #230 (replaces [3.14]'s `blocks_by_head_rejected`): BeaconBlocksByHead v1 is offered. A
+/// peer's request through the [3.7] requester path (`outbound_behaviour` over the production
+/// codec) negotiates, and the probe, which has no block source, answers an empty success
+/// (D8), never an error chunk or a reset; nothing is counted invalid or timed out, and the
+/// connection stays up.
+#[tokio::test]
+async fn blocks_by_head_served() {
+    let mut ours = Node::spawn(config(status_with(DIGEST), 1, 4)).await;
+    let contexts = Arc::new(p2p_wire::testkit::column_context_table());
+    let codec = RpcCodec::<E>::new(contexts, Deadlines::default());
+    let mut peer = tcp_swarm(super::outbound_behaviour(Protocol::BlocksByHeadV1, codec));
+    peer.dial(ours.addr.clone()).unwrap();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let SwarmEvent::ConnectionEstablished { .. } = peer.select_next_some().await {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("connected");
+    let request = Request::BlocksByHead(BlocksByHeadV1Request {
+        beacon_root: [0x11; 32].into(),
+        count: 64,
+    });
+    let id = peer
+        .behaviour_mut()
+        .send_request(&ours.peer, RpcRequest::Valid(request));
+    let outcome = tokio::time::timeout(WAIT, async {
+        loop {
+            match peer.select_next_some().await {
+                SwarmEvent::Behaviour(request_response::Event::Message {
+                    message:
+                        request_response::Message::Response {
+                            request_id,
+                            response,
+                        },
+                    ..
+                }) if request_id == id => return Ok(response),
+                SwarmEvent::Behaviour(request_response::Event::OutboundFailure {
+                    request_id,
+                    error,
+                    ..
+                }) if request_id == id => return Err(error.to_string()),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the request ended");
+    assert_eq!(
+        outcome.map(|chunks| chunks.len()),
+        Ok(0),
+        "an empty success"
+    );
+    assert_eq!(ours.metrics.invalid_data_count(Direction::Inbound), 0);
+    for kind in Deadline::ALL {
+        assert_eq!(ours.metrics.timeouts(kind), 0, "{kind:?}");
+    }
+    let requester = *peer.local_peer_id();
+    let seen = ours.drain(SETTLE).await;
+    assert!(
+        !seen
+            .iter()
+            .any(|s| matches!(s, Seen::Closed(p) if *p == requester)),
+        "{seen:?}"
+    );
 }
 
 #[tokio::test]
