@@ -110,6 +110,7 @@ use super::head::{follow_head, HeadFollow, HeadSource};
 use super::root_wait::{Answer, RootWaits};
 use super::{BlockApi, GossipColumn, RefBlock, RefError, RefLimits, RefView, ReferenceApi, Root};
 use crate::da::custody::Custody;
+use crate::persist::budget::Branch;
 use crate::reqresp::ServeClock;
 use crate::verify::client::{Held, KzgVerifier};
 use cl_chain_columns::{
@@ -1096,7 +1097,9 @@ where
 
 /// Where the writer thread stores columns: the column env.
 trait ColumnSink {
-    /// [`ColumnWriter::write_block_columns_partial`]: on a failure, what was committed first.
+    /// [`ColumnWriter::write_block_columns_on`] on [`Branch::Side`]: on a failure, what was
+    /// committed first. The probe never establishes that a block is canonical, so its columns
+    /// never spend the budget's canonical headroom.
     fn write_block_columns(
         &self,
         slot: Slot,
@@ -1128,7 +1131,7 @@ impl ColumnSink for ColumnWriter {
         link: BlockLink,
         columns: &[Column<'_>],
     ) -> Result<WriteReport, WriteFailed> {
-        ColumnWriter::write_block_columns_partial(self, slot, root, link, columns)
+        ColumnWriter::write_block_columns_on(self, slot, root, link, Branch::Side, columns)
     }
 
     fn settle_pending(&self, before_slot: Slot) -> cl_chain_columns::Result<usize> {
@@ -1680,6 +1683,70 @@ mod tests {
         assert_eq!(dropped.dropped(Drop::StoreFailed), 2);
         assert_eq!(metrics.stored(), 0);
         assert_eq!(queue.lock().items, 0);
+    }
+
+    /// Probe ingest never knows a block is canonical, so its columns are charged on the side
+    /// branch: at the columns cap they are refused, not admitted on the canonical headroom.
+    /// So are the columns of the writer's plain write methods, which name no branch.
+    #[test]
+    fn a_probe_write_at_the_columns_cap_is_a_side_branch_write() {
+        use crate::persist::budget::{Budget, Caps, Kind};
+        use cl_chain_columns::{WriterOptions, MIN_MAX_SIZE};
+        let dir = tempfile::tempdir().unwrap();
+        let mut caps = Caps {
+            aggregate: 1000,
+            headroom_percent: 10,
+            ..Caps::unlimited()
+        };
+        caps.bytes[Kind::Columns as usize] = Some(600);
+        let opts = WriterOptions {
+            max_size: MIN_MAX_SIZE,
+        };
+        let writer =
+            ColumnWriter::open_with_budget(dir.path(), opts, Arc::new(Budget::new(caps))).unwrap();
+        writer.seed_stamp().unwrap();
+        // The canonical chain fills the columns cap.
+        let full = vec![1; 600];
+        let canonical = [Column {
+            index: 0,
+            ssz: &full,
+        }];
+        writer
+            .write_block_columns_on(1, &[1; 32], BlockLink::Gap, Branch::Canonical, &canonical)
+            .unwrap();
+        let queue = queue(IngestLimits::default());
+        let (dropped, metrics) = metrics();
+        write_batch(
+            &writer,
+            vec![write(&queue, 2, [2; 32], 0)],
+            &dropped,
+            &metrics,
+        );
+        assert_eq!(writer.reader().columns_for_root(&[2; 32]).unwrap(), vec![]);
+        assert_eq!(dropped.dropped(Drop::StoreFailed), 1);
+        assert_eq!(metrics.stored(), 0);
+        assert_eq!(queue.lock().items, 0);
+        assert_eq!(writer.budget().refusals(Kind::Columns, Branch::Side), 1);
+        assert_eq!(
+            writer.budget().refusals(Kind::Columns, Branch::Canonical),
+            0
+        );
+        let column = [Column {
+            index: 0,
+            ssz: b"gossip",
+        }];
+        let err = writer.write_columns(3, &[3; 32], &column).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                cl_chain_columns::Error::OverBudget {
+                    branch: Branch::Side
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(writer.budget().refusals(Kind::Columns, Branch::Side), 2);
+        assert_eq!(writer.budget().used(Kind::Columns).bytes, 600);
     }
 
     /// A column env that commits the first transaction of a block's columns, then fails.

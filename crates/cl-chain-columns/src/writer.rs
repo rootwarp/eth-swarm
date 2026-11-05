@@ -409,7 +409,8 @@ impl ColumnWriter {
     /// ([`ColumnReader::first_stored_slot`]) also lowers it to `slot`.
     ///
     /// The block is stored with [`BlockLink::Gap`]: nothing is known of its chain
-    /// ([`Self::write_block_columns`]).
+    /// ([`Self::write_block_columns`]). Its columns are charged on [`Branch::Side`]
+    /// ([`Self::write_block_columns_partial`]).
     pub fn write_columns(
         &self,
         slot: u64,
@@ -445,6 +446,9 @@ impl ColumnWriter {
     /// [`Self::write_block_columns`], and on a failure what was committed before it: the
     /// transactions before the one that failed stay committed, so their columns are stored.
     /// A batch refused before its first transaction committed nothing.
+    ///
+    /// The columns are charged on [`Branch::Side`]: nothing here says the block is canonical,
+    /// so they never spend the canonical headroom ([`Self::write_block_columns_on`]).
     pub fn write_block_columns_partial(
         &self,
         slot: u64,
@@ -452,14 +456,16 @@ impl ColumnWriter {
         link: BlockLink,
         columns: &[Column<'_>],
     ) -> std::result::Result<WriteReport, WriteFailed> {
-        self.write_block_columns_on(slot, block_root, link, Branch::Canonical, columns)
+        self.write_block_columns_on(slot, block_root, link, Branch::Side, columns)
     }
 
     /// [`Self::write_block_columns_partial`] on `branch`: each transaction's columns, net of
     /// the rows they replace, are admitted by the budget ([`Self::budget`]) and charged in it.
     /// [`Branch::Finalized`] is charged and never refused. A transaction the budget ignores is
-    /// [`Error::OverBudget`] and writes nothing. [`Self::write_block_columns_partial`] writes
-    /// on [`Branch::Canonical`].
+    /// [`Error::OverBudget`] and writes nothing. Only a caller that has established the block
+    /// is on the canonical chain passes [`Branch::Canonical`]; columns of a block not known to
+    /// be canonical, such as probe ingest's and peer-fed ones, go on [`Branch::Side`], which
+    /// the other write methods use.
     pub fn write_block_columns_on(
         &self,
         slot: u64,

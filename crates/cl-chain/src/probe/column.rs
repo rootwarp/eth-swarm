@@ -34,6 +34,7 @@
 
 use super::{BlockApi, RefBlock, RefView, ReferenceApi};
 use crate::da::custody::Custody;
+use crate::persist::budget::Branch;
 use crate::verify::client::{Held, KzgOutcome, KzgVerifier};
 use consensus_types::das::{compute_subnet_for_data_column_sidecar, NUMBER_OF_COLUMNS};
 use consensus_types::{gloas, EthSpec};
@@ -326,11 +327,12 @@ where
 }
 
 /// Stores a column that passed [`storage_contract`] in the column env, as its SSZ under
-/// `(slot, beacon_block_root, index)`.
+/// `(slot, beacon_block_root, index)`. A peer-fed column says nothing of whether its block is
+/// canonical, so it is charged to the disk budget on [`Branch::Side`].
 ///
 /// # Errors
 ///
-/// The column store's ([`cl_chain_columns::ColumnWriter::write_columns`]).
+/// The column store's ([`cl_chain_columns::ColumnWriter::write_block_columns_on`]).
 pub fn store_verified<E: EthSpec>(
     verified: &Verified<'_, E>,
     writer: &cl_chain_columns::ColumnWriter,
@@ -342,8 +344,15 @@ pub fn store_verified<E: EthSpec>(
         ssz: &ssz,
     };
     writer
-        .write_columns(sidecar.slot, &sidecar.beacon_block_root.0, &[column])
+        .write_block_columns_on(
+            sidecar.slot,
+            &sidecar.beacon_block_root.0,
+            cl_chain_columns::BlockLink::Gap,
+            Branch::Side,
+            &[column],
+        )
         .map(drop)
+        .map_err(|failed| failed.error)
 }
 
 #[cfg(test)]
