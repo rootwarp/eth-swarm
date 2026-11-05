@@ -5530,61 +5530,69 @@ mod tests {
         assert_eq!(control.streams.available_permits(), 256);
     }
 
-    /// Cole B1, Vera N1: an answer costs `count` tokens, but cl-store reads its finalized half
-    /// by walking down from `F0`, a step per slot whatever `count` is (the fake's store half:
-    /// 250 ms a slot walked). A one-token request that starts more than the depth cap (8 here)
-    /// below `F0` is `3: ResourceUnavailable` at once, after the head read, with no store range
-    /// asked for, and gives its one lookup slot back then: an honest request waiting for that
-    /// slot is served after its own short walk, never `2` for want of a slot. A start at the cap
-    /// is served; one past it is `3` even when its end reaches into what is served.
+    /// Cole B1, Vera N1: cl-store finds a range in its finalized slot index at any depth, so
+    /// the only floor below `F0` is the start of the block serve window. A one-token request
+    /// 999,998 slots below `F0`, inside the window, is served, cl-store asked for exactly its
+    /// range. One that starts below the window, at or below the `F0` read before, is
+    /// `3: ResourceUnavailable` at once, even when its end reaches into the window: before a
+    /// lookup slot or any IPC call, the head read included.
     #[tokio::test(start_paused = true)]
     async fn byrange_deep_request_bounded() {
-        let (mut control, metrics, peers) = serving(2, |_| {});
+        let (mut control, metrics, peers) = serving(1, |_| {});
         let fake = Fake::new();
-        fake.walk_cost(Duration::from_millis(250));
+        fake.finalize_at(1_000_000);
         let (_, held) = by_range(&fake, Some(0), 1, &metrics);
-        let held = held.with_max_depth(8);
+        let held = held.with_window(Arc::new(|| Some(2)));
         let responder: Arc<dyn Responder<Spec>> = Arc::new(held.clone());
-        let started = Instant::now();
-        let deep = control.answer_streamed(peers[1], BLOCKS, range(1, 1), &responder);
-        let deep = write_on_task(&control, deep.unwrap());
-        tokio::time::sleep(Duration::from_millis(1)).await;
-        let (chunks, took) = serve_blocks(&mut control, peers[0], range(18, 4), &responder).await;
-        assert_eq!(block_slots(&chunks), fixture::canonical(18, 22), "served");
-        assert_linked(&chunks);
-        assert_eq!(
-            took,
-            Duration::from_millis(500),
-            "its own walk of 2 slots, no wait"
-        );
-        let (ended, wire) = deep.await.unwrap();
-        let deep_chunks = received(&wire, &range(1, 1)).await;
-        assert_eq!(
-            only_error(&deep_chunks),
-            Some(ResultCode::ResourceUnavailable)
-        );
-        assert_eq!(
-            ended - started,
-            Duration::ZERO,
-            "the deep request ends at once"
-        );
-        assert_eq!(
-            fake.ranges(),
-            [(Half::Store, 18, 3), (Half::Chain, 21, 1)],
-            "the deep request never asked cl-store for a range"
-        );
-        assert_eq!(metrics.block_lookup_failures("store", "depth"), 1);
+        let (chunks, _) = serve_blocks(&mut control, peers[0], range(2, 1), &responder).await;
+        assert_eq!(block_slots(&chunks), [2], "999,998 slots below F0");
+        assert_eq!(fake.calls(), [Call::Head, Call::Range(Half::Store, 2, 1)]);
+        for request in [range(1, 1), range(1, 10)] {
+            let (chunks, took) = serve_blocks(&mut control, peers[0], request, &responder).await;
+            assert_eq!(only_error(&chunks), Some(ResultCode::ResourceUnavailable));
+            assert_eq!(took, Duration::ZERO, "at once");
+        }
+        assert_eq!(fake.calls(), Vec::<Call>::new(), "never asked the stores");
+        assert_eq!(metrics.block_lookup_failures("store", "window"), 2);
         closed(&fake).await;
         assert_eq!(held.free_lookups(), 1);
+    }
 
-        let (chunks, _) = serve_blocks(&mut control, peers[0], range(12, 2), &responder).await;
-        assert_eq!(block_slots(&chunks), [12, 13], "a start at the cap");
-        for request in [range(11, 1), range(11, 10)] {
-            let (chunks, _) = serve_blocks(&mut control, peers[0], request, &responder).await;
-            assert_eq!(only_error(&chunks), Some(ResultCode::ResourceUnavailable));
+    /// The block serve window does not account for finality (`phase0` L1532–1536): with the
+    /// store finalized at 20 and the window starting at 30, only finalized history below the
+    /// window is refused. Before any `F0` read, a start below the window is decided by the head
+    /// read: at or below `F0` it is `3`, no range asked for. Once `F0` is known, such a start is
+    /// `3` with no IPC call, also at `F0` itself and when the request reaches into the window.
+    /// A start above `F0` is served from cl-chain: one wholly below the window, and one that
+    /// crosses its start, in full. Only the refusals are counted, as `{store, window}`.
+    #[tokio::test(start_paused = true)]
+    async fn byrange_unfinalized_below_window_served() {
+        let (mut control, metrics, peers) = serving(1, |_| {});
+        let peer = peers[0];
+        let fake = Fake::new();
+        let (_, held) = by_range(&fake, Some(0), 16, &metrics);
+        let held = held.with_window(Arc::new(|| Some(30)));
+        let responder: Arc<dyn Responder<Spec>> = Arc::new(held.clone());
+        let (chunks, _) = serve_blocks(&mut control, peer, range(10, 4), &responder).await;
+        assert_eq!(only_error(&chunks), Some(ResultCode::ResourceUnavailable));
+        assert_eq!(fake.calls(), [Call::Head], "F0 read, no range asked for");
+        for request in [range(10, 4), range(20, 1), range(20, 15)] {
+            let (chunks, _) = serve_blocks(&mut control, peer, request.clone(), &responder).await;
+            let code = only_error(&chunks);
+            assert_eq!(code, Some(ResultCode::ResourceUnavailable), "{request:?}");
         }
-        assert_eq!(fake.ranges(), [(Half::Store, 12, 2)]);
-        assert_eq!(metrics.block_lookup_failures("store", "depth"), 3);
+        assert_eq!(fake.calls(), [], "the F0 read before decides: no IPC call");
+        assert_eq!(metrics.block_lookup_failures("store", "window"), 4);
+        let (chunks, _) = serve_blocks(&mut control, peer, range(21, 1), &responder).await;
+        assert_eq!(block_slots(&chunks), [21], "wholly below the window");
+        assert_eq!(fake.calls(), [Call::Head, Call::Range(Half::Chain, 21, 1)]);
+        let (chunks, _) = serve_blocks(&mut control, peer, range(21, 20), &responder).await;
+        assert_eq!(block_slots(&chunks), fixture::canonical(21, 41), "in full");
+        assert_linked(&chunks);
+        assert_eq!(fake.calls(), [Call::Head, Call::Range(Half::Chain, 21, 20)]);
+        assert_eq!(metrics.block_lookup_failures("store", "window"), 4);
+        closed(&fake).await;
+        assert_eq!(held.free_lookups(), 16);
     }
 
     /// #146: `step` above 1 is answered with at most the first block of the range (`phase0`

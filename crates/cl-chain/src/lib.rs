@@ -29,6 +29,9 @@
 //! [`da::custody`] owns the node's custody group count: never decreasing, stored in the column
 //! env, advertised through the MetaData and the ENR, and the column subnets cl-p2p subscribes.
 //!
+//! [`finalized_index`] backfills the store's finalized slot index when cl-chain opens a store
+//! that an older cl-chain left unindexed, down to the start of the block serve window.
+//!
 //! [`compiled_config`] is the startup check of the config values that the state transition
 //! compiles in: a network config with another value stops the start.
 //!
@@ -39,6 +42,7 @@
 pub mod compiled_config;
 pub mod da;
 pub mod events;
+pub mod finalized_index;
 pub mod persist;
 pub mod probe;
 pub mod reqresp;

@@ -1,11 +1,13 @@
 //! The schema version: a `u64 BE` row under [`SCHEMA_VERSION_KEY`] in `meta`, checked on every
 //! open, writer and reader.
 //!
-//! - [`SCHEMA_VERSION`] (2): opens.
-//! - 1, #291's layout (no `block_index`, `envelopes`, `fc_snapshot`): the writer upgrades it in
-//!   place, creating those tables, filling `block_index` from `blocks` and writing 2, all in its
-//!   open transaction, rewriting no other row. A reader refuses it
-//!   ([`Error::NeedsUpgrade`]) until then.
+//! - [`SCHEMA_VERSION`] (3): opens.
+//! - 2 (no `finalized_slots`): the writer upgrades it in place, creating the table empty and
+//!   writing 3 in its open transaction, rewriting no other row; the index is backfilled after
+//!   the open ([`crate::finalized::backfill`]). A reader refuses it ([`Error::NeedsUpgrade`])
+//!   until then.
+//! - 1, #291's layout (no `block_index`, `envelopes`, `fc_snapshot` either): the same, and
+//!   `block_index` is filled from `blocks` in that transaction.
 //! - Absent: a fresh env, or one cl-chain-columns wrote before this crate (its four tables
 //!   only). A reader opens it as it is; the writer upgrades it in place, as for 1.
 //! - Any other value, newer or unknown: [`Error::SchemaVersion`], nothing written. The writer
@@ -19,10 +21,10 @@ use libmdbx::{NoWriteMap, Transaction, TransactionKind, WriteFlags, RW};
 use crate::{keys::SCHEMA_VERSION_KEY, tables::META, Error, Result};
 
 /// The schema this build reads and writes.
-pub const SCHEMA_VERSION: u64 = 2;
+pub const SCHEMA_VERSION: u64 = 3;
 
-/// The one older version the writer upgrades in place.
-const UPGRADED_FROM: u64 = 1;
+/// The older versions the writer upgrades in place.
+const UPGRADED_FROM: [u64; 2] = [1, 2];
 
 /// The stored version, `None` if there is none (no row, or no `meta` table yet).
 fn stored<K: TransactionKind>(txn: &Transaction<'_, K, NoWriteMap>) -> Result<Option<u64>> {
@@ -46,23 +48,22 @@ fn newer_or_unknown(found: u64) -> Error {
     }
 }
 
-/// The writer's check: whether the env needs the upgrade to [`SCHEMA_VERSION`] (absent or 1);
-/// an error for any other version.
+/// The writer's check: whether the env needs the upgrade to [`SCHEMA_VERSION`] (absent, 1 or
+/// 2); an error for any other version.
 pub(crate) fn check_writer(txn: &Transaction<'_, RW, NoWriteMap>) -> Result<bool> {
     match stored(txn)? {
         Some(SCHEMA_VERSION) => Ok(false),
-        None | Some(UPGRADED_FROM) => Ok(true),
+        None => Ok(true),
+        Some(found) if UPGRADED_FROM.contains(&found) => Ok(true),
         Some(found) => Err(newer_or_unknown(found)),
     }
 }
 
-/// The reader's check: [`SCHEMA_VERSION`] or absent opens; 1 waits for the writer.
+/// The reader's check: [`SCHEMA_VERSION`] or absent opens; 1 and 2 wait for the writer.
 pub(crate) fn check_reader<K: TransactionKind>(txn: &Transaction<'_, K, NoWriteMap>) -> Result<()> {
     match stored(txn)? {
         None | Some(SCHEMA_VERSION) => Ok(()),
-        Some(UPGRADED_FROM) => Err(Error::NeedsUpgrade {
-            found: UPGRADED_FROM,
-        }),
+        Some(found) if UPGRADED_FROM.contains(&found) => Err(Error::NeedsUpgrade { found }),
         Some(found) => Err(newer_or_unknown(found)),
     }
 }

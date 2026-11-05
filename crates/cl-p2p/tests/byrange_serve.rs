@@ -14,11 +14,11 @@ use cl_chain::reqresp::{
 };
 use cl_chain_columns::ColumnWriter;
 use cl_p2p::behaviour::SpecBehaviour;
-use cl_p2p::rpc::blocks::{BlockSource, ByRangeResponder, Failed, ServedBlock};
+use cl_p2p::rpc::blocks::{BlockSource, ByRangeResponder, Failed, Half, ServedBlock};
 use cl_p2p::rpc::blocks_ipc::IpcBlocks;
 use cl_p2p::rpc::inbound::{Control, SharedStatus, StatusSource};
 use cl_p2p::rpc::metrics::RpcMetrics;
-use cl_p2p::rpc::outbound::RangeRequester;
+use cl_p2p::rpc::outbound::{OutboundError, RangeError, RangeRequester};
 use cl_p2p::transport::{build_swarm, MuxerBudget, SwarmConfig, TransportMetrics};
 use consensus_types::caps::NetworkCaps;
 use consensus_types::primitives::U256;
@@ -33,6 +33,7 @@ use libp2p::Swarm;
 use network_config::{Epoch, ForkName, ForkSchedule, ScheduledFork};
 use p2p_wire::rpc::codec::ContextTable;
 use p2p_wire::rpc::messages::{ForkDigest, StatusV2};
+use p2p_wire::rpc::protocols::ResultCode;
 use p2p_wire::testkit::{fulu_block, gloas_block, FULU_BPO_DIGEST, FULU_DIGEST, GLOAS_DIGEST};
 use prometheus_client::registry::Registry;
 use ssz::Encode;
@@ -314,15 +315,157 @@ async fn range_sync_across_finality_and_the_gloas_fork() {
     }
 }
 
-/// Cole B1, Vera N1: cl-p2p refuses a range that starts deeper below the store's finalized slot
-/// than it lets cl-store walk before it asks cl-store, and cl-store refuses the same depth
-/// itself: one value on both sides.
-#[test]
-fn finalized_depth_matches_the_store() {
-    assert_eq!(
-        cl_p2p::rpc::blocks::MAX_FINALIZED_DEPTH,
-        cl_store::MAX_FINALIZED_DEPTH
-    );
+/// Cole B1, Vera N1: the start of the block serve window is cl-p2p's only floor below the
+/// store's finalized slot (`rpc::inbound`'s `byrange_deep_request_bounded`), and cl-store has no
+/// fixed depth cap of its own: over its socket, the real cl-store serves a range 999,999 slots
+/// below its finalized slot, found in its finalized slot index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_window_is_the_only_floor() {
+    const TOP: u64 = 1_000_000;
+    let env_dir = tempfile::tempdir().unwrap();
+    let writer = test_writer(env_dir.path()).unwrap();
+    let (mut chain, mut parent) = (Vec::new(), [0; 32]);
+    for slot in [1, 2, 3, TOP] {
+        let b = block(slot, parent, 0);
+        parent = b.message_root().0;
+        chain.push(b);
+    }
+    let txn = txn::begin(&writer).unwrap();
+    for b in &chain {
+        store_schema::blocks::put::<E>(&txn, &schedule(), &b.as_ssz_bytes()).unwrap();
+    }
+    let stamp = Stamp {
+        head_seq: 1,
+        head_root: parent,
+        head_slot: TOP,
+        finalized_root: parent,
+        finalized_slot: TOP,
+    };
+    txn::commit(txn, Update::New(stamp)).unwrap();
+    let env = Shared(Arc::new(writer));
+    let sockets = tempfile::tempdir().unwrap();
+    let store = cl_store::StoreServer::new(link(), Arc::new(cl_store::Reader::over(env)));
+    let store = serve(sockets.path(), "cl-store.sock", store.routes()).await;
+    let source = IpcBlocks::new(store.clone(), store, link());
+    let finalized = tokio::time::timeout(WAIT, source.finalized_slot()).await;
+    assert_eq!(finalized.expect("answered").unwrap(), TOP);
+    let blocks = tokio::time::timeout(WAIT, source.blocks(Half::Store, 1, 2)).await;
+    let blocks = blocks.expect("opened").unwrap_or_else(|e| panic!("{e:?}"));
+    let read = tokio::time::timeout(WAIT, blocks.collect::<Vec<_>>()).await;
+    let read: Result<Vec<ServedBlock>, Failed> = read.expect("ended").into_iter().collect();
+    let slots: Vec<u64> = read
+        .unwrap_or_else(|e| panic!("{e:?}"))
+        .iter()
+        .map(|b| b.slot)
+        .collect();
+    assert_eq!(slots, [1, 2]);
+}
+
+/// The block serve window does not account for finality (`phase0/p2p-interface.md`
+/// L1532–1536): a node MUST serve every block more recent than its latest finalized checkpoint,
+/// even outside the window. Over the real cl-store and cl-chain, the store finalized at
+/// [`FINALIZED`] (20), the window starting at slot 30 and our `earliest_available_slot` 0: a
+/// range starting in finalized history below the window is `3: ResourceUnavailable`, the
+/// whole request, also when it reaches past the finalized slot (the first decided by the
+/// finalized slot's read, the others by the one read before); a range above the finalized slot
+/// is served from cl-chain, wholly below the window (the stored canonical block at 21) or
+/// crossing its start, in full. Only the refusals are counted, as `{store, window}`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unfinalized_history_below_the_window_is_served() {
+    const WINDOW: u64 = 30;
+    let env_dir = tempfile::tempdir().unwrap();
+    let (env, chain) = seeded(env_dir.path());
+    let sockets = tempfile::tempdir().unwrap();
+    let store = cl_store::StoreServer::new(link(), Arc::new(cl_store::Reader::over(env.clone())));
+    let store = serve(sockets.path(), "cl-store.sock", store.routes()).await;
+    let columns_dir = tempfile::tempdir().unwrap();
+    let columns = Arc::new(ColumnServer::new(
+        Arc::new(ColumnWriter::open_seeded(columns_dir.path()).unwrap()) as Arc<dyn ColumnStore>,
+        U256::MAX,
+        Arc::new(Clock),
+        ServeBudget::default(),
+    ));
+    let chain_server = ReqRespServer::new(link(), columns).serving_blocks(Arc::new(env.clone()));
+    let chain_routes = tonic::service::Routes::new(chain_server.into_service());
+    let chain_channel = serve(sockets.path(), "cl-chain.sock", chain_routes).await;
+
+    let ours = Arc::new(SharedStatus::new(Some(status())));
+    let mut registry = Registry::default();
+    let metrics = RpcMetrics::register(&mut Registry::default());
+    let responder = ByRangeResponder::new(
+        Arc::new(IpcBlocks::new(store, chain_channel, link())),
+        Arc::clone(&ours) as Arc<dyn StatusSource>,
+        16,
+        Some(metrics.clone()),
+    )
+    .with_window(Arc::new(|| Some(WINDOW)));
+    let node = control(&mut registry, &ours).with_blocks_responder(Arc::new(responder));
+    let mut node = swarm(node, true, &mut registry);
+    let addr = loop {
+        if let SwarmEvent::NewListenAddr { address, .. } = node.select_next_some().await {
+            break address;
+        }
+    };
+    let node_id = *node.local_peer_id();
+    tokio::spawn(async move {
+        loop {
+            node.select_next_some().await;
+        }
+    });
+
+    let theirs = Arc::new(SharedStatus::new(Some(status())));
+    let mut requester = swarm(control(&mut registry, &theirs), false, &mut registry);
+    requester.dial(addr).unwrap();
+    tokio::time::timeout(WAIT, async {
+        while requester
+            .behaviour()
+            .req_resp
+            .status_valid_peers()
+            .is_empty()
+        {
+            requester.select_next_some().await;
+        }
+    })
+    .await
+    .expect("our node is Status-valid");
+
+    let digests = |epoch: Epoch| Some(digest_at(epoch));
+    let mut sync = RangeRequester::new(&mut requester, &digests);
+    for (start, count) in [(10, 4), (FINALIZED, 1), (FINALIZED, 15)] {
+        let got = tokio::time::timeout(WAIT, sync.blocks_by_range(node_id, start, count))
+            .await
+            .expect("answered");
+        assert!(
+            matches!(
+                &got,
+                Err(RangeError::Outbound(OutboundError::ErrorResponse {
+                    code: ResultCode::ResourceUnavailable,
+                    ..
+                }))
+            ),
+            "[{start}, +{count}): {got:?}"
+        );
+    }
+    assert_eq!(metrics.block_lookup_failures("store", "window"), 3);
+    let canonical = |start: u64, end: u64| -> Vec<Vec<u8>> {
+        chain
+            .iter()
+            .filter(|b| (start..end).contains(&b.slot()))
+            .map(Encode::as_ssz_bytes)
+            .collect()
+    };
+    for (start, count) in [(FINALIZED + 1, 1), (FINALIZED + 1, HEAD - FINALIZED)] {
+        let blocks = tokio::time::timeout(WAIT, sync.blocks_by_range(node_id, start, count))
+            .await
+            .expect("answered")
+            .unwrap_or_else(|e| panic!("[{start}, +{count}): {e}"));
+        let got: Vec<Vec<u8>> = blocks.iter().map(Encode::as_ssz_bytes).collect();
+        let want = canonical(start, start + count);
+        assert!(!want.is_empty());
+        assert_eq!(got, want, "[{start}, +{count})");
+        assert!(blocks.iter().all(|b| b.slot() != 36), "the fork block");
+    }
+    assert_eq!(metrics.block_lookup_failures("store", "window"), 3);
 }
 
 /// #230: BeaconBlocksByHead's source, the production `IpcBlocks::by_head`, against the real

@@ -47,7 +47,7 @@ use crate::reqresp::{
     WallClock,
 };
 use crate::verify::client::{KzgClient, KzgVerifier};
-use crate::ChainStub;
+use crate::{finalized_index, ChainStub};
 use cl_chain_columns::{ColumnReader, ColumnWriter};
 use consensus_types::caps::NetworkCaps;
 use consensus_types::primitives::U256;
@@ -724,8 +724,8 @@ pub struct ProbeService<E: EthSpec, V> {
 
 impl<E: EthSpec, V: KzgVerifier + 'static> ProbeService<E, V> {
     /// Opens the store (again, after a restart), stamps a new one from `plan.anchor` before
-    /// its first write ([`stamp_from_anchor`]), starts the ingest and the reference
-    /// follower. Must be called within a tokio runtime. The store's metrics go to `registry`.
+    /// its first write ([`stamp_from_anchor`]), backfills its finalized slot index
+    /// ([`finalized_index::backfill`]), starts the ingest and the reference follower. Must be called within a tokio runtime. The store's metrics go to `registry`.
     ///
     /// Blocking: [`ColumnWriter::open`] can sleep the calling thread for about a second while
     /// a lingering writer lock clears. Call it once at startup (as `devnet-probe` does), or
@@ -756,6 +756,11 @@ impl<E: EthSpec, V: KzgVerifier + 'static> ProbeService<E, V> {
         claim_node_id(&plan.columns_dir, plan.node_id, has_custody)?;
         // No write commits before the first stamp: a new store is stamped from its anchor first.
         stamp_from_anchor::<E>(&writer, net.config().fork_schedule(), plan.anchor.as_ref())?;
+        // A store an older cl-chain left without its finalized slot index: indexed down to the
+        // serve window's start before the first column write (probe mode holds its anchor).
+        let floor = finalized_index::window_floor(&net.probe_chain(), ipc::hello::system_ms());
+        finalized_index::backfill(&writer, floor, finalized_index::BACKFILL_BATCH)
+            .map_err(|e| format!("finalized slot index: {e}"))?;
         let custody = Custody::open(
             Arc::clone(&writer),
             NoEnr,

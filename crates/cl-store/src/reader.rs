@@ -10,8 +10,10 @@
 //! carry none of their own.
 //!
 //! The canonical chain is the stamp's: a block by slot is the one on the parent walk down from
-//! the stamp's head (from its finalized block, for a slot at or below it); a skipped slot, or a
-//! slot whose only blocks are off that chain, is [`ReadError::NotFound`].
+//! the stamp's head; for a slot at or below its finalized slot, the one the finalized slot index
+//! holds ([`store_schema::finalized`], written with the stamp), or below the index's floor the
+//! one on the walk down from its finalized block. A skipped slot, or a slot whose only blocks
+//! are off that chain, is [`ReadError::NotFound`].
 //!
 //! Every transaction runs under its call's [`Deadline`], checked when it opens, every 64 blocks
 //! it walks and once more before its data is returned, with the transaction open, so a slow read
@@ -40,7 +42,7 @@ use std::{
 use store_schema::{
     blocks::{self, Stored},
     env::{self, Env, RoTxn},
-    stamp,
+    finalized, stamp,
 };
 pub use store_schema::{keys::Root, stamp::Stamp};
 
@@ -53,7 +55,7 @@ pub fn system_clock() -> Clock {
     Arc::new(Instant::now)
 }
 
-/// How many blocks a walk reads between two looks at its deadline.
+/// How many blocks (or index rows) a read takes between two looks at its deadline.
 const DEADLINE_EVERY: usize = 64;
 
 /// The point past which a call's read transactions stop with [`ReadError::DeadlineExceeded`].
@@ -100,8 +102,8 @@ impl Deadline {
 pub enum ReadError {
     /// The snapshot has no stamp row (nothing is stamped yet, so nothing is served), or the
     /// env cannot be read now (out of reader slots, busy, wants recovery, or down until it
-    /// reopens: [`crate::recover`]), or a range starts deeper below the finalized slot than
-    /// is served ([`crate::MAX_FINALIZED_DEPTH`]).
+    /// reopens: [`crate::recover`]), or a range starts below the floor of the finalized slot
+    /// index (what cl-chain has not indexed yet).
     #[error("store unavailable")]
     Unavailable,
     /// No such block in the snapshot, or none on the stamp's chain at that slot.
@@ -154,6 +156,9 @@ pub struct Reader {
     /// A read transaction failed to begin with `MDBX_WANNA_RECOVERY` or `MDBX_PANIC`: this
     /// env handle is of no further use ([`crate::recover`] reopens the env).
     broken: AtomicBool,
+    /// The blocks and index rows its reads touched, for the tests that count a read's work.
+    #[cfg(test)]
+    pub(crate) touched: std::sync::atomic::AtomicUsize,
 }
 
 impl Reader {
@@ -167,6 +172,8 @@ impl Reader {
         Ok(Self {
             env: Box::new(env::open_reader(path)?),
             broken: AtomicBool::new(false),
+            #[cfg(test)]
+            touched: Default::default(),
         })
     }
 
@@ -179,6 +186,8 @@ impl Reader {
         Self {
             env: Box::new(env),
             broken: AtomicBool::new(false),
+            #[cfg(test)]
+            touched: Default::default(),
         }
     }
 
@@ -237,7 +246,10 @@ impl Reader {
             walked: Cell::new(0),
         };
         deadline.check()?;
-        let value = f(&snap)?;
+        let value = f(&snap);
+        #[cfg(test)]
+        self.touched.fetch_add(snap.walked.get(), Ordering::Relaxed);
+        let value = value?;
         deadline.check()?;
         Ok(value)
     }
@@ -280,7 +292,8 @@ impl From<store_schema::Error> for ReadError {
 pub(crate) struct Snapshot<'r> {
     txn: RoTxn<'r>,
     deadline: &'r Deadline,
-    /// Blocks walked so far, for the deadline's look every [`DEADLINE_EVERY`].
+    /// Blocks walked and index rows read so far, for the deadline's look every
+    /// [`DEADLINE_EVERY`].
     walked: Cell<usize>,
 }
 
@@ -299,8 +312,17 @@ impl Snapshot<'_> {
         Ok(blocks::stored(&self.txn, root)?)
     }
 
-    /// [`blocks::walk`] down from `from` to `low`, the deadline looked at every
-    /// [`DEADLINE_EVERY`] blocks walked.
+    /// One block or index row read: the deadline looked at every [`DEADLINE_EVERY`].
+    fn step(&self) -> Result<(), ReadError> {
+        let walked = self.walked.get() + 1;
+        self.walked.set(walked);
+        if walked.is_multiple_of(DEADLINE_EVERY) {
+            self.deadline.check()?;
+        }
+        Ok(())
+    }
+
+    /// [`blocks::walk`] down from `from` to `low`, a [`Self::step`] per block.
     pub(crate) fn walk(
         &self,
         from: Root,
@@ -308,21 +330,41 @@ impl Snapshot<'_> {
         mut visit: impl FnMut(u64, Root, &[u8]) -> ControlFlow<()>,
     ) -> Result<(), ReadError> {
         blocks::walk(&self.txn, from, low, |slot, root, ssz| {
-            let walked = self.walked.get() + 1;
-            self.walked.set(walked);
-            if walked.is_multiple_of(DEADLINE_EVERY) {
-                self.deadline.check()?;
-            }
+            self.step()?;
             Ok::<_, ReadError>(visit(slot, root, ssz))
         })
     }
 
-    /// The stamp's canonical block at `slot`: the one on the walk down from its head (from its
-    /// finalized block, for a slot at or below that). `None` for a skipped slot, a slot above
-    /// the head and one below what is stored.
+    /// Whether the finalized slot index covers `slot`, at or below the stamp's finalized slot:
+    /// from its floor up.
+    pub(crate) fn indexed(&self, slot: u64) -> Result<bool, ReadError> {
+        Ok(finalized::indexed_from(&self.txn)?.is_some_and(|from| slot >= from))
+    }
+
+    /// [`finalized::range`]: the indexed blocks of `start..end`, a [`Self::step`] per block.
+    pub(crate) fn finalized_range(
+        &self,
+        start: u64,
+        end: u64,
+        mut visit: impl FnMut(u64, Root, &[u8]),
+    ) -> Result<(), ReadError> {
+        finalized::range(&self.txn, start, end, |slot, root, ssz| {
+            self.step()?;
+            visit(slot, root, ssz);
+            Ok::<_, ReadError>(())
+        })
+    }
+
+    /// The stamp's canonical block at `slot`: the one on the walk down from its head; at or
+    /// below its finalized slot the index's, or below the index's floor the one on the walk
+    /// down from its finalized block. `None` for a skipped slot, a slot above the head and one
+    /// below what is stored.
     fn canonical_at(&self, stamp: &Stamp, slot: u64) -> Result<Option<Root>, ReadError> {
         if slot > stamp.head_slot {
             return Ok(None);
+        }
+        if slot <= stamp.finalized_slot && self.indexed(slot)? {
+            return Ok(finalized::root_at(&self.txn, slot)?);
         }
         let from = if slot <= stamp.finalized_slot {
             stamp.finalized_root
@@ -341,9 +383,12 @@ impl Snapshot<'_> {
     }
 
     /// Whether the block `(slot, root)` is finalized by `stamp`: at or below its finalized
-    /// slot and on its chain.
+    /// slot and the index's block there, a point lookup. Below the index's floor, `false`: not
+    /// proven, never a false `true`.
     fn finalized(&self, stamp: &Stamp, slot: u64, root: Root) -> Result<bool, ReadError> {
-        Ok(slot <= stamp.finalized_slot && self.canonical_at(stamp, slot)? == Some(root))
+        Ok(slot <= stamp.finalized_slot
+            && self.indexed(slot)?
+            && finalized::root_at(&self.txn, slot)? == Some(root))
     }
 
     fn block(&self, stamp: &Stamp, at: BlockRef) -> Result<Block, ReadError> {
@@ -378,10 +423,9 @@ impl Snapshot<'_> {
 /// A block's `finalized` is decided once, at the first block at or below the stamp's finalized
 /// slot (whether it is on the stamp's chain, read in that block's transaction), and holds for
 /// every block below it: a walk that reaches that slot on a fork reads its blocks below as not
-/// finalized, never the other way. Deciding it walks down from the finalized block, a read per
-/// stored block in between, so a first block more than [`crate::MAX_FINALIZED_DEPTH`] slots
-/// below the finalized slot is not walked to (#230): it reads `false`, not proven, never a
-/// false `true`, and so do the blocks below it.
+/// finalized, never the other way. Deciding it is a point lookup in the finalized slot index,
+/// at any depth; a first block below the index's floor reads `false`, not proven, never a false
+/// `true`, and so do the blocks below it.
 pub struct ParentWalk {
     reader: Arc<Reader>,
     deadline: Deadline,
@@ -441,8 +485,6 @@ impl ParentWalk {
             };
             let finalized = if decided || slot > stamp.finalized_slot {
                 None
-            } else if stamp.finalized_slot - slot > crate::MAX_FINALIZED_DEPTH {
-                Some(false)
             } else {
                 Some(snap.finalized(stamp, slot, root)?)
             };
@@ -504,7 +546,7 @@ mod tests {
         collections::BTreeSet,
         io::{BufRead, Read, Write},
         path::PathBuf,
-        sync::atomic::{AtomicU64, AtomicUsize},
+        sync::atomic::AtomicU64,
         thread,
     };
     use store_schema::{
@@ -1195,50 +1237,6 @@ mod tests {
         let blocks: Vec<&[u8]> = ssz.iter().map(Vec::as_slice).collect();
         store.import(&blocks, stamp(1, (n, parent), (n, parent)));
         roots
-    }
-
-    /// #230 D3a: a parent walk decides `finalized` once, at its first block at or below the
-    /// stamp's finalized slot, by walking down from the finalized block to it. That walk is
-    /// bounded: a block more than [`crate::MAX_FINALIZED_DEPTH`] (2,048) slots below the
-    /// finalized slot reads `finalized` false ("not proven", never a false `true`), as do the
-    /// blocks below it, after a few looks at the clock (no walk); one exactly 2,048 below is
-    /// walked to and reads `true`.
-    #[test]
-    fn blocks_by_head_deep_root_bounded() {
-        let store = Store::new();
-        let depth = crate::MAX_FINALIZED_DEPTH;
-        let top = depth + 70;
-        let roots = linear(&store, top);
-        let reader = Arc::new(store.reader());
-        let looks = Arc::new(AtomicUsize::new(0));
-        let clock: Clock = {
-            let (looks, t0) = (Arc::clone(&looks), Instant::now());
-            Arc::new(move || {
-                looks.fetch_add(1, Ordering::SeqCst);
-                t0
-            })
-        };
-        let walk = |slot: u64| {
-            looks.store(0, Ordering::SeqCst);
-            let deadline = Deadline::after(Arc::clone(&clock), Duration::from_secs(600));
-            let root = roots[usize::try_from(slot - 1).unwrap()];
-            let read: Vec<(u64, bool)> = ParentWalk::new(Arc::clone(&reader), root, 2, deadline)
-                .map(|b| b.map(|b| (b.value.slot, b.value.finalized)))
-                .collect::<Result<_, _>>()
-                .unwrap();
-            (read, looks.load(Ordering::SeqCst))
-        };
-        let deep = top - depth - 1;
-        let (read, deep_looks) = walk(deep);
-        assert_eq!(read, [(deep, false), (deep - 1, false)], "not proven");
-        assert!(
-            deep_looks <= 6,
-            "{deep_looks} looks: no walk to the finalized block"
-        );
-        let edge = top - depth;
-        let (read, edge_looks) = walk(edge);
-        assert_eq!(read, [(edge, true), (edge - 1, true)]);
-        assert!(edge_looks > 32, "walked: {edge_looks} looks");
     }
 
     /// #230 D3b: a walk's deadline bounds when a step may start; each step's read transaction

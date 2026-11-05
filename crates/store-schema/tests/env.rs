@@ -30,6 +30,7 @@ use libmdbx::{
 use store_schema::{
     blocks,
     env::{self, WriterOptions, DEFAULT_MAX_SIZE},
+    finalized,
     keys::{
         decode_slot_root_key, slot_root_key, Root, CONTIGUOUS_FROM_KEY, SCHEMA_VERSION_KEY,
         STAMP_KEY,
@@ -37,7 +38,7 @@ use store_schema::{
     stamp::{self, Stamp},
     tables::{
         BLOCKS, BLOCK_INDEX, COLUMNS, COLUMN_LINKS, COLUMN_ROOTS, ENVELOPES, FC_SNAPSHOT,
-        MAX_TABLES, META, STATES, TABLES,
+        FINALIZED_SLOTS, MAX_TABLES, META, STATES, TABLES,
     },
     txn::{self, Update},
     version::SCHEMA_VERSION,
@@ -281,8 +282,8 @@ fn v1_env(path: &Path, extra: &[&str]) -> Database<NoWriteMap> {
 }
 
 /// What every reader asserts in one RO txn: the stamp row is valid ([`stamp::read`]: its head
-/// and finalized blocks are stored), its head block is there, and no block is newer than its
-/// head; with no stamp, no block at all.
+/// and finalized blocks are stored), its head block is there, its finalized block is in the
+/// finalized slot index, and no block is newer than its head; with no stamp, no block at all.
 fn stamp_agrees_with_blocks<K: TransactionKind>(
     txn: &Transaction<'_, K, NoWriteMap>,
 ) -> Option<Stamp> {
@@ -301,6 +302,11 @@ fn stamp_agrees_with_blocks<K: TransactionKind>(
             assert!(
                 txn.get::<()>(&blocks, &head).unwrap().is_some(),
                 "the stamp's head block is missing"
+            );
+            assert_eq!(
+                finalized::root_at(txn, stamp.finalized_slot).unwrap(),
+                Some(stamp.finalized_root),
+                "the stamp's finalized block is not indexed in its snapshot"
             );
             let (slot, _) = newest.expect("a stamp without its blocks");
             assert!(
@@ -340,7 +346,8 @@ fn max_tables_before_create() {
             "states",
             "block_index",
             "envelopes",
-            "fc_snapshot"
+            "fc_snapshot",
+            "finalized_slots"
         ]
     );
     assert_eq!(
@@ -353,7 +360,8 @@ fn max_tables_before_create() {
             STATES,
             BLOCK_INDEX,
             ENVELOPES,
-            FC_SNAPSHOT
+            FC_SNAPSHOT,
+            FINALIZED_SLOTS
         ],
         TABLES
     );
@@ -559,7 +567,14 @@ fn a_legacy_column_env_is_upgraded_in_place() {
     .unwrap();
     assert_eq!(
         created,
-        [BLOCKS, STATES, BLOCK_INDEX, ENVELOPES, FC_SNAPSHOT]
+        [
+            BLOCKS,
+            STATES,
+            BLOCK_INDEX,
+            ENVELOPES,
+            FC_SNAPSHOT,
+            FINALIZED_SLOTS
+        ]
     );
     assert_eq!(
         meta_row(writer.raw_env(), SCHEMA_VERSION_KEY),
@@ -668,6 +683,7 @@ fn all_tables_created() {
         COLUMNS,
         COLUMN_ROOTS,
         COLUMN_LINKS,
+        FINALIZED_SLOTS,
     ]
     .map(String::from)
     .into();
@@ -847,13 +863,16 @@ fn a_v1_env_is_upgraded_in_place_rows_identical() {
         Ok::<_, Error>(())
     })
     .unwrap();
-    assert_eq!(created, [BLOCK_INDEX, ENVELOPES, FC_SNAPSHOT]);
+    assert_eq!(
+        created,
+        [BLOCK_INDEX, ENVELOPES, FC_SNAPSHOT, FINALIZED_SLOTS]
+    );
     let db = writer.raw_env();
     assert_eq!(
         meta_row(db, SCHEMA_VERSION_KEY),
         Some(SCHEMA_VERSION.to_be_bytes().to_vec())
     );
-    assert_eq!(SCHEMA_VERSION, 2);
+    assert_eq!(SCHEMA_VERSION, 3);
     for (table, old) in v1_tables.iter().zip(&before) {
         let mut new = rows(db, table);
         let mut old = old.clone();
@@ -877,7 +896,7 @@ fn a_v1_env_is_upgraded_in_place_rows_identical() {
     assert_eq!((stamp.head_slot, stamp.finalized_slot), (9, 3));
     drop(writer);
 
-    let reader = env::open_reader(dir.path()).expect("a v2 env opens");
+    let reader = env::open_reader(dir.path()).expect("a v3 env opens");
     drop(reader);
     let mut created = vec!["sentinel"];
     let writer = env::open_writer_with(dir.path(), opts(), |_, new: &[&'static str]| {
@@ -964,7 +983,10 @@ fn an_empty_unstamped_v1_store_upgrades() {
         Ok::<_, Error>(())
     })
     .unwrap();
-    assert_eq!(created, [BLOCK_INDEX, ENVELOPES, FC_SNAPSHOT]);
+    assert_eq!(
+        created,
+        [BLOCK_INDEX, ENVELOPES, FC_SNAPSHOT, FINALIZED_SLOTS]
+    );
     let db = writer.raw_env();
     assert_eq!(
         meta_row(db, SCHEMA_VERSION_KEY),
@@ -977,7 +999,7 @@ fn an_empty_unstamped_v1_store_upgrades() {
             .into_iter()
             .collect::<BTreeSet<_>>()
     );
-    for table in [BLOCKS, BLOCK_INDEX, ENVELOPES, FC_SNAPSHOT] {
+    for table in [BLOCKS, BLOCK_INDEX, ENVELOPES, FC_SNAPSHOT, FINALIZED_SLOTS] {
         assert_eq!(rows(db, table), vec![], "table {table}");
     }
     assert_eq!(meta_row(db, STAMP_KEY), None);
@@ -1089,7 +1111,7 @@ fn an_unstamped_open_adds_no_row_from_its_upgrade() {
     let slot = 5u64.to_be_bytes();
     let cgc = 8u64.to_be_bytes();
     // One row of each table: `(table, key, value)`.
-    let rows: [(&str, &[u8], &[u8]); 10] = [
+    let rows: [(&str, &[u8], &[u8]); 11] = [
         (COLUMNS, &column, b"column"),
         (COLUMN_ROOTS, &root, &slot),
         (META, b"cgc", &cgc),
@@ -1100,6 +1122,7 @@ fn an_unstamped_open_adds_no_row_from_its_upgrade() {
         (BLOCK_INDEX, &root, &slot),
         (ENVELOPES, &block, b"envelope"),
         (FC_SNAPSHOT, b"fc", b"snapshot"),
+        (FINALIZED_SLOTS, &slot, &root),
     ];
     for table in TABLES {
         assert!(rows.iter().any(|(t, ..)| *t == table), "no row of {table}");

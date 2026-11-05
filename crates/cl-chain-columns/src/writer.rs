@@ -728,6 +728,20 @@ impl ColumnWriter {
         })
     }
 
+    /// One batch of the finalized slot index's backfill ([`store_schema::finalized::backfill`]):
+    /// at most `batch` slots, down to `floor`, in one background-priority write transaction with
+    /// the stamp carried. The new from slot, or `None` with nothing committed once none is due.
+    pub fn index_finalized_batch(&self, floor: u64, batch: u64) -> Result<Option<u64>> {
+        self.write_txn(Priority::Background, |txn| {
+            Ok(
+                match store_schema::finalized::backfill(txn, floor, batch)? {
+                    Some(from) => Commit::Yes(Some(from)),
+                    None => Commit::No(None),
+                },
+            )
+        })
+    }
+
     /// Runs `body` in one write txn under a scheduler permit and commits if it asks to, with
     /// the env's stamp carried ([`store_schema::txn::commit`]): a stamp that no longer checks
     /// out fails the commit, and nothing of the txn is written.

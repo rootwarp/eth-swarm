@@ -16,18 +16,25 @@
 //!    with no Status of ours it is `2: ServerError`. When the floor is above the start of the
 //!    block serve window (`network_config::window`, L1527–1530: the node is not compliant
 //!    until it backfilled), that is logged once and shown in `rpc_block_window_gap_slots`.
+//!    A start below the window's start and at or below the highest `F0` read so far (finality
+//!    only advances, so that is still finalized) is `3` too, at once (counted as
+//!    `{store, window}`): expired finalized history.
 //! 2. **A lookup slot**: at most [`super::limits::RpcLimits::max_block_lookups`] answers hold
 //!    IPC calls at once; one past them waits for a slot up to [`BLOCK_LOOKUP_TIMEOUT`], then
 //!    is `2`.
 //! 3. **The split**: the store's finalized slot `F0`, read first ([`BlockSource::finalized_slot`],
-//!    cl-store's `GetChainHead.finalized_slot`). The blocks of `[start, min(end, F0 + 1))` come
-//!    from cl-store, then those of `[max(start, F0 + 1), end)` from cl-chain, each half asked
-//!    for only if it is not empty. Finality only advances and cl-store is never ahead of
+//!    cl-store's `GetChainHead.finalized_slot`). A start below the window's start and at or
+//!    below `F0` is `3` (`{store, window}`), the whole request, whatever of it reaches into the
+//!    window: cl-store finds any range inside the window in its finalized slot index in one
+//!    seek, so the window is the only floor below `F0`, and finalized history deeper than it is
+//!    never asked for. The window does not account for finality (L1532–1536): a start above
+//!    `F0` is served even below the window's start. The blocks of `[start, min(end, F0 + 1))`
+//!    come from cl-store, then those of `[max(start, F0 + 1), end)` from cl-chain, each half
+//!    asked for only if it is not empty. Finality only advances and cl-store is never ahead of
 //!    cl-chain, so a later store read still holds every finalized block up to `F0`, and
 //!    cl-chain's head descends from `F0`'s block: no gap and no duplicate, whatever finality
-//!    does meanwhile. A start more than [`MAX_FINALIZED_DEPTH`] below `F0` is
-//!    `3: ResourceUnavailable` before cl-store is asked (counted as `{store, depth}`): its walk
-//!    down from `F0` costs a block per slot whatever `count` is.
+//!    does meanwhile. A start inside the window that cl-store has not indexed yet (its backfill
+//!    still under way) is its `UNAVAILABLE`: `3`.
 //! 4. **One chain**: blocks go out in ascending slot order inside the range, each block's
 //!    `parent_root` the root of the block before it (L1558–1572). A block that breaks that ends
 //!    the answer at the last whole chunk (L1574–1575: the view changed), counted, never an
@@ -57,7 +64,7 @@ use p2p_wire::rpc::messages::BlocksByRangeV2Request;
 use p2p_wire::rpc::protocols::{Request, Response, ResultCode};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -67,17 +74,6 @@ use tokio::sync::Semaphore;
 /// head read, opening a half's stream, each block of it) has its own; the stream's writer cuts
 /// the whole answer at the first-byte and total deadlines.
 pub const BLOCK_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// How far below the store's finalized slot `F0` a range may start \[est\]: 2,048 slots (64
-/// epochs of 32 slots, about 6.8 hours). An answer costs `count` tokens, but cl-store reads the
-/// finalized half by walking the parents down from its finalized block, one stored block per
-/// slot between `F0` and `start_slot` whatever `count` is, so uncapped a one-token request
-/// deep in history walks all of it. A start below `F0 - MAX_FINALIZED_DEPTH` is
-/// `3: ResourceUnavailable` before cl-store is asked: bounded work per request until a
-/// finalized slot index (slot to root) lands, which reaches any depth in one lookup. cl-store
-/// refuses the same depth itself (`cl_store::MAX_FINALIZED_DEPTH`; `tests/byrange_serve.rs`
-/// pins the two together).
-pub const MAX_FINALIZED_DEPTH: u64 = 2_048;
 
 /// Which half of an answer a block comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -105,7 +101,8 @@ pub struct Failed {
     /// The result code the answer ends with if nothing went out yet.
     pub code: ResultCode,
     /// The metric's `kind` label: `status` (the call failed), `refused` (an error chunk),
-    /// `contract`, `timeout`, `order`, `link`, `decode` or `depth` (a start too far below `F0`).
+    /// `contract`, `timeout`, `order`, `link`, `decode` or `window` (a start in finalized
+    /// history below the serve window).
     pub kind: &'static str,
     /// What happened, for the log.
     pub why: String,
@@ -185,10 +182,11 @@ pub struct ByRangeResponder {
     lookups: Arc<Semaphore>,
     metrics: Option<RpcMetrics>,
     window: Option<WindowStart>,
+    /// The highest `F0` read so far: never above the store's finalized slot now, finality only
+    /// advancing (0 before the first read: slot 0 is final whatever `F0` is).
+    finalized: Arc<AtomicU64>,
     /// Whether the floor above the window's start was logged.
     warned: Arc<AtomicBool>,
-    /// The deepest start below `F0` served ([`MAX_FINALIZED_DEPTH`]).
-    max_depth: u64,
     /// The store streams of the ByHead answers it builds ([`Self::head_responder`]).
     head_streams: StoreStreams,
 }
@@ -209,8 +207,8 @@ impl ByRangeResponder {
             lookups: Arc::new(Semaphore::new(max_lookups.min(Semaphore::MAX_PERMITS))),
             metrics,
             window: None,
+            finalized: Arc::default(),
             warned: Arc::default(),
-            max_depth: MAX_FINALIZED_DEPTH,
             head_streams: StoreStreams::new(
                 MAX_BYHEAD_STORE_STREAMS,
                 MAX_BYHEAD_STORE_STREAMS_PER_IP,
@@ -218,15 +216,8 @@ impl ByRangeResponder {
         }
     }
 
-    /// The same responder, serving starts at most `depth` slots below `F0`.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn with_max_depth(mut self, depth: u64) -> Self {
-        self.max_depth = depth;
-        self
-    }
-
-    /// The same responder, comparing its floor with `window`'s start (see the module docs).
+    /// The same responder, refusing starts in finalized history below `window`'s start and
+    /// comparing its floor with it (see the module docs).
     #[must_use]
     pub fn with_window(mut self, window: WindowStart) -> Self {
         self.window = Some(window);
@@ -269,9 +260,9 @@ impl ByRangeResponder {
         failed
     }
 
-    /// Compares the floor `eas` with the serve window's start.
-    fn check_window(&self, eas: u64) {
-        let Some(start) = self.window.as_ref().and_then(|window| window()) else {
+    /// Compares the floor `eas` with the serve window's start, if known.
+    fn check_window(&self, eas: u64, start: Option<u64>) {
+        let Some(start) = start else {
             return;
         };
         if let Some(metrics) = &self.metrics {
@@ -285,6 +276,21 @@ impl ByRangeResponder {
                  below earliest_available_slot get 3: ResourceUnavailable until backfill"
             );
         }
+    }
+
+    /// `3` for `start`, below the serve window's start `window` and at or below the finalized
+    /// slot `finalized`: expired finalized history, counted as `{store, window}`.
+    fn expired(&self, start: u64, window: u64, finalized: u64) -> Failed {
+        let why = format!(
+            "start_slot {start} below the serve window's start {window}, at or below F0 \
+             {finalized}"
+        );
+        let expired = Failed {
+            code: ResultCode::ResourceUnavailable,
+            kind: "window",
+            why,
+        };
+        self.failed(Half::Store, expired)
     }
 
     /// The answer to `range` into `out` (see the module docs).
@@ -308,7 +314,15 @@ impl ByRangeResponder {
                 ),
             });
         }
-        self.check_window(eas);
+        let window = self.window.as_ref().and_then(|window| window());
+        self.check_window(eas, window);
+        // Below the window only finalized history is refused: at once when an `F0` read before
+        // proves the start finalized, else once `F0` is read.
+        let below = window.filter(|start| range.start_slot < *start);
+        let known = self.finalized.load(Ordering::Relaxed);
+        if let Some(window) = below.filter(|_| range.start_slot <= known) {
+            return Err(self.expired(range.start_slot, window, known));
+        }
         let count = if range.step > 1 {
             range.count.min(1)
         } else {
@@ -321,17 +335,9 @@ impl ByRangeResponder {
         };
         let finalized = self.source.finalized_slot().await;
         let finalized = finalized.map_err(|f| self.failed(Half::Store, f))?;
-        if start < finalized.saturating_sub(self.max_depth) {
-            let why = format!(
-                "start_slot {start} more than {} slots below F0 {finalized}",
-                self.max_depth
-            );
-            let deep = Failed {
-                code: ResultCode::ResourceUnavailable,
-                kind: "depth",
-                why,
-            };
-            return Err(self.failed(Half::Store, deep));
+        self.finalized.fetch_max(finalized, Ordering::Relaxed);
+        if let Some(window) = below.filter(|_| start <= finalized) {
+            return Err(self.expired(start, window, finalized));
         }
         let split = finalized.saturating_add(1);
         if start < split {
@@ -554,8 +560,6 @@ pub(crate) mod testing {
         script: Mutex<HashMap<Step, Act>>,
         /// Blocks the chain half serves in place of the canonical one at a slot.
         replaced: Mutex<Vec<(u64, ServedBlock)>>,
-        /// What the store half takes per slot walked before it opens.
-        walk_cost: Mutex<Option<Duration>>,
         /// Blocks the store holds besides [`chain`]'s (fork blocks), found by root.
         known: Mutex<Vec<ServedBlock>>,
         /// Blocks a parent walk sends in place of its `n`th.
@@ -588,6 +592,11 @@ pub(crate) mod testing {
             fake
         }
 
+        /// The store's finalized slot is `slot` from now on.
+        pub(crate) fn finalize_at(&self, slot: u64) {
+            self.0.finalized.store(slot, Ordering::SeqCst);
+        }
+
         /// From the next head read on, the finalized slot moves to `slot` once it was read.
         pub(crate) fn advance_after_head(&self, slot: u64) {
             *self.0.advance_to.lock().unwrap() = Some(slot);
@@ -601,12 +610,6 @@ pub(crate) mod testing {
         /// The chain half serves `block` in place of the canonical block at slot `at`.
         pub(crate) fn replace(&self, at: u64, block: ServedBlock) {
             self.0.replaced.lock().unwrap().push((at, block));
-        }
-
-        /// From now on the store half takes `per_slot` for each slot from its finalized slot
-        /// down to the range's start before it opens, as cl-store's parent walk does.
-        pub(crate) fn walk_cost(&self, per_slot: Duration) {
-            *self.0.walk_cost.lock().unwrap() = Some(per_slot);
         }
 
         /// The store holds `block` too (off [`chain`]), found by its root.
@@ -699,12 +702,6 @@ pub(crate) mod testing {
                 }
                 let end = start.saturating_add(count);
                 let finalized = fake.0.finalized.load(Ordering::SeqCst);
-                let cost = *fake.0.walk_cost.lock().unwrap();
-                if let Some(per_slot) = cost.filter(|_| half == Half::Store) {
-                    let walked = finalized.saturating_sub(start);
-                    let walked = u32::try_from(walked).unwrap_or(u32::MAX);
-                    tokio::time::sleep(per_slot.saturating_mul(walked)).await;
-                }
                 let replaced = fake.0.replaced.lock().unwrap().clone();
                 let blocks: Vec<ServedBlock> = chain()
                     .into_iter()

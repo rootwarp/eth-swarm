@@ -80,6 +80,7 @@ use libmdbx::{
 
 use crate::{
     env::{RoTxn, WriterEnv},
+    finalized,
     keys::{CONTIGUOUS_FROM_KEY, SCHEMA_VERSION_KEY, STAMP_KEY},
     stamp::{self, Stamp},
     tables::{BLOCKS, BLOCK_INDEX, META, TABLES},
@@ -266,7 +267,8 @@ pub fn seed_unstamped(writer: &WriterEnv, table: &str, rows: &[(&[u8], &[u8])]) 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Update {
     /// A new head or finalized checkpoint (block import), checked as [`stamp::read`] checks a
-    /// stored one before it is written, and against the stamp stored before it, if any:
+    /// stored one before it is written, and against the stamp stored before it, if any. A
+    /// finalized block that moves is indexed in the same transaction ([`finalized`]):
     /// `head_seq` never goes down ([`Error::StampSeqDecrease`]), one `head_seq` names one head
     /// root ([`Error::StampSeqReused`]), and the finalized slot never goes down
     /// ([`Error::StampFinalizedDecrease`]). The same stamp again, and any forward move (a reorg
@@ -290,10 +292,13 @@ pub fn commit(txn: RwTxn<'_>, update: Update) -> Result<Option<Stamp>> {
         Update::New(new) => {
             new.check(&txn)?;
             let meta = txn.open_table(Some(META))?;
-            if let Some(row) = txn.get::<Vec<u8>>(&meta, STAMP_KEY)? {
-                // Decoded only: the txn may have pruned the stored stamp's blocks.
-                moves_forward(&Stamp::decode(&row)?, &new)?;
+            // Decoded only: the txn may have pruned the stored stamp's blocks.
+            let stored = txn.get::<Vec<u8>>(&meta, STAMP_KEY)?;
+            let stored = stored.map(|row| Stamp::decode(&row)).transpose()?;
+            if let Some(stored) = &stored {
+                moves_forward(stored, &new)?;
             }
+            finalized::advance(&txn, stored.as_ref(), &new)?;
             Some(new)
         }
         Update::Carry => Some(stamp::read(&txn)?.ok_or(Error::CarryBeforeFirstStamp)?),
@@ -427,8 +432,8 @@ mod tests {
         keys::{slot_root_key, Root, STAMP_KEY},
         stamp::tests::{env_with_blocks, valid, A, B},
         tables::{
-            BLOCKS, BLOCK_INDEX, COLUMNS, COLUMN_LINKS, COLUMN_ROOTS, ENVELOPES, FC_SNAPSHOT, META,
-            STATES, TABLES,
+            BLOCKS, BLOCK_INDEX, COLUMNS, COLUMN_LINKS, COLUMN_ROOTS, ENVELOPES, FC_SNAPSHOT,
+            FINALIZED_SLOTS, META, STATES, TABLES,
         },
         testkit::{fulu_block_ssz, schedule, E},
     };
@@ -844,7 +849,7 @@ mod tests {
         let slot = 5u64.to_be_bytes();
         let cgc = 8u64.to_be_bytes();
         // One row of each table: `(table, key, value)`.
-        let rows: [(&str, &[u8], &[u8]); 10] = [
+        let rows: [(&str, &[u8], &[u8]); 11] = [
             (COLUMNS, &column, b"column"),
             (COLUMN_ROOTS, &A, &slot),
             (META, b"cgc", &cgc),
@@ -855,6 +860,7 @@ mod tests {
             (BLOCK_INDEX, &A, &slot),
             (ENVELOPES, &block, b"envelope"),
             (FC_SNAPSHOT, b"fc", b"snapshot"),
+            (FINALIZED_SLOTS, &slot, &A),
         ];
         for table in TABLES {
             assert!(rows.iter().any(|(t, ..)| *t == table), "no row of {table}");

@@ -30,8 +30,9 @@
 //! - `rpc_block_lookup_failures_total{half, kind}`: BeaconBlocksByRange and BeaconBlocksByHead
 //!   lookups that ended an answer ([`crate::rpc::blocks`], [`crate::rpc::blocks_head`]: every
 //!   parent walk is `store`), by half (`store`, `chain`) and kind (`status`, `refused`,
-//!   `contract`, `timeout`, the chain breaks `order`, `link`, `decode`, and `depth`: a start
-//!   too far below the store's finalized slot).
+//!   `contract`, `timeout`, the chain breaks `order`, `link`, `decode`, and `window`: a start
+//!   at or below the store's finalized slot, or a walk's block, below the start of the block
+//!   serve window).
 //! - `rpc_block_window_gap_slots`: slots from the start of the block serve window to our
 //!   `earliest_available_slot`, set at each BeaconBlocksByRange answer; above 0 the node does
 //!   not serve the whole window yet (`phase0/p2p-interface.md` L1527–1541, backfill).

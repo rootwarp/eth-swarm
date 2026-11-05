@@ -35,6 +35,11 @@ pub const SCHEMA_VERSION_KEY: &[u8] = b"schema_version";
 /// ([`crate::txn::commit`]): exactly [`crate::stamp::STAMP_LEN`] bytes, checked on every read.
 pub const STAMP_KEY: &[u8] = b"stamp";
 
+/// `meta` row of the lowest slot the finalized slot index covers without gaps, up to the
+/// stamp's finalized slot (`u64 BE`, [`crate::finalized`]): 0 once it reaches the bottom of the
+/// stored chain; none while it covers nothing.
+pub const FINALIZED_INDEX_FROM_KEY: &[u8] = b"finalized_index_from";
+
 /// `meta` row of cl-chain-columns' contiguous-from slot (its `CONTIGUOUS_FROM_KEY` is this
 /// one), named here because its migration in the writer's open
 /// ([`crate::env::open_writer_with`]) may add the row before the first stamp: with
