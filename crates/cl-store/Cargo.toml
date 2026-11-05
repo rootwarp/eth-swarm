@@ -48,7 +48,8 @@ store-schema = { path = "../store-schema", features = ["test-hooks"] }
 # Same crate libmdbx links; `cannot_write` tries writes straight through the C API.
 mdbx-sys = "=12.13.2"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+# test-util: a stalled GetBlocksByHead stream's tests run on a paused clock.
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "test-util"] }
 # cl-chain's EventsService served on a Unix socket (tonic's incoming stream).
 tokio-stream = { version = "0.1", features = ["net"] }
 # Real blocks from store-schema's tests/common, built and encoded in code (no spec vectors).

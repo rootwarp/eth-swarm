@@ -4,12 +4,15 @@
 #
 # Run as root (the root-tests CI job). It builds cl-store's lib test binary and cl-chain-columns'
 # fill_env example (the production writer paths, as scripts/mdbx-chk-envs.sh uses it), copies
-# both into a fresh 0755 temp directory, and makes the env directory there, owned
-# WRITER:GROUP with mode 0750 (GROUP: READER's primary group, the store group). fill_env fills
-# it as WRITER (`sudo -u`). Then, as [5.43] has it, mdbx.dat is 0640 and mdbx.lck 0660, both
-# in GROUP. The two tests run as READER (`sudo -u`), with CL_STORE_TWO_USER_ENV naming the
-# env. Each prints a `two-user: <test> ok` line once it has checked that env as that user; the
-# run fails unless both lines are there, so a test that skipped or was filtered out fails it.
+# both into a fresh 0755 temp directory, and makes the env directory there as cl-node
+# provisions it: owned WRITER:GROUP, setgid, mode 2750 (GROUP: READER's primary group, the
+# store group), so the files the writer creates are in GROUP. Nothing else: fill_env fills it
+# as WRITER (`sudo -u`) under umask 0077, the units' UMask=, and the writer sets every mode
+# of the [5.43] layout itself (store-schema's env: mdbx.dat 0640, mdbx.lck 0660, the
+# directory 0750, its setgid bit kept). The two tests run as READER (`sudo -u`), with
+# CL_STORE_TWO_USER_ENV naming the env. Each prints a `two-user: <test> ok` line once it has
+# checked that env as that user; the run fails unless both lines are there, so a test that
+# skipped or was filtered out fails it.
 #
 # Usage: scripts/store-two-users.sh WRITER READER
 # Env: CARGO (default `cargo`), SUDO (default `sudo`), CARGO_TARGET_DIR.
@@ -75,12 +78,14 @@ cp "$fill" "$base/fill_env"
 chmod 0755 "$base/cl-store-tests" "$base/fill_env"
 env_dir="$base/env"
 mkdir "$env_dir"
+# cl-node's provisioning: the directory and its group only. The writer sets every mode.
 chown "$writer:$group" "$env_dir"
-chmod 0750 "$env_dir"
+chmod 2750 "$env_dir"
 cd "$base"
 
 rc=0
-"$sudo" -u "$writer" "$base/fill_env" "$env_dir" || rc=$?
+# sudo keeps a umask stricter than its own default (0022), so the writer runs under 0077.
+(umask 0077 && "$sudo" -u "$writer" "$base/fill_env" "$env_dir") || rc=$?
 if ((rc != 0)); then
   echo "ERROR: fill_env as $writer failed (exit $rc)"
   exit 1
@@ -91,10 +96,6 @@ for file in mdbx.dat mdbx.lck; do
     exit 1
   fi
 done
-chgrp "$group" "$env_dir/mdbx.dat" "$env_dir/mdbx.lck"
-chmod 0640 "$env_dir/mdbx.dat"
-chmod 0660 "$env_dir/mdbx.lck"
-
 rc=0
 # shellcheck disable=SC2086 # $tests is the list of test names
 out=$("$sudo" -u "$reader" env CL_STORE_TWO_USER_ENV="$env_dir" "$base/cl-store-tests" \

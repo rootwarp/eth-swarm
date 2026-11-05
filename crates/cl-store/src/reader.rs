@@ -706,10 +706,12 @@ mod tests {
     }
 
     /// The two-user run only ([`TWO_USER_ENV`]; skipped otherwise): the env is laid out as
-    /// [5.43] has it, and this user, the reader's, cannot write it. The directory is 0750, the
-    /// data file 0640 and the lock file 0660, each owned by another user (the writer's) and in
-    /// this user's group (the store group). The data file does not open for writing and no
-    /// file can be created in the directory, yet the env opens read-only and serves its head.
+    /// [5.43] has it, by the writer itself under umask 0077, and this user, the reader's,
+    /// cannot write it. The directory is 0750 and setgid (2750, cl-node's provisioning keeps
+    /// the files in its group), the data file 0640 and the lock file 0660, each owned by
+    /// another user (the writer's) and in this user's group (the store group). The data file
+    /// does not open for writing and no file can be created in the directory, yet the env
+    /// opens read-only and serves its head.
     #[test]
     fn env_permissions() {
         use std::os::unix::fs::MetadataExt;
@@ -723,7 +725,7 @@ mod tests {
             ipc::peercred::effective_gid(),
         );
         assert_ne!(uid, 0, "run as the reader's user, not as root");
-        for (name, mode) in [(".", 0o750), ("mdbx.dat", 0o640), ("mdbx.lck", 0o660)] {
+        for (name, mode) in [(".", 0o2750), ("mdbx.dat", 0o640), ("mdbx.lck", 0o660)] {
             let meta = std::fs::metadata(path.join(name)).unwrap();
             assert_eq!(meta.mode() & 0o7777, mode, "{name}: mode {:o}", meta.mode());
             assert_ne!(meta.uid(), uid, "{name} is the writer's, not this user's");

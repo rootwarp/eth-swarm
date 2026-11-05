@@ -925,6 +925,119 @@ mod tests {
         drop(placed().await);
     }
 
+    /// A `GetBlocksByHead` request for `count` blocks down from `root`, with its hello.
+    fn head_request(root: &Root, count: u64) -> Request<pb::GetBlocksByHeadRequest> {
+        Request::new(pb::GetBlocksByHeadRequest {
+            root: root.to_vec(),
+            count,
+            hello: Some(fixture::v1_link().local()),
+        })
+    }
+
+    /// Vera N2, Cole NIT 3 (and #303 N4): a client that never reads its `GetBlocksByHead`
+    /// stream holds the walk's reader only until that reader is found broken, not for the
+    /// stream's life ([`HEAD_WALK_TIMEOUT`]). On a real env opened read-only (MDBX refuses a
+    /// second open of it in this process while the old handle lives), once a read finds the
+    /// reader broken the stalled stream ends and drops it, and the env reopens read-only far
+    /// sooner, on a paused clock. The stream ends after the hello it never read: no room for
+    /// an UNAVAILABLE frame, which is not waited for.
+    #[test]
+    fn blocks_by_head_broken_reader_ends_a_stalled_stream() {
+        use tokio_stream::StreamExt as _;
+        let _serial = crate::testkit::serial();
+        let dir = tempfile::tempdir().unwrap();
+        let blocks = chain(8);
+        {
+            let writer = store_schema::env::test_writer(dir.path()).unwrap();
+            let all: Vec<&[u8]> = blocks.iter().map(|b| b.ssz.as_slice()).collect();
+            crate::testkit::import(&writer, &all, stamp_of(1, &blocks[7], &blocks[0]));
+        }
+        let store = Arc::new(Recovering::open(dir.path()));
+        let server = StoreServer::recovering(fixture::v1_link(), Arc::clone(&store));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let start = tokio::time::Instant::now();
+            let soon = HEAD_WALK_TIMEOUT / 10;
+            // Never read: its one-frame queue holds the hello, and its first body waits.
+            let stalled = server
+                .get_blocks_by_head(head_request(&blocks[7].root, 8))
+                .await
+                .unwrap()
+                .into_inner();
+            let reader = store.reader().unwrap();
+            let held = Arc::downgrade(&reader);
+            reader.poison();
+            drop(reader);
+            // A hint makes each read try a reopen at once, whatever the backoff.
+            loop {
+                store.hint();
+                if store.read(|r| r.head(&crate::testkit::deadline())).is_ok() {
+                    break;
+                }
+                assert!(
+                    start.elapsed() < soon,
+                    "no reopen in {soon:?}: the stalled stream still holds the broken reader \
+                     ({} holders)",
+                    held.strong_count()
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(held.strong_count(), 0, "the broken reader is gone");
+            assert!(start.elapsed() < soon, "reopened at {:?}", start.elapsed());
+            let frames: Vec<_> = stalled.collect().await;
+            assert_eq!(frames.len(), 1, "the hello, then the end: {frames:?}");
+            assert!(frames[0].is_ok());
+            assert!(
+                start.elapsed() < soon,
+                "the stream ended at {:?}",
+                start.elapsed()
+            );
+        });
+    }
+
+    /// A reader found broken mid-walk ends the `GetBlocksByHead` stream before its next step:
+    /// a client reading along gets at most the one body already queued, then the end
+    /// (UNAVAILABLE when there was room for it), never the rest of the walk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocks_by_head_broken_reader_takes_no_further_step() {
+        use tokio_stream::StreamExt as _;
+        let store = Store::new();
+        let blocks = chain(8);
+        let all: Vec<&[u8]> = blocks.iter().map(|b| b.ssz.as_slice()).collect();
+        store.import(&all, stamp_of(1, &blocks[7], &blocks[0]));
+        let reader = Arc::new(store.reader());
+        let server = StoreServer::new(fixture::v1_link(), Arc::clone(&reader));
+        let mut stream = server
+            .get_blocks_by_head(head_request(&blocks[7].root, 8))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut bodies = 0;
+        while bodies < 1 {
+            let message = stream.next().await.expect("a frame").expect("not an error");
+            if let Frame::Body(_) = message.into_frame().expect("hello or body") {
+                bodies += 1;
+            }
+        }
+        reader.poison();
+        let rest: Vec<_> = stream.collect().await;
+        let mut after = 0;
+        for frame in &rest {
+            match frame {
+                Ok(message) => match message.clone().into_frame().expect("hello or body") {
+                    Frame::Body(_) => after += 1,
+                    Frame::Hello(_) => panic!("a second hello"),
+                },
+                Err(status) => assert_eq!(status.code(), Code::Unavailable, "{status:?}"),
+            }
+        }
+        assert!(after <= 1, "{after} bodies after the reader broke");
+    }
+
     /// A read txn held past the call's deadline fails the call `DEADLINE_EXCEEDED`, on every
     /// served RPC (`GetBlocksByHead`: its first step's txn, past the call timeout from the
     /// call's start). The method ACL gives every method of the descriptor to cl-api, cl-sync and
