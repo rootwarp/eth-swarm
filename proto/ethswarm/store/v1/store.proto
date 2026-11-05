@@ -155,10 +155,13 @@ message GetChainHeadResponse {
 }
 
 // A block and its ancestors, newest first: the block at `root`, then its parent, and so on, one
-// block per body (BeaconBlocksByHead). The stream is stamped once, from the read transaction that
-// finds `root`; each further block is read in its own short read transaction under the call's
-// deadline, and the walk does not stop when the stamp changes. It ends with OK after `count`
-// blocks, at a parent that is not stored, or with no body at all for an unknown `root`.
+// block per body. cl-p2p calls it for BeaconBlocksByHead v1 and reads it at its peer's pace. The
+// stream is stamped once, from the read transaction that finds `root`, which runs under the
+// call's deadline (2 s) before the stream opens; each further block is read in its own short
+// read transaction, ended 2 s after its step started, and the walk does not stop when the stamp
+// changes. The stream lives 10 s: a step that would start later fails DEADLINE_EXCEEDED after the
+// bodies already sent. It ends with OK after `count` blocks, at a parent that is not stored,
+// after slot 0, or with no body at all for an unknown `root`.
 message GetBlocksByHeadRequest {
   // 32 bytes. Block root (hash_tree_root of the BeaconBlock).
   bytes root = 1;
@@ -182,7 +185,9 @@ message GetBlocksByHeadResponseBody {
   // PAYLOAD_TYPE_SIGNED_BEACON_BLOCK, one per message; `root` is the block root. SSZ max
   // MAX_PAYLOAD_SIZE = 10485760 bytes.
   ethswarm.common.v1.Envelope block = 1;
-  // The same stamp on every body of the stream: that of its first read transaction.
+  // The same stamp on every body of the stream: that of its first read transaction. `finalized`
+  // is decided at the first block at or below the stamp's finalized slot; for one more than
+  // 2,048 slots below it, and every block after it, it is false (not proven, never a false true).
   ReadMeta meta = 2;
   ethswarm.common.v1.Error error = 3;
 }

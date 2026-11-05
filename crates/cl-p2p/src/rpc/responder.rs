@@ -54,14 +54,16 @@ pub type Serving = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// Serves the requests of one protocol as streamed answers (see the module docs).
 ///
-/// [`super::inbound::Control`] checks a request before it reaches the responder (a count over
-/// its cap is `1: InvalidRequest`, never clamped), books [`Self::cost`] tokens of the peer's
+/// [`super::inbound::Control`] checks a request before it reaches the responder (a BlocksByRange
+/// `count` over its cap is `1: InvalidRequest`, never clamped; a BlocksByHead one is served as
+/// that cap, `fulu/p2p-interface.md` L820–821), books [`Self::cost`] tokens of the peer's
 /// quota for it, and once the first of them is due calls [`Self::serve`] on the answer's own
 /// task, running its future until it returns or the stream ends (written, reset, timed out),
 /// whichever is first.
 pub trait Responder<E: EthSpec>: Send + Sync + 'static {
     /// The tokens of the peer's (peer, protocol) quota `request` is charged when it is
-    /// admitted: by default the items it asks for (BlocksByRange `count`; a column range
+    /// admitted: by default the items it asks for (BlocksByRange `count`; BlocksByHead
+    /// `min(count, 128)`; a column range
     /// `count × len(columns)`; by root, the items it names; 1 on a single-response protocol).
     /// Its chunks go out at those tokens, and those it did not use, past one for its read, go
     /// back once it ended (not after a reset).

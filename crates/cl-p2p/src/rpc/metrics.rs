@@ -27,8 +27,9 @@
 //!   goes to its stream.
 //! - `rpc_inbound_streams_refused_total`: inbound streams answered `2: ServerError` because
 //!   `max_inbound_streams` streamed answers were open ([`crate::rpc::limits::RpcLimits`]).
-//! - `rpc_block_lookup_failures_total{half, kind}`: BeaconBlocksByRange lookups that ended an
-//!   answer ([`crate::rpc::blocks`]), by half (`store`, `chain`) and kind (`status`, `refused`,
+//! - `rpc_block_lookup_failures_total{half, kind}`: BeaconBlocksByRange and BeaconBlocksByHead
+//!   lookups that ended an answer ([`crate::rpc::blocks`], [`crate::rpc::blocks_head`]: every
+//!   parent walk is `store`), by half (`store`, `chain`) and kind (`status`, `refused`,
 //!   `contract`, `timeout`, the chain breaks `order`, `link`, `decode`, and `depth`: a start
 //!   too far below the store's finalized slot).
 //! - `rpc_block_window_gap_slots`: slots from the start of the block serve window to our
@@ -159,7 +160,7 @@ pub fn protocol_label(protocol: Protocol) -> &'static str {
         Protocol::GoodbyeV1 => "goodbye",
         Protocol::DataColumnsByRangeV1 => "data_column_sidecars_by_range",
         Protocol::DataColumnsByRootV1 => "data_column_sidecars_by_root",
-        Protocol::BlocksByHeadV1 => todo!("#230"),
+        Protocol::BlocksByHeadV1 => "beacon_blocks_by_head",
     }
 }
 

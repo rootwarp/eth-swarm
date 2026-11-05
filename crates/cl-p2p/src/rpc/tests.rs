@@ -503,7 +503,8 @@ impl RawPeer {
             | ProtocolsEvent::Goodbye(e)
             | ProtocolsEvent::BlocksByRange(e)
             | ProtocolsEvent::DataColumnsByRange(e)
-            | ProtocolsEvent::DataColumnsByRoot(e) => e,
+            | ProtocolsEvent::DataColumnsByRoot(e)
+            | ProtocolsEvent::BlocksByHead(e) => e,
         };
         match event {
             DuplexEvent::Inbound(Event::Message {
@@ -1721,7 +1722,6 @@ fn unsupported_ids_stay_unregistered() {
 #[derive(libp2p::swarm::NetworkBehaviour)]
 #[behaviour(prelude = "libp2p::swarm::derive_prelude")]
 struct UnsupportedRequests {
-    blocks_by_head: request_response::Behaviour<BytesCodec>,
     envelopes_by_range: request_response::Behaviour<BytesCodec>,
     envelopes_by_root: request_response::Behaviour<BytesCodec>,
     status: request_response::Behaviour<BytesCodec>,
@@ -1740,7 +1740,6 @@ type Which = Option<Unsupported>;
 impl Requester {
     async fn connect(node: &Node) -> Self {
         let mut swarm = tcp_swarm(UnsupportedRequests {
-            blocks_by_head: bytes_behaviour(Unsupported::BlocksByHeadV1.id()),
             envelopes_by_range: bytes_behaviour(Unsupported::EnvelopesByRangeV1.id()),
             envelopes_by_root: bytes_behaviour(Unsupported::EnvelopesByRootV1.id()),
             status: bytes_behaviour(Protocol::StatusV2.id()),
@@ -1767,7 +1766,6 @@ impl Requester {
     fn behaviour(&mut self, which: Which) -> &mut request_response::Behaviour<BytesCodec> {
         let requests = self.swarm.behaviour_mut();
         match which {
-            Some(Unsupported::BlocksByHeadV1) => &mut requests.blocks_by_head,
             Some(Unsupported::EnvelopesByRangeV1) => &mut requests.envelopes_by_range,
             Some(Unsupported::EnvelopesByRootV1) => &mut requests.envelopes_by_root,
             None => &mut requests.status,
@@ -1784,9 +1782,6 @@ impl Requester {
         tokio::time::timeout(WAIT, async {
             loop {
                 let (from, event) = match self.swarm.select_next_some().await {
-                    SwarmEvent::Behaviour(UnsupportedRequestsEvent::BlocksByHead(e)) => {
-                        (Some(Unsupported::BlocksByHeadV1), e)
-                    }
                     SwarmEvent::Behaviour(UnsupportedRequestsEvent::EnvelopesByRange(e)) => {
                         (Some(Unsupported::EnvelopesByRangeV1), e)
                     }
@@ -1849,8 +1844,6 @@ impl Requester {
 /// A well-formed request of `protocol`, as a peer would send it.
 fn unsupported_request(protocol: Unsupported) -> Vec<u8> {
     let ssz = match protocol {
-        // (beacon_root: Root, count: uint64)
-        Unsupported::BlocksByHeadV1 => [&[0x11; 32][..], &64u64.to_le_bytes()].concat(),
         // (start_slot: Slot, count: uint64)
         Unsupported::EnvelopesByRangeV1 => [64u64.to_le_bytes(), 32u64.to_le_bytes()].concat(),
         // List[Root, MAX_REQUEST_PAYLOADS]: two roots.
@@ -1895,6 +1888,15 @@ async fn blocks_by_head_served() {
     let codec = RpcCodec::<E>::new(contexts, Deadlines::default());
     let mut peer = tcp_swarm(super::outbound_behaviour(Protocol::BlocksByHeadV1, codec));
     peer.dial(ours.addr.clone()).unwrap();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let SwarmEvent::ConnectionEstablished { .. } = peer.select_next_some().await {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("connected");
     let request = Request::BlocksByHead(BlocksByHeadV1Request {
         beacon_root: [0x11; 32].into(),
         count: 64,
@@ -1975,7 +1977,7 @@ async fn unsupported_counted() {
         Err(OutboundFailure::UnsupportedProtocols)
     ));
     tracing::callsite::rebuild_interest_cache();
-    assert_eq!(counts(), [0, 0, 0]);
+    assert_eq!(counts(), [0, 0]);
 
     let mut peer = Requester::connect(&ours).await;
     for (n, protocol) in Unsupported::ALL.into_iter().enumerate() {
@@ -1983,10 +1985,10 @@ async fn unsupported_counted() {
             peer.refused(protocol).await;
         }
     }
-    assert_eq!(counts(), [1, 2, 3]);
+    assert_eq!(counts(), [1, 2]);
     // A served protocol is not counted.
     peer.still_served().await;
-    assert_eq!(counts(), [1, 2, 3]);
+    assert_eq!(counts(), [1, 2]);
 }
 
 // ---------------------------------------------------------------------------------------------

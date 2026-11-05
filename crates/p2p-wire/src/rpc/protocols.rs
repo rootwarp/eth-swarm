@@ -2,9 +2,10 @@
 //!
 //! Protocol IDs follow `phase0/p2p-interface.md` "Protocol identification":
 //! `/eth2/beacon_chain/req/<message_name>/<version>/<encoding>`, always `ssz_snappy`.
-//! `BeaconBlocksByRange` v2 and the two column protocols carry context bytes
-//! (`altair/p2p-interface.md`; for a column sidecar the digest of the epoch of its slot,
-//! `fulu/p2p-interface.md` L700–702, L766–768); the other responses have one shape in every fork.
+//! `BeaconBlocksByRange` v2, `BeaconBlocksByHead` v1 and the two column protocols carry context
+//! bytes (`altair/p2p-interface.md`; for a block or a column sidecar the digest of the epoch of
+//! its slot, `fulu/p2p-interface.md` L700–702, L766–768, L847–848); the other responses have
+//! one shape in every fork.
 //! `Goodbye` carries a
 //! `uint64` reason both ways ("Request, Response Content", `phase0/p2p-interface.md` L1461): the
 //! disconnecting peer writes its reason, and the response is one chunk with a reason too (L1483),
@@ -29,7 +30,8 @@ use ssz::Encode;
 use std::fmt;
 
 /// `MAX_REQUEST_BLOCKS_DENEB` (`deneb/p2p-interface.md` configuration): the most blocks a
-/// `BeaconBlocksByRange` response may hold. 128 in every known network config.
+/// `BeaconBlocksByRange` or `BeaconBlocksByHead` response may hold. 128 in every known network
+/// config.
 pub const MAX_REQUEST_BLOCKS_DENEB: u64 = 128;
 
 /// `MAX_REQUEST_PAYLOADS` (`gloas/p2p-interface.md` L84): the most execution payload envelopes
@@ -141,7 +143,7 @@ pub enum Protocol {
 
 impl Protocol {
     /// Every protocol. New ones go at the end: fuzz seeds select a protocol by its index here.
-    pub const ALL: [Protocol; 7] = [
+    pub const ALL: [Protocol; 8] = [
         Protocol::StatusV2,
         Protocol::MetaDataV3,
         Protocol::PingV1,
@@ -149,6 +151,7 @@ impl Protocol {
         Protocol::GoodbyeV1,
         Protocol::DataColumnsByRangeV1,
         Protocol::DataColumnsByRootV1,
+        Protocol::BlocksByHeadV1,
     ];
 
     /// The multistream protocol ID.
@@ -167,8 +170,13 @@ impl Protocol {
             Protocol::DataColumnsByRootV1 => {
                 "/eth2/beacon_chain/req/data_column_sidecars_by_root/1/ssz_snappy"
             }
-            Protocol::BlocksByHeadV1 => todo!(),
+            Protocol::BlocksByHeadV1 => "/eth2/beacon_chain/req/beacon_blocks_by_head/1/ssz_snappy",
         }
+    }
+
+    /// Whether this is one of the two block protocols, whose responses are blocks.
+    pub const fn is_blocks(self) -> bool {
+        matches!(self, Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1)
     }
 
     /// Whether this is one of the two data column protocols.
@@ -181,29 +189,32 @@ impl Protocol {
 
     /// Whether a success chunk carries the 4-byte fork digest before its payload.
     pub const fn has_context_bytes(self) -> bool {
-        matches!(self, Protocol::BlocksByRangeV2) || self.is_columns()
+        self.is_blocks() || self.is_columns()
     }
 
-    /// Whether the response is exactly one chunk (every protocol but `BeaconBlocksByRange` and
-    /// the column protocols, whose responses may hold anything from no chunk to their request's
-    /// count, and `Goodbye`, whose one chunk some clients leave out).
+    /// Whether the response is exactly one chunk (every protocol but the block and column
+    /// protocols, whose responses may hold anything from no chunk to their request's count, and
+    /// `Goodbye`, whose one chunk some clients leave out).
     pub const fn single_response(self) -> bool {
-        !matches!(self, Protocol::BlocksByRangeV2 | Protocol::GoodbyeV1) && !self.is_columns()
+        !matches!(self, Protocol::GoodbyeV1) && !self.is_blocks() && !self.is_columns()
     }
 
     /// Whether a responder may answer `3: ResourceUnavailable` (`phase0/p2p-interface.md` L1291:
     /// "only valid as a response where specified"): `BeaconBlocksByRange` (L1540, for blocks
-    /// the responder does not have), `DataColumnSidecarsByRange` (`fulu/p2p-interface.md`
-    /// L654–656, outside `data_column_serve_range`) and `DataColumnSidecarsByRoot` (L754–756,
-    /// before `minimum_request_epoch`).
+    /// the responder does not have), `BeaconBlocksByHead` (`fulu/p2p-interface.md` L837–838, a
+    /// `beacon_root` older than the serve window), `DataColumnSidecarsByRange` (L654–656,
+    /// outside `data_column_serve_range`) and `DataColumnSidecarsByRoot` (L754–756, before
+    /// `minimum_request_epoch`).
     pub const fn permits_resource_unavailable(self) -> bool {
-        matches!(self, Protocol::BlocksByRangeV2) || self.is_columns()
+        self.is_blocks() || self.is_columns()
     }
 
     /// This protocol's row of limits.
     pub fn limits<E: EthSpec>(self) -> ProtocolLimits {
         let (max_request_items, max_response_chunks) = match self {
-            Protocol::BlocksByRangeV2 => (MAX_REQUEST_BLOCKS_DENEB, MAX_REQUEST_BLOCKS_DENEB),
+            Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 => {
+                (MAX_REQUEST_BLOCKS_DENEB, MAX_REQUEST_BLOCKS_DENEB)
+            }
             Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1 => (
                 MAX_REQUEST_DATA_COLUMN_SIDECARS,
                 MAX_REQUEST_DATA_COLUMN_SIDECARS,
@@ -211,7 +222,7 @@ impl Protocol {
             _ => (0, 1),
         };
         let (ssz_min, ssz_max) = match self {
-            Protocol::BlocksByRangeV2 => (
+            Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 => (
                 MIN_SIGNED_BEACON_BLOCK_LEN,
                 ForkName::ALL
                     .into_iter()
@@ -269,7 +280,9 @@ impl Protocol {
     ) -> Option<SszBounds> {
         let max = self.response_max_len_with::<E>(fork, network)?;
         let min = match (self, fork) {
-            (Protocol::BlocksByRangeV2, _) => MIN_SIGNED_BEACON_BLOCK_LEN,
+            (Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1, _) => {
+                MIN_SIGNED_BEACON_BLOCK_LEN
+            }
             (Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1, Some(fork)) => {
                 match fork {
                     ForkName::Fulu => MIN_FULU_DATA_COLUMN_SIDECAR_LEN,
@@ -294,7 +307,9 @@ impl Protocol {
             }
             Protocol::GoodbyeV1 => Some(<Goodbye as ssz::Decode>::ssz_fixed_len()),
             Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1 => None,
-            Protocol::BlocksByHeadV1 => todo!(),
+            Protocol::BlocksByHeadV1 => {
+                Some(<BlocksByHeadV1Request as ssz::Decode>::ssz_fixed_len())
+            }
         }
     }
 
@@ -316,7 +331,7 @@ impl Protocol {
             Protocol::StatusV2 => Some(<StatusV2 as ssz::Decode>::ssz_fixed_len()),
             Protocol::MetaDataV3 => Some(<MetaDataV3 as ssz::Decode>::ssz_fixed_len()),
             Protocol::PingV1 => Some(<Ping as ssz::Decode>::ssz_fixed_len()),
-            Protocol::BlocksByRangeV2 => {
+            Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 => {
                 fork.and_then(|f| caps::max_size::<E>(ObjectKind::SignedBeaconBlock, f))
             }
             Protocol::GoodbyeV1 => Some(<Goodbye as ssz::Decode>::ssz_fixed_len()),
@@ -324,7 +339,6 @@ impl Protocol {
                 let (fork, network) = (fork?, network?);
                 caps::max_size_for::<E>(ObjectKind::DataColumnSidecar, fork, network)
             }
-            Protocol::BlocksByHeadV1 => todo!(),
         }
     }
 
@@ -391,13 +405,15 @@ impl Request {
     }
 
     /// The most response chunks the peer may send: the request's `count` (at most
-    /// [`MAX_REQUEST_BLOCKS_DENEB`]) for `BeaconBlocksByRange`; the sidecars a column request
+    /// [`MAX_REQUEST_BLOCKS_DENEB`]) for `BeaconBlocksByRange` and `BeaconBlocksByHead` (whose
+    /// larger `count` is served as that many, `fulu/p2p-interface.md` L820–821); the sidecars a column request
     /// names (`count × len(columns)`, `fulu/p2p-interface.md` L684–685; the sum of the
     /// identifiers' columns, L728–730), at most [`MAX_REQUEST_DATA_COLUMN_SIDECARS`]; 1 for every
     /// other protocol.
     pub fn max_response_chunks(&self) -> u64 {
         match self {
             Request::BlocksByRange(r) => r.count.min(MAX_REQUEST_BLOCKS_DENEB),
+            Request::BlocksByHead(r) => r.count.min(MAX_REQUEST_BLOCKS_DENEB),
             Request::DataColumnsByRange(r) => {
                 r.requested_sidecars().min(MAX_REQUEST_DATA_COLUMN_SIDECARS)
             }
@@ -418,7 +434,7 @@ impl Request {
             Request::Goodbye(g) => Some(g.as_ssz_bytes()),
             Request::DataColumnsByRange(r) => Some(r.as_ssz_bytes()),
             Request::DataColumnsByRoot(r) => Some(r.as_ssz_bytes()),
-            Request::BlocksByHead(_) => todo!(),
+            Request::BlocksByHead(r) => Some(r.as_ssz_bytes()),
         }
     }
 }
@@ -463,7 +479,8 @@ pub enum Response<E: EthSpec> {
     MetaData(MetaDataV3),
     /// `Ping`.
     Ping(Ping),
-    /// One block of a `BeaconBlocksByRange` response, in the fork its context bytes named.
+    /// One block of a `BeaconBlocksByRange` or `BeaconBlocksByHead` response, in the fork its
+    /// context bytes named.
     /// Boxed: a block is far larger than the other responses.
     Block(Box<forked::SignedBeaconBlock<E>>),
     /// `Goodbye`: the responder's reason.
@@ -474,14 +491,14 @@ pub enum Response<E: EthSpec> {
 }
 
 impl<E: EthSpec> Response<E> {
-    /// Whether this is a response of `protocol`: a column sidecar answers both column
-    /// protocols, every other response its own one.
+    /// Whether this is a response of `protocol`: a block answers both block protocols, a
+    /// column sidecar both column protocols, every other response its own one.
     pub fn answers(&self, protocol: Protocol) -> bool {
         match self {
             Response::Status(_) => protocol == Protocol::StatusV2,
             Response::MetaData(_) => protocol == Protocol::MetaDataV3,
             Response::Ping(_) => protocol == Protocol::PingV1,
-            Response::Block(_) => protocol == Protocol::BlocksByRangeV2,
+            Response::Block(_) => protocol.is_blocks(),
             Response::Goodbye(_) => protocol == Protocol::GoodbyeV1,
             Response::DataColumn(_) => protocol.is_columns(),
         }

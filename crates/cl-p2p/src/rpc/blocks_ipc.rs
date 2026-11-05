@@ -1,6 +1,7 @@
 //! The production [`BlockSource`] (#146): [`IpcBlocks`], cl-store's `GetChainHead` (the split
 //! point, `finalized_slot`) and `GetBlocksByRange` (the finalized half), and cl-chain's
-//! `ReqRespService/BlocksByRange` (the rest).
+//! `ReqRespService/BlocksByRange` (the rest); for BeaconBlocksByHead, cl-store's parent walk
+//! `GetBlocksByHead`, read as the store half (#230).
 //!
 //! - **Contract.** Every stream is read through the `ipc` contract layer ([`Link::open`] on
 //!   [`Inbound::from_server`]): the server's hello first, `seq` strictly from 1, and each
@@ -120,8 +121,20 @@ impl BlockSource for IpcBlocks {
         }
     }
 
-    fn by_head(&self, _: [u8; 32], _: u64) -> Lookup<Blocks> {
-        todo!("#230")
+    fn by_head(&self, root: [u8; 32], count: u64) -> Lookup<Blocks> {
+        let (link, hello) = (self.link.clone(), Some(self.link.local()));
+        let mut store = self.store.clone();
+        let request = store::GetBlocksByHeadRequest {
+            root: root.to_vec(),
+            count,
+            hello,
+        };
+        let step = BLOCK_LOOKUP_TIMEOUT;
+        Box::pin(async move {
+            let call = within(step, store.get_blocks_by_head(request)).await?;
+            let stream = call.map_err(|status| call_failed(Half::Store, &status))?;
+            Ok(read_blocks(link, stream.into_inner(), Half::Store, step))
+        })
     }
 }
 
@@ -177,7 +190,12 @@ impl BlockBody for store::GetBlocksByRangeResponseBody {
 
 impl BlockBody for store::GetBlocksByHeadResponseBody {
     fn envelope(self) -> Result<Envelope, Failed> {
-        todo!("#230")
+        check_read_meta(self.meta.as_ref())?;
+        if let Some(e) = self.error {
+            return Err(refused(e.code, &e.detail));
+        }
+        self.block
+            .ok_or_else(|| contract("a store body without its block"))
     }
 }
 

@@ -2,7 +2,8 @@
 //! `gloas/p2p-interface.md` L1356–1374): [`ByRangeResponder`], the production [`Responder`],
 //! over a [`BlockSource`] ([`super::blocks_ipc::IpcBlocks`] in the service). cl-p2p opens no
 //! database: the finalized blocks come from cl-store (store.v1), the rest from cl-chain
-//! (chain.v1, ADR-006).
+//! (chain.v1, ADR-006). [`ByRangeResponder::head_responder`] builds the BeaconBlocksByHead
+//! responder over the same source, lookup slots and window ([`super::blocks_head`], #230).
 //!
 //! # An answer
 //!
@@ -41,6 +42,7 @@
 //! timeout `2`) ends the answer with its code before the first chunk, and cleanly at the last
 //! whole chunk after it; each is counted in `rpc_block_lookup_failures_total{half, kind}`.
 
+use super::blocks_head::ByHeadResponder;
 use super::columns::fixed_message;
 use super::inbound::StatusSource;
 use super::metrics::RpcMetrics;
@@ -78,7 +80,7 @@ pub const MAX_FINALIZED_DEPTH: u64 = 2_048;
 /// Which half of an answer a block comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Half {
-    /// The finalized blocks, and the split point: cl-store.
+    /// The finalized blocks, the split point and every parent walk: cl-store.
     Store,
     /// The blocks above the store's finalized slot: cl-chain.
     Chain,
@@ -147,12 +149,31 @@ pub trait BlockSource: Send + Sync + 'static {
     /// The canonical blocks of `[start, start + count)` from `half`, ascending.
     fn blocks(&self, half: Half, start: u64, count: u64) -> Lookup<Blocks>;
 
-    /// The block at `root` and its ancestors, newest first, at most `count` (#230).
+    /// The block at `root` and its ancestors, newest first, at most `count`, from cl-store's
+    /// parent walk (#230): none for a root it does not hold.
     fn by_head(&self, root: [u8; 32], count: u64) -> Lookup<Blocks>;
 }
 
-/// The start slot of the block serve window now, if known.
+/// The start slot of the block serve window now, if known; both block responders read it.
 pub type WindowStart = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// `block` decoded by the fork of its slot, and its `parent_root`; one that does not decode,
+/// or decodes to a block of another slot, is `2` (`decode`).
+pub(super) fn decode<E: EthSpec>(
+    block: &ServedBlock,
+) -> Result<(forked::SignedBeaconBlock<E>, [u8; 32]), Failed> {
+    let decoded =
+        forked::SignedBeaconBlock::<E>::from_ssz_bytes_for_fork(&block.ssz, block.fork)
+            .map_err(|e| Failed::server_error("decode", format!("slot {}: {e:?}", block.slot)))?;
+    if decoded.slot() != block.slot {
+        return Err(Failed::server_error("decode", "a block of another slot"));
+    }
+    let parent = match &decoded {
+        forked::SignedBeaconBlock::Fulu(b) => b.message.parent_root.0,
+        forked::SignedBeaconBlock::Gloas(b) => b.message.parent_root.0,
+    };
+    Ok((decoded, parent))
+}
 
 /// Serves BeaconBlocksByRange v2 from a [`BlockSource`] (see the module docs).
 #[derive(Clone)]
@@ -204,10 +225,17 @@ impl ByRangeResponder {
         self
     }
 
-    /// The BeaconBlocksByHead responder (#230): not yet.
+    /// The BeaconBlocksByHead responder over the same source, taking its lookup slots from
+    /// this responder's pool, counting its failures in the same metrics and reading the same
+    /// window (#230, D5, D7).
     #[must_use]
-    pub fn head_responder(&self) -> super::blocks_head::ByHeadResponder {
-        todo!("#230")
+    pub fn head_responder(&self) -> ByHeadResponder {
+        ByHeadResponder::new(
+            Arc::clone(&self.source),
+            Arc::clone(&self.lookups),
+            self.metrics.clone(),
+            self.window.clone(),
+        )
     }
 
     /// Lookup slots free now.
@@ -323,15 +351,23 @@ impl ByRangeResponder {
 }
 
 /// One answer on its way out.
-struct Out<E: EthSpec> {
-    sink: ChunkSink<E>,
+pub(super) struct Out<E: EthSpec> {
+    pub(super) sink: ChunkSink<E>,
     /// Chunks sent.
-    sent: usize,
+    pub(super) sent: usize,
     /// The slot and root of the block sent last.
     last: Option<(u64, [u8; 32])>,
 }
 
 impl<E: EthSpec> Out<E> {
+    pub(super) fn new(sink: ChunkSink<E>) -> Self {
+        Self {
+            sink,
+            sent: 0,
+            last: None,
+        }
+    }
+
     /// `block` as the next chunk of `[start, end)`, if it is: after the last block, inside the
     /// range, on the last block, decoded in its fork.
     fn check(&mut self, block: ServedBlock, start: u64, end: u64) -> Result<Response<E>, Failed> {
@@ -343,18 +379,7 @@ impl<E: EthSpec> Out<E> {
             );
             return Err(Failed::server_error("order", why));
         }
-        let decoded =
-            forked::SignedBeaconBlock::<E>::from_ssz_bytes_for_fork(&block.ssz, block.fork)
-                .map_err(|e| {
-                    Failed::server_error("decode", format!("slot {}: {e:?}", block.slot))
-                })?;
-        let parent = match &decoded {
-            forked::SignedBeaconBlock::Fulu(b) => b.message.parent_root.0,
-            forked::SignedBeaconBlock::Gloas(b) => b.message.parent_root.0,
-        };
-        if decoded.slot() != block.slot {
-            return Err(Failed::server_error("decode", "a block of another slot"));
-        }
+        let (decoded, parent) = decode::<E>(&block)?;
         if self.last.is_some_and(|(_, root)| root != parent) {
             let why = format!("slot {}: parent_root is not the block before", block.slot);
             return Err(Failed::server_error("link", why));
@@ -365,7 +390,7 @@ impl<E: EthSpec> Out<E> {
 
     /// Ends the answer on `failed`: its error chunk if nothing went out, else at the last whole
     /// chunk.
-    async fn end(&mut self, failed: Failed) {
+    pub(super) async fn end(&mut self, failed: Failed) {
         if self.sent == 0 {
             let _ = self
                 .sink
@@ -390,11 +415,7 @@ impl<E: EthSpec> Responder<E> for ByRangeResponder {
             let Request::BlocksByRange(range) = request else {
                 return;
             };
-            let mut out = Out {
-                sink,
-                sent: 0,
-                last: None,
-            };
+            let mut out = Out::new(sink);
             if let Err(failed) = this.answer(range, &mut out).await {
                 out.end(failed).await;
             }

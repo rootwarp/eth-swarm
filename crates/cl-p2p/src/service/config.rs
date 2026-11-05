@@ -29,9 +29,10 @@
 //!   connection caps do not apply to them.
 //! - **`store_socket`** and **`store_uid`** (both or neither): cl-store's socket and the UID its
 //!   server must run as. With them cl-p2p serves BeaconBlocksByRange v2 from cl-store's
-//!   finalized blocks and cl-chain's above them ([`crate::rpc::blocks`]); without them every
-//!   BlocksByRange request is `3: ResourceUnavailable`. The probe units leave them out: probe
-//!   mode stores only its anchor block.
+//!   finalized blocks and cl-chain's above them ([`crate::rpc::blocks`]), and BeaconBlocksByHead
+//!   v1 from cl-store's parent walk ([`crate::rpc::blocks_head`]); without them every
+//!   BlocksByRange request is `3: ResourceUnavailable` and every BlocksByHead request an empty
+//!   success. The probe units leave them out: probe mode stores only its anchor block.
 //! - **`mode`** is the IP rule of the candidates' addresses (`p2p_wire::ip::ip_rule`), the
 //!   rule of cl-discv5's `mode`: give both the same value. The static peers do not obey it.
 
