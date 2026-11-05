@@ -770,6 +770,11 @@ impl<E: EthSpec> Protocols<E> {
     }
 
     /// The behaviour of `protocol`.
+    ///
+    /// # Panics
+    ///
+    /// On `BeaconBlocksByHead`, which has no behaviour until it is served ([6.42]): [`Control`]
+    /// sends no request of it, and a peer's fails negotiation ([`super::unsupported`]).
     pub fn of(&mut self, protocol: Protocol) -> &mut Duplex<E> {
         match protocol {
             Protocol::StatusV2 => &mut self.status,
@@ -779,7 +784,7 @@ impl<E: EthSpec> Protocols<E> {
             Protocol::BlocksByRangeV2 => &mut self.blocks_by_range,
             Protocol::DataColumnsByRangeV1 => &mut self.data_columns_by_range,
             Protocol::DataColumnsByRootV1 => &mut self.data_columns_by_root,
-            Protocol::BlocksByHeadV1 => todo!(),
+            Protocol::BlocksByHeadV1 => unreachable!("BeaconBlocksByHead is not registered"),
         }
     }
 }
@@ -1870,7 +1875,10 @@ impl<E: EthSpec> Control<E> {
             request @ (Request::DataColumnsByRange(_) | Request::DataColumnsByRoot(_)) => {
                 self.serve_columns(peer, protocol, channel, request);
             }
-            Request::BlocksByHead(_) => todo!(),
+            // Unregistered until it is served ([6.42]), so never read: dropped unanswered.
+            Request::BlocksByHead(_) => {
+                tracing::debug!(%peer, "a BlocksByHead request: not served");
+            }
         }
     }
 
@@ -2393,7 +2401,10 @@ impl<E: EthSpec> Control<E> {
             Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1 => {
                 tracing::debug!(%peer, %protocol, chunks = chunks.len(), "a column response");
             }
-            Protocol::BlocksByHeadV1 => todo!(),
+            // We send no BlocksByHead request.
+            Protocol::BlocksByHeadV1 => {
+                tracing::debug!(%peer, chunks = chunks.len(), "a BlocksByHead response");
+            }
         }
     }
 

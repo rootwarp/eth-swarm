@@ -146,7 +146,8 @@ impl RateLimits {
             Protocol::GoodbyeV1 => None,
             Protocol::DataColumnsByRangeV1 => Some(self.data_columns_by_range),
             Protocol::DataColumnsByRootV1 => Some(self.data_columns_by_root),
-            Protocol::BlocksByHeadV1 => todo!(),
+            // Not served yet ([6.42]): BlocksByRange's values, in a bucket of its own.
+            Protocol::BlocksByHeadV1 => Some(self.blocks_by_range),
         }
     }
 }
@@ -1639,7 +1640,7 @@ pub fn outbound_queue_name(protocol: Protocol) -> &'static str {
         Protocol::GoodbyeV1 => "rpc_outbound_goodbye",
         Protocol::DataColumnsByRangeV1 => "rpc_outbound_data_columns_by_range",
         Protocol::DataColumnsByRootV1 => "rpc_outbound_data_columns_by_root",
-        Protocol::BlocksByHeadV1 => todo!(),
+        Protocol::BlocksByHeadV1 => "rpc_outbound_blocks_by_head",
     }
 }
 

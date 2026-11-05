@@ -8,6 +8,7 @@ import "ethswarm/common/v1/error.proto";
 // Served by cl-chain, called by cl-p2p to answer inbound peer requests.
 // cl-p2p opens no database: it reads finalized block ranges from cl-store
 // (ethswarm.store.v1 GetBlocksByRange) and everything above the store's finalized slot here.
+// BeaconBlocksByHead reads cl-store only (ethswarm.store.v1 GetBlocksByHead, a walk by root).
 
 message ResponseChunk {
   oneof result {

@@ -16,7 +16,9 @@
 //! Every transaction runs under its call's [`Deadline`], checked when it opens, every 64 blocks
 //! it walks and once more before its data is returned, with the transaction open, so a slow read
 //! cannot pin MVCC pages past it. [`ParentWalk`] (`GetBlocksByHead`) is stamped once, by its
-//! first transaction, then reads each further block in a short transaction of its own.
+//! first transaction, then reads each further block in a short transaction of its own: the
+//! walk's deadline bounds when a step may start, and each step's transaction ends within its
+//! step timeout of the step's start ([`ParentWalk::with_step_timeout`]).
 //!
 //! A read transaction that fails to begin with `MDBX_WANNA_RECOVERY` or `MDBX_PANIC` is
 //! `Unavailable`, like any env that cannot be read now, and marks the reader broken: the env
@@ -67,6 +69,20 @@ impl Deadline {
     pub fn after(clock: Clock, timeout: Duration) -> Self {
         let at = clock().checked_add(timeout);
         Self { at, clock }
+    }
+
+    /// This deadline, or `timeout` from now on its clock if that is sooner.
+    #[must_use]
+    pub(crate) fn within(&self, timeout: Duration) -> Self {
+        let soon = (self.clock)().checked_add(timeout);
+        let at = match (self.at, soon) {
+            (Some(at), Some(soon)) => Some(at.min(soon)),
+            (at, soon) => at.or(soon),
+        };
+        Self {
+            at,
+            clock: Arc::clone(&self.clock),
+        }
     }
 
     /// [`ReadError::DeadlineExceeded`] once the deadline has passed.
@@ -353,17 +369,23 @@ impl Snapshot<'_> {
 
 /// `GetBlocksByHead`: the block at a root, then its parent, and so on, newest first. The first
 /// step reads the stamp and the block in one transaction; it stamps every block. Each further
-/// step reads one block in a short transaction of its own, under the same deadline, whatever
-/// the stamp is by then. The walk ends after `count` blocks, at a parent that is not stored, or
-/// at once for an unknown root; it fuses after an error.
+/// step reads one block in a short transaction of its own, under the walk's deadline (and, with
+/// a step timeout, within it of the step's start), whatever the stamp is by then. The walk ends
+/// after `count` blocks, at a parent that is not stored, after slot 0, or at once for an
+/// unknown root; it fuses after an error.
 ///
 /// A block's `finalized` is decided once, at the first block at or below the stamp's finalized
 /// slot (whether it is on the stamp's chain, read in that block's transaction), and holds for
 /// every block below it: a walk that reaches that slot on a fork reads its blocks below as not
-/// finalized, never the other way.
+/// finalized, never the other way. Deciding it walks down from the finalized block, a read per
+/// stored block in between, so a first block more than [`crate::MAX_FINALIZED_DEPTH`] slots
+/// below the finalized slot is not walked to (#230): it reads `false`, not proven, never a
+/// false `true`, and so do the blocks below it.
 pub struct ParentWalk {
     reader: Arc<Reader>,
     deadline: Deadline,
+    /// Each step's read transaction ends this long after the step started, if set.
+    step: Option<Duration>,
     next: Option<Root>,
     left: u64,
     /// The first step's stamp.
@@ -379,6 +401,7 @@ impl ParentWalk {
         Self {
             reader,
             deadline,
+            step: None,
             next: Some(root),
             left: count,
             stamp: None,
@@ -387,10 +410,11 @@ impl ParentWalk {
         }
     }
 
-    /// The same walk, each read transaction ended `timeout` after its step started (#230): not
-    /// yet.
+    /// The same walk, each step's read transaction ended within `timeout` of the step's start,
+    /// however far off the walk's deadline is.
     #[must_use]
-    pub fn with_step_timeout(self, _timeout: Duration) -> Self {
+    pub fn with_step_timeout(mut self, timeout: Duration) -> Self {
+        self.step = Some(timeout);
         self
     }
 
@@ -403,18 +427,22 @@ impl ParentWalk {
             };
             let finalized = if decided || slot > stamp.finalized_slot {
                 None
+            } else if stamp.finalized_slot - slot > crate::MAX_FINALIZED_DEPTH {
+                Some(false)
             } else {
                 Some(snap.finalized(stamp, slot, root)?)
             };
             Ok(Some((slot, parent, ssz.into_owned(), finalized)))
         };
+        let deadline = match self.step {
+            Some(timeout) => self.deadline.within(timeout),
+            None => self.deadline.clone(),
+        };
         let Stamped { stamp, value } = match self.stamp {
-            None => self.reader.read(&self.deadline, read)?,
+            None => self.reader.read(&deadline, read)?,
             Some(stamp) => Stamped {
                 stamp,
-                value: self
-                    .reader
-                    .view(&self.deadline, |snap| read(snap, &stamp))?,
+                value: self.reader.view(&deadline, |snap| read(snap, &stamp))?,
             },
         };
         self.stamp = Some(stamp);

@@ -159,7 +159,7 @@ pub fn protocol_label(protocol: Protocol) -> &'static str {
         Protocol::GoodbyeV1 => "goodbye",
         Protocol::DataColumnsByRangeV1 => "data_column_sidecars_by_range",
         Protocol::DataColumnsByRootV1 => "data_column_sidecars_by_root",
-        Protocol::BlocksByHeadV1 => todo!(),
+        Protocol::BlocksByHeadV1 => "beacon_blocks_by_head",
     }
 }
 

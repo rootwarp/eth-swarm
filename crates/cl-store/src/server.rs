@@ -15,7 +15,10 @@
 //!   (`ERROR_CODE_RESOURCE_UNAVAILABLE`), unread. Envelope `root`s are block roots.
 //! - `GetBlocksByHead` is a [`ParentWalk`]: `count` capped at [`MAX_BLOCKS`], stamped by its
 //!   first read (before the stream opens), then one block per read as the client reads, at
-//!   most one body ahead.
+//!   most one body ahead. cl-p2p reads it at its peer's pace for BeaconBlocksByHead (#230), so
+//!   the stream lives [`HEAD_WALK_TIMEOUT`] while each step's read transaction ends within the
+//!   call timeout of the step's start; a block more than [`crate::MAX_FINALIZED_DEPTH`] slots
+//!   below the finalized slot reads `finalized` false (not proven, unwalked).
 //! - `GetChainHead` carries the stamp's head and its finalized block's slot (`finalized_slot`,
 //!   where cl-p2p splits a BeaconBlocksByRange answer between cl-store and cl-chain); the stamp
 //!   holds no checkpoint epoch, justified checkpoint, head state root or earliest slot, so those
@@ -103,6 +106,13 @@ pub fn store_acl(callers: Callers) -> Result<MethodAcl, AclError> {
 
 /// How long one call's reads may take, unless [`StoreServer::with_timeout`] says otherwise.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a `GetBlocksByHead` stream may run \[est\]: 10 s, past the 9.5 s cl-p2p's
+/// BeaconBlocksByHead answer runs while it reads a block per peer token (#230). A step that
+/// would start later fails `DEADLINE_EXCEEDED`; each step's read transaction still ends within
+/// the call timeout of the step's start, so no transaction pins MVCC pages longer than a
+/// unary call's.
+pub const HEAD_WALK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The `StoreService`.
 #[derive(Clone)]
@@ -366,11 +376,12 @@ impl StoreService for StoreServer {
             .map_err(|e| e.to_status())?;
         let root = root_of(&req.root)?;
         let count = req.count.min(MAX_BLOCKS);
-        let (store, deadline) = (Arc::clone(&self.store), self.deadline());
+        let (store, timeout) = (Arc::clone(&self.store), self.timeout);
+        let deadline = Deadline::after(Arc::clone(&self.clock), HEAD_WALK_TIMEOUT.max(timeout));
         let walk = tokio::task::spawn_blocking(move || {
-            store
-                .reader()
-                .map(|reader| ParentWalk::new(reader, root, count, deadline))
+            store.reader().map(|reader| {
+                ParentWalk::new(reader, root, count, deadline).with_step_timeout(timeout)
+            })
         })
         .await
         .map_err(|_| status(ReadError::Internal))?
