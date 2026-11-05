@@ -140,6 +140,8 @@ pub struct ChainSettings {
     pub verify_wait: Duration,
     /// cl-p2p's UID, the one caller.
     pub caller_uid: u32,
+    /// The non-finality disk budget (`[chain.disk_budget]`).
+    pub disk_budget: crate::persist::budget::DiskBudget,
 }
 
 /// Why the config was refused.
@@ -228,6 +230,7 @@ pub fn settings(config: &Config) -> Result<ChainSettings, SettingsError> {
         verify_timeout,
         verify_wait,
         caller_uid,
+        disk_budget: crate::persist::budget::DiskBudget::default(),
     })
 }
 

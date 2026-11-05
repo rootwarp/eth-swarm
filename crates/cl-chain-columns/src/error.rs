@@ -61,6 +61,13 @@ pub enum Error {
     /// A block root maps to exactly one slot; a write named a different one.
     #[error("block root is stored at slot {stored}, write named slot {given}")]
     SlotMismatch { stored: u64, given: u64 },
+    /// The non-finality disk budget IGNOREs the write ([`store_schema::budget`]): over the
+    /// columns cap or the aggregate on a side branch, or over the canonical headroom. Nothing
+    /// of the transaction was written.
+    #[error("the disk budget ignores a {} column write", branch.name())]
+    OverBudget {
+        branch: store_schema::budget::Branch,
+    },
     #[error("cgc {0} exceeds NUMBER_OF_CUSTODY_GROUPS ({NUMBER_OF_CUSTODY_GROUPS})")]
     CgcOutOfRange(u64),
     /// The custody group count never decreases (`fulu/validator.md`); nothing was written.

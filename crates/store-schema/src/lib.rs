@@ -51,6 +51,7 @@
 //!   and a version-1 or -2 env the writer has not upgraded yet.
 
 pub mod blocks;
+pub mod budget;
 pub mod env;
 mod error;
 pub mod finalized;

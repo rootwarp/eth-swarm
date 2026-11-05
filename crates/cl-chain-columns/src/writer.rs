@@ -3,13 +3,14 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex, MutexGuard, PoisonError,
+        Arc, Mutex, MutexGuard, PoisonError,
     },
     thread,
 };
 
 use libmdbx::WriteFlags;
 use store_schema::{
+    budget::{Branch, Budget, Caps},
     stamp::Stamp,
     txn::{ReadTxn, RwTxn, Update},
 };
@@ -255,6 +256,24 @@ impl ColumnWriter {
         })
     }
 
+    /// [`Self::open_with`], the unfinalized column writes admitted and charged by `budget`
+    /// ([`store_schema::budget`]), its counters loaded from the env. [`Self::open`] and
+    /// [`Self::open_with`] count with no cap ([`Caps::unlimited`]). Blocks the same way.
+    pub fn open_with_budget(
+        path: impl AsRef<Path>,
+        options: WriterOptions,
+        budget: Arc<Budget>,
+    ) -> Result<Self> {
+        let _ = (path.as_ref(), options, budget);
+        todo!()
+    }
+
+    /// The budget the writer's column writes are admitted by.
+    #[must_use]
+    pub fn budget(&self) -> &Arc<Budget> {
+        todo!()
+    }
+
     /// Read access through the writer's own env.
     #[must_use]
     pub fn reader(&self) -> &ColumnReader {
@@ -461,6 +480,22 @@ impl ColumnWriter {
             }
             written
         })
+    }
+
+    /// [`Self::write_block_columns_partial`] on `branch`: each transaction's columns, net of
+    /// the rows they replace, are admitted by the budget ([`Self::budget`]) and charged in it.
+    /// [`Branch::Finalized`] is charged and never refused. A transaction the budget ignores is
+    /// [`Error::OverBudget`] and writes nothing.
+    pub fn write_block_columns_on(
+        &self,
+        slot: u64,
+        block_root: &BlockRoot,
+        link: BlockLink,
+        branch: Branch,
+        columns: &[Column<'_>],
+    ) -> std::result::Result<WriteReport, WriteFailed> {
+        let _ = (slot, block_root, link, branch, columns);
+        todo!()
     }
 
     /// Reorg pruning: removes every column of each orphaned block root, one write transaction

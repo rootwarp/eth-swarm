@@ -7,6 +7,7 @@
 
 mod atomic;
 mod base;
+pub mod budget;
 mod crc32c;
 pub mod durable;
 mod import_log;
