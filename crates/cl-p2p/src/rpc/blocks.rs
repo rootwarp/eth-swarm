@@ -146,6 +146,10 @@ pub trait BlockSource: Send + Sync + 'static {
 
     /// The canonical blocks of `[start, start + count)` from `half`, ascending.
     fn blocks(&self, half: Half, start: u64, count: u64) -> Lookup<Blocks>;
+
+    /// The block at `root` and its ancestors, newest first, at most `count`, from cl-store's
+    /// parent walk (#230): none for a root it does not hold.
+    fn by_head(&self, root: [u8; 32], count: u64) -> Lookup<Blocks>;
 }
 
 /// The start slot of the block serve window now, if known.
@@ -199,6 +203,12 @@ impl ByRangeResponder {
     pub fn with_window(mut self, window: WindowStart) -> Self {
         self.window = Some(window);
         self
+    }
+
+    /// The BeaconBlocksByHead responder over the same source (#230): not yet.
+    #[must_use]
+    pub fn head_responder(&self) -> super::blocks_head::ByHeadResponder {
+        todo!("#230")
     }
 
     /// Lookup slots free now.
@@ -444,6 +454,22 @@ pub(crate) mod testing {
         chain
     }
 
+    /// The `parent_root` of `block`, decoded in its fork.
+    pub(crate) fn parent_of(block: &ServedBlock) -> [u8; 32] {
+        let decoded =
+            forked::SignedBeaconBlock::<Minimal>::from_ssz_bytes_for_fork(&block.ssz, block.fork)
+                .unwrap();
+        match decoded {
+            forked::SignedBeaconBlock::Fulu(b) => b.message.parent_root.0,
+            forked::SignedBeaconBlock::Gloas(b) => b.message.parent_root.0,
+        }
+    }
+
+    /// The canonical block at `slot`.
+    pub(crate) fn at(slot: u64) -> ServedBlock {
+        chain().into_iter().find(|b| b.slot == slot).unwrap()
+    }
+
     /// The slots of the canonical blocks of `[start, end)`.
     pub(crate) fn canonical(start: u64, end: u64) -> Vec<u64> {
         chain()
@@ -478,6 +504,8 @@ pub(crate) mod testing {
     pub(crate) enum Call {
         Head,
         Range(Half, u64, u64),
+        /// A parent walk from a root, of at most `count` blocks (#230).
+        ByHead([u8; 32], u64),
     }
 
     #[derive(Default)]
@@ -493,6 +521,14 @@ pub(crate) mod testing {
         replaced: Mutex<Vec<(u64, ServedBlock)>>,
         /// What the store half takes per slot walked before it opens.
         walk_cost: Mutex<Option<Duration>>,
+        /// Blocks the store holds besides [`chain`]'s (fork blocks), found by root.
+        known: Mutex<Vec<ServedBlock>>,
+        /// Blocks a parent walk sends in place of its `n`th.
+        walk_replaced: Mutex<Vec<(usize, ServedBlock)>>,
+        /// How many blocks past its `count` a parent walk sends.
+        overserve: AtomicU64,
+        /// The blocks parent walks handed over so far.
+        walk_reads: AtomicUsize,
     }
 
     /// A [`BlockSource`] over [`chain`]: the store half holds the blocks at or below its
@@ -538,6 +574,26 @@ pub(crate) mod testing {
             *self.0.walk_cost.lock().unwrap() = Some(per_slot);
         }
 
+        /// The store holds `block` too (off [`chain`]), found by its root.
+        pub(crate) fn add(&self, block: ServedBlock) {
+            self.0.known.lock().unwrap().push(block);
+        }
+
+        /// Parent walks send `block` in place of their `n`th block.
+        pub(crate) fn replace_in_walk(&self, n: usize, block: ServedBlock) {
+            self.0.walk_replaced.lock().unwrap().push((n, block));
+        }
+
+        /// Parent walks go on `extra` blocks past their `count`, as far as the parents reach.
+        pub(crate) fn overserve(&self, extra: u64) {
+            self.0.overserve.store(extra, Ordering::SeqCst);
+        }
+
+        /// The blocks parent walks handed over so far.
+        pub(crate) fn walk_reads(&self) -> usize {
+            self.0.walk_reads.load(Ordering::SeqCst)
+        }
+
         /// The calls so far, and forgets them.
         pub(crate) fn calls(&self) -> Vec<Call> {
             std::mem::take(&mut *self.0.calls.lock().unwrap())
@@ -549,7 +605,7 @@ pub(crate) mod testing {
                 .into_iter()
                 .filter_map(|c| match c {
                     Call::Range(half, start, count) => Some((half, start, count)),
-                    Call::Head => None,
+                    Call::Head | Call::ByHead(..) => None,
                 })
                 .collect()
         }
@@ -632,6 +688,49 @@ pub(crate) mod testing {
                         }
                         let next = blocks.next()?;
                         Some((Ok(next), (i + 1, blocks, fake, live)))
+                    },
+                );
+                Ok(Box::pin(items) as Blocks)
+            })
+        }
+
+        /// The store's parent walk: the block at `root`, then its parent, while stored, ending
+        /// after slot 0 or `count` blocks (plus [`Fake::overserve`]); scripted at
+        /// `Open(Store)` and `Item(Store, n)`.
+        fn by_head(&self, root: [u8; 32], count: u64) -> Lookup<Blocks> {
+            let (fake, live) = (self.clone(), self.enter());
+            fake.0.calls.lock().unwrap().push(Call::ByHead(root, count));
+            Box::pin(async move {
+                if let Some(failed) = acted(fake.act(Step::Open(Half::Store))).await {
+                    return failed;
+                }
+                let mut known = chain();
+                known.extend(fake.0.known.lock().unwrap().iter().cloned());
+                let take = count.saturating_add(fake.0.overserve.load(Ordering::SeqCst));
+                let mut walk = Vec::new();
+                let mut next = Some(root);
+                while let Some(at) = next.filter(|_| (walk.len() as u64) < take) {
+                    let Some(block) = known.iter().find(|b| b.root == at).cloned() else {
+                        break;
+                    };
+                    next = (block.slot > 0).then(|| parent_of(&block));
+                    walk.push(block);
+                }
+                for (n, block) in fake.0.walk_replaced.lock().unwrap().iter() {
+                    if let Some(item) = walk.get_mut(*n) {
+                        *item = block.clone();
+                    }
+                }
+                let items = futures::stream::unfold(
+                    (0usize, walk.into_iter(), fake, live),
+                    move |(i, mut walk, fake, live)| async move {
+                        let step = Step::Item(Half::Store, i);
+                        if let Some(failed) = acted(fake.act(step)).await {
+                            return Some((failed, (i + 1, Vec::new().into_iter(), fake, live)));
+                        }
+                        let next = walk.next()?;
+                        fake.0.walk_reads.fetch_add(1, Ordering::SeqCst);
+                        Some((Ok(next), (i + 1, walk, fake, live)))
                     },
                 );
                 Ok(Box::pin(items) as Blocks)

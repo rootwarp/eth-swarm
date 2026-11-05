@@ -4,13 +4,16 @@
 //! v2 with the production responder over the production IPC client; the requester is the probe's
 //! own `RangeRequester`, which checks every block's context bytes and parent link. It syncs the
 //! fixture's five epochs across finality and the Fulu→Gloas switch.
+//!
+//! #230: the same cl-store also serves the parent walk of BeaconBlocksByHead's source
+//! (`IpcBlocks::by_head`), read here directly: the protocol is not dispatched to a swarm yet.
 
 use cl_chain::reqresp::{
     BlockStore, ColumnServer, ColumnStore, ReqRespServer, ServeBudget, ServeClock,
 };
 use cl_chain_columns::ColumnWriter;
 use cl_p2p::behaviour::SpecBehaviour;
-use cl_p2p::rpc::blocks::ByRangeResponder;
+use cl_p2p::rpc::blocks::{BlockSource, ByRangeResponder, Failed, ServedBlock};
 use cl_p2p::rpc::blocks_ipc::IpcBlocks;
 use cl_p2p::rpc::inbound::{Control, SharedStatus, StatusSource};
 use cl_p2p::rpc::metrics::RpcMetrics;
@@ -319,4 +322,74 @@ fn finalized_depth_matches_the_store() {
         cl_p2p::rpc::blocks::MAX_FINALIZED_DEPTH,
         cl_store::MAX_FINALIZED_DEPTH
     );
+}
+
+/// #230: BeaconBlocksByHead's source, the production `IpcBlocks::by_head`, against the real
+/// cl-store over its socket: the block at the root and its ancestors, newest first, at most
+/// `count` (a larger one served as 128), across the store's finalized slot and the Fulu→Gloas
+/// switch, each block as stored and with the fork of its slot; from the fork block, its own
+/// branch; no block for a root the store does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn by_head_walks_the_store_over_ipc() {
+    let env_dir = tempfile::tempdir().unwrap();
+    let (env, chain) = seeded(env_dir.path());
+    let sockets = tempfile::tempdir().unwrap();
+    let store = cl_store::StoreServer::new(link(), Arc::new(cl_store::Reader::over(env.clone())));
+    let store = serve(sockets.path(), "cl-store.sock", store.routes()).await;
+    // A parent walk reads cl-store alone: the chain channel is never called.
+    let source = IpcBlocks::new(store.clone(), store, link());
+    let walk = |root: [u8; 32], count: u64| {
+        let lookup = source.by_head(root, count);
+        async move {
+            let blocks = tokio::time::timeout(WAIT, lookup).await.expect("opened");
+            let blocks = blocks.unwrap_or_else(|e| panic!("{e:?}"));
+            let read = tokio::time::timeout(WAIT, blocks.collect::<Vec<_>>()).await;
+            let read: Result<Vec<ServedBlock>, Failed> = read.expect("ended").into_iter().collect();
+            read.unwrap_or_else(|e| panic!("{e:?}"))
+        }
+    };
+    let root = |slot: u64| {
+        chain
+            .iter()
+            .find(|b| b.slot() == slot)
+            .unwrap()
+            .message_root()
+            .0
+    };
+    let ancestry = |from: u64, n: usize| -> Vec<(u64, Vec<u8>)> {
+        chain
+            .iter()
+            .rev()
+            .filter(|b| b.slot() <= from)
+            .take(n)
+            .map(|b| (b.slot(), b.as_ssz_bytes()))
+            .collect()
+    };
+    let as_stored = |blocks: Vec<ServedBlock>| -> Vec<(u64, Vec<u8>)> {
+        for b in &blocks {
+            let fork = if b.slot < 32 {
+                ForkName::Fulu
+            } else {
+                ForkName::Gloas
+            };
+            assert_eq!(b.fork, fork, "slot {}", b.slot);
+        }
+        blocks.into_iter().map(|b| (b.slot, b.ssz)).collect()
+    };
+    for (from, count, n) in [
+        (HEAD, 128, 36),
+        (HEAD, u64::MAX, 36),
+        (HEAD, 10, 10),
+        (24, 8, 8),
+        (FINALIZED, 1, 1),
+        (2, 128, 2),
+    ] {
+        let got = as_stored(walk(root(from), count).await);
+        assert_eq!(got, ancestry(from, n), "from {from}, count {count}");
+    }
+    let (_, fork) = fixture();
+    let mut branch = vec![(36, fork.as_ssz_bytes())];
+    branch.extend(ancestry(35, 2));
+    assert_eq!(as_stored(walk(fork.message_root().0, 3).await), branch);
+    assert!(walk([0xee; 32], 8).await.is_empty(), "a root not stored");
 }

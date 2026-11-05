@@ -30,8 +30,9 @@ use p2p_wire::rpc::codec::{
     MAX_EMPTY_FRAMES, MAX_FRAME_BODY_LEN,
 };
 use p2p_wire::rpc::messages::{
-    BlocksByRangeV2Request, DataColumnsByRangeV1Request, DataColumnsByRootIdentifier,
-    DataColumnsByRootV1Request, ForkDigest, Goodbye, Ping, MAX_ERROR_MESSAGE_LEN,
+    BlocksByHeadV1Request, BlocksByRangeV2Request, DataColumnsByRangeV1Request,
+    DataColumnsByRootIdentifier, DataColumnsByRootV1Request, ForkDigest, Goodbye, Ping,
+    MAX_ERROR_MESSAGE_LEN,
 };
 use p2p_wire::rpc::protocols::{Protocol, ResultCode};
 use p2p_wire::testkit;
@@ -467,13 +468,45 @@ fn rpc_chunk(seeds: &mut Vec<Seed>, status: &[u8], metadata: &[u8], ping: &[u8])
         requests(seeds, target, i | REQUEST_SELECTOR, &prefix, request);
     }
 
-    let i = index(Protocol::BlocksByRangeV2);
-    requests(seeds, target, i | REQUEST_SELECTOR, "blocks-", Some(&range));
+    // BeaconBlocksByHead (selector 7): the same block chunks as BeaconBlocksByRange, and its
+    // `(beacon_root, count)` request.
+    let by_head = BlocksByHeadV1Request {
+        beacon_root: [0x11; 32].into(),
+        count: 64,
+    }
+    .as_ssz_bytes();
+    for (protocol, prefix, request) in [
+        (Protocol::BlocksByRangeV2, "blocks-", &range[..]),
+        (Protocol::BlocksByHeadV1, "blocks-head-", &by_head[..]),
+    ] {
+        let i = index(protocol);
+        requests(seeds, target, i | REQUEST_SELECTOR, prefix, Some(request));
+        block_chunks(seeds, target, i, protocol, prefix);
+    }
+
+    for (protocol, name) in [
+        (Protocol::DataColumnsByRangeV1, "columns-range-"),
+        (Protocol::DataColumnsByRootV1, "columns-root-"),
+    ] {
+        columns(seeds, target, index(protocol), protocol, name);
+    }
+}
+
+/// `rpc_chunk` for a block protocol, after its index `i`: its block chunks (Fulu, Fulu under
+/// the BPO digest, Gloas), a block under another fork's digest, an unknown digest, the context
+/// cut short, the result codes and the malformed payloads and frames, named `{prefix}*`.
+fn block_chunks(
+    seeds: &mut Vec<Seed>,
+    target: &'static str,
+    i: u8,
+    protocol: Protocol,
+    prefix: &str,
+) {
     let mut sink = Sink {
         seeds,
         target,
         lead: &[i],
-        prefix: "blocks-",
+        prefix,
     };
     let fulu = block_chunk(
         testkit::FULU_DIGEST,
@@ -507,7 +540,7 @@ fn rpc_chunk(seeds: &mut Vec<Seed>, status: &[u8], metadata: &[u8], ping: &[u8])
     );
     sink.result_codes();
     let head = cat(&[&[ResultCode::Success.as_byte()], &testkit::GLOAS_DIGEST]);
-    let bound = Protocol::BlocksByRangeV2
+    let bound = protocol
         .response_max_len::<E>(Some(ForkName::Gloas))
         .expect("a Gloas block has a bound");
     sink.bad_payloads(&head, bound, 1000);
@@ -519,13 +552,6 @@ fn rpc_chunk(seeds: &mut Vec<Seed>, status: &[u8], metadata: &[u8], ping: &[u8])
     let bomb = framed(BLOCK_BOMB_LEN, &vec![0; BLOCK_BOMB_LEN]);
     sink.add("snappy-bomb-1mib-within-bound", &cat(&[&head, &bomb]));
     sink.truncated_and_trailing(&gloas);
-
-    for (protocol, name) in [
-        (Protocol::DataColumnsByRangeV1, "columns-range-"),
-        (Protocol::DataColumnsByRootV1, "columns-root-"),
-    ] {
-        columns(seeds, target, index(protocol), protocol, name);
-    }
 }
 
 /// `rpc_chunk` for a column protocol, after its index `i`: its request (valid, past its lists'
