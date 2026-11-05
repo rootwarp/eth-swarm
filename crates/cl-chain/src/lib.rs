@@ -26,6 +26,9 @@
 //!
 //! [`verify`] is cl-chain's side of `ethswarm.verify.v1`: cl-chain never runs BLS or KZG itself.
 //!
+//! [`engine`] is cl-chain's side of `ethswarm.engine.v1`: the forkchoiceUpdated arguments and
+//! their ordered, latest-wins sender. Nothing calls the sender yet.
+//!
 //! [`da::custody`] owns the node's custody group count: never decreasing, stored in the column
 //! env, advertised through the MetaData and the ENR, and the column subnets cl-p2p subscribes.
 //!
@@ -41,6 +44,7 @@
 
 pub mod compiled_config;
 pub mod da;
+pub mod engine;
 pub mod events;
 pub mod finalized_index;
 pub mod persist;

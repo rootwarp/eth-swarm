@@ -151,6 +151,8 @@ pub struct ChainSettings {
     pub caller_uid: u32,
     /// The non-finality disk budget (`[chain.disk_budget]`).
     pub disk_budget: DiskBudget,
+    /// cl-engine's socket (`[chain.engine] socket`).
+    pub engine_socket: PathBuf,
 }
 
 /// Why the config was refused.
@@ -244,6 +246,7 @@ pub fn settings(config: &Config) -> Result<ChainSettings, SettingsError> {
         verify_wait,
         caller_uid,
         disk_budget: table.disk_budget,
+        engine_socket: PathBuf::new(),
     })
 }
 
