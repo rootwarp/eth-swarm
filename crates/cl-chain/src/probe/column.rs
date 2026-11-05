@@ -32,7 +32,9 @@
 //! Only a [`Verified`] column can be stored ([`store_verified`]), and only [`storage_contract`]
 //! makes one.
 
-use super::{BlockApi, RefBlock, RefView, ReferenceApi};
+use super::{
+    BlockApi, Canonical, CanonicalChain, ChainView, RefBlock, RefView, ReferenceApi, Root,
+};
 use crate::da::custody::Custody;
 use crate::persist::budget::Branch;
 use crate::verify::client::{Held, KzgOutcome, KzgVerifier};
@@ -326,15 +328,30 @@ where
     }
 }
 
+/// The disk-budget branch of the block `root` at `slot` by `view`, the reference's canonical
+/// chain as the probe follows it ([`CanonicalChain::view`]): [`Branch::Canonical`] only for a
+/// block on it. A block off it, one it does not place (below its first block or above its
+/// head) and every block while the chain is unknown (`None`) go on [`Branch::Side`], so only
+/// the canonical chain's columns spend the budget's canonical headroom.
+#[must_use]
+pub fn branch_of(view: Option<&ChainView>, slot: u64, root: &Root) -> Branch {
+    match view.map(|view| view.status(slot, root)) {
+        Some(Canonical::Yes) => Branch::Canonical,
+        Some(Canonical::No | Canonical::Unknown) | None => Branch::Side,
+    }
+}
+
 /// Stores a column that passed [`storage_contract`] in the column env, as its SSZ under
-/// `(slot, beacon_block_root, index)`. A peer-fed column says nothing of whether its block is
-/// canonical, so it is charged to the disk budget on [`Branch::Side`].
+/// `(slot, beacon_block_root, index)`, charged to the disk budget on the branch of its block
+/// by the reference's chain `chain` ([`branch_of`]): [`Branch::Side`] unless the chain has the
+/// block on it.
 ///
 /// # Errors
 ///
 /// The column store's ([`cl_chain_columns::ColumnWriter::write_block_columns_on`]).
 pub fn store_verified<E: EthSpec>(
     verified: &Verified<'_, E>,
+    chain: &CanonicalChain,
     writer: &cl_chain_columns::ColumnWriter,
 ) -> Result<(), cl_chain_columns::Error> {
     let sidecar = verified.sidecar();
@@ -343,12 +360,14 @@ pub fn store_verified<E: EthSpec>(
         index: sidecar.index,
         ssz: &ssz,
     };
+    let root = sidecar.beacon_block_root.0;
+    let branch = branch_of(chain.view().as_deref(), sidecar.slot, &root);
     writer
         .write_block_columns_on(
             sidecar.slot,
-            &sidecar.beacon_block_root.0,
+            &root,
             cl_chain_columns::BlockLink::Gap,
-            Branch::Side,
+            branch,
             &[column],
         )
         .map(drop)
