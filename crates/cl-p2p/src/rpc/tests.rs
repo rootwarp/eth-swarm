@@ -1681,8 +1681,14 @@ fn unsupported_ids_stay_unregistered() {
             "/eth2/beacon_chain/req/execution_payload_envelopes_by_root/1/ssz_snappy",
         ]
     );
+    // p2p-wire knows BeaconBlocksByHead; the probe registers it once it serves it ([6.42]).
     for protocol in Protocol::ALL {
-        assert_eq!(Unsupported::from_id(protocol.id()), None, "{protocol}");
+        let unsupported = Unsupported::from_id(protocol.id());
+        if protocol == Protocol::BlocksByHeadV1 {
+            assert_eq!(unsupported, Some(Unsupported::BlocksByHeadV1));
+        } else {
+            assert_eq!(unsupported, None, "{protocol}");
+        }
     }
     let readme = include_str!("../../README.md");
     let deviations = readme

@@ -146,6 +146,7 @@ impl RateLimits {
             Protocol::GoodbyeV1 => None,
             Protocol::DataColumnsByRangeV1 => Some(self.data_columns_by_range),
             Protocol::DataColumnsByRootV1 => Some(self.data_columns_by_root),
+            Protocol::BlocksByHeadV1 => todo!(),
         }
     }
 }
@@ -1638,6 +1639,7 @@ pub fn outbound_queue_name(protocol: Protocol) -> &'static str {
         Protocol::GoodbyeV1 => "rpc_outbound_goodbye",
         Protocol::DataColumnsByRangeV1 => "rpc_outbound_data_columns_by_range",
         Protocol::DataColumnsByRootV1 => "rpc_outbound_data_columns_by_root",
+        Protocol::BlocksByHeadV1 => todo!(),
     }
 }
 

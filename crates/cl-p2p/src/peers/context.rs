@@ -507,7 +507,7 @@ mod tests {
                 "Handling PRUNE message for peer"
             );
             for protocol in [
-                "/eth2/beacon_chain/req/beacon_blocks_by_head/1/ssz_snappy",
+                "/eth2/beacon_chain/req/execution_payload_envelopes_by_range/1/ssz_snappy",
                 long.as_str(),
             ] {
                 tracing::debug!(

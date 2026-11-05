@@ -779,6 +779,7 @@ impl<E: EthSpec> Protocols<E> {
             Protocol::BlocksByRangeV2 => &mut self.blocks_by_range,
             Protocol::DataColumnsByRangeV1 => &mut self.data_columns_by_range,
             Protocol::DataColumnsByRootV1 => &mut self.data_columns_by_root,
+            Protocol::BlocksByHeadV1 => todo!(),
         }
     }
 }
@@ -1869,6 +1870,7 @@ impl<E: EthSpec> Control<E> {
             request @ (Request::DataColumnsByRange(_) | Request::DataColumnsByRoot(_)) => {
                 self.serve_columns(peer, protocol, channel, request);
             }
+            Request::BlocksByHead(_) => todo!(),
         }
     }
 
@@ -2391,6 +2393,7 @@ impl<E: EthSpec> Control<E> {
             Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1 => {
                 tracing::debug!(%peer, %protocol, chunks = chunks.len(), "a column response");
             }
+            Protocol::BlocksByHeadV1 => todo!(),
         }
     }
 
