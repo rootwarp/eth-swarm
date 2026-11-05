@@ -2,7 +2,8 @@
 //! `gloas/p2p-interface.md` L1356–1374): [`ByRangeResponder`], the production [`Responder`],
 //! over a [`BlockSource`] ([`super::blocks_ipc::IpcBlocks`] in the service). cl-p2p opens no
 //! database: the finalized blocks come from cl-store (store.v1), the rest from cl-chain
-//! (chain.v1, ADR-006).
+//! (chain.v1, ADR-006). [`ByRangeResponder::head_responder`] builds the BeaconBlocksByHead
+//! responder over the same source, lookup slots and window ([`super::blocks_head`], #230).
 //!
 //! # An answer
 //!
@@ -41,6 +42,7 @@
 //! timeout `2`) ends the answer with its code before the first chunk, and cleanly at the last
 //! whole chunk after it; each is counted in `rpc_block_lookup_failures_total{half, kind}`.
 
+use super::blocks_head::ByHeadResponder;
 use super::columns::fixed_message;
 use super::inbound::StatusSource;
 use super::metrics::RpcMetrics;
@@ -78,7 +80,7 @@ pub const MAX_FINALIZED_DEPTH: u64 = 2_048;
 /// Which half of an answer a block comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Half {
-    /// The finalized blocks, and the split point: cl-store.
+    /// The finalized blocks, the split point and every parent walk: cl-store.
     Store,
     /// The blocks above the store's finalized slot: cl-chain.
     Chain,
@@ -146,10 +148,32 @@ pub trait BlockSource: Send + Sync + 'static {
 
     /// The canonical blocks of `[start, start + count)` from `half`, ascending.
     fn blocks(&self, half: Half, start: u64, count: u64) -> Lookup<Blocks>;
+
+    /// The block at `root` and its ancestors, newest first, at most `count`, from cl-store's
+    /// parent walk (#230): none for a root it does not hold.
+    fn by_head(&self, root: [u8; 32], count: u64) -> Lookup<Blocks>;
 }
 
-/// The start slot of the block serve window now, if known.
+/// The start slot of the block serve window now, if known; both block responders read it.
 pub type WindowStart = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// `block` decoded by the fork of its slot, and its `parent_root`; one that does not decode,
+/// or decodes to a block of another slot, is `2` (`decode`).
+pub(super) fn decode<E: EthSpec>(
+    block: &ServedBlock,
+) -> Result<(forked::SignedBeaconBlock<E>, [u8; 32]), Failed> {
+    let decoded =
+        forked::SignedBeaconBlock::<E>::from_ssz_bytes_for_fork(&block.ssz, block.fork)
+            .map_err(|e| Failed::server_error("decode", format!("slot {}: {e:?}", block.slot)))?;
+    if decoded.slot() != block.slot {
+        return Err(Failed::server_error("decode", "a block of another slot"));
+    }
+    let parent = match &decoded {
+        forked::SignedBeaconBlock::Fulu(b) => b.message.parent_root.0,
+        forked::SignedBeaconBlock::Gloas(b) => b.message.parent_root.0,
+    };
+    Ok((decoded, parent))
+}
 
 /// Serves BeaconBlocksByRange v2 from a [`BlockSource`] (see the module docs).
 #[derive(Clone)]
@@ -199,6 +223,19 @@ impl ByRangeResponder {
     pub fn with_window(mut self, window: WindowStart) -> Self {
         self.window = Some(window);
         self
+    }
+
+    /// The BeaconBlocksByHead responder over the same source, taking its lookup slots from
+    /// this responder's pool, counting its failures in the same metrics and reading the same
+    /// window (#230, D5, D7).
+    #[must_use]
+    pub fn head_responder(&self) -> ByHeadResponder {
+        ByHeadResponder::new(
+            Arc::clone(&self.source),
+            Arc::clone(&self.lookups),
+            self.metrics.clone(),
+            self.window.clone(),
+        )
     }
 
     /// Lookup slots free now.
@@ -314,15 +351,23 @@ impl ByRangeResponder {
 }
 
 /// One answer on its way out.
-struct Out<E: EthSpec> {
-    sink: ChunkSink<E>,
+pub(super) struct Out<E: EthSpec> {
+    pub(super) sink: ChunkSink<E>,
     /// Chunks sent.
-    sent: usize,
+    pub(super) sent: usize,
     /// The slot and root of the block sent last.
     last: Option<(u64, [u8; 32])>,
 }
 
 impl<E: EthSpec> Out<E> {
+    pub(super) fn new(sink: ChunkSink<E>) -> Self {
+        Self {
+            sink,
+            sent: 0,
+            last: None,
+        }
+    }
+
     /// `block` as the next chunk of `[start, end)`, if it is: after the last block, inside the
     /// range, on the last block, decoded in its fork.
     fn check(&mut self, block: ServedBlock, start: u64, end: u64) -> Result<Response<E>, Failed> {
@@ -334,18 +379,7 @@ impl<E: EthSpec> Out<E> {
             );
             return Err(Failed::server_error("order", why));
         }
-        let decoded =
-            forked::SignedBeaconBlock::<E>::from_ssz_bytes_for_fork(&block.ssz, block.fork)
-                .map_err(|e| {
-                    Failed::server_error("decode", format!("slot {}: {e:?}", block.slot))
-                })?;
-        let parent = match &decoded {
-            forked::SignedBeaconBlock::Fulu(b) => b.message.parent_root.0,
-            forked::SignedBeaconBlock::Gloas(b) => b.message.parent_root.0,
-        };
-        if decoded.slot() != block.slot {
-            return Err(Failed::server_error("decode", "a block of another slot"));
-        }
+        let (decoded, parent) = decode::<E>(&block)?;
         if self.last.is_some_and(|(_, root)| root != parent) {
             let why = format!("slot {}: parent_root is not the block before", block.slot);
             return Err(Failed::server_error("link", why));
@@ -356,7 +390,7 @@ impl<E: EthSpec> Out<E> {
 
     /// Ends the answer on `failed`: its error chunk if nothing went out, else at the last whole
     /// chunk.
-    async fn end(&mut self, failed: Failed) {
+    pub(super) async fn end(&mut self, failed: Failed) {
         if self.sent == 0 {
             let _ = self
                 .sink
@@ -381,11 +415,7 @@ impl<E: EthSpec> Responder<E> for ByRangeResponder {
             let Request::BlocksByRange(range) = request else {
                 return;
             };
-            let mut out = Out {
-                sink,
-                sent: 0,
-                last: None,
-            };
+            let mut out = Out::new(sink);
             if let Err(failed) = this.answer(range, &mut out).await {
                 out.end(failed).await;
             }
@@ -444,6 +474,22 @@ pub(crate) mod testing {
         chain
     }
 
+    /// The `parent_root` of `block`, decoded in its fork.
+    pub(crate) fn parent_of(block: &ServedBlock) -> [u8; 32] {
+        let decoded =
+            forked::SignedBeaconBlock::<Minimal>::from_ssz_bytes_for_fork(&block.ssz, block.fork)
+                .unwrap();
+        match decoded {
+            forked::SignedBeaconBlock::Fulu(b) => b.message.parent_root.0,
+            forked::SignedBeaconBlock::Gloas(b) => b.message.parent_root.0,
+        }
+    }
+
+    /// The canonical block at `slot`.
+    pub(crate) fn at(slot: u64) -> ServedBlock {
+        chain().into_iter().find(|b| b.slot == slot).unwrap()
+    }
+
     /// The slots of the canonical blocks of `[start, end)`.
     pub(crate) fn canonical(start: u64, end: u64) -> Vec<u64> {
         chain()
@@ -478,6 +524,8 @@ pub(crate) mod testing {
     pub(crate) enum Call {
         Head,
         Range(Half, u64, u64),
+        /// A parent walk from a root, of at most `count` blocks (#230).
+        ByHead([u8; 32], u64),
     }
 
     #[derive(Default)]
@@ -493,6 +541,14 @@ pub(crate) mod testing {
         replaced: Mutex<Vec<(u64, ServedBlock)>>,
         /// What the store half takes per slot walked before it opens.
         walk_cost: Mutex<Option<Duration>>,
+        /// Blocks the store holds besides [`chain`]'s (fork blocks), found by root.
+        known: Mutex<Vec<ServedBlock>>,
+        /// Blocks a parent walk sends in place of its `n`th.
+        walk_replaced: Mutex<Vec<(usize, ServedBlock)>>,
+        /// How many blocks past its `count` a parent walk sends.
+        overserve: AtomicU64,
+        /// The blocks parent walks handed over so far.
+        walk_reads: AtomicUsize,
     }
 
     /// A [`BlockSource`] over [`chain`]: the store half holds the blocks at or below its
@@ -538,6 +594,26 @@ pub(crate) mod testing {
             *self.0.walk_cost.lock().unwrap() = Some(per_slot);
         }
 
+        /// The store holds `block` too (off [`chain`]), found by its root.
+        pub(crate) fn add(&self, block: ServedBlock) {
+            self.0.known.lock().unwrap().push(block);
+        }
+
+        /// Parent walks send `block` in place of their `n`th block.
+        pub(crate) fn replace_in_walk(&self, n: usize, block: ServedBlock) {
+            self.0.walk_replaced.lock().unwrap().push((n, block));
+        }
+
+        /// Parent walks go on `extra` blocks past their `count`, as far as the parents reach.
+        pub(crate) fn overserve(&self, extra: u64) {
+            self.0.overserve.store(extra, Ordering::SeqCst);
+        }
+
+        /// The blocks parent walks handed over so far.
+        pub(crate) fn walk_reads(&self) -> usize {
+            self.0.walk_reads.load(Ordering::SeqCst)
+        }
+
         /// The calls so far, and forgets them.
         pub(crate) fn calls(&self) -> Vec<Call> {
             std::mem::take(&mut *self.0.calls.lock().unwrap())
@@ -549,7 +625,7 @@ pub(crate) mod testing {
                 .into_iter()
                 .filter_map(|c| match c {
                     Call::Range(half, start, count) => Some((half, start, count)),
-                    Call::Head => None,
+                    Call::Head | Call::ByHead(..) => None,
                 })
                 .collect()
         }
@@ -632,6 +708,49 @@ pub(crate) mod testing {
                         }
                         let next = blocks.next()?;
                         Some((Ok(next), (i + 1, blocks, fake, live)))
+                    },
+                );
+                Ok(Box::pin(items) as Blocks)
+            })
+        }
+
+        /// The store's parent walk: the block at `root`, then its parent, while stored, ending
+        /// after slot 0 or `count` blocks (plus [`Fake::overserve`]); scripted at
+        /// `Open(Store)` and `Item(Store, n)`.
+        fn by_head(&self, root: [u8; 32], count: u64) -> Lookup<Blocks> {
+            let (fake, live) = (self.clone(), self.enter());
+            fake.0.calls.lock().unwrap().push(Call::ByHead(root, count));
+            Box::pin(async move {
+                if let Some(failed) = acted(fake.act(Step::Open(Half::Store))).await {
+                    return failed;
+                }
+                let mut known = chain();
+                known.extend(fake.0.known.lock().unwrap().iter().cloned());
+                let take = count.saturating_add(fake.0.overserve.load(Ordering::SeqCst));
+                let mut walk = Vec::new();
+                let mut next = Some(root);
+                while let Some(at) = next.filter(|_| (walk.len() as u64) < take) {
+                    let Some(block) = known.iter().find(|b| b.root == at).cloned() else {
+                        break;
+                    };
+                    next = (block.slot > 0).then(|| parent_of(&block));
+                    walk.push(block);
+                }
+                for (n, block) in fake.0.walk_replaced.lock().unwrap().iter() {
+                    if let Some(item) = walk.get_mut(*n) {
+                        *item = block.clone();
+                    }
+                }
+                let items = futures::stream::unfold(
+                    (0usize, walk.into_iter(), fake, live),
+                    move |(i, mut walk, fake, live)| async move {
+                        let step = Step::Item(Half::Store, i);
+                        if let Some(failed) = acted(fake.act(step)).await {
+                            return Some((failed, (i + 1, Vec::new().into_iter(), fake, live)));
+                        }
+                        let next = walk.next()?;
+                        fake.0.walk_reads.fetch_add(1, Ordering::SeqCst);
+                        Some((Ok(next), (i + 1, walk, fake, live)))
                     },
                 );
                 Ok(Box::pin(items) as Blocks)

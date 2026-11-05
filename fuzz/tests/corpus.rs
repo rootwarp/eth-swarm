@@ -215,23 +215,31 @@ fn every_target_has_the_required_malformed_seeds() {
     for prefix in ["status-", "metadata-", "ping-", "goodbye-"] {
         chunks("rpc_chunk", prefix);
     }
-    for prefix in ["status-", "ping-", "goodbye-", "blocks-"] {
+    for prefix in ["status-", "ping-", "goodbye-", "blocks-", "blocks-head-"] {
         requests("rpc_chunk", prefix);
     }
-    for name in CHUNK_SEEDS {
-        let name = if name == "valid" { "gloas-valid" } else { name };
-        assert!(
-            has("rpc_chunk", &format!("blocks-{name}")),
-            "rpc_chunk/blocks-{name}"
-        );
+    // BeaconBlocksByRange and BeaconBlocksByHead (selector 7) alike.
+    for prefix in ["blocks-", "blocks-head-"] {
+        for name in CHUNK_SEEDS {
+            let name = if name == "valid" { "gloas-valid" } else { name };
+            assert!(
+                has("rpc_chunk", &format!("{prefix}{name}")),
+                "rpc_chunk/{prefix}{name}"
+            );
+        }
+        for name in [
+            "unknown-context-digest",
+            "context-cut-short",
+            "fulu-bpo-digest-valid",
+        ] {
+            let name = format!("{prefix}{name}");
+            assert!(has("rpc_chunk", &name), "rpc_chunk/{name}");
+        }
     }
     for name in [
         "metadata-request-empty",
         "goodbye-valid",
         "goodbye-error-code-1",
-        "blocks-unknown-context-digest",
-        "blocks-context-cut-short",
-        "blocks-fulu-bpo-digest-valid",
     ] {
         assert!(has("rpc_chunk", name), "rpc_chunk/{name}");
     }

@@ -193,6 +193,13 @@ fn request_seeds() {
     check_requests(Protocol::BlocksByRangeV2, "rpc_chunk", range, |n| {
         body("rpc_chunk", &format!("blocks-request-{n}"))
     });
+    let head = Request::BlocksByHead(p2p_wire::rpc::messages::BlocksByHeadV1Request {
+        beacon_root: [0x11; 32].into(),
+        count: 64,
+    });
+    check_requests(Protocol::BlocksByHeadV1, "rpc_chunk", head, |n| {
+        body("rpc_chunk", &format!("blocks-head-request-{n}"))
+    });
     for (target, prefix) in [("metadata_v3", ""), ("rpc_chunk", "metadata-")] {
         let decode = |name: &str| {
             decode_request(
@@ -211,41 +218,74 @@ fn request_seeds() {
 
 #[test]
 fn rpc_chunk_block_and_goodbye_seeds() {
-    let block = |name: &str| {
-        decode_response_chunk::<E>(
-            &body("rpc_chunk", &format!("blocks-{name}")),
-            Protocol::BlocksByRangeV2,
-            contexts(),
-        )
-    };
-    let fork = |name: &str| match block(name) {
-        Ok(ResponseChunk::Success(Response::Block(b))) => b.fork_name().to_string(),
-        other => format!("{other:?}"),
-    };
-    assert_eq!(fork("fulu-valid"), "fulu");
-    assert_eq!(fork("fulu-bpo-digest-valid"), "fulu");
-    assert_eq!(fork("gloas-valid"), "gloas");
-    assert!(matches!(
-        block("unknown-context-digest"),
-        Err(CodecError::UnknownContext(_))
-    ));
-    assert_eq!(block("context-cut-short"), Err(CodecError::Truncated));
-    assert!(matches!(
-        block("fulu-block-under-gloas-digest"),
-        Err(CodecError::Decode(_))
-    ));
-    assert!(matches!(
-        block("prefix-under-block-minimum"),
-        Err(CodecError::PayloadTooSmall { .. })
-    ));
-    assert!(matches!(
-        block("snappy-bomb"),
-        Err(CodecError::CompressedTooLarge { len: 1000, .. })
-    ));
-    assert!(matches!(
-        block("snappy-bomb-1mib-within-bound"),
-        Err(CodecError::Decode(_))
-    ));
+    // BeaconBlocksByRange, and BeaconBlocksByHead (selector 7) with the same block chunks.
+    for (protocol, prefix) in [
+        (Protocol::BlocksByRangeV2, "blocks-"),
+        (Protocol::BlocksByHeadV1, "blocks-head-"),
+    ] {
+        let block = |name: &str| {
+            decode_response_chunk::<E>(
+                &body("rpc_chunk", &format!("{prefix}{name}")),
+                protocol,
+                contexts(),
+            )
+        };
+        let fork = |name: &str| match block(name) {
+            Ok(ResponseChunk::Success(Response::Block(b))) => b.fork_name().to_string(),
+            other => format!("{other:?}"),
+        };
+        assert_eq!(fork("fulu-valid"), "fulu", "{protocol}");
+        assert_eq!(fork("fulu-bpo-digest-valid"), "fulu", "{protocol}");
+        assert_eq!(fork("gloas-valid"), "gloas", "{protocol}");
+        assert!(
+            matches!(
+                block("unknown-context-digest"),
+                Err(CodecError::UnknownContext(_))
+            ),
+            "{protocol}"
+        );
+        assert_eq!(
+            block("context-cut-short"),
+            Err(CodecError::Truncated),
+            "{protocol}"
+        );
+        assert!(
+            matches!(
+                block("fulu-block-under-gloas-digest"),
+                Err(CodecError::Decode(_))
+            ),
+            "{protocol}"
+        );
+        assert!(
+            matches!(
+                block("prefix-under-block-minimum"),
+                Err(CodecError::PayloadTooSmall { .. })
+            ),
+            "{protocol}"
+        );
+        assert!(
+            matches!(
+                block("snappy-bomb"),
+                Err(CodecError::CompressedTooLarge { len: 1000, .. })
+            ),
+            "{protocol}"
+        );
+        assert!(
+            matches!(
+                block("snappy-bomb-1mib-within-bound"),
+                Err(CodecError::Decode(_))
+            ),
+            "{protocol}"
+        );
+        // Codes 1-3: BeaconBlocksByHead specifies `3` too (`fulu/p2p-interface.md` L837–838).
+        for code in 1..=3 {
+            let got = block(&format!("error-code-{code}"));
+            assert!(
+                matches!(got, Ok(ResponseChunk::Error { .. })),
+                "{protocol}: {got:?}"
+            );
+        }
+    }
     let goodbye = |name: &str| {
         decode_response_chunk::<E>(
             &body("rpc_chunk", &format!("goodbye-{name}")),
@@ -266,6 +306,8 @@ fn rpc_chunk_block_and_goodbye_seeds() {
     ));
     // The selector names the protocol and the direction.
     assert_eq!(seed("rpc_chunk", "blocks-gloas-valid")[0], 3);
+    assert_eq!(seed("rpc_chunk", "blocks-head-gloas-valid")[0], 7);
+    assert_eq!(seed("rpc_chunk", "blocks-head-request-valid")[0], 7 | 8);
     assert_eq!(seed("rpc_chunk", "goodbye-request-valid")[0], 4 | 8);
 }
 

@@ -1,10 +1,11 @@
 //! The result code of a req/resp answer that a failed cl-store call (`ethswarm.store.v1`) ends.
 //!
-//! BeaconBlocksByRange's finalized half reads cl-store ([`super::blocks_ipc`], #146), and the
-//! parent walk of `BeaconBlocksByHead` will ([6.42]); a failed store call is mapped through
-//! here. cl-store fails a read `UNAVAILABLE`, with `ERROR_CODE_RESOURCE_UNAVAILABLE` in the
-//! status details, when it has nothing stamped to serve from: the responder does not have the
-//! data, `3: ResourceUnavailable`, never `2: ServerError`.
+//! BeaconBlocksByRange's finalized half reads cl-store ([`super::blocks_ipc`], #146), and so
+//! does the parent walk of `BeaconBlocksByHead` ([`super::blocks_head`], #230); a failed store
+//! call is mapped through here. cl-store fails a read `UNAVAILABLE`, with
+//! `ERROR_CODE_RESOURCE_UNAVAILABLE` in the status details, when it has nothing stamped to serve
+//! from: the responder does not have the data, `3: ResourceUnavailable`, never
+//! `2: ServerError`.
 
 use ethswarm_proto::common::ErrorCode;
 use ipc::error::error_from_status;
