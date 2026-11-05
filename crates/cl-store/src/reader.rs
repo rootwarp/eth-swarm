@@ -387,6 +387,13 @@ impl ParentWalk {
         }
     }
 
+    /// The same walk, each read transaction ended `timeout` after its step started (#230): not
+    /// yet.
+    #[must_use]
+    pub fn with_step_timeout(self, _timeout: Duration) -> Self {
+        self
+    }
+
     /// The block at `root`, if stored, and where the walk goes on.
     fn step(&mut self, root: Root) -> Result<Option<Stamped<Block>>, ReadError> {
         let decided = self.finalized.is_some();
@@ -454,6 +461,7 @@ mod tests {
         collections::BTreeSet,
         io::{BufRead, Read, Write},
         path::PathBuf,
+        sync::atomic::{AtomicU64, AtomicUsize},
         thread,
     };
     use store_schema::{
@@ -1129,6 +1137,90 @@ mod tests {
         );
         let walk: Vec<_> = ParentWalk::new(Arc::new(reader), root, 8, dl).collect();
         assert_eq!(walk, [Err(ReadError::Unavailable)]);
+    }
+
+    /// `n` blocks on one chain, slots 1 to `n`, stamped head and finalized at the last: their
+    /// roots, by slot - 1.
+    fn linear(store: &Store, n: u64) -> Vec<Root> {
+        let (mut ssz, mut roots, mut parent) = (Vec::new(), Vec::new(), [0; 32]);
+        for slot in 1..=n {
+            let (block, root) = block(slot, parent, 0);
+            ssz.push(block);
+            roots.push(root);
+            parent = root;
+        }
+        let blocks: Vec<&[u8]> = ssz.iter().map(Vec::as_slice).collect();
+        store.import(&blocks, stamp(1, (n, parent), (n, parent)));
+        roots
+    }
+
+    /// #230 D3a: a parent walk decides `finalized` once, at its first block at or below the
+    /// stamp's finalized slot, by walking down from the finalized block to it. That walk is
+    /// bounded: a block more than [`crate::MAX_FINALIZED_DEPTH`] (2,048) slots below the
+    /// finalized slot reads `finalized` false ("not proven", never a false `true`), as do the
+    /// blocks below it, after a few looks at the clock (no walk); one exactly 2,048 below is
+    /// walked to and reads `true`.
+    #[test]
+    fn blocks_by_head_deep_root_bounded() {
+        let store = Store::new();
+        let depth = crate::MAX_FINALIZED_DEPTH;
+        let top = depth + 70;
+        let roots = linear(&store, top);
+        let reader = Arc::new(store.reader());
+        let looks = Arc::new(AtomicUsize::new(0));
+        let clock: Clock = {
+            let (looks, t0) = (Arc::clone(&looks), Instant::now());
+            Arc::new(move || {
+                looks.fetch_add(1, Ordering::SeqCst);
+                t0
+            })
+        };
+        let walk = |slot: u64| {
+            looks.store(0, Ordering::SeqCst);
+            let deadline = Deadline::after(Arc::clone(&clock), Duration::from_secs(600));
+            let root = roots[usize::try_from(slot - 1).unwrap()];
+            let read: Vec<(u64, bool)> = ParentWalk::new(Arc::clone(&reader), root, 2, deadline)
+                .map(|b| b.map(|b| (b.value.slot, b.value.finalized)))
+                .collect::<Result<_, _>>()
+                .unwrap();
+            (read, looks.load(Ordering::SeqCst))
+        };
+        let deep = top - depth - 1;
+        let (read, deep_looks) = walk(deep);
+        assert_eq!(read, [(deep, false), (deep - 1, false)], "not proven");
+        assert!(
+            deep_looks <= 6,
+            "{deep_looks} looks: no walk to the finalized block"
+        );
+        let edge = top - depth;
+        let (read, edge_looks) = walk(edge);
+        assert_eq!(read, [(edge, true), (edge - 1, true)]);
+        assert!(edge_looks > 32, "walked: {edge_looks} looks");
+    }
+
+    /// #230 D3b: a walk's deadline bounds when a step may start; each step's read transaction
+    /// still ends within the step timeout of the step's start, however far off the walk's
+    /// deadline is. On a clock that moves 1 s at every look (a step looks once as it starts,
+    /// and twice in its transaction), a 2 s step fails its first read `DeadlineExceeded`, and
+    /// a 3 s step walks on, under the same 600 s walk deadline.
+    #[test]
+    fn parent_walk_step_txn_bounded() {
+        let store = Store::new();
+        let roots = linear(&store, 4);
+        let reader = Arc::new(store.reader());
+        let walk = |step: u64| {
+            let ticks = AtomicU64::new(0);
+            let t0 = Instant::now();
+            let clock: Clock =
+                Arc::new(move || t0 + Duration::from_secs(ticks.fetch_add(1, Ordering::SeqCst)));
+            let deadline = Deadline::after(clock, Duration::from_secs(600));
+            ParentWalk::new(Arc::clone(&reader), roots[3], 4, deadline)
+                .with_step_timeout(Duration::from_secs(step))
+                .map(|b| b.map(|b| b.value.slot))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(walk(2), [Err(ReadError::DeadlineExceeded)]);
+        assert_eq!(walk(3), [Ok(4), Ok(3), Ok(2), Ok(1)]);
     }
 
     /// A block by slot is the canonical one of the snapshot's own stamp: the block on the

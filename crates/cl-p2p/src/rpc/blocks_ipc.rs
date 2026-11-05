@@ -119,6 +119,10 @@ impl BlockSource for IpcBlocks {
             }
         }
     }
+
+    fn by_head(&self, _: [u8; 32], _: u64) -> Lookup<Blocks> {
+        todo!("#230")
+    }
 }
 
 /// `step` around one IPC step; past it the step fails `2` (`timeout`).
@@ -168,6 +172,12 @@ impl BlockBody for store::GetBlocksByRangeResponseBody {
         }
         self.item
             .ok_or_else(|| contract("a store body without its block"))
+    }
+}
+
+impl BlockBody for store::GetBlocksByHeadResponseBody {
+    fn envelope(self) -> Result<Envelope, Failed> {
+        todo!("#230")
     }
 }
 
@@ -344,6 +354,18 @@ mod tests {
             item: Some(item),
             meta,
             error: None,
+        })
+    }
+
+    fn head_body(
+        block: Option<Envelope>,
+        meta: Option<ReadMeta>,
+        error: Option<Error>,
+    ) -> store::GetBlocksByHeadResponse {
+        store::GetBlocksByHeadResponse::body(store::GetBlocksByHeadResponseBody {
+            block,
+            meta,
+            error,
         })
     }
 
@@ -552,6 +574,81 @@ mod tests {
                 ResultCode::ServerError,
                 "{status:?}"
             );
+        }
+    }
+
+    /// #230: a `GetBlocksByHead` stream reads as the store half does: each body's envelope is
+    /// a block, held to its slot's fork digest, newest first as the store walks; no body at
+    /// all (a root the store does not hold) is no block. A body without the full read stamp,
+    /// or with neither block nor error, breaks the contract (`2`); a body's error is `3` for
+    /// `ERROR_CODE_RESOURCE_UNAVAILABLE`, else `2`. A failed call maps as every store call
+    /// does: cl-store's own `UNAVAILABLE` is `3`, anything else `2`.
+    #[tokio::test]
+    async fn by_head_reads_store_stream() {
+        use crate::rpc::blocks::testing::at;
+        let link = link();
+        let hello = || store::GetBlocksByHeadResponse::hello(server_hello(&link));
+        let (b40, b39) = (at(40), at(39));
+        let served = read(
+            vec![
+                hello(),
+                head_body(Some(envelope(&b40, 1)), meta(), None),
+                head_body(Some(envelope(&b39, 2)), meta(), None),
+            ],
+            Half::Store,
+        )
+        .await;
+        assert_eq!(served, [Ok(b40.clone()), Ok(b39)]);
+        assert_eq!(served[0].as_ref().unwrap().fork, ForkName::Gloas);
+        assert!(read(vec![hello()], Half::Store).await.is_empty(), "no body");
+        let error = |code: ErrorCode| {
+            Some(Error {
+                code: code as i32,
+                detail: "from cl-store".into(),
+            })
+        };
+        for (case, body, code) in [
+            (
+                "stampless",
+                head_body(Some(envelope(&b40, 1)), None, None),
+                ResultCode::ServerError,
+            ),
+            (
+                "neither",
+                head_body(None, meta(), None),
+                ResultCode::ServerError,
+            ),
+            (
+                "unavailable",
+                head_body(None, meta(), error(ErrorCode::ResourceUnavailable)),
+                ResultCode::ResourceUnavailable,
+            ),
+            (
+                "deadline",
+                head_body(None, meta(), error(ErrorCode::DeadlineExceeded)),
+                ResultCode::ServerError,
+            ),
+        ] {
+            let served = read(vec![hello(), body], Half::Store).await;
+            let failed = served[0].clone().unwrap_err();
+            assert_eq!(failed.code, code, "{case}");
+            assert_eq!(served.len(), 1, "{case}: nothing after it");
+        }
+        let details = to_status(&wire_error(ErrorCode::ResourceUnavailable, "no stamp"))
+            .details()
+            .to_vec();
+        let unstamped =
+            Status::with_details(Code::Unavailable, "store unavailable", details.into());
+        for (status, code) in [
+            (unstamped, ResultCode::ResourceUnavailable),
+            (Status::deadline_exceeded("late"), ResultCode::ServerError),
+            (Status::internal("walk"), ResultCode::ServerError),
+            (
+                Status::unavailable("connection refused"),
+                ResultCode::ServerError,
+            ),
+        ] {
+            assert_eq!(call_failed(Half::Store, &status).code, code, "{status:?}");
         }
     }
 

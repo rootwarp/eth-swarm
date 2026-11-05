@@ -779,6 +779,7 @@ impl<E: EthSpec> Protocols<E> {
             Protocol::BlocksByRangeV2 => &mut self.blocks_by_range,
             Protocol::DataColumnsByRangeV1 => &mut self.data_columns_by_range,
             Protocol::DataColumnsByRootV1 => &mut self.data_columns_by_root,
+            Protocol::BlocksByHeadV1 => todo!("#230"),
         }
     }
 }
@@ -1023,6 +1024,8 @@ pub struct Control<E: EthSpec> {
     queue_timer: Option<Pin<Box<Sleep>>>,
     /// Serves BlocksByRange with streamed answers; `None` answers `3: ResourceUnavailable`.
     blocks_responder: Option<Arc<dyn Responder<E>>>,
+    /// Serves BlocksByHead (#230).
+    head_responder: Option<Arc<dyn Responder<E>>>,
     /// The streamed answers' slots ([`RpcLimits::max_inbound_streams`]), over every peer.
     streams: Arc<Semaphore>,
 }
@@ -1131,6 +1134,7 @@ impl<E: EthSpec> Control<E> {
             column_queue: VecDeque::new(),
             queue_timer: None,
             blocks_responder: None,
+            head_responder: None,
             streams,
         }
     }
@@ -1141,6 +1145,23 @@ impl<E: EthSpec> Control<E> {
     pub fn with_blocks_responder(mut self, responder: Arc<dyn Responder<E>>) -> Self {
         self.blocks_responder = Some(responder);
         self
+    }
+
+    /// The same behaviour, serving BlocksByHead with `responder` (#230).
+    #[must_use]
+    pub fn with_head_responder(mut self, responder: Arc<dyn Responder<E>>) -> Self {
+        self.head_responder = Some(responder);
+        self
+    }
+
+    /// Our answer to `peer`'s BlocksByHead `request` (#230): not yet.
+    pub(super) fn head_answer(
+        &mut self,
+        _peer: PeerId,
+        _protocol: Protocol,
+        _request: Request,
+    ) -> Option<Answer<E>> {
+        todo!("#230")
     }
 
     /// What our Status answers hold now ([`StatusBacklog`]).
@@ -1869,6 +1890,11 @@ impl<E: EthSpec> Control<E> {
             request @ (Request::DataColumnsByRange(_) | Request::DataColumnsByRoot(_)) => {
                 self.serve_columns(peer, protocol, channel, request);
             }
+            request @ Request::BlocksByHead(_) => {
+                if let Some(answer) = self.head_answer(peer, protocol, request) {
+                    self.send_answer(protocol, channel, answer);
+                }
+            }
         }
     }
 
@@ -2391,6 +2417,7 @@ impl<E: EthSpec> Control<E> {
             Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1 => {
                 tracing::debug!(%peer, %protocol, chunks = chunks.len(), "a column response");
             }
+            Protocol::BlocksByHeadV1 => todo!("#230"),
         }
     }
 
@@ -5721,6 +5748,594 @@ mod tests {
                     assert_eq!(only_error(&chunks), Some(ResultCode::ServerError));
                 }
             }
+        }
+    }
+
+    // --- BeaconBlocksByHead from cl-store (#230) ---
+
+    use super::super::blocks::ServedBlock;
+    use p2p_wire::rpc::messages::BlocksByHeadV1Request;
+
+    const HEAD: Protocol = Protocol::BlocksByHeadV1;
+
+    fn head(root: [u8; 32], count: u64) -> Request {
+        Request::BlocksByHead(BlocksByHeadV1Request {
+            beacon_root: root.into(),
+            count,
+        })
+    }
+
+    /// The production ByHead responder over `fake` (D5: built from the range responder, whose
+    /// `lookups` slots and window it shares), the window starting at slot `window` if given.
+    fn by_head(
+        fake: &Fake,
+        window: Option<u64>,
+        lookups: usize,
+        metrics: &RpcMetrics,
+    ) -> (Arc<dyn Responder<Spec>>, ByRangeResponder) {
+        let (_, range) = by_range(fake, Some(0), lookups, metrics);
+        let range = match window {
+            Some(start) => range.with_window(Arc::new(move || Some(start))),
+            None => range,
+        };
+        (Arc::new(range.head_responder()), range)
+    }
+
+    /// When a chunk of `peer`'s `protocol` bucket charged now would be due (a look).
+    fn due_on(control: &Control<Spec>, peer: PeerId, protocol: Protocol) -> Instant {
+        let mut limiter = control.limiter.lock().unwrap();
+        let now = Instant::now();
+        let charge = limiter.charge(peer, protocol, now);
+        let due = charge.due();
+        limiter.refund(peer, protocol, charge, now);
+        due
+    }
+
+    /// Puts `peer`'s ByHead bucket `tokens` in debt: when its next token is due.
+    fn head_debt(control: &Control<Spec>, peer: PeerId, tokens: u64) -> Instant {
+        let now = Instant::now();
+        let _ = control
+            .limiter
+            .lock()
+            .unwrap()
+            .charge_block(peer, HEAD, tokens, now);
+        due_on(control, peer, HEAD)
+    }
+
+    /// The chunks a ByHead requester of `request` reads from `wire`, context bytes included.
+    async fn head_received(wire: &[u8], request: &Request) -> Vec<ReceivedChunk<Spec>> {
+        let contexts = Arc::new(testkit::context_table());
+        let mut codec = RpcCodec::<Spec>::new(contexts, Deadlines::default());
+        let valid = RpcRequest::Valid(request.clone());
+        let mut sent = futures::io::sink();
+        codec.write_request(&HEAD, &mut sent, valid).await.unwrap();
+        codec.read_response(&HEAD, &mut &wire[..]).await.unwrap()
+    }
+
+    /// Writes `answer` to a requester that takes every write at once: what it reads.
+    async fn write_head(
+        control: &Control<Spec>,
+        answer: Answer<Spec>,
+        request: &Request,
+    ) -> Vec<ReceivedChunk<Spec>> {
+        let mut reader = Reader::new(Duration::ZERO);
+        writer(control)
+            .write_response(&HEAD, &mut reader, answer)
+            .await
+            .unwrap();
+        head_received(&reader.bytes, request).await
+    }
+
+    /// Serves `request` with `responder`: what the requester reads, and how long it took.
+    async fn serve_head(
+        control: &mut Control<Spec>,
+        peer: PeerId,
+        request: Request,
+        responder: &Arc<dyn Responder<Spec>>,
+    ) -> (Vec<ReceivedChunk<Spec>>, Duration) {
+        let start = Instant::now();
+        let answer = control.answer_streamed(peer, HEAD, request.clone(), responder);
+        let chunks = write_head(control, answer.unwrap(), &request).await;
+        (chunks, Instant::now() - start)
+    }
+
+    /// The (slot, root) of each block of `chunks`.
+    fn walked(chunks: &[ReceivedChunk<Spec>]) -> Vec<(u64, [u8; 32])> {
+        blocks_of(chunks)
+            .iter()
+            .map(|b| (b.slot(), b.message_root().0))
+            .collect()
+    }
+
+    /// The (slot, root) of the canonical ancestry of the block at `from`: at most `n`, newest
+    /// first.
+    fn ancestry(from: u64, n: usize) -> Vec<(u64, [u8; 32])> {
+        fixture::chain()
+            .iter()
+            .rev()
+            .filter(|b| b.slot <= from)
+            .take(n)
+            .map(|b| (b.slot, b.root))
+            .collect()
+    }
+
+    /// Each block is the parent of the one before it (`fulu` L819–820), at a lower slot.
+    fn assert_descending(chunks: &[ReceivedChunk<Spec>]) {
+        for pair in blocks_of(chunks).windows(2) {
+            let parent = match pair[0] {
+                forked::SignedBeaconBlock::Fulu(b) => b.message.parent_root,
+                forked::SignedBeaconBlock::Gloas(b) => b.message.parent_root,
+            };
+            assert_eq!(parent, pair[1].message_root(), "slot {}", pair[0].slot());
+            assert!(pair[1].slot() < pair[0].slot());
+        }
+    }
+
+    /// #230 AC `byhead_ancestry` (`fulu/p2p-interface.md` L819–820): a known head returns its
+    /// ancestry, the block at `beacon_root` included, in descending slot order, up to `count`
+    /// blocks: exact (slot, root) pairs, skipped slots skipped. One store walk per answer
+    /// (D1: no finalized-slot read, no chain half), so the walk crosses the store's finalized
+    /// slot (20) with no gap and no duplicate. Across the epoch-2 BPO digest and the epoch-4
+    /// Gloas switch each chunk carries its own epoch's digest, decodes in that fork and is the
+    /// block as stored (Cole).
+    #[tokio::test(start_paused = true)]
+    async fn byhead_ancestry() {
+        let (mut control, metrics, peers) = serving(1, |_| {});
+        let fake = Fake::new();
+        let (responder, _) = by_head(&fake, None, 16, &metrics);
+        for (from, count, n) in [
+            (40, 128, 36),
+            (40, 10, 10),
+            (24, 8, 8),
+            (21, 2, 2),
+            (20, 1, 1),
+            (2, 128, 2),
+        ] {
+            let root = fixture::at(from).root;
+            let (chunks, _) =
+                serve_head(&mut control, peers[0], head(root, count), &responder).await;
+            assert_eq!(
+                walked(&chunks),
+                ancestry(from, n),
+                "from {from}, count {count}"
+            );
+            assert_descending(&chunks);
+            assert_eq!(fake.calls(), [Call::ByHead(root, count)], "one store walk");
+        }
+        let (chunks, _) = serve_head(
+            &mut control,
+            peers[0],
+            head(fixture::at(40).root, 128),
+            &responder,
+        )
+        .await;
+        let mut seen = HashSet::new();
+        for (chunk, block) in chunks.iter().zip(blocks_of(&chunks)) {
+            let slot = block.slot();
+            let (digest, fork) = match slot / 8 {
+                0..=1 => (FULU_DIGEST, ForkName::Fulu),
+                2..=3 => (FULU_BPO_DIGEST, ForkName::Fulu),
+                _ => (GLOAS_DIGEST, ForkName::Gloas),
+            };
+            assert_eq!(chunk.context, Some(digest), "slot {slot}");
+            assert_eq!(block.fork_name(), fork, "slot {slot}");
+            assert_eq!(block.as_ssz_bytes(), fixture::at(slot).ssz, "slot {slot}");
+            seen.insert(digest);
+        }
+        assert_eq!(seen.len(), 3, "every digest of the fixture");
+    }
+
+    /// #230 AC `byhead_limits` (Ezra, 2026-11-01): `count` over 128 (129, `u64::MAX`) is
+    /// served as `min(count, MAX_REQUEST_BLOCKS_DENEB)` = 128 (`fulu` L820–821), never `1`,
+    /// and books 128 tokens, never the raw count; `count` 0 is an empty success that reads and
+    /// books nothing; a root we do not hold is a success of zero chunks, no error code (L832:
+    /// "zero or more"; the ≥ 1 MUST of L840–841 is for a root we hold); a held root below the
+    /// start of the serve window is `3: ResourceUnavailable` before any chunk (L836–838), and
+    /// one at the start is served.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_limits() {
+        let (mut control, metrics, peers) = serving(3, |l| {
+            l.rate.blocks_by_head = Quota::new(1, Duration::from_secs(1));
+        });
+        let fake = Fake::new();
+        let (responder, held) = by_head(&fake, None, 16, &metrics);
+        let root = fixture::at(40).root;
+        for (peer, count) in [(peers[0], 129), (peers[1], u64::MAX)] {
+            let start = Instant::now();
+            let answer = control.answer_streamed(peer, HEAD, head(root, count), &responder);
+            assert_eq!(
+                due_on(&control, peer, HEAD) - start,
+                Duration::from_secs(128),
+                "{count}: 128 tokens booked"
+            );
+            drop(answer);
+        }
+        let (mut fast, fast_metrics, fast_peers) = serving(1, |_| {});
+        let peer = fast_peers[0];
+        let (responder_fast, _) = by_head(&fake, None, 16, &fast_metrics);
+        fake.calls();
+        for count in [129, u64::MAX] {
+            let (chunks, _) = serve_head(&mut fast, peer, head(root, count), &responder_fast).await;
+            assert_eq!(
+                walked(&chunks),
+                ancestry(40, 36),
+                "{count}: served, never 1"
+            );
+            assert_eq!(fake.calls(), [Call::ByHead(root, 128)], "{count}: clamped");
+        }
+
+        let peer = peers[2];
+        let due = due_on(&control, peer, HEAD);
+        let (chunks, _) = serve_head(&mut control, peer, head(root, 0), &responder).await;
+        assert!(chunks.is_empty(), "count 0: an empty success, {chunks:?}");
+        assert_eq!(fake.calls(), [], "count 0: nothing read");
+        assert_eq!(due_on(&control, peer, HEAD), due, "count 0: nothing booked");
+
+        let unknown = [0xee; 32];
+        let (chunks, _) =
+            serve_head(&mut fast, fast_peers[0], head(unknown, 8), &responder_fast).await;
+        assert!(
+            chunks.is_empty(),
+            "an unknown root: zero chunks, {chunks:?}"
+        );
+        assert_eq!(fake.calls(), [Call::ByHead(unknown, 8)]);
+        assert_eq!(held.free_lookups(), 16);
+
+        let (windowed, _) = by_head(&fake, Some(24), 16, &fast_metrics);
+        let below = head(fixture::at(23).root, 4);
+        let (chunks, _) = serve_head(&mut fast, fast_peers[0], below, &windowed).await;
+        assert_eq!(only_error(&chunks), Some(ResultCode::ResourceUnavailable));
+        let at_start = head(fixture::at(24).root, 4);
+        let (chunks, _) = serve_head(&mut fast, fast_peers[0], at_start, &windowed).await;
+        assert_eq!(
+            walked(&chunks),
+            ancestry(24, 1),
+            "served, and stops below the window"
+        );
+    }
+
+    /// #230 (the rulings' second window case): a walk that reaches an ancestor below the start
+    /// of the serve window stops before it and ends with success, never an error chunk. The
+    /// window's start is read once per answer, and the store walk is dropped at the stop.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_window_stop() {
+        let (mut control, metrics, peers) = serving(1, |_| {});
+        let fake = Fake::new();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let window = {
+            let reads = Arc::clone(&reads);
+            Arc::new(move || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Some(18)
+            })
+        };
+        let (_, range) = by_range(&fake, Some(0), 16, &metrics);
+        let responder: Arc<dyn Responder<Spec>> =
+            Arc::new(range.with_window(window).head_responder());
+        let (chunks, _) = serve_head(
+            &mut control,
+            peers[0],
+            head(fixture::at(40).root, 128),
+            &responder,
+        )
+        .await;
+        let want: Vec<(u64, [u8; 32])> = ancestry(40, 36)
+            .into_iter()
+            .filter(|(slot, _)| *slot >= 18)
+            .collect();
+        assert_eq!(walked(&chunks), want, "a clean end before slot 16");
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "the window read once");
+        closed(&fake).await;
+        assert_eq!(
+            fake.walk_reads(),
+            want.len() + 1,
+            "the block below read, not sent"
+        );
+    }
+
+    /// #230 D9: a walk ends cleanly where the store's walk ends (a parent it does not hold,
+    /// after slot 0); a failed store step after `k` chunks ends the answer at those `k`,
+    /// counted; one before the first chunk ends it with its code (cl-store's `UNAVAILABLE` is
+    /// `3`, anything else `2`).
+    #[tokio::test(start_paused = true)]
+    async fn byhead_stops_cleanly() {
+        let (mut control, metrics, peers) = serving(1, |_| {});
+        let peer = peers[0];
+        let fake = Fake::new();
+        let orphan = fixture::block(45, [0xaa; 32], 3);
+        fake.add(orphan.clone());
+        let genesis = fixture::block(0, [0; 32], 0);
+        let child = fixture::block(3, genesis.root, 5);
+        fake.add(genesis.clone());
+        fake.add(child.clone());
+        let (responder, held) = by_head(&fake, None, 16, &metrics);
+        let (chunks, _) = serve_head(&mut control, peer, head(orphan.root, 8), &responder).await;
+        assert_eq!(walked(&chunks), [(45, orphan.root)], "a parent not stored");
+        let (chunks, _) = serve_head(&mut control, peer, head(child.root, 8), &responder).await;
+        assert_eq!(
+            walked(&chunks),
+            [(3, child.root), (0, genesis.root)],
+            "slot 0 reached"
+        );
+
+        for (step, code) in [
+            (Step::Open(Half::Store), ResultCode::ResourceUnavailable),
+            (Step::Open(Half::Store), ResultCode::ServerError),
+            (Step::Item(Half::Store, 0), ResultCode::ServerError),
+        ] {
+            let fake = Fake::new();
+            fake.script(step, Act::Fail(failed(code, "status")));
+            let (responder, held) = by_head(&fake, None, 16, &metrics);
+            let root = fixture::at(40).root;
+            let (chunks, _) = serve_head(&mut control, peer, head(root, 8), &responder).await;
+            assert_eq!(only_error(&chunks), Some(code), "{step:?}");
+            closed(&fake).await;
+            assert_eq!(held.free_lookups(), 16);
+        }
+        let fake = Fake::new();
+        let timeout = failed(ResultCode::ServerError, "timeout");
+        fake.script(Step::Item(Half::Store, 3), Act::Fail(timeout));
+        let (responder, _) = by_head(&fake, None, 16, &metrics);
+        let root = fixture::at(40).root;
+        let (chunks, _) = serve_head(&mut control, peer, head(root, 8), &responder).await;
+        assert_eq!(walked(&chunks), ancestry(40, 3), "a clean end after 3");
+        assert_eq!(metrics.block_lookup_failures("store", "status"), 3);
+        assert_eq!(metrics.block_lookup_failures("store", "timeout"), 1);
+        closed(&fake).await;
+        assert_eq!(held.free_lookups(), 16);
+    }
+
+    /// #230 D9: the store's blocks are held to the walk: the first is the block at
+    /// `beacon_root`, each next one the parent of the block before, at a lower slot, and each
+    /// decodes in the fork of its slot to a block of that slot. A break before the first chunk
+    /// is `2`; after it the answer ends cleanly at its last whole chunk.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_contract_breaks() {
+        let (mut control, metrics, peers) = serving(1, |_| {});
+        let peer = peers[0];
+        let root = fixture::at(40).root;
+        let garbage = ServedBlock {
+            ssz: vec![0; 200],
+            ..fixture::at(40)
+        };
+        let another_slot = ServedBlock {
+            slot: 41,
+            ..fixture::at(40)
+        };
+        for (case, first) in [
+            ("a wrong first root", fixture::at(39)),
+            ("a decode failure", garbage),
+            ("another slot", another_slot),
+        ] {
+            let fake = Fake::new();
+            fake.replace_in_walk(0, first);
+            let (responder, _) = by_head(&fake, None, 16, &metrics);
+            let (chunks, _) = serve_head(&mut control, peer, head(root, 8), &responder).await;
+            assert_eq!(only_error(&chunks), Some(ResultCode::ServerError), "{case}");
+            closed(&fake).await;
+        }
+        let sibling = fixture::block(39, [0xee; 32], 7);
+        let not_lower = ServedBlock {
+            slot: 39,
+            ..fixture::at(38)
+        };
+        for (case, n, block, sent) in [
+            ("a broken parent link", 1, sibling, 1),
+            ("a slot that does not descend", 2, fixture::at(39), 2),
+            ("a block of another slot", 2, not_lower, 2),
+        ] {
+            let fake = Fake::new();
+            fake.replace_in_walk(n, block);
+            let (responder, _) = by_head(&fake, None, 16, &metrics);
+            let (chunks, _) = serve_head(&mut control, peer, head(root, 8), &responder).await;
+            assert_eq!(walked(&chunks), ancestry(40, sent), "{case}: a clean end");
+            closed(&fake).await;
+        }
+    }
+
+    /// #230 (Vera): the walk stops at `min(count, 128)` blocks whatever the store sends: no
+    /// block past it is read, and the store's stream is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_hard_stop_at_count() {
+        let (mut control, metrics, peers) = serving(1, |_| {});
+        let fake = Fake::new();
+        fake.overserve(10);
+        let (responder, _) = by_head(&fake, None, 16, &metrics);
+        let root = fixture::at(40).root;
+        let (chunks, _) = serve_head(&mut control, peers[0], head(root, 4), &responder).await;
+        assert_eq!(walked(&chunks), ancestry(40, 4));
+        closed(&fake).await;
+        assert_eq!(fake.walk_reads(), 4, "nothing read past the count");
+    }
+
+    /// #230 AC (Ezra, 2026-11-01): rate limiting never empties an answer. A ByHead bucket in the
+    /// most debt two open answers of 128 blocks leave (D6) delays the walk to the peer's token,
+    /// not past it: the store is not asked before then, and the first block goes out whole at
+    /// that token, before the 9.5 s end, with no error; the rest follow at the quota.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_rate_limited_first_block() {
+        let (mut control, metrics, peers) = serving(1, |_| {});
+        let peer = peers[0];
+        let fake = Fake::new();
+        let (responder, _) = by_head(&fake, None, 16, &metrics);
+        let start = Instant::now();
+        let ready = head_debt(&control, peer, 2 * 128);
+        assert!(ready - start > Duration::from_secs(2), "in debt");
+        let request = head(fixture::at(40).root, 128);
+        let answer = control.answer_streamed(peer, HEAD, request.clone(), &responder);
+        let mut reader = Reader::new(Duration::ZERO);
+        let written = Arc::clone(&reader.written);
+        let mut codec = writer(&control);
+        let write = tokio::spawn(async move {
+            codec
+                .write_response(&HEAD, &mut reader, answer.unwrap())
+                .await
+                .unwrap();
+            reader.bytes
+        });
+        tokio::time::sleep_until(ready - Duration::from_millis(1)).await;
+        assert_eq!(fake.calls(), [], "no store read before the token");
+        assert_eq!(written.load(Ordering::SeqCst), 0);
+        tokio::time::sleep_until(ready + Duration::from_millis(1)).await;
+        assert!(
+            written.load(Ordering::SeqCst) >= 1,
+            "the first block at its token"
+        );
+        let wire = write.await.unwrap();
+        assert!(Instant::now() - start < Duration::from_millis(9_500));
+        let chunks = head_received(&wire, &request).await;
+        assert_eq!(walked(&chunks), ancestry(40, 36), "whole, no error");
+    }
+
+    /// #230 (Vera): the walk streams block by block, never collected: a requester that stops
+    /// reading holds the store back to what it took, the queue and the one in hand, within the
+    /// peer's byte budget.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_bounded_memory() {
+        let (mut control, metrics, peers) = serving(1, |_| {});
+        let peer = peers[0];
+        let budget = control.cfg.limits.max_queued_bytes_per_peer;
+        assert_eq!(budget, 4 << 20);
+        let fake = Fake::new();
+        let (responder, _) = by_head(&fake, None, 16, &metrics);
+        let root = fixture::at(40).root;
+        let answer = control.answer_streamed(peer, HEAD, head(root, 128), &responder);
+        let mut reader = Reader::new(Duration::from_millis(10)).stopping_after(2, false);
+        let mut codec = writer(&control);
+        let write = codec.write_response(&HEAD, &mut reader, answer.unwrap());
+        assert!(tokio::time::timeout(Duration::from_secs(3), write)
+            .await
+            .is_err());
+        let read = fake.walk_reads();
+        assert!(read >= 2, "it streamed: {read}");
+        assert!(read <= 2 + STREAM_QUEUE_LEN + 2, "{read} read for 2 sent");
+        closed(&fake).await;
+        assert_eq!(free_bytes(&control, peer), budget);
+    }
+
+    /// #230 AC (Vera): a requester reset mid-walk frees the walk task, the stream slot, the
+    /// lookup slot and the peer's bytes, and drops the store stream, which cancels the call:
+    /// no read runs after it.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_cancel_mid_walk() {
+        let (mut control, metrics, peers) = serving(1, |_| {});
+        let peer = peers[0];
+        let budget = control.cfg.limits.max_queued_bytes_per_peer;
+        let fake = Fake::new();
+        let (responder, held) = by_head(&fake, None, 16, &metrics);
+        let root = fixture::at(40).root;
+        let answer = control.answer_streamed(peer, HEAD, head(root, 128), &responder);
+        let mut reader = Reader::new(Duration::from_millis(10)).stopping_after(3, true);
+        let err = writer(&control)
+            .write_response(&HEAD, &mut reader, answer.unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+        closed(&fake).await;
+        let read = fake.walk_reads();
+        assert!((3..=3 + STREAM_QUEUE_LEN + 2).contains(&read), "{read}");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(fake.walk_reads(), read, "no read after the reset");
+        assert_eq!(held.free_lookups(), 16);
+        assert_eq!(control.streams.available_permits(), 256);
+        assert_eq!(free_bytes(&control, peer), budget);
+    }
+
+    /// #230 AC (Vera): a stream dropped while its answer waits for the peer's token (the
+    /// `ready_at()` wait) frees the task and the stream slot and reads nothing, and its tokens
+    /// stay charged; an answer that is not dropped walks at its token.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_cancel_during_token_wait() {
+        let (mut control, metrics, peers) = serving(1, |_| {});
+        let peer = peers[0];
+        let fake = Fake::new();
+        let (responder, held) = by_head(&fake, None, 16, &metrics);
+        let root = fixture::at(40).root;
+        let ready = head_debt(&control, peer, 2 * 128);
+        let answer = control.answer_streamed(peer, HEAD, head(root, 4), &responder);
+        let due = due_on(&control, peer, HEAD);
+        tokio::time::sleep_until(ready - Duration::from_millis(500)).await;
+        drop(answer);
+        closed(&fake).await;
+        assert_eq!(control.streams.available_permits(), 256, "the slot is back");
+        tokio::time::sleep_until(ready + Duration::from_secs(1)).await;
+        assert_eq!(fake.calls(), [], "nothing read");
+        assert_eq!(held.free_lookups(), 16);
+        assert_eq!(due_on(&control, peer, HEAD), due, "the tokens stay charged");
+        let request = head(root, 4);
+        let (chunks, _) = serve_head(&mut control, peer, request, &responder).await;
+        assert_eq!(walked(&chunks), ancestry(40, 4));
+        assert_eq!(fake.calls(), [Call::ByHead(root, 4)]);
+    }
+
+    /// #230: past the global stream cap a ByHead request is one `2: ServerError` chunk: it
+    /// books nothing and reads nothing, while the answer holding the slot walks the store.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_over_cap_server_error() {
+        let (mut control, metrics, peers) = serving(2, |l| l.max_inbound_streams = 1);
+        let fake = Fake::new();
+        fake.script(Step::Item(Half::Store, 1), Act::Stall);
+        let (responder, _) = by_head(&fake, None, 16, &metrics);
+        let root = fixture::at(40).root;
+        let first = control.answer_streamed(peers[0], HEAD, head(root, 4), &responder);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(fake.calls(), [Call::ByHead(root, 4)], "the first walks");
+        let due = due_on(&control, peers[1], HEAD);
+        let (chunks, _) = serve_head(&mut control, peers[1], head(root, 4), &responder).await;
+        assert_eq!(only_error(&chunks), Some(ResultCode::ServerError));
+        assert_eq!(due_on(&control, peers[1], HEAD), due, "nothing booked");
+        assert_eq!(fake.calls(), [], "nothing read");
+        drop(first);
+    }
+
+    /// #230 D5: ByHead answers take their lookup slot from the range responder's pool: with
+    /// every slot held by range answers, a ByHead request waits one IPC step for one, then
+    /// gets `2: ServerError` (busy), without reaching the store; once the slots are back it is
+    /// served.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_shares_lookup_slots() {
+        let (mut control, metrics, peers) = serving(2, |_| {});
+        let fake = Fake::new();
+        fake.script(Step::Head, Act::Stall);
+        let (by_range, held) = by_range(&fake, Some(0), 16, &metrics);
+        let responder: Arc<dyn Responder<Spec>> = Arc::new(held.head_responder());
+        let mut writes = Vec::new();
+        for _ in 0..16 {
+            let answer = control.answer_streamed(peers[0], BLOCKS, range(1, 4), &by_range);
+            writes.push(write_on_task(&control, answer.unwrap()));
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(held.free_lookups(), 0, "every slot held by a range answer");
+        let root = fixture::at(40).root;
+        let (chunks, took) = serve_head(&mut control, peers[1], head(root, 4), &responder).await;
+        assert_eq!(only_error(&chunks), Some(ResultCode::ServerError));
+        assert_eq!(took, BLOCK_LOOKUP_TIMEOUT, "waited one IPC step for a slot");
+        assert!(
+            !fake.calls().contains(&Call::ByHead(root, 4)),
+            "never reached the store"
+        );
+        for write in writes {
+            write.await.unwrap();
+        }
+        closed(&fake).await;
+        assert_eq!(held.free_lookups(), 16);
+        let (chunks, _) = serve_head(&mut control, peers[1], head(root, 4), &responder).await;
+        assert_eq!(walked(&chunks), ancestry(40, 4));
+    }
+
+    /// #230 D8: with no block source every ByHead request is an empty success at the peer's
+    /// token, never an error: we hold nothing we can reach.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_no_source_empty() {
+        let (mut control, _, peers) = serving(1, |_| {});
+        let peer = peers[0];
+        for count in [128, 0] {
+            let ready = head_debt(&control, peer, 4);
+            let request = head(fixture::at(40).root, count);
+            let answer = control.head_answer(peer, HEAD, request.clone()).unwrap();
+            let chunks = write_head(&control, answer, &request).await;
+            assert!(chunks.is_empty(), "{count}: {chunks:?}");
+            assert_eq!(Instant::now(), ready, "{count}: at the peer's token");
         }
     }
 }

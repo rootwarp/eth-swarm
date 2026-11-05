@@ -43,6 +43,7 @@
 
 pub mod answer_bucket;
 pub mod blocks;
+pub mod blocks_head;
 pub mod blocks_ipc;
 pub mod chain_status;
 pub mod codec;

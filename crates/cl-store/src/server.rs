@@ -427,7 +427,7 @@ mod tests {
     use pb::{store_service_client::StoreServiceClient, ReadMeta};
     use std::{
         collections::BTreeSet,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{AtomicU64, AtomicUsize, Ordering},
         time::Instant,
     };
     use tonic::Code;
@@ -686,6 +686,73 @@ mod tests {
     ) -> Option<Frame<pb::GetBlocksByHeadResponseBody>> {
         let message = stream.message().await.unwrap()?;
         Some(message.into_frame().expect("hello or body"))
+    }
+
+    /// A clock the test moves: `t0` and the milliseconds added to the counter.
+    fn manual() -> (Clock, Arc<AtomicU64>) {
+        let (t0, ms) = (Instant::now(), Arc::new(AtomicU64::new(0)));
+        let read = Arc::clone(&ms);
+        let clock: Clock =
+            Arc::new(move || t0 + Duration::from_millis(read.load(Ordering::SeqCst)));
+        (clock, ms)
+    }
+
+    /// #230 D3b: cl-p2p reads a `GetBlocksByHead` stream at its peer's pace, a block per token
+    /// (20 ms by default), for up to its 9.5 s answer. The stream lives 10 s, past the call's
+    /// 2 s (each step's read transaction still under it): 128 bodies read 50 ms apart (6.4 s)
+    /// all arrive, and a reader that comes back past 10 s gets `DEADLINE_EXCEEDED` after what
+    /// was sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocks_by_head_paced_reader() {
+        let store = Store::new();
+        let blocks = chain(140);
+        let all: Vec<&[u8]> = blocks.iter().map(|b| b.ssz.as_slice()).collect();
+        store.import(&all, stamp_of(1, &blocks[139], &blocks[99]));
+        let (clock, ms) = manual();
+        let server = server(&store).with_clock(clock);
+        let conn = Mode::InProcess.connect(Server::new(server.routes())).await;
+        let mut raw = StoreServiceClient::new(conn.transport.clone());
+        let link = fixture::v1_link();
+        let request = || pb::GetBlocksByHeadRequest {
+            root: blocks[139].root.to_vec(),
+            count: 128,
+            hello: Some(link.local()),
+        };
+        // Reads to the end: the bodies, and the status the stream ended with.
+        async fn drain(
+            stream: &mut tonic::Streaming<pb::GetBlocksByHeadResponse>,
+            ms: &AtomicU64,
+            pause: impl Fn(usize) -> u64,
+        ) -> (usize, Option<Code>) {
+            let mut bodies = 0;
+            loop {
+                match stream.message().await {
+                    Ok(Some(m)) => match m.into_frame().expect("hello or body") {
+                        Frame::Hello(_) => continue,
+                        Frame::Body(_) => bodies += 1,
+                    },
+                    Ok(None) => return (bodies, None),
+                    Err(status) => return (bodies, Some(status.code())),
+                }
+                ms.fetch_add(pause(bodies), Ordering::SeqCst);
+            }
+        }
+        let mut paced = raw
+            .get_blocks_by_head(request())
+            .await
+            .unwrap()
+            .into_inner();
+        let read = drain(&mut paced, &ms, |_| 50).await;
+        assert_eq!(read, (128, None), "every body, read over 6.4 s");
+
+        let mut late = raw
+            .get_blocks_by_head(request())
+            .await
+            .unwrap()
+            .into_inner();
+        let (bodies, ended) = drain(&mut late, &ms, |n| if n == 3 { 11_000 } else { 0 }).await;
+        assert_eq!(ended, Some(Code::DeadlineExceeded));
+        assert!((3..=6).contains(&bodies), "what was sent first: {bodies}");
     }
 
     /// A clock that reads `t0` its first `reads` times, then an hour later: time passes once
