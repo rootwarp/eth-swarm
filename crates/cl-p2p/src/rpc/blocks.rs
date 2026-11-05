@@ -42,7 +42,9 @@
 //! timeout `2`) ends the answer with its code before the first chunk, and cleanly at the last
 //! whole chunk after it; each is counted in `rpc_block_lookup_failures_total{half, kind}`.
 
-use super::blocks_head::ByHeadResponder;
+use super::blocks_head::{
+    ByHeadResponder, StoreStreams, MAX_BYHEAD_STORE_STREAMS, MAX_BYHEAD_STORE_STREAMS_PER_IP,
+};
 use super::columns::fixed_message;
 use super::inbound::StatusSource;
 use super::metrics::RpcMetrics;
@@ -187,6 +189,8 @@ pub struct ByRangeResponder {
     warned: Arc<AtomicBool>,
     /// The deepest start below `F0` served ([`MAX_FINALIZED_DEPTH`]).
     max_depth: u64,
+    /// The store streams of the ByHead answers it builds ([`Self::head_responder`]).
+    head_streams: StoreStreams,
 }
 
 impl ByRangeResponder {
@@ -207,6 +211,10 @@ impl ByRangeResponder {
             window: None,
             warned: Arc::default(),
             max_depth: MAX_FINALIZED_DEPTH,
+            head_streams: StoreStreams::new(
+                MAX_BYHEAD_STORE_STREAMS,
+                MAX_BYHEAD_STORE_STREAMS_PER_IP,
+            ),
         }
     }
 
@@ -227,12 +235,13 @@ impl ByRangeResponder {
 
     /// The BeaconBlocksByHead responder over the same source, taking its lookup slots from
     /// this responder's pool, counting its failures in the same metrics and reading the same
-    /// window (#230, D5, D7).
+    /// window (#230, D5, D7). Every one it builds shares one pool of store streams.
     #[must_use]
     pub fn head_responder(&self) -> ByHeadResponder {
         ByHeadResponder::new(
             Arc::clone(&self.source),
             Arc::clone(&self.lookups),
+            self.head_streams.clone(),
             self.metrics.clone(),
             self.window.clone(),
         )
@@ -242,6 +251,12 @@ impl ByRangeResponder {
     #[must_use]
     pub fn free_lookups(&self) -> usize {
         self.lookups.available_permits()
+    }
+
+    /// The store streams its ByHead answers hold now.
+    #[cfg(test)]
+    pub(crate) fn held_store_streams(&self) -> usize {
+        self.head_streams.held()
     }
 
     /// Counts and logs `failed` of `half`, and hands it back.

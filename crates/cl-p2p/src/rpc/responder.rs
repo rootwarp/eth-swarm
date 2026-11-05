@@ -39,6 +39,7 @@ use p2p_wire::rpc::messages::MAX_ERROR_MESSAGE_LEN;
 use p2p_wire::rpc::protocols::{Protocol, Request, Response, ResultCode};
 use std::future::Future;
 use std::marker::PhantomData;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
@@ -76,6 +77,20 @@ pub trait Responder<E: EthSpec>: Send + Sync + 'static {
     /// naming no item. The returned future stops when a [`ChunkSink`] call fails or is dropped
     /// when the stream ends. Returning ends the answer; a panic ends it as a failure.
     fn serve(&self, peer: PeerId, request: Request, sink: ChunkSink<E>) -> Serving;
+
+    /// [`Self::serve`] for a `peer` whose connection comes from `ip` (`None` without an IP),
+    /// what [`StreamedAnswer`] calls: a responder that caps its answers per IP takes it from
+    /// here ([`super::blocks_head`]). By default `ip` is not used.
+    fn serve_from(
+        &self,
+        peer: PeerId,
+        ip: Option<IpAddr>,
+        request: Request,
+        sink: ChunkSink<E>,
+    ) -> Serving {
+        let _ = ip;
+        self.serve(peer, request, sink)
+    }
 }
 
 /// One peer's budget of queued response bytes
@@ -296,11 +311,12 @@ pub struct StreamedAnswer {
 impl StreamedAnswer {
     /// Runs `responder` on `peer`'s `request` on its own task from `ready` (the peer's first
     /// token), its chunks' context bytes from `contexts`, each holding its bytes of `budget`
-    /// while queued, the answer holding `slot`; `None` outside a tokio runtime. A request
-    /// naming no item is not served: its empty answer ends at `ready`.
+    /// while queued, the answer holding `slot`; `None` outside a tokio runtime. `peer` comes
+    /// with the IP of its connection ([`Responder::serve_from`]). A request naming no item is
+    /// not served: its empty answer ends at `ready`.
     pub(crate) fn start<E: EthSpec>(
         responder: Arc<dyn Responder<E>>,
-        peer: PeerId,
+        (peer, ip): (PeerId, Option<IpAddr>),
         request: Request,
         contexts: Arc<ContextTable>,
         budget: PeerBytes,
@@ -320,7 +336,7 @@ impl StreamedAnswer {
         let task = runtime.spawn(async move {
             tokio::time::sleep_until(ready).await;
             if max_chunks > 0 {
-                responder.serve(peer, request, sink).await;
+                responder.serve_from(peer, ip, request, sink).await;
             }
             // Only a responder that returned says so: one that panicked or was aborted drops
             // its sink, which ends the answer as a failure.
@@ -429,6 +445,16 @@ pub(crate) mod testing {
         request: Request,
         budget: usize,
     ) -> (StreamedAnswer, Arc<Semaphore>, PeerBytes) {
+        start_from(responder, None, request, budget)
+    }
+
+    /// [`start`] for a fresh peer at `ip`.
+    pub(crate) fn start_from<E: EthSpec>(
+        responder: &Arc<dyn Responder<E>>,
+        ip: Option<std::net::IpAddr>,
+        request: Request,
+        budget: usize,
+    ) -> (StreamedAnswer, Arc<Semaphore>, PeerBytes) {
         let slots = Arc::new(Semaphore::new(1));
         let bytes = PeerBytes::new(budget);
         let slot = Arc::clone(&slots).try_acquire_owned().expect("a free slot");
@@ -436,7 +462,7 @@ pub(crate) mod testing {
         let (peer, budget, now) = (PeerId::random(), bytes.clone(), Instant::now());
         let answer = StreamedAnswer::start(
             Arc::clone(responder),
-            peer,
+            (peer, ip),
             request,
             contexts,
             budget,
