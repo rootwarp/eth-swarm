@@ -6,10 +6,16 @@
 //!
 //! - **cl-chain** (its socket, its server's UID checked): our Status from `GetStatus`
 //!   ([`ChainStatusSource`]), the column answers from `DataColumnsByRange`/`ByRoot`
-//!   ([`ChainColumns`]), and the custody subnets from `WatchSubscriptions`. The start waits for
+//!   ([`ChainColumns`]), the blocks above cl-store's finalized slot from `BlocksByRange`, and
+//!   the custody subnets from `WatchSubscriptions`. The start waits for
 //!   cl-chain up to `chain_wait_ms`, and for its first subscriptions. Then it refuses a key whose
 //!   custody columns are not the ones cl-chain names ([`check_custody`]): cl-chain's `node_id`
 //!   is then another key's. Each later body is held to the same key and group count.
+//! - **cl-store**, if `store_socket` is set (its server's UID checked, under the same wait):
+//!   the finalized blocks from `GetBlocksByRange` and the split point from `GetChainHead`.
+//!   With cl-chain's `BlocksByRange` it is the source of our BeaconBlocksByRange v2 answers
+//!   ([`IpcBlocks`], [`crate::rpc::blocks`]); without it every such request is
+//!   `3: ResourceUnavailable`.
 //! - **The swarm** ([`swarm::serving_swarm`]): the ignore-all gossipsub on the topic list
 //!   (`gossip_topics`) and the custody column subnets, under the fork digests that cl-chain's
 //!   subscriptions name ([`digests::DigestTopics`]): a superseded digest's topics leave two
@@ -37,9 +43,10 @@
 //!
 //! Exit codes, which `RestartPreventExitStatus=1 2 64` reads: 0 a clean stop; 1 a refused
 //! credential or a start that a restart cannot fix (the swarm, the socket's bind, an ACL of
-//! unserved methods, a cl-chain server of another user); 2 a refused config, custody columns
-//! that are not our key's (at the start or later), or a cl-discv5 record of another `cgc`; 64
-//! an argument; 69 cl-chain (its directory included) not there within `chain_wait_ms`, or a
+//! unserved methods, a cl-chain or cl-store server of another user); 2 a refused config, custody
+//! columns that are not our key's (at the start or later), or a cl-discv5 record of another
+//! `cgc`; 64 an argument; 69 cl-chain or a configured cl-store (its directory included) not
+//! there within `chain_wait_ms`, or a
 //! clock before genesis (restarted); 70 a fault of the run that a restart can fix, such as a
 //! topic set that cannot follow the fork digests (restarted); 71 no log writer (restarted).
 
@@ -54,6 +61,8 @@ pub mod validate;
 use crate::behaviour::{log_identify, SpecBehaviour, SpecBehaviourEvent};
 use crate::custody::CustodySubscriptions;
 use crate::peers::manager::GoodbyeLedger;
+use crate::rpc::blocks::BlockSource;
+use crate::rpc::blocks_ipc::IpcBlocks;
 use crate::rpc::chain_status::{ChainStatus, ChainStatusSource, DEFAULT_STATUS_REFRESH};
 use crate::rpc::columns::ChainColumns;
 use crate::rpc::inbound::StatusSource;
@@ -244,6 +253,17 @@ pub fn chain_unreachable(socket: &Path, err: &tonic::transport::Error) -> ServeE
     let shown = format!("cl-chain at {}: {}", socket.display(), error_chain(err));
     if ipc::uds::peer_refusal(err).is_some() {
         ServeError::Failed(format!("{shown}: the server is not cl-chain's user"))
+    } else {
+        ServeError::Unavailable(shown)
+    }
+}
+
+/// The start's error for a cl-store at `socket` that did not accept, as [`chain_unreachable`]'s
+/// for cl-chain.
+pub fn store_unreachable(socket: &Path, err: &tonic::transport::Error) -> ServeError {
+    let shown = format!("cl-store at {}: {}", socket.display(), error_chain(err));
+    if ipc::uds::peer_refusal(err).is_some() {
+        ServeError::Failed(format!("{shown}: the server is not cl-store's user"))
     } else {
         ServeError::Unavailable(shown)
     }
@@ -457,6 +477,24 @@ pub async fn serve<E: EthSpec>(
             return Err(ServeError::Config(e.to_string()));
         }
     };
+    // cl-store, if configured: the finalized half of our BlocksByRange answers.
+    let blocks = match &settings.store {
+        None => None,
+        Some((socket, uid)) => {
+            let connect = ipc::uds::connect_path_waiting(socket, *uid, wait, || {
+                tracing::info!(socket = %socket.display(), "cl-store is not accepting yet");
+            });
+            let store = tokio::select! {
+                () = &mut hooks.shutdown => {
+                    watching_subs.abort();
+                    return Ok(());
+                }
+                store = connect => store.map_err(|e| store_unreachable(socket, &e))?,
+            };
+            let source = IpcBlocks::new(store, chain.clone(), link.clone());
+            Some(Arc::new(source) as Arc<dyn BlockSource>)
+        }
+    };
     let status = ChainStatusSource::new(ChainStatus::new(chain.clone()));
     let refresh = status.keep_current(DEFAULT_STATUS_REFRESH);
     let grace = digest_grace(network.config().slot_duration_ms(), E::slots_per_epoch());
@@ -477,6 +515,7 @@ pub async fn serve<E: EthSpec>(
             link.clone(),
             MAX_COLUMN_RESPONSE_BYTES,
         ))),
+        blocks,
     };
     let plan = swarm::SwarmPlan {
         listen: settings.listen.clone(),

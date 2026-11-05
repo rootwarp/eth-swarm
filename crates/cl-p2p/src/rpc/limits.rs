@@ -257,6 +257,13 @@ pub const DEFAULT_MAX_INBOUND_STREAMS: usize = 256;
 /// larger than it is queued alone.
 pub const DEFAULT_MAX_QUEUED_BYTES_PER_PEER: usize = 4 << 20;
 
+/// BlocksByRange answers that hold IPC calls (cl-store, cl-chain) at once \[est\]: 16. One past
+/// it waits for a slot for up to one IPC step ([`super::blocks::BLOCK_LOOKUP_TIMEOUT`]), then
+/// is answered `2: ServerError`. 16 is an estimate, not a measurement: tune it once the cost
+/// of a lookup under load is measured (each walks at most
+/// [`super::blocks::MAX_FINALIZED_DEPTH`] blocks above its range in cl-store).
+pub const DEFAULT_MAX_BLOCK_LOOKUPS: usize = 16;
+
 /// How long an admitted column request waits for a place once its tokens are due \[est\]: 2 s,
 /// so that with a 2 s lookup its first byte goes out before the requester's 5 s deadline. Past
 /// it the request gets `2: ServerError`, counted.
@@ -294,6 +301,8 @@ pub struct RpcLimits {
     /// Encoded bytes one peer's streamed answers hold queued
     /// ([`DEFAULT_MAX_QUEUED_BYTES_PER_PEER`]).
     pub max_queued_bytes_per_peer: usize,
+    /// BlocksByRange answers holding IPC calls at once ([`DEFAULT_MAX_BLOCK_LOOKUPS`]).
+    pub max_block_lookups: usize,
 }
 
 impl Default for RpcLimits {
@@ -311,6 +320,7 @@ impl Default for RpcLimits {
             column_write_deadline: COLUMN_WRITE_DEADLINE,
             max_inbound_streams: DEFAULT_MAX_INBOUND_STREAMS,
             max_queued_bytes_per_peer: DEFAULT_MAX_QUEUED_BYTES_PER_PEER,
+            max_block_lookups: DEFAULT_MAX_BLOCK_LOOKUPS,
         }
     }
 }

@@ -7,6 +7,8 @@
 //! chain_uid = 990                                        # the UID of ethswarm-chain
 //! discv5_socket = "/run/ethswarm/cl-discv5/cl-discv5.sock"   # optional, this default
 //! discv5_uid = 992                                       # the UID of ethswarm-discv5
+//! store_socket = "/run/ethswarm/cl-store/cl-store.sock"  # optional, with store_uid
+//! store_uid = 994                                        # the UID of ethswarm-store
 //! gossip_topics = "/etc/ethswarm/gossip-topics.toml"     # optional, this default
 //! target_peers = 32                                      # optional: 1 to 32, our dials
 //! static_peers = ["/ip4/10.0.0.2/tcp/9000/p2p/16Uiu2…"]  # optional: always dialled
@@ -25,6 +27,11 @@
 //! - **`static_peers`** are `/ip4|ip6/<addr>/tcp/<port>/p2p/<peer id>` ([`PinnedPeer`]): the
 //!   reference nodes. They are dialled at start and again after each disconnect, and the
 //!   connection caps do not apply to them.
+//! - **`store_socket`** and **`store_uid`** (both or neither): cl-store's socket and the UID its
+//!   server must run as. With them cl-p2p serves BeaconBlocksByRange v2 from cl-store's
+//!   finalized blocks and cl-chain's above them ([`crate::rpc::blocks`]); without them every
+//!   BlocksByRange request is `3: ResourceUnavailable`. The probe units leave them out: probe
+//!   mode stores only its anchor block.
 //! - **`mode`** is the IP rule of the candidates' addresses (`p2p_wire::ip::ip_rule`), the
 //!   rule of cl-discv5's `mode`: give both the same value. The static peers do not obey it.
 
@@ -74,6 +81,8 @@ struct P2pTable {
     chain_uid: Option<u32>,
     discv5_socket: Option<PathBuf>,
     discv5_uid: Option<u32>,
+    store_socket: Option<PathBuf>,
+    store_uid: Option<u32>,
     gossip_topics: Option<PathBuf>,
     target_peers: Option<usize>,
     #[serde(default)]
@@ -113,6 +122,8 @@ pub struct P2pSettings {
     pub goodbye_ledger: GoodbyeLedgerConfig,
     /// The IP rule of the candidates' addresses.
     pub mode: NetworkMode,
+    /// cl-store's socket and the UID its server must run as; `None` serves no blocks.
+    pub store: Option<(PathBuf, u32)>,
 }
 
 /// Why the `[p2p]` table was refused. No variant quotes a value.
@@ -184,6 +195,13 @@ impl P2pSettings {
         let chain_socket = absolute("chain_socket", raw.chain_socket, DEFAULT_CHAIN_SOCKET)?;
         let discv5_socket = absolute("discv5_socket", raw.discv5_socket, DEFAULT_DISCV5_SOCKET)?;
         let topics_path = absolute("gossip_topics", raw.gossip_topics, DEFAULT_GOSSIP_TOPICS)?;
+        let together = "give store_socket and store_uid together";
+        let store = match (raw.store_socket, raw.store_uid) {
+            (None, None) => None,
+            (Some(socket), Some(uid)) => Some((absolute("store_socket", Some(socket), "")?, uid)),
+            (Some(_), None) => return Err(key("store_uid", together)),
+            (None, Some(_)) => return Err(key("store_socket", together)),
+        };
         let chain_uid = raw.chain_uid.ok_or(P2pConfigError::Missing("chain_uid"))?;
         let discv5_uid = raw
             .discv5_uid
@@ -240,6 +258,7 @@ impl P2pSettings {
             chain_wait,
             goodbye_ledger: raw.goodbye_ledger,
             mode,
+            store,
         })
     }
 }
@@ -416,6 +435,41 @@ mod tests {
         assert_eq!(err, P2pConfigError::Missing("chain_uid"));
         let err = P2pSettings::from_table(table("chain_uid = 1"), me() + 1, me()).unwrap_err();
         assert_eq!(err, P2pConfigError::Missing("discv5_uid"));
+    }
+
+    /// #146: `store_socket` and `store_uid` come together or not at all: with neither cl-p2p
+    /// serves no blocks (BlocksByRange is `3`); one alone, or a relative socket path, is
+    /// refused.
+    #[test]
+    fn the_store_socket_comes_with_its_uid() {
+        let t = topics(TOPICS);
+        assert_eq!(settings("", &t).unwrap().store, None);
+        let s = settings(
+            "store_socket = \"/run/ethswarm/cl-store/cl-store.sock\"\nstore_uid = 994\n",
+            &t,
+        )
+        .unwrap();
+        assert_eq!(
+            s.store,
+            Some((PathBuf::from("/run/ethswarm/cl-store/cl-store.sock"), 994))
+        );
+        for (text, want) in [
+            (
+                "store_socket = \"/run/ethswarm/cl-store/cl-store.sock\"",
+                "store_uid",
+            ),
+            ("store_uid = 994", "store_socket"),
+            (
+                "store_socket = \"cl-store.sock\"\nstore_uid = 994",
+                "store_socket",
+            ),
+        ] {
+            let err = settings(text, &t).unwrap_err();
+            assert!(
+                matches!(&err, P2pConfigError::Key { key, .. } if *key == want),
+                "{text}: {err}"
+            );
+        }
     }
 
     /// The topic list is read only through the owner walk, and must load.

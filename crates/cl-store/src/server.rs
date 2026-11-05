@@ -10,13 +10,16 @@
 //!   `INVALID_ARGUMENT` (`ERROR_CODE_INVALID`); anything else is `INTERNAL`.
 //! - `GetBlock` (a root, a slot, `head` or `finalized`) and `GetChainHead` answer from one read
 //!   transaction and its stamp. `GetBlocksByRange` serves finalized blocks only, at most
-//!   [`MAX_BLOCKS`], read in one transaction before its stream opens. Envelope `root`s are
-//!   block roots.
+//!   [`MAX_BLOCKS`], read in one transaction before its stream opens; a range that starts more
+//!   than [`crate::MAX_FINALIZED_DEPTH`] below the finalized slot is `UNAVAILABLE`
+//!   (`ERROR_CODE_RESOURCE_UNAVAILABLE`), unread. Envelope `root`s are block roots.
 //! - `GetBlocksByHead` is a [`ParentWalk`]: `count` capped at [`MAX_BLOCKS`], stamped by its
 //!   first read (before the stream opens), then one block per read as the client reads, at
 //!   most one body ahead.
-//! - `GetChainHead` carries the stamp's head; the stamp holds no checkpoint epoch, justified
-//!   checkpoint, head state root or earliest slot, so those fields stay empty.
+//! - `GetChainHead` carries the stamp's head and its finalized block's slot (`finalized_slot`,
+//!   where cl-p2p splits a BeaconBlocksByRange answer between cl-store and cl-chain); the stamp
+//!   holds no checkpoint epoch, justified checkpoint, head state root or earliest slot, so those
+//!   fields stay empty.
 //! - `GetState`, `GetPayloadEnvelope`, `GetDataColumns` and `GetDataColumnsByRange` run the
 //!   contract checks and answer `UNIMPLEMENTED`; so does `include_envelopes`.
 //! - The method ACL is [`store_acl`]: the server's owner puts it in front as an
@@ -348,6 +351,7 @@ impl StoreService for StoreServer {
             head_slot: stamp.head_slot,
             head_root: stamp.head_root.to_vec(),
             meta: Some(read_meta(&stamp, stamp.head_slot <= stamp.finalized_slot)),
+            finalized_slot: stamp.finalized_slot,
             ..Default::default()
         }))
     }
@@ -581,6 +585,25 @@ mod tests {
 
     async fn client_of(store: &Store) -> StoreReader<ipc::testkit::Transport> {
         client(server(store)).await
+    }
+
+    /// #146: `GetChainHead` carries the stamp's finalized slot (`finalized_slot`, 8), the split
+    /// point cl-p2p serves a BlocksByRange answer around, from the same read as the head; in
+    /// process and over a Unix socket.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chain_head_carries_finalized_slot() {
+        let store = Store::new();
+        let blocks = chain(8);
+        let all: Vec<&[u8]> = blocks.iter().map(|b| b.ssz.as_slice()).collect();
+        store.import(&all, stamp_of(1, &blocks[7], &blocks[4]));
+        let dir = ipc::testkit::tempdir();
+        for mode in [Mode::InProcess, Mode::over_uds(dir.path())] {
+            let conn = mode.connect(Server::new(server(&store).routes())).await;
+            let mut reader = StoreReader::new(conn.transport.clone(), fixture::v1_link());
+            let head = reader.get_chain_head().await.unwrap();
+            assert_eq!(head.head_slot, blocks[7].slot, "{}", mode.name());
+            assert_eq!(head.finalized_slot, blocks[4].slot, "{}", mode.name());
+        }
     }
 
     /// A commit that lands while a `GetBlocksByHead` stream is being read (a new head, a new

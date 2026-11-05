@@ -23,7 +23,7 @@
 //! handle is of no further use, and [`crate::recover`] reopens the env read-only.
 
 use std::{
-    borrow::{Borrow, Cow},
+    borrow::Borrow,
     cell::Cell,
     ops::ControlFlow,
     path::Path,
@@ -35,10 +35,9 @@ use std::{
 };
 
 use store_schema::{
+    blocks::{self, Stored},
     env::{self, Env, RoTxn},
-    keys::slot_root_key,
     stamp,
-    tables::{BLOCKS, BLOCK_INDEX},
 };
 pub use store_schema::{keys::Root, stamp::Stamp};
 
@@ -84,7 +83,8 @@ impl Deadline {
 pub enum ReadError {
     /// The snapshot has no stamp row (nothing is stamped yet, so nothing is served), or the
     /// env cannot be read now (out of reader slots, busy, wants recovery, or down until it
-    /// reopens: [`crate::recover`]).
+    /// reopens: [`crate::recover`]), or a range starts deeper below the finalized slot than
+    /// is served ([`crate::MAX_FINALIZED_DEPTH`]).
     #[error("store unavailable")]
     Unavailable,
     /// No such block in the snapshot, or none on the stamp's chain at that slot.
@@ -154,9 +154,11 @@ impl Reader {
     }
 
     /// A reader of an env this process already has open (the writer's own, in tests): MDBX
-    /// refuses a second open of one env in one process.
-    #[cfg(test)]
-    pub(crate) fn over(env: impl Borrow<Env> + Send + Sync + 'static) -> Self {
+    /// refuses a second open of one env in one process. Test seam only (`test-hooks`: another
+    /// crate's tests serve cl-store over cl-chain's env, #146).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn over(env: impl Borrow<Env> + Send + Sync + 'static) -> Self {
         Self {
             env: Box::new(env),
             broken: AtomicBool::new(false),
@@ -257,40 +259,6 @@ impl From<store_schema::Error> for ReadError {
     }
 }
 
-/// `SignedBeaconBlock` SSZ in every fork: the 4-byte offset of `message`, always 100 (the
-/// 96-byte signature is its only other field), then the message's `slot` (`u64` LE),
-/// `proposer_index` (8) and `parent_root` (32).
-const MESSAGE_OFFSET: u32 = 100;
-const SLOT_AT: usize = MESSAGE_OFFSET as usize;
-const PARENT_ROOT_AT: usize = SLOT_AT + 16;
-
-/// The slot and parent root of a block's SSZ; [`ReadError::Internal`] for bytes without that
-/// layout.
-fn slot_and_parent(ssz: &[u8]) -> Result<(u64, Root), ReadError> {
-    let offset = ssz.get(..4).and_then(|b| b.try_into().ok());
-    let slot = ssz
-        .get(SLOT_AT..SLOT_AT + 8)
-        .and_then(|b| b.try_into().ok());
-    let parent = ssz.get(PARENT_ROOT_AT..PARENT_ROOT_AT + 32);
-    match (
-        offset.map(u32::from_le_bytes),
-        slot,
-        parent.map(Root::try_from),
-    ) {
-        (Some(MESSAGE_OFFSET), Some(slot), Some(Ok(parent))) => {
-            Ok((u64::from_le_bytes(slot), parent))
-        }
-        _ => Err(ReadError::Internal),
-    }
-}
-
-/// A block as a read transaction holds it.
-struct Stored<'t> {
-    slot: u64,
-    parent: Root,
-    ssz: Cow<'t, [u8]>,
-}
-
 /// One read transaction under its call's deadline.
 pub(crate) struct Snapshot<'r> {
     txn: RoTxn<'r>,
@@ -309,56 +277,27 @@ impl Snapshot<'_> {
         }
     }
 
-    /// The block at `root`: its slot (`block_index`), SSZ (`blocks`) and parent root; `None`
-    /// if it has no index row. An index row without its block, or a block whose SSZ is not of
-    /// that slot, is corruption.
+    /// The block at `root` ([`blocks::stored`]).
     fn stored(&self, root: &Root) -> Result<Option<Stored<'_>>, ReadError> {
-        let index = self.txn.open_table(Some(BLOCK_INDEX))?;
-        let Some(slot) = self.txn.get::<[u8; 8]>(&index, root)? else {
-            return Ok(None);
-        };
-        let slot = u64::from_be_bytes(slot);
-        let blocks = self.txn.open_table(Some(BLOCKS))?;
-        let ssz = self
-            .txn
-            .get::<Cow<'_, [u8]>>(&blocks, &slot_root_key(slot, root))?
-            .ok_or(ReadError::Internal)?;
-        match slot_and_parent(&ssz)? {
-            (own, parent) if own == slot => Ok(Some(Stored { slot, parent, ssz })),
-            _ => Err(ReadError::Internal),
-        }
+        Ok(blocks::stored(&self.txn, root)?)
     }
 
-    /// Walks the parents down from `from`, newest first: `visit` sees each stored block
-    /// `(slot, root, ssz)` until it breaks, a block is below `low`, or a parent is not stored.
-    /// Each parent's slot must be below its child's.
+    /// [`blocks::walk`] down from `from` to `low`, the deadline looked at every
+    /// [`DEADLINE_EVERY`] blocks walked.
     pub(crate) fn walk(
         &self,
         from: Root,
         low: u64,
         mut visit: impl FnMut(u64, Root, &[u8]) -> ControlFlow<()>,
     ) -> Result<(), ReadError> {
-        let mut next = Some(from);
-        let mut above = None;
-        while let Some(root) = next.take() {
-            let Some(block) = self.stored(&root)? else {
-                break;
-            };
+        blocks::walk(&self.txn, from, low, |slot, root, ssz| {
             let walked = self.walked.get() + 1;
             self.walked.set(walked);
             if walked.is_multiple_of(DEADLINE_EVERY) {
                 self.deadline.check()?;
             }
-            if above.is_some_and(|above| block.slot >= above) {
-                return Err(ReadError::Internal);
-            }
-            if block.slot < low || visit(block.slot, root, &block.ssz).is_break() {
-                break;
-            }
-            above = Some(block.slot);
-            next = (block.slot > 0).then_some(block.parent);
-        }
-        Ok(())
+            Ok::<_, ReadError>(visit(slot, root, ssz))
+        })
     }
 
     /// The stamp's canonical block at `slot`: the one on the walk down from its head (from its

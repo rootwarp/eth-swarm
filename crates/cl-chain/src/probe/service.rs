@@ -13,7 +13,8 @@
 //!     the columns out of retention;
 //!   - the column server ([`ColumnServer`]) and our Status ([`StatusProvider`], its
 //!     `earliest_available_slot` the column server's), on `ReqRespService`
-//!     ([`ReqRespServer`]);
+//!     ([`ReqRespServer`]), with `BlocksByRange` over the store's env: probe mode stores only
+//!     its anchor block, so that is all it serves;
 //!   - the custody subscriptions on `GossipService/WatchSubscriptions` ([`GossipServer`]);
 //!   - the column hand-off on `GossipService/Validate` ([`validate`]): cl-p2p hands over the
 //!     column sidecars that its gossipsub captured, [`ColumnHandOff`] gives them to the store,
@@ -42,7 +43,8 @@ use crate::probe::{
     ServedColumns, StatusProvider, DEFAULT_API_TIMEOUT,
 };
 use crate::reqresp::{
-    ChainStatus, ColumnServer, ColumnStore, ReqRespServer, ServeBudget, ServeClock, WallClock,
+    BlockStore, ChainStatus, ColumnServer, ColumnStore, ReqRespServer, ServeBudget, ServeClock,
+    WallClock,
 };
 use crate::verify::client::{KzgClient, KzgVerifier};
 use crate::ChainStub;
@@ -80,10 +82,12 @@ pub const CHAIN_SERVICE: &str = "cl-chain";
 /// The one caller of cl-chain's socket: cl-p2p.
 pub const P2P_CALLER: &str = "cl-p2p";
 
-/// The `ethswarm.chain.v1` methods that cl-p2p calls, and only those: our Status, the custody
-/// columns by range and by root, the custody subscriptions, and the column hand-off.
-pub const CHAIN_METHODS: [&str; 5] = [
+/// The `ethswarm.chain.v1` methods that cl-p2p calls, and only those: our Status, the blocks
+/// above cl-store's finalized slot by range, the custody columns by range and by root, the
+/// custody subscriptions, and the column hand-off.
+pub const CHAIN_METHODS: [&str; 6] = [
     "/ethswarm.chain.v1.ReqRespService/GetStatus",
+    "/ethswarm.chain.v1.ReqRespService/BlocksByRange",
     "/ethswarm.chain.v1.ReqRespService/DataColumnsByRange",
     "/ethswarm.chain.v1.ReqRespService/DataColumnsByRoot",
     "/ethswarm.chain.v1.GossipService/WatchSubscriptions",
@@ -963,6 +967,7 @@ impl<E: EthSpec, V> ProbeService<E, V> {
     pub fn req_resp_server(&self) -> ReqRespServer {
         ReqRespServer::new(self.link.clone(), Arc::clone(&self.columns))
             .serving_status(Arc::clone(&self.status) as Arc<dyn ChainStatus>)
+            .serving_blocks(Arc::clone(&self.writer) as Arc<dyn BlockStore>)
     }
 
     /// The handle that ends every `WatchSubscriptions` and `Subscribe` stream

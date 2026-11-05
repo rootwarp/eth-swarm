@@ -111,6 +111,7 @@ async fn the_metric_names_the_reports_read() {
         status: Arc::new(SharedStatus::new(None)),
         custody_group_count: CUSTODY_REQUIREMENT,
         columns: None,
+        blocks: None,
     };
     let plan = swarm::SwarmPlan {
         listen: Vec::new(),
@@ -205,6 +206,7 @@ fn sepolia_owner(
             status: Arc::clone(&status),
             custody_group_count: CUSTODY_REQUIREMENT,
             columns: None,
+            blocks: None,
         },
         swarm::SwarmPlan {
             listen: Vec::new(),

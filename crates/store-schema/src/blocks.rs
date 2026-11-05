@@ -1,5 +1,8 @@
 //! Imported blocks: `blocks` keyed by `slot ‖ root` and `block_index` from root to slot,
-//! always written in one transaction.
+//! always written in one transaction; and the one parent walk every reader of them uses
+//! ([`walk`]: cl-store's finalized ranges and by-slot reads, cl-chain's head ranges).
+
+use std::{borrow::Cow, ops::ControlFlow};
 
 use consensus_types::{forked::SignedBeaconBlock, EthSpec, ForkSchedule};
 use libmdbx::WriteFlags;
@@ -7,9 +10,86 @@ use libmdbx::WriteFlags;
 use crate::{
     keys::{decode_slot_root_key, slot_root_key, Root},
     tables::{BLOCKS, BLOCK_INDEX},
-    txn::RwTxn,
+    txn::{ReadTxn, RwTxn},
     Error, Result,
 };
+
+/// `SignedBeaconBlock` SSZ in every fork: the 4-byte offset of `message`, always 100 (the
+/// 96-byte signature is its only other field), then the message's `slot` (`u64` LE),
+/// `proposer_index` (8) and `parent_root` (32).
+const MESSAGE_OFFSET: u32 = 100;
+const SLOT_AT: usize = MESSAGE_OFFSET as usize;
+const PARENT_ROOT_AT: usize = SLOT_AT + 16;
+
+/// The slot and parent root of a block's SSZ; `None` for bytes without that layout.
+fn slot_and_parent(ssz: &[u8]) -> Option<(u64, Root)> {
+    let offset = ssz.get(..4)?.try_into().ok().map(u32::from_le_bytes)?;
+    let slot = ssz.get(SLOT_AT..SLOT_AT + 8)?.try_into().ok()?;
+    let parent = ssz
+        .get(PARENT_ROOT_AT..PARENT_ROOT_AT + 32)?
+        .try_into()
+        .ok()?;
+    (offset == MESSAGE_OFFSET).then(|| (u64::from_le_bytes(slot), parent))
+}
+
+/// A block as a read transaction holds it.
+pub struct Stored<'t> {
+    pub slot: u64,
+    pub parent: Root,
+    /// The `SignedBeaconBlock` SSZ, as stored.
+    pub ssz: Cow<'t, [u8]>,
+}
+
+/// The block at `root`: its slot (`block_index`), SSZ (`blocks`) and parent root; `None` if it
+/// has no index row. An index row without its block, or a block whose SSZ is not of that slot,
+/// is [`Error::Corrupt`].
+pub fn stored<'t, T: ReadTxn>(txn: &'t T, root: &Root) -> Result<Option<Stored<'t>>> {
+    let index = txn.open_table(Some(BLOCK_INDEX))?;
+    let Some(slot) = txn.get::<[u8; 8]>(&index, root)? else {
+        return Ok(None);
+    };
+    let slot = u64::from_be_bytes(slot);
+    let blocks = txn.open_table(Some(BLOCKS))?;
+    let corrupt = Error::Corrupt { table: BLOCKS };
+    let ssz = txn
+        .get::<Cow<'t, [u8]>>(&blocks, &slot_root_key(slot, root))?
+        .ok_or(corrupt)?;
+    match slot_and_parent(&ssz) {
+        Some((own, parent)) if own == slot => Ok(Some(Stored { slot, parent, ssz })),
+        _ => Err(Error::Corrupt { table: BLOCKS }),
+    }
+}
+
+/// Walks the parents down from `from` in `txn`, newest first: `visit` sees each stored block
+/// `(slot, root, ssz)` until it breaks or fails, a block is below `low`, or a parent is not
+/// stored. Each parent's slot must be below its child's, else [`Error::Corrupt`].
+///
+/// # Errors
+///
+/// The env's, as `E`, or `visit`'s.
+pub fn walk<T: ReadTxn, E: From<Error>>(
+    txn: &T,
+    from: Root,
+    low: u64,
+    mut visit: impl FnMut(u64, Root, &[u8]) -> std::result::Result<ControlFlow<()>, E>,
+) -> std::result::Result<(), E> {
+    let mut next = Some(from);
+    let mut above = None;
+    while let Some(root) = next.take() {
+        let Some(block) = stored(txn, &root)? else {
+            break;
+        };
+        if above.is_some_and(|above| block.slot >= above) {
+            return Err(Error::Corrupt { table: BLOCKS }.into());
+        }
+        if block.slot < low || visit(block.slot, root, &block.ssz)?.is_break() {
+            break;
+        }
+        above = Some(block.slot);
+        next = (block.slot > 0).then_some(block.parent);
+    }
+    Ok(())
+}
 
 /// Stores a signed block from its SSZ in `txn` and returns its `(slot, root)`.
 ///
