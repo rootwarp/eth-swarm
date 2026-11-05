@@ -33,6 +33,9 @@
 //!
 //! [chain.disk_budget]                           # optional, every key: the proposed values
 //! aggregate_mib = 49152                         # (crate::persist::budget::DiskBudget)
+//!
+//! [chain.engine]                                # optional
+//! socket = "/run/ethswarm/cl-engine/cl-engine.sock"   # this default
 //! ```
 //!
 //! - **The ACL** must be exactly [`chain_acl`] of the `cl-p2p` caller: a config that gives a
@@ -46,6 +49,9 @@
 //! - **`[chain.disk_budget]`** is the non-finality disk budget ([`crate::persist::budget`]): a
 //!   missing key is its default, an unknown key or a per-type cap above the aggregate is
 //!   refused.
+//! - **`[chain.engine] socket`** is cl-engine's socket ([`DEFAULT_ENGINE_SOCKET`]), an absolute
+//!   path, for the forkchoiceUpdated sender ([`crate::engine::client`]). Nothing connects to it
+//!   yet.
 //! - **`node_id`** is public (the discv5 node ID of the probe's key, which cl-discv5 logs).
 //!   cl-chain never gets the key itself. The custody columns follow it.
 //!
@@ -84,6 +90,10 @@ pub const CONFIG_PATH: &str = "/etc/ethswarm/cl-chain.toml";
 /// Where the column store lives unless `columns_dir` says otherwise: under the unit's
 /// `StateDirectory=ethswarm-chain`.
 pub const DEFAULT_COLUMNS_DIR: &str = "/var/lib/ethswarm-chain/columns";
+
+/// cl-engine's socket on the node (`ipc::uds::SocketDir::new("cl-engine")`), unless
+/// `[chain.engine] socket` says otherwise.
+pub const DEFAULT_ENGINE_SOCKET: &str = "/run/ethswarm/cl-engine/cl-engine.sock";
 
 /// The environment variable that names the config of the test binary `cl-chain-test`. The
 /// `cl-chain` binary never reads it.
@@ -126,6 +136,23 @@ struct ChainTable {
     verify_wait_ms: Option<u64>,
     #[serde(default)]
     disk_budget: DiskBudget,
+    #[serde(default)]
+    engine: EngineTable,
+}
+
+/// The `[chain.engine]` table.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct EngineTable {
+    socket: PathBuf,
+}
+
+impl Default for EngineTable {
+    fn default() -> Self {
+        Self {
+            socket: PathBuf::from(DEFAULT_ENGINE_SOCKET),
+        }
+    }
 }
 
 /// What cl-chain runs with, read from its config and checked.
@@ -217,6 +244,9 @@ pub fn settings(config: &Config) -> Result<ChainSettings, SettingsError> {
     if !columns_dir.is_absolute() {
         return Err(key("columns_dir", "must be an absolute path"));
     }
+    if !table.engine.socket.is_absolute() {
+        return Err(key("engine.socket", "must be an absolute path"));
+    }
     let verify_timeout = match table.verify_timeout_ms {
         None => DEFAULT_VERIFY_TIMEOUT,
         Some(ms) if ms > 0 && u128::from(ms) <= MAX_VERIFY_TIMEOUT.as_millis() => {
@@ -246,7 +276,7 @@ pub fn settings(config: &Config) -> Result<ChainSettings, SettingsError> {
         verify_wait,
         caller_uid,
         disk_budget: table.disk_budget,
-        engine_socket: PathBuf::new(),
+        engine_socket: table.engine.socket,
     })
 }
 

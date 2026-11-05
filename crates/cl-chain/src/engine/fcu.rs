@@ -81,8 +81,15 @@ impl ForkchoiceArgs {
     /// (cl-engine sends `null` and picks `engine_forkchoiceUpdatedV4`) and no raised wait.
     #[must_use]
     pub fn request(&self, seq: u64) -> pb::ForkchoiceUpdatedRequest {
-        let _ = seq;
-        todo!()
+        pb::ForkchoiceUpdatedRequest {
+            seq,
+            head_block_hash: self.head_block_hash.to_vec(),
+            safe_block_hash: self.safe_block_hash.to_vec(),
+            finalized_block_hash: self.finalized_block_hash.to_vec(),
+            payload_attributes: None,
+            timeout_ms: 0,
+            custody_columns: self.custody_columns.to_vec(),
+        }
     }
 }
 
@@ -93,8 +100,22 @@ pub fn forkchoice_args(
     view: &impl ForkchoiceView,
     custody_columns: [u8; CUSTODY_COLUMN_BYTES],
 ) -> Option<ForkchoiceArgs> {
-    let _ = (view, custody_columns);
-    todo!()
+    let (head, status) = view.head();
+    let bid = view.bid_of(&head)?;
+    let head_block_hash = match status {
+        PayloadStatus::Full => bid.block_hash,
+        PayloadStatus::Empty | PayloadStatus::Pending => bid.parent_block_hash,
+    };
+    let parent_hash = |root: Root| {
+        view.bid_of(&root)
+            .map_or(Hash32::ZERO, |bid| bid.parent_block_hash)
+    };
+    Some(ForkchoiceArgs {
+        head_block_hash,
+        safe_block_hash: parent_hash(view.justified_root()),
+        finalized_block_hash: parent_hash(view.finalized_root()),
+        custody_columns,
+    })
 }
 
 /// `get_custody_column_bits` (`gloas/fork-choice.md` L254-262) of the node's custody
@@ -103,6 +124,12 @@ pub fn forkchoice_args(
 /// `NUMBER_OF_COLUMNS` is not a column and sets nothing.
 #[must_use]
 pub fn custody_column_bits(columns: &[ColumnIndex]) -> [u8; CUSTODY_COLUMN_BYTES] {
-    let _ = columns;
-    todo!()
+    let mut bits = [0; CUSTODY_COLUMN_BYTES];
+    for &column in columns {
+        if column < NUMBER_OF_COLUMNS {
+            // Below 128, so both fit.
+            bits[(column / 8) as usize] |= 1 << (column % 8);
+        }
+    }
+    bits
 }
