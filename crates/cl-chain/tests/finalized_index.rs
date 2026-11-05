@@ -1,7 +1,7 @@
 //! cl-chain's side of the finalized slot index: the backfill it runs when it opens the store
 //! again ([`finalized_index::backfill`]), through its one writer, [`ColumnWriter`]: bounded
 //! batches, each its own write transaction with the stamp carried, down to the block serve
-//! window's start ([`finalized_index::window_floor`]) or the lowest stored block.
+//! window's start ([`finalized_index::window_floor`]) or the bottom of the stored chain.
 
 use std::path::Path;
 
@@ -128,7 +128,7 @@ fn reopen_backfills_a_v2_env_in_bounded_batches() {
         assert_eq!(finalized_index::backfill(&writer, 0, 8).unwrap(), 3);
         assert_eq!(writer.stamped_txns_committed(), 3);
     }
-    assert_eq!(read(dir.path()), (Some(stamp()), want(1), Some(1)));
+    assert_eq!(read(dir.path()), (Some(stamp()), want(0), Some(0)));
 
     let writer = ColumnWriter::open(dir.path()).unwrap();
     assert_eq!(finalized_index::backfill(&writer, 0, 8).unwrap(), 0);

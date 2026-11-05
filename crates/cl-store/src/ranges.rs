@@ -1,24 +1,13 @@
 //! Finalized block ranges: the blocks of a slot range at or below the stamp's finalized slot,
 //! in one read transaction with its stamp, under the call's deadline.
 //!
-//! The blocks are the stamp's finalized chain, read by walking the parents down from its
-//! finalized block: a fork block the writer still holds at a finalized slot is never served.
-//! The walk costs one block per stored block between the finalized block and the range, so a
-//! range is served only from at most [`MAX_FINALIZED_DEPTH`] slots below the finalized slot.
-
-use std::ops::ControlFlow;
+//! The blocks are the stamp's finalized chain, found in the finalized slot index that cl-chain
+//! writes with the stamp that finalizes them ([`store_schema::finalized`]): a fork block the
+//! writer still holds at a finalized slot is never served. A range costs one seek and a row per
+//! block, at any depth below the finalized slot. One that starts below the index's floor (what
+//! cl-chain's backfill has not reached yet) is [`ReadError::Unavailable`], unread.
 
 use crate::reader::{Block, Deadline, ReadError, Reader, Stamped};
-
-/// How far below the stamp's finalized slot a range may start \[est\]: 2,048 slots (64 epochs
-/// of 32 slots, about 6.8 hours). The walk down from the finalized block reads one stored block
-/// per slot between it and the range, whatever `count` is, so a one-block range deep in history
-/// would walk all of it. A range that starts deeper is [`ReadError::Unavailable`] before any
-/// block is read, so a read walks at most this many blocks above its range: bounded work per
-/// request until a finalized slot index (slot to root) lands, which reaches any depth in one
-/// lookup. cl-p2p refuses the same depth before it asks
-/// (`cl_p2p::rpc::blocks::MAX_FINALIZED_DEPTH`).
-pub const MAX_FINALIZED_DEPTH: u64 = 2_048;
 
 impl Reader {
     /// The canonical blocks with a slot in `start..start + count` and at or below the stamp's
@@ -26,8 +15,8 @@ impl Reader {
     ///
     /// # Errors
     ///
-    /// [`ReadError`]: [`ReadError::Unavailable`] too for a range that starts more than
-    /// [`MAX_FINALIZED_DEPTH`] below the stamp's finalized slot, before any block is read.
+    /// [`ReadError`]: [`ReadError::Unavailable`] too for a range that starts below the floor of
+    /// the finalized slot index, before any block is read.
     pub fn finalized_blocks(
         &self,
         start: u64,
@@ -40,22 +29,18 @@ impl Reader {
                 .min(stamp.finalized_slot.saturating_add(1));
             let mut blocks = Vec::new();
             if start < end {
-                if start < stamp.finalized_slot.saturating_sub(MAX_FINALIZED_DEPTH) {
+                if !snap.indexed(start)? {
                     return Err(ReadError::Unavailable);
                 }
-                snap.walk(stamp.finalized_root, start, |slot, root, ssz| {
-                    if slot < end {
-                        blocks.push(Block {
-                            slot,
-                            root,
-                            ssz: ssz.to_vec(),
-                            finalized: true,
-                        });
-                    }
-                    ControlFlow::Continue(())
+                snap.finalized_range(start, end, |slot, root, ssz| {
+                    blocks.push(Block {
+                        slot,
+                        root,
+                        ssz: ssz.to_vec(),
+                        finalized: true,
+                    });
                 })?;
             }
-            blocks.reverse();
             Ok(blocks)
         })
     }

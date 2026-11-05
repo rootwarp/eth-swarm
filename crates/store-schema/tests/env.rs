@@ -346,7 +346,8 @@ fn max_tables_before_create() {
             "states",
             "block_index",
             "envelopes",
-            "fc_snapshot"
+            "fc_snapshot",
+            "finalized_slots"
         ]
     );
     assert_eq!(
@@ -359,7 +360,8 @@ fn max_tables_before_create() {
             STATES,
             BLOCK_INDEX,
             ENVELOPES,
-            FC_SNAPSHOT
+            FC_SNAPSHOT,
+            FINALIZED_SLOTS
         ],
         TABLES
     );
@@ -1109,7 +1111,7 @@ fn an_unstamped_open_adds_no_row_from_its_upgrade() {
     let slot = 5u64.to_be_bytes();
     let cgc = 8u64.to_be_bytes();
     // One row of each table: `(table, key, value)`.
-    let rows: [(&str, &[u8], &[u8]); 10] = [
+    let rows: [(&str, &[u8], &[u8]); 11] = [
         (COLUMNS, &column, b"column"),
         (COLUMN_ROOTS, &root, &slot),
         (META, b"cgc", &cgc),
@@ -1120,6 +1122,7 @@ fn an_unstamped_open_adds_no_row_from_its_upgrade() {
         (BLOCK_INDEX, &root, &slot),
         (ENVELOPES, &block, b"envelope"),
         (FC_SNAPSHOT, b"fc", b"snapshot"),
+        (FINALIZED_SLOTS, &slot, &root),
     ];
     for table in TABLES {
         assert!(rows.iter().any(|(t, ..)| *t == table), "no row of {table}");

@@ -269,8 +269,8 @@ pub const DEFAULT_MAX_QUEUED_BYTES_PER_PEER: usize = 4 << 20;
 /// pool for both \[est\]: 16. One past it waits for a slot for up to one IPC step
 /// ([`super::blocks::BLOCK_LOOKUP_TIMEOUT`]), then is answered `2: ServerError`. 16 is an
 /// estimate, not a measurement: tune it once the cost of a lookup under load is measured (a
-/// range walks at most [`super::blocks::MAX_FINALIZED_DEPTH`] blocks above it in cl-store; a
-/// parent walk reads its blocks and decides their finality flag in at most as many).
+/// range is one seek in cl-store's finalized slot index and a row per block, at any depth; a
+/// parent walk reads a block per step and decides its finality flag in one lookup).
 pub const DEFAULT_MAX_BLOCK_LOOKUPS: usize = 16;
 
 /// How long a streamed answer runs before its stream's writer ends it cleanly: the requester's

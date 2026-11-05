@@ -162,7 +162,7 @@ fn blocks_by_head_deep_canonical_and_sibling() {
     let (read, sibling_looks) = walk(sibling[0].1);
     assert_eq!(read, [(2, false), (1, false)], "off the finalized chain");
     assert!(
-        canonical_looks <= 6 && sibling_looks <= 6,
+        canonical_looks <= 7 && sibling_looks <= 7,
         "{canonical_looks}, {sibling_looks} looks: no walk to the finalized block"
     );
     let by_root = |root| {

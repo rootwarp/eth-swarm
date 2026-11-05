@@ -23,11 +23,14 @@ pub const BLOCK_INDEX: &str = "block_index";
 pub const ENVELOPES: &str = "envelopes";
 /// The fork-choice snapshot. Created empty; its writer comes with #128.
 pub const FC_SNAPSHOT: &str = "fc_snapshot";
+/// Slot (`u64 BE`) → the root of the stamp's finalized chain's block there
+/// ([`crate::finalized`]), written with the stamp that finalizes it.
+pub const FINALIZED_SLOTS: &str = "finalized_slots";
 
 /// Every table, in creation order: the four cl-chain-columns tables of before, then schema 1's,
-/// then schema 2's. Any other named table in the env refuses every open
+/// then schema 2's, then schema 3's. Any other named table in the env refuses every open
 /// ([`Error::UnknownTable`]).
-pub const TABLES: [&str; 9] = [
+pub const TABLES: [&str; 10] = [
     COLUMNS,
     COLUMN_ROOTS,
     META,
@@ -37,6 +40,7 @@ pub const TABLES: [&str; 9] = [
     BLOCK_INDEX,
     ENVELOPES,
     FC_SNAPSHOT,
+    FINALIZED_SLOTS,
 ];
 
 /// `max_tables` of every open, set before any table is created or opened (`None` makes every

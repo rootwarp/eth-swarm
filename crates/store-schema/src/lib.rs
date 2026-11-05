@@ -15,9 +15,11 @@
 //! | `states`            | [`keys::slot_root_key`]: `slot (u64 BE) ‖ block_root (32)` | opaque (the importer's SSZ) |
 //! | `envelopes`         | not written yet ([5.14a])                       |                             |
 //! | `fc_snapshot`       | not written yet (#128)                          |                             |
+//! | `finalized_slots`   | `slot (u64 BE)`                                 | the root of the stamp's finalized chain's block there ([`finalized`]) |
 //!
 //! `meta` rows: [`keys::SCHEMA_VERSION_KEY`] (`u64 BE`, [`version`]); [`keys::STAMP_KEY`], the
 //! head/finalized [`stamp`], 88 bytes, that every write transaction commits ([`txn::commit`]);
+//! [`keys::FINALIZED_INDEX_FROM_KEY`], the lowest slot `finalized_slots` covers (`u64 BE`);
 //! cl-chain-columns' custody and watermark rows (`cgc`, `finalized_slot`, ...). The version
 //! check reads only its own row, so a new row never needs a migration.
 //!
@@ -39,15 +41,17 @@
 //!   `MDBX_EXCLUSIVE`; a live holder is [`Error::WriterHeld`]), opens the env read-write with
 //!   `SyncMode::Durable` and `max_tables` = [`tables::MAX_TABLES`] set before any table is
 //!   created, checks the requested geometry, then in one write transaction checks the schema
-//!   version and the table names, creates every missing table (upgrading a version-1 env in
-//!   place) and writes the version row.
+//!   version and the table names, creates every missing table (upgrading a version-1 or -2 env
+//!   in place) and writes the version row. The finalized slot index of an upgraded env is
+//!   backfilled after the open ([`finalized::backfill`]).
 //! - [`env::open_reader`]: `MDBX_RDONLY` with the same options; it never opens or creates the
 //!   writer guard, and refuses a version or a table name it does not know, as the writer does,
-//!   and a version-1 env the writer has not upgraded yet.
+//!   and a version-1 or -2 env the writer has not upgraded yet.
 
 pub mod blocks;
 pub mod env;
 mod error;
+pub mod finalized;
 pub mod keys;
 pub mod stamp;
 pub mod tables;

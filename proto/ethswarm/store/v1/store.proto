@@ -109,6 +109,10 @@ message GetPayloadEnvelopeResponse {
   ethswarm.common.v1.Error error = 3;
 }
 
+// Finalized blocks only: those of the stamp's finalized chain at or below its finalized slot, found
+// in the finalized slot index cl-chain writes with the stamp, at any depth. A range that starts
+// below the index's floor (what cl-chain has not indexed yet) fails UNAVAILABLE
+// (ERROR_CODE_RESOURCE_UNAVAILABLE) before any block is read.
 message GetBlocksByRangeRequest {
   uint64 start_slot = 1;
   // <= MAX_REQUEST_BLOCKS_DENEB = 128.
@@ -189,8 +193,9 @@ message GetBlocksByHeadResponseBody {
   // MAX_PAYLOAD_SIZE = 10485760 bytes.
   ethswarm.common.v1.Envelope block = 1;
   // The same stamp on every body of the stream: that of its first read transaction. `finalized`
-  // is decided at the first block at or below the stamp's finalized slot; for one more than
-  // 2,048 slots below it, and every block after it, it is false (not proven, never a false true).
+  // is decided at the first block at or below the stamp's finalized slot, by a lookup in the
+  // finalized slot index at any depth; for one below the index's floor (not indexed yet), and
+  // every block after it, it is false (not proven, never a false true).
   ReadMeta meta = 2;
   ethswarm.common.v1.Error error = 3;
 }

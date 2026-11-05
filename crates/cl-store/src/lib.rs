@@ -2,7 +2,8 @@
 //!
 //! - [`reader`]: the env opened read-only (`MDBX_RDONLY`). Every read is one read transaction
 //!   that reads the stamp row with its data, under a per-call deadline; no stamp, no data.
-//! - `ranges`: finalized block ranges ([`Reader::finalized_blocks`]), under the same rules.
+//! - `ranges`: finalized block ranges ([`Reader::finalized_blocks`]), under the same rules,
+//!   from the finalized slot index cl-chain writes: any depth in one seek.
 //! - [`server`]: the `StoreService`: `GetBlock`, `GetBlocksByRange`, `GetChainHead` and the
 //!   streamed parent walk `GetBlocksByHead`, behind the `ipc` contract layer and the method
 //!   ACL ([`server::store_acl`]: cl-api, cl-sync, cl-p2p). The other RPCs run the contract
@@ -30,7 +31,6 @@ mod testkit;
 
 pub use backoff::Backoff;
 pub use follow::{Followed, Follower, CHAIN_METHODS};
-pub use ranges::MAX_FINALIZED_DEPTH;
 pub use reader::{BlockRef, Deadline, ReadError, Reader};
 pub use recover::Recovering;
 pub use server::{store_acl, Callers, StoreServer};

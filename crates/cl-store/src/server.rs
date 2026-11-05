@@ -10,16 +10,17 @@
 //!   `INVALID_ARGUMENT` (`ERROR_CODE_INVALID`); anything else is `INTERNAL`.
 //! - `GetBlock` (a root, a slot, `head` or `finalized`) and `GetChainHead` answer from one read
 //!   transaction and its stamp. `GetBlocksByRange` serves finalized blocks only, at most
-//!   [`MAX_BLOCKS`], read in one transaction before its stream opens; a range that starts more
-//!   than [`crate::MAX_FINALIZED_DEPTH`] below the finalized slot is `UNAVAILABLE`
-//!   (`ERROR_CODE_RESOURCE_UNAVAILABLE`), unread. Envelope `root`s are block roots.
+//!   [`MAX_BLOCKS`], read in one transaction before its stream opens, from the finalized slot
+//!   index at any depth; a range that starts below the index's floor (what cl-chain has not
+//!   indexed yet) is `UNAVAILABLE` (`ERROR_CODE_RESOURCE_UNAVAILABLE`), unread. Envelope
+//!   `root`s are block roots.
 //! - `GetBlocksByHead` is a [`ParentWalk`]: `count` capped at [`MAX_BLOCKS`], stamped by its
 //!   first read (before the stream opens), then one block per read as the client reads, at
 //!   most one body ahead. cl-p2p reads it at its peer's pace for BeaconBlocksByHead (#230), so
 //!   the stream lives [`HEAD_WALK_TIMEOUT`] while each step's read transaction is checked
-//!   against the call timeout from the step's start (the first step's from the call's); a
-//!   block more than [`crate::MAX_FINALIZED_DEPTH`] slots below the finalized slot reads
-//!   `finalized` false (not proven, unwalked). Each frame waits for the client until the
+//!   against the call timeout from the step's start (the first step's from the call's); its
+//!   `finalized` is a lookup in the finalized slot index, `false` below the index's floor (not
+//!   proven). Each frame waits for the client until the
 //!   stream's end at most, so a stalled client holds nothing past it, and at most
 //!   [`MAX_HEAD_STREAMS`] streams are open at once: a call past them is `UNAVAILABLE`, unread.
 //! - `GetChainHead` carries the stamp's head and its finalized block's slot (`finalized_slot`,

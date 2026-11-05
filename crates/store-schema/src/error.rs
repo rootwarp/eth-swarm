@@ -65,8 +65,8 @@ pub enum Error {
         /// Its length.
         len: usize,
     },
-    /// A reader met a schema version only the writer's open upgrades (#291's version 1). The
-    /// reader opens once cl-chain has opened the env.
+    /// A reader met a schema version only the writer's open upgrades (1 or 2). The reader opens
+    /// once cl-chain has opened the env.
     #[error("env schema version {found} needs a writer upgrade")]
     NeedsUpgrade {
         /// The stored version.

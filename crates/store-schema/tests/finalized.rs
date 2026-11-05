@@ -102,7 +102,7 @@ fn stored_stamp(writer: &WriterEnv) -> Option<Stamp> {
 }
 
 /// The index moves with the stamp's finalized block, in the same transaction: the first stamp
-/// indexes the chain below its finalized block down to the lowest stored block, each later one
+/// indexes the chain below its finalized block down to its bottom (from 0), each later one
 /// the blocks from the finalized block before it up, never a fork block, never above the
 /// finalized slot. A commit that carries the stamp, or is refused, changes nothing; so does a
 /// transaction dropped before its commit.
@@ -120,7 +120,7 @@ fn the_index_moves_with_the_finalized_stamp() {
     let fork = chain(at(&blocks, 7).1, [8], 9);
     let all: Vec<Block> = blocks.iter().chain(&fork).cloned().collect();
     import(&writer, &all, stamp(1, at(&blocks, 20), at(&blocks, 10))).unwrap();
-    assert_eq!(index(&writer), (want(&blocks, 1, 10), Some(1)));
+    assert_eq!(index(&writer), (want(&blocks, 1, 10), Some(0)));
 
     let read = |slot| finalized::root_at(&writer.begin_ro_txn().unwrap(), slot).unwrap();
     assert_eq!(
@@ -133,11 +133,11 @@ fn the_index_moves_with_the_finalized_stamp() {
 
     // Carried: nothing moves.
     txn::commit(txn::begin(&writer).unwrap(), Update::Carry).unwrap();
-    assert_eq!(index(&writer), (want(&blocks, 1, 10), Some(1)));
+    assert_eq!(index(&writer), (want(&blocks, 1, 10), Some(0)));
 
     // Dropped before its commit, and refused at it: nothing is written.
     let txn = txn::begin(&writer).unwrap();
-    let missing = stamp(2, at(&blocks, 20), (30, [0xee; 32]));
+    let missing = stamp(2, at(&blocks, 40), (30, [0xee; 32]));
     let err = txn::commit(txn, Update::New(missing)).unwrap_err();
     assert!(matches!(err, Error::StampBlockMissing { .. }), "{err:?}");
     let txn = txn::begin(&writer).unwrap();
@@ -145,22 +145,22 @@ fn the_index_moves_with_the_finalized_stamp() {
     txn.put(&table, 30u64.to_be_bytes(), [0xee; 32], WriteFlags::UPSERT)
         .unwrap();
     drop(txn);
-    assert_eq!(index(&writer), (want(&blocks, 1, 10), Some(1)));
+    assert_eq!(index(&writer), (want(&blocks, 1, 10), Some(0)));
 
     // Finality moves to 30 (12 and 17 skipped): the rows from 11 up, in that commit.
     import(&writer, &[], stamp(2, at(&blocks, 40), at(&blocks, 30))).unwrap();
-    assert_eq!(index(&writer), (want(&blocks, 1, 30), Some(1)));
+    assert_eq!(index(&writer), (want(&blocks, 1, 30), Some(0)));
     assert_eq!(
         stored_stamp(&writer),
         Some(stamp(2, at(&blocks, 40), at(&blocks, 30)))
     );
     // A new head alone moves nothing.
     import(&writer, &[], stamp(3, at(&blocks, 39), at(&blocks, 30))).unwrap();
-    assert_eq!(index(&writer), (want(&blocks, 1, 30), Some(1)));
+    assert_eq!(index(&writer), (want(&blocks, 1, 30), Some(0)));
 }
 
-/// A first stamp whose chain does not reach genesis (a checkpoint anchor) indexes from its
-/// lowest stored block. A finalized block whose chain does not lead to the one before it (no
+/// A first stamp whose chain does not reach genesis (a checkpoint anchor) indexes down to its
+/// lowest stored block: the bottom, from 0 (nothing below is stored). A finalized block whose chain does not lead to the one before it (no
 /// writer path does that) restarts the index at its own lowest row, so a reader never trusts a
 /// row of the other chain.
 #[test]
@@ -174,7 +174,7 @@ fn the_index_starts_at_the_lowest_stored_block() {
         stamp(1, at(&blocks, 110), at(&blocks, 104)),
     )
     .unwrap();
-    assert_eq!(index(&writer), (want(&blocks, 100, 104), Some(100)));
+    assert_eq!(index(&writer), (want(&blocks, 100, 104), Some(0)));
 
     // 107' and 108' on 103, around the finalized block at 104.
     let other = chain(at(&blocks, 103).1, [107, 108], 5);
@@ -182,7 +182,8 @@ fn the_index_starts_at_the_lowest_stored_block() {
     import(&writer, &other, s).unwrap();
     let (rows, from) = index(&writer);
     assert_eq!(from, Some(107));
-    assert_eq!(rows.range(107..), want(&other, 107, 108).range(107..));
+    let above: BTreeMap<u64, Root> = rows.range(107..).map(|(s, r)| (*s, *r)).collect();
+    assert_eq!(above, want(&other, 107, 108));
 }
 
 /// Turns the env at `path` into the version-2 layout this index came with: no
@@ -226,7 +227,7 @@ fn batch(writer: &WriterEnv, floor: u64, slots: u64) -> Option<u64> {
 /// Upgrading a version-2 env creates the empty table and writes version 3, nothing else; a
 /// reader waits for that. Backfill then indexes it down from the finalized block, at most
 /// `slots` slots per batch, each batch its own commit with the stamp carried unchanged, and
-/// stops at the lowest stored block.
+/// stops at the bottom of the stored chain (from 0).
 #[test]
 fn backfill_on_reopen_of_a_v2_env() {
     let dir = tempfile::tempdir().unwrap();
@@ -257,8 +258,8 @@ fn backfill_on_reopen_of_a_v2_env() {
         assert_eq!((&rows, indexed), (&want(&blocks, from, 30), Some(from)));
         assert_eq!(stored_stamp(&writer), Some(stamped), "carried");
     }
-    assert_eq!(froms, [23, 15, 7, 1]);
-    assert_eq!(index(&writer), (want(&blocks, 1, 30), Some(1)));
+    assert_eq!(froms, [23, 15, 7, 0]);
+    assert_eq!(index(&writer), (want(&blocks, 0, 30), Some(0)));
     drop(writer);
     env::open_reader(dir.path()).expect("a v3 env opens");
 }
@@ -281,8 +282,8 @@ fn backfill_resumes_after_a_crash_between_batches() {
     let writer = env::open_writer(dir.path(), opts()).unwrap();
     assert_eq!(index(&writer), (want(&blocks, 23, 30), Some(23)));
     let froms: Vec<u64> = std::iter::from_fn(|| batch(&writer, 0, 8)).collect();
-    assert_eq!(froms, [15, 7, 1]);
-    assert_eq!(index(&writer), (want(&blocks, 1, 30), Some(1)));
+    assert_eq!(froms, [15, 7, 0]);
+    assert_eq!(index(&writer), (want(&blocks, 0, 30), Some(0)));
 }
 
 /// Backfill stops at the floor it is given (the block serve window's start): the index covers

@@ -15,7 +15,10 @@
 //!    Status peers pick us by) is `3: ResourceUnavailable` before any IPC call (L1538–1541);
 //!    with no Status of ours it is `2: ServerError`. When the floor is above the start of the
 //!    block serve window (`network_config::window`, L1527–1530: the node is not compliant
-//!    until it backfilled), that is logged once and shown in `rpc_block_window_gap_slots`.
+//!    until it backfilled), that is logged once and shown in `rpc_block_window_gap_slots`. A
+//!    start below the window's start is `3` too (counted as `{store, window}`): cl-store finds
+//!    any range inside it in its finalized slot index in one seek, so the window is the only
+//!    floor below `F0`, and a range deeper in history is never asked for.
 //! 2. **A lookup slot**: at most [`super::limits::RpcLimits::max_block_lookups`] answers hold
 //!    IPC calls at once; one past them waits for a slot up to [`BLOCK_LOOKUP_TIMEOUT`], then
 //!    is `2`.
@@ -25,9 +28,8 @@
 //!    for only if it is not empty. Finality only advances and cl-store is never ahead of
 //!    cl-chain, so a later store read still holds every finalized block up to `F0`, and
 //!    cl-chain's head descends from `F0`'s block: no gap and no duplicate, whatever finality
-//!    does meanwhile. A start more than [`MAX_FINALIZED_DEPTH`] below `F0` is
-//!    `3: ResourceUnavailable` before cl-store is asked (counted as `{store, depth}`): its walk
-//!    down from `F0` costs a block per slot whatever `count` is.
+//!    does meanwhile. A start inside the window that cl-store has not indexed yet (its backfill
+//!    still under way) is its `UNAVAILABLE`: `3`.
 //! 4. **One chain**: blocks go out in ascending slot order inside the range, each block's
 //!    `parent_root` the root of the block before it (L1558–1572). A block that breaks that ends
 //!    the answer at the last whole chunk (L1574–1575: the view changed), counted, never an
@@ -68,17 +70,6 @@ use tokio::sync::Semaphore;
 /// the whole answer at the first-byte and total deadlines.
 pub const BLOCK_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How far below the store's finalized slot `F0` a range may start \[est\]: 2,048 slots (64
-/// epochs of 32 slots, about 6.8 hours). An answer costs `count` tokens, but cl-store reads the
-/// finalized half by walking the parents down from its finalized block, one stored block per
-/// slot between `F0` and `start_slot` whatever `count` is, so uncapped a one-token request
-/// deep in history walks all of it. A start below `F0 - MAX_FINALIZED_DEPTH` is
-/// `3: ResourceUnavailable` before cl-store is asked: bounded work per request until a
-/// finalized slot index (slot to root) lands, which reaches any depth in one lookup. cl-store
-/// refuses the same depth itself (`cl_store::MAX_FINALIZED_DEPTH`; `tests/byrange_serve.rs`
-/// pins the two together).
-pub const MAX_FINALIZED_DEPTH: u64 = 2_048;
-
 /// Which half of an answer a block comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Half {
@@ -105,7 +96,8 @@ pub struct Failed {
     /// The result code the answer ends with if nothing went out yet.
     pub code: ResultCode,
     /// The metric's `kind` label: `status` (the call failed), `refused` (an error chunk),
-    /// `contract`, `timeout`, `order`, `link`, `decode` or `depth` (a start too far below `F0`).
+    /// `contract`, `timeout`, `order`, `link`, `decode` or `window` (a start below the serve
+    /// window).
     pub kind: &'static str,
     /// What happened, for the log.
     pub why: String,
@@ -187,8 +179,6 @@ pub struct ByRangeResponder {
     window: Option<WindowStart>,
     /// Whether the floor above the window's start was logged.
     warned: Arc<AtomicBool>,
-    /// The deepest start below `F0` served ([`MAX_FINALIZED_DEPTH`]).
-    max_depth: u64,
     /// The store streams of the ByHead answers it builds ([`Self::head_responder`]).
     head_streams: StoreStreams,
 }
@@ -210,7 +200,6 @@ impl ByRangeResponder {
             metrics,
             window: None,
             warned: Arc::default(),
-            max_depth: MAX_FINALIZED_DEPTH,
             head_streams: StoreStreams::new(
                 MAX_BYHEAD_STORE_STREAMS,
                 MAX_BYHEAD_STORE_STREAMS_PER_IP,
@@ -218,15 +207,8 @@ impl ByRangeResponder {
         }
     }
 
-    /// The same responder, serving starts at most `depth` slots below `F0`.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn with_max_depth(mut self, depth: u64) -> Self {
-        self.max_depth = depth;
-        self
-    }
-
-    /// The same responder, comparing its floor with `window`'s start (see the module docs).
+    /// The same responder, refusing starts below `window`'s start and comparing its floor with
+    /// it (see the module docs).
     #[must_use]
     pub fn with_window(mut self, window: WindowStart) -> Self {
         self.window = Some(window);
@@ -269,9 +251,9 @@ impl ByRangeResponder {
         failed
     }
 
-    /// Compares the floor `eas` with the serve window's start.
-    fn check_window(&self, eas: u64) {
-        let Some(start) = self.window.as_ref().and_then(|window| window()) else {
+    /// Compares the floor `eas` with the serve window's start, if known.
+    fn check_window(&self, eas: u64, start: Option<u64>) {
+        let Some(start) = start else {
             return;
         };
         if let Some(metrics) = &self.metrics {
@@ -308,7 +290,20 @@ impl ByRangeResponder {
                 ),
             });
         }
-        self.check_window(eas);
+        let window = self.window.as_ref().and_then(|window| window());
+        self.check_window(eas, window);
+        if let Some(start) = window.filter(|start| range.start_slot < *start) {
+            let why = format!(
+                "start_slot {} below the serve window's start {start}",
+                range.start_slot
+            );
+            let below = Failed {
+                code: ResultCode::ResourceUnavailable,
+                kind: "window",
+                why,
+            };
+            return Err(self.failed(Half::Store, below));
+        }
         let count = if range.step > 1 {
             range.count.min(1)
         } else {
@@ -321,18 +316,6 @@ impl ByRangeResponder {
         };
         let finalized = self.source.finalized_slot().await;
         let finalized = finalized.map_err(|f| self.failed(Half::Store, f))?;
-        if start < finalized.saturating_sub(self.max_depth) {
-            let why = format!(
-                "start_slot {start} more than {} slots below F0 {finalized}",
-                self.max_depth
-            );
-            let deep = Failed {
-                code: ResultCode::ResourceUnavailable,
-                kind: "depth",
-                why,
-            };
-            return Err(self.failed(Half::Store, deep));
-        }
         let split = finalized.saturating_add(1);
         if start < split {
             self.half(out, Half::Store, start, end.min(split)).await?;
