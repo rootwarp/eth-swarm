@@ -22,7 +22,9 @@
 //! - **Never recovery, never write.** cl-store opens the env with `MDBX_RDONLY` only, so it
 //!   never recovers it: an env that wants recovery stays down until cl-chain, its one writer,
 //!   has opened it. MDBX refuses a second open of one env in one process, so a reopen while a
-//!   read still holds the old handle fails, and is tried again on the backoff.
+//!   read still holds the old handle fails, and is tried again on the backoff. A
+//!   `GetBlocksByHead` stream, which holds its reader between frames, lets go of it as soon as
+//!   it is found broken ([`crate::server`]), whether or not its client reads.
 
 use std::{
     path::PathBuf,

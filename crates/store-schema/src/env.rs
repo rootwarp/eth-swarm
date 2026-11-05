@@ -2,7 +2,14 @@
 //! `max_tables` = [`MAX_TABLES`]: MDBX returns `MDBX_INCOMPATIBLE` when one process opens an
 //! env `SafeNoSync`/`UtterlyNoSync` and another opens it `Durable`, so the sync mode is fixed
 //! here and not configurable.
+//!
+//! The env's layout on disk is the writer's ([`open_writer`]): the directory [`DIR_MODE`] (a
+//! setgid bit there kept), `mdbx.dat` [`DATA_MODE`] and `mdbx.lck` [`LOCK_MODE`], whatever
+//! the umask (the units run `UMask=0077`), set when the writer creates the env and again on
+//! every writer open. The writer never changes a group: the files take the directory's,
+//! which cl-node provisions as the store group, setgid (`2750`).
 
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 
@@ -97,6 +104,20 @@ impl Default for WriterOptions {
 
 /// File name (no sub-directory) of the writer guard env inside the env directory.
 const WRITER_GUARD: &str = "writer.guard";
+
+/// The env directory's mode: the writer's, listed and entered by the store group (cl-store).
+/// A setgid bit on it is kept, so the files the writer creates stay in the directory's group.
+pub const DIR_MODE: u32 = 0o750;
+
+/// `mdbx.dat`'s mode: the writer's, read by the store group.
+pub const DATA_MODE: u32 = 0o640;
+
+/// `mdbx.lck`'s mode: written by the store group too, whose readers register their read
+/// transactions there.
+pub const LOCK_MODE: u32 = 0o660;
+
+/// The setgid bit, kept on the env directory.
+const SETGID: u32 = 0o2000;
 
 /// The options of every open; only the mode differs between the writer and readers.
 fn options(mode: Mode) -> DatabaseOptions {
@@ -205,6 +226,13 @@ pub fn open_writer(path: &Path, opts: WriterOptions) -> Result<WriterEnv> {
 /// adds no row: the store's first rows come with its first stamp
 /// ([`Update::New`](txn::Update::New)).
 ///
+/// Layout: the env directory is made [`DIR_MODE`] at most (its parents through the umask),
+/// MDBX creates `mdbx.dat` and `mdbx.lck` no wider than [`DATA_MODE`] and [`LOCK_MODE`],
+/// and once the env is open the directory and both files are given exactly those modes, the
+/// directory's setgid bit kept: an env created under any umask, or left wider or narrower, is
+/// laid out again. Only the modes; the files take the directory's group, never changed here.
+/// A mode that cannot be set (not the writer's file) fails the open ([`Error::EnvMode`]).
+///
 /// Blocking: an `EAGAIN` on the guard or the env is retried for about a second
 /// ([`WRITER_LOCK_ATTEMPTS`] tries, [`WRITER_LOCK_RETRY_INTERVAL`] apart), sleeping the calling
 /// thread. Call it at startup, or from async code through `spawn_blocking`.
@@ -222,6 +250,7 @@ where
         _env: lock_writer(path)?,
     };
     let env = open_rw(path, opts)?;
+    lay_out(path)?;
     let txn = RwTxn::new(env.begin_rw_txn().map_err(Error::from)?);
     let upgrade_version = version::check_writer(txn.raw())?;
     tables::check_known(txn.raw())?;
@@ -298,12 +327,18 @@ fn open_rw_with(
     let env = retry_writer_lock(path, pace, || {
         open(
             path,
-            options(Mode::ReadWrite(ReadWriteOptions {
-                sync_mode: SyncMode::Durable,
-                max_size: Some(max_size),
-                growth_step: Some(growth_step),
-                ..ReadWriteOptions::default()
-            })),
+            DatabaseOptions {
+                // `mdbx.dat` is created no wider than this (the umask may narrow it), and MDBX
+                // derives `mdbx.lck`'s from it: LOCK_MODE. `lay_out` then sets both exactly.
+                // `as _`: `mode_t` is not `u32` on every target.
+                permissions: Some(DATA_MODE as _),
+                ..options(Mode::ReadWrite(ReadWriteOptions {
+                    sync_mode: SyncMode::Durable,
+                    max_size: Some(max_size),
+                    growth_step: Some(growth_step),
+                    ..ReadWriteOptions::default()
+                }))
+            },
         )
     })?;
     let effective = env.info()?.map_size();
@@ -350,7 +385,7 @@ impl WriterLockPace {
 /// `MDBX_BUSY` is [`Error::EnvBusy`] on that attempt. Any other error is returned as-is, also
 /// without a retry.
 fn lock_writer(path: &Path) -> Result<Env> {
-    std::fs::create_dir_all(path)?;
+    make_dir(path)?;
     let guard = path.join(WRITER_GUARD);
     retry_writer_lock(path, WriterLockPace::production(), || {
         Env::open_with_options(
@@ -362,6 +397,51 @@ fn lock_writer(path: &Path) -> Result<Env> {
             },
         )
     })
+}
+
+/// Makes the env directory if it is missing: its parents through the umask, itself
+/// [`DIR_MODE`] at most ([`lay_out`] sets it exactly).
+fn make_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::DirBuilder::new().mode(DIR_MODE).create(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        made => Ok(made?),
+    }
+}
+
+/// Gives the open env at `path` its layout: the directory [`DIR_MODE`] with its setgid bit
+/// kept, `mdbx.dat` [`DATA_MODE`], `mdbx.lck` [`LOCK_MODE`]. Each by path, and only if it
+/// differs: no new descriptor of a file MDBX holds, whose close would drop this process's
+/// POSIX locks on it were MDBX on them rather than OFD locks.
+fn lay_out(path: &Path) -> Result<()> {
+    let dir = std::fs::metadata(path)?.mode();
+    set_mode(path, DIR_MODE | (dir & SETGID))?;
+    set_mode(&path.join("mdbx.dat"), DATA_MODE)?;
+    set_mode(&path.join("mdbx.lck"), LOCK_MODE)
+}
+
+/// Sets `path`'s mode (special bits included) to `want` unless it is that already, and checks
+/// that it held: the kernel clears a setgid bit an owner outside the file's group asks for.
+fn set_mode(path: &Path, want: u32) -> Result<()> {
+    let failed = |source| Error::EnvMode {
+        path: path.to_path_buf(),
+        want,
+        source,
+    };
+    let found = std::fs::metadata(path).map_err(failed)?.mode() & 0o7777;
+    if found == want {
+        return Ok(());
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(want)).map_err(failed)?;
+    let found = std::fs::metadata(path).map_err(failed)?.mode() & 0o7777;
+    if found != want {
+        return Err(failed(std::io::Error::other(format!(
+            "mode {found:o} after the chmod"
+        ))));
+    }
+    Ok(())
 }
 
 /// Runs `attempt` until the exclusive lock is held, the `EAGAIN` budget is spent, or some

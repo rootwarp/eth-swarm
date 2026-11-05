@@ -75,7 +75,11 @@ one `Wants=` per service, in start order, and `WantedBy=multi-user.target`.
   30 s to stop covers svc-runtime's 10 s drain and cl-verify's pubkey snapshot flush.
   `RestartSec=5s` stays under systemd's default start limit, so a crash loop keeps retrying.
 - **UMask=0077.** ipc sets the socket (0660), its directory (0750) and its lock (0600) modes
-  explicitly, and systemd sets the runtime and state directory modes, so nothing needs 0007.
+  explicitly, store-schema's writer (cl-chain) sets the store env's (directory 0750, a setgid
+  bit kept; `mdbx.dat` 0640; `mdbx.lck` 0660) on every open and never changes a group, and
+  systemd sets the runtime and state directory modes, so nothing needs 0007. The store env's
+  directory is provisioned once: the writer's, in the store group, setgid (2750), so its files
+  are in that group (`scripts/store-two-users.sh` does the same).
 - **StateDirectory** only where ARCH lists state (chain, verify, p2p, discv5, sync), 0700,
   named `ethswarm-<svc>` as in ops/probe (cl-chain's default columns dir is under it).
 - **READY=1 only.** Readiness is `sd_notify` READY=1 from the main process. The Hello check

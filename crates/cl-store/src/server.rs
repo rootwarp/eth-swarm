@@ -23,6 +23,10 @@
 //!   proven). Each frame waits for the client until the
 //!   stream's end at most, so a stalled client holds nothing past it, and at most
 //!   [`MAX_HEAD_STREAMS`] streams are open at once: a call past them is `UNAVAILABLE`, unread.
+//!   It waits only while the walk's reader is sound: once a read finds it broken (the env
+//!   wants recovery), the stream takes no further step, drops the walk and its reader at once
+//!   (so the env can reopen: MDBX refuses a second open in one process while one lives), and
+//!   ends with `UNAVAILABLE` if the client has room for it, without waiting.
 //! - `GetChainHead` carries the stamp's head and its finalized block's slot (`finalized_slot`,
 //!   where cl-p2p splits a BeaconBlocksByRange answer between cl-store and cl-chain); the stamp
 //!   holds no checkpoint epoch, justified checkpoint, head state root or earliest slot, so those
@@ -121,7 +125,8 @@ pub const HEAD_WALK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `GetBlocksByHead` streams open at once \[est\]: 32, twice cl-p2p's block lookups. Each holds
 /// its walk and at most two blocks (one queued, one in hand) until it ends, by
-/// [`HEAD_WALK_TIMEOUT`] at the latest; a call past them is `UNAVAILABLE` before any read.
+/// [`HEAD_WALK_TIMEOUT`] at the latest, or at once once its reader is found broken; a call past
+/// them is `UNAVAILABLE` before any read.
 pub const MAX_HEAD_STREAMS: usize = 32;
 
 /// The `StoreService`.
@@ -230,6 +235,49 @@ impl StoreServer {
             .map_err(|e| e.to_status())
     }
 
+    /// Streams `walk` after `hello`, `next` its first read, until the walk or the client is
+    /// done, the stream's end (`until`), or the walk's reader is found broken: then (`true`)
+    /// it returns at once, with the walk and its reader dropped.
+    async fn serve_walk(
+        &self,
+        tx: &mpsc::Sender<Result<pb::GetBlocksByHeadResponse, Status>>,
+        hello: Hello,
+        mut walk: ParentWalk,
+        mut next: Option<Stamped<Block>>,
+        until: tokio::time::Instant,
+    ) -> bool {
+        let hello = Ok(pb::GetBlocksByHeadResponse::hello(hello));
+        match send_while_sound(tx, hello, until, walk.reader()).await {
+            Sent::Went => {}
+            Sent::Dropped => return false,
+            Sent::Broken => return true,
+        }
+        let mut seq = 0;
+        while let Some(read) = next {
+            seq += 1;
+            let body = self.head_body(read, seq);
+            let failed = body.is_err();
+            let body = body.map(pb::GetBlocksByHeadResponse::body);
+            match send_while_sound(tx, body, until, walk.reader()).await {
+                Sent::Went if !failed => {}
+                Sent::Went | Sent::Dropped => return false,
+                Sent::Broken => return true,
+            }
+            if walk.reader().is_broken() {
+                return true;
+            }
+            match step(walk).await {
+                Ok((rest, after)) => (walk, next) = (rest, after),
+                Err(status) => {
+                    // The walk went with the failed step.
+                    send_by(tx, Err(status), until).await;
+                    return false;
+                }
+            }
+        }
+        false
+    }
+
     fn head_body(
         &self,
         read: Stamped<Block>,
@@ -287,6 +335,30 @@ async fn send_by<T>(tx: &mpsc::Sender<T>, frame: T, until: tokio::time::Instant)
         tokio::time::timeout_at(until, tx.send(frame)).await,
         Ok(Ok(()))
     )
+}
+
+/// How a frame of a `GetBlocksByHead` stream fared.
+enum Sent {
+    /// It went.
+    Went,
+    /// The client is gone, or the stream's end came first.
+    Dropped,
+    /// The walk's reader was found broken first: the frame did not go.
+    Broken,
+}
+
+/// [`send_by`], unless `reader` is found broken first (checked before the frame is offered).
+async fn send_while_sound<T>(
+    tx: &mpsc::Sender<T>,
+    frame: T,
+    until: tokio::time::Instant,
+    reader: &Reader,
+) -> Sent {
+    tokio::select! {
+        biased;
+        () = reader.broken() => Sent::Broken,
+        went = send_by(tx, frame, until) => if went { Sent::Went } else { Sent::Dropped },
+    }
 }
 
 /// The walk's next block, read on `spawn_blocking`.
@@ -433,33 +505,18 @@ impl StoreService for StoreServer {
         .map_err(|_| status(ReadError::Internal))?
         .map_err(status)?;
         // The stamped first read, before the stream opens: with no stamp the call fails.
-        let (mut walk, mut next) = step(walk).await?;
-        let hello = pb::GetBlocksByHeadResponse::hello(self.hello()?);
+        let (walk, next) = step(walk).await?;
+        let hello = self.hello()?;
         let (tx, rx) = mpsc::channel(1);
         let server = self.clone();
         ipc::spawn_in_span(async move {
             let _place = place;
-            // Each frame waits for the client until the stream's end at most: a stalled client
-            // gets the frames queued, then the end, and holds nothing past it.
-            if !send_by(&tx, Ok(hello), until).await {
-                return;
-            }
-            let mut seq = 0;
-            while let Some(read) = next {
-                seq += 1;
-                let body = server.head_body(read, seq);
-                let failed = body.is_err();
-                let body = body.map(pb::GetBlocksByHeadResponse::body);
-                if !send_by(&tx, body, until).await || failed {
-                    return;
-                }
-                match step(walk).await {
-                    Ok((rest, after)) => (walk, next) = (rest, after),
-                    Err(status) => {
-                        send_by(&tx, Err(status), until).await;
-                        return;
-                    }
-                }
+            // Each frame waits for the client until the stream's end at most, and only while
+            // the reader is sound: a stalled client gets the frames queued, then the end, and
+            // holds nothing past it, nor the reader past its break.
+            if server.serve_walk(&tx, hello, walk, next, until).await {
+                // The walk and its reader are gone already; the end goes only if there is room.
+                let _ = tx.try_send(Err(status(ReadError::Unavailable)));
             }
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
@@ -968,6 +1025,8 @@ mod tests {
                 .await
                 .unwrap()
                 .into_inner();
+            // Its task runs: the hello queued, the first body waiting for room.
+            tokio::time::sleep(Duration::from_millis(1)).await;
             let reader = store.reader().unwrap();
             let held = Arc::downgrade(&reader);
             reader.poison();

@@ -25,7 +25,9 @@
 //!
 //! A read transaction that fails to begin with `MDBX_WANNA_RECOVERY` or `MDBX_PANIC` is
 //! `Unavailable`, like any env that cannot be read now, and marks the reader broken: the env
-//! handle is of no further use, and [`crate::recover`] reopens the env read-only.
+//! handle is of no further use, and [`crate::recover`] reopens the env read-only. Whoever holds
+//! the reader across an await can wait for that ([`Reader::broken`]) and let go of it: a
+//! `GetBlocksByHead` stream does.
 
 use std::{
     borrow::Borrow,
@@ -156,6 +158,8 @@ pub struct Reader {
     /// A read transaction failed to begin with `MDBX_WANNA_RECOVERY` or `MDBX_PANIC`: this
     /// env handle is of no further use ([`crate::recover`] reopens the env).
     broken: AtomicBool,
+    /// Wakes every [`Reader::broken`] waiting once `broken` is set.
+    on_broken: tokio::sync::Notify,
     /// The blocks and index rows its reads touched, for the tests that count a read's work.
     #[cfg(test)]
     pub(crate) touched: std::sync::atomic::AtomicUsize,
@@ -172,6 +176,7 @@ impl Reader {
         Ok(Self {
             env: Box::new(env::open_reader(path)?),
             broken: AtomicBool::new(false),
+            on_broken: tokio::sync::Notify::new(),
             #[cfg(test)]
             touched: Default::default(),
         })
@@ -186,6 +191,7 @@ impl Reader {
         Self {
             env: Box::new(env),
             broken: AtomicBool::new(false),
+            on_broken: tokio::sync::Notify::new(),
             #[cfg(test)]
             touched: Default::default(),
         }
@@ -201,10 +207,26 @@ impl Reader {
         self.broken.load(Ordering::Relaxed)
     }
 
+    /// Resolves once this reader is broken ([`Self::is_broken`]), at once if it is already.
+    pub(crate) async fn broken(&self) {
+        // Made before the flag is read: a `notify_waiters` from then on wakes it.
+        let notified = self.on_broken.notified();
+        if self.is_broken() {
+            return;
+        }
+        notified.await;
+    }
+
+    /// Marks the reader broken and wakes whoever waits for that.
+    fn mark_broken(&self) {
+        self.broken.store(true, Ordering::Relaxed);
+        self.on_broken.notify_waiters();
+    }
+
     /// Marks the reader as if a read transaction had failed with `MDBX_WANNA_RECOVERY`.
     #[cfg(test)]
     pub(crate) fn poison(&self) {
-        self.broken.store(true, Ordering::Relaxed);
+        self.mark_broken();
     }
 
     /// The block `at` names, with the stamp of the transaction it was read in.
@@ -237,7 +259,7 @@ impl Reader {
                 err,
                 store_schema::Error::Mdbx(libmdbx::Error::WannaRecovery | libmdbx::Error::Panic)
             ) {
-                self.broken.store(true, Ordering::Relaxed);
+                self.mark_broken();
             }
         })?;
         let snap = Snapshot {
@@ -474,6 +496,11 @@ impl ParentWalk {
     pub fn with_first_deadline(mut self, first: Deadline) -> Self {
         self.first = Some(first);
         self
+    }
+
+    /// The reader the walk reads through.
+    pub(crate) fn reader(&self) -> &Reader {
+        &self.reader
     }
 
     /// The block at `root`, if stored, and where the walk goes on.

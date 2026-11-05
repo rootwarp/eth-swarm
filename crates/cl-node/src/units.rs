@@ -279,8 +279,9 @@ fn lifecycle() -> String {
 }
 
 /// The ops/probe hardening block (Vera, M4). UMask=0077: ipc sets the socket (0660), its
-/// directory (0750) and lock (0600) modes explicitly and systemd sets RuntimeDirectoryMode= and
-/// StateDirectoryMode=, so nothing needs a looser umask.
+/// directory (0750) and lock (0600) modes explicitly, store-schema's writer the store env's
+/// (directory 0750, `mdbx.dat` 0640, `mdbx.lck` 0660), and systemd sets RuntimeDirectoryMode=
+/// and StateDirectoryMode=, so nothing needs a looser umask.
 const HARDENING: &str = "\
 UMask=0077
 NoNewPrivileges=yes

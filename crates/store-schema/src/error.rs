@@ -11,6 +11,20 @@ pub enum Error {
     /// Creating the env directory failed (or an upgrade hook's own I/O).
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// The writer could not give the env directory or one of its files its mode in the env
+    /// layout ([`DIR_MODE`](crate::env::DIR_MODE), [`DATA_MODE`](crate::env::DATA_MODE),
+    /// [`LOCK_MODE`](crate::env::LOCK_MODE)): the chmod failed (the file is not the writer's,
+    /// or a sandbox refuses a setgid bit) or did not hold (a setgid bit the kernel cleared:
+    /// the writer is not in the directory's group). Nothing was written.
+    #[error("env layout: {} wants mode {want:o}: {source}", path.display())]
+    EnvMode {
+        /// The directory or file.
+        path: PathBuf,
+        /// Its mode in the layout, special bits included.
+        want: u32,
+        /// Why it does not have it.
+        source: std::io::Error,
+    },
     /// The writer guard stayed `EAGAIN`/`EWOULDBLOCK` through the retry budget: another writer
     /// holds the env, in this process or another.
     ///
