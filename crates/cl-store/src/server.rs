@@ -15,7 +15,10 @@
 //!   (`ERROR_CODE_RESOURCE_UNAVAILABLE`), unread. Envelope `root`s are block roots.
 //! - `GetBlocksByHead` is a [`ParentWalk`]: `count` capped at [`MAX_BLOCKS`], stamped by its
 //!   first read (before the stream opens), then one block per read as the client reads, at
-//!   most one body ahead.
+//!   most one body ahead. cl-p2p reads it at its peer's pace for BeaconBlocksByHead (#230), so
+//!   the stream lives [`HEAD_WALK_TIMEOUT`] while each step's read transaction ends within the
+//!   call timeout of the step's start; a block more than [`crate::MAX_FINALIZED_DEPTH`] slots
+//!   below the finalized slot reads `finalized` false (not proven, unwalked).
 //! - `GetChainHead` carries the stamp's head and its finalized block's slot (`finalized_slot`,
 //!   where cl-p2p splits a BeaconBlocksByRange answer between cl-store and cl-chain); the stamp
 //!   holds no checkpoint epoch, justified checkpoint, head state root or earliest slot, so those
@@ -103,6 +106,13 @@ pub fn store_acl(callers: Callers) -> Result<MethodAcl, AclError> {
 
 /// How long one call's reads may take, unless [`StoreServer::with_timeout`] says otherwise.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a `GetBlocksByHead` stream may run \[est\]: 10 s, past the 9.5 s cl-p2p's
+/// BeaconBlocksByHead answer runs while it reads a block per peer token (#230). A step that
+/// would start later fails `DEADLINE_EXCEEDED`; each step's read transaction still ends within
+/// the call timeout of the step's start, so no transaction pins MVCC pages longer than a
+/// unary call's.
+pub const HEAD_WALK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The `StoreService`.
 #[derive(Clone)]
@@ -366,11 +376,12 @@ impl StoreService for StoreServer {
             .map_err(|e| e.to_status())?;
         let root = root_of(&req.root)?;
         let count = req.count.min(MAX_BLOCKS);
-        let (store, deadline) = (Arc::clone(&self.store), self.deadline());
+        let (store, timeout) = (Arc::clone(&self.store), self.timeout);
+        let deadline = Deadline::after(Arc::clone(&self.clock), HEAD_WALK_TIMEOUT.max(timeout));
         let walk = tokio::task::spawn_blocking(move || {
-            store
-                .reader()
-                .map(|reader| ParentWalk::new(reader, root, count, deadline))
+            store.reader().map(|reader| {
+                ParentWalk::new(reader, root, count, deadline).with_step_timeout(timeout)
+            })
         })
         .await
         .map_err(|_| status(ReadError::Internal))?
@@ -427,7 +438,7 @@ mod tests {
     use pb::{store_service_client::StoreServiceClient, ReadMeta};
     use std::{
         collections::BTreeSet,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{AtomicU64, AtomicUsize, Ordering},
         time::Instant,
     };
     use tonic::Code;
@@ -688,6 +699,73 @@ mod tests {
         Some(message.into_frame().expect("hello or body"))
     }
 
+    /// A clock the test moves: `t0` and the milliseconds added to the counter.
+    fn manual() -> (Clock, Arc<AtomicU64>) {
+        let (t0, ms) = (Instant::now(), Arc::new(AtomicU64::new(0)));
+        let read = Arc::clone(&ms);
+        let clock: Clock =
+            Arc::new(move || t0 + Duration::from_millis(read.load(Ordering::SeqCst)));
+        (clock, ms)
+    }
+
+    /// #230 D3b: cl-p2p reads a `GetBlocksByHead` stream at its peer's pace, a block per token
+    /// (20 ms by default), for up to its 9.5 s answer. The stream lives 10 s, past the call's
+    /// 2 s (each step's read transaction still under it): 128 bodies read 50 ms apart (6.4 s)
+    /// all arrive, and a reader that comes back past 10 s gets `DEADLINE_EXCEEDED` after what
+    /// was sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocks_by_head_paced_reader() {
+        let store = Store::new();
+        let blocks = chain(140);
+        let all: Vec<&[u8]> = blocks.iter().map(|b| b.ssz.as_slice()).collect();
+        store.import(&all, stamp_of(1, &blocks[139], &blocks[99]));
+        let (clock, ms) = manual();
+        let server = server(&store).with_clock(clock);
+        let conn = Mode::InProcess.connect(Server::new(server.routes())).await;
+        let mut raw = StoreServiceClient::new(conn.transport.clone());
+        let link = fixture::v1_link();
+        let request = || pb::GetBlocksByHeadRequest {
+            root: blocks[139].root.to_vec(),
+            count: 128,
+            hello: Some(link.local()),
+        };
+        // Reads to the end: the bodies, and the status the stream ended with.
+        async fn drain(
+            stream: &mut tonic::Streaming<pb::GetBlocksByHeadResponse>,
+            ms: &AtomicU64,
+            pause: impl Fn(usize) -> u64,
+        ) -> (usize, Option<Code>) {
+            let mut bodies = 0;
+            loop {
+                match stream.message().await {
+                    Ok(Some(m)) => match m.into_frame().expect("hello or body") {
+                        Frame::Hello(_) => continue,
+                        Frame::Body(_) => bodies += 1,
+                    },
+                    Ok(None) => return (bodies, None),
+                    Err(status) => return (bodies, Some(status.code())),
+                }
+                ms.fetch_add(pause(bodies), Ordering::SeqCst);
+            }
+        }
+        let mut paced = raw
+            .get_blocks_by_head(request())
+            .await
+            .unwrap()
+            .into_inner();
+        let read = drain(&mut paced, &ms, |_| 50).await;
+        assert_eq!(read, (128, None), "every body, read over 6.4 s");
+
+        let mut late = raw
+            .get_blocks_by_head(request())
+            .await
+            .unwrap()
+            .into_inner();
+        let (bodies, ended) = drain(&mut late, &ms, |n| if n == 3 { 11_000 } else { 0 }).await;
+        assert_eq!(ended, Some(Code::DeadlineExceeded));
+        assert!((3..=6).contains(&bodies), "what was sent first: {bodies}");
+    }
+
     /// A clock that reads `t0` its first `reads` times, then an hour later: time passes once
     /// the call's read txn is open (its first two reads are the call's start and the txn's
     /// open).
@@ -704,7 +782,8 @@ mod tests {
     }
 
     /// A read txn held past the call's deadline fails the call `DEADLINE_EXCEEDED`, on every
-    /// served RPC. The method ACL gives every method of the descriptor to cl-api, cl-sync and
+    /// served RPC (`GetBlocksByHead`: its first step's txn, past the call timeout from the
+    /// step's start). The method ACL gives every method of the descriptor to cl-api, cl-sync and
     /// cl-p2p: each of them passes on every method, and any other caller, or one with no
     /// credentials, is refused `PERMISSION_DENIED` before the service sees the call.
     #[tokio::test(flavor = "multi_thread")]

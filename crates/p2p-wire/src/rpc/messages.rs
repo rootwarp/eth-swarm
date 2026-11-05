@@ -4,6 +4,8 @@
 //! - [`MetaDataV3`]: `fulu/p2p-interface.md` "GetMetaData v3" (adds `custody_group_count`).
 //! - [`Ping`] and [`Goodbye`]: `phase0/p2p-interface.md`, a bare `uint64` each.
 //! - [`BlocksByRangeV2Request`]: `phase0/p2p-interface.md` "BeaconBlocksByRange v2" request.
+//! - [`BlocksByHeadV1Request`]: `fulu/p2p-interface.md` "BeaconBlocksByHead v1" request
+//!   (L796–863).
 //! - [`DataColumnsByRangeV1Request`] and [`DataColumnsByRootV1Request`]:
 //!   `fulu/p2p-interface.md` "DataColumnSidecarsByRange v1" (L605–710) and
 //!   "DataColumnSidecarsByRoot v1" (L712–775), with `DataColumnIndices` (L74–83),
@@ -83,6 +85,15 @@ pub struct BlocksByRangeV2Request {
     pub count: u64,
     /// Deprecated, must be 1.
     pub step: u64,
+}
+
+/// The `BeaconBlocksByHead` v1 request (`fulu/p2p-interface.md` L804–808): 40 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub struct BlocksByHeadV1Request {
+    /// The newest block asked for: the walk down its ancestry starts there, inclusive.
+    pub beacon_root: Root,
+    /// How many blocks, newest first; at most `MAX_REQUEST_BLOCKS_DENEB` are served (L820–821).
+    pub count: u64,
 }
 
 /// `NUMBER_OF_COLUMNS` (`fulu/das-core.md`): 128 in both presets, so the column lists here are

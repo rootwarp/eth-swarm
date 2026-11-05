@@ -43,8 +43,9 @@
 //! under a counting allocator.
 
 use crate::rpc::messages::{
-    BlocksByRangeV2Request, DataColumnsByRangeV1Request, DataColumnsByRootV1Request, ErrorMessage,
-    ForkDigest, Goodbye, MetaDataV3, Ping, StatusV2, MAX_ERROR_MESSAGE_LEN,
+    BlocksByHeadV1Request, BlocksByRangeV2Request, DataColumnsByRangeV1Request,
+    DataColumnsByRootV1Request, ErrorMessage, ForkDigest, Goodbye, MetaDataV3, Ping, StatusV2,
+    MAX_ERROR_MESSAGE_LEN,
 };
 use crate::rpc::protocols::{Protocol, Request, Response, ResponseChunk, ResultCode, SszBounds};
 use consensus_types::caps::{NetworkCaps, ObjectKind, MAX_PAYLOAD_SIZE};
@@ -653,6 +654,9 @@ pub fn decode_request(protocol: Protocol, buf: &[u8]) -> Result<Request, CodecEr
         Protocol::DataColumnsByRootV1 => {
             Request::DataColumnsByRoot(DataColumnsByRootV1Request::from_ssz_bytes(&ssz)?)
         }
+        Protocol::BlocksByHeadV1 => {
+            Request::BlocksByHead(BlocksByHeadV1Request::from_ssz_bytes(&ssz)?)
+        }
     })
 }
 
@@ -838,7 +842,7 @@ pub fn decode_response_chunk<E: EthSpec>(
         Protocol::StatusV2 => Response::Status(StatusV2::from_ssz_bytes(&ssz)?),
         Protocol::MetaDataV3 => Response::MetaData(MetaDataV3::from_ssz_bytes(&ssz)?),
         Protocol::PingV1 => Response::Ping(Ping::from_ssz_bytes(&ssz)?),
-        Protocol::BlocksByRangeV2 => {
+        Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 => {
             let fork = head.fork.ok_or(CodecError::MissingContext(protocol))?;
             Response::Block(Box::new(
                 forked::SignedBeaconBlock::from_ssz_bytes_for_fork(&ssz, fork)?,
@@ -1314,6 +1318,40 @@ mod tests {
         ));
     }
 
+    /// #230: a BeaconBlocksByHead request is its 40-byte container both ways; a payload of
+    /// another length is refused at its prefix, before anything past it is decompressed.
+    #[test]
+    fn roundtrip_blocks_by_head_req() {
+        let request = Request::BlocksByHead(BlocksByHeadV1Request {
+            beacon_root: [0x11; 32].into(),
+            count: 64,
+        });
+        let bytes = encode_request(&request).unwrap();
+        let back = decode_request(Protocol::BlocksByHeadV1, &bytes).unwrap();
+        assert_eq!(back, request);
+        assert_eq!(encode_request(&back).unwrap(), bytes);
+        for len in [0usize, 24, 39, 41, 48] {
+            let wrong = encode_chunk(&vec![0x11; len]).unwrap();
+            let err = decode_request(Protocol::BlocksByHeadV1, &wrong).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    CodecError::PayloadTooLarge { max: 40, .. }
+                        | CodecError::PayloadTooSmall { min: 40, .. }
+                ),
+                "{len}: {err:?}"
+            );
+        }
+        // A range request is not a head request.
+        let range = Request::BlocksByRange(BlocksByRangeV2Request {
+            start_slot: 64,
+            count: 2,
+            step: 1,
+        });
+        let range = encode_request(&range).unwrap();
+        assert!(decode_request(Protocol::BlocksByHeadV1, &range).is_err());
+    }
+
     #[test]
     fn roundtrip_column_requests() {
         let range = Request::DataColumnsByRange(DataColumnsByRangeV1Request {
@@ -1468,10 +1506,12 @@ mod tests {
             assert_eq!(&chunk[1..5], digest);
             let decoded =
                 decode_response_chunk::<E>(&chunk, Protocol::BlocksByRangeV2, &contexts).unwrap();
-            assert_eq!(
-                decoded,
-                ResponseChunk::Success(Response::Block(Box::new(block)))
-            );
+            let want = ResponseChunk::Success(Response::Block(Box::new(block)));
+            // #230: a BeaconBlocksByHead chunk is read the same way.
+            let by_head =
+                decode_response_chunk::<E>(&chunk, Protocol::BlocksByHeadV1, &contexts).unwrap();
+            assert_eq!(by_head, want);
+            assert_eq!(decoded, want);
         }
     }
 

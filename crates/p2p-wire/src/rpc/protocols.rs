@@ -2,9 +2,10 @@
 //!
 //! Protocol IDs follow `phase0/p2p-interface.md` "Protocol identification":
 //! `/eth2/beacon_chain/req/<message_name>/<version>/<encoding>`, always `ssz_snappy`.
-//! `BeaconBlocksByRange` v2 and the two column protocols carry context bytes
-//! (`altair/p2p-interface.md`; for a column sidecar the digest of the epoch of its slot,
-//! `fulu/p2p-interface.md` L700–702, L766–768); the other responses have one shape in every fork.
+//! `BeaconBlocksByRange` v2, `BeaconBlocksByHead` v1 and the two column protocols carry context
+//! bytes (`altair/p2p-interface.md`; for a block or a column sidecar the digest of the epoch of
+//! its slot, `fulu/p2p-interface.md` L700–702, L766–768, L847–848); the other responses have
+//! one shape in every fork.
 //! `Goodbye` carries a
 //! `uint64` reason both ways ("Request, Response Content", `phase0/p2p-interface.md` L1461): the
 //! disconnecting peer writes its reason, and the response is one chunk with a reason too (L1483),
@@ -19,9 +20,9 @@
 //! ([`Protocol::response_bounds_with`]); the table row holds the preset bound.
 
 use crate::rpc::messages::{
-    BlocksByRangeV2Request, DataColumnsByRangeV1Request, DataColumnsByRootIdentifier,
-    DataColumnsByRootV1Request, ErrorMessage, Goodbye, MetaDataV3, Ping, StatusV2,
-    MAX_ERROR_MESSAGE_LEN,
+    BlocksByHeadV1Request, BlocksByRangeV2Request, DataColumnsByRangeV1Request,
+    DataColumnsByRootIdentifier, DataColumnsByRootV1Request, ErrorMessage, Goodbye, MetaDataV3,
+    Ping, StatusV2, MAX_ERROR_MESSAGE_LEN,
 };
 use consensus_types::caps::{self, NetworkCaps, ObjectKind};
 use consensus_types::{forked, EthSpec, ForkName};
@@ -29,7 +30,8 @@ use ssz::Encode;
 use std::fmt;
 
 /// `MAX_REQUEST_BLOCKS_DENEB` (`deneb/p2p-interface.md` configuration): the most blocks a
-/// `BeaconBlocksByRange` response may hold. 128 in every known network config.
+/// `BeaconBlocksByRange` or `BeaconBlocksByHead` response may hold. 128 in every known network
+/// config.
 pub const MAX_REQUEST_BLOCKS_DENEB: u64 = 128;
 
 /// `MAX_REQUEST_PAYLOADS` (`gloas/p2p-interface.md` L84): the most execution payload envelopes
@@ -135,11 +137,13 @@ pub enum Protocol {
     DataColumnsByRangeV1,
     /// `/eth2/beacon_chain/req/data_column_sidecars_by_root/1/ssz_snappy`.
     DataColumnsByRootV1,
+    /// `/eth2/beacon_chain/req/beacon_blocks_by_head/1/ssz_snappy` (Fulu).
+    BlocksByHeadV1,
 }
 
 impl Protocol {
     /// Every protocol. New ones go at the end: fuzz seeds select a protocol by its index here.
-    pub const ALL: [Protocol; 7] = [
+    pub const ALL: [Protocol; 8] = [
         Protocol::StatusV2,
         Protocol::MetaDataV3,
         Protocol::PingV1,
@@ -147,6 +151,7 @@ impl Protocol {
         Protocol::GoodbyeV1,
         Protocol::DataColumnsByRangeV1,
         Protocol::DataColumnsByRootV1,
+        Protocol::BlocksByHeadV1,
     ];
 
     /// The multistream protocol ID.
@@ -165,7 +170,13 @@ impl Protocol {
             Protocol::DataColumnsByRootV1 => {
                 "/eth2/beacon_chain/req/data_column_sidecars_by_root/1/ssz_snappy"
             }
+            Protocol::BlocksByHeadV1 => "/eth2/beacon_chain/req/beacon_blocks_by_head/1/ssz_snappy",
         }
+    }
+
+    /// Whether this is one of the two block protocols, whose responses are blocks.
+    pub const fn is_blocks(self) -> bool {
+        matches!(self, Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1)
     }
 
     /// Whether this is one of the two data column protocols.
@@ -178,29 +189,32 @@ impl Protocol {
 
     /// Whether a success chunk carries the 4-byte fork digest before its payload.
     pub const fn has_context_bytes(self) -> bool {
-        matches!(self, Protocol::BlocksByRangeV2) || self.is_columns()
+        self.is_blocks() || self.is_columns()
     }
 
-    /// Whether the response is exactly one chunk (every protocol but `BeaconBlocksByRange` and
-    /// the column protocols, whose responses may hold anything from no chunk to their request's
-    /// count, and `Goodbye`, whose one chunk some clients leave out).
+    /// Whether the response is exactly one chunk (every protocol but the block and column
+    /// protocols, whose responses may hold anything from no chunk to their request's count, and
+    /// `Goodbye`, whose one chunk some clients leave out).
     pub const fn single_response(self) -> bool {
-        !matches!(self, Protocol::BlocksByRangeV2 | Protocol::GoodbyeV1) && !self.is_columns()
+        !matches!(self, Protocol::GoodbyeV1) && !self.is_blocks() && !self.is_columns()
     }
 
     /// Whether a responder may answer `3: ResourceUnavailable` (`phase0/p2p-interface.md` L1291:
     /// "only valid as a response where specified"): `BeaconBlocksByRange` (L1540, for blocks
-    /// the responder does not have), `DataColumnSidecarsByRange` (`fulu/p2p-interface.md`
-    /// L654–656, outside `data_column_serve_range`) and `DataColumnSidecarsByRoot` (L754–756,
-    /// before `minimum_request_epoch`).
+    /// the responder does not have), `BeaconBlocksByHead` (`fulu/p2p-interface.md` L837–838, a
+    /// `beacon_root` older than the serve window), `DataColumnSidecarsByRange` (L654–656,
+    /// outside `data_column_serve_range`) and `DataColumnSidecarsByRoot` (L754–756, before
+    /// `minimum_request_epoch`).
     pub const fn permits_resource_unavailable(self) -> bool {
-        matches!(self, Protocol::BlocksByRangeV2) || self.is_columns()
+        self.is_blocks() || self.is_columns()
     }
 
     /// This protocol's row of limits.
     pub fn limits<E: EthSpec>(self) -> ProtocolLimits {
         let (max_request_items, max_response_chunks) = match self {
-            Protocol::BlocksByRangeV2 => (MAX_REQUEST_BLOCKS_DENEB, MAX_REQUEST_BLOCKS_DENEB),
+            Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 => {
+                (MAX_REQUEST_BLOCKS_DENEB, MAX_REQUEST_BLOCKS_DENEB)
+            }
             Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1 => (
                 MAX_REQUEST_DATA_COLUMN_SIDECARS,
                 MAX_REQUEST_DATA_COLUMN_SIDECARS,
@@ -208,7 +222,7 @@ impl Protocol {
             _ => (0, 1),
         };
         let (ssz_min, ssz_max) = match self {
-            Protocol::BlocksByRangeV2 => (
+            Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 => (
                 MIN_SIGNED_BEACON_BLOCK_LEN,
                 ForkName::ALL
                     .into_iter()
@@ -266,7 +280,9 @@ impl Protocol {
     ) -> Option<SszBounds> {
         let max = self.response_max_len_with::<E>(fork, network)?;
         let min = match (self, fork) {
-            (Protocol::BlocksByRangeV2, _) => MIN_SIGNED_BEACON_BLOCK_LEN,
+            (Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1, _) => {
+                MIN_SIGNED_BEACON_BLOCK_LEN
+            }
             (Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1, Some(fork)) => {
                 match fork {
                     ForkName::Fulu => MIN_FULU_DATA_COLUMN_SIDECAR_LEN,
@@ -291,6 +307,9 @@ impl Protocol {
             }
             Protocol::GoodbyeV1 => Some(<Goodbye as ssz::Decode>::ssz_fixed_len()),
             Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1 => None,
+            Protocol::BlocksByHeadV1 => {
+                Some(<BlocksByHeadV1Request as ssz::Decode>::ssz_fixed_len())
+            }
         }
     }
 
@@ -312,7 +331,7 @@ impl Protocol {
             Protocol::StatusV2 => Some(<StatusV2 as ssz::Decode>::ssz_fixed_len()),
             Protocol::MetaDataV3 => Some(<MetaDataV3 as ssz::Decode>::ssz_fixed_len()),
             Protocol::PingV1 => Some(<Ping as ssz::Decode>::ssz_fixed_len()),
-            Protocol::BlocksByRangeV2 => {
+            Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 => {
                 fork.and_then(|f| caps::max_size::<E>(ObjectKind::SignedBeaconBlock, f))
             }
             Protocol::GoodbyeV1 => Some(<Goodbye as ssz::Decode>::ssz_fixed_len()),
@@ -366,6 +385,8 @@ pub enum Request {
     DataColumnsByRange(DataColumnsByRangeV1Request),
     /// `DataColumnSidecarsByRoot` v1.
     DataColumnsByRoot(DataColumnsByRootV1Request),
+    /// `BeaconBlocksByHead` v1.
+    BlocksByHead(BlocksByHeadV1Request),
 }
 
 impl Request {
@@ -379,17 +400,20 @@ impl Request {
             Request::Goodbye(_) => Protocol::GoodbyeV1,
             Request::DataColumnsByRange(_) => Protocol::DataColumnsByRangeV1,
             Request::DataColumnsByRoot(_) => Protocol::DataColumnsByRootV1,
+            Request::BlocksByHead(_) => Protocol::BlocksByHeadV1,
         }
     }
 
     /// The most response chunks the peer may send: the request's `count` (at most
-    /// [`MAX_REQUEST_BLOCKS_DENEB`]) for `BeaconBlocksByRange`; the sidecars a column request
-    /// names (`count × len(columns)`, `fulu/p2p-interface.md` L684–685; the sum of the
-    /// identifiers' columns, L728–730), at most [`MAX_REQUEST_DATA_COLUMN_SIDECARS`]; 1 for every
-    /// other protocol.
+    /// [`MAX_REQUEST_BLOCKS_DENEB`]) for `BeaconBlocksByRange` and `BeaconBlocksByHead` (whose
+    /// larger `count` is served as that many, `fulu/p2p-interface.md` L820–821); the sidecars a
+    /// column request names (`count × len(columns)`, L684–685; the sum of the identifiers'
+    /// columns, L728–730), at most [`MAX_REQUEST_DATA_COLUMN_SIDECARS`]; 1 for every other
+    /// protocol.
     pub fn max_response_chunks(&self) -> u64 {
         match self {
             Request::BlocksByRange(r) => r.count.min(MAX_REQUEST_BLOCKS_DENEB),
+            Request::BlocksByHead(r) => r.count.min(MAX_REQUEST_BLOCKS_DENEB),
             Request::DataColumnsByRange(r) => {
                 r.requested_sidecars().min(MAX_REQUEST_DATA_COLUMN_SIDECARS)
             }
@@ -410,6 +434,7 @@ impl Request {
             Request::Goodbye(g) => Some(g.as_ssz_bytes()),
             Request::DataColumnsByRange(r) => Some(r.as_ssz_bytes()),
             Request::DataColumnsByRoot(r) => Some(r.as_ssz_bytes()),
+            Request::BlocksByHead(r) => Some(r.as_ssz_bytes()),
         }
     }
 }
@@ -454,7 +479,8 @@ pub enum Response<E: EthSpec> {
     MetaData(MetaDataV3),
     /// `Ping`.
     Ping(Ping),
-    /// One block of a `BeaconBlocksByRange` response, in the fork its context bytes named.
+    /// One block of a `BeaconBlocksByRange` or `BeaconBlocksByHead` response, in the fork its
+    /// context bytes named.
     /// Boxed: a block is far larger than the other responses.
     Block(Box<forked::SignedBeaconBlock<E>>),
     /// `Goodbye`: the responder's reason.
@@ -465,14 +491,14 @@ pub enum Response<E: EthSpec> {
 }
 
 impl<E: EthSpec> Response<E> {
-    /// Whether this is a response of `protocol`: a column sidecar answers both column
-    /// protocols, every other response its own one.
+    /// Whether this is a response of `protocol`: a block answers both block protocols, a
+    /// column sidecar both column protocols, every other response its own one.
     pub fn answers(&self, protocol: Protocol) -> bool {
         match self {
             Response::Status(_) => protocol == Protocol::StatusV2,
             Response::MetaData(_) => protocol == Protocol::MetaDataV3,
             Response::Ping(_) => protocol == Protocol::PingV1,
-            Response::Block(_) => protocol == Protocol::BlocksByRangeV2,
+            Response::Block(_) => protocol.is_blocks(),
             Response::Goodbye(_) => protocol == Protocol::GoodbyeV1,
             Response::DataColumn(_) => protocol.is_columns(),
         }
@@ -552,6 +578,7 @@ mod tests {
                 "/eth2/beacon_chain/req/goodbye/1/ssz_snappy",
                 "/eth2/beacon_chain/req/data_column_sidecars_by_range/1/ssz_snappy",
                 "/eth2/beacon_chain/req/data_column_sidecars_by_root/1/ssz_snappy",
+                "/eth2/beacon_chain/req/beacon_blocks_by_head/1/ssz_snappy",
             ]
         );
         assert_eq!(Protocol::PingV1.as_ref(), Protocol::PingV1.to_string());
@@ -563,6 +590,7 @@ mod tests {
             let multi = matches!(
                 p,
                 Protocol::BlocksByRangeV2
+                    | Protocol::BlocksByHeadV1
                     | Protocol::DataColumnsByRangeV1
                     | Protocol::DataColumnsByRootV1
             );
@@ -593,7 +621,8 @@ mod tests {
     #[test]
     fn only_blocks_and_columns_permit_resource_unavailable() {
         for p in Protocol::ALL {
-            let permits = p == Protocol::BlocksByRangeV2 || p.is_columns();
+            let permits =
+                matches!(p, Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1) || p.is_columns();
             assert_eq!(p.permits_resource_unavailable(), permits, "{p}");
         }
     }
@@ -607,6 +636,8 @@ mod tests {
         assert_eq!(Protocol::MetaDataV3.request_len(), None);
         assert_eq!(Protocol::PingV1.request_len(), Some(8));
         assert_eq!(Protocol::BlocksByRangeV2.request_len(), Some(24));
+        // `(beacon_root: Root, count: uint64)` (`fulu/p2p-interface.md` L804–808).
+        assert_eq!(Protocol::BlocksByHeadV1.request_len(), Some(32 + 8));
         let meta = Protocol::MetaDataV3.response_max_len::<Minimal>(None);
         assert_eq!(meta, Some(8 + 8 + 1 + 8));
         assert_eq!(Protocol::StatusV2.error_max_len(), 256);
@@ -709,6 +740,10 @@ mod tests {
         );
         assert_eq!(Request::MetaData.max_response_chunks(), 1);
         assert_eq!(Request::Ping(Ping(1)).max_response_chunks(), 1);
+        // BeaconBlocksByHead: `min(count, MAX_REQUEST_BLOCKS_DENEB)` (`fulu` L820–821).
+        for (count, max) in [(0, 0), (1, 1), (128, 128), (129, 128), (u64::MAX, 128)] {
+            assert_eq!(head(count).max_response_chunks(), max, "{count}");
+        }
         assert_eq!(Request::MetaData.ssz_body(), None);
         assert_eq!(Request::MetaData.protocol(), Protocol::MetaDataV3);
     }
@@ -728,8 +763,10 @@ mod tests {
         let block = forked::SignedBeaconBlock::Fulu(testkit::fulu_block::<Minimal>(1));
         let ssz = block.as_ssz_bytes();
         let block = Response::Block(Box::new(block));
-        assert!(block.answers(Protocol::BlocksByRangeV2));
-        assert!(!block.answers(Protocol::DataColumnsByRangeV1));
+        for p in Protocol::ALL {
+            let blocks = matches!(p, Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1);
+            assert_eq!(block.answers(p), blocks, "{p}");
+        }
         assert_eq!(block.ssz_bytes(), ssz);
         let sidecar = forked::DataColumnSidecar::Gloas(testkit::gloas_sidecar::<Minimal>(3, 9));
         let ssz = sidecar.as_ssz_bytes();
@@ -743,6 +780,66 @@ mod tests {
         }
         let goodbye: Response<Minimal> = Response::Goodbye(Goodbye(3));
         assert_eq!(goodbye.ssz_bytes_len(), 8);
+    }
+
+    fn head(count: u64) -> Request {
+        Request::BlocksByHead(BlocksByHeadV1Request {
+            beacon_root: [7; 32].into(),
+            count,
+        })
+    }
+
+    /// #230: BeaconBlocksByHead v1 (`fulu/p2p-interface.md` L796–863), new in Fulu: last in
+    /// `ALL` (fuzz seeds pick a protocol by its index there), context bytes per block, any
+    /// number of chunks up to `count`, `3: ResourceUnavailable` permitted (L837–838), a fixed
+    /// 40-byte request and the block bounds of BeaconBlocksByRange v2 at every fork. The
+    /// request body is its SSZ container.
+    #[test]
+    fn blocks_by_head_row() {
+        use consensus_types::Mainnet;
+        let p = Protocol::BlocksByHeadV1;
+        assert_eq!(
+            p.id(),
+            "/eth2/beacon_chain/req/beacon_blocks_by_head/1/ssz_snappy"
+        );
+        assert_eq!(
+            Protocol::ALL.last(),
+            Some(&p),
+            "new protocols go at the end"
+        );
+        assert_eq!(Protocol::ALL.len(), 8);
+        assert!(p.has_context_bytes());
+        assert!(!p.single_response());
+        assert!(p.permits_resource_unavailable());
+        assert_eq!(p.request_bounds(), Some(SszBounds::exactly(40)));
+        let range = Protocol::BlocksByRangeV2;
+        assert_eq!(p.response_bounds::<Minimal>(None), None);
+        for fork in ForkName::ALL {
+            assert_eq!(
+                p.response_bounds::<Mainnet>(Some(fork)),
+                range.response_bounds::<Mainnet>(Some(fork)),
+                "{fork}"
+            );
+        }
+        for (row, by_range) in [
+            (p.limits::<Minimal>(), range.limits::<Minimal>()),
+            (p.limits::<Mainnet>(), range.limits::<Mainnet>()),
+        ] {
+            assert_eq!(row.id, p.id());
+            assert_eq!(row.request, Some(SszBounds::exactly(40)));
+            assert_eq!(
+                (row.max_request_items, row.max_response_chunks),
+                (MAX_REQUEST_BLOCKS_DENEB, MAX_REQUEST_BLOCKS_DENEB)
+            );
+            assert_eq!(
+                (row.ssz_min, row.ssz_max),
+                (by_range.ssz_min, by_range.ssz_max)
+            );
+        }
+        let request = head(129);
+        assert_eq!(request.protocol(), p);
+        let body = request.ssz_body().unwrap();
+        assert_eq!(body, [&[7; 32][..], &129u64.to_le_bytes()].concat());
     }
 
     fn by_range(start_slot: u64, count: u64, columns: Vec<u64>) -> Request {
