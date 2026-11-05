@@ -598,12 +598,16 @@ mod tests {
             "rpc_outbound_inflight{protocol=\"beacon_blocks_by_range\"} 0",
             "rpc_rate_limited_total{protocol=\"ping\"} 0",
             "rpc_rate_limited_total{protocol=\"goodbye\"} 0",
-            "rpc_inbound_unsupported_total{protocol=\"beacon_blocks_by_head\"} 0",
             "rpc_inbound_unsupported_total{protocol=\"execution_payload_envelopes_by_range\"} 0",
             "rpc_inbound_unsupported_total{protocol=\"execution_payload_envelopes_by_root\"} 0",
         ] {
             assert!(text.contains(line), "{line} missing from\n{text}");
         }
+        // #230: served, so no longer counted as unsupported.
+        assert!(
+            !text.contains("rpc_inbound_unsupported_total{protocol=\"beacon_blocks_by_head\"}"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -642,7 +646,7 @@ mod tests {
             2
         );
         assert_eq!(
-            metrics.inbound_unsupported_count(Unsupported::BlocksByHeadV1),
+            metrics.inbound_unsupported_count(Unsupported::EnvelopesByRangeV1),
             0
         );
         let text = text(&registry);

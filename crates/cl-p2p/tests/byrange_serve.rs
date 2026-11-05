@@ -6,7 +6,8 @@
 //! fixture's five epochs across finality and the Fulu→Gloas switch.
 //!
 //! #230: the same cl-store also serves the parent walk of BeaconBlocksByHead's source
-//! (`IpcBlocks::by_head`), read here directly: the protocol is not dispatched to a swarm yet.
+//! (`IpcBlocks::by_head`), read here directly (the swarm's dispatch of BeaconBlocksByHead is
+//! `rpc::inbound`'s `byhead_over_a_swarm`).
 
 use cl_chain::reqresp::{
     BlockStore, ColumnServer, ColumnStore, ReqRespServer, ServeBudget, ServeClock,

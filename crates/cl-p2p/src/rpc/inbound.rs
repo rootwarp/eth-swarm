@@ -1,12 +1,13 @@
 //! The control protocols, both ways: Status v2, MetaData v3, Ping v1 and Goodbye v1, plus
 //! `BeaconBlocksByRange` v2, served by a [`Responder`] if one is given
 //! ([`Control::with_blocks_responder`]) and else answered `3: ResourceUnavailable` (the probe
-//! stores no blocks), and the custody columns served by `DataColumnSidecarsByRange` v1 and
-//! `DataColumnSidecarsByRoot` v1.
+//! stores no blocks), `BeaconBlocksByHead` v1, served by a [`Responder`] if one is given
+//! ([`Control::with_head_responder`]) and else answered an empty success, and the custody
+//! columns served by `DataColumnSidecarsByRange` v1 and `DataColumnSidecarsByRoot` v1.
 //!
 //! [`Control`] is the probe swarm's req/resp behaviour. It holds one [`Duplex`] per protocol
 //! ([`Protocols`], see [`crate::rpc`] for why one each): an inbound-only and an outbound-only
-//! `request_response` behaviour, so these seven are what multistream-select offers and any other
+//! `request_response` behaviour, so these eight are what multistream-select offers and any other
 //! protocol fails negotiation (`phase0/p2p-interface.md` L187–190), among them the MUST-support
 //! ones the probe leaves out ([`super::unsupported`]). It answers every inbound
 //! request itself and reports what it learned as [`ControlEvent`]s.
@@ -54,8 +55,18 @@
 //!   The service's responder is [`super::blocks::ByRangeResponder`] (#146): cl-store's
 //!   finalized blocks, then cl-chain's above them, one chain, each block with its own epoch's
 //!   digest (see [`super::blocks`]).
+//! - **BeaconBlocksByHead** (`fulu/p2p-interface.md` L796–863, #230): never invalid: a `count`
+//!   above `MAX_REQUEST_BLOCKS_DENEB` is served as 128 and books 128 tokens of its own bucket
+//!   (L820–821; Ezra's ruling of 2026-11-01). The service's responder is
+//!   [`super::blocks_head::ByHeadResponder`]: the ancestry of `beacon_root`, newest first, from
+//!   one cl-store walk (see [`super::blocks_head`]), whose store streams are capped overall
+//!   and per IP (`3: ResourceUnavailable` past either). With none (no block source) it is
+//!   [`NoBlocks`]: an empty success at the peer's token, since we hold nothing we can reach.
+//!   Either way the answer is streamed, as below.
+//!
 //!   With a [`Responder`] the answer is streamed ([`super::responder`]): the request is checked
-//!   first, as above, before the responder runs or anything is read or booked (never clamped);
+//!   first, as above, before the responder runs or anything is read or booked (a BlocksByRange
+//!   `count` is never clamped);
 //!   then the responder produces its chunks on its own task, started once the peer's first
 //!   booked token is due, as the stream's writer sends them (one asking for no block is not
 //!   served: its empty answer goes out at that token). The writer sends `2: ServerError` if no
@@ -247,6 +258,7 @@
 //! until then it holds one of the protocol's [`MAX_CONCURRENT_REQUESTS`] stream slots on its
 //! connection. Every passed deadline counts in `rpc_timeouts_total{kind}`.
 
+use super::blocks_head::NoBlocks;
 use super::codec::{
     Answer, Deadline, Deadlines, InboundCodec, ReadError, ReceivedChunk, RpcCodec, RpcRequest,
 };
@@ -742,6 +754,7 @@ pub struct Protocols<E: EthSpec> {
     pub blocks_by_range: Duplex<E>,
     pub data_columns_by_range: Duplex<E>,
     pub data_columns_by_root: Duplex<E>,
+    pub blocks_by_head: Duplex<E>,
 }
 
 impl<E: EthSpec> Protocols<E> {
@@ -766,15 +779,11 @@ impl<E: EthSpec> Protocols<E> {
             blocks_by_range: Duplex::new(Protocol::BlocksByRangeV2, &codec),
             data_columns_by_range: Duplex::new(Protocol::DataColumnsByRangeV1, &codec),
             data_columns_by_root: Duplex::new(Protocol::DataColumnsByRootV1, &codec),
+            blocks_by_head: Duplex::new(Protocol::BlocksByHeadV1, &codec),
         }
     }
 
     /// The behaviour of `protocol`.
-    ///
-    /// # Panics
-    ///
-    /// On `BeaconBlocksByHead`, which has no behaviour until it is served ([6.42]): [`Control`]
-    /// sends no request of it, and a peer's fails negotiation ([`super::unsupported`]).
     pub fn of(&mut self, protocol: Protocol) -> &mut Duplex<E> {
         match protocol {
             Protocol::StatusV2 => &mut self.status,
@@ -784,7 +793,7 @@ impl<E: EthSpec> Protocols<E> {
             Protocol::BlocksByRangeV2 => &mut self.blocks_by_range,
             Protocol::DataColumnsByRangeV1 => &mut self.data_columns_by_range,
             Protocol::DataColumnsByRootV1 => &mut self.data_columns_by_root,
-            Protocol::BlocksByHeadV1 => unreachable!("BeaconBlocksByHead is not registered"),
+            Protocol::BlocksByHeadV1 => &mut self.blocks_by_head,
         }
     }
 }
@@ -881,6 +890,8 @@ struct PeerState<E: EthSpec> {
     direction: Direction,
     /// The address block of its remote IP, for the per-IP column answer places.
     ip: Option<super::answer_bucket::AnswerBucket>,
+    /// Its remote IP, for the per-IP ByHead store streams ([`super::blocks_head`]).
+    remote_ip: Option<std::net::IpAddr>,
     /// The verdict on its last judged Status.
     status_valid: Option<bool>,
     /// Its last judged Status.
@@ -1029,6 +1040,9 @@ pub struct Control<E: EthSpec> {
     queue_timer: Option<Pin<Box<Sleep>>>,
     /// Serves BlocksByRange with streamed answers; `None` answers `3: ResourceUnavailable`.
     blocks_responder: Option<Arc<dyn Responder<E>>>,
+    /// Serves BlocksByHead with streamed answers: [`NoBlocks`]' empty success unless
+    /// [`Self::with_head_responder`] gave one.
+    head_responder: Arc<dyn Responder<E>>,
     /// The streamed answers' slots ([`RpcLimits::max_inbound_streams`]), over every peer.
     streams: Arc<Semaphore>,
 }
@@ -1137,6 +1151,7 @@ impl<E: EthSpec> Control<E> {
             column_queue: VecDeque::new(),
             queue_timer: None,
             blocks_responder: None,
+            head_responder: Arc::new(NoBlocks),
             streams,
         }
     }
@@ -1147,6 +1162,26 @@ impl<E: EthSpec> Control<E> {
     pub fn with_blocks_responder(mut self, responder: Arc<dyn Responder<E>>) -> Self {
         self.blocks_responder = Some(responder);
         self
+    }
+
+    /// The same behaviour, serving BlocksByHead with `responder`'s streamed answers (see the
+    /// module docs) instead of an empty success.
+    #[must_use]
+    pub fn with_head_responder(mut self, responder: Arc<dyn Responder<E>>) -> Self {
+        self.head_responder = responder;
+        self
+    }
+
+    /// Our answer to `peer`'s BlocksByHead `request` (see the module docs): the head
+    /// responder's streamed answer, or [`NoBlocks`]' empty one at the peer's token.
+    pub(super) fn head_answer(
+        &mut self,
+        peer: PeerId,
+        protocol: Protocol,
+        request: Request,
+    ) -> Option<Answer<E>> {
+        let responder = Arc::clone(&self.head_responder);
+        self.answer_streamed(peer, protocol, request, &responder)
     }
 
     /// What our Status answers hold now ([`StatusBacklog`]).
@@ -1727,6 +1762,8 @@ impl<E: EthSpec> Control<E> {
     ) -> Option<Answer<E>> {
         let invalid = match &request {
             Request::BlocksByRange(range) => out_of_bounds(range),
+            // Clamped, never invalid (`fulu/p2p-interface.md` L820–821; Ezra, 2026-11-01).
+            Request::BlocksByHead(_) => None,
             other => column_request_error(other),
         };
         if let Some(why) = invalid {
@@ -1734,7 +1771,8 @@ impl<E: EthSpec> Control<E> {
             let chunks = error_chunk(ResultCode::InvalidRequest, &why);
             return Some(self.paced(peer, protocol, chunks));
         }
-        let budget = self.peers.get(&peer)?.queued_bytes.clone();
+        let state = self.peers.get(&peer)?;
+        let (budget, ip) = (state.queued_bytes.clone(), state.remote_ip);
         let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
             self.metrics.inbound_stream_refused();
             tracing::debug!(%peer, %protocol, "inbound stream cap reached: 2: ServerError");
@@ -1752,9 +1790,15 @@ impl<E: EthSpec> Control<E> {
         .with_lookup_cost(1);
         let (contexts, ready) = (Arc::clone(&self.cfg.contexts), booked.ready_at());
         let responder = Arc::clone(responder);
-        let Some(stream) =
-            StreamedAnswer::start(responder, peer, request, contexts, budget, slot, ready)
-        else {
+        let Some(stream) = StreamedAnswer::start(
+            responder,
+            (peer, ip),
+            request,
+            contexts,
+            budget,
+            slot,
+            ready,
+        ) else {
             let chunks = error_chunk(ResultCode::ServerError, "no runtime");
             return Some(self.paced(peer, protocol, chunks));
         };
@@ -1875,9 +1919,10 @@ impl<E: EthSpec> Control<E> {
             request @ (Request::DataColumnsByRange(_) | Request::DataColumnsByRoot(_)) => {
                 self.serve_columns(peer, protocol, channel, request);
             }
-            // Unregistered until it is served ([6.42]), so never read: dropped unanswered.
-            Request::BlocksByHead(_) => {
-                tracing::debug!(%peer, "a BlocksByHead request: not served");
+            request @ Request::BlocksByHead(_) => {
+                if let Some(answer) = self.head_answer(peer, protocol, request) {
+                    self.send_answer(protocol, channel, answer);
+                }
             }
         }
     }
@@ -2483,6 +2528,7 @@ impl<E: EthSpec> Control<E> {
             ProtocolsEvent::BlocksByRange(e) => (Protocol::BlocksByRangeV2, e),
             ProtocolsEvent::DataColumnsByRange(e) => (Protocol::DataColumnsByRangeV1, e),
             ProtocolsEvent::DataColumnsByRoot(e) => (Protocol::DataColumnsByRootV1, e),
+            ProtocolsEvent::BlocksByHead(e) => (Protocol::BlocksByHeadV1, e),
         };
         match event {
             DuplexEvent::Inbound(Event::Message {
@@ -2631,6 +2677,7 @@ impl<E: EthSpec> NetworkBehaviour for Control<E> {
                             .limits
                             .column_answer_prefixes
                             .of(c.endpoint.get_remote_address()),
+                        remote_ip: super::answer_bucket::remote_ip(c.endpoint.get_remote_address()),
                         status_valid: None,
                         status: None,
                         metadata_seq: None,
@@ -2869,11 +2916,22 @@ mod tests {
         n: usize,
         up: bool,
     ) {
+        connection_from(control, peer, n, up, "/ip4/127.0.0.1/tcp/1");
+    }
+
+    /// [`connection`] from the remote address `from`.
+    fn connection_from(
+        control: &mut Control<consensus_types::Minimal>,
+        peer: PeerId,
+        n: usize,
+        up: bool,
+        from: &str,
+    ) {
         use libp2p::core::ConnectedPoint;
         use libp2p::swarm::behaviour::{ConnectionClosed, ConnectionEstablished};
         let endpoint = ConnectedPoint::Listener {
             local_addr: "/ip4/127.0.0.1/tcp/9000".parse().unwrap(),
-            send_back_addr: "/ip4/127.0.0.1/tcp/1".parse().unwrap(),
+            send_back_addr: from.parse().unwrap(),
         };
         let connection_id = ConnectionId::new_unchecked(n);
         if up {
@@ -5736,5 +5794,396 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- BeaconBlocksByHead dispatched (#230 part B2) ---
+
+    use super::super::blocks_head::MAX_BYHEAD_STORE_STREAMS_PER_IP;
+    use p2p_wire::rpc::messages::BlocksByHeadV1Request;
+
+    const HEAD: Protocol = Protocol::BlocksByHeadV1;
+
+    fn head(root: [u8; 32], count: u64) -> Request {
+        Request::BlocksByHead(BlocksByHeadV1Request {
+            beacon_root: root.into(),
+            count,
+        })
+    }
+
+    /// `control` dispatching BlocksByHead to the production ByHead responder over `fake`,
+    /// built from the range responder whose 16 lookup slots it shares (D5), and that range
+    /// responder.
+    fn heading(
+        control: Control<Spec>,
+        fake: &Fake,
+        metrics: &RpcMetrics,
+    ) -> (Control<Spec>, ByRangeResponder) {
+        let (_, range) = by_range(fake, Some(0), 16, metrics);
+        let responder: Arc<dyn Responder<Spec>> = Arc::new(range.head_responder());
+        (control.with_head_responder(responder), range)
+    }
+
+    /// When a chunk of `peer`'s `protocol` bucket charged now would be due (a look).
+    fn due_on(control: &Control<Spec>, peer: PeerId, protocol: Protocol) -> Instant {
+        let mut limiter = control.limiter.lock().unwrap();
+        let now = Instant::now();
+        let charge = limiter.charge(peer, protocol, now);
+        let due = charge.due();
+        limiter.refund(peer, protocol, charge, now);
+        due
+    }
+
+    /// Puts `peer`'s ByHead bucket `tokens` in debt: when its next token is due.
+    fn head_debt(control: &Control<Spec>, peer: PeerId, tokens: u64) -> Instant {
+        let now = Instant::now();
+        let _ = control
+            .limiter
+            .lock()
+            .unwrap()
+            .charge_block(peer, HEAD, tokens, now);
+        due_on(control, peer, HEAD)
+    }
+
+    /// The chunks a ByHead requester of `request` reads from `wire`, context bytes included.
+    async fn head_received(wire: &[u8], request: &Request) -> Vec<ReceivedChunk<Spec>> {
+        let contexts = Arc::new(testkit::context_table());
+        let mut codec = RpcCodec::<Spec>::new(contexts, Deadlines::default());
+        let valid = RpcRequest::Valid(request.clone());
+        let mut sent = futures::io::sink();
+        codec.write_request(&HEAD, &mut sent, valid).await.unwrap();
+        codec.read_response(&HEAD, &mut &wire[..]).await.unwrap()
+    }
+
+    /// Writes `answer` to a requester that takes every write at once: what it reads.
+    async fn write_head(
+        control: &Control<Spec>,
+        answer: Answer<Spec>,
+        request: &Request,
+    ) -> Vec<ReceivedChunk<Spec>> {
+        let mut reader = Reader::new(Duration::ZERO);
+        writer(control)
+            .write_response(&HEAD, &mut reader, answer)
+            .await
+            .unwrap();
+        head_received(&reader.bytes, request).await
+    }
+
+    /// `control`'s answer to `peer`'s BlocksByHead `request`, as dispatched: what the requester
+    /// reads.
+    async fn dispatch_head(
+        control: &mut Control<Spec>,
+        peer: PeerId,
+        request: Request,
+    ) -> Vec<ReceivedChunk<Spec>> {
+        let answer = control.head_answer(peer, HEAD, request.clone());
+        write_head(control, answer.expect("dispatched"), &request).await
+    }
+
+    /// The (slot, root) of each block of `chunks`.
+    fn walked(chunks: &[ReceivedChunk<Spec>]) -> Vec<(u64, [u8; 32])> {
+        blocks_of(chunks)
+            .iter()
+            .map(|b| (b.slot(), b.message_root().0))
+            .collect()
+    }
+
+    /// The (slot, root) of the canonical ancestry of the block at `from`: at most `n`, newest
+    /// first.
+    fn ancestry(from: u64, n: usize) -> Vec<(u64, [u8; 32])> {
+        fixture::chain()
+            .iter()
+            .rev()
+            .filter(|b| b.slot <= from)
+            .take(n)
+            .map(|b| (b.slot, b.root))
+            .collect()
+    }
+
+    /// #324 N1, #326 N3: BeaconBlocksByHead has a behaviour of its own, so `Protocols::of`
+    /// hands one out for every protocol, BlocksByHead included, and never panics.
+    #[test]
+    fn byhead_registered() {
+        let contexts = Arc::new(testkit::context_table());
+        let mut protocols = Protocols::<Spec>::new(contexts, Deadlines::default(), None);
+        for protocol in Protocol::ALL {
+            let _ = protocols.of(protocol);
+        }
+    }
+
+    /// #230 (Ezra, 2026-11-01): a BlocksByHead `count` over 128 is dispatched, never
+    /// `1: InvalidRequest`, and books 128 tokens of the peer's own ByHead bucket
+    /// (`rate.blocks_by_head`), never the raw count, and none of its BlocksByRange bucket;
+    /// `count` 0 is an empty success that reads and books nothing.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_books_the_clamped_count() {
+        let (control, metrics, peers) = serving(3, |l| {
+            l.rate.blocks_by_head = Quota::new(1, Duration::from_secs(1));
+        });
+        let fake = Fake::new();
+        let (mut control, _) = heading(control, &fake, &metrics);
+        let root = fixture::at(40).root;
+        for (peer, count) in [(peers[0], 129), (peers[1], u64::MAX)] {
+            let (start, range_due) = (Instant::now(), next_due(&control, peer));
+            let answer = control.head_answer(peer, HEAD, head(root, count));
+            assert!(answer.is_some(), "{count}: dispatched");
+            assert_eq!(
+                due_on(&control, peer, HEAD) - start,
+                Duration::from_secs(128),
+                "{count}: 128 tokens booked"
+            );
+            assert_eq!(
+                next_due(&control, peer),
+                range_due,
+                "{count}: its own bucket"
+            );
+        }
+        let due = due_on(&control, peers[2], HEAD);
+        let chunks = dispatch_head(&mut control, peers[2], head(root, 0)).await;
+        assert!(chunks.is_empty(), "count 0: an empty success, {chunks:?}");
+        assert_eq!(fake.calls(), [], "count 0: nothing read");
+        assert_eq!(
+            due_on(&control, peers[2], HEAD),
+            due,
+            "count 0: nothing booked"
+        );
+    }
+
+    /// #230 AC (Ezra, 2026-11-01): rate limiting never empties an answer. A ByHead bucket in
+    /// the most debt two open answers of 128 blocks leave (D6) delays the walk to the peer's
+    /// token, not past it: the store is not asked before then, and the first block goes out
+    /// whole at that token, before the 9.5 s end, with no error; the rest follow at the quota.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_rate_limited_first_block() {
+        let (control, metrics, peers) = serving(1, |_| {});
+        let peer = peers[0];
+        let fake = Fake::new();
+        let (mut control, _) = heading(control, &fake, &metrics);
+        let start = Instant::now();
+        let ready = head_debt(&control, peer, 2 * 128);
+        assert!(ready - start > Duration::from_secs(2), "in debt");
+        let request = head(fixture::at(40).root, 128);
+        let answer = control.head_answer(peer, HEAD, request.clone());
+        let mut reader = Reader::new(Duration::ZERO);
+        let written = Arc::clone(&reader.written);
+        let mut codec = writer(&control);
+        let write = tokio::spawn(async move {
+            let answer = answer.expect("dispatched");
+            codec
+                .write_response(&HEAD, &mut reader, answer)
+                .await
+                .unwrap();
+            reader.bytes
+        });
+        tokio::time::sleep_until(ready - Duration::from_millis(1)).await;
+        assert_eq!(fake.calls(), [], "no store read before the token");
+        assert_eq!(written.load(Ordering::SeqCst), 0);
+        tokio::time::sleep_until(ready + Duration::from_millis(1)).await;
+        assert!(
+            written.load(Ordering::SeqCst) >= 1,
+            "the first block at its token"
+        );
+        let wire = write.await.unwrap();
+        assert!(Instant::now() - start < Duration::from_millis(9_500));
+        let chunks = head_received(&wire, &request).await;
+        assert_eq!(walked(&chunks), ancestry(40, 36), "whole, no error");
+    }
+
+    /// #230 AC (Vera): a stream dropped while its answer waits for the peer's token frees the
+    /// task and the stream slot and reads nothing, and its tokens stay charged; an answer that
+    /// is not dropped walks at its token.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_cancel_during_token_wait() {
+        let (control, metrics, peers) = serving(1, |_| {});
+        let peer = peers[0];
+        let fake = Fake::new();
+        let (mut control, range) = heading(control, &fake, &metrics);
+        let root = fixture::at(40).root;
+        let ready = head_debt(&control, peer, 2 * 128);
+        let answer = control.head_answer(peer, HEAD, head(root, 4));
+        assert!(answer.is_some(), "dispatched");
+        let due = due_on(&control, peer, HEAD);
+        tokio::time::sleep_until(ready - Duration::from_millis(500)).await;
+        drop(answer);
+        closed(&fake).await;
+        assert_eq!(control.streams.available_permits(), 256, "the slot is back");
+        assert_eq!(due_on(&control, peer, HEAD), due, "the tokens stay charged");
+        tokio::time::sleep_until(ready + Duration::from_secs(1)).await;
+        assert_eq!(fake.calls(), [], "nothing read");
+        assert_eq!(range.free_lookups(), 16);
+        let chunks = dispatch_head(&mut control, peer, head(root, 4)).await;
+        assert_eq!(walked(&chunks), ancestry(40, 4));
+        assert_eq!(fake.calls(), [Call::ByHead(root, 4)]);
+    }
+
+    /// #230: past the global stream cap a ByHead request is one `2: ServerError` chunk: it
+    /// books nothing and reads nothing, while the answer holding the slot walks the store.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_over_cap_server_error() {
+        let (control, metrics, peers) = serving(2, |l| l.max_inbound_streams = 1);
+        let fake = Fake::new();
+        fake.script(Step::Item(Half::Store, 1), Act::Stall);
+        let (mut control, _) = heading(control, &fake, &metrics);
+        let root = fixture::at(40).root;
+        let first = control.head_answer(peers[0], HEAD, head(root, 4));
+        assert!(first.is_some(), "dispatched");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(fake.calls(), [Call::ByHead(root, 4)], "the first walks");
+        let due = due_on(&control, peers[1], HEAD);
+        let chunks = dispatch_head(&mut control, peers[1], head(root, 4)).await;
+        assert_eq!(only_error(&chunks), Some(ResultCode::ServerError));
+        assert_eq!(due_on(&control, peers[1], HEAD), due, "nothing booked");
+        assert_eq!(fake.calls(), [], "nothing read");
+        assert_eq!(metrics.inbound_streams_refused(), 1);
+        drop(first);
+    }
+
+    /// #230 B1 (Vera; Ezra's ruling): the peers of one IP hold at most
+    /// [`MAX_BYHEAD_STORE_STREAMS_PER_IP`] (4) ByHead store streams, the IP an IPv4 address (an
+    /// IPv4-mapped IPv6 one counted as it) or an IPv6 /58. Four peers on 203.0.113.7 with
+    /// stalled answers (128 blocks, none read) hold four; a fifth peer there, and one at
+    /// `::ffff:203.0.113.7`, get `3: ResourceUnavailable` before any chunk and never reach the
+    /// store, while a peer on 203.0.113.8 is served. The same for four peers spread over the
+    /// /58 `2001:db8:0:0::` to `2001:db8:0:3f::`, a fifth in it, and one on the next /58.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_store_streams_per_ip() {
+        const _: () = assert!(MAX_BYHEAD_STORE_STREAMS_PER_IP == 4);
+        let (control, metrics, _) = serving(0, |_| {});
+        let fake = Fake::new();
+        let (mut control, range) = heading(control, &fake, &metrics);
+        let root = fixture::at(40).root;
+        let mut connections = 0..;
+        let mut at = |control: &mut Control<Spec>, from: &str| {
+            let peer = PeerId::random();
+            let n = connections.next().unwrap();
+            connection_from(control, peer, n, true, &format!("{from}/tcp/{}", 1000 + n));
+            peer
+        };
+        let mut stalled = Vec::new();
+        for (crowd, refused, served) in [
+            (
+                ["/ip4/203.0.113.7"; 4],
+                ["/ip4/203.0.113.7", "/ip6/::ffff:203.0.113.7"],
+                "/ip4/203.0.113.8",
+            ),
+            (
+                [
+                    "/ip6/2001:db8::1",
+                    "/ip6/2001:db8::2",
+                    "/ip6/2001:db8:0:3f::1",
+                    "/ip6/2001:db8:0:3f:ffff::9",
+                ],
+                ["/ip6/2001:db8:0:10::7", "/ip6/2001:db8::1"],
+                "/ip6/2001:db8:0:40::1",
+            ),
+        ] {
+            for from in crowd {
+                let peer = at(&mut control, from);
+                let answer = control.head_answer(peer, HEAD, head(root, 128));
+                stalled.push(answer.expect("dispatched"));
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(fake.open(), stalled.len(), "{crowd:?}: a store stream each");
+            let _ = fake.calls();
+            for from in refused {
+                let peer = at(&mut control, from);
+                let chunks = dispatch_head(&mut control, peer, head(root, 4)).await;
+                let code = only_error(&chunks);
+                assert_eq!(code, Some(ResultCode::ResourceUnavailable), "{from}");
+                assert_eq!(fake.calls(), [], "{from}: never reached the store");
+            }
+            let peer = at(&mut control, served);
+            let chunks = dispatch_head(&mut control, peer, head(root, 4)).await;
+            assert_eq!(walked(&chunks), ancestry(40, 4), "{served}: served");
+            assert_eq!(fake.calls(), [Call::ByHead(root, 4)]);
+        }
+        assert_eq!(range.held_store_streams(), 8, "4 per IP");
+        assert_eq!(metrics.block_lookup_failures("store", "ip_streams"), 4);
+        drop(stalled);
+        closed(&fake).await;
+        assert_eq!(range.held_store_streams(), 0);
+    }
+
+    /// #230 D8: with no block source every ByHead request is an empty success at the peer's
+    /// token, never an error: we hold nothing we can reach.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_no_source_empty() {
+        let (mut control, _, peers) = serving(1, |l| {
+            l.rate.blocks_by_head = Quota::new(1, Duration::from_secs(1));
+        });
+        let peer = peers[0];
+        for count in [128, 0] {
+            let start = Instant::now();
+            let ready = head_debt(&control, peer, 4);
+            assert!(ready > start, "in debt");
+            let chunks = dispatch_head(&mut control, peer, head(fixture::at(40).root, count)).await;
+            assert!(chunks.is_empty(), "{count}: {chunks:?}");
+            assert_eq!(Instant::now(), ready, "{count}: at the peer's token");
+        }
+    }
+
+    /// #324 N2 (cl-p2p's side): a requester that stops reading holds its answer until
+    /// `request_response`'s own exchange timeout drops the stream, and that drop ends the walk:
+    /// the store stream is dropped (which cancels cl-store's call), and the lookup slot, the
+    /// stream slot and the peer's bytes are back.
+    #[tokio::test(start_paused = true)]
+    async fn byhead_resp_timeout_drops_the_store_stream() {
+        let (control, metrics, peers) = serving(1, |_| {});
+        let peer = peers[0];
+        let fake = Fake::new();
+        let (mut control, range) = heading(control, &fake, &metrics);
+        let budget = control.cfg.limits.max_queued_bytes_per_peer;
+        let answer = control.head_answer(peer, HEAD, head(fixture::at(40).root, 128));
+        let mut reader = Reader::new(Duration::ZERO).stopping_after(2, false);
+        let mut codec = writer(&control);
+        let write = codec.write_response(&HEAD, &mut reader, answer.expect("dispatched"));
+        let timed_out = tokio::time::timeout(REQUEST_TIMEOUT, write).await;
+        assert!(timed_out.is_err(), "the requester never read on");
+        closed(&fake).await;
+        assert_eq!(range.free_lookups(), 16);
+        assert_eq!(control.streams.available_permits(), 256);
+        assert_eq!(free_bytes(&control, peer), budget);
+    }
+
+    /// #230 through the whole stack (TCP, noise, yamux; real time): a peer's BlocksByHead
+    /// request negotiates and is answered by the production ByHead responder, a `count` over
+    /// 128 served as 128, each block with its epoch's digest.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn byhead_over_a_swarm() {
+        let fake = Fake::new();
+        let mut cfg = crate::testkit::control_config(Some(testkit::status()));
+        cfg.contexts = testing::serving_table(NetworkCaps::PRESET_BOUND);
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = RpcMetrics::register(&mut registry);
+        let control = Control::<Spec>::new(cfg, metrics.clone());
+        let (control, _) = heading(control, &fake, &metrics);
+        let transport = crate::transport::TransportMetrics::register(&mut registry);
+        let budget = crate::transport::MuxerBudget::with_defaults(&transport);
+        let mut swarm_cfg = crate::transport::SwarmConfig::new(budget);
+        swarm_cfg.listen_addrs = vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()];
+        let key = libp2p::identity::Keypair::generate_secp256k1();
+        let mut node = crate::transport::build_swarm(key, &swarm_cfg, control).unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = node.select_next_some().await {
+                break address;
+            }
+        };
+        let ours = *node.local_peer_id();
+        tokio::spawn(async move {
+            loop {
+                node.select_next_some().await;
+            }
+        });
+        let mut peer = raw_peer(HEAD, &addr).await;
+        let root = fixture::at(40).root;
+        for (count, n) in [(8, 8), (u64::MAX, 36)] {
+            let request = head(root, count);
+            let wire = exchange(&mut peer, ours, encode_request(&request).unwrap()).await;
+            let chunks = head_received(&wire, &request).await;
+            assert_eq!(walked(&chunks), ancestry(40, n), "{count}");
+        }
+        assert_eq!(
+            fake.calls(),
+            [Call::ByHead(root, 8), Call::ByHead(root, 128)]
+        );
     }
 }

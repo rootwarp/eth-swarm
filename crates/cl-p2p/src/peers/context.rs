@@ -18,7 +18,7 @@
 //!
 //! - **Rate limit**: the `over quota: chunk withheld` and `over quota: column chunk withheld`
 //!   events of [`crate::rpc::limits`], with the peer in `peer` and the protocol ID in
-//!   `protocol`. Only the seven protocol IDs the probe serves become entries.
+//!   `protocol`. Only the eight protocol IDs the probe serves become entries.
 //! - **PRUNE**: the pinned gossipsub's PRUNE event, `Handling PRUNE message for peer` (target
 //!   `libp2p_gossipsub::behaviour`), with the peer in `peer`.
 //!

@@ -16,9 +16,12 @@
 //! - `GetBlocksByHead` is a [`ParentWalk`]: `count` capped at [`MAX_BLOCKS`], stamped by its
 //!   first read (before the stream opens), then one block per read as the client reads, at
 //!   most one body ahead. cl-p2p reads it at its peer's pace for BeaconBlocksByHead (#230), so
-//!   the stream lives [`HEAD_WALK_TIMEOUT`] while each step's read transaction ends within the
-//!   call timeout of the step's start; a block more than [`crate::MAX_FINALIZED_DEPTH`] slots
-//!   below the finalized slot reads `finalized` false (not proven, unwalked).
+//!   the stream lives [`HEAD_WALK_TIMEOUT`] while each step's read transaction is checked
+//!   against the call timeout from the step's start (the first step's from the call's); a
+//!   block more than [`crate::MAX_FINALIZED_DEPTH`] slots below the finalized slot reads
+//!   `finalized` false (not proven, unwalked). Each frame waits for the client until the
+//!   stream's end at most, so a stalled client holds nothing past it, and at most
+//!   [`MAX_HEAD_STREAMS`] streams are open at once: a call past them is `UNAVAILABLE`, unread.
 //! - `GetChainHead` carries the stamp's head and its finalized block's slot (`finalized_slot`,
 //!   where cl-p2p splits a BeaconBlocksByRange answer between cl-store and cl-chain); the stamp
 //!   holds no checkpoint epoch, justified checkpoint, head state root or earliest slot, so those
@@ -45,7 +48,7 @@ use pb::{
     store_service_server::{StoreService, StoreServiceServer},
 };
 use prost::Message;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{service::Routes, Code, Request, Response, Status};
 
@@ -109,10 +112,16 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long a `GetBlocksByHead` stream may run \[est\]: 10 s, past the 9.5 s cl-p2p's
 /// BeaconBlocksByHead answer runs while it reads a block per peer token (#230). A step that
-/// would start later fails `DEADLINE_EXCEEDED`; each step's read transaction still ends within
-/// the call timeout of the step's start, so no transaction pins MVCC pages longer than a
-/// unary call's.
+/// would start later fails `DEADLINE_EXCEEDED`, and a frame the client has not taken by then
+/// ends the stream after the frames queued; each step's read transaction is still checked
+/// against the call timeout from the step's start (the first step's from the call's start), so
+/// no transaction pins MVCC pages much longer than a unary call's.
 pub const HEAD_WALK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `GetBlocksByHead` streams open at once \[est\]: 32, twice cl-p2p's block lookups. Each holds
+/// its walk and at most two blocks (one queued, one in hand) until it ends, by
+/// [`HEAD_WALK_TIMEOUT`] at the latest; a call past them is `UNAVAILABLE` before any read.
+pub const MAX_HEAD_STREAMS: usize = 32;
 
 /// The `StoreService`.
 #[derive(Clone)]
@@ -121,6 +130,10 @@ pub struct StoreServer {
     store: Arc<Recovering>,
     timeout: Duration,
     clock: Clock,
+    /// How long a `GetBlocksByHead` stream lives ([`HEAD_WALK_TIMEOUT`]).
+    walk: Duration,
+    /// The open `GetBlocksByHead` streams' places ([`MAX_HEAD_STREAMS`]).
+    head_streams: Arc<Semaphore>,
 }
 
 impl StoreServer {
@@ -138,6 +151,8 @@ impl StoreServer {
             store,
             timeout: DEFAULT_TIMEOUT,
             clock: system_clock(),
+            walk: HEAD_WALK_TIMEOUT,
+            head_streams: Arc::new(Semaphore::new(MAX_HEAD_STREAMS)),
         }
     }
 
@@ -151,6 +166,18 @@ impl StoreServer {
     #[cfg(test)]
     fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_walk_timeout(mut self, walk: Duration) -> Self {
+        self.walk = walk;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_head_streams(mut self, streams: usize) -> Self {
+        self.head_streams = Arc::new(Semaphore::new(streams));
         self
     }
 
@@ -251,6 +278,14 @@ fn read_meta(stamp: &Stamp, finalized: bool) -> pb::ReadMeta {
         execution_optimistic: false,
         finalized,
     }
+}
+
+/// Sends `frame` unless `until` passes first: whether it went.
+async fn send_by<T>(tx: &mpsc::Sender<T>, frame: T, until: tokio::time::Instant) -> bool {
+    matches!(
+        tokio::time::timeout_at(until, tx.send(frame)).await,
+        Ok(Ok(()))
+    )
 }
 
 /// The walk's next block, read on `spawn_blocking`.
@@ -370,17 +405,27 @@ impl StoreService for StoreServer {
         &self,
         request: Request<pb::GetBlocksByHeadRequest>,
     ) -> Result<Response<Self::GetBlocksByHeadStream>, Status> {
+        // The call's start: its first read's deadline, queue time in the blocking hops included.
+        let first = self.deadline();
         let req = request.into_inner();
         self.link
             .accept_hello_field(req.hello.as_ref())
             .map_err(|e| e.to_status())?;
         let root = root_of(&req.root)?;
         let count = req.count.min(MAX_BLOCKS);
-        let (store, timeout) = (Arc::clone(&self.store), self.timeout);
-        let deadline = Deadline::after(Arc::clone(&self.clock), HEAD_WALK_TIMEOUT.max(timeout));
+        // Held by the stream's task to its end; past the cap the call reads nothing.
+        let place = Arc::clone(&self.head_streams)
+            .try_acquire_owned()
+            .map_err(|_| status(ReadError::Unavailable))?;
+        let (store, timeout, lives) = (Arc::clone(&self.store), self.timeout, self.walk);
+        let lives = lives.max(timeout);
+        let until = tokio::time::Instant::now() + lives;
+        let deadline = Deadline::after(Arc::clone(&self.clock), lives);
         let walk = tokio::task::spawn_blocking(move || {
             store.reader().map(|reader| {
-                ParentWalk::new(reader, root, count, deadline).with_step_timeout(timeout)
+                ParentWalk::new(reader, root, count, deadline)
+                    .with_step_timeout(timeout)
+                    .with_first_deadline(first)
             })
         })
         .await
@@ -392,7 +437,10 @@ impl StoreService for StoreServer {
         let (tx, rx) = mpsc::channel(1);
         let server = self.clone();
         ipc::spawn_in_span(async move {
-            if tx.send(Ok(hello)).await.is_err() {
+            let _place = place;
+            // Each frame waits for the client until the stream's end at most: a stalled client
+            // gets the frames queued, then the end, and holds nothing past it.
+            if !send_by(&tx, Ok(hello), until).await {
                 return;
             }
             let mut seq = 0;
@@ -400,18 +448,14 @@ impl StoreService for StoreServer {
                 seq += 1;
                 let body = server.head_body(read, seq);
                 let failed = body.is_err();
-                if tx
-                    .send(body.map(pb::GetBlocksByHeadResponse::body))
-                    .await
-                    .is_err()
-                    || failed
-                {
+                let body = body.map(pb::GetBlocksByHeadResponse::body);
+                if !send_by(&tx, body, until).await || failed {
                     return;
                 }
                 match step(walk).await {
                     Ok((rest, after)) => (walk, next) = (rest, after),
                     Err(status) => {
-                        let _ = tx.send(Err(status)).await;
+                        send_by(&tx, Err(status), until).await;
                         return;
                     }
                 }
@@ -770,20 +814,119 @@ mod tests {
     /// the call's read txn is open (its first two reads are the call's start and the txn's
     /// open).
     fn late_after(reads: usize) -> Clock {
+        late_by(reads, Duration::from_secs(3600))
+    }
+
+    /// A clock that reads `t0` its first `reads` times, then `by` later.
+    fn late_by(reads: usize, by: Duration) -> Clock {
         let t0 = Instant::now();
         let calls = AtomicUsize::new(0);
         Arc::new(move || {
             if calls.fetch_add(1, Ordering::SeqCst) < reads {
                 t0
             } else {
-                t0 + Duration::from_secs(3600)
+                t0 + by
             }
         })
     }
 
+    /// #230 (Cole NIT 3 of part A): a `GetBlocksByHead` call's first read is checked against
+    /// the call's deadline from when the call came in, not from when its first step started.
+    /// On a clock that reads `t0` once (the call's start) and later from then on (time queued
+    /// in the blocking hops), a 1 s call 1.5 s late fails `DEADLINE_EXCEEDED` before its
+    /// stream opens; 0.5 s late it walks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocks_by_head_first_read_from_the_call() {
+        async fn walk(server: StoreServer, root: &[u8]) -> Result<usize, ErrorCode> {
+            let bodies = client(server)
+                .await
+                .get_blocks_by_head(by_head(root, 4))
+                .await;
+            bodies.map(|b| b.len()).map_err(|e| e.code())
+        }
+        let store = Store::new();
+        let blocks = chain(4);
+        let all: Vec<&[u8]> = blocks.iter().map(|b| b.ssz.as_slice()).collect();
+        store.import(&all, stamp_of(1, &blocks[3], &blocks[2]));
+        let late = |ms| {
+            server(&store)
+                .with_timeout(Duration::from_secs(1))
+                .with_clock(late_by(1, Duration::from_millis(ms)))
+        };
+        let head = blocks[3].root;
+        assert_eq!(
+            walk(late(1_500), &head).await,
+            Err(ErrorCode::DeadlineExceeded),
+            "queued past the call's 1 s"
+        );
+        assert_eq!(walk(late(500), &head).await, Ok(4), "within it");
+    }
+
+    /// #230 (Vera N2, Cole NIT 2 of part A): a client that stops reading a `GetBlocksByHead`
+    /// stream holds it no longer than the stream lives: each frame waits for the client until
+    /// then at most, and the stream ends there, after what was queued, freeing its walk, its
+    /// block and its place. The server holds a place per open stream, at most
+    /// `with_head_streams` (here 1): a call past them is `UNAVAILABLE` before any read; once the
+    /// stalled stream ended a call is served again, and a stream read to its end gives its
+    /// place back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocks_by_head_stalled_reader_released() {
+        use tokio_stream::StreamExt as _;
+        let store = Store::new();
+        let blocks = chain(8);
+        let all: Vec<&[u8]> = blocks.iter().map(|b| b.ssz.as_slice()).collect();
+        store.import(&all, stamp_of(1, &blocks[7], &blocks[0]));
+        let lives = Duration::from_millis(300);
+        let server = server(&store).with_walk_timeout(lives).with_head_streams(1);
+        let request = || {
+            Request::new(pb::GetBlocksByHeadRequest {
+                root: blocks[7].root.to_vec(),
+                count: 8,
+                hello: Some(fixture::v1_link().local()),
+            })
+        };
+        // A place: retried until the one place is free again, for at most 5 s.
+        let (server, request) = (&server, &request);
+        let placed = move || async move {
+            let start = Instant::now();
+            loop {
+                match server.get_blocks_by_head(request()).await {
+                    Ok(stream) => return stream.into_inner(),
+                    Err(status) => assert_eq!(status.code(), Code::Unavailable, "{status:?}"),
+                }
+                assert!(start.elapsed() < Duration::from_secs(5), "no place in 5 s");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+
+        let called = Instant::now();
+        // Never read: its one-frame queue holds the hello, and its first body waits.
+        let stalled = placed().await;
+        let refused = server.get_blocks_by_head(request()).await.err();
+        let refused = refused.expect("a call past the cap");
+        assert_eq!(refused.code(), Code::Unavailable, "{refused:?}");
+        let served = placed().await;
+        assert!(
+            called.elapsed() >= lives,
+            "the stalled stream lived out its time"
+        );
+        let frames: Vec<_> = stalled.collect().await;
+        assert_eq!(
+            frames.len(),
+            1,
+            "the hello it never read, then the end: {frames:?}"
+        );
+        assert!(frames[0].is_ok());
+
+        let frames: Vec<_> = served.collect().await;
+        assert_eq!(frames.len(), 9, "the hello and 8 bodies");
+        assert!(frames.iter().all(Result::is_ok));
+        drop(placed().await);
+    }
+
     /// A read txn held past the call's deadline fails the call `DEADLINE_EXCEEDED`, on every
     /// served RPC (`GetBlocksByHead`: its first step's txn, past the call timeout from the
-    /// step's start). The method ACL gives every method of the descriptor to cl-api, cl-sync and
+    /// call's start). The method ACL gives every method of the descriptor to cl-api, cl-sync and
     /// cl-p2p: each of them passes on every method, and any other caller, or one with no
     /// credentials, is refused `PERMISSION_DENIED` before the service sees the call.
     #[tokio::test(flavor = "multi_thread")]

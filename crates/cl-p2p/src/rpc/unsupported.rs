@@ -1,8 +1,8 @@
 //! The req/resp protocols the spec makes MUST-support that the probe does not register:
-//! `BeaconBlocksByHead` v1 (`fulu/p2p-interface.md` L796–863) and
 //! `ExecutionPayloadEnvelopesByRange` v1 and `ExecutionPayloadEnvelopesByRoot` v1
 //! (`gloas/p2p-interface.md` L1396, L1446). Written probe deviations (the README's
-//! §Deviations), closed by [6.42] and [6.19b].
+//! §Deviations), closed by [6.19b]. `BeaconBlocksByHead` v1 was one until [6.42] (#230)
+//! registered it ([`super::blocks_head`]).
 //!
 //! # Rejection
 //!
@@ -23,7 +23,7 @@
 //! layer the owner adds to its subscriber (`tracing_subscriber::registry().with(...)`, next to
 //! its formatting layer); without it the counter stays at 0. It enables that one debug event for
 //! itself only, so the other layers' levels are unchanged, and reads both fields into fixed
-//! buffers, so a peer's proposal costs no allocation and only the three [`Unsupported`] names
+//! buffers, so a peer's proposal costs no allocation and only the two [`Unsupported`] names
 //! ever become label values.
 //!
 //! `tracing` caches each callsite's interest process-wide: install the subscriber before the
@@ -51,8 +51,6 @@ const MAX_FIELD_LEN: usize = 96;
 /// A protocol the probe leaves unregistered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Unsupported {
-    /// `/eth2/beacon_chain/req/beacon_blocks_by_head/1/ssz_snappy` (Fulu).
-    BlocksByHeadV1,
     /// `/eth2/beacon_chain/req/execution_payload_envelopes_by_range/1/ssz_snappy` (Gloas).
     EnvelopesByRangeV1,
     /// `/eth2/beacon_chain/req/execution_payload_envelopes_by_root/1/ssz_snappy` (Gloas).
@@ -61,17 +59,12 @@ pub enum Unsupported {
 
 impl Unsupported {
     /// Every protocol the probe leaves unregistered.
-    pub const ALL: [Self; 3] = [
-        Self::BlocksByHeadV1,
-        Self::EnvelopesByRangeV1,
-        Self::EnvelopesByRootV1,
-    ];
+    pub const ALL: [Self; 2] = [Self::EnvelopesByRangeV1, Self::EnvelopesByRootV1];
 
     /// The multistream protocol ID.
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
-            Self::BlocksByHeadV1 => "/eth2/beacon_chain/req/beacon_blocks_by_head/1/ssz_snappy",
             Self::EnvelopesByRangeV1 => {
                 "/eth2/beacon_chain/req/execution_payload_envelopes_by_range/1/ssz_snappy"
             }
@@ -85,7 +78,6 @@ impl Unsupported {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::BlocksByHeadV1 => "beacon_blocks_by_head",
             Self::EnvelopesByRangeV1 => "execution_payload_envelopes_by_range",
             Self::EnvelopesByRootV1 => "execution_payload_envelopes_by_root",
         }
@@ -215,7 +207,7 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt as _;
 
     /// The counts after `emit` ran under a subscriber holding only [`layer`].
-    fn counted(emit: impl FnOnce()) -> [u64; 3] {
+    fn counted(emit: impl FnOnce()) -> [u64; 2] {
         let metrics = RpcMetrics::register(&mut Registry::default());
         let subscriber = tracing_subscriber::registry().with(layer(metrics.clone()));
         tracing::subscriber::with_default(subscriber, emit);
@@ -238,16 +230,16 @@ mod tests {
             // A plain `&str` field counts the same.
             tracing::debug!(
                 target: "multistream_select::listener_select",
-                protocol = Unsupported::BlocksByHeadV1.id(),
+                protocol = Unsupported::EnvelopesByRangeV1.id(),
                 "Listener: rejecting protocol"
             );
         });
-        assert_eq!(counts, [2, 2, 3]);
+        assert_eq!(counts, [2, 2]);
     }
 
     #[test]
     fn counts_nothing_else() {
-        let head = Unsupported::BlocksByHeadV1.id();
+        let head = Unsupported::EnvelopesByRangeV1.id();
         let longer = format!("{head}{}", "x".repeat(MAX_FIELD_LEN));
         let counts = counted(|| {
             // Confirmed, not refused.
@@ -256,9 +248,10 @@ mod tests {
                 protocol = %head,
                 "Listener: confirming protocol"
             );
-            // A refused id the probe does not name, and one it does serve.
+            // A refused id the probe does not name, and ones it does serve.
             for id in [
                 "/eth2/beacon_chain/req/beacon_blocks_by_head/2/ssz_snappy",
+                "/eth2/beacon_chain/req/beacon_blocks_by_head/1/ssz_snappy",
                 "/eth2/beacon_chain/req/status/2/ssz_snappy",
                 &longer,
             ] {
@@ -287,7 +280,7 @@ mod tests {
                 "!".repeat(MAX_FIELD_LEN)
             );
         });
-        assert_eq!(counts, [0, 0, 0]);
+        assert_eq!(counts, [0, 0]);
     }
 
     #[derive(Clone, Default)]

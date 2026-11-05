@@ -556,7 +556,7 @@ pub fn encode_response_chunks<E: EthSpec>(
 /// `InvalidInput` for anything the protocol does not allow.
 fn check_response<E: EthSpec>(protocol: Protocol, chunks: &[ReceivedChunk<E>]) -> io::Result<()> {
     let max = match protocol {
-        Protocol::BlocksByRangeV2 => usize::MAX,
+        Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 => usize::MAX,
         // No more than `compute_max_request_data_column_sidecars()` (`fulu/p2p-interface.md`
         // L667–670, L746–747).
         Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1 => {
@@ -1357,6 +1357,20 @@ mod tests {
                 .await
                 .unwrap_err();
         assert!(matches!(err, ReadError::TooManyChunks { max: 1 }), "{err}");
+    }
+
+    /// #230: a BeaconBlocksByHead answer is a list of blocks, as BlocksByRange's is: every
+    /// block the request's `count` allows, never cut to one chunk.
+    #[test]
+    fn blocks_by_head_answers_are_lists() {
+        let block = |slot| ReceivedChunk::<E> {
+            context: Some(testkit::FULU_DIGEST),
+            chunk: ResponseChunk::Success(Response::Block(Box::new(
+                forked::SignedBeaconBlock::Fulu(testkit::fulu_block(slot)),
+            ))),
+        };
+        let chunks = encode_response_chunks(Protocol::BlocksByHeadV1, &[block(2), block(1)]);
+        assert_eq!(chunks.map(|c| c.len()).ok(), Some(2));
     }
 
     #[tokio::test]

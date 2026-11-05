@@ -156,12 +156,15 @@ message GetChainHeadResponse {
 
 // A block and its ancestors, newest first: the block at `root`, then its parent, and so on, one
 // block per body. cl-p2p calls it for BeaconBlocksByHead v1 and reads it at its peer's pace. The
-// stream is stamped once, from the read transaction that finds `root`, which runs under the
-// call's deadline (2 s) before the stream opens; each further block is read in its own short
-// read transaction, ended 2 s after its step started, and the walk does not stop when the stamp
-// changes. The stream lives 10 s: a step that would start later fails DEADLINE_EXCEEDED after the
-// bodies already sent. It ends with OK after `count` blocks, at a parent that is not stored,
-// after slot 0, or with no body at all for an unknown `root`.
+// stream is stamped once, from the read transaction that finds `root`, which is checked against
+// the call's deadline (2 s from the call) before the stream opens; each further block is read in
+// its own short read transaction, checked against 2 s from its step's start, and the walk does
+// not stop when the stamp changes. The stream lives 10 s: a step that would start later fails
+// DEADLINE_EXCEEDED after the bodies already sent, and a frame the client has not taken by then
+// ends the stream with OK after the frames queued. It ends with OK after `count` blocks, at a
+// parent that is not stored, after slot 0, or with no body at all for an unknown `root`. At most
+// 32 streams are open at once: a call past them fails UNAVAILABLE
+// (ERROR_CODE_RESOURCE_UNAVAILABLE) before any read.
 message GetBlocksByHeadRequest {
   // 32 bytes. Block root (hash_tree_root of the BeaconBlock).
   bytes root = 1;

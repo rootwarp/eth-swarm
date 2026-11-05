@@ -54,7 +54,9 @@ use consensus_types::EthSpec;
 use futures::task::AtomicWaker;
 use libp2p::PeerId;
 use p2p_wire::rpc::codec::max_response_chunk_len;
-use p2p_wire::rpc::protocols::{Protocol, MAX_REQUEST_DATA_COLUMN_SIDECARS};
+use p2p_wire::rpc::protocols::{
+    Protocol, MAX_REQUEST_BLOCKS_DENEB, MAX_REQUEST_DATA_COLUMN_SIDECARS,
+};
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
@@ -100,7 +102,9 @@ impl Quota {
 /// periods: under 5 s, the requester's first-byte and per-chunk deadline (ours, and the common
 /// client default). A peer within the request limit is slowed down, never timed out. Two full
 /// `BeaconBlocksByRange` answers from an empty bucket take 256 periods, about 5 s, inside the
-/// 10 s an exchange may take. The column protocols count sidecars, and an answer holds no more
+/// 10 s an exchange may take; `BeaconBlocksByHead` has its own bucket with the same values, so
+/// an answer's first token is due within 256 periods (5.1 s), inside the 9.5 s it runs
+/// ([`RpcLimits::validate`]). The column protocols count sidecars, and an answer holds no more
 /// than its quota delivers in [`COLUMN_ANSWER_WINDOW`] ([`RpcLimits::column_answer_sidecars`]:
 /// 512 + 5 s / 5 ms = 1,512 by default), so a paced answer is never cut by the requester's
 /// deadline. `Goodbye` has no quota: its one response chunk ends the connection.
@@ -119,6 +123,8 @@ pub struct RateLimits {
     pub data_columns_by_range: Quota,
     /// `DataColumnSidecarsByRoot`, in sidecars: as by range.
     pub data_columns_by_root: Quota,
+    /// `BeaconBlocksByHead`, in blocks: as by range, in a bucket of its own (#230).
+    pub blocks_by_head: Quota,
 }
 
 impl Default for RateLimits {
@@ -130,6 +136,7 @@ impl Default for RateLimits {
             blocks_by_range: Quota::new(128, Duration::from_millis(20)),
             data_columns_by_range: Quota::new(512, Duration::from_millis(5)),
             data_columns_by_root: Quota::new(512, Duration::from_millis(5)),
+            blocks_by_head: Quota::new(128, Duration::from_millis(20)),
         }
     }
 }
@@ -146,8 +153,7 @@ impl RateLimits {
             Protocol::GoodbyeV1 => None,
             Protocol::DataColumnsByRangeV1 => Some(self.data_columns_by_range),
             Protocol::DataColumnsByRootV1 => Some(self.data_columns_by_root),
-            // Not served yet ([6.42]): BlocksByRange's values, in a bucket of its own.
-            Protocol::BlocksByHeadV1 => Some(self.blocks_by_range),
+            Protocol::BlocksByHeadV1 => Some(self.blocks_by_head),
         }
     }
 }
@@ -259,12 +265,18 @@ pub const DEFAULT_MAX_INBOUND_STREAMS: usize = 256;
 /// larger than it is queued alone.
 pub const DEFAULT_MAX_QUEUED_BYTES_PER_PEER: usize = 4 << 20;
 
-/// BlocksByRange answers that hold IPC calls (cl-store, cl-chain) at once \[est\]: 16. One past
-/// it waits for a slot for up to one IPC step ([`super::blocks::BLOCK_LOOKUP_TIMEOUT`]), then
-/// is answered `2: ServerError`. 16 is an estimate, not a measurement: tune it once the cost
-/// of a lookup under load is measured (each walks at most
-/// [`super::blocks::MAX_FINALIZED_DEPTH`] blocks above its range in cl-store).
+/// BlocksByRange and BlocksByHead answers that hold IPC calls (cl-store, cl-chain) at once, one
+/// pool for both \[est\]: 16. One past it waits for a slot for up to one IPC step
+/// ([`super::blocks::BLOCK_LOOKUP_TIMEOUT`]), then is answered `2: ServerError`. 16 is an
+/// estimate, not a measurement: tune it once the cost of a lookup under load is measured (a
+/// range walks at most [`super::blocks::MAX_FINALIZED_DEPTH`] blocks above it in cl-store; a
+/// parent walk reads its blocks and decides their finality flag in at most as many).
 pub const DEFAULT_MAX_BLOCK_LOOKUPS: usize = 16;
+
+/// How long a streamed answer runs before its stream's writer ends it cleanly: the requester's
+/// 10 s less [`super::inbound::STATUS_ANSWER_SLACK`].
+pub const BLOCK_ANSWER_END: Duration =
+    super::REQUEST_TIMEOUT.saturating_sub(super::inbound::STATUS_ANSWER_SLACK);
 
 /// How long an admitted column request waits for a place once its tokens are due \[est\]: 2 s,
 /// so that with a 2 s lookup its first byte goes out before the requester's 5 s deadline. Past
@@ -303,7 +315,8 @@ pub struct RpcLimits {
     /// Encoded bytes one peer's streamed answers hold queued
     /// ([`DEFAULT_MAX_QUEUED_BYTES_PER_PEER`]).
     pub max_queued_bytes_per_peer: usize,
-    /// BlocksByRange answers holding IPC calls at once ([`DEFAULT_MAX_BLOCK_LOOKUPS`]).
+    /// BlocksByRange and BlocksByHead answers holding IPC calls at once
+    /// ([`DEFAULT_MAX_BLOCK_LOOKUPS`]), one pool for both.
     pub max_block_lookups: usize,
 }
 
@@ -366,14 +379,29 @@ impl RpcLimits {
     /// the latest each token can come: a booking's first token is due before its answer takes a
     /// place, and the rest follow at most one per period after it. So with these limits a full
     /// first block is refused `3: ResourceUnavailable` at its hold only when its lookup or its
-    /// writer took time, never for an instant lookup.
+    /// writer took time, never for an instant lookup. The BlocksByHead quota delivers an
+    /// answer's first token before the answer ends ([`BLOCK_ANSWER_END`]), behind the
+    /// [`MAX_CONCURRENT_REQUESTS`] answers of 128 blocks a peer may have booked, so rate limiting
+    /// never ends a held root's answer with no block (#230).
     ///
     /// # Errors
     ///
+    /// [`RpcLimitsError::BlocksQuotaTooSlow`] for a BlocksByHead quota too slow for that, else
     /// [`RpcLimitsError::ColumnHoldTooLong`] if the answer window and the write deadline are too
     /// long to schedule, else [`RpcLimitsError::ColumnQuotaTooSlow`] for the first column quota
     /// that does not deliver that block in time.
     pub fn validate<E: EthSpec>(&self, network: &NetworkCaps) -> Result<(), RpcLimitsError> {
+        let quota = self.rate.blocks_by_head;
+        let booked = MAX_CONCURRENT_REQUESTS as u32 * MAX_REQUEST_BLOCKS_DENEB as u32;
+        let first_token = quota.period.saturating_mul(booked);
+        if first_token >= BLOCK_ANSWER_END {
+            return Err(RpcLimitsError::BlocksQuotaTooSlow {
+                field: "rate.blocks_by_head",
+                period: quota.period,
+                first_token,
+                end: BLOCK_ANSWER_END,
+            });
+        }
         let deadlines = self.column_deadlines();
         let hold = deadlines.answer_window.saturating_add(deadlines.write);
         let start = Instant::now();
@@ -468,6 +496,23 @@ pub enum RpcLimitsError {
         delivered_in: Duration,
         /// How long an answer holds its place: the window and the write deadline.
         hold: Duration,
+    },
+    /// A block quota under which an answer's first token can be due past the end of the
+    /// answer: a held root's answer would end with no block (#230).
+    #[error(
+        "{field}: one token per {period:?} leaves an answer's first token up to {first_token:?} \
+         away, past the {end:?} an answer runs"
+    )]
+    BlocksQuotaTooSlow {
+        /// The quota's field.
+        field: &'static str,
+        /// Its period.
+        period: Duration,
+        /// How long the first token may be away: [`MAX_CONCURRENT_REQUESTS`] answers of 128
+        /// blocks of periods.
+        first_token: Duration,
+        /// How long an answer runs ([`BLOCK_ANSWER_END`]).
+        end: Duration,
     },
     /// An answer window and write deadline too long to schedule an answer in.
     #[error("the column answer window and write deadline ({hold:?}) are too long to schedule")]
@@ -1807,6 +1852,56 @@ mod tests {
 
     fn validate(limits: &RpcLimits) -> Result<(), RpcLimitsError> {
         limits.validate::<consensus_types::Minimal>(&network())
+    }
+
+    /// #230 D6: BeaconBlocksByHead has its own bucket, `rate.blocks_by_head`, with
+    /// BlocksByRange's values (128 at once, then one per 20 ms) and its own outbound queue.
+    /// With at most `MAX_CONCURRENT_REQUESTS` answers open per peer, each booking at most 128
+    /// tokens, an answer's first token is due within that many full answers' periods:
+    /// 2 × 128 × 20 ms ≈ 5.1 s, inside the 9.5 s an answer runs, so rate limiting never ends
+    /// the answer of a held root with no block (Ezra, 2026-11-01). A quota too slow for that is
+    /// refused when the limits are loaded.
+    #[test]
+    fn blocks_by_head_quota_first_token_in_time() {
+        let limits = RpcLimits::default();
+        assert_eq!(limits.rate.blocks_by_head, limits.rate.blocks_by_range);
+        assert_eq!(
+            limits.rate.quota(Protocol::BlocksByHeadV1),
+            Some(Quota::new(128, Duration::from_millis(20)))
+        );
+        let own = Quota::new(3, Duration::from_millis(7));
+        let rate = RateLimits {
+            blocks_by_head: own,
+            ..RateLimits::default()
+        };
+        assert_eq!(
+            rate.quota(Protocol::BlocksByHeadV1),
+            Some(own),
+            "its own field"
+        );
+        assert_eq!(
+            rate.quota(Protocol::BlocksByRangeV2),
+            Some(rate.blocks_by_range)
+        );
+        assert_eq!(
+            outbound_queue_name(Protocol::BlocksByHeadV1),
+            "rpc_outbound_blocks_by_head"
+        );
+        let end = crate::rpc::REQUEST_TIMEOUT - crate::rpc::inbound::STATUS_ANSWER_SLACK;
+        let answers = MAX_CONCURRENT_REQUESTS as u32
+            * p2p_wire::rpc::protocols::MAX_REQUEST_BLOCKS_DENEB as u32;
+        let worst = limits.rate.blocks_by_head.period * answers;
+        assert!(worst < end, "{worst:?}");
+        assert_eq!(validate(&limits), Ok(()));
+        let slow = RpcLimits {
+            rate: RateLimits {
+                blocks_by_head: Quota::new(128, Duration::from_millis(40)),
+                ..RateLimits::default()
+            },
+            ..RpcLimits::default()
+        };
+        let err = validate(&slow).unwrap_err();
+        assert!(err.to_string().contains("rate.blocks_by_head"), "{err}");
     }
 
     /// The default limits with `quota` on both column protocols.

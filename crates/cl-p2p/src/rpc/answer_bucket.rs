@@ -75,20 +75,27 @@ impl AnswerPrefixes {
         }
     }
 
-    /// The bucket of the IP `remote` starts with (after an `/ip6zone`, which names an
-    /// interface), `None` if it starts with no IP.
+    /// The bucket of the IP `remote` starts with ([`remote_ip`]), `None` if it starts with no
+    /// IP.
     #[must_use]
     pub fn of(&self, remote: &Multiaddr) -> Option<AnswerBucket> {
-        let mut parts = remote.iter();
-        let first = match parts.next()? {
-            Protocol::Ip6zone(_) => parts.next()?,
-            other => other,
-        };
-        match first {
-            Protocol::Ip4(ip) => Some(self.bucket(IpAddr::V4(ip))),
-            Protocol::Ip6(ip) => Some(self.bucket(IpAddr::V6(ip))),
-            _ => None,
-        }
+        remote_ip(remote).map(|ip| self.bucket(ip))
+    }
+}
+
+/// The IP `remote` starts with (after an `/ip6zone`, which names an interface), `None` if it
+/// starts with no IP.
+#[must_use]
+pub fn remote_ip(remote: &Multiaddr) -> Option<IpAddr> {
+    let mut parts = remote.iter();
+    let first = match parts.next()? {
+        Protocol::Ip6zone(_) => parts.next()?,
+        other => other,
+    };
+    match first {
+        Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+        Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+        _ => None,
     }
 }
 

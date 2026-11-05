@@ -17,8 +17,9 @@
 //! it walks and once more before its data is returned, with the transaction open, so a slow read
 //! cannot pin MVCC pages past it. [`ParentWalk`] (`GetBlocksByHead`) is stamped once, by its
 //! first transaction, then reads each further block in a short transaction of its own: the
-//! walk's deadline bounds when a step may start, and each step's transaction ends within its
-//! step timeout of the step's start ([`ParentWalk::with_step_timeout`]).
+//! walk's deadline bounds when a step may start, and each step's transaction is checked against
+//! its step timeout from the step's start ([`ParentWalk::with_step_timeout`]), the first step's
+//! against the call's deadline if given ([`ParentWalk::with_first_deadline`]).
 //!
 //! A read transaction that fails to begin with `MDBX_WANNA_RECOVERY` or `MDBX_PANIC` is
 //! `Unavailable`, like any env that cannot be read now, and marks the reader broken: the env
@@ -384,8 +385,11 @@ impl Snapshot<'_> {
 pub struct ParentWalk {
     reader: Arc<Reader>,
     deadline: Deadline,
-    /// Each step's read transaction ends this long after the step started, if set.
+    /// Each step's read transaction is checked against this long after the step started, if
+    /// set.
     step: Option<Duration>,
+    /// The first step's deadline instead, if set: the call's.
+    first: Option<Deadline>,
     next: Option<Root>,
     left: u64,
     /// The first step's stamp.
@@ -402,6 +406,7 @@ impl ParentWalk {
             reader,
             deadline,
             step: None,
+            first: None,
             next: Some(root),
             left: count,
             stamp: None,
@@ -410,11 +415,20 @@ impl ParentWalk {
         }
     }
 
-    /// The same walk, each step's read transaction ended within `timeout` of the step's start,
-    /// however far off the walk's deadline is.
+    /// The same walk, each step's read transaction checked against `timeout` from the step's
+    /// start, however far off the walk's deadline is.
     #[must_use]
     pub fn with_step_timeout(mut self, timeout: Duration) -> Self {
         self.step = Some(timeout);
+        self
+    }
+
+    /// The same walk, its first step's read transaction checked against `first` (the call's
+    /// deadline, taken when the call came in) instead of a step timeout from the step's start:
+    /// time queued before the first step counts.
+    #[must_use]
+    pub fn with_first_deadline(mut self, first: Deadline) -> Self {
+        self.first = Some(first);
         self
     }
 
@@ -434,9 +448,10 @@ impl ParentWalk {
             };
             Ok(Some((slot, parent, ssz.into_owned(), finalized)))
         };
-        let deadline = match self.step {
-            Some(timeout) => self.deadline.within(timeout),
-            None => self.deadline.clone(),
+        let deadline = match (self.first.take(), self.step) {
+            (Some(first), _) => first,
+            (None, Some(timeout)) => self.deadline.within(timeout),
+            (None, None) => self.deadline.clone(),
         };
         let Stamped { stamp, value } = match self.stamp {
             None => self.reader.read(&deadline, read)?,
@@ -1249,6 +1264,53 @@ mod tests {
         };
         assert_eq!(walk(2), [Err(ReadError::DeadlineExceeded)]);
         assert_eq!(walk(3), [Ok(4), Ok(3), Ok(2), Ok(1)]);
+    }
+
+    /// #230 (Cole NIT 3 of part A): the first step's read transaction is checked against the
+    /// call's deadline, taken when the call came in, not the step timeout from the step's
+    /// start: time the call spent queued before its first step counts. A walk whose call came
+    /// in 2.5 s before its first step, under a 2 s call timeout, fails that step
+    /// `DeadlineExceeded`; without the call's deadline the step has its own 2 s and reads. The
+    /// steps after the first still get the step timeout from their own start.
+    #[test]
+    fn parent_walk_first_step_from_the_call() {
+        let store = Store::new();
+        let roots = linear(&store, 4);
+        let reader = Arc::new(store.reader());
+        let (t0, ms) = (Instant::now(), Arc::new(AtomicU64::new(0)));
+        let clock: Clock = {
+            let ms = Arc::clone(&ms);
+            Arc::new(move || t0 + Duration::from_millis(ms.load(Ordering::SeqCst)))
+        };
+        let walk = |from_the_call: bool| {
+            ms.store(0, Ordering::SeqCst);
+            let call = Deadline::after(Arc::clone(&clock), Duration::from_secs(2));
+            let deadline = Deadline::after(Arc::clone(&clock), Duration::from_secs(600));
+            let walk = ParentWalk::new(Arc::clone(&reader), roots[3], 4, deadline)
+                .with_step_timeout(Duration::from_secs(2));
+            let mut walk = if from_the_call {
+                walk.with_first_deadline(call)
+            } else {
+                walk
+            };
+            // Queued 2.5 s before the first step.
+            ms.store(2_500, Ordering::SeqCst);
+            let first = walk.next().map(|b| b.map(|b| b.value.slot));
+            // 3 s on: past the call's deadline, but each further step has its own 2 s.
+            ms.store(5_500, Ordering::SeqCst);
+            let rest: Vec<_> = walk.map(|b| b.map(|b| b.value.slot)).collect();
+            (first, rest)
+        };
+        assert_eq!(
+            walk(true),
+            (Some(Err(ReadError::DeadlineExceeded)), Vec::new()),
+            "the call's 2 s"
+        );
+        assert_eq!(
+            walk(false),
+            (Some(Ok(4)), vec![Ok(3), Ok(2), Ok(1)]),
+            "the step's own 2 s"
+        );
     }
 
     /// A block by slot is the canonical one of the snapshot's own stamp: the block on the
