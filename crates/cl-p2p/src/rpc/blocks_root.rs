@@ -34,21 +34,136 @@
 //! `rpc_block_lookup_failures_total{half, kind}`: the answer is what the other half found, or
 //! the first failure's code if neither found anything. Each IPC step runs under
 //! [`BLOCK_LOOKUP_TIMEOUT`], and the stream's writer cuts the answer at its deadlines.
+//!
+//! # The send budget
+//!
+//! A block read later can go out first (cl-store's are read after cl-chain's), so the answer
+//! holds its blocks until the last one is read. It holds at most the peer's send budget of
+//! them ([`ChunkSink::budget`], `RpcLimits::max_queued_bytes_per_peer`), each counted as the
+//! largest chunk it can go out as (`max_response_chunk_len`), and holds them as stored, raw
+//! SSZ: each is decoded once to check it as it is read and again as it goes out, never held
+//! decoded. A block is let go as its chunk is queued, which takes no more of the budget than
+//! it was counted at, so what an answer holds plus what it has queued stays within the budget,
+//! as a range answer's queued chunks do ([`super::responder`]).
+//!
+//! The answer is the request-order prefix of the blocks found that fits ("Clients MAY limit
+//! the number of blocks in the response"): a block that does not fit cuts the answer at its
+//! root, and so does one pushed out by a block read later for an earlier root; a full budget
+//! cuts it after its last block. Nothing from the cut on is served or read: each half's
+//! stream, in request order, is dropped at its first block past the cut, which cancels the
+//! call, and cl-store is asked, and asked again, only for roots before the cut. A block whose
+//! chunk alone is over the budget is held alone, as the sink queues it alone, so the first
+//! block found always goes out ("MUST respond with at least one block, if they have it"). A
+//! half that fails takes back the blocks it added, not the cut they made.
 
-use super::blocks::{decode, BlockSource, ByRoot, Failed, Half, Out, BLOCK_LOOKUP_TIMEOUT};
+use super::blocks::{
+    decode, BlockSource, Failed, Half, Out, RootItem, ServedBlock, BLOCK_LOOKUP_TIMEOUT,
+};
 use super::blocks_head::StoreStreams;
 use super::metrics::RpcMetrics;
 use super::responder::{ChunkSink, Responder, Serving};
-use consensus_types::{forked, EthSpec};
+use consensus_types::EthSpec;
+use futures::StreamExt as _;
 use libp2p::PeerId;
+use p2p_wire::rpc::codec::max_response_chunk_len;
 use p2p_wire::rpc::protocols::{Request, Response};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-/// The blocks found so far, by root.
-type Found<E> = HashMap<[u8; 32], forked::SignedBeaconBlock<E>>;
+/// The blocks an answer holds until they go out (see "The send budget"): as stored, by the
+/// place of their root in the request, those of the request-order prefix that fits `budget`.
+struct Held {
+    /// The roots asked for, each once, in request order.
+    wanted: Vec<[u8; 32]>,
+    blocks: BTreeMap<usize, ServedBlock>,
+    /// The chunk bytes the blocks held go out as, at most ([`cost`]).
+    bytes: usize,
+    budget: usize,
+    /// The place of the first root not served: its block, or one before it, did not fit.
+    cut: usize,
+}
+
+/// The most bytes `block` goes out as: one chunk, its context bytes and framing included.
+fn cost(block: &ServedBlock) -> usize {
+    max_response_chunk_len(block.ssz.len())
+}
+
+impl Held {
+    /// Nothing held yet of `wanted`, within `budget` chunk bytes.
+    fn new(wanted: Vec<[u8; 32]>, budget: usize) -> Self {
+        Self {
+            cut: wanted.len(),
+            wanted,
+            blocks: BTreeMap::new(),
+            bytes: 0,
+            budget,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    /// The place of `root` in the request.
+    fn place(&self, root: &[u8; 32]) -> Option<usize> {
+        self.wanted.iter().position(|r| r == root)
+    }
+
+    /// Whether `root` is asked for before the cut.
+    fn before_cut(&self, root: &[u8; 32]) -> bool {
+        self.place(root).is_some_and(|at| at < self.cut)
+    }
+
+    /// The roots before the cut with no block held, in request order.
+    fn misses(&self) -> Vec<[u8; 32]> {
+        (0..self.cut)
+            .filter(|at| !self.blocks.contains_key(at))
+            .map(|at| self.wanted[at])
+            .collect()
+    }
+
+    /// Holds `block` if its root is before the cut, then lets go of the blocks of the latest
+    /// roots, moving the cut to them, while the budget is over (a block alone is held whatever
+    /// its size); its place if it is still held.
+    fn hold(&mut self, block: ServedBlock) -> Option<usize> {
+        let at = self.place(&block.root).filter(|at| *at < self.cut)?;
+        self.bytes += cost(&block);
+        if let Some(old) = self.blocks.insert(at, block) {
+            self.bytes -= cost(&old);
+        }
+        while self.bytes > self.budget && self.blocks.len() > 1 {
+            let Some((last, out)) = self.blocks.pop_last() else {
+                break;
+            };
+            self.bytes -= cost(&out);
+            self.cut = last;
+        }
+        if self.bytes >= self.budget {
+            // No block after the last one held fits any more.
+            let after = self.blocks.last_key_value().map_or(0, |(last, _)| last + 1);
+            self.cut = self.cut.min(after);
+        }
+        self.blocks.contains_key(&at).then_some(at)
+    }
+
+    /// Lets go of the blocks held at `places`.
+    fn take_back(&mut self, places: &[usize]) {
+        for at in places {
+            if let Some(block) = self.blocks.remove(at) {
+                self.bytes -= cost(&block);
+            }
+        }
+    }
+
+    /// Lets go of the block of the first root held, and hands it over.
+    fn next(&mut self) -> Option<ServedBlock> {
+        let (_, block) = self.blocks.pop_first()?;
+        self.bytes -= cost(&block);
+        Some(block)
+    }
+}
 
 /// Serves BeaconBlocksByRoot v2 from a [`BlockSource`] (see the module docs).
 #[derive(Clone)]
@@ -86,47 +201,66 @@ impl ByRootResponder {
         failed
     }
 
-    /// `half`'s blocks of `roots` into `found`, all or none; the roots it holds unfinalized.
+    /// `half`'s blocks of `roots` into `held` while they fit, all or none: a failure takes back
+    /// what it added. Its stream is read a block at a time and dropped at the first block past
+    /// the cut (see "The send budget"). The roots before the cut it holds unfinalized.
     async fn ask<E: EthSpec>(
         &self,
         half: Half,
         roots: Vec<[u8; 32]>,
-        found: &mut Found<E>,
+        held: &mut Held,
     ) -> Result<Vec<[u8; 32]>, Failed> {
-        let answer = self.source.by_root(half, roots.clone()).await;
-        let ByRoot {
-            blocks,
-            unfinalized,
-        } = answer.map_err(|f| self.failed(half, f))?;
-        let mut new = Found::new();
-        for block in blocks {
-            let decoded = decode::<E>(&block).map_err(|f| self.failed(half, f))?.0;
-            if !roots.contains(&block.root) || new.insert(block.root, decoded).is_some() {
-                let why = "a block of a root not asked for, or twice";
-                return Err(self.failed(half, Failed::server_error("contract", why)));
+        let opened = self.source.by_root(half, roots.clone()).await;
+        let mut items = opened.map_err(|f| self.failed(half, f))?;
+        let (mut added, mut seen, mut unfinalized) = (Vec::new(), HashSet::new(), Vec::new());
+        let read = loop {
+            let block = match items.next().await {
+                None => break Ok(()),
+                Some(Err(failed)) => break Err(failed),
+                Some(Ok(RootItem::Unfinalized(root))) => {
+                    if roots.contains(&root) {
+                        unfinalized.push(root);
+                    }
+                    continue;
+                }
+                Some(Ok(RootItem::Block(block))) => block,
+            };
+            if let Err(failed) = decode::<E>(&block) {
+                break Err(failed);
             }
+            if !roots.contains(&block.root) || !seen.insert(block.root) {
+                let why = "a block of a root not asked for, or twice";
+                break Err(Failed::server_error("contract", why));
+            }
+            match held.hold(block) {
+                Some(at) => added.push(at),
+                // Past the cut: so is every block after it.
+                None => break Ok(()),
+            }
+        };
+        drop(items);
+        if let Err(failed) = read {
+            held.take_back(&added);
+            return Err(self.failed(half, failed));
         }
-        found.extend(new);
-        Ok(unfinalized
-            .into_iter()
-            .filter(|root| roots.contains(root))
-            .collect())
+        unfinalized.retain(|root| held.before_cut(root));
+        Ok(unfinalized)
     }
 
-    /// cl-store's blocks of `misses` into `found`, under a store-stream permit for a peer at
+    /// cl-store's blocks of `misses` into `held`, under a store-stream permit for a peer at
     /// `ip`: once more for the roots it holds unfinalized if `retry`.
     async fn ask_store<E: EthSpec>(
         &self,
         misses: Vec<[u8; 32]>,
         ip: Option<IpAddr>,
         retry: bool,
-        found: &mut Found<E>,
+        held: &mut Held,
     ) -> Result<(), Failed> {
         let _permit = self
             .streams
             .take(ip)
             .map_err(|f| self.failed(Half::Store, f))?;
-        let unfinalized = self.ask(Half::Store, misses, found).await?;
+        let unfinalized = self.ask::<E>(Half::Store, misses, held).await?;
         if !retry || unfinalized.is_empty() {
             return Ok(());
         }
@@ -134,7 +268,9 @@ impl ByRootResponder {
             roots = unfinalized.len(),
             "finality moved during a by-root answer: cl-store asked once more"
         );
-        self.ask(Half::Store, unfinalized, found).await.map(drop)
+        self.ask::<E>(Half::Store, unfinalized, held)
+            .await
+            .map(drop)
     }
 
     /// The answer to `roots` from a peer at `ip` into `out` (see the module docs).
@@ -154,28 +290,26 @@ impl ByRootResponder {
         let Ok(Ok(_slot)) = tokio::time::timeout(BLOCK_LOOKUP_TIMEOUT, slot).await else {
             return Err(Failed::server_error("busy", "no lookup slot in time"));
         };
-        let mut found = Found::new();
-        let chain = self.ask(Half::Chain, wanted.clone(), &mut found).await;
-        let misses: Vec<[u8; 32]> = wanted
-            .iter()
-            .filter(|root| !found.contains_key(*root))
-            .copied()
-            .collect();
+        let mut held = Held::new(wanted, out.sink.budget());
+        let chain = self
+            .ask::<E>(Half::Chain, held.wanted.clone(), &mut held)
+            .await;
+        let misses = held.misses();
         let mut failure = chain.as_ref().err().cloned();
         if !misses.is_empty() {
-            let store = self.ask_store(misses, ip, chain.is_ok(), &mut found);
+            let store = self.ask_store::<E>(misses, ip, chain.is_ok(), &mut held);
             failure = failure.or(store.await.err());
         }
-        if let Some(failed) = failure.filter(|_| found.is_empty()) {
+        if let Some(failed) = failure.filter(|_| held.is_empty()) {
             return Err(failed);
         }
-        for root in &wanted {
-            let Some(block) = found.remove(root) else {
-                continue;
-            };
+        while let Some(block) = held.next() {
+            // Checked as it was read: decoded again only as it goes out, one at a time.
+            let decoded = decode::<E>(&block)?.0;
+            drop(block);
             if out
                 .sink
-                .send(Response::Block(Box::new(block)))
+                .send(Response::Block(Box::new(decoded)))
                 .await
                 .is_err()
             {

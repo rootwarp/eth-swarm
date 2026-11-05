@@ -210,9 +210,12 @@ multistream-select negotiation, among them the MUST-support
   a duplicate once, each with its own epoch's digest; a root neither serves gets no chunk. A
   half that fails or breaks the contract adds nothing and is counted
   (`rpc_block_lookup_failures_total{half, kind}`); with nothing found the answer is that
-  failure's code. The answer holds a lookup slot to its end, as a range answer does, and
-  books one token per root named in its own bucket. Without the store socket every request
-  is an empty success.
+  failure's code. The answer holds the blocks it found, as stored, until the last one is read,
+  and never more than the peer's send budget of them (`max_queued_bytes_per_peer`, a block
+  over it alone): it is the request-order prefix of the blocks found that fits, and neither
+  half's stream is read past it. The answer holds a lookup slot to its end, as a range answer
+  does, and books one token per root named in its own bucket. Without the store socket every
+  request is an empty success.
 - **Rejects**: a request that breaks the wire format gets `1: InvalidRequest` (a Goodbye's
   too), and so does a
   `BeaconBlocksByRange` request with `step` 0 or a `count` above `MAX_REQUEST_BLOCKS_DENEB` (128;

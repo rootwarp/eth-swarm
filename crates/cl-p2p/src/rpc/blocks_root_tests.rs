@@ -1,21 +1,25 @@
 //! BeaconBlocksByRoot answers over the `blocks::testing` fixture: the chain-first split with
-//! its IPC calls, the retry when finality moved, half failures, deadlines and the store-stream
-//! pool.
+//! its IPC calls, the retry when finality moved, half failures, deadlines, the store-stream
+//! pool and the send budget.
 
+use super::{cost, Held};
 use crate::rpc::blocks::testing::{self as fixture, block, failed, Act, Fake, Step};
 use crate::rpc::blocks::{ByRangeResponder, Half, ServedBlock};
 use crate::rpc::blocks_head::MAX_BYHEAD_STORE_STREAMS;
 use crate::rpc::codec::{Answer, Deadlines, InboundCodec, ReceivedChunk, RpcCodec, RpcRequest};
 use crate::rpc::inbound::SharedStatus;
+use crate::rpc::limits::DEFAULT_MAX_QUEUED_BYTES_PER_PEER;
 use crate::rpc::metrics::RpcMetrics;
 use crate::rpc::responder::{testing, Responder, StreamedAnswer};
 use consensus_types::caps::NetworkCaps;
-use consensus_types::{ForkName, Minimal};
+use consensus_types::{forked, ForkName, Minimal};
 use libp2p::request_response::Codec as _;
+use p2p_wire::rpc::codec::max_response_chunk_len;
 use p2p_wire::rpc::messages::{BlocksByHeadV1Request, BlocksByRootV2Request, StatusV2};
 use p2p_wire::rpc::protocols::{Protocol, Request, Response, ResponseChunk, ResultCode};
 use p2p_wire::testkit::{self as wire, FULU_BPO_DIGEST, FULU_DIGEST, GLOAS_DIGEST};
 use prometheus_client::registry::Registry;
+use proptest::prelude::*;
 use ssz::Encode as _;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -72,13 +76,19 @@ async fn serve_from(
     request: Request,
 ) -> Vec<ReceivedChunk<E>> {
     let (stream, _, _) = testing::start_from(responder, ip, request.clone(), ROOMY);
+    read_back(stream, request).await.1
+}
+
+/// The answer `stream` to `request` as written, and as the requester reads it.
+async fn read_back(stream: StreamedAnswer, request: Request) -> (Vec<u8>, Vec<ReceivedChunk<E>>) {
     let wire = write(stream).await;
     let contexts = Arc::new(wire::context_table());
     let mut codec = RpcCodec::<E>::new(contexts, Deadlines::default());
     let mut sent = futures::io::sink();
     let valid = RpcRequest::Valid(request);
     codec.write_request(&ROOT, &mut sent, valid).await.unwrap();
-    codec.read_response(&ROOT, &mut &wire[..]).await.unwrap()
+    let chunks = codec.read_response(&ROOT, &mut &wire[..]).await.unwrap();
+    (wire, chunks)
 }
 
 async fn serve(responder: &Arc<dyn Responder<E>>, request: Request) -> Vec<ReceivedChunk<E>> {
@@ -346,4 +356,242 @@ fn byroot_cost_is_the_roots_named() {
     let (responder, _) = responders(&fake, &metrics());
     assert_eq!(responder.cost(&by_root(&[at(30), at(30), UNKNOWN])), 3);
     assert_eq!(responder.cost(&by_root(&[])), 0);
+}
+
+const MIB: usize = 1 << 20;
+/// The production send budget of one peer (`max_queued_bytes_per_peer`).
+const BUDGET: usize = DEFAULT_MAX_QUEUED_BYTES_PER_PEER;
+
+/// A Fulu block at `slot` carrying one transaction of `len` bytes, `salt` making it its own.
+fn big(slot: u64, salt: u8, len: usize) -> ServedBlock {
+    let mut b = wire::fulu_block::<E>(slot);
+    b.message.proposer_index = salt.into();
+    let tx = vec![salt; len].try_into().unwrap();
+    b.message
+        .body
+        .execution_payload
+        .transactions
+        .push(tx)
+        .unwrap();
+    let block = forked::SignedBeaconBlock::Fulu(b);
+    ServedBlock {
+        slot,
+        root: block.message_root().0,
+        fork: ForkName::Fulu,
+        ssz: block.as_ssz_bytes(),
+    }
+}
+
+/// The most bytes `block` goes out as, one chunk.
+fn chunk_bound(block: &ServedBlock) -> usize {
+    max_response_chunk_len(block.ssz.len())
+}
+
+/// The request-order prefix of `found` whose chunks fit `budget`, as roots.
+fn fitting(found: &[&ServedBlock], budget: usize) -> Vec<[u8; 32]> {
+    let mut bytes = 0;
+    found
+        .iter()
+        .take_while(|b| {
+            bytes += chunk_bound(b);
+            bytes <= budget
+        })
+        .map(|b| b.root)
+        .collect()
+}
+
+/// An answer holds its blocks until the last one is read, so it holds at most the peer's send
+/// budget of them (`max_queued_bytes_per_peer`, 4 MiB): it is the request-order prefix of the
+/// blocks found whose chunks fit, cl-chain's and cl-store's mixed, and neither half is read
+/// past it. Here 16 blocks of 1 to 2 MiB, about 24 MiB, come from both halves to a peer that
+/// reads nothing. cl-chain's stream is dropped at its third block, the first that does not
+/// fit; cl-store is asked only for the misses before it, and its first block, ahead in the
+/// request, pushes cl-chain's second out; its stream is dropped at its first block past that.
+/// Both streams are gone while the peer still reads nothing, what is queued is within the
+/// budget, and so is the whole answer on the wire. A block whose chunk alone is over the
+/// budget goes out alone, as the sink queues it alone: nothing after it is asked for.
+#[tokio::test(start_paused = true)]
+async fn byroot_answer_within_send_budget() {
+    let fake = Fake::new();
+    let (responder, range) = responders(&fake, &metrics());
+    let (mut store, mut chain, mut asked) = (Vec::new(), Vec::new(), Vec::new());
+    let store_sizes = [3 * MIB / 2, MIB, MIB, MIB, MIB, MIB, MIB, MIB];
+    let chain_sizes = [
+        MIB,
+        2 * MIB,
+        3 * MIB / 2,
+        2 * MIB,
+        MIB,
+        2 * MIB,
+        MIB,
+        2 * MIB,
+    ];
+    for (i, (s, c)) in (0u8..).zip(store_sizes.into_iter().zip(chain_sizes)) {
+        // Finalized (slot 10, at or below 20) from cl-store, above finality from cl-chain.
+        let (s, c) = (big(10, 2 * i + 1, s), big(25, 2 * i + 2, c));
+        fake.add_finalized(s.clone());
+        fake.add(c.clone());
+        asked.extend([s.root, c.root]);
+        if i == 0 {
+            asked.push(UNKNOWN);
+        }
+        store.push(s);
+        chain.push(c);
+    }
+    let found: Vec<&ServedBlock> = asked
+        .iter()
+        .filter_map(|r| store.iter().chain(&chain).find(|b| b.root == *r))
+        .collect();
+    let total: usize = found.iter().map(|b| b.ssz.len()).sum();
+    assert!(total > 5 * BUDGET, "{total} bytes in all");
+    let want = fitting(&found, BUDGET);
+    assert_eq!(want, [store[0].root, chain[0].root, store[1].root]);
+
+    let request = by_root(&asked);
+    let (answer, _, bytes) = testing::start_from(&responder, None, request.clone(), BUDGET);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    closed(&fake).await;
+    let queued = BUDGET - bytes.available();
+    assert!(queued > 0 && queued <= BUDGET, "{queued} bytes queued");
+    assert_eq!(
+        fake.root_reads(),
+        [
+            chain[0].root,
+            chain[1].root,
+            chain[2].root,
+            store[0].root,
+            store[1].root,
+            store[2].root
+        ],
+        "each half read up to its first block past the budget, while the peer reads nothing"
+    );
+    let misses = vec![store[0].root, UNKNOWN, store[1].root, store[2].root];
+    assert_eq!(
+        fake.root_calls(),
+        [(Half::Chain, asked.clone()), (Half::Store, misses)],
+        "cl-store asked for the misses before the cut only"
+    );
+    let (wire, chunks) = read_back(answer, request).await;
+    assert_eq!(roots_of(&chunks), want, "a request-order prefix");
+    let held: usize = want
+        .iter()
+        .map(|r| chunk_bound(found.iter().find(|b| b.root == *r).unwrap()))
+        .sum();
+    assert!(
+        wire.len() <= held && held <= BUDGET,
+        "{} on the wire",
+        wire.len()
+    );
+
+    let huge = big(26, 99, 5 * MIB);
+    fake.add(huge.clone());
+    assert!(chunk_bound(&huge) > BUDGET);
+    let asked = [huge.root, store[1].root, chain[0].root];
+    let request = by_root(&asked);
+    let (answer, _, _) = testing::start_from(&responder, None, request.clone(), BUDGET);
+    let (_, chunks) = read_back(answer, request).await;
+    assert_eq!(roots_of(&chunks), [huge.root], "alone");
+    assert_eq!(
+        fake.root_calls(),
+        [(Half::Chain, asked.to_vec())],
+        "nothing fits after it"
+    );
+    assert_eq!(fake.root_reads(), [huge.root, chain[0].root]);
+    closed(&fake).await;
+    assert_eq!(range.free_lookups(), LOOKUPS);
+    assert_eq!(range.held_store_streams(), 0);
+}
+
+/// A half that fails takes back the blocks it added, not the cut they made: cl-store's first
+/// block pushes cl-chain's second out, then its stream fails, so the answer is cl-chain's
+/// first block alone, and the failure is counted.
+#[tokio::test(start_paused = true)]
+async fn byroot_failed_half_keeps_the_cut() {
+    let metrics = metrics();
+    let fake = Fake::new();
+    let (responder, _) = responders(&fake, &metrics);
+    let (s0, s1) = (big(10, 1, 3 * MIB / 2), big(10, 3, MIB));
+    let (c0, c1) = (big(25, 2, MIB), big(25, 4, 2 * MIB));
+    for s in [&s0, &s1] {
+        fake.add_finalized(s.clone());
+    }
+    for c in [&c0, &c1] {
+        fake.add(c.clone());
+    }
+    let asked = [s0.root, c0.root, s1.root, c1.root];
+    fake.script(
+        Step::Item(Half::Store, 1),
+        Act::Fail(failed(ResultCode::ServerError, "timeout")),
+    );
+    let request = by_root(&asked);
+    let (answer, _, _) = testing::start_from(&responder, None, request.clone(), BUDGET);
+    let (_, chunks) = read_back(answer, request).await;
+    assert_eq!(roots_of(&chunks), [c0.root]);
+    assert_eq!(fake.root_reads(), [c0.root, c1.root, s0.root]);
+    assert_eq!(metrics.block_lookup_failures("store", "timeout"), 1);
+    closed(&fake).await;
+}
+
+/// The root of place `at` in [`held_cases`]'s requests.
+fn root_at(at: usize) -> [u8; 32] {
+    [u8::try_from(at).unwrap(); 32]
+}
+
+/// A request of up to 16 roots, the size of each found one's block (`None`: not found), the
+/// order the found ones are read in, and a budget.
+fn held_cases() -> impl Strategy<Value = (Vec<Option<usize>>, Vec<usize>, usize)> {
+    let found = prop::collection::vec(prop::option::of(0usize..6_000), 1..16);
+    found.prop_flat_map(|found| {
+        let places: Vec<usize> = (0..found.len()).filter(|at| found[*at].is_some()).collect();
+        (Just(found), Just(places).prop_shuffle(), 0usize..24_000)
+    })
+}
+
+proptest! {
+    /// Whatever order the blocks are read in, what an answer holds stays within the budget
+    /// (a block alone whatever its size), is every block read before the cut and nothing at
+    /// or after it, and once every block was read is the request-order prefix of the found
+    /// blocks that fits (or the first alone, if it alone is over).
+    #[test]
+    fn held_is_the_request_order_prefix_that_fits((found, order, budget) in held_cases()) {
+        let block = |at: usize| ServedBlock {
+            slot: 1,
+            root: root_at(at),
+            fork: ForkName::Fulu,
+            ssz: vec![0; found[at].unwrap()],
+        };
+        let mut held = Held::new((0..found.len()).map(root_at).collect(), budget);
+        let mut read = Vec::new();
+        for at in order {
+            let kept = held.hold(block(at));
+            read.push(at);
+            let places: Vec<usize> = held.blocks.keys().copied().collect();
+            let bytes: usize = held.blocks.values().map(cost).sum();
+            prop_assert_eq!(held.bytes, bytes);
+            prop_assert!(bytes <= budget || places.len() == 1, "{} over {}", bytes, budget);
+            let mut below: Vec<usize> = read.iter().copied().filter(|p| *p < held.cut).collect();
+            below.sort_unstable();
+            prop_assert_eq!(&places, &below, "the blocks read before the cut, cut {}", held.cut);
+            prop_assert_eq!(kept.is_some(), places.contains(&at));
+        }
+        let mut want = Vec::new();
+        let mut bytes = 0;
+        for (at, len) in found.iter().enumerate() {
+            let Some(len) = len else { continue };
+            bytes += max_response_chunk_len(*len);
+            if bytes > budget && !want.is_empty() {
+                break;
+            }
+            want.push(at);
+            if bytes >= budget {
+                break;
+            }
+        }
+        let places: Vec<usize> = held.blocks.keys().copied().collect();
+        prop_assert_eq!(places, want);
+        let misses = held.misses();
+        prop_assert!(misses.iter().all(|r| found[usize::from(r[0])].is_none()));
+        while held.next().is_some() {}
+        prop_assert_eq!(held.bytes, 0);
+    }
 }

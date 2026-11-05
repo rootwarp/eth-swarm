@@ -21,12 +21,13 @@
 //!   column request's).
 //! - **Bounds.** Each step (the call, the server's hello, each body) runs under
 //!   [`BLOCK_LOOKUP_TIMEOUT`]; past it the half fails `2` and its stream is dropped, which
-//!   cancels the call. Bodies are read one at a time as the answer goes out (a by-root half
-//!   is read whole, [`super::blocks_root`]). Messages are
-//!   capped at `MAX_PAYLOAD_SIZE` plus 64 KiB.
+//!   cancels the call. Bodies are read one at a time as the answer goes out; a by-root half's
+//!   only as far as the peer's send budget reaches, then its stream is dropped
+//!   ([`super::blocks_root`]). Messages are capped at `MAX_PAYLOAD_SIZE` plus 64 KiB.
 
 use super::blocks::{
-    BlockSource, Blocks, ByRoot, Failed, Half, Lookup, ServedBlock, BLOCK_LOOKUP_TIMEOUT,
+    BlockSource, Blocks, Failed, Half, Lookup, RootItem, RootItems, ServedBlock,
+    BLOCK_LOOKUP_TIMEOUT,
 };
 use super::store_status::store_result_code;
 use consensus_types::caps::MAX_PAYLOAD_SIZE;
@@ -40,6 +41,7 @@ use ipc::link::{Accepted, Guarded};
 use ipc::Link;
 use p2p_wire::rpc::protocols::ResultCode;
 use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 use tonic::transport::Channel;
 use tonic::Status;
@@ -142,7 +144,7 @@ impl BlockSource for IpcBlocks {
         })
     }
 
-    fn by_root(&self, half: Half, roots: Vec<[u8; 32]>) -> Lookup<ByRoot> {
+    fn by_root(&self, half: Half, roots: Vec<[u8; 32]>) -> Lookup<RootItems> {
         let (link, hello) = (self.link.clone(), Some(self.link.local()));
         let roots = roots.iter().map(|root| root.to_vec()).collect();
         let step = BLOCK_LOOKUP_TIMEOUT;
@@ -152,42 +154,40 @@ impl BlockSource for IpcBlocks {
             if half == Half::Store {
                 let request = store::GetBlocksByRootRequest { roots, hello };
                 let call = within(step, store.get_blocks_by_root(request)).await?;
-                return read_by_root(link, call.map_err(failed)?.into_inner(), step).await;
+                return Ok(read_by_root(link, call.map_err(failed)?.into_inner(), step));
             }
             let request = chain::BlocksByRootRequest { roots, hello };
             let call = within(step, chain.blocks_by_root(request)).await?;
             let blocks = read_blocks(link, call.map_err(failed)?.into_inner(), half, step);
-            let blocks: Vec<_> = blocks.collect().await;
-            Ok(ByRoot {
-                blocks: blocks.into_iter().collect::<Result<_, _>>()?,
-                unfinalized: Vec::new(),
-            })
+            Ok(Box::pin(blocks.map(|block| block.map(RootItem::Block))) as RootItems)
         })
     }
 }
 
-/// cl-store's `GetBlocksByRoot` answer `stream`, read to its end, each step within `step`: a
-/// body without its block or an error names a root cl-store holds unfinalized.
-async fn read_by_root<S>(link: Link, stream: S, step: Duration) -> Result<ByRoot, Failed>
+/// cl-store's `GetBlocksByRoot` answer `stream`, a body at a time, each step within `step`: a
+/// body without its block or an error names a root cl-store holds unfinalized. The first
+/// failure ends it, and drops the stream.
+fn read_by_root<S>(link: Link, stream: S, step: Duration) -> RootItems
 where
     S: Stream<Item = Result<store::GetBlocksByRootResponse, Status>> + Unpin + Send + 'static,
 {
-    let broken = |e: ipc::ContractError| contract(format!("store: {}", e.detail()));
-    let opened = within(step, link.open(Inbound::from_server(stream))).await?;
-    let mut guarded = opened.map_err(broken)?;
-    let mut answer = ByRoot::default();
-    while let Some(accepted) = within(step, guarded.body()).await?.map_err(broken)? {
-        let body = &accepted.body;
-        if body.block.is_some() || body.error.is_some() {
-            answer.blocks.push(served(&link, accepted)?);
-            continue;
-        }
-        check_read_meta(body.meta.as_ref())?;
-        let root = <[u8; 32]>::try_from(body.unfinalized_root.as_slice())
-            .map_err(|_| contract("a store body with neither a block nor a 32-byte root"))?;
-        answer.unfinalized.push(root);
+    read_items(link, stream, Half::Store, step, root_item)
+}
+
+/// One accepted body of cl-store's `GetBlocksByRoot` answer: its block, or the root it holds
+/// unfinalized.
+fn root_item(
+    link: &Link,
+    accepted: Accepted<store::GetBlocksByRootResponseBody>,
+) -> Result<RootItem, Failed> {
+    let body = &accepted.body;
+    if body.block.is_some() || body.error.is_some() {
+        return served(link, accepted).map(RootItem::Block);
     }
-    Ok(answer)
+    check_read_meta(body.meta.as_ref())?;
+    let root = <[u8; 32]>::try_from(body.unfinalized_root.as_slice())
+        .map_err(|_| contract("a store body with neither a block nor a 32-byte root"))?;
+    Ok(RootItem::Unfinalized(root))
 }
 
 /// `step` around one IPC step; past it the step fails `2` (`timeout`).
@@ -343,6 +343,24 @@ where
     T: InFrame + Send + 'static,
     T::Body: Envelopes + BlockBody + Send,
 {
+    read_items(link, stream, half, step, served)
+}
+
+/// What `item` makes of each body of `half`'s response `stream`, one at a time as it is read,
+/// each step within `step`. The first failure ends them, and drops the stream.
+fn read_items<S, T, I>(
+    link: Link,
+    stream: S,
+    half: Half,
+    step: Duration,
+    item: fn(&Link, Accepted<T::Body>) -> Result<I, Failed>,
+) -> Pin<Box<dyn Stream<Item = Result<I, Failed>> + Send>>
+where
+    S: Stream<Item = Result<T, Status>> + Unpin + Send + 'static,
+    T: InFrame + Send + 'static,
+    T::Body: Envelopes + Send,
+    I: Send + 'static,
+{
     let broken = move |e: ipc::ContractError| contract(format!("{}: {}", half.label(), e.detail()));
     let start = (Reading::Opening(Inbound::from_server(stream)), link);
     Box::pin(futures::stream::unfold(
@@ -358,7 +376,7 @@ where
                 Reading::Done => return None,
             };
             let next = match within(step, guarded.body()).await {
-                Ok(Ok(Some(accepted))) => served(&link, accepted),
+                Ok(Ok(Some(accepted))) => item(&link, accepted),
                 Ok(Ok(None)) => return None,
                 Ok(Err(e)) => Err(broken(e)),
                 Err(timeout) => Err(timeout),
@@ -756,22 +774,32 @@ mod tests {
         })
     }
 
+    /// What [`read_by_root`] makes of `frames`, to the end of the stream or its first failure.
+    async fn root_items(
+        link: &Link,
+        frames: Vec<store::GetBlocksByRootResponse>,
+        step: Duration,
+    ) -> Result<Vec<RootItem>, Failed> {
+        let stream = futures::stream::iter(frames.into_iter().map(Ok));
+        let items: Vec<_> = read_by_root(link.clone(), stream, step).collect().await;
+        items.into_iter().collect()
+    }
+
     /// cl-store's `GetBlocksByRoot` stream: a body's envelope is a finalized block, held to its
     /// slot's fork digest; a body with no block names a root held unfinalized; no body at all
     /// is nothing found. A body without its stamp, or with neither block nor a 32-byte root,
     /// breaks the contract (`2`); a body's error is refused with its code. cl-chain's
     /// `BlocksByRoot` chunks read as its range chunks do, and its error chunk maps the same.
-    /// A stream that stops between bodies fails the half `2` (`timeout`) at the step's end.
+    /// The store's stream is read a body at a time, never collected: a block is handed over
+    /// as it comes, and a stream that then stops fails the half `2` (`timeout`) at the step's
+    /// end, which drops it.
     #[tokio::test(start_paused = true)]
     async fn by_root_reads_both_halves() {
         use crate::rpc::blocks::testing::at;
         let link = link();
         let hello = || store::GetBlocksByRootResponse::hello(server_hello(&link));
         let step = Duration::from_secs(2);
-        let read = |frames: Vec<store::GetBlocksByRootResponse>| {
-            let stream = futures::stream::iter(frames.into_iter().map(Ok));
-            read_by_root(link.clone(), stream, step)
-        };
+        let read = |frames| root_items(&link, frames, step);
         let (b10, b30) = (at(10), at(30));
         let frames = vec![
             hello(),
@@ -780,11 +808,13 @@ mod tests {
         ];
         let answer = read(frames).await.unwrap();
         assert_eq!(
-            (answer.blocks, answer.unfinalized),
-            (vec![b10.clone()], vec![b30.root])
+            answer,
+            [
+                RootItem::Block(b10.clone()),
+                RootItem::Unfinalized(b30.root)
+            ]
         );
-        let answer = read(vec![hello()]).await.unwrap();
-        assert!(answer.blocks.is_empty() && answer.unfinalized.is_empty());
+        assert_eq!(read(vec![hello()]).await.unwrap(), []);
         for (case, body) in [
             (
                 "stampless block",
@@ -852,12 +882,17 @@ mod tests {
             dropped: Arc::clone(&dropped),
         };
         let start = tokio::time::Instant::now();
-        let failed = read_by_root(link.clone(), stream, step).await.unwrap_err();
+        let mut items = read_by_root(link.clone(), stream, step);
+        let first = items.next().await.unwrap();
+        assert_eq!(first, Ok(RootItem::Block(b10)), "handed over as it comes");
+        assert_eq!(tokio::time::Instant::now(), start);
+        let failed = items.next().await.unwrap().unwrap_err();
         assert_eq!(
             (failed.code, failed.kind),
             (ResultCode::ServerError, "timeout")
         );
         assert_eq!(tokio::time::Instant::now() - start, step);
+        assert!(items.next().await.is_none(), "the half ends with it");
         assert!(dropped.load(Ordering::SeqCst), "the call cancelled");
     }
 
