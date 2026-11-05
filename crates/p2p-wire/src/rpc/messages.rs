@@ -6,6 +6,7 @@
 //! - [`BlocksByRangeV2Request`]: `phase0/p2p-interface.md` "BeaconBlocksByRange v2" request.
 //! - [`BlocksByHeadV1Request`]: `fulu/p2p-interface.md` "BeaconBlocksByHead v1" request
 //!   (L796–863).
+//! - [`BlocksByRootV2Request`]: `BeaconBlockRoots` (`deneb/p2p-interface.md` L78–83).
 //! - [`DataColumnsByRangeV1Request`] and [`DataColumnsByRootV1Request`]:
 //!   `fulu/p2p-interface.md` "DataColumnSidecarsByRange v1" (L605–710) and
 //!   "DataColumnSidecarsByRoot v1" (L712–775), with `DataColumnIndices` (L74–83),
@@ -13,7 +14,7 @@
 //! - [`ErrorMessage`]: `phase0/p2p-interface.md` "Responding side", `List[byte, 256]`.
 //!
 //! Every type here is fixed-size except [`ErrorMessage`], whose bound is
-//! [`MAX_ERROR_MESSAGE_LEN`], and the two column requests, whose lists are bounded by
+//! [`MAX_ERROR_MESSAGE_LEN`], and the by-root and column requests, whose lists are bounded by
 //! `NUMBER_OF_COLUMNS` and `MAX_REQUEST_BLOCKS_DENEB`; [`crate::rpc::protocols`] holds the length
 //! bounds the codec checks before decoding.
 
@@ -95,6 +96,12 @@ pub struct BlocksByHeadV1Request {
     /// How many blocks, newest first; at most `MAX_REQUEST_BLOCKS_DENEB` are served (L820–821).
     pub count: u64,
 }
+
+/// The `BeaconBlocksByRoot` v2 request: `BeaconBlockRoots`,
+/// `List[Root, MAX_REQUEST_BLOCKS_DENEB]` (`deneb/p2p-interface.md` L78–83).
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[ssz(struct_behaviour = "transparent")]
+pub struct BlocksByRootV2Request(pub VariableList<Root, MaxRequestBlocksDeneb>);
 
 /// `NUMBER_OF_COLUMNS` (`fulu/das-core.md`): 128 in both presets, so the column lists here are
 /// preset-free (`consensus_types` checks the preset value against it).

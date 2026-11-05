@@ -47,7 +47,8 @@ chars.
 per protocol: an inbound-only and an outbound-only `request_response` behaviour, each at most 2
 open streams per connection, so the peer's two and our two never take each other's slots and
 a peer's third concurrent stream is reset. Those, plus `BeaconBlocksByRange` v2,
-`BeaconBlocksByHead` v1 and the column protocols `DataColumnSidecarsByRange` v1 and
+`BeaconBlocksByHead` v1, `BeaconBlocksByRoot` v2 and the column protocols
+`DataColumnSidecarsByRange` v1 and
 `DataColumnSidecarsByRoot` v1, are the only protocols offered: any other fails
 multistream-select negotiation, among them the MUST-support
 `ExecutionPayloadEnvelopesByRange`/`ByRoot` v1 (see
@@ -197,14 +198,32 @@ multistream-select negotiation, among them the MUST-support
   BlocksByRange's values, so a held root's first block goes out whole at its token, never
   later than 5.1 s in (`RpcLimits::validate`). Without the store socket every request is an
   empty success at the peer's token: we hold nothing we can reach.
+- **BeaconBlocksByRoot v2** (`rpc::blocks_root`; `phase0/p2p-interface.md` L1577–1626,
+  `gloas` L1376–1394): with the store socket, `ByRootResponder`
+  (`ByRangeResponder::root_responder`) over the same `IpcBlocks`. More than 128 roots is past
+  the request's SSZ bound: `1: InvalidRequest`. Each root is looked up once: one cl-chain
+  `BlocksByRoot` call for all of them (every block it stores above its finalized slot, on any
+  branch, orphans included), then one cl-store `GetBlocksByRoot` call for the rest (the
+  finalized chain), under a permit of the BlocksByHead store-stream pool. A root cl-store holds
+  above its own finalized slot that cl-chain did not serve means finality moved between the
+  two calls: cl-store is asked once more for those roots. The blocks go out in request order,
+  a duplicate once, each with its own epoch's digest; a root neither serves gets no chunk. A
+  half that fails or breaks the contract adds nothing and is counted
+  (`rpc_block_lookup_failures_total{half, kind}`); with nothing found the answer is that
+  failure's code. The answer holds the blocks it found, as stored, until the last one is read,
+  and never more than the peer's send budget of them (`max_queued_bytes_per_peer`, a block
+  over it alone): it is the request-order prefix of the blocks found that fits, and neither
+  half's stream is read past it. The answer holds a lookup slot to its end, as a range answer
+  does, and books one token per root named in its own bucket. Without the store socket every
+  request is an empty success.
 - **Rejects**: a request that breaks the wire format gets `1: InvalidRequest` (a Goodbye's
   too), and so does a
   `BeaconBlocksByRange` request with `step` 0 or a `count` above `MAX_REQUEST_BLOCKS_DENEB` (128;
   semantically invalid, `phase0` L1286, L1514, `deneb` L876; the connection stays). `3:
   ResourceUnavailable` goes out only where the protocol specifies it: `BeaconBlocksByRange`,
   answered so on every other request when no store socket is configured (the probe stores no
-  blocks), `BeaconBlocksByHead` (a `beacon_root` below the serve window), and the two column
-  protocols. A Status we cannot
+  blocks), `BeaconBlocksByHead` (a `beacon_root` below the serve window),
+  `BeaconBlocksByRoot` (no store stream free), and the two column protocols. A Status we cannot
   answer (no Status of ours yet) gets `2: ServerError`. Error chunks carry no context bytes.
 - **Deadlines** (in the codec, `tokio::time::timeout`, both directions): 5 s to the first
   byte, 5 s per chunk, 10 s in total. Those are this client's own policy \[est\], taken from
@@ -215,7 +234,8 @@ multistream-select negotiation, among them the MUST-support
 - **Rate limits** (`rpc::limits::RateLimiter`, `ControlConfig::limits`): a token bucket per
   peer and protocol, counted in response chunks \[est\]: Status 5 at once then one per 2 s,
   MetaData and Ping 2 then one per 2 s, BeaconBlocksByRange 128 then one per 20 ms,
-  BeaconBlocksByHead the same in its own bucket, each column protocol 512 sidecars then one per
+  BeaconBlocksByHead and BeaconBlocksByRoot the same, each in its own bucket, each column
+  protocol 512 sidecars then one per
   5 ms. A peer
   over its quota gets no error chunk and its stream stays open: the stream's writer
   (`rpc::codec::InboundCodec`) charges each chunk when it is next to go and withholds it until

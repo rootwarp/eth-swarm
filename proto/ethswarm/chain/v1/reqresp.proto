@@ -9,6 +9,8 @@ import "ethswarm/common/v1/error.proto";
 // cl-p2p opens no database: it reads finalized block ranges from cl-store
 // (ethswarm.store.v1 GetBlocksByRange) and everything above the store's finalized slot here.
 // BeaconBlocksByHead reads cl-store only (ethswarm.store.v1 GetBlocksByHead, a walk by root).
+// BeaconBlocksByRoot asks here first, then cl-store for the roots not served here
+// (ethswarm.store.v1 GetBlocksByRoot, finalized blocks).
 
 message ResponseChunk {
   oneof result {
@@ -67,7 +69,10 @@ message BlocksByRangeResponseBody {
   ResponseChunk item = 1;
 }
 
-// BeaconBlocksByRoot v2. Each root 32 bytes; <= MAX_REQUEST_BLOCKS_DENEB = 128 roots.
+// BeaconBlocksByRoot v2. Each root 32 bytes; <= MAX_REQUEST_BLOCKS_DENEB = 128 roots, else
+// ERROR_CODE_INVALID. The answer is every requested block stored above the stamp's finalized slot,
+// on any branch, in request order, each once; a root not stored, or stored at or below the
+// finalized slot, gets nothing. One envelope per block, as for BlocksByRange.
 message BlocksByRootRequest {
   // 32 bytes each (Root); at most MAX_REQUEST_BLOCKS_DENEB = 128 entries.
   repeated bytes roots = 1;

@@ -62,8 +62,9 @@ pub struct Sources {
     pub columns: Option<Arc<dyn ColumnSource>>,
     /// The blocks' source (cl-store and cl-chain, [`crate::rpc::blocks_ipc::IpcBlocks`]),
     /// served by a [`ByRangeResponder`] whose floor is [`Self::status`]'s and by its
-    /// [`ByRangeResponder::head_responder`]; `None` answers every BlocksByRange request
-    /// `3: ResourceUnavailable` and every BlocksByHead request an empty success.
+    /// [`ByRangeResponder::head_responder`] and [`ByRangeResponder::root_responder`]; `None`
+    /// answers every BlocksByRange request `3: ResourceUnavailable` and every BlocksByHead and
+    /// BlocksByRoot request an empty success.
     pub blocks: Option<Arc<dyn BlockSource>>,
 }
 
@@ -154,6 +155,7 @@ pub fn serving_swarm<E: EthSpec>(
             .with_window(window_start::<E>(config, genesis));
         control = control
             .with_head_responder(Arc::new(responder.head_responder()))
+            .with_root_responder(Arc::new(responder.root_responder()))
             .with_blocks_responder(Arc::new(responder));
     }
     match gossip {

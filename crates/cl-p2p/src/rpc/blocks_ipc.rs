@@ -1,7 +1,9 @@
 //! The production [`BlockSource`] (#146): [`IpcBlocks`], cl-store's `GetChainHead` (the split
 //! point, `finalized_slot`) and `GetBlocksByRange` (the finalized half), and cl-chain's
 //! `ReqRespService/BlocksByRange` (the rest); for BeaconBlocksByHead, cl-store's parent walk
-//! `GetBlocksByHead`, read as the store half (#230).
+//! `GetBlocksByHead`, read as the store half (#230); for BeaconBlocksByRoot, cl-chain's
+//! `BlocksByRoot` and cl-store's `GetBlocksByRoot`, whose bodies name a root it holds
+//! unfinalized in place of a block.
 //!
 //! - **Contract.** Every stream is read through the `ipc` contract layer ([`Link::open`] on
 //!   [`Inbound::from_server`]): the server's hello first, `seq` strictly from 1, and each
@@ -19,22 +21,27 @@
 //!   column request's).
 //! - **Bounds.** Each step (the call, the server's hello, each body) runs under
 //!   [`BLOCK_LOOKUP_TIMEOUT`]; past it the half fails `2` and its stream is dropped, which
-//!   cancels the call. Bodies are read one at a time as the answer goes out. Messages are
-//!   capped at `MAX_PAYLOAD_SIZE` plus 64 KiB.
+//!   cancels the call. Bodies are read one at a time as the answer goes out; a by-root half's
+//!   only as far as the peer's send budget reaches, then its stream is dropped
+//!   ([`super::blocks_root`]). Messages are capped at `MAX_PAYLOAD_SIZE` plus 64 KiB.
 
-use super::blocks::{BlockSource, Blocks, Failed, Half, Lookup, ServedBlock, BLOCK_LOOKUP_TIMEOUT};
+use super::blocks::{
+    BlockSource, Blocks, Failed, Half, Lookup, RootItem, RootItems, ServedBlock,
+    BLOCK_LOOKUP_TIMEOUT,
+};
 use super::store_status::store_result_code;
 use consensus_types::caps::MAX_PAYLOAD_SIZE;
 use ethswarm_proto::chain;
 use ethswarm_proto::common::{Envelope, ErrorCode, PayloadType};
 use ethswarm_proto::store;
-use futures::Stream;
+use futures::{Stream, StreamExt as _};
 use ipc::envelope::Envelopes;
 use ipc::frame::{InFrame, Inbound};
 use ipc::link::{Accepted, Guarded};
 use ipc::Link;
 use p2p_wire::rpc::protocols::ResultCode;
 use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 use tonic::transport::Channel;
 use tonic::Status;
@@ -136,6 +143,51 @@ impl BlockSource for IpcBlocks {
             Ok(read_blocks(link, stream.into_inner(), Half::Store, step))
         })
     }
+
+    fn by_root(&self, half: Half, roots: Vec<[u8; 32]>) -> Lookup<RootItems> {
+        let (link, hello) = (self.link.clone(), Some(self.link.local()));
+        let roots = roots.iter().map(|root| root.to_vec()).collect();
+        let step = BLOCK_LOOKUP_TIMEOUT;
+        let failed = move |status: Status| call_failed(half, &status);
+        let (mut chain, mut store) = (self.chain.clone(), self.store.clone());
+        Box::pin(async move {
+            if half == Half::Store {
+                let request = store::GetBlocksByRootRequest { roots, hello };
+                let call = within(step, store.get_blocks_by_root(request)).await?;
+                return Ok(read_by_root(link, call.map_err(failed)?.into_inner(), step));
+            }
+            let request = chain::BlocksByRootRequest { roots, hello };
+            let call = within(step, chain.blocks_by_root(request)).await?;
+            let blocks = read_blocks(link, call.map_err(failed)?.into_inner(), half, step);
+            Ok(Box::pin(blocks.map(|block| block.map(RootItem::Block))) as RootItems)
+        })
+    }
+}
+
+/// cl-store's `GetBlocksByRoot` answer `stream`, a body at a time, each step within `step`: a
+/// body without its block or an error names a root cl-store holds unfinalized. The first
+/// failure ends it, and drops the stream.
+fn read_by_root<S>(link: Link, stream: S, step: Duration) -> RootItems
+where
+    S: Stream<Item = Result<store::GetBlocksByRootResponse, Status>> + Unpin + Send + 'static,
+{
+    read_items(link, stream, Half::Store, step, root_item)
+}
+
+/// One accepted body of cl-store's `GetBlocksByRoot` answer: its block, or the root it holds
+/// unfinalized.
+fn root_item(
+    link: &Link,
+    accepted: Accepted<store::GetBlocksByRootResponseBody>,
+) -> Result<RootItem, Failed> {
+    let body = &accepted.body;
+    if body.block.is_some() || body.error.is_some() {
+        return served(link, accepted).map(RootItem::Block);
+    }
+    check_read_meta(body.meta.as_ref())?;
+    let root = <[u8; 32]>::try_from(body.unfinalized_root.as_slice())
+        .map_err(|_| contract("a store body with neither a block nor a 32-byte root"))?;
+    Ok(RootItem::Unfinalized(root))
 }
 
 /// `step` around one IPC step; past it the step fails `2` (`timeout`).
@@ -199,14 +251,36 @@ impl BlockBody for store::GetBlocksByHeadResponseBody {
     }
 }
 
+impl BlockBody for store::GetBlocksByRootResponseBody {
+    fn envelope(self) -> Result<Envelope, Failed> {
+        check_read_meta(self.meta.as_ref())?;
+        if let Some(e) = self.error {
+            return Err(refused(e.code, &e.detail));
+        }
+        self.block
+            .ok_or_else(|| contract("a store body without its block"))
+    }
+}
+
+impl BlockBody for chain::BlocksByRootResponseBody {
+    fn envelope(self) -> Result<Envelope, Failed> {
+        chain_envelope(self.item)
+    }
+}
+
 impl BlockBody for chain::BlocksByRangeResponseBody {
     fn envelope(self) -> Result<Envelope, Failed> {
-        match self.item.and_then(|item| item.result) {
-            Some(chain::response_chunk::Result::Chunk(envelope)) => Ok(envelope),
-            Some(chain::response_chunk::Result::Error(e)) => Err(refused(e.code, &e.detail)),
-            // `Envelopes::check_shape` refuses a chunk with neither.
-            None => Err(contract("an empty chunk")),
-        }
+        chain_envelope(self.item)
+    }
+}
+
+/// The envelope of cl-chain's chunk `item`, or the refusal it carries.
+fn chain_envelope(item: Option<chain::ResponseChunk>) -> Result<Envelope, Failed> {
+    match item.and_then(|item| item.result) {
+        Some(chain::response_chunk::Result::Chunk(envelope)) => Ok(envelope),
+        Some(chain::response_chunk::Result::Error(e)) => Err(refused(e.code, &e.detail)),
+        // `Envelopes::check_shape` refuses a chunk with neither.
+        None => Err(contract("an empty chunk")),
     }
 }
 
@@ -269,6 +343,24 @@ where
     T: InFrame + Send + 'static,
     T::Body: Envelopes + BlockBody + Send,
 {
+    read_items(link, stream, half, step, served)
+}
+
+/// What `item` makes of each body of `half`'s response `stream`, one at a time as it is read,
+/// each step within `step`. The first failure ends them, and drops the stream.
+fn read_items<S, T, I>(
+    link: Link,
+    stream: S,
+    half: Half,
+    step: Duration,
+    item: fn(&Link, Accepted<T::Body>) -> Result<I, Failed>,
+) -> Pin<Box<dyn Stream<Item = Result<I, Failed>> + Send>>
+where
+    S: Stream<Item = Result<T, Status>> + Unpin + Send + 'static,
+    T: InFrame + Send + 'static,
+    T::Body: Envelopes + Send,
+    I: Send + 'static,
+{
     let broken = move |e: ipc::ContractError| contract(format!("{}: {}", half.label(), e.detail()));
     let start = (Reading::Opening(Inbound::from_server(stream)), link);
     Box::pin(futures::stream::unfold(
@@ -284,7 +376,7 @@ where
                 Reading::Done => return None,
             };
             let next = match within(step, guarded.body()).await {
-                Ok(Ok(Some(accepted))) => served(&link, accepted),
+                Ok(Ok(Some(accepted))) => item(&link, accepted),
                 Ok(Ok(None)) => return None,
                 Ok(Err(e)) => Err(broken(e)),
                 Err(timeout) => Err(timeout),
@@ -305,7 +397,6 @@ mod tests {
     use crate::rpc::blocks::ServedBlock;
     use consensus_types::Minimal;
     use ethswarm_proto::common::{Envelope, Error, ErrorCode, Hello, PayloadType};
-    use futures::StreamExt as _;
     use ipc::envelope::DigestTable;
     use ipc::error::{to_status, wire_error};
     use ipc::frame::OutFrame;
@@ -668,6 +759,141 @@ mod tests {
         ] {
             assert_eq!(call_failed(Half::Store, &status).code, code, "{status:?}");
         }
+    }
+
+    fn root_body(
+        block: Option<Envelope>,
+        meta: Option<ReadMeta>,
+        unfinalized_root: Vec<u8>,
+    ) -> store::GetBlocksByRootResponse {
+        store::GetBlocksByRootResponse::body(store::GetBlocksByRootResponseBody {
+            block,
+            meta,
+            error: None,
+            unfinalized_root,
+        })
+    }
+
+    /// What [`read_by_root`] makes of `frames`, to the end of the stream or its first failure.
+    async fn root_items(
+        link: &Link,
+        frames: Vec<store::GetBlocksByRootResponse>,
+        step: Duration,
+    ) -> Result<Vec<RootItem>, Failed> {
+        let stream = futures::stream::iter(frames.into_iter().map(Ok));
+        let items: Vec<_> = read_by_root(link.clone(), stream, step).collect().await;
+        items.into_iter().collect()
+    }
+
+    /// cl-store's `GetBlocksByRoot` stream: a body's envelope is a finalized block, held to its
+    /// slot's fork digest; a body with no block names a root held unfinalized; no body at all
+    /// is nothing found. A body without its stamp, or with neither block nor a 32-byte root,
+    /// breaks the contract (`2`); a body's error is refused with its code. cl-chain's
+    /// `BlocksByRoot` chunks read as its range chunks do, and its error chunk maps the same.
+    /// The store's stream is read a body at a time, never collected: a block is handed over
+    /// as it comes, and a stream that then stops fails the half `2` (`timeout`) at the step's
+    /// end, which drops it.
+    #[tokio::test(start_paused = true)]
+    async fn by_root_reads_both_halves() {
+        use crate::rpc::blocks::testing::at;
+        let link = link();
+        let hello = || store::GetBlocksByRootResponse::hello(server_hello(&link));
+        let step = Duration::from_secs(2);
+        let read = |frames| root_items(&link, frames, step);
+        let (b10, b30) = (at(10), at(30));
+        let frames = vec![
+            hello(),
+            root_body(Some(envelope(&b10, 1)), meta(), Vec::new()),
+            root_body(None, meta(), b30.root.to_vec()),
+        ];
+        let answer = read(frames).await.unwrap();
+        assert_eq!(
+            answer,
+            [
+                RootItem::Block(b10.clone()),
+                RootItem::Unfinalized(b30.root)
+            ]
+        );
+        assert_eq!(read(vec![hello()]).await.unwrap(), []);
+        for (case, body) in [
+            (
+                "stampless block",
+                root_body(Some(envelope(&b10, 1)), None, Vec::new()),
+            ),
+            ("stampless root", root_body(None, None, b30.root.to_vec())),
+            ("neither", root_body(None, meta(), Vec::new())),
+            ("short root", root_body(None, meta(), vec![1; 31])),
+        ] {
+            let failed = read(vec![hello(), body]).await.unwrap_err();
+            assert_eq!(
+                (failed.code, failed.kind),
+                (ResultCode::ServerError, "contract"),
+                "{case}"
+            );
+        }
+        let refused = store::GetBlocksByRootResponse::body(store::GetBlocksByRootResponseBody {
+            meta: meta(),
+            error: Some(Error {
+                code: ErrorCode::ResourceUnavailable as i32,
+                detail: "from cl-store".into(),
+            }),
+            ..Default::default()
+        });
+        let failed = read(vec![hello(), refused]).await.unwrap_err();
+        assert_eq!(failed.code, ResultCode::ResourceUnavailable);
+
+        let chain_hello = || chain::BlocksByRootResponse::hello(server_hello(&link));
+        let chunk = |item| {
+            chain::BlocksByRootResponse::body(chain::BlocksByRootResponseBody {
+                item: Some(chain::ResponseChunk { result: Some(item) }),
+            })
+        };
+        let served = read_blocks(
+            link.clone(),
+            futures::stream::iter(
+                [
+                    chain_hello(),
+                    chunk(chain::response_chunk::Result::Chunk(envelope(&b30, 1))),
+                    chunk(chain::response_chunk::Result::Error(Error {
+                        code: ErrorCode::ResourceUnavailable as i32,
+                        detail: "refused".into(),
+                    })),
+                ]
+                .map(Ok),
+            ),
+            Half::Chain,
+            step,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(served[0], Ok(b30));
+        assert_eq!(
+            served[1].clone().unwrap_err().code,
+            ResultCode::ResourceUnavailable
+        );
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let stream = Stalling {
+            frames: vec![
+                hello(),
+                root_body(Some(envelope(&b10, 1)), meta(), Vec::new()),
+            ]
+            .into(),
+            dropped: Arc::clone(&dropped),
+        };
+        let start = tokio::time::Instant::now();
+        let mut items = read_by_root(link.clone(), stream, step);
+        let first = items.next().await.unwrap();
+        assert_eq!(first, Ok(RootItem::Block(b10)), "handed over as it comes");
+        assert_eq!(tokio::time::Instant::now(), start);
+        let failed = items.next().await.unwrap().unwrap_err();
+        assert_eq!(
+            (failed.code, failed.kind),
+            (ResultCode::ServerError, "timeout")
+        );
+        assert_eq!(tokio::time::Instant::now() - start, step);
+        assert!(items.next().await.is_none(), "the half ends with it");
+        assert!(dropped.load(Ordering::SeqCst), "the call cancelled");
     }
 
     /// A response stream that yields `frames`, then nothing for good; `dropped` once it is

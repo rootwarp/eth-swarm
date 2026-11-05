@@ -184,6 +184,14 @@ impl<E: EthSpec> ChunkSink<E> {
         }
     }
 
+    /// The peer's whole budget of queued bytes, shared by its streams
+    /// ([`super::limits::RpcLimits::max_queued_bytes_per_peer`]): a responder that holds
+    /// blocks before it sends them holds at most this much ([`super::blocks_root`]).
+    #[must_use]
+    pub fn budget(&self) -> usize {
+        self.budget.len
+    }
+
     /// Queues `response` as the next success chunk, once the queue and the peer's byte budget
     /// have room.
     ///

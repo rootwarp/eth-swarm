@@ -124,7 +124,7 @@ impl StoreStreams {
 
     /// A permit for the store stream of an answer to a peer at `ip` (`None`: not counted per
     /// IP), at once; `3: ResourceUnavailable` if the pool or `ip`'s share of it is full.
-    fn take(&self, ip: Option<IpAddr>) -> Result<StreamPermit, Failed> {
+    pub(super) fn take(&self, ip: Option<IpAddr>) -> Result<StreamPermit, Failed> {
         let bucket = ip.map(|ip| BYHEAD_IP_PREFIXES.bucket(ip));
         let mut held = self.lock();
         let of_ip = bucket.map_or(0, |b| held.per_ip.get(&b).copied().unwrap_or(0));
@@ -149,7 +149,7 @@ impl StoreStreams {
 }
 
 /// One store stream's permit ([`StoreStreams::take`]), given back on drop.
-struct StreamPermit {
+pub(super) struct StreamPermit {
     streams: StoreStreams,
     bucket: Option<AnswerBucket>,
 }

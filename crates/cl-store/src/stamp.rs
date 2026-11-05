@@ -46,6 +46,7 @@ stamped!(
     GetBlocksByRangeResponseBody,
     GetDataColumnsByRangeResponseBody,
     GetBlocksByHeadResponseBody,
+    GetBlocksByRootResponseBody,
 );
 
 /// The stamp of `response`, or the contract violation of a missing one.
@@ -153,6 +154,7 @@ store_items!(
     GetBlocksByRangeResponseBody => item,
     GetDataColumnsByRangeResponseBody => column,
     GetBlocksByHeadResponseBody => block,
+    GetBlocksByRootResponseBody => block,
 );
 
 impl StoreItem for pb::GetChainHeadResponse {
@@ -322,6 +324,16 @@ where
     ) -> Result<Vec<pb::GetBlocksByHeadResponseBody>, ContractError> {
         let request = self.with_hello(request);
         let r = self.inner.get_blocks_by_head(request).await;
+        self.stream(r).await
+    }
+
+    /// Every body of the stream; the request's hello is set from the link.
+    pub async fn get_blocks_by_root(
+        &mut self,
+        request: pb::GetBlocksByRootRequest,
+    ) -> Result<Vec<pb::GetBlocksByRootResponseBody>, ContractError> {
+        let request = self.with_hello(request);
+        let r = self.inner.get_blocks_by_root(request).await;
         self.stream(r).await
     }
 

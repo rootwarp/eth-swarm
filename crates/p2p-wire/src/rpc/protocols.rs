@@ -2,7 +2,8 @@
 //!
 //! Protocol IDs follow `phase0/p2p-interface.md` "Protocol identification":
 //! `/eth2/beacon_chain/req/<message_name>/<version>/<encoding>`, always `ssz_snappy`.
-//! `BeaconBlocksByRange` v2, `BeaconBlocksByHead` v1 and the two column protocols carry context
+//! `BeaconBlocksByRange` v2, `BeaconBlocksByHead` v1, `BeaconBlocksByRoot` v2 and the two column
+//! protocols carry context
 //! bytes (`altair/p2p-interface.md`; for a block or a column sidecar the digest of the epoch of
 //! its slot, `fulu/p2p-interface.md` L700–702, L766–768, L847–848); the other responses have
 //! one shape in every fork.
@@ -20,9 +21,9 @@
 //! ([`Protocol::response_bounds_with`]); the table row holds the preset bound.
 
 use crate::rpc::messages::{
-    BlocksByHeadV1Request, BlocksByRangeV2Request, DataColumnsByRangeV1Request,
-    DataColumnsByRootIdentifier, DataColumnsByRootV1Request, ErrorMessage, Goodbye, MetaDataV3,
-    Ping, StatusV2, MAX_ERROR_MESSAGE_LEN,
+    BlocksByHeadV1Request, BlocksByRangeV2Request, BlocksByRootV2Request,
+    DataColumnsByRangeV1Request, DataColumnsByRootIdentifier, DataColumnsByRootV1Request,
+    ErrorMessage, Goodbye, MetaDataV3, Ping, StatusV2, MAX_ERROR_MESSAGE_LEN,
 };
 use consensus_types::caps::{self, NetworkCaps, ObjectKind};
 use consensus_types::{forked, EthSpec, ForkName};
@@ -30,8 +31,8 @@ use ssz::Encode;
 use std::fmt;
 
 /// `MAX_REQUEST_BLOCKS_DENEB` (`deneb/p2p-interface.md` configuration): the most blocks a
-/// `BeaconBlocksByRange` or `BeaconBlocksByHead` response may hold. 128 in every known network
-/// config.
+/// block response may hold, and the most roots a `BeaconBlocksByRoot` request names. 128 in
+/// every known network config.
 pub const MAX_REQUEST_BLOCKS_DENEB: u64 = 128;
 
 /// `MAX_REQUEST_PAYLOADS` (`gloas/p2p-interface.md` L84): the most execution payload envelopes
@@ -69,6 +70,14 @@ const COLUMNS_BY_RANGE_REQUEST: SszBounds = SszBounds {
 const COLUMNS_BY_ROOT_REQUEST: SszBounds = SszBounds {
     min: 0,
     max: MAX_REQUEST_BLOCKS_DENEB as usize * (4 + 32 + 4 + 8 * NUMBER_OF_COLUMNS as usize),
+};
+
+/// The SSZ length of a `BeaconBlocksByRoot` v2 request: 32 bytes per root, at most
+/// `MAX_REQUEST_BLOCKS_DENEB` roots (`deneb/p2p-interface.md` L78–83). One more root is past the
+/// bound, refused at the length prefix (`1: InvalidRequest`).
+const BLOCKS_BY_ROOT_REQUEST: SszBounds = SszBounds {
+    min: 0,
+    max: MAX_REQUEST_BLOCKS_DENEB as usize * 32,
 };
 
 /// The shortest `SignedBeaconBlock` of either fork, as a lower bound: the fixed parts of
@@ -139,11 +148,13 @@ pub enum Protocol {
     DataColumnsByRootV1,
     /// `/eth2/beacon_chain/req/beacon_blocks_by_head/1/ssz_snappy` (Fulu).
     BlocksByHeadV1,
+    /// `/eth2/beacon_chain/req/beacon_blocks_by_root/2/ssz_snappy`.
+    BlocksByRootV2,
 }
 
 impl Protocol {
     /// Every protocol. New ones go at the end: fuzz seeds select a protocol by its index here.
-    pub const ALL: [Protocol; 8] = [
+    pub const ALL: [Protocol; 9] = [
         Protocol::StatusV2,
         Protocol::MetaDataV3,
         Protocol::PingV1,
@@ -152,6 +163,7 @@ impl Protocol {
         Protocol::DataColumnsByRangeV1,
         Protocol::DataColumnsByRootV1,
         Protocol::BlocksByHeadV1,
+        Protocol::BlocksByRootV2,
     ];
 
     /// The multistream protocol ID.
@@ -171,12 +183,16 @@ impl Protocol {
                 "/eth2/beacon_chain/req/data_column_sidecars_by_root/1/ssz_snappy"
             }
             Protocol::BlocksByHeadV1 => "/eth2/beacon_chain/req/beacon_blocks_by_head/1/ssz_snappy",
+            Protocol::BlocksByRootV2 => "/eth2/beacon_chain/req/beacon_blocks_by_root/2/ssz_snappy",
         }
     }
 
-    /// Whether this is one of the two block protocols, whose responses are blocks.
+    /// Whether this is one of the three block protocols, whose responses are blocks.
     pub const fn is_blocks(self) -> bool {
-        matches!(self, Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1)
+        matches!(
+            self,
+            Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 | Protocol::BlocksByRootV2
+        )
     }
 
     /// Whether this is one of the two data column protocols.
@@ -202,7 +218,8 @@ impl Protocol {
     /// Whether a responder may answer `3: ResourceUnavailable` (`phase0/p2p-interface.md` L1291:
     /// "only valid as a response where specified"): `BeaconBlocksByRange` (L1540, for blocks
     /// the responder does not have), `BeaconBlocksByHead` (`fulu/p2p-interface.md` L837–838, a
-    /// `beacon_root` older than the serve window), `DataColumnSidecarsByRange` (L654–656,
+    /// `beacon_root` older than the serve window), `BeaconBlocksByRoot` (`phase0` L1613–1615, a
+    /// root before the serve window), `DataColumnSidecarsByRange` (L654–656,
     /// outside `data_column_serve_range`) and `DataColumnSidecarsByRoot` (L754–756, before
     /// `minimum_request_epoch`).
     pub const fn permits_resource_unavailable(self) -> bool {
@@ -212,7 +229,7 @@ impl Protocol {
     /// This protocol's row of limits.
     pub fn limits<E: EthSpec>(self) -> ProtocolLimits {
         let (max_request_items, max_response_chunks) = match self {
-            Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 => {
+            Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 | Protocol::BlocksByRootV2 => {
                 (MAX_REQUEST_BLOCKS_DENEB, MAX_REQUEST_BLOCKS_DENEB)
             }
             Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1 => (
@@ -222,7 +239,7 @@ impl Protocol {
             _ => (0, 1),
         };
         let (ssz_min, ssz_max) = match self {
-            Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 => (
+            Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 | Protocol::BlocksByRootV2 => (
                 MIN_SIGNED_BEACON_BLOCK_LEN,
                 ForkName::ALL
                     .into_iter()
@@ -260,6 +277,7 @@ impl Protocol {
         match self {
             Protocol::DataColumnsByRangeV1 => Some(COLUMNS_BY_RANGE_REQUEST),
             Protocol::DataColumnsByRootV1 => Some(COLUMNS_BY_ROOT_REQUEST),
+            Protocol::BlocksByRootV2 => Some(BLOCKS_BY_ROOT_REQUEST),
             _ => self.request_len().map(SszBounds::exactly),
         }
     }
@@ -280,9 +298,10 @@ impl Protocol {
     ) -> Option<SszBounds> {
         let max = self.response_max_len_with::<E>(fork, network)?;
         let min = match (self, fork) {
-            (Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1, _) => {
-                MIN_SIGNED_BEACON_BLOCK_LEN
-            }
+            (
+                Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 | Protocol::BlocksByRootV2,
+                _,
+            ) => MIN_SIGNED_BEACON_BLOCK_LEN,
             (Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1, Some(fork)) => {
                 match fork {
                     ForkName::Fulu => MIN_FULU_DATA_COLUMN_SIDECAR_LEN,
@@ -296,7 +315,7 @@ impl Protocol {
 
     /// The SSZ length of a fixed-size request body, or `None` for a protocol whose request is
     /// empty (`MetaData`: nothing at all is written, not even a length prefix) or variable-size
-    /// (the column requests: [`Protocol::request_bounds`]).
+    /// (the by-root and column requests: [`Protocol::request_bounds`]).
     pub fn request_len(self) -> Option<usize> {
         match self {
             Protocol::StatusV2 => Some(<StatusV2 as ssz::Decode>::ssz_fixed_len()),
@@ -306,7 +325,9 @@ impl Protocol {
                 Some(<BlocksByRangeV2Request as ssz::Decode>::ssz_fixed_len())
             }
             Protocol::GoodbyeV1 => Some(<Goodbye as ssz::Decode>::ssz_fixed_len()),
-            Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1 => None,
+            Protocol::DataColumnsByRangeV1
+            | Protocol::DataColumnsByRootV1
+            | Protocol::BlocksByRootV2 => None,
             Protocol::BlocksByHeadV1 => {
                 Some(<BlocksByHeadV1Request as ssz::Decode>::ssz_fixed_len())
             }
@@ -331,7 +352,7 @@ impl Protocol {
             Protocol::StatusV2 => Some(<StatusV2 as ssz::Decode>::ssz_fixed_len()),
             Protocol::MetaDataV3 => Some(<MetaDataV3 as ssz::Decode>::ssz_fixed_len()),
             Protocol::PingV1 => Some(<Ping as ssz::Decode>::ssz_fixed_len()),
-            Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 => {
+            Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 | Protocol::BlocksByRootV2 => {
                 fork.and_then(|f| caps::max_size::<E>(ObjectKind::SignedBeaconBlock, f))
             }
             Protocol::GoodbyeV1 => Some(<Goodbye as ssz::Decode>::ssz_fixed_len()),
@@ -387,6 +408,8 @@ pub enum Request {
     DataColumnsByRoot(DataColumnsByRootV1Request),
     /// `BeaconBlocksByHead` v1.
     BlocksByHead(BlocksByHeadV1Request),
+    /// `BeaconBlocksByRoot` v2.
+    BlocksByRoot(BlocksByRootV2Request),
 }
 
 impl Request {
@@ -401,6 +424,7 @@ impl Request {
             Request::DataColumnsByRange(_) => Protocol::DataColumnsByRangeV1,
             Request::DataColumnsByRoot(_) => Protocol::DataColumnsByRootV1,
             Request::BlocksByHead(_) => Protocol::BlocksByHeadV1,
+            Request::BlocksByRoot(_) => Protocol::BlocksByRootV2,
         }
     }
 
@@ -408,12 +432,13 @@ impl Request {
     /// [`MAX_REQUEST_BLOCKS_DENEB`]) for `BeaconBlocksByRange` and `BeaconBlocksByHead` (whose
     /// larger `count` is served as that many, `fulu/p2p-interface.md` L820–821); the sidecars a
     /// column request names (`count × len(columns)`, L684–685; the sum of the identifiers'
-    /// columns, L728–730), at most [`MAX_REQUEST_DATA_COLUMN_SIDECARS`]; 1 for every other
-    /// protocol.
+    /// columns, L728–730), at most [`MAX_REQUEST_DATA_COLUMN_SIDECARS`]; the roots a
+    /// `BeaconBlocksByRoot` request names; 1 for every other protocol.
     pub fn max_response_chunks(&self) -> u64 {
         match self {
             Request::BlocksByRange(r) => r.count.min(MAX_REQUEST_BLOCKS_DENEB),
             Request::BlocksByHead(r) => r.count.min(MAX_REQUEST_BLOCKS_DENEB),
+            Request::BlocksByRoot(r) => r.0.len() as u64,
             Request::DataColumnsByRange(r) => {
                 r.requested_sidecars().min(MAX_REQUEST_DATA_COLUMN_SIDECARS)
             }
@@ -435,6 +460,7 @@ impl Request {
             Request::DataColumnsByRange(r) => Some(r.as_ssz_bytes()),
             Request::DataColumnsByRoot(r) => Some(r.as_ssz_bytes()),
             Request::BlocksByHead(r) => Some(r.as_ssz_bytes()),
+            Request::BlocksByRoot(r) => Some(r.as_ssz_bytes()),
         }
     }
 }
@@ -479,8 +505,7 @@ pub enum Response<E: EthSpec> {
     MetaData(MetaDataV3),
     /// `Ping`.
     Ping(Ping),
-    /// One block of a `BeaconBlocksByRange` or `BeaconBlocksByHead` response, in the fork its
-    /// context bytes named.
+    /// One block of a block protocol's response, in the fork its context bytes named.
     /// Boxed: a block is far larger than the other responses.
     Block(Box<forked::SignedBeaconBlock<E>>),
     /// `Goodbye`: the responder's reason.
@@ -579,6 +604,7 @@ mod tests {
                 "/eth2/beacon_chain/req/data_column_sidecars_by_range/1/ssz_snappy",
                 "/eth2/beacon_chain/req/data_column_sidecars_by_root/1/ssz_snappy",
                 "/eth2/beacon_chain/req/beacon_blocks_by_head/1/ssz_snappy",
+                "/eth2/beacon_chain/req/beacon_blocks_by_root/2/ssz_snappy",
             ]
         );
         assert_eq!(Protocol::PingV1.as_ref(), Protocol::PingV1.to_string());
@@ -591,6 +617,7 @@ mod tests {
                 p,
                 Protocol::BlocksByRangeV2
                     | Protocol::BlocksByHeadV1
+                    | Protocol::BlocksByRootV2
                     | Protocol::DataColumnsByRangeV1
                     | Protocol::DataColumnsByRootV1
             );
@@ -621,8 +648,12 @@ mod tests {
     #[test]
     fn only_blocks_and_columns_permit_resource_unavailable() {
         for p in Protocol::ALL {
-            let permits =
-                matches!(p, Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1) || p.is_columns();
+            let permits = p.is_blocks() || p.is_columns();
+            let blocks = matches!(
+                p,
+                Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1 | Protocol::BlocksByRootV2
+            );
+            assert_eq!(p.is_blocks(), blocks, "{p}");
             assert_eq!(p.permits_resource_unavailable(), permits, "{p}");
         }
     }
@@ -764,8 +795,7 @@ mod tests {
         let ssz = block.as_ssz_bytes();
         let block = Response::Block(Box::new(block));
         for p in Protocol::ALL {
-            let blocks = matches!(p, Protocol::BlocksByRangeV2 | Protocol::BlocksByHeadV1);
-            assert_eq!(block.answers(p), blocks, "{p}");
+            assert_eq!(block.answers(p), p.is_blocks(), "{p}");
         }
         assert_eq!(block.ssz_bytes(), ssz);
         let sidecar = forked::DataColumnSidecar::Gloas(testkit::gloas_sidecar::<Minimal>(3, 9));
@@ -802,12 +832,7 @@ mod tests {
             p.id(),
             "/eth2/beacon_chain/req/beacon_blocks_by_head/1/ssz_snappy"
         );
-        assert_eq!(
-            Protocol::ALL.last(),
-            Some(&p),
-            "new protocols go at the end"
-        );
-        assert_eq!(Protocol::ALL.len(), 8);
+        assert_eq!(Protocol::ALL[7], p, "new protocols go at the end");
         assert!(p.has_context_bytes());
         assert!(!p.single_response());
         assert!(p.permits_resource_unavailable());
@@ -840,6 +865,68 @@ mod tests {
         assert_eq!(request.protocol(), p);
         let body = request.ssz_body().unwrap();
         assert_eq!(body, [&[7; 32][..], &129u64.to_le_bytes()].concat());
+    }
+
+    /// BeaconBlocksByRoot v2 (`phase0/p2p-interface.md` L1577–1626, `deneb` L78–83, `gloas`
+    /// L1376–1394): last in `ALL`, context bytes per block, any number of chunks up to the
+    /// roots named, `3: ResourceUnavailable` permitted (L1613–1615), the block bounds of
+    /// BeaconBlocksByRange v2, and a request of at most `MAX_REQUEST_BLOCKS_DENEB` roots: one
+    /// more is past the SSZ bound.
+    #[test]
+    fn blocks_by_root_row() {
+        use crate::rpc::codec::{decode_request, encode_chunk};
+        use crate::rpc::messages::BlocksByRootV2Request;
+        use consensus_types::Mainnet;
+        let p = Protocol::BlocksByRootV2;
+        assert_eq!(
+            p.id(),
+            "/eth2/beacon_chain/req/beacon_blocks_by_root/2/ssz_snappy"
+        );
+        assert_eq!(
+            Protocol::ALL.last(),
+            Some(&p),
+            "new protocols go at the end"
+        );
+        assert_eq!(Protocol::ALL.len(), 9);
+        assert!(p.is_blocks() && p.has_context_bytes() && !p.single_response());
+        assert!(p.permits_resource_unavailable());
+        assert_eq!(p.request_len(), None);
+        assert_eq!(p.request_bounds(), Some(SszBounds { min: 0, max: 4096 }));
+        let range = Protocol::BlocksByRangeV2;
+        for fork in ForkName::ALL {
+            assert_eq!(
+                p.response_bounds::<Mainnet>(Some(fork)),
+                range.response_bounds::<Mainnet>(Some(fork)),
+                "{fork}"
+            );
+        }
+        let (row, by_range) = (p.limits::<Mainnet>(), range.limits::<Mainnet>());
+        assert_eq!(
+            (row.max_request_items, row.max_response_chunks),
+            (MAX_REQUEST_BLOCKS_DENEB, MAX_REQUEST_BLOCKS_DENEB)
+        );
+        assert_eq!(
+            (row.ssz_min, row.ssz_max),
+            (by_range.ssz_min, by_range.ssz_max)
+        );
+        let roots = |n: u8| {
+            let roots: Vec<_> = (0..n).map(|i| [i; 32].into()).collect();
+            Request::BlocksByRoot(BlocksByRootV2Request(roots.try_into().unwrap()))
+        };
+        for n in [0, 1, 128] {
+            let request = roots(n);
+            assert_eq!(request.protocol(), p);
+            assert_eq!(request.max_response_chunks(), u64::from(n));
+            let body = request.ssz_body().unwrap();
+            assert_eq!(body.len(), 32 * usize::from(n));
+            let wire = encode_chunk(&body).unwrap();
+            assert_eq!(decode_request(p, &wire).unwrap(), request, "{n}");
+        }
+        // 129 roots: past `BeaconBlockRoots`' limit, refused at the length prefix.
+        let over: Vec<u8> = (0..129u8).flat_map(|i| [i; 32]).collect();
+        assert!(decode_request(p, &encode_chunk(&over).unwrap()).is_err());
+        // Not a whole number of roots.
+        assert!(decode_request(p, &encode_chunk(&[7; 33]).unwrap()).is_err());
     }
 
     fn by_range(start_slot: u64, count: u64, columns: Vec<u64>) -> Request {

@@ -330,12 +330,12 @@ impl Snapshot<'_> {
     }
 
     /// The block at `root` ([`blocks::stored`]).
-    fn stored(&self, root: &Root) -> Result<Option<Stored<'_>>, ReadError> {
+    pub(crate) fn stored(&self, root: &Root) -> Result<Option<Stored<'_>>, ReadError> {
         Ok(blocks::stored(&self.txn, root)?)
     }
 
     /// One block or index row read: the deadline looked at every [`DEADLINE_EVERY`].
-    fn step(&self) -> Result<(), ReadError> {
+    pub(crate) fn step(&self) -> Result<(), ReadError> {
         let walked = self.walked.get() + 1;
         self.walked.set(walked);
         if walked.is_multiple_of(DEADLINE_EVERY) {
@@ -407,7 +407,12 @@ impl Snapshot<'_> {
     /// Whether the block `(slot, root)` is finalized by `stamp`: at or below its finalized
     /// slot and the index's block there, a point lookup. Below the index's floor, `false`: not
     /// proven, never a false `true`.
-    fn finalized(&self, stamp: &Stamp, slot: u64, root: Root) -> Result<bool, ReadError> {
+    pub(crate) fn finalized(
+        &self,
+        stamp: &Stamp,
+        slot: u64,
+        root: Root,
+    ) -> Result<bool, ReadError> {
         Ok(slot <= stamp.finalized_slot
             && self.indexed(slot)?
             && finalized::root_at(&self.txn, slot)? == Some(root))

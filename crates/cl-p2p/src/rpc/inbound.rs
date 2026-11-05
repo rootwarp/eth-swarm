@@ -2,12 +2,13 @@
 //! `BeaconBlocksByRange` v2, served by a [`Responder`] if one is given
 //! ([`Control::with_blocks_responder`]) and else answered `3: ResourceUnavailable` (the probe
 //! stores no blocks), `BeaconBlocksByHead` v1, served by a [`Responder`] if one is given
-//! ([`Control::with_head_responder`]) and else answered an empty success, and the custody
-//! columns served by `DataColumnSidecarsByRange` v1 and `DataColumnSidecarsByRoot` v1.
+//! ([`Control::with_head_responder`]) and else answered an empty success, `BeaconBlocksByRoot`
+//! v2 the same way ([`Control::with_root_responder`]), and the custody columns served by
+//! `DataColumnSidecarsByRange` v1 and `DataColumnSidecarsByRoot` v1.
 //!
 //! [`Control`] is the probe swarm's req/resp behaviour. It holds one [`Duplex`] per protocol
 //! ([`Protocols`], see [`crate::rpc`] for why one each): an inbound-only and an outbound-only
-//! `request_response` behaviour, so these eight are what multistream-select offers and any other
+//! `request_response` behaviour, so these nine are what multistream-select offers and any other
 //! protocol fails negotiation (`phase0/p2p-interface.md` L187–190), among them the MUST-support
 //! ones the probe leaves out ([`super::unsupported`]). It answers every inbound
 //! request itself and reports what it learned as [`ControlEvent`]s.
@@ -63,6 +64,12 @@
 //!   and per IP (`3: ResourceUnavailable` past either). With none (no block source) it is
 //!   [`NoBlocks`]: an empty success at the peer's token, since we hold nothing we can reach.
 //!   Either way the answer is streamed, as below.
+//! - **BeaconBlocksByRoot** (`phase0/p2p-interface.md` L1577–1626): more than
+//!   `MAX_REQUEST_BLOCKS_DENEB` roots is past the request's SSZ bound, `1: InvalidRequest` at
+//!   the codec. The service's responder is [`super::blocks_root::ByRootResponder`]: cl-chain's
+//!   unfinalized blocks, then cl-store's finalized ones, in request order, each root once,
+//!   from a bucket of its own; with none it is [`NoBlocks`], an empty success. Streamed as
+//!   below.
 //!
 //!   With a [`Responder`] the answer is streamed ([`super::responder`]): the request is checked
 //!   first, as above, before the responder runs or anything is read or booked (a BlocksByRange
@@ -755,6 +762,7 @@ pub struct Protocols<E: EthSpec> {
     pub data_columns_by_range: Duplex<E>,
     pub data_columns_by_root: Duplex<E>,
     pub blocks_by_head: Duplex<E>,
+    pub blocks_by_root: Duplex<E>,
 }
 
 impl<E: EthSpec> Protocols<E> {
@@ -780,6 +788,7 @@ impl<E: EthSpec> Protocols<E> {
             data_columns_by_range: Duplex::new(Protocol::DataColumnsByRangeV1, &codec),
             data_columns_by_root: Duplex::new(Protocol::DataColumnsByRootV1, &codec),
             blocks_by_head: Duplex::new(Protocol::BlocksByHeadV1, &codec),
+            blocks_by_root: Duplex::new(Protocol::BlocksByRootV2, &codec),
         }
     }
 
@@ -794,6 +803,7 @@ impl<E: EthSpec> Protocols<E> {
             Protocol::DataColumnsByRangeV1 => &mut self.data_columns_by_range,
             Protocol::DataColumnsByRootV1 => &mut self.data_columns_by_root,
             Protocol::BlocksByHeadV1 => &mut self.blocks_by_head,
+            Protocol::BlocksByRootV2 => &mut self.blocks_by_root,
         }
     }
 }
@@ -1043,6 +1053,8 @@ pub struct Control<E: EthSpec> {
     /// Serves BlocksByHead with streamed answers: [`NoBlocks`]' empty success unless
     /// [`Self::with_head_responder`] gave one.
     head_responder: Arc<dyn Responder<E>>,
+    /// Serves BlocksByRoot the same way ([`Self::with_root_responder`]).
+    root_responder: Arc<dyn Responder<E>>,
     /// The streamed answers' slots ([`RpcLimits::max_inbound_streams`]), over every peer.
     streams: Arc<Semaphore>,
 }
@@ -1152,6 +1164,7 @@ impl<E: EthSpec> Control<E> {
             queue_timer: None,
             blocks_responder: None,
             head_responder: Arc::new(NoBlocks),
+            root_responder: Arc::new(NoBlocks),
             streams,
         }
     }
@@ -1169,6 +1182,14 @@ impl<E: EthSpec> Control<E> {
     #[must_use]
     pub fn with_head_responder(mut self, responder: Arc<dyn Responder<E>>) -> Self {
         self.head_responder = responder;
+        self
+    }
+
+    /// The same behaviour, serving BlocksByRoot with `responder`'s streamed answers instead of
+    /// an empty success.
+    #[must_use]
+    pub fn with_root_responder(mut self, responder: Arc<dyn Responder<E>>) -> Self {
+        self.root_responder = responder;
         self
     }
 
@@ -1762,8 +1783,9 @@ impl<E: EthSpec> Control<E> {
     ) -> Option<Answer<E>> {
         let invalid = match &request {
             Request::BlocksByRange(range) => out_of_bounds(range),
-            // Clamped, never invalid (`fulu/p2p-interface.md` L820–821; Ezra, 2026-11-01).
-            Request::BlocksByHead(_) => None,
+            // Clamped, never invalid (`fulu/p2p-interface.md` L820–821; Ezra, 2026-11-01); a
+            // by-root request's bound is its SSZ list's.
+            Request::BlocksByHead(_) | Request::BlocksByRoot(_) => None,
             other => column_request_error(other),
         };
         if let Some(why) = invalid {
@@ -1921,6 +1943,12 @@ impl<E: EthSpec> Control<E> {
             }
             request @ Request::BlocksByHead(_) => {
                 if let Some(answer) = self.head_answer(peer, protocol, request) {
+                    self.send_answer(protocol, channel, answer);
+                }
+            }
+            request @ Request::BlocksByRoot(_) => {
+                let responder = Arc::clone(&self.root_responder);
+                if let Some(answer) = self.answer_streamed(peer, protocol, request, &responder) {
                     self.send_answer(protocol, channel, answer);
                 }
             }
@@ -2446,9 +2474,9 @@ impl<E: EthSpec> Control<E> {
             Protocol::DataColumnsByRangeV1 | Protocol::DataColumnsByRootV1 => {
                 tracing::debug!(%peer, %protocol, chunks = chunks.len(), "a column response");
             }
-            // We send no BlocksByHead request.
-            Protocol::BlocksByHeadV1 => {
-                tracing::debug!(%peer, chunks = chunks.len(), "a BlocksByHead response");
+            // We send no BlocksByHead or BlocksByRoot request.
+            Protocol::BlocksByHeadV1 | Protocol::BlocksByRootV2 => {
+                tracing::debug!(%peer, %protocol, chunks = chunks.len(), "a block response");
             }
         }
     }
@@ -2529,6 +2557,7 @@ impl<E: EthSpec> Control<E> {
             ProtocolsEvent::DataColumnsByRange(e) => (Protocol::DataColumnsByRangeV1, e),
             ProtocolsEvent::DataColumnsByRoot(e) => (Protocol::DataColumnsByRootV1, e),
             ProtocolsEvent::BlocksByHead(e) => (Protocol::BlocksByHeadV1, e),
+            ProtocolsEvent::BlocksByRoot(e) => (Protocol::BlocksByRootV2, e),
         };
         match event {
             DuplexEvent::Inbound(Event::Message {
@@ -6193,5 +6222,89 @@ mod tests {
             fake.calls(),
             [Call::ByHead(root, 8), Call::ByHead(root, 128)]
         );
+    }
+
+    // --- BeaconBlocksByRoot dispatched ---
+
+    const ROOT: Protocol = Protocol::BlocksByRootV2;
+
+    fn roots(roots: &[[u8; 32]]) -> Request {
+        let roots: Vec<_> = roots.iter().map(|r| (*r).into()).collect();
+        Request::BlocksByRoot(p2p_wire::rpc::messages::BlocksByRootV2Request(
+            roots.try_into().unwrap(),
+        ))
+    }
+
+    /// Writes `answer` on BlocksByRoot to a requester taking every write at once: what it
+    /// reads of `request`'s answer, context bytes included.
+    async fn write_root(
+        control: &Control<Spec>,
+        answer: Answer<Spec>,
+        request: Request,
+    ) -> Vec<ReceivedChunk<Spec>> {
+        let mut reader = Reader::new(Duration::ZERO);
+        writer(control)
+            .write_response(&ROOT, &mut reader, answer)
+            .await
+            .unwrap();
+        let contexts = Arc::new(testkit::context_table());
+        let mut codec = RpcCodec::<Spec>::new(contexts, Deadlines::default());
+        let mut sent = futures::io::sink();
+        let valid = RpcRequest::Valid(request);
+        codec.write_request(&ROOT, &mut sent, valid).await.unwrap();
+        codec
+            .read_response(&ROOT, &mut &reader.bytes[..])
+            .await
+            .unwrap()
+    }
+
+    /// BeaconBlocksByRoot has a behaviour and a bucket of its own (`rate.blocks_by_root`): a
+    /// request books one token there per root named, none of the BlocksByRange or BlocksByHead
+    /// buckets, and the production root responder answers it in request order, a duplicate
+    /// once. With no block source the answer is an empty success.
+    #[tokio::test(start_paused = true)]
+    async fn byroot_dispatched_on_its_own_bucket() {
+        let (control, metrics, peers) = serving(2, |l| {
+            l.rate.blocks_by_root = Quota::new(1, Duration::from_secs(1));
+        });
+        let fake = Fake::new();
+        let (_, range) = by_range(&fake, Some(0), 16, &metrics);
+        let responder: Arc<dyn Responder<Spec>> = Arc::new(range.root_responder());
+        let mut control = control.with_root_responder(Arc::clone(&responder));
+        let peer = peers[0];
+        let (start, range_due) = (Instant::now(), next_due(&control, peer));
+        let head_due = due_on(&control, peer, HEAD);
+        let asked = [
+            fixture::at(30).root,
+            fixture::at(10).root,
+            fixture::at(30).root,
+        ];
+        let answer = control.answer_streamed(peer, ROOT, roots(&asked), &responder);
+        assert_eq!(due_on(&control, peer, ROOT) - start, Duration::from_secs(3));
+        assert_eq!(next_due(&control, peer), range_due, "not the range bucket");
+        assert_eq!(
+            due_on(&control, peer, HEAD),
+            head_due,
+            "not the head bucket"
+        );
+        let chunks = write_root(&control, answer.expect("dispatched"), roots(&asked)).await;
+        let got: Vec<[u8; 32]> = blocks_of(&chunks)
+            .iter()
+            .map(|b| b.message_root().0)
+            .collect();
+        assert_eq!(got, [asked[0], asked[1]]);
+
+        let (mut bare, _, peers) = serving(1, |_| {});
+        let request = roots(&asked);
+        let none = Arc::clone(&bare.root_responder);
+        let answer = bare.answer_streamed(peers[0], ROOT, request.clone(), &none);
+        let chunks = write_root(&bare, answer.expect("dispatched"), request).await;
+        assert!(chunks.is_empty(), "no block source: {chunks:?}");
+        let mut protocols = Protocols::<Spec>::new(
+            Arc::new(testkit::context_table()),
+            Deadlines::default(),
+            None,
+        );
+        let _ = protocols.of(ROOT);
     }
 }

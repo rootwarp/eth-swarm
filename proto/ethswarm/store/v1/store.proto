@@ -5,7 +5,7 @@ package ethswarm.store.v1;
 import "ethswarm/common/v1/envelope.proto";
 import "ethswarm/common/v1/error.proto";
 
-// Served by cl-store; called by cl-api and cl-sync (and cl-p2p for finalized req/resp ranges).
+// Served by cl-store; called by cl-api and cl-sync (and cl-p2p for finalized req/resp blocks).
 //
 // cl-store is the READ side. It opens MDBX read-only and has NO write RPC; cl-chain is the single writer.
 // Consistency:
@@ -200,6 +200,41 @@ message GetBlocksByHeadResponseBody {
   ethswarm.common.v1.Error error = 3;
 }
 
+// Finalized blocks by root, for cl-p2p's BeaconBlocksByRoot v2 answer (the roots cl-chain does not
+// serve). One read transaction, stamped, before the stream opens; then one body per requested root
+// the store holds, in request order: `block` for one the stamp finalizes (at or below its finalized
+// slot and the finalized slot index's block there), `unfinalized_root` for one above the stamp's
+// finalized slot (not served). No body for a root not stored, or stored off the finalized chain at
+// or below the finalized slot. More than 128 roots, or a root that is not 32 bytes, fails
+// INVALID_ARGUMENT (ERROR_CODE_INVALID) unread.
+message GetBlocksByRootRequest {
+  // 32 bytes each (Root); at most MAX_REQUEST_BLOCKS_DENEB = 128 entries.
+  repeated bytes roots = 1;
+  // Required: the client's handshake. This server-streaming request is the client's only frame,
+  // so it carries hello in-line; missing hello is ERROR_CODE_CONTRACT_VIOLATION.
+  ethswarm.common.v1.Hello hello = 2;
+}
+
+message GetBlocksByRootResponse {
+  // Exactly one `hello` first, then only `body` frames. A first frame that is not hello, or a
+  // hello mid-stream, is ERROR_CODE_CONTRACT_VIOLATION.
+  oneof frame {
+    ethswarm.common.v1.Hello hello = 1;
+    GetBlocksByRootResponseBody body = 2;
+  }
+}
+
+message GetBlocksByRootResponseBody {
+  // PAYLOAD_TYPE_SIGNED_BEACON_BLOCK; `root` is the block root. SSZ max MAX_PAYLOAD_SIZE =
+  // 10485760 bytes.
+  ethswarm.common.v1.Envelope block = 1;
+  // The stamp of the read transaction, the same on every body; `finalized` is true with `block`.
+  ReadMeta meta = 2;
+  ethswarm.common.v1.Error error = 3;
+  // 32 bytes. Set instead of `block` for a requested root stored above the stamp's finalized slot.
+  bytes unfinalized_root = 4;
+}
+
 // Data columns for a slot range. count * len(columns) <= MAX_REQUEST_DATA_COLUMN_SIDECARS = 16384
 // (specs/fulu/p2p-interface.md); larger requests fail with ERROR_CODE_INVALID.
 message GetDataColumnsByRangeRequest {
@@ -237,4 +272,5 @@ service StoreService {
   rpc GetDataColumnsByRange(GetDataColumnsByRangeRequest) returns (stream GetDataColumnsByRangeResponse);
   rpc GetChainHead(GetChainHeadRequest) returns (GetChainHeadResponse);
   rpc GetBlocksByHead(GetBlocksByHeadRequest) returns (stream GetBlocksByHeadResponse);
+  rpc GetBlocksByRoot(GetBlocksByRootRequest) returns (stream GetBlocksByRootResponse);
 }

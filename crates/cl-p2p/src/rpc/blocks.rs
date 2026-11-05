@@ -3,7 +3,8 @@
 //! over a [`BlockSource`] ([`super::blocks_ipc::IpcBlocks`] in the service). cl-p2p opens no
 //! database: the finalized blocks come from cl-store (store.v1), the rest from cl-chain
 //! (chain.v1, ADR-006). [`ByRangeResponder::head_responder`] builds the BeaconBlocksByHead
-//! responder over the same source, lookup slots and window ([`super::blocks_head`], #230).
+//! responder over the same source, lookup slots and window ([`super::blocks_head`], #230), and
+//! [`ByRangeResponder::root_responder`] the BeaconBlocksByRoot one ([`super::blocks_root`]).
 //!
 //! # An answer
 //!
@@ -52,6 +53,7 @@
 use super::blocks_head::{
     ByHeadResponder, StoreStreams, MAX_BYHEAD_STORE_STREAMS, MAX_BYHEAD_STORE_STREAMS_PER_IP,
 };
+use super::blocks_root::ByRootResponder;
 use super::columns::fixed_message;
 use super::inbound::StatusSource;
 use super::metrics::RpcMetrics;
@@ -151,7 +153,25 @@ pub trait BlockSource: Send + Sync + 'static {
     /// The block at `root` and its ancestors, newest first, at most `count`, from cl-store's
     /// parent walk (#230): none for a root it does not hold.
     fn by_head(&self, root: [u8; 32], count: u64) -> Lookup<Blocks>;
+
+    /// What `half` serves of `roots`, in their order: cl-chain every block above its finalized
+    /// slot, cl-store the finalized ones and the roots it holds above its own ([`RootItem`]).
+    fn by_root(&self, half: Half, roots: Vec<[u8; 32]>) -> Lookup<RootItems>;
 }
+
+/// One item of a half's answer to a by-root lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootItem {
+    /// A block it serves.
+    Block(ServedBlock),
+    /// A root cl-store holds above its finalized slot, not served (never cl-chain's).
+    Unfinalized([u8; 32]),
+}
+
+/// One half's answer to a by-root lookup, read one item at a time (never collected): the
+/// answer reads it only as far as the peer's send budget reaches, then drops it
+/// ([`super::blocks_root`]), which cancels the call.
+pub type RootItems = Pin<Box<dyn Stream<Item = Result<RootItem, Failed>> + Send>>;
 
 /// The start slot of the block serve window now, if known; both block responders read it.
 pub type WindowStart = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
@@ -235,6 +255,18 @@ impl ByRangeResponder {
             self.head_streams.clone(),
             self.metrics.clone(),
             self.window.clone(),
+        )
+    }
+
+    /// The BeaconBlocksByRoot responder over the same source, lookup slots, metrics and pool of
+    /// store streams as [`Self::head_responder`]'s.
+    #[must_use]
+    pub fn root_responder(&self) -> ByRootResponder {
+        ByRootResponder::new(
+            Arc::clone(&self.source),
+            Arc::clone(&self.lookups),
+            self.head_streams.clone(),
+            self.metrics.clone(),
         )
     }
 
@@ -541,12 +573,14 @@ pub(crate) mod testing {
     }
 
     /// One call of the source.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) enum Call {
         Head,
         Range(Half, u64, u64),
         /// A parent walk from a root, of at most `count` blocks (#230).
         ByHead([u8; 32], u64),
+        /// A by-root lookup of one half.
+        ByRoot(Half, Vec<[u8; 32]>),
     }
 
     #[derive(Default)]
@@ -562,12 +596,19 @@ pub(crate) mod testing {
         replaced: Mutex<Vec<(u64, ServedBlock)>>,
         /// Blocks the store holds besides [`chain`]'s (fork blocks), found by root.
         known: Mutex<Vec<ServedBlock>>,
+        /// Blocks the store holds as finalized besides [`chain`]'s, found by root.
+        finalized_known: Mutex<Vec<ServedBlock>>,
+        /// The roots of the blocks by-root lookups handed over, in order.
+        root_reads: Mutex<Vec<[u8; 32]>>,
         /// Blocks a parent walk sends in place of its `n`th.
         walk_replaced: Mutex<Vec<(usize, ServedBlock)>>,
         /// How many blocks past its `count` a parent walk sends.
         overserve: AtomicU64,
         /// The blocks parent walks handed over so far.
         walk_reads: AtomicUsize,
+        /// The finalized slots the store's next by-root lookups read, one each, before
+        /// `finalized` again: a store behind the chain.
+        store_lags: Mutex<std::collections::VecDeque<u64>>,
     }
 
     /// A [`BlockSource`] over [`chain`]: the store half holds the blocks at or below its
@@ -617,6 +658,18 @@ pub(crate) mod testing {
             self.0.known.lock().unwrap().push(block);
         }
 
+        /// The store holds `block` as a finalized one (off [`chain`]), found by its root: its
+        /// by-root lookups serve it at or below the finalized slot.
+        pub(crate) fn add_finalized(&self, block: ServedBlock) {
+            self.0.finalized_known.lock().unwrap().push(block);
+        }
+
+        /// The roots of the blocks by-root lookups handed over so far, in order, and forgets
+        /// them.
+        pub(crate) fn root_reads(&self) -> Vec<[u8; 32]> {
+            std::mem::take(&mut *self.0.root_reads.lock().unwrap())
+        }
+
         /// Parent walks send `block` in place of their `n`th block.
         pub(crate) fn replace_in_walk(&self, n: usize, block: ServedBlock) {
             self.0.walk_replaced.lock().unwrap().push((n, block));
@@ -625,6 +678,22 @@ pub(crate) mod testing {
         /// Parent walks go on `extra` blocks past their `count`, as far as the parents reach.
         pub(crate) fn overserve(&self, extra: u64) {
             self.0.overserve.store(extra, Ordering::SeqCst);
+        }
+
+        /// The store's next by-root lookups read these finalized slots, one each.
+        pub(crate) fn lag_store(&self, slots: impl IntoIterator<Item = u64>) {
+            self.0.store_lags.lock().unwrap().extend(slots);
+        }
+
+        /// The by-root calls so far, and forgets every call.
+        pub(crate) fn root_calls(&self) -> Vec<(Half, Vec<[u8; 32]>)> {
+            self.calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    Call::ByRoot(half, roots) => Some((half, roots)),
+                    _ => None,
+                })
+                .collect()
         }
 
         /// The blocks parent walks handed over so far.
@@ -643,7 +712,7 @@ pub(crate) mod testing {
                 .into_iter()
                 .filter_map(|c| match c {
                     Call::Range(half, start, count) => Some((half, start, count)),
-                    Call::Head | Call::ByHead(..) => None,
+                    Call::Head | Call::ByHead(..) | Call::ByRoot(..) => None,
                 })
                 .collect()
         }
@@ -767,6 +836,74 @@ pub(crate) mod testing {
                 );
                 Ok(Box::pin(items) as Blocks)
             })
+        }
+
+        /// [`Fake::root_lookup`]'s items one at a time, each block counted in
+        /// [`Fake::root_reads`] as it is handed over; scripted at `Open(half)` and
+        /// `Item(half, n)`.
+        fn by_root(&self, half: Half, roots: Vec<[u8; 32]>) -> Lookup<RootItems> {
+            let (fake, live) = (self.clone(), self.enter());
+            let call = Call::ByRoot(half, roots.clone());
+            fake.0.calls.lock().unwrap().push(call);
+            Box::pin(async move {
+                if let Some(failed) = acted(fake.act(Step::Open(half))).await {
+                    return failed;
+                }
+                let found = fake.root_lookup(half, &roots);
+                let items = futures::stream::unfold(
+                    (0usize, found.into_iter(), fake, live),
+                    move |(i, mut found, fake, live)| async move {
+                        if let Some(failed) = acted(fake.act(Step::Item(half, i))).await {
+                            return Some((failed, (i + 1, Vec::new().into_iter(), fake, live)));
+                        }
+                        let next = found.next()?;
+                        if let RootItem::Block(block) = &next {
+                            fake.0.root_reads.lock().unwrap().push(block.root);
+                        }
+                        Some((Ok(next), (i + 1, found, fake, live)))
+                    },
+                );
+                Ok(Box::pin(items) as RootItems)
+            })
+        }
+    }
+
+    impl Fake {
+        /// The chain half: every block of `roots` held above the finalized slot (any branch,
+        /// [`Fake::replace`]d); the store half: the canonical ones (or
+        /// [`Fake::add_finalized`]) at or below its finalized slot, and the roots held above
+        /// it. In the order of `roots`.
+        fn root_lookup(&self, half: Half, roots: &[[u8; 32]]) -> Vec<RootItem> {
+            let mut known = chain();
+            known.extend(self.0.known.lock().unwrap().iter().cloned());
+            let held_final = self.0.finalized_known.lock().unwrap().clone();
+            known.extend(held_final.iter().cloned());
+            let lag = match half {
+                Half::Store => self.0.store_lags.lock().unwrap().pop_front(),
+                Half::Chain => None,
+            };
+            let finalized = lag.unwrap_or_else(|| self.0.finalized.load(Ordering::SeqCst));
+            let (canonical, replaced) = (chain(), self.0.replaced.lock().unwrap().clone());
+            let mut answer = Vec::new();
+            for root in roots {
+                let Some(block) = known.iter().find(|b| b.root == *root).cloned() else {
+                    continue;
+                };
+                let swap = replaced.iter().find(|(at, _)| *at == block.slot);
+                match half {
+                    Half::Chain if block.slot > finalized => {
+                        answer.push(RootItem::Block(swap.map_or(block, |(_, r)| r.clone())));
+                    }
+                    Half::Store if block.slot > finalized => {
+                        answer.push(RootItem::Unfinalized(*root));
+                    }
+                    Half::Store if canonical.contains(&block) || held_final.contains(&block) => {
+                        answer.push(RootItem::Block(block));
+                    }
+                    _ => {}
+                }
+            }
+            answer
         }
     }
 

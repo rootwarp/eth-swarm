@@ -12,6 +12,13 @@
 //! cl-store's finalized slot, so the walk is bounded by non-finality (and one write of the
 //! store's lag). It shares the column reads' places ([`super::DEFAULT_MAX_READS`]) and stops at
 //! [`super::READ_DEADLINE`]. When fork choice lands, the walk becomes its canonical chain.
+//!
+//! `ReqRespService/BlocksByRoot` ([`unfinalized_blocks`]): the requested blocks cl-p2p serves a
+//! peer's BeaconBlocksByRoot v2 request from before it asks cl-store for the rest. Every block
+//! stored above the stamp's finalized slot is served, on any branch (an orphan the env still
+//! holds included), in request order and each once: a point lookup in `block_index` per root,
+//! in one read transaction. A root not stored, or stored at or below the finalized slot, gets
+//! nothing: cl-store serves the finalized chain.
 
 use super::{Refusal, MAX_REQUEST_BLOCKS_DENEB};
 use cl_chain_columns::{ColumnReader, ColumnWriter};
@@ -109,6 +116,47 @@ pub fn canonical_blocks(
         return Err(late());
     }
     blocks.reverse();
+    Ok(blocks)
+}
+
+/// The blocks of `roots` stored above the stamp's finalized slot, in request order, each once,
+/// read in one transaction, stopping at `deadline`.
+///
+/// # Errors
+///
+/// [`Refusal::Invalid`] for more than `MAX_REQUEST_BLOCKS_DENEB` roots;
+/// [`Refusal::Unavailable`] with no stamp; [`Refusal::Store`] for a failed read or one past
+/// `deadline`.
+pub fn unfinalized_blocks(
+    store: &dyn BlockStore,
+    roots: &[Root],
+    deadline: Instant,
+) -> Result<Vec<StoredBlock>, Refusal> {
+    if roots.len() > MAX_REQUEST_BLOCKS_DENEB {
+        return Err(Refusal::Invalid(format!("{} roots, over 128", roots.len())));
+    }
+    let txn = store.read_txn().map_err(Refusal::Store)?;
+    let stamp = store_schema::stamp::read(&txn)?
+        .ok_or_else(|| Refusal::Unavailable("nothing is stamped yet".into()))?;
+    let mut blocks: Vec<StoredBlock> = Vec::new();
+    for root in roots {
+        if blocks.iter().any(|b| b.root == *root) {
+            continue;
+        }
+        if let Some(b) = store_schema::blocks::stored(&txn, root)? {
+            if b.slot > stamp.finalized_slot {
+                let ssz = b.ssz.into_owned();
+                blocks.push(StoredBlock {
+                    slot: b.slot,
+                    root: *root,
+                    ssz,
+                });
+            }
+        }
+    }
+    if Instant::now() >= deadline {
+        return Err(Refusal::Store("the block read passed its deadline".into()));
+    }
     Ok(blocks)
 }
 
