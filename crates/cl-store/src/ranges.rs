@@ -62,45 +62,5 @@ impl Reader {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::testkit::{block, deadline, stamp, Store};
-
-    /// Cole B1, Vera N1: a range is read by walking down from the finalized block, one block per
-    /// slot walked, whatever `count` is. One that starts more than [`MAX_FINALIZED_DEPTH`] below
-    /// the finalized slot is `Unavailable` before any block is read, even when its end reaches
-    /// into what is served (never a part of it); one that starts at that depth is served.
-    #[test]
-    fn deep_range_unavailable() {
-        let store = Store::new();
-        let finalized = MAX_FINALIZED_DEPTH + 10;
-        let edge = finalized - MAX_FINALIZED_DEPTH;
-        let (mut blocks, mut parent) = (Vec::new(), [0; 32]);
-        for slot in [1, edge - 1, edge, edge + 1, finalized] {
-            let (ssz, root) = block(slot, parent, 0);
-            blocks.push(ssz);
-            parent = root;
-        }
-        let at = (finalized, parent);
-        store.import(
-            &blocks.iter().map(Vec::as_slice).collect::<Vec<_>>(),
-            stamp(1, at, at),
-        );
-        let reader = store.reader();
-        let dl = deadline();
-        let slots = |start, count| {
-            reader
-                .finalized_blocks(start, count, &dl)
-                .map(|read| read.value.iter().map(|b| b.slot).collect::<Vec<_>>())
-        };
-        assert_eq!(slots(edge, 1), Ok(vec![edge]), "at the cap");
-        assert_eq!(slots(edge, 128), Ok(vec![edge, edge + 1]));
-        assert_eq!(slots(finalized, 1), Ok(vec![finalized]));
-        assert_eq!(
-            slots(edge - 1, 1),
-            Err(ReadError::Unavailable),
-            "one past it"
-        );
-        assert_eq!(slots(1, 128), Err(ReadError::Unavailable), "never a part");
-    }
-}
+#[path = "ranges_tests.rs"]
+mod tests;

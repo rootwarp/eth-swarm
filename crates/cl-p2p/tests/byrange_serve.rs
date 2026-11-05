@@ -14,7 +14,7 @@ use cl_chain::reqresp::{
 };
 use cl_chain_columns::ColumnWriter;
 use cl_p2p::behaviour::SpecBehaviour;
-use cl_p2p::rpc::blocks::{BlockSource, ByRangeResponder, Failed, ServedBlock};
+use cl_p2p::rpc::blocks::{BlockSource, ByRangeResponder, Failed, Half, ServedBlock};
 use cl_p2p::rpc::blocks_ipc::IpcBlocks;
 use cl_p2p::rpc::inbound::{Control, SharedStatus, StatusSource};
 use cl_p2p::rpc::metrics::RpcMetrics;
@@ -314,15 +314,50 @@ async fn range_sync_across_finality_and_the_gloas_fork() {
     }
 }
 
-/// Cole B1, Vera N1: cl-p2p refuses a range that starts deeper below the store's finalized slot
-/// than it lets cl-store walk before it asks cl-store, and cl-store refuses the same depth
-/// itself: one value on both sides.
-#[test]
-fn finalized_depth_matches_the_store() {
-    assert_eq!(
-        cl_p2p::rpc::blocks::MAX_FINALIZED_DEPTH,
-        cl_store::MAX_FINALIZED_DEPTH
-    );
+/// Cole B1, Vera N1: the start of the block serve window is cl-p2p's only floor below the
+/// store's finalized slot (`rpc::inbound`'s `byrange_deep_request_bounded`), and cl-store has no
+/// fixed depth cap of its own: over its socket, the real cl-store serves a range 999,999 slots
+/// below its finalized slot, found in its finalized slot index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_window_is_the_only_floor() {
+    const TOP: u64 = 1_000_000;
+    let env_dir = tempfile::tempdir().unwrap();
+    let writer = test_writer(env_dir.path()).unwrap();
+    let (mut chain, mut parent) = (Vec::new(), [0; 32]);
+    for slot in [1, 2, 3, TOP] {
+        let b = block(slot, parent, 0);
+        parent = b.message_root().0;
+        chain.push(b);
+    }
+    let txn = txn::begin(&writer).unwrap();
+    for b in &chain {
+        store_schema::blocks::put::<E>(&txn, &schedule(), &b.as_ssz_bytes()).unwrap();
+    }
+    let stamp = Stamp {
+        head_seq: 1,
+        head_root: parent,
+        head_slot: TOP,
+        finalized_root: parent,
+        finalized_slot: TOP,
+    };
+    txn::commit(txn, Update::New(stamp)).unwrap();
+    let env = Shared(Arc::new(writer));
+    let sockets = tempfile::tempdir().unwrap();
+    let store = cl_store::StoreServer::new(link(), Arc::new(cl_store::Reader::over(env)));
+    let store = serve(sockets.path(), "cl-store.sock", store.routes()).await;
+    let source = IpcBlocks::new(store.clone(), store, link());
+    let finalized = tokio::time::timeout(WAIT, source.finalized_slot()).await;
+    assert_eq!(finalized.expect("answered").unwrap(), TOP);
+    let blocks = tokio::time::timeout(WAIT, source.blocks(Half::Store, 1, 2)).await;
+    let blocks = blocks.expect("opened").unwrap_or_else(|e| panic!("{e:?}"));
+    let read = tokio::time::timeout(WAIT, blocks.collect::<Vec<_>>()).await;
+    let read: Result<Vec<ServedBlock>, Failed> = read.expect("ended").into_iter().collect();
+    let slots: Vec<u64> = read
+        .unwrap_or_else(|e| panic!("{e:?}"))
+        .iter()
+        .map(|b| b.slot)
+        .collect();
+    assert_eq!(slots, [1, 2]);
 }
 
 /// #230: BeaconBlocksByHead's source, the production `IpcBlocks::by_head`, against the real

@@ -554,8 +554,6 @@ pub(crate) mod testing {
         script: Mutex<HashMap<Step, Act>>,
         /// Blocks the chain half serves in place of the canonical one at a slot.
         replaced: Mutex<Vec<(u64, ServedBlock)>>,
-        /// What the store half takes per slot walked before it opens.
-        walk_cost: Mutex<Option<Duration>>,
         /// Blocks the store holds besides [`chain`]'s (fork blocks), found by root.
         known: Mutex<Vec<ServedBlock>>,
         /// Blocks a parent walk sends in place of its `n`th.
@@ -588,6 +586,11 @@ pub(crate) mod testing {
             fake
         }
 
+        /// The store's finalized slot is `slot` from now on.
+        pub(crate) fn finalize_at(&self, slot: u64) {
+            self.0.finalized.store(slot, Ordering::SeqCst);
+        }
+
         /// From the next head read on, the finalized slot moves to `slot` once it was read.
         pub(crate) fn advance_after_head(&self, slot: u64) {
             *self.0.advance_to.lock().unwrap() = Some(slot);
@@ -601,12 +604,6 @@ pub(crate) mod testing {
         /// The chain half serves `block` in place of the canonical block at slot `at`.
         pub(crate) fn replace(&self, at: u64, block: ServedBlock) {
             self.0.replaced.lock().unwrap().push((at, block));
-        }
-
-        /// From now on the store half takes `per_slot` for each slot from its finalized slot
-        /// down to the range's start before it opens, as cl-store's parent walk does.
-        pub(crate) fn walk_cost(&self, per_slot: Duration) {
-            *self.0.walk_cost.lock().unwrap() = Some(per_slot);
         }
 
         /// The store holds `block` too (off [`chain`]), found by its root.
@@ -699,12 +696,6 @@ pub(crate) mod testing {
                 }
                 let end = start.saturating_add(count);
                 let finalized = fake.0.finalized.load(Ordering::SeqCst);
-                let cost = *fake.0.walk_cost.lock().unwrap();
-                if let Some(per_slot) = cost.filter(|_| half == Half::Store) {
-                    let walked = finalized.saturating_sub(start);
-                    let walked = u32::try_from(walked).unwrap_or(u32::MAX);
-                    tokio::time::sleep(per_slot.saturating_mul(walked)).await;
-                }
                 let replaced = fake.0.replaced.lock().unwrap().clone();
                 let blocks: Vec<ServedBlock> = chain()
                     .into_iter()
