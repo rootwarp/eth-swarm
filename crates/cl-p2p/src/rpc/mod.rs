@@ -11,6 +11,8 @@
 //!   are counted against.
 //! - [`blocks`]: BeaconBlocksByRange v2 answers ([`blocks::ByRangeResponder`]) over a
 //!   [`blocks::BlockSource`]: cl-store's finalized blocks, then cl-chain's.
+//! - [`blocks_head`]: BeaconBlocksByHead v1 answers ([`blocks_head::ByHeadResponder`]) over the
+//!   same source: cl-store's parent walk. Not dispatched yet.
 //! - [`blocks_ipc`]: that source in the service ([`blocks_ipc::IpcBlocks`]): store.v1 and
 //!   chain.v1 clients held to the contract.
 //! - [`chain_status`]: our Status from cl-chain's `ReqRespService/GetStatus`
