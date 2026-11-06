@@ -929,6 +929,16 @@ mod tests {
         };
         let v4 = forkchoice_params("engine_forkchoiceUpdatedV4", &custody).unwrap();
         assert_eq!(v4[2], format!("0x{}", "0f".repeat(16)));
+        // The whole V4 params without attributes: [state, null, 16 bytes of DATA].
+        let state = serde_json::json!({
+            "headBlockHash": format!("0x{}", "01".repeat(32)),
+            "safeBlockHash": format!("0x{}", "02".repeat(32)),
+            "finalizedBlockHash": format!("0x{}", "03".repeat(32)),
+        });
+        assert_eq!(
+            v4,
+            serde_json::json!([state, null, format!("0x{}", "0f".repeat(16))])
+        );
     }
 
     #[test]
