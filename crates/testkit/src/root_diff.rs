@@ -158,6 +158,19 @@ impl Reference {
         Self { url, timeout }
     }
 
+    /// The head header, for the slot sampler sharing this bounded reference transport.
+    pub(crate) async fn head_header(&self) -> Result<serde_json::Value, Error> {
+        crate::collector::get_json_at(
+            &self.url,
+            "/eth/v1/beacon/headers/head",
+            "/eth/v1/beacon/headers/head",
+            crate::collector::MAX_JSON_BYTES,
+            self.timeout,
+        )
+        .await
+        .map_err(|_| Error::Reference)
+    }
+
     pub(crate) async fn read_state(&self, state: &str) -> Result<Checkpoints, Error> {
         let path = format!("/eth/v1/beacon/states/{state}/finality_checkpoints");
         let body: serde_json::Value = crate::collector::get_json_at(
@@ -207,11 +220,40 @@ impl QuerySource {
             timeout,
         }
     }
+
+    /// Shared deadline/peer/size guard for fixed-state and named-head soak reads.
+    pub(crate) async fn summary(
+        &self,
+        id: ethswarm_proto::chain::hot_state_id::Id,
+    ) -> Result<ethswarm_proto::chain::GetStateSummaryResponse, Error> {
+        use ethswarm_proto::chain::{self as pb, query_service_client::QueryServiceClient};
+        let read = async {
+            let channel = ipc::uds::connect_path(&self.socket, self.uid)
+                .await
+                .map_err(|_| Error::Query)?;
+            let mut client = QueryServiceClient::new(channel).max_decoding_message_size(64 << 10);
+            let mut request = tonic::Request::new(pb::GetStateSummaryRequest {
+                state: Some(pb::HotStateId { id: Some(id) }),
+            });
+            request.set_timeout(self.timeout);
+            let response = client
+                .get_state_summary(request)
+                .await
+                .map_err(|_| Error::Query)?
+                .into_inner();
+            if response.state_root.len() != 32 || response.block_root.len() != 32 {
+                return Err(Error::Query);
+            }
+            Ok(response)
+        };
+        tokio::time::timeout(self.timeout, read)
+            .await
+            .map_err(|_| Error::Query)?
+    }
 }
 
 impl CheckpointSource for QuerySource {
     async fn read(&self, slot: u64) -> Result<Checkpoints, Error> {
-        use ethswarm_proto::chain::{self as pb, query_service_client::QueryServiceClient};
         fn checkpoint(
             value: Option<ethswarm_proto::common::Checkpoint>,
         ) -> Result<Checkpoint, Error> {
@@ -222,36 +264,16 @@ impl CheckpointSource for QuerySource {
                 root: Root::from(root),
             })
         }
-        let read = async {
-            let channel = ipc::uds::connect_path(&self.socket, self.uid)
-                .await
-                .map_err(|_| Error::Query)?;
-            let mut client = QueryServiceClient::new(channel).max_decoding_message_size(64 << 10);
-            let mut request = tonic::Request::new(pb::GetStateSummaryRequest {
-                state: Some(pb::HotStateId {
-                    id: Some(pb::hot_state_id::Id::Slot(slot)),
-                }),
-            });
-            request.set_timeout(self.timeout);
-            let response = client
-                .get_state_summary(request)
-                .await
-                .map_err(|_| Error::Query)?
-                .into_inner();
-            if response.slot != slot
-                || response.state_root.len() != 32
-                || response.block_root.len() != 32
-            {
-                return Err(Error::Query);
-            }
-            Ok(Checkpoints {
-                finalized: checkpoint(response.finalized)?,
-                justified: checkpoint(response.justified)?,
-            })
-        };
-        tokio::time::timeout(self.timeout, read)
-            .await
-            .map_err(|_| Error::Query)?
+        let response = self
+            .summary(ethswarm_proto::chain::hot_state_id::Id::Slot(slot))
+            .await?;
+        if response.slot != slot {
+            return Err(Error::Query);
+        }
+        Ok(Checkpoints {
+            finalized: checkpoint(response.finalized)?,
+            justified: checkpoint(response.justified)?,
+        })
     }
 }
 

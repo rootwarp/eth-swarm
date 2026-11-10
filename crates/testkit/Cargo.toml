@@ -29,6 +29,11 @@ name = "root-diff"
 path = "src/bin/root-diff.rs"
 required-features = ["soak"]
 
+[[bin]]
+name = "head-lag"
+path = "src/bin/head-lag.rs"
+required-features = ["soak"]
+
 [features]
 # For this crate's tests and its users' tests: write-fault injection (`archive::Fault`: an
 # interrupted write, a full disk), payload fixtures (`archive::fixtures`), and the collector's

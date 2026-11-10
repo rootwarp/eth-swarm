@@ -34,3 +34,7 @@ pub mod root_diff;
 /// Second-reference-CL adapter for the soak tool's chain.v1 reads, not a production chain.
 #[cfg(feature = "soak")]
 pub mod query_stub;
+
+/// Slot-aligned head-lag samples and run-wide percentile/recovery computation.
+#[cfg(feature = "soak")]
+pub mod head_lag;
