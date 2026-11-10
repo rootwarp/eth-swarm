@@ -27,6 +27,7 @@ members = [
     "crates/node-key",
     "crates/state-transition",
     "crates/cl-node",
+    "crates/engine-api",
 ]
 
 [workspace.package]
