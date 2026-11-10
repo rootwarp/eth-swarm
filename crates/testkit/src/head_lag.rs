@@ -486,6 +486,13 @@ pub async fn analyze_jsonl(
     input: impl tokio::io::AsyncRead + Unpin,
     slots_per_epoch: u64,
 ) -> Result<Summary, Error> {
+    let samples = read_samples(input).await?;
+    analyze(&samples, slots_per_epoch)
+}
+
+pub(crate) async fn read_samples(
+    input: impl tokio::io::AsyncRead + Unpin,
+) -> Result<Vec<Sample>, Error> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     fn append(line: &[u8], samples: &mut Vec<Sample>) -> Result<(), Error> {
         if samples.len() as u64 >= MAX_SAMPLES {
@@ -519,5 +526,11 @@ pub async fn analyze_jsonl(
             line.clear();
         }
     }
-    analyze(&samples, slots_per_epoch)
+    Ok(samples)
 }
+
+mod alerts;
+pub use alerts::{run_live, Alert, AlertKind, Monitor, ALERT_RULES};
+
+mod report;
+pub use report::{report_jsonl, window_report, Report};

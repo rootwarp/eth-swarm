@@ -45,9 +45,10 @@ test-support = ["p2p-wire/testkit", "dep:ssz_types", "hyper/server"]
 replay = ["dep:crypto-bls", "dep:state-transition"]
 
 # Offline-testable soak tooling and QueryService adapter. Does not link service crates.
-soak = ["dep:ipc", "dep:ethswarm-proto", "dep:tonic", "dep:tokio-stream", "tokio/fs", "tokio/io-util", "tokio/io-std"]
+soak = ["dep:prometheus-client", "dep:ipc", "dep:ethswarm-proto", "dep:tonic", "dep:tokio-stream", "tokio/fs", "tokio/io-util", "tokio/io-std"]
 
 [dependencies]
+prometheus-client = { version = "0.25.1", optional = true }
 ipc = { path = "../ipc", optional = true }
 ethswarm-proto = { path = "../ethswarm-proto", optional = true }
 tonic = { workspace = true, optional = true }
