@@ -450,7 +450,18 @@ pub struct NewPayloadClient {
     expected_uid: u32,
     seq: EngineSeq,
     metrics: NewPayloadMetrics,
-    client: Mutex<Option<EngineServiceClient<Channel>>>,
+    shared: Mutex<Shared>,
+    /// Held by the one call that is opening the connection, and only while it does.
+    opening: tokio::sync::Mutex<()>,
+}
+
+/// The connection [`NewPayloadClient`]'s calls share.
+#[derive(Default)]
+struct Shared {
+    /// The open connection, if any.
+    client: Option<EngineServiceClient<Channel>>,
+    /// Attempts to open one that failed, so far.
+    failed: u64,
 }
 
 impl NewPayloadClient {
@@ -468,7 +479,8 @@ impl NewPayloadClient {
             expected_uid,
             seq,
             metrics,
-            client: Mutex::new(None),
+            shared: Mutex::default(),
+            opening: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -538,20 +550,38 @@ impl NewPayloadClient {
             .map_or(not_verified(Reason::Malformed), verdict::map_proto)
     }
 
-    /// The open connection, or a new one.
+    /// The open connection, or a new one. One call at a time opens it: a call that finds none
+    /// waits for the attempt under way, if any, and takes its outcome (its connection, or none
+    /// if it failed) rather than open one of its own. The wait ends with that attempt, so no
+    /// call's RPC runs under it.
     async fn connection(&self) -> Option<EngineServiceClient<Channel>> {
-        let open = self.lock().clone();
-        if open.is_some() {
-            return open;
+        let failed_before = {
+            let shared = self.lock();
+            if let Some(open) = &shared.client {
+                return Some(open.clone());
+            }
+            shared.failed
+        };
+        let _opening = self.opening.lock().await;
+        {
+            let shared = self.lock();
+            if let Some(open) = &shared.client {
+                return Some(open.clone());
+            }
+            if shared.failed != failed_before {
+                // The attempt this call waited for failed.
+                return None;
+            }
         }
         let connect = ipc::uds::connect_path(&self.socket, self.expected_uid);
         match tokio::time::timeout(CALL_TIMEOUT, connect).await {
             Ok(Ok(channel)) => {
                 let client = EngineServiceClient::new(channel);
-                *self.lock() = Some(client.clone());
+                self.lock().client = Some(client.clone());
                 Some(client)
             }
             failed => {
+                self.lock().failed += 1;
                 let error = match failed {
                     Ok(Err(err)) => err.to_string(),
                     _ => "timed out".to_owned(),
@@ -567,11 +597,11 @@ impl NewPayloadClient {
     }
 
     fn disconnect(&self) {
-        *self.lock() = None;
+        self.lock().client = None;
     }
 
-    fn lock(&self) -> MutexGuard<'_, Option<EngineServiceClient<Channel>>> {
-        self.client.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> MutexGuard<'_, Shared> {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
