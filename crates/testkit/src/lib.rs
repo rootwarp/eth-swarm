@@ -26,3 +26,7 @@ pub mod collector;
 pub mod export_blocks;
 #[cfg(feature = "replay")]
 pub mod replay;
+
+/// Scriptable, JWT-authenticated loopback Engine API fixture (dev-dependencies only).
+#[cfg(feature = "mock-el")]
+pub mod mock_el;

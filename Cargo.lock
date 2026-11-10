@@ -5972,12 +5972,15 @@ dependencies = [
 name = "testkit"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "blst",
  "bytes",
  "consensus-types",
  "crypto-bls",
+ "engine-api",
  "ethereum_ssz",
  "hex",
+ "hmac 0.12.1",
  "http",
  "http-body-util",
  "hyper",

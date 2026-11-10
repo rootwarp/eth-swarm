@@ -34,7 +34,13 @@ test-support = ["p2p-wire/testkit", "dep:ssz_types", "hyper/server"]
 # `crypto-bls/verify` (scripts/check-cl-chain-features.sh). `cargo run --bin replay` turns it on.
 replay = ["dep:crypto-bls", "dep:state-transition"]
 
+# Scriptable loopback Engine API fixture; consumers opt in from dev-dependencies only.
+mock-el = ["dep:engine-api", "dep:hmac", "dep:base64", "hyper/server"]
+
 [dependencies]
+engine-api = { path = "../engine-api", optional = true }
+hmac = { version = "0.12", optional = true }
+base64 = { version = "0.22", optional = true }
 consensus-types = { path = "../consensus-types" }
 network-config = { path = "../network-config" }
 # In-process BLS for genesis replay (`crypto-bls` verify + aggregate), feature `replay` only.
@@ -71,7 +77,7 @@ ethereum_ssz.workspace = true
 ssz_types = { workspace = true, optional = true }
 
 [dev-dependencies]
-testkit = { path = ".", features = ["test-support", "replay"] }
+testkit = { path = ".", features = ["test-support", "replay", "mock-el"] }
 tempfile = "3"
 # The replay fixture chain (tests/support/chain.rs): real validator keys and the test inputs
 # (`genesis_state`, `bid_for_state`). `testing` is dev-only (scripts/check-stf-testing.sh).
@@ -84,4 +90,4 @@ consensus-types = { path = "../consensus-types" }
 network-config = { path = "../network-config" }
 ethereum_ssz.workspace = true
 tree_hash.workspace = true
-tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "test-util"] }
