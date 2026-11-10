@@ -900,6 +900,7 @@ dependencies = [
  "bytes",
  "cl-chain-columns",
  "consensus-types",
+ "engine-api",
  "ethereum_ssz",
  "ethswarm-proto",
  "hex",
@@ -1704,6 +1705,18 @@ dependencies = [
  "sec1 0.8.1",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "engine-api"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "consensus-types",
+ "ethereum_ssz",
+ "serde",
+ "sha2 0.10.9",
+ "typenum",
 ]
 
 [[package]]

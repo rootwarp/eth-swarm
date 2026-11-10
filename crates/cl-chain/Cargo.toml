@@ -48,6 +48,9 @@ consensus-types = { path = "../consensus-types" }
 # verify::pubkey_feed: builder_key_version, the version of each builder key it feeds to cl-verify.
 # The pure state transition: it links no BLS library (scripts/check-state-transition-deps.sh).
 state-transition = { path = "../state-transition" }
+# engine::client: the engine_newPayloadV5 params of an envelope and its bid, and the
+# PayloadStatusV1 that engine::verdict maps. Pure, no I/O; it adds no crate to Cargo.lock.
+engine-api = { path = "../engine-api" }
 # probe::storage_contract: block roots of the reference node's blocks, the stored sidecar's SSZ.
 tree_hash.workspace = true
 ethereum_ssz.workspace = true

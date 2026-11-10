@@ -1,4 +1,8 @@
-//! [`FcuSender`]: cl-chain's `ForkchoiceUpdated` client of cl-engine (`ethswarm.engine.v1`).
+//! cl-chain's clients of cl-engine (`ethswarm.engine.v1`): [`FcuSender`] for
+//! `ForkchoiceUpdated` (below), and [`NewPayloadClient`] for `NewPayload` (see its docs), whose
+//! answers become an [`ElVerdict`]. Both take `seq` from the process's one [`EngineSeq`].
+//!
+//! The `ForkchoiceUpdated` sender:
 //!
 //! - **Latest wins.** One task sends; [`FcuSender::send`] only puts the arguments in a
 //!   one-value slot. A value that is replaced before the task took it is never sent, and is
@@ -23,6 +27,10 @@
 //!   `chain_fcu_errors_total{kind}` ([`FcuErrorKind`]).
 
 use super::fcu::ForkchoiceArgs;
+use super::verdict::{self, ElVerdict, Reason};
+use consensus_types::gloas::{ExecutionPayloadBid, ExecutionPayloadEnvelope};
+use consensus_types::EthSpec;
+use engine_api::new_payload_v5_params;
 use ethswarm_proto::engine as pb;
 use pb::engine_service_client::EngineServiceClient;
 use prometheus_client::metrics::counter::Counter;
@@ -272,10 +280,7 @@ impl Task {
             Ok(Ok(response)) => response.into_inner(),
             Ok(Err(status)) => {
                 self.metrics.error(FcuErrorKind::Rpc);
-                let lost = matches!(
-                    status.code(),
-                    Code::Unavailable | Code::Cancelled | Code::Unknown | Code::DeadlineExceeded
-                );
+                let lost = lost_in_transport(status.code());
                 tracing::warn!(seq, code = ?status.code(), retry = lost, "forkchoiceUpdated failed");
                 if lost {
                     return Err(Failed::Lost);
@@ -371,4 +376,239 @@ impl Drop for FcuSender {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+/// `engine_newPayloadV5`'s timeout (execution-apis `amsterdam.md`): the wait cl-engine gives
+/// the EL before it answers `EngineError` `TIMEOUT`. The request asks for no other
+/// (`timeout_ms` 0, which never shortens it), and [`NewPayloadClient`] waits [`CALL_TIMEOUT`],
+/// longer, for cl-engine's answer.
+pub const NEW_PAYLOAD_V5_TIMEOUT: Duration = Duration::from_secs(6);
+
+// The client never gives up before cl-engine's wait for the EL is over.
+const _: () = assert!(CALL_TIMEOUT.as_secs() > NEW_PAYLOAD_V5_TIMEOUT.as_secs());
+
+/// `chain_new_payload_verdicts_total{verdict}`, by [`ElVerdict::label`].
+#[derive(Clone, Debug, Default)]
+pub struct NewPayloadMetrics {
+    verdicts: Family<KindLabel, Counter>,
+}
+
+impl NewPayloadMetrics {
+    /// Registers the counter in `registry`.
+    pub fn register(registry: &mut Registry) -> Self {
+        let metrics = Self::default();
+        registry.register(
+            "chain_new_payload_verdicts",
+            "newPayload calls, by the verdict they gave",
+            metrics.verdicts.clone(),
+        );
+        // Every verdict is there from the start, at 0.
+        for verdict in ElVerdict::LABELS {
+            drop(metrics.verdicts.get_or_create(&[("verdict", verdict)]));
+        }
+        metrics
+    }
+
+    /// Verdicts labelled `verdict` so far: 0 for a label that is not one of
+    /// [`ElVerdict::LABELS`].
+    #[must_use]
+    pub fn verdicts(&self, verdict: &str) -> u64 {
+        ElVerdict::LABELS
+            .into_iter()
+            .find(|label| *label == verdict)
+            .map_or(0, |label| {
+                self.verdicts.get_or_create(&[("verdict", label)]).get()
+            })
+    }
+
+    fn count(&self, verdict: &ElVerdict) {
+        self.verdicts
+            .get_or_create(&[("verdict", verdict.label())])
+            .inc();
+    }
+}
+
+/// cl-chain's `NewPayload` client of cl-engine: one `engine_newPayloadV5` call per envelope,
+/// whose answer is an [`ElVerdict`].
+///
+/// - **One call, no retry.** Each call takes the next `seq` of the process's [`EngineSeq`], the
+///   one the [`FcuSender`] uses, once it has a connection. A failed call is
+///   [`ElVerdict::NotVerified`]; calling again is the caller's choice.
+/// - **The wait.** `timeout_ms` is 0, so cl-engine gives the EL the spec's 6 s
+///   ([`NEW_PAYLOAD_V5_TIMEOUT`]) and answers `EngineError` `TIMEOUT` after it. The client gives
+///   cl-engine [`CALL_TIMEOUT`] to connect and as much to answer; no answer by then is
+///   [`Reason::Timeout`].
+/// - **Fail closed.** Only a status, read by [`verdict::map_proto`], gives a verdict. An
+///   `EngineError` (also beside a status), a failed call, an answer for another `seq`, no
+///   status, no connection and a timeout are `NotVerified`, never `Valid`.
+/// - **Connection.** One, opened at the first call and shared by concurrent calls. A call
+///   lost in transport (a timeout, `UNAVAILABLE`, `CANCELLED`, `UNKNOWN`, `DEADLINE_EXCEEDED`)
+///   drops it, and the next call opens another.
+/// - **Metrics.** `chain_new_payload_verdicts_total{verdict}` ([`NewPayloadMetrics`]).
+pub struct NewPayloadClient {
+    socket: PathBuf,
+    expected_uid: u32,
+    seq: EngineSeq,
+    metrics: NewPayloadMetrics,
+    shared: Mutex<Shared>,
+    /// Held by the one call that is opening the connection, and only while it does.
+    opening: tokio::sync::Mutex<()>,
+}
+
+/// The connection [`NewPayloadClient`]'s calls share.
+#[derive(Default)]
+struct Shared {
+    /// The open connection, if any.
+    client: Option<EngineServiceClient<Channel>>,
+    /// Attempts to open one that failed, so far.
+    failed: u64,
+}
+
+impl NewPayloadClient {
+    /// A client of cl-engine's socket at `socket`, served by `expected_uid`, with `seq` from
+    /// `seq`. It connects at the first call.
+    #[must_use]
+    pub fn new(
+        socket: impl Into<PathBuf>,
+        expected_uid: u32,
+        seq: EngineSeq,
+        metrics: NewPayloadMetrics,
+    ) -> Self {
+        Self {
+            socket: socket.into(),
+            expected_uid,
+            seq,
+            metrics,
+            shared: Mutex::default(),
+            opening: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// Sends `envelope`, whose committed bid is `bid`, to the EL, and gives its verdict (see
+    /// the type docs). Must be called within a Tokio runtime.
+    pub async fn new_payload<E: EthSpec>(
+        &self,
+        envelope: &ExecutionPayloadEnvelope<E>,
+        bid: &ExecutionPayloadBid<E>,
+    ) -> ElVerdict {
+        let verdict = self.call(envelope, bid).await;
+        self.metrics.count(&verdict);
+        if let ElVerdict::NotVerified(reason) = verdict {
+            tracing::warn!(
+                block_hash = %envelope.payload.block_hash,
+                ?reason,
+                "newPayload: no verdict"
+            );
+        }
+        verdict
+    }
+
+    async fn call<E: EthSpec>(
+        &self,
+        envelope: &ExecutionPayloadEnvelope<E>,
+        bid: &ExecutionPayloadBid<E>,
+    ) -> ElVerdict {
+        let not_verified = ElVerdict::NotVerified;
+        let Ok(data) = serde_json::to_vec(&new_payload_v5_params(envelope, bid)) else {
+            return not_verified(Reason::Malformed);
+        };
+        let Some(mut client) = self.connection().await else {
+            return not_verified(Reason::Connect);
+        };
+        let seq = self.seq.next();
+        let request = pb::NewPayloadRequest {
+            seq,
+            params: Some(pb::VersionedData {
+                version: pb::EngineMethodVersion::GloasAmsterdam as i32,
+                encoding: pb::PayloadEncoding::Json as i32,
+                data,
+            }),
+            timeout_ms: 0,
+        };
+        let response = match tokio::time::timeout(CALL_TIMEOUT, client.new_payload(request)).await {
+            Ok(Ok(response)) => response.into_inner(),
+            Ok(Err(status)) => {
+                if lost_in_transport(status.code()) {
+                    self.disconnect();
+                }
+                return not_verified(Reason::Rpc(status.code()));
+            }
+            Err(_) => {
+                self.disconnect();
+                return not_verified(Reason::Timeout);
+            }
+        };
+        if response.seq != seq {
+            return not_verified(Reason::Malformed);
+        }
+        if let Some(error) = &response.error {
+            return not_verified(Reason::Engine(error.kind));
+        }
+        response
+            .status
+            .as_ref()
+            .map_or(not_verified(Reason::Malformed), verdict::map_proto)
+    }
+
+    /// The open connection, or a new one. One call at a time opens it: a call that finds none
+    /// waits for the attempt under way, if any, and takes its outcome (its connection, or none
+    /// if it failed) rather than open one of its own. The wait ends with that attempt, so no
+    /// call's RPC runs under it.
+    async fn connection(&self) -> Option<EngineServiceClient<Channel>> {
+        let failed_before = {
+            let shared = self.lock();
+            if let Some(open) = &shared.client {
+                return Some(open.clone());
+            }
+            shared.failed
+        };
+        let _opening = self.opening.lock().await;
+        {
+            let shared = self.lock();
+            if let Some(open) = &shared.client {
+                return Some(open.clone());
+            }
+            if shared.failed != failed_before {
+                // The attempt this call waited for failed.
+                return None;
+            }
+        }
+        let connect = ipc::uds::connect_path(&self.socket, self.expected_uid);
+        match tokio::time::timeout(CALL_TIMEOUT, connect).await {
+            Ok(Ok(channel)) => {
+                let client = EngineServiceClient::new(channel);
+                self.lock().client = Some(client.clone());
+                Some(client)
+            }
+            failed => {
+                self.lock().failed += 1;
+                let error = match failed {
+                    Ok(Err(err)) => err.to_string(),
+                    _ => "timed out".to_owned(),
+                };
+                tracing::warn!(
+                    socket = %self.socket.display(),
+                    error,
+                    "newPayload: cl-engine did not accept"
+                );
+                None
+            }
+        }
+    }
+
+    fn disconnect(&self) {
+        self.lock().client = None;
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Shared> {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// A gRPC status of a call lost on the way, after which the connection is opened again.
+fn lost_in_transport(code: Code) -> bool {
+    matches!(
+        code,
+        Code::Unavailable | Code::Cancelled | Code::Unknown | Code::DeadlineExceeded
+    )
 }
