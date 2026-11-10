@@ -1,7 +1,7 @@
 //! The newPayload verdict contract: `verdict::map` of every `PayloadStatusV1`,
 //! [`NewPayloadClient`] against a mock `ethswarm.engine.v1` server on a Unix socket, and the
 //! per-block [`ExecutionStatuses`]. The client tests run on paused time, so the 6 s waits take
-//! no wall-clock time.
+//! no wall-clock time; the concurrency tests, which wait for nothing, run on real time.
 
 use cl_chain::engine::client::{
     EngineSeq, NewPayloadClient, NewPayloadMetrics, CALL_TIMEOUT, NEW_PAYLOAD_V5_TIMEOUT,
@@ -25,8 +25,10 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::{mpsc, watch, Barrier};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request, Response, Status};
 
 type E = Minimal;
@@ -149,11 +151,13 @@ fn engine_error(kind: pb::EngineErrorKind) -> Answer {
 }
 
 /// A mock engine.v1 server: it records each `NewPayload` request and gives the next scripted
-/// answer after its delay.
+/// answer after its delay. With `together`, it answers no request before that many are in
+/// flight.
 #[derive(Clone, Default)]
 struct MockEngine {
     script: Arc<Mutex<VecDeque<(Duration, Answer)>>>,
     seen: Arc<Mutex<Vec<pb::NewPayloadRequest>>>,
+    together: Option<Arc<Barrier>>,
 }
 
 impl MockEngine {
@@ -178,6 +182,9 @@ impl EngineService for MockEngine {
         let Some((after, answer)) = next else {
             return Err(Status::internal("mock: no scripted answer"));
         };
+        if let Some(together) = &self.together {
+            together.wait().await;
+        }
         tokio::time::sleep(after).await;
         match answer {
             Answer::Response {
@@ -240,6 +247,71 @@ fn serve(path: &Path, mock: MockEngine) -> JoinHandle<Result<(), tonic::transpor
 
 fn uid() -> u32 {
     ipc::uds::Ownership::current().uid
+}
+
+/// Serves `mock` on `path` through its own accept loop, which admits connections the way
+/// cl-engine does: once `cap` connections are served, one more is closed on accept, unread.
+/// Gives the number of connections accepted so far, the closed ones included. No served
+/// connection closes during a test, so those admitted are the ones served at once.
+fn serve_counted(path: &Path, mock: MockEngine, cap: Option<usize>) -> watch::Receiver<usize> {
+    let listener = tokio::net::UnixListener::bind(path).unwrap();
+    let (accepted_tx, accepted) = watch::channel(0);
+    let (admit, admitted) = mpsc::channel::<std::io::Result<tokio::net::UnixStream>>(1);
+    tokio::spawn(async move {
+        let mut served = 0;
+        while let Ok((stream, _)) = listener.accept().await {
+            accepted_tx.send_modify(|n| *n += 1);
+            if cap.is_some_and(|cap| served >= cap) {
+                drop(stream);
+                continue;
+            }
+            served += 1;
+            if admit.send(Ok(stream)).await.is_err() {
+                return;
+            }
+        }
+    });
+    let routes = tonic::service::Routes::new(EngineServiceServer::new(mock));
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_routes(routes)
+            .serve_with_incoming(ReceiverStream::new(admitted)),
+    );
+    accepted
+}
+
+/// cl-engine's default cap on the connections it serves at once.
+const ENGINE_CONNECTIONS: usize = 4;
+
+/// The calls that start together in the concurrency tests.
+const CALLERS: usize = 4;
+
+/// `CALLERS` newPayload calls, each of its own block, that start together on a new client of
+/// `path` (so with no connection yet); `mock` answers each VALID.
+async fn concurrent_calls(path: &Path, mock: &MockEngine) -> Vec<ElVerdict> {
+    let client = Arc::new(NewPayloadClient::new(
+        path,
+        uid(),
+        EngineSeq::new(),
+        NewPayloadMetrics::default(),
+    ));
+    let start = Arc::new(Barrier::new(CALLERS));
+    let calls: Vec<_> = (1..=CALLERS as u8)
+        .map(|n| {
+            mock.answer(Duration::ZERO, status(Kind::Valid, Some(hash(n))));
+            let (client, start) = (Arc::clone(&client), Arc::clone(&start));
+            tokio::spawn(async move {
+                let block = block(n, n - 1);
+                start.wait().await;
+                client.new_payload(&block.envelope, &block.bid).await
+            })
+        })
+        .collect();
+    let mut verdicts = Vec::new();
+    for call in calls {
+        verdicts.push(call.await.unwrap());
+    }
+    verdicts
 }
 
 /// A mock server on a fresh socket and a client of it.
@@ -696,4 +768,53 @@ async fn optimistic_permits_import() {
     ] {
         assert!(text.contains(line), "{line} in\n{text}");
     }
+}
+
+/// Calls that start together on a client with no connection open one between them: the server
+/// accepts exactly one connection, not one per call, and all the calls are in flight on it at
+/// once (the mock answers none before all are), each answered VALID.
+#[tokio::test]
+async fn concurrent_cold_starts_share_one_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("engine.sock");
+    let mock = MockEngine {
+        together: Some(Arc::new(Barrier::new(CALLERS))),
+        ..MockEngine::default()
+    };
+    let accepted = serve_counted(&path, mock.clone(), None);
+
+    let verdicts = concurrent_calls(&path, &mock).await;
+    assert_eq!(verdicts, [ElVerdict::Valid; CALLERS]);
+    assert_eq!(mock.seen().len(), CALLERS);
+    assert_eq!(*accepted.borrow(), 1, "connections accepted");
+}
+
+/// cl-engine serves four connections at once and closes one more on accept. With one of them
+/// taken (a channel held open, as the forkchoiceUpdated sender holds one), calls that start
+/// together on a new client still all get VALID: they share one more connection, so none is
+/// refused one, and no fifth connection is opened.
+#[tokio::test]
+async fn a_capped_server_still_serves_concurrent_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("engine.sock");
+    let mock = MockEngine::default();
+    let mut accepted = serve_counted(&path, mock.clone(), Some(ENGINE_CONNECTIONS));
+    let held = ipc::uds::connect_path(&path, uid()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), accepted.wait_for(|n| *n == 1))
+        .await
+        .expect("the held connection is accepted")
+        .unwrap();
+
+    let verdicts = concurrent_calls(&path, &mock).await;
+    let opened = *accepted.borrow();
+    assert_eq!(
+        verdicts,
+        [ElVerdict::Valid; CALLERS],
+        "connections accepted: {opened}"
+    );
+    assert_eq!(
+        opened, 2,
+        "connections accepted: the held one and one shared"
+    );
+    drop(held);
 }
