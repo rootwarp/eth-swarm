@@ -1,0 +1,24 @@
+[package]
+name = "engine-api"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Engine API JSON for Gloas: ExecutionPayloadV4, PayloadStatusV1 and the engine_newPayloadV5 params of an envelope and its bid. Pure, no I/O."
+
+[dependencies]
+consensus-types = { path = "../consensus-types" }
+ethereum_ssz.workspace = true
+alloy-primitives.workspace = true
+typenum.workspace = true
+serde = { version = "1", features = ["derive"] }
+# sha256 of `kzg_commitment_to_versioned_hash`: the version consensus-types already uses.
+sha2 = "0.10"
+
+[dev-dependencies]
+serde_json = "1"
+proptest = "1"
+# Evaluates the OpenRPC `pattern`s of the vendored schema fixture as written.
+regex = "1"
+ssz_types.workspace = true

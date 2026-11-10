@@ -2144,6 +2144,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-api"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "consensus-types",
+ "ethereum_ssz",
+ "proptest",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "ssz_types",
+ "typenum",
+]
+
+[[package]]
 name = "enr"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
