@@ -89,16 +89,23 @@ fn validator_rejects_off_schema_json() {
 #[test]
 fn pinned_example_round_trips() {
     let pinned = Pinned::load();
-    let example = &pinned.example()["params"];
+    let pinned_example = &pinned.example()["params"];
 
-    // The pinned example omits `slotNumber`, which its own schema requires: the decoder
-    // rejects it, as an EL answers `-32602: Invalid params` for a missing field.
-    assert!(pinned.check_params(example).is_err());
+    // The pinned example is not a valid request as written, in two ways the decoder catches:
+    // 1. It omits `slotNumber`, which its own schema requires (an EL answers `-32602`).
+    let err = pinned.check_params(pinned_example).unwrap_err();
+    assert!(err.contains("missing required slotNumber"), "{err}");
+    // 2. Its `blockAccessList` has an odd number of hex digits (1091), which `DATA` forbids
+    //    (common.md); the OpenRPC `bytes` pattern does not check it.
+    let block_access_list = &pinned_example[0]["blockAccessList"];
+    assert_eq!(block_access_list.as_str().unwrap().len(), 2 + 1091);
+    assert!(serde_json::from_value::<Data>(block_access_list.clone()).is_err());
+    let mut example = pinned_example.clone();
+    example[0]["blockAccessList"] = json!("0xc0");
     let err = serde_json::from_value::<NewPayloadV5Params>(example.clone()).unwrap_err();
     assert!(err.to_string().contains("slotNumber"), "{err}");
 
-    // With the field added, the example fits the schema and re-encodes byte for byte.
-    let mut example = example.clone();
+    // With both fixed, every other pinned value fits the schema and re-encodes as pinned.
     example[0]["slotNumber"] = json!("0x1");
     pinned.check_params(&example).unwrap();
     let decoded: NewPayloadV5Params = serde_json::from_value(example.clone()).unwrap();

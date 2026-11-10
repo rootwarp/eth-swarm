@@ -27,6 +27,15 @@ pub struct EngineMethods {
 }
 
 /// The methods of `fork`.
-pub const fn engine_methods(_fork: ForkName) -> EngineMethods {
-    todo!()
+pub const fn engine_methods(fork: ForkName) -> EngineMethods {
+    match fork {
+        ForkName::Fulu => EngineMethods {
+            new_payload: NEW_PAYLOAD_V4,
+            forkchoice_updated: FORKCHOICE_UPDATED_V3,
+        },
+        ForkName::Gloas => EngineMethods {
+            new_payload: NEW_PAYLOAD_V5,
+            forkchoice_updated: FORKCHOICE_UPDATED_V4,
+        },
+    }
 }

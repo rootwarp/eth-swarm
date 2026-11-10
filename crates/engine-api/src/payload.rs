@@ -5,6 +5,7 @@ use crate::encoding::{Data, FixedData, Quantity, Quantity256};
 use consensus_types::gloas::{ExecutionPayload, Withdrawal};
 use consensus_types::EthSpec;
 use serde::{Deserialize, Serialize};
+use typenum::Unsigned;
 
 /// `BYTES_PER_LOGS_BLOOM`: `logsBloom` is `DATA`, 256 bytes.
 pub const BYTES_PER_LOGS_BLOOM: usize = 256;
@@ -47,14 +48,43 @@ pub struct ExecutionPayloadV4 {
 }
 
 impl From<&Withdrawal> for WithdrawalV1 {
-    fn from(_w: &Withdrawal) -> Self {
-        todo!()
+    fn from(w: &Withdrawal) -> Self {
+        Self {
+            index: Quantity(w.index),
+            validator_index: Quantity(w.validator_index),
+            address: w.address.into(),
+            amount: Quantity(w.amount),
+        }
     }
 }
 
 impl<E: EthSpec> From<&ExecutionPayload<E>> for ExecutionPayloadV4 {
-    fn from(_p: &ExecutionPayload<E>) -> Self {
-        todo!()
+    fn from(p: &ExecutionPayload<E>) -> Self {
+        // `BYTES_PER_LOGS_BLOOM` is the same in every preset; checked when `E` is instantiated.
+        const { assert!(E::BytesPerLogsBloom::USIZE == BYTES_PER_LOGS_BLOOM) };
+        let mut logs_bloom = [0; BYTES_PER_LOGS_BLOOM];
+        logs_bloom.copy_from_slice(&p.logs_bloom);
+        Self {
+            parent_hash: p.parent_hash.into(),
+            fee_recipient: p.fee_recipient.into(),
+            state_root: p.state_root.into(),
+            receipts_root: p.receipts_root.into(),
+            logs_bloom: FixedData(logs_bloom),
+            prev_randao: p.prev_randao.into(),
+            block_number: Quantity(p.block_number),
+            gas_limit: Quantity(p.gas_limit),
+            gas_used: Quantity(p.gas_used),
+            timestamp: Quantity(p.timestamp),
+            extra_data: Data(p.extra_data.to_vec()),
+            base_fee_per_gas: Quantity256(p.base_fee_per_gas),
+            block_hash: p.block_hash.into(),
+            transactions: p.transactions.iter().map(|t| Data(t.to_vec())).collect(),
+            withdrawals: p.withdrawals.iter().map(WithdrawalV1::from).collect(),
+            blob_gas_used: Quantity(p.blob_gas_used),
+            excess_blob_gas: Quantity(p.excess_blob_gas),
+            block_access_list: Data(p.block_access_list.to_vec()),
+            slot_number: Quantity(p.slot_number),
+        }
     }
 }
 
@@ -66,7 +96,7 @@ pub enum ValidationStatus {
     Invalid,
     Syncing,
     Accepted,
-    /// Deprecated since `engine_newPayloadV2`; an EL that still sends it means INVALID.
+    /// Supplanted by `INVALID` from `engine_newPayloadV2` on (`shanghai.md`); still means INVALID.
     InvalidBlockHash,
 }
 

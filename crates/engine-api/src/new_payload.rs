@@ -9,6 +9,9 @@ use consensus_types::gloas::{ExecutionPayloadBid, ExecutionPayloadEnvelope, Exec
 use consensus_types::primitives::{KZGCommitment, VersionedHash};
 use consensus_types::EthSpec;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
+use ssz::Encode;
+use std::ops::Deref;
 
 /// `VERSIONED_HASH_VERSION_KZG` (`specs/deneb/beacon-chain.md`).
 pub const VERSIONED_HASH_VERSION_KZG: u8 = 0x01;
@@ -37,34 +40,79 @@ pub struct NewPayloadV5Params {
 }
 
 impl Serialize for NewPayloadV5Params {
-    fn serialize<S: Serializer>(&self, _s: S) -> Result<S::Ok, S::Error> {
-        todo!()
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        (
+            &self.execution_payload,
+            &self.expected_blob_versioned_hashes,
+            &self.parent_beacon_block_root,
+            &self.execution_requests,
+        )
+            .serialize(s)
     }
 }
 
 impl<'de> Deserialize<'de> for NewPayloadV5Params {
-    fn deserialize<D: Deserializer<'de>>(_d: D) -> Result<Self, D::Error> {
-        todo!()
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let (payload, hashes, root, requests) = Deserialize::deserialize(d)?;
+        Ok(Self {
+            execution_payload: payload,
+            expected_blob_versioned_hashes: hashes,
+            parent_beacon_block_root: root,
+            execution_requests: requests,
+        })
     }
 }
 
 /// `kzg_commitment_to_versioned_hash` (`specs/deneb/beacon-chain.md` L309):
 /// `VERSIONED_HASH_VERSION_KZG + sha256(kzg_commitment)[1:]`.
-pub fn kzg_commitment_to_versioned_hash(_commitment: &KZGCommitment) -> VersionedHash {
-    todo!()
+pub fn kzg_commitment_to_versioned_hash(commitment: &KZGCommitment) -> VersionedHash {
+    let mut hash: [u8; 32] = Sha256::digest(commitment).into();
+    hash[0] = VERSIONED_HASH_VERSION_KZG;
+    hash.into()
 }
 
 /// `get_execution_requests_list` (`specs/gloas/beacon-chain.md` L2126-2141): `request_type ||
 /// ssz_serialize(request_data)` for each non-empty group, in request-type order.
-pub fn get_execution_requests_list<E: EthSpec>(_requests: &ExecutionRequests<E>) -> Vec<Vec<u8>> {
-    todo!()
+pub fn get_execution_requests_list<E: EthSpec>(r: &ExecutionRequests<E>) -> Vec<Vec<u8>> {
+    let mut list = Vec::new();
+    push_group(&mut list, DEPOSIT_REQUEST_TYPE, &r.deposits);
+    push_group(&mut list, WITHDRAWAL_REQUEST_TYPE, &r.withdrawals);
+    push_group(&mut list, CONSOLIDATION_REQUEST_TYPE, &r.consolidations);
+    push_group(&mut list, BUILDER_DEPOSIT_REQUEST_TYPE, &r.builder_deposits);
+    push_group(&mut list, BUILDER_EXIT_REQUEST_TYPE, &r.builder_exits);
+    list
+}
+
+fn push_group<L, T>(list: &mut Vec<Vec<u8>>, request_type: u8, requests: &L)
+where
+    L: Encode + Deref<Target = [T]>,
+{
+    if requests.is_empty() {
+        return;
+    }
+    let mut bytes = Vec::with_capacity(1 + requests.ssz_bytes_len());
+    bytes.push(request_type);
+    requests.ssz_append(&mut bytes);
+    list.push(bytes);
 }
 
 /// The `engine_newPayloadV5` params of `envelope`, whose committed bid is `bid`
 /// (`state.latest_execution_payload_bid`).
 pub fn new_payload_v5_params<E: EthSpec>(
-    _envelope: &ExecutionPayloadEnvelope<E>,
-    _bid: &ExecutionPayloadBid<E>,
+    envelope: &ExecutionPayloadEnvelope<E>,
+    bid: &ExecutionPayloadBid<E>,
 ) -> NewPayloadV5Params {
-    todo!()
+    NewPayloadV5Params {
+        execution_payload: ExecutionPayloadV4::from(&envelope.payload),
+        expected_blob_versioned_hashes: bid
+            .blob_kzg_commitments
+            .iter()
+            .map(|c| kzg_commitment_to_versioned_hash(c).into())
+            .collect(),
+        parent_beacon_block_root: envelope.parent_beacon_block_root.into(),
+        execution_requests: get_execution_requests_list(&envelope.execution_requests)
+            .into_iter()
+            .map(Data)
+            .collect(),
+    }
 }
