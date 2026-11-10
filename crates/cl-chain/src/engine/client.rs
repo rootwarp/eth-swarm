@@ -372,3 +372,72 @@ impl Drop for FcuSender {
         self.task.abort();
     }
 }
+
+/// `engine_newPayloadV5`'s timeout (execution-apis `amsterdam.md`): the wait cl-engine gives
+/// the EL, which cl-chain never shortens.
+pub const NEW_PAYLOAD_V5_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// `chain_new_payload_verdicts_total{verdict}`.
+#[derive(Clone, Debug, Default)]
+pub struct NewPayloadMetrics {
+    verdicts: Family<[(&'static str, &'static str); 1], Counter>,
+}
+
+impl NewPayloadMetrics {
+    /// Registers the counter in `registry`.
+    pub fn register(_registry: &mut Registry) -> Self {
+        todo!()
+    }
+
+    /// Verdicts labelled `verdict` so far.
+    #[must_use]
+    pub fn verdicts(&self, _verdict: &str) -> u64 {
+        let _ = &self.verdicts;
+        todo!()
+    }
+}
+
+/// cl-chain's `NewPayload` client of cl-engine.
+pub struct NewPayloadClient {
+    socket: PathBuf,
+    expected_uid: u32,
+    seq: EngineSeq,
+    metrics: NewPayloadMetrics,
+    client: Mutex<Option<EngineServiceClient<Channel>>>,
+}
+
+impl NewPayloadClient {
+    /// A client of cl-engine's socket at `socket`, served by `expected_uid`, with `seq` from
+    /// `seq`. It connects at the first call.
+    #[must_use]
+    pub fn new(
+        socket: impl Into<PathBuf>,
+        expected_uid: u32,
+        seq: EngineSeq,
+        metrics: NewPayloadMetrics,
+    ) -> Self {
+        Self {
+            socket: socket.into(),
+            expected_uid,
+            seq,
+            metrics,
+            client: Mutex::new(None),
+        }
+    }
+
+    /// Sends `envelope`, whose committed bid is `bid`, to the EL.
+    pub async fn new_payload<E: consensus_types::EthSpec>(
+        &self,
+        _envelope: &consensus_types::gloas::ExecutionPayloadEnvelope<E>,
+        _bid: &consensus_types::gloas::ExecutionPayloadBid<E>,
+    ) -> super::verdict::ElVerdict {
+        let _ = (
+            &self.socket,
+            self.expected_uid,
+            &self.seq,
+            &self.metrics,
+            &self.client,
+        );
+        todo!()
+    }
+}

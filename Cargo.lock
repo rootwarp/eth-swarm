@@ -1062,6 +1062,7 @@ dependencies = [
  "cl-verify",
  "consensus-types",
  "crypto-kzg",
+ "engine-api",
  "ethereum_ssz",
  "ethswarm-proto",
  "hex",
