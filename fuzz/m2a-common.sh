@@ -79,6 +79,7 @@ M2A_KEY_PATHS=(
   crates/cl-discv5
   crates/cl-p2p
   crates/consensus-types
+  crates/engine-api
   crates/ethswarm-proto
   crates/ipc
   crates/network-config
