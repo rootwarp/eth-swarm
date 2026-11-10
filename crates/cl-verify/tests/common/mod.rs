@@ -695,6 +695,79 @@ pub fn output(f: &HashMap<String, Vec<String>>) -> String {
     f["output"][0].clone()
 }
 
+// ---- KZG cells ----
+
+/// The cells of cryptography-specs case `verify_cell_kzg_proof_batch_case_<case>` and the
+/// fixture's output (`true`, `false` or `null`).
+pub fn kzg_case(case: &str) -> (Vec<KzgCellProof>, String) {
+    let f = read_fixture(&format!(
+        "cryptography-specs/verify_cell_kzg_proof_batch/verify_cell_kzg_proof_batch_case_{case}/data.yaml"
+    ));
+    let commitments = hexes(&f, "commitments");
+    let cells = hexes(&f, "cells");
+    let proofs = hexes(&f, "proofs");
+    let indices: Vec<u64> = f["cell_indices"]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+    assert_eq!(commitments.len(), cells.len());
+    assert_eq!(indices.len(), cells.len());
+    let out = (0..cells.len())
+        .map(|i| KzgCellProof {
+            commitment: commitments[i].clone(),
+            cell_index: indices[i],
+            cell: cells[i].clone(),
+            proof: proofs[i].clone(),
+        })
+        .collect();
+    (out, output(&f))
+}
+
+/// The all-zero cell at `cell_index`, with commitment and proof at infinity: the zero polynomial
+/// opens to it at every index, so it verifies.
+pub fn zero_cell(cell_index: u64) -> KzgCellProof {
+    let infinity = [&[0xc0u8][..], &[0u8; 47][..]].concat();
+    KzgCellProof {
+        commitment: infinity.clone(),
+        cell_index,
+        cell: vec![0; 2048],
+        proof: infinity,
+    }
+}
+
+/// `blobs` zero blobs in columns `0..columns`: a block's worth of valid cells.
+pub fn zero_block(columns: u64, blobs: usize) -> Vec<KzgCellProof> {
+    (0..blobs)
+        .flat_map(|_| (0..columns).map(zero_cell))
+        .collect()
+}
+
+pub fn kzg_cells_request(request_id: u64, cells: Vec<KzgCellProof>) -> VerifyKzgRequestBody {
+    VerifyKzgRequestBody {
+        request_id,
+        cells,
+        deadline_unix_ms: far_deadline(),
+        generation: 0,
+    }
+}
+
+/// A one-cell KZG request for a stream with server `generation`, padded (through an oversized
+/// `cell`, so it is a decode error if decoded) to `total` encoded bytes.
+pub fn kzg_request_of_size(request_id: u64, total: usize, generation: u64) -> VerifyKzgRequestBody {
+    use prost::Message;
+    let mut body = kzg_cells_request(request_id, vec![zero_cell(1)]);
+    body.generation = generation;
+    let mut pad = total as i64;
+    loop {
+        body.cells[0].cell = vec![0; pad as usize];
+        let len = kzg_body(body.clone()).encoded_len() as i64;
+        if len == total as i64 {
+            return body;
+        }
+        pad += total as i64 - len;
+    }
+}
+
 // ---- test wall clocks ----
 
 /// The system clock plus an offset the test can step forward at any moment.

@@ -24,30 +24,6 @@ fn production_server_loads_only_the_pinned_setup() {
     ));
 }
 
-fn cells_of(case: &str) -> (Vec<KzgCellProof>, String) {
-    let f = read_fixture(&format!(
-        "cryptography-specs/verify_cell_kzg_proof_batch/verify_cell_kzg_proof_batch_case_{case}/data.yaml"
-    ));
-    let commitments = hexes(&f, "commitments");
-    let cells = hexes(&f, "cells");
-    let proofs = hexes(&f, "proofs");
-    let indices: Vec<u64> = f["cell_indices"]
-        .iter()
-        .map(|s| s.parse().unwrap())
-        .collect();
-    assert_eq!(commitments.len(), cells.len());
-    assert_eq!(indices.len(), cells.len());
-    let out = (0..cells.len())
-        .map(|i| KzgCellProof {
-            commitment: commitments[i].clone(),
-            cell_index: indices[i],
-            cell: cells[i].clone(),
-            proof: proofs[i].clone(),
-        })
-        .collect();
-    (out, output(&f))
-}
-
 #[tokio::test]
 async fn verify_cell_kzg_proof_batch_cases() {
     let cases = [
@@ -64,7 +40,7 @@ async fn verify_cell_kzg_proof_batch_cases() {
     let mut h = start().await;
     let mut s = kzg_open(&mut h).await;
     for (id, (case, want)) in cases.iter().enumerate() {
-        let (cells, expected) = cells_of(case);
+        let (cells, expected) = kzg_case(case);
         let spec = match expected.as_str() {
             "true" => VerifyStatus::Valid,
             "false" => VerifyStatus::Invalid,
@@ -89,7 +65,7 @@ async fn verify_cell_kzg_proof_batch_cases() {
 async fn empty_request_is_a_contract_violation_never_valid() {
     // The fixture expects `true` for zero cells; on the wire that would be an ACCEPT with no
     // pairing check, so the server refuses it.
-    let (cells, expected) = cells_of("valid_zero_cells");
+    let (cells, expected) = kzg_case("valid_zero_cells");
     assert_eq!((cells.len(), expected.as_str()), (0, "true"));
     let mut h = start().await;
     let mut s = kzg_open(&mut h).await;

@@ -1,6 +1,7 @@
-//! caps_before_decode: each server limit (257 BLS sets, a 4 MiB + 1 byte message, 129 KZG
-//! columns) refuses the request with a per-call error that fails the stream. No verdict frame is
-//! sent and the verifier is never called, so no point, cell or proof is decoded.
+//! caps_before_decode: each server limit (257 BLS sets, a 4 MiB + 1 byte BLS message, an 8 MiB + 1
+//! byte KZG message, 129 KZG columns) refuses the request with a per-call error that fails the
+//! stream. No verdict frame is sent and the verifier is never called, so no point, cell or proof
+//! is decoded.
 
 mod common;
 
@@ -8,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use cl_verify::bls::{BlsBackend, BlstBackend, PreparedSet};
-use cl_verify::caps::{MAX_BLS_SETS, MAX_KZG_COLUMNS, MAX_MESSAGE_BYTES};
+use cl_verify::caps::{MAX_BLS_SETS, MAX_KZG_COLUMNS, MAX_KZG_MESSAGE_BYTES, MAX_MESSAGE_BYTES};
 use cl_verify::kzg::{KzgBackend, KzgFailure, PreparedCells};
 use cl_verify::proto::common::ErrorCode;
 use cl_verify::proto::verify::{
@@ -153,21 +154,21 @@ async fn message_cap_refuses_4_mib_plus_one_before_decode() {
 #[tokio::test]
 async fn message_cap_applies_to_kzg_requests() {
     let (mut h, c) = counted().await;
-    // 1 column, many cells: under the column cap, over the byte cap.
-    let n = MAX_MESSAGE_BYTES / 2048 + 1;
+    // 1 column, many cells: under the column cap, over the 8 MiB KZG byte cap.
+    let n = MAX_KZG_MESSAGE_BYTES / 2048 + 1;
     let body = VerifyKzgRequestBody {
         request_id: 1,
         cells: vec![garbage_cell(0); n],
         deadline_unix_ms: far_deadline(),
         generation: 0,
     };
-    assert!(kzg_body(body.clone()).encoded_len() > MAX_MESSAGE_BYTES);
+    assert!(kzg_body(body.clone()).encoded_len() > MAX_KZG_MESSAGE_BYTES);
     let mut s = kzg_open(&mut h).await;
     s.send(kzg_body(body)).await;
-    assert_eq!(
-        s.expect_failure().await.code(),
-        ErrorCode::ContractViolation
-    );
+    let err = s.expect_failure().await;
+    assert_eq!(err.code(), ErrorCode::ContractViolation);
+    // From the frame header, not the cell cap that would follow decode.
+    assert!(err.detail.contains("message cap"), "{}", err.detail);
     assert_eq!(c.kzg_calls.load(Ordering::SeqCst), 0);
 }
 

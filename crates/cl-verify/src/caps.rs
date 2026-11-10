@@ -20,6 +20,8 @@ use crate::wire::wire_error;
 pub const MAX_BLS_SETS: usize = 256;
 /// Max encoded size of one request message, checked from the gRPC frame header before decode.
 pub const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+/// Max encoded size of one VerifyKzg request message.
+pub const MAX_KZG_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 /// Max distinct columns (`cell_index` values) in one `VerifyKzgRequestBody`: one block's worth,
 /// `NUMBER_OF_COLUMNS` = 128 (fulu/das-core.md).
 pub const MAX_KZG_COLUMNS: usize = 128;
