@@ -41,6 +41,7 @@
 //! epochs break the epoch rules is refused before it is applied. The metrics live on the registry
 //! from [`VerifyServer::metrics_registry`].
 
+use std::convert::Infallible;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -58,19 +59,23 @@ use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tokio_stream::Stream;
+use tonic::codegen::{http, Body, Service, StdError};
+use tonic::server::NamedService;
 use tonic::transport::server::UdsConnectInfo;
 use tonic::{Code, Request, Response, Status, Streaming};
 
 use crate::bls::{self, BlsBackend, BlstBackend, KeyCaches};
 use crate::builder_feed::{self, SharedBuilderCache};
-use crate::caps::{self, CapError, MAX_MESSAGE_BYTES};
+use crate::caps::{self, CapError, MAX_KZG_MESSAGE_BYTES, MAX_MESSAGE_BYTES};
 use crate::feed::{self, FrameEpochs, Restored, SharedCache, SnapshotWriter};
 use crate::frame::{InFrame, Inbound, OutFrame};
 use crate::handshake::Handshake;
 use crate::kzg::{self, KzgBackend, PinnedKzgBackend, TrustedSetupConfig};
 use crate::metrics::FeedLagMetrics;
 use crate::proto::common::{Error, ErrorCode};
-use crate::proto::verify::verify_service_server::{VerifyService, VerifyServiceServer};
+use crate::proto::verify::verify_service_server::{
+    VerifyService, VerifyServiceServer, SERVICE_NAME,
+};
 use crate::proto::verify::{
     bls_result, verify_bls_response, verify_kzg_response, BuilderKeyFeedRequest,
     BuilderKeyFeedRequestBody, BuilderKeyFeedResponse, BuilderKeyFeedResponseBody,
@@ -328,12 +333,59 @@ impl VerifyServer {
         *self.inner.feed_open.write().await = false;
     }
 
-    /// The tonic service, with the message cap enforced from the frame header before decode.
+    /// The tonic service, with the message caps enforced from the frame header before decode:
+    /// [`MAX_KZG_MESSAGE_BYTES`] for VerifyKzg, [`MAX_MESSAGE_BYTES`] for every other method.
     #[must_use]
-    pub fn into_service(self) -> VerifyServiceServer<Self> {
-        VerifyServiceServer::new(self)
-            .max_decoding_message_size(MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_MESSAGE_BYTES)
+    pub fn into_service(self) -> CappedService {
+        let server = Arc::new(self);
+        let capped = |max| {
+            VerifyServiceServer::from_arc(Arc::clone(&server))
+                .max_decoding_message_size(max)
+                .max_encoding_message_size(max)
+        };
+        CappedService {
+            kzg: capped(MAX_KZG_MESSAGE_BYTES),
+            rest: capped(MAX_MESSAGE_BYTES),
+        }
+    }
+}
+
+/// The VerifyKzg method path.
+const VERIFY_KZG_PATH: &str = "/ethswarm.verify.v1.VerifyService/VerifyKzg";
+
+/// The Verify service with a message cap per method ([`VerifyServer::into_service`]). tonic
+/// applies one cap to a whole service, so VerifyKzg calls go to a copy of the service under the
+/// KZG cap and every other call to one under [`MAX_MESSAGE_BYTES`]; both share the server.
+#[derive(Clone)]
+pub struct CappedService {
+    kzg: VerifyServiceServer<VerifyServer>,
+    rest: VerifyServiceServer<VerifyServer>,
+}
+
+impl NamedService for CappedService {
+    const NAME: &'static str = SERVICE_NAME;
+}
+
+impl<B> Service<http::Request<B>> for CappedService
+where
+    B: Body + Send + 'static,
+    B::Error: Into<StdError> + Send + 'static,
+{
+    type Response = <VerifyServiceServer<VerifyServer> as Service<http::Request<B>>>::Response;
+    type Error = Infallible;
+    type Future = <VerifyServiceServer<VerifyServer> as Service<http::Request<B>>>::Future;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+        // Generated tonic servers are always ready.
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if request.uri().path() == VERIFY_KZG_PATH {
+            self.kzg.call(request)
+        } else {
+            self.rest.call(request)
+        }
     }
 }
 

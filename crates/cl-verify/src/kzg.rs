@@ -4,7 +4,12 @@
 //! [`TrustedSetup::load_pinned`] under [`BETA4_MAINNET_SHA256`], the consensus-specs
 //! `v1.7.0-beta.4` mainnet setup; any other file is refused before it is parsed. The digest is
 //! fixed here, not configurable. cl-verify has no c-kzg dependency and no loader of its own.
+//!
+//! A request is verified by column ([`verify_columns`]): its cells go to c-kzg's
+//! `verify_cell_kzg_proof_batch` in one call, and only a batch that fails is bisected by column
+//! to name the invalid ones. The RPC answer stays one batch status ([`verify_cells`]).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -66,8 +71,8 @@ impl PreparedCells {
 mod backend {
     use super::{KzgFailure, PreparedCells};
 
-    /// The batch check behind [`super::verify_cells`]; injected so tests can stand in a failing
-    /// verifier.
+    /// The batch check behind [`super::verify_columns`] and [`super::verify_cells`]; injected so
+    /// tests can stand in a failing verifier.
     pub trait KzgBackend: Send + Sync + 'static {
         fn verify(&self, cells: &PreparedCells) -> Result<bool, KzgFailure>;
     }
@@ -128,21 +133,31 @@ fn classify_backend(err: BackendError) -> KzgFailure {
 /// allocated, so a request of many tiny malformed cells never reserves `BYTES_PER_CELL` per entry.
 /// A wrong length or an index `>= NUMBER_OF_COLUMNS` is `DECODE_ERROR`.
 pub fn prepare_cells(cells: &[KzgCellProof]) -> Result<PreparedCells, VerifyStatus> {
-    let well_formed = cells.iter().all(|c| {
-        c.cell_index < NUMBER_OF_COLUMNS
-            && c.commitment.len() == BYTES_PER_COMMITMENT
-            && c.cell.len() == BYTES_PER_CELL
-            && c.proof.len() == BYTES_PER_PROOF
-    });
-    if !well_formed {
+    if !cells.iter().all(well_formed) {
         return Err(VerifyStatus::DecodeError);
     }
+    decode(cells.iter(), cells.len())
+}
+
+/// The spec's lengths and a `cell_index` below `NUMBER_OF_COLUMNS`.
+fn well_formed(c: &KzgCellProof) -> bool {
+    c.cell_index < NUMBER_OF_COLUMNS
+        && c.commitment.len() == BYTES_PER_COMMITMENT
+        && c.cell.len() == BYTES_PER_CELL
+        && c.proof.len() == BYTES_PER_PROOF
+}
+
+/// Decodes `n` cells that are all [`well_formed`].
+fn decode<'a>(
+    cells: impl Iterator<Item = &'a KzgCellProof>,
+    n: usize,
+) -> Result<PreparedCells, VerifyStatus> {
     let decode = |_| VerifyStatus::DecodeError;
     let mut out = PreparedCells {
-        commitments: Vec::with_capacity(cells.len()),
-        cell_indices: Vec::with_capacity(cells.len()),
-        cells: Vec::with_capacity(cells.len()),
-        proofs: Vec::with_capacity(cells.len()),
+        commitments: Vec::with_capacity(n),
+        cell_indices: Vec::with_capacity(n),
+        cells: Vec::with_capacity(n),
+        proofs: Vec::with_capacity(n),
     };
     for c in cells {
         out.commitments
@@ -174,38 +189,170 @@ pub struct ColumnResult {
     pub verdict: ColumnVerdict,
 }
 
-/// Per-column verdicts for `cells`, one per distinct `cell_index` in order of first appearance.
+/// Per-column verdicts for `cells`, one per distinct `cell_index` in order of first appearance. A
+/// column is the cells that share a `cell_index`: a data column sidecar is one column
+/// (`verify_data_column_sidecar_kzg_proofs` passes `[sidecar.index] * len(sidecar.column)`,
+/// fulu/p2p-interface.md).
+///
+/// A column with a malformed cell (see [`prepare_cells`]) is `DecodeError` and is not verified.
+/// The cells of the other columns go to the backend as one batch. Only if it returns false are
+/// those columns bisected, re-verifying halves of whole columns until every invalid column is
+/// named. A backend error at any step is returned as is, with no column verdict. The column cap
+/// is the caller's ([`crate::caps::check_kzg`]).
 pub fn verify_columns(
     cells: &[KzgCellProof],
     backend: &dyn KzgBackend,
 ) -> Result<Vec<ColumnResult>, KzgFailure> {
-    let _ = (cells, backend);
-    todo!("verify_columns")
+    attribute(cells, backend, || Ok(()))
 }
 
-/// Batch verdict for `cells`: VALID only if every cell verifies. An `Error` is returned only when
-/// there is no verdict; its status is then `OVERLOADED` (core unavailable), never VALID. The
-/// server refuses an empty request before it gets here (see [`crate::caps::check_kzg`]).
+/// [`verify_columns`], calling `step` before each bisect batch; its error stops the bisect.
+fn attribute<E: From<KzgFailure>>(
+    cells: &[KzgCellProof],
+    backend: &dyn KzgBackend,
+    mut step: impl FnMut() -> Result<(), E>,
+) -> Result<Vec<ColumnResult>, E> {
+    let columns = group(cells);
+    // Ascending positions in `columns` of the columns that are verified.
+    let checked: Vec<usize> = (0..columns.len())
+        .filter(|&c| columns[c].1.iter().all(|&i| well_formed(&cells[i])))
+        .collect();
+    // Columns `checked[from..to]` as one batch.
+    let verify = |from: usize, to: usize| -> Result<bool, E> {
+        let picked = &checked[from..to];
+        let n = picked.iter().map(|&c| columns[c].1.len()).sum();
+        let members = picked
+            .iter()
+            .flat_map(|&c| columns[c].1.iter().map(|&i| &cells[i]));
+        let batch = decode(members, n).map_err(|_| KzgFailure::BadInput)?;
+        Ok(backend.verify(&batch)?)
+    };
+    let mut valid = vec![true; checked.len()];
+    if !checked.is_empty() && !verify(0, checked.len())? {
+        let mut half = |from, to| {
+            step()?;
+            verify(from, to)
+        };
+        bisect(0, checked.len(), &mut half, &mut valid)?;
+    }
+    Ok(columns
+        .iter()
+        .enumerate()
+        .map(|(c, &(cell_index, _))| {
+            let verdict = match checked.binary_search(&c) {
+                Ok(k) if valid[k] => ColumnVerdict::Valid,
+                Ok(_) => ColumnVerdict::Invalid,
+                Err(_) => ColumnVerdict::DecodeError,
+            };
+            ColumnResult {
+                cell_index,
+                verdict,
+            }
+        })
+        .collect())
+}
+
+/// The columns of `cells` in order of first appearance: each `cell_index` with the positions of
+/// its cells.
+fn group(cells: &[KzgCellProof]) -> Vec<(u64, Vec<usize>)> {
+    let mut slots = HashMap::new();
+    let mut columns: Vec<(u64, Vec<usize>)> = Vec::new();
+    for (i, c) in cells.iter().enumerate() {
+        let slot = *slots.entry(c.cell_index).or_insert_with(|| {
+            columns.push((c.cell_index, Vec::new()));
+            columns.len() - 1
+        });
+        columns[slot].1.push(i);
+    }
+    columns
+}
+
+/// Columns `from..to` failed as one batch: clears `valid` for each invalid one. `verify(a, b)`
+/// checks columns `a..b` as one batch. A half that verifies is valid. When the first half
+/// verifies, the failure is in the second, which is split without being verified whole again (a
+/// batch of valid cells always verifies).
+fn bisect<E>(
+    from: usize,
+    to: usize,
+    verify: &mut dyn FnMut(usize, usize) -> Result<bool, E>,
+    valid: &mut [bool],
+) -> Result<(), E> {
+    if to - from == 1 {
+        valid[from] = false;
+        return Ok(());
+    }
+    let mid = from + (to - from) / 2;
+    if verify(from, mid)? {
+        return bisect(mid, to, verify, valid);
+    }
+    bisect(from, mid, verify, valid)?;
+    if verify(mid, to)? {
+        return Ok(());
+    }
+    bisect(mid, to, verify, valid)
+}
+
+/// Batch verdict for `cells`: VALID only if every column is ([`verify_columns`]), `INVALID` if
+/// one is not, `DECODE_ERROR` with no KZG work if any cell is malformed. An `Error` is returned
+/// only when there is no verdict; its status is then `OVERLOADED` (core unavailable), never
+/// VALID. The server refuses an empty request before it gets here (see
+/// [`crate::caps::check_kzg`]).
 pub fn verify_cells(
     cells: &[KzgCellProof],
     backend: &dyn KzgBackend,
 ) -> (VerifyStatus, Option<Error>) {
-    let prepared = match prepare_cells(cells) {
-        Ok(p) => p,
-        Err(status) => return (status, None),
-    };
-    match backend.verify(&prepared) {
-        Ok(true) => (VerifyStatus::Valid, None),
-        Ok(false) => (VerifyStatus::Invalid, None),
-        Err(KzgFailure::BadInput) => (VerifyStatus::DecodeError, None),
-        Err(KzgFailure::Internal(detail)) => unavailable(&detail),
+    match batch_status(cells, backend, || Ok::<(), KzgFailure>(())) {
+        Ok(status) => (status, None),
+        Err(failure) => no_verdict(failure),
+    }
+}
+
+/// [`verify_cells`]'s status, calling `step` before each bisect batch.
+fn batch_status<E: From<KzgFailure>>(
+    cells: &[KzgCellProof],
+    backend: &dyn KzgBackend,
+    step: impl FnMut() -> Result<(), E>,
+) -> Result<VerifyStatus, E> {
+    if !cells.iter().all(well_formed) {
+        return Ok(VerifyStatus::DecodeError);
+    }
+    let invalid: Vec<u64> = attribute(cells, backend, step)?
+        .into_iter()
+        .filter(|c| c.verdict != ColumnVerdict::Valid)
+        .map(|c| c.cell_index)
+        .collect();
+    if invalid.is_empty() {
+        return Ok(VerifyStatus::Valid);
+    }
+    tracing::debug!(?invalid, "KZG columns failed verification");
+    Ok(VerifyStatus::Invalid)
+}
+
+fn no_verdict(failure: KzgFailure) -> (VerifyStatus, Option<Error>) {
+    match failure {
+        KzgFailure::BadInput => (VerifyStatus::DecodeError, None),
+        KzgFailure::Internal(detail) => unavailable(&detail),
+    }
+}
+
+/// Why a gated job stopped without its verdict.
+enum Halt {
+    Failed(KzgFailure),
+    Closed,
+    Late,
+}
+
+impl From<KzgFailure> for Halt {
+    fn from(failure: KzgFailure) -> Self {
+        Self::Failed(failure)
     }
 }
 
 /// [`verify_cells`] for a job admitted with `deadline`, run on a blocking thread: `None` if its
 /// stream closed before it ran (nothing is answered), `DEADLINE_EXCEEDED` with no KZG work if the
 /// deadline is no longer open on both clocks (the job may have waited for a thread past it, and a
-/// wall clock that steps backwards cannot reopen it).
+/// wall clock that steps backwards cannot reopen it). Both are checked again before each bisect
+/// batch, so a failed batch is not bisected past the deadline or for a closed stream.
 pub fn verify_cells_gated(
     cells: &[KzgCellProof],
     deadline: &Deadline,
@@ -213,13 +360,21 @@ pub fn verify_cells_gated(
     clock: &dyn WallClock,
     backend: &dyn KzgBackend,
 ) -> Option<(VerifyStatus, Option<Error>)> {
-    if closed.load(Ordering::SeqCst) {
-        return None;
+    let gate = || {
+        if closed.load(Ordering::SeqCst) {
+            Err(Halt::Closed)
+        } else if deadline.open(clock) {
+            Ok(())
+        } else {
+            Err(Halt::Late)
+        }
+    };
+    match gate().and_then(|()| batch_status(cells, backend, gate)) {
+        Ok(status) => Some((status, None)),
+        Err(Halt::Failed(failure)) => Some(no_verdict(failure)),
+        Err(Halt::Closed) => None,
+        Err(Halt::Late) => Some((VerifyStatus::DeadlineExceeded, None)),
     }
-    if !deadline.open(clock) {
-        return Some((VerifyStatus::DeadlineExceeded, None));
-    }
-    Some(verify_cells(cells, backend))
 }
 
 /// The no-verdict answer: `OVERLOADED` plus `ERROR_CODE_RESOURCE_UNAVAILABLE`.

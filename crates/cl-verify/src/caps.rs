@@ -1,10 +1,11 @@
 //! Request caps, checked on the received message before any point or cell is decoded.
 //!
-//! The 4 MiB message cap is enforced by the tonic codec from the gRPC frame header, before the
-//! protobuf is decoded at all (see [`crate::server::VerifyServer::into_service`]). The other caps
-//! run on the decoded protobuf but before any BLS point, KZG commitment, cell or proof is touched,
-//! and before anything is allocated per item. A request over any cap is a contract violation that
-//! fails the stream; it never yields a verdict.
+//! The message caps (8 MiB for a VerifyKzg request, 4 MiB for any other) are enforced by the
+//! tonic codec from the gRPC frame header, before the protobuf is decoded at all (see
+//! [`crate::server::VerifyServer::into_service`]). The other caps run on the decoded protobuf but
+//! before any BLS point, KZG commitment, cell or proof is touched, and before anything is
+//! allocated per item. A request over any cap is a contract violation that fails the stream; it
+//! never yields a verdict.
 
 use std::collections::HashSet;
 
@@ -18,9 +19,12 @@ use crate::wire::wire_error;
 
 /// Max BLS sets in one `VerifyBlsRequestBody` (verify.proto: "At most 256 sets").
 pub const MAX_BLS_SETS: usize = 256;
-/// Max encoded size of one request message, checked from the gRPC frame header before decode.
+/// Max encoded size of one request message of every method but VerifyKzg (VerifyBls and the key
+/// feeds), checked from the gRPC frame header before decode.
 pub const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
-/// Max encoded size of one VerifyKzg request message.
+/// Max encoded size of one VerifyKzg request message, checked the same way. A block's columns at
+/// 21 blobs (128 * 21 cells of `BYTES_PER_CELL`, each with a 48-byte commitment and proof: about
+/// 5.5 MiB encoded) do not fit in [`MAX_MESSAGE_BYTES`].
 pub const MAX_KZG_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 /// Max distinct columns (`cell_index` values) in one `VerifyKzgRequestBody`: one block's worth,
 /// `NUMBER_OF_COLUMNS` = 128 (fulu/das-core.md).
