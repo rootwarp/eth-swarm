@@ -7,10 +7,12 @@ fn sample(slot: u64, lag: i64) -> Sample {
     Sample::observed(
         slot,
         Head {
+            payload_status: None,
             slot: (1000_i64 - lag).try_into().unwrap(),
             root: Root::from([0x11; 32]),
         },
         Head {
+            payload_status: None,
             slot: 1000,
             root: Root::from([0x22; 32]),
         },
@@ -152,10 +154,12 @@ fn invalid_timelines_and_forged_lag_are_rejected() {
     assert!(Sample::observed(
         0,
         Head {
+            payload_status: None,
             slot: u64::MAX,
             root: Root::ZERO
         },
         Head {
+            payload_status: None,
             slot: 0,
             root: Root::ZERO
         }
@@ -223,6 +227,7 @@ impl testkit::head_lag::HeadSource for ConstantHead {
         self.calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Head {
+            payload_status: None,
             slot: self.slot,
             root: Root::ZERO,
         })
@@ -336,6 +341,7 @@ async fn missed_and_overrun_slots_are_gaps_not_late_matches() {
         async fn read_head(&self) -> Result<Head, testkit::head_lag::Error> {
             self.clock.advance(Duration::from_secs(13));
             Ok(Head {
+                payload_status: None,
                 slot: 1000,
                 root: Root::ZERO,
             })

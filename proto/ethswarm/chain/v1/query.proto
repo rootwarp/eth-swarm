@@ -113,6 +113,14 @@ message GetStateSummaryRequest {
   HotStateId state = 1;
 }
 
+// Fork-choice head payload selection; NOT an Engine API validation status.
+enum HeadPayloadStatus {
+  // Never a valid explicit wire value. An absent optional field is missing evidence.
+  HEAD_PAYLOAD_STATUS_UNSPECIFIED = 0;
+  HEAD_PAYLOAD_STATUS_EMPTY = 1;
+  HEAD_PAYLOAD_STATUS_FULL = 2;
+}
+
 message GetStateSummaryResponse {
   uint64 slot = 1;
   // 32 bytes (Root).
@@ -122,6 +130,10 @@ message GetStateSummaryResponse {
   ethswarm.common.v1.Checkpoint justified = 4;
   ethswarm.common.v1.Checkpoint finalized = 5;
   ethswarm.common.v1.ReadStamp stamp = 6;
+  // Head-only: MUST describe block_root/slot in the same atomic read. Absent for
+  // fixed-state summaries or older servers; never infer FULL/EMPTY from absence.
+  // Explicit zero is a contract violation; unknown values are ignored as missing evidence.
+  optional HeadPayloadStatus payload_status = 7;
 }
 
 message GetHotValidatorsRequest {

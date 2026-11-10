@@ -1,4 +1,4 @@
-//! Epoch-aligned finalized/justified checkpoint comparisons. Gaps are never matches.
+//! Epoch-aligned checkpoints and lag-gated head/payload-status comparisons. Gaps never match.
 
 use crate::archive::canonical_hex;
 use consensus_types::primitives::Root;
@@ -426,3 +426,9 @@ pub async fn run(
     }
     Ok(report)
 }
+
+mod head;
+pub use head::{
+    compare_head, run_head, HeadError, HeadEvents, HeadGap, HeadRecord, HeadSnapshot, HeadStream,
+    HeadSummary, PayloadStatus,
+};

@@ -11,6 +11,9 @@ pub struct Head {
     pub slot: u64,
     /// Beacon block root.
     pub root: Root,
+    /// Optional atomic chain.v1 head selection; absent on header-only or older observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_status: Option<crate::root_diff::PayloadStatus>,
 }
 
 /// Why a slot has no usable head comparison.
@@ -264,6 +267,7 @@ impl HeadSource for crate::root_diff::Reference {
             .and_then(crate::archive::canonical_hex::<32>)
             .ok_or(Error::Read)?;
         Ok(Head {
+            payload_status: None,
             slot,
             root: Root::from(root),
         })
@@ -279,7 +283,13 @@ impl HeadSource for crate::root_diff::QuerySource {
             .await
             .map_err(|_| Error::Read)?;
         let root: [u8; 32] = response.block_root.try_into().map_err(|_| Error::Read)?;
+        let payload_status = response
+            .payload_status
+            .map(crate::root_diff::PayloadStatus::from_wire)
+            .transpose()
+            .map_err(|_| Error::Read)?;
         Ok(Head {
+            payload_status,
             slot: response.slot,
             root: Root::from(root),
         })
@@ -390,8 +400,51 @@ pub async fn run(
     pause: &impl crate::collector::Pause,
     output: &mut (impl tokio::io::AsyncWrite + Unpin),
 ) -> Result<Summary, Error> {
-    use std::time::Duration;
+    run_with_sink(
+        config,
+        ours,
+        reference,
+        clock,
+        pause,
+        &mut JsonlSink { output },
+    )
+    .await
+}
+
+/// A per-slot consumer, sharing the exact sampling cadence across lag and head comparisons.
+pub trait SampleSink {
+    /// Persist or process a completed sample; failure stops the finite run.
+    fn record(&mut self, sample: &Sample) -> impl std::future::Future<Output = Result<(), Error>>;
+}
+struct JsonlSink<'a, W> {
+    output: &'a mut W,
+}
+impl<W: tokio::io::AsyncWrite + Unpin> SampleSink for JsonlSink<'_, W> {
+    async fn record(&mut self, sample: &Sample) -> Result<(), Error> {
+        write_jsonl(self.output, sample).await
+    }
+}
+pub(crate) async fn write_jsonl(
+    output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    value: &impl Serialize,
+) -> Result<(), Error> {
     use tokio::io::AsyncWriteExt;
+    let mut line = serde_json::to_vec(value).map_err(|_| Error::Record)?;
+    line.push(b'\n');
+    output.write_all(&line).await.map_err(Error::Io)?;
+    output.flush().await.map_err(Error::Io)
+}
+
+/// Poll fixed timestamps and deliver each gap/comparison once to a bounded consumer.
+pub async fn run_with_sink(
+    config: RunConfig,
+    ours: &impl HeadSource,
+    reference: &impl HeadSource,
+    clock: &impl crate::collector::Clock,
+    pause: &impl crate::collector::Pause,
+    sink: &mut impl SampleSink,
+) -> Result<Summary, Error> {
+    use std::time::Duration;
     if config.slots == 0 || config.slots > MAX_SAMPLES || config.slots_per_epoch == 0 {
         return Err(Error::Config);
     }
@@ -420,10 +473,7 @@ pub async fn run(
         if Duration::from_nanos(clock.now().wall_ns).saturating_sub(due) >= window {
             sample = Sample::gap(slot, Gap::MissedSample);
         }
-        let mut line = serde_json::to_vec(&sample).map_err(|_| Error::Record)?;
-        line.push(b'\n');
-        output.write_all(&line).await.map_err(Error::Io)?;
-        output.flush().await.map_err(Error::Io)?;
+        sink.record(&sample).await?;
         samples.push(sample);
     }
     analyze(&samples, config.slots_per_epoch)

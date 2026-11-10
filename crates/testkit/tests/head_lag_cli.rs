@@ -7,10 +7,12 @@ fn record(slot: u64, lag: i64) -> Sample {
     Sample::observed(
         slot,
         Head {
+            payload_status: None,
             slot: (100 - lag) as u64,
             root: Root::ZERO,
         },
         Head {
+            payload_status: None,
             slot: 100,
             root: Root::ZERO,
         },

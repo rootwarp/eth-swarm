@@ -362,3 +362,359 @@ async fn simulated_hour_two_fixture_cls_one_record_per_epoch() {
     assert_eq!(second.seen().len(), 10);
     server.shutdown().await.unwrap();
 }
+
+fn lag_sample(lag: i64) -> testkit::head_lag::Sample {
+    use consensus_types::primitives::Root;
+    use testkit::head_lag::{Head, Sample};
+    Sample::observed(
+        101,
+        Head {
+            payload_status: None,
+            slot: (100 - lag) as u64,
+            root: Root::from([1; 32]),
+        },
+        Head {
+            payload_status: None,
+            slot: 100,
+            root: Root::from([1; 32]),
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn head_compared_only_when_lag_le_2() {
+    use testkit::root_diff::{compare_head, HeadSnapshot, PayloadStatus};
+    for lag in [-1, 0, 1, 2, 3] {
+        let sample = lag_sample(lag);
+        let ours = HeadSnapshot {
+            slot: sample.ours.as_ref().unwrap().slot,
+            root: sample.ours.as_ref().unwrap().root,
+            status: PayloadStatus::Full,
+        };
+        let reference = HeadSnapshot {
+            slot: 100,
+            root: ours.root,
+            status: PayloadStatus::Full,
+        };
+        let result = compare_head(&sample, Some(ours), Some(reference));
+        assert_eq!(result.compared, lag <= 2);
+        assert_eq!(result.r#match, if lag <= 2 { Some(true) } else { None });
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["slot"], 101);
+        assert_eq!(value["lag"], lag);
+    }
+}
+
+#[test]
+fn payload_status_mismatch_flags() {
+    use testkit::root_diff::{compare_head, HeadSnapshot, PayloadStatus};
+    let sample = lag_sample(0);
+    let ours = HeadSnapshot {
+        slot: 100,
+        root: sample.ours.as_ref().unwrap().root,
+        status: PayloadStatus::Full,
+    };
+    let mut reference = ours.clone();
+    reference.status = PayloadStatus::Empty;
+    let record = compare_head(&sample, Some(ours), Some(reference));
+    assert!(record.compared);
+    assert!(
+        record.is_mismatch(),
+        "equal roots with FULL/EMPTY disagreement still mismatch"
+    );
+}
+
+#[test]
+fn head_root_mismatch_flags() {
+    use testkit::root_diff::{compare_head, HeadSnapshot, PayloadStatus};
+    let mut sample = lag_sample(0);
+    sample.reference.as_mut().unwrap().root = consensus_types::primitives::Root::from([2; 32]);
+    let ours = HeadSnapshot {
+        slot: 100,
+        root: sample.ours.as_ref().unwrap().root,
+        status: PayloadStatus::Full,
+    };
+    let reference = HeadSnapshot {
+        root: sample.reference.as_ref().unwrap().root,
+        ..ours.clone()
+    };
+    let record = compare_head(&sample, Some(ours), Some(reference));
+    assert!(record.compared);
+    assert!(record.is_mismatch());
+}
+
+#[test]
+fn sse_reconnect_no_false_match() {
+    use testkit::root_diff::{compare_head, HeadEvents, HeadSnapshot, PayloadStatus};
+    let sample = lag_sample(0);
+    let ours = HeadSnapshot {
+        slot: 100,
+        root: sample.ours.as_ref().unwrap().root,
+        status: PayloadStatus::Full,
+    };
+    let mut events = HeadEvents::default();
+    let fixture = include_bytes!("fixtures/root_diff/head-v2.sse");
+    events.reconnected();
+    for byte in fixture {
+        events.feed(&[*byte]).unwrap();
+    }
+    assert_eq!(
+        compare_head(&sample, Some(ours.clone()), events.snapshot()).r#match,
+        Some(true)
+    );
+    events.disconnected();
+    let gap = compare_head(&sample, Some(ours.clone()), events.snapshot());
+    assert!(!gap.compared);
+    assert_eq!(gap.r#match, None);
+    events.reconnected();
+    assert!(
+        events.snapshot().is_none(),
+        "old events must not survive reconnect"
+    );
+    events.feed(&fixture[..20]).unwrap();
+    events.disconnected();
+    events.reconnected();
+    events.feed(&fixture[20..]).unwrap();
+    assert!(
+        events.snapshot().is_none(),
+        "partial events cannot cross connections"
+    );
+    events.feed(fixture).unwrap();
+    assert_eq!(
+        compare_head(&sample, Some(ours), events.snapshot()).r#match,
+        Some(true)
+    );
+    let malformed = String::from_utf8(fixture.to_vec())
+        .unwrap()
+        .replace("full", "pending");
+    assert!(events.feed(malformed.as_bytes()).is_err());
+    assert!(
+        events.snapshot().is_none(),
+        "unknown statuses invalidate prior evidence"
+    );
+}
+
+#[test]
+fn stale_heads_and_forged_lag_are_gaps() {
+    use testkit::root_diff::{compare_head, HeadSnapshot, PayloadStatus};
+    let mut sample = lag_sample(0);
+    let ours = HeadSnapshot {
+        slot: 100,
+        root: sample.ours.as_ref().unwrap().root,
+        status: PayloadStatus::Full,
+    };
+    let stale = HeadSnapshot {
+        slot: 99,
+        ..ours.clone()
+    };
+    for (a, b) in [
+        (Some(stale.clone()), Some(ours.clone())),
+        (Some(ours.clone()), Some(stale)),
+        (None, Some(ours.clone())),
+    ] {
+        let record = compare_head(&sample, a, b);
+        assert!(!record.compared);
+        assert_eq!(record.r#match, None);
+    }
+    sample.lag = Some(-1);
+    assert!(!compare_head(&sample, Some(ours.clone()), Some(ours)).compared);
+}
+
+#[tokio::test]
+async fn live_sse_idle_gap_never_reuses_the_previous_connection() {
+    use std::time::Duration;
+    use testkit::collector::testing::{FixtureServer, Reply};
+    use testkit::root_diff::HeadStream;
+    let server = FixtureServer::start_with_query(|n, path| {
+        assert_eq!(path, "/eth/v1/events?topics=head_v2");
+        if n == 0 {
+            Reply::stream(vec![include_str!("fixtures/root_diff/head-v2.sse")], true)
+        } else {
+            Reply::stream(vec![], true)
+        }
+    })
+    .await;
+    let stream = HeadStream::start(
+        server.url(""),
+        Duration::from_secs(2),
+        Duration::from_secs(24),
+    )
+    .unwrap();
+    let mut updates = stream.updates();
+    updates.wait_for(|value| value.is_some()).await.unwrap();
+    assert_eq!(stream.snapshot().unwrap().slot, 100);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(25)).await;
+    updates.wait_for(|value| value.is_none()).await.unwrap();
+    assert!(stream.snapshot().is_none());
+    drop(stream);
+    assert!(updates.borrow().is_none());
+}
+
+#[tokio::test]
+async fn query_stub_head_status_is_atomic_and_shared_with_lag_sample() {
+    use std::time::Duration;
+    use testkit::collector::testing::{FixtureServer, Reply};
+    use testkit::head_lag::HeadSource;
+    use testkit::query_stub::QueryStub;
+    use testkit::root_diff::{PayloadStatus, QuerySource};
+    let api=FixtureServer::start(|_,path|match path {
+        "/eth/v1/events"=>Reply::stream(vec![include_str!("fixtures/root_diff/head-v2.sse")],true),
+        "/eth/v1/beacon/headers/head"=>Reply::json(&serde_json::json!({"data":{"root":format!("0x{}","01".repeat(32)),"header":{"message":{"slot":"100","state_root":format!("0x{}","02".repeat(32))}}}}).to_string()),
+        path if path.ends_with("/finality_checkpoints")=>Reply::json(std::str::from_utf8(MATCHING).unwrap()),
+        _=>Reply::status(404),
+    }).await;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = ipc::uds::SocketDir::under(dir.path(), "query-stub").unwrap();
+    let server = QueryStub::start(&socket, api.url(""), Duration::from_secs(2)).unwrap();
+    server
+        .head_updates()
+        .wait_for(|head| head.is_some())
+        .await
+        .unwrap();
+    let ours = QuerySource::new(
+        socket.socket_path(),
+        ipc::peercred::effective_uid(),
+        Duration::from_secs(2),
+    );
+    let head = ours.read_head().await.unwrap();
+    assert_eq!(head.payload_status, Some(PayloadStatus::Full));
+    assert_eq!(head.slot, 100);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn head_run_uses_shared_sampling_schedule_and_writes_both_logs() {
+    use std::time::Duration;
+    use testkit::collector::testing::{FixtureServer, ManualClock, ManualPause, Reply};
+    use testkit::head_lag::{Head, HeadSource, RunConfig, SlotSchedule};
+    use testkit::root_diff::{run_head, HeadStream, PayloadStatus};
+    struct Source;
+    impl HeadSource for Source {
+        async fn read_head(&self) -> Result<Head, testkit::head_lag::Error> {
+            Ok(Head {
+                slot: 100,
+                root: consensus_types::primitives::Root::from([1; 32]),
+                payload_status: Some(PayloadStatus::Full),
+            })
+        }
+    }
+    let api = FixtureServer::start(|_, _| {
+        Reply::stream(vec![include_str!("fixtures/root_diff/head-v2.sse")], true)
+    })
+    .await;
+    let events =
+        HeadStream::start(api.url(""), Duration::from_secs(2), Duration::from_secs(24)).unwrap();
+    events
+        .updates()
+        .wait_for(|head| head.is_some())
+        .await
+        .unwrap();
+    let clock = ManualClock::at(1_200_000_000_000);
+    let mut lag_log = Vec::new();
+    let mut head_log = Vec::new();
+    let report = run_head(
+        RunConfig {
+            schedule: SlotSchedule::new(0, 12, Duration::from_secs(4)).unwrap(),
+            first_slot: 100,
+            slots: 3,
+            slots_per_epoch: 32,
+        },
+        &Source,
+        &Source,
+        &events,
+        &*clock,
+        &ManualPause(clock.clone()),
+        (&mut lag_log, &mut head_log),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (
+            report.samples,
+            report.compared,
+            report.mismatches,
+            report.gaps,
+            report.exit_code()
+        ),
+        (3, 3, 0, 0, 0)
+    );
+    assert_eq!(String::from_utf8(lag_log).unwrap().lines().count(), 3);
+    let text = String::from_utf8(head_log).unwrap();
+    for (i, line) in text.lines().enumerate() {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(value["slot"], 100 + i as u64);
+        assert_eq!(value["match"], true);
+        assert_eq!(value["status_ours"], "full");
+    }
+}
+
+#[test]
+fn unexpected_sse_event_invalidates_prior_status() {
+    use testkit::root_diff::HeadEvents;
+    let mut events = HeadEvents::default();
+    events.reconnected();
+    events
+        .feed(include_bytes!("fixtures/root_diff/head-v2.sse"))
+        .unwrap();
+    assert!(events.snapshot().is_some());
+    assert!(events.feed(b"event: head\ndata: {}\n\n").is_err());
+    assert!(events.snapshot().is_none());
+}
+
+#[tokio::test]
+async fn live_sse_eof_is_a_gap_before_reconnect_backoff() {
+    use std::time::Duration;
+    use testkit::root_diff::{compare_head, HeadSnapshot, HeadStream, PayloadStatus};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (release, closed) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 8192];
+        let mut size = 0;
+        loop {
+            let n = socket.read(&mut request[size..]).await.unwrap();
+            assert!(n > 0);
+            size += n;
+            if request[..size].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                break;
+            }
+            assert!(size < request.len());
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        socket
+            .write_all(include_bytes!("fixtures/root_diff/head-v2.sse"))
+            .await
+            .unwrap();
+        closed.await.unwrap();
+        socket.shutdown().await.unwrap();
+    });
+    let stream = HeadStream::start(
+        testkit::collector::ReferenceApiUrl::parse(&format!("http://{addr}")).unwrap(),
+        Duration::from_secs(2),
+        Duration::from_secs(24),
+    )
+    .unwrap();
+    let mut updates = stream.updates();
+    updates.wait_for(|value| value.is_some()).await.unwrap();
+    release.send(()).unwrap();
+    updates.wait_for(|value| value.is_none()).await.unwrap();
+    let sample = lag_sample(0);
+    let ours = HeadSnapshot {
+        slot: 100,
+        root: sample.ours.as_ref().unwrap().root,
+        status: PayloadStatus::Full,
+    };
+    let record = compare_head(&sample, Some(ours), stream.snapshot());
+    assert!(!record.compared);
+    assert_eq!(record.r#match, None);
+    server.await.unwrap();
+}

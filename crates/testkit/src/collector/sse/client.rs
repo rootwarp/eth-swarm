@@ -415,7 +415,7 @@ pub async fn supported_topics(
 }
 
 /// `GET <path_and_query>` of the event stream: `200 text/event-stream` within `timeout`.
-async fn open_stream(
+pub(crate) async fn open_stream(
     url: &ReferenceApiUrl,
     path_and_query: &str,
     timeout: Duration,
