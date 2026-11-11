@@ -34,5 +34,10 @@ jobs:
           persist-credentials: false
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustc --version
+      - name: Install protoc (ethswarm-proto build.rs runs tonic-prost-build)
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc@3.36.2
+          fallback: none
       - name: Scripted Engine API self-tests (loopback only)
         run: cargo test -p testkit --features mock-el --test mock_el --locked
