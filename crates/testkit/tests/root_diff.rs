@@ -463,11 +463,13 @@ fn sse_reconnect_no_false_match() {
         events.feed(&[*byte]).unwrap();
     }
     assert_eq!(
-        compare_head(&sample, Some(ours.clone()), events.snapshot()).r#match,
-        Some(true)
+        compare_head(&sample, Some(ours.clone()), None).r#match,
+        None
     );
+    assert_eq!(events.snapshot().unwrap().status, PayloadStatus::Full);
     events.disconnected();
-    let gap = compare_head(&sample, Some(ours.clone()), events.snapshot());
+    assert!(events.snapshot().is_none());
+    let gap = compare_head(&sample, Some(ours.clone()), None);
     assert!(!gap.compared);
     assert_eq!(gap.r#match, None);
     events.reconnected();
@@ -484,10 +486,8 @@ fn sse_reconnect_no_false_match() {
         "partial events cannot cross connections"
     );
     events.feed(fixture).unwrap();
-    assert_eq!(
-        compare_head(&sample, Some(ours), events.snapshot()).r#match,
-        Some(true)
-    );
+    assert_eq!(events.snapshot().unwrap().slot, 100);
+    assert_eq!(compare_head(&sample, Some(ours), None).r#match, None);
     let malformed = String::from_utf8(fixture.to_vec())
         .unwrap()
         .replace("full", "pending");
@@ -556,12 +556,12 @@ async fn live_sse_idle_gap_never_reuses_the_previous_connection() {
 }
 
 #[tokio::test]
-async fn query_stub_head_status_is_atomic_and_shared_with_lag_sample() {
+async fn query_stub_without_current_status_cannot_export_sse_as_atomic() {
     use std::time::Duration;
     use testkit::collector::testing::{FixtureServer, Reply};
     use testkit::head_lag::HeadSource;
     use testkit::query_stub::QueryStub;
-    use testkit::root_diff::{PayloadStatus, QuerySource};
+    use testkit::root_diff::QuerySource;
     let api=FixtureServer::start(|_,path|match path {
         "/eth/v1/events"=>Reply::stream(vec![include_str!("fixtures/root_diff/head-v2.sse")],true),
         "/eth/v1/beacon/headers/head"=>Reply::json(&serde_json::json!({"data":{"root":format!("0x{}","01".repeat(32)),"header":{"message":{"slot":"100","state_root":format!("0x{}","02".repeat(32))}}}}).to_string()),
@@ -582,7 +582,10 @@ async fn query_stub_head_status_is_atomic_and_shared_with_lag_sample() {
         Duration::from_secs(2),
     );
     let head = ours.read_head().await.unwrap();
-    assert_eq!(head.payload_status, Some(PayloadStatus::Full));
+    assert_eq!(
+        head.payload_status, None,
+        "an optional SSE transition cannot certify current status"
+    );
     assert_eq!(head.slot, 100);
     server.shutdown().await.unwrap();
 }
@@ -716,7 +719,7 @@ async fn live_sse_eof_is_a_gap_before_reconnect_backoff() {
         root: sample.ours.as_ref().unwrap().root,
         status: PayloadStatus::Full,
     };
-    let record = compare_head(&sample, Some(ours), stream.snapshot());
+    let record = compare_head(&sample, Some(ours), None);
     assert!(!record.compared);
     assert_eq!(record.r#match, None);
     server.await.unwrap();
@@ -768,4 +771,101 @@ async fn mixed_case_headers_roundtrip_through_query_stub() {
             "/eth/v1/beacon/states/0x{}/finality_checkpoints",
             "cd".repeat(32)
         )));
+}
+
+#[tokio::test]
+async fn current_status_is_required_even_with_a_live_cached_event() {
+    use std::time::Duration;
+    use testkit::collector::testing::{FixtureServer, ManualClock, ManualPause, Reply};
+    use testkit::head_lag::{Head, HeadSource, RunConfig, SlotSchedule};
+    use testkit::root_diff::{run_head, HeadStream, PayloadStatus};
+    struct CurrentRead(Option<PayloadStatus>);
+    impl HeadSource for CurrentRead {
+        async fn read_head(&self) -> Result<Head, testkit::head_lag::Error> {
+            Ok(Head {
+                slot: 100,
+                root: consensus_types::primitives::Root::from([1; 32]),
+                payload_status: self.0,
+            })
+        }
+    }
+    let api = FixtureServer::start(|_, _| {
+        Reply::stream(
+            vec![
+                include_str!("fixtures/root_diff/head-v2.sse"),
+                ": heartbeat; FULL to EMPTY transitions need not emit head_v2\n\n",
+            ],
+            true,
+        )
+    })
+    .await;
+    let events =
+        HeadStream::start(api.url(""), Duration::from_secs(2), Duration::from_secs(24)).unwrap();
+    events
+        .updates()
+        .wait_for(|head| head.is_some())
+        .await
+        .unwrap();
+    for (status, compared, mismatches, gaps, exit) in [
+        (None, 0, 0, 1, 2),
+        (Some(PayloadStatus::Empty), 1, 1, 0, 1),
+        (Some(PayloadStatus::Full), 1, 0, 0, 0),
+    ] {
+        let clock = ManualClock::at(1_200_000_000_000);
+        let mut lag_log = Vec::new();
+        let mut head_log = Vec::new();
+        let report = run_head(
+            RunConfig {
+                schedule: SlotSchedule::new(0, 12, Duration::from_secs(4)).unwrap(),
+                first_slot: 100,
+                slots: 1,
+                slots_per_epoch: 32,
+            },
+            &CurrentRead(Some(PayloadStatus::Full)),
+            &CurrentRead(status),
+            &events,
+            &*clock,
+            &ManualPause(clock.clone()),
+            (&mut lag_log, &mut head_log),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                report.compared,
+                report.mismatches,
+                report.gaps,
+                report.exit_code()
+            ),
+            (compared, mismatches, gaps, exit)
+        );
+        assert_eq!(
+            events.snapshot().unwrap().status,
+            PayloadStatus::Full,
+            "the stale live event must not be used as proof"
+        );
+        let value: serde_json::Value = serde_json::from_slice(&head_log).unwrap();
+        assert_eq!(value["compared"], compared == 1);
+        if status.is_none() {
+            assert!(value["match"].is_null());
+        }
+    }
+}
+
+#[test]
+fn head_events_accept_uppercase_and_mixed_case_roots() {
+    use testkit::root_diff::{HeadEvents, PayloadStatus};
+    let fixture = include_str!("fixtures/root_diff/mixed-case-head-v2.sse");
+    for input in [fixture.to_owned(), fixture.replace("aB", "AB")] {
+        let mut events = HeadEvents::default();
+        events.reconnected();
+        events.feed(input.as_bytes()).unwrap();
+        let event = events.snapshot().unwrap();
+        assert_eq!(event.slot, 321);
+        assert_eq!(
+            event.root,
+            consensus_types::primitives::Root::from([0xab; 32])
+        );
+        assert_eq!(event.status, PayloadStatus::Full);
+    }
 }

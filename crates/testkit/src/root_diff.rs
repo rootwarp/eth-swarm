@@ -432,6 +432,6 @@ pub async fn run(
 
 mod head;
 pub use head::{
-    compare_head, run_head, HeadError, HeadEvents, HeadGap, HeadRecord, HeadSnapshot, HeadStream,
-    HeadSummary, PayloadStatus,
+    compare_head, run_head, HeadError, HeadEvent, HeadEvents, HeadGap, HeadRecord, HeadSnapshot,
+    HeadStream, HeadSummary, PayloadStatus,
 };

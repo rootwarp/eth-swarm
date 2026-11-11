@@ -11,7 +11,8 @@ pub struct Head {
     pub slot: u64,
     /// Beacon block root.
     pub root: Root,
-    /// Optional atomic chain.v1 head selection; absent on header-only or older observations.
+    /// Current head selection, only when the adapter guarantees it atomically with this
+    /// slot/root in the same read. Header-only reads and cached SSE must leave it absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_status: Option<crate::root_diff::PayloadStatus>,
 }

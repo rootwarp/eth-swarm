@@ -19,7 +19,7 @@ use tonic::{Request, Response, Status};
 pub struct QueryStub {
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<io::Result<()>>>,
-    heads: tokio::sync::watch::Receiver<Option<crate::root_diff::HeadSnapshot>>,
+    heads: crate::root_diff::HeadStream,
 
     #[cfg(test)]
     accepted: tokio::sync::mpsc::Receiver<()>,
@@ -45,9 +45,7 @@ impl QueryStub {
             Duration::from_secs(24).max(timeout),
         )
         .map_err(io::Error::other)?;
-        let head_updates = heads.updates();
         let adapter = Adapter {
-            heads,
             reference: Reference::new(url.clone(), timeout),
             url,
             timeout,
@@ -92,7 +90,7 @@ impl QueryStub {
         Ok(Self {
             stop: Some(stop),
             task: Some(task),
-            heads: head_updates,
+            heads,
 
             #[cfg(test)]
             accepted,
@@ -102,8 +100,8 @@ impl QueryStub {
     /// Observe second-CL head_v2 readiness/loss without timing sleeps.
     pub fn head_updates(
         &self,
-    ) -> tokio::sync::watch::Receiver<Option<crate::root_diff::HeadSnapshot>> {
-        self.heads.clone()
+    ) -> tokio::sync::watch::Receiver<Option<crate::root_diff::HeadEvent>> {
+        self.heads.updates()
     }
 
     /// Stop accepting and drain deadline-bounded calls, then remove only the owned socket.
@@ -127,7 +125,6 @@ impl Drop for QueryStub {
 }
 
 struct Adapter {
-    heads: crate::root_diff::HeadStream,
     url: ReferenceApiUrl,
     reference: Reference,
     timeout: Duration,
@@ -193,14 +190,9 @@ impl QueryService for Adapter {
             .read_state(&format!("0x{}", hex::encode(&state_root)))
             .await
             .map_err(|_| Status::unavailable("reference checkpoints read failed"))?;
-        let payload_status = if wanted.is_none() {
-            self.heads
-                .snapshot()
-                .filter(|head| head.slot == slot && head.root.as_slice() == block_root.as_slice())
-                .map(|head| head.status.to_wire())
-        } else {
-            None
-        };
+        // Header REST supplies no atomic FULL/EMPTY selection. A live head_v2 cache
+        // cannot fill this field: the API permits transitions without an event.
+        let payload_status = None;
         Ok(Response::new(pb::GetStateSummaryResponse {
             slot,
             state_root,
