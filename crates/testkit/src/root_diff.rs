@@ -1,6 +1,5 @@
 //! Epoch-aligned finalized/justified checkpoint comparisons. Gaps are never matches.
 
-use crate::archive::canonical_hex;
 use consensus_types::primitives::Root;
 use serde::{Deserialize, Serialize};
 
@@ -98,6 +97,14 @@ pub enum Error {
     Io(#[source] std::io::Error),
 }
 
+/// Decode the API's exact 32-byte, 0x-prefixed root; hex digits may use either case.
+/// Archive canonical encodings deliberately have a separate, stricter decoder.
+pub(crate) fn api_root(value: &str) -> Option<[u8; 32]> {
+    let mut root = [0; 32];
+    hex::decode_to_slice(value.strip_prefix("0x")?, &mut root).ok()?;
+    Some(root)
+}
+
 /// Decode Beacon API finality JSON with strict decimal epochs and 32-byte roots.
 pub fn parse_finality(body: &[u8]) -> Result<Checkpoints, Error> {
     #[derive(Deserialize)]
@@ -119,11 +126,7 @@ pub fn parse_finality(body: &[u8]) -> Result<Checkpoints, Error> {
             return Err(Error::InvalidFinality);
         }
         let epoch = api.epoch.parse().map_err(|_| Error::InvalidFinality)?;
-        let root = api
-            .root
-            .strip_prefix("0x")
-            .and_then(canonical_hex::<32>)
-            .ok_or(Error::InvalidFinality)?;
+        let root = api_root(&api.root).ok_or(Error::InvalidFinality)?;
         Ok(Checkpoint {
             epoch,
             root: Root::from(root),
