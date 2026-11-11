@@ -40,3 +40,5 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync",
 tokio-stream = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tonic-prost.workspace = true
+# The scriptable mock EL for the transport-fault tests (tests/faults.rs).
+testkit = { path = "../testkit", features = ["mock-el"] }

@@ -45,6 +45,9 @@ pub const EXCHANGE_CAPABILITIES_TIMEOUT: Duration = Duration::from_secs(1);
 /// TCP connect plus the HTTP/1.1 handshake of one dial. The spec sets no number; without a
 /// bound, a dial to an address that drops packets would hold the queue.
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long without a successful Engine call before the EL counts as offline. The spec sets no
+/// number; 30 s is several slots of silence.
+pub const EL_OFFLINE_AFTER: Duration = Duration::from_secs(30);
 
 /// Where `now` comes from. A test clock makes two requests carry different `iat` values
 /// without sleeping.
@@ -233,6 +236,9 @@ pub struct Config {
     pub backoff: Backoff,
     /// How many dials one [`Session::reconnect`] attempts. Defaults to 5.
     pub max_reconnect_attempts: u32,
+    /// No successful call for this long makes [`Session::el_offline`] true. Defaults to
+    /// [`EL_OFFLINE_AFTER`].
+    pub el_offline_after: Duration,
 }
 
 impl Config {
@@ -246,6 +252,7 @@ impl Config {
             max_body_bytes: MAX_RESPONSE_BYTES,
             backoff: Backoff::default(),
             max_reconnect_attempts: 5,
+            el_offline_after: EL_OFFLINE_AFTER,
         }
     }
 
@@ -331,6 +338,9 @@ pub enum CallError {
     /// JSON-RPC was missing, or `id` did not match.
     #[error("engine response is not a JSON-RPC result for this call")]
     BadResponse,
+    /// The EL answered JSON-RPC `-38005`: the method version is not the one for the fork.
+    #[error("engine method is unsupported for this fork")]
+    UnsupportedFork,
     /// The EL returned a JSON-RPC error. The message is omitted.
     #[error("engine JSON-RPC error {code}")]
     Rpc {
@@ -592,6 +602,12 @@ impl Session {
         self.inner.late_dropped.load(Ordering::Relaxed)
     }
 
+    /// Whether the EL counts as offline.
+    #[must_use]
+    pub fn el_offline(&self) -> bool {
+        todo!("el_offline")
+    }
+
     /// Whether a connection of the current generation is installed. When this is `false`, the
     /// queue reconnects before its next call.
     #[must_use]
@@ -770,6 +786,13 @@ impl Session {
         }
         decode_rpc(id, &collected.to_bytes())
     }
+}
+
+/// The beacon `node/health` code the engine state alone implies.
+#[must_use]
+pub fn health_status(el_offline: bool) -> StatusCode {
+    let _ = el_offline;
+    todo!("health_status")
 }
 
 fn content_length(headers: &http::HeaderMap) -> Option<usize> {

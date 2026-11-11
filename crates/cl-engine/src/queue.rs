@@ -233,6 +233,12 @@ impl Queue {
         self.session.late_dropped()
     }
 
+    /// [`Session::el_offline`].
+    #[must_use]
+    pub fn el_offline(&self) -> bool {
+        self.session.el_offline()
+    }
+
     /// The session, for tests that read the same counters.
     #[must_use]
     pub fn session(&self) -> &Session {
