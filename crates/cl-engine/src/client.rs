@@ -3,7 +3,10 @@
 //! Every call carries a fresh HS256 JWT. The URL must be loopback unless
 //! [`EngineEndpoint::parse`] is given the operator opt-out. Response bodies are capped and every
 //! call has a timeout. A reconnect bumps the connection generation; a body that arrives for an
-//! earlier generation is dropped and never returned.
+//! earlier generation is dropped and never returned. JSON-RPC `-38005` is
+//! [`CallError::UnsupportedFork`] and is never retried with another method version.
+//! [`Session::el_offline`] reports an EL that refuses connections or has not answered for
+//! [`Config::el_offline_after`].
 
 use crate::capabilities::{self, MissingCaps, ADVERTISED};
 use crate::jwt::{self, JwtSecret};
@@ -19,6 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 use zeroize::Zeroize;
 
 /// Default authenticated Engine API port (`authentication.md`).
@@ -48,6 +52,8 @@ pub const DIAL_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long without a successful Engine call before the EL counts as offline. The spec sets no
 /// number; 30 s is several slots of silence.
 pub const EL_OFFLINE_AFTER: Duration = Duration::from_secs(30);
+/// JSON-RPC "Unsupported fork" (`common.md`, errors).
+const UNSUPPORTED_FORK: i64 = -38005;
 
 /// Where `now` comes from. A test clock makes two requests carry different `iat` values
 /// without sleeping.
@@ -339,6 +345,9 @@ pub enum CallError {
     #[error("engine response is not a JSON-RPC result for this call")]
     BadResponse,
     /// The EL answered JSON-RPC `-38005`: the method version is not the one for the fork.
+    ///
+    /// The caller picks the version for its payload's fork, so no other version is tried. The
+    /// connection stays usable: [`CallError::reconnects`] is false.
     #[error("engine method is unsupported for this fork")]
     UnsupportedFork,
     /// The EL returned a JSON-RPC error. The message is omitted.
@@ -404,6 +413,9 @@ struct Inner {
     generation: AtomicU64,
     rpc_id: AtomicU64,
     late_dropped: AtomicU64,
+    el_offline_after: Duration,
+    /// What [`Session::el_offline`] reads. Taken alone, never while another lock is held.
+    reach: Mutex<Reach>,
     slot: Mutex<Option<Slot>>,
     /// The methods the EL listed in the capability exchange of the installed connection.
     listed: Mutex<Arc<[String]>>,
@@ -411,6 +423,25 @@ struct Inner {
     install_gate: Mutex<Option<tests::InstallGate>>,
     #[cfg(test)]
     ready_gate: Mutex<Option<tests::ReadyGate>>,
+}
+
+/// Whether the EL answered lately.
+#[derive(Clone, Copy)]
+enum Reach {
+    /// A call on the current generation, or the capability exchange that installed it,
+    /// succeeded at this instant.
+    Answered(Instant),
+    /// The last dial was refused.
+    Refused,
+}
+
+impl Reach {
+    fn offline(self, now: Instant, after: Duration) -> bool {
+        match self {
+            Self::Answered(at) => now.saturating_duration_since(at) >= after,
+            Self::Refused => true,
+        }
+    }
 }
 
 /// One EL connection. Cloning shares it.
@@ -446,6 +477,9 @@ impl Session {
                 generation: AtomicU64::new(1),
                 rpc_id: AtomicU64::new(1),
                 late_dropped: AtomicU64::new(0),
+                el_offline_after: config.el_offline_after,
+                // Not observable before the exchange below has answered.
+                reach: Mutex::new(Reach::Answered(Instant::now())),
                 slot: Mutex::new(None),
                 listed: Mutex::new(Arc::from([])),
                 #[cfg(test)]
@@ -456,6 +490,7 @@ impl Session {
         };
         let (sender, listed) = session.dial_and_check().await?;
         session.install(1, sender, listed);
+        session.answered();
         Ok(session)
     }
 
@@ -537,6 +572,9 @@ impl Session {
             }
             Ok(other) => {
                 self.restore(generation, sender);
+                if other.is_ok() {
+                    self.answered();
+                }
                 other
             }
         }
@@ -574,6 +612,7 @@ impl Session {
                     #[cfg(test)]
                     self.install_gate(new_gen).await;
                     if self.install(new_gen, sender, listed) {
+                        self.answered();
                         tracing::info!(generation = new_gen, "engine reconnected");
                     }
                     return Ok(());
@@ -602,10 +641,30 @@ impl Session {
         self.inner.late_dropped.load(Ordering::Relaxed)
     }
 
-    /// Whether the EL counts as offline.
+    /// Whether the EL counts as offline: its last dial was refused, or nothing on the current
+    /// generation (a call, or the capability exchange that installed it) has succeeded for
+    /// [`Config::el_offline_after`], measured on the Tokio clock. The next success clears it.
+    /// cl-chain reports it as `SyncStatus.el_offline`; [`health_status`] is the health code.
     #[must_use]
     pub fn el_offline(&self) -> bool {
-        todo!("el_offline")
+        let reach = *lock(&self.inner.reach);
+        reach.offline(Instant::now(), self.inner.el_offline_after)
+    }
+
+    /// Something on the current generation succeeded.
+    fn answered(&self) {
+        let now = Instant::now();
+        let was = std::mem::replace(&mut *lock(&self.inner.reach), Reach::Answered(now));
+        if was.offline(now, self.inner.el_offline_after) {
+            tracing::info!(el_offline = false, "engine answered");
+        }
+    }
+
+    fn refused(&self) {
+        let was = std::mem::replace(&mut *lock(&self.inner.reach), Reach::Refused);
+        if !matches!(was, Reach::Refused) {
+            tracing::warn!(el_offline = true, "engine connection refused");
+        }
     }
 
     /// Whether a connection of the current generation is installed. When this is `false`, the
@@ -685,7 +744,12 @@ impl Session {
         let (mut sender, connection) = tokio::time::timeout(DIAL_TIMEOUT, dial)
             .await
             .map_err(|_| StartError::Transport)?
-            .map_err(|_| StartError::Transport)?;
+            .map_err(|err| {
+                if err.kind() == std::io::ErrorKind::ConnectionRefused {
+                    self.refused();
+                }
+                StartError::Transport
+            })?;
         tokio::spawn(async move {
             if let Err(err) = connection.await {
                 tracing::debug!(error = %err, "engine http connection closed");
@@ -700,7 +764,9 @@ impl Session {
         .map_err(|_| StartError::Transport)?
         .map_err(|err| match err {
             CallError::Unauthorized => StartError::Unauthorized,
-            CallError::BadResponse | CallError::Rpc { .. } => StartError::BadResponse,
+            CallError::BadResponse | CallError::Rpc { .. } | CallError::UnsupportedFork => {
+                StartError::BadResponse
+            }
             CallError::BodyTooLarge { .. } | CallError::Timeout => StartError::BadResponse,
             _ => StartError::Transport,
         })?;
@@ -788,11 +854,16 @@ impl Session {
     }
 }
 
-/// The beacon `node/health` code the engine state alone implies.
+/// The beacon `node/health` code the engine's state implies on its own: 206 while the EL is
+/// offline ([`Session::el_offline`]), else 200. cl-api also answers 206 while syncing or
+/// optimistic.
 #[must_use]
 pub fn health_status(el_offline: bool) -> StatusCode {
-    let _ = el_offline;
-    todo!("health_status")
+    if el_offline {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    }
 }
 
 fn content_length(headers: &http::HeaderMap) -> Option<usize> {
@@ -808,8 +879,10 @@ fn decode_rpc(id: u64, bytes: &[u8]) -> Result<Value, CallError> {
         return Err(CallError::BadResponse);
     }
     if let Some(err) = value.get("error").filter(|err| !err.is_null()) {
-        let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
-        return Err(CallError::Rpc { code });
+        return Err(match err.get("code").and_then(Value::as_i64).unwrap_or(0) {
+            UNSUPPORTED_FORK => CallError::UnsupportedFork,
+            code => CallError::Rpc { code },
+        });
     }
     value.get("result").cloned().ok_or(CallError::BadResponse)
 }
