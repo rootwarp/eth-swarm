@@ -30,3 +30,15 @@ pub mod replay;
 /// Scriptable, JWT-authenticated loopback Engine API fixture (dev-dependencies only).
 #[cfg(feature = "mock-el")]
 pub mod mock_el;
+
+/// Epoch-aligned checkpoint comparison and soak records.
+#[cfg(feature = "soak")]
+pub mod root_diff;
+
+/// Second-reference-CL adapter for the soak tool's chain.v1 reads, not a production chain.
+#[cfg(feature = "soak")]
+pub mod query_stub;
+
+/// Slot-aligned head-lag samples and run-wide percentile/recovery computation.
+#[cfg(feature = "soak")]
+pub mod head_lag;
