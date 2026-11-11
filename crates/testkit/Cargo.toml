@@ -24,6 +24,11 @@ name = "replay"
 path = "src/bin/replay.rs"
 required-features = ["replay"]
 
+[[bin]]
+name = "root-diff"
+path = "src/bin/root-diff.rs"
+required-features = ["soak"]
+
 [features]
 # For this crate's tests and its users' tests: write-fault injection (`archive::Fault`: an
 # interrupted write, a full disk), payload fixtures (`archive::fixtures`), and the collector's
@@ -34,7 +39,14 @@ test-support = ["p2p-wire/testkit", "dep:ssz_types", "hyper/server"]
 # `crypto-bls/verify` (scripts/check-cl-chain-features.sh). `cargo run --bin replay` turns it on.
 replay = ["dep:crypto-bls", "dep:state-transition"]
 
+# Offline-testable soak tooling and QueryService adapter. Does not link service crates.
+soak = ["dep:ipc", "dep:ethswarm-proto", "dep:tonic", "dep:tokio-stream", "tokio/fs", "tokio/io-util", "tokio/io-std"]
+
 [dependencies]
+ipc = { path = "../ipc", optional = true }
+ethswarm-proto = { path = "../ethswarm-proto", optional = true }
+tonic = { workspace = true, optional = true }
+tokio-stream = { version = "0.1", features = ["net"], optional = true }
 consensus-types = { path = "../consensus-types" }
 network-config = { path = "../network-config" }
 # In-process BLS for genesis replay (`crypto-bls` verify + aggregate), feature `replay` only.
@@ -71,7 +83,7 @@ ethereum_ssz.workspace = true
 ssz_types = { workspace = true, optional = true }
 
 [dev-dependencies]
-testkit = { path = ".", features = ["test-support", "replay"] }
+testkit = { path = ".", features = ["test-support", "replay", "soak"] }
 tempfile = "3"
 # The replay fixture chain (tests/support/chain.rs): real validator keys and the test inputs
 # (`genesis_state`, `bid_for_state`). `testing` is dev-only (scripts/check-stf-testing.sh).
@@ -84,4 +96,4 @@ consensus-types = { path = "../consensus-types" }
 network-config = { path = "../network-config" }
 ethereum_ssz.workspace = true
 tree_hash.workspace = true
-tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "test-util"] }

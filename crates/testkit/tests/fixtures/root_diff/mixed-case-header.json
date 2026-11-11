@@ -1,0 +1,11 @@
+{
+  "data": {
+    "root": "0xaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaB",
+    "header": {
+      "message": {
+        "slot": "321",
+        "state_root": "0xcDcDcDcDcDcDcDcDcDcDcDcDcDcDcDcDcDcDcDcDcDcDcDcDcDcDcDcDcDcDcDcD"
+      }
+    }
+  }
+}

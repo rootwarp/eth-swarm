@@ -5977,11 +5977,13 @@ dependencies = [
  "consensus-types",
  "crypto-bls",
  "ethereum_ssz",
+ "ethswarm-proto",
  "hex",
  "http",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "ipc",
  "network-config",
  "p2p-wire",
  "rustix",
@@ -5995,7 +5997,9 @@ dependencies = [
  "testkit",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-stream",
  "toml 0.8.23",
+ "tonic",
  "tree_hash",
 ]
 

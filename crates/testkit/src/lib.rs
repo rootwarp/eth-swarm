@@ -26,3 +26,11 @@ pub mod collector;
 pub mod export_blocks;
 #[cfg(feature = "replay")]
 pub mod replay;
+
+/// Epoch-aligned checkpoint comparison and soak records.
+#[cfg(feature = "soak")]
+pub mod root_diff;
+
+/// Second-reference-CL adapter for the soak tool's chain.v1 reads, not a production chain.
+#[cfg(feature = "soak")]
+pub mod query_stub;
