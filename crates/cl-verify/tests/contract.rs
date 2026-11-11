@@ -1,5 +1,6 @@
 //! The ipc contract suite against cl-verify: every rule in process and over a Unix socket, plus
-//! the builder key feed rules ([`builder_key_feed_rules`]) both ways.
+//! the builder key feed rules ([`builder_key_feed_rules`]) and the VerifyKzg rules
+//! ([`verify_kzg_rules`]) both ways.
 //!
 //! cl-verify serves only cl-chain's UID. Over UDS the kernel supplies this process's
 //! credentials; in process, where no socket exists, the same credentials (read once from a
@@ -10,32 +11,35 @@ mod common;
 use std::sync::{Arc, OnceLock};
 
 use cl_verify::bls::BlstBackend;
+use cl_verify::caps::{self, MAX_KZG_COLUMNS, MAX_MESSAGE_BYTES};
 use cl_verify::feed::SharedCache;
 use cl_verify::handshake::Handshake;
 use cl_verify::kzg::{KzgBackend, KzgFailure, PreparedCells, TrustedSetupConfig};
 use cl_verify::proto::common::{ErrorCode, Hello};
 use cl_verify::proto::verify::verify_service_client::VerifyServiceClient;
 use cl_verify::proto::verify::{
-    builder_key_feed_response, verify_bls_response, BuilderKeyFeedRequest,
-    BuilderKeyFeedRequestBody, BuilderKeyFeedResponse, KeyNamespace, VerifyBlsRequest,
-    VerifyBlsRequestBody, VerifyBlsResponse, VerifyOrigin, VerifyStatus,
+    builder_key_feed_response, verify_bls_response, verify_kzg_response, BuilderKeyFeedRequest,
+    BuilderKeyFeedRequestBody, BuilderKeyFeedResponse, KeyNamespace, KzgCellProof,
+    VerifyBlsRequest, VerifyBlsRequestBody, VerifyBlsResponse, VerifyKzgRequest,
+    VerifyKzgRequestBody, VerifyKzgResponse, VerifyOrigin, VerifyStatus,
 };
 use cl_verify::server::{serve_uds, Limits, ServerConfig, VerifyServer, DEFAULT_SNAPSHOT_INTERVAL};
 use cl_verify::wire::error_from_status;
 use common::{
     bls_body, bls_hello, builder_body, builder_frame, builder_hello, builder_set, builder_signer,
-    far_deadline, outcomes,
+    far_deadline, kzg_body, kzg_case, kzg_cells_request, kzg_hello, outcomes, zero_block,
 };
 use ipc::testkit::{fixture, probe, Mode, Server, Target};
 use ipc::Link;
+use prost::Message;
 use tokio::net::unix::UCred;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::Routes;
 use tonic::transport::server::UdsConnectInfo;
 
-/// The suite never sends KZG work; a verifier that refuses everything keeps the trusted setup
-/// out of these tests.
+/// Only [`verify_kzg_rules`] sends KZG work, to a server of its own over the pinned setup; for
+/// the rest a verifier that refuses everything keeps the trusted setup out of these tests.
 struct NoKzg;
 
 impl KzgBackend for NoKzg {
@@ -192,7 +196,89 @@ async fn builder_key_feed_rules(mode: Mode) {
     );
 }
 
+/// VerifyKzg against the production server (the pinned trusted setup), `mode` either way: a
+/// valid batch is VALID, one with an invalid column is INVALID, a full block at the handshake's
+/// largest blob count (over the 4 MiB BLS message cap) is admitted and VALID, and 129 columns
+/// fail the stream as a contract violation.
+async fn verify_kzg_rules(mode: Mode) {
+    let link = fixture::v1_link();
+    let dir = tempfile::tempdir().expect("snapshot dir");
+    let config = ServerConfig {
+        trusted_setup: common::setup_config(),
+        ..server_config(&link, &dir)
+    };
+    let server = VerifyServer::new(config, SharedCache::default()).expect("the pinned setup");
+    let connection = mode.connect(served(server.clone())).await;
+    let mut client = VerifyServiceClient::new(connection.transport.clone());
+    let (kzg, mut replies, generation) = open_kzg(&mut client, link.local()).await;
+    let send = |request_id: u64, cells: Vec<KzgCellProof>| {
+        let body = VerifyKzgRequestBody {
+            generation,
+            ..kzg_cells_request(request_id, cells)
+        };
+        let kzg = kzg.clone();
+        async move { kzg.send(kzg_body(body)).await.expect("kzg open") }
+    };
+
+    let (valid, _) = kzg_case("valid_not_sorted");
+    let mut invalid = valid.clone();
+    // Column 2 carries the cell of column 3.
+    invalid[1].cell = invalid[0].cell.clone();
+    let blobs = caps::max_kzg_cells(&link.local()) / MAX_KZG_COLUMNS;
+    let block = zero_block(MAX_KZG_COLUMNS as u64, blobs);
+    assert!(kzg_body(kzg_cells_request(3, block.clone())).encoded_len() > MAX_MESSAGE_BYTES);
+    for (request_id, cells, want) in [
+        (1, valid, VerifyStatus::Valid),
+        (2, invalid, VerifyStatus::Invalid),
+        (3, block, VerifyStatus::Valid),
+    ] {
+        send(request_id, cells).await;
+        assert_eq!(next_kzg_reply(&mut replies).await, (request_id, want));
+    }
+    send(4, zero_block(MAX_KZG_COLUMNS as u64 + 1, 1)).await;
+    let failed = replies.message().await.expect_err("the stream fails");
+    assert_eq!(
+        error_from_status(&failed).code(),
+        ErrorCode::ContractViolation
+    );
+    assert_eq!(server.contract_violations(), 1);
+}
+
 type Client = VerifyServiceClient<ipc::testkit::Transport>;
+
+async fn open_kzg(
+    client: &mut Client,
+    hello: Hello,
+) -> (
+    mpsc::Sender<VerifyKzgRequest>,
+    tonic::Streaming<VerifyKzgResponse>,
+    u64,
+) {
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(kzg_hello(hello)).await.expect("kzg open");
+    let mut replies = client
+        .verify_kzg(ReceiverStream::new(rx))
+        .await
+        .expect("VerifyKzg served")
+        .into_inner();
+    let generation = match replies.message().await.expect("a hello").map(|r| r.frame) {
+        Some(Some(verify_kzg_response::Frame::Hello(h))) => h.generation,
+        other => panic!("expected the server hello, got {other:?}"),
+    };
+    (tx, replies, generation)
+}
+
+/// The next VerifyKzg reply: its request id and status, with no `err`.
+async fn next_kzg_reply(replies: &mut tonic::Streaming<VerifyKzgResponse>) -> (u64, VerifyStatus) {
+    match replies.message().await.expect("a reply").map(|r| r.frame) {
+        Some(Some(verify_kzg_response::Frame::Body(b))) => {
+            assert_eq!(b.err, None);
+            let status = VerifyStatus::try_from(b.status).expect("a known status");
+            (b.request_id, status)
+        }
+        other => panic!("expected a VerifyKzg body, got {other:?}"),
+    }
+}
 
 async fn open_builder_feed(
     client: &mut Client,
@@ -254,4 +340,4 @@ async fn open_bls(
     (tx, results, generation)
 }
 
-ipc::contract_suite!(target, extra: [builder_key_feed_rules]);
+ipc::contract_suite!(target, extra: [builder_key_feed_rules, verify_kzg_rules]);
