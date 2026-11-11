@@ -115,7 +115,7 @@ pub struct Recovery {
     pub end_slot: Option<u64>,
     /// Sampling-slot distance; slot duration is supplied by the network configuration.
     pub elapsed_slots: u64,
-    /// Whether the observed interval is longer than one epoch (inclusive limit).
+    /// Whether continuous observations proved a duration longer than one epoch.
     pub over_epoch: bool,
     /// Missing observations inside this interval make its exact recovery time uncertain.
     pub had_gaps: bool,
@@ -203,8 +203,10 @@ pub fn analyze(samples: &[Sample], slots_per_epoch: u64) -> Result<Summary, Erro
     for sample in samples {
         if let Some(recovery) = &mut active {
             recovery.elapsed_slots = sample.slot - recovery.start_slot;
-            recovery.over_epoch = recovery.elapsed_slots > slots_per_epoch;
-            recovery.had_gaps |= previous.is_some_and(|previous| sample.slot - previous > 1);
+            recovery.had_gaps |=
+                sample.lag.is_none() || previous.is_some_and(|previous| sample.slot - previous > 1);
+            // Missing evidence cannot prove continuous lag; an earlier proof stays sticky.
+            recovery.over_epoch |= !recovery.had_gaps && recovery.elapsed_slots > slots_per_epoch;
         }
         match sample.lag {
             Some(lag) if lag > 2 => {
@@ -263,8 +265,7 @@ impl HeadSource for crate::root_diff::Reference {
         let slot = slot.parse().map_err(|_| Error::Read)?;
         let root = header["data"]["root"]
             .as_str()
-            .and_then(|root| root.strip_prefix("0x"))
-            .and_then(crate::archive::canonical_hex::<32>)
+            .and_then(crate::root_diff::api_root)
             .ok_or(Error::Read)?;
         Ok(Head {
             payload_status: None,
@@ -452,7 +453,15 @@ pub async fn run_with_sink(
         .first_slot
         .checked_add(config.slots)
         .ok_or(Error::Config)?;
-    config.schedule.due(end - 1)?;
+    let window = Duration::from_secs(config.schedule.seconds_per_slot)
+        .checked_sub(config.schedule.offset)
+        .ok_or(Error::Config)?;
+    config
+        .schedule
+        .due(end - 1)?
+        .checked_add(window)
+        .filter(|end| end.as_nanos() <= u128::from(u64::MAX))
+        .ok_or(Error::Config)?;
     let mut samples = Vec::new();
     for slot in config.first_slot..end {
         let due = config.schedule.due(slot)?;
@@ -463,14 +472,14 @@ pub async fn run_with_sink(
             };
             pause.pause(wait).await;
         }
-        let window = Duration::from_secs(config.schedule.seconds_per_slot);
-        let mut sample = if Duration::from_nanos(clock.now().wall_ns).saturating_sub(due) >= window
-        {
+        // The offset consumes part of this slot; it must not extend the slot itself.
+        let expires = due.checked_add(window).ok_or(Error::Config)?;
+        let mut sample = if Duration::from_nanos(clock.now().wall_ns) >= expires {
             Sample::gap(slot, Gap::MissedSample)
         } else {
             observe(slot, ours, reference).await
         };
-        if Duration::from_nanos(clock.now().wall_ns).saturating_sub(due) >= window {
+        if Duration::from_nanos(clock.now().wall_ns) >= expires {
             sample = Sample::gap(slot, Gap::MissedSample);
         }
         sink.record(&sample).await?;
