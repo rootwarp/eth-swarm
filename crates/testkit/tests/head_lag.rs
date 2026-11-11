@@ -712,3 +712,114 @@ fn report_is_causal_and_empty_windows_never_pass() {
     let empty = window_report(&[], 12, 32, Some(7199)).unwrap();
     assert_eq!((empty.gap_seconds, empty.exit_code()), (86400, 2));
 }
+
+#[test]
+fn uncertain_recovery_is_not_proven_but_prior_breaches_stay_sticky() {
+    use testkit::head_lag::Gap;
+    for explicit in [false, true] {
+        let mut timeline: Vec<_> = (0..10_000).map(|slot| sample(slot, 0)).collect();
+        timeline.push(sample(10_000, 3));
+        if explicit {
+            timeline.extend((10_001..10_041).map(|slot| Sample::gap(slot, Gap::Reference)));
+        }
+        timeline.push(sample(10_041, 0));
+        let report = analyze(&timeline, 32).unwrap();
+        assert_eq!(report.p99, Some(0));
+        assert_eq!(report.recoveries[0].elapsed_slots, 41);
+        assert!(report.recoveries[0].had_gaps);
+        assert!(
+            !report.exceeds_recovery(),
+            "missing observations cannot establish a breach"
+        );
+        assert_eq!(report.exit_code(), 2);
+    }
+    for proven in [false, true] {
+        let mut timeline: Vec<_> = (0..10_000).map(|slot| sample(slot, 0)).collect();
+        let end = if proven { 10_034 } else { 10_033 };
+        timeline.extend((10_000..end).map(|slot| sample(slot, 3)));
+        timeline.push(Sample::gap(end, Gap::Reference));
+        let open = analyze(&timeline, 32).unwrap();
+        assert_eq!(
+            open.exceeds_recovery(),
+            proven,
+            "a gap itself must not cross the proof boundary"
+        );
+        timeline.push(sample(end + 1, 0));
+        let closed = analyze(&timeline, 32).unwrap();
+        assert_eq!(closed.exceeds_recovery(), proven);
+        assert_eq!(closed.exit_code(), if proven { 1 } else { 2 });
+    }
+}
+
+#[tokio::test]
+async fn sampled_slot_end_is_exclusive_before_and_after_reads() {
+    use std::time::Duration;
+    use testkit::collector::testing::{ManualClock, ManualPause};
+    use testkit::head_lag::{run, RunConfig, SlotSchedule};
+    struct AdvancingHead {
+        clock: std::sync::Arc<ManualClock>,
+        delay: Duration,
+    }
+    impl testkit::head_lag::HeadSource for AdvancingHead {
+        async fn read_head(&self) -> Result<Head, testkit::head_lag::Error> {
+            self.clock.advance(self.delay);
+            Ok(Head {
+                slot: 10,
+                root: Root::ZERO,
+                payload_status: None,
+            })
+        }
+    }
+    let schedule = SlotSchedule::new(1000, 12, Duration::from_secs(4)).unwrap();
+    for (now, delay, compared, calls) in [
+        (1131, 0, 1, 1),
+        (1132, 0, 0, 0),
+        (1133, 0, 0, 0),
+        (1124, 7, 1, 1),
+        (1124, 8, 0, 1),
+        (1124, 9, 0, 1),
+    ] {
+        let clock = ManualClock::at(now * 1_000_000_000);
+        let ours = ConstantHead::new(10);
+        let reference = AdvancingHead {
+            clock: clock.clone(),
+            delay: Duration::from_secs(delay),
+        };
+        let report = run(
+            RunConfig {
+                schedule,
+                first_slot: 10,
+                slots: 1,
+                slots_per_epoch: 32,
+            },
+            &ours,
+            &reference,
+            &*clock,
+            &ManualPause(clock.clone()),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.compared, compared, "now={now}, delay={delay}");
+        assert_eq!(report.gap_samples, 1 - compared);
+        assert_eq!(ours.calls.load(std::sync::atomic::Ordering::Relaxed), calls);
+    }
+}
+
+#[tokio::test]
+async fn reference_head_accepts_mixed_case_api_roots() {
+    use std::time::Duration;
+    use testkit::collector::testing::{FixtureServer, Reply};
+    use testkit::head_lag::HeadSource;
+    use testkit::root_diff::Reference;
+    let api = FixtureServer::start(|_, _| {
+        Reply::json(include_str!("fixtures/root_diff/mixed-case-header.json"))
+    })
+    .await;
+    let head = Reference::new(api.url(""), Duration::from_secs(2))
+        .read_head()
+        .await
+        .unwrap();
+    assert_eq!(head.slot, 321);
+    assert_eq!(head.root, Root::from([0xab; 32]));
+}

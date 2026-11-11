@@ -12,7 +12,7 @@ pub enum PayloadStatus {
     Full,
 }
 
-/// A single atomic head/status snapshot from QueryService or head_v2.
+/// A current atomic head/status read guaranteed by its adapter (not a cached SSE event).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadSnapshot {
     /// Head block slot (may precede the polling slot after an empty slot).
@@ -20,6 +20,25 @@ pub struct HeadSnapshot {
     /// Head beacon block root.
     pub root: Root,
     /// This head's FULL/EMPTY selection.
+    pub status: PayloadStatus,
+}
+
+/// An observed SSE transition. FULL-to-EMPTY events are optional, so this is not
+/// evidence of the current selection and cannot be supplied to `compare_head`.
+///
+/// ```compile_fail
+/// use testkit::root_diff::{compare_head, HeadEvents};
+/// fn stale(sample: &testkit::head_lag::Sample, events: &HeadEvents) {
+///     compare_head(sample, None, events.snapshot());
+/// }
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadEvent {
+    /// Slot carried by the event.
+    pub slot: u64,
+    /// Beacon block root carried by the event.
+    pub root: Root,
+    /// Selection at the observed transition, not necessarily the current selection.
     pub status: PayloadStatus,
 }
 
@@ -33,7 +52,7 @@ pub enum HeadGap {
     Sample,
     /// Our atomic status snapshot is absent or does not match the sampled head.
     Ours,
-    /// No connected, matching reference event is available.
+    /// No current atomic reference status read matches the sampled head.
     Reference,
 }
 
@@ -50,7 +69,7 @@ pub struct HeadRecord {
     pub head_ref: Option<Root>,
     /// Our matching snapshot's status, if available.
     pub status_ours: Option<PayloadStatus>,
-    /// The reference event's status, if available.
+    /// The reference current read's status, if available.
     pub status_ref: Option<PayloadStatus>,
     /// Whether the lag gate and all evidence checks succeeded.
     pub compared: bool,
@@ -131,7 +150,7 @@ pub struct HeadError;
 #[derive(Default)]
 pub struct HeadEvents {
     parser: crate::collector::SseParser,
-    current: Option<HeadSnapshot>,
+    current: Option<HeadEvent>,
     connected: bool,
 }
 impl HeadEvents {
@@ -147,7 +166,7 @@ impl HeadEvents {
         self.connected = false;
     }
     /// The most recent valid event on this connection only.
-    pub fn snapshot(&self) -> Option<HeadSnapshot> {
+    pub fn snapshot(&self) -> Option<HeadEvent> {
         self.current.clone()
     }
     /// Decode recorded or live chunks. Invalid subscribed events invalidate the old head.
@@ -195,13 +214,8 @@ impl HeadEvents {
             {
                 return Err(HeadError);
             }
-            let root = event
-                .data
-                .block
-                .strip_prefix("0x")
-                .and_then(crate::archive::canonical_hex::<32>)
-                .ok_or(HeadError)?;
-            self.current = Some(HeadSnapshot {
+            let root = super::api_root(&event.data.block).ok_or(HeadError)?;
+            self.current = Some(HeadEvent {
                 slot: event.data.slot.parse().map_err(|_| HeadError)?,
                 root: Root::from(root),
                 status: event.data.payload_status,
@@ -213,9 +227,9 @@ impl HeadEvents {
 
 /// Owned head_v2 subscription. Drop cancels the bounded reader and invalidates cached evidence.
 pub struct HeadStream {
-    current: tokio::sync::watch::Receiver<Option<HeadSnapshot>>,
+    current: tokio::sync::watch::Receiver<Option<HeadEvent>>,
     task: tokio::task::JoinHandle<()>,
-    publish: tokio::sync::watch::Sender<Option<HeadSnapshot>>,
+    publish: tokio::sync::watch::Sender<Option<HeadEvent>>,
 }
 impl HeadStream {
     /// Subscribe on the existing owner-checked loopback/tunnel URL, with bounded deadlines.
@@ -272,12 +286,12 @@ impl HeadStream {
             publish,
         })
     }
-    /// Latest head on the currently connected stream, or no evidence.
-    pub fn snapshot(&self) -> Option<HeadSnapshot> {
+    /// Latest observed transition on this connection; never proof of current status.
+    pub fn snapshot(&self) -> Option<HeadEvent> {
         self.current.borrow().clone()
     }
     /// Observe readiness and connection-loss changes without polling or timing sleeps.
-    pub fn updates(&self) -> tokio::sync::watch::Receiver<Option<HeadSnapshot>> {
+    pub fn updates(&self) -> tokio::sync::watch::Receiver<Option<HeadEvent>> {
         self.current.clone()
     }
 }
@@ -294,12 +308,6 @@ impl PayloadStatus {
             Ok(ethswarm_proto::chain::HeadPayloadStatus::Empty) => Ok(Self::Empty),
             Ok(ethswarm_proto::chain::HeadPayloadStatus::Full) => Ok(Self::Full),
             _ => Err(HeadError),
-        }
-    }
-    pub(crate) fn to_wire(self) -> i32 {
-        match self {
-            Self::Empty => ethswarm_proto::chain::HeadPayloadStatus::Empty as i32,
-            Self::Full => ethswarm_proto::chain::HeadPayloadStatus::Full as i32,
         }
     }
 }
@@ -334,7 +342,6 @@ impl HeadSummary {
 }
 
 struct HeadSink<'a, L, H> {
-    events: &'a HeadStream,
     lag: &'a mut L,
     head: &'a mut H,
     samples: u64,
@@ -350,16 +357,18 @@ impl<L: tokio::io::AsyncWrite + Unpin, H: tokio::io::AsyncWrite + Unpin> crate::
         &mut self,
         sample: &crate::head_lag::Sample,
     ) -> Result<(), crate::head_lag::Error> {
-        let ours = sample.ours.as_ref().and_then(|head| {
-            head.payload_status.map(|status| HeadSnapshot {
-                slot: head.slot,
-                root: head.root,
-                status,
+        let current = |head: &Option<crate::head_lag::Head>| {
+            head.as_ref().and_then(|head| {
+                head.payload_status.map(|status| HeadSnapshot {
+                    slot: head.slot,
+                    root: head.root,
+                    status,
+                })
             })
-        });
-        // Take the connected-stream snapshot before either output await. Correlation below
-        // rejects a different slot/root; no second moving-head QueryService read is made.
-        let record = compare_head(sample, ours, self.events.snapshot());
+        };
+        // Only the sampled reads' adapter-guaranteed atomic statuses certify a comparison.
+        // Generic head_v2 permits omitted transitions, even with a live heartbeat.
+        let record = compare_head(sample, current(&sample.ours), current(&sample.reference));
         crate::head_lag::write_jsonl(self.lag, sample).await?;
         crate::head_lag::write_jsonl(self.head, &record).await?;
         self.samples += 1;
@@ -371,14 +380,17 @@ impl<L: tokio::io::AsyncWrite + Unpin, H: tokio::io::AsyncWrite + Unpin> crate::
     }
 }
 
-/// Use the head-lag sampler for both lag and SSE-correlated head/status JSONL outputs.
+/// Use the shared sampler for lag and authoritative current head/status comparisons.
+/// SSE is observational only. Header-only adapters supply no status and produce gaps;
+/// an adapter must guarantee the status in the same current read to certify a comparison.
+/// The stream parameter preserves caller-owned observation/lifecycle compatibility only.
 /// The output tuple is `(lag_samples, head_comparisons)`. Drops cancel in-flight reads;
 /// the caller owns the SSE stream and its shutdown lifetime.
 pub async fn run_head(
     config: crate::head_lag::RunConfig,
     ours: &impl crate::head_lag::HeadSource,
     reference: &impl crate::head_lag::HeadSource,
-    events: &HeadStream,
+    _events: &HeadStream,
     clock: &impl crate::collector::Clock,
     pause: &impl crate::collector::Pause,
     outputs: (
@@ -387,7 +399,6 @@ pub async fn run_head(
     ),
 ) -> Result<HeadSummary, crate::head_lag::Error> {
     let mut sink = HeadSink {
-        events,
         lag: outputs.0,
         head: outputs.1,
         samples: 0,

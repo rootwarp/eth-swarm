@@ -15,10 +15,14 @@ use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{Request, Response, Status};
 
 /// A private-runtime-dir UDS fixture. Drop signals graceful shutdown; `shutdown` waits for it.
+/// Even silent handshakes and transport drains close within twice the configured timeout.
 pub struct QueryStub {
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<io::Result<()>>>,
-    heads: tokio::sync::watch::Receiver<Option<crate::root_diff::HeadSnapshot>>,
+    heads: crate::root_diff::HeadStream,
+
+    #[cfg(test)]
+    accepted: tokio::sync::mpsc::Receiver<()>,
 }
 
 impl QueryStub {
@@ -41,9 +45,7 @@ impl QueryStub {
             Duration::from_secs(24).max(timeout),
         )
         .map_err(io::Error::other)?;
-        let head_updates = heads.updates();
         let adapter = Adapter {
-            heads,
             reference: Reference::new(url.clone(), timeout),
             url,
             timeout,
@@ -60,12 +62,24 @@ impl QueryStub {
             Ok(request)
         });
         let (stop, stopped) = oneshot::channel();
+        let incoming = UnixListenerStream::new(listener);
+        #[cfg(test)]
+        let (accepted_tx, accepted) = tokio::sync::mpsc::channel(1);
+        #[cfg(test)]
+        let incoming = tokio_stream::StreamExt::map(incoming, move |stream| {
+            let _ = accepted_tx.try_send(());
+            stream
+        });
         let task = tokio::spawn(async move {
             let result = tonic::transport::Server::builder()
                 .concurrency_limit_per_connection(8)
                 .timeout(timeout)
+                // RPC deadlines do not cover HTTP/2 handshakes or graceful transport drain.
+                // Tonic's age+grace timer force-closes the owned connection in either state.
+                .max_connection_age(timeout)
+                .max_connection_age_grace(timeout)
                 .add_service(service)
-                .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async {
+                .serve_with_incoming_shutdown(incoming, async {
                     let _ = stopped.await;
                 })
                 .await
@@ -76,15 +90,18 @@ impl QueryStub {
         Ok(Self {
             stop: Some(stop),
             task: Some(task),
-            heads: head_updates,
+            heads,
+
+            #[cfg(test)]
+            accepted,
         })
     }
 
     /// Observe second-CL head_v2 readiness/loss without timing sleeps.
     pub fn head_updates(
         &self,
-    ) -> tokio::sync::watch::Receiver<Option<crate::root_diff::HeadSnapshot>> {
-        self.heads.clone()
+    ) -> tokio::sync::watch::Receiver<Option<crate::root_diff::HeadEvent>> {
+        self.heads.updates()
     }
 
     /// Stop accepting and drain deadline-bounded calls, then remove only the owned socket.
@@ -108,7 +125,6 @@ impl Drop for QueryStub {
 }
 
 struct Adapter {
-    heads: crate::root_diff::HeadStream,
     url: ReferenceApiUrl,
     reference: Reference,
     timeout: Duration,
@@ -117,8 +133,7 @@ struct Adapter {
 fn root(value: &Value) -> Result<Vec<u8>, Status> {
     value
         .as_str()
-        .and_then(|s| s.strip_prefix("0x"))
-        .and_then(crate::archive::canonical_hex::<32>)
+        .and_then(crate::root_diff::api_root)
         .map(Vec::from)
         .ok_or_else(|| Status::unavailable("invalid reference header root"))
 }
@@ -175,14 +190,9 @@ impl QueryService for Adapter {
             .read_state(&format!("0x{}", hex::encode(&state_root)))
             .await
             .map_err(|_| Status::unavailable("reference checkpoints read failed"))?;
-        let payload_status = if wanted.is_none() {
-            self.heads
-                .snapshot()
-                .filter(|head| head.slot == slot && head.root.as_slice() == block_root.as_slice())
-                .map(|head| head.status.to_wire())
-        } else {
-            None
-        };
+        // Header REST supplies no atomic FULL/EMPTY selection. A live head_v2 cache
+        // cannot fill this field: the API permits transitions without an event.
+        let payload_status = None;
         Ok(Response::new(pb::GetStateSummaryResponse {
             slot,
             state_root,
@@ -247,5 +257,57 @@ impl QueryService for Adapter {
         Err(Status::unimplemented(
             "query fixture: checkpoint summaries only",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collector::testing::{FixtureServer, Reply};
+    use tokio::io::AsyncReadExt;
+
+    async fn silent_peer_cleanup(explicit: bool) {
+        let api = FixtureServer::start(|_, _| Reply::status(503)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = ipc::uds::SocketDir::under(dir.path(), "silent-peer").unwrap();
+        let deadline = Duration::from_millis(20);
+        let mut server = QueryStub::start(&socket, api.url(""), deadline).unwrap();
+        let mut peer = tokio::net::UnixStream::connect(socket.socket_path())
+            .await
+            .unwrap();
+        // Accept barrier: no sleeps and no race with the listener's shutdown select.
+        server.accepted.recv().await.unwrap();
+        tokio::time::timeout(Duration::from_millis(100), async {
+            if explicit {
+                server.shutdown().await.unwrap();
+            } else {
+                let task = server.task.take().unwrap();
+                drop(server);
+                task.await.unwrap().unwrap();
+            }
+        })
+        .await
+        .expect("silent handshake must not strand shutdown");
+        assert!(
+            !socket.socket_path().exists(),
+            "owned socket must be removed"
+        );
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_millis(100), peer.read_to_end(&mut bytes))
+            .await
+            .expect("the accepted transport must be closed")
+            .unwrap();
+        let rebound = QueryStub::start(&socket, api.url(""), deadline).unwrap();
+        rebound.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_peer_explicit_shutdown_is_bounded() {
+        silent_peer_cleanup(true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_peer_drop_closes_transport_and_socket() {
+        silent_peer_cleanup(false).await;
     }
 }

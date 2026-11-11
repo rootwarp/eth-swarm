@@ -1,0 +1,3 @@
+event: head_v2
+data: {"version":"gloas","data":{"slot":"321","block":"0xaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaBaB","payload_status":"full"}}
+
