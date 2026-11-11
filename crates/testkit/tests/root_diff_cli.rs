@@ -48,3 +48,68 @@ fn cli_help_and_usage_are_safe() {
     assert_eq!(bad.status.code(), Some(64));
     assert!(!String::from_utf8_lossy(&bad.stderr).contains("do-not-echo"));
 }
+
+#[cfg(unix)]
+#[test]
+fn head_run_writes_shared_gap_records_without_overwriting_logs() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let url = dir.path().join("reference.url");
+    std::fs::write(&url, "http://127.0.0.1:1").unwrap();
+    std::fs::set_permissions(&url, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let output = dir.path().join("head.jsonl");
+    let lag = dir.path().join("lag.jsonl");
+    let uid = std::fs::metadata(&url).unwrap().uid().to_string();
+    let invoke = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_root-diff"))
+            .args(["head-run", "--socket"])
+            .arg(dir.path().join("unused.sock"))
+            .args(["--server-uid", &uid, "--reference-url-file"])
+            .arg(&url)
+            .args([
+                "--genesis-time",
+                "0",
+                "--seconds-per-slot",
+                "1",
+                "--slots-per-epoch",
+                "32",
+                "--slots",
+                "2",
+                "--first-slot",
+                "0",
+                "--offset-ms",
+                "0",
+                "--out",
+            ])
+            .arg(&output)
+            .arg("--lag-out")
+            .arg(&lag)
+            .output()
+            .unwrap()
+    };
+    let first = invoke();
+    assert_eq!(
+        first.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(summary["gaps"], 2);
+    assert_eq!(summary["compared"], 0);
+    let original = std::fs::read(&output).unwrap();
+    for line in String::from_utf8(original.clone()).unwrap().lines() {
+        let record: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(record["compared"], false);
+        assert!(record["match"].is_null());
+    }
+    assert_eq!(
+        String::from_utf8(std::fs::read(&lag).unwrap())
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    assert_eq!(invoke().status.code(), Some(2));
+    assert_eq!(std::fs::read(output).unwrap(), original);
+}

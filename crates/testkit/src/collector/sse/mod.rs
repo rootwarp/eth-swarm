@@ -17,3 +17,6 @@ pub use node::{
 };
 pub use parse::{SseEvent, SseParser, TooLarge, MAX_EVENT_BYTES, MAX_EVENT_NAME_BYTES};
 pub use spec::{config_name, MAX_SPEC_BYTES, SPEC_PATH};
+
+#[cfg(feature = "soak")]
+pub(crate) use client::open_stream;

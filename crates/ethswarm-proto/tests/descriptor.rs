@@ -65,3 +65,30 @@ fn generated_clients_and_servers_exist_for_each_service() {
     assert_eq!(names[0], "ethswarm.api.v1.ApiService");
     assert_eq!(names[7], "ethswarm.verify.v1.VerifyService");
 }
+
+#[test]
+fn head_payload_status_has_explicit_presence_and_stable_wire_values() {
+    use ethswarm_proto::chain::{GetStateSummaryResponse, HeadPayloadStatus};
+    let absent = GetStateSummaryResponse::default();
+    assert_eq!(
+        GetStateSummaryResponse::decode(absent.encode_to_vec().as_slice())
+            .unwrap()
+            .payload_status,
+        None
+    );
+    assert_eq!(HeadPayloadStatus::Unspecified as i32, 0);
+    assert_eq!(HeadPayloadStatus::Empty as i32, 1);
+    assert_eq!(HeadPayloadStatus::Full as i32, 2);
+    for status in [HeadPayloadStatus::Empty, HeadPayloadStatus::Full] {
+        let value = GetStateSummaryResponse {
+            payload_status: Some(status as i32),
+            ..Default::default()
+        };
+        assert_eq!(
+            GetStateSummaryResponse::decode(value.encode_to_vec().as_slice())
+                .unwrap()
+                .payload_status,
+            Some(status as i32)
+        );
+    }
+}
