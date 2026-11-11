@@ -66,7 +66,7 @@ pub struct Alert {
     pub p99: Option<i64>,
     /// Successful samples in the trailing hour; makes partial startup coverage explicit.
     pub window_samples: u64,
-    /// Current recovery duration in sampling slots, if an episode is open.
+    /// Recovery duration at firing, including a healthy sample closing the episode.
     pub recovery_slots: Option<u64>,
     /// A recovery crossed gaps; its exact recovery time is uncertain.
     pub had_gaps: bool,
@@ -129,13 +129,11 @@ impl Monitor {
             *had_gaps |=
                 sample.lag.is_none() || self.previous.is_some_and(|old| sample.slot - old > 1);
         }
-        match sample.lag {
-            Some(lag) if lag > 2 => {
-                self.recovery.get_or_insert((sample.slot, false));
-            }
-            Some(_) => self.recovery = None,
-            None => {}
+        if sample.lag.is_some_and(|lag| lag > 2) {
+            self.recovery.get_or_insert((sample.slot, false));
         }
+        // The healthy closing observation contributes to the completed interval.
+        // Retain it through rising-edge evaluation, including its current roots.
         let recovery_slots = self.recovery.map(|(start, _)| sample.slot - start);
         let had_gaps = self.recovery.is_some_and(|(_, gaps)| gaps);
         let recovering = recovery_slots.is_some_and(|slots| slots > self.slots_per_epoch);
@@ -159,13 +157,6 @@ impl Monitor {
         self.metrics.available.set(i64::from(sample.lag.is_some()));
         self.metrics.p99.set(p99.unwrap_or(0));
         self.metrics.count.set(lags.len() as i64);
-        self.metrics.recovery.set(
-            recovery_slots
-                .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
-                .unwrap_or(0),
-        );
-        self.metrics.active.set(i64::from(self.recovery.is_some()));
-        self.metrics.uncertain.set(i64::from(had_gaps));
         let active = p99.is_some_and(|lag| lag > 2);
         let mut alerts = Vec::new();
         let worst = sample.lag.is_some_and(|lag| lag > 32);
@@ -198,9 +189,23 @@ impl Monitor {
                 had_gaps,
             });
         }
+        if sample.lag.is_some_and(|lag| lag <= 2) {
+            self.recovery = None;
+        }
+        let recovery_open = self.recovery.is_some();
+        self.metrics.recovery.set(
+            recovery_slots
+                .filter(|_| recovery_open)
+                .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
+                .unwrap_or(0),
+        );
+        self.metrics.active.set(i64::from(recovery_open));
+        self.metrics
+            .uncertain
+            .set(i64::from(recovery_open && had_gaps));
         self.p99_active = active;
         self.worst_active = worst;
-        self.recovery_active = recovering;
+        self.recovery_active = recovering && recovery_open;
         Ok(alerts)
     }
 }

@@ -134,7 +134,8 @@ pub fn window_report(
             let finish = recovery.end_slot.unwrap_or(end).min(end);
             recovery.elapsed_slots = finish - recovery.start_slot;
             recovery.end_slot = recovery.end_slot.filter(|slot| *slot <= end);
-            recovery.over_epoch = recovery.elapsed_slots > slots_per_epoch;
+            // Clipping may discard proof, but missing tail evidence cannot create it.
+            recovery.over_epoch &= recovery.elapsed_slots > slots_per_epoch;
             recovery.had_gaps |= samples.last().is_none_or(|sample| sample.slot < finish);
             recovery
         })

@@ -420,7 +420,14 @@ fn alert_p99() {
     assert_eq!(alerts[0].window_samples, 300);
     assert_eq!(alerts[0].head_ours, Root::from([0x11; 32]));
     assert_eq!(alerts[0].head_ref, Root::from([0x22; 32]));
-    assert!(monitor.observe(&sample(604, 1)).unwrap().is_empty());
+    let closing = monitor.observe(&sample(604, 1)).unwrap();
+    assert_eq!(closing.len(), 1);
+    assert_eq!(closing[0].kind, AlertKind::Recovery);
+    assert!(
+        closing[0].had_gaps,
+        "the observed interval is only a warning"
+    );
+    assert_eq!(closing[0].recovery_slots, Some(304));
     assert!(
         monitor
             .observe(&sample(605, 3))
@@ -581,9 +588,16 @@ fn report_window_preserves_carry_in_and_missing_tail() {
         "an open recovery is not a completed pass"
     );
     let tail = window_report(&samples, 12, 32, Some(7232)).unwrap();
+    assert!(!tail.summary.recoveries[0].over_epoch);
+    assert!(tail.summary.recoveries[0].had_gaps);
+    assert_eq!(tail.exit_code(), 2, "a missing tail never proves a breach");
+    let proven: Vec<_> = (0..7200)
+        .map(|slot| sample(slot, if slot >= 7166 { 3 } else { 1 }))
+        .collect();
+    let tail = window_report(&proven, 12, 32, Some(7232)).unwrap();
     assert!(tail.summary.recoveries[0].over_epoch);
     assert!(tail.summary.recoveries[0].had_gaps);
-    assert_eq!(tail.exit_code(), 1);
+    assert_eq!(tail.exit_code(), 1, "earlier proven breaches remain sticky");
     let missing = window_report(&[sample(10000, 1)], 12, 32, Some(10001)).unwrap();
     assert_eq!(
         (
@@ -822,4 +836,66 @@ async fn reference_head_accepts_mixed_case_api_roots() {
         .unwrap();
     assert_eq!(head.slot, 321);
     assert_eq!(head.root, Root::from([0xab; 32]));
+}
+
+#[test]
+fn recovery_closing_sample_is_evaluated_once_and_rearms() {
+    use testkit::head_lag::{AlertKind, Monitor};
+    for seconds in [1, 12] {
+        for closing in [33, 32, 34] {
+            let mut monitor = Monitor::new(seconds, 32).unwrap();
+            for slot in 0..3500 {
+                assert!(monitor.observe(&sample(slot, 1)).unwrap().is_empty());
+            }
+            let mut recoveries = Vec::new();
+            for offset in 0..=closing {
+                let lag = if offset == closing { 1 } else { 3 };
+                recoveries.extend(
+                    monitor
+                        .observe(&sample(3500 + offset, lag))
+                        .unwrap()
+                        .into_iter()
+                        .filter(|a| a.kind == AlertKind::Recovery),
+                );
+            }
+            assert_eq!(
+                recoveries.len(),
+                usize::from(closing > 32),
+                "seconds={seconds}, closing={closing}"
+            );
+            if let Some(alert) = recoveries.first() {
+                assert_eq!(
+                    (alert.slot, alert.context_slot, alert.recovery_slots),
+                    (3533, 3533, Some(33))
+                );
+                assert_eq!(
+                    (alert.head_ours, alert.head_ref),
+                    (Root::from([0x11; 32]), Root::from([0x22; 32]))
+                );
+                assert!(!alert.had_gaps);
+                assert_eq!(alert.lag, if closing == 33 { 1 } else { 3 });
+                if seconds == 1 {
+                    assert_eq!(alert.p99, Some(1));
+                }
+            }
+            let metrics = monitor.metrics().unwrap();
+            assert!(metrics.contains("head_lag_recovery_active 0\n"));
+            assert!(metrics.contains("head_lag_recovery_slots 0\n"));
+            let healthy = 3500 + closing + 1;
+            monitor.observe(&sample(healthy, 1)).unwrap();
+            let next = healthy + 1;
+            let mut repeated = Vec::new();
+            for offset in 0..=33 {
+                repeated.extend(
+                    monitor
+                        .observe(&sample(next + offset, if offset == 33 { 1 } else { 3 }))
+                        .unwrap()
+                        .into_iter()
+                        .filter(|a| a.kind == AlertKind::Recovery),
+                );
+            }
+            assert_eq!(repeated.len(), 1, "a completed episode must rearm");
+            assert_eq!(repeated[0].slot, next + 33);
+        }
+    }
 }
