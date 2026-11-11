@@ -1,0 +1,12 @@
+{
+  "data": {
+    "finalized": {
+      "epoch": "8",
+      "root": "0xABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCDABCD"
+    },
+    "current_justified": {
+      "epoch": "9",
+      "root": "0xeFeFeFeFeFeFeFeFeFeFeFeFeFeFeFeFeFeFeFeFeFeFeFeFeFeFeFeFeFeFeFeF"
+    }
+  }
+}

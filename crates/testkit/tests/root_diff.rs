@@ -284,7 +284,10 @@ fn malformed_finality_is_rejected_without_echoing_response_data() {
             ("epoch", serde_json::json!("+9")),
             ("epoch", serde_json::json!("18446744073709551616")),
             ("root", serde_json::json!("private-response-data")),
-            ("root", serde_json::json!(format!("0x{}", "AA".repeat(32)))),
+            ("root", serde_json::json!(format!("0x{}", "AG".repeat(32)))),
+            ("root", serde_json::json!(format!("0x{}", "ab".repeat(31)))),
+            ("root", serde_json::json!(format!("0x{}", "ab".repeat(33)))),
+            ("root", serde_json::json!(format!("0X{}", "ab".repeat(32)))),
         ] {
             let mut value = original.clone();
             value["data"][field][key] = bad;
@@ -361,4 +364,52 @@ async fn simulated_hour_two_fixture_cls_one_record_per_epoch() {
     assert!(records.iter().all(|record| record.r#match == Some(true)));
     assert_eq!(second.seen().len(), 10);
     server.shutdown().await.unwrap();
+}
+
+#[test]
+fn mixed_case_finality_roots_are_equivalent() {
+    let mixed = include_bytes!("fixtures/root_diff/mixed-case-finality.json");
+    let canonical = String::from_utf8(mixed.to_vec())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert_eq!(
+        parse_finality(mixed).unwrap(),
+        parse_finality(canonical.as_bytes()).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn mixed_case_headers_roundtrip_through_query_stub() {
+    use std::time::Duration;
+    use testkit::collector::testing::{FixtureServer, Reply};
+    use testkit::query_stub::QueryStub;
+    use testkit::root_diff::{sample, QuerySource, Reference};
+    let api = FixtureServer::start(|_, path| {
+        if path == "/eth/v1/beacon/headers/321" {
+            Reply::json(include_str!("fixtures/root_diff/mixed-case-header.json"))
+        } else if path.ends_with("/finality_checkpoints") {
+            Reply::json(include_str!("fixtures/root_diff/mixed-case-finality.json"))
+        } else {
+            Reply::status(404)
+        }
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = ipc::uds::SocketDir::under(dir.path(), "mixed-case").unwrap();
+    let timeout = Duration::from_secs(2);
+    let server = QueryStub::start(&socket, api.url(""), timeout).unwrap();
+    let ours = QuerySource::new(
+        socket.socket_path(),
+        ipc::peercred::effective_uid(),
+        timeout,
+    );
+    let reference = Reference::new(api.url(""), timeout);
+    let record = sample(10, 321, &ours, &reference).await;
+    server.shutdown().await.unwrap();
+    assert_eq!(record.r#match, Some(true), "{record:?}");
+    assert!(api.seen().iter().any(|(path, _)| path
+        == &format!(
+            "/eth/v1/beacon/states/0x{}/finality_checkpoints",
+            "cd".repeat(32)
+        )));
 }
