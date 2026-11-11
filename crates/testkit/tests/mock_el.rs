@@ -104,8 +104,8 @@ async fn each_status() {
 
 fn sign(key: &[u8; 32], claims: Value, algorithm: &str) -> String {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2_hmac::Sha256;
     let header = json!({"alg":algorithm,"typ":"JWT"});
     let input = format!(
         "{}.{}",

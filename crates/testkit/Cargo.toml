@@ -35,11 +35,13 @@ test-support = ["p2p-wire/testkit", "dep:ssz_types", "hyper/server"]
 replay = ["dep:crypto-bls", "dep:state-transition"]
 
 # Scriptable loopback Engine API fixture; consumers opt in from dev-dependencies only.
-mock-el = ["dep:engine-api", "dep:hmac", "dep:base64", "hyper/server"]
+mock-el = ["dep:engine-api", "dep:hmac", "dep:sha2-hmac", "dep:base64", "hyper/server"]
 
 [dependencies]
 engine-api = { path = "../engine-api", optional = true }
-hmac = { version = "0.12", optional = true }
+# Match the production JWT digest pair without changing archive hashing's sha2 API.
+hmac = { version = "0.13", optional = true }
+sha2-hmac = { package = "sha2", version = "0.11", optional = true }
 base64 = { version = "0.22", optional = true }
 consensus-types = { path = "../consensus-types" }
 network-config = { path = "../network-config" }

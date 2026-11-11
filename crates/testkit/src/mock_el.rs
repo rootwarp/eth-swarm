@@ -6,12 +6,12 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use bytes::Bytes;
 use engine_api::{FixedData, PayloadStatusV1, ValidationStatus};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
-use sha2::Sha256;
+use sha2_hmac::Sha256;
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
