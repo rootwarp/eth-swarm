@@ -1,24 +1,38 @@
 //! Finite slot-aligned head sampling and offline run-wide computation.
 use std::{collections::BTreeMap, path::PathBuf, process::ExitCode, time::Duration};
 use testkit::collector::{Clock, ReferenceApiUrl, SystemClock, TokioPause};
-use testkit::head_lag::{analyze_jsonl, run, RunConfig, SlotSchedule, Summary, MAX_SAMPLES};
+use testkit::head_lag::{analyze_jsonl, run_live, RunConfig, SlotSchedule, Summary, MAX_SAMPLES};
 use testkit::root_diff::{QuerySource, Reference};
 use tokio::io::AsyncWriteExt;
 
 const HELP: &str = "\
-usage: head-lag analyze --samples JSONL --slots-per-epoch N
+usage: head-lag report --window 24h --samples JSONL --seconds-per-slot N
+         --slots-per-epoch N [--end-slot N]
+       head-lag rules
+       head-lag analyze --samples JSONL --slots-per-epoch N
        head-lag run --socket PATH --server-uid UID --reference-url-file FILE
          --genesis-time UNIX_SECONDS --seconds-per-slot N --slots-per-epoch N
          --slots N --out NEW_FILE [--first-slot N] [--offset-ms 4000] [--timeout-secs 6]
+         [--alerts-out NEW_FILE] [--metrics-out NEW_FILE]
 
 Samples reference-minus-ours head slot lag every slot, normally +4 seconds into the slot.
 Run writes shared JSONL and prints run-wide JSON statistics. Analyze recomputes from JSONL.
 Nearest-rank p99 <=2, worst <=32, recovery <=one epoch. Gaps never become zero lag.
 Reference URL files use the collector's owner/mode/loopback restrictions (use tunnels).
-Finite computation only; no live alerts or 24-hour Markdown report. Output must be new.
+Run emits rising-edge alert JSONL immediately (stderr unless --alerts-out is set).
+Metrics use atomic prometheus-client textfile snapshots; rules gate their freshness.
+Report emits 24h Markdown; missing coverage/open recovery cannot qualify as PASS.
+All run output paths must be new; existing logs are never overwritten.
 Exit codes: 0 within thresholds, 1 computed breach, 2 gaps/runtime failure, 64 usage, 130 interrupted.";
 
 enum Args {
+    Report {
+        samples: PathBuf,
+        sps: u64,
+        spe: u64,
+        end: Option<u64>,
+    },
+    Rules,
     Analyze {
         samples: PathBuf,
         spe: u64,
@@ -33,6 +47,8 @@ enum Args {
         spe: u64,
         out: PathBuf,
         timeout: Duration,
+        alerts: Option<PathBuf>,
+        metrics: Option<PathBuf>,
     },
 }
 
@@ -62,7 +78,21 @@ async fn main() -> ExitCode {
 fn parse(args: Vec<String>) -> Result<Args, String> {
     let mut args = args.into_iter();
     let mode = args.next().ok_or("missing command")?;
+    if mode == "rules" {
+        return if args.next().is_none() {
+            Ok(Args::Rules)
+        } else {
+            Err("unexpected rules argument".into())
+        };
+    }
     let allowed: &[&str] = match mode.as_str() {
+        "report" => &[
+            "--window",
+            "--samples",
+            "--seconds-per-slot",
+            "--slots-per-epoch",
+            "--end-slot",
+        ],
         "analyze" => &["--samples", "--slots-per-epoch"],
         "run" => &[
             "--socket",
@@ -76,6 +106,8 @@ fn parse(args: Vec<String>) -> Result<Args, String> {
             "--first-slot",
             "--offset-ms",
             "--timeout-secs",
+            "--alerts-out",
+            "--metrics-out",
         ],
         _ => return Err("unknown command".into()),
     };
@@ -114,6 +146,18 @@ fn parse(args: Vec<String>) -> Result<Args, String> {
     if spe == 0 {
         return Err("zero epoch length".into());
     }
+    if mode == "report" {
+        let sps = number("--seconds-per-slot")?;
+        if required("--window")? != "24h" || sps == 0 || 86400 % sps != 0 {
+            return Err("report requires a whole-slot 24h window".into());
+        }
+        return Ok(Args::Report {
+            samples: required("--samples")?.into(),
+            sps,
+            spe,
+            end: optional("--end-slot")?,
+        });
+    }
     if mode == "analyze" {
         return Ok(Args::Analyze {
             samples: required("--samples")?.into(),
@@ -146,6 +190,8 @@ fn parse(args: Vec<String>) -> Result<Args, String> {
         spe,
         out: required("--out")?.into(),
         timeout: Duration::from_secs(timeout),
+        alerts: values.get("--alerts-out").map(PathBuf::from),
+        metrics: values.get("--metrics-out").map(PathBuf::from),
     })
 }
 
@@ -163,6 +209,35 @@ async fn print_summary(summary: Summary) -> Result<u8, String> {
 
 async fn execute(args: Args) -> Result<u8, String> {
     match args {
+        Args::Rules => {
+            let mut stdout = tokio::io::stdout();
+            stdout
+                .write_all(testkit::head_lag::ALERT_RULES.as_bytes())
+                .await
+                .map_err(|_| "rules write failed")?;
+            stdout.flush().await.map_err(|_| "rules flush failed")?;
+            Ok(0)
+        }
+        Args::Report {
+            samples,
+            sps,
+            spe,
+            end,
+        } => {
+            let input = tokio::fs::File::open(samples)
+                .await
+                .map_err(|_| "cannot open samples")?;
+            let report = testkit::head_lag::report_jsonl(input, sps, spe, end)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut stdout = tokio::io::stdout();
+            stdout
+                .write_all(report.markdown().as_bytes())
+                .await
+                .map_err(|_| "report write failed")?;
+            stdout.flush().await.map_err(|_| "report flush failed")?;
+            Ok(report.exit_code())
+        }
         Args::Analyze { samples, spe } => {
             let input = tokio::fs::File::open(samples)
                 .await
@@ -182,6 +257,8 @@ async fn execute(args: Args) -> Result<u8, String> {
             spe,
             out,
             timeout,
+            alerts,
+            metrics,
         } => {
             let url = tokio::task::spawn_blocking(move || ReferenceApiUrl::read_file(&url))
                 .await
@@ -200,8 +277,29 @@ async fn execute(args: Args) -> Result<u8, String> {
                 .open(out)
                 .await
                 .map_err(|_| "cannot create new run log")?;
+            let mut alert_output: Box<dyn tokio::io::AsyncWrite + Unpin> =
+                if let Some(path) = alerts {
+                    Box::new(
+                        tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(path)
+                            .await
+                            .map_err(|_| "cannot create new alert log")?,
+                    )
+                } else {
+                    Box::new(tokio::io::stderr())
+                };
+            if let Some(path) = &metrics {
+                tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .await
+                    .map_err(|_| "cannot create new metrics file")?;
+            }
             tokio::select! {
-                result = run(RunConfig {schedule,first_slot,slots,slots_per_epoch:spe},&ours,&reference,&clock,&TokioPause,&mut output) => print_summary(result.map_err(|error|error.to_string())?).await,
+                result = run_live(RunConfig {schedule,first_slot,slots,slots_per_epoch:spe},&ours,&reference,&clock,&TokioPause,(&mut output,&mut alert_output,metrics.as_deref())) => print_summary(result.map_err(|error|error.to_string())?).await,
                 interrupted = tokio::signal::ctrl_c() => {interrupted.map_err(|_|"interrupt handler failed")?;Ok(130)}
             }
         }

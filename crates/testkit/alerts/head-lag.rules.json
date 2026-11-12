@@ -1,0 +1,45 @@
+{
+  "groups": [
+    {
+      "name": "head-lag",
+      "rules": [
+        {
+          "alert": "HeadLagP99",
+          "expr": "(head_lag_p99_slots > 2) and (head_lag_window_samples > 0) and (time() - head_lag_updated_at_seconds <= 2 * head_lag_sample_period_seconds) and (head_lag_updated_at_seconds > 0) and (time() >= head_lag_updated_at_seconds)",
+          "for": "0s",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "Observed nearest-rank p99 over the trailing hour exceeds two slots",
+            "context": "Correlate local alert JSONL slot/context_slot and both head roots with root-diff; roots are not metric labels"
+          }
+        },
+        {
+          "alert": "HeadLagWorst",
+          "expr": "(head_lag_slots > 32) and (head_lag_available == 1) and (time() - head_lag_updated_at_seconds <= 2 * head_lag_sample_period_seconds) and (head_lag_updated_at_seconds > 0) and (time() >= head_lag_updated_at_seconds)",
+          "for": "0s",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "Current head lag exceeds thirty-two slots",
+            "context": "Correlate local alert JSONL slot/context_slot and both head roots with root-diff; roots are not metric labels"
+          }
+        },
+        {
+          "alert": "HeadLagRecovery",
+          "expr": "(head_lag_recovery_slots > head_lag_slots_per_epoch) and (head_lag_recovery_active == 1) and (time() - head_lag_updated_at_seconds <= 2 * head_lag_sample_period_seconds) and (head_lag_updated_at_seconds > 0) and (time() >= head_lag_updated_at_seconds)",
+          "for": "0s",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "Observed recovery exceeds one epoch; gaps may make exact timing uncertain",
+            "context": "Correlate local alert JSONL slot/context_slot and both head roots with root-diff; roots are not metric labels"
+          }
+        }
+      ]
+    }
+  ]
+}
