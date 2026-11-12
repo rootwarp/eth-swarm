@@ -1,4 +1,4 @@
-//! Second-CL adapter for checkpoint soak tests. Implements only GetStateSummary in this slice.
+//! Second-CL adapter for checkpoint/head soak tests. Atomic head status comes from head_v2.
 //! Uses a fixed slot header then finality by that header's state root, never two moving heads.
 //! Missing slot headers (including empty slots) are unavailable, not invented snapshots.
 
@@ -19,6 +19,8 @@ use tonic::{Request, Response, Status};
 pub struct QueryStub {
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<io::Result<()>>>,
+    heads: crate::root_diff::HeadStream,
+
     #[cfg(test)]
     accepted: tokio::sync::mpsc::Receiver<()>,
 }
@@ -37,6 +39,12 @@ impl QueryStub {
         let (listener, guard) =
             ipc::uds::bind(dir, ipc::uds::Ownership::current())?.into_tokio()?;
         let uid = ipc::peercred::effective_uid();
+        let heads = crate::root_diff::HeadStream::start(
+            url.clone(),
+            timeout,
+            Duration::from_secs(24).max(timeout),
+        )
+        .map_err(io::Error::other)?;
         let adapter = Adapter {
             reference: Reference::new(url.clone(), timeout),
             url,
@@ -82,9 +90,18 @@ impl QueryStub {
         Ok(Self {
             stop: Some(stop),
             task: Some(task),
+            heads,
+
             #[cfg(test)]
             accepted,
         })
+    }
+
+    /// Observe second-CL head_v2 readiness/loss without timing sleeps.
+    pub fn head_updates(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<crate::root_diff::HeadEvent>> {
+        self.heads.updates()
     }
 
     /// Stop accepting and drain deadline-bounded calls, then remove only the owned socket.
@@ -173,6 +190,9 @@ impl QueryService for Adapter {
             .read_state(&format!("0x{}", hex::encode(&state_root)))
             .await
             .map_err(|_| Status::unavailable("reference checkpoints read failed"))?;
+        // Header REST supplies no atomic FULL/EMPTY selection. A live head_v2 cache
+        // cannot fill this field: the API permits transitions without an event.
+        let payload_status = None;
         Ok(Response::new(pb::GetStateSummaryResponse {
             slot,
             state_root,
@@ -180,6 +200,7 @@ impl QueryService for Adapter {
             justified: Some(checkpoint(checkpoints.justified)),
             finalized: Some(checkpoint(checkpoints.finalized)),
             stamp: None,
+            payload_status,
         }))
     }
 
@@ -187,9 +208,7 @@ impl QueryService for Adapter {
         &self,
         _: Request<pb::GetForkChoiceRequest>,
     ) -> Result<Response<pb::GetForkChoiceResponse>, Status> {
-        Err(Status::unimplemented(
-            "head and payload status belong to the head-comparison slice",
-        ))
+        Err(Status::unimplemented("query fixture: state summaries only"))
     }
     async fn get_hot_state(
         &self,

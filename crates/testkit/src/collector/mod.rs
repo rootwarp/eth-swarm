@@ -88,3 +88,6 @@ pub use url::{ReferenceApiUrl, UrlError, UrlFileError, MAX_URL_FILE_BYTES};
 pub mod testing;
 #[cfg(test)]
 mod tests;
+
+#[cfg(feature = "soak")]
+pub(crate) use sse::open_stream;

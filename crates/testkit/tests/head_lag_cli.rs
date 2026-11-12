@@ -7,10 +7,12 @@ fn record(slot: u64, lag: i64) -> Sample {
     Sample::observed(
         slot,
         Head {
+            payload_status: None,
             slot: (100 - lag) as u64,
             root: Root::ZERO,
         },
         Head {
+            payload_status: None,
             slot: 100,
             root: Root::ZERO,
         },
@@ -87,6 +89,8 @@ fn finite_run_records_missed_slots_and_never_overwrites_output() {
     std::fs::write(&url, "http://127.0.0.1:1").unwrap();
     std::fs::set_permissions(&url, std::fs::Permissions::from_mode(0o600)).unwrap();
     let output = dir.path().join("run.jsonl");
+    let alerts = dir.path().join("alerts.jsonl");
+    let metrics = dir.path().join("head-lag.prom");
     let uid = std::fs::metadata(&url).unwrap().uid().to_string();
     let invoke = || {
         Command::new(env!("CARGO_BIN_EXE_head-lag"))
@@ -110,6 +114,10 @@ fn finite_run_records_missed_slots_and_never_overwrites_output() {
                 "--out",
             ])
             .arg(&output)
+            .arg("--alerts-out")
+            .arg(&alerts)
+            .arg("--metrics-out")
+            .arg(&metrics)
             .output()
             .unwrap()
     };
@@ -130,7 +138,71 @@ fn finite_run_records_missed_slots_and_never_overwrites_output() {
         assert_eq!(record.gap, Some(Gap::MissedSample));
         assert!(record.lag.is_none());
     }
+    assert!(std::fs::read(&alerts).unwrap().is_empty());
+    assert!(std::fs::read_to_string(&metrics)
+        .unwrap()
+        .contains("head_lag_available 0\n"));
     let second = invoke();
     assert_eq!(second.status.code(), Some(2));
     assert_eq!(std::fs::read(output).unwrap(), original);
+}
+
+#[test]
+fn report_command_qualifies_only_complete_days_and_emits_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("day.jsonl");
+    let mut input = String::new();
+    for slot in 0..7200 {
+        input.push_str(&serde_json::to_string(&record(slot, 1)).unwrap());
+        input.push('\n');
+    }
+    std::fs::write(&path, input).unwrap();
+    let invoke = |window: &str| {
+        Command::new(env!("CARGO_BIN_EXE_head-lag"))
+            .args(["report", "--window", window, "--samples"])
+            .arg(&path)
+            .args(["--seconds-per-slot", "12", "--slots-per-epoch", "32"])
+            .output()
+            .unwrap()
+    };
+    let clean = invoke("24h");
+    assert_eq!(
+        clean.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+    assert!(String::from_utf8_lossy(&clean.stdout).contains("Overall: PASS"));
+    std::fs::write(&path, serde_json::to_string(&record(7199, 1)).unwrap()).unwrap();
+    let short = invoke("24h");
+    assert_eq!(short.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&short.stdout).contains("Overall: FAIL"));
+    assert_eq!(invoke("1h").status.code(), Some(64));
+    let rules = Command::new(env!("CARGO_BIN_EXE_head-lag"))
+        .arg("rules")
+        .output()
+        .unwrap();
+    assert!(rules.status.success());
+    let document: serde_json::Value = serde_json::from_slice(&rules.stdout).unwrap();
+    assert_eq!(document["groups"][0]["rules"].as_array().unwrap().len(), 3);
+    let expressions = [
+        "head_lag_p99_slots > 2",
+        "head_lag_slots > 32",
+        "head_lag_recovery_slots > head_lag_slots_per_epoch",
+    ];
+    for (rule, threshold) in document["groups"][0]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(expressions)
+    {
+        assert!(rule["expr"].as_str().unwrap().contains(threshold));
+        assert!(
+            rule["expr"]
+                .as_str()
+                .unwrap()
+                .contains("head_lag_updated_at_seconds"),
+            "stopped runs must age out"
+        );
+    }
 }

@@ -7,10 +7,12 @@ fn sample(slot: u64, lag: i64) -> Sample {
     Sample::observed(
         slot,
         Head {
+            payload_status: None,
             slot: (1000_i64 - lag).try_into().unwrap(),
             root: Root::from([0x11; 32]),
         },
         Head {
+            payload_status: None,
             slot: 1000,
             root: Root::from([0x22; 32]),
         },
@@ -152,10 +154,12 @@ fn invalid_timelines_and_forged_lag_are_rejected() {
     assert!(Sample::observed(
         0,
         Head {
+            payload_status: None,
             slot: u64::MAX,
             root: Root::ZERO
         },
         Head {
+            payload_status: None,
             slot: 0,
             root: Root::ZERO
         }
@@ -223,6 +227,7 @@ impl testkit::head_lag::HeadSource for ConstantHead {
         self.calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Head {
+            payload_status: None,
             slot: self.slot,
             root: Root::ZERO,
         })
@@ -336,6 +341,7 @@ async fn missed_and_overrun_slots_are_gaps_not_late_matches() {
         async fn read_head(&self) -> Result<Head, testkit::head_lag::Error> {
             self.clock.advance(Duration::from_secs(13));
             Ok(Head {
+                payload_status: None,
                 slot: 1000,
                 root: Root::ZERO,
             })
@@ -391,6 +397,337 @@ async fn jsonl_analysis_is_bounded_and_validates_records() {
 }
 
 #[test]
+fn alert_p99() {
+    use testkit::head_lag::{AlertKind, Monitor};
+    let mut monitor = Monitor::new(12, 32).unwrap();
+    for slot in 0..300 {
+        assert!(monitor.observe(&sample(slot, 1)).unwrap().is_empty());
+    }
+    let mut alerts = Vec::new();
+    for slot in 300..305 {
+        alerts.extend(monitor.observe(&sample(slot, 3)).unwrap());
+    }
+    let alerts: Vec<_> = alerts
+        .iter()
+        .filter(|alert| alert.kind == AlertKind::P99)
+        .collect();
+    assert_eq!(
+        alerts.len(),
+        1,
+        "alert on the rising edge, not every bad sample"
+    );
+    assert_eq!(alerts[0].slot, 303);
+    assert_eq!(alerts[0].window_samples, 300);
+    assert_eq!(alerts[0].head_ours, Root::from([0x11; 32]));
+    assert_eq!(alerts[0].head_ref, Root::from([0x22; 32]));
+    let closing = monitor.observe(&sample(604, 1)).unwrap();
+    assert_eq!(closing.len(), 1);
+    assert_eq!(closing[0].kind, AlertKind::Recovery);
+    assert!(
+        closing[0].had_gaps,
+        "the observed interval is only a warning"
+    );
+    assert_eq!(closing[0].recovery_slots, Some(304));
+    assert!(
+        monitor
+            .observe(&sample(605, 3))
+            .unwrap()
+            .iter()
+            .any(|alert| alert.kind == AlertKind::P99),
+        "old breaches expire after the sliding hour"
+    );
+}
+
+#[test]
+fn alert_worst() {
+    use testkit::head_lag::{AlertKind, Monitor};
+    let mut monitor = Monitor::new(12, 32).unwrap();
+    assert!(!monitor
+        .observe(&sample(0, 32))
+        .unwrap()
+        .iter()
+        .any(|a| a.kind == AlertKind::Worst));
+    assert_eq!(
+        monitor
+            .observe(&sample(1, 33))
+            .unwrap()
+            .iter()
+            .filter(|a| a.kind == AlertKind::Worst)
+            .count(),
+        1
+    );
+    assert!(!monitor
+        .observe(&sample(2, 34))
+        .unwrap()
+        .iter()
+        .any(|a| a.kind == AlertKind::Worst));
+    monitor.observe(&sample(3, 2)).unwrap();
+    assert!(monitor
+        .observe(&sample(4, 33))
+        .unwrap()
+        .iter()
+        .any(|a| a.kind == AlertKind::Worst));
+}
+
+#[test]
+fn alert_recovery() {
+    use testkit::head_lag::{AlertKind, Gap, Monitor};
+    let mut monitor = Monitor::new(12, 32).unwrap();
+    monitor.observe(&sample(0, 3)).unwrap();
+    for slot in 1..=32 {
+        assert!(!monitor
+            .observe(&Sample::gap(slot, Gap::Reference))
+            .unwrap()
+            .iter()
+            .any(|a| a.kind == AlertKind::Recovery));
+    }
+    let alerts = monitor.observe(&Sample::gap(33, Gap::Reference)).unwrap();
+    let alert = alerts
+        .iter()
+        .find(|alert| alert.kind == AlertKind::Recovery)
+        .unwrap();
+    assert_eq!(
+        (alert.slot, alert.context_slot, alert.recovery_slots),
+        (33, 0, Some(33))
+    );
+    assert!(alert.had_gaps);
+    assert_eq!(alert.head_ours, Root::from([0x11; 32]));
+    monitor.observe(&sample(34, 2)).unwrap();
+    let mut monitor = Monitor::new(12, 400).unwrap();
+    let mut recoveries = Vec::new();
+    for slot in 0..=402 {
+        recoveries.extend(
+            monitor
+                .observe(&sample(slot, 3))
+                .unwrap()
+                .into_iter()
+                .filter(|a| a.kind == AlertKind::Recovery),
+        );
+    }
+    assert_eq!(
+        recoveries.len(),
+        1,
+        "ongoing recovery must outlive the sliding-hour buffer"
+    );
+    assert_eq!(recoveries[0].recovery_slots, Some(401));
+}
+
+#[test]
+fn no_alert_clean() {
+    use testkit::head_lag::{Gap, Monitor};
+    let mut monitor = Monitor::new(12, 32).unwrap();
+    for slot in 0..400 {
+        let record = if slot == 12 {
+            Sample::gap(slot, Gap::Reference)
+        } else {
+            sample(slot, 2)
+        };
+        assert!(monitor.observe(&record).unwrap().is_empty());
+    }
+    let metrics = monitor.metrics().unwrap();
+    assert!(metrics.contains("# TYPE head_lag_slots gauge"));
+    assert!(metrics.contains("head_lag_slots 2\n"));
+    assert!(metrics.contains("head_lag_available 1\n"));
+    assert!(monitor
+        .observe(&Sample::gap(400, Gap::Reference))
+        .unwrap()
+        .is_empty());
+    let metrics = monitor.metrics().unwrap();
+    assert!(metrics.contains("head_lag_available 0\n"));
+    assert!(
+        metrics.contains("head_lag_slots 2\n"),
+        "a gap must not fabricate healthy zero lag"
+    );
+    assert!(monitor.observe(&sample(400, 1)).is_err());
+    assert!(Monitor::new(0, 32).is_err());
+}
+
+#[tokio::test]
+async fn report_golden() {
+    use testkit::head_lag::report_jsonl;
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/head_lag/report-timeline.json")).unwrap();
+    let mut input = Vec::new();
+    let mut slot = 0;
+    for entry in fixture.as_array().unwrap() {
+        for _ in 0..entry["repeat"].as_u64().unwrap() {
+            serde_json::to_writer(&mut input, &sample(slot, entry["lag"].as_i64().unwrap()))
+                .unwrap();
+            input.push(b'\n');
+            slot += 1;
+        }
+    }
+    let report = report_jsonl(input.as_slice(), 12, 32, None).await.unwrap();
+    assert_eq!(
+        report.markdown(),
+        include_str!("fixtures/head_lag/report.md")
+    );
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn report_window_preserves_carry_in_and_missing_tail() {
+    use testkit::head_lag::window_report;
+    let samples: Vec<_> = (0..=7205)
+        .map(|slot| sample(slot, if slot < 35 { 3 } else { 1 }))
+        .collect();
+    let report = window_report(&samples, 12, 32, None).unwrap();
+    assert_eq!(report.start_slot, 6);
+    assert_eq!(report.summary.p99, Some(1));
+    assert_eq!(
+        report.summary.recoveries[0].start_slot, 0,
+        "recovery must not restart at the report boundary"
+    );
+    assert_eq!(report.exit_code(), 1);
+    let samples: Vec<_> = (0..7200)
+        .map(|slot| sample(slot, if slot == 7199 { 3 } else { 1 }))
+        .collect();
+    assert_eq!(
+        window_report(&samples, 12, 32, None).unwrap().exit_code(),
+        2,
+        "an open recovery is not a completed pass"
+    );
+    let tail = window_report(&samples, 12, 32, Some(7232)).unwrap();
+    assert!(!tail.summary.recoveries[0].over_epoch);
+    assert!(tail.summary.recoveries[0].had_gaps);
+    assert_eq!(tail.exit_code(), 2, "a missing tail never proves a breach");
+    let proven: Vec<_> = (0..7200)
+        .map(|slot| sample(slot, if slot >= 7166 { 3 } else { 1 }))
+        .collect();
+    let tail = window_report(&proven, 12, 32, Some(7232)).unwrap();
+    assert!(tail.summary.recoveries[0].over_epoch);
+    assert!(tail.summary.recoveries[0].had_gaps);
+    assert_eq!(tail.exit_code(), 1, "earlier proven breaches remain sticky");
+    let missing = window_report(&[sample(10000, 1)], 12, 32, Some(10001)).unwrap();
+    assert_eq!(
+        (
+            missing.summary.samples,
+            missing.summary.gap_samples,
+            missing.gap_seconds
+        ),
+        (7200, 7199, 86388)
+    );
+    assert_eq!(missing.exit_code(), 2);
+    assert!(!missing.markdown().contains("Overall: PASS"));
+    assert!(window_report(&samples, 7, 32, None).is_err());
+}
+
+#[tokio::test]
+async fn live_alerts_are_written_during_sampling_with_atomic_metrics() {
+    use std::{
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
+        time::Duration,
+    };
+    use testkit::collector::{
+        testing::{ManualClock, ManualPause},
+        Clock,
+    };
+    use testkit::head_lag::{run_live, RunConfig, SlotSchedule};
+    struct LiveWriter {
+        clock: Arc<ManualClock>,
+        due: u64,
+        bytes: Vec<u8>,
+    }
+    impl tokio::io::AsyncWrite for LiveWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            assert_eq!(
+                this.clock.now().wall_ns,
+                this.due,
+                "alerts must not be deferred until run completion"
+            );
+            this.bytes.extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    let schedule = SlotSchedule::new(1000, 12, Duration::from_secs(4)).unwrap();
+    let due = schedule.due(10).unwrap().as_nanos().try_into().unwrap();
+    let clock = ManualClock::at(due);
+    let mut alerts = LiveWriter {
+        clock: clock.clone(),
+        due,
+        bytes: Vec::new(),
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let metrics = directory.path().join("lag.prom");
+    std::fs::write(&metrics, "initial").unwrap();
+    let summary = run_live(
+        RunConfig {
+            schedule,
+            first_slot: 10,
+            slots: 3,
+            slots_per_epoch: 32,
+        },
+        &ConstantHead::new(966),
+        &ConstantHead::new(1000),
+        &*clock,
+        &ManualPause(clock.clone()),
+        (&mut Vec::new(), &mut alerts, Some(metrics.as_path())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.exit_code(), 1);
+    let text = String::from_utf8(alerts.bytes).unwrap();
+    assert_eq!(text.lines().count(), 2);
+    for line in text.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(value["slot"], 10);
+        assert!(value["head_ours"].is_string());
+        assert!(value["head_ref"].is_string());
+    }
+    assert!(std::fs::read_to_string(&metrics)
+        .unwrap()
+        .contains("head_lag_slots 34\n"));
+    assert!(std::fs::read_to_string(&metrics)
+        .unwrap()
+        .contains("head_lag_updated_at_seconds 1148\n"));
+    assert_eq!(
+        std::fs::read_dir(directory.path()).unwrap().count(),
+        1,
+        "atomic publication must not leave scratch files"
+    );
+}
+
+#[test]
+fn report_is_causal_and_empty_windows_never_pass() {
+    use testkit::head_lag::window_report;
+    let samples: Vec<_> = (0..=10035)
+        .map(|slot| sample(slot, if (10000..10035).contains(&slot) { 3 } else { 1 }))
+        .collect();
+    assert_eq!(
+        window_report(&samples, 12, 32, Some(9999))
+            .unwrap()
+            .exit_code(),
+        0
+    );
+    let report = window_report(&samples, 12, 32, Some(10000)).unwrap();
+    assert_eq!(report.exit_code(), 2);
+    assert_eq!(report.summary.recoveries[0].end_slot, None);
+    assert_eq!(
+        report.summary.recoveries[0].elapsed_slots, 0,
+        "future observations cannot resolve or age an earlier report"
+    );
+    assert_eq!(
+        window_report(&samples, 12, 32, None).unwrap().exit_code(),
+        1
+    );
+    let empty = window_report(&[], 12, 32, Some(7199)).unwrap();
+    assert_eq!((empty.gap_seconds, empty.exit_code()), (86400, 2));
+}
+
+#[test]
 fn uncertain_recovery_is_not_proven_but_prior_breaches_stay_sticky() {
     use testkit::head_lag::Gap;
     for explicit in [false, true] {
@@ -443,6 +780,7 @@ async fn sampled_slot_end_is_exclusive_before_and_after_reads() {
             Ok(Head {
                 slot: 10,
                 root: Root::ZERO,
+                payload_status: None,
             })
         }
     }
@@ -498,4 +836,66 @@ async fn reference_head_accepts_mixed_case_api_roots() {
         .unwrap();
     assert_eq!(head.slot, 321);
     assert_eq!(head.root, Root::from([0xab; 32]));
+}
+
+#[test]
+fn recovery_closing_sample_is_evaluated_once_and_rearms() {
+    use testkit::head_lag::{AlertKind, Monitor};
+    for seconds in [1, 12] {
+        for closing in [33, 32, 34] {
+            let mut monitor = Monitor::new(seconds, 32).unwrap();
+            for slot in 0..3500 {
+                assert!(monitor.observe(&sample(slot, 1)).unwrap().is_empty());
+            }
+            let mut recoveries = Vec::new();
+            for offset in 0..=closing {
+                let lag = if offset == closing { 1 } else { 3 };
+                recoveries.extend(
+                    monitor
+                        .observe(&sample(3500 + offset, lag))
+                        .unwrap()
+                        .into_iter()
+                        .filter(|a| a.kind == AlertKind::Recovery),
+                );
+            }
+            assert_eq!(
+                recoveries.len(),
+                usize::from(closing > 32),
+                "seconds={seconds}, closing={closing}"
+            );
+            if let Some(alert) = recoveries.first() {
+                assert_eq!(
+                    (alert.slot, alert.context_slot, alert.recovery_slots),
+                    (3533, 3533, Some(33))
+                );
+                assert_eq!(
+                    (alert.head_ours, alert.head_ref),
+                    (Root::from([0x11; 32]), Root::from([0x22; 32]))
+                );
+                assert!(!alert.had_gaps);
+                assert_eq!(alert.lag, if closing == 33 { 1 } else { 3 });
+                if seconds == 1 {
+                    assert_eq!(alert.p99, Some(1));
+                }
+            }
+            let metrics = monitor.metrics().unwrap();
+            assert!(metrics.contains("head_lag_recovery_active 0\n"));
+            assert!(metrics.contains("head_lag_recovery_slots 0\n"));
+            let healthy = 3500 + closing + 1;
+            monitor.observe(&sample(healthy, 1)).unwrap();
+            let next = healthy + 1;
+            let mut repeated = Vec::new();
+            for offset in 0..=33 {
+                repeated.extend(
+                    monitor
+                        .observe(&sample(next + offset, if offset == 33 { 1 } else { 3 }))
+                        .unwrap()
+                        .into_iter()
+                        .filter(|a| a.kind == AlertKind::Recovery),
+                );
+            }
+            assert_eq!(repeated.len(), 1, "a completed episode must rearm");
+            assert_eq!(repeated[0].slot, next + 33);
+        }
+    }
 }

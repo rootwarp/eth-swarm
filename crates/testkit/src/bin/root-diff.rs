@@ -15,16 +15,34 @@ usage: root-diff check --ours JSON --reference JSON --epoch N
        root-diff run --socket PATH --server-uid UID --reference-url-file FILE
          --genesis-time UNIX_SECONDS --seconds-per-slot N --slots-per-epoch N
          --epochs N --out NEW_FILE [--first-epoch N] [--timeout-secs N]
+       root-diff head-run --socket PATH --server-uid UID --reference-url-file FILE
+         --genesis-time UNIX_SECONDS --seconds-per-slot N --slots-per-epoch N
+         --slots N --out NEW_HEAD_FILE --lag-out NEW_LAG_FILE
+         [--first-slot N] [--offset-ms 4000] [--timeout-secs N]
        root-diff query-stub --runtime-root DIR --reference-url-file FILE [--timeout-secs N]
 
 Compares finalized and current justified checkpoint epoch/root pairs. Run samples the fixed
 state slot at each epoch boundary + one slot. JSONL gaps have match:null, never match:true.
 The reference URL file uses the collector's owner/mode/loopback restrictions (use tunnels).
 The query-stub serves GetStateSummary from a second CL; missing headers become gaps.
-Head/payload-status comparison is a later slice. Output files must not already exist.
+Head-run uses the head-lag sampler and head_v2 SSE; only lag <=2 with coherent atomic
+head/status snapshots is compared. SSE loss/unknown status is a gap, never a match.
+Output files must not already exist. Head-run prints its JSON summary to stdout.
 Exit codes: 0 all match, 1 any mismatch, 2 gaps/runtime failure, 64 usage, 130 interrupted.";
 
 enum Args {
+    Head {
+        socket: PathBuf,
+        uid: u32,
+        url: PathBuf,
+        schedule: testkit::head_lag::SlotSchedule,
+        first: Option<u64>,
+        slots: u64,
+        spe: u64,
+        out: PathBuf,
+        lag_out: PathBuf,
+        timeout: Duration,
+    },
     Check {
         ours: PathBuf,
         reference: PathBuf,
@@ -87,6 +105,20 @@ fn parse(args: Vec<String>) -> Result<Args, String> {
             "--first-epoch",
             "--timeout-secs",
         ],
+        "head-run" => &[
+            "--socket",
+            "--server-uid",
+            "--reference-url-file",
+            "--genesis-time",
+            "--seconds-per-slot",
+            "--slots-per-epoch",
+            "--slots",
+            "--out",
+            "--lag-out",
+            "--first-slot",
+            "--offset-ms",
+            "--timeout-secs",
+        ],
         "query-stub" => &["--runtime-root", "--reference-url-file", "--timeout-secs"],
         _ => return Err("unknown command".into()),
     };
@@ -136,6 +168,43 @@ fn parse(args: Vec<String>) -> Result<Args, String> {
         return Ok(Args::Stub {
             root: required("--runtime-root")?.into(),
             url,
+            timeout,
+        });
+    }
+    if mode == "head-run" {
+        let optional = |name: &str| {
+            values
+                .get(name)
+                .map(|value| value.parse::<u64>())
+                .transpose()
+                .map_err(|_| format!("invalid {name}"))
+        };
+        let schedule = testkit::head_lag::SlotSchedule::new(
+            number("--genesis-time")?,
+            number("--seconds-per-slot")?,
+            Duration::from_millis(optional("--offset-ms")?.unwrap_or(4000)),
+        )
+        .map_err(|error| error.to_string())?;
+        let slots = number("--slots")?;
+        let spe = number("--slots-per-epoch")?;
+        if !(1..=testkit::head_lag::MAX_SAMPLES).contains(&slots)
+            || spe == 0
+            || timeout > Duration::from_secs(60)
+        {
+            return Err("invalid head-run length, epoch, or timeout".into());
+        }
+        return Ok(Args::Head {
+            socket: required("--socket")?.into(),
+            uid: number("--server-uid")?
+                .try_into()
+                .map_err(|_| "invalid server UID")?,
+            url,
+            schedule,
+            first: optional("--first-slot")?,
+            slots,
+            spe,
+            out: required("--out")?.into(),
+            lag_out: required("--lag-out")?.into(),
             timeout,
         });
     }
@@ -191,6 +260,54 @@ async fn fixture(path: PathBuf) -> Option<testkit::root_diff::Checkpoints> {
 
 async fn execute(args: Args) -> Result<u8, String> {
     match args {
+        Args::Head {
+            socket,
+            uid,
+            url,
+            schedule,
+            first,
+            slots,
+            spe,
+            out,
+            lag_out,
+            timeout,
+        } => {
+            let url = url_file(url).await?;
+            let events = testkit::root_diff::HeadStream::start(
+                url.clone(),
+                timeout,
+                Duration::from_secs(24).max(timeout),
+            )
+            .map_err(|error| error.to_string())?;
+            let ours = QuerySource::new(socket, uid, timeout);
+            let reference = Reference::new(url, timeout);
+            let clock = SystemClock::new();
+            let first_slot = first
+                .map(Ok)
+                .unwrap_or_else(|| schedule.next_slot(Duration::from_nanos(clock.now().wall_ns)))
+                .map_err(|error| error.to_string())?;
+            let mut head_output = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(out)
+                .await
+                .map_err(|_| "cannot create new head log")?;
+            let mut lag_output = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(lag_out)
+                .await
+                .map_err(|_| "cannot create new lag log")?;
+            tokio::select! {
+                result=testkit::root_diff::run_head(testkit::head_lag::RunConfig {schedule,first_slot,slots,slots_per_epoch:spe},&ours,&reference,&events,&clock,&TokioPause,(&mut lag_output,&mut head_output))=> {
+                    let summary=result.map_err(|error|error.to_string())?;
+                    let mut bytes=serde_json::to_vec(&summary).map_err(|_|"summary encoding failed")?;bytes.push(b'\n');
+                    let mut stdout=tokio::io::stdout();stdout.write_all(&bytes).await.map_err(|_|"summary write failed")?;stdout.flush().await.map_err(|_|"summary flush failed")?;
+                    Ok(summary.exit_code())
+                },
+                interrupted=tokio::signal::ctrl_c()=>{interrupted.map_err(|_|"interrupt handler failed")?;Ok(130)}
+            }
+        }
         Args::Check {
             ours,
             reference,
