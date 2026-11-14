@@ -27,6 +27,10 @@ pub mod export_blocks;
 #[cfg(feature = "replay")]
 pub mod replay;
 
+/// Scriptable, JWT-authenticated loopback Engine API fixture (dev-dependencies only).
+#[cfg(feature = "mock-el")]
+pub mod mock_el;
+
 /// Epoch-aligned checkpoint comparison and soak records.
 #[cfg(feature = "soak")]
 pub mod root_diff;

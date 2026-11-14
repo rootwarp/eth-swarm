@@ -1,0 +1,43 @@
+# Early S3 mocked-EL gate, independent of live ELs, Kurtosis and spec vectors.
+name: mock-el
+
+on:
+  pull_request:
+    paths:
+      - 'crates/cl-engine/**'
+      - 'crates/engine-api/**'
+      - 'crates/cl-chain/src/engine/**'
+      - 'crates/testkit/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/mock-el.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mock-el-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+
+jobs:
+  mock-el:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+      - name: Install protoc (ethswarm-proto build.rs runs tonic-prost-build)
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc@3.36.2
+          fallback: none
+      - name: Scripted Engine API self-tests (loopback only)
+        run: cargo test -p testkit --features mock-el --test mock_el --locked

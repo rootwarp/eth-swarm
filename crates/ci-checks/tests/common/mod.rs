@@ -67,3 +67,12 @@ pub fn files_under(dir: &Path) -> Vec<PathBuf> {
     acc.sort();
     acc
 }
+
+/// Reviewed workflow inventory: require every gate to be present and counted.
+pub fn repository_workflow_count() -> usize {
+    let expected =
+        ["ci.yml", "mock-el.yml", "nightly.yml", "replay-nightly.yml"].map(PathBuf::from);
+    let actual = files_under(&workspace_root().join(".github/workflows"));
+    assert_eq!(actual.as_slice(), expected.as_slice());
+    expected.len()
+}

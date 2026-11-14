@@ -44,10 +44,18 @@ test-support = ["p2p-wire/testkit", "dep:ssz_types", "hyper/server"]
 # `crypto-bls/verify` (scripts/check-cl-chain-features.sh). `cargo run --bin replay` turns it on.
 replay = ["dep:crypto-bls", "dep:state-transition"]
 
+# Scriptable loopback Engine API fixture; consumers opt in from dev-dependencies only.
+mock-el = ["dep:engine-api", "dep:hmac", "dep:sha2-hmac", "dep:base64", "hyper/server"]
+
 # Offline-testable soak tooling and QueryService adapter. Does not link service crates.
 soak = ["dep:prometheus-client", "dep:ipc", "dep:ethswarm-proto", "dep:tonic", "dep:tokio-stream", "tokio/fs", "tokio/io-util", "tokio/io-std"]
 
 [dependencies]
+engine-api = { path = "../engine-api", optional = true }
+# Match the production JWT digest pair without changing archive hashing's sha2 API.
+hmac = { version = "0.13", optional = true }
+sha2-hmac = { package = "sha2", version = "0.11", optional = true }
+base64 = { version = "0.22", optional = true }
 prometheus-client = { version = "0.25.1", optional = true }
 ipc = { path = "../ipc", optional = true }
 ethswarm-proto = { path = "../ethswarm-proto", optional = true }
@@ -89,7 +97,7 @@ ethereum_ssz.workspace = true
 ssz_types = { workspace = true, optional = true }
 
 [dev-dependencies]
-testkit = { path = ".", features = ["test-support", "replay", "soak"] }
+testkit = { path = ".", features = ["test-support", "replay", "mock-el", "soak"] }
 tempfile = "3"
 # The replay fixture chain (tests/support/chain.rs): real validator keys and the test inputs
 # (`genesis_state`, `bid_for_state`). `testing` is dev-only (scripts/check-stf-testing.sh).

@@ -5972,13 +5972,16 @@ dependencies = [
 name = "testkit"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "blst",
  "bytes",
  "consensus-types",
  "crypto-bls",
+ "engine-api",
  "ethereum_ssz",
  "ethswarm-proto",
  "hex",
+ "hmac 0.13.0",
  "http",
  "http-body-util",
  "hyper",
@@ -5991,6 +5994,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sha2 0.11.1",
  "snap",
  "ssz_types",
  "state-transition",
