@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{describe, stderr, stdout, workspace_root};
+use common::{describe, repository_workflow_count, stderr, stdout, workspace_root};
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -24,7 +24,10 @@ fn repository_workflows_pass() {
     let out = run(&[]);
     assert!(out.status.success(), "{}", describe(&out));
     assert!(
-        stdout(&out).contains("cargo --locked OK (3 workflow files"),
+        stdout(&out).contains(&format!(
+            "cargo --locked OK ({} workflow files",
+            repository_workflow_count()
+        )),
         "{}",
         describe(&out)
     );

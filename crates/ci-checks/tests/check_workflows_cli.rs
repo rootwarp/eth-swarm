@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{describe, stderr, stdout, workspace_root};
+use common::{describe, repository_workflow_count, stderr, stdout, workspace_root};
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -30,7 +30,10 @@ fn dir_with(files: &[(&str, &str)]) -> TempDir {
 fn repository_workflows_pass() {
     let out = run(&[]);
     assert!(out.status.success(), "{}", describe(&out));
-    assert!(stdout(&out).contains("workflows OK (3 files)"));
+    assert!(stdout(&out).contains(&format!(
+        "workflows OK ({} files)",
+        repository_workflow_count()
+    )));
 }
 
 #[test]
