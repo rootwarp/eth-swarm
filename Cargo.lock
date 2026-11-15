@@ -2428,6 +2428,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "fork-choice"
+version = "0.1.0"
+dependencies = [
+ "consensus-types",
+ "ethereum_ssz",
+ "fork-choice",
+ "hex",
+ "milhouse",
+ "network-config",
+ "serde",
+ "sha2 0.10.9",
+ "ssz_types",
+ "state-transition",
+ "testkit",
+ "thiserror 2.0.21",
+ "toml 0.8.23",
+ "tree_hash",
+]
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,37 @@
+[package]
+name = "fork-choice"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "The pure Gloas fork choice: the Store, on_tick, on_block and get_head. No I/O and no BLS: block states come through a StateProvider."
+
+[features]
+# Dev-only: `testing::mark_payload_verified`, which puts a root in `store.payloads` without an
+# envelope. Only a dev-dependency may enable it.
+testing = []
+
+[dependencies]
+consensus-types = { path = "../consensus-types" }
+# The pure transition helpers that fork choice calls: process_justification_and_finalization,
+# get_ptc, the committees and the balances. No blst.
+state-transition = { path = "../state-transition" }
+ssz_types.workspace = true
+tree_hash.workspace = true
+thiserror = "2"
+
+[dev-dependencies]
+fork-choice = { path = ".", features = ["testing"] }
+# Test states and blocks, and ContractBackend for the replay fixture (dev-only:
+# scripts/check-stf-testing.sh).
+state-transition = { path = "../state-transition", features = ["testing"] }
+# The replay fixture: open_export_pinned and its root list.
+testkit = { path = "../testkit" }
+network-config = { path = "../network-config" }
+milhouse.workspace = true
+ethereum_ssz.workspace = true
+sha2 = "0.10"
+toml = "0.8"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
