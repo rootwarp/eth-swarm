@@ -35,6 +35,8 @@ libtest-mimic = "0.8"
 # Test states of the sanity runner (the tree type of `BeaconState`).
 milhouse.workspace = true
 tempfile = "3"
+# Test states and blocks of the fork_choice runner tests (dev-only: scripts/check-stf-testing.sh).
+state-transition = { path = "../state-transition", features = ["testing"] }
 
 [[test]]
 name = "vectors"

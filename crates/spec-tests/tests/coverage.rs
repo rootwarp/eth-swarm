@@ -107,15 +107,16 @@ fn shuffling_case(root: &Path) {
     );
 }
 
-/// The Gloas trees of the state-transition runners that a minimal or mainnet set must hold,
-/// each with a handler that its runner knows.
-const M3_TREES: [(&str, &str); 6] = [
+/// The Gloas trees of the state-transition runners and of the fork-choice runner that a
+/// minimal or mainnet set must hold, each with a handler that its runner knows.
+const M3_TREES: [(&str, &str); 7] = [
     ("sanity", "blocks"),
     ("epoch_processing", "justification_and_finalization"),
     ("operations", "attestation"),
     ("finality", "finality"),
     ("rewards", "basic"),
     ("random", "random"),
+    ("fork_choice", "on_block"),
 ];
 
 /// The case name of the placeholder cases of [`M3_TREES`].
@@ -218,7 +219,7 @@ fn coverage_passes_on_a_fully_read_tree() {
     );
     assert_eq!(placeholders.len(), M3_TREES.len());
     let covered = suite.guard.check(&suite.reads).unwrap();
-    assert_eq!((covered.read, covered.total), (8, 16));
+    assert_eq!((covered.read, covered.total), (8, 17));
 }
 
 #[test]
@@ -569,8 +570,8 @@ fn missing_fork_subtree_fails() {
         }
         other => panic!("{:?}", other.err()),
     }
-    // Each Gloas tree of the state-transition runners is required too: without its skip
-    // entries, nothing else finds a tree that is missing.
+    // Each Gloas tree of the state-transition runners and of the fork-choice runner is
+    // required too: without its skip entries, nothing else finds a tree that is missing.
     for (runner, _) in M3_TREES {
         let tree = minimal_tree();
         std::fs::remove_dir_all(tree.path().join(format!("{MINIMAL}/gloas/{runner}"))).unwrap();
@@ -678,5 +679,125 @@ fn expired_entry_fails_the_suite_and_expiry_day_passes() {
     match suite_on("2026-12-01") {
         Err(SuiteError::Rules(msg)) => assert!(msg.contains("expired on 2026-11-30"), "{msg}"),
         other => panic!("{:?}", other.err()),
+    }
+}
+
+const FORK_CHOICE: &str = "gloas/fork_choice";
+
+/// A Gloas `fork_choice` case of `handler` named `case` whose one step checks the anchor
+/// store: a genesis state of 64 validators and its block.
+fn fork_choice_case(root: &Path, handler: &str, case: &str) {
+    use consensus_types::gloas::BeaconBlock;
+    use ssz::Encode;
+    use state_transition::testing::{genesis_state, signed_block};
+    let dir = format!("{MINIMAL}/{FORK_CHOICE}/{handler}/pyspec_tests/{case}");
+    let mut state = genesis_state::<consensus_types::Minimal>(&[32_000_000_000; 64]);
+    let mut block: BeaconBlock<consensus_types::Minimal> = signed_block(0, 0).message;
+    block.body.signed_execution_payload_bid.message = state.latest_execution_payload_bid.clone();
+    block.state_root = state_transition::state_root(&mut state).unwrap();
+    let anchor = format!("'0x{}'", hex::encode(block.tree_hash_root()));
+    let snappy = |b: Vec<u8>| snap::raw::Encoder::new().compress_vec(&b).unwrap();
+    write(
+        root,
+        &format!("{dir}/anchor_state.ssz_snappy"),
+        &snappy(state.as_ssz_bytes()),
+    );
+    write(
+        root,
+        &format!("{dir}/anchor_block.ssz_snappy"),
+        &snappy(block.as_ssz_bytes()),
+    );
+    write(
+        root,
+        &format!("{dir}/steps.yaml"),
+        format!(
+            "- checks:\n    genesis_time: 0\n    time: 0\n    \
+             head: {{slot: 0, root: {anchor}, payload_status: 0}}\n    \
+             justified_checkpoint: {{epoch: 0, root: {anchor}}}\n    \
+             finalized_checkpoint: {{epoch: 0, root: {anchor}}}\n    \
+             proposer_boost_root: '0x{}'\n",
+            "00".repeat(32)
+        )
+        .as_bytes(),
+    );
+    write(root, &format!("{dir}/meta.yaml"), b"description: anchor\n");
+    write(
+        root,
+        &format!("{dir}/manifest.yaml"),
+        format!(
+            "preset: minimal\nfork: gloas\nrunner: fork_choice\nhandler: {handler}\n\
+             suite: pyspec_tests\ncase: {case}\n"
+        )
+        .as_bytes(),
+    );
+}
+
+#[test]
+fn fork_choice_case_runs_through_the_suite_and_every_file_is_read() {
+    let tree = minimal_tree();
+    fork_choice_case(tree.path(), "get_head", "genesis");
+    let suite = build(tree.path(), &value_yaml_excused(), "minimal").unwrap();
+    let name = "gloas_fork_choice_minimal::get_head::pyspec_tests::genesis";
+    let trial = suite.trials.iter().find(|t| t.name == name).unwrap();
+    assert!(
+        matches!(trial.outcome, Outcome::Run(_)),
+        "{name} does not run"
+    );
+    run_all(&suite);
+    let covered = suite.guard.check(&suite.reads).unwrap();
+    assert_eq!((covered.read, covered.total), (13, 22));
+}
+
+#[test]
+fn fork_choice_handler_directories_must_be_known() {
+    // A known handler that the runner does not run needs a skip entry.
+    let tree = minimal_tree();
+    fork_choice_case(tree.path(), "on_attestation", "case_0");
+    let name = "gloas_fork_choice_minimal::on_attestation::pyspec_tests::case_0";
+    let suite = build(tree.path(), &value_yaml_excused(), "minimal").unwrap();
+    let trial = suite.trials.iter().find(|t| t.name == name).unwrap();
+    assert!(matches!(trial.outcome, Outcome::Unaccounted), "{name}");
+    let skip = entry(
+        "consensus-specs",
+        "gloas",
+        "minimal",
+        "fork_choice",
+        "on_attestation",
+        "",
+    );
+    let suite = build(tree.path(), &(value_yaml_excused() + &skip), "minimal").unwrap();
+    let trial = suite.trials.iter().find(|t| t.name == name).unwrap();
+    assert!(matches!(trial.outcome, Outcome::Skip(_)), "{name}");
+
+    // An unknown handler directory fails setup, also with a skip entry for it.
+    let tree = minimal_tree();
+    fork_choice_case(tree.path(), "on_tick", "case_0");
+    let skip = entry(
+        "consensus-specs",
+        "gloas",
+        "minimal",
+        "fork_choice",
+        "on_tick",
+        "",
+    );
+    match build(tree.path(), &(value_yaml_excused() + &skip), "minimal") {
+        Err(SuiteError::Setup(msg)) => assert!(
+            msg.contains("unknown fork_choice handler directory `on_tick`"),
+            "{msg}"
+        ),
+        other => panic!("expected a setup error, got {:?}", other.err()),
+    }
+}
+
+#[test]
+fn minimal_and_mainnet_sets_require_the_gloas_fork_choice_tree() {
+    for (name, preset) in [("minimal", "minimal"), ("mainnet", "mainnet")] {
+        let set = suite::SETS.iter().find(|s| s.name == name).unwrap();
+        let tree = format!("tests/{preset}/gloas/fork_choice");
+        assert!(
+            set.subtrees.contains(&tree.as_str()),
+            "{name}: {:?}",
+            set.subtrees
+        );
     }
 }

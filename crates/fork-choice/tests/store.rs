@@ -535,3 +535,85 @@ fn store_target_checkpoint_state_advances_the_target_block_state() {
         Err(Error::UnknownBlock(unknown.root))
     );
 }
+
+/// A store whose anchor is a block of `slot` and the state of that block. The parent of the
+/// anchor block is not in the store, as after a checkpoint sync. The anchor block is the
+/// checkpoint block of its epoch only if `slot` is the first slot of that epoch.
+fn checkpoint_store(slot: Slot) -> (Store<E>, BeaconBlock<E>) {
+    let (mut state, mut block) = anchor();
+    state.slot = slot;
+    block.slot = slot;
+    block.parent_root = Root::repeat_byte(0xa0);
+    block.state_root = state_root(&mut state).unwrap();
+    let store = get_forkchoice_store(state, block.clone(), slot_duration()).unwrap();
+    (store, block)
+}
+
+#[test]
+fn checkpoint_anchor_accepts_a_first_child_in_the_next_slot() {
+    let (mut store, anchor_block) = checkpoint_store(24);
+    let anchor = anchor_block.tree_hash_root();
+    let checkpoint = Checkpoint {
+        epoch: 3,
+        root: anchor,
+    };
+    assert_eq!(store.finalized_checkpoint(), &checkpoint);
+    tick(&mut store, 25);
+    let block = child(&anchor_block, 25, false, 1);
+    // The shuffling dependent slot of epoch 3 is slot 15, before the anchor. The walk to it
+    // must stop at the anchor and must not look up the parent of the anchor.
+    assert_eq!(on_block(&mut store, &PLAIN, &block), Ok(()));
+    let root = root_of(&block);
+    assert_eq!(store.block(root), Some(&block.message));
+    // The head and the new block both have the anchor as their dependent root, so the timely
+    // block gets the proposer boost.
+    assert_eq!(store.proposer_boost_root(), root);
+    assert_eq!(get_head(&store), Ok(empty(root)));
+    assert_eq!(store.finalized_checkpoint(), &checkpoint);
+}
+
+#[test]
+fn checkpoint_anchor_in_the_middle_of_an_epoch_accepts_a_child() {
+    // The first slot of the finalized epoch 3 is slot 24, before the anchor of slot 27. The
+    // finalized checkpoint block of the parent must be the anchor.
+    let (mut store, anchor_block) = checkpoint_store(27);
+    let anchor = anchor_block.tree_hash_root();
+    assert_eq!(store.finalized_checkpoint().root, anchor);
+    tick(&mut store, 28);
+    let block = child(&anchor_block, 28, false, 1);
+    assert_eq!(on_block(&mut store, &PLAIN, &block), Ok(()));
+    assert_eq!(get_checkpoint_block(&store, root_of(&block), 3), Ok(anchor));
+    assert_eq!(get_head(&store), Ok(empty(root_of(&block))));
+}
+
+#[test]
+fn checkpoint_anchor_ancestor_walk_stops_at_the_anchor() {
+    let (mut store, anchor_block) = checkpoint_store(24);
+    let anchor = anchor_block.tree_hash_root();
+    tick(&mut store, 26);
+    let b25 = child(&anchor_block, 25, false, 1);
+    on_block(&mut store, &PLAIN, &b25).unwrap();
+    let b26 = child(&b25.message, 26, false, 2);
+    on_block(&mut store, &PLAIN, &b26).unwrap();
+    let (r25, r26) = (root_of(&b25), root_of(&b26));
+    // Below the anchor, the walk gives the anchor with the payload status that its child
+    // builds on.
+    assert_eq!(get_ancestor(&store, pending(r26), 10), Ok(empty(anchor)));
+    assert_eq!(get_ancestor(&store, pending(r26), 25), Ok(empty(r25)));
+    assert_eq!(
+        get_ancestor(&store, pending(anchor), 0),
+        Ok(pending(anchor))
+    );
+    assert_eq!(get_checkpoint_block(&store, r26, 1), Ok(anchor));
+    assert_eq!(is_ancestor(&store, pending(r26), pending(anchor)), Ok(true));
+    assert_eq!(is_ancestor(&store, pending(r26), empty(anchor)), Ok(true));
+    assert_eq!(is_ancestor(&store, pending(r26), full(anchor)), Ok(false));
+    // The walk must not make up a block below the anchor: the parent of the anchor and any
+    // other root that the store does not have stay unknown.
+    let below = anchor_block.parent_root;
+    assert_eq!(
+        get_ancestor(&store, pending(below), 0),
+        Err(Error::UnknownBlock(below))
+    );
+    assert_eq!(store.block(below), None);
+}
