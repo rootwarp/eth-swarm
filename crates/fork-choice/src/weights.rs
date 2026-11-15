@@ -2,8 +2,9 @@
 //! tiebreaker, with the helpers that they call.
 //!
 //! The scores read `store.latest_messages` and `store.equivocating_indices`, which
-//! `on_attestation` and `on_attester_slashing` fill. Until then both are empty, so the
-//! attestation score of each node is zero and only the proposer boost gives weight.
+//! `on_attestation` and `on_attester_slashing` fill. Those handlers are not here yet, so
+//! outside the tests (the seams of `crate::testing`) both are empty: the attestation score of
+//! each node is zero and only the proposer boost gives weight.
 
 use crate::store::{
     get_checkpoint_block, get_current_slot, get_current_store_epoch, get_parent_payload_status,

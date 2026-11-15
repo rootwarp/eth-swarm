@@ -10,8 +10,8 @@
 //! The crate does no I/O and links no BLS library. The state transition of a block comes
 //! from the caller through a [`StateProvider`]. `on_attestation`, `on_attester_slashing`,
 //! `on_execution_payload_envelope` and `on_payload_attestation_message` from the wire are not
-//! here yet: until they are, `store.latest_messages` is empty, and only
-//! `testing::mark_payload_verified` (tests only) puts a root in `store.payloads`.
+//! here yet. Until they are, only the test seams of `testing` (tests only) fill
+//! `store.latest_messages`, `store.equivocating_indices` and `store.payloads`.
 //!
 //! The spec signals an invalid call with a failed `assert` or a missing key. Here each public
 //! handler returns an [`Error`] instead, and a failed handler leaves the store as it was.
@@ -145,15 +145,37 @@ pub enum Error {
 }
 
 /// Test seams. Only tests may enable them: the feature `testing` is for dev-dependencies.
+/// They change the store without the checks of the handlers that they stand for, so that a
+/// test can reach the weight of a node before those handlers exist.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
-    use crate::Store;
-    use consensus_types::primitives::Root;
+    use crate::{LatestMessage, Store};
+    use consensus_types::primitives::{Root, ValidatorIndex};
     use state_transition::Preset;
 
     /// Puts `root` in `store.payloads`, as `on_execution_payload_envelope` does after it
     /// verifies the envelope of the block.
     pub fn mark_payload_verified<E: Preset>(store: &mut Store<E>, root: Root) {
         store.payloads.insert(root);
+    }
+
+    /// Sets `store.latest_messages[validator_index]` to `message`, as `update_latest_messages`
+    /// does for an attestation that `on_attestation` accepts. It replaces an earlier message
+    /// of any slot, and it also sets a message of an equivocating validator: the test chooses.
+    pub fn set_latest_message<E: Preset>(
+        store: &mut Store<E>,
+        validator_index: ValidatorIndex,
+        message: LatestMessage,
+    ) {
+        store.latest_messages.insert(validator_index, message);
+    }
+
+    /// Puts `validator_index` in `store.equivocating_indices`, as `on_attester_slashing` does
+    /// for each validator of both attestations of a slashing.
+    pub fn add_equivocating_index<E: Preset>(
+        store: &mut Store<E>,
+        validator_index: ValidatorIndex,
+    ) {
+        store.equivocating_indices.insert(validator_index);
     }
 }

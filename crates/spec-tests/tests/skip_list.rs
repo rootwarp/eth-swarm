@@ -50,13 +50,17 @@ fn every_entry_names_its_owner_and_removing_issue() {
             "{e:?}"
         );
         let plan_id = e.issue.split_once('.').is_some_and(|(major, minor)| {
+            // A part of a plan item has one lowercase letter after its number.
+            let minor = minor
+                .strip_suffix(|c: char| c.is_ascii_lowercase())
+                .unwrap_or(minor);
             [major, minor]
                 .iter()
                 .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
         });
         assert!(
             e.issue == "none" || plan_id,
-            "issue must be a plan ID such as \"1.17\" or \"none\": {e:?}"
+            "issue must be a plan ID such as \"1.17\" or \"5.11b\", or \"none\": {e:?}"
         );
     }
 }
@@ -484,4 +488,191 @@ fn skip_toml_has_no_m3_entries_fails_on_an_m3_entry() {
     )
     .unwrap();
     assert_eq!(m3_entries_of(&copy), Vec::<String>::new());
+}
+
+/// A Gloas `fork_choice` case of `handler`.
+fn fork_choice_case(preset: &str, handler: &str, case: &str) -> CaseKey {
+    CaseKey {
+        case: format!("pyspec_tests/{case}"),
+        ..consensus("gloas", preset, "fork_choice", handler)
+    }
+}
+
+/// The Gloas `fork_choice` cases whose steps are only `tick`, `block` and `checks`, in both
+/// presets, by handler (consensus-specs v1.7.0-beta.4 pyspec sources).
+const TICK_AND_BLOCK_CASES: [(&str, &[&str]); 3] = [
+    (
+        "on_block",
+        &[
+            "basic",
+            "on_block_future_block",
+            "on_block_bad_parent_root",
+            "proposer_boost",
+            "proposer_boost_root_same_slot_untimely_block",
+            "proposer_boost_is_first_block",
+            "on_block_parent_full_rejects_unverified_payload",
+        ],
+    ),
+    (
+        "get_head",
+        &[
+            "genesis",
+            "chain_no_attestations",
+            "split_tie_breaker_no_attestations",
+        ],
+    ),
+    (
+        "get_parent_payload_status",
+        &["get_parent_payload_status__genesis_empty_block_hash"],
+    ),
+];
+
+#[test]
+fn gloas_fork_choice_tick_and_block_cases_are_not_skipped() {
+    let skips = committed();
+    for preset in ["minimal", "mainnet"] {
+        for (handler, cases) in TICK_AND_BLOCK_CASES {
+            for case in cases {
+                let k = fork_choice_case(preset, handler, case);
+                let skip = skips.skipped_by(&k);
+                assert!(skip.is_none(), "{k} is skipped: {skip:?}");
+            }
+        }
+    }
+}
+
+/// Cases of the four run handlers that need a step or a check that the runner does not have.
+/// The plan item that removes their skip is the attestation item for attestations, attester
+/// slashings and PTC messages, and the envelope item for execution payload envelopes.
+const OTHER_STEP_CASES: [(&str, &str, &str); 16] = [
+    ("minimal", "on_block", "on_block_checkpoints"),
+    ("minimal", "on_block", "on_block_before_finalized"),
+    (
+        "minimal",
+        "on_block",
+        "on_block_finalized_skip_slots_not_in_skip_chain",
+    ),
+    (
+        "minimal",
+        "on_block",
+        "new_finalized_slot_is_justified_checkpoint_ancestor",
+    ),
+    (
+        "minimal",
+        "on_block",
+        "justification_withholding_reverse_order",
+    ),
+    ("minimal", "on_block", "justified_update_always_if_better"),
+    (
+        "minimal",
+        "on_block",
+        "incompatible_justification_update_end_of_epoch",
+    ),
+    ("minimal", "on_block", "not_pull_up_current_epoch_block"),
+    ("minimal", "on_block", "pull_up_on_tick"),
+    ("minimal", "get_head", "filtered_block_tree"),
+    ("minimal", "get_head", "voting_source_beyond_two_epoch"),
+    (
+        "minimal",
+        "get_head",
+        "discard_equivocations_slashed_validator_censoring",
+    ),
+    ("mainnet", "get_head", "shorter_chain_but_heavier_weight"),
+    (
+        "mainnet",
+        "get_head",
+        "proposer_boost_excludes_slashed_validators",
+    ),
+    (
+        "mainnet",
+        "get_head",
+        "discard_equivocations_on_attester_slashing",
+    ),
+    (
+        "minimal",
+        "filter_node_tree_variants",
+        "get_head_prunes_childless_unviable_full_variant",
+    ),
+];
+
+#[test]
+fn gloas_fork_choice_cases_with_other_steps_stay_skipped() {
+    let skips = committed();
+    for (preset, handler, case) in OTHER_STEP_CASES {
+        let k = fork_choice_case(preset, handler, case);
+        let want = if handler == "filter_node_tree_variants" {
+            "5.14a"
+        } else {
+            "5.11b"
+        };
+        assert_eq!(issue_of(&skips, &k), want, "{k}");
+    }
+    for preset in ["minimal", "mainnet"] {
+        for (handler, case) in [
+            ("on_block", "on_block_parent_full_accepts_verified_payload"),
+            ("get_head", "get_head_full_payload_tiebreak"),
+            ("get_head", "get_head_empty_payload_tiebreak"),
+        ] {
+            let k = fork_choice_case(preset, handler, case);
+            assert_eq!(issue_of(&skips, &k), "5.14a", "{k}");
+        }
+    }
+}
+
+#[test]
+fn other_fork_choice_handlers_and_forks_stay_skipped() {
+    let skips = committed();
+    for (preset, handler, want) in [
+        ("*", "on_attestation", "5.11b"),
+        ("*", "ex_ante", "5.11b"),
+        ("minimal", "reorg", "5.11b"),
+        ("minimal", "withholding", "5.11b"),
+        ("minimal", "should_apply_proposer_boost", "5.11b"),
+        ("*", "on_payload_attestation_message", "5.11b"),
+        ("*", "on_execution_payload_envelope", "5.14a"),
+        ("*", "payload_timeliness", "5.14a"),
+        ("*", "payload_data_availability", "5.14a"),
+        ("minimal", "deposit_with_reorg", "5.14a"),
+    ] {
+        let presets: &[&str] = if preset == "*" {
+            &["minimal", "mainnet"]
+        } else {
+            &[preset]
+        };
+        for preset in presets {
+            let k = consensus("gloas", preset, "fork_choice", handler);
+            let e = skips
+                .skipped_by(&k)
+                .unwrap_or_else(|| panic!("{k} is not skipped"));
+            assert_eq!(e.issue, want, "{k}");
+            assert!(!e.reason.trim().is_empty(), "{k}");
+        }
+    }
+    // Fork choice is Gloas only: the Fulu cases have no runner, and heze is out of scope.
+    for preset in ["minimal", "mainnet"] {
+        for handler in ["on_block", "get_head", "ex_ante"] {
+            let k = consensus("fulu", preset, "fork_choice", handler);
+            assert_eq!(issue_of(&skips, &k), "none", "{k}");
+            let k = consensus("heze", preset, "fork_choice", handler);
+            let e = skips.skipped_by(&k).unwrap();
+            assert!(e.reason.contains("heze"), "{k}: {e:?}");
+        }
+    }
+}
+
+/// No entry may skip a whole run handler of Gloas fork choice, or every handler of the
+/// runner: the first matching entry wins, so such an entry hides every case below it.
+#[test]
+fn no_wildcard_entry_reaches_the_run_fork_choice_handlers() {
+    let skips = committed();
+    for preset in ["minimal", "mainnet"] {
+        for handler in ["on_block", "get_head", "get_parent_payload_status"] {
+            let k = CaseKey {
+                case: "pyspec_tests/a_new_case".into(),
+                ..consensus("gloas", preset, "fork_choice", handler)
+            };
+            let skip = skips.skipped_by(&k);
+            assert!(skip.is_none(), "{k} is skipped: {skip:?}");
+        }
+    }
 }

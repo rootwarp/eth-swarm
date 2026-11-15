@@ -8,8 +8,9 @@ publish = false
 description = "The pure Gloas fork choice: the Store, on_tick, on_block and get_head. No I/O and no BLS: block states come through a StateProvider."
 
 [features]
-# Dev-only: `testing::mark_payload_verified`, which puts a root in `store.payloads` without an
-# envelope. Only a dev-dependency may enable it.
+# Dev-only: the seams of `testing`, which change the store without the checks of a handler:
+# `mark_payload_verified` (a root in `store.payloads` without an envelope), `set_latest_message`
+# and `add_equivocating_index`. Only a dev-dependency may enable it.
 testing = []
 
 [dependencies]
