@@ -543,6 +543,10 @@ fn now_unix_ms() -> u64 {
 }
 
 #[cfg(test)]
+#[path = "bls_tests.rs"]
+mod bls_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::{blobs, ClVerify, ManualClock, Served, Stub, StubVerify};

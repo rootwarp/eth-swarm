@@ -10,12 +10,13 @@
 //!   commitments only if all three agree.
 //! - [`ClVerify`]: an in-process cl-verify (`VerifyServer::new`: the pinned trusted setup) on a
 //!   Unix socket in a temp dir.
-//! - [`StubVerify`]: a VerifyKzg server that misbehaves on purpose (silent, mute, hangs up).
+//! - [`StubVerify`]: a VerifyKzg server that misbehaves on purpose (silent, mute, hangs up). In
+//!   [`Stub::Silent`] mode it also opens VerifyBls streams and never answers on them.
 //!   [`StubVerify::start_network`] checks each client hello as cl-verify does, with the
 //!   network hello at the time of a [`ManualClock`] ([`Handshake::accept`]).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use crate::verify::client::KzgClient;
+use crate::verify::client::{BlsClient, KzgClient};
 use cl_verify::feed::SharedCache;
 use cl_verify::handshake::Handshake;
 use cl_verify::kzg::TrustedSetupConfig;
@@ -27,9 +28,9 @@ use ethswarm_proto::common::{
 use ethswarm_proto::verify::verify_service_client::VerifyServiceClient;
 use ethswarm_proto::verify::verify_service_server::{VerifyService, VerifyServiceServer};
 use ethswarm_proto::verify::{
-    verify_kzg_request, verify_kzg_response, BuilderKeyFeedRequest, BuilderKeyFeedResponse,
-    PubkeyFeedRequest, PubkeyFeedResponse, VerifyBlsRequest, VerifyBlsResponse, VerifyKzgRequest,
-    VerifyKzgResponse, VerifyKzgResponseBody, VerifyStatus,
+    verify_bls_response, verify_kzg_request, verify_kzg_response, BuilderKeyFeedRequest,
+    BuilderKeyFeedResponse, PubkeyFeedRequest, PubkeyFeedResponse, VerifyBlsRequest,
+    VerifyBlsResponse, VerifyKzgRequest, VerifyKzgResponse, VerifyKzgResponseBody, VerifyStatus,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -188,7 +189,7 @@ pub type Handshakes = Arc<Mutex<Vec<Result<Vec<u8>, ErrorCode>>>>;
 /// A server task on a Unix socket in its own temp dir, stopped when this is dropped.
 pub struct Served {
     pub socket: PathBuf,
-    /// VerifyKzg streams the server has answered (counted by [`StubVerify`] only).
+    /// VerifyKzg and VerifyBls streams the server has answered (counted by [`StubVerify`] only).
     opened: Arc<AtomicUsize>,
     /// The client hellos a network stub checked.
     handshakes: Handshakes,
@@ -235,7 +236,15 @@ impl Served {
         KzgClient::network_with_clock(VerifyServiceClient::new(channel), Arc::new(network), clock)
     }
 
-    /// VerifyKzg streams opened so far.
+    /// A VerifyBls client to this server, with the fixed test hello.
+    pub async fn bls_client(&self) -> BlsClient {
+        let channel = ipc::uds::connect_path(&self.socket, my_uid())
+            .await
+            .unwrap();
+        BlsClient::new(VerifyServiceClient::new(channel), hello())
+    }
+
+    /// VerifyKzg and VerifyBls streams opened so far.
     pub fn streams_opened(&self) -> usize {
         self.opened.load(Ordering::SeqCst)
     }
@@ -306,6 +315,8 @@ pub struct StubVerify {
     mode: Stub,
     opened: Arc<AtomicUsize>,
     open: Mutex<Vec<mpsc::Sender<Result<VerifyKzgResponse, Status>>>>,
+    /// The senders of the silent VerifyBls streams.
+    open_bls: Mutex<Vec<mpsc::Sender<Result<VerifyBlsResponse, Status>>>>,
     /// cl-verify's side of the handshake and its clock: each client hello is checked against
     /// it before the stub answers ([`Self::start_network`]).
     network: Option<(Handshake, Arc<ManualClock>)>,
@@ -321,11 +332,27 @@ impl VerifyService for StubVerify {
     type PubkeyFeedStream = Frames<PubkeyFeedResponse>;
     type BuilderKeyFeedStream = Frames<BuilderKeyFeedResponse>;
 
+    /// [`Stub::Silent`] only: the hello, then every request read and none answered.
     async fn verify_bls(
         &self,
-        _: Request<Streaming<VerifyBlsRequest>>,
+        request: Request<Streaming<VerifyBlsRequest>>,
     ) -> Result<Response<Self::VerifyBlsStream>, Status> {
-        Err(Status::unimplemented("stub"))
+        if !matches!(self.mode, Stub::Silent) || self.network.is_some() {
+            return Err(Status::unimplemented("stub"));
+        }
+        self.opened.fetch_add(1, Ordering::SeqCst);
+        let mut inbound = request.into_inner();
+        let (tx, rx) = mpsc::channel(16);
+        let server_hello = VerifyBlsResponse {
+            frame: Some(verify_bls_response::Frame::Hello(Hello {
+                generation: 0x5eed,
+                ..hello()
+            })),
+        };
+        tx.send(Ok(server_hello)).await.unwrap();
+        tokio::spawn(async move { while let Ok(Some(_)) = inbound.message().await {} });
+        self.open_bls.lock().unwrap().push(tx);
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
     async fn verify_kzg(
@@ -453,6 +480,7 @@ impl StubVerify {
             mode,
             opened: Arc::clone(&opened),
             open: Mutex::default(),
+            open_bls: Mutex::default(),
             network,
             handshakes: Arc::clone(&handshakes),
         };
