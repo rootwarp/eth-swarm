@@ -192,7 +192,7 @@ enum State {
         /// When it became `Invalid`, in [`ExecutionStatuses::invalid`] order.
         order: u64,
         /// The `latestValidHash` of its `INVALID`, while the boundary waits for a missing
-        /// payload between the two.
+        /// payload: one between the two, or the `latestValidHash` payload itself.
         pending: Option<Hash32>,
     },
 }
@@ -218,7 +218,7 @@ struct Entry {
 enum Walk {
     /// The next hash up is the `latestValidHash`.
     Found,
-    /// A payload that is not `Optimistic`: the boundary is not in this chain.
+    /// A `Valid` payload, or one the walk passed before: the boundary is not in this chain.
     Stopped,
     /// A payload that is not recorded (yet).
     Missing,
@@ -236,12 +236,14 @@ enum Walk {
 ///   becomes `Invalid` too, whatever it was, and so does every payload recorded later on an
 ///   `Invalid` one: a payload on an invalid parent is invalid.
 /// - The `latestValidHash` of an `Invalid` sets a boundary ("How to apply `latestValidHash`
-///   when payload status is `INVALID`"). For a hash, the walk goes up the recorded `Optimistic`
-///   ancestors: if the next hash up is the `latestValidHash`, every payload of the walk is
-///   `Invalid` (with its descendants), and the `latestValidHash` payload and its `Optimistic`
-///   ancestors are `Valid`. For the zero hash, every `Optimistic` ancestor of the walk is
-///   `Invalid`. For `null`, or a walk that stops at a payload that is not `Optimistic`, only the
-///   payload is. A walk that stops at a payload that is not recorded waits for it.
+///   when payload status is `INVALID`"). The walk goes up the recorded `Optimistic` ancestors,
+///   and passes those that are `Invalid` already (an earlier walk of the same boundary can have
+///   made them `Invalid`). For a hash, if the next hash up is the `latestValidHash`, every
+///   payload of the walk is `Invalid` (with its descendants), and the `latestValidHash` payload
+///   and its `Optimistic` ancestors are `Valid`. For the zero hash, every `Optimistic` ancestor
+///   of the walk is `Invalid`. For `null`, or a hash whose walk stops at a `Valid` payload, only
+///   the payload is. A walk that stops at a payload that is not recorded waits for it, and so
+///   does a `latestValidHash` payload that is not recorded yet.
 /// - A payload recorded after its children links up with them: a `Valid` child makes it `Valid`
 ///   (with its `Optimistic` ancestors), an `Invalid` one passes `Invalid` down to them, and a
 ///   boundary below it that waited for it is applied again.
@@ -445,8 +447,12 @@ impl ExecutionStatuses {
                 break Walk::Found;
             }
             match self.blocks.get(&at) {
-                Some(entry) if matches!(entry.state, State::Optimistic) && seen.insert(at) => {
-                    walked.push(at);
+                // An Invalid ancestor is passed, not walked: it can be Invalid from an earlier
+                // walk of this boundary, and the boundary can be above it.
+                Some(entry) if !matches!(entry.state, State::Valid) && seen.insert(at) => {
+                    if let State::Optimistic = entry.state {
+                        walked.push(at);
+                    }
                     at = entry.parent_hash;
                 }
                 Some(_) => break Walk::Stopped,
@@ -463,7 +469,13 @@ impl ExecutionStatuses {
         if end == Walk::Found {
             self.make_valid(boundary);
         }
-        let waits = end == Walk::Missing;
+        // The boundary waits for a payload that is not recorded: the one that ended the walk, or
+        // the `latestValidHash` payload, which becomes Valid when it is recorded.
+        let waits = match end {
+            Walk::Missing => true,
+            Walk::Found => !self.blocks.contains_key(&boundary),
+            Walk::Stopped => false,
+        };
         if let Some(Entry {
             state: State::Invalid { pending, .. },
             ..
