@@ -37,6 +37,12 @@ network-config = { path = "../network-config" }
 tokio = { version = "1", features = ["time", "sync", "net", "rt"] }
 # The verify.v1 KZG client's request stream.
 tokio-stream = "0.1"
+# The encoded size of a VerifyBls set, for the 4 MiB request cap. The version tonic-prost and
+# ethswarm-proto already link.
+prost.workspace = true
+# import::block: eth_aggregate_pubkeys for the next sync committee (PubkeyAggregator). Only
+# `aggregate`: every signature check goes through cl-verify (scripts/check-cl-chain-features.sh).
+crypto-bls = { path = "../crypto-bls", features = ["aggregate"] }
 thiserror = "2"
 tracing = "0.1"
 # da::custody: the custody record lives in the column env until it moves into the store schema.

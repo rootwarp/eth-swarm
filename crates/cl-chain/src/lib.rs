@@ -26,6 +26,11 @@
 //!
 //! [`verify`] is cl-chain's side of `ethswarm.verify.v1`: cl-chain never runs BLS or KZG itself.
 //!
+//! [`core`] is the chain core: the single writer thread of the chain state, with its bounded
+//! queues (block import first, then envelope, then gossip commit) and its pre-states. It
+//! imports a block through [`import`] and commits it only on a VALID VerifyBls verdict and a
+//! post-state root equal to `block.state_root`. Nothing in the service runs it yet.
+//!
 //! [`engine`] is cl-chain's side of `ethswarm.engine.v1`: the forkchoiceUpdated arguments and
 //! their ordered, latest-wins sender. Nothing calls the sender yet.
 //!
@@ -43,10 +48,12 @@
 //! socket and the method ACL through `svc-runtime`, and the SIGTERM drain.
 
 pub mod compiled_config;
+pub mod core;
 pub mod da;
 pub mod engine;
 pub mod events;
 pub mod finalized_index;
+pub mod import;
 pub mod persist;
 pub mod probe;
 pub mod reqresp;
