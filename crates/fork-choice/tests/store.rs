@@ -538,10 +538,20 @@ fn store_target_checkpoint_state_advances_the_target_block_state() {
 
 /// A store whose anchor is a block of `slot` and the state of that block. The parent of the
 /// anchor block is not in the store, as after a checkpoint sync. The anchor block is the
-/// checkpoint block of its epoch only if `slot` is the first slot of that epoch.
+/// checkpoint block of its epoch only if `slot` is the first slot of that epoch. As in a
+/// state of epoch 3 of a chain that finalizes, the state justifies epoch 2 and finalizes
+/// epoch 1, so the voting source of a child of the anchor is recent enough to be viable.
 fn checkpoint_store(slot: Slot) -> (Store<E>, BeaconBlock<E>) {
     let (mut state, mut block) = anchor();
     state.slot = slot;
+    state.current_justified_checkpoint = Checkpoint {
+        epoch: 2,
+        root: Root::repeat_byte(0x10),
+    };
+    state.finalized_checkpoint = Checkpoint {
+        epoch: 1,
+        root: Root::repeat_byte(0x08),
+    };
     block.slot = slot;
     block.parent_root = Root::repeat_byte(0xa0);
     block.state_root = state_root(&mut state).unwrap();

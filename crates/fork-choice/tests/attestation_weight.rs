@@ -319,13 +319,15 @@ fn boost(equivocate: bool) -> Boost {
     }
 }
 
-/// The beacon committee of `slot` (one committee for each slot of 64 validators) from the
-/// state of `root`.
+/// The members of every beacon committee of `slot` of epoch 0, from the state of `root`. With
+/// 64 validators, the minimal preset has two committees of four for each slot.
 fn committee(store: &Store<E>, root: Root, slot: Slot) -> Vec<ValidatorIndex> {
     let state = store.block_state(root).unwrap();
     let cache = CommitteeCache::new(state, 0).unwrap();
-    assert_eq!(cache.committees_per_slot(), 1);
-    cache.committee(slot, 0).unwrap().to_vec()
+    assert_eq!(cache.committees_per_slot(), 2);
+    (0..cache.committees_per_slot())
+        .flat_map(|index| cache.committee(slot, index).unwrap().to_vec())
+        .collect()
 }
 
 #[test]

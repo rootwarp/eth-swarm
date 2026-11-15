@@ -62,6 +62,9 @@ pub(crate) const PTC_TIMELINESS_INDEX: usize = 1;
 /// `Store` (G L192-213). The fields are private: only `on_tick` and `on_block` change them,
 /// which keeps each per-block map keyed by the same roots as `blocks`.
 ///
+/// `anchor_root` is not a spec field. It is the root of the anchor block, the one block of the
+/// store whose parent is not in the store: the ancestor walk stops there ([`get_ancestor`]).
+///
 /// `slot_duration_ms` is the config value `SLOT_DURATION_MS`, the one config value of fork
 /// choice that differs between the presets ([`crate::config_values`] lists the others).
 /// `payloads` holds the roots only: fork choice reads only `root in store.payloads`.
@@ -69,6 +72,7 @@ pub(crate) const PTC_TIMELINESS_INDEX: usize = 1;
 #[derive(Debug, Clone)]
 pub struct Store<E: Preset> {
     pub(crate) slot_duration_ms: NonZeroU64,
+    pub(crate) anchor_root: Root,
     pub(crate) time_ms: u64,
     pub(crate) genesis_time_ms: u64,
     pub(crate) justified_checkpoint: Checkpoint,
@@ -215,6 +219,7 @@ pub fn get_forkchoice_store<E: Preset>(
     let votes = vec![None; ptc_size::<E>()];
     Ok(Store {
         slot_duration_ms,
+        anchor_root,
         time_ms,
         genesis_time_ms,
         unrealized_justified_checkpoint: justified_checkpoint.clone(),
@@ -353,6 +358,12 @@ pub fn is_parent_node_full<E: Preset>(
 
 /// `get_ancestor` (G L388-397): the node of the chain of `node` at `slot`, with the payload
 /// status that its child builds on. A loop instead of the spec's recursion.
+///
+/// The walk stops at the anchor, also for a `slot` before it: the store has no block below
+/// the anchor, and the spec's walk would fail on the parent of a non-genesis anchor (a
+/// checkpoint sync) for each slot before it, for example the shuffling dependent slot of the
+/// first two epochs after the anchor. Production clients also stop at their oldest block.
+/// The node of the anchor keeps the payload status that its child builds on.
 pub fn get_ancestor<E: Preset>(
     store: &Store<E>,
     mut node: ForkChoiceNode,
@@ -360,7 +371,7 @@ pub fn get_ancestor<E: Preset>(
 ) -> Result<ForkChoiceNode, Error> {
     loop {
         let block = store.get_block(node.root)?;
-        if block.slot <= slot {
+        if block.slot <= slot || node.root == store.anchor_root {
             return Ok(node);
         }
         node = ForkChoiceNode::new(block.parent_root, get_parent_payload_status(store, block)?);
