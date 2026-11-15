@@ -322,6 +322,7 @@ async fn minus_38005_no_downgrade() {
         .await
         .unwrap()
         .into_inner();
+    assert!(reply.status.is_none(), "{reply:?}");
     let error = reply.error.expect("an engine error");
     assert_eq!(error.kind, pb::EngineErrorKind::UnsupportedFork as i32);
     assert_eq!(error.rpc_code, -38005);
@@ -457,15 +458,23 @@ async fn timeout_waits_full() {
         let case = format!("{method}, timeout_ms {timeout_ms}, reply at {delay:?}");
         if delay < wait {
             assert_eq!(
-                status.map(|status| status.status),
+                status.as_ref().map(|status| status.status),
                 Some(pb::PayloadStatusKind::Valid as i32),
                 "{case}: {error:?}"
             );
+            assert!(
+                error.is_none(),
+                "{case}: a status must come without an error"
+            );
         } else {
             assert_eq!(
-                error.map(|error| error.kind),
+                error.as_ref().map(|error| error.kind),
                 Some(pb::EngineErrorKind::Timeout as i32),
                 "{case}: {status:?}"
+            );
+            assert!(
+                status.is_none(),
+                "{case}: an error must come without a status"
             );
         }
     }
@@ -550,6 +559,180 @@ async fn el_offline_sets_flag_and_206() {
         health_status(queue.el_offline()),
         StatusCode::PARTIAL_CONTENT
     );
+}
+
+/// The calls that reach an EL that is up but give no result: `-38005`, `-32601`, HTTP 500 and,
+/// with the client clock 61 s off, HTTP 401. None of them reconnects.
+async fn calls_without_a_result(session: &Session, clock: &Skew, http_500: [u8; 32]) {
+    let calls = [
+        (
+            NEW_PAYLOAD_V4,
+            payload([0x34; 32]),
+            CallError::UnsupportedFork,
+        ),
+        (
+            GET_BLOBS_V3,
+            json!([[]]),
+            CallError::Rpc {
+                code: METHOD_NOT_FOUND,
+            },
+        ),
+        (
+            NEW_PAYLOAD_V5,
+            payload(http_500),
+            CallError::HttpStatus { status: 500 },
+        ),
+    ];
+    for (method, params, want) in calls {
+        let got = session.call(method, &params, NEW_PAYLOAD_V5_TIMEOUT).await;
+        assert_eq!(got, Err(want), "{method}");
+    }
+    clock.set(61);
+    let got = session
+        .call(NEW_PAYLOAD_V5, &payload([0x35; 32]), NEW_PAYLOAD_V5_TIMEOUT)
+        .await;
+    clock.set(0);
+    assert_eq!(got, Err(CallError::Unauthorized), "61 s clock skew");
+    assert_eq!(session.generation(), 1, "no call reconnects");
+    assert!(session.is_connected());
+}
+
+/// Only an `Ok` on the current generation counts as an answer. A JSON-RPC error (`-38005`,
+/// `-32601`), an HTTP error and HTTP 401 come from an EL that is up, but they do not refresh
+/// the 30 s window, and they do not clear `el_offline` once it is set.
+#[tokio::test(start_paused = true)]
+async fn only_ok_counts_as_an_answer() {
+    let _frozen = freeze();
+    let mock = start_el(KEY).await;
+    mock.set_capabilities(
+        [
+            NEW_PAYLOAD_V5,
+            FORKCHOICE_UPDATED_V4,
+            NEW_PAYLOAD_V4,
+            GET_BLOBS_V3,
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+    );
+    let http_500 = [0x33; 32];
+    mock.on_new_payload(http_500, Reply::Http(500));
+    let clock = skewed(0);
+    let config = config(&mock, Arc::clone(&clock) as Arc<dyn Clock>);
+    let window = config.el_offline_after;
+    assert_eq!(window, Duration::from_secs(30));
+    let session = Session::connect(config).await.unwrap();
+
+    // 1 ms before the end of the window that the capability exchange opened.
+    tokio::time::advance(window - Duration::from_millis(1)).await;
+    assert!(!session.el_offline());
+    calls_without_a_result(&session, &clock, http_500).await;
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(
+        session.el_offline(),
+        "a call without a result must not refresh the window"
+    );
+    assert_eq!(
+        health_status(session.el_offline()),
+        StatusCode::PARTIAL_CONTENT
+    );
+
+    calls_without_a_result(&session, &clock, http_500).await;
+    assert!(
+        session.el_offline(),
+        "a call without a result must not clear el_offline"
+    );
+
+    session
+        .call(NEW_PAYLOAD_V5, &payload([0x36; 32]), NEW_PAYLOAD_V5_TIMEOUT)
+        .await
+        .unwrap();
+    assert!(!session.el_offline(), "an Ok clears el_offline");
+}
+
+/// Through the server, an EL reply that is not a JSON-RPC result (incomplete JSON) and an
+/// HTTP error are an `EngineError` with no `PayloadStatus`, for NewPayload and for
+/// ForkchoiceUpdated. A VALID reply is a `PayloadStatus` with no `EngineError`.
+#[tokio::test]
+async fn status_and_error_are_exclusive() {
+    let mock = start_el(KEY).await;
+    let mut served = serve_engine(&mock).await;
+    let (malformed, http_500, valid) = ([0x41; 32], [0x42; 32], [0x43; 32]);
+    mock.on_new_payload(malformed, Reply::Malformed);
+    mock.on_forkchoice_updated(malformed, Reply::Malformed);
+    mock.on_new_payload(http_500, Reply::Http(500));
+    mock.on_forkchoice_updated(http_500, Reply::Http(500));
+    let failures = [(malformed, 0), (http_500, 500)];
+    let mut seq = 0;
+    for (hash, rpc_code) in failures {
+        seq += 1;
+        let reply = served
+            .client
+            .new_payload(new_payload_request(
+                seq,
+                pb::EngineMethodVersion::GloasAmsterdam,
+                hash,
+                0,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reply.seq, seq);
+        assert!(reply.status.is_none(), "newPayload: {reply:?}");
+        let error = reply.error.expect("newPayload: an engine error");
+        assert_eq!(
+            (error.kind, error.rpc_code),
+            (pb::EngineErrorKind::Other as i32, rpc_code)
+        );
+
+        seq += 1;
+        let reply = served
+            .client
+            .forkchoice_updated(forkchoice_request(seq, hash, 0))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reply.seq, seq);
+        assert!(reply.status.is_none(), "forkchoiceUpdated: {reply:?}");
+        assert!(reply.payload_id.is_empty(), "forkchoiceUpdated: {reply:?}");
+        let error = reply.error.expect("forkchoiceUpdated: an engine error");
+        assert_eq!(
+            (error.kind, error.rpc_code),
+            (pb::EngineErrorKind::Other as i32, rpc_code)
+        );
+    }
+
+    let reply = served
+        .client
+        .new_payload(new_payload_request(
+            5,
+            pb::EngineMethodVersion::GloasAmsterdam,
+            valid,
+            0,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(reply.error.is_none(), "newPayload: {reply:?}");
+    assert_eq!(
+        reply.status.map(|status| status.status),
+        Some(pb::PayloadStatusKind::Valid as i32)
+    );
+    let reply = served
+        .client
+        .forkchoice_updated(forkchoice_request(6, valid, 0))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(reply.error.is_none(), "forkchoiceUpdated: {reply:?}");
+    assert_eq!(
+        reply.status.map(|status| status.status),
+        Some(pb::PayloadStatusKind::Valid as i32)
+    );
+    let calls: Vec<String> = sent(&mock)
+        .into_iter()
+        .filter(|method| method != EXCHANGE_CAPABILITIES)
+        .collect();
+    assert_eq!(calls, [NEW_PAYLOAD_V5, FORKCHOICE_UPDATED_V4].repeat(3));
 }
 
 /// A reply that arrives after a reconnect belongs to the replaced generation: the caller gets

@@ -1,10 +1,13 @@
 //! The newPayload verdict contract: `verdict::map` of every `PayloadStatusV1`,
 //! [`NewPayloadClient`] against a mock `ethswarm.engine.v1` server on a Unix socket, and the
-//! per-block [`ExecutionStatuses`]. The client tests run on paused time, so the 6 s waits take
-//! no wall-clock time; the concurrency tests, which wait for nothing, run on real time.
+//! per-block [`ExecutionStatuses`]. The client tests run on paused time, so the 6 s and 12 s
+//! waits take no wall-clock time; the timeout test also holds the paused clock still
+//! ([`freeze`]), so only `tokio::time::advance` moves it. The concurrency tests, which wait for
+//! nothing, run on real time.
 
 use cl_chain::engine::client::{
-    EngineSeq, NewPayloadClient, NewPayloadMetrics, CALL_TIMEOUT, NEW_PAYLOAD_V5_TIMEOUT,
+    new_payload_json, EngineSeq, NewPayloadClient, NewPayloadMetrics, CALL_TIMEOUT,
+    MAX_NEW_PAYLOAD_JSON_BYTES, NEW_PAYLOAD_V5_TIMEOUT,
 };
 use cl_chain::engine::verdict::{self, ElVerdict, ExecutionStatus, ExecutionStatuses, Reason};
 use consensus_types::gloas::{
@@ -25,7 +28,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, watch, Barrier};
+use tokio::sync::{mpsc, watch, Barrier, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
@@ -124,6 +127,8 @@ enum Answer {
     Rpc(Code),
     /// No answer, ever: a stalled cl-engine.
     Stall,
+    /// VALID, with the `blockHash` of the request's payload as `latestValidHash`.
+    Valid,
 }
 
 fn raw(status: pb::PayloadStatus) -> Answer {
@@ -157,6 +162,8 @@ fn engine_error(kind: pb::EngineErrorKind) -> Answer {
 struct MockEngine {
     script: Arc<Mutex<VecDeque<(Duration, Answer)>>>,
     seen: Arc<Mutex<Vec<pb::NewPayloadRequest>>>,
+    /// Notified each time a request is recorded.
+    recorded: Arc<Notify>,
     together: Option<Arc<Barrier>>,
 }
 
@@ -168,6 +175,27 @@ impl MockEngine {
     fn seen(&self) -> Vec<pb::NewPayloadRequest> {
         self.seen.lock().unwrap().clone()
     }
+
+    /// Waits until at least `n` requests are recorded.
+    async fn arrived(&self, n: usize) {
+        loop {
+            let notified = self.recorded.notified();
+            tokio::pin!(notified);
+            // Register before the check, so no notification is lost.
+            notified.as_mut().enable();
+            if self.seen.lock().unwrap().len() >= n {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// The `blockHash` of the payload in a `NewPayload` request.
+fn requested_block_hash(req: &pb::NewPayloadRequest) -> Vec<u8> {
+    let data = &req.params.as_ref().expect("params").data;
+    let params: NewPayloadV5Params = serde_json::from_slice(data).expect("V5 params");
+    params.execution_payload.block_hash.0.to_vec()
 }
 
 #[tonic::async_trait]
@@ -178,6 +206,7 @@ impl EngineService for MockEngine {
     ) -> Result<Response<pb::NewPayloadResponse>, Status> {
         let req = request.into_inner();
         self.seen.lock().unwrap().push(req.clone());
+        self.recorded.notify_waiters();
         let next = self.script.lock().unwrap().pop_front();
         let Some((after, answer)) = next else {
             return Err(Status::internal("mock: no scripted answer"));
@@ -202,6 +231,15 @@ impl EngineService for MockEngine {
             })),
             Answer::Rpc(code) => Err(Status::new(code, "mock")),
             Answer::Stall => std::future::pending().await,
+            Answer::Valid => Ok(Response::new(pb::NewPayloadResponse {
+                seq: req.seq,
+                status: Some(pb::PayloadStatus {
+                    status: Kind::Valid as i32,
+                    latest_valid_hash: requested_block_hash(&req),
+                    validation_error: String::new(),
+                }),
+                error: None,
+            })),
         }
     }
 
@@ -298,7 +336,8 @@ async fn concurrent_calls(path: &Path, mock: &MockEngine) -> Vec<ElVerdict> {
     let start = Arc::new(Barrier::new(CALLERS));
     let calls: Vec<_> = (1..=CALLERS as u8)
         .map(|n| {
-            mock.answer(Duration::ZERO, status(Kind::Valid, Some(hash(n))));
+            // The calls arrive in any order: each VALID carries its own request's hash.
+            mock.answer(Duration::ZERO, Answer::Valid);
             let (client, start) = (Arc::clone(&client), Arc::clone(&start));
             tokio::spawn(async move {
                 let block = block(n, n - 1);
@@ -365,6 +404,8 @@ async fn status_table() {
         validation_error: None,
     };
     let invalid = |latest_valid_hash| ElVerdict::Invalid { latest_valid_hash };
+    // Every row is a reply for the payload `hash(1)`.
+    let block_hash = hash(1);
     let rows = [
         (v1(ValidationStatus::Valid, Some(hash(1))), ElVerdict::Valid),
         (v1(ValidationStatus::Invalid, Some(lvh)), invalid(Some(lvh))),
@@ -378,14 +419,22 @@ async fn status_table() {
         (v1(ValidationStatus::Accepted, None), ElVerdict::Optimistic),
     ];
     for (status, want) in &rows {
-        assert_eq!(verdict::map(status), *want, "{status:?}");
+        assert_eq!(verdict::map(status, block_hash), *want, "{status:?}");
         let json = serde_json::to_vec(status).unwrap();
-        assert_eq!(verdict::map_json(&json), *want, "{status:?} as JSON");
+        assert_eq!(
+            verdict::map_json(&json, block_hash),
+            *want,
+            "{status:?} as JSON"
+        );
         let with_error = PayloadStatusV1 {
             validation_error: Some("mock".to_owned()),
             ..status.clone()
         };
-        assert_eq!(verdict::map(&with_error), *want, "{with_error:?}");
+        assert_eq!(
+            verdict::map(&with_error, block_hash),
+            *want,
+            "{with_error:?}"
+        );
     }
     // A status this version does not define, or none at all: never VALID.
     for json in [
@@ -398,7 +447,7 @@ async fn status_table() {
         "not json",
     ] {
         assert_eq!(
-            verdict::map_json(json.as_bytes()),
+            verdict::map_json(json.as_bytes(), block_hash),
             ElVerdict::NotVerified(Reason::UnknownStatus),
             "{json}"
         );
@@ -409,7 +458,7 @@ async fn status_table() {
         r#"{"status":"INVALID","latestValidHash":"77"}"#,
     ] {
         assert_eq!(
-            verdict::map_json(json.as_bytes()),
+            verdict::map_json(json.as_bytes(), block_hash),
             ElVerdict::NotVerified(Reason::Malformed),
             "{json}"
         );
@@ -520,47 +569,109 @@ fn status_of(kind: Kind) -> Option<pb::PayloadStatus> {
     })
 }
 
-/// A VALID just under the 6 s floor is taken. cl-engine's own 6 s timeout, a cl-engine that
-/// never answers, and a VALID that comes after the client gave up are all `NotVerified`,
-/// never permit the import and record nothing. The client never gives up before the floor,
-/// and never shortens cl-engine's wait (`timeout_ms` 0).
+/// The client's wait for cl-engine's answer, as a number: [`CALL_TIMEOUT`] must be 12 s.
+const CLIENT_WAIT: Duration = Duration::from_secs(12);
+/// cl-engine's wait for the EL on `engine_newPayloadV5` (`amsterdam.md`), as a number:
+/// [`NEW_PAYLOAD_V5_TIMEOUT`] must be 6 s.
+const ENGINE_WAIT: Duration = Duration::from_secs(6);
+
+/// Holds the paused clock still until dropped. Tokio does not auto-advance paused time while a
+/// blocking task runs (`tokio::time::pause`, "Preventing auto-advance"). Without this, a wait on
+/// Unix-socket I/O could move the clock to the next timer.
+struct Frozen {
+    _release: std::sync::mpsc::Sender<()>,
+}
+
+fn freeze() -> Frozen {
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || {
+        // Returns once the sender is dropped.
+        let _ = released.recv();
+    });
+    Frozen { _release: release }
+}
+
+/// Sends `block`, and the mock gives `answer` `after` the request arrives. Waits for the
+/// request to arrive, moves the frozen clock to 1 ms before `at`, and checks that the call has
+/// no verdict yet. Then moves the clock to `at` and gives the verdict, with the time the call
+/// took on the paused clock.
+async fn verdict_at(
+    s: &Setup,
+    block: &Block,
+    after: Duration,
+    answer: Answer,
+    at: Duration,
+) -> (ElVerdict, Duration) {
+    let start = Instant::now();
+    s.mock.answer(after, answer);
+    let seen = s.mock.seen().len();
+    let call = s.client.new_payload(&block.envelope, &block.bid);
+    tokio::pin!(call);
+    tokio::select! {
+        biased;
+        verdict = &mut call => panic!("a verdict before the request arrived: {verdict:?}"),
+        () = s.mock.arrived(seen + 1) => {}
+    }
+    assert_eq!(start.elapsed(), Duration::ZERO, "the clock must not move");
+    let early = at - Duration::from_millis(1);
+    tokio::time::advance(early).await;
+    for _ in 0..16 {
+        tokio::select! {
+            biased;
+            verdict = &mut call => panic!("a verdict at {early:?}, before {at:?}: {verdict:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+    }
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let verdict = call.await;
+    (verdict, start.elapsed())
+}
+
+/// The two waits, pinned apart. A VALID 1 ms inside cl-engine's 6 s wait is taken. cl-engine's
+/// own TIMEOUT comes at 6 s, and the client takes it then. A cl-engine that never answers, and a
+/// VALID that comes after 13 s, end at the client's 12 s wait, not before. With a client wait
+/// of 7 s, the stalled call would end before 12 s and this test would fail. None of these
+/// permits the import or records a status, and no request shortens cl-engine's wait
+/// (`timeout_ms` 0).
 #[tokio::test(start_paused = true)]
 async fn timeout_never_valid() {
+    assert_eq!(NEW_PAYLOAD_V5_TIMEOUT, ENGINE_WAIT);
+    assert_eq!(CALL_TIMEOUT, CLIENT_WAIT);
+    let _frozen = freeze();
     let s = setup();
     let mut statuses = ExecutionStatuses::new();
+    let ms = Duration::from_millis;
+
     let first = block(1, 0);
-    let just_under = NEW_PAYLOAD_V5_TIMEOUT - Duration::from_millis(1);
-    let start = Instant::now();
-    let verdict = s
-        .send(&first, just_under, status(Kind::Valid, Some(hash(1))))
-        .await;
+    let just_under = ENGINE_WAIT - ms(1);
+    let (verdict, took) = verdict_at(&s, &first, just_under, Answer::Valid, just_under).await;
     assert_eq!(verdict, ElVerdict::Valid);
-    assert!(start.elapsed() >= just_under, "{:?}", start.elapsed());
+    assert_eq!(took, just_under);
 
     let block = block(2, 1);
     let unverified = [
         // cl-engine's wait for the EL ran out at 6 s.
         (
-            NEW_PAYLOAD_V5_TIMEOUT,
+            ENGINE_WAIT,
             engine_error(pb::EngineErrorKind::Timeout),
+            ENGINE_WAIT,
             Reason::Engine(pb::EngineErrorKind::Timeout as i32),
         ),
         // cl-engine never answers.
-        (Duration::ZERO, Answer::Stall, Reason::Timeout),
+        (Duration::ZERO, Answer::Stall, CLIENT_WAIT, Reason::Timeout),
         // The VALID comes after the client gave up.
         (
-            CALL_TIMEOUT + Duration::from_secs(1),
-            status(Kind::Valid, Some(hash(2))),
+            CLIENT_WAIT + Duration::from_secs(1),
+            Answer::Valid,
+            CLIENT_WAIT,
             Reason::Timeout,
         ),
     ];
-    for (after, answer, reason) in unverified {
-        let start = Instant::now();
-        let verdict = s.send(&block, after, answer.clone()).await;
-        let waited = start.elapsed();
+    for (after, answer, at, reason) in unverified {
+        let (verdict, took) = verdict_at(&s, &block, after, answer.clone(), at).await;
         assert_eq!(verdict, ElVerdict::NotVerified(reason), "{answer:?}");
+        assert_eq!(took, at, "{answer:?}");
         assert!(!verdict.permits_payload_import());
-        assert!(waited >= NEW_PAYLOAD_V5_TIMEOUT, "{answer:?}: {waited:?}");
         assert_eq!(
             statuses.record(block.block_hash(), block.parent_hash(), &verdict),
             None
@@ -572,9 +683,118 @@ async fn timeout_never_valid() {
     }
 }
 
+/// VALID must carry the submitted payload's `block_hash` as `latestValidHash` (`paris.md`,
+/// payload validation, rule 3). `null`, a missing member, an empty hash, the zero hash and
+/// another payload's hash are `NotVerified(Malformed)`: they never permit the import and record
+/// nothing.
+#[tokio::test(start_paused = true)]
+async fn valid_carries_the_payload_hash() {
+    let block_hash = hash(1);
+    let v1 = |latest_valid_hash: Option<Hash32>| PayloadStatusV1 {
+        status: ValidationStatus::Valid,
+        latest_valid_hash: latest_valid_hash.map(|h| FixedData(h.0)),
+        validation_error: None,
+    };
+    let malformed = ElVerdict::NotVerified(Reason::Malformed);
+    assert_eq!(
+        verdict::map(&v1(Some(block_hash)), block_hash),
+        ElVerdict::Valid
+    );
+    for lvh in [None, Some(Hash32::ZERO), Some(hash(2))] {
+        assert_eq!(verdict::map(&v1(lvh), block_hash), malformed, "{lvh:?}");
+        let json = serde_json::to_vec(&v1(lvh)).unwrap();
+        assert_eq!(
+            verdict::map_json(&json, block_hash),
+            malformed,
+            "{lvh:?} as JSON"
+        );
+    }
+    assert_eq!(
+        verdict::map_json(br#"{"status":"VALID"}"#, block_hash),
+        malformed,
+        "no latestValidHash member"
+    );
+
+    let s = setup();
+    let mut statuses = ExecutionStatuses::new();
+    let block = block(1, 0);
+    for lvh in [None, Some(Hash32::ZERO), Some(hash(2))] {
+        let verdict = s
+            .send(&block, Duration::ZERO, status(Kind::Valid, lvh))
+            .await;
+        assert_eq!(verdict, malformed, "{lvh:?}");
+        assert!(!verdict.permits_payload_import());
+        assert_eq!(
+            statuses.record(block.block_hash(), block.parent_hash(), &verdict),
+            None
+        );
+    }
+    let verdict = s.send(&block, Duration::ZERO, Answer::Valid).await;
+    assert_eq!(verdict, ElVerdict::Valid);
+}
+
+/// `block` with one transaction of `len` zero bytes and `gas_used` set to `gas_used`.
+fn with_transaction(mut block: Block, len: usize, gas_used: u64) -> Block {
+    block.envelope.payload.transactions = list(vec![list(vec![0; len])]);
+    block.envelope.payload.gas_used = gas_used;
+    block
+}
+
+/// engine.proto caps a JSON params body at 32 MiB (33554432 bytes). A payload whose params
+/// would be larger is `NotVerified(Malformed)`, and the client does not connect to cl-engine
+/// for it. A payload under the cap, on the same client, connects and is answered.
+#[tokio::test]
+async fn params_past_32_mib_are_refused_before_connecting() {
+    assert_eq!(MAX_NEW_PAYLOAD_JSON_BYTES, 33_554_432);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("engine.sock");
+    let mock = MockEngine::default();
+    let accepted = serve_counted(&path, mock.clone(), None);
+    let client =
+        NewPayloadClient::new(&path, uid(), EngineSeq::new(), NewPayloadMetrics::default());
+    // 16 MiB and 1 byte of transaction is more than 32 MiB as hex.
+    let big = with_transaction(block(1, 0), MAX_NEW_PAYLOAD_JSON_BYTES / 2 + 1, 0);
+    assert_eq!(
+        client.new_payload(&big.envelope, &big.bid).await,
+        ElVerdict::NotVerified(Reason::Malformed)
+    );
+    assert!(mock.seen().is_empty());
+    assert_eq!(*accepted.borrow(), 0, "no connection to cl-engine");
+
+    mock.answer(Duration::ZERO, Answer::Valid);
+    let small = block(2, 1);
+    assert_eq!(
+        client.new_payload(&small.envelope, &small.bid).await,
+        ElVerdict::Valid
+    );
+    assert_eq!(*accepted.borrow(), 1);
+}
+
+/// `new_payload_json` gives the params up to exactly 32 MiB of JSON, and `None` one byte past
+/// it. The size comes from one transaction (two hex digits per byte) and the hex length of
+/// `gas_used` (`0x0` or `0x10`).
+#[test]
+fn new_payload_json_is_capped_at_32_mib() {
+    let json_len = |len, gas_used| {
+        let block = with_transaction(block(1, 0), len, gas_used);
+        new_payload_json(&block.envelope, &block.bid).map(|json| json.len())
+    };
+    let base = json_len(0, 0).expect("an empty transaction is under the cap");
+    let gap = MAX_NEW_PAYLOAD_JSON_BYTES - base;
+    // One more hex digit in `gas_used` takes one more byte.
+    let (len, gas_used, longer) = if gap.is_multiple_of(2) {
+        (gap / 2, 0, 0x10)
+    } else {
+        (gap / 2, 0x10, 0x100)
+    };
+    assert_eq!(json_len(len, gas_used), Some(MAX_NEW_PAYLOAD_JSON_BYTES));
+    assert_eq!(json_len(len, longer), None);
+}
+
 /// SYNCING and ACCEPTED leave a chain of payloads optimistic. A later VALID for one of them
 /// makes it and every optimistic ancestor VALID, walking the recorded parent hashes; its
-/// descendant and a sibling stay optimistic, and an INVALID ancestor stops the walk.
+/// descendant and a sibling stay optimistic. A payload recorded on an INVALID one is Invalid,
+/// and a later VALID does not change that.
 #[tokio::test(start_paused = true)]
 async fn optimistic_then_valid() {
     use ExecutionStatus::{Invalid, Optimistic, Valid};
@@ -647,7 +867,8 @@ async fn optimistic_then_valid() {
         ]
     );
 
-    // 20 is INVALID, 21 and 22 optimistic on it: a VALID for 22 stops at 20.
+    // 20 is INVALID, and 21 and 22 come on it with SYNCING: both are Invalid, also after a
+    // VALID for 22.
     let invalid = ElVerdict::Invalid {
         latest_valid_hash: Some(hash(19)),
     };
@@ -657,7 +878,7 @@ async fn optimistic_then_valid() {
     statuses.record(hash(22), hash(21), &ElVerdict::Valid);
     assert_eq!(
         [20, 21, 22].map(|n| statuses.status(&hash(n))),
-        [Some(Invalid), Some(Valid), Some(Valid)]
+        [Some(Invalid), Some(Invalid), Some(Invalid)]
     );
 }
 
@@ -665,9 +886,10 @@ async fn optimistic_then_valid() {
 /// `Valid`. `Invalid` and every `NotVerified` (a timeout, a transport error, an unknown status,
 /// no connection) never permit it: INVALID replaces an optimistic status and later SYNCING or
 /// VALID do not undo it; a NotVerified records nothing and leaves an earlier status as it was.
+/// The `latestValidHash` of the INVALID names its parent, which becomes Valid.
 #[tokio::test(start_paused = true)]
 async fn optimistic_permits_import() {
-    use ExecutionStatus::{Invalid, Optimistic};
+    use ExecutionStatus::{Invalid, Optimistic, Valid};
     assert!(ElVerdict::Valid.permits_payload_import());
     assert!(ElVerdict::Optimistic.permits_payload_import());
     let refused = [
@@ -743,7 +965,7 @@ async fn optimistic_permits_import() {
             Some(Invalid)
         );
     }
-    assert_eq!(statuses.status(&one.block_hash()), Some(Optimistic));
+    assert_eq!(statuses.status(&one.block_hash()), Some(Valid));
 
     // No cl-engine on the socket.
     let gone = NewPayloadClient::new(

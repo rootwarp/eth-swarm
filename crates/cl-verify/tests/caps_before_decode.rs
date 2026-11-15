@@ -1,7 +1,8 @@
 //! caps_before_decode: each server limit (257 BLS sets, a 4 MiB + 1 byte BLS message, an 8 MiB + 1
-//! byte KZG message, 129 KZG columns) refuses the request with a per-call error that fails the
-//! stream. No verdict frame is sent and the verifier is never called, so no point, cell or proof
-//! is decoded.
+//! byte KZG message, 129 KZG columns, a 4 MiB + 1 byte PubkeyFeed or BuilderKeyFeed frame) refuses
+//! the request with a per-call error that fails the stream. No verdict frame is sent and the
+//! verifier is never called, so no point, cell or proof is decoded, and no key is written to a
+//! cache.
 
 mod common;
 
@@ -13,7 +14,8 @@ use cl_verify::caps::{MAX_BLS_SETS, MAX_KZG_COLUMNS, MAX_KZG_MESSAGE_BYTES, MAX_
 use cl_verify::kzg::{KzgBackend, KzgFailure, PreparedCells};
 use cl_verify::proto::common::ErrorCode;
 use cl_verify::proto::verify::{
-    BlsSet, KzgCellProof, VerifyBlsRequestBody, VerifyKzgRequestBody, VerifyStatus,
+    BlsSet, BuilderKeyFeedRequestBody, KzgCellProof, PubkeyFeedRequestBody, VerifyBlsRequestBody,
+    VerifyKzgRequestBody, VerifyStatus,
 };
 use common::*;
 use prost::Message;
@@ -68,6 +70,13 @@ fn garbage_cell(cell_index: u64) -> KzgCellProof {
         cell: vec![0xff; 2048],
         proof: vec![0xff; 48],
     }
+}
+
+/// The two message caps, as numbers: 8 MiB for VerifyKzg and 4 MiB for every other method.
+#[test]
+fn message_caps_are_8_mib_for_kzg_and_4_mib_for_the_rest() {
+    assert_eq!(MAX_KZG_MESSAGE_BYTES, 8_388_608);
+    assert_eq!(MAX_MESSAGE_BYTES, 4_194_304);
 }
 
 #[tokio::test]
@@ -205,5 +214,101 @@ async fn column_cap_129_fails_the_stream_without_a_verdict() {
         c.kzg_calls.load(Ordering::SeqCst),
         1,
         "the 129-column call never reached c-kzg"
+    );
+}
+
+/// A PubkeyFeed frame of one key at `start`, padded (through that key, so it is not 48 bytes and
+/// is refused if decoded) to `total` encoded bytes.
+fn feed_frame_of_size(start: u64, total: usize) -> PubkeyFeedRequestBody {
+    let mut body = feed_frame(start, [start]);
+    let mut pad = total as i64;
+    loop {
+        body.pubkeys[0] = vec![0; pad as usize];
+        let len = feed_body(body.clone()).encoded_len() as i64;
+        if len == total as i64 {
+            return body;
+        }
+        pad += total as i64 - len;
+    }
+}
+
+/// A BuilderKeyFeed frame of one key at `start`, padded the same way.
+fn builder_frame_of_size(start: u64, total: usize) -> BuilderKeyFeedRequestBody {
+    let mut body = builder_frame(start, [start]);
+    let mut pad = total as i64;
+    loop {
+        body.entries[0].pubkey = vec![0; pad as usize];
+        let len = builder_body(body.clone()).encoded_len() as i64;
+        if len == total as i64 {
+            return body;
+        }
+        pad += total as i64 - len;
+    }
+}
+
+#[tokio::test]
+async fn pubkey_feed_cap_refuses_4_mib_plus_one_without_a_cache_write() {
+    let mut h = start_with(Options {
+        cache: cache_of(2),
+        ..Options::default()
+    })
+    .await;
+    let (mut s, first) = feed_open(&mut h).await;
+    assert_eq!(first, 2);
+    s.send(feed_body(announcing(feed_frame(2, [2]), 3))).await;
+    let r = feed_reply(&mut s).await;
+    assert_eq!((r.high_water, r.err), (3, None));
+
+    let at_cap = feed_frame_of_size(3, MAX_MESSAGE_BYTES);
+    assert_eq!(feed_body(at_cap.clone()).encoded_len(), MAX_MESSAGE_BYTES);
+    s.send(feed_body(at_cap)).await;
+    // Exactly 4 MiB is decoded; its key is not 48 bytes, so the frame is refused in-band.
+    let r = feed_reply(&mut s).await;
+    assert_eq!(r.high_water, 3);
+    assert_eq!(r.err.map(|e| e.code()), Some(ErrorCode::ContractViolation));
+
+    let over = feed_frame_of_size(3, MAX_MESSAGE_BYTES + 1);
+    assert_eq!(feed_body(over.clone()).encoded_len(), MAX_MESSAGE_BYTES + 1);
+    s.send(feed_body(over)).await;
+    let err = s.expect_failure().await;
+    assert_eq!(err.code(), ErrorCode::ContractViolation, "{}", err.detail);
+    assert_eq!(h.cache.read().unwrap().high_water(), 3, "no cache write");
+    let (_s, again) = feed_open(&mut h).await;
+    assert_eq!(again, 3, "a new stream sees the same high-water mark");
+}
+
+#[tokio::test]
+async fn builder_feed_cap_refuses_4_mib_plus_one_without_a_cache_write() {
+    let mut h = start().await;
+    let (mut s, first) = builder_open(&mut h).await;
+    assert_eq!(first, 0);
+    assert_eq!(
+        builder_apply(&mut s, builder_frame(0, [0])).await,
+        (1, None)
+    );
+
+    let at_cap = builder_frame_of_size(1, MAX_MESSAGE_BYTES);
+    assert_eq!(
+        builder_body(at_cap.clone()).encoded_len(),
+        MAX_MESSAGE_BYTES
+    );
+    // Exactly 4 MiB is decoded; its key is not 48 bytes, so the frame is refused in-band.
+    assert_eq!(
+        builder_apply(&mut s, at_cap).await,
+        (1, Some(ErrorCode::ContractViolation))
+    );
+
+    let over = builder_frame_of_size(1, MAX_MESSAGE_BYTES + 1);
+    assert_eq!(
+        builder_body(over.clone()).encoded_len(),
+        MAX_MESSAGE_BYTES + 1
+    );
+    s.send(builder_body(over)).await;
+    let err = s.expect_failure().await;
+    assert_eq!(err.code(), ErrorCode::ContractViolation, "{}", err.detail);
+    let (_s, again) = builder_open(&mut h).await;
+    assert_eq!(
+        again, 1,
+        "no cache write: the builder high-water mark is unchanged"
     );
 }

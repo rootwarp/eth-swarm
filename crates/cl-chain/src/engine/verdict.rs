@@ -1,22 +1,28 @@
 //! What cl-chain makes of an `engine_newPayloadV5` answer: an [`ElVerdict`] for each reply, and
 //! the [`ExecutionStatuses`] of the payloads it has asked about.
 //!
-//! - **The map** ([`map`], execution-apis `paris.md` L99-118): `VALID` is [`ElVerdict::Valid`];
-//!   `INVALID` and `INVALID_BLOCK_HASH` are [`ElVerdict::Invalid`] with `latestValidHash` as
-//!   given, `null` included; `SYNCING` and `ACCEPTED` are [`ElVerdict::Optimistic`]. It reads one
-//!   reply: two contradicting replies for one payload are the caller's to reconcile.
+//! - **The map** ([`map`], execution-apis `paris.md` L99-118): `VALID` is [`ElVerdict::Valid`]
+//!   only if its `latestValidHash` is the submitted payload's `block_hash` (`paris.md`, payload
+//!   validation, rule 3), else [`Reason::Malformed`]; `INVALID` and `INVALID_BLOCK_HASH` are
+//!   [`ElVerdict::Invalid`] with `latestValidHash` as given, `null` included; `SYNCING` and
+//!   `ACCEPTED` are [`ElVerdict::Optimistic`]. It reads one reply: two contradicting replies for
+//!   one payload are the caller's to reconcile.
 //! - **Fail closed.** A status this client cannot name, a reply that breaks the contract, an
 //!   error from cl-engine, a failed call and a timeout are [`ElVerdict::NotVerified`], never
 //!   `Valid`: [`map_json`] for the Engine API JSON, [`map_proto`] for engine.v1, where
 //!   `PAYLOAD_STATUS_KIND_UNSPECIFIED` breaks the contract and an unknown value is not decoded.
-//! - **The import gate** ([`ElVerdict::permits_payload_import`]): `Valid` and `Optimistic` only.
-//!   No data availability check: that is a separate gate.
+//! - **The import gate** ([`ElVerdict::permits_payload_import`]): `Valid` and `Optimistic` only;
+//!   [`ExecutionStatuses::permits_payload_import`] also refuses a payload or an execution parent
+//!   recorded `Invalid`. This is only the EL verdict gate. It is not the envelope's signature
+//!   check, its bid and beacon-block consistency, the other consensus checks, data availability,
+//!   or the check that a full parent's payload is verified. Those are separate gates, specified in
+//!   `gloas/fork-choice.md::{verify_execution_payload_envelope,on_execution_payload_envelope,on_block,is_payload_verified}`.
 //! - **The table** ([`ExecutionStatuses`]): see its docs.
 
 use consensus_types::primitives::Hash32;
 use engine_api::{FixedData, PayloadStatusV1, ValidationStatus};
 use ethswarm_proto::engine as pb;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 /// The EL's verdict on one payload, or why there is none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,7 +48,9 @@ pub enum Reason {
     UnknownStatus,
     /// A reply that breaks the Engine API or the engine.v1 contract: a field that does not
     /// decode, `PAYLOAD_STATUS_KIND_UNSPECIFIED`, a `latest_valid_hash` of neither 0 nor 32
-    /// bytes, neither a status nor an error, or another call's `seq`.
+    /// bytes, a `VALID` whose `latestValidHash` is not the submitted payload's `block_hash`
+    /// (`null`, empty or another hash), neither a status nor an error, or another call's `seq`.
+    /// Also params that would be past the 32 MiB JSON cap, which are never sent.
     Malformed,
     /// cl-engine answered an `EngineError` of this `EngineErrorKind` (its value, maybe one this
     /// client does not know): the EL is unreachable, timed out, refused the params, ...
@@ -59,7 +67,16 @@ impl ElVerdict {
     /// Every `label`, in order.
     pub const LABELS: [&'static str; 4] = ["valid", "invalid", "optimistic", "not_verified"];
 
-    /// Whether the envelope may be imported: on `Valid` and `Optimistic` only.
+    /// Whether the EL's verdict lets the envelope be imported: on `Valid` and `Optimistic` only
+    /// (`bellatrix/optimistic-sync.md`: `VALID` and `NOT_VALIDATED` import, `INVALIDATED` does
+    /// not, and an engine error or no answer MUST NOT import).
+    ///
+    /// This is only the EL verdict gate. It does not check the envelope's signature, its
+    /// consistency with the beacon block and the committed bid, the other consensus checks, data
+    /// availability, or that the execution parent is fully verified. Those are separate gates:
+    /// `gloas/fork-choice.md::{verify_execution_payload_envelope,on_execution_payload_envelope,on_block,is_payload_verified}`.
+    /// [`ExecutionStatuses::permits_payload_import`] adds what the table knows: a payload or an
+    /// execution parent recorded `Invalid` refuses the import.
     #[must_use]
     pub fn permits_payload_import(&self) -> bool {
         matches!(self, Self::Valid | Self::Optimistic)
@@ -78,11 +95,19 @@ impl ElVerdict {
     }
 }
 
-/// The verdict of one `PayloadStatusV1`. `validationError` does not change it.
+/// The verdict of one `PayloadStatusV1` for the submitted payload `block_hash`. A `VALID` must
+/// carry `block_hash` as `latestValidHash`; `null` or another hash is [`Reason::Malformed`].
+/// `validationError` does not change the verdict.
 #[must_use]
-pub fn map(status: &PayloadStatusV1) -> ElVerdict {
+pub fn map(status: &PayloadStatusV1, block_hash: Hash32) -> ElVerdict {
     match status.status {
-        ValidationStatus::Valid => ElVerdict::Valid,
+        ValidationStatus::Valid => {
+            if status.latest_valid_hash.map(|h| Hash32::from(h.0)) == Some(block_hash) {
+                ElVerdict::Valid
+            } else {
+                ElVerdict::NotVerified(Reason::Malformed)
+            }
+        }
         ValidationStatus::Invalid | ValidationStatus::InvalidBlockHash => ElVerdict::Invalid {
             latest_valid_hash: status.latest_valid_hash.map(|h| Hash32::from(h.0)),
         },
@@ -90,13 +115,13 @@ pub fn map(status: &PayloadStatusV1) -> ElVerdict {
     }
 }
 
-/// The verdict of a `PayloadStatusV1` as JSON. JSON that does not decode is
-/// [`Reason::UnknownStatus`] unless its `status` is one the Engine API defines, then
-/// [`Reason::Malformed`].
+/// The verdict of a `PayloadStatusV1` as JSON, for the submitted payload `block_hash` (see
+/// [`map`]). JSON that does not decode is [`Reason::UnknownStatus`] unless its `status` is one
+/// the Engine API defines, then [`Reason::Malformed`].
 #[must_use]
-pub fn map_json(json: &[u8]) -> ElVerdict {
+pub fn map_json(json: &[u8], block_hash: Hash32) -> ElVerdict {
     if let Ok(status) = serde_json::from_slice::<PayloadStatusV1>(json) {
-        return map(&status);
+        return map(&status, block_hash);
     }
     let known = serde_json::from_slice::<serde_json::Value>(json)
         .ok()
@@ -109,9 +134,10 @@ pub fn map_json(json: &[u8]) -> ElVerdict {
     })
 }
 
-/// The verdict of an engine.v1 `PayloadStatus`.
+/// The verdict of an engine.v1 `PayloadStatus`, for the submitted payload `block_hash` (see
+/// [`map`]). An empty `latest_valid_hash` is `null`.
 #[must_use]
-pub fn map_proto(status: &pb::PayloadStatus) -> ElVerdict {
+pub fn map_proto(status: &pb::PayloadStatus, block_hash: Hash32) -> ElVerdict {
     use pb::PayloadStatusKind as Kind;
     let kind = match Kind::try_from(status.status) {
         Ok(Kind::Valid) => ValidationStatus::Valid,
@@ -129,45 +155,112 @@ pub fn map_proto(status: &pb::PayloadStatus) -> ElVerdict {
             Err(_) => return ElVerdict::NotVerified(Reason::Malformed),
         },
     };
-    map(&PayloadStatusV1 {
-        status: kind,
-        latest_valid_hash,
-        validation_error: None,
-    })
+    map(
+        &PayloadStatusV1 {
+            status: kind,
+            latest_valid_hash,
+            validation_error: None,
+        },
+        block_hash,
+    )
 }
 
 /// What cl-chain knows of one execution payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionStatus {
-    /// The EL answered `VALID`, for it or a descendant.
+    /// The EL answered `VALID`, for it or a descendant, or named it as the `latestValidHash` of
+    /// an `INVALID`.
     Valid,
-    /// Imported on `SYNCING` or `ACCEPTED`, and not `VALID` yet.
+    /// Imported on `SYNCING` or `ACCEPTED`, and not `VALID` or `INVALID` yet.
     Optimistic,
-    /// The EL answered `INVALID` or `INVALID_BLOCK_HASH`.
+    /// The EL answered `INVALID` or `INVALID_BLOCK_HASH` for it, or it is in the invalid part of
+    /// the chain of such an answer, or it descends from an `Invalid` payload.
     Invalid,
+}
+
+/// Most `Invalid` payloads [`ExecutionStatuses`] keeps: 128 epochs at one per slot. Past it, the
+/// payload that became `Invalid` first is dropped first. A dropped payload has no status, so a
+/// later payload on it is not refused by the table; the EL still gives its own verdict.
+pub const MAX_INVALID_PAYLOADS: usize = 4096;
+
+/// One payload's status, as the table holds it.
+#[derive(Clone, Copy, Debug)]
+enum State {
+    Valid,
+    Optimistic,
+    Invalid {
+        /// When it became `Invalid`, in [`ExecutionStatuses::invalid`] order.
+        order: u64,
+        /// The `latestValidHash` of its `INVALID`, while the boundary waits for a missing
+        /// payload: one between the two, or the `latestValidHash` payload itself.
+        pending: Option<Hash32>,
+    },
+}
+
+impl State {
+    fn status(self) -> ExecutionStatus {
+        match self {
+            Self::Valid => ExecutionStatus::Valid,
+            Self::Optimistic => ExecutionStatus::Optimistic,
+            Self::Invalid { .. } => ExecutionStatus::Invalid,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Entry {
-    status: ExecutionStatus,
+    state: State,
     parent_hash: Hash32,
+}
+
+/// How a walk up from an `INVALID` payload towards its `latestValidHash` ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    /// The next hash up is the `latestValidHash`.
+    Found,
+    /// A `Valid` payload, or one the walk passed before: the boundary is not in this chain.
+    Stopped,
+    /// A payload that is not recorded (yet).
+    Missing,
 }
 
 /// The [`ExecutionStatus`] of each payload cl-chain has a verdict for, by its `block_hash`,
 /// with its `parent_hash`. Nothing reads it yet; it will give `execution_optimistic` and the
-/// confirmed and safe hashes. It is never pruned yet.
+/// confirmed and safe hashes. The rules are those of `bellatrix/optimistic-sync.md`.
 ///
 /// - `Valid` makes the payload `Valid`, and every ancestor still `Optimistic` too, walking the
 ///   recorded parent hashes up to the first ancestor that is not recorded or not `Optimistic`.
 /// - `Optimistic` makes a payload with no status `Optimistic`, and leaves `Valid` alone.
 /// - `Invalid` makes the payload `Invalid`, whatever it was. `INVALID` is final (`paris.md`
-///   L114): a later `Valid` or `Optimistic` leaves it `Invalid`. Its descendants are not
-///   touched here.
+///   L114): a later `Valid` or `Optimistic` leaves it `Invalid`. Every recorded descendant
+///   becomes `Invalid` too, whatever it was, and so does every payload recorded later on an
+///   `Invalid` one: a payload on an invalid parent is invalid.
+/// - The `latestValidHash` of an `Invalid` sets a boundary ("How to apply `latestValidHash`
+///   when payload status is `INVALID`"). The walk goes up the recorded `Optimistic` ancestors,
+///   and passes those that are `Invalid` already (an earlier walk of the same boundary can have
+///   made them `Invalid`). For a hash, if the next hash up is the `latestValidHash`, every
+///   payload of the walk is `Invalid` (with its descendants), and the `latestValidHash` payload
+///   and its `Optimistic` ancestors are `Valid`. For the zero hash, every `Optimistic` ancestor
+///   of the walk is `Invalid`. For `null`, or a hash whose walk stops at a `Valid` payload, only
+///   the payload is. A walk that stops at a payload that is not recorded waits for it, and so
+///   does a `latestValidHash` payload that is not recorded yet.
+/// - A payload recorded after its children links up with them: a `Valid` child makes it `Valid`
+///   (with its `Optimistic` ancestors), an `Invalid` one passes `Invalid` down to them, and a
+///   boundary below it that waited for it is applied again.
 /// - `NotVerified` records nothing: a payload without a status stays without one, and an
 ///   earlier status stays as it is.
+///
+/// [`ExecutionStatuses::prune_finalized`] drops what finality makes useless, and at most
+/// [`MAX_INVALID_PAYLOADS`] `Invalid` payloads are kept.
 #[derive(Debug, Default)]
 pub struct ExecutionStatuses {
     blocks: HashMap<Hash32, Entry>,
+    /// The recorded payloads on each parent hash, recorded or not, in the order they came.
+    children: HashMap<Hash32, Vec<Hash32>>,
+    /// The `Invalid` payloads by the order they became `Invalid`: the first goes first.
+    invalid: BTreeMap<u64, Hash32>,
+    /// The order the next `Invalid` payload takes.
+    next_order: u64,
 }
 
 impl ExecutionStatuses {
@@ -185,42 +278,283 @@ impl ExecutionStatuses {
         parent_hash: Hash32,
         verdict: &ElVerdict,
     ) -> Option<ExecutionStatus> {
-        let new = match verdict {
-            ElVerdict::Valid => ExecutionStatus::Valid,
-            ElVerdict::Optimistic => ExecutionStatus::Optimistic,
-            ElVerdict::Invalid { .. } => ExecutionStatus::Invalid,
-            ElVerdict::NotVerified(_) => return self.status(&block_hash),
-        };
-        let entry = self.blocks.entry(block_hash).or_insert(Entry {
-            status: new,
-            parent_hash,
-        });
-        entry.status = match (entry.status, new) {
-            (ExecutionStatus::Invalid, _) | (_, ExecutionStatus::Invalid) => {
-                ExecutionStatus::Invalid
-            }
-            (ExecutionStatus::Valid, _) | (_, ExecutionStatus::Valid) => ExecutionStatus::Valid,
-            (ExecutionStatus::Optimistic, ExecutionStatus::Optimistic) => {
-                ExecutionStatus::Optimistic
-            }
-        };
-        let (status, mut ancestor) = (entry.status, entry.parent_hash);
-        if status == ExecutionStatus::Valid {
-            // Each step turns one Optimistic entry Valid, so the walk ends.
-            while let Some(entry) = self.blocks.get_mut(&ancestor) {
-                if entry.status != ExecutionStatus::Optimistic {
-                    break;
-                }
-                entry.status = ExecutionStatus::Valid;
-                ancestor = entry.parent_hash;
-            }
+        if let ElVerdict::NotVerified(_) = verdict {
+            return self.status(&block_hash);
         }
-        Some(status)
+        let new = !self.blocks.contains_key(&block_hash);
+        if new {
+            self.blocks.insert(
+                block_hash,
+                Entry {
+                    state: State::Optimistic,
+                    parent_hash,
+                },
+            );
+            self.children
+                .entry(parent_hash)
+                .or_default()
+                .push(block_hash);
+        }
+        match verdict {
+            ElVerdict::Valid => self.make_valid(block_hash),
+            ElVerdict::Invalid { latest_valid_hash } => {
+                self.invalidate(block_hash);
+                self.apply_boundary(block_hash, *latest_valid_hash);
+            }
+            ElVerdict::Optimistic | ElVerdict::NotVerified(_) => {}
+        }
+        if new {
+            self.link(block_hash, parent_hash);
+        }
+        self.evict_past_bound();
+        self.status(&block_hash)
     }
 
     /// The status of the payload `block_hash`, `None` if it has none.
     #[must_use]
     pub fn status(&self, block_hash: &Hash32) -> Option<ExecutionStatus> {
-        self.blocks.get(block_hash).map(|entry| entry.status)
+        self.blocks
+            .get(block_hash)
+            .map(|entry| entry.state.status())
+    }
+
+    /// The table's import gate: [`ElVerdict::permits_payload_import`], and neither the payload
+    /// `block_hash` nor its execution parent `parent_hash` is recorded `Invalid`
+    /// (`bellatrix/optimistic-sync.md`: the parent MUST NOT have an `INVALIDATED` payload). An
+    /// execution parent with no status does not refuse it. Like the verdict's gate, this is only
+    /// the EL verdict gate, not the rest of the envelope's verification.
+    #[must_use]
+    pub fn permits_payload_import(
+        &self,
+        block_hash: &Hash32,
+        parent_hash: &Hash32,
+        verdict: &ElVerdict,
+    ) -> bool {
+        let invalid = |hash| self.status(hash) == Some(ExecutionStatus::Invalid);
+        verdict.permits_payload_import() && !invalid(block_hash) && !invalid(parent_hash)
+    }
+
+    /// Drops what finality at the payload `finalized` makes useless: `finalized` and every
+    /// recorded ancestor of it, and every payload that descends from one of those ancestors but
+    /// not from `finalized` (a fork that can no longer become canonical). Keeps the descendants
+    /// of `finalized` and the payloads whose ancestry is not recorded. Returns how many payloads
+    /// it dropped: none if `finalized` is not recorded.
+    pub fn prune_finalized(&mut self, finalized: &Hash32) -> usize {
+        let mut seen = HashSet::new();
+        let mut doomed = Vec::new();
+        let mut at = *finalized;
+        while let Some(entry) = self.blocks.get(&at) {
+            if !seen.insert(at) {
+                break;
+            }
+            doomed.push(at);
+            at = entry.parent_hash;
+        }
+        // The forks off the ancestors; the chain itself is already in `seen`.
+        let mut forks: VecDeque<Hash32> = doomed
+            .iter()
+            .skip(1)
+            .filter_map(|ancestor| self.children.get(ancestor))
+            .flatten()
+            .copied()
+            .collect();
+        while let Some(hash) = forks.pop_front() {
+            if !seen.insert(hash) {
+                continue;
+            }
+            doomed.push(hash);
+            if let Some(children) = self.children.get(&hash) {
+                forks.extend(children.iter().copied());
+            }
+        }
+        for hash in &doomed {
+            self.remove(hash);
+        }
+        doomed.len()
+    }
+
+    /// How many payloads have a status.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Whether no payload has a status.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    /// `hash`, unless it is `Invalid`, and every `Optimistic` ancestor become `Valid`.
+    fn make_valid(&mut self, hash: Hash32) {
+        let Some(entry) = self.blocks.get_mut(&hash) else {
+            return;
+        };
+        if let State::Invalid { .. } = entry.state {
+            return;
+        }
+        entry.state = State::Valid;
+        let mut ancestor = entry.parent_hash;
+        // Each step turns one Optimistic entry Valid, so the walk ends.
+        while let Some(entry) = self.blocks.get_mut(&ancestor) {
+            if !matches!(entry.state, State::Optimistic) {
+                break;
+            }
+            entry.state = State::Valid;
+            ancestor = entry.parent_hash;
+        }
+    }
+
+    /// `hash` and every recorded descendant become `Invalid`, whatever they were. A payload that
+    /// is `Invalid` already has only `Invalid` descendants, so the walk does not go past it.
+    fn invalidate(&mut self, hash: Hash32) {
+        let mut queue = VecDeque::from([hash]);
+        while let Some(at) = queue.pop_front() {
+            let Some(entry) = self.blocks.get_mut(&at) else {
+                continue;
+            };
+            if let State::Invalid { .. } = entry.state {
+                continue;
+            }
+            entry.state = State::Invalid {
+                order: self.next_order,
+                pending: None,
+            };
+            self.invalid.insert(self.next_order, at);
+            self.next_order += 1;
+            if let Some(children) = self.children.get(&at) {
+                queue.extend(children.iter().copied());
+            }
+        }
+    }
+
+    /// Applies `latest_valid_hash`, the boundary of an `INVALID` for the payload `hash` (see the
+    /// type docs).
+    fn apply_boundary(&mut self, hash: Hash32, latest_valid_hash: Option<Hash32>) {
+        let Some(boundary) = latest_valid_hash else {
+            return;
+        };
+        let Some(entry) = self.blocks.get(&hash) else {
+            return;
+        };
+        let zero = boundary == Hash32::ZERO;
+        // The recorded Optimistic ancestors, nearest first.
+        let mut walked = Vec::new();
+        let mut seen = HashSet::new();
+        let mut at = entry.parent_hash;
+        let end = loop {
+            if !zero && at == boundary {
+                break Walk::Found;
+            }
+            match self.blocks.get(&at) {
+                // An Invalid ancestor is passed, not walked: it can be Invalid from an earlier
+                // walk of this boundary, and the boundary can be above it.
+                Some(entry) if !matches!(entry.state, State::Valid) && seen.insert(at) => {
+                    if let State::Optimistic = entry.state {
+                        walked.push(at);
+                    }
+                    at = entry.parent_hash;
+                }
+                Some(_) => break Walk::Stopped,
+                None => break Walk::Missing,
+            }
+        };
+        if zero || end == Walk::Found {
+            // The topmost payload of the walk is the first invalid one, and the rest descend
+            // from it.
+            if let Some(&first) = walked.last() {
+                self.invalidate(first);
+            }
+        }
+        if end == Walk::Found {
+            self.make_valid(boundary);
+        }
+        // The boundary waits for a payload that is not recorded: the one that ended the walk, or
+        // the `latestValidHash` payload, which becomes Valid when it is recorded.
+        let waits = match end {
+            Walk::Missing => true,
+            Walk::Found => !self.blocks.contains_key(&boundary),
+            Walk::Stopped => false,
+        };
+        if let Some(Entry {
+            state: State::Invalid { pending, .. },
+            ..
+        }) = self.blocks.get_mut(&hash)
+        {
+            *pending = waits.then_some(boundary);
+        }
+    }
+
+    /// Links the payload `hash`, recorded for the first time, with what was recorded before
+    /// it: its parent, its children, and the boundaries below it that waited for it.
+    fn link(&mut self, hash: Hash32, parent_hash: Hash32) {
+        if self.status(&parent_hash) == Some(ExecutionStatus::Invalid) {
+            self.invalidate(hash);
+        }
+        let Some(children) = self.children.get(&hash) else {
+            return;
+        };
+        if children
+            .iter()
+            .any(|child| self.status(child) == Some(ExecutionStatus::Valid))
+        {
+            self.make_valid(hash);
+        }
+        for (waiting, boundary) in self.waiting_below(hash) {
+            self.apply_boundary(waiting, Some(boundary));
+        }
+    }
+
+    /// The `Invalid` payloads below `hash` whose boundary waits, with that boundary.
+    fn waiting_below(&self, hash: Hash32) -> Vec<(Hash32, Hash32)> {
+        let mut waiting = Vec::new();
+        let mut seen = HashSet::from([hash]);
+        let mut queue = VecDeque::from([hash]);
+        while let Some(at) = queue.pop_front() {
+            for &child in self.children.get(&at).into_iter().flatten() {
+                if !seen.insert(child) {
+                    continue;
+                }
+                if let Some(Entry {
+                    state:
+                        State::Invalid {
+                            pending: Some(boundary),
+                            ..
+                        },
+                    ..
+                }) = self.blocks.get(&child)
+                {
+                    waiting.push((child, *boundary));
+                }
+                queue.push_back(child);
+            }
+        }
+        waiting
+    }
+
+    /// Drops the oldest `Invalid` payloads past [`MAX_INVALID_PAYLOADS`].
+    fn evict_past_bound(&mut self) {
+        while self.invalid.len() > MAX_INVALID_PAYLOADS {
+            let Some((_, hash)) = self.invalid.pop_first() else {
+                break;
+            };
+            self.remove(&hash);
+        }
+    }
+
+    /// Drops the payload `hash` from the table and its indexes. Its children keep their status.
+    fn remove(&mut self, hash: &Hash32) {
+        let Some(entry) = self.blocks.remove(hash) else {
+            return;
+        };
+        if let State::Invalid { order, .. } = entry.state {
+            self.invalid.remove(&order);
+        }
+        if let Some(siblings) = self.children.get_mut(&entry.parent_hash) {
+            siblings.retain(|child| child != hash);
+            if siblings.is_empty() {
+                self.children.remove(&entry.parent_hash);
+            }
+        }
     }
 }

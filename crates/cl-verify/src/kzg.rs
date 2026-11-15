@@ -5,9 +5,11 @@
 //! `v1.7.0-beta.4` mainnet setup; any other file is refused before it is parsed. The digest is
 //! fixed here, not configurable. cl-verify has no c-kzg dependency and no loader of its own.
 //!
-//! A request is verified by column ([`verify_columns`]): its cells go to c-kzg's
-//! `verify_cell_kzg_proof_batch` in one call, and only a batch that fails is bisected by column
-//! to name the invalid ones. The RPC answer stays one batch status ([`verify_cells`]).
+//! The RPC answer is one batch status ([`verify_cells`]): every cell of the request goes to
+//! c-kzg's `verify_cell_kzg_proof_batch` in one call, and a batch that fails is `INVALID` with no
+//! further call. Naming the invalid columns is a separate, costlier path ([`verify_columns`]):
+//! only a batch that fails is bisected by column, at most `2n - 1` calls for `n` columns (255 for
+//! 128 columns that all fail).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -197,8 +199,8 @@ pub struct ColumnResult {
 /// A column with a malformed cell (see [`prepare_cells`]) is `DecodeError` and is not verified.
 /// The cells of the other columns go to the backend as one batch. Only if it returns false are
 /// those columns bisected, re-verifying halves of whole columns until every invalid column is
-/// named. A backend error at any step is returned as is, with no column verdict. The column cap
-/// is the caller's ([`crate::caps::check_kzg`]).
+/// named: at most `2n - 1` backend calls for `n` columns. A backend error at any step is returned
+/// as is, with no column verdict. The column cap is the caller's ([`crate::caps::check_kzg`]).
 pub fn verify_columns(
     cells: &[KzgCellProof],
     backend: &dyn KzgBackend,
@@ -292,39 +294,35 @@ fn bisect<E>(
     bisect(mid, to, verify, valid)
 }
 
-/// Batch verdict for `cells`: VALID only if every column is ([`verify_columns`]), `INVALID` if
-/// one is not, `DECODE_ERROR` with no KZG work if any cell is malformed. An `Error` is returned
-/// only when there is no verdict; its status is then `OVERLOADED` (core unavailable), never
-/// VALID. The server refuses an empty request before it gets here (see
+/// Batch verdict for `cells`, from one backend call over every cell: VALID if the batch
+/// verifies, `INVALID` if it does not, `DECODE_ERROR` with no KZG work if any cell is malformed.
+/// A failing batch is not bisected, so no column is named ([`verify_columns`] names them). An
+/// `Error` is returned only when there is no verdict; its status is then `OVERLOADED` (core
+/// unavailable), never VALID. The server refuses an empty request before it gets here (see
 /// [`crate::caps::check_kzg`]).
 pub fn verify_cells(
     cells: &[KzgCellProof],
     backend: &dyn KzgBackend,
 ) -> (VerifyStatus, Option<Error>) {
-    match batch_status(cells, backend, || Ok::<(), KzgFailure>(())) {
+    match batch_status(cells, backend) {
         Ok(status) => (status, None),
         Err(failure) => no_verdict(failure),
     }
 }
 
-/// [`verify_cells`]'s status, calling `step` before each bisect batch.
-fn batch_status<E: From<KzgFailure>>(
+/// [`verify_cells`]'s status: one backend call, never a bisect.
+fn batch_status(
     cells: &[KzgCellProof],
     backend: &dyn KzgBackend,
-    step: impl FnMut() -> Result<(), E>,
-) -> Result<VerifyStatus, E> {
+) -> Result<VerifyStatus, KzgFailure> {
     if !cells.iter().all(well_formed) {
         return Ok(VerifyStatus::DecodeError);
     }
-    let invalid: Vec<u64> = attribute(cells, backend, step)?
-        .into_iter()
-        .filter(|c| c.verdict != ColumnVerdict::Valid)
-        .map(|c| c.cell_index)
-        .collect();
-    if invalid.is_empty() {
+    let batch = decode(cells.iter(), cells.len()).map_err(|_| KzgFailure::BadInput)?;
+    if backend.verify(&batch)? {
         return Ok(VerifyStatus::Valid);
     }
-    tracing::debug!(?invalid, "KZG columns failed verification");
+    tracing::debug!(cells = cells.len(), "KZG batch failed verification");
     Ok(VerifyStatus::Invalid)
 }
 
@@ -351,8 +349,9 @@ impl From<KzgFailure> for Halt {
 /// [`verify_cells`] for a job admitted with `deadline`, run on a blocking thread: `None` if its
 /// stream closed before it ran (nothing is answered), `DEADLINE_EXCEEDED` with no KZG work if the
 /// deadline is no longer open on both clocks (the job may have waited for a thread past it, and a
-/// wall clock that steps backwards cannot reopen it). Both are checked again before each bisect
-/// batch, so a failed batch is not bisected past the deadline or for a closed stream.
+/// wall clock that steps backwards cannot reopen it). Both are checked again once the one batch
+/// call returns, so a verdict reached past the deadline is `DEADLINE_EXCEEDED` and one for a
+/// closed stream is not answered.
 pub fn verify_cells_gated(
     cells: &[KzgCellProof],
     deadline: &Deadline,
@@ -369,7 +368,13 @@ pub fn verify_cells_gated(
             Err(Halt::Late)
         }
     };
-    match gate().and_then(|()| batch_status(cells, backend, gate)) {
+    let run = || -> Result<VerifyStatus, Halt> {
+        gate()?;
+        let status = batch_status(cells, backend)?;
+        gate()?;
+        Ok(status)
+    };
+    match run() {
         Ok(status) => Some((status, None)),
         Err(Halt::Failed(failure)) => Some(no_verdict(failure)),
         Err(Halt::Closed) => None,
@@ -650,6 +655,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// In the bisect of the naming path, a backend error is no verdict. The aggregate status
+    /// takes one call, so the same backend gives it `INVALID` and is not asked again.
     #[test]
     fn a_backend_error_in_the_bisect_is_no_verdict() {
         /// The whole batch fails; every later call fails inside the library.
@@ -668,9 +675,12 @@ pub(crate) mod tests {
             verify_columns(&cells, &FailsThenBreaks::default()),
             Err(KzgFailure::Internal("c-kzg malloc".into()))
         );
-        let (status, err) = verify_cells(&cells, &FailsThenBreaks::default());
-        assert_eq!(status, VerifyStatus::Overloaded);
-        assert_eq!(err.unwrap().code(), ErrorCode::ResourceUnavailable);
+        let backend = FailsThenBreaks::default();
+        assert_eq!(
+            verify_cells(&cells, &backend),
+            (VerifyStatus::Invalid, None)
+        );
+        assert_eq!(backend.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// Fails every batch. Its first call steps the wall clock past the deadline or closes the
@@ -694,8 +704,10 @@ pub(crate) mod tests {
         }
     }
 
+    /// The deadline passes or the stream closes while the first batch runs: the gated status
+    /// gives no verdict, and no KZG work follows.
     #[test]
-    fn the_bisect_stops_once_the_deadline_passes_or_the_stream_closes() {
+    fn a_batch_that_ends_late_or_after_close_gives_no_verdict() {
         let cells: Vec<_> = (0..16).map(cell).collect();
         for close in [false, true] {
             let backend = FailsAndStops {
@@ -714,6 +726,135 @@ pub(crate) mod tests {
                 1,
                 "no KZG work after the first batch"
             );
+        }
+    }
+
+    /// The aggregate status does not name columns. A request whose 128 columns all fail is one
+    /// backend call, not the 255 calls of a full bisect. So is a request with one failing
+    /// column, and so is the gated path the server runs.
+    #[test]
+    fn an_aggregate_status_is_one_backend_call() {
+        let cells: Vec<_> = (0..128).map(cell).collect();
+        for bad in [(0..128).collect::<Vec<u64>>(), vec![77]] {
+            let backend = BadColumns::new(bad.iter().copied());
+            assert_eq!(
+                verify_cells(&cells, &backend),
+                (VerifyStatus::Invalid, None)
+            );
+            assert_eq!(
+                backend.calls().len(),
+                1,
+                "{} failing columns: one batch call",
+                bad.len()
+            );
+        }
+        let clock = Manual(std::sync::atomic::AtomicU64::new(1_000));
+        let deadline = Deadline::new(60_000, &clock).unwrap();
+        let open = AtomicBool::new(false);
+        let backend = BadColumns::new(0..128);
+        assert_eq!(
+            verify_cells_gated(&cells, &deadline, &open, &clock, &backend),
+            Some((VerifyStatus::Invalid, None))
+        );
+        assert_eq!(backend.calls().len(), 1, "gated: one batch call");
+    }
+
+    /// The naming path keeps full attribution: it names every failing column. When all 128
+    /// columns fail, that is 255 backend calls (the worst case). A smaller mixed request names
+    /// each failing column and no other.
+    #[test]
+    fn verify_columns_names_every_failing_column() {
+        let all: Vec<u64> = (0..128).collect();
+        let cells: Vec<_> = all.iter().copied().map(cell).collect();
+        let backend = BadColumns::new(all.iter().copied());
+        assert_eq!(
+            verify_columns(&cells, &backend),
+            Ok(results(all.iter().copied(), &all))
+        );
+        assert_eq!(backend.calls().len(), 255);
+
+        // Twelve columns of two blobs each; four of them fail.
+        let cells: Vec<_> = (0..12).chain(0..12).map(cell).collect();
+        let bad = [1, 6, 7, 11];
+        let backend = BadColumns::new(bad);
+        assert_eq!(verify_columns(&cells, &backend), Ok(results(0..12, &bad)));
+    }
+
+    /// Fails every batch that holds a cell of a `bad` column, and records each batch. When it
+    /// is asked about a batch that is one bad column, which the bisect names next, it steps the
+    /// wall clock past the deadline or closes the stream.
+    struct StopsAtTheFirstNamedColumn {
+        bad: Vec<u64>,
+        clock: std::sync::Arc<Manual>,
+        closed: std::sync::Arc<AtomicBool>,
+        close: bool,
+        calls: std::sync::Mutex<Vec<Vec<u64>>>,
+    }
+
+    impl KzgBackend for StopsAtTheFirstNamedColumn {
+        fn verify(&self, c: &PreparedCells) -> Result<bool, KzgFailure> {
+            let indices = c.cell_indices();
+            self.calls.lock().unwrap().push(indices.to_vec());
+            let fails = indices.iter().any(|i| self.bad.contains(i));
+            let one_column = indices.iter().all(|i| *i == indices[0]);
+            if fails && one_column {
+                if self.close {
+                    self.closed.store(true, Ordering::SeqCst);
+                } else {
+                    self.clock.0.store(u64::MAX, Ordering::SeqCst);
+                }
+            }
+            Ok(!fails)
+        }
+    }
+
+    /// A gated bisect runs several sub-batches deep and names its first failing column. Then
+    /// the deadline passes or the stream closes: the next step stops the bisect. No backend
+    /// call follows, and the result is the halt, not a partial list of column verdicts.
+    #[test]
+    fn a_gated_bisect_stops_after_the_first_named_column() {
+        // Sixteen columns of two blobs each; columns 0 and 9 fail.
+        let cells: Vec<_> = (0..16).chain(0..16).map(cell).collect();
+        for close in [false, true] {
+            let backend = StopsAtTheFirstNamedColumn {
+                bad: vec![0, 9],
+                clock: std::sync::Arc::new(Manual(std::sync::atomic::AtomicU64::new(1_000))),
+                closed: std::sync::Arc::default(),
+                close,
+                calls: std::sync::Mutex::default(),
+            };
+            let (clock, closed) = (backend.clock.as_ref(), backend.closed.as_ref());
+            let deadline = Deadline::new(60_000, clock).unwrap();
+            // The gate of the gated entry points: closed first, then the deadline.
+            let gate = || {
+                if closed.load(Ordering::SeqCst) {
+                    Err(Halt::Closed)
+                } else if deadline.open(clock) {
+                    Ok(())
+                } else {
+                    Err(Halt::Late)
+                }
+            };
+            let got = attribute(&cells, &backend, gate);
+            if close {
+                assert!(matches!(got, Err(Halt::Closed)), "close: the bisect halts");
+            } else {
+                assert!(matches!(got, Err(Halt::Late)), "deadline: the bisect halts");
+            }
+            let calls = backend.calls.lock().unwrap().clone();
+            // The whole request, then columns 0..8, 0..4, 0..2 and column 0 alone, each batch
+            // with the two cells of a column side by side.
+            let want: Vec<Vec<u64>> = [8, 4, 2, 1]
+                .into_iter()
+                .map(|n| (0..n).flat_map(|c| [c, c]).collect())
+                .collect();
+            assert_eq!(
+                calls.len(),
+                5,
+                "close: {close}: no backend call after the stop"
+            );
+            assert_eq!(calls[0].len(), 32, "close: {close}");
+            assert_eq!(calls[1..], want[..], "close: {close}");
         }
     }
 

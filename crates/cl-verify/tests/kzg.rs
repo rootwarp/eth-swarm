@@ -1,7 +1,8 @@
-//! kzg: VerifyKzg as per-column batch verification over the pinned trusted setup. A request's
-//! cells are flattened into one `verify_cell_kzg_proof_batch` call; only a batch that fails is
-//! bisected by column (the cells that share a `cell_index`), so the invalid column is named. A
-//! request over 128 columns or 8 MiB is refused before any KZG work.
+//! kzg: VerifyKzg as batch verification over the pinned trusted setup. A request's cells go to
+//! one `verify_cell_kzg_proof_batch` call, and the answer is that batch's status. The naming path
+//! (`verify_columns`) bisects a batch that fails by column (the cells that share a `cell_index`),
+//! so each invalid column is named. A request over 128 columns or 8 MiB is refused before any KZG
+//! work.
 
 mod common;
 
@@ -152,8 +153,35 @@ async fn over_128_refused() {
     assert_eq!(h.server.contract_violations(), 1);
 }
 
+/// A request whose 128 columns all fail gets one INVALID status from one backend call: the
+/// aggregate answer does not bisect to name the columns.
+#[tokio::test]
+async fn all_invalid_128_columns_is_one_backend_call() {
+    let (mut h, backend) = recorded().await;
+    let mut s = kzg_open(&mut h).await;
+    let cells: Vec<KzgCellProof> = (0..MAX_KZG_COLUMNS as u64)
+        .map(|cell_index| {
+            let mut cell = zero_cell(cell_index);
+            // Not the zero polynomial's cell: the proof at infinity does not open it.
+            cell.cell[31] = 1;
+            cell
+        })
+        .collect();
+    s.send(kzg_body(kzg_cells_request(1, cells))).await;
+    let r = kzg_reply(&mut s).await;
+    assert_eq!((r.request_id, r.status), (1, VerifyStatus::Invalid as i32));
+    let calls = backend.calls();
+    assert_eq!(calls.len(), 1, "one batch call, no bisect");
+    assert_eq!(calls[0].len(), MAX_KZG_COLUMNS);
+}
+
 #[tokio::test]
 async fn over_8mib_refused() {
+    assert_eq!(
+        MAX_KZG_MESSAGE_BYTES,
+        8 * 1024 * 1024,
+        "the KZG cap is 8 MiB"
+    );
     let (mut h, backend) = recorded().await;
     let mut s = kzg_open(&mut h).await;
     let at_cap = kzg_request_of_size(1, MAX_KZG_MESSAGE_BYTES, s.generation);
