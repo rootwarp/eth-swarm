@@ -4,9 +4,11 @@
 //! [`EngineEndpoint::parse`] is given the operator opt-out. Response bodies are capped and every
 //! call has a timeout. A reconnect bumps the connection generation; a body that arrives for an
 //! earlier generation is dropped and never returned. JSON-RPC `-38005` is
-//! [`CallError::UnsupportedFork`] and is never retried with another method version.
+//! [`CallError::UnsupportedFork`] and is never retried with another method version. A reply
+//! whose `jsonrpc` is not `"2.0"` is [`CallError::BadResponse`].
 //! [`Session::el_offline`] reports an EL that refuses connections or has not answered for
-//! [`Config::el_offline_after`].
+//! [`Config::el_offline_after`]. Each reach update carries the generation it came from, and an
+//! update of a replaced generation is dropped.
 
 use crate::capabilities::{self, MissingCaps, ADVERTISED};
 use crate::jwt::{self, JwtSecret};
@@ -54,6 +56,8 @@ pub const DIAL_TIMEOUT: Duration = Duration::from_secs(1);
 pub const EL_OFFLINE_AFTER: Duration = Duration::from_secs(30);
 /// JSON-RPC "Unsupported fork" (`common.md`, errors).
 const UNSUPPORTED_FORK: i64 = -38005;
+/// The `jsonrpc` member of every request and of every response this client accepts (JSON-RPC 2.0).
+const JSONRPC_VERSION: &str = "2.0";
 
 /// Where `now` comes from. A test clock makes two requests carry different `iat` values
 /// without sleeping.
@@ -341,7 +345,8 @@ pub enum CallError {
     /// There is no connection.
     #[error("engine is not connected")]
     NotConnected,
-    /// JSON-RPC was missing, or `id` did not match.
+    /// Not a JSON-RPC 2.0 response to this call: the body is not JSON, `jsonrpc` is not the
+    /// string `"2.0"`, `id` is not this call's, or there is neither a `result` nor an `error`.
     #[error("engine response is not a JSON-RPC result for this call")]
     BadResponse,
     /// The EL answered JSON-RPC `-38005`: the method version is not the one for the fork.
@@ -414,7 +419,9 @@ struct Inner {
     rpc_id: AtomicU64,
     late_dropped: AtomicU64,
     el_offline_after: Duration,
-    /// What [`Session::el_offline`] reads. Taken alone, never while another lock is held.
+    /// What [`Session::el_offline`] reads. Taken alone, never while another lock is held, and
+    /// never across an `.await`. Written only by an update of the current generation
+    /// ([`Session::reach`]).
     reach: Mutex<Reach>,
     slot: Mutex<Option<Slot>>,
     /// The methods the EL listed in the capability exchange of the installed connection.
@@ -432,10 +439,11 @@ struct Inner {
 /// Whether the EL answered lately.
 #[derive(Clone, Copy)]
 enum Reach {
-    /// A call on the current generation, or the capability exchange that installed it,
-    /// succeeded at this instant.
+    /// A call, or the capability exchange that installed its connection, succeeded at this
+    /// instant, on the generation that was current then.
     Answered(Instant),
-    /// The last dial was refused.
+    /// A dial for the generation that was current then was refused, and nothing has succeeded
+    /// since.
     Refused,
 }
 
@@ -496,9 +504,9 @@ impl Session {
                 answer_gate: Mutex::new(None),
             }),
         };
-        let (sender, listed) = session.dial_and_check().await?;
+        let (sender, listed) = session.dial_and_check(1).await?;
         session.install(1, sender, listed);
-        session.answered();
+        session.answered(1);
         Ok(session)
     }
 
@@ -583,7 +591,7 @@ impl Session {
                 if other.is_ok() {
                     #[cfg(test)]
                     tests::pass(&self.inner.answer_gate).await;
-                    self.answered();
+                    self.answered(generation);
                 }
                 other
             }
@@ -617,12 +625,12 @@ impl Session {
                 return Err(StartError::Unavailable);
             }
             attempt += 1;
-            match self.dial_and_check().await {
+            match self.dial_and_check(new_gen).await {
                 Ok((sender, listed)) => {
                     #[cfg(test)]
                     self.install_gate(new_gen).await;
                     if self.install(new_gen, sender, listed) {
-                        self.answered();
+                        self.answered(new_gen);
                         tracing::info!(generation = new_gen, "engine reconnected");
                     }
                     return Ok(());
@@ -651,30 +659,61 @@ impl Session {
         self.inner.late_dropped.load(Ordering::Relaxed)
     }
 
-    /// Whether the EL counts as offline: its last dial was refused, or nothing on the current
-    /// generation (a call, or the capability exchange that installed it) has succeeded for
-    /// [`Config::el_offline_after`], measured on the Tokio clock. The next success clears it.
-    /// cl-chain reports it as `SyncStatus.el_offline`; [`health_status`] is the health code.
+    /// Whether the EL counts as offline: a dial for the current generation was refused, or no
+    /// call (or the capability exchange that installed a connection) has succeeded for
+    /// [`Config::el_offline_after`], measured on the Tokio clock. Only a success on the current
+    /// generation clears it. A JSON-RPC error, an HTTP error status and HTTP 401 are not a
+    /// success: they neither clear the flag nor restart the window. An update from a generation
+    /// that a reconnect has replaced is dropped, so a late success cannot clear the flag and a
+    /// refused dial that a newer reconnect overtook cannot set it.
+    ///
+    /// Nothing outside this crate reads the flag yet. No engine.v1 field carries it, and
+    /// cl-chain's `ImportService.GetChainStatus` is still a stub, so `SyncStatus.el_offline` is
+    /// not set from it. When a `SyncStatus` with `el_offline` set reaches cl-api, cl-api answers
+    /// `node/health` with 206; [`health_status`] gives the same code from this flag alone.
     #[must_use]
     pub fn el_offline(&self) -> bool {
         let reach = *lock(&self.inner.reach);
         reach.offline(Instant::now(), self.inner.el_offline_after)
     }
 
-    /// Something on the current generation succeeded.
-    fn answered(&self) {
+    /// A call on `generation`, or the capability exchange that installed it, succeeded.
+    fn answered(&self, generation: u64) {
         let now = Instant::now();
-        let was = std::mem::replace(&mut *lock(&self.inner.reach), Reach::Answered(now));
+        let Some(was) = self.reach(generation, Reach::Answered(now)) else {
+            return;
+        };
         if was.offline(now, self.inner.el_offline_after) {
-            tracing::info!(el_offline = false, "engine answered");
+            tracing::info!(el_offline = false, generation, "engine answered");
         }
     }
 
-    fn refused(&self) {
-        let was = std::mem::replace(&mut *lock(&self.inner.reach), Reach::Refused);
+    /// A dial for `generation` was refused.
+    fn refused(&self, generation: u64) {
+        let Some(was) = self.reach(generation, Reach::Refused) else {
+            return;
+        };
         if !matches!(was, Reach::Refused) {
-            tracing::warn!(el_offline = true, "engine connection refused");
+            tracing::warn!(el_offline = true, generation, "engine connection refused");
         }
+    }
+
+    /// Sets the reach state to `update` and returns the state before, if `generation` is the
+    /// current generation; else drops the update and returns `None`. The check and the write
+    /// happen under the reach lock and the generation never decreases, so an update of a
+    /// replaced generation never lands after an update of a newer one.
+    fn reach(&self, generation: u64, update: Reach) -> Option<Reach> {
+        let mut reach = lock(&self.inner.reach);
+        let current = self.generation();
+        if current != generation {
+            tracing::debug!(
+                generation,
+                current,
+                "engine reach update of a replaced generation dropped"
+            );
+            return None;
+        }
+        Some(std::mem::replace(&mut *reach, update))
     }
 
     /// Whether a connection of the current generation is installed. When this is `false`, the
@@ -735,8 +774,11 @@ impl Session {
         }
     }
 
+    /// Dials for `generation` and runs the capability exchange. A refused dial updates the reach
+    /// state for `generation`.
     async fn dial_and_check(
         &self,
+        generation: u64,
     ) -> Result<(SendRequest<Full<Bytes>>, Arc<[String]>), StartError> {
         let addr = self
             .inner
@@ -760,7 +802,7 @@ impl Session {
                 if err.kind() == std::io::ErrorKind::ConnectionRefused {
                     #[cfg(test)]
                     tests::pass(&self.inner.refuse_gate).await;
-                    self.refused();
+                    self.refused(generation);
                 }
                 return Err(StartError::Transport);
             }
@@ -811,7 +853,7 @@ impl Session {
             return Err(CallError::Transport);
         }
         let body = serde_json::to_vec(&serde_json::json!({
-            "jsonrpc": "2.0",
+            "jsonrpc": JSONRPC_VERSION,
             "id": id,
             "method": method,
             "params": params,
@@ -870,8 +912,9 @@ impl Session {
 }
 
 /// The beacon `node/health` code the engine's state implies on its own: 206 while the EL is
-/// offline ([`Session::el_offline`]), else 200. cl-api also answers 206 while syncing or
-/// optimistic.
+/// offline ([`Session::el_offline`]), else 200. No production code calls it yet (see
+/// [`Session::el_offline`]). cl-api computes its own answer from the `SyncStatus` it polls:
+/// 206 while syncing, optimistic or `el_offline`.
 #[must_use]
 pub fn health_status(el_offline: bool) -> StatusCode {
     if el_offline {
@@ -887,8 +930,14 @@ fn content_length(headers: &http::HeaderMap) -> Option<usize> {
     usize::try_from(parsed).ok()
 }
 
+/// The `result` of the JSON-RPC 2.0 response to request `id`. `jsonrpc` must be the string
+/// `"2.0"` and `id` must be `id`, also when the body carries an `error`; anything else is
+/// [`CallError::BadResponse`].
 fn decode_rpc(id: u64, bytes: &[u8]) -> Result<Value, CallError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| CallError::BadResponse)?;
+    if value.get("jsonrpc").and_then(Value::as_str) != Some(JSONRPC_VERSION) {
+        return Err(CallError::BadResponse);
+    }
     let got = value.get("id").and_then(Value::as_u64);
     if got != Some(id) {
         return Err(CallError::BadResponse);
