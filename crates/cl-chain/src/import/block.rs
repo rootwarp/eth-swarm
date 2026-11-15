@@ -21,11 +21,15 @@
 //! no validator that a valid block signs with (a new validator is not active yet). A builder
 //! index can take a new key: the set carries the key version of the state at the block slot,
 //! and a pre-state key of another version is no verdict.
+//!
+//! Before it returns the post-state, the import asks a [`PayloadImportGate`] about the payload
+//! bid of the block. A refusal is IGNORE. Today the core uses [`PermitAll`]; a later check of
+//! the execution status of the payload will plug in here.
 
 use crate::verify::client::BlsOutcome;
 use crate::verify::pubkey_feed::{builder_signer, BuilderFeed};
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
-use consensus_types::primitives::{BLSPubkey, Epoch, Root};
+use consensus_types::primitives::{BLSPubkey, Epoch, Hash32, Root};
 use crypto_bls::{eth_aggregate_pubkeys, PublicKey};
 use ethswarm_proto::verify::{BlsSet, KeyNamespace, Signer, VerifyOrigin};
 use network_config::ChainConfig;
@@ -34,6 +38,25 @@ use state_transition::{
     PubkeyAggregator, SignatureBackend, SignatureSet, SignerRef, StfError,
 };
 use tree_hash::TreeHash;
+
+/// Says if a block whose payload bid has these hashes may commit. The import asks it only
+/// after the transition accepted the bid (`bid.parent_block_hash == state.latest_block_hash`)
+/// and the post-state root equals `block.state_root`.
+pub trait PayloadImportGate: Send {
+    /// `true` if the block may commit. `block_hash` is `bid.block_hash`, `parent_block_hash`
+    /// is `bid.parent_block_hash`.
+    fn permits(&self, block_hash: &Hash32, parent_block_hash: &Hash32) -> bool;
+}
+
+/// The gate the core uses today: it permits each payload.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PermitAll;
+
+impl PayloadImportGate for PermitAll {
+    fn permits(&self, _block_hash: &Hash32, _parent_block_hash: &Hash32) -> bool {
+        true
+    }
+}
 
 /// The post-state of an imported block, and its roots.
 #[derive(Debug, Clone)]
@@ -61,12 +84,14 @@ pub enum NotImported {
 }
 
 /// Imports `block` on `pre`, the post-state of its parent (see the module docs). `verdict`
-/// gives one cl-verify verdict for a batch of sets, or none.
+/// gives one cl-verify verdict for a batch of sets, or none. `gate` can refuse the payload bid
+/// of the block (IGNORE).
 pub fn import_block<E: Preset>(
     pre: &BeaconState<E>,
     block: &SignedBeaconBlock<E>,
     config: &ChainConfig,
     verdict: &dyn Fn(Vec<BlsSet>) -> BlsOutcome,
+    gate: &dyn PayloadImportGate,
 ) -> Result<Imported<E>, NotImported> {
     let capella_fork_version = config
         .capella_fork_version()
@@ -96,6 +121,13 @@ pub fn import_block<E: Preset>(
             block: block.message.state_root,
             computed,
         }));
+    }
+    let bid = &block.message.body.signed_execution_payload_bid.message;
+    if !gate.permits(&bid.block_hash, &bid.parent_block_hash) {
+        return Err(NotImported::Ignored(format!(
+            "the payload gate refused payload {} on parent {}",
+            bid.block_hash, bid.parent_block_hash
+        )));
     }
     Ok(Imported {
         block_root: block.message.tree_hash_root(),

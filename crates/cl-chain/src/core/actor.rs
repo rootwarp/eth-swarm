@@ -13,13 +13,15 @@
 //! if not set): no verdict by then is IGNORE. The core commits only on a VALID verdict and a
 //! post-state root equal to `block.state_root`: it keeps the post-state as a pre-state, and the
 //! block becomes the head. There is no fork choice yet, so the head is the last block the core
-//! committed. On any other outcome the head and the pre-states do not change.
+//! committed. On any other outcome the head and the pre-states do not change. The
+//! [`PayloadImportGate`] of [`ChainCore::with_payload_gate`] ([`PermitAll`] if not set) can
+//! refuse a block that would commit: that is IGNORE.
 //!
 //! Envelope import and gossip commit are queue kinds only: the core answers each such item
 //! IGNORE and changes nothing.
 
 use super::snapshot::{max_pre_states, Snapshots};
-use crate::import::block::{import_block, NotImported};
+use crate::import::block::{import_block, NotImported, PayloadImportGate, PermitAll};
 use crate::verify::client::{BlsOutcome, BlsVerifier};
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
 use consensus_types::primitives::{Root, Slot};
@@ -208,6 +210,7 @@ pub struct ChainCore<E: Preset> {
     snapshots: Snapshots<BeaconState<E>>,
     head: Head,
     verify_timeout: Duration,
+    gate: Box<dyn PayloadImportGate>,
     turns: u64,
 }
 
@@ -240,6 +243,7 @@ impl<E: Preset> ChainCore<E> {
             snapshots: Snapshots::new(head.block_root, state, max_pre_states::<E>()),
             head,
             verify_timeout: DEFAULT_VERIFY_TIMEOUT,
+            gate: Box::new(PermitAll),
             turns: 0,
         })
     }
@@ -248,6 +252,13 @@ impl<E: Preset> ChainCore<E> {
     #[must_use]
     pub fn with_verify_timeout(mut self, timeout: Duration) -> Self {
         self.verify_timeout = timeout;
+        self
+    }
+
+    /// The same core with `gate` as the payload gate of each import.
+    #[must_use]
+    pub fn with_payload_gate(mut self, gate: impl PayloadImportGate + 'static) -> Self {
+        self.gate = Box::new(gate);
         self
     }
 
@@ -314,7 +325,7 @@ impl<E: Preset> ChainCore<E> {
         };
         let timeout = self.verify_timeout;
         let verdict = |sets: Vec<BlsSet>| verify(runtime, verifier, sets, timeout);
-        match import_block(pre, block, &self.config, &verdict) {
+        match import_block(pre, block, &self.config, &verdict, self.gate.as_ref()) {
             Ok(imported) => {
                 self.head = Head {
                     block_root: imported.block_root,
