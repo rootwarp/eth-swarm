@@ -1,7 +1,8 @@
-//! kzg: VerifyKzg as per-column batch verification over the pinned trusted setup. A request's
-//! cells are flattened into one `verify_cell_kzg_proof_batch` call; only a batch that fails is
-//! bisected by column (the cells that share a `cell_index`), so the invalid column is named. A
-//! request over 128 columns or 8 MiB is refused before any KZG work.
+//! kzg: VerifyKzg as batch verification over the pinned trusted setup. A request's cells go to
+//! one `verify_cell_kzg_proof_batch` call, and the answer is that batch's status. The naming path
+//! (`verify_columns`) bisects a batch that fails by column (the cells that share a `cell_index`),
+//! so each invalid column is named. A request over 128 columns or 8 MiB is refused before any KZG
+//! work.
 
 mod common;
 
