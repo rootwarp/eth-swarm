@@ -162,7 +162,7 @@ fn forkchoice_store_starts_at_the_anchor_with_no_payloads() {
     assert!(store.checkpoint_state(&checkpoint).is_some());
     assert!(!is_payload_verified(&store, root));
     assert_eq!(store.block_timeliness(root), Some([true, true]));
-    let votes = vec![None; PTC_SIZE];
+    let votes = [None; PTC_SIZE];
     assert_eq!(store.payload_timeliness_vote(root), Some(&votes[..]));
     assert_eq!(store.payload_data_availability_vote(root), Some(&votes[..]));
 }
@@ -374,7 +374,7 @@ fn on_block_records_timeliness_and_a_late_block_gets_no_boost() {
     on_block(&mut store, &PLAIN, &block).unwrap();
     assert_eq!(store.block_timeliness(root_of(&block)), Some([false, true]));
     assert_eq!(store.proposer_boost_root(), Root::ZERO);
-    let votes = vec![None; PTC_SIZE];
+    let votes = [None; PTC_SIZE];
     assert_eq!(
         store.payload_timeliness_vote(root_of(&block)),
         Some(&votes[..])
