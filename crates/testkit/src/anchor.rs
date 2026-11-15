@@ -37,10 +37,10 @@ pub const BLOCK_FILE: &str = "block.ssz";
 /// The SSZ of the anchor state, the post-state of the block.
 pub const STATE_FILE: &str = "state.ssz";
 /// The largest `anchor.json` read.
-pub const MAX_RECORD_BYTES: u64 = 64 << 10;
+const MAX_RECORD_BYTES: u64 = 64 << 10;
 /// The largest `block.ssz` or `state.ssz` read: a mainnet-preset state with a few million
 /// validators fits.
-pub const MAX_BODY_BYTES: u64 = 2 << 30;
+const MAX_BODY_BYTES: u64 = 2 << 30;
 
 /// `anchor.json`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,7 +139,7 @@ pub enum AnchorError {
         computed: Root,
     },
     /// `hash_tree_root(state)`, `block.message.state_root` and `state_root` are not one root.
-    #[error("state root {computed} and block state_root {block} must equal the anchor state_root {anchor}")]
+    #[error("state root {computed}, block state_root {block}, anchor state_root {anchor}")]
     StateRoot {
         /// `state_root` of `anchor.json`.
         anchor: Root,
@@ -148,22 +148,11 @@ pub enum AnchorError {
         /// `hash_tree_root(state)`.
         computed: Root,
     },
-    /// The block or the state is not at the anchor slot.
-    #[error("block slot {block} and state slot {state} must equal the anchor slot {anchor}")]
-    Slot {
-        /// `slot` of `anchor.json`.
-        anchor: Slot,
-        /// `block.message.slot`.
-        block: Slot,
-        /// `state.slot`.
-        state: Slot,
-    },
 }
 
 /// An anchor that [`load_anchor`] checked. Only [`load_anchor`] makes one.
 #[derive(Debug, Clone)]
 pub struct LoadedAnchor<E: EthSpec> {
-    record: AnchorRecord,
     state: BeaconState<E>,
     block: SignedBeaconBlock<E>,
     block_root: Root,
@@ -171,11 +160,6 @@ pub struct LoadedAnchor<E: EthSpec> {
 }
 
 impl<E: EthSpec> LoadedAnchor<E> {
-    /// `anchor.json` as read.
-    pub fn record(&self) -> &AnchorRecord {
-        &self.record
-    }
-
     /// The anchor state: the post-state of [`Self::block`].
     pub fn state(&self) -> &BeaconState<E> {
         &self.state
@@ -259,15 +243,14 @@ pub fn load_anchor<E: EthSpec>(dir: &Path) -> Result<LoadedAnchor<E>, AnchorErro
             computed: state_root,
         });
     }
+    // The roots bind the state to the block; the record must name their slot.
     if block.message.slot != record.slot || state.slot != record.slot {
-        return Err(AnchorError::Slot {
-            anchor: record.slot,
-            block: block.message.slot,
-            state: state.slot,
-        });
+        return Err(AnchorError::Record(format!(
+            "slot {} is not the block slot {} and the state slot {}",
+            record.slot, block.message.slot, state.slot
+        )));
     }
     Ok(LoadedAnchor {
-        record,
         state,
         block,
         block_root,
