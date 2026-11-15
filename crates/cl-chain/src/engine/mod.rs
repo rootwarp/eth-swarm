@@ -7,7 +7,9 @@
 //!   latest value wins; and [`client::NewPayloadClient`], which sends an envelope's
 //!   `engine_newPayloadV5` params and gives the EL's verdict.
 //! - [`verdict`]: the verdict of a `PayloadStatusV1` (fail closed: never `Valid` without a
-//!   `VALID`), the envelope import gate, and the execution status of each payload. Pure.
+//!   `VALID` for the submitted payload), the EL verdict import gate, and the execution status
+//!   of each payload, with the optimistic-sync rules, pruning at finality and a bound on the
+//!   `Invalid` payloads it keeps. Pure.
 //!
 //! Nothing calls the sender on head changes, or the newPayload client on import, yet: there
 //! is no block import core and no fork choice store to call them.

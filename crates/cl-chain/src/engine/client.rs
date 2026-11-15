@@ -28,7 +28,7 @@
 
 use super::fcu::ForkchoiceArgs;
 use super::verdict::{self, ElVerdict, Reason};
-use consensus_types::gloas::{ExecutionPayloadBid, ExecutionPayloadEnvelope};
+use consensus_types::gloas::{ExecutionPayload, ExecutionPayloadBid, ExecutionPayloadEnvelope};
 use consensus_types::EthSpec;
 use engine_api::new_payload_v5_params;
 use ethswarm_proto::engine as pb;
@@ -387,6 +387,69 @@ pub const NEW_PAYLOAD_V5_TIMEOUT: Duration = Duration::from_secs(6);
 // The client never gives up before cl-engine's wait for the EL is over.
 const _: () = assert!(CALL_TIMEOUT.as_secs() > NEW_PAYLOAD_V5_TIMEOUT.as_secs());
 
+/// The largest JSON params body cl-chain builds or sends: engine.proto caps JSON `data` at
+/// 32 MiB (33554432 bytes).
+pub const MAX_NEW_PAYLOAD_JSON_BYTES: usize = 33_554_432;
+
+/// The `engine_newPayloadV5` params of `envelope`, whose committed bid is `bid`, as JSON (the
+/// `data` of a `NewPayloadRequest`), or `None` if they would be larger than
+/// [`MAX_NEW_PAYLOAD_JSON_BYTES`]. A payload whose transactions, block access list and
+/// `extra_data` are past the cap as hex alone is refused before the params are built. Otherwise
+/// the encoder stops at the first byte past the cap, so the body never grows past it.
+#[must_use]
+pub fn new_payload_json<E: EthSpec>(
+    envelope: &ExecutionPayloadEnvelope<E>,
+    bid: &ExecutionPayloadBid<E>,
+) -> Option<Vec<u8>> {
+    if hex_floor(&envelope.payload) > MAX_NEW_PAYLOAD_JSON_BYTES {
+        return None;
+    }
+    json_within(
+        &new_payload_v5_params(envelope, bid),
+        MAX_NEW_PAYLOAD_JSON_BYTES,
+    )
+}
+
+/// A lower bound on the JSON size of `payload`'s params: every byte of a transaction, of the
+/// block access list and of `extra_data` is two hex digits.
+fn hex_floor<E: EthSpec>(payload: &ExecutionPayload<E>) -> usize {
+    payload
+        .transactions
+        .iter()
+        .map(|transaction| transaction.len())
+        .chain([payload.block_access_list.len(), payload.extra_data.len()])
+        .fold(0, usize::saturating_add)
+        .saturating_mul(2)
+}
+
+/// `value` as JSON if it takes at most `cap` bytes; `None` if it takes more or does not encode.
+fn json_within<T: serde::Serialize>(value: &T, cap: usize) -> Option<Vec<u8>> {
+    /// Takes bytes up to `cap`, and fails the write that would pass it.
+    struct Capped {
+        out: Vec<u8>,
+        cap: usize,
+    }
+    impl std::io::Write for Capped {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.cap - self.out.len() {
+                return Err(std::io::Error::other("past the JSON cap"));
+            }
+            self.out.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut capped = Capped {
+        out: Vec::new(),
+        cap,
+    };
+    serde_json::to_writer(&mut capped, value).ok()?;
+    Some(capped.out)
+}
+
 /// `chain_new_payload_verdicts_total{verdict}`, by [`ElVerdict::label`].
 #[derive(Clone, Debug, Default)]
 pub struct NewPayloadMetrics {
@@ -438,9 +501,13 @@ impl NewPayloadMetrics {
 ///   ([`NEW_PAYLOAD_V5_TIMEOUT`]) and answers `EngineError` `TIMEOUT` after it. The client gives
 ///   cl-engine [`CALL_TIMEOUT`] to connect and as much to answer; no answer by then is
 ///   [`Reason::Timeout`].
-/// - **Fail closed.** Only a status, read by [`verdict::map_proto`], gives a verdict. An
-///   `EngineError` (also beside a status), a failed call, an answer for another `seq`, no
-///   status, no connection and a timeout are `NotVerified`, never `Valid`.
+/// - **Fail closed.** Only a status, read by [`verdict::map_proto`] for the envelope's
+///   `block_hash`, gives a verdict. An `EngineError` (also beside a status), a failed call, an
+///   answer for another `seq`, no status, a `VALID` whose `latestValidHash` is not the
+///   payload's `block_hash`, no connection and a timeout are `NotVerified`, never `Valid`.
+/// - **Size.** Params that would be past [`MAX_NEW_PAYLOAD_JSON_BYTES`] of JSON
+///   ([`new_payload_json`]) are [`Reason::Malformed`] before a connection is taken or opened,
+///   and are never sent.
 /// - **Connection.** One, opened at the first call and shared by concurrent calls. A call
 ///   lost in transport (a timeout, `UNAVAILABLE`, `CANCELLED`, `UNKNOWN`, `DEADLINE_EXCEEDED`)
 ///   drops it, and the next call opens another.
@@ -509,7 +576,8 @@ impl NewPayloadClient {
         bid: &ExecutionPayloadBid<E>,
     ) -> ElVerdict {
         let not_verified = ElVerdict::NotVerified;
-        let Ok(data) = serde_json::to_vec(&new_payload_v5_params(envelope, bid)) else {
+        let block_hash = envelope.payload.block_hash;
+        let Some(data) = new_payload_json(envelope, bid) else {
             return not_verified(Reason::Malformed);
         };
         let Some(mut client) = self.connection().await else {
@@ -547,7 +615,9 @@ impl NewPayloadClient {
         response
             .status
             .as_ref()
-            .map_or(not_verified(Reason::Malformed), verdict::map_proto)
+            .map_or(not_verified(Reason::Malformed), |status| {
+                verdict::map_proto(status, block_hash)
+            })
     }
 
     /// The open connection, or a new one. One call at a time opens it: a call that finds none
