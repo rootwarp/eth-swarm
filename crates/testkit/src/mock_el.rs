@@ -51,6 +51,8 @@ pub enum Reply {
     Drop,
     /// HTTP 200 with an incomplete JSON document.
     Malformed,
+    /// HTTP status `code` with a JSON body that is not a JSON-RPC response.
+    Http(u16),
     /// VALID with a mismatched latestValidHash and non-null validationError.
     Contradictory,
 }
@@ -267,6 +269,7 @@ async fn handle(
             ))
         }
         Reply::Malformed => return raw_response(200, Bytes::from_static(b"{\"jsonrpc\":")),
+        Reply::Http(code) => return response(code, &json!({"error":"scripted HTTP status"})),
         Reply::Contradictory => {
             let mut wrong = hash.0;
             wrong[0] ^= 1;

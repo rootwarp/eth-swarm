@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
+use tokio::task::JoinHandle;
 
 pub struct Seen {
     pub method: String,
@@ -46,7 +47,8 @@ pub struct MockEl {
     addr: SocketAddr,
     state: Arc<State>,
     release: watch::Sender<bool>,
-    _shutdown: oneshot::Sender<()>,
+    shutdown: oneshot::Sender<()>,
+    accepting: JoinHandle<()>,
 }
 
 impl MockEl {
@@ -54,6 +56,16 @@ impl MockEl {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
+        Self::serve(listener, secret, methods)
+    }
+
+    /// [`MockEl::start`] on `addr`: an EL that comes back on the port it used before.
+    pub async fn start_at(addr: SocketAddr, secret: &[u8; 32], methods: Vec<String>) -> Self {
+        let listener = TcpListener::bind(addr).await.unwrap();
+        Self::serve(listener, secret, methods)
+    }
+
+    fn serve(listener: TcpListener, secret: &[u8; 32], methods: Vec<String>) -> Self {
         let addr = listener.local_addr().unwrap();
         let (release, hold) = watch::channel(false);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
@@ -72,7 +84,7 @@ impl MockEl {
             capability_calls: AtomicU64::new(0),
         });
         let serve = Arc::clone(&state);
-        tokio::spawn(async move {
+        let accepting = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     biased;
@@ -98,12 +110,29 @@ impl MockEl {
             addr,
             state,
             release,
-            _shutdown: shutdown_tx,
+            shutdown: shutdown_tx,
+            accepting,
         }
     }
 
     pub fn url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Stops the accept loop and returns once the listener is closed. A dial to
+    /// [`MockEl::addr`] is then refused. Connections accepted before stay open.
+    pub async fn stop(self) {
+        let Self {
+            shutdown,
+            accepting,
+            ..
+        } = self;
+        drop(shutdown);
+        accepting.await.unwrap();
     }
 
     pub fn set_methods(&self, methods: &[&str]) {
