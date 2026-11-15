@@ -1,0 +1,159 @@
+//! The Gloas fork choice (`specs/gloas/fork-choice.md` at consensus-specs v1.7.0-beta.4, and the
+//! phase0 helpers that Gloas keeps), ported function by function.
+//!
+//! - [`store`]: [`Store`], [`get_forkchoice_store`], the time helpers and the ancestry
+//!   helpers with their payload status.
+//! - [`handlers`]: [`on_tick`], [`on_block`] and [`store_target_checkpoint_state`].
+//! - [`weights`]: [`get_head`], the filtered node tree, [`get_weight`] and the payload
+//!   tiebreaker.
+//!
+//! The crate does no I/O and links no BLS library. The state transition of a block comes
+//! from the caller through a [`StateProvider`]. `on_attestation`, `on_attester_slashing`,
+//! `on_execution_payload_envelope` and `on_payload_attestation_message` from the wire are not
+//! here yet: until they are, `store.latest_messages` is empty, and only
+//! `testing::mark_payload_verified` (tests only) puts a root in `store.payloads`.
+//!
+//! The spec signals an invalid call with a failed `assert` or a missing key. Here each public
+//! handler returns an [`Error`] instead, and a failed handler leaves the store as it was.
+//! Each ported function cites its spec lines: G `gloas/fork-choice.md`, P0
+//! `phase0/fork-choice.md`, P0b `phase0/beacon-chain.md`.
+
+pub mod handlers;
+pub mod store;
+pub mod weights;
+
+pub use handlers::{on_block, on_tick, store_target_checkpoint_state, StateProvider};
+pub use store::{
+    compute_slots_since_epoch_start, get_ancestor, get_checkpoint_block, get_current_slot,
+    get_current_store_epoch, get_forkchoice_store, get_parent_payload_status,
+    get_slots_since_genesis, get_time_into_slot_ms, is_ancestor, is_parent_node_full,
+    is_payload_verified, milliseconds_to_seconds, seconds_to_milliseconds, ForkChoiceNode,
+    LatestMessage, PayloadStatus, Store,
+};
+pub use weights::{
+    get_filtered_node_tree, get_head, get_node_children, get_weight, is_valid_dependent_root,
+};
+
+use consensus_types::primitives::{Epoch, Root, Slot, ValidatorIndex};
+use state_transition::StfError;
+
+/// `BASIS_POINTS` (P0 L126).
+pub const BASIS_POINTS: u64 = 10_000;
+/// `ATTESTATION_DUE_BPS_GLOAS` (`configs/{minimal,mainnet}.yaml`, 2500 in both).
+pub const ATTESTATION_DUE_BPS_GLOAS: u64 = 2_500;
+/// `PAYLOAD_ATTESTATION_DUE_BPS` (`configs/{minimal,mainnet}.yaml`, 7500 in both).
+pub const PAYLOAD_ATTESTATION_DUE_BPS: u64 = 7_500;
+/// `PROPOSER_SCORE_BOOST` (P0 L132, `configs/{minimal,mainnet}.yaml`, 40 in both).
+pub const PROPOSER_SCORE_BOOST: u64 = 40;
+/// `REORG_HEAD_WEIGHT_THRESHOLD` (P0 L133, `configs/{minimal,mainnet}.yaml`, 20 in both).
+pub const REORG_HEAD_WEIGHT_THRESHOLD: u64 = 20;
+
+/// The config values that fork choice compiles in, by config key. They are equal in the
+/// minimal and the mainnet configs. A caller compares them with its network config at
+/// startup, as it does with `state_transition::preset::config_values`. `SLOT_DURATION_MS`
+/// differs between networks, so it is an argument of [`get_forkchoice_store`].
+pub fn config_values() -> [(&'static str, u64); 4] {
+    [
+        ("ATTESTATION_DUE_BPS_GLOAS", ATTESTATION_DUE_BPS_GLOAS),
+        ("PAYLOAD_ATTESTATION_DUE_BPS", PAYLOAD_ATTESTATION_DUE_BPS),
+        ("PROPOSER_SCORE_BOOST", PROPOSER_SCORE_BOOST),
+        ("REORG_HEAD_WEIGHT_THRESHOLD", REORG_HEAD_WEIGHT_THRESHOLD),
+    ]
+}
+
+/// Why a fork-choice call failed: a spec `assert` or a missing key of the spec's `Store`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Error {
+    /// `get_forkchoice_store` asserts `anchor_block.state_root == hash_tree_root(anchor_state)`.
+    #[error("anchor block state root {block} is not the anchor state root {state}")]
+    AnchorStateRoot {
+        /// `anchor_block.state_root`.
+        block: Root,
+        /// `hash_tree_root(anchor_state)`.
+        state: Root,
+    },
+    /// `on_block` asserts `block.parent_root in store.block_states`.
+    #[error("parent block {0} is not in the store")]
+    UnknownParent(Root),
+    /// `on_block` asserts `is_payload_verified(store, block.parent_root)` for a block that
+    /// builds on the FULL payload of its parent (G L1058-1061).
+    #[error("the block builds on the FULL payload of {0}, which is not verified")]
+    ParentPayloadNotVerified(Root),
+    /// `on_block` asserts `get_current_slot(store) >= block.slot`.
+    #[error("block slot {block} is after the current slot {current}")]
+    FutureBlock {
+        /// `block.slot`.
+        block: Slot,
+        /// `get_current_slot(store)`.
+        current: Slot,
+    },
+    /// `on_block` asserts that the block is after the first slot of the finalized epoch.
+    #[error("block slot {block} is not after the finalized slot {finalized}")]
+    NotAfterFinalized {
+        /// `block.slot`.
+        block: Slot,
+        /// `compute_start_slot_at_epoch(store.finalized_checkpoint.epoch)`.
+        finalized: Slot,
+    },
+    /// `on_block` asserts that the block descends from the finalized checkpoint block.
+    #[error("the checkpoint block {checkpoint_block} is not the finalized block {finalized}")]
+    NotFinalizedDescendant {
+        /// `store.finalized_checkpoint.root`.
+        finalized: Root,
+        /// The checkpoint block of the parent at the finalized epoch.
+        checkpoint_block: Root,
+    },
+    /// The [`StateProvider`] failed. [`StfError::proves_invalid`] tells whether the block (or
+    /// the slots) are invalid by the spec.
+    #[error("state transition: {0}")]
+    StateTransition(StfError),
+    /// A state helper failed on a state of the store: a fault of the store, not of the input.
+    #[error("state helper: {0}")]
+    Stf(StfError),
+    /// A spec lookup of a block, a block state or a per-block entry of the store that the
+    /// store does not have, for example an ancestor below the anchor.
+    #[error("block {0} is not in the store")]
+    UnknownBlock(Root),
+    /// `store.checkpoint_states[store.justified_checkpoint]` is missing. On the spec path,
+    /// `on_attestation` stores the state of each attestation target first.
+    #[error("no checkpoint state of epoch {epoch} root {root}")]
+    MissingCheckpointState {
+        /// The checkpoint epoch.
+        epoch: Epoch,
+        /// The checkpoint root.
+        root: Root,
+    },
+    /// `on_payload_attestation_message` asserts that the attester is in the PTC.
+    #[error("validator {validator} is not in the PTC of slot {slot}")]
+    NotInPtc {
+        /// The attester.
+        validator: ValidatorIndex,
+        /// `data.slot`.
+        slot: Slot,
+    },
+    /// A time before genesis: the `Uint64` subtraction of `compute_slot_at_time_ms` fails.
+    #[error("time {time_ms} ms is before the genesis time {genesis_time_ms} ms")]
+    BeforeGenesis {
+        /// The time of the tick.
+        time_ms: u64,
+        /// `store.genesis_time_ms`.
+        genesis_time_ms: u64,
+    },
+    /// A `Uint64` operation of the spec overflowed.
+    #[error("arithmetic overflow")]
+    Overflow,
+}
+
+/// Test seams. Only tests may enable them: the feature `testing` is for dev-dependencies.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use crate::Store;
+    use consensus_types::primitives::Root;
+    use state_transition::Preset;
+
+    /// Puts `root` in `store.payloads`, as `on_execution_payload_envelope` does after it
+    /// verifies the envelope of the block.
+    pub fn mark_payload_verified<E: Preset>(store: &mut Store<E>, root: Root) {
+        store.payloads.insert(root);
+    }
+}

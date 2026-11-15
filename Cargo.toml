@@ -26,6 +26,7 @@ members = [
     "crates/devnet-probe",
     "crates/node-key",
     "crates/state-transition",
+    "crates/fork-choice",
     "crates/cl-node",
     "crates/engine-api",
 ]
