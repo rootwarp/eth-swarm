@@ -810,6 +810,7 @@ fn failure_error(err: CallError) -> pb::EngineError {
         CallError::Timeout => (pb::EngineErrorKind::Timeout, 0),
         CallError::BodyTooLarge { .. } => (pb::EngineErrorKind::TooLargeRequest, -38004),
         CallError::Rpc { code } => (kind_of(*code), i32::try_from(*code).unwrap_or(0)),
+        CallError::UnsupportedFork => (pb::EngineErrorKind::UnsupportedFork, -38005),
         CallError::Transport | CallError::NotConnected | CallError::Stopped => {
             (pb::EngineErrorKind::ElUnreachable, 0)
         }
