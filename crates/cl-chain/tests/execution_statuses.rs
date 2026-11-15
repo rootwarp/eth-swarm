@@ -260,6 +260,115 @@ fn a_boundary_two_payloads_up_waits_for_both() {
     );
 }
 
+/// INVALID for 3 on 2 with the all-zero `latestValidHash`. The ancestors arrive after it: 2 on 1,
+/// then 1 on the missing 9, then 4 on 1. Each ancestor of 3 is in the chain of 3, so it must
+/// become Invalid. 4 is on the Invalid 1, so it must become Invalid too. The table must refuse an
+/// import of 4 on 1.
+#[test]
+fn a_zero_latest_valid_hash_invalidates_ancestors_recorded_later() {
+    let mut statuses = ExecutionStatuses::new();
+    chain(
+        &mut statuses,
+        &[
+            (3, 2, invalid(Some(Hash32::ZERO))),
+            (2, 1, OPT),
+            (1, 9, OPT),
+            (4, 1, OPT),
+        ],
+    );
+    assert_eq!(
+        statuses_of(&statuses, [1, 2, 3, 4]),
+        [Some(Invalid); 4],
+        "1, 2, 3 and 4 must be Invalid"
+    );
+    for verdict in [OPT, VALID] {
+        assert!(
+            !statuses.permits_payload_import(&hash(4), &hash(1), &verdict),
+            "the table must refuse 4 on 1 with {verdict:?}"
+        );
+    }
+}
+
+/// INVALID for 3 on 2 with the all-zero `latestValidHash`, while 9 is missing. 1 is on 9, 2 and 4
+/// are on 1, and 5 is on 9. The walk up makes 2 and 1 Invalid, and 4 too. When 9 arrives, the
+/// boundary applies again. The walk must step over 2 and 1, which are Invalid already. Thus 9
+/// and its other child 5 must become Invalid. The boundary continues to wait, so 8 must become
+/// Invalid when it arrives.
+#[test]
+fn a_zero_latest_valid_hash_steps_over_ancestors_that_are_invalid_already() {
+    let mut statuses = ExecutionStatuses::new();
+    chain(
+        &mut statuses,
+        &[
+            (1, 9, OPT),
+            (2, 1, OPT),
+            (4, 1, OPT),
+            (5, 9, OPT),
+            (3, 2, invalid(Some(Hash32::ZERO))),
+        ],
+    );
+    assert_eq!(
+        statuses_of(&statuses, [1, 2, 3, 4, 5]),
+        [
+            Some(Invalid),
+            Some(Invalid),
+            Some(Invalid),
+            Some(Invalid),
+            Some(Optimistic)
+        ]
+    );
+    assert_eq!(
+        statuses.record(hash(9), hash(8), &OPT),
+        Some(Invalid),
+        "9 must be Invalid"
+    );
+    assert_eq!(
+        statuses_of(&statuses, [5, 9]),
+        [Some(Invalid); 2],
+        "9 and 5 must be Invalid"
+    );
+    assert!(!statuses.permits_payload_import(&hash(6), &hash(9), &OPT));
+    assert_eq!(
+        statuses.record(hash(8), hash(7), &OPT),
+        Some(Invalid),
+        "8 must be Invalid"
+    );
+}
+
+/// INVALID for 3 on 2 with `latestValidHash` 2, while 2 is missing. The boundary must wait for
+/// 2. When 2 arrives, it must become Valid, and its Optimistic parent 1 too. 3 stays Invalid.
+/// The same applies with an Optimistic payload between the two: INVALID for 13 on 12 with
+/// `latestValidHash` 11 makes 12 Invalid at once, and 11 must become Valid when it arrives.
+#[test]
+fn a_latest_valid_hash_payload_recorded_later_becomes_valid() {
+    let mut statuses = ExecutionStatuses::new();
+    chain(
+        &mut statuses,
+        &[(1, 0, OPT), (3, 2, invalid(Some(hash(2)))), (12, 11, OPT)],
+    );
+    assert_eq!(
+        statuses.record(hash(2), hash(1), &OPT),
+        Some(Valid),
+        "2 must be Valid"
+    );
+    assert_eq!(
+        statuses_of(&statuses, [1, 2, 3]),
+        [Some(Valid), Some(Valid), Some(Invalid)]
+    );
+
+    statuses.record(hash(13), hash(12), &invalid(Some(hash(11))));
+    assert_eq!(statuses_of(&statuses, [12, 13]), [Some(Invalid); 2]);
+    assert_eq!(
+        statuses.record(hash(11), hash(10), &OPT),
+        Some(Valid),
+        "11 must be Valid"
+    );
+    assert_eq!(
+        statuses_of(&statuses, [11, 12, 13]),
+        [Some(Valid), Some(Invalid), Some(Invalid)]
+    );
+}
+
 /// What stays as it was: INVALID is final, SYNCING does not downgrade VALID, and a call with no
 /// verdict records nothing.
 #[test]
