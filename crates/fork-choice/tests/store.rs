@@ -477,6 +477,27 @@ fn pending_node_children_are_its_empty_and_verified_full_nodes() {
 }
 
 #[test]
+fn node_children_come_in_the_order_of_import() {
+    let (mut store, anchor_block) = new_store();
+    let anchor = anchor_block.tree_hash_root();
+    tick(&mut store, 2);
+    let blocks: Vec<_> = (1..=8)
+        .map(|tag| child(&anchor_block, 1, false, tag))
+        .collect();
+    let order = [5, 2, 7, 0, 3, 6, 1, 4];
+    for i in order {
+        on_block(&mut store, &PLAIN, &blocks[i]).unwrap();
+    }
+    // The spec reads `store.blocks`, a dict in the order of import.
+    let want: Vec<_> = order
+        .iter()
+        .map(|&i| pending(root_of(&blocks[i])))
+        .collect();
+    assert_eq!(get_node_children(&store, &empty(anchor)), Ok(want));
+    assert_eq!(get_node_children(&store, &full(anchor)), Ok(vec![]));
+}
+
+#[test]
 fn get_head_extends_the_payload_that_the_boosted_block_builds_on() {
     let f = fork(true);
     assert_eq!(f.store.proposer_boost_root(), f.b);
