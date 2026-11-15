@@ -4,7 +4,8 @@
 //! from a temporary directory in the `anchor-fetch` layout, through
 //! `testkit::anchor::load_anchor`. The block to import is the slot 1 block of the same export.
 //! A fake cl-verify behind `BlsVerifier` gives the VerifyBls verdicts. One test uses the
-//! production `BlsClient` and an in-process cl-verify instead.
+//! production `BlsClient` and an in-process cl-verify instead. One test sets a fake payload
+//! gate that refuses each payload.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[allow(dead_code)]
@@ -17,9 +18,10 @@ mod verify {
 }
 
 use cl_chain::core::{queue, ChainCore, Head, Outcome, SubmitError};
+use cl_chain::import::block::PayloadImportGate;
 use cl_chain::verify::client::{BlsOutcome, BlsVerifier};
 use consensus_types::gloas::SignedBeaconBlock;
-use consensus_types::primitives::Root;
+use consensus_types::primitives::{Hash32, Root};
 use consensus_types::Minimal;
 use ethswarm_proto::verify::{BlsSet, KeyNamespace};
 use network_config::ChainConfig;
@@ -81,6 +83,21 @@ impl BlsVerifier for FakeVerify {
                 BlsOutcome::Valid
             }
         }
+    }
+}
+
+/// A fake payload gate. It refuses each payload and keeps the hashes of each call.
+struct RefusingGate {
+    calls: Arc<Mutex<Vec<(Hash32, Hash32)>>>,
+}
+
+impl PayloadImportGate for RefusingGate {
+    fn permits(&self, block_hash: &Hash32, parent_block_hash: &Hash32) -> bool {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((*block_hash, *parent_block_hash));
+        false
     }
 }
 
@@ -306,6 +323,31 @@ async fn state_root_mismatch_not_committed() {
             Outcome::Invalid(StfError::StateRootMismatch { .. })
         ),
         "{outcome:?}"
+    );
+    assert_unchanged(&core, f.anchor, block_root);
+}
+
+#[tokio::test]
+async fn refused_payload_gate_ignores() {
+    let f = fixture();
+    let block_root = f.block.message.tree_hash_root();
+    let bid = &f.block.message.body.signed_execution_payload_bid.message;
+    let expected = (bid.block_hash, bid.parent_block_hash);
+    let calls = Arc::default();
+    let core = f.core.with_payload_gate(RefusingGate {
+        calls: Arc::clone(&calls),
+    });
+    let (outcome, core, verify) = import_one(core, f.block, Answer::Valid).await;
+    assert!(matches!(outcome, Outcome::Ignored(_)), "{outcome:?}");
+    assert_eq!(
+        verify.calls().len(),
+        1,
+        "the block sets must go to cl-verify one time"
+    );
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![expected],
+        "the gate must get the hashes of the payload bid of the block"
     );
     assert_unchanged(&core, f.anchor, block_root);
 }
