@@ -24,7 +24,7 @@
 #             coverage excuse instead of a skip                     (optional)
 #   reason    why it is skipped                                     (required)
 #   owner     team member responsible                               (required)
-#   issue     plan item whose work removes the entry, e.g. "1.17", or "none"
+#   issue     plan item whose work removes the entry, e.g. "1.17" or "5.11b", or "none"
 #                                                                   (required)
 #   expires   YYYY-MM-DD; valid through that day, and from the next day the entry fails CI
 #                                                                   (required)

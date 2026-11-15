@@ -1,0 +1,395 @@
+//! consensus-spec-tests `tests/<preset>/gloas/fork_choice/<handler>/pyspec_tests/<case>/`
+//! through the `fork-choice` crate (`tests/formats/fork_choice/README.md` at v1.7.0-beta.4).
+//!
+//! A case holds `anchor_state.ssz_snappy`, `anchor_block.ssz_snappy`, `steps.yaml`, the
+//! `block_<root>.ssz_snappy` files that its steps name, an optional `meta.yaml`
+//! (`description`, `bls_setting`), an optional `config.yaml` and `manifest.yaml` (the suite
+//! checks it). [`run`] makes the store with `get_forkchoice_store` and the `SLOT_DURATION_MS`
+//! of the preset config, and then runs each step in sequence:
+//!
+//! - `tick`: `on_tick(store, seconds_to_milliseconds(tick))`.
+//! - `block`: `on_block`, with `state_transition` and the BLS backend of
+//!   [`crate::bls_backend`] (BLS is on unless `bls_setting: 2`). A step with `valid: false`
+//!   must fail with an error that proves the block invalid. A valid block with attestations
+//!   or attester slashings fails the case: the format then runs `on_attestation` and
+//!   `on_attester_slashing`, which are not ported. The payload attestations of a block need
+//!   no more work: `on_block` gives their votes to the store (`notify_ptc_messages`), and the
+//!   messages that the format makes from them set the same votes again.
+//! - `checks`: `head` (the slot, root and payload status of `get_head`), `time`,
+//!   `genesis_time`, `justified_checkpoint`, `finalized_checkpoint` and `proposer_boost_root`.
+//!
+//! Each other step, step key or check key fails the case. Thus a case that needs a handler
+//! or a check that is not here cannot pass because the runner does less.
+
+use crate::bls_backend::{backend_for, bls_context, bls_setting, Bls, StateKeys};
+use crate::config::check_same_config;
+use crate::coverage::Reads;
+use crate::fixture;
+use crate::plan::Case;
+use ::fork_choice::{
+    get_forkchoice_store, get_head, milliseconds_to_seconds, on_block, on_tick,
+    seconds_to_milliseconds, Error, StateProvider, Store,
+};
+use consensus_types::gloas::{BeaconBlock, BeaconState, Checkpoint, SignedBeaconBlock};
+use consensus_types::primitives::{Root, Slot};
+use consensus_types::{Mainnet, Minimal};
+use ssz::Decode;
+use state_transition::per_slot::process_slots;
+use state_transition::{state_transition, BackendError, BlsContext, Preset, StfError};
+use std::num::NonZeroU64;
+use std::path::Path;
+use yaml_rust2::Yaml;
+
+/// The Gloas handler directories that this runner runs.
+pub const RUNNABLE: [&str; 4] = [
+    "on_block",
+    "get_head",
+    "get_parent_payload_status",
+    "filter_node_tree_variants",
+];
+
+/// The Gloas handler directories of v1.7.0-beta.4 that this runner does not run: each case
+/// needs a step or a check that it does not have. `testing/skip.toml` skips them.
+pub const NOT_RUN: [&str; 10] = [
+    "on_attestation",
+    "on_execution_payload_envelope",
+    "on_payload_attestation_message",
+    "ex_ante",
+    "reorg",
+    "withholding",
+    "deposit_with_reorg",
+    "payload_timeliness",
+    "payload_data_availability",
+    "should_apply_proposer_boost",
+];
+
+/// Whether this runner runs a Gloas handler directory. `Err` for a directory that it does
+/// not know: the suite fails setup on it, so a new handler gets a decision.
+pub fn handler_runs(handler: &str) -> Result<bool, String> {
+    if RUNNABLE.contains(&handler) {
+        Ok(true)
+    } else if NOT_RUN.contains(&handler) {
+        Ok(false)
+    } else {
+        Err(format!(
+            "unknown fork_choice handler directory `{handler}`: classify it in crates/spec-tests/src/fork_choice.rs"
+        ))
+    }
+}
+
+/// Whether this runner takes `handler` of `fork` and `preset`.
+pub fn supported(fork: &str, preset: &str, handler: &str) -> bool {
+    fork == "gloas" && matches!(preset, "minimal" | "mainnet") && handler_runs(handler) == Ok(true)
+}
+
+/// `SLOT_DURATION_MS` of `configs/minimal.yaml` (L70) at v1.7.0-beta.4.
+const MINIMAL_SLOT_DURATION_MS: u64 = 6_000;
+/// `SLOT_DURATION_MS` of `configs/mainnet.yaml` (L74) at v1.7.0-beta.4.
+const MAINNET_SLOT_DURATION_MS: u64 = 12_000;
+
+/// Runs one case. `Err` describes a failure.
+pub fn run(reads: &Reads, case: &Case) -> Result<(), String> {
+    let handler = &case.key.handler;
+    if handler_runs(handler) != Ok(true) {
+        return Err(format!("no fork_choice runner for handler {handler}"));
+    }
+    match case.key.preset.as_str() {
+        "minimal" => run_case::<Minimal>(reads, case, MINIMAL_SLOT_DURATION_MS),
+        "mainnet" => run_case::<Mainnet>(reads, case, MAINNET_SLOT_DURATION_MS),
+        other => Err(format!("no fork_choice runner for preset {other}")),
+    }
+}
+
+fn run_case<E: Preset>(reads: &Reads, case: &Case, slot_duration_ms: u64) -> Result<(), String> {
+    let file = |name: &str| case.file(name).ok_or_else(|| format!("case has no {name}"));
+    let bls = bls_setting(reads, case)?;
+    let anchor_state: BeaconState<E> = decode(reads, file("anchor_state.ssz_snappy")?)?;
+    let anchor_block: BeaconBlock<E> = decode(reads, file("anchor_block.ssz_snappy")?)?;
+    check_config::<E>(reads, case, anchor_state.fork.epoch, slot_duration_ms)?;
+    let steps = fixture::load(reads, file("steps.yaml")?)?;
+    let steps = fixture::list(&steps).map_err(|e| format!("steps.yaml: {e}"))?;
+    let slot_duration = NonZeroU64::new(slot_duration_ms).ok_or("SLOT_DURATION_MS is zero")?;
+    let mut store = get_forkchoice_store(anchor_state, anchor_block, slot_duration)
+        .map_err(|e| format!("get_forkchoice_store: {e}"))?;
+    let provider = Transition {
+        preset: &case.key.preset,
+        bls,
+    };
+    for (i, step) in steps.iter().enumerate() {
+        apply_step(reads, case, &mut store, &provider, step)
+            .map_err(|e| format!("steps.yaml step {i}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// The `config.yaml` of a case, if it has one: the values that the transition compiles in
+/// ([`check_same_config`]), the values that fork choice compiles in
+/// (`fork_choice::config_values`) and `SLOT_DURATION_MS` of the preset.
+fn check_config<E: Preset>(
+    reads: &Reads,
+    case: &Case,
+    fork_epoch: u64,
+    slot_duration_ms: u64,
+) -> Result<(), String> {
+    check_same_config::<E>(reads, case, fork_epoch)?;
+    let Some(path) = case.file("config.yaml") else {
+        return Ok(());
+    };
+    let config = fixture::load(reads, path)?;
+    let values = ::fork_choice::config_values()
+        .into_iter()
+        .chain([("SLOT_DURATION_MS", slot_duration_ms)]);
+    for (name, want) in values {
+        let got = fixture::field(&config, name).map_err(|e| format!("config.yaml: {e}"))?;
+        if unsigned(got) != Some(want) {
+            return Err(format!(
+                "config.yaml sets {name} to {got:?}, but the runner uses {want}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The state transition of the vectors. The signatures go to the in-process BLS backend with
+/// the keys of the state, or to no check for `bls_setting: 2`, with the config of the preset.
+struct Transition<'a> {
+    preset: &'a str,
+    bls: Bls,
+}
+
+impl Transition<'_> {
+    fn context<'k>(&self, keys: &'k StateKeys) -> Result<BlsContext<'k>, StfError> {
+        // Only an unknown preset fails here, and `run` accepts only known presets.
+        bls_context(self.preset, backend_for(self.bls, keys))
+            .map_err(|e| StfError::SignatureBackend(BackendError(e)))
+    }
+}
+
+impl<E: Preset> StateProvider<E> for Transition<'_> {
+    fn state_transition(
+        &self,
+        state: &mut BeaconState<E>,
+        signed_block: &SignedBeaconBlock<E>,
+    ) -> Result<(), StfError> {
+        // The keys of the state at the slot of the block, as in the sanity runner: an epoch
+        // boundary on the way can add validators and builders. If the slots fail,
+        // `state_transition` fails on them in the same way.
+        let pre_keys = StateKeys::new(state);
+        let mut at_slot = state.clone();
+        let advanced = process_slots(
+            &mut at_slot,
+            signed_block.message.slot,
+            &self.context(&pre_keys)?,
+        )
+        .is_ok();
+        let keys = if advanced {
+            StateKeys::new(&at_slot)
+        } else {
+            pre_keys
+        };
+        state_transition(state, signed_block, true, &self.context(&keys)?)
+    }
+
+    fn process_slots(&self, state: &mut BeaconState<E>, slot: Slot) -> Result<(), StfError> {
+        let keys = StateKeys::new(state);
+        process_slots(state, slot, &self.context(&keys)?)
+    }
+}
+
+/// Runs one entry of `steps.yaml`.
+fn apply_step<E: Preset>(
+    reads: &Reads,
+    case: &Case,
+    store: &mut Store<E>,
+    provider: &Transition<'_>,
+    step: &Yaml,
+) -> Result<(), String> {
+    let map = step
+        .as_hash()
+        .ok_or_else(|| format!("expected a mapping, got {step:?}"))?;
+    let keys = map
+        .keys()
+        .map(|k| {
+            k.as_str()
+                .ok_or_else(|| format!("key {k:?} is not a string"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let only = |kind: &str, allowed: &[&str]| match keys.iter().find(|k| !allowed.contains(k)) {
+        Some(k) => Err(format!("unsupported key `{k}` in a {kind} step")),
+        None => Ok(()),
+    };
+    let valid = match &step["valid"] {
+        Yaml::BadValue => true,
+        v => fixture::boolean(v).map_err(|e| format!("valid: {e}"))?,
+    };
+    if keys.contains(&"tick") {
+        only("tick", &["tick", "valid"])?;
+        tick(store, &step["tick"], valid)
+    } else if keys.contains(&"block") {
+        only("block", &["block", "valid"])?;
+        block(reads, case, store, provider, &step["block"], valid)
+    } else if keys == ["checks"] {
+        let checks = step["checks"]
+            .as_hash()
+            .ok_or("checks: expected a mapping")?;
+        checks.iter().try_for_each(|(key, want)| {
+            let key = key.as_str().ok_or("checks: a key is not a string")?;
+            check(store, key, want)
+        })
+    } else {
+        Err(format!(
+            "unsupported step {keys:?}: the runner has only tick, block and checks"
+        ))
+    }
+}
+
+fn tick<E: Preset>(store: &mut Store<E>, seconds: &Yaml, valid: bool) -> Result<(), String> {
+    let seconds = unsigned(seconds).ok_or_else(|| format!("tick: {seconds:?} is not a time"))?;
+    match (on_tick(store, seconds_to_milliseconds(seconds)), valid) {
+        (Ok(()), true) => Ok(()),
+        (Err(Error::BeforeGenesis { .. } | Error::Overflow), false) => Ok(()),
+        (Ok(()), false) => Err(format!(
+            "on_tick accepted tick {seconds}, which the vector expects to fail"
+        )),
+        (Err(e), _) => Err(format!("on_tick failed on tick {seconds}: {e}")),
+    }
+}
+
+fn block<E: Preset>(
+    reads: &Reads,
+    case: &Case,
+    store: &mut Store<E>,
+    provider: &Transition<'_>,
+    name: &Yaml,
+    valid: bool,
+) -> Result<(), String> {
+    let name = name.as_str().ok_or("block: expected a file name")?;
+    let file = format!("{name}.ssz_snappy");
+    let path = case
+        .file(&file)
+        .ok_or_else(|| format!("case has no {file}"))?;
+    let signed_block: SignedBeaconBlock<E> = decode(reads, path)?;
+    let body = &signed_block.message.body;
+    if valid && !body.attestations.is_empty() {
+        return Err(format!(
+            "{name} has attestations: the format runs on_attestation for each, which is not ported"
+        ));
+    }
+    if valid && !body.attester_slashings.is_empty() {
+        return Err(format!(
+            "{name} has attester slashings: the format runs on_attester_slashing for each, which is not ported"
+        ));
+    }
+    match (on_block(store, provider, &signed_block), valid) {
+        (Ok(()), true) => Ok(()),
+        (Err(e), false) if proves_invalid(&e) => Ok(()),
+        (Ok(()), false) => Err(format!(
+            "on_block accepted {name}, which the vector expects to fail"
+        )),
+        (Err(e), false) => Err(format!(
+            "on_block failed on {name} with {e}, which is not a spec failure"
+        )),
+        (Err(e), true) => Err(format!("on_block refused {name}: {e}")),
+    }
+}
+
+/// Whether `on_block` failed on a spec assert about the block, not on a fault of the store.
+fn proves_invalid(e: &Error) -> bool {
+    match e {
+        Error::UnknownParent(_)
+        | Error::ParentPayloadNotVerified(_)
+        | Error::FutureBlock { .. }
+        | Error::NotAfterFinalized { .. }
+        | Error::NotFinalizedDescendant { .. } => true,
+        Error::StateTransition(e) => e.proves_invalid(),
+        _ => false,
+    }
+}
+
+/// One check of a `checks` step against the store.
+fn check<E: Preset>(store: &Store<E>, key: &str, want: &Yaml) -> Result<(), String> {
+    let result = match key {
+        "head" => check_head(store, want),
+        "time" => equal(milliseconds_to_seconds(store.time_ms()), want, unsigned),
+        "genesis_time" => equal(
+            milliseconds_to_seconds(store.genesis_time_ms()),
+            want,
+            unsigned,
+        ),
+        "justified_checkpoint" => equal(store.justified_checkpoint().clone(), want, checkpoint),
+        "finalized_checkpoint" => equal(store.finalized_checkpoint().clone(), want, checkpoint),
+        "proposer_boost_root" => equal(store.proposer_boost_root(), want, root),
+        other => return Err(format!("unsupported check `{other}`")),
+    };
+    result.map_err(|e| format!("{key}: {e}"))
+}
+
+/// `head`: the slot, the root and the payload status of `get_head`.
+fn check_head<E: Preset>(store: &Store<E>, want: &Yaml) -> Result<(), String> {
+    let map = want.as_hash().ok_or("expected a mapping")?;
+    if let Some(k) = map
+        .keys()
+        .find(|k| !matches!(k.as_str(), Some("slot" | "root" | "payload_status")))
+    {
+        return Err(format!("unsupported key {k:?}"));
+    }
+    let head = get_head(store).map_err(|e| format!("get_head: {e}"))?;
+    let slot = store
+        .block(head.root)
+        .map(|b| b.slot)
+        .ok_or_else(|| format!("head {} is not in the store", head.root))?;
+    let got = (slot, head.root, head.payload_status as u64);
+    let field = |name: &str| fixture::field(want, name);
+    let want = (
+        unsigned(field("slot")?).ok_or("slot is not a slot")?,
+        root(field("root")?).ok_or("root is not a root")?,
+        unsigned(field("payload_status")?).ok_or("payload_status is not a number")?,
+    );
+    if got == want {
+        Ok(())
+    } else {
+        Err(format!(
+            "got (slot, root, payload_status) {got:?}, want {want:?}"
+        ))
+    }
+}
+
+/// Compares `got` with `want` as `parse` reads it.
+fn equal<T: PartialEq + std::fmt::Debug>(
+    got: T,
+    want: &Yaml,
+    parse: fn(&Yaml) -> Option<T>,
+) -> Result<(), String> {
+    match parse(want) {
+        Some(want) if want == got => Ok(()),
+        Some(want) => Err(format!("got {got:?}, want {want:?}")),
+        None => Err(format!("cannot read {want:?}")),
+    }
+}
+
+fn unsigned(y: &Yaml) -> Option<u64> {
+    y.as_i64().and_then(|v| u64::try_from(v).ok())
+}
+
+fn root(y: &Yaml) -> Option<Root> {
+    fixture::hex_array::<32>(y).ok().flatten().map(Root::from)
+}
+
+/// A checkpoint `{epoch, root}` with no other key.
+fn checkpoint(y: &Yaml) -> Option<Checkpoint> {
+    let map = y.as_hash()?;
+    let known = map
+        .keys()
+        .all(|k| matches!(k.as_str(), Some("epoch" | "root")));
+    known.then_some(())?;
+    Some(Checkpoint {
+        epoch: unsigned(&y["epoch"])?,
+        root: root(&y["root"])?,
+    })
+}
+
+/// An SSZ value from a `.ssz_snappy` file.
+fn decode<T: Decode>(reads: &Reads, path: &Path) -> Result<T, String> {
+    let bytes = fixture::ssz_snappy(reads, path)?;
+    T::from_ssz_bytes(&bytes).map_err(|e| format!("{}: {e:?}", path.display()))
+}

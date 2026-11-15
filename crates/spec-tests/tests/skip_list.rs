@@ -50,13 +50,17 @@ fn every_entry_names_its_owner_and_removing_issue() {
             "{e:?}"
         );
         let plan_id = e.issue.split_once('.').is_some_and(|(major, minor)| {
+            // A part of a plan item has one lowercase letter after its number.
+            let minor = minor
+                .strip_suffix(|c: char| c.is_ascii_lowercase())
+                .unwrap_or(minor);
             [major, minor]
                 .iter()
                 .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
         });
         assert!(
             e.issue == "none" || plan_id,
-            "issue must be a plan ID such as \"1.17\" or \"none\": {e:?}"
+            "issue must be a plan ID such as \"1.17\" or \"5.11b\", or \"none\": {e:?}"
         );
     }
 }

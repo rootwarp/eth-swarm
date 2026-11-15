@@ -5,8 +5,8 @@
 use crate::coverage::{self, CaseShape, Guard, Layout, Reads, Slot};
 use crate::plan::{plan, Case, CaseKey, Date, Disposition, Scope, SkipList, COMPTESTS_PRESETS};
 use crate::{
-    bls, epoch_processing, finality, fixture, kzg, networking, operations, random, rewards, sanity,
-    shuffling, ssz_generic, ssz_static,
+    bls, epoch_processing, finality, fixture, fork_choice, kzg, networking, operations, random,
+    rewards, sanity, shuffling, ssz_generic, ssz_static,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -89,8 +89,9 @@ const fn consensus(
 /// the rest are scanned when extracted.
 ///
 /// `minimal` and `mainnet` must hold the trees of each runner that no skip entry may reach:
-/// `ssz_static`, `phase0/shuffling` and the Gloas state-transition runners. Without these
-/// subtrees, a missing tree would pass setup and run no trial.
+/// `ssz_static`, `phase0/shuffling`, the Gloas state-transition runners and Gloas
+/// `fork_choice`, whose tick and block cases run. Without these subtrees, a missing tree would
+/// pass setup and run no trial.
 ///
 /// `general` at v1.7.0-beta.4 holds only `altair/bls`, which is its scope.
 ///
@@ -147,6 +148,7 @@ pub const SETS: [VectorSet; 7] = [
             "tests/minimal/gloas/finality",
             "tests/minimal/gloas/rewards",
             "tests/minimal/gloas/random",
+            "tests/minimal/gloas/fork_choice",
         ],
     ),
     consensus(
@@ -163,6 +165,7 @@ pub const SETS: [VectorSet; 7] = [
             "tests/mainnet/gloas/finality",
             "tests/mainnet/gloas/rewards",
             "tests/mainnet/gloas/random",
+            "tests/mainnet/gloas/fork_choice",
         ],
     ),
     VectorSet {
@@ -449,8 +452,8 @@ fn incomplete(set: &VectorSet, dir: &Path, cases: &[Case]) -> Option<String> {
     })
 }
 
-/// Fails on a `bls`, `kzg`, Gloas `epoch_processing` or Gloas `operations` handler
-/// directory the runners do not classify.
+/// Fails on a `bls`, `kzg`, Gloas `epoch_processing`, Gloas `operations` or Gloas
+/// `fork_choice` handler directory the runners do not classify.
 fn handler_check(k: &CaseKey) -> Result<(), String> {
     if k.handler.is_empty() {
         return Ok(());
@@ -466,6 +469,11 @@ fn handler_check(k: &CaseKey) -> Result<(), String> {
         "epoch_processing" => epoch_processing::check_handler(k),
         "operations" if k.source == "consensus-specs" && k.fork == "gloas" => {
             operations::handler_runs(&k.handler)
+                .map(drop)
+                .map_err(|e| e + &at())
+        }
+        "fork_choice" if k.source == "consensus-specs" && k.fork == "gloas" => {
+            fork_choice::handler_runs(&k.handler)
                 .map(drop)
                 .map_err(|e| e + &at())
         }
@@ -489,6 +497,7 @@ enum Kind {
     Finality,
     Rewards,
     Random,
+    ForkChoice,
 }
 
 /// The runner for a case, or `None` if nothing in this crate runs it.
@@ -548,6 +557,11 @@ fn kind(case: &Case) -> Option<Kind> {
         ("consensus-specs", "random") if random::supported(&k.fork, &k.preset, &k.handler) => {
             Some(Kind::Random)
         }
+        ("consensus-specs", "fork_choice")
+            if fork_choice::supported(&k.fork, &k.preset, &k.handler) =>
+        {
+            Some(Kind::ForkChoice)
+        }
         _ => None,
     }
 }
@@ -602,6 +616,10 @@ impl Kind {
             Kind::Random => {
                 consensus_manifest(reads, case)?;
                 random::run(reads, case)
+            }
+            Kind::ForkChoice => {
+                consensus_manifest(reads, case)?;
+                fork_choice::run(reads, case)
             }
         }
     }

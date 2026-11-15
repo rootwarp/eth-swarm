@@ -5711,6 +5711,7 @@ dependencies = [
  "crypto-kzg",
  "ethereum_ssz",
  "ethereum_ssz_derive",
+ "fork-choice",
  "hex",
  "libtest-mimic",
  "milhouse",
