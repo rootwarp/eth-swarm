@@ -65,6 +65,13 @@ pub(crate) const PTC_TIMELINESS_INDEX: usize = 1;
 /// `anchor_root` is not a spec field. It is the root of the anchor block, the one block of the
 /// store whose parent is not in the store: the ancestor walk stops there ([`get_ancestor`]).
 ///
+/// `children` and `ptc_timely_proposals` are not spec fields. They are indexes of `blocks`,
+/// so that head selection reads the blocks that it needs and does not scan every block for
+/// each node. `children` maps an EMPTY or a FULL node to the roots of the blocks that build
+/// on it, in the order of import (the order of the spec's dict). It never has a PENDING key.
+/// `ptc_timely_proposals` maps a slot and a proposer to the roots of the blocks of that slot
+/// and proposer that were timely for the PTC deadline (`block_timeliness[root][1]`).
+///
 /// `slot_duration_ms` is the config value `SLOT_DURATION_MS`, the one config value of fork
 /// choice that differs between the presets ([`crate::config_values`] lists the others).
 /// `payloads` holds the roots only: fork choice reads only `root in store.payloads`.
@@ -90,6 +97,8 @@ pub struct Store<E: Preset> {
     pub(crate) payloads: HashSet<Root>,
     pub(crate) payload_timeliness_vote: HashMap<Root, Vec<Option<bool>>>,
     pub(crate) payload_data_availability_vote: HashMap<Root, Vec<Option<bool>>>,
+    pub(crate) children: HashMap<ForkChoiceNode, Vec<Root>>,
+    pub(crate) ptc_timely_proposals: BTreeMap<(Slot, ValidatorIndex), Vec<Root>>,
 }
 
 impl<E: Preset> Store<E> {
@@ -217,6 +226,8 @@ pub fn get_forkchoice_store<E: Preset>(
     let genesis_time_ms = seconds_to_milliseconds(anchor_state.genesis_time);
     let time_ms = compute_time_at_slot_ms(genesis_time_ms, anchor_state.slot, slot_duration_ms)?;
     let votes = vec![None; ptc_size::<E>()];
+    // The anchor is timely for both deadlines.
+    let anchor_proposal = (anchor_block.slot, anchor_block.proposer_index);
     Ok(Store {
         slot_duration_ms,
         anchor_root,
@@ -235,6 +246,8 @@ pub fn get_forkchoice_store<E: Preset>(
         payloads: HashSet::new(),
         payload_timeliness_vote: HashMap::from([(anchor_root, votes.clone())]),
         payload_data_availability_vote: HashMap::from([(anchor_root, votes)]),
+        children: HashMap::new(),
+        ptc_timely_proposals: BTreeMap::from([(anchor_proposal, vec![anchor_root])]),
         justified_checkpoint,
         finalized_checkpoint,
     })

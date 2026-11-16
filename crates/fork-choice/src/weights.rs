@@ -9,27 +9,29 @@
 use crate::store::{
     get_checkpoint_block, get_current_slot, get_current_store_epoch, get_parent_payload_status,
     is_ancestor, is_parent_node_full, is_payload_verified, ptc_size, ForkChoiceNode, LatestMessage,
-    PayloadStatus, Store, PTC_TIMELINESS_INDEX,
+    PayloadStatus, Store,
 };
 use crate::{Error, PROPOSER_SCORE_BOOST, REORG_HEAD_WEIGHT_THRESHOLD};
-use consensus_types::gloas::{BeaconState, Checkpoint};
+use consensus_types::gloas::{BeaconBlock, BeaconState, Checkpoint};
 use consensus_types::primitives::{Gwei, Root, Slot};
 use state_transition::accessors::{get_current_epoch, is_active_validator};
 use state_transition::caches::CommitteeCache;
 use state_transition::per_epoch::participation::get_total_balance;
 use state_transition::Preset;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// `GENESIS_EPOCH`.
 const GENESIS_EPOCH: u64 = 0;
 
-/// `get_head` (G L638-670).
+/// `get_head` (G L638-670). The parts of `get_weight` that are the same for each node are
+/// computed once for the call ([`Boost`]), not once for each node.
 pub fn get_head<E: Preset>(store: &Store<E>) -> Result<ForkChoiceNode, Error> {
     let nodes = get_filtered_node_tree(store)?;
     let justified_root = store.justified_checkpoint.root;
     if nodes.is_empty() {
         return Ok(ForkChoiceNode::new(justified_root, PayloadStatus::Empty));
     }
+    let mut boost = None;
     let mut head = ForkChoiceNode::new(justified_root, PayloadStatus::Pending);
     loop {
         let mut best: Option<((Gwei, Root, u8), ForkChoiceNode)> = None;
@@ -38,7 +40,7 @@ pub fn get_head<E: Preset>(store: &Store<E>) -> Result<ForkChoiceNode, Error> {
                 continue;
             }
             let key = (
-                get_weight(store, &child)?,
+                weight(store, &child, &mut boost)?,
                 child.root,
                 get_payload_status_tiebreaker(store, &child)?,
             );
@@ -64,7 +66,8 @@ pub fn get_filtered_node_tree<E: Preset>(
 
 /// `get_node_children` (G L614-628): the EMPTY node and, with a verified payload, the FULL
 /// node of a PENDING node; else the PENDING nodes of the blocks that build on the payload
-/// status of `node`.
+/// status of `node`, in the order of import. The blocks come from the index of children of
+/// the store, which `on_block` fills with `get_parent_payload_status` of each block.
 pub fn get_node_children<E: Preset>(
     store: &Store<E>,
     node: &ForkChoiceNode,
@@ -76,15 +79,11 @@ pub fn get_node_children<E: Preset>(
         }
         return Ok(children);
     }
-    let mut children = Vec::new();
-    for (root, block) in &store.blocks {
-        if block.parent_root == node.root
-            && get_parent_payload_status(store, block)? == node.payload_status
-        {
-            children.push(ForkChoiceNode::new(*root, PayloadStatus::Pending));
-        }
-    }
-    Ok(children)
+    let roots = store.children.get(node).map_or(&[][..], Vec::as_slice);
+    Ok(roots
+        .iter()
+        .map(|root| ForkChoiceNode::new(*root, PayloadStatus::Pending))
+        .collect())
 }
 
 /// `filter_node_tree` (P0 L427-467): a node is viable if a leaf below it is viable. An
@@ -167,28 +166,93 @@ fn get_voting_source<E: Preset>(store: &Store<E>, block_root: Root) -> Result<Ch
 
 /// `get_weight` (G L567-589).
 pub fn get_weight<E: Preset>(store: &Store<E>, node: &ForkChoiceNode) -> Result<Gwei, Error> {
+    weight(store, node, &mut None)
+}
+
+/// `get_weight` with the [`Boost`] of the caller. `boost` is computed at the first node that
+/// passes `is_previous_slot_payload_decision`, as the spec reads the justified state and
+/// `should_apply_proposer_boost` there first, so the call fails where the spec fails.
+fn weight<E: Preset>(
+    store: &Store<E>,
+    node: &ForkChoiceNode,
+    boost: &mut Option<Boost>,
+) -> Result<Gwei, Error> {
     if is_previous_slot_payload_decision(store, node)? {
         return Ok(0);
     }
     let state = store.justified_state()?;
     let attestation_score = get_attestation_score(store, node, state)?;
-    if !should_apply_proposer_boost(store)? {
-        return Ok(attestation_score);
-    }
-    let proposer_boost_node =
-        ForkChoiceNode::new(store.proposer_boost_root, PayloadStatus::Pending);
-    let proposer_score = if is_ancestor(store, proposer_boost_node, *node)? {
-        calculate_committee_fraction(state, PROPOSER_SCORE_BOOST)?
-    } else {
-        0
+    let boost = match boost {
+        Some(boost) => boost,
+        None => boost.insert(Boost::new(store, state)?),
     };
+    let proposer_score = boost.proposer_score(node)?;
     attestation_score
         .checked_add(proposer_score)
         .ok_or(Error::Overflow)
 }
 
+/// The proposer boost part of `get_weight` (G L578-588), which does not depend on the node.
+enum Boost {
+    /// `should_apply_proposer_boost` is false, or the boosted block is not in the store any
+    /// more. A pruned boosted block does not descend from the finalized block, so it is an
+    /// ancestor of no node that the store keeps.
+    Off,
+    On {
+        /// The status of each block on the chain of the PENDING node of the boosted block
+        /// down to the anchor: the root and the status of `get_ancestor(boost_node, slot)`
+        /// for each slot. With it, `is_ancestor(boost_node, node)` is a lookup.
+        chain: HashMap<Root, PayloadStatus>,
+        /// `calculate_committee_fraction(justified_state, PROPOSER_SCORE_BOOST)`. The spec
+        /// computes it only for an ancestor of the boosted block, so an error waits for one.
+        score: Result<Gwei, Error>,
+    },
+}
+
+impl Boost {
+    fn new<E: Preset>(store: &Store<E>, state: &BeaconState<E>) -> Result<Self, Error> {
+        let root = store.proposer_boost_root;
+        if !store.blocks.contains_key(&root) || !should_apply_proposer_boost(store)? {
+            return Ok(Self::Off);
+        }
+        let mut chain = HashMap::new();
+        let mut node = ForkChoiceNode::new(root, PayloadStatus::Pending);
+        loop {
+            chain.insert(node.root, node.payload_status);
+            let block = store.get_block(node.root)?;
+            if node.root == store.anchor_root {
+                break;
+            }
+            node = ForkChoiceNode::new(block.parent_root, get_parent_payload_status(store, block)?);
+        }
+        let score = calculate_committee_fraction(state, PROPOSER_SCORE_BOOST);
+        Ok(Self::On { chain, score })
+    }
+
+    /// The proposer score of `node`: `is_ancestor(boost_node, node)` (G L406-415) gives the
+    /// score, else zero. `node.root` is in the store.
+    fn proposer_score(&self, node: &ForkChoiceNode) -> Result<Gwei, Error> {
+        let Self::On { chain, score } = self else {
+            return Ok(0);
+        };
+        let is_ancestor = chain.get(&node.root).is_some_and(|status| {
+            node.payload_status == *status || node.payload_status == PayloadStatus::Pending
+        });
+        if is_ancestor {
+            score.clone()
+        } else {
+            Ok(0)
+        }
+    }
+}
+
 /// `get_attestation_score` (P0 L338-356). It walks the latest messages instead of the
 /// registry: the sum is the same, and the store has few messages or none.
+///
+/// A message for a block that the store does not have counts for no node. Only a prune
+/// drops a block that a message names, and such a block is not a descendant of the
+/// finalized block, so in the spec's store, which keeps it, the message supports no node
+/// that the pruned store keeps.
 fn get_attestation_score<E: Preset>(
     store: &Store<E>,
     node: &ForkChoiceNode,
@@ -209,7 +273,10 @@ fn get_attestation_score<E: Preset>(
         {
             continue;
         }
-        if is_ancestor(store, get_supported_node(store, message)?, *node)? {
+        let Some(block) = store.blocks.get(&message.root) else {
+            continue;
+        };
+        if is_ancestor(store, get_supported_node(block, message), *node)? {
             score = score
                 .checked_add(validator.effective_balance)
                 .ok_or(Error::Overflow)?;
@@ -218,12 +285,11 @@ fn get_attestation_score<E: Preset>(
     Ok(score)
 }
 
-/// `get_supported_node` (G L436-451).
+/// `get_supported_node` (G L436-451). `block` is `store.blocks[message.root]`.
 fn get_supported_node<E: Preset>(
-    store: &Store<E>,
+    block: &BeaconBlock<E>,
     message: &LatestMessage,
-) -> Result<ForkChoiceNode, Error> {
-    let block = store.get_block(message.root)?;
+) -> ForkChoiceNode {
     let payload_status = if block.slot >= message.slot {
         PayloadStatus::Pending
     } else if message.payload_present {
@@ -231,7 +297,7 @@ fn get_supported_node<E: Preset>(
     } else {
         PayloadStatus::Empty
     };
-    Ok(ForkChoiceNode::new(message.root, payload_status))
+    ForkChoiceNode::new(message.root, payload_status)
 }
 
 /// `calculate_committee_fraction` (P0 L300-307). `compute_proposer_score` and
@@ -271,7 +337,7 @@ fn is_previous_slot_payload_decision<E: Preset>(
 /// differ only in the votes they count.
 fn payload_vote<E: Preset>(
     store: &Store<E>,
-    votes: &std::collections::HashMap<Root, Vec<Option<bool>>>,
+    votes: &HashMap<Root, Vec<Option<bool>>>,
     root: Root,
     value: bool,
 ) -> Result<bool, Error> {
@@ -330,21 +396,15 @@ fn should_apply_proposer_boost<E: Preset>(store: &Store<E>) -> Result<bool, Erro
     if parent.slot.saturating_add(1) < slot || !is_head_weak(store, parent_root)? {
         return Ok(true);
     }
-    // A weak parent of the previous slot: boost only without an early equivocation.
-    for (root, other) in &store.blocks {
-        let timely = store
-            .block_timeliness
-            .get(root)
-            .ok_or(Error::UnknownBlock(*root))?[PTC_TIMELINESS_INDEX];
-        if timely
-            && other.proposer_index == parent.proposer_index
-            && other.slot.checked_add(1) == Some(slot)
-            && *root != parent_root
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    // A weak parent of the previous slot: boost only without an early equivocation, a block
+    // of the parent's slot and proposer that was timely for the PTC deadline.
+    let early_equivocation = slot.checked_sub(1).is_some_and(|previous_slot| {
+        store
+            .ptc_timely_proposals
+            .get(&(previous_slot, parent.proposer_index))
+            .is_some_and(|roots| roots.iter().any(|root| *root != parent_root))
+    });
+    Ok(!early_equivocation)
 }
 
 /// `is_head_weak` (G L810-832). The equivocation term needs the committees of the head slot
@@ -392,8 +452,13 @@ pub fn is_valid_dependent_root<E: Preset>(
     if root == get_head(store)?.root {
         return Ok(true);
     }
-    Ok(store
-        .blocks
-        .values()
-        .any(|block| block.parent_root == root && block.slot > dependent_slot))
+    for payload_status in [PayloadStatus::Empty, PayloadStatus::Full] {
+        let parent = ForkChoiceNode::new(root, payload_status);
+        for child in get_node_children(store, &parent)? {
+            if store.get_block(child.root)?.slot > dependent_slot {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
