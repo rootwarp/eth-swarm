@@ -648,3 +648,37 @@ fn checkpoint_anchor_ancestor_walk_stops_at_the_anchor() {
     );
     assert_eq!(store.block(below), None);
 }
+
+/// A provider whose post-state has no participation, so the pull-up of the checkpoints after
+/// the state transition fails.
+fn no_participation(state: &mut BeaconState<E>) {
+    state.previous_epoch_participation = Default::default();
+    state.current_epoch_participation = Default::default();
+}
+
+#[test]
+fn refused_calls_leave_every_field_of_the_store_unchanged() {
+    let (mut store, anchor_block) = new_store();
+    tick(&mut store, 1);
+    let a = child(&anchor_block, 1, false, 1);
+    on_block(&mut store, &PLAIN, &a).unwrap();
+    tick(&mut store, 17);
+    let before = store.clone();
+    let mut orphan = child(&a.message, 2, false, 2);
+    orphan.message.parent_root = Root::repeat_byte(0x45);
+    let late_pull_up = Provider(no_participation);
+    let cases: [(&dyn StateProvider<E>, SignedBeaconBlock<E>); 5] = [
+        (&PLAIN, orphan),
+        (&PLAIN, child(&a.message, 18, false, 3)),
+        (&Refuse, child(&a.message, 17, false, 4)),
+        (&PLAIN, child(&a.message, 17, true, 5)),
+        (&late_pull_up, child(&a.message, 17, false, 6)),
+    ];
+    for (provider, block) in &cases {
+        let got = on_block(&mut store, *provider, block);
+        assert!(got.is_err(), "slot {}: {got:?}", block.message.slot);
+        assert!(store == before, "slot {}: {got:?}", block.message.slot);
+    }
+    assert!(on_tick(&mut store, GENESIS_TIME * 1000 - 1).is_err());
+    assert!(store == before);
+}

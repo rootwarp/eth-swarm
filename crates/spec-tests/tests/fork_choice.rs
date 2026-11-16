@@ -9,7 +9,8 @@
 
 use consensus_types::common::AttestationData;
 use consensus_types::gloas::{
-    Attestation, BeaconBlock, BeaconState, Checkpoint, SignedBeaconBlock,
+    Attestation, BeaconBlock, BeaconState, Checkpoint, PayloadAttestation, PayloadAttestationData,
+    SignedBeaconBlock,
 };
 use consensus_types::primitives::{Root, Slot};
 use consensus_types::Minimal;
@@ -148,7 +149,12 @@ impl CaseDir {
 
     /// Runs the case and checks that the runner read every file of it.
     fn run(&self) -> Result<(), String> {
-        let case = self.case("on_block");
+        self.run_as("on_block")
+    }
+
+    /// [`CaseDir::run`] for a case of `handler`.
+    fn run_as(&self, handler: &str) -> Result<(), String> {
+        let case = self.case(handler);
         let reads = Reads::default();
         let result = run(&reads, &case);
         if result.is_ok() {
@@ -456,4 +462,115 @@ fn a_case_of_another_preset_or_handler_fails() {
     let other = case.case("on_attestation");
     let err = run(&Reads::default(), &other).unwrap_err();
     assert!(err.contains("on_attestation"), "{err}");
+}
+
+#[test]
+fn ex_ante_runs_as_a_handler_of_tick_and_block_steps() {
+    assert!(RUNNABLE.contains(&"ex_ante"));
+    assert!(!NOT_RUN.contains(&"ex_ante"));
+    assert_eq!(handler_runs("ex_ante"), Ok(true));
+    for preset in ["minimal", "mainnet"] {
+        assert!(supported("gloas", preset, "ex_ante"), "{preset}");
+    }
+    let (_, block) = anchor();
+    let root = block.tree_hash_root();
+    let mut case = CaseDir::new(BLS_OFF);
+    case.steps(&checks(GENESIS_TIME, root, root, 0, Root::ZERO));
+    assert_eq!(case.run_as("ex_ante"), Ok(()));
+}
+
+#[test]
+fn a_case_must_run_at_least_one_check() {
+    let (_, block) = anchor();
+    let root = block.tree_hash_root();
+    for steps in [
+        "[]\n".to_owned(),
+        format!("- tick: {}\n", time_at(1)),
+        format!("- tick: {}\n- checks: {{}}\n", time_at(1)),
+        // A checks step with no check fails, also after a step with checks.
+        checks(GENESIS_TIME, root, root, 0, Root::ZERO) + "- checks: {}\n",
+    ] {
+        let mut case = CaseDir::new(BLS_OFF);
+        case.steps(&steps);
+        match case.run() {
+            Err(err) => assert!(err.contains("check"), "{steps}: {err}"),
+            Ok(()) => panic!("a case with no check passes: {steps}"),
+        }
+    }
+}
+
+/// `PTC_SIZE` of the minimal preset.
+const PTC_SIZE: usize = 16;
+
+/// The post-state of `block` on `state`, with BLS off and no state root check.
+fn post_state(state: &BeaconState<E>, block: &SignedBeaconBlock<E>) -> BeaconState<E> {
+    let mut post = state.clone();
+    let backend = ContractBackend::new([]);
+    state_transition(&mut post, block, false, &bls_context(&backend)).unwrap();
+    post
+}
+
+/// [`block_on`] with a payload attestation of every PTC member for the block of `state`, which
+/// must be of the slot before `slot`.
+fn block_with_ptc_votes(state: &BeaconState<E>, slot: Slot) -> SignedBeaconBlock<E> {
+    let mut at_slot = state.clone();
+    process_slots(&mut at_slot, slot, &no_bls()).unwrap();
+    let mut block = block_at_state_slot(&at_slot);
+    block.message.body.signed_execution_payload_bid =
+        bid_for_state(&at_slot, BUILDER_INDEX_SELF_BUILD, 0);
+    let mut aggregation_bits = BitVector::new();
+    for position in 0..PTC_SIZE {
+        aggregation_bits.set(position, true).unwrap();
+    }
+    let data = PayloadAttestationData {
+        beacon_block_root: block.message.parent_root,
+        slot: slot - 1,
+        payload_present: true,
+        blob_data_available: true,
+    };
+    block
+        .message
+        .body
+        .payload_attestations
+        .push(PayloadAttestation {
+            aggregation_bits,
+            data,
+            signature: [0; 96],
+        })
+        .unwrap();
+    let mut post = post_state(state, &block);
+    block.message.state_root = state_root(&mut post).unwrap();
+    block
+}
+
+#[test]
+fn a_repeated_block_with_payload_attestations_fails_closed() {
+    let (state, anchor_block) = anchor();
+    let anchor = anchor_block.tree_hash_root();
+    let first = block_on(&state, 1);
+    let second = block_with_ptc_votes(&post_state(&state, &first), 2);
+    let root = second.message.tree_hash_root();
+    let once = format!(
+        "- tick: {}\n- block: {}\n- block: {}\n",
+        time_at(2),
+        block_name(&first),
+        block_name(&second)
+    );
+    let repeat = format!("- block: {}\n", block_name(&second));
+    // The spec's on_block runs again for a known block and gives its PTC votes to the store
+    // again, but fork_choice::on_block returns early, so the runner must refuse the step.
+    for (steps, want) in [
+        (once.clone(), None),
+        (once + &repeat, Some("payload attestations")),
+    ] {
+        let mut case = CaseDir::new(BLS_OFF);
+        case.block(&first);
+        case.block(&second);
+        case.steps(&(steps + &checks(time_at(2), anchor, root, 2, root)));
+        match (case.run(), want) {
+            (Ok(()), None) => {}
+            (Err(err), Some(needle)) => assert!(err.contains(needle), "{needle}: {err}"),
+            (got, want) => panic!("got {got:?}, want {want:?}"),
+        }
+    }
 }
