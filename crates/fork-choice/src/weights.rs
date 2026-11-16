@@ -170,8 +170,9 @@ pub fn get_weight<E: Preset>(store: &Store<E>, node: &ForkChoiceNode) -> Result<
 }
 
 /// `get_weight` with the [`Boost`] of the caller. `boost` is computed at the first node that
-/// passes `is_previous_slot_payload_decision`, as the spec reads the justified state and
-/// `should_apply_proposer_boost` there first, so the call fails where the spec fails.
+/// is not a payload decision of the previous slot (`is_previous_slot_payload_decision`). The
+/// spec first reads the justified state and `should_apply_proposer_boost` at that node too, so
+/// the call fails where the spec fails.
 fn weight<E: Preset>(
     store: &Store<E>,
     node: &ForkChoiceNode,
