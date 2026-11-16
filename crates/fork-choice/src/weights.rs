@@ -195,9 +195,7 @@ fn weight<E: Preset>(
 
 /// The proposer boost part of `get_weight` (G L578-588), which does not depend on the node.
 enum Boost {
-    /// `should_apply_proposer_boost` is false, or the boosted block is not in the store any
-    /// more. A pruned boosted block does not descend from the finalized block, so it is an
-    /// ancestor of no node that the store keeps.
+    /// `should_apply_proposer_boost` is false.
     Off,
     On {
         /// The status of each block on the chain of the PENDING node of the boosted block
@@ -213,7 +211,7 @@ enum Boost {
 impl Boost {
     fn new<E: Preset>(store: &Store<E>, state: &BeaconState<E>) -> Result<Self, Error> {
         let root = store.proposer_boost_root;
-        if !store.blocks.contains_key(&root) || !should_apply_proposer_boost(store)? {
+        if !should_apply_proposer_boost(store)? {
             return Ok(Self::Off);
         }
         let mut chain = HashMap::new();

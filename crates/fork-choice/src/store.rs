@@ -429,7 +429,10 @@ pub fn is_ancestor<E: Preset>(
 ///
 /// If the finalized block is not in the store, or the justified or the unrealized justified
 /// block does not descend from it, nothing is dropped: the walks of the subtree of that
-/// block need the blocks below the finalized block.
+/// block need the blocks below the finalized block. Nothing is dropped either while the
+/// proposer boost names a block that does not descend from it: `should_extend_payload` and
+/// `should_apply_proposer_boost` read `store.blocks[store.proposer_boost_root]`. The boost
+/// is of the current slot, so the first tick of the next slot clears it and then prunes.
 pub(crate) fn prune<E: Preset>(store: &mut Store<E>) {
     let finalized = store.finalized_checkpoint.clone();
     if finalized.root == store.anchor_root || !store.blocks.contains_key(&finalized.root) {
@@ -451,7 +454,10 @@ pub(crate) fn prune<E: Preset>(store: &mut Store<E>) {
         &store.justified_checkpoint,
         &store.unrealized_justified_checkpoint,
     ];
-    if justified.iter().any(|c| !keep.contains(&c.root)) {
+    let boost = store.proposer_boost_root;
+    if justified.iter().any(|c| !keep.contains(&c.root))
+        || (boost != Root::ZERO && !keep.contains(&boost))
+    {
         return;
     }
     store.blocks.retain(|root, _| keep.contains(root));
