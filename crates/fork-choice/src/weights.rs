@@ -442,13 +442,21 @@ fn is_head_weak<E: Preset>(store: &Store<E>, head_root: Root) -> Result<bool, Er
 }
 
 /// `is_valid_dependent_root` (G L732-744): `root` is, or can become, the latest block at or
-/// before `dependent_slot` on some branch.
+/// before `dependent_slot` on some branch. The spec scans `store.blocks` for a child of
+/// `root`. The index of children has every block but the anchor, whose parent is not in the
+/// store, so the edge from the anchor to its parent is checked first.
 pub fn is_valid_dependent_root<E: Preset>(
     store: &Store<E>,
     root: Root,
     dependent_slot: Slot,
 ) -> Result<bool, Error> {
     if root == get_head(store)?.root {
+        return Ok(true);
+    }
+    // A root only on a branch that a prune dropped for a conflict with finality is false
+    // here and true in the spec's store. That branch cannot become canonical.
+    let anchor = store.get_block(store.anchor_root)?;
+    if anchor.parent_root == root && anchor.slot > dependent_slot {
         return Ok(true);
     }
     for payload_status in [PayloadStatus::Empty, PayloadStatus::Full] {
