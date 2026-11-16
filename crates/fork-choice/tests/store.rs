@@ -682,3 +682,33 @@ fn refused_calls_leave_every_field_of_the_store_unchanged() {
     assert!(on_tick(&mut store, GENESIS_TIME * 1000 - 1).is_err());
     assert!(store == before);
 }
+
+#[test]
+fn get_head_breaks_a_tie_of_weight_with_the_larger_root() {
+    for reverse in [false, true] {
+        let (mut store, anchor_block) = new_store();
+        tick(&mut store, 2);
+        // Both blocks are late, so neither gets the proposer boost, and no votes give
+        // weight: both PENDING nodes weigh zero.
+        let mut blocks = [
+            child(&anchor_block, 1, false, 1),
+            child(&anchor_block, 1, false, 2),
+        ];
+        if reverse {
+            blocks.reverse();
+        }
+        for block in &blocks {
+            on_block(&mut store, &PLAIN, block).unwrap();
+        }
+        let roots = blocks.each_ref().map(root_of);
+        for root in roots {
+            assert_eq!(get_weight(&store, &pending(root)), Ok(0));
+        }
+        let larger = roots.into_iter().max().unwrap();
+        assert_eq!(
+            get_head(&store).map(|n| n.root),
+            Ok(larger),
+            "reverse: {reverse}"
+        );
+    }
+}

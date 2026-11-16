@@ -578,3 +578,28 @@ fn a_repeated_block_with_payload_attestations_fails_closed() {
         }
     }
 }
+
+#[test]
+fn a_failed_state_transition_proves_a_block_invalid() {
+    let (state, anchor_block) = anchor();
+    let anchor = anchor_block.tree_hash_root();
+    let mut block = block_on(&state, 1);
+    block.message.state_root = Root::repeat_byte(0x66);
+    // The transition fails on the state root, which proves the block invalid: a step with
+    // `valid: false` passes, and the store keeps the anchor as head.
+    for (valid, outcome) in [("false", None), ("true", Some("state root mismatch"))] {
+        let mut case = CaseDir::new(BLS_OFF);
+        case.block(&block);
+        let steps = format!(
+            "- tick: {}\n- block: {}\n  valid: {valid}\n",
+            time_at(1),
+            block_name(&block)
+        ) + &checks(time_at(1), anchor, anchor, 0, Root::ZERO);
+        case.steps(&steps);
+        match (case.run(), outcome) {
+            (Ok(()), None) => {}
+            (Err(err), Some(needle)) => assert!(err.contains(needle), "{needle}: {err}"),
+            (got, want) => panic!("valid: {valid}: got {got:?}, want {want:?}"),
+        }
+    }
+}
