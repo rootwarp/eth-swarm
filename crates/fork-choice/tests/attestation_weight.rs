@@ -272,14 +272,23 @@ fn finalized_branch_wins_over_heavier_votes_and_refuses_a_block_off_it() {
 
     // A block on `b` does not descend from the finalized checkpoint. on_block must refuse it
     // and keep the store.
-    tick(&mut store, 10);
-    let d = child(&b.message, 10, false, 4);
+    let d = child(&b.message, 9, false, 4);
     assert_eq!(
         on_block(&mut store, &PLAIN, &d),
         Err(Error::NotFinalizedDescendant {
             finalized: ra,
             checkpoint_block: rb,
         })
+    );
+    assert_eq!(store.block(root_of(&d)), None);
+    assert_eq!(get_head(&store), Ok(empty(rc)));
+    // The next tick drops `b`, so on_block refuses a block on it for its unknown parent.
+    tick(&mut store, 10);
+    assert_eq!(store.block(rb), None);
+    let d = child(&b.message, 10, false, 4);
+    assert_eq!(
+        on_block(&mut store, &PLAIN, &d),
+        Err(Error::UnknownParent(rb))
     );
     assert_eq!(store.block(root_of(&d)), None);
     assert_eq!(get_head(&store), Ok(empty(rc)));

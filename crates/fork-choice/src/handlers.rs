@@ -8,8 +8,8 @@ use crate::store::{
     compute_slot_at_time_ms, compute_slots_since_epoch_start, compute_start_slot_at_epoch,
     compute_time_at_slot_ms, get_ancestor, get_checkpoint_block, get_current_slot,
     get_current_store_epoch, get_parent_payload_status, get_slot_component_duration_ms,
-    get_time_into_slot_ms, is_payload_verified, key, ptc_size, ForkChoiceNode, PayloadStatus,
-    Store, ATTESTATION_TIMELINESS_INDEX, PTC_TIMELINESS_INDEX,
+    get_time_into_slot_ms, is_payload_verified, key, prune, ptc_size, ForkChoiceNode,
+    PayloadStatus, Store, ATTESTATION_TIMELINESS_INDEX, PTC_TIMELINESS_INDEX,
 };
 use crate::weights::get_head;
 use crate::{Error, ATTESTATION_DUE_BPS_GLOAS, PAYLOAD_ATTESTATION_DUE_BPS};
@@ -39,6 +39,10 @@ pub trait StateProvider<E: Preset> {
 
 /// `on_tick` (P0 L946-954): one `on_tick_per_slot` for each slot start up to `time_ms`, then
 /// one at `time_ms`. A time before genesis fails and leaves the store as it was.
+///
+/// Then, if the finalized checkpoint moved since the last prune, the store drops the blocks
+/// that do not descend from the finalized block (`store::prune`). This is not in the spec, and it
+/// does not change the result of a handler or of `get_head`.
 pub fn on_tick<E: Preset>(store: &mut Store<E>, time_ms: u64) -> Result<(), Error> {
     let tick_slot = compute_slot_at_time_ms(store, time_ms)?;
     while get_current_slot(store) < tick_slot {
@@ -49,6 +53,7 @@ pub fn on_tick<E: Preset>(store: &mut Store<E>, time_ms: u64) -> Result<(), Erro
         on_tick_per_slot(store, next_slot_time_ms);
     }
     on_tick_per_slot(store, time_ms);
+    prune(store);
     Ok(())
 }
 

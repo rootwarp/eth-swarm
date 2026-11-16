@@ -24,7 +24,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 const GENESIS_EPOCH: u64 = 0;
 
 /// `get_head` (G L638-670). The parts of `get_weight` that are the same for each node are
-/// computed once for the call ([`Boost`]), not once for each node.
+/// computed once for the call (`Boost`), not once for each node.
 pub fn get_head<E: Preset>(store: &Store<E>) -> Result<ForkChoiceNode, Error> {
     let nodes = get_filtered_node_tree(store)?;
     let justified_root = store.justified_checkpoint.root;

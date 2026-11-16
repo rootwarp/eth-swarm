@@ -318,3 +318,39 @@ fn a_dropped_early_equivocation_still_withholds_the_proposer_boost() {
         );
     }
 }
+
+#[test]
+fn the_store_keeps_every_block_while_the_justified_block_is_off_the_finalized_branch() {
+    let (mut store, anchor_block) = new_store();
+    tick(&mut store, 1);
+    let a = child(&anchor_block, 1, 1);
+    let b = child(&anchor_block, 1, 2);
+    for block in [&a, &b] {
+        on_block(&mut store, &PLAIN, block).unwrap();
+    }
+    tick(&mut store, 9);
+    // Only a slashable majority can justify `b` after it finalizes `a`. The walks of the
+    // subtree of `b` need the blocks below `a`, so the prune must wait.
+    let (finalized, justified) = (
+        Checkpoint {
+            epoch: 1,
+            root: root_of(&a),
+        },
+        Checkpoint {
+            epoch: 1,
+            root: root_of(&b),
+        },
+    );
+    let conflicting = Provider(move |state: &mut BeaconState<E>| {
+        state.current_justified_checkpoint = justified.clone();
+        state.finalized_checkpoint = finalized.clone();
+    });
+    let c = child(&a.message, 9, 3);
+    on_block(&mut store, &conflicting, &c).unwrap();
+    assert_eq!(store.justified_checkpoint().root, root_of(&b));
+    assert_eq!(store.finalized_checkpoint().root, root_of(&a));
+    tick(&mut store, 10);
+    for root in [anchor_block.tree_hash_root(), root_of(&b)] {
+        assert!(store.block(root).is_some());
+    }
+}

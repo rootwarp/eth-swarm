@@ -13,6 +13,10 @@
 //! here yet. Until they are, only the test seams of `testing` (tests only) fill
 //! `store.latest_messages`, `store.equivocating_indices` and `store.payloads`.
 //!
+//! The spec's store keeps every block. Here `on_tick` also drops the blocks that do not
+//! descend from the finalized checkpoint block once finality moves, with no change to the
+//! result of a handler or of [`get_head`] ([`on_tick`]).
+//!
 //! The spec signals an invalid call with a failed `assert` or a missing key. Here each public
 //! handler returns an [`Error`] instead, and a failed handler leaves the store as it was.
 //! Each ported function cites its spec lines: G `gloas/fork-choice.md`, P0

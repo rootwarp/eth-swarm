@@ -404,6 +404,77 @@ pub fn is_ancestor<E: Preset>(
             || ancestor.payload_status == PayloadStatus::Pending))
 }
 
+/// Not a spec function: drops what the store does not need once finality moves. `on_tick`
+/// calls it, so the store prunes at the first tick after `on_block` or a tick moves the
+/// finalized checkpoint.
+///
+/// It keeps the finalized checkpoint block and its descendants, and drops every other block
+/// with the per-block entries of each, the index of children of each, and the checkpoint
+/// states of earlier epochs or of dropped blocks. The finalized block becomes the anchor, so
+/// the ancestor walk stops there ([`get_ancestor`]). Latest messages and equivocating
+/// indices stay as the spec keeps them.
+///
+/// The spec's store keeps every block, and `get_head`, `get_weight` and the asserts of
+/// `on_block` give the same result on the pruned store:
+/// - The filtered tree starts at the justified block, a descendant of the finalized block,
+///   and every walk up from a descendant stops at or above the finalized block.
+/// - A message for a dropped block supports no node of the subtree ([`crate::get_weight`]).
+/// - A block on a dropped block fails with [`crate::Error::UnknownParent`], where the spec's
+///   store fails the finalized descendant assert.
+/// - The PTC-timely proposals of the previous slot and later stay, also of dropped blocks,
+///   for the early equivocation check of a later boost.
+///
+/// If the finalized block is not in the store, or the justified or the unrealized justified
+/// block does not descend from it, nothing is dropped: the walks of the subtree of that
+/// block need the blocks below the finalized block.
+pub(crate) fn prune<E: Preset>(store: &mut Store<E>) {
+    let finalized = store.finalized_checkpoint.clone();
+    if finalized.root == store.anchor_root || !store.blocks.contains_key(&finalized.root) {
+        return;
+    }
+    let mut keep = HashSet::from([finalized.root]);
+    let mut next = vec![finalized.root];
+    while let Some(root) = next.pop() {
+        for payload_status in [PayloadStatus::Empty, PayloadStatus::Full] {
+            let node = ForkChoiceNode::new(root, payload_status);
+            for child in store.children.get(&node).into_iter().flatten() {
+                if keep.insert(*child) {
+                    next.push(*child);
+                }
+            }
+        }
+    }
+    let justified = [
+        &store.justified_checkpoint,
+        &store.unrealized_justified_checkpoint,
+    ];
+    if justified.iter().any(|c| !keep.contains(&c.root)) {
+        return;
+    }
+    store.blocks.retain(|root, _| keep.contains(root));
+    store.block_states.retain(|root, _| keep.contains(root));
+    store.block_timeliness.retain(|root, _| keep.contains(root));
+    store
+        .unrealized_justifications
+        .retain(|root, _| keep.contains(root));
+    store.payloads.retain(|root| keep.contains(root));
+    store
+        .payload_timeliness_vote
+        .retain(|root, _| keep.contains(root));
+    store
+        .payload_data_availability_vote
+        .retain(|root, _| keep.contains(root));
+    store.children.retain(|node, _| keep.contains(&node.root));
+    store
+        .checkpoint_states
+        .retain(|(epoch, root), _| *epoch >= finalized.epoch && keep.contains(root));
+    // A later boosted block is of the current slot or later, so the check reads the
+    // previous slot or later.
+    let first_slot = get_current_slot(store).saturating_sub(1);
+    store.ptc_timely_proposals = store.ptc_timely_proposals.split_off(&(first_slot, 0));
+    store.anchor_root = finalized.root;
+}
+
 /// `get_checkpoint_block` (G L421-428).
 pub fn get_checkpoint_block<E: Preset>(
     store: &Store<E>,
