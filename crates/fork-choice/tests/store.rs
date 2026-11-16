@@ -649,6 +649,23 @@ fn checkpoint_anchor_ancestor_walk_stops_at_the_anchor() {
     assert_eq!(store.block(below), None);
 }
 
+#[test]
+fn checkpoint_anchor_parent_is_a_valid_dependent_root_before_the_anchor_slot() {
+    let (mut store, anchor_block) = checkpoint_store(24);
+    let parent = anchor_block.parent_root;
+    // The store does not have the parent of the anchor, but the anchor builds on it. The spec
+    // scans `store.blocks`, so the anchor must count as a later child of its parent.
+    assert_eq!(is_valid_dependent_root(&store, parent, 23), Ok(true));
+    assert_eq!(is_valid_dependent_root(&store, parent, 0), Ok(true));
+    // No block after the anchor slot builds on the parent.
+    assert_eq!(is_valid_dependent_root(&store, parent, 24), Ok(false));
+    tick(&mut store, 25);
+    let block = child(&anchor_block, 25, false, 1);
+    on_block(&mut store, &PLAIN, &block).unwrap();
+    assert_eq!(is_valid_dependent_root(&store, parent, 24), Ok(false));
+    assert_eq!(is_valid_dependent_root(&store, parent, 23), Ok(true));
+}
+
 /// A provider whose post-state has no participation, so the pull-up of the checkpoints after
 /// the state transition fails.
 fn no_participation(state: &mut BeaconState<E>) {

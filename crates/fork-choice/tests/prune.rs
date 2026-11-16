@@ -11,11 +11,11 @@
 use consensus_types::gloas::{BeaconBlock, BeaconState, Checkpoint, SignedBeaconBlock};
 use consensus_types::primitives::{Gwei, Root, Slot, ValidatorIndex};
 use consensus_types::Minimal;
-use fork_choice::testing::{add_equivocating_index, set_latest_message};
+use fork_choice::testing::{add_equivocating_index, mark_payload_verified, set_latest_message};
 use fork_choice::{
-    get_ancestor, get_filtered_node_tree, get_forkchoice_store, get_head, get_weight, on_block,
-    on_tick, store_target_checkpoint_state, Error, ForkChoiceNode, LatestMessage, PayloadStatus,
-    StateProvider, Store,
+    get_ancestor, get_filtered_node_tree, get_forkchoice_store, get_head, get_weight,
+    is_valid_dependent_root, on_block, on_tick, store_target_checkpoint_state, Error,
+    ForkChoiceNode, LatestMessage, PayloadStatus, StateProvider, Store,
 };
 use state_transition::testing::{genesis_state, signed_block};
 use state_transition::{state_root, StfError};
@@ -113,6 +113,13 @@ fn empty(root: Root) -> ForkChoiceNode {
     ForkChoiceNode {
         root,
         payload_status: PayloadStatus::Empty,
+    }
+}
+
+fn full(root: Root) -> ForkChoiceNode {
+    ForkChoiceNode {
+        root,
+        payload_status: PayloadStatus::Full,
     }
 }
 
@@ -353,4 +360,108 @@ fn the_store_keeps_every_block_while_the_justified_block_is_off_the_finalized_br
     for root in [anchor_block.tree_hash_root(), root_of(&b)] {
         assert!(store.block(root).is_some());
     }
+}
+
+#[test]
+fn the_parent_of_the_new_anchor_stays_a_valid_dependent_root_after_the_prune() {
+    let mut f = finalized();
+    assert_eq!(is_valid_dependent_root(&f.store, f.anchor, 0), Ok(true));
+    let time = f.store.time_ms();
+    on_tick(&mut f.store, time).unwrap();
+    assert!(f.store.block(f.anchor).is_none());
+    // `a` of slot 1 is the new anchor, and it builds on the dropped genesis anchor. The spec's
+    // store keeps `a` and its parent edge, so the genesis anchor stays a dependent root for
+    // slot 0.
+    assert_eq!(is_valid_dependent_root(&f.store, f.anchor, 0), Ok(true));
+    assert_eq!(is_valid_dependent_root(&f.store, f.anchor, 1), Ok(false));
+}
+
+/// A store at the start of slot 10, with `a` and `b` of slot 1 on the anchor.
+fn two_branches() -> (Store<E>, SignedBeaconBlock<E>, SignedBeaconBlock<E>) {
+    let (mut store, anchor_block) = new_store();
+    tick(&mut store, 1);
+    let a = child(&anchor_block, 1, 1);
+    let b = child(&anchor_block, 1, 2);
+    for block in [&a, &b] {
+        on_block(&mut store, &PLAIN, block).unwrap();
+    }
+    tick(&mut store, 10);
+    (store, a, b)
+}
+
+/// Adds `c` of slot 9 on `a`, late in slot 10, with no proposer boost. The post-state of `c`
+/// justifies and finalizes epoch 1 with `a`. Then the store keeps the state of the justified
+/// checkpoint, as `on_attestation` does on the spec path.
+fn finalize_late(store: &mut Store<E>, a: &SignedBeaconBlock<E>) -> SignedBeaconBlock<E> {
+    let checkpoint = Checkpoint {
+        epoch: 1,
+        root: root_of(a),
+    };
+    let c = child(&a.message, 9, 3);
+    on_block(store, &finalizing(checkpoint.clone()), &c).unwrap();
+    assert_eq!(store.finalized_checkpoint(), &checkpoint);
+    store_target_checkpoint_state(store, &PLAIN, &checkpoint).unwrap();
+    c
+}
+
+#[test]
+fn a_same_slot_prune_keeps_the_head_when_the_boosted_block_is_on_a_dropped_branch() {
+    let (mut store, a, b) = two_branches();
+    // `y` is timely, so it takes the proposer boost. It is on `b`, and the finality of `a`
+    // drops `b`.
+    let y = child(&b.message, 10, 6);
+    on_block(&mut store, &PLAIN, &y).unwrap();
+    let y = root_of(&y);
+    assert_eq!(store.proposer_boost_root(), y);
+    let c = finalize_late(&mut store, &a);
+    let c_root = root_of(&c);
+    mark_payload_verified(&mut store, c_root);
+    // `c` is of the previous slot, its payload is verified, and `y` does not build on `c`. So
+    // should_extend_payload is true and the FULL node of `c` wins.
+    assert_eq!(get_head(&store), Ok(full(c_root)));
+
+    // A tick in the same slot keeps the boost of `y`. The spec reads `store.blocks[y]` in
+    // should_extend_payload, so the prune must not make `y` unknown.
+    let time = store.time_ms();
+    on_tick(&mut store, time).unwrap();
+    assert_eq!(store.proposer_boost_root(), y);
+    assert_eq!(get_head(&store), Ok(full(c_root)), "boosted block y: {y}");
+    let d = child(&c.message, 10, 4);
+    assert_eq!(on_block(&mut store, &PLAIN, &d), Ok(()));
+    assert!(store.block(root_of(&d)).is_some());
+    assert_eq!(get_head(&store), Ok(full(c_root)));
+
+    // The next slot clears the boost. Then the store drops the blocks beside `a`.
+    tick(&mut store, 11);
+    assert_eq!(store.proposer_boost_root(), Root::ZERO);
+    for root in [root_of(&b), y] {
+        assert!(store.block(root).is_none());
+    }
+    for root in [root_of(&a), c_root, root_of(&d)] {
+        assert!(store.block(root).is_some());
+    }
+}
+
+#[test]
+fn a_same_slot_prune_keeps_the_empty_choice_of_a_boosted_child_of_the_previous_slot_block() {
+    let (mut store, a, b) = two_branches();
+    let c = finalize_late(&mut store, &a);
+    let c_root = root_of(&c);
+    // `z` is timely, so it takes the proposer boost. It builds on the EMPTY node of `c`, and
+    // the payload of `c` is verified after `z`.
+    let z = child(&c.message, 10, 4);
+    on_block(&mut store, &PLAIN, &z).unwrap();
+    let z = root_of(&z);
+    assert_eq!(store.proposer_boost_root(), z);
+    mark_payload_verified(&mut store, c_root);
+    // `z` builds on `c`, and is_parent_node_full of `z` is false. So should_extend_payload is
+    // false and the EMPTY node of `c` wins.
+    assert_eq!(get_head(&store), Ok(empty(z)));
+
+    // `z` descends from `a`, so a tick in the same slot drops the blocks beside `a`.
+    let time = store.time_ms();
+    on_tick(&mut store, time).unwrap();
+    assert_eq!(store.proposer_boost_root(), z);
+    assert!(store.block(root_of(&b)).is_none());
+    assert_eq!(get_head(&store), Ok(empty(z)));
 }
