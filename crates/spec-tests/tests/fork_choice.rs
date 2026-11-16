@@ -169,14 +169,15 @@ impl CaseDir {
 const BLS_OFF: Option<&str> = Some("bls_setting: 2\n");
 
 #[test]
-fn runner_takes_the_four_gloas_handlers_of_tick_and_block_steps() {
+fn runner_takes_the_five_gloas_handlers_of_tick_and_block_steps() {
     assert_eq!(
         RUNNABLE,
         [
             "on_block",
             "get_head",
             "get_parent_payload_status",
-            "filter_node_tree_variants"
+            "filter_node_tree_variants",
+            "ex_ante"
         ]
     );
     for handler in RUNNABLE {
@@ -191,7 +192,6 @@ fn runner_takes_the_four_gloas_handlers_of_tick_and_block_steps() {
         "on_attestation",
         "on_execution_payload_envelope",
         "on_payload_attestation_message",
-        "ex_ante",
         "reorg",
         "withholding",
         "deposit_with_reorg",
@@ -337,14 +337,15 @@ fn signatures_are_checked_unless_the_case_turns_bls_off() {
         let mut case = CaseDir::new(meta);
         case.block(&block);
         case.steps(&format!(
-            "- tick: {}\n- block: {}\n  valid: {valid}\n",
+            "- tick: {}\n- block: {}\n  valid: {valid}\n- checks:\n    time: {}\n",
             time_at(1),
-            block_name(&block)
+            block_name(&block),
+            time_at(1)
         ));
         assert_eq!(case.run().is_ok(), ok, "{meta:?} valid: {valid}");
     }
     let mut case = CaseDir::new(Some("bls_setting: 3\n"));
-    case.steps("- tick: 1606824006\n");
+    case.steps("- tick: 1606824006\n- checks:\n    time: 1606824006\n");
     let err = case.run().unwrap_err();
     assert!(err.contains("bls_setting"), "{err}");
 }
@@ -352,7 +353,10 @@ fn signatures_are_checked_unless_the_case_turns_bls_off() {
 #[test]
 fn a_tick_before_genesis_must_have_the_verdict_of_the_vector() {
     let mut case = CaseDir::new(BLS_OFF);
-    case.steps(&format!("- tick: {}\n  valid: false\n", GENESIS_TIME - 1));
+    case.steps(&format!(
+        "- tick: {}\n  valid: false\n- checks:\n    time: {GENESIS_TIME}\n",
+        GENESIS_TIME - 1
+    ));
     assert_eq!(case.run(), Ok(()));
     let mut case = CaseDir::new(BLS_OFF);
     case.steps(&format!("- tick: {}\n", GENESIS_TIME - 1));

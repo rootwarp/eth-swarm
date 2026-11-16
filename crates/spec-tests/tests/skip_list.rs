@@ -624,7 +624,6 @@ fn other_fork_choice_handlers_and_forks_stay_skipped() {
     let skips = committed();
     for (preset, handler, want) in [
         ("*", "on_attestation", "5.11b"),
-        ("*", "ex_ante", "5.11b"),
         ("minimal", "reorg", "5.11b"),
         ("minimal", "withholding", "5.11b"),
         ("minimal", "should_apply_proposer_boost", "5.11b"),
@@ -666,7 +665,12 @@ fn other_fork_choice_handlers_and_forks_stay_skipped() {
 fn no_wildcard_entry_reaches_the_run_fork_choice_handlers() {
     let skips = committed();
     for preset in ["minimal", "mainnet"] {
-        for handler in ["on_block", "get_head", "get_parent_payload_status"] {
+        for handler in [
+            "on_block",
+            "get_head",
+            "get_parent_payload_status",
+            "ex_ante",
+        ] {
             let k = CaseKey {
                 case: "pyspec_tests/a_new_case".into(),
                 ..consensus("gloas", preset, "fork_choice", handler)

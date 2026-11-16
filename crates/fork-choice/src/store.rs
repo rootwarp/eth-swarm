@@ -76,7 +76,10 @@ pub(crate) const PTC_TIMELINESS_INDEX: usize = 1;
 /// choice that differs between the presets ([`crate::config_values`] lists the others).
 /// `payloads` holds the roots only: fork choice reads only `root in store.payloads`.
 /// `checkpoint_states` is keyed by `(epoch, root)`.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` compares every field, so a caller can check that a refused call left the store
+/// as it was.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Store<E: Preset> {
     pub(crate) slot_duration_ms: NonZeroU64,
     pub(crate) anchor_root: Root,
