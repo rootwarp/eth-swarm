@@ -241,13 +241,14 @@ expires = "2026-11-30"
 
 # ---------------------------------------------------------------------------------------
 # Fork choice. crates/spec-tests/src/fork_choice.rs runs the Gloas handlers on_block,
-# get_head, get_parent_payload_status and filter_node_tree_variants with tick and block steps
-# and store checks only, and it fails closed on any other step or check. The case globs
-# below skip the cases of those handlers that need more: blocks with attestations,
+# get_head, get_parent_payload_status, filter_node_tree_variants and ex_ante with tick and
+# block steps and store checks only, and it fails closed on any other step or check. The
+# entries below skip the cases of those handlers that need more: blocks with attestations,
 # attestation or attester_slashing steps, execution_payload steps or payload vote checks
-# (from the consensus-specs v1.7.0-beta.4 pyspec sources). A new case of a run handler is
-# not skipped, so it runs and fails until it gets an entry or a handler. The other Gloas
-# handlers and every Fulu case are skipped whole, and heze cases fall to the heze entry.
+# (from the consensus-specs v1.7.0-beta.4 pyspec sources). The ex_ante entries name each
+# case. A new case of a run handler is not skipped, so it runs and fails until it gets an
+# entry or a handler. The other Gloas handlers and every Fulu case are skipped whole, and
+# heze cases fall to the heze entry.
 
 [[skip]]
 source  = "consensus-specs"
@@ -409,7 +410,44 @@ fork    = "gloas"
 preset  = "*"
 runner  = "fork_choice"
 handler = "ex_ante"
-reason  = "The handler needs attestation steps in most cases; on_attestation is not ported, and the runner does not run the handler"
+case    = "pyspec_tests/ex_ante_vanilla"
+reason  = "An attestation step gives the weight: on_attestation is not ported, and the runner fails a step that needs it"
+owner   = "ian"
+issue   = "5.11b"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "*"
+runner  = "fork_choice"
+handler = "ex_ante"
+case    = "pyspec_tests/ex_ante_sandwich_with_honest_attestation"
+reason  = "An attestation step of an honest validator gives the weight: on_attestation is not ported, and the runner fails a step that needs it"
+owner   = "ian"
+issue   = "5.11b"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "mainnet"
+runner  = "fork_choice"
+handler = "ex_ante"
+case    = "pyspec_tests/ex_ante_attestations_is_greater_than_proposer_boost_with_boost"
+reason  = "Attestation steps give the weight (a case of mainnet committees only): on_attestation is not ported, and the runner fails a step that needs it"
+owner   = "ian"
+issue   = "5.11b"
+expires = "2026-11-30"
+
+[[skip]]
+source  = "consensus-specs"
+fork    = "gloas"
+preset  = "mainnet"
+runner  = "fork_choice"
+handler = "ex_ante"
+case    = "pyspec_tests/ex_ante_sandwich_with_boost_not_sufficient"
+reason  = "Attestation steps give the weight (a case of mainnet committees only): on_attestation is not ported, and the runner fails a step that needs it"
 owner   = "ian"
 issue   = "5.11b"
 expires = "2026-11-30"

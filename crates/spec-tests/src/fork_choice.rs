@@ -10,13 +10,18 @@
 //! - `tick`: `on_tick(store, seconds_to_milliseconds(tick))`.
 //! - `block`: `on_block`, with `state_transition` and the BLS backend of
 //!   [`crate::bls_backend`] (BLS is on unless `bls_setting: 2`). A step with `valid: false`
-//!   must fail with an error that proves the block invalid. A valid block with attestations
-//!   or attester slashings fails the case: the format then runs `on_attestation` and
-//!   `on_attester_slashing`, which are not ported. The payload attestations of a block need
-//!   no more work: `on_block` gives their votes to the store (`notify_ptc_messages`), and the
-//!   messages that the format makes from them set the same votes again.
+//!   must fail with an error that proves the block invalid, and must leave the store equal
+//!   to the store before the step (as a `tick` with `valid: false` must). A valid block with
+//!   attestations or attester slashings fails the case: the format then runs
+//!   `on_attestation` and `on_attester_slashing`, which are not ported. The payload
+//!   attestations of a block need no more work: `on_block` gives their votes to the store
+//!   (`notify_ptc_messages`), and the messages that the format makes from them set the same
+//!   votes again. A block that the store has and that carries payload attestations fails the
+//!   case: the spec's `on_block` gives its votes again, and `fork_choice::on_block` returns
+//!   early for a known block.
 //! - `checks`: `head` (the slot, root and payload status of `get_head`), `time`,
 //!   `genesis_time`, `justified_checkpoint`, `finalized_checkpoint` and `proposer_boost_root`.
+//!   A `checks` step with no check fails, and so does a case that runs no check.
 //!
 //! Each other step, step key or check key fails the case. Thus a case that needs a handler
 //! or a check that is not here cannot pass because the runner does less.
@@ -38,23 +43,24 @@ use state_transition::per_slot::process_slots;
 use state_transition::{state_transition, BackendError, BlsContext, Preset, StfError};
 use std::num::NonZeroU64;
 use std::path::Path;
+use tree_hash::TreeHash;
 use yaml_rust2::Yaml;
 
 /// The Gloas handler directories that this runner runs.
-pub const RUNNABLE: [&str; 4] = [
+pub const RUNNABLE: [&str; 5] = [
     "on_block",
     "get_head",
     "get_parent_payload_status",
     "filter_node_tree_variants",
+    "ex_ante",
 ];
 
 /// The Gloas handler directories of v1.7.0-beta.4 that this runner does not run: each case
 /// needs a step or a check that it does not have. `testing/skip.toml` skips them.
-pub const NOT_RUN: [&str; 10] = [
+pub const NOT_RUN: [&str; 9] = [
     "on_attestation",
     "on_execution_payload_envelope",
     "on_payload_attestation_message",
-    "ex_ante",
     "reorg",
     "withholding",
     "deposit_with_reorg",
@@ -115,9 +121,14 @@ fn run_case<E: Preset>(reads: &Reads, case: &Case, slot_duration_ms: u64) -> Res
         preset: &case.key.preset,
         bls,
     };
+    let mut checks = 0;
     for (i, step) in steps.iter().enumerate() {
-        apply_step(reads, case, &mut store, &provider, step)
+        checks += apply_step(reads, case, &mut store, &provider, step)
             .map_err(|e| format!("steps.yaml step {i}: {e}"))?;
+    }
+    // A case with no check would pass for any store.
+    if checks == 0 {
+        return Err("steps.yaml runs no check".into());
     }
     Ok(())
 }
@@ -196,14 +207,14 @@ impl<E: Preset> StateProvider<E> for Transition<'_> {
     }
 }
 
-/// Runs one entry of `steps.yaml`.
+/// Runs one entry of `steps.yaml`, and gives the number of checks that it ran.
 fn apply_step<E: Preset>(
     reads: &Reads,
     case: &Case,
     store: &mut Store<E>,
     provider: &Transition<'_>,
     step: &Yaml,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let map = step
         .as_hash()
         .ok_or_else(|| format!("expected a mapping, got {step:?}"))?;
@@ -224,18 +235,22 @@ fn apply_step<E: Preset>(
     };
     if keys.contains(&"tick") {
         only("tick", &["tick", "valid"])?;
-        tick(store, &step["tick"], valid)
+        tick(store, &step["tick"], valid).map(|()| 0)
     } else if keys.contains(&"block") {
         only("block", &["block", "valid"])?;
-        block(reads, case, store, provider, &step["block"], valid)
+        block(reads, case, store, provider, &step["block"], valid).map(|()| 0)
     } else if keys == ["checks"] {
         let checks = step["checks"]
             .as_hash()
             .ok_or("checks: expected a mapping")?;
+        if checks.is_empty() {
+            return Err("a checks step has no check".into());
+        }
         checks.iter().try_for_each(|(key, want)| {
             let key = key.as_str().ok_or("checks: a key is not a string")?;
             check(store, key, want)
-        })
+        })?;
+        Ok(checks.len())
     } else {
         Err(format!(
             "unsupported step {keys:?}: the runner has only tick, block and checks"
@@ -245,9 +260,10 @@ fn apply_step<E: Preset>(
 
 fn tick<E: Preset>(store: &mut Store<E>, seconds: &Yaml, valid: bool) -> Result<(), String> {
     let seconds = unsigned(seconds).ok_or_else(|| format!("tick: {seconds:?} is not a time"))?;
+    let before = (!valid).then(|| store.clone());
     match (on_tick(store, seconds_to_milliseconds(seconds)), valid) {
         (Ok(()), true) => Ok(()),
-        (Err(Error::BeforeGenesis { .. } | Error::Overflow), false) => Ok(()),
+        (Err(Error::BeforeGenesis { .. } | Error::Overflow), false) => unchanged(store, before),
         (Ok(()), false) => Err(format!(
             "on_tick accepted tick {seconds}, which the vector expects to fail"
         )),
@@ -270,6 +286,12 @@ fn block<E: Preset>(
         .ok_or_else(|| format!("case has no {file}"))?;
     let signed_block: SignedBeaconBlock<E> = decode(reads, path)?;
     let body = &signed_block.message.body;
+    let known = store.block(signed_block.message.tree_hash_root()).is_some();
+    if known && !body.payload_attestations.is_empty() {
+        return Err(format!(
+            "{name} is in the store and has payload attestations: the spec's on_block gives their votes again, and fork_choice::on_block returns early for a known block"
+        ));
+    }
     if valid && !body.attestations.is_empty() {
         return Err(format!(
             "{name} has attestations: the format runs on_attestation for each, which is not ported"
@@ -280,9 +302,10 @@ fn block<E: Preset>(
             "{name} has attester slashings: the format runs on_attester_slashing for each, which is not ported"
         ));
     }
+    let before = (!valid).then(|| store.clone());
     match (on_block(store, provider, &signed_block), valid) {
         (Ok(()), true) => Ok(()),
-        (Err(e), false) if proves_invalid(&e) => Ok(()),
+        (Err(e), false) if proves_invalid(&e) => unchanged(store, before),
         (Ok(()), false) => Err(format!(
             "on_block accepted {name}, which the vector expects to fail"
         )),
@@ -290,6 +313,15 @@ fn block<E: Preset>(
             "on_block failed on {name} with {e}, which is not a spec failure"
         )),
         (Err(e), true) => Err(format!("on_block refused {name}: {e}")),
+    }
+}
+
+/// A refused call must not modify the store (P0 L97-99): `store` must equal `before`, the
+/// copy from before the call.
+fn unchanged<E: Preset>(store: &Store<E>, before: Option<Store<E>>) -> Result<(), String> {
+    match before {
+        Some(before) if *store != before => Err("the refused call changed the store".into()),
+        _ => Ok(()),
     }
 }
 

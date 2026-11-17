@@ -624,7 +624,6 @@ fn other_fork_choice_handlers_and_forks_stay_skipped() {
     let skips = committed();
     for (preset, handler, want) in [
         ("*", "on_attestation", "5.11b"),
-        ("*", "ex_ante", "5.11b"),
         ("minimal", "reorg", "5.11b"),
         ("minimal", "withholding", "5.11b"),
         ("minimal", "should_apply_proposer_boost", "5.11b"),
@@ -666,7 +665,12 @@ fn other_fork_choice_handlers_and_forks_stay_skipped() {
 fn no_wildcard_entry_reaches_the_run_fork_choice_handlers() {
     let skips = committed();
     for preset in ["minimal", "mainnet"] {
-        for handler in ["on_block", "get_head", "get_parent_payload_status"] {
+        for handler in [
+            "on_block",
+            "get_head",
+            "get_parent_payload_status",
+            "ex_ante",
+        ] {
             let k = CaseKey {
                 case: "pyspec_tests/a_new_case".into(),
                 ..consensus("gloas", preset, "fork_choice", handler)
@@ -674,5 +678,50 @@ fn no_wildcard_entry_reaches_the_run_fork_choice_handlers() {
             let skip = skips.skipped_by(&k);
             assert!(skip.is_none(), "{k} is skipped: {skip:?}");
         }
+    }
+}
+
+/// The `ex_ante` cases with attestation steps, by preset. The two cases of mainnet only need
+/// committees of the mainnet preset.
+const EX_ANTE_ATTESTATION_CASES: [(&str, &str); 6] = [
+    ("minimal", "ex_ante_vanilla"),
+    ("mainnet", "ex_ante_vanilla"),
+    ("minimal", "ex_ante_sandwich_with_honest_attestation"),
+    ("mainnet", "ex_ante_sandwich_with_honest_attestation"),
+    (
+        "mainnet",
+        "ex_ante_attestations_is_greater_than_proposer_boost_with_boost",
+    ),
+    ("mainnet", "ex_ante_sandwich_with_boost_not_sufficient"),
+];
+
+#[test]
+fn ex_ante_skips_only_its_attestation_cases_by_exact_name() {
+    let skips = committed();
+    for (preset, case) in EX_ANTE_ATTESTATION_CASES {
+        let k = fork_choice_case(preset, "ex_ante", case);
+        assert_eq!(issue_of(&skips, &k), "5.11b", "{k}");
+    }
+    for preset in ["minimal", "mainnet"] {
+        // The sandwich without attestations has only tick, block and checks steps, so it
+        // must run. Other names must not match an entry: each entry names one case.
+        for case in [
+            "ex_ante_sandwich_without_attestations",
+            "ex_ante_vanilla_2",
+            "ex_ante_sandwich_with_honest_attestation_2",
+            "a_new_case",
+        ] {
+            let k = fork_choice_case(preset, "ex_ante", case);
+            let skip = skips.skipped_by(&k);
+            assert!(skip.is_none(), "{k} is skipped: {skip:?}");
+        }
+    }
+    // The minimal preset has no case of the mainnet only names.
+    for case in [
+        "ex_ante_attestations_is_greater_than_proposer_boost_with_boost",
+        "ex_ante_sandwich_with_boost_not_sufficient",
+    ] {
+        let k = fork_choice_case("minimal", "ex_ante", case);
+        assert!(skips.skipped_by(&k).is_none(), "{k}");
     }
 }

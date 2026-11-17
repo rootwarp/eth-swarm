@@ -8,8 +8,8 @@ use crate::store::{
     compute_slot_at_time_ms, compute_slots_since_epoch_start, compute_start_slot_at_epoch,
     compute_time_at_slot_ms, get_ancestor, get_checkpoint_block, get_current_slot,
     get_current_store_epoch, get_parent_payload_status, get_slot_component_duration_ms,
-    get_time_into_slot_ms, is_parent_node_full, is_payload_verified, key, ptc_size, ForkChoiceNode,
-    PayloadStatus, Store, ATTESTATION_TIMELINESS_INDEX,
+    get_time_into_slot_ms, is_payload_verified, key, prune, ptc_size, ForkChoiceNode,
+    PayloadStatus, Store, ATTESTATION_TIMELINESS_INDEX, PTC_TIMELINESS_INDEX,
 };
 use crate::weights::get_head;
 use crate::{Error, ATTESTATION_DUE_BPS_GLOAS, PAYLOAD_ATTESTATION_DUE_BPS};
@@ -39,6 +39,10 @@ pub trait StateProvider<E: Preset> {
 
 /// `on_tick` (P0 L946-954): one `on_tick_per_slot` for each slot start up to `time_ms`, then
 /// one at `time_ms`. A time before genesis fails and leaves the store as it was.
+///
+/// Then, if the finalized checkpoint moved since the last prune, the store drops the blocks
+/// that do not descend from the finalized block (`store::prune`). This is not in the spec, and it
+/// does not change the result of a handler or of `get_head`.
 pub fn on_tick<E: Preset>(store: &mut Store<E>, time_ms: u64) -> Result<(), Error> {
     let tick_slot = compute_slot_at_time_ms(store, time_ms)?;
     while get_current_slot(store) < tick_slot {
@@ -49,6 +53,7 @@ pub fn on_tick<E: Preset>(store: &mut Store<E>, time_ms: u64) -> Result<(), Erro
         on_tick_per_slot(store, next_slot_time_ms);
     }
     on_tick_per_slot(store, time_ms);
+    prune(store);
     Ok(())
 }
 
@@ -116,7 +121,9 @@ pub fn on_block<E: Preset, P: StateProvider<E> + ?Sized>(
         .block_states
         .get(&block.parent_root)
         .ok_or(Error::UnknownParent(block.parent_root))?;
-    if is_parent_node_full(store, block)? && !is_payload_verified(store, block.parent_root) {
+    // `is_parent_node_full` (G L378-379), kept for the index of children below.
+    let parent_status = get_parent_payload_status(store, block)?;
+    if parent_status == PayloadStatus::Full && !is_payload_verified(store, block.parent_root) {
         return Err(Error::ParentPayloadNotVerified(block.parent_root));
     }
     let current_slot = get_current_slot(store);
@@ -155,9 +162,8 @@ pub fn on_block<E: Preset, P: StateProvider<E> + ?Sized>(
     // `get_shuffling_dependent_root` of the new block, from its parent: the block itself
     // is not in the store yet.
     let dependent_slot = compute_shuffling_dependent_slot::<E>(epoch)?;
+    let parent = ForkChoiceNode::new(block.parent_root, parent_status);
     let block_dependent_root = if block.slot > dependent_slot {
-        let parent =
-            ForkChoiceNode::new(block.parent_root, get_parent_payload_status(store, block)?);
         get_ancestor(store, parent, dependent_slot)?.root
     } else {
         block_root
@@ -177,6 +183,7 @@ pub fn on_block<E: Preset, P: StateProvider<E> + ?Sized>(
 
     store.blocks.insert(block_root, block.clone());
     store.block_states.insert(block_root, state);
+    store.children.entry(parent).or_default().push(block_root);
     let no_votes = vec![None; ptc_size::<E>()];
     store
         .payload_timeliness_vote
@@ -190,6 +197,13 @@ pub fn on_block<E: Preset, P: StateProvider<E> + ?Sized>(
     }
     // `record_block_timeliness` (G L989-1000).
     store.block_timeliness.insert(block_root, timeliness);
+    if timeliness[PTC_TIMELINESS_INDEX] {
+        store
+            .ptc_timely_proposals
+            .entry((block.slot, block.proposer_index))
+            .or_default()
+            .push(block_root);
+    }
     // `update_proposer_boost_root` (G L1019-1031).
     if timeliness[ATTESTATION_TIMELINESS_INDEX]
         && store.proposer_boost_root == Root::ZERO

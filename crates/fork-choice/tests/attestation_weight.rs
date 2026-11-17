@@ -272,14 +272,23 @@ fn finalized_branch_wins_over_heavier_votes_and_refuses_a_block_off_it() {
 
     // A block on `b` does not descend from the finalized checkpoint. on_block must refuse it
     // and keep the store.
-    tick(&mut store, 10);
-    let d = child(&b.message, 10, false, 4);
+    let d = child(&b.message, 9, false, 4);
     assert_eq!(
         on_block(&mut store, &PLAIN, &d),
         Err(Error::NotFinalizedDescendant {
             finalized: ra,
             checkpoint_block: rb,
         })
+    );
+    assert_eq!(store.block(root_of(&d)), None);
+    assert_eq!(get_head(&store), Ok(empty(rc)));
+    // The next tick drops `b`, so on_block refuses a block on it for its unknown parent.
+    tick(&mut store, 10);
+    assert_eq!(store.block(rb), None);
+    let d = child(&b.message, 10, false, 4);
+    assert_eq!(
+        on_block(&mut store, &PLAIN, &d),
+        Err(Error::UnknownParent(rb))
     );
     assert_eq!(store.block(root_of(&d)), None);
     assert_eq!(get_head(&store), Ok(empty(rc)));
@@ -429,4 +438,73 @@ fn ptc_votes_in_a_block_decide_the_payload_of_its_parent() {
         let want = if present { full(rp) } else { empty(rc) };
         assert_eq!(get_head(&store), Ok(want), "payload present: {present}");
     }
+}
+
+#[test]
+fn a_message_of_the_slot_of_its_block_supports_only_the_pending_node() {
+    let mut f = fork();
+    // At slot 4, the EMPTY and FULL nodes of `b` and `c` (slot 2) are not of the previous
+    // slot, so they have weight again.
+    tick(&mut f.store, 4);
+    let w = |f: &Fork, n: ForkChoiceNode| get_weight(&f.store, &n).unwrap();
+    // `block.slot >= message.slot`: a message of the slot of its block supports the PENDING
+    // node, whatever `payload_present` says.
+    vote(&mut f.store, 0, 2, f.b, false);
+    vote(&mut f.store, 1, 2, f.c, true);
+    for root in [f.b, f.c] {
+        assert_eq!(w(&f, pending(root)), BALANCE);
+        assert_eq!(w(&f, empty(root)), 0);
+        assert_eq!(w(&f, full(root)), 0);
+    }
+    // A message of a later slot supports the node of its payload status.
+    vote(&mut f.store, 0, 3, f.b, false);
+    vote(&mut f.store, 1, 3, f.c, true);
+    assert_eq!(w(&f, empty(f.b)), BALANCE);
+    assert_eq!(w(&f, full(f.c)), BALANCE);
+    assert_eq!(w(&f, full(f.b)), 0);
+    assert_eq!(w(&f, empty(f.c)), 0);
+}
+
+#[test]
+fn get_head_starts_at_the_new_justified_block_once_its_state_is_stored() {
+    let (mut store, anchor_block) = new_store();
+    let anchor = anchor_block.tree_hash_root();
+    tick(&mut store, 1);
+    let a = child(&anchor_block, 1, false, 1);
+    let b = child(&anchor_block, 1, false, 2);
+    for block in [&a, &b] {
+        on_block(&mut store, &PLAIN, block).unwrap();
+    }
+    let (ra, rb) = (root_of(&a), root_of(&b));
+    for validator in 0..8 {
+        vote(&mut store, validator, 1, rb, false);
+    }
+    assert_eq!(get_head(&store).map(|n| n.root), Ok(rb));
+
+    // The post-state of `c` on `a` justifies epoch 1 with `a`. The finalized checkpoint stays
+    // at genesis, so the store does not prune.
+    let justified = Checkpoint { epoch: 1, root: ra };
+    let checkpoint = justified.clone();
+    let justifying = Provider(move |state: &mut BeaconState<E>| {
+        state.current_justified_checkpoint = checkpoint.clone();
+    });
+    tick(&mut store, 9);
+    let c = child(&a.message, 9, false, 3);
+    on_block(&mut store, &justifying, &c).unwrap();
+    let rc = root_of(&c);
+    assert_eq!(store.justified_checkpoint(), &justified);
+    assert_eq!(store.finalized_checkpoint().root, anchor);
+    // `get_head` reads the state of the justified checkpoint. On the spec path,
+    // `on_attestation` stores it first; here `store_target_checkpoint_state` does.
+    assert_eq!(
+        get_head(&store),
+        Err(Error::MissingCheckpointState { epoch: 1, root: ra })
+    );
+    store_target_checkpoint_state(&mut store, &PLAIN, &justified).unwrap();
+    // `b` keeps more weight, but the filtered tree starts at the justified block `a`.
+    assert_eq!(get_weight(&store, &pending(rb)), Ok(8 * BALANCE));
+    assert_eq!(get_head(&store), Ok(empty(rc)));
+    tick(&mut store, 10);
+    assert!(store.block(rb).is_some() && store.block(anchor).is_some());
+    assert_eq!(get_head(&store), Ok(empty(rc)));
 }

@@ -139,6 +139,8 @@ jobs:
         run: bash scripts/tests/check-test-backends.test.sh && bash scripts/check-test-backends.sh
       - name: Only dev-dependencies enable state-transition/testing (backends without BLS)
         run: bash scripts/tests/check-stf-testing.test.sh && bash scripts/check-stf-testing.sh
+      - name: Only dev-dependencies enable fork-choice/testing (store seams without handler checks)
+        run: bash scripts/tests/check-fork-choice-testing.test.sh && bash scripts/check-fork-choice-testing.sh
       - name: Only spec-tests may enable crypto-bls/test-vectors
         run: bash scripts/check-bls-features.sh
       - name: cl-chain links only crypto-bls/aggregate, never crypto-bls/verify

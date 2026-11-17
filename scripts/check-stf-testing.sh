@@ -10,11 +10,16 @@
 # `s/testing` or `s?/testing` for a rename `s = { package = "state-transition" }`) fail: a
 # feature can forward only to a normal or a build dependency.
 #
-# Usage: scripts/check-stf-testing.sh [path/to/workspace/Cargo.toml]   (default: this repo)
+# The same rules hold for the `testing` feature of another package: the second argument names
+# it (scripts/check-fork-choice-testing.sh checks `fork-choice/testing` this way).
+#
+# Usage: scripts/check-stf-testing.sh [path/to/workspace/Cargo.toml] [package]
+#   (default: this repo, and the package state-transition)
 # Env: CARGO (default `cargo`). Needs python3. Works with bash 3.2.
 set -euo pipefail
 
 manifest=${1:-"$(cd "$(dirname "$0")/.." && pwd)/Cargo.toml"}
+package=${2:-state-transition}
 cargo=${CARGO:-cargo}
 
 rc=0
@@ -27,7 +32,7 @@ fi
 printf '%s' "$meta" | python3 -I -c '
 import sys, json
 
-OWNER, FEATURE = "state-transition", "testing"
+OWNER, FEATURE = sys.argv[1], "testing"
 meta = json.load(sys.stdin)
 pkgs = meta["packages"]
 owner = [p for p in pkgs if p["name"] == OWNER]
@@ -58,5 +63,5 @@ for e in errors:
     print("ERROR: " + e, file=sys.stderr)
 if errors:
     sys.exit(1)
-print("state-transition/testing OK (enabled by dev-dependencies only)")
-'
+print("%s/%s OK (enabled by dev-dependencies only)" % (OWNER, FEATURE))
+' "$package"

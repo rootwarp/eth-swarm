@@ -477,6 +477,27 @@ fn pending_node_children_are_its_empty_and_verified_full_nodes() {
 }
 
 #[test]
+fn node_children_come_in_the_order_of_import() {
+    let (mut store, anchor_block) = new_store();
+    let anchor = anchor_block.tree_hash_root();
+    tick(&mut store, 2);
+    let blocks: Vec<_> = (1..=8)
+        .map(|tag| child(&anchor_block, 1, false, tag))
+        .collect();
+    let order = [5, 2, 7, 0, 3, 6, 1, 4];
+    for i in order {
+        on_block(&mut store, &PLAIN, &blocks[i]).unwrap();
+    }
+    // The spec reads `store.blocks`, a dict in the order of import.
+    let want: Vec<_> = order
+        .iter()
+        .map(|&i| pending(root_of(&blocks[i])))
+        .collect();
+    assert_eq!(get_node_children(&store, &empty(anchor)), Ok(want));
+    assert_eq!(get_node_children(&store, &full(anchor)), Ok(vec![]));
+}
+
+#[test]
 fn get_head_extends_the_payload_that_the_boosted_block_builds_on() {
     let f = fork(true);
     assert_eq!(f.store.proposer_boost_root(), f.b);
@@ -626,4 +647,85 @@ fn checkpoint_anchor_ancestor_walk_stops_at_the_anchor() {
         Err(Error::UnknownBlock(below))
     );
     assert_eq!(store.block(below), None);
+}
+
+#[test]
+fn checkpoint_anchor_parent_is_a_valid_dependent_root_before_the_anchor_slot() {
+    let (mut store, anchor_block) = checkpoint_store(24);
+    let parent = anchor_block.parent_root;
+    // The store does not have the parent of the anchor, but the anchor builds on it. The spec
+    // scans `store.blocks`, so the anchor must count as a later child of its parent.
+    assert_eq!(is_valid_dependent_root(&store, parent, 23), Ok(true));
+    assert_eq!(is_valid_dependent_root(&store, parent, 0), Ok(true));
+    // No block after the anchor slot builds on the parent.
+    assert_eq!(is_valid_dependent_root(&store, parent, 24), Ok(false));
+    tick(&mut store, 25);
+    let block = child(&anchor_block, 25, false, 1);
+    on_block(&mut store, &PLAIN, &block).unwrap();
+    assert_eq!(is_valid_dependent_root(&store, parent, 24), Ok(false));
+    assert_eq!(is_valid_dependent_root(&store, parent, 23), Ok(true));
+}
+
+/// A provider whose post-state has no participation, so the pull-up of the checkpoints after
+/// the state transition fails.
+fn no_participation(state: &mut BeaconState<E>) {
+    state.previous_epoch_participation = Default::default();
+    state.current_epoch_participation = Default::default();
+}
+
+#[test]
+fn refused_calls_leave_every_field_of_the_store_unchanged() {
+    let (mut store, anchor_block) = new_store();
+    tick(&mut store, 1);
+    let a = child(&anchor_block, 1, false, 1);
+    on_block(&mut store, &PLAIN, &a).unwrap();
+    tick(&mut store, 17);
+    let before = store.clone();
+    let mut orphan = child(&a.message, 2, false, 2);
+    orphan.message.parent_root = Root::repeat_byte(0x45);
+    let late_pull_up = Provider(no_participation);
+    let cases: [(&dyn StateProvider<E>, SignedBeaconBlock<E>); 5] = [
+        (&PLAIN, orphan),
+        (&PLAIN, child(&a.message, 18, false, 3)),
+        (&Refuse, child(&a.message, 17, false, 4)),
+        (&PLAIN, child(&a.message, 17, true, 5)),
+        (&late_pull_up, child(&a.message, 17, false, 6)),
+    ];
+    for (provider, block) in &cases {
+        let got = on_block(&mut store, *provider, block);
+        assert!(got.is_err(), "slot {}: {got:?}", block.message.slot);
+        assert!(store == before, "slot {}: {got:?}", block.message.slot);
+    }
+    assert!(on_tick(&mut store, GENESIS_TIME * 1000 - 1).is_err());
+    assert!(store == before);
+}
+
+#[test]
+fn get_head_breaks_a_tie_of_weight_with_the_larger_root() {
+    for reverse in [false, true] {
+        let (mut store, anchor_block) = new_store();
+        tick(&mut store, 2);
+        // Both blocks are late, so neither gets the proposer boost, and no votes give
+        // weight: both PENDING nodes weigh zero.
+        let mut blocks = [
+            child(&anchor_block, 1, false, 1),
+            child(&anchor_block, 1, false, 2),
+        ];
+        if reverse {
+            blocks.reverse();
+        }
+        for block in &blocks {
+            on_block(&mut store, &PLAIN, block).unwrap();
+        }
+        let roots = blocks.each_ref().map(root_of);
+        for root in roots {
+            assert_eq!(get_weight(&store, &pending(root)), Ok(0));
+        }
+        let larger = roots.into_iter().max().unwrap();
+        assert_eq!(
+            get_head(&store).map(|n| n.root),
+            Ok(larger),
+            "reverse: {reverse}"
+        );
+    }
 }
