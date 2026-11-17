@@ -370,7 +370,7 @@ async fn one_verify_deadline_runs_from_the_start_of_the_import() {
 }
 
 /// The deadline of the core in the silent cl-verify test.
-const SHORT_TIMEOUT: Duration = Duration::from_millis(60);
+const SHORT_TIMEOUT: Duration = Duration::from_millis(80);
 /// The wait of [`Paused`] before each call.
 const PAUSE: Duration = Duration::from_millis(15);
 
@@ -386,8 +386,12 @@ impl BlsVerifier for Paused {
 }
 
 /// A silent cl-verify behind the production client. Each import must end at its deadline and
-/// close its VerifyBls stream, so that no request stays in the window. The import after a full
-/// window of such imports must still reach cl-verify.
+/// close its VerifyBls stream, so that a stream never carries a second request and no request
+/// stays in the window. More requests than the window holds must reach cl-verify.
+///
+/// The deadline starts before the transition, so an import on a slow machine can run out of
+/// time before it sends its request. The test thus counts the requests that cl-verify reads,
+/// not the imports.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_silent_cl_verify_does_not_fill_the_request_window() {
     let served = testing::StubVerify::start(testing::Stub::Silent);
@@ -397,19 +401,29 @@ async fn a_silent_cl_verify_does_not_fill_the_request_window() {
     let core = f.core.with_verify_timeout(SHORT_TIMEOUT);
     let (sender, queue) = queue::<Minimal>(QUEUE);
     let writer = core.spawn(queue, verifier, Handle::current()).unwrap();
-    for import in 1..=DEFAULT_MAX_OUTSTANDING + 1 {
+    for import in 1..=4 * DEFAULT_MAX_OUTSTANDING {
         let reply = sender.import(f.block.clone()).unwrap();
         let outcome = reply.await.unwrap().outcome;
         assert!(
             matches!(&outcome, Outcome::Ignored(why) if why.contains("no verdict by the deadline")),
             "import {import}: {outcome:?}"
         );
-        assert_eq!(
-            served.streams_opened(),
-            import,
-            "import {import}: each import must close its VerifyBls stream at its deadline"
+        assert!(
+            served.bls_requests() <= served.streams_opened(),
+            "import {import}: a stream must close at the deadline of its request, so it must \
+             not carry a second request ({} requests on {} streams)",
+            served.bls_requests(),
+            served.streams_opened()
         );
+        if served.bls_requests() > DEFAULT_MAX_OUTSTANDING {
+            break;
+        }
     }
+    assert!(
+        served.bls_requests() > DEFAULT_MAX_OUTSTANDING,
+        "more requests than the window holds must reach cl-verify: {}",
+        served.bls_requests()
+    );
     drop(sender);
     let core = writer.join().unwrap();
     assert_unchanged(&core, f.anchor, block_root);

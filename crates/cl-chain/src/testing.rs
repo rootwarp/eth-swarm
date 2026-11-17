@@ -194,6 +194,8 @@ pub struct Served {
     pub socket: PathBuf,
     /// VerifyKzg and VerifyBls streams the server has answered (counted by [`StubVerify`] only).
     opened: Arc<AtomicUsize>,
+    /// VerifyBls request bodies the server has read (counted by [`StubVerify`] only).
+    bls_requests: Arc<AtomicUsize>,
     /// The client hellos a network stub checked.
     handshakes: Handshakes,
     _dir: tempfile::TempDir,
@@ -252,6 +254,11 @@ impl Served {
         self.opened.load(Ordering::SeqCst)
     }
 
+    /// VerifyBls request bodies read so far, over all streams.
+    pub fn bls_requests(&self) -> usize {
+        self.bls_requests.load(Ordering::SeqCst)
+    }
+
     /// What a network stub found in each client hello so far, in stream order.
     pub fn handshakes(&self) -> Vec<Result<Vec<u8>, ErrorCode>> {
         self.handshakes.lock().unwrap().clone()
@@ -287,6 +294,7 @@ impl ClVerify {
         Served {
             socket,
             opened: Arc::default(),
+            bls_requests: Arc::default(),
             handshakes: Arc::default(),
             _dir: dir,
             _stop: stop,
@@ -320,6 +328,7 @@ pub enum Stub {
 pub struct StubVerify {
     mode: Stub,
     opened: Arc<AtomicUsize>,
+    bls_requests: Arc<AtomicUsize>,
     open: Mutex<Vec<mpsc::Sender<Result<VerifyKzgResponse, Status>>>>,
     /// The senders of the silent VerifyBls streams.
     open_bls: Mutex<Vec<mpsc::Sender<Result<VerifyBlsResponse, Status>>>>,
@@ -363,10 +372,14 @@ impl VerifyService for StubVerify {
         };
         tx.send(Ok(server_hello)).await.unwrap();
         let answers = tx.clone();
+        let read = Arc::clone(&self.bls_requests);
         tokio::spawn(async move {
             while let Ok(Some(frame)) = inbound.message().await {
-                let (Some(wait), Some(verify_bls_request::Frame::Body(body))) = (wait, frame.frame)
-                else {
+                let Some(verify_bls_request::Frame::Body(body)) = frame.frame else {
+                    continue;
+                };
+                read.fetch_add(1, Ordering::SeqCst);
+                let Some(wait) = wait else {
                     continue;
                 };
                 tokio::time::sleep(wait).await;
@@ -509,10 +522,12 @@ impl StubVerify {
     fn serve(mode: Stub, network: Option<(Handshake, Arc<ManualClock>)>) -> Served {
         let (dir, socket, listener) = socket();
         let opened = Arc::<AtomicUsize>::default();
+        let bls_requests = Arc::<AtomicUsize>::default();
         let handshakes = Handshakes::default();
         let stub = StubVerify {
             mode,
             opened: Arc::clone(&opened),
+            bls_requests: Arc::clone(&bls_requests),
             open: Mutex::default(),
             open_bls: Mutex::default(),
             network,
@@ -529,6 +544,7 @@ impl StubVerify {
         Served {
             socket,
             opened,
+            bls_requests,
             handshakes,
             _dir: dir,
             _stop: stop,
