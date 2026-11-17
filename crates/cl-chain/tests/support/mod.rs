@@ -131,20 +131,26 @@ pub fn ungated_fixture() -> Fixture {
         .expect("the anchor must install")
         .with_verify_timeout(VERIFY_TIMEOUT);
     assert_eq!(core.head(), anchor, "the head must be the anchor");
+    Fixture {
+        core,
+        anchor,
+        block: export_block(1),
+        config: pinned.config,
+    }
+}
+
+/// The block at `slot` of the pinned export.
+pub fn export_block(slot: u64) -> SignedBeaconBlock<Minimal> {
+    let pinned = pinned_export().expect("the pinned export must open");
     let entry = pinned
         .export
         .manifest()
         .blocks
         .iter()
-        .find(|entry| entry.slot == 1)
-        .expect("the export must hold a slot 1 block");
+        .find(|entry| entry.slot == slot)
+        .expect("the export must hold a block at the slot");
     let bytes = pinned.export.block_ssz(entry).unwrap();
-    Fixture {
-        core,
-        anchor,
-        block: SignedBeaconBlock::from_ssz_bytes(&bytes).unwrap(),
-        config: pinned.config,
-    }
+    SignedBeaconBlock::from_ssz_bytes(&bytes).unwrap()
 }
 
 /// Imports `block` on a core with a fake cl-verify that gives `answer`. Returns the outcome,
