@@ -140,18 +140,101 @@ async fn a_silent_cl_verify_is_no_verdict_and_its_stream_closes() {
     let served = StubVerify::start(Stub::Silent);
     let client = served.bls_client().await;
     let timeout = Duration::from_millis(50);
-    let outcome = client.verify_sets(vec![set(1, true)], timeout).await;
+    let outcome = client
+        .verify_sets(vec![set(1, true)], Instant::now() + timeout)
+        .await;
     assert_eq!(
         outcome,
         BlsOutcome::NoVerdict("no verdict by the deadline".into())
     );
     assert_eq!(served.streams_opened(), 1);
     // The stream of the late call is gone: the next call opens a new one.
-    let outcome = client.verify_sets(vec![set(1, true)], timeout).await;
+    let outcome = client
+        .verify_sets(vec![set(1, true)], Instant::now() + timeout)
+        .await;
     assert!(matches!(outcome, BlsOutcome::NoVerdict(_)), "{outcome:?}");
     assert_eq!(
         served.streams_opened(),
         2,
         "a VerifyBls stream without an answer by the deadline must close"
+    );
+}
+
+/// Polls `call` until its request is in the outstanding table of `link`, then drops it.
+async fn drop_after_send<F: Future>(link: &StreamLink<Bls>, call: F)
+where
+    F::Output: std::fmt::Debug,
+{
+    let mut call = std::pin::pin!(call);
+    let sent = async {
+        while link.calls.outstanding() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::select! {
+        outcome = &mut call => panic!("the call must wait for its verdict: {outcome:?}"),
+        () = sent => {}
+    }
+}
+
+#[tokio::test]
+async fn a_call_dropped_after_its_send_closes_its_stream_and_frees_its_slot() {
+    let served = StubVerify::start(Stub::Silent);
+    let client = served.bls_client().await;
+    let long = Duration::from_secs(60);
+    for dropped in 1..=DEFAULT_MAX_OUTSTANDING + 1 {
+        let link = client.streams.live().await.unwrap();
+        let call = client.verify_sets(vec![set(1, true)], Instant::now() + long);
+        drop_after_send(&link, call).await;
+        assert_eq!(
+            link.calls.outstanding(),
+            0,
+            "call {dropped}: a dropped call must not keep its slot"
+        );
+        assert!(
+            link.requests.is_closed(),
+            "call {dropped}: a dropped call must close its stream"
+        );
+    }
+    assert_eq!(served.streams_opened(), DEFAULT_MAX_OUTSTANDING + 1);
+    let outcome = client
+        .verify_sets(
+            vec![set(1, true)],
+            Instant::now() + Duration::from_millis(50),
+        )
+        .await;
+    assert_eq!(
+        outcome,
+        BlsOutcome::NoVerdict(LATE.into()),
+        "the next call must have room in the window"
+    );
+}
+
+#[tokio::test]
+async fn the_requests_of_one_batch_share_its_deadline() {
+    // 600 sets go out as three requests (256, 256 and 88 sets), one after the other. The stub
+    // answers each one after `wait`.
+    let wait = Duration::from_millis(200);
+    let served = StubVerify::start(Stub::ValidAfter(wait));
+    let client = served.bls_client().await;
+    let sets: Vec<BlsSet> = (0..600)
+        .map(|index| {
+            let mut one = set(1, false);
+            one.signers[0].validator_index = index;
+            one
+        })
+        .collect();
+    // The third answer comes after the deadline: a request must not get a new deadline.
+    let outcome = client
+        .verify_sets(sets.clone(), Instant::now() + wait * 5 / 2)
+        .await;
+    assert_eq!(outcome, BlsOutcome::NoVerdict(LATE.into()));
+    // With room for the three answers, the batch is valid.
+    let outcome = client.verify_sets(sets, Instant::now() + wait * 6).await;
+    assert_eq!(outcome, BlsOutcome::Valid);
+    assert_eq!(
+        served.bls_requests(),
+        6,
+        "each batch must go out as three requests"
     );
 }

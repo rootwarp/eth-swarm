@@ -16,7 +16,6 @@
 //! record that `anchor-fetch` writes. This crate never links cl-sync, so [`AnchorRecord`] is
 //! its own copy of that shape.
 
-#[cfg(feature = "test-support")]
 pub mod fixtures;
 
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};

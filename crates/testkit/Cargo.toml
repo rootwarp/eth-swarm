@@ -38,7 +38,8 @@ required-features = ["soak"]
 # For this crate's tests and its users' tests: write-fault injection (`archive::Fault`: an
 # interrupted write, a full disk), payload fixtures (`archive::fixtures`), and the collector's
 # scripted clock and fixture beacon node (`collector::testing`, a hyper server on 127.0.0.1), and
-# the export's fixture devnet (`export_blocks::fixtures`).
+# the export's fixture devnet (`export_blocks::fixtures`), and the anchor loader (`anchor`, with
+# `anchor::fixtures`).
 test-support = ["p2p-wire/testkit", "dep:ssz_types", "hyper/server"]
 # Genesis replay. Not a default: cl-chain's dev-dependency on this crate must not pull
 # `crypto-bls/verify` (scripts/check-cl-chain-features.sh). `cargo run --bin replay` turns it on.

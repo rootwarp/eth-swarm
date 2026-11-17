@@ -44,9 +44,12 @@
 //! within the caps of verify.v1, in order: at most [`MAX_BLS_SETS`] sets, [`MAX_BLS_SIGNERS`]
 //! signers, [`MAX_INLINE_KEYS`] inline keys (a request of one set can carry more) and
 //! [`MAX_BLS_MESSAGE_BYTES`] encoded. A set that does not fit alone makes the whole batch no
-//! verdict: a batch is never sent in part. The requests share one deadline, and the batch is
-//! valid only if each request is. A request without an answer by its deadline closes its
-//! stream (a stalled VerifyBls stream must close), and the next call opens a new one.
+//! verdict: a batch is never sent in part. The caller gives the deadline as an instant, not as a
+//! duration, so the calls of one import share the deadline of that import. The requests of a
+//! batch share it too, and the batch is valid only if each request is. A request without an
+//! answer closes its stream when its deadline passes or when its call is dropped first (a
+//! stalled VerifyBls stream must close, and a dropped call must not keep its slot in the window),
+//! and the next call opens a new one.
 
 use ethswarm_proto::common::{ErrorCode, Hello};
 use ethswarm_proto::verify::verify_service_client::VerifyServiceClient;
@@ -142,11 +145,12 @@ pub trait KzgVerifier: Send + Sync {
 
 /// Checks the BLS signature sets of a block import, through cl-verify.
 pub trait BlsVerifier: Send + Sync {
-    /// One verdict for all of `sets`, within `timeout` or none.
+    /// One verdict for all of `sets` by `deadline`, or none. The caller gives each call of one
+    /// import the same `deadline`, so a later call does not get a new budget.
     fn verify_sets(
         &self,
         sets: Vec<BlsSet>,
-        timeout: Duration,
+        deadline: Instant,
     ) -> impl Future<Output = BlsOutcome> + Send;
 }
 
@@ -581,7 +585,7 @@ impl BlsClient {
     }
 
     /// Sends one request of `sets` and waits for its verdict until `deadline`. A request
-    /// without an answer by then closes its stream.
+    /// without an answer by then, or whose call is dropped before its answer, closes its stream.
     async fn request(&self, sets: Vec<BlsSet>, deadline: Instant, unix_ms: u64) -> BlsOutcome {
         let link = match tokio::time::timeout_at(deadline, self.streams.live()).await {
             Ok(Ok(link)) => link,
@@ -602,26 +606,50 @@ impl BlsClient {
             };
             (request, hashes)
         };
-        match link.exchange(build, deadline, Box::new(())).await {
+        let mut unsettled = Unsettled {
+            streams: &self.streams,
+            link: &link,
+            settled: false,
+        };
+        let outcome = match link.exchange(build, deadline, Box::new(())).await {
             Ok(body) => bls_outcome(&body),
-            Err(Failure::Late) => {
-                self.streams.close(&link);
-                BlsOutcome::NoVerdict(LATE.into())
-            }
+            // `unsettled` closes the stream on its drop.
+            Err(Failure::Late) => return BlsOutcome::NoVerdict(LATE.into()),
+            // The stream is closed, ended or refused the request: there is no request on it
+            // to wait for.
             Err(Failure::Other(why)) => BlsOutcome::NoVerdict(why),
+        };
+        unsettled.settled = true;
+        outcome
+    }
+}
+
+/// A VerifyBls request in flight. Dropped before it is settled (late, or its call dropped), it
+/// closes its stream: cl-verify may never answer, and the request must not keep its slot in
+/// the window of that stream.
+struct Unsettled<'a> {
+    streams: &'a Streams<Bls>,
+    link: &'a StreamLink<Bls>,
+    settled: bool,
+}
+
+impl Drop for Unsettled<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.streams.close(self.link);
         }
     }
 }
 
 impl BlsVerifier for BlsClient {
-    async fn verify_sets(&self, sets: Vec<BlsSet>, timeout: Duration) -> BlsOutcome {
+    async fn verify_sets(&self, sets: Vec<BlsSet>, deadline: Instant) -> BlsOutcome {
         let requests = match bls_requests(sets) {
             Ok(requests) => requests,
             Err(why) => return BlsOutcome::NoVerdict(why),
         };
-        let deadline = Instant::now() + timeout;
-        let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
-        let unix_ms = now_unix_ms().saturating_add(timeout_ms);
+        let left = deadline.saturating_duration_since(Instant::now());
+        let left_ms = u64::try_from(left.as_millis()).unwrap_or(u64::MAX);
+        let unix_ms = now_unix_ms().saturating_add(left_ms);
         for sets in requests {
             let outcome = self.request(sets, deadline, unix_ms).await;
             if outcome != BlsOutcome::Valid {

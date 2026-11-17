@@ -7,22 +7,36 @@
 //! IGNOREs it. When more than one queue holds an item, the thread serves block import first,
 //! then envelope, then gossip commit.
 //!
-//! A block import runs [`import_block`] on the pre-state of the parent of the block. The core
-//! sends the signature sets to cl-verify through a [`BlsVerifier`], on the Tokio runtime of the
-//! caller, with the deadline of [`ChainCore::with_verify_timeout`] ([`DEFAULT_VERIFY_TIMEOUT`]
-//! if not set): no verdict by then is IGNORE. The core commits only on a VALID verdict and a
-//! post-state root equal to `block.state_root`: it keeps the post-state as a pre-state, and the
-//! block becomes the head. There is no fork choice yet, so the head is the last block the core
-//! committed. On any other outcome the head and the pre-states do not change. The
-//! [`PayloadImportGate`] of [`ChainCore::with_payload_gate`] ([`PermitAll`] if not set) can
-//! refuse a block that would commit: that is IGNORE.
+//! A block import first takes its deadline: the time of [`ChainCore::with_verify_timeout`]
+//! ([`DEFAULT_VERIFY_TIMEOUT`] if not set) from the start of the import. Then the core checks
+//! the block before any state processing, because the slot loop of the transition costs one
+//! `process_slot` for each slot and the queue senders have no clock and no pre-states:
+//!
+//! - no [`PayloadImportGate`] is set: IGNORE. [`ChainCore::from_anchor`] sets none, so a core
+//!   that misses [`ChainCore::with_payload_gate`] commits nothing
+//!   ([`PermitAll`](crate::import::block::PermitAll) is an explicit opt-in);
+//! - the block slot is more than [`MAX_FUTURE_SLOTS`] ahead of the slot of the wall clock
+//!   ([`ChainCore::with_clock`], the system clock if not set), or the wall clock is before
+//!   genesis: IGNORE;
+//! - the block is the head, or its post-state is already a pre-state: IGNORE;
+//! - the parent has no pre-state: IGNORE;
+//! - `proposer_index` is past the registry of the parent pre-state: INVALID.
+//!
+//! Then it runs [`import_block`] on the pre-state of the parent. The core sends the signature
+//! sets to cl-verify through a [`BlsVerifier`], on the Tokio runtime of the caller, with the
+//! deadline of the import: each VerifyBls call of one import gets the same deadline, and no
+//! verdict by then is IGNORE. The core commits only on a VALID verdict, a post-state root equal
+//! to `block.state_root` and a gate that permits the payload: it makes the parent pre-state the
+//! most recently used, keeps the post-state as a pre-state, and the block becomes the head.
+//! There is no fork choice yet, so the head is the last block the core committed. On any other
+//! outcome the head and the pre-states do not change, their order of use included.
 //!
 //! Envelope import and gossip commit are queue kinds only: the core answers each such item
 //! IGNORE and changes nothing.
 
 use super::snapshot::{max_pre_states, Snapshots};
-use crate::import::block::{import_block, NotImported, PayloadImportGate, PermitAll};
-use crate::verify::client::{BlsOutcome, BlsVerifier};
+use crate::import::block::{import_block, NotImported, PayloadImportGate};
+use crate::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
 use consensus_types::primitives::{Root, Slot};
 use ethswarm_proto::verify::BlsSet;
@@ -30,15 +44,22 @@ use network_config::ChainConfig;
 use state_transition::{state_root, Preset, StfError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tree_hash::TreeHash;
 
-/// The VerifyBls deadline of a block import \[est\]: well inside a slot, so a block that has no
-/// verdict by then is IGNOREd and can come again.
+/// The time a block import has for its VerifyBls verdicts, from the start of the import
+/// \[est\]: well inside a slot, so a block that has no verdict by then is IGNOREd and can come
+/// again.
 pub const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// The most slots a block can be ahead of the slot of the wall clock: one slot of clock skew
+/// between the core and the proposer. The gossip rule (`MAXIMUM_GOSSIP_CLOCK_DISPARITY`) is
+/// tighter, but it is for gossip validation, and no code reads that config value yet.
+pub const MAX_FUTURE_SLOTS: u64 = 1;
 
 /// The last block the core committed, or the anchor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,9 +167,8 @@ pub fn queue<E: Preset>(capacity: usize) -> (CoreSender<E>, CoreQueue<E>) {
 
 impl<E: Preset> CoreSender<E> {
     /// Queues `block` for import. The answer comes on the receiver; a receiver that closes
-    /// without one means the core stopped (IGNORE). Bound `block.slot` against the wall clock
-    /// first: the slot loop of the transition costs one `process_slot` for each slot, and the
-    /// core does not bound it.
+    /// without one means the core stopped (IGNORE). The core checks the slot of the block
+    /// against the wall clock before the slot loop (see the module docs).
     pub fn import(
         &self,
         block: SignedBeaconBlock<E>,
@@ -207,10 +227,14 @@ impl<E: Preset> CoreQueue<E> {
 /// The single writer of the chain state (see the module docs).
 pub struct ChainCore<E: Preset> {
     config: ChainConfig,
+    /// `genesis_time` of the anchor state, Unix seconds: the start of slot 0.
+    genesis_time: u64,
     snapshots: Snapshots<BeaconState<E>>,
     head: Head,
     verify_timeout: Duration,
-    gate: Box<dyn PayloadImportGate>,
+    /// `None` until [`Self::with_payload_gate`]: no block commits without a gate.
+    gate: Option<Box<dyn PayloadImportGate>>,
+    clock: UnixClock,
     turns: u64,
 }
 
@@ -218,6 +242,9 @@ impl<E: Preset> ChainCore<E> {
     /// A core on the anchor `state` and `block` of `config`'s network. The roots are computed
     /// again here: the state must have the root `block.state_root`. This is not the Bootstrap
     /// RPC; the caller checks where the anchor comes from.
+    ///
+    /// The core has no payload gate: it IGNOREs each block until [`Self::with_payload_gate`]
+    /// sets one.
     pub fn from_anchor(
         mut state: BeaconState<E>,
         block: SignedBeaconBlock<E>,
@@ -226,6 +253,9 @@ impl<E: Preset> ChainCore<E> {
         config
             .capella_fork_version()
             .map_err(|e| AnchorError::Config(e.to_string()))?;
+        if config.slot_duration_ms() == 0 {
+            return Err(AnchorError::Config("SLOT_DURATION_MS is 0".into()));
+        }
         let computed = state_root(&mut state).map_err(AnchorError::State)?;
         if computed != block.message.state_root {
             return Err(AnchorError::State(StfError::StateRootMismatch {
@@ -240,15 +270,18 @@ impl<E: Preset> ChainCore<E> {
         };
         Ok(Self {
             config,
+            genesis_time: state.genesis_time,
             snapshots: Snapshots::new(head.block_root, state, max_pre_states::<E>()),
             head,
             verify_timeout: DEFAULT_VERIFY_TIMEOUT,
-            gate: Box::new(PermitAll),
+            gate: None,
+            clock: Arc::new(system_clock),
             turns: 0,
         })
     }
 
-    /// The same core with `timeout` as the VerifyBls deadline of each import.
+    /// The same core where each import has `timeout` for its VerifyBls verdicts: one deadline,
+    /// taken at the start of the import, for each VerifyBls call of that import.
     #[must_use]
     pub fn with_verify_timeout(mut self, timeout: Duration) -> Self {
         self.verify_timeout = timeout;
@@ -258,7 +291,15 @@ impl<E: Preset> ChainCore<E> {
     /// The same core with `gate` as the payload gate of each import.
     #[must_use]
     pub fn with_payload_gate(mut self, gate: impl PayloadImportGate + 'static) -> Self {
-        self.gate = Box::new(gate);
+        self.gate = Some(Box::new(gate));
+        self
+    }
+
+    /// The same core with `clock` (Unix milliseconds) as its wall clock, in place of the system
+    /// clock.
+    #[must_use]
+    pub fn with_clock(mut self, clock: UnixClock) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -319,19 +360,47 @@ impl<E: Preset> ChainCore<E> {
         verifier: &Arc<V>,
         runtime: &Handle,
     ) -> Outcome {
+        // In the context of the runtime, so that the deadline is on the clock of its timers. A
+        // timeout past the range of `Instant` gives no time at all: no verdict is IGNORE.
+        let deadline = {
+            let _context = runtime.enter();
+            let now = Instant::now();
+            now.checked_add(self.verify_timeout).unwrap_or(now)
+        };
+        let Some(gate) = self.gate.as_deref() else {
+            return Outcome::Ignored("no payload gate is set".into());
+        };
+        if let Err(why) = self.check_slot(block.message.slot) {
+            return Outcome::Ignored(why);
+        }
+        let block_root = block.message.tree_hash_root();
+        if block_root == self.head.block_root || self.snapshots.peek(&block_root).is_some() {
+            return Outcome::Ignored(format!("block {block_root} is already committed"));
+        }
         let parent = block.message.parent_root;
-        let Some(pre) = self.snapshots.get(&parent) else {
+        // A peek: the parent becomes the most recently used only if its child commits, so a
+        // failed import does not change the order of use.
+        let Some(pre) = self.snapshots.peek(&parent) else {
             return Outcome::Ignored(format!("no pre-state for the parent {parent}"));
         };
-        let timeout = self.verify_timeout;
-        let verdict = |sets: Vec<BlsSet>| verify(runtime, verifier, sets, timeout);
-        match import_block(pre, block, &self.config, &verdict, self.gate.as_ref()) {
+        // The slot loop can add a validator, but not an active one: its activation waits for
+        // the finality of a later epoch than the one that added it, and the loop has no new
+        // attestations to finalize that epoch. So an index past the registry of the parent is
+        // never the proposer, and `process_block_header` refuses it after the slot loop.
+        // Refused here, it costs no slot loop.
+        let proposer = block.message.proposer_index;
+        if !usize::try_from(proposer).is_ok_and(|index| index < pre.validators.len()) {
+            return Outcome::Invalid(StfError::UnknownValidator(proposer));
+        }
+        let verdict = |sets: Vec<BlsSet>| verify(runtime, verifier, sets, deadline);
+        match import_block(pre, block, &self.config, &verdict, gate) {
             Ok(imported) => {
                 self.head = Head {
                     block_root: imported.block_root,
                     slot: block.message.slot,
                     state_root: imported.state_root,
                 };
+                self.snapshots.promote(&parent);
                 self.snapshots.insert(imported.block_root, imported.post);
                 Outcome::Committed {
                     block_root: imported.block_root,
@@ -342,19 +411,46 @@ impl<E: Preset> ChainCore<E> {
             Err(NotImported::Ignored(why)) => Outcome::Ignored(why),
         }
     }
+
+    /// `Err` (why, for the log) if `slot` is more than [`MAX_FUTURE_SLOTS`] ahead of the slot
+    /// of the wall clock, or if the wall clock is before genesis.
+    fn check_slot(&self, slot: Slot) -> Result<(), String> {
+        let now_ms = (self.clock)();
+        let wall_slot = now_ms
+            .checked_sub(u128::from(self.genesis_time) * 1000)
+            .and_then(|since| since.checked_div(u128::from(self.config.slot_duration_ms())))
+            .ok_or_else(|| format!("the wall clock {now_ms} ms is before genesis"))?;
+        if u128::from(slot) > wall_slot + u128::from(MAX_FUTURE_SLOTS) {
+            return Err(format!(
+                "block slot {slot} is more than {MAX_FUTURE_SLOTS} slot ahead of the wall-clock \
+                 slot {wall_slot}"
+            ));
+        }
+        Ok(())
+    }
 }
 
-/// The verdict of `verifier` on `sets`, or none by `timeout`. The call runs on `runtime`; the
+/// The system clock in Unix milliseconds, 0 before 1970 (before any genesis).
+fn system_clock() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis())
+}
+
+/// The verdict of `verifier` on `sets`, or none by `deadline`. The call runs on `runtime`; the
 /// core thread waits for it.
 fn verify<V: BlsVerifier + 'static>(
     runtime: &Handle,
     verifier: &Arc<V>,
     sets: Vec<BlsSet>,
-    timeout: Duration,
+    deadline: Instant,
 ) -> BlsOutcome {
     let verifier = Arc::clone(verifier);
     let call = runtime.spawn(async move {
-        tokio::time::timeout(timeout, verifier.verify_sets(sets, timeout))
+        // The deadline of the verifier, not a second timer: it stops only a verifier that does
+        // not keep its deadline, so that a late VALID never commits. `BlsClient` closes its
+        // stream when its call is dropped, so this cannot leave a request in its window.
+        tokio::time::timeout_at(deadline, verifier.verify_sets(sets, deadline))
             .await
             .unwrap_or_else(|_| BlsOutcome::NoVerdict("no verdict by the deadline".into()))
     });

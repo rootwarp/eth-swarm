@@ -19,11 +19,14 @@
 //!   the block and our post-state and stops. The feature is not default, so a dev-dependency
 //!   on this crate does not link `crypto-bls/verify`.
 //!
-//! - [`anchor`]: the checked anchor (state and signed block) of an `anchor-fetch` output
-//!   directory, with `anchor.json` as its commit marker.
+//! - `anchor` (feature `test-support`): the checked anchor (state and signed block) of an
+//!   `anchor-fetch` output directory, with `anchor.json` as its commit marker. Only tests load
+//!   an anchor this way, so a tool that links this crate without the feature does not link the
+//!   loader.
 //!
 //! The crate never links `cl-sync`: replay reads `anchor-fetch`'s output directory instead.
 
+#[cfg(feature = "test-support")]
 pub mod anchor;
 pub mod archive;
 pub mod collector;

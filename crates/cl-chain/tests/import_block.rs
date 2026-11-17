@@ -1,11 +1,9 @@
 //! Acceptance tests of block import through the chain core.
 //!
-//! Each test installs the genesis anchor of the pinned minimal Gloas export. The anchor comes
-//! from a temporary directory in the `anchor-fetch` layout, through
-//! `testkit::anchor::load_anchor`. The block to import is the slot 1 block of the same export.
-//! A fake cl-verify behind `BlsVerifier` gives the VerifyBls verdicts. One test uses the
-//! production `BlsClient` and an in-process cl-verify instead. One test sets a fake payload
-//! gate that refuses each payload.
+//! The fixture is in [`support`]: the genesis anchor of the pinned minimal Gloas export, its
+//! slot 1 block, and a fake cl-verify behind `BlsVerifier`. Two tests use the production
+//! `BlsClient` instead, one with an in-process cl-verify and one with a silent stub. One test
+//! sets a fake payload gate that refuses each payload.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[allow(dead_code)]
@@ -17,74 +15,27 @@ mod verify {
     pub use cl_chain::verify::client;
 }
 
+#[allow(dead_code)]
+mod support;
+
 use cl_chain::core::{queue, ChainCore, Head, Outcome, SubmitError};
-use cl_chain::import::block::PayloadImportGate;
-use cl_chain::verify::client::{BlsOutcome, BlsVerifier};
-use consensus_types::gloas::SignedBeaconBlock;
+use cl_chain::import::block::{PayloadImportGate, PermitAll};
+use cl_chain::verify::client::{BlsClient, BlsOutcome, BlsVerifier, DEFAULT_MAX_OUTSTANDING};
 use consensus_types::primitives::{Hash32, Root};
 use consensus_types::Minimal;
 use ethswarm_proto::verify::{BlsSet, KeyNamespace};
-use network_config::ChainConfig;
-use ssz::Decode;
 use state_transition::StfError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use support::{
+    assert_unchanged, fixture, import_one, import_with, ungated_fixture, Answer, FakeVerify, QUEUE,
+    VERIFY_TIMEOUT,
+};
 use testkit::anchor::fixtures::{pinned_export, AnchorFiles};
 use testkit::anchor::load_anchor;
 use tokio::runtime::Handle;
+use tokio::time::Instant;
 use tree_hash::TreeHash;
-
-/// Room in each queue of the core.
-const QUEUE: usize = 4;
-/// The VerifyBls deadline of the core in these tests.
-const VERIFY_TIMEOUT: Duration = Duration::from_secs(4);
-
-/// What the fake cl-verify answers.
-#[derive(Clone, Copy, Debug)]
-enum Answer {
-    /// `VERIFY_STATUS_VALID` for each set.
-    Valid,
-    /// `VERIFY_STATUS_INVALID`.
-    Invalid,
-    /// No answer.
-    Never,
-    /// `VERIFY_STATUS_VALID`, but only after two deadlines.
-    Late,
-}
-
-/// A fake cl-verify. It gives one answer to each call and keeps the sets of each call.
-struct FakeVerify {
-    answer: Answer,
-    calls: Mutex<Vec<Vec<BlsSet>>>,
-}
-
-impl FakeVerify {
-    fn new(answer: Answer) -> Arc<Self> {
-        Arc::new(Self {
-            answer,
-            calls: Mutex::default(),
-        })
-    }
-
-    fn calls(&self) -> Vec<Vec<BlsSet>> {
-        self.calls.lock().unwrap().clone()
-    }
-}
-
-impl BlsVerifier for FakeVerify {
-    async fn verify_sets(&self, sets: Vec<BlsSet>, _timeout: Duration) -> BlsOutcome {
-        self.calls.lock().unwrap().push(sets);
-        match self.answer {
-            Answer::Valid => BlsOutcome::Valid,
-            Answer::Invalid => BlsOutcome::Invalid,
-            Answer::Never => std::future::pending().await,
-            Answer::Late => {
-                tokio::time::sleep(VERIFY_TIMEOUT * 2).await;
-                BlsOutcome::Valid
-            }
-        }
-    }
-}
 
 /// A fake payload gate. It refuses each payload and keeps the hashes of each call.
 struct RefusingGate {
@@ -99,94 +50,6 @@ impl PayloadImportGate for RefusingGate {
             .push((*block_hash, *parent_block_hash));
         false
     }
-}
-
-/// The installed genesis anchor and the slot 1 block.
-struct Fixture {
-    core: ChainCore<Minimal>,
-    anchor: Head,
-    block: SignedBeaconBlock<Minimal>,
-    config: ChainConfig,
-}
-
-fn fixture() -> Fixture {
-    let pinned = pinned_export().expect("the pinned export must open");
-    let dir = tempfile::tempdir().unwrap();
-    AnchorFiles::genesis(&pinned.export)
-        .unwrap()
-        .write(dir.path())
-        .unwrap();
-    let loaded = load_anchor::<Minimal>(dir.path()).expect("the anchor must load");
-    let anchor = Head {
-        block_root: loaded.block_root(),
-        slot: loaded.slot(),
-        state_root: loaded.state_root(),
-    };
-    let (state, block) = loaded.into_parts();
-    let core = ChainCore::from_anchor(state, block, pinned.config.clone())
-        .expect("the anchor must install")
-        .with_verify_timeout(VERIFY_TIMEOUT);
-    assert_eq!(core.head(), anchor, "the head must be the anchor");
-    let entry = pinned
-        .export
-        .manifest()
-        .blocks
-        .iter()
-        .find(|entry| entry.slot == 1)
-        .expect("the export must hold a slot 1 block");
-    let bytes = pinned.export.block_ssz(entry).unwrap();
-    Fixture {
-        core,
-        anchor,
-        block: SignedBeaconBlock::from_ssz_bytes(&bytes).unwrap(),
-        config: pinned.config,
-    }
-}
-
-/// Imports `block` on a core with a fake cl-verify that gives `answer`. Returns the outcome,
-/// the core after its writer thread stops, and the fake.
-async fn import_one(
-    core: ChainCore<Minimal>,
-    block: SignedBeaconBlock<Minimal>,
-    answer: Answer,
-) -> (Outcome, ChainCore<Minimal>, Arc<FakeVerify>) {
-    let verify = FakeVerify::new(answer);
-    let (outcome, core) = import_with(core, block, Arc::clone(&verify)).await;
-    (outcome, core, verify)
-}
-
-/// Imports `block` on a core that sends its sets to `verifier`. Returns the outcome and the
-/// core after its writer thread stops.
-async fn import_with<V: BlsVerifier + 'static>(
-    core: ChainCore<Minimal>,
-    block: SignedBeaconBlock<Minimal>,
-    verifier: Arc<V>,
-) -> (Outcome, ChainCore<Minimal>) {
-    let (sender, queue) = queue::<Minimal>(QUEUE);
-    let writer = core.spawn(queue, verifier, Handle::current()).unwrap();
-    let reply = sender
-        .import(block)
-        .expect("the import queue must have room");
-    let served = reply.await.expect("the core must answer");
-    drop(sender);
-    let core = writer.join().expect("the writer thread must not panic");
-    (served.outcome, core)
-}
-
-/// The core holds only the anchor: its head and its pre-state did not change.
-fn assert_unchanged(core: &ChainCore<Minimal>, anchor: Head, block_root: Root) {
-    assert_eq!(core.head(), anchor, "the head must stay the anchor");
-    assert_eq!(core.pre_states(), 1, "the core must hold only the anchor");
-    assert!(
-        core.state(&block_root).is_none(),
-        "the core must not hold a post-state of the block"
-    );
-    let mut state = core.state(&anchor.block_root).unwrap().clone();
-    assert_eq!(
-        state_transition::state_root(&mut state).unwrap(),
-        anchor.state_root,
-        "the anchor state must not change"
-    );
 }
 
 #[tokio::test]
@@ -410,5 +273,158 @@ async fn cl_verify_checks_the_block_sets() {
     block.signature[10] ^= 0x01;
     let (outcome, core) = import_with(f.core, block, client).await;
     assert_eq!(outcome, Outcome::Invalid(StfError::InvalidBlockSignature));
+    assert_unchanged(&core, f.anchor, block_root);
+}
+
+#[tokio::test]
+async fn a_core_commits_only_with_an_explicit_payload_gate() {
+    let f = ungated_fixture();
+    let block_root = f.block.message.tree_hash_root();
+    let (outcome, core, _) = import_one(f.core, f.block, Answer::Valid).await;
+    assert!(
+        matches!(outcome, Outcome::Ignored(_)),
+        "a core without a payload gate must not commit: {outcome:?}"
+    );
+    assert_unchanged(&core, f.anchor, block_root);
+
+    let f = ungated_fixture();
+    let core = f.core.with_payload_gate(PermitAll);
+    let (outcome, _, _) = import_one(core, f.block, Answer::Valid).await;
+    assert!(
+        matches!(outcome, Outcome::Committed { .. }),
+        "the explicit gate PermitAll must let the block commit: {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_committed_block_again_is_ignored_without_a_transition() {
+    let f = fixture();
+    let verify = FakeVerify::new(Answer::Valid);
+    let (sender, queue) = queue::<Minimal>(QUEUE);
+    let writer = f
+        .core
+        .spawn(queue, Arc::clone(&verify), Handle::current())
+        .unwrap();
+    let first = sender.import(f.block.clone()).unwrap().await.unwrap();
+    assert!(
+        matches!(first.outcome, Outcome::Committed { .. }),
+        "{:?}",
+        first.outcome
+    );
+    let again = sender.import(f.block.clone()).unwrap().await.unwrap();
+    assert!(
+        matches!(again.outcome, Outcome::Ignored(_)),
+        "a block that is the head must be IGNORE: {:?}",
+        again.outcome
+    );
+    assert_eq!(
+        verify.calls().len(),
+        1,
+        "a committed block must not run the transition again"
+    );
+    drop(sender);
+    let core = writer.join().unwrap();
+    assert_eq!(core.pre_states(), 2, "the anchor and the one post-state");
+}
+
+#[tokio::test]
+async fn an_out_of_range_proposer_is_invalid_before_the_transition() {
+    let f = fixture();
+    let validators = f.core.state(&f.anchor.block_root).unwrap().validators.len();
+    let first_out = u64::try_from(validators).unwrap();
+    for proposer in [first_out, u64::MAX] {
+        let f = fixture();
+        let mut block = f.block;
+        block.message.proposer_index = proposer;
+        let block_root = block.message.tree_hash_root();
+        let (outcome, core, verify) = import_one(f.core, block, Answer::Valid).await;
+        assert_eq!(
+            outcome,
+            Outcome::Invalid(StfError::UnknownValidator(proposer)),
+            "a proposer past the registry of the parent state must be refused before the slot loop"
+        );
+        assert!(verify.calls().is_empty(), "{proposer}");
+        assert_unchanged(&core, f.anchor, block_root);
+    }
+}
+
+#[tokio::test]
+async fn one_verify_deadline_runs_from_the_start_of_the_import() {
+    let f = fixture();
+    let (outcome, _, verify) = import_one(f.core, f.block, Answer::Valid).await;
+    assert!(matches!(outcome, Outcome::Committed { .. }), "{outcome:?}");
+    let called = verify.called();
+    assert!(!called.is_empty(), "the block sets must go to cl-verify");
+    for call in &called {
+        // The core starts the deadline before the transition, so the transition time is
+        // already gone when the call comes.
+        assert!(
+            call.deadline < call.at + VERIFY_TIMEOUT,
+            "the deadline must not start at the VerifyBls call: {call:?}"
+        );
+        assert_eq!(
+            call.deadline, called[0].deadline,
+            "each call of one import must have the same deadline"
+        );
+    }
+}
+
+/// The deadline of the core in the silent cl-verify test.
+const SHORT_TIMEOUT: Duration = Duration::from_millis(80);
+/// The wait of [`Paused`] before each call.
+const PAUSE: Duration = Duration::from_millis(15);
+
+/// The production client, with a pause before each call. The pause stands for work that the
+/// caller does before the client gets the call.
+struct Paused(BlsClient);
+
+impl BlsVerifier for Paused {
+    async fn verify_sets(&self, sets: Vec<BlsSet>, deadline: Instant) -> BlsOutcome {
+        tokio::time::sleep(PAUSE).await;
+        self.0.verify_sets(sets, deadline).await
+    }
+}
+
+/// A silent cl-verify behind the production client. Each import must end at its deadline and
+/// close its VerifyBls stream, so that a stream never carries a second request and no request
+/// stays in the window. More requests than the window holds must reach cl-verify.
+///
+/// The deadline starts before the transition, so an import on a slow machine can run out of
+/// time before it sends its request. The test thus counts the requests that cl-verify reads,
+/// not the imports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_cl_verify_does_not_fill_the_request_window() {
+    let served = testing::StubVerify::start(testing::Stub::Silent);
+    let verifier = Arc::new(Paused(served.bls_client().await));
+    let f = fixture();
+    let block_root = f.block.message.tree_hash_root();
+    let core = f.core.with_verify_timeout(SHORT_TIMEOUT);
+    let (sender, queue) = queue::<Minimal>(QUEUE);
+    let writer = core.spawn(queue, verifier, Handle::current()).unwrap();
+    for import in 1..=4 * DEFAULT_MAX_OUTSTANDING {
+        let reply = sender.import(f.block.clone()).unwrap();
+        let outcome = reply.await.unwrap().outcome;
+        assert!(
+            matches!(&outcome, Outcome::Ignored(why) if why.contains("no verdict by the deadline")),
+            "import {import}: {outcome:?}"
+        );
+        assert!(
+            served.bls_requests() <= served.streams_opened(),
+            "import {import}: a stream must close at the deadline of its request, so it must \
+             not carry a second request ({} requests on {} streams)",
+            served.bls_requests(),
+            served.streams_opened()
+        );
+        if served.bls_requests() > DEFAULT_MAX_OUTSTANDING {
+            break;
+        }
+    }
+    assert!(
+        served.bls_requests() > DEFAULT_MAX_OUTSTANDING,
+        "more requests than the window holds must reach cl-verify: {}",
+        served.bls_requests()
+    );
+    drop(sender);
+    let core = writer.join().unwrap();
     assert_unchanged(&core, f.anchor, block_root);
 }
