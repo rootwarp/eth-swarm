@@ -23,8 +23,9 @@
 //! and a pre-state key of another version is no verdict.
 //!
 //! Before it returns the post-state, the import asks a [`PayloadImportGate`] about the payload
-//! bid of the block. A refusal is IGNORE. Today the core uses [`PermitAll`]; a later check of
-//! the execution status of the payload will plug in here.
+//! bid of the block. A refusal is IGNORE. The chain core has no gate until one is set, and
+//! commits nothing without one; a later check of the execution status of the payload will plug
+//! in here.
 
 use crate::verify::client::BlsOutcome;
 use crate::verify::pubkey_feed::{builder_signer, BuilderFeed};
@@ -48,7 +49,8 @@ pub trait PayloadImportGate: Send {
     fn permits(&self, block_hash: &Hash32, parent_block_hash: &Hash32) -> bool;
 }
 
-/// The gate the core uses today: it permits each payload.
+/// A gate that permits each payload. The chain core uses it only when its caller sets it: a
+/// core without a gate commits nothing.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PermitAll;
 

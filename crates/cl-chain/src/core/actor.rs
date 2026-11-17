@@ -12,6 +12,9 @@
 //! the block before any state processing, because the slot loop of the transition costs one
 //! `process_slot` for each slot and the queue senders have no clock and no pre-states:
 //!
+//! - no [`PayloadImportGate`] is set: IGNORE. [`ChainCore::from_anchor`] sets none, so a core
+//!   that misses [`ChainCore::with_payload_gate`] commits nothing
+//!   ([`PermitAll`](crate::import::block::PermitAll) is an explicit opt-in);
 //! - the block slot is more than [`MAX_FUTURE_SLOTS`] ahead of the slot of the wall clock
 //!   ([`ChainCore::with_clock`], the system clock if not set), or the wall clock is before
 //!   genesis: IGNORE;
@@ -22,18 +25,17 @@
 //! Then it runs [`import_block`] on the pre-state of the parent. The core sends the signature
 //! sets to cl-verify through a [`BlsVerifier`], on the Tokio runtime of the caller, with the
 //! deadline of the import: each VerifyBls call of one import gets the same deadline, and no
-//! verdict by then is IGNORE. The core commits only on a VALID verdict and a post-state root
-//! equal to `block.state_root`: it keeps the post-state as a pre-state, and the block becomes
-//! the head. There is no fork choice yet, so the head is the last block the core committed. On
-//! any other outcome the head and the pre-states do not change. The [`PayloadImportGate`] of
-//! [`ChainCore::with_payload_gate`] ([`PermitAll`] if not set) can refuse a block that would
-//! commit: that is IGNORE.
+//! verdict by then is IGNORE. The core commits only on a VALID verdict, a post-state root equal
+//! to `block.state_root` and a gate that permits the payload: it keeps the post-state as a
+//! pre-state, and the block becomes the head. There is no fork choice yet, so the head is the
+//! last block the core committed. On any other outcome the head and the pre-states do not
+//! change.
 //!
 //! Envelope import and gossip commit are queue kinds only: the core answers each such item
 //! IGNORE and changes nothing.
 
 use super::snapshot::{max_pre_states, Snapshots};
-use crate::import::block::{import_block, NotImported, PayloadImportGate, PermitAll};
+use crate::import::block::{import_block, NotImported, PayloadImportGate};
 use crate::verify::client::{BlsOutcome, BlsVerifier, UnixClock};
 use consensus_types::gloas::{BeaconState, SignedBeaconBlock};
 use consensus_types::primitives::{Root, Slot};
@@ -230,7 +232,8 @@ pub struct ChainCore<E: Preset> {
     snapshots: Snapshots<BeaconState<E>>,
     head: Head,
     verify_timeout: Duration,
-    gate: Box<dyn PayloadImportGate>,
+    /// `None` until [`Self::with_payload_gate`]: no block commits without a gate.
+    gate: Option<Box<dyn PayloadImportGate>>,
     clock: UnixClock,
     turns: u64,
 }
@@ -239,6 +242,9 @@ impl<E: Preset> ChainCore<E> {
     /// A core on the anchor `state` and `block` of `config`'s network. The roots are computed
     /// again here: the state must have the root `block.state_root`. This is not the Bootstrap
     /// RPC; the caller checks where the anchor comes from.
+    ///
+    /// The core has no payload gate: it IGNOREs each block until [`Self::with_payload_gate`]
+    /// sets one.
     pub fn from_anchor(
         mut state: BeaconState<E>,
         block: SignedBeaconBlock<E>,
@@ -268,7 +274,7 @@ impl<E: Preset> ChainCore<E> {
             snapshots: Snapshots::new(head.block_root, state, max_pre_states::<E>()),
             head,
             verify_timeout: DEFAULT_VERIFY_TIMEOUT,
-            gate: Box::new(PermitAll),
+            gate: None,
             clock: Arc::new(system_clock),
             turns: 0,
         })
@@ -285,7 +291,7 @@ impl<E: Preset> ChainCore<E> {
     /// The same core with `gate` as the payload gate of each import.
     #[must_use]
     pub fn with_payload_gate(mut self, gate: impl PayloadImportGate + 'static) -> Self {
-        self.gate = Box::new(gate);
+        self.gate = Some(Box::new(gate));
         self
     }
 
@@ -361,6 +367,9 @@ impl<E: Preset> ChainCore<E> {
             let now = Instant::now();
             now.checked_add(self.verify_timeout).unwrap_or(now)
         };
+        let Some(gate) = self.gate.as_deref() else {
+            return Outcome::Ignored("no payload gate is set".into());
+        };
         if let Err(why) = self.check_slot(block.message.slot) {
             return Outcome::Ignored(why);
         }
@@ -382,7 +391,7 @@ impl<E: Preset> ChainCore<E> {
             return Outcome::Invalid(StfError::UnknownValidator(proposer));
         }
         let verdict = |sets: Vec<BlsSet>| verify(runtime, verifier, sets, deadline);
-        match import_block(pre, block, &self.config, &verdict, self.gate.as_ref()) {
+        match import_block(pre, block, &self.config, &verdict, gate) {
             Ok(imported) => {
                 self.head = Head {
                     block_root: imported.block_root,
