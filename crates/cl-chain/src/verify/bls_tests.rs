@@ -232,4 +232,9 @@ async fn the_requests_of_one_batch_share_its_deadline() {
     // With room for the three answers, the batch is valid.
     let outcome = client.verify_sets(sets, Instant::now() + wait * 6).await;
     assert_eq!(outcome, BlsOutcome::Valid);
+    assert_eq!(
+        served.bls_requests(),
+        6,
+        "each batch must go out as three requests"
+    );
 }
