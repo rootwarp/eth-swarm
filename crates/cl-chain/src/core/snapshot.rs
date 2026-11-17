@@ -45,13 +45,17 @@ impl<S> Snapshots<S> {
 
     /// The pre-state of block `root`, now the most recently used.
     pub fn get(&mut self, root: &Root) -> Option<&S> {
-        if self.anchor.0 == *root {
-            return Some(&self.anchor.1);
+        self.promote(root);
+        self.peek(root)
+    }
+
+    /// Makes the pre-state of block `root` the most recently used. A root without a pre-state,
+    /// and the anchor, change nothing.
+    pub fn promote(&mut self, root: &Root) {
+        if let Some(at) = self.recent.iter().position(|(r, _)| r == root) {
+            let entry = self.recent.remove(at);
+            self.recent.push(entry);
         }
-        let at = self.recent.iter().position(|(r, _)| r == root)?;
-        let entry = self.recent.remove(at);
-        self.recent.push(entry);
-        self.recent.last().map(|(_, state)| state)
     }
 
     /// The pre-state of block `root`. The order of use does not change.

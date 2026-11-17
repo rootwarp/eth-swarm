@@ -67,6 +67,32 @@ fn an_insert_of_a_known_root_replaces_it() {
 }
 
 #[test]
+fn a_promote_makes_a_pre_state_the_most_recent() {
+    let mut lru = Snapshots::new(root(0), 0u8, 3);
+    lru.insert(root(1), 1);
+    lru.insert(root(2), 2);
+    lru.promote(&root(1));
+    // A promote of the anchor or of an unknown root changes nothing.
+    lru.promote(&root(0));
+    lru.promote(&root(9));
+    lru.insert(root(3), 3);
+    assert_eq!(lru.peek(&root(2)), None, "2 is now the least recent");
+    assert_eq!(lru.peek(&root(1)), Some(&1));
+    assert_eq!(lru.peek(&root(0)), Some(&0));
+}
+
+#[test]
+fn a_peek_does_not_change_the_order_of_use() {
+    let mut lru = Snapshots::new(root(0), 0u8, 3);
+    lru.insert(root(1), 1);
+    lru.insert(root(2), 2);
+    assert_eq!(lru.peek(&root(1)), Some(&1));
+    lru.insert(root(3), 3);
+    assert_eq!(lru.peek(&root(1)), None, "1 must stay the least recent");
+    assert_eq!(lru.peek(&root(2)), Some(&2));
+}
+
+#[test]
 fn the_newest_stays_under_any_bound() {
     let mut lru = Snapshots::new(root(0), 0u8, 0);
     lru.insert(root(1), 1);

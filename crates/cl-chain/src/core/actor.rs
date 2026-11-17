@@ -26,10 +26,10 @@
 //! sets to cl-verify through a [`BlsVerifier`], on the Tokio runtime of the caller, with the
 //! deadline of the import: each VerifyBls call of one import gets the same deadline, and no
 //! verdict by then is IGNORE. The core commits only on a VALID verdict, a post-state root equal
-//! to `block.state_root` and a gate that permits the payload: it keeps the post-state as a
-//! pre-state, and the block becomes the head. There is no fork choice yet, so the head is the
-//! last block the core committed. On any other outcome the head and the pre-states do not
-//! change.
+//! to `block.state_root` and a gate that permits the payload: it makes the parent pre-state the
+//! most recently used, keeps the post-state as a pre-state, and the block becomes the head.
+//! There is no fork choice yet, so the head is the last block the core committed. On any other
+//! outcome the head and the pre-states do not change, their order of use included.
 //!
 //! Envelope import and gossip commit are queue kinds only: the core answers each such item
 //! IGNORE and changes nothing.
@@ -378,7 +378,9 @@ impl<E: Preset> ChainCore<E> {
             return Outcome::Ignored(format!("block {block_root} is already committed"));
         }
         let parent = block.message.parent_root;
-        let Some(pre) = self.snapshots.get(&parent) else {
+        // A peek: the parent becomes the most recently used only if its child commits, so a
+        // failed import does not change the order of use.
+        let Some(pre) = self.snapshots.peek(&parent) else {
             return Outcome::Ignored(format!("no pre-state for the parent {parent}"));
         };
         // The slot loop can add a validator, but not an active one: its activation waits for
@@ -398,6 +400,7 @@ impl<E: Preset> ChainCore<E> {
                     slot: block.message.slot,
                     state_root: imported.state_root,
                 };
+                self.snapshots.promote(&parent);
                 self.snapshots.insert(imported.block_root, imported.post);
                 Outcome::Committed {
                     block_root: imported.block_root,
