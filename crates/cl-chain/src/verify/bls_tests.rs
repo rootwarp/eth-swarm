@@ -155,3 +155,49 @@ async fn a_silent_cl_verify_is_no_verdict_and_its_stream_closes() {
         "a VerifyBls stream without an answer by the deadline must close"
     );
 }
+
+/// Polls `call` until its request is in the outstanding table of `link`, then drops it.
+async fn drop_after_send<F: Future>(link: &StreamLink<Bls>, call: F)
+where
+    F::Output: std::fmt::Debug,
+{
+    let mut call = std::pin::pin!(call);
+    let sent = async {
+        while link.calls.outstanding() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::select! {
+        outcome = &mut call => panic!("the call must wait for its verdict: {outcome:?}"),
+        () = sent => {}
+    }
+}
+
+#[tokio::test]
+async fn a_call_dropped_after_its_send_closes_its_stream_and_frees_its_slot() {
+    let served = StubVerify::start(Stub::Silent);
+    let client = served.bls_client().await;
+    let long = Duration::from_secs(60);
+    for dropped in 1..=DEFAULT_MAX_OUTSTANDING + 1 {
+        let link = client.streams.live().await.unwrap();
+        drop_after_send(&link, client.verify_sets(vec![set(1, true)], long)).await;
+        assert_eq!(
+            link.calls.outstanding(),
+            0,
+            "call {dropped}: a dropped call must not keep its slot"
+        );
+        assert!(
+            link.requests.is_closed(),
+            "call {dropped}: a dropped call must close its stream"
+        );
+    }
+    assert_eq!(served.streams_opened(), DEFAULT_MAX_OUTSTANDING + 1);
+    let outcome = client
+        .verify_sets(vec![set(1, true)], Duration::from_millis(50))
+        .await;
+    assert_eq!(
+        outcome,
+        BlsOutcome::NoVerdict(LATE.into()),
+        "the next call must have room in the window"
+    );
+}
