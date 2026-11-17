@@ -140,14 +140,18 @@ async fn a_silent_cl_verify_is_no_verdict_and_its_stream_closes() {
     let served = StubVerify::start(Stub::Silent);
     let client = served.bls_client().await;
     let timeout = Duration::from_millis(50);
-    let outcome = client.verify_sets(vec![set(1, true)], timeout).await;
+    let outcome = client
+        .verify_sets(vec![set(1, true)], Instant::now() + timeout)
+        .await;
     assert_eq!(
         outcome,
         BlsOutcome::NoVerdict("no verdict by the deadline".into())
     );
     assert_eq!(served.streams_opened(), 1);
     // The stream of the late call is gone: the next call opens a new one.
-    let outcome = client.verify_sets(vec![set(1, true)], timeout).await;
+    let outcome = client
+        .verify_sets(vec![set(1, true)], Instant::now() + timeout)
+        .await;
     assert!(matches!(outcome, BlsOutcome::NoVerdict(_)), "{outcome:?}");
     assert_eq!(
         served.streams_opened(),
@@ -180,7 +184,8 @@ async fn a_call_dropped_after_its_send_closes_its_stream_and_frees_its_slot() {
     let long = Duration::from_secs(60);
     for dropped in 1..=DEFAULT_MAX_OUTSTANDING + 1 {
         let link = client.streams.live().await.unwrap();
-        drop_after_send(&link, client.verify_sets(vec![set(1, true)], long)).await;
+        let call = client.verify_sets(vec![set(1, true)], Instant::now() + long);
+        drop_after_send(&link, call).await;
         assert_eq!(
             link.calls.outstanding(),
             0,
@@ -193,11 +198,38 @@ async fn a_call_dropped_after_its_send_closes_its_stream_and_frees_its_slot() {
     }
     assert_eq!(served.streams_opened(), DEFAULT_MAX_OUTSTANDING + 1);
     let outcome = client
-        .verify_sets(vec![set(1, true)], Duration::from_millis(50))
+        .verify_sets(
+            vec![set(1, true)],
+            Instant::now() + Duration::from_millis(50),
+        )
         .await;
     assert_eq!(
         outcome,
         BlsOutcome::NoVerdict(LATE.into()),
         "the next call must have room in the window"
     );
+}
+
+#[tokio::test]
+async fn the_requests_of_one_batch_share_its_deadline() {
+    // 600 sets go out as three requests (256, 256 and 88 sets), one after the other. The stub
+    // answers each one after `wait`.
+    let wait = Duration::from_millis(200);
+    let served = StubVerify::start(Stub::ValidAfter(wait));
+    let client = served.bls_client().await;
+    let sets: Vec<BlsSet> = (0..600)
+        .map(|index| {
+            let mut one = set(1, false);
+            one.signers[0].validator_index = index;
+            one
+        })
+        .collect();
+    // The third answer comes after the deadline: a request must not get a new deadline.
+    let outcome = client
+        .verify_sets(sets.clone(), Instant::now() + wait * 5 / 2)
+        .await;
+    assert_eq!(outcome, BlsOutcome::NoVerdict(LATE.into()));
+    // With room for the three answers, the batch is valid.
+    let outcome = client.verify_sets(sets, Instant::now() + wait * 6).await;
+    assert_eq!(outcome, BlsOutcome::Valid);
 }

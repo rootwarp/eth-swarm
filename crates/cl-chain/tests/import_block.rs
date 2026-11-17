@@ -34,6 +34,7 @@ use support::{
 use testkit::anchor::fixtures::{pinned_export, AnchorFiles};
 use testkit::anchor::load_anchor;
 use tokio::runtime::Handle;
+use tokio::time::Instant;
 use tree_hash::TreeHash;
 
 /// A fake payload gate. It refuses each payload and keeps the hashes of each call.
@@ -378,9 +379,9 @@ const PAUSE: Duration = Duration::from_millis(15);
 struct Paused(BlsClient);
 
 impl BlsVerifier for Paused {
-    async fn verify_sets(&self, sets: Vec<BlsSet>, timeout: Duration) -> BlsOutcome {
+    async fn verify_sets(&self, sets: Vec<BlsSet>, deadline: Instant) -> BlsOutcome {
         tokio::time::sleep(PAUSE).await;
-        self.0.verify_sets(sets, timeout).await
+        self.0.verify_sets(sets, deadline).await
     }
 }
 

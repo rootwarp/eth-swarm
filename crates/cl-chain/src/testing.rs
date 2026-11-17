@@ -11,7 +11,8 @@
 //! - [`ClVerify`]: an in-process cl-verify (`VerifyServer::new`: the pinned trusted setup) on a
 //!   Unix socket in a temp dir.
 //! - [`StubVerify`]: a VerifyKzg server that misbehaves on purpose (silent, mute, hangs up). In
-//!   [`Stub::Silent`] mode it also opens VerifyBls streams and never answers on them.
+//!   [`Stub::Silent`] mode it also opens VerifyBls streams and never answers on them; in
+//!   [`Stub::ValidAfter`] mode it answers each VerifyBls request VALID after a wait.
 //!   [`StubVerify::start_network`] checks each client hello as cl-verify does, with the
 //!   network hello at the time of a [`ManualClock`] ([`Handshake::accept`]).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -28,10 +29,12 @@ use ethswarm_proto::common::{
 use ethswarm_proto::verify::verify_service_client::VerifyServiceClient;
 use ethswarm_proto::verify::verify_service_server::{VerifyService, VerifyServiceServer};
 use ethswarm_proto::verify::{
-    verify_bls_response, verify_kzg_request, verify_kzg_response, BuilderKeyFeedRequest,
-    BuilderKeyFeedResponse, PubkeyFeedRequest, PubkeyFeedResponse, VerifyBlsRequest,
-    VerifyBlsResponse, VerifyKzgRequest, VerifyKzgResponse, VerifyKzgResponseBody, VerifyStatus,
+    bls_result, verify_bls_request, verify_bls_response, verify_kzg_request, verify_kzg_response,
+    BlsResult, BuilderKeyFeedRequest, BuilderKeyFeedResponse, PubkeyFeedRequest,
+    PubkeyFeedResponse, VerifyBlsRequest, VerifyBlsResponse, VerifyBlsResponseBody,
+    VerifyKzgRequest, VerifyKzgResponse, VerifyKzgResponseBody, VerifyStatus,
 };
+use ipc::fence::{FencedRequest, FencedResult};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -307,6 +310,9 @@ pub enum Stub {
     Unfenced,
     /// Answers the first request with a second hello.
     HelloTwice,
+    /// VerifyBls only: answers each request `VERIFY_STATUS_VALID` for each set, with its
+    /// fences, after this wait. A VerifyKzg stream is silent.
+    ValidAfter(std::time::Duration),
 }
 
 /// A VerifyKzg server scripted by [`Stub`]. Its senders live as long as the server, so a silent
@@ -332,12 +338,18 @@ impl VerifyService for StubVerify {
     type PubkeyFeedStream = Frames<PubkeyFeedResponse>;
     type BuilderKeyFeedStream = Frames<BuilderKeyFeedResponse>;
 
-    /// [`Stub::Silent`] only: the hello, then every request read and none answered.
+    /// [`Stub::Silent`]: the hello, then every request read and none answered.
+    /// [`Stub::ValidAfter`]: the hello, then each request answered after the wait.
     async fn verify_bls(
         &self,
         request: Request<Streaming<VerifyBlsRequest>>,
     ) -> Result<Response<Self::VerifyBlsStream>, Status> {
-        if !matches!(self.mode, Stub::Silent) || self.network.is_some() {
+        let wait = match self.mode {
+            Stub::Silent => None,
+            Stub::ValidAfter(wait) => Some(wait),
+            _ => return Err(Status::unimplemented("stub")),
+        };
+        if self.network.is_some() {
             return Err(Status::unimplemented("stub"));
         }
         self.opened.fetch_add(1, Ordering::SeqCst);
@@ -350,7 +362,29 @@ impl VerifyService for StubVerify {
             })),
         };
         tx.send(Ok(server_hello)).await.unwrap();
-        tokio::spawn(async move { while let Ok(Some(_)) = inbound.message().await {} });
+        let answers = tx.clone();
+        tokio::spawn(async move {
+            while let Ok(Some(frame)) = inbound.message().await {
+                let (Some(wait), Some(verify_bls_request::Frame::Body(body))) = (wait, frame.frame)
+                else {
+                    continue;
+                };
+                tokio::time::sleep(wait).await;
+                let valid = BlsResult {
+                    result: Some(bls_result::Result::Status(VerifyStatus::Valid as i32)),
+                    fence: None,
+                };
+                let mut answer = VerifyBlsResponseBody {
+                    request_id: body.request_id,
+                    results: vec![valid; body.sets.len()],
+                };
+                answer.stamp(&body.result_fences());
+                let frame = verify_bls_response::Frame::Body(answer);
+                let _ = answers
+                    .send(Ok(VerifyBlsResponse { frame: Some(frame) }))
+                    .await;
+            }
+        });
         self.open_bls.lock().unwrap().push(tx);
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }

@@ -77,11 +77,10 @@ impl FakeVerify {
 }
 
 impl BlsVerifier for FakeVerify {
-    async fn verify_sets(&self, sets: Vec<BlsSet>, timeout: Duration) -> BlsOutcome {
-        let at = Instant::now();
+    async fn verify_sets(&self, sets: Vec<BlsSet>, deadline: Instant) -> BlsOutcome {
         self.called.lock().unwrap().push(Called {
-            at,
-            deadline: at + timeout,
+            at: Instant::now(),
+            deadline,
         });
         self.calls.lock().unwrap().push(sets);
         match self.answer {

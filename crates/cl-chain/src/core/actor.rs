@@ -7,10 +7,12 @@
 //! IGNOREs it. When more than one queue holds an item, the thread serves block import first,
 //! then envelope, then gossip commit.
 //!
-//! A block import runs [`import_block`] on the pre-state of the parent of the block. The core
-//! sends the signature sets to cl-verify through a [`BlsVerifier`], on the Tokio runtime of the
-//! caller, with the deadline of [`ChainCore::with_verify_timeout`] ([`DEFAULT_VERIFY_TIMEOUT`]
-//! if not set): no verdict by then is IGNORE. The core commits only on a VALID verdict and a
+//! A block import first takes its deadline: the time of [`ChainCore::with_verify_timeout`]
+//! ([`DEFAULT_VERIFY_TIMEOUT`] if not set) from the start of the import. Then it runs
+//! [`import_block`] on the pre-state of the parent of the block. The core sends the signature
+//! sets to cl-verify through a [`BlsVerifier`], on the Tokio runtime of the caller, with the
+//! deadline of the import: each VerifyBls call of one import gets the same deadline, and no
+//! verdict by then is IGNORE. The core commits only on a VALID verdict and a
 //! post-state root equal to `block.state_root`: it keeps the post-state as a pre-state, and the
 //! block becomes the head. There is no fork choice yet, so the head is the last block the core
 //! committed. On any other outcome the head and the pre-states do not change. The
@@ -34,10 +36,12 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tree_hash::TreeHash;
 
-/// The VerifyBls deadline of a block import \[est\]: well inside a slot, so a block that has no
-/// verdict by then is IGNOREd and can come again.
+/// The time a block import has for its VerifyBls verdicts, from the start of the import
+/// \[est\]: well inside a slot, so a block that has no verdict by then is IGNOREd and can come
+/// again.
 pub const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// The last block the core committed, or the anchor.
@@ -248,7 +252,8 @@ impl<E: Preset> ChainCore<E> {
         })
     }
 
-    /// The same core with `timeout` as the VerifyBls deadline of each import.
+    /// The same core where each import has `timeout` for its VerifyBls verdicts: one deadline,
+    /// taken at the start of the import, for each VerifyBls call of that import.
     #[must_use]
     pub fn with_verify_timeout(mut self, timeout: Duration) -> Self {
         self.verify_timeout = timeout;
@@ -319,12 +324,18 @@ impl<E: Preset> ChainCore<E> {
         verifier: &Arc<V>,
         runtime: &Handle,
     ) -> Outcome {
+        // In the context of the runtime, so that the deadline is on the clock of its timers. A
+        // timeout past the range of `Instant` gives no time at all: no verdict is IGNORE.
+        let deadline = {
+            let _context = runtime.enter();
+            let now = Instant::now();
+            now.checked_add(self.verify_timeout).unwrap_or(now)
+        };
         let parent = block.message.parent_root;
         let Some(pre) = self.snapshots.get(&parent) else {
             return Outcome::Ignored(format!("no pre-state for the parent {parent}"));
         };
-        let timeout = self.verify_timeout;
-        let verdict = |sets: Vec<BlsSet>| verify(runtime, verifier, sets, timeout);
+        let verdict = |sets: Vec<BlsSet>| verify(runtime, verifier, sets, deadline);
         match import_block(pre, block, &self.config, &verdict, self.gate.as_ref()) {
             Ok(imported) => {
                 self.head = Head {
@@ -344,17 +355,20 @@ impl<E: Preset> ChainCore<E> {
     }
 }
 
-/// The verdict of `verifier` on `sets`, or none by `timeout`. The call runs on `runtime`; the
+/// The verdict of `verifier` on `sets`, or none by `deadline`. The call runs on `runtime`; the
 /// core thread waits for it.
 fn verify<V: BlsVerifier + 'static>(
     runtime: &Handle,
     verifier: &Arc<V>,
     sets: Vec<BlsSet>,
-    timeout: Duration,
+    deadline: Instant,
 ) -> BlsOutcome {
     let verifier = Arc::clone(verifier);
     let call = runtime.spawn(async move {
-        tokio::time::timeout(timeout, verifier.verify_sets(sets, timeout))
+        // The deadline of the verifier, not a second timer: it stops only a verifier that does
+        // not keep its deadline, so that a late VALID never commits. `BlsClient` closes its
+        // stream when its call is dropped, so this cannot leave a request in its window.
+        tokio::time::timeout_at(deadline, verifier.verify_sets(sets, deadline))
             .await
             .unwrap_or_else(|_| BlsOutcome::NoVerdict("no verdict by the deadline".into()))
     });
