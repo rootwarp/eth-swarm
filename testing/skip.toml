@@ -241,62 +241,14 @@ expires = "2026-11-30"
 
 # ---------------------------------------------------------------------------------------
 # Fork choice. crates/spec-tests/src/fork_choice.rs runs the Gloas handlers on_block,
-# get_head, get_parent_payload_status, filter_node_tree_variants and ex_ante with tick and
-# block steps and store checks only, and it fails closed on any other step or check. The
-# entries below skip the cases of those handlers that need more: blocks with attestations,
-# attestation or attester_slashing steps, execution_payload steps or payload vote checks
-# (from the consensus-specs v1.7.0-beta.4 pyspec sources). The ex_ante entries name each
-# case. A new case of a run handler is not skipped, so it runs and fails until it gets an
-# entry or a handler. The other Gloas handlers and every Fulu case are skipped whole, and
-# heze cases fall to the heze entry.
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "minimal"
-runner  = "fork_choice"
-handler = "on_block"
-case    = "pyspec_tests/on_block_checkpoints"
-reason  = "The blocks carry attestations (next_epoch_with_attestations): the format runs on_attestation for each; on_attestation is not ported, and the runner fails a block or a step that needs it"
-owner   = "ian"
-issue   = "5.11b"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "minimal"
-runner  = "fork_choice"
-handler = "on_block"
-case    = "pyspec_tests/*finalized*"
-reason  = "The blocks that finalize carry attestations: the format runs on_attestation for each; on_attestation is not ported, and the runner fails a block or a step that needs it"
-owner   = "ian"
-issue   = "5.11b"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "minimal"
-runner  = "fork_choice"
-handler = "on_block"
-case    = "pyspec_tests/*justifi*"
-reason  = "The blocks that justify carry attestations: the format runs on_attestation for each; on_attestation is not ported, and the runner fails a block or a step that needs it"
-owner   = "ian"
-issue   = "5.11b"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "minimal"
-runner  = "fork_choice"
-handler = "on_block"
-case    = "pyspec_tests/*pull_up*"
-reason  = "The blocks that pull up the checkpoints carry attestations: the format runs on_attestation for each; on_attestation is not ported, and the runner fails a block or a step that needs it"
-owner   = "ian"
-issue   = "5.11b"
-expires = "2026-11-30"
+# get_head, get_parent_payload_status, filter_node_tree_variants, ex_ante, on_attestation,
+# reorg, withholding and should_apply_proposer_boost with tick, block, attestation and
+# attester_slashing steps and store checks (viable_for_head_roots_and_weights included), and
+# it fails closed on any other step or check. The entries below skip, by exact name, the
+# cases of those handlers that need an execution_payload step or payload vote checks (from
+# the consensus-specs v1.7.0-beta.4 pyspec sources). A new case of a run handler is not
+# skipped, so it runs and fails until it gets an entry or a handler. The other Gloas handlers
+# and every Fulu case are skipped whole, and heze cases fall to the heze entry.
 
 [[skip]]
 source  = "consensus-specs"
@@ -316,7 +268,7 @@ fork    = "gloas"
 preset  = "*"
 runner  = "fork_choice"
 handler = "get_head"
-case    = "pyspec_tests/get_head_*_payload_tiebreak"
+case    = "pyspec_tests/get_head_full_payload_tiebreak"
 reason  = "An execution_payload step, a block with payload attestations and payload vote checks: on_execution_payload_envelope is not ported, and the runner fails an execution_payload step, and it has no payload vote check"
 owner   = "ian"
 issue   = "5.14a"
@@ -328,67 +280,8 @@ fork    = "gloas"
 preset  = "*"
 runner  = "fork_choice"
 handler = "get_head"
-case    = "pyspec_tests/shorter_chain_but_heavier_weight"
-reason  = "An attestation step gives the weight: on_attestation is not ported, and the runner fails a block or a step that needs it"
-owner   = "ian"
-issue   = "5.11b"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "*"
-runner  = "fork_choice"
-handler = "get_head"
-case    = "pyspec_tests/proposer_boost_excludes_slashed_validators"
-reason  = "Attestation steps give the weight: on_attestation is not ported, and the runner fails a block or a step that needs it"
-owner   = "ian"
-issue   = "5.11b"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "*"
-runner  = "fork_choice"
-handler = "get_head"
-case    = "pyspec_tests/discard_equivocations_*"
-reason  = "Attestation and attester_slashing steps: on_attester_slashing is not ported either; on_attestation is not ported, and the runner fails a block or a step that needs it"
-owner   = "ian"
-issue   = "5.11b"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "minimal"
-runner  = "fork_choice"
-handler = "get_head"
-case    = "pyspec_tests/filtered_block_tree"
-reason  = "Blocks with attestations and attestation steps: on_attestation is not ported, and the runner fails a block or a step that needs it"
-owner   = "ian"
-issue   = "5.11b"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "minimal"
-runner  = "fork_choice"
-handler = "get_head"
-case    = "pyspec_tests/voting_source_*"
-reason  = "The blocks that justify carry attestations: on_attestation is not ported, and the runner fails a block or a step that needs it"
-owner   = "ian"
-issue   = "5.11b"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "minimal"
-runner  = "fork_choice"
-handler = "filter_node_tree_variants"
-reason  = "Each case needs more than tick and block steps: setup_finalized_store blocks with attestations, attestation steps and an execution_payload step. on_attestation and on_execution_payload_envelope are not ported. The runner knows the handler and runs its cases when both land"
+case    = "pyspec_tests/get_head_empty_payload_tiebreak"
+reason  = "An execution_payload step, a block with payload attestations and payload vote checks: on_execution_payload_envelope is not ported, and the runner fails an execution_payload step, and it has no payload vote check"
 owner   = "ian"
 issue   = "5.14a"
 expires = "2026-11-30"
@@ -399,9 +292,10 @@ fork    = "gloas"
 preset  = "*"
 runner  = "fork_choice"
 handler = "on_attestation"
-reason  = "Every case has attestation steps: on_attestation is not ported, and the runner fails a block or a step that needs it"
+case    = "pyspec_tests/validate_on_attestation_same_slot_full_vote_rejected"
+reason  = "An execution_payload step makes the payload of the attested block verified before a FULL vote: on_execution_payload_envelope is not ported, and the runner fails an execution_payload step"
 owner   = "ian"
-issue   = "5.11b"
+issue   = "5.14a"
 expires = "2026-11-30"
 
 [[skip]]
@@ -409,11 +303,11 @@ source  = "consensus-specs"
 fork    = "gloas"
 preset  = "*"
 runner  = "fork_choice"
-handler = "ex_ante"
-case    = "pyspec_tests/ex_ante_vanilla"
-reason  = "An attestation step gives the weight: on_attestation is not ported, and the runner fails a step that needs it"
+handler = "on_attestation"
+case    = "pyspec_tests/validate_on_attestation_later_slot_full_vote_valid"
+reason  = "An execution_payload step makes the payload of the attested block verified before a FULL vote: on_execution_payload_envelope is not ported, and the runner fails an execution_payload step"
 owner   = "ian"
-issue   = "5.11b"
+issue   = "5.14a"
 expires = "2026-11-30"
 
 [[skip]]
@@ -421,35 +315,11 @@ source  = "consensus-specs"
 fork    = "gloas"
 preset  = "*"
 runner  = "fork_choice"
-handler = "ex_ante"
-case    = "pyspec_tests/ex_ante_sandwich_with_honest_attestation"
-reason  = "An attestation step of an honest validator gives the weight: on_attestation is not ported, and the runner fails a step that needs it"
+handler = "on_attestation"
+case    = "pyspec_tests/validate_on_attestation_beacon_root_payload_check"
+reason  = "An execution_payload step makes the payload of the attested block verified before a FULL vote: on_execution_payload_envelope is not ported, and the runner fails an execution_payload step"
 owner   = "ian"
-issue   = "5.11b"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "mainnet"
-runner  = "fork_choice"
-handler = "ex_ante"
-case    = "pyspec_tests/ex_ante_attestations_is_greater_than_proposer_boost_with_boost"
-reason  = "Attestation steps give the weight (a case of mainnet committees only): on_attestation is not ported, and the runner fails a step that needs it"
-owner   = "ian"
-issue   = "5.11b"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "mainnet"
-runner  = "fork_choice"
-handler = "ex_ante"
-case    = "pyspec_tests/ex_ante_sandwich_with_boost_not_sufficient"
-reason  = "Attestation steps give the weight (a case of mainnet committees only): on_attestation is not ported, and the runner fails a step that needs it"
-owner   = "ian"
-issue   = "5.11b"
+issue   = "5.14a"
 expires = "2026-11-30"
 
 [[skip]]
@@ -457,32 +327,10 @@ source  = "consensus-specs"
 fork    = "gloas"
 preset  = "minimal"
 runner  = "fork_choice"
-handler = "reorg"
-reason  = "The blocks carry attestations and some cases have attestation steps; on_attestation is not ported, and the runner does not run the handler"
+handler = "filter_node_tree_variants"
+reason  = "Each case has an execution_payload step after setup_finalized_store: on_execution_payload_envelope is not ported, and the runner fails an execution_payload step. The runner knows the handler and runs its cases when the envelope handler lands"
 owner   = "ian"
-issue   = "5.11b"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "minimal"
-runner  = "fork_choice"
-handler = "withholding"
-reason  = "The blocks carry attestations; on_attestation is not ported, and the runner does not run the handler"
-owner   = "ian"
-issue   = "5.11b"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "minimal"
-runner  = "fork_choice"
-handler = "should_apply_proposer_boost"
-reason  = "setup_finalized_store blocks with attestations, attestation steps and viable_for_head checks; on_attestation is not ported, and the runner does not run the handler"
-owner   = "ian"
-issue   = "5.11b"
+issue   = "5.14a"
 expires = "2026-11-30"
 
 [[skip]]
@@ -491,9 +339,9 @@ fork    = "gloas"
 preset  = "*"
 runner  = "fork_choice"
 handler = "on_payload_attestation_message"
-reason  = "payload_attestation_message steps and payload vote checks; on_payload_attestation_message from the wire is not ported, and the runner does not run the handler"
+reason  = "payload_attestation_message steps and payload vote checks: on_payload_attestation_message from the wire is not ported, and the runner does not run the handler"
 owner   = "ian"
-issue   = "5.11b"
+issue   = "5.14a"
 expires = "2026-11-30"
 
 [[skip]]
@@ -535,7 +383,7 @@ fork    = "gloas"
 preset  = "minimal"
 runner  = "fork_choice"
 handler = "deposit_with_reorg"
-reason  = "An execution_payload step, a child of the FULL parent with parent execution requests, and blocks with attestations; on_execution_payload_envelope and on_attestation are not ported"
+reason  = "An execution_payload step and a child of the FULL parent with parent execution requests: on_execution_payload_envelope is not ported, and the runner does not run the handler"
 owner   = "ian"
 issue   = "5.14a"
 expires = "2026-11-30"
