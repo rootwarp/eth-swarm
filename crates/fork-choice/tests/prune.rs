@@ -465,3 +465,55 @@ fn a_same_slot_prune_keeps_the_empty_choice_of_a_boosted_child_of_the_previous_s
     assert!(store.block(root_of(&b)).is_none());
     assert_eq!(get_head(&store), Ok(empty(z)));
 }
+
+/// A block at `slot` on the FULL `parent` by proposer `tag`: its bid builds on the payload of
+/// the bid of `parent`.
+fn on_full(parent: &BeaconBlock<E>, slot: Slot, tag: u8) -> SignedBeaconBlock<E> {
+    let mut block = child(parent, slot, tag);
+    block
+        .message
+        .body
+        .signed_execution_payload_bid
+        .message
+        .parent_block_hash = parent.body.signed_execution_payload_bid.message.block_hash;
+    block
+}
+
+#[test]
+fn children_of_a_full_parent_keep_their_dependent_root_boost_and_place_across_a_prune() {
+    let (mut store, a, b) = two_branches();
+    let ra = root_of(&a);
+    mark_payload_verified(&mut store, ra);
+    // `c` of slot 9 builds on the FULL node of `a`, late in slot 10, and its post-state
+    // justifies and finalizes epoch 1 with `a`.
+    let checkpoint = Checkpoint { epoch: 1, root: ra };
+    let c = on_full(&a.message, 9, 3);
+    on_block(&mut store, &finalizing(checkpoint.clone()), &c).unwrap();
+    assert_eq!(store.finalized_checkpoint(), &checkpoint);
+    store_target_checkpoint_state(&mut store, &PLAIN, &checkpoint).unwrap();
+    // The one child of `a` builds on its FULL node, so `a` is a dependent root for slot 8.
+    assert_ne!(get_head(&store).map(|n| n.root), Ok(ra));
+    assert_eq!(is_valid_dependent_root(&store, ra, 8), Ok(true));
+
+    // `d` of slot 10 on the FULL node of `a` is timely, so it takes the proposer boost. The
+    // boost supports the FULL node of `a`, and not its EMPTY node.
+    let d = on_full(&a.message, 10, 4);
+    on_block(&mut store, &PLAIN, &d).unwrap();
+    assert_eq!(store.proposer_boost_root(), root_of(&d));
+    assert_eq!(get_weight(&store, &full(ra)), Ok(PROPOSER_SCORE));
+    assert_eq!(get_weight(&store, &empty(ra)), Ok(0));
+    assert_eq!(get_weight(&store, &pending(ra)), Ok(PROPOSER_SCORE));
+
+    // A tick in the same slot drops `b`, beside `a`, and keeps the children of the FULL node
+    // of `a`, with the same head and weights.
+    let before = head_and_weights(&store);
+    let time = store.time_ms();
+    on_tick(&mut store, time).unwrap();
+    assert!(store.block(root_of(&b)).is_none());
+    for root in [ra, root_of(&c), root_of(&d)] {
+        assert!(store.block(root).is_some(), "{root}");
+    }
+    assert_eq!(head_and_weights(&store), before);
+    assert_eq!(get_weight(&store, &empty(ra)), Ok(0));
+    assert_eq!(is_valid_dependent_root(&store, ra, 8), Ok(true));
+}
