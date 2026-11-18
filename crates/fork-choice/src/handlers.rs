@@ -1,4 +1,5 @@
 //! The handlers `on_tick` and `on_block`, their helpers, and `store_target_checkpoint_state`.
+//! `on_attestation` and `on_attester_slashing` are in [`crate::attestations`].
 //!
 //! A handler that fails leaves the store as it was: "Invalid calls to handlers must not modify
 //! `store`" (P0 L97-99). `on_block` computes every value that can fail before it changes the
@@ -331,8 +332,21 @@ pub fn store_target_checkpoint_state<E: Preset, P: StateProvider<E> + ?Sized>(
     provider: &P,
     target: &Checkpoint,
 ) -> Result<(), Error> {
+    if let Some(state) = target_checkpoint_state(store, provider, target)? {
+        store.checkpoint_states.insert(key(target), state);
+    }
+    Ok(())
+}
+
+/// The state that `store_target_checkpoint_state` stores for `target`, or `None` if the store
+/// has it. `on_attestation` stores it only once the attestation is valid.
+pub(crate) fn target_checkpoint_state<E: Preset, P: StateProvider<E> + ?Sized>(
+    store: &Store<E>,
+    provider: &P,
+    target: &Checkpoint,
+) -> Result<Option<BeaconState<E>>, Error> {
     if store.checkpoint_states.contains_key(&key(target)) {
-        return Ok(());
+        return Ok(None);
     }
     let mut base_state = store.get_block_state(target.root)?.clone();
     let start_slot = compute_start_slot_at_epoch::<E>(target.epoch)?;
@@ -341,6 +355,5 @@ pub fn store_target_checkpoint_state<E: Preset, P: StateProvider<E> + ?Sized>(
             .process_slots(&mut base_state, start_slot)
             .map_err(Error::StateTransition)?;
     }
-    store.checkpoint_states.insert(key(target), base_state);
-    Ok(())
+    Ok(Some(base_state))
 }

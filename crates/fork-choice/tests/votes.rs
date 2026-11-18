@@ -331,13 +331,16 @@ fn payload_status_tiebreak() {
     let mut f = one_block(3);
     let a = f.root();
     mark_payload_verified(&mut f.store, a);
-    gossip(&mut f.store, &Vote::new(&f.store, 2, a, 0).index(1)).unwrap();
-    gossip(&mut f.store, &Vote::new(&f.store, 2, a, 1).index(0)).unwrap();
+    let full_vote = Vote::new(&f.store, 2, a, 0).index(1);
+    let empty_vote = Vote::new(&f.store, 2, a, 1).index(0);
+    gossip(&mut f.store, &full_vote).unwrap();
+    gossip(&mut f.store, &empty_vote).unwrap();
     assert_eq!(get_weight(&f.store, &full(a)), Ok(BALANCE));
     assert_eq!(get_weight(&f.store, &empty(a)), Ok(BALANCE));
     assert_eq!(get_head(&f.store), Ok(full(a)));
     // A heavier EMPTY node wins: the weight decides before the tiebreaker.
-    gossip(&mut f.store, &Vote::new(&f.store, 2, a, 2).index(0)).unwrap();
+    let empty_vote = Vote::new(&f.store, 2, a, 2).index(0);
+    gossip(&mut f.store, &empty_vote).unwrap();
     assert_eq!(get_weight(&f.store, &empty(a)), Ok(2 * BALANCE));
     assert_eq!(get_head(&f.store), Ok(empty(a)));
 
@@ -422,7 +425,8 @@ fn slashed_weight_removed() {
     gossip(&mut slashed.store, &for_b).unwrap();
     gossip(&mut slashed.store, &for_c).unwrap();
     // The honest store has the same votes without the equivocator.
-    gossip(&mut honest.store, &Vote::new(&honest.store, 3, b, 1)).unwrap();
+    let honest_for_b = Vote::new(&honest.store, 3, b, 1);
+    gossip(&mut honest.store, &honest_for_b).unwrap();
     gossip(&mut honest.store, &for_c).unwrap();
     assert_eq!(get_weight(&slashed.store, &pending(b)), Ok(2 * BALANCE));
     assert_ne!(all_weights(&slashed), all_weights(&honest));
@@ -461,7 +465,8 @@ fn slashed_weight_removed() {
     assert_eq!(get_head(&slashed.store), get_head(&honest.store));
 
     // A vote of an equivocator sets no message and adds no weight.
-    gossip(&mut slashed.store, &Vote::new(&slashed.store, 3, c, 3)).unwrap();
+    let late_vote = Vote::new(&slashed.store, 3, c, 3);
+    gossip(&mut slashed.store, &late_vote).unwrap();
     assert_eq!(slashed.store.latest_message(attesters[3]), None);
     assert_eq!(all_weights(&slashed), all_weights(&honest));
 }
@@ -748,15 +753,17 @@ fn refused_signature_leaves_no_checkpoint_state() {
 
 #[test]
 fn attesting_indices_that_the_committees_cannot_give_are_indexed_attestation_errors() {
-    let mut f = one_block(3);
+    let mut f = one_block(SLOTS_PER_EPOCH);
     let a = f.root();
-    let vote = Vote::new(&f.store, 2, a, 0);
+    let vote = Vote::new(&f.store, SLOTS_PER_EPOCH - 1, a, 0);
     // Fewer bits than the committee has members: the spec fails on the index of a bit.
     let mut short = vote.attestation(&f.store);
     let mut bits = ProgressiveBitList::with_capacity(1);
     bits.set(0, true).unwrap();
     short.aggregation_bits = bits;
-    // A committee past the two committees of the slot.
+    // The spec does not check the committee index against the committees of the slot: an
+    // index past them gives a committee of a later slot. Past the last committee of the
+    // epoch, the spec fails in `compute_shuffled_index`.
     let mut no_committee = vote.attestation(&f.store);
     no_committee.committee_bits = BitVector::new();
     no_committee.committee_bits.set(3, true).unwrap();

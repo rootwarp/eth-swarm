@@ -23,6 +23,11 @@ through it.
 a slot or an epoch before the anchor gives the anchor, where the spec gives an older block or
 fails.
 
-**Recheck.** When `on_attestation` lands, check that its `get_checkpoint_block` call for the
-attestation target never asks for an epoch before the anchor. The target is of the current or
-the previous epoch, which is at or after the finalized epoch.
+**Attestation targets.** `on_attestation` refuses a target whose epoch starts before the
+anchor block (`AttestationError::TargetBeforeAnchor`) before it calls `get_checkpoint_block`.
+For such an epoch the spec's walk passes below the anchor: after a checkpoint sync it fails on
+the missing parent, and after a prune it gives a block older than every block of the store,
+which cannot be the target. So the spec refuses the attestation at the same assert. Such a
+target is the epoch before a checkpoint-sync anchor state whose block is not at the first
+slot of that epoch, or, in an attestation of a block, the previous epoch of a block of the
+finalized epoch.

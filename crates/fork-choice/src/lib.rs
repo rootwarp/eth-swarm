@@ -4,28 +4,31 @@
 //! - [`store`]: [`Store`], [`get_forkchoice_store`], the time helpers and the ancestry
 //!   helpers with their payload status.
 //! - [`handlers`]: [`on_tick`], [`on_block`] and [`store_target_checkpoint_state`].
+//! - [`attestations`]: [`on_attestation`] and [`on_attester_slashing`].
 //! - [`weights`]: [`get_head`], the filtered node tree, [`get_weight`] and the payload
 //!   tiebreaker.
 //!
 //! The crate does no I/O and links no BLS library. The state transition of a block comes
-//! from the caller through a [`StateProvider`]. `on_attestation`, `on_attester_slashing`,
-//! `on_execution_payload_envelope` and `on_payload_attestation_message` from the wire are not
-//! here yet. Until they are, only the test seams of `testing` (tests only) fill
-//! `store.latest_messages`, `store.equivocating_indices` and `store.payloads`.
+//! from the caller through a [`StateProvider`], and the BLS verdicts of an attestation through
+//! a [`SignatureVerifier`]. `on_execution_payload_envelope` and
+//! `on_payload_attestation_message` from the wire are not here yet. Until they are, only the
+//! test seam `testing::mark_payload_verified` (tests only) fills `store.payloads`.
 //!
 //! The spec's store keeps every block. Here `on_tick` also drops the blocks that do not
 //! descend from the finalized checkpoint block once finality moves, with no change to the
-//! result of a handler or of [`get_head`] ([`on_tick`]).
+//! result of [`on_block`] or of [`get_head`] ([`on_tick`]).
 //!
 //! The spec signals an invalid call with a failed `assert` or a missing key. Here each public
 //! handler returns an [`Error`] instead, and a failed handler leaves the store as it was.
 //! Each ported function cites its spec lines: G `gloas/fork-choice.md`, P0
 //! `phase0/fork-choice.md`, P0b `phase0/beacon-chain.md`.
 
+pub mod attestations;
 pub mod handlers;
 pub mod store;
 pub mod weights;
 
+pub use attestations::{on_attestation, on_attester_slashing, SignatureVerifier};
 pub use handlers::{on_block, on_tick, store_target_checkpoint_state, StateProvider};
 pub use store::{
     compute_slots_since_epoch_start, get_ancestor, get_checkpoint_block, get_current_slot,
@@ -38,7 +41,7 @@ pub use weights::{
     get_filtered_node_tree, get_head, get_node_children, get_weight, is_valid_dependent_root,
 };
 
-use consensus_types::primitives::{Epoch, Root, Slot, ValidatorIndex};
+use consensus_types::primitives::{CommitteeIndex, Epoch, Root, Slot, ValidatorIndex};
 use state_transition::StfError;
 
 /// `BASIS_POINTS` (P0 L126).
@@ -146,11 +149,108 @@ pub enum Error {
     /// A `Uint64` operation of the spec overflowed.
     #[error("arithmetic overflow")]
     Overflow,
+    /// `on_attestation` or `on_attester_slashing` failed a spec `assert` on its input. An
+    /// attestation can pass later, when its blocks or its slot arrive.
+    #[error("invalid attestation: {0}")]
+    InvalidAttestation(AttestationError),
+    /// `get_indexed_attestation` or `is_valid_indexed_attestation` failed with an error, not a
+    /// verdict. [`StfError::proves_invalid`] tells whether the spec fails on the input too (a
+    /// bit or a committee that the slot does not have, an index past the registry), or the
+    /// state or the signature backend failed (no verdict, never a proof).
+    #[error("indexed attestation: {0}")]
+    IndexedAttestation(StfError),
+}
+
+/// The spec `assert` that an attestation or an attester slashing failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AttestationError {
+    /// `validate_target_epoch_against_current_time` (P0 L816-823): an attestation from the
+    /// wire must have the target epoch of the current or the previous epoch of the store.
+    #[error("target epoch {target} is not the current epoch {current} or the one before")]
+    TargetEpochNotCurrent {
+        /// `data.target.epoch`.
+        target: Epoch,
+        /// `get_current_store_epoch(store)`.
+        current: Epoch,
+    },
+    /// The target epoch must be the epoch of the attestation slot.
+    #[error("target epoch {target} is not the epoch of slot {slot}")]
+    TargetEpochMismatch {
+        /// `data.target.epoch`.
+        target: Epoch,
+        /// `data.slot`.
+        slot: Slot,
+    },
+    /// The target block must be in the store.
+    #[error("target block {0} is not in the store")]
+    UnknownTarget(Root),
+    /// The attested block must be in the store.
+    #[error("attested block {0} is not in the store")]
+    UnknownBeaconBlock(Root),
+    /// The attested block must not be after the attestation slot.
+    #[error("attested block of slot {block} is after the attestation slot {slot}")]
+    FutureBlock {
+        /// The slot of the attested block.
+        block: Slot,
+        /// `data.slot`.
+        slot: Slot,
+    },
+    /// `data.index` must be 0 (an EMPTY vote) or 1 (a FULL vote) (G L937).
+    #[error("attestation index {0} is not 0 or 1")]
+    IndexOutOfRange(CommitteeIndex),
+    /// A vote of the slot of its block must have index 0: the payload of that block is not
+    /// known at the attestation deadline (G L938-939).
+    #[error("a vote of the slot of block {0} is for its FULL node")]
+    SameSlotFullVote(Root),
+    /// A FULL vote needs the verified payload of its block (G L942-943).
+    #[error("a FULL vote for block {0}, whose payload is not verified")]
+    PayloadNotVerified(Root),
+    /// The target epoch starts before the anchor block. The spec's `get_checkpoint_block`
+    /// walks below the anchor for it, where the store has no block: see
+    /// `attestations::validate_on_attestation`.
+    #[error("target epoch {epoch} starts before the anchor block of slot {anchor_slot}")]
+    TargetBeforeAnchor {
+        /// `data.target.epoch`.
+        epoch: Epoch,
+        /// The slot of the anchor block.
+        anchor_slot: Slot,
+    },
+    /// The target must be the checkpoint block of the attested block (the LMD vote must agree
+    /// with the FFG vote).
+    #[error("target {target} is not the checkpoint block {checkpoint_block}")]
+    TargetNotCheckpointBlock {
+        /// `data.target.root`.
+        target: Root,
+        /// `get_checkpoint_block(store, data.beacon_block_root, data.target.epoch)`.
+        checkpoint_block: Root,
+    },
+    /// An attestation counts only from the slot after its own.
+    #[error("attestation slot {slot} is not before the current slot {current}")]
+    SlotNotPast {
+        /// `data.slot`.
+        slot: Slot,
+        /// `get_current_slot(store)`.
+        current: Slot,
+    },
+    /// `is_valid_indexed_attestation` is false: the indices are empty, not sorted or not
+    /// unique, or the signature is invalid.
+    #[error("the indexed attestation is not valid")]
+    InvalidIndexedAttestation,
+    /// `is_slashable_attestation_data` is false: not a double vote and not a surround vote.
+    #[error("the two attestations are not slashable")]
+    NotSlashable,
+}
+
+impl From<AttestationError> for Error {
+    fn from(e: AttestationError) -> Self {
+        Self::InvalidAttestation(e)
+    }
 }
 
 /// Test seams. Only tests may enable them: the feature `testing` is for dev-dependencies.
-/// They change the store without the checks of the handlers that they stand for, so that a
-/// test can reach the weight of a node before those handlers exist.
+/// They change the store without the checks of the handlers that they stand for:
+/// `mark_payload_verified` stands for `on_execution_payload_envelope`, which is not here yet,
+/// and the others let a test set a weight without the committees of an attestation.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
     use crate::{LatestMessage, Store};

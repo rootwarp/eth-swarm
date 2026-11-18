@@ -42,8 +42,8 @@ impl ForkChoiceNode {
     }
 }
 
-/// `LatestMessage` (G L182-185): the latest attestation of a validator. `on_attestation`
-/// fills these; until then every store has none.
+/// `LatestMessage` (G L182-185): the latest attestation of a validator, which
+/// `on_attestation` sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LatestMessage {
     /// The attestation slot.
@@ -59,8 +59,8 @@ pub(crate) const ATTESTATION_TIMELINESS_INDEX: usize = 0;
 /// `PTC_TIMELINESS_INDEX` (G L107).
 pub(crate) const PTC_TIMELINESS_INDEX: usize = 1;
 
-/// `Store` (G L192-213). The fields are private: only `on_tick` and `on_block` change them,
-/// which keeps each per-block map keyed by the same roots as `blocks`.
+/// `Store` (G L192-213). The fields are private: only the handlers change them, which keeps
+/// each per-block map keyed by the same roots as `blocks`.
 ///
 /// `anchor_root` is not a spec field. It is the root of the anchor block, the one block of the
 /// store whose parent is not in the store: the ancestor walk stops there ([`get_ancestor`]).
@@ -153,6 +153,16 @@ impl<E: Preset> Store<E> {
     /// `store.checkpoint_states[checkpoint]`.
     pub fn checkpoint_state(&self, checkpoint: &Checkpoint) -> Option<&BeaconState<E>> {
         self.checkpoint_states.get(&key(checkpoint))
+    }
+
+    /// `store.latest_messages[validator_index]`.
+    pub fn latest_message(&self, validator_index: ValidatorIndex) -> Option<&LatestMessage> {
+        self.latest_messages.get(&validator_index)
+    }
+
+    /// `store.equivocating_indices`.
+    pub fn equivocating_indices(&self) -> &BTreeSet<ValidatorIndex> {
+        &self.equivocating_indices
     }
 
     /// `store.block_timeliness[root]`: timely for the attestation deadline, then for the PTC
