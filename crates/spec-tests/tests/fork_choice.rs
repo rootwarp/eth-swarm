@@ -9,15 +9,17 @@
 
 use consensus_types::common::AttestationData;
 use consensus_types::gloas::{
-    Attestation, BeaconBlock, BeaconState, Checkpoint, PayloadAttestation, PayloadAttestationData,
-    SignedBeaconBlock,
+    Attestation, AttesterSlashing, BeaconBlock, BeaconState, Checkpoint, IndexedAttestation,
+    PayloadAttestation, PayloadAttestationData, SignedBeaconBlock,
 };
-use consensus_types::primitives::{Root, Slot};
+use consensus_types::primitives::{Gwei, Root, Slot, ValidatorIndex};
 use consensus_types::Minimal;
 use spec_tests::coverage::Reads;
 use spec_tests::fork_choice::{handler_runs, run, supported, NOT_RUN, RUNNABLE};
 use spec_tests::plan::{Case, CaseFile, CaseKey};
 use ssz::{BitVector, Encode, ProgressiveBitList};
+use ssz_types::ProgressiveVariableList;
+use state_transition::caches::CommitteeCache;
 use state_transition::per_slot::process_slots;
 use state_transition::preset::BUILDER_INDEX_SELF_BUILD;
 use state_transition::testing::{
@@ -124,6 +126,17 @@ impl CaseDir {
         });
     }
 
+    /// Puts `value` in the case as `<prefix>_0x<root>.ssz_snappy`, and gives the name of the
+    /// file without `.ssz_snappy`, as a step names it.
+    fn object<T: Encode + TreeHash>(&mut self, prefix: &str, value: &T) -> String {
+        let name = format!("{prefix}_0x{}", hex::encode(value.tree_hash_root()));
+        self.put(
+            &format!("{name}.ssz_snappy"),
+            &snappy(&value.as_ssz_bytes()),
+        );
+        name
+    }
+
     fn block(&mut self, block: &SignedBeaconBlock<E>) {
         let name = format!("{}.ssz_snappy", block_name(block));
         self.put(&name, &snappy(&block.as_ssz_bytes()));
@@ -169,16 +182,21 @@ impl CaseDir {
 const BLS_OFF: Option<&str> = Some("bls_setting: 2\n");
 
 #[test]
-fn runner_takes_the_five_gloas_handlers_of_tick_and_block_steps() {
+fn runner_takes_the_gloas_handlers_of_its_steps() {
     assert_eq!(
-        RUNNABLE,
+        RUNNABLE.as_slice(),
         [
             "on_block",
             "get_head",
             "get_parent_payload_status",
             "filter_node_tree_variants",
-            "ex_ante"
+            "ex_ante",
+            "on_attestation",
+            "reorg",
+            "withholding",
+            "should_apply_proposer_boost",
         ]
+        .as_slice()
     );
     for handler in RUNNABLE {
         assert_eq!(handler_runs(handler), Ok(true));
@@ -188,18 +206,20 @@ fn runner_takes_the_five_gloas_handlers_of_tick_and_block_steps() {
         assert!(!supported("heze", "minimal", handler));
         assert!(!supported("gloas", "general", handler));
     }
-    for handler in [
-        "on_attestation",
-        "on_execution_payload_envelope",
-        "on_payload_attestation_message",
-        "reorg",
-        "withholding",
-        "deposit_with_reorg",
-        "payload_timeliness",
-        "payload_data_availability",
-        "should_apply_proposer_boost",
-    ] {
-        assert!(NOT_RUN.contains(&handler), "{handler}");
+    // Each case of these handlers has an execution_payload or a payload_attestation_message
+    // step, or payload vote checks.
+    assert_eq!(
+        NOT_RUN.as_slice(),
+        [
+            "on_execution_payload_envelope",
+            "on_payload_attestation_message",
+            "deposit_with_reorg",
+            "payload_timeliness",
+            "payload_data_availability",
+        ]
+        .as_slice()
+    );
+    for handler in NOT_RUN {
         assert_eq!(handler_runs(handler), Ok(false));
         assert!(!supported("gloas", "minimal", handler));
     }
@@ -368,21 +388,22 @@ fn a_tick_before_genesis_must_have_the_verdict_of_the_vector() {
 fn steps_and_checks_that_the_runner_does_not_have_fail_closed() {
     let (state, _) = anchor();
     let block = block_on(&state, 1);
-    let mut with_attestation = block.clone();
-    with_attestation
-        .message
-        .body
-        .attestations
-        .push(attestation())
-        .unwrap();
     for (steps, needle) in [
         (
             "- attestation: attestation_0x00\n".to_owned(),
-            "attestation",
+            "attestation_0x00",
         ),
         (
             "- attester_slashing: attester_slashing_0x00\n".to_owned(),
-            "attester_slashing",
+            "attester_slashing_0x00",
+        ),
+        (
+            "- attestation: attestation_0x00\n  extra: 1\n".to_owned(),
+            "extra",
+        ),
+        (
+            "- attester_slashing: attester_slashing_0x00\n  extra: 1\n".to_owned(),
+            "extra",
         ),
         (
             "- execution_payload: execution_payload_envelope_0x00\n  valid: true\n".to_owned(),
@@ -393,8 +414,14 @@ fn steps_and_checks_that_the_runner_does_not_have_fail_closed() {
             "payload_attestation_message",
         ),
         (
-            "- checks:\n    viable_for_head_roots_and_weights: []\n".to_owned(),
-            "viable_for_head_roots_and_weights",
+            "- checks:\n    payload_timeliness_vote: {block_root: '0x00', votes: []}\n"
+                .to_owned(),
+            "payload_timeliness_vote",
+        ),
+        (
+            "- checks:\n    viable_for_head_roots_and_weights: [{root: '0x00', weight: 0, payload_status: 0, extra: 1}]\n"
+                .to_owned(),
+            "extra",
         ),
         (
             "- checks:\n    get_proposer_head: '0x00'\n".to_owned(),
@@ -418,41 +445,6 @@ fn steps_and_checks_that_the_runner_does_not_have_fail_closed() {
         let err = case.run().unwrap_err();
         assert!(err.contains(needle), "{needle}: {err}");
     }
-    // A block with attestations needs `on_attestation` after `on_block`.
-    let mut case = CaseDir::new(BLS_OFF);
-    case.block(&with_attestation);
-    case.steps(&format!(
-        "- tick: {}\n- block: {}\n",
-        time_at(1),
-        block_name(&with_attestation)
-    ));
-    let err = case.run().unwrap_err();
-    assert!(err.contains("on_attestation"), "{err}");
-}
-
-/// An `Attestation` of committee 0 at slot 0 with one bit set. The runner refuses the block
-/// before it reads the attestation.
-fn attestation() -> Attestation<E> {
-    let checkpoint = Checkpoint {
-        epoch: 0,
-        root: Root::ZERO,
-    };
-    let mut aggregation_bits = ProgressiveBitList::with_capacity(1);
-    aggregation_bits.set(0, true).unwrap();
-    let mut committee_bits = BitVector::new();
-    committee_bits.set(0, true).unwrap();
-    Attestation {
-        aggregation_bits,
-        data: AttestationData {
-            slot: 0,
-            index: 0,
-            beacon_block_root: Root::ZERO,
-            source: checkpoint.clone(),
-            target: checkpoint,
-        },
-        signature: [0; 96],
-        committee_bits,
-    }
 }
 
 #[test]
@@ -463,9 +455,9 @@ fn a_case_of_another_preset_or_handler_fails() {
     other.key.preset = "general".into();
     let err = run(&Reads::default(), &other).unwrap_err();
     assert!(err.contains("general"), "{err}");
-    let other = case.case("on_attestation");
+    let other = case.case("payload_timeliness");
     let err = run(&Reads::default(), &other).unwrap_err();
-    assert!(err.contains("on_attestation"), "{err}");
+    assert!(err.contains("payload_timeliness"), "{err}");
 }
 
 #[test]
@@ -600,6 +592,304 @@ fn a_failed_state_transition_proves_a_block_invalid() {
             (Ok(()), None) => {}
             (Err(err), Some(needle)) => assert!(err.contains(needle), "{needle}: {err}"),
             (got, want) => panic!("valid: {valid}: got {got:?}, want {want:?}"),
+        }
+    }
+}
+
+/// The balance of each validator of the [`anchor`] state.
+const BALANCE: Gwei = 32_000_000_000;
+
+/// The members at `positions` of committee 0 of `slot` of epoch 0, from `state`.
+fn members(state: &BeaconState<E>, slot: Slot, positions: &[usize]) -> Vec<ValidatorIndex> {
+    let cache = CommitteeCache::new(state, 0).unwrap();
+    let committee = cache.committee(slot, 0).unwrap();
+    positions.iter().map(|p| committee[*p]).collect()
+}
+
+/// The data of a vote of `slot` for `root` with the target `target` of epoch 0 and the source
+/// of `state`.
+fn vote_data(state: &BeaconState<E>, slot: Slot, root: Root, target: Root) -> AttestationData {
+    AttestationData {
+        slot,
+        index: 0,
+        beacon_block_root: root,
+        source: state.current_justified_checkpoint.clone(),
+        target: Checkpoint {
+            epoch: 0,
+            root: target,
+        },
+    }
+}
+
+/// An attestation of the members at `positions` of committee 0 of `slot` of epoch 0 for
+/// `root`, with the target `target` of epoch 0. The committee comes from `state`.
+fn vote(
+    state: &BeaconState<E>,
+    slot: Slot,
+    root: Root,
+    target: Root,
+    positions: &[usize],
+) -> Attestation<E> {
+    let size = CommitteeCache::new(state, 0)
+        .unwrap()
+        .committee(slot, 0)
+        .unwrap()
+        .len();
+    let mut aggregation_bits = ProgressiveBitList::with_capacity(size);
+    for &position in positions {
+        aggregation_bits.set(position, true).unwrap();
+    }
+    let mut committee_bits = BitVector::new();
+    committee_bits.set(0, true).unwrap();
+    Attestation {
+        aggregation_bits,
+        data: vote_data(state, slot, root, target),
+        signature: [0; 96],
+        committee_bits,
+    }
+}
+
+/// The indexed attestation of [`vote`].
+fn indexed(
+    state: &BeaconState<E>,
+    slot: Slot,
+    root: Root,
+    target: Root,
+    positions: &[usize],
+) -> IndexedAttestation<E> {
+    let mut indices = members(state, slot, positions);
+    indices.sort_unstable();
+    IndexedAttestation {
+        attesting_indices: ProgressiveVariableList::new(indices).unwrap(),
+        data: vote_data(state, slot, root, target),
+        signature: [0; 96],
+    }
+}
+
+/// A `viable_for_head_roots_and_weights` check of the EMPTY leaves `leaves` (root, weight).
+fn viable(leaves: &[(Root, Gwei)]) -> String {
+    let mut step = "- checks:\n    viable_for_head_roots_and_weights:\n".to_owned();
+    if leaves.is_empty() {
+        step = "- checks:\n    viable_for_head_roots_and_weights: []\n".to_owned();
+    }
+    for (root, weight) in leaves {
+        step += &format!(
+            "    - {{root: {}, weight: {weight}, payload_status: 0}}\n",
+            hex_root(*root)
+        );
+    }
+    step
+}
+
+#[test]
+fn attestation_and_attester_slashing_steps_change_the_weights() {
+    let (state, anchor_block) = anchor();
+    let anchor = anchor_block.tree_hash_root();
+    let block = block_on(&state, 1);
+    let root = block.message.tree_hash_root();
+    // Two votes of slot 2 for the block, then a slashing of the first voter: a second vote of
+    // the same target epoch for the anchor.
+    let attestation = vote(&state, 2, root, anchor, &[0, 1]);
+    let slashing = AttesterSlashing {
+        attestation_1: indexed(&state, 2, root, anchor, &[0]),
+        attestation_2: indexed(&state, 2, anchor, anchor, &[0]),
+    };
+    let mut case = CaseDir::new(BLS_OFF);
+    case.block(&block);
+    let attestation = case.object("attestation", &attestation);
+    let slashing = case.object("attester_slashing", &slashing);
+    let steps = format!("- tick: {}\n- block: {}\n", time_at(3), block_name(&block))
+        + &viable(&[(root, 0)])
+        + &format!("- attestation: {attestation}\n")
+        + &viable(&[(root, 2 * BALANCE)])
+        + &checks(time_at(3), anchor, root, 1, Root::ZERO)
+        + &format!("- attester_slashing: {slashing}\n")
+        + &viable(&[(root, BALANCE)]);
+    case.steps(&steps);
+    assert_eq!(case.run_as("on_attestation"), Ok(()));
+}
+
+#[test]
+fn attestation_and_attester_slashing_steps_must_have_the_verdict_of_the_vector() {
+    let (state, anchor_block) = anchor();
+    let anchor = anchor_block.tree_hash_root();
+    let block = block_on(&state, 1);
+    let root = block.message.tree_hash_root();
+    let good = vote(&state, 2, root, anchor, &[0]);
+    let mut bad_index = good.clone();
+    bad_index.data.index = 2;
+    let mut too_early = good.clone();
+    too_early.data.slot = 3;
+    // The same data twice is not a slashable pair.
+    let not_slashable = AttesterSlashing {
+        attestation_1: indexed(&state, 2, root, anchor, &[0]),
+        attestation_2: indexed(&state, 2, root, anchor, &[0]),
+    };
+    let slashable = AttesterSlashing {
+        attestation_1: indexed(&state, 2, root, anchor, &[0]),
+        attestation_2: indexed(&state, 2, anchor, anchor, &[0]),
+    };
+    let prefix = format!("- tick: {}\n- block: {}\n", time_at(3), block_name(&block));
+    for (kind, object, valid, outcome) in [
+        // A refused step that the vector expects to fail passes, and leaves the store as it
+        // was.
+        ("attestation", bad_index.as_ssz_bytes(), "false", None),
+        ("attestation", too_early.as_ssz_bytes(), "false", None),
+        (
+            "attester_slashing",
+            not_slashable.as_ssz_bytes(),
+            "false",
+            None,
+        ),
+        // An accepted step marked invalid, and a refused step marked valid, fail.
+        (
+            "attestation",
+            good.as_ssz_bytes(),
+            "false",
+            Some("accepted"),
+        ),
+        (
+            "attester_slashing",
+            slashable.as_ssz_bytes(),
+            "false",
+            Some("accepted"),
+        ),
+        (
+            "attestation",
+            bad_index.as_ssz_bytes(),
+            "true",
+            Some("on_attestation"),
+        ),
+        (
+            "attester_slashing",
+            not_slashable.as_ssz_bytes(),
+            "true",
+            Some("on_attester_slashing"),
+        ),
+    ] {
+        let mut case = CaseDir::new(BLS_OFF);
+        case.block(&block);
+        let name = format!("{kind}_0x{:02x}", object.len());
+        case.put(&format!("{name}.ssz_snappy"), &snappy(&object));
+        let steps = prefix.clone()
+            + &format!("- {kind}: {name}\n  valid: {valid}\n")
+            + &viable(&[(root, 0)]);
+        case.steps(&steps);
+        match (case.run(), outcome) {
+            (Ok(()), None) => {}
+            (Err(err), Some(needle)) => assert!(err.contains(needle), "{needle}: {err}"),
+            (got, want) => panic!("{kind} valid: {valid}: got {got:?}, want {want:?}"),
+        }
+    }
+}
+
+/// A block at `slot` on the anchor `state` with `attestations` and `slashings`, and the root
+/// of its post-state with BLS off.
+fn block_with_operations(
+    state: &BeaconState<E>,
+    slot: Slot,
+    attestations: Vec<Attestation<E>>,
+    slashings: Vec<AttesterSlashing<E>>,
+) -> SignedBeaconBlock<E> {
+    let mut at_slot = state.clone();
+    process_slots(&mut at_slot, slot, &no_bls()).unwrap();
+    let mut block = block_at_state_slot(&at_slot);
+    block.message.body.signed_execution_payload_bid =
+        bid_for_state(&at_slot, BUILDER_INDEX_SELF_BUILD, 0);
+    for attestation in attestations {
+        block.message.body.attestations.push(attestation).unwrap();
+    }
+    for slashing in slashings {
+        block
+            .message
+            .body
+            .attester_slashings
+            .push(slashing)
+            .unwrap();
+    }
+    let mut post = post_state(state, &block);
+    block.message.state_root = state_root(&mut post).unwrap();
+    block
+}
+
+#[test]
+fn a_valid_block_applies_its_attestations_and_then_its_attester_slashings() {
+    let (state, anchor_block) = anchor();
+    let anchor = anchor_block.tree_hash_root();
+    let x = block_on(&state, 1);
+    let rx = x.message.tree_hash_root();
+    // `w` of slot 3 on the anchor carries two votes of slot 2 for `x`, and a slashing of the
+    // second voter. Only the first vote keeps its weight.
+    let slashing = AttesterSlashing {
+        attestation_1: indexed(&state, 2, rx, anchor, &[1]),
+        attestation_2: indexed(&state, 2, anchor, anchor, &[1]),
+    };
+    let w = block_with_operations(
+        &state,
+        3,
+        vec![vote(&state, 2, rx, anchor, &[0, 1])],
+        vec![slashing],
+    );
+    let rw = w.message.tree_hash_root();
+    let mut case = CaseDir::new(BLS_OFF);
+    case.block(&x);
+    case.block(&w);
+    // At slot 4, the EMPTY node of `w` of the previous slot has no weight.
+    let steps = format!(
+        "- tick: {}\n- block: {}\n- block: {}\n- tick: {}\n",
+        time_at(3),
+        block_name(&x),
+        block_name(&w),
+        time_at(4)
+    ) + &viable(&[(rx, BALANCE), (rw, 0)])
+        + &checks(time_at(4), anchor, rx, 1, Root::ZERO);
+    case.steps(&steps);
+    assert_eq!(case.run(), Ok(()));
+
+    // A block that the state transition accepts, with a vote that fork choice refuses: its
+    // target is not a block of the store.
+    let unknown = Root::repeat_byte(0x09);
+    let w = block_with_operations(&state, 3, vec![vote(&state, 2, rx, unknown, &[0])], vec![]);
+    let mut case = CaseDir::new(BLS_OFF);
+    case.block(&x);
+    case.block(&w);
+    case.steps(
+        &(format!(
+            "- tick: {}\n- block: {}\n- block: {}\n",
+            time_at(3),
+            block_name(&x),
+            block_name(&w)
+        ) + &viable(&[(rx, 0)])),
+    );
+    let err = case.run().unwrap_err();
+    assert!(err.contains("on_attestation"), "{err}");
+}
+
+#[test]
+fn viable_for_head_roots_and_weights_must_match_the_leaves() {
+    let (_, anchor_block) = anchor();
+    let anchor = anchor_block.tree_hash_root();
+    let other = Root::repeat_byte(0x77);
+    let full_leaf = format!(
+        "- checks:\n    viable_for_head_roots_and_weights:\n    - {{root: {}, weight: 0, payload_status: 1}}\n",
+        hex_root(anchor)
+    );
+    for (steps, ok) in [
+        (viable(&[(anchor, 0)]), true),
+        (viable(&[(anchor, 1)]), false),
+        (viable(&[(other, 0)]), false),
+        (viable(&[]), false),
+        (viable(&[(anchor, 0), (anchor, 0)]), false),
+        (full_leaf, false),
+    ] {
+        let mut case = CaseDir::new(BLS_OFF);
+        case.steps(&steps);
+        match case.run_as("should_apply_proposer_boost") {
+            Ok(()) => assert!(ok, "{steps}"),
+            Err(err) => {
+                assert!(!ok, "{steps}: {err}");
+                assert!(err.contains("viable_for_head_roots_and_weights"), "{err}");
+            }
         }
     }
 }
