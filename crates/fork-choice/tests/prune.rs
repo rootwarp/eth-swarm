@@ -18,9 +18,9 @@ use consensus_types::Minimal;
 use fork_choice::testing::{add_equivocating_index, mark_payload_verified, set_latest_message};
 use fork_choice::{
     get_ancestor, get_filtered_node_tree, get_forkchoice_store, get_head, get_weight,
-    is_valid_dependent_root, on_attestation, on_block, on_tick, store_target_checkpoint_state,
-    AttestationError, Error, ForkChoiceNode, LatestMessage, PayloadStatus, SignatureVerifier,
-    StateProvider, Store,
+    is_payload_verified, is_valid_dependent_root, on_attestation, on_block, on_tick,
+    store_target_checkpoint_state, AttestationError, Error, ForkChoiceNode, LatestMessage,
+    PayloadStatus, SignatureVerifier, StateProvider, Store,
 };
 use ssz::{BitVector, ProgressiveBitList};
 use state_transition::caches::CommitteeCache;
@@ -727,4 +727,40 @@ fn the_store_keeps_a_dropped_block_for_attestations_until_the_end_of_the_next_ep
             f.b
         )))
     );
+}
+
+#[test]
+fn a_full_vote_for_a_dropped_block_reads_its_verified_payload_after_the_prune() {
+    for verified in [false, true] {
+        let mut f = finalized();
+        if verified {
+            mark_payload_verified(&mut f.store, f.x);
+        }
+        // A FULL vote of slot 10 for `x` of slot 9, with the target `b` of epoch 1.
+        let target = Checkpoint {
+            epoch: 1,
+            root: f.b,
+        };
+        let mut attestation = attestation(&f.store, 10, f.x, &target, &[0]);
+        attestation.data.index = 1;
+        tick(&mut f.store, 11);
+        assert!(f.store.block(f.x).is_none());
+        // The spec's store keeps `x` and the root of its payload.
+        assert_eq!(is_payload_verified(&f.store, f.x), verified);
+        let want = if verified {
+            Ok(())
+        } else {
+            Err(Error::InvalidAttestation(
+                AttestationError::PayloadNotVerified(f.x),
+            ))
+        };
+        assert_eq!(
+            on_attestation(&mut f.store, &PLAIN, &attestation, false),
+            want,
+            "verified: {verified}"
+        );
+        // The store forgets the root of the payload with the dropped block.
+        tick(&mut f.store, 3 * SLOTS_PER_EPOCH);
+        assert!(!is_payload_verified(&f.store, f.x));
+    }
 }
