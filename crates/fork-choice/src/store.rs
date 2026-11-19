@@ -62,8 +62,15 @@ pub(crate) const PTC_TIMELINESS_INDEX: usize = 1;
 /// `Store` (G L192-213). The fields are private: only the handlers change them, which keeps
 /// each per-block map keyed by the same roots as `blocks`.
 ///
-/// `anchor_root` is not a spec field. It is the root of the anchor block, the one block of the
-/// store whose parent is not in the store: the ancestor walk stops there ([`get_ancestor`]).
+/// `anchor_root` is not a spec field. It is the root of the anchor block, the one block of
+/// `blocks` whose parent is not in `blocks`: the ancestor walk stops there ([`get_ancestor`]).
+///
+/// `dropped` is not a spec field. It has the blocks that a prune dropped (`prune`) with what
+/// `on_attestation` reads of each: the slot, the parent root and the post-state. The spec's
+/// store keeps every block, and a valid attestation can name a dropped block. Head selection
+/// does not read `dropped`, so a message for a dropped block supports no node. `payloads` keeps
+/// the roots of the dropped blocks too, for `is_payload_verified`. The store forgets a dropped
+/// block at the end of the epoch after the prune (`release_dropped`).
 ///
 /// `children` and `ptc_timely_proposals` are not spec fields. They are indexes of `blocks`,
 /// so that head selection reads the blocks that it needs and does not scan every block for
@@ -102,6 +109,21 @@ pub struct Store<E: Preset> {
     pub(crate) payload_data_availability_vote: HashMap<Root, Vec<Option<bool>>>,
     pub(crate) children: HashMap<ForkChoiceNode, Vec<Root>>,
     pub(crate) ptc_timely_proposals: BTreeMap<(Slot, ValidatorIndex), Vec<Root>>,
+    pub(crate) dropped: HashMap<Root, DroppedBlock<E>>,
+}
+
+/// A block that a prune dropped, with what `validate_on_attestation` and
+/// `store_target_checkpoint_state` read of it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DroppedBlock<E: Preset> {
+    /// `block.slot`.
+    pub(crate) slot: Slot,
+    /// `block.parent_root`.
+    pub(crate) parent_root: Root,
+    /// `store.block_states[root]`.
+    pub(crate) state: BeaconState<E>,
+    /// The last epoch in which the store keeps the block: the epoch after the prune.
+    pub(crate) last_epoch: Epoch,
 }
 
 impl<E: Preset> Store<E> {
@@ -193,6 +215,28 @@ impl<E: Preset> Store<E> {
             .ok_or(Error::UnknownBlock(root))
     }
 
+    /// The slot and the parent root of `store.blocks[root]` for the checks of an attestation:
+    /// a block of the store, or a block that a prune dropped and the store keeps.
+    pub(crate) fn attestation_block(&self, root: Root) -> Option<(Slot, Root)> {
+        match self.blocks.get(&root) {
+            Some(block) => Some((block.slot, block.parent_root)),
+            None => self.dropped.get(&root).map(|d| (d.slot, d.parent_root)),
+        }
+    }
+
+    /// `store.block_states[root]` for `store_target_checkpoint_state`: the state of a block of
+    /// the store, or of a block that a prune dropped and the store keeps.
+    pub(crate) fn target_block_state(&self, root: Root) -> Result<&BeaconState<E>, Error> {
+        match self.block_states.get(&root) {
+            Some(state) => Ok(state),
+            None => self
+                .dropped
+                .get(&root)
+                .map(|d| &d.state)
+                .ok_or(Error::UnknownBlock(root)),
+        }
+    }
+
     /// `store.checkpoint_states[store.justified_checkpoint]`.
     pub(crate) fn justified_state(&self) -> Result<&BeaconState<E>, Error> {
         let checkpoint = &self.justified_checkpoint;
@@ -261,6 +305,7 @@ pub fn get_forkchoice_store<E: Preset>(
         payload_data_availability_vote: HashMap::from([(anchor_root, votes)]),
         children: HashMap::new(),
         ptc_timely_proposals: BTreeMap::from([(anchor_proposal, vec![anchor_root])]),
+        dropped: HashMap::new(),
         justified_checkpoint,
         finalized_checkpoint,
     })
@@ -421,11 +466,12 @@ pub fn is_ancestor<E: Preset>(
 /// calls it, so the store prunes at the first tick after `on_block` or a tick moves the
 /// finalized checkpoint.
 ///
-/// It keeps the finalized checkpoint block and its descendants, and drops every other block
-/// with the per-block entries of each, the index of children of each, and the checkpoint
-/// states of earlier epochs or of dropped blocks. The finalized block becomes the anchor, so
-/// the ancestor walk stops there ([`get_ancestor`]). Latest messages and equivocating
-/// indices stay as the spec keeps them.
+/// It keeps the finalized checkpoint block and its descendants. It moves every other block to
+/// `store.dropped` with its slot, its parent root and its state, and keeps the root of its
+/// verified payload. It drops the other per-block entries of each, the index of children of
+/// each, and the checkpoint states of earlier epochs or of dropped blocks. The finalized block
+/// becomes the anchor, so the ancestor walk stops there ([`get_ancestor`]). Latest messages
+/// and equivocating indices stay as the spec keeps them.
 ///
 /// The spec's store keeps every block, and `get_head`, `get_weight` and the asserts of
 /// `on_block` give the same result on the pruned store:
@@ -436,6 +482,9 @@ pub fn is_ancestor<E: Preset>(
 ///   store fails the finalized descendant assert.
 /// - The PTC-timely proposals of the previous slot and later stay, also of dropped blocks,
 ///   for the early equivocation check of a later boost.
+///
+/// `on_attestation` reads the dropped blocks in `store.dropped`, so it gives the result of the
+/// spec until the store forgets them ([`release_dropped`]).
 ///
 /// If the finalized block is not in the store, or the justified or the unrealized justified
 /// block does not descend from it, nothing is dropped: the walks of the subtree of that
@@ -470,13 +519,33 @@ pub(crate) fn prune<E: Preset>(store: &mut Store<E>) {
     {
         return;
     }
-    store.blocks.retain(|root, _| keep.contains(root));
-    store.block_states.retain(|root, _| keep.contains(root));
+    let last_epoch = get_current_store_epoch(store).saturating_add(1);
+    let drop: Vec<Root> = store
+        .blocks
+        .keys()
+        .filter(|root| !keep.contains(*root))
+        .copied()
+        .collect();
+    for root in drop {
+        let block = store.blocks.remove(&root);
+        let state = store.block_states.remove(&root);
+        if let (Some(block), Some(state)) = (block, state) {
+            let dropped = DroppedBlock {
+                slot: block.slot,
+                parent_root: block.parent_root,
+                state,
+                last_epoch,
+            };
+            store.dropped.insert(root, dropped);
+        }
+    }
     store.block_timeliness.retain(|root, _| keep.contains(root));
     store
         .unrealized_justifications
         .retain(|root, _| keep.contains(root));
-    store.payloads.retain(|root| keep.contains(root));
+    store
+        .payloads
+        .retain(|root| keep.contains(root) || store.dropped.contains_key(root));
     store
         .payload_timeliness_vote
         .retain(|root, _| keep.contains(root));
@@ -492,6 +561,36 @@ pub(crate) fn prune<E: Preset>(store: &mut Store<E>) {
     let first_slot = get_current_slot(store).saturating_sub(1);
     store.ptc_timely_proposals = store.ptc_timely_proposals.split_off(&(first_slot, 0));
     store.anchor_root = finalized.root;
+}
+
+/// Not a spec function: forgets the blocks that a prune dropped, at the end of the epoch after
+/// the prune. `on_tick` calls it.
+///
+/// An attestation from the wire must have the target epoch of the current or the previous
+/// epoch (`validate_target_epoch_against_current_time`). So a vote with the target epoch of the
+/// prune, or of an earlier epoch, can arrive until the end of the next epoch. Until then the
+/// store keeps the dropped blocks with their states, the roots of their verified payloads and
+/// the checkpoint states that `on_attestation` stores for them. Then it forgets them, and `on_attestation` refuses a vote that
+/// names one of them, as a block that the store does not have. The spec's store keeps every
+/// block and takes such a vote if it is valid. A vote from the wire then has a target epoch
+/// after the prune, so if it names a forgotten block it also attests to one, and in the spec
+/// its message supports no node of the pruned store. A vote from a block has no such limit.
+pub(crate) fn release_dropped<E: Preset>(store: &mut Store<E>) {
+    let epoch = get_current_store_epoch(store);
+    let released: HashSet<Root> = store
+        .dropped
+        .iter()
+        .filter(|(_, dropped)| dropped.last_epoch < epoch)
+        .map(|(root, _)| *root)
+        .collect();
+    if released.is_empty() {
+        return;
+    }
+    store.dropped.retain(|root, _| !released.contains(root));
+    store.payloads.retain(|root| !released.contains(root));
+    store
+        .checkpoint_states
+        .retain(|(_, root), _| !released.contains(root));
 }
 
 /// `get_checkpoint_block` (G L421-428).

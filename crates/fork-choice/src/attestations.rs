@@ -9,12 +9,12 @@
 
 use crate::handlers::{target_checkpoint_state, StateProvider};
 use crate::store::{
-    compute_start_slot_at_epoch, get_checkpoint_block, get_current_slot, get_current_store_epoch,
-    is_payload_verified, key, LatestMessage, Store,
+    compute_start_slot_at_epoch, get_current_slot, get_current_store_epoch, is_payload_verified,
+    key, LatestMessage, Store,
 };
 use crate::{AttestationError, Error};
 use consensus_types::gloas::{Attestation, AttesterSlashing, BeaconState, IndexedAttestation};
-use consensus_types::primitives::{Epoch, ValidatorIndex};
+use consensus_types::primitives::{Epoch, Root, ValidatorIndex};
 use state_transition::caches::CommitteeCache;
 use state_transition::per_block::attestation::get_indexed_attestation_with;
 use state_transition::per_block::slashings::is_slashable_attestation_data;
@@ -132,14 +132,20 @@ fn validate_target_epoch_against_current_time<E: Preset>(
 
 /// `validate_on_attestation` (G L914-955), with the asserts in spec order.
 ///
-/// One check is not in the spec: the target epoch must not start before the anchor block
-/// ([`AttestationError::TargetBeforeAnchor`]). For such an epoch the spec's
-/// `get_checkpoint_block` walks below the anchor ([`crate::get_ancestor`] stops there). After
-/// a checkpoint sync, the spec fails on the parent of the anchor, which no store has. After a
-/// prune, the spec's walk gives a block older than every block of the store, and that block
-/// is not the target, which is a block of the store. Thus the spec refuses the attestation
-/// in both cases, at the same assert. An attestation of a block can have such a target: the
-/// previous epoch of a block of the finalized epoch.
+/// The spec reads `store.blocks`, which keeps every block. Here the checks of the target, of
+/// the attested block and the walk of `get_checkpoint_block` read the blocks of the store and
+/// the blocks that a prune dropped and the store still keeps (`Store::dropped`). So a vote for
+/// a block beside the finalized block, or with a target below the anchor, passes the asserts
+/// that it passes in the spec's store. Its message then supports no node, or a node of the
+/// store, as in the spec ([`crate::get_weight`]).
+///
+/// The walk fails with [`AttestationError::TargetBeforeAnchor`] where it needs the parent of a
+/// block and the store does not have that parent. After a checkpoint sync this is the parent
+/// of the anchor, and the spec fails on it too. After the store forgets the dropped blocks of a
+/// prune (`store::release_dropped`), it can also be the parent of a block that the store
+/// keeps. The spec walks on there, so it can take a vote from a block that is refused here. A
+/// vote from the wire then has a target epoch after the prune, and its walk does not reach a
+/// forgotten block.
 fn validate_on_attestation<E: Preset>(
     store: &Store<E>,
     attestation: &Attestation<E>,
@@ -157,15 +163,13 @@ fn validate_on_attestation<E: Preset>(
         }
         .into());
     }
-    if !store.blocks.contains_key(&target.root) {
+    if store.attestation_block(target.root).is_none() {
         return Err(AttestationError::UnknownTarget(target.root).into());
     }
     let root = data.beacon_block_root;
-    let block_slot = store
-        .blocks
-        .get(&root)
-        .ok_or(AttestationError::UnknownBeaconBlock(root))?
-        .slot;
+    let (block_slot, _) = store
+        .attestation_block(root)
+        .ok_or(AttestationError::UnknownBeaconBlock(root))?;
     if block_slot > data.slot {
         return Err(AttestationError::FutureBlock {
             block: block_slot,
@@ -182,17 +186,7 @@ fn validate_on_attestation<E: Preset>(
     if data.index == 1 && !is_payload_verified(store, root) {
         return Err(AttestationError::PayloadNotVerified(root).into());
     }
-    // The target epoch is the epoch of `data.slot`, so its first slot does not overflow.
-    let epoch_first_slot = compute_start_slot_at_epoch::<E>(target.epoch)?;
-    let anchor_slot = store.get_block(store.anchor_root)?.slot;
-    if epoch_first_slot < anchor_slot {
-        return Err(AttestationError::TargetBeforeAnchor {
-            epoch: target.epoch,
-            anchor_slot,
-        }
-        .into());
-    }
-    let checkpoint_block = get_checkpoint_block(store, root, target.epoch)?;
+    let checkpoint_block = attestation_checkpoint_block(store, root, target.epoch)?;
     if target.root != checkpoint_block {
         return Err(AttestationError::TargetNotCheckpointBlock {
             target: target.root,
@@ -210,6 +204,36 @@ fn validate_on_attestation<E: Preset>(
         .into());
     }
     Ok(())
+}
+
+/// `get_checkpoint_block` (G L421-428) for [`validate_on_attestation`], on the blocks of the
+/// store and the dropped blocks that it keeps ([`Store::attestation_block`]). Only the root of
+/// the result counts, so the walk does not compute the payload status of each node. The
+/// spec's `get_ancestor` reads the parent of each block that it passes
+/// (`get_parent_payload_status`), so the walk fails where the store does not have that parent.
+fn attestation_checkpoint_block<E: Preset>(
+    store: &Store<E>,
+    mut root: Root,
+    epoch: Epoch,
+) -> Result<Root, Error> {
+    // The target epoch is the epoch of `data.slot`, so its first slot does not overflow.
+    let epoch_first_slot = compute_start_slot_at_epoch::<E>(epoch)?;
+    loop {
+        let (slot, parent_root) = store
+            .attestation_block(root)
+            .ok_or(Error::UnknownBlock(root))?;
+        if slot <= epoch_first_slot {
+            return Ok(root);
+        }
+        if store.attestation_block(parent_root).is_none() {
+            return Err(AttestationError::TargetBeforeAnchor {
+                epoch,
+                anchor_slot: slot,
+            }
+            .into());
+        }
+        root = parent_root;
+    }
 }
 
 /// `update_latest_messages` (G L965-983): by the attestation slot, not the target epoch. A

@@ -247,10 +247,10 @@ impl Boost {
 /// registry: the sum is the same. Each node walks every message, so `get_head` costs nodes
 /// times messages times the ancestor walk; vote deltas are a later change.
 ///
-/// A message for a block that the store does not have counts for no node. Only a prune
-/// drops a block that a message names, and such a block is not a descendant of the
-/// finalized block, so in the spec's store, which keeps it, the message supports no node
-/// that the pruned store keeps.
+/// A message for a block that is not in `store.blocks` counts for no node. Only a prune drops
+/// a block that a message names, and `on_attestation` can still set a message for a dropped
+/// block. Such a block is not a descendant of the finalized block, so in the spec's store,
+/// which keeps it, the message supports no node that the pruned store keeps.
 fn get_attestation_score<E: Preset>(
     store: &Store<E>,
     node: &ForkChoiceNode,

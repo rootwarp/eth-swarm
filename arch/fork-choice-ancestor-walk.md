@@ -23,11 +23,25 @@ through it.
 a slot or an epoch before the anchor gives the anchor, where the spec gives an older block or
 fails.
 
-**Attestation targets.** `on_attestation` refuses a target whose epoch starts before the
-anchor block (`AttestationError::TargetBeforeAnchor`) before it calls `get_checkpoint_block`.
-For such an epoch the spec's walk passes below the anchor: after a checkpoint sync it fails on
-the missing parent, and after a prune it gives a block older than every block of the store,
-which cannot be the target. So the spec refuses the attestation at the same assert. Such a
-target is the epoch before a checkpoint-sync anchor state whose block is not at the first
-slot of that epoch, or, in an attestation of a block, the previous epoch of a block of the
-finalized epoch.
+**Attestation targets.** The spec's store keeps every block, so after finality moves an
+attestation can still name a block beside the finalized block, or have a target below the new
+anchor, and pass every assert of `on_attestation`. Its attesters then move to that block,
+and their older messages stop giving weight to the nodes that they support. So the prune
+keeps what `on_attestation` reads of each dropped block in `Store::dropped`: its slot, its
+parent root and its post-state, and the root of its verified payload stays in `payloads`.
+`validate_on_attestation` looks up the target and the attested block in the store or in
+`dropped`, and its `get_checkpoint_block` walk goes through both, past the anchor.
+`store_target_checkpoint_state` reads the dropped state. `get_head` and `get_weight` read
+only the blocks that the prune keeps, so a message for a dropped block supports no node, as
+in the spec. The walk fails with `AttestationError::TargetBeforeAnchor` where it needs the
+parent of a block and the store does not have that parent. After a checkpoint sync this is
+the parent of the anchor, and the spec fails on it too.
+
+The store forgets the dropped blocks, their states and their checkpoint states at the end of
+the epoch after the prune (`store::release_dropped`). Until then a vote from the wire with a
+target epoch of the prune or earlier can arrive, and `on_attestation` gives the result of the
+spec for every vote that it gets. After that it refuses a vote that names a forgotten block
+(`UnknownTarget`, `UnknownBeaconBlock`, or `TargetBeforeAnchor` for a walk below a kept
+block), where the spec's store takes a valid one. A vote from the wire then has a target
+epoch after the prune, so if it names a forgotten block it also attests to one, and in the
+spec its message supports no node of the pruned store. A vote from a block has no such limit.

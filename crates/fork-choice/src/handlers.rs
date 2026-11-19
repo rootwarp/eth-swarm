@@ -9,8 +9,8 @@ use crate::store::{
     compute_slot_at_time_ms, compute_slots_since_epoch_start, compute_start_slot_at_epoch,
     compute_time_at_slot_ms, get_ancestor, get_checkpoint_block, get_current_slot,
     get_current_store_epoch, get_parent_payload_status, get_slot_component_duration_ms,
-    get_time_into_slot_ms, is_payload_verified, key, prune, ptc_size, ForkChoiceNode,
-    PayloadStatus, Store, ATTESTATION_TIMELINESS_INDEX, PTC_TIMELINESS_INDEX,
+    get_time_into_slot_ms, is_payload_verified, key, prune, ptc_size, release_dropped,
+    ForkChoiceNode, PayloadStatus, Store, ATTESTATION_TIMELINESS_INDEX, PTC_TIMELINESS_INDEX,
 };
 use crate::weights::get_head;
 use crate::{Error, ATTESTATION_DUE_BPS_GLOAS, PAYLOAD_ATTESTATION_DUE_BPS};
@@ -41,9 +41,12 @@ pub trait StateProvider<E: Preset> {
 /// `on_tick` (P0 L946-954): one `on_tick_per_slot` for each slot start up to `time_ms`, then
 /// one at `time_ms`. A time before genesis fails and leaves the store as it was.
 ///
-/// Then, if the finalized checkpoint moved since the last prune, the store drops the blocks
-/// that do not descend from the finalized block (`store::prune`). This is not in the spec, and it
-/// does not change the result of a handler or of `get_head`.
+/// Then the store forgets the blocks that a prune dropped in the epoch before the previous
+/// epoch or earlier (`store::release_dropped`). If the finalized checkpoint moved since the
+/// last prune, it drops the blocks that do not descend from the finalized block
+/// (`store::prune`), and keeps what `on_attestation` reads of them. This is not in the spec.
+/// It does not change the result of `on_block` or of `get_head`, and `on_attestation` gives
+/// the result of the spec until the store forgets the dropped blocks.
 pub fn on_tick<E: Preset>(store: &mut Store<E>, time_ms: u64) -> Result<(), Error> {
     let tick_slot = compute_slot_at_time_ms(store, time_ms)?;
     while get_current_slot(store) < tick_slot {
@@ -54,6 +57,7 @@ pub fn on_tick<E: Preset>(store: &mut Store<E>, time_ms: u64) -> Result<(), Erro
         on_tick_per_slot(store, next_slot_time_ms);
     }
     on_tick_per_slot(store, time_ms);
+    release_dropped(store);
     prune(store);
     Ok(())
 }
@@ -326,7 +330,8 @@ fn ptc_votes<E: Preset>(
 }
 
 /// `store_target_checkpoint_state` (P0 L860-866): the state of `target.root` advanced to the
-/// first slot of `target.epoch`, kept in `store.checkpoint_states`.
+/// first slot of `target.epoch`, kept in `store.checkpoint_states`. The target can be a block
+/// that a prune dropped and the store keeps (`Store::dropped`).
 pub fn store_target_checkpoint_state<E: Preset, P: StateProvider<E> + ?Sized>(
     store: &mut Store<E>,
     provider: &P,
@@ -348,7 +353,7 @@ pub(crate) fn target_checkpoint_state<E: Preset, P: StateProvider<E> + ?Sized>(
     if store.checkpoint_states.contains_key(&key(target)) {
         return Ok(None);
     }
-    let mut base_state = store.get_block_state(target.root)?.clone();
+    let mut base_state = store.target_block_state(target.root)?.clone();
     let start_slot = compute_start_slot_at_epoch::<E>(target.epoch)?;
     if base_state.slot < start_slot {
         provider

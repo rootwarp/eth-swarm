@@ -16,7 +16,9 @@
 //!
 //! The spec's store keeps every block. Here `on_tick` also drops the blocks that do not
 //! descend from the finalized checkpoint block once finality moves, with no change to the
-//! result of [`on_block`] or of [`get_head`] ([`on_tick`]).
+//! result of [`on_block`] or of [`get_head`] ([`on_tick`]). The store keeps what
+//! [`on_attestation`] reads of the dropped blocks until the end of the epoch after the prune,
+//! so [`on_attestation`] gives the result of the spec until then.
 //!
 //! The spec signals an invalid call with a failed `assert` or a missing key. Here each public
 //! handler returns an [`Error`] instead, and a failed handler leaves the store as it was.
@@ -205,14 +207,15 @@ pub enum AttestationError {
     /// A FULL vote needs the verified payload of its block (G L942-943).
     #[error("a FULL vote for block {0}, whose payload is not verified")]
     PayloadNotVerified(Root),
-    /// The target epoch starts before the anchor block. The spec's `get_checkpoint_block`
-    /// walks below the anchor for it, where the store has no block: see
+    /// The target epoch starts before the oldest block that the store has on the chain of the
+    /// attested block, an anchor of the store. The spec's `get_checkpoint_block` walks to the
+    /// parent of that block, which the store does not have: see
     /// `attestations::validate_on_attestation`.
     #[error("target epoch {epoch} starts before the anchor block of slot {anchor_slot}")]
     TargetBeforeAnchor {
         /// `data.target.epoch`.
         epoch: Epoch,
-        /// The slot of the anchor block.
+        /// The slot of that block.
         anchor_slot: Slot,
     },
     /// The target must be the checkpoint block of the attested block (the LMD vote must agree
