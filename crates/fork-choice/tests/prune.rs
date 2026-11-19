@@ -729,6 +729,101 @@ fn the_store_keeps_a_dropped_block_for_attestations_until_the_end_of_the_next_ep
     );
 }
 
+/// Gives the two `attesters` older messages for `d2` and `other` an older message for `d`, all
+/// of slot 12.
+fn older_messages(
+    store: &mut Store<E>,
+    (attesters, other): ([ValidatorIndex; 2], ValidatorIndex),
+    d2: Root,
+    d: Root,
+) {
+    for validator in attesters {
+        vote(store, validator, 12, d2);
+    }
+    vote(store, other, 12, d);
+}
+
+#[test]
+fn after_the_window_a_refused_block_vote_for_a_forgotten_block_keeps_the_head_that_the_spec_moves()
+{
+    let mut f = finalized();
+    // Each vote is for `x` of slot 9 at the first slot of its epoch, with the target `x` in that
+    // epoch: `x` is its own checkpoint block in each epoch after epoch 1. The test makes the
+    // votes while the store has the state of `x`.
+    let in_window = Checkpoint {
+        epoch: 2,
+        root: f.x,
+    };
+    let after_window = Checkpoint {
+        epoch: 3,
+        root: f.x,
+    };
+    let in_window_slot = 2 * SLOTS_PER_EPOCH;
+    let after_window_slot = 3 * SLOTS_PER_EPOCH;
+    let in_window_voters = attesters_and_other(&f.store, &in_window, in_window_slot);
+    let after_window_voters = attesters_and_other(&f.store, &after_window, after_window_slot);
+    let in_window_vote = attestation(&f.store, in_window_slot, f.x, &in_window, &[0, 1]);
+    let after_window_vote = attestation(&f.store, after_window_slot, f.x, &after_window, &[0, 1]);
+
+    // The tick of slot 11 drops `b` and `x`. `d2` of slot 11 on `c` is a kept block beside `d`.
+    tick(&mut f.store, 11);
+    assert!(f.store.block(f.x).is_none());
+    let c_block = f.store.block(f.c).unwrap().clone();
+    let d2 = child(&c_block, 11, 7);
+    on_block(&mut f.store, &PLAIN, &d2).unwrap();
+    let d2 = root_of(&d2);
+    tick(&mut f.store, in_window_slot + 1);
+
+    // The spec's store keeps `x`. In epoch 2 this store still keeps `x` too, so it must give
+    // the result of the spec. The two attesters of the vote have older messages for `d2`, and
+    // one other validator has an older message for `d`. The vote moves the two attesters to
+    // `x`, and then `d` must be the head.
+    let mut spec = f.store.clone();
+    older_messages(&mut spec, in_window_voters, d2, f.d);
+    assert_eq!(get_head(&spec), Ok(empty(d2)));
+    assert_eq!(
+        on_attestation(&mut spec, &PLAIN, &in_window_vote, true),
+        Ok(())
+    );
+    let moved = LatestMessage {
+        slot: in_window_slot,
+        root: f.x,
+        payload_present: false,
+    };
+    for validator in in_window_voters.0 {
+        assert_eq!(spec.latest_message(validator), Some(&moved));
+    }
+    assert_eq!(get_head(&spec), Ok(empty(f.d)), "d: {}, d2: {}", f.d, d2);
+
+    // The same older messages for the attesters of the vote of epoch 3. At the first tick of
+    // epoch 3 the store forgets `x`. A block of slot 25 has the vote of slot 24. All states of
+    // this test have one shuffling, so the state of that block and the state of `x` give the
+    // vote the same attesters. The spec's store takes this vote and moves the head to `d`, as
+    // in epoch 2. This store must refuse the vote and keep the older messages, so `d2` must
+    // stay the head.
+    older_messages(&mut f.store, after_window_voters, d2, f.d);
+    tick(&mut f.store, after_window_slot);
+    tick(&mut f.store, after_window_slot + 1);
+    assert_eq!(get_head(&f.store), Ok(empty(d2)));
+    let before = f.store.clone();
+    assert_eq!(
+        on_attestation(&mut f.store, &PLAIN, &after_window_vote, true),
+        Err(Error::InvalidAttestation(AttestationError::UnknownTarget(
+            f.x
+        )))
+    );
+    assert_eq!(f.store, before);
+    let older = LatestMessage {
+        slot: 12,
+        root: d2,
+        payload_present: false,
+    };
+    for validator in after_window_voters.0 {
+        assert_eq!(f.store.latest_message(validator), Some(&older));
+    }
+    assert_eq!(get_head(&f.store), Ok(empty(d2)), "d: {}, d2: {}", f.d, d2);
+}
+
 #[test]
 fn a_full_vote_for_a_dropped_block_reads_its_verified_payload_after_the_prune() {
     for verified in [false, true] {
