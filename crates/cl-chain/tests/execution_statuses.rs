@@ -124,8 +124,9 @@ fn invalid_with_null_invalidates_the_payload_and_its_descendants() {
     );
 }
 
-/// INVALID with the all-zero `latestValidHash`: every Optimistic ancestor in the chain is
-/// invalid too. The walk up stops at a Valid payload, which stays Valid.
+/// INVALID with the all-zero `latestValidHash`: `invalidBlock` is the first execution payload of
+/// the chain, so every Optimistic ancestor must become Invalid too. The Valid payload 1 must stay
+/// Valid, and the table must report the EL contradiction: the EL calls 1 invalid now.
 #[test]
 fn invalid_with_the_zero_hash_invalidates_the_optimistic_run() {
     let mut statuses = ExecutionStatuses::new();
@@ -138,6 +139,7 @@ fn invalid_with_the_zero_hash_invalidates_the_optimistic_run() {
         statuses_of(&statuses, [1, 2, 3, 4]),
         [Some(Valid), Some(Invalid), Some(Invalid), Some(Invalid)]
     );
+    assert!(statuses.el_contradiction());
 }
 
 /// A `latestValidHash` that is not in the chain of the payload counts as `null`: only the
