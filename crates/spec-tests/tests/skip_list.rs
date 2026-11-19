@@ -541,80 +541,181 @@ fn gloas_fork_choice_tick_and_block_cases_are_not_skipped() {
     }
 }
 
-/// Cases of the four run handlers that need a step or a check that the runner does not have.
-/// The plan item that removes their skip is the attestation item for attestations, attester
-/// slashings and PTC messages, and the envelope item for execution payload envelopes.
-const OTHER_STEP_CASES: [(&str, &str, &str); 16] = [
-    ("minimal", "on_block", "on_block_checkpoints"),
-    ("minimal", "on_block", "on_block_before_finalized"),
+/// The Gloas `fork_choice` cases whose steps are `tick`, `block`, `attestation`,
+/// `attester_slashing` and `checks` (with `viable_for_head_roots_and_weights`), by preset and
+/// handler (consensus-specs v1.7.0-beta.4 pyspec sources). The blocks of many carry
+/// attestations, which the runner gives to `on_attestation`.
+const ATTESTATION_CASES: [(&str, &str, &[&str]); 9] = [
     (
-        "minimal",
-        "on_block",
-        "on_block_finalized_skip_slots_not_in_skip_chain",
+        "*",
+        "on_attestation",
+        &[
+            "validate_on_attestation_same_slot_empty_vote",
+            "validate_on_attestation_payload_invalid_index",
+        ],
     ),
     (
-        "minimal",
-        "on_block",
-        "new_finalized_slot_is_justified_checkpoint_ancestor",
+        "*",
+        "get_head",
+        &[
+            "shorter_chain_but_heavier_weight",
+            "proposer_boost_excludes_slashed_validators",
+            "discard_equivocations_on_attester_slashing",
+        ],
     ),
-    (
-        "minimal",
-        "on_block",
-        "justification_withholding_reverse_order",
-    ),
-    ("minimal", "on_block", "justified_update_always_if_better"),
-    (
-        "minimal",
-        "on_block",
-        "incompatible_justification_update_end_of_epoch",
-    ),
-    ("minimal", "on_block", "not_pull_up_current_epoch_block"),
-    ("minimal", "on_block", "pull_up_on_tick"),
-    ("minimal", "get_head", "filtered_block_tree"),
-    ("minimal", "get_head", "voting_source_beyond_two_epoch"),
     (
         "minimal",
         "get_head",
-        "discard_equivocations_slashed_validator_censoring",
+        &[
+            "filtered_block_tree",
+            "discard_equivocations_slashed_validator_censoring",
+            "voting_source_within_two_epoch",
+            "voting_source_beyond_two_epoch",
+        ],
     ),
-    ("mainnet", "get_head", "shorter_chain_but_heavier_weight"),
+    (
+        "minimal",
+        "on_block",
+        &[
+            "on_block_checkpoints",
+            "on_block_before_finalized",
+            "on_block_finalized_skip_slots",
+            "on_block_finalized_skip_slots_not_in_skip_chain",
+            "new_finalized_slot_is_justified_checkpoint_ancestor",
+            "justification_withholding",
+            "justification_withholding_reverse_order",
+            "justification_update_beginning_of_epoch",
+            "justification_update_end_of_epoch",
+            "incompatible_justification_update_start_of_epoch",
+            "incompatible_justification_update_end_of_epoch",
+            "justified_update_not_realized_finality",
+            "justified_update_monotonic",
+            "justified_update_always_if_better",
+            "pull_up_past_epoch_block",
+            "not_pull_up_current_epoch_block",
+            "pull_up_on_tick",
+        ],
+    ),
+    (
+        "*",
+        "ex_ante",
+        &[
+            "ex_ante_vanilla",
+            "ex_ante_sandwich_without_attestations",
+            "ex_ante_sandwich_with_honest_attestation",
+        ],
+    ),
     (
         "mainnet",
-        "get_head",
-        "proposer_boost_excludes_slashed_validators",
-    ),
-    (
-        "mainnet",
-        "get_head",
-        "discard_equivocations_on_attester_slashing",
+        "ex_ante",
+        &[
+            "ex_ante_attestations_is_greater_than_proposer_boost_with_boost",
+            "ex_ante_sandwich_with_boost_not_sufficient",
+        ],
     ),
     (
         "minimal",
-        "filter_node_tree_variants",
-        "get_head_prunes_childless_unviable_full_variant",
+        "reorg",
+        &[
+            "simple_attempted_reorg_without_enough_ffg_votes",
+            "simple_attempted_reorg_delayed_justification_current_epoch",
+            "include_votes_another_empty_chain_with_enough_ffg_votes_current_epoch",
+            "include_votes_another_empty_chain_without_enough_ffg_votes_current_epoch",
+            "delayed_justification_current_epoch",
+            "delayed_justification_previous_epoch",
+            "simple_attempted_reorg_delayed_justification_previous_epoch",
+            "include_votes_another_empty_chain_with_enough_ffg_votes_previous_epoch",
+        ],
+    ),
+    (
+        "minimal",
+        "withholding",
+        &[
+            "withholding_attack",
+            "withholding_attack_unviable_honest_chain",
+        ],
+    ),
+    (
+        "minimal",
+        "should_apply_proposer_boost",
+        &[
+            "should_apply_proposer_boost_parent_not_adjacent",
+            "should_apply_proposer_boost_parent_not_weak",
+            "should_apply_proposer_boost_no_equivocation",
+            "should_apply_proposer_boost_withheld",
+        ],
     ),
 ];
 
 #[test]
-fn gloas_fork_choice_cases_with_other_steps_stay_skipped() {
+fn gloas_fork_choice_attestation_cases_are_not_skipped() {
     let skips = committed();
-    for (preset, handler, case) in OTHER_STEP_CASES {
-        let k = fork_choice_case(preset, handler, case);
-        let want = if handler == "filter_node_tree_variants" {
-            "5.14a"
+    for (preset, handler, cases) in ATTESTATION_CASES {
+        let presets: &[&str] = if preset == "*" {
+            &["minimal", "mainnet"]
         } else {
-            "5.11b"
+            &[preset]
         };
-        assert_eq!(issue_of(&skips, &k), want, "{k}");
+        for preset in presets {
+            for case in cases {
+                let k = fork_choice_case(preset, handler, case);
+                let skip = skips.skipped_by(&k);
+                assert!(skip.is_none(), "{k} is skipped: {skip:?}");
+            }
+        }
     }
-    for preset in ["minimal", "mainnet"] {
-        for (handler, case) in [
-            ("on_block", "on_block_parent_full_accepts_verified_payload"),
-            ("get_head", "get_head_full_payload_tiebreak"),
-            ("get_head", "get_head_empty_payload_tiebreak"),
-        ] {
-            let k = fork_choice_case(preset, handler, case);
-            assert_eq!(issue_of(&skips, &k), "5.14a", "{k}");
+}
+
+/// The cases of the run handlers with an `execution_payload` step, by preset and handler.
+/// The envelope item removes their skip.
+const PAYLOAD_STEP_CASES: [(&str, &str, &[&str]); 4] = [
+    (
+        "*",
+        "on_block",
+        &["on_block_parent_full_accepts_verified_payload"],
+    ),
+    (
+        "*",
+        "get_head",
+        &[
+            "get_head_full_payload_tiebreak",
+            "get_head_empty_payload_tiebreak",
+        ],
+    ),
+    (
+        "*",
+        "on_attestation",
+        &[
+            "validate_on_attestation_same_slot_full_vote_rejected",
+            "validate_on_attestation_later_slot_full_vote_valid",
+            "validate_on_attestation_beacon_root_payload_check",
+        ],
+    ),
+    (
+        "minimal",
+        "filter_node_tree_variants",
+        &[
+            "get_head_prunes_childless_unviable_full_variant",
+            "get_head_prunes_childless_unviable_empty_variant",
+            "get_filtered_node_tree_contains_both_viable_childless_variants",
+        ],
+    ),
+];
+
+#[test]
+fn gloas_fork_choice_cases_with_payload_steps_stay_skipped() {
+    let skips = committed();
+    for (preset, handler, cases) in PAYLOAD_STEP_CASES {
+        let presets: &[&str] = if preset == "*" {
+            &["minimal", "mainnet"]
+        } else {
+            &[preset]
+        };
+        for preset in presets {
+            for case in cases {
+                let k = fork_choice_case(preset, handler, case);
+                assert_eq!(issue_of(&skips, &k), "5.14a", "{k}");
+            }
         }
     }
 }
@@ -623,11 +724,7 @@ fn gloas_fork_choice_cases_with_other_steps_stay_skipped() {
 fn other_fork_choice_handlers_and_forks_stay_skipped() {
     let skips = committed();
     for (preset, handler, want) in [
-        ("*", "on_attestation", "5.11b"),
-        ("minimal", "reorg", "5.11b"),
-        ("minimal", "withholding", "5.11b"),
-        ("minimal", "should_apply_proposer_boost", "5.11b"),
-        ("*", "on_payload_attestation_message", "5.11b"),
+        ("*", "on_payload_attestation_message", "5.14a"),
         ("*", "on_execution_payload_envelope", "5.14a"),
         ("*", "payload_timeliness", "5.14a"),
         ("*", "payload_data_availability", "5.14a"),
@@ -660,7 +757,8 @@ fn other_fork_choice_handlers_and_forks_stay_skipped() {
 }
 
 /// No entry may skip a whole run handler of Gloas fork choice, or every handler of the
-/// runner: the first matching entry wins, so such an entry hides every case below it.
+/// runner: the first matching entry wins, so such an entry hides every case below it. A new
+/// case of a run handler is not skipped, so it runs and fails until it gets an entry.
 #[test]
 fn no_wildcard_entry_reaches_the_run_fork_choice_handlers() {
     let skips = committed();
@@ -670,6 +768,10 @@ fn no_wildcard_entry_reaches_the_run_fork_choice_handlers() {
             "get_head",
             "get_parent_payload_status",
             "ex_ante",
+            "on_attestation",
+            "reorg",
+            "withholding",
+            "should_apply_proposer_boost",
         ] {
             let k = CaseKey {
                 case: "pyspec_tests/a_new_case".into(),
@@ -678,50 +780,5 @@ fn no_wildcard_entry_reaches_the_run_fork_choice_handlers() {
             let skip = skips.skipped_by(&k);
             assert!(skip.is_none(), "{k} is skipped: {skip:?}");
         }
-    }
-}
-
-/// The `ex_ante` cases with attestation steps, by preset. The two cases of mainnet only need
-/// committees of the mainnet preset.
-const EX_ANTE_ATTESTATION_CASES: [(&str, &str); 6] = [
-    ("minimal", "ex_ante_vanilla"),
-    ("mainnet", "ex_ante_vanilla"),
-    ("minimal", "ex_ante_sandwich_with_honest_attestation"),
-    ("mainnet", "ex_ante_sandwich_with_honest_attestation"),
-    (
-        "mainnet",
-        "ex_ante_attestations_is_greater_than_proposer_boost_with_boost",
-    ),
-    ("mainnet", "ex_ante_sandwich_with_boost_not_sufficient"),
-];
-
-#[test]
-fn ex_ante_skips_only_its_attestation_cases_by_exact_name() {
-    let skips = committed();
-    for (preset, case) in EX_ANTE_ATTESTATION_CASES {
-        let k = fork_choice_case(preset, "ex_ante", case);
-        assert_eq!(issue_of(&skips, &k), "5.11b", "{k}");
-    }
-    for preset in ["minimal", "mainnet"] {
-        // The sandwich without attestations has only tick, block and checks steps, so it
-        // must run. Other names must not match an entry: each entry names one case.
-        for case in [
-            "ex_ante_sandwich_without_attestations",
-            "ex_ante_vanilla_2",
-            "ex_ante_sandwich_with_honest_attestation_2",
-            "a_new_case",
-        ] {
-            let k = fork_choice_case(preset, "ex_ante", case);
-            let skip = skips.skipped_by(&k);
-            assert!(skip.is_none(), "{k} is skipped: {skip:?}");
-        }
-    }
-    // The minimal preset has no case of the mainnet only names.
-    for case in [
-        "ex_ante_attestations_is_greater_than_proposer_boost_with_boost",
-        "ex_ante_sandwich_with_boost_not_sufficient",
-    ] {
-        let k = fork_choice_case("minimal", "ex_ante", case);
-        assert!(skips.skipped_by(&k).is_none(), "{k}");
     }
 }

@@ -2,9 +2,7 @@
 //! tiebreaker, with the helpers that they call.
 //!
 //! The scores read `store.latest_messages` and `store.equivocating_indices`, which
-//! `on_attestation` and `on_attester_slashing` fill. Those handlers are not here yet, so
-//! outside the tests (the seams of `crate::testing`) both are empty: the attestation score of
-//! each node is zero and only the proposer boost gives weight.
+//! `on_attestation` and `on_attester_slashing` fill.
 
 use crate::store::{
     get_checkpoint_block, get_current_slot, get_current_store_epoch, get_parent_payload_status,
@@ -246,12 +244,13 @@ impl Boost {
 }
 
 /// `get_attestation_score` (P0 L338-356). It walks the latest messages instead of the
-/// registry: the sum is the same, and the store has few messages or none.
+/// registry: the sum is the same. Each node walks every message, so `get_head` costs nodes
+/// times messages times the ancestor walk; vote deltas are a later change.
 ///
-/// A message for a block that the store does not have counts for no node. Only a prune
-/// drops a block that a message names, and such a block is not a descendant of the
-/// finalized block, so in the spec's store, which keeps it, the message supports no node
-/// that the pruned store keeps.
+/// A message for a block that is not in `store.blocks` counts for no node. Only a prune drops
+/// a block that a message names, and `on_attestation` can still set a message for a dropped
+/// block. Such a block is not a descendant of the finalized block, so in the spec's store,
+/// which keeps it, the message supports no node that the pruned store keeps.
 fn get_attestation_score<E: Preset>(
     store: &Store<E>,
     node: &ForkChoiceNode,

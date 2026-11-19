@@ -2,7 +2,8 @@
 //! through the `fork-choice` crate (`tests/formats/fork_choice/README.md` at v1.7.0-beta.4).
 //!
 //! A case holds `anchor_state.ssz_snappy`, `anchor_block.ssz_snappy`, `steps.yaml`, the
-//! `block_<root>.ssz_snappy` files that its steps name, an optional `meta.yaml`
+//! `block_<root>.ssz_snappy`, `attestation_<root>.ssz_snappy` and
+//! `attester_slashing_<root>.ssz_snappy` files that its steps name, an optional `meta.yaml`
 //! (`description`, `bls_setting`), an optional `config.yaml` and `manifest.yaml` (the suite
 //! checks it). [`run`] makes the store with `get_forkchoice_store` and the `SLOT_DURATION_MS`
 //! of the preset config, and then runs each step in sequence:
@@ -11,17 +12,22 @@
 //! - `block`: `on_block`, with `state_transition` and the BLS backend of
 //!   [`crate::bls_backend`] (BLS is on unless `bls_setting: 2`). A step with `valid: false`
 //!   must fail with an error that proves the block invalid, and must leave the store equal
-//!   to the store before the step (as a `tick` with `valid: false` must). A valid block with
-//!   attestations or attester slashings fails the case: the format then runs
-//!   `on_attestation` and `on_attester_slashing`, which are not ported. The payload
-//!   attestations of a block need no more work: `on_block` gives their votes to the store
-//!   (`notify_ptc_messages`), and the messages that the format makes from them set the same
-//!   votes again. A block that the store has and that carries payload attestations fails the
-//!   case: the spec's `on_block` gives its votes again, and `fork_choice::on_block` returns
-//!   early for a known block.
+//!   to the store before the step (as each other step with `valid: false` must). After a
+//!   valid block, the runner gives each attestation of the block to
+//!   `on_attestation(..., is_from_block=True)` and then each attester slashing to
+//!   `on_attester_slashing`, as the pyspec helper `add_block` does; each must pass. The
+//!   payload attestations of a block need no more work: `on_block` gives their votes to the
+//!   store (`notify_ptc_messages`), and the messages that the format makes from them set the
+//!   same votes again. A block that the store has and that carries payload attestations fails
+//!   the case: the test format gives its votes to the store again after `on_block`, and
+//!   `fork_choice::on_block` returns early for a known block, so the runner cannot tell which
+//!   votes the vector expects.
+//! - `attestation`: `on_attestation(..., is_from_block=False)`, the default of the format.
+//! - `attester_slashing`: `on_attester_slashing`.
 //! - `checks`: `head` (the slot, root and payload status of `get_head`), `time`,
-//!   `genesis_time`, `justified_checkpoint`, `finalized_checkpoint` and `proposer_boost_root`.
-//!   A `checks` step with no check fails, and so does a case that runs no check.
+//!   `genesis_time`, `justified_checkpoint`, `finalized_checkpoint`, `proposer_boost_root` and
+//!   `viable_for_head_roots_and_weights`. A `checks` step with no check fails, and so does a
+//!   case that runs no check.
 //!
 //! Each other step, step key or check key fails the case. Thus a case that needs a handler
 //! or a check that is not here cannot pass because the runner does less.
@@ -32,41 +38,48 @@ use crate::coverage::Reads;
 use crate::fixture;
 use crate::plan::Case;
 use ::fork_choice::{
-    get_forkchoice_store, get_head, milliseconds_to_seconds, on_block, on_tick,
-    seconds_to_milliseconds, Error, StateProvider, Store,
+    get_filtered_node_tree, get_forkchoice_store, get_head, get_node_children, get_weight,
+    milliseconds_to_seconds, on_attestation, on_attester_slashing, on_block, on_tick,
+    seconds_to_milliseconds, Error, ForkChoiceNode, PayloadStatus, SignatureVerifier,
+    StateProvider, Store,
 };
-use consensus_types::gloas::{BeaconBlock, BeaconState, Checkpoint, SignedBeaconBlock};
+use consensus_types::gloas::{
+    Attestation, AttesterSlashing, BeaconBlock, BeaconState, Checkpoint, SignedBeaconBlock,
+};
 use consensus_types::primitives::{Root, Slot};
 use consensus_types::{Mainnet, Minimal};
 use ssz::Decode;
 use state_transition::per_slot::process_slots;
-use state_transition::{state_transition, BackendError, BlsContext, Preset, StfError};
+use state_transition::{
+    state_transition, BackendError, BlsContext, Preset, SignatureSet, StfError,
+};
 use std::num::NonZeroU64;
 use std::path::Path;
 use tree_hash::TreeHash;
 use yaml_rust2::Yaml;
 
 /// The Gloas handler directories that this runner runs.
-pub const RUNNABLE: [&str; 5] = [
+pub const RUNNABLE: [&str; 9] = [
     "on_block",
     "get_head",
     "get_parent_payload_status",
     "filter_node_tree_variants",
     "ex_ante",
+    "on_attestation",
+    "reorg",
+    "withholding",
+    "should_apply_proposer_boost",
 ];
 
 /// The Gloas handler directories of v1.7.0-beta.4 that this runner does not run: each case
-/// needs a step or a check that it does not have. `testing/skip.toml` skips them.
-pub const NOT_RUN: [&str; 9] = [
-    "on_attestation",
+/// needs an `execution_payload` or a `payload_attestation_message` step, or payload vote
+/// checks. `testing/skip.toml` skips them.
+pub const NOT_RUN: [&str; 5] = [
     "on_execution_payload_envelope",
     "on_payload_attestation_message",
-    "reorg",
-    "withholding",
     "deposit_with_reorg",
     "payload_timeliness",
     "payload_data_availability",
-    "should_apply_proposer_boost",
 ];
 
 /// Whether this runner runs a Gloas handler directory. `Err` for a directory that it does
@@ -207,6 +220,17 @@ impl<E: Preset> StateProvider<E> for Transition<'_> {
     }
 }
 
+impl<E: Preset> SignatureVerifier<E> for Transition<'_> {
+    fn verify_signature_sets(
+        &self,
+        state: &BeaconState<E>,
+        sets: &[SignatureSet],
+    ) -> Result<bool, BackendError> {
+        let keys = StateKeys::new(state);
+        backend_for(self.bls, &keys).verify_signature_sets(sets)
+    }
+}
+
 /// Runs one entry of `steps.yaml`, and gives the number of checks that it ran.
 fn apply_step<E: Preset>(
     reads: &Reads,
@@ -239,6 +263,20 @@ fn apply_step<E: Preset>(
     } else if keys.contains(&"block") {
         only("block", &["block", "valid"])?;
         block(reads, case, store, provider, &step["block"], valid).map(|()| 0)
+    } else if keys.contains(&"attestation") {
+        only("attestation", &["attestation", "valid"])?;
+        let attestation: Attestation<E> = object(reads, case, &step["attestation"])?;
+        run_handler(store, "on_attestation", valid, |store| {
+            on_attestation(store, provider, &attestation, false)
+        })
+        .map(|()| 0)
+    } else if keys.contains(&"attester_slashing") {
+        only("attester_slashing", &["attester_slashing", "valid"])?;
+        let slashing: AttesterSlashing<E> = object(reads, case, &step["attester_slashing"])?;
+        run_handler(store, "on_attester_slashing", valid, |store| {
+            on_attester_slashing(store, provider, &slashing)
+        })
+        .map(|()| 0)
     } else if keys == ["checks"] {
         let checks = step["checks"]
             .as_hash()
@@ -253,7 +291,7 @@ fn apply_step<E: Preset>(
         Ok(checks.len())
     } else {
         Err(format!(
-            "unsupported step {keys:?}: the runner has only tick, block and checks"
+            "unsupported step {keys:?}: the runner has only tick, block, attestation, attester_slashing and checks"
         ))
     }
 }
@@ -279,40 +317,64 @@ fn block<E: Preset>(
     name: &Yaml,
     valid: bool,
 ) -> Result<(), String> {
-    let name = name.as_str().ok_or("block: expected a file name")?;
-    let file = format!("{name}.ssz_snappy");
-    let path = case
-        .file(&file)
-        .ok_or_else(|| format!("case has no {file}"))?;
-    let signed_block: SignedBeaconBlock<E> = decode(reads, path)?;
+    let signed_block: SignedBeaconBlock<E> = object(reads, case, name)?;
+    let name = name.as_str().unwrap_or_default();
     let body = &signed_block.message.body;
     let known = store.block(signed_block.message.tree_hash_root()).is_some();
     if known && !body.payload_attestations.is_empty() {
         return Err(format!(
-            "{name} is in the store and has payload attestations: the spec's on_block gives their votes again, and fork_choice::on_block returns early for a known block"
+            "{name} is in the store and has payload attestations: the test format gives their votes to the store again after on_block, and fork_choice::on_block returns early for a known block"
         ));
     }
-    if valid && !body.attestations.is_empty() {
-        return Err(format!(
-            "{name} has attestations: the format runs on_attestation for each, which is not ported"
-        ));
+    run_handler(store, "on_block", valid, |store| {
+        on_block(store, provider, &signed_block)
+    })?;
+    if !valid {
+        return Ok(());
     }
-    if valid && !body.attester_slashings.is_empty() {
-        return Err(format!(
-            "{name} has attester slashings: the format runs on_attester_slashing for each, which is not ported"
-        ));
+    // `add_block` of the pyspec helpers: the attestations of the block, then its attester
+    // slashings.
+    for attestation in body.attestations.iter() {
+        on_attestation(store, provider, attestation, true)
+            .map_err(|e| format!("on_attestation refused an attestation of {name}: {e}"))?;
     }
+    for slashing in body.attester_slashings.iter() {
+        on_attester_slashing(store, provider, slashing).map_err(|e| {
+            format!("on_attester_slashing refused an attester slashing of {name}: {e}")
+        })?;
+    }
+    Ok(())
+}
+
+/// The SSZ object of the `<name>.ssz_snappy` file that a step names.
+fn object<T: Decode>(reads: &Reads, case: &Case, name: &Yaml) -> Result<T, String> {
+    let name = name.as_str().ok_or("expected a file name")?;
+    let file = format!("{name}.ssz_snappy");
+    let path = case
+        .file(&file)
+        .ok_or_else(|| format!("case has no {file}"))?;
+    decode(reads, path)
+}
+
+/// Runs `handler` on `store` for a step with the flag `valid`. A refused step must fail on a
+/// spec assert about its input, and must not modify the store (P0 L97-99).
+fn run_handler<E: Preset>(
+    store: &mut Store<E>,
+    name: &str,
+    valid: bool,
+    handler: impl FnOnce(&mut Store<E>) -> Result<(), Error>,
+) -> Result<(), String> {
     let before = (!valid).then(|| store.clone());
-    match (on_block(store, provider, &signed_block), valid) {
+    match (handler(store), valid) {
         (Ok(()), true) => Ok(()),
         (Err(e), false) if proves_invalid(&e) => unchanged(store, before),
         (Ok(()), false) => Err(format!(
-            "on_block accepted {name}, which the vector expects to fail"
+            "{name} accepted a step that the vector expects to fail"
         )),
         (Err(e), false) => Err(format!(
-            "on_block failed on {name} with {e}, which is not a spec failure"
+            "{name} failed with {e}, which is not a spec failure"
         )),
-        (Err(e), true) => Err(format!("on_block refused {name}: {e}")),
+        (Err(e), true) => Err(format!("{name} refused a valid step: {e}")),
     }
 }
 
@@ -325,15 +387,16 @@ fn unchanged<E: Preset>(store: &Store<E>, before: Option<Store<E>>) -> Result<()
     }
 }
 
-/// Whether `on_block` failed on a spec assert about the block, not on a fault of the store.
+/// Whether a handler failed on a spec assert about its input, not on a fault of the store.
 fn proves_invalid(e: &Error) -> bool {
     match e {
         Error::UnknownParent(_)
         | Error::ParentPayloadNotVerified(_)
         | Error::FutureBlock { .. }
         | Error::NotAfterFinalized { .. }
-        | Error::NotFinalizedDescendant { .. } => true,
-        Error::StateTransition(e) => e.proves_invalid(),
+        | Error::NotFinalizedDescendant { .. }
+        | Error::InvalidAttestation(_) => true,
+        Error::StateTransition(e) | Error::IndexedAttestation(e) => e.proves_invalid(),
         _ => false,
     }
 }
@@ -351,6 +414,7 @@ fn check<E: Preset>(store: &Store<E>, key: &str, want: &Yaml) -> Result<(), Stri
         "justified_checkpoint" => equal(store.justified_checkpoint().clone(), want, checkpoint),
         "finalized_checkpoint" => equal(store.finalized_checkpoint().clone(), want, checkpoint),
         "proposer_boost_root" => equal(store.proposer_boost_root(), want, root),
+        "viable_for_head_roots_and_weights" => check_viable(store, want),
         other => return Err(format!("unsupported check `{other}`")),
     };
     result.map_err(|e| format!("{key}: {e}"))
@@ -382,6 +446,57 @@ fn check_head<E: Preset>(store: &Store<E>, want: &Yaml) -> Result<(), String> {
     } else {
         Err(format!(
             "got (slot, root, payload_status) {got:?}, want {want:?}"
+        ))
+    }
+}
+
+/// `viable_for_head_roots_and_weights` (`get_viable_for_head_checks` of the pyspec helpers):
+/// the root, the weight and the payload status of each leaf of the walk from the PENDING
+/// justified node through the children in the filtered node tree. The format lists the
+/// leaves in the order of a stack, which the spec does not define, so the runner compares
+/// them in sorted order.
+fn check_viable<E: Preset>(store: &Store<E>, want: &Yaml) -> Result<(), String> {
+    let mut want = fixture::list(want)?
+        .iter()
+        .map(|leaf| {
+            let map = leaf.as_hash().ok_or("expected a mapping")?;
+            let known = ["root", "weight", "payload_status"];
+            if let Some(k) = map
+                .keys()
+                .find(|k| !k.as_str().is_some_and(|k| known.contains(&k)))
+            {
+                return Err(format!("unsupported key {k:?}"));
+            }
+            Ok((
+                root(fixture::field(leaf, "root")?).ok_or("root is not a root")?,
+                unsigned(fixture::field(leaf, "weight")?).ok_or("weight is not a number")?,
+                unsigned(fixture::field(leaf, "payload_status")?)
+                    .ok_or("payload_status is not a number")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let tree = get_filtered_node_tree(store).map_err(|e| format!("get_filtered_node_tree: {e}"))?;
+    let mut pending = vec![ForkChoiceNode {
+        root: store.justified_checkpoint().root,
+        payload_status: PayloadStatus::Pending,
+    }];
+    let mut got = Vec::new();
+    while let Some(node) = pending.pop() {
+        let children = get_node_children(store, &node).map_err(|e| format!("children: {e}"))?;
+        let viable: Vec<_> = children.into_iter().filter(|c| tree.contains(c)).collect();
+        if viable.is_empty() {
+            let weight = get_weight(store, &node).map_err(|e| format!("get_weight: {e}"))?;
+            got.push((node.root, weight, node.payload_status as u64));
+        }
+        pending.extend(viable);
+    }
+    want.sort_unstable();
+    got.sort_unstable();
+    if got == want {
+        Ok(())
+    } else {
+        Err(format!(
+            "got (root, weight, payload_status) {got:?}, want {want:?}"
         ))
     }
 }
