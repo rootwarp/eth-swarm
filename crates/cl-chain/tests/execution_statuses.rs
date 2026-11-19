@@ -1,15 +1,18 @@
 //! The [`ExecutionStatuses`] table on its own, without a client: the `latestValidHash` boundary of
 //! an INVALID verdict, invalid descendants, a payload recorded before its parent, the import gate
-//! of the table, pruning at finality, and the bound on retained Invalid payloads.
+//! of the table, pruning at finality, the bound on retained Invalid payloads, INVALID_BLOCK_HASH,
+//! and the EL contradictions.
 //!
-//! The rules come from `bellatrix/optimistic-sync.md`, "How to apply `latestValidHash` when
-//! payload status is `INVALID`" and "How to optimistically import blocks". A payload is
+//! The rules come from consensus-specs v1.7.0-beta.4, `specs/bellatrix/optimistic-sync.md`: "How
+//! to apply `latestValidHash` when payload status is `INVALID`", "How to optimistically import
+//! blocks" and "Transitioning from VALID -> INVALIDATED or INVALIDATED -> VALID". A payload is
 //! `hash(n)`, and `chain` records each `(n, parent, verdict)` in order.
 
 use cl_chain::engine::verdict::{
-    ElVerdict, ExecutionStatus, ExecutionStatuses, Reason, MAX_INVALID_PAYLOADS,
+    self, ElVerdict, ExecutionStatus, ExecutionStatuses, Reason, MAX_INVALID_PAYLOADS,
 };
 use consensus_types::primitives::Hash32;
+use engine_api::{FixedData, PayloadStatusV1, ValidationStatus};
 
 use ExecutionStatus::{Invalid, Optimistic, Valid};
 
@@ -38,6 +41,21 @@ fn statuses_of<const N: usize>(
 
 const OPT: ElVerdict = ElVerdict::Optimistic;
 const VALID: ElVerdict = ElVerdict::Valid;
+
+/// The verdict of an Engine API reply with `status` and `latest_valid_hash` for the payload
+/// `block_hash`.
+fn reply(
+    status: ValidationStatus,
+    latest_valid_hash: Option<Hash32>,
+    block_hash: Hash32,
+) -> ElVerdict {
+    let reply = PayloadStatusV1 {
+        status,
+        latest_valid_hash: latest_valid_hash.map(|h| FixedData(h.0)),
+        validation_error: None,
+    };
+    verdict::map(&reply, block_hash)
+}
 
 /// INVALID for 5 with `latestValidHash` 2: the invalid block is 3, the child of 2 in the chain
 /// of 5. 3, 4 and 5 become Invalid, and so do the other descendants of 3 (6 on 3, 7 on 5). 2 is
@@ -88,7 +106,7 @@ fn invalid_with_null_invalidates_the_payload_and_its_descendants() {
             (3, 2, OPT),
             (4, 3, OPT),
             (5, 3, OPT),
-            (6, 4, VALID),
+            (6, 4, OPT),
         ],
     );
     statuses.record(hash(3), hash(2), &invalid(None));
@@ -96,13 +114,13 @@ fn invalid_with_null_invalidates_the_payload_and_its_descendants() {
         statuses_of(&statuses, [1, 2, 3, 4, 5, 6]),
         [
             Some(Valid),
-            Some(Valid),
+            Some(Optimistic),
             Some(Invalid),
             Some(Invalid),
             Some(Invalid),
             Some(Invalid)
         ],
-        "a descendant of an Invalid payload is Invalid, also one recorded Valid"
+        "each descendant of an Invalid payload must be Invalid"
     );
 }
 
@@ -123,23 +141,14 @@ fn invalid_with_the_zero_hash_invalidates_the_optimistic_run() {
 }
 
 /// A `latestValidHash` that is not in the chain of the payload counts as `null`: only the
-/// payload (and its descendants) become Invalid. The walk up never passes a Valid payload, and
-/// a recorded payload on another branch is not made Valid.
+/// payload (and its descendants) become Invalid. A recorded payload on another branch is not
+/// made Valid. This is no EL contradiction.
 #[test]
 fn a_latest_valid_hash_outside_the_chain_counts_as_null() {
     let mut statuses = ExecutionStatuses::new();
     chain(
         &mut statuses,
-        &[
-            (1, 0, VALID),
-            (2, 1, OPT),
-            (3, 2, OPT),
-            (9, 8, OPT),
-            (11, 10, VALID),
-            (12, 11, OPT),
-            (13, 12, VALID),
-            (14, 13, OPT),
-        ],
+        &[(1, 0, VALID), (2, 1, OPT), (3, 2, OPT), (9, 8, OPT)],
     );
     // 9 is recorded, but on another branch.
     statuses.record(hash(3), hash(2), &invalid(Some(hash(9))));
@@ -152,12 +161,7 @@ fn a_latest_valid_hash_outside_the_chain_counts_as_null() {
             Some(Optimistic)
         ]
     );
-    // 11 is in the chain of 14, but above the Valid 13: the walk stops at 13.
-    statuses.record(hash(14), hash(13), &invalid(Some(hash(11))));
-    assert_eq!(
-        statuses_of(&statuses, [11, 12, 13, 14]),
-        [Some(Valid), Some(Valid), Some(Valid), Some(Invalid)]
-    );
+    assert!(!statuses.el_contradiction());
 }
 
 /// A payload recorded on an Invalid execution parent is Invalid, whatever its own verdict, and
@@ -198,7 +202,7 @@ fn a_parent_recorded_after_its_children_passes_on_invalid() {
     // 13 and 14 wait for 12.
     chain(
         &mut statuses,
-        &[(13, 12, OPT), (14, 13, OPT), (15, 13, VALID)],
+        &[(13, 12, OPT), (14, 13, OPT), (15, 13, OPT)],
     );
     statuses.record(hash(12), hash(11), &invalid(None));
     assert_eq!(statuses_of(&statuses, [12, 13, 14, 15]), [Some(Invalid); 4]);
@@ -467,8 +471,9 @@ fn wide(i: u32) -> Hash32 {
     Hash32::from(bytes)
 }
 
-/// At most `MAX_INVALID_PAYLOADS` Invalid payloads are kept. Past the bound, the payload that
-/// became Invalid first goes first. An Optimistic or Valid payload is never evicted by it.
+/// At most `MAX_INVALID_PAYLOADS` Invalid payloads keep a full entry. Past the bound, the payload
+/// that became Invalid first loses its entry first, but it must stay Invalid. An Optimistic or
+/// Valid payload is never evicted by it.
 #[test]
 fn retained_invalid_payloads_are_bounded() {
     assert_eq!(MAX_INVALID_PAYLOADS, 4096);
@@ -482,8 +487,11 @@ fn retained_invalid_payloads_are_bounded() {
     }
     assert_eq!(statuses.len(), MAX_INVALID_PAYLOADS + 2);
     for i in 0..total {
-        let want = (i >= over).then_some(Invalid);
-        assert_eq!(statuses.status(&wide(i)), want, "invalid payload {i}");
+        assert_eq!(
+            statuses.status(&wide(i)),
+            Some(Invalid),
+            "invalid payload {i}"
+        );
     }
     assert_eq!(
         statuses_of(&statuses, [1, 2]),
@@ -497,6 +505,295 @@ fn retained_invalid_payloads_are_bounded() {
     assert_eq!(statuses.len(), MAX_INVALID_PAYLOADS + 2);
     assert_eq!(statuses_of(&statuses, [3, 4]), [Some(Invalid); 2]);
     for i in over..over + 2 {
-        assert_eq!(statuses.status(&wide(i)), None, "invalid payload {i}");
+        assert_eq!(
+            statuses.status(&wide(i)),
+            Some(Invalid),
+            "invalid payload {i}"
+        );
     }
+}
+
+/// INVALID_BLOCK_HASH means that the payload does not hash to the `block_hash` that it claims. The
+/// claimed hash can be the hash of an honest payload, so the reply must give no verdict and must
+/// record nothing for that hash. Its `latestValidHash` must not count, also when it names a
+/// recorded payload. The verdict gate must refuse the envelope. A later honest VALID for the
+/// claimed hash must still count.
+#[test]
+fn invalid_block_hash_records_nothing_and_moves_no_boundary() {
+    let mut statuses = ExecutionStatuses::new();
+    chain(&mut statuses, &[(1, 0, OPT), (2, 1, OPT)]);
+    for latest_valid_hash in [Some(hash(1)), None] {
+        let verdict = reply(
+            ValidationStatus::InvalidBlockHash,
+            latest_valid_hash,
+            hash(3),
+        );
+        assert_eq!(
+            verdict,
+            ElVerdict::NotVerified(Reason::InvalidBlockHash),
+            "latestValidHash {latest_valid_hash:?}"
+        );
+        assert!(!verdict.permits_payload_import());
+        assert!(!statuses.permits_payload_import(&hash(3), &hash(2), &verdict));
+        assert_eq!(
+            statuses.record(hash(3), hash(2), &verdict),
+            None,
+            "3 must have no status"
+        );
+        // A tampered envelope can claim the hash of 2, which is recorded.
+        let verdict = reply(
+            ValidationStatus::InvalidBlockHash,
+            latest_valid_hash,
+            hash(2),
+        );
+        assert_eq!(
+            statuses.record(hash(2), hash(1), &verdict),
+            Some(Optimistic)
+        );
+        assert_eq!(
+            statuses_of(&statuses, [1, 2, 3]),
+            [Some(Optimistic), Some(Optimistic), None],
+            "1 and 2 must stay Optimistic, and 3 must have no status"
+        );
+    }
+    let honest = reply(ValidationStatus::Valid, Some(hash(3)), hash(3));
+    assert_eq!(statuses.record(hash(3), hash(2), &honest), Some(Valid));
+    assert_eq!(statuses_of(&statuses, [1, 2, 3]), [Some(Valid); 3]);
+    assert!(!statuses.el_contradiction());
+}
+
+/// 1 is Valid, and 2, 3 and 4 are Optimistic. INVALID for 3 with a `null` `latestValidHash` makes
+/// 3 and 4 Invalid, and 2 must stay Optimistic. INVALID for 4 with `latestValidHash` 1 then sets
+/// `invalidBlock` to 2, the child of 1 in the chain of 4. The walk up must step over 3, which is
+/// Invalid already, and 2 must become Invalid.
+#[test]
+fn a_later_boundary_steps_over_an_ancestor_that_is_invalid_already() {
+    let mut statuses = ExecutionStatuses::new();
+    chain(
+        &mut statuses,
+        &[(1, 0, VALID), (2, 1, OPT), (3, 2, OPT), (4, 3, OPT)],
+    );
+    statuses.record(hash(3), hash(2), &invalid(None));
+    assert_eq!(
+        statuses_of(&statuses, [1, 2, 3, 4]),
+        [Some(Valid), Some(Optimistic), Some(Invalid), Some(Invalid)],
+        "2 must stay Optimistic"
+    );
+    statuses.record(hash(4), hash(3), &invalid(Some(hash(1))));
+    assert_eq!(
+        statuses_of(&statuses, [1, 2, 3, 4]),
+        [Some(Valid), Some(Invalid), Some(Invalid), Some(Invalid)],
+        "2 must be Invalid"
+    );
+    assert!(!statuses.el_contradiction());
+}
+
+/// The same boundary as above, but 3 and 4 have lost their full entries to newer Invalid
+/// payloads. INVALID for 5 on 4 with `latestValidHash` 1 must step over 4 and 3, and 2 must become
+/// Invalid.
+#[test]
+fn a_boundary_steps_over_evicted_invalid_ancestors() {
+    let mut statuses = ExecutionStatuses::new();
+    chain(
+        &mut statuses,
+        &[(1, 0, VALID), (2, 1, OPT), (3, 2, OPT), (4, 3, OPT)],
+    );
+    statuses.record(hash(3), hash(2), &invalid(None));
+    for i in 0..u32::try_from(MAX_INVALID_PAYLOADS).unwrap() {
+        statuses.record(wide(i), hash(0xfe), &invalid(None));
+    }
+    assert_eq!(
+        statuses.len(),
+        MAX_INVALID_PAYLOADS + 2,
+        "3 and 4 are evicted"
+    );
+    assert_eq!(
+        statuses.record(hash(5), hash(4), &invalid(Some(hash(1)))),
+        Some(Invalid)
+    );
+    assert_eq!(
+        statuses_of(&statuses, [1, 2, 3, 4, 5]),
+        [
+            Some(Valid),
+            Some(Invalid),
+            Some(Invalid),
+            Some(Invalid),
+            Some(Invalid)
+        ],
+        "2 must be Invalid"
+    );
+}
+
+/// 2 is Invalid, and it loses its full entry to `MAX_INVALID_PAYLOADS` newer Invalid payloads. It
+/// must stay Invalid until finality prunes it. A later SYNCING, ACCEPTED or VALID for it must not
+/// change that, and the gate must refuse it and a payload on it. A new payload on it must be
+/// Invalid. Finality at 3, beside 2, makes 2 a dead fork, and then the table must drop 2 and the
+/// payload on it.
+#[test]
+fn an_evicted_invalid_payload_stays_invalid_until_finality_prunes_it() {
+    let mut statuses = ExecutionStatuses::new();
+    chain(
+        &mut statuses,
+        &[
+            (1, 0, VALID),
+            (2, 1, OPT),
+            (3, 1, OPT),
+            (2, 1, invalid(None)),
+        ],
+    );
+    for i in 0..u32::try_from(MAX_INVALID_PAYLOADS).unwrap() {
+        statuses.record(wide(i), hash(0xfe), &invalid(None));
+    }
+    assert_eq!(statuses.len(), MAX_INVALID_PAYLOADS + 2, "2 is evicted");
+    assert_eq!(statuses.status(&hash(2)), Some(Invalid));
+    for status in [
+        ValidationStatus::Syncing,
+        ValidationStatus::Accepted,
+        ValidationStatus::Valid,
+    ] {
+        let verdict = reply(status, Some(hash(2)), hash(2));
+        assert_eq!(
+            statuses.record(hash(2), hash(1), &verdict),
+            Some(Invalid),
+            "{status:?} must leave 2 Invalid"
+        );
+        assert!(!statuses.permits_payload_import(&hash(2), &hash(1), &verdict));
+        assert!(!statuses.permits_payload_import(&hash(4), &hash(2), &verdict));
+    }
+    assert_eq!(statuses.record(hash(4), hash(2), &OPT), Some(Invalid));
+
+    statuses.prune_finalized(&hash(3));
+    assert_eq!(statuses_of(&statuses, [1, 2, 3, 4]), [None; 4]);
+}
+
+/// consensus-specs v1.7.0-beta.4, `specs/bellatrix/optimistic-sync.md`. "How to optimistically
+/// import blocks": a payload moves only from `NOT_VALIDATED` to `VALID` or to `INVALIDATED`.
+/// "Transitioning from VALID -> INVALIDATED or INVALIDATED -> VALID": the specification omits
+/// these two transitions, because only a faulty execution engine can cause them, and they need
+/// manual intervention.
+///
+/// 1, 2 and 3 are Valid. INVALID for 1 must not change them, and the table must report the EL
+/// contradiction. 4 on 3 is Optimistic and descends from 1, so it moves to Invalid.
+#[test]
+fn invalid_never_changes_a_valid_payload_and_reports_the_contradiction() {
+    let mut statuses = ExecutionStatuses::new();
+    chain(
+        &mut statuses,
+        &[(1, 0, VALID), (2, 1, VALID), (3, 2, VALID), (4, 3, OPT)],
+    );
+    assert!(!statuses.el_contradiction());
+    assert_eq!(
+        statuses.record(hash(1), hash(0), &invalid(None)),
+        Some(Valid)
+    );
+    assert_eq!(
+        statuses_of(&statuses, [1, 2, 3, 4]),
+        [Some(Valid), Some(Valid), Some(Valid), Some(Invalid)],
+        "1, 2 and 3 must stay Valid"
+    );
+    assert!(statuses.el_contradiction());
+}
+
+/// The same rules for an INVALID that reaches a Valid payload from above. 13 and 15 on 12 come
+/// before 12, and VALID for 15 makes 13 Valid. INVALID for 12 must not change 13 or 15, and the
+/// table must report the EL contradiction. 14 on 13 is Optimistic, so it moves to Invalid.
+#[test]
+fn invalid_for_a_late_parent_never_changes_a_valid_child() {
+    let mut statuses = ExecutionStatuses::new();
+    chain(
+        &mut statuses,
+        &[(13, 12, OPT), (14, 13, OPT), (15, 13, VALID)],
+    );
+    assert!(!statuses.el_contradiction());
+    statuses.record(hash(12), hash(11), &invalid(None));
+    assert_eq!(
+        statuses_of(&statuses, [12, 13, 14, 15]),
+        [Some(Invalid), Some(Valid), Some(Invalid), Some(Valid)],
+        "13 and 15 must stay Valid"
+    );
+    assert!(statuses.el_contradiction());
+}
+
+/// The same rules for a `latestValidHash` boundary above a Valid payload. 11, 12 and 13 are Valid,
+/// and 14 on 13 is Optimistic. INVALID for 14 with `latestValidHash` 11 sets `invalidBlock` to 12.
+/// 12 and 13 must stay Valid, 14 is Invalid, and the table must report the EL contradiction.
+#[test]
+fn a_boundary_above_a_valid_payload_never_changes_it() {
+    let mut statuses = ExecutionStatuses::new();
+    chain(
+        &mut statuses,
+        &[
+            (11, 10, VALID),
+            (12, 11, OPT),
+            (13, 12, VALID),
+            (14, 13, OPT),
+        ],
+    );
+    assert!(!statuses.el_contradiction());
+    statuses.record(hash(14), hash(13), &invalid(Some(hash(11))));
+    assert_eq!(
+        statuses_of(&statuses, [11, 12, 13, 14]),
+        [Some(Valid), Some(Valid), Some(Valid), Some(Invalid)],
+        "11, 12 and 13 must stay Valid"
+    );
+    assert!(statuses.el_contradiction());
+}
+
+/// The same rules for VALID (see above). 2 is Invalid. VALID for 3 on 2 must not make 3 Valid: 3
+/// is new on an Invalid parent, so it is Invalid. 2 must stay Invalid, the gate must refuse 3 on
+/// 2, and the table must report the EL contradiction. VALID for an Invalid payload itself must
+/// not change it or its Optimistic parent, and the table must report it too.
+#[test]
+fn valid_never_changes_an_invalid_payload_and_reports_the_contradiction() {
+    let mut statuses = ExecutionStatuses::new();
+    chain(
+        &mut statuses,
+        &[(1, 0, VALID), (2, 1, OPT), (2, 1, invalid(None))],
+    );
+    assert!(!statuses.el_contradiction());
+    assert_eq!(
+        statuses.record(hash(3), hash(2), &VALID),
+        Some(Invalid),
+        "3 must not become Valid"
+    );
+    assert_eq!(
+        statuses_of(&statuses, [1, 2, 3]),
+        [Some(Valid), Some(Invalid), Some(Invalid)],
+        "2 must stay Invalid"
+    );
+    assert!(!statuses.permits_payload_import(&hash(3), &hash(2), &VALID));
+    assert!(statuses.el_contradiction());
+
+    let mut statuses = ExecutionStatuses::new();
+    chain(&mut statuses, &[(1, 0, OPT), (2, 1, invalid(None))]);
+    assert!(!statuses.el_contradiction());
+    assert_eq!(statuses.record(hash(2), hash(1), &VALID), Some(Invalid));
+    assert_eq!(
+        statuses_of(&statuses, [1, 2]),
+        [Some(Optimistic), Some(Invalid)]
+    );
+    assert!(statuses.el_contradiction());
+}
+
+/// 1 and 2 are Valid, 9 on 1 is Optimistic, and 3 on 2 is Optimistic. Finality at 1 prunes 1.
+/// Finality at 2 then makes 9 a dead fork: 9 descends from 1 but not from 2. The table must drop
+/// 9, although its parent 1 has no entry any more. 3 must stay.
+#[test]
+fn a_later_finality_prunes_a_fork_off_the_previous_finalized_payload() {
+    let mut statuses = ExecutionStatuses::new();
+    chain(
+        &mut statuses,
+        &[(1, 0, VALID), (2, 1, VALID), (9, 1, OPT), (3, 2, OPT)],
+    );
+    assert_eq!(statuses.prune_finalized(&hash(1)), 1);
+    assert_eq!(
+        statuses_of(&statuses, [2, 3, 9]),
+        [Some(Valid), Some(Optimistic), Some(Optimistic)]
+    );
+    assert_eq!(statuses.prune_finalized(&hash(2)), 2, "2 and 9");
+    assert_eq!(
+        statuses_of(&statuses, [2, 3, 9]),
+        [None, Some(Optimistic), None],
+        "9 must have no status"
+    );
 }

@@ -404,17 +404,19 @@ async fn status_table() {
         validation_error: None,
     };
     let invalid = |latest_valid_hash| ElVerdict::Invalid { latest_valid_hash };
+    let bad_block_hash = ElVerdict::NotVerified(Reason::InvalidBlockHash);
     // Every row is a reply for the payload `hash(1)`.
     let block_hash = hash(1);
     let rows = [
         (v1(ValidationStatus::Valid, Some(hash(1))), ElVerdict::Valid),
         (v1(ValidationStatus::Invalid, Some(lvh)), invalid(Some(lvh))),
         (v1(ValidationStatus::Invalid, None), invalid(None)),
+        // INVALID_BLOCK_HASH gives no verdict, and its `latestValidHash` must not count.
         (
             v1(ValidationStatus::InvalidBlockHash, Some(lvh)),
-            invalid(Some(lvh)),
+            bad_block_hash,
         ),
-        (v1(ValidationStatus::InvalidBlockHash, None), invalid(None)),
+        (v1(ValidationStatus::InvalidBlockHash, None), bad_block_hash),
         (v1(ValidationStatus::Syncing, None), ElVerdict::Optimistic),
         (v1(ValidationStatus::Accepted, None), ElVerdict::Optimistic),
     ];
@@ -470,11 +472,8 @@ async fn status_table() {
         (status(Kind::Valid, Some(hash(1))), ElVerdict::Valid),
         (status(Kind::Invalid, Some(lvh)), invalid(Some(lvh))),
         (status(Kind::Invalid, None), invalid(None)),
-        (
-            status(Kind::InvalidBlockHash, Some(lvh)),
-            invalid(Some(lvh)),
-        ),
-        (status(Kind::InvalidBlockHash, None), invalid(None)),
+        (status(Kind::InvalidBlockHash, Some(lvh)), bad_block_hash),
+        (status(Kind::InvalidBlockHash, None), bad_block_hash),
         (status(Kind::Syncing, None), ElVerdict::Optimistic),
         (status(Kind::Accepted, None), ElVerdict::Optimistic),
         (
