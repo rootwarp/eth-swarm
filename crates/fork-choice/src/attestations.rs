@@ -144,8 +144,8 @@ fn validate_target_epoch_against_current_time<E: Preset>(
 /// of the anchor, and the spec fails on it too. After the store forgets the dropped blocks of a
 /// prune (`store::release_dropped`), it can also be the parent of a block that the store
 /// keeps. The spec walks on there, so it can take a vote from a block that is refused here. A
-/// vote from the wire then has a target epoch after the prune, and its walk does not reach a
-/// forgotten block.
+/// vote from the wire then has a target epoch of `p + 2` or later for a prune in epoch `p`, and
+/// its walk does not reach a forgotten block.
 fn validate_on_attestation<E: Preset>(
     store: &Store<E>,
     attestation: &Attestation<E>,

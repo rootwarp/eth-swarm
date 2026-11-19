@@ -41,8 +41,8 @@ pub trait StateProvider<E: Preset> {
 /// `on_tick` (P0 L946-954): one `on_tick_per_slot` for each slot start up to `time_ms`, then
 /// one at `time_ms`. A time before genesis fails and leaves the store as it was.
 ///
-/// Then the store forgets the blocks that a prune dropped in the epoch before the previous
-/// epoch or earlier (`store::release_dropped`). If the finalized checkpoint moved since the
+/// Then the store forgets the blocks that a prune dropped three or more epochs before the
+/// current epoch (`store::release_dropped`). If the finalized checkpoint moved since the
 /// last prune, it drops the blocks that do not descend from the finalized block
 /// (`store::prune`), and keeps what `on_attestation` reads of them. This is not in the spec.
 /// It does not change the result of `on_block` or of `get_head`, and `on_attestation` gives

@@ -16,12 +16,14 @@
 //!
 //! The spec's store keeps every block. Here [`on_tick`] still drops the blocks that do not
 //! descend from the finalized checkpoint block once finality moves, from the kept set that
-//! [`on_block`], [`get_head`] and [`get_weight`] read. The store keeps what [`on_attestation`]
-//! reads of the dropped blocks until the end of the epoch after the prune, so for a vote that
-//! arrives in that window [`on_attestation`] and then [`get_head`] give the result of the spec.
-//! After that window [`on_attestation`] refuses a vote that names a forgotten block, where the
-//! spec would still accept a valid one. A refused vote leaves the older latest messages of its
-//! attesters in place, where the spec replaces them, so [`get_head`] can differ from the spec.
+//! [`on_block`], [`get_head`] and [`get_weight`] read. After a prune in epoch `p`, the store
+//! keeps what [`on_attestation`] reads of the dropped blocks through the end of epoch `p + 2`.
+//! That window has every target epoch up to `p + 1`, for a vote from the wire and for a vote
+//! from a block, and for a vote that arrives in it [`on_attestation`] and then [`get_head`]
+//! give the result of the spec. After that window [`on_attestation`] refuses a vote that names
+//! a forgotten block, where the spec would still accept a valid one. A refused vote leaves the
+//! older latest messages of its attesters in place, where the spec replaces them, so
+//! [`get_head`] can differ from the spec.
 //!
 //! The spec signals an invalid call with a failed `assert` or a missing key. Here each public
 //! handler returns an [`Error`] instead, and a failed handler leaves the store as it was.

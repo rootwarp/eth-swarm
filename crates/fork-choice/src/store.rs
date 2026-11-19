@@ -69,8 +69,9 @@ pub(crate) const PTC_TIMELINESS_INDEX: usize = 1;
 /// `on_attestation` reads of each: the slot, the parent root and the post-state. The spec's
 /// store keeps every block, and a valid attestation can name a dropped block. Head selection
 /// does not read `dropped`, so a message for a dropped block supports no node. `payloads` keeps
-/// the roots of the dropped blocks too, for `is_payload_verified`. The store forgets a dropped
-/// block at the end of the epoch after the prune (`release_dropped`).
+/// the roots of the dropped blocks too, for `is_payload_verified`. A prune in epoch `p` keeps a
+/// dropped block through the end of epoch `p + 2`, and the first tick of epoch `p + 3` forgets
+/// it (`release_dropped`).
 ///
 /// `children` and `ptc_timely_proposals` are not spec fields. They are indexes of `blocks`,
 /// so that head selection reads the blocks that it needs and does not scan every block for
@@ -122,7 +123,7 @@ pub(crate) struct DroppedBlock<E: Preset> {
     pub(crate) parent_root: Root,
     /// `store.block_states[root]`.
     pub(crate) state: BeaconState<E>,
-    /// The last epoch in which the store keeps the block: the epoch after the prune.
+    /// The last epoch in which the store keeps the block: the second epoch after the prune.
     pub(crate) last_epoch: Epoch,
 }
 
@@ -519,7 +520,7 @@ pub(crate) fn prune<E: Preset>(store: &mut Store<E>) {
     {
         return;
     }
-    let last_epoch = get_current_store_epoch(store).saturating_add(1);
+    let last_epoch = get_current_store_epoch(store).saturating_add(2);
     let drop: Vec<Root> = store
         .blocks
         .keys()
@@ -563,26 +564,33 @@ pub(crate) fn prune<E: Preset>(store: &mut Store<E>) {
     store.anchor_root = finalized.root;
 }
 
-/// Not a spec function: forgets the blocks that a prune dropped, at the end of the epoch after
-/// the prune. `on_tick` calls it.
+/// Not a spec function: forgets the blocks that a prune dropped, after the end of the second
+/// epoch after the prune. `on_tick` calls it.
 ///
-/// An attestation from the wire must have the target epoch of the current or the previous
-/// epoch (`validate_target_epoch_against_current_time`). So a vote with the target epoch of the
-/// prune, or of an earlier epoch, can arrive until the end of the next epoch. Until then the
-/// store keeps the dropped blocks with their states, the roots of their verified payloads and
-/// the checkpoint states that `on_attestation` stores for them. Then it forgets them, and
-/// `on_attestation` refuses a vote that names one of them, as a block that the store does not
-/// have.
+/// A prune in epoch `p` keeps each dropped block with `last_epoch = p + 2`, so the first tick of
+/// epoch `p + 3` forgets it. An attestation from the wire must have the target epoch of the
+/// current or the previous epoch (`validate_target_epoch_against_current_time`), but that check
+/// does not limit the age of the target block. In epoch `p + 2` a vote from the wire can have
+/// the target epoch `p + 1` and name a dropped block `X` of a slot at or before the first slot
+/// of `p + 1`. Then `X` is its own checkpoint block in `p + 1`, so the target root is `X` too.
+/// So through the end of epoch `p + 2` the store keeps the dropped blocks with their states,
+/// the roots of their verified payloads and the checkpoint states that `on_attestation` stores
+/// for them. In that window `on_attestation` has every target of an epoch up to `p + 1`, for a
+/// vote from the wire and for a vote from a block. Then the store forgets the dropped blocks,
+/// and `on_attestation` refuses a vote that names one of them, as a block that the store does
+/// not have.
 ///
 /// This is a deliberate deviation from the spec: the store does not keep the dropped blocks
 /// and their states forever. The spec's store keeps every block and takes such a vote if it
-/// is valid, also with a later target epoch. In an epoch `e` after the window, a vote for a
-/// forgotten block `X` with the target `(e, X)` passes every assert of the spec, because `X`
-/// is its own checkpoint block in `e`. Gossip ignores that vote, because `X` does not descend
-/// from the finalized block, but `process_attestation` does not, so a block can include it.
-/// The spec then replaces the older latest message of each attester, and so takes the weight
-/// of that attester off the kept blocks. Here the refused vote, also a vote from a block, leaves
-/// the older message in place, and its weight stays. So `get_head` can differ from the spec.
+/// is valid. In an epoch `e >= p + 3`, after the window, a vote for a forgotten block `X` with
+/// the target `(e, X)` passes every assert of the spec, because `X` is its own checkpoint block
+/// in `e`. A vote from a block can also name `X` with an earlier target epoch, for example
+/// `p + 1` in a block that the store gets after the window. Gossip ignores such a vote, because
+/// `X` does not descend from the finalized block, but `process_attestation` does not, so a
+/// block can include it. The spec then replaces the older latest message of each attester,
+/// and so takes the weight of that attester off the kept blocks. Here the refused vote, also a
+/// vote from a block, leaves the older message in place, and its weight stays. So `get_head`
+/// can differ from the spec.
 pub(crate) fn release_dropped<E: Preset>(store: &mut Store<E>) {
     let epoch = get_current_store_epoch(store);
     let released: HashSet<Root> = store
