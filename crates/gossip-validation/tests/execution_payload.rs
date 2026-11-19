@@ -2,10 +2,13 @@
 //! fork-choice store that the tests build, and `Seen::resolve` after the signature check.
 //!
 //! The test provider does not run the state transition. The post-state of a block is the parent
-//! state at the slot of the block, with the header of the block. The gossip checks read only the
-//! block, its bid, and the builders, the proposer and the fork of that state.
+//! state at the slot of the block, with the header and the bid of the block. The gossip checks
+//! read only the block, its bid, and the builders, the proposer and the fork of that state.
+//! `on_execution_payload_envelope` of fork choice reads the header and the bid of the
+//! post-state, so a test can run both on the same store.
 //!
-//! This crate links no BLS library. A test gives the BLS verdict of a pending set itself.
+//! This crate links no BLS library. A test gives the BLS verdict of a pending set itself, and
+//! the hooks of fork choice give theirs.
 
 use consensus_types::gloas::{
     BeaconBlock, BeaconBlockHeader, BeaconState, Checkpoint, ConsolidationRequest,
@@ -17,7 +20,11 @@ use consensus_types::signing::{
     compute_signing_root, SignatureSet, SignerRef, BUILDER_INDEX_SELF_BUILD, DOMAIN_BEACON_BUILDER,
 };
 use consensus_types::{EthSpec, Mainnet, Minimal};
-use fork_choice::{get_forkchoice_store, on_block, on_tick, StateProvider, Store};
+use fork_choice::{
+    get_forkchoice_store, is_payload_verified, on_block, on_execution_payload_envelope, on_tick,
+    DataAvailability, DataAvailabilityCheck, ExecutionEngine, NewPayloadRequestRef, PayloadImport,
+    SignatureVerifier, StateProvider, Store,
+};
 use gossip_validation::{
     validate_execution_payload_envelope_gossip, verify_execution_requests_limits,
     verify_withdrawals_limit, IgnoreReason, RejectReason, RequestCounts, RequestKind, Seen,
@@ -28,6 +35,7 @@ use ssz_types::FixedVector;
 use state_transition::accessors::{builder_key_version, get_domain};
 use state_transition::testing::{builder, empty_requests, genesis_state, signed_block};
 use state_transition::{state_root, BackendError, StfError};
+use std::cell::RefCell;
 use std::num::NonZeroU64;
 use tree_hash::TreeHash;
 
@@ -75,7 +83,8 @@ fn anchor(slot: Slot) -> (BeaconState<E>, BeaconBlock<E>) {
 }
 
 /// The test provider: the post-state is the parent state at the slot of the block, with the
-/// header of the block. `process_slots` only sets the slot.
+/// header and the bid of the block, as `process_block_header` and
+/// `process_execution_payload_bid` set them. `process_slots` only sets the slot.
 struct Provider;
 
 impl StateProvider<E> for Provider {
@@ -93,6 +102,8 @@ impl StateProvider<E> for Provider {
             state_root: Root::ZERO,
             body_root: block.body.tree_hash_root(),
         };
+        state.latest_execution_payload_bid =
+            block.body.signed_execution_payload_bid.message.clone();
         Ok(())
     }
 
@@ -179,6 +190,18 @@ fn chain_at(
     Chain { store, block, root }
 }
 
+/// Sets the state root of `block` to the root of its [`Provider`] post-state on its parent in
+/// `store`. Then the root of the latest block header of that post-state is the block root, as
+/// `verify_execution_payload_envelope` of fork choice checks.
+fn commit_state_root(store: &Store<E>, block: &mut SignedBeaconBlock<E>) {
+    let mut post = store
+        .block_state(block.message.parent_root)
+        .unwrap()
+        .clone();
+    Provider.state_transition(&mut post, block).unwrap();
+    block.message.state_root = state_root(&mut post).unwrap();
+}
+
 /// A store in which a prune dropped the block of `chain`, and the post-state of that block
 /// from before the prune.
 struct Dropped {
@@ -188,8 +211,9 @@ struct Dropped {
 
 /// The anchor at slot 0, `a` and `b` at slot 1 on it, the block at slot 9 on `b`, and `c` at
 /// slot 9 on `a`. The bid of the block is by `builder_index`, has the block hash `[0xbb; 32]`
-/// and commits to `requests`. The post-state of `c` justifies and finalizes epoch 1 (first
-/// slot 8) with `a`, and the tick after it, in slot 10, drops the anchor, `b` and the block.
+/// and commits to `requests`, and the block commits to its post-state. The post-state of `c`
+/// justifies and finalizes epoch 1 (first slot 8) with `a`, and the tick after it, in slot 10,
+/// drops the anchor, `b` and the block.
 ///
 /// The prune in epoch 1 keeps the dropped block and its post-state through the end of epoch 3
 /// (slot 31), but [`Store::block`] and [`Store::block_state`] no longer have them.
@@ -205,7 +229,8 @@ fn dropped(builder_index: BuilderIndex, requests: &ExecutionRequests<E>) -> Drop
         on_block(&mut store, &Provider, block).unwrap();
     }
     on_tick(&mut store, time_at(10)).unwrap();
-    let block = block_with_bid(b.message.tree_hash_root(), 9, builder_index, requests);
+    let mut block = block_with_bid(b.message.tree_hash_root(), 9, builder_index, requests);
+    commit_state_root(&store, &mut block);
     on_block(&mut store, &Provider, &block).unwrap();
     let root = block.message.tree_hash_root();
     let state = store.block_state(root).unwrap().clone();
@@ -451,6 +476,87 @@ fn an_envelope_for_a_dropped_block_must_ignore_once_the_store_forgets_it() {
         validate(&Seen::default(), &chain, &signed),
         Verdict::Ignore(IgnoreReason::UnknownBlock(chain.root))
     );
+}
+
+/// The hooks of `on_execution_payload_envelope`: a valid signature, available data and a VALID
+/// engine answer, and a record of each call.
+#[derive(Default)]
+struct Hooks {
+    sets: RefCell<Vec<SignatureSet>>,
+    availability_checks: RefCell<Vec<Root>>,
+    payload_block_hashes: RefCell<Vec<Root>>,
+}
+
+impl SignatureVerifier<E> for Hooks {
+    fn verify_signature_sets(
+        &self,
+        _: &BeaconState<E>,
+        sets: &[SignatureSet],
+    ) -> Result<bool, BackendError> {
+        self.sets.borrow_mut().extend_from_slice(sets);
+        Ok(true)
+    }
+}
+
+impl DataAvailabilityCheck for Hooks {
+    fn is_data_available(&self, beacon_block_root: Root) -> DataAvailability {
+        self.availability_checks
+            .borrow_mut()
+            .push(beacon_block_root);
+        DataAvailability::Available
+    }
+}
+
+impl ExecutionEngine<E> for Hooks {
+    fn verify_and_notify_new_payload(
+        &self,
+        request: &NewPayloadRequestRef<'_, E>,
+    ) -> PayloadImport {
+        self.payload_block_hashes
+            .borrow_mut()
+            .push(request.execution_payload.block_hash);
+        PayloadImport::Valid
+    }
+}
+
+/// [`envelope`] with no requests, and with the parent hash of `state` and the prev_randao of
+/// its bid: the gossip checks and `verify_execution_payload_envelope` of fork choice on
+/// `state`, the post-state of the block of `chain`, both accept it.
+fn envelope_on(chain: &Chain, state: &BeaconState<E>) -> SignedExecutionPayloadEnvelope<E> {
+    let mut signed = envelope(chain, empty_requests());
+    let payload = &mut signed.message.payload;
+    payload.parent_hash = state.latest_block_hash;
+    payload.prev_randao = state.latest_execution_payload_bid.prev_randao;
+    signed
+}
+
+#[test]
+fn gossip_and_fork_choice_must_both_accept_a_valid_envelope_for_a_retained_dropped_block() {
+    let Dropped { mut chain, state } = dropped(BUILDER, &empty_requests());
+    assert_not_live(&chain);
+    let signed = envelope_on(&chain, &state);
+
+    // Gossip: the checks before the signature pass, and the valid signature accepts.
+    let mut seen = Seen::default();
+    let (gossip_sets, gossip) = match validate(&seen, &chain, &signed) {
+        Verdict::Pending { bls_sets, seen_key } => (bls_sets, seen.resolve(seen_key, Ok(true))),
+        other => (vec![], other),
+    };
+    // Fork choice: the signature is valid, the data is available and the engine says VALID.
+    let hooks = Hooks::default();
+    let fork_choice = on_execution_payload_envelope(&mut chain.store, &hooks, &signed);
+
+    // Neither path may ignore the envelope as unknown while the other accepts it.
+    assert_eq!((gossip, fork_choice), (Verdict::Accept, Ok(())));
+    // Both check the same signature set, on the post-state of the dropped block.
+    assert_eq!(gossip_sets, vec![expected_set_on(&state, &signed)]);
+    assert_eq!(*hooks.sets.borrow(), gossip_sets);
+    assert_eq!(*hooks.availability_checks.borrow(), vec![chain.root]);
+    assert_eq!(*hooks.payload_block_hashes.borrow(), vec![block_hash()]);
+    assert!(seen.has_execution_payload_envelope(chain.root, BUILDER));
+    assert!(is_payload_verified(&chain.store, chain.root));
+    // The payload is verified, and the block stays out of the live tree.
+    assert_not_live(&chain);
 }
 
 /// A view of the store that has the blocks but no post-state: each block failed validation.
