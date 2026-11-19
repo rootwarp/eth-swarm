@@ -242,25 +242,14 @@ expires = "2026-11-30"
 # ---------------------------------------------------------------------------------------
 # Fork choice. crates/spec-tests/src/fork_choice.rs runs the Gloas handlers on_block,
 # get_head, get_parent_payload_status, filter_node_tree_variants, ex_ante, on_attestation,
-# reorg, withholding and should_apply_proposer_boost with tick, block, attestation and
-# attester_slashing steps and store checks (viable_for_head_roots_and_weights included), and
-# it fails closed on any other step or check. The entries below skip, by exact name, the
-# cases of those handlers that need an execution_payload step or payload vote checks (from
-# the consensus-specs v1.7.0-beta.4 pyspec sources). A new case of a run handler is not
-# skipped, so it runs and fails until it gets an entry or a handler. The other Gloas handlers
-# and every Fulu case are skipped whole, and heze cases fall to the heze entry.
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "*"
-runner  = "fork_choice"
-handler = "on_block"
-case    = "pyspec_tests/on_block_parent_full_accepts_verified_payload"
-reason  = "An execution_payload step makes the parent FULL before its child: on_execution_payload_envelope is not ported, and the runner fails an execution_payload step"
-owner   = "ian"
-issue   = "5.14a"
-expires = "2026-11-30"
+# reorg, withholding, should_apply_proposer_boost, on_execution_payload_envelope and
+# deposit_with_reorg with tick, block, attestation, attester_slashing and execution_payload
+# steps and store checks (viable_for_head_roots_and_weights included), and it fails closed on
+# any other step or check. The entries below skip, by exact name, the cases of those handlers
+# that need payload attestations from the wire or payload vote checks (from the
+# consensus-specs v1.7.0-beta.4 pyspec sources). A new case of a run handler is not skipped,
+# so it runs and fails until it gets an entry or a handler. The other Gloas handlers and every
+# Fulu case are skipped whole, and heze cases fall to the heze entry.
 
 [[skip]]
 source  = "consensus-specs"
@@ -269,7 +258,7 @@ preset  = "*"
 runner  = "fork_choice"
 handler = "get_head"
 case    = "pyspec_tests/get_head_full_payload_tiebreak"
-reason  = "An execution_payload step, a block with payload attestations and payload vote checks: on_execution_payload_envelope is not ported, and the runner fails an execution_payload step, and it has no payload vote check"
+reason  = "Payload vote checks after a block with payload attestations: the runner has no payload vote check"
 owner   = "ian"
 issue   = "5.14a"
 expires = "2026-11-30"
@@ -281,54 +270,7 @@ preset  = "*"
 runner  = "fork_choice"
 handler = "get_head"
 case    = "pyspec_tests/get_head_empty_payload_tiebreak"
-reason  = "An execution_payload step, a block with payload attestations and payload vote checks: on_execution_payload_envelope is not ported, and the runner fails an execution_payload step, and it has no payload vote check"
-owner   = "ian"
-issue   = "5.14a"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "*"
-runner  = "fork_choice"
-handler = "on_attestation"
-case    = "pyspec_tests/validate_on_attestation_same_slot_full_vote_rejected"
-reason  = "An execution_payload step makes the payload of the attested block verified before a FULL vote: on_execution_payload_envelope is not ported, and the runner fails an execution_payload step"
-owner   = "ian"
-issue   = "5.14a"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "*"
-runner  = "fork_choice"
-handler = "on_attestation"
-case    = "pyspec_tests/validate_on_attestation_later_slot_full_vote_valid"
-reason  = "An execution_payload step makes the payload of the attested block verified before a FULL vote: on_execution_payload_envelope is not ported, and the runner fails an execution_payload step"
-owner   = "ian"
-issue   = "5.14a"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "*"
-runner  = "fork_choice"
-handler = "on_attestation"
-case    = "pyspec_tests/validate_on_attestation_beacon_root_payload_check"
-reason  = "An execution_payload step makes the payload of the attested block verified before a FULL vote: on_execution_payload_envelope is not ported, and the runner fails an execution_payload step"
-owner   = "ian"
-issue   = "5.14a"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "minimal"
-runner  = "fork_choice"
-handler = "filter_node_tree_variants"
-reason  = "Each case has an execution_payload step after setup_finalized_store: on_execution_payload_envelope is not ported, and the runner fails an execution_payload step. The runner knows the handler and runs its cases when the envelope handler lands"
+reason  = "Payload vote checks after a block with payload attestations: the runner has no payload vote check"
 owner   = "ian"
 issue   = "5.14a"
 expires = "2026-11-30"
@@ -349,19 +291,8 @@ source  = "consensus-specs"
 fork    = "gloas"
 preset  = "*"
 runner  = "fork_choice"
-handler = "on_execution_payload_envelope"
-reason  = "Every case has an execution_payload step; on_execution_payload_envelope is not ported, and the runner does not run the handler"
-owner   = "ian"
-issue   = "5.14a"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "*"
-runner  = "fork_choice"
 handler = "payload_timeliness"
-reason  = "An execution_payload step, blocks with payload attestations and payload vote checks; on_execution_payload_envelope is not ported, and the runner does not run the handler"
+reason  = "Payload vote checks after blocks with payload attestations: the runner has no payload vote check and does not run the handler"
 owner   = "ian"
 issue   = "5.14a"
 expires = "2026-11-30"
@@ -372,18 +303,7 @@ fork    = "gloas"
 preset  = "*"
 runner  = "fork_choice"
 handler = "payload_data_availability"
-reason  = "An execution_payload step, blocks with payload attestations and payload vote checks; on_execution_payload_envelope is not ported, and the runner does not run the handler"
-owner   = "ian"
-issue   = "5.14a"
-expires = "2026-11-30"
-
-[[skip]]
-source  = "consensus-specs"
-fork    = "gloas"
-preset  = "minimal"
-runner  = "fork_choice"
-handler = "deposit_with_reorg"
-reason  = "An execution_payload step and a child of the FULL parent with parent execution requests: on_execution_payload_envelope is not ported, and the runner does not run the handler"
+reason  = "Payload vote checks after blocks with payload attestations: the runner has no payload vote check and does not run the handler"
 owner   = "ian"
 issue   = "5.14a"
 expires = "2026-11-30"
