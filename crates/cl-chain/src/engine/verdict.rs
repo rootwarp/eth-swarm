@@ -373,6 +373,11 @@ impl ExecutionStatuses {
     /// of `finalized` and the payloads whose ancestry is not recorded. An evicted `Invalid`
     /// payload counts as recorded. Returns how many payloads it dropped: none if `finalized` is
     /// not recorded.
+    ///
+    /// The walk up ends at a parent hash with no entry, usually the payload an earlier prune
+    /// finalized. That payload is an ancestor of `finalized` too, and `children` keeps its
+    /// children after its entry is gone, so it anchors the forks off it: none of them leaks
+    /// past a later finality.
     pub fn prune_finalized(&mut self, finalized: &Hash32) -> usize {
         let mut seen = HashSet::new();
         let mut doomed = Vec::new();
@@ -384,10 +389,15 @@ impl ExecutionStatuses {
             doomed.push(at);
             at = parent;
         }
-        // The forks off the ancestors; the chain itself is already in `seen`.
+        if doomed.is_empty() {
+            // Nothing tells which children of `finalized` it is not an ancestor of.
+            return 0;
+        }
+        // The forks off the ancestors and off `at`; the chain itself is already in `seen`.
         let mut forks: VecDeque<Hash32> = doomed
             .iter()
             .skip(1)
+            .chain([&at])
             .filter_map(|ancestor| self.children.get(ancestor))
             .flatten()
             .copied()
