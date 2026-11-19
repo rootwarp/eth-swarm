@@ -9,10 +9,11 @@
 
 use consensus_types::common::AttestationData;
 use consensus_types::gloas::{
-    Attestation, AttesterSlashing, BeaconBlock, BeaconState, Checkpoint, IndexedAttestation,
-    PayloadAttestation, PayloadAttestationData, SignedBeaconBlock,
+    Attestation, AttesterSlashing, BeaconBlock, BeaconState, Checkpoint, ExecutionPayload,
+    ExecutionPayloadEnvelope, IndexedAttestation, PayloadAttestation, PayloadAttestationData,
+    SignedBeaconBlock, SignedExecutionPayloadEnvelope,
 };
-use consensus_types::primitives::{Gwei, Root, Slot, ValidatorIndex};
+use consensus_types::primitives::{Gwei, Root, Slot, ValidatorIndex, U256};
 use consensus_types::Minimal;
 use spec_tests::coverage::Reads;
 use spec_tests::fork_choice::{handler_runs, run, supported, NOT_RUN, RUNNABLE};
@@ -23,8 +24,8 @@ use state_transition::caches::CommitteeCache;
 use state_transition::per_slot::process_slots;
 use state_transition::preset::BUILDER_INDEX_SELF_BUILD;
 use state_transition::testing::{
-    bid_for_state, block_at_state_slot, bls_context, genesis_state, no_bls, signed_block,
-    ContractBackend,
+    bid_for_state, block_at_state_slot, bls_context, empty_requests, genesis_state, no_bls,
+    signed_block, ContractBackend,
 };
 use state_transition::{state_root, state_transition};
 use tempfile::TempDir;
@@ -61,6 +62,62 @@ fn block_on(state: &BeaconState<E>, slot: Slot) -> SignedBeaconBlock<E> {
     state_transition(&mut post, &block, false, &bls_context(&backend)).unwrap();
     block.message.state_root = state_root(&mut post).unwrap();
     block
+}
+
+/// A block at `slot` on the block of `state`, as [`block_on`] makes it, whose bid commits to
+/// no execution requests, and its post-state.
+fn block_and_post(state: &BeaconState<E>, slot: Slot) -> (SignedBeaconBlock<E>, BeaconState<E>) {
+    let mut at_slot = state.clone();
+    process_slots(&mut at_slot, slot, &no_bls()).unwrap();
+    let mut block = block_at_state_slot(&at_slot);
+    let mut bid = bid_for_state(&at_slot, BUILDER_INDEX_SELF_BUILD, 0);
+    bid.message.execution_requests_root = empty_requests::<E>().tree_hash_root();
+    block.message.body.signed_execution_payload_bid = bid;
+    let mut post = state.clone();
+    let backend = ContractBackend::new([]);
+    state_transition(&mut post, &block, false, &bls_context(&backend)).unwrap();
+    block.message.state_root = state_root(&mut post).unwrap();
+    (block, post)
+}
+
+/// The envelope of `block` that `verify_execution_payload_envelope` accepts on `post`, the
+/// post-state of the block. Its signature is not valid, so the cases turn BLS off.
+fn envelope_of(
+    block: &SignedBeaconBlock<E>,
+    post: &BeaconState<E>,
+) -> SignedExecutionPayloadEnvelope<E> {
+    let bid = &block.message.body.signed_execution_payload_bid.message;
+    let withdrawals: Vec<_> = post.payload_expected_withdrawals.iter().cloned().collect();
+    SignedExecutionPayloadEnvelope {
+        message: ExecutionPayloadEnvelope {
+            payload: ExecutionPayload {
+                parent_hash: post.latest_block_hash,
+                fee_recipient: bid.fee_recipient,
+                state_root: Root::repeat_byte(0x02),
+                receipts_root: Root::repeat_byte(0x03),
+                logs_bloom: Default::default(),
+                prev_randao: bid.prev_randao,
+                block_number: 1,
+                gas_limit: bid.gas_limit,
+                gas_used: 0,
+                timestamp: time_at(post.slot),
+                extra_data: Default::default(),
+                base_fee_per_gas: U256::from(7),
+                block_hash: bid.block_hash,
+                transactions: Default::default(),
+                withdrawals: withdrawals.try_into().unwrap(),
+                blob_gas_used: 0,
+                excess_blob_gas: 0,
+                block_access_list: Default::default(),
+                slot_number: post.slot,
+            },
+            execution_requests: empty_requests(),
+            builder_index: bid.builder_index,
+            beacon_block_root: block.message.tree_hash_root(),
+            parent_beacon_block_root: block.message.parent_root,
+        },
+        signature: [0x11; 96],
+    }
 }
 
 fn hex_root(root: Root) -> String {
@@ -195,6 +252,8 @@ fn runner_takes_the_gloas_handlers_of_its_steps() {
             "reorg",
             "withholding",
             "should_apply_proposer_boost",
+            "on_execution_payload_envelope",
+            "deposit_with_reorg",
         ]
         .as_slice()
     );
@@ -206,14 +265,12 @@ fn runner_takes_the_gloas_handlers_of_its_steps() {
         assert!(!supported("heze", "minimal", handler));
         assert!(!supported("gloas", "general", handler));
     }
-    // Each case of these handlers has an execution_payload or a payload_attestation_message
-    // step, or payload vote checks.
+    // Each case of these handlers has a payload_attestation_message step or payload vote
+    // checks.
     assert_eq!(
         NOT_RUN.as_slice(),
         [
-            "on_execution_payload_envelope",
             "on_payload_attestation_message",
-            "deposit_with_reorg",
             "payload_timeliness",
             "payload_data_availability",
         ]
@@ -406,8 +463,8 @@ fn steps_and_checks_that_the_runner_does_not_have_fail_closed() {
             "extra",
         ),
         (
-            "- execution_payload: execution_payload_envelope_0x00\n  valid: true\n".to_owned(),
-            "execution_payload",
+            "- execution_payload: execution_payload_envelope_0x00\n  extra: 1\n".to_owned(),
+            "extra",
         ),
         (
             "- payload_attestation_message: payload_attestation_message_0x00\n".to_owned(),
@@ -890,6 +947,79 @@ fn viable_for_head_roots_and_weights_must_match_the_leaves() {
                 assert!(!ok, "{steps}: {err}");
                 assert!(err.contains("viable_for_head_roots_and_weights"), "{err}");
             }
+        }
+    }
+}
+
+#[test]
+fn an_execution_payload_step_verifies_the_payload_of_its_block() {
+    let (state, anchor_block) = anchor();
+    let anchor = anchor_block.tree_hash_root();
+    let (block, post) = block_and_post(&state, 1);
+    let root = block.message.tree_hash_root();
+    let envelope = envelope_of(&block, &post);
+    assert_eq!(envelope.message.builder_index, BUILDER_INDEX_SELF_BUILD);
+    let head = |payload_status: u8| {
+        format!(
+            "- checks:\n    head: {{slot: 1, root: {}, payload_status: {payload_status}}}\n",
+            hex_root(root)
+        )
+    };
+    for (valid, outcome) in [("true", None), ("false", Some("accepted"))] {
+        let mut case = CaseDir::new(BLS_OFF);
+        case.block(&block);
+        let name = case.object("execution_payload_envelope", &envelope);
+        // Before the envelope only the EMPTY node of the block exists. After it, the FULL node
+        // wins the tie at the slot of the block.
+        let steps = format!("- tick: {}\n- block: {}\n", time_at(1), block_name(&block))
+            + &head(0)
+            + &format!("- execution_payload: {name}\n  valid: {valid}\n")
+            + &head(1)
+            + &checks(time_at(1), anchor, root, 1, root)
+                .replace("payload_status: 0", "payload_status: 1");
+        case.steps(&steps);
+        match (case.run_as("on_execution_payload_envelope"), outcome) {
+            (Ok(()), None) => {}
+            (Err(err), Some(needle)) => assert!(err.contains(needle), "{needle}: {err}"),
+            (got, want) => panic!("valid: {valid}: got {got:?}, want {want:?}"),
+        }
+    }
+}
+
+#[test]
+fn an_execution_payload_step_must_have_the_verdict_of_the_vector() {
+    let (state, _) = anchor();
+    let (block, post) = block_and_post(&state, 1);
+    let root = block.message.tree_hash_root();
+    let mut wrong_slot = envelope_of(&block, &post);
+    wrong_slot.message.payload.slot_number = 2;
+    let mut unknown_block = envelope_of(&block, &post);
+    unknown_block.message.beacon_block_root = Root::repeat_byte(0x42);
+    for (envelope, valid, outcome) in [
+        // An invalid envelope that the vector expects to fail passes, and the payload of the
+        // block stays unverified: the head stays on the EMPTY node.
+        (&wrong_slot, "false", None),
+        (&unknown_block, "false", None),
+        // An invalid envelope marked valid fails.
+        (&wrong_slot, "true", Some("refused a valid step")),
+        (&unknown_block, "true", Some("refused a valid step")),
+    ] {
+        let mut case = CaseDir::new(BLS_OFF);
+        case.block(&block);
+        let name = case.object("execution_payload_envelope", envelope);
+        let steps = format!(
+            "- tick: {}\n- block: {}\n- execution_payload: {name}\n  valid: {valid}\n",
+            time_at(1),
+            block_name(&block)
+        ) + &format!(
+            "- checks:\n    head: {{slot: 1, root: {}, payload_status: 0}}\n",
+            hex_root(root)
+        );
+        case.steps(&steps);
+        match (case.run_as("on_execution_payload_envelope"), outcome) {
+            (Ok(()), None) => {}
+            (Err(err), Some(needle)) => assert!(err.contains(needle), "{needle}: {err}"),
+            (got, want) => panic!("valid: {valid}: got {got:?}, want {want:?}"),
         }
     }
 }
