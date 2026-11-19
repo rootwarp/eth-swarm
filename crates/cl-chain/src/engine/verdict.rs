@@ -3,10 +3,11 @@
 //!
 //! - **The map** ([`map`], execution-apis `paris.md` L99-118): `VALID` is [`ElVerdict::Valid`]
 //!   only if its `latestValidHash` is the submitted payload's `block_hash` (`paris.md`, payload
-//!   validation, rule 3), else [`Reason::Malformed`]; `INVALID` and `INVALID_BLOCK_HASH` are
-//!   [`ElVerdict::Invalid`] with `latestValidHash` as given, `null` included; `SYNCING` and
-//!   `ACCEPTED` are [`ElVerdict::Optimistic`]. It reads one reply: two contradicting replies for
-//!   one payload are the caller's to reconcile.
+//!   validation, rule 3), else [`Reason::Malformed`]; `INVALID` is [`ElVerdict::Invalid`] with
+//!   `latestValidHash` as given, `null` included; `INVALID_BLOCK_HASH` is
+//!   [`Reason::InvalidBlockHash`], whatever its `latestValidHash`; `SYNCING` and `ACCEPTED` are
+//!   [`ElVerdict::Optimistic`]. It reads one reply: two contradicting replies for one payload are
+//!   the caller's to reconcile.
 //! - **Fail closed.** A status this client cannot name, a reply that breaks the contract, an
 //!   error from cl-engine, a failed call and a timeout are [`ElVerdict::NotVerified`], never
 //!   `Valid`: [`map_json`] for the Engine API JSON, [`map_proto`] for engine.v1, where
@@ -29,7 +30,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 pub enum ElVerdict {
     /// `VALID`.
     Valid,
-    /// `INVALID` or `INVALID_BLOCK_HASH`, with `latestValidHash` as the EL gave it.
+    /// `INVALID`, with `latestValidHash` as the EL gave it. `INVALID_BLOCK_HASH` is not this:
+    /// see [`Reason::InvalidBlockHash`].
     Invalid {
         /// `latestValidHash`: `None` when the EL sent `null`.
         latest_valid_hash: Option<Hash32>,
@@ -61,6 +63,12 @@ pub enum Reason {
     Timeout,
     /// No connection to cl-engine.
     Connect,
+    /// `INVALID_BLOCK_HASH`: the payload sent does not hash to the `block_hash` it claims. That
+    /// says nothing of the payload that has this hash, which can be an honest one (a tampered
+    /// envelope can claim it), so it is no verdict on it. Its `latestValidHash` does not count
+    /// either: `paris.md` requires `null` with this status, and one from a faulty EL must not
+    /// move a boundary.
+    InvalidBlockHash,
 }
 
 impl ElVerdict {
@@ -97,6 +105,7 @@ impl ElVerdict {
 
 /// The verdict of one `PayloadStatusV1` for the submitted payload `block_hash`. A `VALID` must
 /// carry `block_hash` as `latestValidHash`; `null` or another hash is [`Reason::Malformed`].
+/// `INVALID_BLOCK_HASH` is [`Reason::InvalidBlockHash`], with any `latestValidHash`.
 /// `validationError` does not change the verdict.
 #[must_use]
 pub fn map(status: &PayloadStatusV1, block_hash: Hash32) -> ElVerdict {
@@ -108,9 +117,10 @@ pub fn map(status: &PayloadStatusV1, block_hash: Hash32) -> ElVerdict {
                 ElVerdict::NotVerified(Reason::Malformed)
             }
         }
-        ValidationStatus::Invalid | ValidationStatus::InvalidBlockHash => ElVerdict::Invalid {
+        ValidationStatus::Invalid => ElVerdict::Invalid {
             latest_valid_hash: status.latest_valid_hash.map(|h| Hash32::from(h.0)),
         },
+        ValidationStatus::InvalidBlockHash => ElVerdict::NotVerified(Reason::InvalidBlockHash),
         ValidationStatus::Syncing | ValidationStatus::Accepted => ElVerdict::Optimistic,
     }
 }
@@ -173,8 +183,9 @@ pub enum ExecutionStatus {
     Valid,
     /// Imported on `SYNCING` or `ACCEPTED`, and not `VALID` or `INVALID` yet.
     Optimistic,
-    /// The EL answered `INVALID` or `INVALID_BLOCK_HASH` for it, or it is in the invalid part of
-    /// the chain of such an answer, or it descends from an `Invalid` payload.
+    /// The EL answered `INVALID` for it, or it is in the invalid part of the chain of such an
+    /// answer, or it descends from an `Invalid` payload. `INVALID_BLOCK_HASH` never makes a
+    /// payload `Invalid` ([`Reason::InvalidBlockHash`]).
     Invalid,
 }
 
