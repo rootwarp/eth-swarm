@@ -13,7 +13,7 @@ use consensus_types::common::AttestationData;
 use consensus_types::gloas::{
     Attestation, BeaconBlock, BeaconState, Checkpoint, SignedBeaconBlock,
 };
-use consensus_types::primitives::{Gwei, Root, Slot, ValidatorIndex};
+use consensus_types::primitives::{Epoch, Gwei, Root, Slot, ValidatorIndex};
 use consensus_types::Minimal;
 use fork_choice::testing::{add_equivocating_index, mark_payload_verified, set_latest_message};
 use fork_choice::{
@@ -103,6 +103,13 @@ fn finalizing(checkpoint: Checkpoint) -> Provider<impl Fn(&mut BeaconState<E>)> 
     })
 }
 
+/// A provider whose post-state justifies `checkpoint`.
+fn justifying(checkpoint: Checkpoint) -> Provider<impl Fn(&mut BeaconState<E>)> {
+    Provider(move |state: &mut BeaconState<E>| {
+        state.current_justified_checkpoint = checkpoint.clone();
+    })
+}
+
 /// A block at `slot` on the EMPTY `parent` by proposer `tag`.
 fn child(parent: &BeaconBlock<E>, slot: Slot, tag: u8) -> SignedBeaconBlock<E> {
     let mut block = signed_block::<E>(slot, u64::from(tag));
@@ -167,6 +174,17 @@ struct Finalized {
 }
 
 fn finalized() -> Finalized {
+    finalized_layout(false)
+}
+
+/// The layout of [`finalized`], but the post-state of `e` justifies epoch 1 with `a`, as the
+/// post-state of `c` does. Then the voting source of `e` has the epoch of the justified
+/// checkpoint of the store, and `e` stays a viable leaf after epoch 2.
+fn finalized_with_justified_e() -> Finalized {
+    finalized_layout(true)
+}
+
+fn finalized_layout(justified_e: bool) -> Finalized {
     let (mut store, anchor_block) = new_store();
     tick(&mut store, 1);
     let a = child(&anchor_block, 1, 1);
@@ -189,8 +207,11 @@ fn finalized() -> Finalized {
     store_target_checkpoint_state(&mut store, &PLAIN, &checkpoint).unwrap();
     let d = child(&c.message, 10, 4);
     let e = child(&a.message, 10, 5);
-    for block in [&d, &e] {
-        on_block(&mut store, &PLAIN, block).unwrap();
+    on_block(&mut store, &PLAIN, &d).unwrap();
+    if justified_e {
+        on_block(&mut store, &justifying(checkpoint), &e).unwrap();
+    } else {
+        on_block(&mut store, &PLAIN, &e).unwrap();
     }
     Finalized {
         store,
@@ -699,7 +720,75 @@ fn a_previous_epoch_target_below_the_new_anchor_is_taken_after_the_prune() {
 }
 
 #[test]
-fn the_store_keeps_a_dropped_block_for_attestations_until_the_end_of_the_next_epoch() {
+fn a_previous_epoch_vote_from_the_wire_for_a_dropped_block_moves_the_head_two_epochs_after_the_prune(
+) {
+    let mut f = finalized_with_justified_e();
+    // `x` of slot 9 is its own checkpoint block in epoch 2. Two members of committee 0 of slot
+    // 16 vote for `x` with the target `(2, x)`. The test makes the vote while the store has
+    // the state of `x`.
+    let slot = 2 * SLOTS_PER_EPOCH;
+    let target = Checkpoint {
+        epoch: 2,
+        root: f.x,
+    };
+    let (attesters, other) = attesters_and_other(&f.store, &target, slot);
+    let attestation = attestation(&f.store, slot, f.x, &target, &[0, 1]);
+    // The two members have older messages for `e`, and one other validator has an older
+    // message for `d`, all of slot 8.
+    for validator in attesters {
+        vote(&mut f.store, validator, 8, f.e);
+    }
+    vote(&mut f.store, other, 8, f.d);
+
+    // The tick of slot 11 in epoch 1 drops `b` and `x`. Then `e` has two votes and `c` has one.
+    tick(&mut f.store, 11);
+    assert!(f.store.block(f.x).is_none());
+
+    // At slot 17 the target epoch 2 is the current epoch. The vote moves the two members to
+    // `x`, which supports no kept node, and `d` must become the head.
+    let mut early = f.store.clone();
+    tick(&mut early, slot + 1);
+    assert_eq!(get_head(&early), Ok(empty(f.e)));
+    assert_eq!(
+        on_attestation(&mut early, &PLAIN, &attestation, false),
+        Ok(())
+    );
+    assert_eq!(get_head(&early), Ok(empty(f.d)));
+
+    // At slot 24, the first slot of epoch 3, the target epoch 2 is the previous epoch, so the
+    // vote can still come from the wire. Its target is the dropped block `x`. The spec's store
+    // keeps `x` and takes the vote. This store must take the vote too, and `d` must be the
+    // head, as in the store that took the vote at slot 17.
+    let mut late = f.store.clone();
+    tick(&mut late, 3 * SLOTS_PER_EPOCH);
+    tick(&mut early, 3 * SLOTS_PER_EPOCH);
+    assert_eq!(get_head(&early), Ok(empty(f.d)));
+    // The post-state of `e` justifies epoch 1, so `e` is a viable leaf in epoch 3 and its two
+    // votes make it the head before the vote.
+    assert_eq!(get_head(&late), Ok(empty(f.e)));
+    let result = on_attestation(&mut late, &PLAIN, &attestation, false);
+    assert_eq!(
+        (result, get_head(&late)),
+        (Ok(()), Ok(empty(f.d))),
+        "d: {}, e: {}",
+        f.d,
+        f.e
+    );
+    let message = LatestMessage {
+        slot,
+        root: f.x,
+        payload_present: false,
+    };
+    for validator in attesters {
+        assert_eq!(late.latest_message(validator), Some(&message));
+    }
+    assert_eq!(get_weight(&late, &pending(f.e)), Ok(0));
+    assert_eq!(head_and_weights(&late), head_and_weights(&early));
+}
+
+#[test]
+fn the_store_keeps_a_dropped_block_for_attestations_until_the_end_of_the_second_epoch_after_the_prune(
+) {
     let mut f = finalized();
     let target = Checkpoint {
         epoch: 1,
@@ -707,7 +796,7 @@ fn the_store_keeps_a_dropped_block_for_attestations_until_the_end_of_the_next_ep
     };
     let attestation = attestation(&f.store, 9, f.x, &target, &[0]);
     // The prune runs in epoch 1. In epoch 2 a vote from the wire with the target epoch 1 is
-    // of the previous epoch, and the store must still take it.
+    // of the previous epoch, and the store must take it.
     tick(&mut f.store, 11);
     tick(&mut f.store, 2 * SLOTS_PER_EPOCH);
     assert!(f.store.block(f.x).is_none());
@@ -716,10 +805,18 @@ fn the_store_keeps_a_dropped_block_for_attestations_until_the_end_of_the_next_ep
         Ok(())
     );
     assert!(f.store.checkpoint_state(&target).is_some());
-    // In epoch 3 no vote from the wire can have the target epoch 1. The store forgets the
-    // dropped blocks, their states and the checkpoint states of them. The spec's store keeps
-    // every block, and it takes this vote from a block.
-    tick(&mut f.store, 3 * SLOTS_PER_EPOCH);
+    // The store keeps the dropped blocks, their states and their checkpoint states through
+    // the end of epoch 3. At the first and at the last slot of epoch 3 the store must still
+    // have the checkpoint state, and it must take the vote from a block.
+    for slot in [3 * SLOTS_PER_EPOCH, 4 * SLOTS_PER_EPOCH - 1] {
+        tick(&mut f.store, slot);
+        let kept = f.store.checkpoint_state(&target).is_some();
+        let result = on_attestation(&mut f.store, &PLAIN, &attestation, true);
+        assert_eq!((kept, result), (true, Ok(())), "slot {slot}");
+    }
+    // The first tick of epoch 4 forgets the dropped blocks, their states and their checkpoint
+    // states. The spec's store keeps every block, and it takes this vote from a block.
+    tick(&mut f.store, 4 * SLOTS_PER_EPOCH);
     assert!(f.store.checkpoint_state(&target).is_none());
     assert_eq!(
         on_attestation(&mut f.store, &PLAIN, &attestation, true),
@@ -743,27 +840,32 @@ fn older_messages(
     vote(store, other, 12, d);
 }
 
+/// A vote of committee 0 of the first slot of `epoch` for `x`, with the target `x` in that
+/// epoch, by its first two members. Also gives the two members and one other validator. The
+/// store must still have the state of `x`.
+fn vote_for_x(
+    store: &Store<E>,
+    x: Root,
+    epoch: Epoch,
+) -> (([ValidatorIndex; 2], ValidatorIndex), Attestation<E>) {
+    let target = Checkpoint { epoch, root: x };
+    let slot = epoch * SLOTS_PER_EPOCH;
+    let voters = attesters_and_other(store, &target, slot);
+    (voters, attestation(store, slot, x, &target, &[0, 1]))
+}
+
 #[test]
 fn after_the_window_a_refused_block_vote_for_a_forgotten_block_keeps_the_head_that_the_spec_moves()
 {
     let mut f = finalized();
     // Each vote is for `x` of slot 9 at the first slot of its epoch, with the target `x` in that
     // epoch: `x` is its own checkpoint block in each epoch after epoch 1. The test makes the
-    // votes while the store has the state of `x`.
-    let in_window = Checkpoint {
-        epoch: 2,
-        root: f.x,
-    };
-    let after_window = Checkpoint {
-        epoch: 3,
-        root: f.x,
-    };
-    let in_window_slot = 2 * SLOTS_PER_EPOCH;
-    let after_window_slot = 3 * SLOTS_PER_EPOCH;
-    let in_window_voters = attesters_and_other(&f.store, &in_window, in_window_slot);
-    let after_window_voters = attesters_and_other(&f.store, &after_window, after_window_slot);
-    let in_window_vote = attestation(&f.store, in_window_slot, f.x, &in_window, &[0, 1]);
-    let after_window_vote = attestation(&f.store, after_window_slot, f.x, &after_window, &[0, 1]);
+    // votes while the store has the state of `x`. The prune runs in epoch 1, so the store
+    // keeps `x` through the end of epoch 3.
+    let in_window = [2, 3].map(|epoch| (epoch, vote_for_x(&f.store, f.x, epoch)));
+    let after_window_epoch = 4;
+    let after_window_slot = after_window_epoch * SLOTS_PER_EPOCH;
+    let (after_window_voters, after_window_vote) = vote_for_x(&f.store, f.x, after_window_epoch);
 
     // The tick of slot 11 drops `b` and `x`. `d2` of slot 11 on `c` is a kept block beside `d`.
     tick(&mut f.store, 11);
@@ -772,39 +874,63 @@ fn after_the_window_a_refused_block_vote_for_a_forgotten_block_keeps_the_head_th
     let d2 = child(&c_block, 11, 7);
     on_block(&mut f.store, &PLAIN, &d2).unwrap();
     let d2 = root_of(&d2);
-    tick(&mut f.store, in_window_slot + 1);
 
-    // The spec's store keeps `x`. In epoch 2 this store still keeps `x` too, so it must give
-    // the result of the spec. The two attesters of the vote have older messages for `d2`, and
-    // one other validator has an older message for `d`. The vote moves the two attesters to
-    // `x`, and then `d` must be the head.
-    let mut spec = f.store.clone();
-    older_messages(&mut spec, in_window_voters, d2, f.d);
-    assert_eq!(get_head(&spec), Ok(empty(d2)));
-    assert_eq!(
-        on_attestation(&mut spec, &PLAIN, &in_window_vote, true),
-        Ok(())
-    );
-    let moved = LatestMessage {
-        slot: in_window_slot,
-        root: f.x,
-        payload_present: false,
-    };
-    for validator in in_window_voters.0 {
-        assert_eq!(spec.latest_message(validator), Some(&moved));
+    // The spec's store keeps `x`. In epochs 2 and 3 this store still keeps `x` too, so it must
+    // give the result of the spec. A block of the second slot of the epoch has the vote. The
+    // two attesters of the vote have older messages for `d2`, and one other validator has an
+    // older message for `d`. The vote moves the two attesters to `x`, and then `d` must be the
+    // head.
+    for (epoch, (voters, vote)) in in_window {
+        let slot = epoch * SLOTS_PER_EPOCH;
+        tick(&mut f.store, slot);
+        tick(&mut f.store, slot + 1);
+        let mut spec = f.store.clone();
+        older_messages(&mut spec, voters, d2, f.d);
+        assert_eq!(get_head(&spec), Ok(empty(d2)), "epoch {epoch}");
+        assert_eq!(
+            on_attestation(&mut spec, &PLAIN, &vote, true),
+            Ok(()),
+            "epoch {epoch}"
+        );
+        let moved = LatestMessage {
+            slot,
+            root: f.x,
+            payload_present: false,
+        };
+        for validator in voters.0 {
+            assert_eq!(
+                spec.latest_message(validator),
+                Some(&moved),
+                "epoch {epoch}"
+            );
+        }
+        assert_eq!(
+            get_head(&spec),
+            Ok(empty(f.d)),
+            "epoch {epoch}, d: {}, d2: {}",
+            f.d,
+            d2
+        );
     }
-    assert_eq!(get_head(&spec), Ok(empty(f.d)), "d: {}, d2: {}", f.d, d2);
 
-    // The same older messages for the attesters of the vote of epoch 3. At the first tick of
-    // epoch 3 the store forgets `x`. A block of slot 25 has the vote of slot 24. All states of
-    // this test have one shuffling, so the state of that block and the state of `x` give the
-    // vote the same attesters. The spec's store takes this vote and moves the head to `d`, as
-    // in epoch 2. This store must refuse the vote and keep the older messages, so `d2` must
-    // stay the head.
+    // The same older messages for the attesters of the vote of epoch 4. The first tick of
+    // epoch 4 forgets `x`. A block of slot 33 has the vote of slot 32. All states of this test
+    // have one shuffling, so the state of that block and the state of `x` give the vote the
+    // same attesters.
     older_messages(&mut f.store, after_window_voters, d2, f.d);
     tick(&mut f.store, after_window_slot);
     tick(&mut f.store, after_window_slot + 1);
+    // `d` and `d2` have the voting source of the justified checkpoint of the store, so both
+    // stay viable leaves in epoch 4.
     assert_eq!(get_head(&f.store), Ok(empty(d2)));
+    // The spec's store takes this vote, as in epochs 2 and 3. It gives the two attesters
+    // messages for `x`, which support no kept node, and then `d` is the head.
+    let mut spec = f.store.clone();
+    for validator in after_window_voters.0 {
+        vote(&mut spec, validator, after_window_slot, f.x);
+    }
+    assert_eq!(get_head(&spec), Ok(empty(f.d)));
+    // This store must refuse the vote and keep the older messages, so `d2` must stay the head.
     let before = f.store.clone();
     assert_eq!(
         on_attestation(&mut f.store, &PLAIN, &after_window_vote, true),
@@ -854,8 +980,15 @@ fn a_full_vote_for_a_dropped_block_reads_its_verified_payload_after_the_prune() 
             want,
             "verified: {verified}"
         );
-        // The store forgets the root of the payload with the dropped block.
-        tick(&mut f.store, 3 * SLOTS_PER_EPOCH);
+        // The store keeps the root of the payload with the dropped block through the end of
+        // epoch 3, and the first tick of epoch 4 forgets it.
+        tick(&mut f.store, 4 * SLOTS_PER_EPOCH - 1);
+        assert_eq!(
+            is_payload_verified(&f.store, f.x),
+            verified,
+            "verified: {verified}"
+        );
+        tick(&mut f.store, 4 * SLOTS_PER_EPOCH);
         assert!(!is_payload_verified(&f.store, f.x));
     }
 }
