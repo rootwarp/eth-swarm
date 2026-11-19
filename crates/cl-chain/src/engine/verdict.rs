@@ -189,9 +189,11 @@ pub enum ExecutionStatus {
     Invalid,
 }
 
-/// Most `Invalid` payloads [`ExecutionStatuses`] keeps: 128 epochs at one per slot. Past it, the
-/// payload that became `Invalid` first is dropped first. A dropped payload has no status, so a
-/// later payload on it is not refused by the table; the EL still gives its own verdict.
+/// Most `Invalid` payloads [`ExecutionStatuses`] keeps a full entry for: 128 epochs at one per
+/// slot. Past it, the payload that became `Invalid` first loses its entry first, and only its
+/// hash and parent hash stay. It stays `Invalid` until [`ExecutionStatuses::prune_finalized`]
+/// drops it: a later `VALID` or `SYNCING` must not bring an `INVALID` payload back. A boundary
+/// it waited for is dropped with the entry.
 pub const MAX_INVALID_PAYLOADS: usize = 4096;
 
 /// One payload's status, as the table holds it.
@@ -262,16 +264,21 @@ enum Walk {
 ///   earlier status stays as it is.
 ///
 /// [`ExecutionStatuses::prune_finalized`] drops what finality makes useless, and at most
-/// [`MAX_INVALID_PAYLOADS`] `Invalid` payloads are kept.
+/// [`MAX_INVALID_PAYLOADS`] `Invalid` payloads keep a full entry.
 #[derive(Debug, Default)]
 pub struct ExecutionStatuses {
     blocks: HashMap<Hash32, Entry>,
-    /// The recorded payloads on each parent hash, recorded or not, in the order they came.
+    /// The recorded payloads on each parent hash, recorded or not, in the order they came. An
+    /// evicted payload stays here, so that the walks down and finality still reach it.
     children: HashMap<Hash32, Vec<Hash32>>,
-    /// The `Invalid` payloads by the order they became `Invalid`: the first goes first.
+    /// The `Invalid` payloads with a full entry by the order they became `Invalid`: the first
+    /// goes first.
     invalid: BTreeMap<u64, Hash32>,
     /// The order the next `Invalid` payload takes.
     next_order: u64,
+    /// The `Invalid` payloads that lost their entry to [`MAX_INVALID_PAYLOADS`], with their parent
+    /// hash.
+    evicted: HashMap<Hash32, Hash32>,
 }
 
 impl ExecutionStatuses {
@@ -292,7 +299,7 @@ impl ExecutionStatuses {
         if let ElVerdict::NotVerified(_) = verdict {
             return self.status(&block_hash);
         }
-        let new = !self.blocks.contains_key(&block_hash);
+        let new = self.get(&block_hash).is_none();
         if new {
             self.blocks.insert(
                 block_hash,
@@ -324,9 +331,7 @@ impl ExecutionStatuses {
     /// The status of the payload `block_hash`, `None` if it has none.
     #[must_use]
     pub fn status(&self, block_hash: &Hash32) -> Option<ExecutionStatus> {
-        self.blocks
-            .get(block_hash)
-            .map(|entry| entry.state.status())
+        self.get(block_hash).map(|(status, _)| status)
     }
 
     /// The table's import gate: [`ElVerdict::permits_payload_import`], and neither the payload
@@ -348,18 +353,19 @@ impl ExecutionStatuses {
     /// Drops what finality at the payload `finalized` makes useless: `finalized` and every
     /// recorded ancestor of it, and every payload that descends from one of those ancestors but
     /// not from `finalized` (a fork that can no longer become canonical). Keeps the descendants
-    /// of `finalized` and the payloads whose ancestry is not recorded. Returns how many payloads
-    /// it dropped: none if `finalized` is not recorded.
+    /// of `finalized` and the payloads whose ancestry is not recorded. An evicted `Invalid`
+    /// payload counts as recorded. Returns how many payloads it dropped: none if `finalized` is
+    /// not recorded.
     pub fn prune_finalized(&mut self, finalized: &Hash32) -> usize {
         let mut seen = HashSet::new();
         let mut doomed = Vec::new();
         let mut at = *finalized;
-        while let Some(entry) = self.blocks.get(&at) {
+        while let Some((_, parent)) = self.get(&at) {
             if !seen.insert(at) {
                 break;
             }
             doomed.push(at);
-            at = entry.parent_hash;
+            at = parent;
         }
         // The forks off the ancestors; the chain itself is already in `seen`.
         let mut forks: VecDeque<Hash32> = doomed
@@ -384,16 +390,28 @@ impl ExecutionStatuses {
         doomed.len()
     }
 
-    /// How many payloads have a status.
+    /// How many payloads have a full entry: an evicted `Invalid` payload (see
+    /// [`MAX_INVALID_PAYLOADS`]) has a status but does not count.
     #[must_use]
     pub fn len(&self) -> usize {
         self.blocks.len()
     }
 
-    /// Whether no payload has a status.
+    /// Whether no payload has a full entry (see [`Self::len`]).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
+    }
+
+    /// The status and parent hash of the payload `hash`. An evicted payload is `Invalid`.
+    fn get(&self, hash: &Hash32) -> Option<(ExecutionStatus, Hash32)> {
+        match self.blocks.get(hash) {
+            Some(entry) => Some((entry.state.status(), entry.parent_hash)),
+            None => self
+                .evicted
+                .get(hash)
+                .map(|&parent| (ExecutionStatus::Invalid, parent)),
+        }
     }
 
     /// `hash`, unless it is `Invalid`, and every `Optimistic` ancestor become `Valid`.
@@ -445,26 +463,25 @@ impl ExecutionStatuses {
         let Some(boundary) = latest_valid_hash else {
             return;
         };
-        let Some(entry) = self.blocks.get(&hash) else {
+        let Some((_, mut at)) = self.get(&hash) else {
             return;
         };
         let zero = boundary == Hash32::ZERO;
         // The recorded Optimistic ancestors, nearest first.
         let mut walked = Vec::new();
         let mut seen = HashSet::new();
-        let mut at = entry.parent_hash;
         let end = loop {
             if !zero && at == boundary {
                 break Walk::Found;
             }
-            match self.blocks.get(&at) {
+            match self.get(&at) {
                 // An Invalid ancestor is passed, not walked: it can be Invalid from an earlier
-                // walk of this boundary, and the boundary can be above it.
-                Some(entry) if !matches!(entry.state, State::Valid) && seen.insert(at) => {
-                    if let State::Optimistic = entry.state {
+                // walk of this boundary, or evicted, and the boundary can be above it.
+                Some((status, parent)) if status != ExecutionStatus::Valid && seen.insert(at) => {
+                    if status == ExecutionStatus::Optimistic {
                         walked.push(at);
                     }
-                    at = entry.parent_hash;
+                    at = parent;
                 }
                 Some(_) => break Walk::Stopped,
                 None => break Walk::Missing,
@@ -484,7 +501,7 @@ impl ExecutionStatuses {
         // the `latestValidHash` payload, which becomes Valid when it is recorded.
         let waits = match end {
             Walk::Missing => true,
-            Walk::Found => !self.blocks.contains_key(&boundary),
+            Walk::Found => self.get(&boundary).is_none(),
             Walk::Stopped => false,
         };
         if let Some(Entry {
@@ -543,28 +560,36 @@ impl ExecutionStatuses {
         waiting
     }
 
-    /// Drops the oldest `Invalid` payloads past [`MAX_INVALID_PAYLOADS`].
+    /// Evicts the oldest `Invalid` payloads past [`MAX_INVALID_PAYLOADS`]: each keeps only its
+    /// hash and parent hash, and stays in `children`.
     fn evict_past_bound(&mut self) {
         while self.invalid.len() > MAX_INVALID_PAYLOADS {
             let Some((_, hash)) = self.invalid.pop_first() else {
                 break;
             };
-            self.remove(&hash);
+            if let Some(entry) = self.blocks.remove(&hash) {
+                self.evicted.insert(hash, entry.parent_hash);
+            }
         }
     }
 
-    /// Drops the payload `hash` from the table and its indexes. Its children keep their status.
+    /// Drops the payload `hash`, evicted or not, from the table and its indexes. Its children
+    /// keep their status.
     fn remove(&mut self, hash: &Hash32) {
-        let Some(entry) = self.blocks.remove(hash) else {
+        let parent_hash = if let Some(entry) = self.blocks.remove(hash) {
+            if let State::Invalid { order, .. } = entry.state {
+                self.invalid.remove(&order);
+            }
+            entry.parent_hash
+        } else if let Some(parent_hash) = self.evicted.remove(hash) {
+            parent_hash
+        } else {
             return;
         };
-        if let State::Invalid { order, .. } = entry.state {
-            self.invalid.remove(&order);
-        }
-        if let Some(siblings) = self.children.get_mut(&entry.parent_hash) {
+        if let Some(siblings) = self.children.get_mut(&parent_hash) {
             siblings.retain(|child| child != hash);
             if siblings.is_empty() {
-                self.children.remove(&entry.parent_hash);
+                self.children.remove(&parent_hash);
             }
         }
     }
