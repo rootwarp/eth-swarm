@@ -95,7 +95,7 @@ impl Seen {
         signatures: Result<bool, BackendError>,
     ) -> Verdict {
         match signatures {
-            Ok(true) => self.commit(seen_key),
+            Ok(true) => self.commit(seen_key), // stamped-commits: not an env txn (Seen)
             Ok(false) => Verdict::Reject(RejectReason::InvalidSignature),
             Err(_) => Verdict::Ignore(IgnoreReason::NoSignatureVerdict),
         }
