@@ -14,11 +14,13 @@
 //! `on_payload_attestation_message` from the wire are not here yet. Until they are, only the
 //! test seam `testing::mark_payload_verified` (tests only) fills `store.payloads`.
 //!
-//! The spec's store keeps every block. Here `on_tick` also drops the blocks that do not
-//! descend from the finalized checkpoint block once finality moves, with no change to the
-//! result of [`on_block`] or of [`get_head`] ([`on_tick`]). The store keeps what
-//! [`on_attestation`] reads of the dropped blocks until the end of the epoch after the prune,
-//! so [`on_attestation`] gives the result of the spec until then.
+//! The spec's store keeps every block. Here [`on_tick`] still drops the blocks that do not
+//! descend from the finalized checkpoint block once finality moves, from the kept set that
+//! [`on_block`], [`get_head`] and [`get_weight`] read. The store keeps what [`on_attestation`]
+//! reads of the dropped blocks until the end of the epoch after the prune, so for a vote that
+//! arrives in that window [`on_attestation`] and then [`get_head`] give the result of the spec.
+//! After that window [`on_attestation`] refuses a vote that names a forgotten block, where the
+//! spec would still accept a valid one.
 //!
 //! The spec signals an invalid call with a failed `assert` or a missing key. Here each public
 //! handler returns an [`Error`] instead, and a failed handler leaves the store as it was.
