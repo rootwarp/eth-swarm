@@ -102,6 +102,26 @@ impl StateProvider<E> for Provider {
     }
 }
 
+/// [`Provider`], and the post-state justifies and finalizes the checkpoint.
+struct Finalizing(Checkpoint);
+
+impl StateProvider<E> for Finalizing {
+    fn state_transition(
+        &self,
+        state: &mut BeaconState<E>,
+        signed_block: &SignedBeaconBlock<E>,
+    ) -> Result<(), StfError> {
+        Provider.state_transition(state, signed_block)?;
+        state.current_justified_checkpoint = self.0.clone();
+        state.finalized_checkpoint = self.0.clone();
+        Ok(())
+    }
+
+    fn process_slots(&self, state: &mut BeaconState<E>, slot: Slot) -> Result<(), StfError> {
+        Provider.process_slots(state, slot)
+    }
+}
+
 /// A store with an anchor and one block after it, and that block.
 struct Chain {
     store: Store<E>,
@@ -112,6 +132,32 @@ struct Chain {
 /// [`chain_at`] with the anchor at slot 0.
 fn chain(builder_index: BuilderIndex, requests: &ExecutionRequests<E>) -> Chain {
     chain_at(0, builder_index, requests)
+}
+
+/// A block at `slot` by `proposer` on the EMPTY payload of `parent`.
+fn block_on(parent: Root, slot: Slot, proposer: u64) -> SignedBeaconBlock<E> {
+    let mut block = signed_block::<E>(slot, proposer);
+    block.message.parent_root = parent;
+    let bid = &mut block.message.body.signed_execution_payload_bid.message;
+    bid.parent_block_hash = Root::repeat_byte(0xee);
+    block
+}
+
+/// A block at `slot` by [`PROPOSER`] on the EMPTY payload of `parent`. The bid of the block is
+/// by `builder_index`, has the block hash `[0xbb; 32]` and commits to `requests`.
+fn block_with_bid(
+    parent: Root,
+    slot: Slot,
+    builder_index: BuilderIndex,
+    requests: &ExecutionRequests<E>,
+) -> SignedBeaconBlock<E> {
+    let mut block = block_on(parent, slot, PROPOSER);
+    let bid = &mut block.message.body.signed_execution_payload_bid.message;
+    bid.builder_index = builder_index;
+    bid.block_hash = block_hash();
+    bid.gas_limit = GAS_LIMIT;
+    bid.execution_requests_root = requests.tree_hash_root();
+    block
 }
 
 /// A store with the anchor at `anchor_slot`, and a block at the next slot on it. The bid of
@@ -127,17 +173,63 @@ fn chain_at(
     let mut store = get_forkchoice_store(state, anchor_block, slot_duration).unwrap();
     let slot = anchor_slot + 1;
     on_tick(&mut store, time_at(slot)).unwrap();
-    let mut block = signed_block::<E>(slot, PROPOSER);
-    block.message.parent_root = anchor_root;
-    let bid = &mut block.message.body.signed_execution_payload_bid.message;
-    bid.builder_index = builder_index;
-    bid.block_hash = block_hash();
-    bid.parent_block_hash = Root::repeat_byte(0xee);
-    bid.gas_limit = GAS_LIMIT;
-    bid.execution_requests_root = requests.tree_hash_root();
+    let block = block_with_bid(anchor_root, slot, builder_index, requests);
     on_block(&mut store, &Provider, &block).unwrap();
     let root = block.message.tree_hash_root();
     Chain { store, block, root }
+}
+
+/// A store in which a prune dropped the block of `chain`, and the post-state of that block
+/// from before the prune.
+struct Dropped {
+    chain: Chain,
+    state: BeaconState<E>,
+}
+
+/// The anchor at slot 0, `a` and `b` at slot 1 on it, the block at slot 9 on `b`, and `c` at
+/// slot 9 on `a`. The bid of the block is by `builder_index`, has the block hash `[0xbb; 32]`
+/// and commits to `requests`. The post-state of `c` justifies and finalizes epoch 1 (first
+/// slot 8) with `a`, and the tick after it, in slot 10, drops the anchor, `b` and the block.
+///
+/// The prune in epoch 1 keeps the dropped block and its post-state through the end of epoch 3
+/// (slot 31), but [`Store::block`] and [`Store::block_state`] no longer have them.
+fn dropped(builder_index: BuilderIndex, requests: &ExecutionRequests<E>) -> Dropped {
+    let (state, anchor_block) = anchor(0);
+    let anchor_root = anchor_block.tree_hash_root();
+    let slot_duration = NonZeroU64::new(SLOT_MS).unwrap();
+    let mut store = get_forkchoice_store(state, anchor_block, slot_duration).unwrap();
+    on_tick(&mut store, time_at(1)).unwrap();
+    let a = block_on(anchor_root, 1, 1);
+    let b = block_on(anchor_root, 1, 2);
+    for block in [&a, &b] {
+        on_block(&mut store, &Provider, block).unwrap();
+    }
+    on_tick(&mut store, time_at(10)).unwrap();
+    let block = block_with_bid(b.message.tree_hash_root(), 9, builder_index, requests);
+    on_block(&mut store, &Provider, &block).unwrap();
+    let root = block.message.tree_hash_root();
+    let state = store.block_state(root).unwrap().clone();
+    let checkpoint = Checkpoint {
+        epoch: 1,
+        root: a.message.tree_hash_root(),
+    };
+    let c = block_on(checkpoint.root, 9, 3);
+    on_block(&mut store, &Finalizing(checkpoint.clone()), &c).unwrap();
+    assert_eq!(store.finalized_checkpoint(), &checkpoint);
+    // A tick in the same slot prunes.
+    on_tick(&mut store, time_at(10)).unwrap();
+    assert!(Store::block(&store, anchor_root).is_none());
+    Dropped {
+        chain: Chain { store, block, root },
+        state,
+    }
+}
+
+/// The block of `chain` is not in the live tree of the store: [`Store::block`] and
+/// [`Store::block_state`] do not have it.
+fn assert_not_live(chain: &Chain) {
+    assert!(Store::block(&chain.store, chain.root).is_none());
+    assert!(Store::block_state(&chain.store, chain.root).is_none());
 }
 
 fn withdrawal(index: u64) -> Withdrawal {
@@ -198,7 +290,14 @@ fn envelope(chain: &Chain, requests: ExecutionRequests<E>) -> SignedExecutionPay
 /// The set of `verify_execution_payload_envelope_signature` (`gloas/beacon-chain.md`
 /// L2107-2120) for `signed` on the post-state of the block of `chain`.
 fn expected_set(chain: &Chain, signed: &SignedExecutionPayloadEnvelope<E>) -> SignatureSet {
-    let state = chain.store.block_state(chain.root).unwrap();
+    expected_set_on(chain.store.block_state(chain.root).unwrap(), signed)
+}
+
+/// The set of `verify_execution_payload_envelope_signature` for `signed` on `state`.
+fn expected_set_on(
+    state: &BeaconState<E>,
+    signed: &SignedExecutionPayloadEnvelope<E>,
+) -> SignatureSet {
     let index = signed.message.builder_index;
     let signer = if index == BUILDER_INDEX_SELF_BUILD {
         SignerRef::Validator(PROPOSER)
@@ -279,6 +378,78 @@ fn an_envelope_for_an_unknown_block_must_ignore() {
     assert_eq!(
         validate(&Seen::default(), &chain, &signed),
         Verdict::Ignore(IgnoreReason::UnknownBlock(unknown))
+    );
+}
+
+#[test]
+fn a_valid_envelope_for_a_retained_dropped_block_must_wait_for_its_signature_and_then_accept() {
+    let Dropped { chain, state } = dropped(BUILDER, &empty_requests());
+    assert_not_live(&chain);
+    let signed = envelope(&chain, empty_requests());
+    let mut seen = Seen::default();
+    let (sets, key) = pending(validate(&seen, &chain, &signed));
+    assert_eq!(sets, vec![expected_set_on(&state, &signed)]);
+    assert_eq!(seen.resolve(key, Ok(true)), Verdict::Accept);
+    assert!(seen.has_execution_payload_envelope(chain.root, BUILDER));
+    assert_eq!(
+        seen.execution_payload(block_hash()).unwrap().gas_limit,
+        GAS_LIMIT
+    );
+}
+
+#[test]
+fn an_invalid_signature_for_a_retained_dropped_block_must_reject() {
+    let Dropped { chain, .. } = dropped(BUILDER, &empty_requests());
+    assert_not_live(&chain);
+    let mut signed = envelope(&chain, empty_requests());
+    signed.signature = OTHER_SIG;
+    let mut seen = Seen::default();
+    let (_, key) = pending(validate(&seen, &chain, &signed));
+    assert_eq!(
+        seen.resolve(key, Ok(false)),
+        Verdict::Reject(RejectReason::InvalidSignature)
+    );
+    assert_eq!(seen, Seen::default());
+}
+
+#[test]
+fn an_envelope_that_does_not_match_a_retained_dropped_block_must_reject() {
+    let Dropped { chain, .. } = dropped(BUILDER, &empty_requests());
+    assert_not_live(&chain);
+    // Slot 10 is after the finalized slot 8, so only the block slot 9 refuses it.
+    let mut signed = envelope(&chain, empty_requests());
+    signed.message.payload.slot_number = 10;
+    assert_eq!(
+        validate(&Seen::default(), &chain, &signed),
+        Verdict::Reject(RejectReason::SlotMismatch {
+            block: 9,
+            payload: 10,
+        })
+    );
+    let mut signed = envelope(&chain, empty_requests());
+    signed.message.builder_index = 0;
+    assert_eq!(
+        validate(&Seen::default(), &chain, &signed),
+        Verdict::Reject(RejectReason::BuilderIndexMismatch {
+            envelope: 0,
+            bid: BUILDER,
+        })
+    );
+}
+
+#[test]
+fn an_envelope_for_a_dropped_block_must_ignore_once_the_store_forgets_it() {
+    let Dropped { mut chain, .. } = dropped(BUILDER, &empty_requests());
+    let signed = envelope(&chain, empty_requests());
+    // The last slot of epoch 3, the second epoch after the prune: the store keeps the block.
+    on_tick(&mut chain.store, time_at(31)).unwrap();
+    assert_not_live(&chain);
+    pending(validate(&Seen::default(), &chain, &signed));
+    // The first tick of epoch 4 forgets it.
+    on_tick(&mut chain.store, time_at(32)).unwrap();
+    assert_eq!(
+        validate(&Seen::default(), &chain, &signed),
+        Verdict::Ignore(IgnoreReason::UnknownBlock(chain.root))
     );
 }
 
